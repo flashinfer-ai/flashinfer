@@ -498,8 +498,8 @@ with ``torchrun``), you could use separate output files per rank and merge them 
    expected to be atomic on most network filesystems (NFS, Lustre) per POSIX
    semantics.  FlashInfer's cubin caching also relies on this guarantee.
 
-Batch-Invariant Autotuning
---------------------------
+Excluding Split-K Tactics
+-------------------------
 
 Some tactics change the floating-point reduction order; for example the
 ``mm_mxfp8(backend="cute-dsl")`` split-K tactics, offered only for M <= 32,
@@ -509,36 +509,65 @@ ranks (or two restarts) that tuned the same GEMM can therefore round the same
 row differently, and a small-M call (such as a prefix-cache extend) can round
 differently from the same rows inside a large prefill.
 
-To restrict tuning to tactics whose result does not depend on the tactic or on
-M, enable batch-invariant autotuning before tuning and serving:
+To keep the tuned kernels but exclude the tactics that split the reduction,
+enable exclude-split-K autotuning before tuning and serving:
 
 .. code-block:: python
 
-    from flashinfer.autotuner import set_autotune_batch_invariant
+    from flashinfer.autotuner import set_autotune_exclude_split_k
 
-    set_autotune_batch_invariant(True)  # or FLASHINFER_AUTOTUNE_BATCH_INVARIANT=1
+    set_autotune_exclude_split_k(True)  # or FLASHINFER_AUTOTUNE_EXCLUDE_SPLIT_K=1
 
 The autotuner then profiles and serves only tactics for which the runner's
-``TunableRunner.is_batch_invariant_tactic(tactic)`` returns ``True``; a cached
-tactic that is not batch-invariant (in memory, from ``autotune(cache=...)`` or
-from bundled configs) is treated as a cache miss. Runners report every tactic
-as batch-invariant unless they override the method. When the mode is on, a
-runner list whose untuned default would split the reduction (for example the
-SM100/SM103 MXFP8 warp split-K runner at small N) puts a non-split runner
-first instead, and an ``autotune_v2`` tuning context does not race a
-non-invariant default tactic.
+``TunableRunner.is_split_free_tactic(tactic)`` returns ``True``; a cached
+split-K tactic (in memory, from ``autotune(cache=...)`` or from bundled
+configs) is treated as a cache miss. When the mode is on, a runner list whose
+untuned default would split the reduction (for example the SM100/SM103 MXFP8
+warp split-K runner at small N) puts a split-free runner first instead, and an
+``autotune_v2`` tuning context does not race a split-K default tactic.
 
-.. note::
+Scope of the guarantee
+^^^^^^^^^^^^^^^^^^^^^^
 
-   Classified runners: the SM100/SM103/SM107 ``mm_mxfp8(backend="cute-dsl")``
-   runners and the ``cutedsl_low_latency`` block-scaled GEMM runner (split-K
-   is their only batch-variant tactic family, and their untuned default does
-   not split K under the mode). On SM107 bitwise equality between the low-M
-   kernel and the SM107 wide-tile kernel across M buckets is not validated.
-   ``mm_fp4(backend="cute-dsl")`` is not classified yet: it keeps the default
-   ``is_batch_invariant_tactic`` (every tactic allowed) and may still select
-   split-K under the mode.
+``is_split_free_tactic`` defaults to ``True``, so the mode only constrains
+runners that classify their tactics by overriding it. The guarantee is: the
+tactics of classified runners do not split the reduction (no split-K), so a
+classified runner's per-M-bucket winners all accumulate K in the same order.
+Classified runners today, all in ``flashinfer/gemm/gemm_base.py``:
 
+* ``CuteDSLMxfp8GemmRunner``: ``mm_mxfp8(backend="cute-dsl")`` on
+  SM100/SM103/SM107 (split-K is only offered for M <= 32; the untuned default
+  does not split K under the mode, on SM107 included).
+* ``CuteDSLMxfp8WarpSplitKRunner``: the ``mm_mxfp8(backend="cute-dsl")``
+  warp split-K runner on SM100/SM103/SM107. Every tactic splits K, so under
+  the mode it is never selected and never serves as the untuned default.
+* ``CutedslLowLatencyBlockscaledGemmRunner``: the ``cutedsl_low_latency``
+  backend of ``mm_fp8``, ``mm_mxfp8``, ``mm_fp4`` and ``tgv_gemm_sm100``
+  (split-K is its only tactic family that changes the reduction order; the
+  untuned default is a split-K == 1 tactic).
+
+Everything else is unclassified and keeps its full tactic space under the
+mode; ``mm_fp4(backend="cute-dsl")`` in particular may still select split-K.
+The first time the autotuner tunes an unclassified runner while the mode is on
+it logs one warning per runner class naming the runner. A multi-backend runner
+list can also pick a different runner per M bucket, each with its own
+reduction order: for example ``mm_mxfp8(backend="auto")`` on SM12x tunes
+across b12x, cutlass and cudnn, none of which is classified. Pin the backend
+when a single kernel family across M matters. On SM107 bitwise equality
+between the low-M MXFP8 kernel and the SM107 wide-tile kernel across M buckets
+is not validated.
+
+Relationship to ``batch_invariant=True``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The op-level ``batch_invariant=True`` argument (``mm_bf16``, ``bmm_fp8``,
+``mm_mxfp8``, ``mm_fp4``) selects a dedicated bit-exact kernel class and does
+not autotune. Exclude-split-K autotuning keeps the tuned CuTe-DSL kernels and
+only removes the split-K tactics, so the per-M-bucket winners of a classified
+runner do not change the reduction order. Use it when you need numerics that
+are stable across batch sizes at tuned performance and can accept that it is
+not a bit-exactness guarantee; use ``batch_invariant=True`` when you need
+bit-exact results.
 
 Interaction with other autotuner features:
 
@@ -551,7 +580,7 @@ Interaction with other autotuner features:
   the old entry in the active cache (a managed store or ``autotune(cache=...)``
   file). Keep separate caches if you switch the mode back and forth.
 * ``ReplayCoverage`` reports a rejected cached winner as a miss with reason
-  ``not_batch_invariant``. Under ``strict_replay=True`` that miss raises, like
+  ``excluded_split_k``. Under ``strict_replay=True`` that miss raises, like
   any other miss: a strict replay with the mode on needs a cache that was
   tuned with the mode on.
 * Graph timing (``use_cuda_graph_individual_timing``) and the tactics blocklist

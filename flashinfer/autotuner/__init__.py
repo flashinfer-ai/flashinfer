@@ -26,12 +26,12 @@ from flashinfer.autotuner.autotuner import (
     _tactic_to_json,
     _tactic_to_json_hashable,
     autotune,
-    get_autotune_batch_invariant,
+    get_autotune_exclude_split_k,
     get_autotune_process_group,
     is_in_profile_measurement,
     make_bucket_mapper,
     round_to_nearest_bucket,
-    set_autotune_batch_invariant,
+    set_autotune_exclude_split_k,
     set_autotune_process_group,
 )
 
@@ -63,11 +63,11 @@ __all__ = [
     "autotuner_initializer_rand_scaled",
     "autotuner_initializer_randn",
     "autotuner_initializer_zeros",
-    "get_autotune_batch_invariant",
+    "get_autotune_exclude_split_k",
     "get_autotune_process_group",
     "is_in_profile_measurement",
     "make_bucket_mapper",
     "round_to_nearest_bucket",
-    "set_autotune_batch_invariant",
+    "set_autotune_exclude_split_k",
     "set_autotune_process_group",
 ]

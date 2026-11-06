@@ -1,9 +1,10 @@
-"""Tests for batch-invariant autotuning (set_autotune_batch_invariant).
+"""Tests for exclude-split-K autotuning (set_autotune_exclude_split_k).
 
 No GPU is required: profiling is faked and tensors live on the CPU.
 """
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -20,8 +21,8 @@ from flashinfer.autotuner import (
     TunableRunner,
     TuningConfig,
     autotune,
-    get_autotune_batch_invariant,
-    set_autotune_batch_invariant,
+    get_autotune_exclude_split_k,
+    set_autotune_exclude_split_k,
 )
 
 from .test_autotune_cache_scope import _CONFIG, _GRAPH, _OP
@@ -35,7 +36,7 @@ class SplitRunner(TunableRunner):
     def get_valid_tactics(self, inputs, profile):
         return [0, 1, 2]
 
-    def is_batch_invariant_tactic(self, tactic):
+    def is_split_free_tactic(self, tactic):
         return tactic != 1
 
     def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
@@ -43,16 +44,16 @@ class SplitRunner(TunableRunner):
 
 
 def _mode(enabled):
-    saved = get_autotune_batch_invariant()
-    set_autotune_batch_invariant(enabled)
+    saved = get_autotune_exclude_split_k()
+    set_autotune_exclude_split_k(enabled)
     try:
         yield
     finally:
-        set_autotune_batch_invariant(saved)
+        set_autotune_exclude_split_k(saved)
 
 
 @pytest.fixture
-def batch_invariant():
+def exclude_split_k():
     yield from _mode(True)
 
 
@@ -85,8 +86,84 @@ def test_default_runner_trusts_every_tactic():
         def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
             return inputs[0]
 
-    assert Plain().is_batch_invariant_tactic((128, 32, 4))
-    assert Plain().is_batch_invariant_tactic(-1)
+    assert Plain().is_split_free_tactic((128, 32, 4))
+    assert Plain().is_split_free_tactic(-1)
+
+
+class Unclassified(TunableRunner):
+    """Keeps the base-class default: its tactics are not constrained."""
+
+    def get_valid_tactics(self, inputs, profile):
+        return [0, 1, 2]
+
+    def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
+        return inputs[0]
+
+
+class _RecordingHandler(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+
+@pytest.fixture
+def tuner_warnings():
+    """WARNING records of the autotuner logger (a standalone Logger that does
+    not propagate to the root, so caplog does not see it)."""
+    handler = _RecordingHandler()
+    handler.setLevel(logging.WARNING)
+    autotuner_module.logger.addHandler(handler)
+    try:
+        yield handler.records
+    finally:
+        autotuner_module.logger.removeHandler(handler)
+
+
+def _unclassified_warnings(records):
+    return [
+        r.getMessage()
+        for r in records
+        if "does not classify its tactics" in r.getMessage()
+    ]
+
+
+def test_unclassified_runner_warns_once_per_class(
+    fake_profile, exclude_split_k, tuner_warnings
+):
+    tuner = reset_autotuner()
+    with autotune(tune_mode=True):
+        # Two ops, two instances of the same class: one warning. The runner's
+        # tactics are unconstrained, so the split tactic 1 still wins.
+        for op in ("uncl_a", "uncl_b"):
+            _, tactic = tuner.choose_one(
+                op, [Unclassified()], TuningConfig(), _inputs()
+            )
+            assert tactic == 1
+        # A classified runner never warns.
+        tuner.choose_one("uncl_c", [SplitRunner()], TuningConfig(), _inputs())
+    warnings = _unclassified_warnings(tuner_warnings)
+    assert len(warnings) == 1, [r.getMessage() for r in tuner_warnings]
+    assert "Unclassified" in warnings[0]
+    assert "uncl_a" in warnings[0]
+    assert "SplitRunner" not in warnings[0]
+    # clear_cache resets the once-per-class memory.
+    tuner_warnings.clear()
+    tuner.clear_cache()
+    with autotune(tune_mode=True):
+        tuner.choose_one("uncl_d", [Unclassified()], TuningConfig(), _inputs())
+    assert len(_unclassified_warnings(tuner_warnings)) == 1
+
+
+def test_unclassified_runner_does_not_warn_without_mode(
+    fake_profile, default_mode, tuner_warnings
+):
+    tuner = reset_autotuner()
+    with autotune(tune_mode=True):
+        tuner.choose_one("uncl_off", [Unclassified()], TuningConfig(), _inputs())
+    assert not _unclassified_warnings(tuner_warnings)
 
 
 def test_tuning_picks_fastest_tactic_by_default(fake_profile, default_mode):
@@ -98,7 +175,7 @@ def test_tuning_picks_fastest_tactic_by_default(fake_profile, default_mode):
     assert tactic == 1
 
 
-def test_tuning_skips_non_invariant_tactics(fake_profile, batch_invariant):
+def test_tuning_skips_split_k_tactics(fake_profile, exclude_split_k):
     tuner = reset_autotuner()
     with autotune(tune_mode=True):
         _, tactic = tuner.choose_one(
@@ -108,7 +185,7 @@ def test_tuning_skips_non_invariant_tactics(fake_profile, batch_invariant):
     assert 1 not in fake_profile
 
 
-def test_cached_non_invariant_tactic_is_a_miss(batch_invariant):
+def test_cached_split_k_tactic_is_a_miss(exclude_split_k):
     tuner = reset_autotuner()
     runner = SplitRunner()
     inputs = _inputs()
@@ -125,13 +202,13 @@ class ShapedRunner(SplitRunner):
     """Classifies by a tuple slot, like the MXFP8 runner, so a tactic of the
     wrong shape (an edited cache file, a stale format) raises."""
 
-    def is_batch_invariant_tactic(self, tactic):
+    def is_split_free_tactic(self, tactic):
         if tactic == -1:
             return True
         return int(tactic[4]) == 1
 
 
-def test_malformed_cached_tactic_is_a_miss(batch_invariant):
+def test_malformed_cached_tactic_is_a_miss(exclude_split_k):
     tuner = reset_autotuner()
     runner = ShapedRunner()
     inputs = _inputs()
@@ -142,7 +219,7 @@ def test_malformed_cached_tactic_is_a_miss(batch_invariant):
         assert tuner.choose_one("bi_malformed", [runner], config, inputs)[1] == -1
 
 
-def test_cached_non_invariant_tactic_is_reprofiled(fake_profile, batch_invariant):
+def test_cached_split_k_tactic_is_reprofiled(fake_profile, exclude_split_k):
     tuner = reset_autotuner()
     runner = SplitRunner()
     inputs = _inputs()
@@ -153,7 +230,7 @@ def test_cached_non_invariant_tactic_is_reprofiled(fake_profile, batch_invariant
         assert tuner.choose_one("bi_retune", [runner], config, inputs)[1] == 2
 
 
-def test_file_config_with_non_invariant_tactic_is_ignored(
+def test_file_config_with_split_k_tactic_is_ignored(
     monkeypatch, tmp_path, fake_profile, default_mode
 ):
     monkeypatch.setattr(
@@ -179,13 +256,13 @@ def test_file_config_with_non_invariant_tactic_is_ignored(
         0,
         1,
     )
-    saved = get_autotune_batch_invariant()
-    set_autotune_batch_invariant(True)
+    saved = get_autotune_exclude_split_k()
+    set_autotune_exclude_split_k(True)
     try:
         assert not fresh.search_cache("bi_file", [runner], shapes, config, inputs)[0]
         assert fresh.choose_one("bi_file", [runner], config, inputs)[1] == -1
     finally:
-        set_autotune_batch_invariant(saved)
+        set_autotune_exclude_split_k(saved)
 
 
 def test_ranked_shortlist_cached_before_mode_is_reranked(fake_profile, default_mode):
@@ -196,11 +273,11 @@ def test_ranked_shortlist_cached_before_mode_is_reranked(fake_profile, default_m
     with autotune(tune_mode=True):
         assert tuner.rank_tactics("bi_rank", [runner], config, inputs, k=2) == [1, 2]
     fake_profile.clear()
-    set_autotune_batch_invariant(True)
+    set_autotune_exclude_split_k(True)
     with autotune(tune_mode=True):
         assert tuner.rank_tactics("bi_rank", [runner], config, inputs, k=2) == [2, 0]
     assert sorted(fake_profile) == [0, 2]
-    # The re-ranked shortlist is invariant, so it is served from the cache.
+    # The re-ranked shortlist is split-free, so it is served from the cache.
     fake_profile.clear()
     with autotune(tune_mode=True):
         assert tuner.rank_tactics("bi_rank", [runner], config, inputs, k=2) == [2, 0]
@@ -210,24 +287,24 @@ def test_ranked_shortlist_cached_before_mode_is_reranked(fake_profile, default_m
 class SplitDefault(SplitRunner):
     """Its untuned default splits the reduction (e.g. SM107 warp split-K)."""
 
-    def is_batch_invariant_tactic(self, tactic):
+    def is_split_free_tactic(self, tactic):
         return tactic not in (-1, 1)
 
 
-def test_untuned_call_uses_first_invariant_fallback_runner(default_mode):
+def test_untuned_call_uses_first_split_free_fallback_runner(default_mode):
     tuner = reset_autotuner()
     split, plain = SplitDefault(), SplitRunner()
     inputs = _inputs()
     config = TuningConfig()
     assert tuner.choose_one("bi_fb", [split, plain], config, inputs) == (split, -1)
-    set_autotune_batch_invariant(True)
+    set_autotune_exclude_split_k(True)
     assert tuner.choose_one("bi_fb", [split, plain], config, inputs) == (plain, -1)
     with autotune(tune_mode=False, skip_ops={"bi_fb"}):
         assert tuner.choose_one("bi_fb", [split, plain], config, inputs) == (
             plain,
             -1,
         )
-    with pytest.raises(RuntimeError, match="batch-invariant fallback"):
+    with pytest.raises(RuntimeError, match="split-free fallback"):
         tuner.choose_one("bi_fb", [split], config, inputs)
 
 
@@ -237,14 +314,14 @@ def test_untuned_call_uses_first_invariant_fallback_runner(default_mode):
 class _NoTwo(DummyRunner):
     """Graph-timed winner of make_scoped_tuner is tactic 2; call it split-K."""
 
-    def is_batch_invariant_tactic(self, tactic):
+    def is_split_free_tactic(self, tactic):
         return tactic != 2
 
 
 class _NoTwoNoDefault(_NoTwo):
-    """The untuned default (-1) is not batch-invariant either."""
+    """The untuned default (-1) splits the reduction too."""
 
-    def is_batch_invariant_tactic(self, tactic):
+    def is_split_free_tactic(self, tactic):
         return tactic not in (-1, 2)
 
 
@@ -263,36 +340,34 @@ def _v2_replay(**kwargs):
     )
 
 
-def test_managed_non_invariant_winner_is_a_reported_miss(
-    tmp_path, monkeypatch, default_mode
-):
+def test_managed_split_k_winner_is_a_reported_miss(tmp_path, monkeypatch, default_mode):
     tuner, calls = make_scoped_tuner(tmp_path, monkeypatch)
     runner = _NoTwo()
     assert _v2_tune(tuner, runner) == 2
     tuner.clear_cache()
     calls.clear()
-    set_autotune_batch_invariant(True)
+    set_autotune_exclude_split_k(True)
     report = ReplayCoverage()
     with _v2_replay(replay_report=report):
         assert _v2_choose(tuner, runner) == -1
     assert (report.hits, report.misses) == (0, 1)
-    assert report.records[0]["reasons"] == ("not_batch_invariant",)
+    assert report.records[0]["reasons"] == ("excluded_split_k",)
     # Strict replay rejects it like any other miss, without profiling.
     with (
-        pytest.raises(RuntimeError, match="not_batch_invariant"),
+        pytest.raises(RuntimeError, match="excluded_split_k"),
         _v2_replay(strict_replay=True),
     ):
         _v2_choose(tuner, runner)
     assert not calls
     # Without the mode the same store entry is still a hit.
-    set_autotune_batch_invariant(False)
+    set_autotune_exclude_split_k(False)
     tuner.clear_cache()
     with _v2_replay(strict_replay=True) as report:
         assert _v2_choose(tuner, runner) == 2
     assert report.hits == 1
 
 
-def test_retune_under_mode_publishes_invariant_winner(
+def test_retune_under_mode_publishes_split_free_winner(
     tmp_path, monkeypatch, default_mode
 ):
     tuner, calls = make_scoped_tuner(tmp_path, monkeypatch)
@@ -300,7 +375,7 @@ def test_retune_under_mode_publishes_invariant_winner(
     assert _v2_tune(tuner, runner) == 2
     tuner.clear_cache()
     calls.clear()
-    set_autotune_batch_invariant(True)
+    set_autotune_exclude_split_k(True)
     assert _v2_tune(tuner, runner) == 0
     assert all(t != 2 for _, t in calls)
     tuner.clear_cache()
@@ -309,9 +384,7 @@ def test_retune_under_mode_publishes_invariant_winner(
     assert report.hits == 1
 
 
-def test_v2_default_race_skips_non_invariant_default(
-    tmp_path, monkeypatch, batch_invariant
-):
+def test_v2_default_race_skips_split_k_default(tmp_path, monkeypatch, exclude_split_k):
     tuner, calls = make_scoped_tuner(tmp_path, monkeypatch)
     assert _v2_tune(tuner, _NoTwo()) == 0
     assert -1 in [t for _, t in calls]
@@ -330,7 +403,7 @@ import torch
 import torch.distributed as dist
 from flashinfer.autotuner import (
     AutoTuner, TunableRunner, TuningConfig, autotune,
-    set_autotune_batch_invariant, set_autotune_process_group,
+    set_autotune_exclude_split_k, set_autotune_process_group,
 )
 from flashinfer.autotuner.autotuner import _TuningGroupError
 
@@ -344,13 +417,13 @@ set_autotune_process_group(dist.group.WORLD)
 class Split(TunableRunner):
     def get_valid_tactics(self, inputs, profile):
         return [0, 1, 2]
-    def is_batch_invariant_tactic(self, tactic):
+    def is_split_free_tactic(self, tactic):
         return tactic != 1
     def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
         return inputs[0]
 
 class Plain(Split):
-    # Every candidate is invariant: the mode leaves the plan unchanged.
+    # Every candidate is split-free: the mode leaves the plan unchanged.
     def get_valid_tactics(self, inputs, profile):
         return [0, 2]
 
@@ -367,7 +440,7 @@ try:
         ("mixed", (False, True), Split),
         ("mixed_plain", (False, True), Plain),
     ):
-        set_autotune_batch_invariant(modes[rank])
+        set_autotune_exclude_split_k(modes[rank])
         tuner = AutoTuner()
         AutoTuner._instance = tuner
         failed = False

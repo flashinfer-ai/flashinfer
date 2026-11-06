@@ -825,20 +825,23 @@ class TunableRunner(ABC):
         """
         return [-1]
 
-    def is_batch_invariant_tactic(self, tactic: Any) -> bool:
-        """Whether ``tactic`` reduces each output element in the same order as
-        this runner's fallback (``tactic=-1``) at every M.
+    def is_split_free_tactic(self, tactic: Any) -> bool:
+        """Whether ``tactic`` accumulates each output element's K reduction in
+        one pass, in the same order as this runner's fallback (``tactic=-1``)
+        at every M; ``False`` for tactics that split the reduction (split-K
+        across CTAs or warps).
 
-        Under batch-invariant autotuning (see
-        :func:`set_autotune_batch_invariant`) the autotuner only selects
-        tactics for which this returns ``True``, so the result for a row does
-        not depend on which tactic won the timing race, on the rank that tuned
-        it, or on the batch size (M bucket) it ran at.
+        Under exclude-split-K autotuning (see
+        :func:`set_autotune_exclude_split_k`) the autotuner only selects
+        tactics for which this returns ``True``, so the reduction order of a
+        row does not depend on which tactic won the timing race, on the rank
+        that tuned it, or on the batch size (M bucket) it ran at.
 
-        Override it in runners whose tactic space includes tactics that split
-        the reduction differently, e.g. split-K across CTAs or warps. The
-        default trusts every tactic. ``tactic`` may come from a cache file, so
-        tuples can arrive as lists.
+        The default returns ``True`` for every tactic: a runner that does not
+        override it is *unclassified*, keeps its full tactic space under the
+        mode, and is reported once by a warning when it is tuned. Override it
+        in runners whose tactic space includes split-K tactics. ``tactic`` may
+        come from a cache file, so tuples can arrive as lists.
         """
         return True
 
@@ -1249,43 +1252,57 @@ def is_in_profile_measurement() -> bool:
 
 _tune_process_group: Optional["torch.distributed.ProcessGroup"] = None
 
-_batch_invariant: bool = os.environ.get(
-    "FLASHINFER_AUTOTUNE_BATCH_INVARIANT", "0"
+_exclude_split_k: bool = os.environ.get(
+    "FLASHINFER_AUTOTUNE_EXCLUDE_SPLIT_K", "0"
 ).lower() in ("1", "true", "yes", "on")
 
 
-def set_autotune_batch_invariant(enabled: bool) -> None:
-    """Restrict autotuning to batch-invariant tactics (process-wide).
+def set_autotune_exclude_split_k(enabled: bool) -> None:
+    """Exclude split-K tactics from autotuning (process-wide).
 
     When enabled, the autotuner only selects tactics whose runner reports
-    :meth:`TunableRunner.is_batch_invariant_tactic`, both when profiling and
+    :meth:`TunableRunner.is_split_free_tactic`, both when profiling and
     when it serves a cached result (in-memory, ``autotune(cache=...)`` file or
-    bundled config); a cached tactic that is not batch-invariant counts as a
-    cache miss. Runners whose untuned default would itself split the reduction
-    also switch to a batch-invariant default.
+    bundled config); a cached split-K tactic counts as a cache miss. Runners
+    whose untuned default would itself split the reduction also switch to a
+    split-free default.
 
-    Tactics such as split-K change the floating-point reduction order. They are
+    Scope: the guarantee is that the tactics of *classified* runners (those
+    that override ``is_split_free_tactic``) do not split the reduction, so
+    their per-M-bucket winners all reduce K in the same order. Classified
+    runners today: ``CuteDSLMxfp8GemmRunner`` and
+    ``CuteDSLMxfp8WarpSplitKRunner`` (``mm_mxfp8(backend="cute-dsl")`` on
+    SM100/SM103/SM107) and ``CutedslLowLatencyBlockscaledGemmRunner`` (the
+    ``cutedsl_low_latency`` backend of ``mm_fp8``, ``mm_mxfp8``, ``mm_fp4`` and
+    ``tgv_gemm_sm100``). Unclassified runners keep their full tactic space; the
+    first time one is tuned under the mode a warning names it. A multi-backend
+    runner list (for example ``mm_mxfp8(backend="auto")`` on SM12x: b12x,
+    cutlass, cudnn) may still pick a different runner per M bucket. This is not
+    a bit-exactness guarantee; for bit-exact results use the op-level
+    ``batch_invariant=True`` kernels instead.
+
+    Split-K tactics change the floating-point reduction order. Each is
     deterministic run to run, but the chosen tactic depends on timing noise and
     on the M bucket, so without this mode the same row can round differently
     across ranks, restarts, or batch sizes (e.g. a 27-token prefix-cache extend
-    versus a full prefill). Enable it when bitwise reproducibility matters more
-    than the last few percent of small-M GEMM speed.
+    versus a full prefill). Enable it when numerics stable across batch sizes
+    matter more than the last few percent of small-M GEMM speed.
 
-    Also enabled by ``FLASHINFER_AUTOTUNE_BATCH_INVARIANT=1``. Under
+    Also enabled by ``FLASHINFER_AUTOTUNE_EXCLUDE_SPLIT_K=1``. Under
     :func:`set_autotune_process_group` every rank must use the same setting,
     since it changes the candidate set; ranks that disagree fail the
     distributed plan check. The setting is not part of the cache key: a
     rejected entry is reported by ``ReplayCoverage`` as a miss with reason
-    ``"not_batch_invariant"`` (so ``strict_replay`` raises), and re-profiling
+    ``"excluded_split_k"`` (so ``strict_replay`` raises), and re-profiling
     it in tuning mode replaces it in the active cache. Not thread-safe.
     """
-    global _batch_invariant
-    _batch_invariant = bool(enabled)
+    global _exclude_split_k
+    _exclude_split_k = bool(enabled)
 
 
-def get_autotune_batch_invariant() -> bool:
-    """Return whether batch-invariant autotuning is enabled."""
-    return _batch_invariant
+def get_autotune_exclude_split_k() -> bool:
+    """Return whether exclude-split-K autotuning is enabled."""
+    return _exclude_split_k
 
 
 def set_autotune_process_group(
@@ -1350,7 +1367,7 @@ def _tuning_group_agreement(phase, selection, status=0, error=None):
     parent's preparation gate fails coherently rather than reducing different
     tensor sizes. Rank-local shapes and cache roots are deliberately excluded
     by callers; they need not match in an expert-parallel deployment. The
-    process-wide batch-invariant setting is part of the selection fingerprint
+    process-wide exclude-split-K setting is part of the selection fingerprint
     because it changes which tactics may be selected or served from cache.
     """
     if torch.cuda.is_current_stream_capturing():
@@ -1370,7 +1387,7 @@ def _tuning_group_agreement(phase, selection, status=0, error=None):
 
     phase_digest = digest(phase)
     try:
-        selection_digest = digest((_batch_invariant, selection))
+        selection_digest = digest((_exclude_split_k, selection))
     except Exception as exc:
         selection_digest = bytes(32)
         status = 2
@@ -1405,7 +1422,7 @@ def _check_tuning_group_phase(phase, selection=(), error=None):
     if not agreed:
         raise _TuningGroupError(
             f"Autotune group plan mismatch at {phase!r}: local selection={repr(selection)[:512]}, "
-            f"batch_invariant={_batch_invariant}"
+            f"exclude_split_k={_exclude_split_k}"
         )
 
 
@@ -1423,7 +1440,7 @@ def _sync_oom_across_tune_group(
     if not agreed:
         raise _TuningGroupError(
             f"Autotune group plan mismatch at {phase!r}: local selection={repr(selection)[:512]}, "
-            f"batch_invariant={_batch_invariant}"
+            f"exclude_split_k={_exclude_split_k}"
         )
     return False
 
@@ -1981,6 +1998,10 @@ class AutoTuner:
         # (op, runner, source) triples whose cached tactic failed
         # revalidation, so the warning fires once, not per call.
         self._logged_invalid_tactic: set[tuple[str, str, str]] = set()
+        # Runner classes already reported as unclassified under exclude-split-K
+        # autotuning (no is_split_free_tactic override), so the warning fires
+        # once per class, not per call.
+        self._warned_unclassified_runners: set[str] = set()
         # Cache-metadata mismatch severities ("hard"/"soft") already logged at
         # WARNING; repeats for further cache files are logged at DEBUG (a
         # deployment can touch dozens of cache files per process).
@@ -2181,15 +2202,15 @@ class AutoTuner:
     ) -> str | None:
         """Why a cached tactic cannot be served, or ``None`` if it can.
 
-        ``"not_batch_invariant"``: batch-invariant autotuning is enabled and
-        the runner does not report the tactic as batch-invariant.
+        ``"excluded_split_k"``: exclude-split-K autotuning is enabled and
+        the runner does not report the tactic as split-free.
         ``"invalid_tactic"``: the tactic failed :meth:`_tactic_still_valid`.
         Either way the lookup treats the entry as a cache miss; replay
         coverage reports the reason, and strict replay rejects it like any
         other miss.
         """
-        if not self._batch_invariance_allows(runner, tactic, custom_op, source):
-            return "not_batch_invariant"
+        if not self._split_k_exclusion_allows(runner, tactic, custom_op, source):
+            return "excluded_split_k"
         if not self._tactic_still_valid(
             runner,
             inputs,
@@ -2201,24 +2222,24 @@ class AutoTuner:
             return "invalid_tactic"
         return None
 
-    def _batch_invariance_allows(
+    def _split_k_exclusion_allows(
         self, runner: TunableRunner, tactic: Any, custom_op: str, source: str
     ) -> bool:
-        """False iff batch-invariant autotuning rejects this cached tactic."""
-        if not _batch_invariant:
+        """False iff exclude-split-K autotuning rejects this cached tactic."""
+        if not _exclude_split_k:
             return True
         try:
-            if runner.is_batch_invariant_tactic(tactic):
+            if runner.is_split_free_tactic(tactic):
                 return True
         except Exception:  # noqa: BLE001 -- a malformed cached tactic is a miss
             pass
-        key = (custom_op, runner.__class__.__name__, f"{source}:batch_invariant")
+        key = (custom_op, runner.__class__.__name__, f"{source}:exclude_split_k")
         if key not in self._logged_invalid_tactic:
             self._logged_invalid_tactic.add(key)
             logger.info(
                 f"[Autotuner]: ignoring cached tactic {tactic!r} for "
                 f"{custom_op} (runner={runner.__class__.__name__}, "
-                f"source={source}): not batch-invariant"
+                f"source={source}): split-K tactic excluded"
             )
         return False
 
@@ -2226,14 +2247,14 @@ class AutoTuner:
     def _fallback_runner_index(runners: list[TunableRunner]) -> int | None:
         """Index of the runner whose tactic -1 serves an untuned call.
 
-        ``0`` unless batch-invariant autotuning is enabled and ``runners[0]``
-        does not report its fallback as batch-invariant; then the first runner
+        ``0`` unless exclude-split-K autotuning is enabled and ``runners[0]``
+        does not report its fallback as split-free; then the first runner
         whose fallback is, or ``None`` if there is none.
         """
-        if not _batch_invariant:
+        if not _exclude_split_k:
             return 0
         return next(
-            (i for i, r in enumerate(runners) if r.is_batch_invariant_tactic(-1)),
+            (i for i, r in enumerate(runners) if r.is_split_free_tactic(-1)),
             None,
         )
 
@@ -2244,21 +2265,39 @@ class AutoTuner:
         index = self._fallback_runner_index(runners)
         if index is None:
             raise RuntimeError(
-                f"Batch-invariant autotuning is enabled but no runner for "
-                f"{custom_op} has a batch-invariant fallback tactic "
+                f"Exclude-split-K autotuning is enabled but no runner for "
+                f"{custom_op} has a split-free fallback tactic "
                 f"(runners={[type(r).__name__ for r in runners]}); tune this "
-                f"shape or disable set_autotune_batch_invariant"
+                f"shape or disable set_autotune_exclude_split_k"
             )
         return runners[index], -1
+
+    def _warn_if_unclassified(self, custom_op: str, runner: TunableRunner) -> None:
+        """Warn once per runner class when exclude-split-K autotuning tunes a
+        runner that does not override ``is_split_free_tactic``: its tactics
+        are not constrained by the mode."""
+        cls = type(runner)
+        if cls.is_split_free_tactic is not TunableRunner.is_split_free_tactic:
+            return
+        if cls.__name__ in self._warned_unclassified_runners:
+            return
+        self._warned_unclassified_runners.add(cls.__name__)
+        logger.warning(
+            f"[Autotuner]: exclude-split-K autotuning is enabled but runner "
+            f"{cls.__name__} (first seen for {custom_op}) does not classify "
+            f"its tactics (no is_split_free_tactic override); its tactics are "
+            f"not constrained by the mode and may still split the reduction"
+        )
 
     def _filter_candidates(
         self, custom_op: str, runner: TunableRunner, tactics: list[Any]
     ) -> list[Any]:
         """Profiling candidates after the offline blocklist and, under
-        batch-invariant autotuning, the runner's batch-invariance check."""
+        exclude-split-K autotuning, the runner's split-free check."""
         tactics = self._blocklist.filter(custom_op, runner, tactics)
-        if _batch_invariant:
-            tactics = [t for t in tactics if runner.is_batch_invariant_tactic(t)]
+        if _exclude_split_k:
+            self._warn_if_unclassified(custom_op, runner)
+            tactics = [t for t in tactics if runner.is_split_free_tactic(t)]
         return tactics
 
     @property
@@ -3111,8 +3150,8 @@ class AutoTuner:
             optimal combination based on performance measurements. It caches results
             to avoid redundant profiling of the same configuration.
             Although runners[0] with tactic=-1 is always treated as the fallback runner
-            (under batch-invariant autotuning, the first runner whose tactic=-1 is
-            batch-invariant).
+            (under exclude-split-K autotuning, the first runner whose tactic=-1 is
+            split-free).
             Runner authors are suggested to provide a fallback implementation for each runner to avoid potential issues.
         """
         # Hold the lock for the entire method.  In non-tuning mode this is a
@@ -3443,8 +3482,8 @@ class AutoTuner:
                                     and race_default
                                     and -1 not in valid_tactics
                                     and (
-                                        not _batch_invariant
-                                        or r.is_batch_invariant_tactic(-1)
+                                        not _exclude_split_k
+                                        or r.is_split_free_tactic(-1)
                                     )
                                 ):
                                     valid_tactics = [-1, *valid_tactics]
@@ -3968,10 +4007,10 @@ class AutoTuner:
             if _all_ranks_hit_cache(
                 cached is not None
                 and cached[0] == policy
-                # A shortlist ranked before batch-invariant mode was enabled
+                # A shortlist ranked before exclude-split-K mode was enabled
                 # may hold tactics the mode now rejects; re-rank it.
                 and all(
-                    self._batch_invariance_allows(runner, t, custom_op, "ranked")
+                    self._split_k_exclusion_allows(runner, t, custom_op, "ranked")
                     for t in cached[1]
                 ),
                 (type(runner).__name__, k, cached[1][:k]) if cached else None,
@@ -5515,6 +5554,7 @@ class AutoTuner:
             self._observed_cache_generations.clear()
             self._logged_file_hits.clear()
             self._logged_cache_miss_oor.clear()
+            self._warned_unclassified_runners.clear()
             self._logged_top_bucket.clear()
             self._dirty = False
             self._dirty_seq = 0

@@ -234,8 +234,8 @@ def test_low_latency_blockscaled_gemm_can_implement(
     )
 
 
-def test_low_latency_blockscaled_gemm_batch_invariant_tactics():
-    """Split-K is the runner's only batch-variant tactic family: the untuned
+def test_low_latency_blockscaled_gemm_split_free_tactics():
+    """Split-K is the runner's only non-split-free tactic family: the untuned
     default never splits K, and every tactic the mode accepts produces the
     same bits as the default."""
     _require_supported_gpu()
@@ -256,12 +256,12 @@ def test_low_latency_blockscaled_gemm_batch_invariant_tactics():
     inputs = [a, b, sfa, sfb, out, workspace, mnkl, alpha, bias]
     tactics = runner.get_valid_tactics(inputs, None)
 
-    assert runner.is_batch_invariant_tactic(-1)
-    assert runner.is_batch_invariant_tactic(None)
+    assert runner.is_split_free_tactic(-1)
+    assert runner.is_split_free_tactic(None)
     for tactic in tactics:
         expected = tactic[3] == 1
-        assert runner.is_batch_invariant_tactic(tactic) is expected, tactic
-        assert runner.is_batch_invariant_tactic(list(tactic)) is expected, tactic
+        assert runner.is_split_free_tactic(tactic) is expected, tactic
+        assert runner.is_split_free_tactic(list(tactic)) is expected, tactic
     assert any(tactic[3] > 1 for tactic in tactics)
 
     out.zero_()
