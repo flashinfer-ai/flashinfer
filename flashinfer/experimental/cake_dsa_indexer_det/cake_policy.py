@@ -919,7 +919,8 @@ class DispatchPolicy:
             other = self.block_q_l6 if three_wg else self.block_q_narrow
             ctas = max(1, int(grid))
             waves_wide = -(-units_wide // ctas)
-            waves_other = -(-(-(-int(num_queries) // other)) // ctas)
+            units_other = -(-int(num_queries) // other)
+            waves_other = -(-units_other // ctas)
             if three_wg:
                 wide = waves_other >= waves[1] * waves_wide and mean_tiles >= waves[2]
             else:
