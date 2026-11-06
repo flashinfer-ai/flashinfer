@@ -128,7 +128,7 @@
       "closure_sha256": "be78da9cf92f6390c7abce6079b23a01c20b0c417e88182f0a9dfa56899f12ea",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
-      "min_cuda": "12.8",
+      "min_cuda": "12.9",
       "name": "cake_kda_det_train_036e1c7e1dfc95a88aae_sm_100a",
       "nvcc_flags": [
         "--use_fast_math"
@@ -191,7 +191,7 @@
       "closure_sha256": "01f3800933989cb908e2d41cd308d5f1299e7c60b67b135fcd6b6872055cb482",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
-      "min_cuda": "12.8",
+      "min_cuda": "12.9",
       "name": "cake_kda_det_train_058a68a5b4d89c53be4b_sm_100a",
       "nvcc_flags": [
         "--use_fast_math"
@@ -842,7 +842,7 @@
       "closure_sha256": "36e389cfe8bb3e87d3283b12f2ca6344d53605eb8f9ccd77e971630e669e98a9",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
-      "min_cuda": "12.8",
+      "min_cuda": "12.9",
       "name": "cake_kda_det_train_1f9c46f98f4290ee26df_sm_100a",
       "nvcc_flags": [
         "--use_fast_math"
@@ -968,7 +968,7 @@
       "closure_sha256": "e2adf85405786dba245894592541739d1dfd8b13d9b7b2559a3f3673a51a9221",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
-      "min_cuda": "12.8",
+      "min_cuda": "12.9",
       "name": "cake_kda_det_train_22812d87c26b53a1ba10_sm_100a",
       "nvcc_flags": [
         "--use_fast_math"
@@ -1031,7 +1031,7 @@
       "closure_sha256": "290ff01688dfddc78f3b3aedf13ca2b8f3cb3a9d5a2031611d20888a16fb1916",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
-      "min_cuda": "12.8",
+      "min_cuda": "12.9",
       "name": "cake_kda_det_train_22a2f04d41df18554b84_sm_100a",
       "nvcc_flags": [
         "--use_fast_math"
@@ -1094,7 +1094,7 @@
       "closure_sha256": "e169902bb5fffbab95950d7fd24116403986df3abb89fd1190a802c96013de7f",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
-      "min_cuda": "12.8",
+      "min_cuda": "12.9",
       "name": "cake_kda_det_train_243fb0b23aea1b296ab6_sm_100a",
       "nvcc_flags": [
         "--use_fast_math"
@@ -1367,7 +1367,7 @@
       "closure_sha256": "fb9a5b5ed6a3a643c231bff18c0274bae18ad4d1a309773bebc176decb9997bb",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
-      "min_cuda": "12.8",
+      "min_cuda": "12.9",
       "name": "cake_kda_det_train_3712054f19d4180caa28_sm_100a",
       "nvcc_flags": [
         "--use_fast_math"
@@ -1577,7 +1577,7 @@
       "closure_sha256": "e47e8b8db302377a0fa3f1e57ffed611dad307b53fabc4babb91780de18be8d1",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
-      "min_cuda": "12.8",
+      "min_cuda": "12.9",
       "name": "cake_kda_det_train_3f4b037a0a1f8dcc314b_sm_100a",
       "nvcc_flags": [
         "--use_fast_math"
@@ -1766,7 +1766,7 @@
       "closure_sha256": "85e7e25b555d9017a2e3b18fbcb3d3c3a9d99dfdb183e1b34ba860ac52c24c62",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
-      "min_cuda": "12.8",
+      "min_cuda": "12.9",
       "name": "cake_kda_det_train_4734a5d4f63d815ec086_sm_100a",
       "nvcc_flags": [
         "--use_fast_math"
@@ -1913,7 +1913,7 @@
       "closure_sha256": "ad53bdf6062f0005d086416f3425a74249b1d5e21ef02bda36f4c917eeed3ecf",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
-      "min_cuda": "12.8",
+      "min_cuda": "12.9",
       "name": "cake_kda_det_train_4cce3cc5bc6210c95ce3_sm_100a",
       "nvcc_flags": [
         "--use_fast_math"
@@ -2102,7 +2102,7 @@
       "closure_sha256": "d5c36ecaff1392e62c22eda675af29ac282f1403e598f0b5090ea967fd4a3f01",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
-      "min_cuda": "12.8",
+      "min_cuda": "12.9",
       "name": "cake_kda_det_train_5f5a5b3715675e083823_sm_100a",
       "nvcc_flags": [
         "--use_fast_math"
@@ -2165,7 +2165,7 @@
       "closure_sha256": "91178a228e0de03ef823845d47c1bf808a0d5d911203ce2963ef29688b26af5d",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
-      "min_cuda": "12.8",
+      "min_cuda": "12.9",
       "name": "cake_kda_det_train_5fcc76904e5e2dd891de_sm_100a",
       "nvcc_flags": [
         "--use_fast_math"
@@ -2354,7 +2354,7 @@
       "closure_sha256": "d0677903f801235cc735df70a4571e4882e3cc034c6ff7de2ac25a6c8edbcf2a",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
-      "min_cuda": "12.8",
+      "min_cuda": "12.9",
       "name": "cake_kda_det_train_706240be56d4e41df1a2_sm_100a",
       "nvcc_flags": [
         "--use_fast_math"
@@ -2669,7 +2669,7 @@
       "closure_sha256": "f1548497bb1c39094345d5e758e50544837610c16dd8a5aff7c385f83195952f",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
-      "min_cuda": "12.8",
+      "min_cuda": "12.9",
       "name": "cake_kda_det_train_7eca60b36e233943dae6_sm_100a",
       "nvcc_flags": [
         "--use_fast_math"
@@ -2984,7 +2984,7 @@
       "closure_sha256": "cf5e6f417b179ed37d478f879334ff5e82403160993eb2100d7a67310f9b1e5c",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
-      "min_cuda": "12.8",
+      "min_cuda": "12.9",
       "name": "cake_kda_det_train_898a1eb972fbaf55789a_sm_100a",
       "nvcc_flags": [
         "--use_fast_math"
@@ -3047,7 +3047,7 @@
       "closure_sha256": "86bc258e380620ba45b64d1fe29d21b829fb1983741d571e3e8aebf3699109e5",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
-      "min_cuda": "12.8",
+      "min_cuda": "12.9",
       "name": "cake_kda_det_train_8ab0929b8154c90b5eff_sm_100a",
       "nvcc_flags": [
         "--use_fast_math"
@@ -3362,7 +3362,7 @@
       "closure_sha256": "8c570885d73c86a9054988b8b792cb95c00a507716ed78a11513bc42e1b4a984",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
-      "min_cuda": "12.8",
+      "min_cuda": "12.9",
       "name": "cake_kda_det_train_909a0aa57efb3f353972_sm_100a",
       "nvcc_flags": [
         "--use_fast_math"
@@ -3488,7 +3488,7 @@
       "closure_sha256": "7dbb4035f2c693851c8c7f15824acc32b42d3c65a5036ccecda66da5dd87b23f",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
-      "min_cuda": "12.8",
+      "min_cuda": "12.9",
       "name": "cake_kda_det_train_945a87fa84a265fc9f94_sm_100a",
       "nvcc_flags": [
         "--use_fast_math"
@@ -3677,7 +3677,7 @@
       "closure_sha256": "6ac7a7e3d9cf4572c7069a549540381c74954b1356fff208cd3713772e7e16e7",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
-      "min_cuda": "12.8",
+      "min_cuda": "12.9",
       "name": "cake_kda_det_train_9931cdff5dfd86c687c7_sm_100a",
       "nvcc_flags": [
         "--use_fast_math"
@@ -3824,7 +3824,7 @@
       "closure_sha256": "f48e9fc3ec2e1e6ea7367e9c68bb1d65222329ab95a2f311ee5e21b85953a0b1",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
-      "min_cuda": "12.8",
+      "min_cuda": "12.9",
       "name": "cake_kda_det_train_a557058a8aeca49a6402_sm_100a",
       "nvcc_flags": [
         "--use_fast_math"
@@ -3971,7 +3971,7 @@
       "closure_sha256": "0d270842881dfb70f68fa4a8e648163de22f0b7cfa96e436080d5d10f5017a36",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
-      "min_cuda": "12.8",
+      "min_cuda": "12.9",
       "name": "cake_kda_det_train_ac974e171d56fc3ce10b_sm_100a",
       "nvcc_flags": [
         "--use_fast_math"
@@ -4622,7 +4622,7 @@
       "closure_sha256": "08b1943d3b751202f87afd37d466ef82f4161f19dadbaeddfecec3ca744373d8",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
-      "min_cuda": "12.8",
+      "min_cuda": "12.9",
       "name": "cake_kda_det_train_d32455627b87ba0a1d87_sm_100a",
       "nvcc_flags": [
         "--use_fast_math"
@@ -4811,7 +4811,7 @@
       "closure_sha256": "c64f17ffdd12bee3c4a4e1b930d146e6d7abde8a3802e40d039ef99887613ac9",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
-      "min_cuda": "12.8",
+      "min_cuda": "12.9",
       "name": "cake_kda_det_train_dec885b973bd44f88416_sm_100a",
       "nvcc_flags": [
         "--use_fast_math"
@@ -5063,7 +5063,7 @@
       "closure_sha256": "10c66cfb894c37ef5f81e7cda989d7fa3b50558497c449d6414861afa81c3201",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
-      "min_cuda": "12.8",
+      "min_cuda": "12.9",
       "name": "cake_kda_det_train_e60e7ca5d88192193e61_sm_100a",
       "nvcc_flags": [
         "--use_fast_math"
@@ -5315,7 +5315,7 @@
       "closure_sha256": "b30e9a22c26b09d6b4561307e4525f8f6a90944caa71989462e3624edd5ab86a",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
-      "min_cuda": "12.8",
+      "min_cuda": "12.9",
       "name": "cake_kda_det_train_eac26fffb3df8780302c_sm_100a",
       "nvcc_flags": [
         "--use_fast_math"
@@ -5378,7 +5378,7 @@
       "closure_sha256": "05ec3212fb39e9b1e8d81a29c8e6b5ff101bfc3c74a98f34ace71d031401ebb2",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
-      "min_cuda": "12.8",
+      "min_cuda": "12.9",
       "name": "cake_kda_det_train_f011cd9add8f3c7c3eee_sm_100a",
       "nvcc_flags": [
         "--use_fast_math"
@@ -5504,7 +5504,7 @@
       "closure_sha256": "925f0e20f2aa1d2b2e4eff092eaf4552651afa913c5d9a86d518deedd9d7ccc2",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
-      "min_cuda": "12.8",
+      "min_cuda": "12.9",
       "name": "cake_kda_det_train_f6a70fb0288a508f2828_sm_100a",
       "nvcc_flags": [
         "--use_fast_math"
@@ -5630,7 +5630,7 @@
       "closure_sha256": "f8a8577c36e3970ab36ec45b8f0686e2522826e35ac4b6227ce9fcf508e220e6",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
-      "min_cuda": "12.8",
+      "min_cuda": "12.9",
       "name": "cake_kda_det_train_f92b256cccc2c9007554_sm_100a",
       "nvcc_flags": [
         "--use_fast_math"
