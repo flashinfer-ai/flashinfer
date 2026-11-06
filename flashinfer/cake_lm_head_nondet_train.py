@@ -17,11 +17,17 @@ Cake non-deterministic LM-head + loss training entries (SM100 / SM103 /
 SM107): the chunked LM-head projection with a cross-entropy or policy
 objective, its per-row log-probabilities, and the log-probabilities / KL over
 a ragged candidate support.  The same computation, arguments and precision
-boundaries as the deterministic module ``flashinfer.cake_lm_head_det_train``,
-with one relaxation: each K slice of a sliced dX GEMM is added straight into
-the FP32 ``dX`` accumulator by an unordered FP32 reduction, so ``dX`` is not
-bitwise reproducible run to run (``loss``, ``logp`` and ``dW`` keep their
-fixed order).
+boundaries as the deterministic module ``flashinfer.cake_lm_head_det_train``.
+Each K slice of a sliced dX GEMM is added straight into the FP32 ``dX``
+accumulator by an unordered FP32 reduction, so ``dX`` is not bitwise
+reproducible run to run (``loss``, ``logp`` and ``dW`` keep their fixed
+order).  Two row skips of this backend also differ from the deterministic
+module: zero-weight policy rows and log-probability rows with a zero ``dlogp``
+leave the gradient GEMMs, so ``loss`` / ``dW`` bits may differ from the
+deterministic module's within the accuracy budgets, and a non-finite value in
+a zero-weight row does not reach ``loss`` / ``dX`` / ``dW``.  The backend
+README lists the output differences ("Zero-weight policy rows" and
+"Zero-gradient rows of the log-probability backward").
 
 Entries: :func:`cake_lm_head_nondet_train_loss`,
 :func:`cake_lm_head_nondet_train_logprob`,
@@ -128,10 +134,11 @@ def cake_lm_head_nondet_train_loss(
     r"""Differentiable chunked LM-head projection + loss with a memory-bounded
     backward and an unordered dX reduction, SM100 / SM103 / SM107 only.
 
-    The computation, the arguments, the switches and their
+    See :func:`flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_loss`
+    for the computation, the arguments, the switches and their
     ``FLASHINFER_CAKE_LM_HEAD_LOSS_*`` fallbacks, ``memory_mode``,
-    ``num_valid_rows`` and the outputs are those of
-    :func:`flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_loss`.
+    ``num_valid_rows`` and the outputs, except as the module docstring notes
+    (the dX reduction and the zero-weight row split).
 
     Notes
     -----
@@ -251,9 +258,10 @@ def cake_lm_head_nondet_train_logprob(
     r"""Differentiable chunked selected-token log-probability with an
     unordered dX reduction, SM100 / SM103 / SM107 only.
 
-    The computation and the arguments (``memory_mode="keep_logits"``,
-    ``temperature`` and ``check_temperature`` included) are those of
-    :func:`flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_logprob`.
+    See :func:`flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_logprob`
+    for the computation and the arguments (``memory_mode="keep_logits"``,
+    ``temperature`` and ``check_temperature`` included), except as the module
+    docstring notes (the dX reduction and the zero-gradient row skip).
     The backward adds each K slice of a sliced dX GEMM into the FP32 ``dX``
     accumulator by an unordered FP32 reduction (``logp`` keeps its fixed
     order); torch's deterministic mode raises PyTorch's alert before that
@@ -261,8 +269,10 @@ def cake_lm_head_nondet_train_logprob(
     temperature the backend runs the same temperature forms (``logp`` the
     deterministic entry's bits, ``dW`` too when no valid row has a zero
     ``dlogp``; ``dX`` the same products, a sliced chunk's in the unordered
-    reduction).  ``None`` and a Python number whose FP32 value is 1.0 run the
-    call without a temperature; a ``bool`` is a ``ValueError``.
+    reduction).  The zero-gradient row skip runs the dX / dW GEMMs of the rows
+    with a nonzero ``dlogp`` only, with or without a temperature.  ``None``
+    and a Python number whose FP32 value is 1.0 run the call without a
+    temperature; a ``bool`` is a ``ValueError``.
     """
     if backend != "cake":
         raise ValueError(
@@ -342,10 +352,9 @@ def cake_lm_head_nondet_train_preload(
     r"""Do part of the one-time work of a process's first chunked LM-head call
     ahead of it, then wait for the device once (SM100 / SM103 / SM107 only).
 
-    The work of
-    :func:`flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_preload`
-    for this backend, whose libraries and per-device state the other entries
-    use.  The per-thread state (side streams, events, count cells) is the
+    See :func:`flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_preload`
+    for the work; here it is done for this backend, whose libraries and
+    per-device state the other entries use.  The per-thread state (side streams, events, count cells) is the
     calling thread's: another thread forms its own at its first call.
     ``temperature=True`` also loads the backend's temperature libraries and
     launches its temperature path's PyTorch operators once.
@@ -375,8 +384,8 @@ def cake_lm_head_nondet_train_support_logprob(
     r"""Differentiable log-probabilities over a ragged candidate support per
     token, SM100 / SM103 / SM107 only.
 
-    The computation and the arguments are those of
-    :func:`flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_support_logprob`.
+    See :func:`flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_support_logprob`
+    for the computation and the arguments.
     The entry makes no run-to-run bitwise promise for the gradients: its
     backward raises PyTorch's alert under torch's deterministic mode before a
     dense dX of more than one K slice (with ``warn_only=True`` it warns and
@@ -418,9 +427,9 @@ def cake_lm_head_nondet_train_support_kl(
     r"""Unreduced forward KL from a detached teacher over a ragged candidate
     support, SM100 / SM103 / SM107 only.
 
-    The computation and the arguments are those of
-    :func:`flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_support_kl`;
-    the gradients as in :func:`cake_lm_head_nondet_train_support_logprob`.
+    See :func:`flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_support_kl`
+    for the computation and the arguments; the gradients are as in
+    :func:`cake_lm_head_nondet_train_support_logprob`.
     """
     if backend != "cake":
         raise ValueError(
