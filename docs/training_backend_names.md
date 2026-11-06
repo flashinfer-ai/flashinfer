@@ -5,11 +5,99 @@ backward for fixed inputs, hardware, execution plan and initial accumulation
 buffers. It does not promise identical bits across shapes, devices, reduction
 plans or parallel partitions. `kcp` is the suffix for a context-parallel route.
 
+The rules and the target table below are the naming scheme for every CAKE
+training family (FlashInfer issue #8928). Families move to it one per PR; until
+a family's rename lands, the current names listed in its section below stay in
+effect. `nondet` marks a package whose forward or backward does not promise
+run-to-run bitwise results.
+
+## Naming rules
+
+1. **Module:** `flashinfer.cake_<op>_<mode>_train[_kcp]`. `mode` is `det` or `nondet`.
+   - The public facade module always sits at the top level of `flashinfer`.
+   - The backend package always sits at `flashinfer/experimental/cake/<module>/`.
+2. **Autograd functional:** `cake_<op>_<mode>[_kcp]`.
+3. **Autograd class:** `Cake<Op><Mode>[Kcp]Function`.
+4. **Other functions:** the module name plus `_<verb>`, for example `_forward`, `_backward`, `_forward_workspace_bytes`, `_partition` or `_build_context`.
+   - Use `forward` / `backward`, never `fwd` / `bwd`.
+5. **Support query:** `is_<module>_supported`.
+6. **Types:** `Cake<Op><Mode>[Kcp]<Noun>`, for example `CakeKDADetKcpContext`.
+7. **Mode is part of the name, and only of the name:**
+   - No entry point takes `deterministic=`.
+   - No public name lacks a mode word. This includes families that have only one implementation today.
+8. **`torch.use_deterministic_algorithms(True)`:**
+   - A `nondet` entry raises PyTorch's alert at its non-deterministic step. With `warn_only=True` it warns and runs `nondet`. It never falls back to `det`.
+   - `det` entries never alert.
+9. **No aliases or shims for the old names.** Old names fail at import.
+10. **Order of the name parts:** `op` → `mode` → `train` → `kcp` → verb.
+    - The mode is the primary choice: it selects the package and the kernels. KCP is a variant within each mode.
+    - All entries of one package share one prefix, such as `cake_kda_det_train_kcp_`.
+
+## Target names
+
+Module names are under `flashinfer.`. "Planned" marks versions that do not exist yet and will be added later under the same names.
+
+| Family | Mode | Route | Module | Autograd entry | Autograd class | Current name |
+|---|---|---|---|---|---|---|
+| RMSNorm | det | single rank | `cake_rmsnorm_det_train` | `cake_rmsnorm_det` | `CakeRMSNormDetFunction` | unchanged |
+| | nondet | single rank | `cake_rmsnorm_nondet_train` | `cake_rmsnorm_nondet` | `CakeRMSNormNondetFunction` | `cake_rmsnorm_train` / `cake_rmsnorm` |
+| SiLU-gated RMSNorm | det | single rank | `cake_rmsnorm_silu_gate_det_train` | `cake_rmsnorm_silu_gate_det` | `CakeRMSNormSiLUGateDetFunction` | unchanged |
+| | nondet | single rank | `cake_rmsnorm_silu_gate_nondet_train` | `cake_rmsnorm_silu_gate_nondet` | `CakeRMSNormSiLUGateNondetFunction` | `cake_rmsnorm_silu_gate_train` / `cake_rmsnorm_silu_gate` |
+| causal conv1d | det | single rank | `cake_causal_conv1d_det_train` | `cake_causal_conv1d_det` | `CakeCausalConv1dDetFunction` | unchanged |
+| | det | KCP | `cake_causal_conv1d_det_train_kcp` | `cake_causal_conv1d_det_kcp`, `cake_causal_conv1d_det_kcp_multi` | `CakeCausalConv1dDetKcpFunction`, `CakeCausalConv1dDetKcpMultiFunction` | `cake_causal_conv1d_det_kcp`, `cake_causal_conv1d_det_multi_kcp`, `CakeCausalConv1dDetFunctionKcp` |
+| | nondet | single rank | `cake_causal_conv1d_nondet_train` | `cake_causal_conv1d_nondet` | `CakeCausalConv1dNondetFunction` | `experimental.cake.cake_causal_conv1d_train` / `cake_causal_conv1d` |
+| | nondet | KCP | `cake_causal_conv1d_nondet_train_kcp` | `cake_causal_conv1d_nondet_kcp`, `cake_causal_conv1d_nondet_kcp_multi` | `CakeCausalConv1dNondetKcpFunction`, `CakeCausalConv1dNondetKcpMultiFunction` | `cake_causal_conv1d_train_kcp` / `cake_causal_conv1d_kcp`, `cake_causal_conv1d_multi_kcp` |
+| mHC | det | single rank | `cake_mhc_det_train` | `cake_mhc_det_train_prepare`, `cake_mhc_det_train_finish` | `CakeMHCDetPrepareFunction`, `CakeMHCDetFinishFunction` | functions unchanged; classes `CakeMHCDetTrain*Function` |
+| | nondet | single rank | `cake_mhc_nondet_train` | `cake_mhc_nondet_train_prepare`, `cake_mhc_nondet_train_finish` | `CakeMHCNondetPrepareFunction`, `CakeMHCNondetFinishFunction` | `experimental.cake.cake_mhc_train` / `cake_mhc_train_*` |
+| mHC head | det | single rank | `cake_mhc_head_det_train` | `cake_mhc_head_det` | `CakeMHCHeadDetFunction` | `cake_mhc_det_train_head` / `CakeMHCDetTrainHeadFunction` |
+| | nondet | single rank | `cake_mhc_head_nondet_train` | `cake_mhc_head_nondet` | `CakeMHCHeadNondetFunction` | planned |
+| GDN | det | single rank | `cake_gdn_det_train` (new top-level facade) | `cake_gdn_det` | `CakeGDNDetFunction` | `experimental.cake_gdn_det_train` / `chunk_gated_delta_rule_det` |
+| | det | KCP | `cake_gdn_det_train_kcp` | `cake_gdn_det_kcp` | `CakeGDNDetKcpFunction` | `chunk_gdn_det_kcp` / `ChunkGDNDetFunctionKcp` |
+| | nondet | single rank | `cake_gdn_nondet_train` | `cake_gdn_nondet` | `CakeGDNNondetFunction` | `experimental.cake.cake_gdn_train` / `chunk_gated_delta_rule(deterministic=False)` |
+| | nondet | KCP | `cake_gdn_nondet_train_kcp` | `cake_gdn_nondet_kcp` | `CakeGDNNondetKcpFunction` | `cake_gdn_train_kcp` / `chunk_gdn_kcp` |
+| KDA | det | single rank | `cake_kda_det_train` | `cake_kda_det` | `CakeKDADetFunction` | `chunk_kda_det` / `ChunkKDADetFunction` |
+| | det | KCP | `cake_kda_det_train_kcp` | `cake_kda_det_kcp` | `CakeKDADetKcpFunction` | `chunk_kda_det_kcp` / `ChunkKDADetFunctionKcp` |
+| | nondet | single rank | `cake_kda_nondet_train` | `cake_kda_nondet` | `CakeKDANondetFunction` | `cake_kda_train` selector and `experimental.cake.cake_kda_train` / `chunk_kda` |
+| | nondet | KCP | `cake_kda_nondet_train_kcp` | `cake_kda_nondet_kcp` | `CakeKDANondetKcpFunction` | `cake_kda_train_kcp` / `chunk_kda_kcp` |
+| LM head | det | single rank | `cake_lm_head_det_train` | `cake_lm_head_det_train_loss`, `cake_lm_head_det_train_logprob`, `cake_lm_head_det_train_support_logprob`, `cake_lm_head_det_train_support_kl` | per entry, by rule 3 | `chunked_lm_head_det_*` |
+| | nondet | single rank | `cake_lm_head_nondet_train` | `cake_lm_head_nondet_train_loss` and the other three entries | per entry, by rule 3 | `chunked_lm_head_*(deterministic=False)` |
+| MoE grouped GEMM | det | single rank | `cake_moe_grouped_gemm_det_train` | `cake_moe_grouped_gemm_det` | `CakeMoEGroupedGemmDetFunction` | `cake_grouped_det_mm` / `CakeGroupedDetMm` |
+| | nondet | single rank | `cake_moe_grouped_gemm_nondet_train` | `cake_moe_grouped_gemm_nondet` | `CakeMoEGroupedGemmNondetFunction` | `cake_grouped_mm` |
+| dense GEMM | det | single rank | `cake_dense_gemm_det_train` | `cake_dense_gemm_det_train_projection`, `cake_dense_gemm_det_train_router` | per entry, by rule 3 | `dense_projection_det_gemm`, `router_fp32_det_gemm` |
+| | nondet | single rank | `cake_dense_gemm_nondet_train` | `cake_dense_gemm_nondet_train_projection`, `cake_dense_gemm_nondet_train_router` | per entry, by rule 3 | `experimental.dense_projection_gemm` `cake_backend` |
+| DSA indexer | det | single rank | `cake_dsa_indexer_det_train` | entries renamed by the rules | | `experimental.cake_dsa_indexer_det` |
+| | nondet | single rank | `cake_dsa_indexer_nondet_train` | | | planned |
+| DSA sparse attention | det | single rank | `cake_dsa_sparse_attention_det_train` | | | planned |
+| | nondet | single rank | `cake_dsa_sparse_attention_nondet_train` | entries renamed by the rules | | `experimental.cake_dsa_train` |
+| GQA HD256 | det | single rank | `cake_gqa_det_train` | `cake_gqa_det` | `CakeGQADetFunction` | planned |
+| | nondet | single rank | `cake_gqa_nondet_train` | `cake_gqa_nondet` | `CakeGQANondetFunction` | `gqa_train` / `varlen_gqa_attention` |
+
+### KCP entries: KDA det as the example
+
+GDN and conv1d use the same pattern with their own stem. For `nondet`, replace `det` with `nondet`.
+
+| Current | New |
+|---|---|
+| `chunk_kda_det_fwd_kcp` / `chunk_kda_det_bwd_kcp` | `cake_kda_det_train_kcp_forward` / `cake_kda_det_train_kcp_backward` |
+| `partition_det_kcp` | `cake_kda_det_train_kcp_partition` |
+| `build_context_det_kcp` | `cake_kda_det_train_kcp_build_context` |
+| `kda_det_workspace_bytes_kcp` / `kda_det_saved_bytes_kcp` / `kda_det_comm_bytes_kcp` | `cake_kda_det_train_kcp_workspace_bytes` / `cake_kda_det_train_kcp_saved_bytes` / `cake_kda_det_train_kcp_comm_bytes` |
+| `reduce_gate_param_grads_det_kcp` | `cake_kda_det_train_kcp_reduce_gate_param_grads` |
+| `ContextDetKcp`, `PartitionDetKcp`, `WorkspaceDetKcp`, `SavedDetKcp`, `RecomputeHandleDetKcp` | `CakeKDADetKcpContext`, `CakeKDADetKcpPartition`, `CakeKDADetKcpWorkspace`, `CakeKDADetKcpSaved`, `CakeKDADetKcpRecomputeHandle` |
+
+## Decisions
+
+- **GDN `nondet` stays.** Today it is fixed-order in practice; its contract does not promise run-to-run bits.
+- **mHC head becomes its own family.** It ships `det` now; `nondet` is planned.
+- **Missing versions keep their reserved names:** mHC head `nondet`, DSA indexer `nondet`, DSA sparse attention `det` and GQA `det`.
+
+## Current names
+
 | Training family | Canonical backend / route name |
 | --- | --- |
 | LM head + loss | `cake_lm_head_det_loss` (deterministic); `cake.cake_lm_head_loss` (non-deterministic) |
 
-## LM head + loss
+### LM head + loss
 
 | Canonical name | Name before the `det` naming (alias) |
 | --- | --- |
@@ -37,7 +125,7 @@ keep their names. Generated CUDA symbols and content-addressed library
 identifiers are build identities; they do not establish the operator's
 determinism contract.
 
-## LM head + loss: non-deterministic package
+### LM head + loss: non-deterministic package
 
 The non-deterministic package `flashinfer.experimental.cake.cake_lm_head_loss`
 keeps every precision boundary of the deterministic package (BF16 logits and
