@@ -142,15 +142,19 @@ s[t, j] = k_scale[j] * sum_h w[t, h] * relu(sum_d q[t, h, d] * k[j, d])
   `split_narrow` and `split_l6` scan programs, each with its longest-first
   segment order copy (`:lsf`), and also the unpaired `wide`
   program (8 queries per unit, tile unroll 2) with its `:lsf` copy;
-  `sm_107a` registers `narrow`, `l6`, `split_narrow` and the unpaired `wide`
-  program (tile unroll 2), without `:lsf` copies.  Keys carry the
-  form tag before the order suffix: `scan:<kind>:u<n>:s0:f1:fp8[:lsf]`.  The
+  `sm_107a` registers `narrow`, `l6` with its snake unit order copy,
+  `split_narrow` and the unpaired `wide` program (tile unroll 2), without
+  `:lsf` copies.  Keys carry the form tag before the order suffix:
+  `scan:<kind>:u<n>:s<0|1>:f1:fp8[:lsf]`, `s1` only for the `sm_107a` `l6`
+  snake program.  The
   merge and finalize programs are the BF16 form's.  Launches are non-PDL and
   non-cooperative, like BF16.
 * **Dispatch**: the architecture's FP8 record is its BF16 `POLICY` record with
   the fields of `cake_jit.POLICY_FP8[arch]` replaced
   (`cake_policy.fp8_policy_record`); `POLICY_FP8` names every architecture's
-  FP8 `static_scan_kinds` itself.
+  FP8 `static_scan_kinds` itself.  On `sm_100a` it also sets
+  `wide_wave_rule`, so the FP8 form chooses its wide unit by waves of the
+  grid (the unit geometry rule below).
   `cake_policy.select_fp8_program` runs the BF16 decision procedure under it
   and maps the decided kind to a registered FP8 kind: its own where an FP8
   program of it is registered (`wide` on `sm_100a`, `sm_103a` and `sm_107a`),
@@ -158,7 +162,11 @@ s[t, j] = k_scale[j] * sum_h w[t, h] * relu(sum_d q[t, h, d] * k[j, d])
   -> `l6`, the largest FP8 unit below `wide`, `pair_narrow` -> `narrow`,
   `split_wide` -> `split_narrow`, and `split_l6` -> `split_narrow` where no
   FP8 `split_l6` program is registered); the program
-  runs without a CTA pair, in the plain unit order, in its sampled-fit form,
+  runs without a CTA pair, in the plain unit order (the snake order where
+  the decision takes it, the snake copy of the FP8 program is registered
+  and the call stays within the FP8 record's `snake_cap_rule`: the `l6`
+  program on `sm_107a`, for one document within 40 waves of the persistent
+  grid), in its sampled-fit form,
   with the decided tile unroll where an FP8 program of it is registered
   (else the smallest registered one) and in the longest-first order where
   the BF16 rule picks it and an FP8 copy exists.  A fallback kind takes its
@@ -183,7 +191,11 @@ s[t, j] = k_scale[j] * sum_h w[t, h] * relu(sum_d q[t, h, d] * k[j, d])
   the narrow fallback.  An FP8 buffer sized for such a call under an
   earlier, smaller fallback (`narrow`, and for a `wide` decision also `l6`)
   is rejected (`workspace_buffer needs N bytes`) and must be sized again
-  with this function.
+  with this function.  On `sm_100a` the FP8 wave rule (`wide_wave_rule`)
+  gives more calls the 8-query `wide` unit than the BF16 rule does; their FP8
+  bound grows with the queries per unit (8 rather than the `narrow` unit's 4
+  or the `l6` unit's 6), and a buffer sized for such a call under the
+  previous package is rejected the same way.
 * **Prepared runners** bind `k_scale` with `q` / `k`: new values written into
   it are read by the next run.
 
@@ -256,12 +268,12 @@ mean key tiles per work unit, `(Tkv - T / (2 ratio)) / S / 128`.
 
 | decision | rule (record fields) |
 |---|---|
-| unit geometry | `block_q_wide` queries per unit first where the record sets `wide_first_rule`, the call is wide-eligible (at least `wide_rule[0]` wide rounds per CTA and `rounds x mean tiles >= wide_rule[1]`) and the mean unit tiles reach `wide_first_rule[0]`; else `block_q_l6` (three math warpgroups) when the mean unit tiles are at most `l6_rule[0]` and `top_k >= l6_rule[1]`; else `block_q_wide` when wide-eligible; else `block_q_narrow` |
+| unit geometry | where the record sets `wide_wave_rule` (the FP8 record of `sm_100a`), it replaces `wide_rule` and `wide_first_rule`: `block_q_wide` queries per unit when the unit the `l6_rule` leaves (`block_q_l6`, else `block_q_narrow`) needs at least `wide_wave_rule[1]` times the wide unit's waves of the grid (`ceil(ceil(T / block_q) / grid)`) against `block_q_l6`, from `wide_wave_rule[2]` mean unit tiles on, or `wide_wave_rule[0]` times against `block_q_narrow`; else that unit.  Without it: `block_q_wide` queries per unit first where the record sets `wide_first_rule`, the call is wide-eligible (at least `wide_rule[0]` wide rounds per CTA and `rounds x mean tiles >= wide_rule[1]`) and the mean unit tiles reach `wide_first_rule[0]`; else `block_q_l6` (three math warpgroups) when the mean unit tiles are at most `l6_rule[0]` and `top_k >= l6_rule[1]`; else `block_q_wide` when wide-eligible; else `block_q_narrow` |
 | key-range split | `n_split = clamp(grid // units, 1, min(mean tiles // split_min_range_tiles, split_max))`; on architectures with `split_wave_rule` a two-way split when the units are long and the unsplit call would idle `split_wave_rule[1]` of the CTAs in its ragged last round (where the record sets `split_wave_scope` (sm_107a), only for its unit geometries on calls of at most its segment count, and with its third item on sampled calls only); only for a unit geometry of `split_units` (the units whose split program the architecture registers): any other unit runs unsplit |
 | CTA pair | the two-CTA multicast program when the mean unit tiles lie in `pair_rule[0..1]`, `top_k >= pair_rule[2]`, the call is not split (grid made even) and the unit geometry is one of `pair_units` (the units whose pair program the architecture registers) |
 | unpaired wide unit | where the record sets `wide_pair_snake_only` (sm_107a), a sampled call keeps the CTA pair of the wide unit only where the pair program walks the snake order; elsewhere it runs the unpaired wide program when that program is registered |
 | unpaired three-warpgroup preference | a call whose plan does not split takes the `block_q_l6` unit without a CTA pair: with the sampled first threshold off (`sample_tiles_max=0`), where the record sets `l6_solo_unsampled_max_queries` (sm_100a, sm_103a: 16384) only a call planned on the CTA-pair l6 unit of at most that many queries (other units keep their plan), else always where the record sets `l6_solo_rule` (sm_107a); on a sampled call, where the record sets `l6_solo_rule`, with at least `l6_solo_rule[1]` segments or at most `l6_solo_rule[0]` mean unit tiles; only where the l6 unit would not split either and the program it picks is registered (`PROGRAM_KEYS[arch]`, which the backend passes to `select_program`; without it the preference stays off), else the plan of the rows above |
-| unit order | snake order when `snake_rule` names the program kind and the mean tiles / unit-cost spread reach its floors |
+| unit order | snake order when `snake_rule` names the program kind and the mean tiles / unit-cost spread reach its floors; an FP8 call runs a snake program only within `snake_cap_rule` [max segments, max waves of the persistent grid] (the FP8 record of `sm_107a`: [1, 40]; None elsewhere) |
 | tile-loop unroll | `tile_unroll_factor` when `tile_unroll_rule` names the program kind and `top_k` reaches its floor (yielding to the snake order where the rule says so) |
 | sampled first threshold on buffer-fitting units | when the mean unit tiles are at most `sample_fit_max_mean_tiles`, the mean segment offset leaves fitting units and the program kind is one of `sample_fit_kinds` (the kinds whose sampled-fit program the architecture registers; the split programs, for example, run their plain form on every call) |
 | sampled rank shift | `sample_shift_rule[1]` permille where the record sets `sample_shift_rule` and `top_k >= sample_shift_rule[0]`, else `sample_shift_permille`; an explicit `sample_shift_permille=` knob overrides both.  A launch scalar only: it sets how conservative the sampled first threshold is (a threshold that proves too aggressive is streamed again exactly), never the program, the capacity or an output bit; unsampled calls (`sample_tiles_max=0`) do not read it |
@@ -293,7 +305,12 @@ that writes the registry verifies the record against them before it is frozen.
   package needed 114 / 228 MiB (119537664 / 239075328 B); a reused buffer
   sized under the previous package for such a call must be re-sized (the
   runner rejects it with `workspace_buffer needs N bytes`), and
-  `cake_dsa_indexer_det_train_topk_workspace_size` follows the new plan automatically.  It is
+  `cake_dsa_indexer_det_train_topk_workspace_size` follows the new plan automatically.  On
+  `sm_100a`, BF16 calls of 5.5 to 6 wide rounds per CTA (`wide_rule[0]`; the
+  FP8 form decides by its `wide_wave_rule`) now take eight queries per unit as
+  well: 148 MiB (155197568 B) at the 16384-slot floor at `top_k = 2048` on 148
+  SMs, where the previous package needed 74 MiB (77602944 B), with identical
+  ids and score bits; re-size a buffer reused across such calls the same way.  It is
   the larger of the sampled default's plan and the plan with the sampled first
   threshold off (`sample_tiles_max=0`): on sm_107a the unpaired
   three-warpgroup preference can give an unsampled call six queries per unit
@@ -361,7 +378,7 @@ per entry.  `csrc/.clang-format` disables formatting so the digests stay valid.
   units: one kernel per program or per group of programs that differ only in
   their constants (a scan lever-twin group, the rank-finalize programs of one
   window form, the CUB finalize programs) and one binding per launcher text
-  (the 70 scan programs share 8 bindings, the 25 rank-finalize programs 4, the
+  (the 76 scan programs share 9 bindings, the 25 rank-finalize programs 9, the
   5 CUB finalize programs 1; the merge program has its own).  A shared kernel
   source names its kernel `CAKE_PROGRAM_KERNEL` and reads its constants (the
   window, block size, tile unroll and snake order) from `CAKE_INDEXER_<KNOB>`; a

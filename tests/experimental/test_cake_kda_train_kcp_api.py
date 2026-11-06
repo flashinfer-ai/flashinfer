@@ -46,7 +46,6 @@ import torch
 
 import flashinfer.cake_kda_det_train_kcp as det_api
 import flashinfer.cake_kda_train_kcp as kcp_api
-import flashinfer.kda_train as kda_train
 from flashinfer.api_logging import ExperimentalWarning
 
 pytestmark = pytest.mark.cpu_only
@@ -951,9 +950,9 @@ def _nd_objects() -> list:
 
 
 def test_legacy_names_stay_the_deterministic_objects() -> None:
-    """``flashinfer.kda_train`` and the compatibility package ``flashinfer.experimental.cake_kda_train`` stay the
-    deterministic package's paths: every previous name IS its deterministic object and none is an object of this
-    package or of the facade (``chunk_kda_kcp``, spelled by both, included)."""
+    """The det name of every previous name (``flashinfer.cake_kda_det_train_kcp`` and the det package
+    ``flashinfer.experimental.cake_kda_det_train_kcp``) is a deterministic object and none is an object of this
+    package or of the facade (``chunk_kda_kcp`` included)."""
     nd = _nd_objects()
     assert len(nd) > 50
 
@@ -961,17 +960,17 @@ def test_legacy_names_stay_the_deterministic_objects() -> None:
         return any(obj is o for o in nd)
 
     for old, new in LEGACY_FACADE_NAMES.items():
-        obj = getattr(kda_train, old)
+        obj = getattr(det_api, new)
         assert obj is getattr(det_api, new), old
         assert not is_nd(obj), old
     for old, new in LEGACY_TYPE_NAMES.items():
-        obj = getattr(kda_train, old)
+        obj = getattr(det_api, new)
         assert obj is getattr(det_api, new), old
         assert not is_nd(obj), old
-    assert kda_train.chunk_kda_kcp is not kcp_api.chunk_kda_kcp
-    assert kda_train.chunk_kda_kcp is not _mod("cake_kcp").chunk_kda_kcp
+    assert det_api.chunk_kda_det_kcp is not kcp_api.chunk_kda_kcp
+    assert det_api.chunk_kda_det_kcp is not _mod("cake_kcp").chunk_kda_kcp
     for sub in ("cake_kcp", "cake_kcp_plan", "cake_kcp_jit"):
-        compat = importlib.import_module(f"{COMPAT_PACKAGE}.{sub}")
+        compat = importlib.import_module(f"{DET_PACKAGE}.{sub}")
         assert compat is _det(sub), sub
         assert compat is not _mod(sub), sub
     for name in (

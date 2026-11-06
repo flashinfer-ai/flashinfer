@@ -2743,7 +2743,9 @@ class KdaChunkSaved:
     ``deterministic`` is the mode of the forward that wrote the set (``False``: this package).  The forward
     programs are copies of the deterministic package's, so both packages write the same versions in the same
     format, and the backward of either reads a set of the other in both gate modes and both in-kernel Q/K L2 norm
-    modes.
+    modes: this package's backward reads the deterministic package's set as it is; the deterministic entries take
+    their own type only (``KdaDetChunkSaved``, with the same fields but ``deterministic``), so the facade's
+    deterministic route hands them this package's set as one, with the same tensors.
     """
 
     version: int

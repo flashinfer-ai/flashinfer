@@ -160,6 +160,22 @@ def test_packing_fills_the_last_wave(rows_per_head):
         assert torch.equal(plan["work"], expected["work"])
 
 
+def test_split_cost_past_the_kv_limit():
+    """Equal rows of 40 blocks, 0.68 rows per virtual CTA on 188 SMs: while the
+    K and V of the 8 KV heads span at most _SPLIT_KV_BLOCKS blocks, the plan
+    splits every row in two; past that, a split part costs _FAR_SPLIT_COST and
+    the plan keeps the rows whole."""
+    counts = torch.full((8, 32), 40, dtype=torch.int64)
+    first = (torch.cumsum(counts.reshape(-1), 0) - counts.reshape(-1)).view_as(counts)
+    limit = cake_vsa_sm120._SPLIT_KV_BLOCKS // 8
+    near, far = (
+        cake_vsa_sm120.build_work(counts, first, 1, 188, num_kv_blocks=n)
+        for n in (limit, limit + 1)
+    )
+    assert near["total_work"] == 2 * counts.numel()
+    assert far["total_work"] == counts.numel()
+
+
 def _bsr(mb, nb, generator):
     counts = torch.randint(0, nb + 1, (mb,), generator=generator)
     indptr = torch.cat((torch.zeros(1, dtype=torch.int64), torch.cumsum(counts, 0)))

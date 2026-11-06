@@ -441,6 +441,120 @@ def test_callables_without_deterministic_parameter_pass() -> None:
     assert_no_deterministic_keyword(_module(DET_MODULE, PLAIN_WRAPPER))
 
 
+# Type aliases a facade exports: typing's subscripted generics are callable, with a
+# (*args, **kwargs) signature, but they name types, not entry points.
+TYPE_ALIASES = """
+import collections.abc
+import typing
+
+
+CakeToyDetSource = typing.Callable[[], typing.Union[tuple, list]]
+CakeToyDetMaybeSource = typing.Optional[typing.Callable[[], tuple]]
+CakeToyDetHook = collections.abc.Callable[[int], int]
+CakeToyDetShapes = list[int]
+
+
+class CakeToyDetPlan:
+    Source = typing.Callable[[], tuple]
+
+    def build(self, shape):
+        return shape
+
+
+__all__ = [
+    "CakeToyDetSource",
+    "CakeToyDetMaybeSource",
+    "CakeToyDetHook",
+    "CakeToyDetShapes",
+    "CakeToyDetPlan",
+]
+"""
+
+
+def test_type_aliases_are_not_entry_points() -> None:
+    module = _module(DET_MODULE, TYPE_ALIASES)
+    assert callable(module.CakeToyDetSource)
+    assert callable(module.CakeToyDetShapes)
+    assert_no_deterministic_keyword(module)
+    assert_no_deterministic_keyword(
+        [module.CakeToyDetSource, module.CakeToyDetHook, module.CakeToyDetShapes]
+    )
+
+
+def test_entry_beside_type_aliases_still_fails() -> None:
+    source = (
+        TYPE_ALIASES
+        + """
+
+def cake_toy_det(x, **options):
+    return x
+
+
+__all__ = [*__all__, "cake_toy_det"]
+"""
+    )
+    module = _module(DET_MODULE, source)
+    error = (
+        "toy.cake_toy_det_train.cake_toy_det: takes a 'deterministic' parameter"
+        " through **options"
+    )
+    with pytest.raises(AssertionError) as info:
+        assert_no_deterministic_keyword(module)
+    message = str(info.value)
+    assert error in message, message
+    assert message.startswith("1 "), message
+
+
+# An entry that takes **options and checks the keys at call time, with a
+# ``__signature__`` that lists every option keyword-only: inspect.signature reads it,
+# in the wrapper too (functools.wraps copies it), so no **options is left to bind.
+SIGNED_OPTIONS = """
+import functools
+import inspect
+
+_OPTIONS = {"chunk": 64, "stages": 2}
+
+
+def backend_forward(x, **options):
+    unknown = sorted(set(options) - set(_OPTIONS))
+    if unknown:
+        raise TypeError(f"unknown options {unknown}")
+    return x
+
+
+backend_forward.__signature__ = inspect.Signature(
+    [inspect.Parameter("x", inspect.Parameter.POSITIONAL_OR_KEYWORD)]
+    + [
+        inspect.Parameter(key, inspect.Parameter.KEYWORD_ONLY, default=value)
+        for key, value in _OPTIONS.items()
+    ]
+)
+
+
+@functools.wraps(backend_forward)
+def cake_toy_det_train_forward(x, **options):
+    return backend_forward(x, **options)
+
+
+__all__ = ["cake_toy_det_train_forward"]
+"""
+
+
+def test_signature_without_var_keyword_replaces_options() -> None:
+    assert_no_deterministic_keyword(_module(DET_MODULE, SIGNED_OPTIONS))
+    unsigned = SIGNED_OPTIONS.replace(
+        "backend_forward.__signature__ = ", "_unused_signature = "
+    )
+    assert unsigned != SIGNED_OPTIONS
+    error = (
+        "toy.cake_toy_det_train.cake_toy_det_train_forward: takes a 'deterministic'"
+        " parameter through **options"
+    )
+    with pytest.raises(AssertionError) as info:
+        assert_no_deterministic_keyword(_module(DET_MODULE, unsigned))
+    assert error in str(info.value), info.value
+
+
 BACKEND = """
 class CakeToyDetFunction:
     @staticmethod

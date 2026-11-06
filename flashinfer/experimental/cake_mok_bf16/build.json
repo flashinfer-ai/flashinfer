@@ -55,9 +55,9 @@
     }
   },
   "generator": {
-    "cake_revision": "c7392c99bc11b1841985f5370ef6248a78070061",
+    "cake_revision": "07d12e5afed471a0a788f0ff9164c74384549ece",
     "cuda": "13.4.92",
-    "rendered_at": "2026-11-06T03:38:58Z"
+    "rendered_at": "2026-11-06T17:50:57Z"
   },
   "libraries": [
     {
@@ -1627,6 +1627,28 @@
       ]
     },
     {
+      "arch": "sm_107a",
+      "closure_sha256": "0b9c74387865c53814f4dd87a7d7b895f207a165a2ef40c8514d56282df08f0f",
+      "entry": "run",
+      "gencode": "-gencode=arch=compute_107a,code=sm_107a",
+      "min_cuda": "13.4",
+      "name": "cake_mok_forward_mxfp8_clamped_multimacro_sm_107a",
+      "nvcc_flags": [
+        "--use_fast_math",
+        "-DCAKE_MOK_KERNEL=kernel_cake_mok_forward_mxfp8_clamped_multimacro"
+      ],
+      "nvcc_flags_if": [],
+      "path": "aot/cake_mok_forward_mxfp8_clamped_multimacro_sm_107a.so",
+      "sha256": {
+        "csrc/sm_100a/cake_mok_forward_mxfp8_binding.cu": "a8006fb8234b18e631c60b88f363217333382dd7a0f1437f55002909738cf1c4",
+        "csrc/sm_107a/cake_mok_forward_mxfp8_clamped_multimacro.cu": "31879ddd24c46c63fc75b6d41c0b722787e9bc91379aa87d402ce91677a0460c"
+      },
+      "sources": [
+        "csrc/sm_107a/cake_mok_forward_mxfp8_clamped_multimacro.cu",
+        "csrc/sm_100a/cake_mok_forward_mxfp8_binding.cu"
+      ]
+    },
+    {
       "arch": "sm_100a",
       "closure_sha256": "cf87f689cbfb5356b75e1c78bc766295ca6a6de1209a599b31c21aec1302331c",
       "entry": "run",
@@ -1689,6 +1711,28 @@
       },
       "sources": [
         "csrc/sm_107a/cake_mok_forward_mxfp8_clamped.cu",
+        "csrc/sm_100a/cake_mok_forward_mxfp8_binding.cu"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "closure_sha256": "1f6260537a553ac4428c87218aac1dd9172b5ae6852ccd0da42c473727c35484",
+      "entry": "run",
+      "gencode": "-gencode=arch=compute_107a,code=sm_107a",
+      "min_cuda": "13.4",
+      "name": "cake_mok_forward_mxfp8_multimacro_sm_107a",
+      "nvcc_flags": [
+        "--use_fast_math",
+        "-DCAKE_MOK_KERNEL=kernel_cake_mok_forward_mxfp8_multimacro"
+      ],
+      "nvcc_flags_if": [],
+      "path": "aot/cake_mok_forward_mxfp8_multimacro_sm_107a.so",
+      "sha256": {
+        "csrc/sm_100a/cake_mok_forward_mxfp8_binding.cu": "a8006fb8234b18e631c60b88f363217333382dd7a0f1437f55002909738cf1c4",
+        "csrc/sm_107a/cake_mok_forward_mxfp8_multimacro.cu": "3e7ea552f2bd8d650c5996089ff8b42e308577f135a8254cb8f83aeaac383d2f"
+      },
+      "sources": [
+        "csrc/sm_107a/cake_mok_forward_mxfp8_multimacro.cu",
         "csrc/sm_100a/cake_mok_forward_mxfp8_binding.cu"
       ]
     },

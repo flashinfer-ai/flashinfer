@@ -65,7 +65,10 @@ for the previous one passes its `bool` in that slot and raises `TypeError`.
   backward is the forward's package.
 - Both packages write the saved set in the same format (the forward programs
   are the same), so either backward reads it.  This package's saved set
-  carries `deterministic=False`.
+  carries `deterministic=False`.  The deterministic package's entries take
+  their own saved-set type only (`KdaDetChunkSaved`), so the facade's
+  deterministic route hands them this package's set as one, with the same
+  fields and tensors.
 - A workspace serves its own package.  This package refuses another
   package's workspace (`TypeError`), and a `deterministic=True` facade call
   refuses a `deterministic=False` workspace.  When torch's deterministic

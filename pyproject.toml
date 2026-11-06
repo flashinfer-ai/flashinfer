@@ -22,7 +22,7 @@ authors = [{ name = "FlashInfer team" }]
 license = "Apache-2.0"
 readme = "README.md"
 urls = { Homepage = "https://github.com/flashinfer-ai/flashinfer" }
-license-files = ["LICENSE", "LICENSE*.txt", "licenses/LICENSE.kda-for-kda", "licenses/LICENSE.cudnn-frontend-MIT.txt"]
+license-files = ["LICENSE", "NOTICE", "LICENSE*.txt", "licenses/LICENSE.kda-for-kda", "licenses/LICENSE.cudnn-frontend-MIT.txt", "licenses/LICENSE.batch-invariant-ops.txt"]
 
 [project.optional-dependencies]
 b12x = ["torch>=2.12.0", "nvidia-cutlass-dsl[cu13]>=4.8.0", "rich>=13", "safetensors>=0.6"]
@@ -72,6 +72,7 @@ exclude = [
   "flashinfer.experimental.b12x._compat*",
   "flashinfer.prims_ts.moe.tools*",
   "flashinfer.batch_invariant.lean*",
+  "flashinfer.moe_ep.kernel_src.sm100.kimi-k3-megamoe*",
 ]
 
 [tool.setuptools.package-dir]
@@ -82,6 +83,7 @@ exclude = [
 "flashinfer.data.cccl" = "3rdparty/cccl"
 
 [tool.setuptools.package-data]
+"flashinfer.experimental.hc_sum_sm100" = ["csrc/**", "README.md", "SOURCES.md"]
 "flashinfer.experimental.b12x.comm.roce" = ["*.c"]
 "flashinfer.experimental.b12x.loader" = ["*.c", "*.h"]
 # Cake-exported packages (flashinfer-ai/flashinfer#6553): the generated csrc tree plus the
@@ -101,9 +103,9 @@ exclude = [
 "flashinfer.cake_mhc_det_train_head_backend" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake.cake_mhc_train_backend" = ["csrc/**", "build.json"]
 "flashinfer.cake_gated_act_mxfp8_backend" = ["csrc/**", "build.json"]
-"flashinfer.cake_rmsnorm_silu_gate_det_train_backend" = ["csrc/**", "build.json"]
-"flashinfer.cake_rmsnorm_silu_gate_train_backend" = ["csrc/**", "build.json"]
-"flashinfer.experimental.cake_dsa_train" = ["csrc/**", "build.json"]
+"flashinfer.experimental.cake.cake_rmsnorm_silu_gate_det_train" = ["csrc/**", "build.json"]
+"flashinfer.experimental.cake.cake_rmsnorm_silu_gate_nondet_train" = ["csrc/**", "build.json"]
+"flashinfer.experimental.cake.cake_dsa_sparse_attention_nondet_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_kda_det_train" = ["csrc/**", "build.json"]
 # Generated sources of its non-deterministic counterpart (deterministic=False).
 "flashinfer.experimental.cake.cake_kda_train" = ["csrc/**", "build.json"]
@@ -116,7 +118,7 @@ exclude = [
 "flashinfer.experimental.cake.cake_gdn_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake.cake_gqa_nondet_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_rubin_mla_nvfp4_decode" = ["csrc/**", "build.json"]
-"flashinfer.experimental.cake_lm_head_det_loss" = ["csrc/**", "build.json"]
+"flashinfer.experimental.cake.cake_lm_head_det_train" = ["csrc/**", "build.json"]
 # Generated sources of its non-deterministic counterpart (deterministic=False).
 "flashinfer.experimental.cake.cake_lm_head_loss" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_mok_bf16" = ["csrc/*.cu", "csrc/*/*.cu", "csrc/*.h", "sources.json", "build.json", "README.md"]
@@ -153,7 +155,15 @@ exclude = [
 # next to its module.
 "flashinfer.experimental.deepgemm_dense_mqa" = ["*.json"]
 "flashinfer" = ["_build_meta.py", "mla_kv_pack_fp8_workloads.json"]
-# The batch-invariant GEMM dispatcher's fitted constants, read at runtime next to its module.
+# The private loader imports this hyphenated source tree from package data.
+"flashinfer.moe_ep.kernel_src.sm100" = [
+  "kimi-k3-megamoe/**/*.py",
+  "kimi-k3-megamoe/*.py",
+  "kimi-k3-megamoe/*.md",
+  "kimi-k3-megamoe/*.json",
+  "kimi-k3-megamoe/LICENSE",
+  "kimi-k3-megamoe/NOTICE",
+]
 "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe" = ["*.md"]
 "flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe" = ["*.md"]
 "flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe" = ["*.md"]
@@ -188,11 +198,12 @@ exclude = [
 "flashinfer.experimental.cake_moe_grouped_det_gemm" = ["csrc/**", "build.json"]
 # Generated sources of its non-deterministic counterpart (deterministic=False).
 "flashinfer.experimental.cake.cake_moe_grouped_gemm" = ["csrc/**", "build.json"]
-# Generated sources for the experimental exact-SM100a/SM107a dense projection GEMM backend.
-"flashinfer.experimental.dense_projection_det_gemm" = ["csrc/**", "build.json"]
-# Generated sources for the experimental SM100a/SM103a/SM107a dense projection GEMM backend with an explicit
-# numerical mode (the non-deterministic split-K programs; the deterministic ones ship with dense_projection_det_gemm).
-"flashinfer.experimental.dense_projection_gemm" = ["csrc/**", "build.json"]
+# Generated sources for the deterministic SM100a/SM103a/SM107a dense GEMM training backend
+# (flashinfer.cake_dense_gemm_det_train).
+"flashinfer.experimental.cake.cake_dense_gemm_det_train" = ["csrc/**", "build.json"]
+# Generated sources for the non-deterministic SM100a/SM103a/SM107a dense GEMM training backend
+# (flashinfer.cake_dense_gemm_nondet_train; the deterministic programs it reuses ship with cake_dense_gemm_det_train).
+"flashinfer.experimental.cake.cake_dense_gemm_nondet_train" = ["csrc/**", "build.json"]
 # Generated sources for the experimental exact-SM100a/SM103a StepFun fused-MoE backend (cake-build/1).
 "flashinfer.experimental.cake_stepfun_moe" = ["csrc/**", "build.json"]
 # Standalone cuDNN Frost Python sources and the native MoE adapter, compiled on first use.
@@ -281,6 +292,8 @@ exclude = [
   "flashinfer/prims_ts/",
   "flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/",
   "flashinfer/moe_ep/kernel_src/sm100/next_cutedsl_megamoe/src/",
+  # Mypy cannot name the private loader's hyphenated package-data directory.
+  "flashinfer/moe_ep/kernel_src/sm100/kimi-k3-megamoe/",
   "flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src/",
   "flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/",
   "flashinfer/moe_ep/kernel_src/sm120/swapab_cutedsl_megakernel/src/",
@@ -328,6 +341,7 @@ extend-exclude = [
   "flashinfer/cute_dsl/attention/fmha/helpers",
   "flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src",
   "flashinfer/moe_ep/kernel_src/sm100/next_cutedsl_megamoe/src",
+  "flashinfer/moe_ep/kernel_src/sm100/kimi-k3-megamoe/src",
   "flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src",
   "flashinfer/experimental/cake_mxfp8_megamoe_ep16/csrc/cake_mxfp8_megamoe_ep16/cute",
   "flashinfer/topk_varlen/kernels/gvr_topk_decode.py",

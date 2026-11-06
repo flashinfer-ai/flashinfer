@@ -886,6 +886,22 @@
       },
       "sequence": "cake_deepgemm_sm120_paged_mqa_logits_seq_4f2fd8ba84ad710fe3ca"
     },
+    "sm120:fp8:h32:p64:n4:a4:mpf_bta_ha_k2q_ef_dynv28_p5s1": {
+      "atom_variant": "a4",
+      "clean_logits": "raw",
+      "kernel_launches": 2,
+      "next_n": 4,
+      "next_n_atom": 4,
+      "num_heads": 32,
+      "page_kv": 64,
+      "schedule": {
+        "dyn_pct": 5,
+        "dyn_seg": 1,
+        "dyn_slots": 8,
+        "kind": "dyn"
+      },
+      "sequence": "cake_deepgemm_sm120_paged_mqa_logits_seq_3736a378f8cd316b4449"
+    },
     "sm120:fp8:h32:p64:n4:a4:mpf_bta_ha_k2q_ef_par": {
       "atom_variant": "a4",
       "clean_logits": "raw",
@@ -2670,7 +2686,7 @@
             ],
             [
               128,
-              null
+              "sm120:fp8:h32:p64:n4:a4:mpf_bta_ha_k2q_ef_dynv28_p5s1"
             ]
           ],
           "h32:p64:n5:a2:c16k": [
@@ -8892,6 +8908,131 @@
         "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
         "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_4c1edb9d3eb963e12290_kernel.cu",
         "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_ce9972dce15c32afd34f_binding.cu"
+      ],
+      "stages": [
+        "metadata",
+        "logits"
+      ],
+      "standalone": true
+    },
+    "cake_deepgemm_sm120_paged_mqa_logits_seq_3736a378f8cd316b4449": {
+      "arches": [
+        "sm_120a"
+      ],
+      "arg_plan": [
+        [
+          "buffer",
+          "metadata.context_lens"
+        ],
+        [
+          "buffer",
+          "metadata.schedule_meta"
+        ],
+        [
+          "parameter",
+          "metadata.batch_size"
+        ],
+        [
+          "parameter",
+          "metadata.next_n"
+        ],
+        [
+          "parameter",
+          "metadata.num_next_n_atoms"
+        ],
+        [
+          "parameter",
+          "metadata.split_kv"
+        ],
+        [
+          "parameter",
+          "metadata.num_sms"
+        ],
+        [
+          "parameter",
+          "metadata.dyn_slots"
+        ],
+        [
+          "parameter",
+          "metadata.dyn_pct"
+        ],
+        [
+          "parameter",
+          "metadata.dyn_seg"
+        ],
+        [
+          "grid",
+          "metadata.grid_x"
+        ],
+        [
+          "grid",
+          "metadata.grid_y"
+        ],
+        [
+          "grid",
+          "metadata.grid_z"
+        ],
+        [
+          "tma_buffer",
+          "logits.Q"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "logits.Weights"
+        ],
+        [
+          "buffer",
+          "logits.Logits"
+        ],
+        [
+          "buffer",
+          "logits.context_lens"
+        ],
+        [
+          "buffer",
+          "logits.block_table"
+        ],
+        [
+          "buffer",
+          "logits.schedule_meta"
+        ],
+        [
+          "parameter",
+          "logits.logits_stride"
+        ],
+        [
+          "parameter",
+          "logits.block_table_stride"
+        ],
+        [
+          "grid",
+          "logits.grid_x"
+        ],
+        [
+          "grid",
+          "logits.grid_y"
+        ],
+        [
+          "grid",
+          "logits.grid_z"
+        ]
+      ],
+      "compile_flags": [],
+      "ffi_entry": "run",
+      "kind": "sequence",
+      "role": "sequence",
+      "sources": [
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_2870f0f230889249addf_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_3736a378f8cd316b4449_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_3736a378f8cd316b4449_binding.cu"
       ],
       "stages": [
         "metadata",
