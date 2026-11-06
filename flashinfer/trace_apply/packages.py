@@ -1014,6 +1014,14 @@ def check_target_hardware(solution: Mapping[str, Any], *, device: Any = None) ->
         )
 
 
+def _enabled_conflict(definition: str) -> SealedPackageError:
+    """The refusal for a sealed package whose Definition already has an enabled Solution."""
+    return SealedPackageError(
+        f"definition {definition!r} already has an enabled Solution; disable "
+        "it before loading a sealed package for it"
+    )
+
+
 def load_packages(
     root: Path,
     digests: Sequence[str],
@@ -1055,6 +1063,14 @@ def load_packages(
                 raise SealedPackageError(
                     f"{SOLUTION_NAME} is not a FlashInfer Solution: {error}"
                 ) from error
+            if enable:
+                # Refused before its module runs and before import_entry binds
+                # it: a binding left behind would hold the Definition against
+                # every other digest until release_packages().
+                from . import apply
+
+                if apply.is_enabled() and package.operation in apply._solutions:
+                    raise _enabled_conflict(package.operation)
             entry = import_entry(package)
             solutions[package.operation] = solution
             result.packages.append(package)
@@ -1079,10 +1095,7 @@ def load_packages(
         # for a Definition already enabled is refused, not substituted.
         current = dict(apply._solutions) if apply.is_enabled() else {}
         for definition in sorted(set(current) & set(solutions)):
-            conflict = SealedPackageError(
-                f"definition {definition!r} already has an enabled Solution; disable "
-                "it before loading a sealed package for it"
-            )
+            conflict = _enabled_conflict(definition)
             if strict:
                 raise conflict
             taken = solutions.pop(definition)

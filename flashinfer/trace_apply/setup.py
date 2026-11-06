@@ -93,7 +93,11 @@ def _is_capturing(device: Any) -> bool:
     Asked on the call's device, so a capture on another GPU than the current
     one is seen, and on the current device too when it differs: a setup
     allocates and synchronizes, which a capture open anywhere in the process
-    may not tolerate."""
+    may not tolerate. Seen from the calling thread: CUDA answers for the
+    current stream only and offers no process-wide query, so a capture another
+    thread holds is the serving contract's to keep away from a first use
+    (engines capture in a single-threaded warm-up, after every weight set ran
+    eagerly)."""
     if device.type != "cuda":
         return False
     import torch

@@ -414,12 +414,16 @@ def test_release_packages_leaves_curated_and_captured_solutions_enabled(
     assert preloaded_entry(definition, name) is None
 
     # One Definition has one Solution: a sealed package for an enabled one is
-    # refused (strict) or recorded and left out (best effort), never substituted.
+    # refused (strict) or recorded and left out (best effort), never substituted,
+    # and refused before its module runs: nothing is imported or bound for it.
+    modules = {m for m in sys.modules if m.startswith("_flashinfer_sealed_")}
     with pytest.raises(pk.SealedPackageError, match="already has an enabled Solution"):
         pk.load_packages(GOLDEN_ROOT, [GOLDEN_SETUP_DIGEST])
     result = pk.load_packages(GOLDEN_ROOT, [GOLDEN_SETUP_DIGEST], strict=False)
     assert result.applied == 0 and GOLDEN_SETUP_DIGEST in result.errors
     assert apply_module._solutions == {"rmsnorm_h16": curated}
+    assert pk.setup_stats() == {} and preloaded_entry(*GOLDEN_SETUP_KEY) is None
+    assert {m for m in sys.modules if m.startswith("_flashinfer_sealed_")} == modules
 
     # Release goes by identity: a curated Solution enabled for the sealed
     # Definition after Apply was disabled is not the sealed one and stays.

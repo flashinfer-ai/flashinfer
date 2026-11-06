@@ -182,6 +182,9 @@ observes freezes its key set, so a weight set that appears afterwards is refused
 too and a setup input that is really an activation cannot grow state without
 bound (``MAX_WEIGHT_SETS`` bounds it under eager execution). Run every weight
 set eagerly before capturing, as an engine's profiling and warm-up forwards do.
+The check sees the calling thread's capture (CUDA offers no process-wide
+query), so a first use on one thread while another thread captures is what
+that warm-up rule rules out, not something the callable can detect.
 A state does not survive ``fork``: a call from another process is refused. A
 setup that calls its own Definition with a new weight set is refused too,
 rather than left waiting on the lock it holds.

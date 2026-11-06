@@ -138,7 +138,7 @@ def seal_package(
     manifest_bytes = json_bytes(manifest)
     digest = hashlib.sha256(manifest_bytes).hexdigest()
     directory = root / digest
-    (directory / "bundle").mkdir(parents=True)
+    (directory / "bundle").mkdir(parents=True, exist_ok=True)
     (directory / "manifest.json").write_bytes(manifest_bytes)
     if sidecar is not None:
         (directory / "qualification.json").write_bytes(json_bytes(sidecar))
