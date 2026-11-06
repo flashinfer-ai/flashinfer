@@ -30,6 +30,7 @@ limitations under the License.
 # ``test_cake_dsa_indexer_det_train_api.py`` and their #8928 naming rules by
 # ``test_cake_dsa_indexer_det_train_names.py``.
 
+import dataclasses
 import itertools
 import json
 import os
@@ -111,6 +112,7 @@ _COMMON = dict(
     cand_cap_ceiling_unsampled=None,
     wide_first_rule=None,
     wide_wave_rule=None,
+    desc_walk_kinds=None,
     split_max=32,
     split_min_range_tiles=64,
     split_units=["l6", "narrow", "wide"],
@@ -753,6 +755,15 @@ def test_policy_record_round_trip_and_validation():
         dict(wide_wave_rule=[1.6, 1.3, 80.0, 1]),
         dict(wide_wave_rule=[-1.0, 1.3, 80.0]),
         dict(wide_wave_rule=[1.6, 1.3, True]),
+        # the descending-walk kinds: [unsampled kinds, sampled kinds], ascending lists of physical scan kinds, or None
+        dict(desc_walk_kinds="wide"),
+        dict(desc_walk_kinds=[]),
+        dict(desc_walk_kinds=[["wide"]]),
+        dict(desc_walk_kinds=[["wide"], [], []]),
+        dict(desc_walk_kinds=[["wide_desc"], []]),
+        dict(desc_walk_kinds=[["wide", "wide"], []]),
+        dict(desc_walk_kinds=[["wide", "l6"], []]),
+        dict(desc_walk_kinds=[[1], []]),
         # the units that split: an ascending list of unit geometries (may be empty)
         dict(split_units="l6"),
         dict(split_units=["split_l6"]),
@@ -878,6 +889,13 @@ def test_policy_record_round_trip_and_validation():
     assert not single.lsf_single_fits(16384, 15360, 1, 1)
     assert not single.lsf_single_fits(32768, 32768, 2, 1)
     assert not DispatchPolicy.from_record(record).lsf_single_fits(1024, 1 << 20, 1, 1)
+    walked = DispatchPolicy.from_record(dict(record, desc_walk_kinds=[["wide"], []]))
+    assert walked.desc_walk_kinds == [["wide"], []]
+    assert walked.record()["desc_walk_kinds"] == [["wide"], []]
+    assert DispatchPolicy.from_record(walked.record()) == walked
+    assert walked.desc_walk_for("wide", sampled=False)
+    assert not walked.desc_walk_for("wide", sampled=True)
+    assert not walked.desc_walk_for("l6", sampled=False)
     scoped = DispatchPolicy.from_record(
         dict(record, split_wave_scope=(("narrow", "wide"), 2, False))
     )
@@ -1866,6 +1884,71 @@ def test_l6_solo_rule_prefers_the_unpaired_l6_unit_where_registered_and_unsplit(
         assert (a.kind, a.block_q, a.pair) == (b.kind, b.block_q, b.pair), arch
 
 
+def test_desc_walk_kinds_runs_the_descending_wide_twin_with_sampling_off():
+    """sm_103a ``desc_walk_kinds`` ``[["wide"], []]``: a call with the sampled first threshold off whose plan is the
+    single-CTA wide program runs its descending-walk twin (key kind ``wide_desc``: the same unit, split, tile unroll, fit
+    and longest-first form; the same ids and score bits); sampled calls, every other kind and sm_100a / sm_107a (field
+    None) keep their program.  On a grid of shapes in both modes and on every frozen SM count, each plan equals the plan
+    of the record without the field except for exactly that key; the sampled list ``[["wide"], ["wide"]]`` moves sampled
+    wide calls the same way; without a registry the field is inert."""
+    if not cake_jit.PROGRAM_KEYS:
+        pytest.skip("placeholder registry")
+    for arch in ("sm_100a", "sm_107a"):
+        assert policy_for(arch).desc_walk_kinds is None
+        assert not any(":wide_desc:" in k for k in cake_jit.PROGRAM_KEYS[arch])
+    p, keys = policy_for("sm_103a"), cake_jit.PROGRAM_KEYS["sm_103a"]
+    assert p.desc_walk_kinds == [["wide"], []]
+    desc = sorted(k for k in keys if k.startswith("scan:wide_desc:"))
+    assert len(desc) == 8
+    assert all(k.replace("scan:wide_desc:", "scan:wide:") in keys for k in desc)
+    plain = DispatchPolicy.from_record(dict(p.record(), desc_walk_kinds=None))
+    both = DispatchPolicy.from_record(
+        dict(p.record(), desc_walk_kinds=[["wide"], ["wide"]])
+    )
+
+    def plan(policy, T, Tkv, S, sample, grid, top_k=2048, scan_keys=keys):
+        return select_program(
+            policy,
+            num_queries=T,
+            num_keys=Tkv,
+            num_segments=S,
+            ratio=1,
+            top_k=top_k,
+            grid=grid,
+            sample_tiles_max=sample,
+            scan_keys=scan_keys,
+        )
+
+    def twin(choice):
+        key = choice.scan_key.replace("scan:wide:", "scan:wide_desc:", 1)
+        if choice.physical_kind != "wide" or key not in keys:
+            return choice
+        return dataclasses.replace(choice, scan_key=key)
+
+    moved = {False: 0, True: 0}
+    for q, k, S, top_k, sample, grid in itertools.product(
+        (1024, 4096, 8192, 16384),
+        (32768, 131072, 262144),
+        (1, 2, 8),
+        (512, 2048),
+        (None, 0),
+        _FROZEN_GRIDS["sm_103a"],
+    ):
+        T, Tkv = q * S, k * S
+        if q > k or T > 131072:
+            continue
+        base = plan(plain, T, Tkv, S, sample, grid, top_k)
+        sampled = base.sample_tiles_max > 0
+        want = base if sampled else twin(base)
+        assert plan(p, T, Tkv, S, sample, grid, top_k) == want, (T, Tkv, S, sample)
+        assert plan(both, T, Tkv, S, sample, grid, top_k) == twin(base)
+        assert plan(p, T, Tkv, S, sample, grid, top_k, scan_keys=None) == plan(
+            plain, T, Tkv, S, sample, grid, top_k, scan_keys=None
+        )
+        moved[sampled] += twin(base) != base
+    assert moved[False] > 0 and moved[True] > 0, moved
+
+
 def test_l6_solo_unsampled_max_queries_on_sm_100a_and_sm_103a():
     """sm_100a / sm_103a ``l6_solo_unsampled_max_queries`` 16384 (no ``l6_solo_rule``): a call with the sampled first
     threshold off and at most 16384 queries whose plan is the CTA-pair l6 unit without a split runs the unpaired l6 unit;
@@ -2149,7 +2232,8 @@ def test_ticket_units_bound_covers_every_segment_split_and_static_path_matches_t
 def test_sample_fit_kinds_name_exactly_the_registered_sampled_fit_programs():
     """``sample_fit_kinds`` is the registry's own list: every scan kind with a registered ``:f1`` program and no other, so
     the dispatch never composes a sampled-fit key the architecture does not ship (round 3: a 32768-slot capacity made
-    split units of 22k-42k keys fit the buffer and selected ``scan:split_l6:u1:s0:f1``, which has no program)."""
+    split units of 22k-42k keys fit the buffer and selected ``scan:split_l6:u1:s0:f1``, which has no program).  A
+    descending-walk twin (key kind ``<kind>_desc``) is not a decided kind: its ascending program carries the form."""
     if not cake_jit.PROGRAM_KEYS:
         pytest.skip("placeholder registry")
     for arch, keys in cake_jit.PROGRAM_KEYS.items():
@@ -2157,7 +2241,9 @@ def test_sample_fit_kinds_name_exactly_the_registered_sampled_fit_programs():
             {
                 key.split(":")[1]
                 for key in keys
-                if key.startswith("scan:") and key.endswith(":f1")
+                if key.startswith("scan:")
+                and key.endswith(":f1")
+                and not key.split(":")[1].endswith("_desc")
             }
         )
         assert policy_for(arch).sample_fit_kinds == registered, arch

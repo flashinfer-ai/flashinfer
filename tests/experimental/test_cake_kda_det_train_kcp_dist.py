@@ -50,7 +50,7 @@ from tests.test_helpers.cake_package import cake_package
 
 cake_kcp = cake_package("cake_kda_det_train_kcp", "cake_kcp")
 cake_kcp_plan = cake_package("cake_kda_det_train_kcp", "cake_kcp_plan")
-cake_jit = cake_package("cake_kda_det_train", "cake_jit")
+cake_jit = cake_package("cake.cake_kda_det_train", "cake_jit")
 cake_kcp_jit = cake_package("cake_kda_det_train_kcp", "cake_kcp_jit")
 
 PACKAGE_DIR = Path(cake_kcp_jit.__file__).resolve().parent
@@ -563,7 +563,7 @@ def _run_upload_rank(
     pack prepared behind queued work (``heads=H``) issues one pinned copy, does not wait and runs bitwise; a pack
     prepared from another thread on a held-back side stream does the same; repeated ``exchange="ring"`` calls record
     no further upload on the context (ring rows); the plan's ``P`` of each rank is reported."""
-    from flashinfer.cake_causal_conv1d_det_train_backend import kcp as conv
+    from flashinfer.experimental.cake.cake_causal_conv1d_det_train import kcp as conv
     from tests.test_helpers.cake_host_sync import (
         census,
         counts_agree,
@@ -613,8 +613,8 @@ def _run_upload_rank(
         return [out.detach()] + [lf.grad for lf in leaves]
 
     def halo(c) -> list:
-        y, hist = conv.cake_causal_conv1d_det_forward_kcp(x, w, c)
-        return [y, *conv.cake_causal_conv1d_det_backward_kcp(x, w, c, dy, hist)]
+        y, hist = conv.cake_causal_conv1d_det_train_kcp_forward(x, w, c)
+        return [y, *conv.cake_causal_conv1d_det_train_kcp_backward(x, w, c, dy, hist)]
 
     def eq(a, b) -> bool:
         return len(a) == len(b) and all(
@@ -1630,8 +1630,8 @@ def _run_rank_ckpt(
         hs = (
             (
                 cake_kcp.RecomputeHandleDetKcp(),  # shared by the q convolution and KDA
-                conv_kcp.RecomputeHandleDetKcp(),
-                conv_kcp.RecomputeHandleDetKcp(),
+                conv_kcp.CakeCausalConv1dDetKcpRecomputeHandle(),
+                conv_kcp.CakeCausalConv1dDetKcpRecomputeHandle(),
             )
             if mode == "handle"
             else (None, None, None)
@@ -1682,12 +1682,12 @@ def _run_rank_ckpt(
         + 2 * int(ctx.halo.n_hist_rows) * C * 2
     )
 
-    # the same layer with cake_causal_conv1d_det_multi_kcp (the q / k / v convolutions in one call, one halo exchange
+    # the same layer with cake_causal_conv1d_det_kcp_multi (the q / k / v convolutions in one call, one halo exchange
     # per direction) and ONE handle for the convolutions and KDA: bitwise the three single calls, two halo
     # collectives (and waits) fewer in every phase that exchanges halos, the same retained bytes
     def layer_multi(xq, xk, xv, wq, wk, wv, g_, b_, w_, h):
         T = xq.shape[0]
-        qq, kk, vv = conv_kcp.cake_causal_conv1d_det_multi_kcp(
+        qq, kk, vv = conv_kcp.cake_causal_conv1d_det_kcp_multi(
             (xq, xk, xv), (wq, wk, wv), ctx, recompute_handle=h
         )
         y = cake_kcp.chunk_kda_det_kcp(
