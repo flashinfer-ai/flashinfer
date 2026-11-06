@@ -1015,7 +1015,10 @@ __global__ void __launch_bounds__(FINALIZE_WARP_THREADS)
 #endif
 
   auto* outVecPtr = reinterpret_cast<VecElem*>(params.outPtr + tokenIdx * params.hiddenDim);
-  for (int64_t vecBase = vecBegin + lane; vecBase < vecEnd; vecBase += vecsPerStep) {
+  // Warp-uniform bound: every lane takes part in the shuffles below, and the lanes past the end of
+  // the slice skip their loads and stores.
+  for (int64_t stepBegin = vecBegin; stepBegin < vecEnd; stepBegin += vecsPerStep) {
+    int64_t const vecBase = stepBegin + lane;
     ComputeElem acc[FINALIZE_WARP_VECS];
 #pragma unroll
     for (int u = 0; u < FINALIZE_WARP_VECS; ++u) {
