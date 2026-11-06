@@ -74,7 +74,11 @@ and architecture (the token-count bands ``BWD_SLAB_BANDS`` ahead of the
 per-architecture ``BWD_SLAB_PROGRAM``: the dynamic-schedule form ``dynr`` on
 sm_100a and sm_103a, ``xrsg`` on sm_107a; on sm_100a for ``1024 < T <= 4096``
 its late-claim form ``dynl``, which ``BWD_SLAB_FIT`` replaces with ``xrsg_p160``
-where the K7 units fit the SMs and at the chunk counts / runs it lists); the
+where the K7 units fit the SMs and at the chunk counts / runs it lists; inside
+the token-count bands of ``BWD_DPL_BANDS`` -- on sm_100a ``4095 < T <= 8192`` -- the ``_dpl``
+form of ``dynr`` / ``dynl``, whose ``dfn_part`` stores carry the L2 hint
+EVICT_LAST, and then the reduction's ``_dpl`` form, whose ``dfn_part``
+loads carry EVICT_FIRST; bitwise the forms); the
 residual mixing's program of record is per
 architecture too (``FWD_FINISH_PROGRAM`` / :func:`fwd_finish_program`, its
 launch grid :func:`k4_grid_of_record`), and the token-owner band
@@ -3985,6 +3989,71 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "bwd",
         },
     },
+    "cake_mhc_det_train_bwd_slab__dynl_dpl": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "X"],
+            ["buffer", "dY"],
+            ["buffer", "dU"],
+            ["buffer", "dzp"],
+            ["buffer", "fnTp"],
+            ["buffer", "dX"],
+            ["buffer", "tokp"],
+            ["buffer", "dfn_part"],
+            ["parameter", "T"],
+            ["parameter", "P"],
+            ["parameter", "rpc"],
+            ["buffer", "ticket"],
+            ["launch", "enable_pdl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "chunks_rule": "k7_chunks",
+            "kind": "slab_chunks",
+            "slabs": 64,
+        },
+        "hidden": 4096,
+        "kernel": "cake_mhc_det_train_bwd_slab__dynl_dpl",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_slab__dynl_dpl",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 228480,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": "runtime",
+        },
+        "library": "cake_mhc_det_train_bwd_slab__dynl_dpl",
+        "logical": {
+            "P": "parts",
+            "T": "rows",
+            "X": "x_flat",
+            "dU": "du",
+            "dX": "dx_flat",
+            "dY": "dy_flat",
+            "dfn_part": "dfn_part",
+            "dzp": "dzp_rows",
+            "fnTp": "fnTp",
+            "rpc": "rows_per_chunk",
+            "ticket": "ticket",
+            "tokp": "tokp",
+        },
+        "role": "bwd_slab",
+        "select_rule": {
+            "kind": "program",
+            "program": "dynl_dpl",
+            "rule": "bwd_slab_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "bwd",
+        },
+    },
     "cake_mhc_det_train_bwd_slab__dynr": {
         "arches": [
             "sm_100a",
@@ -4044,6 +4113,71 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": {
             "kind": "program",
             "program": "dynr",
+            "rule": "bwd_slab_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "bwd",
+        },
+    },
+    "cake_mhc_det_train_bwd_slab__dynr_dpl": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "X"],
+            ["buffer", "dY"],
+            ["buffer", "dU"],
+            ["buffer", "dzp"],
+            ["buffer", "fnTp"],
+            ["buffer", "dX"],
+            ["buffer", "tokp"],
+            ["buffer", "dfn_part"],
+            ["parameter", "T"],
+            ["parameter", "P"],
+            ["parameter", "rpc"],
+            ["buffer", "ticket"],
+            ["launch", "enable_pdl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "chunks_rule": "k7_chunks",
+            "kind": "slab_chunks",
+            "slabs": 64,
+        },
+        "hidden": 4096,
+        "kernel": "cake_mhc_det_train_bwd_slab__dynr_dpl",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_slab__dynr_dpl",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 228480,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": "runtime",
+        },
+        "library": "cake_mhc_det_train_bwd_slab__dynr_dpl",
+        "logical": {
+            "P": "parts",
+            "T": "rows",
+            "X": "x_flat",
+            "dU": "du",
+            "dX": "dx_flat",
+            "dY": "dy_flat",
+            "dfn_part": "dfn_part",
+            "dzp": "dzp_rows",
+            "fnTp": "fnTp",
+            "rpc": "rows_per_chunk",
+            "ticket": "ticket",
+            "tokp": "tokp",
+        },
+        "role": "bwd_slab",
+        "select_rule": {
+            "kind": "program",
+            "program": "dynr_dpl",
             "rule": "bwd_slab_program",
         },
         "workspace_rule": {
@@ -4397,6 +4531,62 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "bwd",
         },
     },
+    "cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl_dpl": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "dfn_part"],
+            ["buffer", "param_partial"],
+            ["buffer", "dfn"],
+            ["buffer", "dscale"],
+            ["buffer", "dbase"],
+            ["parameter", "n_parts"],
+            ["parameter", "n_chunks"],
+            ["parameter", "accumulate"],
+            ["launch", "enable_pdl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas": 411,
+            "kind": "fixed",
+        },
+        "hidden": 4096,
+        "kernel": "cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl_dpl",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl_dpl",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 4224,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": "runtime",
+        },
+        "library": "cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl_dpl",
+        "logical": {
+            "accumulate": "accumulate",
+            "dbase": "dbase",
+            "dfn": "dfn",
+            "dfn_part": "dfn_part",
+            "dscale": "dscale",
+            "n_chunks": "chunks",
+            "n_parts": "parts",
+            "param_partial": "param_partial",
+        },
+        "role": "bwd_reduce",
+        "select_rule": {
+            "kind": "program",
+            "program": "s27_wcvt_fadd_fshfl_dpl",
+            "rule": "bwd_reduce_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "bwd",
+        },
+    },
     "cake_mhc_det_train_bwd_reduce__wpu4_spred": {
         "arches": [
             "sm_100a",
@@ -4446,6 +4636,62 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": {
             "kind": "program",
             "program": "wpu4_spred",
+            "rule": "bwd_reduce_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "bwd",
+        },
+    },
+    "cake_mhc_det_train_bwd_reduce__wpu4_spred_dpl": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "dfn_part"],
+            ["buffer", "param_partial"],
+            ["buffer", "dfn"],
+            ["buffer", "dscale"],
+            ["buffer", "dbase"],
+            ["parameter", "n_parts"],
+            ["parameter", "n_chunks"],
+            ["parameter", "accumulate"],
+            ["launch", "enable_pdl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas": 411,
+            "kind": "fixed",
+        },
+        "hidden": 4096,
+        "kernel": "cake_mhc_det_train_bwd_reduce__wpu4_spred_dpl",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_reduce__wpu4_spred_dpl",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 4224,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": "runtime",
+        },
+        "library": "cake_mhc_det_train_bwd_reduce__wpu4_spred_dpl",
+        "logical": {
+            "accumulate": "accumulate",
+            "dbase": "dbase",
+            "dfn": "dfn",
+            "dfn_part": "dfn_part",
+            "dscale": "dscale",
+            "n_chunks": "chunks",
+            "n_parts": "parts",
+            "param_partial": "param_partial",
+        },
+        "role": "bwd_reduce",
+        "select_rule": {
+            "kind": "program",
+            "program": "wpu4_spred_dpl",
             "rule": "bwd_reduce_program",
         },
         "workspace_rule": {
@@ -4559,6 +4805,62 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": {
             "kind": "program",
             "program": "wpu4_fadd",
+            "rule": "bwd_reduce_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "bwd",
+        },
+    },
+    "cake_mhc_det_train_bwd_reduce__wpu4_fadd_dpl": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "dfn_part"],
+            ["buffer", "param_partial"],
+            ["buffer", "dfn"],
+            ["buffer", "dscale"],
+            ["buffer", "dbase"],
+            ["parameter", "n_parts"],
+            ["parameter", "n_chunks"],
+            ["parameter", "accumulate"],
+            ["launch", "enable_pdl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas": 411,
+            "kind": "fixed",
+        },
+        "hidden": 4096,
+        "kernel": "cake_mhc_det_train_bwd_reduce__wpu4_fadd_dpl",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_reduce__wpu4_fadd_dpl",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 4224,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": "runtime",
+        },
+        "library": "cake_mhc_det_train_bwd_reduce__wpu4_fadd_dpl",
+        "logical": {
+            "accumulate": "accumulate",
+            "dbase": "dbase",
+            "dfn": "dfn",
+            "dfn_part": "dfn_part",
+            "dscale": "dscale",
+            "n_chunks": "chunks",
+            "n_parts": "parts",
+            "param_partial": "param_partial",
+        },
+        "role": "bwd_reduce",
+        "select_rule": {
+            "kind": "program",
+            "program": "wpu4_fadd_dpl",
             "rule": "bwd_reduce_program",
         },
         "workspace_rule": {
@@ -7831,9 +8133,14 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_mhc_det_train_bwd_slab__dynr",
             "cake_mhc_det_train_bwd_slab__xrsg_p160",
             "cake_mhc_det_train_bwd_slab__dynl",
+            "cake_mhc_det_train_bwd_slab__dynl_dpl",
+            "cake_mhc_det_train_bwd_slab__dynr_dpl",
             "cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl",
             "cake_mhc_det_train_bwd_reduce__wpu4_spred",
             "cake_mhc_det_train_bwd_reduce__wpu4_fadd",
+            "cake_mhc_det_train_bwd_reduce__wpu4_fadd_dpl",
+            "cake_mhc_det_train_bwd_reduce__wpu4_spred_dpl",
+            "cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl_dpl",
             "cake_mhc_det_train_bwd_reduce__wpu4_spred_trows",
             "cake_mhc_det_train_bwd_reduce__wpu4_fadd_trows",
         ],
@@ -8576,8 +8883,13 @@ FWD_MAP_CLAIM = {
 # 65536, checkpoint 0.996 / 0.995, 0.980 / 0.988, 0.973 / 0.975, 0.991 / 0.986, 0.995 / 0.995 and 0.995 / 0.995: every
 # path reads faster with the hint from 65 to 65536 tokens except 14929-15288, where the checkpoint path reads 0.9997 /
 # 1.0001 at 15288 (forward 0.990 / 0.991) and the form itself runs.
+# On sm_100a the band runs on to 7168 tokens: against the 6144-token band (B200, two sessions, CUPTI active) every
+# path reads faster in both sessions -- forward 0.979 / 0.978 at 6656 and 0.986 / 0.987 at 7168, forward_pf 0.983 /
+# 0.982 and 0.983 / 0.985, checkpoint 0.983 / 0.983 and 0.989 / 0.990 (identical-program control 0.999-1.000); at
+# 7680 forward reads 0.998 / 0.998 there but 1.000 / 1.002 against main in two record sessions, so the band stops
+# at 7168.
 FWD_MAP_XNRM = {
-    "sm_100a": ((64, 6144),),
+    "sm_100a": ((64, 7168),),
     "sm_103a": ((64, 6144),),
     "sm_107a": ((64, 14928), (15288, 65536)),
 }
@@ -8868,7 +9180,34 @@ BWD_REDUCE_GRID = {
     "s27_wcvt_fadd_fshfl_trows": 411,
     "wpu4_fadd_trows": 411,
     "wpu4_spred_trows": 411,
+    # the dfn_part L2 hint forms of BWD_DPL_BANDS launch their program's grid
+    "s27_wcvt_fadd_fshfl_dpl": 411,
+    "wpu4_fadd_dpl": 411,
+    "wpu4_spred_dpl": 411,
 }
+# BWD_DPL_BANDS: (above, at_most) token-count bands per architecture where the column-slab pass stores the dfn_part
+# partials with the L2 policy EVICT_LAST and the final reduction loads them EVICT_FIRST: the
+# "_dpl" form of the routed K7 program when it is one of BWD_DPL_SLABS (dfn_l2="evict_last") and of the routed
+# K8 program, ahead of its group-row suffix (dfn_l2="evict_first"); bitwise the forms, only the cache policy of
+# the dfn_part stores / loads differs. The partial slabs (1.5 MiB each) then stay in L2 for the reduction: on B200
+# its dfn_part DRAM reads fall from 16-22 MB to 0.6-3.0 MB at 3072-16263 tokens and it takes 1.8-1.9 us less
+# (ncu). Path time against the plain forms (CUPTI active, L2 flushed before every call, two B200 sessions):
+# backward 0.981 / 0.983 and checkpoint 0.989 / 0.990 at 4096, 0.988 / 0.986 and 0.986 / 0.986 at 6144, 0.991 /
+# 0.991 and 0.990 / 0.989 at 8192, 0.995 / 0.995 and 0.994 / 0.994 at 12288, 0.996 / 0.997 and 0.995 / 0.996 at
+# 14928, 0.997 / 0.996 and 0.996 / 0.994 at 16263; 2048, 2560 and 3584 read 0.998-1.003 (there the one-round fit
+# form xrsg_p160 already leaves dfn_part in L2; 3072, between them, reads 0.984-0.989), the checkpoint path at
+# 32768 / 65536 1.005 / 1.010 (the slabs no longer fit; identical-program control void). Against main in the record
+# sessions the checkpoint path reads 1.000 / 0.997 at 14928, 0.999 / 1.002 at 15566, 1.016 / 0.997 at 15590, 0.990 /
+# 1.001 at 16164 and 0.996 / 0.999 / 1.005 / 0.998 at 16263 (16114: identical-program control void in both) -> the
+# band is 4096-8192 tokens on sm_100a; above it the plain forms (15288, 16132 and 16165, measured faster, would each
+# be a single-token band). sm_103a: the reduction is FP64-bound (74 % of its time), the hint does not shorten it ->
+# no band.
+BWD_DPL_BANDS = {
+    "sm_100a": ((4095, 8192),),
+    "sm_103a": (),
+    "sm_107a": (),
+}
+BWD_DPL_SLABS = ("dynl", "dynr")  # the K7 programs with a _dpl form
 # K5_GRID_BANDS: (above, at_most, grid_per_sm) per architecture -- the backward prepare's launch grid by token count
 # inside a band the design's persistent M1 grid min(ceil(T / 2), grid_per_sm x sm_count) (grid-stride
 # trips of the same binary: a host rule only, the program bytes are unchanged), outside every band the one-trip
@@ -8940,7 +9279,7 @@ H_TABLE_NAMES = (
     "FWD_MAP_CLAIM", "FWD_COEF_REGIMES", "BWD_TOKEN_PROGRAM", "BWD_TOKEN_REGIMES", "BWD_TOKEN_BANDS", "BWD_ROW_BANDS",
     "BWD_SLAB_PROGRAM", "BWD_SLAB_BANDS", "BWD_SLAB_FIT", "BWD_REDUCE_PROGRAM", "BWD_REDUCE_REGIMES", "BWD_REDUCE_PARTS",
     "BWD_REDUCE_GRID", "K5_GRID_BANDS", "K5_FORM_BANDS", "K5_FORM_ROWS", "FWD_FINISH_PROGRAM", "FWD_FINISH_ROWS",
-    "FWD_FINISH_COL_SPLIT", "K3_TILING", "K6_CTAS_PER_SM", "FWD_MAP_XNRM",
+    "FWD_FINISH_COL_SPLIT", "K3_TILING", "K6_CTAS_PER_SM", "FWD_MAP_XNRM", "BWD_DPL_BANDS",
 )  # fmt: skip
 H_TABLES: dict[int, dict[str, Any]] = {
     5120: {
@@ -9045,6 +9384,7 @@ H_TABLES: dict[int, dict[str, Any]] = {
         "FWD_FINISH_COL_SPLIT": 5,
         "K3_TILING": (2, 5),
         "K6_CTAS_PER_SM": 2,
+        "BWD_DPL_BANDS": {"sm_100a": (), "sm_103a": (), "sm_107a": ()},
     },
     7168: {
         "PK_BANDS": {"sm_100a": (), "sm_103a": (), "sm_107a": ()},
@@ -9139,6 +9479,7 @@ H_TABLES: dict[int, dict[str, Any]] = {
         "FWD_FINISH_COL_SPLIT": 7,
         "K3_TILING": (2, 7),
         "K6_CTAS_PER_SM": 1,
+        "BWD_DPL_BANDS": {"sm_100a": (), "sm_103a": (), "sm_107a": ()},
     },
 }
 
@@ -9341,7 +9682,17 @@ def bwd_slab_program(
             units <= sm_count or kept
         ):  # one round of K7 units, or a chunk count / (P, T) run the band keeps on xrsg
             program = fit[1]
+    if program in BWD_DPL_SLABS and _in_bands(
+        T, _tab("BWD_DPL_BANDS", hidden)[arch]
+    ):  # the dfn_part partials kept in L2 for the final reduction
+        program += "_dpl"
     return program
+
+
+def _in_bands(
+    T, bands
+):  # -> whether above < T <= at_most for a band of ((above, at_most[, ...]), ...)
+    return any(band[0] < T <= band[1] for band in bands)
 
 
 def bwd_reduce_program(
@@ -9359,6 +9710,10 @@ def bwd_reduce_program(
         for refined, p_min, p_max in parts:
             if p_min <= P and (p_max is None or p_max >= P):
                 program = refined
+    if bwd_slab_program(T, sm_count, arch, hidden).endswith(
+        "_dpl"
+    ):  # the column-slab pass kept dfn_part in L2: the form loading it EVICT_FIRST
+        program += "_dpl"
     if bwd_group_rows(T, sm_count, arch, hidden):  # the program's group-row form
         program += "_trows"
     return program
@@ -10040,7 +10395,11 @@ PDL_OFF_BANDS: dict[str, dict[str, dict[str, tuple[tuple[int, int], ...]]]] = {
             "checkpoint": ((0, 4096),),
         },
     },
-    "sm_107a": {},
+    "sm_107a": {
+        "K6->K7": {
+            "checkpoint": ((3583, 4096),),
+        },
+    },
 }
 
 
@@ -10319,6 +10678,8 @@ __all__ = [
     "TOKP_LAYOUT",
     "WORKSPACE_OF_KIND",
     "WORKSPACE_REGIONS",
+    "BWD_DPL_BANDS",
+    "BWD_DPL_SLABS",
     "BWD_REDUCE_GRID",
     "BWD_REDUCE_PARTS",
     "BWD_REDUCE_PROGRAM",

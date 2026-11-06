@@ -210,8 +210,9 @@ edges, measured at hidden 4096 and applied at every hidden size), where the
 early launch would hold the dependent's CTAs resident while the predecessor
 still runs.  The column-slab pass (every form) sits on the deterministic
 ``K6->K7`` edge: the token-owner pass releases the fn split at once and the fn
-split releases the column-slab pass at once, so the column-slab pass's early
-launch overlaps the token-owner pass as in the deterministic route.
+split releases the column-slab pass at once, so the column-slab pass may
+launch before the token-owner pass ends; it waits only for the fn split, whose
+last instruction waits for the token-owner pass.
 ``PDL_BAND_OVERRIDES`` holds this package's own bands, measured on its kernels
 per architecture, SM count and hidden size (the route plan passes the device's
 SM count): a cell replaces the ``PDL_OFF_BANDS`` cell of its edge and path for
@@ -223,7 +224,10 @@ hidden size; on GB200 (sm_100a with 152 SMs) the collapse and the backward
 prepare are off in (2944, 3584] tokens, 24 to 28 token tiles, and the
 column-slab pass has its own bands per hidden size; on GB300 with 152 SMs the
 column-slab pass (checkpointed backward) has its own bands per hidden size;
-every other board keeps ``PDL_OFF_BANDS``.
+on sm_107a the column-slab pass keeps the attribute on at every token count
+and SM count (hidden 4096: a cell without a band in place of the
+deterministic column slab's checkpointed-backward band); every other board
+keeps ``PDL_OFF_BANDS``.
 """
 
 from __future__ import annotations
@@ -7713,8 +7717,13 @@ FWD_MAP_CLAIM = {
 # 65536, checkpoint 0.996 / 0.995, 0.980 / 0.988, 0.973 / 0.975, 0.991 / 0.986, 0.995 / 0.995 and 0.995 / 0.995: every
 # path reads faster with the hint from 65 to 65536 tokens except 14929-15288, where the checkpoint path reads 0.9997 /
 # 1.0001 at 15288 (forward 0.990 / 0.991) and the form itself runs.
+# On sm_100a the band runs on to 7168 tokens: against the 6144-token band (B200, two sessions, CUPTI active) every
+# path reads faster in both sessions -- forward 0.979 / 0.978 at 6656 and 0.986 / 0.987 at 7168, forward_pf 0.983 /
+# 0.982 and 0.983 / 0.985, checkpoint 0.983 / 0.983 and 0.989 / 0.990 (identical-program control 0.999-1.000); at
+# 7680 forward reads 0.998 / 0.998 there but 1.000 / 1.002 against main in two record sessions, so the band stops
+# at 7168.
 FWD_MAP_XNRM = {
-    "sm_100a": ((64, 6144),),
+    "sm_100a": ((64, 7168),),
     "sm_103a": ((64, 6144),),
     "sm_107a": ((64, 14928), (15288, 65536)),
 }
@@ -8113,7 +8122,8 @@ K6_CTAS_PER_SM = 2
 # it does not spell is an error, never the H 4096 value. The column slab's calibration of those sizes is no H_TABLES
 # entry: lpt_chunks reads BWD_SLAB_LPT_HIDDEN (BWD_SLAB_LPT is the H 4096 table), and bwd_slab_order reads
 # BWD_SLAB_ORDER at every size; the board cells of BWD_SLAB_LPT_OVERRIDES / BWD_SLAB_ORDER_OVERRIDES name their hidden
-# size in the key.
+# size in the key. BWD_DPL_BANDS (the bands of the deterministic column slab's and reduction's L2-hint forms) goes
+# with the dropped column-slab and final-reduction tables.
 H_TABLE_NAMES = (
     "PK_BANDS", "FN_SPLIT_PROGRAM", "FN_SPLIT_GRID", "FWD_MAP_PRODUCTION", "FWD_MAP_BANDS", "FWD_MAP_FIT",
     "FWD_MAP_CLAIM", "FWD_COEF_REGIMES", "BWD_TOKEN_PROGRAM", "BWD_TOKEN_REGIMES", "BWD_TOKEN_BANDS",
@@ -9212,7 +9222,8 @@ PDL_PATHS = ("forward", "backward", "checkpoint")
 # bands of PDL_OFF_BANDS are the deterministic package's on the edges this
 # package has (the atomic column slab (every form), launched behind the fn
 # split that the token-owner pass releases at once, takes the deterministic
-# column slab's K6->K7 bands; there is no K7->K8 edge).
+# column slab's K6->K7 bands, except on sm_107a, where its own cell of
+# PDL_BAND_OVERRIDES keeps the attribute on; there is no K7->K8 edge).
 PDL_EDGES = {
     "cake_mhc_train_bwd_prepare": "K1->K5",
     "cake_mhc_train_bwd_slab_atomic": "K6->K7",
@@ -9241,7 +9252,11 @@ PDL_OFF_BANDS: dict[str, dict[str, dict[str, tuple[tuple[int, int], ...]]]] = {
             "checkpoint": ((4096, 8192),),
         },
     },
-    "sm_107a": {},
+    "sm_107a": {
+        "K6->K7": {
+            "checkpoint": ((3583, 4096),),
+        },
+    },
 }
 # This package's own bands, measured on its kernels on B200 (sm_100a, 148 SMs):
 # package-level A/B of these bands against PDL_OFF_BANDS on the forward and
@@ -9281,7 +9296,14 @@ PDL_OFF_BANDS: dict[str, dict[str, dict[str, tuple[tuple[int, int], ...]]]] = {
 # 2160) and on above, off in (1024, 1984] and (7168, 8192] at 5120 (on was
 # 0.67..1.39 us faster from 1985 to 2046 tokens, 16 of 16 groups, and 0.39 us
 # slower at 8192) and on between, and off from 769 tokens on at 7168.
-# B300 (sm_103a, 148 SMs) and sm_107a are not measured and keep PDL_OFF_BANDS.
+# On sm_107a (R200) the column slab (K6->K7, checkpoint) keeps the attribute on at every token count and SM count
+# (hidden 4096): the deterministic band (3583, 4096] is the deterministic column slab's, measured on its own kernel,
+# and this package's column slab launches behind the atomic fn split. On R200 with 212 SMs (HBM at 3186 MHz), the
+# checkpointed step with the attribute off at every token count against on (4 processes, one per GPU; events with a
+# 512 MiB L2 flush before every call, and CUDA graphs): off is slower beyond the identical-arm control in both
+# timings at 2048, 2880, 2944, 3072, 3456, 3584, 3840 and 4096 tokens (events: 0.79..2.14 us per call, 4 of 4
+# processes; CUDA graphs: 3 or 4 of 4) and not faster at 8192.
+# B300 (sm_103a, 148 SMs) is not measured and keeps PDL_OFF_BANDS.
 PDL_BAND_OVERRIDES: dict[
     tuple[str, int | None, int | None],
     dict[str, dict[str, tuple[tuple[int, int | None], ...]]],
@@ -9347,6 +9369,11 @@ PDL_BAND_OVERRIDES: dict[
             "checkpoint": ((831, None),),
         },
     },
+    ("sm_107a", None, 4096): {
+        "K6->K7": {
+            "checkpoint": (),
+        },
+    },
 }
 
 
@@ -9366,7 +9393,8 @@ def enable_pdl(
     of :data:`PDL_BAND_OVERRIDES` under the most specific key that holds one --
     ``(arch, sm_count, hidden)``, ``(arch, sm_count, None)``, ``(arch, None,
     hidden)``, with the record's hidden size -- else the cell of
-    :data:`PDL_OFF_BANDS`."""
+    :data:`PDL_OFF_BANDS`.  An override cell without a band still counts as one:
+    it keeps the attribute on at every token count."""
 
     if path not in PDL_PATHS:
         raise ValueError(f"unknown Cake mHC training call path: {path!r}")

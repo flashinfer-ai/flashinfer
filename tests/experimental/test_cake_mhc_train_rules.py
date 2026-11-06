@@ -59,10 +59,12 @@ and record scalars of every hidden size on its boards of record
   sm_103a at 5120 and 7168 ``dynr`` and ``dynr_os``), no reduction; every
   program the column slab's tables and board cells can name has a record on
   the route, and every ``_os`` record a band of them that names it;
-* the PDL bands without an SM count are the deterministic ones; this package's
-  own bands (``PDL_BAND_OVERRIDES``, B200 with 148 SMs only) replace them on
-  that board alone, the most specific key first (the order of the keys under a
-  test table), and the route plan passes the device's SM count;
+* the PDL bands without an SM count are the deterministic ones, but on sm_107a,
+  whose column slab keeps the attribute on at hidden 4096 (a cell without a
+  band); this package's own bands (``PDL_BAND_OVERRIDES``: B200 with 148 SMs,
+  GB200 and GB300 with 152) replace them on their board alone, the most
+  specific key first (the order of the keys under a test table), and the route
+  plan passes the device's SM count;
 * the workspaces: ``fwd`` the deterministic one, ``bwd`` the deterministic
   regions at the same offsets without the trailing ``dfn_part``, at every
   hidden size;
@@ -1170,10 +1172,12 @@ def test_pdl_follows_the_deterministic_edges(arch: str, sm: int) -> None:
     """``PDL_EDGES`` = the deterministic edges without ``K7->K8``, the column slab's stem
     ``cake_mhc_train_bwd_slab_atomic`` on ``K6->K7`` (every form and size); ``PDL_OFF_BANDS`` = the deterministic
     bands without ``K7->K8`` (one table for every hidden size, as in the deterministic package).  On every path and
-    token count (the counts of record and every band boundary) the ``enable_pdl`` without an SM count (this package's
-    own bands, ``PDL_BAND_OVERRIDES``, need one: :func:`test_pdl_band_overrides_by_board`) of the column-slab records
-    of each hidden size equals every deterministic column-slab record's of the route of that size, the fn splits take
-    no per-call argument (their attribute is static), and every copied record reads the deterministic value."""
+    token count (the counts of record and every band boundary) the ``enable_pdl`` without an SM count of the
+    column-slab records of each hidden size reads the bands of :func:`_pdl_cell` without an SM count: every
+    deterministic column-slab record's value of the route of that size where no ``(arch, None, hidden)`` cell holds
+    the column slab's edge (the bands with an SM count: :func:`test_pdl_band_overrides_by_board`; the sm_107a cell:
+    :func:`test_pdl_sm107a_column_slab_keeps_pdl_on`), the fn splits take no per-call argument (their attribute is
+    static), and every copied record reads the deterministic value."""
     expected_edges = {
         _renamed(stem): edge
         for stem, edge in det.PDL_EDGES.items()
@@ -1220,13 +1224,22 @@ def test_pdl_follows_the_deterministic_edges(arch: str, sm: int) -> None:
     ]
     for T in sorted(set(T_VALUES) | {t for t in boundaries if t > 0}):
         for path in det.PDL_PATHS:
-            value = nd.enable_pdl(SLAB, T, arch, path)
-            assert value in (0, 1)
+            det_value = _pdl_value(
+                T, det.PDL_OFF_BANDS.get(arch, {}).get("K6->K7", {}).get(path, ())
+            )
             for hidden, (names, split, det_slabs) in slabs.items():
+                value = _pdl_value(T, _pdl_cell(arch, None, hidden, "K6->K7", path))
                 for name in names:
                     assert nd.enable_pdl(name, T, arch, path) == value, (T, path, name)
                 for name in det_slabs:
-                    assert value == det.enable_pdl(name, T, arch, path), (T, path, name)
+                    assert det.enable_pdl(name, T, arch, path) == det_value, (
+                        T,
+                        path,
+                        name,
+                    )
+                own = PDL_OVERRIDES.get((arch, None, hidden), {}).get("K6->K7", {})
+                if own.get(path) is None:
+                    assert value == det_value, (T, path, hidden)
                 assert nd.enable_pdl(split, T, arch, path) == 1, (T, path, hidden)
             for name in copied:
                 assert nd.enable_pdl(_renamed(name), T, arch, path) == det.enable_pdl(
@@ -1242,7 +1255,9 @@ def test_pdl_follows_the_deterministic_edges(arch: str, sm: int) -> None:
 # and the column slab (``K6->K7``, checkpointed backward) per hidden size.  GB200: the collapse and the backward
 # prepare off in (2944, 3584] beside the deterministic (4096, 8192] at every hidden size, and the column slab per
 # hidden size, open above at 7168.  GB300: the column slab (checkpointed backward) per hidden size, open above at 5120
-# and 7168.  Every other board (B300: sm_103a with 148 SMs, sm_107a) keeps the deterministic bands.
+# and 7168.  sm_107a (every SM count and none, hidden 4096): the column slab (checkpointed backward) without a band
+# in place of the deterministic column slab's band.  Every other board (B300: sm_103a with 148 SMs) and every other
+# edge of sm_107a keeps the deterministic bands.
 PDL_OVERRIDES = {
     ("sm_100a", 148, None): {
         "K1->K3": {"forward": ((2944, 3456), (4096, 8192))},
@@ -1263,8 +1278,9 @@ PDL_OVERRIDES = {
         "K6->K7": {"checkpoint": ((1087, 1920), (4096, 8192), (24576, None))}
     },
     ("sm_103a", 152, 7168): {"K6->K7": {"checkpoint": ((831, None),)}},
+    ("sm_107a", None, 4096): {"K6->K7": {"checkpoint": ()}},
 }
-# The boards with bands of their own (B200, GB200 and GB300).
+# The boards with bands of their own (B200, GB200 and GB300; the sm_107a cell holds no SM count).
 PDL_OVERRIDE_BOARDS = {
     (arch, sm) for arch, sm, _hidden in PDL_OVERRIDES if sm is not None
 }
@@ -1364,8 +1380,9 @@ def test_pdl_band_overrides_are_well_formed() -> None:
     """``PDL_BAND_OVERRIDES`` is the table of record (:data:`PDL_OVERRIDES`) and well formed: each key names a known
     architecture, an SM count (a positive int) or ``None`` and a hidden size the architecture serves or ``None``,
     never both ``None`` (that cell is ``PDL_OFF_BANDS``'s); each cell sits on an edge of ``PDL_EDGES`` and a path of
-    ``PDL_PATHS`` and holds non-empty, sorted, disjoint bands ``(above, at_most]`` of ints with
-    ``0 <= above < at_most``, where only the last band may leave ``at_most`` ``None`` (no upper end)."""
+    ``PDL_PATHS`` and holds sorted, disjoint bands ``(above, at_most]`` of ints with ``0 <= above < at_most``, where
+    only the last band may leave ``at_most`` ``None`` (no upper end), or no band where it keeps the attribute on over
+    a band of ``PDL_OFF_BANDS``."""
     assert nd.PDL_BAND_OVERRIDES == PDL_OVERRIDES
     assert "PDL_BAND_OVERRIDES" in nd.__all__
     edges = set(nd.PDL_EDGES.values())
@@ -1379,7 +1396,10 @@ def test_pdl_band_overrides_are_well_formed() -> None:
         for edge, paths in cells.items():
             assert edge in edges and paths, (key, edge)
             for path, bands in paths.items():
-                assert path in nd.PDL_PATHS and bands, (key, edge, path)
+                assert path in nd.PDL_PATHS, (key, edge, path)
+                assert bands or nd.PDL_OFF_BANDS.get(arch, {}).get(edge, {}).get(
+                    path
+                ), (key, edge, path)
                 last = None
                 for i, (above, at_most) in enumerate(bands):
                     assert type(above) is int, (key, edge, bands)
@@ -1398,10 +1418,11 @@ def test_pdl_band_overrides_are_well_formed() -> None:
 def test_pdl_band_overrides_by_board(arch: str, sm: int) -> None:
     """On every board (the boards of record, GB200 and B300), hidden size, path, record that takes the per-call PDL
     argument and token count (:func:`_pdl_token_counts`), ``enable_pdl`` with the board's SM count reads 0 exactly
-    inside the bands of :func:`_pdl_cell` and 1 outside, and without an SM count the deterministic bands (the
-    four-argument value, the deterministic record's for the copied records: the collapse and the backward prepare).
-    Only the boards with bands of their own (:data:`PDL_OVERRIDE_BOARDS`: B200 with 148 SMs, GB200 and GB300 with
-    152) read other values than the deterministic bands; every other board reads the value without an SM count."""
+    inside the bands of :func:`_pdl_cell` and 1 outside, and without an SM count the bands of :func:`_pdl_cell`
+    without one: the deterministic bands but under an ``(arch, None, hidden)`` cell (the four-argument value, the
+    deterministic record's for the copied records: the collapse and the backward prepare).  Only the boards with bands
+    of their own (:data:`PDL_OVERRIDE_BOARDS`: B200 with 148 SMs, GB200 and GB300 with 152) read other values than
+    the bands without an SM count; every other board reads the value without an SM count."""
     differs = 0
     for hidden in _arch_sizes(arch):
         names = _runtime_pdl_records(arch, hidden)
@@ -1413,8 +1434,11 @@ def test_pdl_band_overrides_by_board(arch: str, sm: int) -> None:
             copied = det_name in det.MODULES
             for path in nd.PDL_PATHS:
                 cell = _pdl_cell(arch, sm, hidden, edge, path)
-                base = det.PDL_OFF_BANDS.get(arch, {}).get(edge, {}).get(path, ())
-                assert _pdl_cell(arch, None, hidden, edge, path) == base
+                base = _pdl_cell(arch, None, hidden, edge, path)
+                assert (
+                    base == det.PDL_OFF_BANDS.get(arch, {}).get(edge, {}).get(path, ())
+                    or (arch, None, hidden) in PDL_OVERRIDES
+                ), (hidden, name, path)
                 for T in _pdl_token_counts(arch):
                     what = (hidden, name, path, T)
                     value = nd.enable_pdl(name, T, arch, path, sm_count=sm)
@@ -1491,6 +1515,51 @@ def test_pdl_band_overrides_at_the_measured_points_gb300() -> None:
                     assert nd.enable_pdl(
                         name, T, arch, path, sm_count=152
                     ) == nd.enable_pdl(name, T, arch, path), (hidden, name, path, T)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("sm", (208, 212, 216, None))
+def test_pdl_sm107a_column_slab_keeps_pdl_on(sm: int | None) -> None:
+    """On sm_107a at hidden 4096 (its one size), with every R200 SM count and without one, every column-slab record
+    of the ``bwd_finish`` route reads 1 on the checkpointed backward at the edges of the deterministic column slab's
+    band (``PDL_OFF_BANDS``, ``K6->K7``, checkpointed backward), inside it, beside it and away from it, where the
+    deterministic column slab reads 0 exactly inside that band; on the other paths the column slab, and on every path
+    the other records that take the per-call argument (the collapse and the backward prepare), read the deterministic
+    values."""
+    arch = "sm_107a"
+    assert _arch_sizes(arch) == (HIDDEN,)
+    band = det.PDL_OFF_BANDS[arch]["K6->K7"]["checkpoint"]
+    edges = {
+        T for above, at_most in band for T in (above, above + 1, at_most, at_most + 1)
+    }
+    tokens = sorted(T for T in {1, 2048, 8192, *edges} if T > 0)
+    assert any(_pdl_value(T, band) == 0 for T in tokens), band
+    slabs = _slabs(arch)
+    det_slabs = [
+        n
+        for n in det.route_modules(arch, HIDDEN, "bwd_finish")
+        if _det_role(n) == "bwd_slab"
+    ]
+    others = [n for n in _runtime_pdl_records(arch, HIDDEN) if n not in slabs]
+    assert slabs and det_slabs and others, (slabs, det_slabs, others)
+    for T in tokens:
+        det_value = _pdl_value(T, band)
+        for name in det_slabs:
+            assert det.enable_pdl(name, T, arch, "checkpoint") == det_value, (name, T)
+        for name in slabs:
+            what = (sm, name, T)
+            assert nd.enable_pdl(name, T, arch, "checkpoint", sm_count=sm) == 1, what
+            for path in ("forward", "backward"):
+                assert nd.enable_pdl(
+                    name, T, arch, path, sm_count=sm
+                ) == det.enable_pdl(det_slabs[0], T, arch, path), (what, path)
+        for name in others:
+            det_name = name.replace(ND_PREFIX, DET_PREFIX)
+            assert det_name in det.MODULES, name
+            for path in nd.PDL_PATHS:
+                assert nd.enable_pdl(
+                    name, T, arch, path, sm_count=sm
+                ) == det.enable_pdl(det_name, T, arch, path), (sm, name, T, path)
 
 
 # A test table for the order of the keys: one band per key on the column slab's edge of sm_100a.  (sm_100a, 148, 5120)
@@ -1706,10 +1775,12 @@ _SHARED_TABLES = (
     "K5_FORM_BANDS", "K5_FORM_ROWS", "FWD_FINISH_PROGRAM", "FWD_FINISH_ROWS", "FWD_FINISH_COL_SPLIT", "K3_TILING",
     "K6_CTAS_PER_SM", "PDL_PATHS", "SELECT_RULE_KINDS", "RUN_TIME_ITERS_ROLES",
 )  # fmt: skip
-# The deterministic column-slab and reduction rules, absent here.
+# The deterministic column-slab and reduction rules, absent here (BWD_DPL_BANDS / BWD_DPL_SLABS: the bands and the
+# column-slab programs of their L2-hint forms).
 _DROPPED_RULES = (
     "BWD_SLAB_PROGRAM", "BWD_SLAB_BANDS", "BWD_SLAB_FIT", "BWD_REDUCE_PROGRAM", "BWD_REDUCE_REGIMES",
-    "BWD_REDUCE_PARTS", "BWD_REDUCE_GRID", "bwd_slab_program", "bwd_reduce_program", "bwd_reduce_grid",
+    "BWD_REDUCE_PARTS", "BWD_REDUCE_GRID", "BWD_DPL_BANDS", "BWD_DPL_SLABS", "bwd_slab_program",
+    "bwd_reduce_program", "bwd_reduce_grid",
 )  # fmt: skip
 # This package's own column-slab rule, absent from the deterministic registry.
 _OWN_RULES = (
@@ -3329,8 +3400,8 @@ def test_no_entry_alerts_before_its_operands_pass(monkeypatch) -> None:
 @pytest.mark.cpu_only
 def test_package_wiring() -> None:
     """The test-helper key, ``flashinfer.experimental.cake`` (a docstring only), the package data, the ignored
-    ``aot/`` directory and the pre-commit exclude of the generated sources; the legacy backend directory keeps its
-    alias module only (no registry, manifest or sources)."""
+    ``aot/`` directory and the pre-commit exclude of the generated sources; no module is left at the removed
+    ``flashinfer.cake_mhc_train_backend`` path."""
     assert PACKAGES[KEY] == PACKAGE_NAME == pkg.__name__
     assert "flashinfer.cake_mhc_train_backend" not in PACKAGES.values()
     assert "cake_mhc_train" not in PACKAGES
@@ -3350,10 +3421,7 @@ def test_package_wiring() -> None:
         "experimental/cake/cake_mhc_train_backend/csrc/"
         in (REPO / ".pre-commit-config.yaml").read_text()
     )
-    legacy = REPO / "flashinfer" / "cake_mhc_train_backend"
-    assert sorted(p.name for p in legacy.iterdir() if p.name != "__pycache__") == [
-        "__init__.py"
-    ]
+    assert not list((REPO / "flashinfer" / "cake_mhc_train_backend").glob("*.py"))
 
 
 @pytest.mark.cpu_only
@@ -3410,7 +3478,7 @@ def _manifest_checker():
 
 @pytest.mark.cpu_only
 def test_manifest_checker_lists_the_package() -> None:
-    """The build-manifest checker lists this package once (generic registry walker over ``cake_jit.py``) and no legacy
+    """The build-manifest checker lists this package once (generic registry walker over ``cake_jit.py``) and no removed
     ``flashinfer.cake_mhc_train_backend``; its vendored gate finds the package's suite key; the in-tree checks report
     nothing."""
     checker = _manifest_checker()

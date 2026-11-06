@@ -71,12 +71,12 @@ _GRIDS = {"sm_100a": (148,), "sm_103a": (148, 152, 160), "sm_107a": (212,)}
 # DeepGEMM's fp8_mqa_logits accumulates in four K = 32 steps, the order of the sm_100a / sm_103a FP8 programs.
 _K32_ARCHES = ("sm_100a", "sm_103a")
 # The architectures that register an FP8 wide program; elsewhere an FP8 wide decision runs l6 (``FP8_KIND_FALLBACK``).
-_FP8_WIDE_ARCHES = ("sm_103a",)
+_FP8_WIDE_ARCHES = ("sm_100a", "sm_103a")
 
 
 def _spec_fp8_keys(arch: str) -> set[str]:
     """The FP8 scan keys the export registers per architecture: narrow, l6, split_narrow and split_l6 with
-    their :lsf copies on sm_100a / sm_103a, and wide with its :lsf copy on sm_103a; narrow, l6 and split_narrow on
+    their :lsf copies on sm_100a / sm_103a, and wide with its :lsf copy on sm_100a / sm_103a; narrow, l6 and split_narrow on
     sm_107a.  A stand-in registry for the host tests while a checkout registers none; the dispatch reads the tile
     unroll from the keys, so two unrolls appear."""
     if arch == "sm_107a":
@@ -289,7 +289,7 @@ def test_fp8_program_choice_follows_the_key():
         "wide": policy.block_q_wide,
         "l6": policy.block_q_l6,
     }
-    # sm_103a's keys add the wide program
+    # both key sets carry the wide program
     for key in sorted(_spec_fp8_keys("sm_100a") | _spec_fp8_keys("sm_103a")):
         fields = scan_key_fields(key)
         c = fp8_program_choice(policy, base, key)
@@ -433,7 +433,7 @@ def test_fp8_dispatch_maps_the_decision_under_the_fp8_record_and_reaches_every_f
 )
 def test_fp8_wide_call_runs_the_wide_or_l6_program(arch, grid):
     """s1_8k_on_64k (8192 queries over 73728 keys, one segment, top_k 2048): the BF16 record plans a wide unit, and the
-    FP8 form runs its wide program (8 queries per unit) where the architecture registers one (sm_103a), else its l6
+    FP8 form runs its wide program (8 queries per unit) where the architecture registers one (sm_100a / sm_103a), else its l6
     program (``FP8_KIND_FALLBACK``), unpaired and unsplit, rather than the narrow one."""
     keys = set((cake_jit.PROGRAM_KEYS or {}).get(arch) or ())
     if not any(scan_key_form(k) == FP8 for k in keys):
@@ -854,16 +854,26 @@ def test_fp8_empty_rows_and_no_keys_are_all_padding():
     assert indices.shape == (0, 16) and scores.shape == (0, 16)
 
 
+# two segments of unequal key length, each with more units than CTAs: the longest-first order and the ticket draws
+# that continue into the shorter segment differ from the plain order's
+_UNEQUAL2 = dict(seg_q_len=[4096, 4096], seg_k_len=[200000, 20000], top_k=2048)
+
+
 @pytest.mark.parametrize(
     "shape",
-    [dict(seg_q_len=[700, 300, 200], seg_k_len=[700, 9000, 4000], top_k=1024), _S1],
-    ids=["packed", "s1_8k_on_64k"],
+    [
+        dict(seg_q_len=[700, 300, 200], seg_k_len=[700, 9000, 4000], top_k=1024),
+        _S1,
+        _UNEQUAL2,
+    ],
+    ids=["packed", "s1_8k_on_64k", "unequal_two_segments"],
 )
 def test_fp8_dispatch_invariance_over_every_registered_program(monkeypatch, shape):
     """Every FP8 program of the device's architecture, forced on the same call (the planned capacity, check period,
     sampling and finalize; the split and unit geometry of the forced key), returns the dispatched program's ids and
     score bits: within one architecture the dispatched FP8 program never changes a result.  The packed call is judged
-    against the reference; on ``_S1`` every unit kind outnumbers the CTAs, so a drawing program draws tickets."""
+    against the reference; on ``_S1`` and ``_UNEQUAL2`` every unit kind outnumbers the CTAs, so a drawing program
+    draws tickets, and on ``_UNEQUAL2`` the draws cross from one segment into the other in both segment orders."""
     _require_fp8_program()
     arch = arch_for(torch.device("cuda"))
     policy = policy_for(arch, FP8)
@@ -873,7 +883,9 @@ def test_fp8_dispatch_invariance_over_every_registered_program(monkeypatch, shap
         for key in unrolls.values()
     )
     inputs = ref.make_fp8_inputs(seed=41, device="cuda", **shape)
-    reference = None if shape is _S1 else ref.select_reference(inputs)
+    reference = (
+        None if shape is _S1 or shape is _UNEQUAL2 else ref.select_reference(inputs)
+    )
     original = cake_backend.plan_dsa_indexer_det_topk
     for sample in (None, 0):
         extra = {} if sample is None else {"sample_tiles_max": sample}
