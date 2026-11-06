@@ -31,23 +31,23 @@ checkpoint early stop off so that every arm recomputes its forward GEMM
 (``2 x forward + backward``, the same work in every arm).  Opt-in autograd rows
 over the same distributions: ``step_es``, that step with early stop on (the
 torch default: an arm whose inputs are saved before its GEMM launches,
-``cake`` and ``torch._grouped_mm``, skips the recomputed forward); ``block`` /
+``cake_det`` and ``torch._grouped_mm``, skips the recomputed forward); ``block`` /
 ``block_es``, one checkpointed MoE expert block with early stop off / on --
 gate_up, ``silu(a) * b`` on its two halves, down, with the gradients of ``x``,
 ``w1`` and ``w2`` -- in which only the recompute of the down GEMM can be
 skipped.  The rate of the ``step`` rows counts the four GEMMs every arm runs;
 that of the other autograd rows the useful work only (forward, data and
-weight gradient of each GEMM).  Opt-in arm ``cake_inforward``: ``cake``
-through a direct ``CakeGroupedDetMm.apply(x, w, offs, True)``, whose forward
+weight gradient of each GEMM).  Opt-in arm ``cake_det_inforward``: ``cake_det``
+through a direct ``CakeGroupedDetMm.apply(x, w, offs)``, whose forward
 GEMM launches inside ``forward`` so that a checkpoint always recomputes it
-(autograd rows only; when it runs with ``cake``, the JSON records the elements
+(autograd rows only; when it runs with ``cake_det``, the JSON records the elements
 in which their outputs and gradients differ -- none).  ``--census`` adds the
 CUDA kernel count of one call per arm (``torch.profiler``).
 
 Usage::
 
     python benchmarks/bench_cake_moe_grouped_det_gemm.py [--ops fwd,wgrad,step] [--rows e4_m112576] [--cupti] [--json out.json]
-    python benchmarks/bench_cake_moe_grouped_det_gemm.py --ops step,step_es,block,block_es --arms cake,cake_inforward,torch_grouped_mm [--census]
+    python benchmarks/bench_cake_moe_grouped_det_gemm.py --ops step,step_es,block,block_es --arms cake_det,cake_det_inforward,torch_grouped_mm [--census]
 """
 
 import argparse
@@ -99,7 +99,7 @@ E4_GROUPS = {
 }
 EXPERT_COUNTS = (8, 16, 32)
 EXPERT_COUNT_SUM_M = 131072
-ARMS = ("cake", "torch_grouped_mm", "per_expert_cublas", "cudnn_grouped_mm")
+ARMS = ("cake_det", "torch_grouped_mm", "per_expert_cublas", "cudnn_grouped_mm")
 
 
 def build_rows():
@@ -239,7 +239,7 @@ def _step(mm, t, early_stop=False):
     recompute stops once the region saved its last tensor, so an arm whose inputs are
     saved before its GEMM launches (``torch._grouped_mm``, ``cake_grouped_det_mm``) does
     one GEMM less, and one that launches inside ``Function.forward``
-    (``cake_inforward``) still recomputes it."""
+    (``cake_det_inforward``) still recomputes it."""
     return _checkpointed(mm, t, ("x", "w"), early_stop)
 
 
@@ -264,7 +264,7 @@ def _autograd(mm, row, t):
     return _step(mm, t, early_stop=op == "step_es")
 
 
-def cake_arm(row, t):
+def cake_det_arm(row, t):
     op = row["op"]
     if op in AUTOGRAD_OPS:
         fn = _autograd(lambda x, w, offs: cake_grouped_det_mm(x, w, offs), row, t)
@@ -278,14 +278,14 @@ def cake_arm(row, t):
     return launch.launch, f"{launch.record_name} plan={launch.plan}"
 
 
-def cake_inforward_arm(row, t):
-    """``cake`` through a direct ``CakeGroupedDetMm.apply``: the forward GEMM launches
+def cake_det_inforward_arm(row, t):
+    """``cake_det`` through a direct ``CakeGroupedDetMm.apply``: the forward GEMM launches
     inside ``forward``, before autograd saves the inputs (the internal control of the
     autograd rows)."""
     op = row["op"]
     if op not in AUTOGRAD_OPS:
         raise NotImplementedError("the in-forward control has autograd rows only")
-    fn = _autograd(lambda x, w, offs: CakeGroupedDetMm.apply(x, w, offs, True), row, t)
+    fn = _autograd(lambda x, w, offs: CakeGroupedDetMm.apply(x, w, offs), row, t)
     return fn, f"{AUTOGRAD_NOTES[op]} (direct CakeGroupedDetMm.apply)"
 
 
@@ -380,11 +380,11 @@ def cudnn_grouped_mm_arm(row, t):
 
 
 ARM_BUILDERS = {
-    "cake": cake_arm,
+    "cake_det": cake_det_arm,
     "torch_grouped_mm": torch_grouped_mm_arm,
     "per_expert_cublas": per_expert_cublas_arm,
     "cudnn_grouped_mm": cudnn_grouped_mm_arm,
-    "cake_inforward": cake_inforward_arm,
+    "cake_det_inforward": cake_det_inforward_arm,
 }
 
 
@@ -402,15 +402,15 @@ def _autograd_outputs(fn):
     return [y.detach()] + [leaf.grad for leaf in leaves]
 
 
-def _cake_vs_inforward(row, grads):
-    """The count of elements in which the ``cake`` and ``cake_inforward`` output and
+def _cake_det_vs_inforward(row, grads):
+    """The count of elements in which the ``cake_det`` and ``cake_det_inforward`` output and
     gradients differ (none: the same deterministic programs)."""
     if len(grads) < 2:
         return None
     names = ("out", "x.grad", "w1.grad", "w2.grad")
     if row["op"] not in BLOCK_OPS:
         names = ("y", "x.grad", "w.grad")
-    pairs = zip(names, grads["cake"], grads["cake_inforward"], strict=True)
+    pairs = zip(names, grads["cake_det"], grads["cake_det_inforward"], strict=True)
     return {name: int((a != b).sum()) for name, a, b in pairs}
 
 
@@ -471,12 +471,11 @@ def main():
         parser.error(f"unknown arms {unknown}")
     if args.census and args.cupti:
         parser.error("--census profiles with torch.profiler; run it without --cupti")
-    if {"cake", "cake_inforward"} & set(arms) and not cb.generated_program_available(
-        device
-    ):
+    cake_arms = {"cake_det", "cake_det_inforward"} & set(arms)
+    if cake_arms and not cb.generated_program_available(device):
         arch = cb.arch_for(device)
         print(
-            f"# no generated program registered for this device ({arch}); the cake arms are skipped"
+            f"# no generated program registered for this device ({arch}); the cake_det arms are skipped"
         )
 
     results = []
@@ -500,8 +499,10 @@ def main():
         # Alternate the arm order between measured rows so that no arm always runs first.
         row_arms = arms if len(results) % 2 == 0 else arms[::-1]
         record["arm_order"] = list(row_arms)
-        # An autograd row run by both cake and cake_inforward compares their results.
-        check = row["op"] in AUTOGRAD_OPS and {"cake", "cake_inforward"} <= set(arms)
+        # An autograd row run by both cake_det and cake_det_inforward compares their results.
+        check = row["op"] in AUTOGRAD_OPS and {"cake_det", "cake_det_inforward"} <= set(
+            arms
+        )
         cells, grads = {}, {}
         for arm in row_arms:
             try:
@@ -509,7 +510,7 @@ def main():
                 times = _times_ms(fn, args.cupti)
                 ms = times["median_ms"]
                 entry = dict(**times, tflops=flops / ms / 1e9, note=note)
-                if check and arm in ("cake", "cake_inforward"):
+                if check and arm in ("cake_det", "cake_det_inforward"):
                     grads[arm] = _autograd_outputs(fn)
                     torch.cuda.synchronize(device)
                 if args.census:
@@ -521,15 +522,17 @@ def main():
                 record["arms"][arm] = dict(error=f"{type(exc).__name__}: {exc}"[:200])
                 cells[arm] = "n/a"
         if check:
-            record["cake_vs_inforward"] = _cake_vs_inforward(row, grads)
+            record["cake_det_vs_inforward"] = _cake_det_vs_inforward(row, grads)
         results.append(record)
         print(
             f"{row['label']:48s} {sum(row['sizes']):7d} "
             + " ".join(f"{cells[arm]:>18s}" for arm in arms)
         )
-        differing = record.get("cake_vs_inforward") or {}
+        differing = record.get("cake_det_vs_inforward") or {}
         if any(differing.values()):
-            print(f"# {row['label']}: cake differs from cake_inforward {differing}")
+            print(
+                f"# {row['label']}: cake_det differs from cake_det_inforward {differing}"
+            )
         del t, grads
         torch.cuda.empty_cache()
 
