@@ -290,6 +290,8 @@ run_bounded_parallel "${AOT_PROVIDER_CONCURRENCY}" build_provider_wheel \
 }
 echo "Provider wheels built in $(( SECONDS - PROVIDER_BUILD_STARTED_AT )) s"
 if [ -n "${FLASHINFER_SCCACHE_FLAVOR:-}" ]; then
+    # Diagnostics only: never fail the job on them.
+    set +eo pipefail
     echo "TRIAL host CPU seconds during provider build: $(awk -v a="$(trial_cpu_seconds)" -v b="${TRIAL_CPU_START}" 'BEGIN{print a-b}')"
     # Per-object and per-module checksums, paths relative to the build tree, for
     # cross-flavor output equality.
@@ -300,21 +302,29 @@ if [ -n "${FLASHINFER_SCCACHE_FLAVOR:-}" ]; then
     sed 's/^/TRIALSUM /' trial-object-sha256.txt
     # Content beyond raw bytes, for the first 40 nvcc objects: SASS text and
     # section-size layout (both independent of embedded temp names / module ids).
-    ( cd build/aot-providers && find . -name '*.cuda.o' | LC_ALL=C sort | head -40 ) | while read -r o; do
+    ( cd build/aot-providers && find . -name '*.cuda.o' | LC_ALL=C sort | sed -n '1,40p' ) | while read -r o; do
         f="build/aot-providers/${o#./}"
         sass=$(/usr/local/cuda/bin/cuobjdump -sass "$f" 2>/dev/null | grep -v -e 'Fatbin' -e 'code for' -e 'arch = ' -e 'identifier' | sha256sum | cut -c1-16)
         secs=$(readelf -SW "$f" | awk '/^ *\[/{print $2, $6}' | sha256sum | cut -c1-16)
         echo "TRIALSASS ${o} sass=${sass} sections=${secs}"
+    done
+    ( cd build/aot-providers && find . -name '*.cuda.o' | LC_ALL=C sort | sed -n '1,3p' ) | while read -r o; do
+        readelf -SW "build/aot-providers/${o#./}" | sed "s|^|TRIALSEC ${o##*/} |"
+        /usr/local/cuda/bin/cuobjdump -lelf -lptx "build/aot-providers/${o#./}" 2>&1 | sed "s|^|TRIALFATBIN ${o##*/} |"
+        strings -n 12 "build/aot-providers/${o#./}" | grep -i -e tmp -e module -e '__nv' | sort -u | head -20 | sed "s|^|TRIALSTR ${o##*/} |"
     done
     # nvcc run-to-run determinism: compile two targets directly (no sccache) twice.
     for t in $(cd build/aot-providers/sm80/cached_ops && ninja -f tmp/flashinfer_jit.ninja -t targets all 2>/dev/null | awk -F: '/\.cuda\.o:/{print $1}' | LC_ALL=C sort | head -2); do
         cmd=$(cd build/aot-providers/sm80/cached_ops && ninja -f tmp/flashinfer_jit.ninja -t commands "$t" | tail -1)
         cmd=${cmd#sccache }
         for i in 1 2; do
-            ( cd build/aot-providers/sm80/cached_ops && eval "${cmd//-o $t/-o /tmp/det$i.o}" ) >/dev/null 2>&1
+            # Same output path both times, so only nondeterminism can differ.
+            ( cd build/aot-providers/sm80/cached_ops && eval "${cmd//-o $t/-o /tmp/det.o}" ) >/dev/null 2>&1
+            cp /tmp/det.o "/tmp/det$i.o"
         done
         echo "TRIALDET ${t} run1=$(sha256sum < /tmp/det1.o | cut -c1-16) run2=$(sha256sum < /tmp/det2.o | cut -c1-16) cached=$(cd build/aot-providers/sm80/cached_ops && sha256sum < "$t" | cut -c1-16)"
     done
+    set -eo pipefail
     set -x
 fi
 
