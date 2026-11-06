@@ -43,9 +43,8 @@ from . import cake_build
 # ``router_fp32_fwd_simt_*``) and the sum of the
 # deterministic router program's split-K partials in a fixed order (template ``router_partials_sum``), which this
 # package's binding of that program launches after it.  Every program the deterministic package registers
-# (``cake_dense_projection_det_gemm_<hex>``, templates ``dense_proj_det_gemm_*``, ``router_fp32_det_gemm_*``,
-# ``split_fp32_det_bf16x3``) is served by that package: :func:`select_module` and
-# :func:`load_cake_dense_projection_gemm_module` forward its templates and names to it.
+# (``cake_dense_projection_det_gemm_<hex>``) is served by that package's registry and loader only: :func:`select_module`
+# and :func:`load_cake_dense_projection_gemm_module` know this package's programs, nothing else.
 
 # fmt: off
 ARG_PLANS: dict[str, list[list[str]]] = {
@@ -98,12 +97,12 @@ KERNELS: dict[str, dict[str, str]] = {
 # The architectures this package registers programs for (``KERNELS`` keys and every record's ``arches`` are drawn
 # from it).
 ARCHES = ("sm_100a", "sm_103a", "sm_107a")
-TRACKING_ISSUE = "flashinfer-ai/flashinfer#5677"  # the dense projection GEMM family (both numerical modes)
+# The tracking issue of the dense projection GEMM family (both packages).
+TRACKING_ISSUE = "flashinfer-ai/flashinfer#5677"
 
-#: The program-name prefix of this package and of the deterministic package.
+#: The program-name prefix of this package.
 PROGRAM_PREFIX = "cake_dense_projection_gemm_"
-DET_PROGRAM_PREFIX = "cake_dense_projection_det_gemm_"
-#: The instance templates of this package's programs, and of the deterministic package's.  The token ``atomic``
+#: The instance templates of this package's programs.  The token ``atomic``
 #: keeps every template of this package different from every template the deterministic package registers and
 #: from every template it registered before its rename (``dense_proj_gemm_<layout>...``, ``router_fp32_gemm_<ab>``);
 #: ``router_fp32_gemm_ts_`` names the router weight gradient's head/tail programs with the ``A`` parts in tensor memory,
@@ -119,11 +118,6 @@ TEMPLATE_PREFIXES = (
     "router_fp32_dgrad_simt_",
     "router_partials_sum",
     "router_fp32_fwd_simt_",
-)
-DET_TEMPLATE_PREFIXES = (
-    "dense_proj_det_gemm_",
-    "router_fp32_det_gemm_",
-    "split_fp32_det_bf16x3",
 )
 
 #: The deterministic package: a sibling of this package (``<parent>.dense_projection_det_gemm``), resolved on first
@@ -147,22 +141,12 @@ def deterministic_module(name: str) -> ModuleType:
         parent = __name__.rpartition(".")[0].rpartition(".")[0]
         if not parent:
             raise RuntimeError(
-                f"{__name__.rpartition('.')[0]} delegates its deterministic path to the package "
+                f"{__name__.rpartition('.')[0]} reuses the programs of the deterministic package "
                 f"{DETERMINISTIC_PACKAGE!r}, which a vendored copy has no sibling of; vendor that package too and "
                 "bind it with cake_backend.use_deterministic_backend(<its cake_backend module>)"
             )
         package = f"{parent}.{DETERMINISTIC_PACKAGE}"
     return importlib.import_module(f"{package}.{name}")
-
-
-def is_det_template(template: str) -> bool:
-    """Whether ``template`` names an instance of the deterministic package."""
-    return template.startswith(DET_TEMPLATE_PREFIXES)
-
-
-def is_det_program(name: str) -> bool:
-    """Whether ``name`` names a program of the deterministic package."""
-    return name.startswith(DET_PROGRAM_PREFIX)
 
 
 def arg_plan_key(plan) -> str:
@@ -196,10 +180,8 @@ def registered_templates(arch: str) -> tuple[str, ...]:
 
 
 def select_module(arch: str, template: str) -> str:
-    """Return the registered module name serving ``template`` on ``arch``: a template of the deterministic package
-    resolves through that package's registry, any other through this package's."""
-    if is_det_template(template):
-        return deterministic_module("cake_jit").select_module(arch, template)
+    """Return the registered module name of this package serving ``template`` on ``arch`` (a template of the
+    deterministic package is not registered here: that package's ``cake_jit.select_module`` resolves it)."""
     name = KERNELS.get(arch, {}).get(template)
     if name is None:
         registered = registered_templates(arch)
@@ -237,13 +219,9 @@ def _load_module(name: str, arch: str):
 
 
 def load_cake_dense_projection_gemm_module(name: str, arch: str):
-    """Load (once per program and architecture) the generated program ``name`` for ``arch``: this package's
-    prebuilt library under ``aot/`` when it ships one, else FlashInfer's JIT build of its ``build.json`` entry; a
-    program of the deterministic package is loaded by that package's loader."""
-    if is_det_program(name):
-        return deterministic_module(
-            "cake_jit"
-        ).load_cake_dense_projection_det_gemm_module(name, arch)
+    """Load (once per program and architecture) this package's generated program ``name`` for ``arch``: its
+    prebuilt library under ``aot/`` when it ships one, else FlashInfer's JIT build of its ``build.json`` entry (a
+    program of the deterministic package is loaded by that package's ``load_cake_dense_projection_det_gemm_module``)."""
     return _load_module(name, arch)
 
 

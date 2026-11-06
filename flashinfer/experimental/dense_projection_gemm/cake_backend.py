@@ -13,25 +13,28 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Cake backend with an explicit numerical mode: the GLM-5.2 dense projection GEMMs for training (K1) and the FP32
-router-gate GEMM (K2) on SM100 / SM103 / SM107.
+Cake backend, non-deterministic: the GLM-5.2 dense projection GEMMs for training (K1) and the FP32 router-gate GEMM
+(K2) on SM100 / SM103 / SM107.
 
 The deterministic implementation is the package ``dense_projection_det_gemm`` (flashinfer-ai/flashinfer#5677 and
-#7043; named so by #8046): its stream-K and split-K reductions add the partials in a fixed order, so every result is
-bitwise reproducible run to run.  This package keeps that package's operations, view contract, dtypes, accuracy
-budgets and host paths (prepared and convenience) and adds a second numerical mode whose split-K reductions add the
-partials in the order they finish.  Only run-to-run bitwise reproducibility is relaxed: the products, the FP32
-accumulation, the rounding points (an output is rounded once, from the complete FP32 sum), the masks, the layouts
-and the dynamic shapes are the deterministic package's, and no reduction flushes a subnormal.
+#7043): its stream-K and split-K reductions add the partials in a fixed order, so every result is bitwise
+reproducible run to run.  This package keeps that package's operations, view contract, dtypes, accuracy budgets and
+host paths (prepared and convenience) and adds programs whose split-K reductions add the partials in the order they
+finish.  The products, the FP32 accumulation, the rounding points (an output is rounded once, from the complete FP32
+sum), the masks, the layouts and the dynamic shapes are the deterministic package's, and no reduction flushes a
+subnormal.  A result of this package carries no run-to-run bitwise guarantee on any row, also on a row that runs a
+fixed-order program today.
 
-Numerical mode
---------------
-Every entry point takes the keyword-only argument ``deterministic: bool = True``:
+Mode and dispatch rules
+-----------------------
+Every compute entry point takes the keyword-only argument ``deterministic: bool = True`` and accepts only
+``deterministic=False``:
 
-* ``deterministic=True`` (the default) calls the deterministic package's canonical object with the same arguments
-  (:data:`DETERMINISTIC_NAMES`: ``projection_forward`` -> ``projection_det_forward``, ...): the same planner, the
-  same programs, the same bits and the same errors.  The names this import path had before #8046 keep their behavior.
-* ``deterministic=False`` runs the schedule of this package for an operation :data:`ROUTES` marks ``"atomic"``:
+* Any other value -- the default, ``True``, ``None``, ``0``, ``1``, ``"False"`` -- raises ``ValueError`` before
+  anything is planned, allocated or launched.  The message names the deterministic package's entry point of the
+  operation (``projection_wgrad`` -> ``projection_det_wgrad``, ...).  The keyword never selects the deterministic
+  package, and nothing falls back to it.
+* ``deterministic=False`` runs the routes of :data:`ROUTES`:
 
   - the K1 weight gradient (both operands MN-major, ``K = T`` ragged), launched as the transposed-store GEMM
     ``out[l, n, m]``: each of ``L x m_tiles x n_tiles`` tiles is cut into ``num_splits`` K ranges; every split stores
@@ -58,33 +61,41 @@ Every entry point takes the keyword-only argument ``deterministic: bool = True``
     stored once (other bits than the deterministic program's, within the deterministic package's router FP64
     budget); every other forward row and token count runs the deterministic program.
 
-  Every other operation -- the K1 forward and input gradient, the BF16x3 split -- runs the deterministic programs in
-  both modes: a recomputed forward must reproduce its result, and where the deterministic plan of a K1 forward or input
-  gradient splits K across CTAs (its automatic two-way split), it adds the partials in a fixed order.  The K1 forward
-  rows of :data:`K1_FORWARD_RULES_BY_SM` (exact token counts on 152-SM ``sm_100a`` / ``sm_103a`` parts) run another
-  plan of those programs with ``deterministic=False``: the single-CTA program, every tile's whole K in one CTA.  On the
-  convenience path a call of ``deterministic=False`` that
-  runs a deterministic program (the K1 forward and input gradient, a K2 row without a verdict) launches it through a
-  binding of this package (the deterministic package's plan and programs, and the reduction of its split-K partials in
-  the deterministic package's order by this package's program: the same bits, fewer host operations per call).
-* With ``torch.use_deterministic_algorithms(True)`` an explicit ``deterministic=False`` raises ``RuntimeError``; with
-  ``warn_only=True`` it warns and runs the deterministic path (:func:`_resolve_deterministic`).  The default does not
-  consult the PyTorch setting: it is deterministic already.
+  Every other operation -- the K1 forward and input gradient, the BF16x3 split -- runs the deterministic programs: a
+  recomputed forward must reproduce its result, and where the deterministic plan of a K1 forward or input gradient
+  splits K across CTAs (its automatic two-way split), it adds the partials in a fixed order.  The K1 forward rows of
+  :data:`K1_FORWARD_RULES_BY_SM` (exact token counts on 152-SM ``sm_100a`` / ``sm_103a`` parts) run another plan of
+  those programs: the single-CTA program, every tile's whole K in one CTA.
+* Under ``torch.use_deterministic_algorithms(True)`` a launch whose result can vary run to run -- the K1 split-K
+  program at three or more splits, a K2 stream-K partition that gives an element more than two partials -- raises
+  PyTorch's alert right before it launches (:func:`_alert_order_varying`): ``RuntimeError``, or with
+  ``warn_only=True`` a ``UserWarning``, after which the launch runs.  The fixed-order launches (every other route)
+  do not alert.  The PyTorch setting never changes which program a call runs.
+
+The helpers of this package (the planners, the rule tables, :func:`router_symbol`, :func:`bind_launch`, ...) take no
+mode keyword.
 
 The two packages
 ----------------
 This package registers only the programs of its own schedule (``cake_jit``: programs
-``cake_dense_projection_gemm_<hex>``, templates ``dense_proj_gemm_atomic_*`` / ``router_fp32_gemm_atomic_*``); every
-deterministic program, and every planner rule of the deterministic package, is that package's (resolved as this
-package's sibling on first use, never through an absolute ``flashinfer`` import; a vendored copy binds it with
-:func:`use_deterministic_backend`).  The deterministic package never imports this one.  The module-level names this
-path had before #8046 that are not entry points (``ROW_RULES``, ``stream_k_plan``, ``wgrad_views``, the plan and
-prepared types ``GemmPlan`` / ``PreparedGemm`` / ``RouterPlan`` / ``PreparedRouterGemm``, ...) read through to the
-deterministic package (module ``__getattr__``); assigning one here does not change the deterministic package's.
-:func:`clear_convenience_caches` clears the convenience caches and workspace arenas of both packages; a convenience-path
-call that this package launches from its arenas, captured into a CUDA graph, stays valid until then (the arenas keep
-every buffer a launch was bound to, through growths and cache evictions); a call it hands to the deterministic package's
-convenience path follows that package's rule (:func:`clear_convenience_caches`).
+``cake_dense_projection_gemm_<hex>``, templates ``dense_proj_gemm_atomic_*`` / ``router_fp32_gemm_*``); every
+deterministic program, and every planner rule of the deterministic package, is that package's.  A
+``deterministic=False`` call reuses them on the rows that run the deterministic programs (above): it launches the
+deterministic plan and program through a binding of this package (the same bits, fewer host operations per call),
+or, where that binding cannot rebuild the call's launch views from its tensors (two operands that alias) and for a
+batched forward that the deterministic package runs on its swapped small-token program, it calls the deterministic
+package's entry point of the same operation (the same program, the same bits).  On such a row ``plan_*`` /
+``prepare_*`` return the deterministic package's plan or prepared launch.  A row that runs a program of this package
+never goes to the deterministic package.  The deterministic package is imported at run time as this package's
+sibling, never through an absolute ``flashinfer`` import; a vendored copy binds it with
+:func:`use_deterministic_backend`.  The deterministic package never imports this one, and this module re-exports no
+name of it.  :func:`clear_convenience_caches` clears the convenience caches and workspace arenas of both packages; a
+convenience-path call that this package launches from its arenas, captured into a CUDA graph, stays valid until then
+(the arenas keep every buffer a launch was bound to, through growths and cache evictions); a call it hands to the
+deterministic package's entry point follows that package's rule (:func:`clear_convenience_caches`).
+
+The tensors passed between the forward and the gradients carry no mode: recompute a checkpointed forward with the
+package that made the saved one (same package only).
 """
 
 from __future__ import annotations
@@ -97,7 +108,7 @@ import warnings
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from functools import cached_property
-from types import ModuleType
+from types import FrameType, ModuleType
 from typing import Any, Callable, Optional, TypeVar, Union
 
 import torch
@@ -105,7 +116,7 @@ import tvm_ffi
 
 from . import cake_jit
 
-# The registry names this module had before #8046, re-exported from this package's own registry.
+# This package's own registry and loader, re-exported (its programs only).
 from .cake_jit import KERNELS as KERNELS
 from .cake_jit import MODULES as MODULES
 from .cake_jit import TRACKING_ISSUE as TRACKING_ISSUE
@@ -116,37 +127,25 @@ from .cake_jit import (
 from .cake_jit import select_module as select_module
 
 # ---------------------------------------------------------------------------
-# The deterministic package and the numerical mode
+# The deterministic package and the mode rules
 # ---------------------------------------------------------------------------
 
-#: Each name of this module's entry points and types -> its canonical object in the deterministic package's
-#: ``cake_backend`` (the former names #8046 kept there as aliases).  ``deterministic=True`` calls that object.
-DETERMINISTIC_NAMES: dict[str, str] = {
-    "GemmPlan": "DetGemmPlan",
-    "PreparedGemm": "PreparedDetGemm",
-    "PreparedRouterGemm": "PreparedRouterDetGemm",
-    "RouterPlan": "RouterDetPlan",
-    "dense_projection_gemm": "dense_projection_det_gemm",
-    "plan_dense_projection_gemm": "plan_dense_projection_det_gemm",
-    "plan_router_fp32_gemm": "plan_router_fp32_det_gemm",
-    "prepare_dense_projection_gemm": "prepare_dense_projection_det_gemm",
-    "prepare_projection_wgrad": "prepare_projection_det_wgrad",
-    "prepare_router_fp32_gemm": "prepare_router_fp32_det_gemm",
-    "projection_dgrad": "projection_det_dgrad",
-    "projection_forward": "projection_det_forward",
-    "projection_wgrad": "projection_det_wgrad",
-    "router_dgrad": "router_det_dgrad",
-    "router_forward": "router_det_forward",
-    "router_fp32_gemm": "router_fp32_det_gemm",
-    "router_wgrad": "router_det_wgrad",
-    "split_fp32_to_bf16x3_": "split_fp32_to_bf16x3_det_",
-    "instance_symbol": "instance_symbol",
-    "router_symbol": "router_symbol",
-}
-#: The types among :data:`DETERMINISTIC_NAMES`: read through to the deterministic package's classes.
-_DET_TYPES = ("GemmPlan", "PreparedGemm", "PreparedRouterGemm", "RouterPlan")
-#: Names spelling the ``det`` token live in the deterministic package only; this module does not read them through.
-_DET_SPELLED = re.compile(r"(?:^|_)det(?:_|$)|Det")
+#: The deterministic package's entry points this package calls on the rows that run the deterministic programs
+#: (see "The two packages" above); :func:`use_deterministic_backend` checks that a bound module has them.
+_DET_ENTRIES = (
+    "dense_projection_det_gemm",
+    "plan_dense_projection_det_gemm",
+    "plan_router_fp32_det_gemm",
+    "prepare_dense_projection_det_gemm",
+    "prepare_projection_det_wgrad",
+    "prepare_router_fp32_det_gemm",
+    "projection_det_dgrad",
+    "projection_det_forward",
+    "projection_det_wgrad",
+    "router_fp32_det_gemm",
+    "split_fp32_to_bf16x3_det_",
+    "clear_convenience_caches",
+)
 
 
 def use_deterministic_backend(module: ModuleType) -> None:
@@ -157,9 +156,7 @@ def use_deterministic_backend(module: ModuleType) -> None:
     caches and arenas (:func:`_drop_convenience_entries`): their entries hold the plans and programs of the package
     bound before.  Like :func:`clear_convenience_caches`, it invalidates the CUDA graphs that captured a
     convenience-path call of this package."""
-    missing = [
-        name for key, name in DETERMINISTIC_NAMES.items() if not hasattr(module, name)
-    ]
+    missing = [name for name in _DET_ENTRIES if not hasattr(module, name)]
     if missing:
         raise TypeError(
             f"{getattr(module, '__name__', module)!r} is not the deterministic dense projection GEMM backend: "
@@ -188,33 +185,85 @@ def deterministic_backend() -> ModuleType:
     return module
 
 
-def _det_entry(name: str) -> Callable[..., Any]:
-    return getattr(deterministic_backend(), DETERMINISTIC_NAMES[name])
-
-
-def _resolve_deterministic(deterministic: bool, api: str) -> bool:
-    """Whether a call of ``api`` runs the deterministic path.
-
-    ``deterministic=True`` does.  ``deterministic=False`` runs this package's schedule unless
-    ``torch.use_deterministic_algorithms(True)`` is in effect: then the call raises ``RuntimeError``, or, with
-    ``warn_only=True``, warns (``UserWarning``) and runs the deterministic path.  A call that asked for determinism
-    never runs a program of this package.
-    """
-    if deterministic:
-        return True
-    if not torch.are_deterministic_algorithms_enabled():
-        return False
-    message = (
-        f"{__name__}.{api}(deterministic=False) adds split-K partials in the order they finish, but "
-        "torch.use_deterministic_algorithms(True) is in effect; call it with deterministic=True or use "
-        f"{cake_jit.DETERMINISTIC_PACKAGE}.cake_backend.{DETERMINISTIC_NAMES.get(api, api)}"
+def _det_package_name() -> str:
+    """The dotted name of the deterministic package (the bound one, else this package's sibling), as text: the mode
+    messages name it without importing it."""
+    package = cake_jit._det_package
+    if package is not None:
+        return package
+    parent = __name__.rpartition(".")[0].rpartition(".")[0]
+    return (
+        f"{parent}.{cake_jit.DETERMINISTIC_PACKAGE}"
+        if parent
+        else cake_jit.DETERMINISTIC_PACKAGE
     )
+
+
+def _require_false(deterministic: Any, entry: str, det_entry: str) -> None:
+    """The mode rule of every compute entry point, its first statement: this package computes non-deterministically,
+    so ``entry`` takes only ``deterministic=False``.  Any other value (the default ``True``, ``None``, ``0``, ``1``,
+    ``"False"``, a NumPy bool) raises ``ValueError`` naming the deterministic package's entry point ``det_entry``;
+    the keyword never selects the deterministic package."""
+    if deterministic is not False:
+        package = __name__.rpartition(".")[0] or __name__
+        raise ValueError(
+            f"{entry}: {package} runs the non-deterministic package only and needs deterministic=False (got "
+            f"{deterministic!r}): pass deterministic=False for the non-deterministic path; the deterministic entry "
+            f"is {_det_package_name()}.cake_backend.{det_entry}"
+        )
+
+
+def _warning_stacklevel() -> int:
+    """The ``stacklevel`` of a warning raised in this module that points at the first frame outside it (the caller's
+    line): the depth of this module's frames between the warning and the caller."""
+    level = 1
+    frame: Optional[FrameType] = sys._getframe(1)
+    while frame is not None and frame.f_globals.get("__name__") == __name__:
+        level += 1
+        frame = frame.f_back
+    return level
+
+
+def _alert_order_varying(launch: str) -> None:
+    """PyTorch's alert for an operation without a deterministic implementation, raised right before this package
+    launches ``launch``, a program whose result can vary run to run (the K1 split-K program at three or more splits,
+    a K2 stream-K partition that gives an element more than two partials), while PyTorch's deterministic algorithms
+    are enabled: a ``RuntimeError``, or a ``UserWarning`` under ``torch.use_deterministic_algorithms(True,
+    warn_only=True)``, after which the launch runs; nothing otherwise.  The alert of PyTorch's own operators (PyTorch
+    exposes no public Python entry for it).  Fixed-order launches do not call it, and it never changes the program
+    that runs."""
+    if not torch.are_deterministic_algorithms_enabled():
+        return
     if torch.is_deterministic_algorithms_warn_only_enabled():
         warnings.warn(
-            f"{message}; running the deterministic path", UserWarning, stacklevel=3
+            f"{__name__}: {launch} does not have a deterministic implementation, but you set "
+            "'torch.use_deterministic_algorithms(True, warn_only=True)'; "
+            f"{_det_package_name()} is the deterministic package",
+            UserWarning,
+            stacklevel=_warning_stacklevel(),
         )
-        return True
-    raise RuntimeError(message)
+        return
+    raise RuntimeError(
+        f"{__name__}: {launch} does not have a deterministic implementation, but you set "
+        f"'torch.use_deterministic_algorithms(True)'; {_det_package_name()} is the deterministic package, or use "
+        "the 'warn_only=True' option if that is acceptable for your application"
+    )
+
+
+def _k1_launch_text(plan: Any) -> str:
+    """The launch an order-varying K1 plan (:class:`AtomicGemmPlan`) names in :func:`_alert_order_varying`."""
+    return (
+        f"the K1 split-K program {plan.template} at {plan.splits} splits (the partials added in the order the "
+        "splits finish)"
+    )
+
+
+def _k2_launch_text(plan: Any) -> str:
+    """The launch an order-varying K2 plan (:class:`AtomicRouterPlan`) names in :func:`_alert_order_varying`."""
+    return (
+        f"the router stream-K program {plan.template} with {plan.units} units over {plan.tiles} tiles (more than "
+        "two partials per element, added in the order they finish)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +272,8 @@ def _resolve_deterministic(deterministic: bool, api: str) -> bool:
 
 #: The program family each operation runs with ``deterministic=False``: ``"atomic"`` -- this package's planner and
 #: programs (the planner keeps every row without a measured verdict on the deterministic program, see
-#: :func:`k1_plan` / :func:`router_partition`) -- or ``"det"`` -- the deterministic package's programs in both modes.  K1
+#: :func:`k1_plan` / :func:`router_partition`) -- or ``"det"`` -- the deterministic package's programs (fixed order).
+#: The mode keyword never reads this table: it only takes ``deterministic=False`` (:func:`_require_false`).  K1
 #: operations are keyed by the operand layouts of the launched GEMM (``kk`` forward, ``kn`` input gradient, ``nn``
 #: weight gradient; ``nk`` has no training use), K2 by the layout class of ``router_layout_class``.
 ROUTES: dict[str, str] = {
@@ -1059,7 +1109,7 @@ K1_FORWARD_SINGLE_CTA_KNOBS: dict[str, Any] = {
 #: ``sm_103a`` parts the deterministic plan of these rows splits K two ways over CTA pairs of 256-wide tiles (stream-K,
 #: the partials added in a fixed order); the single-CTA program (:data:`K1_FORWARD_SINGLE_CTA_KNOBS`) keeps every tile's
 #: whole K in one CTA, so a forward still repeats bit for bit and a recomputed forward reproduces its result, with other
-#: bits than ``deterministic=True`` (within the deterministic package's BF16 budget against FP64).  Measured at exactly
+#: bits than the deterministic package's plan (within the deterministic package's BF16 budget against FP64).  Measured at exactly
 #: these token counts (no other token count, SM count or row): the single op faster than the deterministic plan in every
 #: run (a one-sided paired sign test, p < 0.05, median ratio below 0.99, eager and CUDA graph), no more than 3 % slower
 #: than it next to a kernel holding 8, 16 or 32 SMs on another stream, and the training steps that contain the forward
@@ -1165,6 +1215,12 @@ class AtomicGemmPlan:
     @property
     def items(self) -> int:
         return self.tiles * self.splits
+
+    @property
+    def reproducible(self) -> bool:
+        """Whether the result repeats bit for bit: one split stores whole tiles (its chains added in order), two add
+        ``own + other`` (one add of two values); three or more add the partials in the order the splits finish."""
+        return self.splits <= 2
 
     @property
     def grid(self) -> tuple[int, int, int]:
@@ -2067,8 +2123,8 @@ def router_partition(
         if layout == "kk" and s > ROUTER_FORWARD_MAX_SPLITS:
             raise ValueError(
                 f"router_fp32_gemm(deterministic=False): the forward takes at most {ROUTER_FORWARD_MAX_SPLITS} "
-                f"splits (more partials per element do not repeat bit for bit under recompute), got {s}; use "
-                "deterministic=True for more"
+                f"splits (more partials per element do not repeat bit for bit under recompute), got {s}; the "
+                f"deterministic entry {_det_package_name()}.cake_backend.router_fp32_det_gemm takes more"
             )
         spec = f"S{s}"
     else:
@@ -2873,11 +2929,9 @@ def _atomic_bind(
 def bind_launch(
     module_name: str, values: dict[str, Any], grid: tuple[int, int, int], arch: str
 ) -> Any:
-    """Order ``values`` by the generated argument plan of ``module_name`` and load its entry: a program of the
-    deterministic package binds through that package (its ``bind_launch``), one of this package here.  Fails
-    closed on a keyword the kernel expects that the host does not provide."""
-    if cake_jit.is_det_program(module_name):
-        return deterministic_backend().bind_launch(module_name, values, grid, arch)
+    """Order ``values`` by the generated argument plan of ``module_name``, a program of this package, and load its
+    entry (the deterministic package's programs bind through that package's ``bind_launch``).  Fails closed on a
+    keyword the kernel expects that the host does not provide.  Takes no mode keyword."""
     entry, arguments = _atomic_bind(module_name, values, grid, arch)
     return _AtomicLaunch(module_name, entry, arguments, grid)
 
@@ -2931,6 +2985,8 @@ class PreparedAtomicGemm:
 
     def launch(self) -> torch.Tensor:
         assert self._launch is not None
+        if not self.plan.reproducible:
+            _alert_order_varying(_k1_launch_text(self.plan))
         with deterministic_backend()._ffi_stream_context(self.device_index):
             self._launch()
         return self.out
@@ -2976,6 +3032,9 @@ class PreparedAtomicRouterGemm:
 
     def launch(self) -> torch.Tensor:
         assert self._launch is not None
+        if not self.plan.reproducible:
+            # before the split, the fill of ``out`` and the program: a raise leaves ``out`` untouched
+            _alert_order_varying(_k2_launch_text(self.plan))
         det = deterministic_backend()
         index = self.device_index
         stream = det._current_raw_stream(index)
@@ -3202,9 +3261,10 @@ def _atomic_k2(
     _, arch, sm_count = _device_and_arch(A, B, out)
     plan, _ = plan_atomic_router(A, B, out, arch=arch, sm_count=sm_count, splits=splits)
     if plan is None:
+        det = deterministic_backend()
         if op == "plan":
-            return _det_entry("plan_router_fp32_gemm")(A, B, out, splits=splits)
-        return _det_entry("prepare_router_fp32_gemm")(
+            return det.plan_router_fp32_det_gemm(A, B, out, splits=splits)
+        return det.prepare_router_fp32_det_gemm(
             A, B, out, splits=splits, **_pdl_kw(enable_pdl)
         )
     if op == "plan":
@@ -3216,8 +3276,7 @@ def _atomic_k2(
 #
 # The deterministic package's design (one least-recently-used cache per kind, keyed by device, stream and view
 # geometry; one growable workspace arena per (device, raw stream) shared by every cached entry), with caches and
-# arenas of their own: a buffer of this package is never a buffer of the deterministic package, and the names below
-# are not names this path had before #8046 (those read through to the deterministic package's state).  The cache
+# arenas of their own: a buffer of this package is never a buffer of the deterministic package.  The cache
 # bound is the deterministic package's ``CONVENIENCE_CACHE_SIZE``, read on every insertion, so one setting bounds
 # both packages.  A cached entry holds its plan and the resolved program entry, never a caller's tensor: the views
 # are rebuilt from the caller's tensors on every call.  The launches of one stream share its arena; launches on
@@ -3590,6 +3649,8 @@ class _CachedAtomic:
     k1: Optional[_K1Binding] = field(default=None, repr=False)
     det_plan: Any = field(default=None, repr=False)
     memo: Any = field(default=None, repr=False)
+    # the plan's launch can vary run to run (``not plan.reproducible``): PyTorch's alert before every launch
+    order_varying: bool = False
 
 
 #: An entry of the convenience caches (:data:`_K1_ATOMIC_CACHE`, :data:`_K1_DET_CACHE`, :data:`_K2_ATOMIC_CACHE`,
@@ -3763,6 +3824,8 @@ def _k1_cached_launch(
     entry = det._cache_get(cache, _k1_key(index, stream, (*head, pdl, *tail), *sources))
     if entry is None or entry.k1 is None or entry.entry is None:
         return False
+    if entry.order_varying:
+        _alert_order_varying(_k1_launch_text(entry.plan))
     _launch_k1_binding(det, entry.entry, entry.k1, entry.arena, sources, index, stream)
     return True
 
@@ -3837,6 +3900,8 @@ class _CachedDetK1:
     entry: Optional[Callable[..., Any]] = field(default=None, repr=False)
     arena: Optional[_AtomicArena] = field(default=None, repr=False)
     k1: Optional[_K1Binding] = field(default=None, repr=False)
+    # a deterministic program is fixed-order: never alerts (read by :func:`_k1_cached_launch`)
+    order_varying: bool = False
 
 
 def _plan_det_k1(
@@ -4036,13 +4101,20 @@ def _launch_cached_atomic_k1(
                         k1=_bind_atomic_k1(
                             plan, module_name, arg_plan, A, B, out, arena, pdl
                         ),
+                        order_varying=not plan.reproducible,
                     )
                 entry = _cache_insert(_K1_ATOMIC_CACHE, key, entry)
     bound, fn = entry.k1, entry.entry
     if bound is None or fn is None:
         if entry.plan is None:
+            # a row on the deterministic program whose views the binding cannot rebuild: the same program through
+            # the deterministic package's entry point
             return det_call()
+        if entry.order_varying:
+            _alert_order_varying(_k1_launch_text(entry.plan))
         return _launch_atomic_k1_unbound(entry, A, B, out, index, stream, pdl)
+    if entry.order_varying:
+        _alert_order_varying(_k1_launch_text(entry.plan))
     _launch_k1_binding(det, fn, bound, entry.arena, (A, B, out), index, stream)
     return out
 
@@ -4261,6 +4333,7 @@ def _plan_atomic_k2(
         split_arg_plan=split_arg_plan,
         k2=binding,
         memo=memo,
+        order_varying=not plan.reproducible,
     )
 
 
@@ -4293,6 +4366,9 @@ def _launch_atomic_k2_binding(
     weight gradient's output gradient, the input gradient's router weight) and ``out``."""
     arena, fn, bound = entry.arena, entry.entry, entry.k2
     assert arena is not None and fn is not None and bound is not None
+    if entry.order_varying:
+        # before the split, the fill of ``out`` and the program: a raise leaves ``out`` untouched
+        _alert_order_varying(_k2_launch_text(entry.plan))
     split_fn = entry.split_entry
     # the split, the memset and the kernel share the arena's BF16x3 stack
     with arena.lock:
@@ -4508,9 +4584,7 @@ def _launch_cached_splitk_k2(
                     _plan_splitk_k2(A, B, out, splits, index, stream, pdl),
                 )
     if entry.k2 is None or entry.entry is None or entry.arena is None:
-        return getattr(det, DETERMINISTIC_NAMES["router_fp32_gemm"])(
-            A, B, out, splits=splits, enable_pdl=bool(pdl)
-        )
+        return det.router_fp32_det_gemm(A, B, out, splits=splits, enable_pdl=bool(pdl))
     a_view, split_src = _launch_views(A, B, entry.plan, views)
     _launch_splitk_k2_binding(det, entry, out, a_view, split_src, index, stream)
     return out
@@ -4769,10 +4843,10 @@ def clear_convenience_caches() -> None:
     workspace, so capture such graphs again after it.  A captured ``deterministic=False`` convenience-path call that
     this package launches from its arenas (its programs, and the deterministic programs it launches through its
     binding) stays valid until then: its arena keeps every buffer a launch was bound to, through growths and cache
-    evictions.  A call this package hands to the deterministic package's convenience path (launch views its binding
-    cannot rebuild from the call's tensors, such as two operands that alias; a batched forward on that package's
-    swapped small-token program; ``torch.use_deterministic_algorithms(True, warn_only=True)``) follows that package's
-    rule: a CUDA graph captures its prepared launch, not its convenience path.  The graphs captured on one stream share
+    evictions.  A call on a row that runs the deterministic program, which this package hands to the deterministic
+    package's entry point of the same operation (launch views its binding cannot rebuild from the call's tensors, such
+    as two operands that alias; a batched forward on that package's swapped small-token program), follows that
+    package's rule: a CUDA graph captures its prepared launch, not its convenience path.  The graphs captured on one stream share
     its arena: replay them one at a time, and not concurrently with calls on that stream."""
     _drop_convenience_entries()
     deterministic_backend().clear_convenience_caches()
@@ -4800,26 +4874,17 @@ def _splits_kw(splits: Optional[int]) -> dict[str, Any]:
     return {} if splits is None else {"splits": splits}
 
 
-def instance_symbol(key: tuple, *, deterministic: bool = True) -> str:
-    """The instance template of a K1 instance key (``deterministic_backend().instance_key``): the deterministic
-    package's symbol in both modes.  This package's K1 programs are not keyed by the deterministic instance keys;
-    their templates are :func:`atomic_k1_template` (``dense_proj_gemm_atomic_nn_n<block_n>[_f32]_t``)."""
-    _resolve_deterministic(deterministic, "instance_symbol")
-    return _det_entry("instance_symbol")(key)
-
-
-def router_symbol(
-    a_mn: bool, b_mn: bool, out_t: bool, *, deterministic: bool = True
-) -> str:
-    """Kernel symbol / registry template of a router instance: ``router_fp32_det_gemm_<a><b>[_t]`` of the
-    deterministic package, or with ``deterministic=False`` ``router_fp32_gemm_atomic_<a><b>[_t]`` for the layout
-    classes this package reduces (``kk``, ``nn_t``) and the deterministic symbol for ``kn`` (no stream-K program; its
-    SIMT programs are named per tile, :func:`router_simt_template`)."""
-    det = _resolve_deterministic(deterministic, "router_symbol")
-    det_symbol = _det_entry("router_symbol")(a_mn, b_mn, out_t)
+def router_symbol(a_mn: bool, b_mn: bool, out_t: bool) -> str:
+    """Kernel symbol / registry template of this package's router stream-K program for the layout class of
+    ``(a_mn, b_mn)``: ``router_fp32_gemm_atomic_<a><b>[_t]`` for the classes this package reduces with it (``kk``,
+    ``nn_t``).  Takes no mode keyword.  ``kn`` has no stream-K program (its SIMT programs are named per tile,
+    :func:`router_simt_template`) and the deterministic planner refuses ``nk``: ``ValueError``."""
     layout = _k2_class(a_mn, b_mn)
-    if det or layout == "k2_kn" or _route(layout) == "det":
-        return det_symbol
+    if layout not in ("k2_kk", "k2_nn_t"):
+        raise ValueError(
+            f"router_symbol: the layout class {layout[3:]!r} has no stream-K program of this package (the input "
+            "gradient's SIMT programs are router_simt_template(tile, 'kn'))"
+        )
     return (
         cake_jit.TEMPLATE_PREFIXES[1]
         + ("n" if a_mn else "k")
@@ -4836,16 +4901,19 @@ def plan_dense_projection_gemm(
     deterministic: bool = True,
     **kwargs: Any,
 ) -> Any:
-    """Validate the views and plan the K1 launch: the deterministic package's ``plan_dense_projection_det_gemm``
-    with the same keywords (``sm_count``, ``l2_bytes``, ``transposed_out``, the planner knobs, ``arch``); with
-    ``deterministic=False`` a weight-gradient layout (both operands MN-major) is planned for this package's split-K
-    program (:class:`AtomicGemmPlan`; the knobs ``splits`` / ``block_n`` / ``chains`` are this package's, the others
-    apply when the row runs the deterministic program)."""
-    if (
-        _resolve_deterministic(deterministic, "plan_dense_projection_gemm")
-        or _route(_k1_layout(A, B)) == "det"
-    ):
-        return _det_entry("plan_dense_projection_gemm")(A, B, out, **kwargs)
+    """Validate the views and plan the K1 launch: with ``deterministic=False`` (the only value accepted) a
+    weight-gradient layout (both operands MN-major) is planned for this package's split-K program
+    (:class:`AtomicGemmPlan`; the knobs ``splits`` / ``block_n`` / ``chains`` are this package's, the others --
+    ``sm_count``, ``l2_bytes``, ``transposed_out``, the planner knobs, ``arch`` -- apply when the row runs the
+    deterministic program).  A row the planner keeps on the deterministic program, and every other layout, returns the
+    deterministic package's plan (``plan_dense_projection_det_gemm``)."""
+    _require_false(
+        deterministic, "plan_dense_projection_gemm", "plan_dense_projection_det_gemm"
+    )
+    if _route(_k1_layout(A, B)) == "det":
+        return deterministic_backend().plan_dense_projection_det_gemm(
+            A, B, out, **kwargs
+        )
     own, det_kwargs = _split_knobs(kwargs)
     return _atomic_k1(
         "plan",
@@ -4856,7 +4924,7 @@ def plan_dense_projection_gemm(
         own=own,
         arch=det_kwargs.get("arch"),
         sm_count=det_kwargs.get("sm_count"),
-        det_call=lambda: _det_entry("plan_dense_projection_gemm")(
+        det_call=lambda: deterministic_backend().plan_dense_projection_det_gemm(
             A, B, out, **det_kwargs
         ),
     )
@@ -4870,17 +4938,22 @@ def prepare_dense_projection_gemm(
     deterministic: bool = True,
     **kwargs: Any,
 ) -> Any:
-    """Validate one K1 binding, plan it for the device and prepare its allocation-free launch: the deterministic
-    package's ``prepare_dense_projection_det_gemm`` with the same keywords (``transposed_out`` and the planner
-    knobs); with ``deterministic=False`` a weight-gradient layout prepares this package's split-K program (its
-    workspace is owned by the prepared object; ``splits`` / ``block_n`` / ``chains`` as for
-    :func:`plan_dense_projection_gemm`).
-    ``enable_pdl`` (default: the device supports it) makes either launch a programmatic dependent launch."""
-    if (
-        _resolve_deterministic(deterministic, "prepare_dense_projection_gemm")
-        or _route(_k1_layout(A, B)) == "det"
-    ):
-        return _det_entry("prepare_dense_projection_gemm")(A, B, out, **kwargs)
+    """Validate one K1 binding, plan it for the device and prepare its allocation-free launch: with
+    ``deterministic=False`` (the only value accepted) a weight-gradient layout prepares this package's split-K program
+    (:class:`PreparedAtomicGemm`; its workspace is owned by the prepared object; ``splits`` / ``block_n`` / ``chains``
+    as for :func:`plan_dense_projection_gemm`).  A row the planner keeps on the deterministic program, and every other
+    layout, prepares the deterministic package's ``prepare_dense_projection_det_gemm`` (its keywords:
+    ``transposed_out`` and the planner knobs).  ``enable_pdl`` (default: the device supports it) makes either launch
+    a programmatic dependent launch."""
+    _require_false(
+        deterministic,
+        "prepare_dense_projection_gemm",
+        "prepare_dense_projection_det_gemm",
+    )
+    if _route(_k1_layout(A, B)) == "det":
+        return deterministic_backend().prepare_dense_projection_det_gemm(
+            A, B, out, **kwargs
+        )
     own, det_kwargs = _split_knobs(kwargs)
     return _atomic_k1(
         "prepare",
@@ -4889,7 +4962,7 @@ def prepare_dense_projection_gemm(
         out,
         transposed_out=bool(det_kwargs.get("transposed_out", False)),
         own=own,
-        det_call=lambda: _det_entry("prepare_dense_projection_gemm")(
+        det_call=lambda: deterministic_backend().prepare_dense_projection_det_gemm(
             A, B, out, **det_kwargs
         ),
         enable_pdl=det_kwargs.get("enable_pdl"),
@@ -4907,24 +4980,16 @@ def dense_projection_gemm(
     weights_static: bool = False,
 ) -> torch.Tensor:
     """``out[l, m, n] = sum_k A[l, m, k] B[l, k, n]`` for strided views (the cached convenience path; see the
-    deterministic package for the view contract).  ``deterministic=False`` runs a weight-gradient layout (both
-    operands MN-major) on this package's split-K program where the planner takes the row; every other layout and
-    row runs the deterministic program.  ``enable_pdl`` (default: the device supports it) launches either program
-    as a programmatic dependent launch; each waits for the preceding kernel before its first global access, and
-    ``weights_static=True`` lets the deterministic swapped small-token forward start its loads of ``B`` before the
-    wait (see the deterministic package's ``dense_projection_det_gemm``)."""
-    if _resolve_deterministic(deterministic, "dense_projection_gemm"):
-        return _det_entry("dense_projection_gemm")(
-            A,
-            B,
-            out,
-            transposed_out=transposed_out,
-            enable_pdl=enable_pdl,
-            **_weights_kw(weights_static),
-        )
+    deterministic package for the view contract).  ``deterministic=False`` (the only value accepted) runs a
+    weight-gradient layout (both operands MN-major) on this package's split-K program where the planner takes the
+    row; every other layout and row runs the deterministic program.  ``enable_pdl`` (default: the device supports it)
+    launches either program as a programmatic dependent launch; each waits for the preceding kernel before its first
+    global access, and ``weights_static=True`` lets the deterministic swapped small-token forward start its loads of
+    ``B`` before the wait (see the deterministic package's ``dense_projection_det_gemm``)."""
+    _require_false(deterministic, "dense_projection_gemm", "dense_projection_det_gemm")
 
     def det_call() -> Any:
-        return _det_entry("dense_projection_gemm")(
+        return deterministic_backend().dense_projection_det_gemm(
             A,
             B,
             out,
@@ -4968,15 +5033,13 @@ def projection_forward(
     deterministic: bool = True,
     enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
-    """``out[T, N] = X[T, K] @ W[N, K].T`` (bf16 out by default).  The deterministic package's programs in both modes
-    (a recomputed forward must reproduce its result; where the deterministic plan splits K across CTAs, it adds the
-    partials in a fixed order); with ``deterministic=False`` through this package's binding of them (:func:`_det_k1`):
-    the deterministic plan, program and bits, except on a row of :data:`K1_FORWARD_RULES_BY_SM` for the device, which
-    runs the program the deterministic planner gives it with the table's knobs (:func:`k1_forward_knobs`; other bits,
-    still the same on every run).
-    ``enable_pdl`` as for :func:`dense_projection_gemm`."""
-    if _resolve_deterministic(deterministic, "projection_forward"):
-        return _det_entry("projection_forward")(X, W, out, **_pdl_kw(enable_pdl))
+    """``out[T, N] = X[T, K] @ W[N, K].T`` (bf16 out by default), ``deterministic=False`` only.  The deterministic
+    package's programs (a recomputed forward must reproduce its result; where the deterministic plan splits K across
+    CTAs, it adds the partials in a fixed order) through this package's binding of them (:func:`_det_k1`): the
+    deterministic plan, program and bits, except on a row of :data:`K1_FORWARD_RULES_BY_SM` for the device, which runs
+    the program the deterministic planner gives it with the table's knobs (:func:`k1_forward_knobs`; other bits, still
+    the same on every run).  ``enable_pdl`` as for :func:`dense_projection_gemm`."""
+    _require_false(deterministic, "projection_forward", "projection_det_forward")
     if out is None:
         out = torch.empty(X.shape[0], W.shape[0], device=X.device, dtype=torch.bfloat16)
     o = out
@@ -4988,7 +5051,9 @@ def projection_forward(
         (X, W, o),
         ("fwd",),
         lambda: (X, W.t(), o, False, _k1_forward_knobs_of(X, W, o)),
-        lambda: _det_entry("projection_forward")(X, W, o, **_pdl_kw(enable_pdl)),
+        lambda: deterministic_backend().projection_det_forward(
+            X, W, o, **_pdl_kw(enable_pdl)
+        ),
         enable_pdl,
     )
 
@@ -5002,13 +5067,10 @@ def projection_dgrad(
     deterministic: bool = True,
     enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
-    """``out[T, K] = G[T, N] @ W[N, K]``.  The deterministic program in both modes (whole output tiles); with
-    ``deterministic=False`` through this package's binding of it (:func:`_det_k1`: the same plan, program and bits).
-    ``enable_pdl`` as for :func:`dense_projection_gemm`."""
-    if _resolve_deterministic(deterministic, "projection_dgrad"):
-        return _det_entry("projection_dgrad")(
-            G, W, out, out_dtype=out_dtype, **_pdl_kw(enable_pdl)
-        )
+    """``out[T, K] = G[T, N] @ W[N, K]``, ``deterministic=False`` only.  The deterministic program (whole output tiles)
+    through this package's binding of it (:func:`_det_k1`: the same plan, program and bits).  ``enable_pdl`` as for
+    :func:`dense_projection_gemm`."""
+    _require_false(deterministic, "projection_dgrad", "projection_det_dgrad")
     if out is None:
         out = torch.empty(
             G.shape[0],
@@ -5025,7 +5087,7 @@ def projection_dgrad(
         (G, W, o),
         ("dgrad",),
         lambda: (G, W, o, False, ()),
-        lambda: _det_entry("projection_dgrad")(
+        lambda: deterministic_backend().projection_det_dgrad(
             G, W, o, out_dtype=out_dtype, **_pdl_kw(enable_pdl)
         ),
         enable_pdl,
@@ -5042,14 +5104,13 @@ def prepare_projection_wgrad(
     deterministic: bool = True,
     enable_pdl: Optional[bool] = None,
 ) -> Any:
-    """Prepared ``out[N, K] = G[T, N].T @ X[T, K]``.  ``deterministic=False`` prepares this package's split-K
-    program as the transposed-store GEMM ``X.T @ G`` (``M = K``, ``N = N``) where the planner takes the row; a row it
-    does not take prepares the deterministic package's ``prepare_projection_det_wgrad`` (its orientation, ``sk``,
+    """Prepared ``out[N, K] = G[T, N].T @ X[T, K]``, ``deterministic=False`` only: this package's split-K program as
+    the transposed-store GEMM ``X.T @ G`` (``M = K``, ``N = N``) where the planner takes the row; a row it does not
+    take prepares the deterministic package's ``prepare_projection_det_wgrad`` (its orientation, ``sk``,
     ``cta_rows``).  ``enable_pdl`` as for :func:`prepare_dense_projection_gemm`."""
-    if _resolve_deterministic(deterministic, "prepare_projection_wgrad"):
-        return _det_entry("prepare_projection_wgrad")(
-            G, X, out, sk=sk, cta_rows=cta_rows, **_pdl_kw(enable_pdl)
-        )
+    _require_false(
+        deterministic, "prepare_projection_wgrad", "prepare_projection_det_wgrad"
+    )
     return _atomic_k1(
         "prepare",
         X.t(),
@@ -5057,7 +5118,7 @@ def prepare_projection_wgrad(
         out,
         transposed_out=True,
         own={},
-        det_call=lambda: _det_entry("prepare_projection_wgrad")(
+        det_call=lambda: deterministic_backend().prepare_projection_det_wgrad(
             G, X, out, sk=sk, cta_rows=cta_rows, **_pdl_kw(enable_pdl)
         ),
         enable_pdl=enable_pdl,
@@ -5075,21 +5136,12 @@ def projection_wgrad(
     deterministic: bool = True,
     enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
-    """``out[N, K] = G[T, N].T @ X[T, K]`` (ragged reduction length ``T``).  ``deterministic=False`` runs this
+    """``out[N, K] = G[T, N].T @ X[T, K]`` (ragged reduction length ``T``), ``deterministic=False`` only: this
     package's split-K program where the planner takes the row (the split partials summed in the order they finish,
     the output rounded once), else the deterministic package's ``projection_det_wgrad`` program (its orientation,
     ``sk`` and ``cta_rows``) through this package's binding of it (:func:`_launch_cached_atomic_k1`); ``enable_pdl``
     as for :func:`dense_projection_gemm`."""
-    if _resolve_deterministic(deterministic, "projection_wgrad"):
-        return _det_entry("projection_wgrad")(
-            G,
-            X,
-            out,
-            out_dtype=out_dtype,
-            sk=sk,
-            cta_rows=cta_rows,
-            **_pdl_kw(enable_pdl),
-        )
+    _require_false(deterministic, "projection_wgrad", "projection_det_wgrad")
     if out is None:
         out = torch.empty(
             int(G.shape[1]),
@@ -5115,7 +5167,7 @@ def projection_wgrad(
         out,
         transposed_out=True,
         own={},
-        det_call=lambda: _det_entry("projection_wgrad")(
+        det_call=lambda: deterministic_backend().projection_det_wgrad(
             G,
             X,
             out,
@@ -5154,14 +5206,15 @@ def plan_router_fp32_gemm(
     splits: Optional[int] = None,
     deterministic: bool = True,
 ) -> Any:
-    """Classify the fp32 views and plan the K2 launch (the deterministic package's ``plan_router_fp32_det_gemm``);
-    ``deterministic=False`` plans this package's stream-K program for the ``kk`` / ``nn_t`` classes and the SIMT
-    programs in their windows (:class:`AtomicRouterPlan`; ``splits`` sets ``splits`` units per tile, see
-    :func:`router_units`)."""
-    if _resolve_deterministic(deterministic, "plan_router_fp32_gemm") or (
-        _route(_k2_layout(A, B)) == "det"
-    ):
-        return _det_entry("plan_router_fp32_gemm")(A, B, out, splits=splits)
+    """Classify the fp32 views and plan the K2 launch, ``deterministic=False`` only: this package's stream-K program
+    for the ``kk`` / ``nn_t`` classes and the SIMT programs in their windows (:class:`AtomicRouterPlan`; ``splits``
+    sets ``splits`` units per tile, see :func:`router_units`); a row the planner keeps on the deterministic program,
+    and a layout class routed ``"det"``, returns the deterministic package's plan (``plan_router_fp32_det_gemm``)."""
+    _require_false(deterministic, "plan_router_fp32_gemm", "plan_router_fp32_det_gemm")
+    if _route(_k2_layout(A, B)) == "det":
+        return deterministic_backend().plan_router_fp32_det_gemm(
+            A, B, out, splits=splits
+        )
     return _atomic_k2("plan", A, B, out, splits=splits)
 
 
@@ -5174,16 +5227,18 @@ def prepare_router_fp32_gemm(
     deterministic: bool = True,
     enable_pdl: Optional[bool] = None,
 ) -> Any:
-    """Validate one fp32 binding, plan it and prepare its allocation-free launch (the deterministic package's
-    ``prepare_router_fp32_det_gemm``); ``deterministic=False`` prepares this package's stream-K program for the
-    ``kk`` / ``nn_t`` classes (its launch splits the second operand, zeroes ``out`` on the stream when a segment adds
-    into it, and runs the program: no partial buffers), and a SIMT program in its windows (the ``nn_t`` and ``kn``
-    classes: one kernel over the fp32 operands).  ``enable_pdl`` (default: the device supports it) launches the split
-    and the stream-K program as programmatic dependent launches."""
-    if _resolve_deterministic(deterministic, "prepare_router_fp32_gemm") or (
-        _route(_k2_layout(A, B)) == "det"
-    ):
-        return _det_entry("prepare_router_fp32_gemm")(
+    """Validate one fp32 binding, plan it and prepare its allocation-free launch, ``deterministic=False`` only: this
+    package's stream-K program for the ``kk`` / ``nn_t`` classes (its launch splits the second operand, zeroes
+    ``out`` on the stream when a segment adds into it, and runs the program: no partial buffers), and a SIMT program
+    in its windows (the ``nn_t`` and ``kn`` classes: one kernel over the fp32 operands); a row the planner keeps on the
+    deterministic program prepares the deterministic package's ``prepare_router_fp32_det_gemm``.  ``enable_pdl``
+    (default: the device supports it) launches the split and the stream-K program as programmatic dependent
+    launches."""
+    _require_false(
+        deterministic, "prepare_router_fp32_gemm", "prepare_router_fp32_det_gemm"
+    )
+    if _route(_k2_layout(A, B)) == "det":
+        return deterministic_backend().prepare_router_fp32_det_gemm(
             A, B, out, splits=splits, **_pdl_kw(enable_pdl)
         )
     return _atomic_k2("prepare", A, B, out, splits=splits, enable_pdl=enable_pdl)
@@ -5194,18 +5249,12 @@ def _router_gemm(
     B: torch.Tensor,
     out: torch.Tensor,
     splits: Optional[int],
-    det: bool,
     enable_pdl: Optional[bool] = None,
     views: Optional[tuple] = None,
 ) -> torch.Tensor:
-    """K2 on the convenience path: ``det`` calls the deterministic package's; with ``deterministic=False`` a layout
-    class routed ``"det"`` runs the deterministic program through this package's binding (:func:`_splitk_k2`), the
-    others this package's K2 path (``views``: an entry point's own launch views, :func:`_launch_views`).
-    ``enable_pdl`` reaches every route."""
-    if det:
-        return _det_entry("router_fp32_gemm")(
-            A, B, out, splits=splits, **_pdl_kw(enable_pdl)
-        )
+    """K2 on the convenience path: a layout class routed ``"det"`` runs the deterministic program through this
+    package's binding (:func:`_splitk_k2`), the others this package's K2 path (``views``: an entry point's own launch
+    views, :func:`_launch_views`).  ``enable_pdl`` reaches every route."""
     if _route(_k2_layout(A, B)) == "det":
         return _splitk_k2(A, B, out, splits, views, enable_pdl)
     return _atomic_k2(
@@ -5223,14 +5272,14 @@ def router_fp32_gemm(
     enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     """``out[m, n] = sum_k A[m, k] B[k, n]`` for fp32 views through the BF16x3 emulation (the cached convenience
-    path).  ``deterministic=False`` runs the ``kk`` / ``nn_t`` rows the planner takes (:func:`router_units`) on this
+    path), ``deterministic=False`` only: the ``kk`` / ``nn_t`` rows the planner takes (:func:`router_units`) on this
     package's stream-K program, whose part tiles add into ``out`` in the order they finish, instead of the
     fixed-order split-K sum, the ``nn_t`` / ``kn`` token counts of a SIMT window on its exact-FP32 program
     (:func:`router_simt`) and the ``kk`` token counts of a forward SIMT window on the forward's cluster program
     (:func:`router_forward_simt`); every other row runs the deterministic program.  ``enable_pdl`` as for
     :func:`prepare_router_fp32_gemm`."""
-    det = _resolve_deterministic(deterministic, "router_fp32_gemm")
-    return _router_gemm(A, B, out, splits, det, enable_pdl)
+    _require_false(deterministic, "router_fp32_gemm", "router_fp32_det_gemm")
+    return _router_gemm(A, B, out, splits, enable_pdl)
 
 
 def router_forward(
@@ -5242,17 +5291,13 @@ def router_forward(
     deterministic: bool = True,
     enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
-    """``out[T, N] = X[T, K] @ W[N, K].T`` in FP32 through the emulation; ``splits`` defaults to the deterministic
-    package's production count (4).  With ``deterministic=False`` a row runs this package's program only with an
-    explicit ``splits`` (at most two partials per element: the logits repeat bit for bit) or a verdict of
-    :data:`ROUTER_RULES` (the token windows of the forward's SIMT program, :func:`router_forward_simt`), else the
-    deterministic program (its plan for ``router_fp32_gemm(X, W.T, out)``, through this package's binding,
-    :func:`_launch_cached_splitk_k2`): without a split count, while no router table gives the forward a verdict,
-    without the per-call check of the row."""
-    if _resolve_deterministic(deterministic, "router_forward"):
-        return _det_entry("router_forward")(
-            X, W, out, **_splits_kw(splits), **_pdl_kw(enable_pdl)
-        )
+    """``out[T, N] = X[T, K] @ W[N, K].T`` in FP32 through the emulation, ``deterministic=False`` only.  A row runs
+    this package's program only with an explicit ``splits`` (at most two partials per element: the logits repeat bit
+    for bit) or a verdict of :data:`ROUTER_RULES` (the token windows of the forward's SIMT program,
+    :func:`router_forward_simt`), else the deterministic program (its plan for ``router_fp32_gemm(X, W.T, out)``,
+    through this package's binding, :func:`_launch_cached_splitk_k2`): without a split count, while no router table
+    gives the forward a verdict, without the per-call check of the row."""
+    _require_false(deterministic, "router_forward", "router_det_forward")
     if out is None:
         out = torch.empty(X.shape[0], W.shape[0], device=X.device, dtype=torch.float32)
     if _k2_entry("fwd", X, W, out, splits, enable_pdl) is not None:
@@ -5262,7 +5307,7 @@ def router_forward(
         # no router table gives the forward a verdict: the deterministic program (the plan the planner would keep),
         # without the per-call check of the row
         return _splitk_k2(X, W.t(), out, None, views, enable_pdl)
-    return _router_gemm(X, W.t(), out, splits, False, enable_pdl, views)
+    return _router_gemm(X, W.t(), out, splits, enable_pdl, views)
 
 
 def router_dgrad(
@@ -5273,22 +5318,18 @@ def router_dgrad(
     deterministic: bool = True,
     enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
-    """``out[T, K] = G[T, N] @ W[N, K]`` in FP32: the deterministic program (one split: nothing to reduce) through the
-    emulation; with ``deterministic=False`` in the token windows of the row's input-gradient verdict in
-    :data:`ROUTER_RULES` (or, on a part with a table of its own, :data:`ROUTER_RULES_BY_SM`) the exact-FP32 SIMT
-    program (:func:`router_simt`: compensated sums of the products of ``G`` and ``W`` read in place, every element of
-    ``out`` stored once), and at every other row and token count the deterministic program through this package's
-    binding of it (:func:`_launch_cached_splitk_k2`: the same plan, program and bits).  ``enable_pdl`` as for
-    :func:`prepare_router_fp32_gemm`."""
-    if _resolve_deterministic(deterministic, "router_dgrad"):
-        return _det_entry("router_dgrad")(G, W, out, **_pdl_kw(enable_pdl))
+    """``out[T, K] = G[T, N] @ W[N, K]`` in FP32, ``deterministic=False`` only: in the token windows of the row's
+    input-gradient verdict in :data:`ROUTER_RULES` (or, on a part with a table of its own, :data:`ROUTER_RULES_BY_SM`)
+    the exact-FP32 SIMT program (:func:`router_simt`: compensated sums of the products of ``G`` and ``W`` read in
+    place, every element of ``out`` stored once), and at every other row and token count the deterministic program
+    (one split: nothing to reduce) through this package's binding of it (:func:`_launch_cached_splitk_k2`: the same
+    plan, program and bits).  ``enable_pdl`` as for :func:`prepare_router_fp32_gemm`."""
+    _require_false(deterministic, "router_dgrad", "router_det_dgrad")
     if out is None:
         out = torch.empty(G.shape[0], W.shape[1], device=G.device, dtype=torch.float32)
     if _k2_entry("dgrad", G, W, out, None, enable_pdl) is not None:
         return out
-    return _router_gemm(
-        G, W, out, None, False, enable_pdl, (G.unsqueeze(0), W, _DGRAD_VIEWS)
-    )
+    return _router_gemm(G, W, out, None, enable_pdl, (G.unsqueeze(0), W, _DGRAD_VIEWS))
 
 
 def router_wgrad(
@@ -5300,44 +5341,16 @@ def router_wgrad(
     deterministic: bool = True,
     enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
-    """``out[N, K] = G[T, N].T @ X[T, K]`` in FP32: the swapped GEMM ``X.T @ G`` with a transposed store;
-    ``splits`` defaults to the deterministic package's production count (6), or with ``deterministic=False`` to the
-    partition of the row's verdict in :data:`ROUTER_RULES` or, on a part with a table of its own, in
-    :data:`ROUTER_RULES_BY_SM` (:func:`router_partition`; a row or token count without one runs the deterministic
-    program, through this package's binding of it without planning the row here, :func:`_launch_cached_splitk_k2`)."""
-    if _resolve_deterministic(deterministic, "router_wgrad"):
-        return _det_entry("router_wgrad")(
-            G, X, out, **_splits_kw(splits), **_pdl_kw(enable_pdl)
-        )
+    """``out[N, K] = G[T, N].T @ X[T, K]`` in FP32, ``deterministic=False`` only: the swapped GEMM ``X.T @ G`` with a
+    transposed store; ``splits`` defaults to the partition of the row's verdict in :data:`ROUTER_RULES` or, on a part
+    with a table of its own, in :data:`ROUTER_RULES_BY_SM` (:func:`router_partition`; a row or token count without one
+    runs the deterministic program, through this package's binding of it without planning the row here,
+    :func:`_launch_cached_splitk_k2`)."""
+    _require_false(deterministic, "router_wgrad", "router_det_wgrad")
     if out is None:
         out = torch.empty(G.shape[1], X.shape[1], device=G.device, dtype=torch.float32)
     if _k2_entry("wgrad", G, X, out, splits, enable_pdl) is not None:
         return out
     # a row without a verdict (kept per device and geometry, :func:`_router_memo`) runs the deterministic program
     views = (X.unsqueeze(0), G, _WGRAD_VIEWS)
-    return _router_gemm(G.t(), X, out, splits, False, enable_pdl, views)
-
-
-def split_fp32_to_bf16x3_(
-    src: torch.Tensor,
-    parts: torch.Tensor,
-    resid: torch.Tensor,
-    *,
-    deterministic: bool = True,
-) -> torch.Tensor:
-    """Exact three-way BF16 split ``src = p1 + p2 + p3`` into the retained ``parts [3, *src.shape]`` stack with the
-    fp32 scratch ``resid``.  The same deterministic stage in both modes."""
-    _resolve_deterministic(deterministic, "split_fp32_to_bf16x3_")
-    return _det_entry("split_fp32_to_bf16x3_")(src, parts, resid)
-
-
-def __getattr__(name: str) -> Any:
-    """Read the other module-level names of this path through to the deterministic package (``ROW_RULES``,
-    ``stream_k_plan``, ``wgrad_views``, the plan and prepared types, ...).  Names spelling the ``det`` token are not
-    read through: they live in the deterministic package only."""
-    if (name.startswith("__") and name.endswith("__")) or _DET_SPELLED.search(name):
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    try:
-        return getattr(deterministic_backend(), DETERMINISTIC_NAMES.get(name, name))
-    except AttributeError:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
+    return _router_gemm(G.t(), X, out, splits, enable_pdl, views)
