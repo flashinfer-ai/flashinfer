@@ -177,6 +177,8 @@ def test_recurrent_kda_cu_seqlens_host_avoids_sync(backend, lengths):
         pytest.skip("KDA chunk prefill routes need SM100/SM103")
     if backend == "ptx" and capability != (10, 3):
         pytest.skip("backend='ptx' requires SM103")
+    if backend != "auto" and capability not in ((10, 0), (10, 3)):
+        pytest.skip(f"backend={backend!r} supports SM100/SM103 only")
     heads, state_dtype = {
         "ptx": (64, torch.float32),
         "cute-dsl-persistent": (8, torch.float32),
@@ -237,7 +239,9 @@ def test_recurrent_kda_cu_seqlens_host_avoids_sync(backend, lengths):
             torch.cuda.synchronize()
     except (ImportError, RuntimeError) as exc:
         if backend in ("ptx", "tirx", "cute-dsl-persistent") and (
-            isinstance(exc, ImportError) or "requires" in str(exc)
+            isinstance(exc, ImportError)
+            or "requires" in str(exc)
+            or "ptxas" in str(exc)
         ):
             pytest.skip(f"{backend} unavailable: {exc}")
         raise
