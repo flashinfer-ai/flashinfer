@@ -5636,19 +5636,26 @@ def _prepare(
 # deterministic implementation.  Later versions may launch unordered reductions (``deterministic=False`` is the opt-in);
 # a path that does raises that alert.  The compute entries take ``deterministic`` (default ``True``) so that a caller
 # states the mode it wants, and refuse every value but ``False`` (this package never falls back; the deterministic route
-# is ``flashinfer.experimental.cake_gdn_det_train_kcp``, and ``flashinfer.cake_gdn_train_kcp`` dispatches between the
-# two).  The mode is never stored in the context.
+# is ``flashinfer.cake_gdn_det_train_kcp``, and ``flashinfer.cake_gdn_train_kcp`` is this package's entry module with the
+# same rule).  The mode is never stored in the context.
 MODE = "nondeterministic"
+# Each compute entry's deterministic counterpart in ``flashinfer.cake_gdn_det_train_kcp`` (named in the refusal).
+_DET_ENTRIES = {
+    "chunk_gdn_kcp": "chunk_gdn_det_kcp",
+    "chunk_gdn_fwd_kcp": "chunk_gdn_det_fwd_kcp",
+    "chunk_gdn_bwd_kcp": "chunk_gdn_det_bwd_kcp",
+}
 
 
 def check_mode(deterministic: Any, entry: str) -> None:
-    """Refuse every ``deterministic`` but ``False`` (``ValueError``).  No alert under PyTorch's deterministic algorithms:
-    every path of this version is fixed-order."""
+    """Refuse every ``deterministic`` but ``False`` (``ValueError`` naming the entry's deterministic counterpart).  No
+    alert under PyTorch's deterministic algorithms: every path of this version is fixed-order."""
     if deterministic is not False:
+        det = _DET_ENTRIES.get(entry, "chunk_gdn_det_kcp")
         raise ValueError(
             f"{entry}: flashinfer.experimental.cake_gdn_train_kcp is the non-deterministic package and needs "
-            f"deterministic=False (got {deterministic!r}); the deterministic route is "
-            "flashinfer.experimental.cake_gdn_det_train_kcp (or flashinfer.cake_gdn_train_kcp with deterministic=True)"
+            f"deterministic=False (got {deterministic!r}): pass deterministic=False for the non-deterministic path; "
+            f"the deterministic entry is flashinfer.cake_gdn_det_train_kcp.{det}"
         )
 
 

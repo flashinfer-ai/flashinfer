@@ -1325,6 +1325,8 @@ def test_sm107a_registers_the_fp8_decode_route_only():
         "fp8_h128_prefill_source_persistent",
         "fp8_h128_prefill_source_persistent_uniform",
         "fp8_h128_prefill_source_persistent_uniform_k64",
+        "fp8_h128_prefill_source_persistent_uniform_k64_split",
+        "fp8_h128_prefill_source_persistent_uniform_k64_split_reduce",
         "fp8_h64_prefill_source_persistent_m64",
         "fp8_h64_prefill_source_persistent_m64_multi_tile",
         "fp8_h64_prefill_source_persistent_m64_multi_tile_kv4",
@@ -1397,12 +1399,14 @@ _HOST_TMA_SOURCE_TENSORS = frozenset(
         "main_cache_g4f",
         "extra_cache_g4d",
         "extra_cache_g4f",
+        # SM107 split-KV producer: the [pieces, heads, 512] partial-O view.
+        "partial_O_pieces",
     }
 )
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("arch", _ARCHES)
+@pytest.mark.parametrize("arch", [*_ARCHES, "sm_107a"])
 def test_registered_arg_plans_use_known_names(arch):
     """Every generated argument is bindable by name."""
     unknown = []
@@ -1522,8 +1526,13 @@ def test_metadata_param_vocabulary_is_bindable():
         "tmap_swa_kv",
         "tmap_compressed_v",
         "tmap_o",
+        "tmap_partial_o",
     ):
         assert cake.is_bindable_arg("tma_buffer", tma_name)
+    # The SM107 split-KV producer's additions to the uniform plan.
+    assert cake.canonical_arg_name("tma_buffer", "tmap_partial_o") == "partial_O_pieces"
+    for name in ("num_whole_items", "num_splits"):
+        assert cake.is_bindable_arg("parameter", name), name
     assert cake.canonical_arg_name("parameter", "num_q_heads") == "num_heads"
     assert cake.canonical_arg_name("parameter", "num_split") == "num_splits"
     assert not cake.is_bindable_arg("buffer", "completion_base")
@@ -2256,11 +2265,13 @@ def test_persistent_route_synthesizes_dense_query_offsets(monkeypatch):
 class _RecordingLauncher:
     """Minimal stand-in for ``_Launcher`` that records the launched variants."""
 
-    def __init__(self, arch: str, **values):
+    def __init__(self, arch: str, *, split=None, **values):
         self.arch = arch
         # The call's PDL switch and longest request (run_cake_dsv4 sets both):
         # PDL off and one-token requests unless given.
         self.values = {"enable_pdl": False, "max_q_len": 1, **values}
+        # The whole launch's split-KV plan (run_cake_dsv4 sets it; None unless given).
+        self.split = split
         self.calls: list[tuple[str, dict]] = []
 
     def variant(self, name, *, grid, **overrides):
@@ -2274,6 +2285,14 @@ class _RecordingLauncher:
         return {
             "partial_O": f"partial_O[{num_splits}]",
             "partial_lse": f"partial_lse[{num_splits}]",
+            "num_splits": num_splits,
+        }
+
+    def pieces(self, rows, num_splits):
+        return {
+            "partial_O": f"partial_O[{rows}x{num_splits}]",
+            "partial_O_pieces": f"partial_O_pieces[{rows}x{num_splits}]",
+            "partial_lse": f"partial_lse[{rows}x{num_splits}]",
             "num_splits": num_splits,
         }
 
@@ -3637,9 +3656,10 @@ def test_sm107a_uniform_launch_follows_the_process_runtime(
 def test_sibling_gates_know_every_oversized_binding():
     """The programs whose generated bindings launch in CUDA 13.4's oversized
     shared-memory mode are exactly the K=64 and four-stage siblings the gates
-    hold, each with the dynamic shared memory its gate compares with the
-    device's oversized ceiling; every other program, including those the gates
-    fall back to, launches in the standard mode."""
+    hold and the SM107 split producer the K=64 gate holds, each with the
+    dynamic shared memory its gate compares with the device's oversized
+    ceiling; every other program, including those the gates fall back to,
+    launches in the standard mode."""
     import re
 
     from flashinfer.jit.cake_dsv4 import VARIANTS, _get_csrc_dir
@@ -3654,6 +3674,12 @@ def test_sibling_gates_know_every_oversized_binding():
         for arch, smem in smem_by_arch.items()
         for route in routes
     }
+    # The split-KV producer launches only where the K=64 gate passes
+    # (cake._k64_split), so it shares the K=64 sibling's shared memory.
+    for arch, smem in cake._K64_SIBLING_OVERSIZED_SMEM_BYTES.items():
+        split = VARIANTS[arch].get(cake._K64_SPLIT_VARIANT)
+        if split is not None and split != VARIANTS[arch][cake._K64_SPLIT_ROUTE]:
+            gated[split] = smem
     oversized = {}
     for path in sorted(_get_csrc_dir().glob("*/*_binding.cu")):
         text = path.read_text(encoding="utf-8")
@@ -3894,20 +3920,26 @@ def test_sm107a_m64_multi_tile_launch_follows_the_process_runtime(
 # counts up to the half wave run the persistent body, every token count past
 # it the M64 body.
 _SM107_KV4_M64_SPANS = """
-widths             | 208         | 208 kv4     | 216         | 216 kv4     | 224 kv4
-176                | 1-12 17-104 | 1-104       | 1-12 17-108 | 1-108       | 1-112
-177 191            | 1-12 17-104 | 1-12 17-104 | 1-12 17-108 | 1-12 17-108 | 1-12 17-112
-192 255            | 1-12 32-104 | 1-12 32-104 | 1-12 33-108 | 1-12 33-108 | 1-12 34-112
-256                | 1-12 27-104 | 1-104       | 1-12 28-108 | 1-108       | 1-112
-257 288 289 352    | 1-12 54-104 | 1-16 52-104 | 1-12 56-108 | 1-16 54-108 | 1-16 56-112
-353 383            | 1-12 54-104 | 1-12 52-104 | 1-12 56-108 | 1-12 54-108 | 1-12 56-112
-384                | 53-104      | 1-104       | 55-108      | 1-108       | 1-112
-385 511            | 63-104      | 63-104      | 65-108      | 65-108      | 68-112
-512                | 55-104      | 51-104      | 57-108      | 52-108      | 54-112
-896 1152           | -           | 78-104      | -           | 80-108      | 83-112
-1024               | -           | 93-104      | -           | 96-108      | 100-112
-513 640 768 895    | -           | -           | -           | -           | -
-897 1023 1025 1151 | -           | -           | -           | -           | -
+widths          | 208         | 208 kv4           | 216         | 216 kv4           | 224 kv4
+176             | 1-12 17-104 | 1-104             | 1-12 17-108 | 1-108             | 1-112
+177 191         | 1-12 17-104 | 1-12 17-104       | 1-12 17-108 | 1-12 17-108       | 1-12 17-112
+192 255         | 1-12 32-104 | 1-12 32-104       | 1-12 33-108 | 1-12 33-108       | 1-12 34-112
+256             | 1-12 27-104 | 1-104             | 1-12 28-108 | 1-108             | 1-112
+257 288 289 352 | 1-12 54-104 | 1-16 24-47 52-104 | 1-12 56-108 | 1-16 24-47 54-108 | 1-16 24-47 56-112
+353 383         | 1-12 54-104 | 1-12 44-47 52-104 | 1-12 56-108 | 1-12 44-47 54-108 | 1-12 44-47 56-112
+384             | 53-104      | 1-104             | 55-108      | 1-108             | 1-112
+385 511         | 63-104      | 60-104            | 65-108      | 63-108            | 65-112
+512             | 55-104      | 40-104            | 57-108      | 41-108            | 43-112
+513 639         | -           | 64-104            | -           | 67-108            | 69-112
+640             | -           | 32-47 56-104      | -           | 32-47 58-108      | 32-47 60-112
+641 767         | -           | 59-104            | -           | 62-108            | 64-112
+768             | -           | 55-104            | -           | 58-108            | 60-112
+769 895         | -           | 77-104            | -           | 80-108            | 83-112
+896             | -           | 63-104            | -           | 66-108            | 68-112
+897 1023        | -           | 78-104            | -           | 81-108            | 83-112
+1024            | -           | 81-104            | -           | 84-108            | 87-112
+1025 1151       | -           | 91-104            | -           | 94-108            | 98-112
+1152            | -           | 77-104            | -           | 79-108            | 82-112
 """
 
 
@@ -3966,9 +3998,10 @@ def test_fp8_h64_decode_rows_route_by_the_kv4_edges_on_sm107():
     """On SM107 every FP8/H64 decode row up to two tokens past the half wave
     (208, 216 and 224 SMs) routes as ``_SM107_KV4_M64_SPANS`` lists, without
     and with the four-stage edges.  They take widths 176, 256 and 384 at every
-    token count, widths 257-352 at 1-16 tokens (then the persistent body again
-    until 52 tokens at 208 SMs), widths 257-383 and 512 a few tokens earlier,
-    and widths 896, 1024 and 1152 before the half wave."""
+    token count; widths 257-352 at 1-16 and 24-47 tokens and widths 353-383 at
+    44-47 tokens, below the uniform route's K=64 floor (then the persistent
+    body again until 52 tokens at 208 SMs); widths 385-512 earlier; and
+    widths 513-1152 before the half wave, width 640 also at 32-47 tokens."""
     table = _sm107_kv4_m64_spans()
     assert len(_sm107_kv4_widths()) == sum(len(widths) for widths, _ in table)
     for widths, spans in table:
@@ -3987,16 +4020,20 @@ def test_fp8_h64_decode_rows_route_by_the_kv4_edges_on_sm107():
 @pytest.mark.cpu_only
 def test_kv4_edges_only_promote_sm107a_h64_decode_rows():
     """The four-stage edges only move SM107 FP8/H64 decode rows of more than
-    one tile from the persistent body to the multi-tile M64 body: both tables
-    key SM107 alone, no M64 edge comes later than today's, no short-window
-    width keeps a row persistent that today runs on the M64 body, and the
-    other architectures, head counts, BF16 and prefill rows route as without
+    one tile from the persistent body to the multi-tile M64 body: the three
+    tables key SM107 alone, no M64 edge comes later than today's, no
+    short-window width keeps a row persistent that today runs on the M64 body,
+    the windows below the K=64 floor start past 16 tokens and below that
+    floor, on disjoint widths of a key with an edge and two or more complete
+    tiles (rows the persistent body runs past 12 tokens), and the other
+    architectures, head counts, BF16 and prefill rows route as without
     them."""
     import itertools
 
     short = cake._FP8_H64_PERSISTENT_SHORT_MIN_WIDTH_KV4
     early = cake._FP8_H64_M64_EARLY_WAVE_KV4
-    assert set(short) == set(early) == {"sm_107a"}
+    band = cake._FP8_H64_M64_BELOW_K64_KV4
+    assert set(short) == set(early) == set(band) == {"sm_107a"}
     for arch, edges in early.items():
         base = cake._FP8_H64_M64_EARLY_WAVE[arch]
         for tiles, (num, den) in edges.items():
@@ -4004,6 +4041,17 @@ def test_kv4_edges_only_promote_sm107a_h64_decode_rows():
             if tiles in base:
                 base_num, base_den = base[tiles]
                 assert num * base_den <= base_num * den, tiles
+    for arch, keys in band.items():
+        floor = cake._K64_SIBLING_MIN_TOKENS[arch]
+        for tiles, windows in keys.items():
+            assert tiles in early[arch] and tiles[1] >= 2, tiles
+            last = 0
+            for min_width, max_width, first in sorted(windows):
+                assert last < min_width <= max_width, (tiles, min_width)
+                for width in (min_width, max_width):
+                    assert (-(-width // 128), width // 128) == tiles, width
+                assert 17 <= first < floor, (tiles, first)
+                last = max_width
     for arch, entries in short.items():
         # Today the one-tile rows run the persistent body up to 16 tokens from
         # the one-tile short-window width on; wider rows from two tiles on.
@@ -4122,6 +4170,53 @@ def test_kv4_false_routes_are_todays():
                     default = _h64_decode_route(width, tokens, sm_count, arch)
                     off = _h64_decode_route(width, tokens, sm_count, arch, kv4=False)
                     assert default == off == expected, (arch, sm_count, width, tokens)
+
+
+# SM107's previous four-stage edges of the FP8/H64 decode rows (no windows
+# below the K=64 floor), frozen.
+_PREVIOUS_SM107_H64_EARLY_WAVE_KV4 = {
+    (2, 1): (3, 20),
+    (2, 2): (0, 1),
+    (3, 2): (14, 57),
+    (3, 3): (0, 1),
+    (4, 3): (3, 10),
+    (4, 4): (19, 79),
+    (7, 7): (77, 208),
+    (8, 8): (23, 52),
+    (9, 9): (77, 208),
+}
+
+
+@pytest.mark.cpu_only
+def test_kv4_tables_only_promote_relative_to_the_previous_kv4_tables(monkeypatch):
+    """Relative to the previous four-stage edges (frozen above, without
+    windows below the K=64 floor), the current tables move SM107 FP8/H64
+    decode rows of widths 129-1152 only from the uniform route to the
+    multi-tile M64 route: 22775, 23411 and 23285 rows up to two tokens past
+    the half wave at 208, 212 and 216 SMs."""
+    sm_counts = (208, 212, 216)
+    current = {
+        (sm_count, width, tokens): _h64_decode_route(
+            width, tokens, sm_count, "sm_107a", kv4=True
+        )
+        for sm_count in sm_counts
+        for width in range(129, 1153)
+        for tokens in range(1, sm_count // 2 + 3)
+    }
+    monkeypatch.setattr(
+        cake,
+        "_FP8_H64_M64_EARLY_WAVE_KV4",
+        {"sm_107a": _PREVIOUS_SM107_H64_EARLY_WAVE_KV4},
+    )
+    monkeypatch.setattr(cake, "_FP8_H64_M64_BELOW_K64_KV4", {})
+    moved = dict.fromkeys(sm_counts, 0)
+    for row, new in current.items():
+        sm_count, width, tokens = row
+        old = _h64_decode_route(width, tokens, sm_count, "sm_107a", kv4=True)
+        if new != old:
+            assert (old, new) == (_UNIFORM_ROUTE, _M64_MULTI_TILE_ROUTE), row
+            moved[sm_count] += 1
+    assert moved == {208: 22775, 212: 23411, 216: 23285}
 
 
 def _bf16_out_at(rows, num_heads, offset):
@@ -4268,7 +4363,7 @@ def test_row_tiled_h64_decode_chunks_run_the_kv4_sibling(monkeypatch):
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("width,tokens", [(384, 48), (512, 52)])
+@pytest.mark.parametrize("width,tokens", [(384, 48), (512, 52), (640, 56)])
 def test_k64_only_ceiling_keeps_todays_h64_decode_routes(
     monkeypatch, k64_gate, kv4_gate, width, tokens
 ):
@@ -4288,6 +4383,80 @@ def test_k64_only_ceiling_keeps_todays_h64_decode_routes(
     (bound,) = calls
     assert (bound["grid_x"], bound["grid_y"], bound["grid_z"]) == (2 * tokens, 1, 1)
     assert bound["total_work_items"] == tokens
+
+
+@pytest.mark.cpu_only
+def test_sm107a_kv4_band_ends_at_the_k64_floor(monkeypatch):
+    """With the four-stage edges, SM107's FP8/H64 decode rows of widths
+    257-352 take the M64 body from 24 tokens, those of widths 353-383 from
+    44 tokens and those of width 640 from 32 tokens up to the uniform route's
+    K=64 floor (48 rows, read when the call routes), then the persistent body
+    until the early edge; without them, and on the other architectures, the
+    rows route as before.  At 208 SMs those rows launch the four-stage
+    sibling, one CTA per token; the rows from the floor run the uniform
+    route's K=64 sibling and the rows of widths 353-383 below 44 tokens its
+    K=32 program, two CTAs per token."""
+    assert cake._FP8_H64_M64_BELOW_K64_KV4 == {
+        "sm_107a": {
+            (3, 2): ((257, 352, 24), (353, 383, 44)),
+            (5, 5): ((640, 640, 32),),
+        },
+    }
+    assert cake._K64_SIBLING_MIN_TOKENS == {"sm_107a": 48}
+    # The first M64 token count of the early edge with and without them.
+    kv4_edge = {208: 52, 212: 53, 216: 54}
+    base_edge = {208: 54, 212: 55, 216: 56}
+
+    def m64_body(width, tokens, sm_count, arch, kv4):
+        return cake._fp8_h64_uses_m64_body(
+            tokens, sm_count, sparse_topk=width, arch=arch, kv4=kv4
+        )
+
+    for sm_count in (208, 212, 216):
+        for width in range(260, 384, 4):
+            first = 24 if width <= 352 else 44
+            for tokens in range(13, 61):
+                key = (sm_count, width, tokens)
+                band = first <= tokens <= 47
+                with_kv4 = band or tokens >= kv4_edge[sm_count]
+                assert m64_body(width, tokens, sm_count, "sm_107a", True) == with_kv4
+                today = tokens >= base_edge[sm_count]
+                assert m64_body(width, tokens, sm_count, "sm_107a", False) == today
+                for arch in ("sm_100a", "sm_103a", None):
+                    assert not m64_body(width, tokens, sm_count, arch, False), key
+                    assert not m64_body(width, tokens, sm_count, arch, True), key
+    # Width 640 (five complete tiles) from 32 tokens up to the floor, then the
+    # persistent body until its early edge.
+    for sm_count, edge in ((208, 56), (212, 57), (216, 58)):
+        for tokens in range(13, 61):
+            with_kv4 = 32 <= tokens <= 47 or tokens >= edge
+            assert m64_body(640, tokens, sm_count, "sm_107a", True) == with_kv4
+            assert not m64_body(640, tokens, sm_count, "sm_107a", False)
+    sibling = f"{_M64_MULTI_TILE_ROUTE}_kv4"
+    for width, tokens, program, grid in (
+        (296, 30, sibling, 30),
+        (296, 48, f"{_UNIFORM_ROUTE}_k64", 96),
+        (296, 50, f"{_UNIFORM_ROUTE}_k64", 100),
+        (296, 52, sibling, 52),
+        (380, 30, _UNIFORM_ROUTE, 60),
+        (380, 45, sibling, 45),
+    ):
+        programs, calls, _ = _run_fake_h64_decode_fp8(
+            monkeypatch, arch="sm_107a", width=width, tokens=tokens
+        )
+        (bound,) = calls
+        assert programs == [program], (width, tokens)
+        assert (bound["grid_x"], bound["grid_y"], bound["grid_z"]) == (grid, 1, 1)
+        assert bound["total_work_items"] == tokens
+    # The windows end at the floor the call reads: 40 rows end them at 39.
+    monkeypatch.setattr(cake, "_K64_SIBLING_MIN_TOKENS", {"sm_107a": 40})
+    for tokens in range(13, 61):
+        lower = m64_body(296, tokens, 208, "sm_107a", True)
+        upper = m64_body(380, tokens, 208, "sm_107a", True)
+        assert lower == (24 <= tokens <= 39 or tokens >= 52), tokens
+        assert upper == (tokens >= 52), tokens
+        wide = m64_body(640, tokens, 208, "sm_107a", True)
+        assert wide == (32 <= tokens <= 39 or tokens >= 56), tokens
 
 
 @pytest.mark.cpu_only
@@ -4662,6 +4831,30 @@ def test_workspace_requirement_is_exact_per_route():
     assert fp8.minimum_bytes == cake._PARTIAL_OFFSET + 512 + -(-(1025 * 4) // 128) * 128
     # The route-agnostic single-launch bound stays conservative (five splits).
     assert get_cake_dsv4_workspace_bytes(1024, 128, 128, torch.float8_e4m3fn) > mib128
+    # The uniform route at a split-KV shape reports the split carve (40
+    # pieces of 128 x 512 BF16 and 128 FP32 each at 8 rows of five pieces)
+    # on every architecture; the one-row minimum stays the route's.
+    for arch in ("sm_100a", "sm_103a", "sm_107a"):
+        split = cake.cake_dsv4_workspace_requirement(
+            dtype=torch.float8_e4m3fn,
+            num_heads=128,
+            num_query_tokens=8,
+            sm_count=_SM_COUNT,
+            sparse_topk=1152,
+            compressed_page_size=64,
+            max_q_len=1,
+            batch_size=8,
+            ragged=False,
+            arch=arch,
+        )
+        assert split.route == "fp8_h128_prefill_source_persistent_uniform"
+        assert split.num_splits == 1 and split.uses_workspace
+        assert split.single_launch_bytes == 5_526_528 == 263168 + 40 * (131072 + 512)
+        # One row per launch: 128 heads x 4 B of LSE plus the 9 shifted offsets.
+        assert split.minimum_bytes == cake._PARTIAL_OFFSET + 512 + 128
+        assert split.rows_per_launch(split.minimum_bytes) == 1
+        # The route's own launch over all rows fits its LSE region.
+        assert split.rows_per_launch(cake._PARTIAL_OFFSET + 8 * 128 * 4) == 8
     # The split route without a token bound tiles inside 128 MiB; the counter
     # region caps one launch at 16384 rows of four counters.
     h32 = cake.cake_dsv4_workspace_requirement(
@@ -4778,3 +4971,577 @@ def test_route_plan_matches_the_dispatcher(monkeypatch, arch):
                         ), route
                     checked += 1
     assert checked > 0
+
+
+# --------------------------------------------------------------------------- #
+# SM107 split-KV launches of the FP8/H128 uniform-gather route                #
+# --------------------------------------------------------------------------- #
+
+# Pieces per row of the split launches SM107 runs with PDL (128 heads, items
+# 1025-1152 wide): the first of 9, 5, 3 and 2 that keeps rows x pieces <= 40.
+_SPLIT_PIECES = {
+    **dict.fromkeys(range(1, 5), 9),
+    **dict.fromkeys(range(5, 9), 5),
+    **dict.fromkeys(range(9, 14), 3),
+    **dict.fromkeys(range(14, 18), 2),
+}
+
+
+def _split_plan(**shape):
+    """``cake._k64_split_plan`` of an SM107 uniform launch of 8 PDL rows over
+    1152-wide items with 128 heads, with ``shape`` changed."""
+    args = dict(
+        route=_UNIFORM_ROUTE,
+        arch="sm_107a",
+        num_heads=128,
+        num_query_tokens=8,
+        sparse_topk=1152,
+        enable_pdl=True,
+    )
+    args.update(shape)
+    route = args.pop("route")
+    return cake._k64_split_plan(route, **args)
+
+
+@pytest.mark.cpu_only
+def test_k64_split_rule_is_sm107a_only():
+    """Only SM107 splits, and only with PDL, the uniform route's 128-head
+    launches of at most 17 rows over nine-tile items, at most 40 pieces."""
+    assert _UNIFORM_ROUTE == cake._K64_SPLIT_ROUTE
+    assert f"{_UNIFORM_ROUTE}_k64_split" == cake._K64_SPLIT_VARIANT
+    assert f"{_UNIFORM_ROUTE}_k64_split_reduce" == cake._K64_SPLIT_MERGE
+    rule = cake._K64SplitRule(
+        num_tiles=9,
+        max_tokens_pdl=17,
+        max_tokens_no_pdl=0,
+        max_pieces=40,
+        splits=(9, 5, 3, 2),
+    )
+    assert {"sm_107a": rule} == cake._K64_SPLIT_RULES
+    # The split keys are not K=64 siblings: the K=64 floor never applies to them.
+    assert cake._K64_SPLIT_VARIANT not in cake._K64_SIBLING_ROUTES
+    assert cake._K64_SPLIT_MERGE not in cake._K64_SIBLING_ROUTES
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("tokens", [*range(1, 19), 24, 48, 127])
+@pytest.mark.parametrize("sparse_topk", [1028, 1088, 1152])
+def test_k64_split_plan_pins(tokens, sparse_topk):
+    """Rows 1-4 split into nine pieces, 5-8 into five, 9-13 into three and
+    14-17 into two; no whole rows; 18 rows and more keep the route."""
+    expected = (0, tokens, _SPLIT_PIECES[tokens]) if tokens in _SPLIT_PIECES else None
+    assert _split_plan(num_query_tokens=tokens, sparse_topk=sparse_topk) == expected
+    if expected is not None:
+        assert tokens * expected[2] <= 40
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"arch": "sm_100a"},
+        {"arch": "sm_103a"},
+        {"arch": "sm_120a"},
+        {"route": "fp8_h128_prefill_source_persistent"},
+        {"route": "fp8_h64_prefill_source_persistent_m64_multi_tile"},
+        {"route": "bf16_h128_topk4x_v52"},
+        {"num_heads": 64},
+        {"num_heads": 32},
+        {"num_heads": 16},
+        {"num_heads": 8},
+        {"sparse_topk": 1024},
+        {"sparse_topk": 896},
+        {"sparse_topk": 640},
+        {"sparse_topk": 128},
+        {"sparse_topk": 1156},
+        {"enable_pdl": False},
+        {"num_query_tokens": 0},
+        {"num_query_tokens": 18},
+    ],
+    ids=lambda change: ",".join(f"{k}={v}" for k, v in change.items()),
+)
+def test_k64_split_plan_keeps_every_other_launch(change):
+    assert _split_plan() == (0, 8, 5)
+    assert _split_plan(**change) is None
+
+
+@pytest.mark.cpu_only
+def test_k64_split_plan_without_pdl_follows_its_own_ceiling(monkeypatch):
+    """Launches without PDL split up to the rule's PDL-off row ceiling (0 on
+    main: none) with the same pieces as with PDL."""
+    import dataclasses
+
+    rule = cake._K64_SPLIT_RULES["sm_107a"]
+    monkeypatch.setattr(
+        cake,
+        "_K64_SPLIT_RULES",
+        {"sm_107a": dataclasses.replace(rule, max_tokens_no_pdl=13)},
+    )
+    for tokens in range(1, 19):
+        split = (0, tokens, _SPLIT_PIECES[tokens]) if tokens in _SPLIT_PIECES else None
+        assert _split_plan(num_query_tokens=tokens, enable_pdl=True) == split
+        assert _split_plan(num_query_tokens=tokens, enable_pdl=False) == (
+            split if tokens <= 13 else None
+        )
+
+
+@pytest.mark.cpu_only
+def test_k64_split_checks_the_workspace_registry_and_gate(monkeypatch):
+    """A planned split runs only when the workspace holds its carve, the
+    architecture routes both split keys to programs of their own and the K=64
+    gate passes; the gate is asked last."""
+    import flashinfer.jit.cake_dsv4 as jit
+
+    carve = cake_dsv4_workspace_layout(8, 128, 5).total_bytes
+    asked = []
+    launchable = [True]
+
+    def gate(arch, device):
+        asked.append((arch, device))
+        return launchable[0]
+
+    monkeypatch.setattr(cake, "_k64_sibling_launchable", gate)
+
+    def split(**changes):
+        args = dict(
+            arch="sm_107a",
+            num_heads=128,
+            num_query_tokens=8,
+            sparse_topk=1152,
+            enable_pdl=True,
+            workspace_bytes=carve,
+            device=_DEVICE,
+        )
+        args.update(changes)
+        return cake._k64_split(_UNIFORM_ROUTE, **args)
+
+    keys = (cake._K64_SPLIT_VARIANT, cake._K64_SPLIT_MERGE)
+    table = {
+        arch: {key: program for key, program in variants.items() if key not in keys}
+        for arch, variants in jit.VARIANTS.items()
+    }
+    monkeypatch.setattr(jit, "VARIANTS", table)
+    assert split() is None
+    sm107 = table["sm_107a"]
+    sm107[cake._K64_SPLIT_VARIANT] = "fake_split_producer"
+    assert split() is None
+    sm107[cake._K64_SPLIT_MERGE] = sm107[_UNIFORM_ROUTE]
+    assert split() is None
+    sm107[cake._K64_SPLIT_MERGE] = "fake_split_merge"
+    assert asked == []
+    assert split() == (0, 8, 5)
+    assert asked == [("sm_107a", _DEVICE)]
+    assert split(workspace_bytes=carve - 1) is None
+    assert split(enable_pdl=False) is None
+    assert split(num_query_tokens=18) is None
+    assert len(asked) == 1
+    assert split(workspace_bytes=carve + 4096) == (0, 8, 5)
+    launchable[0] = False
+    assert split() is None
+    assert len(asked) == 3
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("tokens", [1, 4, 5, 8, 9, 13, 14, 17])
+def test_split_launch_runs_the_producer_then_the_merge(tokens):
+    """A split launch issues the split producer over 2 CTAs per piece and the
+    merge over one CTA per (row, head), in one run, both on the piece views."""
+    splits = _SPLIT_PIECES[tokens]
+    out = torch.empty((tokens, 128, 512), dtype=torch.bfloat16)
+    L = _RecordingLauncher(
+        "sm_107a",
+        split=(0, tokens, splits),
+        Q=torch.empty(0),
+        O=out,
+        num_query_tokens=tokens,
+        num_heads=128,
+        sparse_topk=1152,
+        max_q_len=1,
+        enable_pdl=True,
+    )
+    cake._dispatch_route(_UNIFORM_ROUTE, L)
+    pieces = L.pieces(tokens, splits)
+    (producer, producer_args), (merge, merge_args) = L.calls
+    assert producer == cake._K64_SPLIT_VARIANT
+    assert producer_args == {
+        "grid": (2 * tokens * splits, 1, 1),
+        "total_work_items": tokens * splits,
+        "num_whole_items": 0,
+        **pieces,
+    }
+    assert merge == cake._K64_SPLIT_MERGE
+    merge_out = merge_args.pop("O")
+    assert merge_args == {"grid": (tokens, 128, 1), **pieces}
+    assert merge_out.data_ptr() == out.data_ptr() and merge_out.shape == out.shape
+
+
+def _uniform_plan():
+    import flashinfer.jit.cake_dsv4 as jit
+
+    return [tuple(pair) for pair in jit.ARG_PLANS[_UNIFORM_ROUTE]]
+
+
+def _split_producer_plan():
+    """The uniform plan with the split producer's additions, in the order of
+    its kernel signature: ``tmap_partial_o`` after ``tmap_o``, then
+    ``num_whole_items`` and ``num_splits`` after ``batch_size``."""
+    plan = _uniform_plan()
+    at = plan.index(("tma_buffer", "tmap_o")) + 1
+    plan[at:at] = [("tma_buffer", "tmap_partial_o")]
+    at = plan.index(("parameter", "batch_size")) + 1
+    plan[at:at] = [("parameter", "num_whole_items"), ("parameter", "num_splits")]
+    return plan
+
+
+# The merge's argument plan (its kernel signature: the pieces, O, H and s;
+# PDL is a launch attribute of each call).
+_SPLIT_MERGE_PLAN = _plan(
+    ("buffer", "partial_O"),
+    ("buffer", "partial_lse"),
+    ("buffer", "O"),
+    ("parameter", "num_heads"),
+    ("parameter", "num_splits"),
+    ("launch", "enable_pdl"),
+)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+def test_split_programs_take_the_plans_the_host_binds(arch):
+    """SM107 routes both split keys to programs of their own: the producer's
+    plan is the uniform plan with the split additions and the merge's plan is
+    its kernel signature.  SM100 / SM103 route both keys to the uniform
+    program."""
+    import flashinfer.jit.cake_dsv4 as jit
+
+    variants = jit.VARIANTS[arch]
+    uniform = variants[_UNIFORM_ROUTE]
+    keys = (cake._K64_SPLIT_VARIANT, cake._K64_SPLIT_MERGE)
+    own = [variants.get(key, uniform) != uniform for key in keys]
+    assert own == [arch == "sm_107a"] * len(keys)
+    if arch == "sm_107a":
+        plans = (_split_producer_plan(), _SPLIT_MERGE_PLAN)
+        for key, plan in zip(keys, plans, strict=True):
+            assert get_cake_dsv4_spec(key, arch=arch)["arg_plan"] == tuple(plan), key
+
+
+class _SplitRun:
+    """The launches of one fake run: ``calls`` = (variant, bound arguments by
+    name) in launch order; ``sequences`` = the run_sequence calls (launches
+    per call)."""
+
+    def __init__(self):
+        self.calls: list[tuple[str, dict]] = []
+        self.sequences: list[int] = []
+
+
+def _install_fake_split_registry(monkeypatch, *, routed: bool) -> _SplitRun:
+    """Fake modules for the uniform route, its K=64 sibling and the two split
+    programs; with ``routed``, a registry in which SM107 routes both split
+    keys to programs of their own and SM100 / SM103 to the uniform program."""
+    import flashinfer.jit.cake_dsv4 as jit
+
+    plans = {
+        _UNIFORM_ROUTE: _uniform_plan(),
+        f"{_UNIFORM_ROUTE}_k64": _uniform_plan(),
+        cake._K64_SPLIT_VARIANT: _split_producer_plan(),
+        cake._K64_SPLIT_MERGE: _SPLIT_MERGE_PLAN,
+    }
+    _install_fake_variants(monkeypatch, plans)
+    record = _SplitRun()
+
+    class _Module:
+        def __init__(self, variant):
+            self.variant = variant
+
+        def run(self, *args):
+            names = (name for _, name in plans[self.variant])
+            record.calls.append((self.variant, dict(zip(names, args, strict=True))))
+
+    class _Sequence:
+        @staticmethod
+        def run_sequence(*flat):
+            launches = 0
+            i = 0
+            while i < len(flat):
+                fn, count = flat[i], flat[i + 1]
+                fn(*flat[i + 2 : i + 2 + count])
+                i += 2 + count
+                launches += 1
+            record.sequences.append(launches)
+
+    monkeypatch.setattr(
+        cake, "_variant_module", lambda variant, *, arch: _Module(variant)
+    )
+    monkeypatch.setattr(cake, "_sequence_module", lambda: _Sequence)
+    keys = (cake._K64_SPLIT_VARIANT, cake._K64_SPLIT_MERGE)
+    table = {
+        arch: {key: program for key, program in variants.items() if key not in keys}
+        for arch, variants in jit.VARIANTS.items()
+    }
+    if routed:
+        for arch, variants in table.items():
+            own = arch == "sm_107a"
+            uniform = variants[_UNIFORM_ROUTE]
+            variants[cake._K64_SPLIT_VARIANT] = (
+                "fake_split_producer" if own else uniform
+            )
+            variants[cake._K64_SPLIT_MERGE] = "fake_split_merge" if own else uniform
+    monkeypatch.setattr(jit, "VARIANTS", table)
+    return record
+
+
+def _split_inputs(tokens, *, workspace_bytes=None, num_heads=128, sparse_topk=1152):
+    """run_cake_dsv4 keyword arguments of a dense one-row-per-request FP8
+    decode call over ``sparse_topk``-wide items (page size 64)."""
+    table = torch.arange(tokens * sparse_topk, dtype=torch.int32).reshape(
+        tokens, sparse_topk
+    )
+    if workspace_bytes is None:
+        workspace_bytes = get_cake_dsv4_workspace_bytes(
+            tokens, num_heads, sparse_topk, torch.float8_e4m3fn
+        )
+    return dict(
+        query=torch.zeros((tokens, num_heads, 512), dtype=torch.float8_e4m3fn),
+        swa_kv_cache=torch.zeros((4, 1, 256, 512), dtype=torch.float8_e4m3fn),
+        compressed_kv_cache=torch.zeros((8, 1, 64, 512), dtype=torch.float8_e4m3fn),
+        workspace_buffer=_aligned_u8(workspace_bytes),
+        out=torch.zeros((tokens, num_heads, 512), dtype=torch.bfloat16),
+        bmm1_scale=0.5,
+        bmm2_scale=1.0,
+        sinks=None,
+        max_q_len=1,
+        cum_seq_lens_q=None,
+        seq_lens=torch.full((tokens,), 4096, dtype=torch.int32),
+        backend="cake",
+        sparse_indices=table,
+        sparse_topk_lens=torch.full((tokens,), sparse_topk, dtype=torch.int32),
+    )
+
+
+def _run_split(monkeypatch, inputs, *, arch="sm_107a", enable_pdl=True, routed=True):
+    record = _install_fake_split_registry(monkeypatch, routed=routed)
+    monkeypatch.setattr(cake, "_target_arch", lambda device: arch)
+    assert cake.run_cake_dsv4(**inputs, enable_pdl=enable_pdl) is inputs["out"]
+    return record
+
+
+def _launch_record(calls):
+    """``calls`` with every tensor as (address, shape, strides, dtype)."""
+
+    def key(value):
+        if isinstance(value, torch.Tensor):
+            return (value.data_ptr(), tuple(value.shape), value.stride(), value.dtype)
+        return value
+
+    return [
+        (variant, {name: key(value) for name, value in args.items()})
+        for variant, args in calls
+    ]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("tokens", [1, 4, 5, 8, 9, 13, 14, 17])
+def test_run_cake_dsv4_split_launch_binds_the_piece_views(monkeypatch, tokens):
+    """The split launch carves cake_dsv4_workspace_layout(T, H, s): the
+    producer stores its pieces through the [T * s, H, 512] partial-O view at
+    byte 263168 and the LSE right after it, final O of single-piece rows
+    through O; the merge reads the same views and writes O; both bind the
+    call's PDL and run in one run_sequence call."""
+    splits = _SPLIT_PIECES[tokens]
+    pieces = tokens * splits
+    inputs = _split_inputs(tokens)
+    record = _run_split(monkeypatch, inputs)
+    assert record.sequences == [2]
+    (producer, p), (merge, m) = record.calls
+    assert (producer, merge) == (cake._K64_SPLIT_VARIANT, cake._K64_SPLIT_MERGE)
+    base = inputs["workspace_buffer"].data_ptr()
+    out = inputs["out"]
+    layout = cake_dsv4_workspace_layout(tokens, 128, splits)
+    assert layout.partial_o == (263168, pieces * 128 * 512 * 2)
+    lse_offset = 263168 + pieces * 131072
+    assert layout.partial_lse == (lse_offset, pieces * 128 * 4)
+    # Producer.
+    view = p["tmap_partial_o"]
+    assert view.data_ptr() == base + 263168 and view.is_contiguous()
+    assert view.shape == (pieces, 128, 512) and view.dtype == torch.bfloat16
+    assert p["partial_lse"].data_ptr() == base + lse_offset
+    assert p["partial_lse"].numel() == pieces * 128
+    assert p["partial_lse"].dtype == torch.float32
+    assert p["tmap_o"] is p["O"] and p["O"].data_ptr() == out.data_ptr()
+    assert p["O"].shape == (tokens, 128, 512)
+    assert (p["grid_x"], p["grid_y"], p["grid_z"]) == (2 * pieces, 1, 1)
+    assert p["total_work_items"] == pieces and p["num_whole_items"] == 0
+    assert p["num_splits"] == splits and p["num_query_tokens"] == tokens
+    assert p["num_heads"] == 128 and p["sparse_topk"] == 1152
+    assert p["enable_pdl"] == 1
+    # Merge.
+    assert m["partial_O"].data_ptr() == base + 263168
+    assert m["partial_O"].numel() == pieces * 128 * 512
+    assert m["partial_lse"].data_ptr() == base + lse_offset
+    assert m["partial_lse"].numel() == pieces * 128
+    assert m["O"].data_ptr() == out.data_ptr() and m["O"].shape == (tokens, 128, 512)
+    assert m["num_splits"] == splits and m["num_heads"] == 128
+    assert (m["grid_x"], m["grid_y"], m["grid_z"]) == (tokens, 128, 1)
+    assert m["enable_pdl"] == 1
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("tokens", [1, 8, 17])
+@pytest.mark.parametrize(
+    "fallback", ["workspace", "no_pdl", "sm_103a", "gate", "unrouted"]
+)
+def test_split_fallbacks_launch_the_route_as_main(monkeypatch, tokens, fallback):
+    """A workspace one byte short of the split carve, a call without PDL, an
+    architecture other than SM107, a process that cannot launch the K=64
+    programs and a registry without the split programs each run the route's
+    own single launch, argument for argument as without the split."""
+    carve = cake_dsv4_workspace_layout(tokens, 128, _SPLIT_PIECES[tokens]).total_bytes
+    inputs = _split_inputs(
+        tokens, workspace_bytes=carve - 1 if fallback == "workspace" else carve
+    )
+    arch = "sm_103a" if fallback == "sm_103a" else "sm_107a"
+    enable_pdl = fallback != "no_pdl"
+    asked = []
+    if fallback == "gate":
+        monkeypatch.setattr(
+            cake,
+            "_k64_sibling_launchable",
+            lambda gate_arch, device: asked.append((gate_arch, device)) or False,
+        )
+    got = _run_split(
+        monkeypatch,
+        inputs,
+        arch=arch,
+        enable_pdl=enable_pdl,
+        routed=fallback != "unrouted",
+    )
+    main = _run_split(
+        monkeypatch, inputs, arch=arch, enable_pdl=enable_pdl, routed=False
+    )
+    assert _launch_record(got.calls) == _launch_record(main.calls)
+    assert got.sequences == []
+    ((variant, args),) = got.calls
+    assert variant == _UNIFORM_ROUTE
+    assert (args["grid_x"], args["grid_y"], args["grid_z"]) == (2 * tokens, 1, 1)
+    assert args["total_work_items"] == tokens
+    base = inputs["workspace_buffer"].data_ptr()
+    assert args["partial_lse"].data_ptr() == base + 263168
+    assert args["partial_lse"].numel() == tokens * 128
+    assert args["O"].data_ptr() == inputs["out"].data_ptr()
+    assert args["enable_pdl"] == int(enable_pdl)
+    assert asked == ([("sm_107a", torch.device("cpu"))] if fallback == "gate" else [])
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "tokens,num_heads,sparse_topk",
+    [(18, 128, 1152), (24, 128, 1152), (8, 128, 1024), (8, 128, 640), (8, 64, 1152)],
+)
+def test_split_keeps_the_route_outside_its_rule(
+    monkeypatch, tokens, num_heads, sparse_topk
+):
+    """Uniform-route launches outside the rule (more than 17 rows, items of
+    fewer than nine tiles, the 64-head rows this route also runs) keep the
+    route's single launch on SM107 with the split programs registered."""
+    inputs = _split_inputs(tokens, num_heads=num_heads, sparse_topk=sparse_topk)
+    got = _run_split(monkeypatch, inputs)
+    main = _run_split(monkeypatch, inputs, routed=False)
+    assert _launch_record(got.calls) == _launch_record(main.calls)
+    ((variant, args),) = got.calls
+    assert variant == _UNIFORM_ROUTE and args["grid_x"] == 2 * tokens
+
+
+@pytest.mark.cpu_only
+def test_row_tiled_launches_never_split(monkeypatch):
+    """A workspace below the route's single launch tiles the rows; no chunk
+    splits, although each chunk alone is a split shape."""
+    tokens = 8
+    plan = cake._route_plan(
+        _UNIFORM_ROUTE, num_query_tokens=tokens, num_heads=128, sparse_topk=1152
+    )
+    workspace_bytes = cake._launch_workspace_bytes(plan, 4, 128, tokens + 1)
+    assert (
+        cake._rows_per_launch(
+            plan,
+            num_query_tokens=tokens,
+            num_heads=128,
+            batch_size=tokens,
+            workspace_bytes=workspace_bytes,
+        )
+        == 4
+    )
+    splits = []
+    dispatch = cake._dispatch_route
+
+    def recording_dispatch(route, L):
+        splits.append(L.split)
+        dispatch(route, L)
+
+    monkeypatch.setattr(cake, "_dispatch_route", recording_dispatch)
+    record = _run_split(
+        monkeypatch, _split_inputs(tokens, workspace_bytes=workspace_bytes)
+    )
+    assert splits == [None, None]
+    assert record.sequences == []
+    assert [variant for variant, _ in record.calls] == [_UNIFORM_ROUTE] * 2
+    assert [args["num_query_tokens"] for _, args in record.calls] == [4, 4]
+    assert all(args["grid_x"] == 8 for _, args in record.calls)
+    assert _split_plan(num_query_tokens=4) == (0, 4, 9)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+@pytest.mark.parametrize("sm_count", [148, 216])
+def test_workspace_requirement_covers_the_split_launch(arch, sm_count):
+    """At a split shape the requirement reports the split carve on every
+    architecture and SM count (the PDL setting is no input); elsewhere and in
+    the one-row minimum it reports the route's own numbers, and
+    get_cake_dsv4_workspace_bytes bounds every split carve."""
+    for tokens in (*range(1, 19), 24, 48):
+        for sparse_topk in (1024, 1028, 1152):
+            for num_heads in (64, 128):
+                req = cake.cake_dsv4_workspace_requirement(
+                    dtype=torch.float8_e4m3fn,
+                    num_heads=num_heads,
+                    num_query_tokens=tokens,
+                    sm_count=sm_count,
+                    sparse_topk=sparse_topk,
+                    compressed_page_size=64,
+                    max_q_len=1,
+                    batch_size=tokens,
+                    ragged=False,
+                    arch=arch,
+                )
+                own = cake._launch_workspace_bytes(req.plan, tokens, num_heads, 0)
+                split = (
+                    req.route == _UNIFORM_ROUTE
+                    and num_heads == 128
+                    and sparse_topk > 1024
+                    and tokens in _SPLIT_PIECES
+                )
+                if split:
+                    carve = cake_dsv4_workspace_layout(
+                        tokens, 128, _SPLIT_PIECES[tokens]
+                    ).total_bytes
+                    assert req.single_launch_bytes == carve > own
+                    assert carve <= get_cake_dsv4_workspace_bytes(
+                        tokens, 128, sparse_topk, torch.float8_e4m3fn
+                    )
+                else:
+                    assert req.single_launch_bytes == own, (tokens, sparse_topk)
+                assert req.num_splits == req.plan.num_splits
+                assert req.minimum_bytes == min(
+                    own,
+                    cake._launch_workspace_bytes(req.plan, 1, num_heads, tokens + 1),
+                )
+    # The largest carve: 8 rows of five pieces (40 pieces).
+    assert (
+        max(
+            cake._k64_split_workspace_bytes(
+                _UNIFORM_ROUTE, num_heads=128, num_query_tokens=tokens, sparse_topk=1152
+            )
+            for tokens in range(1, 18)
+        )
+        == 5_526_528
+    )
