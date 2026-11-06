@@ -36,7 +36,7 @@ input storage:
 * ``local``: the single-rank Cake kernels on the rank's shard as a batch of
   its own (no exchange; the per-rank work without the boundaries): the
   deterministic causal convolution and
-  ``flashinfer.experimental.cake.cake_gdn_det_train.chunk_gated_delta_rule_det``;
+  ``flashinfer.experimental.cake.cake_gdn_det_train.cake_gdn_det``;
 * ``control``: the KCP path again -- the identical-program control.
 
 Protocol: ``--groups`` groups (at least 3); in every group the arms run in the
@@ -92,7 +92,7 @@ from flashinfer.cake_gdn_det_train_kcp import (  # noqa: E402
     partition_det_kcp,
 )
 from flashinfer.experimental.cake.cake_gdn_det_train import (  # noqa: E402
-    chunk_gated_delta_rule_det,
+    cake_gdn_det,
 )
 
 ARMS = ("cake", "fla", "local", "control")
@@ -273,7 +273,7 @@ def _local_arm(problem: dict[str, Any], boundary: str) -> Callable[[], None]:
 
     def forward(q, k, v, g, beta, x, w):
         y = cake_causal_conv1d_det(x, w, cu)
-        out, _ = chunk_gated_delta_rule_det(
+        out, _ = cake_gdn_det(
             q[None],
             k[None],
             v[None],
