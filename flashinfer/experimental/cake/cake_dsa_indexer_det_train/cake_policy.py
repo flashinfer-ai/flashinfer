@@ -89,6 +89,7 @@ POLICY_FIELDS = (
     "wide_rule",  # [min wide rounds per CTA, min rounds x mean unit tiles] of the wide program
     "wide_first_rule",  # [min mean unit tiles] from which a wide-eligible call takes the wide program before the three-warpgroup rule, or None (the three-warpgroup rule first)
     "wide_wave_rule",  # [min narrow / wide wave ratio, min l6 / wide wave ratio, min mean unit tiles against l6] replacing wide_rule and wide_first_rule, or None; see unit_block_q_for
+    "desc_walk_kinds",  # [physical scan kinds whose descending-walk twin (key kind "<kind>_desc") a call with the sampled first threshold off runs, the same for a sampled call], or None; see select_program
     "split_max",  # most key-range splits per unit
     "split_min_range_tiles",  # a split's key range is at least this many tiles
     "split_wave_rule",  # [min mean unit tiles, min CTA-efficiency gain] for a two-way split, or None
@@ -313,6 +314,7 @@ _OPTIONAL_RULE = (
     "l6_rule",
     "wide_first_rule",
     "wide_wave_rule",
+    "desc_walk_kinds",
     "split_wave_rule",
     "split_wave_scope",
     "split_fit_rule",
@@ -365,6 +367,7 @@ class DispatchPolicy:
     wide_rule: list
     wide_first_rule: Optional[list]
     wide_wave_rule: Optional[list]
+    desc_walk_kinds: Optional[list]
     split_max: int
     split_min_range_tiles: int
     split_wave_rule: Optional[list]
@@ -475,6 +478,19 @@ class DispatchPolicy:
         ):
             raise ValueError(
                 f"policy['wide_wave_rule'] must be [min narrow / wide wave ratio, min l6 / wide wave ratio, min mean unit tiles] or None, got {waves!r}"
+            )
+        desc = raw["desc_walk_kinds"]
+        if desc is not None and (
+            len(desc) != 2
+            or not all(
+                isinstance(kinds, (list, tuple))
+                and all(isinstance(k, str) and k in PHYSICAL_KINDS for k in kinds)
+                and list(kinds) == sorted(set(kinds))
+                for kinds in desc
+            )
+        ):
+            raise ValueError(
+                f"policy['desc_walk_kinds'] must be [unsampled kinds, sampled kinds] (ascending lists of physical scan kinds {PHYSICAL_KINDS}) or None, got {desc!r}"
             )
         pair_units = raw["pair_units"]
         if (
@@ -1125,6 +1141,13 @@ class DispatchPolicy:
             else self.tile_unroll_default
         )
 
+    def desc_walk_for(self, physical_kind: str, sampled: bool) -> bool:
+        """The call runs the descending-walk twin of its scan program (key kind ``<physical_kind>_desc``, the same unit,
+        split, pair, tile unroll and fit form): ``desc_walk_kinds`` names the physical kind for the call's sampling
+        mode (``select_program`` takes the twin only where the registry has it)."""
+        rule = self.desc_walk_kinds
+        return rule is not None and physical_kind in rule[1 if sampled else 0]
+
     def sample_fit_for(
         self,
         num_queries: int,
@@ -1612,7 +1635,8 @@ def select_program(
     split with the unpaired l6 unit only where that unit would not split and its program key is registered.  A record's
     ``wide_pair_snake_only`` (sampled calls) drops the CTA pair of a wide unit that would not walk the snake order where the
     unpaired wide program is in ``scan_keys`` (without a registry it stays off, as the l6 preference); ``split_wave_scope``
-    limits the two-way wave split.
+    limits the two-way wave split.  A record's ``desc_walk_kinds`` runs the descending-walk twin of the decided program
+    (key kind ``<kind>_desc``) where it names the kind for the call's sampling mode and ``scan_keys`` has the twin.
     """
     T, Tkv, S, r, K = (
         int(num_queries),
@@ -1759,6 +1783,13 @@ def select_program(
     )
     scan_entries = grid_ctas * block_q * cap
     staging = T * n_split * K if split else 0
+    key = scan_key(physical, unroll, snake, fit, lsf)
+    # desc_walk_kinds: the descending-walk twin of the decided program, where the record names its kind for the call's
+    # sampling mode and the registry has it (no registry: off); the plan, the knobs and the workspace stay
+    if scan_keys is not None and policy.desc_walk_for(physical, tiles > 0):
+        desc_key = scan_key(f"{physical}_desc", unroll, snake, fit, lsf)
+        if desc_key in scan_keys:
+            key = desc_key
     return ProgramChoice(
         num_queries=T,
         num_keys=Tkv,
@@ -1798,7 +1829,7 @@ def select_program(
         rank_persist_ctas=int(policy.rank_persist_ctas_per_sm)
         if rank_persistent
         else 0,
-        scan_key=scan_key(physical_kind(kind, unit), unroll, snake, fit, lsf),
+        scan_key=key,
         merge_key=MERGE_KEY if split else None,
         finalize_key=finalize_key(
             rank_threads,
