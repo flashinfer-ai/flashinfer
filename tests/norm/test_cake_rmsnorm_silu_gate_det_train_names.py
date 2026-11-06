@@ -201,12 +201,31 @@ def test_every_public_name_carries_its_mode(key) -> None:
             assert _mode_words(name) == [mode], (key, name)
 
 
+def test_the_mode_word_is_a_whole_word() -> None:
+    """The mode check reads whole words (``_``-separated words, or the
+    capitalized words of a CamelCase name), so ``nondet`` never counts as
+    ``det`` and a word that only contains ``det`` counts as neither."""
+    for mode in MODES:
+        for name in PUBLIC[mode]:
+            assert _mode_words(name) == [mode], name
+    for name in (
+        *OLD_NAMES,
+        "cake_rmsnorm_silu_gate_determinism",
+        "CakeRMSNormSiLUGateDeterminismFunction",
+    ):
+        assert _mode_words(name) == [], name
+
+
 @pytest.mark.parametrize("key", list(NAMESPACES), ids=NAMESPACE_IDS)
 def test_no_entry_has_a_deterministic_parameter(key) -> None:
+    """No entry binds a ``deterministic`` keyword: not the functions, and not
+    the autograd class's ``forward`` and ``backward``."""
     entries = _entries(NAMESPACES[key])
     assert len(entries) == len(PUBLIC[key[0]]) + 1, key
     for name, entry in entries.items():
         assert "deterministic" not in inspect.signature(entry).parameters, (key, name)
+        with pytest.raises(TypeError):
+            inspect.signature(entry).bind_partial(deterministic=False)
     cls = getattr(NAMESPACES[key], CLASS[key[0]])
     assert list(inspect.signature(cls.forward).parameters) == [
         "ctx",

@@ -64,8 +64,8 @@ Mode and dispatch rules (the same in
    refuses the other package's workspace (``ValueError``).
 5. The former names are gone, with no alias or shim: the former modules fail
    at import, and the former names without a mode word are attributes of
-   neither ``flashinfer`` nor either module.  The migration table (former
-   name, name) is in the SiLU-gated RMSNorm section of ``docs/api/norm.rst``.
+   neither ``flashinfer`` nor either module.  The SiLU-gated RMSNorm section
+   of ``docs/api/norm.rst`` maps each former name to its names in both modes.
 
 Usage::
 

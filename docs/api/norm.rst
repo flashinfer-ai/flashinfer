@@ -174,48 +174,53 @@ an autograd wrapper that saves only its inputs.
    raw partial sums of one package and serves only that package (FP32 for the
    deterministic package, FP64 for the non-deterministic one): each backward
    refuses the other package's workspace (``ValueError``).
-5. The former names are gone, with no alias or shim: the modules
-   ``flashinfer.cake_rmsnorm_silu_gate_train``,
-   ``flashinfer.cake_rmsnorm_silu_gate_train_backend`` and
-   ``flashinfer.cake_rmsnorm_silu_gate_det_train_backend`` fail at import, and
-   the names without a mode word (``CakeRMSNormSiLUGateFunction``,
-   ``cake_rmsnorm_silu_gate``, ``cake_rmsnorm_silu_gate_train_forward``,
-   ``cake_rmsnorm_silu_gate_train_backward``,
-   ``cake_rmsnorm_silu_gate_train_backward_workspace``,
-   ``cake_rmsnorm_silu_gate_train_backward_workspace_bytes``,
-   ``cake_rmsnorm_silu_gate_train_reset_workspace`` and
-   ``is_cake_rmsnorm_silu_gate_train_supported``) are attributes of neither
-   ``flashinfer`` nor either module.
+5. The former names are gone, with no alias or shim: the former modules fail
+   at import, and the former names without a mode word are attributes of
+   neither ``flashinfer`` nor either module.
 
-The former names and their replacements (the deterministic names are
-unchanged):
+The former names and their names in each mode.  A former entry ran the
+deterministic package by default (``deterministic=True``) and the
+non-deterministic package with ``deterministic=False``:
 
 .. list-table::
     :header-rows: 1
 
     * - Former name
-      - Name
+      - Name (former default, ``deterministic=True``)
+      - Name (former ``deterministic=False``)
     * - ``flashinfer.cake_rmsnorm_silu_gate_train`` (module)
+      - ``flashinfer.cake_rmsnorm_silu_gate_det_train``
       - ``flashinfer.cake_rmsnorm_silu_gate_nondet_train``
-    * - ``flashinfer.cake_rmsnorm_silu_gate_train_backend`` (package)
-      - ``flashinfer.experimental.cake.cake_rmsnorm_silu_gate_nondet_train``
     * - ``flashinfer.cake_rmsnorm_silu_gate_det_train_backend`` (package)
       - ``flashinfer.experimental.cake.cake_rmsnorm_silu_gate_det_train``
-    * - ``cake_rmsnorm_silu_gate(..., deterministic=False)``
-      - ``cake_rmsnorm_silu_gate_nondet(...)``
+      - (none)
+    * - ``flashinfer.cake_rmsnorm_silu_gate_train_backend`` (package; it took
+        ``deterministic=False`` only)
+      - (none)
+      - ``flashinfer.experimental.cake.cake_rmsnorm_silu_gate_nondet_train``
+    * - ``cake_rmsnorm_silu_gate``
+      - ``cake_rmsnorm_silu_gate_det``
+      - ``cake_rmsnorm_silu_gate_nondet``
     * - ``CakeRMSNormSiLUGateFunction``
+      - ``CakeRMSNormSiLUGateDetFunction``
       - ``CakeRMSNormSiLUGateNondetFunction``
     * - ``cake_rmsnorm_silu_gate_train_forward``
+      - ``cake_rmsnorm_silu_gate_det_train_forward``
       - ``cake_rmsnorm_silu_gate_nondet_train_forward``
     * - ``cake_rmsnorm_silu_gate_train_backward``
+      - ``cake_rmsnorm_silu_gate_det_train_backward``
       - ``cake_rmsnorm_silu_gate_nondet_train_backward``
     * - ``cake_rmsnorm_silu_gate_train_backward_workspace_bytes``
+      - ``cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes``
       - ``cake_rmsnorm_silu_gate_nondet_train_backward_workspace_bytes``
     * - ``cake_rmsnorm_silu_gate_train_backward_workspace``
+      - ``cake_rmsnorm_silu_gate_det_train_backward_workspace``
       - ``cake_rmsnorm_silu_gate_nondet_train_backward_workspace``
     * - ``cake_rmsnorm_silu_gate_train_reset_workspace``
+      - (none: the deterministic workspace needs no reset)
       - ``cake_rmsnorm_silu_gate_nondet_train_reset_workspace``
     * - ``is_cake_rmsnorm_silu_gate_train_supported``
+      - ``is_cake_rmsnorm_silu_gate_det_train_supported``
       - ``is_cake_rmsnorm_silu_gate_nondet_train_supported``
 
 .. currentmodule:: flashinfer.cake_rmsnorm_silu_gate_det_train
