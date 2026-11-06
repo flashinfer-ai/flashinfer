@@ -935,6 +935,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "sample_shift_rule": None,
         "sample_class_rule": [8, 500],
         "lsf_programs": True,
+        "lsf_single_rule": None,
         "static_scan_kinds": [],
         "far_sample": 0,
         "check_period_max": 32,
@@ -1016,6 +1017,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "sample_shift_rule": [4096, 375],
         "sample_class_rule": [8, 500],
         "lsf_programs": True,
+        "lsf_single_rule": None,
         "static_scan_kinds": [],
         "far_sample": 0,
         "check_period_max": 32,
@@ -1113,6 +1115,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "sample_shift_rule": None,
         "sample_class_rule": None,
         "lsf_programs": False,
+        "lsf_single_rule": None,
         "static_scan_kinds": ["l6", "pair_l6"],
         "far_sample": 0,
         "check_period_max": 32,
@@ -1158,10 +1161,13 @@ POLICY: dict[str, dict[str, Any]] = {
 # waves over at least 84 mean unit tiles.  On sm_107a a call the snake rule
 # marks runs the snake copy of the FP8 l6 program only as one document within
 # 40 waves of the persistent grid (snake_cap_rule): packed documents and longer
-# calls are faster in the plain order.
+# calls are faster in the plain order.  On sm_103a a one-document call of the
+# FP8 wide unit runs its :lsf copy from 64 mean unit tiles on (lsf_single_rule):
+# the same units in the same order, measured faster there and slower on shorter
+# units.
 POLICY_FP8: dict[str, dict[str, Any]] = {
     "sm_100a": {"static_scan_kinds": [], "wide_wave_rule": [1.7, 1.3, 84.0]},
-    "sm_103a": {"static_scan_kinds": []},
+    "sm_103a": {"static_scan_kinds": [], "lsf_single_rule": [64.0]},
     "sm_107a": {
         "static_scan_kinds": ["l6", "narrow", "split_narrow", "wide"],
         "split_fit_rule": None,
