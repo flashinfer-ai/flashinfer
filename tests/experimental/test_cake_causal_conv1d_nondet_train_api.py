@@ -410,8 +410,7 @@ def test_entry_points_mirror_the_package() -> None:
 def test_entry_points_are_stable(recorded, kcp_recorded) -> None:
     """Every entry point, helper and support query of the two modules is a stable API (``@flashinfer_api``; FlashInfer
     issue #8928): none is marked experimental (no ``is_experimental`` set ``True`` on the entry point or on the
-    function it wraps), and a call emits no ``ExperimentalWarning``.  The modules list these names, and the single-rank
-    module re-exports the package's autograd Function."""
+    function it wraps), and a call emits no ``ExperimentalWarning``."""
 
     x, w, cu, dy, b, ctx = (object() for _ in range(6))
     cpu = torch.device("cpu")
@@ -435,6 +434,13 @@ def test_entry_points_are_stable(recorded, kcp_recorded) -> None:
             c for c in caught if issubclass(c.category, ExperimentalWarning)
         ]
         assert experimental == [], (name, experimental)
+
+
+@pytest.mark.cpu_only
+def test_modules_list_their_names() -> None:
+    """The two modules list their entry points, helpers and support query, and the single-rank module re-exports the
+    package's autograd Function (resolved from the real package, so this test takes no recorder fixture)."""
+
     assert set(facade.__all__) >= set(ENTRIES) | set(HELPERS) | {SUPPORTED[0]}
     assert set(kcp_facade.__all__) == set(KCP_ENTRIES) | {
         "CakeCausalConv1dNondetKcpRecomputeHandle"
