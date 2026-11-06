@@ -17,7 +17,9 @@ priced for `dhu_tc2` (see Chain); they then match within the same budgets.
 On `sm_107a` a call may also take a deeper split table (see Chain); the
 outputs that depend on that table then match within the same budgets too.
 
-Both the API and the backend are experimental: no compatibility guarantee.
+The facade `flashinfer.cake_gdn_nondet_train` is a stable FlashInfer API: its
+entry points are `@flashinfer_api` functions.  This package, under
+`flashinfer.experimental.cake`, is its backend.
 SM100 (B200 / GB200), SM103 (B300 / GB300) and SM107 (R200) are the supported
 architectures; another device raises `RuntimeError`.  The SM107 libraries need
 CUDA 13.4 or newer.  The feature does not

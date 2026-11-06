@@ -1795,8 +1795,8 @@ def test_device_route_does_not_synchronize(device) -> None:
 # --------------------------------------------------------------------------- the names and the mode (no device)
 
 # The public names of the package: the package root's ``__all__`` (the facade's are tested in
-# ``test_cake_gdn_nondet_train_api.py``).  Every one carries the mode word ``nondet`` (the check looks for ``nondet``:
-# ``det`` alone is a substring of it).
+# ``test_cake_gdn_nondet_train_api.py``).  Every one carries the mode word ``nondet`` as a word of its own (see
+# ``_name_tokens``: ``det`` is a substring of ``nondet``, so a substring check cannot tell the modes apart).
 PACKAGE_NAMES = ("CakeGDNNondetFunction", "cake_gdn_nondet", "cake_gdn_nondet_train_backward",
                  "cake_gdn_nondet_train_forward")  # fmt: skip
 # The package's entries and, in the same order, the deterministic package's entries (its det names).
@@ -1816,12 +1816,29 @@ OLD_NAMES = (
     "gdn_chunk_backward",
 )
 _ALERT = "does not have a deterministic implementation"
+# One word of a name part: an acronym run before a capitalized word, a capitalized or lower-case word, the rest of an
+# acronym run, digits.
+_WORD = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|[0-9]+")
+
+
+def _name_tokens(name: str) -> list[str]:
+    """The lower-cased words of ``name``, split on ``_`` and on CamelCase boundaries, an acronym run as one word
+    (``CakeGDNNondetFunction``: ``cake``, ``gdn``, ``nondet``, ``function``)."""
+    return [word.lower() for part in name.split("_") for word in _WORD.findall(part)]
 
 
 def test_the_public_names_are_the_nondet_names() -> None:
+    # the split itself: an acronym run is one word, and ``det`` is a word of a det name only
+    for name, words in (
+        ("CakeGDNNondetFunction", "cake gdn nondet function"),
+        ("cake_gdn_nondet_train_forward", "cake gdn nondet train forward"),
+        ("CakeGDNDetFunction", "cake gdn det function"),
+    ):
+        assert _name_tokens(name) == words.split(), name
     assert sorted(cake_gdn_nondet_train.__all__) == sorted(PACKAGE_NAMES)
     for name in cake_gdn_nondet_train.__all__:
-        assert "nondet" in name.lower(), name
+        tokens = _name_tokens(name)
+        assert "nondet" in tokens and "det" not in tokens, (name, tokens)
         assert getattr(cake_gdn_nondet_train, name) is not None, name
     # one object per entry: the package root re-exports cake_chain's
     for name in PACKAGE_NAMES:
@@ -1850,23 +1867,37 @@ def test_the_old_names_are_gone_and_the_det_names_are_the_det_package() -> None:
 
 
 def _callables(module) -> dict:
-    """The callables of ``module.__all__``, an autograd Function by its ``forward`` and ``backward``."""
+    """The callables of ``module.__all__``, an autograd Function by its ``forward`` and ``backward`` (and by its
+    ``apply`` when that signature names its parameters)."""
+    var_kinds = (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
     found = {}
     for name in module.__all__:
         obj = getattr(module, name)
         if isinstance(obj, type):
             found[f"{name}.forward"] = obj.forward
             found[f"{name}.backward"] = obj.backward
+            # ``torch.autograd.Function.apply`` takes ``*args, **kwargs``: its signature binds any keyword, so the
+            # check reads ``forward``, the parameters ``apply`` passes on, and ``apply`` only if it names them
+            params = inspect.signature(obj.apply).parameters.values()
+            if all(p.kind not in var_kinds for p in params):
+                found[f"{name}.apply"] = obj.apply
         else:
             found[name] = obj
     return found
 
 
 def test_no_entry_takes_a_deterministic_parameter() -> None:
-    for name, fn in _callables(cake_gdn_nondet_train).items():
-        params = inspect.signature(fn).parameters
-        bad = [p for p in params if "deterministic" in p.lower()]
-        assert not bad, (name, bad)
+    # every callable of the package root's ``__all__``: binding the keyword fails at the signature
+    callables = _callables(cake_gdn_nondet_train)
+    assert {"cake_gdn_nondet", "CakeGDNNondetFunction.forward", "cake_gdn_nondet_train_forward",
+            "cake_gdn_nondet_train_backward"} <= set(callables)  # fmt: skip
+    for name, fn in callables.items():
+        try:
+            inspect.signature(fn).bind_partial(deterministic=False)
+        except TypeError as exc:
+            assert "deterministic" in str(exc), (name, exc)
+        else:
+            pytest.fail(f"{name} binds deterministic=")
 
 
 def test_a_deterministic_keyword_is_a_type_error() -> None:

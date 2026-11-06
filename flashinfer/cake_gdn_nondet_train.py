@@ -34,9 +34,10 @@ Mode rules
   fallback.
 * The deterministic counterpart is ``flashinfer.cake_gdn_det_train``.
 
-Thin experimental entry points: the host plan, the autograd Function and the
-generated kernels live in the package; this module forwards every argument.
-Every plan pin is a keyword argument; no environment variable is read.
+A stable FlashInfer API: thin ``@flashinfer_api`` entry points that import the
+package on first use.  The host plan, the autograd Function and the generated
+kernels live in the package; this module forwards every argument.  Every plan
+pin is a keyword argument; no environment variable is read.
 
 Usage::
 
@@ -59,9 +60,7 @@ from typing import Any, Optional
 
 import torch
 
-from .api_logging import flashinfer_experimental_api
-
-_FEATURE = "Cake packed GDN chunked training, non-deterministic (SM100/SM103/SM107)"
+from .api_logging import flashinfer_api
 
 
 # The package is imported on first use and cached: a call does not repeat the import.
@@ -72,7 +71,7 @@ def _pkg():
     return cake_gdn_nondet_train
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_gdn_nondet(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -159,6 +158,7 @@ def cake_gdn_nondet(
     )
 
 
+@flashinfer_api
 def is_cake_gdn_nondet_train_supported(
     device: torch.device | str | int | None = None,
 ) -> bool:

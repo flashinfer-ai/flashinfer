@@ -16,8 +16,9 @@ limitations under the License.
 Tests of the public surface of the facade ``flashinfer.cake_gdn_nondet_train`` of the non-deterministic GDN
 chunked-training package ``flashinfer.experimental.cake.cake_gdn_nondet_train`` (the package's own names are tested in
 its backend suite ``test_cake_gdn_nondet_train.py``).  On the CPU: importing the facade does not import the package
-before first use; the exact facade names, each with ``nondet``; the old names and the old module path gone; no
-``deterministic`` parameter (passing one is a ``TypeError``); the support query returns a ``bool``.  On a device: the
+before first use; the exact facade names, each with the word ``nondet``; the facade is a stable API (``@flashinfer_api``
+entries, not marked experimental, a first call warns of nothing); the old names and the old module path gone; no
+``deterministic`` keyword (passing one is a ``TypeError``); the support query returns a ``bool``.  On a device: the
 facade runs unchanged under PyTorch's deterministic algorithms, strict and ``warn_only`` (no alert, no warning, no
 fallback to the deterministic package), to the bits of the default mode.
 
@@ -31,6 +32,7 @@ import importlib
 import importlib.util
 import inspect
 import math
+import re
 import subprocess
 import sys
 import warnings
@@ -46,8 +48,8 @@ PACKAGE = "flashinfer.experimental.cake.cake_gdn_nondet_train"
 OLD_MODULE = "flashinfer.experimental.cake.cake_gdn_train"
 HEAD_DIM = 128
 
-# The facade's ``__all__``.  Every name carries the mode word ``nondet`` (the check looks for ``nondet``: ``det`` alone
-# is a substring of it).
+# The facade's ``__all__``.  Every name carries the mode word ``nondet`` as a word of its own (see ``_name_tokens``:
+# ``det`` is a substring of ``nondet``, so a substring check cannot tell the modes apart).
 FACADE_NAMES = (
     "CakeGDNNondetFunction",
     "cake_gdn_nondet",
@@ -67,20 +69,36 @@ DET_NAMES = (
     "cake_gdn_det_train_backward",
 )
 GRAD_NAMES = ("dq", "dk", "dv", "dg", "dbeta")
+# One word of a name part: an acronym run before a capitalized word, a capitalized or lower-case word, the rest of an
+# acronym run, digits.
+_WORD = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|[0-9]+")
 
 
 def _facade():
     return importlib.import_module(FACADE)
 
 
+def _name_tokens(name: str) -> list[str]:
+    """The lower-cased words of ``name``, split on ``_`` and on CamelCase boundaries, an acronym run as one word
+    (``CakeGDNNondetFunction``: ``cake``, ``gdn``, ``nondet``, ``function``)."""
+    return [word.lower() for part in name.split("_") for word in _WORD.findall(part)]
+
+
 def _callables(module) -> dict:
-    """The callables of ``module.__all__``, an autograd Function by its ``forward`` and ``backward``."""
+    """The callables of ``module.__all__``, an autograd Function by its ``forward`` and ``backward`` (and by its
+    ``apply`` when that signature names its parameters)."""
+    var_kinds = (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
     found = {}
     for name in module.__all__:
         obj = getattr(module, name)
         if isinstance(obj, type):
             found[f"{name}.forward"] = obj.forward
             found[f"{name}.backward"] = obj.backward
+            # ``torch.autograd.Function.apply`` takes ``*args, **kwargs``: its signature binds any keyword, so the
+            # check reads ``forward``, the parameters ``apply`` passes on, and ``apply`` only if it names them
+            params = inspect.signature(obj.apply).parameters.values()
+            if all(p.kind not in var_kinds for p in params):
+                found[f"{name}.apply"] = obj.apply
         else:
             found[name] = obj
     return found
@@ -109,10 +127,18 @@ def test_importing_the_facade_does_not_import_the_package() -> None:
 
 
 def test_the_facade_names_are_the_nondet_names() -> None:
+    # the split itself: an acronym run is one word, and ``det`` is a word of a det name only
+    for name, words in (
+        ("CakeGDNNondetFunction", "cake gdn nondet function"),
+        ("is_cake_gdn_nondet_train_supported", "is cake gdn nondet train supported"),
+        ("CakeGDNDetFunction", "cake gdn det function"),
+    ):
+        assert _name_tokens(name) == words.split(), name
     facade = _facade()
     assert sorted(facade.__all__) == sorted(FACADE_NAMES)
     for name in facade.__all__:
-        assert "nondet" in name.lower(), name
+        tokens = _name_tokens(name)
+        assert "nondet" in tokens and "det" not in tokens, (name, tokens)
         assert getattr(facade, name) is not None, name
     # the facade resolves the package's Function; the entries keep their names
     cake_chain = cake_package("cake_gdn_nondet_train", "cake_chain")
@@ -148,12 +174,56 @@ def test_the_old_module_path_does_not_import() -> None:
         assert importlib.util.find_spec(f"{OLD_MODULE}.{sub}") is None, sub
 
 
-def test_no_facade_entry_takes_a_deterministic_parameter() -> None:
+def test_the_facade_is_a_stable_api() -> None:
+    # real ``@flashinfer_api`` defs of the facade module, not marked by the experimental-API decorator (it sets
+    # ``is_experimental`` and ``experimental_feature`` and puts a ``.. warning::`` banner first in the docstring)
     facade = _facade()
-    for name, fn in _callables(facade).items():
-        params = inspect.signature(fn).parameters
-        bad = [p for p in params if "deterministic" in p.lower()]
-        assert not bad, (name, bad)
+    for name in ("cake_gdn_nondet", "is_cake_gdn_nondet_train_supported"):
+        entry = getattr(facade, name)
+        assert inspect.unwrap(entry).__module__ == FACADE, name
+        assert not getattr(entry, "is_experimental", False), name
+        assert not hasattr(entry, "experimental_feature"), name
+        assert not entry.__doc__.lstrip().startswith(".. warning::"), name
+    # a fresh interpreter, since the experimental-API decorator warns on the first call of a process only: the first
+    # call, with a keyword the entry does not take, fails at its signature on host operands and warns of nothing
+    code = (
+        "import warnings\n"
+        "import torch\n"
+        f"import {FACADE} as facade\n"
+        f"q = torch.zeros(1, 64, 1, {HEAD_DIM}, dtype=torch.bfloat16)\n"
+        f"v = torch.zeros(1, 64, 2, {HEAD_DIM}, dtype=torch.bfloat16)\n"
+        "g, beta = torch.zeros(1, 64, 2), torch.zeros(1, 64, 2)\n"
+        "with warnings.catch_warnings(record=True) as caught:\n"
+        "    warnings.simplefilter('always')\n"
+        "    try:\n"
+        "        facade.cake_gdn_nondet(q, q, v, g, beta, deterministic=False)\n"
+        "    except TypeError as exc:\n"
+        "        assert 'deterministic' in str(exc), exc\n"
+        "    else:\n"
+        "        raise AssertionError('the entry took deterministic=')\n"
+        "assert not caught, [(w.category.__name__, str(w.message)) for w in caught]\n"
+        "print('ok')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=300
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().splitlines()[-1] == "ok"
+
+
+def test_no_facade_entry_takes_a_deterministic_parameter() -> None:
+    # every callable of the facade's ``__all__``: binding the keyword fails at the signature
+    facade = _facade()
+    callables = _callables(facade)
+    assert {"cake_gdn_nondet", "CakeGDNNondetFunction.forward",
+            "is_cake_gdn_nondet_train_supported"} <= set(callables)  # fmt: skip
+    for name, fn in callables.items():
+        try:
+            inspect.signature(fn).bind_partial(deterministic=False)
+        except TypeError as exc:
+            assert "deterministic" in str(exc), (name, exc)
+        else:
+            pytest.fail(f"{name} binds deterministic=")
     # the facade entry copies the package entry's signature and forwards every argument
     cake_chain = cake_package("cake_gdn_nondet_train", "cake_chain")
     ours = inspect.signature(facade.cake_gdn_nondet).parameters
@@ -274,7 +344,7 @@ def test_the_facade_runs_unchanged_under_torch_deterministic_algorithms(
     facade = _facade()
     seq_lens, heads = (300, 77, 640), (2, 6)
     inputs = _inputs(seq_lens, heads, device, seed=269)
-    # the default mode first: it also takes the facade's one-time ExperimentalWarning
+    # the default mode first: the reference bits
     want = _run(facade.cake_gdn_nondet, inputs, seq_lens)
     for warn_only in (False, True):
         with (
