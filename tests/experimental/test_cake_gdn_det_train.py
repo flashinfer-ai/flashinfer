@@ -443,6 +443,8 @@ def test_the_value_half_split_rule() -> None:
         "fwd_ho_vh2",
         "fwd_ho_vh2_sm_107a",
     ]
+    # the doubled grid only where the record is the split; elsewhere fwd_ho's grid (the program's own)
+    assert [cake_chain.fwd_ho_vh2_splits(arch) for arch in ARCHES] == [False, False, True]
     engaged = cake_chain.fwd_ho_vh2_engaged
     # twice the CTAs in one round of one CTA per SM
     assert engaged(6, 16, 192) and not engaged(6, 16, 191)
