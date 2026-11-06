@@ -133,8 +133,55 @@ def _mm_fp4_fingerprint(
     )
 
 
+def _moe_bf16_fingerprint(
+    H: int,
+    I: int,
+    top_k: int,
+    num_experts: int,
+    method: object = "Renormalize",
+    act: str = "swiglu",
+) -> str:
+    """The bf16 MoE classes behind ``MoELayer`` with ``BatchInvariantMoeConfig``: ``method`` is a
+    :class:`flashinfer.RoutingMethodType` (or its name) among the ones the class implements, ``act`` ``"swiglu"`` (the gated
+    class) or ``"relu2"`` (the ungated one)."""
+    # absolute on purpose: the JIT cache keys follow relative imports, and the MoE specification is not part of the GEMM
+    # modules' closures
+    from flashinfer.fused_moe.batch_invariant import spec
+    from flashinfer.tllm_enums import RoutingMethodType
+
+    if isinstance(method, str) and method in RoutingMethodType.__members__:
+        method = RoutingMethodType[method]
+    if isinstance(method, RoutingMethodType):
+        if method not in spec.METHOD_OF_FLASHINFER:
+            raise ValueError(
+                f"the batch-invariant MoE classes do not implement routing method {method!r}"
+            )
+        rm = spec.METHOD_OF_FLASHINFER[method]
+    elif isinstance(method, str):
+        rm = spec.METHODS[method]
+    elif isinstance(method, spec.RoutingMethod):
+        rm = method
+    else:
+        raise TypeError(
+            f"method must be a RoutingMethodType, its name or a RoutingMethod, got {method!r}"
+        )
+    if act not in ("swiglu", "relu2"):
+        raise ValueError(f"act must be 'swiglu' or 'relu2', got {act!r}")
+    return spec.spec_fingerprint(
+        H, I, top_k, num_experts, rm, "bf16", "silu" if act == "swiglu" else "relu2"
+    )
+
+
 #: The FlashInfer APIs with a batch-invariant class, by API name.
 CLASSES: Dict[str, ClassInfo] = {
+    # the unified MoE layer with `BatchInvariantMoeConfig`: the routing method and the activation (gated SwiGLU / ungated
+    # ReLU^2) are dimensions of the class; the hidden and intermediate sizes fix the two GEMM classes
+    "fused_moe": ClassInfo(
+        "moe.bf16",
+        ("H", "I", "top_k", "num_experts"),
+        _moe_bf16_fingerprint,
+        ("method", "act"),
+    ),
     "mm_bf16": ClassInfo("gemm.bf16", ("N", "K"), _mm_bf16_fingerprint, ("bias",)),
     # the fp8 input dtype is a dimension: e4m3 and e5m2 are two classes (gemm.e4m3.*, gemm.e5m2.*) of one API; the output
     # dtype (bf16 / fp16) is the chain's conversion; the batch is not a dimension (every element is one launch of the class)

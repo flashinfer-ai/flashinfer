@@ -34,6 +34,7 @@ _FI_DIR = Path(__file__).resolve().parents[1]  # the flashinfer package
 MODE_DIRS: Tuple[Path, ...] = (
     _FI_DIR / "batch_invariant",
     _FI_DIR / "gemm" / "batch_invariant",
+    _FI_DIR / "fused_moe" / "batch_invariant",
 )
 
 #: Root files of every cache module, relative to the flashinfer package; the module's closure is the transitive
@@ -49,6 +50,14 @@ MODULE_ROOTS: Dict[str, Tuple[str, ...]] = {
     # module's objects valid and vice versa (the split's fixup stays in the dense module)
     "batch_invariant_gemm_blockscaled": (
         "gemm/batch_invariant/blocks/compile_blockscaled.py",
+    ),
+    # the bf16 MoE kernels: the grouped GEMM (which composes the dense GEMM blocks: they are in its closure), the
+    # routing, permutation and combine kernels; the MoE API, dispatcher and runner stay outside
+    "batch_invariant_moe": (
+        "fused_moe/batch_invariant/blocks/compile.py",
+        "fused_moe/batch_invariant/route.py",
+        "fused_moe/batch_invariant/permute.py",
+        "fused_moe/batch_invariant/combine.py",
     ),
 }
 
@@ -72,6 +81,11 @@ MODULE_NON_KERNEL_SOURCES: Dict[str, Tuple[str, ...]] = {
         "gemm/batch_invariant/heuristic.py",
     ),
     "batch_invariant_gemm_blockscaled": (
+        "gemm/batch_invariant/schedule.py",
+        "gemm/batch_invariant/heuristic.py",
+    ),
+    # the grouped kernels compose the dense GEMM blocks, whose closure reaches the GEMM dispatcher files
+    "batch_invariant_moe": (
         "gemm/batch_invariant/schedule.py",
         "gemm/batch_invariant/heuristic.py",
     ),

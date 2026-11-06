@@ -3279,8 +3279,68 @@ class FrostLowLatencyConfig:
         )
 
 
+@dataclass(frozen=True)
+class BatchInvariantMoeConfig:
+    """The batch-invariant MoE backend: the bf16 classes ``moe.bf16.swiglu`` (default ``SwiGLU``) and ``moe.bf16.relu2``
+    (``ReLU2``) of the mode documented in ``flashinfer/batch_invariant/README.md``, on SM100 / SM103 / SM107.
+
+    Every output bit is a function of the token's own row, its ``top_k`` experts and routing weights and the expert
+    weights alone: the batch size and composition, the row's position, the expert loads and the grouped-GEMM record the
+    dispatcher or the autotuner picks never enter the dataflow (run-to-run determinism, batch / permutation / sub-batch
+    invariance, configuration agreement; the proofs are the ``MoE`` Lean module of the mode). The combine is the
+    slot-order fp32 fold, so ``MoEFinalizeConfig.use_fused_finalize`` is ignored and ``do_finalize`` must stay ``True``.
+    All three routing input modes are taken: ``FromLogits`` runs the class's own routing (``Default``, ``Renormalize``,
+    ``RenormalizeNaive``, ``Sigmoid``, ``SigmoidRenorm`` and ``DeepSeekV3`` with ``n_group <= 1``), the pre-routed modes take the caller's ids
+    and weights. Unsupported inputs raise :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; the backend
+    never falls back and is not a default candidate: name it in ``BackendOptions`` (alone, it skips the shootout).
+
+    Weights: ``prepare_weights`` takes the canonical ``w1 [E, 2I, H]`` (rows ``[up, gate]``) for ``SwiGLU`` or
+    ``w1 [E, I, H]`` for ``ReLU2``, and ``w2 [E, H, I]``, bf16; activations are bf16 ``[num_tokens, H]`` as given.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (100, 103, 107)
+
+    @staticmethod
+    def prepare_weights(
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        *,
+        num_local_experts: Optional[int] = None,
+        hidden_size: Optional[int] = None,
+        intermediate_size: Optional[int] = None,
+        activation: Optional["ActivationConfig"] = None,
+        device: Optional[torch.device] = None,
+    ) -> Dict[str, Any]:
+        """The backend's weight view: the gate / up rows interleaved for the gated class, as given for the ungated one."""
+        from .batch_invariant.api import MoEWeights
+
+        gated = (
+            isinstance(activation, SwiGLU)
+            if activation is not None
+            else (intermediate_size is None or w1.shape[1] == 2 * intermediate_size)
+        )
+        w1 = w1.to(device=device) if device is not None else w1
+        w2 = w2.to(device=device) if device is not None else w2
+        return MoEWeights.prepare(
+            w1.to(torch.bfloat16), w2.to(torch.bfloat16), gated=gated
+        ).view()
+
+    @staticmethod
+    def prepare_activations(
+        hidden_states: torch.Tensor, *, quant: Optional["QuantConfig"] = None
+    ) -> Tuple[torch.Tensor, None]:
+        """bf16 activations as given (no scale)."""
+        return hidden_states.to(torch.bfloat16).contiguous(), None
+
+    def __repr__(self) -> str:
+        return "BatchInvariantMoeConfig()"
+
+
 # Union type for backend config
 BackendConfigType = Union[
+    BatchInvariantMoeConfig,
     FrostLowLatencyConfig,
     CudnnFrostBf16Config,
     CudnnFrostMxfp8Config,
@@ -3326,6 +3386,7 @@ BackendConfigType = Union[
 ]
 
 ALL_BACKEND_CONFIGS = (
+    BatchInvariantMoeConfig,
     FrostLowLatencyConfig,
     CudnnFrostBf16Config,
     CudnnFrostMxfp8Config,
