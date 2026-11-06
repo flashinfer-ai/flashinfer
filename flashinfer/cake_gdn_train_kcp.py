@@ -81,7 +81,7 @@ Usage::
     gdn_comm_bytes_kcp(ctx, H_qk=16, HV=48, C=10240)                                       # bytes per collective
 
 The width-4 causal convolution with halo of the same partition is
-``flashinfer.cake_causal_conv1d_train.cake_causal_conv1d_kcp(x_local, weight, ctx)``
+``flashinfer.cake_causal_conv1d_det_train_kcp.cake_causal_conv1d_det_kcp(x_local, weight, ctx)``
 with this module's ``ctx``.
 """
 
