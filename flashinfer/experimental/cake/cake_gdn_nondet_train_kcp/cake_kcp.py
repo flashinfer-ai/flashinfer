@@ -6952,6 +6952,19 @@ _DET_PACKED_SPLIT = (
     "flashinfer.experimental.cake.cake_gdn_det_train_kcp.cake_kcp",
     "CakeGDNDetKcpPackedQKVSplitFunction",
 )
+# the last two parts of that module: a build that vendors the deterministic package under another parent package
+# (or as a top-level package) imports it under another prefix
+_DET_PACKED_SPLIT_MODULE_TAIL = "cake_gdn_det_train_kcp.cake_kcp"
+
+
+def _is_det_packed_split(cls) -> bool:
+    """Whether ``cls`` is the deterministic package's packed Q/K/V split class, wherever that package is imported from."""
+    module = getattr(cls, "__module__", None) or ""
+    return getattr(cls, "__qualname__", None) == _DET_PACKED_SPLIT[1] and (
+        module == _DET_PACKED_SPLIT[0]
+        or module == _DET_PACKED_SPLIT_MODULE_TAIL
+        or module.endswith("." + _DET_PACKED_SPLIT_MODULE_TAIL)
+    )
 
 
 def _feeds_packed_split(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
@@ -6966,7 +6979,7 @@ def _feeds_packed_split(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bo
     cls = getattr(type(node), "_forward_cls", None)
     if cls is CakeGDNNondetKcpPackedQKVSplitFunction:
         return True
-    return cls is not None and (cls.__module__, cls.__qualname__) == _DET_PACKED_SPLIT
+    return cls is not None and _is_det_packed_split(cls)
 
 
 PACKED_SPLIT_STATS: dict[str, int] = {

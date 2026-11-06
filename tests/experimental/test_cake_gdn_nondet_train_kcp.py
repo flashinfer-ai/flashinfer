@@ -9559,6 +9559,47 @@ def test_the_deterministic_packed_split_is_named_by_its_module_and_class() -> No
         "flashinfer.experimental.cake.cake_gdn_det_train_kcp.cake_kcp",
         "CakeGDNDetKcpPackedQKVSplitFunction",
     )
+    assert kcp._is_det_packed_split(det_cls)
+
+
+def test_the_deterministic_packed_split_is_recognized_under_a_vendored_prefix() -> None:
+    """A build that vendors the deterministic package under another parent package (or as a top-level package)
+    imports its split class under another module prefix: the class is still recognized by the module's last two parts
+    and its name.  Another class name or another module tail is not.  Class objects only (no tensor, no device)."""
+    kcp = _package("cake_kcp")
+
+    def stand_in(
+        module: str, qualname: str = "CakeGDNDetKcpPackedQKVSplitFunction"
+    ) -> type:
+        cls = type(qualname.rsplit(".", 1)[-1], (), {})
+        cls.__module__, cls.__qualname__ = module, qualname
+        return cls
+
+    for module in (
+        "flashinfer.experimental.cake.cake_gdn_det_train_kcp.cake_kcp",
+        "cake_gdn_det_train_kcp.cake_kcp",
+        "vendored.kernels.cake_gdn_det_train_kcp.cake_kcp",
+    ):
+        assert kcp._is_det_packed_split(stand_in(module)), module
+    for module, qualname in (
+        (
+            "vendored.cake_gdn_det_train_kcp.cake_kcp",
+            "CakeGDNNondetKcpPackedQKVSplitFunction",
+        ),
+        (
+            "vendored.cake_gdn_nondet_train_kcp.cake_kcp",
+            "CakeGDNDetKcpPackedQKVSplitFunction",
+        ),
+        (
+            "vendored.xcake_gdn_det_train_kcp.cake_kcp",
+            "CakeGDNDetKcpPackedQKVSplitFunction",
+        ),
+        ("cake_gdn_det_train_kcp.cake_kcp_plan", "CakeGDNDetKcpPackedQKVSplitFunction"),
+    ):
+        assert not kcp._is_det_packed_split(stand_in(module, qualname)), (
+            module,
+            qualname,
+        )
 
 
 @pytest.mark.parametrize("mode", CKPT_FORMS)
