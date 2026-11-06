@@ -343,6 +343,7 @@ from __future__ import annotations
 import ctypes
 import dataclasses
 import functools
+import operator
 import types
 import warnings
 import weakref
@@ -2246,13 +2247,52 @@ def _scratch_tables(local: Any) -> dict[str, torch.Tensor]:
     return tables
 
 
+# (record, arch) -> [cake_jit.load, cake_jit.MODULES, fetch, grid axes, FFI entry or None] of _launch_record_trim
+_LAUNCH_PLANS: dict[tuple[str, str], list[Any]] = {}
+
+
+def _launch_plan(name: str, arch: str) -> list[Any]:
+    """The launch plan of record ``name`` on ``arch`` for :func:`_launch_record_trim`: where every grid argument
+    follows the logical ones in the record's argument plan, an ``operator.itemgetter`` of the logical names (in plan
+    order) and the grid axes after them (``fetch=None`` keeps the loop otherwise); the FFI entry is filled in by the
+    first launch that gets its arguments (``cake_jit.load`` is cached per (record, arch): the same object on every
+    launch)."""
+    order = cake_jit._argument_plan(name)
+    names = [logical for logical, _ in order if logical is not None]
+    axes = tuple(axis for logical, axis in order if logical is None)
+    trailing = all(logical is None for logical, _ in order[len(names) :])
+    fetch = operator.itemgetter(*names) if trailing and len(names) >= 2 else None
+    plan = [cake_jit.load, cake_jit.MODULES, fetch, axes, None]
+    _LAUNCH_PLANS[(name, arch)] = plan
+    return plan
+
+
 def _launch_record_trim(
     local: Any, name: str, grid: tuple[int, int, int], values: dict[str, Any]
 ) -> None:
     """Trimmed host path: ``cake_jit.run_module(name, values, grid=grid, device_index=local.device_index)`` with the
     launch inlined -- the record's argument plan (cached by cake_jit), the arena's cached arch, the raw-stream FFI
-    context.  Same record, same grid, same positional arguments, same stream as ``local.run``."""
+    context.  Same record, same grid, same positional arguments, same stream as ``local.run``.  The record's launch
+    plan (:func:`_launch_plan`: its FFI entry and one fetch of its logical arguments) is built once per (record,
+    architecture) while ``cake_jit``'s ``load`` / ``MODULES`` stay the same objects; a missing logical argument
+    raises as the loop below does."""
     jit = cake_jit
+    plan = _LAUNCH_PLANS.get((name, local.arch))
+    if plan is None or plan[0] is not jit.load or plan[1] is not jit.MODULES:
+        plan = _launch_plan(name, local.arch)
+    if plan[2] is not None:
+        try:
+            args = [*plan[2](values), *(int(grid[axis]) for axis in plan[3])]
+        except KeyError:
+            args = None  # the loop below names the missing argument
+        if args is not None:
+            if plan[4] is None:
+                plan[4] = getattr(
+                    jit.load(name, local.arch), jit.MODULES[name]["ffi_entry"]
+                )
+            with _ffi_stream(local.device_index):
+                plan[4](*args)
+            return
     record = jit.MODULES[name]
     args = []
     for logical_name, axis in jit._argument_plan(name):
@@ -5520,6 +5560,37 @@ def _bind_tape(call: CallKcp, tape: dict[str, torch.Tensor]) -> None:
     call.scratch["views"] = views
 
 
+def _fwd_buffers(
+    call: CallKcp,
+    *,
+    save: bool,
+    replay: bool,
+    bound: dict[str, torch.Tensor] | None,
+    tape: dict[str, torch.Tensor] | None,
+) -> None:
+    """The forward's per-call KCP buffers (:func:`_forward`): ``S_in`` (fresh, or the handle's); with
+    ``save_transfer`` on a saving forward the c1 receive tensor (fresh, or the handle's) and at ``P > 1`` ``stage_m``;
+    the carry plane of a saving ``P > 1`` forward under ``saved_carry`` that keeps no hand-off tape set (``tape``)."""
+    tb, opts = call.tb, call.opts
+    keep_transfer = opts.save_transfer and save and not replay
+    if bound is None:
+        call.fresh("S_in")
+    else:
+        call.bufs["S_in"] = bound["S_in"]
+    if keep_transfer:
+        if bound is None:
+            call.fresh("c1_recv")
+        else:
+            call.bufs["c1_recv"] = bound["c1_recv"]
+        if tb.P > 1:
+            call.fresh("stage_m")  # M_seg^T of the segmented fragments (§16 item 5b)
+    if (
+        save and not replay and tb.P > 1 and call.saved_carry == 1 and tape is None
+    ):  # the carry plane as a fresh tensor: the carry merges below write it, the tape walk reads it, the saved set keeps it
+        plane = call.fresh("carry")
+        call.scratch["saved_carry_plane"] = plane.numel() * plane.element_size()
+
+
 def _forward(
     call: CallKcp,
     *,
@@ -5527,6 +5598,7 @@ def _forward(
     replay: bool,
     bound: dict[str, torch.Tensor] | None = None,
     tape: dict[str, torch.Tensor] | None = None,
+    alloc_out: bool = False,
 ) -> None:
     """The design note §3.5.  ``save``: the saved set is kept (fresh ``S_in``; with ``save_transfer`` also the c1 receive
     tensor and ``M_seg``); ``replay``: the forward of a replay-mode backward (no ``fwd_o``, nothing kept).
@@ -5547,38 +5619,31 @@ def _forward(
     ``kcp_fwdh_o`` (``out`` from the walk, no tape, no ``fwd_o`` launch) unless the forward keeps its tapes
     (``replay``: the backward reads them; ``tape``: the checkpoint hand-off's tape set, which its backward reads) or
     the ``fwd_o_fuse`` knob is ``0``; then the tape walk and ``fwd_o``."""
-    tb, opts = call.tb, call.opts
+    tb = call.tb
     wait_first = call.schedule == "wait_first"
     fuse_o = not replay and tape is None and call.fwd_o_fuse == 1
     call.fwd_walk = "kcp_fwdh_o" if fuse_o else "kcp_fwdh_tape"
-    keep_transfer = opts.save_transfer and save and not replay
-    if bound is None:
-        call.fresh("S_in")
-    else:
-        call.bufs["S_in"] = bound["S_in"]
-    if keep_transfer:
-        if bound is None:
-            call.fresh("c1_recv")
-        else:
-            call.bufs["c1_recv"] = bound["c1_recv"]
-        if tb.P > 1:
-            call.fresh("stage_m")  # M_seg^T of the segmented fragments (§16 item 5b)
-    if (
-        save and not replay and tb.P > 1 and call.saved_carry == 1 and tape is None
-    ):  # the carry plane as a fresh tensor: the carry merges below write it, the tape walk reads it, the saved set keeps it
-        plane = call.fresh("carry")
-        call.scratch["saved_carry_plane"] = plane.numel() * plane.element_size()
     # the hand-off's tape set: bound before the first local stage writes into it
     if tape is not None:
         _bind_tape(call, tape)
         call.scratch["checkpoint_handoff"] = "save"
     if replay:  # the replay's prep (the GLM prep's rows, the internal dout copy), then the internal Aqk / Akk rows
+        _fwd_buffers(call, save=save, replay=replay, bound=bound, tape=tape)
         _bwd_rows(call, None)
     else:  # the intra program writes the GLM prep's rows itself (write_prep = 1); no token-row copies are saved
         if call.l2n:
             _qk_l2norm_stage(call)
         call.stage("fwd_intra")
         call.stage("wy_fwd")
+        # the two local stages read neither the KCP buffers nor ``out`` (their records bind no ``out``, and the
+        # buffers are K1-K4 / collective operands; the hand-off's tape set they write is bound above): allocated
+        # after the stages are issued, so the first launch does not wait for them (host order only: the same
+        # launches with the same arguments in the same order)
+        _fwd_buffers(call, save=save, replay=replay, bound=bound, tape=tape)
+        if alloc_out:
+            call.out = _alloc(
+                (call.T_r, call.H, D), call.backend.dtypes["out"], call.device
+            )
     if bound is None:
         _summaries(call)
     elif (
@@ -6464,13 +6529,12 @@ def _fwd_body(
     keeps its tape set (:func:`_tape_alloc`) in the saved set instead of the carry plane.  In-kernel Q / K L2 norm:
     the rstd the fused intra program writes, kept by a saving forward (:func:`_qk_l2norm_begin`)."""
     rstd = _qk_l2norm_begin(call, save=save) if call.l2n else None
-    call.out = _alloc((call.T_r, call.H, D), call.backend.dtypes["out"], call.device)
     kept = (
         _tape_alloc(call)
         if tape and save and call.local_values is not None and call.T_r > 0
         else None
     )
-    _forward(call, save=save, replay=False, bound=bound, tape=kept)
+    _forward(call, save=save, replay=False, bound=bound, tape=kept, alloc_out=True)
     if call.l2n:
         call.l2n_values = None
     saved = None
