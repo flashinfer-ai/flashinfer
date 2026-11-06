@@ -5503,16 +5503,6 @@ def is_supported(device: torch.device | str | int | None = None) -> bool:
     )
 
 
-# The names before the det rename, bound to the same objects (not in ``__all__``): the KCP modules and existing
-# callers keep working, ``isinstance`` holds across the two spellings.
-ChunkKDAFunction = ChunkKDADetFunction
-KdaArena = KdaDetArena
-KdaChunkSaved = KdaDetChunkSaved
-KdaWorkspace = KdaDetWorkspace
-chunk_kda = chunk_kda_det
-chunk_kda_bwd = chunk_kda_det_bwd
-chunk_kda_fwd = chunk_kda_det_fwd
-
 __all__ = [
     "ALIGN",
     "BT",

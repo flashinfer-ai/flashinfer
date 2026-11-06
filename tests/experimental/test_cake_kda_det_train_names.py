@@ -16,12 +16,11 @@ limitations under the License.
 Names of the Cake packed KDA chunked training package.
 
 The single-rank entry points live in ``flashinfer.cake_kda_det_train`` and the package in
-``flashinfer.experimental.cake_kda_det_train``.  Every previous name is the same object as its det name:
-the single-rank names of ``flashinfer.kda_train``, the backend names of ``cake_backend`` and of the package, and
-every name of the compatibility package ``flashinfer.experimental.cake_kda_train``, whose submodules are the det
-package's module objects and whose ``__all__`` (so its star import) is the list before the move.  The previous names
-stay out of the det ``__all__``.  The manifests name the det package; the 78 single-rank programs (65 of the g
-gate, 8 of the raw gate, 5 of the Q/K L2 norm fallback) are ``cake_kda_det_train_<digest>`` libraries.  Importing a facade or either package loads
+``flashinfer.experimental.cake_kda_det_train``; every public name carries ``det``.  The names before the det
+rename are gone: the module ``flashinfer.kda_train``, the package ``flashinfer.experimental.cake_kda_train``, the
+helper ``tests.test_helpers.cake_kda_train_reference`` and the previous single-rank names of the facade, of
+``cake_backend`` and of the package.  The manifests name the det package; the 78 single-rank programs (65 of the g
+gate, 8 of the raw gate, 5 of the Q/K L2 norm fallback) are ``cake_kda_det_train_<digest>`` libraries.  Importing the facade or the package loads
 no KCP host module (checked in a fresh interpreter by module file).
 """
 
@@ -37,7 +36,6 @@ from pathlib import Path
 import pytest
 
 import flashinfer.cake_kda_det_train as det_api
-import flashinfer.kda_train as kda_train
 from flashinfer.experimental import cake_kda_det_train as package
 from flashinfer.experimental.cake_kda_det_train import (
     cake_backend,
@@ -50,13 +48,12 @@ pytestmark = pytest.mark.cpu_only
 NEW_PACKAGE = "flashinfer.experimental.cake_kda_det_train"
 OLD_PACKAGE = "flashinfer.experimental.cake_kda_train"
 PACKAGE_DIR = Path(cake_jit.__file__).resolve().parent
-OLD_DIR = PACKAGE_DIR.parent / "cake_kda_train"
 # the det package's modules, read from its directory
 SUBMODULES = tuple(
     sorted(p.stem for p in PACKAGE_DIR.glob("*.py") if p.stem != "__init__")
 )
 
-# (previous name, det name) of the single-rank entry points
+# (removed previous name, det name) of the single-rank entry points
 FACADE_PAIRS = (
     ("chunk_kda_fwd", "chunk_kda_det_fwd"),
     ("chunk_kda_bwd", "chunk_kda_det_bwd"),
@@ -67,7 +64,7 @@ FACADE_PAIRS = (
     ("kda_train_saved_bytes", "kda_det_train_saved_bytes"),
     ("is_kda_train_supported", "is_kda_det_train_supported"),
 )
-# (previous name, det name) of the backend
+# (removed previous name, det name) of the backend
 BACKEND_PAIRS = (
     ("ChunkKDAFunction", "ChunkKDADetFunction"),
     ("KdaArena", "KdaDetArena"),
@@ -79,94 +76,60 @@ BACKEND_PAIRS = (
 )
 # the backend names the package __init__ exports
 PACKAGE_PAIRS = tuple(p for p in BACKEND_PAIRS if p[0] != "KdaArena")
-# the package's __all__ before the move: the det __all__ with the previous backend names
-PREVIOUS_ALL = sorted(
-    {dict((new, old) for old, new in PACKAGE_PAIRS).get(n, n) for n in package.__all__}
+# the modules removed with the previous names
+REMOVED_MODULES = (
+    "flashinfer.kda_train",
+    OLD_PACKAGE,
+    *(
+        f"{OLD_PACKAGE}.{m}"
+        for m in ("cake_backend", "cake_build", "cake_jit", "cake_kcp", "cake_kcp_jit", "cake_kcp_plan")
+    ),
+    "tests.test_helpers.cake_kda_train_reference",
 )
 
 
 @pytest.mark.parametrize("old,new", FACADE_PAIRS)
-def test_facade_previous_names_are_the_det_objects(old: str, new: str) -> None:
+def test_facade_has_only_the_det_names(old: str, new: str) -> None:
     fn = getattr(det_api, new)
-    assert getattr(kda_train, old) is fn
     assert fn.__name__ == new
     assert new in det_api.__all__ and old not in det_api.__all__
-    assert old in kda_train.__all__
+    assert not hasattr(det_api, old)
 
 
 def test_facade_shares_the_scale_and_the_feature() -> None:
-    assert kda_train.DEFAULT_SCALE is det_api.DEFAULT_SCALE
     assert det_api.DEFAULT_SCALE == 128**-0.5 == cake_backend.SCALE
     for _, new in FACADE_PAIRS[:3]:
         assert getattr(det_api, new).experimental_feature == det_api._FEATURE
 
 
 @pytest.mark.parametrize("old,new", BACKEND_PAIRS)
-def test_backend_previous_names_are_the_det_objects(old: str, new: str) -> None:
+def test_backend_has_only_the_det_names(old: str, new: str) -> None:
     obj = getattr(cake_backend, new)
-    assert getattr(cake_backend, old) is obj
     assert obj.__name__ == new and obj.__qualname__ == new
     assert obj.__module__ == f"{NEW_PACKAGE}.cake_backend"
     assert new in cake_backend.__all__ and old not in cake_backend.__all__
+    assert not hasattr(cake_backend, old)
 
 
 @pytest.mark.parametrize("old,new", PACKAGE_PAIRS)
-def test_package_previous_names_are_the_det_objects(old: str, new: str) -> None:
-    assert getattr(package, old) is getattr(package, new) is getattr(cake_backend, new)
+def test_package_has_only_the_det_names(old: str, new: str) -> None:
+    assert getattr(package, new) is getattr(cake_backend, new)
     assert new in package.__all__ and old not in package.__all__
+    assert not hasattr(package, old)
 
 
-def test_workspace_isinstance_holds_across_the_spellings() -> None:
-    assert issubclass(cake_backend.KdaDetWorkspace, cake_backend.KdaWorkspace)
-    arena = cake_backend.KdaArena(lean=True)
-    assert isinstance(
-        arena, cake_backend.KdaDetArena
-    ) and arena == cake_backend.KdaDetArena(lean=True)
-
-
-def test_compatibility_package_is_the_det_package() -> None:
-    old = importlib.import_module(OLD_PACKAGE)
-    assert sorted(old.__all__) == PREVIOUS_ALL
-    for name in package.__all__:
-        assert getattr(old, name) is getattr(package, name), name
-    for previous, det in PACKAGE_PAIRS:
-        assert getattr(old, previous) is getattr(cake_backend, det), previous
-    with pytest.raises(AttributeError):
-        _ = old.NoSuchName  # type: ignore[attr-defined]
-
-
-def test_compatibility_package_star_import_binds_the_previous_names() -> None:
-    scope: dict[str, object] = {}
-    exec(f"from {OLD_PACKAGE} import *", scope)
-    names = sorted(name for name in scope if name != "__builtins__")
-    assert names == PREVIOUS_ALL
-    for previous, det in PACKAGE_PAIRS:
-        assert scope[previous] is getattr(cake_backend, det), previous
-    for name in names:
-        assert scope[name] is getattr(package, name), name
+@pytest.mark.parametrize("module", REMOVED_MODULES)
+def test_previous_modules_are_removed(module: str) -> None:
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module(module)
 
 
 @pytest.mark.parametrize("submodule", SUBMODULES)
-def test_compatibility_submodules_are_the_det_modules(submodule: str) -> None:
+def test_det_submodules_are_the_package_modules(submodule: str) -> None:
     new = importlib.import_module(f"{NEW_PACKAGE}.{submodule}")
-    assert importlib.import_module(f"{OLD_PACKAGE}.{submodule}") is new
     assert new.__name__ == f"{NEW_PACKAGE}.{submodule}"
     assert Path(new.__file__).resolve().parent == PACKAGE_DIR
-    old_package = importlib.import_module(OLD_PACKAGE)
-    assert getattr(old_package, submodule) is new
-    assert cake_package("cake_kda_train", submodule) is new
     assert cake_package("cake_kda_det_train", submodule) is new
-
-
-def test_compatibility_package_holds_no_sources() -> None:
-    files = {p.name for p in OLD_DIR.iterdir() if p.name != "__pycache__"}
-    assert all(name.endswith(".py") for name in files), sorted(files)
-    assert {"__init__.py", *(f"{m}.py" for m in SUBMODULES)} <= files
-
-
-def test_reference_helper_previous_path_is_the_det_module() -> None:
-    new = importlib.import_module("tests.test_helpers.cake_kda_det_train_reference")
-    assert importlib.import_module("tests.test_helpers.cake_kda_train_reference") is new
 
 
 def test_manifests_name_the_det_package_and_libraries() -> None:
@@ -216,10 +179,8 @@ print("KCP_LOADED", loaded)
     "imports",
     [
         ("flashinfer.cake_kda_det_train",),
-        ("flashinfer.kda_train",),
         (NEW_PACKAGE,),
-        (OLD_PACKAGE,),
-        (f"{OLD_PACKAGE}.cake_backend", f"{OLD_PACKAGE}.cake_jit"),
+        (f"{NEW_PACKAGE}.cake_backend", f"{NEW_PACKAGE}.cake_jit"),
     ],
 )
 def test_imports_load_no_kcp_host_module(imports: tuple[str, ...]) -> None:
