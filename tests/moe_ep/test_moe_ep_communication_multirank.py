@@ -592,6 +592,9 @@ def test_split_layer_leaves_rows_the_combine_never_reads(sync_protocol, monkeypa
     try:
         # Tunes the fused MoE, so both measured calls run the same tactics.
         layer(t)
+        # The ranks agree on the protocol, so they all skip together.
+        if sync_protocol == "sentinel" and not layer._communication.sentinel_enabled:
+            pytest.skip("the sentinel protocol is unavailable here")
         monkeypatch.setattr(FusedMoeSplitKernelBackend, "compute", compute_into_nan)
         skipped = layer(t)
         monkeypatch.setattr(
