@@ -352,7 +352,9 @@ def _expect_known_race(request, case, operand):
         races = races | _KNOWN_RACES_SM10X
     reason = races.get((case.spec.name, case.backend, operand))
     if reason is not None:
-        request.applymarker(pytest.mark.xfail(reason=reason, strict=False))
+        request.applymarker(
+            pytest.mark.xfail(reason=reason, strict=False, raises=AssertionError)
+        )
 
 
 def _read_cases():
