@@ -29,7 +29,7 @@ and otherwise through FlashInfer's JIT from the same sources and flags,
 verifying every source digest before the first build.
 
 The routes, their selection rules and the forward programs are those of the
-deterministic package (``flashinfer.cake_causal_conv1d_det_train_backend``):
+deterministic package (``flashinfer.cake_causal_conv1d_det_train``):
 the forward routes ``fwd`` / ``fwd_dt`` / ``fwd_bias`` run this package's
 copies of the det forward programs (no cross-CTA reduction, so ``y`` is the
 det program's bits), and the backward routes ``bwd`` / ``bwd_dt`` /

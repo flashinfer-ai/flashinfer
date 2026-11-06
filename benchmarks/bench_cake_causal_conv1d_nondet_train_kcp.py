@@ -14,10 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Benchmark of the context-parallel (KCP) Cake packed width-4 depthwise causal convolution + SiLU training step in its
-two numerical modes, ``deterministic=True`` (the deterministic KCP backward: a cooperative launch whose grid reduces
-the ``dweight`` partial in a fixed order) against ``deterministic=False`` (one ordinary launch with unordered
-``dweight`` accumulators), both through ``flashinfer.cake_causal_conv1d_train_kcp``: ``cake_causal_conv1d_kcp``, or
-``cake_causal_conv1d_multi_kcp`` over ``--tensors`` convolutions of one layer (one halo exchange per direction).
+two numerical modes: the deterministic KCP package (``flashinfer.cake_causal_conv1d_det_train_kcp``:
+``cake_causal_conv1d_det_kcp`` / ``cake_causal_conv1d_det_multi_kcp``; a cooperative backward launch whose grid
+reduces the ``dweight`` partial in a fixed order) against the non-deterministic KCP package
+(``flashinfer.cake_causal_conv1d_nondet_train_kcp``: ``cake_causal_conv1d_nondet_kcp`` /
+``cake_causal_conv1d_nondet_kcp_multi``; one ordinary backward launch with unordered ``dweight`` accumulators), each
+called by its own entry-point names; the multi entry runs ``--tensors`` convolutions of one layer (one halo exchange
+per direction).
 One process per rank: ``torchrun --nproc_per_node W`` (W = 2 / 4 / 8), or a plain ``python`` launch for a one-rank
 group (W = 1).
 
@@ -87,14 +90,15 @@ print it.
 
 Example::
 
-    python benchmarks/bench_cake_causal_conv1d_train_kcp.py --tokens 250340 --channels 512 1280
-    torchrun --nproc_per_node 4 benchmarks/bench_cake_causal_conv1d_train_kcp.py --json kcp_w4.json
-    torchrun --nproc_per_node 8 benchmarks/bench_cake_causal_conv1d_train_kcp.py --tensors 3 --layout zigzag
+    python benchmarks/bench_cake_causal_conv1d_nondet_train_kcp.py --tokens 250340 --channels 512 1280
+    torchrun --nproc_per_node 4 benchmarks/bench_cake_causal_conv1d_nondet_train_kcp.py --json kcp_w4.json
+    torchrun --nproc_per_node 8 benchmarks/bench_cake_causal_conv1d_nondet_train_kcp.py --tensors 3 --layout zigzag
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib
 import gc
 import json
 import os
@@ -102,7 +106,6 @@ import socket
 import statistics
 import sys
 import time
-import warnings
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -112,18 +115,18 @@ from torch.utils.checkpoint import checkpoint
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import flashinfer.cake_causal_conv1d_det_train_backend as det_backend  # noqa: E402
-import flashinfer.cake_causal_conv1d_train_kcp as kcp_api  # noqa: E402
-import flashinfer.experimental.cake.cake_causal_conv1d_train as conv  # noqa: E402
-import flashinfer.experimental.cake.cake_causal_conv1d_train_backend as nondet_backend  # noqa: E402
+import flashinfer.cake_causal_conv1d_det_train as det_conv  # noqa: E402
+import flashinfer.cake_causal_conv1d_det_train_kcp as det_kcp_api  # noqa: E402
+import flashinfer.cake_causal_conv1d_nondet_train as nondet_conv  # noqa: E402
+import flashinfer.cake_causal_conv1d_nondet_train_kcp as nondet_kcp_api  # noqa: E402
+import flashinfer.experimental.cake.cake_causal_conv1d_nondet_train as nondet_backend  # noqa: E402
 import cake_causal_conv1d_baselines as baselines  # noqa: E402
-from bench_cake_causal_conv1d_train import (  # noqa: E402
+from bench_cake_causal_conv1d_nondet_train import (  # noqa: E402
     P1_CHANNELS,
     P2_TOKENS,
     doc_lengths,
     perf_rows,
 )
-from flashinfer.api_logging import ExperimentalWarning  # noqa: E402
 from flashinfer.cake_kda_det_train_kcp import (  # noqa: E402
     build_context_det_kcp,
     partition_det_kcp,
@@ -133,7 +136,20 @@ from flashinfer.testing import bench_gpu_time  # noqa: E402
 WIDTH = 4
 SEED = 0
 LAYOUTS = ("contiguous", "zigzag", "zigzag_per_document")
-MODES = {"det": True, "nondet": False}
+# The entry points of each mode by role: the deterministic KCP package's det names and the non-deterministic KCP
+# package's nondet names (the same arguments); ``supported`` is the route check of the mode's single-rank package.
+MODES: dict[str, dict[str, Callable]] = {
+    "det": {
+        "supported": det_conv.is_cake_causal_conv1d_det_train_supported,
+        "single": det_kcp_api.cake_causal_conv1d_det_kcp,
+        "multi": det_kcp_api.cake_causal_conv1d_det_multi_kcp,
+    },
+    "nondet": {
+        "supported": nondet_conv.is_cake_causal_conv1d_nondet_train_supported,
+        "single": nondet_kcp_api.cake_causal_conv1d_nondet_kcp,
+        "multi": nondet_kcp_api.cake_causal_conv1d_nondet_kcp_multi,
+    },
+}
 PHASES = ("fwd", "bwd", "ckpt")
 KINDS = ("gpu", "ahead", "wall", "host")
 ROUNDS = 21
@@ -304,6 +320,10 @@ class _GpuAhead:
 
 
 def _clear_package_caches() -> None:
+    # the deterministic package's backend, wherever its facade keeps it
+    det_backend = importlib.import_module(
+        det_conv.CakeCausalConv1dDetFunction.__module__
+    )
     for module in (det_backend, nondet_backend):
         for name in ("_FORWARD_WORKSPACES", "_BACKWARD_WORKSPACES"):
             cache = getattr(module, name, None)
@@ -421,27 +441,22 @@ class Problem:
         torch.cuda.empty_cache()
 
 
-def _calls(p: Problem, deterministic: bool) -> dict[str, Callable[[], object]]:
-    """``{name: fn}`` of one mode on its own leaves: the timed phases ``fwd`` / ``bwd`` / ``ckpt``, ``record`` (the
-    forward the timed ``bwd`` replays the backward of), the one-shot ``bwd_once`` and ``ckpt_memory`` probes."""
+def _calls(p: Problem, api: dict[str, Callable]) -> dict[str, Callable[[], object]]:
+    """``{name: fn}`` of one mode (``api``: its ``MODES`` entry points) on its own leaves: the timed phases ``fwd`` /
+    ``bwd`` / ``ckpt``, ``record`` (the forward the timed ``bwd`` replays the backward of), the one-shot ``bwd_once``
+    and ``ckpt_memory`` probes."""
 
     xs = [x.detach().clone().requires_grad_(True) for x in p.xs]
     ws = [w.detach().clone().requires_grad_(True) for w in p.ws]
     n = len(xs)
     state: dict[str, tuple] = {}
 
+    single, multi = api["single"], api["multi"]
+
     def layer(*args) -> tuple:
         if n == 1:
-            return (
-                kcp_api.cake_causal_conv1d_kcp(
-                    args[0], args[1], p.ctx, deterministic=deterministic
-                ),
-            )
-        return tuple(
-            kcp_api.cake_causal_conv1d_multi_kcp(
-                args[:n], args[n:], p.ctx, deterministic=deterministic
-            )
-        )
+            return (single(args[0], args[1], p.ctx),)
+        return tuple(multi(args[:n], args[n:], p.ctx))
 
     def reset() -> None:
         for leaf in (*xs, *ws):
@@ -492,8 +507,8 @@ def _check(p: Problem, device: torch.device) -> dict:
     """Per rank: nondet ``y`` / ``dx`` bitwise the det ones, each ``dweight`` partial within the budget of det's."""
 
     outs = {}
-    for mode, deterministic in MODES.items():
-        calls = _calls(p, deterministic)
+    for mode, api in MODES.items():
+        calls = _calls(p, api)
         ys = calls["record"]()
         g = calls["bwd"]()
         torch.cuda.synchronize(device)
@@ -568,7 +583,7 @@ def _baselines(
     for x, w, dy in zip(p.global_xs, p.ws, p.global_dys, strict=True):
         xl = x.detach().clone().requires_grad_(True)
         wl = w.detach().clone().requires_grad_(True)
-        y = conv.cake_causal_conv1d(xl, wl, cu_t, None, deterministic=False)
+        y = nondet_conv.cake_causal_conv1d_nondet(xl, wl, cu_t, None)
         y.backward(dy)
         references.append((y.detach(), xl.grad, wl.grad))
         del xl, wl, y
@@ -640,8 +655,8 @@ def bench_row(
         "modes": {},
     }
     # One untimed pass per mode: the JIT loads and the first exchanges.
-    for deterministic in MODES.values():
-        calls = _calls(p, deterministic)
+    for api in MODES.values():
+        calls = _calls(p, api)
         calls["fwd"]()
         calls["record"]()
         calls["bwd"]()
@@ -649,8 +664,8 @@ def bench_row(
     torch.cuda.synchronize(device)
     entries: dict[str, dict] = {mode: {} for mode in MODES}
     # Initialization and memory: the first call of each phase after clearing the workspace caches, then a steady one.
-    for mode, deterministic in MODES.items():
-        calls = _calls(p, deterministic)
+    for mode, api in MODES.items():
+        calls = _calls(p, api)
         for phase in PHASES:
             _clear_package_caches()
             for when in ("first", "steady"):
@@ -664,7 +679,7 @@ def bench_row(
                 entries[mode][f"{phase}_{when}"] = _probe(probe, device)
     sota_entries, sota_calls = _baselines(p, args, rank, world, device)
     # Interleaved rounds: every phase of both modes and of every baseline per round, in the balanced arm order below.
-    timed = {mode: _calls(p, deterministic) for mode, deterministic in MODES.items()}
+    timed = {mode: _calls(p, api) for mode, api in MODES.items()}
     for calls in timed.values():
         calls["record"]()
     timed.update(sota_calls)
@@ -799,7 +814,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--tensors",
         type=int,
         default=1,
-        help="convolutions per layer: 1 runs cake_causal_conv1d_kcp, more run cake_causal_conv1d_multi_kcp",
+        help="convolutions per layer: 1 runs cake_causal_conv1d_det_kcp / cake_causal_conv1d_nondet_kcp, more run "
+        "cake_causal_conv1d_det_multi_kcp / cake_causal_conv1d_nondet_kcp_multi",
     )
     parser.add_argument(
         "--layout",
@@ -829,18 +845,17 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.rounds < 1 or args.tensors < 1:
         parser.error("--rounds and --tensors must be at least 1")
     args.sota_arms = baselines.parse_arms(args.sota, baselines.KCP_ARMS)
-    warnings.simplefilter("ignore", ExperimentalWarning)
     rank, world, device = _init()
-    for mode, deterministic in MODES.items():
-        if not conv.is_cake_causal_conv1d_train_supported(
-            device, deterministic=deterministic
-        ):
+    for mode, api in MODES.items():
+        if not api["supported"](device):
             raise SystemExit(
                 f"the {mode} package has no exported route on this device (or is not rendered)"
             )
     if torch.are_deterministic_algorithms_enabled():
         raise SystemExit(
-            "torch.use_deterministic_algorithms(True) would run both modes deterministically"
+            "torch.use_deterministic_algorithms(True) is in effect: the non-deterministic backward raises "
+            "PyTorch's non-determinism alert there (a RuntimeError; with warn_only=True a UserWarning, then it "
+            "runs); run the benchmark with it off"
         )
     if rank == 0:
         print(
