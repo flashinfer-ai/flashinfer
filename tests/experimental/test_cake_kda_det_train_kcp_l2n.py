@@ -162,14 +162,20 @@ def _cpu_ctx(W: int = 2, rank: int = 0, lengths=(700, 1, 1300, 999), sm: int = 1
     cu = [0]
     for n in lengths:
         cu.append(cu[-1] + n)
-    part = cake_kcp_plan.partition_det_kcp(cu, W, layout="zigzag_per_document")
-    return cake_kcp_plan.build_context_det_kcp(part, None, rank, "cpu", 4, sm_count=sm)
+    part = cake_kcp_plan.cake_kda_det_train_kcp_partition(
+        cu, W, layout="zigzag_per_document"
+    )
+    return cake_kcp_plan.cake_kda_det_train_kcp_build_context(
+        part, None, rank, "cpu", 4, sm_count=sm
+    )
 
 
 def _cpu_zero_ctx(rank: int = 1):
     """A rank of a ragged CP4 partition; rank 1 holds no token."""
     part, _ = _partition((3000,), 4, "ragged:1200,0,900,900")
-    return cake_kcp_plan.build_context_det_kcp(part, None, rank, "cpu", 4, sm_count=148)
+    return cake_kcp_plan.cake_kda_det_train_kcp_build_context(
+        part, None, rank, "cpu", 4, sm_count=148
+    )
 
 
 def _cpu_ops(ctx, H: int) -> dict:
@@ -1971,7 +1977,7 @@ def _refusal_rank(
     )
     try:
         part, _ = _partition((3000,), W, layout)
-        ctx = cake_kcp_plan.build_context_det_kcp(
+        ctx = cake_kcp_plan.cake_kda_det_train_kcp_build_context(
             part, None, rank, "cpu", 4, sm_count=148
         )
         H = 4
@@ -2717,7 +2723,7 @@ def test_gpu_l2n_flag_off_identity_w1() -> None:
     tensors_of: dict = {}
     for lengths, H in rows:
         part, cu = _partition(lengths, 1, "contiguous")
-        ctx = cake_kcp_plan.build_context_det_kcp(part, None, 0, device)
+        ctx = cake_kcp_plan.cake_kda_det_train_kcp_build_context(part, None, 0, device)
         glob = make_inputs(lengths, H, device)
         q, k, v, g, beta, dout = (glob[n] for n in ("q", "k", "v", "g", "beta", "dout"))
         got = {}
@@ -2828,7 +2834,7 @@ def _run_rank(
         _init_group(rank, W, device, rdzv)
     group = dist.group.WORLD if W > 1 else None
     part, cu = _partition(lengths, W, layout)
-    ctx = cake_kcp_plan.build_context_det_kcp(part, group, rank, device)
+    ctx = cake_kcp_plan.cake_kda_det_train_kcp_build_context(part, group, rank, device)
     total = cu[-1]
     T = int(ctx.T_r)
     gate = "raw" if raw_gate else "g"

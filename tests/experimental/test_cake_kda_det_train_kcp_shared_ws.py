@@ -69,7 +69,7 @@ def _cu(lengths) -> list[int]:
 
 
 def _part(lengths, W: int = 1, layout: str = "contiguous"):
-    return kp.partition_det_kcp(
+    return kp.cake_kda_det_train_kcp_partition(
         torch.tensor(_cu(lengths), dtype=torch.int64), W, layout=layout
     )
 
@@ -120,7 +120,9 @@ def test_byte_query_of_a_list_is_the_per_pool_max() -> None:
             parts = [_part(lengths, W, layout) for lengths in PACKS]
             for r in range(W):
                 ctxs = [
-                    kp.build_context_det_kcp(p, None, r, "cpu", 4, sm_count=SM_COUNT)
+                    kp.cake_kda_det_train_kcp_build_context(
+                        p, None, r, "cpu", 4, sm_count=SM_COUNT
+                    )
                     for p in parts
                 ]
                 for H in HEADS:
@@ -204,7 +206,9 @@ def test_reserve_floor_and_allocate_false_size_forwards_for_the_backward() -> No
     sizes the backward pools too (no forward-only state to upgrade); ``allocate=False`` allocates nothing until the
     first ensure; a workspace without a context keeps today's forward-only first state."""
     part = _part((1000, 577), 4, "zigzag_per_document")
-    ctx = kp.build_context_det_kcp(part, None, 1, "cpu", 4, sm_count=SM_COUNT)
+    ctx = kp.cake_kda_det_train_kcp_build_context(
+        part, None, 1, "cpu", 4, sm_count=SM_COUNT
+    )
     full = kp.kcp_arena_layout(ctx, H=4)["arena"]
     fwd = kp.kcp_arena_layout(ctx, H=4, backward=False)["arena"]
     assert fwd < full
@@ -234,7 +238,9 @@ def test_shared_workspace_holds_no_context_and_bounds_its_caches() -> None:
     ws = cake_kcp.CakeKDADetKcpWorkspace(local=False)
     refs = []
     for _ in range(3):
-        ctx = kp.build_context_det_kcp(part, None, 0, "cpu", 4, sm_count=SM_COUNT)
+        ctx = kp.cake_kda_det_train_kcp_build_context(
+            part, None, 0, "cpu", 4, sm_count=SM_COUNT
+        )
         tb = ws.ensure(ctx, 64, device="cpu", backward=True, host_trim=True)
         assert ws.ensure(ctx, 64, device="cpu", backward=True, host_trim=True) is tb
         refs.append((weakref.ref(ctx), weakref.ref(tb)))
@@ -243,14 +249,16 @@ def test_shared_workspace_holds_no_context_and_bounds_its_caches() -> None:
     assert all(a() is None and b() is None for a, b in refs)
     assert ws._fast and all(rec[0]() is None for rec in ws._fast.values())
     # a dead ensure record misses: the next ensure takes the full path
-    ctx = kp.build_context_det_kcp(part, None, 0, "cpu", 4, sm_count=SM_COUNT)
+    ctx = kp.cake_kda_det_train_kcp_build_context(
+        part, None, 0, "cpu", 4, sm_count=SM_COUNT
+    )
     assert ws.ensure(ctx, 64, device="cpu", backward=True, host_trim=True) is not None
     n = ws._pools["c1_send"].numel()
     for i in range(1, cake_kcp.SLICE_CACHE_MAX + 50):
         ws.pool("c1_send", min(i, n), cached=True)
         assert len(ws._slices) <= cake_kcp.SLICE_CACHE_MAX
     # interleaved packs: one record each, every one a hit while no storage changes
-    other = kp.build_context_det_kcp(
+    other = kp.cake_kda_det_train_kcp_build_context(
         _part((50, 640, 77)), None, 0, "cpu", 4, sm_count=SM_COUNT
     )
     for _ in range(2):  # the first round may grow a pool, which drops the records
@@ -268,7 +276,9 @@ def test_shared_workspace_holds_no_context_and_bounds_its_caches() -> None:
     ws.tables = real
     part = _part((50, 640, 77))
     for _ in range(cake_kcp.ENSURE_CACHE_MAX + 10):
-        c = kp.build_context_det_kcp(part, None, 0, "cpu", 4, sm_count=SM_COUNT)
+        c = kp.cake_kda_det_train_kcp_build_context(
+            part, None, 0, "cpu", 4, sm_count=SM_COUNT
+        )
         ws.ensure(c, 64, device="cpu", backward=True, host_trim=True)
         assert len(ws._fast) <= cake_kcp.ENSURE_CACHE_MAX
 
@@ -318,7 +328,9 @@ def _operands(device, T: int, H: int, seed: int) -> dict:
 
 def _packs(device, H: int, packs=PACKS, W: int = 1, rank: int = 0, layout="contiguous"):
     ctxs = [
-        kp.build_context_det_kcp(_part(lengths, W, layout), None, rank, device)
+        kp.cake_kda_det_train_kcp_build_context(
+            _part(lengths, W, layout), None, rank, device
+        )
         for lengths in packs
     ]
     ops = [_operands(device, int(c.T_r), H, 0x7815 + i) for i, c in enumerate(ctxs)]
@@ -1336,7 +1348,9 @@ def _rank_packs(rank: int, W: int, row, rdzv: str | None):
         _init_group(rank, W, device, rdzv)
     group = dist.group.WORLD if W > 1 else None
     ctxs = [
-        kp.build_context_det_kcp(_part(lengths, W, layout), group, rank, device)
+        kp.cake_kda_det_train_kcp_build_context(
+            _part(lengths, W, layout), group, rank, device
+        )
         for lengths in packs
     ]
     ops = [

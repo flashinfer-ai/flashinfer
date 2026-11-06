@@ -423,7 +423,9 @@ def test_lean_stage_values_cover_the_records(H, arch) -> None:
     grids at the range's chunk count; the gate epilogue only where it launches; the replay layout's launch list
     with one tail range is the earlier one."""
     sm = ARCH_SMS[arch]
-    ctx = kp.build_context_det_kcp(_part(PROXY_PACK), None, 0, "cpu", 4, sm_count=sm)
+    ctx = kp.cake_kda_det_train_kcp_build_context(
+        _part(PROXY_PACK), None, 0, "cpu", 4, sm_count=sm
+    )
     plan = cake_backend.plan(ctx.T_r, ctx.n_frag, H, sm, arch)
     passes = kp.local_lean_passes(plan)
     assert passes > 1
@@ -579,7 +581,9 @@ def test_lean_byte_prediction_on_the_host() -> None:
             parts = [_part(lengths, W, layout) for lengths in (*PACKS, PROXY_PACK)]
             for r in range(W):
                 ctxs = [
-                    kp.build_context_det_kcp(p, None, r, "cpu", 4, sm_count=152)
+                    kp.cake_kda_det_train_kcp_build_context(
+                        p, None, r, "cpu", 4, sm_count=152
+                    )
                     for p in parts
                 ]
                 for H in (4, 12, 64):
@@ -665,7 +669,7 @@ def test_lean_passes_knob_bytes_on_the_host() -> None:
     smallest arena; a forward-only workspace ignores it; the knob is validated and needs the lean arena (the
     public byte query forwards both arguments)."""
     part = _part(PROXY_PACK)
-    ctx = kp.build_context_det_kcp(part, None, 0, "cpu", 4, sm_count=152)
+    ctx = kp.cake_kda_det_train_kcp_build_context(part, None, 0, "cpu", 4, sm_count=152)
     fi_kcp = pytest.importorskip("flashinfer.cake_kda_det_train_kcp")
     for H in (4, 64):
         p = cake_backend.plan(ctx.T_r, ctx.n_frag, H, ctx.sm_count)
@@ -792,7 +796,8 @@ def test_gpu_single_rank_workspace_views_and_route_layouts(device) -> None:
 
 def _packs_on(device, H: int, packs) -> tuple[list, list]:
     ctxs = [
-        kp.build_context_det_kcp(_part(lengths), None, 0, device) for lengths in packs
+        kp.cake_kda_det_train_kcp_build_context(_part(lengths), None, 0, device)
+        for lengths in packs
     ]
     ops = [_operands(device, int(c.T_r), H, 0x7815 + i) for i, c in enumerate(ctxs)]
     return ctxs, ops

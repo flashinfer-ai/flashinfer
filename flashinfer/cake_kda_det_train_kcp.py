@@ -16,22 +16,22 @@ limitations under the License.
 Deterministic context-parallel (KCP) packed KDA (Kimi Delta Attention) chunked training
 (SM100 / SM103 / SM107), the Cake backend.
 
-The packed batch is split over the ranks of a process group (``partition_det_kcp``), every rank
+The packed batch is split over the ranks of a process group (``cake_kda_det_train_kcp_partition``), every rank
 holds its fragments of the documents, and the per-document state recurrences cross the rank
-boundaries through the plan's collectives (``build_context_det_kcp``).  The per-rank launch
+boundaries through the plan's collectives (``cake_kda_det_train_kcp_build_context``).  The per-rank launch
 sequences, the autograd Function, the plan and the generated kernels live in
 ``flashinfer.experimental.cake.cake_kda_det_train_kcp``; the single-rank entry points are in
 ``flashinfer.cake_kda_det_train``::
 
-    from flashinfer.cake_kda_det_train_kcp import partition_det_kcp, build_context_det_kcp, cake_kda_det_kcp
+    from flashinfer.cake_kda_det_train_kcp import cake_kda_det_train_kcp_partition, cake_kda_det_train_kcp_build_context, cake_kda_det_kcp
 
-    part = partition_det_kcp(cu_seqlens_global_cpu, world_size)          # once per batch layout
-    ctx = build_context_det_kcp(part, group, rank, device)               # tables and collectives of this rank
+    part = cake_kda_det_train_kcp_partition(cu_seqlens_global_cpu, world_size)          # once per batch layout
+    ctx = cake_kda_det_train_kcp_build_context(part, group, rank, device)               # tables and collectives of this rank
     out_local = cake_kda_det_kcp(q_local, k_local, v_local, g_local, beta_local, ctx)   # autograd
     out_local, saved = cake_kda_det_train_kcp_forward(q_local, k_local, v_local, g_local, beta_local, ctx)
     grads = cake_kda_det_train_kcp_backward(q_local, k_local, v_local, g_local, beta_local, ctx, dout_local, saved=saved)
 
-    ctx_next = build_context_det_kcp(part_next, group, rank, device, heads=H)   # prepare the next pack while
+    ctx_next = cake_kda_det_train_kcp_build_context(part_next, group, rank, device, heads=H)   # prepare the next pack while
                                                                                # this one runs: no host wait
 
 The width-4 causal convolution with halo of the same partition takes this module's ``ctx``.
@@ -52,7 +52,7 @@ from .cake_kda_det_train import _FEATURE, DEFAULT_SCALE
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
-def partition_det_kcp(
+def cake_kda_det_train_kcp_partition(
     cu_seqlens_global_cpu: Any,
     world_size: int,
     layout: str = "contiguous",
@@ -75,18 +75,18 @@ def partition_det_kcp(
 
     Returns
     -------
-    ``PartitionDetKcp``: per rank its fragments (document, token range) of the batch; the input of
-    :func:`build_context_det_kcp` on every rank.
+    ``CakeKDADetKcpPartition``: per rank its fragments (document, token range) of the batch; the input of
+    :func:`cake_kda_det_train_kcp_build_context` on every rank.
     """
     from .experimental.cake.cake_kda_det_train_kcp import cake_kcp_plan
 
-    return cake_kcp_plan.partition_det_kcp(
+    return cake_kcp_plan.cake_kda_det_train_kcp_partition(
         cu_seqlens_global_cpu, world_size, layout, fragments, cut_points=cut_points
     )
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
-def build_context_det_kcp(
+def cake_kda_det_train_kcp_build_context(
     part: Any,
     group: Any,
     rank: int,
@@ -102,8 +102,8 @@ def build_context_det_kcp(
 
     Parameters
     ----------
-    part : PartitionDetKcp
-        From :func:`partition_det_kcp`, the same object on every rank.
+    part : CakeKDADetKcpPartition
+        From :func:`cake_kda_det_train_kcp_partition`, the same object on every rank.
     group
         The ``torch.distributed`` process group of the context-parallel ranks.
     rank : int
@@ -124,11 +124,11 @@ def build_context_det_kcp(
 
     Returns
     -------
-    ``ContextDetKcp``: the argument every KCP entry point takes; reusable across calls of the same batch layout.
+    ``CakeKDADetKcpContext``: the argument every KCP entry point takes; reusable across calls of the same batch layout.
     """
     from .experimental.cake.cake_kda_det_train_kcp import cake_kcp_plan
 
-    return cake_kcp_plan.build_context_det_kcp(
+    return cake_kcp_plan.cake_kda_det_train_kcp_build_context(
         part,
         group,
         rank,
@@ -164,8 +164,8 @@ def cake_kda_det_train_kcp_forward(
     q, k, v, g, beta : torch.Tensor
         This rank's shard of the operands of :func:`~flashinfer.cake_kda_det_train.chunk_kda_det_fwd` (the tokens of its fragments, in the
         partition's order): BF16 ``[1, S_local, H, 128]`` ``q, k, v``, FP32 ``g``, BF16 ``[1, S_local, H]`` ``beta``.
-    ctx : ContextDetKcp
-        From :func:`build_context_det_kcp`.
+    ctx : CakeKDADetKcpContext
+        From :func:`cake_kda_det_train_kcp_build_context`.
     scale : float, optional
         Output scale; ``128 ** -0.5`` when ``None``.
     save_for_backward : bool
@@ -505,12 +505,12 @@ def cake_kda_det_train_kcp_comm_bytes(
 # The types of the route, resolved on first access so that importing this module imports neither the KCP host
 # module (torch.distributed, the KCP loader) nor the plan: public name -> the submodule that defines it.
 _LAZY_TYPES = {
+    "CakeKDADetKcpContext": "cake_kcp_plan",
     "CakeKDADetKcpOptions": "cake_kcp",
+    "CakeKDADetKcpPartition": "cake_kcp_plan",
     "CakeKDADetKcpRecomputeHandle": "cake_kcp",
     "CakeKDADetKcpSaved": "cake_kcp",
     "CakeKDADetKcpWorkspace": "cake_kcp",
-    "ContextDetKcp": "cake_kcp_plan",
-    "PartitionDetKcp": "cake_kcp_plan",
 }
 
 
@@ -534,19 +534,19 @@ def __dir__() -> list[str]:
 
 __all__ = [
     "DEFAULT_SCALE",
-    "CakeKDADetKcpOptions",  # noqa: F822 - resolved by __getattr__
+    "CakeKDADetKcpContext",  # noqa: F822 - resolved by __getattr__
+    "CakeKDADetKcpOptions",  # noqa: F822
+    "CakeKDADetKcpPartition",  # noqa: F822
     "CakeKDADetKcpRecomputeHandle",  # noqa: F822
     "CakeKDADetKcpSaved",  # noqa: F822
     "CakeKDADetKcpWorkspace",  # noqa: F822
-    "ContextDetKcp",  # noqa: F822
-    "PartitionDetKcp",  # noqa: F822
-    "build_context_det_kcp",
     "cake_kda_det_kcp",
     "cake_kda_det_train_kcp_backward",
+    "cake_kda_det_train_kcp_build_context",
     "cake_kda_det_train_kcp_comm_bytes",
     "cake_kda_det_train_kcp_forward",
+    "cake_kda_det_train_kcp_partition",
     "cake_kda_det_train_kcp_reduce_gate_param_grads",
     "cake_kda_det_train_kcp_saved_bytes",
     "cake_kda_det_train_kcp_workspace_bytes",
-    "partition_det_kcp",
 ]

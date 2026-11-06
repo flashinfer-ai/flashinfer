@@ -40,8 +40,8 @@ PREVIOUS_PACKAGE = "flashinfer.experimental.cake_kda_det_train_kcp"
 
 # the entry points of flashinfer.cake_kda_det_train_kcp
 FACADE_NAMES = (
-    "partition_det_kcp",
-    "build_context_det_kcp",
+    "cake_kda_det_train_kcp_partition",
+    "cake_kda_det_train_kcp_build_context",
     "cake_kda_det_kcp",
     "cake_kda_det_train_kcp_forward",
     "cake_kda_det_train_kcp_backward",
@@ -52,9 +52,9 @@ FACADE_NAMES = (
 )
 # the types the facade resolves on first access
 TYPE_NAMES = (
-    "ContextDetKcp",
+    "CakeKDADetKcpContext",
     "CakeKDADetKcpOptions",
-    "PartitionDetKcp",
+    "CakeKDADetKcpPartition",
     "CakeKDADetKcpRecomputeHandle",
     "CakeKDADetKcpSaved",
     "CakeKDADetKcpWorkspace",
@@ -70,12 +70,12 @@ BACKEND_NAMES = (
     ("cake_kcp", "cake_kda_det_kcp"),
     ("cake_kcp", "cake_kda_det_train_kcp_backward"),
     ("cake_kcp", "cake_kda_det_train_kcp_forward"),
-    ("cake_kcp_plan", "ContextDetKcp"),
-    ("cake_kcp_plan", "FragmentDetKcp"),
-    ("cake_kcp_plan", "PartitionDetKcp"),
-    ("cake_kcp_plan", "build_context_det_kcp"),
+    ("cake_kcp_plan", "CakeKDADetKcpContext"),
+    ("cake_kcp_plan", "CakeKDADetKcpFragment"),
+    ("cake_kcp_plan", "CakeKDADetKcpPartition"),
+    ("cake_kcp_plan", "cake_kda_det_train_kcp_build_context"),
     ("cake_kcp_plan", "cake_kda_det_train_kcp_comm_bytes"),
-    ("cake_kcp_plan", "partition_det_kcp"),
+    ("cake_kcp_plan", "cake_kda_det_train_kcp_partition"),
     ("cake_kcp_plan", "cake_kda_det_train_kcp_saved_bytes"),
     ("cake_kcp_plan", "cake_kda_det_train_kcp_workspace_bytes"),
 )
@@ -104,16 +104,21 @@ PREVIOUS_NAMES = (
 DET_NAMES_BEFORE_8928 = (
     "CallDetKcp",
     "ChunkKDADetFunctionKcp",
+    "ContextDetKcp",
+    "FragmentDetKcp",
     "OptionsDetKcp",
+    "PartitionDetKcp",
     "RecomputeHandleDetKcp",
     "SavedDetKcp",
     "WorkspaceDetKcp",
+    "build_context_det_kcp",
     "chunk_kda_det_bwd_kcp",
     "chunk_kda_det_fwd_kcp",
     "chunk_kda_det_kcp",
     "kda_det_comm_bytes_kcp",
     "kda_det_saved_bytes_kcp",
     "kda_det_workspace_bytes_kcp",
+    "partition_det_kcp",
     "reduce_gate_param_grads_det_kcp",
 )
 # #8928 rule 7: every public name carries the mode; ALL_CAPS module constants keep their names
@@ -122,16 +127,6 @@ CONSTANT_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
 MODE_NAME = re.compile(
     r"^(?:cake_kda_det_kcp|cake_kda_det_train_kcp_[a-z0-9_]+|is_cake_kda_det_train_kcp_supported"
     r"|CakeKDADetKcp[A-Za-z0-9]+)$"
-)
-# the partition and context names: renamed in their own step (#8928 open question, a shared flashinfer.cake_kcp)
-PARTITION_CONTEXT_NAMES = frozenset(
-    {
-        "ContextDetKcp",
-        "FragmentDetKcp",
-        "PartitionDetKcp",
-        "build_context_det_kcp",
-        "partition_det_kcp",
-    }
 )
 
 
@@ -198,7 +193,7 @@ def test_public_names_carry_the_mode(where: str) -> None:
     assert names
     for name in names:
         assert re.search(r"(?:^|_)det(?:_|$)|Det", name), name
-        assert MODE_NAME.match(name) or name in PARTITION_CONTEXT_NAMES, name
+        assert MODE_NAME.match(name), name
 
 
 @pytest.mark.parametrize("where", ("facade", "package"))
@@ -229,10 +224,10 @@ def test_no_entry_takes_deterministic(where: str) -> None:
 
 def test_errors_name_the_det_entry_points() -> None:
     plan = importlib.import_module(f"{PACKAGE}.cake_kcp_plan")
-    with pytest.raises(ValueError, match=r"^partition_det_kcp: "):
-        plan.partition_det_kcp([0, 64], 0)
-    with pytest.raises(ValueError, match=r"^partition_det_kcp: "):
-        plan.partition_det_kcp([0, 64], 1, "no-such-layout")
+    with pytest.raises(ValueError, match=r"^cake_kda_det_train_kcp_partition: "):
+        plan.cake_kda_det_train_kcp_partition([0, 64], 0)
+    with pytest.raises(ValueError, match=r"^cake_kda_det_train_kcp_partition: "):
+        plan.cake_kda_det_train_kcp_partition([0, 64], 1, "no-such-layout")
 
 
 def test_package_names_resolve_on_first_access_only() -> None:

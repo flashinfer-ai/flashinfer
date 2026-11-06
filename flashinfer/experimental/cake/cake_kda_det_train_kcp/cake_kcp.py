@@ -47,7 +47,7 @@ CUDA-graph replay (adopted in an earlier revision; keyword
 first call of a validity key runs eagerly, the second is captured into a
 ``torch.cuda.CUDAGraph`` and every later call of the key replays it -- the same
 launches and collectives, bitwise the eager result.  The key is the call's
-kind, its ContextDetKcp / workspace / backend objects, every option and the
+kind, its CakeKDADetKcpContext / workspace / backend objects, every option and the
 shape / stride / dtype / data pointer of every operand and saved tensor: a
 framework gets the replay only with pointer-stable operands and the same
 objects per layer; anything else is a silent eager call (``GRAPH_STATS``,
@@ -654,7 +654,7 @@ def _operands(
     beta = _squeeze_batch(beta, "beta", 2)
     if int(ctx.T_r) != T:
         raise ValueError(
-            f"operands carry {T} tokens, the ContextDetKcp of rank {ctx.rank} holds T_r={ctx.T_r}"
+            f"operands carry {T} tokens, the CakeKDADetKcpContext of rank {ctx.rank} holds T_r={ctx.T_r}"
         )
     if not 1 <= H <= 64:
         raise ValueError(f"H={H}: the Cake KDA kernels take 1..64 heads")
@@ -2767,7 +2767,7 @@ def _prefix(values) -> list[int]:
 
 class _Tables:
     """Everything the launch sequences read for one ``(ctx, H)``: the segment plan, walk lists, the compact tile
-    tables of every pool, the collective splits and the K4 chains, derived once from ``cake_kcp_plan.ContextDetKcp`` /
+    tables of every pool, the collective splits and the K4 chains, derived once from ``cake_kcp_plan.CakeKDADetKcpContext`` /
     ``KcpHeadPlan`` and cached on the context (``ctx._table_sets``, shared by every workspace; the test knob
     ``table_cache="workspace"`` keeps the previous per-workspace cache) (the design note §7.2, §10.3, §14.4).  The set
     holds the context weakly; a table it copies to the device at first use costs one asynchronous pinned copy
@@ -4623,7 +4623,7 @@ class CakeKDADetKcpCall:
             ctx, "p_rule", cake_kcp_plan.P_RULE_DEFAULT
         ):
             raise ValueError(
-                f"_kcp_test_knobs p_rule {opts.p_rule!r} differs from the context's plan rule {getattr(ctx, 'p_rule', cake_kcp_plan.P_RULE_DEFAULT)!r}: give the knob to build_context_det_kcp"
+                f"_kcp_test_knobs p_rule {opts.p_rule!r} differs from the context's plan rule {getattr(ctx, 'p_rule', cake_kcp_plan.P_RULE_DEFAULT)!r}: give the knob to cake_kda_det_train_kcp_build_context"
             )
         self.schedule = str(opts.schedule)
         self.cols_rule = str(opts.cols_rule)  # D1
@@ -6194,7 +6194,7 @@ def cake_kda_det_train_kcp_forward(
 ) -> tuple[torch.Tensor, CakeKDADetKcpSaved | None]:
     """The KCP forward of this rank's fragments (the KCP contract §3.2): ``out`` like ``v`` (fresh) and the saved set
     (``None`` without ``save_for_backward`` or in ``boundary_mode="replay"``).  ``ctx`` is this rank's
-    ``ContextDetKcp``; the token operands are its ``T_r`` local tokens in fragment order; ``**options`` are the
+    ``CakeKDADetKcpContext``; the token operands are its ``T_r`` local tokens in fragment order; ``**options`` are the
     keywords of :class:`CakeKDADetKcpOptions` (+ ``_kcp_test_knobs``), among them ``graph="replay"`` (keyed CUDA-graph
     capture / replay of this call; module docstring and :func:`graph_cache_clear`).
 
@@ -6340,7 +6340,7 @@ def _check_saved(saved: CakeKDADetKcpSaved, call: CakeKDADetKcpCall) -> None:
     if saved.version != KCP_SAVED_VERSION:
         raise ValueError(f"saved: version {saved.version} is not {KCP_SAVED_VERSION}")
     if saved.ctx is not call.ctx:
-        raise ValueError("saved: the saved set belongs to another ContextDetKcp")
+        raise ValueError("saved: the saved set belongs to another CakeKDADetKcpContext")
     if (saved.T_r, saved.H, saved.n_frag, saved.P) != (
         call.T_r,
         call.H,
@@ -7150,7 +7150,7 @@ def _handle_bind(
     the shapes / dtype / device of the call's pools."""
     if entry.get("ctx") is not call.ctx:
         raise ValueError(
-            "recompute_handle: the 'kda' entry belongs to another ContextDetKcp"
+            "recompute_handle: the 'kda' entry belongs to another CakeKDADetKcpContext"
         )
     stored = entry.get("fingerprint")
     if stored != fingerprint:

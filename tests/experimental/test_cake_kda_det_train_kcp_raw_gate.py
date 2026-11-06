@@ -132,8 +132,12 @@ def _cpu_ctx(W: int = 2, rank: int = 0, lengths=(700, 1, 1300, 999), sm: int = 1
     cu = [0]
     for n in lengths:
         cu.append(cu[-1] + n)
-    part = cake_kcp_plan.partition_det_kcp(cu, W, layout="zigzag_per_document")
-    return cake_kcp_plan.build_context_det_kcp(part, None, rank, "cpu", 4, sm_count=sm)
+    part = cake_kcp_plan.cake_kda_det_train_kcp_partition(
+        cu, W, layout="zigzag_per_document"
+    )
+    return cake_kcp_plan.cake_kda_det_train_kcp_build_context(
+        part, None, rank, "cpu", 4, sm_count=sm
+    )
 
 
 def _cpu_ops(ctx, H: int, *, raw: bool = True) -> dict:
@@ -361,7 +365,11 @@ def test_gpu_raw_reserved_shared_workspace_is_bitwise_per_pack() -> None:
         ctxs, ops = [], []
         for i, lengths in enumerate(SHARED_PACKS):
             part, cu = _partition(lengths, 1, "contiguous")
-            ctxs.append(cake_kcp_plan.build_context_det_kcp(part, None, 0, device))
+            ctxs.append(
+                cake_kcp_plan.cake_kda_det_train_kcp_build_context(
+                    part, None, 0, device
+                )
+            )
             glob = make_raw_inputs(lengths, H, device, seed=0x7816 + i)
             o = _local_slices(
                 part, 0, cu, {n: glob[n] for n in ("q", "k", "v", "g", "beta", "dout")}
@@ -813,7 +821,7 @@ def _run_rank(rank: int, W: int, row, rdzv: str | None, result_dir: str | None) 
         _init_group(rank, W, device, rdzv)
     group = dist.group.WORLD if W > 1 else None
     part, cu = _partition(lengths, W, layout)
-    ctx = cake_kcp_plan.build_context_det_kcp(part, group, rank, device)
+    ctx = cake_kcp_plan.cake_kda_det_train_kcp_build_context(part, group, rank, device)
     total = cu[-1]
     glob = make_raw_inputs(lengths, H, device)
     A_log, dt_bias = glob["A_log"], glob["dt_bias"]
@@ -1239,7 +1247,7 @@ def _protocol_rank(
         _init_group(rank, W, device, rdzv)
     group = dist.group.WORLD if W > 1 else None
     part, cu = _partition(lengths, W, layout)
-    ctx = cake_kcp_plan.build_context_det_kcp(part, group, rank, device)
+    ctx = cake_kcp_plan.cake_kda_det_train_kcp_build_context(part, group, rank, device)
     total = cu[-1]
     cu_t = torch.tensor(cu, dtype=torch.int32, device=device)
     ws_r = cake_kcp.CakeKDADetKcpWorkspace(use_gate_in_kernel=True)

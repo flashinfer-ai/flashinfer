@@ -119,12 +119,12 @@ from flashinfer.cake_causal_conv1d_det_train_kcp import (  # noqa: E402
 from flashinfer.cake_kda_det_train_kcp import (  # noqa: E402
     CakeKDADetKcpRecomputeHandle,
     CakeKDADetKcpWorkspace,
-    build_context_det_kcp,
+    cake_kda_det_train_kcp_build_context,
     cake_kda_det_kcp,
     cake_kda_det_train_kcp_comm_bytes,
     cake_kda_det_train_kcp_saved_bytes,
     cake_kda_det_train_kcp_workspace_bytes,
-    partition_det_kcp,
+    cake_kda_det_train_kcp_partition,
     cake_kda_det_train_kcp_reduce_gate_param_grads,
 )
 from flashinfer.cake_kda_det_train import chunk_kda_det  # noqa: E402
@@ -202,9 +202,9 @@ def make_problem(args, rank: int, world: int, device: torch.device) -> dict[str,
         torch.bfloat16
     )
     weight = (torch.randn(args.channels, WIDTH, generator=gen) * 0.3).to(device)
-    part = partition_det_kcp(cu_cpu, world, args.layout)
+    part = cake_kda_det_train_kcp_partition(cu_cpu, world, args.layout)
     group = dist.group.WORLD
-    ctx = build_context_det_kcp(part, group, rank, device)
+    ctx = cake_kda_det_train_kcp_build_context(part, group, rank, device)
     fragments = part.fragments[rank]
     local = {
         name: _shard(inputs[name], cu, fragments).to(device)
@@ -395,8 +395,10 @@ def _token_problem(
     cu = [0]
     for length in lengths:
         cu.append(cu[-1] + length)
-    part = partition_det_kcp(torch.tensor(cu, dtype=torch.int32), world, args.layout)
-    ctx = build_context_det_kcp(part, dist.group.WORLD, rank, device)
+    part = cake_kda_det_train_kcp_partition(
+        torch.tensor(cu, dtype=torch.int32), world, args.layout
+    )
+    ctx = cake_kda_det_train_kcp_build_context(part, dist.group.WORLD, rank, device)
     fragments = part.fragments[rank]
     local = {
         name: _shard(inputs[name], cu, fragments).to(device)

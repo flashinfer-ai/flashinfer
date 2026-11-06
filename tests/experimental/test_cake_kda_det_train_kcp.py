@@ -97,27 +97,29 @@ def harness_partition(row, W: int, layout: str):
             ]
             for r in range(W)
         ]
-        part = kp.partition_det_kcp(cu, W, fragments=table)
+        part = kp.cake_kda_det_train_kcp_partition(cu, W, fragments=table)
     elif layout == "D":
         cuts = [kcp_shapes.doc_cuts_D(row, W, d) for d in range(len(row.lengths))]
-        part = kp.partition_det_kcp(
+        part = kp.cake_kda_det_train_kcp_partition(
             cu, W, layout="zigzag_per_document", cut_points=cuts
         )
     else:
-        part = kp.partition_det_kcp(cu, W, layout=LAYOUT_NAMES[layout])
+        part = kp.cake_kda_det_train_kcp_partition(cu, W, layout=LAYOUT_NAMES[layout])
     return frags, part
 
 
 def contexts(part, sm_count: int = SM_COUNT):
     return [
-        kp.build_context_det_kcp(part, None, r, "cpu", 4, sm_count=sm_count)
+        kp.cake_kda_det_train_kcp_build_context(
+            part, None, r, "cpu", 4, sm_count=sm_count
+        )
         for r in range(part.world_size)
     ]
 
 
 @pytest.mark.parametrize("case", CASES, ids=CASE_IDS)
 def test_partition_matches_the_harness(case) -> None:
-    """Gate 1: partition_det_kcp == kcp_shapes.partition / links / local_cu_seqlens on every row, CP and layout."""
+    """Gate 1: cake_kda_det_train_kcp_partition == kcp_shapes.partition / links / local_cu_seqlens on every row, CP and layout."""
     name, W, layout = case
     row = kcp_shapes.ROWS[name]
     frags, part = harness_partition(row, W, layout)
@@ -373,7 +375,9 @@ def _small_partition(W: int, lengths=(700, 1, 1300, 999), layout="zigzag_per_doc
     cu = [0]
     for n in lengths:
         cu.append(cu[-1] + n)
-    return kp.partition_det_kcp(torch.tensor(cu, dtype=torch.int64), W, layout=layout)
+    return kp.cake_kda_det_train_kcp_partition(
+        torch.tensor(cu, dtype=torch.int64), W, layout=layout
+    )
 
 
 @pytest.mark.parametrize("H", OWNERSHIP_H)
@@ -533,7 +537,7 @@ def test_zero_token_rank_keeps_chains_and_splits() -> None:
     """Gate 3 (C4b): a rank with T_r = 0 has no local sequences and no token-side tables but still owns heads, holds
     its chain tables and joins every collective with zero-length splits."""
     table = [[(0, 0, 1200)], [], [(0, 1200, 900)], [(0, 2100, 900)]]
-    part = kp.partition_det_kcp(
+    part = kp.cake_kda_det_train_kcp_partition(
         torch.tensor([0, 3000], dtype=torch.int64), 4, fragments=table
     )
     assert part.rank_tokens(1) == 0 and part.local_cu_seqlens(1) == (0,)
@@ -994,7 +998,7 @@ def test_kcp_plan_wave_rule_is_pure_in_sm_count() -> None:
 @pytest.mark.parametrize("W", (4, 8, 16))
 def test_kcp_plan_wave_rule_on_q1_c(monkeypatch, W) -> None:
     """The Q1 C fragment sets at CP4 / CP8 / CP16 (hand-derived from Q1's lengths) and the P of the rules per rank
-    through the context (knob p_rule via build_context_det_kcp; describe() records it; the shipped default is wave_fill1 =
+    through the context (knob p_rule via cake_kda_det_train_kcp_build_context; describe() records it; the shipped default is wave_fill1 =
     wave above the chain cap + the one-wave fill on one-fragment ranks below it): every rank has <= 2 fragments: at
     CP4 / CP8 (fragments > 256 chunks) the wave rule gives P = 7 everywhere (= the default), at CP16 (<= 244 chunks)
     the chain condition keeps the occ P under wave while the shipped fill plans P = 2 on every rank (one-fragment
@@ -1009,7 +1013,7 @@ def test_kcp_plan_wave_rule_on_q1_c(monkeypatch, W) -> None:
     }[W]
     monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", False)
     with pytest.raises(ValueError, match="enable_test_knobs"):
-        kp.build_context_det_kcp(
+        kp.cake_kda_det_train_kcp_build_context(
             part,
             None,
             0,
@@ -1034,8 +1038,10 @@ def test_kcp_plan_wave_rule_on_q1_c(monkeypatch, W) -> None:
             [(f.doc, f.off, f.length) for f in mine],
         )
         assert tuple(actual) == Q1_C_ACTUAL[W][r], (W, r, actual)
-        dflt = kp.build_context_det_kcp(part, None, r, "cpu", 4, sm_count=SM_COUNT)
-        occ = kp.build_context_det_kcp(
+        dflt = kp.cake_kda_det_train_kcp_build_context(
+            part, None, r, "cpu", 4, sm_count=SM_COUNT
+        )
+        occ = kp.cake_kda_det_train_kcp_build_context(
             part,
             None,
             r,
@@ -1044,7 +1050,7 @@ def test_kcp_plan_wave_rule_on_q1_c(monkeypatch, W) -> None:
             sm_count=SM_COUNT,
             _kcp_test_knobs={"p_rule": "occ"},
         )
-        wave = kp.build_context_det_kcp(
+        wave = kp.cake_kda_det_train_kcp_build_context(
             part,
             None,
             r,
@@ -1066,7 +1072,7 @@ def test_kcp_plan_wave_rule_on_q1_c(monkeypatch, W) -> None:
             dflt.heads(64).P
             == kp.kcp_plan(n_frag, nc, 64, SM_COUNT, p_rule="wave_fill1").P
         )
-        fill1 = kp.build_context_det_kcp(
+        fill1 = kp.cake_kda_det_train_kcp_build_context(
             part,
             None,
             r,
@@ -1153,7 +1159,7 @@ def test_kcp_plan_wave_rule_lane_rows(monkeypatch, case) -> None:
         assert (p_a if applies else occ.P) == rec.P, (case, r, actual, rec)
         if n_frag <= 1:
             assert p_a == p_b
-        ctx = kp.build_context_det_kcp(
+        ctx = kp.cake_kda_det_train_kcp_build_context(
             part,
             None,
             r,
@@ -1453,7 +1459,7 @@ def test_kcp_plan_wave_fill_lane_rows(monkeypatch, case) -> None:
             assert rec["wave_fill1"] == rec["wave"], (case, rec)
     changed = [rec["rank"] for rec in ranks if rec["wave_fill1"] != rec["wave"]]
     for r in changed[:1] or [0]:
-        ctx = kp.build_context_det_kcp(
+        ctx = kp.cake_kda_det_train_kcp_build_context(
             part,
             None,
             r,
@@ -1632,7 +1638,7 @@ def _two_doc_two_rank_partition(chunks: int = 100):
     and a document-last (crossing-in) fragment of ``chunks`` chunks -- the two-fragment Z rank shape of the tie rule."""
     n = chunks * 64
     cu = torch.tensor([0, 2 * n, 4 * n], dtype=torch.int64)
-    return kp.partition_det_kcp(
+    return kp.cake_kda_det_train_kcp_partition(
         cu, 2, fragments=[[(0, 0, n), (1, n, n)], [(0, n, n), (1, 0, n)]]
     )
 
@@ -1642,14 +1648,16 @@ def test_p1tie_knob_is_gated_and_plans(monkeypatch) -> None:
     with pytest.raises(ValueError, match="enable_test_knobs"):
         kp.validate_test_knobs({"p_rule": "wave_fill1_p1tie"})
     part = _two_doc_two_rank_partition(100)
-    ctx0 = kp.build_context_det_kcp(part, None, 0, "cpu", 4, sm_count=SM_COUNT)
+    ctx0 = kp.cake_kda_det_train_kcp_build_context(
+        part, None, 0, "cpu", 4, sm_count=SM_COUNT
+    )
     assert (ctx0.p_rule, ctx0.heads(64).P, ctx0.heads(64).NSEG) == (
         "wave_fill1_p1tie",
         1,
         2,
     )
     monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
-    ctx_fill1 = kp.build_context_det_kcp(
+    ctx_fill1 = kp.cake_kda_det_train_kcp_build_context(
         part,
         None,
         0,
@@ -1668,7 +1676,7 @@ def test_p1tie_knob_is_gated_and_plans(monkeypatch) -> None:
         "p_rule": "wave_fill1_p1tie",
     }
     for r in range(2):
-        ctx = kp.build_context_det_kcp(
+        ctx = kp.cake_kda_det_train_kcp_build_context(
             part,
             None,
             r,
@@ -1686,12 +1694,12 @@ def test_p1tie_knob_is_gated_and_plans(monkeypatch) -> None:
         assert ctx.heads(4).P == ctx0.heads(4).P  # H = 4: unchanged
     # an unequal pair (170 + 59 chunks on one rank) keeps P = 2 under the knob
     n1, n2 = 170 * 64, 59 * 64
-    part_u = kp.partition_det_kcp(
+    part_u = kp.cake_kda_det_train_kcp_partition(
         torch.tensor([0, 2 * n1, 2 * n1 + 2 * n2], dtype=torch.int64),
         2,
         fragments=[[(0, 0, n1), (1, n2, n2)], [(0, n1, n1), (1, 0, n2)]],
     )
-    ctx_u = kp.build_context_det_kcp(
+    ctx_u = kp.cake_kda_det_train_kcp_build_context(
         part_u,
         None,
         0,
@@ -1823,7 +1831,7 @@ def test_kcp_plan_p1tie_lane_rows(monkeypatch, case) -> None:
         if H <= 4:
             assert cand == base, (case, rec)
         if want_inv:
-            ctx_b = kp.build_context_det_kcp(
+            ctx_b = kp.cake_kda_det_train_kcp_build_context(
                 part,
                 None,
                 r,
@@ -1832,7 +1840,9 @@ def test_kcp_plan_p1tie_lane_rows(monkeypatch, case) -> None:
                 sm_count=SM_COUNT,
                 _kcp_test_knobs={"p_rule": "wave_fill1"},
             )
-            ctx_c = kp.build_context_det_kcp(part, None, r, "cpu", 4, sm_count=SM_COUNT)
+            ctx_c = kp.cake_kda_det_train_kcp_build_context(
+                part, None, r, "cpu", 4, sm_count=SM_COUNT
+            )
             inv_b, inv_c = _inventory(ctx_b, H), _inventory(ctx_c, H)
             assert (inv_b["P"], inv_c["P"]) == (base, cand), (case, rec)
             if cand == base:
@@ -1857,7 +1867,9 @@ def test_kcp_plan_p1tie_lane_rows(monkeypatch, case) -> None:
         },
     )
     for r in changed[:1] or [0]:
-        ctx = kp.build_context_det_kcp(part, None, r, "cpu", 4, sm_count=SM_COUNT)
+        ctx = kp.cake_kda_det_train_kcp_build_context(
+            part, None, r, "cpu", 4, sm_count=SM_COUNT
+        )
         assert (ctx.p_rule, ctx.heads(H).P, ctx.describe(H)["p_rule"]) == (
             "wave_fill1_p1tie",
             ranks[r]["wave_fill1_p1tie"],
@@ -1919,7 +1931,7 @@ def test_merge_fuse_knob_and_fused_carry_chains(monkeypatch) -> None:
     )
     part = _two_doc_two_rank_partition(100)
     for r in range(2):
-        ctx = kp.build_context_det_kcp(
+        ctx = kp.cake_kda_det_train_kcp_build_context(
             part,
             None,
             r,
@@ -1975,7 +1987,7 @@ def test_merge_fuse_knob_and_fused_carry_chains(monkeypatch) -> None:
     )
     # P = 1 (an eight-fragment D rank): the fused families are empty like their parts
     tb1 = cake_kcp._Tables(
-        kp.build_context_det_kcp(
+        kp.cake_kda_det_train_kcp_build_context(
             _small_partition(4), None, 1, "cpu", 4, sm_count=SM_COUNT
         ),
         64,
@@ -1993,7 +2005,7 @@ def test_merge_fuse_knob_and_fused_carry_chains(monkeypatch) -> None:
         )
     )
     inv1 = _inventory(
-        kp.build_context_det_kcp(
+        kp.cake_kda_det_train_kcp_build_context(
             _small_partition(4), None, 1, "cpu", 4, sm_count=SM_COUNT
         ),
         64,
@@ -2007,27 +2019,31 @@ def test_limits_are_rejected_before_launch() -> None:
     many = [(0, i, 1, 0) for i in range(kp.MAX_FRAGS + 1)] + [
         (0, kp.MAX_FRAGS + 1, 1, 1)
     ]
-    part = kp.partition_det_kcp(
+    part = kp.cake_kda_det_train_kcp_partition(
         torch.tensor([0, kp.MAX_FRAGS + 2], dtype=torch.int64), W, fragments=many
     )
     with pytest.raises(ValueError, match="at most 65536"):
-        kp.build_context_det_kcp(part, None, 0, "cpu", sm_count=SM_COUNT)
-    big = kp.partition_det_kcp(
+        kp.cake_kda_det_train_kcp_build_context(part, None, 0, "cpu", sm_count=SM_COUNT)
+    big = kp.cake_kda_det_train_kcp_partition(
         torch.tensor([0, 2**25], dtype=torch.int64), 2, layout="contiguous"
     )
-    ctx = kp.build_context_det_kcp(big, None, 0, "cpu", sm_count=SM_COUNT)
+    ctx = kp.cake_kda_det_train_kcp_build_context(
+        big, None, 0, "cpu", sm_count=SM_COUNT
+    )
     with pytest.raises(ValueError, match="int32"):
         ctx.heads(64)  # R * H * 64 >= 2**31
     with pytest.raises(ValueError):
-        kp.build_context_det_kcp(part, None, 2, "cpu")
+        kp.cake_kda_det_train_kcp_build_context(part, None, 2, "cpu")
     # [1 | 1 | 1 | long]: head row 0 of the long fragment has THREE consumers (the fragments ending at 3, 2, 1) -- the
     # C3 row of record at layout D (a 5-token document in 1-token pieces) has this pattern: three slots per head row
-    p3 = kp.partition_det_kcp(
+    p3 = kp.cake_kda_det_train_kcp_partition(
         torch.tensor([0, 500], dtype=torch.int64),
         4,
         fragments=[[(0, 0, 1)], [(0, 1, 1)], [(0, 2, 1)], [(0, 3, 497)]],
     )
-    ctx3 = kp.build_context_det_kcp(p3, None, 3, "cpu", sm_count=SM_COUNT)
+    ctx3 = kp.cake_kda_det_train_kcp_build_context(
+        p3, None, 3, "cpu", sm_count=SM_COUNT
+    )
     assert (
         ctx3.halo.head_row_off[0] == ((0, 1, 3), (2, 4, -1), (5, -1, -1))
         and ctx3.halo.n_head_rows == 6
@@ -2035,12 +2051,14 @@ def test_limits_are_rejected_before_launch() -> None:
     assert tuple(ctx3.halo_tables["head_row_off"].shape) == (1, 3, 3)
     assert kp.MAX_HEAD_CONSUMERS == 3
     # [1 | 2 | long] (the C7 pattern) has two consumers per head row and is accepted
-    p2 = kp.partition_det_kcp(
+    p2 = kp.cake_kda_det_train_kcp_partition(
         torch.tensor([0, 500], dtype=torch.int64),
         3,
         fragments=[[(0, 0, 1)], [(0, 1, 2)], [(0, 3, 497)]],
     )
-    ctx2 = kp.build_context_det_kcp(p2, None, 2, "cpu", sm_count=SM_COUNT)
+    ctx2 = kp.cake_kda_det_train_kcp_build_context(
+        p2, None, 2, "cpu", sm_count=SM_COUNT
+    )
     assert (
         ctx2.halo.head_row_off[0][0] == (0, 1, -1)
         and ctx2.halo.head_row_off[0][1] == (2, -1, -1)
@@ -2049,12 +2067,12 @@ def test_limits_are_rejected_before_launch() -> None:
 
 
 def test_partition_validation_and_defaults() -> None:
-    """partition_det_kcp: explicit tables are validated; layouts cut as documented; zero-length fragments are skipped by
+    """cake_kda_det_train_kcp_partition: explicit tables are validated; layouts cut as documented; zero-length fragments are skipped by
     the chains; the default zigzag_per_document cut is near-equal."""
     cu = torch.tensor(
         [0, 100, 100, 350], dtype=torch.int64
     )  # a zero-length document in the middle
-    part = kp.partition_det_kcp(cu, 2, layout="contiguous")
+    part = kp.cake_kda_det_train_kcp_partition(cu, 2, layout="contiguous")
     assert [[(f.doc, f.off, f.length) for f in frs] for frs in part.fragments] == [
         [(0, 0, 100), (2, 0, 75)],
         [(2, 75, 175)],
@@ -2064,12 +2082,12 @@ def test_partition_validation_and_defaults() -> None:
         and part.fragments[1][0].prev == (0, 1)
         and part.fragments[0][0].next is None
     )
-    z = kp.partition_det_kcp(cu, 2, layout="zigzag")
+    z = kp.cake_kda_det_train_kcp_partition(cu, 2, layout="zigzag")
     assert [[(f.doc, f.off, f.length) for f in frs] for frs in z.fragments] == [
         [(0, 0, 88), (2, 163, 87)],
         [(0, 88, 12), (2, 0, 76), (2, 76, 87)],
     ]
-    d = kp.partition_det_kcp(cu, 2, layout="zigzag_per_document")
+    d = kp.cake_kda_det_train_kcp_partition(cu, 2, layout="zigzag_per_document")
     assert [(f.doc, f.off, f.length) for f in d.fragments[0]] == [
         (0, 0, 25),
         (0, 75, 25),
@@ -2090,7 +2108,7 @@ def test_partition_validation_and_defaults() -> None:
         d.fragments[0][2].prev is None and d.fragments[0][2].next is None
     )  # zero-length: not in the chain
     assert d.chains()[2] == ((0, 4), (1, 4), (1, 5), (0, 5))
-    with_cuts = kp.partition_det_kcp(
+    with_cuts = kp.cake_kda_det_train_kcp_partition(
         cu,
         2,
         layout="zigzag_per_document",
@@ -2108,36 +2126,40 @@ def test_partition_validation_and_defaults() -> None:
         5
     ].prev == (0, 4)
     with pytest.raises(ValueError):
-        kp.partition_det_kcp(
+        kp.cake_kda_det_train_kcp_partition(
             cu, 2, layout="zigzag_per_document", cut_points=[[0, 50, 100]] * 3
         )
     with pytest.raises(ValueError, match="covered"):
-        kp.partition_det_kcp(
+        kp.cake_kda_det_train_kcp_partition(
             torch.tensor([0, 10], dtype=torch.int64),
             2,
             fragments=[[(0, 0, 4)], [(0, 5, 5)]],
         )
     with pytest.raises(ValueError, match="not covered|covered up to|gap"):
-        kp.partition_det_kcp(
+        kp.cake_kda_det_train_kcp_partition(
             torch.tensor([0, 10], dtype=torch.int64),
             2,
             fragments=[[(0, 0, 6)], [(0, 5, 5)]],
         )
     with pytest.raises(ValueError, match="order"):
-        kp.partition_det_kcp(
+        kp.cake_kda_det_train_kcp_partition(
             torch.tensor([0, 10], dtype=torch.int64),
             1,
             fragments=[[(0, 5, 5), (0, 0, 5)]],
         )
     with pytest.raises(ValueError):
-        kp.partition_det_kcp(
+        kp.cake_kda_det_train_kcp_partition(
             torch.tensor([0, 10], dtype=torch.int64), 2, fragments=[(0, 0, 10, 2)]
         )
     with pytest.raises(ValueError):
-        kp.partition_det_kcp(torch.tensor([0, 10], dtype=torch.int64), 2, layout="ring")
+        kp.cake_kda_det_train_kcp_partition(
+            torch.tensor([0, 10], dtype=torch.int64), 2, layout="ring"
+        )
     with pytest.raises(ValueError, match="CPU"):
-        kp.partition_det_kcp(torch.tensor([0, 10], dtype=torch.int64, device="meta"), 2)
-    flat = kp.partition_det_kcp(
+        kp.cake_kda_det_train_kcp_partition(
+            torch.tensor([0, 10], dtype=torch.int64, device="meta"), 2
+        )
+    flat = kp.cake_kda_det_train_kcp_partition(
         torch.tensor([0, 10], dtype=torch.int64),
         2,
         fragments=[(0, 0, 4, 1), (0, 4, 6, 0)],
@@ -2147,8 +2169,8 @@ def test_partition_validation_and_defaults() -> None:
         and flat.records(0) == ((0, 4, 6, (1, 0), None),)
         and flat.records(1) == ((0, 0, 4, None, (0, 0)),)
     )
-    assert kp.partition_det_kcp([0, 10], 1).fragments == (
-        (kp.FragmentDetKcp(0, 0, 10, 0, 0),),
+    assert kp.cake_kda_det_train_kcp_partition([0, 10], 1).fragments == (
+        (kp.CakeKDADetKcpFragment(0, 0, 10, 0, 0),),
     )
 
 
@@ -2216,7 +2238,7 @@ def _random_ragged_partition(rng, W: int):
             per_rank[rng.randrange(W)].append((d, rng.randint(0, n), 0))
     for frs in per_rank:
         frs.sort(key=lambda x: (x[0], x[1]))
-    return kp.partition_det_kcp(cu, W, fragments=per_rank)
+    return kp.cake_kda_det_train_kcp_partition(cu, W, fragments=per_rank)
 
 
 def test_halo_sources_bisect_matches_the_scan_on_random_partitions() -> None:
@@ -2231,7 +2253,9 @@ def test_halo_sources_bisect_matches_the_scan_on_random_partitions() -> None:
     for W in range(2, 65):
         parts = [_random_ragged_partition(rng, W) for _ in range(3)]
         cu = parts[0].cu_seqlens
-        parts += [kp.partition_det_kcp(cu, W, layout=lay) for lay in kp.LAYOUTS]
+        parts += [
+            kp.cake_kda_det_train_kcp_partition(cu, W, layout=lay) for lay in kp.LAYOUTS
+        ]
         for part in parts:
             for halo in (1, 2, 3, 4):
                 got = kp._halo_sources(part, halo)
@@ -2725,7 +2749,9 @@ def test_ring_exchange_resolves_save_transfer() -> None:
     assert cake_kcp.CakeKDADetKcpOptions(exchange="ring").check().save_transfer is False
     # the resolved options select the ring scheme on a two-rank partition (one hop) without raising
     part = _small_partition(2, lengths=(3000,), layout="contiguous")
-    ctx = kp.build_context_det_kcp(part, None, 0, "cpu", 4, sm_count=SM_COUNT)
+    ctx = kp.cake_kda_det_train_kcp_build_context(
+        part, None, 0, "cpu", 4, sm_count=SM_COUNT
+    )
     tb = cake_kcp._Tables(ctx, 4)
     assert tb.max_hops <= cake_kcp.RING_MAX_HOPS
     opts = cake_kcp._options({"exchange": "ring"})
@@ -3049,7 +3075,7 @@ def _fused_cases():
     cases.append(
         (
             "ragged-zero-rank",
-            kp.partition_det_kcp(
+            kp.cake_kda_det_train_kcp_partition(
                 torch.tensor([0, 3000], dtype=torch.int64), 4, fragments=table
             ),
         )
@@ -3097,8 +3123,12 @@ def test_fused_walk_tables_are_a_pure_function_of_the_plan() -> None:
     contexts give identical tables; the plan JSON of a rank is identical across builds."""
     part = _small_partition(4, lengths=(3000,), layout="contiguous")
     for r in range(4):
-        a = kp.build_context_det_kcp(part, None, r, "cpu", 4, sm_count=SM_COUNT)
-        b = kp.build_context_det_kcp(part, None, r, "cpu", 4, sm_count=SM_COUNT)
+        a = kp.cake_kda_det_train_kcp_build_context(
+            part, None, r, "cpu", 4, sm_count=SM_COUNT
+        )
+        b = kp.cake_kda_det_train_kcp_build_context(
+            part, None, r, "cpu", 4, sm_count=SM_COUNT
+        )
         assert a.describe(64) == b.describe(64)
         ta, tb = (
             cake_kcp._Tables(a, 64, fused_walks=1),
@@ -3197,7 +3227,9 @@ def test_walk_geometry_knob_is_gated_and_validated(monkeypatch) -> None:
         with pytest.raises(ValueError):
             cake_kcp._options({"_kcp_test_knobs": {"walk_geometry": bad}})
     part = _small_partition(4, lengths=(3000,), layout="contiguous")
-    ctx = kp.build_context_det_kcp(part, None, 1, "cpu", 4, sm_count=SM_COUNT)
+    ctx = kp.cake_kda_det_train_kcp_build_context(
+        part, None, 1, "cpu", 4, sm_count=SM_COUNT
+    )
     with pytest.raises(ValueError, match="walk_geometry"):
         cake_kcp._Tables(ctx, 64, walk_geometry="lpt")
     assert (
@@ -3356,8 +3388,12 @@ def test_walk_geometry_tables_are_a_pure_function_of_the_plan() -> None:
     lists under every geometry."""
     part = _small_partition(4, lengths=(3000, 700), layout="zigzag")
     for r in range(4):
-        a = kp.build_context_det_kcp(part, None, r, "cpu", 4, sm_count=SM_COUNT)
-        b = kp.build_context_det_kcp(part, None, r, "cpu", 4, sm_count=SM_COUNT)
+        a = kp.cake_kda_det_train_kcp_build_context(
+            part, None, r, "cpu", 4, sm_count=SM_COUNT
+        )
+        b = kp.cake_kda_det_train_kcp_build_context(
+            part, None, r, "cpu", 4, sm_count=SM_COUNT
+        )
         for g in cake_kcp.WALK_GEOMETRIES:
             ta, tb = (
                 cake_kcp._Tables(a, 64, walk_geometry=g),
@@ -3412,7 +3448,7 @@ def test_gpu_table_parity(device, case) -> None:
     failures = []
     checked = 0
     for r in range(W):
-        ctx = kp.build_context_det_kcp(part, None, r, device)
+        ctx = kp.cake_kda_det_train_kcp_build_context(part, None, r, device)
         if ctx.n_frag == 0:
             _evidence(
                 "parity",
@@ -3522,8 +3558,8 @@ def _ckpt_problem(device, lengths, H):
     cu = [0]
     for n in lengths:
         cu.append(cu[-1] + n)
-    part = kp.partition_det_kcp(cu, 1)
-    ctx = kp.build_context_det_kcp(part, None, 0, device)
+    part = kp.cake_kda_det_train_kcp_partition(cu, 1)
+    ctx = kp.cake_kda_det_train_kcp_build_context(part, None, 0, device)
     ops = make_inputs(lengths, H, device)
     names = ("q", "k", "v", "g", "beta", "dout")
     return ctx, {n: ops[n].to(device).contiguous() for n in names}
@@ -4078,7 +4114,7 @@ def test_gpu_recompute_handle_misuse_raises(device, monkeypatch) -> None:
         e["fingerprint"] = tuple(fp.items())
 
     for tamper, match in (
-        (tamper_ctx, "another ContextDetKcp"),
+        (tamper_ctx, "another CakeKDADetKcpContext"),
         (tamper_fp, r"differs in \['modes'\]"),
         (tamper_tensor, "S_in"),
         (tamper_keep, r"differs in \['keep'\]"),
@@ -4571,8 +4607,8 @@ def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap, walk_form) 
     dt = backend.dtypes
     H = 2
     cu = torch.tensor([0, 300, 1024, 1500], dtype=torch.int64)
-    part = kp.partition_det_kcp(cu, 1)
-    ctx = kp.build_context_det_kcp(part, None, 0, device)
+    part = kp.cake_kda_det_train_kcp_partition(cu, 1)
+    ctx = kp.cake_kda_det_train_kcp_build_context(part, None, 0, device)
     T = int(ctx.T_r)
     gen = torch.Generator(device=device).manual_seed(0x3837)
 
@@ -4964,7 +5000,9 @@ def test_host_trim_workspace_fast_paths() -> None:
     """Trimmed host path: ``ensure(host_trim=True)`` returns the last tables for the same (ctx, H, device, backward, knobs) and
     takes the full path otherwise; ``pool(cached=True)`` returns the same ``[:n]`` view while the pool is unchanged."""
     part = _small_partition(4, lengths=(3000,), layout="contiguous")
-    ctx = kp.build_context_det_kcp(part, None, 1, "cpu", 4, sm_count=SM_COUNT)
+    ctx = kp.cake_kda_det_train_kcp_build_context(
+        part, None, 1, "cpu", 4, sm_count=SM_COUNT
+    )
     ws = cake_kcp.CakeKDADetKcpWorkspace(local=False)
     tb = ws.ensure(ctx, 64, device="cpu", backward=False, host_trim=True)
     assert ws.ensure(ctx, 64, device="cpu", backward=False, host_trim=True) is tb
@@ -5241,7 +5279,9 @@ def test_host_trim_backward_walk_sublists_are_table_owned() -> None:
         ((40, 40), "zigzag"),
     ):
         part = _small_partition(4, lengths=lengths, layout=layout)
-        ctx = kp.build_context_det_kcp(part, None, 1, "cpu", 4, sm_count=SM_COUNT)
+        ctx = kp.cake_kda_det_train_kcp_build_context(
+            part, None, 1, "cpu", 4, sm_count=SM_COUNT
+        )
         tb = cake_kcp._Tables(ctx, 64, fused_walks=1)
         p0, rest = tb.walk_all_p0, tb.walk_all_rest
         assert tb.walk_all_p0 is p0 and tb.walk_all_rest is rest
@@ -5269,7 +5309,9 @@ def test_host_trim_table_identity_caches() -> None:
     from flashinfer.experimental.cake.cake_kda_det_train_kcp import cake_kcp_jit
 
     part = _small_partition(4, lengths=(3000,), layout="contiguous")
-    ctx = kp.build_context_det_kcp(part, None, 1, "cpu", 4, sm_count=SM_COUNT)
+    ctx = kp.cake_kda_det_train_kcp_build_context(
+        part, None, 1, "cpu", 4, sm_count=SM_COUNT
+    )
     tb = cake_kcp._Tables(ctx, 64, fused_walks=1)
     assert tb.P > 1
     w1 = tb.dev_list(tb.walk_offset, "cpu")
@@ -5405,8 +5447,10 @@ def test_walk_form_of_decides_once_per_table_set() -> None:
     launch: the forms of a per-launch evaluation (the rule's inputs are static per ``(ctx, H)``; the device's
     architecture is read, for the per-architecture rule alone, on the first launch of a key only), a fresh equal list
     finding the same entry, the knob's forced forms passing through; a provider without a form rule gives ``"full"``."""
-    part = kp.partition_det_kcp((0, 64 * 200, 64 * 350), 4, layout="contiguous")
-    ctx = kp.build_context_det_kcp(part, None, 0, "cpu", 4, sm_count=148)
+    part = kp.cake_kda_det_train_kcp_partition(
+        (0, 64 * 200, 64 * 350), 4, layout="contiguous"
+    )
+    ctx = kp.cake_kda_det_train_kcp_build_context(part, None, 0, "cpu", 4, sm_count=148)
     tb = cake_kcp._Tables(ctx, 64)
     evaluated: list[tuple] = []
     arch_reads: list = []
@@ -5503,8 +5547,10 @@ def test_walk_form_of_passes_arch_to_a_per_architecture_rule_alone() -> None:
     a ``device_arch``, serves its string rules (``"fit"`` / ``"split"``) without a ``TypeError`` and without an
     architecture read: ``_walk_form_of`` passes ``arch`` only for a per-architecture rule (a mapping of
     ``WALK_FORM_RULES``), which still receives it."""
-    part = kp.partition_det_kcp((0, 64 * 200, 64 * 350), 4, layout="contiguous")
-    ctx = kp.build_context_det_kcp(part, None, 0, "cpu", 4, sm_count=148)
+    part = kp.cake_kda_det_train_kcp_partition(
+        (0, 64 * 200, 64 * 350), 4, layout="contiguous"
+    )
+    ctx = kp.cake_kda_det_train_kcp_build_context(part, None, 0, "cpu", 4, sm_count=148)
     tb = cake_kcp._Tables(ctx, 64)
     walk = tb.walk_offset
     assert walk
@@ -5922,7 +5968,9 @@ def test_host_trim_templates_live_on_the_arena_and_weakly_key_the_table_set() ->
         )
 
     part = _small_partition(4, lengths=(3000,), layout="contiguous")
-    ctx = kp.build_context_det_kcp(part, None, 1, "cpu", 4, sm_count=SM_COUNT)
+    ctx = kp.cake_kda_det_train_kcp_build_context(
+        part, None, 1, "cpu", 4, sm_count=SM_COUNT
+    )
     H = 64
     tb = cake_kcp._Tables(ctx, H, fused_walks=1)
     arena = Arena(ctx, H)
@@ -5955,7 +6003,9 @@ def test_host_trim_templates_live_on_the_arena_and_weakly_key_the_table_set() ->
     gc.collect()
     assert wr_tb() is None
     # a new table set on the same arena misses, purges the dead entries and leaves one live entry
-    ctx2 = kp.build_context_det_kcp(part, None, 1, "cpu", 4, sm_count=SM_COUNT)
+    ctx2 = kp.cake_kda_det_train_kcp_build_context(
+        part, None, 1, "cpu", 4, sm_count=SM_COUNT
+    )
     tb2 = cake_kcp._Tables(ctx2, H, fused_walks=1)
     c4 = call_for(arena, ctx2, tb2, H, False)
     backend.begin_call(c4)
@@ -5996,7 +6046,7 @@ def test_local_stage_values_cover_the_records(H, arch, sm) -> None:
     grids; the intra record that computes the layout itself gets the arena's scratch table set (and the workspace
     bytes count it) while every other program reads the context's tables."""
     part = _small_partition(2)
-    ctx = kp.build_context_det_kcp(part, None, 0, "cpu", 4, sm_count=sm)
+    ctx = kp.cake_kda_det_train_kcp_build_context(part, None, 0, "cpu", 4, sm_count=sm)
     assert ctx.T_r > 0
     plan = cake_backend.plan(ctx.T_r, ctx.n_frag, H, sm, arch)
     tb = cake_kcp._Tables(ctx, H, fused_walks=1)
@@ -6238,7 +6288,7 @@ def _tape_ctx(segmented: bool, sm: int):
     """The first rank of :data:`TAPE_CASES` with tokens whose segment plan has ``P > 1`` (``segmented``) or ``P = 1``,
     with its head count."""
     for W, rank, lengths, H in TAPE_CASES:
-        ctx = kp.build_context_det_kcp(
+        ctx = kp.cake_kda_det_train_kcp_build_context(
             _small_partition(W, lengths), None, rank, "cpu", 4, sm_count=sm
         )
         if (
@@ -6592,8 +6642,8 @@ def test_gpu_host_trim_fresh_context_per_call_releases_everything(device) -> Non
     dt = backend.dtypes
     H = 2
     cu = torch.tensor([0, 300, 1024, 1500], dtype=torch.int64)
-    part = kp.partition_det_kcp(cu, 1)
-    T = int(kp.build_context_det_kcp(part, None, 0, device).T_r)
+    part = kp.cake_kda_det_train_kcp_partition(cu, 1)
+    T = int(kp.cake_kda_det_train_kcp_build_context(part, None, 0, device).T_r)
     gen = torch.Generator(device=device).manual_seed(0x3837)
 
     def randn(*shape):
@@ -6612,7 +6662,7 @@ def test_gpu_host_trim_fresh_context_per_call_releases_everything(device) -> Non
     dout = (0.5 * randn(T, H, cake_kcp.D)).to(dt["dout"])
 
     def step():
-        ctx = kp.build_context_det_kcp(part, None, 0, device)
+        ctx = kp.cake_kda_det_train_kcp_build_context(part, None, 0, device)
         ws = cake_kcp.CakeKDADetKcpWorkspace(
             state_dtype=dt["state"], local=backend.local_stages
         )
@@ -6665,7 +6715,7 @@ def test_gpu_workspace_upgrade_releases_superseded_storage_first(device) -> None
     ):
         part = _small_partition(W, lengths=lengths, layout=layout)
         for r in range(W):
-            ctx = kp.build_context_det_kcp(part, None, r, device)
+            ctx = kp.cake_kda_det_train_kcp_build_context(part, None, r, device)
             if ctx.T_r == 0:
                 continue
             for H in (4, 64):
@@ -6727,8 +6777,8 @@ def test_gpu_first_training_step_releases_the_forward_arena(device, graph) -> No
     dt = backend.dtypes
     H = 2
     cu = torch.tensor([0, 300, 1024, 1500], dtype=torch.int64)
-    part = kp.partition_det_kcp(cu, 1)
-    ctx = kp.build_context_det_kcp(part, None, 0, device)
+    part = kp.cake_kda_det_train_kcp_partition(cu, 1)
+    ctx = kp.cake_kda_det_train_kcp_build_context(part, None, 0, device)
     T = int(ctx.T_r)
     gen = torch.Generator(device=device).manual_seed(0x3837)
 
@@ -6868,7 +6918,7 @@ def test_gpu_forward_only_layout_is_bitwise_and_lean(device) -> None:
 
     for lengths, H in FWD_ONLY_ROWS:
         part = _small_partition(1, lengths=lengths, layout="contiguous")
-        ctx = kp.build_context_det_kcp(part, None, 0, device)
+        ctx = kp.cake_kda_det_train_kcp_build_context(part, None, 0, device)
         P = ctx.heads(H).P
         seen_p1 += P == 1
         seen_pn += P > 1
@@ -7022,7 +7072,7 @@ def test_gpu_graph_replay_on_the_forward_only_layout_then_backward(device) -> No
     dt = backend.dtypes
     H = 2
     part = _small_partition(1, lengths=(1450,), layout="contiguous")
-    ctx = kp.build_context_det_kcp(part, None, 0, device)
+    ctx = kp.cake_kda_det_train_kcp_build_context(part, None, 0, device)
     assert ctx.heads(H).P > 1
     x = _unit_operands(device, int(ctx.T_r), H)
     q, k, v, g, beta, dout = (x[n] for n in ("q", "k", "v", "g", "beta", "dout"))
@@ -7102,7 +7152,7 @@ def test_gpu_graph_replay_after_a_forward_without_a_saved_set(device) -> None:
     dt = backend.dtypes
     H = 2
     part = _small_partition(1, lengths=(1450,), layout="contiguous")
-    ctx = kp.build_context_det_kcp(part, None, 0, device)
+    ctx = kp.cake_kda_det_train_kcp_build_context(part, None, 0, device)
     assert ctx.heads(H).P > 1
     x = _unit_operands(device, int(ctx.T_r), H)
     q, k, v, g, beta = (x[n] for n in ("q", "k", "v", "g", "beta"))

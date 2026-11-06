@@ -14,10 +14,10 @@ give bitwise the same outputs and gradients.
 ## Usage
 
 The packed batch of one training step may be split over the ranks of a
-`torch.distributed` process group.  `partition_det_kcp` cuts the documents into
+`torch.distributed` process group.  `cake_kda_det_train_kcp_partition` cuts the documents into
 per-rank fragments (`"contiguous"`, `"zigzag"` or `"zigzag_per_document"`
 layouts, an explicit `fragments` table, or `cut_points` with the
-`"zigzag_per_document"` layout); `build_context_det_kcp` gives every rank the
+`"zigzag_per_document"` layout); `cake_kda_det_train_kcp_build_context` gives every rank the
 device tables of its fragments, the collectives that carry the per-document
 state recurrences and the convolution's history rows across the rank
 boundaries, and the segment plan of its fragment walks.  The per-rank entry
@@ -25,13 +25,13 @@ points take the rank's shard of the operands (the tokens of its fragments, in
 the partition's order) and return that shard's outputs and gradients:
 
 ```python
-from flashinfer.cake_kda_det_train_kcp import (partition_det_kcp, build_context_det_kcp, cake_kda_det_kcp,
+from flashinfer.cake_kda_det_train_kcp import (cake_kda_det_train_kcp_partition, cake_kda_det_train_kcp_build_context, cake_kda_det_kcp,
                                   cake_kda_det_train_kcp_forward, cake_kda_det_train_kcp_backward,
                                   cake_kda_det_train_kcp_workspace_bytes, cake_kda_det_train_kcp_saved_bytes, cake_kda_det_train_kcp_comm_bytes)
 from flashinfer.cake_causal_conv1d_det_train_kcp import cake_causal_conv1d_det_kcp
 
-part = partition_det_kcp(cu_seqlens_global_cpu, world_size)          # the same object on every rank
-ctx = build_context_det_kcp(part, group, rank, device)               # this rank's tables and collectives
+part = cake_kda_det_train_kcp_partition(cu_seqlens_global_cpu, world_size)          # the same object on every rank
+ctx = cake_kda_det_train_kcp_build_context(part, group, rank, device)               # this rank's tables and collectives
 y_local = cake_causal_conv1d_det_kcp(x_local, conv_weight, ctx)  # the convolution before the KDA step
 out_local = cake_kda_det_kcp(q_local, k_local, v_local, g_local, beta_local, ctx)   # autograd
 out_local, saved = cake_kda_det_train_kcp_forward(q_local, k_local, v_local, g_local, beta_local, ctx,
@@ -53,7 +53,7 @@ has no such parameter. The first call of a
 validity key runs eagerly, the second is captured into a CUDA graph and every
 later call of the key replays it: the same launches and collectives, bitwise
 the eager result, with no host work between them. The key is the call's kind,
-its `ContextDetKcp` / workspace / backend objects, every option and the shape,
+its `CakeKDADetKcpContext` / workspace / backend objects, every option and the shape,
 stride, dtype and data pointer of every operand and saved tensor.
 Requirements: the operands of a layer must keep their data pointers, shapes,
 strides and dtypes across steps (static activation buffers), the same context,
@@ -181,7 +181,7 @@ through the private test knob `host_trim` (after
 
 Host synchronization: no KCP call and no pack preparation copies a table from
 pageable memory or waits for queued device work, with or without a
-caller-owned workspace. `build_context_det_kcp` copies the context's tables in one
+caller-owned workspace. `cake_kda_det_train_kcp_build_context` copies the context's tables in one
 pinned non-blocking copy on `stream=` (default: the current stream), so pack
 N+1 can be prepared while pack N runs; `heads=H` derives the head plans there
 as well (host work; their device tables are copied only when read, and the

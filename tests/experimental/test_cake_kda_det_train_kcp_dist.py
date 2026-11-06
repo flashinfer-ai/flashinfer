@@ -127,8 +127,10 @@ def _partition(lengths, W: int, layout: str):
                 p = e
                 d += 1
             pos = end
-        return cake_kcp_plan.partition_det_kcp(cu, W, fragments=nested), cu
-    return cake_kcp_plan.partition_det_kcp(cu, W, layout=layout), cu
+        return cake_kcp_plan.cake_kda_det_train_kcp_partition(
+            cu, W, fragments=nested
+        ), cu
+    return cake_kcp_plan.cake_kda_det_train_kcp_partition(cu, W, layout=layout), cu
 
 
 def _local_slices(part, rank: int, cu: list[int], tensors: dict) -> dict:
@@ -170,7 +172,7 @@ def _run_rank(rank: int, W: int, row, rdzv: str | None, result_dir: str | None) 
         _init_group(rank, W, device, rdzv)
     group = dist.group.WORLD if W > 1 else None
     part, cu = _partition(lengths, W, layout)
-    ctx = cake_kcp_plan.build_context_det_kcp(part, group, rank, device)
+    ctx = cake_kcp_plan.cake_kda_det_train_kcp_build_context(part, group, rank, device)
     total = cu[-1]
     glob = make_inputs(
         lengths, H, device
@@ -626,7 +628,9 @@ def _run_upload_rank(
         )
 
     def build(**kw):
-        return cake_kcp_plan.build_context_det_kcp(part, group, rank, device, **kw)
+        return cake_kcp_plan.cake_kda_det_train_kcp_build_context(
+            part, group, rank, device, **kw
+        )
 
     def window(fn, **kw) -> dict:
         return census(fn, device, sleep_ms=DIST_SLEEP_MS, **kw)
@@ -1154,7 +1158,7 @@ def _run_rank_ckpt(
         _init_group(rank, W, device, rdzv)
     group = dist.group.WORLD
     part, cu = _partition(lengths, W, layout)
-    ctx = cake_kcp_plan.build_context_det_kcp(part, group, rank, device)
+    ctx = cake_kcp_plan.cake_kda_det_train_kcp_build_context(part, group, rank, device)
     glob = make_inputs(lengths, H, device)
     ops = _local_slices(part, rank, cu, glob)
     q, k, v, g, beta, dout = (ops[n] for n in ("q", "k", "v", "g", "beta", "dout"))
