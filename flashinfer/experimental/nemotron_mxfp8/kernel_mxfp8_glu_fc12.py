@@ -49,7 +49,7 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel(_BaseSm100SwigluMxfp8Fc12Kernel):
     token_comm: TokenInPullTokenBackPush
     # SMEM budget for all "non-problem-tensor" buffers (mbarriers, sched
     # work-tile buffer, TMEM allocator state).  Reserved at host side in
-    # ``_compute_stages``.  Bump if ``SharedStorage`` over-allocates SMEM.
+    # `_compute_stages`.  Bump if `SharedStorage` over-allocates SMEM.
     _SmemMiscBudget = 1024
 
     # Supported (ab_dtype, sf_vec_size) pairings.
@@ -130,7 +130,7 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel(_BaseSm100SwigluMxfp8Fc12Kernel):
     def _setup_attributes(self) -> None:
         """Set up MMA / cluster / tile shapes, SMEM layouts, stage counts.
 
-        The fc12 path shares ``mma_tiler_mnk`` and SMEM layouts across phases.
+        The fc12 path shares `mma_tiler_mnk` and SMEM layouts across phases.
         """
         self.dispatch_warp_id = (8, 9, 10, 11)
         num_token_back_warps = 0
@@ -194,7 +194,7 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel(_BaseSm100SwigluMxfp8Fc12Kernel):
 
         # Epilogue is autonomous: it owns all epi-side decisions (overlap,
         # acc stages, subtile dispatch, TMA commit/drain, piggyback red.add).
-        # We pass kernel-level params + ``allow_overlap_acc`` hint and read
+        # We pass kernel-level params + `allow_overlap_acc` hint and read
         # the decisions back via @property below.
         _epi_common = dict(
             mma_tiler_mnk=self.mma_tiler,
@@ -219,7 +219,7 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel(_BaseSm100SwigluMxfp8Fc12Kernel):
         # sD stages locked to subtile_cnt: one full CTA output tile lives in
         # sD at a time.  Per-subtile producer_acquire/commit go
         # away — only one batched commit + drain happens per task tile (in
-        # the epilogue's ``run`` loop body).
+        # the epilogue's `run` loop body).
         self.num_d_stage = 4  # One complete 32-token output tile per epilogue warp.
         # fc1 output (fp8 quantised) SMEM — always present.
         d_bytes_total = self.epilogue.bytes_per_stage * self.num_d_stage
@@ -385,9 +385,9 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel(_BaseSm100SwigluMxfp8Fc12Kernel):
     # ── MegaMoE communication hook stubs ─────────────────────────────────────
     #
     # No-op base implementations for the lean fc1+fc2 path.  Mirroring the
-    # identically-named stubs in the NVFP4 base (``kernel_fc12.py``).
-    # ``Sm100NemotronMegaMoEMxfp8Kernel`` (megamoe_kernel_mxfp8.py) overrides all of
-    # them to delegate to ``src/token_comm.py``.
+    # identically-named stubs in the NVFP4 base (`kernel_fc12.py`).
+    # `Sm100NemotronMegaMoEMxfp8Kernel` (megamoe_kernel_mxfp8.py) overrides all of
+    # them to delegate to `src/token_comm.py`.
 
     def token_comm_extra_smem_storage_class(self) -> type:
         return self.token_comm.extra_smem_storage_class()
@@ -473,9 +473,9 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel(_BaseSm100SwigluMxfp8Fc12Kernel):
         # ── Optional dynamic load-balance counter ────────────────────────
         load_balance_counter: Optional[cute.Tensor] = None,
         # ── Sizes-mode per-expert token count (MegaMoE path) ─────────────
-        # Exactly one of ``offs`` / ``expert_token_sizes`` must be non-None.
-        # MegaMoE subclass passes a zero-copy ``i32 stride=(2,)`` view onto
-        # ``expert_recv_count_sum`` filled by the dispatch warps.
+        # Exactly one of `offs` / `expert_token_sizes` must be non-None.
+        # MegaMoE subclass passes a zero-copy `i32 stride=(2,)` view onto
+        # `expert_recv_count_sum` filled by the dispatch warps.
         expert_token_sizes: Optional[cute.Tensor] = None,
         token_comm_args=None,
         fc1_c: Optional[cute.Tensor] = None,
@@ -619,13 +619,13 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel(_BaseSm100SwigluMxfp8Fc12Kernel):
         )
 
         # fc2 phase B operand = fc1 output reused (no new view needed:
-        # ``fc1_output_gemm`` was built from ``fc1_output.iterator`` with the same
+        # `fc1_output_gemm` was built from `fc1_output.iterator` with the same
         # (tokens_sum, intermediate_downproj, fake-L=1) layout that fc2's
         # GEMM-B view wants; reuse it directly when wiring fc2 TMA-B atom).
 
         # C_gemm (fc2 output, BFloat16; STG.256-driven by the epilogue's
-        # ``Fc2UnpackPermuteStg`` — no TMA store path).
-        # We still build a GEMM-domain view so ``ext.get_gmem_tensor("d", ...)``
+        # `Fc2UnpackPermuteStg` — no TMA store path).
+        # We still build a GEMM-domain view so `ext.get_gmem_tensor("d", ...)`
         # can apply the per-expert offset.  TMA atom is NOT built for fc2_output.
         # MegaMoE passes a 3D (max_tokens, topk, hidden) combine output; the lean
         # path passes 2D (tokens, hidden).  In both cases build a 3D GEMM-domain
@@ -680,16 +680,16 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel(_BaseSm100SwigluMxfp8Fc12Kernel):
         )
 
         expert_cnt = experts
-        # ``intermediate_gateup`` (= fc1_weight.shape[2]) is what we pass to the
-        # scheduler via ``expert_shape``; see ``MoESchedulerParamsBase``
+        # `intermediate_gateup` (= fc1_weight.shape[2]) is what we pass to the
+        # scheduler via `expert_shape`; see `MoESchedulerParamsBase`
         # docstring for the precise contract.
         hidden_dim = hidden
 
         # ── Infer dtypes and major modes ──
         # Phases share dtypes by construction. For MXFP8: A/B/fc1_output
         # are Float8E4M3FN/Float8E5M2 and SFs are Float8E8M0FNU.
-        # ``self.fc1_output_dtype`` drives the sD SMEM element type and flows
-        # into the epilogue ctor as ``fc1_output_dtype``.
+        # `self.fc1_output_dtype` drives the sD SMEM element type and flows
+        # into the epilogue ctor as `fc1_output_dtype`.
         self.a_dtype: Type[cutlass.Numeric] = activation_gemm.element_type
         self.b_dtype: Type[cutlass.Numeric] = fc1_weight_gemm.element_type
         self.fc1_output_dtype: Type[cutlass.Numeric] = fc1_output_gemm.element_type
@@ -777,8 +777,8 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel(_BaseSm100SwigluMxfp8Fc12Kernel):
 
         # TMA store for fc1 MXFP8 output.
         # Per-subtile issue lives in
-        # ``self.epilogue.tma_store_fc1_output``; commit / drain lives
-        # inside the epilogue's ``run`` loop body.
+        # `self.epilogue.tma_store_fc1_output`; commit / drain lives
+        # inside the epilogue's `run` loop body.
         fc1_output_tma_op = cpasync.CopyBulkTensorTileS2GOp()
         tma_atom_fc1_output, tma_tensor_fc1_output = cpasync.make_tiled_tma_atom(
             fc1_output_tma_op,
@@ -852,26 +852,26 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel(_BaseSm100SwigluMxfp8Fc12Kernel):
 
         # ── Scheduler params + grid + launch ──
         #
-        # ``expert_cnt`` / ``intermediate_gateup`` / ``hidden_dim`` are
+        # `expert_cnt` / `intermediate_gateup` / `hidden_dim` are
         # extracted from the (possibly rewritten) tensor shapes above:
-        #   - static path (``static_expert_shape`` bound): they are
+        #   - static path (`static_expert_shape` bound): they are
         #     codegen-time Python int constants; the new base
-        #     ``MoESchedulerParamsBase.__init__`` preserves the Python
-        #     int type and ``__extract_mlir_values__`` skips them, so
+        #     `MoESchedulerParamsBase.__init__` preserves the Python
+        #     int type and `__extract_mlir_values__` skips them, so
         #     they remain inlined literals across the scheduler's scf
         #     region boundaries (no demotion to iter_arg / kernel-arg).
         #   - dynamic path: they are runtime Int32 from tensor metadata.
         #
-        # ``expert_shape[1]`` carries ``intermediate_gateup`` semantics
-        # (= fc1_weight.shape[2]) per the ``MoESchedulerParamsBase.__init__``
+        # `expert_shape[1]` carries `intermediate_gateup` semantics
+        # (= fc1_weight.shape[2]) per the `MoESchedulerParamsBase.__init__`
         # contract.  The fused fc12 scheduler reads it as fc1 GEMM-M
-        # (under swap-AB) and derives ``num_fc1_intermediate_blocks``
+        # (under swap-AB) and derives `num_fc1_intermediate_blocks`
         # from it.
         # atomic_counter mode requires a host-allocated GMEM Int32 scalar
         # whose pointer lives in scheduler params; static mode passes
         # None (params validate this).  Caller's contract from __call__:
-        # ``load_balance_counter`` is required iff ``load_balance_mode ==
-        # 'atomic_counter'``; otherwise may be None.
+        # `load_balance_counter` is required iff `load_balance_mode ==
+        # 'atomic_counter'`; otherwise may be None.
         load_balance_counter_ptr = None
 
         if cutlass.const_expr((offs is None) == (expert_token_sizes is None)):
@@ -1171,10 +1171,10 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel(_BaseSm100SwigluMxfp8Fc12Kernel):
 
         # Issue the first scheduler claim before cluster init wait so the
         # atomic/offsets latency overlaps with pipeline setup.
-        # Under MegaMoE + static load-balance, ``internal_init`` walks
-        # per-expert sizes from ``expert_recv_count_sum`` -- those are not
+        # Under MegaMoE + static load-balance, `internal_init` walks
+        # per-expert sizes from `expert_recv_count_sum` -- those are not
         # valid until the dispatch barrier completes, so we defer init to the
-        # sched warp (after ``token_comm_hook_sched_warp_pre_init_wait``).
+        # sched warp (after `token_comm_hook_sched_warp_pre_init_wait`).
         early_internal_init = (self.load_balance_mode == "atomic_counter") or (
             not self.enable_token_comm
         )
@@ -1217,9 +1217,9 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel(_BaseSm100SwigluMxfp8Fc12Kernel):
         acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
 
         # acc_fake layout: (MMA, MMA_M, MMA_N, STAGE).  Under
-        # ``overlapping_accum`` the two acc buffers share TMEM with SF
+        # `overlapping_accum` the two acc buffers share TMEM with SF
         # columns; we shrink the stage stride so the second buffer
-        # starts at ``(tile_n - num_sf_tmem_cols)`` cols instead of tile_n.
+        # starts at `(tile_n - num_sf_tmem_cols)` cols instead of tile_n.
         acc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, self.num_acc_stage))
         if cutlass.const_expr(self.overlapping_accum):
             acc_fake = cute.make_tensor(
@@ -1240,10 +1240,10 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel(_BaseSm100SwigluMxfp8Fc12Kernel):
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
 
         mma_tiler_k = self.mma_tiler[2]
-        # ``fc1_weight_gemm.shape[1]`` / ``fc2_weight_gemm.shape[1]``
-        # both resolve to ``hidden`` / ``intermediate_downproj``.  Under
-        # ``static_expert_shape`` they are codegen-time Python ints
-        # (rewritten on ``fc1_weight`` / ``fc2_weight`` at ``__call__``
+        # `fc1_weight_gemm.shape[1]` / `fc2_weight_gemm.shape[1]`
+        # both resolve to `hidden` / `intermediate_downproj`.  Under
+        # `static_expert_shape` they are codegen-time Python ints
+        # (rewritten on `fc1_weight` / `fc2_weight` at `__call__`
         # entry); otherwise they are runtime Int32 from tensor metadata.
         # The arithmetic below folds to an immediate in the static path.
         k_tile_cnt_fc1 = (fc1_weight_gemm.shape[1] + mma_tiler_k - 1) // mma_tiler_k
@@ -1800,7 +1800,7 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel(_BaseSm100SwigluMxfp8Fc12Kernel):
                 pipeline.PipelineUserType.Producer, self.num_acc_pipeline_stages
             )
 
-            # K-tile counts ``k_tile_cnt_fc1`` / ``k_tile_cnt_fc2`` come
+            # K-tile counts `k_tile_cnt_fc1` / `k_tile_cnt_fc2` come
             # from the enclosing scope (computed once before the TMA warps).
 
             work_tile_info = sched_consumer.consume_work()
@@ -1904,7 +1904,7 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel(_BaseSm100SwigluMxfp8Fc12Kernel):
         # Epilogue warps (warps 0-3)
         # ════════════════════════════════════════════════════════════════════
         #
-        # Fully delegated to ``self.epilogue.run(...)`` -- the epilogue owns
+        # Fully delegated to `self.epilogue.run(...)` -- the epilogue owns
         # the entire 2-phase task-tile loop.
         if warp_idx < self.mma_warp_id:
             epi_warp_idx = warp_idx

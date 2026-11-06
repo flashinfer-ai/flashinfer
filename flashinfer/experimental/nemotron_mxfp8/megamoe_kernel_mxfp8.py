@@ -10,8 +10,8 @@ epilogue stores preserve separate BF16 contributions for FP32 weighted assembly.
 Workspace layout and dispatch readiness follow the existing MegaMoE protocol.
 """
 
-# NOTE: ``from __future__ import annotations`` is intentionally NOT used here
-# (PEP 563 string-ifies class-body annotations, which breaks ``@cute.struct``
+# NOTE: `from __future__ import annotations` is intentionally NOT used here
+# (PEP 563 string-ifies class-body annotations, which breaks `@cute.struct`
 # element-type introspection).  See moe_nvfp4_swapab/megamoe_kernel.py.
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -141,11 +141,11 @@ class Sm100NemotronMegaMoEMxfp8Kernel(Sm100ClampedRelu2Mxfp8Fc12Kernel):
     def _dispatch_smem_bytes(self) -> int:
         """SMEM for dispatch pull mbarriers, expert scratch, and token buffer.
 
-        Must match ``TokenInPullTokenBackPush.extra_smem_storage_class``:
-        ``pull_mbar[Int64, 4] + smem_expert_count[Int32, num_total_experts]
-        + pull_buffer[Uint8, 4 * hidden_bytes]``.
-        Standalone token-back adds ``tb_pull_mbar[Int64, 4]`` and
-        ``tb_pull_buffer[Uint8, 4 * tb_chunk_bytes]``.
+        Must match `TokenInPullTokenBackPush.extra_smem_storage_class`:
+        `pull_mbar[Int64, 4] + smem_expert_count[Int32, num_total_experts]
+        + pull_buffer[Uint8, 4 * hidden_bytes]`.
+        Standalone token-back adds `tb_pull_mbar[Int64, 4]` and
+        `tb_pull_buffer[Uint8, 4 * tb_chunk_bytes]`.
         """
         pull_mbar_bytes = _DispatchWarpCount * 8
         expert_count_bytes = self.num_total_experts * 4
@@ -355,7 +355,7 @@ class Sm100NemotronMegaMoEMxfp8Kernel(Sm100ClampedRelu2Mxfp8Fc12Kernel):
     # =========================================================================
 
     def get_workspace_sizes(self) -> Tuple[int, int]:
-        """Return ``(local_ws_bytes, shared_ws_bytes)``."""
+        """Return `(local_ws_bytes, shared_ws_bytes)`."""
         return self._local_total, self._shared_total
 
     # =========================================================================
@@ -371,7 +371,7 @@ class Sm100NemotronMegaMoEMxfp8Kernel(Sm100ClampedRelu2Mxfp8Fc12Kernel):
         stride: Optional[Tuple[int, ...]],
         assumed_align: int,
     ) -> cute.Tensor:
-        """Build a typed cute view at ``byte_offset`` of the opaque workspace."""
+        """Build a typed cute view at `byte_offset` of the opaque workspace."""
         byte_ptr = byte_workspace.iterator + Int64(byte_offset)
         typed_iter = cute.make_ptr(
             cute_dtype,
@@ -470,7 +470,7 @@ class Sm100NemotronMegaMoEMxfp8Kernel(Sm100ClampedRelu2Mxfp8Fc12Kernel):
         # Opaque workspaces.
         local_workspace: cute.Tensor,  # (local_ws_bytes,) Uint8
         shared_workspace: cute.Tensor,  # (shared_ws_bytes,) Uint8
-        # Runtime host payload; packed into ``SymBuffer{world_size}``.
+        # Runtime host payload; packed into `SymBuffer{world_size}`.
         peer_rank_ptr_mapper_host,
         # Codegen / runtime.
         max_active_clusters: cutlass.Constexpr,
@@ -571,7 +571,7 @@ class Sm100NemotronMegaMoEMxfp8Kernel(Sm100ClampedRelu2Mxfp8Fc12Kernel):
             "nvlink_barrier_signal",
         )
 
-        # i32 stride=(2,) view onto the i64 ``expert_recv_count_sum`` buffer --
+        # i32 stride=(2,) view onto the i64 `expert_recv_count_sum` buffer --
         # low32 bits hold per-expert total token count after _dispatch_barrier;
         # zero-copy alias for sizes-mode scheduling.
         expert_token_sizes = self._view_shared(

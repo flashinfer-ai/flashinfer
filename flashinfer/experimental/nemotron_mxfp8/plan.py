@@ -250,7 +250,7 @@ class LocalExpertPlan:
         )
 
     def run(self, hidden_states, expert_ids, routing_weights, *, out):
-        """Enqueue the complete local path on the current stream, returning ``out``.
+        """Enqueue the complete local path on the current stream, returning `out`.
 
         Inputs have exactly the prepared bucket capacity. Use ID -1 for padding;
         other global IDs must be in [0, 512). Output is contiguous FP32 [T, 768].

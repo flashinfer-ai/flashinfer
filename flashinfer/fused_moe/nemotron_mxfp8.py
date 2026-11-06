@@ -31,13 +31,13 @@ def prepare_nemotron_mxfp8_local_experts(
     """Compile and allocate a native fixed-bucket Nemotron local-expert plan.
 
     The plan owns fused staging, FC1/activation/FC2, lookup scheduling, detached
-    cleanup and FP32 weighted assembly. ``run(x, ids, probs, out=partial)`` writes
+    cleanup and FP32 weighted assembly. `run(x, ids, probs, out=partial)` writes
     directly into the caller's NVLS buffer, on the caller's current stream.
     No distributed initialization or collective is performed by this API.
 
     Targets SM103, hidden 768, intermediate 4096, top-k 10, 128 local experts.
-    ``max_tokens`` is the gathered bucket capacity, not the rank-local capacity.
-    ``local_expert_offset`` is 0/128/256/384. Hardware tanh is part of the winning
+    `max_tokens` is the gathered bucket capacity, not the rank-local capacity.
+    `local_expert_offset` is 0/128/256/384. Hardware tanh is part of the winning
     configuration; False is provided only for numerical attribution controls.
     Experimental numerical and end-to-end performance qualification is pending.
     """

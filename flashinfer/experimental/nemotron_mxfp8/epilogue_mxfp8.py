@@ -138,11 +138,11 @@ class GluMxfp8Epilogue(_BaseGluMxfp8Epilogue):
 
         Owns the per-warp lane offset, per-stage col offset (overlap-acc
         phase aware), and per-subtile col offset arithmetic.  Returned
-        tensor is what ``_run_fc{1,2}_subtile`` and
-        ``_TmemTranspose16x32Core.load_subtile_raw_acc`` consume.
+        tensor is what `_run_fc{1,2}_subtile` and
+        `_TmemTranspose16x32Core.load_subtile_raw_acc` consume.
 
-        ``cute.assume(divby=16)`` is applied here once -- callees can
-        derive ``+32`` first/second-half ptrs from the returned tensor's
+        `cute.assume(divby=16)` is applied here once -- callees can
+        derive `+32` first/second-half ptrs from the returned tensor's
         iterator without re-asserting alignment (16-aligned base + 32 is
         still 16-aligned).
         """
@@ -610,12 +610,12 @@ class GluMxfp8Epilogue(_BaseGluMxfp8Epilogue):
         """
         Run the full fc1+fc2-fused epilogue task-tile loop.
 
-        ``token_comm_args`` (MegaMoE path) is forwarded to the fc2 task tile so
+        `token_comm_args` (MegaMoE path) is forwarded to the fc2 task tile so
         the fc2 STG is routed to the source rank's combine output.
         """
-        # Trace-time contract: ``smem_fc1_output_buffer=None`` is legal only
+        # Trace-time contract: `smem_fc1_output_buffer=None` is legal only
         # for the direct-STG fc1 path — every dereference below sits behind a
-        # ``const_expr(use_stg_fc1)`` gate keyed on the same flag, so the TMA
+        # `const_expr(use_stg_fc1)` gate keyed on the same flag, so the TMA
         # branches are never traced when the buffer is absent.  A new,
         # ungated use would only fail in the use_stg_fc1=True compile; this
         # assert pins the failure to the entry point instead.
