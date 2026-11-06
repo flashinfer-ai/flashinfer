@@ -130,8 +130,9 @@ from typing import Any
 
 import tvm_ffi
 
-from ..cake_kda_det_train import cake_jit
-from . import cake_build, cake_kcp_plan
+from . import _single_rank, cake_build, cake_kcp_plan
+
+cake_jit = _single_rank.module("cake_jit")
 
 # One verified build per architecture: B200 (``sm_100a``), B300 / GB300
 # (``sm_103a``) and R200 (``sm_107a``); the chunk stages' architectures.

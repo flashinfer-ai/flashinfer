@@ -313,8 +313,10 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from ..cake_kda_det_train import cake_backend, cake_jit
-from . import cake_kcp_plan
+from . import _single_rank, cake_kcp_plan
+
+cake_backend = _single_rank.module("cake_backend")
+cake_jit = _single_rank.module("cake_jit")
 
 D = cake_backend.D  # head dimension (128)
 BT = cake_backend.BT  # tokens per chunk (64)

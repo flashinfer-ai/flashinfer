@@ -464,6 +464,8 @@ The files of this package:
   tables and collectives, with the byte queries.
 * `cake_kcp.py` -- the per-rank launch sequences, the saved set and workspace
   of a rank, the autograd `Function` and the three entry points.
+* `_single_rank.py` -- the name of the single-rank package this package
+  requires (see "Vendoring") and the import of its modules.
 * `build.test.json` -- a `cake-build/1` manifest of the same form as
   `build.json` holding the test-only programs of `cake_kcp_jit.TEST_MODULES`
   (the TF32 hi/lo transfer walk, its static `precision_mode` 1 and 2 forms,
@@ -483,6 +485,16 @@ The files of this package:
   of the two chunk stages (`kcp_fwd_o`, `kcp_dav`), rendered like the
   single-rank ones (digests in `build.json` and `build.test.json`).
 
+## Vendoring
+
+This package needs its single-rank sibling `cake_kda_det_train`: it runs that
+package's chunk stages and reads its registry.  `build.json` and
+`build.test.json` declare it as `common.requires.packages:
+["cake_kda_det_train"]` (directory names).  `_single_rank.py` finds the
+sibling by name from this package's parent, so vendor the two directories
+together, either as siblings under one parent package or both as top-level
+packages.  Importing them needs no `flashinfer`.
+
 ## Status
 
 The registry holds sixteen shipped programs (`cake_kcp_jit.MODULES`, in
@@ -492,7 +504,9 @@ The registry holds sixteen shipped programs (`cake_kcp_jit.MODULES`, in
 Tests: `tests/experimental/test_cake_kda_det_train_kcp_build.py` (the KCP
 registries and manifests, no device needed),
 `tests/experimental/test_cake_kda_det_train_kcp.py` (the per-rank path),
-`tests/experimental/test_cake_kda_det_train_kcp_dist.py` (multi-GPU rows) and
+`tests/experimental/test_cake_kda_det_train_kcp_dist.py` (multi-GPU rows),
+`tests/experimental/test_cake_kda_det_train_kcp_standalone.py` (the two
+vendored layouts without `flashinfer`) and
 `tests/experimental/test_cake_kda_det_train_kcp_api.py` (the public entry
 points and the previous names); benchmark
 `benchmarks/bench_cake_kda_det_train_kcp.py` (`torchrun`, one process per
