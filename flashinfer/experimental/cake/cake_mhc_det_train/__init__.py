@@ -13,42 +13,13 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Non-deterministic backend of the Cake four-stream mHC training forward /
-backward (hidden sizes 4096, 5120 and 7168 per call, from ``X``; 4 streams;
-SM100 / SM103, and hidden 4096 on SM107), one self-contained
-package (host API bodies, the ``cake_jit`` registry, the ``cake_build`` loader
-and the generated CUDA sources under ``csrc/``).  It imports nothing from other
-flashinfer packages and ships its own copy of every program it launches.  The
-dispatching entry points (``deterministic=True`` -> the deterministic package
-``flashinfer.cake_mhc_det_train``) and the user-facing documentation live in
-:mod:`flashinfer.experimental.cake.cake_mhc_train`.
-
-Numerical contract against the deterministic package: the forward, the
-statistics replay, the residual mixing and ``backward_prepare`` run copies of
-the deterministic programs (the same bits).  ``backward_finish`` runs the
-deterministic token-owner pass, the atomic fn split (beside the token-owner
-pass, as its programmatic dependent) and the atomic column slab (see
-:mod:`.cake_jit`; its dynamic-schedule form, or at the token counts and devices
-the host rule picks, the two-size tail schedule over other chunk sizes): the
-column slab adds the ``dfn`` sum of every (column slab, token chunk) unit into
-``dfn`` with FP32 reductions, so only the summation order of ``dfn`` varies
-from run to run (each element within ``P <= 32`` FP32 roundings of the
-fixed-order sum of its per-chunk partials; the FP32 reduction flushes
-subnormal addends and results to zero).  ``dX``, ``dscale`` and ``dbase`` are
-the deterministic package's bits.  There is no final reduction kernel, and the
-backward workspace has no per-chunk ``dfn`` partial region.
-
-Numerical-mode keyword: every compute and workspace entry point takes
-``deterministic: bool = True`` and raises ``ValueError`` unless it is
-``False``: this package has no deterministic backward, so a call must opt in
-(the facade routes ``deterministic=True`` to the deterministic package).  With
-``torch.use_deterministic_algorithms(True)`` the paths that launch the
-unordered reduction -- :func:`cake_mhc_train_backward_finish` and the backward
-of the prepare node (:func:`cake_mhc_train_prepare`) -- raise PyTorch's alert
-for an operation without a deterministic implementation (a ``RuntimeError``,
-or a ``UserWarning`` under ``warn_only=True``) right before that launch, after
-their operands pass and only for ``T > 0``, and never fall back.  The forward,
-statistics, ``backward_prepare`` and workspace entry points do not alert.
+Backend of :mod:`flashinfer.cake_mhc_det_train`: Cake four-stream mHC training
+forward / backward (hidden sizes 4096, 5120 and 7168 per call, from ``X``;
+4 streams; SM100 / SM103, and hidden 4096 on SM107) as one
+self-contained package (host API bodies, the ``cake_jit`` loader and the
+generated CUDA sources under ``csrc/``).  The stable, ``@flashinfer_api``-decorated
+entry points and the full user-facing documentation live in
+:mod:`flashinfer.cake_mhc_det_train`; import that module.
 """
 
 from __future__ import annotations
@@ -56,7 +27,6 @@ from __future__ import annotations
 import functools
 import math
 import operator
-import warnings
 import weakref
 from typing import Any, Optional
 
@@ -71,6 +41,8 @@ from .cake_jit import (
     HIDDEN,
     HIDDEN_SIZES,
     MAPPING_ROWS,
+    N_PAD,
+    PIECES,
     RMS_EPS,
     SINKHORN_ITERS,
     SINKHORN_ITERS_MAX,
@@ -78,11 +50,11 @@ from .cake_jit import (
     STREAMS,
     arch_for_capability,
     route_applies,
-    route_key,
-    route_modules,
     selected_modules,
     supported_hidden_sizes,
 )
+from .cake_jit import route_key as cake_mhc_det_train_route_key
+from .cake_jit import route_modules as cake_mhc_det_train_route_modules
 
 SUPPORTED_COMPUTE_CAPABILITIES: tuple[tuple[int, int], ...] = tuple(
     sorted(ARCH_BY_CAPABILITY)
@@ -115,54 +87,6 @@ _TORCH_DTYPES = {
 }
 
 
-def _require_nondeterministic(deterministic: Any, entry: str) -> None:
-    """The mode contract of every entry point: the package computes non-deterministically, so an entry point takes
-    ``deterministic=False`` and raises ``ValueError`` for any other value (the deterministic package is
-    ``flashinfer.cake_mhc_det_train``)."""
-
-    if deterministic is not False:
-        raise ValueError(
-            f"{entry} computes non-deterministically and takes deterministic=False (got "
-            f"{deterministic!r}); flashinfer.cake_mhc_det_train is the deterministic package"
-        )
-
-
-def _require_hidden(hidden: Any, entry: str) -> None:
-    """The hidden-size contract of the workspace entry points, checked before any device query: a ``hidden``
-    keyword that is not an ``int`` of :data:`cake_jit.HIDDEN_SIZES` raises ``ValueError``.  The sizes of the
-    device's architecture (``supported_hidden_sizes``) are checked with the device (:func:`_workspace_bytes`)."""
-
-    if type(hidden) is not int or hidden not in HIDDEN_SIZES:
-        raise ValueError(
-            f"{entry}(deterministic=False) supports hidden sizes {HIDDEN_SIZES} (got {hidden!r}); "
-            "each architecture's sizes are cake_jit.supported_hidden_sizes(arch)"
-        )
-
-
-def _alert_nondeterministic(entry: str) -> None:
-    """PyTorch's alert for an operation without a deterministic implementation, raised by ``entry`` before it
-    launches the unordered reduction while PyTorch's deterministic algorithms are enabled: a ``RuntimeError``, or a
-    ``UserWarning`` under ``torch.use_deterministic_algorithms(True, warn_only=True)`` (the alert of PyTorch's own
-    operators; PyTorch exposes no public Python entry for it).  Fixed-order launches do not alert."""
-
-    if not torch.are_deterministic_algorithms_enabled():
-        return
-    if torch.is_deterministic_algorithms_warn_only_enabled():
-        warnings.warn(
-            f"{entry} does not have a deterministic implementation, but you set "
-            "'torch.use_deterministic_algorithms(True, warn_only=True)'; "
-            "flashinfer.cake_mhc_det_train is the deterministic package",
-            stacklevel=3,
-        )
-        return
-    raise RuntimeError(
-        f"{entry} does not have a deterministic implementation, but you set "
-        "'torch.use_deterministic_algorithms(True)'; flashinfer.cake_mhc_det_train is "
-        "the deterministic package, or use the 'warn_only=True' option if that is acceptable for your "
-        "application"
-    )
-
-
 def _device_index(device: torch.device) -> int:
     return device.index if device.index is not None else torch.cuda.current_device()
 
@@ -188,7 +112,7 @@ def _device_arch(device: torch.device) -> str:
     return arch
 
 
-def is_cake_mhc_train_supported(
+def is_cake_mhc_det_train_supported(
     device: torch.device, hidden: Optional[int] = None
 ) -> bool:
     """Whether ``device`` (and optionally ``hidden``) has every exported route."""
@@ -384,7 +308,7 @@ def _check_route(device: torch.device, arch: str, kind: str, hidden: int) -> Non
         kind=kind,
     ):
         raise ValueError(
-            f"no exported Cake mHC training route {route_key(hidden, kind)!r} on {arch}; "
+            f"no exported Cake mHC training route {cake_mhc_det_train_route_key(hidden, kind)!r} on {arch}; "
             f"supported hidden sizes: {supported_hidden_sizes(arch)}"
         )
     _ROUTES_CHECKED.add((arch, kind, hidden))
@@ -427,12 +351,8 @@ def _workspace_bytes(
     )
 
 
-def cake_mhc_train_forward_workspace_bytes(
-    T: int,
-    device: torch.device,
-    *,
-    hidden: int = HIDDEN,
-    deterministic: bool = True,
+def cake_mhc_det_train_forward_workspace_bytes(
+    T: int, device: torch.device, *, hidden: int = HIDDEN
 ) -> int:
     """Bytes of the caller-owned forward workspace for up to ``T`` tokens of hidden
     size ``hidden`` on ``device``.
@@ -440,14 +360,12 @@ def cake_mhc_train_forward_workspace_bytes(
     The forward routes (``forward_prepare`` and the ``forward_stats`` replay) hold
     one 256-byte ticket region (first, at the same offset for every token count),
     the BF16 pieces of ``fn`` in the mapping operand layout and the FP32
-    per-K-unit partials of the mapping pass: the deterministic package's forward
-    workspace, byte for byte.  The size is the maximum over every token count up
-    to ``T``, so a buffer sized for the largest token count serves every smaller
-    one (and CUDA Graph replays at a smaller ``T``).  The ticket words must be
-    zero on first use (allocate with ``torch.zeros`` or
-    :func:`cake_mhc_train_forward_workspace`); the kernels leave them zero.
-    ``T == 0`` needs no workspace (nothing is launched).  ``deterministic`` must
-    be ``False``.
+    per-K-unit partials of the mapping pass.  The size is the maximum over every
+    token count up to ``T``, so a buffer sized for the largest token count
+    serves every smaller one (and CUDA Graph replays at a smaller ``T``).  The
+    ticket words must be zero on first use (allocate with ``torch.zeros`` or
+    :func:`cake_mhc_det_train_forward_workspace`); the kernels leave them zero.
+    ``T == 0`` needs no workspace (nothing is launched).
 
     ``hidden`` (keyword, default ``4096``) is the hidden size ``H`` of the calls
     the buffer serves (``X.shape[2]``; a size of ``supported_hidden_sizes`` of
@@ -457,17 +375,11 @@ def cake_mhc_train_forward_workspace_bytes(
     by a call of a larger ``H`` it is too small for.
     """
 
-    _require_nondeterministic(deterministic, "cake_mhc_train_forward_workspace_bytes")
-    _require_hidden(hidden, "cake_mhc_train_forward_workspace_bytes")
     return _workspace_bytes("fwd", T, device, hidden)
 
 
-def cake_mhc_train_backward_workspace_bytes(
-    T: int,
-    device: torch.device,
-    *,
-    hidden: int = HIDDEN,
-    deterministic: bool = True,
+def cake_mhc_det_train_backward_workspace_bytes(
+    T: int, device: torch.device, *, hidden: int = HIDDEN
 ) -> int:
     """Bytes of the caller-owned backward workspace for up to ``T`` tokens of hidden
     size ``hidden`` on ``device``.
@@ -475,55 +387,38 @@ def cake_mhc_train_backward_workspace_bytes(
     The ``backward_finish`` route holds one 256-byte ticket region (first, at
     the same offset for every token count), the transposed BF16 pieces of
     ``fn``, the per-token records of the token-owner pass (``dz'`` pieces and the
-    per-token scalars, padded to a multiple of 128 rows) and the per-CTA
-    parameter partials: the deterministic package's backward regions at the same
-    offsets without its per-chunk FP32 ``dfn`` partials (``P x 24 x 4H x 4``
-    bytes, ``P <= 32``), so a deterministic backward workspace of the same ``H``
-    also serves this package.  The size is the maximum over every token count up
-    to ``T``; ``hidden`` is the hidden size of the calls the buffer serves, as in
-    :func:`cake_mhc_train_forward_workspace_bytes` (a buffer sized for one ``H``
+    per-token scalars, padded to a multiple of 128 rows), the per-CTA parameter
+    partials and the per-chunk FP32 partials of ``dfn``.  The size is the
+    maximum over every token count up to ``T``; ``hidden`` is the hidden size
+    of the calls the buffer serves, as in
+    :func:`cake_mhc_det_train_forward_workspace_bytes` (a buffer sized for one ``H``
     is refused by a call of a larger ``H`` it is too small for).
-    ``deterministic`` must be ``False``.
     """
 
-    _require_nondeterministic(deterministic, "cake_mhc_train_backward_workspace_bytes")
-    _require_hidden(hidden, "cake_mhc_train_backward_workspace_bytes")
     return _workspace_bytes("bwd", T, device, hidden)
 
 
-def cake_mhc_train_forward_workspace(
-    T: int,
-    device: torch.device,
-    *,
-    hidden: int = HIDDEN,
-    deterministic: bool = True,
+def cake_mhc_det_train_forward_workspace(
+    T: int, device: torch.device, *, hidden: int = HIDDEN
 ) -> torch.Tensor:
     """Allocate a zero-initialized forward workspace for up to ``T`` tokens of hidden
     size ``hidden`` (see ``..._forward_workspace_bytes``)."""
 
-    _require_nondeterministic(deterministic, "cake_mhc_train_forward_workspace")
-    _require_hidden(hidden, "cake_mhc_train_forward_workspace")
-    nbytes = _workspace_bytes("fwd", T, device, hidden)
+    nbytes = cake_mhc_det_train_forward_workspace_bytes(T, device, hidden=hidden)
     return torch.zeros(nbytes, dtype=torch.uint8, device=torch.device(device))
 
 
-def cake_mhc_train_backward_workspace(
-    T: int,
-    device: torch.device,
-    *,
-    hidden: int = HIDDEN,
-    deterministic: bool = True,
+def cake_mhc_det_train_backward_workspace(
+    T: int, device: torch.device, *, hidden: int = HIDDEN
 ) -> torch.Tensor:
     """Allocate a zero-initialized backward workspace for up to ``T`` tokens of hidden
     size ``hidden`` (see ``..._backward_workspace_bytes``)."""
 
-    _require_nondeterministic(deterministic, "cake_mhc_train_backward_workspace")
-    _require_hidden(hidden, "cake_mhc_train_backward_workspace")
-    nbytes = _workspace_bytes("bwd", T, device, hidden)
+    nbytes = cake_mhc_det_train_backward_workspace_bytes(T, device, hidden=hidden)
     return torch.zeros(nbytes, dtype=torch.uint8, device=torch.device(device))
 
 
-def cake_mhc_train_reset_workspace(workspace: torch.Tensor) -> None:
+def cake_mhc_det_train_reset_workspace(workspace: torch.Tensor) -> None:
     """Return a workspace to its first-use state after an interrupted launch.
 
     The kernels' unit tickets self-reset at the end of every launch; a launch
@@ -608,13 +503,13 @@ def _workspace_views(
     total = layout["total_bytes"]
     if workspace.numel() < total:
         helper = (
-            "cake_mhc_train_forward_workspace_bytes"
+            "cake_mhc_det_train_forward_workspace_bytes"
             if kind == "fwd"
-            else "cake_mhc_train_backward_workspace_bytes"
+            else "cake_mhc_det_train_backward_workspace_bytes"
         )
         raise ValueError(
             f"workspace holds {workspace.numel()} bytes; T={rows} at hidden={hidden} "
-            f"needs {total} ({helper}(T, device, hidden={hidden}, deterministic=False))"
+            f"needs {total} ({helper}(T, device, hidden={hidden}))"
         )
     base = workspace[:total]  # a multiple of 256 bytes: every typed view divides it
     typed: dict[torch.dtype, torch.Tensor] = {}
@@ -633,10 +528,7 @@ def _workspace_views(
 # per (device, kind, hidden size, power-of-two token bucket), allocated on first
 # use, so a caller that passes no workspace allocates at most log2(T_max)
 # buffers per device and hidden size while the caller-held path never
-# allocates.  Every stream and every graph replay on the device shares a
-# bucket's buffer: calls that can run concurrently on different streams pass
-# caller-owned workspaces.  No buffer is created during a CUDA graph capture
-# (its zero fill would only be recorded).
+# allocates.
 _DEFAULT_WORKSPACES: dict[tuple[int, str, int, int], torch.Tensor] = {}
 
 
@@ -647,17 +539,6 @@ def _default_workspace(
     key = (_device_index(device), kind, hidden, bucket)
     found = _DEFAULT_WORKSPACES.get(key)
     if found is None:
-        # The fill runs on the current stream of ``device`` (the stream the
-        # call launches on), which need not be the current device's stream.
-        with torch.cuda.device(key[0]):
-            capturing = torch.cuda.is_current_stream_capturing()
-        if capturing:
-            raise ValueError(
-                f"no default {kind} workspace exists for T={rows} at hidden={hidden} (token-count bucket "
-                f"{bucket}) and none can be allocated during a CUDA graph capture: run the call once with "
-                "deterministic=False and the same token count and hidden size before the capture, or pass a "
-                "caller-owned workspace"
-            )
         found = torch.zeros(
             _workspace_bytes(kind, bucket, device, hidden),
             dtype=torch.uint8,
@@ -828,7 +709,7 @@ class _Launch:
         self.run, self.template, self.slots = run, template, slots
 
 
-_PLANS: dict[tuple[str, str, int, int, int, str, bool], tuple[_Launch, ...]] = {}
+_PLANS: dict[tuple[str, str, int, int, int, str, bool, bool], tuple[_Launch, ...]] = {}
 
 
 def _route_plan(
@@ -839,23 +720,25 @@ def _route_plan(
     device_index: int,
     path: str,
     sinkhorn_iters: int = SINKHORN_ITERS,
+    carry: bool = False,
 ) -> tuple[_Launch, ...]:
     """The launches of one route for ``rows`` tokens of hidden size ``hidden`` on
-    ``device_index`` along ``path`` (one of ``cake_jit.PDL_PATHS``: with the
-    device's SM count it fixes the per-call PDL argument of the records whose
-    binding takes one, :func:`cake_jit.enable_pdl`).  A ``sinkhorn_iters`` other
-    than the count of record selects the run-time-count records; the count
-    itself is a launch value, so one plan serves every such count.  A route that
-    exports no run-time-count program raises ``NotImplementedError`` for such a
-    count (``cake_jit.selected_modules``)."""
+    ``device_index`` along ``path`` (one of ``cake_jit.PDL_PATHS``: it fixes the
+    per-call PDL argument of the records whose binding takes one,
+    :func:`cake_jit.enable_pdl`).  A ``sinkhorn_iters`` other than the count of
+    record selects the run-time-count records; the count itself is a launch
+    value, so one plan serves every such count.  A route that exports no
+    run-time-count program raises ``NotImplementedError`` for such a count
+    (``cake_jit.selected_modules``).  ``carry`` names the launches of the
+    checkpoint carry instead (``cake_jit.carried_modules``)."""
 
     run_time = int(sinkhorn_iters) != SINKHORN_ITERS
-    key = (arch, kind, rows, hidden, device_index, path, run_time)
+    key = (arch, kind, rows, hidden, device_index, path, run_time, carry)
     plan = _PLANS.get(key)
     if plan is None:
         launches = []
         sm_count = _loader.sm_count(device_index)
-        for name in selected_modules(
+        for name in (_loader.carried_modules if carry else selected_modules)(
             arch,
             hidden,
             kind,
@@ -877,9 +760,7 @@ def _route_plan(
                     template.append(grid_values[arg_key])
                     continue
                 if arg_kind == "launch":
-                    template.append(
-                        _loader.enable_pdl(name, rows, arch, path, sm_count=sm_count)
-                    )
+                    template.append(_loader.enable_pdl(name, rows, arch, path))
                     continue
                 logical_name = logical[arg_key]
                 if logical_name in fixed:
@@ -912,8 +793,7 @@ def _current_stream(device_index: int) -> int:
 # The per-call logical values of each route, in the order a call passes them to
 # :func:`_launch_route`, then the workspace regions (fetched from the views with
 # ``_WORKSPACE_VALUES``); the token count and the host-plan scalars of a route
-# (and the column slab's ``lpt`` chunks of ``cake_jit.slab_plan``) are fixed per
-# token count (``_HOST_VALUES``) and bound into the plan.
+# are fixed per token count (``_HOST_VALUES``) and bound into the plan.
 _CALL_VALUES: dict[str, tuple[str, ...]] = {
     "fwd_prepare": (
         "fn",
@@ -957,10 +837,9 @@ _CALL_VALUES: dict[str, tuple[str, ...]] = {
     ),
 }
 # Logical workspace values -> region names.  The forward fn split writes the
-# forward operand layout only; its transposed-layout pointer is bound to the
-# same region, exactly like the source launcher binds an unused parameter.  The
-# backward's atomic fn split takes the transposed layout only, and the column
-# slab adds into ``dfn`` itself (no per-chunk partial region).
+# forward operand layout only and the backward one the transposed layout; the
+# other layout's pointer is bound to the same region, exactly like the source
+# launcher binds an unused parameter.
 _FWD_WORKSPACE_VALUES = (
     ("fnp", "fnp"),
     ("fnTp", "fnp"),
@@ -975,10 +854,12 @@ _WORKSPACE_VALUES: dict[str, tuple[tuple[str, str], ...]] = {
     "bwd_prepare": (),
     "bwd_finish": (
         ("fnTp", "fnTp"),
+        ("fnp", "fnTp"),
         ("dzp", "dzp"),
         ("tokp", "tokp"),
         ("param_partial", "param_partial"),
         ("dzp_rows", "dzp_rows"),
+        ("dfn_part", "dfn_part"),
         ("ticket", "ticket"),
     ),
 }
@@ -993,11 +874,24 @@ _HOST_VALUES: dict[str, tuple[str, ...]] = {
         "parts",
         "rows_per_chunk",
         "chunks",
-        "lpt_parts",
-        "lpt_rows_per_chunk",
-        "lpt_big_parts",
-        "lpt_small_rows_per_chunk",
+        "groups",
     ),
+}
+# The checkpoint carry (``cake_jit.FN_SPLIT_CARRY``): the replay's dual-layout fn
+# split writes the transposed layout into a caller buffer, the call value ``fnTp``,
+# and the backward's route without its fn split reads that buffer instead of the
+# workspace region.
+_CARRY_CALL_VALUES: dict[str, tuple[str, ...]] = {
+    "fwd_recompute": _CALL_VALUES["fwd_recompute"] + ("fnTp",),
+    "bwd_finish": _CALL_VALUES["bwd_finish"] + ("fnTp",),
+}
+_CARRY_WORKSPACE_VALUES: dict[str, tuple[tuple[str, str], ...]] = {
+    kind: tuple(
+        (name, region)
+        for name, region in _WORKSPACE_VALUES[kind]
+        if name not in ("fnTp", "fnp") or (kind == "fwd_recompute" and name == "fnp")
+    )
+    for kind in _CARRY_CALL_VALUES
 }
 
 
@@ -1020,16 +914,22 @@ class _FastRoute:
         self.workspace, self.x_flat = workspace, x_flat
 
 
-_FAST_ROUTES: dict[tuple[str, int, int, int, str], _FastRoute] = {}
+_FAST_ROUTES: dict[tuple[str, int, int, int, str, bool], _FastRoute] = {}
 
 
 def _fast_route(
-    arch: str, kind: str, rows: int, hidden: int, device_index: int, path: str
+    arch: str,
+    kind: str,
+    rows: int,
+    hidden: int,
+    device_index: int,
+    path: str,
+    carry: bool = False,
 ) -> _FastRoute:
-    key = (kind, hidden, rows, device_index, path)
+    key = (kind, hidden, rows, device_index, path, carry)
     found = _FAST_ROUTES.get(key)
     if found is None:
-        found = _build_fast_route(arch, kind, rows, hidden, device_index, path)
+        found = _build_fast_route(arch, kind, rows, hidden, device_index, path, carry)
         if len(_FAST_ROUTES) >= _CACHE_ENTRIES:
             _FAST_ROUTES.clear()
         _FAST_ROUTES[key] = found
@@ -1037,22 +937,24 @@ def _fast_route(
 
 
 def _build_fast_route(
-    arch: str, kind: str, rows: int, hidden: int, device_index: int, path: str
+    arch: str,
+    kind: str,
+    rows: int,
+    hidden: int,
+    device_index: int,
+    path: str,
+    carry: bool = False,
 ) -> _FastRoute:
-    plan = _route_plan(arch, kind, rows, hidden, device_index, path)
-    workspace_values = _WORKSPACE_VALUES[kind]
-    names = _CALL_VALUES[kind] + tuple(name for name, _ in workspace_values)
+    plan = _route_plan(arch, kind, rows, hidden, device_index, path, carry=carry)
+    workspace_values = (_CARRY_WORKSPACE_VALUES if carry else _WORKSPACE_VALUES)[kind]
+    call_values = (_CARRY_CALL_VALUES if carry else _CALL_VALUES)[kind]
+    names = call_values + tuple(name for name, _ in workspace_values)
     position_of = {name: position for position, name in enumerate(names)}
     host: dict[str, Any] = {"rows": rows}
     if _HOST_VALUES[kind]:
-        sm = _loader.sm_count(device_index)
-        host_plan = _loader.host_plan(rows, sm, arch, hidden=hidden)
-        if kind == "bwd_finish":
-            # the column slab's lpt chunks: slab_plan, read when the plan is built (not part of the cached host plan)
-            host_plan = {
-                **host_plan,
-                **_loader.slab_plan(rows, sm, arch, hidden=hidden),
-            }
+        host_plan = _loader.host_plan(
+            rows, _loader.sm_count(device_index), arch, hidden
+        )
         for name in _HOST_VALUES[kind]:
             host[name] = host_plan[name]
     statics: list[Any] = []
@@ -1072,7 +974,7 @@ def _build_fast_route(
                 statics.append(host[logical_name])
             else:
                 raise ValueError(
-                    f"the {route_key(hidden, kind)!r} route needs the logical value {logical_name!r}"
+                    f"the {cake_mhc_det_train_route_key(hidden, kind)!r} route needs the logical value {logical_name!r}"
                 )
         launches.append((launch.run, _tuple_getter(sources)))
     workspace_getter = (
@@ -1118,9 +1020,12 @@ def _run_route(
     device: torch.device,
     path: str,
     sinkhorn_iters: int = SINKHORN_ITERS,
+    carry: bool = False,
 ) -> None:
     device_index = _device_index(device)
-    plan = _route_plan(arch, kind, rows, hidden, device_index, path, sinkhorn_iters)
+    plan = _route_plan(
+        arch, kind, rows, hidden, device_index, path, sinkhorn_iters, carry=carry
+    )
     stream = _current_stream(device_index)
     with _tvm_ffi().use_raw_stream(_tvm_device(device_index), stream):
         for launch in plan:
@@ -1130,7 +1035,7 @@ def _run_route(
                     args[position] = values[logical_name]
             except KeyError as missing:
                 raise ValueError(
-                    f"the {route_key(hidden, kind)!r} route needs the logical value {missing.args[0]!r}"
+                    f"the {cake_mhc_det_train_route_key(hidden, kind)!r} route needs the logical value {missing.args[0]!r}"
                 ) from None
             launch.run(*args)
 
@@ -1219,10 +1124,7 @@ def _forward_values(
     sinkhorn_iters: int = SINKHORN_ITERS,
 ) -> dict[str, Any]:
     plan = _loader.host_plan(
-        rows,
-        _loader.sm_count(_device_index(device)),
-        _device_arch(device),
-        hidden=hidden,
+        rows, _loader.sm_count(_device_index(device)), _device_arch(device), hidden
     )
     # The fn split writes the forward operand layout only (``want_t = 0`` is the
     # record's own scalar); its transposed-layout pointer is bound to the same
@@ -1250,7 +1152,7 @@ def _forward_values(
     }
 
 
-def cake_mhc_train_forward_prepare(
+def cake_mhc_det_train_forward_prepare(
     X: torch.Tensor,
     fn: torch.Tensor,
     scale: torch.Tensor,
@@ -1262,7 +1164,6 @@ def cake_mhc_train_forward_prepare(
     out: Optional[torch.Tensor] = None,
     stats_out: Optional[torch.Tensor] = None,
     workspace: Optional[torch.Tensor] = None,
-    deterministic: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     r"""Forward mapping, coefficients and collapse: ``U`` and the per-token statistics.
 
@@ -1294,24 +1195,21 @@ def cake_mhc_train_forward_prepare(
     stats_out : torch.Tensor, optional
         Preallocated FP32 ``[T, 64]`` contiguous statistics record.
     workspace : torch.Tensor, optional
-        Caller-owned ``uint8`` buffer from :func:`cake_mhc_train_forward_workspace`
+        Caller-owned ``uint8`` buffer from :func:`cake_mhc_det_train_forward_workspace`
         (sized for this ``H``: ``hidden=X.shape[2]``); a per-device default
         buffer is used when omitted.
-    deterministic : bool
-        Must be ``False`` (``ValueError`` otherwise).
 
     Returns
     -------
     ``(U, stats)``: BF16 ``U[t, d] = BF16(sum_i pre[t, i] X[t, i, d])`` and the
     FP32 ``[T, 64]`` per-token record ``r | z[24] | pre[4] | post[4] | C[16] | pad[15]``
     (256 bytes per token) that ``forward_finish``, ``backward_prepare`` and
-    ``backward_finish`` consume, bitwise the deterministic package's.  No
-    ``[T, 4H]`` or ``[T, 4, H]`` FP32 temporary is produced.
+    ``backward_finish`` consume.  No ``[T, 4H]`` or ``[T, 4, H]`` FP32
+    temporary is produced.
 
     The launches run on the current torch stream of the tensors' device.
     """
 
-    _require_nondeterministic(deterministic, "cake_mhc_train_forward_prepare")
     fast = _fast_forward(
         X, fn, scale, base, rms_eps, hc_eps, sinkhorn_iters, "fwd_prepare"
     )
@@ -1377,7 +1275,7 @@ def cake_mhc_train_forward_prepare(
     return U, stats
 
 
-def cake_mhc_train_forward_stats(
+def cake_mhc_det_train_forward_stats(
     X: torch.Tensor,
     fn: torch.Tensor,
     scale: torch.Tensor,
@@ -1388,35 +1286,64 @@ def cake_mhc_train_forward_stats(
     sinkhorn_iters: int = 20,
     stats_out: Optional[torch.Tensor] = None,
     workspace: Optional[torch.Tensor] = None,
-    deterministic: bool = True,
 ) -> torch.Tensor:
     r"""Recompute the per-token statistics of ``forward_prepare`` (checkpoint replay).
 
     Parameters
     ----------
     X, fn, scale, base : torch.Tensor
-        As in :func:`cake_mhc_train_forward_prepare`.
+        As in :func:`cake_mhc_det_train_forward_prepare`.
     rms_eps, hc_eps, sinkhorn_iters : float, float, int
-        As in :func:`cake_mhc_train_forward_prepare` (the epsilons are launch
+        As in :func:`cake_mhc_det_train_forward_prepare` (the epsilons are launch
         arguments; the iteration count is ``1 .. SINKHORN_ITERS_MAX``, default ``20``).
     stats_out : torch.Tensor, optional
         Preallocated FP32 ``[T, 64]`` contiguous statistics record.
     workspace : torch.Tensor, optional
-        Caller-owned forward workspace (:func:`cake_mhc_train_forward_workspace`).
-    deterministic : bool
-        Must be ``False`` (``ValueError`` otherwise).
+        Caller-owned forward workspace (:func:`cake_mhc_det_train_forward_workspace`).
 
     Returns
     -------
     FP32 ``[T, 64]`` ``stats``, bitwise identical to the record
-    :func:`cake_mhc_train_forward_prepare` returns for the same inputs on the same
+    :func:`cake_mhc_det_train_forward_prepare` returns for the same inputs on the same
     device: the route is the strict prefix of the forward (fn split, mapping
     pass, coefficients) under the same work partition, without the ``U`` write.
 
     The launches run on the current torch stream of the tensors' device.
     """
 
-    _require_nondeterministic(deterministic, "cake_mhc_train_forward_stats")
+    return _forward_stats(
+        X,
+        fn,
+        scale,
+        base,
+        rms_eps=rms_eps,
+        hc_eps=hc_eps,
+        sinkhorn_iters=sinkhorn_iters,
+        stats_out=stats_out,
+        workspace=workspace,
+        fnTp=None,
+    )
+
+
+def _forward_stats(
+    X: torch.Tensor,
+    fn: torch.Tensor,
+    scale: torch.Tensor,
+    base: torch.Tensor,
+    *,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+    stats_out: Optional[torch.Tensor],
+    workspace: Optional[torch.Tensor],
+    fnTp: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """:func:`cake_mhc_det_train_forward_stats`; with ``fnTp`` (a BF16 ``[3, 4H, 32]``
+    buffer of the checkpoint carry, ``cake_jit.FN_SPLIT_CARRY``) the replay's fn split is
+    the dual-layout record, which also writes the transposed layout of the backward into
+    ``fnTp`` (the autograd checkpoint path alone passes it)."""
+
+    carry = fnTp is not None
     fast = _fast_forward(
         X, fn, scale, base, rms_eps, hc_eps, sinkhorn_iters, "fwd_recompute"
     )
@@ -1429,12 +1356,22 @@ def cake_mhc_train_forward_stats(
                 _empty((rows, STATS_COLS), _F32, X) if stats_out is None else stats_out
             )
             route = _fast_route(
-                arch, "fwd_recompute", rows, hidden, index, _PATH_CHECKPOINT
+                arch, "fwd_recompute", rows, hidden, index, _PATH_CHECKPOINT, carry
             )
             views = _fast_workspace(workspace, "fwd", rows, hidden, index, X)
+            fast_values = (
+                fn,
+                X,
+                X.view(route.x_flat),
+                scale,
+                base,
+                stats,
+                rms_eps,
+                hc_eps,
+            )
             _launch_route(
                 route,
-                (fn, X, X.view(route.x_flat), scale, base, stats, rms_eps, hc_eps)
+                (fast_values + (fnTp,) if carry else fast_values)
                 + route.workspace(views),
                 index,
             )
@@ -1467,6 +1404,8 @@ def cake_mhc_train_forward_stats(
         hc_eps=hc_eps,
         sinkhorn_iters=sinkhorn_iters,
     )
+    if carry:
+        values["fnTp"] = fnTp
     _run_route(
         arch,
         "fwd_recompute",
@@ -1476,17 +1415,17 @@ def cake_mhc_train_forward_stats(
         device=device,
         path=_PATH_CHECKPOINT,
         sinkhorn_iters=sinkhorn_iters,
+        carry=carry,
     )
     return stats
 
 
-def cake_mhc_train_forward_finish(
+def cake_mhc_det_train_forward_finish(
     X: torch.Tensor,
     B: torch.Tensor,
     stats: torch.Tensor,
     *,
     out: Optional[torch.Tensor] = None,
-    deterministic: bool = True,
 ) -> torch.Tensor:
     r"""Residual mixing: ``Y[t, j, d] = BF16(post[t, j] B[t, d] + sum_i C[t, i, j] X[t, i, d])``.
 
@@ -1498,12 +1437,10 @@ def cake_mhc_train_forward_finish(
     B : torch.Tensor
         BF16 ``[T, H]`` contiguous output of the external branch applied to ``U``.
     stats : torch.Tensor
-        FP32 ``[T, 64]`` record returned by :func:`cake_mhc_train_forward_prepare`
-        (or :func:`cake_mhc_train_forward_stats`).
+        FP32 ``[T, 64]`` record returned by :func:`cake_mhc_det_train_forward_prepare`
+        (or :func:`cake_mhc_det_train_forward_stats`).
     out : torch.Tensor, optional
         Preallocated BF16 ``[T, 4, H]`` contiguous ``Y``.
-    deterministic : bool
-        Must be ``False`` (``ValueError`` otherwise).
 
     Returns
     -------
@@ -1512,7 +1449,6 @@ def cake_mhc_train_forward_finish(
     The launches run on the current torch stream of the tensors' device.
     """
 
-    _require_nondeterministic(deterministic, "cake_mhc_train_forward_finish")
     fast = _fast_rows(X, "fwd_finish")
     if fast is not None:
         rows, hidden, index, arch = fast
@@ -1556,7 +1492,7 @@ def cake_mhc_train_forward_finish(
     return Y
 
 
-def cake_mhc_train_backward_prepare(
+def cake_mhc_det_train_backward_prepare(
     dY: torch.Tensor,
     B: torch.Tensor,
     X: torch.Tensor,
@@ -1564,7 +1500,6 @@ def cake_mhc_train_backward_prepare(
     *,
     dB: Optional[torch.Tensor] = None,
     grad_stats_out: Optional[torch.Tensor] = None,
-    deterministic: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     r"""Branch-output gradient and the per-token gradient statistics (before the branch backward).
 
@@ -1583,8 +1518,6 @@ def cake_mhc_train_backward_prepare(
         Preallocated BF16 ``[T, H]`` contiguous output.
     grad_stats_out : torch.Tensor, optional
         Preallocated FP32 ``[T, 32]`` contiguous output.
-    deterministic : bool
-        Must be ``False`` (``ValueError`` otherwise).
 
     Returns
     -------
@@ -1596,7 +1529,6 @@ def cake_mhc_train_backward_prepare(
     The launches run on the current torch stream of the tensors' device.
     """
 
-    _require_nondeterministic(deterministic, "cake_mhc_train_backward_prepare")
     return _backward_prepare(
         dY, B, X, stats, dB=dB, grad_stats_out=grad_stats_out, path=_PATH_BACKWARD
     )
@@ -1612,7 +1544,7 @@ def _backward_prepare(
     grad_stats_out: Optional[torch.Tensor],
     path: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """:func:`cake_mhc_train_backward_prepare` along ``path`` (``_PATH_BACKWARD`` from
+    """:func:`cake_mhc_det_train_backward_prepare` along ``path`` (``_PATH_BACKWARD`` from
     saved statistics, ``_PATH_CHECKPOINT`` after the forward prefix was replayed: the
     autograd nodes know which): the path fixes the per-call PDL argument of the
     backward prepare's records (:func:`cake_jit.enable_pdl`)."""
@@ -1681,7 +1613,7 @@ def _backward_prepare(
     return dB, gstats
 
 
-def cake_mhc_train_backward_finish(
+def cake_mhc_det_train_backward_finish(
     X: torch.Tensor,
     dY: torch.Tensor,
     dU: torch.Tensor,
@@ -1701,7 +1633,6 @@ def cake_mhc_train_backward_finish(
     dfn: Optional[torch.Tensor] = None,
     dscale: Optional[torch.Tensor] = None,
     dbase: Optional[torch.Tensor] = None,
-    deterministic: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     r"""Input gradient and parameter gradients (after the branch backward produced ``dU``).
 
@@ -1721,54 +1652,40 @@ def cake_mhc_train_backward_finish(
     fn, scale, base : torch.Tensor
         The parameters of the forward (FP32 ``[24, 4H]``, ``[3]``, ``[24]``).
     stats : torch.Tensor
-        FP32 ``[T, 64]`` record of the forward (saved, or recomputed with
-        :func:`cake_mhc_train_forward_stats`: the same record bit for bit).
+        FP32 ``[T, 64]`` record of the forward (saved or recomputed with
+        :func:`cake_mhc_det_train_forward_stats`; both give bitwise the same gradients).
     grad_stats : torch.Tensor
-        FP32 ``[T, 32]`` record returned by :func:`cake_mhc_train_backward_prepare`.
+        FP32 ``[T, 32]`` record returned by :func:`cake_mhc_det_train_backward_prepare`.
     rms_eps, hc_eps, sinkhorn_iters : float, float, int
-        As in :func:`cake_mhc_train_forward_prepare` (the epsilons are launch
+        As in :func:`cake_mhc_det_train_forward_prepare` (the epsilons are launch
         arguments; the iteration count is ``1 .. SINKHORN_ITERS_MAX``, default ``20``).
     accumulate : bool
-        ``False`` (default): ``dfn``, ``dscale`` and ``dbase`` are written (the
-        fn split zeroes ``dfn`` before the column slab adds into it).
-        ``True``: the caller passes all three; the column slab adds the ``dfn``
-        sums onto its current values with the same FP32 reductions, and
-        ``dscale`` / ``dbase`` add their current value last in the FP64 fold,
-        rounded once (the deterministic package's accumulation, bit for bit).
+        ``False`` (default): ``dfn``, ``dscale`` and ``dbase`` are written.
+        ``True``: the caller passes all three and the fixed-order sums are added
+        to their current values (one read-modify-write per element by its single
+        owner, so four consecutive accumulations are reproducible).
     workspace : torch.Tensor, optional
-        Caller-owned ``uint8`` buffer from :func:`cake_mhc_train_backward_workspace`
-        (sized for this ``H``: ``hidden=X.shape[2]``; or a deterministic
-        backward workspace of that ``H``: the regions sit at the same offsets);
-        a per-device default buffer is used when omitted.
+        Caller-owned ``uint8`` buffer from :func:`cake_mhc_det_train_backward_workspace`
+        (sized for this ``H``: ``hidden=X.shape[2]``); a per-device default
+        buffer is used when omitted.
     dX : torch.Tensor, optional
         Preallocated BF16 ``[T, 4, H]`` contiguous output.
     dfn, dscale, dbase : torch.Tensor, optional
         Preallocated FP32 ``[24, 4H]``, ``[3]``, ``[24]`` contiguous outputs
         (required with ``accumulate=True``).
-    deterministic : bool
-        Must be ``False`` (``ValueError`` otherwise).
 
     Returns
     -------
     ``(dX, dfn, dscale, dbase)``: the BF16 ``dX`` sums the mapping, collapse and
-    residual-mixing contributions in FP32 and rounds once, and ``dscale`` /
-    ``dbase`` are fixed-order FP64 folds rounded once: all three bitwise the
-    deterministic package's.  ``dfn`` adds the per-unit FP32 sums of at most
-    ``P <= 32`` token chunks (the host rule's chunk sizes per token count and
-    device) per element in an order that varies from run to run (each element
-    within ``P`` FP32 roundings of the fixed-order sum of the same chunk
-    partials; the FP32 reduction flushes subnormal addends and results to
-    zero).  With ``T == 0`` nothing is launched: ``dX`` is empty and the
-    parameter gradients are zeroed (``accumulate=False``) or left untouched
-    (``accumulate=True``).
+    residual-mixing contributions in FP32 and rounds once; the FP32 parameter
+    gradients are fixed-order reductions, bitwise reproducible for a given token
+    count on a given device.  With ``T == 0`` nothing is launched: ``dX`` is
+    empty and the parameter gradients are zeroed (``accumulate=False``) or left
+    untouched (``accumulate=True``).
 
-    With ``torch.use_deterministic_algorithms(True)`` the call raises PyTorch's
-    alert for an operation without a deterministic implementation
-    (``RuntimeError``; under ``warn_only=True`` a ``UserWarning``, and the call
-    runs).  The launches run on the current torch stream of the tensors' device.
+    The launches run on the current torch stream of the tensors' device.
     """
 
-    _require_nondeterministic(deterministic, "cake_mhc_train_backward_finish")
     return _backward_finish(
         X,
         dY,
@@ -1789,7 +1706,7 @@ def cake_mhc_train_backward_finish(
         dscale=dscale,
         dbase=dbase,
         path=_PATH_BACKWARD,
-        alert="cake_mhc_train_backward_finish",
+        fnTp=None,
     )
 
 
@@ -1814,15 +1731,16 @@ def _backward_finish(
     dscale: Optional[torch.Tensor],
     dbase: Optional[torch.Tensor],
     path: str,
-    alert: str,
+    fnTp: Optional[torch.Tensor],
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """:func:`cake_mhc_train_backward_finish` along ``path`` (``_PATH_BACKWARD`` from
+    """:func:`cake_mhc_det_train_backward_finish` along ``path`` (``_PATH_BACKWARD`` from
     saved statistics, ``_PATH_CHECKPOINT`` after the forward prefix was replayed: the
     autograd nodes know which): the path fixes the per-call PDL argument of the
-    column-slab record (:func:`cake_jit.enable_pdl`).  ``alert`` names the entry
-    point in PyTorch's deterministic-algorithms alert, raised right before the
-    launches (validated arguments, ``T > 0``): only the column-slab pass's
-    unordered ``dfn`` reduction is non-deterministic."""
+    column-slab and reduction records (:func:`cake_jit.enable_pdl`).  ``fnTp``: the
+    transposed fn split the checkpoint carry's replay wrote (the prepare node's
+    backward passes it); the route then launches no fn split and reads it."""
+
+    carry = fnTp is not None
 
     fast = _fast_forward(
         X, fn, scale, base, rms_eps, hc_eps, sinkhorn_iters, "bwd_finish"
@@ -1850,9 +1768,8 @@ def _backward_finish(
                 dscale = _empty(_SCALE_SHAPE, _F32, X)
             if dbase is None:
                 dbase = _empty(_BASE_SHAPE, _F32, X)
-            route = _fast_route(arch, "bwd_finish", rows, hidden, index, path)
+            route = _fast_route(arch, "bwd_finish", rows, hidden, index, path, carry)
             views = _fast_workspace(workspace, "bwd", rows, hidden, index, X)
-            _alert_nondeterministic(alert)
             _launch_route(
                 route,
                 (
@@ -1872,6 +1789,7 @@ def _backward_finish(
                     dbase,
                     1 if accumulate else 0,
                 )
+                + ((fnTp,) if carry else ())
                 + route.workspace(views),
                 index,
             )
@@ -1913,21 +1831,19 @@ def _backward_finish(
             dbase.zero_()
         return dX, dfn, dscale, dbase
     ws = _workspace_for(workspace, "bwd", rows, hidden, device)
-    _alert_nondeterministic(alert)
-    sm = _loader.sm_count(_device_index(device))
-    plan = _loader.host_plan(rows, sm, arch, hidden=hidden)
-    slab = _loader.slab_plan(rows, sm, arch, hidden=hidden)
-    # The atomic fn split writes the transposed operand layout and, without
-    # accumulate, zeroes dfn.  The column-slab pass (the dynr record over the
-    # one-size chunks or the lpt record over the host rule's two-size chunks,
-    # or their slab-fastest _os copies where bwd_slab_order names "slab")
-    # describes the ``[T, 4, H]`` tensors as ``[T, 4H]``, reads the first
-    # ``T`` rows of the padded ``dz'`` record, draws its work units from the
-    # workspace's self-resetting ticket word, adds into dfn and folds dscale /
-    # dbase.
+    plan = _loader.host_plan(
+        rows, _loader.sm_count(_device_index(device)), _device_arch(device), hidden
+    )
+    # The fn split writes the transposed operand layout only (``want_t = 1`` is
+    # the record's own scalar); its forward-layout pointer is bound to the same
+    # region.  The column-slab pass describes the ``[T, 4, H]`` tensors as
+    # ``[T, 4H]`` and reads the first ``T`` rows of the padded ``dz'`` record;
+    # its dynamic-schedule form draws its work units from the workspace's
+    # self-resetting ticket word.
     values: dict[str, Any] = {
         "fn": fn,
         "fnTp": ws["fnTp"],
+        "fnp": ws["fnTp"],
         "x": X,
         "du": dU,
         "stats": stats,
@@ -1946,19 +1862,19 @@ def _backward_finish(
         "dy_flat": dY.view(rows, STREAMS * hidden),
         "dzp_rows": ws["dzp_rows"],
         "dx_flat": dX.view(rows, STREAMS * hidden),
+        "dfn_part": ws["dfn_part"],
         "ticket": ws["ticket"],
         "parts": plan["parts"],
         "rows_per_chunk": plan["rows_per_chunk"],
-        "lpt_parts": slab["lpt_parts"],
-        "lpt_rows_per_chunk": slab["lpt_rows_per_chunk"],
-        "lpt_big_parts": slab["lpt_big_parts"],
-        "lpt_small_rows_per_chunk": slab["lpt_small_rows_per_chunk"],
         "dfn": dfn,
         "dscale": dscale,
         "dbase": dbase,
         "chunks": plan["chunks"],
+        "groups": plan["groups"],
         "accumulate": 1 if accumulate else 0,
     }
+    if carry:
+        values["fnTp"] = fnTp
     _run_route(
         arch,
         "bwd_finish",
@@ -1968,6 +1884,7 @@ def _backward_finish(
         device=device,
         path=path,
         sinkhorn_iters=sinkhorn_iters,
+        carry=carry,
     )
     return dX, dfn, dscale, dbase
 
@@ -1994,6 +1911,16 @@ class _MHCTrainState:
     state only from a finish node without those edges whose prepare node is
     ``recorded`` (a finish forward rerun by a reentrant checkpoint region that
     starts after the prepare); the prepare node's backward empties them.
+
+    The checkpoint carry (``save_stats=False`` inside a band of
+    ``cake_jit.FN_SPLIT_CARRY``): the prepare node has one more edge, a stand-in
+    of the BF16 ``[3, 4H, 32]`` transposed fn split; the finish node's backward
+    replays the statistics with the dual-layout split into a fresh buffer and
+    hands it on that edge, and the prepare node's backward launches its route
+    without the split when ``fn`` is still the tensor and version the replay
+    split (``fn_key``), else the full route.  The buffer exists from the replay
+    to the end of the prepare node's backward (3 MiB at H 4096); the forward
+    keeps nothing more.
     """
 
     __slots__ = (
@@ -2010,6 +1937,7 @@ class _MHCTrainState:
         "sinkhorn_iters",
         "workspace",
         "backward_workspace",
+        "fn_key",
     )
 
     def __init__(
@@ -2028,11 +1956,18 @@ class _MHCTrainState:
         self.save_stats = bool(save_stats)
         self.rms_eps, self.hc_eps, self.sinkhorn_iters = rms_eps, hc_eps, sinkhorn_iters
         self.workspace, self.backward_workspace = workspace, backward_workspace
+        self.fn_key: Optional[tuple[Any, ...]] = None
 
-    def replay(self, X: torch.Tensor) -> torch.Tensor:
-        """The bitwise-identical replay of the forward prefix's ``stats``."""
+    def replay(
+        self, X: torch.Tensor, fnTp: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """The bitwise-identical replay of the forward prefix's ``stats``; with ``fnTp``
+        the checkpoint carry's replay, which also writes the transposed fn split
+        into it and records the identity of ``fn`` it split."""
 
-        return cake_mhc_train_forward_stats(
+        if fnTp is not None:
+            self.fn_key = _fn_key(self.fn)
+        return _forward_stats(
             X,
             self.fn,
             self.scale,
@@ -2040,8 +1975,9 @@ class _MHCTrainState:
             rms_eps=self.rms_eps,
             hc_eps=self.hc_eps,
             sinkhorn_iters=self.sinkhorn_iters,
+            stats_out=None,
             workspace=self.workspace,
-            deterministic=False,
+            fnTp=fnTp,
         )
 
     def take(
@@ -2055,7 +1991,7 @@ class _MHCTrainState:
 
 
 class _MHCTrainHandle:
-    """What :func:`cake_mhc_train_prepare` returns beside ``U``: the shared state and the prepare node's edges.
+    """What :func:`cake_mhc_det_train_prepare` returns beside ``U``: the shared state and the prepare node's edges.
 
     The edges are extra outputs of the prepare node: one-element, zero-stride
     tensors shaped like what the finish node's backward hands the prepare node's
@@ -2072,27 +2008,46 @@ class _MHCTrainHandle:
         self.state, self.edges = state, edges
 
 
-# The edge stand-ins per (device, token count, hidden size, save_stats).  No
+def _fn_key(fn: torch.Tensor) -> tuple[Any, ...]:
+    """What the checkpoint carry checks before reusing the transposed split of ``fn``:
+    its storage, its version counter, its shape and dtype."""
+
+    return (fn.data_ptr(), fn._version, tuple(fn.shape), fn.dtype, fn.device)
+
+
+def _carries(rows: int, hidden: int, device: torch.device, save_stats: bool) -> bool:
+    """Whether a prepare call of ``rows`` tokens takes the checkpoint carry's edge."""
+
+    return (
+        not save_stats
+        and _loader.fn_split_carry(rows, _device_arch(device), hidden) is not None
+    )
+
+
+# The edge stand-ins per (device, token count, hidden size, save_stats, carry).  No
 # kernel reads or writes an edge, so the edges of every prepare call alias these
 # one-element buffers; each call takes its own tensors (``detach``), so the
 # edges of two connections are distinct autograd outputs, and allocates no
 # memory.
-_EDGES: dict[tuple[torch.device, int, int, bool], tuple[torch.Tensor, ...]] = {}
+_EDGES: dict[tuple[torch.device, int, int, bool, bool], tuple[torch.Tensor, ...]] = {}
 
 
 def _edges(
-    rows: int, hidden: int, device: torch.device, save_stats: bool
+    rows: int, hidden: int, device: torch.device, save_stats: bool, carry: bool = False
 ) -> tuple[torch.Tensor, ...]:
     """One-element, zero-stride stand-ins of BF16 ``dY`` ``[T, 4, H]``, the FP32
-    gradient statistics ``[T, 32]`` and, under ``save_stats=False``, the FP32
-    statistics ``[T, 64]``: the prepare node's edge outputs."""
+    gradient statistics ``[T, 32]``, under ``save_stats=False`` the FP32
+    statistics ``[T, 64]`` and, with the checkpoint carry, the BF16 transposed fn
+    split ``[3, 4H, 32]``: the prepare node's edge outputs."""
 
-    key = (device, rows, hidden, save_stats)
+    key = (device, rows, hidden, save_stats, carry)
     edges = _EDGES.get(key)
     if edges is None:
         shapes = [((rows, STREAMS, hidden), _BF16), ((rows, GSTATS_COLS), _F32)]
         if not save_stats:
             shapes.append(((rows, STATS_COLS), _F32))
+        if carry:
+            shapes.append(((PIECES, STREAMS * hidden, N_PAD), _BF16))
         edges = tuple(
             torch.empty_strided(shape, (0,) * len(shape), dtype=dtype, device=device)
             for shape, dtype in shapes
@@ -2100,9 +2055,7 @@ def _edges(
         if len(_EDGES) >= _CACHE_ENTRIES:
             _EDGES.clear()
         _EDGES[key] = edges
-    if save_stats:
-        return edges[0].detach(), edges[1].detach()
-    return edges[0].detach(), edges[1].detach(), edges[2].detach()
+    return tuple(edge.detach() for edge in edges)
 
 
 def _as_bf16(
@@ -2115,26 +2068,20 @@ def _as_bf16(
     return grad.contiguous().to(_BF16)
 
 
-class CakeMHCTrainPrepareFunction(torch.autograd.Function):
+class CakeMHCDetPrepareFunction(torch.autograd.Function):
     """Autograd node of ``forward_prepare``: ``forward(X, fn, scale, base, state) -> (U, *edges)``.
 
-    Its backward is the non-deterministic ``backward_finish``: it receives
-    ``dU`` from the external branch and, as the gradients of the edges (outputs
-    the finish node takes as inputs), ``dY`` and the gradient statistics from the
-    finish node's backward; it returns the single-cast ``dX`` (mapping, collapse
-    and residual-mixing contributions summed in FP32) and the FP32 parameter
-    gradients (``dfn`` summed with FP32 reductions in a run-to-run varying
-    order); the finish node returns no gradient for ``X``.  ``state`` is the
-    private state :func:`cake_mhc_train_prepare` builds (that entry point checks
-    the mode).  With ``torch.use_deterministic_algorithms(True)`` when the
-    backward runs, it raises PyTorch's alert named
-    ``CakeMHCTrainPrepareFunction.backward`` (``RuntimeError``; under
-    ``warn_only=True`` a ``UserWarning``, and the backward runs).
+    Its backward is ``backward_finish``: it receives ``dU`` from the external
+    branch and, as the gradients of the edges (outputs the finish node takes as
+    inputs), ``dY`` and the gradient statistics from the finish node's backward;
+    it returns the single-cast ``dX`` (mapping, collapse and residual-mixing
+    contributions summed in FP32) and the FP32 parameter gradients; the finish
+    node returns no gradient for ``X``.
     """
 
     @staticmethod
     def forward(ctx, X, fn, scale, base, state):
-        U, stats = cake_mhc_train_forward_prepare(
+        U, stats = cake_mhc_det_train_forward_prepare(
             X,
             fn,
             scale,
@@ -2143,7 +2090,6 @@ class CakeMHCTrainPrepareFunction(torch.autograd.Function):
             hc_eps=state.hc_eps,
             sinkhorn_iters=state.sinkhorn_iters,
             workspace=state.workspace,
-            deterministic=False,
         )
         state.fn, state.scale, state.base = fn.detach(), scale.detach(), base.detach()
         state.stats = stats  # read and released by the finish forward
@@ -2154,13 +2100,19 @@ class CakeMHCTrainPrepareFunction(torch.autograd.Function):
         ctx.state = state
         # An output the backward did not reach arrives as ``None``, not as zeros.
         ctx.set_materialize_grads(False)
-        return (U,) + _edges(X.shape[0], X.shape[2], X.device, state.save_stats)
+        rows, hidden = X.shape[0], X.shape[2]
+        carry = _carries(rows, hidden, X.device, state.save_stats)
+        return (U,) + _edges(rows, hidden, X.device, state.save_stats, carry)
 
     @staticmethod
-    def backward(ctx, dU, dY, grad_stats, stats=None):
+    def backward(ctx, dU, dY, grad_stats, stats=None, fnTp=None):
         X, *saved = ctx.saved_tensors
         state = ctx.state
         held = state.take()
+        # The carried transposed split serves only the fn the replay split.
+        key, state.fn_key = state.fn_key, None
+        if fnTp is not None and key != _fn_key(state.fn):
+            fnTp = None
         if dY is None:
             # No edge gradient: a finish node rerun by a reentrant checkpoint left
             # them on the state, or the finish node's backward never ran (``Y``
@@ -2196,14 +2148,12 @@ class CakeMHCTrainPrepareFunction(torch.autograd.Function):
             dscale=None,
             dbase=None,
             path=_PATH_BACKWARD if saved else _PATH_CHECKPOINT,
-            # PyTorch's alert when its deterministic algorithms are enabled now
-            # (also when they were enabled after the forward).
-            alert="CakeMHCTrainPrepareFunction.backward",
+            fnTp=fnTp,
         )
         return dX, dfn, dscale, dbase, None
 
 
-class CakeMHCTrainFinishFunction(torch.autograd.Function):
+class CakeMHCDetFinishFunction(torch.autograd.Function):
     """Autograd node of ``forward_finish``: ``forward(X, B, state, *edges) -> Y``.
 
     Its backward is ``backward_prepare``: it returns ``dB`` for the external
@@ -2223,13 +2173,13 @@ class CakeMHCTrainFinishFunction(torch.autograd.Function):
         if stats is None:
             if state.fn is None:
                 raise RuntimeError(
-                    "cake_mhc_train_finish needs the state of a preceding cake_mhc_train_prepare"
+                    "cake_mhc_det_train_finish needs the state of a preceding cake_mhc_det_train_prepare"
                 )
             # Replay: a checkpoint region that starts after the prepare reruns the
             # finish on a state that already released its statistics; recompute
             # them bitwise from ``X``.
             stats = state.replay(X)
-        Y = cake_mhc_train_forward_finish(X, B, stats, deterministic=False)
+        Y = cake_mhc_det_train_forward_finish(X, B, stats)
         if state.save_stats:
             ctx.save_for_backward(X, B, stats)
         else:
@@ -2242,7 +2192,20 @@ class CakeMHCTrainFinishFunction(torch.autograd.Function):
     def backward(ctx, dY):
         X, B, *saved = ctx.saved_tensors
         state = ctx.state
-        stats = saved[0] if saved else state.replay(X)
+        edges = len(ctx.needs_input_grad) - 3
+        to_prepare = bool(edges) and ctx.needs_input_grad[3]
+        fnTp = None
+        if saved:
+            stats = saved[0]
+        elif to_prepare and edges == 4:
+            # The checkpoint carry: the replay also writes the transposed fn split,
+            # handed to the prepare node's backward on the fourth edge.
+            fnTp = torch.empty(
+                (PIECES, STREAMS * X.shape[2], N_PAD), dtype=_BF16, device=X.device
+            )
+            stats = state.replay(X, fnTp)
+        else:
+            stats = state.replay(X)
         dY = _as_bf16(dY, shape=(X.shape[0], STREAMS, X.shape[2]), device=X.device)
         dB, grad_stats = _backward_prepare(
             dY,
@@ -2254,8 +2217,9 @@ class CakeMHCTrainFinishFunction(torch.autograd.Function):
             path=_PATH_BACKWARD if saved else _PATH_CHECKPOINT,
         )
         handed = (dY, grad_stats) if saved else (dY, grad_stats, stats)
-        edges = len(ctx.needs_input_grad) - 3
-        if edges and ctx.needs_input_grad[3]:
+        if to_prepare:
+            if edges == 4:
+                handed += (fnTp,)
             return (None, dB, None, *handed)
         if state.recorded:
             # No edge reaches the prepare node (a finish rerun by a reentrant
@@ -2266,7 +2230,7 @@ class CakeMHCTrainFinishFunction(torch.autograd.Function):
         return (None, dB, None) + (None,) * edges
 
 
-def cake_mhc_train_prepare(
+def cake_mhc_det_train_prepare(
     X: torch.Tensor,
     fn: torch.Tensor,
     scale: torch.Tensor,
@@ -2278,40 +2242,32 @@ def cake_mhc_train_prepare(
     save_stats: bool = True,
     workspace: Optional[torch.Tensor] = None,
     backward_workspace: Optional[torch.Tensor] = None,
-    deterministic: bool = True,
 ) -> tuple[torch.Tensor, _MHCTrainHandle]:
-    """Autograd-enabled ``forward_prepare``: ``(U, handle)``; pass ``handle`` to :func:`cake_mhc_train_finish`.
+    """Autograd-enabled ``forward_prepare``: ``(U, handle)``; pass ``handle`` to :func:`cake_mhc_det_train_finish`.
 
     Parameters
     ----------
     X, fn, scale, base : torch.Tensor
-        As in :func:`cake_mhc_train_forward_prepare` (``X`` and the parameters may require gradients).
+        As in :func:`cake_mhc_det_train_forward_prepare` (``X`` and the parameters may require gradients).
     rms_eps, hc_eps, sinkhorn_iters : float, float, int
-        As in :func:`cake_mhc_train_forward_prepare` (the epsilons are launch
+        As in :func:`cake_mhc_det_train_forward_prepare` (the epsilons are launch
         arguments; the iteration count is ``1 .. SINKHORN_ITERS_MAX``, default ``20``).
     save_stats : bool
         ``True`` (default): the per-token statistics are saved for the backward
         through the autograd saved tensors (an activation checkpoint frees and
         recomputes them with the inputs).  ``False``: they are dropped after the
-        forward and recomputed from ``X`` in the backward (checkpoint replay),
-        bit for bit the saved record.
+        forward and recomputed from ``X`` in the backward (checkpoint replay);
+        the gradients are bitwise the same.
     workspace, backward_workspace : torch.Tensor, optional
         Caller-owned forward / backward workspaces sized for this ``H``
         (``hidden=X.shape[2]``); per-device defaults when omitted.
-    deterministic : bool
-        Must be ``False`` (``ValueError`` otherwise).
 
     Returns
     -------
     ``(U, handle)``: BF16 ``U`` and the handle of this prepare node for one
-    :func:`cake_mhc_train_finish`.  The forward runs the deterministic programs'
-    copies and does not alert; the prepare node's backward runs the
-    non-deterministic ``backward_finish`` and raises PyTorch's alert when its
-    deterministic algorithms are enabled at that time (see
-    :class:`CakeMHCTrainPrepareFunction`).
+    :func:`cake_mhc_det_train_finish`.
     """
 
-    _require_nondeterministic(deterministic, "cake_mhc_train_prepare")
     state = _MHCTrainState(
         save_stats=save_stats,
         rms_eps=rms_eps,
@@ -2320,47 +2276,43 @@ def cake_mhc_train_prepare(
         workspace=workspace,
         backward_workspace=backward_workspace,
     )
-    out = CakeMHCTrainPrepareFunction.apply(X, fn, scale, base, state)
+    out = CakeMHCDetPrepareFunction.apply(X, fn, scale, base, state)
     U = out[0]
     # ``U`` requires grad exactly when the prepare node was recorded.
     state.recorded = U.requires_grad
     return U, _MHCTrainHandle(state, out[1:] if state.recorded else ())
 
 
-def cake_mhc_train_finish(
-    X: torch.Tensor,
-    B: torch.Tensor,
-    handle: _MHCTrainHandle,
-    *,
-    deterministic: bool = True,
+def cake_mhc_det_train_finish(
+    X: torch.Tensor, B: torch.Tensor, handle: _MHCTrainHandle
 ) -> torch.Tensor:
     """Autograd-enabled ``forward_finish``: ``Y`` from ``X``, the branch output ``B`` and the prepare ``handle``.
 
     Parameters
     ----------
     X : torch.Tensor
-        The BF16 ``[T, 4, H]`` tensor passed to :func:`cake_mhc_train_prepare`.
+        The BF16 ``[T, 4, H]`` tensor passed to :func:`cake_mhc_det_train_prepare`.
     B : torch.Tensor
         BF16 ``[T, H]`` output of the external branch applied to ``U`` (may require gradients).
     handle : object
-        The handle returned by :func:`cake_mhc_train_prepare`, for one finish.  A
+        The handle returned by :func:`cake_mhc_det_train_prepare`, for one finish.  A
         reentrant checkpoint region (``use_reentrant=True``) holds both calls or
         starts after the prepare; it does not end between them.
-    deterministic : bool
-        Must be ``False`` (``ValueError`` otherwise).
 
     Returns
     -------
     BF16 ``Y`` of shape ``[T, 4, H]``.
     """
 
-    _require_nondeterministic(deterministic, "cake_mhc_train_finish")
     if not isinstance(handle, _MHCTrainHandle):
-        raise TypeError("handle must be the handle returned by cake_mhc_train_prepare")
+        raise TypeError(
+            "handle must be the handle returned by cake_mhc_det_train_prepare (a cake_mhc_nondet_train_prepare "
+            "handle goes to flashinfer.cake_mhc_nondet_train.cake_mhc_nondet_train_finish)"
+        )
     # The forward takes the edges off the handle: the handle then holds nothing of
     # the prepare node, and a checkpoint rerun of this call runs without them.
     edges, handle.edges = handle.edges, ()
-    return CakeMHCTrainFinishFunction.apply(X, B, handle.state, *edges)
+    return CakeMHCDetFinishFunction.apply(X, B, handle.state, *edges)
 
 
 __all__ = [
@@ -2368,21 +2320,21 @@ __all__ = [
     "SUPPORTED_COMPUTE_CAPABILITIES",
     "TENSOR_ALIGNMENT_BYTES",
     "WORKSPACE_ALIGNMENT_BYTES",
-    "CakeMHCTrainFinishFunction",
-    "CakeMHCTrainPrepareFunction",
-    "cake_mhc_train_backward_finish",
-    "cake_mhc_train_backward_prepare",
-    "cake_mhc_train_backward_workspace",
-    "cake_mhc_train_backward_workspace_bytes",
-    "cake_mhc_train_finish",
-    "cake_mhc_train_forward_finish",
-    "cake_mhc_train_forward_prepare",
-    "cake_mhc_train_forward_stats",
-    "cake_mhc_train_forward_workspace",
-    "cake_mhc_train_forward_workspace_bytes",
-    "cake_mhc_train_prepare",
-    "cake_mhc_train_reset_workspace",
-    "is_cake_mhc_train_supported",
-    "route_key",
-    "route_modules",
+    "CakeMHCDetFinishFunction",
+    "CakeMHCDetPrepareFunction",
+    "cake_mhc_det_train_backward_finish",
+    "cake_mhc_det_train_backward_prepare",
+    "cake_mhc_det_train_backward_workspace",
+    "cake_mhc_det_train_backward_workspace_bytes",
+    "cake_mhc_det_train_finish",
+    "cake_mhc_det_train_forward_finish",
+    "cake_mhc_det_train_forward_prepare",
+    "cake_mhc_det_train_forward_stats",
+    "cake_mhc_det_train_forward_workspace",
+    "cake_mhc_det_train_forward_workspace_bytes",
+    "cake_mhc_det_train_prepare",
+    "cake_mhc_det_train_reset_workspace",
+    "cake_mhc_det_train_route_key",
+    "cake_mhc_det_train_route_modules",
+    "is_cake_mhc_det_train_supported",
 ]

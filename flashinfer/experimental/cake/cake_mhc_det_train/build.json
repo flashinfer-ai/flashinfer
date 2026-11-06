@@ -4696,6 +4696,6 @@
       ]
     }
   ],
-  "package": "flashinfer.cake_mhc_det_train_backend",
+  "package": "flashinfer.experimental.cake.cake_mhc_det_train",
   "schema": "cake-build/1"
 }

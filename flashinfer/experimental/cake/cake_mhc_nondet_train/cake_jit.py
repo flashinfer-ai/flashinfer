@@ -18,7 +18,7 @@ the non-deterministic backward (hidden sizes 4096, 5120 and 7168, 4 streams;
 SM100 / SM103, and SM107 at hidden 4096).
 
 This registry is a self-contained copy of the deterministic package's registry
-(``flashinfer.cake_mhc_det_train_backend.cake_jit``): every record, route, host
+(``flashinfer.experimental.cake.cake_mhc_det_train.cake_jit``): every record, route, host
 rule and table below is that registry's under the ``cake_mhc_train_`` prefix,
 except what the backward's ``bwd_finish`` route changes.  The deterministic
 column-slab records (``bwd_slab``) and final-reduction records (``bwd_reduce``)
@@ -95,9 +95,10 @@ column slab: no final reduction, and the ``bwd`` workspace has no per-chunk
 varies from run to run: each element sums at most ``P`` per-chunk partials
 (``P <= 32``: the chunk count of :func:`k7_chunks`, or of the two-size geometry
 under ``lpt``, whose chunks can cover other token ranges, so its total can also
-differ from the deterministic ``dfn`` in the low-order bits), so it lies within
-``P`` FP32 roundings of the fixed-order sum of those partials, and the FP32
-reduction flushes subnormal addends and results to zero.  ``dX`` and every other
+differ from the deterministic ``dfn`` in the low-order bits) with at most ``P``
+FP32 additions, so two runs differ by at most about
+``2 P u (|start| + sum |partial|)`` (``u = 2^-24``), and the FP32 reduction
+flushes subnormal addends and results to zero.  ``dX`` and every other
 route's outputs are the deterministic package's bits; ``dscale`` and ``dbase``
 are its per-CTA reduction's bits, which are its values except where it runs the
 group-row forms (hidden 4096 above 14927 tokens on sm_100a and sm_103a).

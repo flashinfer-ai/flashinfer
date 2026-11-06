@@ -15,11 +15,11 @@ limitations under the License.
 
 Host-plan, packaging and mode-policy tests of the Cake four-stream mHC training
 package with the non-deterministic backward
-(``flashinfer.experimental.cake.cake_mhc_train_backend``; FlashInfer issue
+(``flashinfer.experimental.cake.cake_mhc_nondet_train``; FlashInfer issue
 #8068; no GPU needed, nothing is built or launched).
 
 The package is a standalone copy of the deterministic package
-(``flashinfer.cake_mhc_det_train_backend``) under the ``cake_mhc_train_``
+(``flashinfer.experimental.cake.cake_mhc_det_train``) under the ``cake_mhc_train_``
 prefix at its hidden sizes (4096 on every architecture, 5120 and 7168 on
 sm_100a / sm_103a), except the ``bwd_finish`` routes.  This module checks the
 registry ``cake_jit.py`` against the deterministic registry's records, routes
@@ -90,11 +90,19 @@ and record scalars of every hidden size on its boards of record
 * the package is standalone: no source file imports another flashinfer package
   (the shared ``cake_build.py`` JIT fallback aside, inside a function), and a
   copy under another name imports and plans with ``flashinfer`` blocked;
-* the mode policy without a device: every compute and workspace entry point
-  refuses any ``deterministic`` other than ``False`` first (``ValueError``),
-  only ``backward_finish`` raises PyTorch's alert under
-  ``torch.use_deterministic_algorithms(True)`` (before any validation or
-  launch), and the alert's wording;
+* the mode policy without a device: the mode is part of the names (every
+  exported name but the ALL_CAPS constants carries the ``nondet`` token), no
+  public callable has a ``deterministic`` parameter (the autograd
+  ``Function.forward`` included) and a ``deterministic`` keyword is the
+  interpreter's ``TypeError`` before any operand check; every entry point has
+  the deterministic package's counterpart of the same verb; only
+  ``backward_finish`` raises PyTorch's alert under
+  ``torch.use_deterministic_algorithms(True)``, after its operands pass and
+  right before its launch, and the alert's wording;
+* the top-level module ``flashinfer.cake_mhc_nondet_train`` (read as source):
+  every entry point forwards to this package's function of the same name with
+  this package's parameters, the package is imported only on first use, and
+  nothing is imported from the deterministic package;
 * the wiring: the test-helper key, the package data, the build-manifest
   checker's row and ``build.json``.
 
@@ -115,6 +123,7 @@ import heapq
 import importlib.util
 import inspect
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -126,13 +135,18 @@ import torch
 
 from tests.test_helpers.cake_package import PACKAGES, cake_package
 
-KEY = "cake.cake_mhc_train"
-PACKAGE_NAME = "flashinfer.experimental.cake.cake_mhc_train_backend"
+KEY = "cake.cake_mhc_nondet_train"
+PACKAGE_NAME = "flashinfer.experimental.cake.cake_mhc_nondet_train"
+# The former import paths of this package: removed, with no alias.
+FORMER_PACKAGES = (
+    "flashinfer.experimental.cake.cake_mhc_train_backend",
+    "flashinfer.cake_mhc_train_backend",
+)
 pkg = cake_package(KEY)
 nd = cake_package(KEY, "cake_jit")
 cake_build = cake_package(KEY, "cake_build")
-det = cake_package("cake_mhc_det_train", "cake_jit")
-det_build = cake_package("cake_mhc_det_train", "cake_build")
+det = cake_package("cake.cake_mhc_det_train", "cake_jit")
+det_build = cake_package("cake.cake_mhc_det_train", "cake_build")
 
 PACKAGE_DIR = Path(nd.__file__).resolve().parent
 REPO = Path(__file__).resolve().parents[2]
@@ -398,29 +412,53 @@ DET_ROUTES = {
 DET_RECORD_SCALARS = {
     name: scalars for name, scalars in det.RECORD_SCALARS.items() if name in DET_MODULES
 }
-# The public entry points that take the mode keyword (every compute and workspace entry point).
-MODE_ENTRIES = (
-    "cake_mhc_train_forward_prepare",
-    "cake_mhc_train_forward_stats",
-    "cake_mhc_train_forward_finish",
-    "cake_mhc_train_backward_prepare",
-    "cake_mhc_train_backward_finish",
-    "cake_mhc_train_prepare",
-    "cake_mhc_train_finish",
-    "cake_mhc_train_forward_workspace_bytes",
-    "cake_mhc_train_backward_workspace_bytes",
-    "cake_mhc_train_forward_workspace",
-    "cake_mhc_train_backward_workspace",
+# The public entry points (every compute and workspace entry point, the autograd prepare / finish included).
+ENTRIES = (
+    "cake_mhc_nondet_train_forward_prepare",
+    "cake_mhc_nondet_train_forward_stats",
+    "cake_mhc_nondet_train_forward_finish",
+    "cake_mhc_nondet_train_backward_prepare",
+    "cake_mhc_nondet_train_backward_finish",
+    "cake_mhc_nondet_train_prepare",
+    "cake_mhc_nondet_train_finish",
+    "cake_mhc_nondet_train_forward_workspace_bytes",
+    "cake_mhc_nondet_train_backward_workspace_bytes",
+    "cake_mhc_nondet_train_forward_workspace",
+    "cake_mhc_nondet_train_backward_workspace",
 )
-# The public functions without it.
-MODELESS = (
-    "is_cake_mhc_train_supported",
-    "cake_mhc_train_reset_workspace",
-    "route_key",
-    "route_modules",
+# The other public functions.
+HELPERS = (
+    "is_cake_mhc_nondet_train_supported",
+    "cake_mhc_nondet_train_reset_workspace",
+    "cake_mhc_nondet_train_route_key",
+    "cake_mhc_nondet_train_route_modules",
 )
+# The top-level module of the mode (read as source: the suite imports nothing but its package) and its entry points.
+FACADE = "flashinfer/cake_mhc_nondet_train.py"
+FACADE_ENTRIES = ("is_cake_mhc_nondet_train_supported", *ENTRIES)
+# The prefixes of the public entry points of the two modes (the same verbs follow).
+NONDET_API, DET_API = "cake_mhc_nondet_train", "cake_mhc_det_train"
 _ALERT = "does not have a deterministic implementation"
-_REFUSAL = "computes non-deterministically and takes deterministic=False"
+# The interpreter's refusal of a ``deterministic`` keyword: no entry point has that parameter.
+_NO_MODE_KEYWORD = "unexpected keyword argument 'deterministic'"
+# The ``TypeError`` of ``cake_mhc_nondet_train_finish`` for a handle its prepare did not make.
+_HANDLE_REFUSAL = (
+    "handle must be the handle returned by cake_mhc_nondet_train_prepare (a cake_mhc_det_train_prepare "
+    "handle goes to flashinfer.cake_mhc_det_train.cake_mhc_det_train_finish)"
+)
+
+
+def _mode_tokens(name: str) -> set[str]:
+    """The mode words of ``name``: ``det`` / ``nondet`` as ``_``-separated tokens of a snake_case name, ``Det`` /
+    ``Nondet`` as words of a CamelCase one (a substring test would read ``nondet`` as ``det`` too)."""
+    if name[:1].isupper():
+        return {word.lower() for word in re.findall(r"(Nondet|Det)(?=[A-Z]|$)", name)}
+    return set(re.findall(r"(?:^|_)(det|nondet)(?=_|$)", name))
+
+
+def _shape(parameters) -> list:
+    """Name, kind and default of each parameter."""
+    return [(p.name, p.kind, p.default) for p in parameters]
 
 
 def _renamed(value):
@@ -3078,7 +3116,9 @@ def test_route_glue_and_supported_hidden_sizes() -> None:
         nd.route_key(HIDDEN, "bwd_reduce")
     with pytest.raises(ValueError):
         nd.selected_modules("sm_90a", HIDDEN, "bwd_finish", rows=129, sm_count=148)
-    assert pkg.route_modules is nd.route_modules and pkg.route_key is nd.route_key
+    assert pkg.cake_mhc_nondet_train_route_modules is nd.route_modules
+    assert pkg.cake_mhc_nondet_train_route_key is nd.route_key
+    assert not hasattr(pkg, "route_key") and not hasattr(pkg, "route_modules")
 
 
 @pytest.mark.cpu_only
@@ -3188,7 +3228,7 @@ package = importlib.import_module(sys.argv[2])
 jit = importlib.import_module(sys.argv[2] + ".cake_jit")
 importlib.import_module(sys.argv[2] + ".cake_build")
 out = {
-    "supported_cpu": package.is_cake_mhc_train_supported(torch.device("cpu")),
+    "supported_cpu": package.is_cake_mhc_nondet_train_supported(torch.device("cpu")),
     "selection": {
         f"{arch}/{sm}/{hidden}": list(jit.selected_modules(arch, hidden, "bwd_finish", rows=4096, sm_count=sm))
         for arch, sm in jit.RULES_BOARDS
@@ -3197,8 +3237,8 @@ out = {
     "bwd_bytes": jit.workspace_bytes("bwd", 4096, 148, "sm_100a"),
 }
 try:
-    package.cake_mhc_train_backward_finish(*([None] * 9))
-except ValueError as error:
+    package.cake_mhc_nondet_train_backward_finish(*([None] * 9), deterministic=False)
+except TypeError as error:
     out["refusal"] = str(error)
 out["flashinfer"] = sorted(
     name for name, module in sys.modules.items()
@@ -3211,9 +3251,10 @@ print(json.dumps(out))
 @pytest.mark.cpu_only
 def test_vendored_copy_imports_with_flashinfer_blocked(tmp_path: Path) -> None:
     """The package directory copied under another top-level name (the vendored gate's first step, without its
-    sources) imports, plans its routes (every hidden size of every board) and refuses ``deterministic=True`` in an
-    interpreter where every ``flashinfer`` import raises; no flashinfer module is loaded."""
-    neutral = "vendored_cake_mhc_train_backend"
+    sources) imports, plans its routes (every hidden size of every board) and refuses a ``deterministic`` keyword
+    (the interpreter's ``TypeError``) in an interpreter where every ``flashinfer`` import raises; no flashinfer module
+    is loaded."""
+    neutral = "vendored_cake_mhc_nondet_train"
     shutil.copytree(
         PACKAGE_DIR,
         tmp_path / neutral,
@@ -3242,43 +3283,158 @@ def test_vendored_copy_imports_with_flashinfer_blocked(tmp_path: Path) -> None:
             nd.selected_modules(arch, hidden, "bwd_finish", rows=4096, sm_count=sm)
         ), (arch, sm, hidden)
     assert out["bwd_bytes"] == nd.workspace_bytes("bwd", 4096, 148, "sm_100a")
-    assert out["refusal"].startswith(f"cake_mhc_train_backward_finish {_REFUSAL}")
+    assert _NO_MODE_KEYWORD in out["refusal"], out["refusal"]
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# The mode policy (no device: the refusal and the alert come before any device work)
+# The mode policy (no device: a keyword the entry points do not take is refused before any operand, device or route
+# check; the top-level module is read as source)
 
 
 @pytest.mark.cpu_only
 def test_exports() -> None:
-    """The package exports the det-free names only (no ``cake_mhc_det_train_*`` / ``CakeMHCDetTrain*`` name, no head
-    entry point) and every exported name exists."""
+    """Every exported name exists and, but the ALL_CAPS constants, carries the mode token ``nondet`` (``Nondet`` in a
+    class name) and no ``det`` token; no head entry point; the former generic route helpers are gone."""
     for name in pkg.__all__:
         assert hasattr(pkg, name), name
-        assert "det_train" not in name and "DetTrain" not in name, name
         assert "head" not in name.lower(), name
-    assert set(MODE_ENTRIES) | set(MODELESS) <= set(pkg.__all__)
-    assert {"CakeMHCTrainPrepareFunction", "CakeMHCTrainFinishFunction"} <= set(
+        if not name.isupper():
+            assert _mode_tokens(name) == {"nondet"}, name
+    assert set(ENTRIES) | set(HELPERS) <= set(pkg.__all__)
+    assert {"CakeMHCNondetPrepareFunction", "CakeMHCNondetFinishFunction"} <= set(
         pkg.__all__
     )
+    assert not {"route_key", "route_modules"} & set(pkg.__all__)
     assert pkg.SUPPORTED_COMPUTE_CAPABILITIES == ((10, 0), (10, 3), (10, 7))
     assert pkg.__name__ == PACKAGE_NAME
 
 
+def _functions(path: Path) -> dict[str, ast.FunctionDef]:
+    """The module-level functions of ``path`` by name."""
+    tree = ast.parse(path.read_text(), filename=str(path))
+    return {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+
+
+def _body(function: ast.FunctionDef) -> list[ast.stmt]:
+    """The statements of ``function`` after its docstring."""
+    first = function.body[0]
+    if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant):
+        if isinstance(first.value.value, str):
+            return function.body[1:]
+    return function.body
+
+
+def _expression(source: str) -> str:
+    """``ast.dump`` of the expression ``source`` (no positions), to compare a statement's expression with."""
+    return ast.dump(ast.parse(source, mode="eval").body)
+
+
 @pytest.mark.cpu_only
-def test_entry_points_take_the_deterministic_keyword() -> None:
-    for name in MODE_ENTRIES:
-        parameter = inspect.signature(getattr(pkg, name)).parameters["deterministic"]
-        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY, name
-        assert parameter.default is True, name
-    for name in MODELESS:
-        assert (
-            "deterministic" not in inspect.signature(getattr(pkg, name)).parameters
-        ), name
+def test_no_public_callable_takes_a_deterministic_keyword() -> None:
+    """No public callable of the package has a ``deterministic`` parameter (the mode is the package: its names carry
+    ``nondet``), the ``forward`` / ``backward`` of its autograd ``Function`` classes included, and the former mode
+    check ``_require_nondeterministic`` is gone."""
+    checked = []
+    for name in pkg.__all__:
+        obj = getattr(pkg, name)
+        if inspect.isclass(obj):
+            functions = {
+                f"{name}.forward": obj.forward,
+                f"{name}.backward": obj.backward,
+            }
+        elif callable(obj):
+            functions = {name: obj}
+        else:
+            continue
+        for label, function in functions.items():
+            assert "deterministic" not in inspect.signature(function).parameters, label
+            checked.append(label)
+    assert {*ENTRIES, *HELPERS, "CakeMHCNondetPrepareFunction.forward"} <= set(checked)
+    assert not hasattr(pkg, "_require_nondeterministic")
+    assert "_require_nondeterministic" not in Path(pkg.__file__).read_text()
 
 
-def _cpu_calls(**mode) -> dict:
-    """One call per mode entry point on CPU operands of 8 tokens (``mode``: the keyword, ``{}`` the default)."""
+@pytest.mark.cpu_only
+def test_facade_forwards_every_entry_point_to_the_package() -> None:
+    """The top-level module ``flashinfer.cake_mhc_nondet_train`` (read as source, not imported) defines its entry
+    points and the private ``_pkg`` / ``__getattr__`` / ``__dir__`` only, each entry point with this package's
+    parameters (names, kinds and defaults; the ``hidden`` default is the module's ``_HIDDEN``, this package's
+    ``cake_jit.HIDDEN``).  Each body forwards to this package's function of the same name, read off ``_pkg()``, with
+    every argument unchanged.  The package is imported only inside a function (no module-level import of
+    ``flashinfer.experimental``), no import names the deterministic package, and every name the module resolves on
+    first access (``_LAZY``) is an exported name of this package."""
+    path = REPO / FACADE
+    if not path.is_file():
+        pytest.skip(f"{FACADE} is not beside this test (installed package)")
+    for node, in_function in _imports(path):
+        names = [alias.name for alias in node.names]
+        if isinstance(node, ast.ImportFrom) and node.module:
+            names.append(node.module)
+        assert not [n for n in names if "cake_mhc_det_train" in n], (node.lineno, names)
+        # The dotted path of each imported object: ``experimental`` as a path component, not as a substring of a
+        # name (``from .api_logging import flashinfer_experimental_api`` imports nothing of the package).
+        if isinstance(node, ast.ImportFrom):
+            paths = [f"{node.module or ''}.{alias.name}" for alias in node.names]
+        else:
+            paths = [alias.name for alias in node.names]
+        if [p for p in paths if "experimental" in p.split(".")]:
+            assert in_function, (node.lineno, paths)
+    tree = ast.parse(path.read_text(), filename=str(path))
+    constants = {
+        target.id: ast.literal_eval(node.value)
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name) and target.id in ("_HIDDEN", "_LAZY")
+    }
+    assert constants["_HIDDEN"] == nd.HIDDEN
+    assert set(constants["_LAZY"]) <= set(pkg.__all__), constants["_LAZY"]
+    functions = _functions(path)
+    want = {*FACADE_ENTRIES, "_pkg", "__getattr__", "__dir__"}
+    assert set(functions) == want, sorted(set(functions) ^ want)
+
+    def default(node):
+        if node is None:
+            return inspect.Parameter.empty
+        if isinstance(node, ast.Name):
+            return constants[node.id]
+        return ast.literal_eval(node)
+
+    for name in FACADE_ENTRIES:
+        args = functions[name].args
+        assert not (args.posonlyargs or args.vararg or args.kwarg), name
+        positional_defaults = [None] * (len(args.args) - len(args.defaults))
+        parameters = [
+            (arg.arg, inspect.Parameter.POSITIONAL_OR_KEYWORD, default(node))
+            for arg, node in zip(
+                args.args, positional_defaults + list(args.defaults), strict=True
+            )
+        ] + [
+            (arg.arg, inspect.Parameter.KEYWORD_ONLY, default(node))
+            for arg, node in zip(args.kwonlyargs, args.kw_defaults, strict=True)
+        ]
+        expected = _shape(inspect.signature(getattr(pkg, name)).parameters.values())
+        forwarded = [parameter[0] for parameter in expected]
+        body = _body(functions[name])
+        assert len(body) == 1, name
+        assert parameters == expected, name
+        returned = body[-1]
+        assert isinstance(returned, ast.Return), name
+        call = returned.value
+        assert isinstance(call, ast.Call), name
+        assert ast.dump(call.func) == _expression(f"_pkg().{name}"), name
+        assert all(isinstance(arg, ast.Name) for arg in call.args), name
+        for keyword in call.keywords:
+            assert isinstance(keyword.value, ast.Name), (name, keyword.arg)
+            assert keyword.value.id == keyword.arg, (name, keyword.arg)
+        passed = [arg.id for arg in call.args]
+        assert passed == forwarded[: len(passed)], name
+        passed += [keyword.arg for keyword in call.keywords]
+        assert sorted(passed) == sorted(forwarded), name
+
+
+def _cpu_calls(**keywords) -> dict:
+    """One call per entry point on CPU operands of 8 tokens, each with ``keywords`` added."""
     T, cpu = 8, torch.device("cpu")
     X = torch.zeros(T, 4, 4096, dtype=torch.bfloat16)
     fn = torch.zeros(24, 16384)
@@ -3289,51 +3445,64 @@ def _cpu_calls(**mode) -> dict:
     )
     stats, gstats = torch.zeros(T, 64), torch.zeros(T, 32)
     return {
-        "cake_mhc_train_forward_prepare": lambda: pkg.cake_mhc_train_forward_prepare(X, fn, scale, base, **mode),
-        "cake_mhc_train_forward_stats": lambda: pkg.cake_mhc_train_forward_stats(X, fn, scale, base, **mode),
-        "cake_mhc_train_forward_finish": lambda: pkg.cake_mhc_train_forward_finish(X, B, stats, **mode),
-        "cake_mhc_train_backward_prepare": lambda: pkg.cake_mhc_train_backward_prepare(X, B, X, stats, **mode),
-        "cake_mhc_train_backward_finish": lambda: pkg.cake_mhc_train_backward_finish(
-            X, X, dU, B, fn, scale, base, stats, gstats, **mode
+        "cake_mhc_nondet_train_forward_prepare": lambda: pkg.cake_mhc_nondet_train_forward_prepare(X, fn, scale, base, **keywords),
+        "cake_mhc_nondet_train_forward_stats": lambda: pkg.cake_mhc_nondet_train_forward_stats(X, fn, scale, base, **keywords),
+        "cake_mhc_nondet_train_forward_finish": lambda: pkg.cake_mhc_nondet_train_forward_finish(X, B, stats, **keywords),
+        "cake_mhc_nondet_train_backward_prepare": lambda: pkg.cake_mhc_nondet_train_backward_prepare(X, B, X, stats, **keywords),
+        "cake_mhc_nondet_train_backward_finish": lambda: pkg.cake_mhc_nondet_train_backward_finish(
+            X, X, dU, B, fn, scale, base, stats, gstats, **keywords
         ),
-        "cake_mhc_train_prepare": lambda: pkg.cake_mhc_train_prepare(X, fn, scale, base, **mode),
-        "cake_mhc_train_finish": lambda: pkg.cake_mhc_train_finish(X, B, object(), **mode),
-        "cake_mhc_train_forward_workspace_bytes": lambda: pkg.cake_mhc_train_forward_workspace_bytes(T, cpu, **mode),
-        "cake_mhc_train_backward_workspace_bytes": lambda: pkg.cake_mhc_train_backward_workspace_bytes(T, cpu, **mode),
-        "cake_mhc_train_forward_workspace": lambda: pkg.cake_mhc_train_forward_workspace(T, cpu, **mode),
-        "cake_mhc_train_backward_workspace": lambda: pkg.cake_mhc_train_backward_workspace(T, cpu, **mode),
+        "cake_mhc_nondet_train_prepare": lambda: pkg.cake_mhc_nondet_train_prepare(X, fn, scale, base, **keywords),
+        "cake_mhc_nondet_train_finish": lambda: pkg.cake_mhc_nondet_train_finish(X, B, object(), **keywords),
+        "cake_mhc_nondet_train_forward_workspace_bytes": lambda: pkg.cake_mhc_nondet_train_forward_workspace_bytes(T, cpu, **keywords),
+        "cake_mhc_nondet_train_backward_workspace_bytes": lambda: pkg.cake_mhc_nondet_train_backward_workspace_bytes(T, cpu, **keywords),
+        "cake_mhc_nondet_train_forward_workspace": lambda: pkg.cake_mhc_nondet_train_forward_workspace(T, cpu, **keywords),
+        "cake_mhc_nondet_train_backward_workspace": lambda: pkg.cake_mhc_nondet_train_backward_workspace(T, cpu, **keywords),
     }  # fmt: skip
 
 
-_MODES = (
-    {},
-    {"deterministic": True},
-    {"deterministic": None},
-    {"deterministic": 0},
-    {"deterministic": 1},
-    {"deterministic": "False"},
-)
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("value", (False, True, None), ids=repr)
+def test_entry_points_refuse_a_deterministic_keyword_first(value) -> None:
+    """A ``deterministic`` keyword, whatever its value, is the interpreter's ``TypeError`` (an unexpected keyword
+    argument) on every entry point and helper, before any operand, device, handle or route check -- also with
+    PyTorch's deterministic algorithms on, with no alert (warnings are errors)."""
+    calls = _cpu_calls(deterministic=value)
+    assert set(calls) == set(ENTRIES)
+    calls.update(
+        is_cake_mhc_nondet_train_supported=lambda: (
+            pkg.is_cake_mhc_nondet_train_supported(
+                torch.device("cpu"), deterministic=value
+            )
+        ),
+        cake_mhc_nondet_train_reset_workspace=lambda: (
+            pkg.cake_mhc_nondet_train_reset_workspace(None, deterministic=value)
+        ),
+    )
+    for torch_mode in ((False, False), (True, False), (True, True)):
+        with (
+            _torch_deterministic(torch_mode[0], warn_only=torch_mode[1]),
+            warnings.catch_warnings(),
+        ):
+            warnings.simplefilter("error")
+            for call in calls.values():
+                with pytest.raises(TypeError, match=_NO_MODE_KEYWORD):
+                    call()
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    "mode", _MODES, ids=["default", "true", "none", "zero", "one", "string"]
-)
-def test_entry_points_refuse_a_deterministic_mode_first(mode: dict) -> None:
-    """Any ``deterministic`` but the bool ``False`` (the default ``True`` included) is a ``ValueError`` naming the
-    entry point and the deterministic package, before any operand, device or route check -- also with PyTorch's
-    deterministic algorithms on (the refusal precedes the alert)."""
-    calls = _cpu_calls(**mode)
-    assert set(calls) == set(MODE_ENTRIES)
-    for torch_mode in ((False, False), (True, False), (True, True)):
-        with _torch_deterministic(torch_mode[0], warn_only=torch_mode[1]):
-            for name, call in calls.items():
-                with pytest.raises(ValueError, match=f"^{name} {_REFUSAL}") as info:
-                    call()
-                assert (
-                    "flashinfer.cake_mhc_det_train is the deterministic package"
-                    in str(info.value)
-                ), name
+def test_every_entry_point_has_a_deterministic_counterpart() -> None:
+    """The two modes share their verbs: every entry point of this package (``is_..._supported`` included) has the
+    deterministic package's entry point of the same verb (``cake_mhc_det_train_<verb>``) with the same parameters."""
+    det_package = cake_package("cake.cake_mhc_det_train")
+    for entry in FACADE_ENTRIES:
+        det_entry = entry.replace(NONDET_API, DET_API, 1)
+        assert det_entry != entry and det_entry in det_package.__all__, entry
+        assert _shape(
+            inspect.signature(getattr(pkg, entry)).parameters.values()
+        ) == _shape(
+            inspect.signature(getattr(det_package, det_entry)).parameters.values()
+        ), entry
 
 
 def _expected_alert(entry: str, warn_only: bool) -> str:
@@ -3372,16 +3541,17 @@ def test_alert_wording_in_both_torch_modes() -> None:
 
 @pytest.mark.cpu_only
 def test_no_entry_alerts_before_its_operands_pass(monkeypatch) -> None:
-    """With ``deterministic=False`` under PyTorch's deterministic algorithms (strict and ``warn_only=True``): the alert
+    """Under PyTorch's deterministic algorithms (strict and ``warn_only=True``): the alert
     belongs to the unordered ``dfn`` reduction, so it is raised right before the launches of ``backward_finish``
     (validated operands, ``T > 0``; the GPU suite checks it there and that ``T == 0`` does not alert).  On the CPU
     operands here every entry point, ``backward_finish`` included, refuses its operands with no alert and launches
-    nothing (warnings are errors)."""
+    nothing (warnings are errors); ``cake_mhc_nondet_train_finish`` refuses the handle its prepare did not make with a
+    ``TypeError`` that names the deterministic finish."""
     launched = []
     monkeypatch.setattr(pkg, "_launch_route", lambda *a, **k: launched.append(a))
     monkeypatch.setattr(pkg, "_run_route", lambda *a, **k: launched.append(a))
-    calls = _cpu_calls(deterministic=False)
-    assert "cake_mhc_train_backward_finish" in calls
+    calls = _cpu_calls()
+    assert "cake_mhc_nondet_train_backward_finish" in calls
     for warn_only in (False, True):
         with _torch_deterministic(True, warn_only=warn_only), warnings.catch_warnings():
             warnings.simplefilter("error")
@@ -3389,7 +3559,9 @@ def test_no_entry_alerts_before_its_operands_pass(monkeypatch) -> None:
                 with pytest.raises((ValueError, TypeError)) as info:
                     call()
                 assert _ALERT not in str(info.value), (name, warn_only)
-                assert _REFUSAL not in str(info.value), (name, warn_only)
+                if name == "cake_mhc_nondet_train_finish":
+                    assert info.type is TypeError, warn_only
+                    assert str(info.value) == _HANDLE_REFUSAL, warn_only
     assert launched == []
 
 
@@ -3400,11 +3572,13 @@ def test_no_entry_alerts_before_its_operands_pass(monkeypatch) -> None:
 @pytest.mark.cpu_only
 def test_package_wiring() -> None:
     """The test-helper key, ``flashinfer.experimental.cake`` (a docstring only), the package data, the ignored
-    ``aot/`` directory and the pre-commit exclude of the generated sources; no module is left at the removed
-    ``flashinfer.cake_mhc_train_backend`` path."""
+    ``aot/`` directory and the pre-commit exclude of the generated sources; no key, package data, exclude or module
+    is left at the former paths (``flashinfer.experimental.cake.cake_mhc_train_backend`` and its
+    ``cake_mhc_train`` module, the 0.7.3 ``flashinfer.cake_mhc_train_backend``)."""
     assert PACKAGES[KEY] == PACKAGE_NAME == pkg.__name__
-    assert "flashinfer.cake_mhc_train_backend" not in PACKAGES.values()
-    assert "cake_mhc_train" not in PACKAGES
+    for former in FORMER_PACKAGES:
+        assert former not in PACKAGES.values(), former
+    assert not {"cake_mhc_train", "cake.cake_mhc_train"} & set(PACKAGES)
     tree = ast.parse((REPO / "flashinfer/experimental/cake/__init__.py").read_text())
     assert ast.get_docstring(tree)
     assert len(tree.body) == 1, "flashinfer.experimental.cake holds a docstring only"
@@ -3415,13 +3589,36 @@ def test_package_wiring() -> None:
     data = tomllib.loads((REPO / "pyproject.toml").read_text())
     package_data = data["tool"]["setuptools"]["package-data"]
     assert package_data[PACKAGE_NAME] == ["csrc/**", "build.json"]
-    assert "flashinfer.cake_mhc_train_backend" not in package_data
+    for former in FORMER_PACKAGES:
+        assert former not in package_data, former
     assert "aot/" in (PACKAGE_DIR / ".gitignore").read_text().split()
-    assert (
-        "experimental/cake/cake_mhc_train_backend/csrc/"
-        in (REPO / ".pre-commit-config.yaml").read_text()
+    pre_commit = (REPO / ".pre-commit-config.yaml").read_text()
+    # pre-commit skips every generated source of the package (a per-package entry or the generic #8928 rule), still
+    # checks its Python modules; the former tree holds no sources (the shared exclude may still list its path)
+    exclude = re.compile(
+        next(ln for ln in pre_commit.splitlines() if ln.startswith("exclude:"))
+        .split(":", 1)[1]
+        .strip()
     )
-    assert not list((REPO / "flashinfer" / "cake_mhc_train_backend").glob("*.py"))
+    root, package_dir = REPO.resolve(), PACKAGE_DIR.resolve()
+    sources = [
+        p.relative_to(root).as_posix()
+        for p in sorted((package_dir / "csrc").rglob("*"))
+        if p.is_file()
+    ]
+    assert sources and all(exclude.search(p) for p in sources), [
+        p for p in sources if not exclude.search(p)
+    ]
+    assert not exclude.search(
+        (package_dir / "cake_jit.py").relative_to(root).as_posix()
+    )
+    assert not list(
+        (REPO / "flashinfer/experimental/cake/cake_mhc_train_backend/csrc").glob("*")
+    )
+    for former in FORMER_PACKAGES:
+        directory = REPO.joinpath(*former.split("."))
+        assert not list(directory.glob("*.py")), former
+    assert not (REPO / "flashinfer/experimental/cake/cake_mhc_train.py").exists()
 
 
 @pytest.mark.cpu_only
@@ -3478,9 +3675,8 @@ def _manifest_checker():
 
 @pytest.mark.cpu_only
 def test_manifest_checker_lists_the_package() -> None:
-    """The build-manifest checker lists this package once (generic registry walker over ``cake_jit.py``) and no removed
-    ``flashinfer.cake_mhc_train_backend``; its vendored gate finds the package's suite key; the in-tree checks report
-    nothing."""
+    """The build-manifest checker lists this package once (generic registry walker over ``cake_jit.py``) and no former
+    path (``FORMER_PACKAGES``); its vendored gate finds the package's suite key; the in-tree checks report nothing."""
     checker = _manifest_checker()
     try:
         path = str(PACKAGE_DIR.relative_to(REPO.resolve()))
@@ -3493,8 +3689,6 @@ def test_manifest_checker_lists_the_package() -> None:
     (entry,) = entries
     assert (entry.path, entry.loader) == (path, "cake_jit.py")
     assert entry.refs is checker.refs_generic
-    assert not [
-        p for p in checker.PACKAGES if p.name == "flashinfer.cake_mhc_train_backend"
-    ]
+    assert not [p for p in checker.PACKAGES if p.name in FORMER_PACKAGES]
     assert checker.suite_key(REPO, entry) == KEY
     assert checker.run_in_tree(REPO, [entry]) == []

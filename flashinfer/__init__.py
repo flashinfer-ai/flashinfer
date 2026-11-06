@@ -190,6 +190,9 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
         ".cake_causal_conv1d_det_train",
         "cake_causal_conv1d_det_train_forward_workspace_bytes",
     ),
+    "CakeMHCDetFinishFunction": (".cake_mhc_det_train", "CakeMHCDetFinishFunction"),
+    "CakeMHCDetPrepareFunction": (".cake_mhc_det_train", "CakeMHCDetPrepareFunction"),
+    "CakeMHCHeadDetFunction": (".cake_mhc_head_det_train", "CakeMHCHeadDetFunction"),
     "cake_lm_head_det_train": (".cake_lm_head_det_train", None),
     # The deterministic Cake MoE grouped GEMM: the names of its module.
     **{
@@ -402,15 +405,6 @@ from .cake_causal_conv1d_det_train import (
 )
 
 from .cake_mhc_det_train import (
-    CakeMHCDetTrainFinishFunction as CakeMHCDetTrainFinishFunction,
-)
-from .cake_mhc_det_train import (
-    CakeMHCDetTrainHeadFunction as CakeMHCDetTrainHeadFunction,
-)
-from .cake_mhc_det_train import (
-    CakeMHCDetTrainPrepareFunction as CakeMHCDetTrainPrepareFunction,
-)
-from .cake_mhc_det_train import (
     cake_mhc_det_train_backward_finish as cake_mhc_det_train_backward_finish,
 )
 from .cake_mhc_det_train import (
@@ -432,14 +426,14 @@ from .cake_mhc_det_train import (
 from .cake_mhc_det_train import (
     cake_mhc_det_train_forward_workspace_bytes as cake_mhc_det_train_forward_workspace_bytes,
 )
-from .cake_mhc_det_train import cake_mhc_det_train_head as cake_mhc_det_train_head
-from .cake_mhc_det_train import (
-    cake_mhc_det_train_head_backward as cake_mhc_det_train_head_backward,
-)
-from .cake_mhc_det_train import (
-    cake_mhc_det_train_head_forward as cake_mhc_det_train_head_forward,
-)
 from .cake_mhc_det_train import cake_mhc_det_train_prepare as cake_mhc_det_train_prepare
+from .cake_mhc_head_det_train import cake_mhc_head_det as cake_mhc_head_det
+from .cake_mhc_head_det_train import (
+    cake_mhc_head_det_train_backward as cake_mhc_head_det_train_backward,
+)
+from .cake_mhc_head_det_train import (
+    cake_mhc_head_det_train_forward as cake_mhc_head_det_train_forward,
+)
 from .cake_gdp import (
     cake_gated_delta_product_mtp as cake_gated_delta_product_mtp,
 )
