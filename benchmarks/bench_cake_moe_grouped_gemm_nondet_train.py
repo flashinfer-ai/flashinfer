@@ -23,7 +23,7 @@ through the autograd wrapper under ``torch.utils.checkpoint`` (non-reentrant,
 early stop off so that every arm recomputes its forward), both gradients included.
 Opt-in autograd rows over the same distributions: ``step_es``, that step with
 checkpoint early stop on (the torch default: an arm whose inputs are saved
-before its GEMM launches, ``cake_det``, ``cake`` and ``torch._grouped_mm``,
+before its GEMM launches, ``cake_det``, ``cake_nondet`` and ``torch._grouped_mm``,
 skips the recomputed forward); ``block`` / ``block_es``, one checkpointed MoE expert
 block with early stop off / on -- gate_up, ``silu(a) * b`` on its two halves,
 down, with the gradients of ``x``, ``w1`` and ``w2`` -- in which only the
@@ -32,14 +32,14 @@ useful work only (forward, data and weight gradient of each GEMM); the ``step``
 rows keep their earlier count, which includes the recomputed forward.
 
 Arms: ``cake_det`` (the deterministic package,
-``flashinfer.experimental.cake_moe_grouped_det_gemm``), ``cake``
-(``flashinfer.experimental.cake.cake_moe_grouped_gemm`` with
-``deterministic=False``), ``torch._grouped_mm``, a per-group cuBLAS loop with
-host-known bounds and ``flashinfer.grouped_mm.grouped_mm_bf16`` (cuDNN; fwd /
-dgrad only); opt-in ``cake_inforward``, ``cake`` through a direct
-``CakeGroupedMm.apply(x, w, offs, False)``, whose forward GEMM launches inside
-``forward`` so that a checkpoint always recomputes it (autograd rows only; when
-it runs with ``cake``, the JSON records the elements in which their outputs and
+``flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train``), ``cake_nondet``
+(``flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train``),
+``torch._grouped_mm``, a per-group cuBLAS loop with host-known bounds and
+``flashinfer.grouped_mm.grouped_mm_bf16`` (cuDNN; fwd / dgrad only); opt-in
+``cake_nondet_inforward``, ``cake_nondet`` through a direct
+``CakeMoEGroupedGemmNondetFunction.apply(x, w, offs)``, whose forward GEMM launches
+inside ``forward`` so that a checkpoint always recomputes it (autograd rows only; when
+it runs with ``cake_nondet``, the JSON records the elements in which their outputs and
 gradients differ -- none in the output and ``x.grad``).  ``--census`` adds the
 CUDA kernel count of one call per arm (``torch.profiler``).  Each row reports
 the median time with a cold L2 between
@@ -47,8 +47,8 @@ iterations (and the 10th / 90th percentiles), the peak device memory one
 preparation and launch takes beyond its inputs and output (the Cake arms'
 kept stream workspaces included: they are dropped before the measurement) and
 the memory it retains, the Cake plans (stages, tail split, whether the split
-tail is unordered), the error of the ``cake`` output against ``cake_det``, and
-the ``cake`` / ``cake_det`` time ratio.  Consecutive rows run the arms in
+tail is unordered), the error of the ``cake_nondet`` output against ``cake_det``, and
+the ``cake_nondet`` / ``cake_det`` time ratio.  Consecutive rows run the arms in
 alternating order (the JSON records it as ``arm_order``); an arm with no
 program for the device is dropped.
 
@@ -78,9 +78,9 @@ forward, data gradient and weight gradient), ``det_mgB`` (the
 deterministic autograd wrapper's bf16 ``w.grad``, then the fp32
 ``main_grad.add_``; the deterministic bf16 ``dW`` and the add in
 ``wgrad_acc``) and ``det_mgX`` (the deterministic package's own accumulate:
-``cake_grouped_det_mm(..., fuse_wgrad_accumulation=True)`` into the fp32
+``cake_moe_grouped_gemm_det(..., fuse_wgrad_accumulation=True)`` into the fp32
 ``main_grad`` with the ``grad_added_to_main_grad`` placeholder;
-``prepare_grouped_det_gemm_wgrad(..., accumulate=True)`` in ``wgrad_acc``).
+``cake_moe_grouped_gemm_det_train_prepare_wgrad(..., accumulate=True)`` in ``wgrad_acc``).
 The peak memory includes the placeholder gradient and every temporary.  A
 fused arm records ``plan["accumulate"]`` and, where the device serves an
 accumulate build of its dtype, fails unless the row is fused
@@ -93,9 +93,9 @@ cuBLAS) are not arms of this benchmark.
 
 Usage::
 
-    python benchmarks/bench_cake_moe_grouped_gemm.py [--ops fwd,wgrad,step] [--rows e4_m112576] [--arms cake_det,cake] [--cupti] [--json out.json]
-    python benchmarks/bench_cake_moe_grouped_gemm.py --ops step,step_es,block,block_es --arms cake_det,cake,cake_inforward,torch_grouped_mm [--census]
-    python benchmarks/bench_cake_moe_grouped_gemm.py --ops acc,bwd_acc,wgrad_acc --arms ovw,acc,mgB,mgF,mgO,mgX,mgXn,mgX_zero,accX,det_acc,det_mgB,det_mgX
+    python benchmarks/bench_cake_moe_grouped_gemm_nondet_train.py [--ops fwd,wgrad,step] [--rows e4_m112576] [--arms cake_det,cake_nondet] [--cupti] [--json out.json]
+    python benchmarks/bench_cake_moe_grouped_gemm_nondet_train.py --ops step,step_es,block,block_es --arms cake_det,cake_nondet,cake_nondet_inforward,torch_grouped_mm [--census]
+    python benchmarks/bench_cake_moe_grouped_gemm_nondet_train.py --ops acc,bwd_acc,wgrad_acc --arms ovw,acc,mgB,mgF,mgO,mgX,mgXn,mgX_zero,accX,det_acc,det_mgB,det_mgX
 """
 
 import argparse
@@ -106,12 +106,16 @@ import torch
 import torch.profiler
 import torch.utils.checkpoint
 
-from flashinfer.experimental.cake import cake_moe_grouped_gemm as pkg
-from flashinfer.experimental.cake.cake_moe_grouped_gemm import cake_backend as cb
-import flashinfer.experimental.cake_moe_grouped_det_gemm as det_pkg
-from flashinfer.experimental.cake_moe_grouped_det_gemm import cake_backend as det_cb
-from flashinfer.experimental.cake_moe_grouped_det_gemm.cake_autograd import (
-    cake_grouped_det_mm,
+import flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train as pkg
+from flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train import (
+    cake_backend as cb,
+)
+import flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train as det_pkg
+from flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train import (
+    cake_backend as det_cb,
+)
+from flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train.cake_autograd import (
+    cake_moe_grouped_gemm_det,
 )
 from flashinfer.testing import bench_gpu_time
 
@@ -160,7 +164,13 @@ EXPERT_COUNT_SUM_M = 131072
 # E=32 over EXPERT_COUNT_SUM_M rows, 16 short groups beside 16 long ones: an average of 4096 rows keeps the
 # 512-wide k tile, whose accumulate epilogue then runs tiles of short mainloops.
 ACC_SHORT_E32 = [64 + 28 * i for i in range(16)] + [7918] * 16
-ARMS = ("cake_det", "cake", "torch_grouped_mm", "per_expert_cublas", "cudnn_grouped_mm")
+ARMS = (
+    "cake_det",
+    "cake_nondet",
+    "torch_grouped_mm",
+    "per_expert_cublas",
+    "cudnn_grouped_mm",
+)
 ACC_ARMS = (
     "ovw",
     "acc",
@@ -384,9 +394,9 @@ def _step(autograd_fn, t, early_stop=False):
     Early stop off (the ``step`` rows): every arm recomputes its forward GEMM,
     ``2 x forward + backward``.  On (the torch default, the ``step_es`` rows): the
     recompute stops once the region saved its last tensor, so an arm whose inputs are
-    saved before its GEMM launches (``torch._grouped_mm``, ``cake_grouped_det_mm``,
-    ``cake_grouped_mm``) does one GEMM less, and one that launches inside
-    ``Function.forward`` (``cake_inforward``) still recomputes it."""
+    saved before its GEMM launches (``torch._grouped_mm``, ``cake_moe_grouped_gemm_det``,
+    ``cake_moe_grouped_gemm_nondet``) does one GEMM less, and one that launches inside
+    ``Function.forward`` (``cake_nondet_inforward``) still recomputes it."""
     return _checkpointed(autograd_fn, t, ("x", "w"), early_stop)
 
 
@@ -422,10 +432,12 @@ def _cake_arm(backend, row, t):
     deterministic = backend is det_cb
     if op in AUTOGRAD_OPS:
         if deterministic:
-            fn = _autograd(lambda x, w, offs: cake_grouped_det_mm(x, w, offs), row, t)
+            fn = _autograd(
+                lambda x, w, offs: cake_moe_grouped_gemm_det(x, w, offs), row, t
+            )
         else:
             fn = _autograd(
-                lambda x, w, offs: pkg.cake_grouped_mm(x, w, offs, deterministic=False),
+                lambda x, w, offs: pkg.cake_moe_grouped_gemm_nondet(x, w, offs),
                 row,
                 t,
             )
@@ -435,18 +447,18 @@ def _cake_arm(backend, row, t):
         args = (t["g"], t["x"])
     if deterministic:
         prepare = {
-            "fwd": det_cb.prepare_grouped_det_gemm_fwd,
-            "dgrad": det_cb.prepare_grouped_det_gemm_dgrad,
-            "wgrad": det_cb.prepare_grouped_det_gemm_wgrad,
+            "fwd": det_cb.cake_moe_grouped_gemm_det_train_prepare_forward,
+            "dgrad": det_cb.cake_moe_grouped_gemm_det_train_prepare_dgrad,
+            "wgrad": det_cb.cake_moe_grouped_gemm_det_train_prepare_wgrad,
         }[op]
         launch = prepare(*args, t["offs"], out=t["out"])
     else:
         prepare = {
-            "fwd": cb.prepare_grouped_gemm_fwd,
-            "dgrad": cb.prepare_grouped_gemm_dgrad,
-            "wgrad": cb.prepare_grouped_gemm_wgrad,
+            "fwd": cb.cake_moe_grouped_gemm_nondet_train_prepare_forward,
+            "dgrad": cb.cake_moe_grouped_gemm_nondet_train_prepare_dgrad,
+            "wgrad": cb.cake_moe_grouped_gemm_nondet_train_prepare_wgrad,
         }[op]
-        launch = prepare(*args, t["offs"], out=t["out"], deterministic=False)
+        launch = prepare(*args, t["offs"], out=t["out"])
     return launch.launch, launch, _plan_note(launch)
 
 
@@ -454,22 +466,28 @@ def cake_det_arm(row, t):
     return _cake_arm(det_cb, row, t)
 
 
-def cake_arm(row, t):
+def cake_nondet_arm(row, t):
     return _cake_arm(cb, row, t)
 
 
-def cake_inforward_arm(row, t):
-    """``cake`` through a direct ``CakeGroupedMm.apply``: the forward GEMM launches
-    inside ``forward``, before autograd saves the inputs, as before the wrapper
-    deferred it (the internal control of the autograd rows)."""
+def cake_nondet_inforward_arm(row, t):
+    """``cake_nondet`` through a direct ``CakeMoEGroupedGemmNondetFunction.apply``: the
+    forward GEMM launches inside ``forward``, before autograd saves the inputs, as
+    before the wrapper deferred it (the internal control of the autograd rows)."""
     op = row["op"]
     if op not in AUTOGRAD_OPS:
         raise NotImplementedError("the in-forward control has autograd rows only")
     _no_acc_rows(op)
     fn = _autograd(
-        lambda x, w, offs: pkg.CakeGroupedMm.apply(x, w, offs, False), row, t
+        lambda x, w, offs: pkg.CakeMoEGroupedGemmNondetFunction.apply(x, w, offs),
+        row,
+        t,
     )
-    return fn, None, f"{AUTOGRAD_NOTES[op]} (direct CakeGroupedMm.apply)"
+    return (
+        fn,
+        None,
+        f"{AUTOGRAD_NOTES[op]} (direct CakeMoEGroupedGemmNondetFunction.apply)",
+    )
 
 
 def torch_grouped_mm_arm(row, t):
@@ -581,9 +599,9 @@ class _MainGradMm(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, w, offs, mode):
         if mode == "det_acc":
-            y = det_pkg.grouped_det_gemm_fwd(x, w, offs)
+            y = det_pkg.cake_moe_grouped_gemm_det_train_forward(x, w, offs)
         else:
-            y = pkg.grouped_gemm_fwd(x, w, offs, deterministic=False)
+            y = pkg.cake_moe_grouped_gemm_nondet_train_forward(x, w, offs)
         ctx.save_for_backward(x, w, offs)
         ctx.w, ctx.mode = w, mode
         return y
@@ -598,22 +616,24 @@ class _MainGradMm(torch.autograd.Function):
         dx = None
         if ctx.needs_input_grad[0]:
             if det:
-                dx = det_pkg.grouped_det_gemm_dgrad(g, w, offs)
+                dx = det_pkg.cake_moe_grouped_gemm_det_train_dgrad(g, w, offs)
             else:
-                dx = pkg.grouped_gemm_dgrad(g, w, offs, deterministic=False)
+                dx = pkg.cake_moe_grouped_gemm_nondet_train_dgrad(g, w, offs)
         main_grad = ctx.w.main_grad
         if det:
             main_grad.add_(
-                det_pkg.grouped_det_gemm_wgrad(g, x, offs, out_dtype=torch.float32)
+                det_pkg.cake_moe_grouped_gemm_det_train_wgrad(
+                    g, x, offs, out_dtype=torch.float32
+                )
             )
         elif ctx.mode == "mgF":
             main_grad.add_(
-                pkg.grouped_gemm_wgrad(
-                    g, x, offs, out_dtype=torch.float32, deterministic=False
+                pkg.cake_moe_grouped_gemm_nondet_train_wgrad(
+                    g, x, offs, out_dtype=torch.float32
                 )
             )
         else:
-            pkg.grouped_gemm_wgrad(g, x, offs, out=main_grad, deterministic=False)
+            pkg.cake_moe_grouped_gemm_nondet_train_wgrad(g, x, offs, out=main_grad)
         return dx, None, None, None
 
 
@@ -670,17 +690,17 @@ def _acc_autograd(arm, t, op):
     if arm in ("ovw", "acc", "mgB"):
 
         def mm(a, b, o):
-            return pkg.cake_grouped_mm(a, b, o, deterministic=False)
+            return pkg.cake_moe_grouped_gemm_nondet(a, b, o)
 
     elif arm == "det_mgB":
 
         def mm(a, b, o):
-            return cake_grouped_det_mm(a, b, o)
+            return cake_moe_grouped_gemm_det(a, b, o)
 
     elif arm == "det_mgX":
 
         def mm(a, b, o):
-            return cake_grouped_det_mm(a, b, o, fuse_wgrad_accumulation=True)
+            return cake_moe_grouped_gemm_det(a, b, o, fuse_wgrad_accumulation=True)
 
     elif arm in ("mgF", "mgO", "det_acc"):
 
@@ -690,8 +710,8 @@ def _acc_autograd(arm, t, op):
     else:
 
         def mm(a, b, o):
-            return pkg.cake_grouped_mm(
-                a, b, o, deterministic=False, fuse_wgrad_accumulation=True
+            return pkg.cake_moe_grouped_gemm_nondet(
+                a, b, o, fuse_wgrad_accumulation=True
             )
 
     y_once = mm(x, w, offs) if op == "bwd_acc" else None
@@ -725,8 +745,8 @@ def _acc_wgrad(arm, t):
     mg32, mg16 = t["main_grad32"], t["main_grad16"]
 
     def prepare(out, accumulate=False):
-        return cb.prepare_grouped_gemm_wgrad(
-            g, x, offs, out=out, deterministic=False, accumulate=accumulate
+        return cb.cake_moe_grouped_gemm_nondet_train_prepare_wgrad(
+            g, x, offs, out=out, accumulate=accumulate
         )
 
     if arm in ("mgXn", "mgX_zero"):
@@ -736,7 +756,7 @@ def _acc_wgrad(arm, t):
     if arm == "det_mgX":
         # The deterministic package's accumulate: its fp32 dW into the launch's scratch,
         # then the add.
-        return det_cb.prepare_grouped_det_gemm_wgrad(
+        return det_cb.cake_moe_grouped_gemm_det_train_prepare_wgrad(
             g, x, offs, out=mg32, accumulate=True
         ).launch
     if arm in DET_ACC_ARMS:
@@ -744,7 +764,9 @@ def _acc_wgrad(arm, t):
         # Megatron's unfused path) into a temporary, then the fp32 add into main_grad.
         dtype = torch.float32 if arm == "det_acc" else torch.bfloat16
         tmp = torch.empty(mg32.shape, dtype=dtype, device=mg32.device)
-        det_launch = det_cb.prepare_grouped_det_gemm_wgrad(g, x, offs, out=tmp)
+        det_launch = det_cb.cake_moe_grouped_gemm_det_train_prepare_wgrad(
+            g, x, offs, out=tmp
+        )
 
         def run_det():
             det_launch.launch()
@@ -787,17 +809,17 @@ def _acc_arm(arm):
 
 ARM_BUILDERS = {
     "cake_det": cake_det_arm,
-    "cake": cake_arm,
+    "cake_nondet": cake_nondet_arm,
     "torch_grouped_mm": torch_grouped_mm_arm,
     "per_expert_cublas": per_expert_cublas_arm,
     "cudnn_grouped_mm": cudnn_grouped_mm_arm,
-    "cake_inforward": cake_inforward_arm,
+    "cake_nondet_inforward": cake_nondet_inforward_arm,
     **{arm: _acc_arm(arm) for arm in ACC_ARMS},
 }
 CAKE_BACKENDS = {
     "cake_det": det_cb,
-    "cake": cb,
-    "cake_inforward": cb,
+    "cake_nondet": cb,
+    "cake_nondet_inforward": cb,
     **dict.fromkeys(ACC_ARMS, cb),
     **dict.fromkeys(DET_ACC_ARMS, det_cb),
 }
@@ -832,13 +854,13 @@ def _memory(arm, row, t, device):
 
 
 def _error_vs_det(row, t, outs):
-    """The ``cake`` output against ``cake_det``'s in the deterministic budget's unit
+    """The ``cake_nondet`` output against ``cake_det``'s in the deterministic budget's unit
     (bf16: worst |d| / (1e-2 + 1e-2 |ref|); fp32: rel-L2 / 1e-4) and the count of
     differing elements."""
-    if "cake" not in outs or "cake_det" not in outs:
+    if "cake_nondet" not in outs or "cake_det" not in outs:
         return None
-    out, ref = outs["cake"].float(), outs["cake_det"].float()
-    differing = int((outs["cake"] != outs["cake_det"]).sum())
+    out, ref = outs["cake_nondet"].float(), outs["cake_det"].float()
+    differing = int((outs["cake_nondet"] != outs["cake_det"]).sum())
     if row["op"] == "wgrad" and row["out_dtype"] == torch.float32:
         err = float((out - ref).norm() / ref.norm().clamp_min(1e-30)) / 1e-4
     else:
@@ -852,16 +874,18 @@ def _autograd_outputs(fn):
     return [y.detach()] + [leaf.grad for leaf in leaves]
 
 
-def _cake_vs_inforward(row, grads):
-    """The count of elements in which the ``cake`` and ``cake_inforward`` output and
-    gradients differ (the output and ``x.grad`` must be equal; a weight gradient may
-    differ where its split tail is unordered)."""
+def _cake_nondet_vs_inforward(row, grads):
+    """The count of elements in which the ``cake_nondet`` and ``cake_nondet_inforward``
+    output and gradients differ (the output and ``x.grad`` must be equal; a weight
+    gradient may differ where its split tail is unordered)."""
     if len(grads) < 2:
         return None
     names = ("out", "x.grad", "w1.grad", "w2.grad")
     if row["op"] not in BLOCK_OPS:
         names = ("y", "x.grad", "w.grad")
-    pairs = zip(names, grads["cake"], grads["cake_inforward"], strict=True)
+    pairs = zip(
+        names, grads["cake_nondet"], grads["cake_nondet_inforward"], strict=True
+    )
     return {name: int((a != b).sum()) for name, a, b in pairs}
 
 
@@ -963,8 +987,11 @@ def main():
         # Alternate the arm order between measured rows so that no arm always runs first.
         row_arms = arms if len(results) % 2 == 0 else arms[::-1]
         record["arm_order"] = list(row_arms)
-        # An autograd row run by both cake and cake_inforward compares their results.
-        check = row["op"] in AUTOGRAD_OPS and {"cake", "cake_inforward"} <= set(arms)
+        # An autograd row run by both cake_nondet and cake_nondet_inforward compares their results.
+        check = row["op"] in AUTOGRAD_OPS and {
+            "cake_nondet",
+            "cake_nondet_inforward",
+        } <= set(arms)
         cells, outs, grads = {}, {}, {}
         for arm in row_arms:
             try:
@@ -976,7 +1003,7 @@ def main():
                     fn()
                     torch.cuda.synchronize(device)
                     outs[arm] = t["out"].clone()
-                if check and arm in ("cake", "cake_inforward"):
+                if check and arm in ("cake_nondet", "cake_nondet_inforward"):
                     grads[arm] = _autograd_outputs(fn)
                     torch.cuda.synchronize(device)
                 if args.census:
@@ -995,9 +1022,9 @@ def main():
                 cells[arm] = f"{'n/a':>24s}"
         ratio = None
         det_ms = record["arms"].get("cake_det", {}).get("median_ms")
-        cake_ms = record["arms"].get("cake", {}).get("median_ms")
-        if det_ms and cake_ms:
-            ratio = cake_ms / det_ms
+        nondet_ms = record["arms"].get("cake_nondet", {}).get("median_ms")
+        if det_ms and nondet_ms:
+            ratio = nondet_ms / det_ms
         record["cake_over_det"] = ratio
         if row["op"] in ACC_OPS:
             medians = {a: e.get("median_ms") for a, e in record["arms"].items()}
@@ -1008,7 +1035,7 @@ def main():
             }
         record["cake_vs_det_output"] = _error_vs_det(row, t, outs)
         if check:
-            record["cake_vs_inforward"] = _cake_vs_inforward(row, grads)
+            record["cake_nondet_vs_inforward"] = _cake_nondet_vs_inforward(row, grads)
         results.append(record)
         print(
             f"{row['label']:48s} {sum(row['sizes']):7d} "
@@ -1018,9 +1045,11 @@ def main():
         if record.get("acc_ratios"):
             shown = " ".join(f"{k} {v:.4f}" for k, v in record["acc_ratios"].items())
             print(f"# {row['label']}: {shown}")
-        differing = record.get("cake_vs_inforward") or {}
+        differing = record.get("cake_nondet_vs_inforward") or {}
         if any(differing.get(name) for name in ("y", "out", "x.grad")):
-            print(f"# {row['label']}: cake differs from cake_inforward {differing}")
+            print(
+                f"# {row['label']}: cake_nondet differs from cake_nondet_inforward {differing}"
+            )
         del t, outs, grads
         torch.cuda.empty_cache()
 
@@ -1029,7 +1058,7 @@ def main():
         geo = math.exp(sum(math.log(v) for v in ratios) / len(ratios))
         slower = [r["label"] for r in results if (r["cake_over_det"] or 0) > 1.0]
         print(
-            f"# cake / cake_det median-time ratio: geomean {geo:.4f} over {len(ratios)} rows; "
+            f"# cake_nondet / cake_det median-time ratio: geomean {geo:.4f} over {len(ratios)} rows; "
             f"{len(slower)} rows slower"
         )
     if args.json:

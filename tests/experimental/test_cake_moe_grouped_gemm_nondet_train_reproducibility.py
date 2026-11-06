@@ -19,7 +19,7 @@ deterministic package.
 Over the 58 MoE projection rows of the benchmark and the edge cases of the
 deterministic package's determinism suite (seeded fixed inputs per case):
 
-* the facade (``deterministic=False``, the only mode it takes) gives the
+* the module ``flashinfer.cake_moe_grouped_gemm_nondet_train`` gives the
   deterministic package's bits for ``fwd`` and ``dgrad``;
 * ``fwd`` and ``dgrad`` of the non-deterministic package give the deterministic
   package's bits, the data gradient's own sm_100a L2 evict-first build included
@@ -51,13 +51,13 @@ import torch
 
 pytest.importorskip("tvm_ffi")
 
-import flashinfer.experimental.cake.grouped_mm as facade
+import flashinfer.cake_moe_grouped_gemm_nondet_train as facade
 from tests.test_helpers.cake_package import cake_package
 
-cb = cake_package("cake.cake_moe_grouped_gemm", "cake_backend")
-cake_jit = cake_package("cake.cake_moe_grouped_gemm", "cake_jit")
-det_cb = cake_package("cake_moe_grouped_det_gemm", "cake_backend")
-det_jit = cake_package("cake_moe_grouped_det_gemm", "cake_jit")
+cb = cake_package("cake_moe_grouped_gemm_nondet_train", "cake_backend")
+cake_jit = cake_package("cake_moe_grouped_gemm_nondet_train", "cake_jit")
+det_cb = cake_package("cake_moe_grouped_gemm_det_train", "cake_backend")
+det_jit = cake_package("cake_moe_grouped_gemm_det_train", "cake_jit")
 HOST_PLAN_CONSTANTS = cake_jit.HOST_PLAN_CONSTANTS
 
 REPEATS = 10  # launches per output pre-state (zero bytes, then FILL_BYTE)
@@ -66,7 +66,7 @@ FILL_BYTE = 0x5A
 ATOL = RTOL = 1e-2  # bf16 outputs
 FP32_REL_L2 = 1e-4  # fp32 weight gradient
 
-# The 58 MoE projection rows of benchmarks/bench_cake_moe_grouped_gemm.py.
+# The 58 MoE projection rows of benchmarks/bench_cake_moe_grouped_gemm_nondet_train.py.
 BENCH_PROJ = {"gate_up": (4096, 6144), "down": (6144, 2048)}
 E4_GROUPS = {
     112576: {
@@ -293,26 +293,32 @@ def _prepare(backend, case, a, b, offs, out):
     non-deterministic (``cb``) package."""
     if backend is det_cb:
         if case.op == "fwd":
-            return det_cb.prepare_grouped_det_gemm_fwd(a, b, offs, out=out)
+            return det_cb.cake_moe_grouped_gemm_det_train_prepare_forward(
+                a, b, offs, out=out
+            )
         if case.op == "dgrad":
-            return det_cb.prepare_grouped_det_gemm_dgrad(a, b, offs, out=out)
-        return det_cb.prepare_grouped_det_gemm_wgrad(
+            return det_cb.cake_moe_grouped_gemm_det_train_prepare_dgrad(
+                a, b, offs, out=out
+            )
+        return det_cb.cake_moe_grouped_gemm_det_train_prepare_wgrad(
             a, b, offs, out=out, out_dtype=case.out_dtype
         )
     if case.op == "fwd":
-        return cb.prepare_grouped_gemm_fwd(a, b, offs, out=out, deterministic=False)
+        return cb.cake_moe_grouped_gemm_nondet_train_prepare_forward(
+            a, b, offs, out=out
+        )
     if case.op == "dgrad":
-        return cb.prepare_grouped_gemm_dgrad(a, b, offs, out=out, deterministic=False)
-    return cb.prepare_grouped_gemm_wgrad(
-        a, b, offs, out=out, out_dtype=case.out_dtype, deterministic=False
+        return cb.cake_moe_grouped_gemm_nondet_train_prepare_dgrad(a, b, offs, out=out)
+    return cb.cake_moe_grouped_gemm_nondet_train_prepare_wgrad(
+        a, b, offs, out=out, out_dtype=case.out_dtype
     )
 
 
 def _facade(case, a, b, offs, out):
     """The facade's call of a ``fwd`` / ``dgrad`` case (non-deterministic only)."""
     if case.op == "fwd":
-        return facade.grouped_gemm_fwd(a, b, offs, out=out, deterministic=False)
-    return facade.grouped_gemm_dgrad(a, b, offs, out=out, deterministic=False)
+        return facade.cake_moe_grouped_gemm_nondet_train_forward(a, b, offs, out=out)
+    return facade.cake_moe_grouped_gemm_nondet_train_dgrad(a, b, offs, out=out)
 
 
 def _bits(out):
@@ -396,7 +402,7 @@ def test_routes_mirror_the_deterministic_package():
     architecture whose host plan never selects it (not in ``wave_sync_archs`` for the
     route's k tile).  The accumulate stages of the 512-wide k tile (``<stage>_acc``,
     which the deterministic package does not have) are left out of the mirror; their
-    twins are mirrored, and ``test_cake_moe_grouped_gemm_acc.py`` checks them against
+    twins are mirrored, and ``test_cake_moe_grouped_gemm_nondet_train_acc.py`` checks them against
     their twins.  So is a stage of ``OWN_STAGES`` on an architecture where the
     deterministic route does not serve it (the data gradient's sm_100a
     ``main_wide_ef``, this package's own evict-first build): it is held to the

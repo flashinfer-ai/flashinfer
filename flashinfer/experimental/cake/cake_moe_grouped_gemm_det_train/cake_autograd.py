@@ -17,9 +17,9 @@ limitations under the License.
 # torch.autograd wrapper of the ragged BF16 MoE grouped GEMM: the forward
 # projection ``Y = X @ W[e].T`` with the activation gradient ``dX = G @ W[e]``
 # and the weight gradient ``dW[e] = G[e].T @ X[e]`` in ``backward``.
-# ``CakeGroupedDetMm`` calls the three generated programs as plain functions; no
-# torch custom op is registered.  ``cake_grouped_det_mm`` launches the forward
-# after ``CakeGroupedDetMm.apply`` returns, so autograd saves ``x``, ``w`` and
+# ``CakeMoEGroupedGemmDetFunction`` calls the three generated programs as plain functions; no
+# torch custom op is registered.  ``cake_moe_grouped_gemm_det`` launches the forward
+# after ``CakeMoEGroupedGemmDetFunction.apply`` returns, so autograd saves ``x``, ``w`` and
 # ``offs`` before the GEMM runs, as it does for a built-in op: a non-reentrant
 # checkpoint with early stop on (the torch default) then skips the recomputed
 # GEMM when these are the last saves of the innermost checkpointed region.
@@ -35,8 +35,8 @@ limitations under the License.
 # The package is deterministic only: no entry point takes a ``deterministic``
 # argument (passing one raises ``TypeError``), and
 # ``torch.use_deterministic_algorithms(True)`` changes nothing here (every launch
-# reduces in a fixed order).  The non-deterministic counterpart is
-# ``flashinfer.experimental.cake.cake_moe_grouped_gemm``.
+# reduces in a fixed order).  The non-deterministic counterpart is the module
+# ``flashinfer.cake_moe_grouped_gemm_nondet_train``.
 
 from __future__ import annotations
 
@@ -44,9 +44,9 @@ import torch
 
 from .cake_backend import (
     _require_flag,
-    prepare_grouped_det_gemm_dgrad,
-    prepare_grouped_det_gemm_fwd,
-    prepare_grouped_det_gemm_wgrad,
+    cake_moe_grouped_gemm_det_train_prepare_dgrad,
+    cake_moe_grouped_gemm_det_train_prepare_forward,
+    cake_moe_grouped_gemm_det_train_prepare_wgrad,
 )
 
 _MAIN_GRAD_DTYPES = (torch.float32, torch.bfloat16)
@@ -65,13 +65,13 @@ def _in_backward() -> bool:
 def _fwd_op(
     x: torch.Tensor, w: torch.Tensor, offs: torch.Tensor, out: torch.Tensor
 ) -> None:
-    prepare_grouped_det_gemm_fwd(x, w, offs, out=out).launch()
+    cake_moe_grouped_gemm_det_train_prepare_forward(x, w, offs, out=out).launch()
 
 
 def _dgrad_op(
     g: torch.Tensor, w: torch.Tensor, offs: torch.Tensor, out: torch.Tensor
 ) -> None:
-    prepare_grouped_det_gemm_dgrad(g, w, offs, out=out).launch()
+    cake_moe_grouped_gemm_det_train_prepare_dgrad(g, w, offs, out=out).launch()
 
 
 def _wgrad_op(
@@ -81,7 +81,9 @@ def _wgrad_op(
     out: torch.Tensor,
     num_groups: int,
 ) -> None:
-    prepare_grouped_det_gemm_wgrad(g, x, offs, out=out, num_groups=num_groups).launch()
+    cake_moe_grouped_gemm_det_train_prepare_wgrad(
+        g, x, offs, out=out, num_groups=num_groups
+    ).launch()
 
 
 def _wgrad_acc_op(
@@ -93,7 +95,7 @@ def _wgrad_acc_op(
 ) -> None:
     # ``main_grad[e] += G[e].T @ X[e]``: the deterministic weight gradient in main_grad's dtype into the
     # launch's scratch, then ``main_grad.add_`` on the same stream (the package's accumulate mode).
-    prepare_grouped_det_gemm_wgrad(
+    cake_moe_grouped_gemm_det_train_prepare_wgrad(
         g, x, offs, out=main_grad, num_groups=num_groups, accumulate=True
     ).launch()
 
@@ -144,8 +146,8 @@ def _bf16_rows(t: torch.Tensor) -> torch.Tensor:
     return t
 
 
-# Passed by ``cake_grouped_det_mm`` as the fourth argument of
-# ``CakeGroupedDetMm.apply``: ``forward`` then allocates ``Y`` without launching,
+# Passed by ``cake_moe_grouped_gemm_det`` as the fourth argument of
+# ``CakeMoEGroupedGemmDetFunction.apply``: ``forward`` then allocates ``Y`` without launching,
 # and the wrapper fills it after ``apply`` returns (after autograd saved the
 # inputs).  ``forward`` accepts nothing else in that position but ``None``.
 _DEFER_FWD = object()
@@ -159,16 +161,16 @@ def _fill_fwd(
         _fwd_op(x, w, offs, y.detach())
 
 
-class CakeGroupedDetMm(torch.autograd.Function):
+class CakeMoEGroupedGemmDetFunction(torch.autograd.Function):
     """``Y = grouped X @ W[e].T`` with ``dX`` and ``dW`` from the Cake programs.
 
     ``x`` ``[sum_m, K]`` bf16, ``w`` ``[E, N, K]`` bf16, ``offs`` int32 device
     end offsets ``[E]`` (or ``m_indptr`` ``[E + 1]``).  ``backward`` returns
     ``dX`` ``[sum_m, K]`` bf16 and ``dW`` ``[E, N, K]`` in the dtype of ``w``;
     both reductions are bitwise deterministic and empty groups give exact
-    zeros.  Through :func:`cake_grouped_det_mm` the forward GEMM runs after
+    zeros.  Through :func:`cake_moe_grouped_gemm_det` the forward GEMM runs after
     autograd saved ``x``, ``w`` and ``offs``, so a checkpoint's early stop can
-    skip it; a direct ``CakeGroupedDetMm.apply(x, w, offs)`` launches inside
+    skip it; a direct ``CakeMoEGroupedGemmDetFunction.apply(x, w, offs)`` launches inside
     ``forward`` and a checkpoint always recomputes it, as does the wrapper
     under ``torch.jit.trace`` and ``torch.compile``.  ``apply`` takes no mode
     argument: a fourth argument other than ``None`` (such as a stale ``True`` /
@@ -176,12 +178,12 @@ class CakeGroupedDetMm(torch.autograd.Function):
 
     The fifth argument, ``fuse_wgrad_accumulation`` (default ``False``; a bool,
     ``ValueError`` otherwise), makes the backward add the weight gradient into
-    ``w.main_grad`` instead (:func:`cake_grouped_det_mm`; a direct call passes
+    ``w.main_grad`` instead (:func:`cake_moe_grouped_gemm_det`; a direct call passes
     ``apply(x, w, offs, None, True)``); ``forward`` then keeps the Python object
     ``w`` on ``ctx`` (a saved tensor unpacked under a checkpoint has no
     attributes).  ``forward`` runs with grad mode off and cannot tell whether
     autograd records the call, so it does not check ``main_grad``:
-    :func:`cake_grouped_det_mm` checks it before ``apply`` when autograd
+    :func:`cake_moe_grouped_gemm_det` checks it before ``apply`` when autograd
     records the call, and the backward checks it again (the only check of a
     direct ``apply``).
     """
@@ -197,14 +199,16 @@ class CakeGroupedDetMm(torch.autograd.Function):
     ):
         if _launch is not None and _launch is not _DEFER_FWD:
             raise TypeError(
-                "CakeGroupedDetMm.apply(x, w, offs) takes no fourth argument (an internal slot: omit it, "
-                "or pass None before fuse_wgrad_accumulation), got "
-                f"{_launch!r}: the deterministic package has no deterministic argument "
+                "CakeMoEGroupedGemmDetFunction.apply(x, w, offs) takes no fourth argument (an internal slot: "
+                "omit it, or pass None before fuse_wgrad_accumulation), got "
+                f"{_launch!r}: the deterministic module has no deterministic argument "
                 "(the non-deterministic autograd function is "
-                "flashinfer.experimental.cake.cake_moe_grouped_gemm.CakeGroupedMm)"
+                "flashinfer.cake_moe_grouped_gemm_nondet_train.CakeMoEGroupedGemmNondetFunction)"
             )
         _require_flag(
-            fuse_wgrad_accumulation, "fuse_wgrad_accumulation", "CakeGroupedDetMm"
+            fuse_wgrad_accumulation,
+            "fuse_wgrad_accumulation",
+            "CakeMoEGroupedGemmDetFunction",
         )
         num_groups = int(w.shape[0])
         y = torch.empty(x.shape[0], w.shape[1], dtype=torch.bfloat16, device=x.device)
@@ -223,11 +227,15 @@ class CakeGroupedDetMm(torch.autograd.Function):
         fuse = ctx.fuse_wgrad_accumulation and ctx.needs_input_grad[1]
         if fuse and torch.is_grad_enabled():
             raise NotImplementedError(
-                "CakeGroupedDetMm.backward: fuse_wgrad_accumulation=True adds into w.main_grad, which a "
+                "CakeMoEGroupedGemmDetFunction.backward: fuse_wgrad_accumulation=True adds into w.main_grad, which a "
                 "double backward (create_graph=True) cannot differentiate; use "
                 "fuse_wgrad_accumulation=False"
             )
-        main_grad = _main_grad(ctx.w, "CakeGroupedDetMm.backward") if fuse else None
+        main_grad = (
+            _main_grad(ctx.w, "CakeMoEGroupedGemmDetFunction.backward")
+            if fuse
+            else None
+        )
         # The autograd engine runs backward on a worker thread that has not
         # touched the CUDA runtime yet; the programs encode their TMA
         # descriptors through the driver API, which needs the primary context
@@ -264,7 +272,7 @@ class CakeGroupedDetMm(torch.autograd.Function):
         return (dx, dw) + (None,) * (len(ctx.needs_input_grad) - 2)
 
 
-def cake_grouped_det_mm(
+def cake_moe_grouped_gemm_det(
     x: torch.Tensor,
     w: torch.Tensor,
     offs: torch.Tensor,
@@ -323,7 +331,7 @@ def cake_grouped_det_mm(
     torch.Tensor
         ``[sum_m, N]`` bfloat16.  ``backward`` produces ``x.grad`` ``[sum_m, K]``
         bfloat16 and ``w.grad`` ``[E, N, K]`` in ``w``'s dtype (bfloat16); use
-        :func:`grouped_det_gemm_wgrad` directly for an fp32 weight gradient, or
+        :func:`cake_moe_grouped_gemm_det_train_wgrad` directly for an fp32 weight gradient, or
         ``fuse_wgrad_accumulation=True`` to add it into an fp32 ``main_grad``.
         The forward GEMM runs after autograd saved ``x``, ``w`` and ``offs``:
         under a non-reentrant checkpoint with early stop on, the recomputation
@@ -338,11 +346,10 @@ def cake_grouped_det_mm(
     (passing one raises ``TypeError``) and
     ``torch.use_deterministic_algorithms(True)`` changes nothing (no alert, no
     warning).  The non-deterministic wrapper is
-    ``flashinfer.experimental.cake.cake_moe_grouped_gemm.cake_grouped_mm(...,
-    deterministic=False)``.
+    ``flashinfer.cake_moe_grouped_gemm_nondet_train.cake_moe_grouped_gemm_nondet``.
     """
     _require_flag(
-        fuse_wgrad_accumulation, "fuse_wgrad_accumulation", "cake_grouped_det_mm"
+        fuse_wgrad_accumulation, "fuse_wgrad_accumulation", "cake_moe_grouped_gemm_det"
     )
     if x.dtype != torch.bfloat16 or w.dtype != torch.bfloat16:
         raise ValueError(f"x and w must be bfloat16 (got {x.dtype} and {w.dtype})")
@@ -351,12 +358,12 @@ def cake_grouped_det_mm(
             # A backward that writes a tensor the graph does not return is invisible to a trace and
             # to AOTAutograd.
             raise NotImplementedError(
-                "cake_grouped_det_mm: fuse_wgrad_accumulation=True is not supported under "
+                "cake_moe_grouped_gemm_det: fuse_wgrad_accumulation=True is not supported under "
                 "torch.jit.trace or torch.compile"
             )
         # A trace records ``apply`` only, and Dynamo cannot lift the deferred
         # launch out of a checkpointed region: keep the launch inside ``forward``.
-        return CakeGroupedDetMm.apply(x, w, offs)
+        return CakeMoEGroupedGemmDetFunction.apply(x, w, offs)
     # Only a call that autograd records needs ``main_grad`` before the backward, so it is
     # checked here, where grad mode is the caller's (``forward`` runs with it off): not
     # under ``no_grad`` or inference mode, and not in a checkpoint recompute inside a
@@ -367,11 +374,11 @@ def cake_grouped_det_mm(
         and torch.is_grad_enabled()
         and not _in_backward()
     ):
-        _main_grad(w, "cake_grouped_det_mm")
+        _main_grad(w, "cake_moe_grouped_gemm_det")
     # ``apply`` saves x, w and offs; a checkpoint recomputation may stop inside it.
     if fuse_wgrad_accumulation:
-        y = CakeGroupedDetMm.apply(x, w, offs, _DEFER_FWD, True)
+        y = CakeMoEGroupedGemmDetFunction.apply(x, w, offs, _DEFER_FWD, True)
     else:
-        y = CakeGroupedDetMm.apply(x, w, offs, _DEFER_FWD)
+        y = CakeMoEGroupedGemmDetFunction.apply(x, w, offs, _DEFER_FWD)
     _fill_fwd(x, w, offs, y)
     return y

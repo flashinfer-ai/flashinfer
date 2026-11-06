@@ -14,32 +14,33 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-# Experimental Cake backend: ragged BF16 MoE grouped GEMM for SM100 / SM103 /
-# SM107.  Three operations over groups of rows described by an int32 device
-# tensor of cumulative end offsets (never read on the host): the row
-# projection ``Y = X @ W[e].T`` (``grouped_det_gemm_fwd``), the activation gradient
-# ``dX = G @ W[e]`` (``grouped_det_gemm_dgrad``) and the weight gradient
-# ``dW[e] = G[e].T @ X[e]`` with bf16 or fp32 output (``grouped_det_gemm_wgrad``),
-# also added into a caller's fp32 / bf16 buffer (``accumulate=True``; the autograd
-# wrapper's ``fuse_wgrad_accumulation`` adds into ``w.main_grad``).
+# Experimental Cake backend of ``flashinfer.cake_moe_grouped_gemm_det_train``: the
+# deterministic ragged BF16 MoE grouped GEMM for SM100 / SM103 / SM107.  Three
+# operations over groups of rows described by an int32 device tensor of
+# cumulative end offsets (never read on the host): the row projection
+# ``Y = X @ W[e].T`` (``cake_moe_grouped_gemm_det_train_forward``), the activation
+# gradient ``dX = G @ W[e]`` (``cake_moe_grouped_gemm_det_train_dgrad``) and the
+# weight gradient ``dW[e] = G[e].T @ X[e]`` with bf16 or fp32 output
+# (``cake_moe_grouped_gemm_det_train_wgrad``), also added into a caller's fp32 /
+# bf16 buffer (``accumulate=True``; the autograd wrapper's
+# ``fuse_wgrad_accumulation`` adds into ``w.main_grad``).
 #
-# The public (experimental) entry points are the core functions
-# ``flashinfer.grouped_mm.grouped_det_gemm_fwd`` / ``grouped_det_gemm_dgrad`` /
-# ``grouped_det_gemm_wgrad`` / ``cake_grouped_det_mm`` and the stable API
-# ``flashinfer.grouped_mm.grouped_mm_bf16(..., backend="cake")``: they carry
-# the experimental-API marking and the once-only warnings and hand off to the
-# plain functions of this package.  The package holds those plain functions
-# (the three one-shot helpers below, which prepare and launch in one call),
-# the ``torch.autograd`` wrapper ``cake_grouped_det_mm`` / ``CakeGroupedDetMm`` of
-# ``cake_autograd``, the host planning and the prepare-once / launch-many
-# surface (``prepare_grouped_det_gemm_*`` returning a ``GroupedDetGemmLaunch``) of
-# ``cake_backend`` together with the stable-API handoff
-# ``cake_backend.grouped_det_mm_bf16_cake``, and the JIT registration of the
-# generated sources in ``cake_jit``.  The submodules are re-exported lazily
-# and stay unimported until first use, so importing this package is cheap.
-# The package imports nothing from the rest of FlashInfer: only itself,
-# ``torch`` and ``tvm_ffi`` (the JIT fallback of ``cake_build`` imports
-# ``flashinfer`` inside ``try/except ImportError``).
+# The public entry points are the functions of the top-level module
+# ``flashinfer.cake_moe_grouped_gemm_det_train`` (stable APIs) and
+# ``flashinfer.grouped_mm.grouped_mm_bf16(..., backend="cake")``: they hand off
+# to the plain functions of this package, which have the same names.  The package holds
+# those plain functions (the three one-shot helpers below, which prepare and
+# launch in one call), the ``torch.autograd`` wrapper
+# ``cake_moe_grouped_gemm_det`` / ``CakeMoEGroupedGemmDetFunction`` of
+# ``cake_autograd``, the host planning and the prepare-once / launch-many surface
+# (``cake_moe_grouped_gemm_det_train_prepare_{forward,dgrad,wgrad}`` returning a
+# ``CakeMoEGroupedGemmDetLaunch``) of ``cake_backend`` together with the
+# stable-API handoff ``cake_backend.grouped_det_mm_bf16_cake``, and the JIT
+# registration of the generated sources in ``cake_jit``.  The submodules are
+# re-exported lazily and stay unimported until first use, so importing this
+# package is cheap.  The package imports nothing from the rest of FlashInfer:
+# only itself, ``torch`` and ``tvm_ffi`` (the JIT fallback of ``cake_build``
+# imports ``flashinfer`` inside ``try/except ImportError``).
 # ``offs`` may be given as ``[E]`` end offsets or as ``m_indptr`` ``[E + 1]``.
 
 from __future__ import annotations
@@ -49,29 +50,31 @@ from typing import Any, Optional
 import torch
 
 __all__ = [
-    "CakeGroupedDetMm",
-    "GroupedDetGemmLaunch",
-    "cake_grouped_det_mm",
-    "grouped_det_gemm_dgrad",
-    "grouped_det_gemm_fwd",
-    "grouped_det_gemm_wgrad",
-    "prepare_grouped_det_gemm_dgrad",
-    "prepare_grouped_det_gemm_fwd",
-    "prepare_grouped_det_gemm_wgrad",
+    "CakeMoEGroupedGemmDetFunction",
+    "CakeMoEGroupedGemmDetLaunch",
+    "cake_moe_grouped_gemm_det",
+    "cake_moe_grouped_gemm_det_train_dgrad",
+    "cake_moe_grouped_gemm_det_train_forward",
+    "cake_moe_grouped_gemm_det_train_prepare_dgrad",
+    "cake_moe_grouped_gemm_det_train_prepare_forward",
+    "cake_moe_grouped_gemm_det_train_prepare_wgrad",
+    "cake_moe_grouped_gemm_det_train_wgrad",
 ]
 
 _BACKEND_EXPORTS = frozenset(
     {
-        "GroupedDetGemmLaunch",
-        "prepare_grouped_det_gemm_dgrad",
-        "prepare_grouped_det_gemm_fwd",
-        "prepare_grouped_det_gemm_wgrad",
+        "CakeMoEGroupedGemmDetLaunch",
+        "cake_moe_grouped_gemm_det_train_prepare_dgrad",
+        "cake_moe_grouped_gemm_det_train_prepare_forward",
+        "cake_moe_grouped_gemm_det_train_prepare_wgrad",
     }
 )
-_AUTOGRAD_EXPORTS = frozenset({"CakeGroupedDetMm", "cake_grouped_det_mm"})
+_AUTOGRAD_EXPORTS = frozenset(
+    {"CakeMoEGroupedGemmDetFunction", "cake_moe_grouped_gemm_det"}
+)
 
 
-def grouped_det_gemm_fwd(
+def cake_moe_grouped_gemm_det_train_forward(
     x: torch.Tensor,
     w: torch.Tensor,
     offs: torch.Tensor,
@@ -100,15 +103,15 @@ def grouped_det_gemm_fwd(
     Notes
     -----
     Prepares and launches in one call.  For repeated launches over the same
-    tensors (or CUDA Graph capture) use ``prepare_grouped_det_gemm_fwd`` once and
+    tensors (or CUDA Graph capture) use ``cake_moe_grouped_gemm_det_train_prepare_forward`` once and
     call ``launch()`` on the returned object.
     """
-    from .cake_backend import prepare_grouped_det_gemm_fwd
+    from .cake_backend import cake_moe_grouped_gemm_det_train_prepare_forward
 
-    return prepare_grouped_det_gemm_fwd(x, w, offs, out=out).launch()
+    return cake_moe_grouped_gemm_det_train_prepare_forward(x, w, offs, out=out).launch()
 
 
-def grouped_det_gemm_dgrad(
+def cake_moe_grouped_gemm_det_train_dgrad(
     g: torch.Tensor,
     w: torch.Tensor,
     offs: torch.Tensor,
@@ -119,14 +122,14 @@ def grouped_det_gemm_dgrad(
     ``g`` is ``[sum_m, N]`` bfloat16, ``w`` is ``[E, N, K]`` bfloat16 and is
     read in place (no transpose copy), ``offs`` is ``[E]`` int32 device end
     offsets (or ``m_indptr`` ``[E + 1]``) and ``out`` is ``[sum_m, K]`` bfloat16.  ``K % 256 == 0`` and
-    ``N % 64 == 0`` are required.  See ``grouped_det_gemm_fwd`` for the prepared form.
+    ``N % 64 == 0`` are required.  See ``cake_moe_grouped_gemm_det_train_forward`` for the prepared form.
     """
-    from .cake_backend import prepare_grouped_det_gemm_dgrad
+    from .cake_backend import cake_moe_grouped_gemm_det_train_prepare_dgrad
 
-    return prepare_grouped_det_gemm_dgrad(g, w, offs, out=out).launch()
+    return cake_moe_grouped_gemm_det_train_prepare_dgrad(g, w, offs, out=out).launch()
 
 
-def grouped_det_gemm_wgrad(
+def cake_moe_grouped_gemm_det_train_wgrad(
     g: torch.Tensor,
     x: torch.Tensor,
     offs: torch.Tensor,
@@ -144,7 +147,7 @@ def grouped_det_gemm_wgrad(
     is ``[E, N, K]`` in ``out_dtype`` (bfloat16 or float32; defaults to the
     dtype of ``out``, else bfloat16).  fp32 accumulation, bitwise deterministic, exact zeros for empty
     groups.  ``N % 256 == 0`` and ``K`` a multiple of the selected k tile (256,
-    or 512 when chosen) are required.  See ``grouped_det_gemm_fwd`` for the
+    or 512 when chosen) are required.  See ``cake_moe_grouped_gemm_det_train_forward`` for the
     prepared form.
 
     ``accumulate=True`` (keyword-only, default ``False``) adds into ``out``
@@ -156,13 +159,13 @@ def grouped_det_gemm_wgrad(
     of that dtype and added with ``out.add_`` on the same stream, so ``out``
     holds AccumulateGrad's bits of it, bitwise reproducible run to run.  The
     scratch takes ``E * N * K`` elements (``4 * E * N * K`` bytes for fp32)
-    for the call; ``prepare_grouped_det_gemm_wgrad(..., accumulate=True)``
+    for the call; ``cake_moe_grouped_gemm_det_train_prepare_wgrad(..., accumulate=True)``
     keeps it with a prepared launch (CUDA-graph capturable; every launch and
     replay adds again).  ``sum_m == 0`` leaves ``out`` unchanged.
     """
-    from .cake_backend import prepare_grouped_det_gemm_wgrad
+    from .cake_backend import cake_moe_grouped_gemm_det_train_prepare_wgrad
 
-    return prepare_grouped_det_gemm_wgrad(
+    return cake_moe_grouped_gemm_det_train_prepare_wgrad(
         g,
         x,
         offs,

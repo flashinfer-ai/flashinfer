@@ -49,7 +49,7 @@ import torch
 
 from tests.test_helpers.cake_package import cake_package
 
-PACKAGE = "cake_moe_grouped_det_gemm"
+PACKAGE = "cake_moe_grouped_gemm_det_train"
 cb = cake_package(PACKAGE, "cake_backend")
 cake_jit = cake_package(PACKAGE, "cake_jit")
 HOST_PLAN_CONSTANTS = cake_jit.HOST_PLAN_CONSTANTS
@@ -61,7 +61,7 @@ SPOT_ROWS = 64
 SPOT_COLS = 256
 WORKER_TIMEOUT_S = 3600
 
-# The 58 MoE projection rows of benchmarks/bench_cake_moe_grouped_det_gemm.py:
+# The 58 MoE projection rows of benchmarks/bench_cake_moe_grouped_gemm_det_train.py:
 # (N, K) of w ``[E, N, K]``; E=4 balanced / skewed / one-empty group sizes at two
 # token counts for every op, the fp32 weight gradient of the balanced E=4 rows,
 # and E=8/16/32 balanced over 131072 rows.
@@ -261,10 +261,14 @@ def _inputs(case, device):
 
 def _prepare(case, a, b, offs, out):
     if case.op == "fwd":
-        return cb.prepare_grouped_det_gemm_fwd(x=a, w=b, offs=offs, out=out)
+        return cb.cake_moe_grouped_gemm_det_train_prepare_forward(
+            x=a, w=b, offs=offs, out=out
+        )
     if case.op == "dgrad":
-        return cb.prepare_grouped_det_gemm_dgrad(g=a, w=b, offs=offs, out=out)
-    return cb.prepare_grouped_det_gemm_wgrad(
+        return cb.cake_moe_grouped_gemm_det_train_prepare_dgrad(
+            g=a, w=b, offs=offs, out=out
+        )
+    return cb.cake_moe_grouped_gemm_det_train_prepare_wgrad(
         g=a, x=b, offs=offs, out=out, out_dtype=case.out_dtype, num_groups=None
     )
 

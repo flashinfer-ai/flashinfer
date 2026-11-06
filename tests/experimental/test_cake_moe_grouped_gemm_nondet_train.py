@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Backend suite of the non-deterministic ragged BF16 MoE grouped GEMM package
-(``deterministic=False``).
+(``flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train``).
 
 The forward pass, the data gradient and the 256-wide k tile's weight gradient
 run copies of the deterministic package's programs (but for the data gradient's
@@ -28,12 +28,12 @@ split tail's workspaces are checked at rest (zero) after the launches.  Only
 this package is imported (through ``cake_package``), so the suite also runs
 against a vendored copy of it.
 
-``cake_grouped_mm`` launches the forward after autograd saved its inputs, so the
+``cake_moe_grouped_gemm_nondet`` launches the forward after autograd saved its inputs, so the
 early stop of a non-reentrant checkpoint skips the recomputed GEMM when nothing
 after it saves a tensor.  The autograd tests count the forward launches (a
 pass-through on ``cake_autograd._fwd_op``) and, where the torch profiler records
 kernels, the CUDA kernels of checkpointed steps; the control arm is a direct
-``CakeGroupedMm.apply``, which launches inside ``forward``.
+``CakeMoEGroupedGemmNondetFunction.apply``, which launches inside ``forward``.
 """
 
 import collections
@@ -49,10 +49,10 @@ from tests.test_helpers.cake_package import cake_package
 
 # Backend suite: the package is named through ``cake_package`` only; nothing
 # else of flashinfer is imported here.  The facade and the numerical-mode
-# checks live in ``test_cake_moe_grouped_gemm_api.py``, the comparisons with
+# checks live in ``test_cake_moe_grouped_gemm_nondet_train_api.py``, the comparisons with
 # the deterministic package (its routes and bits) in
-# ``test_cake_moe_grouped_gemm_reproducibility.py``.
-PACKAGE = "cake.cake_moe_grouped_gemm"
+# ``test_cake_moe_grouped_gemm_nondet_train_reproducibility.py``.
+PACKAGE = "cake_moe_grouped_gemm_nondet_train"
 pkg = cake_package(PACKAGE)
 cb = cake_package(PACKAGE, "cake_backend")
 cake_jit = cake_package(PACKAGE, "cake_jit")
@@ -62,13 +62,10 @@ HOST_PLAN_CONSTANTS = cake_jit.HOST_PLAN_CONSTANTS
 PROGRAMS = cake_jit.PROGRAMS
 ROUTES = cake_jit.ROUTES
 
-# Every entry point of the package needs deterministic=False.
-grouped_gemm_fwd = functools.partial(pkg.grouped_gemm_fwd, deterministic=False)
-grouped_gemm_dgrad = functools.partial(pkg.grouped_gemm_dgrad, deterministic=False)
-grouped_gemm_wgrad = functools.partial(pkg.grouped_gemm_wgrad, deterministic=False)
-prepare_fwd = functools.partial(cb.prepare_grouped_gemm_fwd, deterministic=False)
-prepare_dgrad = functools.partial(cb.prepare_grouped_gemm_dgrad, deterministic=False)
-prepare_wgrad = functools.partial(cb.prepare_grouped_gemm_wgrad, deterministic=False)
+# Short names of the package's entry points.
+prepare_fwd = cb.cake_moe_grouped_gemm_nondet_train_prepare_forward
+prepare_dgrad = cb.cake_moe_grouped_gemm_nondet_train_prepare_dgrad
+prepare_wgrad = cb.cake_moe_grouped_gemm_nondet_train_prepare_wgrad
 
 ATOL = RTOL = 1e-2  # bf16 outputs
 FP32_REL_L2 = 1e-4  # fp32 weight gradient vs the fp64 reference
@@ -817,7 +814,7 @@ def test_group_count_sweep_splits_the_tail_at_every_sm_count(arch, sm_count):
 def test_fwd_matches_reference(sizes, n, k):
     device = _require_program("fwd")
     x, w, _g, offs = _inputs(sizes, n, k, device)
-    out = grouped_gemm_fwd(x, w, offs)
+    out = pkg.cake_moe_grouped_gemm_nondet_train_forward(x, w, offs)
     assert out.shape == (sum(sizes), n)
     _assert_bf16_close(out, _reference("fwd", x, w, sizes))
 
@@ -828,7 +825,7 @@ def test_fwd_matches_reference(sizes, n, k):
 def test_dgrad_matches_reference(sizes, n, k):
     device = _require_program("dgrad")
     _x, w, g, offs = _inputs(sizes, n, k, device)
-    out = grouped_gemm_dgrad(g, w, offs)
+    out = pkg.cake_moe_grouped_gemm_nondet_train_dgrad(g, w, offs)
     assert out.shape == (sum(sizes), k)
     _assert_bf16_close(out, _reference("dgrad", g, w, sizes))
 
@@ -867,10 +864,14 @@ def test_group_counts_match_reference(groups, op):
     n, k = GROUP_SHAPE
     x, w, g, offs = _inputs(sizes, n, k, device, seed=groups)
     if op == "fwd":
-        _assert_bf16_close(grouped_gemm_fwd(x, w, offs), _reference("fwd", x, w, sizes))
+        _assert_bf16_close(
+            pkg.cake_moe_grouped_gemm_nondet_train_forward(x, w, offs),
+            _reference("fwd", x, w, sizes),
+        )
     else:
         _assert_bf16_close(
-            grouped_gemm_dgrad(g, w, offs), _reference("dgrad", g, w, sizes)
+            pkg.cake_moe_grouped_gemm_nondet_train_dgrad(g, w, offs),
+            _reference("dgrad", g, w, sizes),
         )
 
 
@@ -1274,10 +1275,10 @@ def test_gradient_accumulation(monkeypatch):
     dws = []
     w.register_hook(lambda grad: dws.append(grad.detach().clone()))
     for g in (g1, g2):
-        pkg.cake_grouped_mm(x, w, offs, deterministic=False).backward(g)
+        pkg.cake_moe_grouped_gemm_nondet(x, w, offs).backward(g)
     torch.cuda.synchronize()
-    dx1 = grouped_gemm_dgrad(g1, w0, offs)
-    dx2 = grouped_gemm_dgrad(g2, w0, offs)
+    dx1 = pkg.cake_moe_grouped_gemm_nondet_train_dgrad(g1, w0, offs)
+    dx2 = pkg.cake_moe_grouped_gemm_nondet_train_dgrad(g2, w0, offs)
     assert torch.equal(x.grad, dx1 + dx2)
     assert len(dws) == 2
     for dw, g in zip(dws, (g1, g2), strict=True):
@@ -1384,13 +1385,13 @@ def test_padded_outputs_leave_the_padding_untouched():
     padded = torch.full(
         (sum_m, n + 64), float("nan"), dtype=torch.bfloat16, device=device
     )
-    out = grouped_gemm_fwd(x, w, offs, out=padded[:, :n])
+    out = pkg.cake_moe_grouped_gemm_nondet_train_forward(x, w, offs, out=padded[:, :n])
     _assert_bf16_close(out, _reference("fwd", x, w, K512_E3))
     assert torch.isnan(padded[:, n:]).all()
     padded = torch.full(
         (len(K512_E3), n, k + 32), float("nan"), dtype=torch.bfloat16, device=device
     )
-    out = grouped_gemm_wgrad(g, x, offs, out=padded[:, :, :k])
+    out = pkg.cake_moe_grouped_gemm_nondet_train_wgrad(g, x, offs, out=padded[:, :, :k])
     _assert_bf16_close(out, _reference("wgrad", g, x, K512_E3))
     assert torch.isnan(padded[:, :, k:]).all()
 
@@ -1412,13 +1413,15 @@ def test_wgrad_accepts_row_padded_operands(out_dtype):
     launch = prepare_wgrad(g_pad, x_pad, offs, out_dtype=out_dtype)
     assert launch.stages[0] == stage, launch.stages
     out = launch.launch().clone()
-    dense = grouped_gemm_wgrad(g, x, offs, out_dtype=out_dtype)
+    dense = pkg.cake_moe_grouped_gemm_nondet_train_wgrad(
+        g, x, offs, out_dtype=out_dtype
+    )
     assert torch.equal(out, dense)
     _assert_wgrad_close(out, _reference("wgrad", g, x, sizes))
 
 
 def test_autograd_backward_takes_row_strided_operands():
-    """``cake_grouped_mm(deterministic=False)`` on a row-strided leaf ``x`` whose output is
+    """``cake_moe_grouped_gemm_nondet`` on a row-strided leaf ``x`` whose output is
     concatenated with another tensor, so that the backward receives a row-strided
     ``grad_y`` (a narrow of the concatenation's gradient); on the shape of the 256-wide k
     tile's ``main_wave`` weight gradient, ``Y``, ``dX`` and ``dW`` are within the
@@ -1433,7 +1436,7 @@ def test_autograd_backward_takes_row_strided_operands():
     x = _row_padded(x0).detach().requires_grad_(True)
     assert x.is_leaf and x.stride(0) == k + ROW_PAD
     w = w0.clone().requires_grad_(True)
-    y = pkg.cake_grouped_mm(x, w, offs, deterministic=False)
+    y = pkg.cake_moe_grouped_gemm_nondet(x, w, offs)
     other = torch.zeros(y.shape[0], ROW_PAD, dtype=y.dtype, device=device)
     z = torch.cat([y, other], dim=1)
     grad_strides = []
@@ -1453,9 +1456,15 @@ def test_empty_batch():
     device = _require_program("wgrad", torch.float32)
     x, w, g, offs = _inputs([0, 0], 256, 512, device)
     y = torch.full((0, 256), 0.0, dtype=torch.bfloat16, device=device)
-    assert grouped_gemm_fwd(x, w, offs, out=y).shape == (0, 256)
+    assert pkg.cake_moe_grouped_gemm_nondet_train_forward(x, w, offs, out=y).shape == (
+        0,
+        256,
+    )
     dw = torch.full((2, 256, 512), float("nan"), dtype=torch.float32, device=device)
-    assert torch.equal(grouped_gemm_wgrad(g, x, offs, out=dw), torch.zeros_like(dw))
+    assert torch.equal(
+        pkg.cake_moe_grouped_gemm_nondet_train_wgrad(g, x, offs, out=dw),
+        torch.zeros_like(dw),
+    )
 
 
 def test_rejects_misaligned_shapes():
@@ -1478,16 +1487,25 @@ def test_m_indptr_form_matches_offs_form():
     device = _require_program("wgrad", torch.bfloat16)
     x, w, g, offs = _inputs(RAGGED_E6, 512, 256, device)
     m_indptr = _m_indptr(RAGGED_E6, device)
-    assert torch.equal(grouped_gemm_fwd(x, w, m_indptr), grouped_gemm_fwd(x, w, offs))
     assert torch.equal(
-        grouped_gemm_dgrad(g, w, m_indptr), grouped_gemm_dgrad(g, w, offs)
+        pkg.cake_moe_grouped_gemm_nondet_train_forward(x, w, m_indptr),
+        pkg.cake_moe_grouped_gemm_nondet_train_forward(x, w, offs),
+    )
+    assert torch.equal(
+        pkg.cake_moe_grouped_gemm_nondet_train_dgrad(g, w, m_indptr),
+        pkg.cake_moe_grouped_gemm_nondet_train_dgrad(g, w, offs),
     )
     ref = _reference("wgrad", g, x, RAGGED_E6)
     _assert_bf16_close(
-        grouped_gemm_wgrad(g, x, m_indptr, num_groups=len(RAGGED_E6)), ref
+        pkg.cake_moe_grouped_gemm_nondet_train_wgrad(
+            g, x, m_indptr, num_groups=len(RAGGED_E6)
+        ),
+        ref,
     )
     with pytest.raises(ValueError):  # neither E nor E + 1 entries
-        grouped_gemm_wgrad(g, x, m_indptr[:-2], num_groups=len(RAGGED_E6))
+        pkg.cake_moe_grouped_gemm_nondet_train_wgrad(
+            g, x, m_indptr[:-2], num_groups=len(RAGGED_E6)
+        )
 
 
 def test_autograd_wrapper_matches_reference():
@@ -1497,7 +1515,7 @@ def test_autograd_wrapper_matches_reference():
     x, w, g, offs = _inputs(K512_E3, 512, 1024, device)
     x = x.clone().requires_grad_(True)
     w = w.clone().requires_grad_(True)
-    y = pkg.cake_grouped_mm(x, w, offs, deterministic=False)
+    y = pkg.cake_moe_grouped_gemm_nondet(x, w, offs)
     assert y.shape == (sum(K512_E3), 512) and y.dtype == torch.bfloat16
     _assert_bf16_close(y.detach(), _reference("fwd", x.detach(), w.detach(), K512_E3))
     y.backward(g)
@@ -1506,9 +1524,9 @@ def test_autograd_wrapper_matches_reference():
     _assert_bf16_close(w.grad, _reference("wgrad", g, x.detach(), K512_E3))
     _assert_empty_groups_zero(w.grad, K512_E3)
     with pytest.raises(ValueError):
-        pkg.cake_grouped_mm(x.float(), w, offs, deterministic=False)
-    with pytest.raises(ValueError):
-        cake_autograd.CakeGroupedMm.apply(x, w, offs, True)
+        pkg.cake_moe_grouped_gemm_nondet(x.float(), w, offs)
+    with pytest.raises(TypeError, match="takes no fourth argument"):
+        cake_autograd.CakeMoEGroupedGemmNondetFunction.apply(x, w, offs, True)
 
 
 # ---------------------------------------------------------------------------
@@ -1563,14 +1581,14 @@ def _tile_case(device, tile):
 
 
 def _wrapper(offs):
-    """``gemm(a, b)`` through ``cake_grouped_mm``: the forward launch after ``apply``."""
-    return lambda a, b: pkg.cake_grouped_mm(a, b, offs, deterministic=False)
+    """``gemm(a, b)`` through ``cake_moe_grouped_gemm_nondet``: the forward launch after ``apply``."""
+    return lambda a, b: pkg.cake_moe_grouped_gemm_nondet(a, b, offs)
 
 
 def _in_forward(offs):
-    """The control arm: ``gemm(a, b)`` through a direct ``CakeGroupedMm.apply``, which
+    """The control arm: ``gemm(a, b)`` through a direct ``CakeMoEGroupedGemmNondetFunction.apply``, which
     launches inside ``forward``, before autograd saves the inputs."""
-    return lambda a, b: cake_autograd.CakeGroupedMm.apply(a, b, offs, False)
+    return lambda a, b: cake_autograd.CakeMoEGroupedGemmNondetFunction.apply(a, b, offs)
 
 
 def _leaves(*tensors):
@@ -1702,14 +1720,14 @@ def _torch_deterministic():
 
 @pytest.mark.parametrize("sizes", [RAGGED_E4, [0, 0]], ids=["ragged", "empty"])
 def test_wrapper_saves_inputs_before_the_forward_launch(sizes, monkeypatch):
-    """Through ``cake_grouped_mm`` autograd saves ``x``, ``w`` and ``offs`` (the inputs
+    """Through ``cake_moe_grouped_gemm_nondet`` autograd saves ``x``, ``w`` and ``offs`` (the inputs
     themselves, in this order) and then the forward launches into ``Y``, saving nothing;
-    a direct ``CakeGroupedMm.apply`` launches first and saves after.  The node is
-    ``CakeGroupedMmBackward`` and ``Y`` has the forward's bits either way, also with no
+    a direct ``CakeMoEGroupedGemmNondetFunction.apply`` launches first and saves after.  The node is
+    ``CakeMoEGroupedGemmNondetFunctionBackward`` and ``Y`` has the forward's bits either way, also with no
     rows (``sum_m == 0``)."""
     device = _require_program("fwd")
     x0, w0, _g, offs = _inputs(sizes, *SMALL_SHAPE, device, seed=40)
-    want = grouped_gemm_fwd(x0, w0, offs)
+    want = pkg.cake_moe_grouped_gemm_nondet_train_forward(x0, w0, offs)
     events = []
     launch = cake_autograd._fwd_op
 
@@ -1737,7 +1755,7 @@ def test_wrapper_saves_inputs_before_the_forward_launch(sizes, monkeypatch):
             assert t.data_ptr() == src.data_ptr(), (t.shape, src.shape)
             assert t.shape == src.shape and t.dtype == src.dtype
         assert [p for kind, p in events if kind == "fwd"] == [y.data_ptr()]
-        assert type(y.grad_fn).__name__ == "CakeGroupedMmBackward"
+        assert type(y.grad_fn).__name__ == "CakeMoEGroupedGemmNondetFunctionBackward"
         assert torch.equal(y.detach(), want)
 
 
@@ -1969,8 +1987,8 @@ def test_checkpointed_gradient_accumulation_and_retain_graph(monkeypatch):
         y.backward(g)
     torch.cuda.synchronize()
     assert calls["fwd"] == [(n, k)] * 2
-    dx1 = grouped_gemm_dgrad(g1, w0, offs)
-    dx2 = grouped_gemm_dgrad(g2, w0, offs)
+    dx1 = pkg.cake_moe_grouped_gemm_nondet_train_dgrad(g1, w0, offs)
+    dx2 = pkg.cake_moe_grouped_gemm_nondet_train_dgrad(g2, w0, offs)
     assert torch.equal(x.grad, dx1 + dx2)
     assert len(dws) == 2
     for dw, g in zip(dws, (g1, g2), strict=True):
@@ -2009,16 +2027,20 @@ def test_checkpoint_with_a_frozen_operand(frozen, monkeypatch):
     if frozen == "w":
         assert calls["dgrad"] == [SMALL_SHAPE] and calls["wgrad"] == []
         assert w.grad is None
-        assert torch.equal(x.grad, grouped_gemm_dgrad(g, w0, offs))
+        assert torch.equal(
+            x.grad, pkg.cake_moe_grouped_gemm_nondet_train_dgrad(g, w0, offs)
+        )
     else:
         assert calls["wgrad"] == [SMALL_SHAPE] and calls["dgrad"] == []
         assert x.grad is None
-        assert torch.equal(w.grad, grouped_gemm_wgrad(g, x0, offs))
+        assert torch.equal(
+            w.grad, pkg.cake_moe_grouped_gemm_nondet_train_wgrad(g, x0, offs)
+        )
 
 
 @pytest.mark.parametrize("grad", [True, False], ids=["grad", "no_grad"])
 def test_wrapper_forward_cuda_graph_replay(grad):
-    """A CUDA graph captured around ``cake_grouped_mm`` (with leaves that require grad and
+    """A CUDA graph captured around ``cake_moe_grouped_gemm_nondet`` (with leaves that require grad and
     grad mode on, or under ``no_grad``) replays the forward launch the wrapper makes after
     ``apply``: after new group boundaries (same ``sum_m``) are written into ``offs``,
     every replay gives the bits of the eager wrapper on those boundaries."""
@@ -2043,7 +2065,7 @@ def test_wrapper_forward_cuda_graph_replay(grad):
         offs.copy_(_offs(sizes, device))
         y.detach().fill_(float("nan"))
         graph.replay()
-        eager = pkg.cake_grouped_mm(x0, w0, offs, deterministic=False)
+        eager = pkg.cake_moe_grouped_gemm_nondet(x0, w0, offs)
         torch.cuda.synchronize()
         assert torch.equal(y.detach(), eager), sizes
         _assert_bf16_close(y.detach(), _reference("fwd", x0, w0, sizes))
@@ -2124,7 +2146,7 @@ def test_wrapper_under_jit_trace(monkeypatch):
     x0, w0, _g, offs = _inputs(SMALL_SIZES, *SMALL_SHAPE, device, seed=51)
     x1 = _inputs(SMALL_SIZES, *SMALL_SHAPE, device, seed=52)[0]
     traced = torch.jit.trace(
-        lambda a, b, o: pkg.cake_grouped_mm(a, b, o, deterministic=False),
+        lambda a, b, o: pkg.cake_moe_grouped_gemm_nondet(a, b, o),
         (x0, w0, offs),
         check_trace=False,
     )
@@ -2132,9 +2154,11 @@ def test_wrapper_under_jit_trace(monkeypatch):
     out = traced(x1, w0, offs)
     torch.cuda.synchronize()
     assert calls["fwd"] == [SMALL_SHAPE]
-    eager = pkg.cake_grouped_mm(x1, w0, offs, deterministic=False)
+    eager = pkg.cake_moe_grouped_gemm_nondet(x1, w0, offs)
     assert torch.equal(out, eager)
-    assert not torch.equal(eager, grouped_gemm_fwd(x0, w0, offs))
+    assert not torch.equal(
+        eager, pkg.cake_moe_grouped_gemm_nondet_train_forward(x0, w0, offs)
+    )
 
 
 @pytest.mark.parametrize("backend", ["eager", "inductor"])
@@ -2175,16 +2199,17 @@ def test_wrapper_under_torch_compile(backend):
         f"control arm: {control_failure!r}"
     )
     pytest.skip(
-        f"torch.compile ({backend}) fails the same way through CakeGroupedMm.apply: "
+        f"torch.compile ({backend}) fails the same way through CakeMoEGroupedGemmNondetFunction.apply: "
         f"{type(failure).__name__}: {str(failure)[:400]}"
     )
 
 
 def test_direct_apply_keeps_the_in_forward_launch(monkeypatch):
-    """A direct ``CakeGroupedMm.apply(x, w, offs, False)`` launches the forward inside
+    """A direct ``CakeMoEGroupedGemmNondetFunction.apply(x, w, offs)`` launches the forward inside
     ``forward`` and gives the wrapper's bits (``Y``, ``dX``, ``dW`` of the 256-wide k
-    tile); ``apply(..., True)`` raises ``ValueError``; shape and offset errors, which the
-    wrapper now raises after autograd saved the inputs, are still ``ValueError``."""
+    tile); a stale fourth argument (``apply(..., True)``) raises ``TypeError``; shape and
+    offset errors, which the wrapper now raises after autograd saved the inputs, are
+    still ``ValueError``."""
     device = _require_autograd_programs()
     x0, w0, g, offs = _ordered_inputs(device, *SMALL_SHAPE, seed=54)
     calls = _count_launches(monkeypatch)
@@ -2193,8 +2218,8 @@ def test_direct_apply_keeps_the_in_forward_launch(monkeypatch):
     assert calls["fwd"] == [SMALL_SHAPE] * 2
     _assert_same_step(direct, wrapped)
     x, w = _leaves(x0, w0)
-    with pytest.raises(ValueError):
-        cake_autograd.CakeGroupedMm.apply(x, w, offs, True)
+    with pytest.raises(TypeError, match="takes no fourth argument"):
+        cake_autograd.CakeMoEGroupedGemmNondetFunction.apply(x, w, offs, True)
     n, k = SMALL_SHAPE
     for bad_w, bad_offs in (
         (w0[:, : n - 128], offs),  # N % 256 != 0
@@ -2202,6 +2227,6 @@ def test_direct_apply_keeps_the_in_forward_launch(monkeypatch):
         (w0, offs.to(torch.int64)),
     ):
         with pytest.raises(ValueError):
-            pkg.cake_grouped_mm(
-                x, bad_w.clone().requires_grad_(True), bad_offs, deterministic=False
+            pkg.cake_moe_grouped_gemm_nondet(
+                x, bad_w.clone().requires_grad_(True), bad_offs
             )
