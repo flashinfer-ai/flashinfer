@@ -23,7 +23,7 @@ Opt-in forms of the Cake chunked LM-head + loss backend (:mod:`.cake_backend`):
   (:func:`given_valid_rows`);
 * ``memory_mode="keep_logits"`` (log-probability entry, without
   ``num_valid_rows``): :mod:`.cake_backend`'s
-  ``chunked_lm_head_logprob_keep`` -- where a backward can follow, the
+  ``cake_lm_head_nondet_train_logprob_keep`` -- where a backward can follow, the
   forward keeps the BF16 logits of the valid rows (``2 * T_v * V`` bytes) and
   the backward forms ``dz`` from them instead of recomputing them.
 
@@ -205,9 +205,9 @@ MEMORY_MODES = (
     "fast",
     "budget",
 )  # ``memory_mode`` of the autograd entries: the fastest form / the step-peak budget (:func:`memory_plan`)
-# ``memory_mode`` of :func:`chunked_lm_head_logprob` only: keep the forward's BF16 logits for the backward
+# ``memory_mode`` of :func:`cake_lm_head_nondet_train_logprob` only: keep the forward's BF16 logits for the backward
 # (``2 * T_v * V`` bytes), whose ``row_grad`` then forms ``dz`` from them instead of recomputing the logits --
-# :mod:`.cake_backend`'s ``chunked_lm_head_logprob_keep``
+# :mod:`.cake_backend`'s ``cake_lm_head_nondet_train_logprob_keep``
 KEEP_LOGITS = "keep_logits"
 
 
@@ -1867,7 +1867,7 @@ class LmHeadLossRunner:
         runs the dX GEMMs: under torch's deterministic algorithms a plan with a K-sliced dX chunk raises PyTorch's
         alert first (:func:`.cake_backend._alert_unordered_dx`)."""
         if self.problem.entry == "loss":
-            _alert_unordered_dx(self.plan, "LmHeadLossRunner.forward")
+            _alert_unordered_dx(self.plan, "LmHeadLossRunner.forward", "loss")
         return self._forward()
 
     def _forward(self):
@@ -1894,7 +1894,7 @@ class LmHeadLossRunner:
         GEMM) has one fixed order and does not alert.
         """
         if self.problem.entry == "logprob":
-            _alert_unordered_dx(self.plan, "LmHeadLossRunner.backward")
+            _alert_unordered_dx(self.plan, "LmHeadLossRunner.backward", "logprob")
         return self._backward(grad)
 
     def _backward(self, grad: Optional[torch.Tensor] = None):
@@ -4344,7 +4344,7 @@ def forward_loss(
             key += (options["dw_rows"], True)  # a recompute form's plan options
         binding = cache.lookup(key)
         if binding is not None:
-            _alert_unordered_dx(binding.plan, "forward_loss")
+            _alert_unordered_dx(binding.plan, "forward_loss", "loss")
             loss, logp, dx_acc, dw_acc, deferred, row_state = binding.forward(
                 X,
                 W,
@@ -4405,7 +4405,7 @@ def forward_loss(
         **common,
         **(options or {}),
     )
-    _alert_unordered_dx(runner.plan, "forward_loss")
+    _alert_unordered_dx(runner.plan, "forward_loss", "loss")
     if backend == "cake":
         # The first call launches through the templated binding too: its per-call temporaries come from the caching
         # allocator, so the deferred ``dz`` rows keep the chunk buffer alive and nothing else -- a view into the
@@ -5849,7 +5849,7 @@ def backward_logprob(
             )  # a budget form's accumulated rows (:attr:`Plan.dw_rows`)
         binding = cache.lookup(key)
         if binding is not None:
-            _alert_unordered_dx(binding.plan, "backward_logprob")
+            _alert_unordered_dx(binding.plan, "backward_logprob", "logprob")
             dx, dw = binding.backward_logprob(
                 X, W, labels, lse, dlogp, row_index, hc, stream_mode, fill_side
             )
@@ -5876,7 +5876,7 @@ def backward_logprob(
         _template_only=backend == "cake" and hc is not None,
         dx_rule=rule,
     )
-    _alert_unordered_dx(runner.plan, "backward_logprob")
+    _alert_unordered_dx(runner.plan, "backward_logprob", "logprob")
     if hc is not None:
         binding = _Binding.from_runner(runner, hc)
         del runner
@@ -6291,7 +6291,7 @@ def backward_logprob_temperature(
             key = temperature_binding_key(key)
         binding = cache.lookup(key)
         if binding is not None:
-            _alert_unordered_dx(binding.plan, "backward_logprob_temperature")
+            _alert_unordered_dx(binding.plan, "backward_logprob_temperature", "logprob")
             dx, dw = (
                 cast(_TemperatureBinding, binding).backward_logprob(
                     X,
@@ -6334,7 +6334,7 @@ def backward_logprob_temperature(
         _template_only=backend == "cake" and hc is not None,
         dx_rule=rule,
     )
-    _alert_unordered_dx(runner.plan, "backward_logprob_temperature")
+    _alert_unordered_dx(runner.plan, "backward_logprob_temperature", "logprob")
     if hc is not None:
         binding = _TemperatureBinding.from_runner(runner, hc)
         del runner
@@ -6362,7 +6362,7 @@ _SECOND_BACKWARD = (
 )
 
 
-class ChunkedLmHeadLossFunction(torch.autograd.Function):
+class CakeLMHeadNondetLossFunction(torch.autograd.Function):
     """Entry (a): the forward produces the FP32 gradient accumulators; the backward scales and casts them.
 
     With ``memory_mode="budget"`` (``ctx.early_release``) a backward that frees the graph (no ``retain_graph`` /
@@ -6408,7 +6408,7 @@ class ChunkedLmHeadLossFunction(torch.autograd.Function):
             # in :mod:`.cake_backend`)
             if _main._selective_checkpoint_modes():
                 with _main._modes_off():
-                    return ChunkedLmHeadLossFunction.forward(
+                    return CakeLMHeadNondetLossFunction.forward(
                         ctx,
                         X,
                         W,
@@ -6431,7 +6431,7 @@ class ChunkedLmHeadLossFunction(torch.autograd.Function):
                         num_valid_rows,
                         check_num_valid_rows,
                     )
-            ChunkedLmHeadLossFunction._setup(
+            CakeLMHeadNondetLossFunction._setup(
                 ctx, X, grad_weight_dtype, backend, memory_mode
             )
             ckpt = _main._checkpoint_pass()
@@ -6506,7 +6506,7 @@ class ChunkedLmHeadLossFunction(torch.autograd.Function):
             check_num_valid_rows=check_num_valid_rows,
             return_logp=bool(return_logp),
         )
-        ChunkedLmHeadLossFunction._setup(
+        CakeLMHeadNondetLossFunction._setup(
             ctx, X, grad_weight_dtype, backend, memory_mode
         )
         # the deferred weight gradient's operands: the last chunk's dz rows and its X rows, the latter a view of the
@@ -6522,7 +6522,7 @@ class ChunkedLmHeadLossFunction(torch.autograd.Function):
             ctx.save_for_backward(
                 result.dz_last, result.x_last, result.x_src, result.x_idx, X, W
             )
-        ChunkedLmHeadLossFunction._keep(ctx, result)
+        CakeLMHeadNondetLossFunction._keep(ctx, result)
         ctx.mark_non_differentiable(result.logp)
         return result.loss, result.logp
 
@@ -6581,7 +6581,7 @@ class ChunkedLmHeadLossFunction(torch.autograd.Function):
             # backward's own fused forward) is the gradient state
             inputs = ctx.saved_tensors
             state = _main._split_state(ctx, inputs, forward_loss)
-            ChunkedLmHeadLossFunction._keep(ctx, state)
+            CakeLMHeadNondetLossFunction._keep(ctx, state)
             saved = (state.dz_last, state.x_last, state.x_src, state.x_idx) + (
                 tuple(inputs[:2])
                 if state.memory_plan is not None and state.memory_plan.recompute
@@ -6607,7 +6607,7 @@ class ChunkedLmHeadLossFunction(torch.autograd.Function):
                 )
             )
             if not keep:
-                ChunkedLmHeadLossFunction._release(ctx)
+                CakeLMHeadNondetLossFunction._release(ctx)
             return (dx, dw) + none[2:]
         mplan = ctx.memory_plan
         if saved is None:
@@ -6668,11 +6668,11 @@ class ChunkedLmHeadLossFunction(torch.autograd.Function):
                 ctx.dw_acc, grad_loss, ctx.grad_weight_dtype, backend=ctx.backend
             )
         if not keep:
-            ChunkedLmHeadLossFunction._release(ctx)
+            CakeLMHeadNondetLossFunction._release(ctx)
         return (dx, dw) + none[2:]
 
 
-class ChunkedLmHeadLogprobFunction(torch.autograd.Function):
+class CakeLMHeadNondetLogprobFunction(torch.autograd.Function):
     """Entry (b): the forward saves the row statistic; the backward recomputes the logits."""
 
     @staticmethod
@@ -6700,7 +6700,7 @@ class ChunkedLmHeadLogprobFunction(torch.autograd.Function):
             and _main._selective_checkpoint_modes()
         ):
             with _main._modes_off():  # under a selective checkpoint's modes: popped (as in :mod:`.cake_backend`)
-                return ChunkedLmHeadLogprobFunction.forward(
+                return CakeLMHeadNondetLogprobFunction.forward(
                     ctx,
                     X,
                     W,
@@ -6818,8 +6818,8 @@ class ChunkedLmHeadLogprobFunction(torch.autograd.Function):
         return (dx, dw) + (None,) * 14
 
 
-class ChunkedLmHeadLogprobTemperatureFunction(torch.autograd.Function):
-    """:class:`ChunkedLmHeadLogprobFunction` of a call with a temperature (:func:`chunked_lm_head_logprob`)."""
+class CakeLMHeadNondetLogprobTemperatureFunction(torch.autograd.Function):
+    """:class:`CakeLMHeadNondetLogprobFunction` of a call with a temperature (:func:`cake_lm_head_nondet_train_logprob`)."""
 
     @staticmethod
     def forward(
@@ -6848,7 +6848,7 @@ class ChunkedLmHeadLogprobTemperatureFunction(torch.autograd.Function):
             and _main._selective_checkpoint_modes()
         ):
             with _main._modes_off():  # under a selective checkpoint's modes: popped (as in :mod:`.cake_backend`)
-                return ChunkedLmHeadLogprobTemperatureFunction.forward(
+                return CakeLMHeadNondetLogprobTemperatureFunction.forward(
                     ctx,
                     X,
                     W,
@@ -7309,7 +7309,7 @@ def _dw_cast_taken(acc: list) -> torch.Tensor:
     return scale_cast(accumulator, None, torch.bfloat16)
 
 
-def chunked_lm_head_loss(
+def cake_lm_head_nondet_train_loss(
     X: torch.Tensor,
     W: torch.Tensor,
     labels: torch.Tensor,
@@ -7396,7 +7396,7 @@ def chunked_lm_head_loss(
 
     With neither keyword (``memory_mode`` ``None`` or ``"fast"`` and
     ``num_valid_rows`` ``None``) the call is :mod:`.cake_backend`'s
-    ``chunked_lm_head_loss``.  Its gradient placement
+    ``cake_lm_head_nondet_train_loss``.  Its gradient placement
     (:func:`.cake_backend.set_gradient_placement`) applies here too.  With
     ``memory_mode="budget"`` a backward that
     frees the graph releases the forward's saved accumulators as soon as it
@@ -7406,7 +7406,7 @@ def chunked_lm_head_loss(
     if check_num_valid_rows and num_valid_rows is None:
         raise ValueError(_CHECK_WITHOUT_COUNT)
     if num_valid_rows is None and _resolve_memory_mode(memory_mode) == "fast":
-        return _main.chunked_lm_head_loss(
+        return _main.cake_lm_head_nondet_train_loss(
             X,
             W,
             labels,
@@ -7473,7 +7473,7 @@ def chunked_lm_head_loss(
             return_logp=bool(return_logp),
         )
         return (result.loss, result.logp) if return_logp else result.loss
-    loss, logp = ChunkedLmHeadLossFunction.apply(
+    loss, logp = CakeLMHeadNondetLossFunction.apply(
         X,
         W,
         labels,
@@ -7498,7 +7498,7 @@ def chunked_lm_head_loss(
     return (loss, logp.detach()) if return_logp else loss
 
 
-def chunked_lm_head_logprob(
+def cake_lm_head_nondet_train_logprob(
     X: torch.Tensor,
     W: torch.Tensor,
     labels: torch.Tensor,
@@ -7519,26 +7519,26 @@ def chunked_lm_head_logprob(
 ) -> torch.Tensor:
     """Differentiable FP32 ``logp [T]`` (0 on ignored rows) for arbitrary downstream losses.  The switches
     ``compact_rows`` / ``fuse_dw_cast`` / ``dx_finalize`` / ``dw_stream`` / ``hidden_count`` / ``gemm_tuning`` and
-    their defaults (``None`` = the documented default) as in :func:`chunked_lm_head_loss`, plus the logits GEMM arms
+    their defaults (``None`` = the documented default) as in :func:`cake_lm_head_nondet_train_loss`, plus the logits GEMM arms
     of this entry: ``logprob_lbl`` (default ``True``, :func:`logprob_lbl_default`) -- the forward's logits GEMM
     writes the row statistics and the label column's logit only -- and ``logprob_dz`` (default ``True``,
     :func:`logprob_dz_default`) -- the backward's recompute writes ``dz`` from its epilogue, no ``row_grad`` launch
     (both bitwise the same outputs).  Every switch is resolved once in the forward; the backward reuses the
     forward's valid-row index (no count, no host synchronization) and recomputes under the same values.
     ``memory_mode`` (``"budget"``: the backward's weight-gradient form of :func:`memory_plan`), ``num_valid_rows`` and
-    ``check_num_valid_rows`` (the forward's count) as in :func:`chunked_lm_head_loss`; with neither keyword the call
-    is :mod:`.cake_backend`'s ``chunked_lm_head_logprob``.  ``memory_mode="keep_logits"`` (:data:`KEEP_LOGITS`,
-    without ``num_valid_rows``; ``cake`` backend): :mod:`.cake_backend`'s ``chunked_lm_head_logprob_keep`` --
+    ``check_num_valid_rows`` (the forward's count) as in :func:`cake_lm_head_nondet_train_loss`; with neither keyword the call
+    is :mod:`.cake_backend`'s ``cake_lm_head_nondet_train_logprob``.  ``memory_mode="keep_logits"`` (:data:`KEEP_LOGITS`,
+    without ``num_valid_rows``; ``cake`` backend): :mod:`.cake_backend`'s ``cake_lm_head_nondet_train_logprob_keep`` --
     where a backward can follow, the forward keeps the BF16 logits of the valid rows (``2 * T_v * V`` bytes until the
     backward) and the backward forms ``dz`` from them instead of recomputing them (bitwise the same ``logp`` /
     ``dW``; ``dX`` the same products in the unordered reduction of a chunk of more than one dX slice); where none
     can, the default entry.  Like ``"budget"`` it is a ``ValueError`` on the reference backend (the backend-level
-    ``chunked_lm_head_logprob_keep`` runs the default entry there)."""
+    ``cake_lm_head_nondet_train_logprob_keep`` runs the default entry there)."""
     if check_num_valid_rows and num_valid_rows is None:
         raise ValueError(_CHECK_WITHOUT_COUNT)
     try:
         if num_valid_rows is None and _resolve_memory_mode(memory_mode) == "fast":
-            return _main.chunked_lm_head_logprob(
+            return _main.cake_lm_head_nondet_train_logprob(
                 X,
                 W,
                 labels,
@@ -7565,7 +7565,7 @@ def chunked_lm_head_logprob(
             )
         if backend != "cake":
             raise ValueError(f"memory_mode={KEEP_LOGITS!r} runs on the cake backend")
-        return _main.chunked_lm_head_logprob_keep(
+        return _main.cake_lm_head_nondet_train_logprob_keep(
             X,
             W,
             labels,
@@ -7582,7 +7582,7 @@ def chunked_lm_head_logprob(
         )
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
-    return ChunkedLmHeadLogprobFunction.apply(
+    return CakeLMHeadNondetLogprobFunction.apply(
         X,
         W,
         labels,
@@ -7602,7 +7602,7 @@ def chunked_lm_head_logprob(
     )
 
 
-def chunked_lm_head_logprob_temperature(
+def cake_lm_head_nondet_train_logprob_temperature(
     X: torch.Tensor,
     W: torch.Tensor,
     labels: torch.Tensor,
@@ -7625,15 +7625,15 @@ def chunked_lm_head_logprob_temperature(
 ) -> torch.Tensor:
     """Differentiable FP32 ``logp [T]`` (0 on ignored rows) for arbitrary downstream losses.  The switches
     ``compact_rows`` / ``fuse_dw_cast`` / ``dx_finalize`` / ``dw_stream`` / ``hidden_count`` / ``gemm_tuning`` and
-    their defaults (``None`` = the documented default) as in :func:`chunked_lm_head_loss`, plus the logits GEMM arms
+    their defaults (``None`` = the documented default) as in :func:`cake_lm_head_nondet_train_loss`, plus the logits GEMM arms
     of this entry: ``logprob_lbl`` (default ``True``, :func:`logprob_lbl_default`) -- the forward's logits GEMM
     writes the row statistics and the label column's logit only -- and ``logprob_dz`` (default ``True``,
     :func:`logprob_dz_default`) -- the backward's recompute writes ``dz`` from its epilogue, no ``row_grad`` launch
     (both bitwise the same outputs).  Every switch is resolved once in the forward; the backward reuses the
     forward's valid-row index (no count, no host synchronization) and recomputes under the same values.
     ``memory_mode`` (``"budget"``: the backward's weight-gradient form of :func:`memory_plan`), ``num_valid_rows`` and
-    ``check_num_valid_rows`` (the forward's count) as in :func:`chunked_lm_head_loss`; with neither keyword the call
-    is :mod:`.cake_backend`'s ``chunked_lm_head_logprob``.
+    ``check_num_valid_rows`` (the forward's count) as in :func:`cake_lm_head_nondet_train_loss`; with neither keyword the call
+    is :mod:`.cake_backend`'s ``cake_lm_head_nondet_train_logprob``.
 
     ``temperature`` (default ``None``, the same as ``1.0``: no temperature):
     a positive number or a float32 ``[T]`` tensor on ``X``'s device (one value per
@@ -7663,7 +7663,7 @@ def chunked_lm_head_logprob_temperature(
                 f"memory_mode={KEEP_LOGITS!r} takes no temperature (the kept logits' gradient form has no temperature "
                 "form): pass temperature=None, or memory_mode=None, 'fast' or 'budget'"
             )
-        return chunked_lm_head_logprob(
+        return cake_lm_head_nondet_train_logprob(
             X,
             W,
             labels,
@@ -7682,7 +7682,7 @@ def chunked_lm_head_logprob_temperature(
             check_num_valid_rows=check_num_valid_rows,
         )
     if num_valid_rows is None and _resolve_memory_mode(memory_mode) == "fast":
-        return _main.chunked_lm_head_logprob_temperature(
+        return _main.cake_lm_head_nondet_train_logprob_temperature(
             X,
             W,
             labels,
@@ -7703,7 +7703,7 @@ def chunked_lm_head_logprob_temperature(
         raise ValueError(f"backend must be one of {BACKENDS}")
     if temperature is None or (type(temperature) is float and temperature == 1.0):
         # the default path: no temperature operation (a scalar 1.0 resolves to none)
-        return ChunkedLmHeadLogprobFunction.apply(
+        return CakeLMHeadNondetLogprobFunction.apply(
             X,
             W,
             labels,
@@ -7721,7 +7721,7 @@ def chunked_lm_head_logprob_temperature(
             num_valid_rows,
             check_num_valid_rows,
         )
-    return ChunkedLmHeadLogprobTemperatureFunction.apply(
+    return CakeLMHeadNondetLogprobTemperatureFunction.apply(
         X,
         W,
         labels,
@@ -7745,21 +7745,21 @@ def chunked_lm_head_logprob_temperature(
 
 PRELOAD_ROWS = (
     1 << 16
-)  # rows of the int32 count constant (1, 2, ...) preload allocates; longer calls extend it
+)  # rows of the int32 count constant (1, 2, ...) cake_lm_head_nondet_train_preload allocates; longer calls extend it
 
 
-def preload(
+def cake_lm_head_nondet_train_preload(
     device: Optional[Union[torch.device, int, str]] = None,
     *,
     temperature: bool = False,
 ) -> None:
     """Do part of the one-time work of a process's first call ahead of it, then wait for the device once.
 
-    ``preload`` loads every library of the stages ``device``'s architecture registers in ``cake_jit.STAGES`` (a JIT
+    ``cake_lm_head_nondet_train_preload`` loads every library of the stages ``device``'s architecture registers in ``cake_jit.STAGES`` (a JIT
     build when the package ships no prebuilt ``aot/`` library; the candidate-support stages of ``cake_support`` are
     not among them and still load at their first call), creates the calling thread's dW side stream and fork event, its
     dX fill stream and join event and its hidden-count pinned cell, event and int32 count constant -- per-thread state:
-    another thread forms its own at its first call, so ``preload`` warms the calling thread only -- the
+    another thread forms its own at its first call, so ``cake_lm_head_nondet_train_preload`` warms the calling thread only -- the
     constant cells, launches each PyTorch operator of the valid-row count paths once on a few rows (``ge``,
     ``cumsum``, ``searchsorted``, ``eq``,
     ``_assert_async``, ``nonzero``, ``index_select``, ``index_copy_``, ``where``) and then synchronizes ``device``.
@@ -7778,7 +7778,9 @@ def preload(
     else:
         dev = torch.device(device)
     if dev.type != "cuda":
-        raise ValueError(f"preload needs a CUDA device, got {dev}")
+        raise ValueError(
+            f"cake_lm_head_nondet_train_preload needs a CUDA device, got {dev}"
+        )
     index = int(dev.index if dev.index is not None else torch.cuda.current_device())
     dev = torch.device("cuda", index)
     module_name, record = record_for(dev)
@@ -7788,7 +7790,7 @@ def preload(
         if temperature
         else registered_stages(module_name)
     )
-    # the temperature forms load with preload(temperature=True) or at a call's first use
+    # the temperature forms load with cake_lm_head_nondet_train_preload(temperature=True) or at a call's first use
     for stage in stages:
         load_cake_lm_head_loss_module(module_name, stage)
     with torch.cuda.device(index):
@@ -7805,7 +7807,7 @@ def preload(
         valid, pos, idx_full = compaction_index(
             labels, ar=_hidden_count_arange(index, int(labels.numel()))
         )
-        _assert_on_device(pos[-1] == int(pos.numel() - 2), "preload")
+        _assert_on_device(pos[-1] == int(pos.numel() - 2), "cake_lm_head_nondet_train_preload")
         index_rows = valid.nonzero().squeeze(1)
         rows = torch.zeros((8, 8), dtype=torch.bfloat16, device=dev)
         picked = torch.index_select(rows, 0, index_rows)
@@ -7815,7 +7817,7 @@ def preload(
         if temperature:
             # the temperature path's operators: the value check, the scalar fill and the gathers
             tau = torch.full((8,), 0.5, dtype=torch.float32, device=dev)
-            _assert_on_device(((tau > 0) & (tau < math.inf)).all(), "preload")
+            _assert_on_device(((tau > 0) & (tau < math.inf)).all(), "cake_lm_head_nondet_train_preload")
             torch.index_select(tau, 0, index_rows)
             torch.index_select(
                 tau,

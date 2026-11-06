@@ -818,7 +818,7 @@ def _check_word(word: torch.Tensor, check_inputs: bool) -> None:
 
 @dataclass(frozen=True)
 class SupportOutputs:
-    """Which outputs one call forms (``SupportLogprobFunction`` returns them in this order)."""
+    """Which outputs one call forms (``CakeLMHeadNondetSupportFunction`` returns them in this order)."""
 
     packed: bool
     selected: bool
@@ -1967,7 +1967,7 @@ def support_memory_report(
     return report
 
 
-class SupportLogprobFunction(torch.autograd.Function):
+class CakeLMHeadNondetSupportFunction(torch.autograd.Function):
     """One forward serves every requested output; gradients to ``X`` and ``W`` only."""
 
     @staticmethod
@@ -1989,7 +1989,7 @@ class SupportLogprobFunction(torch.autograd.Function):
         if _TOP_SAVED_HOOKS(False) is not None and _selective_checkpoint_modes():
             # under selective activation checkpointing: every dispatch mode popped (as in :mod:`.cake_backend`)
             with _modes_off():
-                return SupportLogprobFunction.forward(
+                return CakeLMHeadNondetSupportFunction.forward(
                     ctx,
                     X,
                     W,
@@ -2090,7 +2090,10 @@ class SupportLogprobFunction(torch.autograd.Function):
         ):
             # before the backward's first launch: its dense dX adds K slices in the order they finish (torch's flag
             # read first: outside its deterministic algorithms the slice rule is not evaluated)
-            _alert_nondeterministic("SupportLogprobFunction.backward")
+            _alert_nondeterministic(
+                "CakeLMHeadNondetSupportFunction.backward",
+                "support_kl" if ctx.outputs.kl else "support_logprob",
+            )
         T, H, V = problem.num_rows, problem.hidden, problem.vocab
         if T == 0:
             (X,) = ctx.saved_tensors
@@ -2176,7 +2179,7 @@ def _support_call(
     if backend == "cake":
         cx = _cake_context(X.device)
         cake = (cx, make_support_plan(problem, cx.arch, cx.geometry, knobs))
-    result = SupportLogprobFunction.apply(
+    result = CakeLMHeadNondetSupportFunction.apply(
         X,
         W,
         support_ids,
@@ -2206,7 +2209,7 @@ def _check_first_offset(offsets: torch.Tensor, check_inputs: bool) -> None:
         _assert_on_device(first == 0, _ASSERT_MESSAGE)
 
 
-def chunked_lm_head_support_logprob(
+def cake_lm_head_nondet_train_support_logprob(
     X: torch.Tensor,
     W: torch.Tensor,
     support_ids: torch.Tensor,
@@ -2265,7 +2268,7 @@ def chunked_lm_head_support_logprob(
     return res["packed"] if labels is None else res["selected"]
 
 
-def chunked_lm_head_support_kl(
+def cake_lm_head_nondet_train_support_kl(
     X: torch.Tensor,
     W: torch.Tensor,
     support_ids: torch.Tensor,
@@ -2288,7 +2291,7 @@ def chunked_lm_head_support_kl(
     (``lq``, aligned with ``support_ids``; ``-inf`` allowed: ``Q = 0``).  Student and teacher share the
     support.  Rows with ``K_t <= 1`` give 0.  ``return_logprobs=True`` also returns the differentiable
     packed student ``logp [M]``: ``(kl, logp)``.  Weighting, reduction and any ``tau ** 2`` factor belong to
-    the caller.  Other arguments (and the backend-level knobs) as in :func:`chunked_lm_head_support_logprob`.
+    the caller.  Other arguments (and the backend-level knobs) as in :func:`cake_lm_head_nondet_train_support_logprob`.
     """
     outputs = SupportOutputs(packed=bool(return_logprobs), selected=False, kl=True)
     res = _support_call(
@@ -2314,15 +2317,15 @@ def chunked_lm_head_support_kl(
 
 __all__ = [
     "CANONICAL_SEQUENCE",
+    "CakeLMHeadNondetSupportFunction",
     "NO_ERROR",
     "SUPPORT_ERRORS",
     "SUPPORT_M_MAX",
     "SUPPORT_V_MAX",
-    "SupportLogprobFunction",
     "SupportReferenceEngine",
     "SupportRows",
-    "chunked_lm_head_support_kl",
-    "chunked_lm_head_support_logprob",
+    "cake_lm_head_nondet_train_support_kl",
+    "cake_lm_head_nondet_train_support_logprob",
     "decode_support_error",
     "describe_support_error",
     "support_error_word",
