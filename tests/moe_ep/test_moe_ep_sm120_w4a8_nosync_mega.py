@@ -1,4 +1,4 @@
-"""SM120 MXFP4 x MXFP8 decode MegaMoE (moe_ep backend ``sm120_mxfp4_mxfp8_bf16_decode``) through
+"""SM120 MXFP4 x MXFP8 nosync MegaMoE (moe_ep backend ``sm120_mxfp4_mxfp8_bf16_nosync``) through
 ``MoEEpLayer`` against a dense reference with the kernel's numerics.
 
 ``stage_inputs`` quantizes the BF16 activations to MXFP8 (E4M3, one power-of-two scale per 32
@@ -8,7 +8,7 @@ follows those rules; it also reports the error of both against an unquantized-in
 reference.
 
 Run with plain Python (workers are spawned here):
-    python tests/moe_ep/test_moe_ep_sm120_w4a8_decode_mega.py --ep 4 --tokens 1 8 20 64
+    python tests/moe_ep/test_moe_ep_sm120_w4a8_nosync_mega.py --ep 4 --tokens 1 8 20 64
 """
 
 import argparse
@@ -103,7 +103,7 @@ def _rel(a, b):
     ).item()
 
 
-def _layer(args, rank, experts, raw1, raw2, backend="decode"):
+def _layer(args, rank, experts, raw1, raw2, backend="nosync"):
     from flashinfer.moe_ep import (
         BootstrapConfig,
         FleetParams,
@@ -112,9 +112,9 @@ def _layer(args, rank, experts, raw1, raw2, backend="decode"):
         PrequantizedMoEWeights,
     )
 
-    if backend == "decode":
+    if backend == "nosync":
         from flashinfer.moe_ep import (
-            Sm120_Mxfp4_Mxfp8_Bf16_Decode_MegaMoeConfig as Config,
+            Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig as Config,
         )
 
         config = Config(
@@ -284,7 +284,7 @@ def _worker(rank, args):
         dist.all_reduce(metrics, op=dist.ReduceOp.MAX)
         if rank == 0:
             print(
-                f"PASS sm120 decode EP{ep} M={m_all}{' uneven' if args.uneven else ''} "
+                f"PASS sm120 nosync EP{ep} M={m_all}{' uneven' if args.uneven else ''} "
                 f"routing={args.routing} transport={args.transport} "
                 f"relative_l2={metrics[0].item():.3g} "
                 f"vs_unquantized_intermediate={metrics[1].item():.3g}"
@@ -331,21 +331,21 @@ def _sm120_gpus(n):
 
 
 @pytest.mark.parametrize("ep", [2, 4, 8])
-def test_sm120_decode(ep):
+def test_sm120_nosync(ep):
     if not _sm120_gpus(ep):
         pytest.skip(f"requires {ep} SM120 GPUs")
     _run(_args(ep=ep))
 
 
 @pytest.mark.parametrize("routing", ["hot", "empty", "invalid"])
-def test_sm120_decode_skewed_routing(routing):
+def test_sm120_nosync_skewed_routing(routing):
     """Every route on the same experts, every route masked, and out-of-range or repeated ids."""
     if not _sm120_gpus(4):
         pytest.skip("requires 4 SM120 GPUs")
     _run(_args(routing=routing, repeats=3))
 
 
-def test_sm120_decode_uneven_rows():
+def test_sm120_nosync_uneven_rows():
     """Ranks stage different row counts in the same call, one of them none."""
     if not _sm120_gpus(4):
         pytest.skip("requires 4 SM120 GPUs")
@@ -353,7 +353,7 @@ def test_sm120_decode_uneven_rows():
 
 
 @pytest.mark.parametrize("hidden", [256, 768])
-def test_sm120_decode_hidden_widths(hidden):
+def test_sm120_nosync_hidden_widths(hidden):
     """Hidden sizes whose MXFP8 scale row (hidden / 32 bytes) is not a multiple of 16 bytes."""
     if not _sm120_gpus(4):
         pytest.skip("requires 4 SM120 GPUs")
@@ -366,7 +366,7 @@ def test_sm120_decode_hidden_widths(hidden):
     [(4096, 2048, 256, 6), (5120, 2304, 384, 6), (4096, 2048, 288, 8)],
     ids=["dsv4_flash", "dsv41_flash", "glm53_flash"],
 )
-def test_sm120_decode_model_shapes(ep, hidden, intermediate, experts, topk):
+def test_sm120_nosync_model_shapes(ep, hidden, intermediate, experts, topk):
     """DeepSeek-V4-Flash, DeepSeek-V4.1-Flash and GLM-5.3-Flash routed experts at EP4 and EP8."""
     if not _sm120_gpus(ep):
         pytest.skip(f"requires {ep} SM120 GPUs")
@@ -383,14 +383,14 @@ def test_sm120_decode_model_shapes(ep, hidden, intermediate, experts, topk):
 
 
 @pytest.mark.parametrize("tokens_per_item", [8, 16, 24, 32])
-def test_sm120_decode_tokens_per_item(tokens_per_item):
+def test_sm120_nosync_tokens_per_item(tokens_per_item):
     """Every work-item width, forced, at token counts below and above it."""
     if not _sm120_gpus(4):
         pytest.skip("requires 4 SM120 GPUs")
     _run(_args(tokens=[1, 20, 64, 128], tokens_per_item=tokens_per_item))
 
 
-def test_sm120_decode_matches_cake():
+def test_sm120_nosync_matches_cake():
     """Same weights and inputs through the sibling cake backend: the two agree up to their
     intermediate-quantization recipes."""
     if not _sm120_gpus(4):
@@ -412,7 +412,7 @@ _NIC = os.environ.get("FLASHINFER_TEST_MEGAMOE_SM120_NIC") == "1"
 
 @pytest.mark.parametrize("ep", [2, 4, 8])
 @pytest.mark.parametrize("routing", ["random", "hot", "empty", "invalid"])
-def test_sm120_decode_nic_transport(ep, routing):
+def test_sm120_nosync_nic_transport(ep, routing):
     """Every pair over NCCL GIN (transport="nic"): same results as P2P."""
     if not _NIC:
         pytest.skip("set FLASHINFER_TEST_MEGAMOE_SM120_NIC=1 on a GIN-capable host")
@@ -421,7 +421,7 @@ def test_sm120_decode_nic_transport(ep, routing):
     _run(_args(ep=ep, routing=routing, repeats=3, transport="nic"))
 
 
-def test_sm120_decode_auto_transport():
+def test_sm120_nosync_auto_transport():
     """transport="auto": P2P where NCCL maps the pair, GIN elsewhere, with uneven rows."""
     if not _NIC:
         pytest.skip("set FLASHINFER_TEST_MEGAMOE_SM120_NIC=1 on a GIN-capable host")

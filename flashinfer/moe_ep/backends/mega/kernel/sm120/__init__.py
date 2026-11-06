@@ -3,13 +3,13 @@
 from . import (
     mxfp4_mxfp8_bf16_cake,
     mxfp4_mxfp8_bf16_cutedsl,
-    mxfp4_mxfp8_bf16_decode,
+    mxfp4_mxfp8_bf16_nosync,
     mxfp8_mxfp8_bf16_cutedsl,
 )
 
 __all__ = [
     "mxfp4_mxfp8_bf16_cake",
     "mxfp4_mxfp8_bf16_cutedsl",
-    "mxfp4_mxfp8_bf16_decode",
+    "mxfp4_mxfp8_bf16_nosync",
     "mxfp8_mxfp8_bf16_cutedsl",
 ]

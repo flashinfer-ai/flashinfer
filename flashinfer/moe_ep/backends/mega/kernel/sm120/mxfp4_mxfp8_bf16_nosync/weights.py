@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Weight preprocessing for the SM120 MXFP4 x MXFP8 decode MegaMoE backend.
+"""Weight preprocessing for the SM120 MXFP4 x MXFP8 nosync MegaMoE backend.
 
 Canonical input (same contract as the sibling ``mxfp4_mxfp8_bf16_cutedsl`` and
 ``mxfp4_mxfp8_bf16_cake`` backends): a
