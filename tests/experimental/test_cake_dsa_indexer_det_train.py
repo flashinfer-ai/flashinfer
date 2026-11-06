@@ -110,6 +110,7 @@ _COMMON = dict(
     cand_cap_ceiling=None,
     cand_cap_ceiling_unsampled=None,
     wide_first_rule=None,
+    wide_wave_rule=None,
     split_max=32,
     split_min_range_tiles=64,
     split_units=["l6", "narrow", "wide"],
@@ -119,6 +120,7 @@ _COMMON = dict(
     l6_solo_unsampled_max_queries=None,
     wide_pair_snake_only=False,
     snake_default=False,
+    snake_cap_rule=None,
     tile_unroll_default=1,
     tile_unroll_factor=2,
     sample_fit_max_mean_tiles=512,
@@ -347,15 +349,19 @@ def test_registry_records_are_well_formed():
         assert set(keys) == set(scan_keys) | set(finalize_keys) | set(rank_keys) | {
             MERGE_KEY
         }, arch
-        # every scan key follows the key grammar; an FP8 key (``:fp8`` before ``:lsf``) runs in the plain unit order
-        # and the sampled-fit form, and the BF16 record's rules below are the BF16 programs' (the FP8 form has a
-        # record of its own, ``policy_for(arch, "fp8")``)
+        # every scan key follows the key grammar; an FP8 key (``:fp8`` before ``:lsf``) runs the sampled-fit form, in
+        # the plain unit order or as the snake copy of a registered plain FP8 program, and the BF16 record's rules
+        # below are the BF16 programs' (the FP8 form has a record of its own, ``policy_for(arch, "fp8")``)
         for key in scan_keys:
             fields = scan_key_fields(key)
             assert fields is not None, (arch, key)
             assert (key.split(":")[-1] == "lsf") == fields.lsf, (arch, key)
             if fields.form == cake_policy.FP8:
-                assert not fields.snake and fields.sample_fit, (arch, key)
+                assert fields.sample_fit, (arch, key)
+                assert not fields.snake or key.replace(":s1:", ":s0:", 1) in keys, (
+                    arch,
+                    key,
+                )
         scan_keys = [k for k in scan_keys if scan_key_form(k) == cake_policy.BF16]
         # the rank finalize programs are registered exactly where the architecture's rule admits a call
         assert bool(rank_keys) == (
@@ -739,6 +745,13 @@ def test_policy_record_round_trip_and_validation():
         dict(wide_first_rule=[512.0, 1]),
         dict(wide_first_rule=[-1.0]),
         dict(wide_first_rule=[True]),
+        # the wave rule: [min narrow / wide wave ratio, min l6 / wide wave ratio, min mean unit tiles], each >= 0, or None
+        dict(wide_wave_rule=1.6),
+        dict(wide_wave_rule=[]),
+        dict(wide_wave_rule=[1.6, 1.3]),
+        dict(wide_wave_rule=[1.6, 1.3, 80.0, 1]),
+        dict(wide_wave_rule=[-1.0, 1.3, 80.0]),
+        dict(wide_wave_rule=[1.6, 1.3, True]),
         # the units that split: an ascending list of unit geometries (may be empty)
         dict(split_units="l6"),
         dict(split_units=["split_l6"]),
@@ -758,6 +771,15 @@ def test_policy_record_round_trip_and_validation():
         dict(l6_solo_unsampled_max_queries=16384.0),
         dict(l6_solo_unsampled_max_queries=True),
         dict(l6_solo_unsampled_max_queries=[16384]),
+        # the FP8 snake cap: [max segments >= 1, max waves >= 1] or None
+        dict(snake_cap_rule=40),
+        dict(snake_cap_rule=[]),
+        dict(snake_cap_rule=[1]),
+        dict(snake_cap_rule=[1, 40, 1]),
+        dict(snake_cap_rule=[0, 40]),
+        dict(snake_cap_rule=[1, 0]),
+        dict(snake_cap_rule=[1.0, 40]),
+        dict(snake_cap_rule=[True, 40]),
         # the scope of the two-way wave split: [ascending unit geometries, max segments >= 1, sampled only] or None
         dict(split_wave_scope="narrow"),
         dict(split_wave_scope=[]),
@@ -828,6 +850,18 @@ def test_policy_record_round_trip_and_validation():
     assert first.wide_first_rule == [192.0]
     assert first.record()["wide_first_rule"] == [192.0]
     assert DispatchPolicy.from_record(first.record()) == first
+    waved = DispatchPolicy.from_record(dict(record, wide_wave_rule=[1.6, 1.3, 80.0]))
+    assert waved.wide_wave_rule == [1.6, 1.3, 80.0]
+    assert waved.record()["wide_wave_rule"] == [1.6, 1.3, 80.0]
+    assert DispatchPolicy.from_record(waved.record()) == waved
+    capped = DispatchPolicy.from_record(dict(record, snake_cap_rule=(1, 40)))
+    assert capped.record()["snake_cap_rule"] == [1, 40]
+    assert DispatchPolicy.from_record(capped.record()) == capped
+    # waves of 6-query units on 212 CTAs: 32768 queries take 26, 65536 take 52
+    assert capped.snake_copy_fits(32768, 1, 6, 212)
+    assert not capped.snake_copy_fits(65536, 1, 6, 212)
+    assert not capped.snake_copy_fits(32768, 2, 6, 212)
+    assert DispatchPolicy.from_record(record).snake_copy_fits(1 << 20, 64, 6, 212)
     scoped = DispatchPolicy.from_record(
         dict(record, split_wave_scope=(("narrow", "wide"), 2, False))
     )
@@ -1476,6 +1510,34 @@ def test_wide_first_precedence_and_pair_units_guard():
         dict(hostile.record(), pair_units=["l6", "wide"])
     )
     assert _select(hostile_open, 131072, 131072).kind == "pair_wide"
+
+
+def test_wide_wave_rule_compares_waves_of_the_persistent_grid():
+    """``wide_wave_rule`` replaces ``wide_rule`` and ``wide_first_rule``: the wide unit takes a call when the unit the
+    other rules leave needs at least the record's ratio of the wide unit's waves of the grid (``ceil(units / grid)``),
+    against the three-warpgroup unit also from a mean unit tile count on.  The fixture takes ``NARROW_PAIR_POLICY``
+    (``l6_rule`` to 256 tiles at top_k >= 512) with the rule [1.7, 1.3, 84] on a 148-CTA grid."""
+    waved = DispatchPolicy.from_record(
+        dict(NARROW_PAIR_POLICY.record(), wide_wave_rule=[1.7, 1.3, 84.0])
+    )
+
+    def unit(T, Tkv, K=2048):
+        return waved.unit_block_q_for(T, Tkv, 1, 1, 148, K)
+
+    # 4096 queries over 65536 keys (496 mean tiles): narrow 1024 units = 7 waves, wide 512 = 4 waves, 7 >= 6.8 -> wide
+    assert unit(4096, 65536) == 8
+    # 2560 queries over 49152 keys: narrow 640 units = 5 waves, wide 320 = 3 waves, 5 < 5.1 -> narrow
+    assert unit(2560, 49152) == 4
+    # 16384 queries over 20480 keys (96 mean tiles, three-warpgroup): l6 2731 units = 19 waves, wide 2048 = 14
+    # waves, 19 >= 18.2 from the 84-tile floor on -> wide; at 18432 keys (80 mean tiles) below the floor -> l6
+    assert unit(16384, 20480) == 8
+    assert unit(16384, 18432) == 6
+    # 8k causal document (32 mean tiles): l6 10 waves against wide 7, 10 >= 9.1 but below the floor -> l6
+    assert unit(8192, 8192) == 6
+    # top_k 256 has no three-warpgroup unit: 712 queries over 4096 keys compare narrow 2 waves with wide 1 -> wide
+    assert unit(712, 4096, K=256) == 8
+    # the record without the field keeps the rounds-and-work rule: 512 / 148 = 3.5 rounds < 6 -> narrow
+    assert NARROW_PAIR_POLICY.unit_block_q_for(4096, 65536, 1, 1, 148, 2048) == 4
 
 
 def test_sample_shift_rule_precedence():
