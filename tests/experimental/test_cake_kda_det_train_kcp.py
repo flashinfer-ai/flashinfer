@@ -3507,7 +3507,7 @@ CKPT_IDS = [f"s{'_'.join(map(str, lens))}-h{H}" for lens, H in CKPT_ROWS]
 
 def _ckpt_problem(device, lengths, H):
     """A one-rank problem: the context, the operands (the delta rule's contract) and ``dout``."""
-    from tests.test_helpers.cake_kda_train_reference import make_inputs
+    from tests.test_helpers.cake_kda_det_train_reference import make_inputs
 
     cu = [0]
     for n in lengths:
@@ -4228,6 +4228,105 @@ def test_recompute_handle_byte_queries(W) -> None:
     assert kp.kda_det_saved_bytes_kcp(
         ctx, save_transfer=None
     ) == kp.kda_det_saved_bytes_kcp(ctx, save_transfer=kp.SAVE_TRANSFER_DEFAULT)
+
+
+# --------------------------------------------------------------------------- the non-deterministic package's objects
+
+SAVED_MODE_RE = (
+    r"saved: a \S+\.SavedDetKcp \(the deterministic KCP forward\) is required, got {}; a saved set of the "
+    r"non-deterministic package \(deterministic=False\) is read by that package's backward"
+)
+WORKSPACE_MODE_RE = (
+    r"workspace: a \S+\.WorkspaceDetKcp is required, got {}\.WorkspaceKcp; a workspace of the non-deterministic "
+    r"package \(deterministic=False\) serves that package's calls only"
+)
+
+
+def test_backward_refuses_the_other_modes_saved_set_and_workspace() -> None:
+    """Host only: :func:`chunk_kda_det_bwd_kcp` refuses a saved set that is not a ``SavedDetKcp`` -- the
+    non-deterministic package's ``SavedKcp`` (the same version, members and metadata) or any other object -- and a
+    workspace of the non-deterministic package with ``ValueError`` naming the mode, before it reads an option, a graph
+    key, an operand or a tensor (the operands here are placeholders); ``_call_workspace`` (the workspace check of
+    every entry point) refuses that workspace alike and keeps ``TypeError`` for any other object.  The
+    non-deterministic package's backward refuses this package's saved set in the same way."""
+    nd_kcp = cake_package("cake_kda_train_kcp", "cake_kcp")
+    t = torch.zeros(1)
+    meta = dict(
+        version=cake_kcp.KCP_SAVED_VERSION, T_r=1, H=1, n_frag=1, P=1, Hg=1, scale=0.5, save_mode="light",
+        save_transfer=False, offset_class="fla", exchange="a2a", precision_mode=0,
+    )  # fmt: skip
+    nd_saved = nd_kcp.SavedKcp(S_in=t, c1_recv=None, M_seg=None, ctx=None, **meta)
+    saved = cake_kcp.SavedDetKcp(S_in=t, c1_recv=None, M_seg=None, ctx=None, **meta)
+    assert nd_kcp.KCP_SAVED_VERSION == cake_kcp.KCP_SAVED_VERSION
+    assert nd_saved.meta() == saved.meta() and nd_saved.flags() == saved.flags()
+    nd_ws = nd_kcp.WorkspaceKcp()
+    ops = (t, t, t, t, t, object(), t)
+    for graph in ("off", "replay"):
+        for bad, name in (
+            (nd_saved, f"{nd_kcp.__name__}.SavedKcp"),
+            (object(), "builtins.object"),
+        ):
+            with pytest.raises(ValueError, match=SAVED_MODE_RE.format(name)):
+                cake_kcp.chunk_kda_det_bwd_kcp(*ops, saved=bad, graph=graph)
+        for kw in ({"saved": saved}, {}):
+            with pytest.raises(
+                ValueError, match=WORKSPACE_MODE_RE.format(nd_kcp.__name__)
+            ):
+                cake_kcp.chunk_kda_det_bwd_kcp(*ops, workspace=nd_ws, graph=graph, **kw)
+    backend = types.SimpleNamespace(dtypes={"state": torch.float32})
+    with pytest.raises(ValueError, match=WORKSPACE_MODE_RE.format(nd_kcp.__name__)):
+        cake_kcp._call_workspace(nd_ws, backend, "light", "g", False, "cpu")
+    with pytest.raises(TypeError, match="workspace must be a WorkspaceDetKcp"):
+        cake_kcp._call_workspace(object(), backend, "light", "g", False, "cpu")
+    with pytest.raises(ValueError, match="a saved set of the deterministic package"):
+        nd_kcp.chunk_kda_bwd_kcp(*ops, saved=saved, deterministic=False)
+
+
+def test_gpu_backward_refuses_the_other_modes_saved_set_and_workspace(device) -> None:
+    """One rank: a real forward of the non-deterministic package (``deterministic=False``) on this package's context
+    writes a ``SavedKcp`` of the same version and context and fills a ``WorkspaceKcp``.  This package's backward
+    refuses either (saved and replay mode, eager and graph replay) with ``ValueError`` naming the mode, its forward
+    and autograd entry refuse that workspace alike; nothing completes (no launch inventory), and the backward on
+    this package's own saved set and workspace afterwards is bitwise the one before."""
+    nd_kcp = cake_package("cake_kda_train_kcp", "cake_kcp")
+    ctx, ops = _ckpt_problem(device, (300, 724, 476), 2)
+    args = [ops[n] for n in ("q", "k", "v", "g", "beta")]
+    nd_ws = nd_kcp.WorkspaceKcp()
+    _, nd_saved = nd_kcp.chunk_kda_fwd_kcp(
+        *args, ctx, workspace=nd_ws, deterministic=False
+    )
+    assert isinstance(nd_saved, nd_kcp.SavedKcp) and nd_saved.ctx is ctx
+    assert nd_saved.version == cake_kcp.KCP_SAVED_VERSION
+    ws = cake_kcp.WorkspaceDetKcp()
+    _, saved = cake_kcp.chunk_kda_det_fwd_kcp(*args, ctx, workspace=ws)
+
+    def bwd(**kw):
+        return cake_kcp.chunk_kda_det_bwd_kcp(*args, ctx, ops["dout"], **kw)
+
+    ref = bwd(saved=saved, workspace=ws)
+    saved_re = SAVED_MODE_RE.format(f"{nd_kcp.__name__}.SavedKcp")
+    ws_re = WORKSPACE_MODE_RE.format(nd_kcp.__name__)
+    cake_kcp.LAST_CALL.clear()
+    try:
+        for graph in ("off", "replay"):
+            for kw, match in (
+                ({"saved": nd_saved, "workspace": ws}, saved_re),
+                ({"saved": nd_saved}, saved_re),
+                ({"saved": saved, "workspace": nd_ws}, ws_re),
+                ({"workspace": nd_ws}, ws_re),
+            ):
+                with pytest.raises(ValueError, match=match):
+                    bwd(graph=graph, **kw)
+            with pytest.raises(ValueError, match=ws_re):
+                cake_kcp.chunk_kda_det_fwd_kcp(*args, ctx, workspace=nd_ws, graph=graph)
+            leaves = [x.detach().clone().requires_grad_(True) for x in args]
+            with pytest.raises(ValueError, match=ws_re):
+                cake_kcp.chunk_kda_det_kcp(*leaves, ctx, workspace=nd_ws, graph=graph)
+        assert cake_kcp.LAST_CALL == {}, "a refused call completed"
+    finally:  # a cached graph entry would pin ws / ctx
+        cake_kcp.graph_cache_clear()
+    again = bwd(saved=saved, workspace=ws)
+    assert all(torch.equal(a, b) for a, b in zip(again, ref, strict=True))
 
 
 # --------------------------------------------------------------------------- FP64 fake backend (`-k fake`)
@@ -5019,7 +5118,7 @@ def test_forward_only_layout_bytes_and_prediction() -> None:
                 {
                     "backward": False,
                     "fwd_layout": "fwd_kcp",
-                    "arena": cake_backend.KdaArena(batch_tokens=S),
+                    "arena": cake_backend.KdaDetArena(batch_tokens=S),
                 }
             )
         for kw in bad:
@@ -5265,8 +5364,8 @@ def test_walk_form_of_decides_once_per_table_set() -> None:
     """``_walk_form_of`` (the record form of a K1 / K2 walk launch) evaluates the registry's rule once per
     ``(program, walk list, H, SM count, knob, device)`` of the call's table set and looks the form up on every later
     launch: the forms of a per-launch evaluation (the rule's inputs are static per ``(ctx, H)``; the device's
-    architecture is read on the first launch of a key only), a fresh equal list finding the same entry, the knob's
-    forced forms passing through; a provider without a form rule gives ``"full"``."""
+    architecture is read, for the per-architecture rule alone, on the first launch of a key only), a fresh equal list
+    finding the same entry, the knob's forced forms passing through; a provider without a form rule gives ``"full"``."""
     part = kp.partition_det_kcp((0, 64 * 200, 64 * 350), 4, layout="contiguous")
     ctx = kp.build_context_det_kcp(part, None, 0, "cpu", 4, sm_count=148)
     tb = cake_kcp._Tables(ctx, 64)
@@ -5275,7 +5374,9 @@ def test_walk_form_of_decides_once_per_table_set() -> None:
 
     def rule(program, chains, num_heads, sm_count, *, knob="auto", arch=None):
         evaluated.append((program, tuple(chains), num_heads, sm_count, knob))
-        assert arch == "sm_100a"
+        # the architecture reaches the per-architecture rule (a mapping) alone
+        per_arch = not isinstance(cake_kcp_jit.WALK_FORM_RULES[program], str)
+        assert arch == ("sm_100a" if per_arch else None), (program, arch)
         return cake_kcp_jit.walk_form(
             program, chains, num_heads, sm_count, knob=knob, arch=arch
         )
@@ -5339,9 +5440,12 @@ def test_walk_form_of_decides_once_per_table_set() -> None:
         for (knob, name, walk) in forms
     ), (len(evaluated), len(forms))
     assert all(form == knob for (knob, _, _), form in forms.items() if knob != "auto")
-    assert len(arch_reads) == len(
-        evaluated
-    )  # the architecture on a key's first launch only
+    assert (
+        len(arch_reads)
+        == sum(
+            not isinstance(cake_kcp_jit.WALK_FORM_RULES[e[0]], str) for e in evaluated
+        )
+    )  # the architecture on a key's first launch only, for the per-architecture rule alone
     assert {
         forms[("auto", name, tuple(tb.walk_offset))]
         for name in cake_kcp_jit.WALK_FORM_RULES
@@ -5352,6 +5456,79 @@ def test_walk_form_of_decides_once_per_table_set() -> None:
             types.SimpleNamespace(), bare, "kcp_fwdh_offset", {"walk": tb.walk_offset}
         )
         == "full"
+    )
+
+
+def test_walk_form_of_passes_arch_to_a_per_architecture_rule_alone() -> None:
+    """A provider whose ``walk_form`` takes ``(program, chains, num_heads, sm_count, *, knob)`` and no ``arch``, beside
+    a ``device_arch``, serves its string rules (``"fit"`` / ``"split"``) without a ``TypeError`` and without an
+    architecture read: ``_walk_form_of`` passes ``arch`` only for a per-architecture rule (a mapping of
+    ``WALK_FORM_RULES``), which still receives it."""
+    part = kp.partition_det_kcp((0, 64 * 200, 64 * 350), 4, layout="contiguous")
+    ctx = kp.build_context_det_kcp(part, None, 0, "cpu", 4, sm_count=148)
+    tb = cake_kcp._Tables(ctx, 64)
+    walk = tb.walk_offset
+    assert walk
+    arch_reads: list = []
+
+    def device_arch(index):
+        arch_reads.append(index)
+        return "sm_103a"
+
+    def call():
+        return types.SimpleNamespace(
+            tb=tb, H=64, device=torch.device("cpu"), walk_form="auto"
+        )
+
+    old_calls: list = []
+
+    def old_rule(program, chains, num_heads, sm_count, *, knob="auto"):
+        old_calls.append((program, knob))
+        return {"kcp_fwdh_offset": "full", "kcp_fwdh_tape": "split"}[program]
+
+    old = types.SimpleNamespace(
+        jit=types.SimpleNamespace(
+            walk_form=old_rule,
+            WALK_FORM_RULES={"kcp_fwdh_offset": "fit", "kcp_fwdh_tape": "split"},
+            sm_count=lambda index: 148,
+            device_arch=device_arch,
+        )
+    )
+    assert (
+        cake_kcp._walk_form_of(call(), old, "kcp_fwdh_offset", {"walk": walk}) == "full"
+    )
+    assert (
+        cake_kcp._walk_form_of(call(), old, "kcp_fwdh_tape", {"walk": walk}) == "split"
+    )
+    assert old_calls == [("kcp_fwdh_offset", "auto"), ("kcp_fwdh_tape", "auto")]
+    assert arch_reads == []
+
+    seen: list = []
+
+    def rule(program, chains, num_heads, sm_count, *, knob="auto", arch=None):
+        seen.append((program, arch))
+        return cake_kcp_jit.walk_form(
+            program, chains, num_heads, sm_count, knob=knob, arch=arch
+        )
+
+    registry = types.SimpleNamespace(
+        jit=types.SimpleNamespace(
+            walk_form=rule,
+            WALK_FORM_RULES=cake_kcp_jit.WALK_FORM_RULES,
+            sm_count=lambda index: 148,
+            device_arch=device_arch,
+        )
+    )
+    seg = [int(x) for x in tb.hp.seg_chunk_start]
+    chains = [seg[s + 1] - seg[s] for s in walk]
+    for name, form_rule in cake_kcp_jit.WALK_FORM_RULES.items():
+        want = cake_kcp_jit.walk_form(name, chains, 64, 148, arch="sm_103a")
+        assert cake_kcp._walk_form_of(call(), registry, name, {"walk": walk}) == want
+        assert seen[-1] == (name, None if isinstance(form_rule, str) else "sm_103a")
+    assert (
+        len(arch_reads)
+        == sum(not isinstance(r, str) for r in cake_kcp_jit.WALK_FORM_RULES.values())
+        >= 1
     )
 
 

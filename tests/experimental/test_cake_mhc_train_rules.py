@@ -3400,8 +3400,8 @@ def test_no_entry_alerts_before_its_operands_pass(monkeypatch) -> None:
 @pytest.mark.cpu_only
 def test_package_wiring() -> None:
     """The test-helper key, ``flashinfer.experimental.cake`` (a docstring only), the package data, the ignored
-    ``aot/`` directory and the pre-commit exclude of the generated sources; the legacy backend directory keeps its
-    alias module only (no registry, manifest or sources)."""
+    ``aot/`` directory and the pre-commit exclude of the generated sources; no module is left at the removed
+    ``flashinfer.cake_mhc_train_backend`` path."""
     assert PACKAGES[KEY] == PACKAGE_NAME == pkg.__name__
     assert "flashinfer.cake_mhc_train_backend" not in PACKAGES.values()
     assert "cake_mhc_train" not in PACKAGES
@@ -3421,10 +3421,7 @@ def test_package_wiring() -> None:
         "experimental/cake/cake_mhc_train_backend/csrc/"
         in (REPO / ".pre-commit-config.yaml").read_text()
     )
-    legacy = REPO / "flashinfer" / "cake_mhc_train_backend"
-    assert sorted(p.name for p in legacy.iterdir() if p.name != "__pycache__") == [
-        "__init__.py"
-    ]
+    assert not list((REPO / "flashinfer" / "cake_mhc_train_backend").glob("*.py"))
 
 
 @pytest.mark.cpu_only
@@ -3481,7 +3478,7 @@ def _manifest_checker():
 
 @pytest.mark.cpu_only
 def test_manifest_checker_lists_the_package() -> None:
-    """The build-manifest checker lists this package once (generic registry walker over ``cake_jit.py``) and no legacy
+    """The build-manifest checker lists this package once (generic registry walker over ``cake_jit.py``) and no removed
     ``flashinfer.cake_mhc_train_backend``; its vendored gate finds the package's suite key; the in-tree checks report
     nothing."""
     checker = _manifest_checker()

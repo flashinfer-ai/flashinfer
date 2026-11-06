@@ -1511,9 +1511,7 @@ def test_autograd_wrapper_matches_reference_and_is_deterministic():
     x.grad = None
     w.grad = None
     # Same gradients from the m_indptr form; bitwise reproducible.
-    cake_grouped_det_mm(
-        x, w, _m_indptr(RAGGED_E6, device), deterministic=True
-    ).backward(g)
+    cake_grouped_det_mm(x, w, _m_indptr(RAGGED_E6, device)).backward(g)
     torch.cuda.synchronize()
     assert torch.equal(x.grad, dx) and torch.equal(w.grad, dw)
     with pytest.raises(ValueError):
@@ -1566,10 +1564,10 @@ def _wrapper(offs):
     return lambda a, b: pkg.cake_grouped_det_mm(a, b, offs)
 
 
-def _in_forward(offs, deterministic=True):
+def _in_forward(offs):
     """The control arm: ``gemm(a, b)`` through a direct ``CakeGroupedDetMm.apply``, which
     launches inside ``forward``, before autograd saves the inputs."""
-    return lambda a, b: cake_autograd.CakeGroupedDetMm.apply(a, b, offs, deterministic)
+    return lambda a, b: cake_autograd.CakeGroupedDetMm.apply(a, b, offs)
 
 
 def _leaves(*tensors):
@@ -2166,19 +2164,23 @@ def test_wrapper_under_torch_compile(backend):
 
 
 def test_direct_apply_keeps_the_in_forward_launch(monkeypatch):
-    """A direct ``CakeGroupedDetMm.apply(x, w, offs, deterministic)`` launches the forward
-    inside ``forward`` and gives the wrapper's bits (``Y``, ``dX``, ``dW``) with
-    ``deterministic`` ``True`` or ``False`` (the same programs); shape and offset errors,
-    which the wrapper now raises after autograd saved the inputs, are still
-    ``ValueError``."""
+    """A direct ``CakeGroupedDetMm.apply(x, w, offs)`` launches the forward inside
+    ``forward`` and gives the wrapper's bits (``Y``, ``dX``, ``dW``); a stale fourth
+    argument (a ``True`` / ``False`` numerical mode) raises ``TypeError`` before any
+    launch; shape and offset errors, which the wrapper now raises after autograd saved
+    the inputs, are still ``ValueError``."""
     device = _require_autograd_programs()
     x0, w0, g, offs = _inputs(SMALL_SIZES, *SMALL_SHAPE, device, seed=54)
     calls = _count_launches(monkeypatch)
     wrapped = _step(_wrapper(offs), _leaves(x0, w0), (g,))
-    for deterministic in (True, False):
-        direct = _step(_in_forward(offs, deterministic), _leaves(x0, w0), (g,))
-        _assert_same_step(direct, wrapped)
-    assert calls["fwd"] == [SMALL_SHAPE] * 3
+    direct = _step(_in_forward(offs), _leaves(x0, w0), (g,))
+    _assert_same_step(direct, wrapped)
+    assert calls["fwd"] == [SMALL_SHAPE] * 2
+    for stale in (True, False):
+        x, w = _leaves(x0, w0)
+        with pytest.raises(TypeError, match="takes no fourth argument"):
+            cake_autograd.CakeGroupedDetMm.apply(x, w, offs, stale)
+    assert calls["fwd"] == [SMALL_SHAPE] * 2
     x, _w = _leaves(x0, w0)
     n, k = SMALL_SHAPE
     for bad_w, bad_offs in (
