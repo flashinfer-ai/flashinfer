@@ -539,8 +539,8 @@ PACKAGES: tuple[Package, ...] = (
         refs_mok_bf16,
     ),
     Package(
-        "flashinfer.experimental.dense_projection_det_gemm",
-        "flashinfer/experimental/dense_projection_det_gemm",
+        "flashinfer.experimental.cake.cake_dense_gemm_det_train",
+        "flashinfer/experimental/cake/cake_dense_gemm_det_train",
         "cake_jit.py",
         refs_generic,
     ),

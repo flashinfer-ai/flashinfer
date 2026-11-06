@@ -188,8 +188,9 @@ exclude = [
 "flashinfer.experimental.cake_moe_grouped_det_gemm" = ["csrc/**", "build.json"]
 # Generated sources of its non-deterministic counterpart (deterministic=False).
 "flashinfer.experimental.cake.cake_moe_grouped_gemm" = ["csrc/**", "build.json"]
-# Generated sources for the experimental exact-SM100a/SM107a dense projection GEMM backend.
-"flashinfer.experimental.dense_projection_det_gemm" = ["csrc/**", "build.json"]
+# Generated sources for the deterministic SM100a/SM103a/SM107a dense GEMM training backend
+# (flashinfer.cake_dense_gemm_det_train).
+"flashinfer.experimental.cake.cake_dense_gemm_det_train" = ["csrc/**", "build.json"]
 # Generated sources for the experimental SM100a/SM103a/SM107a dense projection GEMM backend with an explicit
 # numerical mode (the non-deterministic split-K programs; the deterministic ones ship with dense_projection_det_gemm).
 "flashinfer.experimental.dense_projection_gemm" = ["csrc/**", "build.json"]
