@@ -13,9 +13,9 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Single-GPU tests of the non-deterministic KCP convolution (``cake_causal_conv1d_kcp(..., deterministic=False)``): one
-process, world size 1, no process group (the halo exchange of one rank is the identity), on the deterministic KCP
-suite's rows, contexts and FP64 oracle, plus a C = 10240 row for (a) and (b).
+Single-GPU tests of the non-deterministic KCP convolution (``cake_causal_conv1d_nondet_kcp``): one process, world
+size 1, no process group (the halo exchange of one rank is the identity), on the deterministic KCP suite's rows,
+contexts and FP64 oracle, plus a C = 10240 row for (a) and (b).
 
 (a) ``y`` and ``hist`` are bitwise the deterministic KCP forward's (the same programs); ``dx`` is bitwise the
     deterministic KCP backward's (the same per-thread arithmetic and fold); the FP32 ``dweight`` partial is within
@@ -27,7 +27,8 @@ suite's rows, contexts and FP64 oracle, plus a C = 10240 row for (a) and (b).
     gradient accumulation, graph replay (bitwise ``y`` / ``hist`` / ``dx``), the legacy channel-tile plan, the side
     kernel of FlashInfer issues #7038 / #7548 (the backward is an ordinary launch: no stall beside a resident kernel),
     the grid that gives up one SM when the last channel-tile rank is partial (issue #8365) and torch's deterministic
-    mode (the backward alerts).
+    mode (the backward alerts, through the package's entries and through the non-deterministic KCP package
+    ``flashinfer.cake_causal_conv1d_nondet_train_kcp``, whose entries take no ``deterministic`` keyword).
 
 Every test skips until the exporter has rendered the non-deterministic package.
 """
@@ -39,11 +40,11 @@ import statistics
 import pytest
 import torch
 
-from flashinfer.cake_causal_conv1d_det_train_backend import kcp as det_kcp
-from flashinfer.experimental.cake import cake_causal_conv1d_train_backend as pkg
-from flashinfer.experimental.cake.cake_causal_conv1d_train_backend import (
+from flashinfer.experimental.cake import cake_causal_conv1d_nondet_train as pkg
+from flashinfer.experimental.cake.cake_causal_conv1d_nondet_train import (
     kcp as conv_kcp,
 )
+from tests.test_helpers.cake_package import cake_package
 from tests.test_cake_causal_conv1d_det_train_kcp import (
     DW_ATOL,
     DW_RTOL,
@@ -59,28 +60,32 @@ from tests.test_cake_causal_conv1d_det_train_kcp import (
     _reference,
 )
 
+# the deterministic package's KCP backend, through the one place the suites name packages
+det_kcp = cake_package("cake_causal_conv1d_det_train", "kcp")
+
 REPEATS = 20
-NONDET = {"deterministic": False}
 # Beside the deterministic suite's rows: C = 10240 (a packed q / k / v projection width), a fragment cut inside each
 # of two documents.
 WIDE_ROWS = [("wide-qkv", (2000, 1003), (1, 2, 1997, 1003), 10240)]
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
-    or not pkg.is_cake_causal_conv1d_train_supported(torch.device("cuda")),
+    or not pkg.is_cake_causal_conv1d_nondet_train_supported(torch.device("cuda")),
     reason=(
-        "the non-deterministic cake_causal_conv1d_train package needs a supported CUDA device (SM100 / SM103 / "
+        "the non-deterministic cake_causal_conv1d_nondet_train package needs a supported CUDA device (SM100 / SM103 / "
         "SM107) and its rendered build.json / csrc (TODO-EXPORT until the exporter renders it)"
     ),
 )
 
 
 def _fwd(x, w, ctx, **kw):
-    return conv_kcp.cake_causal_conv1d_forward_kcp(x, w, ctx, **kw, **NONDET)
+    return conv_kcp.cake_causal_conv1d_nondet_train_kcp_forward(x, w, ctx, **kw)
 
 
 def _bwd(x, w, ctx, dy, hist, **kw):
-    return conv_kcp.cake_causal_conv1d_backward_kcp(x, w, ctx, dy, hist, **kw, **NONDET)
+    return conv_kcp.cake_causal_conv1d_nondet_train_kcp_backward(
+        x, w, ctx, dy, hist, **kw
+    )
 
 
 def _stream_workspace() -> torch.Tensor | None:
@@ -174,7 +179,7 @@ def test_autograd_function_matches_the_direct_calls(name, lens, cuts, C):
     for _ in range(2):
         x = p.x_local.clone().requires_grad_(True)
         w = p.w.clone().requires_grad_(True)
-        y = conv_kcp.cake_causal_conv1d_kcp(x, w, p.ctx, **NONDET)
+        y = conv_kcp.cake_causal_conv1d_nondet_kcp(x, w, p.ctx)
         y.backward(p.dy_local)
         runs.append({"y": y.detach(), "dx": x.grad, "dw": w.grad})
     y_direct, hist = _fwd(p.x_local, p.w, p.ctx)
@@ -203,7 +208,7 @@ def test_rejects_mismatched_context_and_keeps_the_kcp_contract():
     with pytest.raises(ValueError, match="weight must be torch.float32"):
         _fwd(p.x_local, p.w.to(torch.bfloat16), p.ctx)
     with pytest.raises(TypeError):
-        conv_kcp.cake_causal_conv1d_forward_kcp(
+        conv_kcp.cake_causal_conv1d_nondet_train_kcp_forward(
             p.x_local, p.w, p.ctx, bias=torch.zeros(p.C, device=device)
         )
 
@@ -321,7 +326,7 @@ def test_backward_grid_gives_up_one_sm_when_the_last_rank_is_partial(
             _, _, dw_ref = _reference(p.x, p.w, p.cu, p.dy)
             for host_trim in (1, 0):
                 conv_kcp._set_test_knobs({"host_trim": host_trim})
-                conv_kcp.host_cache_clear()
+                conv_kcp.cake_causal_conv1d_nondet_train_kcp_host_cache_clear()
                 seen.clear()
                 dx, dw = _bwd(p.x_local, p.w, p.ctx, p.dy_local, hist)
                 torch.cuda.synchronize()
@@ -333,7 +338,7 @@ def test_backward_grid_gives_up_one_sm_when_the_last_rank_is_partial(
                 assert held is None or int(torch.count_nonzero(held)) == 0, label
     finally:
         conv_kcp._set_test_knobs(None)
-        conv_kcp.host_cache_clear()
+        conv_kcp.cake_causal_conv1d_nondet_train_kcp_host_cache_clear()
 
 
 @pytest.mark.parametrize("form", ["knob", "keyword"])
@@ -390,15 +395,13 @@ def _ckpt_run(p, *, handle=None, reentrant=False, ckpt=True, counter=None, twice
 
     from torch.utils.checkpoint import checkpoint
 
-    from flashinfer.experimental.cake import cake_causal_conv1d_train_kcp as facade
+    from flashinfer import cake_causal_conv1d_nondet_train_kcp as facade
 
     x = p.x_local.clone().requires_grad_(True)
     w = p.w.clone().requires_grad_(True)
 
     def fn(x_, w_, h_):
-        return facade.cake_causal_conv1d_kcp(
-            x_, w_, p.ctx, recompute_handle=h_, deterministic=False
-        )
+        return facade.cake_causal_conv1d_nondet_kcp(x_, w_, p.ctx, recompute_handle=h_)
 
     if not ckpt:
         y = fn(x, w, handle)
@@ -428,8 +431,8 @@ def test_checkpoint_and_recompute_handle(
     monkeypatch, name, lens, cuts, C, reentrant
 ) -> None:
     """Checkpointed (2 x forward + backward) with and without a recompute handle: ``y`` / ``dx`` bitwise the direct
-    pass's and the deterministic route's, ``dweight`` within budget; the exchange counts of the deterministic suite
-    (one per direction, none in a recompute with a handle)."""
+    pass's (``dx`` also the deterministic KCP backward's), ``dweight`` within budget; the exchange counts of the
+    deterministic suite (one per direction, none in a recompute with a handle)."""
 
     device = torch.device("cuda")
     p = _problem(lens, cuts, C, device)
@@ -437,7 +440,7 @@ def test_checkpoint_and_recompute_handle(
     plain_cc = _ExchangeCounter(monkeypatch, conv_kcp)
     plain = _ckpt_run(p, reentrant=reentrant, counter=plain_cc)
     monkeypatch.undo()
-    handle = conv_kcp.RecomputeHandleKcp()
+    handle = conv_kcp.CakeCausalConv1dNondetKcpRecomputeHandle()
     cc = _ExchangeCounter(monkeypatch, conv_kcp)
     conv_kcp.LAST_CALL.pop("recompute_handle", None)
     got = _ckpt_run(p, handle=handle, reentrant=reentrant, counter=cc)
@@ -468,7 +471,12 @@ def test_gradient_accumulation_and_retain_graph(monkeypatch) -> None:
     p = _problem((5000, 1003), (1, 2, 4997, 1003), 512, device)
     direct = _ckpt_run(p, ckpt=False)
     cc = _ExchangeCounter(monkeypatch, conv_kcp)
-    twice = _ckpt_run(p, handle=conv_kcp.RecomputeHandleKcp(), counter=cc, twice=True)
+    twice = _ckpt_run(
+        p,
+        handle=conv_kcp.CakeCausalConv1dNondetKcpRecomputeHandle(),
+        counter=cc,
+        twice=True,
+    )
     assert cc.table() == {"orig": 1, "recompute": 0, "bwd": 2}
     assert torch.equal(_bits(twice["dx"]), _bits(direct["dx"] + direct["dx"]))
     _dw_within(
@@ -479,27 +487,26 @@ def test_gradient_accumulation_and_retain_graph(monkeypatch) -> None:
 def test_recompute_handle_misuse_raises() -> None:
     device = torch.device("cuda")
     p = _problem((5000, 1003), (1, 2, 4997, 1003), 512, device)
-    handle = conv_kcp.RecomputeHandleKcp()
-    conv_kcp.cake_causal_conv1d_kcp(
-        p.x_local, p.w, p.ctx, recompute_handle=handle, **NONDET
+    handle = conv_kcp.CakeCausalConv1dNondetKcpRecomputeHandle()
+    conv_kcp.cake_causal_conv1d_nondet_kcp(
+        p.x_local, p.w, p.ctx, recompute_handle=handle
     )
     assert conv_kcp.LAST_CALL["recompute_handle"] == {"fwd": "capture"}
     with pytest.raises(RuntimeError, match="per call and micro-step"):
-        conv_kcp.cake_causal_conv1d_kcp(
-            p.x_local, p.w, p.ctx, recompute_handle=handle, **NONDET
+        conv_kcp.cake_causal_conv1d_nondet_kcp(
+            p.x_local, p.w, p.ctx, recompute_handle=handle
         )
     with pytest.raises(ValueError, match="graph='off'"):
-        conv_kcp.cake_causal_conv1d_kcp(
+        conv_kcp.cake_causal_conv1d_nondet_kcp(
             p.x_local,
             p.w,
             p.ctx,
             graph="replay",
-            recompute_handle=conv_kcp.RecomputeHandleKcp(),
-            **NONDET,
+            recompute_handle=conv_kcp.CakeCausalConv1dNondetKcpRecomputeHandle(),
         )
     with pytest.raises(TypeError, match="entries"):
-        conv_kcp.cake_causal_conv1d_kcp(
-            p.x_local, p.w, p.ctx, recompute_handle=object(), **NONDET
+        conv_kcp.cake_causal_conv1d_nondet_kcp(
+            p.x_local, p.w, p.ctx, recompute_handle=object()
         )
 
 
@@ -564,54 +571,61 @@ def test_torch_deterministic_mode_alerts_on_the_backward() -> None:
         torch.use_deterministic_algorithms(True)
         y, _ = _fwd(p.x_local, p.w, p.ctx)
         assert torch.equal(y, y0)
-        with pytest.raises(RuntimeError, match="cake_causal_conv1d_backward_kcp"):
+        with pytest.raises(
+            RuntimeError, match="cake_causal_conv1d_nondet_train_kcp_backward"
+        ):
             _bwd(p.x_local, p.w, p.ctx, p.dy_local, hist)
         x = p.x_local.clone().requires_grad_(True)
-        y = conv_kcp.cake_causal_conv1d_kcp(x, p.w, p.ctx, **NONDET)
-        with pytest.raises(RuntimeError, match="cake_causal_conv1d_backward_kcp"):
+        y = conv_kcp.cake_causal_conv1d_nondet_kcp(x, p.w, p.ctx)
+        with pytest.raises(
+            RuntimeError, match="cake_causal_conv1d_nondet_train_kcp_backward"
+        ):
             y.backward(p.dy_local)
         torch.use_deterministic_algorithms(True, warn_only=True)
-        with pytest.warns(UserWarning, match="cake_causal_conv1d_backward_kcp"):
+        with pytest.warns(
+            UserWarning, match="cake_causal_conv1d_nondet_train_kcp_backward"
+        ):
             _bwd(p.x_local, p.w, p.ctx, p.dy_local, hist)
     finally:
         torch.use_deterministic_algorithms(prev, warn_only=prev_warn)
 
 
 @pytest.mark.parametrize("multi", [False, True], ids=["single", "multi"])
-def test_kcp_module_is_nondeterministic_only(multi) -> None:
-    """``flashinfer.experimental.cake.cake_causal_conv1d_train_kcp`` on a device: the default and every value but ``False`` raise the
-    mode ``ValueError`` before anything runs; with ``False`` it returns the package's bits; under torch's
-    deterministic mode the forward runs and the backward raises (strict) or warns and runs (``warn_only``)."""
+def test_kcp_facade_under_torch_deterministic_mode(multi) -> None:
+    """``flashinfer.cake_causal_conv1d_nondet_train_kcp`` on a device: its entries take no ``deterministic`` keyword
+    (the ordinary ``TypeError``) and return the package's bits; under torch's deterministic mode the forward runs and
+    the backward raises (strict, also when the mode is set between the forward and the backward: the mode is read
+    when the backward runs) or warns and runs (``warn_only``); it never falls back to the deterministic package."""
 
-    from flashinfer.experimental.cake import cake_causal_conv1d_train_kcp as facade
+    from flashinfer import cake_causal_conv1d_nondet_train_kcp as facade
 
     device = torch.device("cuda")
     p = _problem((5000, 1003), (1, 2, 4997, 1003), 512, device)
 
-    def call(x, w, **mode):
+    def call(x, w, **kw):
         if multi:
-            (y,) = facade.cake_causal_conv1d_multi_kcp((x,), (w,), p.ctx, **mode)
+            (y,) = facade.cake_causal_conv1d_nondet_kcp_multi((x,), (w,), p.ctx, **kw)
             return y
-        return facade.cake_causal_conv1d_kcp(x, w, p.ctx, **mode)
+        return facade.cake_causal_conv1d_nondet_kcp(x, w, p.ctx, **kw)
 
     def run(before_backward=None):
         x = p.x_local.clone().requires_grad_(True)
         w = p.w.clone().requires_grad_(True)
-        y = call(x, w, **NONDET)
+        y = call(x, w)
         if before_backward is not None:
             before_backward()
         y.backward(p.dy_local)
         return {"y": y.detach(), "dx": x.grad, "dw": w.grad}
 
-    for mode in ({}, {"deterministic": True}, {"deterministic": None}):
-        with pytest.raises(ValueError, match="needs deterministic=False"):
-            call(p.x_local, p.w, **mode)
+    for value in (False, True):
+        with pytest.raises(TypeError, match="deterministic"):
+            call(p.x_local, p.w, deterministic=value)
     y_direct, hist = _fwd(p.x_local, p.w, p.ctx)
     dx_direct, dw_direct = _bwd(p.x_local, p.w, p.ctx, p.dy_local, hist)
     direct = {"y": y_direct, "dx": dx_direct, "dw": dw_direct}
     assert _same(run(), direct)
 
-    alert = "cake_causal_conv1d_(multi_)?backward_kcp does not have a deterministic"
+    alert = "cake_causal_conv1d_nondet_train_kcp_(multi_)?backward does not have a deterministic"
     prev, prev_warn = (
         torch.are_deterministic_algorithms_enabled(),
         torch.is_deterministic_algorithms_warn_only_enabled(),
@@ -627,8 +641,5 @@ def test_kcp_module_is_nondeterministic_only(multi) -> None:
         with pytest.warns(UserWarning, match=alert):
             got = run()
         assert _same(got, direct)
-        for mode in ({}, {"deterministic": True}):
-            with pytest.raises(ValueError, match="needs deterministic=False"):
-                call(p.x_local, p.w, **mode)
     finally:
         torch.use_deterministic_algorithms(prev, warn_only=prev_warn)

@@ -14,12 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 CPU tests of the non-deterministic conv KCP module's private test knobs, the bookkeeping of its CUDA-graph replay
-cache, its trimmed host path, its recompute handle and its numerical-mode keyword: the knob is refused without
+cache, its trimmed host path, its recompute handle and its public names: the knob is refused without
 ``CAKE_KCP_TEST_KNOBS=1``, validated against ``GRAPH_MODES`` and off by default; the validity key tells operands
 apart by data pointer, shape, stride and dtype, keeps one entry per key, and the first call of a key runs eagerly;
-every public entry refuses ``deterministic`` other than ``False`` before anything else; the KCP module
-``flashinfer.experimental.cake.cake_causal_conv1d_train_kcp`` imports no KCP host module until a call needs one.
-No kernel runs here.
+no public entry takes a ``deterministic`` keyword (the ordinary ``TypeError``) and every public name carries
+``nondet``; the non-deterministic KCP package ``flashinfer.cake_causal_conv1d_nondet_train_kcp`` imports no KCP host
+module until a call needs one.  No kernel runs here.
 """
 
 from __future__ import annotations
@@ -29,9 +29,10 @@ import types
 import pytest
 import torch
 
-from flashinfer.experimental.cake.cake_causal_conv1d_train_backend import (
+from flashinfer.experimental.cake.cake_causal_conv1d_nondet_train import (
     kcp as conv_kcp,
 )
+from tests.test_helpers.cake_package import PACKAGES
 
 
 @pytest.mark.cpu_only
@@ -149,11 +150,21 @@ def test_graph_cache_key_and_eager_first_call(monkeypatch) -> None:
         }
         assert conv_kcp._graph_run("fwd", None, lambda: ("y", "hist")) == ("y", "hist")
         assert conv_kcp.LAST_CALL["fwd"]["graph_key"] is None
-        # graph_cache_clear(): drops every entry (to be called before destroy_process_group), reports the count
+        # cake_causal_conv1d_nondet_train_kcp_graph_cache_clear(): drops every entry (to be called before destroy_process_group), reports the count
         n_entries = len(conv_kcp._GRAPHS)
-        assert n_entries >= 2 and "graph_cache_clear" in conv_kcp.__all__
-        assert conv_kcp.graph_cache_clear() == n_entries
-        assert conv_kcp._GRAPHS == {} and conv_kcp.graph_cache_clear() == 0
+        assert (
+            n_entries >= 2
+            and "cake_causal_conv1d_nondet_train_kcp_graph_cache_clear"
+            in conv_kcp.__all__
+        )
+        assert (
+            conv_kcp.cake_causal_conv1d_nondet_train_kcp_graph_cache_clear()
+            == n_entries
+        )
+        assert (
+            conv_kcp._GRAPHS == {}
+            and conv_kcp.cake_causal_conv1d_nondet_train_kcp_graph_cache_clear() == 0
+        )
     finally:
         conv_kcp._set_test_knobs(None)
         conv_kcp._GRAPHS.clear()
@@ -179,14 +190,12 @@ def test_graph_public_keyword_mode_and_key(monkeypatch) -> None:
     w = torch.empty(16, 4, dtype=torch.float32)
     ctx = types.SimpleNamespace(T_r=8, n_frag=1, world_size=1)
     for call in (  # validated on the caller's frame, before any device work
-        lambda: conv_kcp.cake_causal_conv1d_kcp(
-            x, w, ctx, graph="capture", deterministic=False
+        lambda: conv_kcp.cake_causal_conv1d_nondet_kcp(x, w, ctx, graph="capture"),
+        lambda: conv_kcp.cake_causal_conv1d_nondet_train_kcp_forward(
+            x, w, ctx, graph="capture"
         ),
-        lambda: conv_kcp.cake_causal_conv1d_forward_kcp(
-            x, w, ctx, graph="capture", deterministic=False
-        ),
-        lambda: conv_kcp.cake_causal_conv1d_backward_kcp(
-            x, w, ctx, x, x, graph="capture", deterministic=False
+        lambda: conv_kcp.cake_causal_conv1d_nondet_train_kcp_backward(
+            x, w, ctx, x, x, graph="capture"
         ),
     ):
         with pytest.raises(ValueError, match="graph"):
@@ -227,8 +236,8 @@ def test_graph_public_keyword_mode_and_key(monkeypatch) -> None:
 @pytest.mark.cpu_only
 def test_host_trim_cache_is_per_context_and_bounded(monkeypatch) -> None:
     """The trimmed host path keeps one entry set per context object (by identity, the context pinned), bounded
-    by ``HOST_CACHE_MAX`` (the oldest context dropped) and cleared by ``host_cache_clear()``."""
-    conv_kcp.host_cache_clear()
+    by ``HOST_CACHE_MAX`` (the oldest context dropped) and cleared by ``cake_causal_conv1d_nondet_train_kcp_host_cache_clear()``."""
+    conv_kcp.cake_causal_conv1d_nondet_train_kcp_host_cache_clear()
     a, b = types.SimpleNamespace(), types.SimpleNamespace()
     key = ("fwd", 8, 16, "cpu", (0, 8))
     ea = conv_kcp._host_cache_entry(a, key)
@@ -243,7 +252,10 @@ def test_host_trim_cache_is_per_context_and_bounded(monkeypatch) -> None:
         types.SimpleNamespace(), key
     )  # a third context evicts the oldest (a)
     assert id(a) not in conv_kcp._HOST_CACHE and id(b) in conv_kcp._HOST_CACHE
-    assert conv_kcp.host_cache_clear() == 2 and conv_kcp._HOST_CACHE == {}
+    assert (
+        conv_kcp.cake_causal_conv1d_nondet_train_kcp_host_cache_clear() == 2
+        and conv_kcp._HOST_CACHE == {}
+    )
 
 
 @pytest.mark.cpu_only
@@ -271,7 +283,7 @@ def test_host_trim_ffi_device_and_cpu_refusal(monkeypatch) -> None:
         conv_kcp._set_test_knobs(None)
     with pytest.raises(ValueError, match="CUDA"):
         conv_kcp._kcp_forward(x, w, ctx)
-    conv_kcp.host_cache_clear()
+    conv_kcp.cake_causal_conv1d_nondet_train_kcp_host_cache_clear()
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -280,8 +292,8 @@ def test_host_trim_ffi_device_and_cpu_refusal(monkeypatch) -> None:
 
 @pytest.mark.cpu_only
 def test_recompute_handle_object() -> None:
-    h = conv_kcp.RecomputeHandleKcp()
-    assert conv_kcp.RecomputeHandleKcp.__slots__ == ("entries",)
+    h = conv_kcp.CakeCausalConv1dNondetKcpRecomputeHandle()
+    assert conv_kcp.CakeCausalConv1dNondetKcpRecomputeHandle.__slots__ == ("entries",)
     assert h.entries == {} and h.nbytes() == 0
     with pytest.raises(AttributeError):
         h.other = 1
@@ -292,7 +304,9 @@ def test_recompute_handle_object() -> None:
     h.clear()
     assert h.entries == {} and h.nbytes() == 0
     assert conv_kcp.HANDLE_KEY == "conv"
-    assert {"RecomputeHandleKcp", "HANDLE_KEY"} <= set(conv_kcp.__all__)
+    assert {"CakeCausalConv1dNondetKcpRecomputeHandle", "HANDLE_KEY"} <= set(
+        conv_kcp.__all__
+    )
 
 
 @pytest.mark.cpu_only
@@ -310,18 +324,23 @@ def test_recompute_handle_phase_and_entry_rules() -> None:
         @staticmethod
         def backward(fctx, g):
             seen["in_backward"] = conv_kcp._kcp_in_backward()
-            seen["empty"] = conv_kcp._handle_lookup(conv_kcp.RecomputeHandleKcp())
+            seen["empty"] = conv_kcp._handle_lookup(
+                conv_kcp.CakeCausalConv1dNondetKcpRecomputeHandle()
+            )
             seen["entry"] = conv_kcp._handle_lookup(full)
             return g
 
-    full = conv_kcp.RecomputeHandleKcp()
+    full = conv_kcp.CakeCausalConv1dNondetKcpRecomputeHandle()
     full.entries["conv"] = {"hist": torch.zeros(1, 8, dtype=torch.bfloat16)}
     t = torch.zeros(4, requires_grad=True)
     Probe.apply(t).sum().backward()
     assert seen["in_backward"] is True
     assert seen["empty"] is None
     assert seen["entry"] is full.entries["conv"] and "conv" in full.entries
-    assert conv_kcp._handle_lookup(conv_kcp.RecomputeHandleKcp()) is None
+    assert (
+        conv_kcp._handle_lookup(conv_kcp.CakeCausalConv1dNondetKcpRecomputeHandle())
+        is None
+    )
     with pytest.raises(RuntimeError, match="micro-step"):
         conv_kcp._handle_lookup(full)
     with pytest.raises(TypeError, match="entries"):
@@ -335,7 +354,7 @@ def test_recompute_handle_needs_the_graph_task_binding(monkeypatch) -> None:
     monkeypatch.setattr(conv_kcp, "_GRAPH_TASK_ID_BINDING", None)
     monkeypatch.setattr(conv_kcp, "_GRAPH_TASK_ID_USABLE", None)
     with pytest.raises(RuntimeError, match="_current_graph_task_id"):
-        conv_kcp._handle_lookup(conv_kcp.RecomputeHandleKcp())
+        conv_kcp._handle_lookup(conv_kcp.CakeCausalConv1dNondetKcpRecomputeHandle())
     with pytest.raises(RuntimeError, match="_current_graph_task_id"):
         conv_kcp._kcp_in_backward()
 
@@ -370,86 +389,81 @@ def test_recompute_handle_hist_validation() -> None:
 
 
 @pytest.mark.cpu_only
-def test_every_kcp_entry_refuses_a_deterministic_mode() -> None:
-    """Every public entry and both autograd functions of the non-deterministic KCP backend refuse ``deterministic``
-    other than ``False`` (``ValueError``) before any operand or context check, so the refusal needs no device."""
+def test_kcp_entries_take_no_deterministic_keyword() -> None:
+    """No public entry of the non-deterministic KCP backend takes ``deterministic``: passing it is the ordinary
+    ``TypeError`` (raised before the body runs, so no device is needed); every public name of the module carries
+    ``nondet`` (the constants and the cache helper aside) and the previous names are gone."""
+    import inspect
 
     x = torch.empty(8, 16, dtype=torch.bfloat16)
     w = torch.empty(16, 4, dtype=torch.float32)
     ctx = types.SimpleNamespace(T_r=8, n_frag=1, world_size=1)
     calls = {
-        "kcp": lambda d: conv_kcp.cake_causal_conv1d_kcp(x, w, ctx, **d),
-        "forward": lambda d: conv_kcp.cake_causal_conv1d_forward_kcp(x, w, ctx, **d),
-        "backward": lambda d: conv_kcp.cake_causal_conv1d_backward_kcp(x, w, ctx, x, x, **d),
-        "multi": lambda d: conv_kcp.cake_causal_conv1d_multi_kcp((x,), (w,), ctx, **d),
-        "multi_forward": lambda d: conv_kcp.cake_causal_conv1d_multi_forward_kcp((x,), (w,), ctx, **d),
-        "multi_backward": lambda d: conv_kcp.cake_causal_conv1d_multi_backward_kcp((x,), (w,), ctx, (x,), (x,), **d),
-        "function": lambda d: conv_kcp.CakeCausalConv1dFunctionKcp.apply(x, w, ctx, None, None, d.get("deterministic", True)),
-        "multi_function": lambda d: conv_kcp.CakeCausalConv1dMultiFunctionKcp.apply(
-            ctx, None, None, d.get("deterministic", True), 1, x, w
-        ),
+        conv_kcp.cake_causal_conv1d_nondet_kcp: lambda fn, d: fn(x, w, ctx, **d),
+        conv_kcp.cake_causal_conv1d_nondet_train_kcp_forward: lambda fn, d: fn(x, w, ctx, **d),
+        conv_kcp.cake_causal_conv1d_nondet_train_kcp_backward: lambda fn, d: fn(x, w, ctx, x, x, **d),
+        conv_kcp.cake_causal_conv1d_nondet_kcp_multi: lambda fn, d: fn((x,), (w,), ctx, **d),
+        conv_kcp.cake_causal_conv1d_nondet_train_kcp_multi_forward: lambda fn, d: fn((x,), (w,), ctx, **d),
+        conv_kcp.cake_causal_conv1d_nondet_train_kcp_multi_backward: lambda fn, d: fn((x,), (w,), ctx, (x,), (x,), **d),
     }  # fmt: skip
-    for call in calls.values():
-        for kwargs in (
-            {},
-            {"deterministic": True},
-            {"deterministic": 0},
-            {"deterministic": None},
+    for fn, call in calls.items():
+        assert "deterministic" not in inspect.signature(fn).parameters, fn.__name__
+        for value in (False, True):
+            with pytest.raises(TypeError, match="deterministic"):
+                call(fn, {"deterministic": value})
+    for name in conv_kcp.__all__:
+        if name.isupper() or name in (
+            "cake_causal_conv1d_nondet_train_kcp_graph_cache_clear",
+            "plan_cache_clear",
         ):
-            with pytest.raises(ValueError, match="deterministic=False"):
-                call(kwargs)
-
-
-@pytest.mark.cpu_only
-def test_kcp_signatures_carry_the_deterministic_keyword() -> None:
-    import inspect
-
-    for fn in (
-        conv_kcp.cake_causal_conv1d_kcp,
-        conv_kcp.cake_causal_conv1d_forward_kcp,
-        conv_kcp.cake_causal_conv1d_backward_kcp,
-        conv_kcp.cake_causal_conv1d_multi_kcp,
-        conv_kcp.cake_causal_conv1d_multi_forward_kcp,
-        conv_kcp.cake_causal_conv1d_multi_backward_kcp,
+            continue
+        assert "nondet" in name.lower(), name
+        assert "det" not in name.lower().replace("nondet", ""), name
+    for old in (
+        "KcpRecomputeHandle",
+        "RecomputeHandleKcp",
+        "CakeCausalConv1dFunctionKcp",
+        "CakeCausalConv1dMultiFunctionKcp",
+        "cake_causal_conv1d_kcp",
+        "cake_causal_conv1d_multi_kcp",
+        "cake_causal_conv1d_forward_kcp",
+        "cake_causal_conv1d_backward_kcp",
+        "cake_causal_conv1d_multi_forward_kcp",
+        "cake_causal_conv1d_multi_backward_kcp",
     ):
-        p = inspect.signature(fn).parameters["deterministic"]
-        assert p.kind is inspect.Parameter.KEYWORD_ONLY and p.default is True, (
-            fn.__name__
-        )
-    assert not hasattr(conv_kcp, "KcpRecomputeHandle")
-    assert not any(
-        "det" in name.replace("deterministic", "") for name in conv_kcp.__all__
-    )
+        assert not hasattr(conv_kcp, old), old
 
 
 @pytest.mark.cpu_only
 def test_facade_reexports_the_handle_lazily() -> None:
-    """``flashinfer.experimental.cake.cake_causal_conv1d_train_kcp.RecomputeHandleKcp`` is the non-deterministic
-    backend's class; importing the facade imports neither the non-deterministic package nor a KCP host module
-    (``kcp`` imports torch.distributed; ``kcp_jit``) -- checked in a fresh interpreter; both facade entries carry the keyword-only
-    ``recompute_handle=None`` and ``deterministic=True``; the deterministic names are unchanged."""
+    """``flashinfer.cake_causal_conv1d_nondet_train_kcp.CakeCausalConv1dNondetKcpRecomputeHandle`` is the
+    non-deterministic backend's class; importing the facade imports neither the non-deterministic backend package
+    nor a KCP host module (``kcp`` imports torch.distributed; ``kcp_jit``) -- checked in a fresh interpreter; both
+    facade entries carry the keyword-only ``recompute_handle=None`` and no ``deterministic`` keyword; the
+    deterministic names are unchanged."""
     import subprocess
     import sys
 
     code = (
         "import inspect, sys\n"
-        "import flashinfer.experimental.cake.cake_causal_conv1d_train_kcp as f\n"
-        "pkg = 'flashinfer.experimental.cake.cake_causal_conv1d_train_backend'\n"
-        "det = 'flashinfer.cake_causal_conv1d_det_train_backend'\n"
+        "import flashinfer.cake_causal_conv1d_nondet_train_kcp as f\n"
+        "pkg = 'flashinfer.experimental.cake.cake_causal_conv1d_nondet_train'\n"
+        f"det = {PACKAGES['cake_causal_conv1d_det_train']!r}\n"
         "loaded = sorted(m for m in sys.modules if m.startswith((pkg, det + '.kcp')))\n"
         "assert not loaded, loaded\n"
-        "for fn in (f.cake_causal_conv1d_kcp, f.cake_causal_conv1d_multi_kcp):\n"
+        "for fn in (f.cake_causal_conv1d_nondet_kcp, f.cake_causal_conv1d_nondet_kcp_multi):\n"
         "    ps = inspect.signature(fn).parameters\n"
         "    assert ps['recompute_handle'].kind is inspect.Parameter.KEYWORD_ONLY and ps['recompute_handle'].default is None\n"
-        "    assert ps['deterministic'].kind is inspect.Parameter.KEYWORD_ONLY and ps['deterministic'].default is True\n"
+        "    assert 'deterministic' not in ps\n"
         "assert pkg not in sys.modules\n"
-        "from flashinfer.experimental.cake.cake_causal_conv1d_train_kcp import RecomputeHandleKcp\n"
-        "from flashinfer.experimental.cake.cake_causal_conv1d_train_backend.kcp import RecomputeHandleKcp as B\n"
-        "assert RecomputeHandleKcp is B and 'RecomputeHandleKcp' in f.__all__ and 'RecomputeHandleKcp' in dir(f)\n"
+        "H = 'CakeCausalConv1dNondetKcpRecomputeHandle'\n"
+        "from flashinfer.cake_causal_conv1d_nondet_train_kcp import CakeCausalConv1dNondetKcpRecomputeHandle as A\n"
+        "from flashinfer.experimental.cake.cake_causal_conv1d_nondet_train import kcp\n"
+        "assert A is kcp.CakeCausalConv1dNondetKcpRecomputeHandle and H in f.__all__ and H in dir(f)\n"
         "import flashinfer.cake_causal_conv1d_det_train_kcp as d\n"
-        "from flashinfer.cake_causal_conv1d_det_train_backend.kcp import RecomputeHandleDetKcp\n"
-        "assert RecomputeHandleDetKcp is not B\n"
-        "assert d.cake_causal_conv1d_det_kcp is not f.cake_causal_conv1d_kcp\n"
+        "from flashinfer.cake_causal_conv1d_det_train_kcp import RecomputeHandleDetKcp\n"
+        "assert RecomputeHandleDetKcp is not A\n"
+        "assert d.cake_causal_conv1d_det_kcp is not f.cake_causal_conv1d_nondet_kcp\n"
         "print('FACADE_IMPORT_OK')\n"
     )
     r = subprocess.run(

@@ -15,28 +15,25 @@ limitations under the License.
 
 Context-parallel (KCP) packed width-4 depthwise causal convolution + SiLU training (SM100 / SM103 / SM107), the
 non-deterministic package: thin experimental entry points of
-``flashinfer.experimental.cake.cake_causal_conv1d_train_backend.kcp`` (imported on first use).  The deterministic
-KCP entry points are :mod:`flashinfer.cake_causal_conv1d_det_train_kcp` (``cake_causal_conv1d_det_kcp``,
-``cake_causal_conv1d_det_multi_kcp``, ``RecomputeHandleDetKcp``); this module never runs them.
+``flashinfer.experimental.cake.cake_causal_conv1d_nondet_train.kcp`` (imported on first use).  The deterministic
+KCP package is :mod:`flashinfer.cake_causal_conv1d_det_train_kcp` (``cake_causal_conv1d_det_kcp``,
+``cake_causal_conv1d_det_multi_kcp``, ``RecomputeHandleDetKcp``); this module never runs it.
 
-Numerical mode (the same rule as every non-deterministic training package; "torch deterministic mode" is
-``torch.use_deterministic_algorithms(True)``, with or without ``warn_only=True``)::
+Numerical mode (the same rule as every non-deterministic training package): the module name chooses the package,
+and no entry point takes a mode keyword.  "torch deterministic mode" is ``torch.use_deterministic_algorithms(True)``,
+with or without ``warn_only=True``::
 
-    call                                   torch deterministic mode off   torch deterministic mode on
-    this module, deterministic=False       non-deterministic              the forward runs; the backward raises
-                                                                            RuntimeError before any exchange
-                                                                            (warn_only=True: a UserWarning, then
-                                                                            it runs); it never falls back
-    this module, any other deterministic   ValueError naming the          ValueError
-      value (the default True included)      deterministic entry point
-    the deterministic names (*_det_*)      deterministic; no              deterministic; no warning
-                                             deterministic keyword
-                                             (TypeError)
+    package                                        torch deterministic mode off   torch deterministic mode on
+    the non-deterministic package                  non-deterministic              the forward runs; the backward raises
+      (flashinfer.cake_causal_conv1d_nondet_                                        RuntimeError before any exchange
+      train_kcp, this module)                                                       (warn_only=True: a UserWarning, then
+                                                                                    it runs); it never falls back
+    the deterministic package                      deterministic                  deterministic; no warning
+      (flashinfer.cake_causal_conv1d_det_
+      train_kcp)
 
-Every entry point takes keyword-only ``deterministic: bool = True`` and runs only with ``deterministic=False``, so a
-call states the non-deterministic mode explicitly and a call that relied on a deterministic default fails with an
-error that names the deterministic entry point instead of silently changing mode.  Every rank of ``ctx.group`` runs
-the same entry points (and the same torch deterministic setting) for a call.
+The backward reads torch's deterministic setting when it runs (the autograd backward included).  Every rank of
+``ctx.group`` runs the same entry points (and the same torch deterministic setting) for a call.
 
 Contract: the context of the KDA step (``ContextDetKcp`` from
 ``flashinfer.cake_kda_det_train_kcp.build_context_det_kcp``), FP32 taps and no bias, the halo exchanges (one
@@ -45,23 +42,26 @@ the recompute-handle rules and the multi-tensor calls are the deterministic KCP 
 ordinary launch (no cooperative attribute, no grid barrier) whose CTAs add their FP32 ``dweight`` rows into zeroed
 accumulators with unordered global reductions.  ``y`` and ``dx`` are bitwise the deterministic KCP entry point's;
 the rank-local FP32 ``dweight`` partial stays within the deterministic error budget but is not bitwise reproducible
-run to run (its cross-rank reduction remains the framework's).  The package is chosen by name at each call, so a
-checkpoint recompute (``torch.utils.checkpoint``, reentrant or not) runs the same package; keep torch's
-deterministic setting the same from a forward to its backward.
+run to run (its cross-rank reduction remains the framework's).  The package is chosen by name, so a checkpoint
+recompute (``torch.utils.checkpoint``, reentrant or not) runs the same package.
 
-Name map (deterministic -> this module): ``cake_causal_conv1d_det_kcp`` -> :func:`cake_causal_conv1d_kcp`,
-``cake_causal_conv1d_det_multi_kcp`` -> :func:`cake_causal_conv1d_multi_kcp`, ``RecomputeHandleDetKcp`` ->
-``RecomputeHandleKcp`` (any object with an ``entries`` dict serves either package)::
+Name map (the deterministic package -> this module): ``cake_causal_conv1d_det_kcp`` ->
+:func:`cake_causal_conv1d_nondet_kcp`, ``cake_causal_conv1d_det_multi_kcp`` ->
+:func:`cake_causal_conv1d_nondet_kcp_multi`, ``RecomputeHandleDetKcp`` -> ``CakeCausalConv1dNondetKcpRecomputeHandle``
+(any object with an ``entries`` dict serves either package)::
 
-    from flashinfer.experimental.cake.cake_causal_conv1d_train_kcp import cake_causal_conv1d_kcp, cake_causal_conv1d_multi_kcp
+    from flashinfer.cake_causal_conv1d_nondet_train_kcp import (
+        cake_causal_conv1d_nondet_kcp,
+        cake_causal_conv1d_nondet_kcp_multi,
+    )
 
-    y_local = cake_causal_conv1d_kcp(x_local, weight, ctx, deterministic=False)  # one-launch backward
-    q, k, v = cake_causal_conv1d_multi_kcp((xq, xk, xv), (wq, wk, wv), ctx, deterministic=False)
+    y_local = cake_causal_conv1d_nondet_kcp(x_local, weight, ctx)  # one-launch backward
+    q, k, v = cake_causal_conv1d_nondet_kcp_multi((xq, xk, xv), (wq, wk, wv), ctx)
 
 The backward beside a kernel of another stream (FlashInfer issue #8365): ``bwd_reserve_sms=K`` (SM100 / SM103;
 ``ValueError`` on SM107) launches the main backward ``K`` SMs short of its single wave::
 
-    y_local = cake_causal_conv1d_kcp(x_local, weight, ctx, deterministic=False, bwd_reserve_sms=1)
+    y_local = cake_causal_conv1d_nondet_kcp(x_local, weight, ctx, bwd_reserve_sms=1)
 """
 
 from __future__ import annotations
@@ -70,22 +70,9 @@ from typing import Any, Optional, Sequence
 
 import torch
 
-from ...api_logging import flashinfer_experimental_api
+from .api_logging import flashinfer_experimental_api
 
 _FEATURE = "Cake context-parallel causal conv1d + SiLU training, non-deterministic package (SM100/SM103/SM107)"
-
-
-def _nondeterministic_only(deterministic: object, entry: str, det_entry: str) -> None:
-    """Refuse every ``deterministic`` value but ``False`` (the default ``True`` included) with a ``ValueError`` that
-    names the deterministic entry point: this module runs the non-deterministic package only."""
-
-    if deterministic is not False:
-        raise ValueError(
-            f"{entry} runs the non-deterministic package (unordered dweight reductions) and needs "
-            f"deterministic=False, got deterministic={deterministic!r}; the deterministic entry point is "
-            f"flashinfer.cake_causal_conv1d_det_train_kcp.{det_entry} (pass deterministic=False here for the "
-            "non-deterministic path)"
-        )
 
 
 def _given(**keywords: Any) -> dict[str, Any]:
@@ -96,21 +83,23 @@ def _given(**keywords: Any) -> dict[str, Any]:
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
-def cake_causal_conv1d_kcp(
+def cake_causal_conv1d_nondet_kcp(
     x_local: torch.Tensor,
     weight: torch.Tensor,
     ctx: Any,
     *,
     recompute_handle: Optional[Any] = None,
     cooperative: Optional[bool] = None,
-    deterministic: bool = True,
     bwd_reserve_sms: Optional[int] = None,
 ) -> torch.Tensor:
     """Autograd-enabled context-parallel packed width-4 depthwise causal convolution + SiLU of this rank's fragments,
     non-deterministic backward.
 
     The first tokens of a fragment that continues a document read the history rows of the preceding fragment
-    (exchanged through the context's halo collective) instead of zeros.  FP32 taps, no bias.
+    (exchanged through the context's halo collective) instead of zeros.  FP32 taps, no bias.  The backward is one
+    launch with an unordered ``dweight`` partial (``y`` / ``dx`` bitwise the deterministic ones).  When torch's
+    deterministic mode is on as the backward runs, the backward raises a ``RuntimeError`` before any exchange (a
+    ``UserWarning``, then it runs, with ``warn_only=True``).
 
     Parameters
     ----------
@@ -122,19 +111,15 @@ def cake_causal_conv1d_kcp(
     ctx : ContextDetKcp
         From ``flashinfer.cake_kda_det_train_kcp.build_context_det_kcp`` (the same context the KDA step of the rank
         uses).
-    recompute_handle : RecomputeHandleKcp, optional
+    recompute_handle : CakeCausalConv1dNondetKcpRecomputeHandle, optional
         Keyword-only, default ``None``.  A handle (any object with an ``entries`` dict) makes the checkpoint
         recompute of this call run without the forward halo exchange, under the rules of
         :func:`flashinfer.cake_causal_conv1d_det_train_kcp.cake_causal_conv1d_det_kcp` (one handle per call and
         micro-step, created outside the outermost checkpoint region; every rank passes one or none).
     cooperative : bool, optional
         Keyword-only, default ``None``.  The main backward is always one ordinary launch: ``None`` and ``False``
-        mean the same and ``True`` raises ``ValueError`` (the deterministic entry point's cooperative form is
-        ``cake_causal_conv1d_det_kcp(..., cooperative=True)``).
-    deterministic : bool
-        Keyword-only, default ``True``, which raises: pass ``False``.  Any value but ``False`` raises
-        ``ValueError`` naming ``cake_causal_conv1d_det_kcp``.  With ``False``: the one-launch backward with an
-        unordered ``dweight`` partial (``y`` / ``dx`` bitwise the deterministic ones).
+        mean the same and ``True`` raises ``ValueError`` (the cooperative form belongs to the deterministic KCP
+        package: ``cake_causal_conv1d_det_kcp(..., cooperative=True)``).
     bwd_reserve_sms : int, optional
         Keyword-only, default ``None`` (the package's ``RESERVE_DEFAULT``, 0).  The SMs the main backward leaves to
         kernels of other streams (issue #8365): ``K >= 1`` launches its single-wave grid ``K x ctas_per_sm`` CTAs
@@ -148,8 +133,8 @@ def cake_causal_conv1d_kcp(
         ``bool`` or a non-``int`` raises ``TypeError``, a negative value or one not below the device's SM count
         ``ValueError``.  On sm_107a ``K >= 1`` raises ``ValueError``: there the reserved grid costs up to 1.055x the
         shipped grid unloaded (``C`` = 1024, 62585 tokens), above this opt-in's 1.040 limit.  The deterministic
-        entry point's form beside a kernel of another stream is ``cooperative=False``.  Each rank may choose its own
-        value (no collective depends on it).
+        KCP package's form beside a kernel of another stream is ``cooperative=False``.  Each rank may choose its
+        own value (no collective depends on it).
 
     Returns
     -------
@@ -158,39 +143,35 @@ def cake_causal_conv1d_kcp(
         partial.
     """
 
-    _nondeterministic_only(
-        deterministic, "cake_causal_conv1d_kcp", "cake_causal_conv1d_det_kcp"
-    )
-    from .cake_causal_conv1d_train_backend import (  # noqa: PLC0415
+    from .experimental.cake.cake_causal_conv1d_nondet_train import (  # noqa: PLC0415
         kcp as _kcp,
     )
 
-    return _kcp.cake_causal_conv1d_kcp(
+    return _kcp.cake_causal_conv1d_nondet_kcp(
         x_local,
         weight,
         ctx,
         recompute_handle=recompute_handle,
-        deterministic=False,
         **_given(cooperative=cooperative, bwd_reserve_sms=bwd_reserve_sms),
     )
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
-def cake_causal_conv1d_multi_kcp(
+def cake_causal_conv1d_nondet_kcp_multi(
     xs: Sequence[torch.Tensor],
     weights: Sequence[torch.Tensor],
     ctx: Any,
     *,
     recompute_handle: Optional[Any] = None,
     cooperative: Optional[bool] = None,
-    deterministic: bool = True,
     bwd_reserve_sms: Optional[int] = None,
 ) -> tuple[torch.Tensor, ...]:
     """Autograd-enabled context-parallel convolutions of several tensors of one layer (for example its q, k and v)
     with one halo exchange per direction, non-deterministic backward.
 
-    Outputs and ``dx`` are bitwise ``tuple(cake_causal_conv1d_kcp(x, w, ctx, deterministic=False) for x, w in
-    zip(xs, weights))``; each ``dweight`` is that tensor's own unordered FP32 partial.
+    Outputs and ``dx`` are bitwise ``tuple(cake_causal_conv1d_nondet_kcp(x, w, ctx) for x, w in zip(xs,
+    weights))``; each ``dweight`` is that tensor's own unordered FP32 partial.  Under torch's deterministic mode the
+    backward alerts like the single call's.
 
     Parameters
     ----------
@@ -200,18 +181,15 @@ def cake_causal_conv1d_multi_kcp(
     weights : sequence of torch.Tensor
         FP32 ``[C_i, 4]`` contiguous taps, one per tensor.
     ctx : ContextDetKcp
-        As in :func:`cake_causal_conv1d_kcp`.  Every rank of the group calls this function once per layer, in the
-        same order, with the same tensor count and channel counts.
-    recompute_handle : RecomputeHandleKcp, optional
+        As in :func:`cake_causal_conv1d_nondet_kcp`.  Every rank of the group calls this function once per layer, in
+        the same order, with the same tensor count and channel counts.
+    recompute_handle : CakeCausalConv1dNondetKcpRecomputeHandle, optional
         One handle for the whole call (its ``"conv"`` entry holds the ``n`` history pools), under the rules of
-        :func:`cake_causal_conv1d_kcp`.
+        :func:`cake_causal_conv1d_nondet_kcp`.
     cooperative : bool, optional
-        As in :func:`cake_causal_conv1d_kcp`.
-    deterministic : bool
-        As in :func:`cake_causal_conv1d_kcp`: only ``False`` runs; any other value raises ``ValueError`` naming
-        ``cake_causal_conv1d_det_multi_kcp``.
+        As in :func:`cake_causal_conv1d_nondet_kcp`.
     bwd_reserve_sms : int, optional
-        As in :func:`cake_causal_conv1d_kcp`, one value for every tensor of the call.
+        As in :func:`cake_causal_conv1d_nondet_kcp`, one value for every tensor of the call.
 
     Returns
     -------
@@ -219,45 +197,39 @@ def cake_causal_conv1d_multi_kcp(
         The ``n`` BF16 outputs, each of its input's shape.
     """
 
-    _nondeterministic_only(
-        deterministic,
-        "cake_causal_conv1d_multi_kcp",
-        "cake_causal_conv1d_det_multi_kcp",
-    )
-    from .cake_causal_conv1d_train_backend import (  # noqa: PLC0415
+    from .experimental.cake.cake_causal_conv1d_nondet_train import (  # noqa: PLC0415
         kcp as _kcp,
     )
 
-    return _kcp.cake_causal_conv1d_multi_kcp(
+    return _kcp.cake_causal_conv1d_nondet_kcp_multi(
         xs,
         weights,
         ctx,
         recompute_handle=recompute_handle,
-        deterministic=False,
         **_given(cooperative=cooperative, bwd_reserve_sms=bwd_reserve_sms),
     )
 
 
-# ``RecomputeHandleKcp`` (the non-deterministic KCP package's recompute handle class) resolves on first access, so
-# importing this module imports neither the non-deterministic package
-# (``flashinfer.experimental.cake.cake_causal_conv1d_train_backend``) nor a KCP host module (torch.distributed, the
-# KCP loader).
+# ``CakeCausalConv1dNondetKcpRecomputeHandle`` (the non-deterministic KCP package's recompute handle class) resolves
+# on first access, so importing this module imports neither the non-deterministic backend package
+# (``flashinfer.experimental.cake.cake_causal_conv1d_nondet_train``) nor a KCP host module (torch.distributed, the KCP
+# loader).
 def __getattr__(name: str) -> Any:
-    if name == "RecomputeHandleKcp":
-        from .cake_causal_conv1d_train_backend.kcp import (  # noqa: PLC0415
-            RecomputeHandleKcp,
+    if name == "CakeCausalConv1dNondetKcpRecomputeHandle":
+        from .experimental.cake.cake_causal_conv1d_nondet_train.kcp import (  # noqa: PLC0415
+            CakeCausalConv1dNondetKcpRecomputeHandle,
         )
 
-        return RecomputeHandleKcp
+        return CakeCausalConv1dNondetKcpRecomputeHandle
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def __dir__() -> list[str]:
-    return sorted(set(globals()) | {"RecomputeHandleKcp"})
+    return sorted(set(globals()) | {"CakeCausalConv1dNondetKcpRecomputeHandle"})
 
 
 __all__ = [
-    "RecomputeHandleKcp",  # noqa: F822 - resolved by __getattr__
-    "cake_causal_conv1d_kcp",
-    "cake_causal_conv1d_multi_kcp",
+    "CakeCausalConv1dNondetKcpRecomputeHandle",  # noqa: F822 - resolved by __getattr__
+    "cake_causal_conv1d_nondet_kcp",
+    "cake_causal_conv1d_nondet_kcp_multi",
 ]

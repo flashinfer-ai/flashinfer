@@ -106,35 +106,48 @@ Training causal conv1d (Cake)
 
 .. rubric:: Numerical mode
 
-.. list-table:: Deterministic and non-deterministic entry points
-   :header-rows: 1
-   :widths: 22 39 39
+The module selects the numerical mode: the deterministic package
+(``flashinfer.cake_causal_conv1d_det_train[_kcp]``) or the non-deterministic
+package (``flashinfer.cake_causal_conv1d_nondet_train[_kcp]``).  No entry point
+takes a ``deterministic`` keyword; passing one raises ``TypeError``.
 
-   * -
-     - Deterministic
-     - Non-deterministic (experimental)
-   * - single-rank
+.. list-table:: Training causal conv1d modules by numerical mode
+   :header-rows: 1
+   :widths: 16 34 25 25
+
+   * - Mode and route
+     - Module and entry points
+     - Results
+     - Under ``torch.use_deterministic_algorithms(True)``
+   * - deterministic, single-rank
      - ``flashinfer.cake_causal_conv1d_det_train``: ``cake_causal_conv1d_det``,
        ``cake_causal_conv1d_det_train_forward``,
        ``cake_causal_conv1d_det_train_backward``
-     - ``flashinfer.experimental.cake.cake_causal_conv1d_train``:
-       ``cake_causal_conv1d``, ``cake_causal_conv1d_train_forward``,
-       ``cake_causal_conv1d_train_backward``
-   * - context-parallel (KCP)
+     - ``y``, ``dx``, ``dweight`` and ``dbias`` bitwise reproducible
+     - no effect
+   * - deterministic, context-parallel (KCP)
      - ``flashinfer.cake_causal_conv1d_det_train_kcp``:
        ``cake_causal_conv1d_det_kcp``, ``cake_causal_conv1d_det_multi_kcp``
-     - ``flashinfer.experimental.cake.cake_causal_conv1d_train_kcp``:
-       ``cake_causal_conv1d_kcp``, ``cake_causal_conv1d_multi_kcp``
-   * - ``deterministic`` keyword
-     - none: passing one raises ``TypeError``
-     - pass ``deterministic=False``; the default ``True`` and every other value
-       raise ``ValueError`` naming the deterministic entry point
-   * - results
-     - ``y``, ``dx``, ``dweight`` and ``dbias`` bitwise reproducible
+     - ``y``, ``dx`` and the rank-local FP32 ``dweight`` partial bitwise
+       reproducible
+     - no effect
+   * - non-deterministic, single-rank (experimental)
+     - ``flashinfer.cake_causal_conv1d_nondet_train``:
+       ``cake_causal_conv1d_nondet``,
+       ``cake_causal_conv1d_nondet_train_forward``,
+       ``cake_causal_conv1d_nondet_train_backward``
      - ``y`` and ``dx`` bitwise the deterministic package's; ``dweight`` and
        ``dbias`` within its error budget, not bitwise reproducible
-   * - ``torch.use_deterministic_algorithms(True)``
-     - no effect
+     - the forward runs; the backward raises ``RuntimeError`` (with
+       ``warn_only=True``: ``UserWarning``, then it runs); nothing falls back
+       to the deterministic package
+   * - non-deterministic, context-parallel (KCP, experimental)
+     - ``flashinfer.cake_causal_conv1d_nondet_train_kcp``:
+       ``cake_causal_conv1d_nondet_kcp``,
+       ``cake_causal_conv1d_nondet_kcp_multi``
+     - ``y`` and ``dx`` bitwise the deterministic package's; the rank-local
+       FP32 ``dweight`` partial within its error budget, not bitwise
+       reproducible
      - the forward runs; the backward raises ``RuntimeError`` (with
        ``warn_only=True``: ``UserWarning``, then it runs); nothing falls back
        to the deterministic package
@@ -190,55 +203,57 @@ Training causal conv1d, non-deterministic (Cake, experimental)
 ---------------------------------------------------------------
 
 The same convolution, single-rank and context-parallel, with a backward whose
-``dweight`` / ``dbias`` reductions are unordered.  These entry points are
+``dweight`` / ``dbias`` reductions are unordered: the non-deterministic package
+``flashinfer.cake_causal_conv1d_nondet_train[_kcp]``.  These entry points are
 experimental (``@flashinfer_experimental_api``: the first call warns once with
-``ExperimentalWarning``) and are not listed in the API summaries above.  Every
-entry point, workspace helper and support query takes a keyword-only
-``deterministic: bool = True`` and runs only with ``deterministic=False``; any
-other value, the default included, raises ``ValueError`` that names the
-deterministic entry point, before anything runs.  Nothing here runs the
-deterministic package.
+``ExperimentalWarning``) and are not listed in the API summaries above.  The
+module selects the mode, and nothing here runs the deterministic package.
 
-* ``flashinfer.experimental.cake.cake_causal_conv1d_train``:
-  ``cake_causal_conv1d``, ``cake_causal_conv1d_train_forward``,
-  ``cake_causal_conv1d_train_backward``, the forward / backward workspace
-  helpers ``cake_causal_conv1d_train_{forward,backward}_workspace{,_bytes}``
-  and ``is_cake_causal_conv1d_train_supported``.  The parameters are the
-  deterministic entry points' plus ``deterministic``.
-* ``flashinfer.experimental.cake.cake_causal_conv1d_train_kcp``:
-  ``cake_causal_conv1d_kcp``, ``cake_causal_conv1d_multi_kcp`` and
-  ``RecomputeHandleKcp``, with the
-  keyword-only ``bwd_reserve_sms`` (SMs the main backward leaves free;
-  ``bwd_reserve_sms >= 1`` raises ``ValueError`` on SM107).
-  ``cooperative=True`` raises ``ValueError``: the backward is one ordinary
-  launch.
+* ``flashinfer.cake_causal_conv1d_nondet_train``:
+  ``cake_causal_conv1d_nondet`` (its autograd function
+  ``CakeCausalConv1dNondetFunction``),
+  ``cake_causal_conv1d_nondet_train_forward``,
+  ``cake_causal_conv1d_nondet_train_backward``, the forward / backward
+  workspace helpers
+  ``cake_causal_conv1d_nondet_train_{forward,backward}_workspace{,_bytes}``
+  and ``is_cake_causal_conv1d_nondet_train_supported``.  The parameters are the
+  deterministic entry points'.
+* ``flashinfer.cake_causal_conv1d_nondet_train_kcp``:
+  ``cake_causal_conv1d_nondet_kcp``, ``cake_causal_conv1d_nondet_kcp_multi``
+  and ``CakeCausalConv1dNondetKcpRecomputeHandle``, with the deterministic KCP
+  entry points' parameters and the keyword-only ``bwd_reserve_sms`` (SMs the
+  main backward leaves free; ``bwd_reserve_sms >= 1`` raises ``ValueError`` on
+  SM107).  ``cooperative=True`` raises ``ValueError``: it applies to the
+  deterministic KCP package only, and the non-deterministic main backward is
+  one ordinary launch.
 
 The package behind both,
-``flashinfer.experimental.cake.cake_causal_conv1d_train_backend`` (and its
-``kcp`` module), follows the same mode rule for its entry points and
-workspace helpers; it is not marked experimental, and its support query
-``is_cake_causal_conv1d_train_supported(device)`` takes no ``deterministic``.
+``flashinfer.experimental.cake.cake_causal_conv1d_nondet_train``, exports the
+single-rank names; its ``kcp`` module exports the KCP names, the explicit
+entry points ``cake_causal_conv1d_nondet_train_kcp_{forward,backward}`` and
+``cake_causal_conv1d_nondet_train_kcp_multi_{forward,backward}`` and the
+autograd functions ``CakeCausalConv1dNondetKcpFunction`` and
+``CakeCausalConv1dNondetKcpMultiFunction``.  The package is not marked
+experimental and follows the same rules.
 
-Each name maps to a deterministic name: ``cake_causal_conv1d`` ->
-``cake_causal_conv1d_det``, ``cake_causal_conv1d_train_{forward,backward}`` ->
-``cake_causal_conv1d_det_train_{forward,backward}``,
-``cake_causal_conv1d_kcp`` -> ``cake_causal_conv1d_det_kcp``,
-``cake_causal_conv1d_multi_kcp`` -> ``cake_causal_conv1d_det_multi_kcp``,
-``RecomputeHandleKcp`` -> ``RecomputeHandleDetKcp``.  The deterministic
-package's names before the det rename (the modules
-``flashinfer.cake_causal_conv1d_train`` and
-``flashinfer.cake_causal_conv1d_train_backend``, the top-level
-``flashinfer.cake_causal_conv1d`` / ``CakeCausalConv1dFunction`` /
-``cake_causal_conv1d_train_{forward,backward}`` and the KCP names
-``cake_causal_conv1d_kcp`` / ``cake_causal_conv1d_kcp_multi`` /
-``KcpRecomputeHandle`` of ``flashinfer.cake_causal_conv1d_det_train``) are
-removed; use the ``det`` names.  Example::
+Each name of the two modules maps to the deterministic name with ``det`` in
+place of ``nondet`` (``cake_causal_conv1d_nondet`` ->
+``cake_causal_conv1d_det``, ``CakeCausalConv1dNondetFunction`` ->
+``CakeCausalConv1dDetFunction``,
+``cake_causal_conv1d_nondet_kcp`` -> ``cake_causal_conv1d_det_kcp``), except
+``cake_causal_conv1d_nondet_kcp_multi`` -> ``cake_causal_conv1d_det_multi_kcp``
+and ``CakeCausalConv1dNondetKcpRecomputeHandle`` -> ``RecomputeHandleDetKcp``.
+Example::
 
-    from flashinfer.experimental.cake.cake_causal_conv1d_train import (
-        cake_causal_conv1d,
+    from flashinfer.cake_causal_conv1d_nondet_train import (
+        cake_causal_conv1d_nondet,
+    )
+    from flashinfer.cake_causal_conv1d_nondet_train_kcp import (
+        cake_causal_conv1d_nondet_kcp,
     )
 
-    y = cake_causal_conv1d(x, weight, cu_seqlens, bias, deterministic=False)
+    y = cake_causal_conv1d_nondet(x, weight, cu_seqlens, bias)
+    y_local = cake_causal_conv1d_nondet_kcp(x_local, weight, ctx)
 
 Numerical contract: the forward runs copies of the deterministic forward
 programs, so ``y`` is bitwise the same.  The backward is one ordinary launch
@@ -257,11 +272,12 @@ multi backward, and so the autograd backward) raise PyTorch's alert for an
 operation without a deterministic implementation before they launch anything:
 a ``RuntimeError``, or a ``UserWarning`` with ``warn_only=True``, after which
 the backward runs.  The mode is read when the backward runs.  Use the
-deterministic entry points for deterministic results.
+deterministic package (``flashinfer.cake_causal_conv1d_det_train[_kcp]``) for
+deterministic results.
 
 The non-deterministic backward workspace holds the accumulators and one
 ticket counter per channel tile.  Allocate it with
-``cake_causal_conv1d_train_backward_workspace(S, C, device, deterministic=False)``
+``cake_causal_conv1d_nondet_train_backward_workspace(S, C, device)``
 (a zeroed ``uint8`` buffer); every launch leaves it zero, and its size depends
 on ``C`` and the route, not on ``S``.  Do not share one workspace between two
 backward launches that can run at the same time, for example on two streams.
@@ -269,3 +285,72 @@ Without a caller workspace the package keeps one zeroed buffer per device and
 stream; inside a CUDA Graph capture it keeps one zeroed buffer per capture and
 stream (when CUDA's capture id is not available, every captured call allocates
 its own).
+
+.. rubric:: Renamed non-deterministic modules and names
+
+The non-deterministic modules and names below were renamed.  The old names
+were removed without aliases: importing an old module raises
+``ModuleNotFoundError``.  The ``deterministic`` keyword was removed as well:
+the module selects the mode, so call the deterministic package's names for
+deterministic results.
+
+.. list-table:: Old and new non-deterministic names
+   :header-rows: 1
+   :widths: 50 50
+
+   * - Old name (removed, no alias)
+     - New name
+   * - ``flashinfer.experimental.cake.cake_causal_conv1d_train``
+     - ``flashinfer.cake_causal_conv1d_nondet_train``
+   * - ``flashinfer.cake_causal_conv1d_train_kcp``,
+       ``flashinfer.experimental.cake.cake_causal_conv1d_train_kcp``
+     - ``flashinfer.cake_causal_conv1d_nondet_train_kcp``
+   * - ``flashinfer.experimental.cake.cake_causal_conv1d_train_backend``
+     - ``flashinfer.experimental.cake.cake_causal_conv1d_nondet_train``
+   * - ``flashinfer.experimental.cake.cake_causal_conv1d_train_backend.kcp``
+     - ``flashinfer.experimental.cake.cake_causal_conv1d_nondet_train.kcp``
+   * - ``cake_causal_conv1d``
+     - ``cake_causal_conv1d_nondet``
+   * - ``CakeCausalConv1dFunction``
+     - ``CakeCausalConv1dNondetFunction``
+   * - ``cake_causal_conv1d_train_forward``
+     - ``cake_causal_conv1d_nondet_train_forward``
+   * - ``cake_causal_conv1d_train_backward``
+     - ``cake_causal_conv1d_nondet_train_backward``
+   * - ``cake_causal_conv1d_train_forward_workspace``
+     - ``cake_causal_conv1d_nondet_train_forward_workspace``
+   * - ``cake_causal_conv1d_train_backward_workspace``
+     - ``cake_causal_conv1d_nondet_train_backward_workspace``
+   * - ``cake_causal_conv1d_train_forward_workspace_bytes``
+     - ``cake_causal_conv1d_nondet_train_forward_workspace_bytes``
+   * - ``cake_causal_conv1d_train_backward_workspace_bytes``
+     - ``cake_causal_conv1d_nondet_train_backward_workspace_bytes``
+   * - ``is_cake_causal_conv1d_train_supported``
+     - ``is_cake_causal_conv1d_nondet_train_supported``
+   * - ``cake_causal_conv1d_kcp``
+     - ``cake_causal_conv1d_nondet_kcp``
+   * - ``cake_causal_conv1d_multi_kcp``
+     - ``cake_causal_conv1d_nondet_kcp_multi``
+   * - ``RecomputeHandleKcp``
+     - ``CakeCausalConv1dNondetKcpRecomputeHandle``
+   * - ``CakeCausalConv1dFunctionKcp``
+     - ``CakeCausalConv1dNondetKcpFunction``
+   * - ``CakeCausalConv1dMultiFunctionKcp``
+     - ``CakeCausalConv1dNondetKcpMultiFunction``
+   * - ``cake_causal_conv1d_forward_kcp``
+     - ``cake_causal_conv1d_nondet_train_kcp_forward``
+   * - ``cake_causal_conv1d_backward_kcp``
+     - ``cake_causal_conv1d_nondet_train_kcp_backward``
+   * - ``cake_causal_conv1d_multi_forward_kcp``
+     - ``cake_causal_conv1d_nondet_train_kcp_multi_forward``
+   * - ``cake_causal_conv1d_multi_backward_kcp``
+     - ``cake_causal_conv1d_nondet_train_kcp_multi_backward``
+
+The deterministic package's names before its ``det`` rename (the modules
+``flashinfer.cake_causal_conv1d_train`` and
+``flashinfer.cake_causal_conv1d_train_backend``, the top-level
+``flashinfer.cake_causal_conv1d`` / ``CakeCausalConv1dFunction`` /
+``cake_causal_conv1d_train_{forward,backward}`` and the KCP names
+``cake_causal_conv1d_kcp`` / ``cake_causal_conv1d_kcp_multi`` /
+``KcpRecomputeHandle`` of ``flashinfer.cake_causal_conv1d_det_train``) are
+removed too; use the ``det`` names.

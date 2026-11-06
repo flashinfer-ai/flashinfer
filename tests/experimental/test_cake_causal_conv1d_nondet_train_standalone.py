@@ -15,18 +15,18 @@ limitations under the License.
 
 Standalone-import tests of the non-deterministic Cake causal conv1d training package.
 
-A copy of ``flashinfer/experimental/cake/cake_causal_conv1d_train_backend`` must
+A copy of ``flashinfer/experimental/cake/cake_causal_conv1d_nondet_train`` must
 import and reach its host-side checks on its own: under another top-level name,
 in a ``python -I`` subprocess with ``flashinfer`` blocked (the form of a
 vendoring gate, ``scripts/check_cake_build_manifests.py --vendored-gate``).  The
 package imports only itself, ``torch`` and ``tvm_ffi``; the experimental marking
 belongs to the experimental entry points
-``flashinfer.experimental.cake.cake_causal_conv1d_train`` and
-``flashinfer.experimental.cake.cake_causal_conv1d_train_kcp`` (covered by
-``test_cake_causal_conv1d_train_api.py``), so a direct call of the package emits
-no warning, and the only ``flashinfer`` import is the JIT fallback of
-``cake_build.py``.  Two tests, CPU-only: no GPU, no generated program and no JIT
-build is needed, so both run on every lane.
+``flashinfer.cake_causal_conv1d_nondet_train`` and
+``flashinfer.cake_causal_conv1d_nondet_train_kcp`` (covered by
+``test_cake_causal_conv1d_nondet_train_api.py``), so a direct call of the
+package emits no warning, and the only ``flashinfer`` import is the JIT
+fallback of ``cake_build.py``.  Two tests, CPU-only: no GPU, no generated
+program and no JIT build is needed, so both run on every lane.
 """
 
 from __future__ import annotations
@@ -44,11 +44,11 @@ import torch
 
 tvm_ffi = pytest.importorskip("tvm_ffi")  # the package's loaders import it
 
-import flashinfer.experimental.cake.cake_causal_conv1d_train_backend as pkg
+import flashinfer.experimental.cake.cake_causal_conv1d_nondet_train as pkg
 
 PACKAGE_DIR = Path(pkg.__file__).resolve().parent
 # The copy's top-level name in the subprocess.
-VENDORED_NAME = "vendored_causal_conv1d_train"
+VENDORED_NAME = "vendored_causal_conv1d_nondet_train"
 
 
 # ---------------------------------------------------------------------------
@@ -108,21 +108,21 @@ for module in (pkg, kcp, cake_build):
     for name in module.__all__:
         getattr(module, name)
 assert {
-    "cake_causal_conv1d",
-    "cake_causal_conv1d_train_forward",
-    "cake_causal_conv1d_train_backward",
-    "cake_causal_conv1d_train_backward_workspace",
-    "is_cake_causal_conv1d_train_supported",
+    "cake_causal_conv1d_nondet",
+    "cake_causal_conv1d_nondet_train_forward",
+    "cake_causal_conv1d_nondet_train_backward",
+    "cake_causal_conv1d_nondet_train_backward_workspace",
+    "is_cake_causal_conv1d_nondet_train_supported",
 }.issubset(pkg.__all__), sorted(pkg.__all__)
 assert {
-    "cake_causal_conv1d_kcp",
-    "cake_causal_conv1d_forward_kcp",
-    "cake_causal_conv1d_backward_kcp",
-    "cake_causal_conv1d_multi_kcp",
+    "cake_causal_conv1d_nondet_kcp",
+    "cake_causal_conv1d_nondet_train_kcp_forward",
+    "cake_causal_conv1d_nondet_train_kcp_backward",
+    "cake_causal_conv1d_nondet_kcp_multi",
 }.issubset(kcp.__all__), sorted(kcp.__all__)
 assert isinstance(cake_jit.MODULES, dict) and cake_jit.MODULES  # registries loaded
 assert isinstance(kcp_jit.MODULES, dict) and kcp_jit.MODULES
-assert pkg.is_cake_causal_conv1d_train_supported(torch.device("cpu")) is False
+assert pkg.is_cake_causal_conv1d_nondet_train_supported(torch.device("cpu")) is False
 
 
 def bf16(*shape):
@@ -138,19 +138,18 @@ x, dy, w = bf16(S, C), bf16(S, C), f32(C, 4)
 cu = torch.tensor([0, S], dtype=torch.int32)
 # Host-side rejections on CPU tensors, each raised before any device query, program bind or launch:
 calls = [
-    # every entry needs deterministic=False (the package has no deterministic programs; the default is True)
-    lambda: pkg.cake_causal_conv1d_train_forward(x, w, cu),
-    lambda: pkg.cake_causal_conv1d_train_backward(x, w, cu, dy),
-    lambda: pkg.cake_causal_conv1d(x, w, cu),
-    lambda: kcp.cake_causal_conv1d_forward_kcp(x, w, None),
-    lambda: kcp.cake_causal_conv1d_backward_kcp(x, w, None, dy, x),
-    lambda: kcp.cake_causal_conv1d_kcp(x, w, None),
-    lambda: kcp.cake_causal_conv1d_multi_forward_kcp([x], [w], None),
     # CPU operands and devices: the programs take CUDA tensors only
-    lambda: pkg.cake_causal_conv1d_train_forward(x, w, cu, deterministic=False),
-    lambda: pkg.cake_causal_conv1d_train_backward(x, w, cu, dy, deterministic=False),
-    lambda: pkg.cake_causal_conv1d_train_forward_workspace_bytes(S, C, "cpu", deterministic=False),
-    lambda: pkg.cake_causal_conv1d_train_backward_workspace_bytes(S, C, "cpu", deterministic=False),
+    lambda: pkg.cake_causal_conv1d_nondet_train_forward(x, w, cu),
+    lambda: pkg.cake_causal_conv1d_nondet_train_backward(x, w, cu, dy),
+    lambda: pkg.cake_causal_conv1d_nondet(x, w, cu),
+    lambda: pkg.cake_causal_conv1d_nondet_train_forward_workspace_bytes(S, C, "cpu"),
+    lambda: pkg.cake_causal_conv1d_nondet_train_backward_workspace_bytes(S, C, "cpu"),
+    # KCP keywords, refused before the context is read: an unknown graph mode and a cooperative main backward
+    lambda: kcp.cake_causal_conv1d_nondet_train_kcp_forward(x, w, None, graph="eager"),
+    lambda: kcp.cake_causal_conv1d_nondet_train_kcp_backward(x, w, None, dy, x, graph="eager"),
+    lambda: kcp.cake_causal_conv1d_nondet_train_kcp_multi_forward([x], [w], None, graph="eager"),
+    lambda: kcp.cake_causal_conv1d_nondet_kcp(x, w, None, cooperative=True),
+    lambda: kcp.cake_causal_conv1d_nondet_kcp_multi([x], [w], None, cooperative=True),
 ]
 
 with warnings.catch_warnings(record=True) as rec:
@@ -181,8 +180,9 @@ def test_vendored_copy_imports_with_flashinfer_blocked(tmp_path):
     subprocess with ``flashinfer`` blocked (meta-path finder plus
     ``sys.modules["flashinfer"] = None``), resolves the ``__all__`` of the package,
     its KCP module and the loader, reports no support for a CPU device, raises the
-    host-side ``ValueError`` of eleven entry-point calls on CPU operands without
-    emitting a warning of any kind, and loads no ``flashinfer`` module."""
+    host-side ``ValueError`` of ten entry-point calls (CPU operands, an unknown KCP
+    graph mode, a cooperative KCP backward) without emitting a warning of any kind,
+    and loads no ``flashinfer`` module."""
     root = tmp_path / "site"
     shutil.copytree(
         PACKAGE_DIR,

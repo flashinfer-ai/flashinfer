@@ -14,27 +14,30 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Tests of the experimental entry points of the non-deterministic Cake causal convolution + SiLU training package: the
-single-rank module ``flashinfer.experimental.cake.cake_causal_conv1d_train`` and the KCP module
-``flashinfer.experimental.cake.cake_causal_conv1d_train_kcp``.
+single-rank module ``flashinfer.cake_causal_conv1d_nondet_train`` and the KCP module
+``flashinfer.cake_causal_conv1d_nondet_train_kcp``, thin entry points of the package
+``flashinfer.experimental.cake.cake_causal_conv1d_nondet_train``.
 
-Mode rule (CPU, the packages replaced by recorders): every entry point, helper and support query runs the
-non-deterministic package with the caller's arguments unchanged when ``deterministic=False``; any other value (the
-default ``True``, ``None``, ints, strings, tensors) raises ``ValueError`` naming the deterministic entry point before
-anything runs; nothing ever runs the deterministic package, also under ``torch.use_deterministic_algorithms(True)``
-(strict and ``warn_only=True``), where the call reaches the non-deterministic package unchanged and without a
-warning of its own.  The deterministic names take no ``deterministic`` keyword (``TypeError``); the deterministic package's names before the det rename are gone.  The entry points
-are marked experimental and mirror the package's signatures; ``import flashinfer`` imports neither module.  The
-opt-in ``bwd_grid_mult`` is refused with the deterministic package's errors.  On a device (once the package is
-rendered): the entry points return the package's bits (``y`` and ``dx`` bitwise the deterministic package's, the
-parameter gradients within budget), at every ``bwd_grid_mult``; under torch's deterministic mode the forward runs and
-the backward raises (strict) or warns and runs (``warn_only``), also when the mode changes between a forward and its
-backward and through ``torch.utils.checkpoint`` (reentrant and not).  The numerical contract itself is
-``test_cake_causal_conv1d_train.py``'s.
+On CPU (the package replaced by recorders): every entry point, helper and support query hands the caller's arguments
+to the non-deterministic package unchanged, also under ``torch.use_deterministic_algorithms(True)`` (strict and
+``warn_only=True``) and without a warning of its own; nothing ever runs the deterministic package
+(``flashinfer.cake_causal_conv1d_det_train[_kcp]``).  The module chooses the mode: no entry point of either package
+takes a ``deterministic`` keyword (``TypeError``), and the deterministic names are unchanged.  The entry points are
+marked experimental and take the deterministic package's parameters (the KCP ones plus ``bwd_reserve_sms``);
+``import flashinfer`` imports neither module, and the KCP module imports the package on first use only.  The opt-in
+``bwd_grid_mult`` is refused with the deterministic package's errors, and ``cooperative=True`` with an error that names
+the deterministic KCP package.  On a device (once the package is rendered): the entry points return the package's
+bits (``y`` and ``dx`` bitwise the deterministic package's, the parameter gradients within budget), at every
+``bwd_grid_mult``; under torch's deterministic mode the forward runs and the backward raises (strict) or warns and runs
+(``warn_only``), also when the mode changes between a forward and its backward and through ``torch.utils.checkpoint``
+(reentrant and not).  The public names are ``test_cake_causal_conv1d_nondet_train_names.py``'s; the numerical contract
+itself is ``test_cake_causal_conv1d_nondet_train.py``'s.
 """
 
 from __future__ import annotations
 
 import inspect
+import re
 import subprocess
 import sys
 import types
@@ -46,38 +49,40 @@ import torch
 import flashinfer
 import flashinfer.cake_causal_conv1d_det_train as det_facade
 import flashinfer.cake_causal_conv1d_det_train_kcp as det_kcp_facade
-import flashinfer.experimental.cake.cake_causal_conv1d_train_kcp as kcp_facade
-import flashinfer.experimental.cake.cake_causal_conv1d_train as facade
-import flashinfer.experimental.cake.cake_causal_conv1d_train_backend as backend
+import flashinfer.cake_causal_conv1d_nondet_train as facade
+import flashinfer.cake_causal_conv1d_nondet_train_kcp as kcp_facade
+import flashinfer.experimental.cake.cake_causal_conv1d_nondet_train as backend
 from flashinfer.api_logging import ExperimentalWarning
+from tests.test_helpers.cake_package import cake_package
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 SEED = 8066
 WIDTH = 4
 DW_ATOL, DW_RTOL = 5e-2, 1e-4
-# Every deterministic value but False: refused with a ValueError that names the deterministic entry point.
-REFUSED_MODES = (True, None, 0, 1, "False", torch.tensor(False))
 
 # entry point -> deterministic package name
 ENTRIES = {
-    "cake_causal_conv1d_train_forward": "cake_causal_conv1d_det_train_forward",
-    "cake_causal_conv1d_train_backward": "cake_causal_conv1d_det_train_backward",
-    "cake_causal_conv1d": "cake_causal_conv1d_det",
+    "cake_causal_conv1d_nondet_train_forward": "cake_causal_conv1d_det_train_forward",
+    "cake_causal_conv1d_nondet_train_backward": "cake_causal_conv1d_det_train_backward",
+    "cake_causal_conv1d_nondet": "cake_causal_conv1d_det",
 }
 HELPERS = {
-    "cake_causal_conv1d_train_forward_workspace": "cake_causal_conv1d_det_train_forward_workspace",
-    "cake_causal_conv1d_train_forward_workspace_bytes": "cake_causal_conv1d_det_train_forward_workspace_bytes",
-    "cake_causal_conv1d_train_backward_workspace": "cake_causal_conv1d_det_train_backward_workspace",
-    "cake_causal_conv1d_train_backward_workspace_bytes": "cake_causal_conv1d_det_train_backward_workspace_bytes",
+    "cake_causal_conv1d_nondet_train_forward_workspace": "cake_causal_conv1d_det_train_forward_workspace",
+    "cake_causal_conv1d_nondet_train_forward_workspace_bytes": "cake_causal_conv1d_det_train_forward_workspace_bytes",
+    "cake_causal_conv1d_nondet_train_backward_workspace": "cake_causal_conv1d_det_train_backward_workspace",
+    "cake_causal_conv1d_nondet_train_backward_workspace_bytes": "cake_causal_conv1d_det_train_backward_workspace_bytes",
 }
 SUPPORTED = (
-    "is_cake_causal_conv1d_train_supported",
+    "is_cake_causal_conv1d_nondet_train_supported",
     "is_cake_causal_conv1d_det_train_supported",
 )
 KCP_ENTRIES = {
-    "cake_causal_conv1d_kcp": "cake_causal_conv1d_det_kcp",
-    "cake_causal_conv1d_multi_kcp": "cake_causal_conv1d_det_multi_kcp",
+    "cake_causal_conv1d_nondet_kcp": "cake_causal_conv1d_det_kcp",
+    "cake_causal_conv1d_nondet_kcp_multi": "cake_causal_conv1d_det_multi_kcp",
 }
+FACADE = "flashinfer.cake_causal_conv1d_nondet_train"
+KCP_FACADE = "flashinfer.cake_causal_conv1d_nondet_train_kcp"
+PACKAGE = "flashinfer.experimental.cake.cake_causal_conv1d_nondet_train"
 
 
 class _Recorder:
@@ -100,9 +105,7 @@ def recorded(monkeypatch):
 
     log: list = []
     nondet_names = [*ENTRIES, *HELPERS, SUPPORTED[0]]
-    monkeypatch.setattr(
-        facade, "_backend", lambda: _namespace("nondet", nondet_names, log)
-    )
+    monkeypatch.setattr(facade, "_backend", _namespace("nondet", nondet_names, log))
     for det_name in [*ENTRIES.values(), *HELPERS.values(), SUPPORTED[1]]:
         monkeypatch.setattr(det_facade, det_name, _Recorder(f"det.{det_name}", log))
     yield log
@@ -110,7 +113,7 @@ def recorded(monkeypatch):
 
 @pytest.fixture
 def kcp_recorded(monkeypatch):
-    from flashinfer.experimental.cake.cake_causal_conv1d_train_backend import (
+    from flashinfer.experimental.cake.cake_causal_conv1d_nondet_train import (
         kcp as kcp_backend,
     )
 
@@ -167,101 +170,47 @@ def _quiet(call):
     return result, list(caught)
 
 
-def _refused(entry: str, det_entry: str):
-    """The ``ValueError`` of a refused mode: it names the entry point, the deterministic one, and ``False``."""
-
-    return pytest.raises(
-        ValueError,
-        match=rf"^{entry} runs the non-deterministic package .* needs deterministic=False, got .*; the "
-        rf"deterministic entry point is flashinfer\.cake_causal_conv1d_det_train(_kcp)?\.{det_entry} \(pass "
-        r"deterministic=False here",
-    )
-
-
 # ----------------------------------------------------------------------------------------------------------------
-# The mode rule (CPU).
+# The entry points run the non-deterministic package (CPU).
 
 
 @pytest.mark.cpu_only
-def test_entry_points_run_the_package_with_false(recorded) -> None:
+def test_entry_points_pass_the_call_to_the_package(recorded) -> None:
     x, w, cu, dy, b, ws = (object() for _ in range(6))
     calls = {
-        "cake_causal_conv1d_train_forward": ((x, w, cu), {"bias": b, "out": None, "workspace": ws}),
-        "cake_causal_conv1d_train_backward": (
+        "cake_causal_conv1d_nondet_train_forward": ((x, w, cu), {"bias": b, "out": None, "workspace": ws}),
+        "cake_causal_conv1d_nondet_train_backward": (
             (x, w, cu, dy),
             {"bias": b, "silu_grad_preactivation": "fp32", "workspace": ws, "dx": None, "dweight": None, "dbias": None,
              "bwd_grid_mult": 3},
         ),
-        "cake_causal_conv1d": ((x, w, cu, b), {"silu_grad_preactivation": "fp32", "bwd_grid_mult": 3}),
+        "cake_causal_conv1d_nondet": ((x, w, cu, b), {"silu_grad_preactivation": "fp32", "bwd_grid_mult": 3}),
     }  # fmt: skip
     for entry in ENTRIES:
         args, kwargs = calls[entry]
         recorded.clear()
-        result, caught = _quiet(
-            lambda: getattr(facade, entry)(*args, **kwargs, deterministic=False)
-        )
+        result, caught = _quiet(lambda: getattr(facade, entry)(*args, **kwargs))
         assert result == f"nondet.{entry}" and caught == [], entry
         ((name, got_args, got_kwargs),) = recorded
-        assert got_args == args and got_kwargs == {**kwargs, "deterministic": False}, (
-            entry
-        )
+        assert got_args == args and got_kwargs == kwargs, entry
 
 
 @pytest.mark.cpu_only
-def test_helpers_run_the_package_with_false(recorded) -> None:
+def test_helpers_pass_the_call_to_the_package(recorded) -> None:
     device = torch.device("cpu")
     for helper in HELPERS:
         # The backward helpers size for a bwd_grid_mult (passed on by keyword); the forward ones don't.
         sized = {"bwd_grid_mult": 4} if "backward" in helper else {}
         recorded.clear()
-        assert (
-            getattr(facade, helper)(64, 256, device, **sized, deterministic=False)
-            == f"nondet.{helper}"
-        )
-        assert recorded == [
-            (f"nondet.{helper}", (64, 256, device), {**sized, "deterministic": False})
-        ], helper
+        assert getattr(facade, helper)(64, 256, device, **sized) == f"nondet.{helper}"
+        assert recorded == [(f"nondet.{helper}", (64, 256, device), sized)], helper
     recorded.clear()
-    assert (
-        facade.is_cake_causal_conv1d_train_supported(device, deterministic=False)
-        == "nondet.is_cake_causal_conv1d_train_supported"
+    assert facade.is_cake_causal_conv1d_nondet_train_supported(device) == (
+        "nondet.is_cake_causal_conv1d_nondet_train_supported"
     )
-    # The package's support query takes no mode keyword.
-    assert recorded == [("nondet.is_cake_causal_conv1d_train_supported", (device,), {})]
-
-
-@pytest.mark.cpu_only
-def test_every_other_mode_is_refused_naming_the_deterministic_entry(
-    recorded, kcp_recorded
-) -> None:
-    """The default and every value but ``False`` raise ``ValueError`` before anything runs, from every entry point,
-    helper and support query of both modules (the KCP keyword path included); nothing reaches either package."""
-
-    positional = {
-        "cake_causal_conv1d_train_forward": 3,
-        "cake_causal_conv1d_train_backward": 4,
-        "cake_causal_conv1d": 3,
-    }
-    cpu = torch.device("cpu")
-    for mode in ({}, *({"deterministic": bad} for bad in REFUSED_MODES)):
-        for entry, det_name in ENTRIES.items():
-            args = (None,) * positional[entry]
-            with _refused(entry, det_name):
-                _quiet(lambda: getattr(facade, entry)(*args, **mode))
-        for helper, det_name in HELPERS.items():
-            with _refused(helper, det_name):
-                getattr(facade, helper)(64, 256, cpu, **mode)
-        with _refused(*SUPPORTED):
-            facade.is_cake_causal_conv1d_train_supported(cpu, **mode)
-        for entry, det_name in KCP_ENTRIES.items():
-            for keywords in ({}, {"cooperative": False}, {"bwd_reserve_sms": 1}):
-                with _refused(entry, det_name):
-                    _quiet(
-                        lambda: getattr(kcp_facade, entry)(
-                            None, None, None, **keywords, **mode
-                        )
-                    )
-    assert recorded == [] and kcp_recorded == []
+    assert recorded == [
+        ("nondet.is_cake_causal_conv1d_nondet_train_supported", (device,), {})
+    ]
 
 
 @pytest.mark.cpu_only
@@ -273,19 +222,19 @@ def test_bwd_grid_mult_is_validated_like_the_deterministic_package() -> None:
     cpu = torch.device("cpu")
     calls = {
         "backward": (
-            lambda m: facade.cake_causal_conv1d_train_backward(None, None, None, None, bwd_grid_mult=m, deterministic=False),
+            lambda m: facade.cake_causal_conv1d_nondet_train_backward(None, None, None, None, bwd_grid_mult=m),
             lambda m: det_facade.cake_causal_conv1d_det_train_backward(None, None, None, None, bwd_grid_mult=m),
         ),
         "autograd": (
-            lambda m: facade.cake_causal_conv1d(None, None, None, bwd_grid_mult=m, deterministic=False),
+            lambda m: facade.cake_causal_conv1d_nondet(None, None, None, bwd_grid_mult=m),
             lambda m: det_facade.cake_causal_conv1d_det(None, None, None, bwd_grid_mult=m),
         ),
         "bwd_ws": (
-            lambda m: facade.cake_causal_conv1d_train_backward_workspace(64, 256, cpu, bwd_grid_mult=m, deterministic=False),
+            lambda m: facade.cake_causal_conv1d_nondet_train_backward_workspace(64, 256, cpu, bwd_grid_mult=m),
             lambda m: det_facade.cake_causal_conv1d_det_train_backward_workspace(64, 256, cpu, bwd_grid_mult=m),
         ),
         "bwd_ws_bytes": (
-            lambda m: facade.cake_causal_conv1d_train_backward_workspace_bytes(64, 256, cpu, bwd_grid_mult=m, deterministic=False),
+            lambda m: facade.cake_causal_conv1d_nondet_train_backward_workspace_bytes(64, 256, cpu, bwd_grid_mult=m),
             lambda m: det_facade.cake_causal_conv1d_det_train_backward_workspace_bytes(64, 256, cpu, bwd_grid_mult=m),
         ),
     }  # fmt: skip
@@ -301,62 +250,51 @@ def test_bwd_grid_mult_is_validated_like_the_deterministic_package() -> None:
             assert errors[0][0] is expected, (name, bad, errors)
             assert errors[0][1].startswith("bwd_grid_mult must be"), (name, bad, errors)
         with pytest.raises(expected, match="bwd_grid_mult must be"):
-            backend.CakeCausalConv1dFunction.apply(
-                None, None, None, None, "bf16", bad, False
+            backend.CakeCausalConv1dNondetFunction.apply(
+                None, None, None, None, "bf16", bad
             )
 
 
 @pytest.mark.cpu_only
-def test_torch_deterministic_mode_changes_nothing_here(
+def test_torch_deterministic_mode_never_runs_the_deterministic_package(
     recorded, kcp_recorded, torch_deterministic
 ) -> None:
-    """Strict and ``warn_only=True`` alike: ``deterministic=False`` reaches the non-deterministic package unchanged
-    and without a warning from these modules (the package's backward raises PyTorch's alert itself); every other
-    value is still refused; nothing runs the deterministic package."""
+    """Strict and ``warn_only=True`` alike, every entry point reaches the non-deterministic package unchanged and
+    without a warning from these modules (the package's backward raises PyTorch's alert itself); nothing runs the
+    deterministic package."""
 
     x, w, cu, dy, b, ctx = (object() for _ in range(6))
     # The autograd entry takes the bias positionally (and passes it on so); give it one.
     entry_args = {
-        "cake_causal_conv1d_train_forward": (x, w, cu),
-        "cake_causal_conv1d_train_backward": (x, w, cu, dy),
-        "cake_causal_conv1d": (x, w, cu, b),
+        "cake_causal_conv1d_nondet_train_forward": (x, w, cu),
+        "cake_causal_conv1d_nondet_train_backward": (x, w, cu, dy),
+        "cake_causal_conv1d_nondet": (x, w, cu, b),
     }
     for entry in ENTRIES:
         args = entry_args[entry]
         recorded.clear()
-        result, caught = _quiet(
-            lambda: getattr(facade, entry)(*args, deterministic=False)
-        )
+        result, caught = _quiet(lambda: getattr(facade, entry)(*args))
         assert result == f"nondet.{entry}" and caught == [], (entry, caught)
-        ((name, got_args, got_kwargs),) = recorded
+        ((name, got_args, _),) = recorded
         assert name == f"nondet.{entry}" and got_args == args, entry
-        assert got_kwargs["deterministic"] is False, entry
-        with _refused(entry, ENTRIES[entry]):
-            _quiet(lambda: getattr(facade, entry)(*args))
     for entry in KCP_ENTRIES:
         kcp_recorded.clear()
         result, caught = _quiet(
-            lambda: getattr(kcp_facade, entry)(
-                x, w, ctx, deterministic=False, bwd_reserve_sms=1
-            )
+            lambda: getattr(kcp_facade, entry)(x, w, ctx, bwd_reserve_sms=1)
         )
         assert result == f"nondet.{entry}" and caught == [], (entry, caught)
         assert kcp_recorded == [
             (
                 f"nondet.{entry}",
                 (x, w, ctx),
-                {
-                    "recompute_handle": None,
-                    "deterministic": False,
-                    "bwd_reserve_sms": 1,
-                },
+                {"recompute_handle": None, "bwd_reserve_sms": 1},
             )
         ]
     assert not any(name.startswith("det.") for name, *_ in recorded + kcp_recorded)
 
 
 @pytest.mark.cpu_only
-def test_kcp_entry_points_run_the_package_with_false(kcp_recorded) -> None:
+def test_kcp_entry_points_pass_keywords_when_given(kcp_recorded) -> None:
     """``recompute_handle`` always reaches the package; ``cooperative`` and ``bwd_reserve_sms`` only when given
     (``None`` keeps the package's defaults); the package validates them."""
 
@@ -372,87 +310,40 @@ def test_kcp_entry_points_run_the_package_with_false(kcp_recorded) -> None:
             kcp_recorded.clear()
             result, caught = _quiet(
                 lambda: getattr(kcp_facade, entry)(
-                    x, w, ctx, recompute_handle=handle, deterministic=False, **keywords
+                    x, w, ctx, recompute_handle=handle, **keywords
                 )
             )
             assert result == f"nondet.{entry}" and caught == []
             given = {k: v for k, v in keywords.items() if v is not None}
             assert kcp_recorded == [
-                (
-                    f"nondet.{entry}",
-                    (x, w, ctx),
-                    {"recompute_handle": handle, "deterministic": False, **given},
-                )
+                (f"nondet.{entry}", (x, w, ctx), {"recompute_handle": handle, **given})
             ], (entry, keywords)
 
 
 @pytest.mark.cpu_only
 def test_kcp_package_refuses_a_cooperative_backward() -> None:
     """The non-deterministic package's main backward is one ordinary launch: ``cooperative=True`` is a
-    ``ValueError`` and a non-``bool`` a ``TypeError``, both before anything runs, also through the KCP module."""
+    ``ValueError`` that names the deterministic KCP package and a non-``bool`` a ``TypeError``, both before anything
+    runs, also through the KCP module."""
 
-    from flashinfer.experimental.cake.cake_causal_conv1d_train_backend import (
+    from flashinfer.experimental.cake.cake_causal_conv1d_nondet_train import (
         kcp as kcp_backend,
     )
 
     x, w, ctx = (object() for _ in range(3))
     for entry in KCP_ENTRIES:
+        refusal = (
+            f"{entry}: cooperative=True applies to the deterministic KCP package "
+            "flashinfer.cake_causal_conv1d_det_train_kcp only; the non-deterministic main backward is one ordinary "
+            "launch (pass cooperative=None or False)"
+        )
         for fn in (getattr(kcp_backend, entry), getattr(kcp_facade, entry)):
-            with pytest.raises(
-                ValueError,
-                match=rf"^{entry}: cooperative=True applies to the deterministic entry point "
-                rf"flashinfer\.cake_causal_conv1d_det_train_kcp\.{KCP_ENTRIES[entry]} only; ",
-            ):
-                _quiet(lambda: fn(x, w, ctx, cooperative=True, deterministic=False))
+            with pytest.raises(ValueError, match=rf"^{re.escape(refusal)}$"):
+                _quiet(lambda: fn(x, w, ctx, cooperative=True))
             with pytest.raises(
                 TypeError, match=f"{entry}: cooperative must be None or a bool"
             ):
-                _quiet(lambda: fn(x, w, ctx, cooperative=1, deterministic=False))
-
-
-@pytest.mark.cpu_only
-def test_package_refusals_name_the_deterministic_entry() -> None:
-    """Every entry point of the package (single-rank and ``kcp``) refuses a mode but ``False`` naming its own
-    deterministic entry point, which exists; the map covers exactly the entry points that check the mode."""
-
-    import importlib
-    import re
-    from pathlib import Path
-
-    sources = [
-        Path(backend.__file__),
-        Path(backend.__file__).with_name("kcp.py"),
-    ]
-    checked = {
-        name
-        for path in sources
-        for name in re.findall(
-            r'_require_nondeterministic\(\s*deterministic,\s*"(\w+)"', path.read_text()
-        )
-    }
-    assert checked == set(backend._DET_ENTRIES), checked ^ set(backend._DET_ENTRIES)
-    for entry, det_path in backend._DET_ENTRIES.items():
-        module, _, name = det_path.rpartition(".")
-        assert "det" in name.lower() and hasattr(
-            importlib.import_module(module), name
-        ), det_path
-        for bad in REFUSED_MODES:
-            with pytest.raises(
-                ValueError,
-                match=rf"^{entry} is the non-deterministic implementation .* needs deterministic=False, got "
-                rf".*; the deterministic entry point is {re.escape(det_path)} \(pass deterministic=False here",
-            ):
-                backend._require_nondeterministic(bad, entry)
-        backend._require_nondeterministic(False, entry)
-    cpu = torch.device("cpu")
-    calls = {
-        "cake_causal_conv1d_train_forward": lambda: backend.cake_causal_conv1d_train_forward(None, None, None),
-        "cake_causal_conv1d_train_backward": lambda: backend.cake_causal_conv1d_train_backward(None, None, None, None),
-        "cake_causal_conv1d_train_backward_workspace_bytes": lambda: backend.cake_causal_conv1d_train_backward_workspace_bytes(64, 256, cpu),
-    }  # fmt: skip
-    for entry, call in calls.items():
-        with pytest.raises(ValueError, match=re.escape(backend._DET_ENTRIES[entry])):
-            call()
+                _quiet(lambda: fn(x, w, ctx, cooperative=1))
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -467,26 +358,22 @@ def _parameters(fn) -> list[tuple]:
 
 @pytest.mark.cpu_only
 def test_entry_points_mirror_the_package() -> None:
-    """The single-rank module's entry points and helpers take exactly the package's parameters (``deterministic=True``
-    keyword-only last), which are the deterministic package's plus ``deterministic``; the KCP module's take a subset
-    of the package's, ending in ``deterministic`` and ``bwd_reserve_sms``."""
+    """The single-rank module's entry points, helpers and support query take exactly the package's parameters, which
+    are the deterministic package's; the KCP module's take the deterministic KCP package's plus keyword-only
+    ``bwd_reserve_sms`` last, each as the package takes it."""
 
-    for entry, det_name in {**ENTRIES, **HELPERS}.items():
+    for entry, det_name in {**ENTRIES, **HELPERS, SUPPORTED[0]: SUPPORTED[1]}.items():
         mine = _parameters(getattr(facade, entry))
         assert mine == _parameters(getattr(backend, entry)), entry
-        assert mine[-1] == ("deterministic", inspect.Parameter.KEYWORD_ONLY, True), (
-            entry
-        )
-        assert mine[:-1] == _parameters(getattr(det_facade, det_name)), entry
-    assert _parameters(facade.is_cake_causal_conv1d_train_supported) == [
+        assert mine == _parameters(getattr(det_facade, det_name)), entry
+    assert _parameters(facade.is_cake_causal_conv1d_nondet_train_supported) == [
         ("device", inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.empty),
-        ("deterministic", inspect.Parameter.KEYWORD_ONLY, True),
     ]
     for name in (
-        "cake_causal_conv1d_train_backward",
-        "cake_causal_conv1d",
-        "cake_causal_conv1d_train_backward_workspace",
-        "cake_causal_conv1d_train_backward_workspace_bytes",
+        "cake_causal_conv1d_nondet_train_backward",
+        "cake_causal_conv1d_nondet",
+        "cake_causal_conv1d_nondet_train_backward_workspace",
+        "cake_causal_conv1d_nondet_train_backward_workspace_bytes",
     ):
         for module in (facade, backend):
             parameter = inspect.signature(getattr(module, name)).parameters[
@@ -494,26 +381,25 @@ def test_entry_points_mirror_the_package() -> None:
             ]
             assert parameter.kind is inspect.Parameter.KEYWORD_ONLY, (module, name)
             assert parameter.default == 1, (module, name)
-    function = list(
-        inspect.signature(backend.CakeCausalConv1dFunction.forward).parameters
+    det_backend = cake_package("cake_causal_conv1d_det_train")
+
+    assert _parameters(backend.CakeCausalConv1dNondetFunction.forward) == _parameters(
+        det_backend.CakeCausalConv1dDetFunction.forward
     )
-    assert function[-2:] == ["bwd_grid_mult", "deterministic"], function
     assert backend.BWD_GRID_MULTS == (1, 2, 3, 4)
     assert facade.BWD_GRID_MULTS is backend.BWD_GRID_MULTS
     assert "BWD_GRID_MULTS" in backend.__all__ and "BWD_GRID_MULTS" in facade.__all__
-    import flashinfer.cake_causal_conv1d_det_train_backend as det_backend
-
     assert backend.BWD_GRID_MULTS == det_backend.BWD_GRID_MULTS
-    from flashinfer.experimental.cake.cake_causal_conv1d_train_backend import (
+    from flashinfer.experimental.cake.cake_causal_conv1d_nondet_train import (
         kcp as kcp_backend,
     )
 
-    for entry in KCP_ENTRIES:
+    for entry, det_name in KCP_ENTRIES.items():
         mine = _parameters(getattr(kcp_facade, entry))
-        assert mine[-2:] == [
-            ("deterministic", inspect.Parameter.KEYWORD_ONLY, True),
-            ("bwd_reserve_sms", inspect.Parameter.KEYWORD_ONLY, None),
-        ], entry
+        assert mine[-1] == ("bwd_reserve_sms", inspect.Parameter.KEYWORD_ONLY, None), (
+            entry
+        )
+        assert mine[:-1] == _parameters(getattr(det_kcp_facade, det_name)), entry
         theirs = {p[0]: p for p in _parameters(getattr(kcp_backend, entry))}
         assert all(theirs.get(p[0]) == p for p in mine), entry
 
@@ -527,17 +413,22 @@ def test_entry_points_are_experimental() -> None:
             entry
         )
     assert set(facade.__all__) >= set(ENTRIES) | set(HELPERS) | {SUPPORTED[0]}
-    assert set(kcp_facade.__all__) == set(KCP_ENTRIES) | {"RecomputeHandleKcp"}
-    assert facade.CakeCausalConv1dFunction is backend.CakeCausalConv1dFunction
+    assert set(kcp_facade.__all__) == set(KCP_ENTRIES) | {
+        "CakeCausalConv1dNondetKcpRecomputeHandle"
+    }
+    assert (
+        facade.CakeCausalConv1dNondetFunction is backend.CakeCausalConv1dNondetFunction
+    )
 
 
 @pytest.mark.cpu_only
-def test_deterministic_names_take_no_mode_keyword() -> None:
-    """The deterministic package's entry points carry ``det``, take no ``deterministic`` keyword (passing one is a
-    ``TypeError`` from the call itself) and are other objects than these modules' entry points."""
+def test_no_entry_point_takes_a_mode_keyword() -> None:
+    """The module chooses the mode: no entry point of either package takes a ``deterministic`` keyword (passing one,
+    of any value, is a ``TypeError`` from the call itself, before anything runs), and the entry points of the two
+    packages are distinct objects."""
 
     cpu = torch.device("cpu")
-    det_calls = {
+    calls = {
         "cake_causal_conv1d_det": lambda **k: det_facade.cake_causal_conv1d_det(None, None, None, **k),
         "cake_causal_conv1d_det_train_forward": lambda **k: det_facade.cake_causal_conv1d_det_train_forward(None, None, None, **k),
         "cake_causal_conv1d_det_train_backward": lambda **k: det_facade.cake_causal_conv1d_det_train_backward(None, None, None, None, **k),
@@ -545,17 +436,24 @@ def test_deterministic_names_take_no_mode_keyword() -> None:
         "is_cake_causal_conv1d_det_train_supported": lambda **k: det_facade.is_cake_causal_conv1d_det_train_supported(cpu, **k),
         "cake_causal_conv1d_det_kcp": lambda **k: det_kcp_facade.cake_causal_conv1d_det_kcp(None, None, None, **k),
         "cake_causal_conv1d_det_multi_kcp": lambda **k: det_kcp_facade.cake_causal_conv1d_det_multi_kcp(None, None, None, **k),
+        "cake_causal_conv1d_nondet": lambda **k: facade.cake_causal_conv1d_nondet(None, None, None, **k),
+        "cake_causal_conv1d_nondet_train_forward": lambda **k: facade.cake_causal_conv1d_nondet_train_forward(None, None, None, **k),
+        "cake_causal_conv1d_nondet_train_backward": lambda **k: facade.cake_causal_conv1d_nondet_train_backward(None, None, None, None, **k),
+        "cake_causal_conv1d_nondet_train_backward_workspace_bytes": lambda **k: facade.cake_causal_conv1d_nondet_train_backward_workspace_bytes(64, 256, cpu, **k),
+        "is_cake_causal_conv1d_nondet_train_supported": lambda **k: facade.is_cake_causal_conv1d_nondet_train_supported(cpu, **k),
+        "cake_causal_conv1d_nondet_kcp": lambda **k: kcp_facade.cake_causal_conv1d_nondet_kcp(None, None, None, **k),
+        "cake_causal_conv1d_nondet_kcp_multi": lambda **k: kcp_facade.cake_causal_conv1d_nondet_kcp_multi(None, None, None, **k),
     }  # fmt: skip
-    for name, call in det_calls.items():
-        module = det_kcp_facade if name.endswith("_kcp") else det_facade
-        assert "det" in name
+    modules = (facade, kcp_facade, det_facade, det_kcp_facade)
+    for name, call in calls.items():
+        module = next(m for m in modules if name in m.__all__)
         assert (
             "deterministic" not in inspect.signature(getattr(module, name)).parameters
         ), name
         for mode in (True, False):
             with pytest.raises(TypeError, match="deterministic"):
-                call(deterministic=mode)
-    for entry, det_name in {**ENTRIES, **HELPERS}.items():
+                _quiet(lambda: call(deterministic=mode))
+    for entry, det_name in {**ENTRIES, **HELPERS, SUPPORTED[0]: SUPPORTED[1]}.items():
         assert getattr(facade, entry) is not getattr(det_facade, det_name), entry
     for entry, det_name in KCP_ENTRIES.items():
         assert getattr(kcp_facade, entry) is not getattr(det_kcp_facade, det_name), (
@@ -566,8 +464,8 @@ def test_deterministic_names_take_no_mode_keyword() -> None:
 @pytest.mark.cpu_only
 def test_deterministic_names_are_unchanged_and_carry_det() -> None:
     """Every deterministic name is the deterministic object and carries ``det``; the names the deterministic package
-    had before the det rename are bound nowhere, and the same-spelled non-deterministic names live in these modules
-    only."""
+    had before the det rename, which the non-deterministic package had before FlashInfer issue #8928, are bound
+    nowhere, and the non-deterministic names live in these modules only."""
 
     for name in (
         "cake_causal_conv1d_det",
@@ -583,6 +481,7 @@ def test_deterministic_names_are_unchanged_and_carry_det() -> None:
         "CakeCausalConv1dFunction",
         "cake_causal_conv1d_train",
         "cake_causal_conv1d_train_backend",
+        "cake_causal_conv1d_train_kcp",
     ):
         assert not hasattr(flashinfer, name), name
     for name in (
@@ -594,31 +493,42 @@ def test_deterministic_names_are_unchanged_and_carry_det() -> None:
         assert not hasattr(det_kcp_facade, name), name
     for entry in ENTRIES:
         assert not hasattr(det_facade, entry), entry
-    assert not hasattr(det_facade, "CakeCausalConv1dFunction")
+    for entry in KCP_ENTRIES:
+        assert not hasattr(det_kcp_facade, entry), entry
+    assert not hasattr(det_facade, "CakeCausalConv1dNondetFunction")
     assert (
         det_kcp_facade.cake_causal_conv1d_det_kcp
-        is not kcp_facade.cake_causal_conv1d_kcp
+        is not kcp_facade.cake_causal_conv1d_nondet_kcp
     )
 
 
 @pytest.mark.cpu_only
 def test_core_does_not_import_the_experimental_package() -> None:
-    """``import flashinfer`` imports neither module nor the non-deterministic package; the KCP module imports
-    neither the package nor the single-rank module until a call; the single-rank module imports the
-    non-deterministic package but no KCP host module."""
+    """``import flashinfer`` imports neither module nor the non-deterministic package.  Both modules sit in core, so
+    each imports the package only on first use (the containment rules of ``flashinfer/experimental/README.md``): the
+    KCP module imports neither the package nor the single-rank module until then (its recompute handle class resolves
+    the package's ``kcp`` module on first access); the single-rank module imports the package on the first access to
+    one of its names, and no KCP host module."""
 
     code = (
+        "import importlib\n"
         "import sys\n"
         "import flashinfer\n"
-        "cake = 'flashinfer.experimental.cake'\n"
-        "loaded = sorted(m for m in sys.modules if m == cake or m.startswith(cake + '.'))\n"
-        "assert not loaded, loaded\n"
-        "import flashinfer.experimental.cake.cake_causal_conv1d_train_kcp\n"
-        "loaded = sorted(m for m in sys.modules if m.startswith(cake + '.') and m != cake + '.cake_causal_conv1d_train_kcp')\n"
-        "assert not loaded, loaded\n"
-        "import flashinfer.experimental.cake.cake_causal_conv1d_train\n"
+        f"pkg, single, kcp_module = {PACKAGE!r}, {FACADE!r}, {KCP_FACADE!r}\n"
+        "def loaded(*names):\n"
+        "    prefixes = tuple(n + '.' for n in names)\n"
+        "    return sorted(m for m in sys.modules if m in names or m.startswith(prefixes))\n"
+        "assert not loaded(pkg, single, kcp_module), loaded(pkg, single, kcp_module)\n"
+        "kcp_facade = importlib.import_module(kcp_module)\n"
+        "assert not loaded(pkg, single), loaded(pkg, single)\n"
+        "single_facade = importlib.import_module(single)\n"
+        "assert not loaded(pkg), loaded(pkg)\n"
+        "assert single_facade.BWD_GRID_MULTS == (1, 2, 3, 4)\n"
+        "assert pkg in sys.modules\n"
         "kcp = [m for m in sys.modules if m.endswith(('.kcp', '.kcp_jit')) and 'conv1d' in m]\n"
         "assert not kcp, kcp\n"
+        "handle = kcp_facade.CakeCausalConv1dNondetKcpRecomputeHandle\n"
+        "assert handle.__module__ == pkg + '.kcp', handle.__module__\n"
         "print('IMPORT_ISOLATION_OK')\n"
     )
     r = subprocess.run(
@@ -639,7 +549,7 @@ def _gpu_supported() -> bool:
     return (
         torch.cuda.is_available()
         and torch.cuda.get_device_capability(_device()) in SUPPORTED_CAPABILITIES
-        and backend.is_cake_causal_conv1d_train_supported(_device())
+        and backend.is_cake_causal_conv1d_nondet_train_supported(_device())
         and det_facade.is_cake_causal_conv1d_det_train_supported(_device())
     )
 
@@ -648,8 +558,7 @@ gpu = pytest.mark.skipif(
     not _gpu_supported(),
     reason="needs an SM100 / SM103 / SM107 device and the rendered non-deterministic package (TODO-EXPORT)",
 )
-ND = {"deterministic": False}
-ALERT = "cake_causal_conv1d_train_backward does not have a deterministic implementation"
+ALERT = "cake_causal_conv1d_nondet_train_backward does not have a deterministic implementation"
 
 
 def _problem(S: int = 1000, C: int = 512):
@@ -673,29 +582,32 @@ def test_entry_points_return_the_packages_bits() -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ExperimentalWarning)
         y_det = det_facade.cake_causal_conv1d_det_train_forward(x, w, cu, bias=b)
-        y = facade.cake_causal_conv1d_train_forward(x, w, cu, bias=b, **ND)
+        y = facade.cake_causal_conv1d_nondet_train_forward(x, w, cu, bias=b)
         assert torch.equal(y, y_det)
         det_grads = det_facade.cake_causal_conv1d_det_train_backward(
             x, w, cu, dy, bias=b
         )
-        ws = facade.cake_causal_conv1d_train_backward_workspace(S, C, _device(), **ND)
+        ws = facade.cake_causal_conv1d_nondet_train_backward_workspace(S, C, _device())
         assert ws.dtype == torch.uint8 and int(torch.count_nonzero(ws)) == 0
-        assert ws.numel() == facade.cake_causal_conv1d_train_backward_workspace_bytes(
-            S, C, _device(), **ND
+        assert (
+            ws.numel()
+            == facade.cake_causal_conv1d_nondet_train_backward_workspace_bytes(
+                S, C, _device()
+            )
         )
-        dx, dw, db = facade.cake_causal_conv1d_train_backward(
-            x, w, cu, dy, bias=b, workspace=ws, **ND
+        dx, dw, db = facade.cake_causal_conv1d_nondet_train_backward(
+            x, w, cu, dy, bias=b, workspace=ws
         )
         assert int(torch.count_nonzero(ws)) == 0
         assert torch.equal(dx, det_grads[0])
         _close(dw, det_grads[1])
         _close(db, det_grads[2])
-        assert facade.cake_causal_conv1d_train_forward_workspace_bytes(
-            S, C, _device(), **ND
+        assert facade.cake_causal_conv1d_nondet_train_forward_workspace_bytes(
+            S, C, _device()
         ) == det_facade.cake_causal_conv1d_det_train_forward_workspace_bytes(
             S, C, _device()
         )
-        assert facade.is_cake_causal_conv1d_train_supported(_device(), **ND) is True
+        assert facade.is_cake_causal_conv1d_nondet_train_supported(_device()) is True
 
 
 @gpu
@@ -708,16 +620,16 @@ def test_bwd_grid_mult() -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ExperimentalWarning)
         default = det_facade.cake_causal_conv1d_det_train_backward(x, w, cu, dy, bias=b)
-        nbytes = facade.cake_causal_conv1d_train_backward_workspace_bytes(
-            S, C, _device(), **ND
+        nbytes = facade.cake_causal_conv1d_nondet_train_backward_workspace_bytes(
+            S, C, _device()
         )
         for mult in backend.BWD_GRID_MULTS:
-            ws = facade.cake_causal_conv1d_train_backward_workspace(
-                S, C, _device(), bwd_grid_mult=mult, **ND
+            ws = facade.cake_causal_conv1d_nondet_train_backward_workspace(
+                S, C, _device(), bwd_grid_mult=mult
             )
             assert ws.numel() == nbytes and int(torch.count_nonzero(ws)) == 0
-            dx, dw, db = facade.cake_causal_conv1d_train_backward(
-                x, w, cu, dy, bias=b, workspace=ws, bwd_grid_mult=mult, **ND
+            dx, dw, db = facade.cake_causal_conv1d_nondet_train_backward(
+                x, w, cu, dy, bias=b, workspace=ws, bwd_grid_mult=mult
             )
             assert int(torch.count_nonzero(ws)) == 0
             assert torch.equal(dx, default[0]), mult
@@ -726,8 +638,8 @@ def test_bwd_grid_mult() -> None:
             xg = x.clone().requires_grad_(True)
             wg = w.clone().requires_grad_(True)
             bg = b.clone().requires_grad_(True)
-            facade.cake_causal_conv1d(
-                xg, wg, cu, bg, bwd_grid_mult=mult, **ND
+            facade.cake_causal_conv1d_nondet(
+                xg, wg, cu, bg, bwd_grid_mult=mult
             ).backward(dy)
             assert torch.equal(xg.grad, default[0]), mult
             _close(wg.grad, default[1])
@@ -743,8 +655,8 @@ def _autograd(x0, w0, cu, dy, b0=None, *, before_backward=None, checkpointed=Non
     leaves = [t.clone().requires_grad_(True) for t in (x0, w0, b0) if t is not None]
 
     def layer(*args):
-        return facade.cake_causal_conv1d(
-            args[0], args[1], cu, args[2] if len(args) > 2 else None, **ND
+        return facade.cake_causal_conv1d_nondet(
+            args[0], args[1], cu, args[2] if len(args) > 2 else None
         )
 
     if checkpointed is None:
@@ -786,10 +698,10 @@ def test_torch_deterministic_mode_alerts_on_the_backward(torch_mode) -> None:
         y_det = det_facade.cake_causal_conv1d_det_train_forward(x, w, cu)
 
         torch_mode(False)
-        y = facade.cake_causal_conv1d_train_forward(x, w, cu, **ND)
+        y = facade.cake_causal_conv1d_nondet_train_forward(x, w, cu)
         assert torch.equal(y, y_det)
         with pytest.raises(RuntimeError, match=ALERT):
-            facade.cake_causal_conv1d_train_backward(x, w, cu, dy, **ND)
+            facade.cake_causal_conv1d_nondet_train_backward(x, w, cu, dy)
         with pytest.raises(RuntimeError, match=ALERT):
             _autograd(x, w, cu, dy)
         torch_mode(None)
@@ -798,7 +710,7 @@ def test_torch_deterministic_mode_alerts_on_the_backward(torch_mode) -> None:
 
         torch_mode(True)
         with pytest.warns(UserWarning, match=ALERT):
-            dx, dw = facade.cake_causal_conv1d_train_backward(x, w, cu, dy, **ND)
+            dx, dw = facade.cake_causal_conv1d_nondet_train_backward(x, w, cu, dy)
         assert torch.equal(dx, expected[0])
         _close(dw, expected[1])
         torch_mode(None)
