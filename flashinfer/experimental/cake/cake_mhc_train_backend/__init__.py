@@ -19,9 +19,9 @@ SM100 / SM103, and hidden 4096 on SM107), one self-contained
 package (host API bodies, the ``cake_jit`` registry, the ``cake_build`` loader
 and the generated CUDA sources under ``csrc/``).  It imports nothing from other
 flashinfer packages and ships its own copy of every program it launches.  The
-dispatching entry points (``deterministic=True`` -> the deterministic package
-``flashinfer.cake_mhc_det_train``) and the user-facing documentation live in
-:mod:`flashinfer.experimental.cake.cake_mhc_train`.
+user-facing module and documentation are
+:mod:`flashinfer.experimental.cake.cake_mhc_train`, which forwards every entry
+point here.
 
 Numerical contract against the deterministic package: the forward, the
 statistics replay, the residual mixing and ``backward_prepare`` run copies of
@@ -34,14 +34,20 @@ column slab adds the ``dfn`` sum of every (column slab, token chunk) unit into
 ``dfn`` with FP32 reductions, so only the summation order of ``dfn`` varies
 from run to run (each element within ``P <= 32`` FP32 roundings of the
 fixed-order sum of its per-chunk partials; the FP32 reduction flushes
-subnormal addends and results to zero).  ``dX``, ``dscale`` and ``dbase`` are
-the deterministic package's bits.  There is no final reduction kernel, and the
-backward workspace has no per-chunk ``dfn`` partial region.
+subnormal addends and results to zero).  ``dX`` is the deterministic package's
+bits; ``dscale`` and ``dbase`` are the bits of its per-CTA reduction (see
+:mod:`.cake_jit` for the group-row band where they can differ).  There is no
+final reduction kernel, and the backward workspace has no per-chunk ``dfn``
+partial region.
 
-Numerical-mode keyword: every compute and workspace entry point takes
-``deterministic: bool = True`` and raises ``ValueError`` unless it is
-``False``: this package has no deterministic backward, so a call must opt in
-(the facade routes ``deterministic=True`` to the deterministic package).  With
+Numerical-mode keyword: every compute and workspace entry point, and
+:func:`cake_mhc_train_prepare` / :func:`cake_mhc_train_finish`, takes a
+keyword-only ``deterministic: bool = True`` and raises ``ValueError`` unless it
+is ``False``, naming the deterministic package's entry point
+(``flashinfer.cake_mhc_det_train.cake_mhc_det_train_*``): this package has no
+deterministic path and nothing falls back to one, so a call passes
+``deterministic=False`` explicitly.  :func:`cake_mhc_train_reset_workspace`,
+:func:`is_cake_mhc_train_supported` and :func:`route_key` take no keyword.  With
 ``torch.use_deterministic_algorithms(True)`` the paths that launch the
 unordered reduction -- :func:`cake_mhc_train_backward_finish` and the backward
 of the prepare node (:func:`cake_mhc_train_prepare`) -- raise PyTorch's alert
@@ -116,15 +122,18 @@ _TORCH_DTYPES = {
 
 
 def _require_nondeterministic(deterministic: Any, entry: str) -> None:
-    """The mode contract of every entry point: the package computes non-deterministically, so an entry point takes
-    ``deterministic=False`` and raises ``ValueError`` for any other value (the deterministic package is
-    ``flashinfer.cake_mhc_det_train``)."""
+    """The mode contract of every entry point: the package computes non-deterministically, so a call passes
+    ``deterministic=False``, and any other value raises ``ValueError`` naming the deterministic package's entry
+    point (``flashinfer.cake_mhc_det_train``), with no fallback."""
 
-    if deterministic is not False:
-        raise ValueError(
-            f"{entry} computes non-deterministically and takes deterministic=False (got "
-            f"{deterministic!r}); flashinfer.cake_mhc_det_train is the deterministic package"
-        )
+    if deterministic is False:
+        return
+    det_entry = entry.replace("cake_mhc_train", "cake_mhc_det_train", 1)
+    raise ValueError(
+        f"{entry} computes non-deterministically (got deterministic={deterministic!r}): pass "
+        "deterministic=False for the non-deterministic path, or call "
+        f"flashinfer.cake_mhc_det_train.{det_entry} for the deterministic one (no fallback)"
+    )
 
 
 def _require_hidden(hidden: Any, entry: str) -> None:
@@ -447,7 +456,7 @@ def cake_mhc_train_forward_workspace_bytes(
     zero on first use (allocate with ``torch.zeros`` or
     :func:`cake_mhc_train_forward_workspace`); the kernels leave them zero.
     ``T == 0`` needs no workspace (nothing is launched).  ``deterministic`` must
-    be ``False``.
+    be ``False`` (``ValueError`` naming the deterministic entry point otherwise).
 
     ``hidden`` (keyword, default ``4096``) is the hidden size ``H`` of the calls
     the buffer serves (``X.shape[2]``; a size of ``supported_hidden_sizes`` of
@@ -483,7 +492,8 @@ def cake_mhc_train_backward_workspace_bytes(
     to ``T``; ``hidden`` is the hidden size of the calls the buffer serves, as in
     :func:`cake_mhc_train_forward_workspace_bytes` (a buffer sized for one ``H``
     is refused by a call of a larger ``H`` it is too small for).
-    ``deterministic`` must be ``False``.
+    ``deterministic`` must be ``False`` (``ValueError`` naming the deterministic
+    entry point otherwise).
     """
 
     _require_nondeterministic(deterministic, "cake_mhc_train_backward_workspace_bytes")
@@ -1298,7 +1308,8 @@ def cake_mhc_train_forward_prepare(
         (sized for this ``H``: ``hidden=X.shape[2]``); a per-device default
         buffer is used when omitted.
     deterministic : bool
-        Must be ``False`` (``ValueError`` otherwise).
+        Must be ``False`` (``ValueError`` naming the deterministic entry point
+        otherwise).
 
     Returns
     -------
@@ -1404,7 +1415,8 @@ def cake_mhc_train_forward_stats(
     workspace : torch.Tensor, optional
         Caller-owned forward workspace (:func:`cake_mhc_train_forward_workspace`).
     deterministic : bool
-        Must be ``False`` (``ValueError`` otherwise).
+        Must be ``False`` (``ValueError`` naming the deterministic entry point
+        otherwise).
 
     Returns
     -------
@@ -1503,7 +1515,8 @@ def cake_mhc_train_forward_finish(
     out : torch.Tensor, optional
         Preallocated BF16 ``[T, 4, H]`` contiguous ``Y``.
     deterministic : bool
-        Must be ``False`` (``ValueError`` otherwise).
+        Must be ``False`` (``ValueError`` naming the deterministic entry point
+        otherwise).
 
     Returns
     -------
@@ -1584,7 +1597,8 @@ def cake_mhc_train_backward_prepare(
     grad_stats_out : torch.Tensor, optional
         Preallocated FP32 ``[T, 32]`` contiguous output.
     deterministic : bool
-        Must be ``False`` (``ValueError`` otherwise).
+        Must be ``False`` (``ValueError`` naming the deterministic entry point
+        otherwise).
 
     Returns
     -------
@@ -1746,7 +1760,8 @@ def cake_mhc_train_backward_finish(
         Preallocated FP32 ``[24, 4H]``, ``[3]``, ``[24]`` contiguous outputs
         (required with ``accumulate=True``).
     deterministic : bool
-        Must be ``False`` (``ValueError`` otherwise).
+        Must be ``False`` (``ValueError`` naming the deterministic entry point
+        otherwise).
 
     Returns
     -------
@@ -2299,7 +2314,8 @@ def cake_mhc_train_prepare(
         Caller-owned forward / backward workspaces sized for this ``H``
         (``hidden=X.shape[2]``); per-device defaults when omitted.
     deterministic : bool
-        Must be ``False`` (``ValueError`` otherwise).
+        Must be ``False`` (``ValueError`` naming the deterministic entry point
+        otherwise).
 
     Returns
     -------
@@ -2343,11 +2359,14 @@ def cake_mhc_train_finish(
     B : torch.Tensor
         BF16 ``[T, H]`` output of the external branch applied to ``U`` (may require gradients).
     handle : object
-        The handle returned by :func:`cake_mhc_train_prepare`, for one finish.  A
-        reentrant checkpoint region (``use_reentrant=True``) holds both calls or
-        starts after the prepare; it does not end between them.
+        The handle returned by :func:`cake_mhc_train_prepare`, for one finish
+        (any other handle, such as a ``cake_mhc_det_train_prepare`` one, raises
+        ``TypeError``).  A reentrant checkpoint region (``use_reentrant=True``)
+        holds both calls or starts after the prepare; it does not end between
+        them.
     deterministic : bool
-        Must be ``False`` (``ValueError`` otherwise).
+        Must be ``False`` (``ValueError`` naming the deterministic entry point
+        otherwise).
 
     Returns
     -------
@@ -2356,7 +2375,10 @@ def cake_mhc_train_finish(
 
     _require_nondeterministic(deterministic, "cake_mhc_train_finish")
     if not isinstance(handle, _MHCTrainHandle):
-        raise TypeError("handle must be the handle returned by cake_mhc_train_prepare")
+        raise TypeError(
+            "handle must be the handle returned by cake_mhc_train_prepare (a cake_mhc_det_train_prepare handle "
+            "goes to flashinfer.cake_mhc_det_train.cake_mhc_det_train_finish)"
+        )
     # The forward takes the edges off the handle: the handle then holds nothing of
     # the prepare node, and a checkpoint rerun of this call runs without them.
     edges, handle.edges = handle.edges, ()

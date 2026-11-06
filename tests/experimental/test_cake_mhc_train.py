@@ -33,12 +33,15 @@ which this package does not copy: the reference there is its backward with
 those forms off, :func:`_det_backward`); each ``dfn`` element sums ``P``
 per-chunk FP32 partials (``P`` the column slab's chunk count:
 ``cake_jit.k7_chunks``, or the two-size geometry where ``cake_jit.lpt_chunks``
-fires; at most 32) in an order that may change from run to run.  Every entry
-point takes ``deterministic=False`` (any other value is a ``ValueError``,
-checked without a device by ``test_cake_mhc_train_rules.py``).  The
-deterministic package (``flashinfer.cake_mhc_det_train_backend``) is the
-same-input reference throughout, never a source of tolerances.  This module
-checks:
+fires; at most 32) in an order that may change from run to run.  Every compute
+and workspace entry point, the autograd prepare and finish included, takes
+``deterministic=False`` passed explicitly (``is_cake_mhc_train_supported`` and
+``cake_mhc_train_reset_workspace`` take no ``deterministic``): any other
+value, the default ``True`` included, is a ``ValueError`` naming the
+deterministic package's entry, never a fallback (checked without a device by
+``test_cake_mhc_train_rules.py``).  The deterministic package
+(``flashinfer.cake_mhc_det_train_backend``) is the same-input reference
+throughout, never a source of tolerances.  This module checks:
 
 * accuracy against the FP64 reference of ``test_cake_mhc_det_train.py`` under
   its bars, on the worst of 5 launches of every draw: BF16 ``dX`` at atol =
@@ -1686,8 +1689,8 @@ def test_launches_are_this_packages_records(monkeypatch, hidden: int) -> None:
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# PyTorch's deterministic algorithms (the alert of the unordered reduction; the facade's fallback to the
-# deterministic package is test_cake_mhc_train_api.py's)
+# PyTorch's deterministic algorithms (the alert of the unordered reduction; the facade, which forwards to this
+# package, is test_cake_mhc_train_api.py's)
 
 
 def _our_alerts(caught) -> list[str]:
@@ -2497,7 +2500,10 @@ def test_argument_validation() -> None:
     be a 1-D, 256-byte aligned ``uint8`` CUDA tensor of the non-deterministic size (a non-tensor a ``TypeError``).
     An operand or output of another hidden size than ``X``, and a call whose hidden size the package does not list
     (6144) or the architecture does not route (5120 and 7168 on sm_107a), is a ``ValueError``.  ``B`` is optional:
-    ``None`` gives the same ``dX`` / ``dscale`` / ``dbase`` bits and a ``dfn`` within the bound."""
+    ``None`` gives the same ``dX`` / ``dscale`` / ``dbase`` bits and a ``dfn`` within the bound.  ``finish`` takes
+    only this package's handles (any other object, a deterministic package's handle included, is a ``TypeError``
+    naming the deterministic finish), and checks the mode first: the default ``deterministic`` with such a handle is
+    the mode's ``ValueError`` naming the deterministic finish."""
     T = 8
     i = _make_inputs(T, seed=SEED + 9)
     X, fn, scale, base = i["X"], i["fn"], i["scale"], i["base"]
@@ -2587,10 +2593,21 @@ def test_argument_validation() -> None:
         _nd_prepare(X.float(), fn, scale, base)
     with pytest.raises(ValueError):
         _nd_prepare(padded, fn, scale, base)
-    with pytest.raises(TypeError):
-        _nd_finish(X, i["B"], object())
-    with pytest.raises(TypeError):
-        _nd_finish(X, i["B"], det.cake_mhc_det_train_prepare(X, fn, scale, base)[1])
+    foreign = (
+        "handle must be the handle returned by cake_mhc_train_prepare (a cake_mhc_det_train_prepare handle goes to "
+        "flashinfer.cake_mhc_det_train.cake_mhc_det_train_finish)"
+    )
+    det_handle = det.cake_mhc_det_train_prepare(X, fn, scale, base)[1]
+    for handle in (object(), det_handle):
+        with pytest.raises(TypeError, match=re.escape(foreign)):
+            _nd_finish(X, i["B"], handle)
+    default_mode = (
+        "cake_mhc_train_finish computes non-deterministically (got deterministic=True): pass deterministic=False for "
+        "the non-deterministic path, or call flashinfer.cake_mhc_det_train.cake_mhc_det_train_finish for the "
+        "deterministic one (no fallback)"
+    )
+    with pytest.raises(ValueError, match=re.escape(default_mode)):
+        pkg.cake_mhc_train_finish(X, i["B"], det_handle)
 
 
 # ----------------------------------------------------------------------------------------------------------------

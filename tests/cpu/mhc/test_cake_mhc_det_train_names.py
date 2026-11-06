@@ -13,9 +13,9 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Names of the deterministic mHC training package: every public name of
-``flashinfer.cake_mhc_det_train`` and of its backends carries ``det`` (the
-generic constants and route helpers below are qualified by the module path),
+Names of the deterministic mHC training package: every exported function and
+class of ``flashinfer.cake_mhc_det_train`` and of its backends carries ``det``
+(the generic constants and route helpers below are qualified by the module path),
 the names without ``det`` that FlashInfer 0.7.3 used for the same objects are
 gone (no alias module, no top-level alias), and no entry point takes a
 ``deterministic`` keyword.

@@ -73,6 +73,7 @@ import contextlib
 import gc
 import json
 import math
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -1003,7 +1004,9 @@ def test_workspace_sizes_and_which_sizing_serves_which_backward(hidden: int) -> 
     layout (:func:`_det_per_cta`: the parameter region ``[chunks, 32]`` at every token count) without its last region,
     the per-chunk ``dfn`` partials (``P x 24 x 4H`` FP32): the same regions at the same offsets; its public size is
     the envelope over every token count up to ``T``, below the deterministic package's; the forward workspace is the
-    deterministic one.  A workspace of the deterministic sizing serves the non-deterministic backward; one of the
+    deterministic one.  The size helper called without ``deterministic=False`` (the default or ``True``) raises the
+    ``ValueError`` that names ``cake_mhc_det_train_backward_workspace_bytes``.  A workspace of the deterministic
+    sizing (``cake_mhc_det_train_backward_workspace``) serves the non-deterministic backward; one of the
     non-deterministic sizing is refused by the deterministic backward (and by a larger token count)."""
     dev, sm, arch = _device(), _sm_count(), _arch()
     for T in (1, 7, 63, 64, 65, 129, 257, 1000, 2049, 4096, 8192, 16263, 32768, 65536):
@@ -1046,8 +1049,14 @@ def test_workspace_sizes_and_which_sizing_serves_which_backward(hidden: int) -> 
         pkg.cake_mhc_train_backward_workspace_bytes(
             -1, dev, hidden=hidden, deterministic=False
         )
+    refusal = re.escape(
+        "cake_mhc_train_backward_workspace_bytes computes non-deterministically (got deterministic=True): pass "
+        "deterministic=False for the non-deterministic path, or call "
+        "flashinfer.cake_mhc_det_train.cake_mhc_det_train_backward_workspace_bytes for the deterministic one "
+        "(no fallback)"
+    )
     for kwargs in ({}, {"deterministic": True}):
-        with pytest.raises(ValueError, match="takes deterministic=False"):
+        with pytest.raises(ValueError, match=refusal):
             pkg.cake_mhc_train_backward_workspace_bytes(
                 2049, dev, hidden=hidden, **kwargs
             )

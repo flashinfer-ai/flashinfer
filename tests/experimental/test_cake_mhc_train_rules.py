@@ -91,10 +91,17 @@ and record scalars of every hidden size on its boards of record
   (the shared ``cake_build.py`` JIT fallback aside, inside a function), and a
   copy under another name imports and plans with ``flashinfer`` blocked;
 * the mode policy without a device: every compute and workspace entry point
-  refuses any ``deterministic`` other than ``False`` first (``ValueError``),
-  only ``backward_finish`` raises PyTorch's alert under
-  ``torch.use_deterministic_algorithms(True)`` (before any validation or
-  launch), and the alert's wording;
+  (``cake_mhc_train_prepare`` and ``cake_mhc_train_finish`` included) takes a
+  keyword-only ``deterministic: bool = True`` and checks it first: any value
+  other than ``False``, the default included, raises a ``ValueError`` naming
+  the deterministic package's entry point (no fallback); only
+  ``backward_finish`` raises PyTorch's alert under
+  ``torch.use_deterministic_algorithms(True)``, after its operands pass and
+  right before its launch, and the alert's wording;
+* the selector module ``flashinfer.experimental.cake.cake_mhc_train`` (read as
+  source): every entry point takes the same keyword and forwards to this
+  package's function of the same name, and nothing is imported from the
+  deterministic package;
 * the wiring: the test-helper key, the package data, the build-manifest
   checker's row and ``build.json``.
 
@@ -398,7 +405,8 @@ DET_ROUTES = {
 DET_RECORD_SCALARS = {
     name: scalars for name, scalars in det.RECORD_SCALARS.items() if name in DET_MODULES
 }
-# The public entry points that take the mode keyword (every compute and workspace entry point).
+# The public entry points that take the mode keyword (every compute and workspace entry point, the autograd prepare /
+# finish included).
 MODE_ENTRIES = (
     "cake_mhc_train_forward_prepare",
     "cake_mhc_train_forward_stats",
@@ -412,15 +420,36 @@ MODE_ENTRIES = (
     "cake_mhc_train_forward_workspace",
     "cake_mhc_train_backward_workspace",
 )
-# The public functions without it.
+# The public functions without it (``is_cake_mhc_train_supported`` is mode-free here; the selector's copy takes it).
 MODELESS = (
     "is_cake_mhc_train_supported",
     "cake_mhc_train_reset_workspace",
     "route_key",
     "route_modules",
 )
+# The selector module (read as source: the suite imports nothing but its package) and its entry points, each with the
+# mode keyword.
+SELECTOR = "flashinfer/experimental/cake/cake_mhc_train.py"
+SELECTOR_ENTRIES = ("is_cake_mhc_train_supported", *MODE_ENTRIES)
 _ALERT = "does not have a deterministic implementation"
-_REFUSAL = "computes non-deterministically and takes deterministic=False"
+# The start of the refusal of a ``deterministic`` other than ``False`` (:func:`_refusal`: the whole message).
+_REFUSAL = "computes non-deterministically (got deterministic="
+# The ``TypeError`` of ``cake_mhc_train_finish`` for a handle its prepare did not make.
+_HANDLE_REFUSAL = (
+    "handle must be the handle returned by cake_mhc_train_prepare (a cake_mhc_det_train_prepare handle goes to "
+    "flashinfer.cake_mhc_det_train.cake_mhc_det_train_finish)"
+)
+
+
+def _refusal(entry: str, deterministic) -> str:
+    """The ``ValueError`` message of ``entry`` for ``deterministic`` (any value but ``False``): it names the
+    deterministic package's entry point and says there is no fallback."""
+    det_entry = entry.replace(ND_PREFIX, DET_PREFIX, 1)
+    return (
+        f"{entry} computes non-deterministically (got deterministic={deterministic!r}): pass deterministic=False "
+        f"for the non-deterministic path, or call flashinfer.cake_mhc_det_train.{det_entry} for the deterministic "
+        "one (no fallback)"
+    )
 
 
 def _renamed(value):
@@ -3211,8 +3240,9 @@ print(json.dumps(out))
 @pytest.mark.cpu_only
 def test_vendored_copy_imports_with_flashinfer_blocked(tmp_path: Path) -> None:
     """The package directory copied under another top-level name (the vendored gate's first step, without its
-    sources) imports, plans its routes (every hidden size of every board) and refuses ``deterministic=True`` in an
-    interpreter where every ``flashinfer`` import raises; no flashinfer module is loaded."""
+    sources) imports, plans its routes (every hidden size of every board) and refuses the default
+    ``deterministic=True`` (the message naming the deterministic entry point) in an interpreter where every
+    ``flashinfer`` import raises; no flashinfer module is loaded."""
     neutral = "vendored_cake_mhc_train_backend"
     shutil.copytree(
         PACKAGE_DIR,
@@ -3242,11 +3272,12 @@ def test_vendored_copy_imports_with_flashinfer_blocked(tmp_path: Path) -> None:
             nd.selected_modules(arch, hidden, "bwd_finish", rows=4096, sm_count=sm)
         ), (arch, sm, hidden)
     assert out["bwd_bytes"] == nd.workspace_bytes("bwd", 4096, 148, "sm_100a")
-    assert out["refusal"].startswith(f"cake_mhc_train_backward_finish {_REFUSAL}")
+    assert out["refusal"] == _refusal("cake_mhc_train_backward_finish", True)
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# The mode policy (no device: the refusal and the alert come before any device work)
+# The mode policy (no device: the refusal comes before any operand, device or route check; the selector module is
+# read as source)
 
 
 @pytest.mark.cpu_only
@@ -3265,16 +3296,117 @@ def test_exports() -> None:
     assert pkg.__name__ == PACKAGE_NAME
 
 
+def _functions(path: Path) -> dict[str, ast.FunctionDef]:
+    """The module-level functions of ``path`` by name."""
+    tree = ast.parse(path.read_text(), filename=str(path))
+    return {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+
+
+def _body(function: ast.FunctionDef) -> list[ast.stmt]:
+    """The statements of ``function`` after its docstring."""
+    first = function.body[0]
+    if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant):
+        if isinstance(first.value.value, str):
+            return function.body[1:]
+    return function.body
+
+
+def _expression(source: str) -> str:
+    """``ast.dump`` of the expression ``source`` (no positions), to compare a statement's expression with."""
+    return ast.dump(ast.parse(source, mode="eval").body)
+
+
 @pytest.mark.cpu_only
 def test_entry_points_take_the_deterministic_keyword() -> None:
+    """Every mode entry point takes a keyword-only ``deterministic`` with the default ``True`` and checks it first:
+    its first statement after the docstring is ``_require_nondeterministic(deterministic, "<entry>")`` (the finish's
+    handle check comes after it).  The mode-free functions take no ``deterministic``."""
+    functions = _functions(Path(pkg.__file__))
     for name in MODE_ENTRIES:
         parameter = inspect.signature(getattr(pkg, name)).parameters["deterministic"]
         assert parameter.kind is inspect.Parameter.KEYWORD_ONLY, name
         assert parameter.default is True, name
+        first = _body(functions[name])[0]
+        assert isinstance(first, ast.Expr), name
+        assert ast.dump(first.value) == _expression(
+            f'_require_nondeterministic(deterministic, "{name}")'
+        ), name
     for name in MODELESS:
         assert (
             "deterministic" not in inspect.signature(getattr(pkg, name)).parameters
         ), name
+
+
+@pytest.mark.cpu_only
+def test_selector_forwards_every_entry_point_to_the_package() -> None:
+    """The selector module ``flashinfer.experimental.cake.cake_mhc_train`` (read as source, not imported) defines its
+    entry points only, each with this package's parameters (names, kinds and defaults;
+    ``is_cake_mhc_train_supported`` adds the keyword-only ``deterministic: bool = True``).  Each body forwards to this
+    package's function of the same name with every argument unchanged, ``deterministic`` included;
+    ``is_cake_mhc_train_supported`` first checks it with ``_nd._require_nondeterministic``.  No import names the
+    deterministic package."""
+    path = REPO / SELECTOR
+    if not path.is_file():
+        pytest.skip(f"{SELECTOR} is not beside this test (installed package)")
+    for node, _ in _imports(path):
+        names = [alias.name for alias in node.names]
+        if isinstance(node, ast.ImportFrom) and node.module:
+            names.append(node.module)
+        assert not [n for n in names if "cake_mhc_det_train" in n], (node.lineno, names)
+    functions = _functions(path)
+    assert set(functions) == set(SELECTOR_ENTRIES), sorted(
+        set(functions) ^ set(SELECTOR_ENTRIES)
+    )
+    owners = {"_nd": pkg, "_nd_jit": nd}
+
+    def default(node):
+        if node is None:
+            return inspect.Parameter.empty
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            return getattr(owners[node.value.id], node.attr)
+        return ast.literal_eval(node)
+
+    for name in SELECTOR_ENTRIES:
+        args = functions[name].args
+        assert not (args.posonlyargs or args.vararg or args.kwarg), name
+        positional_defaults = [None] * (len(args.args) - len(args.defaults))
+        parameters = [
+            (arg.arg, inspect.Parameter.POSITIONAL_OR_KEYWORD, default(node))
+            for arg, node in zip(
+                args.args, positional_defaults + list(args.defaults), strict=True
+            )
+        ] + [
+            (arg.arg, inspect.Parameter.KEYWORD_ONLY, default(node))
+            for arg, node in zip(args.kwonlyargs, args.kw_defaults, strict=True)
+        ]
+        expected = [
+            (parameter.name, parameter.kind, parameter.default)
+            for parameter in inspect.signature(getattr(pkg, name)).parameters.values()
+        ]
+        forwarded = [parameter[0] for parameter in expected]
+        body = _body(functions[name])
+        if name == "is_cake_mhc_train_supported":
+            expected.append(("deterministic", inspect.Parameter.KEYWORD_ONLY, True))
+            assert len(body) == 2 and isinstance(body[0], ast.Expr), name
+            assert ast.dump(body[0].value) == _expression(
+                f'_nd._require_nondeterministic(deterministic, "{name}")'
+            ), name
+        else:
+            assert len(body) == 1, name
+        assert parameters == expected, name
+        returned = body[-1]
+        assert isinstance(returned, ast.Return), name
+        call = returned.value
+        assert isinstance(call, ast.Call), name
+        assert ast.dump(call.func) == _expression(f"_nd.{name}"), name
+        assert all(isinstance(arg, ast.Name) for arg in call.args), name
+        for keyword in call.keywords:
+            assert isinstance(keyword.value, ast.Name), (name, keyword.arg)
+            assert keyword.value.id == keyword.arg, (name, keyword.arg)
+        passed = [arg.id for arg in call.args]
+        assert passed == forwarded[: len(passed)], name
+        passed += [keyword.arg for keyword in call.keywords]
+        assert sorted(passed) == sorted(forwarded), name
 
 
 def _cpu_calls(**mode) -> dict:
@@ -3320,20 +3452,41 @@ _MODES = (
     "mode", _MODES, ids=["default", "true", "none", "zero", "one", "string"]
 )
 def test_entry_points_refuse_a_deterministic_mode_first(mode: dict) -> None:
-    """Any ``deterministic`` but the bool ``False`` (the default ``True`` included) is a ``ValueError`` naming the
-    entry point and the deterministic package, before any operand, device or route check -- also with PyTorch's
-    deterministic algorithms on (the refusal precedes the alert)."""
+    """Any ``deterministic`` but the bool ``False`` (the default ``True`` included) is the ``ValueError`` of
+    :func:`_refusal`, naming the entry point and the deterministic package's entry point (no fallback), before any
+    operand, device, handle or route check -- also with PyTorch's deterministic algorithms on, with no alert
+    (warnings are errors: the refusal precedes the alert)."""
     calls = _cpu_calls(**mode)
     assert set(calls) == set(MODE_ENTRIES)
+    value = mode.get("deterministic", True)
     for torch_mode in ((False, False), (True, False), (True, True)):
-        with _torch_deterministic(torch_mode[0], warn_only=torch_mode[1]):
+        with (
+            _torch_deterministic(torch_mode[0], warn_only=torch_mode[1]),
+            warnings.catch_warnings(),
+        ):
+            warnings.simplefilter("error")
             for name, call in calls.items():
-                with pytest.raises(ValueError, match=f"^{name} {_REFUSAL}") as info:
+                with pytest.raises(ValueError) as info:
                     call()
-                assert (
-                    "flashinfer.cake_mhc_det_train is the deterministic package"
-                    in str(info.value)
-                ), name
+                assert str(info.value) == _refusal(name, value), name
+
+
+@pytest.mark.cpu_only
+def test_refusal_names_the_deterministic_entry_point() -> None:
+    """The one mode check (the first statement of every mode entry point and of the selector's
+    ``is_cake_mhc_train_supported``): ``False`` passes, and every other value raises the ``ValueError`` of
+    :func:`_refusal`.  The deterministic package exports the entry point the message names."""
+    det_package = cake_package("cake_mhc_det_train")
+    for entry in SELECTOR_ENTRIES:
+        assert entry.replace(ND_PREFIX, DET_PREFIX, 1) in det_package.__all__, entry
+        assert pkg._require_nondeterministic(False, entry) is None
+        for mode in _MODES[1:]:
+            with pytest.raises(ValueError) as info:
+                pkg._require_nondeterministic(mode["deterministic"], entry)
+            assert str(info.value) == _refusal(entry, mode["deterministic"]), (
+                entry,
+                mode,
+            )
 
 
 def _expected_alert(entry: str, warn_only: bool) -> str:
@@ -3376,7 +3529,8 @@ def test_no_entry_alerts_before_its_operands_pass(monkeypatch) -> None:
     belongs to the unordered ``dfn`` reduction, so it is raised right before the launches of ``backward_finish``
     (validated operands, ``T > 0``; the GPU suite checks it there and that ``T == 0`` does not alert).  On the CPU
     operands here every entry point, ``backward_finish`` included, refuses its operands with no alert and launches
-    nothing (warnings are errors)."""
+    nothing (warnings are errors); ``cake_mhc_train_finish`` refuses the handle its prepare did not make with a
+    ``TypeError`` that names the deterministic finish."""
     launched = []
     monkeypatch.setattr(pkg, "_launch_route", lambda *a, **k: launched.append(a))
     monkeypatch.setattr(pkg, "_run_route", lambda *a, **k: launched.append(a))
@@ -3390,6 +3544,9 @@ def test_no_entry_alerts_before_its_operands_pass(monkeypatch) -> None:
                     call()
                 assert _ALERT not in str(info.value), (name, warn_only)
                 assert _REFUSAL not in str(info.value), (name, warn_only)
+                if name == "cake_mhc_train_finish":
+                    assert info.type is TypeError, warn_only
+                    assert str(info.value) == _HANDLE_REFUSAL, warn_only
     assert launched == []
 
 

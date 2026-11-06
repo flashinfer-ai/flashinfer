@@ -74,9 +74,9 @@ except the generic ``ARCHES``, ``SUPPORTED_COMPUTE_CAPABILITIES``,
 ``TENSOR_ALIGNMENT_BYTES``, ``WORKSPACE_ALIGNMENT_BYTES``, ``route_key`` and
 ``route_modules``.  These objects have no alias names (0.7.3's
 ``flashinfer.cake_mhc_train`` names are removed, with no alias).  The
-entry points take no ``deterministic`` keyword and run unchanged under
-``torch.use_deterministic_algorithms(True)``.  The non-deterministic mode is
-``flashinfer.experimental.cake.cake_mhc_train``.
+entry points take no ``deterministic`` keyword and give the same results
+under ``torch.use_deterministic_algorithms(True)`` and raise no alert.  The
+non-deterministic mode is ``flashinfer.experimental.cake.cake_mhc_train``.
 
 Usage::
 
