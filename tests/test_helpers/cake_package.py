@@ -37,7 +37,7 @@ PACKAGES: dict[str, str] = {
     "cake_mok_bf16": "flashinfer.experimental.cake_mok_bf16",
     "cake.cake_kda_det_train": "flashinfer.experimental.cake.cake_kda_det_train",
     "cake.cake_kda_nondet_train": "flashinfer.experimental.cake.cake_kda_nondet_train",
-    "cake_kda_det_train_kcp": "flashinfer.experimental.cake_kda_det_train_kcp",
+    "cake.cake_kda_det_train_kcp": "flashinfer.experimental.cake.cake_kda_det_train_kcp",
     "cake.cake_kda_nondet_train_kcp": "flashinfer.experimental.cake.cake_kda_nondet_train_kcp",
     "cake_gdn_det_train_kcp": "flashinfer.experimental.cake_gdn_det_train_kcp",
     "cake_gdn_train_kcp": "flashinfer.experimental.cake_gdn_train_kcp",
