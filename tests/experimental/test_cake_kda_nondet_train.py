@@ -4357,7 +4357,7 @@ def test_copied_programs_are_the_deterministic_packages_sources(
                 det_text = (det_dir / det_path).read_text()
                 assert "cake_kda_det_train" not in text, (name, path)
                 assert text == det_text.replace(
-                    "cake_kda_det_train", "cake_kda_nondet_train"
+                    "cake_kda_det_train", "cake_kda_train"
                 ), (
                     name,
                     path,
