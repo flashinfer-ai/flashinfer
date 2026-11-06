@@ -3291,7 +3291,18 @@ def override_tiles(arch: str, route: str, C: int, geometry: dict[str, int]) -> i
 # Written by the exporter from the backward kernel generator's table; every
 # other channel count, route, ``S``, thread count and architecture keeps
 # :func:`tile_override`'s or :func:`channel_split`'s plan.
-NARROW_TILES: dict[str, dict[tuple[str, int, int], tuple[int, int]]] = {}
+NARROW_TILES: dict[str, dict[tuple[str, int, int], tuple[int, int]]] = {
+    "sm_100a": {
+        ("bwd", 224, 224): (31292, 500680),
+        ("bwd", 520, 624): (31292, 500680),
+        ("bwd", 632, 760): (31292, 500680),
+    },
+    "sm_103a": {
+        ("bwd", 224, 224): (31292, 500680),
+        ("bwd", 520, 624): (31292, 500680),
+        ("bwd", 632, 760): (31292, 500680),
+    },
+}
 
 # The narrow rows' tile: ``NARROW_CT_VEC`` channel vectors of a CTA of
 # ``NARROW_THREADS`` threads (other geometries keep their plan).
