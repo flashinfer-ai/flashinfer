@@ -17,7 +17,7 @@ flashinfer public-API tests of the Cake MoE grouped GEMM package.
 
 The experimental entry points ``grouped_det_gemm_fwd``, ``grouped_det_gemm_dgrad``,
 ``grouped_det_gemm_wgrad`` and ``cake_grouped_det_mm`` of ``flashinfer.grouped_mm`` (the
-thin core module ``flashinfer.grouped_mm.cake``) and the stable entry point
+thin core module ``flashinfer.grouped_mm.cake_det``) and the stable entry point
 ``flashinfer.grouped_mm.grouped_mm_bf16(..., backend="cake")`` hand off to
 ``flashinfer.experimental.cake_moe_grouped_det_gemm``.  This suite covers the core
 entry points on CPU -- the experimental-API marking, the signatures and docstrings
@@ -60,7 +60,7 @@ ATOL = RTOL = 1e-2  # bf16 outputs
 RAGGED_E4 = [300, 0, 1, 700]
 RAGGED_E6 = [1, 257, 511, 4099, 0, 33]
 
-# The experimental entry points of flashinfer.grouped_mm.cake; the package
+# The experimental entry points of flashinfer.grouped_mm.cake_det; the package
 # functions they hand off to carry the same names.
 ENTRY_POINTS = (
     "grouped_det_gemm_fwd",
@@ -176,16 +176,16 @@ def test_core_entry_points_warn_once_and_the_package_functions_do_not():
 def test_importing_grouped_mm_does_not_import_the_package():
     """``flashinfer.grouped_mm`` reaches the package through deferred imports only
     (experimental containment): a fresh interpreter that imports it has the thin
-    module ``flashinfer.grouped_mm.cake`` loaded and no module of
+    module ``flashinfer.grouped_mm.cake_det`` loaded and no module of
     ``flashinfer.experimental.cake_moe_grouped_det_gemm``."""
     code = (
         "import json, sys\n"
         "import flashinfer.grouped_mm\n"
         "print(json.dumps(sorted(m for m in sys.modules"
-        " if m == 'flashinfer.grouped_mm.cake'"
+        " if m == 'flashinfer.grouped_mm.cake_det'"
         " or m.startswith('flashinfer.experimental.cake_moe_grouped_det_gemm'))))\n"
     )
-    assert json.loads(_run_cpu_subprocess(code)) == ["flashinfer.grouped_mm.cake"]
+    assert json.loads(_run_cpu_subprocess(code)) == ["flashinfer.grouped_mm.cake_det"]
 
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""Experimental Cake ragged BF16 grouped GEMM entry points.
+"""Experimental deterministic Cake ragged BF16 grouped GEMM entry points.
 
 Thin core entry points, per ``flashinfer/experimental/README.md``: each
 function below carries the public signature and the documentation of its
