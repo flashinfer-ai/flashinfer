@@ -356,18 +356,17 @@ def _uses_packed_fp4_mul():
 def _fp4x8_mul_e4m3x8(word: cutlass.Int32, scale: cutlass.Int32):
     """Eight E2M1 values times one byte-broadcast E4M3 scale, as E4M3 RN/SATFINITE.
 
-    The packed multiply takes one E2M1 value in the low nibble of each byte, so
-    the even and odd nibbles are multiplied separately and their bytes
-    re-interleaved: 7 instructions instead of the F16 route's 12 (4 cvt, 4 mul,
-    4 cvt). The loader warps' conversion is the main-tile critical path.
+    The dense packed multiply takes four contiguous E2M1 nibbles from each 16-bit
+    half and returns their E4M3 bytes in order, so each half is one QMUL4 whose
+    nibble selector picks the half: 2 instructions instead of the padded
+    e2m1p4x4 form's 7 (mask/shift, two multiplies, two PRMT re-interleaves) or
+    the F16 route's 12 (4 cvt, 4 mul, 4 cvt), bitwise identical to both. The
+    loader warps' conversion is the main-tile critical path.
     """
     return prims.inline_ptx(
-        "{ .reg .b32 lo, hi; "
-        "and.b32 lo, {$r0}, 0x0F0F0F0F; shr.b32 hi, {$r0}, 4; "
-        "and.b32 hi, hi, 0x0F0F0F0F; "
-        "mul.e4m3x4.e2m1p4x4.e4m3x4.satfinite lo, lo, {$r1}; "
-        "mul.e4m3x4.e2m1p4x4.e4m3x4.satfinite hi, hi, {$r1}; "
-        "prmt.b32 {$w0}, lo, hi, 0x5140; prmt.b32 {$w1}, lo, hi, 0x7362; }",
+        "{ .reg .b16 lo, hi; mov.b32 {lo, hi}, {$r0}; "
+        "mul.rn.e4m3x4.e2m1x4.e4m3x4.satfinite {$w0}, lo, {$r1}; "
+        "mul.rn.e4m3x4.e2m1x4.e4m3x4.satfinite {$w1}, hi, {$r1}; }",
         write_only_types=[cutlass.Int32] * 2,
         read_only_args=[word, scale],
     )

@@ -250,9 +250,10 @@ group per D128 stage, and converts each stage from SMEM. These copies issue
 before the tile's first KV slot is acquired: reused slots are released only after
 the previous tile's PV, which the in-order MMA issues after the next QK. With
 bundled CUDA >= 13.2 the exact E2M1 * E4M3 product is formed in F16; with CUDA
->= 13.4 on SM100/SM103, PTX 9.4's packed E2M1 x E4M3 multiply rounds it directly
-(bitwise identical, seven instead of twelve instructions per eight values, on
-the loader warps that bound main-tile throughput). Final BF16
+>= 13.4 on SM100/SM103, PTX 9.4's dense packed E2M1 x E4M3 multiply rounds it
+directly, four contiguous nibbles per instruction (bitwise identical, two instead
+of twelve instructions per eight values, on the loader warps that bound
+main-tile throughput). Final BF16
 rows pass through 16 KiB of SMEM so global stores write whole lines; each warp
 reads its staged rows before its predicated stores, and row sinks load before
 the correction task's first wait. Two metadata stages let the next tile's row
@@ -388,11 +389,12 @@ and host overhead; these are not model-token latencies.
 Prims-TS against FlashInfer's TRTLLM-GEN DSv4 sparse MLA decode
 (`trtllm_batch_decode_sparse_mla_dsv4(..., backend="trtllm-gen")`). Warm CUDA
 Graph replay, 32 calls per replay, symmetric ABBA order, 30 samples per arm;
-median us per call. Both arms ran in one process on one B200 (148 SMs), launched
-with PDL and passed the shared FP64 componentwise bound first. Each request has
-128 SWA rows plus `K` main rows selected from a 32768-token context; H64/D512,
-HND, sinks enabled, `bmm1_scale=512**-0.5`. Toolchain: PyTorch 2.11.0+cu128,
-CuTe-DSL 4.8.0 (bundled CUDA 13.4).
+us per call, the mean of two runs' medians. In each run both arms ran in one
+process on one B200 (148 SMs), launched with PDL and passed the shared FP64
+componentwise bound first. Each request has 128 SWA rows plus `K` main rows
+selected from a 32768-token context; H64/D512, HND, sinks enabled,
+`bmm1_scale=512**-0.5`. Toolchain: PyTorch 2.11.0+cu128, CuTe-DSL 4.8.0
+(bundled CUDA 13.4).
 
 Both arms run E4M3 x E4M3 QK and PV MMAs on the same E4M3 Q and SWA. TRTLLM-GEN
 accepts only KV of Q's dtype, so its main pool is dense E4M3 (512 B/token)
@@ -401,15 +403,16 @@ holding exactly the values Prims-TS stages on chip from its packed FP4 pool
 
 | Batch | K=512 Prims-TS | K=512 TRTLLM-GEN | K=128 Prims-TS | K=128 TRTLLM-GEN | K=0 Prims-TS | K=0 TRTLLM-GEN |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 8.06 | 8.61 | 6.68 | 6.08 | 4.69 | 5.09 |
-| 4 | 8.07 | 9.18 | 6.81 | 6.35 | 5.12 | 5.50 |
-| 16 | 11.32 | 10.93 | 7.01 | 6.58 | 5.17 | 5.66 |
-| 24 | 11.84 | 12.48 | 7.10 | 6.66 | 5.22 | 5.75 |
-| 32 | 12.28 | 14.04 | 7.21 | 7.13 | 5.33 | 5.98 |
-| 64 | 13.05 | 17.46 | 7.95 | 8.63 | 6.00 | 7.24 |
-| 128 | 15.26 | 15.54 | 9.36 | 10.77 | 7.19 | 9.19 |
-| 149 | 26.74 | 25.24 | 15.80 | 16.30 | 11.32 | 13.18 |
-| 256 | 31.88 | 28.39 | 16.47 | 17.34 | 11.92 | 14.23 |
+| 1 | 7.80 | 8.43 | 6.54 | 6.17 | 4.83 | 5.16 |
+| 4 | 7.85 | 8.72 | 6.65 | 6.43 | 5.06 | 5.44 |
+| 16 | 11.00 | 10.42 | 6.82 | 6.69 | 5.07 | 5.57 |
+| 24 | 11.35 | 12.47 | 6.89 | 6.94 | 5.16 | 5.64 |
+| 32 | 11.73 | 13.53 | 6.98 | 7.00 | 5.19 | 5.87 |
+| 64 | 12.61 | 17.51 | 7.71 | 8.52 | 5.93 | 7.17 |
+| 128 | 14.53 | 15.51 | 9.12 | 10.63 | 7.10 | 9.11 |
+| 149 | 25.33 | 24.96 | 15.77 | 16.07 | 11.59 | 13.37 |
+| 256 | 30.29 | 28.33 | 16.03 | 17.27 | 11.78 | 14.12 |
 
-TRTLLM-GEN is faster at K=512 for B=16 and B >= 149 and at K=128 for B <= 32;
-Prims-TS is faster for every other measured shape.
+TRTLLM-GEN is faster at K=512 for B=16 and B >= 149 and at K=128 for B <= 16;
+Prims-TS is faster for every other measured shape, though at K=128 for B=24
+and B=32 only by 0.3-0.7%, within the variation between B200s.
