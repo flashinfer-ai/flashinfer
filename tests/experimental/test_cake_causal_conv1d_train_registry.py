@@ -86,8 +86,17 @@ CHANNELS = (
 # 262143 / 262144: both sides of the sm_107a token-floored backward program's floor.
 TOKENS = (1, 1000, 65536, 98304, 147456, 250340, 262143, 262144)
 # The deterministic package's programs this package does not have: the row-group backward program of route ``bwd``
-# on sm_107a (264 <= C < 512).  Every other record pairs with this package's at the same route position.
-DET_ONLY = frozenset({"cake_causal_conv1d_det_train_50aa818e2b2338fb34a4"})
+# on sm_107a (264 <= C < 512) and the SM-wide row-group programs of route ``bwd`` on sm_100a, sm_103a and sm_107a
+# (channel bands of 264 <= C < 512, from a token floor).  Every other record pairs with this package's at the same route
+# position.
+DET_ONLY = frozenset(
+    {
+        "cake_causal_conv1d_det_train_50aa818e2b2338fb34a4",
+        "cake_causal_conv1d_det_train_e057357c655024d4ff1d",
+        "cake_causal_conv1d_det_train_baca4c969c783d07d81f",
+        "cake_causal_conv1d_det_train_5ca7515dd2118dd96241",
+    }
+)
 
 
 @contextmanager
@@ -127,8 +136,12 @@ def _pairs(role: str):
 
 
 def _channels(registry, name: str, arch: str) -> int | None:
+    """The lowest channel threshold of a program's rule on ``arch``: a deterministic program the det-only programs
+    split into several channel bands runs here from the first of them."""
+
     rule = registry.select_rule(registry.MODULES[name])
-    return None if rule is None else rule["channels"].get(arch)
+    value = None if rule is None else rule["channels"].get(arch)
+    return value[0] if isinstance(value, list) else value
 
 
 def _bands():
@@ -260,8 +273,12 @@ def test_backward_records_are_one_launch_with_accumulators() -> None:
         )
         # A twin keeps the deterministic rule but on the architecture of its channel-band program.
         det_rule = det_jit.select_rule(det)
+        if det_rule is not None:
+            channels = {
+                a: _channels(det_jit, det_name, a) for a in det_rule["channels"]
+            }
+            det_rule = {**det_rule, "channels": channels}
         if name in twins:
-            det_rule = {**det_rule, "channels": {**det_rule["channels"]}}
             det_rule["channels"][twins[name]] = _channels(cake_jit, name, twins[name])
         assert cake_jit.select_rule(record) == det_rule, label
         rule = dict(record["workspace_rule"])

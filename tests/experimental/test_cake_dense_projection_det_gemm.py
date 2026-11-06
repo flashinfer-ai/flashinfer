@@ -17,6 +17,7 @@ limitations under the License.
 import ast
 import contextlib
 import dataclasses
+import gc
 import re
 import threading
 from collections import OrderedDict
@@ -41,6 +42,8 @@ CTA_GROUP = cake_backend.CTA_GROUP
 CTA_ROWS_CHOICES = cake_backend.CTA_ROWS_CHOICES
 EPI_WARPS = cake_backend.EPI_WARPS
 ROUTER_SPLITS = cake_backend.ROUTER_SPLITS
+ROUTER_SPLIT_RULES = cake_backend.ROUTER_SPLIT_RULES
+router_splits = cake_backend.router_splits
 ROW_RULES = cake_backend.ROW_RULES
 SK_DUMMY_BASE = cake_backend.SK_DUMMY_BASE
 SK_MIN_ITERS = cake_backend.SK_MIN_ITERS
@@ -3195,20 +3198,23 @@ def test_round33_rules_plan_like_the_cake_launcher(T):
     # 2 sm_100a keys (the 5120 -> 17408 weight gradient: test_gb_t_exact_wgrad_rules_plan_their_programs); their round 8
     # adds one sm_100a key and one sm_103a key (the 16384 -> 6144 forward: test_gb_t_exact_rules_plan_their_programs)
     # and re-values two round-6 keys; their round 9 adds two sm_103a keys (the 12288 -> 4096 forward:
-    # test_gb_t_exact_rules_plan_their_programs) and re-values the two sm_103a round-6 keys;
+    # test_gb_t_exact_rules_plan_their_programs) and re-values the two sm_103a round-6 keys; their round 10
+    # adds one sm_100a and two sm_103a keys (the 4096 -> 12288 input gradient:
+    # test_gb_t_exact_rules_plan_their_programs);
     # the 4096 -> 1024 fp32 weight gradient adds one sm_107a T-exact key at T 16384 (the T 16231 key's rule:
     # test_sm107a_t16384_wgrad_key_plans_the_t16231_rule)
     assert (
         len(ROW_RULES)
-        == 109 + 79 + 86 + 1 + 6 + 26 + 34 + 16 + 10 + 4 + 4 + 2 + 4 + 2 + 2 + 2 + 1
+        == 109 + 79 + 86 + 1 + 6 + 26 + 34 + 16 + 10 + 4 + 4 + 2 + 4 + 2 + 2 + 2 + 3 + 1
     )
     assert (
         sum(k[0] == "sm_100a" for k in ROW_RULES)
-        == 51 + 79 + 8 + 4 + 2 + 2 + 2 + 2 + 2 + 1
+        == 51 + 79 + 8 + 4 + 2 + 2 + 2 + 2 + 2 + 1 + 1
     )
     assert sum(k[0] == "sm_107a" for k in ROW_RULES) == 58 + 6 + 26 + 34 + 1
     assert (
-        sum(k[0] == "sm_103a" for k in ROW_RULES) == 86 + 1 + 8 + 6 + 2 + 2 + 2 + 1 + 2
+        sum(k[0] == "sm_103a" for k in ROW_RULES)
+        == 86 + 1 + 8 + 6 + 2 + 2 + 2 + 1 + 2 + 2
     )
     assert ARCH_RULE_DEFAULTS == {
         "sm_107a": {"pro": 7},
@@ -5555,6 +5561,98 @@ def test_router_planner_refuses_a_misaligned_out_of_a_single_split_row_major_sto
     assert plan_router_fp32_det_gemm(G.t(), X, _offset_out(N, K, 1))[0].splits == 6
 
 
+def test_router_split_rules_are_measured_windows_and_resolve_by_device():
+    """Every ``ROUTER_SPLIT_RULES`` count names a measured device class (``sm_100a`` / ``sm_103a`` at 148 or 152
+    SMs) and a ``kk`` / ``nn_t`` row in the T 16129-16384 window; ``router_splits`` returns it inside the window
+    and the layout's default outside it, for another SM count or N, and without a device."""
+    assert ROUTER_SPLIT_RULES
+    for (arch, sm_count, layout, H), windows in ROUTER_SPLIT_RULES.items():
+        assert arch in ("sm_100a", "sm_103a") and sm_count in (148, 152), arch
+        assert layout in ("kk", "nn_t") and H in (4096, 5120, 6144), layout
+        for lo, hi, splits in windows:
+            assert (lo, hi) == (16129, 16384) and splits >= 1
+            assert splits != ROUTER_SPLITS[layout]
+            for T in (lo, 16172, 16231, hi):
+                M, K = (T, H) if layout == "kk" else (H, T)
+                assert router_splits(layout, M, 256, K, arch, sm_count) == splits
+            for T in (lo - 1, hi + 1):
+                M, K = (T, H) if layout == "kk" else (H, T)
+                assert (
+                    router_splits(layout, M, 256, K, arch, sm_count)
+                    == ROUTER_SPLITS[layout]
+                )
+            M, K = (16231, H) if layout == "kk" else (H, 16231)
+            assert router_splits(layout, M, 256, K, arch, 160) == ROUTER_SPLITS[layout]
+            assert (
+                router_splits(layout, M, 128, K, arch, sm_count)
+                == ROUTER_SPLITS[layout]
+            )
+            assert router_splits(layout, M, 256, K) == ROUTER_SPLITS[layout]
+            assert (
+                router_splits(layout, M, 256, K, "sm_107a", sm_count)
+                == ROUTER_SPLITS[layout]
+            )
+    assert router_splits("kn", 16231, 4096, 256, "sm_100a", 152) == ROUTER_SPLITS["kn"]
+    # a planner call on CPU tensors has no device: the layout's default count at every table row
+    for (_, _, layout, H), ((lo, _, _), *_) in ROUTER_SPLIT_RULES.items():
+        X, G = torch.empty(lo, H), torch.empty(lo, 256)
+        if layout == "kk":
+            A, B, out = X, torch.empty(256, H).t(), torch.empty(lo, 256)
+        else:
+            A, B, out = G.t(), X, torch.empty(256, H)
+        assert plan_router_fp32_det_gemm(A, B, out)[0].splits == ROUTER_SPLITS[layout]
+
+
+def test_router_split_rules_rows_plan_rerun_bit_exact_and_match_fp64_reference():
+    """On a device with ``ROUTER_SPLIT_RULES`` rows: the forward / weight-gradient row plans the table's count without
+    a caller's ``splits`` (prepared and eager), reruns bit for bit, meets the router budget against the FP64 reference
+    (rel_fro, forward top-8 agreement)."""
+    if not _device_supported():
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            f"(compute capability {_registered_capabilities()})"
+        )
+    facts = cake_backend.device_facts(torch.device("cuda"))
+    keys = [k for k in ROUTER_SPLIT_RULES if k[:2] == (facts.arch, facts.sm_count)]
+    if not keys:
+        pytest.skip(
+            f"no ROUTER_SPLIT_RULES row for {facts.arch} at {facts.sm_count} SMs"
+        )
+    for _, _, layout, H in keys:
+        op = "fwd" if layout == "kk" else "wgrad"
+        (lo, hi, splits), *_ = ROUTER_SPLIT_RULES[
+            (facts.arch, facts.sm_count, layout, H)
+        ]
+        v = _router_inputs(op, 16231, seed=SEED + 23, K=H)
+        plan, *_ = plan_router_fp32_det_gemm(v["A"], v["B"], v["out"])
+        _require_program(plan.template)
+        assert (plan.layout, plan.splits) == (layout, splits)
+        cake_backend.clear_convenience_caches()
+        prepared = prepare_router_fp32_det_gemm(v["A"], v["B"], v["out"])
+        assert prepared.splits == splits
+        first = prepared.launch().clone()
+        prepared.launch()
+        torch.cuda.synchronize()
+        assert torch.equal(first, v["out"])
+        if op == "fwd":
+            eager = cake_backend.router_det_forward(v["X"], v["W"])
+        else:
+            eager = cake_backend.router_det_wgrad(v["G"], v["X"])
+        torch.cuda.synchronize()
+        assert torch.equal(eager, first)
+        expected = torch.matmul(v["A"].double(), v["B"].double())
+        rel_fro = float((first.double() - expected).abs().norm() / expected.norm())
+        assert bool(torch.isfinite(first).all()) and rel_fro <= ROUTER_REL_FRO_MAX, (
+            rel_fro
+        )
+        if op == "fwd":
+            ref_top = torch.topk(expected, 8, dim=1).indices.sort(dim=1).values
+            top = torch.topk(first.double(), 8, dim=1).indices.sort(dim=1).values
+            assert int((top != ref_top).any(dim=1).sum()) == 0
+        del v, expected, first, eager
+        torch.cuda.empty_cache()
+
+
 def test_split_fp32_to_bf16x3_is_exact_and_allocation_free_in_place():
     g = torch.Generator().manual_seed(SEED)
     src = torch.randn(64, 96, generator=g) * torch.logspace(-3, 3, 96)
@@ -6676,7 +6774,8 @@ def test_registry_fallback_decodes_the_nearest_generated_program(monkeypatch):
 # 5120 -> 512 forwards, at T 16231 / 16384; round 4: the 5120 -> 17408 input gradient; round 5: the sm_100a
 # 12288 -> 4096 forward; round 6: the 17408 -> 5120 forward, the ragged rule's program; round 8: its form with the tall
 # epilogue released by row half on sm_100a; round 9: the same form on sm_103a, and the sm_103a 12288 -> 4096
-# forward at T 16231 / 16384) name their T-exact key and its program.
+# forward at T 16231 / 16384; round 10: the 4096 -> 12288 input gradient at T 16384 on sm_100a and at
+# T 16231 / 16384 on sm_103a) name their T-exact key and its program.
 # ---------------------------------------------------------------------------
 # fmt: off
 MEASURED_SHAPE_ROWS = (
@@ -6739,7 +6838,7 @@ MEASURED_SHAPE_ROWS = (
     (('sm_100a', False, True, False, False, False, 4096, 4096, None), 16231, 152, 'dense_proj_det_gemm_kn_n256_ht_cg_pro15'),
     (('sm_100a', False, True, False, False, False, 4096, 4096, None), 16384, 152, 'dense_proj_det_gemm_kn_n256_ht_cg_pro15'),
     (('sm_100a', False, True, False, False, False, 4096, 12288, None), 16231, 152, 'dense_proj_det_gemm_kn_n256_m256_ov_ht_cg_pro7'),
-    (('sm_100a', False, True, False, False, False, 4096, 12288, None), 16384, 152, 'dense_proj_det_gemm_kn_n256_m256_ov_ht_cg_pro7'),
+    (('sm_100a', False, True, False, False, False, 4096, 12288, 16384), 16384, 152, 'dense_proj_det_gemm_kn_n256_m256_ht_cg_or_pro7'),
     (('sm_100a', False, True, False, False, False, 5120, 32, None), 16231, 152, 'dense_proj_det_gemm_kn_n256_ht_tma2_lw_pro15'),
     (('sm_100a', False, True, False, False, False, 5120, 32, None), 16384, 152, 'dense_proj_det_gemm_kn_n256_ht_tma2_lw_pro15'),
     (('sm_100a', False, True, False, False, False, 5120, 48, None), 16231, 152, 'dense_proj_det_gemm_kn_n256_ht_tma2_lw_pro15'),
@@ -6918,8 +7017,8 @@ MEASURED_SHAPE_ROWS = (
     (('sm_103a', False, True, False, False, False, 4096, 1024, None), 16384, 152, 'dense_proj_det_gemm_kn_n256_tma1_w8rs'),
     (('sm_103a', False, True, False, False, False, 4096, 4096, None), 16231, 152, 'dense_proj_det_gemm_kn_n256_ht_cg_pro15'),
     (('sm_103a', False, True, False, False, False, 4096, 4096, None), 16384, 152, 'dense_proj_det_gemm_kn_n256_ht_cg_pro15'),
-    (('sm_103a', False, True, False, False, False, 4096, 12288, None), 16231, 152, 'dense_proj_det_gemm_kn_n256_m256_ov_ht_cg_pro7'),
-    (('sm_103a', False, True, False, False, False, 4096, 12288, None), 16384, 152, 'dense_proj_det_gemm_kn_n256_m256_ov_ht_cg_pro7'),
+    (('sm_103a', False, True, False, False, False, 4096, 12288, 16231), 16231, 152, 'dense_proj_det_gemm_kn_n256_m256_ht_cg_or_pro7'),
+    (('sm_103a', False, True, False, False, False, 4096, 12288, 16384), 16384, 152, 'dense_proj_det_gemm_kn_n256_m256_ht_cg_or_pro7'),
     (('sm_103a', False, True, False, False, False, 5120, 32, None), 16231, 152, 'dense_proj_det_gemm_kn_n256_ht_tma2_lw_pro15'),
     (('sm_103a', False, True, False, False, False, 5120, 32, None), 16384, 152, 'dense_proj_det_gemm_kn_n256_ht_tma2_lw_pro15'),
     (('sm_103a', False, True, False, False, False, 5120, 48, None), 16231, 152, 'dense_proj_det_gemm_kn_n256_ht_tma2_lw_pro15'),
@@ -7170,8 +7269,8 @@ def test_sm103a_inherits_the_sm100a_rules_where_it_has_none():
             # an own sm_103a rule of the row at these dims wins over the parent's: the GB T-exact keys of the 6144 x 2048
             # rows and of the 16384 -> 6144 forward at T 16231 over the sm_100a ragged rules, the ragged 4096 -> 48 rule
             # over the sm_100a T-exact keys;
-            # an own T-exact key wins over the row's own ragged rule (the 5120 -> 17408 input gradient, the
-            # 17408 -> 5120 forward and the 12288 -> 4096 forward at T 16231)
+            # an own T-exact key wins over the row's own ragged rule (the 5120 -> 17408 and 4096 -> 12288 input
+            # gradients, the 17408 -> 5120 forward and the 12288 -> 4096 forward at T 16231)
             src = (arch_of,) + key
             own_exact = ("sm_103a",) + key[:5] + dims
             if arch_of == "sm_103a" and M is None and own_exact in ROW_RULES:
@@ -8262,7 +8361,9 @@ def test_eight_warp_form_rules_plan_their_programs(arch, T, monkeypatch):
 # program with the tall epilogue released by row half and the column-grouped raster in 8-column-tile groups, in place of
 # the ragged rule's overlapped half-tail program); round 9 moves the sm_103a 17408 -> 5120 keys the same way and adds
 # the sm_103a 12288 -> 4096 forward at T 16231 / 16384 (that form in 8-column-tile groups, in place of the ragged rule's
-# overlapped half-tail program in 16-column-tile groups).
+# overlapped half-tail program in 16-column-tile groups); round 10 adds the 4096 -> 12288 input gradient at T 16384 on
+# sm_100a and at T 16231 / 16384 on sm_103a (that form in 16-column-tile groups, in place of the ragged rule's overlapped
+# half-tail program in the same groups).
 GB_T_EXACT_ROWS = {
     ("sm_100a", True, 2048, 16384): (
         (16172, 16231),
@@ -8336,6 +8437,14 @@ GB_T_EXACT_ROWS = {
         (16231, 16384),
         "dense_proj_det_gemm_kk_n256_m256_ht_cg_or_pro7",
     ),
+    ("sm_100a", True, 4096, 12288): (
+        (16384,),
+        "dense_proj_det_gemm_kn_n256_m256_ht_cg_or_pro7",
+    ),
+    ("sm_103a", True, 4096, 12288): (
+        (16231, 16384),
+        "dense_proj_det_gemm_kn_n256_m256_ht_cg_or_pro7",
+    ),
 }
 # The GB T-exact rows whose keys keep the ragged rule's program and change only its raster group (round 6: the
 # 17408 -> 5120 forward in 12-column-tile groups, the ragged rule's 8; sm_103a only since round 8, none since
@@ -8371,7 +8480,8 @@ def test_gb_t_exact_rules_plan_their_programs(arch, monkeypatch):
     with the ragged rule's program in 12-column-tile raster groups; round 8: on sm_100a the tall
     epilogue released by row half, and the 16384 -> 6144 forward at T 16231 with that form in 8-column-tile groups;
     round 9: the same form on the sm_103a 17408 -> 5120 forward, and the sm_103a 12288 -> 4096 forward at
-    T 16231 / 16384 in 8-column-tile groups)
+    T 16231 / 16384 in 8-column-tile groups; round 10: the same form on the 4096 -> 12288 input gradient
+    at T 16384 on sm_100a and at T 16231 / 16384 on sm_103a in 16-column-tile groups)
     plan their program at their T on every SM count of the architecture's parts, with whole K per output tile like
     the row's plan without the key (another program, or for round 6 the same program at another raster group);
     one token more or less plans that plan.  The sm_103a 4096 -> 48 input gradient
@@ -9257,6 +9367,12 @@ def _plan_template(v, **knobs):
     return plan.template
 
 
+def _device_template(v, **knobs):
+    """The template a K1 binding of the views ``v`` runs on their device: the plan for the device's own architecture
+    (``_plan_template`` plans for the planner's default architecture), SM count and L2 size."""
+    return _plan_template(v, arch=arch_for(v["out"].device), **knobs)
+
+
 @pytest.mark.parametrize("row, op, out_dtype, T", GPU_ROWS)
 def test_projection_rows_match_fp64_reference(row, op, out_dtype, T):
     if not _device_supported():
@@ -9478,7 +9594,7 @@ def test_convenience_path_reuses_its_planned_launch_without_allocation():
     X = torch.randn(T, K, device=device, generator=g).to(torch.bfloat16)
     W = (torch.randn(N, K, device=device, generator=g) * K**-0.5).to(torch.bfloat16)
     out = torch.empty(T, N, device=device, dtype=torch.bfloat16)
-    _require_program(_plan_template(dict(A=X, B=W.t(), out=out)))
+    _require_program(_device_template(dict(A=X, B=W.t(), out=out)))
     facts = cake_backend.device_facts(device)
     assert facts is cake_backend.device_facts(torch.device("cuda", facts.index))
     assert (facts.sm_count, facts.l2_bytes) == (_sm_count(), _l2_bytes())
@@ -9575,6 +9691,263 @@ def test_convenience_path_replays_a_stream_k_row_bit_exact():
     )
 
 
+class _RecordingModule:
+    """A loaded module stand-in: its entry records ``(module name, arguments)`` (CPU binding tests)."""
+
+    def __init__(self, name: str, calls: list):
+        self.name, self.calls = name, calls
+
+    def __getattr__(self, entry):
+        return lambda *args: self.calls.append((self.name, args))
+
+
+def _cpu_k1_entry_points(monkeypatch, arch="sm_103a"):
+    """CPU stand-ins for the K1 entry points (nothing is loaded or launched): the device facts of a 152-SM part, the
+    device and the raw stream 7 of every call, the dummies on the CPU, stand-in modules whose entries record their
+    arguments, the FFI conversion as the identity and fresh caches.  Returns ``(calls, made)``: the recorded launches
+    and the stream contexts made."""
+    calls, made = [], []
+    facts = cake_backend.DeviceFacts(
+        index=0, arch=arch, sm_count=152, l2_bytes=126 << 20
+    )
+    monkeypatch.setattr(cake_backend.tvm_ffi, "from_dlpack", lambda t, **_: t)
+    monkeypatch.setattr(cake_backend, "device_facts", lambda device=None: facts)
+    monkeypatch.setattr(cake_backend, "arch_for", lambda device=None: arch)
+    monkeypatch.setattr(cake_backend, "require_arch", lambda device: arch)
+    monkeypatch.setattr(cake_backend, "_same_cuda_device", lambda A, B, out: out.device)
+    monkeypatch.setattr(cake_backend, "_cuda_index", lambda device=None: 0)
+    monkeypatch.setattr(cake_backend, "_current_raw_stream", lambda index: 7)
+    monkeypatch.setattr(
+        cake_backend, "_dummy_key", lambda device, dtype, tag=None: ("cpu", dtype, tag)
+    )
+    monkeypatch.setattr(cake_backend, "_DUMMIES", {})
+
+    def stream_context(index, raw=None):
+        made.append((threading.get_ident(), index, raw))
+        return contextlib.nullcontext()
+
+    monkeypatch.setattr(cake_backend, "_ffi_stream_context", stream_context)
+    monkeypatch.setattr(
+        cake_backend,
+        "load_cake_dense_projection_det_gemm_module",
+        lambda name, a: _RecordingModule(name, calls),
+    )
+    for name in ("_K1_CACHE", "_K2_CACHE", "_SWAP_CACHE", "_K1_BOUND_CACHE"):
+        monkeypatch.setattr(cake_backend, name, OrderedDict())
+    monkeypatch.setattr(cake_backend, "_ARENAS", {})
+    monkeypatch.setattr(cake_backend, "_STREAM_CONTEXTS", {})
+    return calls, made
+
+
+def _same_launch_arguments(got: tuple, want: tuple, module_name: str) -> None:
+    """A bound launch's arguments are the convenience path's: the same view geometry for a TMA operand, the same data
+    pointer and dtype (and a contiguous tensor) for a pointer argument, the same values otherwise."""
+    kinds = [
+        kind for kind, _ in cake_jit.arg_plan_of(cake_backend.MODULES[module_name])
+    ]
+    assert len(got) == len(want) == len(kinds)
+    for i, (g, w, kind) in enumerate(zip(got, want, kinds, strict=True)):
+        if isinstance(w, torch.Tensor):
+            assert isinstance(g, torch.Tensor), i
+            if kind == "buffer":
+                assert (g.data_ptr(), g.dtype) == (w.data_ptr(), w.dtype), i
+                assert g.is_contiguous(), i
+            else:
+                assert (tuple(g.shape), g.stride(), g.data_ptr(), g.dtype) == (
+                    tuple(w.shape),
+                    w.stride(),
+                    w.data_ptr(),
+                    w.dtype,
+                ), i
+        else:
+            assert type(g) is type(w) and g == w, (i, g, w)
+
+
+def test_k1_entry_points_launch_the_bound_launch_of_their_key(monkeypatch):
+    """Once a key is bound, the K1 entry points launch it straight from the key: no planning and no convenience call,
+    the arguments of the convenience path's launch of the same call (fresh tensors of the key's geometry rebound), the
+    stream context of a (thread, device, stream) made once.  The arena's workspace is converted again after a growth;
+    tensors that alias keep their key unbound (the convenience path); ``clear_convenience_caches`` drops the bindings,
+    their arena references and the stream contexts."""
+    calls, made = _cpu_k1_entry_points(monkeypatch)
+    bf16, T = torch.bfloat16, 1000
+    X, W, G = (
+        torch.randn(T, 4096).to(bf16),
+        torch.randn(128, 4096).to(bf16),
+        torch.randn(T, 128).to(bf16),
+    )
+    out_f, out_d, out_w = (
+        torch.empty(T, 128, dtype=bf16),
+        torch.empty(T, 4096, dtype=bf16),
+        torch.empty(128, 4096),
+    )
+
+    def run():
+        assert cake_backend.projection_det_forward(X, W, out_f) is out_f
+        assert cake_backend.projection_det_dgrad(G, W, out_d) is out_d
+        assert cake_backend.projection_det_wgrad(G, X, out_w) is out_w
+        assert cake_backend.dense_projection_det_gemm(X, W.t(), out_f) is out_f
+
+    def same_calls(got, want):
+        assert len(got) == len(want)
+        for (name, args), (want_name, want_args) in zip(got, want, strict=True):
+            assert name == want_name
+            _same_launch_arguments(args, want_args, name)
+
+    # the convenience path (no device index for the entry points' binding) plans every call; the second run's
+    # launches (the arena at its grown size) are the reference
+    monkeypatch.setattr(cake_backend, "_entry_index", lambda sources: -1)
+    run()
+    calls.clear()
+    run()
+    want = list(calls)
+    assert len(want) == 4 and len(cake_backend._K1_CACHE) == 3
+    assert not cake_backend._K1_BOUND_CACHE
+    # the first call of each key binds the cached planned launch, then launches it
+    monkeypatch.setattr(cake_backend, "_entry_index", lambda sources: 0)
+    calls.clear()
+    made.clear()
+    run()
+    same_calls(calls, want)
+    assert len(cake_backend._K1_CACHE) == 3
+    bound = list(cake_backend._K1_BOUND_CACHE.values())
+    assert len(bound) == 4 and all(type(b) is cake_backend._BoundGemm for b in bound)
+    (arena,) = cake_backend._ARENAS.values()
+    assert arena.refs == 3 + 4  # the cached entries and the bindings
+    assert all(b.state[0] == arena.version for b in bound)
+
+    # a bound key goes from the key to the launch: no planning, no convenience call
+    def planning(*args, **kwargs):
+        raise AssertionError("planning path")
+
+    monkeypatch.setattr(cake_backend, "_cached_gemm", planning)
+    monkeypatch.setattr(cake_backend, "_launch_cached_gemm", planning)
+    calls.clear()
+    run()
+    same_calls(calls, want)
+    assert len(made) == 1
+    # fresh tensors of the key's geometry are rebound
+    other = torch.empty_like(out_f)
+    assert cake_backend.projection_det_forward(X, W, other) is other
+    pointers = {a.data_ptr() for a in calls[-1][1] if isinstance(a, torch.Tensor)}
+    assert other.data_ptr() in pointers and out_f.data_ptr() not in pointers
+    # a growth of the arena: the bound launches convert its workspace again
+    kinds = {kind for b in bound for _, kind in b.workspace}
+    assert kinds
+    with cake_backend._PLAN_LOCK:
+        for kind in kinds:
+            arena.require(kind, arena.buffers[kind].numel() + 4096)
+    assert all(b.state == (-1, None) for b in bound)
+    calls.clear()
+    run()
+    for b, (_, args) in zip(bound, calls, strict=True):
+        assert b.state[0] == arena.version
+        assert all(args[i] is arena.buffers[kind] for i, kind in b.workspace)
+    # another thread makes its own stream context of the same (device, stream)
+    worker = threading.Thread(target=run)
+    worker.start()
+    worker.join()
+    assert len(made) == 2 and made[0][0] != made[1][0] and made[0][1:] == made[1][1:]
+    cake_backend.clear_convenience_caches()
+    assert not cake_backend._K1_BOUND_CACHE and not cake_backend._STREAM_CONTEXTS
+    assert cake_backend._ARENAS == {} and not cake_backend._K1_CACHE
+    # tensors that alias (``W`` starts at ``X``): the key stays unbound and the convenience path launches
+    monkeypatch.undo()
+    calls, made = _cpu_k1_entry_points(monkeypatch)
+    monkeypatch.setattr(cake_backend, "_entry_index", lambda sources: 0)
+    assert cake_backend.projection_det_forward(X, X[:128], out_f) is out_f
+    assert list(cake_backend._K1_BOUND_CACHE.values()) == [False, False]
+    assert len(calls) == 1
+    # the key does not record aliasing: a call of that geometry takes the convenience path as well
+    assert cake_backend.projection_det_forward(X, W, out_f) is out_f
+    assert len(cake_backend._K1_BOUND_CACHE) == 2 and len(calls) == 2
+    (arena,) = cake_backend._ARENAS.values()
+    assert arena.refs == 1  # the cached entry; an unbound key holds no reference
+
+
+# GPU_ROWS cases the bound-launch test runs: a forward, an input gradient, an fp32 weight gradient and a swapped
+# stream-K weight gradient.
+_BOUND_ROWS = (
+    ("kv_a", "fwd", "bf16", 257),
+    ("kv_a", "dgrad", "bf16", 1001),
+    ("kv_a", "wgrad", "f32", 257),
+    ("indexer_hw", "wgrad", "bf16", 1001),
+)
+
+
+def test_k1_entry_points_bound_launch_is_bit_exact():
+    """On the device the K1 entry points' bound launches give the bits of the convenience path's launch of the same
+    call: on the first call of a key, on fresh outputs of a bound key (no allocation) and after a growth of the arena
+    (the workspace converted again); the slice counters are zero after the launches."""
+    if not _device_supported():
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            f"(compute capability {_registered_capabilities()})"
+        )
+    device = torch.device("cuda")
+    arch = arch_for(device)
+    cases = []
+    for i, (row, op, out_dtype, T) in enumerate(_BOUND_ROWS):
+        v = _make_inputs("proj", row, op, out_dtype, T, seed=SEED + 61 + i)
+        _require_program(_device_template(v))
+        cases.append((op, v))
+
+    def convenience(op, v):
+        out = torch.empty_like(v["out"])
+        if op != "wgrad":
+            return cake_backend._launch_cached_gemm(v["A"], v["B"], out)
+        A, B, t = cake_backend.wgrad_views(
+            v["G"], v["X"], arch=arch, out_f32=out.dtype == torch.float32
+        )
+        return cake_backend._launch_cached_gemm(
+            A, B, out, transposed_out=t, sk="auto", cta_rows=None
+        )
+
+    def entry(op, v, out):
+        if op == "fwd":
+            return cake_backend.projection_det_forward(v["X"], v["W"], out)
+        if op == "dgrad":
+            return cake_backend.projection_det_dgrad(v["G"], v["W"], out)
+        return cake_backend.projection_det_wgrad(v["G"], v["X"], out)
+
+    cake_backend.clear_convenience_caches()
+    want = [convenience(op, v) for op, v in cases]
+    got = [entry(op, v, torch.empty_like(v["out"])) for op, v in cases]
+    torch.cuda.synchronize()
+    for (_op, v), w in zip(cases, want, strict=True):
+        _check(w.t() if v.get("transposed") else w, v["A"].double() @ v["B"].double())
+    assert all(torch.equal(a, b) for a, b in zip(got, want, strict=True))
+    entries = list(cake_backend._K1_BOUND_CACHE.values())
+    assert len(entries) == 4 and all(
+        type(b) is cake_backend._BoundGemm for b in entries
+    )
+    # fresh outputs of the bound keys: no allocation, the same bits
+    fresh = [torch.empty_like(w) for w in want]
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_stats()
+    for (op, v), out in zip(cases, fresh, strict=True):
+        entry(op, v, out)
+    torch.cuda.synchronize()
+    after = torch.cuda.memory_stats()
+    assert after["allocation.all.allocated"] == before["allocation.all.allocated"]
+    assert all(torch.equal(a, b) for a, b in zip(fresh, want, strict=True))
+    # a growth of the arena: the bound launches convert its workspace again and keep the bits
+    (arena,) = cake_backend._ARENAS.values()
+    with cake_backend._PLAN_LOCK:
+        for kind in ("k1_ws", "k1_counters"):
+            arena.require(kind, arena.buffers[kind].numel() + 4096)
+    for (op, v), out in zip(cases, fresh, strict=True):
+        out.fill_(float("nan"))
+        entry(op, v, out)
+    torch.cuda.synchronize()
+    assert all(b.state[0] == arena.version for b in entries)
+    assert all(torch.equal(a, b) for a, b in zip(fresh, want, strict=True))
+    counters = arena.buffers["k1_counters"].view(torch.int32)
+    assert int(torch.count_nonzero(counters)) == 0
+    cake_backend.clear_convenience_caches()
+    assert not cake_backend._K1_BOUND_CACHE and cake_backend._ARENAS == {}
+
+
 def test_convenience_path_memory_is_bounded_across_token_counts():
     """A ragged token count (a new T every step) must not grow the memory the convenience path holds: the
     router entries of 23 distinct T share one arena per (device, stream), so the memory held after the loop is
@@ -9599,6 +9972,7 @@ def test_convenience_path_memory_is_bounded_across_token_counts():
 
     def held_after(T_values):
         cake_backend.clear_convenience_caches()
+        gc.collect()  # device tensors that only cyclic garbage of earlier tests still holds are not held here
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         base = torch.cuda.memory_allocated()

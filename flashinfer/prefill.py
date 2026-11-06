@@ -2966,6 +2966,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
             Whether to enable CUDA graph capture for the prefill kernels, if enabled, the
             auxiliary data structures will be stored in provided buffers. The ``batch_size``
             cannot change during the lifecycle of this wrapper when CUDAGraph is enabled.
+            With ``backend="auto"``, the first successful FA2/FA3 plan fixes the
+            backend for subsequent plans so captured scheduling metadata stays
+            compatible. Inputs requiring a different backend need a new wrapper.
 
         qo_indptr_buf : Optional[torch.Tensor]
             The user reserved buffer to store the ``qo_indptr`` array, the size of the buffer
@@ -3161,6 +3164,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._requested_backend = backend
         self._backend = backend
         self._plan_info = None
+        self._cuda_graph_backend: Optional[str] = None
         self._cached_module = None
         self._seq_lens_kv = None
         self._seq_lens_q = None
@@ -3224,6 +3228,58 @@ class BatchPrefillWithPagedKVCacheWrapper:
             device="cpu",
             pin_memory=True,
         )
+
+    def _determine_auto_backend(
+        self,
+        qo_indptr_host: torch.Tensor,
+        pos_encoding_mode: int,
+        use_fp16_qk_reduction: bool,
+        use_custom_mask: bool,
+        q_data_type: torch.dtype,
+        kv_data_type: torch.dtype,
+        head_dim_qk: int,
+        head_dim_vo: int,
+    ) -> str:
+        """Resolve paged planning and sizing without changing cached plan state."""
+        backend = determine_attention_backend(
+            self.device,
+            pos_encoding_mode,
+            use_fp16_qk_reduction,
+            use_custom_mask,
+            q_data_type,
+            kv_data_type,
+            head_dim_qk=head_dim_qk,
+            head_dim_vo=head_dim_vo,
+        )
+        fp8_query = q_data_type in (torch.float8_e4m3fn, torch.float8_e5m2)
+        if self._cuda_graph_backend is not None:
+            # FA2 and FA3 overwrite the same integer workspace with different
+            # schedules. A captured kernel retains pointers into its old layout.
+            if (self._cuda_graph_backend == "fa3" and backend != "fa3") or (
+                self._cuda_graph_backend == "fa2"
+                and fp8_query
+                and not (
+                    q_data_type == kv_data_type == torch.float8_e4m3fn
+                    and get_compute_capability(self.device) == (12, 0)
+                )
+            ):
+                raise ValueError(
+                    f"CUDA graph backend {self._cuda_graph_backend!r} cannot serve "
+                    "these inputs; create a new wrapper for a different backend."
+                )
+            return self._cuda_graph_backend
+
+        # FA3 uses a fixed query tile; FA2 is faster for short non-FP8 queries
+        # on H20. Reuse the host metadata already needed by plan/workspace_size
+        # instead of launching another CUDA reduction and synchronizing .item().
+        if (
+            backend == "fa3"
+            and not fp8_query
+            and qo_indptr_host.numel() > 1
+            and int((qo_indptr_host[1:] - qo_indptr_host[:-1]).max().item()) <= 64
+        ):
+            return "fa2"
+        return backend
 
     @flashinfer_api
     def workspace_size(
@@ -3472,13 +3528,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
             module = self._jit_module
         else:
             if backend == "auto":
-                backend = determine_attention_backend(
-                    self.device,
+                backend = self._determine_auto_backend(
+                    qo_indptr_host,
                     PosEncodingMode[pos_encoding_mode].value,
                     use_fp16_qk_reduction,
                     use_custom_mask,
                     q_data_type,
                     kv_data_type,
+                    head_dim_qk,
+                    head_dim_vo,
                 )
             if backend == "cudnn":
                 raise NotImplementedError(
@@ -3724,8 +3782,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
         _check_workspace_buffer_alignment(
             self._int_workspace_buffer, "int_workspace_buffer"
         )
-        # every plan() decides the specialized verify kernel afresh
-        self._eagle_verify_fp8kv_sm90_state = None
         q_data_type = canonicalize_torch_dtype(q_data_type)
         if kv_data_type is None:
             kv_data_type = q_data_type
@@ -3748,6 +3804,36 @@ class BatchPrefillWithPagedKVCacheWrapper:
             head_dim_vo = head_dim_qk
         if fixed_split_size is None:
             fixed_split_size = -1
+
+        # Reject incompatible graph replans before changing any accepted plan state.
+        qo_indptr = qo_indptr.contiguous()
+        qo_indptr_host = qo_indptr.to("cpu")
+        auto_backend = None
+        if self._requested_backend == "auto":
+            if use_token_head_sf:
+                if self._cuda_graph_backend == "fa3":
+                    raise ValueError(
+                        "CUDA graph backend 'fa3' cannot serve use_token_head_sf; "
+                        "create a new wrapper with backend='fa2'."
+                    )
+            elif self._jit_module is None:
+                auto_backend = self._determine_auto_backend(
+                    qo_indptr_host,
+                    PosEncodingMode[pos_encoding_mode].value,
+                    use_fp16_qk_reduction,
+                    custom_mask is not None
+                    or packed_custom_mask is not None
+                    or (
+                        self.is_cuda_graph_enabled and self._custom_mask_buf is not None
+                    ),
+                    q_data_type,
+                    kv_data_type,
+                    head_dim_qk,
+                    head_dim_vo,
+                )
+
+        # Reset the specialized kernel only after checking backend compatibility.
+        self._eagle_verify_fp8kv_sm90_state = None
         self._head_dim_qk = head_dim_qk
         self._head_dim_vo = head_dim_vo
 
@@ -3802,7 +3888,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
             )
 
         # Normalized: the planner and kernels read these as raw pointers (#5260).
-        qo_indptr = qo_indptr.contiguous()
         paged_kv_indptr = paged_kv_indptr.contiguous()
         paged_kv_indices = paged_kv_indices.contiguous()
         paged_kv_last_page_len = paged_kv_last_page_len.contiguous()
@@ -3843,8 +3928,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._token_pos_in_items_len = token_pos_in_items_len
         self._max_item_len_ptr = max_item_len_ptr
 
-        # NOTE(Zihao): only required if qo_indptr/paged_kv_indptr are device tensors
-        qo_indptr_host = qo_indptr.to("cpu")
         self._qo_indptr_last = int(qo_indptr_host[-1])
         total_num_rows = self._qo_indptr_last
         if max_token_per_sequence is not None:
@@ -3864,22 +3947,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             self._max_kv_len = max_sequence_kv
 
         # Per-token/head scales already pin FA2; preserve that plan-time choice.
-        if (
-            self._requested_backend == "auto"
-            and self._jit_module is None
-            and not use_token_head_sf
-        ):
-            self._backend = determine_attention_backend(
-                self.device,
-                PosEncodingMode[pos_encoding_mode].value,
-                use_fp16_qk_reduction,
-                packed_custom_mask is not None
-                or (self.is_cuda_graph_enabled and self._custom_mask_buf is not None),
-                q_data_type,
-                kv_data_type,
-                head_dim_qk=head_dim_qk,
-                head_dim_vo=head_dim_vo,
-            )
+        if auto_backend is not None:
+            self._backend = auto_backend
             if (
                 self._backend == "fa2"
                 # A retained FA2 capture also needs its CPU-generated schedule
@@ -4467,6 +4536,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     self._cudnn_plan = _CudnnPrefillPlan.prepare(
                         metadata, q_data_type, self.device, previous_cudnn_plan
                     )
+
+        if (
+            self.is_cuda_graph_enabled
+            and self._requested_backend == "auto"
+            and self._jit_module is None
+            and self._backend in ("fa2", "fa3")
+        ):
+            # A failed plan must not establish the backend for future captures.
+            self._cuda_graph_backend = self._backend
 
     @flashinfer_api
     def prewarm_paged_kv_stride_variant(self, variant: str = "independent") -> None:

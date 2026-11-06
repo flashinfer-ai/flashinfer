@@ -23,12 +23,24 @@ Every entry takes ``deterministic: bool = True``:
   objects of ``flashinfer.cake_gdn_det_train_kcp``: bitwise reproducible at
   the same topology.
 * ``deterministic=False`` runs the non-deterministic package
-  ``flashinfer.experimental.cake_gdn_train_kcp``: the same contract and the
-  same accuracy budgets, not bitwise equal to the deterministic route
+  ``flashinfer.experimental.cake_gdn_train_kcp``: the same entry points and
+  the same accuracy budgets, not bitwise equal to the deterministic route
   (run-to-run reproducible today for a fixed plan and partition; later
-  versions may use unordered reductions).
+  versions may use unordered reductions); it also takes the
+  non-deterministic-only ``save_mode`` values below.
 * With ``torch.use_deterministic_algorithms(True)``, ``deterministic=False``
   runs the deterministic route and warns once per process.
+
+Non-deterministic-only ``save_mode`` values (``ND_ONLY_SAVE_MODES``):
+``"light_akk"`` (the light saved set plus the forward's BF16 ``Akk`` tape;
+the backward's prep replay reads the tape instead of solving the block
+inverse; it needs ``use_qk_l2norm_in_kernel=True``).  Only
+``deterministic=False`` takes them.  The deterministic route refuses them
+with a ``ValueError`` that names ``deterministic=False``: on every compute
+entry and in ``gdn_saved_bytes_kcp`` / ``gdn_workspace_bytes_kcp``, as a
+keyword, a knob or an options field, and also for a ``deterministic=False``
+call that torch's deterministic algorithms route there.  The deterministic
+route takes ``"light"`` and ``"full"`` only.
 
 The mode is never stored in the context: a context, a partition and the byte
 queries of either route describe the same plan.  A saved set is read only by
@@ -88,6 +100,26 @@ _FEATURE = "Cake context-parallel packed GDN chunked training (SM100/SM103/SM107
 
 # The default scale of the contract: ``head_dim ** -0.5`` with head dimension 128.
 DEFAULT_SCALE = 128**-0.5
+
+
+# ``save_mode`` values that only the non-deterministic package takes (opt-in tiers; see the module docstring).
+ND_ONLY_SAVE_MODES = ("light_akk",)
+
+
+def _refuse_nd_only(entry: str, options: Any, kw: dict) -> None:
+    """On the deterministic route: refuse a non-deterministic-only ``save_mode`` given as a keyword or knob (``kw``)
+    or as an options field (a mapping or an options instance)."""
+    modes = [kw.get("save_mode")]
+    if isinstance(options, dict):
+        modes.append(options.get("save_mode"))
+    elif options is not None and dataclasses.is_dataclass(options):
+        modes.append(getattr(options, "save_mode", None))
+    for mode in modes:
+        if isinstance(mode, str) and mode in ND_ONLY_SAVE_MODES:
+            raise ValueError(
+                f"{entry}: save_mode={mode!r} is a non-deterministic-only tier: it needs deterministic=False "
+                "(with torch's deterministic algorithms off); the deterministic route refuses it"
+            )
 
 
 # The routed modules are imported on first use and cached: a call does not repeat the import.
@@ -278,7 +310,8 @@ def chunk_gdn_fwd_kcp(
     workspace : WorkspaceKcp, optional
         A reused caller-held workspace (``gdn_workspace_bytes_kcp``); without one the call allocates its own.
     options, **knobs
-        Keyword-only options (``save_mode`` ``"light"`` | ``"full"``, ``boundary_mode`` ``"saved"`` | ``"replay"``,
+        Keyword-only options (``save_mode`` ``"light"`` | ``"full"`` | ``"light_akk"`` (non-deterministic route
+        only, see the module docstring), ``boundary_mode`` ``"saved"`` | ``"replay"``,
         ``exchange`` ``"a2a"`` | ``"ring"``, ``save_transfer``, ``offset_class`` ``"fla"`` | ``"fp32"``, ``layout`` ``"tma"`` |
         ``"copy"``, ``group_reduce`` ``"fused"`` | ``"host"``, ``graph`` ``"off"`` | ``"replay"``,
         ``reuse_recompute_tapes`` ``"auto"`` (default) | ``True`` | ``False`` (the deterministic route: ``False`` with
@@ -295,6 +328,7 @@ def chunk_gdn_fwd_kcp(
     route's backward only).
     """
     if _deterministic(deterministic, "chunk_gdn_fwd_kcp"):
+        _refuse_nd_only("chunk_gdn_fwd_kcp", options, knobs)
         return _det().chunk_gdn_det_fwd_kcp(
             q,
             k,
@@ -365,6 +399,7 @@ def chunk_gdn_bwd_kcp(
     budgets, not bitwise equal to the deterministic route, on the non-deterministic one.
     """
     if _deterministic(deterministic, "chunk_gdn_bwd_kcp"):
+        _refuse_nd_only("chunk_gdn_bwd_kcp", options, knobs)
         if saved is not None and not isinstance(saved, _det().SavedDetKcp):
             raise ValueError(
                 "chunk_gdn_bwd_kcp: the saved set comes from the non-deterministic route "
@@ -501,6 +536,7 @@ def chunk_gdn_kcp(
     forward runs the forward's route as long as the torch deterministic-algorithms setting does not change in between.
     """
     if _deterministic(deterministic, "chunk_gdn_kcp"):
+        _refuse_nd_only("chunk_gdn_kcp", options, {"save_mode": save_mode})
         return _det().chunk_gdn_det_kcp(
             q,
             k,
@@ -542,8 +578,12 @@ def gdn_workspace_bytes_kcp(
 ) -> int:
     r"""Caller-held workspace bytes of one rank for ``(ctx, H_qk, HV)`` (exchange pools, staging, tapes): the most
     the workspace binds in the forward or the backward of the given options (``reuse_recompute_tapes`` as a keyword;
-    the per-phase terms are ``gdn_workspace_layout_kcp`` of the package) on the route ``deterministic`` selects."""
+    the per-phase terms are ``gdn_workspace_layout_kcp`` of the package) on the route ``deterministic`` selects.
+    ``save_mode="light_akk"`` gives the figure of a call outside a checkpoint: under
+    ``torch.utils.checkpoint(use_reentrant=False)`` that call runs as ``"light"`` and binds the ``save_mode="light"``
+    figure, so a checkpointed ``"light_akk"`` layer is sized with ``save_mode="light"``."""
     if _deterministic(deterministic, "gdn_workspace_bytes_kcp"):
+        _refuse_nd_only("gdn_workspace_bytes_kcp", kw.get("options"), kw)
         return _det().gdn_det_workspace_bytes_kcp(ctx, H_qk=H_qk, HV=HV, **kw)
     return _pkg().gdn_workspace_bytes_kcp(ctx, H_qk=H_qk, HV=HV, **kw)
 
@@ -555,6 +595,7 @@ def gdn_saved_bytes_kcp(
     r"""Saved-set bytes of one layer on this rank (``save_mode``, ``save_transfer`` as keywords), counted per
     crossing fragment, on the route ``deterministic`` selects."""
     if _deterministic(deterministic, "gdn_saved_bytes_kcp"):
+        _refuse_nd_only("gdn_saved_bytes_kcp", kw.get("options"), kw)
         return _det().gdn_det_saved_bytes_kcp(ctx, H_qk=H_qk, HV=HV, **kw)
     return _pkg().gdn_saved_bytes_kcp(ctx, H_qk=H_qk, HV=HV, **kw)
 

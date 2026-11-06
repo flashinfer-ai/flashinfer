@@ -1970,6 +1970,38 @@ def plan_dx_slices(
     return ()
 
 
+# Under the zero-gradient row skip (:data:`DCNT_BASES`) the smallest dX slice count of a chunk, per architecture (an
+# architecture not listed keeps the slice rule's counts).  The one-slice plain store has no counted form: it computes
+# every row of its chunk, a chunk past the live rows included, while the K-sliced reduction's counted form skips the
+# work items past the chunk's count.  So a counted plan runs its one-slice chunks as two-slice reductions
+# (:func:`counted_dx_slices`).  sm_107a keeps the slice rule's counts until measured.
+DX_COUNTED_MIN_SLICES_BY_ARCH: dict[str, int] = {"sm_100a": 2, "sm_103a": 2}
+
+
+def counted_dx_slices(
+    slices: tuple[int, ...],
+    *,
+    arch: Optional[str],
+    dx_max_slices: int,
+    k_iters: int,
+    tuning: dict[str, dict[str, Any]],
+) -> tuple[int, ...]:
+    """The per-chunk dX slice counts of a plan under the zero-gradient row skip: ``slices`` (:func:`plan_dx_slices`)
+    with every count below ``arch``'s :data:`DX_COUNTED_MIN_SLICES_BY_ARCH` entry raised to it.  ``slices`` itself
+    when ``arch`` has no entry, when the record serves fewer slices (``dx_max_slices``), when that many slices do not
+    all hold one of the ``k_iters`` K steps (:func:`dx_slices_fit`) or when ``tuning`` pins the dX slice count."""
+    least = DX_COUNTED_MIN_SLICES_BY_ARCH.get(arch, 1) if arch is not None else 1
+    if (
+        least <= 1
+        or not slices
+        or "k_slices" in tuning.get("dx", {})
+        or int(dx_max_slices) < least
+        or dx_slices_fit(least, k_iters) != least
+    ):
+        return slices
+    return tuple(max(int(s), least) for s in slices)
+
+
 def _dx_fill(values: dict[str, Any]) -> None:
     """Fill the rows of ``dX_acc`` the call's K-sliced reduction launches add into with :data:`DX_FILL_VALUE` (host side,
     one ``fill_`` launch on the caller's stream: capturable, no allocation)."""
@@ -4194,7 +4226,9 @@ def make_plan(
     ``logprob_lbl`` (a log-probability plan of a record that registers them) run the entry's logits GEMM arms
     (:attr:`Plan.logprob_dz`, :attr:`Plan.logprob_lbl`).  ``logprob_keep`` (a log-probability plan, a registered
     program): the kept-logits plan (:class:`_KeptPlan`), which runs neither arm.  ``dcnt`` (a log-probability plan
-    with the dz arm, a registered program): the zero-gradient row skip's ``_dcnt`` forms (:attr:`Plan.dcnt`), the
+    with the dz arm, a registered program): the zero-gradient row skip's ``_dcnt`` forms (:attr:`Plan.dcnt`), each
+    chunk's dX at the architecture's counted slice count at least (:func:`counted_dx_slices`; the slice rule's counts
+    when the plan with those would have no counted forms), the
     last chunk's bf16 fused cast in the TMA epilogue's counted form where :func:`dw_cast_tma_rule` takes the TMA
     epilogue (``counted_tma_cast=False``, a record without that form: the shipped cast's counted form instead); off when
     a chunk takes a form without one (an explicitly pinned weight-gradient TMA epilogue or swapped dX tile)."""
@@ -4238,14 +4272,16 @@ def make_plan(
                     f"gemm_tuning dx split={explicit_f}: the split-tail form runs 1 .. W of a chunk's W wide dX items "
                     f"as half items; the chunk of {rows_c} rows has W = {wide}"
                 )
-    variants: tuple[ChunkVariants, ...] = ()
-    if arch is not None or tuning:
-        variants = tuple(
+
+    def variants_of(slices_: tuple[int, ...]) -> tuple[ChunkVariants, ...]:
+        if arch is None and not tuning:
+            return ()
+        return tuple(
             chunk_variants(
                 rows_c,
                 problem.hidden,
                 num_sms,
-                slices[i] if slices else 1,
+                slices_[i] if slices_ else 1,
                 geometry,
                 arch,
                 tuning,
@@ -4254,8 +4290,15 @@ def make_plan(
             )
             for i, (_, rows_c) in enumerate(chunks)
         )
-    # the zero-gradient row skip's counted forms: none for an explicitly pinned swapped dX tile or weight-gradient TMA
-    # epilogue (the swap rule itself serves the cross-entropy loss only)
+
+    def has_counted_forms(variants_: tuple[ChunkVariants, ...]) -> bool:
+        # none for an explicitly pinned swapped dX tile or weight-gradient TMA epilogue (the swap rule itself serves
+        # the cross-entropy loss only)
+        return not any(
+            v.dx_swab or v.dw_epi_store not in (None, "redsm") for v in variants_
+        )
+
+    # the zero-gradient row skip's counted forms
     dcnt = bool(
         dcnt
         and arch is not None
@@ -4263,10 +4306,25 @@ def make_plan(
         and logprob_dz
         and not logprob_keep
         and not hidden_count
-        and not any(
-            v.dx_swab or v.dw_epi_store not in (None, "redsm") for v in variants
-        )
     )
+    variants: Optional[tuple[ChunkVariants, ...]] = None
+    if dcnt:
+        # the counted plan's slices (:data:`DX_COUNTED_MIN_SLICES_BY_ARCH`) when that plan keeps the counted forms,
+        # else the slice rule's
+        raised = counted_dx_slices(
+            slices,
+            arch=arch,
+            dx_max_slices=dx_max_slices,
+            k_iters=int(problem.vocab) // int(geometry.k_block),
+            tuning=tuning,
+        )
+        if raised != slices:
+            raised_variants = variants_of(raised)
+            if has_counted_forms(raised_variants):
+                slices, variants = raised, raised_variants
+    if variants is None:
+        variants = variants_of(slices)
+    dcnt = dcnt and has_counted_forms(variants)
     if (
         variants
         and (not dcnt or counted_tma_cast)
@@ -7743,6 +7801,54 @@ def _scratch_slots(
     return tuple(name for name in _SCRATCH_SLOTS if name in read)
 
 
+# The log-probability backward's gradient accumulators and outputs (:meth:`_Binding.backward_logprob`).
+_GRADIENT_SLOTS = ("dx_acc", "dx_out", "dw_acc", "dw_out")
+
+
+def _gradients_at_first_dx(
+    slot_values: Callable[..., dict[str, Any]],
+    keys: tuple,
+    t: dict[str, Any],
+    plan: Plan,
+) -> bool:
+    """Whether a log-probability backward can make its gradient accumulators and outputs (:data:`_GRADIENT_SLOTS`)
+    right before the first dX GEMM key of ``keys`` (:func:`_before_first_dx`): the sequence has one and no key ahead of
+    it reads them.  Replayed once per binding on the runner's own tensors (like :func:`_scratch_slots`); a replay that
+    fails keeps them up front."""
+    first = next(
+        (i for i, key in enumerate(keys) if key[0].startswith("gemm_dx")), None
+    )
+    if first is None:
+        return False
+    recorder = _ReadRecorder(t)
+    try:
+        for key in keys[:first]:
+            slot_values(key[0], recorder, plan, key[1])
+    except Exception:  # fail safe: made up front
+        return False
+    return not (recorder.read & set(_GRADIENT_SLOTS))
+
+
+def _before_first_dx(
+    run_key: Callable[[Any], None], before_dx: Optional[Callable[[], None]]
+) -> tuple[Callable[[Any], None], Callable[[], None]]:
+    """``run_key`` that calls ``before_dx`` once right before the first dX GEMM key -- on the caller's stream:
+    :func:`side_stream_schedule` never moves a dX key -- and the call that runs it after the sequence when the sequence
+    had none (the host work it does follows the launches ahead of that key)."""
+    pending = [] if before_dx is None else [before_dx]
+
+    def run(key) -> None:
+        if pending and key[0].startswith("gemm_dx"):
+            pending.pop()()
+        run_key(key)
+
+    def finish() -> None:
+        if pending:
+            pending.pop()()
+
+    return run, finish
+
+
 @dataclass
 class _Binding:
     """One remembered input binding: templated launches (no tensor pinned) plus the plan."""
@@ -7775,6 +7881,9 @@ class _Binding:
     # returns (:func:`_scratch_slots`)
     forward_scratch: tuple = _SCRATCH_SLOTS
     backward_scratch: tuple = _SCRATCH_SLOTS
+    # the log-probability backward makes its gradient accumulators and outputs right before its first dX GEMM key
+    # (behind the row gathers and the recompute launch) instead of up front (:func:`_gradients_at_first_dx`)
+    backward_gradients_at_dx: bool = False
 
     @classmethod
     def from_runner(
@@ -7858,6 +7967,9 @@ class _Binding:
                 ("loss",) if plan.problem.entry == "loss" else (),
             ),
             backward_scratch=_scratch_slots(_slot_values, backward_run, t, plan),
+            backward_gradients_at_dx=_gradients_at_first_dx(
+                _slot_values, backward_run, t, plan
+            ),
         )
 
     def holds_no_tensor(self) -> bool:
@@ -7963,7 +8075,9 @@ class _Binding:
         t: dict[str, Any],
         dw_stream: str = "auto",
         fill_join: Optional[Any] = None,
+        before_dx: Optional[Callable[[], None]] = None,
     ) -> None:
+        """Run ``keys`` with the call's tensors ``t``; ``before_dx`` as in :func:`_before_first_dx`."""
         plan, launches = self.plan, self.launches
 
         def run_key(key) -> None:
@@ -7984,7 +8098,9 @@ class _Binding:
                 launch.prepare(*arguments)
             launch.entry(*arguments)
 
-        _run_keys(self.plan, self.device_index, keys, run_key, dw_stream, fill_join)
+        run, finish = _before_first_dx(run_key, before_dx)
+        _run_keys(self.plan, self.device_index, keys, run, dw_stream, fill_join)
+        finish()
 
     def forward(
         self,
@@ -8114,20 +8230,37 @@ class _Binding:
             else None
         )
         self._scratch(t, hidden, backward=True)
-        if plan.need_dx:
-            if join is None:
-                t["dx_acc"] = _filled_dx_acc(T, H, self.fill_rows, self.device)
-            if plan.dx_cast:
-                t["dx_out"] = torch.empty(
-                    (T, H), dtype=torch.bfloat16, device=self.device
+
+        def gradient_buffers() -> None:
+            if plan.need_dx:
+                if join is None:
+                    t["dx_acc"] = _filled_dx_acc(T, H, self.fill_rows, self.device)
+                if plan.dx_cast:
+                    t["dx_out"] = torch.empty(
+                        (T, H), dtype=torch.bfloat16, device=self.device
+                    )
+            if plan.need_dw:
+                if plan.dw_acc_needed:
+                    t["dw_acc"] = torch.empty(
+                        (V, H), dtype=torch.float32, device=self.device
+                    )
+                t["dw_out"] = torch.empty(
+                    (V, H), dtype=torch.bfloat16, device=self.device
                 )
-        if plan.need_dw:
-            if plan.dw_acc_needed:
-                t["dw_acc"] = torch.empty(
-                    (V, H), dtype=torch.float32, device=self.device
-                )
-            t["dw_out"] = torch.empty((V, H), dtype=torch.bfloat16, device=self.device)
-        self._launch(self.backward_run, t, dw_stream, join)
+
+        # The gradient accumulators and outputs (with the dX_acc fill) are made right before the first dX GEMM key,
+        # behind the row gathers and the recompute launch, which read none of them: a call of a few rows is host-bound
+        # up to its first GEMM, and those launches are no longer held back by this host work.  The same buffers, fill
+        # rows and stream order ahead of every launch that reads or writes them.  Without dX (the first gradient key
+        # is a dW GEMM, possibly on the dW side stream) or when a key ahead of the first dX GEMM reads them
+        # (:attr:`backward_gradients_at_dx`), they are made up front.
+        if plan.need_dx and self.backward_gradients_at_dx:
+            self._launch(
+                self.backward_run, t, dw_stream, join, before_dx=gradient_buffers
+            )
+        else:
+            gradient_buffers()
+            self._launch(self.backward_run, t, dw_stream, join)
         dx = (
             t.get("dx_out") if plan.dx_cast else t.get("dx_acc")
         )  # dx_cast=False: the caller finalizes the accumulator
@@ -8238,6 +8371,9 @@ class _TemperatureBinding(_Binding):
                 ("loss",) if plan.problem.entry == "loss" else (),
             ),
             backward_scratch=_scratch_slots(slot_values, backward_run, t, plan),
+            backward_gradients_at_dx=_gradients_at_first_dx(
+                slot_values, backward_run, t, plan
+            ),
         )
 
     # the rows of the call in progress, per thread (set and cleared around the inherited sequence)
@@ -8323,6 +8459,7 @@ class _TemperatureBinding(_Binding):
         t: dict[str, Any],
         dw_stream: str = "auto",
         fill_join: Optional[Any] = None,
+        before_dx: Optional[Callable[[], None]] = None,
     ) -> None:
         plan, launches = self.plan, self.launches
 
@@ -8346,9 +8483,11 @@ class _TemperatureBinding(_Binding):
                 launch.prepare(*arguments)
             launch.entry(*arguments)
 
+        run, finish = _before_first_dx(run_key, before_dx)
         _run_keys_temperature(
-            self.plan, self.device_index, keys, run_key, dw_stream, fill_join
+            self.plan, self.device_index, keys, run, dw_stream, fill_join
         )
+        finish()
 
 
 class _KeptBinding(_Binding):
@@ -8363,11 +8502,12 @@ class _KeptBinding(_Binding):
         t: dict[str, Any],
         dw_stream: str = "auto",
         fill_join: Optional[Any] = None,
+        before_dx: Optional[Callable[[], None]] = None,
     ) -> None:
         kept = t.get("logits_keep")
         if kept is None:
             # chunk 0's early launches, ahead of the kept views: chunk 0's view is the chunk buffer's first rows
-            super()._launch(keys, t, dw_stream, fill_join)
+            super()._launch(keys, t, dw_stream, fill_join, before_dx)
             return
         plan, launches = self.plan, self.launches
 
@@ -8390,7 +8530,9 @@ class _KeptBinding(_Binding):
                 launch.prepare(*arguments)
             launch.entry(*arguments)
 
-        _run_keys(self.plan, self.device_index, keys, run_key, dw_stream, fill_join)
+        run, finish = _before_first_dx(run_key, before_dx)
+        _run_keys(self.plan, self.device_index, keys, run, dw_stream, fill_join)
+        finish()
 
     def forward_keep(
         self, X, W, labels, row_index=None, hidden=None, dw_stream: str = "auto"
@@ -9974,15 +10116,17 @@ def backward_logprob(
     # the call's plan has its counted forms (``order_rows``)
     skip = False
     scan = counts = None
+    # the fused dX finalize's valid-row mask (labels >= 0) of a call that reuses the forward's row index: one device
+    # comparison, no synchronization, formed in finish_dx behind the queued GEMMs (the call's first launches are not
+    # held back by it)
+    labels_mask = False
     if row_index is not _RECOUNT:
-        # the forward's valid-row index: the plan is known without a count (the valid-row mask of the fused dX finalize
-        # is one device comparison, no synchronization)
+        # the forward's valid-row index: the plan is known without a count
         if row_index is not None and not compact:
             raise ValueError("a valid-row index belongs to a compacted backward")
         skip = _zero_dlogp_skip(X.device, row_index, backend, dz_arm, need_dx, fused_dx)
-        row_valid = (
-            (labels >= 0) if (row_index is not None and fused_dx and not skip) else None
-        )
+        row_valid = None
+        labels_mask = row_index is not None and fused_dx and not skip
     else:
         hc = _hidden_count(
             problem,
@@ -10027,21 +10171,20 @@ def backward_logprob(
             return None
         if dx_cast:
             return scatter_rows(dx, row_index, T)
-        return finalize_dx(
-            dx, None, row_index, row_valid, T, backend=backend, scan=scan
-        )
+        valid = (labels >= 0) if labels_mask else row_valid
+        return finalize_dx(dx, None, row_index, valid, T, backend=backend, scan=scan)
 
     def order_rows(counted: bool) -> None:
         # the plan decides the skip: its counted forms order the rows (one partition launch); a plan without them runs
         # the shipped backward over the forward's row order (no partition, the fused finalize's valid-row mask)
-        nonlocal skip, row_index, lse, scan, counts, row_valid
+        nonlocal skip, row_index, lse, scan, counts, labels_mask
         skip = skip and counted
         if skip:
             row_index, lse, scan, counts = zero_dlogp_partition(
                 labels, dlogp, row_index, lse, problem.chunk
             )
         elif row_valid is None and row_index is not None and fused_dx:
-            row_valid = labels >= 0
+            labels_mask = True
 
     if backend == "cake" and cache.enabled:
         key = logprob_backward_binding_key(
@@ -10439,17 +10582,19 @@ def backward_logprob_temperature(
     # (``order_rows``)
     skip = False
     scan = counts = None
+    # the fused dX finalize's valid-row mask (labels >= 0) of a call that reuses the forward's row index: one device
+    # comparison, no synchronization, formed in finish_dx behind the queued GEMMs (the call's first launches are not
+    # held back by it)
+    labels_mask = False
     if row_index is not _RECOUNT:
-        # the forward's valid-row index: the plan is known without a count (the valid-row mask of the fused dX finalize
-        # is one device comparison, no synchronization)
+        # the forward's valid-row index: the plan is known without a count
         if row_index is not None and not compact:
             raise ValueError("a valid-row index belongs to a compacted backward")
         skip = tau is not None and _zero_dlogp_skip(
             X.device, row_index, backend, dz_arm, need_dx, fused_dx
         )
-        row_valid = (
-            (labels >= 0) if (row_index is not None and fused_dx and not skip) else None
-        )
+        row_valid = None
+        labels_mask = row_index is not None and fused_dx and not skip
     else:
         # a recount with a temperature takes the host count: the device-count recompute stores ``z`` for ``row_grad``,
         # which has no temperature form
@@ -10517,14 +10662,13 @@ def backward_logprob_temperature(
             return None
         if dx_cast:
             return scatter_rows(dx, row_index, T)
-        return finalize_dx(
-            dx, None, row_index, row_valid, T, backend=backend, scan=scan
-        )
+        valid = (labels >= 0) if labels_mask else row_valid
+        return finalize_dx(dx, None, row_index, valid, T, backend=backend, scan=scan)
 
     def order_rows(counted: bool) -> None:
         # :func:`backward_logprob`'s: the plan decides the skip (its counted forms order the rows, one partition
         # launch; a plan without them runs over the forward's row order); the temperature rows follow the order
-        nonlocal skip, row_index, lse, scan, counts, row_valid, tau_rows
+        nonlocal skip, row_index, lse, scan, counts, labels_mask, tau_rows
         skip = skip and counted
         if skip:
             row_index, lse, scan, counts = zero_dlogp_partition(
@@ -10533,7 +10677,7 @@ def backward_logprob_temperature(
             tau_rows = tau_rows_of(row_index)
             return
         if row_valid is None and row_index is not None and fused_dx:
-            row_valid = labels >= 0
+            labels_mask = True
         if tau_rows is None:
             tau_rows = tau_rows_of(row_index)
 

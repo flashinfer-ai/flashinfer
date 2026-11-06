@@ -48,11 +48,20 @@ points do not alert: they give the deterministic bits.
 What changes with `deterministic=False`:
 
 - `fwd`, `dgrad` and the weight gradient with the 256-wide k tile run this
-  package's copies of the deterministic programs, with the same host plan:
-  bitwise the deterministic outputs. The 256-wide k tile's `main_wave`
-  program is the same kernel rendered from a newer source: it takes two more
-  buffer arguments (`A_rows`, `B_rows`) that its sm_100a / sm_103a builds
-  never read, and it has no sm_107a build.
+  package's copies of the deterministic programs and host plan (but for the
+  sm_100a `dgrad` evict-first twin below): bitwise the deterministic outputs.
+  The 256-wide k tile's `main_wave` program is the same kernel rendered from a
+  newer source: it takes two more buffer arguments (`A_rows`, `B_rows`) that
+  its sm_100a / sm_103a builds never read, and it has no sm_107a build.
+- On sm_100a the data gradient also has an L2 evict-first twin of its wide
+  tile (`main_wide_ef`), this package's own build: the deterministic
+  package's sm_100a wide domain-scheduled program with the G loads and the
+  dX stores marked evict-first, so that each group's weights stay in L2. The
+  host takes it under the deterministic package's evict-first rule
+  (`dgrad_evict_first`: at least `dgrad_evict_first_min_rows` rows per group
+  on average and `K >= dgrad_evict_first_min_k`), with sm_100a added to
+  `dgrad_evict_first_archs`. The eviction priority changes no arithmetic: dX
+  is bitwise the deterministic package's.
 - The weight gradient with the 512-wide k tile runs builds of the
   deterministic package's k512 forms (`main`, `main_wave`, `main_halves`,
   `main_wave_halves`, `main_halves_k256t`) whose split tail -- the tiles of
@@ -275,6 +284,12 @@ same planner, constants and stage rules: grid, output tile, evict-first and
 3 / 3 head / tail twins, probed queue split, k tile, wave sync, accumulator
 release, k256 tail); see that package's README. Differences:
 
+- Data-gradient evict-first twin: `HOST_PLAN_CONSTANTS["dgrad_evict_first_archs"]`
+  lists sm_100a and sm_107a (the deterministic package: sm_107a). On sm_100a
+  `main_wide_ef` is this package's own build of the domain-scheduled wide
+  tile (same domain schedule and probed queue split as `main_wide`); on
+  sm_107a it is the copy of the deterministic A-collector twin.
+
 - Unordered tail (`plan_wgrad(..., unordered_tail=True)`): the 512-wide k
   tile on the architectures of `HOST_PLAN_CONSTANTS["unordered_tail_archs"]`
   (`wgrad_unordered_tail`; sm_100a, sm_103a and sm_107a) binds the builds that
@@ -312,13 +327,15 @@ tail-reduce programs are copies of the deterministic package's under this
 package's prefix (`cake_moe_grouped_gemm_<digest>`, the same digests), except
 that the 256-wide k tile's `main_wave` program is rendered from a newer source
 of the same kernel (two more, unused buffer arguments; sm_100a / sm_103a
-only); the 512-wide k tile's routes bind the unordered-tail builds.
+only) and that the data gradient's sm_100a `main_wide_ef` program is this
+package's own evict-first build of the deterministic wide domain-scheduled
+kernel; the 512-wide k tile's routes bind the unordered-tail builds.
 
 | feature | sm_100a | sm_103a | sm_107a |
 | --- | --- | --- | --- |
 | `fwd` / `dgrad` `main`, `main_wide` | domain schedule | domain schedule | static schedule (A collector on `main_wide`) |
 | `fwd` `main_wide_ef` / `main_wide_ts33` | - / - | - / yes | yes / - |
-| `dgrad` `main_wide_ef` / `main_wide_ts33` | - / - | - / yes | yes / - |
+| `dgrad` `main_wide_ef` / `main_wide_ts33` | yes (this package's build) / - | - / yes | yes / - |
 | `dgrad` probed queue split | yes | yes | - |
 | `wgrad` k256 `main` + ordered `tail_reduce` | yes | yes | yes |
 | `wgrad` k256 `main_wave` | yes | yes | - |

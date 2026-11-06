@@ -970,7 +970,8 @@ def test_batch4_whole_bucket_cells(monkeypatch, arch):
     192,2,1024 / 4096 / 16384 cells (tp1:kv_b) launch the A-resident form of the 256-wide grid-stride program
     (``gemm_tstore_k128_gs_ars``; the 1024 cell left the 192-wide tile for it); their staged-register rows keep the record's
     program.  sm_103a keeps its cells, but its 192,2,16384 rows M 4097..12288 and 16384 take the A-resident form
-    through ``DECODE_TABLE_M_RANGES`` (round 12 E).  Checked at both edges of each bucket, with the registry stubbed."""
+    through ``DECODE_TABLE_M_RANGES`` (round 12 E) and its 192,2,1024 rows the MMA-warp TMEM allocation twin of the
+    192-wide program (``ROUTE_TWINS``, round 13).  Checked at both edges of each bucket, with the registry stubbed."""
     monkeypatch.setattr(cb, "route_available", lambda arch, keys: True)
     monkeypatch.setattr(cb, "kernel_program", lambda arch, key: (key, ()))
     in_proj = _family_weight("tp8", "in_proj_qkvgfab")
@@ -1012,7 +1013,9 @@ def test_batch4_whole_bucket_cells(monkeypatch, arch):
             assert plan.grids[-1] == 2 * pairs == 148
         else:
             assert plan.kernels[-1] == (
-                "gemm_tstore_n192_k128" if cell == "192,2,1024" else "gemm_tstore_k128"
+                "gemm_tstore_n192_k128_prg"
+                if cell == "192,2,1024"
+                else "gemm_tstore_k128"
             ), (M, plan.kernels)
             assert not plan.gemm_gs
         rplan = cb.route_plan(kv_b, M, arch, SM_COUNT, None, **staged)

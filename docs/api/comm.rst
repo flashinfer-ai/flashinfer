@@ -667,11 +667,12 @@ for the full integration)::
         o_ = attention(q_, k_, v_)
         o = comm.gather_heads(o_)    # [B,S_global,H_local,D] -> [B,S_local,H,D]
 
-Existing callers can continue passing ``max_elems=...`` instead of
-``max_bytes=...``; the constructor multiplies it by ``dtype.itemsize``.
-Pass only one capacity argument. ``comm.max_elems`` remains available in the
-construction dtype, while ``comm.max_bytes`` is the byte capacity used by the
-new packed-chunk API.
+The v0.7.2 spelling ``max_elems=...`` (a capacity in elements of ``dtype``)
+is still accepted and converted to ``max_elems * dtype.itemsize`` bytes with a
+``DeprecationWarning``; it is deprecated since v0.7.3 and scheduled for
+removal in a future release. Pass exactly one capacity argument. ``comm.max_elems``,
+the v0.7.2 attribute, remains available in the construction dtype;
+``comm.max_bytes`` is the byte capacity used by the packed-chunk API.
 
 Preallocated outputs and NCCL staging can be reused across serialized calls::
 
@@ -773,6 +774,40 @@ Prepared QKV workspaces and ordinary staging workspaces are not interchangeable.
 .. autoclass:: UlyssesQKVWorkspace
     :members:
 
+Low-Precision Implementation Primitives
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The following internal helpers support numerical tests, trace definitions,
+and kernel benchmarks. They are not exported from ``flashinfer.comm``;
+applications should use the prepared ``UlyssesCommunicator`` QKV API above.
+
+.. currentmodule:: flashinfer.comm._ulysses_lowp
+
+.. autosummary::
+    :toctree: ../generated
+
+    capability
+    payload_spec
+    k_sum_v_amax
+    q_grouped_amax
+    k_grouped_amax
+    boundary_descriptors
+    merge_boundary_amax
+    k_boundary_minmax
+    derive_k_boundary_amax
+    zero_scale_and_padding
+    quant_q_into_payload
+    quant_kv_into_payload
+    quant_qkv_pack
+    unpack_for_sage
+    local_stats
+    finalize_stats
+    quant_and_pack
+    verify_duplicate_scale_slots
+    quant_v_fp8_with_scale
+
+.. currentmodule:: flashinfer.comm
+
 Head-Chunk Layout and Transport Primitives
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -855,16 +890,27 @@ count (``launches_per_call``).
 The producer build is selected per architecture and world size
 (``cake_qkv_norm_rope_exchange_overlap.PRODUCER_VARIANT_DEFAULT_BY_ARCH_WORLD``
 of the JIT loader): on SM100 a group of 8 ranks runs the build with wide
-operand loads and bulk row stores (``bulk_ow256``), a group of 4 ranks the
-build with wide operand loads (``ow256``); on SM103 groups of 8 and 4 ranks run
-``ow256``; on SM107 a group of 4 ranks runs the build with bulk row stores
-(``bulk``); groups of 2 ranks and SM90 run the baseline build.  Every build
-stores identical bits; the wide-load builds require 32-byte-aligned ``cos_sin``
-and norm-weight tensors (a misaligned view raises and names the opt-out).  The
+operand loads, bulk row stores and the fused multiply-add epilogue
+(``bulk_ow256_fma``), a group of 4 ranks the build with wide operand loads and
+the fused multiply-add epilogue (``ow256_fma``) and a group of 2 ranks the
+baseline build with the fused multiply-add epilogue (``fma``); on SM103 groups
+of 8 and 4 ranks run ``ow256_fma`` and groups of 2 ranks ``fma``; on SM107 a
+group of 4 ranks runs the build with bulk row stores (``bulk``); the other
+groups of 2 ranks and SM90 run the baseline build.  The ``fma`` builds contract
+the norm and RoPE multiply-adds into single-rounding fused multiply-adds, so
+their stored bits can differ from those of the builds without it; both agree
+within the kernel's accuracy tolerance, and the builds without the fused
+multiply-add epilogue store identical bits.  Every build requires ``cos_sin``
+and norm-weight tensors that start at 16-byte-aligned addresses, the wide-load
+builds at 32-byte-aligned ones (a misaligned view raises; for the 32-byte bases
+the error names the opt-out).  The
 environment variable ``FLASHINFER_QKV_EXCHANGE_PRODUCER_VARIANT`` (``auto`` /
 ``shipped`` / a delivered build name) overrides the selection per session,
-rank-uniformly; the baseline build stays delivered beside every variant, and a
-build that is not delivered for the session's tile width raises and names the
+rank-uniformly; the baseline build stays delivered beside every variant.  A
+default build that is not delivered for the session's tile width (the two-rank
+``fma`` build at a 128-column tile, for example hidden 768 with 6 heads over 2
+ranks) runs the baseline build instead; a build named by the environment
+variable that is not delivered for the tile width raises and names the
 delivered ones.  The host plan's group scaling follows the same keying
 (``cake_qkv_exchange_plan.GROUP_M_SCALE_DEFAULT_BY_ARCH_WORLD``): on SM100
 groups of 4 and 2 ranks and on SM103 every group size double the token-tile
@@ -880,8 +926,8 @@ producer once per destination run of its tile table (the first launch carrying
 the folded rendezvous); the threshold depends on the world size and the hidden
 size (``cake_qkv_exchange_plan.SHAPE_GATE_K_TABLE``: 8192, 16384 or 32768 rows,
 ``per_dest_k_table=0`` restores the single threshold of 16384 and an explicit
-``per_dest_large_m`` replaces the table).  On SM103 a group of 8 ranks runs a
-call whose destination band is not a multiple of 256 columns while every
+``per_dest_large_m`` replaces the table).  On SM103 and SM100 a group of 8 ranks
+runs a call whose destination band is not a multiple of 256 columns while every
 Q / K / V group is (for example hidden 3072) with at least 4096 rows per rank
 on the 256-column pair tile across band edges, each tile storing its two heads
 to their own destinations, as one persistent launch

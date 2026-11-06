@@ -92,10 +92,18 @@ def _separate_workspace_row_offset(
     row_idx: Int32,
     rows_per_split: Int32,
     cfg: cutlass.Constexpr[FmhaDecodeConfig],
+    requested_splits=None,
 ) -> Int64:
-    """Return a split/row offset without overflowing 32-bit products."""
+    """Return a split/row offset without overflowing 32-bit products.
 
-    return (logical_kv_idx * Int64(cfg.max_splits_kv) + Int64(split_idx)) * Int64(
+    Compact runtime splits pack partials by the launch fanout, matching the
+    producer's ``TmemCorrResource._gmem_partial_row_offset``.
+    """
+
+    split_stride = Int64(cfg.max_splits_kv)
+    if cutlass.const_expr(cfg.uses_compact_split_grid and requested_splits is not None):
+        split_stride = Int64(requested_splits)
+    return (logical_kv_idx * split_stride + Int64(split_idx)) * Int64(
         rows_per_split
     ) + Int64(row_idx)
 
@@ -264,6 +272,7 @@ def _reduce_exact_splits_body(
                     reduce_row_idx,
                     g_q_output_rows,
                     cfg,
+                    requested_splits=requested_splits,
                 )
                 stats_offset = workspace_row * Int64(
                     SEPARATE_REDUCTION_LSE_VALUES_PER_ROW * FP32_BYTES
@@ -662,6 +671,7 @@ def decode_gen_parallel_separate_reduction_kernel(
                     reduce_row_idx,
                     g_q_output_rows,
                     cfg,
+                    requested_splits=requested_splits,
                 )
                 stats_offset = workspace_row * Int64(
                     SEPARATE_REDUCTION_LSE_VALUES_PER_ROW * FP32_BYTES

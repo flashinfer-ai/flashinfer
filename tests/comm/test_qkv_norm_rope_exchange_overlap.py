@@ -256,6 +256,84 @@ def test_xband_plan_for_keeps_the_band_policy():
             plans.plan_for(small, "bshd", 0, arch=arch, xband=True)
 
 
+def test_hopper_bn128_tile_table():
+    """The 128-column tile table (``HOPPER_BN128_MAX_M_BY_ARCH_WORLD``: SM90 with 4 ranks at hidden 3072, up to 1024
+    rows): a row of the cell at or below the bound runs the 128-column tile with the band policy's tile order,
+    ``group_m`` and pair flag; a larger row, another cell and ``bn128_max_m=0`` keep the band tile; ``plan_row``
+    reads its gates with the band width."""
+
+    assert plans.HOPPER_BN128_MAX_M_BY_ARCH_WORLD == {("sm_90a", 4): {3072: 1024}}
+    assert plans.HOPPER_BN128_BN == 128
+    assert plans.hopper_bn128_max_m("sm_90a", 4, 3072) == 1024
+    for arch, world_size, hidden in (
+        ("sm_90a", 4, 4096),
+        ("sm_90a", 4, 6144),
+        ("sm_90a", 8, 3072),
+        ("sm_90a", 2, 3072),
+        ("sm_100a", 4, 3072),
+        ("sm_103a", 4, 3072),
+        ("sm_107a", 4, 3072),
+    ):
+        assert plans.hopper_bn128_max_m(arch, world_size, hidden) == 0
+    gates = plans.default_shape_gates("sm_90a", world_size=4)
+    for s_local, swapped in (
+        (1, True),
+        (256, True),
+        (1024, True),
+        (1025, False),
+        (2048, False),
+    ):
+        geometry = plans.Geometry(world_size=4, batch=1, s_local=s_local, hidden=3072)
+        assert plans.block_n_for(geometry) == 256
+        band_policy, band = plans.plan_for(
+            geometry,
+            "bshd",
+            1,
+            arch="sm_90a",
+            bn128_max_m=0,
+        )
+        policy, plan = plans.plan_for(geometry, "bshd", 1, arch="sm_90a")
+        assert band_policy.bn == band.bn == 256
+        assert policy.bn == plan.bn == (128 if swapped else 256)
+        assert (policy.order, policy.group_m, policy.pair) == (
+            band_policy.order,
+            band_policy.group_m,
+            band_policy.pair,
+        )
+        assert (plan.order, plan.group_m, plan.pair) == (
+            band.order,
+            band.group_m,
+            band.pair,
+        )
+        if swapped:
+            assert policy.reasons[:-1] == band_policy.reasons
+            assert "HOPPER_BN128_MAX_M_BY_ARCH_WORLD" in policy.reasons[-1]
+            assert plan.num_tiles == 2 * band.num_tiles
+        else:
+            assert policy == band_policy
+        verdict, row_policy, row_plan = plans.plan_row(
+            geometry, "bshd", 1, arch="sm_90a", gates=gates
+        )
+        assert verdict.bn == 256 and row_policy == policy and row_plan.bn == plan.bn
+        explicit_policy, _plan = plans.plan_for(
+            geometry, "bshd", 1, arch="sm_90a", bn128_max_m=1024
+        )
+        assert explicit_policy == policy
+    # The swapped plan writes every destination element once, like the band plan.
+    geometry = plans.Geometry(world_size=4, batch=1, s_local=200, hidden=3072)
+    for rank in range(4):
+        _policy, plan = plans.plan_for(geometry, "fused", rank, arch="sm_90a")
+        assert plan.bn == 128
+        counts = _destination_writes(plan)
+        per_dest = plan.M * 3 * geometry.h_local * HEAD_DIM
+        for dest in range(4):
+            assert int((counts[dest] == 1).sum()) == per_dest
+            assert int(counts[dest].max()) == 1
+    for bad in (-1, True, 1.5, plans.SHAPE_GATE_ALL_ROWS):
+        with pytest.raises(ValueError, match="bn128_max_m"):
+            plans.plan_for(geometry, "bshd", 0, arch="sm_90a", bn128_max_m=bad)
+
+
 def test_plan_policy_rules():
     small = plans.Geometry(world_size=8, batch=1, s_local=512, hidden=3072)
     assert plans.block_n_for(small) == 128
@@ -899,7 +977,7 @@ def test_shape_gates_resolution(monkeypatch):
 
 def test_shape_gate_k_table_and_xband_defaults():
     """The per-destination launch threshold by hidden size (``SHAPE_GATE_K_TABLE``; SM100 / SM103) and the
-    cross-destination-band gate (``XBAND_MIN_M_DEFAULT_BY_ARCH_WORLD``; SM103 with 8 ranks): the tables, their
+    cross-destination-band gate (``XBAND_MIN_M_DEFAULT_BY_ARCH_WORLD``; SM103 and SM100 with 8 ranks): the tables, their
     lookups and the verdicts ``gate_rows`` / ``plan_row`` derive from them."""
 
     assert plans.SHAPE_GATE_K_TABLE == {
@@ -910,7 +988,10 @@ def test_shape_gate_k_table_and_xband_defaults():
         ("sm_103a", 4): ((0, 32768), (6144, 16384)),
         ("sm_103a", 2): ((0, 32768), (4096, 16384)),
     }
-    assert plans.XBAND_MIN_M_DEFAULT_BY_ARCH_WORLD == {("sm_103a", 8): 4096}
+    assert plans.XBAND_MIN_M_DEFAULT_BY_ARCH_WORLD == {
+        ("sm_103a", 8): 4096,
+        ("sm_100a", 8): 4096,
+    }
     assert plans.XBAND_BN == plans.PAIR_BN == 256
     xb_fields = plans.TILE_FIELDS_XB
     assert xb_fields == (*plans.TILE_FIELDS, "dest1", "base_elem1")
@@ -1211,13 +1292,24 @@ def test_producer_key_grammar():
     """Producer route keys: ``producer_bn<bn>[_pair][_<variant>][_fold<phase>]``; ``parse_producer_key`` is the
     inverse and refuses every other spelling."""
 
-    assert loader.PRODUCER_VARIANTS == ("", "ow256", "bulk_ow256", "bulk")
+    assert loader.PRODUCER_VARIANTS == (
+        "",
+        "ow256",
+        "bulk_ow256",
+        "bulk",
+        "fma",
+        "ow256_fma",
+        "bulk_ow256_fma",
+    )
     assert loader.SHIPPED_VARIANT == ""
     assert loader.PRODUCER_VARIANT_OPERAND_LOAD_WIDTH == {
         "": 128,
         "ow256": 256,
         "bulk_ow256": 256,
         "bulk": 128,
+        "fma": 128,
+        "ow256_fma": 256,
+        "bulk_ow256_fma": 256,
     }
     assert loader.producer_key(256, True) == "producer_bn256_pair"
     assert loader.producer_key(128, False) == "producer_bn128"
@@ -1239,6 +1331,13 @@ def test_producer_key_grammar():
     assert (
         loader.fold_producer_key(256, True, 1, "bulk")
         == "producer_bn256_pair_bulk_fold1"
+    )
+    assert (
+        loader.producer_key(128, True, "bulk_ow256_fma")
+        == "producer_bn128_pair_bulk_ow256_fma"
+    )
+    assert (
+        loader.fold_producer_key(256, True, 0, "fma") == "producer_bn256_pair_fma_fold0"
     )
     parse = loader.parse_producer_key
     for block_n in plans.BLOCK_N_CHOICES:
@@ -1270,15 +1369,32 @@ def test_producer_key_grammar():
         loader.fold_producer_key(128, False, 2)
     with pytest.raises(ValueError, match="producer build variant"):
         loader.producer_key(128, False, "wide")
-    # Cross-destination-band builds: ``<variant>_xb`` of the 256-column pair tile only.
+    # Cross-destination-band builds: ``<variant>_xb`` of the 256-column pair tile only, on the staged row stores (a
+    # bulk build maps to the cross-destination-band build of its staged twin).
     assert loader.XBAND_SUFFIX == "xb" and loader.XBAND_BLOCK_N == plans.XBAND_BN
     assert (
         loader.xband_variant() == "xb" and loader.xband_variant("ow256") == "ow256_xb"
     )
+    assert (
+        loader.xband_variant("bulk_ow256") == "ow256_xb"
+        and loader.xband_variant("bulk") == "xb"
+    )
+    # The fused multiply-add builds keep their trailing ``fma`` token after ``xb``.
+    assert (
+        loader.xband_variant("fma") == "xb_fma"
+        and loader.xband_variant("ow256_fma") == "ow256_xb_fma"
+    )
+    assert loader.xband_variant("bulk_ow256_fma") == "ow256_xb_fma"
     for variant in loader.PRODUCER_VARIANTS:
         xb = loader.xband_variant(variant)
+        staged = loader.XBAND_STAGED_VARIANT[variant]
+        assert (
+            "bulk" not in staged
+            and loader.PRODUCER_VARIANT_OPERAND_LOAD_WIDTH[staged]
+            == (loader.PRODUCER_VARIANT_OPERAND_LOAD_WIDTH[variant])
+        )
         assert loader.is_xband_variant(xb) and not loader.is_xband_variant(variant)
-        assert loader.base_variant(xb) == variant == loader.base_variant(variant)
+        assert loader.base_variant(xb) == staged == loader.base_variant(staged)
         plain = loader.producer_key(256, True, xb)
         assert plain == f"producer_bn256_pair_{xb}"
         assert parse(plain) == (256, True, xb, None)
@@ -1310,8 +1426,9 @@ def test_producer_variant_default_table():
     table = loader.PRODUCER_VARIANT_DEFAULT_BY_ARCH_WORLD
     assert table == {
         "sm_90a": {2: "", 4: "", 8: ""},
-        "sm_100a": {2: "", 4: "ow256", 8: "bulk_ow256"},
-        "sm_103a": {2: "", 4: "ow256", 8: "ow256"},
+        # SM100 / SM103: the fused multiply-add epilogue builds
+        "sm_100a": {2: "fma", 4: "ow256_fma", 8: "bulk_ow256_fma"},
+        "sm_103a": {2: "fma", 4: "ow256_fma", 8: "ow256_fma"},
         # SM107: groups of 4 ranks run the bulk-row-store build (measured there); 2 ranks the baseline build
         "sm_107a": {2: "", 4: "bulk", 8: ""},
     }
@@ -1390,8 +1507,10 @@ def test_producer_variant_default_table():
 
 def test_producer_variant_resolution(monkeypatch):
     """Environment over the (architecture, world size) default: ``auto`` keeps the table, ``shipped`` selects the
-    baseline build, a delivered name selects that build; an undelivered build fails closed naming the environment
-    variable, the ``shipped`` opt-out and the delivered builds -- also when the default itself is not delivered."""
+    baseline build, a delivered name selects that build; an undelivered build named by the environment fails closed
+    naming the environment variable, the ``shipped`` opt-out and the delivered builds.  A default build that is
+    delivered for another tile width only yields to the baseline build of this one; a default build delivered for
+    no tile width (a table without the variant programs) fails closed."""
 
     if not loader.ROUTES:
         pytest.skip("program tables are filled by the exporter")
@@ -1408,6 +1527,11 @@ def test_producer_variant_resolution(monkeypatch):
                 continue
             for world_size in loader.SUPPORTED_WORLD_SIZES:
                 default = loader.default_producer_variant(arch, world_size)
+                delivered_elsewhere = any(
+                    loader.has_producer(arch, other, pair, default)
+                    for other in plans.BLOCK_N_CHOICES
+                    for pair in (False, True)
+                )
                 for value in (None, "auto", ""):
                     if value is None:
                         monkeypatch.delenv(env, raising=False)
@@ -1416,12 +1540,15 @@ def test_producer_variant_resolution(monkeypatch):
                     if default in delivered:
                         resolved = resolve(arch, world_size, block_n)
                         assert resolved == (default, "default")
+                    elif delivered_elsewhere and "" in delivered:
+                        resolved = resolve(arch, world_size, block_n)
+                        assert resolved == ("", "default")
                     else:
                         with pytest.raises(ValueError, match=f"{env}=shipped"):
                             resolve(arch, world_size, block_n)
                 monkeypatch.setenv(env, "shipped")
                 assert resolve(arch, world_size, block_n) == ("", "env")
-                for name in ("ow256", "bulk_ow256", "bulk"):
+                for name in loader.PRODUCER_VARIANTS[1:]:
                     monkeypatch.setenv(env, name)
                     if name in delivered:
                         assert resolve(arch, world_size, block_n) == (name, "env")
@@ -1463,6 +1590,121 @@ def test_producer_variant_resolution(monkeypatch):
                         assert resolve(arch, world_size, block_n) == ("", "default")
                     patched.setenv(env, "shipped")
                     assert resolve(arch, world_size, block_n) == ("", "env")
+
+
+def test_default_producer_variant_resolves_at_every_selectable_tile_width(monkeypatch):
+    """Every (architecture, world size) default resolves at every tile width ``block_n_for`` selects for a
+    supported geometry (1 to 16 heads per rank): to the default build where the route table delivers it for that
+    width, otherwise to the baseline build of the width, delivered with both rendezvous phases for every pair flag
+    the baseline build is delivered for.  The fallback cells are the ``block_n=128`` cells of the two-rank ``fma``
+    defaults and of the SM100 four-rank ``ow256_fma`` default (hidden 768 with 6 heads over 2 ranks is one)."""
+
+    if not loader.ROUTES:
+        pytest.skip("program tables are filled by the exporter")
+    monkeypatch.delenv(backend.PRODUCER_VARIANT_ENV, raising=False)
+    odd_band = plans.Geometry(world_size=2, batch=1, s_local=4096, hidden=768)
+    assert plans.block_n_for(odd_band) == 128
+    fallbacks = set()
+    for arch in loader.ROUTES:
+        for world_size in loader.supported_world_sizes(arch):
+            default = loader.default_producer_variant(arch, world_size)
+            widths = {
+                plans.block_n_for(
+                    plans.Geometry(
+                        world_size=world_size,
+                        batch=1,
+                        s_local=128,
+                        hidden=world_size * heads_per_rank * HEAD_DIM,
+                    )
+                )
+                for heads_per_rank in range(1, 17)
+            }
+            assert widths == set(plans.BLOCK_N_CHOICES)
+            for block_n in sorted(widths):
+                pairs = [
+                    pair
+                    for pair in (False, True)
+                    if loader.has_producer(arch, block_n, pair)
+                ]
+                if not pairs:
+                    # No build of this tile width on the architecture: every session of it refuses.
+                    continue
+                variant, source = backend.resolve_producer_variant(
+                    arch, world_size, block_n
+                )
+                assert source == "default"
+                here = any(
+                    loader.has_producer(arch, block_n, pair, default)
+                    for pair in (False, True)
+                )
+                assert variant == (default if here else loader.SHIPPED_VARIANT)
+                if variant != default:
+                    fallbacks.add((arch, world_size, block_n))
+                for pair in pairs:
+                    assert loader.has_producer(arch, block_n, pair, variant)
+                    assert loader.has_fold_producer(arch, block_n, pair, variant)
+    assert fallbacks == {
+        ("sm_100a", 2, 128),
+        ("sm_100a", 4, 128),
+        ("sm_103a", 2, 128),
+    }
+    assert backend.resolve_producer_variant("sm_100a", 2, 128) == ("", "default")
+    assert backend.resolve_producer_variant("sm_103a", 2, 128) == ("", "default")
+
+
+def test_validate_refuses_misaligned_cos_sin_and_norm_weights():
+    """``CakeQkvExchangeSession._validate`` refuses a ``cos_sin`` or norm-weight view that does not start at a
+    16-byte-aligned address for every producer build, and one that does not start at a 32-byte-aligned address for
+    the wide-load builds (naming the opt-out); aligned operands pass.  Checked on CPU tensors through a session
+    stub: ``_validate`` reads only the session's device, geometry and producer build."""
+
+    session = backend.CakeQkvExchangeSession.__new__(backend.CakeQkvExchangeSession)
+    session.device = torch.device("cpu")
+    session.hidden, session.head_dim, session.max_tokens = 256, HEAD_DIM, 64
+    batch, s_local = 1, 16
+
+    def placed(shape, dtype, offset_bytes):
+        """A contiguous view of ``shape`` that starts ``offset_bytes`` past a 64-byte boundary."""
+
+        itemsize = torch.empty((), dtype=dtype).element_size()
+        numel = math.prod(shape)
+        buffer = torch.zeros(numel + 128 // itemsize, dtype=dtype)
+        start = (-buffer.data_ptr() % 64 + offset_bytes) // itemsize
+        view = buffer[start : start + numel].view(shape)
+        assert view.is_contiguous() and view.data_ptr() % 64 == offset_bytes
+        return view
+
+    x = torch.zeros((batch, s_local, session.hidden), dtype=torch.bfloat16)
+    w_qkv = torch.zeros((3 * session.hidden, session.hidden), dtype=torch.bfloat16)
+    operands = {
+        "q_norm_weight": ((HEAD_DIM,), torch.bfloat16),
+        "k_norm_weight": ((HEAD_DIM,), torch.bfloat16),
+        "cos_sin": ((batch * s_local, HEAD_DIM), torch.float32),
+    }
+
+    def call(offsets):
+        q_scale, k_scale, cos_sin = (
+            placed(*operands[name], offsets.get(name, 0)) for name in operands
+        )
+        return session._validate(x, w_qkv, q_scale, k_scale, cos_sin)
+
+    for variant in loader.PRODUCER_VARIANTS:
+        session.producer_variant = variant
+        wide = loader.PRODUCER_VARIANT_OPERAND_LOAD_WIDTH[variant] == 256
+        assert call({}) == (batch, s_local)
+        for name, (_shape, dtype) in operands.items():
+            itemsize = torch.empty((), dtype=dtype).element_size()
+            with pytest.raises(ValueError, match=f"{name} must start at a 16-byte"):
+                call({name: itemsize})
+            with pytest.raises(ValueError, match=f"{name} must start at a 16-byte"):
+                call({name: 8})
+            if wide:
+                with pytest.raises(
+                    ValueError, match=f"{backend.PRODUCER_VARIANT_ENV}=shipped"
+                ):
+                    call({name: 16})
+            else:
+                assert call({name: 16}) == (batch, s_local)
 
 
 def test_dest_parts_cover_the_table_once_per_destination_run():
@@ -1601,6 +1843,20 @@ def test_loader_tables_are_consistent():
             ) == loader.fold_producers_delivered(arch)
             assert loader.has_producer(arch, policy.bn, policy.pair)
             assert loader.has_fold_producer(arch, policy.bn, policy.pair)
+            # The row's plan (with the 128-column tile table) selects a delivered producer too.
+            row_policy, _plan = plans.plan_for(
+                geometry,
+                "bshd",
+                0,
+                arch=arch,
+                pair_available=loader.has_producer(
+                    arch, plans.block_n_for(geometry), True, variant
+                ),
+            )
+            assert loader.has_producer(arch, row_policy.bn, row_policy.pair, variant)
+            assert loader.has_fold_producer(
+                arch, row_policy.bn, row_policy.pair, variant
+            ) == loader.fold_producers_delivered(arch)
 
 
 # --------------------------------------------------------------------------- multi-GPU
@@ -2462,8 +2718,14 @@ def _run_worker(rank, world_size, port):
                 from_opt_out = opt_out_session(x, w_qkv, q_scale, k_scale, cos_sin)
                 torch.cuda.synchronize(device)
                 _check_outputs(default_session, from_default, expected)
-                for one, other in zip(from_default, from_opt_out, strict=True):
-                    assert torch.equal(one, other)
+                if default_variant.endswith("fma"):
+                    # The fused multiply-add build rounds the norm and RoPE
+                    # multiply-adds once, so its bits can differ from the
+                    # baseline build's: both are checked against the reference.
+                    _check_outputs(opt_out_session, from_opt_out, expected)
+                else:
+                    for one, other in zip(from_default, from_opt_out, strict=True):
+                        assert torch.equal(one, other)
             if loader.PRODUCER_VARIANT_OPERAND_LOAD_WIDTH[default_variant] == 256:
                 # A contiguous ``cos_sin`` view that starts 16 bytes into its allocation: the wide-load build
                 # refuses it on every rank before any collective, naming the opt-out.
@@ -2562,16 +2824,87 @@ def _run_worker(rank, world_size, port):
                 band_path.close()
             torch.cuda.synchronize(device)
             dist.barrier(group=group)
+
+        # 10. 128-column tile table (``HOPPER_BN128_MAX_M_BY_ARCH_WORLD``: SM90 with 4 ranks at hidden 3072): one
+        #     256-column session runs a row at the bound on the 128-column producer and a larger row on its own; both
+        #     against the reference, the bound programs and the prepared rows name the row's tile width.
+        bn128_hidden = 3072
+        bn128_bound = plans.hopper_bn128_max_m(arch, world_size, bn128_hidden)
+        if bn128_bound:
+            bn128_session = QkvNormRopeExchangeOverlap(
+                group,
+                hidden=bn128_hidden,
+                num_heads=bn128_hidden // HEAD_DIM,
+                layout="bshd",
+                max_tokens=2 * bn128_bound,
+                backend="nvlink",
+                device=device,
+            )
+            try:
+                info = bn128_session.describe()
+                assert info["block_n"] == 256
+                assert info["bn128_max_m"] == {
+                    "value": bn128_bound,
+                    "source": "default",
+                    "default": bn128_bound,
+                }
+                launched = {
+                    name
+                    for bn in (plans.HOPPER_BN128_BN, 256)
+                    for name in (
+                        [
+                            loader.fold_producer_program(
+                                arch, bn, False, phase, default_variant
+                            )
+                            for phase in loader.FOLD_PHASES
+                        ]
+                        if fold_default
+                        else [loader.producer_program(arch, bn, False, default_variant)]
+                    )
+                }
+                assert launched <= set(info["programs"]["producers"])
+                for s_local, row_bn in (
+                    (bn128_bound, plans.HOPPER_BN128_BN),
+                    (2 * bn128_bound, 256),
+                ):
+                    x, w_qkv, q_scale, k_scale, cos_sin = _operands(
+                        device,
+                        batch=1,
+                        s_local=s_local,
+                        hidden=bn128_hidden,
+                        seed=61 + rank,
+                    )
+                    expected = _expected(
+                        x, w_qkv, q_scale, k_scale, cos_sin, group, world_size, rank
+                    )
+                    bound = bn128_session.bound_programs(1, s_local)
+                    assert bound["producer"] == loader.producer_program(
+                        arch, row_bn, False, default_variant
+                    )
+                    row = bn128_session.describe()["prepared_row_plans"][f"1x{s_local}"]
+                    assert row.get("block_n", 256) == row_bn
+                    assert "xband" not in row
+                    for _call in range(2):
+                        _check_outputs(
+                            bn128_session,
+                            bn128_session(x, w_qkv, q_scale, k_scale, cos_sin),
+                            expected,
+                        )
+                    torch.cuda.synchronize(device)
+            finally:
+                bn128_session.close()
+            torch.cuda.synchronize(device)
+            dist.barrier(group=group)
     finally:
         dist.destroy_process_group()
 
 
-def _spawn(world_size):
+def _spawn(world_size, target=_run_worker):
     mp.set_start_method("spawn", force=True)
     port = random.randint(30000, 60000)
     processes = [
         mp.Process(
-            target=_run_worker,
+            target=target,
             args=(rank, world_size, port),
             name=f"qkv-exchange-{rank}",
         )
@@ -2601,6 +2934,115 @@ def _supported_device():
     return tuple(torch.cuda.get_device_capability(0)) in loader.CAPABILITY_ARCH
 
 
+ODD_BAND_HIDDEN = 768
+
+
+def _run_odd_band_worker(rank, world_size, port):
+    """The default session of a three-head destination band (hidden 768, 6 heads over 2 ranks: ``block_n=128``):
+    it constructs with the default build where that build is delivered for the tile width and with the baseline
+    build otherwise (the two-rank ``fma`` defaults are delivered at ``block_n=256`` only), binds exactly the programs
+    of the ``shipped`` opt-out in the second case, and matches the reference on a single-CTA row and a pair row; a
+    ``cos_sin`` view that does not start at a 16-byte-aligned address is refused on every rank."""
+
+    from flashinfer.comm import QkvNormRopeExchangeOverlap
+
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        backend="nccl",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=world_size,
+        device_id=device,
+    )
+    group = dist.group.WORLD
+    hidden = ODD_BAND_HIDDEN
+    heads = hidden // HEAD_DIM
+    arch = loader.device_facts(rank).arch
+    max_tokens = plans.PAIR_MIN_M
+    try:
+        capacity = plans.Geometry(
+            world_size=world_size, batch=1, s_local=max_tokens, hidden=hidden
+        )
+        assert plans.block_n_for(capacity) == 128
+        default = loader.default_producer_variant(arch, world_size)
+        delivered = any(
+            loader.has_producer(arch, 128, pair, default) for pair in (False, True)
+        )
+        variant = default if delivered else loader.SHIPPED_VARIANT
+
+        def session_with(env):
+            previous = {name: os.environ.pop(name, None) for name in env}
+            os.environ.update(env)
+            try:
+                return QkvNormRopeExchangeOverlap(
+                    group,
+                    hidden=hidden,
+                    num_heads=heads,
+                    layout="bshd",
+                    max_tokens=max_tokens,
+                    backend="nvlink",
+                    device=device,
+                )
+            finally:
+                for name, value in previous.items():
+                    os.environ.pop(name, None)
+                    if value is not None:
+                        os.environ[name] = value
+
+        os.environ.pop(backend.PRODUCER_VARIANT_ENV, None)
+        session = session_with({})
+        opt_out = session_with({backend.PRODUCER_VARIANT_ENV: "shipped"})
+        try:
+            info = session.describe()
+            assert info["block_n"] == 128
+            assert info["producer_variant"] == {
+                "value": variant,
+                "source": "default",
+                "env": backend.PRODUCER_VARIANT_ENV,
+                "default": default,
+            }
+            for batch, s_local, seed in ((1, 200, 61), (1, max_tokens, 71)):
+                x, w_qkv, q_scale, k_scale, cos_sin = _operands(
+                    device,
+                    batch=batch,
+                    s_local=s_local,
+                    hidden=hidden,
+                    seed=seed + rank,
+                )
+                expected = _expected(
+                    x, w_qkv, q_scale, k_scale, cos_sin, group, world_size, rank
+                )
+                if variant == loader.SHIPPED_VARIANT:
+                    bound = session.bound_programs(batch, s_local)
+                    assert bound == opt_out.bound_programs(batch, s_local)
+                for _call in range(2):
+                    _check_outputs(
+                        session, session(x, w_qkv, q_scale, k_scale, cos_sin), expected
+                    )
+                    _check_outputs(
+                        opt_out, opt_out(x, w_qkv, q_scale, k_scale, cos_sin), expected
+                    )
+            # A contiguous ``cos_sin`` view that starts 4 bytes into its allocation: refused before any collective.
+            buffer = torch.empty(
+                1 + batch * s_local * HEAD_DIM, dtype=torch.float32, device=device
+            )
+            misaligned = buffer[1:].view(batch * s_local, HEAD_DIM)
+            misaligned.copy_(cos_sin)
+            assert misaligned.data_ptr() % 16 == 4
+            for target in (session, opt_out):
+                with pytest.raises(ValueError, match="cos_sin must start at a 16-byte"):
+                    target(x, w_qkv, q_scale, k_scale, misaligned)
+            del buffer, misaligned
+        finally:
+            session.close()
+            opt_out.close()
+        torch.cuda.synchronize(device)
+        dist.barrier(group=group)
+    finally:
+        dist.destroy_process_group()
+
+
 @pytest.mark.parametrize("world_size", [2, 4, 8])
 def test_qkv_norm_rope_exchange_overlap_multi_gpu(world_size):
     if not loader.ROUTES:
@@ -2613,6 +3055,24 @@ def test_qkv_norm_rope_exchange_overlap_multi_gpu(world_size):
     if world_size not in loader.supported_world_sizes(arch):
         pytest.skip(f"world size {world_size} is not supported on {arch}")
     _spawn(world_size)
+
+
+def test_qkv_norm_rope_exchange_overlap_multi_gpu_default_odd_band():
+    """Two ranks, hidden 768 (6 heads, a three-head destination band, ``block_n=128``): the default session
+    constructs and runs on every architecture that delivers the 128-column tile (:func:`_run_odd_band_worker`)."""
+
+    if not loader.ROUTES:
+        pytest.skip("program tables are filled by the exporter")
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires 2 GPUs")
+    if not _supported_device():
+        pytest.skip("requires SM90, SM100, SM103 or SM107 devices")
+    arch = loader.device_facts(0).arch
+    if 2 not in loader.supported_world_sizes(arch):
+        pytest.skip(f"world size 2 is not supported on {arch}")
+    if not any(loader.has_producer(arch, 128, pair) for pair in (False, True)):
+        pytest.skip(f"{arch} delivers no block_n=128 producer")
+    _spawn(2, _run_odd_band_worker)
 
 
 def test_math_reference_is_self_consistent():

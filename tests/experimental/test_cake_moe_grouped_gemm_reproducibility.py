@@ -21,7 +21,8 @@ deterministic package's determinism suite (seeded fixed inputs per case):
 
 * the facade with ``deterministic=True`` gives the deterministic package's bits;
 * ``fwd`` and ``dgrad`` of the non-deterministic package give the deterministic
-  package's bits;
+  package's bits, the data gradient's own sm_100a L2 evict-first build included
+  (it runs where the deterministic package launches its wide tile);
 * the non-deterministic weight gradient, launched ``REPEATS`` times into an
   output filled with zero bytes and ``REPEATS`` times into one filled with
   ``FILL_BYTE``, stays within the deterministic package's budget of the
@@ -34,7 +35,9 @@ deterministic package's determinism suite (seeded fixed inputs per case):
 * row-padded ``g`` and ``x`` on the shape of the 256-wide k tile's ``main_wave``
   weight gradient give the deterministic package's bits.
 
-On the CPU, the registry mirrors the deterministic package's routes and stages.
+On the CPU, the registry mirrors the deterministic package's routes and stages
+(but for the data gradient's own sm_100a ``main_wide_ef`` build, held to the
+deterministic wide tile's launch shape and argument plan).
 """
 
 import dataclasses
@@ -110,6 +113,22 @@ ROW_PAD = 256
 
 OPS = ("fwd", "dgrad", "wgrad")
 INT_VIEW = {torch.bfloat16: torch.int16, torch.float32: torch.int32}
+
+# This package's own builds beside the copies: (route, stage) -> the deterministic
+# package's stage of the same kernel and launch.  The data gradient's L2 evict-first
+# twin of the wide tile on the architectures this package's
+# ``dgrad_evict_first_archs`` adds (sm_100a): the deterministic wide
+# domain-scheduled kernel with evict-first G loads and dX stores.
+OWN_STAGES = {("cake_moe_grouped_gemm_dgrad", "main_wide_ef"): "main_wide"}
+# Data-gradient cases of the evict-first rule (at least ``dgrad_evict_first_min_rows``
+# rows per group on average, ``K >= dgrad_evict_first_min_k``): (label, sizes, N, K),
+# over group sizes off every tile multiple, with a one-row group (the second and
+# third) and an empty group (the third).
+EF_CASES = (
+    ("e2_long", (16390, 16500), 64, 4096),
+    ("one_row_off_tile", (1, 16383, 16385, 32767), 1088, 4608),
+    ("empty_one_row", (0, 49151, 1, 16384), 4096, 6144),
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -331,6 +350,24 @@ def _plan_record(launch):
     return {key: launch.plan[key] for key in keys if key in launch.plan}
 
 
+def _own_stage(case, name, arch):
+    """The stage of ``OWN_STAGES`` this package's host takes for a fwd / dgrad
+    ``case`` on ``arch`` where the deterministic package takes its twin, else None:
+    the data gradient's ``main_wide_ef`` where this package's ``dgrad_evict_first``
+    holds on an architecture the deterministic package's constants do not list."""
+    sum_m, groups = sum(case.sizes), len(case.sizes)
+    if (
+        case.op == "dgrad"
+        and cb.dgrad_evict_first(case.k, arch, sum_m, groups, HOST_PLAN_CONSTANTS)
+        and arch not in det_jit.HOST_PLAN_CONSTANTS["dgrad_evict_first_archs"]
+        and cake_jit.stage_served(name, "main_wide_ef", arch)
+        and cb.fwd_dgrad_tile_n("dgrad", case.n, case.k, arch, HOST_PLAN_CONSTANTS)
+        == int(HOST_PLAN_CONSTANTS["wide_block_n"])
+    ):
+        return "main_wide_ef"
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Registry against the deterministic package (CPU)
 # ---------------------------------------------------------------------------
@@ -362,8 +399,13 @@ def test_routes_mirror_the_deterministic_package():
     route's k tile).  The accumulate stages of the 512-wide k tile (``<stage>_acc``,
     which the deterministic package does not have) are left out of the mirror; their
     twins are mirrored, and ``test_cake_moe_grouped_gemm_acc.py`` checks them against
-    their twins.  (A CPU check; it lives here because the backend suite imports no
-    package but its own.)"""
+    their twins.  So is a stage of ``OWN_STAGES`` on an architecture where the
+    deterministic route does not serve it (the data gradient's sm_100a
+    ``main_wide_ef``, this package's own evict-first build): it is held to the
+    deterministic stage of the same kernel (``main_wide``), with that stage's launch
+    shape, FFI entry and argument plan, under a program name of its own, and only on
+    the architectures this package's ``dgrad_evict_first_archs`` adds.  (A CPU check;
+    it lives here because the backend suite imports no package but its own.)"""
     det_routes, det_programs = det_jit.ROUTES, det_jit.PROGRAMS
     routes, programs = cake_jit.ROUTES, cake_jit.PROGRAMS
     assert set(routes) == {
@@ -390,6 +432,41 @@ def test_routes_mirror_the_deterministic_package():
                 if arch in programs[s["program"]]["arches"]
                 and not s["name"].endswith(cb.ACC_SUFFIX)
             }
+            own = {
+                stage
+                for stage in stages
+                if (name, stage) in OWN_STAGES and stage not in det_stages
+            }
+            stages -= own
+            for stage in own:
+                twin = OWN_STAGES[(name, stage)]
+                assert stage == "main_wide_ef" and route["op"] == "dgrad", (name, stage)
+                assert arch in HOST_PLAN_CONSTANTS["dgrad_evict_first_archs"], arch
+                det_ef_archs = det_jit.HOST_PLAN_CONSTANTS["dgrad_evict_first_archs"]
+                assert arch not in det_ef_archs, arch
+                det_binding = det_jit.stage_binding(det_name, twin, arch)
+                binding = cake_jit.stage_binding(name, stage, arch)
+                assert binding["specializations"] == det_binding["specializations"]
+                det_program = det_programs[det_binding["program"]]
+                program = programs[binding["program"]]
+                assert program["launch"] == det_program["launch"], (name, stage, arch)
+                assert program["ffi_entry"] == det_program["ffi_entry"]
+                row_bases = {("buffer", rows) for rows in cb.ROW_BASES}
+                plan = [
+                    tuple(i) for i in program["arg_plan"] if tuple(i) not in row_bases
+                ]
+                det_plan = [tuple(i) for i in det_program["arg_plan"]]
+                assert plan == det_plan, (name, stage)
+                # Not a copy: a program of its own, beside the copy of the twin.
+                copy = cake_jit.stage_binding(name, twin, arch)["program"]
+                assert binding["program"] != copy
+                assert binding["program"].startswith("cake_moe_grouped_gemm_")
+                assert (
+                    binding["program"].replace(
+                        "cake_moe_grouped_gemm", "cake_moe_grouped_det_gemm"
+                    )
+                    not in det_programs
+                )
             expected_stages = det_stages - {"tail_reduce"} if unordered else det_stages
             unselected = set()
             if route["op"] == "wgrad":
@@ -466,8 +543,14 @@ def test_against_the_deterministic_package(label, record_property):
         out_dtype=str(case.out_dtype).replace("torch.", ""),
     )
     if case.op != "wgrad":
-        # fwd / dgrad: copies of the deterministic programs, the same bits.
-        assert launch.stages == det.stages
+        # fwd / dgrad: the deterministic programs' bits.  The stages are the
+        # deterministic package's, but where this package's host takes its own
+        # evict-first build of the data gradient's wide tile (``OWN_STAGES``).
+        own = _own_stage(case, launch.record_name, cb.arch_for(device))
+        twin = OWN_STAGES.get((launch.record_name, own))
+        expected = [own if stage == twin else stage for stage in det.stages]
+        assert list(launch.stages) == expected, (launch.stages, det.stages)
+        record.update(own_stage=own)
         for fill in (0, FILL_BYTE):
             out.view(torch.uint8).fill_(fill)
             launch.launch()
@@ -522,6 +605,93 @@ def test_against_the_deterministic_package(label, record_property):
         assert mismatches == 0 and differ_from_det == 0, record
     assert worst_vs_det <= 1.0, record
     assert worst_vs_first <= 1.0, record
+
+
+@pytest.mark.parametrize("label,sizes,n,k", EF_CASES, ids=[c[0] for c in EF_CASES])
+def test_dgrad_evict_first_gives_the_deterministic_bits(
+    label, sizes, n, k, monkeypatch
+):
+    """Where this package's ``dgrad_evict_first`` holds, the data gradient launches the
+    L2 evict-first twin of its wide tile (``main_wide_ef``; on sm_100a this package's
+    own build, where the deterministic package launches ``main_wide``).  The cache
+    policy changes no arithmetic: over a one-row group, an empty group and group sizes
+    off every tile multiple, dX has the bits of the deterministic package's data
+    gradient, of this package's wide tile (``main_wide``) and of its 256-column tile
+    (``main``), whatever bytes the output held."""
+    device = _device()
+    case = Case(f"dgrad_ef_{label}", "dgrad", n, k, tuple(sizes), torch.bfloat16)
+    _require_programs(case, device)
+    c = HOST_PLAN_CONSTANTS
+    arch = cb.arch_for(device)
+    sum_m, groups = sum(sizes), len(sizes)
+    # Every case is over the rule's thresholds: the rule holds on its architectures.
+    assert sum_m // groups >= int(c["dgrad_evict_first_min_rows"]), label
+    assert k >= int(c["dgrad_evict_first_min_k"]), label
+    assert k % int(c["wide_block_n"]) == 0, label
+    assert any(size % 128 for size in sizes), label
+    a, b, offs = _inputs(case, device)
+    det_out = _out(case, device)
+    det = _prepare(det_cb, case, a, b, offs, det_out)
+    det_out.view(torch.uint8).fill_(0)
+    det.launch()
+    out = _out(case, device)
+    launch = _prepare(cb, case, a, b, offs, out)
+    name = launch.record_name
+    wide = arch in c["wide_dgrad_archs"] and cake_jit.stage_served(
+        name, "main_wide", arch
+    )
+    ef = (
+        wide
+        and cb.dgrad_evict_first(k, arch, sum_m, groups, c)
+        and cake_jit.stage_served(name, "main_wide_ef", arch)
+    )
+    ts33 = (
+        wide
+        and not ef
+        and cb.dgrad_wide_ts33(k, arch, sum_m, groups, c)
+        and cake_jit.stage_served(name, "main_wide_ts33", arch)
+    )
+    assert ef == (arch in c["dgrad_evict_first_archs"]), arch
+    assert launch.stages[0] == (
+        "main_wide_ef"
+        if ef
+        else "main_wide_ts33"
+        if ts33
+        else "main_wide"
+        if wide
+        else "main"
+    )
+    if ef and arch not in det_jit.HOST_PLAN_CONSTANTS["dgrad_evict_first_archs"]:
+        assert det.stages[0] == "main_wide", det.stages
+    for fill in (0, FILL_BYTE):
+        out.view(torch.uint8).fill_(fill)
+        launch.launch()
+        torch.cuda.synchronize(device)
+        assert torch.equal(_bits(out), _bits(det_out)), f"fill 0x{fill:02x}"
+    ends = [sum(sizes[: i + 1]) for i in range(groups)]
+    for s, t in zip([0] + ends[:-1], ends, strict=True):
+        if t == s + 1:
+            assert int(_bits(out[s:t]).count_nonzero()) > 0, label
+    if not ef:
+        pytest.skip(f"no evict-first data-gradient tile on {arch}")
+    monkeypatch.setitem(c, "dgrad_evict_first_min_rows", 1 << 30)
+    plain_out = _out(case, device)
+    plain = _prepare(cb, case, a, b, offs, plain_out)
+    assert plain.stages[0] == "main_wide", plain.stages
+    assert plain.plan["tile_n"] == launch.plan["tile_n"]
+    plain_out.view(torch.uint8).fill_(FILL_BYTE)
+    plain.launch()
+    torch.cuda.synchronize(device)
+    assert torch.equal(_bits(plain_out), _bits(out)), "main_wide"
+    del plain_out
+    monkeypatch.setitem(c, "wide_dgrad_archs", [])
+    narrow_out = _out(case, device)
+    narrow = _prepare(cb, case, a, b, offs, narrow_out)
+    assert narrow.stages[0] == "main", narrow.stages
+    narrow_out.view(torch.uint8).fill_(FILL_BYTE)
+    narrow.launch()
+    torch.cuda.synchronize(device)
+    assert torch.equal(_bits(narrow_out), _bits(out)), "main"
 
 
 @pytest.mark.parametrize("label", K512_LABELS)
