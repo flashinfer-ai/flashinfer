@@ -853,8 +853,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         # issues per stage, which makes the producer warp the bottleneck. With
         # a K-major SW128 stage of 128-byte rows, every 8 rows are one 1 KB
         # swizzle atom, so the boxes land where the full-tile load would put
-        # them. The pipeline then expects only B/SFA/SFB bytes, and the producer
-        # adds the A bytes it issues.
+        # them. Each stage expects only the A bytes it loads, and the producer
+        # issues B/SFA/SFB before the A boxes so that they do not delay the B load.
         k_tile_elems = self.mma_tiler[2]
         self.skip_padding_rows = (
             (
@@ -871,7 +871,6 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         self.a_box_rows = (64, 32, 16, 8)
         tma_a_boxes = [None] * 8
         self.a_row_bytes = k_tile_elems * self.a_dtype.width // 8
-        self.a_tile_bytes = a_copy_size
         if cutlass.const_expr(self.skip_padding_rows):
             for box_i, box_rows in enumerate(self.a_box_rows):
                 box_smem_layout = cute.make_composed_layout(
@@ -1692,15 +1691,16 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 #
                 # ((atom_v, rest_v), loopK)
                 tAgA_slice = tAgA[(None, mma_tile_coord_mnl[0], None, 0)]
-                # Partial tile: number of 8-row A blocks holding routed rows.
-                a_bytes = cutlass.Int32(self.a_tile_bytes)
+                ab_tx_bytes = cutlass.Int32(self.num_tma_load_bytes)
                 if cutlass.const_expr(self.skip_padding_rows):
+                    # Partial tile: number of 8-row A blocks holding routed rows
+                    # (a_rows >= 0 for a valid tile).
                     a_rows = (
                         tile_info[4]
                         - mma_tile_coord_mnl[0] * self.cta_tile_shape_mnk[0]
                     )
-                    a_blocks8 = cutlass.min((a_rows + 7) // 8, 16)
-                    a_bytes = a_blocks8 * 8 * self.a_row_bytes
+                    a_blocks8 = cutlass.min((cutlass.Uint32(a_rows) + 7) >> 3, 16)
+                    ab_tx_bytes = ab_tx_bytes + a_blocks8 * 8 * self.a_row_bytes
                 # ((atom_v, rest_v), loopK)
                 tBgB_slice = tBgB[
                     (None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])
@@ -1740,15 +1740,45 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
 
                     # Conditionally wait for AB buffer empty
                     ab_pipeline.producer_acquire(
-                        ab_producer_state, peek_ab_empty_status
+                        ab_producer_state,
+                        peek_ab_empty_status,
+                        expected_tx=ab_tx_bytes,
                     )
 
                     # TMA load A/B
+                    if cutlass.const_expr(not self.skip_padding_rows):
+                        cute.copy(
+                            tma_atom_a,
+                            tAgA_k,
+                            tAsA_pipe,
+                            tma_bar_ptr=tma_bar,
+                            mcast_mask=a_full_mcast_mask,
+                        )
+                    cute.copy(
+                        tma_atom_b,
+                        tBgB_k,
+                        tBsB_pipe,
+                        tma_bar_ptr=tma_bar,
+                        mcast_mask=b_full_mcast_mask,
+                    )
+
+                    cute.copy(
+                        tma_atom_sfa,
+                        tAgSFA_k,
+                        tAsSFA_pipe,
+                        tma_bar_ptr=tma_bar,
+                        mcast_mask=sfa_full_mcast_mask,
+                    )
+                    cute.copy(
+                        tma_atom_sfb,
+                        tBgSFB_k,
+                        tBsSFB_pipe,
+                        tma_bar_ptr=tma_bar,
+                        mcast_mask=sfb_full_mcast_mask,
+                    )
+
+                    # Partial-tile A after B/SFA/SFB (see skip_padding_rows)
                     if cutlass.const_expr(self.skip_padding_rows):
-                        # The pipeline expects B/SFA/SFB only: add this stage's A
-                        # bytes before any copy of the stage is issued.
-                        with cute.arch.elect_one():
-                            cute.arch.mbarrier_expect_tx(tma_bar, a_bytes)
                         if a_blocks8 == 16:
                             cute.copy(
                                 tma_atom_a,
@@ -1783,36 +1813,6 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                                         tma_bar_ptr=tma_bar,
                                     )
                                     a_off = a_off + box_rows
-                    else:
-                        cute.copy(
-                            tma_atom_a,
-                            tAgA_k,
-                            tAsA_pipe,
-                            tma_bar_ptr=tma_bar,
-                            mcast_mask=a_full_mcast_mask,
-                        )
-                    cute.copy(
-                        tma_atom_b,
-                        tBgB_k,
-                        tBsB_pipe,
-                        tma_bar_ptr=tma_bar,
-                        mcast_mask=b_full_mcast_mask,
-                    )
-
-                    cute.copy(
-                        tma_atom_sfa,
-                        tAgSFA_k,
-                        tAsSFA_pipe,
-                        tma_bar_ptr=tma_bar,
-                        mcast_mask=sfa_full_mcast_mask,
-                    )
-                    cute.copy(
-                        tma_atom_sfb,
-                        tBgSFB_k,
-                        tBsSFB_pipe,
-                        tma_bar_ptr=tma_bar,
-                        mcast_mask=sfb_full_mcast_mask,
-                    )
 
                     # Peek (try_wait) AB buffer empty for k_tile = prefetch_k_tile_cnt + k_tile + 1
                     ab_producer_state.advance()
