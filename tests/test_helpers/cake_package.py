@@ -26,7 +26,7 @@ PACKAGES: dict[str, str] = {
     "cake_mhc_det_train": "flashinfer.cake_mhc_det_train_backend",
     "cake.cake_dsa_sparse_attention_nondet_train": "flashinfer.experimental.cake.cake_dsa_sparse_attention_nondet_train",
     "cake.cake_dsa_indexer_det_train": "flashinfer.experimental.cake.cake_dsa_indexer_det_train",
-    "cake_lm_head_det_loss": "flashinfer.experimental.cake_lm_head_det_loss",
+    "cake.cake_lm_head_det_train": "flashinfer.experimental.cake.cake_lm_head_det_train",
     # the non-deterministic package (deterministic=False); its key carries the namespace
     "cake.cake_lm_head_loss": "flashinfer.experimental.cake.cake_lm_head_loss",
     "cake_dense_gemm_det_train": "flashinfer.experimental.cake.cake_dense_gemm_det_train",
