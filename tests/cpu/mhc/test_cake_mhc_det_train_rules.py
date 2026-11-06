@@ -176,6 +176,8 @@ REDUCE_LIBRARY = {
     "s27_wcvt_fadd_fshfl_dpl": "cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl_dpl",
     "wpu4_fadd_dpl": "cake_mhc_det_train_bwd_reduce__wpu4_fadd_dpl",
     "wpu4_spred_dpl": "cake_mhc_det_train_bwd_reduce__wpu4_spred_dpl",
+    "wpu4_fadd_dpl_trows": "cake_mhc_det_train_bwd_reduce__wpu4_fadd_dpl_trows",
+    "wpu4_spred_dpl_trows": "cake_mhc_det_train_bwd_reduce__wpu4_spred_dpl_trows",
 }
 COEF_TOKENS_PER_CTA = {
     "qe_mb10": 8,
@@ -205,6 +207,8 @@ REDUCE_GRID = {
     "s27_wcvt_fadd_fshfl_dpl": 411,
     "wpu4_fadd_dpl": 411,
     "wpu4_spred_dpl": 411,
+    "wpu4_fadd_dpl_trows": 411,
+    "wpu4_spred_dpl_trows": 411,
 }
 FINISH_LIBRARY = {
     "production": "cake_mhc_det_train_fwd_finish",
@@ -223,9 +227,11 @@ LIBRARY_ARCHES = {
     "cake_mhc_det_train_bwd_reduce__wpu4": ("sm_107a",),
     "cake_mhc_det_train_bwd_reduce__wpu4_fadd": ("sm_100a", "sm_107a"),
     "cake_mhc_det_train_bwd_reduce__wpu4_fadd_dpl": ("sm_100a",),
+    "cake_mhc_det_train_bwd_reduce__wpu4_fadd_dpl_trows": ("sm_100a",),
     "cake_mhc_det_train_bwd_reduce__wpu4_fadd_trows": ("sm_100a",),
     "cake_mhc_det_train_bwd_reduce__wpu4_spred": ("sm_100a",),
     "cake_mhc_det_train_bwd_reduce__wpu4_spred_dpl": ("sm_100a",),
+    "cake_mhc_det_train_bwd_reduce__wpu4_spred_dpl_trows": ("sm_100a",),
     "cake_mhc_det_train_bwd_reduce__wpu4_spred_trows": ("sm_100a",),
     "cake_mhc_det_train_bwd_slab__dynl": ("sm_100a",),
     "cake_mhc_det_train_bwd_slab__dynl_dpl": ("sm_100a",),
@@ -353,7 +359,7 @@ MULTI_RECORDS = {
         "cake_mhc_det_train_bwd_slab__xrsg__a7",
     ],
 }
-N_RECORDS, N_LIBRARIES = 84, 66
+N_RECORDS, N_LIBRARIES = 86, 68
 # the tail forms each architecture routes beside their X-hint forms (FWD_MAP_XNRM)
 XN_KEPT_TAILS = {"sm_100a": ("ns96_g2_ol2l_ct",), "sm_103a": ("nsx_ct",)}
 RECORD_SCALARS = {
@@ -466,6 +472,8 @@ TABLES = {
         "s27_wcvt_fadd_fshfl_dpl": 411,
         "wpu4_fadd_dpl": 411,
         "wpu4_spred_dpl": 411,
+        "wpu4_fadd_dpl_trows": 411,
+        "wpu4_spred_dpl_trows": 411,
     },
     "BWD_REDUCE_PARTS": {
         "sm_100a": {
@@ -515,6 +523,16 @@ TABLES = {
         "sm_107a": (),
     },
     "BWD_DPL_SLABS": ("dynl", "dynr"),
+    "BWD_DPL_PATHS": {
+        "sm_100a": {"backward": ((8192, 15590), (16131, 16263))},
+        "sm_103a": {},
+        "sm_107a": {},
+    },
+    "FWD_MAP_XNRM_PATHS": {
+        "sm_100a": {"checkpoint": ((7168, 7680),)},
+        "sm_103a": {},
+        "sm_107a": {},
+    },
 }
 # The token counts that exercise every band boundary of the dispatch at the SM counts of record (the kernel-tests
 # rules test's DISPATCH_T).
@@ -1320,7 +1338,9 @@ LAUNCH_FACTS = {
     "cake_mhc_det_train_bwd_reduce__wpu4_fadd": ((256, 1, 1), 4224, 1),
     "cake_mhc_det_train_bwd_reduce__wpu4_fadd_dpl": ((256, 1, 1), 4224, 1),
     "cake_mhc_det_train_bwd_reduce__wpu4_spred_trows": ((256, 1, 1), 128, 1),
+    "cake_mhc_det_train_bwd_reduce__wpu4_spred_dpl_trows": ((256, 1, 1), 128, 1),
     "cake_mhc_det_train_bwd_reduce__wpu4_fadd_trows": ((256, 1, 1), 128, 1),
+    "cake_mhc_det_train_bwd_reduce__wpu4_fadd_dpl_trows": ((256, 1, 1), 128, 1),
     "cake_mhc_det_train_bwd_reduce__s27_wcvt_spred": ((256, 1, 1), 4224, 1),
     "cake_mhc_det_train_bwd_reduce__wpu4": ((256, 1, 1), 4224, 1),
 }
@@ -1403,9 +1423,11 @@ RECORD_ARCHES = {
     "cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl_dpl": ("sm_100a",),
     "cake_mhc_det_train_bwd_reduce__wpu4_spred": ("sm_100a",),
     "cake_mhc_det_train_bwd_reduce__wpu4_spred_dpl": ("sm_100a",),
+    "cake_mhc_det_train_bwd_reduce__wpu4_spred_dpl_trows": ("sm_100a",),
     "cake_mhc_det_train_bwd_reduce__wpu4_spred_trows": ("sm_100a",),
     "cake_mhc_det_train_bwd_reduce__wpu4_fadd": ("sm_100a", "sm_107a"),
     "cake_mhc_det_train_bwd_reduce__wpu4_fadd_dpl": ("sm_100a",),
+    "cake_mhc_det_train_bwd_reduce__wpu4_fadd_dpl_trows": ("sm_100a",),
     "cake_mhc_det_train_bwd_reduce__wpu4_fadd_trows": ("sm_100a",),
     "cake_mhc_det_train_bwd_reduce__s27_wcvt_spred": ("sm_107a",),
     "cake_mhc_det_train_bwd_reduce__wpu4": ("sm_107a",),
@@ -1971,6 +1993,73 @@ def _literals() -> dict:
 
 
 @pytest.mark.cpu_only
+def test_path_bands_of_record() -> None:
+    # The path-keyed bands of record: the call path (forward / backward / checkpoint) selects the _dpl column slab
+    # and reduction (BWD_DPL_PATHS) and the _xn mapping pass (FWD_MAP_XNRM_PATHS) inside its band; path None reads
+    # the path-free tables only.
+    assert loader.PATH_PROGRAM_RULES == (
+        "fwd_map_program",
+        "bwd_slab_program",
+        "bwd_reduce_program",
+    )
+    inside = (8193, 12288, 14928, 15590, 16132, 16263)  # bands are (above, at_most]
+    outside = (15591, 16114, 16130, 16131, 16264)
+    for sm in SM_COUNTS:
+        for T in inside + outside:
+            slab = loader.bwd_slab_program(T, sm, "sm_100a", path="backward")
+            red = loader.bwd_reduce_program(T, sm, "sm_100a", path="backward")
+            band = any(
+                a < T <= b for a, b in TABLES["BWD_DPL_PATHS"]["sm_100a"]["backward"]
+            )
+            assert band == (T in inside), T
+            base = loader.bwd_slab_program(
+                T, sm, "sm_100a"
+            )  # path None: the path-free plan (no _dpl from 8193)
+            assert not base.endswith("_dpl"), (T, sm, base)
+            assert slab == (
+                base + "_dpl" if band and base in loader.BWD_DPL_SLABS else base
+            ), (T, sm, base, slab)
+            assert ("_dpl" in red) == slab.endswith("_dpl"), (T, sm, slab, red)
+            for path in ("checkpoint", None):
+                assert loader.bwd_slab_program(
+                    T, sm, "sm_100a", path=path
+                ) == loader.bwd_slab_program(T, sm, "sm_100a")
+                assert loader.bwd_reduce_program(
+                    T, sm, "sm_100a", path=path
+                ) == loader.bwd_reduce_program(T, sm, "sm_100a")
+    assert [loader.bwd_reduce_program(T, 148, "sm_100a", path="backward") for T in (8193, 14928, 15288)] == [
+        "wpu4_spred_dpl", "wpu4_spred_dpl_trows", "wpu4_fadd_dpl_trows"
+    ]  # fmt: skip
+    for sm in SM_COUNTS:
+        for T in (7168, 7169, 7424, 7680, 7681):
+            base = loader.fwd_map_program(T, sm, "sm_100a")
+            ckpt = loader.fwd_map_program(T, sm, "sm_100a", path="checkpoint")
+            assert loader.fwd_map_program(T, sm, "sm_100a", path="forward") == base, (
+                T,
+                sm,
+            )
+            if 7168 < T <= 7680 and not base.endswith("_xn"):
+                assert ckpt == base + "_xn", (T, sm, base, ckpt)
+            else:
+                assert ckpt == base, (T, sm, base, ckpt)
+    # sm_103a / sm_107a: every path reads the path-free plan
+    for arch in ("sm_103a", "sm_107a"):
+        for sm in SM_COUNTS:
+            for T in range(64, 70000, 389):
+                for rule in loader.PATH_PROGRAM_RULES:
+                    f = getattr(loader, rule)
+                    base = f(T, sm, arch)
+                    for path in loader.PDL_PATHS:
+                        assert f(T, sm, arch, path=path) == base, (
+                            rule,
+                            arch,
+                            sm,
+                            T,
+                            path,
+                        )
+
+
+@pytest.mark.cpu_only
 def test_registry_tables_are_literals() -> None:
     literals = _literals()
     for name in (
@@ -2006,6 +2095,8 @@ def test_registry_tables_are_literals() -> None:
         "K5_FORM_ROWS",
         "BWD_DPL_BANDS",
         "BWD_DPL_SLABS",
+        "BWD_DPL_PATHS",
+        "FWD_MAP_XNRM_PATHS",
         "FN_SPLIT_CARRY",
         "PDL_PATHS",
         "PDL_EDGES",
@@ -2255,7 +2346,16 @@ def test_records_are_consistent() -> None:
             ]
         else:
             slabs = [SLAB_LIBRARY[loader.BWD_SLAB_PROGRAM[arch]]]
-        reduces = _first_programs(loader.bwd_reduce_program, arch, sms)
+        reduces = _first_programs(
+            lambda T, sm, a: loader.bwd_reduce_program(T, sm, a, path="backward"),
+            arch,
+            sms,
+        )  # the backward path's first-T order (BWD_DPL_PATHS), then the programs only the path-free rule reaches
+        reduces += [
+            p
+            for p in _first_programs(loader.bwd_reduce_program, arch, sms)
+            if p not in reduces
+        ]
         # the token-owner run-time-count record closes the token-owner records
         assert libs(H4096_ROUTES[arch]["bwd_finish_h4096"]) == [
             split, *tokens, "cake_mhc_det_train_bwd_token__rt64", *slabs, *[REDUCE_LIBRARY[p] for p in reduces]
@@ -2654,6 +2754,8 @@ def test_launch_facts_of_record() -> None:
         "pt32_trows": ((32, 1, 1), 128, 1),
         "wpu4_fadd_trows": ((256, 1, 1), 128, 1),
         "wpu4_spred_trows": ((256, 1, 1), 128, 1),
+        "wpu4_fadd_dpl_trows": ((256, 1, 1), 128, 1),
+        "wpu4_spred_dpl_trows": ((256, 1, 1), 128, 1),
     }
     for program, name in REDUCE_LIBRARY.items():
         if program in (
