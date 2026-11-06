@@ -5349,31 +5349,17 @@ def _adj_tapes(call: CallDetKcp, *, dcarry: Indexed | None, wait_first: bool) ->
         call.walk("kcp_dhu_tape", tb.walk_cross_rest, dht=dcarry)
 
 
-def _forward(
+def _fwd_buffers(
     call: CallDetKcp,
     *,
     save: bool,
     replay: bool,
-    bound: dict[str, torch.Tensor] | None = None,
+    bound: dict[str, torch.Tensor] | None,
 ) -> None:
-    """The design note §3.5.  ``save``: the saved set is kept (fresh ``S_in``; with ``save_transfer`` also the c1 receive
-    tensor and ``M_seg``); ``replay``: the forward of a replay-mode backward (no ``fwd_o``, nothing kept).
-    ``bound``: the received tensors a recompute handle stored (``S_in``; under ``save_transfer`` also ``c1_recv``):
-    the recompute of a checkpointed forward binds them instead of exchanging -- no c1 / c2 / ring hop and no wait, no
-    owner merge, and no summary launch whose only reader is the exchange (``P = 1``: none; ``P > 1``: the two stage
-    walks that feed the carry merges stay, the map merge and the transpose into ``c1_send`` go); every other launch
-    is the same on the same bits.
-    ``schedule="wait_first"`` (the shipped default since an earlier revision): ``c1 -> wait -> fwd merge -> c2 -> wait -> carry merges -> tape walk(s)``
-    -- no merge or walk is issued while a collective is in flight (the R7 overlap of the document-start walk under c1
-    is dropped); the merges read only ``c1_recv`` / the staging planes and the tapes read no collective buffer, so
-    every published bit is the same.
-    The forward's state walk program (``call.fwd_walk``, every forward tape-walk launch site): the fused walk
-    ``kcp_fwdh_o`` (``out`` from the walk, no tape, no ``fwd_o`` launch) unless the forward keeps its tapes
-    (``replay``: the backward reads them) or the ``fwd_o_fuse`` knob is ``0``; then the tape walk and ``fwd_o``."""
+    """The forward's per-call KCP buffers (:func:`_forward`): ``S_in`` (fresh, or the handle's); with
+    ``save_transfer`` on a saving forward the c1 receive tensor (fresh, or the handle's) and at ``P > 1`` ``stage_m``;
+    the carry plane of a saving ``P > 1`` forward under ``saved_carry``."""
     tb, opts = call.tb, call.opts
-    wait_first = call.schedule == "wait_first"
-    fuse_o = not replay and call.fwd_o_fuse == 1
-    call.fwd_walk = "kcp_fwdh_o" if fuse_o else "kcp_fwdh_tape"
     keep_transfer = opts.save_transfer and save and not replay
     if bound is None:
         call.fresh("S_in")
@@ -5391,13 +5377,50 @@ def _forward(
     ):  # the carry plane as a fresh tensor: the carry merges below write it, the tape walk reads it, the saved set keeps it
         plane = call.fresh("carry")
         call.scratch["saved_carry_plane"] = plane.numel() * plane.element_size()
+
+
+def _forward(
+    call: CallDetKcp,
+    *,
+    save: bool,
+    replay: bool,
+    bound: dict[str, torch.Tensor] | None = None,
+    alloc_out: bool = False,
+) -> None:
+    """The design note §3.5.  ``save``: the saved set is kept (fresh ``S_in``; with ``save_transfer`` also the c1 receive
+    tensor and ``M_seg``); ``replay``: the forward of a replay-mode backward (no ``fwd_o``, nothing kept).
+    ``bound``: the received tensors a recompute handle stored (``S_in``; under ``save_transfer`` also ``c1_recv``):
+    the recompute of a checkpointed forward binds them instead of exchanging -- no c1 / c2 / ring hop and no wait, no
+    owner merge, and no summary launch whose only reader is the exchange (``P = 1``: none; ``P > 1``: the two stage
+    walks that feed the carry merges stay, the map merge and the transpose into ``c1_send`` go); every other launch
+    is the same on the same bits.
+    ``schedule="wait_first"`` (the shipped default since an earlier revision): ``c1 -> wait -> fwd merge -> c2 -> wait -> carry merges -> tape walk(s)``
+    -- no merge or walk is issued while a collective is in flight (the R7 overlap of the document-start walk under c1
+    is dropped); the merges read only ``c1_recv`` / the staging planes and the tapes read no collective buffer, so
+    every published bit is the same.
+    The forward's state walk program (``call.fwd_walk``, every forward tape-walk launch site): the fused walk
+    ``kcp_fwdh_o`` (``out`` from the walk, no tape, no ``fwd_o`` launch) unless the forward keeps its tapes
+    (``replay``: the backward reads them) or the ``fwd_o_fuse`` knob is ``0``; then the tape walk and ``fwd_o``."""
+    tb = call.tb
+    wait_first = call.schedule == "wait_first"
+    fuse_o = not replay and call.fwd_o_fuse == 1
+    call.fwd_walk = "kcp_fwdh_o" if fuse_o else "kcp_fwdh_tape"
     if replay:  # the replay's prep (the GLM prep's rows, the internal dout copy), then the internal Aqk / Akk rows
+        _fwd_buffers(call, save=save, replay=replay, bound=bound)
         _bwd_rows(call, None)
     else:  # the intra program writes the GLM prep's rows itself (write_prep = 1); no token-row copies are saved
         if call.l2n:
             _qk_l2norm_stage(call)
         call.stage("fwd_intra")
         call.stage("wy_fwd")
+        # the two local stages read neither the KCP buffers nor ``out`` (their records bind no ``out``, and the
+        # buffers are K1-K4 / collective operands): allocated after the stages are issued, so the first launch does
+        # not wait for them (host order only: the same launches with the same arguments in the same order)
+        _fwd_buffers(call, save=save, replay=replay, bound=bound)
+        if alloc_out:
+            call.out = _alloc(
+                (call.T_r, call.H, D), call.backend.dtypes["out"], call.device
+            )
     if bound is None:
         _summaries(call)
     elif (
@@ -6235,8 +6258,7 @@ def _fwd_body(
     the tensors of a recompute handle's entry (:func:`_forward`); the saved set then holds them.  In-kernel Q / K L2
     norm: the rstd the fused intra program writes, kept by a saving forward (:func:`_qk_l2norm_begin`)."""
     rstd = _qk_l2norm_begin(call, save=save) if call.l2n else None
-    call.out = _alloc((call.T_r, call.H, D), call.backend.dtypes["out"], call.device)
-    _forward(call, save=save, replay=False, bound=bound)
+    _forward(call, save=save, replay=False, bound=bound, alloc_out=True)
     if call.l2n:
         call.l2n_values = None
     saved = None
