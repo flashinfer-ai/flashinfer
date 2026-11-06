@@ -65,17 +65,10 @@ from tests.test_helpers import cake_gdn_det_train_kcp_reference as REF
 
 
 def _package(submodule: str):
-    try:
-        from tests.test_helpers.cake_package import cake_package
+    """A module of the package through the test-helper registry: a stale entry fails here, never skips."""
+    from tests.test_helpers.cake_package import cake_package
 
-        return cake_package("cake_gdn_nondet_train_kcp", submodule)
-    except (
-        ImportError,
-        KeyError,
-    ):  # the test-helper registry has no entry for this package
-        return importlib.import_module(
-            f"flashinfer.experimental.cake.cake_gdn_nondet_train_kcp.{submodule}"
-        )
+    return cake_package("cake_gdn_nondet_train_kcp", submodule)
 
 
 def _det_package(submodule: str | None = None):
@@ -396,9 +389,9 @@ def test_plan_parity_with_kda_on_rows(path, monkeypatch) -> None:
     ``cake_gdn_nondet_train_kcp_comm_bytes`` equal the row JSON.  Both modules plan under the per-rank rule they share,
     ``"wave_fill1"`` (the GDN default is the row rule, the KDA default its own tie rule; each is selected explicitly
     here: the keyword-only ``p_rule`` on the GDN side, the private test hook on the KDA side)."""
-    kp = importlib.import_module(
-        "flashinfer.experimental.cake_kda_det_train_kcp.cake_kcp_plan"
-    )  # the test only
+    from tests.test_helpers.cake_package import cake_package
+
+    kp = cake_package("cake_kda_det_train_kcp", "cake_kcp_plan")  # the test only
     # the KDA module accepts its private test hook only after its opt-in (enable_test_knobs)
     monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
     with open(path) as fh:

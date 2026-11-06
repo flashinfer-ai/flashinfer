@@ -40,10 +40,11 @@ Mode
   ``Akk`` tape, which the backward's prep replay reads instead of solving the
   block inverse; it needs ``use_qk_l2norm_in_kernel=True``.
 
-Thin experimental entry points: the partition / context plan, the host
-orchestration, the saved set, the autograd Function and the generated kernels
-live in the package; this module forwards every keyword.  Every switch is a
-keyword argument; no environment variable is read.
+A stable FlashInfer API: thin ``@flashinfer_api`` entry points that import the
+package on first use.  The partition / context plan, the host orchestration,
+the saved set, the autograd Function and the generated kernels live in the
+package; this module forwards every keyword.  Every switch is a keyword
+argument; no environment variable is read.
 
 Operands of one rank (its ``T_r`` local tokens in fragment order): ``q, k``
 BF16 ``[1, T_r, H_qk, 128]`` (L2-normalized by the caller, or raw with
@@ -91,9 +92,7 @@ from typing import Any, Optional
 
 import torch
 
-from .api_logging import flashinfer_experimental_api
-
-_FEATURE = "Cake context-parallel packed GDN chunked training (SM100/SM103/SM107)"
+from .api_logging import flashinfer_api
 
 # The default scale of the contract: ``head_dim ** -0.5`` with head dimension 128.
 _DEFAULT_SCALE = 128**-0.5
@@ -121,7 +120,7 @@ def _options_for(options: Any) -> Any:
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_gdn_nondet_train_kcp_partition(
     cu_seqlens_global_cpu: Any,
     world_size: int,
@@ -159,7 +158,7 @@ def cake_gdn_nondet_train_kcp_partition(
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_gdn_nondet_train_kcp_build_context(
     part: Any,
     group: Any,
@@ -193,7 +192,7 @@ def cake_gdn_nondet_train_kcp_build_context(
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_gdn_nondet_train_kcp_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -257,7 +256,7 @@ def cake_gdn_nondet_train_kcp_forward(
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_gdn_nondet_train_kcp_backward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -309,7 +308,7 @@ def cake_gdn_nondet_train_kcp_backward(
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_gdn_nondet_kcp(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -421,7 +420,7 @@ def cake_gdn_nondet_kcp(
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_gdn_nondet_train_kcp_packed_qkv_views(
     qkv: torch.Tensor, *, H_qk: int, HV: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -444,7 +443,7 @@ def cake_gdn_nondet_train_kcp_packed_qkv_views(
     return _pkg().cake_gdn_nondet_train_kcp_packed_qkv_views(qkv, H_qk=H_qk, HV=HV)
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_gdn_nondet_train_kcp_workspace_bytes(
     ctx: Any, *, H_qk: int, HV: int, **kw: Any
 ) -> int:
@@ -457,7 +456,7 @@ def cake_gdn_nondet_train_kcp_workspace_bytes(
     return _pkg().cake_gdn_nondet_train_kcp_workspace_bytes(ctx, H_qk=H_qk, HV=HV, **kw)
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_gdn_nondet_train_kcp_saved_bytes(
     ctx: Any, *, H_qk: int, HV: int, **kw: Any
 ) -> int:
@@ -466,7 +465,7 @@ def cake_gdn_nondet_train_kcp_saved_bytes(
     return _pkg().cake_gdn_nondet_train_kcp_saved_bytes(ctx, H_qk=H_qk, HV=HV, **kw)
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_gdn_nondet_train_kcp_comm_bytes(
     ctx: Any,
     *,
@@ -480,6 +479,7 @@ def cake_gdn_nondet_train_kcp_comm_bytes(
     return _pkg().cake_gdn_nondet_train_kcp_comm_bytes(ctx, H_qk=H_qk, HV=HV, C=C, **kw)
 
 
+@flashinfer_api
 def is_cake_gdn_nondet_train_kcp_supported(
     device: torch.device | str | int | None = None,
 ) -> bool:

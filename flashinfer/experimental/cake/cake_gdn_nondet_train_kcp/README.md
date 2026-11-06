@@ -16,7 +16,9 @@ results are not bitwise equal to that package's.  It also takes the
 `save_mode` value `"light_akk"`, which the deterministic package does not
 take (see "Options").
 
-Both the API and the backend are experimental: no compatibility guarantee.
+The facade `flashinfer.cake_gdn_nondet_train_kcp` is a stable FlashInfer API:
+its entry points are `@flashinfer_api` functions.  This package, under
+`flashinfer.experimental.cake`, is its backend.
 SM100 (B200 / GB200) and SM103 (B300 / GB300) are the acceptance architectures
 of the kernels; SM107 (R200) is compiled from the same sources with an nvcc
 that emits `compute_107a`.  The feature does not participate in automatic
@@ -676,9 +678,10 @@ resident on a side stream therefore delays one CTA, not the whole grid.
 
 ## Status
 
-Experimental.  The kernels are the deterministic route's programs, rendered
-from the same Cake sources under this package's names, and the output walks
-`kcp_fwdh_out` and `kcp_fwdh_out_tape`, which have no deterministic twin;
+The backend of the stable facade (see the top of this file).  The kernels are
+the deterministic route's programs, rendered from the same Cake sources under
+this package's names, and the output walks `kcp_fwdh_out` and
+`kcp_fwdh_out_tape`, which have no deterministic twin;
 `build.json`'s `generator` block names the producing revision.  This package
 differs from its deterministic twin in the default segment plan
 (`fill_small_guard`, see "Faster schedule").  The tests are `tests/experimental/test_cake_gdn_nondet_train_kcp*.py`

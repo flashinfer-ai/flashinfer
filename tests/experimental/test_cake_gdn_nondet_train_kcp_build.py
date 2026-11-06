@@ -56,12 +56,9 @@ def _few_cpu_threads():
 
 
 def _package_import() -> str:
-    """The import path of the package: the test-helper registry's entry when the registry is importable, else the
-    in-tree path."""
-    try:
-        from tests.test_helpers.cake_package import PACKAGES
-    except ImportError:
-        return f"flashinfer.experimental.cake.{PACKAGE}"
+    """The import path of the package: the test-helper registry's entry (a stale entry fails here, never skips)."""
+    from tests.test_helpers.cake_package import PACKAGES
+
     return PACKAGES[PACKAGE]
 
 
@@ -320,11 +317,9 @@ def test_the_loader_and_header_are_the_pinned_bytes_of_every_cake_package() -> N
     _cake_build()
     if not (PACKAGE_DIR / "csrc" / "cake_ffi_checks.h").is_file():
         pytest.skip("csrc/cake_ffi_checks.h is not rendered into the package yet")
-    kda_dir = Path(
-        importlib.import_module(
-            "flashinfer.experimental.cake_kda_det_train.cake_build"
-        ).__file__
-    ).parent
+    from tests.test_helpers.cake_package import cake_package
+
+    kda_dir = Path(cake_package("cake_kda_det_train", "cake_build").__file__).parent
     for relative in ("cake_build.py", "csrc/cake_ffi_checks.h"):
         ours = (PACKAGE_DIR / relative).read_bytes()
         theirs = (kda_dir / relative).read_bytes()

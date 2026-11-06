@@ -37,23 +37,18 @@ census and the saved bytes, ``graph="replay"`` steps, the multi-rank rows; bits 
 from __future__ import annotations
 
 import dataclasses
-import importlib
 import inspect
 import math
 
 import pytest
 import torch
 
-PACKAGE = "flashinfer.experimental.cake.cake_gdn_nondet_train_kcp"
-
 
 def _mod(sub: str | None = None):
-    try:
-        from tests.test_helpers.cake_package import cake_package
+    """The package (or one of its modules) through the test-helper registry: a stale entry fails here, never skips."""
+    from tests.test_helpers.cake_package import cake_package
 
-        return cake_package("cake_gdn_nondet_train_kcp", sub)
-    except (ImportError, KeyError):
-        return importlib.import_module(PACKAGE if sub is None else f"{PACKAGE}.{sub}")
+    return cake_package("cake_gdn_nondet_train_kcp", sub)
 
 
 kcp = _mod("cake_kcp")

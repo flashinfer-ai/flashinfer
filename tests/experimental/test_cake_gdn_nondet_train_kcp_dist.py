@@ -45,7 +45,7 @@ what stays exact is structural (zero gradients, collective counts, byte counts, 
   (``b1``, ``b2``) and no ``all_reduce`` / ``reduce_scatter`` of parameters;
 * the host of every rank (``socket.gethostname``); under Slurm the group spans the hosts the step's task layout gives
   its ranks (the cross-host rows of a multi-node step);
-* the deterministic route (``flashinfer.cake_gdn_det_train_kcp``) on the same operands in the same process: both routes
+* the deterministic package (``cake_gdn_det_train_kcp``) on the same operands in the same process: both packages
   within the same FP64 budgets and their difference within the same budget constants (FP64 is the reference).
 
 ``test_poisoned_workspace_pairs``: one ``CakeGDNNondetKcpWorkspace`` reused across two rows of different token layouts on one group,
@@ -72,7 +72,9 @@ sub-group of its ``W`` lowest ranks; the other ranks skip the row).  Environment
 (row or pair names, comma list; ``all``; or a stage: ``int1`` CP <= 4, ``int3`` CP8, ``int4`` CP16),
 ``KCP_TEST_RESULT_DIR`` (one JSON per row), ``KCP_TEST_MODE`` (``full`` | ``forward``), ``KCP_TEST_REPEATS`` (raises
 ``N_REPEAT`` above 3), ``KCP_TEST_PORT_DIR`` (the Slurm rendezvous port file), ``KCP_TEST_DEBUG_RETAINED``.
-Operands come from the seeded CPU generator (bitwise identical on every rank and host).
+Operands come from the seeded CPU generator (bitwise identical on every rank and host).  The suite imports this package,
+the deterministic package and the causal-convolution package through ``tests/test_helpers/cake_package.py`` and
+nothing else from flashinfer (the facade's tests live in ``test_cake_gdn_nondet_train_kcp_api.py``).
 """
 
 from __future__ import annotations
@@ -102,12 +104,7 @@ import torch.multiprocessing as mp
 
 from tests.test_helpers.kcp_collective_shims import CollectiveCounter, RecomputePhase
 
-PACKAGE = "flashinfer.experimental.cake.cake_gdn_nondet_train_kcp"
-DET_PACKAGE = "flashinfer.experimental.cake.cake_gdn_det_train_kcp"
-DET_API = (
-    "flashinfer.cake_gdn_det_train_kcp"  # the deterministic route's public objects
-)
-FACADE = "flashinfer.cake_gdn_nondet_train_kcp"  # this package's facade
+PACKAGE = "flashinfer.experimental.cake.cake_gdn_nondet_train_kcp"  # the in-tree path (report metadata)
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -127,24 +124,27 @@ def _few_cpu_threads():
 
 
 def _mod(sub: str | None = None):
-    try:
-        from tests.test_helpers.cake_package import cake_package
+    """The package (or one of its modules) through the test-helper registry: a stale entry fails here, never skips."""
+    from tests.test_helpers.cake_package import cake_package
 
-        return cake_package("cake_gdn_nondet_train_kcp", sub)
-    except (ImportError, KeyError):
-        return importlib.import_module(PACKAGE if sub is None else f"{PACKAGE}.{sub}")
+    return cake_package("cake_gdn_nondet_train_kcp", sub)
 
 
 def _det_mod(sub: str | None = None):
-    """A module of the deterministic package (its ``LAST_CALL`` for the collective comparison)."""
-    try:
-        from tests.test_helpers.cake_package import cake_package
+    """A module of the deterministic package through the test-helper registry (its entries and its ``LAST_CALL`` for
+    the collective comparison)."""
+    from tests.test_helpers.cake_package import cake_package
 
-        return cake_package("cake_gdn_det_train_kcp", sub)
-    except (ImportError, KeyError):
-        return importlib.import_module(
-            DET_PACKAGE if sub is None else f"{DET_PACKAGE}.{sub}"
-        )
+    return cake_package("cake_gdn_det_train_kcp", sub)
+
+
+def _conv_mod(sub: str | None = None):
+    """The deterministic causal-convolution package (or its ``kcp`` module) through the test-helper registry: the
+    entries ``cake_causal_conv1d_det`` / ``is_cake_causal_conv1d_det_train_supported`` and
+    ``kcp.cake_causal_conv1d_det_kcp`` that its facades forward to."""
+    from tests.test_helpers.cake_package import cake_package
+
+    return cake_package("cake_causal_conv1d_det_train", sub)
 
 
 kcp = _mod("cake_kcp")
@@ -2447,22 +2447,22 @@ def _run_rank(
         "named": cc_nd.record()["named"].get("bwd", {}),
         "tags": _coll_tags(kcp.LAST_CALL["bwd"]["sequence"]),
     }
-    # (f) the deterministic route (flashinfer.cake_gdn_det_train_kcp objects, its own partition / context /
-    # workspace of the same row) and this route through its facade on the same operands
-    det_api = importlib.import_module(DET_API)
+    # (f) the deterministic package (its own partition / context / workspace of the same row) and this package
+    # through its root's entries on the same operands
     det_kcp = _det_mod("cake_kcp")
-    api = importlib.import_module(FACADE)
-    det_part, _ = _partition_with(det_api.cake_gdn_det_train_kcp_partition, row)
-    det_ctx = det_api.cake_gdn_det_train_kcp_build_context(
+    det_plan = _det_mod("cake_kcp_plan")
+    pkg = _mod()
+    det_part, _ = _partition_with(det_plan.cake_gdn_det_train_kcp_partition, row)
+    det_ctx = det_plan.cake_gdn_det_train_kcp_build_context(
         det_part, group, rank, device
     )
-    det_ws = det_api.CakeGDNDetKcpWorkspace()
-    d_out, d_saved = det_api.cake_gdn_det_train_kcp_forward(
+    det_ws = det_kcp.CakeGDNDetKcpWorkspace()
+    d_out, d_saved = det_kcp.cake_gdn_det_train_kcp_forward(
         q, k, v, g, beta, det_ctx, workspace=det_ws, **base
     )
     with _NamedCounter() as cc_det:
         cc_det.phase = "bwd"
-        d_grads = det_api.cake_gdn_det_train_kcp_backward(
+        d_grads = det_kcp.cake_gdn_det_train_kcp_backward(
             q, k, v, g, beta, det_ctx, dout, saved=d_saved, workspace=det_ws, **base
         )
     coll_det = {
@@ -2473,10 +2473,10 @@ def _run_rank(
         "out": d_out,
         **dict(zip(("dq", "dk", "dv", "dbeta", "dg"), d_grads, strict=True)),
     }
-    f_out, f_saved = api.cake_gdn_nondet_train_kcp_forward(
+    f_out, f_saved = pkg.cake_gdn_nondet_train_kcp_forward(
         q, k, v, g, beta, ctx, workspace=ws, **base
     )
-    f_grads = api.cake_gdn_nondet_train_kcp_backward(
+    f_grads = pkg.cake_gdn_nondet_train_kcp_backward(
         q,
         k,
         v,
@@ -2488,23 +2488,23 @@ def _run_rank(
         workspace=ws,
         **base,
     )
-    res_facade = {
+    res_root = {
         "out": f_out,
         **dict(zip(("dq", "dk", "dv", "dbeta", "dg"), f_grads, strict=True)),
     }
     info["routes"] = {
         "det_saved": type(d_saved).__name__,
-        "facade_saved": type(f_saved).__name__,
+        "root_saved": type(f_saved).__name__,
     }
-    flags["facade_routes_nondet"] = (
+    flags["root_routes_nondet"] = (
         type(f_saved).__name__ == "CakeGDNNondetKcpSaved"
         and type(d_saved).__name__ == "CakeGDNDetKcpSaved"
     )
     judge.fp64("det_route", res_det, refs)
-    judge.fp64("facade_nondet", res_facade, refs)
-    judge.cross("facade_nondet_vs_det", res_facade, res_det)
+    judge.fp64("root_nondet", res_root, refs)
+    judge.cross("root_nondet_vs_det", res_root, res_det)
     judge.cross("run0_vs_det", res, res_det)
-    del res_det, res_facade, d_out, d_saved, d_grads, f_out, f_saved, f_grads, det_ws
+    del res_det, res_root, d_out, d_saved, d_grads, f_out, f_saved, f_grads, det_ws
     info["collectives"] = {"nondet": coll_nd, "det": coll_det}
     flags["bwd_collectives_eq_det"] = coll_nd == coll_det
     flags["bwd_collectives_b1_b2"] = coll_nd["tags"] in (
@@ -3367,8 +3367,8 @@ def _run_rank_conv(
     """C7 on one rank: ``y`` / ``dx`` / ``dweight`` of the rank's tokens against the FP64 oracle of the whole pack,
     ``y`` bitwise equal to the conv package's single-rank conv of the whole pack on the rank's tokens, its repeat
     bitwise, and the halo-row gradients delivered to the predecessor ranks (rank 0 / 1: 1 / 2 tokens of document 0)."""
-    from flashinfer import cake_causal_conv1d_det_train as conv
-    from flashinfer import cake_causal_conv1d_det_train_kcp as conv_kcp
+    conv = _conv_mod()
+    conv_kcp = _conv_mod("kcp")
 
     part, cu = _partition(row)
     ctx = plan.cake_gdn_nondet_train_kcp_build_context(part, group, rank, device)
@@ -3458,7 +3458,7 @@ def test_conv_halo_row(slurm) -> None:
     predecessor ranks, an empty predecessor and a document start.  Runs under Slurm with >= 4 ranks."""
     if slurm is None:
         pytest.skip("the conv halo row runs under Slurm (4 ranks)")
-    conv = pytest.importorskip("flashinfer.cake_causal_conv1d_det_train")
+    conv = _conv_mod()
     if not conv.is_cake_causal_conv1d_det_train_supported(slurm.device):
         pytest.skip("the conv package does not support this device")
     _slurm_row(C7_ROW, slurm, "conv", _run_rank_conv)
@@ -3575,8 +3575,8 @@ def _run_rank_layer(
 ) -> dict:
     """One whole-layer row (``l2n``: #7817, the in-kernel L2 norm on the raw convolution output views instead of the
     caller's norm)."""
-    from flashinfer import cake_causal_conv1d_det_train as conv
-    from flashinfer import cake_causal_conv1d_det_train_kcp as conv_kcp
+    conv = _conv_mod()
+    conv_kcp = _conv_mod("kcp")
 
     H_qk, HV = row.heads
     C = (2 * H_qk + HV) * 128
@@ -3661,9 +3661,10 @@ def _run_rank_layer(
     res_h, rec_h = run("handle")
     # (b) the deterministic layer (its own context of the same partition; the convolution reads it by duck typing):
     # the direct backward's collectives by name
-    det_api = importlib.import_module(DET_API)
-    det_part, _ = _partition_with(det_api.cake_gdn_det_train_kcp_partition, row)
-    det_ctx = det_api.cake_gdn_det_train_kcp_build_context(
+    det_kcp = _det_mod("cake_kcp")
+    det_plan = _det_mod("cake_kcp_plan")
+    det_part, _ = _partition_with(det_plan.cake_gdn_det_train_kcp_partition, row)
+    det_ctx = det_plan.cake_gdn_det_train_kcp_build_context(
         det_part, group, rank, device
     )
     det_leaves = leaves_of()
@@ -3675,7 +3676,7 @@ def _run_rank_layer(
         else:
             qd = _l2_normalize(qkv_d[:, :H_qk])
             kd = _l2_normalize(qkv_d[:, H_qk : 2 * H_qk])
-        out_det = det_api.cake_gdn_det_kcp(
+        out_det = det_kcp.cake_gdn_det_kcp(
             qd,
             kd,
             qkv_d[:, 2 * H_qk :],
@@ -3780,7 +3781,7 @@ def test_layer_checkpoint_rows(row: Row, slurm) -> None:
     region with one recompute handle (see the block comment above).  Runs under Slurm with >= the row's ranks."""
     if slurm is None:
         pytest.skip("the layer rows run under Slurm")
-    conv = pytest.importorskip("flashinfer.cake_causal_conv1d_det_train")
+    conv = _conv_mod()
     if not conv.is_cake_causal_conv1d_det_train_supported(slurm.device):
         pytest.skip("the conv package does not support this device")
     _slurm_row(row, slurm, _backend_name(), _run_rank_layer)
@@ -4339,16 +4340,17 @@ def _run_rank_l2n(
     )  # reported, as the norm-off host form
 
     # (b) the deterministic package with the norm on the same raw operands (its own partition / context / workspace)
-    det_api = importlib.import_module(DET_API)
-    det_part, _ = _partition_with(det_api.cake_gdn_det_train_kcp_partition, row)
-    det_ctx = det_api.cake_gdn_det_train_kcp_build_context(
+    det_kcp = _det_mod("cake_kcp")
+    det_plan = _det_mod("cake_kcp_plan")
+    det_part, _ = _partition_with(det_plan.cake_gdn_det_train_kcp_partition, row)
+    det_ctx = det_plan.cake_gdn_det_train_kcp_build_context(
         det_part, group, rank, device
     )
-    det_ws = det_api.CakeGDNDetKcpWorkspace()
-    d_out, d_saved = det_api.cake_gdn_det_train_kcp_forward(
+    det_ws = det_kcp.CakeGDNDetKcpWorkspace()
+    d_out, d_saved = det_kcp.cake_gdn_det_train_kcp_forward(
         q, k, v, g, beta, det_ctx, workspace=det_ws, **base, **L2N
     )
-    d_grads = det_api.cake_gdn_det_train_kcp_backward(
+    d_grads = det_kcp.cake_gdn_det_train_kcp_backward(
         q, k, v, g, beta, det_ctx, dout, saved=d_saved, workspace=det_ws, **base, **L2N
     )
     res_det = {
@@ -4805,7 +4807,7 @@ def test_l2n_layer_checkpoint_rows(row: Row, slurm) -> None:
     and without a recompute handle, against the FP64 layer oracle and one another within the budgets."""
     if slurm is None:
         pytest.skip("the layer rows run under Slurm")
-    conv = pytest.importorskip("flashinfer.cake_causal_conv1d_det_train")
+    conv = _conv_mod()
     if not conv.is_cake_causal_conv1d_det_train_supported(slurm.device):
         pytest.skip("the conv package does not support this device")
     backend = _backend_name()

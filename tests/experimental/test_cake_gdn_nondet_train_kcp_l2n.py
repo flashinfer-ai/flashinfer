@@ -22,8 +22,8 @@ CPU tests of the in-kernel Q / K L2 norm of the non-deterministic KCP GDN packag
   against the norm-off programs on the normalized rows;
 * the host plumbing on the fake backend: the composed chain (helper -> norm-off route on ``(q_hat, k_hat)`` ->
   helper pullback) bitwise, every saved / replay / checkpoint / handle form bitwise the direct one, ``qn`` / ``kn``
-  never retained, the saved set v2, the option and the facade keyword, the byte queries; and the deterministic package with the norm on the same inputs within the
-  deterministic accuracy constants;
+  never retained, the saved set v2, the option keyword, the byte queries; and the deterministic package with the
+  norm on the same inputs within the deterministic accuracy constants;
 * issue #8367 (norm off and on): plain ``split`` / ``view`` head views of a packed QKV row keep torch's autograd
   path -- their hooks and ``retain_grad`` fire, the gradients are bitwise (fake backend) those of contiguous
   operands and of ``cake_gdn_nondet_train_kcp_packed_qkv_views`` views, and only the packed views hand the packed dQKV row on without a
@@ -31,12 +31,13 @@ CPU tests of the in-kernel Q / K L2 norm of the non-deterministic KCP GDN packag
 
 The fake backend is not bitwise the device programs in #1 / #8's bodies (different accumulation orders): these tests
 prove the plumbing and the oracle, not GPU numerics (``test_cake_gdn_nondet_train_kcp_dist.py`` holds the GPU rows).
+The suite imports the package and the deterministic package through ``tests/test_helpers/cake_package.py`` and nothing
+else from flashinfer; the facade's hand-off of the option is tested in ``test_cake_gdn_nondet_train_kcp_api.py``.
 """
 
 from __future__ import annotations
 
 import dataclasses
-import importlib
 import inspect
 import math
 import struct
@@ -46,16 +47,12 @@ from fractions import Fraction
 import pytest
 import torch
 
-PACKAGE = "flashinfer.experimental.cake.cake_gdn_nondet_train_kcp"
-
 
 def _mod(sub: str | None = None):
-    try:
-        from tests.test_helpers.cake_package import cake_package
+    """The package (or one of its modules) through the test-helper registry: a stale entry fails here, never skips."""
+    from tests.test_helpers.cake_package import cake_package
 
-        return cake_package("cake_gdn_nondet_train_kcp", sub)
-    except (ImportError, KeyError):
-        return importlib.import_module(PACKAGE if sub is None else f"{PACKAGE}.{sub}")
+    return cake_package("cake_gdn_nondet_train_kcp", sub)
 
 
 def _det_mod(sub: str | None = None):
@@ -1192,8 +1189,9 @@ def test_handle_key_carries_the_flag() -> None:
 
 
 def test_option_keyword_and_override_rule() -> None:
-    """One public keyword: a ``CakeGDNNondetKcpOptions`` field (bool only), keyword-only on the three entry points and the facade,
-    following the literal-override rule (an ``options`` instance wins over the default keyword); no rstd keyword."""
+    """One public keyword: a ``CakeGDNNondetKcpOptions`` field (bool only), keyword-only on the three entry points,
+    following the literal-override rule (an ``options`` instance wins over the default keyword); no rstd keyword (the
+    facade's hand-off: ``test_cake_gdn_nondet_train_kcp_api.py``)."""
     opt = _mod("cake_options")
     assert opt.make_options().use_qk_l2norm_in_kernel is False
     assert "use_qk_l2norm_in_kernel" in opt.OPTION_NAMES
@@ -1203,7 +1201,6 @@ def test_option_keyword_and_override_rule() -> None:
     assert (
         opt.make_options(use_qk_l2norm_in_kernel=True).key() != opt.make_options().key()
     )  # the graph key
-    facade = importlib.import_module("flashinfer.cake_gdn_nondet_train_kcp")
     for fn in (
         kcp.cake_gdn_nondet_kcp,
         kcp.cake_gdn_nondet_train_kcp_forward,
@@ -1212,15 +1209,6 @@ def test_option_keyword_and_override_rule() -> None:
         params = inspect.signature(fn).parameters
         p = params["use_qk_l2norm_in_kernel"]
         assert p.kind == p.KEYWORD_ONLY and p.default is False, fn
-        assert not any("rstd" in n for n in params), fn
-    # the facade forwards the option through its keyword arguments to the package
-    for fn in (
-        facade.cake_gdn_nondet_kcp,
-        facade.cake_gdn_nondet_train_kcp_forward,
-        facade.cake_gdn_nondet_train_kcp_backward,
-    ):
-        params = inspect.signature(fn).parameters
-        assert any(p.kind == p.VAR_KEYWORD for p in params.values()), fn
         assert not any("rstd" in n for n in params), fn
     ctx, ops = _setup()
     on = kcp.make_options(backend="fake", use_qk_l2norm_in_kernel=True)
@@ -1242,7 +1230,7 @@ def test_option_keyword_and_override_rule() -> None:
     )
     assert kcp.LAST_CALL["fwd"]["qk_l2norm"] is True
     leaves = [x.detach().clone().requires_grad_(True) for x in _ops(ops)]
-    facade.cake_gdn_nondet_kcp(
+    kcp.cake_gdn_nondet_kcp(
         *leaves, ctx, backend="fake", use_qk_l2norm_in_kernel=True
     ).backward(ops["dout"])
     assert (
@@ -1546,73 +1534,6 @@ def test_no_fla_import() -> None:
     ctx, ops = _setup()
     _saved_pass(ctx, ops, use_qk_l2norm_in_kernel=True)
     assert "fla" not in sys.modules
-
-
-def test_facade_runs_the_norm() -> None:
-    """The ``flashinfer.cake_gdn_nondet_train_kcp`` facade hands ``use_qk_l2norm_in_kernel`` (keyword, mapping or this
-    package's options instance) to this package, which runs the norm: bitwise the package's own call; ``False`` is
-    the norm-off route.  An options instance of the deterministic package is a ``TypeError``."""
-    facade = importlib.import_module("flashinfer.cake_gdn_nondet_train_kcp")
-    det_options = _det_mod("cake_options")
-    ctx, ops = _setup()
-    want = _saved_pass(ctx, ops, use_qk_l2norm_in_kernel=True)
-    for how in (
-        {"use_qk_l2norm_in_kernel": True},
-        {"options": {"backend": "fake", "use_qk_l2norm_in_kernel": True}},
-        {"options": kcp.make_options(backend="fake", use_qk_l2norm_in_kernel=True)},
-    ):
-        kw = {} if "options" in how else {"backend": "fake"}
-        out, saved = facade.cake_gdn_nondet_train_kcp_forward(
-            *_ops(ops), ctx, **kw, **how
-        )
-        assert kcp.LAST_CALL["fwd"]["qk_l2norm"] is True and saved.qk_l2norm, how
-        dq, dk, dv, dbeta, dg = facade.cake_gdn_nondet_train_kcp_backward(
-            *_ops(ops), ctx, ops["dout"], saved=saved, **kw, **how
-        )
-        got = {"out": out, "dq": dq, "dk": dk, "dv": dv, "dg": dg, "dbeta": dbeta}
-        _same(got, want, f"facade {how}")
-    off = facade.cake_gdn_nondet_train_kcp_forward(
-        *_ops(ops),
-        ctx,
-        backend="fake",
-        use_qk_l2norm_in_kernel=False,
-    )[1]
-    assert off.qk_l2norm is False and off.qk_rstd is None
-    assert kcp.LAST_CALL["fwd"]["qk_l2norm"] is False
-    det_o = det_options.CakeGDNDetKcpOptions(
-        backend="fake", use_qk_l2norm_in_kernel=True
-    )
-    with pytest.raises(TypeError, match="^options must be a CakeGDNNondetKcpOptions"):
-        facade.cake_gdn_nondet_train_kcp_forward(*_ops(ops), ctx, options=det_o)
-
-
-def test_facade_byte_queries_take_the_option() -> None:
-    """The facade's byte queries forward ``use_qk_l2norm_in_kernel`` to this package; its norm terms equal those of the
-    deterministic package's own queries (``flashinfer.cake_gdn_det_train_kcp``; same plan inputs, same formulas), and
-    the saved set grows by the FP32 ``r`` of q and k (``8 T_r H_qk`` bytes)."""
-    facade = importlib.import_module("flashinfer.cake_gdn_nondet_train_kcp")
-    det_facade = importlib.import_module("flashinfer.cake_gdn_det_train_kcp")
-    ctx, _ops_ = _setup()
-    H_qk, HV = 2, 6
-    for query in ("saved_bytes", "workspace_bytes"):
-        q = getattr(facade, f"cake_gdn_nondet_train_kcp_{query}")
-        det_q = getattr(det_facade, f"cake_gdn_det_train_kcp_{query}")
-        on = q(ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=True)
-        off = q(ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=False)
-        det_on = det_q(ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=True)
-        det_off = det_q(ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=False)
-        assert on > off and det_on > det_off, query
-        assert on - off == det_on - det_off, query
-        assert on == getattr(gbytes, f"cake_gdn_nondet_train_kcp_{query}")(
-            ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=True
-        ), query
-    assert (
-        facade.cake_gdn_nondet_train_kcp_saved_bytes(
-            ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=True
-        )
-        - facade.cake_gdn_nondet_train_kcp_saved_bytes(ctx, H_qk=H_qk, HV=HV)
-        == 8 * int(ctx.T_r) * H_qk
-    )
 
 
 def _rel_rms(a: torch.Tensor, b: torch.Tensor) -> float:

@@ -28,7 +28,6 @@ tape-and-output walk ``kcp_fwdh_out_tape`` under both schedules and with its spl
 
 from __future__ import annotations
 
-import importlib
 import math
 import os
 import tempfile
@@ -38,7 +37,6 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-PACKAGE = "flashinfer.experimental.cake.cake_gdn_nondet_train_kcp"
 W = 4
 H_QK, HV = 2, 4
 # contiguous layout: 256 tokens per rank
@@ -53,12 +51,10 @@ TENSORS = ("out", "dq", "dk", "dv", "dbeta", "dg")
 
 
 def _mod(sub: str):
-    try:
-        from tests.test_helpers.cake_package import cake_package
+    """A module of the package through the test-helper registry: a stale entry fails here, never skips."""
+    from tests.test_helpers.cake_package import cake_package
 
-        return cake_package("cake_gdn_nondet_train_kcp", sub)
-    except (ImportError, KeyError):
-        return importlib.import_module(f"{PACKAGE}.{sub}")
+    return cake_package("cake_gdn_nondet_train_kcp", sub)
 
 
 def _global_inputs(cu: list[int], seed: int = 20261029) -> dict[str, torch.Tensor]:

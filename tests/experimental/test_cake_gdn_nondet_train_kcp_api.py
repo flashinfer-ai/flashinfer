@@ -13,15 +13,16 @@ limitations under the License.
 CPU tests of the public surface of the NON-DETERMINISTIC context-parallel packed GDN training package
 ``flashinfer.experimental.cake.cake_gdn_nondet_train_kcp`` and of its facade ``flashinfer.cake_gdn_nondet_train_kcp`` (this
 package only; the deterministic counterpart is ``flashinfer.cake_gdn_det_train_kcp``): the options validator
-(``cake_options``), the keyword-only signatures, the facade's and the package's exact public names (every one names
-the mode ``nondet``; the former names and module paths fail at import), the numerical mode (in the name only: no
-entry takes ``deterministic``, a stray keyword is a ``TypeError``; every launch being fixed-order, nothing alerts,
-reroutes or warns under ``torch.use_deterministic_algorithms``; no context, partition or options field holds the
-mode), the package hygiene rules (no environment variable, no KDA package import, standalone: no import of another
-FlashInfer package, its deterministic counterpart included, and no library name of that package) and the host tables
-built on the CPU for the correctness rows' partitions.  No kernel runs here: the compute entries run on the fake
-backend (the CPU emulation), directly or through ``KernelBackend`` with a stub launch glue (the architecture the
-kernel backend passes to the #7 walks).
+(``cake_options``), the keyword-only signatures, the facade's and the package's exact public names (each with the
+word ``nondet``; the former names and module paths fail at import), the facade as a stable API (``@flashinfer_api``
+entries, not marked experimental, a first call warns of nothing), the numerical mode (in the name only: no entry
+takes ``deterministic``, a stray keyword is a ``TypeError``; every launch being fixed-order, nothing alerts, reroutes
+or warns under ``torch.use_deterministic_algorithms``; no context, partition or options field holds the mode), the
+facade's hand-off of ``use_qk_l2norm_in_kernel`` to the package, the package hygiene rules (no environment variable,
+no KDA package import, standalone: no import of another FlashInfer package, its deterministic counterpart included,
+and no library name of that package) and the host tables built on the CPU for the correctness rows' partitions.  No
+kernel runs here: the compute entries run on the fake backend (the CPU emulation), directly or through
+``KernelBackend`` with a stub launch glue (the architecture the kernel backend passes to the #7 walks).
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ import importlib.util
 import inspect
 import json
 import pathlib
+import re
 import subprocess
 import sys
 import types
@@ -696,13 +698,42 @@ def test_package_init_exports_exactly_the_mode_named_names() -> None:
     assert pkg.CakeGDNNondetKcpFunction.__qualname__ == "CakeGDNNondetKcpFunction"
 
 
+# One word of a name part: an acronym run before a capitalized word, a capitalized or lower-case word, the rest of an
+# acronym run, digits.
+_WORD = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|[0-9]+")
+
+
+def _name_tokens(name: str) -> list[str]:
+    """The lower-cased words of ``name``, split on ``_`` and on CamelCase boundaries, an acronym run as one word
+    (``CakeGDNNondetKcpFunction``: ``cake``, ``gdn``, ``nondet``, ``kcp``, ``function``)."""
+    return [word.lower() for part in name.split("_") for word in _WORD.findall(part)]
+
+
 def test_every_public_name_names_the_nondet_mode() -> None:
-    """Every name of the facade's and the package's ``__all__`` contains the whole mode word ``nondet`` (``det``
-    alone is not enough: ``"det" in "nondet"``)."""
+    """Every name of the facade's and the package's ``__all__`` has the mode word ``nondet`` as a word of its own and
+    no word ``det`` (see ``_name_tokens``: ``det`` is a substring of ``nondet``, so a substring check cannot tell the
+    modes apart)."""
+    # the split itself: an acronym run is one word, and ``det`` is a word of a det name only
+    for name, words in (
+        ("CakeGDNNondetKcpFunction", "cake gdn nondet kcp function"),
+        (
+            "CakeGDNNondetKcpPackedQKVSplitFunction",
+            "cake gdn nondet kcp packed qkv split function",
+        ),
+        (
+            "is_cake_gdn_nondet_train_kcp_supported",
+            "is cake gdn nondet train kcp supported",
+        ),
+        ("CakeGDNDetKcpFunction", "cake gdn det kcp function"),
+        ("cake_gdn_det_train_kcp_forward", "cake gdn det train kcp forward"),
+    ):
+        assert _name_tokens(name) == words.split(), name
     facade = importlib.import_module(FACADE)
     names = set(facade.__all__) | set(_mod().__all__)
-    bad = sorted(n for n in names if "nondet" not in n.lower())
-    assert not bad, bad
+    assert names == set(FACADE_FUNCTIONS) | PACKAGE_NAMES
+    for name in sorted(names):
+        tokens = _name_tokens(name)
+        assert "nondet" in tokens and "det" not in tokens, (name, tokens)
 
 
 def test_importing_the_facade_does_not_import_the_package() -> None:
@@ -724,6 +755,97 @@ def test_importing_the_facade_does_not_import_the_package() -> None:
         timeout=600,
     )
     assert proc.returncode == 0, proc.stderr[-4000:]
+
+
+def test_the_facade_is_a_stable_api() -> None:
+    # real ``@flashinfer_api`` defs of the facade module, not marked by the experimental-API decorator (it sets
+    # ``is_experimental`` and ``experimental_feature`` and puts a ``.. warning::`` banner first in the docstring)
+    facade = importlib.import_module(FACADE)
+    for name in FACADE_FUNCTIONS:
+        entry = getattr(facade, name)
+        assert inspect.unwrap(entry).__module__ == FACADE, name
+        assert not getattr(entry, "is_experimental", False), name
+        assert not hasattr(entry, "experimental_feature"), name
+        assert not entry.__doc__.lstrip().startswith(".. warning::"), name
+    # the source: every entry is a top-level def with the one decorator ``@flashinfer_api`` (at the default log level
+    # the decorator returns the function itself, so only the source shows it), the only name taken from
+    # ``api_logging``
+    tree = ast.parse(_facade_source().read_text())
+    decorators = {
+        node.name: [ast.unparse(d) for d in node.decorator_list]
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+    }
+    for name in FACADE_FUNCTIONS:
+        assert decorators.get(name) == ["flashinfer_api"], (name, decorators.get(name))
+    imported = [
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module == "api_logging"
+        for alias in node.names
+    ]
+    assert imported == ["flashinfer_api"], imported
+    # a fresh interpreter, since the experimental-API decorator warns on the first call of a process only: the first
+    # call of every facade entry, with a keyword the entry does not take, fails with a TypeError on host operands
+    # (at the signature, or in the package before any work for the entries that take ``**knobs`` / ``**kw``) and
+    # warns of nothing.  The package is imported before the calls, so only the entries' own first calls are recorded.
+    code = (
+        "import warnings\n"
+        "import torch\n"
+        f"import {FACADE} as facade\n"
+        "pkg = facade._pkg()\n"
+        f"part = pkg.cake_gdn_nondet_train_kcp_partition({MODE_CU!r}, 1, 'contiguous')\n"
+        "ctx = pkg.cake_gdn_nondet_train_kcp_build_context(part, None, 0, 'cpu', sm_count=148)\n"
+        f"T = {MODE_CU[-1]}\n"
+        "q = torch.zeros(T, 2, 128, dtype=torch.bfloat16)\n"
+        "v = torch.zeros(T, 6, 128, dtype=torch.bfloat16)\n"
+        "g, beta = torch.zeros(T, 6), torch.zeros(T, 6)\n"
+        "bad = {'deterministic': False}\n"
+        "calls = {\n"
+        "    'cake_gdn_nondet_train_kcp_partition': lambda: facade.cake_gdn_nondet_train_kcp_partition(\n"
+        f"        {MODE_CU!r}, 1, **bad),\n"
+        "    'cake_gdn_nondet_train_kcp_build_context': lambda: facade.cake_gdn_nondet_train_kcp_build_context(\n"
+        "        part, None, 0, 'cpu', **bad),\n"
+        "    'cake_gdn_nondet_kcp': lambda: facade.cake_gdn_nondet_kcp(\n"
+        "        q, q, v, g, beta, ctx, backend='fake', **bad),\n"
+        "    'cake_gdn_nondet_train_kcp_forward': lambda: facade.cake_gdn_nondet_train_kcp_forward(\n"
+        "        q, q, v, g, beta, ctx, backend='fake', **bad),\n"
+        "    'cake_gdn_nondet_train_kcp_backward': lambda: facade.cake_gdn_nondet_train_kcp_backward(\n"
+        "        q, q, v, g, beta, ctx, v, backend='fake', **bad),\n"
+        "    'cake_gdn_nondet_train_kcp_packed_qkv_views': lambda: facade.cake_gdn_nondet_train_kcp_packed_qkv_views(\n"
+        "        torch.zeros(4, 10 * 128, dtype=torch.bfloat16), H_qk=2, HV=6, **bad),\n"
+        "    'cake_gdn_nondet_train_kcp_workspace_bytes': lambda: facade.cake_gdn_nondet_train_kcp_workspace_bytes(\n"
+        "        ctx, H_qk=2, HV=6, **bad),\n"
+        "    'cake_gdn_nondet_train_kcp_saved_bytes': lambda: facade.cake_gdn_nondet_train_kcp_saved_bytes(\n"
+        "        ctx, H_qk=2, HV=6, **bad),\n"
+        "    'cake_gdn_nondet_train_kcp_comm_bytes': lambda: facade.cake_gdn_nondet_train_kcp_comm_bytes(\n"
+        "        ctx, H_qk=2, HV=6, **bad),\n"
+        "    'is_cake_gdn_nondet_train_kcp_supported': lambda: facade.is_cake_gdn_nondet_train_kcp_supported(\n"
+        "        'cpu', **bad),\n"
+        "}\n"
+        f"assert sorted(calls) == {sorted(FACADE_FUNCTIONS)!r}, sorted(calls)\n"
+        "with warnings.catch_warnings(record=True) as caught:\n"
+        "    warnings.simplefilter('always')\n"
+        "    for name, call in calls.items():\n"
+        "        try:\n"
+        "            call()\n"
+        "        except TypeError as exc:\n"
+        "            assert 'deterministic' in str(exc), (name, exc)\n"
+        "        else:\n"
+        "            raise AssertionError(name + ' took deterministic=')\n"
+        "assert not caught, [(w.category.__name__, str(w.message)) for w in caught]\n"
+        "print('ok', len(calls))\n"
+    )
+    root = pathlib.Path(__file__).resolve().parents[2]
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert result.returncode == 0, result.stderr[-4000:]
+    assert result.stdout.strip().splitlines()[-1] == f"ok {len(FACADE_FUNCTIONS)}"
 
 
 # The former names of this route (#8928) and the deterministic package's pre-rename spellings: no module of the
@@ -934,37 +1056,76 @@ def _call(entry: str, ctx, ops, module=None, **kw):
     return getattr(mod, entry)(*args, ctx, backend="fake", **kw)
 
 
-def _callables(module) -> list:
-    """``(name, callable)`` for every callable of ``module.__all__``, with the ``forward`` / ``backward`` of an
-    autograd Function class."""
-    out = []
+def _callables(module) -> dict:
+    """The callables of ``module.__all__``: a function itself, a class by its constructor, an autograd Function by
+    its ``forward`` and ``backward`` (and by its ``apply`` when that signature names its parameters)."""
+    var_kinds = (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+    found = {}
     for name in module.__all__:
         obj = getattr(module, name)
-        if not callable(obj):
-            continue
-        out.append((name, obj))
+        assert callable(obj), name
         if isinstance(obj, type) and issubclass(obj, torch.autograd.Function):
-            out += [
-                (f"{name}.forward", obj.forward),
-                (f"{name}.backward", obj.backward),
-            ]
-    return out
+            found[f"{name}.forward"] = obj.forward
+            found[f"{name}.backward"] = obj.backward
+            # ``torch.autograd.Function.apply`` takes ``*args, **kwargs``: its signature binds any keyword, so the
+            # check reads ``forward``, the parameters ``apply`` passes on, and ``apply`` only if it names them
+            params = inspect.signature(obj.apply).parameters.values()
+            if all(p.kind not in var_kinds for p in params):
+                found[f"{name}.apply"] = obj.apply
+        else:
+            found[name] = obj
+    return found
+
+
+# The entries that take the option keywords as ``**knobs`` / ``**kw``: their signatures bind any keyword, so a stray
+# ``deterministic=`` reaches the call, which refuses it with ``TypeError`` before any work
+# (``test_a_deterministic_keyword_is_a_type_error``, ``test_the_other_entries_refuse_a_deterministic_keyword``).
+OPTION_KEYWORD_ENTRIES = frozenset(
+    {
+        "cake_gdn_nondet_kcp",
+        "cake_gdn_nondet_train_kcp_forward",
+        "cake_gdn_nondet_train_kcp_backward",
+        "cake_gdn_nondet_train_kcp_workspace_bytes",
+        "cake_gdn_nondet_train_kcp_saved_bytes",
+        "cake_gdn_nondet_train_kcp_comm_bytes",
+    }
+)
 
 
 def test_no_public_callable_takes_a_deterministic_parameter() -> None:
-    """No callable of the facade's or the package's ``__all__`` (and no public function of the submodules the
-    package root exports from) has a ``deterministic`` parameter."""
+    """Every callable of the facade's and the package's ``__all__`` (the types by their constructors, the autograd
+    Functions by ``forward`` and ``backward``) refuses ``deterministic=`` at its signature:
+    ``inspect.signature(...).bind_partial(deterministic=False)`` raises ``TypeError``.  The entries that take the
+    option keywords (``**knobs`` / ``**kw``, exactly :data:`OPTION_KEYWORD_ENTRIES`) name no such parameter and
+    refuse the keyword at the call."""
     facade = importlib.import_module(FACADE)
-    checked = 0
-    for module in (facade, _mod()):
-        for name, fn in _callables(module):
-            try:
-                sig = inspect.signature(fn)
-            except (TypeError, ValueError):
-                continue
+    for module, expected in (
+        (facade, set(FACADE_FUNCTIONS) | set(FACADE_TYPES)),
+        (_mod(), PACKAGE_NAMES),
+    ):
+        callables = _callables(module)
+        assert {
+            "CakeGDNNondetKcpFunction.forward",
+            "CakeGDNNondetKcpFunction.backward",
+            "cake_gdn_nondet_train_kcp_partition",
+            "cake_gdn_nondet_train_kcp_build_context",
+            "CakeGDNNondetKcpOptions",
+        } <= set(callables), module.__name__
+        assert {n.split(".")[0] for n in callables} == expected, module.__name__
+        var_keyword = set()
+        for name, fn in callables.items():
+            sig = inspect.signature(fn)
             assert "deterministic" not in sig.parameters, (module.__name__, name)
-            checked += 1
-    assert checked >= len(FACADE_FUNCTIONS)
+            if any(p.kind is p.VAR_KEYWORD for p in sig.parameters.values()):
+                var_keyword.add(name)
+                continue
+            try:
+                sig.bind_partial(deterministic=False)
+            except TypeError as exc:
+                assert "deterministic" in str(exc), (module.__name__, name, exc)
+            else:
+                pytest.fail(f"{module.__name__}.{name} binds deterministic=")
+        assert var_keyword == OPTION_KEYWORD_ENTRIES, (module.__name__, var_keyword)
     plan = _mod("cake_kcp_plan")
     for fn in (
         plan.cake_gdn_nondet_train_kcp_partition,
@@ -986,28 +1147,37 @@ def test_a_deterministic_keyword_is_a_type_error(entry, value) -> None:
 
 
 def test_the_other_entries_refuse_a_deterministic_keyword() -> None:
-    """The plan, byte-query, view and support entries of the facade refuse ``deterministic=`` with ``TypeError``."""
+    """The plan, byte-query, view and support entries of the facade, and the plan, byte-query and view entries of the
+    package root, refuse ``deterministic=`` with ``TypeError``."""
     facade = importlib.import_module(FACADE)
     ctx, _ops = _mode_case()
     kw = {"deterministic": False}
-    calls = (
-        lambda: facade.cake_gdn_nondet_train_kcp_partition(MODE_CU, 1, **kw),
-        lambda: facade.cake_gdn_nondet_train_kcp_build_context(
-            ctx.partition, None, 0, "cpu", **kw
-        ),
-        lambda: facade.cake_gdn_nondet_train_kcp_workspace_bytes(
-            ctx, H_qk=2, HV=6, **kw
-        ),
-        lambda: facade.cake_gdn_nondet_train_kcp_saved_bytes(ctx, H_qk=2, HV=6, **kw),
-        lambda: facade.cake_gdn_nondet_train_kcp_comm_bytes(ctx, H_qk=2, HV=6, **kw),
-        lambda: facade.cake_gdn_nondet_train_kcp_packed_qkv_views(
-            torch.zeros(4, 10 * 128, dtype=torch.bfloat16), H_qk=2, HV=6, **kw
-        ),
-        lambda: facade.is_cake_gdn_nondet_train_kcp_supported("cpu", **kw),
-    )
-    for call in calls:
-        with pytest.raises(TypeError, match="deterministic"):
-            call()
+    for module in (facade, _mod()):
+        calls = [
+            lambda m=module: m.cake_gdn_nondet_train_kcp_partition(MODE_CU, 1, **kw),
+            lambda m=module: m.cake_gdn_nondet_train_kcp_build_context(
+                ctx.partition, None, 0, "cpu", **kw
+            ),
+            lambda m=module: m.cake_gdn_nondet_train_kcp_workspace_bytes(
+                ctx, H_qk=2, HV=6, **kw
+            ),
+            lambda m=module: m.cake_gdn_nondet_train_kcp_saved_bytes(
+                ctx, H_qk=2, HV=6, **kw
+            ),
+            lambda m=module: m.cake_gdn_nondet_train_kcp_comm_bytes(
+                ctx, H_qk=2, HV=6, **kw
+            ),
+            lambda m=module: m.cake_gdn_nondet_train_kcp_packed_qkv_views(
+                torch.zeros(4, 10 * 128, dtype=torch.bfloat16), H_qk=2, HV=6, **kw
+            ),
+        ]
+        if module is facade:
+            calls.append(
+                lambda: facade.is_cake_gdn_nondet_train_kcp_supported("cpu", **kw)
+            )
+        for call in calls:
+            with pytest.raises(TypeError, match="deterministic"):
+                call()
 
 
 def test_the_support_query_returns_a_bool() -> None:
@@ -1275,15 +1445,12 @@ def test_facade_runs_this_package_only(
     support query included, with torch's deterministic algorithms off, on and on with ``warn_only``: no reroute to
     the deterministic package, no fallback and no warning."""
     facade = importlib.import_module(FACADE)
-    from flashinfer.api_logging import ExperimentalWarning
-
     facade.is_cake_gdn_nondet_train_kcp_supported()  # its first call imports the package's loader
     seen = _route_recorders(monkeypatch)
     torch.use_deterministic_algorithms(torch_mode[0], warn_only=torch_mode[1])
     calls = _facade_calls(facade)
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        warnings.filterwarnings("ignore", category=ExperimentalWarning)
         for _ in range(2):
             for entry, call in calls.items():
                 seen.clear()
@@ -1438,6 +1605,110 @@ def test_facade_forwards_the_l2n_option_to_the_package(monkeypatch) -> None:
     assert seen[-1][1]["options"] is nd_o
 
 
+# The one-rank CPU pack of the in-kernel L2 norm suite (``test_cake_gdn_nondet_train_kcp_l2n.py``: its ``CU``).
+L2N_CU = [0, 100, 740, 817, 1000]
+L2N_TENSORS = ("out", "dq", "dk", "dv", "dg", "dbeta")
+
+
+def _l2n_case():
+    """The norm suite's one-rank CPU context of :data:`L2N_CU` (built as that suite builds it) and seeded operands of
+    heads ``(2, 6)``."""
+    plan = _mod("cake_kcp_plan")
+    part = plan.cake_gdn_nondet_train_kcp_partition(
+        torch.tensor(L2N_CU, dtype=torch.int64), 1, "contiguous"
+    )
+    ctx = plan.cake_gdn_nondet_train_kcp_build_context(
+        part, None, 0, torch.device("cpu")
+    )
+    return ctx, _mode_ops(cu=L2N_CU)
+
+
+def test_facade_runs_the_norm() -> None:
+    """The facade hands ``use_qk_l2norm_in_kernel`` (keyword, mapping or this package's options instance) to this
+    package, which runs the norm: bitwise the package's own call; ``False`` is the norm-off route; the autograd node
+    runs the norm in its forward and its backward.  The compute entries take the option through their keyword
+    arguments, with no rstd keyword.  An options instance of the deterministic package is a ``TypeError``."""
+    facade = importlib.import_module(FACADE)
+    kcp = _mod("cake_kcp")
+    det_options = _det("cake_options")
+    for fn in (
+        facade.cake_gdn_nondet_kcp,
+        facade.cake_gdn_nondet_train_kcp_forward,
+        facade.cake_gdn_nondet_train_kcp_backward,
+    ):
+        params = inspect.signature(fn).parameters
+        assert any(p.kind == p.VAR_KEYWORD for p in params.values()), fn
+        assert not any("rstd" in n for n in params), fn
+    ctx, ops = _l2n_case()
+    args = [ops[n] for n in ("q", "k", "v", "g", "beta")]
+    on = {"backend": "fake", "use_qk_l2norm_in_kernel": True}
+    out, saved = kcp.cake_gdn_nondet_train_kcp_forward(*args, ctx, **on)
+    dq, dk, dv, dbeta, dg = kcp.cake_gdn_nondet_train_kcp_backward(
+        *args, ctx, ops["dout"], saved=saved, **on
+    )
+    want = {"out": out, "dq": dq, "dk": dk, "dv": dv, "dg": dg, "dbeta": dbeta}
+    for how in (
+        {"use_qk_l2norm_in_kernel": True},
+        {"options": {"backend": "fake", "use_qk_l2norm_in_kernel": True}},
+        {"options": kcp.make_options(backend="fake", use_qk_l2norm_in_kernel=True)},
+    ):
+        kw = {} if "options" in how else {"backend": "fake"}
+        out, saved = facade.cake_gdn_nondet_train_kcp_forward(*args, ctx, **kw, **how)
+        assert kcp.LAST_CALL["fwd"]["qk_l2norm"] is True and saved.qk_l2norm, how
+        dq, dk, dv, dbeta, dg = facade.cake_gdn_nondet_train_kcp_backward(
+            *args, ctx, ops["dout"], saved=saved, **kw, **how
+        )
+        got = {"out": out, "dq": dq, "dk": dk, "dv": dv, "dg": dg, "dbeta": dbeta}
+        for n in L2N_TENSORS:
+            assert torch.equal(got[n], want[n]), (how, n)
+    off = facade.cake_gdn_nondet_train_kcp_forward(
+        *args, ctx, backend="fake", use_qk_l2norm_in_kernel=False
+    )[1]
+    assert off.qk_l2norm is False and off.qk_rstd is None
+    assert kcp.LAST_CALL["fwd"]["qk_l2norm"] is False
+    leaves = [x.detach().clone().requires_grad_(True) for x in args]
+    facade.cake_gdn_nondet_kcp(*leaves, ctx, **on).backward(ops["dout"])
+    assert (
+        kcp.LAST_CALL["fwd"]["qk_l2norm"] is True
+        and kcp.LAST_CALL["bwd"]["qk_l2norm"] is True
+    )
+    det_o = det_options.CakeGDNDetKcpOptions(
+        backend="fake", use_qk_l2norm_in_kernel=True
+    )
+    with pytest.raises(TypeError, match="^options must be a CakeGDNNondetKcpOptions"):
+        facade.cake_gdn_nondet_train_kcp_forward(*args, ctx, options=det_o)
+
+
+def test_facade_byte_queries_take_the_option() -> None:
+    """The facade's byte queries forward ``use_qk_l2norm_in_kernel`` to this package; its norm terms equal those of the
+    deterministic facade's own queries (``flashinfer.cake_gdn_det_train_kcp``; same plan inputs, same formulas), and
+    the saved set grows by the FP32 ``r`` of q and k (``8 T_r H_qk`` bytes)."""
+    facade = importlib.import_module(FACADE)
+    det_facade = importlib.import_module(DET_FACADE)
+    gbytes = _mod("cake_bytes")
+    ctx, _ops = _l2n_case()
+    H_qk, HV = 2, 6
+    for query in ("saved_bytes", "workspace_bytes"):
+        q = getattr(facade, f"cake_gdn_nondet_train_kcp_{query}")
+        det_q = getattr(det_facade, f"cake_gdn_det_train_kcp_{query}")
+        on = q(ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=True)
+        off = q(ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=False)
+        det_on = det_q(ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=True)
+        det_off = det_q(ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=False)
+        assert on > off and det_on > det_off, query
+        assert on - off == det_on - det_off, query
+        assert on == getattr(gbytes, f"cake_gdn_nondet_train_kcp_{query}")(
+            ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=True
+        ), query
+    assert (
+        facade.cake_gdn_nondet_train_kcp_saved_bytes(
+            ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=True
+        )
+        - facade.cake_gdn_nondet_train_kcp_saved_bytes(ctx, H_qk=H_qk, HV=HV)
+        == 8 * int(ctx.T_r) * H_qk
+    )
+
+
 def test_facade_refuses_an_options_instance_of_another_package(monkeypatch) -> None:
     """An options instance of another package (the deterministic one's, or any other object) is a ``TypeError``
     before the package is called; this package's own instance, a mapping and ``None`` pass through unchanged."""
@@ -1473,8 +1744,6 @@ def test_facade_compute_runs_the_package_under_torch_deterministic_mode(
     without an alert or a warning.  The explicit forward's output and backward's gradients, and the autograd node's
     output and leaf gradients (``q``, ``k``, ``v``, ``g``, ``beta``), equal the package's own forward and explicit
     backward called with torch's deterministic algorithms off (every launch of the package is fixed-order)."""
-    from flashinfer.api_logging import ExperimentalWarning
-
     facade = importlib.import_module(FACADE)
     kcp = _mod("cake_kcp")
     ctx, ops = _mode_case()
@@ -1487,7 +1756,6 @@ def test_facade_compute_runs_the_package_under_torch_deterministic_mode(
     torch.use_deterministic_algorithms(True, warn_only=warn_only)
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        warnings.filterwarnings("ignore", category=ExperimentalWarning)
         out, saved = facade.cake_gdn_nondet_train_kcp_forward(
             *args, ctx, backend="fake"
         )
