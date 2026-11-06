@@ -130,7 +130,7 @@ def _few_cpu_threads():
 
 def _mod(sub: str | None = None):
     try:
-        from tests.test_helpers.cake_package import cake_package
+        from tests.infra.test_helpers.cake_package import cake_package
 
         return cake_package("cake_gdn_train_kcp", sub)
     except (ImportError, KeyError):
@@ -140,7 +140,7 @@ def _mod(sub: str | None = None):
 def _det_mod(sub: str | None = None):
     """A module of the deterministic package (its ``LAST_CALL`` for the collective comparison)."""
     try:
-        from tests.test_helpers.cake_package import cake_package
+        from tests.infra.test_helpers.cake_package import cake_package
 
         return cake_package("cake_gdn_det_train_kcp", sub)
     except (ImportError, KeyError):
@@ -193,7 +193,9 @@ STAGES = ("int1", "int3", "int4")
 def _reference():
     """The FP64 reference: the FlashInfer test helper (read only), else the session harness on PYTHONPATH."""
     try:
-        from tests.test_helpers import cake_gdn_det_train_kcp_reference as ref  # type: ignore[attr-defined]
+        from tests.experimental.test_helpers import (
+            cake_gdn_det_train_kcp_reference as ref,
+        )  # type: ignore[attr-defined]
 
         return ref
     except ImportError:
@@ -204,8 +206,8 @@ def _inputs():
     """The seeded operand generator (``make_inputs(cu, H_qk, HV, *, regime, seed, token_range)``): the inputs helper,
     else the reference helper (the same generator, bitwise), else the session harness on PYTHONPATH."""
     for name in (
-        "tests.test_helpers.cake_gdn_det_train_kcp_inputs",
-        "tests.test_helpers.cake_gdn_det_train_kcp_reference",
+        "tests.experimental.test_helpers.cake_gdn_det_train_kcp_inputs",
+        "tests.experimental.test_helpers.cake_gdn_det_train_kcp_reference",
     ):
         try:
             mod = importlib.import_module(name)

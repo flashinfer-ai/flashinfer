@@ -20,9 +20,16 @@ from typing import Dict, Optional, Sequence, Tuple
 
 import torch
 
-from tests.test_helpers.qwen_3_5_block_cases import NULL_PAGE, OUT_COS, PagedCase
-from tests.test_helpers.qwen_3_5_block_reference import build_rope_tables, cosine
-from tests.test_helpers.qwen_3_8_block_bounds import assert_output_close
+from tests.experimental.test_helpers.qwen_3_5_block_cases import (
+    NULL_PAGE,
+    OUT_COS,
+    PagedCase,
+)
+from tests.experimental.test_helpers.qwen_3_5_block_reference import (
+    build_rope_tables,
+    cosine,
+)
+from tests.experimental.test_helpers.qwen_3_8_block_bounds import assert_output_close
 
 TIE_TOL = 1e-4  # the scorer suite's tie window at the k-th boundary (fp32 logits of O(1) vs the fp64 reference)
 SENT_I32 = -7
@@ -693,7 +700,7 @@ class Qsa38PagedCase(PagedCase):
         self, *, label: str = "pools", rtol: float = 2.0**-7, atol: float = 1e-2
     ) -> None:
         """The step's live rows' K / V in the pools against the oracle's post-RoPE K / V (the 3.5 budget), over the uniform slot mapping."""
-        from tests.test_helpers.qwen_3_5_block_cases import cache_rows
+        from tests.experimental.test_helpers.qwen_3_5_block_cases import cache_rows
 
         live = self.slot_mapping >= 0
         k_rows, v_rows = cache_rows(

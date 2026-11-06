@@ -60,7 +60,7 @@ with and without a caller-owned buffer, and the package's per-(device,
 stream) buffer of the calls that pass none.
 
 This suite exercises the backend package alone: it names the package once,
-through ``tests.test_helpers.cake_package``, and imports nothing else from
+through ``tests.infra.test_helpers.cake_package``, and imports nothing else from
 flashinfer, so a build that vendors the package under another import path
 runs it unchanged after pointing that table entry at its package.  The
 ``flashinfer.cake_causal_conv1d_det_train`` facade and the ``flashinfer``
@@ -78,7 +78,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.test_helpers.cake_package import cake_package
+from tests.infra.test_helpers.cake_package import cake_package
 
 pkg = cake_package("cake_causal_conv1d_det_train")
 cake_build = cake_package("cake_causal_conv1d_det_train", "cake_build")

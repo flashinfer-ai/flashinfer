@@ -128,7 +128,7 @@ attributes cross-arm id differences to these classes:
   (in no segment) are neither written nor read.
 
 Golden vectors: :func:`build_golden` returns the content of
-``tests/test_helpers/cake_msa_icp_golden.json`` (every array is
+``tests/experimental/test_helpers/cake_msa_icp_golden.json`` (every array is
 ``{"dtype", "shape", "zlib_b64"}``: little-endian raw bytes, zlib-compressed,
 base64; ``f32`` arrays carry raw IEEE bits so NaN payloads and ``-0`` survive).
 Inputs are produced by a self-contained SplitMix64 generator, so the content is
@@ -137,9 +137,9 @@ file bytes (zlib builds differ).
 
 Command line (run on a CPU compute allocation, never on a login node)::
 
-    python -m tests.test_helpers.cake_msa_icp_inputs self-test
-    python -m tests.test_helpers.cake_msa_icp_inputs write-golden [PATH]
-    python -m tests.test_helpers.cake_msa_icp_inputs check-golden [PATH]
+    python -m tests.experimental.test_helpers.cake_msa_icp_inputs self-test
+    python -m tests.experimental.test_helpers.cake_msa_icp_inputs write-golden [PATH]
+    python -m tests.experimental.test_helpers.cake_msa_icp_inputs check-golden [PATH]
 """
 
 from __future__ import annotations
@@ -2854,7 +2854,7 @@ def build_golden() -> dict[str, Any]:
     return {
         "meta": {
             "version": GOLDEN_VERSION,
-            "generator": "tests/test_helpers/cake_msa_icp_inputs.py build_golden()",
+            "generator": "tests/experimental/test_helpers/cake_msa_icp_inputs.py build_golden()",
             "contract": "vLLM-project/MSA#46 f380d0e8 + vLLM#63671 a76900d6 with the FI deviations of the helper docstring (D1-D6)",
             "encoding": "arrays are {dtype, shape, zlib_b64}: little-endian raw bytes, zlib, base64; f32 = raw IEEE bits; u32 decodes to int64; u8 E4M3 bytes",
             "constants": {

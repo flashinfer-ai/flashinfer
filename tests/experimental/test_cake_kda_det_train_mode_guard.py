@@ -32,7 +32,7 @@ import torch
 import flashinfer.cake_kda_det_train as det_api
 from flashinfer.api_logging import ExperimentalWarning
 from flashinfer.experimental.cake_kda_det_train import cake_backend, cake_jit
-from tests.test_helpers.cake_kda_det_train_reference import make_inputs
+from tests.experimental.test_helpers.cake_kda_det_train_reference import make_inputs
 
 ND_BACKEND = "flashinfer.experimental.cake.cake_kda_train.cake_backend"
 

@@ -8,7 +8,7 @@ from typing import Union
 
 import pytest
 import torch
-from tests.test_helpers.parametrize import (
+from tests.infra.test_helpers.parametrize import (
     pairwise_product_cases,
     parametrize_product,
 )

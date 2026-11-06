@@ -20,7 +20,7 @@ import pytest
 import torch
 from tests.attention.test_helpers.sink_attention_reference import sink_attention_unified
 from tests.test_helpers.utils_fp4 import create_nvfp4_kv, nvfp4_to_float
-from tests.test_helpers.parametrize import (
+from tests.infra.test_helpers.parametrize import (
     parametrize_product,
     pairwise_product_cases,
 )

@@ -27,7 +27,7 @@ so an implementation that reads ``state[row]`` instead of ``state[idx[row]]``
 fails, and slots outside the indices must come through untouched. All three
 forms must produce bit-identical outputs and final states, and each call must
 be exactly one device launch. The full-census assertion (every kernel and
-memcpy per call, via ``tests.test_helpers.cake_profiler``, not a
+memcpy per call, via ``tests.infra.test_helpers.cake_profiler``, not a
 name-filtered count) is intentional: the batched + ``ssm_state_indices`` form
 currently wraps the same decode kernel in a gather and scatter of the B
 selected state rows (5 launches per call: two int32->int64 index casts, the
@@ -47,7 +47,7 @@ import pytest
 import torch
 
 from flashinfer.utils import is_sm100a_supported
-from tests.test_helpers.cake_profiler import cuda_kernel_names
+from tests.infra.test_helpers.cake_profiler import cuda_kernel_names
 
 try:
     from flashinfer import recurrent_kda

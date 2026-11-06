@@ -24,7 +24,7 @@ from types import SimpleNamespace
 from typing import Sequence
 
 import pytest
-from tests.test_helpers.parametrize import parametrize_product
+from tests.infra.test_helpers.parametrize import parametrize_product
 import torch
 
 pytest.importorskip(

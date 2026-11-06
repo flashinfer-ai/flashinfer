@@ -21,7 +21,7 @@ import torch
 
 import flashinfer
 from flashinfer.utils import device_support_pdl
-from tests.test_helpers.parametrize import (
+from tests.infra.test_helpers.parametrize import (
     parametrize_product,
     pairwise_product_cases,
 )

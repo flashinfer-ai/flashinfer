@@ -34,7 +34,7 @@ no deterministic entry takes a ``deterministic`` argument (``TypeError``, also a
 positional mode of ``CakeGroupedDetMm.apply``), and torch's deterministic mode changes
 nothing for them (no alert, no warning).
 The backend tests of the package live in ``test_cake_moe_grouped_det_gemm.py``, which
-imports the package only through ``tests.test_helpers.cake_package``.
+imports the package only through ``tests.infra.test_helpers.cake_package``.
 """
 
 import importlib
@@ -275,7 +275,7 @@ def test_removed_det_free_names_raise_attribute_error(module_name):
 def test_removed_test_helper_key():
     """The test-helper key ``cake_moe_grouped_gemm`` (formerly the det package's
     compatibility key) is gone; the det and non-deterministic keys stay."""
-    from tests.test_helpers.cake_package import PACKAGES, cake_package
+    from tests.infra.test_helpers.cake_package import PACKAGES, cake_package
 
     assert "cake_moe_grouped_gemm" not in PACKAGES
     with pytest.raises(KeyError):

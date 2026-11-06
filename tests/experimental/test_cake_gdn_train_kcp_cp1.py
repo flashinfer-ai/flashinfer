@@ -16,7 +16,7 @@ limitations under the License.
 The CP = 1 local path of the NON-DETERMINISTIC Cake packed GDN training package
 (``flashinfer.cake_gdn_train_kcp`` with ``deterministic=False`` and a one-rank context, i.e. the package
 ``flashinfer.experimental.cake_gdn_train_kcp``) against the exact FP64 reference of
-``tests/test_helpers/cake_gdn_det_train_kcp_reference.py`` (imported read-only).  The package keeps the
+``tests/experimental/test_helpers/cake_gdn_det_train_kcp_reference.py`` (imported read-only).  The package keeps the
 deterministic route's contract and accuracy budgets, not its bitwise reproducibility: two arms that the deterministic
 tests compare bitwise (strided / contiguous, explicit / autograd, saved / replay, kept / replayed tapes, two caller
 streams) are each judged against the FP64 reference and against each other with the deterministic route's budgets.
@@ -51,7 +51,7 @@ import pathlib
 import pytest
 import torch
 
-from tests.test_helpers.cake_gdn_det_train_kcp_reference import (
+from tests.experimental.test_helpers.cake_gdn_det_train_kcp_reference import (
     BLOCK,
     D,
     GRAD_NAMES,

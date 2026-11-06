@@ -43,7 +43,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
-from tests.test_helpers.cake_package import cake_package
+from tests.infra.test_helpers.cake_package import cake_package
 
 # Backend suite: the packages are named through ``cake_package``; nothing else of flashinfer is imported here.
 package = cake_package("cake_dense_gemm_nondet_train")

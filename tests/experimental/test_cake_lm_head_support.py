@@ -17,13 +17,13 @@ Candidate-support entries (https://github.com/flashinfer-ai/flashinfer/issues/76
 package ``flashinfer.experimental.cake.cake_lm_head_loss``:
 ``chunked_lm_head_support_logprob`` / ``chunked_lm_head_support_kl`` take ``deterministic=False`` only, raise
 PyTorch's deterministic-algorithms alert in their backward, and are held to the deterministic suite's gate
-(``tests/test_helpers/cake_lm_head_support_reference.py``: 1.05x the masked PyTorch baseline's error against the
+(``tests/experimental/test_helpers/cake_lm_head_support_reference.py``: 1.05x the masked PyTorch baseline's error against the
 FP64 oracle plus a floor).  Their programs are the deterministic package's, so the outputs, the sparse dX and the
 weight gradient equal the deterministic entries' bits on the same inputs; the dense dX adds its vocabulary blocks into
 the chunk sum through the K-sliced reduction (``cake_support.support_dx_form``: one slice keeps the deterministic
 bits, more slices -- only inside the rule's measured cells, or forced by a test -- add in the order they finish).  The
 gradients carry no run-to-run promise in this package and are checked over repeated runs against the gate.  The
-package is reached through ``tests.test_helpers.cake_package``.
+package is reached through ``tests.infra.test_helpers.cake_package``.
 """
 
 import contextlib
@@ -32,14 +32,14 @@ import dataclasses
 import pytest
 import torch
 
-from tests.test_helpers.cake_lm_head_support_reference import (
+from tests.experimental.test_helpers.cake_lm_head_support_reference import (
     gate_failures,
     make_support_inputs,
     reference_support_b0,
     reference_support_fp64,
     support_error_report,
 )
-from tests.test_helpers.cake_package import cake_package
+from tests.infra.test_helpers.cake_package import cake_package
 
 cake_support = cake_package("cake.cake_lm_head_loss", "cake_support")
 cake_backend = cake_package("cake.cake_lm_head_loss", "cake_backend")

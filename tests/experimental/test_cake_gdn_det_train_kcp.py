@@ -50,7 +50,7 @@ import torch
 
 def _package(submodule: str):
     try:
-        from tests.test_helpers.cake_package import cake_package
+        from tests.infra.test_helpers.cake_package import cake_package
 
         return cake_package("cake_gdn_det_train_kcp", submodule)
     except KeyError:  # the registry entry is added by the package scaffolding lane

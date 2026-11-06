@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 FP64 reference of the packed KDA training problem for the context-parallel (KCP) tests, generalized from
-``tests/test_helpers/cake_kda_det_train_reference.py`` (per-document token recurrence, 64-token checkpointed blocks) to
+``tests/experimental/test_helpers/cake_kda_det_train_reference.py`` (per-document token recurrence, 64-token checkpointed blocks) to
 a token interval started from a carried state, in broadcast-multiply form (no size-1 bmm, so the module also runs
 on sm_107a where Triton cannot build the bmm lowering).
 
@@ -52,8 +52,8 @@ from __future__ import annotations
 import torch
 from torch.utils.checkpoint import checkpoint
 
-from tests.test_helpers.cake_kda_kcp_inputs import global_operands
-from tests.test_helpers.cake_kda_kcp_shapes import D, Row
+from tests.experimental.test_helpers.cake_kda_kcp_inputs import global_operands
+from tests.experimental.test_helpers.cake_kda_kcp_shapes import D, Row
 
 SCALE = D**-0.5
 BLOCK = 64

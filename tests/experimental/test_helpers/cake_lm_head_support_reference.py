@@ -41,7 +41,7 @@ from typing import Optional, Sequence, Union
 
 import torch
 
-from tests.test_helpers.cake_lm_head_loss_reference import (
+from tests.experimental.test_helpers.cake_lm_head_loss_reference import (
     IGNORE_INDEX,
     _randn_rows,
     make_weight,

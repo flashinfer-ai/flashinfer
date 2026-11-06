@@ -59,7 +59,7 @@ def _package_import() -> str:
     """The import path of the package: the test-helper registry's entry when it lists the package, else the in-tree
     path (the registry has no entry for this package yet)."""
     try:
-        from tests.test_helpers.cake_package import PACKAGES
+        from tests.infra.test_helpers.cake_package import PACKAGES
 
         return PACKAGES[PACKAGE]
     except (ImportError, KeyError):
@@ -69,7 +69,7 @@ def _package_import() -> str:
 def _package(sub: str | None = None):
     """The package (or one of its modules) through the test-helper registry when it lists the package, else directly."""
     try:
-        from tests.test_helpers.cake_package import cake_package
+        from tests.infra.test_helpers.cake_package import cake_package
 
         return cake_package(PACKAGE, sub)
     except (ImportError, KeyError):

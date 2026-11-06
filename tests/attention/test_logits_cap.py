@@ -25,7 +25,7 @@ from tests.test_helpers.jit_utils import (
 
 import flashinfer
 from flashinfer.utils import has_flashinfer_jit_cache
-from tests.test_helpers.parametrize import (
+from tests.infra.test_helpers.parametrize import (
     parametrize_product,
     pairwise_product_cases,
 )

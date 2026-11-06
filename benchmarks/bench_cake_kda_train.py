@@ -141,7 +141,7 @@ from flashinfer.experimental.cake_kda_det_train import (  # noqa: E402
     cake_backend as det_backend,
 )
 from flashinfer.testing import bench_gpu_time  # noqa: E402
-from tests.test_helpers.cake_kda_det_train_reference import (  # noqa: E402
+from tests.experimental.test_helpers.cake_kda_det_train_reference import (  # noqa: E402
     LOWER_BOUND,
     make_inputs,
     make_raw_inputs,

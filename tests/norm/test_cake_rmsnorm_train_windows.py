@@ -50,7 +50,7 @@ import pytest
 import torch
 
 from tests.norm.test_helpers import cake_rmsnorm_train_reference as ref
-from tests.test_helpers.cake_package import cake_package
+from tests.infra.test_helpers.cake_package import cake_package
 
 pkg = cake_package("cake_rmsnorm_train")
 loader = cake_package("cake_rmsnorm_train", "cake_jit")

@@ -1162,7 +1162,7 @@ local + `local_expert_offset` — the real deployment shape, in scope for the
 single-GPU harness; the EP *collective* is not), all under a weight-memory
 budget so one config never hogs the GPU.
 
-**Known-failure ledger** (shared `tests/test_helpers/fuzz_ledger.py`):
+**Known-failure ledger** (shared `tests/infra/test_helpers/fuzz_ledger.py`):
 wrong-answer findings still run and report `xfail` after healthy backends;
 crash-class findings are quarantined before launch. Unexpected passes fail
 strictly so stale waivers are removed.

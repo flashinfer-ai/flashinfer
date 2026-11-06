@@ -67,7 +67,7 @@ import pytest
 import torch
 from torch.utils.checkpoint import checkpoint
 
-from tests.test_helpers.cake_package import cake_package
+from tests.infra.test_helpers.cake_package import cake_package
 
 KEY = "cake.cake_mhc_train"
 pkg = cake_package(KEY)

@@ -80,7 +80,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.test_helpers.cake_package import PACKAGES, cake_package
+from tests.infra.test_helpers.cake_package import PACKAGES, cake_package
 
 KEY = "cake.cake_mhc_train"
 pkg = cake_package(KEY)

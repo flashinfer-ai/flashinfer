@@ -370,7 +370,7 @@ import importlib
 import os
 
 os.environ["PYTHONPATH"] = os.pathsep.join(SYS_PATH)
-table = importlib.import_module("tests.test_helpers.cake_package")
+table = importlib.import_module("tests.infra.test_helpers.cake_package")
 table.PACKAGES.update(PACKAGES)
 import pytest
 
@@ -386,7 +386,7 @@ def _run_suites(root: Path, packages: dict, suites, work: Path, label: str):
     (root / "sitecustomize.py").write_text(
         BLOCKER
         + "import importlib\n"
-        + f"importlib.import_module('tests.test_helpers.cake_package').PACKAGES.update({packages!r})\n"
+        + f"importlib.import_module('tests.infra.test_helpers.cake_package').PACKAGES.update({packages!r})\n"
     )
     junit = work / f"{label}.xml"
     args = [

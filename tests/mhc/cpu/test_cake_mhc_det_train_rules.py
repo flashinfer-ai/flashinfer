@@ -66,7 +66,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.test_helpers.cake_package import cake_package
+from tests.infra.test_helpers.cake_package import cake_package
 
 loader = cake_package("cake_mhc_det_train", "cake_jit")
 # The tables of record of this module describe the hidden size 4096: the H 4096 records, their routes and record

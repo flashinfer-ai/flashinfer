@@ -19,7 +19,7 @@ imports it under its own name, without flashinfer (#6553).  The renames of
 #8928 must keep that working
 (https://github.com/flashinfer-ai/flashinfer/issues/8928#issuecomment-6680200530):
 every backend is self-contained.  This is the one check that imports every
-package of ``PACKAGES`` (``tests/test_helpers/cake_package.py``); family suites
+package of ``PACKAGES`` (``tests/infra/test_helpers/cake_package.py``); family suites
 do not repeat it.  It reads the table when it runs, so a rename PR updates that
 table and nothing here; a row whose directory does not exist fails.
 
@@ -102,7 +102,7 @@ from typing import Any
 
 import pytest
 
-from tests.test_helpers.cake_package import PACKAGES
+from tests.infra.test_helpers.cake_package import PACKAGES
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MANIFEST_CHECKER = REPO_ROOT / "scripts" / "check_cake_build_manifests.py"
@@ -506,7 +506,7 @@ def test_allowlist_names_packages() -> None:
     module of an import path of ``PACKAGES`` that no other entry names."""
     problems = []
     if not KEYS:
-        problems.append("PACKAGES in tests/test_helpers/cake_package.py is empty")
+        problems.append("PACKAGES in tests/infra/test_helpers/cake_package.py is empty")
     paths = [path for path, _, _ in ALLOWLIST]
     stale = sorted(set(paths) - set(KEYS))
     if stale:

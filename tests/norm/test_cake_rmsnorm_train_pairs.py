@@ -35,7 +35,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.test_helpers.cake_package import cake_package
+from tests.infra.test_helpers.cake_package import cake_package
 
 pytestmark = pytest.mark.cpu_only
 

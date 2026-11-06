@@ -9,7 +9,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 
-from tests.test_helpers.qwen_3_5_block_reference import (
+from tests.experimental.test_helpers.qwen_3_5_block_reference import (
     RefGeometry,
     build_rope_tables,
     cosine,

@@ -34,7 +34,7 @@ PACKAGE = "flashinfer.experimental.cake_gdn_det_train_kcp"
 def _mod(sub: str | None = None):
     """The package (or one of its modules) through the test-helper registry when it lists the package, else directly."""
     try:
-        from tests.test_helpers.cake_package import cake_package
+        from tests.infra.test_helpers.cake_package import cake_package
 
         return cake_package("cake_gdn_det_train_kcp", sub)
     except (ImportError, KeyError):

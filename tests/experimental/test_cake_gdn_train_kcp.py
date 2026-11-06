@@ -24,7 +24,7 @@ row (W ranks on threads), and the package's host orchestration on the fake backe
 ``deterministic=False`` (the package refuses anything else).
 
 Plan / table / byte / registry / launch-order checks are exact.  Numerical results are judged against the FP64
-reference of ``tests/test_helpers/cake_gdn_det_train_kcp_reference.py`` with the deterministic route's budget for the
+reference of ``tests/experimental/test_helpers/cake_gdn_det_train_kcp_reference.py`` with the deterministic route's budget for the
 fake backend (``FAKE_TOL_REL_RMS``), and two arms that the deterministic tests compare bitwise (repeat, saved /
 replay, kept / replayed tapes, checkpoint / direct, forced forms) are each judged against that reference and against
 each other with the same budget (``_within_budget``); no tolerance is derived from a non-deterministic output.  The one
@@ -60,12 +60,12 @@ import torch
 # lazily, and a first import racing the rank threads of another test can see a partially initialised sympy (Python 3.14)
 import torch._dynamo  # noqa: F401
 
-from tests.test_helpers import cake_gdn_det_train_kcp_reference as REF
+from tests.experimental.test_helpers import cake_gdn_det_train_kcp_reference as REF
 
 
 def _package(submodule: str):
     try:
-        from tests.test_helpers.cake_package import cake_package
+        from tests.infra.test_helpers.cake_package import cake_package
 
         return cake_package("cake_gdn_train_kcp", submodule)
     except (

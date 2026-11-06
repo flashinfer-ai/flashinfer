@@ -31,7 +31,7 @@ accuracy budgets of ``tests/experimental/cake_gdn_det_train_kcp_g1_budgets.json`
 see the same operands.
 """
 
-from tests.test_helpers.cake_gdn_det_train_kcp_reference import (
+from tests.experimental.test_helpers.cake_gdn_det_train_kcp_reference import (
     BLOCK,
     REGIMES,
     SEED,

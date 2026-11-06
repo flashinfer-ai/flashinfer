@@ -686,7 +686,7 @@ def test_det_free_names_are_only_the_non_deterministic_objects():
     ):
         assert not hasattr(det_pkg, name), name
         assert getattr(pkg, name).__module__.startswith(pkg.__name__), name
-    from tests.test_helpers.cake_package import PACKAGES, cake_package
+    from tests.infra.test_helpers.cake_package import PACKAGES, cake_package
 
     assert "cake_moe_grouped_gemm" not in PACKAGES
     assert cake_package("cake.cake_moe_grouped_gemm") is pkg

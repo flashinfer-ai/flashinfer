@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import pytest
 
-from tests.test_helpers.cake_package import cake_package
+from tests.infra.test_helpers.cake_package import cake_package
 
 loader = cake_package("cake_mhc_det_train", "cake_jit")
 

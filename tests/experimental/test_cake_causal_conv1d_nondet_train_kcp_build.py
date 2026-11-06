@@ -28,7 +28,7 @@ import re
 
 import pytest
 
-from tests.test_helpers.cake_package import cake_package
+from tests.infra.test_helpers.cake_package import cake_package
 
 KEY = "cake_causal_conv1d_nondet_train"
 cake_jit = cake_package(KEY, "cake_jit")

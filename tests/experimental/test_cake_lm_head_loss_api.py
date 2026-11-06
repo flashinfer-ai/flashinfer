@@ -37,7 +37,7 @@ import torch.utils.checkpoint
 import flashinfer.api_logging as api_logging
 import flashinfer.cake_lm_head_det_train as det_public
 import flashinfer.chunked_lm_head as public
-from tests.test_helpers.cake_lm_head_loss_reference import make_inputs
+from tests.experimental.test_helpers.cake_lm_head_loss_reference import make_inputs
 
 SEED = 20261031
 H_HOST, V_HOST = 256, 512

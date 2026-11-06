@@ -5,7 +5,10 @@ from dataclasses import dataclass
 
 import pytest
 import torch
-from tests.test_helpers.parametrize import pairwise_product_cases, parametrize_product
+from tests.infra.test_helpers.parametrize import (
+    pairwise_product_cases,
+    parametrize_product,
+)
 from tests.test_helpers.pdl import late_store
 from tests.test_helpers.utils_fp4 import (
     nvfp4_global_decode_scale_te,

@@ -32,7 +32,7 @@ import torch
 from flashinfer.experimental.cake.cake_causal_conv1d_nondet_train import (
     kcp as conv_kcp,
 )
-from tests.test_helpers.cake_package import PACKAGES
+from tests.infra.test_helpers.cake_package import PACKAGES
 
 
 @pytest.mark.cpu_only

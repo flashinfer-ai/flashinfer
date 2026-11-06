@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 by FlashInfer team
-"""Self-test of the Cake mode-name checks (``tests/test_helpers/cake_mode_names.py``).
+"""Self-test of the Cake mode-name checks (``tests/infra/test_helpers/cake_mode_names.py``).
 
 The modules are synthetic, built here from source; the fresh-interpreter check
 imports standard-library names and packages written to ``tmp_path``.  No flashinfer
@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.test_helpers.cake_mode_names import (
+from tests.infra.test_helpers.cake_mode_names import (
     assert_cake_mode_module,
     assert_mode_names,
     assert_no_deterministic_keyword,

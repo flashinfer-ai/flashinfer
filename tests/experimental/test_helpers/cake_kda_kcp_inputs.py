@@ -41,7 +41,7 @@ import zlib
 
 import torch
 
-from tests.test_helpers.cake_kda_kcp_shapes import SEED, D, Row
+from tests.experimental.test_helpers.cake_kda_kcp_shapes import SEED, D, Row
 
 BLOCK = 64
 EPS = 1e-6

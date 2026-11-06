@@ -67,7 +67,7 @@ def between_sentinels(names: list[str]) -> list[str] | None:
     if not marks:
         raise AssertionError(
             f"no CUDA record of the sentinel kernel {SENTINEL_KERNEL!r} among {names}: "
-            "the sentinel's name changed; fix tests.test_helpers.cake_profiler"
+            "the sentinel's name changed; fix tests.infra.test_helpers.cake_profiler"
         )
     if len(marks) < 2 or marks[-1] != len(names) - 1:
         return None

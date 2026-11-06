@@ -95,8 +95,8 @@
           - "tests/experimental/**/test_*kda*"
           - "tests/experimental/cake_gdn_det_train_kcp*"
           - "tests/mamba/cpu/**"
-          - "tests/test_helpers/*gdn*"
-          - "tests/test_helpers/*kda*"
+          - "tests/experimental/test_helpers/*gdn*"
+          - "tests/experimental/test_helpers/*kda*"
 
 "op: moe":
   - changed-files:
@@ -269,7 +269,7 @@
           - "benchmarks/bench_topk*"
           - "tests/utils/test_cake_sampling*.py"
           - "tests/utils/test_helpers/sampling.py"
-          - "tests/test_helpers/cake_gated_act*"
+          - "tests/utils/test_helpers/cake_gated_act*"
           - "tests/attention/test_cake_fused_qk_rope*.py"
           - "flashinfer/experimental/b12x/norm/**"
           - "flashinfer/experimental/b12x/quantization/**"

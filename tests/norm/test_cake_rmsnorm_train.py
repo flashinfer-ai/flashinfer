@@ -50,7 +50,7 @@ again when the backward runs) and argument validation.  The build manifest's
 per-architecture CUDA floors and flags are checked without a device.
 
 This suite exercises the backend packages alone, through
-``tests.test_helpers.cake_package``; the facade and the ``flashinfer`` top
+``tests.infra.test_helpers.cake_package``; the facade and the ``flashinfer`` top
 level are ``test_cake_rmsnorm_train_api.py``'s.
 """
 
@@ -66,7 +66,7 @@ import pytest
 import torch
 import torch.utils.checkpoint
 
-from tests.test_helpers.cake_package import cake_package
+from tests.infra.test_helpers.cake_package import cake_package
 
 pkg = cake_package("cake_rmsnorm_train")
 loader = cake_package("cake_rmsnorm_train", "cake_jit")

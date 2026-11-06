@@ -24,7 +24,10 @@ from tests.test_helpers.jit_utils import (
 import flashinfer
 from flashinfer.jit.attention import gen_pod_module
 from flashinfer.utils import has_flashinfer_jit_cache
-from tests.test_helpers.parametrize import pairwise_product_cases, parametrize_product
+from tests.infra.test_helpers.parametrize import (
+    pairwise_product_cases,
+    parametrize_product,
+)
 
 
 @pytest.fixture(

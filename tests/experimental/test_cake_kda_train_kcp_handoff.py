@@ -68,7 +68,7 @@ from tests.experimental.test_cake_kda_train_kcp_dist import (
     cake_kcp,
     cake_kcp_plan,
 )
-from tests.test_helpers.cake_kda_det_train_reference import make_inputs
+from tests.experimental.test_helpers.cake_kda_det_train_reference import make_inputs
 
 TENSORS = ("out", "dq", "dk", "dv", "dg", "dbeta", "dw")
 # the launches the hand-off's backward drops (the forward's tape set stands in for their outputs)

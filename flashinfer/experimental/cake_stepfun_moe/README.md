@@ -38,7 +38,7 @@ view of `CakeStepFunConfig.prepare_weights` adds the per-expert fp32
 | --- | --- |
 | `build.json` | cake-build/1 manifest: one entry `cake_stepfun_moe_<20hex>_<arch>` per program and architecture, its kernel source and binding source (a binding shared by several programs is selected by the entry's compile definitions) and their digests, and the content digest (over the entry name, architecture, nvcc flags and the sources' paths and bytes) that names its JIT build |
 | `cake_build.py` | the shared loader: prebuilt `aot/` library when present, else FlashInfer's JIT build of the manifest entry |
-| `cake_jit.py` | the registry: `PROGRAMS` (one record per program with its argument plan, launch shape -- block, cluster and dynamic shared memory -- and stage metadata, expanded at import from compact per-program rows and the shared argument plans `ARG_PLANS`), `STAGE_TABLES` (the five dispatcher tables), `HOST_PLAN_CONSTANTS`; the export's measurement catalogue (`ROUTES`) lives with the tests as `tests/test_helpers/cake_stepfun_moe_routes.json` |
+| `cake_jit.py` | the registry: `PROGRAMS` (one record per program with its argument plan, launch shape -- block, cluster and dynamic shared memory -- and stage metadata, expanded at import from compact per-program rows and the shared argument plans `ARG_PLANS`), `STAGE_TABLES` (the five dispatcher tables), `HOST_PLAN_CONSTANTS`; the export's measurement catalogue (`ROUTES`) lives with the tests as `tests/experimental/test_helpers/cake_stepfun_moe_routes.json` |
 | `cake_launch.py` | `LAUNCH[program]`: the positional launcher of each program, following its argument plan (grid triple last) |
 | `cake_backend.py` | host plan, validation, buffer set, binding and the prepared launches (hand-written) |
 | `csrc/cake_stepfun_moe/` | the generated kernels (`<program>_kernel.cu`) and their TVM-FFI bindings (`<program>_binding.cu`; a binding whose exported text differs from another's only in the kernel symbol, the host-shim namespace, the block size and the dynamic shared memory is built for that program from the other's file with the compile definitions of its `build.json` entry (`CAKE_PROGRAM_KERNEL`, `CAKE_PROGRAM_SHIM` and, for routing, `CAKE_BINDING_THREADS`, `CAKE_BINDING_SMEM`), so 64 bindings serve the 111 programs), the shared device-common header |
@@ -157,7 +157,7 @@ unchanged except for the four files only StepFun used.
 ## Tests
 
 `tests/experimental/test_cake_stepfun_moe.py` is the backend suite (imports the
-package only through `tests/test_helpers/cake_package.py`);
+package only through `tests/infra/test_helpers/cake_package.py`);
 `tests/experimental/test_cake_stepfun_moe_api.py` tests the
 `flashinfer.fused_moe` route against the native trtllm-gen kernels and writes
 the per-family error table; its `fc1` Cake-vs-native rows are `n/a` (no

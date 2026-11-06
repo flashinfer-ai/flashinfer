@@ -19,7 +19,7 @@ manifest, the keyword-only prepare surface, and every exported stage --
 routing (Renormalize top-k), FC1 with the StepFun epilogue, the NVFP4
 per-token requantization, FC2 and finalize -- plus the whole graph, each
 against the torch-only fp32 reference of
-``tests/test_helpers/cake_stepfun_moe_reference.py`` at the per-family
+``tests/experimental/test_helpers/cake_stepfun_moe_reference.py`` at the per-family
 tolerances (bf16 1e-2 / 1e-2, fp8 and mxfp8 0.1 / 0.1 with the e4m3 one-ulp
 block rule, nvfp4 1.0 / 0.1 after dequantization with the e2m1 one-code block
 rule; routing tables bitwise, permutation maps canonically above 16 tokens).
@@ -34,7 +34,7 @@ reference module.  CUDA-graph replays and fresh-process first replays must
 equal eager bitwise, and a whole-graph forward launches only Cake kernels.
 
 This suite exercises the backend package alone: it names the package once,
-through ``tests.test_helpers.cake_package``, and imports nothing else from
+through ``tests.infra.test_helpers.cake_package``, and imports nothing else from
 flashinfer, so a build that vendors the package under another import path
 runs it unchanged after pointing that table entry at its package.  The
 registry and keyword tests run on CPU; every kernel test skips without an
@@ -58,8 +58,8 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.test_helpers import cake_stepfun_moe_reference as ref
-from tests.test_helpers.cake_package import cake_package
+from tests.experimental.test_helpers import cake_stepfun_moe_reference as ref
+from tests.infra.test_helpers.cake_package import cake_package
 
 pkg = cake_package("cake_stepfun_moe")
 cb = cake_package("cake_stepfun_moe", "cake_backend")
@@ -76,9 +76,7 @@ ROUTE_COUNT = 138
 ARG_PLAN_COUNT = 21
 # The export's measurement catalogue (``ROUTES``), delivered with the tests.
 ROUTES_PATH = (
-    Path(__file__).resolve().parents[1]
-    / "test_helpers"
-    / "cake_stepfun_moe_routes.json"
+    Path(__file__).resolve().parent / "test_helpers" / "cake_stepfun_moe_routes.json"
 )
 CAKE_KERNEL_SYMBOL = re.compile(r"\bkernel_cake_stepfun_moe_[0-9a-f]+\b")
 # The retired per-arch minor macro: its name must not appear in any delivered source.
@@ -334,7 +332,7 @@ def test_stage_tables_and_routes_cover_every_program_once():
     """The five dispatcher tables hold program names only, in the production order and counts (50 /
     27 / 2 / 28 / 4); with the two histogram pre units of the cooperative rows they name every
     program exactly once.  Every program is reachable from a route of the export's measurement
-    catalogue (``tests/test_helpers/cake_stepfun_moe_routes.json``) and every route stage names a
+    catalogue (``tests/experimental/test_helpers/cake_stepfun_moe_routes.json``) and every route stage names a
     registered program delivered for the route's architectures."""
     assert tuple(loader.STAGE_TABLES) == loader.STAGE_ORDER
     named = Counter()

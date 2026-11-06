@@ -12,7 +12,7 @@ limitations under the License.
 
 Multi-GPU rows of the context-parallel (KCP) KDA training route (``cake_kda_det_train_kcp.cake_kcp``): ``W`` ranks over
 NCCL, each holding the fragments of one partition of a packed batch, compared with the exact FP64 per-document
-recurrence of the same operands (``tests/test_helpers/cake_kda_det_train_reference``) and with one another (saved ==
+recurrence of the same operands (``tests/experimental/test_helpers/cake_kda_det_train_reference``) and with one another (saved ==
 replay, repeat, autograd == explicit, checkpoint == direct, document-alone == slice, graph replay == eager with
 every rank capturing the same calls).
 
@@ -36,17 +36,17 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from tests.test_helpers.cake_kda_train_kcp_saved import (
+from tests.experimental.test_helpers.cake_kda_train_kcp_saved import (
     carry_slots,
     poison_unwritten_carry,
     written_tensors,
 )
-from tests.test_helpers.cake_kda_det_train_reference import (
+from tests.experimental.test_helpers.cake_kda_det_train_reference import (
     GRAD_NAMES,
     kda_exact_with_grads,
     make_inputs,
 )
-from tests.test_helpers.cake_package import cake_package
+from tests.infra.test_helpers.cake_package import cake_package
 
 cake_kcp = cake_package("cake_kda_det_train_kcp", "cake_kcp")
 cake_kcp_plan = cake_package("cake_kda_det_train_kcp", "cake_kcp_plan")
@@ -554,7 +554,7 @@ DIST_SLEEP_MS = 2000.0  # the queue probe of the dist census windows (the host m
 def _run_upload_rank(
     rank: int, W: int, row, rdzv: str | None, result_dir: str | None
 ) -> dict:
-    """Host synchronization on every rank of a CP row, each window a census of ``tests/test_helpers/cake_host_sync.py``
+    """Host synchronization on every rank of a CP row, each window a census of ``tests/experimental/test_helpers/cake_host_sync.py``
     (upload counter, profiler copies where traced, sync-debug warnings, an event-based queue probe and a host-time
     bound): the new path is bitwise the previous one (KDA saved / replay / checkpointed passes with and without a
     workspace, conv halo forward / backward); the first call of a fresh context (with the reused workspace and with
@@ -564,7 +564,7 @@ def _run_upload_rank(
     prepared from another thread on a held-back side stream does the same; repeated ``exchange="ring"`` calls record
     no further upload on the context (ring rows); the plan's ``P`` of each rank is reported."""
     from flashinfer.cake_causal_conv1d_det_train_backend import kcp as conv
-    from tests.test_helpers.cake_host_sync import (
+    from tests.experimental.test_helpers.cake_host_sync import (
         census,
         counts_agree,
         nonblocking,

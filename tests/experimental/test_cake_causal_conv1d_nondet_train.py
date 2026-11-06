@@ -47,7 +47,7 @@ tiles, on a caller-owned workspace of the public size and on the package's, with
 package's, the gradients within budget of the reference and of the deterministic package, and the workspace zero
 after the call.
 
-This suite names its package once, through ``tests.test_helpers.cake_package`` (key
+This suite names its package once, through ``tests.infra.test_helpers.cake_package`` (key
 ``cake_causal_conv1d_nondet_train``), and the deterministic package for the parity checks through the same table;
 a vendored build without the deterministic package skips those checks.  Every test skips until the exporter has
 rendered the package (``build.json`` and ``csrc/``).
@@ -62,7 +62,7 @@ import weakref
 import pytest
 import torch
 
-from tests.test_helpers.cake_package import cake_package
+from tests.infra.test_helpers.cake_package import cake_package
 
 KEY = "cake_causal_conv1d_nondet_train"
 pkg = cake_package(KEY)

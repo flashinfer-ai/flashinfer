@@ -2,7 +2,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from tests.test_helpers.fuzz_ledger import Finding, FuzzLedger
+from tests.infra.test_helpers.fuzz_ledger import Finding, FuzzLedger
 
 
 @dataclass(frozen=True)

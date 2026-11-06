@@ -51,7 +51,7 @@ Graph warns when it is captured and not when it is replayed; the deterministic
 package's FP32 workspace is refused naming both modes' workspaces.
 
 This suite exercises the package alone, named once through
-``tests.test_helpers.cake_package`` (so a vendored copy runs it unchanged), and
+``tests.infra.test_helpers.cake_package`` (so a vendored copy runs it unchanged), and
 imports nothing else from flashinfer.  The comparisons against the
 deterministic package (``y``, ``dx`` and ``dz`` bitwise, ``dw`` within the
 budget of the deterministic ``dw``), the facade, the ``flashinfer`` top level
@@ -70,7 +70,7 @@ import pytest
 import torch
 import torch.utils.checkpoint
 
-from tests.test_helpers.cake_package import cake_package
+from tests.infra.test_helpers.cake_package import cake_package
 
 KEY = "cake_rmsnorm_silu_gate_nondet_train"
 pkg = cake_package(KEY)

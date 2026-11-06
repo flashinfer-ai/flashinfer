@@ -21,7 +21,10 @@ import pytest
 import torch
 from tests.test_helpers.jit_utils import gen_prefill_attention_modules
 from tests.test_helpers.paged_kv import make_padded_paged_kv_view
-from tests.test_helpers.parametrize import pairwise_product_cases, parametrize_product
+from tests.infra.test_helpers.parametrize import (
+    pairwise_product_cases,
+    parametrize_product,
+)
 
 import flashinfer
 from tests.test_helpers.test_helpers import assert_close_chunked, ref_single_prefill

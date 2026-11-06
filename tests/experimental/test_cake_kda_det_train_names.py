@@ -41,7 +41,7 @@ from flashinfer.experimental.cake_kda_det_train import (
     cake_backend,
     cake_jit,
 )
-from tests.test_helpers.cake_package import cake_package
+from tests.infra.test_helpers.cake_package import cake_package
 
 pytestmark = pytest.mark.cpu_only
 
