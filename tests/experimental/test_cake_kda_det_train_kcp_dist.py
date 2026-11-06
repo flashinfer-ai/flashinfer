@@ -912,7 +912,7 @@ def test_module_imports_only_torch_and_its_package() -> None:
     ``functools.cached_property`` on the host table set (``walk_all_p0`` / ``walk_all_rest``, host ints only) -- stdlib,
     no new module either; ``weakref`` for the trimmed
     path's begin_call template cache, owned by the local arena and weakly keyed by the table set -- stdlib, no new
-    module)."""
+    module; ``operator.itemgetter`` for the trimmed local launch plan's argument fetch -- stdlib, no new module)."""
     import ast
 
     src = Path(cake_kcp.__file__).read_text()
@@ -933,7 +933,8 @@ def test_module_imports_only_torch_and_its_package() -> None:
         "warnings",
         "functools",
         "weakref",
-    }  # weakref: the arena-owned template cache of the trimmed host path; functools: cached_property of the trimmed host path; ctypes: the cache-config bracket of the walk-launch geometry and the capture-graph entry points of the replay cap; warnings: the one RuntimeWarning without a loadable CUDA runtime or for a degraded node cap; no other use
+        "operator",
+    }  # operator: itemgetter of the trimmed local launch plan's arguments; weakref: the arena-owned template cache of the trimmed host path; functools: cached_property of the trimmed host path; ctypes: the cache-config bracket of the walk-launch geometry and the capture-graph entry points of the replay cap; warnings: the one RuntimeWarning without a loadable CUDA runtime or for a degraded node cap; no other use
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for a in node.names:
