@@ -43,7 +43,6 @@ from __future__ import annotations
 import torch
 
 from .cake_backend import (
-    _alert_not_deterministic,
     _prepare_wgrad,
     _require_deterministic_false,
     _require_flag,
@@ -83,8 +82,8 @@ def _wgrad_op(
     out: torch.Tensor,
     num_groups: int,
 ) -> None:
-    # The caller (``CakeGroupedMm.backward``) has raised the deterministic-mode alert.
-    _prepare_wgrad(g, x, offs, out, None, num_groups)._run()
+    # An order-varying launch raises the deterministic-mode alert right before it runs.
+    _prepare_wgrad(g, x, offs, out, None, num_groups)._run("CakeGroupedMm.backward")
 
 
 def _wgrad_acc_op(
@@ -94,8 +93,11 @@ def _wgrad_acc_op(
     main_grad: torch.Tensor,
     num_groups: int,
 ) -> None:
-    # ``main_grad[e] += G[e].T @ X[e]``; the caller has raised the deterministic-mode alert.
-    _prepare_wgrad(g, x, offs, main_grad, None, num_groups, accumulate=True)._run()
+    # ``main_grad[e] += G[e].T @ X[e]``; an order-varying launch raises the deterministic-mode alert
+    # right before it runs (``main_grad`` is then untouched under the strict mode).
+    _prepare_wgrad(g, x, offs, main_grad, None, num_groups, accumulate=True)._run(
+        "CakeGroupedMm.backward"
+    )
 
 
 def _main_grad(w: torch.Tensor, entry: str) -> torch.Tensor:
@@ -136,7 +138,8 @@ def _bf16_rows(t: torch.Tensor) -> torch.Tensor:
 
 # Passed by ``cake_grouped_mm`` as the fifth argument of ``CakeGroupedMm.apply``:
 # ``forward`` then allocates ``Y`` without launching, and the wrapper fills it
-# after ``apply`` returns (after autograd saved the inputs).
+# after ``apply`` returns (after autograd saved the inputs).  ``forward`` accepts
+# nothing else in that position but ``None``.
 _DEFER_FWD = object()
 
 
@@ -153,22 +156,28 @@ class CakeGroupedMm(torch.autograd.Function):
 
     ``x`` ``[sum_m, K]`` bf16, ``w`` ``[E, N, K]`` bf16, ``offs`` int32 device
     end offsets ``[E]`` (or ``m_indptr`` ``[E + 1]``); the fourth argument is
-    the numerical mode and must be ``False``.  ``forward`` saves ``x``, ``w``
+    the numerical mode and must be ``False`` (omitted, it is ``True`` and
+    refused with ``ValueError``, as every other value).  ``forward`` saves ``x``, ``w``
     and ``offs`` only.  ``backward`` returns ``dX`` ``[sum_m, K]`` bf16 (the
     deterministic bits) and ``dW`` ``[E, N, K]`` in the dtype of ``w``, whose
     split tail (512-wide k tile) is added in an order the launch does not fix;
     empty groups give exact zeros.  Under
-    ``torch.use_deterministic_algorithms(True)`` a backward that computes
-    ``dW`` raises the non-determinism alert before launching it.  Through
+    ``torch.use_deterministic_algorithms(True)`` a backward whose ``dW``
+    launch adds such a split tail raises the non-determinism alert immediately
+    before that launch (the forward, ``dX`` and a fixed-order ``dW`` never
+    alert).  Through
     :func:`cake_grouped_mm` the forward GEMM runs after autograd saved ``x``,
     ``w`` and ``offs``, so a checkpoint's early stop can skip it; a direct
     ``CakeGroupedMm.apply(x, w, offs, False)`` launches inside ``forward``
     and a checkpoint always recomputes it, as does the wrapper under
     ``torch.jit.trace`` and ``torch.compile``.
 
-    The sixth argument, ``fuse_wgrad_accumulation`` (default ``False``), makes
-    the backward add the weight gradient into ``w.main_grad`` instead
-    (:func:`cake_grouped_mm`); ``forward`` then keeps the Python object ``w``
+    The fifth argument is an internal slot: anything there but ``None``
+    raises ``TypeError``.  The sixth argument, ``fuse_wgrad_accumulation``
+    (default ``False``; a bool, ``ValueError`` otherwise), makes the backward
+    add the weight gradient into ``w.main_grad`` instead
+    (:func:`cake_grouped_mm`; a direct call passes ``apply(x, w, offs, False,
+    None, True)``); ``forward`` then keeps the Python object ``w``
     on ``ctx`` (a saved tensor unpacked under a checkpoint has no attributes).
     ``forward`` runs with grad mode off and cannot tell whether autograd
     records the call, so it does not check ``main_grad``:
@@ -183,11 +192,17 @@ class CakeGroupedMm(torch.autograd.Function):
         x: torch.Tensor,
         w: torch.Tensor,
         offs: torch.Tensor,
-        deterministic: bool,
+        deterministic: bool = True,
         _launch=None,
         fuse_wgrad_accumulation: bool = False,
     ):
         _require_deterministic_false(deterministic, "CakeGroupedMm")
+        if _launch is not None and _launch is not _DEFER_FWD:
+            raise TypeError(
+                "CakeGroupedMm.apply(x, w, offs, False) takes no fifth argument (an internal slot: omit it, "
+                f"or pass None before fuse_wgrad_accumulation), got {_launch!r}; a direct call that fuses "
+                "the weight-gradient accumulation passes apply(x, w, offs, False, None, True)"
+            )
         _require_flag(
             fuse_wgrad_accumulation, "fuse_wgrad_accumulation", "CakeGroupedMm"
         )
@@ -206,8 +221,6 @@ class CakeGroupedMm(torch.autograd.Function):
     def backward(ctx, grad_y: torch.Tensor):
         x, w, offs = ctx.saved_tensors
         fuse = ctx.fuse_wgrad_accumulation and ctx.needs_input_grad[1]
-        if ctx.needs_input_grad[1]:
-            _alert_not_deterministic("CakeGroupedMm.backward")
         if fuse and torch.is_grad_enabled():
             raise NotImplementedError(
                 "CakeGroupedMm.backward: fuse_wgrad_accumulation=True adds into w.main_grad, which a "
@@ -218,8 +231,12 @@ class CakeGroupedMm(torch.autograd.Function):
         # The autograd engine runs backward on a worker thread that has not
         # touched the CUDA runtime yet; the programs encode their TMA
         # descriptors through the driver API, which needs the primary context
-        # current on the calling thread.  One runtime call binds it.
-        torch.cuda.current_stream(x.device).query()
+        # current on the calling thread.  One runtime call binds it: the
+        # capture-status query, which is legal while a CUDA graph captures the
+        # backward, then a stream query outside a capture (a stream that is
+        # being captured must not be queried: that would end the capture).
+        if not torch.cuda.is_current_stream_capturing():
+            torch.cuda.current_stream(x.device).query()
         g = _bf16_rows(grad_y)
         dx = dw = None
         if ctx.needs_input_grad[0]:
@@ -251,8 +268,8 @@ def cake_grouped_mm(
     x: torch.Tensor,
     w: torch.Tensor,
     offs: torch.Tensor,
-    deterministic: bool = True,
     *,
+    deterministic: bool = True,
     fuse_wgrad_accumulation: bool = False,
 ) -> torch.Tensor:
     """Differentiable ragged grouped GEMM ``Y[offs[e-1]:offs[e]] = X[offs[e-1]:offs[e]] @ W[e].T``.
@@ -267,12 +284,12 @@ def cake_grouped_mm(
         int32 device tensor: ``[E]`` cumulative end offsets or ``m_indptr``
         ``[E + 1]``.  Read by the kernels, never on the host.
     deterministic : bool
-        Must be ``False`` (``ValueError`` otherwise): this is the
-        non-deterministic package, whose weight gradient may add its split tail
-        with unordered fp32 reductions.  The deterministic wrapper is
+        Keyword-only; must be ``False`` (``ValueError`` for every other value,
+        the default included): this is the non-deterministic package, whose
+        weight gradient may add its split tail with unordered fp32 reductions.
+        The deterministic wrapper is
         ``flashinfer.experimental.cake_moe_grouped_det_gemm.cake_grouped_det_mm``
-        (or the facade ``flashinfer.experimental.cake.grouped_mm.cake_grouped_mm``
-        with ``deterministic=True``).
+        (no ``deterministic`` argument); nothing here routes to it.
     fuse_wgrad_accumulation : bool
         ``False`` (default): the backward returns ``w``'s gradient as below.
         ``True`` (Megatron's ``gradient_accumulation_fusion``): ``w.main_grad``
@@ -306,7 +323,10 @@ def cake_grouped_mm(
         reproducible run to run where the 512-wide k tile splits its tail; use
         :func:`grouped_gemm_wgrad` directly for an fp32 weight gradient.  Under
         ``torch.use_deterministic_algorithms(True)`` the backward raises the
-        non-determinism alert (no fallback).  The forward GEMM runs after
+        non-determinism alert immediately before a weight-gradient launch that
+        adds a split tail with unordered reductions (``RuntimeError``; under
+        ``warn_only=True`` a ``UserWarning``, then it runs; no fallback); the
+        forward, ``dX`` and a fixed-order ``dW`` do not alert.  The forward GEMM runs after
         autograd saved ``x``, ``w`` and ``offs``: under a non-reentrant
         checkpoint with early stop on, the recomputation skips it when these
         are the last saves of the innermost checkpointed region, as for a

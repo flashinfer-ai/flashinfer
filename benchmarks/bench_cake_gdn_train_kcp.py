@@ -20,8 +20,8 @@ it out) followed by the KCP GDN step -- with CUDA events, the slowest rank's tim
 
 Arms (``--arms``; every one on the same packed batch, the same partition and the same input storage):
 
-* ``det``: the deterministic route, the objects of ``flashinfer.cake_gdn_det_train_kcp`` (what
-  ``deterministic=True`` dispatches to), with its own partition and context;
+* ``det``: the deterministic route, the entries of ``flashinfer.cake_gdn_det_train_kcp`` called directly, with its
+  own partition and context;
 * ``nondet``: ``flashinfer.cake_gdn_train_kcp`` with ``deterministic=False`` (the package
   ``flashinfer.experimental.cake_gdn_train_kcp``), default options;
 * ``det_graph`` / ``nondet_graph``: ``det`` / ``nondet`` with a caller-owned workspace (``WorkspaceDetKcp`` /
@@ -246,9 +246,9 @@ def _query(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
 
 
 class Route:
-    """The entry points of one numerical route.  ``det``: the objects of ``flashinfer.cake_gdn_det_train_kcp`` (what
-    ``deterministic=True`` dispatches to); ``nondet``: ``flashinfer.cake_gdn_train_kcp`` with
-    ``deterministic=False`` (the package ``flashinfer.experimental.cake_gdn_train_kcp``)."""
+    """The entry points of one numerical route.  ``det``: the entries of ``flashinfer.cake_gdn_det_train_kcp`` (called
+    directly; they take no mode keyword); ``nondet``: ``flashinfer.cake_gdn_train_kcp`` with ``deterministic=False``
+    (the package ``flashinfer.experimental.cake_gdn_train_kcp``)."""
 
     def __init__(self, kind: str) -> None:
         self.kind = kind
@@ -1826,7 +1826,8 @@ def main() -> int:
     args = parse_args()
     if torch.are_deterministic_algorithms_enabled():
         raise SystemExit(
-            "torch deterministic algorithms are enabled: deterministic=False would run the deterministic route"
+            "torch deterministic algorithms are enabled: this bench measures with them off (they can change or "
+            "refuse the kernels of other arms); neither GDN route depends on them"
         )
     rank, world, device = _init()
     arms = args.arm_list

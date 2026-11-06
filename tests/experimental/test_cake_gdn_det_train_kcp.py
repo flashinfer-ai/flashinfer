@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 CPU tests of the GDN KCP metadata layer of ``flashinfer.experimental.cake_gdn_det_train_kcp``: the package-local plan
-module against ``cake_kda_train.cake_kcp_plan`` (field-identical partitions and contexts on the step-0 rows with
+module against ``cake_kda_det_train_kcp.cake_kcp_plan`` (field-identical partitions and contexts on the step-0 rows with
 ``H := HV``, except the b1 buffer with maps, ``B1_DM_FIELDS``, which has this package's own dense layout; the KDA
 package is imported HERE only, never by the package), the per-rank crossing counts and
 exchange bytes against the rows of record, the table builders (pool addressing, segment lists, chains), head
@@ -245,7 +245,7 @@ def _sha(obj) -> str:
 @ROWS
 @pytest.mark.parametrize("path", ROW_FILES, ids=ROW_IDS)
 def test_plan_parity_with_kda_on_rows(path, monkeypatch) -> None:
-    """Result 1: ``cake_gdn_det_train_kcp.cake_kcp_plan`` is field-identical to ``cake_kda_train.cake_kcp_plan`` on every
+    """Result 1: ``cake_gdn_det_train_kcp.cake_kcp_plan`` is field-identical to ``cake_kda_det_train_kcp.cake_kcp_plan`` on every
     step-0 row (partition, every rank's context and head plan at ``H := HV``), except the b1 buffer with maps
     (``B1_DM_FIELDS`` and its split / table keys, checked here for tile coverage and offset range instead), and
     reproduces the row's recorded fragment table.  Result 2: ``n_in`` / ``n_out`` / ``max_chain_fragments`` and the
@@ -253,7 +253,7 @@ def test_plan_parity_with_kda_on_rows(path, monkeypatch) -> None:
     share, ``"wave_fill1"`` (the GDN default is the row rule, the KDA default its own tie rule; each is selected
     explicitly here: the keyword-only ``p_rule`` on the GDN side, the private test hook on the KDA side)."""
     kp = importlib.import_module(
-        "flashinfer.experimental.cake_kda_train.cake_kcp_plan"
+        "flashinfer.experimental.cake_kda_det_train_kcp.cake_kcp_plan"
     )  # the test only
     # the KDA module accepts its private test hook only after its opt-in (enable_test_knobs)
     monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
@@ -263,7 +263,7 @@ def test_plan_parity_with_kda_on_rows(path, monkeypatch) -> None:
     W = int(row["cp"])
     args = _partition_inputs(row)
     part = gp.partition_det_kcp(**args)
-    kpart = kp.kcp_partition(**args)
+    kpart = kp.partition_det_kcp(**args)
     assert part.to_dict() == kpart.to_dict(), "partition differs from the KDA module"
     assert _plain(part.to_dict()["fragments"]) == row["fragments"], (
         "partition differs from the row of record"
@@ -284,7 +284,7 @@ def test_plan_parity_with_kda_on_rows(path, monkeypatch) -> None:
         ctx = gp.build_context_det_kcp(
             part, None, r, CPU, 4, sm_count=SM_COUNT, p_rule="wave_fill1"
         )  # the per-rank rule both modules share; the GDN default "row_cost" is tested on the rows below
-        kctx = kp.build_kcp_context(
+        kctx = kp.build_context_det_kcp(
             kpart,
             None,
             r,
@@ -1873,7 +1873,7 @@ def test_registry_seed() -> None:
 
 
 def test_package_imports_no_kda_and_no_environ() -> None:
-    """The package never imports ``cake_kda_train`` and reads no environment variable; the plan
+    """The package never imports a KDA package (any ``cake_kda*`` module) and reads no environment variable; the plan
     module imports torch, torch.distributed and dataclasses only."""
     for path in sorted(PACKAGE_DIR.glob("*.py")):
         tree = ast.parse(path.read_text())
@@ -1884,8 +1884,8 @@ def test_package_imports_no_kda_and_no_environ() -> None:
                     if isinstance(node, ast.ImportFrom) and node.module
                     else []
                 )
-                assert not any("cake_kda_train" in n for n in names), (
-                    f"{path.name} imports cake_kda_train"
+                assert not any("cake_kda" in n for n in names), (
+                    f"{path.name} imports a KDA package"
                 )
                 assert "os" not in [
                     a.name for a in node.names if isinstance(node, ast.Import)
@@ -2580,6 +2580,59 @@ def test_dead_pools_are_not_sized_for_the_call() -> None:
         ws4.pool("ring_out", 16)
     ws4.ensure(ctx, H_qk, HV, device="cpu", backward=True)
     assert set(kcp.RING_POOLS) <= set(ws4._pools)
+
+
+def _other_mode_twin(cls, name: str):
+    """A stand-in for the other mode's class of the same shape: every attribute and method of ``cls`` (dataclass
+    fields included) on a class that is not ``cls`` -- what the non-deterministic package's ``SavedKcp`` /
+    ``WorkspaceKcp`` look like to this package (same fields and version), built without importing that package."""
+    body = {k: v for k, v in vars(cls).items() if k not in ("__dict__", "__weakref__")}
+    body.update(__module__="other_mode_stand_in", __qualname__=name)
+    return type(name, (), body)
+
+
+def test_backward_refuses_a_saved_set_or_workspace_of_the_other_mode() -> None:
+    """The package backward reads the deterministic forward's ``SavedDetKcp`` and a caller-held ``WorkspaceDetKcp``
+    only.  A saved set of the other mode with every field of this forward's saved set (same version, same context,
+    same problem: it passes every field check of ``_check_saved``) and a workspace of the other mode are refused with
+    ``ValueError`` naming the deterministic mode and the expected type, as is any other object; the real saved set
+    and workspace still run."""
+    kcp = _package("cake_kcp")
+    cu = [0, 100, 740, 817]
+    H_qk, HV = 2, 6
+    part = gp.partition_det_kcp(torch.tensor(cu, dtype=torch.int64), 1, "contiguous")
+    ctx = gp.build_context_det_kcp(part, None, 0, CPU)
+    ops = _inputs(cu, H_qk, HV)
+    args = [ops[n] for n in ("q", "k", "v", "g", "beta")]
+    ws = kcp.WorkspaceDetKcp()
+    _, saved = kcp.chunk_gdn_det_fwd_kcp(
+        *args, ctx, backend="fake", segments=2, workspace=ws
+    )
+    assert type(saved) is kcp.SavedDetKcp
+    saved_twin = _other_mode_twin(kcp.SavedDetKcp, "SavedKcp")(
+        **{f.name: getattr(saved, f.name) for f in dataclasses.fields(saved) if f.init}
+    )
+    assert dataclasses.fields(saved_twin) == dataclasses.fields(saved)
+    assert saved_twin.version == saved.version and saved_twin.ctx is ctx
+    ws_twin = object.__new__(_other_mode_twin(kcp.WorkspaceDetKcp, "WorkspaceKcp"))
+    vars(ws_twin).update(vars(kcp.WorkspaceDetKcp()))
+    for name, kw, expected in (
+        ("saved", {"saved": saved_twin}, "SavedDetKcp"),
+        ("saved", {"saved": object(), "workspace": ws}, "SavedDetKcp"),
+        ("workspace", {"saved": saved, "workspace": ws_twin}, "WorkspaceDetKcp"),
+        ("workspace", {"workspace": object()}, "WorkspaceDetKcp"),
+    ):
+        with pytest.raises(
+            ValueError,
+            match=rf"chunk_gdn_det_bwd_kcp: {name} must be a {expected} of the deterministic mode",
+        ):
+            kcp.chunk_gdn_det_bwd_kcp(
+                *args, ctx, ops["dout"], backend="fake", segments=2, **kw
+            )
+    grads = kcp.chunk_gdn_det_bwd_kcp(
+        *args, ctx, ops["dout"], saved=saved, backend="fake", segments=2, workspace=ws
+    )
+    assert all(torch.isfinite(g.float()).all() for g in grads)
 
 
 def test_eager_forward_sizes_c2_send_at_its_first_writer(monkeypatch) -> None:
