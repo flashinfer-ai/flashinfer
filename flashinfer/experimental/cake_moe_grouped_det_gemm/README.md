@@ -20,7 +20,7 @@ synchronises on them.
 | --- | --- | --- | --- |
 | `grouped_det_gemm_fwd(x, w, offs, out=None)` | `Y[offs[e-1]:offs[e]] = X[offs[e-1]:offs[e]] @ W[e].T` | `x [sum_m, K]`, `w [E, N, K]` bf16 | `Y [sum_m, N]` bf16 |
 | `grouped_det_gemm_dgrad(g, w, offs, out=None)` | `dX[offs[e-1]:offs[e]] = G[offs[e-1]:offs[e]] @ W[e]` (W read in place) | `g [sum_m, N]`, `w [E, N, K]` bf16 | `dX [sum_m, K]` bf16 |
-| `grouped_det_gemm_wgrad(g, x, offs, out=None, out_dtype=None, num_groups=None)` | `dW[e] = G[offs[e-1]:offs[e]].T @ X[offs[e-1]:offs[e]]` | `g [sum_m, N]`, `x [sum_m, K]` bf16 | `dW [E, N, K]` bf16 or fp32 |
+| `grouped_det_gemm_wgrad(g, x, offs, out=None, out_dtype=None, num_groups=None, *, accumulate=False)` | `dW[e] = G[offs[e-1]:offs[e]].T @ X[offs[e-1]:offs[e]]` (with `accumulate=True`: `out[e] += dW[e]`) | `g [sum_m, N]`, `x [sum_m, K]` bf16 | `dW [E, N, K]` bf16 or fp32 |
 
 Alignment: `fwd` needs `N % 256 == 0` and `K % 64 == 0`; `dgrad` needs
 `K % 256 == 0` and `N % 64 == 0`; `wgrad` needs `N % 256 == 0` and `K` a
@@ -41,7 +41,8 @@ This package is deterministic only; every public name carries `det`.
 | --- | --- |
 | any entry point of this package or `flashinfer.grouped_mm.{grouped_det_gemm_*, cake_grouped_det_mm}` | the deterministic programs: fixed reduction order, bitwise reproducible run to run |
 | a `deterministic` argument (`True` or `False`), e.g. `cake_grouped_det_mm(x, w, offs, deterministic=False)` | `TypeError`: no deterministic entry takes one |
-| a fourth argument of `CakeGroupedDetMm.apply(x, w, offs)` (e.g. a stale `True` / `False` mode) | `TypeError` |
+| a fourth argument of `CakeGroupedDetMm.apply(x, w, offs)` other than `None` (e.g. a stale `True` / `False` mode; the fifth is `fuse_wgrad_accumulation`) | `TypeError` |
+| `accumulate=True` / `fuse_wgrad_accumulation=True` | the deterministic weight gradient added into `out` / `w.main_grad`, bitwise reproducible run to run (Weight-gradient accumulation, below) |
 | `torch.use_deterministic_algorithms(True)` (also `warn_only=True`) | no change: no alert, no warning |
 | `flashinfer.grouped_mm.grouped_mm_bf16(..., backend="cake")` | the deterministic forward (the forward programs of both Cake packages give the same bits) |
 
@@ -120,7 +121,8 @@ wrapper (`CakeGroupedDetMm`): `backward` produces `x.grad` with the `dgrad`
 program and `w.grad` with the `wgrad` program in the dtype of `w`. The
 programs always reduce in a fixed order and there is no `deterministic`
 argument; `grouped_det_gemm_wgrad(..., out_dtype=torch.float32)`
-gives an fp32 weight gradient. `CakeGroupedDetMm` calls the three programs as
+gives an fp32 weight gradient, and `fuse_wgrad_accumulation=True` adds it
+into an fp32 `w.main_grad` (next section). `CakeGroupedDetMm` calls the three programs as
 plain functions; no torch custom op is registered.
 The wrapper launches the forward GEMM after `CakeGroupedDetMm.apply` returns,
 that is after autograd saved `x`, `w` and `offs`, as for a built-in op. Under
@@ -131,6 +133,122 @@ region (of its output or of any other tensor) makes it run, with the same
 bits. A direct `CakeGroupedDetMm.apply(x, w, offs)` launches inside
 `forward` and is always recomputed, as is the wrapper under `torch.jit.trace`
 and `torch.compile`.
+
+## Weight-gradient accumulation
+
+`grouped_det_gemm_wgrad(..., out=out, accumulate=True)` (also
+`prepare_grouped_det_gemm_wgrad(..., accumulate=True)` and
+`flashinfer.grouped_mm.grouped_det_gemm_wgrad`) adds the deterministic weight
+gradient into the caller's `out` instead of overwriting it:
+`out[e] += G[e].T @ X[e]`, Megatron's `gradient_accumulation_fusion` into an
+fp32 or bf16 `main_grad` (FlashInfer issue #5678).
+`cake_grouped_det_mm(..., fuse_wgrad_accumulation=True)` does the same in its
+backward into `w.main_grad` (below). Both switches are keyword-only and off by
+default; with the defaults the routes, programs, plans and bits are unchanged,
+and `plan["accumulate"]` is `"off"`.
+
+The launch composes (`plan["accumulate"] == "composed"`). The host plans it
+exactly as the overwrite of `out.dtype` (route, k tile, stage, grid, tail split
+and its ordered tail reduce, raster, wave mode). The bound programs write that
+overwrite into a contiguous scratch of `out.dtype`, and the launch adds the
+scratch with `out.add_` on the same stream, outside autograd. No new device
+program runs.
+
+Numerical contract:
+
+- `out` gets AccumulateGrad's bits of the deterministic weight gradient in its
+  dtype. fp32 `out`: `RN_fp32(out + dW32)`, one fp32 add of the fp32 overwrite
+  of the same call. bf16 `out`: `RN_bf16(out + dW_bf16)` with the bf16
+  overwrite, the bits autograd gives when it accumulates `w.grad`.
+- Bitwise reproducible run to run, as the overwrite: every element is reduced
+  in a fixed order (the split tail by the ordered tail reduce) and added once.
+  `torch.use_deterministic_algorithms(True)` changes nothing (no alert, no
+  warning).
+- Accuracy: the deterministic `dW`'s error budget plus one rounding in
+  `out`'s dtype.
+- An empty group adds exact zeros, with the semantics of `out.add_`: its values
+  are kept, `-0.0` becomes `+0.0` and a signaling NaN is quieted. `sum_m == 0`
+  launches nothing and leaves `out` unchanged.
+
+Checks (`ValueError`, before anything is allocated or bound): `out` given,
+`out_dtype` None or `out.dtype`, bfloat16 or float32, `[E, N, K]` with unit
+stride along `K`, rows and experts that do not overlap (row stride at least
+`K`, expert stride at least `N` row strides: an expanded `out` is refused), no
+memory shared with `g`, `x` or `offs`, and `accumulate` a bool. Row and expert
+padding is allowed and never read or written.
+
+Prepared launches and CUDA graphs: `launch()` and every replay of a graph that
+captured it add again (a prepared accumulate launch is not idempotent); the add
+bumps `out._version`. The scratch is owned by the prepared launch, as its
+descriptor slots are: keep the launch alive while a graph that captured it may
+replay (the graph does not keep the scratch alive), and do not have one
+prepared accumulate launch in flight on two streams at once. A launch prepared
+inside a captured backward allocates the scratch from, and returns it to, the
+graph's pool within that backward. As for any in-place operation, two launches
+into the same `out` on different streams must be ordered by the caller.
+
+`cake_grouped_det_mm(x, w, offs, fuse_wgrad_accumulation=True)` follows
+Megatron and Transformer Engine, as the non-deterministic wrapper does:
+`w.main_grad` must be an fp32 or bf16 tensor of `w`'s shape on its device with
+unit stride along the last dimension (row padding allowed). It is checked at
+the forward call when autograd records it (`w` requires grad, grad mode is on,
+not a checkpoint recompute), so not under `torch.no_grad()`, and again at the
+backward, which reads `w.main_grad` then, so a re-pointed buffer is honoured.
+The backward adds the deterministic `dW` into it with the accumulate mode and
+returns for `w` a fresh `torch.empty` of `w`'s shape and dtype when `w` has the
+attribute `grad_added_to_main_grad` (it is set to `True`; `torch.zeros` when
+`w.zero_out_wgrad` is true), else `None` (`w.grad` stays untouched and no
+gradient hook of `w` fires). `x.grad` is unchanged, bitwise. Every backward
+adds: `retain_graph` twice adds twice, and a `torch.autograd.grad(...,
+inputs=...)` that excludes `w` still adds into `w.main_grad`, so split
+backward-input / backward-weight schedules are not supported. A `w` that does
+not require grad is never added to. The flag raises `NotImplementedError` under
+`torch.jit.trace`, `torch.compile` and in a `create_graph` backward; under a
+reentrant checkpoint `w` arrives detached without `main_grad` (`ValueError`;
+use `use_reentrant=False`). A non-reentrant checkpoint's early stop still skips
+the recomputed forward GEMM. A direct `CakeGroupedDetMm.apply(x, w, offs, None,
+True)` takes the flag as its fifth argument (the fourth is an internal slot)
+and checks `main_grad` at the backward only.
+
+Cost (`S = E * N * K` elements):
+
+- Memory: the scratch takes `4 * S` bytes for an fp32 `out` (`2 * S` for
+  bf16) for the life of the prepared launch (in the autograd wrapper, the
+  weight-gradient launch of one backward). Gate/up projection (`N` 4096, `K`
+  6144): 384 MiB at `E` 4, 768 MiB at 8, 1.5 GiB at 16, 3 GiB at 32. Down
+  projection (`N` 6144, `K` 2048): 192 MiB, 384 MiB, 768 MiB, 1.5 GiB. The
+  backward's peak is `2 * S` bytes above the default flag's (a bf16 `w.grad`
+  of `2 * S` bytes that Megatron then adds into `main_grad`); the
+  `grad_added_to_main_grad` placeholder (`2 * S` bytes) is allocated after the
+  scratch is released.
+- Traffic: the programs write the scratch and the add reads it back, `8 * S`
+  bytes beyond the add's read and write of `out`; the time is that of the fp32
+  weight gradient followed by `main_grad.add_`. The non-deterministic package
+  adds in the 512-wide k tile's epilogue instead (no scratch); this package
+  composes.
+- Under `torch.use_deterministic_algorithms(True)` with
+  `torch.utils.deterministic.fill_uninitialized_memory` on (the default),
+  torch fills the scratch and the `torch.empty` placeholder with NaN when it
+  allocates them, one more write of each.
+
+```python
+from flashinfer.experimental.cake_moe_grouped_det_gemm import prepare_grouped_det_gemm_wgrad
+from flashinfer.grouped_mm import cake_grouped_det_mm, grouped_det_gemm_wgrad
+
+# Megatron-style accumulation into an fp32 main_grad, deterministic
+w = torch.nn.Parameter(torch.randn(E, N, K, dtype=torch.bfloat16, device="cuda"))
+w.main_grad = torch.zeros(E, N, K, dtype=torch.float32, device="cuda")
+# (Megatron's DDP also sets w.grad_added_to_main_grad; the backward then returns a
+# placeholder gradient for its hooks.  Without the attribute w.grad stays None.)
+for x, g in micro_batches:
+    y = cake_grouped_det_mm(x, w, offs, fuse_wgrad_accumulation=True)
+    y.backward(g)  # w.main_grad[e] += G[e].T @ X[e]; x.grad as usual
+
+# Low level: add into any fp32 / bf16 buffer
+grouped_det_gemm_wgrad(g, x, offs, out=main_grad, accumulate=True)
+launch = prepare_grouped_det_gemm_wgrad(g, x, offs, out=main_grad, accumulate=True)
+launch.launch()  # main_grad += dW; launch.plan["accumulate"] == "composed"
+```
 
 ## Host plan
 
@@ -278,9 +396,10 @@ constants delivered with the generated programs (`HOST_PLAN_CONSTANTS`):
 
 `GroupedDetGemmLaunch.plan` exposes `grid`, `tile_k`, `tail_splits`,
 `raster_rows`, `launches` and, for `fwd` / `dgrad`, `tile_n`, `clusters`, `c0`,
-`c1` (the even split) and `queue_split`, for `wgrad` `tail_tile_k` (the k width of the split tail tiles) and
-`wave_mode`, for inspection and tests; `GroupedDetGemmLaunch.stages`
-names the bound stages in launch order.
+`c1` (the even split) and `queue_split`, for `wgrad` `tail_tile_k` (the k width of the split tail tiles),
+`wave_mode` and `accumulate` (`"off"` or `"composed"`), for inspection and tests; `GroupedDetGemmLaunch.stages`
+names the bound stages in launch order, and `GroupedDetGemmLaunch.add_from` is the
+scratch of an accumulate launch (else `None`).
 
 ## Build targets and layout
 
@@ -372,7 +491,7 @@ call of the package's functions emits none of them.
 ## Tests and benchmark
 
 ```bash
-pytest tests/experimental/test_cake_moe_grouped_det_gemm.py tests/experimental/test_cake_moe_grouped_det_gemm_api.py tests/experimental/test_cake_moe_grouped_det_gemm_standalone.py tests/experimental/test_cake_moe_grouped_det_gemm_determinism.py
+pytest tests/experimental/test_cake_moe_grouped_det_gemm.py tests/experimental/test_cake_moe_grouped_det_gemm_api.py tests/experimental/test_cake_moe_grouped_det_gemm_standalone.py tests/experimental/test_cake_moe_grouped_det_gemm_determinism.py tests/experimental/test_cake_moe_grouped_det_gemm_acc.py
 python benchmarks/bench_cake_moe_grouped_det_gemm.py --help
 ```
 
@@ -393,7 +512,17 @@ imports, raises its host-side errors without any warning and has its only
 data gradient, weight gradient in bf16 and fp32 at both k tiles with the tail
 reduce, the probed split of the data gradient) on fixed inputs and zeroed
 accumulators and requires bitwise-identical outputs, also across fresh
-processes. The benchmark times the prepared
+processes.
+`test_cake_moe_grouped_det_gemm_acc.py` covers the weight-gradient accumulation:
+on the CPU the plans (equal to the overwrite's, bound to the scratch), the
+checks, the launch's add and the autograd flag's Megatron contract with CPU
+stand-ins for the preparations; on a GPU every weight-gradient form with and
+without a split tail, fp32 and bf16, bitwise against `out0.add_(dW)` and run to
+run, CUDA graph replays, streams, layouts, and the autograd flag with the
+generated programs. The accumulation is timed by the accumulation rows of
+`benchmarks/bench_cake_moe_grouped_gemm.py` (arm `det_mgX`, beside the
+deterministic baselines `det_acc` and `det_mgB` and the non-deterministic arms).
+The benchmark `benchmarks/bench_cake_moe_grouped_det_gemm.py` times the prepared
 launches against `torch._grouped_mm`, a per-group cuBLAS loop and
 `flashinfer.grouped_mm.grouped_mm_bf16` on the MoE projection rows of the
 design (E = 4 ragged distributions, E = 8 / 16 / 32 balanced, fp32 weight
@@ -403,6 +532,8 @@ gradients).
 
 - bf16 inputs only; `E`, `sum_m`, `N`, `K` and the output span must fit
   32-bit element addressing.
+- The weight-gradient accumulation composes: a scratch of the weight
+  gradient's size (above), no add in the kernel epilogue.
 - The alignment rules above; no transposed operand layouts other than the
   documented in-place `W` read of `dgrad`.
 - Compute capability 10.0, 10.3 or 10.7 only; other devices raise.

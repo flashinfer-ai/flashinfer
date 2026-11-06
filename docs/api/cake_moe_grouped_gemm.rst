@@ -115,7 +115,9 @@ supported), and raises ``NotImplementedError`` under ``torch.jit.trace``, ``torc
 and a ``create_graph`` backward.
 
 The facade hands ``accumulate`` and ``fuse_wgrad_accumulation`` to the package with the
-same mode rules; it has no deterministic route.
+same mode rules; it has no deterministic route.  The deterministic package takes the same two
+switches and always composes (its deterministic overwrite into a scratch, then
+``out.add_``), bitwise reproducible run to run: see :ref:`apicake_moe_grouped_det_gemm`.
 
 Functions
 ---------
