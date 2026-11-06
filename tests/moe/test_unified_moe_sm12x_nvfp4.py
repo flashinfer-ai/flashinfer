@@ -1,6 +1,6 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""Native SM12x NVFP4 chain correctness; the default MoE backend is unchanged."""
+"""Native SM12x NVFP4 chain correctness and shared route consumers."""
 
 import importlib
 
