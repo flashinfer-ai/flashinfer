@@ -13,13 +13,14 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Reproducibility of the selectable-mode Cake MoE grouped GEMM against the
+Reproducibility of the non-deterministic Cake MoE grouped GEMM against the
 deterministic package.
 
 Over the 58 MoE projection rows of the benchmark and the edge cases of the
 deterministic package's determinism suite (seeded fixed inputs per case):
 
-* the facade with ``deterministic=True`` gives the deterministic package's bits;
+* the facade (``deterministic=False``, the only mode it takes) gives the
+  deterministic package's bits for ``fwd`` and ``dgrad``;
 * ``fwd`` and ``dgrad`` of the non-deterministic package give the deterministic
   package's bits, the data gradient's own sm_100a L2 evict-first build included
   (it runs where the deterministic package launches its wide tile);
@@ -308,13 +309,10 @@ def _prepare(backend, case, a, b, offs, out):
 
 
 def _facade(case, a, b, offs, out):
+    """The facade's call of a ``fwd`` / ``dgrad`` case (non-deterministic only)."""
     if case.op == "fwd":
-        return facade.grouped_gemm_fwd(a, b, offs, out=out, deterministic=True)
-    if case.op == "dgrad":
-        return facade.grouped_gemm_dgrad(a, b, offs, out=out, deterministic=True)
-    return facade.grouped_gemm_wgrad(
-        a, b, offs, out=out, out_dtype=case.out_dtype, deterministic=True
-    )
+        return facade.grouped_gemm_fwd(a, b, offs, out=out, deterministic=False)
+    return facade.grouped_gemm_dgrad(a, b, offs, out=out, deterministic=False)
 
 
 def _bits(out):
@@ -518,13 +516,14 @@ def test_against_the_deterministic_package(label, record_property):
     det = _prepare(det_cb, case, a, b, offs, det_out)
     det_out.view(torch.uint8).fill_(0)
     det.launch()
-    # The facade's deterministic=True runs the deterministic package: the same bits.
-    facade_out = _out(case, device)
-    facade_out.view(torch.uint8).fill_(FILL_BYTE)
-    _facade(case, a, b, offs, facade_out)
-    torch.cuda.synchronize(device)
-    assert torch.equal(_bits(facade_out), _bits(det_out)), "facade deterministic=True"
-    del facade_out
+    if case.op != "wgrad":
+        # The facade runs this package; its fwd / dgrad give the deterministic bits.
+        facade_out = _out(case, device)
+        facade_out.view(torch.uint8).fill_(FILL_BYTE)
+        _facade(case, a, b, offs, facade_out)
+        torch.cuda.synchronize(device)
+        assert torch.equal(_bits(facade_out), _bits(det_out)), "facade fwd / dgrad"
+        del facade_out
     out = _out(case, device)
     launch = _prepare(cb, case, a, b, offs, out)
     record = dict(
