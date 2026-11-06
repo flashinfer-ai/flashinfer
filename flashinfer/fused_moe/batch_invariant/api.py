@@ -77,10 +77,10 @@ class MoEWeights:
         act = act if act is not None else ("silu" if gated else "relu2")
         if act not in (S.ACTS if gated else S.UNGATED_ACTS):
             raise ValueError(f"no {'gated' if gated else 'ungated'} chain {act!r}")
-        params = S.params_key(params)
-        if len(params) != len(S.ACT_PARAMS.get(act, ())):
+        key: Tuple[Optional[float], ...] = S.params_key(params)
+        if len(key) != len(S.ACT_PARAMS.get(act, ())):
             raise ValueError(
-                f"chain {act!r} takes parameters {S.ACT_PARAMS.get(act, ())}, got {params!r}"
+                f"chain {act!r} takes parameters {S.ACT_PARAMS.get(act, ())}, got {key!r}"
             )
         if (
             fc1.dtype != torch.bfloat16
@@ -102,13 +102,13 @@ class MoEWeights:
                 "H and I must be multiples of 8 (16-byte-aligned bf16 operands)"
             )
         if not gated:
-            return MoEWeights(fc1.contiguous(), fc2.contiguous(), False, act, params)
+            return MoEWeights(fc1.contiguous(), fc2.contiguous(), False, act, key)
         return MoEWeights(
             fc1.contiguous() if interleaved else interleave_fc1(fc1),
             fc2.contiguous(),
             True,
             act,
-            params,
+            key,
         )
 
     @property
@@ -250,9 +250,9 @@ def route(
     if logits.dim() != 2 or logits.stride(1) != 1 or logits.dtype not in _IN:
         raise TypeError("route: logits must be a row-major f32 or bf16 [T, E]")
     T, E = logits.shape
-    if E > 512:
+    if E > 1024:
         raise ValueError(
-            f"route: {E} experts; the route kernel scores at most 512 experts"
+            f"route: {E} experts; the route kernel scores at most 1024 experts"
         )
     if not 1 <= top_k <= min(E, 16):
         raise ValueError(f"route: top_k {top_k} must be in [1, min(E, 16)]")

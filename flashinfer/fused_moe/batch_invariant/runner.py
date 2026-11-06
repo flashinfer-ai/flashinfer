@@ -154,9 +154,9 @@ class BatchInvariantMoeRunner(MoERunner):
             raise unsupported(
                 CLASS, f"top_k {routing.top_k}", "1 <= top_k <= min(num_experts, 16)"
             )
-        if not 1 <= routing.num_experts <= 512:
+        if not 1 <= routing.num_experts <= 1024:
             raise unsupported(
-                CLASS, f"num_experts {routing.num_experts}", "1 <= num_experts <= 512"
+                CLASS, f"num_experts {routing.num_experts}", "1 <= num_experts <= 1024"
             )
         if routing.n_group not in (None, 0, 1) or routing.topk_group not in (
             None,

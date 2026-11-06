@@ -25,7 +25,7 @@ import cutlass.cute as cute
 from cutlass import Boolean, Int32
 from cutlass.cutlass_dsl import extract_mlir_values, new_from_mlir_values
 
-MAX_E = 576  # experts per launch: 512 routed + a shared one, rounded to whole lanes (static smem tables of MAX_E + 1 ints)
+MAX_E = 1024  # experts per launch (static smem tables of MAX_E + 1 ints; a whole number of lanes)
 
 
 def warp_roles(epi_warpgroups: int) -> Tuple[Tuple[int, ...], int, int, int]:

@@ -748,6 +748,24 @@ def test_layer_matches_the_class_composition(act):
 
 
 @needs_device
+def test_the_largest_expert_count_routes_and_runs():
+    """1024 experts (the routing kernel's widest bucket, the group tables' size): the class's routing from the logits
+    equals the CPU model, and the layer equals the class composition at that expert count."""
+    from flashinfer.fused_moe.batch_invariant import spec as S
+    from flashinfer.fused_moe.batch_invariant.api import route
+
+    T, k, H, I, E = 96, 8, 256, 128, 1024
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=9, adversarial=True)
+    ids, wts = route(logits, k)
+    ref_ids, ref_w = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    assert torch.equal(ids.cpu(), ref_ids) and torch.equal(bits(wts.cpu()), bits(ref_w))
+    layer = _layer(k, E, I)
+    out = layer(_logits_pack(x, logits), _weights(w1, w2))
+    ref = _reference_ffn(x, ids, wts, w1, w2, S.activation_of(_SWIGLU))
+    assert torch.equal(bits(out.cpu()), bits(ref))
+
+
+@needs_device
 def test_three_routing_modes_agree_and_runs_are_deterministic():
     """From logits, pre-routed unpacked (fp32 and bf16 weights) and pre-routed packed give the bits of the class on their
     inputs (the packed mode's bf16-rounded weights are its inputs); repeated runs and a CUDA-graph replay reproduce them."""
@@ -940,7 +958,7 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
     errors = (BatchInvariantUnsupportedError, RuntimeError, NotImplementedError)
     oai = _layer(k, E, I, SwiGLU(alpha=1.702, beta=1.0, limit=7.0))
     assert isinstance(oai.runners[0], BatchInvariantMoeRunner)
-    for cfg_kw, what in ((dict(k=17), "top_k"), (dict(E=600), "num_experts")):
+    for cfg_kw, what in ((dict(k=17), "top_k"), (dict(E=1025), "num_experts")):
         with pytest.raises(errors) as excinfo:
             _layer(cfg_kw.get("k", k), cfg_kw.get("E", E), I)
         assert what in str(excinfo.value) or "moe.bf16" in str(excinfo.value)

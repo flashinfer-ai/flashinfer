@@ -3290,7 +3290,10 @@ class BatchInvariantMoeConfig:
     weights alone: the batch size and composition, the row's position, the expert loads and the grouped-GEMM record the
     dispatcher or the autotuner picks never enter the dataflow (run-to-run determinism, batch / permutation / sub-batch
     invariance, configuration agreement; the proofs are the ``MoE`` Lean module of the mode). The combine is the
-    slot-order fp32 fold, so ``MoEFinalizeConfig.use_fused_finalize`` is ignored and ``do_finalize`` must stay ``True``.
+    slot-order fp32 fold of the class and the backend always performs it: ``MoEFinalizeConfig.do_finalize`` must stay
+    ``True`` (the unreduced per-slot rows of ``do_finalize=False`` are not returned; they belong with the expert-parallel
+    classes, together with the convention for non-local experts) and ``use_fused_finalize`` is ignored (the combine is
+    never an atomic finalize).
     All three routing input modes are taken: ``FromLogits`` runs the class's own routing (``Default``, ``Renormalize``,
     ``RenormalizeNaive``, ``Sigmoid``, ``SigmoidRenorm`` and ``DeepSeekV3`` with ``n_group <= 1``), the pre-routed modes take the caller's ids
     and weights. Unsupported inputs raise :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; the backend

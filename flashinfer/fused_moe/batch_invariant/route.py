@@ -45,7 +45,7 @@ class RouteKernel:
     method's weights, written in slot order."""
 
     def __init__(self, Ep: int, k: int, method: S.RoutingMethod):
-        assert Ep % LANES == 0 and Ep // LANES in (1, 2, 4, 8, 16) and 1 <= k <= 16
+        assert Ep % LANES == 0 and Ep // LANES in (1, 2, 4, 8, 16, 32) and 1 <= k <= 16
         self.Ep, self.P, self.k, self.method = Ep, Ep // LANES, k, method
         red = S.softmax_reduction(Ep, lambda fp, e: None)
         self.plan = canon.plan(
