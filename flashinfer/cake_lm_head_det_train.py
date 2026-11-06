@@ -27,9 +27,10 @@ entry takes a ``deterministic`` keyword (passing one is a ``TypeError``), and
 ``torch.use_deterministic_algorithms(True)`` changes nothing (these entries
 never raise its alert).
 
-Thin experimental wrappers: validation of the backend contract, the chunk
-plans, the workspace, launch binding, autograd wrappers and JIT registration
-live in the backend package ``flashinfer.experimental.cake.cake_lm_head_det_train``,
+A stable API (``@flashinfer_api``; no ``ExperimentalWarning``) of thin
+wrappers: validation of the backend contract, the chunk plans, the workspace,
+launch binding, autograd wrappers and JIT registration live in the
+experimental backend package ``flashinfer.experimental.cake.cake_lm_head_det_train``,
 imported on first use.  The ``FLASHINFER_CAKE_LM_HEAD_LOSS_*`` variables are
 this wrapper's A/B knobs (``flashinfer/_cake_lm_head_train_knobs.py``): a
 switch keyword left at ``None`` falls back to its variable, and the resolved
@@ -45,7 +46,7 @@ from typing import Any, Dict, Optional, Union
 import torch
 
 from . import _cake_lm_head_train_knobs as _knobs
-from .api_logging import flashinfer_experimental_api
+from .api_logging import flashinfer_api
 
 __all__ = [
     "cake_lm_head_det_train_logprob",
@@ -54,8 +55,6 @@ __all__ = [
     "cake_lm_head_det_train_support_kl",
     "cake_lm_head_det_train_support_logprob",
 ]
-
-_FEATURE = "Cake det LM-head + loss training kernels (SM100/SM103/SM107)"
 
 
 @functools.cache
@@ -81,7 +80,7 @@ def _cake_backend_opt_in() -> ModuleType:
     return cake_backend_opt_in
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_lm_head_det_train_loss(
     X: torch.Tensor,
     W: torch.Tensor,
@@ -433,7 +432,7 @@ def _logprob_temperature(
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_lm_head_det_train_logprob(
     X: torch.Tensor,
     W: torch.Tensor,
@@ -570,7 +569,7 @@ def cake_lm_head_det_train_logprob(
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_lm_head_det_train_preload(
     device: Optional[Union[torch.device, int, str]] = None,
     *,
@@ -609,7 +608,7 @@ def _cake_support() -> ModuleType:
     return cake_support
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_lm_head_det_train_support_logprob(
     X: torch.Tensor,
     W: torch.Tensor,
@@ -660,7 +659,7 @@ def cake_lm_head_det_train_support_logprob(
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_lm_head_det_train_support_kl(
     X: torch.Tensor,
     W: torch.Tensor,

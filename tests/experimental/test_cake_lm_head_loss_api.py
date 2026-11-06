@@ -207,13 +207,13 @@ def _nd_calls(fake, entry):
 
 def test_entries_are_experimental_dispatchers():
     """Each det-free entry is its own experimental function (not the deterministic object) with its module's
-    feature, and every deterministic entry keeps its marking and its own module's feature."""
+    feature; every deterministic entry is a stable API (no experimental marking)."""
     for entry, det in ENTRIES.items():
         fn, det_fn = getattr(public, entry), getattr(det_public, det)
         assert fn is not det_fn, entry
-        assert fn.is_experimental is True and det_fn.is_experimental is True, entry
+        assert fn.is_experimental is True, entry
+        assert getattr(det_fn, "is_experimental", False) is False, det
         assert fn.experimental_feature == public._FEATURE, entry
-        assert det_fn.experimental_feature == det_public._FEATURE, det
         assert fn.__name__ == entry and "SM100" in fn.__doc__, entry
     for name in (
         "_det_loss",

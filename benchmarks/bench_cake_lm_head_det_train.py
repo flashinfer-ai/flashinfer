@@ -502,7 +502,7 @@ class ArmCCEDefault(ArmCCE):
 
 
 class ArmCake(ArmAutograd):
-    """The public experimental entry points (``flashinfer.cake_lm_head_det_train``, ``backend="cake"``); a
+    """The public entry points (``flashinfer.cake_lm_head_det_train``, ``backend="cake"``); a
     log-probability row with a temperature passes the inputs' temperature argument as is (a Python number for the
     scalar form, the ``[T]`` tensor otherwise)."""
 

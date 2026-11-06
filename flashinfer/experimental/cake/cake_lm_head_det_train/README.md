@@ -6,7 +6,9 @@ memory-bounded backward (GLM-5.2 geometry: hidden size 6144, vocabulary
 154880, irregular token counts such as 16231 or 16172 per step, default token
 chunk 4096).  Tracking issue: flashinfer-ai/flashinfer#5680.
 
-Both the API and the backend are experimental: no compatibility guarantee,
+The public module `flashinfer.cake_lm_head_det_train` is a stable API
+(`@flashinfer_api`, no `ExperimentalWarning`); this backend package is
+experimental, with no compatibility guarantee for its internal modules.
 SM100 (B200 / GB200) is the acceptance architecture; SM103 (B300 / GB300) and
 SM107 (R200) are compiled from the same sources (SM107 runs SM103's programs,
 built for `sm_107a`, under the base dispatch rules).  The feature does not participate in

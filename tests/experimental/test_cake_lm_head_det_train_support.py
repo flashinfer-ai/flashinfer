@@ -1931,7 +1931,7 @@ def test_public_support_entries():
         "cake_lm_head_det_train_support_kl",
     ):
         fn = getattr(public, name)
-        assert fn.is_experimental is True
+        assert getattr(fn, "is_experimental", False) is False
         assert "SM100" in fn.__doc__
         inner = inspect.signature(getattr(cake_support, name)).parameters
         outer = inspect.signature(fn).parameters

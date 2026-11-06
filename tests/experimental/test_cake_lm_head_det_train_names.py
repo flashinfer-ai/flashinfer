@@ -214,12 +214,13 @@ def test_former_names_are_gone_from_the_backend():
 
 
 def test_facade_all_is_the_five_entries():
-    """The facade's ``__all__`` is exactly its five experimental entries, each named after the module."""
+    """The facade's ``__all__`` is exactly its five entries, each named after the module and each a stable API
+    (no experimental marking)."""
     assert sorted(public.__all__) == list(ENTRIES)
     for name in public.__all__:
         fn = getattr(public, name)
         assert name.startswith("cake_lm_head_det_train_"), name
-        assert fn.is_experimental is True, name
+        assert getattr(fn, "is_experimental", False) is False, name
         assert fn.__name__ == name, name
 
 

@@ -15,14 +15,14 @@ limitations under the License.
 
 flashinfer public-API tests of the Cake chunked LM-head + loss package.
 
-The experimental entry points ``flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_loss`` and
+The stable entry points ``flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_loss`` and
 ``cake_lm_head_det_train_logprob`` are thin wrappers over
-``flashinfer.experimental.cake.cake_lm_head_det_train.cake_backend``: they carry the experimental
-marking, accept ``backend="cake"`` only and own FlashInfer's A/B environment variables
+``flashinfer.experimental.cake.cake_lm_head_det_train.cake_backend``: they carry no experimental
+marking and emit no ``ExperimentalWarning``, accept ``backend="cake"`` only and own FlashInfer's A/B environment variables
 ``FLASHINFER_CAKE_LM_HEAD_LOSS_*`` -- a switch keyword left at ``None`` falls back to its
 variable and the resolved value is passed down; the two binding-cache variables are
 read when the module is imported and applied when it first reaches the backend.  The
-tests here cover that wrapper: the marking, each variable's fallback and parsing, the
+tests here cover that wrapper: the (absent) marking, each variable's fallback and parsing, the
 cache configuration and, on a supported device, the pass-down through the public
 entry.  The backend tests live in ``test_cake_lm_head_det_train.py``, which imports the
 package only through ``tests.test_helpers.cake_package`` and reads no environment
@@ -89,15 +89,18 @@ def _host_call():
     return X, W, labels
 
 
-def test_public_api_is_marked_experimental():
-    assert cake_lm_head_det_train_loss.is_experimental is True
-    assert cake_lm_head_det_train_logprob.is_experimental is True
+def test_public_api_is_stable():
+    """The entries are a stable API: no experimental marking and no ``ExperimentalWarning`` on a call."""
+    assert getattr(cake_lm_head_det_train_loss, "is_experimental", False) is False
+    assert getattr(cake_lm_head_det_train_logprob, "is_experimental", False) is False
     assert "SM100" in cake_lm_head_det_train_loss.__doc__
     assert "SM100" in cake_lm_head_det_train_logprob.__doc__
     X, W, labels = _host_call()
     # the public module serves the cake backend only
-    with pytest.raises(ValueError, match="backend"):
-        cake_lm_head_det_train_loss(X, W, labels, loss_div=1.0, backend="reference")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", ExperimentalWarning)
+        with pytest.raises(ValueError, match="backend"):
+            cake_lm_head_det_train_loss(X, W, labels, loss_div=1.0, backend="reference")
     with pytest.raises(ValueError, match="backend"):
         cake_lm_head_det_train_logprob(X, W, labels, backend="reference")
 
@@ -210,9 +213,12 @@ def test_public_api_memory_and_count_keywords(monkeypatch):
                         **kw,
                     )
     assert not seen, seen
-    assert public.cake_lm_head_det_train_preload.is_experimental is True
+    assert (
+        getattr(public.cake_lm_head_det_train_preload, "is_experimental", False)
+        is False
+    )
     with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ExperimentalWarning)
+        warnings.simplefilter("error", ExperimentalWarning)
         with pytest.raises(ValueError, match="CUDA device"):
             public.cake_lm_head_det_train_preload("cpu")
 
