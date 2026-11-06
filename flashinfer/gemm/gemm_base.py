@@ -7824,6 +7824,11 @@ def _heuristic_func_mm_mxfp8(
         return [c for c in order if c in suitable_backends]
     # don't select trtllm since it requires weight shuffling
     if "cutlass" in suitable_backends:
+        # On SM107 the CuTe-DSL and cuDNN kernels win on some shapes; listing them after
+        # CUTLASS lets the autotuner rank all three while untuned calls keep CUTLASS.
+        if get_compute_capability(a.device) == (10, 7):
+            extra = ["cute-dsl"] + (["cudnn"] if CUDNN_AVAILABLE else [])
+            return ["cutlass"] + [c for c in extra if c in suitable_backends]
         return ["cutlass"]
     # fall back to cudnn (e.g. on SM12x when CUTLASS scale-layout
     # requirements are not met) when it is available.
@@ -8042,7 +8047,7 @@ def mm_mxfp8(
 
     tuning_config = (
         _MM_MXFP8_CUTE_DSL_TUNING_CONFIG
-        if backends in (["cute-dsl"], ["cutedsl_low_latency"])
+        if "cute-dsl" in backends or backends == ["cutedsl_low_latency"]
         else _MM_MXFP8_TUNING_CONFIG
     )
 
