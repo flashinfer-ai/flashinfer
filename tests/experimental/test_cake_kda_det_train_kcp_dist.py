@@ -945,6 +945,7 @@ def test_module_imports_only_torch_and_its_package() -> None:
         "ctypes",
         "warnings",
         "functools",
+        "inspect",  # inspect.signature: the entry points' signatures state their keyword options (stdlib)
         "weakref",
         "operator",
         "sys",  # sys.modules: the non-deterministic package's types are found without importing that package

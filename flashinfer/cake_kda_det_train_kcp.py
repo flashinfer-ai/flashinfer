@@ -39,6 +39,7 @@ The width-4 causal convolution with halo of the same partition takes this module
 
 from __future__ import annotations
 
+import inspect
 from typing import Any, Optional
 
 import torch
@@ -49,6 +50,45 @@ from .cake_kda_det_train import DEFAULT_SCALE
 # The KCP entry points forward to ``flashinfer.experimental.cake.cake_kda_det_train_kcp.cake_kcp`` (the per-rank
 # launch sequences over the kernels of the ``cake_kcp_jit`` registry) and ``cake_kcp_plan`` (the partition, the
 # context's tables and collectives, the byte queries).  Every keyword is forwarded; nothing is validated here.
+
+# The keywords the three entries with ``**options`` forward to the backend entry of the same name: the raw gate
+# keywords, the options of ``CakeKDADetKcpOptions`` (``cake_kcp._OPTION_KEYS``) and the private test hook, with the
+# backend's defaults.  They are listed here, not read from the backend, so that importing this module loads no
+# backend module; the API test checks that each entry's signature equals the backend entry's.
+_FORWARDED_KEYWORDS = (
+    ("use_gate_in_kernel", False, "bool"),
+    ("A_log", None, "Optional[torch.Tensor]"),
+    ("dt_bias", None, "Optional[torch.Tensor]"),
+    ("lower_bound", None, "Optional[float]"),
+    ("save_transfer", None, "Optional[bool]"),
+    ("exchange", "auto", "str"),
+    ("head_groups", 1, "int"),
+    ("offset_class", "fla", "str"),
+    ("debug_sequence", False, "bool"),
+    ("spec3_probe", "off", "str"),
+    ("graph", "off", "str"),
+    ("_kcp_test_knobs", None, "Optional[dict[str, Any]]"),
+)
+
+
+def _forwarding_signature(fn):
+    """Give entry ``fn`` the signature of the keywords it accepts: its own parameters without ``**options``, then
+    :data:`_FORWARDED_KEYWORDS` as keyword-only parameters.  ``fn`` still takes ``**options`` and forwards them; the
+    backend refuses an unknown keyword (``TypeError``).  Returns ``fn`` itself."""
+    sig = inspect.signature(fn)
+    params = [
+        p
+        for p in sig.parameters.values()
+        if p.kind is not inspect.Parameter.VAR_KEYWORD
+    ]
+    params += [
+        inspect.Parameter(
+            name, inspect.Parameter.KEYWORD_ONLY, default=default, annotation=annotation
+        )
+        for name, default, annotation in _FORWARDED_KEYWORDS
+    ]
+    fn.__signature__ = sig.replace(parameters=params)
+    return fn
 
 
 @flashinfer_api
@@ -141,6 +181,7 @@ def cake_kda_det_train_kcp_build_context(
 
 
 @flashinfer_api
+@_forwarding_signature
 def cake_kda_det_train_kcp_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -226,6 +267,7 @@ def cake_kda_det_train_kcp_forward(
 
 
 @flashinfer_api
+@_forwarding_signature
 def cake_kda_det_train_kcp_backward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -290,6 +332,7 @@ def cake_kda_det_train_kcp_backward(
 
 
 @flashinfer_api
+@_forwarding_signature
 def cake_kda_det_kcp(
     q: torch.Tensor,
     k: torch.Tensor,

@@ -301,6 +301,7 @@ from __future__ import annotations
 import ctypes
 import dataclasses
 import functools
+import inspect
 import operator
 import sys
 import types
@@ -4531,6 +4532,41 @@ def _default_options() -> CakeKDADetKcpOptions:
     return opts
 
 
+def _with_option_signature(fn):
+    """Give entry point ``fn`` the signature of the keywords it accepts: its own parameters without ``**options``,
+    then one keyword-only parameter per :data:`_OPTION_KEYS` with the default of its :class:`CakeKDADetKcpOptions`
+    field, then ``_kcp_test_knobs`` (``None``).  ``inspect.signature(fn).bind_partial(deterministic=False)`` then
+    raises ``TypeError``, as for every other entry point.  The implementation still takes ``**options`` and
+    validates them with :func:`_options` (an unknown keyword is a ``TypeError`` at the call; the validated options
+    the autograd node passes on as ``_kcp_options`` are internal).  Returns ``fn`` itself."""
+    fields = {f.name: f for f in dataclasses.fields(CakeKDADetKcpOptions)}
+    sig = inspect.signature(fn)
+    params = [
+        p
+        for p in sig.parameters.values()
+        if p.kind is not inspect.Parameter.VAR_KEYWORD
+    ]
+    params += [
+        inspect.Parameter(
+            key,
+            inspect.Parameter.KEYWORD_ONLY,
+            default=fields[key].default,
+            annotation=fields[key].type,
+        )
+        for key in _OPTION_KEYS
+    ]
+    params.append(
+        inspect.Parameter(
+            "_kcp_test_knobs",
+            inspect.Parameter.KEYWORD_ONLY,
+            default=None,
+            annotation="dict[str, Any] | None",
+        )
+    )
+    fn.__signature__ = sig.replace(parameters=params)
+    return fn
+
+
 def _exchange_scheme(tb: _Tables, opts: CakeKDADetKcpOptions) -> str:
     """``a2a`` or ``ring`` (SPEC-2): ``auto`` is ``a2a`` in Phase 1 (the ring path arrives with gate 5); an explicit
     ``ring`` needs every document chain within ``RING_MAX_HOPS`` hops."""
@@ -6172,6 +6208,7 @@ def _prepare(
     return call, batched
 
 
+@_with_option_signature
 def cake_kda_det_train_kcp_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -6420,6 +6457,7 @@ def _check_saved(saved: CakeKDADetKcpSaved, call: CakeKDADetKcpCall) -> None:
         )
 
 
+@_with_option_signature
 def cake_kda_det_train_kcp_backward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -7399,6 +7437,7 @@ class CakeKDADetKcpFunction(torch.autograd.Function):
         )
 
 
+@_with_option_signature
 def cake_kda_det_kcp(
     q: torch.Tensor,
     k: torch.Tensor,

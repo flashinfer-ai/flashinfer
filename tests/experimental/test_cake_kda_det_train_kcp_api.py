@@ -16,16 +16,17 @@ limitations under the License.
 flashinfer public-API tests of the Cake deterministic context-parallel (KCP) packed KDA training package
 (``flashinfer.experimental.cake.cake_kda_det_train_kcp``), device-free: the keywords the entry points of
 ``flashinfer.cake_kda_det_train_kcp`` forward, and the #8928 names.  The shared check of #8928
-(``tests.test_helpers.cake_mode_names``) covers the names of the facade and the package: the mode word right after
-the op, no ``deterministic`` keyword, each object bound under one name only (the facade, the ``flashinfer`` top
-level, the package's modules) and the earlier names and package path failing at import.  The three entries that
-take ``**options`` bind any keyword by signature, so the keyword check runs on them by call (the options check
-refuses ``deterministic`` before any operand is read).  This file adds what the shared check does not cover: the
-facade entries are stable (not experimental) and defined in the facade, the types resolve lazily to the backend
-classes, the backend modules define the names, errors name the entry points, and importing the facade or the
-package loads no host module.
+(``tests.test_helpers.cake_mode_names.assert_cake_mode_module``) covers the facade: the mode word right after the
+op, no ``deterministic`` keyword, each object bound under one name only (the facade, the ``flashinfer`` top level,
+the package and its modules) and the earlier names and package path failing at import; the package states the
+mode and takes no ``deterministic`` keyword either.  The three entries that take ``**options`` state the options
+in their signatures (keyword-only, the option keys of ``CakeKDADetKcpOptions``), checked against the options.
+This file adds what the shared check does not cover: the facade entries are stable (not experimental) and defined
+in the facade, the types resolve lazily to the backend classes, the backend modules define the names, errors name
+the entry points, and importing the facade or the package loads no host module.
 """
 
+import dataclasses
 import importlib
 import inspect
 import subprocess
@@ -38,10 +39,9 @@ import pytest
 import flashinfer
 import flashinfer.cake_kda_det_train_kcp as kcp_api
 from tests.test_helpers.cake_mode_names import (
+    assert_cake_mode_module,
     assert_mode_names,
     assert_no_deterministic_keyword,
-    assert_old_names_fail,
-    assert_same_object_same_name,
 )
 
 
@@ -149,7 +149,7 @@ ENTRY_BACKEND = {
 FACADE = "flashinfer.cake_kda_det_train_kcp"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SUBMODULES = ("cake_kcp", "cake_kcp_plan", "cake_kcp_jit", "cake_build")
-# the entries that take ``**options`` (forwarded to the backend's options check): checked by call
+# the entries that take ``**options`` (validated by the backend's options check); their signatures state the options
 OPTIONS_ENTRIES = (
     "cake_kda_det_kcp",
     "cake_kda_det_train_kcp_backward",
@@ -239,51 +239,65 @@ def test_backend_definitions_carry_the_det_names(module: str, new: str) -> None:
 
 
 def test_facade_follows_the_cake_mode_names() -> None:
-    # the shared check (assert_cake_mode_module without its keyword check, see test_no_entry_takes_deterministic):
-    # the facade, the flashinfer top level and the package's modules bind each object under its facade name only,
-    # including the backend object each entry calls
-    assert_mode_names(kcp_api, "det")
-    assert_same_object_same_name(
+    # the shared check: the mode word, no ``deterministic`` keyword, each object bound under its facade name only
+    # (the facade, the flashinfer top level, the package and the modules it serves its names from, including the
+    # backend object each entry calls) and the earlier names and package path failing at import
+    assert_cake_mode_module(
         kcp_api,
-        [flashinfer, *(_backend(m) for m in ("cake_kcp", "cake_kcp_plan"))],
+        "det",
+        namespaces=[
+            flashinfer,
+            importlib.import_module(PACKAGE),
+            *(_backend(m) for m in ("cake_kcp", "cake_kcp_plan")),
+        ],
         forwards=[
             (name, getattr(_backend(module), name))
             for name, module in ENTRY_BACKEND.items()
         ],
+        old_modules=OLD_MODULES,
+        old_names=OLD_NAMES,
+        cwd=REPO_ROOT,
     )
-    assert_old_names_fail(OLD_MODULES, OLD_NAMES, cwd=REPO_ROOT)
 
 
-def test_package_states_the_mode() -> None:
-    assert_mode_names(importlib.import_module(PACKAGE), "det")
+def test_package_states_the_mode_and_takes_no_deterministic_keyword() -> None:
+    package = importlib.import_module(PACKAGE)
+    assert_mode_names(package, "det")
+    assert_no_deterministic_keyword(package)
 
 
-@pytest.mark.parametrize("where", ("facade", "package"))
-def test_no_entry_takes_deterministic(where: str) -> None:
-    # #8928 rule 7: the mode is part of the name only.  The shared keyword check runs on every public callable but
-    # the three entries with ``**options``, which bind ``deterministic=`` there and refuse it at the call (the
-    # options check runs before any operand is read).
-    mod = kcp_api if where == "facade" else importlib.import_module(PACKAGE)
-    names = [name for name in mod.__all__ if callable(getattr(mod, name))]
-    # functions only: a class is checked by its constructor (an autograd Function by its forward / backward)
-    var_keyword = [
-        name
-        for name in names
-        if not inspect.isclass(getattr(mod, name))
-        and any(
-            p.kind is inspect.Parameter.VAR_KEYWORD
-            for p in inspect.signature(getattr(mod, name)).parameters.values()
+@pytest.mark.parametrize("name", OPTIONS_ENTRIES)
+def test_option_entries_state_the_option_keys(name: str) -> None:
+    # The backend entry takes ``**options``; its signature states them instead: the keyword-only parameters it adds
+    # to its own are the option keys (``cake_kcp._OPTION_KEYS``) with the defaults of their ``CakeKDADetKcpOptions``
+    # fields, then ``_kcp_test_knobs`` (``None``).  The facade entry, which forwards ``**options``, states the same
+    # parameters (names, kinds, defaults).
+    cake_kcp = _backend("cake_kcp")
+    backend = getattr(cake_kcp, name)
+    code = backend.__code__
+    own = code.co_varnames[: code.co_argcount + code.co_kwonlyargcount]
+    params = inspect.signature(backend).parameters
+    assert all(p.kind is not inspect.Parameter.VAR_KEYWORD for p in params.values())
+    added = [n for n in params if n not in own]
+    assert added == [*cake_kcp._OPTION_KEYS, "_kcp_test_knobs"]
+    assert all(params[n].kind is inspect.Parameter.KEYWORD_ONLY for n in added)
+    defaults = {
+        f.name: f.default for f in dataclasses.fields(cake_kcp.CakeKDADetKcpOptions)
+    }
+    assert {n: params[n].default for n in cake_kcp._OPTION_KEYS} == {
+        n: defaults[n] for n in cake_kcp._OPTION_KEYS
+    }
+    assert params["_kcp_test_knobs"].default is None
+
+    def stated(fn):
+        ps = inspect.signature(fn).parameters.values()
+        keyword_only = inspect.Parameter.KEYWORD_ONLY
+        return (
+            [(p.name, p.kind, p.default) for p in ps if p.kind is not keyword_only],
+            {p.name: p.default for p in ps if p.kind is keyword_only},
         )
-    ]
-    assert sorted(var_keyword) == sorted(OPTIONS_ENTRIES)
-    assert_no_deterministic_keyword(
-        [getattr(mod, name) for name in names if name not in OPTIONS_ENTRIES]
-    )
-    for name in OPTIONS_ENTRIES:
-        obj = getattr(mod, name)
-        args, kwargs = _required_arguments(obj)
-        with pytest.raises(TypeError, match="deterministic"):
-            obj(*args, deterministic=False, **kwargs)
+
+    assert stated(getattr(kcp_api, name)) == stated(backend)
 
 
 def test_errors_name_the_det_entry_points() -> None:
