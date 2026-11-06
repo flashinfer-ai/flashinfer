@@ -161,10 +161,12 @@ not picked them up):
   SF token-back), which keep the unrotated serial loop. `src/src/ptx_helpers.py` adds
   `red_add_relaxed_gpu_s32_raw`. `megamoe_kernel_fp8.py` takes ctor kwargs
   `dispatch_pull_batch` / `dispatch_pull_rotate`. `epilogue_fp8_swapab.py`
-  and the MX `run_wgmma_task_tile` take `n_half` as a runtime value, so for
-  packed FP4 with `token_back_mode='epi_warps'` the two epilogue warpgroups
-  share one code copy (the calls share `fc1_args` / `store_args` /
-  `fc2_args`); FP8 keeps one copy per half and compiles as before.
+  and the MX `run_wgmma_task_tile` take `n_half` as a runtime value, so with
+  `token_back_mode='epi_warps'` the two epilogue warpgroups share one code
+  copy (FP8 per-tensor / blockwise and packed FP4; the calls share
+  `fc1_args` / `store_args` / `fc2_args`). Blockwise N64 keeps one copy per
+  half: it already runs near the register limit and measured 2.5-4% slower
+  with the shared copy (blockwise N16/N32/N72/N80 tie or gain).
   Dispatch-side token-back (`reuse_dispatch_warps` / `standalone_warps`)
   keeps one copy per half: that path can give intermittent run-to-run output
   differences without these changes too, which the shared copy made far more
@@ -195,8 +197,8 @@ not picked them up):
   `dispatch_pull_batch` / `dispatch_pull_rotate` kwargs of
   `megamoe_kernel_fp8.py`; and the runtime `n_half` of the epilogue and the
   MX `run_wgmma_task_tile` (drop `cutlass.Constexpr` from those parameters),
-  keeping the per-half copies under `_token_back_by_dispatch` or a scale
-  mode other than `mxfp4_hybrid`.
+  keeping the per-half copies under `_token_back_by_dispatch` and for
+  blockwise N64.
 - Paired BF16 FC2 stores for K128 MXFP4 tiles (2026-10-27, measured on
   H2560/I640/E512/top10/EP2 in October):
   `src/moe_hopper_fp8/mxfp4_policy.py` resolves `paired_stores` for tile K
