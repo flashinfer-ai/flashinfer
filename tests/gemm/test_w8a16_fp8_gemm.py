@@ -339,6 +339,62 @@ def test_w8a16_fp8_gemm_workspace_bytes_splitk_overflow():
         )
 
 
+def test_fast_divmod_magic_bounds():
+    """The Blackwell tile scheduler divides by a magic multiplier, which is exact
+    only while x * d < 2^40 and x * magic fits in 64 bits (magic is about 2^40 / d,
+    so at d == 1 the product overflows from x = 2^23, long before the first bound
+    fails).  The helper must fall back to the exact division (magic 0) at either
+    bound and divide exactly just below it.  Runs the host-side DSL code itself,
+    with no kernel launch."""
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import from_dlpack
+
+    from flashinfer.gemm.kernels.cute_dsl.w8a16_fp8_gemm_sm100 import (
+        _FAST_DIVMOD_LIMIT,
+        _fast_divmod,
+        _fast_divmod_magic,
+    )
+
+    @cute.jit
+    def probe(
+        d: cutlass.Int32, x_max: cutlass.Int32, x: cutlass.Int32, out: cute.Tensor
+    ):
+        magic = _fast_divmod_magic(d, x_max)
+        q, r = _fast_divmod(x, d, magic)
+        out[0] = magic
+        out[1] = q.to(cutlass.Int64)
+        out[2] = r.to(cutlass.Int64)
+
+    out = torch.zeros(3, dtype=torch.int64)
+
+    def run(d, x_max, x):
+        out.zero_()
+        probe(d, x_max, x, from_dlpack(out))
+        return out[0].item(), (out[1].item(), out[2].item())
+
+    int32_max = 2**31 - 1
+    int64_max = 2**63 - 1
+    for d in (1, 2, 3, 132, 148, 1000, 2**20, int32_max):
+        magic = -(-_FAST_DIVMOD_LIMIT // d)
+        # The largest x_max under each bound, and one past it.
+        exact_bound = (_FAST_DIVMOD_LIMIT - 1) // d
+        product_bound = int64_max // magic
+        edges = {exact_bound, exact_bound + 1, product_bound, product_bound + 1, 1000}
+        for x_max in sorted(x for x in edges if 1 <= x <= int32_max):
+            fast = x_max * d < _FAST_DIVMOD_LIMIT and x_max <= product_bound
+            x = x_max - 1
+            got_magic, got = run(d, x_max, x)
+            assert (got_magic != 0) == fast, (d, x_max, got_magic)
+            assert got == divmod(x, d), (d, x_max, x, got)
+    # The shape that crashed: M=1, N=(2^23 + 1) * 128 on 128x128 tiles is 2^23 + 1
+    # tiles along one axis and a single one along the other (d == 1); 2^23 - 1 tiles
+    # take the fast path exactly.
+    assert run(1, 2**23 + 1, 2**23)[0] == 0
+    magic, got = run(1, 2**23 - 1, 2**23 - 2)
+    assert magic == 1 << 40 and got == (2**23 - 2, 0)
+
+
 def test_w8a16_fp8_gemm_rejects_aliasing():
     """The two buffers a call writes (out, workspace) must not share bytes with anything
     it reads, or with each other; inputs may alias one another.  Checked before launch,

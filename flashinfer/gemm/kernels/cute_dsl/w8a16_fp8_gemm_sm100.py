@@ -47,6 +47,7 @@ from .w8a16_fp8_gemm_sm100_utils import (
 _FAST_DIVMOD_SHIFT = 40
 # x * d below this bound makes the multiply-and-shift exact (see _fast_divmod_magic).
 _FAST_DIVMOD_LIMIT = 1 << _FAST_DIVMOD_SHIFT
+_INT64_MAX = (1 << 63) - 1
 
 
 @cute.jit
@@ -54,11 +55,15 @@ def _fast_divmod_magic(d: cutlass.Int32, x_max: cutlass.Int32) -> cutlass.Int64:
     """The multiplier for ``_fast_divmod`` by ``d`` over dividends below ``x_max``:
     ceil(2^40 / d), with which x // d == (x * magic) >> 40 exactly whenever
     x * d < 2^40 (the rounding error is x * (magic * d - 2^40) / (d * 2^40), below
-    one quotient step under that bound).  0 when the bound does not hold for every
-    dividend: ``_fast_divmod`` then divides exactly."""
+    one quotient step under that bound) and x * magic fits in 64 bits (magic is
+    about 2^40 / d, so for small d the product overflows long before the first
+    bound fails: at d == 1 from x = 2^23).  0 when either bound does not hold for
+    every dividend: ``_fast_divmod`` then divides exactly."""
     d64 = d.to(cutlass.Int64)
     magic = (cutlass.Int64(_FAST_DIVMOD_LIMIT) + d64 - 1) // d64
-    if x_max.to(cutlass.Int64) * d64 >= _FAST_DIVMOD_LIMIT:
+    x_max64 = x_max.to(cutlass.Int64)
+    overflow = x_max64 > cutlass.Int64(_INT64_MAX) // magic
+    if x_max64 * d64 >= _FAST_DIVMOD_LIMIT or overflow:
         magic = cutlass.Int64(0)
     return magic
 
