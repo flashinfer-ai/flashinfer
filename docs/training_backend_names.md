@@ -69,7 +69,7 @@ Module names are under `flashinfer.`. "Planned" marks versions that do not exist
 | DSA indexer | det | single rank | `cake_dsa_indexer_det_train` | `cake_dsa_indexer_det_train_topk`, `cake_dsa_indexer_det_train_topk_workspace_size` | none (no autograd: top-k selection) | `experimental.cake_dsa_indexer_det` (+ alias `experimental.cake_dsa_indexer`) / `dsa_indexer.dsa_indexer_det_topk(backend="cake")`, `dsa_indexer_det_topk_workspace_size`, aliases `dsa_indexer_topk*` |
 | | nondet | single rank | `cake_dsa_indexer_nondet_train` | | | planned |
 | DSA sparse attention | det | single rank | `cake_dsa_sparse_attention_det_train` | | | planned |
-| | nondet | single rank | `cake_dsa_sparse_attention_nondet_train` | entries renamed by the rules | | `experimental.cake_dsa_train` |
+| | nondet | single rank | `cake_dsa_sparse_attention_nondet_train` | `cake_dsa_sparse_attention_nondet`, `cake_dsa_sparse_attention_nondet_varlen`, `cake_dsa_sparse_attention_nondet_nope`, `cake_dsa_sparse_attention_nondet_nope_varlen` | `CakeDSASparseAttentionNondetFunction` (both rope entries), `CakeDSASparseAttentionNondetNopeFunction`, `CakeDSASparseAttentionNondetNopeVarlenFunction` | `experimental.cake_dsa_train` / `dsa_sparse_attention.dsa_sparse_attention{,_varlen,_nope,_nope_varlen}` |
 | GQA HD256 | det | single rank | `cake_gqa_det_train` | `cake_gqa_det` | `CakeGQADetFunction` | planned |
 | | nondet | single rank | `cake_gqa_nondet_train` | `cake_gqa_nondet` | `CakeGQANondetFunction` | `gqa_train` / `varlen_gqa_attention` |
 
