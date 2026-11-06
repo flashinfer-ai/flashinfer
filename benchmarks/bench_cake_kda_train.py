@@ -70,27 +70,17 @@ flash-linear-attention's ``chunk_kda(use_gate_in_kernel=True, ...)``, whose
 ``out`` the row compares with the non-deterministic arm's
 (``fla_raw_out_vs_nd``: the relative RMS difference; an adapter that drops a
 gate term shows here).  This package's raw mode runs the deterministic
-package's programs in the same order (no path runs an S1 pair; a tape backward
+package's programs in the same order on every architecture (a tape backward
 may run this package's w-only WY twin in place of the WY program, writing the
-same ``w``) but for the parameter-gradient reduce: on ``sm_100a`` / ``sm_103a`` its backward runs an
-``R1c`` pair (the GLM intra program adds the per-chunk partials in FP64 into
-the workspace's accumulators, its cast rounds them once), on ``sm_107a`` and
-with ``--l2n`` on every architecture the deterministic pair.  A raw row reports ``r1c`` (the pair's GLM intra and cast
-records and replica count; ``None`` on ``sm_107a``), ``param_acc_bytes`` (the
-nd workspace's FP64 accumulators, outside its arena ``workspace_bytes``),
-``raw_partials_bytes`` (the per-call partials and scratch the deterministic
-pair allocates on every backward, which an ``R1c`` backward does not) and
-``peak_drop_bytes`` (det minus nd ``peak_bytes`` per boundary).  In
-``nd_vs_det`` every result but ``dA_log`` / ``ddt_bias`` is bitwise; those two
-are bitwise on ``sm_107a`` and differ by FP32 rounding on the ``R1c`` rows
-(reported, not gated: ``param_max_ulp`` the largest distance in representable
-FP32 values, ``param_differing_elements`` how many differ).
+same ``w``), so every result (``dg`` of the raw gate, ``dA_log`` and
+``ddt_bias`` included) is bitwise the deterministic one and no path runs an S1
+pair.
 
-``--build-order`` sets which Cake arm allocates first: its workspace (with the
-accumulators of an ``R1c`` row), its first results comparison call (where its
-first-use buffers are made), its saved set and its closures.  The arena
-placement this decides moves a few kernels by microseconds, so a det / nd ratio
-measured in one order carries a placement bias.  ``det-first`` (the default)
+``--build-order`` sets which Cake arm allocates first: its workspace, its first
+results comparison call (where its first-use buffers are made), its saved set
+and its closures.  The arena placement this decides moves a few kernels by
+microseconds, so a det / nd ratio measured in one order carries a placement
+bias.  ``det-first`` (the default)
 is the order of the earlier runs; ``nd-first`` swaps it; ``both`` runs every
 row in both orders, prints both, and reports per arm and boundary the mean of
 the two orders' medians (``order_avg``), the ratios of those means
@@ -558,27 +548,12 @@ def _bits_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
     return torch.equal(a.contiguous().view(view), b.contiguous().view(view))
 
 
-def _ulp_distance(a: torch.Tensor, b: torch.Tensor) -> tuple[int, int]:
-    """``(largest distance, differing elements)`` of two FP32 tensors of one shape, the distance counted in
-    representable FP32 values (``+0`` and ``-0`` one value)."""
-
-    def ordered(t: torch.Tensor) -> torch.Tensor:
-        i = t.contiguous().view(torch.int32).to(torch.int64)
-        return torch.where(i < 0, -(i & 0x7FFFFFFF), i)
-
-    d = (ordered(a) - ordered(b)).abs()
-    if d.numel() == 0:
-        return 0, 0
-    return int(d.max().item()), int((d > 0).sum().item())
-
-
 def _nd_vs_det(inputs: dict, det_ws, nd_ws, build_order: str = "det-first") -> dict:
     """The non-deterministic results against the deterministic ones on the same inputs, from the saved set and from
-    the replay: the outputs that are bitwise (in the raw gate mode every one but ``dA_log`` / ``ddt_bias`` of an
-    ``R1c`` row; in the in-kernel Q/K L2 norm mode every one, ``dg`` included), ``dg``'s differing elements and
-    largest difference, and in the raw gate mode the largest FP32 ulp distance of ``dA_log`` / ``ddt_bias`` and
-    their differing elements.  The arms run in ``build_order`` (:data:`CAKE_ARMS`): the first call on a workspace
-    makes its first-use buffers."""
+    the replay: the outputs that are bitwise (in the raw gate mode every one, ``dA_log`` and ``ddt_bias`` included;
+    in the in-kernel Q/K L2 norm mode every one, ``dg`` included), and ``dg``'s differing elements and largest
+    difference.  The arms run in ``build_order`` (:data:`CAKE_ARMS`): the first call on a workspace makes its
+    first-use buffers."""
     report = {}
     for label, replay in (("saved", False), ("replay", True)):
         results = {
@@ -601,12 +576,6 @@ def _nd_vs_det(inputs: dict, det_ws, nd_ws, build_order: str = "det-first") -> d
             "dg_max_abs_diff": float(diff.max().item()) if diff.numel() else 0.0,
             "dg_max_abs": float(det["dg"].abs().max().item()) if diff.numel() else 0.0,
         }
-        if "dA_log" in det:
-            ulps = {n: _ulp_distance(nd[n], det[n]) for n in ("dA_log", "ddt_bias")}
-            report[label]["param_max_ulp"] = {n: u[0] for n, u in ulps.items()}
-            report[label]["param_differing_elements"] = {
-                n: u[1] for n, u in ulps.items()
-            }
     return report
 
 
@@ -620,21 +589,6 @@ def _nd_vs_det_or_error(
         gc.collect()
         torch.cuda.empty_cache()
         return {"error": _error(exc)}
-
-
-def _r1c(ws) -> dict | None:
-    """The ``R1c`` pair a raw nd workspace's backward runs: its GLM intra and cast records and replica count
-    (``None`` on the deterministic pair's rows and in the g mode)."""
-    stripes = nd_backend._r1c_stripes(ws.plan)
-    if stripes is None:
-        return None
-    records = ws.records()
-    pair: dict = {
-        stage: sorted({by[stage] for by in records.values() if by.get(stage)})
-        for stage in ("glm_intra", "param_finalize")
-    }
-    pair["stripes"] = stripes
-    return pair
 
 
 def _s1_paths(ws) -> list[str]:
@@ -734,13 +688,9 @@ def run_row(
         )
 
     def nd_workspace():
-        ws = cake_workspace(
+        return cake_workspace(
             seqlen, docs, heads, device, gate=gate, l2n=l2n, deterministic=False
         )
-        _ = (
-            ws.param_acc
-        )  # an R1c row's accumulators, allocated with the arena (None elsewhere)
-        return ws
 
     if build_order == "det-first":
         det_ws, nd_ws = det_workspace(), nd_workspace()
@@ -760,11 +710,6 @@ def run_row(
         "records": {"det": det_ws.records(), "nd": nd_ws.records()},
         "s1_paths": _s1_paths(nd_ws),
         "workspace_bytes": {"det": det_ws.bytes, "nd": nd_ws.bytes},
-        "r1c": _r1c(nd_ws),
-        "param_acc_bytes": nd_ws.param_acc_bytes,
-        "raw_partials_bytes": nd_backend._raw_partials_bytes(nd_ws.plan.NC_pad, heads)
-        if gate == "raw"
-        else 0,
         "saved_bytes": nd_backend.saved_bytes(
             seqlen,
             heads,
@@ -954,14 +899,6 @@ def run_row(
             if "fla" in row["ms"] and name in row["ms"]["fla"]:
                 row["ratio_fla_over_nd"][name] = row["ms"]["fla"][name] / nd_ms
         _aa_band(row, name)
-    if gate == "raw" and "det" in row["memory"] and "nd" in row["memory"]:
-        # the per-call partials the deterministic pair allocates and an R1c backward does not
-        row["peak_drop_bytes"] = {
-            name: row["memory"]["det"][name]["peak_bytes"]
-            - row["memory"]["nd"][name]["peak_bytes"]
-            for name in row["memory"]["nd"]
-            if name in row["memory"]["det"]
-        }
     if side_stream:
         row["side_stream"] = {
             arm: {
@@ -997,7 +934,6 @@ def combine_orders(by_order: dict[str, dict]) -> dict:
             "recurrence",
             "segments_per_doc",
             "s1_paths",
-            "r1c",
         )
     }
     row["build_order"] = "both"
@@ -1085,8 +1021,6 @@ def _print_row(row: dict, boundaries: tuple[str, ...]) -> None:
         f"{row['recurrence']}{'/P' + str(row['segments_per_doc']) if row['recurrence'] == 'seg' else ''} "
         f"S1[{','.join(row['s1_paths']) or '-'}] order={row['build_order']}"
     ]
-    if row.get("r1c"):
-        cells[0] += f" R1c[{','.join(row['r1c']['glm_intra'])}]"
     for name in boundaries:
         if name not in row["ms"]["nd"]:
             continue

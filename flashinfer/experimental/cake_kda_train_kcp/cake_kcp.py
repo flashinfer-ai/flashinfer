@@ -35,20 +35,16 @@ paths :data:`LOCAL_PATH_FWD` / :data:`LOCAL_PATH_BWD`: the forward runs copies
 of the deterministic programs, and on the rows of that package's
 ``cake_jit.S1_RECORDS`` the backward's fused gradient leaves the ``q * dq`` term
 of ``dg`` to the GLM intra program that follows it (the pair is selected
-together per rank; its plan refuses a mixed pair).  In the ``"g"`` mode (the
-default) the schedule has a fixed order and no atomic adds: at the same
-topology repeated calls are bitwise equal, saved-mode and checkpoint-replay
-backwards run the same programs and are bitwise equal, and ``out``, ``dq``,
-``dk``, ``dv`` and ``dbeta`` are bitwise those of the deterministic package;
-``dg`` differs from it by FP32 rounding on the ``S1`` rows.  The one unordered
-reduction is the raw gate mode's parameter-gradient reduce on ``sm_100a`` /
-``sm_103a`` with the in-kernel Q/K L2 norm off (the ``R1c`` pairs, "Raw gate
-mode" below): its FP64 additions
-arrive in no fixed order, so a rank's ``dA_log`` / ``ddt_bias`` can differ from
-run to run, and only that backward raises torch's deterministic-algorithms
-alert (on every rank, before any exchange; eagerly and on a graph replay).
-Every other output of the raw mode stays bitwise.  The context holds no mode;
-a saved set is read by the backward of this package only.
+together per rank; its plan refuses a mixed pair).  The schedule has a fixed
+order and no atomic adds: at the same topology repeated calls are bitwise
+equal, saved-mode and checkpoint-replay backwards run the same programs and
+are bitwise equal, and ``out``, ``dq``, ``dk``, ``dv`` and ``dbeta`` are
+bitwise those of the deterministic package; ``dg`` differs from it by FP32
+rounding on the ``S1`` rows.  No path launches an unordered reduction, so no
+entry raises torch's deterministic-algorithms alert (a launch whose result can
+vary from run to run must raise it immediately before that launch).  The
+context holds no mode; a saved set is read by the backward of this package
+only.
 
 Every rank holds its own token fragments (``[T_r, H, 128]`` operands, local
 ``cu_seqlens`` with one sequence per fragment) and only recurrent-state
@@ -77,9 +73,7 @@ CUDA-graph replay (adopted in an earlier revision; keyword
 :func:`chunk_kda_bwd_kcp`, shipped default ``GRAPH_DEFAULT = "off"``): the
 first call of a validity key runs eagerly, the second is captured into a
 ``torch.cuda.CUDAGraph`` and every later call of the key replays it -- the same
-launches and collectives, bitwise the eager result (but for the ``R1c``
-parameter partial sums of a raw backward on ``sm_100a`` / ``sm_103a``, an
-unordered FP64 sum at every replay too).  The key is the call's
+launches and collectives, bitwise the eager result.  The key is the call's
 kind, its ContextKcp / workspace / backend objects, every option and the
 shape / stride / dtype / data pointer of every operand and saved tensor: a
 framework gets the replay only with pointer-stable operands and the same
@@ -245,46 +239,28 @@ the single-rank rule, never copied) and the local stages run the plan's raw
 records (``cake_backend.plan(..., gate="raw")``: the intra and prep programs
 activate the gate ``lower_bound * sigmoid(exp(A_log) * (g + dt_bias))`` in
 their prefix passes, the raw GLM intra program writes the BF16 gradient of the
-raw gate, one launch of the ``param_finalize`` stage forms the rank's parameter
-gradients, no gate epilogue runs: on ``sm_107a`` ``glm_intra_raw`` writes
-per-chunk ``(hi, lo)`` partials and ``param_finalize`` reduces them in a fixed
-order; on ``sm_100a`` / ``sm_103a`` the ``R1c`` GLM intra program adds them in
-FP64 into the local arena's accumulators ``param_acc`` and its cast rounds them
-once and zeroes the accumulators).  The ``gk`` rows
+raw gate and per-chunk ``(hi, lo)`` partials of the parameter gradients, one
+``param_finalize`` launch reduces them, no gate epilogue runs).  The ``gk`` rows
 the K1 / K2 / K3 walks read are the explicit path's bits for the same activated
 gate, so every KCP program, collective and its byte count is unchanged; no
 full-size FP32 gate or gate gradient exists on the route.  ``dA_log`` /
 ``ddt_bias`` of a rank are its partial sums (the gradients through its own
-tokens, reduced on the rank: in the fixed order of its local chunks on
-``sm_107a``, by the ``R1c`` pair's unordered FP64 sum on ``sm_100a`` /
-``sm_103a``, below): the training framework sums them over ``ctx.group`` like
-the gradients of any parameter replicated across the context-parallel ranks, or
-calls :func:`reduce_gate_param_grads_kcp` (an all-gather, then an FP32 sum in
-rank order) when that sum must be bitwise reproducible from the partials -- an
-NCCL all-reduce does not fix its summation order.  The workspace
-(:attr:`WorkspaceKcp.gate`), the saved set and a recompute handle's fingerprint
-record the mode (and the lower bound); a call in another mode is refused.  A raw-mode workspace runs the replay
+tokens, reduced on the rank in the fixed order of its local chunks): the
+training framework sums them over ``ctx.group`` like the gradients of any
+parameter replicated across the context-parallel ranks, or calls
+:func:`reduce_gate_param_grads_kcp` (an all-gather, then an FP32 sum in rank
+order) when that sum must be bitwise reproducible -- an NCCL all-reduce does not
+fix its summation order.  The workspace (:attr:`WorkspaceKcp.gate`), the
+saved set and a recompute handle's fingerprint record the mode (and the lower
+bound); a call in another mode is refused.  A raw-mode workspace runs the replay
 local arena (``local_arena="lean"`` is refused in this mode).  The raw records of
 the single-rank package are copies of the deterministic package's raw programs
-but for the parameter-gradient reduce, and its raw plan selects no ``S1`` pair,
-so every output and the raw gate's gradient are bitwise those of the
-deterministic package's raw KCP route; on ``sm_107a`` the per-rank partial sums
-are bitwise too.  On ``sm_100a`` / ``sm_103a`` the FP64 additions of the ``R1c``
-pair arrive in no fixed order, so a rank's ``dA_log`` / ``ddt_bias`` can differ
-from run to run (and from the deterministic route): by one FP32 ulp at most
-while the FP64 sum's order error stays below half an FP32 ulp of the result
-(only per-chunk terms that nearly cancel exceed it); such a
-backward raises PyTorch's non-determinism alert under
-``torch.use_deterministic_algorithms(True)`` on every rank before any
-exchange.  :func:`reduce_gate_param_grads_kcp` still fixes the cross-rank
-order: every rank gets the same bits from the same partials (which then vary
-from run to run, so the sum does too, by a few FP32 ulps that grow with the
-world size: each partial by about one ulp, each addition rounding either way).
-With the in-kernel Q / K L2 norm (below) the raw backward runs the deterministic
-pair on every architecture (the l2n GLM intra program and
-``param_finalize_l2n``, the deterministic ``param_finalize``), so its partial
-sums are bitwise the deterministic route's and it raises no alert.
-The checkpoint hand-off does not engage in raw mode (:func:`chunk_kda_kcp`).
+and its raw plan selects no ``S1`` pair, so every output, the raw gate's
+gradient and the per-rank partial sums are bitwise those of the deterministic
+package's raw KCP route, with the in-kernel Q / K L2 norm (below: the l2n GLM
+intra program and ``param_finalize_l2n``, the deterministic ``param_finalize``)
+and without it.  The checkpoint hand-off does not engage in raw mode
+(:func:`chunk_kda_kcp`).
 
 In-kernel Q / K L2 norm (FlashInfer issue #7817; keyword-only
 ``use_qk_l2norm_in_kernel=False`` on the three entry points, the workspace and
@@ -3530,12 +3506,10 @@ class WorkspaceKcp:
     :func:`cake_kcp_plan.local_scratch_table_bytes`), and the arena is replaced only by a pack that does not fit.
     A forward never replaces a backward arena with a forward-only one.  :meth:`reserve` sizes the workspace for a
     list of contexts up front, so the calls of those packs allocate nothing and every pointer stays put
-    (``kda_workspace_bytes_kcp([ctx, ...], H=H)`` predicts its ``bytes``).  No content crosses calls but the ``R1c``
-    accumulators of a raw backward, which every backward leaves zero (or marked, to be zeroed by the next one), so the
-    results are bitwise those of one workspace per pack, but for the ``R1c`` parameter partial sums of a raw backward
-    on ``sm_100a`` / ``sm_103a`` (an unordered FP64 sum in either case).  The workspace keeps no context alive.  It
-    records the stream of its last call; a call on another stream first orders that stream's queued work before its
-    own (one ``wait_stream``, never a host wait) and marks the workspace's live storages as used on its stream (one
+    (``kda_workspace_bytes_kcp([ctx, ...], H=H)`` predicts its ``bytes``).  No content crosses calls, so the results are
+    bitwise those of one workspace per pack.  The workspace keeps no context alive.  It records the stream of its
+    last call; a call on another stream first orders that stream's queued work before its own (one
+    ``wait_stream``, never a host wait) and marks the workspace's live storages as used on its stream (one
     ``record_stream`` each, :meth:`_order_stream`), so a pool or arena a later call replaces, or the storage of a
     dropped workspace, goes back to the caching allocator only after the queued work of every stream that used it;
     calls on one stream do neither.  ``allocate=False`` with a context allocates nothing until the first call
@@ -3546,12 +3520,7 @@ class WorkspaceKcp:
     FP32 gate, ``"raw"`` the raw BF16 gate of ``use_gate_in_kernel=True``) for its lifetime: the local arena is
     planned in that mode (``cake_backend.plan(..., gate=)``: the raw records, and on every architecture a backward
     layout without the gate epilogue's ``dg_int`` / ``db_int``); the KCP pools do not depend on it.  A call in the
-    other mode is refused with ``ValueError``.  A raw backward local arena of an ``R1c`` plan (``sm_100a`` /
-    ``sm_103a``) also holds the rank's FP64 parameter-gradient accumulators (``cake_backend.KdaWorkspace.param_acc``,
-    zero between backwards): one storage shared by its plan views, of the largest view's elements (a pack of more
-    heads than it holds grows it, which drops the cached graphs of the arena, :meth:`_param_acc_ready`; ``reserve``
-    sizes it for its contexts); ``bytes`` counts that storage once.  A raw backward zeroes the whole storage first
-    when an earlier one stopped before its cast, and so does a ``graph="replay"`` replay.
+    other mode is refused with ``ValueError``.
 
     ``use_qk_l2norm_in_kernel`` (issue #7817) likewise fixes the in-kernel Q / K L2 norm mode of its calls
     (:attr:`qk_l2norm`) and its form (:attr:`l2n`, the existing backend's plan mode: ``"fused"`` for the flag,
@@ -3796,34 +3765,12 @@ class WorkspaceKcp:
             )
             for ctx in local:
                 view = self._bind_local(ctx, H, dev, backward)
-                # an R1c plan's accumulators at this pack's size (the views share one storage), allocated only:
-                # the first backward zeroes them on its own stream
-                self._param_acc_ready(view, zero=False)
                 for path in (LOCAL_PATH_FWD, LOCAL_PATH_BWD):
                     if cake_kcp_plan.intra_writes_tables(view.plan, path):
                         _scratch_tables(view)
                         break
             self.local_view = None
         return self.bytes
-
-    def _param_acc_ready(self, view: Any, *, zero: bool = True) -> None:
-        """The ``R1c`` accumulators of the local arena sized for ``view`` (the arena or a plan view of it, bound to a
-        raw backward pack) and, with ``zero`` and outside a CUDA-graph capture, zero
-        (``cake_backend.KdaWorkspace._param_acc_clean``: a new storage is allocated unfilled, and an earlier backward
-        that stopped before its cast, or a captured one, left the whole storage marked).  :meth:`reserve` passes
-        ``zero=False`` (allocations only); the backward's :func:`_prepare` zeroes them on the call's stream.  The views
-        share one storage of the largest view's elements; a view of more heads (or replicas) grows it and the
-        replaced storage goes back to the allocator, so the cached graphs pinning this arena, whose launches add into
-        that storage, are dropped first (:func:`_graph_release`, as when the arena is replaced).  Nothing on a plan
-        without an ``R1c`` pair."""
-        if view is None or not view.backward or view.param_acc_bytes == 0:
-            return
-        box = view._param_acc_box[0]
-        if box is not None and box.nbytes < view.param_acc_bytes:
-            _graph_release(self.local)
-        _ = view.param_acc
-        if zero:
-            view._param_acc_clean()
 
     def _require_l2n(self, device: torch.device | str | None) -> None:
         """With the flag on, refuse the mode where the single-rank programs of the workspace's form cannot run on
@@ -3927,9 +3874,6 @@ class WorkspaceKcp:
         if local is not None:
             add(local.arena)
             add(local._eye_box[0])
-            add(
-                local._param_acc_box[0]
-            )  # the R1c accumulators, shared by the views like the eye
             add(local.__dict__.get(TAIL_COUNTS_ATTR))
             for arena in (local, *self._views.values()):
                 for t in (arena.__dict__.get(SCRATCH_TABLES_ATTR) or {}).values():
@@ -4168,12 +4112,8 @@ class WorkspaceKcp:
         if self.local is not None:
             # the arena and the intra record's scratch table set where it writes one, its own and each plan view's
             counts = self.local.__dict__.get(TAIL_COUNTS_ATTR)
-            acc = self.local._param_acc_box[0]
             local = (
                 int(self.local.bytes)
-                # the R1c accumulators of a raw backward arena (outside it; one storage the views share, of the
-                # largest view's elements)
-                + max(self.local.param_acc_bytes, 0 if acc is None else int(acc.nbytes))
                 + _scratch_bytes(self.local.plan)
                 + self._views_scratch
                 + (0 if counts is None else counts.nbytes)
@@ -5741,11 +5681,9 @@ def _backward(call: CallKcp, saved: SavedKcp | None) -> None:
             )  # with fused_walks also the dS_out copies into the extra carry slots
     _adj_tapes(call, dcarry=dcarry, wait_first=wait_first)
     tail = (call.local_values or {}).get("_kcp_tail") if call.T_r else None
-    # raw gate mode: the raw GLM intra program writes d raw and no gate epilogue runs; glm_intra_raw (sm_107a) writes
-    # the per-chunk (hi, lo) partials of dA_log / ddt_bias and one param_finalize launch then reduces this rank's
-    # partials in the order of its local chunks; an R1c GLM intra program (sm_100a / sm_103a) adds them in FP64 into
-    # the local arena's param_acc and its cast (one CTA per head) rounds them and zeroes param_acc (a raw-mode
-    # workspace has no lean arena, so its tail runs in one pass)
+    # raw gate mode: the raw GLM intra program writes d raw and the per-chunk (hi, lo) partials of dA_log / ddt_bias
+    # and no gate epilogue runs; one param_finalize launch then reduces this rank's partials in the order of its
+    # local chunks (a raw-mode workspace has no lean arena, so its tail runs in one pass)
     tail_stages = ("dqkg", "glm_intra") if call.gate == "raw" else TAIL_STAGES
     if not tail:
         for name in tail_stages:
@@ -5758,11 +5696,7 @@ def _backward(call: CallKcp, saved: SavedKcp | None) -> None:
         # the fallback form's separate pullback: dq / dk from the GLM intra capture's FP32 dq_hat / dk_hat
         call.stage("qk_pullback")
     if call.gate == "raw":
-        if "param_acc" in (call.grads or {}):
-            call.stage("param_finalize")
-            call.local._param_acc_end()  # the cast leaves param_acc zero
-        else:
-            call.stage("param_finalize", seg_cap=call.scratch.get("seg_cap"))
+        call.stage("param_finalize", seg_cap=call.scratch.get("seg_cap"))
     # the normalized q / k die after their last reader (the GLM intra program)
     if call.l2n:
         call.l2n_values = None
@@ -5776,8 +5710,7 @@ def _backward(call: CallKcp, saved: SavedKcp | None) -> None:
 # every option; scale; the save flags; and the shape / stride / dtype / data pointer of every operand and saved
 # tensor) runs eagerly.  The second call is captured into a ``torch.cuda.CUDAGraph`` (nothing runs during a capture)
 # and the graph is replayed once; every later call of the key replays it: the same kernels and collectives with the
-# same arguments in the same order (bitwise the eager result, but for the R1c parameter partial sums of a raw backward
-# on sm_100a / sm_103a: an unordered FP64 sum at every replay) with no host work between them.  Any other key runs
+# same arguments in the same order (bitwise the eager result) with no host work between them.  Any other key runs
 # eagerly (silent fallback) and starts its own entry; ``exchange="ring"``, ``debug_sequence`` and a call without a
 # caller-owned workspace are never captured.  A replayed call returns the graph's static tensors (detached, so every
 # call hands autograd fresh objects): the next replay of the same key overwrites them, so a framework must keep its
@@ -6059,18 +5992,6 @@ def _gate_key_flags(gate_args: dict[str, Any]) -> tuple[Any, ...]:
     return ("raw", lb if isinstance(lb, (int, float)) else repr(lb))
 
 
-def _alert_r1c(device: torch.device, H: int, l2n: bool = False) -> None:
-    """PyTorch's non-determinism alert (``cake_backend._alert_r1c``) for a raw gate backward whose local stages run an
-    ``R1c`` pair (the unordered FP64 parameter-gradient reduce on ``sm_100a`` / ``sm_103a`` with the in-kernel Q/K L2
-    norm off; ``l2n``: the call's flag, whose modes run ``param_finalize_l2n``, no ``R1c`` pair).  The decision reads
-    the device's architecture, ``H`` and the flag alone (``cake_backend._r1c_alert_due``), never the rank's tokens, so
-    every rank of the group, one without tokens included, raises (or warns) together before any collective: a rank
-    that raised alone would leave its peers waiting in the exchange."""
-    cake_backend._alert_r1c(
-        device, int(H), "chunk_kda_bwd_kcp", "fused" if l2n else "off"
-    )
-
-
 def _l2n_key_flags(l2n: bool) -> tuple[Any, ...]:
     """The in-kernel Q / K L2 norm in a graph validity key: ``("qk_l2norm",)`` with the flag on, nothing with it off
     (whose key is unchanged)."""
@@ -6144,11 +6065,8 @@ def _prepare(
     A_log: torch.Tensor | None = None,
     dt_bias: torch.Tensor | None = None,
     lower_bound: float | None = None,
-    alert: bool = True,
     use_qk_l2norm_in_kernel: bool = False,
 ):
-    """The checked operands and the call record of one call.  ``alert``: a raw backward runs :func:`_alert_r1c`
-    first; ``False`` on the eager re-preparation of a backward whose capture failed (its first preparation alerted)."""
     backend = get_backend()
     opts = options if isinstance(options, OptionsKcp) else _options(options)
     if save_mode not in SAVE_MODES:
@@ -6189,9 +6107,6 @@ def _prepare(
     if dout is not None:
         dout = _squeeze_batch(dout, "dout", 3)
         _check(dout, "dout", (T, H, D), backend.dtypes["dout"], device)
-    if backward and gate == "raw" and alert:
-        # before anything is allocated, exchanged or launched; every rank decides alike (_alert_r1c)
-        _alert_r1c(device, H, l2n)
     if not l2n:
         workspace = _call_workspace(workspace, backend, save_mode, gate, l2n, device)
     # the in-kernel Q / K L2 norm's capability on this device, before the workspace binds anything: rank-independent
@@ -6211,10 +6126,6 @@ def _prepare(
         walk_geometry=opts.walk_geometry,
         host_trim=bool(opts.host_trim),
     )
-    if backward and gate == "raw":
-        # the R1c accumulators of the local arena, sized for this pack and zero here: outside a graph capture of the
-        # backward
-        workspace._param_acc_ready(workspace.local_view)
     if gp is None:
         ops = {"q": q, "k": k, "v": v, "g": g, "beta": beta}
     else:  # the raw records' operands: the raw view, its element strides, A_log, dt_bias [H * 128], lower_bound
@@ -6556,23 +6467,16 @@ def chunk_kda_bwd_kcp(
     Raw gate mode (``use_gate_in_kernel=True`` with the forward's ``A_log`` / ``dt_bias`` / ``lower_bound``):
     ``(dq, dk, dv, dbeta, dg, dA_log, ddt_bias)``, ``dg`` the BF16 gradient of the raw gate (contiguous, ranked like
     ``g``), ``dA_log`` FP32 ``[H]`` and ``ddt_bias`` FP32 shaped like ``dt_bias``.  The two parameter gradients are
-    this rank's partial sums: the gradients through this rank's own tokens, reduced on the rank (on ``sm_107a`` in an
-    order fixed by its local chunks alone: bitwise repeatable per rank, the same under every schedule and exchange;
-    on ``sm_100a`` / ``sm_103a`` by the ``R1c`` pair, below).  The full gradient is their sum over the ranks of
-    ``ctx.group``; a training framework sums them as it sums the gradients of any parameter replicated across the
-    context-parallel ranks, or calls :func:`reduce_gate_param_grads_kcp` for a sum in a fixed rank order, bitwise
-    reproducible from the same partials (an NCCL all-reduce does not fix its summation order).  No gate epilogue runs
+    this rank's partial sums: the gradients through this rank's own tokens, reduced on the rank in an order fixed by
+    its local chunks alone (bitwise repeatable per rank, the same under every schedule and exchange).  The full
+    gradient is their sum over the ranks of ``ctx.group``; a training framework sums them as it sums the gradients
+    of any parameter replicated across the context-parallel ranks, or calls :func:`reduce_gate_param_grads_kcp` for
+    a sum that is bitwise reproducible (an NCCL all-reduce does not fix its summation order).  No gate epilogue runs
     and no full-size FP32 gate or gate gradient exists on the route.  A saved set of the other mode, or with another
     ``lower_bound`` (its FP32 value), is refused with ``ValueError``, as is a workspace of the other mode.  The raw
-    mode runs the deterministic package's raw records but for the parameter-gradient reduce: every output and the
-    raw gate's gradient are bitwise those of ``chunk_kda_det_bwd_kcp`` on the same rank, and so are the parameter
-    partial sums on ``sm_107a`` (and on every architecture with ``use_qk_l2norm_in_kernel=True``: the deterministic
-    ``param_finalize``, as ``param_finalize_l2n``).  On ``sm_100a`` / ``sm_103a`` with the flag off the local stages
-    reduce them with an ``R1c`` pair (an unordered FP64 sum rounded once to FP32), so they can differ by about one
-    FP32 ulp from run to run and from the deterministic route (module docstring); under
-    ``torch.use_deterministic_algorithms(True)`` such a call raises ``RuntimeError`` (a ``UserWarning`` with
-    ``warn_only=True``) on every rank before it allocates, exchanges or launches anything (the decision reads the
-    architecture, ``H`` and the flag alone).
+    mode runs the deterministic package's raw records: every output, the raw gate's gradient and the parameter
+    partial sums are bitwise those of ``chunk_kda_det_bwd_kcp`` on the same rank, with
+    ``use_qk_l2norm_in_kernel=True`` too (the deterministic ``param_finalize``, as ``param_finalize_l2n``).
 
     ``use_qk_l2norm_in_kernel=True`` (the forward's; issue #7817): the same seven / five tensors, ``dq`` / ``dk`` the
     gradients of the raw ``q`` / ``k`` (contiguous, ranked like ``q``), the FP32 pullback fused into their final BF16
@@ -6619,14 +6523,6 @@ def chunk_kda_bwd_kcp(
             ),
         )
     if entry is not None and entry.graph is not None:
-        if use_gate_in_kernel:
-            # the key matched a call whose operands were checked: q's head axis is H
-            _alert_r1c(q.device, int(q.shape[-2]), l2n)
-            # the graph's R1c launches add into the local arena's accumulators: zeroed first where an eager backward
-            # stopped before its cast (or a capture left them marked)
-            local = getattr(workspace, "local", None)
-            if local is not None:
-                local._param_acc_clean()
         _graph_replay("bwd", entry)
         grads, batched = entry.result
         return _shaped_grads(grads, batched, g, gate_args)
@@ -6679,7 +6575,6 @@ def chunk_kda_bwd_kcp(
             backward=True,
             dout=dout,
             **gate_args,
-            alert=False,  # the first preparation above alerted: one alert per call
             use_qk_l2norm_in_kernel=l2n,
         )
         if saved is not None:
@@ -6725,15 +6620,11 @@ def _bwd_body(call: CallKcp, saved: SavedKcp | None) -> tuple[torch.Tensor, ...]
     """The backward's allocations and launches (eagerly or inside a capture): ``(dq, dk, dv, dbeta, dg)``; in raw
     gate mode ``(dq, dk, dv, dbeta, dg_raw, dA_log, ddt_bias)`` with ``dg_raw`` the BF16 gradient of the raw gate
     (contiguous ``[T_r, H, 128]``), ``dA_log`` FP32 ``[H]`` and ``ddt_bias`` FP32 ``[H * 128]``: this rank's partial
-    sums (the parameter gradients of its own tokens).  On ``sm_107a`` the raw GLM intra program (``glm_intra_raw``)
-    writes the per-chunk ``(hi, lo)`` partials ``dA_part`` / ``db_part`` (FP32 ``[NC_pad, H, 128, 2]`` each, per
-    call, outside the arena; the real chunks only) and ``param_finalize`` reduces them in the fixed order of the
-    local chunks, with its per-call scratch ``part2`` / ``ticket`` and ``seg_cap`` from
-    ``cake_backend._raw_finalize_scratch``.  On ``sm_100a`` / ``sm_103a`` the ``R1c`` GLM intra program adds them in
-    FP64 into the local arena's accumulators ``param_acc`` (``cake_backend.KdaWorkspace.param_acc``: zero before the
-    launch, an earlier aborted backward's leftovers zeroed first in the whole storage) and its cast rounds them once
-    and zeroes them: no per-call partials.  A rank without tokens launches nothing and returns zero parameter
-    gradients.  In-kernel Q / K L2 norm: the saved set's rstd or, in
+    sums (the parameter gradients of its own tokens).  The raw GLM intra program writes the per-chunk ``(hi, lo)``
+    partials ``dA_part`` / ``db_part`` (FP32 ``[NC_pad, H, 128, 2]`` each, per call, outside the arena; the real
+    chunks only) and ``param_finalize`` reduces them in the fixed order of the local chunks, with its per-call
+    scratch ``part2`` / ``ticket`` and ``seg_cap`` from ``cake_backend._raw_finalize_scratch``; a rank without tokens
+    launches nothing and returns zero parameter gradients.  In-kernel Q / K L2 norm: the saved set's rstd or, in
     replay mode, a fresh one, and the normalized q / k (:func:`_qk_l2norm_begin`), in the arena where the replay
     layout's ``v_new`` / ``dv2`` ride on the outputs' bytes (:func:`_l2n_row_hosts`; dq / dk are then the two halves
     of one tensor); the outputs are the same."""
@@ -6754,22 +6645,14 @@ def _bwd_body(call: CallKcp, saved: SavedKcp | None) -> tuple[torch.Tensor, ...]
         call.grads["dg_raw"] = _alloc((T, H, D), dt["dg_raw"], call.device)
         call.grads["dbeta"] = _alloc((T, H), dt["dbeta"], call.device)
         if call.local is not None and T > 0:
-            local = call.local
-            if cake_backend._r1c_stripes(local.plan) is not None:
-                # the R1c pair: the local arena's FP64 accumulators (sized and zeroed by _prepare, outside any
-                # capture), marked until the cast is enqueued (_backward)
-                call.grads["param_acc"] = local._param_acc_begin("chunk_kda_bwd_kcp")
-            else:
-                nc_pad = int(local.plan.NC_pad)
-                for name in ("dA_part", "db_part"):
-                    call.grads[name] = _alloc(
-                        (nc_pad, H, D, 2), dt["dA_log"], call.device
-                    )
-                # param_finalize's per-call scratch: the second-stage partials and the per-head ticket
-                fin = cake_backend._raw_finalize_scratch(nc_pad, H, call.device)
-                call.grads["part2"] = fin["part2"]
-                call.grads["ticket"] = fin["ticket"]
-                call.scratch["seg_cap"] = int(fin["seg_cap"])
+            nc_pad = int(call.local.plan.NC_pad)
+            for name in ("dA_part", "db_part"):
+                call.grads[name] = _alloc((nc_pad, H, D, 2), dt["dA_log"], call.device)
+            # param_finalize's per-call scratch: the second-stage partials and the per-head ticket
+            fin = cake_backend._raw_finalize_scratch(nc_pad, H, call.device)
+            call.grads["part2"] = fin["part2"]
+            call.grads["ticket"] = fin["ticket"]
+            call.scratch["seg_cap"] = int(fin["seg_cap"])
             call.grads["dA_log"] = _alloc((H,), dt["dA_log"], call.device)
             call.grads["ddt_bias"] = _alloc((H * D,), dt["ddt_bias"], call.device)
         else:  # no local stage runs on this rank: its tokens contribute nothing
@@ -7892,10 +7775,8 @@ def chunk_kda_kcp(
     :func:`chunk_kda_fwd_kcp`): ``g`` is the raw gate and the gradients are those of ``q, k, v``, the raw gate
     (BF16), ``beta``, ``A_log`` and ``dt_bias`` (FP32).  The parameter gradients of a rank are its partial sums
     (the gradients through its own tokens); sum them over ``ctx.group`` as for any parameter replicated across the
-    context-parallel ranks, or with :func:`reduce_gate_param_grads_kcp` for a sum in a fixed rank order, bitwise
-    reproducible from the same partials (on ``sm_100a`` / ``sm_103a`` the partials themselves can differ by about one
-    FP32 ulp from run to run: :func:`chunk_kda_bwd_kcp`).  A recompute handle's entry records the gate mode and
-    ``lower_bound``: a recompute in another mode never binds it.  The
+    context-parallel ranks, or with :func:`reduce_gate_param_grads_kcp` for a bitwise reproducible sum.  A recompute
+    handle's entry records the gate mode and ``lower_bound``: a recompute in another mode never binds it.  The
     checkpoint hand-off below does not engage in raw gate mode (its tape set is verified on the explicit gate only):
     the call keeps the light set under every ``checkpoint_handoff`` value, records no decision and counts nothing.
 
@@ -8011,28 +7892,22 @@ def chunk_kda_kcp(
 def reduce_gate_param_grads_kcp(
     ctx: Any, dA_log: torch.Tensor, ddt_bias: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """The raw gate mode's full parameter gradients from every rank's partial sums, in a fixed rank order: bitwise
-    reproducible from the same partial sums.
+    """The raw gate mode's full parameter gradients from every rank's partial sums, bitwise reproducible.
 
     ``dA_log`` (FP32 ``[H]``) and ``ddt_bias`` (FP32 ``[H * 128]`` or ``[H, 128]``) are this rank's partial sums
     from :func:`chunk_kda_bwd_kcp` / :func:`chunk_kda_kcp` with ``use_gate_in_kernel=True`` (the gradients through
     the rank's own tokens).  Every rank of ``ctx.group`` must call this with the same shapes: one
     ``all_gather_into_tensor`` of the ``H + H * 128`` FP32 values on ``ctx.group`` brings every rank's partials in
     group-rank order, then each rank adds them in FP32 in rank order ``0, 1, ..., W - 1`` (no summation in the
-    collective).  So every rank gets the same bits, and the result depends only on the per-rank partials, which on
-    ``sm_107a`` depend only on the rank's tokens and the partition (not on the exchange, schedule, graph replay or
-    recompute).  The deterministic package's ``reduce_gate_param_grads_det_kcp`` is the same algorithm: from the
-    same partials the two give the same bits.  On the ``R1c`` rows (``sm_100a`` / ``sm_103a``) each rank's partials
-    can differ by about one FP32 ulp from run to run (their reduce on the rank is an unordered FP64 sum); the cross-rank
-    order stays fixed here, so every rank still gets the same bits from the partials of one run, and the sums can
-    differ from run to run by a few FP32 ulps that grow with ``W`` (each partial by about one ulp, each of the
-    ``W - 1`` additions rounding either way).  An NCCL all-reduce of the partials gives the same sum up to FP32
-    rounding but does not fix its summation order (it varies with the algorithm, the topology and the message
-    size): use this helper when the sum must be bitwise reproducible from the partials.  Returns fresh ``(dA_log,
-    ddt_bias)`` of the inputs' shapes; with ``world_size == 1`` copies of the inputs.  With ``world_size > 1`` the
-    ``torch.distributed`` process group must be initialized: without one the inputs are only this rank's partial
-    sums, so the call raises ``RuntimeError`` instead of returning them.  Asynchronous on the current stream, no
-    host synchronization."""
+    collective).  So every rank gets the same bits, and the result depends only on the per-rank partials, which
+    depend only on the rank's tokens and the partition (not on the exchange, schedule, graph replay or recompute).
+    The deterministic package's ``reduce_gate_param_grads_det_kcp`` is the same algorithm: from the same partials
+    the two give the same bits.  An NCCL all-reduce of the partials gives the same sum up to FP32 rounding but does
+    not fix its summation order (it varies with the algorithm, the topology and the message size): use this helper
+    when the parameter gradients must be bitwise reproducible.  Returns fresh ``(dA_log, ddt_bias)`` of the inputs'
+    shapes; with ``world_size == 1`` copies of the inputs.  With ``world_size > 1`` the ``torch.distributed``
+    process group must be initialized: without one the inputs are only this rank's partial sums, so the call raises
+    ``RuntimeError`` instead of returning them.  Asynchronous on the current stream, no host synchronization."""
     if dA_log.dtype != torch.float32 or ddt_bias.dtype != torch.float32:
         raise ValueError(
             f"dA_log / ddt_bias: expected torch.float32, got {dA_log.dtype} / {ddt_bias.dtype}"

@@ -25,10 +25,7 @@ launches a kernel; the module imports ``dataclasses``, ``os``, ``torch`` and
 Numerical mode.  This is the plan of the non-deterministic KCP package
 (``deterministic=False``), a copy of the deterministic package's plan
 (``flashinfer.experimental.cake_kda_det_train_kcp``): the same partitions, the
-same tables, collectives, segment plan and byte counts, but for the workspace
-query of a raw gate mode backward on ``sm_100a`` / ``sm_103a``, which adds the
-local arena's FP64 parameter-gradient accumulators (``param_acc``, through
-``cake_backend.workspace_bytes``).  A partition, a context
+same tables, collectives, segment plan and byte counts.  A partition, a context
 and the byte queries hold no mode; the mode is a keyword of the entry points
 (:mod:`.cake_kcp`).  The local arena and table rules the byte queries read are
 those of the non-deterministic single-rank package
@@ -3221,8 +3218,8 @@ QK_L2NORM_STAGES = {
 }
 # the raw gate mode's parameter-gradient reduce: an l2n stage of the single-rank registry (the raw class's l2n GLM
 # intra programs write the deterministic per-chunk partials, so an l2n mode selects ``param_finalize_l2n``, the
-# deterministic record, never an ``R1c`` cast), on the backward's path in both forms; the g mode has no record of
-# the stage.  (path, stage) per gate mode, after the form's stages
+# deterministic record), on the backward's path in both forms; the g mode has no record of the stage.  (path, stage)
+# per gate mode, after the form's stages
 QK_L2NORM_GATE_STAGES = {
     "g": (),
     "raw": ((LOCAL_PATH_BWD, "param_finalize"),),
@@ -3560,8 +3557,7 @@ def kda_workspace_bytes_kcp(
     use_qk_l2norm_in_kernel: bool = False,
 ) -> int:
     """Caller-held workspace bytes of one rank: the local arena for ``(T_r, n_frag, H)`` (zero on a rank without
-    tokens; the existing backend's arena, ``kda_train_workspace_bytes``, which on a raw backward workspace of an
-    ``R1c`` plan includes the FP64 parameter-gradient accumulators outside the arena, or for a backward workspace under
+    tokens; the existing backend's arena, ``kda_train_workspace_bytes``, or for a backward workspace under
     ``local_arena="lean"`` (opt-in; the default ``None`` is ``"replay"``) the lean arena of :func:`local_arena_bytes`
     plus its tail-count table, ``4 * local_tail_count_words(arena, H)`` bytes, where the lean layout serves the row;
     a forward-only light

@@ -715,34 +715,20 @@ def test_either_backward_reads_either_packages_saved_set_by_gate_mode() -> None:
 
 def test_package_workspace_takes_the_gate_mode() -> None:
     """``workspace_bytes`` and ``KdaWorkspace`` take the gate mode of the calls they serve (``"g"``, the default,
-    or ``"raw"``): the raw mode's bytes are the deterministic package's raw bytes plus, on a backward workspace of
-    the R1c rows (``sm_100a`` / ``sm_103a``), the FP64 accumulators ``param_acc`` (``8 * stripes * H * 2 * 128``
-    bytes; none on ``sm_107a`` or a forward workspace), any other value is a ``ValueError`` raised before the device
-    is read, a known one reaches the device check, and a constructor whose ``gate`` is not its plan's is refused."""
+    or ``"raw"``): the raw mode's bytes are the deterministic package's raw bytes on every architecture, forward or
+    backward, any other value is a ``ValueError`` raised before the device is read, a known one reaches the device
+    check, and a constructor whose ``gate`` is not its plan's is refused."""
     S, N, H = 129, 1, 4
     assert cake_backend.workspace_bytes(
         S, N, H, sm_count=148, gate="g"
     ) == cake_backend.workspace_bytes(S, N, H, sm_count=148)
     for arch in ("sm_100a", "sm_103a", "sm_107a"):
         for h in (H, 64):
-            # one replica, but 8 on sm_100a from 32 heads
-            stripes = (
-                None
-                if arch == "sm_107a"
-                else (8 if arch == "sm_100a" and h >= 32 else 1)
-            )
-            p = cake_backend.plan(S, N, h, 148, arch, gate="raw")
-            assert cake_backend._r1c_stripes(p) == stripes, (arch, h)
             for backward in (True, False):
-                acc = 8 * stripes * h * 2 * 128 if stripes and backward else 0
-                assert (
-                    cake_backend.workspace_bytes(
-                        S, N, h, sm_count=148, arch=arch, gate="raw", backward=backward
-                    )
-                    == det_backend.workspace_bytes(
-                        S, N, h, sm_count=148, arch=arch, gate="raw", backward=backward
-                    )
-                    + acc
+                assert cake_backend.workspace_bytes(
+                    S, N, h, sm_count=148, arch=arch, gate="raw", backward=backward
+                ) == det_backend.workspace_bytes(
+                    S, N, h, sm_count=148, arch=arch, gate="raw", backward=backward
                 ), (arch, h, backward)
     ws_type = cake_backend.KdaWorkspace
     for gate in (None, "G", "activated"):
@@ -827,8 +813,7 @@ def test_facade_forwards_the_raw_gate(monkeypatch) -> None:
 
 def test_facade_runs_the_raw_gate_on_the_non_deterministic_package() -> None:
     """Without recorders: ``deterministic=False`` with the raw gate reaches this package, whose entries go on to
-    their host checks, and whose byte query gives the raw mode's bytes (the deterministic package's, plus on a
-    backward workspace of an R1c row, ``sm_100a`` / ``sm_103a``, the FP64 parameter-gradient accumulators)."""
+    their host checks, and whose byte query gives the raw mode's bytes (the deterministic package's)."""
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ExperimentalWarning)
         for name, args in (
@@ -854,12 +839,9 @@ def test_facade_runs_the_raw_gate_on_the_non_deterministic_package() -> None:
             assert got == cake_backend.workspace_bytes(
                 129, 1, 4, sm_count=148, backward=backward, gate="raw"
             )
-            acc = cake_backend._param_acc_bytes(
-                cake_backend.plan(129, 1, 4, 148, gate="raw")
-            )
             assert got == facade.kda_train_workspace_bytes(
                 129, 1, 4, sm_count=148, backward=backward, use_gate_in_kernel=True
-            ) + (acc if backward else 0)
+            )
 
 
 # the in-kernel Q/K L2 norm (#7817): the deterministic package's keyword, on both packages
@@ -947,8 +929,7 @@ def test_package_queries_take_the_in_kernel_qk_l2norm_layout() -> None:
     """``workspace_bytes``, ``saved_bytes``, ``output_bytes`` and ``KdaWorkspace.for_problem`` take the
     deterministic package's ``l2n``: ``"off"`` gives the bytes of the omitted keyword, an l2n mode (``"fused"`` /
     ``"fallback"``, which runs the deterministic package's records in either gate mode) the deterministic package's
-    bytes of that mode, and the saved set adds the reciprocal norms (``8 S H`` bytes); the flag-off raw backward of
-    an R1c row (``sm_100a`` here) adds the FP64 accumulators ``param_acc`` and no l2n mode does; any other value is a
+    bytes of that mode, and the saved set adds the reciprocal norms (``8 S H`` bytes); any other value is a
     ``ValueError`` raised before the device is read, a known one reaches the device check."""
     S, N, H = 129, 1, 4
     assert (
@@ -981,24 +962,9 @@ def test_package_queries_take_the_in_kernel_qk_l2norm_layout() -> None:
                         gate=gate,
                         l2n=l2n,
                     )
-                    acc = (
-                        cake_backend._param_acc_bytes(
-                            cake_backend.plan(
-                                S, N, H, 148, "sm_100a", gate=gate, l2n=l2n
-                            )
-                        )
-                        if gate == "raw" and backward
-                        else 0
-                    )
-                    # the R1c accumulators: the flag-off raw backward alone
-                    assert (acc > 0) == (gate == "raw" and backward and l2n == "off"), (
-                        kw,
-                        acc,
-                    )
-                    assert (
-                        cake_backend.workspace_bytes(S, N, H, **kw)
-                        == det_backend.workspace_bytes(S, N, H, **kw) + acc
-                    ), kw
+                    assert cake_backend.workspace_bytes(
+                        S, N, H, **kw
+                    ) == det_backend.workspace_bytes(S, N, H, **kw), kw
                     compared += 1
             assert cake_backend.output_bytes(
                 S, H, backward=True, gate=gate, l2n=l2n
@@ -1712,16 +1678,8 @@ def test_the_backward_reads_a_saved_set_of_either_package() -> None:
 def test_public_entries_run_the_raw_gate_on_both_packages() -> None:
     """The raw gate mode through the facade: ``deterministic=True`` and ``False`` give the same ``out`` and seven
     results bit for bit (explicit calls with and without a workspace of the raw mode, the autograd node: this
-    package runs the deterministic package's raw-mode programs), but for ``dA_log`` / ``ddt_bias`` on an R1c row
-    (``sm_100a`` / ``sm_103a``: the FP64 parameter-gradient reduce), which hold the R1c bound of the deterministic
-    per-chunk partials instead (``test_cake_kda_train._r1c_exact``); each mode's workspace of the raw mode serves
-    its package, with the byte query's size; a workspace of the g mode is refused by a raw call (``ValueError``)."""
-    from tests.experimental.test_cake_kda_train import (
-        RAW_RETURN_NAMES,
-        _r1c_exact,
-        _r1c_param_check,
-    )
-
+    package runs the deterministic package's raw-mode programs); each mode's workspace of the raw mode serves its
+    package, with the byte query's size; a workspace of the g mode is refused by a raw call (``ValueError``)."""
     device = _device_or_skip()
     lengths, heads = (63, 1, 65), 2
     S, N = sum(lengths), len(lengths)
@@ -1741,11 +1699,8 @@ def test_public_entries_run_the_raw_gate_on_both_packages() -> None:
                 S, N, heads, device, use_gate_in_kernel=True, deterministic=det
             )
             assert ws.gate == "raw", det
-            # the arena, and on a non-deterministic workspace of an R1c row its accumulators
-            assert ws.bytes + (0 if det else ws.param_acc_bytes) == (
-                facade.kda_train_workspace_bytes(
-                    S, N, heads, use_gate_in_kernel=True, deterministic=det
-                )
+            assert ws.bytes == facade.kda_train_workspace_bytes(
+                S, N, heads, use_gate_in_kernel=True, deterministic=det
             )
             runs = []
             for workspace in (None, ws):
@@ -1792,19 +1747,7 @@ def test_public_entries_run_the_raw_gate_on_both_packages() -> None:
                 )
             results[det] = runs
     want_out, want_grads = results[True][0]
-    # the R1c bound of this row (None where the device runs the deterministic pair at this head count)
-    r1c = _r1c_exact(
-        inputs, dict(zip(RAW_RETURN_NAMES[5:], want_grads[5:], strict=True))
-    )
     for det, runs in results.items():
         for i, (out, grads) in enumerate(runs):
             assert _bits_equal(out, want_out), (det, i)
-            if det or r1c is None:
-                assert _same(grads, want_grads), (det, i)
-                continue
-            assert _same(grads[:5], want_grads[:5]), (det, i)
-            _r1c_param_check(
-                dict(zip(RAW_RETURN_NAMES[5:], grads[5:], strict=True)),
-                r1c,
-                tag=(det, i),
-            )
+            assert _same(grads, want_grads), (det, i)

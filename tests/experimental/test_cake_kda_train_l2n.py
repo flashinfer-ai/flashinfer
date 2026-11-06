@@ -20,10 +20,10 @@ chunked training package (``flashinfer.experimental.cake.cake_kda_train``, every
 The package runs the deterministic package's l2n programs in the same order on every row: its l2n records are the
 deterministic package's, the fused gradient's l2n class copies the deterministic records (no S1 pair: no GLM intra
 program of an l2n mode adds the ``q * dq`` term), raw mode's parameter-gradient reduce is the deterministic
-``param_finalize`` (``param_finalize_l2n``; the R1c pairs serve the flag-off mode alone), the gate epilogue never runs
-and the checkpoint hand-off never engages.  The one program of this package's own an l2n mode may run is the tape WY
-twin, in place of the WY program on a tape backward, which writes the same ``w``.  So every result of an l2n mode is the
-deterministic package's l2n result bit for bit, in both gate modes.
+``param_finalize`` (``param_finalize_l2n``; ``param_finalize``, the same program, serves the flag-off mode), the gate
+epilogue never runs and the checkpoint hand-off never engages.  The one program of this package's own an l2n mode may
+run is the tape WY twin, in place of the WY program on a tape backward, which writes the same ``w``.  So every result
+of an l2n mode is the deterministic package's l2n result bit for bit, in both gate modes.
 
 On the CPU (no kernel): the host rules this package shares with the deterministic package (the raw q / k operand
 rule, the mode keyword, the saved set's ``qk_rstd`` / ``qk_l2norm`` and its check, the layouts' transient ``qn`` /
@@ -229,7 +229,7 @@ def test_mode_keyword_must_be_a_bool(bad) -> None:
 def test_l2n_vocabulary_is_the_deterministic_packages() -> None:
     """The modes, the token-local stages and the logical names of the l2n programs are the deterministic package's;
     the l2n stages add the fused gradient (whose S1 records serve the flag-off mode alone) and the parameter finalize
-    (whose R1c casts serve the flag-off mode alone)."""
+    (``param_finalize`` serves the flag-off mode, ``param_finalize_l2n`` the l2n modes: one deterministic program)."""
     assert (
         tuple(cake_backend.L2N_MODES)
         == tuple(cake_jit.L2N_MODES)
@@ -243,13 +243,7 @@ def test_l2n_vocabulary_is_the_deterministic_packages() -> None:
         assert stage in cake_jit.STAGES and stage in cake_jit.OPTIONAL_STAGES
         assert stage in cake_jit.L2N_STAGES
     assert tuple(cake_jit.STAGES) == tuple(det_jit.STAGES)
-    # the logical tensors are the deterministic package's plus the R1c accumulators (a flag-off record's operand)
-    own = ("param_acc",)
-    assert "param_acc" in cake_jit.LOGICAL_TENSORS
-    assert "param_acc" not in det_jit.LOGICAL_TENSORS
-    assert tuple(n for n in cake_jit.LOGICAL_TENSORS if n not in own) == tuple(
-        det_jit.LOGICAL_TENSORS
-    )
+    assert tuple(cake_jit.LOGICAL_TENSORS) == tuple(det_jit.LOGICAL_TENSORS)
     assert tuple(cake_jit.LOGICAL_SCALARS) == tuple(det_jit.LOGICAL_SCALARS)
     for name in ("q_raw", "k_raw", "qn", "kn", "qk_rstd", "qn_int", "kn_int"):
         assert name in cake_jit.LOGICAL_TENSORS
@@ -618,8 +612,8 @@ PLAN_ROWS = (
 def test_l2n_plans_are_the_deterministic_l2n_plans(arch: str) -> None:
     """``plan(..., l2n=mode)`` is the deterministic package's plan of the mode, in both gate modes: the same geometry,
     on every path the same record per stage (the fused gradient's raw and l2n classes and ``param_finalize_l2n`` by
-    their deterministic names, never an S1 record, an R1c record or a hand-off twin) with the same launches, grids and
-    launch counts, the same layouts and bytes; a separate cache entry from the flag-off plan; no gate epilogue; the
+    their deterministic names, never an S1 record or a hand-off twin) with the same launches, grids and launch
+    counts, the same layouts and bytes; a separate cache entry from the flag-off plan; no gate epilogue; the
     token-local stages dispatched in the fallback mode alone; the checkpoint hand-off never engages on it; the flag-off
     plan is the default plan."""
     checked = 0
@@ -676,8 +670,6 @@ def test_l2n_plans_are_the_deterministic_l2n_plans(arch: str) -> None:
                         names = set(by_stage.values()) - {None}
                         assert not names & set(cake_jit.S1_RECORDS), at
                         assert not names & set(cake_jit.HANDOFF_TWINS.values()), at
-                        assert not names & set(cake_jit.R1C_PAIRS), at
-                        assert not names & set(cake_jit.R1C_PAIRS.values()), at
                         assert not p.dispatched("gate_epilogue", path), at
                         for stage in ("qk_l2norm", "qk_apply", "qk_pullback"):
                             if mode == "fused":
@@ -745,11 +737,10 @@ def test_raw_l2n_plans_finish_the_parameter_gradients_with_the_deterministic_fin
 ) -> None:
     """Raw mode with the in-kernel Q/K L2 norm: on every architecture and head count every backward path pairs the
     deterministic l2n GLM intra record (``glm_intra_raw_l2n``; the fallback route: ``glm_intra_raw_l2n_capture``)
-    with ``param_finalize_l2n``, the deterministic ``param_finalize`` (the same program, launch count and grid),
-    never an R1c record, so the plan holds no R1c accumulators and the backward raises no non-determinism alert; the
-    flag-off raw plan keeps its R1c pair on ``sm_100a`` / ``sm_103a``.  The pairing guard refuses an R1c record or
-    the flag-off finalize in an l2n mode, and ``param_finalize_l2n`` in the flag-off mode."""
-    r1c = set(cake_jit.R1C_PAIRS) | set(cake_jit.R1C_PAIRS.values())
+    with ``param_finalize_l2n``, the deterministic ``param_finalize`` (the same program, launch count and grid); the
+    flag-off raw plan pairs ``glm_intra_raw`` with ``param_finalize`` on every architecture, as the deterministic
+    package's flag-off raw plan does.  The pairing guard refuses the flag-off finalize or none in an l2n mode, and
+    ``param_finalize_l2n`` in the flag-off mode."""
     checked = 0
     for H in (1, 4, 16, 31, 32, 64):
         for mode in L2N_ON:
@@ -758,9 +749,6 @@ def test_raw_l2n_plans_finish_the_parameter_gradients_with_the_deterministic_fin
             )
             p = cake_backend.plan(5000, 3, H, 148, arch, gate="raw", l2n=mode)
             dp = det_backend.plan(5000, 3, H, 148, arch, gate="raw", l2n=mode)
-            assert cake_backend._r1c_stripes(p) is None, (H, mode)
-            assert cake_backend._param_acc_bytes(p) == 0, (H, mode)
-            assert cake_backend._r1c_alert_due(arch, H, 148, mode) is False, (H, mode)
             for path, by_stage in p.records.items():
                 if by_stage.get("glm_intra") is None:
                     continue
@@ -768,7 +756,6 @@ def test_raw_l2n_plans_finish_the_parameter_gradients_with_the_deterministic_fin
                 assert by_stage["glm_intra"] == glm == dp.records[path]["glm_intra"], at
                 assert by_stage["param_finalize"] == "param_finalize_l2n", at
                 assert dp.records[path]["param_finalize"] == "param_finalize", at
-                assert not set(by_stage.values()) & r1c, at
                 launches = p.launches("param_finalize", path)
                 assert launches == dp.launches("param_finalize", path) == 1, at
                 assert p.grid("param_finalize", path, 0) == dp.grid(
@@ -776,10 +763,24 @@ def test_raw_l2n_plans_finish_the_parameter_gradients_with_the_deterministic_fin
                 ), at
                 checked += 1
     assert checked > 0
-    # the flag-off raw plan of the same architecture: R1c on sm_100a / sm_103a, the deterministic pair on sm_107a
+    # the flag-off raw plan of the same architecture: the deterministic pair, as the deterministic package's
     off = cake_backend.plan(5000, 3, 16, 148, arch, gate="raw")
-    assert (cake_backend._r1c_stripes(off) is not None) == (arch != "sm_107a")
-    assert cake_backend._r1c_alert_due(arch, 16, 148) is (arch != "sm_107a")
+    det_off = det_backend.plan(5000, 3, 16, 148, arch, gate="raw")
+    paired = 0
+    for path, by_stage in off.records.items():
+        if by_stage.get("glm_intra") is None:
+            continue
+        pair = (by_stage["glm_intra"], by_stage["param_finalize"])
+        assert pair == ("glm_intra_raw", "param_finalize"), (path, pair)
+        assert det_off.records[path]["glm_intra"] == "glm_intra_raw", path
+        assert det_off.records[path]["param_finalize"] == "param_finalize", path
+        launches = off.launches("param_finalize", path)
+        assert launches == det_off.launches("param_finalize", path) == 1, path
+        assert off.grid("param_finalize", path, 0) == det_off.grid(
+            "param_finalize", path, 0
+        ), path
+        paired += 1
+    assert paired > 0
     for mode in L2N_ON:
         glm = "glm_intra_raw_l2n" if mode == "fused" else "glm_intra_raw_l2n_capture"
         base = {
@@ -798,19 +799,15 @@ def test_raw_l2n_plans_finish_the_parameter_gradients_with_the_deterministic_fin
                 gate="raw",
                 l2n=mode,
             )
-        for pair in (
-            {"param_finalize": "param_finalize_cast"},
-            {"glm_intra": "glm_intra_v20c", "param_finalize": "param_finalize_cast"},
-            {
-                "glm_intra": "glm_intra_v20c_r8",
-                "param_finalize": "param_finalize_cast_r8",
-            },
-        ):
-            with pytest.raises(ValueError, match=f"R1c record.*l2n mode {mode!r}"):
-                cake_backend._check_pairs(
-                    {"light": {**base, **pair}}, arch=arch, H=16, gate="raw", l2n=mode
-                )
-    with pytest.raises(ValueError, match="it must be 'param_finalize':"):
+        with pytest.raises(ValueError, match="it must be 'param_finalize_l2n'"):
+            cake_backend._check_pairs(
+                {"light": {**base, "param_finalize": None}},
+                arch=arch,
+                H=16,
+                gate="raw",
+                l2n=mode,
+            )
+    with pytest.raises(ValueError, match="it must be 'param_finalize',"):
         cake_backend._check_pairs(
             {
                 "light": {
