@@ -52,7 +52,8 @@ gemm_bf16_N256_K7168.json
 gemm_bf16_N4096_K4096.json
 gemm_fp4_N2048_K7168_block_size16.json
 gemm_fp8_N1536_K7168.json
-w8a16_fp8_gemm_N4096_K4096.json
+mm_bf16_fp8_N4096_K4096.json
+mm_fp16_fp8_N4096_K4096.json
 gemm_fp8_nt_groupwise_n1536_k7168.json
 group_gemm_fp8_nt_groupwise_contiguous_g2_n128_k128.json
 gemm_mxfp8_N4096_K4096.json
@@ -680,10 +681,14 @@ for N, K in ((4096, 4096), (256, 7168)):
 # Trace is dumped before kernel launch; suppress Hopper/Blackwell-only failures.
 with contextlib.suppress(Exception):
     M, K, N = 128, 4096, 4096
-    act_w8a16 = torch.zeros(M, K, dtype=torch.bfloat16, device=device)
-    weight_w8a16 = torch.zeros(N, K, dtype=torch.float8_e4m3fn, device=device)
-    scale_w8a16 = torch.ones(1, dtype=torch.float32, device=device)
-    flashinfer.gemm.w8a16_fp8_gemm(act_w8a16, weight_w8a16, scale_w8a16)
+    b_w8a16 = torch.zeros(N, K, dtype=torch.float8_e4m3fn, device=device)
+    alpha_w8a16 = torch.ones(1, dtype=torch.float32, device=device)
+    flashinfer.gemm.mm_bf16_fp8(
+        torch.zeros(M, K, dtype=torch.bfloat16, device=device), b_w8a16, alpha_w8a16
+    )
+    flashinfer.gemm.mm_fp16_fp8(
+        torch.zeros(M, K, dtype=torch.float16, device=device), b_w8a16, alpha_w8a16
+    )
 
 # ── GEMM fp8 block-scale (DeepSeek-V3 q_proj: M×7168→1536, block=128) ────────
 # Trace is dumped before kernel launch; suppress SM100-only runtime failures.

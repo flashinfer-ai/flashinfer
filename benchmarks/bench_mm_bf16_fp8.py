@@ -23,7 +23,7 @@ activation dtype.  The baseline this script runs is the cast-copy path --
 ``weight.to(dtype).mul_(scale.to(dtype))`` then ``F.linear`` (the scale is
 rounded to the activation dtype, then the product is), the form of TRT-LLM's
 ``W8A16FP8LinearMethod`` -- against the FlashInfer fused kernel
-(``flashinfer.gemm.w8a16_fp8_gemm``, weight dequantized on the fly, never
+(``flashinfer.gemm.mm_bf16_fp8 / mm_fp16_fp8``, weight dequantized on the fly, never
 materialised).
 
 Columns reported per (layer, TP, M) row:
@@ -72,11 +72,11 @@ denoising steps of the gen tower and always on the und tower:
 
 Usage
 -----
-    python benchmarks/bench_w8a16_fp8_gemm.py                      # whole table
-    python benchmarks/bench_w8a16_fp8_gemm.py --tp 4 --layer mlp.down --m 8192
-    python benchmarks/bench_w8a16_fp8_gemm.py --shape 5120,25600 --m 2048  # N,K
-    python benchmarks/bench_w8a16_fp8_gemm.py --impls kernel --m 44160 --csv out.csv
-    python benchmarks/bench_w8a16_fp8_gemm.py --dtype fp16 --bias
+    python benchmarks/bench_mm_bf16_fp8.py                      # whole table
+    python benchmarks/bench_mm_bf16_fp8.py --tp 4 --layer mlp.down --m 8192
+    python benchmarks/bench_mm_bf16_fp8.py --shape 5120,25600 --m 2048  # N,K
+    python benchmarks/bench_mm_bf16_fp8.py --impls kernel --m 44160 --csv out.csv
+    python benchmarks/bench_mm_bf16_fp8.py --dtype fp16 --bias
 
 ``--impls`` picks which columns run; ``--shape N,K`` with ``--m`` pins one
 problem so another pipeline (ncu, a regression bisect) can capture exactly it.
@@ -407,29 +407,30 @@ def make_kernel(
     w_fp8: torch.Tensor,
     scale: torch.Tensor,
     bias,
-    algo: str | None = None,
+    tactic: str | None = None,
     out: torch.Tensor | None = None,
 ) -> Callable[[], torch.Tensor]:
-    """FlashInfer kernel; ``algo`` selects a tile or split policy (``--algo``; Hopper
+    """FlashInfer kernel; ``tactic`` selects a tile or split policy (``--tactic``; Hopper
     or Blackwell names, a policy may resolve to another tile or run plain).  A kernel
     column was asked for, so an import failure is a failure of the run (not a
     silently skipped column)."""
     try:
-        from flashinfer.gemm import w8a16_fp8_gemm
+        from flashinfer.gemm import mm_bf16_fp8, mm_fp16_fp8
     except ImportError as e:
         raise RuntimeError(
-            "the kernel column was requested but flashinfer.gemm.w8a16_fp8_gemm "
+            "the kernel column was requested but flashinfer.gemm.mm_bf16_fp8 / mm_fp16_fp8 "
             f"cannot be imported: {e!r}"
         ) from e
     if out is None:
         out = torch.empty(
             act.shape[0], w_fp8.shape[0], dtype=act.dtype, device=act.device
         )
-    if algo == "auto":
-        algo = None
+    if tactic == "auto":
+        tactic = None
 
     def run() -> torch.Tensor:
-        return w8a16_fp8_gemm(act, w_fp8, scale, bias=bias, out=out, algo=algo)
+        fn = mm_fp16_fp8 if act.dtype == torch.float16 else mm_bf16_fp8
+        return fn(act, w_fp8, scale, bias=bias, out=out, tactic=tactic)
 
     return run
 
@@ -493,13 +494,15 @@ def bench_shape(args, layer: str, tp: int, m: int, n: int, k: int) -> Row:
     if "cublas" in args.impls:
         impls["cublas"] = make_cublas(act, w_deq, bias)
     kernel_out: torch.Tensor | None = None
-    for name, algo in _kernel_variants(args):
+    for name, tactic in _kernel_variants(args):
         # One output buffer shared by all kernel columns (each column's error is computed
         # right after its own call, before the next one overwrites it): 16 columns of a
         # 4.5 GB output do not fit in 80 GB.
         if kernel_out is None:
             kernel_out = torch.empty(m, n, dtype=dtype, device=dev)
-        impls[name] = make_kernel(act, w_fp8, scale, bias, algo=algo, out=kernel_out)
+        impls[name] = make_kernel(
+            act, w_fp8, scale, bias, tactic=tactic, out=kernel_out
+        )
 
     max_abs: dict[str, float] = {}
     max_rel: dict[str, float] = {}
@@ -634,14 +637,14 @@ def _ratio(num: float | None, den: float | None) -> str:
 
 
 def _kernel_variants(args) -> list[tuple[str, str | None]]:
-    """(column name, algo) for every kernel column requested.  With
-    ``--algo a b ...`` the ``kernel`` column becomes one ``kernel:<algo>`` column per
-    algo, all measured back to back on the same tensors (the fair way to compare
+    """(column name, tactic) for every kernel column requested.  With
+    ``--tactic a b ...`` the ``kernel`` column becomes one ``kernel:<tactic>`` column per
+    tactic, all measured back to back on the same tensors (the fair way to compare
     variants under free-running clocks)."""
     out: list[tuple[str, str | None]] = []
     if "kernel" in args.impls:
-        if args.algo:
-            out += [(f"kernel:{a}", None if a == "auto" else a) for a in args.algo]
+        if args.tactic:
+            out += [(f"kernel:{a}", None if a == "auto" else a) for a in args.tactic]
         else:
             out.append(("kernel", None))
     return out
@@ -810,11 +813,11 @@ def parse_args(argv=None):
         help="absolute floor on the gate as a fraction of max|ref|",
     )
     p.add_argument(
-        "--algo",
+        "--tactic",
         type=str,
         nargs="+",
         default=None,
-        help="one kernel:<algo> column per listed variant, measured back to back "
+        help="one kernel:<tactic> column per listed variant, measured back to back "
         "(Blackwell: 2sm256x128 ...; Hopper: 128x256, 128x192 ...); "
         "default: a single kernel column with the launcher's model",
     )

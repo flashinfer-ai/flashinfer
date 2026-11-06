@@ -206,10 +206,8 @@ def _load_bench():
     import importlib.util
     from pathlib import Path
 
-    path = (
-        Path(__file__).resolve().parents[2] / "benchmarks" / "bench_w8a16_fp8_gemm.py"
-    )
-    spec = importlib.util.spec_from_file_location("bench_w8a16_fp8_gemm", path)
+    path = Path(__file__).resolve().parents[2] / "benchmarks" / "bench_mm_bf16_fp8.py"
+    spec = importlib.util.spec_from_file_location("bench_mm_bf16_fp8", path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module  # dataclasses resolve annotations through it
     spec.loader.exec_module(module)

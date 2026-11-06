@@ -228,8 +228,10 @@ from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
 from .gemm import StaleAdapterError as StaleAdapterError
 from .gemm import svdquant_linear as svdquant_linear
 from .gemm import tgv_gemm_sm100 as tgv_gemm_sm100
-from .gemm import w8a16_fp8_gemm as w8a16_fp8_gemm
-from .gemm import w8a16_fp8_gemm_workspace_bytes as w8a16_fp8_gemm_workspace_bytes
+from .gemm import mm_bf16_fp8 as mm_bf16_fp8
+from .gemm import mm_bf16_fp8_workspace_bytes as mm_bf16_fp8_workspace_bytes
+from .gemm import mm_fp16_fp8 as mm_fp16_fp8
+from .gemm import mm_fp16_fp8_workspace_bytes as mm_fp16_fp8_workspace_bytes
 from .grouped_mm import grouped_mm_bf16 as grouped_mm_bf16
 from .grouped_mm import grouped_mm_fp8 as grouped_mm_fp8
 from .grouped_mm import grouped_mm_mxfp8 as grouped_mm_mxfp8

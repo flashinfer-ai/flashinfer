@@ -26,7 +26,7 @@ Workspace: a split-K call writes fp32 partials there (Blackwell: the slices'
 partials stacked as one output of ``splits x M`` rows, reduced by a second
 kernel; Hopper: one block per tail (tile, slice) plus one arrival counter per
 tail tile, the slices reducing the tile among themselves in the kernel).  The
-public query ``w8a16_fp8_gemm_workspace_bytes`` reports the resolved need.
+public query ``mm_bf16_fp8_workspace_bytes`` reports the resolved need.
 """
 
 import functools
@@ -552,7 +552,7 @@ def launch_w8a16_fp8_gemm(
     4-byte aligned (a one-element view at any fp32 offset is fine; the public
     :func:`flashinfer.gemm.w8a16_fp8_gemm` checks all of that).  ``algo``: a code of the
     architecture's table (0 = the model's choice).  ``workspace``: a buffer of at
-    least :func:`w8a16_fp8_gemm_workspace_bytes` bytes; None only when that is 0.
+    least :func:`mm_bf16_fp8_workspace_bytes` bytes; None only when that is 0.
     The public op owns allocation; this layer never allocates."""
     # The DSL resolves its compile target from the current CUDA device: run the
     # call under act's device, which need not be the current one.
@@ -570,7 +570,7 @@ def _require_workspace(workspace: Optional[torch.Tensor], nbytes: int) -> torch.
     if have < nbytes:
         raise ValueError(
             f"launch_w8a16_fp8_gemm needs a workspace of {nbytes} bytes for this "
-            f"plan, got {have} (see w8a16_fp8_gemm_workspace_bytes)"
+            f"plan, got {have} (see mm_bf16_fp8_workspace_bytes)"
         )
     return workspace
 
@@ -1083,7 +1083,7 @@ def _scratch(
     workspace: torch.Tensor, shape: Tuple, dtype: torch.dtype, offset: int = 0
 ) -> torch.Tensor:
     """A ``shape`` tensor of ``dtype`` carved from ``workspace`` at byte ``offset``
-    (the caller sized the buffer with :func:`w8a16_fp8_gemm_workspace_bytes`)."""
+    (the caller sized the buffer with :func:`mm_bf16_fp8_workspace_bytes`)."""
     numel = 1
     for d in shape:
         numel *= d
