@@ -33,10 +33,7 @@ PACKAGES: dict[str, str] = {
     "cake_dense_gemm_det_train": "flashinfer.experimental.cake.cake_dense_gemm_det_train",
     "cake_dense_gemm_nondet_train": "flashinfer.experimental.cake.cake_dense_gemm_nondet_train",
     "cake_moe_grouped_det_gemm": "flashinfer.experimental.cake_moe_grouped_det_gemm",
-    # the suite name before the deterministic-family rename (compatibility alias)
-    "cake_moe_grouped_gemm": "flashinfer.experimental.cake_moe_grouped_det_gemm",
-    # the non-deterministic package (deterministic=False); its key carries the namespace because
-    # ``cake_moe_grouped_gemm`` stays the det package's compatibility key above
+    # the non-deterministic package (deterministic=False); its key carries the namespace
     "cake.cake_moe_grouped_gemm": "flashinfer.experimental.cake.cake_moe_grouped_gemm",
     "cake_mok_bf16": "flashinfer.experimental.cake_mok_bf16",
     "cake_kda_train": "flashinfer.experimental.cake_kda_train",
@@ -64,8 +61,7 @@ PACKAGES: dict[str, str] = {
     "cake.cake_gdn_train": "flashinfer.experimental.cake.cake_gdn_train",
     "cake_gqa_train": "flashinfer.experimental.cake_gqa_train",
     "cake.cake_mhc_train": "flashinfer.experimental.cake.cake_mhc_train_backend",
-    # the non-deterministic causal conv1d package (``deterministic=False``); its key carries the namespace
-    "cake.cake_causal_conv1d_train": "flashinfer.experimental.cake.cake_causal_conv1d_train_backend",
+    "cake_causal_conv1d_nondet_train": "flashinfer.experimental.cake.cake_causal_conv1d_nondet_train",
 }
 
 

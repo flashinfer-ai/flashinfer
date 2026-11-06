@@ -26,18 +26,33 @@ model's BF16-rounded value; the second check catches a wrong rounding mode or
 a BF16-rounded sigmoid that the per-element bound alone would admit.  Invalid
 rows (request length <= 0) must be +0.0 bit for bit, rows past ``B`` must stay
 untouched.
+
+Each architecture has a 16-row and an 8-row program (token rows per CTA).  They
+must give identical bits; prepare decides once which one serves each ``B``
+(the 8-row program with programmatic dependent launch or when its grid fits one
+wave of the device).  The layout, padding, stream, graph, weight-binding and
+PDL tests run on each program, forced through the backend's ``tile_rows``.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+from pathlib import Path
 
 import pytest
 import torch
 import tvm_ffi
 
 from flashinfer.cake_mla_value_gate import prepare_mla_value_gate
-from flashinfer.experimental.cake_mla_value_gate.cake_jit import ARCH_BY_CAPABILITY
+from flashinfer.experimental.cake_mla_value_gate import cake_backend
+from flashinfer.experimental.cake_mla_value_gate.cake_jit import (
+    ARCH_BY_CAPABILITY,
+    ARCHES,
+    MODULES,
+    records_for,
+    tile_rows,
+)
 
 LATENT = 512
 VALUE = 128
@@ -60,6 +75,28 @@ MAX_MISMATCH_FRACTION = 0.01
 SENTINEL = -777.0
 # Lengths of padded requests: a request is padded iff its length is < 1.
 PADDED_LENGTHS = (0, -1, -(2**31), -4096)
+# The programs of each architecture (token rows per CTA) and the dynamic shared memory each one
+# launches with (rows x 544 x 2 bytes).
+TILES = (16, 8)
+TILE_SMEM_BYTES = {16: 17408, 8: 8704}
+# The B on both sides of the one-wave threshold at H = 12 on B200 / B300 (148 SMs) and GB300 (152).
+THRESHOLD_ROWS = (24, 25)
+# The package directory (the generated bindings live in csrc/).
+PACKAGE_DIR = Path(cake_backend.__file__).parent
+
+tiles = pytest.mark.parametrize("tile", TILES, ids=[f"rows{t}" for t in TILES])
+
+
+def expected_tile(heads: int, rows: int, enable_pdl: bool, sm_count: int) -> int:
+    """The selection rule: the 8-row program with PDL or when its ``4 * H * ceil(B / 8)`` CTAs fit
+    one wave of the device, else the 16-row program."""
+    return 8 if enable_pdl or 4 * heads * -(-rows // 8) <= sm_count else 16
+
+
+def _sm_count() -> int:
+    return torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
 
 
 def _arch() -> str | None:
@@ -282,10 +319,101 @@ def prod_w_uv() -> torch.Tensor:
     return make_w_uv(PROD_HEADS, seed=7)
 
 
-def _prepare(w_uv: torch.Tensor, **kwargs):
+def _prepare(w_uv: torch.Tensor, *, tile: int | None = None, **kwargs):
+    """The public API (the selection rule), or the backend forced to the ``tile``-row program."""
     kwargs.setdefault("max_rows", CAPACITY)
     kwargs.setdefault("sigmoid_precision", "fp32")
-    return prepare_mla_value_gate(w_uv, **kwargs)
+    if tile is None:
+        return prepare_mla_value_gate(w_uv, **kwargs)
+    runner = cake_backend.prepare_mla_value_gate(w_uv, tile_rows=tile, **kwargs)
+    rows = range(1, runner.max_rows + 1)
+    assert {runner.tile_rows_for(b) for b in rows} == {tile}
+    return runner
+
+
+def _bits(x: torch.Tensor) -> torch.Tensor:
+    return x.view(torch.int16)
+
+
+# ----------------------------------------------------------------------------------------------
+# Registry and selection rule (no GPU needed)
+
+
+def _records_by_tile(arch: str) -> dict[int, dict]:
+    return {
+        tile_rows(MODULES[name]): MODULES[name] for name in records_for(arch, "fp32")
+    }
+
+
+@pytest.mark.parametrize("arch", ARCHES)
+def test_registry_has_a_16_row_and_an_8_row_program(arch):
+    names = records_for(arch, "fp32")
+    by_tile = _records_by_tile(arch)
+    assert len(names) == len(TILES) and sorted(by_tile) == sorted(TILES), names
+    for key in ("arg_plan", "logical", "ffi_entry", "sigmoid"):
+        assert by_tile[8][key] == by_tile[16][key], key
+    for record in by_tile.values():
+        assert record["grid_rule"]["kind"] == "value_tiles"
+        assert record["grid_rule"]["cols"] == 32
+        assert record["launch"]["block"] == (128, 1, 1)
+        assert record["launch"]["use_pdl"] == "runtime"
+
+
+@pytest.mark.parametrize("name", sorted(MODULES))
+def test_each_program_launches_with_its_own_shared_memory(name):
+    """The generated binding of every program launches with the dynamic shared memory its record
+    declares, and that is its row tile's size (16 rows: 17408 B, 8 rows: 8704 B)."""
+    record = MODULES[name]
+    smem = record["launch"]["dynamic_smem_bytes"]
+    assert smem == TILE_SMEM_BYTES[tile_rows(record)], (name, smem)
+    binding = PACKAGE_DIR / "csrc" / f"{record['library']}_binding.cu"
+    launched = re.findall(r"dynamicSmemBytes\s*=\s*(\d+)\s*;", binding.read_text())
+    assert launched == [str(smem)], (name, launched)
+
+
+def _rule_records() -> dict[int, dict]:
+    return {
+        tile: {
+            "library": f"rows{tile}",
+            "grid_rule": {"kind": "value_tiles", "cols": 32, "rows": tile},
+        }
+        for tile in TILES
+    }
+
+
+@pytest.mark.parametrize("sm_count", [148, 152])
+def test_selection_rule(sm_count):
+    records = _rule_records()
+
+    def pick(heads, rows, enable_pdl=False, recs=records):
+        return cake_backend.select_tile_rows(
+            recs, rows=rows, heads=heads, enable_pdl=enable_pdl, sm_count=sm_count
+        )
+
+    for heads in (1, 6, 12, 16):
+        for rows in range(1, CAPACITY + 1):
+            for enable_pdl in (True, False):
+                assert pick(heads, rows, enable_pdl) == expected_tile(
+                    heads, rows, enable_pdl, sm_count
+                ), (heads, rows, enable_pdl)
+    # The thresholds on B200 / B300 / GB300: H = 12 -> B <= 24, H = 6 -> B <= 48, H = 16 -> B <= 16,
+    # H = 1 -> every B; with PDL the 8-row program serves every B.
+    assert [pick(12, rows) for rows in THRESHOLD_ROWS] == [8, 16]
+    assert [pick(6, rows) for rows in (48, 49)] == [8, 16]
+    assert [pick(16, rows) for rows in (16, 17)] == [8, 16]
+    assert {pick(1, rows) for rows in range(1, CAPACITY + 1)} == {8}
+    assert {pick(16, rows, True) for rows in range(1, CAPACITY + 1)} == {8}
+    # One program serves every B; three are a registry error.
+    single = {16: records[16]}
+    assert {
+        pick(12, rows, pdl, single) for rows in (1, 64) for pdl in (True, False)
+    } == {16}
+    three = {
+        **records,
+        4: {**records[8], "grid_rule": {**records[8]["grid_rule"], "rows": 4}},
+    }
+    with pytest.raises(RuntimeError):
+        pick(12, 8, False, three)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -293,7 +421,7 @@ def _prepare(w_uv: torch.Tensor, **kwargs):
 
 
 @requires_kernel
-@pytest.mark.parametrize("rows", DECODE_ROWS + BOUNDARY_ROWS)
+@pytest.mark.parametrize("rows", DECODE_ROWS + BOUNDARY_ROWS + THRESHOLD_ROWS)
 @pytest.mark.parametrize(
     "pitch, offset",
     [(PROD_PITCH, PROD_GATE_OFFSET), (PROD_HEADS * VALUE, 0)],
@@ -324,19 +452,21 @@ def test_accuracy_other_heads(heads, rows, padded):
 
 
 @requires_kernel
+@tiles
 @pytest.mark.parametrize("q, rows", [(2, 2), (2, 8), (2, 64), (4, 4), (4, 16), (4, 48)])
-def test_rows_per_request(prod_w_uv, q, rows):
+def test_rows_per_request(prod_w_uv, tile, q, rows):
     case = make_case(rows, PROD_HEADS, q=q, seed=31 * q + rows, invalid_fraction=0.4)
-    _prepare(prod_w_uv, rows_per_request=q).launch(*case.args())
+    _prepare(prod_w_uv, tile=tile, rows_per_request=q).launch(*case.args())
     torch.cuda.synchronize()
     check_case(case, prod_w_uv, f"q={q} B={rows}")
 
 
 @requires_kernel
-def test_sigmoid_is_fp32_not_bf16(prod_w_uv):
+@tiles
+def test_sigmoid_is_fp32_not_bf16(prod_w_uv, tile):
     """The product uses the FP32 sigmoid: a BF16-rounded sigmoid gives other bits on a large fraction."""
     case = make_case(64, PROD_HEADS, seed=99, invalid_fraction=0.0, gate_scale=2.0)
-    _prepare(prod_w_uv).launch(*case.args())
+    _prepare(prod_w_uv, tile=tile).launch(*case.args())
     torch.cuda.synchronize()
     m = model(case.latent, prod_w_uv, case.gate, case.lengths, 1)
     check_against_model(case.out, m, "fp32 sigmoid")
@@ -348,7 +478,8 @@ def test_sigmoid_is_fp32_not_bf16(prod_w_uv):
 
 
 @requires_kernel
-def test_gate_extremes(prod_w_uv):
+@tiles
+def test_gate_extremes(prod_w_uv, tile):
     """Saturating, underflowing, infinite and NaN gates on valid rows."""
     special = [
         0.0, 1.0, -1.0, 8.0, -8.0, 16.0, -16.0, 40.0, -40.0, 87.0, -87.0, 88.0, -88.0,
@@ -361,7 +492,7 @@ def test_gate_extremes(prod_w_uv):
     pattern = values[torch.arange(width) % len(special)].to(torch.bfloat16)
     case.gate.copy_(pattern.cuda().expand(rows, width))
     case.gate[rows - 1, 3] = float("nan")  # a NaN gate on a valid row gives NaN
-    _prepare(prod_w_uv).launch(*case.args())
+    _prepare(prod_w_uv, tile=tile).launch(*case.args())
     torch.cuda.synchronize()
     check_case(case, prod_w_uv, "gate extremes")
     gate = case.gate.float()
@@ -376,10 +507,11 @@ def test_gate_extremes(prod_w_uv):
 
 
 @requires_kernel
-def test_nan_latent_on_a_valid_row_gives_nan(prod_w_uv):
+@tiles
+def test_nan_latent_on_a_valid_row_gives_nan(prod_w_uv, tile):
     case = make_case(4, PROD_HEADS, seed=6, invalid_fraction=0.0)
     case.latent[2, 5, 100] = float("nan")
-    _prepare(prod_w_uv).launch(*case.args())
+    _prepare(prod_w_uv, tile=tile).launch(*case.args())
     torch.cuda.synchronize()
     out = case.out.view(4, PROD_HEADS, VALUE)
     assert torch.isnan(out[2, 5]).all()
@@ -388,19 +520,21 @@ def test_nan_latent_on_a_valid_row_gives_nan(prod_w_uv):
 
 
 @requires_kernel
-def test_invalid_rows_are_positive_zero_and_tail_untouched(prod_w_uv):
+@tiles
+def test_invalid_rows_are_positive_zero_and_tail_untouched(prod_w_uv, tile):
     case = make_case(16, PROD_HEADS, seed=8, invalid_fraction=0.5)
     case.lengths[0] = 0
     case.latent_buf[0] = float("nan")
     case.gate[0] = float("inf")
-    _prepare(prod_w_uv).launch(*case.args())
+    _prepare(prod_w_uv, tile=tile).launch(*case.args())
     torch.cuda.synchronize()
     check_case(case, prod_w_uv, "invalid rows")
     assert torch.all(case.out.view(torch.int16)[0] == 0)
 
 
 @requires_kernel
-def test_negative_lengths_are_padded(prod_w_uv):
+@tiles
+def test_negative_lengths_are_padded(prod_w_uv, tile):
     """A request is padded iff its length is < 1: negative lengths give +0.0 rows."""
     case = make_case(8, PROD_HEADS, seed=12, invalid_fraction=0.0)
     lengths = [-1, -(2**31), 7, -4096, 1, 0, -2, 2**31 - 1]
@@ -408,7 +542,7 @@ def test_negative_lengths_are_padded(prod_w_uv):
     padded = [t for t, n in enumerate(lengths) if n < 1]
     case.latent_buf[padded] = float("nan")
     case.gate[padded] = float("nan")
-    _prepare(prod_w_uv).launch(*case.args())
+    _prepare(prod_w_uv, tile=tile).launch(*case.args())
     torch.cuda.synchronize()
     check_case(case, prod_w_uv, "negative lengths")
     bits = case.out.view(torch.int16)
@@ -419,30 +553,132 @@ def test_negative_lengths_are_padded(prod_w_uv):
 
 
 # ----------------------------------------------------------------------------------------------
+# The two programs: the decision of every B, identical bits, the threshold
+
+
+def _names_by_tile(arch: str) -> dict[int, str]:
+    return {tile_rows(MODULES[name]): name for name in records_for(arch, "fp32")}
+
+
+@requires_kernel
+@pytest.mark.parametrize("heads", [1, 6, 12, 16])
+@pytest.mark.parametrize("enable_pdl", [True, False])
+def test_prepare_decides_the_program_of_every_rows(heads, enable_pdl):
+    runner = _prepare(make_w_uv(heads, seed=heads), enable_pdl=enable_pdl)
+    sm_count = _sm_count()
+    assert runner.sm_count == sm_count
+    names = _names_by_tile(runner.arch)
+    rows = range(1, CAPACITY + 1)
+    decided = [runner.tile_rows_for(b) for b in rows]
+    assert decided == [expected_tile(heads, b, enable_pdl, sm_count) for b in rows]
+    assert [runner.program_for(b) for b in rows] == [names[t] for t in decided]
+    # Only the programs some B uses are loaded; the PDL runner uses the 8-row program alone.
+    assert set(runner.programs) == {names[t] for t in decided}
+    if enable_pdl:
+        assert runner.programs == (names[8],)
+    assert runner.program == runner.program_for(CAPACITY)
+    for bad in (0, CAPACITY + 1):
+        with pytest.raises(ValueError):
+            runner.program_for(bad)
+
+
+@requires_kernel
+@pytest.mark.parametrize("heads", [1, 6, 12, 16])
+@pytest.mark.parametrize("enable_pdl", [True, False])
+def test_both_programs_give_identical_bits(heads, enable_pdl):
+    """The 16-row program, the 8-row program and the rule's choice give the same bits for every B,
+    and each is within the model's bound (strided, offset gate; padded and NaN-filled requests)."""
+    w_uv = make_w_uv(heads, seed=400 + heads)
+    width = heads * VALUE
+    if heads == PROD_HEADS:
+        pitch, offset = PROD_PITCH, PROD_GATE_OFFSET
+    else:
+        pitch, offset = width + 96, 2
+    runners = {tile: _prepare(w_uv, tile=tile, enable_pdl=enable_pdl) for tile in TILES}
+    runners["rule"] = _prepare(w_uv, enable_pdl=enable_pdl)
+    for rows in sorted(set(DECODE_ROWS + BOUNDARY_ROWS + THRESHOLD_ROWS)):
+        case = make_case(rows, heads, pitch=pitch, offset=offset, seed=500 + rows)
+        outs = {}
+        for key, runner in runners.items():
+            case.out_buf.fill_(SENTINEL)
+            runner.launch(*case.args())
+            torch.cuda.synchronize()
+            check_case(case, w_uv, f"H={heads} B={rows} program={key}")
+            outs[key] = case.out.clone()
+        for key in (8, "rule"):
+            assert torch.equal(_bits(outs[key]), _bits(outs[16])), (
+                f"H={heads} B={rows}: program {key} differs from the 16-row program"
+            )
+
+
+@requires_kernel
+@pytest.mark.parametrize("heads", [6, 12, 16])
+def test_threshold_rows_switch_programs(heads):
+    """Without PDL the 8-row program serves the largest B whose 8-row grid fits one wave and the
+    16-row program the next B; both give the 16-row program's bits there.  With PDL the 8-row
+    program serves both."""
+    sm_count = _sm_count()
+    last = max(b for b in range(1, CAPACITY + 1) if 4 * heads * -(-b // 8) <= sm_count)
+    if heads == PROD_HEADS and 144 <= sm_count < 192:  # B200, B300, GB300
+        assert (last, last + 1) == THRESHOLD_ROWS
+    assert last < CAPACITY
+    w_uv = make_w_uv(heads, seed=600 + heads)
+    rule = _prepare(w_uv, enable_pdl=False)
+    with_pdl = _prepare(w_uv, enable_pdl=True)
+    forced = {tile: _prepare(w_uv, tile=tile, enable_pdl=False) for tile in TILES}
+    for rows, tile in ((last, 8), (last + 1, 16)):
+        assert rule.tile_rows_for(rows) == tile
+        assert with_pdl.tile_rows_for(rows) == 8
+        case = make_case(rows, heads, seed=700 + rows)
+        outs = []
+        for runner in (rule, with_pdl, forced[16], forced[8]):
+            case.out_buf.fill_(SENTINEL)
+            runner.launch(*case.args())
+            torch.cuda.synchronize()
+            check_case(case, w_uv, f"H={heads} B={rows}")
+            outs.append(case.out.clone())
+        for out in outs[1:]:
+            assert torch.equal(_bits(out), _bits(outs[0])), f"H={heads} B={rows}"
+
+
+@requires_kernel
+def test_forced_program_rejections(prod_w_uv):
+    with pytest.raises(NotImplementedError, match="4-row"):
+        _prepare(prod_w_uv, tile=4)
+    for bad in (True, "8", 8.0):
+        with pytest.raises(TypeError):
+            cake_backend.prepare_mla_value_gate(
+                prod_w_uv, max_rows=8, sigmoid_precision="fp32", tile_rows=bad
+            )
+
+
+# ----------------------------------------------------------------------------------------------
 # Layouts accepted and rejected
 
 
 @requires_kernel
+@tiles
 @pytest.mark.parametrize(
     "pitch, offset",
     [(1540, 2), (PROD_PITCH + 2, 6), (PROD_PITCH, 10)],
     ids=["even_offset_4B", "pitch3650_off6", "pitch3648_off10"],
 )
-def test_gate_even_offsets_not_16_byte_aligned(prod_w_uv, pitch, offset):
+def test_gate_even_offsets_not_16_byte_aligned(prod_w_uv, tile, pitch, offset):
     case = make_case(33, PROD_HEADS, pitch=pitch, offset=offset, seed=pitch + offset)
     assert case.gate.data_ptr() % 16 != 0
-    _prepare(prod_w_uv).launch(*case.args())
+    _prepare(prod_w_uv, tile=tile).launch(*case.args())
     torch.cuda.synchronize()
     check_case(case, prod_w_uv, f"pitch={pitch} offset={offset}")
 
 
 @requires_kernel
-def test_single_row_gate_pitch_is_immaterial(prod_w_uv):
+@tiles
+def test_single_row_gate_pitch_is_immaterial(prod_w_uv, tile):
     case = make_case(1, PROD_HEADS, pitch=PROD_PITCH, offset=PROD_GATE_OFFSET, seed=3)
     gate = case.gate_buf.as_strided(
         (1, PROD_HEADS * VALUE), (7, 1), PROD_GATE_OFFSET
     )  # a size-1 row dimension may carry any stride
-    _prepare(prod_w_uv).launch(case.latent, gate, case.lengths, case.out)
+    _prepare(prod_w_uv, tile=tile).launch(case.latent, gate, case.lengths, case.out)
     torch.cuda.synchronize()
     check_case(case, prod_w_uv, "B=1")
 
@@ -575,8 +811,9 @@ def test_prepare_refuses_other_architectures():
 
 
 @requires_kernel
-def test_deterministic_and_batch_invariant(prod_w_uv):
-    runner = _prepare(prod_w_uv)
+@tiles
+def test_deterministic_and_batch_invariant(prod_w_uv, tile):
+    runner = _prepare(prod_w_uv, tile=tile)
     full = make_case(CAPACITY, PROD_HEADS, seed=21)
     runner.launch(*full.args())
     reference = full.out.clone()
@@ -584,7 +821,7 @@ def test_deterministic_and_batch_invariant(prod_w_uv):
         full.out.fill_(SENTINEL)
         runner.launch(*full.args())
         assert torch.equal(full.out.view(torch.int16), reference.view(torch.int16))
-    for rows in DECODE_ROWS + BOUNDARY_ROWS:
+    for rows in DECODE_ROWS + BOUNDARY_ROWS + THRESHOLD_ROWS:
         out = torch.full_like(full.out_buf, SENTINEL)
         runner.launch(
             full.latent_buf[:rows],
@@ -604,8 +841,9 @@ def test_deterministic_and_batch_invariant(prod_w_uv):
 
 
 @requires_kernel
-def test_launches_on_the_current_stream(prod_w_uv):
-    runner = _prepare(prod_w_uv)
+@tiles
+def test_launches_on_the_current_stream(prod_w_uv, tile):
+    runner = _prepare(prod_w_uv, tile=tile)
     case = make_case(16, PROD_HEADS, seed=31)
     staged = make_case(16, PROD_HEADS, seed=32)
     side = torch.cuda.Stream()
@@ -631,10 +869,14 @@ def test_prepare_inside_capture_raises(prod_w_uv):
 
 
 @requires_kernel
+@pytest.mark.parametrize("tile", [None, *TILES], ids=["rule", "rows16", "rows8"])
+@pytest.mark.parametrize("rows", [16, 25])
 @pytest.mark.parametrize("enable_pdl", [True, False])
-def test_graph_capture_replays_new_contents(prod_w_uv, enable_pdl):
-    runner = _prepare(prod_w_uv, enable_pdl=enable_pdl)
-    case = make_case(16, PROD_HEADS, pitch=PROD_PITCH, offset=PROD_GATE_OFFSET, seed=40)
+def test_graph_capture_replays_new_contents(prod_w_uv, tile, rows, enable_pdl):
+    runner = _prepare(prod_w_uv, tile=tile, enable_pdl=enable_pdl)
+    case = make_case(
+        rows, PROD_HEADS, pitch=PROD_PITCH, offset=PROD_GATE_OFFSET, seed=40
+    )
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
@@ -645,7 +887,7 @@ def test_graph_capture_replays_new_contents(prod_w_uv, enable_pdl):
         runner.launch(*case.args())
     for seed in (41, 42, 43):
         staged = make_case(
-            16, PROD_HEADS, pitch=PROD_PITCH, offset=PROD_GATE_OFFSET, seed=seed,
+            rows, PROD_HEADS, pitch=PROD_PITCH, offset=PROD_GATE_OFFSET, seed=seed,
             invalid_fraction=0.1 * (seed - 40),
         )  # fmt: skip
         case.load(staged)
@@ -654,24 +896,25 @@ def test_graph_capture_replays_new_contents(prod_w_uv, enable_pdl):
         torch.cuda.synchronize()
         check_case(case, prod_w_uv, f"replay {seed}", inputs=staged)
         eager = torch.full_like(staged.out_buf, SENTINEL)
-        runner.launch(staged.latent, staged.gate, staged.lengths, eager[:16])
+        runner.launch(staged.latent, staged.gate, staged.lengths, eager[:rows])
         torch.cuda.synchronize()
-        assert torch.equal(case.out.view(torch.int16), eager[:16].view(torch.int16))
+        assert torch.equal(_bits(case.out), _bits(eager[:rows]))
 
 
 @requires_kernel
-def test_weight_binding_and_re_prepare():
+@tiles
+def test_weight_binding_and_re_prepare(tile):
     old = make_w_uv(PROD_HEADS, seed=50)
     new = make_w_uv(PROD_HEADS, seed=51)
     case = make_case(8, PROD_HEADS, seed=52)
-    old_runner = _prepare(old)
+    old_runner = _prepare(old, tile=tile)
     old_runner.launch(*case.args())
     torch.cuda.synchronize()
     check_case(case, old, "old weight")
     with_old = case.out.clone()
     # The model replaces its weight storage: the old runner still reads the storage it bound
     # (and keeps it alive), so it must be prepared again for the new weight.
-    new_runner = _prepare(new)
+    new_runner = _prepare(new, tile=tile)
     assert old_runner.w_uv is old and old_runner.w_uv.data_ptr() != new.data_ptr()
     assert new_runner.w_uv is new
     old_runner.launch(*case.args())
@@ -806,8 +1049,8 @@ class _PdlChain:
     """predecessor (triggers, spins, then writes the inputs and snapshots ``out``) -> the PDL runner ->
     successor (PDL launch, waits, then copies ``out``), on the current stream."""
 
-    def __init__(self, probe, runner, case: Case) -> None:
-        self.probe, self.runner, self.case = probe, runner, case
+    def __init__(self, probe, runner, case: Case, tile: int) -> None:
+        self.probe, self.runner, self.case, self.tile = probe, runner, case, tile
         self.staged = make_case(
             case.rows, case.heads, pitch=case.pitch, offset=case.offset, seed=0
         )
@@ -851,7 +1094,7 @@ class _PdlChain:
             c.out, model(staged.latent, w_uv, staged.gate, staged.lengths, c.q), label
         )
         plain = torch.full_like(c.out_buf, SENTINEL)
-        _prepare(w_uv, enable_pdl=False).launch(
+        _prepare(w_uv, tile=self.tile, enable_pdl=False).launch(
             staged.latent, staged.gate, staged.lengths, plain[: c.rows]
         )
         torch.cuda.synchronize()
@@ -869,9 +1112,11 @@ class _PdlChain:
 
 
 @requires_kernel
-def test_pdl_predecessor_and_successor_eager(probe, prod_w_uv):
+@tiles
+def test_pdl_predecessor_and_successor_eager(probe, prod_w_uv, tile):
     case = make_case(64, PROD_HEADS, pitch=PROD_PITCH, offset=PROD_GATE_OFFSET, seed=60)
-    chain = _PdlChain(probe, _prepare(prod_w_uv, enable_pdl=True), case)
+    runner = _prepare(prod_w_uv, tile=tile, enable_pdl=True)
+    chain = _PdlChain(probe, runner, case, tile)
     for seed in (61, 62, 63):
         staged = chain.stage(seed)
         torch.cuda.synchronize()
@@ -881,9 +1126,11 @@ def test_pdl_predecessor_and_successor_eager(probe, prod_w_uv):
 
 
 @requires_kernel
-def test_pdl_predecessor_and_successor_graph(probe, prod_w_uv):
+@tiles
+def test_pdl_predecessor_and_successor_graph(probe, prod_w_uv, tile):
     case = make_case(32, PROD_HEADS, pitch=PROD_PITCH, offset=PROD_GATE_OFFSET, seed=70)
-    chain = _PdlChain(probe, _prepare(prod_w_uv, enable_pdl=True), case)
+    runner = _prepare(prod_w_uv, tile=tile, enable_pdl=True)
+    chain = _PdlChain(probe, runner, case, tile)
     chain.stage(71)
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
