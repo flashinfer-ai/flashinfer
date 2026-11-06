@@ -1,13 +1,16 @@
-# Experimental non-deterministic ragged BF16 MoE grouped GEMM (Cake backend)
+# Non-deterministic ragged BF16 MoE grouped GEMM (Cake backend)
 
-Both this API and its Cake backend are experimental and may change or be
-removed without compatibility guarantees. This package is the
-`deterministic=False` counterpart of the deterministic package
-`flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train`. The entry points are the
-facade functions `flashinfer.cake_moe_grouped_gemm_nondet_train.cake_moe_grouped_gemm_nondet_train_forward`,
-`cake_moe_grouped_gemm_nondet_train_dgrad`, `cake_moe_grouped_gemm_nondet_train_wgrad` and `cake_moe_grouped_gemm_nondet`; calling one of
-them is the explicit opt-in and emits FlashInfer's `ExperimentalWarning` once.
-There is no automatic backend selection. Tracking: FlashInfer issue #8070
+This package is the backend of the module
+`flashinfer.cake_moe_grouped_gemm_nondet_train`, the non-deterministic mode of the
+MoE grouped GEMM; the deterministic mode is the module
+`flashinfer.cake_moe_grouped_gemm_det_train` (backend
+`flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train`). The module's
+functions are stable FlashInfer APIs: the one-shot functions
+`cake_moe_grouped_gemm_nondet_train_forward`, `_dgrad` and `_wgrad`, the prepared
+launches `cake_moe_grouped_gemm_nondet_train_prepare_forward` / `_prepare_dgrad` /
+`_prepare_wgrad`, the autograd entry `cake_moe_grouped_gemm_nondet` and the support
+query `is_cake_moe_grouped_gemm_nondet_train_supported`. There is no automatic
+backend selection. Tracking: FlashInfer issue #8070
 (source requirements: #5678, #6570, #6553, #7047).
 
 The three operations, their arguments, alignment rules and outputs are the
@@ -17,25 +20,22 @@ an int32 **device** tensor `offs[E]` of cumulative end offsets, or
 
 | helper | computation | output |
 | --- | --- | --- |
-| `cake_moe_grouped_gemm_nondet_train_forward(x, w, offs, out=None, *, deterministic=True)` | `Y[offs[e-1]:offs[e]] = X[offs[e-1]:offs[e]] @ W[e].T` | `Y [sum_m, N]` bf16 |
-| `cake_moe_grouped_gemm_nondet_train_dgrad(g, w, offs, out=None, *, deterministic=True)` | `dX[offs[e-1]:offs[e]] = G[offs[e-1]:offs[e]] @ W[e]` (W read in place) | `dX [sum_m, K]` bf16 |
-| `cake_moe_grouped_gemm_nondet_train_wgrad(g, x, offs, out=None, out_dtype=None, num_groups=None, *, deterministic=True, accumulate=False)` | `dW[e] = G[offs[e-1]:offs[e]].T @ X[offs[e-1]:offs[e]]`; with `accumulate=True`, `out[e] += dW[e]` | `dW [E, N, K]` bf16 or fp32 |
+| `cake_moe_grouped_gemm_nondet_train_forward(x, w, offs, out=None)` | `Y[offs[e-1]:offs[e]] = X[offs[e-1]:offs[e]] @ W[e].T` | `Y [sum_m, N]` bf16 |
+| `cake_moe_grouped_gemm_nondet_train_dgrad(g, w, offs, out=None)` | `dX[offs[e-1]:offs[e]] = G[offs[e-1]:offs[e]] @ W[e]` (W read in place) | `dX [sum_m, K]` bf16 |
+| `cake_moe_grouped_gemm_nondet_train_wgrad(g, x, offs, out=None, out_dtype=None, num_groups=None, *, accumulate=False)` | `dW[e] = G[offs[e-1]:offs[e]].T @ X[offs[e-1]:offs[e]]`; with `accumulate=True`, `out[e] += dW[e]` | `dW [E, N, K]` bf16 or fp32 |
 
-## Mode and dispatch rules
+## Mode rules
 
-This package and its facade `flashinfer.cake_moe_grouped_gemm_nondet_train` are
-non-deterministic only. Every function (`grouped_gemm_*`, `prepare_grouped_gemm_*`,
-`cake_moe_grouped_gemm_nondet` / `CakeMoEGroupedGemmNondetFunction`, and the facade's four) takes the
-keyword-only `deterministic: bool = True` (`CakeMoEGroupedGemmNondetFunction.apply` takes it as its
-fourth argument, `True` when omitted; its fifth argument is an internal slot, and
-anything there but `None` raises `TypeError`), and nothing here routes to the
-deterministic package:
+The module is the mode: this package and `flashinfer.cake_moe_grouped_gemm_nondet_train`
+are non-deterministic only, every public name carries `nondet`, and nothing here
+routes to the deterministic module:
 
 | call | result |
 | --- | --- |
-| `deterministic=False` | this package |
-| `deterministic` omitted or `True`, or any value that is not the bool `False` (`None`, `0`, `1`, `"False"`) | `ValueError` naming the deterministic entry (`grouped_det_gemm_*`, `prepare_grouped_det_gemm_*`, `cake_moe_grouped_gemm_det`, `CakeMoEGroupedGemmDetFunction`) and saying "pass deterministic=False for the non-deterministic path"; nothing runs |
-| `deterministic=False` under `torch.use_deterministic_algorithms(True)` | PyTorch's non-determinism alert, naming the deterministic entry, immediately before an order-varying launch (`RuntimeError`, nothing launches; `warn_only=True`: a `UserWarning`, then the launch runs; it names the caller's line for a direct call of `cake_moe_grouped_gemm_nondet_train_wgrad` or `launch()`, a frame of PyTorch's autograd for the backward); never a deterministic fallback |
+| any entry point of this package or of `flashinfer.cake_moe_grouped_gemm_nondet_train` | this package |
+| a `deterministic` argument (`True` or `False`) | `TypeError` before anything runs: no entry takes one |
+| a fourth argument of `CakeMoEGroupedGemmNondetFunction.apply(x, w, offs)` other than `None` (an internal slot; the fifth is `fuse_wgrad_accumulation`) | `TypeError` |
+| a call under `torch.use_deterministic_algorithms(True)` | PyTorch's non-determinism alert, naming the counterpart in `flashinfer.cake_moe_grouped_gemm_det_train`, immediately before an order-varying launch (`RuntimeError`, nothing launches; `warn_only=True`: a `UserWarning`, then the non-deterministic launch runs; it names the caller's line for a direct call of `cake_moe_grouped_gemm_nondet_train_wgrad` or `launch()`, a frame of PyTorch's autograd for the backward); never a deterministic fallback |
 
 An order-varying launch (`CakeMoEGroupedGemmNondetLaunch.order_varying`) is the weight
 gradient whose 512-wide k tile splits its tail (`plan["unordered_tail"]` and
@@ -46,10 +46,26 @@ mode on after the preparation is not missed; under CUDA graph capture that check
 runs when the launch is captured, not at replay. The preparation, the forward,
 the data gradient, the 256-wide k tile's weight gradient (ordered tail reduce)
 and an unsplit tail run in a fixed order and never alert. No tape, saved tensor
-or workspace crosses between this package and the deterministic one. The
-deterministic package's entries take no `deterministic` argument at all.
+or workspace crosses between this package and the deterministic one.
 
-What changes with `deterministic=False`:
+The former names were removed with no alias (`ModuleNotFoundError`,
+`ImportError` or `AttributeError`):
+
+| removed | use instead |
+| --- | --- |
+| `flashinfer.experimental.cake.cake_moe_grouped_gemm`, `flashinfer.experimental.cake.grouped_mm` | `flashinfer.cake_moe_grouped_gemm_nondet_train` (this package: `flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train`) |
+| `grouped_gemm_fwd` / `_dgrad` / `_wgrad` with `deterministic=False` | `cake_moe_grouped_gemm_nondet_train_forward` / `_dgrad` / `_wgrad` |
+| `prepare_grouped_gemm_fwd` / `_dgrad` / `_wgrad` | `cake_moe_grouped_gemm_nondet_train_prepare_forward` / `_prepare_dgrad` / `_prepare_wgrad` |
+| `GroupedGemmLaunch` | `CakeMoEGroupedGemmNondetLaunch` |
+| `cake_grouped_mm(..., deterministic=False)` / `CakeGroupedMm` | `cake_moe_grouped_gemm_nondet` / `CakeMoEGroupedGemmNondetFunction` |
+| the `deterministic` argument of every entry | the module of the mode: `flashinfer.cake_moe_grouped_gemm_det_train` or `flashinfer.cake_moe_grouped_gemm_nondet_train` |
+
+A source checkout that had the old package directory keeps its untracked
+`__pycache__` (and ignored `aot/`) there, which Python then imports as an empty
+namespace package; remove them with
+`git clean -fdX flashinfer/experimental/cake/cake_moe_grouped_gemm`.
+
+What differs from the deterministic module:
 
 - `fwd`, `dgrad` and the weight gradient with the 256-wide k tile run this
   package's copies of the deterministic programs and host plan (but for the
@@ -168,7 +184,7 @@ Numerical contract:
   and a signaling NaN is quieted. The published contract is the composed one;
   bitwise-untouched empty groups are a property of the fused route.
 
-`cake_moe_grouped_gemm_nondet(x, w, offs, deterministic=False, fuse_wgrad_accumulation=True)`
+`cake_moe_grouped_gemm_nondet(x, w, offs, fuse_wgrad_accumulation=True)`
 follows Megatron and Transformer Engine: `w.main_grad` must be an fp32 or bf16
 tensor of `w`'s shape on its device with unit stride along the last dimension
 (checked at the forward call when autograd records it, that is when `w`
@@ -197,12 +213,14 @@ temporary), the fused route with `grad_added_to_main_grad` saves `2 * S` bytes
 then the fp32 add) the peak is equal. The benchmark's accumulation arms report
 the measured peak.
 
-The facade `flashinfer.cake_moe_grouped_gemm_nondet_train` takes the same keywords and
-hands them to this package with the same mode rules; it has no deterministic route.
+The module `flashinfer.cake_moe_grouped_gemm_nondet_train` takes the same keywords
+and hands them to this package; it has no deterministic route.
 
 ```python
-from flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train import cake_moe_grouped_gemm_nondet_train_prepare_wgrad
-from flashinfer.cake_moe_grouped_gemm_nondet_train import cake_moe_grouped_gemm_nondet
+from flashinfer.cake_moe_grouped_gemm_nondet_train import (
+    cake_moe_grouped_gemm_nondet,
+    cake_moe_grouped_gemm_nondet_train_prepare_wgrad,
+)
 
 # Megatron-style fused accumulation into an fp32 main_grad
 w = torch.nn.Parameter(torch.randn(E, N, K, dtype=torch.bfloat16, device="cuda"))
@@ -210,11 +228,11 @@ w.main_grad = torch.zeros(E, N, K, dtype=torch.float32, device="cuda")
 # (Megatron's DDP also sets w.grad_added_to_main_grad; the backward then returns a
 # placeholder gradient for its hooks.  Without the attribute w.grad stays None.)
 for x, g in micro_batches:
-    y = cake_moe_grouped_gemm_nondet(x, w, offs, deterministic=False, fuse_wgrad_accumulation=True)
+    y = cake_moe_grouped_gemm_nondet(x, w, offs, fuse_wgrad_accumulation=True)
     y.backward(g)  # w.main_grad[e] += G[e].T @ X[e]; x.grad as usual
 
 # Low level: add into any fp32 / bf16 buffer
-launch = cake_moe_grouped_gemm_nondet_train_prepare_wgrad(g, x, offs, out=main_grad, deterministic=False, accumulate=True)
+launch = cake_moe_grouped_gemm_nondet_train_prepare_wgrad(g, x, offs, out=main_grad, accumulate=True)
 launch.launch()  # main_grad += dW; launch.plan["accumulate"] is "fused" or "composed"
 ```
 
@@ -224,10 +242,8 @@ launch.launch()  # main_grad += dW; launch.plan["accumulate"] is "fused" or "com
 import torch
 from flashinfer.cake_moe_grouped_gemm_nondet_train import (
     cake_moe_grouped_gemm_nondet,
-    cake_moe_grouped_gemm_nondet_train_wgrad,
-)
-from flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train import (
     cake_moe_grouped_gemm_nondet_train_prepare_wgrad,
+    cake_moe_grouped_gemm_nondet_train_wgrad,
 )
 
 E, N, K = 4, 4096, 6144
@@ -238,27 +254,29 @@ x = torch.randn(sum_m, K, dtype=torch.bfloat16, device="cuda")
 w = torch.randn(E, N, K, dtype=torch.bfloat16, device="cuda")
 g = torch.randn(sum_m, N, dtype=torch.bfloat16, device="cuda")
 
-dw = cake_moe_grouped_gemm_nondet_train_wgrad(g, x, offs, out_dtype=torch.float32, deterministic=False)
-y = cake_moe_grouped_gemm_nondet(x, w, offs, deterministic=False)  # dX and dW in backward
+dw = cake_moe_grouped_gemm_nondet_train_wgrad(g, x, offs, out_dtype=torch.float32)
+y = cake_moe_grouped_gemm_nondet(x, w, offs)  # dX and dW in backward
 
 # Prepare once, launch many (CUDA-graph capturable):
-dw_launch = cake_moe_grouped_gemm_nondet_train_prepare_wgrad(g, x, offs, deterministic=False)
+dw_launch = cake_moe_grouped_gemm_nondet_train_prepare_wgrad(g, x, offs)
 dw = dw_launch.launch()
 print(dw_launch.record_name, dw_launch.stages, dw_launch.plan["unordered_tail"])
 ```
 
-The facade functions carry the experimental-API marking and the once-only
-warnings and hand off to the plain functions of the same names in this
-package (`grouped_gemm_*` in the package root, `cake_moe_grouped_gemm_nondet` in
-`cake_autograd`), which a vendoring build calls directly without any warning.
-`prepare_grouped_gemm_*` validates, allocates the output (when not given) and
+The module's functions hand off to the plain functions of the same names in
+this package (`cake_moe_grouped_gemm_nondet_train_forward`, `_dgrad` and `_wgrad`
+in the package root, `cake_moe_grouped_gemm_nondet_train_prepare_*` and
+`CakeMoEGroupedGemmNondetLaunch` in `cake_backend`, `cake_moe_grouped_gemm_nondet`
+and `CakeMoEGroupedGemmNondetFunction` in `cake_autograd`), which a vendoring
+build calls directly. Importing the module loads none of this package.
+`cake_moe_grouped_gemm_nondet_train_prepare_*` validates, allocates the output (when not given) and
 the weight-gradient descriptor slots, resolves the route and binds the
 generated programs, and returns a `CakeMoEGroupedGemmNondetLaunch` whose `launch()` passes
 the operands' TMA descriptors by value and performs no host synchronisation.
 There is no stable-API handoff: `flashinfer.grouped_mm.grouped_mm_bf16(...,
-backend="cake")` stays on the deterministic package.
+backend="cake")` stays on the deterministic module.
 
-`cake_moe_grouped_gemm_nondet(x, w, offs, deterministic=False)` is a
+`cake_moe_grouped_gemm_nondet(x, w, offs)` is a
 `torch.autograd.Function` wrapper (`CakeMoEGroupedGemmNondetFunction`) that saves `x`, `w` and
 `offs` only. Its forward is the deterministic forward (bitwise), so a
 non-reentrant activation-checkpoint replay recomputes the same `Y`; its
@@ -271,7 +289,7 @@ that is after autograd saved `x`, `w` and `offs`, as for a built-in op. Under
 default), the recomputation therefore stops before this GEMM when these are
 the last saves of the innermost checkpointed region; a later save in that
 region (of its output or of any other tensor) makes it run, with the same
-bits. A direct `CakeMoEGroupedGemmNondetFunction.apply(x, w, offs, False)` launches inside
+bits. A direct `CakeMoEGroupedGemmNondetFunction.apply(x, w, offs)` launches inside
 `forward` and is always recomputed, as is the wrapper under `torch.jit.trace`
 and `torch.compile`.
 
@@ -364,7 +382,7 @@ loads without a FlashInfer installation.
 ## Tests and benchmark
 
 ```bash
-pytest tests/experimental/test_cake_moe_grouped_gemm_nondet_train.py tests/experimental/test_cake_moe_grouped_gemm_nondet_train_api.py tests/experimental/test_cake_moe_grouped_gemm_nondet_train_standalone.py tests/experimental/test_cake_moe_grouped_gemm_nondet_train_reproducibility.py tests/experimental/test_cake_moe_grouped_gemm_nondet_train_acc.py
+pytest tests/experimental/test_cake_moe_grouped_gemm_nondet_train.py tests/experimental/test_cake_moe_grouped_gemm_nondet_train_api.py tests/experimental/test_cake_moe_grouped_gemm_nondet_train_names.py tests/experimental/test_cake_moe_grouped_gemm_nondet_train_standalone.py tests/experimental/test_cake_moe_grouped_gemm_nondet_train_reproducibility.py tests/experimental/test_cake_moe_grouped_gemm_nondet_train_acc.py
 python benchmarks/bench_cake_moe_grouped_gemm_nondet_train.py --help
 ```
 
@@ -374,12 +392,16 @@ op, output dtype and stage form against a per-group fp64 reference (worst case
 over repeats), empty groups, the #6570 shape relaunched and on concurrent
 streams, CUDA graph replay with changed offsets, checkpointing, gradient
 accumulation, changed shapes with reused and garbage-filled scratch, and the
-tail workspaces at rest. `test_cake_moe_grouped_gemm_nondet_train_api.py` covers the facade
-(marking, signatures, the handoff with no deterministic route, the `ValueError`
-of every mode but `False`) and the package's mode checks and its alert before an
-order-varying launch only. `test_cake_moe_grouped_gemm_nondet_train_reproducibility.py`
-checks that `fwd` / `dgrad` give the deterministic package's bits (also through
-the facade), and reports the run-to-run variation of the unordered weight
+tail workspaces at rest. `test_cake_moe_grouped_gemm_nondet_train_api.py` covers the
+module (stable APIs with the package functions' signatures, no warning, the
+support query, the handoff with no deterministic route, the `TypeError` of a
+`deterministic` argument) and the alert before an order-varying launch only.
+`test_cake_moe_grouped_gemm_nondet_train_names.py` (CPU) checks the names: every
+public name carries `nondet`, no callable takes a `deterministic` argument, and
+every removed path and name fails at import.
+`test_cake_moe_grouped_gemm_nondet_train_reproducibility.py` checks that `fwd` /
+`dgrad` give the deterministic package's bits (also through the module), and
+reports the run-to-run variation of the unordered weight
 gradient.
 `test_cake_moe_grouped_gemm_nondet_train_standalone.py` imports a copy with `flashinfer`
 blocked. `test_cake_moe_grouped_gemm_nondet_train_acc.py` covers the accumulate mode: the

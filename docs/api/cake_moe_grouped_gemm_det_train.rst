@@ -1,18 +1,16 @@
 .. _apicake_moe_grouped_gemm_det_train:
 
-Cake deterministic ragged BF16 grouped GEMM (experimental)
-==========================================================
+Cake deterministic ragged BF16 grouped GEMM
+===========================================
 
 .. currentmodule:: flashinfer.cake_moe_grouped_gemm_det_train
 
-The experimental ragged BF16 grouped GEMM entry points live in the module
-:mod:`flashinfer.cake_moe_grouped_gemm_det_train` and hand off to the backend package
-:mod:`flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train`: generated ragged BF16 grouped
-GEMM programs for the expert projections of Mixture-of-Experts layers on SM100
-(B200 / GB200), SM103 (B300 / GB300) and SM107 (R200).  Both the API and the backend
-are experimental (see :ref:`experimental`); calling one of the functions below, or
-naming the backend in the stable API, is the explicit opt-in and emits an
-``ExperimentalWarning`` once.
+The module :mod:`flashinfer.cake_moe_grouped_gemm_det_train` holds the deterministic
+ragged BF16 grouped GEMM of the expert projections of Mixture-of-Experts training on
+SM100 (B200 / GB200), SM103 (B300 / GB300) and SM107 (R200).  Its functions are stable
+FlashInfer APIs: each one hands off to the function of the same name in the backend
+package :mod:`flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train`, which holds
+the generated programs.  Importing the module loads none of the backend package.
 
 Groups are consecutive row ranges of the packed activations, described by an int32
 **device** tensor: either ``offs[E]`` of cumulative end offsets or ``m_indptr[E + 1]``
@@ -31,34 +29,29 @@ operation    computation                                                        
 ``wgrad``    ``dW[e] = G[offs[e-1]:offs[e]].T @ X[offs[e-1]:offs[e]]``             ``[E, N, K]`` bfloat16 or float32
 ============ ==================================================================== ============================
 
-Mode and dispatch rules
------------------------
+Mode rules
+----------
 
-This package and its entry points are deterministic only; every public name carries
-``det``.
+The module is the mode: every entry below is deterministic, and every public name
+carries ``det``.
 
-- Every entry below runs the deterministic programs: a fixed reduction order, bitwise
+- Every entry runs the deterministic programs: a fixed reduction order, bitwise
   reproducible run to run.
-- No deterministic entry takes a ``deterministic`` argument: passing one (``True`` or
-  ``False``, e.g. ``cake_moe_grouped_gemm_det(x, w, offs, deterministic=False)``) raises
-  ``TypeError``, and so does a fourth argument of ``CakeMoEGroupedGemmDetFunction.apply(x, w, offs)``
-  other than ``None`` (a stale ``True`` / ``False`` numerical mode included; the fifth
-  argument is ``fuse_wgrad_accumulation``).
+- No entry takes a ``deterministic`` argument: passing one (``True`` or ``False``, e.g.
+  ``cake_moe_grouped_gemm_det(x, w, offs, deterministic=False)``) raises ``TypeError``,
+  and so does a fourth argument of ``CakeMoEGroupedGemmDetFunction.apply(x, w, offs)``
+  other than ``None`` (the fifth argument is ``fuse_wgrad_accumulation``).
 - ``accumulate=True`` / ``fuse_wgrad_accumulation=True`` add the deterministic weight
   gradient into ``out`` / ``w.main_grad``, bitwise reproducible run to run (below).
 - ``torch.use_deterministic_algorithms(True)`` (also with ``warn_only=True``) changes
   nothing: no alert, no warning.
 - ``flashinfer.grouped_mm.grouped_mm_bf16(..., backend="cake")`` runs the deterministic
-  forward (the forward programs of both Cake packages give the same bits).
+  forward (the forward programs of both modes give the same bits).
 
-The non-deterministic counterpart is a separate package,
-``flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train``, and its facade
-``flashinfer.cake_moe_grouped_gemm_nondet_train`` (see :ref:`apicake_moe_grouped_gemm_nondet_train`),
-which take only ``deterministic=False``.  The names of this package before the
-deterministic-family rename (``flashinfer.experimental.cake_moe_grouped_gemm``,
-``flashinfer.grouped_mm.cake``, ``grouped_gemm_*``, ``cake_grouped_mm`` and the other
-names without ``det``) were removed with no alias: importing them raises
-``ModuleNotFoundError`` / ``AttributeError``.
+The non-deterministic mode is the separate module
+:mod:`flashinfer.cake_moe_grouped_gemm_nondet_train`
+(:ref:`apicake_moe_grouped_gemm_nondet_train`); its entries have the same shapes and
+carry ``nondet``.
 
 Stable API opt-in
 -----------------
@@ -93,7 +86,7 @@ Autograd
 ``cake_moe_grouped_gemm_det(x, w, offs, *, fuse_wgrad_accumulation=False)`` wraps the
 ``torch.autograd.Function`` ``CakeMoEGroupedGemmDetFunction`` of the backend package: its ``backward``
 produces ``x.grad`` with the ``dgrad`` program and ``w.grad`` with the ``wgrad`` program in
-the dtype of ``w``.  The Cake programs always reduce in a fixed order; there is no
+the dtype of ``w``.  The programs always reduce in a fixed order; there is no
 ``deterministic`` argument.  Use :func:`cake_moe_grouped_gemm_det_train_wgrad` with
 ``out_dtype=torch.float32`` for an fp32 weight gradient, or
 ``fuse_wgrad_accumulation=True`` to add it into an fp32 ``w.main_grad`` (below).
@@ -143,18 +136,62 @@ same stream, outside autograd.
   equal).  Under
   ``torch.use_deterministic_algorithms(True)`` with
   ``torch.utils.deterministic.fill_uninitialized_memory`` on, torch also fills the scratch
-  and the placeholder with NaN when it allocates them.  The non-deterministic package adds
+  and the placeholder with NaN when it allocates them.  The non-deterministic module adds
   in the kernel epilogue instead (:ref:`apicake_moe_grouped_gemm_nondet_train`).
 
 Prepared launches
 -----------------
 
-The backend package also holds the prepare-once / launch-many surface:
-``flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train.cake_moe_grouped_gemm_det_train_prepare_forward``,
-``cake_moe_grouped_gemm_det_train_prepare_dgrad`` and ``cake_moe_grouped_gemm_det_train_prepare_wgrad`` validate the
-arguments, bind one generated program and return a ``CakeMoEGroupedGemmDetLaunch`` whose
-``launch()`` performs no allocation and no host synchronisation and is CUDA-graph
-capturable; the same prepared launch stays valid when new offsets or values are
-written into the bound tensors.  The package also carries plain functions of the same
-names as the entry points above; a build that vendors the package calls them
-directly, without the experimental marking and warning.
+.. autosummary::
+    :toctree: ../generated
+
+    cake_moe_grouped_gemm_det_train_prepare_forward
+    cake_moe_grouped_gemm_det_train_prepare_dgrad
+    cake_moe_grouped_gemm_det_train_prepare_wgrad
+
+Each one validates the arguments, binds one generated program and returns a
+``CakeMoEGroupedGemmDetLaunch`` (also importable from the module) whose ``launch()``
+performs no allocation and no host synchronisation and is CUDA-graph capturable; the
+same prepared launch stays valid when new offsets or values are written into the bound
+tensors.  The backend package holds plain functions of the same names; a build that
+vendors the package calls them directly.
+
+Support query
+-------------
+
+.. autosummary::
+    :toctree: ../generated
+
+    is_cake_moe_grouped_gemm_det_train_supported
+
+``is_cake_moe_grouped_gemm_det_train_supported(device=None)`` is ``True`` when the device
+(default: the current CUDA device) has the programs of every operation: the forward, the
+data gradient and the weight gradient.
+
+Removed names
+-------------
+
+The former names of this family were removed with no alias: importing one raises
+``ModuleNotFoundError``, ``ImportError`` or ``AttributeError``.
+
+.. list-table::
+    :header-rows: 1
+
+    * - Removed
+      - Use instead
+    * - ``flashinfer.experimental.cake_moe_grouped_det_gemm``, ``flashinfer.grouped_mm.cake_det``,
+        ``flashinfer.grouped_mm.{grouped_det_gemm_*, cake_grouped_det_mm}``
+      - ``flashinfer.cake_moe_grouped_gemm_det_train`` (backend
+        ``flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train``)
+    * - ``grouped_det_gemm_fwd`` / ``_dgrad`` / ``_wgrad``
+      - ``cake_moe_grouped_gemm_det_train_forward`` / ``_dgrad`` / ``_wgrad``
+    * - ``prepare_grouped_det_gemm_fwd`` / ``_dgrad`` / ``_wgrad``
+      - ``cake_moe_grouped_gemm_det_train_prepare_forward`` / ``_prepare_dgrad`` /
+        ``_prepare_wgrad``
+    * - ``GroupedDetGemmLaunch``
+      - ``CakeMoEGroupedGemmDetLaunch``
+    * - ``cake_grouped_det_mm`` / ``CakeGroupedDetMm``
+      - ``cake_moe_grouped_gemm_det`` / ``CakeMoEGroupedGemmDetFunction``
+    * - ``flashinfer.experimental.cake_moe_grouped_gemm``, ``flashinfer.grouped_mm.cake``
+        (the det-free aliases)
+      - ``flashinfer.cake_moe_grouped_gemm_det_train``

@@ -1,11 +1,14 @@
-# Experimental ragged BF16 MoE grouped GEMM (Cake backend)
+# Deterministic ragged BF16 MoE grouped GEMM (Cake backend)
 
-Both this API and its Cake backend are experimental and may change or be
-removed without compatibility guarantees. The entry points are the core
-functions `flashinfer.cake_moe_grouped_gemm_det_train.cake_moe_grouped_gemm_det_train_forward`, `cake_moe_grouped_gemm_det_train_dgrad`,
-`cake_moe_grouped_gemm_det_train_wgrad` and `cake_moe_grouped_gemm_det`, and the stable API
-`flashinfer.grouped_mm.grouped_mm_bf16(..., backend="cake")`; calling one of
-them is the explicit opt-in and emits FlashInfer's `ExperimentalWarning` once.
+This package is the backend of the module
+`flashinfer.cake_moe_grouped_gemm_det_train`. The module's functions are stable
+FlashInfer APIs: the one-shot functions
+`cake_moe_grouped_gemm_det_train_forward`, `cake_moe_grouped_gemm_det_train_dgrad`
+and `cake_moe_grouped_gemm_det_train_wgrad`, the prepared launches
+`cake_moe_grouped_gemm_det_train_prepare_forward` / `_prepare_dgrad` /
+`_prepare_wgrad`, the autograd entry `cake_moe_grouped_gemm_det` and the support
+query `is_cake_moe_grouped_gemm_det_train_supported`. The forward is also
+reachable from `flashinfer.grouped_mm.grouped_mm_bf16(..., backend="cake")`.
 There is no automatic backend selection. Tracking: FlashInfer issue #5678.
 
 Three operations over `E` groups of rows, described by an int32 **device**
@@ -33,44 +36,53 @@ Numerics: fp32 tensor-core accumulation with one bf16 rounding at the store
 deterministic (no atomics; the split-K tail sums fp32 partials in a fixed
 order); `dW[e] == 0` exactly for empty groups.
 
-## Mode and dispatch rules
+## Mode rules
 
-This package is deterministic only; every public name carries `det`.
+The module is the mode: this package and `flashinfer.cake_moe_grouped_gemm_det_train`
+are deterministic only, and every public name carries `det`.
 
 | call | result |
 | --- | --- |
-| any entry point of this package or `flashinfer.grouped_mm.{grouped_det_gemm_*, cake_moe_grouped_gemm_det}` | the deterministic programs: fixed reduction order, bitwise reproducible run to run |
+| any entry point of this package or of `flashinfer.cake_moe_grouped_gemm_det_train` | the deterministic programs: fixed reduction order, bitwise reproducible run to run |
 | a `deterministic` argument (`True` or `False`), e.g. `cake_moe_grouped_gemm_det(x, w, offs, deterministic=False)` | `TypeError`: no deterministic entry takes one |
 | a fourth argument of `CakeMoEGroupedGemmDetFunction.apply(x, w, offs)` other than `None` (e.g. a stale `True` / `False` mode; the fifth is `fuse_wgrad_accumulation`) | `TypeError` |
 | `accumulate=True` / `fuse_wgrad_accumulation=True` | the deterministic weight gradient added into `out` / `w.main_grad`, bitwise reproducible run to run (Weight-gradient accumulation, below) |
 | `torch.use_deterministic_algorithms(True)` (also `warn_only=True`) | no change: no alert, no warning |
-| `flashinfer.grouped_mm.grouped_mm_bf16(..., backend="cake")` | the deterministic forward (the forward programs of both Cake packages give the same bits) |
+| `flashinfer.grouped_mm.grouped_mm_bf16(..., backend="cake")` | the deterministic forward (the forward programs of both modes give the same bits) |
 
-The non-deterministic counterpart is the separate package
-`flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train` and its facade
-`flashinfer.cake_moe_grouped_gemm_nondet_train`, which take only `deterministic=False`
-(`ValueError` otherwise, naming the deterministic entry of this package) and never
-route here. The names of this package before the deterministic-family rename
-(`flashinfer.experimental.cake_moe_grouped_gemm` with its submodules,
-`flashinfer.grouped_mm.cake`, and `grouped_gemm_*`, `prepare_grouped_gemm_*`,
-`GroupedGemmLaunch`, `CakeGroupedMm`, `cake_grouped_mm`, `grouped_mm_bf16_cake`
-here and in `flashinfer.grouped_mm`) were removed with no alias:
-`ModuleNotFoundError` / `AttributeError`. A source checkout that had the old
-package keeps its untracked `__pycache__` directory, which Python then imports as
-an empty namespace package; remove it with
-`git clean -fdX flashinfer/experimental/cake_moe_grouped_gemm`.
+The non-deterministic mode is the separate module
+`flashinfer.cake_moe_grouped_gemm_nondet_train` (backend
+`flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train`); its entries
+have the same shapes, carry `nondet` and never route here.
+
+The former names were removed with no alias (`ModuleNotFoundError`,
+`ImportError` or `AttributeError`):
+
+| removed | use instead |
+| --- | --- |
+| `flashinfer.experimental.cake_moe_grouped_det_gemm`, `flashinfer.grouped_mm.cake_det`, `flashinfer.grouped_mm.{grouped_det_gemm_*, cake_grouped_det_mm}` | `flashinfer.cake_moe_grouped_gemm_det_train` (this package: `flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train`) |
+| `grouped_det_gemm_fwd` / `_dgrad` / `_wgrad` | `cake_moe_grouped_gemm_det_train_forward` / `_dgrad` / `_wgrad` |
+| `prepare_grouped_det_gemm_fwd` / `_dgrad` / `_wgrad` | `cake_moe_grouped_gemm_det_train_prepare_forward` / `_prepare_dgrad` / `_prepare_wgrad` |
+| `GroupedDetGemmLaunch` | `CakeMoEGroupedGemmDetLaunch` |
+| `cake_grouped_det_mm` / `CakeGroupedDetMm` | `cake_moe_grouped_gemm_det` / `CakeMoEGroupedGemmDetFunction` |
+| `flashinfer.experimental.cake_moe_grouped_gemm`, `flashinfer.grouped_mm.cake` and their det-free names (`grouped_gemm_*`, `cake_grouped_mm`, `grouped_mm_bf16_cake`, ...) | `flashinfer.cake_moe_grouped_gemm_det_train` |
+
+A source checkout that had an old package directory keeps its untracked
+`__pycache__` (and ignored `aot/`) there, which Python then imports as an empty
+namespace package; remove them with
+`git clean -fdX flashinfer/experimental/cake_moe_grouped_det_gemm flashinfer/experimental/cake/cake_moe_grouped_gemm flashinfer/experimental/cake_moe_grouped_gemm`.
 
 ## Usage
 
 ```python
 import torch
-from flashinfer.grouped_mm import (
+from flashinfer.cake_moe_grouped_gemm_det_train import (
     cake_moe_grouped_gemm_det,
     cake_moe_grouped_gemm_det_train_dgrad,
     cake_moe_grouped_gemm_det_train_forward,
+    cake_moe_grouped_gemm_det_train_prepare_wgrad,
     cake_moe_grouped_gemm_det_train_wgrad,
 )
-from flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train import cake_moe_grouped_gemm_det_train_prepare_wgrad
 
 E, N, K = 4, 4096, 6144
 sizes = [28128, 28128, 28128, 28192]
@@ -92,16 +104,15 @@ dw = dw_launch.launch()
 print(dw_launch.record_name, dw_launch.plan)
 ```
 
-The one-shot functions and `cake_moe_grouped_gemm_det` are imported from
-`flashinfer.grouped_mm`: those core entry points carry the experimental-API
-marking and the once-only `ExperimentalWarning` and hand off to the plain
-functions of the same names in this package (`cake_moe_grouped_gemm_det_train_forward`,
-`cake_moe_grouped_gemm_det_train_dgrad` and `cake_moe_grouped_gemm_det_train_wgrad` in the package root,
-`cake_moe_grouped_gemm_det` in `cake_autograd`). A build that vendors the package calls
-those plain functions directly; they emit no warning. The prepared-launch
-surface below is reached from the package itself.
+The entries are imported from `flashinfer.cake_moe_grouped_gemm_det_train`: each
+one hands off to the plain function of the same name in this package
+(`cake_moe_grouped_gemm_det_train_forward`, `_dgrad` and `_wgrad` in the package
+root, `cake_moe_grouped_gemm_det_train_prepare_*` and `CakeMoEGroupedGemmDetLaunch`
+in `cake_backend`, `cake_moe_grouped_gemm_det` and `CakeMoEGroupedGemmDetFunction`
+in `cake_autograd`). Importing the module loads none of this package. A build that
+vendors the package calls those plain functions directly.
 
-`prepare_grouped_det_gemm_*` validates, allocates the output (when not given) and
+`cake_moe_grouped_gemm_det_train_prepare_*` validates, allocates the output (when not given) and
 the weight-gradient workspaces, resolves the route and binds the generated
 programs, and returns a `CakeMoEGroupedGemmDetLaunch`. `launch()` passes the operands'
 TMA descriptors by value (the binding encodes them on the host from the bound
@@ -241,8 +252,11 @@ Cost (`S = E * N * K` elements):
   allocates them, one more write of each.
 
 ```python
-from flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train import cake_moe_grouped_gemm_det_train_prepare_wgrad
-from flashinfer.cake_moe_grouped_gemm_det_train import cake_moe_grouped_gemm_det, cake_moe_grouped_gemm_det_train_wgrad
+from flashinfer.cake_moe_grouped_gemm_det_train import (
+    cake_moe_grouped_gemm_det,
+    cake_moe_grouped_gemm_det_train_prepare_wgrad,
+    cake_moe_grouped_gemm_det_train_wgrad,
+)
 
 # Megatron-style accumulation into an fp32 main_grad, deterministic
 w = torch.nn.Parameter(torch.randn(E, N, K, dtype=torch.bfloat16, device="cuda"))
@@ -493,14 +507,14 @@ installation (under another top-level name, or with
 `sys.modules["flashinfer"] = None` as a vendoring gate sets it). The only
 `flashinfer` import in the package is the loader's JIT fallback in
 `cake_build.py`, inside `try/except ImportError`, reached after import when a
-library is not prebuilt under `aot/`. The experimental warnings and the API
-logging belong to the core entry points (`flashinfer.grouped_mm`), so a direct
-call of the package's functions emits none of them.
+library is not prebuilt under `aot/`. The API logging belongs to the entry points
+of `flashinfer.cake_moe_grouped_gemm_det_train`, so a direct call of the
+package's functions emits no log and no warning.
 
 ## Tests and benchmark
 
 ```bash
-pytest tests/experimental/test_cake_moe_grouped_gemm_det_train.py tests/experimental/test_cake_moe_grouped_gemm_det_train_api.py tests/experimental/test_cake_moe_grouped_gemm_det_train_standalone.py tests/experimental/test_cake_moe_grouped_gemm_det_train_determinism.py tests/experimental/test_cake_moe_grouped_gemm_det_train_acc.py
+pytest tests/experimental/test_cake_moe_grouped_gemm_det_train.py tests/experimental/test_cake_moe_grouped_gemm_det_train_api.py tests/experimental/test_cake_moe_grouped_gemm_det_train_names.py tests/experimental/test_cake_moe_grouped_gemm_det_train_standalone.py tests/experimental/test_cake_moe_grouped_gemm_det_train_determinism.py tests/experimental/test_cake_moe_grouped_gemm_det_train_acc.py
 python benchmarks/bench_cake_moe_grouped_gemm_det_train.py --help
 ```
 
@@ -509,10 +523,13 @@ through `tests.test_helpers.cake_package`) compares against a per-group fp64
 reference (including an empty group, a one-row group, padded outputs,
 determinism and the fp32 output) and skips when no supported device or no
 registered program is present. `test_cake_moe_grouped_gemm_det_train_api.py` covers the
-core entry points of `flashinfer.grouped_mm` (the experimental marking, the
-once-only warnings and the `backend="cake"` route of `grouped_mm_bf16`) and the
-mode rules above (the removed det-free names and paths, the `TypeError` of a
-`deterministic` argument, no change under torch's deterministic mode).
+entry points of `flashinfer.cake_moe_grouped_gemm_det_train` (stable APIs with the
+package functions' signatures and docstrings, no warning, the support query, the
+deferred import), the `backend="cake"` route of `grouped_mm_bf16` and the mode
+rules above (the `TypeError` of a `deterministic` argument, no change under
+torch's deterministic mode). `test_cake_moe_grouped_gemm_det_train_names.py`
+(CPU) checks the names: every public name carries `det`, no callable takes a
+`deterministic` argument, and every removed path and name fails at import.
 `test_cake_moe_grouped_gemm_det_train_standalone.py` copies the package under another
 name into a CPU subprocess with `flashinfer` blocked and checks that it
 imports, raises its host-side errors without any warning and has its only
