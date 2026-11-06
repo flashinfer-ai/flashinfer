@@ -301,6 +301,7 @@ from __future__ import annotations
 import ctypes
 import dataclasses
 import functools
+import operator
 import types
 import warnings
 import weakref
@@ -778,12 +779,16 @@ _PROGRAM_OF = {
 def _walk_form_of(call: Any, programs: Any, name: str, args: dict[str, Any]) -> str:
     """The record form of walk launch ``name`` (``"full"`` / ``"split"``): the registry's rule
     (``cake_kcp_jit.walk_form``) on the launch's chains (the chunk counts of its listed segments), the call's head
-    count, the device's SM count and (a per-architecture rule) its architecture, under the call's ``walk_form`` knob
-    -- decided once per ``(program, walk list)`` of the call's table set and looked up on every later launch
-    (:meth:`_Tables.walk_form`); ``"full"`` with a registry that has no form rule (one record per walk program)."""
+    count, the device's SM count and, for a per-architecture rule, its architecture, under the call's ``walk_form``
+    knob -- decided once per ``(program, walk list)`` of the call's table set and looked up on every later launch
+    (:meth:`_Tables.walk_form`); ``"full"`` with a registry that has no form rule (one record per walk program).
+    The provider's ``walk_form`` is called as ``walk_form(program, chains, num_heads, sm_count, *, knob)``, plus
+    ``arch=`` (the jit's ``device_arch`` of the launch's device) only when ``WALK_FORM_RULES[name]`` is a mapping
+    (a per-architecture rule): a provider whose rules are all strings needs no ``arch`` parameter."""
     jit = getattr(programs, "jit", None)
     rule = getattr(jit, "walk_form", None)
-    if rule is None or name not in getattr(jit, "WALK_FORM_RULES", {}):
+    rules = getattr(jit, "WALK_FORM_RULES", {})
+    if rule is None or name not in rules:
         return "full"
     return call.tb.walk_form(
         name,
@@ -792,7 +797,9 @@ def _walk_form_of(call: Any, programs: Any, name: str, args: dict[str, Any]) -> 
         int(jit.sm_count(call.device.index)),
         str(call.walk_form),
         rule,
-        arch_of=getattr(jit, "device_arch", None),
+        arch_of=getattr(jit, "device_arch", None)
+        if isinstance(rules[name], Mapping)
+        else None,
         device_index=call.device.index,
     )
 
@@ -2142,13 +2149,52 @@ def _scratch_tables(local: Any) -> dict[str, torch.Tensor]:
     return tables
 
 
+# (record, arch) -> [cake_jit.load, cake_jit.MODULES, fetch, grid axes, FFI entry or None] of _launch_record_trim
+_LAUNCH_PLANS: dict[tuple[str, str], list[Any]] = {}
+
+
+def _launch_plan(name: str, arch: str) -> list[Any]:
+    """The launch plan of record ``name`` on ``arch`` for :func:`_launch_record_trim`: where every grid argument
+    follows the logical ones in the record's argument plan, an ``operator.itemgetter`` of the logical names (in plan
+    order) and the grid axes after them (``fetch=None`` keeps the loop otherwise); the FFI entry is filled in by the
+    first launch that gets its arguments (``cake_jit.load`` is cached per (record, arch): the same object on every
+    launch)."""
+    order = cake_jit._argument_plan(name)
+    names = [logical for logical, _ in order if logical is not None]
+    axes = tuple(axis for logical, axis in order if logical is None)
+    trailing = all(logical is None for logical, _ in order[len(names) :])
+    fetch = operator.itemgetter(*names) if trailing and len(names) >= 2 else None
+    plan = [cake_jit.load, cake_jit.MODULES, fetch, axes, None]
+    _LAUNCH_PLANS[(name, arch)] = plan
+    return plan
+
+
 def _launch_record_trim(
     local: Any, name: str, grid: tuple[int, int, int], values: dict[str, Any]
 ) -> None:
     """Trimmed host path: ``cake_jit.run_module(name, values, grid=grid, device_index=local.device_index)`` with the
     launch inlined -- the record's argument plan (cached by cake_jit), the arena's cached arch, the raw-stream FFI
-    context.  Same record, same grid, same positional arguments, same stream as ``local.run``."""
+    context.  Same record, same grid, same positional arguments, same stream as ``local.run``.  The record's launch
+    plan (:func:`_launch_plan`: its FFI entry and one fetch of its logical arguments) is built once per (record,
+    architecture) while ``cake_jit``'s ``load`` / ``MODULES`` stay the same objects; a missing logical argument
+    raises as the loop below does."""
     jit = cake_jit
+    plan = _LAUNCH_PLANS.get((name, local.arch))
+    if plan is None or plan[0] is not jit.load or plan[1] is not jit.MODULES:
+        plan = _launch_plan(name, local.arch)
+    if plan[2] is not None:
+        try:
+            args = [*plan[2](values), *(int(grid[axis]) for axis in plan[3])]
+        except KeyError:
+            args = None  # the loop below names the missing argument
+        if args is not None:
+            if plan[4] is None:
+                plan[4] = getattr(
+                    jit.load(name, local.arch), jit.MODULES[name]["ffi_entry"]
+                )
+            with _ffi_stream(local.device_index):
+                plan[4](*args)
+            return
     record = jit.MODULES[name]
     args = []
     for logical_name, axis in jit._argument_plan(name):
@@ -3442,7 +3488,8 @@ class _Tables:
         """The record form (``"full"`` / ``"split"``) of walk launch ``name`` over the segments ``walk``: the registry's
         rule ``rule`` (``cake_kcp_jit.walk_form``) on the launch's chains (the chunk counts of its listed segments), the
         head count ``H``, the device's SM count, the ``walk_form`` knob and the architecture ``arch_of(device_index)``
-        (passed to the rule where ``arch_of`` is given; read on the first launch of a key only) -- evaluated once per
+        (passed to the rule as ``arch=`` only where ``arch_of`` is given, which :func:`_walk_form_of` does for a
+        per-architecture rule alone; read on the first launch of a key only) -- evaluated once per
         ``(name, walk list, H, SM count, knob, rule, device index)`` of this table set and looked up on every later
         launch.  The rule's inputs are static per
         ``(ctx, H)`` (the walk lists and ``hp.seg_chunk_start`` are this set's, never mutated), so the lookup returns
@@ -4401,6 +4448,8 @@ def _options(kwargs: dict[str, Any]) -> OptionsDetKcp:
                 "_kcp_options is the validated OptionsDetKcp of the entry point and travels alone"
             )
         return pre
+    if not kwargs:
+        return _default_options()
     kwargs = dict(kwargs)
     raw = kwargs.pop("_kcp_test_knobs", None)
     transfer_walk: str | None = (
@@ -4461,6 +4510,22 @@ def _options(kwargs: dict[str, Any]) -> OptionsDetKcp:
         p_rule=p_rule,
         **p2,
     ).check()
+
+
+# The validated options of an empty ``**options``: (the plan module's SAVE_TRANSFER_DEFAULT it resolved, the options).
+_DEFAULT_OPTIONS: list[tuple[Any, OptionsDetKcp]] = []
+
+
+def _default_options() -> OptionsDetKcp:
+    """``_options({})``: an entry point called without keyword options validates the defaults, which depend on no
+    input (only on this module's defaults and the plan module's ``SAVE_TRANSFER_DEFAULT``, the cache key); the first
+    call validates them through the full path, every call gets a fresh copy of that result (equal field by field)."""
+    key = cake_kcp_plan.SAVE_TRANSFER_DEFAULT
+    if not _DEFAULT_OPTIONS or _DEFAULT_OPTIONS[0][0] is not key:
+        _DEFAULT_OPTIONS[:] = [(key, _options({"_kcp_test_knobs": None}))]
+    opts = object.__new__(OptionsDetKcp)
+    opts.__dict__.update(_DEFAULT_OPTIONS[0][1].__dict__)
+    return opts
 
 
 def _exchange_scheme(tb: _Tables, opts: OptionsDetKcp) -> str:
@@ -5284,31 +5349,17 @@ def _adj_tapes(call: CallDetKcp, *, dcarry: Indexed | None, wait_first: bool) ->
         call.walk("kcp_dhu_tape", tb.walk_cross_rest, dht=dcarry)
 
 
-def _forward(
+def _fwd_buffers(
     call: CallDetKcp,
     *,
     save: bool,
     replay: bool,
-    bound: dict[str, torch.Tensor] | None = None,
+    bound: dict[str, torch.Tensor] | None,
 ) -> None:
-    """The design note §3.5.  ``save``: the saved set is kept (fresh ``S_in``; with ``save_transfer`` also the c1 receive
-    tensor and ``M_seg``); ``replay``: the forward of a replay-mode backward (no ``fwd_o``, nothing kept).
-    ``bound``: the received tensors a recompute handle stored (``S_in``; under ``save_transfer`` also ``c1_recv``):
-    the recompute of a checkpointed forward binds them instead of exchanging -- no c1 / c2 / ring hop and no wait, no
-    owner merge, and no summary launch whose only reader is the exchange (``P = 1``: none; ``P > 1``: the two stage
-    walks that feed the carry merges stay, the map merge and the transpose into ``c1_send`` go); every other launch
-    is the same on the same bits.
-    ``schedule="wait_first"`` (the shipped default since an earlier revision): ``c1 -> wait -> fwd merge -> c2 -> wait -> carry merges -> tape walk(s)``
-    -- no merge or walk is issued while a collective is in flight (the R7 overlap of the document-start walk under c1
-    is dropped); the merges read only ``c1_recv`` / the staging planes and the tapes read no collective buffer, so
-    every published bit is the same.
-    The forward's state walk program (``call.fwd_walk``, every forward tape-walk launch site): the fused walk
-    ``kcp_fwdh_o`` (``out`` from the walk, no tape, no ``fwd_o`` launch) unless the forward keeps its tapes
-    (``replay``: the backward reads them) or the ``fwd_o_fuse`` knob is ``0``; then the tape walk and ``fwd_o``."""
+    """The forward's per-call KCP buffers (:func:`_forward`): ``S_in`` (fresh, or the handle's); with
+    ``save_transfer`` on a saving forward the c1 receive tensor (fresh, or the handle's) and at ``P > 1`` ``stage_m``;
+    the carry plane of a saving ``P > 1`` forward under ``saved_carry``."""
     tb, opts = call.tb, call.opts
-    wait_first = call.schedule == "wait_first"
-    fuse_o = not replay and call.fwd_o_fuse == 1
-    call.fwd_walk = "kcp_fwdh_o" if fuse_o else "kcp_fwdh_tape"
     keep_transfer = opts.save_transfer and save and not replay
     if bound is None:
         call.fresh("S_in")
@@ -5326,13 +5377,50 @@ def _forward(
     ):  # the carry plane as a fresh tensor: the carry merges below write it, the tape walk reads it, the saved set keeps it
         plane = call.fresh("carry")
         call.scratch["saved_carry_plane"] = plane.numel() * plane.element_size()
+
+
+def _forward(
+    call: CallDetKcp,
+    *,
+    save: bool,
+    replay: bool,
+    bound: dict[str, torch.Tensor] | None = None,
+    alloc_out: bool = False,
+) -> None:
+    """The design note §3.5.  ``save``: the saved set is kept (fresh ``S_in``; with ``save_transfer`` also the c1 receive
+    tensor and ``M_seg``); ``replay``: the forward of a replay-mode backward (no ``fwd_o``, nothing kept).
+    ``bound``: the received tensors a recompute handle stored (``S_in``; under ``save_transfer`` also ``c1_recv``):
+    the recompute of a checkpointed forward binds them instead of exchanging -- no c1 / c2 / ring hop and no wait, no
+    owner merge, and no summary launch whose only reader is the exchange (``P = 1``: none; ``P > 1``: the two stage
+    walks that feed the carry merges stay, the map merge and the transpose into ``c1_send`` go); every other launch
+    is the same on the same bits.
+    ``schedule="wait_first"`` (the shipped default since an earlier revision): ``c1 -> wait -> fwd merge -> c2 -> wait -> carry merges -> tape walk(s)``
+    -- no merge or walk is issued while a collective is in flight (the R7 overlap of the document-start walk under c1
+    is dropped); the merges read only ``c1_recv`` / the staging planes and the tapes read no collective buffer, so
+    every published bit is the same.
+    The forward's state walk program (``call.fwd_walk``, every forward tape-walk launch site): the fused walk
+    ``kcp_fwdh_o`` (``out`` from the walk, no tape, no ``fwd_o`` launch) unless the forward keeps its tapes
+    (``replay``: the backward reads them) or the ``fwd_o_fuse`` knob is ``0``; then the tape walk and ``fwd_o``."""
+    tb = call.tb
+    wait_first = call.schedule == "wait_first"
+    fuse_o = not replay and call.fwd_o_fuse == 1
+    call.fwd_walk = "kcp_fwdh_o" if fuse_o else "kcp_fwdh_tape"
     if replay:  # the replay's prep (the GLM prep's rows, the internal dout copy), then the internal Aqk / Akk rows
+        _fwd_buffers(call, save=save, replay=replay, bound=bound)
         _bwd_rows(call, None)
     else:  # the intra program writes the GLM prep's rows itself (write_prep = 1); no token-row copies are saved
         if call.l2n:
             _qk_l2norm_stage(call)
         call.stage("fwd_intra")
         call.stage("wy_fwd")
+        # the two local stages read neither the KCP buffers nor ``out`` (their records bind no ``out``, and the
+        # buffers are K1-K4 / collective operands): allocated after the stages are issued, so the first launch does
+        # not wait for them (host order only: the same launches with the same arguments in the same order)
+        _fwd_buffers(call, save=save, replay=replay, bound=bound)
+        if alloc_out:
+            call.out = _alloc(
+                (call.T_r, call.H, D), call.backend.dtypes["out"], call.device
+            )
     if bound is None:
         _summaries(call)
     elif (
@@ -6170,8 +6258,7 @@ def _fwd_body(
     the tensors of a recompute handle's entry (:func:`_forward`); the saved set then holds them.  In-kernel Q / K L2
     norm: the rstd the fused intra program writes, kept by a saving forward (:func:`_qk_l2norm_begin`)."""
     rstd = _qk_l2norm_begin(call, save=save) if call.l2n else None
-    call.out = _alloc((call.T_r, call.H, D), call.backend.dtypes["out"], call.device)
-    _forward(call, save=save, replay=False, bound=bound)
+    _forward(call, save=save, replay=False, bound=bound, alloc_out=True)
     if call.l2n:
         call.l2n_values = None
     saved = None

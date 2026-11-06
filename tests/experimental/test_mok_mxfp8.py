@@ -787,7 +787,7 @@ def test_mxfp8_launch_counters_are_one_slab_per_launch():
             dg_ready=shared_rows + routed_rows,
             replay_gu=routed_rows * ib,
             replay_h=routed_rows,
-            buffers_done=macros,
+            buffers_done=macros * (len(routed[0]) + 1),
             weight_ready=macros,
         ),
     )
