@@ -71,9 +71,7 @@ def _device_or_skip() -> torch.device:
 
 def _operands(device: torch.device | str) -> tuple[torch.Tensor, ...]:
     inputs = make_inputs(LENGTHS, HEADS, device, batched=True)
-    return tuple(
-        inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens", "dout")
-    )
+    return tuple(inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens", "dout"))
 
 
 class _Foreign:
@@ -118,9 +116,7 @@ def test_entries_refuse_a_foreign_object_on_cpu(entry: str, name: str) -> None:
             if entry == "fwd":
                 det_api.chunk_kda_det_fwd(q, k, v, g, beta, cu, **{name: foreign})
             elif entry == "bwd":
-                det_api.chunk_kda_det_bwd(
-                    q, k, v, g, beta, cu, dout, **{name: foreign}
-                )
+                det_api.chunk_kda_det_bwd(q, k, v, g, beta, cu, dout, **{name: foreign})
             else:
                 det_api.chunk_kda_det(q, k, v, g, beta, cu, **{name: foreign})
 
