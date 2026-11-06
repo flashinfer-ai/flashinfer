@@ -290,7 +290,7 @@ def test_the_loader_and_header_are_the_pinned_bytes_of_every_cake_package() -> N
     header too."""
     kda_dir = Path(
         importlib.import_module(
-            "flashinfer.experimental.cake_kda_det_train.cake_build"
+            "flashinfer.experimental.cake.cake_kda_det_train.cake_build"
         ).__file__
     ).parent
     for relative in ("cake_build.py", "csrc/cake_ffi_checks.h"):

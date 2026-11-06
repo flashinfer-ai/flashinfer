@@ -17,8 +17,8 @@ limitations under the License.
 # Experimental Cake backend: packed KDA (Kimi Delta Attention) chunked
 # training forward and backward in the GLM-5.3-Flash geometry (head dimension
 # 128, chunk 64, per-document zero initial state) on SM100 / SM103 / SM107.
-# The public entry points are ``flashinfer.cake_kda_det_train.chunk_kda_det_fwd``,
-# ``chunk_kda_det_bwd`` and ``chunk_kda_det``; the host plan, workspace, launch
+# The public entry points are ``flashinfer.cake_kda_det_train.cake_kda_det_train_forward``,
+# ``cake_kda_det_train_backward`` and ``cake_kda_det``; the host plan, workspace, launch
 # sequences, autograd Function, registry and generated sources live here.
 
 from .cake_backend import (
@@ -27,20 +27,13 @@ from .cake_backend import (
     SAVED_VERSION_TAPE,
     SCALE,
     SEG_SAVE_MIN_TOKENS_PER_SEG,
-    ChunkKDADetFunction,
-    KdaDetChunkSaved,
-    KdaDetWorkspace,
-    Plan,
-    chunk_kda_det,
-    chunk_kda_det_bwd,
-    chunk_kda_det_fwd,
-    is_supported,
-    memory_report,
-    output_bytes,
-    plan,
-    saved_bytes,
-    seg_states_saved,
-    workspace_bytes,
+    CakeKDADetArena,
+    CakeKDADetChunkSaved,
+    CakeKDADetFunction,
+    CakeKDADetWorkspace,
+    cake_kda_det,
+    cake_kda_det_train_backward,
+    cake_kda_det_train_forward,
 )
 from .cake_jit import ARCH_BY_CAPABILITY, ARCHES
 
@@ -52,18 +45,11 @@ __all__ = [
     "SAVED_VERSION_TAPE",
     "SCALE",
     "SEG_SAVE_MIN_TOKENS_PER_SEG",
-    "ChunkKDADetFunction",
-    "KdaDetChunkSaved",
-    "KdaDetWorkspace",
-    "Plan",
-    "chunk_kda_det",
-    "chunk_kda_det_bwd",
-    "chunk_kda_det_fwd",
-    "is_supported",
-    "memory_report",
-    "output_bytes",
-    "plan",
-    "saved_bytes",
-    "seg_states_saved",
-    "workspace_bytes",
+    "CakeKDADetArena",
+    "CakeKDADetChunkSaved",
+    "CakeKDADetFunction",
+    "CakeKDADetWorkspace",
+    "cake_kda_det",
+    "cake_kda_det_train_backward",
+    "cake_kda_det_train_forward",
 ]

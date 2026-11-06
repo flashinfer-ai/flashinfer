@@ -45,7 +45,7 @@ from tests.test_helpers.cake_package import cake_package
 kp = cake_package("cake_kda_det_train_kcp", "cake_kcp_plan")
 cake_kcp = cake_package("cake_kda_det_train_kcp", "cake_kcp")
 cake_kcp_jit = cake_package("cake_kda_det_train_kcp", "cake_kcp_jit")
-cake_jit = cake_package("cake_kda_det_train", "cake_jit")
+cake_jit = cake_package("cake.cake_kda_det_train", "cake_jit")
 
 # the previous path (A/B, negative control)
 OLD = {"upload": "blocking", "table_cache": "workspace"}
