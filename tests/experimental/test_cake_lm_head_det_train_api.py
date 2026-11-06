@@ -102,60 +102,6 @@ def test_public_api_is_marked_experimental():
         cake_lm_head_det_train_logprob(X, W, labels, backend="reference")
 
 
-# The names before the deterministic (``det``) naming that the deterministic modules no longer define (no
-# aliases), by module.  The det-free public names are the non-deterministic package's dispatchers in
-# ``flashinfer.chunked_lm_head`` (tests/experimental/test_cake_lm_head_loss_api.py checks the dispatch).
-REMOVED_NAMES = {
-    "cake_backend": (
-        "chunked_lm_head_loss",
-        "chunked_lm_head_logprob",
-        "prepare_lm_head_loss",
-        "validate_lm_head_inputs",
-        "lm_head_loss_workspace_size",
-        "LmHeadLossRunner",
-        "ChunkedLmHeadLossFunction",
-        "ChunkedLmHeadLogprobFunction",
-        "load_cake_lm_head_loss_module",
-    ),
-    "cake_backend_opt_in": (
-        "chunked_lm_head_loss",
-        "chunked_lm_head_logprob",
-        "prepare_lm_head_loss",
-        "validate_lm_head_inputs",
-        "LmHeadLossRunner",
-        "ChunkedLmHeadLossFunction",
-        "ChunkedLmHeadLogprobFunction",
-        "load_cake_lm_head_loss_module",
-    ),
-    "cake_support": (
-        "chunked_lm_head_support_logprob",
-        "chunked_lm_head_support_kl",
-        "SupportLogprobFunction",
-    ),
-    "cake_jit": ("load_cake_lm_head_loss_module",),
-}
-
-
-def test_names_before_the_det_naming_are_gone():
-    """The package path before the ``det`` naming (``flashinfer.experimental.cake_lm_head_loss``) and the
-    deterministic modules' former names are gone: no module of the old path imports (a stale ``__pycache__``
-    directory can still make the bare package path import as a namespace package, so a module is imported), and
-    no deterministic module defines or exports a former name."""
-    with pytest.raises(ModuleNotFoundError):
-        importlib.import_module(
-            "flashinfer.experimental.cake_lm_head_loss.cake_backend"
-        )
-    assert sum(len(names) for names in REMOVED_NAMES.values()) == 21
-    assert len({name for names in REMOVED_NAMES.values() for name in names}) == 12
-    for module_name, names in REMOVED_NAMES.items():
-        module = importlib.import_module(
-            f"flashinfer.experimental.cake.cake_lm_head_det_train.{module_name}"
-        )
-        for name in names:
-            assert not hasattr(module, name), (module_name, name)
-            assert name not in getattr(module, "__all__", ()), (module_name, name)
-
-
 def test_public_api_switch_keywords():
     """Both public entries take every switch as a keyword-only argument defaulting to ``None``; the loss entry's
     docstring states each default and the variable it falls back to; the backend entries take the same names (the

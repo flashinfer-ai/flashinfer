@@ -19,8 +19,8 @@ logprob,preload,support_logprob,support_kl}``: experimental dispatchers of the n
 ``deterministic=False`` is accepted: it runs that package with the same argument checks and environment fallbacks,
 also while torch's deterministic algorithms are on (the package's own alert decides; no fallback, no warning from the
 dispatcher).  Any other value, the default ``True`` included, is a ``ValueError`` naming the deterministic entry
-(``flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_*``) before any package import or torch query.  The deterministic entries take no
-``deterministic`` keyword (``TypeError``).  The host-layer tests replace the package by recorders; the device tests
+(``flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_*``) before any package import or torch query.  That the deterministic entries take no
+``deterministic`` keyword is checked by ``test_cake_lm_head_det_train_names.py``.  The host-layer tests replace the package by recorders; the device tests
 compare the bits of real calls.
 """
 
@@ -420,49 +420,6 @@ def test_torch_deterministic_mode_passes_a_k_slices_pin_unchanged(
     assert kw["gemm_tuning"] == pinned
     if source == "keyword":
         assert kw["gemm_tuning"] is pinned
-
-
-def test_deterministic_entries_take_no_mode_keyword():
-    """The ``cake_lm_head_det_train_*`` entries have no ``deterministic`` parameter: passing one (``True`` or ``False``)
-    is a ``TypeError`` from argument binding (host tensors suffice: it raises before any work)."""
-    X, W, labels = _host_call()
-    sup = _support_args()
-    calls = {
-        "cake_lm_head_det_train_loss": ((X, W, labels), dict(loss_div=1.0)),
-        "cake_lm_head_det_train_logprob": ((X, W, labels), {}),
-        "cake_lm_head_det_train_preload": ((), {}),
-        "cake_lm_head_det_train_support_logprob": (sup, dict(k_cap=3)),
-        "cake_lm_head_det_train_support_kl": (sup + (torch.zeros(4),), dict(k_cap=3)),
-    }
-    for det, (args, kwargs) in calls.items():
-        fn = getattr(det_public, det)
-        assert "deterministic" not in inspect.signature(fn).parameters, det
-        for value in (True, False):
-            with pytest.raises(
-                TypeError, match="unexpected keyword argument 'deterministic'"
-            ):
-                fn(*args, **kwargs, deterministic=value)
-
-
-def test_deterministic_package_has_no_mode_parameter_and_reads_no_torch_mode():
-    """No function or autograd ``Function.forward`` of the deterministic package's modules takes a
-    ``deterministic`` parameter, and none of them reads torch's deterministic mode."""
-    for name in ("cake_backend", "cake_backend_opt_in", "cake_support"):
-        module = importlib.import_module(
-            f"flashinfer.experimental.cake.cake_lm_head_det_train.{name}"
-        )
-        assert "are_deterministic_algorithms_enabled" not in inspect.getsource(module)
-        for attr, value in vars(module).items():
-            if getattr(value, "__module__", None) != module.__name__:
-                continue
-            if inspect.isclass(value) and issubclass(value, torch.autograd.Function):
-                fn = value.forward
-            elif inspect.isfunction(value):
-                fn = value
-            else:
-                continue
-            params = inspect.signature(fn).parameters
-            assert "deterministic" not in params, f"{name}.{attr}"
 
 
 def test_non_deterministic_binding_caches_take_the_import_settings():
