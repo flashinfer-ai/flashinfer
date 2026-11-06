@@ -13,8 +13,9 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Tests of the non-deterministic Cake packed width-4 depthwise causal convolution + SiLU training package
-(``deterministic=False``; SM100 / SM103 / SM107).
+Tests of the backend of the non-deterministic Cake packed width-4 depthwise causal convolution + SiLU training
+package (``flashinfer.cake_causal_conv1d_nondet_train``, backend
+``flashinfer.experimental.cake.cake_causal_conv1d_nondet_train``; SM100 / SM103 / SM107).
 
 Every kernel output is compared with an independent plain-torch reference of the same math with document-local
 shifts, under the deterministic package's budgets: BF16 ``y`` and ``dx`` within ``atol 1e-3 + rtol 2^-7`` (one
@@ -33,7 +34,7 @@ CUDA Graph capture / replay with and without a caller-owned workspace, one packa
 shared by the capture's backward calls; two streams with two workspaces at once;
 the backward is ONE ordinary launch (no reduce program) and keeps its speed beside a kernel resident on another
 stream (FlashInfer issues #7038 / #7548).  Autograd, non-reentrant activation checkpointing (2 x forward +
-backward) and gradient accumulation; the ``deterministic`` keyword and torch's deterministic mode.
+backward) and gradient accumulation; torch's deterministic mode.
 
 The opt-in ``bwd_grid_mult`` (every value of ``BWD_GRID_MULTS``) on every route, at single-tile, multi-sub-tile and
 partial-last-tile channel counts and at small and large ``S``: the backward launches that many times its untrimmed
@@ -47,7 +48,7 @@ package's, the gradients within budget of the reference and of the deterministic
 after the call.
 
 This suite names its package once, through ``tests.test_helpers.cake_package`` (key
-``cake.cake_causal_conv1d_train``), and the deterministic package for the parity checks through the same table;
+``cake_causal_conv1d_nondet_train``), and the deterministic package for the parity checks through the same table;
 a vendored build without the deterministic package skips those checks.  Every test skips until the exporter has
 rendered the package (``build.json`` and ``csrc/``).
 """
@@ -63,7 +64,7 @@ import torch
 
 from tests.test_helpers.cake_package import cake_package
 
-KEY = "cake.cake_causal_conv1d_train"
+KEY = "cake_causal_conv1d_nondet_train"
 pkg = cake_package(KEY)
 cake_build = cake_package(KEY, "cake_build")
 loader = cake_package(KEY, "cake_jit")
@@ -201,15 +202,15 @@ def _supported() -> bool:
     return (
         torch.cuda.is_available()
         and _capability() in SUPPORTED_CAPABILITIES
-        and pkg.is_cake_causal_conv1d_train_supported(_device())
+        and pkg.is_cake_causal_conv1d_nondet_train_supported(_device())
     )
 
 
 pytestmark = pytest.mark.skipif(
     not _supported(),
     reason=(
-        "the non-deterministic cake_causal_conv1d_train package needs an SM100 / SM103 / SM107 device and its "
-        "rendered build.json / csrc (TODO-EXPORT until the exporter renders it)"
+        "the non-deterministic cake_causal_conv1d_nondet_train package needs an SM100 / SM103 / SM107 device and "
+        "its rendered build.json / csrc (TODO-EXPORT until the exporter renders it)"
     ),
 )
 
@@ -505,20 +506,19 @@ def _assert_within(actual, expected, *, atol, rtol, label) -> float:
 
 
 def _forward(x, w, cu, **kwargs) -> torch.Tensor:
-    return pkg.cake_causal_conv1d_train_forward(x, w, cu, deterministic=False, **kwargs)
+    return pkg.cake_causal_conv1d_nondet_train_forward(x, w, cu, **kwargs)
 
 
 def _backward(x, w, cu, dy, b=None, policy="bf16", **kwargs):
     """``(dx, dweight, dbias_or_None)`` of one non-deterministic backward call."""
 
-    grads = pkg.cake_causal_conv1d_train_backward(
+    grads = pkg.cake_causal_conv1d_nondet_train_backward(
         x,
         w,
         cu,
         dy,
         bias=b,
         silu_grad_preactivation=policy,
-        deterministic=False,
         **kwargs,
     )
     return grads[0], grads[1], (grads[2] if b is not None else None)
@@ -741,9 +741,7 @@ def test_backward_programs_switch_on_channel_count(kind, monkeypatch) -> None:
         (selected,) = loader.selected_modules(arch, kind, C=C, S=S)
         label = f"{kind} S={S} C={C} docs={docs} program={selected}"
         x, w, cu, dy, b, policy = _route_inputs(S, C, docs, kind, key=6)
-        workspace = pkg.cake_causal_conv1d_train_backward_workspace(
-            S, C, device, deterministic=False
-        )
+        workspace = pkg.cake_causal_conv1d_nondet_train_backward_workspace(S, C, device)
         seen.clear()
         dx, dw, db = _backward(x, w, cu, dy, b, policy, workspace=workspace)
         assert seen == [selected], f"{label}: launched {seen}"
@@ -782,9 +780,7 @@ def test_large_case_over_two_to_the_31_elements(kind) -> None:
         y, reference_forward(x, w, cu, b), atol=Y_ATOL, rtol=Y_RTOL, label=f"y {label}"
     )
     del y
-    workspace = pkg.cake_causal_conv1d_train_backward_workspace(
-        S, C, device, deterministic=False
-    )
+    workspace = pkg.cake_causal_conv1d_nondet_train_backward_workspace(S, C, device)
     dx, dw, db = _backward(x, w, cu, dy, b, policy, workspace=workspace)
     assert int(torch.count_nonzero(workspace)) == 0, label
     _check_grads(
@@ -856,9 +852,7 @@ def test_repeated_launches_worst_case(case, kind, record_property) -> None:
     S, C, docs = case
     x, w, cu, dy, b, policy = _route_inputs(S, C, docs, kind, key=3)
     refs = reference_backward(x, w, cu, dy, b=b, policy=policy)
-    workspace = pkg.cake_causal_conv1d_train_backward_workspace(
-        S, C, _device(), deterministic=False
-    )
+    workspace = pkg.cake_causal_conv1d_nondet_train_backward_workspace(S, C, _device())
     dx0 = None
     worst_dw = worst_db = 0.0
     patterns = set()
@@ -934,9 +928,7 @@ def test_tile_override_row(own_workspace, monkeypatch, record_property) -> None:
     label = f"{arch} {kind} S={S} C={C} ct_vec={ct_vec}"
     x, w, cu, dy, b, policy = _route_inputs(S, C, "perf", kind, key=9)
     workspace = (
-        pkg.cake_causal_conv1d_train_backward_workspace(
-            S, C, device, deterministic=False
-        )
+        pkg.cake_causal_conv1d_nondet_train_backward_workspace(S, C, device)
         if own_workspace
         else None
     )
@@ -989,8 +981,8 @@ def test_bwd_grid_mult_keeps_dx_and_the_budgets(case, kind, record_property) -> 
         default = _det_backward(det, x, w, cu, dy, b, policy)
     worst = 0.0
     for mult in pkg.BWD_GRID_MULTS:
-        workspace = pkg.cake_causal_conv1d_train_backward_workspace(
-            S, C, device, bwd_grid_mult=mult, deterministic=False
+        workspace = pkg.cake_causal_conv1d_nondet_train_backward_workspace(
+            S, C, device, bwd_grid_mult=mult
         )
         for own in (True, False):
             kwargs = {"workspace": workspace} if own else {}
@@ -1090,24 +1082,25 @@ def test_workspace_bytes_depend_on_channels_only() -> None:
     device = _device()
     arch = _arch()
     for C in (128, 512, 1160, 1280, 1344, 4096, 8192):
-        nbytes = pkg.cake_causal_conv1d_train_backward_workspace_bytes(
-            1, C, device, deterministic=False
+        nbytes = pkg.cake_causal_conv1d_nondet_train_backward_workspace_bytes(
+            1, C, device
         )
-        assert nbytes == pkg.cake_causal_conv1d_train_backward_workspace_bytes(
-            10**6, C, device, deterministic=False
+        assert nbytes == pkg.cake_causal_conv1d_nondet_train_backward_workspace_bytes(
+            10**6, C, device
         )
         assert nbytes == loader.backward_workspace_bytes(arch, C)
         assert nbytes % loader.WORKSPACE_ALIGN == 0
         # One accumulator set and one counter per channel tile, whatever the grid: every bwd_grid_mult, one size.
         for mult in pkg.BWD_GRID_MULTS:
-            assert nbytes == pkg.cake_causal_conv1d_train_backward_workspace_bytes(
-                1, C, device, bwd_grid_mult=mult, deterministic=False
+            assert (
+                nbytes
+                == pkg.cake_causal_conv1d_nondet_train_backward_workspace_bytes(
+                    1, C, device, bwd_grid_mult=mult
+                )
             )
         # The largest owner holds FP64 bias accumulators (40 bytes per channel) where the architecture has them.
         assert nbytes >= 4 * WIDTH * C
-        ws = pkg.cake_causal_conv1d_train_backward_workspace(
-            1, C, device, deterministic=False
-        )
+        ws = pkg.cake_causal_conv1d_nondet_train_backward_workspace(1, C, device)
         assert ws.dtype == torch.uint8 and ws.numel() == nbytes
         assert int(torch.count_nonzero(ws)) == 0
 
@@ -1122,8 +1115,8 @@ def test_changed_shapes_reuse_one_zero_workspace(kind) -> None:
     device = _device()
     shapes = ((4097, 1280, (1000, 0, 3, 3094)), (65, 256, (64, 1)), (1000, 1344, "perf"),
               (5, 136, (2, 0, 3)), (4097, 1160, (1000, 0, 3, 3094)), (1000, 512, "perf"))  # fmt: skip
-    workspace = pkg.cake_causal_conv1d_train_backward_workspace(
-        1, max(C for _, C, _ in shapes), device, deterministic=False
+    workspace = pkg.cake_causal_conv1d_nondet_train_backward_workspace(
+        1, max(C for _, C, _ in shapes), device
     )
     for own in (True, False):
         for S, C, docs in shapes:
@@ -1167,8 +1160,8 @@ def test_nan_poisoned_outputs_are_overwritten(kind) -> None:
 def test_workspace_validation() -> None:
     S, C = 64, 256
     x, w, cu, dy = _inputs(S, C, None)
-    nbytes = pkg.cake_causal_conv1d_train_backward_workspace_bytes(
-        S, C, _device(), deterministic=False
+    nbytes = pkg.cake_causal_conv1d_nondet_train_backward_workspace_bytes(
+        S, C, _device()
     )
     with pytest.raises(ValueError, match="workspace holds"):
         _backward(
@@ -1211,12 +1204,8 @@ def test_workspace_views_are_built_once_per_workspace() -> None:
     device = _device()
     x, w, cu, dy = _inputs(S, C, docs)
     refs = reference_backward(x, w, cu, dy)
-    nbytes = pkg.cake_causal_conv1d_train_backward_workspace_bytes(
-        S, C, device, deterministic=False
-    )
-    workspace = pkg.cake_causal_conv1d_train_backward_workspace(
-        S, C, device, deterministic=False
-    )
+    nbytes = pkg.cake_causal_conv1d_nondet_train_backward_workspace_bytes(S, C, device)
+    workspace = pkg.cake_causal_conv1d_nondet_train_backward_workspace(S, C, device)
     entries = len(pkg._ACCUMULATOR_VIEWS)
     for call in range(2):
         dx, dw, _ = _backward(x, w, cu, dy, workspace=workspace)
@@ -1283,8 +1272,8 @@ def _capture_and_replay(
         dw = torch.empty(C, WIDTH, dtype=w.dtype, device=device)
         db = None if b is None else torch.empty(C, dtype=b.dtype, device=device)
         workspace = (
-            pkg.cake_causal_conv1d_train_backward_workspace(
-                S, C, device, bwd_grid_mult=bwd_grid_mult, deterministic=False
+            pkg.cake_causal_conv1d_nondet_train_backward_workspace(
+                S, C, device, bwd_grid_mult=bwd_grid_mult
             )
             if own_workspace
             else None
@@ -1473,9 +1462,7 @@ def test_two_streams_with_two_workspaces() -> None:
     streams = [torch.cuda.Stream(device=device) for _ in problems]
     for own in (True, False):
         workspaces = [
-            pkg.cake_causal_conv1d_train_backward_workspace(
-                S, C, device, deterministic=False
-            )
+            pkg.cake_causal_conv1d_nondet_train_backward_workspace(S, C, device)
             if own
             else None
             for _ in problems
@@ -1694,9 +1681,7 @@ def test_fp32g_accumulators_follow_the_rendered_rule(kind, C, monkeypatch) -> No
     S, docs = 4097, (1000, 0, 3, 3094)
     device = _device()
     x, w, cu, dy, b, policy = _route_inputs(S, C, docs, kind, key=11)
-    workspace = pkg.cake_causal_conv1d_train_backward_workspace(
-        S, C, device, deterministic=False
-    )
+    workspace = pkg.cake_causal_conv1d_nondet_train_backward_workspace(S, C, device)
     seen = []
     launch = pkg.run_module
 
@@ -1740,9 +1725,7 @@ def test_backward_keeps_its_speed_beside_a_resident_side_kernel(
     device = _device()
     S, C, docs = 261393, 512, "perf"
     x, w, cu, dy = _inputs(S, C, docs)
-    workspace = pkg.cake_causal_conv1d_train_backward_workspace(
-        S, C, device, deterministic=False
-    )
+    workspace = pkg.cake_causal_conv1d_nondet_train_backward_workspace(S, C, device)
     dx = torch.empty_like(x)
     dw = torch.empty(C, WIDTH, dtype=torch.float32, device=device)
     side = torch.cuda.Stream(device=device)
@@ -1805,9 +1788,9 @@ def test_zero_tokens_return_empty_outputs() -> None:
 
 @pytest.mark.parametrize("combo", AUTOGRAD_COMBOS, ids=_combo_id)
 def test_autograd_end_to_end(combo) -> None:
-    """``cake_causal_conv1d(..., deterministic=False)`` with FP32 / BF16 taps, no / FP32 / BF16 bias, under both
-    SiLU' policies: the forward's bits, ``dx`` bitwise the direct backward's, the parameter gradients within
-    budget of the reference, in the parameters' dtypes; a non-contiguous incoming gradient is materialized."""
+    """``cake_causal_conv1d_nondet`` with FP32 / BF16 taps, no / FP32 / BF16 bias, under both SiLU' policies: the
+    forward's bits, ``dx`` bitwise the direct backward's, the parameter gradients within budget of the reference, in
+    the parameters' dtypes; a non-contiguous incoming gradient is materialized."""
 
     weight_dtype, bias_dtype, policy = combo
     kind = _combo_route(weight_dtype, bias_dtype, policy)
@@ -1821,9 +1804,7 @@ def test_autograd_end_to_end(combo) -> None:
         x = x0.detach().clone().requires_grad_(True)
         w = w0.detach().clone().requires_grad_(True)
         b = None if b0 is None else b0.detach().clone().requires_grad_(True)
-        y = pkg.cake_causal_conv1d(
-            x, w, cu, b, silu_grad_preactivation=policy, deterministic=False
-        )
+        y = pkg.cake_causal_conv1d_nondet(x, w, cu, b, silu_grad_preactivation=policy)
         assert torch.equal(y.detach(), _forward(x0, w0, cu, bias=b0))
         y.backward(incoming)
         assert x.grad.dtype == BF16 and torch.equal(x.grad, dx_direct)
@@ -1855,8 +1836,8 @@ def test_non_reentrant_checkpoint_is_two_forwards_and_a_backward() -> None:
         b = b0.detach().clone().requires_grad_(True)
 
         def layer(x, w, b):
-            return pkg.cake_causal_conv1d(
-                x, w, cu, b, silu_grad_preactivation=policy, deterministic=False
+            return pkg.cake_causal_conv1d_nondet(
+                x, w, cu, b, silu_grad_preactivation=policy
             )
 
         y = checkpoint(layer, x, w, b, use_reentrant=False) if ckpt else layer(x, w, b)
@@ -1879,7 +1860,7 @@ def test_gradient_accumulation() -> None:
     dy2 = torch.randn_like(dy.float()).to(BF16)
     w = w0.detach().clone().requires_grad_(True)
     for g in (dy, dy2):
-        pkg.cake_causal_conv1d(x0, w, cu, deterministic=False).backward(g)
+        pkg.cake_causal_conv1d_nondet(x0, w, cu).backward(g)
     _, dw1, _ = reference_backward(x0, w0, cu, dy)
     _, dw2, _ = reference_backward(x0, w0, cu, dy2)
     _assert_within(
@@ -1912,14 +1893,13 @@ def test_bwd_grid_mult_through_autograd(kind) -> None:
             b = None if b0 is None else b0.detach().clone().requires_grad_(True)
 
             def layer(x, w, b, mult=mult):
-                return pkg.cake_causal_conv1d(
+                return pkg.cake_causal_conv1d_nondet(
                     x,
                     w,
                     cu,
                     b,
                     silu_grad_preactivation=policy,
                     bwd_grid_mult=mult,
-                    deterministic=False,
                 )
 
             y = (
@@ -1942,42 +1922,18 @@ def test_bwd_grid_mult_through_autograd(kind) -> None:
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# The numerical-mode keyword and torch's deterministic mode.
-
-
-def test_every_entry_requires_deterministic_false() -> None:
-    S, C = 64, 256
-    x, w, cu, dy = _inputs(S, C, None)
-    device = _device()
-    calls = {
-        "forward": lambda d: pkg.cake_causal_conv1d_train_forward(x, w, cu, **d),
-        "backward": lambda d: pkg.cake_causal_conv1d_train_backward(x, w, cu, dy, **d),
-        "autograd": lambda d: pkg.cake_causal_conv1d(x, w, cu, **d),
-        "function": lambda d: pkg.CakeCausalConv1dFunction.apply(x, w, cu, None, "bf16", 1, d.get("deterministic", True)),
-        "bwd_ws": lambda d: pkg.cake_causal_conv1d_train_backward_workspace(S, C, device, **d),
-        "bwd_ws_bytes": lambda d: pkg.cake_causal_conv1d_train_backward_workspace_bytes(S, C, device, **d),
-        "fwd_ws": lambda d: pkg.cake_causal_conv1d_train_forward_workspace(S, C, device, **d),
-        "fwd_ws_bytes": lambda d: pkg.cake_causal_conv1d_train_forward_workspace_bytes(S, C, device, **d),
-    }  # fmt: skip
-    for name, call in calls.items():
-        for kwargs in (
-            {},
-            {"deterministic": True},
-            {"deterministic": 0},
-            {"deterministic": None},
-        ):
-            with pytest.raises(ValueError, match="deterministic=False"):
-                call(kwargs)
-        assert call({"deterministic": False}) is not None, name
+# Torch's deterministic mode.
 
 
 def test_torch_deterministic_mode_alerts_on_the_backward() -> None:
-    """Under ``torch.use_deterministic_algorithms(True)`` the backward raises (``warn_only=True``: warns and runs);
-    the forward (the deterministic programs' bits) runs without an alert."""
+    """Under ``torch.use_deterministic_algorithms(True)`` the backward raises (``warn_only=True``: warns and runs the
+    non-deterministic backward); the forward (the deterministic programs' bits) runs without an alert.  The mode is
+    read when the backward runs: an autograd graph recorded with the mode off raises once it is on."""
 
     S, C, docs = 1000, 512, "perf"
     x, w, cu, dy = _inputs(S, C, docs)
     expected_y = _forward(x, w, cu)
+    recorded = pkg.cake_causal_conv1d_nondet(x.clone().requires_grad_(True), w, cu)
     prev, prev_warn = (
         torch.are_deterministic_algorithms_enabled(),
         torch.is_deterministic_algorithms_warn_only_enabled(),
@@ -1985,14 +1941,24 @@ def test_torch_deterministic_mode_alerts_on_the_backward() -> None:
     try:
         torch.use_deterministic_algorithms(True)
         assert torch.equal(_forward(x, w, cu), expected_y)
-        with pytest.raises(RuntimeError, match="cake_causal_conv1d_train_backward"):
+        with pytest.raises(
+            RuntimeError, match="cake_causal_conv1d_nondet_train_backward"
+        ):
             _backward(x, w, cu, dy)
         xg = x.clone().requires_grad_(True)
-        y = pkg.cake_causal_conv1d(xg, w, cu, deterministic=False)
-        with pytest.raises(RuntimeError, match="cake_causal_conv1d_train_backward"):
+        y = pkg.cake_causal_conv1d_nondet(xg, w, cu)
+        with pytest.raises(
+            RuntimeError, match="cake_causal_conv1d_nondet_train_backward"
+        ):
             y.backward(dy)
+        with pytest.raises(
+            RuntimeError, match="cake_causal_conv1d_nondet_train_backward"
+        ):
+            recorded.backward(dy)
         torch.use_deterministic_algorithms(True, warn_only=True)
-        with pytest.warns(UserWarning, match="cake_causal_conv1d_train_backward"):
+        with pytest.warns(
+            UserWarning, match="cake_causal_conv1d_nondet_train_backward"
+        ):
             dx, dw, _ = _backward(x, w, cu, dy)
         _check_grads(
             dx,
@@ -2036,10 +2002,10 @@ def test_argument_validation() -> None:
         with pytest.raises(error, match="bwd_grid_mult must be"):
             _backward(x, w, cu, dy, bwd_grid_mult=bad)
         with pytest.raises(error, match="bwd_grid_mult must be"):
-            pkg.cake_causal_conv1d(x, w, cu, bwd_grid_mult=bad, deterministic=False)
+            pkg.cake_causal_conv1d_nondet(x, w, cu, bwd_grid_mult=bad)
         with pytest.raises(error, match="bwd_grid_mult must be"):
-            pkg.cake_causal_conv1d_train_backward_workspace(
-                S, C, _device(), bwd_grid_mult=bad, deterministic=False
+            pkg.cake_causal_conv1d_nondet_train_backward_workspace(
+                S, C, _device(), bwd_grid_mult=bad
             )
     with pytest.raises(ValueError, match="CUDA"):
         _forward(x.cpu(), w.cpu(), cu.cpu())
@@ -2058,9 +2024,7 @@ def test_fp32_dweight_must_be_16_byte_aligned() -> None:
     refs = reference_backward(x, w, cu, dy, b=b)
     n = C * WIDTH
     buf = torch.zeros(n + 4, dtype=F32, device=device)
-    workspace = pkg.cake_causal_conv1d_train_backward_workspace(
-        S, C, device, deterministic=False
-    )
+    workspace = pkg.cake_causal_conv1d_nondet_train_backward_workspace(S, C, device)
     for bias in (None, b):
         for offset in (1, 2, 3):
             misaligned = buf[offset : offset + n].view(C, WIDTH)
@@ -2120,7 +2084,7 @@ def test_registry_records_reference_the_build_manifest() -> None:
     assert manifest["schema"] == "cake-build/1"
     assert (
         manifest["package"]
-        == "flashinfer.experimental.cake.cake_causal_conv1d_train_backend"
+        == "flashinfer.experimental.cake.cake_causal_conv1d_nondet_train"
     )
     libraries = cake_build.libraries_by_name()
     kcp_loader = cake_package(KEY, "kcp_jit")

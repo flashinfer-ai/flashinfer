@@ -32,7 +32,7 @@ next to this file (its entries sit beside the zero-history entries);
 from the same sources and flags, verifying every source digest first.
 
 The routes of an architecture are the three KCP kinds of the det package
-(``flashinfer.cake_causal_conv1d_det_train_backend.kcp_jit``): ``kcp_fwd``
+(``flashinfer.cake_causal_conv1d_det_train_kcp``): ``kcp_fwd``
 (this package's copy of the det KCP forward: ``y`` and the fragments' history
 rows ``hist``), ``kcp_bwd_head`` (this package's copy of the det head program:
 the head-row derivatives ``dpre_head`` every consumer fragment sends back;

@@ -30,7 +30,7 @@ import pytest
 
 from tests.test_helpers.cake_package import cake_package
 
-KEY = "cake.cake_causal_conv1d_train"
+KEY = "cake_causal_conv1d_nondet_train"
 cake_jit = cake_package(KEY, "cake_jit")
 kcp_jit = cake_package(KEY, "kcp_jit")
 det_kcp_jit = cake_package("cake_causal_conv1d_det_train", "kcp_jit")

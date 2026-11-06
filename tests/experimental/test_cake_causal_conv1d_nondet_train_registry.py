@@ -19,8 +19,9 @@ every backward route keeps the deterministic route's programs and selection (but
 the lowest channel counts of its twin, the program of the route it shares a body with), each backward program is ONE
 ordinary launch (no reduce program) that owns an ``accumulators`` workspace (FP32, or FP64 on the ``_fp32g``
 routes; ``[C, 4]`` taps then ``[C]`` bias words; uint32 ticket counters per channel tile), and the workspace byte
-layout and size depend on ``C`` and the route only.  The ``deterministic`` keyword of every public entry point,
-and the package's wiring (test-helper key, package data, the docstring-only ``flashinfer.experimental.cake``).
+layout and size depend on ``C`` and the route only.  The public names (each carries the mode word ``nondet``; no
+entry point takes a mode keyword), and the package's wiring (test-helper key, package data, the docstring-only
+``flashinfer.experimental.cake``).
 No device is needed; nothing is built or launched.  The ``build.json`` checks skip until the exporter renders the
 package.
 """
@@ -44,7 +45,7 @@ import torch
 
 from tests.test_helpers.cake_package import cake_package
 
-KEY = "cake.cake_causal_conv1d_train"
+KEY = "cake_causal_conv1d_nondet_train"
 pkg = cake_package(KEY)
 cake_build = cake_package(KEY, "cake_build")
 cake_jit = cake_package(KEY, "cake_jit")
@@ -810,66 +811,85 @@ def test_row_plans_follow_a_replaced_override_table(
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# The numerical-mode keyword.
+# The public names: the mode word in every name, no mode keyword (FlashInfer issue #8928).
 
 PUBLIC = (
+    "cake_causal_conv1d_nondet_train_forward",
+    "cake_causal_conv1d_nondet_train_backward",
+    "cake_causal_conv1d_nondet",
+    "cake_causal_conv1d_nondet_train_forward_workspace",
+    "cake_causal_conv1d_nondet_train_forward_workspace_bytes",
+    "cake_causal_conv1d_nondet_train_backward_workspace",
+    "cake_causal_conv1d_nondet_train_backward_workspace_bytes",
+)
+# The public helpers whose names carry no mode (they launch nothing).
+HELPERS = frozenset(
+    {"plan_cache_clear", "cake_causal_conv1d_nondet_train_kcp_graph_cache_clear"}
+)
+# The names before the mode word joined them: removed, with no alias.
+OLD_NAMES = (
+    "cake_causal_conv1d",
+    "CakeCausalConv1dFunction",
     "cake_causal_conv1d_train_forward",
     "cake_causal_conv1d_train_backward",
-    "cake_causal_conv1d",
     "cake_causal_conv1d_train_forward_workspace",
     "cake_causal_conv1d_train_forward_workspace_bytes",
     "cake_causal_conv1d_train_backward_workspace",
     "cake_causal_conv1d_train_backward_workspace_bytes",
+    "is_cake_causal_conv1d_train_supported",
 )
 
 
 @pytest.mark.cpu_only
-def test_entry_points_take_the_deterministic_keyword() -> None:
+def test_public_names_carry_the_mode_and_take_no_mode_keyword() -> None:
+    """Every public name of ``__all__`` but the constants and :data:`HELPERS` carries the mode word ``nondet``; no
+    entry point and no parameter of the autograd function's forward is a ``deterministic`` keyword; the names before
+    the rename are gone (no alias)."""
+
     for name in PUBLIC:
-        p = inspect.signature(getattr(pkg, name)).parameters["deterministic"]
-        assert p.kind is inspect.Parameter.KEYWORD_ONLY and p.default is True, name
-        assert name in pkg.__all__
-    p = inspect.signature(pkg.CakeCausalConv1dFunction.forward).parameters[
+        assert name in pkg.__all__, name
+        assert (
+            "deterministic" not in inspect.signature(getattr(pkg, name)).parameters
+        ), name
+    assert "CakeCausalConv1dNondetFunction" in pkg.__all__
+    assert (
         "deterministic"
-    ]
-    assert p.default is True
-    assert "CakeCausalConv1dFunction" in pkg.__all__
+        not in inspect.signature(pkg.CakeCausalConv1dNondetFunction.forward).parameters
+    )
+    for name in pkg.__all__:
+        assert name.isupper() or name in HELPERS or "nondet" in name.lower(), name
+    for name in OLD_NAMES:
+        assert name not in pkg.__all__ and not hasattr(pkg, name), name
 
 
 @pytest.mark.cpu_only
-def test_entry_points_refuse_a_deterministic_mode_first() -> None:
-    """``deterministic`` other than the bool ``False`` is refused (``ValueError`` naming the deterministic package)
-    before any argument, device or rendering check, so the refusal needs neither a device nor ``build.json``."""
+def test_a_mode_keyword_is_an_ordinary_type_error() -> None:
+    """``deterministic=`` (either value) is Python's ordinary ``TypeError`` for an unexpected keyword at every entry
+    point, raised before any argument, device or rendering check, so it needs neither a device nor ``build.json``;
+    the autograd function takes no positional mode argument after ``bwd_grid_mult``."""
 
     x = torch.empty(8, 16, dtype=torch.bfloat16)
     w = torch.empty(16, 4, dtype=torch.float32)
     cu = torch.tensor([0, 8], dtype=torch.int32)
     cpu = torch.device("cpu")
     calls = {
-        "forward": lambda d: pkg.cake_causal_conv1d_train_forward(x, w, cu, **d),
-        "backward": lambda d: pkg.cake_causal_conv1d_train_backward(x, w, cu, x, **d),
-        "autograd": lambda d: pkg.cake_causal_conv1d(x, w, cu, **d),
-        "function": lambda d: pkg.CakeCausalConv1dFunction.apply(x, w, cu, None, "bf16", 1, d.get("deterministic", True)),
-        "fwd_ws": lambda d: pkg.cake_causal_conv1d_train_forward_workspace(8, 16, cpu, **d),
-        "fwd_ws_bytes": lambda d: pkg.cake_causal_conv1d_train_forward_workspace_bytes(8, 16, cpu, **d),
-        "bwd_ws": lambda d: pkg.cake_causal_conv1d_train_backward_workspace(8, 16, cpu, **d),
-        "bwd_ws_bytes": lambda d: pkg.cake_causal_conv1d_train_backward_workspace_bytes(8, 16, cpu, **d),
+        "forward": lambda **d: pkg.cake_causal_conv1d_nondet_train_forward(x, w, cu, **d),
+        "backward": lambda **d: pkg.cake_causal_conv1d_nondet_train_backward(x, w, cu, x, **d),
+        "autograd": lambda **d: pkg.cake_causal_conv1d_nondet(x, w, cu, **d),
+        "fwd_ws": lambda **d: pkg.cake_causal_conv1d_nondet_train_forward_workspace(8, 16, cpu, **d),
+        "fwd_ws_bytes": lambda **d: pkg.cake_causal_conv1d_nondet_train_forward_workspace_bytes(8, 16, cpu, **d),
+        "bwd_ws": lambda **d: pkg.cake_causal_conv1d_nondet_train_backward_workspace(8, 16, cpu, **d),
+        "bwd_ws_bytes": lambda **d: pkg.cake_causal_conv1d_nondet_train_backward_workspace_bytes(8, 16, cpu, **d),
     }  # fmt: skip
     for name, call in calls.items():
-        for kwargs in (
-            {},
-            {"deterministic": True},
-            {"deterministic": 0},
-            {"deterministic": None},
-            {"deterministic": "False"},
-        ):
-            with pytest.raises(ValueError, match="deterministic=False") as info:
-                call(kwargs)
-            assert "flashinfer.cake_causal_conv1d_det_train" in str(info.value), name
-        # With deterministic=False the CPU tensors / device fail the next check instead.
-        with pytest.raises((ValueError, RuntimeError)) as info:
-            call({"deterministic": False})
-        assert "deterministic=False" not in str(info.value), name
+        for value in (True, False):
+            with pytest.raises(TypeError) as info:
+                call(deterministic=value)
+            assert "unexpected keyword argument 'deterministic'" in str(info.value), (
+                name
+            )
+    with pytest.raises(TypeError):
+        pkg.CakeCausalConv1dNondetFunction.apply(x, w, cu, None, "bf16", 1, False)
 
 
 @pytest.mark.cpu_only
@@ -879,9 +899,7 @@ def test_alert_helper_in_both_torch_modes(monkeypatch) -> None:
     ``RuntimeError`` naming the entry and the deterministic package when on, a ``UserWarning`` with the same naming
     under ``warn_only=True``.  The KCP module uses the same helper."""
 
-    from flashinfer.experimental.cake.cake_causal_conv1d_train_backend import (
-        kcp as conv_kcp,
-    )
+    conv_kcp = cake_package(KEY, "kcp")
 
     assert conv_kcp._alert_nondeterministic is pkg._alert_nondeterministic
     monkeypatch.delattr(torch._C, "_alert_not_deterministic", raising=False)
@@ -935,19 +953,17 @@ def test_backward_entries_alert_before_any_device_work(monkeypatch) -> None:
     try:
         torch.use_deterministic_algorithms(True)
         with pytest.raises(
-            RuntimeError, match="cake_causal_conv1d_train_backward does not have"
+            RuntimeError, match="cake_causal_conv1d_nondet_train_backward does not have"
         ):
-            pkg.cake_causal_conv1d_train_backward(x, w, cu, x, deterministic=False)
+            pkg.cake_causal_conv1d_nondet_train_backward(x, w, cu, x)
         # The forward runs the deterministic forward programs: no alert.
-        y = pkg.cake_causal_conv1d_train_forward(x, w, cu, deterministic=False)
+        y = pkg.cake_causal_conv1d_nondet_train_forward(x, w, cu)
         assert tuple(y.shape) == (0, 16)
         torch.use_deterministic_algorithms(True, warn_only=True)
         with pytest.warns(
-            UserWarning, match="cake_causal_conv1d_train_backward does not have"
+            UserWarning, match="cake_causal_conv1d_nondet_train_backward does not have"
         ):
-            dx, dw = pkg.cake_causal_conv1d_train_backward(
-                x, w, cu, x, deterministic=False
-            )
+            dx, dw = pkg.cake_causal_conv1d_nondet_train_backward(x, w, cu, x)
         assert tuple(dx.shape) == (0, 16) and torch.equal(dw, torch.zeros_like(dw))
     finally:
         torch.use_deterministic_algorithms(prev, warn_only=prev_warn)
@@ -958,7 +974,10 @@ def test_backward_entries_alert_before_any_device_work(monkeypatch) -> None:
 def test_unrendered_package_reports_unsupported() -> None:
     assert cake_jit.is_rendered() is (PACKAGE_DIR / "build.json").is_file()
     if not cake_jit.is_rendered():
-        assert pkg.is_cake_causal_conv1d_train_supported(torch.device("cpu")) is False
+        assert (
+            pkg.is_cake_causal_conv1d_nondet_train_supported(torch.device("cpu"))
+            is False
+        )
         with pytest.raises(RuntimeError):
             cake_build.manifest()
 
@@ -970,7 +989,7 @@ def test_unrendered_package_reports_unsupported() -> None:
 @pytest.mark.cpu_only
 def test_package_wiring() -> None:
     assert (
-        pkg.__name__ == "flashinfer.experimental.cake.cake_causal_conv1d_train_backend"
+        pkg.__name__ == "flashinfer.experimental.cake.cake_causal_conv1d_nondet_train"
     )
     tree = ast.parse((REPO / "flashinfer/experimental/cake/__init__.py").read_text())
     assert ast.get_docstring(tree)
