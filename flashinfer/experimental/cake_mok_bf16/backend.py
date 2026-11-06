@@ -111,6 +111,18 @@ def select_comm_split(loads, base, hot, threshold):
     return tuple(base)
 
 
+def select_multimacro(tokens, macro_size):
+    """Whether a rank launches the sm_107a multimacro MXFP8 forward program.
+
+    ``tokens`` is the rank's observed schedule row count (the padded
+    ``num_tokens`` the forward kernel reads), ``None`` before any observation.
+    True exactly when that schedule holds two macro batches, the case the
+    program speeds up; the two programs give bitwise the same results for any
+    schedule, so a stale observation costs time only. Host-only.
+    """
+    return tokens is not None and -(-int(tokens) // macro_size) == 2
+
+
 class MoKFunctional:
     """Precompile kernels before capture; retain native function signatures."""
 
@@ -141,6 +153,9 @@ class MoKFunctional:
         self._recompute_kernels = {}
         # id(native workspace) -> asynchronous per-rank routed-load observation.
         self._load_state = {}
+        from .jit import target_arch
+
+        self._multimacro_target = target_arch(self.device) == "sm_107a"
         self._sm_count = {}  # device index -> multi_processor_count
         self._kernels(1.0 if clamped_swiglu else None)
         self.epilogues = MoKEpilogues(topk)
@@ -375,7 +390,7 @@ class MoKFunctional:
             workspace.schedule_capacity,
             workspace.ep_rank,
         )
-        self._observe_load(workspace, config)
+        self._observe_load(workspace, config, count)
         layout = self.scheduler.layout(counts, workspace.schedule_capacity, rank)
         self.scheduler.release_counts()
         if owner is not None:
@@ -409,11 +424,17 @@ class MoKFunctional:
                 "pending": None,
                 "loads": (),
                 "split": None,
+                "tokens_host": [
+                    torch.empty(1, dtype=torch.int32, pin_memory=True) for _ in range(2)
+                ],
+                "tokens_observed": [False, False],
+                "tokens": None,
+                "multimacro": False,
             }
             self._load_state[id(workspace)] = entry
         return entry
 
-    def _observe_load(self, workspace, config):
+    def _observe_load(self, workspace, config, num_tokens=None):
         """Queue an asynchronous observation of the per-rank routed-row load.
 
         Every rank counts the gathered expert IDs per owning rank on device
@@ -432,11 +453,17 @@ class MoKFunctional:
         the protocol does not require the ranks to agree on it. Skipped during
         CUDA Graph capture: captured launches keep the split in force at
         capture time.
+
+        Behind the same event it copies this rank's schedule row count
+        ``num_tokens`` (the scheduler's ``(1,)`` int32) for the forward program
+        choice (``_multimacro``) whenever that choice is open (sm_107a,
+        schedule capacity above one macro batch), with or without
+        ``imbalance_comm_sms``.
         """
+        rows = num_tokens is not None and self._multimacro_open(config, workspace)
         if (
-            config.imbalance_comm_sms is None
-            or torch.cuda.is_current_stream_capturing()
-        ):
+            config.imbalance_comm_sms is None and not rows
+        ) or torch.cuda.is_current_stream_capturing():
             return
         entry = self._load_entry(workspace, create=True)
         # Keep a completed observation before its slot stops being pending:
@@ -446,6 +473,9 @@ class MoKFunctional:
         loads = self.scheduler.owner_loads()
         slot = entry["slot"] ^ 1
         entry["host"][slot].copy_(loads, non_blocking=True)
+        if rows:
+            entry["tokens_host"][slot].copy_(num_tokens, non_blocking=True)
+        entry["tokens_observed"][slot] = rows
         entry["events"][slot].record()
         entry["slot"] = entry["pending"] = slot
 
@@ -455,7 +485,50 @@ class MoKFunctional:
         pending = entry["pending"]
         if pending is not None and entry["events"][pending].query():
             entry["loads"] = entry["host"][pending].tolist()
+            if entry["tokens_observed"][pending]:
+                entry["tokens"] = int(entry["tokens_host"][pending][0])
             entry["pending"] = None
+
+    def _multimacro_open(self, config, workspace):
+        """Static guard of the forward program choice: sm_107a and a schedule
+        capacity above one macro batch (otherwise every schedule has at most
+        one macro batch and the default program always runs)."""
+        return (
+            self._multimacro_target
+            and -(-workspace.schedule_capacity // config.macrobatch_size) > 1
+        )
+
+    def _multimacro(self, config, workspace):
+        """Whether this rank's next MXFP8 forward launches the multimacro program.
+
+        Decided per rank from its latest completed observation
+        (``select_multimacro``), like the communication split: ranks may run
+        different programs for a step, which the protocol permits (the
+        programs differ only in the order of this rank's own work and give
+        bitwise the same results). No observation yet keeps the default
+        program; during CUDA Graph capture the choice in force is kept.
+        ``config.comm_split_log`` also prints each change of the choice.
+        """
+        if not self._multimacro_open(config, workspace):
+            return False
+        capturing = torch.cuda.is_current_stream_capturing()
+        entry = self._load_entry(workspace, create=not capturing)
+        if entry is None:
+            return False
+        if not capturing:
+            self._collect_load(entry)
+        choice = select_multimacro(entry["tokens"], config.macrobatch_size)
+        if choice != entry["multimacro"]:
+            entry["multimacro"] = choice
+            if config.comm_split_log:
+                print(
+                    f"[cake_mok_bf16 rank {workspace.ep_rank}] forward program -> "
+                    f"{'multimacro' if choice else 'default'} (schedule rows "
+                    f"{entry['tokens']}, macro batch {config.macrobatch_size})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        return choice
 
     def _comm_split(self, config, workspace):
         """(forward, backward) communication-SM counts for the next launch.
@@ -599,6 +672,7 @@ class MoKFunctional:
         self._barrier(workspace)
         forward_kernel, _ = self._kernels(swiglu_limit, mxfp8)
         fwd_comm_sms, _ = self._comm_split(config, workspace)
+        program = {"multimacro": self._multimacro(config, workspace)} if mxfp8 else {}
         values = forward_kernel(
             workspace.x_buffer[:shared_rows],
             workspace.x_buffer_ptrs,
@@ -617,6 +691,7 @@ class MoKFunctional:
             config.macrobatch_size,
             config.minibatch_size,
             layout=schedule.layout,
+            **program,
         )
         self._barrier(workspace)
         output = self.epilogues.forward(

@@ -521,8 +521,8 @@ PACKAGES: tuple[Package, ...] = (
         refs_moe_grouped_gemm,
     ),
     Package(
-        "flashinfer.experimental.cake_lm_head_det_loss",
-        "flashinfer/experimental/cake_lm_head_det_loss",
+        "flashinfer.experimental.cake.cake_lm_head_det_train",
+        "flashinfer/experimental/cake/cake_lm_head_det_train",
         "cake_jit.py",
         refs_lm_head_det_loss,
     ),
