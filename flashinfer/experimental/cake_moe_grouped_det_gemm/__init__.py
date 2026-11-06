@@ -19,7 +19,8 @@ limitations under the License.
 # tensor of cumulative end offsets (never read on the host): the row
 # projection ``Y = X @ W[e].T`` (``grouped_det_gemm_fwd``), the activation gradient
 # ``dX = G @ W[e]`` (``grouped_det_gemm_dgrad``) and the weight gradient
-# ``dW[e] = G[e].T @ X[e]`` with bf16 or fp32 output (``grouped_det_gemm_wgrad``).
+# ``dW[e] = G[e].T @ X[e]`` with bf16 or fp32 output (``grouped_det_gemm_wgrad``),
+# also added into a caller's fp32 / bf16 buffer (``accumulate=True``).
 #
 # The public (experimental) entry points are the core functions
 # ``flashinfer.grouped_mm.grouped_det_gemm_fwd`` / ``grouped_det_gemm_dgrad`` /
@@ -131,6 +132,8 @@ def grouped_det_gemm_wgrad(
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
     num_groups: Optional[int] = None,
+    *,
+    accumulate: bool = False,
 ) -> torch.Tensor:
     """``dW[e] = G[offs[e-1]:offs[e]].T @ X[offs[e-1]:offs[e]]`` for every group ``e``.
 
@@ -142,11 +145,30 @@ def grouped_det_gemm_wgrad(
     groups.  ``N % 256 == 0`` and ``K`` a multiple of the selected k tile (256,
     or 512 when chosen) are required.  See ``grouped_det_gemm_fwd`` for the
     prepared form.
+
+    ``accumulate=True`` (keyword-only, default ``False``) adds into ``out``
+    instead, ``out[e] += G[e].T @ X[e]`` (Megatron's gradient-accumulation
+    fusion into an fp32 or bf16 ``main_grad``; ``out`` required, bfloat16 or
+    float32, ``out_dtype`` None or its dtype, no overlap of ``out`` with itself,
+    ``g``, ``x`` or ``offs``: ``ValueError``), and returns ``out``: the
+    deterministic weight gradient in ``out``'s dtype is written into a scratch
+    of that dtype and added with ``out.add_`` on the same stream, so ``out``
+    holds AccumulateGrad's bits of it, bitwise reproducible run to run.  The
+    scratch takes ``E * N * K`` elements (``4 * E * N * K`` bytes for fp32)
+    for the call; ``prepare_grouped_det_gemm_wgrad(..., accumulate=True)``
+    keeps it with a prepared launch (CUDA-graph capturable; every launch and
+    replay adds again).  ``sum_m == 0`` leaves ``out`` unchanged.
     """
     from .cake_backend import prepare_grouped_det_gemm_wgrad
 
     return prepare_grouped_det_gemm_wgrad(
-        g, x, offs, out=out, out_dtype=out_dtype, num_groups=num_groups
+        g,
+        x,
+        offs,
+        out=out,
+        out_dtype=out_dtype,
+        num_groups=num_groups,
+        accumulate=accumulate,
     ).launch()
 
 

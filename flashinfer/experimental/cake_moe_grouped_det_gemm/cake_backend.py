@@ -107,6 +107,24 @@ state, set at the launch (a capture records that set with the launch and
 allocates the buffers from the graph's pool) and the even split.  The static
 sm_107a forward and data-gradient programs take ``sched``, ``c0`` and ``c1`` and
 ignore them.
+
+Accumulate mode.  ``prepare_grouped_det_gemm_wgrad(..., out=out, accumulate=True)``
+(also ``grouped_det_gemm_wgrad`` and the autograd wrapper's
+``fuse_wgrad_accumulation``) adds the weight gradient into ``out``:
+``out[e] <- out[e] + G_e^T X_e``, Megatron's gradient-accumulation fusion into an
+fp32 or bf16 ``main_grad``.  The host plans the launch exactly as the overwrite of
+``out.dtype`` (route, k tile, stage, grid, tail split, raster, wave mode); the bound
+programs write that overwrite into a contiguous scratch of ``out.dtype``
+(``E * N * K`` elements) that the preparation allocates and the launch owns, and the
+launch adds it with ``out.add_`` on the same stream (``plan["accumulate"] ==
+"composed"``; ``"off"`` for an overwrite).  ``out`` then holds AccumulateGrad's bits
+of the deterministic weight gradient in its dtype, bitwise reproducible run to run.
+The checks before anything is allocated or bound: ``out`` given, ``out_dtype`` None
+or ``out.dtype``, bfloat16 or float32, three dimensions with unit stride along
+``K``, rows and experts that cannot overlap (row stride at least ``K``, expert stride
+at least ``N`` row strides) and no byte shared with ``g``, ``x`` or ``offs``.
+``sum_m == 0`` launches nothing and leaves ``out`` unchanged.  A launch adds once
+more at every ``launch()`` and every CUDA graph replay.
 """
 
 from __future__ import annotations
@@ -141,6 +159,9 @@ DESCRIPTOR_ALIGN = 128  # bytes; CUtensorMap slots of the caller-owned workspace
 # summed by the tail-reduce stage of that tile's route.
 K256_TAIL_TILE_K = 256
 _DTYPE_NAMES = {torch.bfloat16: "bfloat16", torch.float32: "float32"}
+# ``plan["accumulate"]`` of a weight gradient: an overwrite, or the overwrite into a scratch and an add
+# (module docstring, accumulate mode).
+ACCUMULATE_MODES = ("off", "composed")
 
 
 # ---------------------------------------------------------------------------
@@ -931,6 +952,18 @@ class GroupedDetGemmLaunch:
     of the route in launch order.  The scheduler and wave workspaces are the
     current stream's (module docstring), resolved at every launch, as is the
     probed queue split where ``plan["queue_split"]`` is ``"probed"``.
+
+    A weight gradient prepared with ``accumulate=True`` (``plan["accumulate"]
+    == "composed"``) adds into ``out`` at every ``launch()`` and every replay of
+    a graph that captured it (it is not idempotent): ``add_from`` is the
+    scratch the bound programs write, and the launch adds it into ``out`` with
+    ``out.add_`` on the same stream (which bumps ``out._version``), outside
+    autograd.  The scratch is owned by the prepared launch, as its descriptor
+    slots are, so one prepared accumulate launch must not be in flight on two
+    streams at once, and the launch must be kept alive while any graph that
+    captured it may replay (a graph does not keep the scratch alive).  A
+    launch prepared inside a captured backward allocates the scratch from, and
+    returns it to, the graph's pool within that backward.
     """
 
     op: str
@@ -944,6 +977,9 @@ class GroupedDetGemmLaunch:
     # descriptor slots and the fp32 tail partials.  Kept alive with the launch.
     workspaces: tuple[torch.Tensor, ...] = field(default=(), repr=False)
     device_index: int = -1
+    # Accumulate mode: the contiguous scratch of ``out.dtype`` the bound programs write, added into
+    # ``out`` after them; None for an overwrite.
+    add_from: Optional[torch.Tensor] = field(default=None, repr=False)
 
     def launch(self) -> torch.Tensor:
         if self.zero_fill:
@@ -965,6 +1001,12 @@ class GroupedDetGemmLaunch:
                             bound[c0], bound[c1] = split
                     arguments = bound
                 item.entry(*arguments)
+        if self.add_from is not None:
+            # Outside autograd: ``out`` may be a leaf that requires grad, or an inference tensor
+            # (updated in place only in inference mode).
+            mode = torch.inference_mode if self.out.is_inference() else torch.no_grad
+            with mode():
+                self.out.add_(self.add_from)
         return self.out
 
     __call__ = launch
@@ -1082,6 +1124,7 @@ def _finish(
     workspaces: list,
     *,
     zero_fill: bool = False,
+    add_from: Optional[torch.Tensor] = None,
 ) -> GroupedDetGemmLaunch:
     return GroupedDetGemmLaunch(
         op=op,
@@ -1093,6 +1136,7 @@ def _finish(
         zero_fill=zero_fill,
         workspaces=tuple(workspaces),
         device_index=_device_index(out.device),
+        add_from=add_from,
     )
 
 
@@ -1229,6 +1273,77 @@ def prepare_grouped_det_gemm_dgrad(
     return _prepare_row_op("dgrad", g, w, offs, out)
 
 
+def _require_flag(value: object, keyword: str, entry: str) -> None:
+    """Refuse a non-bool value of the switch ``keyword`` of ``entry`` (``ValueError``)."""
+    if not isinstance(value, bool):
+        raise ValueError(f"{entry}: {keyword} must be a bool, got {value!r}")
+
+
+def _byte_span(t: torch.Tensor) -> tuple[int, int]:
+    """The device bytes ``[start, end)`` the elements of ``t`` lie in (an empty range when it has none)."""
+    if t.numel() == 0:
+        return 0, 0
+    extent = 1 + sum(
+        (size - 1) * stride for size, stride in zip(t.shape, t.stride(), strict=True)
+    )
+    start = int(t.data_ptr())
+    return start, start + extent * t.element_size()
+
+
+def _check_accumulate_out(
+    out: Optional[torch.Tensor],
+    out_dtype: Optional[torch.dtype],
+    operands: dict[str, torch.Tensor],
+    entry: str,
+) -> None:
+    """The checks of a weight gradient that adds into ``out`` (module docstring, accumulate mode), made before
+    anything is allocated or bound: ``out`` given, ``out_dtype`` None or ``out``'s dtype, bfloat16 or
+    float32, three dimensions with unit stride along ``K``, rows and experts that cannot overlap (row stride
+    at least ``K``, expert stride at least ``N`` row strides: an expanded ``out`` is refused), on the device of
+    ``operands`` (name -> tensor) and sharing no byte with any of them."""
+    if out is None:
+        raise ValueError(
+            f"{entry}: accumulate=True adds the weight gradient into out; pass the [E, N, K] tensor "
+            "to add into as out"
+        )
+    if out_dtype is not None and out_dtype != out.dtype:
+        raise ValueError(
+            f"{entry}: accumulate=True adds in the dtype of out ({out.dtype}); out_dtype must be None or "
+            f"that dtype, got {out_dtype}"
+        )
+    if out.dtype not in _DTYPE_NAMES:
+        raise ValueError(
+            f"{entry}: accumulate=True needs a bfloat16 or float32 out, got {out.dtype}"
+        )
+    if out.dim() != 3 or out.stride(2) != 1:
+        raise ValueError(
+            f"{entry}: out must be an [E, N, K] tensor with unit stride along K"
+        )
+    groups, n, k = (int(v) for v in out.shape)
+    ldc, stride_e = int(out.stride(1)), int(out.stride(0))
+    if n > 1 and ldc < k:
+        raise ValueError(
+            f"{entry}: accumulate=True reads and writes every row of out, so its rows must not overlap: "
+            f"the row stride {ldc} is below K={k}"
+        )
+    if groups > 1 and stride_e < n * ldc:
+        raise ValueError(
+            f"{entry}: accumulate=True reads and writes every expert of out, so its experts must not "
+            f"overlap: the expert stride {stride_e} is below N * row stride = {n * ldc} (an expanded "
+            "out has expert stride 0)"
+        )
+    lo, hi = _byte_span(out)
+    for name, t in operands.items():
+        if t.device != out.device:
+            raise ValueError(f"{entry}: out must be on the device of {name}")
+        start, end = _byte_span(t)
+        if lo < end and start < hi:
+            raise ValueError(
+                f"{entry}: out shares memory with {name}; accumulate=True writes out while the "
+                f"kernel reads {name}"
+            )
+
+
 def prepare_grouped_det_gemm_wgrad(
     g: torch.Tensor,
     x: torch.Tensor,
@@ -1236,6 +1351,8 @@ def prepare_grouped_det_gemm_wgrad(
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
     num_groups: Optional[int] = None,
+    *,
+    accumulate: bool = False,
 ) -> GroupedDetGemmLaunch:
     """Prepare ``dW[E, N, K] = grouped G[e].T @ X[e]`` (bf16 in; bf16 or fp32 out), deterministic.
 
@@ -1245,7 +1362,32 @@ def prepare_grouped_det_gemm_wgrad(
     ``N % 256 == 0`` and ``K`` a multiple of the selected k tile (256, or 512
     when it is chosen).  Empty groups produce exact zeros.  ``out_dtype``
     defaults to the dtype of ``out`` (bf16 when neither is given).
+
+    ``accumulate=True`` (keyword-only, default ``False``) adds instead: every
+    launch computes ``out[e] <- out[e] + G[e].T @ X[e]`` into the caller's
+    ``out`` (required, bf16 or fp32; ``out_dtype`` None or ``out.dtype``; rows
+    and experts that do not overlap, no memory shared with ``g``, ``x`` or
+    ``offs``; ``ValueError`` otherwise, before anything is allocated or
+    bound).  The launch runs the overwrite of this plan into a contiguous
+    scratch of ``out.dtype`` (``E * N * K`` elements: ``4 * E * N * K`` bytes
+    for fp32) that this preparation allocates and the launch owns, then
+    ``out.add_(scratch)`` on the same stream, so ``out`` holds AccumulateGrad's
+    bits of the deterministic weight gradient in its dtype, bitwise
+    reproducible run to run (an empty group adds exact zeros: its values stay,
+    ``-0.0`` may become ``+0.0``).  ``plan["accumulate"]`` is ``"composed"``
+    (``"off"`` for an overwrite) and every other plan key is the overwrite's.
+    No row (``sum_m == 0``) launches nothing and leaves ``out`` unchanged.  Each
+    ``launch()`` and each replay of a graph that captured it adds again; keep
+    the launch alive while such a graph may replay.
     """
+    _require_flag(accumulate, "accumulate", "prepare_grouped_det_gemm_wgrad")
+    if accumulate:
+        _check_accumulate_out(
+            out,
+            out_dtype,
+            {"g": g, "x": x, "offs": offs},
+            "prepare_grouped_det_gemm_wgrad",
+        )
     c = host_plan_constants()
     block_n = int(c["block_n"])
     if g.dtype != torch.bfloat16 or x.dtype != torch.bfloat16:
@@ -1330,8 +1472,10 @@ def prepare_grouped_det_gemm_wgrad(
         constants=c,
     )
     plan["wave_mode"] = int(c["wave_sync_mode"][arch]) if wave else 0
+    plan["accumulate"] = "composed" if accumulate else "off"
     if sum_m == 0:
-        return _finish("wgrad", name, plan, out, (), [], [], zero_fill=True)
+        # No row: an overwrite stores exact zeros, an accumulate leaves out as it is (no launch, no add).
+        return _finish("wgrad", name, plan, out, (), [], [], zero_fill=not accumulate)
     grid_x, clusters, splits = plan["grid"][0], plan["clusters"], plan["tail_splits"]
     slots = _aligned_bytes(
         grid_x * int(c["tmap_slots_per_cta"]) * int(c["tmap_slot_bytes"]),
@@ -1345,7 +1489,15 @@ def prepare_grouped_det_gemm_wgrad(
         device=device,
     )
     workspaces: list = [slots, partials]
-    c_view = _span_view(out)
+    # The tensor the bound programs write: out, or in accumulate mode a contiguous scratch of its dtype
+    # (allocated here, owned by the launch; from the graph's pool when the preparation runs under capture).
+    add_from = None
+    target = out
+    if accumulate:
+        add_from = target = torch.empty(
+            num_groups, n, k, dtype=out.dtype, device=device
+        )
+    c_view = _span_view(target)
     main_kwargs = dict(
         A=g,
         B=x,
@@ -1359,8 +1511,8 @@ def prepare_grouped_det_gemm_wgrad(
         sum_m=sum_m,
         N=n,
         K=k,
-        ldc=int(out.stride(1)),
-        stride_e=int(out.stride(0)),
+        ldc=int(target.stride(1)),
+        stride_e=int(target.stride(0)),
         wave_mode=plan["wave_mode"],
         grid=plan["grid"],
     )
@@ -1374,8 +1526,8 @@ def prepare_grouped_det_gemm_wgrad(
             num_groups=num_groups,
             N=n,
             K=k,
-            ldc=int(out.stride(1)),
-            stride_e=int(out.stride(0)),
+            ldc=int(target.stride(1)),
+            stride_e=int(target.stride(0)),
             num_clusters=clusters,
             tail_splits=splits,
             raster_rows=plan["raster_rows"],
@@ -1383,7 +1535,16 @@ def prepare_grouped_det_gemm_wgrad(
         )
         stages.append("tail_reduce")
         launches.append(_bind(reduce_name, "tail_reduce", reduce_kwargs, arch))
-    return _finish("wgrad", name, plan, out, tuple(stages), launches, workspaces)
+    return _finish(
+        "wgrad",
+        name,
+        plan,
+        out,
+        tuple(stages),
+        launches,
+        workspaces,
+        add_from=add_from,
+    )
 
 
 # ---------------------------------------------------------------------------
