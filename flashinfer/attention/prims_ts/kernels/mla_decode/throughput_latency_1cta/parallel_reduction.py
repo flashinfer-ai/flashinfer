@@ -1016,6 +1016,7 @@ def run_parallel_gmem_reduction_kernel(
     output_quant: cutlass.Constexpr = None,
     output_quant_args=None,
     requested_splits=None,
+    use_pdl: cutlass.Constexpr[bool] = True,
 ):
     """Reduce split-KV partials with row-shared local and peer statistics."""
 
@@ -1023,10 +1024,11 @@ def run_parallel_gmem_reduction_kernel(
         raise ValueError(
             "final attention output requires single-CTA reduction clusters"
         )
-    prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
-    # The next PDL launch may start its prologue now; it waits for this
-    # grid's completion before reading anything this reducer writes.
-    prims.griddepcontrol(kind=prims.GridDepAction.LAUNCH_DEPENDENTS)
+    if cutlass.const_expr(use_pdl):
+        prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
+        # The next PDL launch may start its prologue now; it waits for this
+        # grid's completion before reading anything this reducer writes.
+        prims.griddepcontrol(kind=prims.GridDepAction.LAUNCH_DEPENDENTS)
 
     # Reuse the CTA's predicate across the statistics barrier instead of
     # reloading metadata. Sparse finalization can have a live extra source.

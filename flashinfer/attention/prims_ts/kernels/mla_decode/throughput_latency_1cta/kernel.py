@@ -134,11 +134,11 @@ def _publish_neutral_standalone_partial(
     """Publish ``(O=0, LSE=-inf)`` for one pruned producer tile.
 
     Standalone reducers use the configured split geometry.  A runtime-pruned
-    producer must therefore initialize its workspace slot before releasing the
-    PDL-dependent reducer; otherwise a fixed-S reducer could consume stale
-    partials left by an earlier graph replay.  Each thread clears aligned BF16
-    vec8 fragments from this CTA's V slice.  The first V-slice CTA also
-    publishes one neutral LSE per covered Q/head row.
+    producer must therefore still initialize its workspace slot, which the
+    reducer reads with or without PDL; otherwise a fixed-S reducer could
+    consume stale partials left by an earlier graph replay.  Each thread
+    clears aligned BF16 vec8 fragments from this CTA's V slice.  The first
+    V-slice CTA also publishes one neutral LSE per covered Q/head row.
     """
 
     if cutlass.const_expr(cfg.partial_o_dtype_bytes != cutlass.BFloat16.width // 8):
@@ -1791,6 +1791,9 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
     lse_base_on_e = False
     runtime_split_kv = False
     runtime_kv_lengths = False
+    # True launches every grid with PDL, ordered by the matching in-kernel
+    # wait and dependent release; plans set it from their ``enable_pdl``.
+    enable_pdl = True
 
     def __init__(
         self,
@@ -1880,7 +1883,8 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         self.assume_valid_prefix = False
         self.direct_sparse_capacities = (0, 0)
         self.coalesce_keeps_output = False
-        self.use_pdl = False
+        # Grids of at most this many CTAs release their dependents right after
+        # the entry wait (0: only at exit); applies under enable_pdl.
         self.pdl_entry_trigger_max_ctas = 0
 
         cfg = self._make_config()
@@ -2018,6 +2022,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             self.lse_dtype,
             self.runtime_split_kv,
             self.zero_empty_rows,
+            self.enable_pdl,
             self.use_parallel_reduction,
             self.parallel_reduction_topology,
             self.parallel_reduction_elements_per_slice,
@@ -2077,7 +2082,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             )
         if self.coalesce_keeps_output:
             cfg = dataclass_replace(cfg, coalesce_keeps_output=True)
-        if self.use_pdl:
+        if self.enable_pdl:
             cfg = dataclass_replace(
                 cfg,
                 use_pdl=True,
@@ -2681,7 +2686,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             cluster=cluster_shape,
             stream=stream,
             min_blocks_per_mp=1,
-            use_pdl=acc_o is not None or cfg.use_pdl,
+            use_pdl=self.enable_pdl,
         )
         if cutlass.const_expr(acc_o is not None):
             if cutlass.const_expr(
@@ -2729,7 +2734,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                         block=[reduction_threads, 1, 1],
                         stream=stream,
                         min_blocks_per_mp=1,
-                        use_pdl=True,
+                        use_pdl=self.enable_pdl,
                     )
                 else:
                     parallel_reducer.launch(
@@ -2738,7 +2743,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                         cluster=reduction_cluster,
                         stream=stream,
                         min_blocks_per_mp=1,
-                        use_pdl=True,
+                        use_pdl=self.enable_pdl,
                     )
                 return
             (
@@ -2774,7 +2779,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                 smem=reduction_smem,
                 stream=stream,
                 min_blocks_per_mp=1,
-                use_pdl=True,
+                use_pdl=self.enable_pdl,
             )
 
     @cute.kernel
@@ -2811,20 +2816,21 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
     ):
         """Execute one flat-Q, batch, KV-split, and V head-dimension tile."""
         cfg = self.runtime_config(max_q_len)
-        if cutlass.const_expr(cfg.use_pdl or acc_o is not None):
+        if cutlass.const_expr(self.enable_pdl):
             # A PDL launch can start before the preceding grid completes, so
-            # every input read below (metadata, Q, KV, sinks) waits for it.
+            # every input read below (metadata, Q, KV, sinks, device scales)
+            # waits for it.
             prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
-        if cutlass.const_expr(cfg.use_pdl and cfg.pdl_entry_trigger_max_ctas > 0):
-            # Dependents (the reducer, the next decode) wait for this whole
-            # grid before any read, so a small grid releases them now: their
-            # launch and prologue overlap it instead of following it.
-            pdl_thread_idx, _, _ = cute.arch.thread_idx()
-            grid_x, grid_y, grid_z = cute.arch.grid_dim()
-            if pdl_thread_idx == Int32(0) and grid_x * grid_y * grid_z <= Int32(
-                cfg.pdl_entry_trigger_max_ctas
-            ):
-                prims.griddepcontrol(kind=prims.GridDepAction.LAUNCH_DEPENDENTS)
+            if cutlass.const_expr(cfg.pdl_entry_trigger_max_ctas > 0):
+                # Dependents (the reducer, the next decode) wait for this whole
+                # grid before any read, so a small grid releases them now:
+                # their launch and prologue overlap it instead of following it.
+                pdl_thread_idx, _, _ = cute.arch.thread_idx()
+                grid_x, grid_y, grid_z = cute.arch.grid_dim()
+                if pdl_thread_idx == Int32(0) and grid_x * grid_y * grid_z <= Int32(
+                    cfg.pdl_entry_trigger_max_ctas
+                ):
+                    prims.griddepcontrol(kind=prims.GridDepAction.LAUNCH_DEPENDENTS)
 
         if cutlass.const_expr(isinstance(softmax_scale_operand, cute.Tensor)):
             scale_softmax_log2 = softmax_scale_operand[0] * LOG2_E
@@ -3111,8 +3117,8 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                     )
                 elif cutlass.const_expr(acc_o is not None):
                     # Standalone reducers retain configured split loops, so a
-                    # pruned producer must overwrite its workspace slot before
-                    # releasing the PDL-dependent reducer.
+                    # pruned producer must overwrite the workspace slot that
+                    # the reducer reads.
                     _publish_neutral_standalone_partial(
                         cfg,
                         acc_o,
@@ -3138,7 +3144,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                 cfg.tmem_alloc_cols,
                 group=prims.CTAGroup.CTA_1,
             )
-        if cutlass.const_expr(acc_o is not None or cfg.use_pdl):
+        if cutlass.const_expr(self.enable_pdl):
             # Every CTA in the producer grid must release the dependent
             # reducer or next PDL launch, including runtime-padded Q/split CTAs
             # that skipped the task graph. One elected thread emits the
@@ -3173,6 +3179,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             cfg,
             num_reduction_ctas,
             requested_splits=requested_splits,
+            use_pdl=self.enable_pdl,
         )
 
     @cute.kernel
@@ -3210,4 +3217,5 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             self.output_quant,
             output_quant_args,
             requested_splits=requested_splits,
+            use_pdl=self.enable_pdl,
         )
