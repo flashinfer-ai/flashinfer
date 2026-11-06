@@ -1,12 +1,15 @@
 # Cake DSA sparse-attention training backend (SM100 / SM103 / SM107)
 
-Experimental backend for the native 64-query-head DeepSeek Sparse Attention
+Backend package of `flashinfer.cake_dsa_sparse_attention_nondet_train`, the
+non-deterministic package of the native 64-query-head DeepSeek Sparse Attention
 training kernels (top-k sparse MLA with absorbed queries; GLM-5.2 geometry:
 64 heads, 512 latent + 64 rope query/key dimensions, 512 value dimensions,
 top-k 2048).  Tracking issue: flashinfer-ai/flashinfer#5657.
 
-Both the API and the backend are experimental: no compatibility guarantee,
-SM100 (B200 / GB200) is the acceptance architecture of the native kernels and
+The entry points of `flashinfer.cake_dsa_sparse_attention_nondet_train` are
+stable APIs; this backend package is experimental (no compatibility guarantee
+for its own helpers).  SM100 (B200 / GB200) is the acceptance architecture of
+the native kernels and
 SM103 (B300 / GB300) is compiled from the same sources; SM107 (Rubin R200) is
 the acceptance architecture of the packed / strided-layout extension
 (flashinfer-ai/flashinfer#5675) and is compiled from the same sources with an
@@ -15,18 +18,55 @@ automatic backend selection, autotuning or trace-apply.  Its libraries are
 loaded prebuilt from `aot/` when the package ships them and JIT-built by
 FlashInfer from `build.json` otherwise (see "Layout of this package").
 
-## Public entry points (`flashinfer/dsa_sparse_attention.py`)
+## Mode and names (flashinfer-ai/flashinfer#8928)
+
+The module name states the mode and no entry point takes a `deterministic=`
+keyword.  This is the `nondet` package: the forward and `dq` are fixed-order,
+and the backward adds the dK / dV contributions with unordered FP32 atomics, so
+the key gradients may differ run to run within the FP32 reduction spread.
+Under `torch.use_deterministic_algorithms(True)` the forward runs and every
+backward launch sequence (the autograd backward, `backward` / `backward_nope`
+and the prepared runners' `backward`) raises PyTorch's `RuntimeError` before it
+allocates or launches; with `warn_only=True` it issues a `UserWarning` and
+runs this package's backward.  It never falls back to another package.  A
+backward without query rows launches nothing and does not alert.  The
+deterministic package `flashinfer.cake_dsa_sparse_attention_det_train` is a
+reserved name (planned) and does not exist yet.
+
+| Before | Now |
+|---|---|
+| `flashinfer.dsa_sparse_attention` | `flashinfer.cake_dsa_sparse_attention_nondet_train` |
+| `flashinfer.experimental.cake_dsa_train` | `flashinfer.experimental.cake.cake_dsa_sparse_attention_nondet_train` |
+| `dsa_sparse_attention` | `cake_dsa_sparse_attention_nondet` |
+| `dsa_sparse_attention_varlen` | `cake_dsa_sparse_attention_nondet_varlen` |
+| `dsa_sparse_attention_nope` | `cake_dsa_sparse_attention_nondet_nope` |
+| `dsa_sparse_attention_nope_varlen` | `cake_dsa_sparse_attention_nondet_nope_varlen` |
+| `DSASparseAttentionFunction` | `CakeDSASparseAttentionNondetFunction` |
+| `DSASparseAttentionNopeFunction` | `CakeDSASparseAttentionNondetNopeFunction` |
+| `DSASparseAttentionNopeVarlenFunction` | `CakeDSASparseAttentionNondetNopeVarlenFunction` |
+
+The names before the rename are removed (no aliases); importing their modules
+fails.  The environment variables `FLASHINFER_CAKE_DSA_*`, the backend's
+internal helpers (`forward`, `backward`, `prepare_dsa_train`, ...) and the
+generated library, program and kernel names keep their names.
+
+## Public entry points (`flashinfer/cake_dsa_sparse_attention_nondet_train.py`)
 
 ```python
-from flashinfer.dsa_sparse_attention import dsa_sparse_attention, dsa_sparse_attention_varlen
+from flashinfer.cake_dsa_sparse_attention_nondet_train import (
+    cake_dsa_sparse_attention_nondet,
+    cake_dsa_sparse_attention_nondet_varlen,
+)
 
-out = dsa_sparse_attention(q_latent, q_rope, kv_latent, k_rope, indices,
-                           topk_length=None, softmax_scale=None, return_lse=False,
-                           dkv_acc=None, dkv_dst_map=None)
-out = dsa_sparse_attention_varlen(q_latent, q_rope, kv_latent, k_rope, gather_kv_indices,
-                                  cu_seqlens_q, cu_seqlens_k, max_seqlen_q=None, max_seqlen_k=None,
-                                  causal=False, topk_length=None, softmax_scale=None,
-                                  return_lse=False, dkv_acc=None, dkv_dst_map=None)
+out = cake_dsa_sparse_attention_nondet(
+    q_latent, q_rope, kv_latent, k_rope, indices,
+    topk_length=None, softmax_scale=None, return_lse=False,
+    dkv_acc=None, dkv_dst_map=None)
+out = cake_dsa_sparse_attention_nondet_varlen(
+    q_latent, q_rope, kv_latent, k_rope, gather_kv_indices,
+    cu_seqlens_q, cu_seqlens_k, max_seqlen_q=None, max_seqlen_k=None,
+    causal=False, topk_length=None, softmax_scale=None,
+    return_lse=False, dkv_acc=None, dkv_dst_map=None)
 ```
 
 * `q_latent [T, 64, 512]`, `q_rope [T, 64, 64]` BF16; `kv_latent [S, 512]`
@@ -128,7 +168,7 @@ trainer's packed layouts (flashinfer-ai/flashinfer#5675) are consumed in place
 
 `cake_backend.backward(..., dkv_acc=, dkv_dst_map=)`, `prepare_dsa_train(...,
 dkv_acc=, dkv_dst_map=)`, the public entries and the autograd `Function`
-(`DSASparseAttentionFunction.apply(q_latent, q_rope, kv_latent, k_rope, indices,
+(`CakeDSASparseAttentionNondetFunction.apply(q_latent, q_rope, kv_latent, k_rope, indices,
 topk_length, softmax_scale, key_passes, dkv_acc, dkv_dst_map, num_segments)`)
 accumulate the dK/dV gradients directly into a caller-provided FP32 buffer
 instead of returning `dkv_latent` / `dk_rope` (flashinfer-ai/flashinfer#5675:
@@ -152,7 +192,7 @@ context-parallel window):
   entry points (default `False`) validates the values on every call when
   `True` (one device synchronization) and raises `ValueError` on a violation;
   leave it off in production.  The backend reads no environment variable:
-  flashinfer's public wrapper `flashinfer.dsa_sparse_attention` maps
+  flashinfer's public wrapper `flashinfer.cake_dsa_sparse_attention_nondet_train` maps
   `FLASHINFER_CAKE_DSA_CHECK_DST_MAP` onto the keyword when the caller leaves
   it at `None`.
 * Through the autograd entries `dkv_acc` may also be a zero-argument callable
@@ -243,7 +283,7 @@ shapes shows the same cost, and no synchronization is involved.  In a
 GPU-bound training step this is hidden behind the backward kernels (6-8 ms at
 4k tokens).  Host-bound loops should call `cake_backend.forward` /
 `cake_backend.backward` directly or capture the prepared runner into a CUDA
-graph (`benchmarks/bench_cake_dsa_train.py --host-us` reports both; `--host-calls`
+graph (`benchmarks/bench_cake_dsa_sparse_attention_nondet_train.py --host-us` reports both; `--host-calls`
 / `--host-rounds` set the sample size).
 
 ## Kernel structure of one training step
@@ -349,14 +389,19 @@ per row) and rejects `K_slots <= 0`, a non-int32 dtype and a row stride below
 work by `topk_length` and read no slot beyond `K_slots`.
 
 ```python
-from flashinfer.dsa_sparse_attention import dsa_sparse_attention_nope, dsa_sparse_attention_nope_varlen
+from flashinfer.cake_dsa_sparse_attention_nondet_train import (
+    cake_dsa_sparse_attention_nondet_nope,
+    cake_dsa_sparse_attention_nondet_nope_varlen,
+)
 
-out = dsa_sparse_attention_nope(q, kv, indices, topk_length=None, softmax_scale=None,
-                                return_lse=False, dkv_acc=None, dkv_dst_map=None)
-out = dsa_sparse_attention_nope_varlen(q, kv, gather_kv_indices, cu_seqlens_q, cu_seqlens_k,
-                                       max_seqlen_q=None, max_seqlen_k=None, causal=False,
-                                       topk_length=None, softmax_scale=None, return_lse=False,
-                                       dkv_acc=None, dkv_dst_map=None, check_cu_seqlens=True)
+out = cake_dsa_sparse_attention_nondet_nope(
+    q, kv, indices, topk_length=None, softmax_scale=None,
+    return_lse=False, dkv_acc=None, dkv_dst_map=None)
+out = cake_dsa_sparse_attention_nondet_nope_varlen(
+    q, kv, gather_kv_indices, cu_seqlens_q, cu_seqlens_k,
+    max_seqlen_q=None, max_seqlen_k=None, causal=False,
+    topk_length=None, softmax_scale=None, return_lse=False,
+    dkv_acc=None, dkv_dst_map=None, check_cu_seqlens=True)
 ```
 
 * `q [T, 64, 512]` BF16 (contiguous or a strided token / head view, consumed in
@@ -398,7 +443,7 @@ out = dsa_sparse_attention_nope_varlen(q, kv, gather_kv_indices, cu_seqlens_q, c
   valid slot + 1 by default, bitwise `offset_gather_kv_indices`; `compact=True`
   the compacted rows and counts, with an optional `topk_length` cut),
   `prepare_dsa_nope_train` / `DSANopeTrainRunner`, `dsa_nope_train_workspace_size`,
-  `validate_dsa_nope_inputs`, `DSASparseAttentionNopeFunction` (12 forward inputs,
+  `validate_dsa_nope_inputs`, `CakeDSASparseAttentionNondetNopeFunction` (12 forward inputs,
   gradients for `q` and `kv` only).  The binding cache is shared; the NoPE keys are
   tagged (`"nope_fwd"` / `"nope_bwd"`) and never collide with the rope keys.
 * `dkv` semantics.  Fresh (no `dkv_acc`): `backward_nope` returns a new natural
@@ -560,7 +605,8 @@ reports that gap).
   the kernels' own argument names, one per distinct argument plan or grid
   rule (`STAGE_ARGS` / `LAUNCH` / `GRID` keyed by stage name).
 * `cake_backend.py` -- validation, workspace layout, varlen index offsetting,
-  the prepared runner, the autograd `Function` and the eager entry points.
+  the prepared runners, the autograd Functions, the eager entry points and the
+  non-determinism alert of the backward (`_alert_nondeterministic`).
 * `csrc/cake_ffi_checks.h` -- the TVM-FFI helper header the bindings include
   (tensor-argument checks, `TVM_FFI_CHECK_CUDA_ERROR`, `build_cuda_version`),
   shipped by the export so the package compiles without FlashInfer's `csrc/`.
@@ -598,9 +644,12 @@ record with its nine stages (the delta, compaction and cast kernels shared with
 the rope program) and its own key-range-pass and direct-accumulation policies
 (see "NoPE (zero-rope) program").
 
-Tests: `tests/experimental/test_cake_dsa_train.py` (the backend suite: imports
+Tests: `tests/experimental/test_cake_dsa_sparse_attention_nondet_train.py` (the backend suite: imports
 only this package; skips without a registered program or a compute capability
-10.0 / 10.3 / 10.7 device) and `tests/experimental/test_cake_dsa_train_api.py`
-(the flashinfer public entry points and the environment variables the wrapper
-resolves into this package's keyword switches).  Benchmark:
-`benchmarks/bench_cake_dsa_train.py`.
+10.0 / 10.3 / 10.7 device) and `tests/experimental/test_cake_dsa_sparse_attention_nondet_train_api.py`
+(the flashinfer public entry points, the environment variables the wrapper
+resolves into this package's keyword switches and the behaviour under
+`torch.use_deterministic_algorithms`); the CPU-only
+`tests/experimental/test_cake_dsa_sparse_attention_nondet_train_names.py`
+checks the names of #8928.  Benchmark:
+`benchmarks/bench_cake_dsa_sparse_attention_nondet_train.py`.
