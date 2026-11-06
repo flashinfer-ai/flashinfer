@@ -827,6 +827,10 @@ def _disable_locked() -> None:
             len(never),
             never,
         )
+    # Emptied in place: every wrapper built on this mapping (one a caller kept
+    # before its first matching call included) routes nowhere from here on,
+    # instead of resolving a Solution that is no longer enabled.
+    _solutions.clear()
     _solutions = {}
     reset_loaded()
     _reset_stats()

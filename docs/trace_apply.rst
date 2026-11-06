@@ -187,14 +187,15 @@ setup that calls its own Definition with a new weight set is refused too,
 rather than left waiting on the lock it holds.
 
 ``release_packages()`` first disarms the routes it releases: every sealed
-Definition that no captured binding serves leaves Trace Apply's mapping (by
-identity, so a curated Solution enabled for that Definition since stays) and
-loses its preloaded entry, so no route can fall through to the on-disk build
-path afterwards; curated Solutions enabled beside them stay enabled. It then
-tears down every state those bindings retain (``teardown`` when declared; every
-binding is released before a failed teardown is raised) and forgets them; a
-released binding refuses every later call, a wrapper kept across the release
-included. Callers quiesce their calls first. ``setup_stats()`` returns ``{definition: {"runs", "weight_sets",
+Solution whose Definition no captured binding serves leaves Trace Apply's
+mapping (by identity, so a curated Solution enabled for that Definition since
+stays, and the mapping is emptied in place, so a wrapper kept across the
+release routes nowhere), then loses its preloaded entry, so no route can fall
+through to the on-disk build path at any point; curated Solutions enabled
+beside them stay enabled. It then tears down every state those bindings retain
+(``teardown`` when declared; every binding is released before a failed
+teardown is raised) and forgets them; a released binding refuses every later
+call. Callers quiesce their calls first. ``setup_stats()`` returns ``{definition: {"runs", "weight_sets",
 "seconds", "retained_bytes", "refused_in_capture"}}`` for the same bindings. A
 binding that a CUDA-graph capture has observed is never released, by
 ``release_packages()`` or by its own ``release()`` (a ``SetupStateError``):

@@ -740,13 +740,14 @@ class _BundleFinder(importlib.abc.MetaPathFinder):
         raise SealedPackageError(f"no sealed module {fullname!r}")
 
 
-#: The sealed Solutions ``load_packages`` enabled in this process, by Definition:
-#: ``{definition: (solution name, Solution hash)}``. ``release_packages`` takes
-#: exactly these out of Trace Apply's mapping, by identity (a curated Solution
-#: enabled for the same Definition after a ``disable_apply`` is not the sealed
-#: one and stays), and drops their preloaded entries; a Definition a captured
-#: binding serves is kept.
-_preloaded_solutions: dict[str, tuple[str, str]] = {}
+#: The sealed Solutions ``load_packages`` enabled in this process since the last
+#: release: every ``(definition, solution name, Solution hash)``, a Definition
+#: loaded again after a ``disable_apply`` keeping its earlier identity too.
+#: ``release_packages`` takes exactly these out of Trace Apply's mapping, by
+#: identity (a curated Solution enabled for the same Definition since is not a
+#: sealed one and stays), and drops their preloaded entries; a Definition a
+#: captured binding serves is kept, identities and all.
+_preloaded_solutions: set[tuple[str, str, str]] = set()
 _bound_lock = threading.Lock()
 #: {(digest, pid): SetupBoundCallable} — one binding per package and process,
 #: so a repeat ``import_entry`` returns the identical object and the states it
@@ -903,14 +904,16 @@ def _solution_hash(value: Any) -> str | None:
 def release_packages() -> None:
     """Release this process's sealed packages: their routes first, then their bindings.
 
-    The routes are disarmed before any teardown runs: every sealed Definition
-    ``load_packages`` enabled that no captured binding serves leaves Trace
-    Apply's mapping, by identity (a curated Solution enabled for the same
-    Definition since is not the sealed one and stays), and loses its preloaded
-    entry, so neither a teardown re-entering its Definition nor a route a
-    released binding served can reach the on-disk build path, the one place
-    sealed sources must never reach; curated Solutions enabled beside them stay
-    enabled. Then each bound callable tears down the states it retains
+    The routes are disarmed before any teardown runs, in an order that is safe
+    by construction: first every sealed Solution ``load_packages`` enabled whose
+    Definition no captured binding serves leaves Trace Apply's mapping, by
+    identity (a curated Solution enabled for the same Definition since is not a
+    sealed one and stays; a wrapper a caller kept, resolved or not, routes
+    nowhere from then on), then their preloaded entries go, so at no point is a
+    sealed Solution enabled without its preloaded entry, which is what would
+    send a call to the on-disk build path, the one place sealed sources must
+    never reach; curated Solutions enabled beside them stay enabled. Then each
+    bound callable tears down the states it retains
     (``teardown(state)`` when declared), refuses every later call (a wrapper a
     caller kept across the release included) and leaves the registry, so a
     later ``import_entry`` binds afresh. Every binding is released before a
@@ -933,24 +936,24 @@ def release_packages() -> None:
         for key in [key for key, bound in _bound.items() if not bound.frozen]:
             del _bound[key]
     releasing = {
-        definition: identity
-        for definition, identity in _preloaded_solutions.items()
-        if definition not in kept
+        identity for identity in _preloaded_solutions if identity[0] not in kept
     }
-    for definition, (name, _) in releasing.items():
-        apply.unregister_preloaded(definition, name)
-        del _preloaded_solutions[definition]
-    if releasing and apply._solutions:
+    hashes: dict[str, set[str]] = {}
+    for definition, _, solution_hash in releasing:
+        hashes.setdefault(definition, set()).add(solution_hash)
+    if hashes and apply._solutions:
         remaining = {
             definition: solution
             for definition, solution in apply._solutions.items()
-            if definition not in releasing
-            or _solution_hash(solution) != releasing[definition][1]
+            if _solution_hash(solution) not in hashes.get(definition, ())
         }
         if len(remaining) != len(apply._solutions):
             apply.disable_apply()
             if remaining:
                 apply.enable_apply(remaining)
+    for definition, name, _ in sorted(releasing):
+        apply.unregister_preloaded(definition, name)
+    _preloaded_solutions.difference_update(releasing)
     failures: list[SetupStateError] = []
     for bound in released:
         try:
@@ -1085,7 +1088,7 @@ def load_packages(
             apply.register_preloaded(
                 definition, name, fn, solution_hash=solutions[definition].hash()
             )
-            _preloaded_solutions[definition] = (name, solutions[definition].hash())
+            _preloaded_solutions.add((definition, name, solutions[definition].hash()))
         if solutions:
             result.applied = apply.enable_apply({**current, **solutions})
     return result

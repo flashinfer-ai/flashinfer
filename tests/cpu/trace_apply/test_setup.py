@@ -552,6 +552,40 @@ def test_capture_refuses_first_use_freezes_and_never_releases(tmp_path, monkeypa
     assert bound.stats()["weight_sets"] == 1
 
 
+def test_a_wrapper_kept_across_release_routes_nowhere(sm_gate_off, monkeypatch):
+    import flashinfer.trace_apply.apply as apply_module
+
+    def stock(
+        hidden_states, weight, *args, **kwargs
+    ):  # the kernel's stand-in on a CPU host
+        return rmsnorm_reference(hidden_states, weight)
+
+    monkeypatch.setattr(flashinfer.norm, "rmsnorm", stock)
+    pk.load_packages(GOLDEN_ROOT, [GOLDEN_SETUP_DIGEST])
+    kept = (
+        flashinfer.norm.rmsnorm
+    )  # the wrapped API, kept before its first matching call
+    assert (
+        getattr(kept, "_trace_apply", False)
+        and "rmsnorm_h16" in apply_module._solutions
+    )
+    pk.release_packages()
+    assert (
+        flashinfer.norm.rmsnorm is stock
+    )  # the module attribute is the original again
+    monkeypatch.setattr(
+        apply_module,
+        "load_solution",
+        lambda solution: pytest.fail(
+            "the on-disk loader ran for a released sealed Solution"
+        ),
+    )
+    hidden, weight = torch.randn(4, 16), torch.randn(16)
+    # The kept wrapper resolves nothing: stock, never the loader, and no binding.
+    assert torch.allclose(kept(hidden, weight), rmsnorm_reference(hidden, weight))
+    assert pk.setup_stats() == {}
+
+
 def test_capture_is_seen_on_the_calls_device_and_on_the_current_one(monkeypatch):
     capturing = {0: False, 1: False}
     current = [0]

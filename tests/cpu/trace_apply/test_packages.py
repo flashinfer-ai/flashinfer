@@ -35,6 +35,7 @@ from flashinfer.trace_apply.apply import (
     _enable_apply_from_env,
     _get_loaded_solution,
     clear_preloaded,
+    preloaded_entry,
     register_preloaded,
 )
 from tests.cpu.trace_apply.seal_helpers import (
@@ -679,6 +680,47 @@ def test_preloaded_callable_is_bound_to_its_solution(tmp_path, monkeypatch):
 
     monkeypatch.setattr(apply_module, "load_solution", build)
     assert _get_loaded_solution(solution) is sentinel
+
+
+def test_release_drops_every_sealed_identity_a_definition_accumulated(
+    tmp_path, monkeypatch, sm_gate_off
+):
+    import flashinfer.trace_apply.apply as apply_module
+
+    def plain(root, name):
+        source = b"def run(x): return x + 1\n"
+        solution = {
+            **SOLUTION,
+            "name": name,
+            "sources": [{"path": "kernel.py", "content": source.decode()}],
+        }
+        return seal_package(
+            root,
+            {"solution.json": json_bytes(solution), "kernel.py": source},
+            sidecar=QUALIFICATION,
+        )
+
+    # Two sealed Solutions for one Definition across a disable: both identities
+    # are kept until the release, which drops both preloaded entries.
+    pk.load_packages(tmp_path / "first", [plain(tmp_path / "first", "first")])
+    ta.disable_apply()
+    pk.load_packages(tmp_path / "second", [plain(tmp_path / "second", "second")])
+    assert preloaded_entry(OPERATION, "first") and preloaded_entry(OPERATION, "second")
+    # Routes go before entries: at every unregister the Definition is already
+    # out of the mapping, so no call can find it enabled without its entry.
+    still_enabled = []
+    unregister = apply_module.unregister_preloaded
+
+    def spy(definition, name):
+        still_enabled.append(definition in apply_module._solutions)
+        unregister(definition, name)
+
+    monkeypatch.setattr(apply_module, "unregister_preloaded", spy)
+    pk.release_packages()
+    assert still_enabled == [False, False]
+    assert preloaded_entry(OPERATION, "first") is None
+    assert preloaded_entry(OPERATION, "second") is None
+    assert not pk._preloaded_solutions and not apply_module._solutions
 
 
 def test_a_registration_during_another_callers_build_is_seen_under_the_build_lock(
