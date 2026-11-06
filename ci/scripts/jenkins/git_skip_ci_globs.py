@@ -29,7 +29,7 @@ globs = [
     ".gitignore",
     "LICENSE",
     "tests/lint/*",
-    "tests/scripts/infra/task_lint.sh",
+    "tests/scripts/task_lint.sh",
 ]
 
 
