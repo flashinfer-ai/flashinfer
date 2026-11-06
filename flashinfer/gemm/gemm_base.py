@@ -7824,12 +7824,10 @@ def _heuristic_func_mm_mxfp8(
         return [c for c in order if c in suitable_backends]
     # don't select trtllm since it requires weight shuffling
     if "cutlass" in suitable_backends:
-        # On SM107 the CuTe-DSL and cuDNN kernels win on some shapes; listing them after
-        # CUTLASS lets the autotuner rank all three while untuned calls keep CUTLASS.
-        if get_compute_capability(a.device) == (10, 7):
-            extra = ["cute-dsl"] + (["cudnn"] if CUDNN_AVAILABLE else [])
-            return ["cutlass"] + [c for c in extra if c in suitable_backends]
-        return ["cutlass"]
+        # CuTe-DSL and cuDNN follow CUTLASS so the autotuner ranks them while untuned
+        # calls keep CUTLASS.
+        extra = ["cute-dsl"] + (["cudnn"] if CUDNN_AVAILABLE else [])
+        return ["cutlass"] + [c for c in extra if c in suitable_backends]
     # fall back to cudnn (e.g. on SM12x when CUTLASS scale-layout
     # requirements are not met) when it is available.
     if CUDNN_AVAILABLE and "cudnn" in suitable_backends:
@@ -7906,7 +7904,9 @@ def mm_mxfp8(
     backend: Literal["cutlass", "cute-dsl", "cutedsl_low_latency", "trtllm", "cudnn", "b12x", "auto"]
         The backend to use for the operation. Defaults to ``"auto"``.
         ``"auto"`` selects the CUTLASS backend when available and otherwise
-        falls back to the cuDNN backend. On SM120/SM121 it prefers the b12x
+        falls back to the cuDNN backend. With CUTLASS available, the autotuner
+        also ranks the CuTe-DSL and cuDNN backends where they are suitable;
+        untuned calls run CUTLASS. On SM120/SM121 it prefers the b12x
         backend when its requirements are met. Eligible ``"cutedsl_low_latency"``
         problems include it as the last heuristic candidate.
         - The ``"b12x"`` backend (SM120/SM121) is a warp-level MMA kernel with

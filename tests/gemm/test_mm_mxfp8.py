@@ -1103,21 +1103,20 @@ def test_trtllm_raises_for_linear_b_descale():
 
 
 @pytest.mark.parametrize(
-    "cc, cudnn_available, expected",
+    "suitable, cudnn_available, expected",
     [
-        ((10, 7), True, ["cutlass", "cute-dsl", "cudnn"]),
-        ((10, 7), False, ["cutlass", "cute-dsl"]),
-        ((10, 0), True, ["cutlass"]),
+        (["cutlass", "cute-dsl", "cudnn"], True, ["cutlass", "cute-dsl", "cudnn"]),
+        (["cutlass", "cute-dsl", "cudnn"], False, ["cutlass", "cute-dsl"]),
+        (["cutlass", "cudnn"], True, ["cutlass", "cudnn"]),
+        (["cudnn"], True, ["cudnn"]),
     ],
 )
-def test_mm_mxfp8_auto_ranks_cute_dsl_and_cudnn_on_sm107(
-    monkeypatch, cc, cudnn_available, expected
+def test_mm_mxfp8_auto_ranks_cute_dsl_and_cudnn_after_cutlass(
+    monkeypatch, suitable, cudnn_available, expected
 ):
-    """Untuned ``backend="auto"`` calls keep CUTLASS first; on SM107 the autotuner also ranks CuTe-DSL and cuDNN."""
-    monkeypatch.setattr(gemm_base, "get_compute_capability", lambda device: cc)
+    """Untuned ``backend="auto"`` calls keep CUTLASS first; the autotuner also ranks the suitable CuTe-DSL and cuDNN backends."""
     monkeypatch.setattr(gemm_base, "CUDNN_AVAILABLE", cudnn_available)
     a = torch.zeros(4, 128).to(torch.float8_e4m3fn)
     b = torch.zeros(128, 128).to(torch.float8_e4m3fn).t()
     sf = torch.zeros(512, dtype=torch.uint8)
-    suitable = ["cutlass", "cute-dsl", "cudnn"]
     assert gemm_base._heuristic_func_mm_mxfp8(suitable, a, b, sf, sf) == expected
