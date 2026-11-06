@@ -690,7 +690,6 @@ kernel_cake_vsa_sm120_5645b831eaa1960fa011(const __grid_constant__ CUtensorMap q
             m_state[0] = fmaxf(m_state[0], _shfl_xor_sync_0);
             float _shfl_xor_sync_1 = __shfl_xor_sync(0xFFFFFFFF, m_state[0], 1);
             m_state[0] = fmaxf(m_state[0], _shfl_xor_sync_1);
-            o_scale[0] = 1.0f;
             m_prev[1] = m_state[1];
             m_state[1] = fmaxf(m_state[1], fmaxf(fmaxf(qk_acc[2], qk_acc[3]), fmaxf(qk_acc[6], qk_acc[7])));
             m_state[1] = fmaxf(m_state[1], fmaxf(fmaxf(qk_acc[10], qk_acc[11]), fmaxf(qk_acc[14], qk_acc[15])));
@@ -700,54 +699,46 @@ kernel_cake_vsa_sm120_5645b831eaa1960fa011(const __grid_constant__ CUtensorMap q
             m_state[1] = fmaxf(m_state[1], _shfl_xor_sync_2);
             float _shfl_xor_sync_3 = __shfl_xor_sync(0xFFFFFFFF, m_state[1], 1);
             m_state[1] = fmaxf(m_state[1], _shfl_xor_sync_3);
-            o_scale[1] = 1.0f;
-            int moved = __any_sync(0xFFFFFFFF, m_state[0] != m_prev[0] || m_state[1] != m_prev[1]);
-            if (moved != 0) {
-                if (m_state[0] != m_prev[0]) {
-                    float _exp2_4 = approx_exp2(__fmaf_rn(m_prev[0], softmax_scale_log2, -(m_state[0] * softmax_scale_log2)));
-                    o_scale[0] = _exp2_4;
-                }
-                if (m_state[1] != m_prev[1]) {
-                    float _exp2_5 = approx_exp2(__fmaf_rn(m_prev[1], softmax_scale_log2, -(m_state[1] * softmax_scale_log2)));
-                    o_scale[1] = _exp2_5;
-                }
-                {
-                    float2 _pair_scale_even2_6 = make_float2(o_scale[0], o_scale[0]);
-                    float2 _pair_scale_odd2_6 = make_float2(o_scale[1], o_scale[1]);
-                    float2* _pair_scale_src2_6 = reinterpret_cast<float2*>(&out_acc[0]);
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[0]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[1]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[2]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[3]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[4]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[5]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[6]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[7]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[8]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[9]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[10]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[11]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[12]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[13]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[14]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[15]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[16]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[17]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[18]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[19]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[20]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[21]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[22]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[23]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[24]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[25]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[26]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[27]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[28]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[29]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[30]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[31]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
-                }
+            float _exp2_4 = approx_exp2(__fmaf_rn(m_prev[0], softmax_scale_log2, -(m_state[0] * softmax_scale_log2)));
+            o_scale[0] = ((m_state[0] != m_prev[0]) ? _exp2_4 : 1.0f);
+            float _exp2_5 = approx_exp2(__fmaf_rn(m_prev[1], softmax_scale_log2, -(m_state[1] * softmax_scale_log2)));
+            o_scale[1] = ((m_state[1] != m_prev[1]) ? _exp2_5 : 1.0f);
+            {
+                float2 _pair_scale_even2_6 = make_float2(o_scale[0], o_scale[0]);
+                float2 _pair_scale_odd2_6 = make_float2(o_scale[1], o_scale[1]);
+                float2* _pair_scale_src2_6 = reinterpret_cast<float2*>(&out_acc[0]);
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[0]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[1]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[2]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[3]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[4]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[5]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[6]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[7]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[8]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[9]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[10]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[11]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[12]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[13]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[14]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[15]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[16]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[17]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[18]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[19]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[20]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[21]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[22]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[23]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[24]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[25]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[26]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[27]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[28]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[29]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[30]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[31]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
             }
             shift[0] = m_state[0] * softmax_scale_log2;
             shift[1] = m_state[1] * softmax_scale_log2;

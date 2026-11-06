@@ -39,7 +39,8 @@ def main():
         [17, 5, 0, 9, 33, -1, 1, 2], dtype=torch.int32, device="cuda"
     )
 
-    # Prepare once, outside CUDA graph capture: binds w_uv and loads the program.
+    # Prepare once, outside CUDA graph capture: binds w_uv, decides the program of every B
+    # (16-row or 8-row tile; the same bits either way) and loads it.
     runner = prepare_mla_value_gate(w_uv, max_rows=max_rows, sigmoid_precision="fp32")
     latent, gate, out = latent_buf[:rows], projected[:rows, 2112:], out_buf[:rows]
 
@@ -64,7 +65,8 @@ def main():
         tuple(out.shape),
         out.dtype,
         runner.arch,
-        runner.program,
+        runner.program_for(rows),
+        f"tile_rows={runner.tile_rows_for(rows)}",
     )
 
 
