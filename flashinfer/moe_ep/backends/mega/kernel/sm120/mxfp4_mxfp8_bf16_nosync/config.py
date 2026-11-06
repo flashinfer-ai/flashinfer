@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Configuration for the SM120 MXFP4 x MXFP8 nosync MegaMoE backend."""
+"""Configuration for the SM120 MXFP4 x MXFP8 nosync MegaMoE kernel."""
 
 from __future__ import annotations
 
@@ -20,35 +20,39 @@ from dataclasses import dataclass
 
 TRANSPORTS = ("p2p", "auto", "nic")
 TOKENS_PER_ITEM = (8, 16, 24, 32)
+# The kernel is measured faster than cake and cutedsl up to 128 tokens per rank (RTX 6000D and
+# RTX PRO 6000, DeepSeek-V4-Flash, DeepSeek-V4.1-Flash and GLM-5.3-Flash MoE shapes); its expert
+# pools hold max_tokens_per_rank rows per (local expert, source rank).
+MAX_TOKENS_PER_RANK = 128
 
 
 @dataclass
 class Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig:
-    """Static model and tuning parameters.
+    """Static parameters of the nosync kernel (at most 128 tokens per rank).
 
-    ``intermediate_size`` is the post-SwiGLU width (the checkpoint's ``w13`` has
-    ``2 * intermediate_size`` rows, gate rows then up rows).
+    Deployments normally reach it through :class:`NosyncSwitchConfig`, which runs it for
+    small batches and the deployment's own backend for the rest.
 
-    ``swiglu_limit`` clamps the SwiGLU inputs: ``silu(min(gate, limit)) *
-    clamp(up, -limit, limit)``.
+    ``intermediate_size`` is the post-SwiGLU width (``w13`` has ``2 * intermediate_size``
+    rows, gate rows then up rows). ``swiglu_limit`` clamps the SwiGLU inputs:
+    ``silu(min(gate, limit)) * clamp(up, -limit, limit)``; ``inf`` for none.
 
     ``transport`` selects how ranks reach each other:
 
-    * ``"p2p"`` (default): PCIe peer-to-peer stores between every pair (torch
-      symmetric memory).
-    * ``"auto"``: the buffer is an NCCL window; pairs NCCL maps for load/store
-      use peer-to-peer stores, the others (e.g. across CPU sockets where that
-      path is slow) send over the NIC with NCCL GIN.
+    * ``"p2p"`` (default): PCIe peer-to-peer stores between every pair (torch symmetric
+      memory).
+    * ``"auto"``: the buffer is an NCCL window; pairs NCCL maps for load/store use
+      peer-to-peer stores, the others (e.g. across CPU sockets where that path is slow) send
+      over the NIC with NCCL GIN.
     * ``"nic"``: NCCL GIN for every other rank.
 
-    ``"auto"`` and ``"nic"`` need NCCL 2.30.7 with the Device API and a
-    GIN-capable network; every rank must use the same value.
+    ``"auto"`` and ``"nic"`` need NCCL 2.30.7 with the Device API and a GIN-capable network;
+    every rank must use the same value.
 
-    ``tokens_per_item`` is the number of tokens one work item multiplies per
-    weight fragment (8, 16, 24 or 32). ``None`` picks 24 when this rank's
-    routed rows per local expert (``tokens * top_k / local_experts``) reach 7,
-    else 8 (measured crossover with cold L2 on RTX 6000D and RTX PRO 6000).
-    Set it explicitly after sweeping a deployment's shapes for the best time.
+    ``tokens_per_item`` is the number of tokens one work item multiplies per weight load (8,
+    16, 24 or 32). ``None`` picks 24 when this rank's routed rows per local expert
+    (``tokens * top_k / local_experts``) reach 7, else 8 (measured crossover with cold L2 on
+    RTX 6000D and RTX PRO 6000). Set it explicitly after sweeping a deployment's shapes.
     """
 
     intermediate_size: int

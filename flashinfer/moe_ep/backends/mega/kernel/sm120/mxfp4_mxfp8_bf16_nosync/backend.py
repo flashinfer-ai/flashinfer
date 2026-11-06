@@ -34,7 +34,12 @@ from ..mxfp4_mxfp8_bf16_cake.cake_staging import (
     validate_forward_inputs,
 )
 from .config import Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig
-from .weights import preprocess_mega_weights, validate_transformed_mega_weights
+from .config import MAX_TOKENS_PER_RANK
+from .weights import (
+    NosyncMegaWeights,
+    preprocess_mega_weights,
+    validate_transformed_mega_weights,
+)
 from .workspace import NosyncWorkspace
 
 if TYPE_CHECKING:
@@ -46,11 +51,6 @@ MAX_TOP_K = 8
 MAX_LOCAL_EXPERTS = 256
 # the dispatch stages one MXFP8 row (hidden + hidden / 32 bytes) in 8 KB of shared memory
 MAX_HIDDEN = 7936
-# A work item multiplies 8 to 32 tokens per weight fragment, a decode-size design. Up to 128
-# tokens per rank it beats the sibling cutedsl and cake backends on RTX 6000D and RTX PRO 6000
-# (DeepSeek-V4-Flash, DeepSeek-V4.1-Flash and GLM-5.3-Flash MoE shapes); larger batches belong on
-# those backends.
-MAX_TOKENS_PER_RANK = 128
 
 
 @register_mega_kernel(KERNEL_NAME)
@@ -104,8 +104,9 @@ class Sm120Mxfp4Mxfp8NosyncMegaKernelBackend(MegaKernelBackend):
             (hidden <= MAX_HIDDEN, f"token_hidden_size at most {MAX_HIDDEN}"),
             (
                 0 < fleet_params.max_tokens_per_rank <= MAX_TOKENS_PER_RANK,
-                f"max_tokens_per_rank in [1, {MAX_TOKENS_PER_RANK}] (a decode kernel; the "
-                "sm120_mxfp4_mxfp8_bf16_cutedsl / _cake backends serve larger batches)",
+                f"max_tokens_per_rank in [1, {MAX_TOKENS_PER_RANK}] (a decode kernel: use "
+                "MoEEpLayer(..., nosync=NosyncOptions()) to run it for small batches next to "
+                "another backend)",
             ),
         )
         for ok, requirement in checks:
@@ -114,7 +115,7 @@ class Sm120Mxfp4Mxfp8NosyncMegaKernelBackend(MegaKernelBackend):
 
     def preprocess_weights(
         self, weights: MoEWeightPack, fleet_params: FleetParams
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> NosyncMegaWeights:
         return preprocess_mega_weights(
             weights,
             hidden_size=fleet_params.token_hidden_size,
@@ -123,7 +124,7 @@ class Sm120Mxfp4Mxfp8NosyncMegaKernelBackend(MegaKernelBackend):
 
     def validate_transformed_weights(
         self,
-        transformed_weights: tuple[torch.Tensor, torch.Tensor],
+        transformed_weights: NosyncMegaWeights,
         bootstrap: BootstrapConfig,
         fleet_params: FleetParams,
     ) -> None:
@@ -230,7 +231,7 @@ class Sm120Mxfp4Mxfp8NosyncMegaKernelBackend(MegaKernelBackend):
     def compute(
         self,
         workspace: Any,
-        transformed_weights: tuple[torch.Tensor, torch.Tensor],
+        transformed_weights: NosyncMegaWeights,
         *,
         output: torch.Tensor | None,
     ) -> torch.Tensor:
@@ -245,9 +246,14 @@ class Sm120Mxfp4Mxfp8NosyncMegaKernelBackend(MegaKernelBackend):
             and output.shape[1] == ws.hidden
         )
         y = output if direct else ws.output
-        w13, w2 = transformed_weights
         config = self._kernel_config
-        ws.launch(y, w13, w2, launch_rows, config.swiglu_limit, config.tokens_per_item)
+        ws.launch(
+            y,
+            transformed_weights,
+            launch_rows,
+            config.swiglu_limit,
+            config.tokens_per_item,
+        )
         if output is not None and not direct:
             output[:rows].copy_(ws.output[:rows])
             return output

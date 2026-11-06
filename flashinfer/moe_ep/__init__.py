@@ -240,7 +240,7 @@ from .core.validation import (
     validate_mega_forward_inputs,
     validate_split_forward_inputs,
 )
-from .layer import MoEEpLayer
+from .layer import MoEEpLayer, MoEEpNosyncLayer, NosyncOptions
 from .modes import (
     AutoConfig,
     MoEEpAutoLayer,
@@ -327,6 +327,7 @@ __all__ = [
     "MoEEpDispatchResult",
     "MoEEpFaultToleranceUnsupportedError",
     "MoEEpLayer",
+    "MoEEpNosyncLayer",
     "MoEEpMegaLayer",
     "MoEEpMegaWorkspace",
     "MoEEpNotBuiltError",
@@ -365,6 +366,7 @@ __all__ = [
     "Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig",
     "Sm120_Mxfp4_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
     "Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig",
+    "NosyncOptions",
     "Sm120_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
     "TransformedCakeMegaWeights",
     "TransformedCakeW8a8MegaWeights",

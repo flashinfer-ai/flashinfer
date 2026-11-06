@@ -15,7 +15,8 @@
 """SM120 MXFP4 x MXFP8 nosync MegaMoE backend: one persistent kernel per layer
 (routing exchange, dispatch, FC1 + SwiGLU, FC2, combine) for up to 128 tokens per
 rank over PCIe peer-to-peer, or NCCL GIN for the pairs the transport assigns to
-the NIC.
+the NIC. Deployments add it to their configured backend with
+``MoEEpLayer(..., nosync=NosyncOptions())``, which runs it for small calls only.
 
 "nosync": the kernel has no cross-rank barrier. Each producer writes an
 epoch-tagged flag into the consumer's memory after its data (release), and the
@@ -24,10 +25,11 @@ per source instead. No remote atomics and no host-side synchronization."""
 
 from .backend import Sm120Mxfp4Mxfp8NosyncMegaKernelBackend
 from .config import Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig
-from .weights import preprocess_mega_weights
+from .weights import NosyncMegaWeights, preprocess_mega_weights
 
 __all__ = [
     "Sm120Mxfp4Mxfp8NosyncMegaKernelBackend",
     "Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig",
+    "NosyncMegaWeights",
     "preprocess_mega_weights",
 ]
