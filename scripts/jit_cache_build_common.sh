@@ -466,6 +466,13 @@ setup_sccache() {
     return "${setup_status}"
   }
   export FLASHINFER_CXX_LAUNCHER="sccache"
+  # Trial: rapids v0.18.0-rapids.8 fails fatally ("Error computing digest: while
+  # reading '/'") on g++ -MMD compiles that include <vector>, so its trial leaves
+  # host C++ uncached; "upstream-nocxx" does the same on upstream for a matched
+  # baseline. Only the nvcc TUs differ between the two.
+  case "${FLASHINFER_SCCACHE_FLAVOR:-}" in
+    rapids|upstream-nocxx) export FLASHINFER_CXX_LAUNCHER="" ;;
+  esac
   export FLASHINFER_NVCC_LAUNCHER="sccache"
   export FLASHINFER_SCCACHE_ACTIVE=true
   echo "sccache version: $(sccache --version)"
