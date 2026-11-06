@@ -215,7 +215,7 @@ __device__ __forceinline__ void tmem_ld_x8(float* dst, int tmem_addr) {
 extern "C" {
 
 __global__ __launch_bounds__(224, LAUNCH_MIN_BLOCKS) void
-kernel_cake_grouped_fp8_gemm_c07e400950f10afa30b2(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap A64, const __grid_constant__ CUtensorMap A32, const __grid_constant__ CUtensorMap B, int* __restrict__ SFA, int* __restrict__ SFB, int* __restrict__ m_indices, const __grid_constant__ CUtensorMap C_tma, unsigned int shape_m, unsigned int shape_n, unsigned int grid_n, unsigned int k_tiles, unsigned int sfa_row_stride, unsigned int sfa_col_stride, unsigned int sfb_group_stride, unsigned int sfb_row_stride, unsigned int sfb_col_stride)
+kernel_cake_grouped_fp8_gemm_b7998f5a844bc15e8046(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap A64, const __grid_constant__ CUtensorMap A32, const __grid_constant__ CUtensorMap B, int* __restrict__ SFA, int* __restrict__ SFB, int* __restrict__ m_indices, const __grid_constant__ CUtensorMap C_tma, unsigned int shape_m, unsigned int shape_n, unsigned int grid_n, unsigned int k_tiles, unsigned int sfa_row_stride, unsigned int sfa_col_stride, unsigned int sfb_group_stride, unsigned int sfb_row_stride, unsigned int sfb_col_stride)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -253,8 +253,19 @@ kernel_cake_grouped_fp8_gemm_c07e400950f10afa30b2(const __grid_constant__ CUtens
     const int smem_sfb_addr = smem + 50688;
     __nv_bfloat16* epi_staging = reinterpret_cast<__nv_bfloat16*>(smem_raw + 203776);
     const int epi_staging_addr = smem + 203776;
+    int* lead_table = reinterpret_cast<int*>(smem_raw + 220160);
+    const int lead_table_addr = smem + 220160;
 
     // Kernel setup ops
+    unsigned int lt_m_blocks = (shape_m + 128 - 1) / 128;
+    unsigned int lt_total_tiles = lt_m_blocks * grid_n;
+    unsigned int lt_pairs_per_l2 = lt_m_blocks * 16;
+    unsigned int lt_tile = (unsigned int)bid + (unsigned int)(warp * 32 + lane) * (unsigned int)num_bids;
+    unsigned int lt_safe = ((lt_tile < lt_total_tiles) ? lt_tile : (unsigned int)bid);
+    unsigned int lt_in_l2 = lt_safe % lt_pairs_per_l2;
+    unsigned int lt_remaining_n = grid_n - lt_safe / lt_pairs_per_l2 * 16;
+    unsigned int lt_n_in_l2 = ((lt_remaining_n > 16) ? (unsigned int)16 : lt_remaining_n);
+    int lt_lead = m_indices[lt_in_l2 / lt_n_in_l2 * 128];
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&A))) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&A64))) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&A32))) : "memory");
@@ -302,6 +313,7 @@ kernel_cake_grouped_fp8_gemm_c07e400950f10afa30b2(const __grid_constant__ CUtens
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
     }
 
+    lead_table[warp * 32 + lane] = ((lt_tile < lt_total_tiles) ? lt_lead : -1);
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
@@ -321,6 +333,8 @@ kernel_cake_grouped_fp8_gemm_c07e400950f10afa30b2(const __grid_constant__ CUtens
             unsigned int total_tiles = m_blocks * grid_n;
             unsigned int pairs_per_l2 = m_blocks * 16;
             unsigned int n_l2_limit = (unsigned int)16;
+            unsigned int trip = (unsigned int)0;
+            int lead = -1;
             unsigned int _phase_mainloop_done = 0;
             #pragma unroll 1
             for (unsigned int tile_idx = worker_idx; tile_idx < total_tiles; tile_idx += num_workers) {
@@ -333,8 +347,11 @@ kernel_cake_grouped_fp8_gemm_c07e400950f10afa30b2(const __grid_constant__ CUtens
                 unsigned int n_block = first_n + in_l2 % n_in_l2;
                 unsigned int off_m = m_block * 128;
                 unsigned int off_n = n_block * 256;
+                unsigned int slot = ((trip < 224) ? trip : (unsigned int)223);
+                lead = ((trip < 224) ? lead_table[slot] : m_indices[off_m]);
+                trip = trip + 1;
                 unsigned int last_row = shape_m - 1;
-                int group = m_indices[off_m];
+                int group = lead;
                 if (group >= 0) {
                     unsigned int nsub = (unsigned int)1;
                     unsigned int srow_1_9 = off_m + 32;
@@ -431,6 +448,8 @@ kernel_cake_grouped_fp8_gemm_c07e400950f10afa30b2(const __grid_constant__ CUtens
             unsigned int total_tiles_1 = m_blocks_1 * grid_n;
             unsigned int pairs_per_l2_1 = m_blocks_1 * 16;
             unsigned int n_l2_limit_1 = (unsigned int)16;
+            unsigned int trip_1 = (unsigned int)0;
+            int lead_1 = -1;
             unsigned int _phase_epilogue_done = 1;
             unsigned int _phase_tma_full = 0;
             #pragma unroll 1
@@ -442,8 +461,11 @@ kernel_cake_grouped_fp8_gemm_c07e400950f10afa30b2(const __grid_constant__ CUtens
                 unsigned int n_in_l2_1 = ((remaining_n_1 > n_l2_limit_1) ? n_l2_limit_1 : remaining_n_1);
                 unsigned int m_block_1 = in_l2_1 / n_in_l2_1;
                 unsigned int off_m_1 = m_block_1 * 128;
+                unsigned int slot_1 = ((trip_1 < 224) ? trip_1 : (unsigned int)223);
+                lead_1 = ((trip_1 < 224) ? lead_table[slot_1] : m_indices[off_m_1]);
+                trip_1 = trip_1 + 1;
                 unsigned int last_row_1 = shape_m - 1;
-                int group_1 = m_indices[off_m_1];
+                int group_1 = lead_1;
                 if (group_1 >= 0) {
                     unsigned int nsub_1 = (unsigned int)1;
                     unsigned int srow_1_6 = off_m_1 + 32;
@@ -515,6 +537,8 @@ kernel_cake_grouped_fp8_gemm_c07e400950f10afa30b2(const __grid_constant__ CUtens
             unsigned int total_tiles_2 = m_blocks_2 * grid_n;
             unsigned int pairs_per_l2_2 = m_blocks_2 * 16;
             unsigned int n_l2_limit_2 = (unsigned int)16;
+            unsigned int trip_2 = (unsigned int)0;
+            int lead_2 = -1;
             unsigned int _phase_tma_free = 1;
             #pragma unroll 1
             for (unsigned int tile_idx_2 = worker_idx_2; tile_idx_2 < total_tiles_2; tile_idx_2 += num_workers_2) {
@@ -527,8 +551,11 @@ kernel_cake_grouped_fp8_gemm_c07e400950f10afa30b2(const __grid_constant__ CUtens
                 unsigned int n_block_1 = first_n_2 + in_l2_2 % n_in_l2_2;
                 unsigned int off_m_2 = m_block_2 * 128;
                 unsigned int off_n_1 = n_block_1 * 256;
+                unsigned int slot_2 = ((trip_2 < 224) ? trip_2 : (unsigned int)223);
+                lead_2 = ((trip_2 < 224) ? lead_table[slot_2] : m_indices[off_m_2]);
+                trip_2 = trip_2 + 1;
                 unsigned int last_row_2 = shape_m - 1;
-                int group_2 = m_indices[off_m_2];
+                int group_2 = lead_2;
                 if (group_2 >= 0) {
                     unsigned int nsub_2 = (unsigned int)1;
                     unsigned int srow_1_0 = off_m_2 + 32;
@@ -605,6 +632,8 @@ kernel_cake_grouped_fp8_gemm_c07e400950f10afa30b2(const __grid_constant__ CUtens
             unsigned int n_l2_limit_3 = (unsigned int)16;
             unsigned int last_row_3 = shape_m - 1;
             unsigned int last_sfb_block = shape_n / 128 - 1;
+            unsigned int trip_3 = (unsigned int)0;
+            int lead_3 = -1;
             unsigned int _phase_tma_free_1 = 1;
             #pragma unroll 1
             for (unsigned int tile_idx_3 = worker_idx_3; tile_idx_3 < total_tiles_3; tile_idx_3 += num_workers_3) {
@@ -617,8 +646,11 @@ kernel_cake_grouped_fp8_gemm_c07e400950f10afa30b2(const __grid_constant__ CUtens
                 unsigned int n_block_2 = first_n_3 + in_l2_3 % n_in_l2_3;
                 unsigned int off_m_3 = m_block_3 * 128;
                 unsigned int off_n_2 = n_block_2 * 256;
+                unsigned int slot_3 = ((trip_3 < 224) ? trip_3 : (unsigned int)223);
+                lead_3 = ((trip_3 < 224) ? lead_table[slot_3] : m_indices[off_m_3]);
+                trip_3 = trip_3 + 1;
                 unsigned int last_row_0 = shape_m - 1;
-                int group_3 = m_indices[off_m_3];
+                int group_3 = lead_3;
                 if (group_3 >= 0) {
                     unsigned int nsub_3 = (unsigned int)1;
                     unsigned int srow_1_3 = off_m_3 + 32;
