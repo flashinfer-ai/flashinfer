@@ -312,14 +312,15 @@ def test_snapshot_rejects_uncertain_overlap(snapshot_logging):
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("tensor_format", ["torch", "safetensors"])
+@pytest.mark.parametrize("start", [0, 3])
 def test_readonly_alias_gaps_are_zero(
-    snapshot_logging, monkeypatch, tmp_path, tensor_format
+    snapshot_logging, monkeypatch, tmp_path, tensor_format, start
 ):
     logging, _ = snapshot_logging
     if tensor_format == "safetensors":
         safetensors = pytest.importorskip("safetensors.torch")
     backing = torch.full((12,), 9876.0)
-    tensors = {"a": backing[:2], "b": backing[-2:]}
+    tensors = {"a": backing[start : start + 2], "b": backing[-2:]}
     plan = logging._graph_tensor_plan(tensors, [])
     with monkeypatch.context() as capture:
         capture.setattr(
@@ -329,7 +330,7 @@ def test_readonly_alias_gaps_are_zero(
         )
         staged, aliases = logging._stage_graph_tensor_plan(tensors, plan)
     # The readonly values must still be deferred until materialization.
-    backing[:2] = 1
+    backing[start : start + 2] = 1
     backing[-2:] = 2
     logging._save_dump_tensors(staged, tensor_format, tmp_path, "inputs", aliases)
     saved = (
@@ -339,10 +340,13 @@ def test_readonly_alias_gaps_are_zero(
     )
     base = saved[aliases["a"]["base"]]
     torch.testing.assert_close(
-        base, torch.tensor([1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0, 2.0])
+        base, torch.tensor([1.0, 1.0] + [0.0] * (8 - start) + [2.0, 2.0])
     )
     logging._restore_tensor_aliases(saved, aliases)
-    assert saved["b"].storage_offset() == 10
+    assert saved["a"].storage_offset() == 0
+    assert saved["b"].storage_offset() == 10 - start
+    torch.testing.assert_close(saved["a"], torch.ones(2))
+    torch.testing.assert_close(saved["b"], torch.full((2,), 2.0))
     assert (
         saved["a"].untyped_storage().data_ptr()
         == saved["b"].untyped_storage().data_ptr()
