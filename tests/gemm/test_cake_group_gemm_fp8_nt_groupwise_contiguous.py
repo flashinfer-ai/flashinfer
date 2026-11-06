@@ -97,6 +97,7 @@ BLOCK_SCALED_ONLY_TESTS = frozenset(
         "test_block_scaled_rejects_invalid_inputs",
         "test_block_scaled_route_rule_sm107a",
         "test_block_scaled_lead_prefetch_rule",
+        "test_block_scaled_lead_prefetch_rule_bounds",
         "test_block_scaled_block_n_routes_write_the_same_bits",
         "test_block_scaled_block_n_128_routes_cover_partial_scale_words",
         "test_block_scaled_lead_prefetch_writes_the_same_bits",
@@ -1230,8 +1231,8 @@ def test_block_scaled_route_rule_sm107a():
 
 def test_block_scaled_lead_prefetch_rule():
     """SM107a single-run layouts of at most two K blocks whose bounded valid blocks are at most four fifths of
-    the M blocks take the lead-prefetch program; longer K, other architectures, run32 layouts and unknown group
-    counts do not."""
+    the M blocks take the lead-prefetch program; few-row longer-K layouts, other architectures, run32 layouts and
+    unknown group counts do not."""
     from flashinfer.gemm.cake_grouped_fp8_gemm import bs_lead_prefetch
 
     # Qwen3.5-397B down (K 256), 1 / 32 tokens (512 experts): 128 / 384 routed rows bound, 509 / 511 M blocks.
@@ -1243,7 +1244,7 @@ def test_block_scaled_lead_prefetch_rule():
         assert not bs_lead_prefetch(
             m, 256, alignment=128, num_groups=None, arch="sm_107a"
         )
-        # K 512 (4 K blocks) and longer: never.
+        # K 512 (4 K blocks) and longer at under 160 routed rows per group: no.
         for k in (512, 2048, 4096):
             assert not bs_lead_prefetch(
                 m, k, alignment=128, num_groups=512, arch="sm_107a"
@@ -2374,6 +2375,66 @@ def test_block_scaled_rejects_invalid_inputs():
             m_indices,
             out=storage[1 : 1 + int(m_indices.numel()) * 256].view(-1, 256),
         )
+
+
+def _lpf_layout_m(rows_per_group, num_groups, alignment=128):
+    """The compact layout's M for ``rows_per_group * num_groups`` routed rows."""
+    return rows_per_group * num_groups + num_groups * (alignment - 1)
+
+
+def test_block_scaled_lead_prefetch_rule_bounds():
+    """At most two K blocks: at most 10 routed rows per group take the lead-prefetch program
+    whatever the share of valid blocks; more than two K blocks: at least 160 rows per group do."""
+    from flashinfer.gemm.cake_grouped_fp8_gemm import (
+        BS_LPF_LONG_K_MIN_ROWS,
+        BS_LPF_SHORT_K,
+        BS_LPF_SHORT_K_MAX_ROWS,
+        bs_lead_prefetch,
+    )
+
+    assert (BS_LPF_SHORT_K, BS_LPF_SHORT_K_MAX_ROWS, BS_LPF_LONG_K_MIN_ROWS) == (
+        256,
+        10,
+        160,
+    )
+    g = 512
+
+    def lpf(rows, k, num_groups=g, **kw):
+        return bs_lead_prefetch(
+            _lpf_layout_m(rows, num_groups),
+            k,
+            alignment=128,
+            num_groups=num_groups,
+            arch=kw.get("arch", "sm_107a"),
+        )
+
+    # Short K, 10 / 11 rows per group (K 256 / 257): 10 takes it, 11 keeps the
+    # valid-block bound, which these mostly-routed layouts miss; K 257 is long K.
+    assert lpf(10, 256) and not lpf(11, 256)
+    assert not lpf(10, 257) and not lpf(11, 257)
+    # Long K, 159 / 160 rows per group (K 257, 512, 4096): 160 takes it.
+    for k in (257, 512, 4096):
+        assert lpf(160, k) and not lpf(159, k)
+    # K 256 keeps the short-K rule at 160 rows per group.
+    assert not lpf(160, 256) and not lpf(159, 256)
+    # Off SM107a, run32 layouts and unknown group counts: never.
+    for rows, k in ((10, 256), (160, 512)):
+        assert not lpf(rows, k, arch="sm_103a")
+        m = _lpf_layout_m(rows, g)
+        assert not bs_lead_prefetch(
+            m, k, alignment=128, num_groups=None, arch="sm_107a"
+        )
+        assert not bs_lead_prefetch(
+            rows * g + g * 31, k, alignment=32, num_groups=g, arch="sm_107a"
+        )
+    # Qwen3.5-397B down (K 256, 512 experts, top-10) at 64 / 256 / 512 tokens:
+    # 640 / 2560 / 5120 routed rows (1.25 / 5 / 10 per group); gate_up (K 4096)
+    # at 8192 / 16384 tokens: 160 / 320 rows per group.
+    for routed in (640, 2560, 5120):
+        assert bs_lead_prefetch(
+            routed + g * 127, 256, alignment=128, num_groups=g, arch="sm_107a"
+        )
+    assert lpf(160, 4096) and lpf(320, 4096)
 
 
 # (group_counts, N, K, alignment): 128-row aligned layouts both single-run
