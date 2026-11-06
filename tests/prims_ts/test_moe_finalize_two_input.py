@@ -464,6 +464,13 @@ def test_finalize_leaves_rows_without_local_expert_unwritten(
     _finalize_module().trtllm_moe_run_finalize(gemm2_output, zeroed, *common, True)
     _finalize_module().trtllm_moe_run_finalize(gemm2_output, kept, *common, False)
 
+    rows = expanded.clamp(min=0).long()
+    combined = gemm2_output.float()
+    if second is not None:
+        combined = combined + second.float()
+    weights = expert_weights.float() * (expanded != -1)
+    expected = (weights.unsqueeze(-1) * combined[rows]).sum(1).to(torch.bfloat16)
+    torch.testing.assert_close(zeroed[~no_local], expected[~no_local], rtol=0, atol=0)
     assert torch.equal(zeroed[no_local], torch.zeros_like(zeroed[no_local]))
     assert torch.isnan(kept[no_local]).all()
     assert torch.equal(kept[~no_local], zeroed[~no_local])

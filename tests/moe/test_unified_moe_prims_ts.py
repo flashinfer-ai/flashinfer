@@ -513,8 +513,15 @@ class TestPrimsTsUnifiedGpu:
         out = layer(dataclasses.replace(act, output=buffer), weights)
         assert out.data_ptr() == buffer.data_ptr()
         torch.testing.assert_close(out, expected, rtol=0, atol=0)
-        with pytest.raises(ValueError, match="contiguous bfloat16"):
-            layer(dataclasses.replace(act, output=buffer[:, :128]), weights)
+        rows, hidden = buffer.shape
+        for invalid in (
+            buffer[:, :128],
+            buffer.new_empty((rows, 2 * hidden))[:, ::2],
+            buffer.cpu(),
+            buffer.new_empty(rows * hidden + 1)[1:].view(rows, hidden),
+        ):
+            with pytest.raises(ValueError, match="output must be a contiguous"):
+                layer(dataclasses.replace(act, output=invalid), weights)
 
     def test_tuning_pre_hook_binds_each_packs_static_extras(self):
         """Two packs on one runner: each pack's tuning pre-hook installs its own
