@@ -30,6 +30,7 @@ def _shim():
 class KimiK3MegaKernelBackend(MegaKernelBackend):
     """Own Kimi workspaces through the common MegaMoE lifecycle."""
 
+    _config: Sm100_KimiK3_MegaMoeConfig
     supports_output_view = True
 
     def __init__(self, config: Sm100_KimiK3_MegaMoeConfig) -> None:
