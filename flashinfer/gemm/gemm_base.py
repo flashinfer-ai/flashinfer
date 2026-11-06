@@ -56,7 +56,7 @@ from ..autotuner import (
     TunableRunner,
     TuningConfig,
     is_in_profile_measurement,
-    get_autotune_batch_invariant,
+    get_autotune_exclude_split_k,
 )
 from ..fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
@@ -7075,10 +7075,10 @@ def _mxfp8_low_m_fallback_split(
 
     1 on SM100/SM103, where the persistent default also accumulates K in one
     pass. On SM107 (``low_m_only``) the untuned pick splits K to fill the GPU,
-    except under batch-invariant autotuning, where tactic ``-1`` must reduce
-    in the same order as every tactic ``is_batch_invariant_tactic`` accepts.
+    except under exclude-split-K autotuning, where tactic ``-1`` must reduce
+    in the same order as every tactic ``is_split_free_tactic`` accepts.
     """
-    if not low_m_only or get_autotune_batch_invariant():
+    if not low_m_only or get_autotune_exclude_split_k():
         return 1
     return _sm107_low_m_split_k(
         m, n, real_k, ab_dtype, split_k_kernel_cls, get_device_sm_count(device)
@@ -7127,7 +7127,7 @@ def _cute_dsl_gemm_mxfp8_runner(
             _, _, _, _, _, out, _ = inputs
             return (str(out.dtype), enable_pdl)
 
-        def is_batch_invariant_tactic(self, tactic) -> bool:
+        def is_split_free_tactic(self, tactic) -> bool:
             # Every split_k == 1 tactic accumulates K in one pass per output
             # tile, in the same order as the fallback; split-K sums K slices
             # across CTAs and rounds differently. Under the mode the fallback
@@ -7557,7 +7557,7 @@ def _cute_dsl_warp_splitk_mxfp8_gemm_runner(enable_pdl: bool):
             _, _, _, _, _, out, _ = inputs
             return (str(out.dtype), enable_pdl)
 
-        def is_batch_invariant_tactic(self, tactic) -> bool:
+        def is_split_free_tactic(self, tactic) -> bool:
             # Every tactic, including the default, splits K across warps.
             return False
 
@@ -7656,9 +7656,9 @@ def _cute_dsl_mxfp8_runners(
     # Untuned, warp split-K runs first only while its 16-wide output tiles fit in
     # one wave. On wider N the cluster split-K default is faster in back-to-back
     # PDL calls, where its prologue overlaps the previous kernel (#6839).
-    # Batch-invariant autotuning needs a fallback that does not split K.
+    # Exclude-split-K autotuning needs a fallback that does not split K.
     if (
-        not get_autotune_batch_invariant()
+        not get_autotune_exclude_split_k()
         and warp.supports_inputs(inputs)
         and b.shape[1] // 16 <= get_device_sm_count(a.device)
     ):
@@ -7689,10 +7689,10 @@ def _cute_dsl_mxfp8_runners_sm107(
     warp_grid_fits = n // (32 if n % 32 == 0 else 16) <= 2 * get_device_sm_count(
         a.device
     )
-    # Batch-invariant autotuning needs a fallback that does not split K.
+    # Exclude-split-K autotuning needs a fallback that does not split K.
     if (
         warp is not None
-        and not get_autotune_batch_invariant()
+        and not get_autotune_exclude_split_k()
         and warp.supports_inputs(inputs)
         and m <= 8
         and k <= 2048
@@ -8818,7 +8818,7 @@ def _cutedsl_low_latency_blockscaled_gemm_runner(
                 bias_tensor is not None,
             )
 
-        def is_batch_invariant_tactic(self, tactic) -> bool:
+        def is_split_free_tactic(self, tactic) -> bool:
             # Only split_k > 1 changes the reduction order: each CTA of the
             # cluster accumulates its K share and the shares are summed in the
             # epilogue. cta_k and the stage counts regroup the same MMA
@@ -8867,7 +8867,7 @@ def _cutedsl_low_latency_blockscaled_gemm_runner(
                 # Untuned default: the first tactic that does not split K
                 # (the list is sorted so that it is also the nearest to the
                 # (4 * mma_k, 8 stages) default), so tactic -1 reduces K in
-                # the same order at every M (is_batch_invariant_tactic).
+                # the same order at every M (is_split_free_tactic).
                 tactic = next((t for t in tactics if t[3] == 1), None)
                 if tactic is None:
                     raise ValueError(

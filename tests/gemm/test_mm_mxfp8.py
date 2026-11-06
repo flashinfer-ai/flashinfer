@@ -184,21 +184,21 @@ def test_mm_mxfp8_cute_dsl_narrow_tiles_only_within_32_tokens():
     assert narrow and all(t[2] for t in narrow), narrow
 
 
-def _skip_if_batch_invariant_uncovered():
+def _skip_if_exclude_split_k_uncovered():
     # The bit-equality checks are validated on SM100/SM103. On SM107 the mode
     # keeps the low-M default from splitting K, but equality between the low-M
     # kernel and the SM107 wide-tile kernel across M buckets is not validated.
     if get_compute_capability(torch.device("cuda")) == (10, 7):
-        pytest.skip("batch-invariant bit-equality is not validated on SM107")
+        pytest.skip("exclude-split-K bit-equality is not validated on SM107")
 
 
-def test_mm_mxfp8_low_m_fallback_split_under_batch_invariant_mode(monkeypatch):
+def test_mm_mxfp8_low_m_fallback_split_under_exclude_split_k_mode(monkeypatch):
     """The untuned low-M default splits K only on SM107 (``low_m_only``) and
-    only while batch-invariant autotuning is off; under the mode tactic -1
-    reduces K in one pass, as ``is_batch_invariant_tactic(-1)`` promises."""
+    only while exclude-split-K autotuning is off; under the mode tactic -1
+    reduces K in one pass, as ``is_split_free_tactic(-1)`` promises."""
     from flashinfer.autotuner import (
-        get_autotune_batch_invariant,
-        set_autotune_batch_invariant,
+        get_autotune_exclude_split_k,
+        set_autotune_exclude_split_k,
     )
 
     class Kernel:
@@ -216,33 +216,33 @@ def test_mm_mxfp8_low_m_fallback_split_under_batch_invariant_mode(monkeypatch):
     monkeypatch.setattr(gemm_base, "get_device_sm_count", lambda device: 148)
     # tile_k 128, 16 N tiles: 4 slices fill 64 of 111 CTAs with 16 K blocks each.
     args = (8, 2048, 8192, Dtype, Kernel, torch.device("cpu"))
-    saved = get_autotune_batch_invariant()
+    saved = get_autotune_exclude_split_k()
     try:
-        set_autotune_batch_invariant(False)
+        set_autotune_exclude_split_k(False)
         assert gemm_base._mxfp8_low_m_fallback_split(False, *args) == 1
         assert gemm_base._mxfp8_low_m_fallback_split(True, *args) == 4
-        set_autotune_batch_invariant(True)
+        set_autotune_exclude_split_k(True)
         assert gemm_base._mxfp8_low_m_fallback_split(False, *args) == 1
         assert gemm_base._mxfp8_low_m_fallback_split(True, *args) == 1
     finally:
-        set_autotune_batch_invariant(saved)
+        set_autotune_exclude_split_k(saved)
 
 
-def test_mm_mxfp8_cute_dsl_batch_invariant_tactics():
+def test_mm_mxfp8_cute_dsl_split_free_tactics():
     """Split-K tactics (offered only for M <= 32) are the cute-dsl runner's only
-    batch-variant ones; JSON-loaded (list) tactics are classified the same."""
+    non-split-free ones; JSON-loaded (list) tactics are classified the same."""
     _skip_if_unsupported("cute-dsl")
     for m in (1, 8, 27, 32, 128):
         tactics = _mxfp8_cute_dsl_tactics(m, 6144, k=6144)
         runner = gemm_base._cute_dsl_gemm_mxfp8_runner(
             *get_compute_capability(torch.device("cuda")), True, torch.bfloat16
         )
-        assert runner.is_batch_invariant_tactic(-1)
+        assert runner.is_split_free_tactic(-1)
         for t in tactics:
             expected = t[4] == 1
-            assert runner.is_batch_invariant_tactic(t) is expected, t
+            assert runner.is_split_free_tactic(t) is expected, t
             assert (
-                runner.is_batch_invariant_tactic([list(t[0]), list(t[1]), *t[2:]])
+                runner.is_split_free_tactic([list(t[0]), list(t[1]), *t[2:]])
                 is expected
             )
         if m <= 32:
@@ -250,16 +250,16 @@ def test_mm_mxfp8_cute_dsl_batch_invariant_tactics():
 
 
 @pytest.mark.parametrize("k,n", [(6144, 2048), (2048, 2048), (6144, 6144)])
-def test_mm_mxfp8_cute_dsl_batch_invariant_untuned_default(k, n):
+def test_mm_mxfp8_cute_dsl_exclude_split_k_untuned_default(k, n):
     """Without any tuning, the mode makes runners[0] (the untuned default) a
     runner whose fallback does not split K, so small-M rows match large-M rows."""
     from flashinfer.autotuner import (
-        get_autotune_batch_invariant,
-        set_autotune_batch_invariant,
+        get_autotune_exclude_split_k,
+        set_autotune_exclude_split_k,
     )
 
     _skip_if_unsupported("cute-dsl")
-    _skip_if_batch_invariant_uncovered()
+    _skip_if_exclude_split_k_uncovered()
     major, minor = get_compute_capability(torch.device("cuda"))
     torch.manual_seed(0)
     x = torch.randn(4096, k, device="cuda")
@@ -282,32 +282,32 @@ def test_mm_mxfp8_cute_dsl_batch_invariant_untuned_default(k, n):
             major, minor, True, torch.bfloat16, inputs
         )[0]
 
-    saved = get_autotune_batch_invariant()
+    saved = get_autotune_exclude_split_k()
     AutoTuner.get().clear_cache()
     try:
-        set_autotune_batch_invariant(True)
+        set_autotune_exclude_split_k(True)
         for m in (1, 5, 8, 13, 27, 32):
-            assert default_runner(m).is_batch_invariant_tactic(-1), m
+            assert default_runner(m).is_split_free_tactic(-1), m
         large = run(4096)
         for m in (1, 5, 8, 13, 27, 32):
             assert torch.equal(run(m), large[:m]), m
     finally:
-        set_autotune_batch_invariant(saved)
+        set_autotune_exclude_split_k(saved)
         AutoTuner.get().clear_cache()
 
 
 @pytest.mark.parametrize("k,n", [(6144, 6144), (6144, 2048)])
-def test_mm_mxfp8_cute_dsl_batch_invariant_autotune(k, n):
-    """Under batch-invariant autotuning, rows computed in a small-M call (a
+def test_mm_mxfp8_cute_dsl_exclude_split_k_autotune(k, n):
+    """Under exclude-split-K autotuning, rows computed in a small-M call (a
     prefix-cache extend) are bit-identical to the same rows inside a large-M
     call, whichever tactics the tuner picked."""
     from flashinfer.autotuner import (
-        get_autotune_batch_invariant,
-        set_autotune_batch_invariant,
+        get_autotune_exclude_split_k,
+        set_autotune_exclude_split_k,
     )
 
     _skip_if_unsupported("cute-dsl")
-    _skip_if_batch_invariant_uncovered()
+    _skip_if_exclude_split_k_uncovered()
     torch.manual_seed(0)
     x = torch.randn(4096, k, device="cuda")
     x = (x * torch.exp(1.5 * torch.randn(k, device="cuda"))).to(torch.bfloat16)
@@ -318,8 +318,8 @@ def test_mm_mxfp8_cute_dsl_batch_invariant_autotune(k, n):
         a_q, a_s = mxfp8_quantize(x[:m].contiguous(), is_sf_swizzled_layout=True)
         return mm_mxfp8(a_q, w_q.T, a_s, w_s, backend="cute-dsl")
 
-    saved = get_autotune_batch_invariant()
-    set_autotune_batch_invariant(True)
+    saved = get_autotune_exclude_split_k()
+    set_autotune_exclude_split_k(True)
     AutoTuner.get().clear_cache()
     try:
         with autotune(True, tuning_buckets=(8, 16, 32, 4096), round_up=True):
@@ -328,7 +328,7 @@ def test_mm_mxfp8_cute_dsl_batch_invariant_autotune(k, n):
             for m in (1, 5, 13, 27, 32):
                 assert torch.equal(run(m), large[:m]), m
     finally:
-        set_autotune_batch_invariant(saved)
+        set_autotune_exclude_split_k(saved)
         AutoTuner.get().clear_cache()
 
 
