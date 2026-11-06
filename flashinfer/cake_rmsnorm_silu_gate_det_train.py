@@ -31,6 +31,19 @@ return the same bits.  The autograd function saves only its inputs, which keeps
 ``torch.utils.checkpoint(..., use_reentrant=False)`` free of FP32 temporaries.
 No call synchronizes the host or the device; ``T`` and ``H`` are runtime values.
 
+The forward runs one of several fixed-order modules, chosen from the row count
+and the device's SM count: a short forward up to 12 rows per SM (59 on SM107),
+the plain forward, and from 976 rows per SM (800 on SM107) persistent forwards
+whose CTAs each walk a few row blocks.  Every module computes a row with the
+same FP32 operations in the same order, so ``y`` is the same bits on every
+route, and the backward reads only the upstream gradient, ``x``, ``z`` and
+``weight``.  No module waits for another CTA or grid.  Beside a kernel on
+another stream that holds ``k`` of the ``N`` SMs, a persistent forward takes
+at most ``N / (N - k)`` times its time alone, plus the share of one CTA's row
+blocks in the call, plus 0.02 (a CTA whose slot that kernel holds walks all of
+its blocks once it starts); the short forward ends no later than the plain
+forward beside the same kernel, within 2 % or 1.5 microseconds.
+
 Mode and dispatch rules (the same in
 :mod:`flashinfer.cake_rmsnorm_silu_gate_det_train` and
 :mod:`flashinfer.cake_rmsnorm_silu_gate_nondet_train`):

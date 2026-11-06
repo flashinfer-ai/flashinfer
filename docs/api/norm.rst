@@ -143,7 +143,14 @@ backward for training on SM100, SM103 and SM107: rows of 128 (``[T, H, 128]``
 or ``[T * H, 128]``) normalized per head with FP32 statistics and gate, BF16
 inputs, outputs and gradients, a weight shared by every token and head whose
 gradient is summed in a fixed order (repeated calls return the same bits), and
-an autograd wrapper that saves only its inputs.
+an autograd wrapper that saves only its inputs.  The forward runs one of several
+fixed-order modules chosen from the row count and the SM count (a short forward
+up to 12 rows per SM, 59 on SM107; from 976 rows per SM, 800 on SM107,
+persistent forwards whose CTAs each walk a few row blocks); every module returns
+the same bits.  Beside a kernel on another stream that holds ``k`` of the ``N``
+SMs, a persistent forward takes at most ``N / (N - k)`` times its time alone,
+plus one CTA's share of the row blocks, plus 0.02, and the short forward ends
+no later than the plain forward (within 2 % or 1.5 microseconds).
 
 .. rubric:: Mode and dispatch rules
 
