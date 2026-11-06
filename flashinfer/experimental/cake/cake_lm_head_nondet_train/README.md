@@ -34,7 +34,7 @@ takes a `deterministic` keyword, and passing one is Python's own `TypeError`.
 | `loss`, `logp`, `lse` | fixed order, bitwise run to run | fixed order, bitwise run to run (the same programs) |
 | zero-weight policy rows (`loss_weights == 0`) | in the chunk loop | left out of the gradient path (see "Zero-weight policy rows") |
 | log-probability rows with `dlogp == 0` | in the chunk loop | ordered last; the backward's GEMMs skip their work (see "Zero-gradient rows of the log-probability backward") |
-| `dW` | chunk order, bitwise run to run | chunk order, bitwise run to run (the same programs) |
+| `dW` | chunk order, bitwise run to run | chunk order (the same programs); no run-to-run promise |
 | `dX` of a K-sliced chunk | slice 0 stored, slices `>= 1` in FP32 slabs added in slab order | one launch per chunk adds every slice into the `-0.0`-filled FP32 accumulator rows in an unordered FP32 reduction; a one-slice chunk stores its rows as the deterministic package does |
 | precision boundaries | BF16 logits and `dlogits`, FP32 loss arithmetic, FP32 `dX` / `dW` accumulation, one final cast each | the same |
 | under `torch.use_deterministic_algorithms(True)` | runs, never alerts | raises PyTorch's alert before a K-sliced dX launch (below); with `warn_only=True` it warns and runs this package; nothing falls back to the deterministic package |
@@ -524,9 +524,15 @@ names are gone: importing them fails, and no alias is left.
 | `cake_backend.chunked_lm_head_{loss,logprob,logprob_temperature,logprob_keep}`, the same three in `cake_backend_opt_in` | `cake_lm_head_nondet_train_{loss,logprob,logprob_temperature,logprob_keep}` |
 | `cake_backend_opt_in.preload` | `cake_backend_opt_in.cake_lm_head_nondet_train_preload` |
 | `cake_support.chunked_lm_head_support_{logprob,kl}` | `cake_support.cake_lm_head_nondet_train_support_{logprob,kl}` |
-| `ChunkedLmHead{Loss,Logprob,LogprobTemperature,LogprobKeep}Function` (both backend modules) | `CakeLMHeadNondet{Loss,Logprob,LogprobTemperature,LogprobKeep}Function` |
+| `ChunkedLmHead{Loss,Logprob,LogprobTemperature}Function` (both backend modules), `cake_backend.ChunkedLmHeadLogprobKeepFunction` | `CakeLMHeadNondet{Loss,Logprob,LogprobTemperature}Function` (both backend modules), `cake_backend.CakeLMHeadNondetLogprobKeepFunction` |
 | `cake_support.SupportLogprobFunction` | `cake_support.CakeLMHeadNondetSupportFunction` |
 | the `deterministic` keyword of every entry and position of every autograd `Function` | removed |
+
+`cake_support.__all__` lists the two support entries, their autograd class and
+the constants of their contract; its helpers (`SupportReferenceEngine`,
+`SupportRows`, `decode_support_error`, `describe_support_error`,
+`support_error_word`, `support_memory_report`, `support_program_available`,
+`validate_support_inputs`) stay module attributes.
 
 Unchanged: the internal helpers (`prepare_lm_head_loss`,
 `prepare_lm_head_loss_temperature`, `LmHeadLossRunner`,
