@@ -261,13 +261,16 @@ tail runs on the caller's stream.
 ## Speed against the deterministic package
 
 `benchmarks/bench_cake_gdn_nondet_train.py` times this package against
-`flashinfer.experimental.cake.cake_gdn_det_train` on its rows, packs, head pairs
+`flashinfer.experimental.cake.cake_gdn_det_train` (both package entries, no
+facade) on its rows, packs, head pairs
 and group shapes (ABBA order, CUDA events, the L2 flushed before every call),
 prints the stages each backward launched, and lists at the end every shape and
 boundary where this package is slower than the other arm by more than the sum
 of the two spreads.  Backward time of the deterministic package over this
 package's (above 1: this package is faster; the median over 12 ABBA groups of
-the two packages' time ratio inside a group, for the cells whose groups agree):
+the two packages' time ratio inside a group, for the cells whose groups agree).
+All figures in this section were measured before the rename of FlashInfer
+#8928, with the same programs and tables:
 
 | shapes | what this package runs differently | B200 | GB300 |
 |---|---|---|---|
@@ -286,8 +289,9 @@ step (two forwards and the backward) 1.07 (without `(4, 12)`, `(2, 6)`) and 1.03
 deterministic package beyond the sum of the two spreads only in the forward of `g4_16x4096_h4` (0.997) and the forward of `r03_8x4096_h8` (0.995) on B200.  The rows that run the same programs measure down to
 0.989 (`(1, 3)`, GB300) in the backward, and the forward of every
 shape down to 0.991 (`(2, 6)`, GB300): small calls whose issue time
-is about their device time, where the entry's argument and option checks
-(about 0.5 us a call) and the backward's tail rule show.
+is about their device time, where the entry's mode check and option checks
+(about 0.5 us a call; the rename removed the mode check) and the backward's
+tail rule show.
 
 ## Plan pins (keyword-only)
 

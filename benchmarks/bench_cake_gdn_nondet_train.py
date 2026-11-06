@@ -14,9 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Benchmark of the Cake GDN (Gated DeltaNet) training step on one GPU: the deterministic package
-(``flashinfer.cake_gdn_det_train.cake_gdn_det``, bitwise run to run) against the non-deterministic one
-(``flashinfer.cake_gdn_nondet_train.cake_gdn_nondet``).  Both take FLA's ``chunk_gated_delta_rule`` signature; every
-call is a packed
+(``flashinfer.experimental.cake.cake_gdn_det_train.cake_gdn_det``, bitwise run to run) against the non-deterministic
+one (``flashinfer.experimental.cake.cake_gdn_nondet_train.cake_gdn_nondet``).  Every arm calls a package entry
+directly, not a facade (``flashinfer.cake_gdn_det_train`` / ``flashinfer.cake_gdn_nondet_train``), so all arms
+share one call boundary.  Both take FLA's ``chunk_gated_delta_rule`` signature; every call is a packed
 variable-length batch (``B = 1``, ``cu_seqlens`` on the device and ``cu_seqlens_cpu`` on the host: the host-table
 route), head dimension 128, ``use_qk_l2norm_in_kernel=True``.
 
@@ -247,14 +248,14 @@ def _load_package_dir(path: str) -> Any:
 def _entry(arm: str) -> Callable[..., Any]:
     """The GDN entry point of an arm, the package imported on first use (``--list`` needs no GPU and no package)."""
     if arm == "det":
-        from flashinfer.cake_gdn_det_train import cake_gdn_det
+        from flashinfer.experimental.cake.cake_gdn_det_train import cake_gdn_det
 
         return cake_gdn_det
     if arm == "det_dir":
         if DET_DIR is None:
             raise SystemExit("the det_dir arm needs --det-dir")
         return _load_package_dir(DET_DIR).cake_gdn_det
-    from flashinfer.cake_gdn_nondet_train import cake_gdn_nondet
+    from flashinfer.experimental.cake.cake_gdn_nondet_train import cake_gdn_nondet
 
     pins = PIN_ARMS.get(arm, {})
     return functools.partial(cake_gdn_nondet, **pins)
