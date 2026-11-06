@@ -39,7 +39,7 @@ PACKAGES: dict[str, str] = {
     # ``cake_moe_grouped_gemm`` stays the det package's compatibility key above
     "cake.cake_moe_grouped_gemm": "flashinfer.experimental.cake.cake_moe_grouped_gemm",
     "cake_mok_bf16": "flashinfer.experimental.cake_mok_bf16",
-    "cake_kda_det_train": "flashinfer.experimental.cake_kda_det_train",
+    "cake.cake_kda_det_train": "flashinfer.experimental.cake.cake_kda_det_train",
     # the non-deterministic package (deterministic=False); its key carries the namespace
     "cake.cake_kda_train": "flashinfer.experimental.cake.cake_kda_train",
     "cake_kda_det_train_kcp": "flashinfer.experimental.cake_kda_det_train_kcp",
