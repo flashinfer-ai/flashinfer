@@ -205,7 +205,7 @@ from metadata only, allocates the outputs and the saved set fresh per call and
 keeps only transient buffers in the workspace.  The kernels are launched
 through a dispatch table (:class:`Backend`): the shipped backend runs the
 exported programs of :mod:`.cake_kcp_jit` and the local chunk stages through
-:mod:`..cake_kda_det_train.cake_backend`; a test may install another backend (an FP64 emulation of
+:mod:`..cake.cake_kda_det_train.cake_backend`; a test may install another backend (an FP64 emulation of
 the same ABI) for the orchestration tests.
 
 Semantics and contracts follow the KCP design note (its sections 3.5, 3.6, 6.4,
@@ -715,7 +715,7 @@ class Backend:
     ``run(name, args)`` launches program ``name`` (one of :data:`KCP_PROGRAMS`) with the logical arguments ``args``
     (the ABI vocabulary of the design note §14: pools, index tables, ``hg`` / ``n`` addressing scalars, modes; plus
     ``_call``, the :class:`CallDetKcp` the launch belongs to).  ``stage(name, call, **extra)`` launches one local chunk
-    stage of :mod:`..cake_kda_det_train.cake_backend` at the per-rank shape.  ``dtypes`` are the storage dtypes of the operands, outputs
+    stage of :mod:`..cake.cake_kda_det_train.cake_backend` at the per-rank shape.  ``dtypes`` are the storage dtypes of the operands, outputs
     and states; ``local_stages`` says whether the local stages exist (the FP64 emulation folds them into its tape
     programs).  The shipped backend is :class:`KernelBackend`; tests install another with :func:`set_backend`.
     """

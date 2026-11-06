@@ -1405,7 +1405,11 @@ def test_autograd_records_the_forward_mode() -> None:
     want = {}
     for mode, fwd, bwd in (
         (False, cake_backend.chunk_kda_fwd, cake_backend.chunk_kda_bwd),
-        (True, det_backend.cake_kda_det_train_forward, det_backend.cake_kda_det_train_backward),
+        (
+            True,
+            det_backend.cake_kda_det_train_forward,
+            det_backend.cake_kda_det_train_backward,
+        ),
     ):
         extra = {} if mode else {"deterministic": False}
         _, saved = fwd(q, k, v, g, beta, cu, scale=facade.DEFAULT_SCALE, **extra)
