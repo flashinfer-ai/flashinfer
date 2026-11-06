@@ -1169,7 +1169,9 @@ class Sm90W8A16Fp8GemmKernel:
                 a_words[kb + 2] = self._a_loads(kb + 2, stage_addr, a_unit_off)
             if cutlass.const_expr(kb + 1 < num_k_blocks):
                 self._a_convert(tCrA_mma, kb + 1, a_words[kb + 1])
-        warpgroup.fence()
+                # wgmma.fence between the register write and the wgmma that
+                # reads it as A (PTX ISA); ptxas emits the arrive regardless.
+                warpgroup.fence()
 
         # Steady state: the wgmma of k-block kb issued, at most k_wait_max groups
         # pending, then the previous stage is released at the last k-block (all
@@ -1207,7 +1209,7 @@ class Sm90W8A16Fp8GemmKernel:
                     a_words_k[kb + 2] = self._a_loads(kb + 2, stage_addr_k, a_unit_off)
                 if cutlass.const_expr(kb + 1 < num_k_blocks):
                     self._a_convert(tCrA_mma, kb + 1, a_words_k[kb + 1])
-            warpgroup.fence()
+                    warpgroup.fence()
         return read_state, release_state
 
     # ---------------------------------------------------------- tail fix-up
