@@ -82,6 +82,43 @@ def test_config_and_registry_are_fixed_and_copy_knobs():
     assert kernel._config.knobs["mma_tiler_mnk"][0] == 128
 
 
+@pytest.mark.parametrize("quant_kind", ["nvfp4", "mxfp4_mxfp8"])
+def test_k3_and_k31_pro_checkpoint_fields_use_routed_geometry(quant_kind, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    text_config = {
+        "hidden_size": 7168,
+        "routed_expert_hidden_size": 3584,
+        "num_experts": 896,
+        "moe_intermediate_size": 3072,
+        "num_experts_per_token": 16,
+        "hidden_act": "situ",
+        "activation_situ_beta": 4.0,
+        "activation_situ_linear_beta": 25.0,
+    }
+    config = moe_ep.Sm100_KimiK3_MegaMoeConfig(
+        intermediate_size=text_config["moe_intermediate_size"],
+        top_k=text_config["num_experts_per_token"],
+        activation=text_config["hidden_act"],
+        situ_beta=text_config["activation_situ_beta"],
+        situ_linear_beta=text_config["activation_situ_linear_beta"],
+        quant_kind=quant_kind,
+    )
+    fleet = moe_ep.FleetParams(
+        num_experts=text_config["num_experts"],
+        token_hidden_size=text_config["routed_expert_hidden_size"],
+        max_tokens_per_rank=256,
+    )
+    bootstrap = moe_ep.BootstrapConfig(world_size=8, rank=0, auto_bootstrap=False)
+    kernel = create_mega_kernel(config)
+    kernel.validate_init(bootstrap, fleet)
+    assert (kernel._config.situ_beta, kernel._config.situ_linear_beta) == (4.0, 25.0)
+    with pytest.raises(MoEEpConfigError, match="token_hidden_size=3584"):
+        kernel.validate_init(
+            bootstrap, replace(fleet, token_hidden_size=text_config["hidden_size"])
+        )
+
+
 @pytest.mark.parametrize(
     "world,options,message",
     [

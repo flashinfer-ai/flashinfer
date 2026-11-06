@@ -1,9 +1,9 @@
-Kimi K3 MegaMoE
-==============
+Kimi K3-family MegaMoE
+=====================
 
-``Sm100_KimiK3_MegaMoeConfig`` selects an isolated Kimi K3 provider through
+``Sm100_KimiK3_MegaMoeConfig`` selects an isolated Kimi K3-family provider through
 :class:`flashinfer.moe_ep.MoEEpMegaLayer`. It supports SM100/SM103, 896 experts,
-hidden size 3584, intermediate size 3072, top-16 routing, and EP sizes 1, 8,
+routed hidden size 3584, intermediate size 3072, top-16 routing, and EP sizes 1, 8,
 or 16. Each rank owns a contiguous range of experts.
 
 All EP ranks must share one NVLink domain. Across GB300 nodes, the container
@@ -16,35 +16,114 @@ or MXFP4 weights with MXFP8 activations (``quant_kind="mxfp4_mxfp8"``).
 Both paths produce BF16 output. ``combine_dtype`` selects BF16 or MXFP8
 communication. SiTU and late routing weights are required.
 
+Kimi K3 and K3.1 Pro
+-------------------
+
+The published `Kimi K3 config <https://huggingface.co/moonshotai/Kimi-K3/blob/f831ab66814297da540d832a5235f8e904f29d06/config.json>`_
+and `Kimi K3.1 Pro config <https://huggingface.co/moonshotai/Kimi-K3.1-Pro/blob/d9e99b0792a5e93b78ea9bea62a68167e36ddd9e/config.json>`_
+share this routed MoE contract. Both use the same config class and selector;
+there is no model-name switch. Map fields from each checkpoint's
+``text_config`` and retain its own weights, routes and calibration.
+
+.. list-table:: Checkpoint fields used by the routed kernel
+   :header-rows: 1
+
+   * - Checkpoint field
+     - API field
+     - Both models
+   * - ``num_experts``
+     - ``FleetParams.num_experts``
+     - 896
+   * - ``routed_expert_hidden_size``
+     - ``FleetParams.token_hidden_size``
+     - 3584
+   * - ``moe_intermediate_size``
+     - ``intermediate_size``
+     - 3072
+   * - ``num_experts_per_token``
+     - ``top_k``
+     - 16
+   * - ``hidden_act``
+     - ``activation``
+     - ``situ``
+   * - ``activation_situ_beta`` / ``activation_situ_linear_beta``
+     - ``situ_beta`` / ``situ_linear_beta``
+     - 4.0 / 25.0
+
+Use ``routed_expert_hidden_size``, not the full model ``hidden_size=7168``.
+The API validates the routed dimensions and rejects a 7168-wide fleet.
+The framework still owns routing, the 7168-to-3584 input projection, the
+RMSNorm after routed MoE, the 3584-to-7168 output projection, and the two
+shared experts. ``topk_weights`` must already include the model's selected-score
+normalization and routed scaling factor. Apply these weights only once,
+after expert computation, as the kernel does by default.
+
+The following application helper uses the existing API. ``bootstrap``
+identifies the EP group and local CUDA device. ``local_weights`` is a canonical
+:class:`flashinfer.moe_ep.MoEWeightPack` for this rank's routed experts.
+Checkpoint loading and packing remain the caller's work.
+
 .. code-block:: python
 
    from flashinfer import moe_ep
 
-   config = moe_ep.Sm100_KimiK3_MegaMoeConfig(
-       quant_kind="mxfp4_mxfp8",
-       combine_dtype="bf16",
-       situ_beta=4.0,
-       situ_linear_beta=25.0,
+   def make_routed_layer(text, local_weights, bootstrap, capacity,
+                         *, quant_kind="mxfp4_mxfp8", **calibration):
+       config = moe_ep.Sm100_KimiK3_MegaMoeConfig(
+           intermediate_size=text["moe_intermediate_size"],
+           top_k=text["num_experts_per_token"],
+           activation=text["hidden_act"],
+           situ_beta=text["activation_situ_beta"],
+           situ_linear_beta=text["activation_situ_linear_beta"],
+           quant_kind=quant_kind,
+           combine_dtype="bf16",
+           **calibration,
+       )
+       return moe_ep.MoEEpMegaLayer(
+           bootstrap=bootstrap,
+           fleet_params=moe_ep.FleetParams(
+               num_experts=text["num_experts"],
+               token_hidden_size=text["routed_expert_hidden_size"],
+               max_tokens_per_rank=capacity,
+           ),
+           weights=local_weights,
+           backend=moe_ep.MegaConfig(megakernel=config, quantize_input=True),
+       )
+
+Both published checkpoints use MXFP4 routed weights; this example selects
+MXFP8 activations. The two model integrations differ only in the checkpoint
+config and weights they supply:
+
+.. code-block:: python
+
+   # Kimi K3
+   k3_layer = make_routed_layer(
+       k3_config["text_config"], k3_local_weights, bootstrap, capacity=256,
    )
-   layer = moe_ep.MoEEpMegaLayer(
-       bootstrap=moe_ep.BootstrapConfig(
-           world_size=ep_world_size,
-           rank=ep_rank,
-           process_group=ep_group,
-           device=local_cuda_device_index,
-       ),
-       fleet_params=moe_ep.FleetParams(
-           num_experts=896,
-           token_hidden_size=3584,
-           max_tokens_per_rank=256,
-       ),
-       weights=canonical_weights,
-       backend=moe_ep.MegaConfig(megakernel=config, quantize_input=True),
+
+   # Kimi K3.1 Pro
+   k31_layer = make_routed_layer(
+       k31_config["text_config"], k31_local_weights, bootstrap, capacity=256,
    )
+
+For either layer, pass the projected BF16 routed input and the model's routes:
+
+.. code-block:: python
+
+   layer = k31_layer  # Use k3_layer for Kimi K3.
    workspace = layer.create_workspace(256)
-   tensors = moe_ep.MoEEpTensors(hidden_states, topk_ids, topk_weights)
+   tensors = moe_ep.MoEEpTensors(routed_hidden_states, topk_ids, topk_weights)
    layer.warmup(tensors, workspace=workspace)
-   output = layer(tensors, workspace=workspace)
+   routed_output = layer(tensors, workspace=workspace)  # [tokens, 3584]
+
+For an NVFP4-converted checkpoint, set ``quant_kind="nvfp4"`` and pass its
+``input_norm_const``, ``fc1_alpha``, ``fc2_alpha`` and ``fc1_norm_const`` as
+calibration arguments. Do not reuse another checkpoint's calibration or
+interpret MXFP4 packed bytes as NVFP4.
+
+The shared contract is covered by CPU admission tests. The GPU tests below
+validate the routed kernel; they are not an end-to-end K3.1 Pro checkpoint
+accuracy or serving benchmark.
 
 Weights and scales
 ------------------

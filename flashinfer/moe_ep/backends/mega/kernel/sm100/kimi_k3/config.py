@@ -30,9 +30,11 @@ _KNOB_KEYS = frozenset(
 
 @dataclass(frozen=True)
 class Sm100_KimiK3_MegaMoeConfig:
-    """K3 SiTU inference with NVFP4 or MXFP4 weights on SM100/SM103.
+    """K3/K3.1 Pro routed SiTU inference on SM100/SM103.
 
-    Uses 896 experts, hidden size 3584, intermediate size 3072 and top-16.
+    Uses 896 experts, routed width 3584, intermediate size 3072 and top-16.
+    Read the routed width from ``routed_expert_hidden_size``, not ``hidden_size``.
+    Routing, latent projections, post-MoE norm and shared experts stay outside.
     Both SiTU beta values must be supplied, positive and finite.
     ``fast_situ`` selects the source's faster SiTU arithmetic; it can change
     output bits. ``knobs`` accepts fixed native settings, not online tuning.
