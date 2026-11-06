@@ -32,9 +32,11 @@ what stays exact is structural (zero gradients, collective counts, byte counts, 
   same budget constants; ``.backward()`` twice: half the
   accumulated gradient against the FP64 gradient; ``save_mode="full"`` with ``save_transfer=False`` (a2a and, where
   the partition allows it, ring) runs with every package allocation filled with NaN bytes, and its saved set carries
-  ``M_seg`` exactly at ``P > 1`` (the full backward's merges read that plane; it runs no transfer walk); the rows plan
-  ``P = 1``, so the same forms run again at the forced ``P = 2`` (``segments=2``, where every rank's fragments take it)
-  against the light form at ``P = 2``, all under NaN-filled allocations;
+  ``M_seg`` exactly at ``P > 1`` (the full backward's merges read that plane; it runs no transfer walk); a row whose
+  ranks all plan ``P = 1`` reads no ``M_seg`` at its plan, so the same forms run again at the forced ``P = 2``
+  (``segments=2``, where every rank's fragments take it) against the light form at ``P = 2``, all under NaN-filled
+  allocations (a row that plans ``P > 1`` reads the plane at its plan and runs no forced form: the G1 cells are
+  budgets of the planned schedule);
 * worst case: ``N_REPEAT`` forward + backward runs per row, all recorded, the worst run per tensor gated;
 * semantics (G4): the zero-gradient leak stays exact (``dout`` zero outside one document -> exactly zero gradients on
   the others); independence (the other documents' operands replaced) within the budget constants;
@@ -51,7 +53,7 @@ what stays exact is structural (zero gradients, collective counts, byte counts, 
 ``test_poisoned_workspace_pairs``: one ``CakeGDNNondetKcpWorkspace`` reused across two rows of different token layouts on one group,
 every pool and tape of the workspace filled with NaN in between; both rows within the FP64 budgets, each also in the
 ``save_mode="full"`` / ``save_transfer=False`` form (and its ring form where eligible), at the plan's ``P`` and at the forced
-``P = 2`` where every rank's fragments take it, under NaN-filled allocations.  The convolution
+``P = 2`` where every rank plans ``P = 1`` and its fragments take it, under NaN-filled allocations.  The convolution
 halo row C7 (``cake_causal_conv1d_det_kcp`` through this package's context) and the whole-layer checkpoint rows
 (``CakeGDNNondetKcpRecomputeHandle``: the recompute exchanges nothing; out / dx / dweight / dg / dbeta within the budget constants of
 the plain checkpoint and the direct pass and within the correctness clause of the FP64 layer oracle; the backward's
@@ -1930,7 +1932,7 @@ def _run_rank(
         flags["ring_full_saves_m_seg"] = info["ring_full"]["ok"]
         del res_ring, res_ring_full
     del res_recompute
-    # these rows plan P = 1: the same full / ring + full forms again at the forced P = 2 (segments override)
+    # rows whose ranks all plan P = 1: the same full / ring + full forms again at the forced P = 2 (segments override)
     info["p2_eligible"] = _p2_group_ok(ctx, HV, group, W, device)
     if info["p2_eligible"]:
         _p2_full_arms(saved_pass, arm, info, flags, ring=ring_eligible)
@@ -2659,11 +2661,14 @@ def _bitwise(a: dict, b: dict, names=TENSORS) -> dict[str, bool]:
 
 
 def _p2_group_ok(ctx, HV: int, group, W: int, device: torch.device) -> bool:
-    """Every rank's fragments take the segments override ``P = 2`` (the longest fragment of each rank has at least
-    two chunks).  The int1 rows plan ``P = 1``; the forced ``P = 2`` arms put the full form's read of the saved
-    ``M_seg^T`` plane on these rows.  A group decision (MIN over the ranks): every rank runs the same calls."""
+    """Every rank plans ``P = 1`` and its fragments take the segments override ``P = 2`` (the longest fragment of
+    each rank has at least two chunks).  Such a row reads no saved ``M_seg^T`` plane at its plan; the forced
+    ``P = 2`` arms put the full form's read of that plane on it.  A row that plans ``P > 1`` on some rank already
+    reads the plane in its planned forms, and forcing ``P = 2`` there lowers its plan (A4 int3 plans ``P = 24``):
+    a schedule its G1 cells (budgets of the planned schedule) do not cover, so it runs no forced form.  A group
+    decision (MIN over the ranks): every rank runs the same calls."""
     try:
-        ok = int(ctx.heads(HV, P=2).P) == 2
+        ok = int(ctx.heads(HV).P) == 1 and int(ctx.heads(HV, P=2).P) == 2
     except ValueError:
         ok = False
     flag = torch.tensor([1 if ok else 0], dtype=torch.int32, device=device)
@@ -2778,7 +2783,7 @@ def _run_rank_poison(
         del res
         # save_mode="full" without save_transfer on the same workspace under NaN-filled allocations (and its ring
         # form where the partition allows it): at P > 1 its backward reads the saved M_seg^T plane
-        # (+ the forced P = 2 forms where every rank's fragments take it: the pairs' rows plan P = 1)
+        # (+ the forced P = 2 forms where every rank plans P = 1 and its fragments take P = 2: _p2_group_ok)
         ring_ok = W > 1 and int(ctx.n_d_max) - 1 <= kcp.RING_MAX_HOPS
         forms = [("full_no_save_transfer", {})]
         if ring_ok:
