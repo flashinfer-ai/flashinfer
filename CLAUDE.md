@@ -381,10 +381,11 @@ prefix policy without adding a device readback just for dispatch.
 For SM90 NVFP4 fused/split and MXFP4 fused MegaMoE, use
 [`benchmarks/bench_megamoe_fp4_sm90.py`](benchmarks/bench_megamoe_fp4_sm90.py) for timing
 and [`tests/moe/test_megamoe_fp4_sm90.py`](tests/moe/test_megamoe_fp4_sm90.py) for correctness checks.
-For the SM120 MXFP4 path, use
-[`benchmarks/bench_megamoe_mxfp4_sm120.py`](benchmarks/bench_megamoe_mxfp4_sm120.py) (`--backend`
-also times the `moe_ep` SM120 MXFP4 x MXFP8 backends on the same routes) and
-[`tests/moe/test_megamoe_mxfp4_sm120.py`](tests/moe/test_megamoe_mxfp4_sm120.py).
+For the `moe_ep` SM120 MXFP4 x MXFP8 MegaMoE backends (`--backend decode` / `cutedsl` / `cake`
+on the same weights and routes), use
+[`benchmarks/bench_megamoe_mxfp4_sm120.py`](benchmarks/bench_megamoe_mxfp4_sm120.py); the decode
+backend's correctness checks are in
+[`tests/moe_ep/test_moe_ep_sm120_w4a8_decode_mega.py`](tests/moe_ep/test_moe_ep_sm120_w4a8_decode_mega.py).
 
 FlashInfer provides a unified benchmarking framework in `benchmarks/flashinfer_benchmark.py`.
 

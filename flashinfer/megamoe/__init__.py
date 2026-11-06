@@ -1,15 +1,9 @@
-"""FP4 MegaMoE: SM90 (Hopper) NVFP4 fused/split and MXFP4 fused; SM120 MXFP4 fused.
+"""SM90 (Hopper) FP4 MegaMoE: NVFP4 fused/split and MXFP4 fused.
 
 The fused paths perform cross-rank token dispatch, two W4A8 GEMMs, clamped
 SwiGLU and top-k reduction in one persistent kernel. NVFP4 split uses separate
-L1 and L2 launches. All paths use FP8 activations and symmetric memory.
-NVFP4 supports four or eight ranks; MXFP4 supports power-of-two rank counts up to 32
-on SM90.
-
-On SM120 (RTX PRO 6000 class, PCIe peer-to-peer, no NVLink) only MXFP4 is
-available, for one host (up to eight ranks) and decode-size batches: the kernel
-requantises the staged FP8 activations to MXFP8 (E4M3 with a UE8M0 scale per 32
-channels) and runs both GEMMs on the block-scaled FP4 x FP8 tensor-core MMA.
+L1 and L2 launches. All paths use FP8 activations and NVLink symmetric memory.
+NVFP4 supports four or eight ranks; MXFP4 supports power-of-two rank counts up to 32.
 
 Usage::
 
@@ -31,9 +25,6 @@ from typing import Any, Callable, Dict, Optional, Tuple, Union
 import torch
 
 from ..jit.megamoe import (
-    gen_megamoe_sm120_gin_session_module,
-    gen_megamoe_sm120_mxfp4_gin_module,
-    gen_megamoe_sm120_mxfp4_module,
     gen_megamoe_sm90_layout_module,
     gen_megamoe_sm90_mxfp4_module,
     gen_megamoe_sm90_nvfp4_module,
@@ -43,7 +34,6 @@ from ..jit.megamoe import (
 from .heuristics import (
     CANDIDATE_BLOCK_M,
     FusedPlan,
-    align,
     get_num_max_pool_tokens,
     get_num_padded_sf_pool_tokens,
     select_fused_plan,
@@ -73,85 +63,6 @@ __all__ = [
 @functools.cache
 def _get_jit_module(factory, *args):
     return factory(*args).build_and_load()
-
-
-# SM120: the kernel's counter block (sm120_mxfp4_mega_moe.cuh kCtrInts: per-call counters, per-expert
-# and per-tile counts, GIN signal totals; error word at 3) and its slot in the layout below
-_SM120_COUNTER_INTS = 1592
-_SM120_ERROR_INDEX = 3
-_SM120_CTR_SLOT = 14
-_SM120_TRANSPORTS = ("p2p", "nic", "auto")
-# GIN contexts (queue-pair sets): CTAs spread their puts over them; on RTX 6000D EP8 four beat one
-# (1.8 vs 2.5 ms at 128 tokens per rank) and sixteen added signal-poll cost at small batches
-_SM120_GIN_CONTEXTS = 4
-_SM120_MAX_RANKS = 8
-_SM120_MAX_TOPK = 8
-_SM120_MAX_LOCAL_EXPERTS = 256
-_SM120_MAX_HIDDEN = 7936  # the dispatch stages one MXFP8 row (hidden + hidden / 32 bytes) in 8 KB of shared memory
-# The SM120 kernel multiplies 8 tokens per weight tile, a decode-size design. Up to 128 tokens per rank it
-# beats the moe_ep SM120 MXFP4 backends on RTX 6000D and RTX PRO 6000 (DeepSeek-V4-Flash, DeepSeek-V4.1-Flash
-# and GLM-5.3-Flash MoE shapes); at 256 it is mostly 0-14% slower, so larger batches belong on moe_ep.
-_SM120_MAX_TOKENS_PER_RANK = 128
-
-
-def _is_sm120() -> bool:
-    # the SM120 module is built for sm_120a only, which runs on compute capability 12.0 exactly
-    return torch.cuda.get_device_capability() == (12, 0)
-
-
-def _sm120_layout(ranks, experts, capacity, topk, hidden, intermediate, gin=False):
-    """Byte offsets of the SM120 symmetric buffer, in the order the binding reads them:
-    [total, x, x_sf, topk_idx, topk_weights, pool, recv_cnt, recv_flag, comb, comb_flag,
-    route, route_flag, inter, inter_s, ctr, stage_row, inbox, stage_comb, comb_gin, slotmap,
-    stage_slot, cidx]. Every region sits at the same offset on every rank; pool / recv_* /
-    route* are written by the other ranks, comb by the expert ranks, the rest only locally. A
-    pool row holds the MXFP8 token, its scales and the source's (token * 8 + k), padded to 16
-    bytes. The last seven regions (empty without NIC pairs) serve GIN, which sends a token once
-    per rank: the token row staged for and received from GIN ranks, the partials staged for and
-    received from GIN ranks and the slot tables received from and staged for GIN ranks (both
-    packed in the expert rank's (local expert, slot) order), and the packed row of each
-    (token, k)."""
-    epr = experts // ranks
-    rows = (
-        epr * ranks * capacity
-    )  # an expert pool slot per (local expert, source rank, token)
-    row_bytes = hidden + align(hidden // 32 + 4, 16)  # sm120 pool_row_bytes
-    sizes = (
-        capacity * hidden,
-        capacity * (hidden // 128) * 4,
-        capacity * topk * 8,
-        capacity * topk * 4,
-        rows * row_bytes,
-        ranks * epr * 4,
-        ranks * 4,
-        capacity * topk * hidden * 2,
-        ranks * 4,
-        ranks * (1 + capacity * topk) * 4,
-        ranks * 4,
-        rows * intermediate,
-        rows * (intermediate // 128) * 4,
-        _SM120_COUNTER_INTS * 4,
-        capacity * row_bytes if gin else 0,
-        ranks * capacity * row_bytes if gin else 0,
-        ranks * capacity * topk * hidden * 2 if gin else 0,
-        ranks * capacity * topk * hidden * 2 if gin else 0,
-        ranks * capacity * topk * 4 if gin else 0,
-        ranks * capacity * topk * 4 if gin else 0,
-        capacity * topk * 4 if gin else 0,
-    )
-    offsets, cursor = [], 0
-    for size in sizes:
-        offsets.append(cursor)
-        cursor = align(cursor + size, 256)
-    return [cursor, *offsets]
-
-
-def _sm120_weight_strides(hidden, intermediate):
-    """Bytes per expert of the SM120 L1 / L2 weights: packed FP4 then one UE8M0 byte per 32 values."""
-    return (
-        2 * intermediate * hidden // 2 + 2 * intermediate * hidden // 32,
-        hidden * intermediate // 2 + hidden * intermediate // 32,
-    )
 
 
 def _jit_args(factory, plan, b):
@@ -191,29 +102,6 @@ def _run_kernel(factory, entry, plan, y, w1, w2, b, m, stats, gs1, gs2):
     return y
 
 
-def _sm120_tokens_per_item(value: Optional[int]) -> int:
-    if value is None:
-        return 0  # the kernel's default by routed rows per local expert
-    if value not in (8, 16, 24, 32):
-        raise ValueError(
-            f"sm120_tokens_per_item must be 8, 16, 24 or 32, got {value!r}"
-        )
-    return value
-
-
-class _DeviceBytes:
-    """CUDA array interface over memory this module owns (the NCCL window), for torch.as_tensor."""
-
-    def __init__(self, pointer: int, num_bytes: int) -> None:
-        self.__cuda_array_interface__ = {
-            "shape": (num_bytes,),
-            "typestr": "|i1",
-            "data": (pointer, False),
-            "strides": None,
-            "version": 3,
-        }
-
-
 class MegaMoESymmBuffer:
     """Allocate symmetric input, expert-token and output-combine storage.
 
@@ -239,13 +127,6 @@ class MegaMoESymmBuffer:
         SwiGLU clamp value. Defaults to 10.0.
     fast_math : bool
         Use the family's fast-math policy. Defaults to True.
-    transport : str
-        SM120 only: how ranks reach each other. ``"p2p"`` (default) PCIe peer-to-peer
-        stores between every pair. ``"auto"`` allocates the buffer as an NCCL window and
-        sends over the NIC (NCCL GIN) to the ranks NCCL cannot map for load/store (e.g.
-        across CPU sockets on hosts where that path is slow), P2P to the others.
-        ``"nic"`` uses GIN for every other rank. ``"auto"`` and ``"nic"`` need NCCL 2.30.7
-        with the Device API and a GIN-capable network; every rank must pass the same value.
 
     Attributes
     ----------
@@ -267,27 +148,9 @@ class MegaMoESymmBuffer:
         intermediate_hidden: int,
         activation_clamp: float = 10.0,
         fast_math: bool = True,
-        transport: str = "p2p",
     ) -> None:
         import torch.distributed._symmetric_memory as symm_mem
 
-        self.sm120 = _is_sm120()
-        if self.sm120:
-            self._init_sm120(
-                symm_mem,
-                group,
-                num_experts,
-                num_max_tokens_per_rank,
-                num_topk,
-                hidden,
-                intermediate_hidden,
-                activation_clamp,
-                fast_math,
-                transport,
-            )
-            return
-        if transport != "p2p":
-            raise ValueError("transport is an SM120 option; SM90 uses NVLink")
         # Buffer geometry is format-independent; NVFP4 checks its narrower
         # deployment constraints when selecting a fused/split plan.
         select_mxfp4_fused_plan(
@@ -358,162 +221,6 @@ class MegaMoESymmBuffer:
         self.topk_weights = self._view(
             layout[4], (num_max_tokens_per_rank, num_topk), torch.float32
         )
-
-    def _init_sm120(
-        self,
-        symm_mem,
-        group,
-        num_experts,
-        num_max_tokens_per_rank,
-        num_topk,
-        hidden,
-        intermediate_hidden,
-        activation_clamp,
-        fast_math,
-        transport,
-    ) -> None:
-        ranks = group.size()
-        if transport not in _SM120_TRANSPORTS:
-            raise ValueError(
-                f"transport must be one of {_SM120_TRANSPORTS}, got {transport!r}"
-            )
-        if not 1 <= ranks <= _SM120_MAX_RANKS:
-            raise ValueError(
-                f"SM120 MegaMoE supports 1 to {_SM120_MAX_RANKS} ranks (one host)"
-            )
-        if num_experts <= 0 or num_experts % ranks:
-            raise ValueError("num_experts must divide evenly across ranks")
-        if num_experts // ranks > _SM120_MAX_LOCAL_EXPERTS:
-            raise ValueError(
-                f"SM120 MegaMoE supports at most {_SM120_MAX_LOCAL_EXPERTS} experts per rank"
-            )
-        if not 0 < num_topk <= min(_SM120_MAX_TOPK, num_experts):
-            raise ValueError(
-                f"num_topk must be in [1, min({_SM120_MAX_TOPK}, num_experts)] on SM120"
-            )
-        if hidden <= 0 or hidden % 256 or hidden > _SM120_MAX_HIDDEN:
-            raise ValueError(
-                f"hidden must be a multiple of 256 and at most {_SM120_MAX_HIDDEN} on SM120"
-            )
-        if intermediate_hidden <= 0 or intermediate_hidden % 256:
-            raise ValueError("intermediate_hidden must be a multiple of 256 on SM120")
-        if not 0 < num_max_tokens_per_rank <= _SM120_MAX_TOKENS_PER_RANK:
-            raise ValueError(
-                f"SM120 MegaMoE is a decode kernel: num_max_tokens_per_rank must be in "
-                f"[1, {_SM120_MAX_TOKENS_PER_RANK}]; use flashinfer.moe_ep (SM120 MXFP4 x MXFP8 "
-                f"cutedsl / cake) for larger batches"
-            )
-        self.group = group
-        self.num_experts = num_experts
-        self.num_max_tokens_per_rank = num_max_tokens_per_rank
-        self.num_topk = num_topk
-        self.hidden = hidden
-        self.intermediate_hidden = intermediate_hidden
-        self.activation_clamp = activation_clamp
-        self.fast_math = fast_math
-        self.num_sms = torch.cuda.get_device_properties(
-            torch.cuda.current_device()
-        ).multi_processor_count
-        self.transport = transport
-        self._gin_session: Optional[Tuple[Any, int]] = None
-        self._gin: list = []  # [device ncclDevComm*, ncclWindow_t, GIN rank mask] when any pair is GIN
-        layout = _sm120_layout(
-            ranks,
-            num_experts,
-            num_max_tokens_per_rank,
-            num_topk,
-            hidden,
-            intermediate_hidden,
-            gin=transport != "p2p",
-        )
-        self._offsets = layout
-        if transport == "p2p":
-            self.buffer = symm_mem.empty(layout[0], dtype=torch.int8, device="cuda")
-            self.handle = symm_mem.rendezvous(self.buffer, group=group)
-            self.buffer.zero_()
-            self._peer_ptrs = list(self.handle.buffer_ptrs)
-        else:
-            self._init_sm120_nccl_window(group, layout[0], transport)
-        group.barrier()
-        torch.cuda.synchronize()
-        self.x = self._view(
-            layout[1], (num_max_tokens_per_rank, hidden), torch.float8_e4m3fn
-        )
-        self.x_sf = self._view(
-            layout[2], (num_max_tokens_per_rank, hidden // 128), torch.float32
-        )
-        self.topk_idx = self._view(
-            layout[3], (num_max_tokens_per_rank, num_topk), torch.int64
-        )
-        self.topk_weights = self._view(
-            layout[4], (num_max_tokens_per_rank, num_topk), torch.float32
-        )
-
-    def _init_sm120_nccl_window(self, group, num_bytes, transport) -> None:
-        """The buffer as one NCCL symmetric window on the group's communicator: LSA peer pointers
-        where NCCL maps a pair, NCCL GIN for the rest ("auto") or for every other rank ("nic")."""
-        torch.distributed.barrier(
-            group=group
-        )  # ProcessGroupNCCL creates its communicator lazily
-        backend = group._get_backend(torch.device("cuda"))
-        if not hasattr(backend, "_comm_ptr"):
-            raise RuntimeError(
-                "SM120 MegaMoE NIC transport needs a ProcessGroupNCCL exposing _comm_ptr"
-            )
-        session = _get_jit_module(gen_megamoe_sm120_gin_session_module)
-        rank, ranks = group.rank(), group.size()
-        handle = int(
-            session.megamoe_sm120_gin_session_create(
-                int(backend._comm_ptr()), rank, ranks, num_bytes, _SM120_GIN_CONTEXTS
-            )
-        )
-        self._gin_session = (session, handle)
-        base, win, dev_comm, gin_type, _, contexts = (
-            int(v) for v in session.megamoe_sm120_gin_session_info(handle)
-        )
-        peers = [int(p) for p in session.megamoe_sm120_gin_session_peers(handle)]
-        mask = 0
-        for w in range(ranks):
-            if w != rank and (transport == "nic" or peers[w] == 0):
-                mask |= 1 << w
-        # the kernel sends and receives over the same transport per pair: the masks must agree
-        masks = [None] * ranks
-        torch.distributed.all_gather_object(masks, mask, group=group)
-        for w in range(ranks):
-            if (mask >> w & 1) != (masks[w] >> rank & 1):
-                raise RuntimeError(
-                    f"SM120 MegaMoE: ranks {rank} and {w} disagree on the NIC transport "
-                    "between them (asymmetric NCCL load/store mapping)"
-                )
-        if mask and dev_comm == 0:
-            raise RuntimeError(
-                "SM120 MegaMoE: ranks "
-                f"{[w for w in range(ranks) if mask >> w & 1]} need the NIC transport, but the "
-                "NCCL communicator offers no GIN"
-            )
-        self.handle = None
-        self._peer_ptrs = [0 if mask >> w & 1 else peers[w] for w in range(ranks)]
-        self._gin = [dev_comm, win, mask, contexts] if mask else []
-        self._gin_type = gin_type
-        self.buffer = torch.as_tensor(_DeviceBytes(base, num_bytes), device="cuda")
-
-    def _sm120_module(self):
-        if self._gin:
-            return _get_jit_module(
-                gen_megamoe_sm120_mxfp4_gin_module, self.fast_math, self._gin_type
-            )
-        return _get_jit_module(gen_megamoe_sm120_mxfp4_module, self.fast_math)
-
-    def error(self) -> int:
-        """SM120: the error word of the last call, 0 when every spin wait completed. A wait that
-        times out (a rank that never entered the call) records its code here and the kernel exits
-        instead of hanging; each call clears it on entry. Synchronizes with the device."""
-        if not self.sm120:
-            raise ValueError("error() is available on the SM120 path only")
-        ctr = self._view(
-            self._offsets[_SM120_CTR_SLOT], (_SM120_COUNTER_INTS,), torch.int32
-        )
-        return int(ctr[_SM120_ERROR_INDEX].item())
 
     def _view(self, byte_offset: int, shape: Tuple[int, ...], dtype: torch.dtype):
         itemsize = torch.empty((), dtype=dtype).element_size()
@@ -612,10 +319,6 @@ class MegaMoESymmBuffer:
         int
             Number of distinct modules built.
         """
-        if self.sm120:  # one shape-generic MXFP4 module
-            self._sm120_module()
-            torch.distributed.barrier(group=self.group)
-            return 1
         if kernel_family not in ("auto", "fused", "split"):
             raise ValueError(
                 f"kernel_family must be 'auto', 'fused' or 'split', got {kernel_family!r}"
@@ -655,15 +358,10 @@ class MegaMoESymmBuffer:
         return len(keys)
 
     def destroy(self) -> None:
-        """Release this rank's views and symmetric-memory handle (collective with the NIC
-        transport, which deregisters the NCCL window)."""
+        """Release this rank's views and symmetric-memory handle."""
         self.handle = None
         self.buffer = None
         self.x = self.x_sf = self.topk_idx = self.topk_weights = None
-        session = getattr(self, "_gin_session", None)
-        if session is not None:
-            self._gin_session = None
-            session[0].megamoe_sm120_gin_session_close(session[1])
 
 
 def nvfp4_mega_moe(
@@ -724,8 +422,6 @@ def nvfp4_mega_moe(
     supports four or eight ranks, which must call matching families in matching order.
     """
     b = symm_buffer
-    if getattr(b, "sm120", False):
-        raise ValueError("SM120 MegaMoE supports MXFP4 weights only (mxfp4_mega_moe)")
     m = int(num_tokens if num_tokens is not None else y.shape[0])
     _validate_call(
         y,
@@ -792,12 +488,7 @@ def _validate_call(y, w1, w2, b, m, weight_format, stats, gs1, gs2):
     if not 0 < m <= b.num_max_tokens_per_rank or m > getattr(b, "num_staged_tokens", 0):
         raise ValueError("num_tokens must fit the staged input and buffer capacity")
     epr = b.num_experts // b.group.size()
-    if getattr(b, "sm120", False):
-        shapes = tuple(
-            (epr, stride)
-            for stride in _sm120_weight_strides(b.hidden, b.intermediate_hidden)
-        )
-    elif weight_format == "nvfp4":
+    if weight_format == "nvfp4":
         shapes = (
             (epr, b.intermediate_hidden * 2, b.hidden // 128 * 80),
             (epr, b.hidden, b.intermediate_hidden // 128 * 80),
@@ -853,7 +544,6 @@ def mxfp4_mega_moe(
     cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
     l1_global_scales: Optional[torch.Tensor] = None,
     l2_global_scales: Optional[torch.Tensor] = None,
-    sm120_tokens_per_item: Optional[int] = None,
 ) -> torch.Tensor:
     """Run fused MXFP4 MegaMoE with chunk-major weights and FP8 activations.
 
@@ -876,16 +566,6 @@ def mxfp4_mega_moe(
         accumulated in place; initialize the vector before first use.
     l1_global_scales, l2_global_scales : torch.Tensor, optional
         FP32 vectors with one multiplier per local expert. Omitted scales use 1.
-    sm120_tokens_per_item : int, optional
-        SM120 only: tokens of one expert that a work item multiplies per weight
-        load, 8, 16, 24 or 32. ``None`` (default) picks 24 when the experts
-        average at least 7 routed rows each (``num_tokens * num_topk`` over the
-        local expert count) and 8 otherwise, the best of 8 / 16 / 24 / 32 measured
-        on RTX 6000D and RTX PRO 6000 for DeepSeek-V4-Flash, DeepSeek-V4.1-Flash
-        and GLM-5.3-Flash at EP4 / EP8. For the best performance on another GPU or
-        model, sweep it per token count with
-        ``benchmarks/bench_megamoe_mxfp4_sm120.py --tokens-per-item`` and pass the
-        winner. Every rank must pass the same value.
 
     Returns
     -------
@@ -894,20 +574,9 @@ def mxfp4_mega_moe(
 
     Notes
     -----
-    All tensors must be contiguous and on the buffer's CUDA device. On SM90 the
-    rank count must be a power of two from 1 to 32. Every rank must invoke the
-    kernel in matching order; MXFP4 always uses the fused family.
-
-    On SM120 one host's ranks (1 to 8) take part over PCIe peer-to-peer, or
-    over the NIC for the pairs the buffer's ``transport`` assigns to NCCL GIN; the
-    weights come from :func:`transform_mxfp4_weights_for_mega_moe` on the same
-    device. The kernel targets decode-size batches: ``num_max_tokens_per_rank``
-    is limited to 128 (beyond that the ``flashinfer.moe_ep`` SM120 backends are
-    faster), and the expert pools hold that many rows per (local expert, source
-    rank). Top-k ids outside ``[0, num_experts)`` and
-    repeats of an earlier id of the same token are treated as masked (-1). A
-    rank whose peers never enter the call records an error code
-    (:meth:`MegaMoESymmBuffer.error`) instead of hanging.
+    All tensors must be contiguous and on the buffer's CUDA device. The rank
+    count must be a power of two from 1 to 32. Every rank must invoke the kernel
+    in matching order; MXFP4 always uses the fused family.
     """
     b = symm_buffer
     m = int(num_tokens if num_tokens is not None else y.shape[0])
@@ -922,32 +591,6 @@ def mxfp4_mega_moe(
         l1_global_scales,
         l2_global_scales,
     )
-    if b.sm120:
-        module = b._sm120_module()
-        module.megamoe_sm120_mxfp4_fused(
-            y,
-            b.buffer,
-            b._peer_ptrs,
-            b.group.rank(),
-            l1_weights,
-            l2_weights,
-            b._offsets,
-            [
-                b.num_experts,
-                b.num_topk,
-                b.hidden,
-                b.intermediate_hidden,
-                b.num_max_tokens_per_rank,
-            ],
-            m,
-            float(b.activation_clamp),
-            cumulative_local_expert_recv_stats,
-            l1_global_scales,
-            l2_global_scales,
-            b._gin,
-            _sm120_tokens_per_item(sm120_tokens_per_item),
-        )
-        return y
     plan = select_mxfp4_fused_plan(
         b.num_sms,
         b.group.size(),

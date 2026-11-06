@@ -1,12 +1,15 @@
-"""SM120 MXFP4 MegaMoE timing (CUDA graph, PCIe peer-to-peer): flashinfer.megamoe against the moe_ep SM120 backends.
+"""SM120 MXFP4 x MXFP8 MegaMoE timing (CUDA graph): the moe_ep SM120 backends (decode / cutedsl / cake) through
+MoEEpLayer, on the same weights, inputs and routes.
 
-Same method as bench_megamoe_fp4_sm90.py: each graph queues an unmeasured NCCL all-reduce gate, then the timing
-events around `repeats` back-to-back calls; per round the time is the maximum over ranks, and the median over
-rounds is reported. --cold-l2 writes 512 MB before every round (with --repeats 1), so the weights come from DRAM as
+Every backend takes BF16 activations; MoEEpLayer.stage_inputs quantizes them to MXFP8 once, outside the timed
+region, and the timed call is compute_staged: the standalone MoE kernel(s), including the dispatch and combine
+communication. Same method as bench_megamoe_fp4_sm90.py: each graph queues an unmeasured NCCL all-reduce gate,
+then the timing events around `repeats` back-to-back calls; per round the time is the maximum over ranks, and the
+median over rounds is reported. --cold-l2 writes 512 MB before every round (with --repeats 1), so the weights come from DRAM as
 in a decode step that walks every layer. Routing: random top-k (--routing random) or balanced (--routing balanced): top-k slot s of global token g goes to
 rank s % EP, local expert (g + 7 s) % E_local, so every rank gets floor or ceil of top-k / EP routes per token.
 
-    python benchmarks/bench_megamoe_mxfp4_sm120.py --ep 4 --shape flash --tokens 1 2 8 16 20 32 64
+    python benchmarks/bench_megamoe_mxfp4_sm120.py --ep 4 --shape flash --cold-l2 --repeats 1 --tokens 1 8 32 128
 """
 
 import argparse
@@ -62,41 +65,9 @@ def _routes(args, rank, m, experts, topk, generator):
     )
 
 
-def _megamoe(args, h, ih, experts, topk, generator, raw):
-    """This module's mxfp4_mega_moe: FP8 activations staged once, the timed call is the fused kernel."""
-    from flashinfer.megamoe import (
-        MegaMoESymmBuffer,
-        mxfp4_mega_moe,
-        transform_mxfp4_weights_for_mega_moe,
-    )
-
-    buffer = MegaMoESymmBuffer(
-        dist.group.WORLD,
-        experts,
-        args.capacity,
-        topk,
-        h,
-        ih,
-        transport=args.mm_transport,
-    )
-    buffer.prewarm()
-    w1, w2 = transform_mxfp4_weights_for_mega_moe(raw(2 * ih, h), raw(h, ih))
-
-    def setup(m, x_bf16, idx, weights):
-        sf = x_bf16.float().abs().amax(-1, keepdim=True).clamp_min(1e-6) / 448
-        x = (x_bf16.float() / sf).to(torch.float8_e4m3fn)
-        buffer.stage(x, sf.expand(m, h // 128).contiguous(), idx, weights)
-        y = torch.empty(m, x_bf16.shape[1], device="cuda", dtype=torch.bfloat16)
-        return lambda: mxfp4_mega_moe(
-            y, w1, w2, buffer, sm120_tokens_per_item=args.tokens_per_item
-        )
-
-    return setup, buffer.destroy
-
-
 def _moe_ep(args, h, ih, experts, topk, generator, raw):
-    """FlashInfer's existing SM120 MXFP4 x MXFP8 MegaMoE backends through MoEEpLayer: BF16 inputs staged (and
-    quantised) once by stage_inputs, the timed call is compute_staged."""
+    """The moe_ep SM120 MXFP4 x MXFP8 MegaMoE backends through MoEEpLayer: BF16 inputs staged (and quantized) once
+    by stage_inputs, the timed call is compute_staged."""
     from flashinfer.moe_ep import (
         BootstrapConfig,
         FleetParams,
@@ -114,7 +85,18 @@ def _moe_ep(args, h, ih, experts, topk, generator, raw):
         w13_scale=s1.view(torch.float8_e8m0fnu),
         w2_scale=s2.view(torch.float8_e8m0fnu),
     )
-    if args.backend == "cutedsl":
+    if args.backend == "decode":
+        from flashinfer.moe_ep import (
+            Sm120_Mxfp4_Mxfp8_Bf16_Decode_MegaMoeConfig as Config,
+        )
+
+        cfg = Config(
+            intermediate_size=ih,
+            top_k=topk,
+            transport=args.decode_transport,
+            tokens_per_item=args.tokens_per_item,
+        )
+    elif args.backend == "cutedsl":
         from flashinfer.moe_ep import (
             Sm120_Mxfp4_Mxfp8_Bf16_Cutedsl_MegaMoeConfig as Config,
         )
@@ -173,9 +155,7 @@ def _worker(rank, args):
     epr = experts // args.ep
     generator = torch.Generator(device="cuda").manual_seed(7919 + rank)
 
-    def raw(
-        n, k
-    ):  # MXFP4 in the transform's input format: packed bytes, E8M0 scales per 32
+    def raw(n, k):  # MXFP4: packed E2M1 bytes, UE8M0 scales per 32
         packed = torch.randint(
             0,
             256,
@@ -189,9 +169,7 @@ def _worker(rank, args):
         ).to(torch.uint8)
         return packed, sf
 
-    setup, destroy = (_megamoe if args.backend == "megamoe" else _moe_ep)(
-        args, h, ih, experts, topk, generator, raw
-    )
+    setup, destroy = _moe_ep(args, h, ih, experts, topk, generator, raw)
     flush = (
         torch.empty(512 << 20, dtype=torch.uint8, device="cuda")
         if args.cold_l2
@@ -256,7 +234,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--tokens", type=int, nargs="+", default=[1, 2, 8, 16, 20, 32, 64]
     )
-    parser.add_argument("--capacity", type=int, default=64)
+    parser.add_argument("--capacity", type=int, default=128)
     parser.add_argument("--routing", choices=["random", "balanced"], default="random")
     parser.add_argument("--cold-l2", action="store_true")
     parser.add_argument("--repeats", type=int, default=40)
@@ -273,10 +251,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--backend",
-        choices=["megamoe", "cutedsl", "cake"],
-        default="megamoe",
-        help="megamoe: flashinfer.megamoe.mxfp4_mega_moe; cutedsl / cake: the moe_ep SM120 MXFP4 x MXFP8 MegaMoE "
-        "backends (sm120_mxfp4_mxfp8_bf16_cutedsl / _cake) through MoEEpLayer",
+        choices=["decode", "cutedsl", "cake"],
+        default="decode",
+        help="moe_ep backend sm120_mxfp4_mxfp8_bf16_decode / _cutedsl / _cake",
     )
     parser.add_argument("--knobs", type=str, default="", help="cutedsl: JSON knobs")
     parser.add_argument(
@@ -287,13 +264,13 @@ if __name__ == "__main__":
         type=int,
         choices=[8, 16, 24, 32],
         default=None,
-        help="megamoe: force the work-item width (default: by routed rows per local expert)",
+        help="decode: force the work-item width (default: by routed rows per local expert)",
     )
     parser.add_argument(
-        "--mm-transport",
+        "--decode-transport",
         choices=["p2p", "nic", "auto"],
         default="p2p",
-        help="megamoe: MegaMoESymmBuffer transport",
+        help="decode: transport",
     )
     args = parser.parse_args()
     if args.cold_l2 and args.repeats != 1:
