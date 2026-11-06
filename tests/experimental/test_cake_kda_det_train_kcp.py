@@ -5019,7 +5019,7 @@ def test_forward_only_layout_bytes_and_prediction() -> None:
                 {
                     "backward": False,
                     "fwd_layout": "fwd_kcp",
-                    "arena": cake_backend.KdaArena(batch_tokens=S),
+                    "arena": cake_backend.KdaDetArena(batch_tokens=S),
                 }
             )
         for kw in bad:

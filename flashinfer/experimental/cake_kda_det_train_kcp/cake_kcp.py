@@ -172,7 +172,7 @@ trimmed segments are not part of the replayed call.
 ``_kcp_test_knobs={"host_trim": 0}`` selects the previous host path for the
 A/B record; the D1 explicit-record merge form (``cols_rule="by_chains"`` beyond
 ``COLS_RULE_CHAINS`` state chains) needs the positional ABI and a diagnostics
-launcher on the arena keeps ``KdaWorkspace.run``: both keep the previous path
+launcher on the arena keeps ``KdaDetWorkspace.run``: both keep the previous path
 under either value of ``host_trim``.
 
 Fused forward output (``FWD_O_FUSE_DEFAULT = 1``): the forward that keeps
@@ -501,7 +501,7 @@ TAIL_STAGES = ("dqkg", "glm_intra", "gate_epilogue")
 TAIL_ROW_BUFFERS = ("gk", "v_new", "dv2", "beta_int", "do_int", "akk_int")
 TAIL_COUNTS_ATTR = "_kcp_tail_counts"  # a lean arena's int32 table 0..L-1 (cake_kcp_plan.local_tail_count_words)
 # a forward-only local arena's layout (:func:`cake_kcp_plan.local_fwd_layout`): the forward runs on the layout its
-# arena was sized for (``KdaWorkspace.fwd_layout``), on a backward arena :data:`LOCAL_LAYOUT_FWD`
+# arena was sized for (``KdaDetWorkspace.fwd_layout``), on a backward arena :data:`LOCAL_LAYOUT_FWD`
 LOCAL_LAYOUT_FWD_ONLY = cake_kcp_plan.LOCAL_LAYOUT_FWD_ONLY
 # The KCP-owned local records (:mod:`.cake_kcp_jit`), by the stage name the launch sequences use: the output program
 # over the K1 ``h`` / ``v_new`` tapes and the ``dA_qk`` / ``dv1`` program whose ``dv1`` K2 reads (the forms the
@@ -827,7 +827,7 @@ TEMPLATE_CACHE_ATTR = "_kcp_local_templates"  # the arena attribute holding the 
 class KernelBackend(Backend):
     """The shipped backend: the KCP programs K1-K4 through a program provider (``launch(program, args, *, grid,
     device_index, precision_mode)`` with the positional ABI of the design note §14) and the local
-    chunk stages through :class:`cake_backend.KdaWorkspace` of the per-rank problem.  The default provider is H3's
+    chunk stages through :class:`cake_backend.KdaDetWorkspace` of the per-rank problem.  The default provider is H3's
     registry (:mod:`.cake_kcp_jit`, imported at the first launch so this module imports without it); a bring-up
     provider launching the source builds directly can be passed (``path="direct"``; never a gated row).
 
@@ -2095,10 +2095,10 @@ ENSURE_CACHE_MAX = (
 
 
 def _plan_view(arena: Any, plan: Any) -> Any:
-    """A view of the local arena ``arena`` (``cake_backend.KdaWorkspace``) under the plan of another pack whose
+    """A view of the local arena ``arena`` (``cake_backend.KdaDetWorkspace``) under the plan of another pack whose
     layouts fit it: the same bytes, ``eye`` / ``flags`` and epoch counter, with its own layout views, its own launch
     templates (:data:`TEMPLATE_CACHE_ATTR`) and its own scratch table set (:data:`SCRATCH_TABLES_ATTR`, sized by its
-    plan).  ``KdaWorkspace.views`` checks that each layout fits the arena's bytes."""
+    plan).  ``KdaDetWorkspace.views`` checks that each layout fits the arena's bytes."""
     view = arena._view(plan)
     view.__dict__.pop(TEMPLATE_CACHE_ATTR, None)
     view.__dict__.pop(SCRATCH_TABLES_ATTR, None)
@@ -3521,7 +3521,7 @@ class _Tables:
 
 class WorkspaceDetKcp:
     """The transient buffers of the KCP route on one rank (the design note §7.4) plus the existing backend's local
-    arena (``cake_backend.KdaWorkspace``) for the token-side stages.
+    arena (``cake_backend.KdaDetWorkspace``) for the token-side stages.
 
     Pools (flat, ``state_dtype``): ``c1_send``, ``c1_recv``, ``c2_send``; ``b1_send``, ``b1_recv``, ``b2_send``,
     ``b2_recv`` (``backward``); at ``P > 1`` the staging planes ``stage_b`` / ``stage_m`` and the ``carry`` plane;
@@ -5836,7 +5836,7 @@ def _graph_release(pinned: Any) -> int:
     be reused, and a later call that builds an equal key finds no entry and starts a new one.  Returns the number
     dropped.  A pinned plan view of the arena ``pinned`` (:func:`_plan_view`, the same ``arena`` tensor) matches
     too."""
-    arena = pinned.arena if isinstance(pinned, cake_backend.KdaWorkspace) else None
+    arena = pinned.arena if isinstance(pinned, cake_backend.KdaDetWorkspace) else None
     stale = [
         key
         for key, e in _GRAPHS.items()
@@ -5844,7 +5844,7 @@ def _graph_release(pinned: Any) -> int:
             p is pinned
             or (
                 arena is not None
-                and isinstance(p, cake_backend.KdaWorkspace)
+                and isinstance(p, cake_backend.KdaDetWorkspace)
                 and p.arena is arena
             )
             for p in e.pins
@@ -7483,17 +7483,3 @@ __all__ = [
     "set_backend",
     "tile_index",
 ]
-
-# The names before the det rename, bound to the same objects (not in ``__all__``).
-ChunkKDAKcpFunction = ChunkKDADetFunctionKcp
-KcpCall = CallDetKcp
-KcpOptions = OptionsDetKcp
-KcpRecomputeHandle = RecomputeHandleDetKcp
-KcpSaved = SavedDetKcp
-KcpWorkspace = WorkspaceDetKcp
-chunk_kda_kcp = chunk_kda_det_kcp
-chunk_kda_kcp_bwd = chunk_kda_det_bwd_kcp
-chunk_kda_kcp_fwd = chunk_kda_det_fwd_kcp
-kcp_comm_bytes = kda_det_comm_bytes_kcp
-kcp_saved_bytes = kda_det_saved_bytes_kcp
-kcp_workspace_bytes = kda_det_workspace_bytes_kcp
