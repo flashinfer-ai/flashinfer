@@ -15,9 +15,18 @@ limitations under the License.
 
 Deterministic context-parallel (KCP) packed GDN (Gated DeltaNet) chunked
 training with precise cross-rank state passing (SM100 / SM103 / SM107), the
-Cake backend.  ``flashinfer.gdn_train`` is the legacy entry point: its names
-(``chunk_gdn_kcp``, ``KcpContext``, ...) are compatibility aliases of the
-objects defined here.
+Cake backend.
+
+Mode and dispatch rules: every entry point here is deterministic and carries
+``det`` in its name; none takes a ``deterministic`` keyword (passing one is a
+``TypeError``).  ``torch.use_deterministic_algorithms`` changes nothing here:
+every launch has a fixed order, so the results are bitwise reproducible run to
+run at the same topology.  ``chunk_gdn_det_bwd_kcp`` refuses a saved set or a
+workspace of the non-deterministic mode with ``ValueError``.  The
+non-deterministic mode is the separate package
+``flashinfer.experimental.cake_gdn_train_kcp``, whose entries take
+``deterministic=False`` explicitly.  The pre-rename names
+(``flashinfer.gdn_train``, ``chunk_gdn_kcp``, ``KcpContext``, ...) were removed.
 
 Thin experimental entry points.  The partition / context plan, the host
 orchestration, the saved set, the autograd Function and the generated kernels
