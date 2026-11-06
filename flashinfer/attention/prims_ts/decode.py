@@ -38,6 +38,7 @@ from flashinfer.utils import (
     get_device_sm_count,
     _check_workspace_buffer_alignment,
     check_shape_dtype_device,
+    resolve_enable_pdl,
 )
 
 from flashinfer.trace.templates.attention import (
@@ -3996,6 +3997,7 @@ def prepare_prims_ts_batch_decode_with_kv_cache(
     lse_mode: Literal["none", "base2"] = "none",
     softmax_scale: Optional[GlobalScale] = None,
     output_scale: GlobalScale = 1.0,
+    enable_pdl: Optional[bool] = None,
 ) -> PrimsTSBatchDecodePlan:
     """Validate and prepare a reusable dense-block-table PrimTS launch.
 
@@ -4054,6 +4056,13 @@ def prepare_prims_ts_batch_decode_with_kv_cache(
         of shape () or (1,) on the query device. Types select the compiled signature;
         values are retained as run defaults. Softmax uses natural units. Tensor
         contents must stay finite and positive and may change during replay.
+    enable_pdl : bool, optional
+        Launch the attention kernel and its standalone reducer with
+        programmatic dependent launch (PDL); each kernel waits in-kernel for
+        the preceding grid before it reads its inputs. ``None`` (default)
+        enables it on devices that support PDL. Split launches with fused or
+        cluster reduction keep plain stream ordering. It does not change the
+        selected launch or the workspace size.
 
     Returns
     -------
@@ -4093,6 +4102,7 @@ def prepare_prims_ts_batch_decode_with_kv_cache(
         use_q_token_kv_block_sparse_route=False,
         softmax_scale=softmax_scale,
         output_scale=output_scale,
+        use_pdl=resolve_enable_pdl(enable_pdl, query.device),
         lse_mode=lse_mode,
         use_attention_sinks=use_attention_sinks,
     )
@@ -4163,6 +4173,7 @@ class BatchDecodePagedTSWrapper:
         initialize_workspace: bool = True,
         softmax_scale: Optional[GlobalScale] = None,
         output_scale: GlobalScale = 1.0,
+        enable_pdl: Optional[bool] = None,
     ) -> None:
         """Select/cache a bounded paged-decode execution and bind reusable scratch.
 
@@ -4183,7 +4194,13 @@ class BatchDecodePagedTSWrapper:
         the compiled signature; run() inherits these defaults. Device values
         must be finite and positive and may change in place during graph replay.
         Softmax scales use natural, not base-2, units.
-        """
+
+        ``enable_pdl`` launches the attention kernel and its standalone
+        reducer with programmatic dependent launch (PDL); each kernel waits
+        in-kernel for the preceding grid before it reads its inputs. ``None``
+        (default) enables it on devices that support PDL. Split launches with
+        fused or cluster reduction keep plain stream ordering. It does not
+        change the selected launch or the workspace size."""
 
         if packed_query and max_q_len is None:
             raise ValueError("packed Q requires max_q_len in plan()")
@@ -4256,6 +4273,7 @@ class BatchDecodePagedTSWrapper:
         device, device_index = _resolve_cuda_device(device)
         if validate:
             _validate_runtime_device(device)
+        enable_pdl = resolve_enable_pdl(enable_pdl, device)
         softmax_scale = normalize_scale(
             head_dim**-0.5 if softmax_scale is None else softmax_scale,
             "softmax_scale",
@@ -4283,7 +4301,10 @@ class BatchDecodePagedTSWrapper:
             storage_page_size,
         )
         spec = _resolve_decode_launch_spec(
-            *policy_args, split_kv=split_kv, use_attention_sinks=use_attention_sinks
+            *policy_args,
+            use_pdl=enable_pdl,
+            split_kv=split_kv,
+            use_attention_sinks=use_attention_sinks,
         )
         kv_prefix_mode: Literal["dynamic", "planned_full"] = "dynamic"
         kv_lengths_mode: Literal["dynamic", "planned_uniform_max"] = "dynamic"
@@ -4695,6 +4716,7 @@ def batch_decode_with_paged_kv_cache(
     workspace_buffer: Optional[torch.Tensor] = None,
     max_kv_len: Optional[int] = None,
     validate: bool = True,
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """One-shot fixed or packed-Q paged decode from fixed page tables.
 
@@ -4768,6 +4790,10 @@ def batch_decode_with_paged_kv_cache(
         Validate tensors and metadata values (may synchronize), default True.
         False trusts the caller and requires workspace and explicit bounds;
         skips tensor and metadata validation. Invalid inputs have undefined behavior.
+    enable_pdl : bool, optional
+        Launch with programmatic dependent launch (PDL). ``None`` (default)
+        enables it on devices that support PDL; see
+        :meth:`BatchDecodePagedTSWrapper.plan`.
 
     Returns
     -------
@@ -4938,6 +4964,7 @@ def batch_decode_with_paged_kv_cache(
         initialize_workspace=allocate_workspace,
         softmax_scale=softmax_scale,
         output_scale=output_scale,
+        enable_pdl=enable_pdl,
     )
     return wrapper.run(
         q,

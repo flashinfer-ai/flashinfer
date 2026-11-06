@@ -44,6 +44,7 @@ from flashinfer.trace.templates.attention import (
     prims_ts_paged_block_sparse_trace_dispatch,
     prims_ts_paged_block_sparse_wrapper_trace_dispatch,
 )
+from flashinfer.utils import resolve_enable_pdl
 
 from ._scales import GlobalScale
 from ._block_sparse.common import (
@@ -176,6 +177,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         softmax_rescale_threshold_log2: float = SOFTMAX_RESCALE_THRESHOLD_LOG2,
         sm_scale: GlobalScale | None = None,
         output_scale: GlobalScale = 1.0,
+        enable_pdl: bool | None = None,
     ) -> None:
         """Choose a legal profile and allocate reusable routing capacity.
 
@@ -262,6 +264,12 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         first, such as attention sinks in the first blocks, are the most
         exposed. 0 rescales on every new row maximum and quantizes FP8 P at
         448.
+
+        ``enable_pdl`` launches a Sage plan's scale prepare, a block-sparse
+        plan's route prepare and attention with programmatic dependent launch
+        (PDL); each kernel waits in-kernel for the preceding grid before it
+        reads its inputs. ``None`` (default) enables it on devices that
+        support PDL.
         """
 
         if use_block_sparse:
@@ -329,6 +337,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
                 output_scale=output_scale,
                 sparse_format=sparse_format,
                 use_proxy_routes=use_proxy_routes,
+                enable_pdl=resolve_enable_pdl(enable_pdl, device),
             )
         # This is the only wrapper mutation. Every failure above leaves the
         # previously published revision intact and runnable.
@@ -498,6 +507,7 @@ def block_sparse_attention(
     sage: SageAttentionParams | None = None,
     sage_config: SageAttentionConfig | None = None,
     softmax_rescale_threshold_log2: float = SOFTMAX_RESCALE_THRESHOLD_LOG2,
+    enable_pdl: bool | None = None,
 ) -> torch.Tensor:
     """Plan and run one compact-BSHD block-sparse or dense attention launch.
 
@@ -572,6 +582,11 @@ def block_sparse_attention(
     share_pattern_across_kv_heads : bool
         False (default) uses one pattern per KV head. True requires a singleton
         pattern-head axis and reuses those rows across all physical KV heads.
+    enable_pdl : bool, optional
+        Launch with programmatic dependent launch (PDL). ``None`` (default)
+        enables it on devices that support PDL; see
+        :meth:`BlockSparseTSWrapper.plan`. The synchronous inspection of BSR
+        inputs is a plain stream-ordered launch.
 
     Returns
     -------
@@ -682,6 +697,7 @@ def block_sparse_attention(
         softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
         sm_scale=sm_scale,
         output_scale=output_scale,
+        enable_pdl=enable_pdl,
     )
     return wrapper.run(
         q,
@@ -727,6 +743,7 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
         softmax_rescale_threshold_log2: float = SOFTMAX_RESCALE_THRESHOLD_LOG2,
         sm_scale: GlobalScale | None = None,
         output_scale: GlobalScale = 1.0,
+        enable_pdl: bool | None = None,
     ) -> None:
         """Plan fixed-Q geometry and a maximum variable-K capacity.
 
@@ -757,6 +774,11 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
         binades a row maximum may rise on the Q64/KV256 and Q128/KV128
         profiles before the output is rescaled; see
         :meth:`BlockSparseTSWrapper.plan`.
+
+        ``enable_pdl`` launches the route prepare and attention with
+        programmatic dependent launch (PDL); each kernel waits in-kernel for
+        the preceding grid before it reads its inputs. ``None`` (default)
+        enables it on devices that support PDL.
         """
 
         static = _validate_block_sparse_static_profile(
@@ -794,6 +816,7 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
                 plan_stream=plan_stream,
                 sm_scale=sm_scale,
                 output_scale=output_scale,
+                enable_pdl=resolve_enable_pdl(enable_pdl, device),
             )
         self._plan_state = candidate
 
@@ -947,6 +970,7 @@ def block_sparse_attention_with_paged_kv_cache(
     output_scale: GlobalScale = 1.0,
     out: torch.Tensor | None = None,
     softmax_rescale_threshold_log2: float = SOFTMAX_RESCALE_THRESHOLD_LOG2,
+    enable_pdl: bool | None = None,
 ) -> torch.Tensor:
     """Plan and run one fixed-Q paged block-sparse attention launch.
 
@@ -1004,6 +1028,11 @@ def block_sparse_attention_with_paged_kv_cache(
     share_pattern_across_kv_heads : bool
         False (default) uses one pattern per KV head. True requires a singleton
         pattern-head axis and reuses those rows across all physical KV heads.
+    enable_pdl : bool, optional
+        Launch with programmatic dependent launch (PDL). ``None`` (default)
+        enables it on devices that support PDL; see
+        :meth:`BlockSparsePagedTSWrapper.plan`. The synchronous inspection of
+        the live metadata is a plain stream-ordered launch.
 
     Returns
     -------
@@ -1105,6 +1134,7 @@ def block_sparse_attention_with_paged_kv_cache(
         softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
         sm_scale=sm_scale,
         output_scale=output_scale,
+        enable_pdl=enable_pdl,
     )
     return wrapper.run(
         q,
