@@ -25,6 +25,7 @@ run-to-run bitwise results.
 7. **Mode is part of the name, and only of the name:**
    - No entry point takes `deterministic=`.
    - No public name lacks a mode word. This includes families that have only one implementation today.
+   - Module constants in ALL_CAPS (for example `ARCHES` or `SUPPORTED_COMPUTE_CAPABILITIES`) carry no mode word: the module path already qualifies them. Every other public name, including helper functions, classes and types, carries the mode word.
 8. **`torch.use_deterministic_algorithms(True)`:**
    - A `nondet` entry raises PyTorch's alert at its non-deterministic step. With `warn_only=True` it warns and runs `nondet`. It never falls back to `det`.
    - `det` entries never alert.
