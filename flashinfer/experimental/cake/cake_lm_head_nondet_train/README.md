@@ -10,8 +10,9 @@ the public module `flashinfer.cake_lm_head_nondet_train`
 the shared contract, the kernels and the toolchain rules in full).  Tracking issue
 of the family: https://github.com/flashinfer-ai/flashinfer/issues/5680.
 
-Both the API and the backend are experimental: no compatibility guarantee,
-SM100 (B200 / GB200) is the acceptance architecture; SM103 (B300 / GB300) and
+The public module is a stable API; this backend package is experimental (its
+own names carry no compatibility guarantee).  SM100 (B200 / GB200) is the
+acceptance architecture; SM103 (B300 / GB300) and
 SM107 (R200) are compiled from the same sources (SM107 runs SM103's programs,
 built for `sm_107a`, with SM103's GEMM tile rule tables except the long chunks'
 3-deep dX operand ring; its zero-gradient row skip has a 1946-row floor and
@@ -192,8 +193,9 @@ without a temperature parameter).
 `cake_lm_head_nondet_train_support_logprob` /
 `cake_lm_head_nondet_train_support_kl` have the deterministic entries'
 contract (`cake_lm_head_det_train_support_logprob` / `_kl`).  One autograd
-`Function`, `CakeLMHeadNondetSupportFunction`, serves both.  As part of this package they make no run-to-run promise for the gradients, and
-their backward raises the alert above only when its dense dX runs a block of
+`Function`, `CakeLMHeadNondetSupportFunction`, serves both.  As part of this
+package they make no run-to-run promise for the gradients, and their backward
+raises the alert above only when its dense dX runs a block of
 more than one K slice (a cell below; never on `sm_103a` or `sm_107a`).  Their
 programs are the deterministic
 package's (every sum has one owner and one order) with two changes on the
@@ -601,6 +603,8 @@ the deterministic package, the zero-weight policy rows, changing shapes on reuse
 replay, gradient accumulation, a retained graph, concurrent streams, a
 CUDA graph of the prepared runner and the kept logits),
 `test_cake_lm_head_nondet_train_api.py` (the public module),
+`test_cake_lm_head_nondet_train_names.py` (the names of the module and its
+backend objects),
 `test_cake_lm_head_nondet_train_standalone.py` (a copy imports with
 `flashinfer` blocked; the prebuilt path) and
 `test_cake_lm_head_nondet_train_support.py` (the candidate-support entries).
