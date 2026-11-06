@@ -7719,23 +7719,28 @@ def _cudnn_mm_mxfp8_runner():
             profile: OptimizationProfile,
         ) -> List[tuple]:
             a, b, _, _, _, out, _ = inputs
-            if self._use_override_shape:
-                graph = self._get_override_graph(a, b, out, tactic=0)
-            else:
-                a3 = a.unsqueeze(0)
-                b3 = b.unsqueeze(0)
-                graph = build_cudnn_gemm_mxfp8_graph(
-                    a_shape=a3.shape,
-                    a_stride=a3.stride(),
-                    a_type=_torch_data_type_to_cudnn_data_type(a.dtype),
-                    b_shape=b3.shape,
-                    b_stride=b3.stride(),
-                    b_type=_torch_data_type_to_cudnn_data_type(b.dtype),
-                    o_type=_torch_data_type_to_cudnn_data_type(out.dtype),
-                    block_size=32,
-                    device=a.device,
-                    tactic=0,
-                )
+            try:
+                if self._use_override_shape:
+                    graph = self._get_override_graph(a, b, out, tactic=0)
+                else:
+                    a3 = a.unsqueeze(0)
+                    b3 = b.unsqueeze(0)
+                    graph = build_cudnn_gemm_mxfp8_graph(
+                        a_shape=a3.shape,
+                        a_stride=a3.stride(),
+                        a_type=_torch_data_type_to_cudnn_data_type(a.dtype),
+                        b_shape=b3.shape,
+                        b_stride=b3.stride(),
+                        b_type=_torch_data_type_to_cudnn_data_type(b.dtype),
+                        o_type=_torch_data_type_to_cudnn_data_type(out.dtype),
+                        block_size=32,
+                        device=a.device,
+                        tactic=0,
+                    )
+            except (cudnn.cudnnGraphNotSupportedError, RuntimeError) as exc:
+                # A declined graph leaves the other auto candidates to the tuner.
+                logger.debug("cuDNN mm_mxfp8 graph unsupported, no tactics: %s", exc)
+                return []
             return _cudnn_graph_engine_knob_tactics(graph)
 
         def forward(
@@ -7923,7 +7928,7 @@ def mm_mxfp8(
           Passing 2D linear scales raises ValueError. Use
           ``mxfp8_quantize(..., is_sf_swizzled_layout=True)``.
         - The ``"cudnn"`` backend consumes block scales in the F8_128x4 swizzled
-          layout (``use_8x4_sf_layout=False``) and is supported on SM100/103/110/120/121.
+          layout (``use_8x4_sf_layout=False``) and is supported on SM100/103/107/110/120/121.
 
     batch_invariant: bool
         ``True`` runs the batch-invariant MXFP8 GEMM class in place of the
