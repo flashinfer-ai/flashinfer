@@ -99,16 +99,22 @@ def _checked(weights: MoEWeightPack, hidden: int, intermediate: int):
     return w13, w2, s13, s2
 
 
-def shared_fp4(transformed: Any) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """The packed E2M1 ``w13`` / ``w2`` inside another backend's transformed weights when
-    they are in this kernel's layout (cake, cutedsl), else ``None``."""
-    if hasattr(transformed, "w1_fp4") and hasattr(transformed, "w2_fp4"):  # cake
-        w13, w2 = transformed.w1_fp4, transformed.w2_fp4
-    else:
-        try:  # cutedsl: ((fc1, fc1_scale), (fc2, fc2_scale))
+def shared_fp4(
+    transformed: Any, kernel_name: str | None
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """The packed E2M1 ``w13`` / ``w2`` inside the transformed weights of the backend named
+    ``kernel_name`` when that backend keeps them in this kernel's layout (cake, cutedsl),
+    else ``None``."""
+    if kernel_name == "sm120_mxfp4_mxfp8_bf16_cake":
+        w13 = getattr(transformed, "w1_fp4", None)
+        w2 = getattr(transformed, "w2_fp4", None)
+    elif kernel_name == "sm120_mxfp4_mxfp8_bf16_cutedsl":
+        try:  # ((fc1, fc1_scale), (fc2, fc2_scale))
             (w13, _), (w2, _) = transformed
         except (TypeError, ValueError):
             return None
+    else:
+        return None
     if not all(
         isinstance(t, torch.Tensor) and t.dtype in FP4_PACKED_DTYPES and t.ndim == 3
         for t in (w13, w2)

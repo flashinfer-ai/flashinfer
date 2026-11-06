@@ -4,9 +4,11 @@
 deployment configures, exactly as without the option, and next to it the SM120 MXFP4 x MXFP8
 nosync MegaMoE kernel (``sm120_mxfp4_mxfp8_bf16_nosync``). A call whose tokens per rank stay
 within ``NosyncOptions.max_tokens_per_rank`` on every rank runs the nosync kernel; every other
-call runs the configured layer. Where the nosync kernel cannot run (not compute capability 12.0,
-weights that are not MXFP4, an unsupported geometry), the option does nothing and every call
-runs the configured layer.
+call runs the configured layer. The option needs pre-quantized MXFP4 weights, the input of the
+cake and cutedsl SM120 MegaMoE backends, whose packed FP4 tensors it shares. Where the nosync
+kernel cannot run (not compute capability 12.0, weights that are not MXFP4 such as the BF16
+weights of a ``SplitConfig`` layer, an unsupported geometry), the option does nothing and every
+call runs the configured layer.
 """
 
 from __future__ import annotations
@@ -149,7 +151,8 @@ class MoEEpNosyncLayer(nn.Module):
         intermediate = weights.w13.shape[1] // 2
         hidden = fleet_params.token_hidden_size
         transformed = getattr(self.base, "_transformed", None)
-        fp4 = shared_fp4(transformed) if transformed is not None else None
+        kernel_name = _configured(backend, "kernel_name")
+        fp4 = shared_fp4(transformed, kernel_name) if transformed is not None else None
         nosync_weights = preprocess_mega_weights(
             weights, hidden_size=hidden, intermediate_size=intermediate, fp4=fp4
         )
