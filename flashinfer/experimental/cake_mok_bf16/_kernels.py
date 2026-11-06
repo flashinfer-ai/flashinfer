@@ -1650,7 +1650,7 @@ class MoKBackwardMXFP8:
             rows,
             g.routed_rows * g.ib,
             g.routed_rows,
-            g.macros,
+            g.macros * (experts + 1),
             g.macros,
         )
         if layout is None:
