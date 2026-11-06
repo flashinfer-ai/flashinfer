@@ -3920,20 +3920,26 @@ def test_sm107a_m64_multi_tile_launch_follows_the_process_runtime(
 # counts up to the half wave run the persistent body, every token count past
 # it the M64 body.
 _SM107_KV4_M64_SPANS = """
-widths             | 208         | 208 kv4     | 216         | 216 kv4     | 224 kv4
-176                | 1-12 17-104 | 1-104       | 1-12 17-108 | 1-108       | 1-112
-177 191            | 1-12 17-104 | 1-12 17-104 | 1-12 17-108 | 1-12 17-108 | 1-12 17-112
-192 255            | 1-12 32-104 | 1-12 32-104 | 1-12 33-108 | 1-12 33-108 | 1-12 34-112
-256                | 1-12 27-104 | 1-104       | 1-12 28-108 | 1-108       | 1-112
-257 288 289 352    | 1-12 54-104 | 1-16 52-104 | 1-12 56-108 | 1-16 54-108 | 1-16 56-112
-353 383            | 1-12 54-104 | 1-12 52-104 | 1-12 56-108 | 1-12 54-108 | 1-12 56-112
-384                | 53-104      | 1-104       | 55-108      | 1-108       | 1-112
-385 511            | 63-104      | 63-104      | 65-108      | 65-108      | 68-112
-512                | 55-104      | 51-104      | 57-108      | 52-108      | 54-112
-896 1152           | -           | 78-104      | -           | 80-108      | 83-112
-1024               | -           | 93-104      | -           | 96-108      | 100-112
-513 640 768 895    | -           | -           | -           | -           | -
-897 1023 1025 1151 | -           | -           | -           | -           | -
+widths          | 208         | 208 kv4           | 216         | 216 kv4           | 224 kv4
+176             | 1-12 17-104 | 1-104             | 1-12 17-108 | 1-108             | 1-112
+177 191         | 1-12 17-104 | 1-12 17-104       | 1-12 17-108 | 1-12 17-108       | 1-12 17-112
+192 255         | 1-12 32-104 | 1-12 32-104       | 1-12 33-108 | 1-12 33-108       | 1-12 34-112
+256             | 1-12 27-104 | 1-104             | 1-12 28-108 | 1-108             | 1-112
+257 288 289 352 | 1-12 54-104 | 1-16 24-47 52-104 | 1-12 56-108 | 1-16 24-47 54-108 | 1-16 24-47 56-112
+353 383         | 1-12 54-104 | 1-12 44-47 52-104 | 1-12 56-108 | 1-12 44-47 54-108 | 1-12 44-47 56-112
+384             | 53-104      | 1-104             | 55-108      | 1-108             | 1-112
+385 511         | 63-104      | 60-104            | 65-108      | 63-108            | 65-112
+512             | 55-104      | 40-104            | 57-108      | 41-108            | 43-112
+513 639         | -           | 64-104            | -           | 67-108            | 69-112
+640             | -           | 32-47 56-104      | -           | 32-47 58-108      | 32-47 60-112
+641 767         | -           | 59-104            | -           | 62-108            | 64-112
+768             | -           | 55-104            | -           | 58-108            | 60-112
+769 895         | -           | 77-104            | -           | 80-108            | 83-112
+896             | -           | 63-104            | -           | 66-108            | 68-112
+897 1023        | -           | 78-104            | -           | 81-108            | 83-112
+1024            | -           | 81-104            | -           | 84-108            | 87-112
+1025 1151       | -           | 91-104            | -           | 94-108            | 98-112
+1152            | -           | 77-104            | -           | 79-108            | 82-112
 """
 
 
@@ -3992,9 +3998,10 @@ def test_fp8_h64_decode_rows_route_by_the_kv4_edges_on_sm107():
     """On SM107 every FP8/H64 decode row up to two tokens past the half wave
     (208, 216 and 224 SMs) routes as ``_SM107_KV4_M64_SPANS`` lists, without
     and with the four-stage edges.  They take widths 176, 256 and 384 at every
-    token count, widths 257-352 at 1-16 tokens (then the persistent body again
-    until 52 tokens at 208 SMs), widths 257-383 and 512 a few tokens earlier,
-    and widths 896, 1024 and 1152 before the half wave."""
+    token count; widths 257-352 at 1-16 and 24-47 tokens and widths 353-383 at
+    44-47 tokens, below the uniform route's K=64 floor (then the persistent
+    body again until 52 tokens at 208 SMs); widths 385-512 earlier; and
+    widths 513-1152 before the half wave, width 640 also at 32-47 tokens."""
     table = _sm107_kv4_m64_spans()
     assert len(_sm107_kv4_widths()) == sum(len(widths) for widths, _ in table)
     for widths, spans in table:
@@ -4013,16 +4020,20 @@ def test_fp8_h64_decode_rows_route_by_the_kv4_edges_on_sm107():
 @pytest.mark.cpu_only
 def test_kv4_edges_only_promote_sm107a_h64_decode_rows():
     """The four-stage edges only move SM107 FP8/H64 decode rows of more than
-    one tile from the persistent body to the multi-tile M64 body: both tables
-    key SM107 alone, no M64 edge comes later than today's, no short-window
-    width keeps a row persistent that today runs on the M64 body, and the
-    other architectures, head counts, BF16 and prefill rows route as without
+    one tile from the persistent body to the multi-tile M64 body: the three
+    tables key SM107 alone, no M64 edge comes later than today's, no
+    short-window width keeps a row persistent that today runs on the M64 body,
+    the windows below the K=64 floor start past 16 tokens and below that
+    floor, on disjoint widths of a key with an edge and two or more complete
+    tiles (rows the persistent body runs past 12 tokens), and the other
+    architectures, head counts, BF16 and prefill rows route as without
     them."""
     import itertools
 
     short = cake._FP8_H64_PERSISTENT_SHORT_MIN_WIDTH_KV4
     early = cake._FP8_H64_M64_EARLY_WAVE_KV4
-    assert set(short) == set(early) == {"sm_107a"}
+    band = cake._FP8_H64_M64_BELOW_K64_KV4
+    assert set(short) == set(early) == set(band) == {"sm_107a"}
     for arch, edges in early.items():
         base = cake._FP8_H64_M64_EARLY_WAVE[arch]
         for tiles, (num, den) in edges.items():
@@ -4030,6 +4041,17 @@ def test_kv4_edges_only_promote_sm107a_h64_decode_rows():
             if tiles in base:
                 base_num, base_den = base[tiles]
                 assert num * base_den <= base_num * den, tiles
+    for arch, keys in band.items():
+        floor = cake._K64_SIBLING_MIN_TOKENS[arch]
+        for tiles, windows in keys.items():
+            assert tiles in early[arch] and tiles[1] >= 2, tiles
+            last = 0
+            for min_width, max_width, first in sorted(windows):
+                assert last < min_width <= max_width, (tiles, min_width)
+                for width in (min_width, max_width):
+                    assert (-(-width // 128), width // 128) == tiles, width
+                assert 17 <= first < floor, (tiles, first)
+                last = max_width
     for arch, entries in short.items():
         # Today the one-tile rows run the persistent body up to 16 tokens from
         # the one-tile short-window width on; wider rows from two tiles on.
@@ -4148,6 +4170,53 @@ def test_kv4_false_routes_are_todays():
                     default = _h64_decode_route(width, tokens, sm_count, arch)
                     off = _h64_decode_route(width, tokens, sm_count, arch, kv4=False)
                     assert default == off == expected, (arch, sm_count, width, tokens)
+
+
+# SM107's previous four-stage edges of the FP8/H64 decode rows (no windows
+# below the K=64 floor), frozen.
+_PREVIOUS_SM107_H64_EARLY_WAVE_KV4 = {
+    (2, 1): (3, 20),
+    (2, 2): (0, 1),
+    (3, 2): (14, 57),
+    (3, 3): (0, 1),
+    (4, 3): (3, 10),
+    (4, 4): (19, 79),
+    (7, 7): (77, 208),
+    (8, 8): (23, 52),
+    (9, 9): (77, 208),
+}
+
+
+@pytest.mark.cpu_only
+def test_kv4_tables_only_promote_relative_to_the_previous_kv4_tables(monkeypatch):
+    """Relative to the previous four-stage edges (frozen above, without
+    windows below the K=64 floor), the current tables move SM107 FP8/H64
+    decode rows of widths 129-1152 only from the uniform route to the
+    multi-tile M64 route: 22775, 23411 and 23285 rows up to two tokens past
+    the half wave at 208, 212 and 216 SMs."""
+    sm_counts = (208, 212, 216)
+    current = {
+        (sm_count, width, tokens): _h64_decode_route(
+            width, tokens, sm_count, "sm_107a", kv4=True
+        )
+        for sm_count in sm_counts
+        for width in range(129, 1153)
+        for tokens in range(1, sm_count // 2 + 3)
+    }
+    monkeypatch.setattr(
+        cake,
+        "_FP8_H64_M64_EARLY_WAVE_KV4",
+        {"sm_107a": _PREVIOUS_SM107_H64_EARLY_WAVE_KV4},
+    )
+    monkeypatch.setattr(cake, "_FP8_H64_M64_BELOW_K64_KV4", {})
+    moved = dict.fromkeys(sm_counts, 0)
+    for row, new in current.items():
+        sm_count, width, tokens = row
+        old = _h64_decode_route(width, tokens, sm_count, "sm_107a", kv4=True)
+        if new != old:
+            assert (old, new) == (_UNIFORM_ROUTE, _M64_MULTI_TILE_ROUTE), row
+            moved[sm_count] += 1
+    assert moved == {208: 22775, 212: 23411, 216: 23285}
 
 
 def _bf16_out_at(rows, num_heads, offset):
@@ -4294,7 +4363,7 @@ def test_row_tiled_h64_decode_chunks_run_the_kv4_sibling(monkeypatch):
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("width,tokens", [(384, 48), (512, 52)])
+@pytest.mark.parametrize("width,tokens", [(384, 48), (512, 52), (640, 56)])
 def test_k64_only_ceiling_keeps_todays_h64_decode_routes(
     monkeypatch, k64_gate, kv4_gate, width, tokens
 ):
@@ -4314,6 +4383,80 @@ def test_k64_only_ceiling_keeps_todays_h64_decode_routes(
     (bound,) = calls
     assert (bound["grid_x"], bound["grid_y"], bound["grid_z"]) == (2 * tokens, 1, 1)
     assert bound["total_work_items"] == tokens
+
+
+@pytest.mark.cpu_only
+def test_sm107a_kv4_band_ends_at_the_k64_floor(monkeypatch):
+    """With the four-stage edges, SM107's FP8/H64 decode rows of widths
+    257-352 take the M64 body from 24 tokens, those of widths 353-383 from
+    44 tokens and those of width 640 from 32 tokens up to the uniform route's
+    K=64 floor (48 rows, read when the call routes), then the persistent body
+    until the early edge; without them, and on the other architectures, the
+    rows route as before.  At 208 SMs those rows launch the four-stage
+    sibling, one CTA per token; the rows from the floor run the uniform
+    route's K=64 sibling and the rows of widths 353-383 below 44 tokens its
+    K=32 program, two CTAs per token."""
+    assert cake._FP8_H64_M64_BELOW_K64_KV4 == {
+        "sm_107a": {
+            (3, 2): ((257, 352, 24), (353, 383, 44)),
+            (5, 5): ((640, 640, 32),),
+        },
+    }
+    assert cake._K64_SIBLING_MIN_TOKENS == {"sm_107a": 48}
+    # The first M64 token count of the early edge with and without them.
+    kv4_edge = {208: 52, 212: 53, 216: 54}
+    base_edge = {208: 54, 212: 55, 216: 56}
+
+    def m64_body(width, tokens, sm_count, arch, kv4):
+        return cake._fp8_h64_uses_m64_body(
+            tokens, sm_count, sparse_topk=width, arch=arch, kv4=kv4
+        )
+
+    for sm_count in (208, 212, 216):
+        for width in range(260, 384, 4):
+            first = 24 if width <= 352 else 44
+            for tokens in range(13, 61):
+                key = (sm_count, width, tokens)
+                band = first <= tokens <= 47
+                with_kv4 = band or tokens >= kv4_edge[sm_count]
+                assert m64_body(width, tokens, sm_count, "sm_107a", True) == with_kv4
+                today = tokens >= base_edge[sm_count]
+                assert m64_body(width, tokens, sm_count, "sm_107a", False) == today
+                for arch in ("sm_100a", "sm_103a", None):
+                    assert not m64_body(width, tokens, sm_count, arch, False), key
+                    assert not m64_body(width, tokens, sm_count, arch, True), key
+    # Width 640 (five complete tiles) from 32 tokens up to the floor, then the
+    # persistent body until its early edge.
+    for sm_count, edge in ((208, 56), (212, 57), (216, 58)):
+        for tokens in range(13, 61):
+            with_kv4 = 32 <= tokens <= 47 or tokens >= edge
+            assert m64_body(640, tokens, sm_count, "sm_107a", True) == with_kv4
+            assert not m64_body(640, tokens, sm_count, "sm_107a", False)
+    sibling = f"{_M64_MULTI_TILE_ROUTE}_kv4"
+    for width, tokens, program, grid in (
+        (296, 30, sibling, 30),
+        (296, 48, f"{_UNIFORM_ROUTE}_k64", 96),
+        (296, 50, f"{_UNIFORM_ROUTE}_k64", 100),
+        (296, 52, sibling, 52),
+        (380, 30, _UNIFORM_ROUTE, 60),
+        (380, 45, sibling, 45),
+    ):
+        programs, calls, _ = _run_fake_h64_decode_fp8(
+            monkeypatch, arch="sm_107a", width=width, tokens=tokens
+        )
+        (bound,) = calls
+        assert programs == [program], (width, tokens)
+        assert (bound["grid_x"], bound["grid_y"], bound["grid_z"]) == (grid, 1, 1)
+        assert bound["total_work_items"] == tokens
+    # The windows end at the floor the call reads: 40 rows end them at 39.
+    monkeypatch.setattr(cake, "_K64_SIBLING_MIN_TOKENS", {"sm_107a": 40})
+    for tokens in range(13, 61):
+        lower = m64_body(296, tokens, 208, "sm_107a", True)
+        upper = m64_body(380, tokens, 208, "sm_107a", True)
+        assert lower == (24 <= tokens <= 39 or tokens >= 52), tokens
+        assert upper == (tokens >= 52), tokens
+        wide = m64_body(640, tokens, 208, "sm_107a", True)
+        assert wide == (32 <= tokens <= 39 or tokens >= 56), tokens
 
 
 @pytest.mark.cpu_only
