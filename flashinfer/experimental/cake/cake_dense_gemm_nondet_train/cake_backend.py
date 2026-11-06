@@ -89,7 +89,8 @@ package's entry point of the same operation (the same program, the same bits).  
 (``CakeDenseGemmDetProjectionPlan``, ``CakeDenseGemmDetProjectionLaunch``, ``CakeDenseGemmDetRouterPlan``,
 ``CakeDenseGemmDetRouterLaunch``).  A row that runs a program of this package
 never goes to the deterministic package.  The deterministic package is imported at run time as this package's
-sibling, never through an absolute ``flashinfer`` import; a vendored copy binds it with
+sibling (the top-level package ``cake_dense_gemm_det_train`` when this package is vendored as a top-level package),
+never through an absolute ``flashinfer`` import; a copy under another name is bound with
 :func:`use_deterministic_backend`.  The deterministic package never imports this one, and this module re-exports no
 name of it.  :func:`cake_dense_gemm_nondet_train_convenience_cache_clear` clears the convenience caches and workspace arenas of both packages; a
 convenience-path call that this package launches from its arenas, captured into a CUDA graph, stays valid until then
@@ -151,12 +152,13 @@ _DET_ENTRIES = (
 
 
 def use_deterministic_backend(module: ModuleType) -> None:
-    """Bind the deterministic package's ``cake_backend`` module explicitly.  In a FlashInfer tree the deterministic
-    package is this package's sibling and is resolved on first use; a vendored copy of this package (imported
-    under another name, without the ``flashinfer`` package around it) vendors the deterministic package too and
-    binds its ``cake_backend`` here before the first call that needs it.  Binding drops this package's convenience
-    caches and arenas (:func:`_drop_convenience_entries`): their entries hold the plans and programs of the package
-    bound before.  Like :func:`cake_dense_gemm_nondet_train_convenience_cache_clear`, it invalidates the CUDA graphs that captured a
+    """Bind the deterministic package's ``cake_backend`` module explicitly.  The deterministic package is this
+    package's sibling and is resolved on first use, in a FlashInfer tree and in a vendored tree that ships
+    ``cake_dense_gemm_det_train`` next to this package (both top-level packages, or both in one parent package); a
+    vendored tree that holds it under another name binds its ``cake_backend`` here before the first call that
+    needs it.  Binding drops this package's convenience caches and arenas (:func:`_drop_convenience_entries`): their
+    entries hold the plans and programs of the package bound before.  Like
+    :func:`cake_dense_gemm_nondet_train_convenience_cache_clear`, it invalidates the CUDA graphs that captured a
     convenience-path call of this package."""
     missing = [name for name in _DET_ENTRIES if not hasattr(module, name)]
     if missing:

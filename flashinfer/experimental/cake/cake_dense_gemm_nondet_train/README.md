@@ -79,8 +79,8 @@ On some rows this module runs the deterministic package's fixed-order programs:
   program today.  The "run-to-run bits" rows below describe the current programs, not a contract.
 - The tensors passed between the forward and the gradients carry no mode: recompute a checkpointed forward with the
   module that made the saved one (same package only).  Neither package has an autograd Function or a saved tape.
-- This package imports the deterministic package at run time, as its sibling (a vendored copy binds it with
-  `cake_backend.use_deterministic_backend`).  It re-exports no name of the deterministic package.
+- This package imports the deterministic package at run time, as its sibling (see
+  [Standalone build](#standalone-build-vendoring)).  It re-exports no name of the deterministic package.
 
 | operation | route |
 |---|---|
@@ -1035,6 +1035,20 @@ the deterministic package's names there.
 | `cake_jit.py` | the registry of this package's programs (`ARG_PLANS`, `MODULES`, `KERNELS`) and the loader |
 | `cake_build.py`, `build.json`, `csrc/cake_dense_projection_gemm/` | the `cake-build/1` loader, manifest and generated sources of this package's programs (written by the Cake exporter) |
 
-The deterministic package is resolved as this package's sibling on first use; the package never imports `flashinfer`
-by absolute name.  A consumer that vendors this package vendors the deterministic package too and binds it with
-`cake_backend.use_deterministic_backend(<its cake_backend module>)`.
+## Standalone build (vendoring)
+
+This backend directory builds and runs outside FlashInfer (flashinfer-ai/flashinfer#6553) with one declared
+dependency: the deterministic backend directory `cake_dense_gemm_det_train`
+(`flashinfer/experimental/cake/cake_dense_gemm_det_train`), whose fixed-order programs this package runs.  `build.json`
+declares it (`common.requires.packages`: `["cake_dense_gemm_det_train"]`, sibling directory names).  A vendoring build
+ships the two directories together, next to each other.
+
+- This package imports the deterministic package lazily, on the first call that needs it, as its sibling:
+  `<parent>.cake_dense_gemm_det_train` when this package sits in a parent package (a FlashInfer tree), the top-level
+  package `cake_dense_gemm_det_train` when this package is vendored as a top-level package.  Importing this package
+  never imports the deterministic one; without it, the first use raises `ImportError` that names it.
+- A tree that holds the deterministic package under another name binds it with
+  `cake_backend.use_deterministic_backend(<its cake_backend module>)` before the first call that needs it.
+- The package imports nothing else outside its own directory.  It imports `flashinfer` only in `cake_build`'s guarded
+  fallback to FlashInfer's JIT when a library is not prebuilt.
+- The mode is the package name: no keyword argument and no environment variable selects it.

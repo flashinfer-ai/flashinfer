@@ -128,9 +128,10 @@ TEMPLATE_PREFIXES = (
     "dense_proj_gemm_dsm_",
 )
 
-#: The deterministic package: a sibling of this package (``<parent>.cake_dense_gemm_det_train``), resolved on first
-#: use and never through an absolute ``flashinfer`` import; a vendored copy binds it explicitly
-#: (``cake_backend.use_deterministic_backend``).
+#: The deterministic package, which this package needs next to it: its sibling, resolved on first use and never
+#: through an absolute ``flashinfer`` import -- ``<parent>.cake_dense_gemm_det_train`` when this package sits in a
+#: parent package (a FlashInfer tree), the top-level package ``cake_dense_gemm_det_train`` when this package is
+#: vendored as a top-level package.  A copy under another name is bound with ``cake_backend.use_deterministic_backend``.
 DETERMINISTIC_PACKAGE = "cake_dense_gemm_det_train"
 _det_package: Optional[str] = None
 
@@ -143,18 +144,25 @@ def bind_deterministic_package(package: str) -> None:
 
 
 def deterministic_module(name: str) -> ModuleType:
-    """The submodule ``name`` (``cake_backend``, ``cake_jit``, ``cake_build``) of the deterministic package."""
+    """The submodule ``name`` (``cake_backend``, ``cake_jit``, ``cake_build``) of the deterministic package: the
+    package bound with ``cake_backend.use_deterministic_backend``, else the sibling :data:`DETERMINISTIC_PACKAGE`
+    (a top-level package when this package is one).  Raises ``ImportError`` when that sibling is not installed."""
     package = _det_package
-    if package is None:
-        parent = __name__.rpartition(".")[0].rpartition(".")[0]
-        if not parent:
-            raise RuntimeError(
-                f"{__name__.rpartition('.')[0]} reuses the programs of the deterministic package "
-                f"{DETERMINISTIC_PACKAGE!r}, which a vendored copy has no sibling of; vendor that package too and "
-                "bind it with cake_backend.use_deterministic_backend(<its cake_backend module>)"
-            )
-        package = f"{parent}.{DETERMINISTIC_PACKAGE}"
-    return importlib.import_module(f"{package}.{name}")
+    if package is not None:
+        return importlib.import_module(f"{package}.{name}")
+    parent = __name__.rpartition(".")[0].rpartition(".")[0]
+    package = f"{parent}.{DETERMINISTIC_PACKAGE}" if parent else DETERMINISTIC_PACKAGE
+    try:
+        return importlib.import_module(f"{package}.{name}")
+    except ModuleNotFoundError as exc:
+        if exc.name not in (package, f"{package}.{name}"):
+            raise
+        raise ImportError(
+            f"{__name__.rpartition('.')[0]} reuses the programs of the deterministic package "
+            f"{DETERMINISTIC_PACKAGE!r} and imports it as its sibling {package!r}, which is not installed: vendor "
+            f"{DETERMINISTIC_PACKAGE} next to this package, or bind a copy with "
+            "cake_backend.use_deterministic_backend(<its cake_backend module>)"
+        ) from exc
 
 
 def arg_plan_key(plan) -> str:

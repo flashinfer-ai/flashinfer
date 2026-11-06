@@ -150,10 +150,9 @@ def test_cake_build_is_the_pinned_loader():
 
 
 def test_the_deterministic_package_resolves_as_a_sibling(monkeypatch):
-    """In a FlashInfer tree and in a copy vendored with the deterministic package beside it (the vendored gate's
-    layout) the deterministic package resolves as this package's sibling."""
-    if not cake_jit.__name__.rpartition(".")[0].rpartition(".")[0]:
-        pytest.skip("a top-level copy has no parent package to hold a sibling")
+    """In a FlashInfer tree and in a copy vendored with the deterministic package beside it (both in one parent
+    package, or both top-level packages: ``test_cake_dense_gemm_nondet_train_standalone.py``) the deterministic
+    package resolves as this package's sibling."""
     monkeypatch.setattr(cake_jit, "_det_package", None)
     assert cake_backend.deterministic_backend() is det_backend
     assert cake_jit.deterministic_module("cake_jit") is det_jit
