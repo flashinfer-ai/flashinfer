@@ -607,11 +607,6 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
         """
         GPU device kernel performing the Persistent batched GEMM computation.
         """
-        # Keep alpha in FP32 for precision: the accumulator is in FP32 and alpha
-        # may be a very small scaling factor. Converting to c_dtype (e.g., FP16)
-        # before multiplication could cause overflow when acc values are large.
-        alpha_value = alpha[0].to(cutlass.Float32)
-
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
 
@@ -908,6 +903,11 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
 
         # PDL bookend: always emitted, actual behavior controlled by use_pdl= in .launch()
         griddepcontrol_wait()
+
+        # Keep alpha in FP32 for precision: the accumulator is in FP32 and alpha
+        # may be a very small scaling factor. Converting to c_dtype (e.g., FP16)
+        # before multiplication could cause overflow when acc values are large.
+        alpha_value = alpha[0].to(cutlass.Float32)
 
         #
         # Construct the scheduler

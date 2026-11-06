@@ -153,8 +153,6 @@ __device__ __forceinline__ TopkResults fast_topk_cuda_v4(
     return threshold_bin;
   };
 
-  if (PDL_ENABLED) cudaGridDependencySynchronize();
-
   if (radix_thread) {
     if (pre_hist != nullptr) {
       shared_hist[threadIdx.x] = pre_hist[threadIdx.x];
@@ -414,6 +412,7 @@ __global__ __launch_bounds__(1024) void __cluster_dims__(NClusters, 1, 1)
         IdxT* __restrict__ output_indices, T* __restrict__ output_values, int seq_len,
         int* __restrict__ pre_hist, int* __restrict__ cached_overflow, int overflow_stride,
         int logit_stride, int indices_stride, int num_cached, const int TopK) {
+  if (PDL_ENABLED) cudaGridDependencySynchronize();
   int64_t cluster_id = blockIdx.x / NClusters;
   int64_t logit_offset = cluster_id * logit_stride;
   int64_t ind_offset = cluster_id * indices_stride;
@@ -462,6 +461,7 @@ __global__ __launch_bounds__(1024) void __cluster_dims__(NClusters, 1, 1)
         int* __restrict__ cached_overflow,  // [batchsize, 4 * NClusters * overflow_stride]
         int overflow_stride, int logit_stride, int indices_stride, int page_table_stride,
         int num_cached, const int TopK) {
+  if (PDL_ENABLED) cudaGridDependencySynchronize();
   int64_t cluster_id = blockIdx.x / NClusters;
   int64_t logit_offset = cluster_id * logit_stride;
   int64_t ind_offset = cluster_id * indices_stride;
@@ -506,6 +506,7 @@ __global__ __launch_bounds__(1024) void __cluster_dims__(NClusters, 1, 1)
         int* __restrict__ pre_hist,         // optional[batchsize, 256]
         int* __restrict__ cached_overflow,  // [batchsize, 4 * NClusters * overflow_stride]
         int overflow_stride, int logit_stride, int indices_stride, int num_cached, const int TopK) {
+  if (PDL_ENABLED) cudaGridDependencySynchronize();
   int cluster_id = blockIdx.x / NClusters;
   int64_t logit_offset = cluster_id * logit_stride;
   int64_t ind_offset = cluster_id * indices_stride;

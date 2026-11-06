@@ -1052,9 +1052,6 @@ class DenseGemmKernel:
         svdquant_l1: Optional[cute.Tensor],
         svdquant_bias: Optional[cute.Tensor],
     ):
-        # Keep alpha in FP32 for precision
-        alpha_value = alpha[0].to(cutlass.Float32)
-
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -1405,6 +1402,9 @@ class DenseGemmKernel:
 
         if cutlass.const_expr(self.enable_pdl):
             griddepcontrol_wait()
+
+        # Keep alpha in FP32 for precision
+        alpha_value = alpha[0].to(cutlass.Float32)
 
         k_tile_cnt = cute.size(gA_mkl, mode=[3])
         block_idx = cute.arch.block_idx()

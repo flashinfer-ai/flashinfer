@@ -21,16 +21,16 @@ import torch
 
 from flashinfer.cuda_utils import checkCudaErrors, driver, nvrtc
 
-# Triggers the dependent launch first and writes `value` only after spinning, so a
+# Triggers the dependent launch first and writes `bits` only after spinning, so a
 # PDL consumer that reads `dst` before `griddepcontrol.wait` sees the old value.
 _LATE_STORE_SOURCE = r"""
-extern "C" __global__ void late_store(float* dst, float value, long long spin_cycles) {
+extern "C" __global__ void late_store(unsigned int* dst, unsigned int bits, long long spin_cycles) {
   asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
   long long start = clock64();
   while (clock64() - start < spin_cycles) {
   }
   asm volatile("" ::: "memory");
-  *dst = value;
+  *dst = bits;
 }
 """
 # Long enough for the consumer kernel to get past its prologue before the store.
@@ -54,14 +54,15 @@ def _late_store_kernel(device_index: int):
     return checkCudaErrors(driver.cuModuleGetFunction(module, b"late_store"))
 
 
-def late_store(dst: torch.Tensor, value: float) -> None:
+def late_store(dst: torch.Tensor, value: int | float) -> None:
+    bits = torch.tensor([value], dtype=dst.dtype).view(torch.uint32).item()
     # Driver calls act on the current context; pin it to dst's device for the
     # module load and the launch alike.
     with torch.cuda.device(dst.device):
         kernel = _late_store_kernel(dst.device.index)
         args = (
-            (dst.data_ptr(), value, _LATE_STORE_SPIN_CYCLES),
-            (ctypes.c_void_p, ctypes.c_float, ctypes.c_longlong),
+            (dst.data_ptr(), bits, _LATE_STORE_SPIN_CYCLES),
+            (ctypes.c_void_p, ctypes.c_uint, ctypes.c_longlong),
         )
         stream = torch.cuda.current_stream(dst.device).cuda_stream
         checkCudaErrors(
