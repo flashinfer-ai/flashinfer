@@ -356,7 +356,8 @@ jobs:
         env:
           RELEASE_TAG: ${{ needs.setup.outputs.release_tag }}
         run: |
-          python3 scripts/infra/update_whl_index.py \
+          INFRA_DIR=scripts/infra; [ -d "${INFRA_DIR}" ] || INFRA_DIR=scripts
+          python3 "${INFRA_DIR}"/update_whl_index.py \
             --dist-dir dist \
             --output-dir flashinfer-whl \
             --release-tag "${RELEASE_TAG}"

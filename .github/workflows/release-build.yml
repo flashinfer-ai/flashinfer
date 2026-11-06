@@ -234,7 +234,10 @@ jobs:
           PYTORCH_INDEX: ${{ matrix.pytorch_index }}
           SCCACHE_BUCKET: ${{ vars.SCCACHE_BUCKET || 'flashinfer-build-cache' }}
           SCCACHE_REGION: ${{ vars.SCCACHE_REGION || 'us-west-2' }}
-        run: bash scripts/infra/build_flashinfer_jit_cache_artifact.sh
+        run: |
+          # Release tags cut before the infra relocation keep these under scripts/.
+          INFRA_DIR=scripts/infra; [ -d "${INFRA_DIR}" ] || INFRA_DIR=scripts
+          bash "${INFRA_DIR}/build_flashinfer_jit_cache_artifact.sh"
         timeout-minutes: 360
 
       - name: Upload provider build diagnostics
@@ -289,7 +292,10 @@ jobs:
           FLASHINFER_JIT_CACHE_PROVIDER_ARCHS: ${{ matrix.provider_architectures }}
           FLASHINFER_LOCAL_VERSION: ${{ matrix.cuda_label }}
           PYTORCH_INDEX: ${{ matrix.pytorch_index }}
-        run: bash scripts/infra/build_flashinfer_jit_cache_artifact.sh
+        run: |
+          # Release tags cut before the infra relocation keep these under scripts/.
+          INFRA_DIR=scripts/infra; [ -d "${INFRA_DIR}" ] || INFRA_DIR=scripts
+          bash "${INFRA_DIR}/build_flashinfer_jit_cache_artifact.sh"
         timeout-minutes: 60
 
       - name: Upload shim artifact
@@ -339,7 +345,8 @@ jobs:
           PLATFORM_TAG: manylinux_2_28_${{ matrix.cpu_architecture }}
         run: |
           read -ra PROVIDERS <<< "${EXPECTED_PROVIDERS}"
-          python3 scripts/infra/verify_jit_cache_provider_release.py \
+          INFRA_DIR=scripts/infra; [ -d "${INFRA_DIR}" ] || INFRA_DIR=scripts
+          python3 "${INFRA_DIR}"/verify_jit_cache_provider_release.py \
             --wheelhouse wheelhouse \
             --version "${EXPECTED_VERSION}" \
             --providers "${PROVIDERS[@]}" \
