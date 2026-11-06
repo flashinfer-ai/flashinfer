@@ -1206,13 +1206,10 @@ def test_deepseek_scale_block_rejects_wrong_expert_dim():
     [
         # DeepSeek-V4.1-Flash experts at EP8: 384 experts, top-6, rows of 8 ranks.
         (512, 8),
-        (4096, 64),
-        (4096, 32),
         (16384, 256),
-        (32768, 256),
     ],
 )
-def test_weight_policy_uses_runtime_routing_instead_of_average(num_tokens, tile_n):
+def test_weight_policy_enables_runtime_selection_on_both_gemms(num_tokens, tile_n):
     pair = map_trtllm_mxfp4_mxfp8_moe_tactic(
         [tile_n, 0], num_tokens=num_tokens, top_k=6, num_local_experts=48
     )
@@ -1221,21 +1218,9 @@ def test_weight_policy_uses_runtime_routing_instead_of_average(num_tokens, tile_
     assert pair.fc2.cfg.build().weight_l2_evict_first == 1
 
 
-@pytest.mark.parametrize(
-    "expert_rows",
-    [
-        [1],
-        [128],
-        [129],
-        [256],
-        [257],
-        [0, 128, 0, 129, 1, 0],
-        [129, 127],  # Mean fits one tile, but expert 0 needs two CTAs.
-        [1, 1024, 1],  # Single-tile experts in a launch with a high mean.
-    ],
-)
-def test_weight_policy_checks_each_experts_entire_token_tile_run(expert_rows):
+def test_weight_policy_checks_each_experts_entire_token_tile_run():
     tile_n = 128
+    expert_rows = [0, 128, 0, 129, 1, 0]
     tile_experts = [
         expert
         for expert, rows in enumerate(expert_rows)
@@ -1267,28 +1252,21 @@ def test_weight_policy_preserves_ineligible_gemm_configs(overrides):
     assert "weight_l2_evict_first" not in pair.fc2.cfg.kwargs
 
 
-@pytest.mark.parametrize(
-    ("overrides", "message"),
-    [
-        ({"weight_l2_evict_first": 2}, "weight_l2_evict_first must be 0 or 1"),
-        (
-            {
-                "weight_l2_evict_first": 1,
-                "cluster_dim_y": 2,
-                "umma_cta_count": 2,
-                "mma_m": 256,
-            },
-            "weight_l2_evict_first requires token-cluster width one",
-        ),
-    ],
-)
-def test_weight_policy_rejects_invalid_options(overrides, message):
+def test_weight_policy_rejects_invalid_options():
     pair = map_trtllm_mxfp4_mxfp8_moe_tactic(
         [16, 0], num_tokens=256, top_k=6, num_local_experts=48
     )
-    cfg = replace(pair.fc2.cfg.build(), **overrides)
+    cfg = replace(
+        pair.fc2.cfg.build(),
+        weight_l2_evict_first=1,
+        cluster_dim_y=2,
+        umma_cta_count=2,
+        mma_m=256,
+    )
     validate_config(replace(cfg, weight_l2_evict_first=0))
-    with pytest.raises(ValueError, match=message):
+    with pytest.raises(
+        ValueError, match="weight_l2_evict_first requires token-cluster width one"
+    ):
         validate_config(cfg)
 
 

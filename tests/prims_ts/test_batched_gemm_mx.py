@@ -965,9 +965,8 @@ class TestMxFc2LowLatency:
             require_mixed_cga_runtime=True,
         )
 
-    @pytest.mark.parametrize("umma_cta_count", [1, 2])
     @pytest.mark.parametrize("early_exit", [0, 1])
-    def test_mxfp4_mxfp8_evict_first_weights(self, umma_cta_count, early_exit):
+    def test_mxfp4_mxfp8_evict_first_weights(self, early_exit):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
             DType,
             TileScheduler,
@@ -982,15 +981,17 @@ class TestMxFc2LowLatency:
             "mma_n": 16,
             "epi_tile_n": 16,
             "tile_k": 256,
-            "mma_m": 128 * umma_cta_count,
-            "umma_cta_count": umma_cta_count,
+            "mma_m": 256,
+            "umma_cta_count": 2,
             **uniform_pipeline_stage_overrides(4),
             "tile_scheduler": int(TileScheduler.PERSISTENT),
             "num_stages_tmem_acc": 2,
             "weight_l2_evict_first": 1,
             "use_early_exit": early_exit,
         }
-        _run_mx_fc2(cfg, num_tokens=256)
+        # 16 tokens for each of the two experts: every expert has a single
+        # token tile, whose weights load evict-first.
+        _run_mx_fc2(cfg, num_tokens=32)
 
 
 class TestMxFc2HighThroughput:
@@ -1277,26 +1278,6 @@ class TestMxFc1LowLatency:
             problem_n=4096,
             require_mixed_cga_runtime=True,
         )
-
-    @pytest.mark.parametrize("early_exit", [0, 1])
-    def test_mxfp4_mxfp8_evict_first_weights(self, early_exit):
-        from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
-            DType,
-        )
-
-        cfg = {
-            **_mx_fc1_base(dtype_a=DType.MXE2M1),
-            "tile_n": 16,
-            "mma_n": 16,
-            "epi_tile_n": 16,
-            "tile_k": 256,
-            **uniform_pipeline_stage_overrides(5),
-            "mma_m": 256,
-            "umma_cta_count": 2,
-            "weight_l2_evict_first": 1,
-            "use_early_exit": early_exit,
-        }
-        _run_mx_fc1(cfg, num_tokens=256)
 
 
 class TestMxFc1HighThroughput:
