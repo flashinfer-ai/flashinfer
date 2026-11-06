@@ -352,6 +352,15 @@ modules stay importable and the first kernel load of such a feature raises;
 Nightly wheels on https://flashinfer.ai/whl and source installs include the
 sources, matching the audience above.
 
+The Cake training backends under `flashinfer/experimental/cake/<module>/` are
+the exception (#8928). Each backs a stable top-level facade
+`flashinfer.cake_<op>_<det|nondet>_train[_kcp]` that is not an experimental
+API. The facade imports its backend inside its functions or through its module
+`__getattr__`, never at module level, and its top-level names in
+`flashinfer/__init__.py` are rows of the lazy-export table `_LAZY_EXPORTS`, so
+`import flashinfer` still loads no backend. Their `csrc/**` ships in every
+wheel, including the release wheel on PyPI.
+
 ## Graduation checklist
 
 To graduate a feature to stable:
