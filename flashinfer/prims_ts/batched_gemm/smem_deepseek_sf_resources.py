@@ -267,8 +267,10 @@ class SmemDeepSeekSfAbResource(MemoryResource):
             )
 
         # Weight scales are [expert, row group, K block]. SwapAB groups rows by
-        # the scale block, so one tile_m tile spans num_dsfp8_weight_sfs_per_stage
-        # consecutive groups. The non-swap path keeps one group per tile_n tile.
+        # the scale block, so one tile_m tile spans
+        # num_dsfp8_weight_sfs_per_subblock consecutive groups (the per-stage
+        # count also multiplies in the K sub-blocks). The non-swap path keeps
+        # one group per tile_n tile.
         block = Int32(self.cfg.deepseek_fp8_block_size)
         if cutlass.const_expr(self.cfg.is_swap_ab):
             self.dsfp8_token_base = tile_coord_n * Int32(self.cfg.tile_n)

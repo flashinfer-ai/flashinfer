@@ -3436,6 +3436,18 @@ void trtllm_moe_run_deepseek_fp8_activation(
       << "DeepSeek FP8 activation: total_num_padded_tokens must be int32.";
 
   auto const activation = validateAndCastActivationType(activation_type);
+  // Both scale buffers are [row_blocks, padded_tokens] and the kernel indexes them by
+  // sf_block_size, so their leading dims must match the block the caller named.
+  int64_t const gemm1_cols = intermediate_size * (isGatedActivation(activation) ? 2 : 1);
+  TVM_FFI_ICHECK(gemm1_output_scale.ndim() == 2 &&
+                 gemm1_output_scale.size(0) == gemm1_cols / sf_block_size)
+      << "DeepSeek FP8 activation: gemm1_output_scale must be [" << gemm1_cols / sf_block_size
+      << ", padded_tokens] for sf_block_size " << sf_block_size << ".";
+  TVM_FFI_ICHECK(activation_output_scale.ndim() == 2 &&
+                 activation_output_scale.size(0) == intermediate_size / sf_block_size &&
+                 activation_output_scale.size(1) == gemm1_output_scale.size(1))
+      << "DeepSeek FP8 activation: activation_output_scale must be ["
+      << intermediate_size / sf_block_size << ", " << gemm1_output_scale.size(1) << "].";
   moe::dev::activation::Data activationData;
   activationData.mDtypeElt = btg::Dtype::E4m3;
   activationData.mUsePdl = enable_pdl;

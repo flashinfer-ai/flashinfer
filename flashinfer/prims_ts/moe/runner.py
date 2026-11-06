@@ -3137,6 +3137,9 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             sm_arch,
             False,
             _gemm_config_flags_cache_key(gemm_config_flags),
+            deepseek_fp8_scale_block_size(
+                self.hidden_size, moe_inputs.hidden_states_scale
+            ),
         )
         if instance_key not in PrimsTsFp8BlockScaleMoERunner.valid_tactics_dict:
             try:

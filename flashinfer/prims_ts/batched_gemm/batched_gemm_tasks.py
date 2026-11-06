@@ -1828,24 +1828,16 @@ def create_epilogue_task_dsfp8(
     work_queue,
     num_k_tiles: int,
 ) -> Task:
-    """DeepSeek FP8 epilogue: per-K-tile SF drain + tail TmemC drain.
+    """DeepSeek FP8 epilogue: per-K-tile TmemC drain scaled into registers.
 
-    Per K-tile (inside the loop):
-      - Wait on ``SmemDeepSeekSfAb`` (the matching dequant SF stage).
-      - Read ``act_lane * weight`` from SMEM and ffma2 into a FP32 register
-        accumulator partial.
-      - Release ``SmemDeepSeekSfAb``.
+    Per K-tile (inside the loop), for each of the ``tile_k / block`` scale
+    sub-blocks (one at block 128):
+      - Wait on the sub-block's ``TmemC`` stage, LDTM to registers, release.
+      - Wait on ``SmemDeepSeekSfAb`` (held for the whole K tile) and ffma2
+        ``act_lane * weight`` into the FP32 register accumulator.
+    Release ``SmemDeepSeekSfAb`` after the last sub-block.
     Tail (after the K-loop):
-      - Wait on ``TmemC`` (single MMA accumulator), LDTM to registers,
-        release.
       - Cast the register accumulator to ``dtype_c`` and TMA/STG store.
-
-    This TS path uses a single TmemC accumulator drained once in the tail,
-    matching the existing ``create_epilogue_task`` shape.
-
-    At block 32 each K tile carries ``tile_k / block`` scale sub-blocks, each
-    in its own accumulator stage: the SF stage is held across them and every
-    sub-block is drained and scaled before the next.
     """
     is_persistent = _is_persistent(cfg)
     dsfp8_k_subblocks = cfg.dsfp8_k_subblocks_per_tile
