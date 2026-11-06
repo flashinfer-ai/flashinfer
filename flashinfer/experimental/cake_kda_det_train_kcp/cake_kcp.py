@@ -302,6 +302,7 @@ import ctypes
 import dataclasses
 import functools
 import operator
+import sys
 import types
 import warnings
 import weakref
@@ -5990,6 +5991,35 @@ def _l2n_key_saved(saved: SavedDetKcp | None) -> tuple[Any, ...]:
     return (saved.qk_rstd,) if saved is not None and saved.qk_l2norm else ()
 
 
+# The host module of the non-deterministic package (deterministic=False), this package's sibling: its workspace type
+# is recognized through sys.modules without importing that package (none of its objects exists before it is imported).
+_ND_KCP = f"{__name__.rsplit('.', 2)[0]}.cake_kda_train_kcp.cake_kcp"
+
+
+def _refuse_nd_workspace(workspace: Any) -> None:
+    """A workspace of the non-deterministic package raises ``ValueError`` naming the mode."""
+    nd = sys.modules.get(_ND_KCP)
+    if nd is not None and isinstance(workspace, getattr(nd, "WorkspaceKcp", ())):
+        raise ValueError(
+            f"workspace: a {WorkspaceDetKcp.__module__}.WorkspaceDetKcp is required, got "
+            f"{type(workspace).__module__}.{type(workspace).__qualname__}; a workspace of the non-deterministic "
+            "package (deterministic=False) serves that package's calls only"
+        )
+
+
+def _refuse_other_mode(saved: Any, workspace: Any) -> None:
+    """The backward's mode check, before any graph key, operand or tensor read: a saved set that is not a
+    :class:`SavedDetKcp` (the non-deterministic package's ``SavedKcp`` has the same version and members) and a
+    workspace of the non-deterministic package raise ``ValueError`` naming the mode."""
+    if saved is not None and not isinstance(saved, SavedDetKcp):
+        raise ValueError(
+            f"saved: a {SavedDetKcp.__module__}.SavedDetKcp (the deterministic KCP forward) is required, got "
+            f"{type(saved).__module__}.{type(saved).__qualname__}; a saved set of the non-deterministic package "
+            "(deterministic=False) is read by that package's backward"
+        )
+    _refuse_nd_workspace(workspace)
+
+
 def _call_workspace(
     workspace: Any,
     backend: Any,
@@ -6001,7 +6031,8 @@ def _call_workspace(
     """The workspace of a call: without one (``None``) a default workspace of the call's modes, the backend's state
     dtype and local stages (with the flag on, its construction checks the mode on ``device``'s architecture);
     otherwise ``workspace``, which must be a :class:`WorkspaceDetKcp` of the call's gate and in-kernel Q / K L2 norm
-    modes and the backend's state dtype (``TypeError`` / ``ValueError``)."""
+    modes and the backend's state dtype (``TypeError`` / ``ValueError``; a workspace of the non-deterministic
+    package: ``ValueError`` naming the mode)."""
     if workspace is None:
         workspace = WorkspaceDetKcp(
             device=device,
@@ -6012,6 +6043,7 @@ def _call_workspace(
             use_qk_l2norm_in_kernel=l2n,
         )
     elif not isinstance(workspace, WorkspaceDetKcp):
+        _refuse_nd_workspace(workspace)
         raise TypeError("workspace must be a WorkspaceDetKcp")
     elif workspace.gate != gate:
         raise ValueError(
@@ -6418,7 +6450,11 @@ def chunk_kda_det_bwd_kcp(
     ``use_qk_l2norm_in_kernel=True`` (the forward's; issue #7817): the same seven / five tensors, ``dq`` / ``dk`` the
     gradients of the raw ``q`` / ``k`` (contiguous, ranked like ``q``), the FP32 pullback fused into their final BF16
     store.  A saved-mode backward reads the saved ``qk_rstd``; a replay-mode backward recomputes it.  A saved set or
-    a workspace of the other mode is refused with ``ValueError``."""
+    a workspace of the other mode is refused with ``ValueError``.
+
+    ``saved`` must come from this package's forward and ``workspace`` must not be one of the non-deterministic package
+    (``deterministic=False``): either raises ``ValueError`` naming the mode before anything is read."""
+    _refuse_other_mode(saved, workspace)
     opts = _options(options)
     gate_args = _gate_args(use_gate_in_kernel, A_log, dt_bias, lower_bound)
     l2n = cake_kcp_plan.check_qk_l2norm(use_qk_l2norm_in_kernel)
