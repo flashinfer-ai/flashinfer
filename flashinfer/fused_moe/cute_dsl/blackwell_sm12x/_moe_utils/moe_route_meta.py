@@ -41,12 +41,15 @@ def count_routes_kernel(
     total_pairs: tl.constexpr,
     block_n: tl.constexpr,
     has_padding: tl.constexpr = True,
+    num_experts: tl.constexpr = None,
 ):
     pair_idx = tl.program_id(0) * block_n + tl.arange(0, block_n)
     valid = pair_idx < total_pairs
     expert = tl.load(topk_ids + pair_idx, mask=valid, other=0)
     if has_padding:
         valid &= expert >= 0
+        if num_experts is not None:
+            valid &= expert < num_experts
     tl.atomic_add(counts + expert, 1, mask=valid, sem="relaxed")
 
 
@@ -145,6 +148,7 @@ def route_assign_kernel(
     scale_align: tl.constexpr,
     block_n: tl.constexpr,
     has_padding: tl.constexpr = True,
+    num_experts: tl.constexpr = None,
 ):
     pid = tl.program_id(0)
     offs = tl.arange(0, block_n)
@@ -154,6 +158,8 @@ def route_assign_kernel(
     route_valid = pair_valid
     if has_padding:
         route_valid &= expert >= 0
+        if num_experts is not None:
+            route_valid &= expert < num_experts
     routed_row = tl.atomic_add(
         expert_cursor + expert, 1, mask=route_valid, sem="relaxed"
     )
@@ -216,7 +222,7 @@ def route_assign_decode_kernel(
     experts = tl.load(topk_ids + offs, mask=pair_valid, other=num_experts)
     route_valid = pair_valid
     if has_padding:
-        route_valid &= experts >= 0
+        route_valid &= (experts >= 0) & (experts < num_experts)
     flat = pid * block_n + offs
     k_block = flat // padded_rows
     scale_row = flat - k_block * padded_rows
@@ -232,7 +238,7 @@ def route_assign_decode_kernel(
     pair_expert = tl.load(topk_ids + pid, mask=pid < total_pairs, other=0)
     route_valid_pid = pid < total_pairs
     if has_padding:
-        route_valid_pid &= pair_expert >= 0
+        route_valid_pid &= (pair_expert >= 0) & (pair_expert < num_experts)
     expert_begin = tl.sum(tl.where(route_valid & (experts < pair_expert), 1, 0), 0)
     rank = tl.sum(
         tl.where(route_valid & (experts == pair_expert) & (offs < pid), 1, 0), 0

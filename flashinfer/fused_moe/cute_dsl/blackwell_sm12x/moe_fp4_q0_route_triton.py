@@ -478,7 +478,13 @@ def _route_meta(
         if num_experts <= PREFILL_FUSED_PREFIX_MAX_EXPERTS:
             workspace.counts.zero_()
             _count_routes_kernel[(ceil_div(total_pairs, block_n),)](
-                topk_ids, workspace.counts, total_pairs, block_n, True, num_warps=4
+                topk_ids,
+                workspace.counts,
+                total_pairs,
+                block_n,
+                True,
+                num_experts=num_experts,
+                num_warps=4,
             )
             _prefix_cursor_kernel[(1,)](
                 workspace.counts,
@@ -510,6 +516,7 @@ def _route_meta(
             NVFP4_SF_M_ALIGN,
             block_n,
             True,
+            num_experts=num_experts,
         )
     if worklist_bm is not None and num_experts > PREFILL_FUSED_PREFIX_MAX_EXPERTS:
         build_nvfp4_worklist(
