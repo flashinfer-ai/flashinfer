@@ -127,7 +127,7 @@ from flashinfer.cake_kda_det_train_kcp import (  # noqa: E402
     partition_det_kcp,
     reduce_gate_param_grads_det_kcp,
 )
-from flashinfer.kda_train import chunk_kda  # noqa: E402
+from flashinfer.cake_kda_det_train import chunk_kda_det  # noqa: E402
 from tests.test_helpers.cake_kda_det_train_reference import (  # noqa: E402
     LOWER_BOUND,
     check_fla_gate,
@@ -135,7 +135,7 @@ from tests.test_helpers.cake_kda_det_train_reference import (  # noqa: E402
     make_raw_inputs,
     raw_gate,
 )
-from tests.test_helpers.cake_kda_train_reference import make_inputs  # noqa: E402
+from tests.test_helpers.cake_kda_det_train_reference import make_inputs  # noqa: E402
 
 ARMS = ("cake", "control", "local", "fla")
 GATE_ARMS = ("R", "E_T", "E_F")
@@ -248,7 +248,7 @@ def _step_local(problem: dict[str, Any]) -> None:
         local[n].detach().requires_grad_(True) for n in ("q", "k", "v", "g", "beta")
     )
     y = cake_causal_conv1d_det(x, w, local["cu_seqlens"])
-    out = chunk_kda(q, k, v, g, beta, local["cu_seqlens"])
+    out = chunk_kda_det(q, k, v, g, beta, local["cu_seqlens"])
     torch.autograd.backward([y, out], [local["dy"], local["dout"]])
 
 

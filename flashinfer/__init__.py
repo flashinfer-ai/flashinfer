@@ -182,6 +182,53 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "cake_gdn_det_train_kcp": (".cake_gdn_det_train_kcp", None),
     "cake_gdn_nondet_train": (".cake_gdn_nondet_train", None),
     "cake_gdn_nondet_train_kcp": (".cake_gdn_nondet_train_kcp", None),
+    # SiLU-gated RMSNorm training (Cake), both modes: each facade imports its
+    # backend package (under flashinfer.experimental.cake) on first use.
+    "cake_rmsnorm_silu_gate_det_train": (".cake_rmsnorm_silu_gate_det_train", None),
+    "cake_rmsnorm_silu_gate_det": (
+        ".cake_rmsnorm_silu_gate_det_train",
+        "cake_rmsnorm_silu_gate_det",
+    ),
+    "cake_rmsnorm_silu_gate_det_train_forward": (
+        ".cake_rmsnorm_silu_gate_det_train",
+        "cake_rmsnorm_silu_gate_det_train_forward",
+    ),
+    "cake_rmsnorm_silu_gate_det_train_backward": (
+        ".cake_rmsnorm_silu_gate_det_train",
+        "cake_rmsnorm_silu_gate_det_train_backward",
+    ),
+    "cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes": (
+        ".cake_rmsnorm_silu_gate_det_train",
+        "cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes",
+    ),
+    "CakeRMSNormSiLUGateDetFunction": (
+        ".cake_rmsnorm_silu_gate_det_train",
+        "CakeRMSNormSiLUGateDetFunction",
+    ),
+    "cake_rmsnorm_silu_gate_nondet_train": (
+        ".cake_rmsnorm_silu_gate_nondet_train",
+        None,
+    ),
+    "cake_rmsnorm_silu_gate_nondet": (
+        ".cake_rmsnorm_silu_gate_nondet_train",
+        "cake_rmsnorm_silu_gate_nondet",
+    ),
+    "cake_rmsnorm_silu_gate_nondet_train_forward": (
+        ".cake_rmsnorm_silu_gate_nondet_train",
+        "cake_rmsnorm_silu_gate_nondet_train_forward",
+    ),
+    "cake_rmsnorm_silu_gate_nondet_train_backward": (
+        ".cake_rmsnorm_silu_gate_nondet_train",
+        "cake_rmsnorm_silu_gate_nondet_train_backward",
+    ),
+    "cake_rmsnorm_silu_gate_nondet_train_backward_workspace_bytes": (
+        ".cake_rmsnorm_silu_gate_nondet_train",
+        "cake_rmsnorm_silu_gate_nondet_train_backward_workspace_bytes",
+    ),
+    "CakeRMSNormSiLUGateNondetFunction": (
+        ".cake_rmsnorm_silu_gate_nondet_train",
+        "CakeRMSNormSiLUGateNondetFunction",
+    ),
 }
 
 
@@ -314,43 +361,6 @@ from .cake_rmsnorm_train import (
 )
 from . import cake_rmsnorm_train as cake_rmsnorm_train
 from . import cake_rmsnorm_train_backend as cake_rmsnorm_train_backend
-from .cake_rmsnorm_silu_gate_det_train import (
-    CakeRMSNormSiLUGateDetFunction as CakeRMSNormSiLUGateDetFunction,
-)
-from .cake_rmsnorm_silu_gate_det_train import (
-    cake_rmsnorm_silu_gate_det as cake_rmsnorm_silu_gate_det,
-)
-from .cake_rmsnorm_silu_gate_det_train import (
-    cake_rmsnorm_silu_gate_det_train_backward as cake_rmsnorm_silu_gate_det_train_backward,
-)
-from .cake_rmsnorm_silu_gate_det_train import (
-    cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes as cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes,
-)
-from .cake_rmsnorm_silu_gate_det_train import (
-    cake_rmsnorm_silu_gate_det_train_forward as cake_rmsnorm_silu_gate_det_train_forward,
-)
-
-# The names before the det rename: the package with the deterministic default and the
-# opt-in non-deterministic weight gradient (``deterministic=False``).
-from .cake_rmsnorm_silu_gate_train import (
-    CakeRMSNormSiLUGateFunction as CakeRMSNormSiLUGateFunction,
-)
-from .cake_rmsnorm_silu_gate_train import (
-    cake_rmsnorm_silu_gate as cake_rmsnorm_silu_gate,
-)
-from .cake_rmsnorm_silu_gate_train import (
-    cake_rmsnorm_silu_gate_train_backward as cake_rmsnorm_silu_gate_train_backward,
-)
-from .cake_rmsnorm_silu_gate_train import (
-    cake_rmsnorm_silu_gate_train_backward_workspace_bytes as cake_rmsnorm_silu_gate_train_backward_workspace_bytes,
-)
-from .cake_rmsnorm_silu_gate_train import (
-    cake_rmsnorm_silu_gate_train_forward as cake_rmsnorm_silu_gate_train_forward,
-)
-from . import cake_rmsnorm_silu_gate_train as cake_rmsnorm_silu_gate_train
-from . import (
-    cake_rmsnorm_silu_gate_train_backend as cake_rmsnorm_silu_gate_train_backend,
-)
 from .cake_causal_conv1d_det_train import (
     CakeCausalConv1dDetFunction as CakeCausalConv1dDetFunction,
 )

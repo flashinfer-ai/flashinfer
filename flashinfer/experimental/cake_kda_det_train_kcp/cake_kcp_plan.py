@@ -3677,13 +3677,3 @@ __all__ = [
     "wave_rule_lpt_cost_10ns",
     "wave_rule_lpt_P",
 ]
-
-# The names before the det rename, bound to the same objects (not in ``__all__``).
-KcpContext = ContextDetKcp
-KcpFragment = FragmentDetKcp
-KcpPartition = PartitionDetKcp
-build_kcp_context = build_context_det_kcp
-kcp_comm_bytes = kda_det_comm_bytes_kcp
-kcp_partition = partition_det_kcp
-kcp_saved_bytes = kda_det_saved_bytes_kcp
-kcp_workspace_bytes = kda_det_workspace_bytes_kcp
