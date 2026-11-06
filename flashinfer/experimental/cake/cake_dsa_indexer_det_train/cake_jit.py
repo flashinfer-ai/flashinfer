@@ -900,6 +900,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "l6_rule": [256.0, 512],
         "wide_rule": [6.0, 300.0],
         "wide_first_rule": None,
+        "wide_wave_rule": None,
         "split_max": 16,
         "split_min_range_tiles": 32,
         "split_wave_rule": None,
@@ -979,6 +980,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "l6_rule": [1024.0, 512],
         "wide_rule": [6.0, 300.0],
         "wide_first_rule": [512.0],
+        "wide_wave_rule": None,
         "split_max": 16,
         "split_min_range_tiles": 32,
         "split_wave_rule": None,
@@ -1058,6 +1060,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "l6_rule": [64.0, 0],
         "wide_rule": [2.0, 250.0],
         "wide_first_rule": None,
+        "wide_wave_rule": None,
         "split_max": 16,
         "split_min_range_tiles": 32,
         "split_wave_rule": [1000, 0.12],
@@ -1139,9 +1142,13 @@ POLICY: dict[str, dict[str, Any]] = {
 # record with these fields replaced (``cake_policy.fp8_policy_record``); each
 # names its own ``static_scan_kinds``: on sm_107a every FP8 scan program keeps
 # the static unit enumeration.  sm_107a keeps no split-fit rule until the FP8
-# split programs are measured under one.
+# split programs are measured under one.  On sm_100a the FP8 wide program
+# decides by waves of the persistent grid (wide_wave_rule): it takes a call
+# from the narrow unit when the narrow units need at least 1.7 times its waves,
+# and from the three-warpgroup unit when those need at least 1.3 times its
+# waves over at least 84 mean unit tiles.
 POLICY_FP8: dict[str, dict[str, Any]] = {
-    "sm_100a": {"static_scan_kinds": []},
+    "sm_100a": {"static_scan_kinds": [], "wide_wave_rule": [1.7, 1.3, 84.0]},
     "sm_103a": {"static_scan_kinds": []},
     "sm_107a": {
         "static_scan_kinds": ["l6", "narrow", "split_narrow", "wide"],

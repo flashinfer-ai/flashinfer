@@ -4980,12 +4980,13 @@ def test_route_plan_matches_the_dispatcher(monkeypatch, arch):
 # --------------------------------------------------------------------------- #
 
 # Pieces per row of the split launches SM107 runs with PDL (128 heads, items
-# 1025-1152 wide): the first of 9, 5, 3 and 2 that keeps rows x pieces <= 40.
+# 1025-1152 wide): the first of 9, 5, 3 and 2 that keeps rows x pieces <= 40
+# (<= 45 for three).
 _SPLIT_PIECES = {
     **dict.fromkeys(range(1, 5), 9),
     **dict.fromkeys(range(5, 9), 5),
-    **dict.fromkeys(range(9, 14), 3),
-    **dict.fromkeys(range(14, 18), 2),
+    **dict.fromkeys(range(9, 16), 3),
+    **dict.fromkeys(range(16, 18), 2),
 }
 
 
@@ -5008,7 +5009,8 @@ def _split_plan(**shape):
 @pytest.mark.cpu_only
 def test_k64_split_rule_is_sm107a_only():
     """Only SM107 splits, and only with PDL, the uniform route's 128-head
-    launches of at most 17 rows over nine-tile items, at most 40 pieces."""
+    launches of at most 17 rows over nine-tile items, at most 40 pieces (45
+    for three per row)."""
     assert _UNIFORM_ROUTE == cake._K64_SPLIT_ROUTE
     assert f"{_UNIFORM_ROUTE}_k64_split" == cake._K64_SPLIT_VARIANT
     assert f"{_UNIFORM_ROUTE}_k64_split_reduce" == cake._K64_SPLIT_MERGE
@@ -5016,8 +5018,7 @@ def test_k64_split_rule_is_sm107a_only():
         num_tiles=9,
         max_tokens_pdl=17,
         max_tokens_no_pdl=0,
-        max_pieces=40,
-        splits=(9, 5, 3, 2),
+        splits=((9, 40), (5, 40), (3, 45), (2, 40)),
     )
     assert {"sm_107a": rule} == cake._K64_SPLIT_RULES
     # The split keys are not K=64 siblings: the K=64 floor never applies to them.
@@ -5029,12 +5030,12 @@ def test_k64_split_rule_is_sm107a_only():
 @pytest.mark.parametrize("tokens", [*range(1, 19), 24, 48, 127])
 @pytest.mark.parametrize("sparse_topk", [1028, 1088, 1152])
 def test_k64_split_plan_pins(tokens, sparse_topk):
-    """Rows 1-4 split into nine pieces, 5-8 into five, 9-13 into three and
-    14-17 into two; no whole rows; 18 rows and more keep the route."""
+    """Rows 1-4 split into nine pieces, 5-8 into five, 9-15 into three and
+    16-17 into two; no whole rows; 18 rows and more keep the route."""
     expected = (0, tokens, _SPLIT_PIECES[tokens]) if tokens in _SPLIT_PIECES else None
     assert _split_plan(num_query_tokens=tokens, sparse_topk=sparse_topk) == expected
     if expected is not None:
-        assert tokens * expected[2] <= 40
+        assert tokens * expected[2] <= (45 if expected[2] == 3 else 40)
 
 
 @pytest.mark.cpu_only
@@ -5144,7 +5145,7 @@ def test_k64_split_checks_the_workspace_registry_and_gate(monkeypatch):
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("tokens", [1, 4, 5, 8, 9, 13, 14, 17])
+@pytest.mark.parametrize("tokens", [1, 4, 5, 8, 9, 15, 16, 17])
 def test_split_launch_runs_the_producer_then_the_merge(tokens):
     """A split launch issues the split producer over 2 CTAs per piece and the
     merge over one CTA per (row, head), in one run, both on the piece views."""
@@ -5343,7 +5344,7 @@ def _launch_record(calls):
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("tokens", [1, 4, 5, 8, 9, 13, 14, 17])
+@pytest.mark.parametrize("tokens", [1, 4, 5, 8, 9, 15, 16, 17])
 def test_run_cake_dsv4_split_launch_binds_the_piece_views(monkeypatch, tokens):
     """The split launch carves cake_dsv4_workspace_layout(T, H, s): the
     producer stores its pieces through the [T * s, H, 512] partial-O view at
@@ -5537,7 +5538,7 @@ def test_workspace_requirement_covers_the_split_launch(arch, sm_count):
                     own,
                     cake._launch_workspace_bytes(req.plan, 1, num_heads, tokens + 1),
                 )
-    # The largest carve: 8 rows of five pieces (40 pieces).
+    # The largest carve: 15 rows of three pieces (45 pieces).
     assert (
         max(
             cake._k64_split_workspace_bytes(
@@ -5545,7 +5546,8 @@ def test_workspace_requirement_covers_the_split_launch(arch, sm_count):
             )
             for tokens in range(1, 18)
         )
-        == 5_526_528
+        == 6_184_448
+        == 263168 + 45 * (131072 + 512)
     )
 
 

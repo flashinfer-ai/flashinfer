@@ -2423,29 +2423,31 @@ class _K64SplitRule:
     # The most query rows a split launch has with and without PDL (0: none).
     max_tokens_pdl: int
     max_tokens_no_pdl: int
-    # The most pieces (rows x pieces per row) of a split launch.
-    max_pieces: int
-    # Pieces per row in order of preference: the first one of at most
-    # ``num_tiles`` that keeps the launch within ``max_pieces``.
-    splits: tuple[int, ...]
+    # ``(s, most pieces)`` in order of preference: a launch takes the first
+    # ``s`` pieces per row with ``s`` at most ``num_tiles`` and rows x ``s``
+    # at most that count's ``most pieces``.
+    splits: tuple[tuple[int, int], ...]
 
 
 # Per architecture.  R200 (sm_107a, 208 SMs), eight back-to-back calls per
 # CUDA graph with PDL, items 1152 wide (nine tiles) whose rows use all of
 # them, split launch vs the K=32 program: 1.50-1.51x at 1-2 rows (nine
-# pieces), 1.43x at 4, 1.34x at 8 (five), 1.23x at 12 (three) and 1.05-1.07x
-# at 16-17 (two).  A launch whose every row fits in one piece (at most
-# ceil(9 / s) tiles: short requests, piece 0 writes O itself) still runs the
-# merge kernel and measured 0.81-0.86x; the host does not read row lengths,
-# so those launches split as well.  Without PDL the 17-row launch measured
-# 0.98x: no launch without PDL splits.
+# pieces), 1.43x at 4, 1.34x at 8 (five), 1.23x at 12 (three), 1.18x at 14
+# and 1.11-1.12x at 15 (three) and 1.05-1.07x at 16-17 (two).  Three pieces
+# run up to 45 pieces: at 14-15 rows they measured 1.06-1.11x of two, and at
+# 16 rows (48 pieces) 0.91-0.92x.  Nine pieces at 5 rows (45 pieces) measured
+# 0.97x of five, so the other counts stay at 40.  A launch whose every row
+# fits in one piece (at most ceil(9 / s) tiles: short requests, piece 0
+# writes O itself) still runs the merge kernel and measured 0.81-0.86x (0.97x
+# of two pieces at 15 rows of at most three tiles); the host does not read
+# row lengths, so those launches split as well.  Without PDL the 17-row
+# launch measured 0.98x: no launch without PDL splits.
 _K64_SPLIT_RULES: Mapping[str, _K64SplitRule] = {
     "sm_107a": _K64SplitRule(
         num_tiles=9,
         max_tokens_pdl=17,
         max_tokens_no_pdl=0,
-        max_pieces=40,
-        splits=(9, 5, 3, 2),
+        splits=((9, 40), (5, 40), (3, 45), (2, 40)),
     ),
 }
 
@@ -2473,8 +2475,8 @@ def _k64_split_plan(
     max_tokens = rule.max_tokens_pdl if enable_pdl else rule.max_tokens_no_pdl
     if not 1 <= num_query_tokens <= max_tokens:
         return None
-    for splits in rule.splits:
-        if splits <= rule.num_tiles and num_query_tokens * splits <= rule.max_pieces:
+    for splits, max_pieces in rule.splits:
+        if splits <= rule.num_tiles and num_query_tokens * splits <= max_pieces:
             return (0, num_query_tokens, splits)
     return None
 

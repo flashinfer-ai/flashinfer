@@ -17,8 +17,9 @@ Names of the non-deterministic GQA HD256 training module ``flashinfer.cake_gqa_n
 
 The public names are the facade's ``__all__`` and the backend objects it forwards to or re-exports
 (``flashinfer.experimental.cake.cake_gqa_nondet_train``): each carries the mode (``nondet``) as a token, the
-former names and package paths are gone (no alias), and no entry point takes a ``deterministic`` keyword.  Torch's
-deterministic mode is read only by the backward's alert.  Internal helpers and build identities (program and library
+former names and package paths are gone (no alias), and no entry point takes a ``deterministic`` keyword.  The rules
+shared by every #8928 family are checked with ``tests.test_helpers.cake_mode_names``; the checks here are this
+family's own.  Torch's deterministic mode is read only by the backward's alert.  Internal helpers and build identities (program and library
 stems ``cake_gqa_train_<hex>``, kernel symbols, csrc file names) keep their names.
 """
 
@@ -34,7 +35,14 @@ from pathlib import Path
 import pytest
 import torch
 
+import flashinfer
 import flashinfer.cake_gqa_nondet_train as public
+from tests.test_helpers.cake_mode_names import (
+    assert_mode_names,
+    assert_no_deterministic_keyword,
+    assert_old_names_fail,
+    assert_same_object_same_name,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -46,6 +54,8 @@ ENTRIES = (
     "cake_gqa_nondet_train_workspace",
     "cake_gqa_nondet_train_workspace_bytes",
 )
+# The ``typing.Callable`` alias the facade re-exports: a type, not an entry point.
+TYPE_ALIASES = ("CakeGQANondetDkvAccSource",)
 # Backend classes and types the facade re-exports (resolved on first access).
 REEXPORTED = (
     "CakeGQANondetDkvAccSource",
@@ -83,15 +93,6 @@ REMOVED_NAMES = (
     "DkvAccSource",
     "workspace_bytes",
 )
-
-
-def _tokens(name: str) -> list:
-    """The lowercase words of ``name``: split on ``_``, then on CamelCase (``CakeGQANondetFunction`` -> cake,
-    gqa, nondet, function)."""
-    words = []
-    for part in name.split("_"):
-        words += re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z0-9]+", part)
-    return [w.lower() for w in words]
 
 
 def _backend(module_name=None):
@@ -166,30 +167,52 @@ def test_facade_all_is_the_entries_and_reexports():
         assert getattr(public, name) is getattr(backend, name), name
 
 
-def test_mode_word_is_a_token():
-    """The token split finds the mode word only as a whole word: ``nondet`` is not ``det``."""
-    assert _tokens("CakeGQANondetFunction") == ["cake", "gqa", "nondet", "function"]
-    assert _tokens("cake_gqa_nondet_train_forward") == [
-        "cake",
-        "gqa",
-        "nondet",
-        "train",
-        "forward",
+def test_the_shared_mode_rules_hold():
+    """The #8928 rules shared by every family (``tests.test_helpers.cake_mode_names``): the facade's public names
+    carry ``nondet`` after the op, no entry point takes ``deterministic``, ``flashinfer``, the backend package and
+    ``cake_backend`` bind each facade object and each backend object a facade entry calls only under the facade's
+    name, and the former module paths and names fail at import in a fresh interpreter.
+
+    These are the checks of ``assert_cake_mode_module``, called one by one so that the keyword check leaves out
+    ``CakeGQANondetDkvAccSource``: a ``typing.Callable`` alias has typing's ``(*args, **kwargs)`` signature, but it
+    is a type, not an entry point (calling it raises ``TypeError``).  ``test_no_entry_takes_a_mode_keyword`` covers
+    the entry points by their own signatures."""
+    package, backend = _backend(), _backend("cake_backend")
+    old_names = [("flashinfer", "gqa_train")]
+    old_names += [
+        ("flashinfer.cake_gqa_nondet_train", name) for name in REMOVED_ENTRIES
     ]
-    assert "det" not in _tokens("cake_gqa_nondet")
-    assert "nondet" not in _tokens("cake_gqa_nondetail")
+    old_names += [
+        (module.__name__, name)
+        for module in (package, backend)
+        for name in REMOVED_NAMES
+    ]
+    assert_mode_names(public)
+    assert_no_deterministic_keyword(
+        [getattr(public, name) for name in public.__all__ if name not in TYPE_ALIASES]
+    )
+    assert_same_object_same_name(
+        public,
+        (flashinfer, package, backend),
+        forwards=[
+            (name, getattr(backend, name)) for name in FORWARDED if name in ENTRIES
+        ],
+    )
+    assert_old_names_fail(
+        REMOVED_MODULES + ("flashinfer.experimental.cake_gqa_train",),
+        old_names,
+        cwd=Path(__file__).resolve().parents[2],
+    )
 
 
 def test_public_names_carry_the_mode():
-    """Every name of the facade's ``__all__`` and every backend object the facade forwards to carries ``nondet`` as
-    a token (ALL_CAPS module constants excepted); every package ``__all__`` name is such an object, an ALL_CAPS
-    constant or the internal ``default_workspace`` helper."""
-    for name in public.__all__:
-        assert "nondet" in _tokens(name) and "det" not in _tokens(name), name
+    """Every backend object the facade forwards to or re-exports carries ``nondet`` after the op (the shared rule,
+    applied to the backend's names); every package ``__all__`` name is such an object, an ALL_CAPS constant or the
+    internal ``default_workspace`` helper."""
     backend = _backend("cake_backend")
     package = _backend()
+    assert_mode_names(package, names=FORWARDED)
     for name in FORWARDED:
-        assert "nondet" in _tokens(name), name
         assert name in backend.__all__ and name in package.__all__, name
         assert getattr(package, name) is getattr(backend, name), name
     for name in package.__all__:

@@ -940,9 +940,9 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1024_sm103a(int* __restrict_
                                        "r"(((full_addr + (b_stage) * 8) & 0xFEFFFFFF)), "l"(0x12F0000000000000ULL) : "memory");
                             } else {
                                 asm volatile(
-                                    "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::2.L2::cache_hint"
-                                    " [%0], [%1, {%2, %3}], [%4], %5;"
-                                    :: "r"(smem_b_addr + b_stage * 16384), "l"((&B2)), "r"(k_1 * 128), "r"(task_1[1] * task_1[6] + n_offset),
+                                    "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::2.L2::cache_hint"
+                                    " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                                    :: "r"(smem_b_addr + b_stage * 16384), "l"((&B2)), "r"(0), "r"(task_1[1] * task_1[6] + n_offset), "r"((unsigned int)k_1 * 2),
                                        "r"(((full_addr + (b_stage) * 8) & 0xFEFFFFFF)), "l"(0x12F0000000000000ULL) : "memory");
                                 asm volatile(
                                     "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::2.L2::cache_hint"

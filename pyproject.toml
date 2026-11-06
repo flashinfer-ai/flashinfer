@@ -103,7 +103,7 @@ exclude = [
 "flashinfer.cake_gated_act_mxfp8_backend" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake.cake_rmsnorm_silu_gate_det_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake.cake_rmsnorm_silu_gate_nondet_train" = ["csrc/**", "build.json"]
-"flashinfer.experimental.cake_dsa_train" = ["csrc/**", "build.json"]
+"flashinfer.experimental.cake.cake_dsa_sparse_attention_nondet_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_kda_det_train" = ["csrc/**", "build.json"]
 # Generated sources of its non-deterministic counterpart (deterministic=False).
 "flashinfer.experimental.cake.cake_kda_train" = ["csrc/**", "build.json"]
@@ -188,11 +188,12 @@ exclude = [
 "flashinfer.experimental.cake_moe_grouped_det_gemm" = ["csrc/**", "build.json"]
 # Generated sources of its non-deterministic counterpart (deterministic=False).
 "flashinfer.experimental.cake.cake_moe_grouped_gemm" = ["csrc/**", "build.json"]
-# Generated sources for the experimental exact-SM100a/SM107a dense projection GEMM backend.
-"flashinfer.experimental.dense_projection_det_gemm" = ["csrc/**", "build.json"]
-# Generated sources for the experimental SM100a/SM103a/SM107a dense projection GEMM backend with an explicit
-# numerical mode (the non-deterministic split-K programs; the deterministic ones ship with dense_projection_det_gemm).
-"flashinfer.experimental.dense_projection_gemm" = ["csrc/**", "build.json"]
+# Generated sources for the deterministic SM100a/SM103a/SM107a dense GEMM training backend
+# (flashinfer.cake_dense_gemm_det_train).
+"flashinfer.experimental.cake.cake_dense_gemm_det_train" = ["csrc/**", "build.json"]
+# Generated sources for the non-deterministic SM100a/SM103a/SM107a dense GEMM training backend
+# (flashinfer.cake_dense_gemm_nondet_train; the deterministic programs it reuses ship with cake_dense_gemm_det_train).
+"flashinfer.experimental.cake.cake_dense_gemm_nondet_train" = ["csrc/**", "build.json"]
 # Generated sources for the experimental exact-SM100a/SM103a StepFun fused-MoE backend (cake-build/1).
 "flashinfer.experimental.cake_stepfun_moe" = ["csrc/**", "build.json"]
 # Standalone cuDNN Frost Python sources and the native MoE adapter, compiled on first use.

@@ -16,7 +16,8 @@ public attributes defined in it (:func:`public_names`).  The checks:
   ``deterministic``: ``inspect.signature(obj).bind_partial(deterministic=False)``
   raises ``TypeError`` (so a ``**kwargs`` fails too) for a function, the constructor
   of a class and the ``forward`` / ``backward`` of a ``torch.autograd.Function``
-  subclass, and no public method has a parameter named ``deterministic``.
+  subclass, and no public method has a parameter named ``deterministic``.  A type
+  alias (``Callable[[], Tensor]``, ``list[int]``) names a type and is skipped.
 * :func:`assert_same_object_same_name`: the module and the other namespaces given
   (the ``flashinfer`` top level, the backend package or modules) bind the module, an
   object of it or a backend object it forwards to (``forwards``) only under the name
@@ -47,6 +48,7 @@ import json
 import re
 import subprocess
 import sys
+import typing
 from collections.abc import Iterable
 from os import PathLike
 from types import ModuleType
@@ -116,7 +118,11 @@ def assert_no_deterministic_keyword(objs: ModuleType | Iterable[object]) -> None
     class and the public methods a class body defines also fail with a parameter
     named ``deterministic``, in its own signature or in the one of the function it
     wraps (``__wrapped__``).  A callable without a Python signature (a builtin type)
-    is skipped.
+    is skipped, and so is a type alias: a subscripted generic such as
+    ``Callable[[], Tensor]``, ``Optional[Tensor]`` or ``list[int]``
+    (``typing.get_origin`` gives its origin) names a type, not an entry point,
+    although it is callable with typing's ``(*args, **kwargs)``.  A class it
+    subscripts is checked when the class itself is public.
     """
     _raise(_deterministic_errors(objs))
 
@@ -298,7 +304,7 @@ def _deterministic_errors(objs: ModuleType | Iterable[object]) -> list[str]:
         items = [(_label(obj), obj) for obj in objs]
     errors = []
     for label, obj in items:
-        if not callable(obj):
+        if not callable(obj) or _is_type_alias(obj):
             continue
         for where, target, entry in _signature_targets(label, obj):
             error = _deterministic_error(target, entry)
@@ -359,10 +365,20 @@ def _signature_targets(label: str, obj: object) -> list[tuple[str, object, bool]
     attrs = {n for n in vars(obj) if not n.startswith("_")}
     for attr in sorted(attrs | {"forward", "backward"}):
         member = getattr(obj, attr, None)
-        if callable(member) and not inspect.isclass(member):
+        if (
+            callable(member)
+            and not inspect.isclass(member)
+            and not _is_type_alias(member)
+        ):
             entry = autograd and attr in ("forward", "backward")
             targets.append((f"{label}.{attr}", member, entry))
     return targets
+
+
+def _is_type_alias(obj: object) -> bool:
+    """``obj`` is a subscripted generic (``Callable[[], Tensor]``, ``list[int]``):
+    a type, not an entry point."""
+    return typing.get_origin(obj) is not None
 
 
 def _is_autograd_function(cls: type) -> bool:
