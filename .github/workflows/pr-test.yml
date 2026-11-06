@@ -42,6 +42,23 @@ on:
         description: 'Skip GPU tests'
         type: boolean
         default: false
+      # Trial-only inputs (sccache fork trial). Defaults keep current behaviour.
+      aot_only:
+        description: 'Run only this AOT lane, as "<arch> <cuda>" (e.g. "x64 cu130"); empty = all'
+        type: string
+        default: ''
+      aot_provider_archs:
+        description: 'Restrict provider architectures (e.g. "8.0"); empty = all'
+        type: string
+        default: ''
+      aot_provider_concurrency:
+        description: 'AOT_PROVIDER_CONCURRENCY override; empty = repo default'
+        type: string
+        default: ''
+      sccache_flavor:
+        description: 'sccache flavor: empty (upstream) or "rapids"'
+        type: string
+        default: ''
 
 concurrency:
   # A label other than run-ci can never start tests, so it gets its own group and
@@ -261,6 +278,7 @@ jobs:
         env:
           SKIP_AOT: ${{ github.event.inputs.skip_aot }}
           SKIP_GPU: ${{ github.event.inputs.skip_gpu }}
+          AOT_ONLY: ${{ github.event.inputs.aot_only }}
           RUNTIME_CUDA_MATRIX: ${{ steps.cuda-versions.outputs.runtime }}
           # Targets requested by the triggering `@flashinfer-bot run <paths>` comment,
           # already validated in the step above. Empty for an unparameterised run.
@@ -300,6 +318,9 @@ jobs:
                   # Runtime entries land before their multi-arch image is
                   # published. The release-ci-docker workflow adds the tag in
                   # its generated follow-up PR; only then can AOT consume it.
+                  if [ -n "${AOT_ONLY}" ] && [ "${AOT_ONLY}" != "${arch} ${cuda}" ]; then
+                    continue
+                  fi
                   if ! grep -q "^flashinfer/flashinfer-ci-${cuda}:" ci/docker-tags.yml; then
                     echo "::notice title=AOT image not published::Skipping ${cuda}; ci/docker-tags.yml has no published image yet" >&2
                     continue
@@ -536,7 +557,9 @@ jobs:
           # Provider builds overlapped per job (see the script). The repository
           # variable AOT_PROVIDER_CONCURRENCY overrides it, and 1 restores the
           # serial loop, for A/B timing without a code change.
-          AOT_PROVIDER_CONCURRENCY: ${{ vars.AOT_PROVIDER_CONCURRENCY || '2' }}
+          AOT_PROVIDER_CONCURRENCY: ${{ github.event.inputs.aot_provider_concurrency || vars.AOT_PROVIDER_CONCURRENCY || '2' }}
+          AOT_PROVIDER_ARCHS_OVERRIDE: ${{ github.event.inputs.aot_provider_archs }}
+          FLASHINFER_SCCACHE_FLAVOR: ${{ github.event.inputs.sccache_flavor }}
         run: |
           if [ "${TEST_SCRIPT}" != "task_test_jit_cache_package_build_import.sh" ]; then
             echo "::error::Unexpected AOT test script: ${TEST_SCRIPT}"
@@ -550,6 +573,8 @@ jobs:
             -e AWS_SECRET_ACCESS_KEY \
             -e SCCACHE_STATS_DIR /workspace/sccache-stats \
             -e AOT_PROVIDER_CONCURRENCY "${AOT_PROVIDER_CONCURRENCY}" \
+            -e AOT_PROVIDER_ARCHS_OVERRIDE "${AOT_PROVIDER_ARCHS_OVERRIDE}" \
+            -e FLASHINFER_SCCACHE_FLAVOR "${FLASHINFER_SCCACHE_FLAVOR}" \
             --no-gpu "./scripts/${TEST_SCRIPT}"
 
       - name: Configure compile cache
