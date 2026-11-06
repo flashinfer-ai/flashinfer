@@ -970,6 +970,8 @@ POLICY: dict[str, dict[str, Any]] = {
         "snake_default": False,
         "snake_rule": None,
         "snake_cap_rule": None,
+        "snake_packed_rule": None,
+        "snake_l6_fallback_waves": None,
         "tile_unroll_default": 1,
         "tile_unroll_factor": 2,
         "tile_unroll_rule": [["wide"], 256, False],
@@ -1053,6 +1055,8 @@ POLICY: dict[str, dict[str, Any]] = {
         "snake_default": False,
         "snake_rule": None,
         "snake_cap_rule": None,
+        "snake_packed_rule": None,
+        "snake_l6_fallback_waves": None,
         "tile_unroll_default": 1,
         "tile_unroll_factor": 2,
         "tile_unroll_rule": [["wide"], 256, False],
@@ -1141,6 +1145,8 @@ POLICY: dict[str, dict[str, Any]] = {
             0.5,
         ],
         "snake_cap_rule": None,
+        "snake_packed_rule": [["l6"], 48.0, None, 7],
+        "snake_l6_fallback_waves": 310,
         "tile_unroll_default": 1,
         "tile_unroll_factor": 2,
         "tile_unroll_rule": [
@@ -1216,23 +1222,32 @@ POLICY: dict[str, dict[str, Any]] = {
 # FP8 wide unit runs its :lsf copy from 64 mean unit tiles on (lsf_single_rule):
 # the same units in the same order, measured faster there and slower on shorter
 # units.  No FP8 call walks its key tiles in descending order (desc_walk_kinds
-# None): the descending-walk programs are BF16 programs.
+# None): the descending-walk programs are BF16 programs.  Each FP8 record
+# leaves the BF16 snake rules of packed calls and of the l6 fallback off
+# (snake_packed_rule, snake_l6_fallback_waves), so the FP8 plans keep their
+# own measured rules.
 POLICY_FP8: dict[str, dict[str, Any]] = {
     "sm_100a": {
         "static_scan_kinds": [],
         "wide_wave_rule": [1.7, 1.3, 84.0],
         "desc_walk_kinds": None,
+        "snake_packed_rule": None,
+        "snake_l6_fallback_waves": None,
     },
     "sm_103a": {
         "static_scan_kinds": [],
         "lsf_single_rule": [64.0],
         "desc_walk_kinds": None,
+        "snake_packed_rule": None,
+        "snake_l6_fallback_waves": None,
     },
     "sm_107a": {
         "static_scan_kinds": ["l6", "narrow", "split_narrow", "wide"],
         "split_fit_rule": None,
         "snake_cap_rule": [1, 40],
         "desc_walk_kinds": None,
+        "snake_packed_rule": None,
+        "snake_l6_fallback_waves": None,
     },
 }
 TRACKING_ISSUE = "flashinfer-ai/flashinfer#5676"
