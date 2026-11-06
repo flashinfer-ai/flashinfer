@@ -31,12 +31,22 @@ scratch sizes come from tensor shapes, ``len(cu_seqlens) - 1`` and the SM
 count.  The segment boundaries ``cu_seqlens_q`` / ``cu_seqlens_k`` (int32 on
 the device, ``cu[0] == 0``, non-decreasing, ``cu_q[-1] == T_q``,
 ``cu_k[-1] == T_k``) are read by the kernels only.
+
+The package is the non-deterministic one of its family (``nondet``): the
+forward is fixed-order, but the backward adds the dQ partials of the key
+blocks (and, with a row map, the dK / dV window rows into the caller's
+destinations) with atomic FP32 reductions, so its gradients are not bitwise
+reproducible run to run.  Under ``torch.use_deterministic_algorithms(True)``
+:func:`cake_gqa_nondet_train_backward` raises PyTorch's alert before it
+launches (``warn_only=True``: it warns and runs this backward); nothing falls
+back to a deterministic implementation.
 """
 
 from __future__ import annotations
 
 import functools
 import math
+import warnings
 import weakref
 from collections.abc import Callable, Mapping
 from typing import Any, Optional, Union
@@ -49,15 +59,17 @@ from . import cake_build, cake_jit
 __all__ = [
     "ARCHES",
     "ARCH_BY_CAPABILITY",
+    "CakeGQANondetDkvAccSource",
+    "CakeGQANondetFunction",
+    "CakeGQANondetWorkspace",
     "HEAD_DIM",
-    "DkvAccSource",
-    "VarlenGQAAttentionFunction",
-    "Workspace",
     "arch_for_capability",
+    "cake_gqa_nondet",
+    "cake_gqa_nondet_train_backward",
+    "cake_gqa_nondet_train_forward",
+    "cake_gqa_nondet_train_workspace_bytes",
     "default_workspace",
     "device_arch",
-    "gqa_attention_bwd",
-    "gqa_attention_fwd",
     "is_prebuilt",
     "library_name",
     "load",
@@ -67,8 +79,6 @@ __all__ = [
     "sm_count",
     "specs_for_arch",
     "stage_record",
-    "varlen_gqa_attention",
-    "workspace_bytes",
 ]
 
 # One verified build per architecture: B200 / GB200 (``sm_100a``), B300 /
@@ -221,13 +231,15 @@ def _launch(
 # Workspace
 
 
-def workspace_bytes(total_q: int, num_heads_q: int, num_segments: int) -> int:
+def cake_gqa_nondet_train_workspace_bytes(
+    total_q: int, num_heads_q: int, num_segments: int
+) -> int:
     """Bytes of the backward scratch one call of these sizes needs (FP32 ``dq_accum [H_q / 2, rows_pad, 256]``,
     ``lse_log2`` and ``dpsum [H_q / 2, rows_pad]``, ``rows_pad = round_up(2 T_q + 128 B, 128)``)."""
     return cake_jit.scratch_bytes(int(total_q), int(num_heads_q), int(num_segments))
 
 
-class Workspace:
+class CakeGQANondetWorkspace:
     """Device scratch of the GQA training attention, reused across calls and shapes.
 
     It holds the forward's tile counter (one ``uint32``, zeroed once; every launch leaves it zero) and the backward
@@ -298,15 +310,17 @@ class Workspace:
         self._scratch = None
 
 
-_DEFAULT_WORKSPACES: dict[tuple[int, int], Workspace] = {}
+_DEFAULT_WORKSPACES: dict[tuple[int, int], CakeGQANondetWorkspace] = {}
 
 
-def default_workspace(device_index: int) -> Workspace:
+def default_workspace(device_index: int) -> CakeGQANondetWorkspace:
     """The workspace of the device's current stream, made on first use and kept for the process."""
     stream = torch.cuda.current_stream(device_index).stream_id
     found = _DEFAULT_WORKSPACES.get((device_index, stream))
     if found is None:
-        found = _DEFAULT_WORKSPACES[(device_index, stream)] = Workspace(device_index)
+        found = _DEFAULT_WORKSPACES[(device_index, stream)] = CakeGQANondetWorkspace(
+            device_index
+        )
     return found
 
 
@@ -393,11 +407,34 @@ def _scale(softmax_scale: Optional[float]) -> float:
     return HEAD_DIM**-0.5 if softmax_scale is None else float(softmax_scale)
 
 
+def _alert_nondeterministic(entry: str) -> None:
+    """PyTorch's alert for an operation without a deterministic implementation, when torch's deterministic algorithms
+    are enabled: a ``RuntimeError``, or a ``UserWarning`` under ``torch.use_deterministic_algorithms(True,
+    warn_only=True)``; nothing otherwise.  :func:`cake_gqa_nondet_train_backward` calls it once per call that has a
+    (query, key) pair, after its checks and before it allocates or launches anything (PyTorch exposes no public Python
+    entry for the alert)."""
+    if not torch.are_deterministic_algorithms_enabled():
+        return
+    if torch.is_deterministic_algorithms_warn_only_enabled():
+        warnings.warn(
+            f"{entry} does not have a deterministic implementation, but you set "
+            "'torch.use_deterministic_algorithms(True, warn_only=True)'; it adds the dQ partials with atomic "
+            "FP32 reductions",
+            stacklevel=3,
+        )
+        return
+    raise RuntimeError(
+        f"{entry} does not have a deterministic implementation, but you set "
+        "'torch.use_deterministic_algorithms(True)': it adds the dQ partials with atomic FP32 reductions; "
+        "you can use the 'warn_only=True' option if that is acceptable for your application"
+    )
+
+
 # ----------------------------------------------------------------------------------------------------------------
 # Forward and backward
 
 
-def gqa_attention_fwd(
+def cake_gqa_nondet_train_forward(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -407,7 +444,7 @@ def gqa_attention_fwd(
     softmax_scale: Optional[float] = None,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
-    workspace: Optional[Workspace] = None,
+    workspace: Optional[CakeGQANondetWorkspace] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Forward: ``(out [T_q, H_q, 256] bf16, lse [H_q, T_q] fp32)``, causal with bottom-right alignment per segment;
     a row that sees no key gets ``out = 0`` and ``lse = -inf``."""
@@ -451,7 +488,7 @@ def gqa_attention_fwd(
     return out, lse
 
 
-def gqa_attention_bwd(
+def cake_gqa_nondet_train_backward(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -470,7 +507,7 @@ def gqa_attention_bwd(
     dv_acc: Optional[torch.Tensor] = None,
     row_map: Optional[torch.Tensor] = None,
     max_seqlen_k: Optional[int] = None,
-    workspace: Optional[Workspace] = None,
+    workspace: Optional[CakeGQANondetWorkspace] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Backward: ``(dq, dk, dv)``.  ``dq`` is BF16 ``[T_q, H_q, 256]``.  dK / dV are summed over the query heads of
     each key head in FP32 and leave the kernel as:
@@ -486,6 +523,11 @@ def gqa_attention_bwd(
     FlashAttention's ``max_seqlen_k``: a smaller value leaves key blocks out); it sizes the backward grid, one CTA pair
     per 128 keys of the longest segment, per key head and segment.  ``None`` bounds it by ``T_k``: always correct,
     with more CTAs that retire at once.  It is never read from the device.
+
+    Not bitwise reproducible run to run: the dQ partials (and the row-map adds) are atomic FP32 reductions.  Under
+    ``torch.use_deterministic_algorithms(True)`` a call with a (query, key) pair raises PyTorch's alert (a
+    ``RuntimeError``; with ``warn_only=True`` a ``UserWarning``, and the backward runs) after the checks and before
+    anything is allocated or launched.
     """
     dims = _check_operands(q, k, v, cu_seqlens_q, cu_seqlens_k)
     if max_seqlen_k is not None and int(max_seqlen_k) < 0:
@@ -524,21 +566,27 @@ def gqa_attention_bwd(
                 f"dkv_dtype must be torch.bfloat16 or torch.float32, got {dkv_dtype}"
             )
         mode = "bf16" if dkv_dtype == torch.bfloat16 else "fp32"
+        if dk is not None:
+            _check_out("dk", dk, kv_shape, dkv_dtype, device)
+        if dv is not None:
+            _check_out("dv", dv, kv_shape, dkv_dtype, device)
+    if dq is not None:
+        _check_out("dq", dq, (total_q, heads_q, HEAD_DIM), torch.bfloat16, device)
+    if total_q and total_k:
+        # The kernels below add the dQ partials (and the row-map rows) with atomic FP32 reductions.
+        _alert_nondeterministic(
+            "cake_gqa_nondet_train_backward (the backward of cake_gqa_nondet)"
+        )
+    if mode != "rowmap":
         if dk is None:
             dk = torch.empty(kv_shape, dtype=dkv_dtype, device=device)
-        else:
-            _check_out("dk", dk, kv_shape, dkv_dtype, device)
         if dv is None:
             dv = torch.empty(kv_shape, dtype=dkv_dtype, device=device)
-        else:
-            _check_out("dv", dv, kv_shape, dkv_dtype, device)
         dk_out, dv_out = dk, dv
     if dq is None:
         dq = torch.empty(
             total_q, heads_q, HEAD_DIM, dtype=torch.bfloat16, device=device
         )
-    else:
-        _check_out("dq", dq, (total_q, heads_q, HEAD_DIM), torch.bfloat16, device)
     if total_q == 0 or total_k == 0:
         # No (query, key) pair: every gradient is zero; a row-map destination keeps its contents.
         dq.zero_()
@@ -609,7 +657,7 @@ def gqa_attention_bwd(
 # the caller's destinations through the row map) or ``(dk_win, dv_win)`` (FP32 window gradients stored into them).
 # Under activation checkpointing a destination passed at forward time would live for every layer at once; one the
 # callable produces lives only while its backward runs.
-DkvAccSource = Callable[
+CakeGQANondetDkvAccSource = Callable[
     [],
     Union[
         tuple[torch.Tensor, torch.Tensor],
@@ -619,7 +667,7 @@ DkvAccSource = Callable[
 
 
 def _resolve_dkv_acc(
-    dkv_acc: DkvAccSource,
+    dkv_acc: CakeGQANondetDkvAccSource,
 ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     produced = dkv_acc()
     if not isinstance(produced, tuple) or len(produced) not in (2, 3):
@@ -633,7 +681,7 @@ def _resolve_dkv_acc(
     return produced[0], produced[1], produced[2]
 
 
-class VarlenGQAAttentionFunction(torch.autograd.Function):
+class CakeGQANondetFunction(torch.autograd.Function):
     """``(out, lse) = attention(q, k, v)``; the saved set is ``(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k)``
     through ``ctx.save_for_backward`` alone, with scalars, the ``dkv_acc`` callable and a weak reference to the
     workspace on ``ctx`` (a checkpointed forward keeps no tensor alive through ``ctx``)."""
@@ -647,11 +695,11 @@ class VarlenGQAAttentionFunction(torch.autograd.Function):
         cu_seqlens_q: torch.Tensor,
         cu_seqlens_k: torch.Tensor,
         softmax_scale: float,
-        dkv_acc: Optional[DkvAccSource],
+        dkv_acc: Optional[CakeGQANondetDkvAccSource],
         max_seqlen_k: Optional[int],
-        workspace: Optional[Workspace],
+        workspace: Optional[CakeGQANondetWorkspace],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        out, lse = gqa_attention_fwd(
+        out, lse = cake_gqa_nondet_train_forward(
             q,
             k,
             v,
@@ -684,7 +732,7 @@ class VarlenGQAAttentionFunction(torch.autograd.Function):
             "workspace": workspace,
         }
         if ctx.dkv_acc is None:
-            dq, dk, dv = gqa_attention_bwd(
+            dq, dk, dv = cake_gqa_nondet_train_backward(
                 q, k, v, out, lse, dout, cu_seqlens_q, cu_seqlens_k, **kwargs
             )
             return dq, dk, dv, None, None, None, None, None, None
@@ -693,13 +741,13 @@ class VarlenGQAAttentionFunction(torch.autograd.Function):
             kwargs.update(dk=dk_t, dv=dv_t, dkv_dtype=torch.float32)
         else:
             kwargs.update(dk_acc=dk_t, dv_acc=dv_t, row_map=row_map)
-        dq = gqa_attention_bwd(
+        dq = cake_gqa_nondet_train_backward(
             q, k, v, out, lse, dout, cu_seqlens_q, cu_seqlens_k, **kwargs
         )[0]
         return dq, None, None, None, None, None, None, None, None
 
 
-def varlen_gqa_attention(
+def cake_gqa_nondet(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -708,17 +756,19 @@ def varlen_gqa_attention(
     *,
     softmax_scale: Optional[float] = None,
     causal: bool = True,
-    dkv_acc: Optional[DkvAccSource] = None,
+    dkv_acc: Optional[CakeGQANondetDkvAccSource] = None,
     max_seqlen_k: Optional[int] = None,
-    workspace: Optional[Workspace] = None,
+    workspace: Optional[CakeGQANondetWorkspace] = None,
     return_lse: bool = False,
 ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-    """Packed-varlen causal GQA attention with autograd (see :func:`gqa_attention_fwd` / :func:`gqa_attention_bwd`).
+    """Packed-varlen causal GQA attention with autograd (see :func:`cake_gqa_nondet_train_forward` /
+    :func:`cake_gqa_nondet_train_backward`).
 
     ``dkv_acc=None``: autograd returns BF16 gradients for ``k`` / ``v``.  A ``dkv_acc`` callable is called in
     backward; it returns ``(dk_acc, dv_acc, row_map)`` (FP32 adds into the destinations) or ``(dk_win, dv_win)`` (FP32
     window gradients stored into them), and ``k`` / ``v`` then get no gradient.  ``max_seqlen_k``: see
-    :func:`gqa_attention_bwd`.
+    :func:`cake_gqa_nondet_train_backward`.  Under ``torch.use_deterministic_algorithms(True)`` the forward runs and
+    the backward raises PyTorch's alert (see :func:`cake_gqa_nondet_train_backward`).
     """
     if not causal:
         raise NotImplementedError(
@@ -726,9 +776,9 @@ def varlen_gqa_attention(
         )
     if dkv_acc is not None and not callable(dkv_acc):
         raise TypeError(
-            "dkv_acc must be None or a zero-argument callable (see DkvAccSource)"
+            "dkv_acc must be None or a zero-argument callable (see CakeGQANondetDkvAccSource)"
         )
-    out, lse = VarlenGQAAttentionFunction.apply(
+    out, lse = CakeGQANondetFunction.apply(
         q,
         k,
         v,

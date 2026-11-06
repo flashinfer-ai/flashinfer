@@ -15,11 +15,12 @@ limitations under the License.
 
 Benchmark of the Cake SiLU-gated RMSNorm training kernels
 (``RMSNorm(x) * w * SiLU(z)`` over ``[T, H, 128]``) with the opt-in
-non-deterministic weight gradient (``deterministic=False``: one backward kernel
-whose last CTA finishes the FP64 weight-gradient sum) against the same entry
-points with the deterministic default (``deterministic=True``: the
-deterministic package's backward kernel and its fixed-order weight-gradient
-reduction).
+non-deterministic weight gradient (``flashinfer.cake_rmsnorm_silu_gate_nondet_train``:
+one backward kernel whose last CTA finishes the FP64 weight-gradient sum)
+against the deterministic package
+(``flashinfer.cake_rmsnorm_silu_gate_det_train``: its backward kernel and its
+fixed-order weight-gradient reduction), each called through its own entry
+points.
 
 Every row times, for both modes, on identical generated inputs:
 
@@ -28,7 +29,7 @@ Every row times, for both modes, on identical generated inputs:
   gradient included (the deterministic reduction kernel, or the last CTA of
   the non-deterministic kernel), with a preallocated caller workspace;
 - ``ckpt``: the activation-checkpointed step through autograd,
-  ``torch.utils.checkpoint(cake_rmsnorm_silu_gate, ..., use_reentrant=False)``
+  ``torch.utils.checkpoint(cake_rmsnorm_silu_gate_nondet, ..., use_reentrant=False)``
   then the backward (which replays the forward): ``2 * fwd + bwd`` measured.
 
 Timing uses CUPTI kernel activity with a cold L2
@@ -47,8 +48,8 @@ in the last place, and the number of distinct ``dw`` bit patterns over
 
 Example::
 
-    python benchmarks/bench_cake_rmsnorm_silu_gate_train.py --tokens 30193 32737 32388 --heads 48
-    python benchmarks/bench_cake_rmsnorm_silu_gate_train.py --json out.json
+    python benchmarks/bench_cake_rmsnorm_silu_gate_nondet_train.py --tokens 30193 32737 32388 --heads 48
+    python benchmarks/bench_cake_rmsnorm_silu_gate_nondet_train.py --json out.json
 """
 
 from __future__ import annotations
@@ -61,18 +62,30 @@ from typing import Callable, Optional
 import torch
 import torch.utils.checkpoint
 
-from flashinfer.cake_rmsnorm_silu_gate_train import (
-    cake_rmsnorm_silu_gate,
-    cake_rmsnorm_silu_gate_train_backward,
-    cake_rmsnorm_silu_gate_train_backward_workspace,
-    cake_rmsnorm_silu_gate_train_backward_workspace_bytes,
-    cake_rmsnorm_silu_gate_train_forward,
-    is_cake_rmsnorm_silu_gate_train_supported,
-)
+import flashinfer.cake_rmsnorm_silu_gate_det_train as det
+import flashinfer.cake_rmsnorm_silu_gate_nondet_train as nd
 from flashinfer.testing import bench_gpu_time
 
 D = 128
-MODES = (("deterministic", True), ("nondeterministic", False))
+# Each mode's entry points: the deterministic package's ``det`` names and the
+# non-deterministic package's ``nondet`` names.
+API = {
+    "deterministic": {
+        "forward": det.cake_rmsnorm_silu_gate_det_train_forward,
+        "backward": det.cake_rmsnorm_silu_gate_det_train_backward,
+        "workspace": det.cake_rmsnorm_silu_gate_det_train_backward_workspace,
+        "workspace_bytes": det.cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes,
+        "autograd": det.cake_rmsnorm_silu_gate_det,
+    },
+    "nondeterministic": {
+        "forward": nd.cake_rmsnorm_silu_gate_nondet_train_forward,
+        "backward": nd.cake_rmsnorm_silu_gate_nondet_train_backward,
+        "workspace": nd.cake_rmsnorm_silu_gate_nondet_train_backward_workspace,
+        "workspace_bytes": nd.cake_rmsnorm_silu_gate_nondet_train_backward_workspace_bytes,
+        "autograd": nd.cake_rmsnorm_silu_gate_nondet,
+    },
+}
+MODES = tuple(API)
 STAGES = ("fwd", "bwd", "ckpt")
 # The issue's token counts and a spread around them, then small and irregular ones.
 TOKENS = (30193, 32737, 32388, 30000, 33000, 1, 7, 129, 1031, 4097)
@@ -143,21 +156,18 @@ def bench_row(T: int, H: int, eps: float, seed: int, repeats: int) -> dict:
     rows = T * H
     result: dict = {"T": T, "H": H, "rows": rows, "eps": eps, "modes": {}}
     outputs = {}
-    for name, deterministic in MODES:
+    for name in MODES:
+        api = API[name]
         y = torch.empty_like(x)
         dx, dz = torch.empty_like(x), torch.empty_like(x)
         dw = torch.empty(D, dtype=torch.bfloat16, device=x.device)
-        ws = cake_rmsnorm_silu_gate_train_backward_workspace(
-            rows, x.device, deterministic=deterministic
-        )
+        ws = api["workspace"](rows, x.device)
 
-        def fwd(y=y, deterministic=deterministic):
-            return cake_rmsnorm_silu_gate_train_forward(
-                x, z, w, eps, out=y, deterministic=deterministic
-            )
+        def fwd(y=y, api=api):
+            return api["forward"](x, z, w, eps, out=y)
 
-        def bwd(dx=dx, dz=dz, dw=dw, ws=ws, deterministic=deterministic):
-            return cake_rmsnorm_silu_gate_train_backward(
+        def bwd(dx=dx, dz=dz, dw=dw, ws=ws, api=api):
+            return api["backward"](
                 dy,
                 x,
                 z,
@@ -167,11 +177,10 @@ def bench_row(T: int, H: int, eps: float, seed: int, repeats: int) -> dict:
                 grad_z=dz,
                 grad_weight=dw,
                 workspace=ws,
-                deterministic=deterministic,
             )
 
-        def bwd_no_workspace(dx=dx, dz=dz, dw=dw, deterministic=deterministic):
-            return cake_rmsnorm_silu_gate_train_backward(
+        def bwd_no_workspace(dx=dx, dz=dz, dw=dw, api=api):
+            return api["backward"](
                 dy,
                 x,
                 z,
@@ -180,11 +189,10 @@ def bench_row(T: int, H: int, eps: float, seed: int, repeats: int) -> dict:
                 grad_x=dx,
                 grad_z=dz,
                 grad_weight=dw,
-                deterministic=deterministic,
             )
 
-        def layer(xa, za, wa, deterministic=deterministic):
-            return cake_rmsnorm_silu_gate(xa, za, wa, eps, deterministic=deterministic)
+        def layer(xa, za, wa, api=api):
+            return api["autograd"](xa, za, wa, eps)
 
         xa, za, wa = (t.detach().requires_grad_(True) for t in (x, z, w))
 
@@ -214,9 +222,7 @@ def bench_row(T: int, H: int, eps: float, seed: int, repeats: int) -> dict:
             "saved_bytes": _saved_bytes(layer, x, z, w),
             "peak_bytes": _peak_bytes(fwd_bwd),
             "temp_bytes": _peak_bytes(bwd_no_workspace),
-            "workspace_bytes": cake_rmsnorm_silu_gate_train_backward_workspace_bytes(
-                rows, x.device, deterministic=deterministic
-            ),
+            "workspace_bytes": api["workspace_bytes"](rows, x.device),
             "dw_patterns": len(patterns),
             "repeats": repeats,
         }
@@ -245,7 +251,7 @@ def _format(result: dict) -> list[str]:
     lines = []
     for stage in STAGES:
         cells = []
-        for name, _ in MODES:
+        for name in MODES:
             s = result["modes"][name][stage]
             cells.append(
                 f"{name} {s['ms'] * 1e3:9.1f} us "
@@ -256,7 +262,7 @@ def _format(result: dict) -> list[str]:
             + " | ".join(cells)
             + f" | speedup x{result[f'{stage}_speedup']:5.2f}"
         )
-    for name, _ in MODES:
+    for name in MODES:
         m = result["modes"][name]
         lines.append(
             f"{head} mem  | {name:16s} saved {m['saved_bytes'] / 2**20:8.1f} MiB  "
@@ -289,9 +295,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--json", default=None)
     args = parser.parse_args(argv)
     device = torch.device("cuda", torch.cuda.current_device())
-    if not is_cake_rmsnorm_silu_gate_train_supported(device, deterministic=False):
+    if not nd.is_cake_rmsnorm_silu_gate_nondet_train_supported(
+        device
+    ) or not det.is_cake_rmsnorm_silu_gate_det_train_supported(device):
         raise SystemExit(
-            "cake_rmsnorm_silu_gate_train(deterministic=False) has no exported route on this device"
+            "cake_rmsnorm_silu_gate_nondet_train or "
+            "cake_rmsnorm_silu_gate_det_train has no exported route on this device"
         )
     torch.use_deterministic_algorithms(False)
     props = torch.cuda.get_device_properties(device)
