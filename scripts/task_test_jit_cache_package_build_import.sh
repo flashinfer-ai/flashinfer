@@ -298,6 +298,23 @@ if [ -n "${FLASHINFER_SCCACHE_FLAVOR:-}" ]; then
     echo "TRIAL objects hashed: $(wc -l < trial-object-sha256.txt), digest of list: $(sha256sum < trial-object-sha256.txt | cut -c1-16)"
     { set +x; } 2>/dev/null
     sed 's/^/TRIALSUM /' trial-object-sha256.txt
+    # Content beyond raw bytes, for the first 40 nvcc objects: SASS text and
+    # section-size layout (both independent of embedded temp names / module ids).
+    ( cd build/aot-providers && find . -name '*.cuda.o' | LC_ALL=C sort | head -40 ) | while read -r o; do
+        f="build/aot-providers/${o#./}"
+        sass=$(/usr/local/cuda/bin/cuobjdump -sass "$f" 2>/dev/null | grep -v -e 'Fatbin' -e 'code for' -e 'arch = ' -e 'identifier' | sha256sum | cut -c1-16)
+        secs=$(readelf -SW "$f" | awk '/^ *\[/{print $2, $6}' | sha256sum | cut -c1-16)
+        echo "TRIALSASS ${o} sass=${sass} sections=${secs}"
+    done
+    # nvcc run-to-run determinism: compile two targets directly (no sccache) twice.
+    for t in $(cd build/aot-providers/sm80/cached_ops && ninja -f tmp/flashinfer_jit.ninja -t targets all 2>/dev/null | awk -F: '/\.cuda\.o:/{print $1}' | LC_ALL=C sort | head -2); do
+        cmd=$(cd build/aot-providers/sm80/cached_ops && ninja -f tmp/flashinfer_jit.ninja -t commands "$t" | tail -1)
+        cmd=${cmd#sccache }
+        for i in 1 2; do
+            ( cd build/aot-providers/sm80/cached_ops && eval "${cmd//-o $t/-o /tmp/det$i.o}" ) >/dev/null 2>&1
+        done
+        echo "TRIALDET ${t} run1=$(sha256sum < /tmp/det1.o | cut -c1-16) run2=$(sha256sum < /tmp/det2.o | cut -c1-16) cached=$(cd build/aot-providers/sm80/cached_ops && sha256sum < "$t" | cut -c1-16)"
+    done
     set -x
 fi
 
