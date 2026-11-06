@@ -552,7 +552,9 @@ def _serialize_value(value: Any, depth: int = 0) -> Any:
 def _stage_tensor_for_dump(tensor: torch.Tensor, graph_capture: bool) -> torch.Tensor:
     """Prepare a tensor for dump without mutating CUDA graph capture."""
     if graph_capture:
-        return tensor.detach()
+        # Snapshot planning needs the original object identity as well as storage
+        # geometry. Staging detaches after recording that identity.
+        return tensor if _DUMP_GRAPH_SNAPSHOTS else tensor.detach()
     if tensor.is_cuda:
         return tensor.cpu()
     return tensor
@@ -622,6 +624,27 @@ def _extract_value_for_dump(
         }
 
     return _serialize_value(value)
+
+
+def _extract_output_tensors(result, graph_capture):
+    """Use one tensor-key encoding for output serialization and replay."""
+    tensors, metadata = {}, {}
+    if isinstance(result, torch.Tensor):
+        tensors["result"] = _stage_tensor_for_dump(result, graph_capture)
+    elif isinstance(result, tuple):
+        for i, item in enumerate(result):
+            key = f"result_{i}"
+            if isinstance(item, torch.Tensor):
+                tensors[key] = _stage_tensor_for_dump(item, graph_capture)
+            else:
+                metadata[key] = _extract_value_for_dump(
+                    item, key, tensors, graph_capture
+                )
+    else:
+        metadata["result"] = _extract_value_for_dump(
+            result, "result", tensors, graph_capture
+        )
+    return tensors, metadata
 
 
 def _extract_tensors_and_metadata_common(
@@ -723,10 +746,21 @@ def _graph_tensor_plan(tensors, snapshot_keys):
             raise ValueError(
                 "Graph snapshots support dense strided tensors without conjugate/negative views"
             )
-        if torch._debug_has_internal_overlap(tensor) == 1:
-            raise ValueError(
-                "Graph snapshots do not support internally overlapping tensor views"
-            )
+        # PyTorch's overlap status 2 means "too hard", not non-overlapping.
+        # Prove disjoint strides using metadata only, including sliced views.
+        # Conservatively reject layouts this sufficient condition cannot prove.
+        required_span = 1
+        if tensor.numel():
+            for stride, size in sorted(
+                (s, n)
+                for n, s in zip(tensor.shape, tensor.stride(), strict=True)
+                if n > 1
+            ):
+                if stride < required_span:
+                    raise ValueError(
+                        "Graph snapshots require provably non-overlapping tensor views"
+                    )
+                required_span += (size - 1) * stride
         storage = tensor.untyped_storage()
         groups.setdefault((tensor.device, storage._cdata), []).append((key, tensor))
     plan = []
@@ -753,10 +787,10 @@ def _graph_tensor_plan(tensors, snapshot_keys):
 
 def _stage_graph_tensor_plan(tensors, plan):
     """Copies here become graph nodes, refreshing the same buffers each replay."""
-    staged = dict(tensors)
+    staged = {key: tensor.detach() for key, tensor in tensors.items()}
     aliases = {}
     for index, (items, start, span, copy) in enumerate(plan):
-        first = items[0][1]
+        first = items[0][1].detach()
         base_key = f"_snapshot_storage_{index}"
         while base_key in staged:
             base_key = "_" + base_key
@@ -766,11 +800,13 @@ def _stage_graph_tensor_plan(tensors, plan):
         else:
             base = first.as_strided((span,), (1,), start)
         staged[base_key] = base
+        identities = {}
         for key, tensor in items:
+            object_key = identities.setdefault(id(tensor), key)
             offset = tensor.storage_offset() - start
             view = base.as_strided(tensor.shape, tensor.stride(), offset)
             if copy:
-                view.copy_(tensor)
+                view.copy_(tensor.detach())
             staged[key] = view
             aliases[key] = {
                 "base": base_key,
@@ -778,6 +814,7 @@ def _stage_graph_tensor_plan(tensors, plan):
                 "stride": list(tensor.stride()),
                 "storage_offset": offset,
                 "original_storage_offset": tensor.storage_offset(),
+                "object_key": object_key,
             }
     return staged, aliases
 
@@ -785,12 +822,9 @@ def _stage_graph_tensor_plan(tensors, plan):
 def _restore_tensor_aliases(tensors, aliases):
     views = {}
     for key, view in aliases.items():
-        identity = (
-            view["base"],
-            tuple(view["shape"]),
-            tuple(view["stride"]),
-            view["storage_offset"],
-        )
+        # Older dumps have no object-identity evidence; do not infer identity
+        # from equal shape/stride/offset alone.
+        identity = view.get("object_key", key)
         if identity not in views:
             views[identity] = tensors[view["base"]].as_strided(
                 view["shape"], view["stride"], view["storage_offset"]
@@ -810,23 +844,42 @@ _GRAPH_DUMP_FLUSH_COUNTER: Dict[str, int] = {}
 
 def _materialize_dump_tensors(
     tensors: Dict[str, torch.Tensor],
+    aliases: Optional[dict] = None,
 ) -> Dict[str, torch.Tensor]:
     """Snapshot tensors to CPU for writing outside CUDA graph capture."""
+    aliases = aliases or {}
+    backing_keys = {view["base"] for view in aliases.values()}
     materialized = {}
     for key, tensor in tensors.items():
+        if key in backing_keys:
+            continue
         if tensor.is_cuda:
             materialized[key] = tensor.detach().cpu()
         else:
             materialized[key] = tensor.detach().clone()
+    # Read-only aliases retain references during capture. Copy only the logical
+    # views at flush, never the unrelated bytes between them in their allocation.
+    for key in backing_keys:
+        materialized[key] = torch.zeros(
+            tensors[key].shape, dtype=tensors[key].dtype, device="cpu"
+        )
+    for key, view in aliases.items():
+        materialized[view["base"]].as_strided(
+            view["shape"], view["stride"], view["storage_offset"]
+        ).copy_(materialized[key])
     return materialized
 
 
 def _save_dump_tensors(
-    tensors: Dict[str, torch.Tensor], tensor_format: str, out_dir: Path, kind: str
+    tensors: Dict[str, torch.Tensor],
+    tensor_format: str,
+    out_dir: Path,
+    kind: str,
+    aliases: Optional[dict] = None,
 ) -> None:
     """Write one inputs/outputs tensor group to *out_dir*."""
     out_dir.mkdir(parents=True, exist_ok=True)
-    tensors = _materialize_dump_tensors(tensors)
+    tensors = _materialize_dump_tensors(tensors, aliases)
     if tensor_format == "safetensors":
         from safetensors.torch import save_file  # noqa: PLC0415
 
@@ -947,7 +1000,7 @@ def _dump_function_inputs(
         if snapshot_mode:
             input_tensors, input_aliases = _stage_graph_tensor_plan(input_tensors, plan)
             if not is_capturing:
-                input_tensors = _materialize_dump_tensors(input_tensors)
+                input_tensors = _materialize_dump_tensors(input_tensors, input_aliases)
 
         # Save input tensors. During graph capture, defer the write: the
         # replay hook snapshots the held tensor references after every replay.
@@ -1058,6 +1111,7 @@ def _dump_function_inputs(
                     "dump_dir": str(dump_dir),
                     "kind": "inputs",
                     "tensors": input_tensors,
+                    "aliases": input_aliases,
                     "format": "safetensors" if _DUMP_SAFETENSORS else "torch",
                     "func_name": func_name,
                     "graph_id": _current_capture_graph_id(),
@@ -1118,23 +1172,9 @@ def _dump_function_outputs(
         def _stage_for_dump(t: torch.Tensor, key: str) -> torch.Tensor:
             return _stage_tensor_for_dump(t, is_capturing)
 
-        output_tensors = {}
-        output_metadata = {}
-        if isinstance(result, torch.Tensor):
-            output_tensors["result"] = _stage_for_dump(result, "result")
-        elif isinstance(result, tuple):
-            for i, item in enumerate(result):
-                if isinstance(item, torch.Tensor):
-                    output_tensors[f"result_{i}"] = _stage_for_dump(item, f"result_{i}")
-                else:
-                    key = f"result_{i}"
-                    output_metadata[key] = _extract_value_for_dump(
-                        item, key, output_tensors, is_capturing
-                    )
-        else:
-            output_metadata["result"] = _extract_value_for_dump(
-                result, "result", output_tensors, is_capturing
-            )
+        output_tensors, output_metadata = _extract_output_tensors(
+            result, is_capturing or snapshot_mode
+        )
 
         if snapshot_mode:
             assert metadata is not None
@@ -1169,7 +1209,9 @@ def _dump_function_outputs(
                 output_tensors, plan
             )
             if not is_capturing:
-                output_tensors = _materialize_dump_tensors(output_tensors)
+                output_tensors = _materialize_dump_tensors(
+                    output_tensors, output_aliases
+                )
 
         # Save output tensors. During graph capture we hold tensor references
         # in the registry; flush_graph_dumps() materializes them on demand so
@@ -1233,12 +1275,13 @@ def _dump_function_outputs(
 
             # Register the captured output tensors so flush_graph_dumps()
             # writes them on demand alongside the inputs.
-            if is_capturing and output_tensors:
+            if is_capturing and (output_tensors or snapshot_mode):
                 _PENDING_GRAPH_DUMPS.append(
                     {
                         "dump_dir": str(dump_path),
                         "kind": "outputs",
                         "tensors": output_tensors,
+                        "aliases": output_aliases,
                         "format": "safetensors" if _DUMP_SAFETENSORS else "torch",
                         "func_name": metadata.get("function_name", "<unknown>"),
                         "graph_id": _current_capture_graph_id(),
@@ -1328,7 +1371,7 @@ def _flush_graph_dumps(synchronize: bool = True, graph_id: Optional[int] = None)
             dump_path = Path(entry["dump_dir"])
             tensors = entry["tensors"]
             kind = entry["kind"]
-            if not tensors:
+            if not tensors and kind != "outputs":
                 continue
             # Self-heal: re-create the dump dir if a caller wiped it
             # between capture-time registration (which mkdir'd it) and
@@ -1344,8 +1387,12 @@ def _flush_graph_dumps(synchronize: bool = True, graph_id: Optional[int] = None)
             # Latest files are kept for backwards compatibility with replay
             # tooling that expects inputs.pt/outputs.pt directly under the
             # dump directory. Snapshot files preserve every explicit flush.
-            _save_dump_tensors(tensors, entry["format"], dump_path, kind)
-            _save_dump_tensors(tensors, entry["format"], snapshot_dir, kind)
+            _save_dump_tensors(
+                tensors, entry["format"], dump_path, kind, entry.get("aliases")
+            )
+            _save_dump_tensors(
+                tensors, entry["format"], snapshot_dir, kind, entry.get("aliases")
+            )
             flushed += 1
             # Promote the JSONL record from the pending state to a terminal
             # one. Consumers that filter by ``execution_status == "completed"``
@@ -1789,34 +1836,39 @@ def replay_from_dump(
                 result_dict["execution_result"] = execution_result
 
                 if compare_outputs:
-                    # Flatten execution result to dict for comparison
-                    actual_outputs = {}
-                    if isinstance(execution_result, torch.Tensor):
-                        actual_outputs["result"] = execution_result
-                    elif isinstance(execution_result, (tuple, list)):
-                        for i, item in enumerate(execution_result):
-                            if isinstance(item, torch.Tensor):
-                                actual_outputs[f"result_{i}"] = item
-                    elif isinstance(execution_result, dict):
-                        # If result is already a dict of tensors? Unlikely for FlashInfer but possible
-                        actual_outputs = dict(execution_result)
+                    actual_outputs, _ = _extract_output_tensors(
+                        execution_result, graph_capture=True
+                    )
 
                     mutated_outputs = metadata.get("mutated_outputs", {})
                     for output_key, input_key in mutated_outputs.items():
                         actual_outputs[output_key] = input_tensors[input_key]
 
-                    # Compare tensors
-                    match = all(key in expected_outputs for key in mutated_outputs)
-                    if expected_outputs:
-                        match = match and _compare_results(
-                            actual_outputs, expected_outputs
+                    recorded_keys = (
+                        set(
+                            metadata.get("tensor_info", {}).get(
+                                "output_tensor_keys", []
+                            )
                         )
-
-                    result_dict["comparison_match"] = match
-                    if match:
-                        _logger.info("Replay comparison passed!")
+                        - backing_keys
+                    )
+                    if metadata.get(
+                        "execution_status"
+                    ) != "completed" or recorded_keys != set(expected_outputs):
+                        result_dict["comparison_match"] = None
+                        result_dict["comparison_error"] = "Output dump is incomplete"
+                        _logger.warning(
+                            "Replay comparison unavailable: output dump is incomplete."
+                        )
                     else:
-                        _logger.warning("Replay comparison FAILED.")
+                        match = set(actual_outputs) == set(expected_outputs)
+                        if match and expected_outputs:
+                            match = _compare_results(actual_outputs, expected_outputs)
+                        result_dict["comparison_match"] = match
+                        if match:
+                            _logger.info("Replay comparison passed!")
+                        else:
+                            _logger.warning("Replay comparison FAILED.")
 
             except Exception as e:
                 _logger.error(f"Execution failed: {e}")
@@ -2580,7 +2632,7 @@ def _attach_fi_trace(
     return wrapped
 
 
-def flashinfer_api(func: Callable = None, *, trace=None) -> Callable:
+def flashinfer_api(func: Callable = None, *, trace=None, mutates_args=None) -> Callable:
     """
     Decorator to FlashInfer's APIs.
 
@@ -2590,6 +2642,10 @@ def flashinfer_api(func: Callable = None, *, trace=None) -> Callable:
     Currently logs input and output values of the function using Python's logging library.
     This decorator integrates with Python's standard logging infrastructure while
     maintaining zero overhead when disabled (FLASHINFER_LOGLEVEL=0).
+
+    ``mutates_args`` declares named inputs modified by public wrappers that
+    delegate to internal custom ops. Snapshot logging uses the declaration at
+    this boundary; it is attached once at decoration time.
 
     Environment Variables
     ---------------------
@@ -2665,11 +2721,16 @@ def flashinfer_api(func: Callable = None, *, trace=None) -> Callable:
     - The %i pattern is automatically replaced with the process ID for multi-process environments.
     - The logger does not propagate to the root logger to avoid duplicate logs.
     """
+    if func is None:
+        return lambda f: flashinfer_api(f, trace=trace, mutates_args=mutates_args)
+    if mutates_args is not None:
+        func.__dict__["_flashinfer_mutates_args"] = (
+            (mutates_args,) if isinstance(mutates_args, str) else tuple(mutates_args)
+        )
+
     # If logging is disabled, return original function with zero overhead.
     # We still attach fi_trace so it is always available regardless of log level.
     if _API_LOG_LEVEL == 0:
-        if func is None:
-            return lambda f: _attach_fi_trace(f, f, trace_template=trace)
         return _attach_fi_trace(func, func, trace_template=trace)
 
     def decorator(f: Callable) -> Callable:
@@ -2761,8 +2822,6 @@ def flashinfer_api(func: Callable = None, *, trace=None) -> Callable:
 
         return _attach_fi_trace(wrapper, f, trace_template=trace)
 
-    if func is None:
-        return decorator
     return decorator(func)
 
 
