@@ -9,3 +9,5 @@ import BIKernels.MXQuant
 import BIKernels.Quant
 import BIKernels.QuantExport
 import BIKernels.QuantCases
+import BIKernels.MoE
+import BIKernels.MoECases

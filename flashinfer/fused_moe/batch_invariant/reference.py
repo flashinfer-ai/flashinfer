@@ -1,0 +1,214 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
+"""CPU references for the MoE spec: ``ExactF32`` (every op through
+:mod:`flashinfer.batch_invariant.fp_interface.exact`, Fractions, the ground truth) and ``TorchF32`` (torch float32
+CPU tensors: ``+ - * /`` are single IEEE roundings, conversions RNE, no flush-to-zero; vectorised, validated against
+``ExactF32`` by the CPU test suite). Both implement the ``fp`` interface the spec is written against, so
+``route_cpu`` / ``swiglu_cpu`` / ``relu2_cpu`` / ``combine_cpu`` evaluate the *same* spec functions the kernels
+execute. The GEMM accumulators themselves come from the device (the opaque ``mma16`` K-step).
+"""
+
+from __future__ import annotations
+
+from typing import List, Optional, Sequence, Tuple, Union
+
+import torch
+
+from ...batch_invariant.fp_interface import exact as fp32
+from . import spec as S
+
+
+class ExactF32:
+    """Scalar exact backend over Python floats restricted to binary32."""
+
+    @staticmethod
+    def const(v: float) -> float:
+        return fp32.to_f32(v)
+
+    add = staticmethod(fp32.add)
+    mul = staticmethod(fp32.mul)
+    div = staticmethod(fp32.div)
+    fma = staticmethod(fp32.fma)
+    sqrt = staticmethod(fp32.sqrt)
+    neg = staticmethod(fp32.neg)
+    fmin = staticmethod(fp32.fmin)
+    fmax = staticmethod(fp32.fmax)
+    exp2i = staticmethod(fp32.exp2i)
+    rowmax = staticmethod(fp32.rowmax)
+
+    @staticmethod
+    def cvt_out(a: float, fmt: str) -> float:
+        if fmt in ("e4m3", "e5m2"):
+            return fp32.to_fp8(a, fmt)
+        return fp32.to_format(
+            a, {"bf16": fp32.BF16, "f16": fp32.F16, "f32": fp32.F32}[fmt]
+        )
+
+    @staticmethod
+    def sym(
+        name: str,
+    ) -> float:  # pragma: no cover - specs bind scalars before evaluation
+        raise KeyError(name)
+
+
+_TORCH_FMT = {"bf16": torch.bfloat16, "f16": torch.float16, "f32": torch.float32}
+
+
+class TorchF32:
+    """Vectorised backend on float32 CPU tensors (broadcasting). Scalars are 0-d tensors."""
+
+    @staticmethod
+    def const(v: float) -> torch.Tensor:
+        return torch.tensor(fp32.to_f32(v), dtype=torch.float32)
+
+    @staticmethod
+    def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        return torch.add(a, b)
+
+    @staticmethod
+    def mul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        return torch.mul(a, b)
+
+    @staticmethod
+    def div(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        return torch.div(a, b)
+
+    @staticmethod
+    def neg(a: torch.Tensor) -> torch.Tensor:
+        return torch.neg(a)
+
+    @staticmethod
+    def fmin(a: torch.Tensor, b: Union[torch.Tensor, float]) -> torch.Tensor:
+        # fp32.fmin returns ``a`` on ties; torch.minimum returns either (equal values): same bits
+        # except for +0 / -0, which the specs never clamp against.
+        return torch.minimum(a, torch.as_tensor(b, dtype=torch.float32))
+
+    @staticmethod
+    def fmax(a: torch.Tensor, b: Union[torch.Tensor, float]) -> torch.Tensor:
+        return torch.maximum(a, torch.as_tensor(b, dtype=torch.float32))
+
+    @staticmethod
+    def exp2i(k: torch.Tensor) -> torch.Tensor:
+        n = k.to(torch.int32)
+        return ((n + 127) << 23).view(torch.float32)
+
+    @staticmethod
+    def rowmax(*vals: torch.Tensor) -> torch.Tensor:
+        return torch.stack(list(vals), dim=0).amax(dim=0)
+
+    @staticmethod
+    def cvt_out(a: torch.Tensor, fmt: str) -> torch.Tensor:
+        if fmt == "e4m3":
+            # the vectorised cvt.rn.satfinite.e4m3 (values), validated against fp32.to_fp8 by the quantization suite
+            from ...batch_invariant.quantization.nvfp4_reference import e4m3_round
+
+            return e4m3_round(a)
+        return a.to(_TORCH_FMT[fmt])
+
+
+# ----------------------------------------------------------------------------- vectorised references
+
+
+def _f32(t: torch.Tensor) -> torch.Tensor:
+    return t.detach().to("cpu", torch.float32)
+
+
+def exp_cpu(x: torch.Tensor) -> torch.Tensor:
+    return S.exp_term(TorchF32, _f32(x))
+
+
+def swiglu_cpu(g: torch.Tensor, u: torch.Tensor, out_fmt: str = "bf16") -> torch.Tensor:
+    """``cvt(silu(g) * u)`` from fp32 accumulators, elementwise."""
+    return S.swiglu_elem(TorchF32, _f32(g), _f32(u), out_fmt)
+
+
+def glu_cpu(
+    g: torch.Tensor, u: torch.Tensor, act: str = "silu", out_fmt: str = "bf16"
+) -> torch.Tensor:
+    """``cvt(act(g) * u)`` from fp32 accumulators (``swiglu_cpu`` for ``act = "silu"``)."""
+    return S.glu_elem(TorchF32, _f32(g), _f32(u), act, out_fmt)
+
+
+def relu2_cpu(acc: torch.Tensor, out_fmt: str = "bf16") -> torch.Tensor:
+    """``cvt(relu(acc)^2)`` from one fp32 accumulator, elementwise (the ungated chain)."""
+    return S.act_elem(TorchF32, _f32(acc), "relu2", out_fmt)
+
+
+def route_cpu(
+    logits: torch.Tensor,
+    k: int,
+    method: S.RoutingMethod = S.SOFTMAX_RENORM,
+    bias: Optional[torch.Tensor] = None,
+    scale: Optional[float] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The routing spec for a whole batch: ``experts [T, k]`` int32, ``weights [T, k]`` f32."""
+    l = _f32(logits)
+    T, E = l.shape
+    cols = [l[:, e] for e in range(E)]
+    b = [_f32(bias)[e] for e in range(E)] if method.bias else None
+    q, w = S.per_expert_scores(TorchF32, cols, method, b)
+    q = torch.stack(q, dim=1)
+    w = torch.stack(w, dim=1)
+    # (score desc, index asc): a stable descending sort keeps equal scores in index order
+    order = torch.sort(q, dim=1, descending=True, stable=True).indices[:, :k]
+    wsel = torch.gather(w, 1, order)
+    ws = S.slot_weights(
+        TorchF32,
+        [wsel[:, r] for r in range(k)],
+        list(range(k)),
+        method,
+        TorchF32.const(scale) if method.scaled else None,
+    )
+    return order.to(torch.int32), torch.stack(ws, dim=1)
+
+
+def combine_cpu(
+    y: torch.Tensor, dest: torch.Tensor, weights: torch.Tensor, out_fmt: str = "bf16"
+) -> torch.Tensor:
+    """``out[t] = cvt( fold_r add(acc, mul(f32(y[dest[t, r]]), w[t, r])) )``."""
+    yc, d, w = y.detach().cpu(), dest.detach().cpu().long(), _f32(weights)
+    T, k = d.shape
+    leaves = [TorchF32.mul(yc[d[:, r]].float(), w[:, r : r + 1]) for r in range(k)]
+    acc = S.combine_reduction(k, lambda fp, r: leaves[r]).canonical(TorchF32)
+    return TorchF32.cvt_out(acc, out_fmt)
+
+
+# ----------------------------------------------------------------------------- exact (scalar) references
+
+
+def route_exact(
+    logits_row: Sequence[float],
+    k: int,
+    method: S.RoutingMethod,
+    bias: Optional[Sequence[float]] = None,
+    scale: Optional[float] = None,
+) -> Tuple[List[int], List[float]]:
+    l = [fp32.to_f32(v) for v in logits_row]
+    b = [fp32.to_f32(v) for v in bias] if bias is not None else None
+    return S.routing_weights(
+        ExactF32, l, k, method, b, fp32.to_f32(scale) if scale is not None else None
+    )
+
+
+def swiglu_exact(g: float, u: float, out_fmt: str = "bf16") -> float:
+    return S.swiglu_elem(ExactF32, fp32.to_f32(g), fp32.to_f32(u), out_fmt)
+
+
+def combine_exact(
+    ys: Sequence[float], ws: Sequence[float], out_fmt: str = "bf16"
+) -> float:
+    return S.combine_elem(
+        ExactF32,
+        [fp32.to_f32(v) for v in ys],
+        [fp32.to_f32(v) for v in ws],
+        out_fmt,
+    )
+
+
+def ulp_error(got: torch.Tensor, ref64: torch.Tensor) -> float:
+    """max |got - ref| in units of the binary32 ulp at ref (for accuracy yardsticks)."""
+    r = ref64.double()
+    ulp = torch.ldexp(
+        torch.ones_like(r), torch.floor(torch.log2(r.abs().clamp_min(1e-38))) - 23
+    )
+    return ((got.double() - r).abs() / ulp).max().item()

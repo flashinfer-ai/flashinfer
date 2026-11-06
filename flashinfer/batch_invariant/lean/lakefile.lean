@@ -15,3 +15,6 @@ lean_exe quantconformance where
 lean_exe axioms where
   root := `Axioms
   supportInterpreter := true
+
+lean_exe moeconformance where
+  root := `MoEMain
