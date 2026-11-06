@@ -777,8 +777,10 @@ class SplitKDenseGemmKernel:
         stages = self.num_ab_stage
         if cutlass.const_expr(not is_a and self.use_pdl):
             cute.arch.griddepcontrol_wait()
-            # Release dependents only after this wait: a pre-pushed consumer reads the epoch at launch.
-            cute.arch.griddepcontrol_launch_dependents()
+            if cutlass.const_expr(self.peer_store is not None):
+                # A pre-pushed consumer reads the epoch at launch: release it only after
+                # this wait, once every earlier push-plane kernel has finished.
+                cute.arch.griddepcontrol_launch_dependents()
 
         empty_phase = cutlass.Int32(1)
         for k_tile in cutlass.range(k_tile_count, unroll=1):
@@ -803,6 +805,8 @@ class SplitKDenseGemmKernel:
             if stage == stages - 1:
                 empty_phase = empty_phase ^ 1
 
+        if cutlass.const_expr(is_a and self.use_pdl and self.peer_store is None):
+            cute.arch.griddepcontrol_launch_dependents()
         if cutlass.const_expr(not is_a and self.has_bias):
             cute.arch.mbarrier_arrive(bar_tma_epilog)
         self._drain_producer(bar_empty, empty_phase, k_tile_count)
