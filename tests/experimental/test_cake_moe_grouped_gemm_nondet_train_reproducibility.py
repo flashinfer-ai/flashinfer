@@ -19,7 +19,7 @@ deterministic package.
 Over the 58 MoE projection rows of the benchmark and the edge cases of the
 deterministic package's determinism suite (seeded fixed inputs per case):
 
-* the facade (``deterministic=False``, the only mode it takes) gives the
+* the module ``flashinfer.cake_moe_grouped_gemm_nondet_train`` gives the
   deterministic package's bits for ``fwd`` and ``dgrad``;
 * ``fwd`` and ``dgrad`` of the non-deterministic package give the deterministic
   package's bits, the data gradient's own sm_100a L2 evict-first build included
@@ -304,19 +304,21 @@ def _prepare(backend, case, a, b, offs, out):
             a, b, offs, out=out, out_dtype=case.out_dtype
         )
     if case.op == "fwd":
-        return cb.prepare_grouped_gemm_fwd(a, b, offs, out=out, deterministic=False)
+        return cb.cake_moe_grouped_gemm_nondet_train_prepare_forward(
+            a, b, offs, out=out
+        )
     if case.op == "dgrad":
-        return cb.prepare_grouped_gemm_dgrad(a, b, offs, out=out, deterministic=False)
-    return cb.prepare_grouped_gemm_wgrad(
-        a, b, offs, out=out, out_dtype=case.out_dtype, deterministic=False
+        return cb.cake_moe_grouped_gemm_nondet_train_prepare_dgrad(a, b, offs, out=out)
+    return cb.cake_moe_grouped_gemm_nondet_train_prepare_wgrad(
+        a, b, offs, out=out, out_dtype=case.out_dtype
     )
 
 
 def _facade(case, a, b, offs, out):
     """The facade's call of a ``fwd`` / ``dgrad`` case (non-deterministic only)."""
     if case.op == "fwd":
-        return facade.grouped_gemm_fwd(a, b, offs, out=out, deterministic=False)
-    return facade.grouped_gemm_dgrad(a, b, offs, out=out, deterministic=False)
+        return facade.cake_moe_grouped_gemm_nondet_train_forward(a, b, offs, out=out)
+    return facade.cake_moe_grouped_gemm_nondet_train_dgrad(a, b, offs, out=out)
 
 
 def _bits(out):

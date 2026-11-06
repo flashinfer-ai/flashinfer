@@ -101,12 +101,12 @@ for name in pkg.__all__:  # the lazy re-exports load cake_backend and cake_autog
     getattr(pkg, name)
 cb = importlib.import_module(PKG_NAME + ".cake_backend")
 for name in (
-    "grouped_gemm_fwd",
-    "grouped_gemm_dgrad",
-    "grouped_gemm_wgrad",
-    "cake_grouped_mm",
+    "cake_moe_grouped_gemm_nondet_train_forward",
+    "cake_moe_grouped_gemm_nondet_train_dgrad",
+    "cake_moe_grouped_gemm_nondet_train_wgrad",
+    "cake_moe_grouped_gemm_nondet",
 ):
-    # plain functions: the experimental marking belongs to the core entry points
+    # plain functions: the experimental marking belongs to the module's entry points
     assert not hasattr(getattr(pkg, name), "is_experimental"), name
 
 
@@ -115,20 +115,15 @@ def f32(*shape):
 
 
 offs = torch.tensor([2, 4], dtype=torch.int32)
-# float32 operands fail the bfloat16 check of the package functions with
-# deterministic=False; without it, every function refuses the mode first.  Every
-# call raises ValueError before any device access.
-calls = []
-for mode in ({"deterministic": False}, {}):
-    calls += [
-        lambda kw=mode: pkg.grouped_gemm_fwd(f32(4, 64), f32(2, 256, 64), offs, **kw),
-        lambda kw=mode: pkg.grouped_gemm_dgrad(f32(4, 64), f32(2, 64, 256), offs, **kw),
-        lambda kw=mode: pkg.grouped_gemm_wgrad(f32(4, 256), f32(4, 64), offs, **kw),
-        lambda kw=mode: pkg.cake_grouped_mm(f32(4, 64), f32(2, 256, 64), offs, **kw),
-        lambda kw=mode: cb.prepare_grouped_gemm_wgrad(
-            f32(4, 256), f32(4, 64), offs, **kw
-        ),
-    ]
+# float32 operands fail the bfloat16 check of the package functions.  Every call
+# raises ValueError before any device access.
+calls = [
+    lambda: pkg.cake_moe_grouped_gemm_nondet_train_forward(f32(4, 64), f32(2, 256, 64), offs),
+    lambda: pkg.cake_moe_grouped_gemm_nondet_train_dgrad(f32(4, 64), f32(2, 64, 256), offs),
+    lambda: pkg.cake_moe_grouped_gemm_nondet_train_wgrad(f32(4, 256), f32(4, 64), offs),
+    lambda: pkg.cake_moe_grouped_gemm_nondet(f32(4, 64), f32(2, 256, 64), offs),
+    lambda: cb.cake_moe_grouped_gemm_nondet_train_prepare_wgrad(f32(4, 256), f32(4, 64), offs),
+]
 assert not hasattr(cb, "grouped_mm_bf16_cake")  # the stable API stays deterministic
 
 with warnings.catch_warnings(record=True) as rec:

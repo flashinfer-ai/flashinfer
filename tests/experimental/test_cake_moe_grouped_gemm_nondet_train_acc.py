@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Weight-gradient accumulation of the non-deterministic ragged BF16 MoE grouped GEMM
-package: ``prepare_grouped_gemm_wgrad`` / ``grouped_gemm_wgrad`` with
-``accumulate=True`` (``out[e] += G[e].T @ X[e]``) and ``cake_grouped_mm`` with
+package: ``cake_moe_grouped_gemm_nondet_train_prepare_wgrad`` / ``cake_moe_grouped_gemm_nondet_train_wgrad`` with
+``accumulate=True`` (``out[e] += G[e].T @ X[e]``) and ``cake_moe_grouped_gemm_nondet`` with
 ``fuse_wgrad_accumulation=True`` (``w.main_grad += dW`` in the backward).
 
 On the CPU (no program is loaded): the registry's accumulate stages (``<stage>_acc``)
@@ -689,22 +689,20 @@ def test_accumulate_refuses_unsafe_outputs_on_both_routes(route, monkeypatch):
             override.get("offs", offs0),
         )
         for call in (
-            lambda: cb.prepare_grouped_gemm_wgrad(
+            lambda: cb.cake_moe_grouped_gemm_nondet_train_prepare_wgrad(
                 g,
                 x,
                 offs,
                 out=out,
                 out_dtype=out_dtype,
-                deterministic=False,
                 accumulate=True,
             ),
-            lambda: pkg.grouped_gemm_wgrad(
+            lambda: pkg.cake_moe_grouped_gemm_nondet_train_wgrad(
                 g,
                 x,
                 offs,
                 out=out,
                 out_dtype=out_dtype,
-                deterministic=False,
                 accumulate=True,
             ),
         ):
@@ -714,8 +712,8 @@ def test_accumulate_refuses_unsafe_outputs_on_both_routes(route, monkeypatch):
     _, _, _, out = _cpu_operands(sizes, n, k, torch.float32)
     for value in (1, 0, None, "True"):
         with pytest.raises(ValueError, match="accumulate must be a bool"):
-            cb.prepare_grouped_gemm_wgrad(
-                g0, x0, offs0, out=out, deterministic=False, accumulate=value
+            cb.cake_moe_grouped_gemm_nondet_train_prepare_wgrad(
+                g0, x0, offs0, out=out, accumulate=value
             )
 
 
@@ -756,13 +754,13 @@ def test_order_varying_follows_the_plan(arch, sm_count, monkeypatch):
 
 
 def _recorded_acc_launch(monkeypatch, plan):
-    """A composed accumulate ``GroupedGemmLaunch`` whose program is a recorder and whose
+    """A composed accumulate ``CakeMoEGroupedGemmNondetLaunch`` whose program is a recorder and whose
     scratch holds ones: each launch adds one into ``out``; returns ``(launch, log)``."""
     monkeypatch.setattr(
         cb, "tvm_ffi", types.SimpleNamespace(use_torch_stream=contextlib.nullcontext)
     )
     log = []
-    launch = cb.GroupedGemmLaunch(
+    launch = cb.CakeMoEGroupedGemmNondetLaunch(
         op="wgrad",
         record_name="cake_moe_grouped_gemm_wgrad_f32_k512",
         stages=("main_halves",),
@@ -783,16 +781,16 @@ def test_accumulate_alerts_only_before_an_order_varying_launch(monkeypatch):
     g, x, offs, _ = _cpu_operands([2, 2], 256, 64, torch.float32)
     with base._torch_deterministic():
         with pytest.raises(ValueError, match="pass the"):
-            cb.prepare_grouped_gemm_wgrad(
-                g, x, offs, deterministic=False, accumulate=True
+            cb.cake_moe_grouped_gemm_nondet_train_prepare_wgrad(
+                g, x, offs, accumulate=True
             )
         with pytest.raises(ValueError, match="pass the"):
-            pkg.grouped_gemm_wgrad(g, x, offs, deterministic=False, accumulate=True)
+            pkg.cake_moe_grouped_gemm_nondet_train_wgrad(g, x, offs, accumulate=True)
     split, log = _recorded_acc_launch(
         monkeypatch, {"unordered_tail": True, "tail_splits": 2}
     )
     assert split.order_varying
-    strict = pytest.raises(RuntimeError, match="GroupedGemmLaunch.launch")
+    strict = pytest.raises(RuntimeError, match="CakeMoEGroupedGemmNondetLaunch.launch")
     with base._torch_deterministic(), strict:
         split.launch()
     assert log == [] and torch.equal(split.out, torch.zeros(4))
@@ -808,7 +806,9 @@ def test_accumulate_alerts_only_before_an_order_varying_launch(monkeypatch):
     finally:
         torch.use_deterministic_algorithms(saved[0], warn_only=saved[1])
     alerts = [w for w in rec if w.category is UserWarning]
-    assert len(alerts) == 1 and "GroupedGemmLaunch.launch" in str(alerts[0].message)
+    assert len(alerts) == 1 and "CakeMoEGroupedGemmNondetLaunch.launch" in str(
+        alerts[0].message
+    )
     assert log == ["launch"] and torch.equal(split.out, torch.ones(4))
     unsplit, log = _recorded_acc_launch(
         monkeypatch, {"unordered_tail": True, "tail_splits": 1}
@@ -825,25 +825,32 @@ def test_accumulate_keywords_and_signatures():
     """The new switches are keyword-only and off by default, in the package and in the
     facade, whose signatures stay the package's."""
     for fn, keyword in (
-        (cb.prepare_grouped_gemm_wgrad, "accumulate"),
-        (pkg.grouped_gemm_wgrad, "accumulate"),
+        (cb.cake_moe_grouped_gemm_nondet_train_prepare_wgrad, "accumulate"),
+        (pkg.cake_moe_grouped_gemm_nondet_train_wgrad, "accumulate"),
         (cb._prepare_wgrad, "accumulate"),
         (cb.generated_program_available, "accumulate"),
-        (pkg.cake_grouped_mm, "fuse_wgrad_accumulation"),
+        (pkg.cake_moe_grouped_gemm_nondet, "fuse_wgrad_accumulation"),
     ):
         parameter = inspect.signature(fn).parameters[keyword]
         assert parameter.kind is inspect.Parameter.KEYWORD_ONLY, fn
         assert parameter.default is False, fn
-    forward = inspect.signature(cake_autograd.CakeGroupedMm.forward).parameters
+    forward = inspect.signature(
+        cake_autograd.CakeMoEGroupedGemmNondetFunction.forward
+    ).parameters
     assert forward["fuse_wgrad_accumulation"].default is False
-    mode = inspect.signature(pkg.cake_grouped_mm).parameters["deterministic"]
-    assert mode.kind is inspect.Parameter.KEYWORD_ONLY and mode.default is True
+    assert (
+        "deterministic"
+        not in inspect.signature(pkg.cake_moe_grouped_gemm_nondet).parameters
+    )
     facade = pytest.importorskip("flashinfer.cake_moe_grouped_gemm_nondet_train")
-    for name in ("grouped_gemm_wgrad", "cake_grouped_mm"):
+    for name in (
+        "cake_moe_grouped_gemm_nondet_train_wgrad",
+        "cake_moe_grouped_gemm_nondet",
+    ):
         impl = (
-            pkg.grouped_gemm_wgrad
-            if name == "grouped_gemm_wgrad"
-            else pkg.cake_grouped_mm
+            pkg.cake_moe_grouped_gemm_nondet_train_wgrad
+            if name == "cake_moe_grouped_gemm_nondet_train_wgrad"
+            else pkg.cake_moe_grouped_gemm_nondet
         )
         assert inspect.signature(getattr(facade, name)) == inspect.signature(impl), name
 
@@ -939,8 +946,8 @@ def test_fuse_flag_refusals_on_the_host():
     offs = torch.tensor([2, 4], dtype=torch.int32)
 
     def call(w, flag=True):
-        return pkg.cake_grouped_mm(
-            x, w, offs, deterministic=False, fuse_wgrad_accumulation=flag
+        return pkg.cake_moe_grouped_gemm_nondet(
+            x, w, offs, fuse_wgrad_accumulation=flag
         )
 
     w = torch.zeros(e, n, k, dtype=torch.bfloat16, requires_grad=True)
@@ -948,7 +955,9 @@ def test_fuse_flag_refusals_on_the_host():
         with pytest.raises(ValueError, match="fuse_wgrad_accumulation must be a bool"):
             call(w, value)
         with pytest.raises(ValueError, match="fuse_wgrad_accumulation must be a bool"):
-            cake_autograd.CakeGroupedMm.apply(x, w, offs, False, None, value)
+            cake_autograd.CakeMoEGroupedGemmNondetFunction.apply(
+                x, w, offs, None, value
+            )
     with pytest.raises(ValueError, match="no main_grad"):
         call(w)
     for bad in (
@@ -984,11 +993,10 @@ def test_fuse_flag_is_refused_under_trace_and_compile(mode, monkeypatch):
     w = torch.zeros(2, 256, 64, dtype=torch.bfloat16, requires_grad=True)
     w.main_grad = torch.zeros(2, 256, 64)
     with pytest.raises(NotImplementedError, match="fuse_wgrad_accumulation"):
-        pkg.cake_grouped_mm(
+        pkg.cake_moe_grouped_gemm_nondet(
             torch.zeros(4, 64, dtype=torch.bfloat16),
             w,
             torch.tensor([2, 4], dtype=torch.int32),
-            deterministic=False,
             fuse_wgrad_accumulation=True,
         )
 
@@ -1022,15 +1030,15 @@ def _facade_recorders(monkeypatch):
         log.append(("new_mm", kwargs))
         return "new"
 
-    monkeypatch.setattr(pkg, "grouped_gemm_wgrad", new_wgrad)
-    monkeypatch.setattr(cake_autograd, "cake_grouped_mm", new_mm)
+    monkeypatch.setattr(pkg, "cake_moe_grouped_gemm_nondet_train_wgrad", new_wgrad)
+    monkeypatch.setattr(cake_autograd, "cake_moe_grouped_gemm_nondet", new_mm)
     return log
 
 
 def test_facade_accumulate_rows(monkeypatch):
-    """The facade hands ``accumulate`` and ``fuse_wgrad_accumulation`` to the package with
-    ``deterministic=False``, also under torch's deterministic mode: no reroute to the
-    deterministic package, no warning, no ``NotImplementedError``."""
+    """The facade hands ``accumulate`` and ``fuse_wgrad_accumulation`` to the package,
+    also under torch's deterministic mode: no reroute to the deterministic package, no
+    warning, no ``NotImplementedError``."""
     facade = pytest.importorskip("flashinfer.cake_moe_grouped_gemm_nondet_train")
     log = _facade_recorders(monkeypatch)
     sizes, n, k = [2, 2], 256, 64
@@ -1040,8 +1048,8 @@ def test_facade_accumulate_rows(monkeypatch):
         with mode, warnings.catch_warnings(record=True) as rec:
             warnings.simplefilter("always")
             assert (
-                facade.grouped_gemm_wgrad(
-                    g, x, offs, out=out, deterministic=False, accumulate=True
+                facade.cake_moe_grouped_gemm_nondet_train_wgrad(
+                    g, x, offs, out=out, accumulate=True
                 )
                 == "new"
             )
@@ -1051,63 +1059,47 @@ def test_facade_accumulate_rows(monkeypatch):
                     out=out,
                     out_dtype=None,
                     num_groups=None,
-                    deterministic=False,
                     accumulate=True,
                 ),
             )
             assert (
-                facade.cake_grouped_mm(
-                    x, weight, offs, deterministic=False, fuse_wgrad_accumulation=True
+                facade.cake_moe_grouped_gemm_nondet(
+                    x, weight, offs, fuse_wgrad_accumulation=True
                 )
                 == "new"
             )
             assert log.pop() == (
                 "new_mm",
-                dict(deterministic=False, fuse_wgrad_accumulation=True),
+                dict(fuse_wgrad_accumulation=True),
             )
             assert log == []
         assert [r for r in rec if r.category is UserWarning] == []
 
 
-def test_facade_accumulate_rows_refuse_the_default_mode(monkeypatch):
-    """Without ``deterministic=False`` (omitted or ``True``) the facade's accumulate rows
-    raise ``ValueError`` naming the deterministic entry and saying to pass
-    ``deterministic=False``, before the checks of ``out`` and before anything runs; the
-    deterministic package is never called and ``out`` is untouched."""
+@pytest.mark.parametrize("value", [True, False])
+def test_facade_accumulate_rows_take_no_mode_keyword(value, monkeypatch):
+    """The facade's accumulate rows take no ``deterministic`` keyword: either value
+    raises Python's ``TypeError`` before the checks of ``out`` and before anything
+    runs, also under torch's deterministic mode; the deterministic package is never
+    called and ``out`` is untouched."""
     facade = pytest.importorskip("flashinfer.cake_moe_grouped_gemm_nondet_train")
     _det_tripwires(monkeypatch)
     g, x, offs, out = _cpu_operands([2, 2], 256, 64, torch.float32)
     weight = torch.zeros(2, 256, 64, dtype=torch.bfloat16)
     calls = (
-        (
-            lambda: facade.grouped_gemm_wgrad(g, x, offs, out=out, accumulate=True),
-            "cake_moe_grouped_gemm_det_train_wgrad",
+        lambda: facade.cake_moe_grouped_gemm_nondet_train_wgrad(
+            g, x, offs, out=out, accumulate=True, deterministic=value
         ),
-        (
-            lambda: facade.grouped_gemm_wgrad(g, x, offs, accumulate=True),
-            "cake_moe_grouped_gemm_det_train_wgrad",
-        ),
-        (
-            lambda: facade.cake_grouped_mm(
-                x, weight, offs, fuse_wgrad_accumulation=True
-            ),
-            "cake_moe_grouped_gemm_det",
-        ),
-        (
-            lambda: facade.cake_grouped_mm(
-                x, weight, offs, deterministic=True, fuse_wgrad_accumulation=True
-            ),
-            "cake_moe_grouped_gemm_det",
+        lambda: facade.cake_moe_grouped_gemm_nondet(
+            x, weight, offs, deterministic=value, fuse_wgrad_accumulation=True
         ),
     )
     for mode in (contextlib.nullcontext(), base._torch_deterministic()):
-        with mode:
-            for call, det in calls:
-                with pytest.raises(ValueError, match=det) as info:
+        with mode, warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # the facade's ExperimentalWarning
+            for call in calls:
+                with pytest.raises(TypeError, match="deterministic"):
                     call()
-                assert "pass deterministic=False for the non-deterministic path" in (
-                    str(info.value)
-                )
     assert torch.equal(out, torch.zeros_like(out))
 
 
@@ -1956,13 +1948,17 @@ def _composed_main_grad(mg0, grads, x, offs):
     contract: the overwrite in that dtype, then ``add_``)."""
     mg = mg0.clone()
     for g in grads:
-        mg.add_(base.grouped_gemm_wgrad(g, x, offs, out_dtype=mg0.dtype))
+        mg.add_(
+            base.cake_moe_grouped_gemm_nondet_train_wgrad(
+                g, x, offs, out_dtype=mg0.dtype
+            )
+        )
     return mg
 
 
 def _fused_gemm(offs):
-    return lambda a, b: pkg.cake_grouped_mm(
-        a, b, offs, deterministic=False, fuse_wgrad_accumulation=True
+    return lambda a, b: pkg.cake_moe_grouped_gemm_nondet(
+        a, b, offs, fuse_wgrad_accumulation=True
     )
 
 
@@ -2025,7 +2021,7 @@ def test_autograd_accumulates_into_main_grad(out_dtype, ckpt, early_stop, monkey
     )
     _assert_within_budget(w.main_grad, expected)
     _, default_dxs = _run_micro_steps(
-        lambda a, b: pkg.cake_grouped_mm(a, b, offs, deterministic=False),
+        lambda a, b: pkg.cake_moe_grouped_gemm_nondet(a, b, offs),
         x0,
         w0,
         mg0,
@@ -2056,7 +2052,7 @@ def test_autograd_returns_megatron_placeholder(zero_out, monkeypatch):
 
 
 def test_graph_captures_the_fused_backward(monkeypatch):
-    """The forward and the fused backward of ``cake_grouped_mm(..., deterministic=False,
+    """The forward and the fused backward of ``cake_moe_grouped_gemm_nondet(...,
     fuse_wgrad_accumulation=True)`` capture into one CUDA graph (the backward binds the
     context without querying the captured stream): on an unsplit shape (one writer per
     element) ``r`` replays from ``mg0`` give bitwise ``mg0`` plus ``r`` composed adds of
@@ -2102,7 +2098,9 @@ def test_autograd_flag_errors_and_side_effects(monkeypatch):
     device, sizes, x0, w0, g1, _g2, offs = _autograd_case(torch.float32, monkeypatch)
     gemm = _fused_gemm(offs)
     mg0 = torch.zeros(w0.shape, device=device)
-    dw1 = base.grouped_gemm_wgrad(g1, x0, offs, out_dtype=torch.float32)
+    dw1 = base.cake_moe_grouped_gemm_nondet_train_wgrad(
+        g1, x0, offs, out_dtype=torch.float32
+    )
 
     def leaves(main_grad=True, requires_grad=True):
         x = x0.clone().requires_grad_(True)
@@ -2181,7 +2179,7 @@ def test_autograd_fuse_alerts_before_an_order_varying_accumulate(form, monkeypat
     y = gemm(x, w)
     with (
         base._torch_deterministic(),
-        pytest.raises(RuntimeError, match="CakeGroupedMm.backward"),
+        pytest.raises(RuntimeError, match="CakeMoEGroupedGemmNondetFunction.backward"),
     ):
         y.backward(g)
     torch.cuda.synchronize()
@@ -2200,7 +2198,9 @@ def test_autograd_fuse_alerts_before_an_order_varying_accumulate(form, monkeypat
     finally:
         torch.use_deterministic_algorithms(saved[0], warn_only=saved[1])
     torch.cuda.synchronize()
-    assert any("CakeGroupedMm.backward" in str(r.message) for r in rec)
+    assert any(
+        "CakeMoEGroupedGemmNondetFunction.backward" in str(r.message) for r in rec
+    )
     assert w.grad_added_to_main_grad is True
     dw = base._reference("wgrad", g, x0, sizes).double()
     expected = (

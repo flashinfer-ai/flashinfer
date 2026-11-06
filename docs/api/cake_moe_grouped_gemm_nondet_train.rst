@@ -20,8 +20,8 @@ Mode and dispatch rules
 The facade functions and the package are non-deterministic only; every ND example passes
 ``deterministic=False``.
 
-- ``deterministic`` is keyword-only on every entry (``cake_grouped_mm`` included; the
-  autograd function ``CakeGroupedMm.apply`` takes it fourth, ``True`` when omitted, and
+- ``deterministic`` is keyword-only on every entry (``cake_moe_grouped_gemm_nondet`` included; the
+  autograd function ``CakeMoEGroupedGemmNondetFunction.apply`` takes it fourth, ``True`` when omitted, and
   refuses anything but ``None`` in its fifth, internal slot with ``TypeError``) and must
   be the bool ``False``: the call runs the non-deterministic package.
 - Every other value -- the default ``True``, ``None``, ``0``, ``1``, ``"False"`` --
@@ -32,20 +32,20 @@ The facade functions and the package are non-deterministic only; every ND exampl
 - Under ``torch.use_deterministic_algorithms(True)`` PyTorch's non-determinism alert is
   raised immediately before an order-varying launch only: the weight gradient whose
   512-wide k tile splits its tail (``plan["unordered_tail"]`` and
-  ``plan["tail_splits"] > 1``; ``GroupedGemmLaunch.order_varying``), in overwrite or
-  accumulate mode -- ``grouped_gemm_wgrad``, a prepared launch's ``launch()`` (also
+  ``plan["tail_splits"] > 1``; ``CakeMoEGroupedGemmNondetLaunch.order_varying``), in overwrite or
+  accumulate mode -- ``cake_moe_grouped_gemm_nondet_train_wgrad``, a prepared launch's ``launch()`` (also
   when the mode was switched on after the preparation; under CUDA graph capture, when
-  the launch is captured) and the backward of ``CakeGroupedMm`` when it computes
+  the launch is captured) and the backward of ``CakeMoEGroupedGemmNondetFunction`` when it computes
   ``dW``.  The alert names the deterministic entry; it is a ``RuntimeError`` (nothing
   launches), or with ``warn_only=True`` a ``UserWarning``, after which the launch runs
-  (it names the caller's line for a direct call of ``grouped_gemm_wgrad`` or
+  (it names the caller's line for a direct call of ``cake_moe_grouped_gemm_nondet_train_wgrad`` or
   ``launch()``, a frame of PyTorch's autograd for the backward).  The preparation, the
   forward, the data gradient, the 256-wide k tile's weight
   gradient (ordered tail reduce) and an unsplit tail have a fixed order and never alert.
 - No tape, saved tensor or workspace crosses between the two packages: each autograd
   function's backward reads only its own saved tensors.
 
-The mode of ``cake_grouped_mm`` is fixed at its forward call; a non-reentrant
+The mode of ``cake_moe_grouped_gemm_nondet`` is fixed at its forward call; a non-reentrant
 activation-checkpoint replay re-runs the same forward, bitwise.
 
 Numerical contract of ``deterministic=False``
@@ -78,9 +78,9 @@ caller.
 Weight-gradient accumulation
 ----------------------------
 
-``grouped_gemm_wgrad(..., out=out, accumulate=True)`` adds the weight gradient into the
+``cake_moe_grouped_gemm_nondet_train_wgrad(..., out=out, accumulate=True)`` adds the weight gradient into the
 caller's bf16 or fp32 ``out`` (``out[e] += G[e].T @ X[e]``, Megatron's gradient-accumulation
-fusion) and ``cake_grouped_mm(..., fuse_wgrad_accumulation=True)`` adds it into
+fusion) and ``cake_moe_grouped_gemm_nondet(..., fuse_wgrad_accumulation=True)`` adds it into
 ``w.main_grad`` in its backward.  Both default to off; with the defaults nothing changes.
 The fused accumulate builds of this release add into an fp32 ``out`` only; a bf16 ``out``
 always takes the composed route (the bf16 overwrite, then the same-dtype ``out.add_``:
@@ -129,31 +129,31 @@ Functions
 The experimental functions are documented by their docstrings (they are not listed for
 autodoc before graduation):
 
-- ``grouped_gemm_fwd(x, w, offs, out=None, *, deterministic=True)``: ``Y = X @ W[e].T``
+- ``cake_moe_grouped_gemm_nondet_train_forward(x, w, offs, out=None, *, deterministic=True)``: ``Y = X @ W[e].T``
   per group, bf16 ``[sum_m, N]``;
-- ``grouped_gemm_dgrad(g, w, offs, out=None, *, deterministic=True)``: ``dX = G @ W[e]``
+- ``cake_moe_grouped_gemm_nondet_train_dgrad(g, w, offs, out=None, *, deterministic=True)``: ``dX = G @ W[e]``
   per group (``W`` read in place), bf16 ``[sum_m, K]``;
-- ``grouped_gemm_wgrad(g, x, offs, out=None, out_dtype=None, num_groups=None, *,
+- ``cake_moe_grouped_gemm_nondet_train_wgrad(g, x, offs, out=None, out_dtype=None, num_groups=None, *,
   deterministic=True, accumulate=False)``: ``dW[e] = G[e].T @ X[e]``, bf16 or fp32
   ``[E, N, K]`` (with ``accumulate=True``, ``out[e] += dW[e]``);
-- ``cake_grouped_mm(x, w, offs, *, deterministic=True, fuse_wgrad_accumulation=False)``: the
+- ``cake_moe_grouped_gemm_nondet(x, w, offs, *, deterministic=True, fuse_wgrad_accumulation=False)``: the
   autograd wrapper (``Y``, with ``dX`` and ``dW`` in the backward, ``dW`` in the dtype of
   ``w``, or added into ``w.main_grad``).
 
 Each takes ``deterministic=False`` only (the default ``True`` raises ``ValueError``,
 above)::
 
-    from flashinfer.cake_moe_grouped_gemm_nondet_train import cake_grouped_mm, grouped_gemm_wgrad
+    from flashinfer.cake_moe_grouped_gemm_nondet_train import cake_moe_grouped_gemm_nondet, cake_moe_grouped_gemm_nondet_train_wgrad
 
-    y = cake_grouped_mm(x, w, offs, deterministic=False)
-    dw = grouped_gemm_wgrad(g, x, offs, out_dtype=torch.float32, deterministic=False)
+    y = cake_moe_grouped_gemm_nondet(x, w, offs, deterministic=False)
+    dw = cake_moe_grouped_gemm_nondet_train_wgrad(g, x, offs, out_dtype=torch.float32, deterministic=False)
 
 The shapes, the group offsets (``offs[E]`` end offsets or ``m_indptr[E + 1]``) and the
 alignment rules are those of :ref:`apicake_moe_grouped_gemm_det_train`.  The prepare-once /
 launch-many surface is in the packages:
-``flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train.prepare_grouped_gemm_fwd``,
-``prepare_grouped_gemm_dgrad`` and ``prepare_grouped_gemm_wgrad`` (with
-``deterministic=False``) return a ``GroupedGemmLaunch`` whose ``plan`` records, for the
+``flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train.cake_moe_grouped_gemm_nondet_train_prepare_forward``,
+``cake_moe_grouped_gemm_nondet_train_prepare_dgrad`` and ``cake_moe_grouped_gemm_nondet_train_prepare_wgrad`` (with
+``deterministic=False``) return a ``CakeMoEGroupedGemmNondetLaunch`` whose ``plan`` records, for the
 weight gradient, ``unordered_tail``, ``tail_splits`` and the sizes of the tail sums and
 tickets.  The stable ``flashinfer.grouped_mm.grouped_mm_bf16(..., backend="cake")`` stays
 on the deterministic package.
@@ -166,18 +166,18 @@ The deterministic names carry ``det``; the non-deterministic names omit it:
 ======================================================== ==============================================================
 deterministic (no ``deterministic`` argument)            non-deterministic (``deterministic=False`` only)
 ======================================================== ==============================================================
-``flashinfer.cake_moe_grouped_gemm_det_train.cake_moe_grouped_gemm_det_train_forward``           ``flashinfer.cake_moe_grouped_gemm_nondet_train.grouped_gemm_fwd``
-``flashinfer.cake_moe_grouped_gemm_det_train.cake_moe_grouped_gemm_det_train_dgrad``         ``flashinfer.cake_moe_grouped_gemm_nondet_train.grouped_gemm_dgrad``
-``flashinfer.cake_moe_grouped_gemm_det_train.cake_moe_grouped_gemm_det_train_wgrad``         ``flashinfer.cake_moe_grouped_gemm_nondet_train.grouped_gemm_wgrad``
-``flashinfer.cake_moe_grouped_gemm_det_train.cake_moe_grouped_gemm_det``            ``flashinfer.cake_moe_grouped_gemm_nondet_train.cake_grouped_mm``
+``flashinfer.cake_moe_grouped_gemm_det_train.cake_moe_grouped_gemm_det_train_forward``           ``flashinfer.cake_moe_grouped_gemm_nondet_train.cake_moe_grouped_gemm_nondet_train_forward``
+``flashinfer.cake_moe_grouped_gemm_det_train.cake_moe_grouped_gemm_det_train_dgrad``         ``flashinfer.cake_moe_grouped_gemm_nondet_train.cake_moe_grouped_gemm_nondet_train_dgrad``
+``flashinfer.cake_moe_grouped_gemm_det_train.cake_moe_grouped_gemm_det_train_wgrad``         ``flashinfer.cake_moe_grouped_gemm_nondet_train.cake_moe_grouped_gemm_nondet_train_wgrad``
+``flashinfer.cake_moe_grouped_gemm_det_train.cake_moe_grouped_gemm_det``            ``flashinfer.cake_moe_grouped_gemm_nondet_train.cake_moe_grouped_gemm_nondet``
 ``cake_moe_grouped_det_gemm.prepare_grouped_det_gemm_*`` ``cake.cake_moe_grouped_gemm.prepare_grouped_gemm_*``
-``cake_moe_grouped_det_gemm.CakeMoEGroupedGemmDetLaunch``       ``cake.cake_moe_grouped_gemm.GroupedGemmLaunch``
-``cake_moe_grouped_det_gemm.CakeMoEGroupedGemmDetFunction``           ``cake.cake_moe_grouped_gemm.CakeGroupedMm``
+``cake_moe_grouped_det_gemm.CakeMoEGroupedGemmDetLaunch``       ``cake.cake_moe_grouped_gemm.CakeMoEGroupedGemmNondetLaunch``
+``cake_moe_grouped_det_gemm.CakeMoEGroupedGemmDetFunction``           ``cake.cake_moe_grouped_gemm.CakeMoEGroupedGemmNondetFunction``
 ======================================================== ==============================================================
 
 The former det-free aliases of the deterministic objects (the package path
 ``flashinfer.experimental.cake_moe_grouped_gemm``, the module ``flashinfer.grouped_mm.cake``
-and ``flashinfer.grouped_mm.grouped_gemm_*`` / ``cake_grouped_mm``) were removed with no
+and ``flashinfer.grouped_mm.grouped_gemm_*`` / ``cake_moe_grouped_gemm_nondet``) were removed with no
 alias; the det-free spellings name only the non-deterministic objects above.
 
 Features by architecture

@@ -33,12 +33,12 @@ rows keep their earlier count, which includes the recomputed forward.
 
 Arms: ``cake_det`` (the deterministic package,
 ``flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train``), ``cake``
-(``flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train`` with
-``deterministic=False``), ``torch._grouped_mm``, a per-group cuBLAS loop with
-host-known bounds and ``flashinfer.grouped_mm.grouped_mm_bf16`` (cuDNN; fwd /
-dgrad only); opt-in ``cake_inforward``, ``cake`` through a direct
-``CakeGroupedMm.apply(x, w, offs, False)``, whose forward GEMM launches inside
-``forward`` so that a checkpoint always recomputes it (autograd rows only; when
+(``flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train``),
+``torch._grouped_mm``, a per-group cuBLAS loop with host-known bounds and
+``flashinfer.grouped_mm.grouped_mm_bf16`` (cuDNN; fwd / dgrad only); opt-in
+``cake_inforward``, ``cake`` through a direct
+``CakeMoEGroupedGemmNondetFunction.apply(x, w, offs)``, whose forward GEMM launches
+inside ``forward`` so that a checkpoint always recomputes it (autograd rows only; when
 it runs with ``cake``, the JSON records the elements in which their outputs and
 gradients differ -- none in the output and ``x.grad``).  ``--census`` adds the
 CUDA kernel count of one call per arm (``torch.profiler``).  Each row reports
@@ -389,7 +389,7 @@ def _step(autograd_fn, t, early_stop=False):
     ``2 x forward + backward``.  On (the torch default, the ``step_es`` rows): the
     recompute stops once the region saved its last tensor, so an arm whose inputs are
     saved before its GEMM launches (``torch._grouped_mm``, ``cake_moe_grouped_gemm_det``,
-    ``cake_grouped_mm``) does one GEMM less, and one that launches inside
+    ``cake_moe_grouped_gemm_nondet``) does one GEMM less, and one that launches inside
     ``Function.forward`` (``cake_inforward``) still recomputes it."""
     return _checkpointed(autograd_fn, t, ("x", "w"), early_stop)
 
@@ -431,7 +431,7 @@ def _cake_arm(backend, row, t):
             )
         else:
             fn = _autograd(
-                lambda x, w, offs: pkg.cake_grouped_mm(x, w, offs, deterministic=False),
+                lambda x, w, offs: pkg.cake_moe_grouped_gemm_nondet(x, w, offs),
                 row,
                 t,
             )
@@ -448,11 +448,11 @@ def _cake_arm(backend, row, t):
         launch = prepare(*args, t["offs"], out=t["out"])
     else:
         prepare = {
-            "fwd": cb.prepare_grouped_gemm_fwd,
-            "dgrad": cb.prepare_grouped_gemm_dgrad,
-            "wgrad": cb.prepare_grouped_gemm_wgrad,
+            "fwd": cb.cake_moe_grouped_gemm_nondet_train_prepare_forward,
+            "dgrad": cb.cake_moe_grouped_gemm_nondet_train_prepare_dgrad,
+            "wgrad": cb.cake_moe_grouped_gemm_nondet_train_prepare_wgrad,
         }[op]
-        launch = prepare(*args, t["offs"], out=t["out"], deterministic=False)
+        launch = prepare(*args, t["offs"], out=t["out"])
     return launch.launch, launch, _plan_note(launch)
 
 
@@ -465,7 +465,7 @@ def cake_arm(row, t):
 
 
 def cake_inforward_arm(row, t):
-    """``cake`` through a direct ``CakeGroupedMm.apply``: the forward GEMM launches
+    """``cake`` through a direct ``CakeMoEGroupedGemmNondetFunction.apply``: the forward GEMM launches
     inside ``forward``, before autograd saves the inputs, as before the wrapper
     deferred it (the internal control of the autograd rows)."""
     op = row["op"]
@@ -473,9 +473,15 @@ def cake_inforward_arm(row, t):
         raise NotImplementedError("the in-forward control has autograd rows only")
     _no_acc_rows(op)
     fn = _autograd(
-        lambda x, w, offs: pkg.CakeGroupedMm.apply(x, w, offs, False), row, t
+        lambda x, w, offs: pkg.CakeMoEGroupedGemmNondetFunction.apply(x, w, offs),
+        row,
+        t,
     )
-    return fn, None, f"{AUTOGRAD_NOTES[op]} (direct CakeGroupedMm.apply)"
+    return (
+        fn,
+        None,
+        f"{AUTOGRAD_NOTES[op]} (direct CakeMoEGroupedGemmNondetFunction.apply)",
+    )
 
 
 def torch_grouped_mm_arm(row, t):
@@ -589,7 +595,7 @@ class _MainGradMm(torch.autograd.Function):
         if mode == "det_acc":
             y = det_pkg.cake_moe_grouped_gemm_det_train_forward(x, w, offs)
         else:
-            y = pkg.grouped_gemm_fwd(x, w, offs, deterministic=False)
+            y = pkg.cake_moe_grouped_gemm_nondet_train_forward(x, w, offs)
         ctx.save_for_backward(x, w, offs)
         ctx.w, ctx.mode = w, mode
         return y
@@ -606,7 +612,7 @@ class _MainGradMm(torch.autograd.Function):
             if det:
                 dx = det_pkg.cake_moe_grouped_gemm_det_train_dgrad(g, w, offs)
             else:
-                dx = pkg.grouped_gemm_dgrad(g, w, offs, deterministic=False)
+                dx = pkg.cake_moe_grouped_gemm_nondet_train_dgrad(g, w, offs)
         main_grad = ctx.w.main_grad
         if det:
             main_grad.add_(
@@ -616,12 +622,12 @@ class _MainGradMm(torch.autograd.Function):
             )
         elif ctx.mode == "mgF":
             main_grad.add_(
-                pkg.grouped_gemm_wgrad(
-                    g, x, offs, out_dtype=torch.float32, deterministic=False
+                pkg.cake_moe_grouped_gemm_nondet_train_wgrad(
+                    g, x, offs, out_dtype=torch.float32
                 )
             )
         else:
-            pkg.grouped_gemm_wgrad(g, x, offs, out=main_grad, deterministic=False)
+            pkg.cake_moe_grouped_gemm_nondet_train_wgrad(g, x, offs, out=main_grad)
         return dx, None, None, None
 
 
@@ -678,7 +684,7 @@ def _acc_autograd(arm, t, op):
     if arm in ("ovw", "acc", "mgB"):
 
         def mm(a, b, o):
-            return pkg.cake_grouped_mm(a, b, o, deterministic=False)
+            return pkg.cake_moe_grouped_gemm_nondet(a, b, o)
 
     elif arm == "det_mgB":
 
@@ -698,8 +704,8 @@ def _acc_autograd(arm, t, op):
     else:
 
         def mm(a, b, o):
-            return pkg.cake_grouped_mm(
-                a, b, o, deterministic=False, fuse_wgrad_accumulation=True
+            return pkg.cake_moe_grouped_gemm_nondet(
+                a, b, o, fuse_wgrad_accumulation=True
             )
 
     y_once = mm(x, w, offs) if op == "bwd_acc" else None
@@ -733,8 +739,8 @@ def _acc_wgrad(arm, t):
     mg32, mg16 = t["main_grad32"], t["main_grad16"]
 
     def prepare(out, accumulate=False):
-        return cb.prepare_grouped_gemm_wgrad(
-            g, x, offs, out=out, deterministic=False, accumulate=accumulate
+        return cb.cake_moe_grouped_gemm_nondet_train_prepare_wgrad(
+            g, x, offs, out=out, accumulate=accumulate
         )
 
     if arm in ("mgXn", "mgX_zero"):

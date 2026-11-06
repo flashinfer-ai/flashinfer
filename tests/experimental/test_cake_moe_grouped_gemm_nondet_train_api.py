@@ -15,23 +15,21 @@ limitations under the License.
 
 flashinfer public-API tests of the non-deterministic Cake MoE grouped GEMM.
 
-The facade ``flashinfer.cake_moe_grouped_gemm_nondet_train`` (``grouped_gemm_fwd``,
-``grouped_gemm_dgrad``, ``grouped_gemm_wgrad``, ``cake_grouped_mm``) and the package
-``flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train`` it hands off to are
-non-deterministic only: the keyword-only ``deterministic`` must be the bool ``False``
-(every other value, the default ``True`` included, raises ``ValueError`` naming the
-deterministic entry of ``flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train``), nothing
-routes to the deterministic package, and under ``torch.use_deterministic_algorithms(True)``
-PyTorch's non-determinism alert is raised immediately before an order-varying launch
-only (the weight gradient whose 512-wide k tile splits its tail).  This suite covers on
-CPU the experimental-API marking and signatures of the facade, its handoff (with the
-package functions replaced by recorders and the deterministic ones by tripwires), the
-mode refusal of the facade and of the package, its deferred imports, the alert contract
-of prepared launches (with recorded launches standing in for the programs: an
-order-varying one alerts, a fixed-order one never does; the alert names the caller's
-frame under ``warn_only``), and that the det-free names exist only as non-deterministic
-objects; on a GPU, the alert of prepared launches and of the autograd backward on an
-order-varying and on a fixed-order shape.
+The module ``flashinfer.cake_moe_grouped_gemm_nondet_train`` and the package
+``flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train`` it hands off to
+are the non-deterministic mode: no entry takes a ``deterministic`` argument (one
+raises ``TypeError`` before anything runs), nothing routes to the deterministic
+module, and under ``torch.use_deterministic_algorithms(True)`` PyTorch's
+non-determinism alert is raised immediately before an order-varying launch only (the
+weight gradient whose 512-wide k tile splits its tail).  This suite covers on CPU the
+experimental-API marking and signatures of the module, its handoff (with the package
+functions replaced by recorders and the deterministic ones by tripwires), the refusal
+of a stale mode argument, its deferred imports, and the alert contract of prepared
+launches (with recorded launches standing in for the programs: an order-varying one
+alerts, a fixed-order one never does; the alert names the caller's frame under
+``warn_only``); on a GPU, the alert of prepared launches and of the autograd backward
+on an order-varying and on a fixed-order shape.  The names of the module, the removed
+ones included, are covered by ``test_cake_moe_grouped_gemm_nondet_train_names.py``.
 """
 
 import contextlib
@@ -51,57 +49,79 @@ import torch.utils.checkpoint
 
 pytest.importorskip("tvm_ffi")  # cake_backend imports it at module level
 
-import flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train as pkg
 import flashinfer.cake_moe_grouped_gemm_nondet_train as facade
 import flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train as det_pkg
+import flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train as pkg
 import flashinfer.grouped_mm as grouped_mm
+from flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train import (
+    cake_autograd as det_autograd,
+)
+from flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train import (
+    cake_backend as det_cb,
+)
 from flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train import (
     cake_autograd,
 )
 from flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train import (
     cake_backend as cb,
 )
-from flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train import (
-    cake_autograd as det_autograd,
-)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+PREFIX = "cake_moe_grouped_gemm_nondet_train"
 ENTRY_POINTS = (
-    "grouped_gemm_fwd",
-    "grouped_gemm_dgrad",
-    "grouped_gemm_wgrad",
-    "cake_grouped_mm",
+    f"{PREFIX}_forward",
+    f"{PREFIX}_dgrad",
+    f"{PREFIX}_wgrad",
+    f"{PREFIX}_prepare_forward",
+    f"{PREFIX}_prepare_dgrad",
+    f"{PREFIX}_prepare_wgrad",
+    "cake_moe_grouped_gemm_nondet",
 )
-# facade entry -> the deterministic entry its mode refusal names
-DET_ENTRY = {
-    "grouped_gemm_fwd": "cake_moe_grouped_gemm_det_train_forward",
-    "grouped_gemm_dgrad": "cake_moe_grouped_gemm_det_train_dgrad",
-    "grouped_gemm_wgrad": "cake_moe_grouped_gemm_det_train_wgrad",
-    "cake_grouped_mm": "cake_moe_grouped_gemm_det",
+LAZY_TYPES = {
+    "CakeMoEGroupedGemmNondetFunction": "cake_autograd",
+    "CakeMoEGroupedGemmNondetLaunch": "cake_backend",
 }
 # The deterministic objects nothing here may call (module, attribute).
 DET_TARGETS = (
     (det_pkg, "cake_moe_grouped_gemm_det_train_forward"),
     (det_pkg, "cake_moe_grouped_gemm_det_train_dgrad"),
     (det_pkg, "cake_moe_grouped_gemm_det_train_wgrad"),
+    (det_cb, "cake_moe_grouped_gemm_det_train_prepare_forward"),
+    (det_cb, "cake_moe_grouped_gemm_det_train_prepare_dgrad"),
+    (det_cb, "cake_moe_grouped_gemm_det_train_prepare_wgrad"),
     (det_autograd, "cake_moe_grouped_gemm_det"),
 )
+# facade entry -> the package object it hands off to (module, attribute)
 NEW_TARGETS = {
-    "grouped_gemm_fwd": (pkg, "grouped_gemm_fwd"),
-    "grouped_gemm_dgrad": (pkg, "grouped_gemm_dgrad"),
-    "grouped_gemm_wgrad": (pkg, "grouped_gemm_wgrad"),
-    "cake_grouped_mm": (cake_autograd, "cake_grouped_mm"),
+    f"{PREFIX}_forward": (pkg, f"{PREFIX}_forward"),
+    f"{PREFIX}_dgrad": (pkg, f"{PREFIX}_dgrad"),
+    f"{PREFIX}_wgrad": (pkg, f"{PREFIX}_wgrad"),
+    f"{PREFIX}_prepare_forward": (cb, f"{PREFIX}_prepare_forward"),
+    f"{PREFIX}_prepare_dgrad": (cb, f"{PREFIX}_prepare_dgrad"),
+    f"{PREFIX}_prepare_wgrad": (cb, f"{PREFIX}_prepare_wgrad"),
+    "cake_moe_grouped_gemm_nondet": (cake_autograd, "cake_moe_grouped_gemm_nondet"),
 }
-MODE_HINT = "pass deterministic=False for the non-deterministic path"
-# Every value of ``deterministic`` but the bool False (``_OMIT``: the default True).
-_OMIT = object()
-NOT_FALSE = (_OMIT, True, None, 0, 1, "False")
-NOT_FALSE_IDS = ("omitted", "True", "None", "0", "1", "str")
+OFFS = torch.tensor([2, 4], dtype=torch.int32)
 
 
 def _package_function(name):
     module, attr = NEW_TARGETS[name]
     return getattr(module, attr)
+
+
+def _bf16(*shape):
+    return torch.zeros(*shape, dtype=torch.bfloat16)
+
+
+def _operands(name):
+    """bfloat16 CPU operands of the entry ``name``: they pass its dtype and shape checks
+    and fail its device check, so a call raises the host-side ``ValueError`` and
+    touches no kernel."""
+    if name.endswith("wgrad"):
+        return _bf16(4, 256), _bf16(4, 64), OFFS
+    if name.endswith("dgrad"):
+        return _bf16(4, 64), _bf16(2, 64, 256), OFFS
+    return _bf16(4, 64), _bf16(2, 256, 64), OFFS
 
 
 class _TorchDeterministic:
@@ -144,8 +164,8 @@ def _user_warnings(records):
 
 
 def _tripwires(monkeypatch):
-    """Replace every deterministic object the facade used to route to by a function that
-    fails the test when called."""
+    """Replace every deterministic entry by a function that fails the test when
+    called."""
 
     for module, attr in DET_TARGETS:
 
@@ -158,39 +178,44 @@ def _tripwires(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# The facade (CPU)
+# The module (CPU)
 # ---------------------------------------------------------------------------
 
 
 def test_facade_entry_points_are_the_experimental_api():
-    """Each facade function is marked experimental with the feature
-    ``cake_moe_grouped_gemm.<name>``, takes the signature of the package function of
-    the same name (the keyword-only ``deterministic: bool = True`` included), documents
-    the ``deterministic`` keyword behind the experimental banner, and is in ``__all__``;
-    the package functions are unmarked."""
-    assert sorted(facade.__all__) == sorted(ENTRY_POINTS)
+    """``flashinfer.cake_moe_grouped_gemm_nondet_train.<name>`` is the experimental API
+    of the package function of the same name: marked with the feature
+    ``cake_moe_grouped_gemm_nondet_train.<name>``, carrying the package function's
+    signature (no ``deterministic`` parameter) and its docstring behind the
+    experimental banner, and listed in the module's ``__all__``; the package function
+    itself is unmarked.  The two types of the module are the package's classes,
+    resolved on first access."""
     for name in ENTRY_POINTS:
         entry, impl = getattr(facade, name), _package_function(name)
+        assert name in facade.__all__, name
+        assert getattr(pkg, name) is impl, name
         assert entry.is_experimental is True, name
-        assert entry.experimental_feature == f"cake_moe_grouped_gemm.{name}", name
-        assert inspect.signature(entry) == inspect.signature(impl), name
-        parameter = inspect.signature(entry).parameters["deterministic"]
-        assert parameter.default is True, name
-        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY, name
+        assert entry.experimental_feature == f"{PREFIX}.{name}", name
+        signature = inspect.signature(entry)
+        assert signature == inspect.signature(impl), name
+        assert "deterministic" not in signature.parameters, name
         assert entry.__doc__.startswith(".. warning::"), name
-        assert "deterministic" in entry.__doc__, name
-        assert DET_ENTRY[name] in entry.__doc__, name
+        assert entry.__doc__.endswith(impl.__doc__), name
         assert not hasattr(impl, "is_experimental"), name
+    for name, submodule in LAZY_TYPES.items():
+        assert name in facade.__all__ and name in dir(facade), name
+        module = importlib.import_module(f"{pkg.__name__}.{submodule}")
+        assert getattr(facade, name) is getattr(module, name) is getattr(pkg, name)
 
 
 def _recorders(monkeypatch):
-    """Replace the package functions the facade hands off to by recorders and the
-    deterministic objects by tripwires; return the log of ``(entry, deterministic)``."""
+    """Replace the package functions the module hands off to by recorders and the
+    deterministic entries by tripwires; return the log of ``(entry, keywords)``."""
     log = []
     for entry, (module, attr) in NEW_TARGETS.items():
 
         def record(*args, _entry=entry, **kwargs):
-            log.append((_entry, kwargs.get("deterministic", "absent")))
+            log.append((_entry, sorted(kwargs)))
             return "result"
 
         monkeypatch.setattr(module, attr, record)
@@ -198,76 +223,82 @@ def _recorders(monkeypatch):
     return log
 
 
-def _operands(name):
-    x = torch.zeros(4, 64, dtype=torch.bfloat16)
-    w = torch.zeros(2, 256, 64, dtype=torch.bfloat16)
-    offs = torch.tensor([2, 4], dtype=torch.int32)
-    return (x, w, offs) if name != "grouped_gemm_wgrad" else (x, x, offs)
-
-
-def _call(name, deterministic=_OMIT):
-    args = _operands(name)
-    if deterministic is _OMIT:
-        return getattr(facade, name)(*args)
-    return getattr(facade, name)(*args, deterministic=deterministic)
-
-
 @pytest.mark.parametrize("name", ENTRY_POINTS)
 def test_facade_hands_every_call_to_the_package(name, monkeypatch):
-    """``deterministic=False`` reaches the package function of the same name with
-    ``deterministic=False``; under torch's deterministic mode (strict and
-    ``warn_only``) the facade neither reroutes to the deterministic package nor warns.
-    The deterministic objects are never called."""
+    """Every call reaches the package function of the same name, with the three
+    operands positional and every other argument by keyword; under torch's
+    deterministic mode (strict and ``warn_only``) the module neither reroutes to the
+    deterministic module nor warns.  The deterministic entries are never called."""
+    keywords = sorted(list(inspect.signature(getattr(facade, name)).parameters)[3:])
     log = _recorders(monkeypatch)
+    entry = getattr(facade, name)
     with warnings.catch_warnings(record=True) as rec:
         warnings.simplefilter("always")
-        assert _call(name, False) == "result"
+        assert entry(*_operands(name)) == "result"
         for warn_only in (False, True):
             with _TorchDeterministic(warn_only):
                 for _ in range(2):
-                    assert _call(name, False) == "result"
+                    assert entry(*_operands(name)) == "result"
     assert _user_warnings(rec) == []
-    assert log == [(name, False)] * 5
-
-
-@pytest.mark.parametrize("name", ENTRY_POINTS)
-@pytest.mark.parametrize("value", NOT_FALSE, ids=NOT_FALSE_IDS)
-def test_facade_rejects_every_mode_but_false(name, value, monkeypatch):
-    """Every value of ``deterministic`` but the bool ``False`` (the default ``True``,
-    ``None``, ``0``, ``1``, ``"False"``) raises ``ValueError`` naming the deterministic
-    entry and saying to pass ``deterministic=False``, also under torch's deterministic
-    mode (strict and ``warn_only``); nothing reaches the deterministic package."""
-    _tripwires(monkeypatch)
-    for mode in (
-        contextlib.nullcontext(),
-        _TorchDeterministic(warn_only=False),
-        _TorchDeterministic(warn_only=True),
-    ):
-        with mode, pytest.raises(ValueError) as info:
-            _call(name, value)
-        message = str(info.value)
-        assert DET_ENTRY[name] in message, message
-        assert MODE_HINT in message, message
-        assert "cake_moe_grouped_gemm_det_train" in message, message
+    assert log == [(name, keywords)] * 5
 
 
 def test_facade_has_no_deterministic_route():
-    """The facade holds no routing state and imports nothing from the deterministic
+    """The module holds no routing state and imports nothing from the deterministic
     package (no fallback warning flags, no mode helper)."""
     for name in ("_FALLBACK_WARNED", "_deterministic", "_caller_stacklevel"):
         assert not hasattr(facade, name), name
     source = Path(facade.__file__).read_text()
-    assert "experimental.cake.cake_moe_grouped_gemm_det_train import" not in source
-    assert "NotImplementedError" not in source
+    assert "experimental.cake.cake_moe_grouped_gemm_det_train" not in source
+    assert "raise NotImplementedError" not in source
 
 
-def test_facade_positional_mode_is_refused(monkeypatch):
-    """``deterministic`` is keyword-only on every facade entry, ``cake_grouped_mm``
-    included: a fourth positional ``False`` of ``cake_grouped_mm`` raises
-    ``TypeError``."""
+@pytest.mark.parametrize("value", [True, False])
+@pytest.mark.parametrize("via", ["package", "facade"])
+@pytest.mark.parametrize("name", ENTRY_POINTS)
+def test_entries_take_no_deterministic_keyword(name, via, value, monkeypatch):
+    """No entry of the module or of the package takes ``deterministic``: either value
+    raises ``TypeError`` naming the keyword before anything runs (the recorders of the
+    module's handoff and the deterministic tripwires stay untouched), also under
+    torch's deterministic mode."""
+    entry = getattr(facade, name) if via == "facade" else _package_function(name)
+    log = _recorders(monkeypatch)
+    for mode in (contextlib.nullcontext(), _TorchDeterministic(warn_only=False)):
+        with mode, pytest.raises(TypeError, match="deterministic"):
+            entry(*_operands(name), deterministic=value)
+    assert log == []
+
+
+def test_autograd_function_forward_takes_no_deterministic_parameter():
+    """``CakeMoEGroupedGemmNondetFunction.forward`` has no ``deterministic`` parameter
+    and no catch-all: its slots are the operands, the internal ``_launch`` slot and the
+    fuse flag."""
+    parameters = inspect.signature(
+        cake_autograd.CakeMoEGroupedGemmNondetFunction.forward
+    ).parameters
+    assert list(parameters) == [
+        "ctx",
+        "x",
+        "w",
+        "offs",
+        "_launch",
+        "fuse_wgrad_accumulation",
+    ]
+
+
+@pytest.mark.parametrize("via", ["package", "facade"])
+@pytest.mark.parametrize("value", [True, False])
+def test_stale_positional_mode_is_a_type_error(via, value, monkeypatch):
+    """The fuse flag of ``cake_moe_grouped_gemm_nondet`` is keyword-only: a stale
+    fourth positional mode argument raises ``TypeError`` before anything runs."""
+    entry = (
+        facade.cake_moe_grouped_gemm_nondet
+        if via == "facade"
+        else pkg.cake_moe_grouped_gemm_nondet
+    )
     log = _recorders(monkeypatch)
     with pytest.raises(TypeError):
-        facade.cake_grouped_mm(*_operands("cake_grouped_mm"), False)
+        entry(*_operands("cake_moe_grouped_gemm_nondet"), value)
     assert log == []
 
 
@@ -277,6 +308,7 @@ import warnings
 import torch
 
 import flashinfer.api_logging as api_logging
+import flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train as pkg
 import flashinfer.cake_moe_grouped_gemm_nondet_train as facade
 
 assert not torch.cuda.is_available()
@@ -286,23 +318,26 @@ def bf16(*shape):
     return torch.zeros(*shape, dtype=torch.bfloat16)
 
 
-# CPU operands fail the device check of the package (deterministic=False) and the
-# default mode fails the mode check: every call raises a host-side ValueError and
-# touches no kernel.
+# bfloat16 CPU operands pass the dtype and shape checks and fail the device
+# check, so every call raises the host-side ValueError and touches no kernel.
 offs = torch.tensor([2, 4], dtype=torch.int32)
+prefix = "cake_moe_grouped_gemm_nondet_train"
 operands = {
-    "grouped_gemm_fwd": (bf16(4, 64), bf16(2, 256, 64), offs),
-    "grouped_gemm_dgrad": (bf16(4, 64), bf16(2, 64, 256), offs),
-    "grouped_gemm_wgrad": (bf16(4, 256), bf16(4, 64), offs),
-    "cake_grouped_mm": (bf16(4, 64), bf16(2, 256, 64), offs),
+    f"{prefix}_forward": (bf16(4, 64), bf16(2, 256, 64), offs),
+    f"{prefix}_dgrad": (bf16(4, 64), bf16(2, 64, 256), offs),
+    f"{prefix}_wgrad": (bf16(4, 256), bf16(4, 64), offs),
+    f"{prefix}_prepare_forward": (bf16(4, 64), bf16(2, 256, 64), offs),
+    f"{prefix}_prepare_dgrad": (bf16(4, 64), bf16(2, 64, 256), offs),
+    f"{prefix}_prepare_wgrad": (bf16(4, 256), bf16(4, 64), offs),
+    "cake_moe_grouped_gemm_nondet": (bf16(4, 64), bf16(2, 256, 64), offs),
 }
 
 
-def warnings_of(fn, args, **kwargs):
+def warnings_of(fn, args):
     with warnings.catch_warnings(record=True) as rec:
         warnings.simplefilter("always")
         try:
-            fn(*args, **kwargs)
+            fn(*args)
         except ValueError:
             pass
         else:
@@ -310,133 +345,71 @@ def warnings_of(fn, args, **kwargs):
     return rec
 
 
+for name in pkg.__all__:  # load the submodules outside the recorded calls
+    getattr(pkg, name)
+
 for name, args in operands.items():
-    entry = getattr(facade, name)
-    [w] = warnings_of(entry, args, deterministic=False)  # first call: one warning
+    entry, impl = getattr(facade, name), getattr(pkg, name)
+    [w] = warnings_of(entry, args)  # first call: exactly one warning
     assert w.category is api_logging.ExperimentalWarning, (name, w.category)
     message = str(w.message)
-    assert f"'cake_moe_grouped_gemm.{name}' is an experimental" in message, message
-    assert warnings_of(entry, args, deterministic=False) == [], name  # then silent
-    assert warnings_of(entry, args) == [], name
+    assert f"'{prefix}.{name}' is an experimental" in message, message
+    assert warnings_of(entry, args) == [], name  # second call: silent
+    assert warnings_of(impl, args) == [], name  # the package function: never
 print("OK")
 """
 
 
-def test_facade_warns_once_per_entry_point():
-    """Each facade function emits ``ExperimentalWarning`` once, on its first call; runs
-    in a subprocess so the once-only flags do not depend on test order."""
+def test_facade_entry_points_warn_once_and_the_package_functions_do_not():
+    """Each entry point emits ``flashinfer.api_logging.ExperimentalWarning`` once, on
+    its first call, before the handoff raises the host-side ``ValueError`` of CPU
+    operands; a second call is silent, and the package functions never warn.  Runs in
+    a subprocess so the once-only flags do not depend on test order."""
     assert _run_cpu_subprocess(_WARN_ONCE) == "OK"
 
 
 def test_importing_the_facade_imports_neither_package():
-    """The facade reaches the package through deferred imports only."""
+    """The module reaches the package through deferred imports only."""
     code = (
         "import json, sys\n"
         "import flashinfer.cake_moe_grouped_gemm_nondet_train\n"
         "import flashinfer.grouped_mm\n"
         "print(json.dumps(sorted(m for m in sys.modules"
         " if m.startswith('flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train')"
-        " or m.startswith('flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train'))))\n"
+        " or m.startswith("
+        "'flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train'))))\n"
     )
     assert json.loads(_run_cpu_subprocess(code)) == []
 
 
 # ---------------------------------------------------------------------------
-# The package's numerical-mode checks and the deterministic-mode alert (CPU)
+# The package's deterministic-mode alert (CPU)
 # ---------------------------------------------------------------------------
 
 
-def _bf16(*shape):
-    return torch.zeros(*shape, dtype=torch.bfloat16)
-
-
-OFFS = torch.tensor([2, 4], dtype=torch.int32)
-PACKAGE_CALLS = {
-    "grouped_gemm_fwd": lambda **kw: pkg.grouped_gemm_fwd(
-        _bf16(4, 64), _bf16(2, 256, 64), OFFS, **kw
-    ),
-    "grouped_gemm_dgrad": lambda **kw: pkg.grouped_gemm_dgrad(
-        _bf16(4, 64), _bf16(2, 64, 256), OFFS, **kw
-    ),
-    "grouped_gemm_wgrad": lambda **kw: pkg.grouped_gemm_wgrad(
-        _bf16(4, 256), _bf16(4, 64), OFFS, **kw
-    ),
-    "prepare_grouped_gemm_fwd": lambda **kw: cb.prepare_grouped_gemm_fwd(
-        _bf16(4, 64), _bf16(2, 256, 64), OFFS, **kw
-    ),
-    "prepare_grouped_gemm_dgrad": lambda **kw: cb.prepare_grouped_gemm_dgrad(
-        _bf16(4, 64), _bf16(2, 64, 256), OFFS, **kw
-    ),
-    "prepare_grouped_gemm_wgrad": lambda **kw: cb.prepare_grouped_gemm_wgrad(
-        _bf16(4, 256), _bf16(4, 64), OFFS, **kw
-    ),
-    "cake_grouped_mm": lambda **kw: pkg.cake_grouped_mm(
-        _bf16(4, 64), _bf16(2, 256, 64), OFFS, **kw
-    ),
-    "CakeGroupedMm": lambda **kw: cake_autograd.CakeGroupedMm.apply(
-        _bf16(4, 64), _bf16(2, 256, 64), OFFS, *kw.values()
-    ),
-}
-
-
-@pytest.mark.parametrize("name", list(PACKAGE_CALLS))
-def test_package_refuses_every_mode_but_false(name):
-    """Every entry point of the package raises ``ValueError`` naming its deterministic
-    entry (``grouped_det_gemm_*``, ``prepare_grouped_det_gemm_*``,
-    ``cake_moe_grouped_gemm_det``, ``CakeMoEGroupedGemmDetFunction``) and saying to pass
-    ``deterministic=False`` unless ``deterministic`` is the bool ``False``; with
-    ``False`` it reaches its host checks (CPU operands: the device check)."""
-    call = PACKAGE_CALLS[name]
-    for value in NOT_FALSE:
-        kwargs = {} if value is _OMIT else {"deterministic": value}
-        with pytest.raises(ValueError) as info:
-            call(**kwargs)
-        message = str(info.value)
-        assert f"cake_moe_grouped_gemm_det_train.{cb._DET_ENTRIES[name]}" in message, (
-            name,
-            value,
-            message,
-        )
-        assert MODE_HINT in message, (name, value)
-    with pytest.raises(ValueError) as info:
-        call(deterministic=False)
-    assert "cake_moe_grouped_gemm_det_train" not in str(info.value), name
-
-
-def test_package_mode_keyword_only():
-    """``deterministic`` is keyword-only on every package function, the autograd
-    wrapper included (a positional fourth argument raises ``TypeError``); only the
-    ``torch.autograd.Function`` takes it positionally."""
-    for fn in (
-        pkg.grouped_gemm_fwd,
-        pkg.grouped_gemm_dgrad,
-        pkg.grouped_gemm_wgrad,
-        pkg.cake_grouped_mm,
-        cb.prepare_grouped_gemm_fwd,
-        cb.prepare_grouped_gemm_dgrad,
-        cb.prepare_grouped_gemm_wgrad,
-    ):
-        parameter = inspect.signature(fn).parameters["deterministic"]
-        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY, fn
-        assert parameter.default is True, fn
-    with pytest.raises(TypeError):
-        pkg.cake_grouped_mm(_bf16(4, 64), _bf16(2, 256, 64), OFFS, False)
-    assert set(cb._DET_ENTRIES) == set(PACKAGE_CALLS)
+def _package_entry(name):
+    """The package callable ``name``: an entry point, or the autograd function's
+    ``apply``."""
+    if name == "CakeMoEGroupedGemmNondetFunction":
+        return cake_autograd.CakeMoEGroupedGemmNondetFunction.apply
+    return _package_function(name)
 
 
 @pytest.mark.parametrize(
     "entry,det",
     [
-        ("CakeGroupedMm.backward", "CakeMoEGroupedGemmDetFunction"),
-        ("GroupedGemmLaunch.launch", "CakeMoEGroupedGemmDetLaunch.launch"),
-        ("grouped_gemm_wgrad", "cake_moe_grouped_gemm_det_train_wgrad"),
+        ("CakeMoEGroupedGemmNondetFunction.backward", "CakeMoEGroupedGemmDetFunction"),
+        ("CakeMoEGroupedGemmNondetLaunch.launch", "CakeMoEGroupedGemmDetLaunch.launch"),
+        (f"{PREFIX}_wgrad", "cake_moe_grouped_gemm_det_train_wgrad"),
     ],
 )
 def test_alert_names_the_deterministic_entry(entry, det):
-    """The alert of every entry that can launch an order-varying weight gradient names the
-    entry and its deterministic counterpart: the ``RuntimeError`` (strict) and the
-    ``UserWarning`` (``warn_only``); nothing with the mode off."""
-    want = f"flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train.{det}"
+    """The alert of every entry that can launch an order-varying weight gradient names
+    the entry and its counterpart in ``flashinfer.cake_moe_grouped_gemm_det_train``:
+    the ``RuntimeError`` (strict) and the ``UserWarning`` (``warn_only``); nothing
+    with the mode off."""
+    want = f"flashinfer.cake_moe_grouped_gemm_det_train.{det}"
+    assert cb._ALERT_DET_ENTRIES[entry] == det
     with (
         _TorchDeterministic(warn_only=False),
         pytest.raises(RuntimeError) as info,
@@ -459,16 +432,16 @@ def test_alert_names_the_deterministic_entry(entry, det):
 
 @pytest.mark.parametrize("value", [True, False, 0, 1, "junk"], ids=str)
 def test_autograd_function_refuses_a_stray_internal_slot(value):
-    """``CakeGroupedMm.apply`` takes the mode fourth and nothing but ``None`` fifth (an
-    internal slot; the fuse flag is sixth): ``apply(x, w, offs, False, True)`` -- the
-    deterministic package's ``apply(x, w, offs, None, True)`` with the mode put first --
-    raises ``TypeError`` before anything runs; ``apply(x, w, offs, False, None, True)``
-    reaches the host checks (CPU operands: the device check)."""
+    """``CakeMoEGroupedGemmNondetFunction.apply`` takes nothing but ``None`` fourth (an
+    internal slot; the fuse flag is fifth): ``apply(x, w, offs, value)`` -- a stale
+    mode argument -- raises ``TypeError`` before anything runs;
+    ``apply(x, w, offs, None, True)`` reaches the host checks (CPU operands: the
+    device check)."""
     x, w = _bf16(4, 64), _bf16(2, 256, 64)
-    with pytest.raises(TypeError, match="takes no fifth argument"):
-        cake_autograd.CakeGroupedMm.apply(x, w, OFFS, False, value)
+    with pytest.raises(TypeError, match="takes no fourth argument"):
+        cake_autograd.CakeMoEGroupedGemmNondetFunction.apply(x, w, OFFS, value)
     with pytest.raises(ValueError, match="device"):
-        cake_autograd.CakeGroupedMm.apply(x, w, OFFS, False, None, True)
+        cake_autograd.CakeMoEGroupedGemmNondetFunction.apply(x, w, OFFS, None, True)
 
 
 @pytest.mark.parametrize("capturing", [False, True], ids=["eager", "capturing"])
@@ -495,7 +468,7 @@ def test_backward_never_queries_a_captured_stream(capturing, monkeypatch):
     w = _bf16(2, 256, 64).requires_grad_(True)
     w.main_grad = torch.zeros(2, 256, 64)
     for fuse in (False, True):
-        y = cake_autograd.CakeGroupedMm.apply(x, w, OFFS, False, None, fuse)
+        y = cake_autograd.CakeMoEGroupedGemmNondetFunction.apply(x, w, OFFS, None, fuse)
         y.backward(torch.ones_like(y))
     assert len(queries) == (0 if capturing else 2), queries
     want = ["_fwd_op", "_dgrad_op", "_wgrad_op"]
@@ -503,15 +476,16 @@ def test_backward_never_queries_a_captured_stream(capturing, monkeypatch):
     assert ran == want, ran
 
 
-@pytest.mark.parametrize("name", [n for n in PACKAGE_CALLS if n != "CakeGroupedMm"])
+@pytest.mark.parametrize("name", [*ENTRY_POINTS, "CakeMoEGroupedGemmNondetFunction"])
 def test_entry_points_and_preparation_do_not_alert(name):
     """Under torch's deterministic mode (strict and ``warn_only``) no entry point alerts
     before it launches anything: the preparation and the host checks run as with the
     mode off (CPU operands: the device check's ``ValueError``), with no warning."""
+    call = _package_entry(name)
     with warnings.catch_warnings(record=True) as rec:
         warnings.simplefilter("always")
         with pytest.raises(ValueError) as info:
-            PACKAGE_CALLS[name](deterministic=False)
+            call(*_operands(name))
     want = str(info.value)
     assert _user_warnings(rec) == []
     for warn_only in (False, True):
@@ -521,13 +495,13 @@ def test_entry_points_and_preparation_do_not_alert(name):
         ):
             warnings.simplefilter("always")
             with pytest.raises(ValueError) as info:
-                PACKAGE_CALLS[name](deterministic=False)
+                call(*_operands(name))
         assert str(info.value) == want, (warn_only, str(info.value))
         assert _user_warnings(rec) == [], [str(w.message) for w in rec]
 
 
 def _recorded_launch(monkeypatch, *, op="wgrad", plan=None, programs=1):
-    """A ``GroupedGemmLaunch`` whose programs are recorders (``programs`` of them; the
+    """A ``CakeMoEGroupedGemmNondetLaunch`` whose programs are recorders (``programs`` of them; the
     log counts their calls), with ``tvm_ffi``'s stream scope replaced by a no-op so it
     runs on the CPU."""
     monkeypatch.setattr(
@@ -538,7 +512,7 @@ def _recorded_launch(monkeypatch, *, op="wgrad", plan=None, programs=1):
         cb._Launch(entry=lambda *args: log.append("launch"), arguments=())
         for _ in range(programs)
     )
-    launch = cb.GroupedGemmLaunch(
+    launch = cb.CakeMoEGroupedGemmNondetLaunch(
         op=op,
         record_name="cake_moe_grouped_gemm_wgrad_bf16_k512",
         stages=("main",) * programs,
@@ -555,7 +529,7 @@ SPLIT_TAIL = {"unordered_tail": True, "tail_splits": 3}
 def test_order_varying_launch_alerts_immediately_before_it_runs(monkeypatch):
     """An order-varying launch (the weight gradient with an unordered split tail) checks
     torch's deterministic mode at every ``launch()``: strict, a ``RuntimeError`` naming
-    ``GroupedGemmLaunch.launch`` and the deterministic entry
+    ``CakeMoEGroupedGemmNondetLaunch.launch`` and the deterministic entry
     (``CakeMoEGroupedGemmDetLaunch.launch``), and nothing launches; ``warn_only``, one
     ``UserWarning`` naming both and the caller's line, then it launches; mode off, it
     launches silently."""
@@ -563,7 +537,9 @@ def test_order_varying_launch_alerts_immediately_before_it_runs(monkeypatch):
     assert launch.order_varying
     with (
         _TorchDeterministic(warn_only=False),
-        pytest.raises(RuntimeError, match="GroupedGemmLaunch.launch") as info,
+        pytest.raises(
+            RuntimeError, match="CakeMoEGroupedGemmNondetLaunch.launch"
+        ) as info,
     ):
         launch.launch()
     assert "cake_moe_grouped_gemm_det_train.CakeMoEGroupedGemmDetLaunch.launch" in str(
@@ -578,7 +554,7 @@ def test_order_varying_launch_alerts_immediately_before_it_runs(monkeypatch):
         launch.launch()
     alerts = _user_warnings(rec)
     assert len(alerts) == 1, [str(w.message) for w in rec]
-    assert "GroupedGemmLaunch.launch" in str(alerts[0].message)
+    assert "CakeMoEGroupedGemmNondetLaunch.launch" in str(alerts[0].message)
     assert "cake_moe_grouped_gemm_det_train.CakeMoEGroupedGemmDetLaunch.launch" in str(
         alerts[0].message
     )
@@ -620,24 +596,28 @@ def test_fixed_order_launches_never_alert(op, plan, programs, monkeypatch):
 @pytest.mark.parametrize("via", ["package", "facade"])
 @pytest.mark.parametrize("accumulate", [False, True])
 def test_weight_gradient_alerts_with_the_entry_name(via, accumulate, monkeypatch):
-    """``grouped_gemm_wgrad`` (the package's, and the facade's handoff to it) raises the
-    alert with its own name immediately before an order-varying launch (overwrite or
-    accumulate): strict, a ``RuntimeError`` and nothing launches; ``warn_only``, a
-    ``UserWarning`` naming the caller's line, then it launches; the deterministic
-    package is never called."""
+    """``cake_moe_grouped_gemm_nondet_train_wgrad`` (the package's, and the module's
+    handoff to it) raises the alert with its own name immediately before an
+    order-varying launch (overwrite or accumulate): strict, a ``RuntimeError`` and
+    nothing launches; ``warn_only``, a ``UserWarning`` naming the caller's line, then
+    it launches; the deterministic module is never called."""
     _tripwires(monkeypatch)
     launch, log = _recorded_launch(monkeypatch, plan=SPLIT_TAIL)
     monkeypatch.setattr(cb, "_prepare_wgrad", lambda *args, **kwargs: launch)
-    fn = pkg.grouped_gemm_wgrad if via == "package" else facade.grouped_gemm_wgrad
+    fn = (
+        pkg.cake_moe_grouped_gemm_nondet_train_wgrad
+        if via == "package"
+        else facade.cake_moe_grouped_gemm_nondet_train_wgrad
+    )
     g, x = _bf16(4, 256), _bf16(4, 64)
     out = torch.zeros(2, 256, 64)
 
     def call():
-        return fn(g, x, OFFS, out=out, deterministic=False, accumulate=accumulate)
+        return fn(g, x, OFFS, out=out, accumulate=accumulate)
 
     with (
         _TorchDeterministic(warn_only=False),
-        pytest.raises(RuntimeError, match="grouped_gemm_wgrad"),
+        pytest.raises(RuntimeError, match="cake_moe_grouped_gemm_nondet_train_wgrad"),
     ):
         call()
     assert log == []
@@ -648,7 +628,9 @@ def test_weight_gradient_alerts_with_the_entry_name(via, accumulate, monkeypatch
         warnings.simplefilter("always")
         call()
     alerts = _user_warnings(rec)
-    assert len(alerts) == 1 and "grouped_gemm_wgrad" in str(alerts[0].message)
+    assert len(alerts) == 1 and "cake_moe_grouped_gemm_nondet_train_wgrad" in str(
+        alerts[0].message
+    )
     assert os.path.samefile(alerts[0].filename, __file__), alerts[0].filename
     assert log == ["launch"]
 
@@ -664,48 +646,6 @@ def test_package_has_no_stable_api_handoff():
         in source
     )
     assert "experimental.cake.cake_moe_grouped_gemm_nondet_train" not in source
-
-
-# ---------------------------------------------------------------------------
-# Det-free names are non-deterministic only (CPU)
-# ---------------------------------------------------------------------------
-
-
-def test_det_free_names_are_only_the_non_deterministic_objects():
-    """After the removal of the det-free aliases of the deterministic objects, the
-    spellings ``grouped_gemm_*``, ``prepare_grouped_gemm_*``, ``GroupedGemmLaunch``,
-    ``CakeGroupedMm`` and ``cake_grouped_mm`` exist only in the non-deterministic
-    package and its facade: the old package path does not import,
-    ``flashinfer.grouped_mm`` and the deterministic package do not have them, and the
-    test-helper key ``cake_moe_grouped_gemm`` is gone."""
-    with pytest.raises(ModuleNotFoundError):
-        importlib.import_module("flashinfer.experimental.cake_moe_grouped_gemm")
-    for name in ("grouped_gemm_fwd", "grouped_gemm_dgrad", "grouped_gemm_wgrad"):
-        assert not hasattr(grouped_mm, name), name
-        assert not hasattr(det_pkg, name), name
-        det_name = "cake_moe_grouped_gemm_det_train_" + name[13:].replace(
-            "fwd", "forward"
-        )
-        assert getattr(facade, name) is not getattr(det_pkg, det_name)
-    assert not hasattr(grouped_mm, "cake_grouped_mm")
-    for name in (
-        "CakeGroupedMm",
-        "GroupedGemmLaunch",
-        "cake_grouped_mm",
-        "prepare_grouped_gemm_fwd",
-        "prepare_grouped_gemm_dgrad",
-        "prepare_grouped_gemm_wgrad",
-    ):
-        assert not hasattr(det_pkg, name), name
-        assert getattr(pkg, name).__module__.startswith(pkg.__name__), name
-    from tests.test_helpers.cake_package import PACKAGES, cake_package
-
-    assert "cake_moe_grouped_gemm" not in PACKAGES
-    assert cake_package("cake_moe_grouped_gemm_nondet_train") is pkg
-    assert (
-        pkg.__name__
-        == "flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -732,12 +672,12 @@ def test_prepared_wgrad_launch_alerts_only_when_order_varying():
     device = base._require_autograd_programs()
     sizes, (n, k) = base._tile_case(device, "k512")
     x, _w, g, offs = base._inputs(sizes, n, k, device, seed=60)
-    launch = cb.prepare_grouped_gemm_wgrad(g, x, offs, deterministic=False)
+    launch = cb.cake_moe_grouped_gemm_nondet_train_prepare_wgrad(g, x, offs)
     assert launch.order_varying, launch.plan
     launch.out.fill_(float("nan"))
     with (
         _TorchDeterministic(warn_only=False),
-        pytest.raises(RuntimeError, match="GroupedGemmLaunch.launch"),
+        pytest.raises(RuntimeError, match="CakeMoEGroupedGemmNondetLaunch.launch"),
     ):
         launch.launch()
     torch.cuda.synchronize()
@@ -749,7 +689,9 @@ def test_prepared_wgrad_launch_alerts_only_when_order_varying():
         warnings.simplefilter("always")
         out = launch.launch()
     torch.cuda.synchronize()
-    alerts = [w for w in rec if "GroupedGemmLaunch.launch" in str(w.message)]
+    alerts = [
+        w for w in rec if "CakeMoEGroupedGemmNondetLaunch.launch" in str(w.message)
+    ]
     assert len(alerts) == 1 and alerts[0].category is UserWarning, [
         str(w.message) for w in rec
     ]
@@ -758,9 +700,9 @@ def test_prepared_wgrad_launch_alerts_only_when_order_varying():
 
     sizes = base.RAGGED_E4
     x, w, g, offs = base._inputs(sizes, 512, 256, device, seed=61)
-    ordered = cb.prepare_grouped_gemm_wgrad(g, x, offs, deterministic=False)
+    ordered = cb.cake_moe_grouped_gemm_nondet_train_prepare_wgrad(g, x, offs)
     assert not ordered.order_varying, ordered.plan
-    fwd = cb.prepare_grouped_gemm_fwd(x, w, offs, deterministic=False)
+    fwd = cb.cake_moe_grouped_gemm_nondet_train_prepare_forward(x, w, offs)
     ref = ordered.launch().clone()
     y_ref = fwd.launch().clone()
     ordered.out.fill_(float("nan"))
@@ -777,11 +719,12 @@ def test_prepared_wgrad_launch_alerts_only_when_order_varying():
 
 
 def test_autograd_backward_alerts_only_before_an_order_varying_weight_gradient():
-    """Under torch's deterministic mode the package's ``CakeGroupedMm`` backward (through
-    the package and through the facade with ``deterministic=False``; no fallback)
-    alerts immediately before an order-varying ``dW`` launch (``RuntimeError``; a
-    ``UserWarning`` with ``warn_only``), not when only ``dX`` is needed, and never on a
-    fixed-order shape, whose gradients have the bits of a run with the mode off."""
+    """Under torch's deterministic mode the backward of the package's
+    ``CakeMoEGroupedGemmNondetFunction`` (through the package and through the module;
+    no fallback) alerts immediately before an order-varying ``dW`` launch
+    (``RuntimeError``; a ``UserWarning`` with ``warn_only``), not when only ``dX`` is
+    needed, and never on a fixed-order shape, whose gradients have the bits of a run
+    with the mode off."""
     base = _base()
     device = base._require_autograd_programs()
 
@@ -794,13 +737,15 @@ def test_autograd_backward_alerts_only_before_an_order_varying_weight_gradient()
 
     sizes, (n, k) = base._tile_case(device, "k512")
     x0, w0, g, offs = base._inputs(sizes, n, k, device, seed=62)
-    package = lambda x, w: pkg.cake_grouped_mm(x, w, offs, deterministic=False)  # noqa: E731
-    through_facade = lambda x, w: facade.cake_grouped_mm(  # noqa: E731
-        x, w, offs, deterministic=False
+    package = lambda x, w: pkg.cake_moe_grouped_gemm_nondet(x, w, offs)  # noqa: E731
+    through_facade = lambda x, w: facade.cake_moe_grouped_gemm_nondet(  # noqa: E731
+        x, w, offs
     )
     with _TorchDeterministic(warn_only=False):
         for fn in (package, through_facade):
-            with pytest.raises(RuntimeError, match="CakeGroupedMm.backward"):
+            with pytest.raises(
+                RuntimeError, match="CakeMoEGroupedGemmNondetFunction.backward"
+            ):
                 run(fn, x0, w0, g)
         dx, dw = run(package, x0, w0, g, needs_w=False)
         assert dx is not None and dw is None
@@ -810,7 +755,9 @@ def test_autograd_backward_alerts_only_before_an_order_varying_weight_gradient()
     ):
         warnings.simplefilter("always")
         dx, dw = run(package, x0, w0, g)
-    alerts = [w for w in rec if "CakeGroupedMm.backward" in str(w.message)]
+    alerts = [
+        w for w in rec if "CakeMoEGroupedGemmNondetFunction.backward" in str(w.message)
+    ]
     assert alerts and all(w.category is UserWarning for w in alerts), [
         str(w.message) for w in rec
     ]
@@ -833,10 +780,10 @@ def test_autograd_backward_alerts_only_before_an_order_varying_weight_gradient()
     "early_stop", [True, False], ids=["early_stop", "no_early_stop"]
 )
 def test_facade_checkpoint_early_stop_skips_the_forward_launch(early_stop, monkeypatch):
-    """Through the facade (``deterministic=False``) the package's wrapper launches its
-    forward after autograd saved the inputs: a non-reentrant checkpoint of one GEMM
-    launches the forward once with early stop on (the recomputation stops before it)
-    and twice with it off, with the bits of the plain call for ``Y`` and ``dX``."""
+    """Through the module the package's wrapper launches its forward after autograd
+    saved the inputs: a non-reentrant checkpoint of one GEMM launches the forward once
+    with early stop on (the recomputation stops before it) and twice with it off, with
+    the bits of the plain call for ``Y`` and ``dX``."""
     base = _base()
     device = base._require_autograd_programs()
     sizes = base.RAGGED_E4
@@ -851,7 +798,7 @@ def test_facade_checkpoint_early_stop_skips_the_forward_launch(early_stop, monke
     monkeypatch.setattr(cake_autograd, "_fwd_op", counted)
 
     def gemm(x, w):
-        return facade.cake_grouped_mm(x, w, offs, deterministic=False)
+        return facade.cake_moe_grouped_gemm_nondet(x, w, offs)
 
     def run(checkpointed):
         launches.clear()

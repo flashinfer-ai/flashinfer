@@ -365,8 +365,7 @@ def cake_moe_grouped_gemm_det(
     (passing one raises ``TypeError``) and
     ``torch.use_deterministic_algorithms(True)`` changes nothing (no alert, no
     warning).  The non-deterministic wrapper is
-    ``flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train.cake_grouped_mm(...,
-    deterministic=False)``.
+    ``flashinfer.cake_moe_grouped_gemm_nondet_train.cake_moe_grouped_gemm_nondet``.
     """
     from .experimental.cake.cake_moe_grouped_gemm_det_train.cake_autograd import (
         cake_moe_grouped_gemm_det as _impl,

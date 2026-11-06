@@ -35,8 +35,8 @@ limitations under the License.
 # The package is deterministic only: no entry point takes a ``deterministic``
 # argument (passing one raises ``TypeError``), and
 # ``torch.use_deterministic_algorithms(True)`` changes nothing here (every launch
-# reduces in a fixed order).  The non-deterministic counterpart is
-# ``flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train``.
+# reduces in a fixed order).  The non-deterministic counterpart is the module
+# ``flashinfer.cake_moe_grouped_gemm_nondet_train``.
 
 from __future__ import annotations
 
@@ -199,11 +199,11 @@ class CakeMoEGroupedGemmDetFunction(torch.autograd.Function):
     ):
         if _launch is not None and _launch is not _DEFER_FWD:
             raise TypeError(
-                "CakeMoEGroupedGemmDetFunction.apply(x, w, offs) takes no fourth argument (an internal slot: omit it, "
-                "or pass None before fuse_wgrad_accumulation), got "
-                f"{_launch!r}: the deterministic package has no deterministic argument "
+                "CakeMoEGroupedGemmDetFunction.apply(x, w, offs) takes no fourth argument (an internal slot: "
+                "omit it, or pass None before fuse_wgrad_accumulation), got "
+                f"{_launch!r}: the deterministic module has no deterministic argument "
                 "(the non-deterministic autograd function is "
-                "flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train.CakeGroupedMm)"
+                "flashinfer.cake_moe_grouped_gemm_nondet_train.CakeMoEGroupedGemmNondetFunction)"
             )
         _require_flag(
             fuse_wgrad_accumulation,
@@ -346,8 +346,7 @@ def cake_moe_grouped_gemm_det(
     (passing one raises ``TypeError``) and
     ``torch.use_deterministic_algorithms(True)`` changes nothing (no alert, no
     warning).  The non-deterministic wrapper is
-    ``flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train.cake_grouped_mm(...,
-    deterministic=False)``.
+    ``flashinfer.cake_moe_grouped_gemm_nondet_train.cake_moe_grouped_gemm_nondet``.
     """
     _require_flag(
         fuse_wgrad_accumulation, "fuse_wgrad_accumulation", "cake_moe_grouped_gemm_det"
