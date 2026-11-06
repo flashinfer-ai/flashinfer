@@ -171,28 +171,22 @@ kernel_cake_mla_value_gate_00ca8bb1c760493fa672(__nv_bfloat16* latent, __nv_bflo
     unsigned int gate_words[2];
     int request_lengths[2];
     {
+        request_lengths[0] = *reinterpret_cast<const int*>(valid_lengths + requests[0]);
+    }
+    {
+        request_lengths[1] = *reinterpret_cast<const int*>(valid_lengths + requests[1]);
+    }
+    {
         uint32_t _scalar_bits_1;
         asm volatile("ld.global.cg.b32 %0, [%1];"
-            : "=r"(_scalar_bits_1) : "l"((const void*)(valid_lengths + (requests[0]))) : "memory");
-        request_lengths[0] = (int32_t)_scalar_bits_1;
+            : "=r"(_scalar_bits_1) : "l"((const void*)(reinterpret_cast<unsigned int*>(gate + (long long)read_rows[0] * (long long)gate_pitch) + (column >> 1))) : "memory");
+        gate_words[0] = (unsigned int)_scalar_bits_1;
     }
     {
         uint32_t _scalar_bits_2;
         asm volatile("ld.global.cg.b32 %0, [%1];"
-            : "=r"(_scalar_bits_2) : "l"((const void*)(valid_lengths + (requests[1]))) : "memory");
-        request_lengths[1] = (int32_t)_scalar_bits_2;
-    }
-    {
-        uint32_t _scalar_bits_3;
-        asm volatile("ld.global.cg.b32 %0, [%1];"
-            : "=r"(_scalar_bits_3) : "l"((const void*)(reinterpret_cast<unsigned int*>(gate + (long long)read_rows[0] * (long long)gate_pitch) + (column >> 1))) : "memory");
-        gate_words[0] = (unsigned int)_scalar_bits_3;
-    }
-    {
-        uint32_t _scalar_bits_4;
-        asm volatile("ld.global.cg.b32 %0, [%1];"
-            : "=r"(_scalar_bits_4) : "l"((const void*)(reinterpret_cast<unsigned int*>(gate + (long long)read_rows[1] * (long long)gate_pitch) + (column >> 1))) : "memory");
-        gate_words[1] = (unsigned int)_scalar_bits_4;
+            : "=r"(_scalar_bits_2) : "l"((const void*)(reinterpret_cast<unsigned int*>(gate + (long long)read_rows[1] * (long long)gate_pitch) + (column >> 1))) : "memory");
+        gate_words[1] = (unsigned int)_scalar_bits_2;
     }
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     asm volatile("cp.async.wait_group 0;");
@@ -232,42 +226,42 @@ kernel_cake_mla_value_gate_00ca8bb1c760493fa672(__nv_bfloat16* latent, __nv_bflo
     if (first_row + group < rows) {
         unsigned int word_0 = 0;
         if (request_lengths[0] > 0) {
-            float _add_5;
-            asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_5) : "f"(chains[0]), "f"(chains[4]));
-            float rounded = (float)(__nv_bfloat16)_add_5;
+            float _add_3;
+            asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_3) : "f"(chains[0]), "f"(chains[4]));
+            float rounded = (float)(__nv_bfloat16)_add_3;
             float exp_neg = approx_exp2(mul_f32_rn_noftz(__uint_as_float(gate_words[0] << 16), -1.442695f));
             float denominator;
             asm("add.rn.f32 %0, %1, %2;" : "=f"(denominator) : "f"(exp_neg), "f"(1.0f));
             float estimate = approx_rcp(denominator);
             float error;
             asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(error) : "f"(denominator), "f"(estimate), "f"(-1.0f));
-            float _neg_6;
-            asm("neg.f32 %0, %1;" : "=f"(_neg_6) : "f"(error));
+            float _neg_4;
+            asm("neg.f32 %0, %1;" : "=f"(_neg_4) : "f"(error));
             float sigmoid;
-            asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(sigmoid) : "f"(estimate), "f"(_neg_6), "f"(estimate));
+            asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(sigmoid) : "f"(estimate), "f"(_neg_4), "f"(estimate));
             unsigned int exponent = __as_u32(denominator) + 25165824 & 2139095040;
             if (exponent <= 33554431) {
-                float _fdiv_7 = __fdiv_rn(1.0f, denominator);
-                sigmoid = _fdiv_7;
+                float _fdiv_5 = __fdiv_rn(1.0f, denominator);
+                sigmoid = _fdiv_5;
             }
             products[0] = mul_f32_rn_noftz(rounded, sigmoid);
-            float _add_8;
-            asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_8) : "f"(chains[1]), "f"(chains[5]));
-            float rounded_0 = (float)(__nv_bfloat16)_add_8;
+            float _add_6;
+            asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_6) : "f"(chains[1]), "f"(chains[5]));
+            float rounded_0 = (float)(__nv_bfloat16)_add_6;
             float exp_neg_0 = approx_exp2(mul_f32_rn_noftz(__uint_as_float(gate_words[0] & 4294901760u), -1.442695f));
             float denominator_0;
             asm("add.rn.f32 %0, %1, %2;" : "=f"(denominator_0) : "f"(exp_neg_0), "f"(1.0f));
             float estimate_0 = approx_rcp(denominator_0);
             float error_0;
             asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(error_0) : "f"(denominator_0), "f"(estimate_0), "f"(-1.0f));
-            float _neg_9;
-            asm("neg.f32 %0, %1;" : "=f"(_neg_9) : "f"(error_0));
+            float _neg_7;
+            asm("neg.f32 %0, %1;" : "=f"(_neg_7) : "f"(error_0));
             float sigmoid_0;
-            asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(sigmoid_0) : "f"(estimate_0), "f"(_neg_9), "f"(estimate_0));
+            asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(sigmoid_0) : "f"(estimate_0), "f"(_neg_7), "f"(estimate_0));
             unsigned int exponent_0 = __as_u32(denominator_0) + 25165824 & 2139095040;
             if (exponent_0 <= 33554431) {
-                float _fdiv_10 = __fdiv_rn(1.0f, denominator_0);
-                sigmoid_0 = _fdiv_10;
+                float _fdiv_8 = __fdiv_rn(1.0f, denominator_0);
+                sigmoid_0 = _fdiv_8;
             }
             products[1] = mul_f32_rn_noftz(rounded_0, sigmoid_0);
             word_0 = __as_u32(__float22bfloat162_rn(make_float2(products[0], products[1])));
@@ -277,42 +271,42 @@ kernel_cake_mla_value_gate_00ca8bb1c760493fa672(__nv_bfloat16* latent, __nv_bflo
     if (first_row + group + 8 < rows) {
         unsigned int word_1 = 0;
         if (request_lengths[1] > 0) {
-            float _add_11;
-            asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_11) : "f"(chains[2]), "f"(chains[6]));
-            float rounded_1 = (float)(__nv_bfloat16)_add_11;
+            float _add_9;
+            asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_9) : "f"(chains[2]), "f"(chains[6]));
+            float rounded_1 = (float)(__nv_bfloat16)_add_9;
             float exp_neg_1 = approx_exp2(mul_f32_rn_noftz(__uint_as_float(gate_words[1] << 16), -1.442695f));
             float denominator_1;
             asm("add.rn.f32 %0, %1, %2;" : "=f"(denominator_1) : "f"(exp_neg_1), "f"(1.0f));
             float estimate_1 = approx_rcp(denominator_1);
             float error_1;
             asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(error_1) : "f"(denominator_1), "f"(estimate_1), "f"(-1.0f));
-            float _neg_12;
-            asm("neg.f32 %0, %1;" : "=f"(_neg_12) : "f"(error_1));
+            float _neg_10;
+            asm("neg.f32 %0, %1;" : "=f"(_neg_10) : "f"(error_1));
             float sigmoid_1;
-            asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(sigmoid_1) : "f"(estimate_1), "f"(_neg_12), "f"(estimate_1));
+            asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(sigmoid_1) : "f"(estimate_1), "f"(_neg_10), "f"(estimate_1));
             unsigned int exponent_1 = __as_u32(denominator_1) + 25165824 & 2139095040;
             if (exponent_1 <= 33554431) {
-                float _fdiv_13 = __fdiv_rn(1.0f, denominator_1);
-                sigmoid_1 = _fdiv_13;
+                float _fdiv_11 = __fdiv_rn(1.0f, denominator_1);
+                sigmoid_1 = _fdiv_11;
             }
             products[0] = mul_f32_rn_noftz(rounded_1, sigmoid_1);
-            float _add_14;
-            asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_14) : "f"(chains[3]), "f"(chains[7]));
-            float rounded_1_1 = (float)(__nv_bfloat16)_add_14;
+            float _add_12;
+            asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_12) : "f"(chains[3]), "f"(chains[7]));
+            float rounded_1_1 = (float)(__nv_bfloat16)_add_12;
             float exp_neg_1_1 = approx_exp2(mul_f32_rn_noftz(__uint_as_float(gate_words[1] & 4294901760u), -1.442695f));
             float denominator_1_1;
             asm("add.rn.f32 %0, %1, %2;" : "=f"(denominator_1_1) : "f"(exp_neg_1_1), "f"(1.0f));
             float estimate_1_1 = approx_rcp(denominator_1_1);
             float error_1_1;
             asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(error_1_1) : "f"(denominator_1_1), "f"(estimate_1_1), "f"(-1.0f));
-            float _neg_15;
-            asm("neg.f32 %0, %1;" : "=f"(_neg_15) : "f"(error_1_1));
+            float _neg_13;
+            asm("neg.f32 %0, %1;" : "=f"(_neg_13) : "f"(error_1_1));
             float sigmoid_1_1;
-            asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(sigmoid_1_1) : "f"(estimate_1_1), "f"(_neg_15), "f"(estimate_1_1));
+            asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(sigmoid_1_1) : "f"(estimate_1_1), "f"(_neg_13), "f"(estimate_1_1));
             unsigned int exponent_1_1 = __as_u32(denominator_1_1) + 25165824 & 2139095040;
             if (exponent_1_1 <= 33554431) {
-                float _fdiv_16 = __fdiv_rn(1.0f, denominator_1_1);
-                sigmoid_1_1 = _fdiv_16;
+                float _fdiv_14 = __fdiv_rn(1.0f, denominator_1_1);
+                sigmoid_1_1 = _fdiv_14;
             }
             products[1] = mul_f32_rn_noftz(rounded_1_1, sigmoid_1_1);
             word_1 = __as_u32(__float22bfloat162_rn(make_float2(products[0], products[1])));

@@ -554,6 +554,25 @@ _ARG_PLANS: dict[str, list[list[str]]] = {
         ["grid", "grid_y"],
         ["grid", "grid_z"],
     ],
+    "gemm_dw_cast_dcnt_lc": [
+        ["tma_buffer", "A"],
+        ["tma_buffer", "B"],
+        ["buffer", "C"],
+        ["buffer", "STATS_OUT"],
+        ["parameter", "M"],
+        ["parameter", "m_tiles"],
+        ["parameter", "k_iters"],
+        ["parameter", "first_chunk"],
+        ["buffer", "WS"],
+        ["parameter", "ldc"],
+        ["parameter", "group_m"],
+        ["parameter", "group_n"],
+        ["buffer", "CNT"],
+        ["buffer", "CNT_NEXT"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
     "gemm_dw_cast_dcnt_tma": [
         ["tma_buffer", "A"],
         ["tma_buffer", "B"],
@@ -1054,6 +1073,14 @@ _REGISTRY: dict[str, dict[str, Any]] = {
                 1,
                 1,
             ],
+            "gemm_dw_acc_lc_dcnt": [
+                "a67940a5db46a847e634",
+                "gemm_dw_cast_dcnt_lc",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512))*4",
+                1,
+                1,
+            ],
             "gemm_dw_acc_gn": [
                 "a3564016593b7189015e",
                 "gemm_logits",
@@ -1065,6 +1092,14 @@ _REGISTRY: dict[str, dict[str, Any]] = {
             "gemm_dw_acc_gn_dcnt": [
                 "3df26065748c1e0839f4",
                 "gemm_dw_dcnt",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512))*4",
+                1,
+                1,
+            ],
+            "gemm_dw_acc_gn_lc_dcnt": [
+                "a76b523c0c39085875cb",
+                "gemm_dw_cast_dcnt_lc",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//512))*4",
                 1,
@@ -1086,6 +1121,14 @@ _REGISTRY: dict[str, dict[str, Any]] = {
                 1,
                 1,
             ],
+            "gemm_dw_cast_bf16_lc_dcnt": [
+                "2408401cfc1a9f7a022b",
+                "gemm_dw_cast_dcnt",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512))*4",
+                1,
+                1,
+            ],
             "gemm_dw_cast_bf16_tma": [
                 "09ef1e4bd18f200203e8",
                 "gemm_dx_2",
@@ -1096,6 +1139,14 @@ _REGISTRY: dict[str, dict[str, Any]] = {
             ],
             "gemm_dw_cast_bf16_tma_dcnt": [
                 "b1e91ee98fdb0aa397ff",
+                "gemm_dw_cast_dcnt_tma",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512))*4",
+                1,
+                1,
+            ],
+            "gemm_dw_cast_bf16_tma_lc_dcnt": [
+                "3a49c4ed930a1853c79d",
                 "gemm_dw_cast_dcnt_tma",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//512))*4",
@@ -1563,6 +1614,14 @@ _REGISTRY: dict[str, dict[str, Any]] = {
                 1,
                 1,
             ],
+            "gemm_dw_acc_lc_dcnt": [
+                "a67940a5db46a847e634",
+                "gemm_dw_cast_dcnt_lc",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512))*4",
+                1,
+                1,
+            ],
             "gemm_dw_acc_gn": [
                 "a3564016593b7189015e",
                 "gemm_logits",
@@ -1574,6 +1633,14 @@ _REGISTRY: dict[str, dict[str, Any]] = {
             "gemm_dw_acc_gn_dcnt": [
                 "3df26065748c1e0839f4",
                 "gemm_dw_dcnt",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512))*4",
+                1,
+                1,
+            ],
+            "gemm_dw_acc_gn_lc_dcnt": [
+                "a76b523c0c39085875cb",
+                "gemm_dw_cast_dcnt_lc",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//512))*4",
                 1,
@@ -1595,6 +1662,14 @@ _REGISTRY: dict[str, dict[str, Any]] = {
                 1,
                 1,
             ],
+            "gemm_dw_cast_bf16_lc_dcnt": [
+                "2408401cfc1a9f7a022b",
+                "gemm_dw_cast_dcnt",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512))*4",
+                1,
+                1,
+            ],
             "gemm_dw_cast_bf16_tma": [
                 "09ef1e4bd18f200203e8",
                 "gemm_dx_2",
@@ -1605,6 +1680,14 @@ _REGISTRY: dict[str, dict[str, Any]] = {
             ],
             "gemm_dw_cast_bf16_tma_dcnt": [
                 "b1e91ee98fdb0aa397ff",
+                "gemm_dw_cast_dcnt_tma",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512))*4",
+                1,
+                1,
+            ],
+            "gemm_dw_cast_bf16_tma_lc_dcnt": [
+                "3a49c4ed930a1853c79d",
                 "gemm_dw_cast_dcnt_tma",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//512))*4",
@@ -2454,11 +2537,15 @@ STAGES = (
     "gemm_dw_acc",
     "gemm_dw_acc_gn",
     "gemm_dw_acc_dcnt",
+    "gemm_dw_acc_lc_dcnt",
     "gemm_dw_acc_gn_dcnt",
+    "gemm_dw_acc_gn_lc_dcnt",
     "gemm_dw_cast_bf16",
     "gemm_dw_cast_bf16_dcnt",
+    "gemm_dw_cast_bf16_lc_dcnt",
     "gemm_dw_cast_bf16_tma",
     "gemm_dw_cast_bf16_tma_dcnt",
+    "gemm_dw_cast_bf16_tma_lc_dcnt",
     "gemm_dw_cast_f32",
     "gemm_dw_cast_f32_gn",
     "scale_cast_bf16",
@@ -2483,7 +2570,11 @@ STAGES = (
 # ``_dcnt`` the form bounded by the device count of the chunk's live rows (the
 # log-probability backward's zero-gradient row skip: the dz arm, the K-sliced dX
 # reductions but the swapped tile, the weight-gradient accumulate and bf16 fused
-# cast, the latter's TMA form too; ``cake_backend.DCNT_BASES``), ``_tau`` the temperature form of the
+# cast, the latter's TMA form too; ``cake_backend.DCNT_BASES``), ``_lc`` (before ``_dcnt``) the cast at
+# the last live chunk of those counted weight-gradient forms (the accumulate, plain and blocked raster, reads
+# the next chunk's count cell and casts when it is zero; the deferred cast, both stores, then writes nothing:
+# ``cake_backend.DW_LIVE_CAST_BASES``, the log-probability backward's eager skip path only; sm_100a and
+# sm_103a), ``_tau`` the temperature form of the
 # log-probability entry's logits GEMM arms, of the device-count logits GEMM with
 # the statistics and of ``row_finalize`` (a per-token FP32 temperature operand;
 # selected by the call's ``temperature``, not by a rule; ``row_finalize_tau`` is a

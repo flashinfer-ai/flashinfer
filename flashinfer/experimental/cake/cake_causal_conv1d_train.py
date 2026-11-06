@@ -81,8 +81,7 @@ so ``dx`` is still bitwise the deterministic one and ``dweight`` / ``dbias``
 keep their budgets; the workspace size does not depend on it (one
 accumulator set and one counter per channel tile, whatever the grid).
 
-Name map (the deterministic names and their compatibility aliases are
-unchanged and always deterministic)::
+Name map (the deterministic names are unchanged and always deterministic)::
 
     deterministic package (unchanged)                    this module (deterministic=...)
     flashinfer.cake_causal_conv1d_det_train.             flashinfer.experimental.cake.cake_causal_conv1d_train.
@@ -98,13 +97,13 @@ unchanged and always deterministic)::
       cake_causal_conv1d_det_multi_kcp                     cake_causal_conv1d_multi_kcp
       RecomputeHandleDetKcp                                RecomputeHandleKcp
 
-The legacy module ``flashinfer.cake_causal_conv1d_train`` and the legacy names
-``flashinfer.cake_causal_conv1d``, ``flashinfer.cake_causal_conv1d_train_forward``
-/ ``_backward``, ``flashinfer.CakeCausalConv1dFunction`` and
+The deterministic package's names before the det rename (the module
+``flashinfer.cake_causal_conv1d_train``, ``flashinfer.cake_causal_conv1d``,
+``flashinfer.cake_causal_conv1d_train_forward`` / ``_backward``,
+``flashinfer.CakeCausalConv1dFunction`` and
 ``flashinfer.cake_causal_conv1d_det_train.cake_causal_conv1d_kcp`` /
-``cake_causal_conv1d_kcp_multi`` / ``KcpRecomputeHandle`` remain aliases of the
-deterministic objects; this module is the explicit namespace of the selectable
-mode.
+``cake_causal_conv1d_kcp_multi`` / ``KcpRecomputeHandle``) are removed; this
+module is the explicit namespace of the selectable mode.
 
 Usage::
 

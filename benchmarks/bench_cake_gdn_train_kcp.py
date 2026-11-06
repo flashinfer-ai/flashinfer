@@ -15,7 +15,7 @@ limitations under the License.
 
 Benchmark of the context-parallel (KCP) Cake packed GDN training step on both numerical routes: one process per
 rank (``torchrun --nproc_per_node N``), every rank timing the module boundary of its fragments -- the KCP causal
-convolution (``flashinfer.cake_causal_conv1d_train.cake_causal_conv1d_kcp``, 10,240 channels; ``--no-conv`` leaves
+convolution (``flashinfer.cake_causal_conv1d_det_train_kcp.cake_causal_conv1d_det_kcp``, 10,240 channels; ``--no-conv`` leaves
 it out) followed by the KCP GDN step -- with CUDA events, the slowest rank's time counting for the iteration.
 
 Arms (``--arms``; every one on the same packed batch, the same partition and the same input storage):
@@ -128,7 +128,7 @@ if (
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import flashinfer  # noqa: E402
-from flashinfer import cake_causal_conv1d_train as conv_api  # noqa: E402
+from flashinfer import cake_causal_conv1d_det_train_kcp as conv_api  # noqa: E402
 
 BASE_ARMS = ("det", "nondet")
 # CUDA-graph replay arms: the route each one runs
@@ -280,6 +280,8 @@ class Route:
             self._comm = self.api.gdn_comm_bytes_kcp
             self.handle_name = "RecomputeHandleKcp"
             self.workspace_name = "WorkspaceKcp"
+        # the host module of the route's package: its ``LAST_CALL`` records and ``graph_cache_clear`` live there
+        self.kcp = importlib.import_module(f"{self.pkg.__name__}.cake_kcp")
 
     def partition(
         self, cu: torch.Tensor, world: int, layout: str, cut_points: Any
@@ -341,9 +343,7 @@ class Route:
 
     def graph_cache_clear(self) -> None:
         """Release this route's captured graphs (before the next configuration and the process group's end)."""
-        fn = getattr(self.pkg, "graph_cache_clear", None) or getattr(
-            getattr(self.pkg, "cake_kcp", None), "graph_cache_clear", None
-        )
+        fn = getattr(self.kcp, "graph_cache_clear", None)
         if fn is not None:
             fn()
 
@@ -373,20 +373,19 @@ class Route:
         }
 
     def modules(self) -> dict[str, Any]:
-        kcp = getattr(self.pkg, "cake_kcp", None)
         return {
             "facade": self.api.__name__,
             "facade_file": self.api.__file__,
             "package": self.pkg.__name__,
             "package_file": self.pkg.__file__,
-            "cake_kcp_file": getattr(kcp, "__file__", None),
+            "cake_kcp_file": self.kcp.__file__,
         }
 
     def clear_last_call(self) -> None:
-        self.pkg.LAST_CALL.clear()
+        self.kcp.LAST_CALL.clear()
 
     def last_call(self, kind: str) -> Optional[dict[str, Any]]:
-        rec = self.pkg.LAST_CALL.get(kind)
+        rec = self.kcp.LAST_CALL.get(kind)
         if not rec:
             return None
         out = {
@@ -695,7 +694,7 @@ def _forward_fn(
     options: Any,
     workspace: Any = None,
 ) -> Callable[..., tuple]:
-    conv = conv_api.cake_causal_conv1d_kcp
+    conv = conv_api.cake_causal_conv1d_det_kcp
 
     def forward(q, k, v, g, beta, x, w, handle=None):
         hk = {} if handle is None else {"recompute_handle": handle}
@@ -786,7 +785,7 @@ def _probe(
     torch.cuda.synchronize(device)
     mem["after_bytes"] = torch.cuda.memory_allocated(device) - base
     mem["step_peak_bytes"] = max(mem["fwd_peak_bytes"], mem.get("bwd_peak_bytes", 0))
-    ran = sorted(kind for kind, route in routes.items() if route.pkg.LAST_CALL)
+    ran = sorted(kind for kind, route in routes.items() if route.kcp.LAST_CALL)
     if sota:
         made = {key: lib.calls[key] - before[key] for key in lib.calls}
         need = (SOTA_GDN_CALL[arm],) + (("conv",) if len(grads_out) == 2 else ())
