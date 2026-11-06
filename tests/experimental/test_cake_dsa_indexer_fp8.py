@@ -230,7 +230,11 @@ def test_fp8_record_replaces_only_its_fields_and_leaves_the_bf16_record():
     assert {
         arch: {f: v for f, v in fields.items() if f != "static_scan_kinds"}
         for arch, fields in cake_jit.POLICY_FP8.items()
-    } == {"sm_100a": {}, "sm_103a": {}, "sm_107a": {"split_fit_rule": None}}
+    } == {
+        "sm_100a": {"wide_wave_rule": [1.7, 1.3, 84.0]},
+        "sm_103a": {},
+        "sm_107a": {"split_fit_rule": None},
+    }
     # the FP8 record never inherits the BF16 programs' static kinds, and takes only record fields
     with pytest.raises(ValueError, match="static_scan_kinds"):
         fp8_policy_record(cake_jit.POLICY["sm_107a"], {})

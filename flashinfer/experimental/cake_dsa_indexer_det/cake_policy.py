@@ -27,7 +27,10 @@ the record.  It depends on nothing but the standard library so that the
 generated-program export can run the very same code against the kernel's own
 dispatch functions before a record is frozen (a disagreement fails the export,
 never the user).  A record may give the wide program precedence over the
-three-warpgroup rule from ``wide_first_rule[0]`` mean unit tiles on, the
+three-warpgroup rule from ``wide_first_rule[0]`` mean unit tiles on, or
+replace both wide rules by ``wide_wave_rule``, which compares the waves of the
+persistent grid the wide unit needs with those of the unit the other rules
+leave (``unit_block_q_for``), the
 CTA pair serves the unit geometries of ``pair_units`` only and the key-range
 split those of ``split_units`` only (the units whose split program the
 architecture registers).  ``l6_solo_rule`` may prefer the three-warpgroup unit
@@ -84,6 +87,7 @@ POLICY_FIELDS = (
     "l6_rule",  # [max mean unit tiles, min top_k] of the three-warpgroup program, or None
     "wide_rule",  # [min wide rounds per CTA, min rounds x mean unit tiles] of the wide program
     "wide_first_rule",  # [min mean unit tiles] from which a wide-eligible call takes the wide program before the three-warpgroup rule, or None (the three-warpgroup rule first)
+    "wide_wave_rule",  # [min narrow / wide wave ratio, min l6 / wide wave ratio, min mean unit tiles against l6] replacing wide_rule and wide_first_rule, or None; see unit_block_q_for
     "split_max",  # most key-range splits per unit
     "split_min_range_tiles",  # a split's key range is at least this many tiles
     "split_wave_rule",  # [min mean unit tiles, min CTA-efficiency gain] for a two-way split, or None
@@ -304,6 +308,7 @@ _OPTIONAL_RULE = (
     "cand_mult_rule_unsampled",
     "l6_rule",
     "wide_first_rule",
+    "wide_wave_rule",
     "split_wave_rule",
     "split_wave_scope",
     "split_fit_rule",
@@ -354,6 +359,7 @@ class DispatchPolicy:
     l6_rule: Optional[list]
     wide_rule: list
     wide_first_rule: Optional[list]
+    wide_wave_rule: Optional[list]
     split_max: int
     split_min_range_tiles: int
     split_wave_rule: Optional[list]
@@ -456,6 +462,13 @@ class DispatchPolicy:
         ):
             raise ValueError(
                 f"policy['wide_first_rule'] must be [min mean unit tiles] or None, got {first!r}"
+            )
+        waves = raw["wide_wave_rule"]
+        if waves is not None and (
+            len(waves) != 3 or not all(_is_number(v) and v >= 0 for v in waves)
+        ):
+            raise ValueError(
+                f"policy['wide_wave_rule'] must be [min narrow / wide wave ratio, min l6 / wide wave ratio, min mean unit tiles] or None, got {waves!r}"
             )
         pair_units = raw["pair_units"]
         if (
@@ -896,13 +909,28 @@ class DispatchPolicy:
         units_wide = -(-int(num_queries) // self.block_q_wide)
         rounds = units_wide / max(1, int(grid))
         mean_tiles = self.mean_unit_tiles(num_queries, num_keys, num_segments, ratio)
+        l6 = self.l6_rule
+        three_wg = l6 is not None and mean_tiles <= l6[0] and int(top_k) >= int(l6[1])
+        waves = self.wide_wave_rule
+        if waves is not None:
+            # the unit the other rules leave (three-warpgroup or narrow) against the wide unit, in waves of the
+            # persistent grid: the wide unit when the other unit needs at least the record's ratio of the wide
+            # unit's waves (against the three-warpgroup unit also from a mean unit tile count on)
+            other = self.block_q_l6 if three_wg else self.block_q_narrow
+            ctas = max(1, int(grid))
+            waves_wide = -(-units_wide // ctas)
+            waves_other = -(-(-(-int(num_queries) // other)) // ctas)
+            if three_wg:
+                wide = waves_other >= waves[1] * waves_wide and mean_tiles >= waves[2]
+            else:
+                wide = waves_other >= waves[0] * waves_wide
+            return self.block_q_wide if wide else other
         min_rounds, min_work = self.wide_rule
         wide = rounds >= min_rounds and rounds * mean_tiles >= min_work
         first = self.wide_first_rule
         if wide and first is not None and mean_tiles >= first[0]:
             return self.block_q_wide
-        l6 = self.l6_rule
-        if l6 is not None and mean_tiles <= l6[0] and int(top_k) >= int(l6[1]):
+        if three_wg:
             return self.block_q_l6
         return self.block_q_wide if wide else self.block_q_narrow
 
