@@ -1,9 +1,10 @@
 """Peer-store epilogues of the low-M BF16 GEMMs on one GPU.
 
-``world_size`` local buffers stand in for the peers (unicast ``peer_ptrs``). Each
-buffer starts as zeros, the sentinel, and must end up holding the plain GEMM
-output, canonicalized, at the documented offset of the half the epoch selects,
-with every other byte untouched. Multicast needs several GPUs and is not covered.
+``world_size`` local buffers stand in for the peers (unicast ``peer_ptrs``). The
+destination range of each buffer starts as zeros, the sentinel, and must end up
+holding the plain GEMM output, canonicalized, at the documented offset of the half
+the epoch selects; every other byte holds a nonzero canary that must stay untouched,
+and so must ``out``. Multicast needs several GPUs and is not covered.
 """
 
 import pytest
@@ -23,18 +24,31 @@ def _require_splitk():
         pytest.skip("nvidia-cutlass-dsl is not available.")
 
 
-def _expected(ref, layout, rank, world_size, slot_bytes, epoch):
-    m, n = ref.shape
-    bits = ref.view(torch.int32)
-    bits = torch.where(bits == 0, torch.full_like(bits, 0x8000), bits)
+_CANARY = 0xA5
+
+
+def _destination(m, n, layout, rank, world_size, slot_bytes, epoch):
     if layout == "gather":
         offset = (epoch & 1) * world_size * slot_bytes + rank * m * n * 2
     else:
         offset = ((epoch & 1) * world_size + rank) * slot_bytes
-    expected = torch.zeros(
-        2 * world_size * slot_bytes, dtype=torch.uint8, device="cuda"
+    return slice(offset, offset + m * n * 2)
+
+
+def _fill_canaries(buffers, destination):
+    """Canaries everywhere, the zero sentinel in the destination range."""
+    for buffer in buffers:
+        buffer.fill_(_CANARY)
+        buffer[destination].zero_()
+
+
+def _expected(ref, destination, world_size, slot_bytes):
+    bits = ref.view(torch.int32)
+    bits = torch.where(bits == 0, torch.full_like(bits, 0x8000), bits)
+    expected = torch.full(
+        (2 * world_size * slot_bytes,), _CANARY, dtype=torch.uint8, device="cuda"
     )
-    expected[offset : offset + m * n * 2] = bits.view(torch.uint8).flatten()
+    expected[destination] = bits.view(torch.uint8).flatten()
     return expected
 
 
@@ -84,12 +98,13 @@ def test_peer_store(m, n, k, kernel, layout, world_size):
     epoch = torch.zeros(1, dtype=torch.int32, device="cuda")
     for value in (0, 1, 6, 3):
         epoch.fill_(value)
-        for buffer in buffers:
-            buffer.zero_()
+        destination = _destination(m, n, layout, rank, world_size, slot_bytes, value)
+        _fill_canaries(buffers, destination)
+        out = torch.full_like(ref, 1)
         run(
             a,
             w.T,
-            torch.empty_like(ref),
+            out,
             tactic,
             peer_ptrs=[buffer.data_ptr() for buffer in buffers],
             epoch_ptr=epoch.data_ptr(),
@@ -98,7 +113,8 @@ def test_peer_store(m, n, k, kernel, layout, world_size):
             world_size=world_size,
             layout=layout,
         )
-        expected = _expected(ref, layout, rank, world_size, slot_bytes, value)
+        torch.testing.assert_close(out, torch.full_like(ref, 1), rtol=0, atol=0)
+        expected = _expected(ref, destination, world_size, slot_bytes)
         for buffer in buffers:
             torch.testing.assert_close(buffer, expected, rtol=0, atol=0)
 
@@ -129,10 +145,13 @@ def test_peer_store_partial_feature_tile(kernel):
         for _ in range(world_size)
     ]
     epoch = torch.zeros(1, dtype=torch.int32, device="cuda")
+    destination = _destination(m, n, "broadcast", rank, world_size, slot_bytes, 0)
+    _fill_canaries(buffers, destination)
+    out = torch.full_like(ref, 1)
     run(
         a,
         w.T,
-        torch.empty_like(ref),
+        out,
         tactic,
         peer_ptrs=[buffer.data_ptr() for buffer in buffers],
         epoch_ptr=epoch.data_ptr(),
@@ -140,7 +159,8 @@ def test_peer_store_partial_feature_tile(kernel):
         rank=rank,
         world_size=world_size,
     )
-    expected = _expected(ref, "broadcast", rank, world_size, slot_bytes, 0)
+    torch.testing.assert_close(out, torch.full_like(ref, 1), rtol=0, atol=0)
+    expected = _expected(ref, destination, world_size, slot_bytes)
     for buffer in buffers:
         torch.testing.assert_close(buffer, expected, rtol=0, atol=0)
 
@@ -192,6 +212,30 @@ def test_peer_store_rejects_bad_arguments():
         tgv.run_tgv_cute_ext(a3, b3, None, out3, True, 18, peer_store=config)
     with pytest.raises(ValueError, match="out"):
         tgv.run_tgv_cute_ext_peer_store(a, w.T, out[:, :8], 18, peer_ptrs=peers, **args)
+    # A config made for a smaller GEMM must not be reused for a larger one.
+    small = warp.make_lamport_peer_store_config(
+        peer_ptrs=peers,
+        multicast_ptr=None,
+        layout="broadcast",
+        m=m // 2,
+        n=n,
+        **{**args, "slot_bytes": m * n},
+    )
+    with pytest.raises(ValueError, match="slot_bytes"):
+        tgv.run_tgv_cute_ext(a, w.T, None, out, True, 18, peer_store=small)
+    # The epilogue stages a row-major output tile.
+    out_cm = torch.empty((n, m), device="cuda", dtype=torch.bfloat16).T
+    with pytest.raises(ValueError, match="row-major"):
+        tgv.run_tgv_cute_ext_peer_store(a, w.T, out_cm, 18, peer_ptrs=peers, **args)
+    with pytest.raises(ValueError, match="row-major"):
+        cluster.run_splitk_dense_peer_store(
+            a,
+            w.T,
+            out_cm,
+            cluster.default_tactic(m, n, k),
+            peer_ptrs=peers,
+            **args,
+        )
 
 
 if __name__ == "__main__":

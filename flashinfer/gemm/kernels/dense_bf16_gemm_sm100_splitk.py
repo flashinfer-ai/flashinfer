@@ -1286,6 +1286,9 @@ def run_splitk_dense_peer_store(
     validate_tactic(tactic, m, n, k, smem_capacity=smem_capacity)
     if a.dtype != _torch.bfloat16:
         raise ValueError("split-K peer store supports bfloat16 only")
+    # The epilogue stages the tile for a row-major output.
+    if not out.is_contiguous():
+        raise ValueError("split-K peer store needs a row-major out")
     # The peer-store epilogue stores 16 B chunks (8 features), predicated against N.
     if n % 8:
         raise ValueError(f"N={n} must be a multiple of 8")

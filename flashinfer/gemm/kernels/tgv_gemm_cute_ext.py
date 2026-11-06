@@ -1370,6 +1370,31 @@ def _resolve_tactic(tactic: int) -> Tuple[int, int, int, bool]:
     return _TGV_CUTE_EXT_TACTIC_CONFIGS[tactic]
 
 
+def _validate_peer_store_tensors(a, b, out) -> tuple[int, int]:
+    """Check the peer-store operands; return ``(M, N)``."""
+    # Peer-store addressing has no batch index.
+    if a.dim() != 2 or b.dim() != 2 or out.dim() != 2:
+        raise ValueError("TGV peer store accepts only 2D a, b and out")
+    m, k = a.shape
+    n = b.shape[1]
+    if b.shape[0] != k or out.shape != (m, n):
+        raise ValueError(
+            f"expected a [M, K], b [K, N] and out [M, N]; got {tuple(a.shape)}, "
+            f"{tuple(b.shape)} and {tuple(out.shape)}"
+        )
+    if any(t.dtype != torch.bfloat16 for t in (a, b, out)):
+        raise ValueError("TGV peer store supports bfloat16 only")
+    if a.device.type != "cuda" or b.device != a.device or out.device != a.device:
+        raise ValueError("a, b and out must be on the same CUDA device")
+    # The epilogue stages the tile for a row-major output.
+    if not out.is_contiguous():
+        raise ValueError("TGV peer store needs a row-major out")
+    # The peer-store epilogue stores 16 B chunks (8 features), predicated against N.
+    if n % 8:
+        raise ValueError(f"N={n} must be a multiple of 8")
+    return m, n
+
+
 def run_tgv_cute_ext(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -1387,8 +1412,15 @@ def run_tgv_cute_ext(
     """
     cta_m, cta_n, num_ab_stage, use_2cta = _resolve_tactic(tactic)
     has_bias = bias is not None
-    if peer_store is not None and (a.dim() != 2 or has_bias):
-        raise ValueError("peer_store needs 2D inputs and no bias")
+    if peer_store is not None:
+        if has_bias:
+            raise ValueError("peer_store needs no bias")
+        m, n = _validate_peer_store_tensors(a, b, out)
+        # A config made for a smaller GEMM must not write past its slot.
+        if m * n * 2 > peer_store.slot_bytes:
+            raise ValueError(
+                f"slot_bytes={peer_store.slot_bytes} is below {m * n * 2} for M={m}, N={n}"
+            )
     if tactic >= _TGV_CUTE_EXT_FIRST_SM107_TACTIC and not _is_sm107(a.device):
         raise ValueError(f"TGV cute_ext tactic {tactic} needs SM107 SMEM.")
 
@@ -1441,23 +1473,7 @@ def run_tgv_cute_ext_peer_store(
     layout: str = "broadcast",
 ) -> None:
     """``run_tgv_cute_ext`` (2D, no bias) storing into peer buffers (``LamportPeerStoreConfig``); ``out`` is not written."""
-    # Peer-store addressing has no batch index.
-    if a.dim() != 2 or b.dim() != 2 or out.dim() != 2:
-        raise ValueError("TGV peer store accepts only 2D a, b and out")
-    m, k = a.shape
-    n = b.shape[1]
-    if b.shape[0] != k or out.shape != (m, n):
-        raise ValueError(
-            f"expected a [M, K], b [K, N] and out [M, N]; got {tuple(a.shape)}, "
-            f"{tuple(b.shape)} and {tuple(out.shape)}"
-        )
-    if any(t.dtype != torch.bfloat16 for t in (a, b, out)):
-        raise ValueError("TGV peer store supports bfloat16 only")
-    if a.device.type != "cuda" or b.device != a.device or out.device != a.device:
-        raise ValueError("a, b and out must be on the same CUDA device")
-    # The peer-store epilogue stores 16 B chunks (8 features), predicated against N.
-    if n % 8:
-        raise ValueError(f"N={n} must be a multiple of 8")
+    m, n = _validate_peer_store_tensors(a, b, out)
     peer_store = make_lamport_peer_store_config(
         peer_ptrs=peer_ptrs,
         multicast_ptr=multicast_ptr,

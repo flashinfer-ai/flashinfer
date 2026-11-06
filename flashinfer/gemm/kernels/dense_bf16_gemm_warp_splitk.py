@@ -582,6 +582,7 @@ class LamportPeerStoreConfig:
 def make_lamport_peer_store_config(
     *, peer_ptrs, multicast_ptr, epoch_ptr, slot_bytes, rank, world_size, layout, m, n
 ) -> LamportPeerStoreConfig:
+    """Validate the destinations of an ``m`` x ``n`` peer-store GEMM; see ``LamportPeerStoreConfig``."""
     if (peer_ptrs is None) == (multicast_ptr is None):
         raise ValueError("pass exactly one of peer_ptrs and multicast_ptr")
     if layout not in ("broadcast", "gather"):
