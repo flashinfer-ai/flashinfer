@@ -7829,10 +7829,8 @@ def _heuristic_func_mm_mxfp8(
         return [c for c in order if c in suitable_backends]
     # don't select trtllm since it requires weight shuffling
     if "cutlass" in suitable_backends:
-        # CuTe-DSL and cuDNN follow CUTLASS so the autotuner ranks them while untuned
-        # calls keep CUTLASS.
-        extra = ["cute-dsl"] + (["cudnn"] if CUDNN_AVAILABLE else [])
-        return ["cutlass"] + [c for c in extra if c in suitable_backends]
+        # Untuned calls run CUTLASS; the autotuner also ranks CuTe-DSL and cuDNN.
+        return [c for c in ("cutlass", "cute-dsl", "cudnn") if c in suitable_backends]
     # fall back to cudnn (e.g. on SM12x when CUTLASS scale-layout
     # requirements are not met) when it is available.
     if CUDNN_AVAILABLE and "cudnn" in suitable_backends:

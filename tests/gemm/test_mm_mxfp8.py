@@ -1103,19 +1103,15 @@ def test_trtllm_raises_for_linear_b_descale():
 
 
 @pytest.mark.parametrize(
-    "suitable, cudnn_available, expected",
+    "suitable, expected",
     [
-        (["cutlass", "cute-dsl", "cudnn"], True, ["cutlass", "cute-dsl", "cudnn"]),
-        (["cutlass", "cute-dsl", "cudnn"], False, ["cutlass", "cute-dsl"]),
-        (["cutlass", "cudnn"], True, ["cutlass", "cudnn"]),
-        (["cudnn"], True, ["cudnn"]),
+        (["cudnn", "cute-dsl", "cutlass"], ["cutlass", "cute-dsl", "cudnn"]),
+        (["cutlass", "cute-dsl"], ["cutlass", "cute-dsl"]),
+        (["cutlass", "cudnn"], ["cutlass", "cudnn"]),
     ],
 )
-def test_mm_mxfp8_auto_ranks_cute_dsl_and_cudnn_after_cutlass(
-    monkeypatch, suitable, cudnn_available, expected
-):
+def test_mm_mxfp8_auto_ranks_cute_dsl_and_cudnn_after_cutlass(suitable, expected):
     """Untuned ``backend="auto"`` calls keep CUTLASS first; the autotuner also ranks the suitable CuTe-DSL and cuDNN backends."""
-    monkeypatch.setattr(gemm_base, "CUDNN_AVAILABLE", cudnn_available)
     a = torch.zeros(4, 128).to(torch.float8_e4m3fn)
     b = torch.zeros(128, 128).to(torch.float8_e4m3fn).t()
     sf = torch.zeros(512, dtype=torch.uint8)
