@@ -8,6 +8,14 @@
 
 SCCACHE_VERSION="0.18.0"
 
+# Trial only: FLASHINFER_SCCACHE_FLAVOR=rapids installs the rapidsai/sccache fork
+# release below instead of upstream, and appends "-rapids" to the S3 key prefix
+# (the fork hashes nvcc inputs differently, so its keys must not share upstream's).
+# The default (unset) is unchanged upstream behaviour.
+SCCACHE_RAPIDS_VERSION="0.18.0-rapids.8"
+SCCACHE_RAPIDS_SHA256_x86_64="6b479c4d4903c8f738f031d4a18f2937a1090827ed553b6bfd7beed0e9aeebeb"
+SCCACHE_RAPIDS_SHA256_aarch64="2994d493d18566af0d55dc4ebc678be6b6f91b6856d1c6837325c121da755b6d"
+
 # Compute MAX_JOBS and FLASHINFER_NVCC_THREADS from system memory/CPU,
 # clamping FLASHINFER_NVCC_THREADS to a sane range and budgeting per-job
 # memory to avoid OOMs on multi-arch builds.
@@ -337,6 +345,31 @@ install_released_sccache() {
   echo "sccache install duration: $((SECONDS - sccache_install_started_at)) seconds"
 }
 
+# Trial: install the pinned rapidsai/sccache release (checksum pinned in this
+# file, not fetched from the same origin as the tarball).
+install_rapids_sccache() {
+  local sccache_arch=$1
+  local ver="${SCCACHE_RAPIDS_VERSION}"
+  local sha_var="SCCACHE_RAPIDS_SHA256_${sccache_arch}"
+  local want_sha="${!sha_var:-}"
+  local archive="sccache-v${ver}-${sccache_arch}-unknown-linux-musl.tar.gz"
+  local url="https://github.com/rapidsai/sccache/releases/download/v${ver}/${archive}"
+  local tmpdir
+  if [ -z "${want_sha}" ]; then
+    echo "ERROR: no pinned rapids sccache checksum for ${sccache_arch}"
+    exit 1
+  fi
+  tmpdir=$(mktemp -d)
+  curl -fsSL "${url}" -o "${tmpdir}/${archive}"
+  printf '%s  %s\n' "${want_sha}" "${tmpdir}/${archive}" | sha256sum -c -
+  tar xzf "${tmpdir}/${archive}" -C "${tmpdir}"
+  mv "${tmpdir}/sccache-v${ver}-${sccache_arch}-unknown-linux-musl/sccache" /usr/local/bin/
+  rm -rf "${tmpdir}"
+  chmod +x /usr/local/bin/sccache
+  export FLASHINFER_SCCACHE_INSTALL_SOURCE="github-release-rapids"
+  export FLASHINFER_SCCACHE_REVISION="v${ver}"
+}
+
 # Install the official sccache release. v0.18.0 is the first release that
 # includes the CUDA 13.3+ nvcc dry-run parser fix required for CUDA 13.4:
 # https://github.com/mozilla/sccache/pull/2722
@@ -353,6 +386,10 @@ install_sccache() {
       ;;
   esac
 
+  if [ "${FLASHINFER_SCCACHE_FLAVOR:-}" = "rapids" ]; then
+    install_rapids_sccache "${sccache_arch}"
+    return
+  fi
   install_released_sccache "${sccache_version}" "${sccache_arch}"
   export FLASHINFER_SCCACHE_INSTALL_SOURCE="github-release"
   export FLASHINFER_SCCACHE_REVISION="v${sccache_version}"
@@ -378,7 +415,12 @@ setup_sccache() {
   unset FLASHINFER_CXX_LAUNCHER FLASHINFER_NVCC_LAUNCHER
   unset FLASHINFER_SCCACHE_ACTIVE FLASHINFER_SCCACHE_STATS_COLLECTED
   sccache_arch=$(uname -m)
-  if [ "$(sccache --version 2>/dev/null)" = "sccache ${SCCACHE_VERSION}" ]; then
+  local want_version="sccache ${SCCACHE_VERSION}"
+  if [ "${FLASHINFER_SCCACHE_FLAVOR:-}" = "rapids" ]; then
+    want_version="sccache ${SCCACHE_RAPIDS_VERSION}"
+    key_prefix="${key_prefix}-rapids"
+  fi
+  if [ "$(sccache --version 2>/dev/null)" = "${want_version}" ]; then
     # Already installed (e.g. by run_with_test_sccache.sh's fail-open probe).
     export FLASHINFER_SCCACHE_INSTALL_SOURCE="${FLASHINFER_SCCACHE_INSTALL_SOURCE:-preinstalled}"
     export FLASHINFER_SCCACHE_REVISION="${FLASHINFER_SCCACHE_REVISION:-v${SCCACHE_VERSION}}"

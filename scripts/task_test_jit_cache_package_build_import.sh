@@ -155,6 +155,11 @@ entry = next(item for item in config["jit_cache"] if item["label"] == cuda_label
 print(" ".join(entry[f"{cpu_architecture}_provider_architectures"]))
 PY
 )
+# Trial/debug only: restrict the build to a subset of provider architectures
+# (e.g. AOT_PROVIDER_ARCHS_OVERRIDE="8.0"). Unset in CI.
+if [ -n "${AOT_PROVIDER_ARCHS_OVERRIDE:-}" ]; then
+    PROVIDER_ARCHITECTURES="${AOT_PROVIDER_ARCHS_OVERRIDE}"
+fi
 read -ra PROVIDER_ARCHITECTURE_LIST <<< "${PROVIDER_ARCHITECTURES}"
 echo "Detected CUDA version: ${CUDA_LABEL}"
 echo "CPU architecture: ${CPU_ARCHITECTURE}"
