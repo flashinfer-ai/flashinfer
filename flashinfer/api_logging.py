@@ -804,7 +804,10 @@ def _stage_graph_tensor_plan(tensors, plan):
         for key, tensor in items:
             object_key = identities.setdefault(id(tensor), key)
             offset = tensor.storage_offset() - start
-            view = base.as_strided(tensor.shape, tensor.stride(), offset)
+            # as_strided takes an absolute offset, including a read-only base's start.
+            view = base.as_strided(
+                tensor.shape, tensor.stride(), base.storage_offset() + offset
+            )
             if copy:
                 view.copy_(tensor.detach())
             staged[key] = view
