@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import contextlib
+import importlib
 import importlib.util
 
 from .version import __version__ as __version__
@@ -169,19 +170,30 @@ _PRIMS_TS_LAZY_EXPORTS = frozenset(
     }
 )
 
+# Top-level names bound on first access instead of by ``import flashinfer``:
+# ``name -> (module, attribute)``.  ``module`` is resolved relative to this
+# package when it starts with ``.``; an ``attribute`` of ``None`` binds the
+# module itself.  Packages whose backend sits under ``flashinfer.experimental``
+# add their top-level names here, so that importing ``flashinfer`` does not
+# import the experimental tree.
+_LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
+    **{name: (".fused_moe", name) for name in sorted(_PRIMS_TS_LAZY_EXPORTS)},
+}
+
 
 def __getattr__(name: str):
-    if name not in _PRIMS_TS_LAZY_EXPORTS:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    from . import fused_moe as _fused_moe
-
-    value = getattr(_fused_moe, name)
+    try:
+        module_name, attribute = _LAZY_EXPORTS[name]
+    except KeyError:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
+    module = importlib.import_module(module_name, __name__)
+    value = module if attribute is None else getattr(module, attribute)
     globals()[name] = value
     return value
 
 
 def __dir__() -> list[str]:
-    return sorted(set(globals()) | _PRIMS_TS_LAZY_EXPORTS)
+    return sorted(set(globals()) | set(_LAZY_EXPORTS))
 
 
 # CuteDSL high-level APIs (conditionally if cute_dsl available)
