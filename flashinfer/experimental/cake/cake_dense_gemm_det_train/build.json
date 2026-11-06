@@ -6627,6 +6627,6 @@
       ]
     }
   ],
-  "package": "flashinfer.experimental.dense_projection_det_gemm",
+  "package": "flashinfer.experimental.cake.cake_dense_gemm_det_train",
   "schema": "cake-build/1"
 }

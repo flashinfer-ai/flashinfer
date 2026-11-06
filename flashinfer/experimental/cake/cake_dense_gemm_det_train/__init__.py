@@ -14,11 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-# Experimental Cake backend: the GLM-5.2 dense projection GEMMs for training
+# Cake backend: the GLM-5.2 dense projection GEMMs for training
 # (BF16 operands, FP32 accumulation, BF16 or FP32 output, strided views, ragged
 # token counts, batched head projections) and the FP32 router-gate GEMM through
 # split-BF16x3 tensor-core emulation, on SM100 / SM103 / SM107
-# (flashinfer-ai/flashinfer#5677).  Host planning, argument-plan binding, the
-# prepared allocation-free launches, the eager entry points, JIT registration
-# and the generated sources live in this package; there is no core entry point
-# yet (importing this package is the explicit opt-in).
+# (flashinfer-ai/flashinfer#5677), deterministic.  Host planning, argument-plan
+# binding, the prepared allocation-free launches, the eager entry points, JIT
+# registration and the generated sources live in this package; the public module
+# is flashinfer.cake_dense_gemm_det_train.
