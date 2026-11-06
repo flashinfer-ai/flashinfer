@@ -54,6 +54,15 @@ def prepare_mla_value_gate(
     uses no atomics and no split-K: results are bitwise reproducible and each row
     does not depend on ``B``.
 
+    An architecture may have two programs that differ only in the token rows one
+    CTA owns (16 or 8); they give identical bits, so the choice affects time
+    only.  For every ``B`` in ``[1, max_rows]`` prepare decides once which one a
+    launch of ``B`` rows runs: the 8-row program when ``enable_pdl`` is true or
+    when its grid of ``4 * H * ceil(B / 8)`` CTAs fits one wave (at most the
+    device's SM count; ``B <= 24`` at ``H = 12`` on B200, B300 and GB300), else
+    the 16-row program.  ``runner.program_for(B)`` and ``runner.tile_rows_for(B)``
+    report the choice.
+
     Parameters
     ----------
     w_uv : torch.Tensor
@@ -70,7 +79,8 @@ def prepare_mla_value_gate(
     rows_per_request : int
         ``q``: row ``t`` belongs to request ``t // q`` (``B % q == 0``).
     enable_pdl : bool
-        Launch with programmatic dependent launch.  The kernel then reads
+        Launch with programmatic dependent launch (and run the 8-row program
+        for every ``B``).  The kernel then reads
         ``w_uv`` before it waits on the preceding kernel of the stream, so that
         kernel must not write ``w_uv``; ``latent``, ``gate`` and
         ``valid_lengths`` are read and ``out`` is written only after the wait.
