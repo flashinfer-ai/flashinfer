@@ -276,7 +276,7 @@ others.  The phase comes from `torch._C._current_graph_task_id()`; a torch
 without it refuses the handle.
 
 One halo exchange for a layer's q / k / v convolutions:
-`cake_causal_conv1d_det_multi_kcp((xq, xk, xv), (wq, wk, wv), ctx)` returns the
+`cake_causal_conv1d_det_kcp_multi((xq, xk, xv), (wq, wk, wv), ctx)` returns the
 three outputs bitwise equal to three `cake_causal_conv1d_det_kcp` calls (outputs,
 `dx` and `dweight`), but its forward and its backward each issue one halo
 collective instead of three: the history rows of the three tensors travel side
@@ -287,7 +287,7 @@ the layer's `"kda"` entry, so the checkpointed layer above needs one handle:
 
 ```python
 def layer(xq, xk, xv, g, beta, h):
-    q, k, v = cake_causal_conv1d_det_multi_kcp((xq, xk, xv), (wq, wk, wv), ctx, recompute_handle=h)
+    q, k, v = cake_causal_conv1d_det_kcp_multi((xq, xk, xv), (wq, wk, wv), ctx, recompute_handle=h)
     ...
     return chunk_kda_det_kcp(q, k, v, g, beta, ctx, recompute_handle=h)
 

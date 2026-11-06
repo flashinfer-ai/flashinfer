@@ -146,7 +146,7 @@ def _device_arch(device: torch.device) -> str:
 
 
 def is_cake_causal_conv1d_det_train_supported(device: torch.device) -> bool:
-    """Whether ``device`` has the exported routes every architecture ships (``fwd`` and ``bwd``).
+    """Whether ``device`` has the exported routes every architecture ships (the forward and the backward).
 
     The optional routes (bias, BF16 taps / gradients, FP32 SiLU') are checked
     per call: a call that needs one the architecture lacks raises a
