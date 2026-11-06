@@ -791,9 +791,11 @@ def test_the_records_are_the_deterministic_records_under_this_packages_names() -
 def test_the_units_are_the_deterministic_units_under_this_packages_names(
     manifest: str,
 ) -> None:
-    """Every library of this package's manifest is the deterministic package's library of the same digits: the same
-    architecture, flags and entry, and sources whose text is the deterministic unit's with the deterministic prefix
-    renamed (file names, kernel symbols, binding namespaces); nothing else differs."""
+    """Every library of this package's manifest is the deterministic package's library of the same digits: every
+    field of the entry the same (architecture, gencode, minimum CUDA, flags, conditional flags, entry) but the name,
+    the path (the deterministic path renamed), the sources and their hashes; the sources' text is the deterministic
+    unit's with the deterministic prefix renamed (file names, kernel symbols, binding namespaces); nothing else
+    differs."""
     det_dir = Path(det_kcp_jit.__file__).resolve().parent
     path, det_path = PACKAGE_DIR / manifest, det_dir / manifest
     if not path.is_file() or not det_path.is_file():
@@ -805,8 +807,11 @@ def test_the_units_are_the_deterministic_units_under_this_packages_names(
     assert set(ours) == set(theirs), manifest
     for name, entry in ours.items():
         det_entry = theirs[name]
-        for key in ("arch", "entry", "nvcc_flags"):
-            assert entry.get(key) == det_entry.get(key), (name, key)
+        own = {"name", "path", "sources", "sha256", "closure_sha256"}
+        assert {k: v for k, v in entry.items() if k not in own} == {
+            k: v for k, v in det_entry.items() if k not in own
+        }, name
+        assert entry["path"] == _renamed(det_entry["path"]), name
         assert entry["sources"] == _renamed(det_entry["sources"]), name
         for source, det_source in zip(
             entry["sources"], det_entry["sources"], strict=True

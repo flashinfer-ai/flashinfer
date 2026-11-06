@@ -6255,8 +6255,10 @@ def test_forward_tapes_have_no_reader_outside_the_call(
     (one launch fewer); no launch of it but the pad-row writer binds the forward views' tapes (the offset walk's
     unused pointers aside), under the tape form only the tape walk and ``kcp_fwd_o`` do.  A backward launches no
     fused walk; it binds only its own views' tapes, and before its first tape walk only the pad-row writers and the
-    offset walk do.  The saved set holds no tape but the checkpoint hand-off's tape set and ``save_mode="tape"`` is
-    refused."""
+    offset walk do.  The checkpoint hand-off's saving forward (its tape set bound) keeps the tape form under both
+    knob values -- the tape walk and one ``kcp_fwd_o``, the tape form's launches -- whose launches bind the hand-off's
+    tensors, never the arena's forward rows of the tape set.  The saved set holds no tape but the checkpoint hand-off's
+    tape set and ``save_mode="tape"`` is refused."""
     monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
     arch, sm = "sm_103a", 152
     ctx, H = _tape_ctx(segmented, sm)
@@ -6330,6 +6332,13 @@ def test_forward_tapes_have_no_reader_outside_the_call(
         grads.update(part2=fin["part2"], ticket=fin["ticket"])
         fin_scratch["seg_cap"] = int(fin["seg_cap"])
 
+    # the checkpoint hand-off's tape set (cake_kcp._tape_alloc: the five tensors of SavedKcp._TAPE), apart from the
+    # arena's rows
+    handoff = {
+        n: torch.zeros(2, D) if n == "h" else torch.zeros(1)
+        for n in cake_kcp.SavedKcp._TAPE
+    }
+
     def drive(kind: str, fwd_o_fuse: int):
         opts = cake_kcp._options(
             {
@@ -6362,6 +6371,9 @@ def test_forward_tapes_have_no_reader_outside_the_call(
             cake_kcp._backward(call, saved)
         elif kind == "bwd_replay":
             cake_kcp._backward(call, None)
+        elif kind == "fwd_handoff":
+            # the checkpoint hand-off's saving forward: its tape set bound in place of the arena's rows
+            cake_kcp._forward(call, save=True, replay=False, tape=handoff)
         else:
             bound = (
                 {"S_in": torch.zeros(1), "c1_recv": torch.zeros(1)}
@@ -6467,6 +6479,34 @@ def test_forward_tapes_have_no_reader_outside_the_call(
             if fuse:  # the backward is the same under both knob values
                 ref, _ = drive(kind, 0)
                 assert form(res, {}) == form(ref, {}), kind
+    # A6: the checkpoint hand-off's forward keeps its tapes under both knob values (the backward reads them): the tape
+    # walk and one kcp_fwd_o, the tape form's launches; they bind the hand-off's tape set, and no launch binds the
+    # arena's forward rows of the tape set
+    res, call = drive("fwd_handoff", fuse)
+    assert call.fwd_walk == "kcp_fwdh_tape", fuse
+    assert call.scratch["checkpoint_handoff"] == "save"
+    walks = [record for src, record, _g, _v in res if src == "walk"]
+    assert "kcp_fwdh_tape" in walks and "kcp_fwdh_o" not in walks, walks
+    fwd_o = [record for src, record, _g, _v in res if record == "kcp_fwd_o"]
+    assert len(fwd_o) == 1, fwd_o
+    ref, _ = drive("fwd_save", 0)
+    assert form(res, {}) == form(ref, {}) and len(res) == len(ref)
+    handoff_tapes = {t.data_ptr(): n for n, t in handoff.items()}
+    rows = arena.views(fwd_layout)
+    arena_tapes = {
+        getattr(rows, n).data_ptr(): n
+        for n in cake_kcp.SavedKcp._TAPE
+        if hasattr(rows, n)
+    }
+    assert {"h", "v_new"} <= set(arena_tapes.values())
+    for entry in res:
+        assert not bound_tapes(entry, arena_tapes), (
+            entry[1],
+            bound_tapes(entry, arena_tapes),
+        )
+        if entry[1] in ("kcp_fwdh_tape", "kcp_fwd_o"):
+            hit = bound_tapes(entry, handoff_tapes)
+            assert {"h", "v_new"} <= hit, (entry[1], hit)
     # A5: the saved set holds no tape but the checkpoint hand-off's tape set (all five or none; the hand-off tests);
     # the tape save mode stays refused
     assert cake_kcp.SavedKcp._TAPE == ("h", "v_new", "w", "aqk_int", "akk_int")

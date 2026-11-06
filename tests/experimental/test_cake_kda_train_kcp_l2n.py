@@ -2281,8 +2281,8 @@ def test_l2n_refusal_is_rank_symmetric(W, layout) -> None:
 
 class _DriveCall(types.SimpleNamespace):
     """A call for the real :func:`cake_kcp._forward` / :func:`cake_kcp._backward`: its local stages run the kernel
-    backend's ``stage`` (the fake arena records their launches); every KCP walk, merge, collective and buffer method
-    is recorded by name in ``kcp`` and launches nothing."""
+    backend's ``stage`` (the fake arena records their launches); every KCP walk (with its program, ``walk:<program>``),
+    merge, collective and buffer method is recorded by name in ``kcp`` and launches nothing."""
 
     def __getattr__(self, name: str):
         if name.startswith("_"):
@@ -2292,6 +2292,9 @@ class _DriveCall(types.SimpleNamespace):
             self.kcp.append(name)
 
         return record
+
+    def walk(self, name: str, walk, **a) -> None:
+        self.kcp.append(f"walk:{name}")
 
     def fresh(self, name: str) -> torch.Tensor:
         self.kcp.append(f"fresh:{name}")
@@ -2540,12 +2543,14 @@ def test_l2n_local_stage_values_cover_the_records(
                 )
 
 
-def _drive_local(pkg: str, H: int, arch: str, sm: int, gate: str, mode: str, kind: str):
+def _drive_local(
+    pkg: str, H: int, arch: str, sm: int, gate: str, mode: str, kind: str, fuse: int
+):
     """The real drivers of a package (``pkg``: ``"nd"`` this one, ``"det"`` the deterministic one) on a CPU arena of
     its existing backend's plan of mode ``mode``, as :func:`test_l2n_local_stage_values_cover_the_records` drives
-    them: ``(launches, kcp)``, ``launches`` the ``(source, record, grid)`` of every local launch in order
-    (``"backend"``: a record of the existing backend on the arena, ``"kcp"``: a KCP-owned record) and ``kcp`` the KCP
-    walk / merge / collective / buffer sequence."""
+    them (``fuse``: the ``fwd_o_fuse`` knob, 1 shipped): ``(launches, kcp)``, ``launches`` the ``(source, record,
+    grid)`` of every local launch in order (``"backend"``: a record of the existing backend on the arena, ``"kcp"``: a
+    KCP-owned record) and ``kcp`` the KCP walk (with its program) / merge / collective / buffer sequence."""
     if pkg == "nd":
         kcp, plan_mod, backend_mod, ctx = (
             cake_kcp,
@@ -2634,7 +2639,7 @@ def _drive_local(pkg: str, H: int, arch: str, sm: int, gate: str, mode: str, kin
         local_values=None, out=None if backward else torch.zeros(1), grads=grads if backward else None,
         device=cpu, opts=opts, gate=gate, l2n=mode != "off", l2n_mode=mode, l2n_values=None,
         backend=backend, schedule=str(opts.schedule), exchange="a2a", merge_fuse=str(opts.merge_fuse),
-        saved_carry=int(opts.saved_carry), bufs={}, kcp=[],
+        saved_carry=int(opts.saved_carry), fwd_o_fuse=fuse, bufs={}, kcp=[],
     )  # fmt: skip
     backend.begin_call(call)
     if call.l2n:
@@ -2658,8 +2663,9 @@ def _drive_local(pkg: str, H: int, arch: str, sm: int, gate: str, mode: str, kin
     LOCAL_RECORD_CASES,
     ids=[f"h{h}-{a}-{s}" for h, a, s in LOCAL_RECORD_CASES],
 )
+@pytest.mark.parametrize("fuse", (1, 0), ids=("fwd_o_fuse1", "fwd_o_fuse0"))
 def test_l2n_local_launches_are_the_deterministic_packages(
-    H, arch, sm, gate, form, kind
+    H, arch, sm, gate, form, kind, fuse
 ) -> None:
     """The real drivers of both packages (:func:`_drive_local`) on the same partition in the mode: this package
     launches, in the same order and with the same grids, the deterministic package's local programs (each record a
@@ -2667,15 +2673,22 @@ def test_l2n_local_launches_are_the_deterministic_packages(
     KCP-owned records, with the same KCP walk / merge / collective sequence; among them the mode's own records (the
     ``_l2n`` twins, the fallback form's programs, the ``dqkg`` records of the mode).  Flag off, the two packages'
     launches differ where this package ships its own programs (reported by the single-rank tests): the comparison
-    is the mode's."""
+    is the mode's.  ``fuse``: the ``fwd_o_fuse`` knob (1 shipped): a forward that keeps no tape walks ``kcp_fwdh_o`` in
+    both packages and launches no ``kcp_fwd_o``; under 0 (and in the replay forward) the tape walk and ``kcp_fwd_o``."""
     missing = cake_kcp_plan.qk_l2norm_missing(form, gate, arch)
     if missing is not None:
         pytest.skip(
             f"use_qk_l2norm_in_kernel=True ({form}) cannot run on the KCP route yet: {missing}"
         )
     assert det_kcp_plan.qk_l2norm_missing(form, gate, arch) is None
-    mine, kcp_mine = _drive_local("nd", H, arch, sm, gate, form, kind)
-    det, kcp_det = _drive_local("det", H, arch, sm, gate, form, kind)
+    mine, kcp_mine = _drive_local("nd", H, arch, sm, gate, form, kind, fuse)
+    det, kcp_det = _drive_local("det", H, arch, sm, gate, form, kind, fuse)
+    # the walk programs (kcp: walk:<program>): the fused walk only in a forward under the shipped knob value
+    fused = fuse == 1 and kind.startswith("fwd")
+    assert ("walk:kcp_fwdh_o" in kcp_mine) == fused, (kind, kcp_mine)
+    assert ("walk:kcp_fwdh_tape" in kcp_mine) == (not fused), (kind, kcp_mine)
+    fwd_o = [r for s, r, _g in mine if s == "kcp" and r == "kcp_fwd_o"]
+    assert len(fwd_o) == int(kind.startswith("fwd") and fuse == 0), (kind, fwd_o)
 
     def key(jit, launch):
         src, record, grid = launch
