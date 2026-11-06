@@ -285,6 +285,20 @@ def test_mxfp8_clamped_relu2_moe(clamp_limit, tactic, swap_ab):
     )
 
 
+def test_mxfp8_clamped_relu2_huge_limit_is_relu2():
+    """A limit whose square overflows fp32 acts as plain ReLU^2, without NaN."""
+    num_tokens, hidden, inter, num_experts, top_k = 33, 896, 1152, 16, 4
+    x, w1, w2, topk_ids, topk_w = _make_case(
+        num_tokens, hidden, inter, num_experts, top_k
+    )
+    out = _run_kernel(
+        x, w1, w2, topk_ids, topk_w, num_experts, clamp_limit=1e20
+    ).float()
+    assert torch.isfinite(out).all()
+    ref_q = _reference(x, w1, w2, topk_ids, topk_w, quantized=True)
+    torch.testing.assert_close(out, ref_q, rtol=5e-2, atol=5e-2 * ref_q.abs().max())
+
+
 @pytest.mark.parametrize("swap_ab", [False, True])
 def test_mxfp8_clamped_relu2_limit_is_read_at_runtime(swap_ab):
     """Different limit values reuse one compiled GEMM1 kernel.

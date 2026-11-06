@@ -998,8 +998,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         # Setup sfc tensor by filling C tensor to scale factor atom layout
         self.generate_sfc = sfc_tensor is not None
         # Fold ClampedRelu2's L ** 2 into the output scales to avoid per-element
-        # multiplies by L. Assumes L ** 2 and alpha / L stay normal in fp32,
-        # which holds for any practical clamp limit. A custom epilogue_op must
+        # multiplies by L. The kernel caps the folded L at 2 ** 32 so L ** 2
+        # stays finite in fp32. A custom epilogue_op must
         # see the full activation, not act / L ** 2, so it disables the fold.
         # pre_fc2_routing quantizes with its own per-expert scale to match its
         # reference bit for bit, so it keeps the unfolded form.
@@ -2713,6 +2713,11 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             # the reciprocal is computed once here, not per element.
             if cutlass.const_expr(self.use_clamped_relu2):
                 clamp_limit = clamped_relu2_limit[0]
+                if cutlass.const_expr(self.fold_clamped_relu2_l2):
+                    # A huge L (or inf) makes the folded L ** 2 overflow fp32 and
+                    # the outputs NaN. For |x| <= 2 ** 26, capping L at 2 ** 32
+                    # changes L * tanh(x / L) by less than the tanh.approx error.
+                    clamp_limit = fmin(clamp_limit, cutlass.Float32(2.0**32))
                 inv_clamp_limit = cutlass.Float32(1.0) / clamp_limit
                 if cutlass.const_expr(self.fold_clamped_relu2_l2):
                     norm_const = norm_const * clamp_limit * clamp_limit
