@@ -44,7 +44,7 @@ from typing import Any, Optional
 ARCHES = ("sm_100a", "sm_103a", "sm_107a")
 ARCH_BY_CAPABILITY = {(10, 0): "sm_100a", (10, 3): "sm_103a", (10, 7): "sm_107a"}
 HEAD_DIM = 256
-PACKAGE = "flashinfer.experimental.cake_gqa_train"
+PACKAGE = "flashinfer.experimental.cake.cake_gqa_nondet_train"
 LIBRARY_PREFIX = "cake_gqa_train"
 MANIFEST = "build.json"
 
