@@ -14,9 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-# The dense projection GEMM package with an explicit numerical mode: the dispatch of every entry point
-# (``deterministic=True`` -> the deterministic package's canonical object, ``deterministic=False`` -> the routes of
-# ``cake_backend.ROUTES``), PyTorch's deterministic-algorithms rule, the names of the former import path, the K1 and
+# The non-deterministic dense projection GEMM package: the mode rule of every compute entry point (only
+# ``deterministic=False``; any other value raises ``ValueError`` naming the deterministic entry point), the routes of
+# ``cake_backend.ROUTES``, PyTorch's deterministic-algorithms alert before an order-varying launch, the absence of
+# every deterministic name (no alias, map or read-through), the K1 and
 # K2 planners (the per-architecture planners, the rule tables, the token-count guard, the stream-K partition), the
 # registry and file names of this package's programs and its workspace kinds.  The CPU tests launch nothing.  The GPU
 # tests (``test_gpu_*``) need a device the deterministic package registers programs for; the ones of this package's
@@ -62,10 +63,10 @@ ROUTER_REL_FRO_MAX = 2e-6
 RERUNS = 20
 SEED = 20261031
 
-# The names of ``cake_backend`` before #8046 that are entry points: each takes ``deterministic`` here.
+# The compute entry points of ``cake_backend``: each takes the keyword-only ``deterministic: bool = True`` and accepts
+# only ``deterministic=False``.
 ENTRY_POINTS = (
     "dense_projection_gemm",
-    "instance_symbol",
     "plan_dense_projection_gemm",
     "plan_router_fp32_gemm",
     "prepare_dense_projection_gemm",
@@ -77,11 +78,9 @@ ENTRY_POINTS = (
     "router_dgrad",
     "router_forward",
     "router_fp32_gemm",
-    "router_symbol",
     "router_wgrad",
-    "split_fp32_to_bf16x3_",
 )
-# former name -> the deterministic package's canonical name
+# name of this package (or a former name) -> the deterministic package's canonical name
 FORMER_TO_DET = {
     "GemmPlan": "DetGemmPlan",
     "PreparedGemm": "PreparedDetGemm",
@@ -126,6 +125,40 @@ FORMER_MODULE_NAMES = (
     "wgrad_swapped", "wgrad_views",
 )
 # fmt: on
+# The names among FORMER_MODULE_NAMES that this package defines itself (its entry points, helpers and constants); every
+# other one is absent here (no read-through to the deterministic package).
+OWN_FORMER_NAMES = frozenset(
+    (
+        *ENTRY_POINTS,
+        "router_symbol",
+        "bind_launch",
+        "clear_convenience_caches",
+        "ROUTER_BLOCK_K",
+        "ROUTER_BLOCK_M",
+        "ROUTER_BLOCK_N",
+    )
+)
+# The names this package no longer has: the former-name map, its read-through and type tables, the mode resolver, the
+# wrappers that only returned or ran a deterministic object, and the forwarding of deterministic templates and programs.
+REMOVED_BACKEND_NAMES = (
+    "DETERMINISTIC_NAMES",
+    "_DET_TYPES",
+    "_DET_SPELLED",
+    "_det_entry",
+    "_resolve_deterministic",
+    "instance_symbol",
+    "split_fp32_to_bf16x3_",
+    "__getattr__",
+)
+REMOVED_JIT_NAMES = (
+    "is_det_template",
+    "is_det_program",
+    "DET_TEMPLATE_PREFIXES",
+    "DET_PROGRAM_PREFIX",
+)
+# The values of ``deterministic`` other than ``False``: each raises ``ValueError`` (``_OMITTED``: no keyword).
+_OMITTED = object()
+NOT_FALSE = (_OMITTED, True, None, 0, 1, "False", 0.0, "")
 DET_TOKEN = re.compile(r"(?:^|[^a-z])det(?:[^a-z]|$)", re.IGNORECASE)
 # the mode is named by deterministic=
 NEGATED_TOKEN = re.compile(r"non_?" + "det", re.IGNORECASE)
@@ -218,21 +251,35 @@ def test_entry_points_take_keyword_only_deterministic_true(name):
 
 
 @pytest.mark.parametrize("name", FORMER_MODULE_NAMES)
-def test_every_former_module_name_resolves(name):
-    obj = getattr(cake_backend, name)
-    if name in ENTRY_POINTS or name in ("bind_launch", "clear_convenience_caches"):
-        assert obj.__module__ == cake_backend.__name__
+def test_no_former_module_name_reads_through(name):
+    """A name ``cake_backend`` had before #8046 is either this package's own object (defined in this module) or
+    absent: no alias and no read-through to the deterministic package."""
+    if name in OWN_FORMER_NAMES:
+        assert name in vars(cake_backend)
+        obj = vars(cake_backend)[name]
+        if callable(obj):
+            assert obj.__module__ == cake_backend.__name__
     else:
-        assert obj is getattr(
-            det_backend, cake_backend.DETERMINISTIC_NAMES.get(name, name)
-        )
+        assert name not in vars(cake_backend) and name not in dir(cake_backend)
+        with pytest.raises(AttributeError):
+            getattr(cake_backend, name)
 
 
-def test_former_types_are_the_deterministic_classes():
-    assert cake_backend.GemmPlan is det_backend.DetGemmPlan
-    assert cake_backend.PreparedGemm is det_backend.PreparedDetGemm
-    assert cake_backend.RouterPlan is det_backend.RouterDetPlan
-    assert cake_backend.PreparedRouterGemm is det_backend.PreparedRouterDetGemm
+def test_the_former_types_are_absent():
+    for name in ("GemmPlan", "PreparedGemm", "RouterPlan", "PreparedRouterGemm"):
+        assert not hasattr(cake_backend, name), name
+
+
+def test_the_removed_names_are_absent():
+    """No former-name map, read-through (module ``__getattr__``), mode resolver, deterministic wrapper or forwarding
+    of deterministic templates and programs is left in this package."""
+    for name in REMOVED_BACKEND_NAMES:
+        assert name not in vars(cake_backend), name
+    for name in REMOVED_BACKEND_NAMES[:-1]:
+        with pytest.raises(AttributeError):
+            getattr(cake_backend, name)
+    for name in REMOVED_JIT_NAMES:
+        assert not hasattr(cake_jit, name), name
 
 
 @pytest.mark.parametrize(
@@ -241,13 +288,31 @@ def test_former_types_are_the_deterministic_classes():
         "projection_det_forward",
         "DetGemmPlan",
         "router_fp32_det_gemm",
+        "ROW_RULES",
+        "stream_k_plan",
+        "wgrad_views",
         "__wrapped__",
         "no_such_name",
     ],
 )
-def test_deterministic_spellings_are_not_read_through(name):
+def test_deterministic_names_are_not_reachable(name):
     with pytest.raises(AttributeError):
         getattr(cake_backend, name)
+
+
+def test_no_deterministic_object_is_reachable_through_this_package():
+    """No function or class the deterministic package defines is an attribute of this package's modules (the
+    deterministic package is reached only through ``deterministic_backend()``)."""
+    det_objects = {
+        id(obj)
+        for module in (det_backend, det_jit)
+        for obj in vars(module).values()
+        if (inspect.isfunction(obj) or inspect.isclass(obj))
+        and obj.__module__ == module.__name__
+    }
+    for module in (cake_backend, cake_jit, package):
+        leaked = sorted(n for n, obj in vars(module).items() if id(obj) in det_objects)
+        assert not leaked, (module.__name__, leaked)
 
 
 def test_the_deterministic_package_resolves_as_a_sibling(monkeypatch):
@@ -266,16 +331,25 @@ def test_use_deterministic_backend_binds_a_vendored_copy(monkeypatch):
         ModuleType("vendored_det_pkg"),
         ModuleType("vendored_det_pkg.cake_backend"),
     )
-    for name in cake_backend.DETERMINISTIC_NAMES.values():
+    for name in cake_backend._DET_ENTRIES:
         setattr(fake, name, Recorder())
     monkeypatch.setitem(sys.modules, "vendored_det_pkg", fake_pkg)
     monkeypatch.setitem(sys.modules, "vendored_det_pkg.cake_backend", fake)
     cake_backend.use_deterministic_backend(fake)
     assert cake_backend.deterministic_backend() is fake
+    # a forward layout (routed "det") plans with the bound package's deterministic planner
+    A, B, out = _k1_views("kk")
     assert (
-        cake_backend.projection_forward("X", "W") is fake.projection_det_forward.result
+        cake_backend.plan_dense_projection_gemm(A, B, out, deterministic=False)
+        is fake.plan_dense_projection_det_gemm.result
     )
-    assert fake.projection_det_forward.calls == [(("X", "W", None), {})]
+    assert fake.plan_dense_projection_det_gemm.calls == [((A, B, out), {})]
+    # the mode rule names the bound package
+    with pytest.raises(
+        ValueError, match=r"vendored_det_pkg\.cake_backend\.projection_det_forward"
+    ):
+        cake_backend.projection_forward("X", "W")
+    assert not fake.projection_det_forward.calls
     with pytest.raises(TypeError, match="lacks"):
         cake_backend.use_deterministic_backend(ModuleType("not_a_backend.cake_backend"))
 
@@ -284,99 +358,130 @@ def test_use_deterministic_backend_binds_a_vendored_copy(monkeypatch):
 # Dispatch (CPU)
 # ---------------------------------------------------------------------------
 
-# entry point -> (positional arguments, keyword arguments, the call the deterministic object receives)
+# entry point -> its positional arguments (sentinels: the mode rule raises before anything reads them) and the
+# keyword arguments of the call
 # fmt: off
-DEFAULT_CALLS = {
-    "dense_projection_gemm": (
-        ("A", "B", "out"),
-        {"transposed_out": True, "enable_pdl": True},
-        (("A", "B", "out"), {"transposed_out": True, "enable_pdl": True}),
-    ),
-    "plan_dense_projection_gemm": (
-        ("A", "B", "out"),
-        {"sm_count": 148, "l2_bytes": 1 << 20, "transposed_out": True, "block_n": 128},
-        (("A", "B", "out"), {"sm_count": 148, "l2_bytes": 1 << 20, "transposed_out": True, "block_n": 128}),
-    ),
-    "prepare_dense_projection_gemm": (("A", "B", "out"), {"sk": False}, (("A", "B", "out"), {"sk": False})),
-    "projection_forward": (("X", "W"), {}, (("X", "W", None), {})),
-    "projection_dgrad": (("G", "W", "out"), {"out_dtype": "f32"}, (("G", "W", "out"), {"out_dtype": "f32"})),
-    "projection_wgrad": (
-        ("G", "X"),
-        {"out_dtype": "f32", "sk": True, "cta_rows": 64},
-        (("G", "X", None), {"out_dtype": "f32", "sk": True, "cta_rows": 64}),
-    ),
-    "prepare_projection_wgrad": (
-        ("G", "X", "out"),
-        {"cta_rows": 128},
-        (("G", "X", "out"), {"sk": "auto", "cta_rows": 128}),
-    ),
-    "plan_router_fp32_gemm": (("A", "B", "out"), {"splits": 3}, (("A", "B", "out"), {"splits": 3})),
-    "prepare_router_fp32_gemm": (("A", "B", "out"), {}, (("A", "B", "out"), {"splits": None})),
-    "router_fp32_gemm": (("A", "B", "out"), {"splits": 2}, (("A", "B", "out"), {"splits": 2})),
-    "router_forward": (("X", "W"), {}, (("X", "W", None), {})),
-    "router_dgrad": (("G", "W", "out"), {}, (("G", "W", "out"), {})),
-    "router_wgrad": (("G", "X"), {"splits": 9}, (("G", "X", None), {"splits": 9})),
-    "split_fp32_to_bf16x3_": (("src", "parts", "resid"), {}, (("src", "parts", "resid"), {})),
+MODE_CALLS = {
+    "dense_projection_gemm": (("A", "B", "out"), {"transposed_out": True, "enable_pdl": True}),
+    "plan_dense_projection_gemm": (("A", "B", "out"), {"sm_count": 148, "transposed_out": True, "block_n": 128}),
+    "prepare_dense_projection_gemm": (("A", "B", "out"), {"sk": False}),
+    "projection_forward": (("X", "W"), {}),
+    "projection_dgrad": (("G", "W", "out"), {"out_dtype": "f32"}),
+    "projection_wgrad": (("G", "X"), {"out_dtype": "f32", "sk": True, "cta_rows": 64}),
+    "prepare_projection_wgrad": (("G", "X", "out"), {"cta_rows": 128}),
+    "plan_router_fp32_gemm": (("A", "B", "out"), {"splits": 3}),
+    "prepare_router_fp32_gemm": (("A", "B", "out"), {}),
+    "router_fp32_gemm": (("A", "B", "out"), {"splits": 2}),
+    "router_forward": (("X", "W"), {}),
+    "router_dgrad": (("G", "W", "out"), {}),
+    "router_wgrad": (("G", "X"), {"splits": 9}),
 }
 # fmt: on
 
 
-@pytest.mark.parametrize("name", sorted(DEFAULT_CALLS))
-def test_the_default_calls_the_deterministic_object(
-    monkeypatch, torch_determinism, name
+def _mode_message(name: str) -> str:
+    """The whole ``ValueError`` text of ``name``'s mode rule, as a pattern (any value after ``got``)."""
+    package = cake_backend.__name__.rpartition(".")[0] or cake_backend.__name__
+    det_entry = f"{cake_backend._det_package_name()}.cake_backend.{FORMER_TO_DET[name]}"
+    head = f"{name}: {package} runs the non-deterministic package only and needs deterministic=False (got "
+    tail = (
+        "): pass deterministic=False for the non-deterministic path; "
+        f"the deterministic entry is {det_entry}"
+    )
+    return "^" + re.escape(head) + ".*" + re.escape(tail) + "$"
+
+
+def _forbid_det_package(monkeypatch) -> list:
+    """Every entry point of the deterministic package and every path of this package records a call, and
+    ``deterministic_backend`` fails: a call that raises the mode rule's ``ValueError`` reaches none of them."""
+    reached = []
+
+    def forbidden(*args, **kwargs):
+        reached.append((args, kwargs))
+        raise AssertionError("the mode rule let the call through")
+
+    monkeypatch.setattr(cake_backend, "deterministic_backend", forbidden)
+    for name in cake_backend._DET_ENTRIES:
+        monkeypatch.setattr(det_backend, name, forbidden)
+    paths = ("_atomic_k1", "_atomic_k2", "_det_k1", "_router_gemm", "_splitk_k2")
+    for name in (*paths, "_k1_cached_launch", "_k2_entry"):
+        monkeypatch.setattr(cake_backend, name, forbidden)
+    return reached
+
+
+def test_mode_calls_cover_every_entry_point():
+    assert sorted(MODE_CALLS) == sorted(ENTRY_POINTS)
+    assert set(ENTRY_POINTS) <= set(FORMER_TO_DET)
+    for name in ENTRY_POINTS:
+        assert hasattr(det_backend, FORMER_TO_DET[name]), name
+
+
+@pytest.mark.parametrize(
+    "value", NOT_FALSE, ids=lambda v: "omitted" if v is _OMITTED else repr(v)
+)
+@pytest.mark.parametrize("name", ENTRY_POINTS)
+def test_every_value_but_false_raises_naming_the_deterministic_entry(
+    monkeypatch, torch_determinism, name, value
 ):
-    """The default path is the deterministic package's object with the same arguments (so the same bits), with and
-    without PyTorch's deterministic mode, and never warns."""
-    args, kwargs, expected = DEFAULT_CALLS[name]
-    recorder = _patch_det(monkeypatch, name)
-    for enabled in (False, True):
-        torch.use_deterministic_algorithms(enabled)
-        with _no_warnings():
-            assert getattr(cake_backend, name)(*args, **kwargs) is recorder.result
-            assert (
-                getattr(cake_backend, name)(*args, deterministic=True, **kwargs)
-                is recorder.result
-            )
-    assert recorder.calls == [expected] * 4
+    """An entry point takes only ``deterministic=False``: the default, ``True``, ``None``, ``0``, ``1``, ``"False"``
+    and every other value raise ``ValueError`` naming the deterministic package's entry point, before anything is
+    planned or launched and without a call of the deterministic package; PyTorch's deterministic mode (strict or
+    ``warn_only``) changes nothing, and nothing warns."""
+    args, kwargs = MODE_CALLS[name]
+    reached = _forbid_det_package(monkeypatch)
+    if value is not _OMITTED:
+        kwargs = dict(kwargs, deterministic=value)
+    for enabled, warn_only in ((False, False), (True, False), (True, True)):
+        torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
+        with _no_warnings(), pytest.raises(ValueError, match=_mode_message(name)):
+            getattr(cake_backend, name)(*args, **kwargs)
+    assert not reached
 
 
-def test_the_default_router_forward_and_wgrad_keep_the_production_splits(monkeypatch):
-    forward, wgrad = (
-        _patch_det(monkeypatch, "router_forward"),
-        _patch_det(monkeypatch, "router_wgrad"),
+def test_numpy_bools_raise():
+    """A NumPy bool is not the bool ``False``: ``np.False_`` and ``np.True_`` raise like any other value."""
+    np = pytest.importorskip("numpy")
+    for value in (np.False_, np.True_):
+        with pytest.raises(ValueError, match=_mode_message("projection_wgrad")):
+            cake_backend.projection_wgrad("G", "X", "out", deterministic=value)
+
+
+def test_the_mode_message_names_the_deterministic_package_without_importing_it(
+    monkeypatch,
+):
+    """The mode rule names the deterministic entry point from text (the bound package, else this package's
+    sibling): it imports nothing."""
+    imported = []
+    monkeypatch.setattr(
+        cake_jit, "deterministic_module", lambda name: imported.append(name)
     )
-    cake_backend.router_forward("X", "W", "out")
-    cake_backend.router_wgrad("G", "X", "out", splits=6)
-    assert forward.calls == [
-        (("X", "W", "out"), {})
-    ]  # the deterministic default (4 splits) applies
-    assert wgrad.calls == [(("G", "X", "out"), {"splits": 6})]
+    monkeypatch.setattr(cake_jit, "_det_package", None)
+    with pytest.raises(ValueError) as raised:
+        cake_backend.router_wgrad("G", "X", deterministic=None)
+    parent = cake_backend.__name__.rpartition(".")[0].rpartition(".")[0]
+    det_package = (
+        f"{parent}.dense_projection_det_gemm" if parent else "dense_projection_det_gemm"
+    )
+    assert f"{det_package}.cake_backend.router_det_wgrad" in str(raised.value)
+    assert "needs deterministic=False (got None)" in str(raised.value)
+    assert not imported
 
 
-def test_instance_and_router_symbols():
-    key = det_backend.instance_key(a_mn=True, b_mn=True)
-    assert cake_backend.instance_symbol(
-        key, deterministic=False
-    ) == det_backend.instance_symbol(key)
-    for a_mn, b_mn, out_t in (
-        (False, False, False),
-        (False, True, False),
-        (True, True, True),
-    ):
-        assert cake_backend.router_symbol(
-            a_mn, b_mn, out_t
-        ) == det_backend.router_symbol(a_mn, b_mn, out_t)
-    assert (
+def test_router_symbol_takes_no_mode_keyword():
+    """``router_symbol`` names this package's stream-K template of the ``kk`` / ``nn_t`` layout classes (a helper:
+    no ``deterministic`` keyword); ``kn`` (SIMT programs only) and ``nk`` have none."""
+    symbol = cake_backend.router_symbol
+    assert "deterministic" not in inspect.signature(symbol).parameters
+    assert symbol(False, False, False) == "router_fp32_gemm_atomic_kk"
+    assert symbol(True, True, True) == "router_fp32_gemm_atomic_nn_t"
+    stream_k = {"router_fp32_gemm_atomic_kk", "router_fp32_gemm_atomic_nn_t"}
+    for arch, table in cake_jit.KERNELS.items():
+        assert stream_k <= set(table), arch
+    for a_mn, b_mn in ((False, True), (True, False)):
+        with pytest.raises(ValueError, match="no stream-K program"):
+            cake_backend.router_symbol(a_mn, b_mn, False)
+    with pytest.raises(TypeError):
         cake_backend.router_symbol(False, False, False, deterministic=False)
-        == "router_fp32_gemm_atomic_kk"
-    )
-    assert (
-        cake_backend.router_symbol(True, True, True, deterministic=False)
-        == "router_fp32_gemm_atomic_nn_t"
-    )
-    assert cake_backend.router_symbol(
-        False, True, False, deterministic=False
-    ) == det_backend.router_symbol(False, True, False)
 
 
 @pytest.mark.parametrize("layout", ["kk", "kn", "nn"])
@@ -464,7 +569,7 @@ def test_k1_deterministic_programs_run_through_the_binding(monkeypatch, op, pdl)
     """``deterministic=False`` K1 calls that run the deterministic program go through this package's binding
     (``_det_k1``): keyed by the entry point's own tensors, with the deterministic package's convenience call as the
     plan (``det_args``) and as the fallback (``det_call``), the entry point's ``enable_pdl`` (and the generic entry's
-    ``weights_static``) passed to both; ``deterministic=True`` calls the deterministic package."""
+    ``weights_static``) passed to both; ``deterministic=True`` raises ``ValueError`` and calls nothing."""
     names = {"fwd": "projection_forward", "dgrad": "projection_dgrad"}
     det = _patch_det(monkeypatch, names.get(op, "dense_projection_gemm"))
     binding = Recorder()
@@ -510,7 +615,9 @@ def test_k1_deterministic_programs_run_through_the_binding(monkeypatch, op, pdl)
             want["weights_static"] = True
         assert det.calls == [((A, B, out), want)]
     det.calls.clear()
-    assert call(True) is det.result and len(det.calls) == 1 and len(binding.calls) == 1
+    with pytest.raises(ValueError, match="needs deterministic=False"):
+        call(True)
+    assert not det.calls and len(binding.calls) == 1
 
 
 def _same_entry_views(views, a_view, split_src, flags) -> None:
@@ -525,13 +632,10 @@ def test_k2_routes(monkeypatch):
     gradient without a split count: its SIMT windows, else the deterministic program), and so does the forward with a
     split count or while some router table gives the forward a verdict; without either the forward runs the
     deterministic program through this package's binding (the plan the planner keeps for a row without a verdict).
-    The split stage is the deterministic package's.  Each entry point passes its own tensors as the launch views.  The
-    forward's shipped verdicts (its SIMT windows) are cleared first."""
+    Each entry point passes its own tensors as the launch views.  The forward's shipped verdicts (its SIMT windows)
+    are cleared first."""
     _without_forward_verdicts(monkeypatch)
-    dgrad, split = (
-        _patch_det(monkeypatch, "router_dgrad"),
-        _patch_det(monkeypatch, "split_fp32_to_bf16x3_"),
-    )
+    dgrad = _patch_det(monkeypatch, "router_dgrad")
     gemm = _patch_det(monkeypatch, "router_fp32_gemm")
     atomic, splitk = Recorder(), Recorder()
     monkeypatch.setattr(cake_backend, "_atomic_k2", atomic)
@@ -555,10 +659,6 @@ def test_k2_routes(monkeypatch):
     )
     assert cake_backend.router_dgrad(G, W, deterministic=False) is atomic.result
     assert not dgrad.calls
-    assert (
-        cake_backend.split_fp32_to_bf16x3_("s", "p", "r", deterministic=False)
-        is split.result
-    )
     calls = atomic.calls
     (
         (fwd2_args, fwd2_kwargs),
@@ -5522,7 +5622,7 @@ def test_k1_forward_rows_bind_their_plan(monkeypatch, arch):
     """``projection_forward(deterministic=False)`` binds, for a row of :data:`K1_FORWARD_RULES_BY_SM` on its part
     (BF16 ``out``, both operands K-major), the deterministic program the deterministic planner gives the row with the
     table's knobs, and the deterministic plan for a token count, row or SM count outside the table; an FP32 ``out``
-    or an operand that is not K-major gets no knobs; ``deterministic=True`` calls the deterministic package."""
+    or an operand that is not K-major gets no knobs; ``deterministic=True`` raises ``ValueError`` and plans nothing."""
     entry_fn = _cpu_k1_launches(monkeypatch, arch)
     monkeypatch.setattr(cake_backend, "_k1_index", lambda *views: 0)
     bf16 = torch.bfloat16
@@ -5567,10 +5667,13 @@ def test_k1_forward_rows_bind_their_plan(monkeypatch, arch):
         monkeypatch.setattr(det_backend, "device_facts", lambda device=None, f=facts: f)
         assert cake_backend._k1_forward_knobs_of(X, W, out) == (), sms
         assert bound_plan(X, W, out) == det_plan(X, W, out, ()), sms
-    # deterministic=True: the deterministic package's entry point, whatever the table says
+    # deterministic=True (the default): ValueError naming the deterministic entry, whatever the table says
     det = _patch_det(monkeypatch, "projection_forward")
-    assert cake_backend.projection_forward(X, W, out) is det.result
-    assert det.calls == [((X, W, out), {})]
+    entry_fn.calls.clear()
+    cake_backend._K1_DET_CACHE.clear()
+    with pytest.raises(ValueError, match="projection_det_forward"):
+        cake_backend.projection_forward(X, W, out)
+    assert not det.calls and not entry_fn.calls and not cake_backend._K1_DET_CACHE
 
 
 def test_k1_entry_points_go_from_their_key_to_the_bound_launch(monkeypatch):
@@ -7089,7 +7192,7 @@ def test_deterministic_backend_follows_the_binding_and_sys_modules(monkeypatch):
         ModuleType("vendored_det_pkg2"),
         ModuleType("vendored_det_pkg2.cake_backend"),
     )
-    for name in cake_backend.DETERMINISTIC_NAMES.values():
+    for name in cake_backend._DET_ENTRIES:
         setattr(fake, name, Recorder())
     monkeypatch.setitem(sys.modules, "vendored_det_pkg2", fake_pkg)
     monkeypatch.setitem(sys.modules, "vendored_det_pkg2.cake_backend", fake)
@@ -7110,7 +7213,7 @@ def test_use_deterministic_backend_drops_the_convenience_entries(monkeypatch):
         ModuleType("vendored_det_pkg3"),
         ModuleType("vendored_det_pkg3.cake_backend"),
     )
-    for name in cake_backend.DETERMINISTIC_NAMES.values():
+    for name in cake_backend._DET_ENTRIES:
         setattr(fake, name, Recorder())
     monkeypatch.setitem(sys.modules, "vendored_det_pkg3", fake_pkg)
     monkeypatch.setitem(sys.modules, "vendored_det_pkg3.cake_backend", fake)
@@ -7171,47 +7274,188 @@ def test_k2_misaligned_out_takes_the_deterministic_path(monkeypatch, shift_elems
 
 
 # ---------------------------------------------------------------------------
-# PyTorch's deterministic-algorithms mode (CPU)
+# PyTorch's deterministic-algorithms mode (CPU): the alert before an order-varying launch
 # ---------------------------------------------------------------------------
 
-# fmt: off
-ATOMIC_MODE_CALLS = {
-    "dense_projection_gemm": lambda: cake_backend.dense_projection_gemm(*_k1_views("nn"), deterministic=False),
-    "projection_forward": lambda: cake_backend.projection_forward("X", "W", deterministic=False),
-    "projection_wgrad": lambda: cake_backend.projection_wgrad("G", "X", "out", deterministic=False),
-    "router_forward": lambda: cake_backend.router_forward("X", "W", deterministic=False),
-    "router_dgrad": lambda: cake_backend.router_dgrad("G", "W", deterministic=False),
-    "router_wgrad": lambda: cake_backend.router_wgrad("G", "X", deterministic=False),
-    "split_fp32_to_bf16x3_": lambda: cake_backend.split_fp32_to_bf16x3_("s", "p", "r", deterministic=False),
-}
-# fmt: on
+
+def _prepared_launch(monkeypatch, k: str, order_varying: bool):
+    """A prepared launch of this package on CPU (nothing is loaded or launched) and the recorders of what it issues:
+    K1 (``"k1"``) at three splits (the partials added in the order the splits finish) or two (one add), its program;
+    K2 (``"k2"``) at 120 units over 40 tiles (three partials per element) or 80 (two), its split, the fill of ``out``
+    and its program."""
+    monkeypatch.setattr(
+        det_backend,
+        "_ffi_stream_context",
+        lambda index, raw=None: contextlib.nullcontext(),
+    )
+    monkeypatch.setattr(det_backend, "_current_raw_stream", lambda index: 0)
+    out, program = torch.zeros(8, 8), Recorder()
+    if k == "k1":
+        plan = cake_backend.AtomicGemmPlan(
+            L=1,
+            M=4096,
+            N=128,
+            K=1000,
+            out_f32=True,
+            transposed_out=True,
+            block_n=128,
+            splits=3 if order_varying else 2,
+            m_tiles=16,
+            n_tiles=1,
+            sm_pairs=76,
+            template="k1_program",
+        )
+        launch = cake_backend.PreparedAtomicGemm(
+            "k1_module", "sm_103a", plan, out, {}, _launch=program
+        )
+        return launch, (program,)
+    plan = cake_backend.AtomicRouterPlan(
+        M=5120,
+        N=256,
+        K=192,
+        a_mn=True,
+        b_mn=True,
+        swapped=False,
+        layout="nn_t",
+        m_tiles=40,
+        n_tiles=2,
+        k_iters=6,
+        units=120 if order_varying else 80,
+        template="k2_program",
+    )
+    split, fill = Recorder(), Recorder()
+    launch = cake_backend.PreparedAtomicRouterGemm(
+        "k2_module", "sm_103a", plan, out, {}, _launch=program, _split=split, _fill=fill
+    )
+    return launch, (split, fill, program)
 
 
-@pytest.mark.parametrize("name", sorted(ATOMIC_MODE_CALLS))
-def test_explicit_false_under_torch_deterministic_mode_raises(
-    monkeypatch, torch_determinism, name
+#: The words of the alert that name the order-varying launch of :func:`_prepared_launch`.
+PREPARED_ALERT_TEXT = {"k1": "at 3 splits", "k2": "with 120 units over 40 tiles"}
+
+
+@pytest.mark.parametrize("k", ["k1", "k2"])
+def test_an_order_varying_prepared_launch_alerts_under_torch_deterministic_mode(
+    monkeypatch, torch_determinism, k
 ):
-    recorder = _patch_det(monkeypatch, name)
-    monkeypatch.setattr(cake_backend, "_atomic_k1", Recorder())
-    monkeypatch.setattr(cake_backend, "_atomic_k2", Recorder())
+    """With ``torch.use_deterministic_algorithms(True)`` a prepared launch whose result varies run to run (K1 at
+    three splits, K2 with three partials per element) raises PyTorch's ``RuntimeError`` before it issues anything (no
+    split, no fill of ``out``, no program); with ``warn_only=True`` it warns, at the caller's line, and launches; with
+    the mode off it launches without a warning.  The alert names the launch and the deterministic package."""
+    launch, recorders = _prepared_launch(monkeypatch, k, True)
+    assert not launch.plan.reproducible
+    text = PREPARED_ALERT_TEXT[k]
     torch.use_deterministic_algorithms(True)
-    with pytest.raises(RuntimeError, match="deterministic=True"):
-        ATOMIC_MODE_CALLS[name]()
-    assert not recorder.calls
-
-
-@pytest.mark.parametrize("name", sorted(ATOMIC_MODE_CALLS))
-def test_explicit_false_under_warn_only_warns_and_runs_the_deterministic_path(
-    monkeypatch, torch_determinism, name
-):
-    recorder = _patch_det(monkeypatch, name)
-    atomic1, atomic2 = Recorder(), Recorder()
-    monkeypatch.setattr(cake_backend, "_atomic_k1", atomic1)
-    monkeypatch.setattr(cake_backend, "_atomic_k2", atomic2)
+    with pytest.raises(RuntimeError, match=re.escape(text)) as info:
+        launch.launch()
+    assert cake_backend._det_package_name() in str(info.value)
+    assert "warn_only=True" in str(info.value)
+    assert not any(r.calls for r in recorders)
     torch.use_deterministic_algorithms(True, warn_only=True)
-    with pytest.warns(UserWarning, match="running the deterministic path"):
-        assert ATOMIC_MODE_CALLS[name]() is recorder.result
-    assert len(recorder.calls) == 1 and not atomic1.calls and not atomic2.calls
+    with pytest.warns(UserWarning, match=re.escape(text)) as record:
+        assert launch.launch() is launch.out
+    assert all(len(r.calls) == 1 for r in recorders)
+    (alert,) = [w for w in record if text in str(w.message)]
+    assert Path(alert.filename).name == Path(__file__).name
+    torch.use_deterministic_algorithms(False)
+    with _no_warnings():
+        assert launch.launch() is launch.out
+    assert all(len(r.calls) == 2 for r in recorders)
+
+
+@pytest.mark.parametrize("k", ["k1", "k2"])
+def test_a_fixed_order_prepared_launch_does_not_alert(
+    monkeypatch, torch_determinism, k
+):
+    """A prepared launch whose result repeats (K1 at two splits, one add of two partials; K2 with at most two partials
+    per element; a SIMT program, which stores every element once) launches without an alert under
+    ``torch.use_deterministic_algorithms(True)``."""
+    launch, recorders = _prepared_launch(monkeypatch, k, False)
+    assert launch.plan.reproducible
+    if k == "k2":
+        assert dataclasses.replace(launch.plan, units=0, simt=(64, 64)).reproducible
+    torch.use_deterministic_algorithms(True)
+    with _no_warnings():
+        assert launch.launch() is launch.out
+    assert all(len(r.calls) == 1 for r in recorders)
+
+
+@pytest.mark.parametrize("splits", [2, 3])
+def test_k1_convenience_launch_alerts_only_when_order_varying(
+    monkeypatch, torch_determinism, splits
+):
+    """``projection_wgrad(deterministic=False)`` on a row this package's planner takes at ``splits`` splits (CPU
+    binding, nothing loaded or launched), under ``torch.use_deterministic_algorithms(True)``: at three splits the
+    planning call and the call from the cached key both raise before the program; with ``warn_only=True`` the call
+    warns and launches; at two splits both calls launch without an alert.  The cached launch keeps whether its plan
+    varies run to run."""
+    entry_fn = _cpu_k1_launches(monkeypatch, "sm_103a")
+    monkeypatch.setattr(cake_backend, "_k1_index", lambda *views: 0)
+    monkeypatch.setattr(cake_backend, "k1_plan", lambda **kw: (128, splits))
+    monkeypatch.setattr(cake_backend, "k1_chain_plan", lambda **kw: None)
+    bf16, T = torch.bfloat16, 1000
+    G, X = torch.empty(T, 128, dtype=bf16), torch.empty(T, 4096, dtype=bf16)
+    out = torch.zeros(128, 4096)
+
+    def call():
+        return cake_backend.projection_wgrad(G, X, out, deterministic=False)
+
+    torch.use_deterministic_algorithms(True)
+    for _ in range(2):  # the planning call, then the call from the cached key
+        if splits == 3:
+            with pytest.raises(RuntimeError, match="at 3 splits"):
+                call()
+        else:
+            with _no_warnings():
+                assert call() is out
+    ((_, entry),) = cake_backend._K1_ATOMIC_CACHE.items()
+    assert entry.plan.splits == splits and entry.k1 is not None
+    assert entry.order_varying == (splits == 3)
+    assert len(entry_fn.calls) == (0 if splits == 3 else 2)
+    if splits == 3:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        with pytest.warns(UserWarning, match="at 3 splits"):
+            assert call() is out
+        assert len(entry_fn.calls) == 1
+
+
+@pytest.mark.parametrize("splits", [2, 3])
+def test_k2_convenience_launch_alerts_only_when_order_varying(
+    monkeypatch, torch_determinism, splits
+):
+    """``router_wgrad(deterministic=False, splits=splits)`` (CPU binding, nothing loaded or launched) under
+    ``torch.use_deterministic_algorithms(True)``: three units per tile (three partials per element) raise before the
+    split, the fill of ``out`` and the program, on the planning call and from the cached key; with ``warn_only=True``
+    the call warns and launches; two units per tile launch without an alert."""
+    entry_fn, fill = _cpu_k2_launches(monkeypatch)
+    _sm103a_wgrad_waves(monkeypatch)
+    split = Recorder()  # the torch chain's split
+    monkeypatch.setattr(det_backend, "split_fp32_to_bf16x3_det_", split)
+    G, X, out = torch.empty(192, 256), torch.empty(192, 5120), torch.zeros(256, 5120)
+    recorders = (entry_fn, fill, split)
+
+    def call():
+        return cake_backend.router_wgrad(G, X, out, splits=splits, deterministic=False)
+
+    torch.use_deterministic_algorithms(True)
+    for _ in range(2):  # the planning call, then the call from the cached key
+        if splits == 3:
+            with pytest.raises(RuntimeError, match="does not have a deterministic"):
+                call()
+        else:
+            with _no_warnings():
+                assert call() is out
+    ((_, entry),) = [
+        (k, e) for k, e in cake_backend._K2_ATOMIC_CACHE.items() if e.plan is not None
+    ]
+    assert entry.plan.simt is None and entry.k2 is not None
+    assert entry.order_varying == (splits == 3) == (not entry.plan.reproducible)
+    assert any(r.calls for r in recorders) == (splits == 2)
+    if splits == 3:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        with pytest.warns(UserWarning, match=re.escape(entry.plan.template)):
+            assert call() is out
+        assert entry_fn.calls
 
 
 def test_routes_table():
@@ -7344,26 +7588,32 @@ def test_no_det_token_in_generated_names_and_no_negated_token_in_the_package():
         assert not DET_TOKEN.search(name)
 
 
-def test_select_module_and_the_loader_forward_deterministic_names(monkeypatch):
+def test_select_module_and_the_loader_take_this_package_s_programs_only(monkeypatch):
+    """``select_module``, the loader and ``bind_launch`` of this package serve its own programs only: a template or a
+    program of the deterministic package is not forwarded to that package (``select_module`` raises, the loader goes
+    to this package's own loading, ``bind_launch`` finds no record)."""
     for arch, table in det_jit.KERNELS.items():
         template = sorted(table)[0]
-        assert cake_jit.select_module(arch, template) == det_jit.select_module(
-            arch, template
-        )
+        with pytest.raises(NotImplementedError, match="not registered"):
+            cake_jit.select_module(arch, template)
     with pytest.raises(NotImplementedError, match="not registered"):
         cake_jit.select_module("sm_100a", "dense_proj_gemm_atomic_nn_unregistered")
-    loader = Recorder()
-    monkeypatch.setattr(det_jit, "load_cake_dense_projection_det_gemm_module", loader)
+    det_loader, own_loader, det_bind = Recorder(), Recorder(), Recorder()
+    monkeypatch.setattr(
+        det_jit, "load_cake_dense_projection_det_gemm_module", det_loader
+    )
+    monkeypatch.setattr(cake_jit, "_load_module", own_loader)
+    monkeypatch.setattr(det_backend, "bind_launch", det_bind)
     name = sorted(det_jit.MODULES)[0]
+    assert name not in cake_jit.MODULES
     assert (
         cake_jit.load_cake_dense_projection_gemm_module(name, "sm_100a")
-        is loader.result
+        is own_loader.result
     )
-    assert loader.calls == [((name, "sm_100a"), {})]
-    bind = Recorder()
-    monkeypatch.setattr(det_backend, "bind_launch", bind)
-    assert cake_backend.bind_launch(name, {"M": 1}, (2, 1, 1), "sm_100a") is bind.result
-    assert bind.calls == [((name, {"M": 1}, (2, 1, 1), "sm_100a"), {})]
+    assert own_loader.calls == [((name, "sm_100a"), {})]
+    with pytest.raises(KeyError):
+        cake_backend.bind_launch(name, {"M": 1}, (2, 1, 1), "sm_100a")
+    assert not det_loader.calls and not det_bind.calls
 
 
 def test_clear_convenience_caches_clears_both_packages():
@@ -7485,40 +7735,6 @@ def _bf16(shape, device, generator, scale=1.0):
     return (torch.randn(shape, device=device, generator=generator) * scale).to(
         torch.bfloat16
     )
-
-
-def test_gpu_default_path_is_bitwise_the_deterministic_path():
-    """The former names with the default give the deterministic package's bits (K1 forward / input gradient /
-    weight gradient, K2 forward / input gradient / weight gradient)."""
-    device = _det_device_or_skip()
-    g = torch.Generator(device=device).manual_seed(SEED)
-    T, K, N = 1001, 6144, 576
-    X, W, G = (
-        _bf16((T, K), device, g),
-        _bf16((N, K), device, g, 0.02),
-        _bf16((T, N), device, g),
-    )
-    cases = [
-        (cake_backend.projection_forward, det_backend.projection_det_forward, (X, W)),
-        (cake_backend.projection_dgrad, det_backend.projection_det_dgrad, (G, W)),
-        (cake_backend.projection_wgrad, det_backend.projection_det_wgrad, (G, X)),
-    ]
-    T2, K2, N2 = 1001, 6144, 256
-    Xf = torch.randn(T2, K2, device=device, generator=g)
-    Wf = torch.randn(N2, K2, device=device, generator=g) * 0.02
-    Gf = torch.randn(T2, N2, device=device, generator=g)
-    cases += [
-        (cake_backend.router_forward, det_backend.router_det_forward, (Xf, Wf)),
-        (cake_backend.router_dgrad, det_backend.router_det_dgrad, (Gf, Wf)),
-        (cake_backend.router_wgrad, det_backend.router_det_wgrad, (Gf, Xf)),
-    ]
-    for ours, theirs, args in cases:
-        try:
-            expected = theirs(*args)
-        except NotImplementedError as exc:
-            pytest.skip(f"{theirs.__name__}: {exc}")
-        got = ours(*args)
-        assert got.dtype == expected.dtype and torch.equal(got, expected), ours.__name__
 
 
 def _rel_fro(out: torch.Tensor, ref: torch.Tensor) -> float:
@@ -7943,19 +8159,39 @@ def test_gpu_k1_small_token_counts_guard():
         _k1_prepare(G, X, out, arch, 2)
 
 
-def test_gpu_torch_deterministic_mode_rule(torch_determinism):
-    """Under ``torch.use_deterministic_algorithms(True)`` an explicit ``deterministic=False`` raises before any
-    launch; with ``warn_only=True`` it warns and returns the deterministic bits."""
-    device = _det_device_or_skip()
-    G, X, out = _k1_wgrad_inputs("indexer_hw", 4097, torch.bfloat16, device, SEED + 40)
-    expected = det_backend.projection_det_wgrad(G, X, torch.empty_like(out))
+def test_gpu_torch_deterministic_mode_alerts_before_an_order_varying_launch(
+    k1_rule, torch_determinism
+):
+    """Under ``torch.use_deterministic_algorithms(True)`` a ``deterministic=False`` call whose launch is fixed order
+    (two splits: one add) runs without an alert and repeats bit for bit; a launch whose result varies run to run
+    (three splits) raises PyTorch's ``RuntimeError`` before it launches (``out`` untouched), or with
+    ``warn_only=True`` warns and runs this package's program within the accuracy rule.  The setting never changes
+    the program that runs."""
+    device, arch = _atomic_device_or_skip()
+    G, X, out = _k1_wgrad_inputs("indexer_k", 16231, torch.bfloat16, device, SEED + 40)
+    # the FP64 reference before the mode is on (its cuBLAS GEMM would need CUBLAS_WORKSPACE_CONFIG under it)
+    ref = G.double().t() @ X.double()
+    k1_rule(G, X, out, 2)
     torch.use_deterministic_algorithms(True)
-    with pytest.raises(RuntimeError, match="deterministic=True"):
+    with _no_warnings():
+        first = cake_backend.projection_wgrad(G, X, out, deterministic=False).clone()
+        for _ in range(RERUNS):
+            again = cake_backend.projection_wgrad(G, X, out, deterministic=False)
+            assert torch.equal(again, first)
+    k1_rule(G, X, out, 3)
+    out.fill_(7.0)
+    with pytest.raises(RuntimeError, match="at 3 splits"):
         cake_backend.projection_wgrad(G, X, out, deterministic=False)
+    torch.cuda.synchronize()
+    assert bool((out == 7.0).all())
     torch.use_deterministic_algorithms(True, warn_only=True)
-    with pytest.warns(UserWarning, match="running the deterministic path"):
+    with pytest.warns(UserWarning, match="at 3 splits"):
         got = cake_backend.projection_wgrad(G, X, out, deterministic=False)
-    assert torch.equal(got, expected)
+    torch.cuda.synchronize()
+    torch.use_deterministic_algorithms(False)
+    _k1_check(first, ref, "two splits")
+    _k1_check(got, ref, "three splits")
+    assert _arena_tickets_zero()
 
 
 def test_gpu_det_then_atomic_share_a_stream_not_a_workspace(k1_rule):
