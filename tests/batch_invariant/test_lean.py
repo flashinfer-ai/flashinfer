@@ -136,7 +136,7 @@ def test_lean_model_matches_python_engine_and_spec():
         elif kind == "fp4class":
             _, N, K, b = line.split(" ")
             lean[("fp4class", int(N), int(K))] = bool(int(b))
-        elif tag == "attn":
+        elif kind == "attn":
             _, name, sx = line.split(" ", 2)
             lean[("attn", name)] = sx
         else:

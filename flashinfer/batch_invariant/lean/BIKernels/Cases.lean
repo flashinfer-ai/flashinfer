@@ -523,4 +523,5 @@ def attnSpaceD256 : List Attn.Config := [⟨2, 0, 1, 0, 0⟩, ⟨2, 1, 1, 0, 0�
 theorem attn_space_d256_size : attnSpaceD256.length = 36 := by native_decide
 theorem attn_space_d256_ok : attnSpaceD256.all (Attn.ConfigOKD 256) = true := by native_decide
 theorem attn_space_d256_invariant : ∀ b₁ ∈ attnSpaceD256, ∀ b₂ ∈ attnSpaceD256, ∀ (f₁ f₂ : Bool) (P : Attn.Params) (σ τ : Nat → Nat), Attn.kernel b₁ f₁ P σ = Attn.kernel b₂ f₂ P τ := Attn.space_invariant attnSpaceD256
+
 end BIK

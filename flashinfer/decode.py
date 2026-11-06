@@ -3190,6 +3190,18 @@ class BatchDecodeWithPagedKVCacheWrapper:
         rope_theta: Optional[float] = None,
     ) -> torch.Tensor:
         r"""Warning: this function is deprecated, please use :meth:`run` instead."""
+        if self._batch_invariant is not None:
+            self._batch_invariant.validate_forward_options(
+                sm_scale=sm_scale,
+                pos_encoding_mode=pos_encoding_mode,
+                logits_soft_cap=logits_soft_cap,
+                rope_scale=rope_scale,
+                rope_theta=rope_theta,
+                window_left=window_left,
+            )
+            return self.run(
+                q, paged_kv_cache, q_scale=q_scale, k_scale=k_scale, v_scale=v_scale
+            )
         self._pos_encoding_mode = pos_encoding_mode
         self._window_left = window_left
         self._logits_soft_cap = logits_soft_cap
@@ -3390,19 +3402,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 out=out,
                 return_lse=return_lse,
                 lse=lse,
-                window_left=self._window_left if window_left is None else window_left,
+                window_left=window_left,
                 scales=(q_scale, k_scale, v_scale),
                 sinks=sinks,
                 kv_cache_sf=kv_cache_sf,
                 skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
                 enable_pdl=enable_pdl,
-                sm_scale=self._sm_scale
-                if self._sm_scale is not None
-                else 1.0 / math.sqrt(q.shape[-1]),
-                pos_encoding_mode=self._pos_encoding_mode,
-                logits_soft_cap=self._logits_soft_cap,
-                rope_scale=self._rope_scale,
-                rope_theta=self._rope_theta,
             )
 
         if getattr(self, "_use_token_head_sf", False):
@@ -4034,6 +4039,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
         rope_theta: Optional[float] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         r"""Warning: this function is deprecated, please use :meth:`run_return_lse` instead."""
+        if self._batch_invariant is not None:
+            return self.run_return_lse(
+                q, paged_kv_cache, q_scale=q_scale, k_scale=k_scale, v_scale=v_scale
+            )
         self._pos_encoding_mode = pos_encoding_mode
         self._window_left = window_left
         self._logits_soft_cap = logits_soft_cap

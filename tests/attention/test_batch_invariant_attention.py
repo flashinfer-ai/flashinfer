@@ -224,6 +224,245 @@ def reference(pr: Problem, window_left=-1):
     return torch.cat(outs)
 
 
+def _wrapper_case(kind, pr, metadata_device="cuda", **plan_options):
+    """Public plan/run arguments for the same one-query-per-request problem."""
+    w = getattr(flashinfer, WRAPPERS[kind])(
+        workspace(pr.device, mb=8), "NHD", batch_invariant=True
+    )
+
+    def metadata(t):
+        return t.to(metadata_device).clone()
+
+    kwargs = dict(q_data_type=torch.bfloat16, kv_data_type=torch.bfloat16)
+    if kind == 0:
+        plan_args = (
+            metadata(pr.kv_indptr),
+            metadata(pr.kv_indices),
+            metadata(pr.kv_last),
+            pr.Hq,
+            pr.Hkv,
+            pr.D,
+            pr.page,
+        )
+        run_args = (pr.q, pr.cache("NHD"))
+    elif kind == 1:
+        plan_args = (
+            metadata(pr.qo_indptr),
+            metadata(pr.kv_indptr),
+            metadata(pr.kv_indices),
+            metadata(pr.kv_last),
+            pr.Hq,
+            pr.Hkv,
+            pr.D,
+            pr.page,
+        )
+        kwargs["causal"] = True
+        run_args = (pr.q, pr.cache("NHD"))
+    else:
+        plan_args = (
+            metadata(pr.qo_indptr),
+            metadata(pr.kv_indptr_rag),
+            pr.Hq,
+            pr.Hkv,
+            pr.D,
+        )
+        kwargs["causal"] = True
+        run_args = (pr.q, *pr.ragged("NHD"))
+    kwargs.update(plan_options)
+    w.plan(*plan_args, **kwargs)
+    return w, run_args, plan_args, kwargs
+
+
+def _saved_forward_options(wrapper):
+    names = (
+        "_sm_scale",
+        "_window_left",
+        "_pos_encoding_mode",
+        "_logits_soft_cap",
+        "_rope_scale",
+        "_rope_theta",
+        "_causal",
+        "_use_fp16_qk_reduction",
+    )
+    return {name: getattr(wrapper, name) for name in names if hasattr(wrapper, name)}
+
+
+@needs_device
+@pytest.mark.parametrize("kind", range(3), ids=["decode", "paged", "ragged"])
+def test_forward_equivalent_scale(kind):
+    pr = Problem([1], [17], 8, 2, 128, 16, seed=32)
+    w, args, _, _ = _wrapper_case(kind, pr)
+    expected = bits(w.run(*args)).clone()
+    # These distinct Python floats round to the same binary32 kernel scale.
+    equivalent = 128**-0.5
+    assert equivalent != 1.0 / math.sqrt(128)
+    options = {} if kind == 0 else {"causal": True}
+    got = w.forward(*args, sm_scale=equivalent, **options)
+    assert torch.equal(bits(got), expected)
+    assert torch.equal(bits(w.run(*args)), expected)
+
+
+@needs_device
+@pytest.mark.parametrize("kind", range(3), ids=["decode", "paged", "ragged"])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"sm_scale": 0.5},
+        {"pos_encoding_mode": "ROPE_LLAMA"},
+        {"window_left": 123},
+        {"rope_scale": 2.0},
+    ],
+    ids=["scale", "rope", "window", "rope-scale"],
+)
+def test_forward_rejection_preserves_plan(kind, bad):
+    pr = Problem([1], [17], 8, 2, 128, 16, seed=33)
+    w, args, _, _ = _wrapper_case(kind, pr)
+    expected = bits(w.run(*args)).clone()
+    saved = _saved_forward_options(w)
+    options = {} if kind == 0 else {"causal": True}
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        w.forward(*args, **(options | bad))
+    assert _saved_forward_options(w) == saved
+    assert torch.equal(bits(w.run(*args)), expected)
+
+
+@needs_device
+@pytest.mark.parametrize("kind", [1, 2], ids=["paged", "ragged"])
+def test_prefill_replan_after_rejected_forward(kind):
+    pr = Problem([1], [17], 8, 2, 128, 16, seed=34)
+    w, args, plan_args, plan_kw = _wrapper_case(kind, pr)
+    expected = bits(w.run(*args)).clone()
+    saved = _saved_forward_options(w)
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        w.forward(*args, causal=True, use_fp16_qk_reduction=True)
+    assert _saved_forward_options(w) == saved
+    assert torch.equal(bits(w.run(*args)), expected)
+    w.plan(*plan_args, **plan_kw)
+    assert torch.equal(bits(w.run(*args)), expected)
+
+
+@needs_device
+@pytest.mark.parametrize("kind", range(3), ids=["decode", "paged", "ragged"])
+def test_forward_custom_scale(kind):
+    pr = Problem([1], [17], 8, 2, 128, 16, seed=36)
+    scale = 0.25
+    w, args, _, _ = _wrapper_case(kind, pr, sm_scale=scale)
+    expected = bits(w.run(*args)).clone()
+    options = {} if kind == 0 else {"causal": True}
+    equivalent = math.nextafter(scale, math.inf)
+    assert equivalent != scale
+    assert torch.equal(bits(w.forward(*args, sm_scale=equivalent, **options)), expected)
+    for changed in (None, 0.5):
+        with pytest.raises(bi.BatchInvariantUnsupportedError):
+            w.forward(*args, sm_scale=changed, **options)
+        assert torch.equal(bits(w.run(*args)), expected)
+
+
+@needs_device
+@pytest.mark.parametrize("kind", range(3), ids=["decode", "paged", "ragged"])
+@pytest.mark.parametrize("metadata_device", ["cpu", "cuda"])
+def test_metadata_snapshot(kind, metadata_device):
+    pr = Problem([1, 1], [17, 33], 8, 2, 128, 16, seed=37)
+    w, args, plan_args, _ = _wrapper_case(kind, pr, metadata_device)
+    expected = bits(w.run(*args)).clone()
+    # Mutating the caller's buffers after plan must not mutate its snapshot.
+    for value in plan_args:
+        if isinstance(value, torch.Tensor):
+            value.zero_()
+    assert torch.equal(bits(w.run(*args)), expected)
+
+
+@needs_device
+@pytest.mark.parametrize("kind", [0, 1], ids=["decode", "paged"])
+@pytest.mark.parametrize("metadata_device", ["cpu", "cuda"])
+def test_metadata_page_index_bounds(kind, metadata_device):
+    pr = Problem([1], [17], 8, 2, 128, 16, seed=38)
+    w, args, plan_args, plan_kw = _wrapper_case(kind, pr, metadata_device)
+    index_arg = 1 if kind == 0 else 2
+    bad = list(plan_args)
+    bad[index_arg] = plan_args[index_arg].clone()
+    bad[index_arg][0] = -1
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        w.plan(*bad, **plan_kw)
+    # The page-pool size is a run-time input; its upper bound is checked then.
+    bad[index_arg][0] = pr.k_nhd.shape[0]
+    w.plan(*bad, **plan_kw)
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        w.run(*args)
+
+
+@needs_device
+@pytest.mark.parametrize("kind", range(3), ids=["decode", "paged", "ragged"])
+@pytest.mark.parametrize("metadata_device", ["cpu", "cuda"])
+def test_metadata_empty_batch(kind, metadata_device):
+    pr = Problem([], [], 8, 2, 128, 16, seed=38)
+    w, args, _, _ = _wrapper_case(kind, pr, metadata_device)
+    assert w.run(*args).shape == (0, 8, 128)
+
+
+@needs_device
+@pytest.mark.parametrize("kind", range(3), ids=["decode", "paged", "ragged"])
+def test_output_overlap_and_disjoint_arena(kind):
+    pr = Problem([1], [17], 8, 2, 128, 16, seed=39)
+    w, args, _, _ = _wrapper_case(kind, pr)
+    expected = bits(w.run(*args)).clone()
+    q = args[0]
+    k, v = args[1] if kind < 2 else args[1:]
+    # All inputs and output can occupy distinct aligned ranges in one arena.
+    arena = torch.empty(
+        q.numel() * 2 + k.numel() + v.numel(), dtype=q.dtype, device=q.device
+    )
+    offset = 0
+    views = []
+    for source in (q, k, v):
+        view = arena[offset : offset + source.numel()].view(source.shape)
+        view.copy_(source)
+        views.append(view)
+        offset += source.numel()
+    out = arena[offset:].view(q.shape)
+    q_shared, k_shared, v_shared = views
+    shared_args = (q_shared, (k_shared, v_shared)) if kind < 2 else tuple(views)
+    assert w.run(*shared_args, out=out) is out
+    assert torch.equal(bits(out), expected)
+    # A shifted pointer still overlaps K; pointer equality is insufficient.
+    start = q.numel() + 8
+    overlapping = arena[start : start + q.numel()].view(q.shape)
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        w.run(*shared_args, out=overlapping)
+    assert torch.equal(bits(w.run(*shared_args)), expected)
+    from flashinfer.attention.batch_invariant import engine
+
+    delegate = w._batch_invariant
+    engine_args = (
+        delegate._planned,
+        q_shared,
+        k_shared,
+        v_shared,
+        delegate._kv_indptr,
+        delegate._kv_indices,
+        1.0 / math.sqrt(pr.D),
+    )
+    engine_kw = {"ragged": kind == 2}
+    assert engine.run_attention(*engine_args, out=out, **engine_kw) is out
+    assert torch.equal(bits(out), expected)
+    with pytest.raises(ValueError):
+        engine.run_attention(*engine_args, out=overlapping, **engine_kw)
+
+
+@needs_device
+@pytest.mark.parametrize("kind", range(3), ids=["decode", "paged", "ragged"])
+def test_forward_return_lse_rejection_preserves_plan(kind):
+    pr = Problem([1], [17], 8, 2, 128, 16, seed=35)
+    w, args, _, _ = _wrapper_case(kind, pr)
+    expected = bits(w.run(*args)).clone()
+    saved = _saved_forward_options(w)
+    options = {} if kind == 0 else {"causal": True}
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        w.forward_return_lse(*args, window_left=123, **options)
+    assert _saved_forward_options(w) == saved
+    assert torch.equal(bits(w.run(*args)), expected)
+
+
 # ------------------------------------------------------------------------------------------------------ device-free
 @pytest.mark.parametrize("op", WRAPPERS)
 def test_fingerprint_is_a_function_of_the_head_dim(op):
@@ -969,29 +1208,11 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
     with pytest.raises(
         bi.BatchInvariantUnsupportedError
     ):  # the deprecated forward()'s sm_scale cannot differ from the plan's
-        w._batch_invariant.run(
-            pr.q,
-            k,
-            v,
-            out=None,
-            return_lse=False,
-            lse=None,
-            window_left=None,
-            sm_scale=0.5,
-        )
+        w.forward(pr.q, (k, v), causal=True, sm_scale=0.5)
     with pytest.raises(
         bi.BatchInvariantUnsupportedError
     ):  # the deprecated forward()'s causal=False
-        w._batch_invariant.run(
-            pr.q,
-            k,
-            v,
-            out=None,
-            return_lse=False,
-            lse=None,
-            window_left=None,
-            causal=False,
-        )
+        w.forward(pr.q, (k, v), causal=False)
     with pytest.raises(
         bi.BatchInvariantUnsupportedError
     ):  # a positional argument after the cache
@@ -1116,8 +1337,7 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
     assert dec._batch_invariant._config.split_policy == "auto"
     q_last = big.q[[int(big.qo_indptr[i + 1]) - 1 for i in range(4)]].contiguous()
     assert torch.equal(bits(dec.run(q_last, big.cache("NHD"))), bits(out_big))
-    # the deprecated forward() of both prefill wrappers: an fp16 QK reduction is refused after a supported plan (forward() keeps
-    # its options on the wrapper, so this comes last)
+    # Both prefill forward() APIs refuse fp16 QK reduction after a supported plan.
     w.plan(
         pr.qo_indptr,
         pr.kv_indptr,

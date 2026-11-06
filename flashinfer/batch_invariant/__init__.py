@@ -79,6 +79,12 @@ def _bmm_fp8_fingerprint(
     return spec_fingerprint(K, _out_fmt(out_dtype), chunks_for(N, K, fmt), fmt)
 
 
+def _attention_fingerprint(head_dim: int) -> str:
+    from ..attention.batch_invariant.spec import spec_fingerprint
+
+    return spec_fingerprint(head_dim)
+
+
 def _mx_family(arch, op: str = "mm_mxfp8") -> str:
     """The architecture family behind ``arch``: a family name (``"sm_100"`` / ``"sm_103"`` / ``"sm_107"``), a compute
     capability such as ``(10, 7)``, a ``torch.device``, or None for the current CUDA device."""
@@ -131,12 +137,6 @@ def _mm_fp4_fingerprint(
     return spec_fingerprint(
         K, _out_fmt(out_dtype, "mm_fp4"), chunks_for(N, K, fmt), fmt
     )
-
-
-def _attention_fingerprint(head_dim: int) -> str:
-    from ..attention.batch_invariant.spec import spec_fingerprint
-
-    return spec_fingerprint(head_dim)
 
 
 #: The FlashInfer APIs with a batch-invariant class, by API name.

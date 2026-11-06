@@ -85,6 +85,7 @@ class BatchInvariantAttention:
         self._kv_indptr: Optional[torch.Tensor] = None
         self._kv_indices: Optional[torch.Tensor] = None
         self._sm_scale: Optional[float] = None
+        self._scale_log2 = 0.0
         self._window_left = -1
         self._total_q = 0
         self._heads: Tuple[int, int, int] = (0, 0, 0)
@@ -322,7 +323,7 @@ class BatchInvariantAttention:
                 )
             batch = int(kv_indptr.numel()) - 1
             qo_indptr = torch.arange(
-                0, batch + 1, dtype=torch.int32, device=self.device
+                0, batch + 1, dtype=torch.int32, device="cpu"
             ) * int(q_len_per_req)
         else:
             if qo_indptr is None:
@@ -389,7 +390,12 @@ class BatchInvariantAttention:
                 )
             if n_pages:
                 used = kv_indices[:n_pages]
-                lo, hi = int(used.min().item()), int(used.max().item())
+                bounds = torch.aminmax(used)
+                # Only two scalars cross from CUDA; one readback waits for both bounds.
+                if used.is_cuda:
+                    lo, hi = torch.stack(bounds).to("cpu", non_blocking=False).tolist()
+                else:
+                    lo, hi = int(bounds.min), int(bounds.max)
                 if lo < 0:
                     raise unsupported(
                         CLASS, "a negative page index", "page indices in 0..num_pages-1"
@@ -488,46 +494,44 @@ class BatchInvariantAttention:
         self._max_page = max_page
         self._total_kv = int(kv_indptr_host[-1]) if kv_indptr_host.numel() else 0
         self._sm_scale = float(sm_scale) if sm_scale is not None else 1.0 / math.sqrt(D)
+        self._scale_log2 = scale_log2(self._sm_scale)
         self._window_left = int(window_left)
         self._total_q = int(qo_host[-1].item()) if qo_host.numel() else 0
         self._heads = (num_qo_heads, num_kv_heads, D)
         self._page = page_size
 
-    # ------------------------------------------------------------------ run
-    def run(
+    def validate_forward_options(
         self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
         *,
-        out: Optional[torch.Tensor],
-        return_lse: bool,
-        lse: Optional[torch.Tensor],
-        window_left: Optional[int],
-        scales: Tuple = (),
-        sinks=None,
-        kv_cache_sf=None,
-        skip_softmax_threshold_scale_factor=None,
-        enable_pdl: Optional[bool] = None,
-        use_fp16_softmax: Optional[bool] = None,
-        uses_spcompress: Optional[bool] = None,
         sm_scale: Optional[float] = None,
         pos_encoding_mode=None,
         logits_soft_cap: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
+        window_left: Optional[int] = None,
         causal: Optional[bool] = None,
         use_fp16_qk_reduction: bool = False,
-    ) -> torch.Tensor:
-        """The wrappers' ``run`` arguments; ``sm_scale`` .. ``rope_theta`` are the per-call options the deprecated ``forward()`` sets on the
-        wrapper: they must agree with the plan (``sm_scale``) or be the class's defaults."""
+    ) -> None:
+        """Check deprecated ``forward()`` overrides without changing the wrapper or its plan."""
         if self._planned is None:
-            raise RuntimeError("plan() must be called before run()")
-        if sm_scale is not None and float(sm_scale) != self._sm_scale:
+            raise RuntimeError("plan() must be called before forward()")
+        effective_scale = (
+            sm_scale if sm_scale is not None else 1.0 / math.sqrt(self._heads[2])
+        )
+        try:
+            c = engine.check_sm_scale(effective_scale)
+        except ValueError:
             raise unsupported(
                 CLASS,
-                f"sm_scale {sm_scale} at run() after planning {self._sm_scale}",
-                "the planned sm_scale",
+                f"sm_scale {sm_scale}",
+                "a positive finite sm_scale whose log2 scale is a nonzero binary32 number",
+            ) from None
+        # The kernel consumes a binary32 log2 scale, not the caller's Python float.
+        if c != self._scale_log2:
+            raise unsupported(
+                CLASS,
+                f"sm_scale {effective_scale} at forward() after planning {self._sm_scale}",
+                "the planned binary32 log2 scale",
             )
         if logits_soft_cap is not None and logits_soft_cap > 0:
             raise unsupported(
@@ -550,6 +554,35 @@ class BatchInvariantAttention:
                 "use_fp16_qk_reduction",
                 "the fp32 score accumulation of the class",
             )
+        if window_left is not None and int(window_left) != self._window_left:
+            raise unsupported(
+                CLASS,
+                f"window_left {window_left} at forward() after planning {self._window_left}",
+                "the planned window",
+            )
+
+    # ------------------------------------------------------------------ run
+    def run(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor],
+        return_lse: bool,
+        lse: Optional[torch.Tensor],
+        window_left: Optional[int],
+        scales: Tuple = (),
+        sinks=None,
+        kv_cache_sf=None,
+        skip_softmax_threshold_scale_factor=None,
+        enable_pdl: Optional[bool] = None,
+        use_fp16_softmax: Optional[bool] = None,
+        uses_spcompress: Optional[bool] = None,
+    ) -> torch.Tensor:
+        """Validate changing run-time inputs once, then launch with the fixed plan."""
+        if self._planned is None:
+            raise RuntimeError("plan() must be called before run()")
         if use_fp16_softmax or uses_spcompress:
             raise unsupported(
                 CLASS,
@@ -664,23 +697,20 @@ class BatchInvariantAttention:
                 f"out {tuple(out.shape)} {out.dtype} on {out.device}",
                 f"a contiguous bf16 ({q.shape[0]}, {Hq}, {D}) output on {self.device}",
             )
-        if out.untyped_storage().data_ptr() in (
-            k.untyped_storage().data_ptr(),
-            v.untyped_storage().data_ptr(),
-        ):
+        elif engine._output_overlaps_kv(out, k, v):
             raise unsupported(
                 CLASS,
                 "an output that aliases the KV cache",
-                "an output buffer of its own (CTAs store rows while others still read pages)",
+                "an output byte span disjoint from the KV caches (CTAs store rows while others still read pages)",
             )
-        engine.run_attention(
+        engine._run_attention_validated(
             self._planned,
             q,
             k,
             v,
             self._kv_indptr,
             self._kv_indices,
-            self._sm_scale,
+            self._scale_log2,
             self._window_left,
             self.kv_layout,
             out,

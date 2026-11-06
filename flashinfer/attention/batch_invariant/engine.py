@@ -231,9 +231,7 @@ def _kv_view(
 ) -> torch.Tensor:
     """(D, page, Hkv, num_pages) view of an NHD / HND pool (runtime strides; no copy)."""
     if kv_layout == "NHD":
-        assert cache.shape[1:] == (page, Hkv, D), cache.shape
         return cache.permute(3, 1, 2, 0)
-    assert cache.shape[1:] == (Hkv, page, D), cache.shape
     return cache.permute(3, 2, 1, 0)
 
 
@@ -242,11 +240,9 @@ def _kv_view_ragged(kv: torch.Tensor, kv_layout: str, Hkv: int, D: int) -> torch
     ``(D, page, Hkv, num_pages)`` pool with ONE page of ``total_kv`` tokens (no copy; the size-1 page dimension gets a 16-byte
     multiple stride, which the kernel's operand contract declares)."""
     if kv_layout == "NHD":
-        assert kv.shape[1:] == (Hkv, D), kv.shape
         total = kv.shape[0]
         base = kv.permute(2, 0, 1)
     else:
-        assert kv.shape[0] == Hkv and kv.shape[2] == D, kv.shape
         total = kv.shape[1]
         base = kv.permute(2, 1, 0)
     return base.as_strided(
@@ -450,6 +446,33 @@ def workspace_bytes(
     return plan.ws_rows * ws_row(D) * 4
 
 
+def _output_overlaps_kv(out: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
+    """Conservative byte-span overlap for a contiguous output and nonnegative-strided caches.
+
+    Disjoint slices of one allocation are safe. Strided cache spans include any holes,
+    so interleaved views can still be refused even when their live elements are disjoint.
+    """
+    if not out.numel():
+        return False
+    out_start = out.data_ptr()
+    out_end = out_start + out.numel() * out.element_size()
+    for cache in (k, v):
+        if not cache.numel():
+            continue
+        start = cache.data_ptr()
+        if start >= out_end:
+            continue
+        extent = (
+            cache.numel()
+            if cache.is_contiguous()
+            else 1
+            + sum((n - 1) * s for n, s in zip(cache.shape, cache.stride(), strict=True))
+        )
+        if out_start < start + extent * cache.element_size():
+            return True
+    return False
+
+
 def run_attention(
     planned: _Planned,
     q: torch.Tensor,
@@ -464,10 +487,6 @@ def run_attention(
     config: Optional[AttnConfig] = None,
     ragged: bool = False,
 ) -> torch.Tensor:
-    from .blocks.compile import get_compiled_attention
-    from .fixup import MAX_GRID_Y, get_fixup
-    from .spec import TILE_KEYS
-
     total_q, Hq, D = q.shape
     if config is None:
         config = planned.config or default_config(D=D)
@@ -484,13 +503,14 @@ def run_attention(
             f"window_left {window_left} at run_attention over a plan built for window_left {planned.window_left}"
         )
     if ragged:
-        # the packed K / V: (total_kv, Hkv, D) under NHD, (Hkv, total_kv, D) under HND; the kernel is compiled at page = T
-        page = TILE_KEYS
+        # Packed K / V: (total_kv, Hkv, D) under NHD, (Hkv, total_kv, D) under HND.
         Hkv = k_cache.shape[1] if kv_layout == "NHD" else k_cache.shape[0]
-        kv_k, kv_v = (
-            _kv_view_ragged(k_cache, kv_layout, Hkv, D),
-            _kv_view_ragged(v_cache, kv_layout, Hkv, D),
-        )
+        for cache in (k_cache, v_cache):
+            assert (
+                cache.shape[1:] == (Hkv, D)
+                if kv_layout == "NHD"
+                else cache.shape[0] == Hkv and cache.shape[2] == D
+            ), cache.shape
     else:
         page = k_cache.shape[1] if kv_layout == "NHD" else k_cache.shape[2]
         if planned.page is not None and int(page) != planned.page:
@@ -498,10 +518,10 @@ def run_attention(
                 f"a KV cache of page size {page} at run_attention over a plan built for page size {planned.page}"
             )
         Hkv = k_cache.shape[2] if kv_layout == "NHD" else k_cache.shape[1]
-        kv_k, kv_v = (
-            _kv_view(k_cache, kv_layout, Hkv, page, D),
-            _kv_view(v_cache, kv_layout, Hkv, page, D),
-        )
+        for cache in (k_cache, v_cache):
+            assert cache.shape[1:] == (
+                (page, Hkv, D) if kv_layout == "NHD" else (Hkv, page, D)
+            ), cache.shape
     if planned.total_q is not None and int(total_q) != planned.total_q:
         raise ValueError(
             f"{total_q} query rows at run_attention over a plan built for {planned.total_q} (the units write the planned rows)"
@@ -511,7 +531,6 @@ def run_attention(
             f"{Hq} query heads over {Hkv} KV heads at run_attention over a plan built for {planned.heads[0]} over "
             f"{planned.heads[1]} (one unit per KV head: the table does not cover other head counts)"
         )
-    g = Hq // Hkv
     assert (
         q.dtype == torch.bfloat16
         and k_cache.dtype == torch.bfloat16
@@ -532,6 +551,7 @@ def run_attention(
             raise ValueError(
                 f"{name} outer strides must be multiples of 8 elements (16 bytes: the TMA descriptors' requirement); got {tuple(t.stride())}"
             )
+    supplied_out = out is not None
     if out is None:
         out = torch.empty_like(q)
     assert out.shape == q.shape and out.dtype == torch.bfloat16 and out.is_contiguous()
@@ -539,14 +559,58 @@ def run_attention(
         raise ValueError(
             "out must be 16-byte aligned (the TMA descriptors' requirement)"
         )
-    if out.untyped_storage().data_ptr() in (
-        k_cache.untyped_storage().data_ptr(),
-        v_cache.untyped_storage().data_ptr(),
-    ):
+    if supplied_out and _output_overlaps_kv(out, k_cache, v_cache):
         raise ValueError(
             "out must not alias the K / V cache: CTAs store output rows while others still read pages"
         )
     c = check_sm_scale(sm_scale)
+    return _run_attention_validated(
+        planned,
+        q,
+        k_cache,
+        v_cache,
+        kv_indptr,
+        kv_indices,
+        c,
+        window_left,
+        kv_layout,
+        out,
+        config,
+        ragged,
+    )
+
+
+def _run_attention_validated(
+    planned: _Planned,
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_indices: torch.Tensor,
+    c: float,
+    window_left: int,
+    kv_layout: str,
+    out: torch.Tensor,
+    config: AttnConfig,
+    ragged: bool,
+) -> torch.Tensor:
+    """Launch after the public engine or wrapper has checked inputs; ``c`` is the binary32 log2 scale."""
+    from .blocks.compile import get_compiled_attention
+    from .fixup import MAX_GRID_Y, get_fixup
+    from .spec import TILE_KEYS
+
+    total_q, Hq, D = q.shape
+    if ragged:
+        page = TILE_KEYS
+        Hkv = k_cache.shape[1] if kv_layout == "NHD" else k_cache.shape[0]
+        kv_k = _kv_view_ragged(k_cache, kv_layout, Hkv, D)
+        kv_v = _kv_view_ragged(v_cache, kv_layout, Hkv, D)
+    else:
+        page = k_cache.shape[1] if kv_layout == "NHD" else k_cache.shape[2]
+        Hkv = k_cache.shape[2] if kv_layout == "NHD" else k_cache.shape[1]
+        kv_k = _kv_view(k_cache, kv_layout, Hkv, page, D)
+        kv_v = _kv_view(v_cache, kv_layout, Hkv, page, D)
+    g = Hq // Hkv
     plan = planned.plan
     if total_q == 0 or plan.num_units == 0:
         return out  # nothing to compute: no TMA descriptor over an empty query extent
