@@ -15,14 +15,16 @@ limitations under the License.
 
 Public names of the Cake non-deterministic causal conv1d + SiLU training package (FlashInfer issue #8928).
 
-The module names the mode: the experimental entry points ``flashinfer.cake_causal_conv1d_nondet_train`` and
+The module names the mode: the entry-point modules (stable APIs) ``flashinfer.cake_causal_conv1d_nondet_train`` and
 ``flashinfer.cake_causal_conv1d_nondet_train_kcp`` and the package
 ``flashinfer.experimental.cake.cake_causal_conv1d_nondet_train`` (with its ``kcp`` module).  Every public name of the
-two entry-point modules (their ``__all__``) carries the mode word ``nondet``, except the module constants (ALL_CAPS);
-the package carries the mode in its path, and its public entry points and types have the entry-point modules' names
-(its internal helper ``plan_cache_clear`` keeps its name).  No public callable of the four
-modules takes a ``deterministic`` keyword (binding one is a ``TypeError``); the modules of the names before the rename
-do not import, and no module binds an old name.  CPU-only: nothing here launches, builds or needs a device.
+two entry-point modules (their ``__all__``) has the mode word ``nondet`` as one of its words (the name split at ``_``
+and at CamelCase boundaries), except the module constants (ALL_CAPS); the package carries the mode in its path, and
+its public entry points and types have the entry-point modules' names (its internal helper ``plan_cache_clear`` keeps
+its name).  No public callable of the four modules, no package object an entry point forwards to and no ``forward`` /
+``backward`` of the package's autograd Functions takes a ``deterministic`` keyword (binding one is a ``TypeError``);
+the modules of the names before the rename do not import, and no module binds an old name.  CPU-only: nothing here
+launches, builds or needs a device.
 """
 
 from __future__ import annotations
@@ -50,11 +52,25 @@ REMOVED_MODULES = (
     "flashinfer.experimental.cake.cake_causal_conv1d_train_backend",
 )
 # Module constants keep their names (``ARCHES``, ``BWD_GRID_MULTS``, ``SUPPORTED_COMPUTE_CAPABILITIES``, ...); every
-# other public name of an entry-point module carries the mode word.
+# other public name of an entry-point module has the mode word as one of its words.
 CONSTANT = re.compile(r"^[A-Z][A-Z0-9_]*$")
 MODE_WORD = "nondet"
+# One word of a name part between underscores: an upper-case run not followed by a lower-case letter (an acronym), or
+# an optional capital and its lower-case letters and digits (``CakeCausalConv1dNondetKcpFunction`` -> Cake, Causal,
+# Conv1d, Nondet, Kcp, Function).
+WORD = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z0-9]+")
 # The methods of a public class that a call reaches with the caller's keywords, where the class defines them.
 CLASS_METHODS = ("__init__", "forward", "backward", "apply")
+# The package module behind each entry-point module (its entry points forward to the package object of the same name)
+# and the package's autograd Functions that its calls apply (the KCP Functions are not names of the KCP entry-point
+# module).
+FORWARDED = {
+    FACADE: (PACKAGE, ("CakeCausalConv1dNondetFunction",)),
+    KCP_FACADE: (
+        KCP_PACKAGE,
+        ("CakeCausalConv1dNondetKcpFunction", "CakeCausalConv1dNondetKcpMultiFunction"),
+    ),
+}
 
 # (name before the rename, name after it) of the single-rank entry points: the facade and the package.
 SINGLE_RANK = (
@@ -127,45 +143,87 @@ def _public(module: ModuleType) -> list[tuple[str, object]]:
     return [(name, getattr(module, name)) for name in names if not CONSTANT.match(name)]
 
 
+def _words(name: str) -> list[str]:
+    """The lower-case words of ``name``: split at ``_`` and at CamelCase boundaries (see :data:`WORD`)."""
+
+    return [word.lower() for part in name.split("_") for word in WORD.findall(part)]
+
+
+def _members(name: str, obj: object) -> list[tuple[str, object]]:
+    """``[(name, obj)]`` for a function; for a class, ``(name.method, method)`` of the :data:`CLASS_METHODS` it
+    defines."""
+
+    if inspect.isclass(obj):
+        return [
+            (f"{name}.{method}", getattr(obj, method))
+            for method in CLASS_METHODS
+            if method in vars(obj)
+        ]
+    return [(name, obj)] if callable(obj) else []
+
+
 def _callables(module: ModuleType) -> list[tuple[str, object]]:
     """``(qualified name, callable)`` of the public functions of ``module`` and of the methods
-    :data:`CLASS_METHODS` its public classes define."""
+    :data:`CLASS_METHODS` its public classes define; for an entry-point module, also those of the package object each
+    public name forwards to and of the package's autograd Functions its calls apply (:data:`FORWARDED`), whose
+    ``forward`` and ``backward`` must exist."""
 
-    found = []
-    for name, obj in _public(module):
-        if inspect.isclass(obj):
-            found += [
-                (f"{name}.{method}", getattr(obj, method))
-                for method in CLASS_METHODS
-                if method in vars(obj)
-            ]
-        elif callable(obj):
-            found.append((name, obj))
+    found = [member for name, obj in _public(module) for member in _members(name, obj)]
+    if module.__name__ in FORWARDED:
+        package_name, functions = FORWARDED[module.__name__]
+        package = importlib.import_module(package_name)
+        for name, _ in _public(module):
+            found += _members(f"{package_name}.{name}", getattr(package, name))
+        for name in functions:
+            function = getattr(package, name)
+            assert {"forward", "backward"} <= set(vars(function)), (package_name, name)
+            found += _members(f"{package_name}.{name}", function)
     assert found, module.__name__
     return found
 
 
+def test_words_split_at_underscores_and_camel_case() -> None:
+    """The mode word counts only as a whole word of a name: not as a part of a longer word, not inside ``det``."""
+
+    for name, words in (
+        ("CakeCausalConv1dNondetKcpFunction", "cake causal conv1d nondet kcp function"),
+        ("cake_causal_conv1d_nondet_kcp_multi", "cake causal conv1d nondet kcp multi"),
+        ("KCPHandle", "kcp handle"),
+    ):
+        assert _words(name) == words.split(), (name, _words(name))
+    for name in (
+        "cake_causal_conv1d_nondeterministic",
+        "CakeCausalConv1dNondeterministicFunction",
+        "cake_causal_conv1d_det",
+        "RecomputeHandleDetKcp",
+    ):
+        assert MODE_WORD not in _words(name), name
+
+
 @pytest.mark.parametrize("module_name", FACADES)
 def test_public_names_carry_the_mode_word(module_name: str) -> None:
-    """Every name of an entry-point module's ``__all__`` resolves, and every one but the module constants contains
-    ``nondet`` (any case)."""
+    """Every name of an entry-point module's ``__all__`` resolves, and every one but the module constants has
+    ``nondet`` (any case) as one of its words (split at ``_`` and at CamelCase boundaries)."""
 
     module = importlib.import_module(module_name)
     for name, _ in _public(module):
-        assert MODE_WORD in name.lower(), (module_name, name)
+        assert MODE_WORD in _words(name), (module_name, name, _words(name))
 
 
 @pytest.mark.parametrize("module_name", MODULES)
 def test_no_public_callable_takes_a_mode_keyword(module_name: str) -> None:
     """No public function, and no ``__init__`` / ``forward`` / ``backward`` / ``apply`` of a public class, has a
     ``deterministic`` parameter, and ``deterministic=False`` binds to none of them: passing it is Python's own
-    ``TypeError`` (no keyword catch-all, no shim)."""
+    ``TypeError`` (no keyword catch-all, no shim).  For an entry-point module this covers the package objects its
+    entry points forward to and the ``forward`` / ``backward`` of the package's autograd Functions its calls apply
+    (``CakeCausalConv1dNondetFunction``, ``CakeCausalConv1dNondetKcpFunction``,
+    ``CakeCausalConv1dNondetKcpMultiFunction``)."""
 
     module = importlib.import_module(module_name)
     for name, fn in _callables(module):
         signature = inspect.signature(fn)
         assert "deterministic" not in signature.parameters, (module_name, name)
-        with pytest.raises(TypeError):
+        with pytest.raises(TypeError, match="deterministic"):
             signature.bind_partial(deterministic=False)
 
 

@@ -77,7 +77,6 @@ import json
 import statistics
 import sys
 import time
-import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional, Sequence
@@ -87,7 +86,6 @@ import torch
 import flashinfer.cake_causal_conv1d_det_train as det_conv
 import flashinfer.cake_causal_conv1d_nondet_train as nondet_conv
 import flashinfer.experimental.cake.cake_causal_conv1d_nondet_train as nondet_backend
-from flashinfer.api_logging import ExperimentalWarning
 from flashinfer.experimental.cake.cake_causal_conv1d_nondet_train import (
     cake_jit as loader,
 )
@@ -740,7 +738,6 @@ def main(argv: Optional[list[str]] = None) -> int:
         bias_dtype=None if args.bias == "none" else DTYPES[args.bias],
         silu_grad_preactivation=args.silu_grad_preactivation,
     )
-    warnings.simplefilter("ignore", ExperimentalWarning)
     device = torch.device("cuda", torch.cuda.current_device())
     for mode, api in MODES.items():
         if not api["supported"](device):

@@ -40,7 +40,6 @@ import pytest
 import torch
 
 from flashinfer import cake_causal_conv1d_nondet_train_kcp as facade
-from flashinfer.api_logging import ExperimentalWarning
 from flashinfer.experimental.cake import cake_causal_conv1d_nondet_train as pkg
 from flashinfer.experimental.cake.cake_causal_conv1d_nondet_train import (
     kcp as conv_kcp,
@@ -165,7 +164,6 @@ def test_keyword_routing(monkeypatch) -> None:
     try:
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            warnings.simplefilter("ignore", ExperimentalWarning)
             facade.cake_causal_conv1d_nondet_kcp(None, None, None, bwd_reserve_sms=1)
             facade.cake_causal_conv1d_nondet_kcp_multi(
                 None, None, None, bwd_reserve_sms=3

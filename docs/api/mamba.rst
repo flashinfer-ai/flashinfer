@@ -131,7 +131,7 @@ takes a ``deterministic`` keyword; passing one raises ``TypeError``.
      - ``y``, ``dx`` and the rank-local FP32 ``dweight`` partial bitwise
        reproducible
      - no effect
-   * - non-deterministic, single-rank (experimental)
+   * - non-deterministic, single-rank
      - ``flashinfer.cake_causal_conv1d_nondet_train``:
        ``cake_causal_conv1d_nondet``,
        ``cake_causal_conv1d_nondet_train_forward``,
@@ -141,7 +141,7 @@ takes a ``deterministic`` keyword; passing one raises ``TypeError``.
      - the forward runs; the backward raises ``RuntimeError`` (with
        ``warn_only=True``: ``UserWarning``, then it runs); nothing falls back
        to the deterministic package
-   * - non-deterministic, context-parallel (KCP, experimental)
+   * - non-deterministic, context-parallel (KCP)
      - ``flashinfer.cake_causal_conv1d_nondet_train_kcp``:
        ``cake_causal_conv1d_nondet_kcp``,
        ``cake_causal_conv1d_nondet_kcp_multi``
@@ -199,15 +199,15 @@ the halo collective of the KDA step's context.
     cake_causal_conv1d_det_multi_kcp
     RecomputeHandleDetKcp
 
-Training causal conv1d, non-deterministic (Cake, experimental)
----------------------------------------------------------------
+Training causal conv1d, non-deterministic (Cake)
+-------------------------------------------------
 
 The same convolution, single-rank and context-parallel, with a backward whose
 ``dweight`` / ``dbias`` reductions are unordered: the non-deterministic package
 ``flashinfer.cake_causal_conv1d_nondet_train[_kcp]``.  These entry points are
-experimental (``@flashinfer_experimental_api``: the first call warns once with
-``ExperimentalWarning``) and are not listed in the API summaries above.  The
-module selects the mode, and nothing here runs the deterministic package.
+stable APIs (``@flashinfer_api``); their backend package lives under
+``flashinfer.experimental.cake``.  The module selects the mode, and nothing
+here runs the deterministic package.
 
 * ``flashinfer.cake_causal_conv1d_nondet_train``:
   ``cake_causal_conv1d_nondet`` (its autograd function
@@ -226,6 +226,27 @@ module selects the mode, and nothing here runs the deterministic package.
   SM107).  ``cooperative=True`` raises ``ValueError``: it applies to the
   deterministic KCP package only, and the non-deterministic main backward is
   one ordinary launch.
+
+.. currentmodule:: flashinfer.cake_causal_conv1d_nondet_train
+
+.. autosummary::
+    :toctree: ../generated
+
+    cake_causal_conv1d_nondet
+    cake_causal_conv1d_nondet_train_forward
+    cake_causal_conv1d_nondet_train_backward
+    cake_causal_conv1d_nondet_train_backward_workspace_bytes
+    cake_causal_conv1d_nondet_train_backward_workspace
+    CakeCausalConv1dNondetFunction
+
+.. currentmodule:: flashinfer.cake_causal_conv1d_nondet_train_kcp
+
+.. autosummary::
+    :toctree: ../generated
+
+    cake_causal_conv1d_nondet_kcp
+    cake_causal_conv1d_nondet_kcp_multi
+    CakeCausalConv1dNondetKcpRecomputeHandle
 
 The package behind both,
 ``flashinfer.experimental.cake.cake_causal_conv1d_nondet_train``, exports the

@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Tests of the experimental entry points of the non-deterministic Cake causal convolution + SiLU training package: the
+Tests of the stable entry points of the non-deterministic Cake causal convolution + SiLU training package: the
 single-rank module ``flashinfer.cake_causal_conv1d_nondet_train`` and the KCP module
 ``flashinfer.cake_causal_conv1d_nondet_train_kcp``, thin entry points of the package
 ``flashinfer.experimental.cake.cake_causal_conv1d_nondet_train``.
@@ -23,7 +23,8 @@ to the non-deterministic package unchanged, also under ``torch.use_deterministic
 ``warn_only=True``) and without a warning of its own; nothing ever runs the deterministic package
 (``flashinfer.cake_causal_conv1d_det_train[_kcp]``).  The module chooses the mode: no entry point of either package
 takes a ``deterministic`` keyword (``TypeError``), and the deterministic names are unchanged.  The entry points are
-marked experimental and take the deterministic package's parameters (the KCP ones plus ``bwd_reserve_sms``);
+stable APIs (none is marked experimental, and a call emits no ``ExperimentalWarning``) and take the deterministic
+package's parameters (the KCP ones plus ``bwd_reserve_sms``);
 ``import flashinfer`` imports neither module, and the KCP module imports the package on first use only.  The opt-in
 ``bwd_grid_mult`` is refused with the deterministic package's errors, and ``cooperative=True`` with an error that names
 the deterministic KCP package.  On a device (once the package is rendered): the entry points return the package's
@@ -163,11 +164,10 @@ def torch_mode():
 
 
 def _quiet(call):
-    """``call()`` with the one-time experimental notices silenced; returns ``(result, other warnings)``."""
+    """``call()`` with every warning recorded instead of shown; returns ``(result, warnings)``."""
 
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        warnings.simplefilter("ignore", ExperimentalWarning)
         result = call()
     return result, list(caught)
 
@@ -407,13 +407,34 @@ def test_entry_points_mirror_the_package() -> None:
 
 
 @pytest.mark.cpu_only
-def test_entry_points_are_experimental() -> None:
-    for entry in (*ENTRIES, *HELPERS, SUPPORTED[0]):
-        assert getattr(getattr(facade, entry), "is_experimental", False) is True, entry
-    for entry in KCP_ENTRIES:
-        assert getattr(getattr(kcp_facade, entry), "is_experimental", False) is True, (
-            entry
-        )
+def test_entry_points_are_stable(recorded, kcp_recorded) -> None:
+    """Every entry point, helper and support query of the two modules is a stable API (``@flashinfer_api``; FlashInfer
+    issue #8928): none is marked experimental (no ``is_experimental`` set ``True`` on the entry point or on the
+    function it wraps), and a call emits no ``ExperimentalWarning``.  The modules list these names, and the single-rank
+    module re-exports the package's autograd Function."""
+
+    x, w, cu, dy, b, ctx = (object() for _ in range(6))
+    cpu = torch.device("cpu")
+    calls = [
+        (facade, "cake_causal_conv1d_nondet_train_forward", (x, w, cu)),
+        (facade, "cake_causal_conv1d_nondet_train_backward", (x, w, cu, dy)),
+        (facade, "cake_causal_conv1d_nondet", (x, w, cu, b)),
+        *((facade, helper, (64, 256, cpu)) for helper in HELPERS),
+        (facade, SUPPORTED[0], (cpu,)),
+        *((kcp_facade, entry, (x, w, ctx)) for entry in KCP_ENTRIES),
+    ]
+    for module, name, args in calls:
+        fn = getattr(module, name)
+        for marked in (fn, inspect.unwrap(fn)):
+            assert getattr(marked, "is_experimental", False) is not True, name
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = fn(*args)
+        assert result == f"nondet.{name}", name
+        experimental = [
+            c for c in caught if issubclass(c.category, ExperimentalWarning)
+        ]
+        assert experimental == [], (name, experimental)
     assert set(facade.__all__) >= set(ENTRIES) | set(HELPERS) | {SUPPORTED[0]}
     assert set(kcp_facade.__all__) == set(KCP_ENTRIES) | {
         "CakeCausalConv1dNondetKcpRecomputeHandle"
@@ -581,35 +602,31 @@ def _close(got, want) -> None:
 def test_entry_points_return_the_packages_bits() -> None:
     x, w, cu, dy, b = _problem()
     S, C = x.shape
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ExperimentalWarning)
-        y_det = det_facade.cake_causal_conv1d_det_train_forward(x, w, cu, bias=b)
-        y = facade.cake_causal_conv1d_nondet_train_forward(x, w, cu, bias=b)
-        assert torch.equal(y, y_det)
-        det_grads = det_facade.cake_causal_conv1d_det_train_backward(
-            x, w, cu, dy, bias=b
-        )
-        ws = facade.cake_causal_conv1d_nondet_train_backward_workspace(S, C, _device())
-        assert ws.dtype == torch.uint8 and int(torch.count_nonzero(ws)) == 0
-        assert (
-            ws.numel()
-            == facade.cake_causal_conv1d_nondet_train_backward_workspace_bytes(
-                S, C, _device()
-            )
-        )
-        dx, dw, db = facade.cake_causal_conv1d_nondet_train_backward(
-            x, w, cu, dy, bias=b, workspace=ws
-        )
-        assert int(torch.count_nonzero(ws)) == 0
-        assert torch.equal(dx, det_grads[0])
-        _close(dw, det_grads[1])
-        _close(db, det_grads[2])
-        assert facade.cake_causal_conv1d_nondet_train_forward_workspace_bytes(
-            S, C, _device()
-        ) == det_facade.cake_causal_conv1d_det_train_forward_workspace_bytes(
+    y_det = det_facade.cake_causal_conv1d_det_train_forward(x, w, cu, bias=b)
+    y = facade.cake_causal_conv1d_nondet_train_forward(x, w, cu, bias=b)
+    assert torch.equal(y, y_det)
+    det_grads = det_facade.cake_causal_conv1d_det_train_backward(x, w, cu, dy, bias=b)
+    ws = facade.cake_causal_conv1d_nondet_train_backward_workspace(S, C, _device())
+    assert ws.dtype == torch.uint8 and int(torch.count_nonzero(ws)) == 0
+    assert (
+        ws.numel()
+        == facade.cake_causal_conv1d_nondet_train_backward_workspace_bytes(
             S, C, _device()
         )
-        assert facade.is_cake_causal_conv1d_nondet_train_supported(_device()) is True
+    )
+    dx, dw, db = facade.cake_causal_conv1d_nondet_train_backward(
+        x, w, cu, dy, bias=b, workspace=ws
+    )
+    assert int(torch.count_nonzero(ws)) == 0
+    assert torch.equal(dx, det_grads[0])
+    _close(dw, det_grads[1])
+    _close(db, det_grads[2])
+    assert facade.cake_causal_conv1d_nondet_train_forward_workspace_bytes(
+        S, C, _device()
+    ) == det_facade.cake_causal_conv1d_det_train_forward_workspace_bytes(
+        S, C, _device()
+    )
+    assert facade.is_cake_causal_conv1d_nondet_train_supported(_device()) is True
 
 
 @gpu
@@ -619,33 +636,31 @@ def test_bwd_grid_mult() -> None:
 
     x, w, cu, dy, b = _problem()
     S, C = x.shape
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ExperimentalWarning)
-        default = det_facade.cake_causal_conv1d_det_train_backward(x, w, cu, dy, bias=b)
-        nbytes = facade.cake_causal_conv1d_nondet_train_backward_workspace_bytes(
-            S, C, _device()
+    default = det_facade.cake_causal_conv1d_det_train_backward(x, w, cu, dy, bias=b)
+    nbytes = facade.cake_causal_conv1d_nondet_train_backward_workspace_bytes(
+        S, C, _device()
+    )
+    for mult in backend.BWD_GRID_MULTS:
+        ws = facade.cake_causal_conv1d_nondet_train_backward_workspace(
+            S, C, _device(), bwd_grid_mult=mult
         )
-        for mult in backend.BWD_GRID_MULTS:
-            ws = facade.cake_causal_conv1d_nondet_train_backward_workspace(
-                S, C, _device(), bwd_grid_mult=mult
-            )
-            assert ws.numel() == nbytes and int(torch.count_nonzero(ws)) == 0
-            dx, dw, db = facade.cake_causal_conv1d_nondet_train_backward(
-                x, w, cu, dy, bias=b, workspace=ws, bwd_grid_mult=mult
-            )
-            assert int(torch.count_nonzero(ws)) == 0
-            assert torch.equal(dx, default[0]), mult
-            _close(dw, default[1])
-            _close(db, default[2])
-            xg = x.clone().requires_grad_(True)
-            wg = w.clone().requires_grad_(True)
-            bg = b.clone().requires_grad_(True)
-            facade.cake_causal_conv1d_nondet(
-                xg, wg, cu, bg, bwd_grid_mult=mult
-            ).backward(dy)
-            assert torch.equal(xg.grad, default[0]), mult
-            _close(wg.grad, default[1])
-            _close(bg.grad, default[2])
+        assert ws.numel() == nbytes and int(torch.count_nonzero(ws)) == 0
+        dx, dw, db = facade.cake_causal_conv1d_nondet_train_backward(
+            x, w, cu, dy, bias=b, workspace=ws, bwd_grid_mult=mult
+        )
+        assert int(torch.count_nonzero(ws)) == 0
+        assert torch.equal(dx, default[0]), mult
+        _close(dw, default[1])
+        _close(db, default[2])
+        xg = x.clone().requires_grad_(True)
+        wg = w.clone().requires_grad_(True)
+        bg = b.clone().requires_grad_(True)
+        facade.cake_causal_conv1d_nondet(xg, wg, cu, bg, bwd_grid_mult=mult).backward(
+            dy
+        )
+        assert torch.equal(xg.grad, default[0]), mult
+        _close(wg.grad, default[1])
+        _close(bg.grad, default[2])
 
 
 def _autograd(x0, w0, cu, dy, b0=None, *, before_backward=None, checkpointed=None):
@@ -674,13 +689,9 @@ def _autograd(x0, w0, cu, dy, b0=None, *, before_backward=None, checkpointed=Non
 @gpu
 def test_autograd_returns_the_packages_bits() -> None:
     x, w, cu, dy, b = _problem()
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ExperimentalWarning)
-        expected = det_facade.cake_causal_conv1d_det_train_backward(
-            x, w, cu, dy, bias=b
-        )
-        y_det = det_facade.cake_causal_conv1d_det_train_forward(x, w, cu, bias=b)
-        y, dx, dw, db = _autograd(x, w, cu, dy, b)
+    expected = det_facade.cake_causal_conv1d_det_train_backward(x, w, cu, dy, bias=b)
+    y_det = det_facade.cake_causal_conv1d_det_train_forward(x, w, cu, bias=b)
+    y, dx, dw, db = _autograd(x, w, cu, dy, b)
     assert torch.equal(y, y_det) and torch.equal(dx, expected[0])
     _close(dw, expected[1])
     _close(db, expected[2])
@@ -694,39 +705,35 @@ def test_torch_deterministic_mode_alerts_on_the_backward(torch_mode) -> None:
     instead.  A forward under the mode whose backward runs without it runs the package."""
 
     x, w, cu, dy, _ = _problem()
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ExperimentalWarning)
-        expected = det_facade.cake_causal_conv1d_det_train_backward(x, w, cu, dy)
-        y_det = det_facade.cake_causal_conv1d_det_train_forward(x, w, cu)
+    expected = det_facade.cake_causal_conv1d_det_train_backward(x, w, cu, dy)
+    y_det = det_facade.cake_causal_conv1d_det_train_forward(x, w, cu)
 
-        torch_mode(False)
-        y = facade.cake_causal_conv1d_nondet_train_forward(x, w, cu)
-        assert torch.equal(y, y_det)
-        with pytest.raises(RuntimeError, match=ALERT):
-            facade.cake_causal_conv1d_nondet_train_backward(x, w, cu, dy)
-        with pytest.raises(RuntimeError, match=ALERT):
-            _autograd(x, w, cu, dy)
-        torch_mode(None)
-        with pytest.raises(RuntimeError, match=ALERT):
-            _autograd(x, w, cu, dy, before_backward=lambda: torch_mode(False))
+    torch_mode(False)
+    y = facade.cake_causal_conv1d_nondet_train_forward(x, w, cu)
+    assert torch.equal(y, y_det)
+    with pytest.raises(RuntimeError, match=ALERT):
+        facade.cake_causal_conv1d_nondet_train_backward(x, w, cu, dy)
+    with pytest.raises(RuntimeError, match=ALERT):
+        _autograd(x, w, cu, dy)
+    torch_mode(None)
+    with pytest.raises(RuntimeError, match=ALERT):
+        _autograd(x, w, cu, dy, before_backward=lambda: torch_mode(False))
 
-        torch_mode(True)
-        with pytest.warns(UserWarning, match=ALERT):
-            dx, dw = facade.cake_causal_conv1d_nondet_train_backward(x, w, cu, dy)
-        assert torch.equal(dx, expected[0])
-        _close(dw, expected[1])
-        torch_mode(None)
-        with pytest.warns(UserWarning, match=ALERT):
-            y, dx, dw = _autograd(
-                x, w, cu, dy, before_backward=lambda: torch_mode(True)
-            )
-        assert torch.equal(y, y_det) and torch.equal(dx, expected[0])
-        _close(dw, expected[1])
+    torch_mode(True)
+    with pytest.warns(UserWarning, match=ALERT):
+        dx, dw = facade.cake_causal_conv1d_nondet_train_backward(x, w, cu, dy)
+    assert torch.equal(dx, expected[0])
+    _close(dw, expected[1])
+    torch_mode(None)
+    with pytest.warns(UserWarning, match=ALERT):
+        y, dx, dw = _autograd(x, w, cu, dy, before_backward=lambda: torch_mode(True))
+    assert torch.equal(y, y_det) and torch.equal(dx, expected[0])
+    _close(dw, expected[1])
 
-        torch_mode(False)
-        y, dx, dw = _autograd(x, w, cu, dy, before_backward=lambda: torch_mode(None))
-        assert torch.equal(y, y_det) and torch.equal(dx, expected[0])
-        _close(dw, expected[1])
+    torch_mode(False)
+    y, dx, dw = _autograd(x, w, cu, dy, before_backward=lambda: torch_mode(None))
+    assert torch.equal(y, y_det) and torch.equal(dx, expected[0])
+    _close(dw, expected[1])
 
 
 @gpu
@@ -738,20 +745,18 @@ def test_checkpoint(torch_mode, reentrant) -> None:
 
     x, w, cu, dy, b = _problem()
     torch_mode(None)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ExperimentalWarning)
-        direct = _autograd(x, w, cu, dy, b)
-        got = _autograd(x, w, cu, dy, b, checkpointed=reentrant)
-        assert torch.equal(got[0], direct[0]) and torch.equal(got[1], direct[1])
-        _close(got[2], direct[2])
-        _close(got[3], direct[3])
-        with pytest.raises(RuntimeError, match=ALERT):
-            _autograd(
-                x,
-                w,
-                cu,
-                dy,
-                b,
-                checkpointed=reentrant,
-                before_backward=lambda: torch_mode(False),
-            )
+    direct = _autograd(x, w, cu, dy, b)
+    got = _autograd(x, w, cu, dy, b, checkpointed=reentrant)
+    assert torch.equal(got[0], direct[0]) and torch.equal(got[1], direct[1])
+    _close(got[2], direct[2])
+    _close(got[3], direct[3])
+    with pytest.raises(RuntimeError, match=ALERT):
+        _autograd(
+            x,
+            w,
+            cu,
+            dy,
+            b,
+            checkpointed=reentrant,
+            before_backward=lambda: torch_mode(False),
+        )

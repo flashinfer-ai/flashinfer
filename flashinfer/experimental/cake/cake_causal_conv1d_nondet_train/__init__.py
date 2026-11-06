@@ -17,8 +17,8 @@ Non-deterministic backend of the Cake packed width-4 depthwise causal
 convolution + SiLU training forward / backward (SM100 / SM103 / SM107), one
 self-contained package (host API bodies, the ``cake_jit`` registry, the pinned
 ``cake_build`` loader and the generated CUDA sources under ``csrc/``).  It
-imports nothing from other flashinfer packages.  The experimental entry points
-and the user-facing documentation live in the non-deterministic package's
+imports nothing from other flashinfer packages.  The stable entry points and
+the user-facing documentation live in the non-deterministic package's
 facades :mod:`flashinfer.cake_causal_conv1d_nondet_train` and
 :mod:`flashinfer.cake_causal_conv1d_nondet_train_kcp` (the KCP entry points of
 the :mod:`.kcp` module here).

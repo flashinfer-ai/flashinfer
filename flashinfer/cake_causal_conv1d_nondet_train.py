@@ -14,8 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Cake packed width-4 depthwise causal convolution + SiLU training forward /
-backward (SM100 / SM103 / SM107), the non-deterministic package: experimental
-entry points of ``flashinfer.experimental.cake.cake_causal_conv1d_nondet_train``.
+backward (SM100 / SM103 / SM107), the non-deterministic package: the stable
+entry points over the experimental backend package
+``flashinfer.experimental.cake.cake_causal_conv1d_nondet_train``.
 The backward is ONE ordinary launch whose CTAs add their ``dweight`` /
 ``dbias`` rows into zeroed accumulators with unordered global reductions (the
 backward of the deterministic package
@@ -123,11 +124,12 @@ from typing import Any, Optional
 
 import torch
 
-from .api_logging import flashinfer_experimental_api
+from .api_logging import flashinfer_api
 
 # The package lives under flashinfer.experimental; this core module imports it on first use only (the containment
 # rules of flashinfer/experimental/README.md), so importing this module loads nothing from the experimental tree.
-# Its constants and its autograd Function resolve through the module ``__getattr__`` below.
+# Its constants and its autograd Function resolve through the module ``__getattr__`` below.  The entry points are stable
+# APIs (``@flashinfer_api``): real ``def``s whose signatures mirror the package's, forwarding each call to it.
 _FROM_BACKEND = (
     "ARCHES",
     "BWD_GRID_MULTS",
@@ -142,12 +144,7 @@ def _backend():
     return cake_causal_conv1d_nondet_train
 
 
-_FEATURE = (
-    "Cake causal conv1d + SiLU training, non-deterministic package (SM100/SM103/SM107)"
-)
-
-
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def is_cake_causal_conv1d_nondet_train_supported(device: torch.device) -> bool:
     """Whether ``device`` runs the non-deterministic package's base routes (``fwd`` and ``bwd``; the package's
     rendered ``build.json`` is required)."""
@@ -155,7 +152,7 @@ def is_cake_causal_conv1d_nondet_train_supported(device: torch.device) -> bool:
     return _backend().is_cake_causal_conv1d_nondet_train_supported(device)
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_causal_conv1d_nondet_train_backward_workspace_bytes(
     S: int,
     C: int,
@@ -172,7 +169,7 @@ def cake_causal_conv1d_nondet_train_backward_workspace_bytes(
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_causal_conv1d_nondet_train_backward_workspace(
     S: int,
     C: int,
@@ -189,7 +186,7 @@ def cake_causal_conv1d_nondet_train_backward_workspace(
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_causal_conv1d_nondet_train_forward_workspace_bytes(
     S: int, C: int, device: torch.device
 ) -> int:
@@ -201,7 +198,7 @@ def cake_causal_conv1d_nondet_train_forward_workspace_bytes(
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_causal_conv1d_nondet_train_forward_workspace(
     S: int, C: int, device: torch.device
 ) -> torch.Tensor:
@@ -210,7 +207,7 @@ def cake_causal_conv1d_nondet_train_forward_workspace(
     return _backend().cake_causal_conv1d_nondet_train_forward_workspace(S, C, device)
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_causal_conv1d_nondet_train_forward(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -260,7 +257,7 @@ def cake_causal_conv1d_nondet_train_forward(
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_causal_conv1d_nondet_train_backward(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -331,7 +328,7 @@ def cake_causal_conv1d_nondet_train_backward(
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_causal_conv1d_nondet(
     x: torch.Tensor,
     weight: torch.Tensor,

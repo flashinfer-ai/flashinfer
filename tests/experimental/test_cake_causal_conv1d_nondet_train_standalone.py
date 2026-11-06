@@ -19,12 +19,11 @@ A copy of ``flashinfer/experimental/cake/cake_causal_conv1d_nondet_train`` must
 import and reach its host-side checks on its own: under another top-level name,
 in a ``python -I`` subprocess with ``flashinfer`` blocked (the form of a
 vendoring gate, ``scripts/check_cake_build_manifests.py --vendored-gate``).  The
-package imports only itself, ``torch`` and ``tvm_ffi``; the experimental marking
-belongs to the experimental entry points
-``flashinfer.cake_causal_conv1d_nondet_train`` and
+package imports only itself, ``torch`` and ``tvm_ffi``; its stable entry points
+are ``flashinfer.cake_causal_conv1d_nondet_train`` and
 ``flashinfer.cake_causal_conv1d_nondet_train_kcp`` (covered by
-``test_cake_causal_conv1d_nondet_train_api.py``), so a direct call of the
-package emits no warning, and the only ``flashinfer`` import is the JIT
+``test_cake_causal_conv1d_nondet_train_api.py``), neither the package nor its
+entry points emit an experimental warning, and the only ``flashinfer`` import is the JIT
 fallback of ``cake_build.py``.  Two tests, CPU-only: no GPU, no generated
 program and no JIT build is needed, so both run on every lane.
 """

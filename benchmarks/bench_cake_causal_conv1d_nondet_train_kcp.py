@@ -106,7 +106,6 @@ import socket
 import statistics
 import sys
 import time
-import warnings
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -128,7 +127,6 @@ from bench_cake_causal_conv1d_nondet_train import (  # noqa: E402
     doc_lengths,
     perf_rows,
 )
-from flashinfer.api_logging import ExperimentalWarning  # noqa: E402
 from flashinfer.cake_kda_det_train_kcp import (  # noqa: E402
     build_context_det_kcp,
     partition_det_kcp,
@@ -847,7 +845,6 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.rounds < 1 or args.tensors < 1:
         parser.error("--rounds and --tensors must be at least 1")
     args.sota_arms = baselines.parse_arms(args.sota, baselines.KCP_ARMS)
-    warnings.simplefilter("ignore", ExperimentalWarning)
     rank, world, device = _init()
     for mode, api in MODES.items():
         if not api["supported"](device):

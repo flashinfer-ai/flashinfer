@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Context-parallel (KCP) packed width-4 depthwise causal convolution + SiLU training (SM100 / SM103 / SM107), the
-non-deterministic package: thin experimental entry points of
+non-deterministic package: thin stable entry points over the experimental backend module
 ``flashinfer.experimental.cake.cake_causal_conv1d_nondet_train.kcp`` (imported on first use).  The deterministic
 KCP package is :mod:`flashinfer.cake_causal_conv1d_det_train_kcp` (``cake_causal_conv1d_det_kcp``,
 ``cake_causal_conv1d_det_multi_kcp``, ``RecomputeHandleDetKcp``); this module never runs it.
@@ -70,9 +70,7 @@ from typing import Any, Optional, Sequence
 
 import torch
 
-from .api_logging import flashinfer_experimental_api
-
-_FEATURE = "Cake context-parallel causal conv1d + SiLU training, non-deterministic package (SM100/SM103/SM107)"
+from .api_logging import flashinfer_api
 
 
 def _given(**keywords: Any) -> dict[str, Any]:
@@ -82,7 +80,7 @@ def _given(**keywords: Any) -> dict[str, Any]:
     return {name: value for name, value in keywords.items() if value is not None}
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_causal_conv1d_nondet_kcp(
     x_local: torch.Tensor,
     weight: torch.Tensor,
@@ -156,7 +154,7 @@ def cake_causal_conv1d_nondet_kcp(
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_causal_conv1d_nondet_kcp_multi(
     xs: Sequence[torch.Tensor],
     weights: Sequence[torch.Tensor],
