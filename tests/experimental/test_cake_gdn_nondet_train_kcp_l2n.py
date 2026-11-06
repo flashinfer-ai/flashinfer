@@ -1587,20 +1587,23 @@ def test_facade_runs_the_norm() -> None:
 
 
 def test_facade_byte_queries_take_the_option() -> None:
-    """The facade's byte queries forward ``use_qk_l2norm_in_kernel`` to this package: the norm adds bytes, and the
-    saved set grows by the FP32 ``r`` of q and k (``8 T_r H_qk`` bytes)."""
+    """The facade's byte queries forward ``use_qk_l2norm_in_kernel`` to this package; its norm terms equal those of the
+    deterministic package's own queries (``flashinfer.cake_gdn_det_train_kcp``; same plan inputs, same formulas), and
+    the saved set grows by the FP32 ``r`` of q and k (``8 T_r H_qk`` bytes)."""
     facade = importlib.import_module("flashinfer.cake_gdn_nondet_train_kcp")
+    det_facade = importlib.import_module("flashinfer.cake_gdn_det_train_kcp")
     ctx, _ops_ = _setup()
     H_qk, HV = 2, 6
-    for query in (
-        "cake_gdn_nondet_train_kcp_saved_bytes",
-        "cake_gdn_nondet_train_kcp_workspace_bytes",
-    ):
-        q = getattr(facade, query)
+    for query in ("saved_bytes", "workspace_bytes"):
+        q = getattr(facade, f"cake_gdn_nondet_train_kcp_{query}")
+        det_q = getattr(det_facade, f"cake_gdn_det_train_kcp_{query}")
         on = q(ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=True)
         off = q(ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=False)
-        assert on > off, query
-        assert on == getattr(gbytes, query)(
+        det_on = det_q(ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=True)
+        det_off = det_q(ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=False)
+        assert on > off and det_on > det_off, query
+        assert on - off == det_on - det_off, query
+        assert on == getattr(gbytes, f"cake_gdn_nondet_train_kcp_{query}")(
             ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=True
         ), query
     assert (

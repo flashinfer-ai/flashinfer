@@ -408,7 +408,7 @@ OPTION_NAMES = tuple(f.name for f in dataclasses.fields(CakeGDNNondetKcpOptions)
 
 
 def make_options(options: Any = None, /, **kwargs: Any) -> CakeGDNNondetKcpOptions:
-    """A validated :class:`CakeGDNNondetKcpOptions` from an instance, a mapping, or keyword arguments (unknown names are a
+    """A validated :class:`CakeGDNNondetKcpOptions` from an instance, a dict, or keyword arguments (unknown names are a
     ``TypeError``: no option is ever read from anywhere but the call)."""
     if isinstance(options, CakeGDNNondetKcpOptions):
         if kwargs:

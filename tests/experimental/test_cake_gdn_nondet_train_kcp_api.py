@@ -1157,26 +1157,23 @@ def test_a_saved_set_is_read_by_its_own_packages_backward_only() -> None:
                 )
 
 
-# facade entry -> the deterministic facade's entry (``flashinfer.cake_gdn_det_train_kcp``) that the facade must never
-# reach (the recorders below fail a call that does)
-FACADE_DET_NAMES = {
-    "cake_gdn_nondet_train_kcp_partition": "cake_gdn_det_train_kcp_partition",
-    "cake_gdn_nondet_train_kcp_build_context": "cake_gdn_det_train_kcp_build_context",
-    "cake_gdn_nondet_kcp": "cake_gdn_det_kcp",
-    "cake_gdn_nondet_train_kcp_forward": "cake_gdn_det_train_kcp_forward",
-    "cake_gdn_nondet_train_kcp_backward": "cake_gdn_det_train_kcp_backward",
-    "cake_gdn_nondet_train_kcp_packed_qkv_views": "cake_gdn_det_train_kcp_packed_qkv_views",
-    "cake_gdn_nondet_train_kcp_workspace_bytes": "cake_gdn_det_train_kcp_workspace_bytes",
-    "cake_gdn_nondet_train_kcp_saved_bytes": "cake_gdn_det_train_kcp_saved_bytes",
-    "cake_gdn_nondet_train_kcp_comm_bytes": "cake_gdn_det_train_kcp_comm_bytes",
-}
+# The facade entries that call one entry of the same name in this package.
+FACADE_ENTRIES = (
+    "cake_gdn_nondet_train_kcp_partition",
+    "cake_gdn_nondet_train_kcp_build_context",
+    "cake_gdn_nondet_kcp",
+    "cake_gdn_nondet_train_kcp_forward",
+    "cake_gdn_nondet_train_kcp_backward",
+    "cake_gdn_nondet_train_kcp_packed_qkv_views",
+    "cake_gdn_nondet_train_kcp_workspace_bytes",
+    "cake_gdn_nondet_train_kcp_saved_bytes",
+    "cake_gdn_nondet_train_kcp_comm_bytes",
+)
 
 
 def _route_recorders(monkeypatch) -> list:
-    """Replace every entry of this package that the facade calls by a recorder returning its tag (``nondet:<name>``),
-    and every entry of the deterministic facade by one returning ``det:<name>`` (the facade must never reach those);
+    """Replace every entry of this package that the facade calls by a recorder returning its tag (``nondet:<name>``);
     the calls ``(tag, kwargs)`` land in the returned list."""
-    det_facade = importlib.import_module(DET_FACADE)
     pkg = _mod()
     seen: list = []
 
@@ -1187,15 +1184,47 @@ def _route_recorders(monkeypatch) -> list:
 
         return fn
 
-    for entry, det_name in FACADE_DET_NAMES.items():
-        monkeypatch.setattr(det_facade, det_name, recorder(f"det:{det_name}"))
+    for entry in FACADE_ENTRIES:
         monkeypatch.setattr(pkg, entry, recorder(f"nondet:{entry}"))
-    monkeypatch.setattr(
-        det_facade,
-        "is_cake_gdn_det_train_kcp_supported",
-        recorder("det:is_cake_gdn_det_train_kcp_supported"),
-    )
     return seen
+
+
+def test_facade_never_imports_the_deterministic_package() -> None:
+    """A fresh interpreter calls every facade entry (this package's entries replaced by stubs) and the support query:
+    no module of the deterministic package (``cake_gdn_det``) is imported on the way."""
+    code = (
+        "import sys\n"
+        "import torch\n"
+        f"import {FACADE} as facade\n"
+        "import flashinfer.experimental.cake\n"
+        "before = {m for m in sys.modules if 'cake_gdn_det' in m}\n"
+        "pkg = facade._pkg()\n"
+        f"for name in {FACADE_ENTRIES!r}:\n"
+        "    setattr(pkg, name, lambda *a, _n=name, **k: _n)\n"
+        "t, ctx = torch.zeros(1), object()\n"
+        "facade.cake_gdn_nondet_train_kcp_partition([0, 4], 1)\n"
+        "facade.cake_gdn_nondet_train_kcp_build_context(object(), None, 0, 'cpu')\n"
+        "facade.cake_gdn_nondet_kcp(t, t, t, t, t, ctx)\n"
+        "facade.cake_gdn_nondet_train_kcp_forward(t, t, t, t, t, ctx)\n"
+        "facade.cake_gdn_nondet_train_kcp_backward(t, t, t, t, t, ctx, t)\n"
+        "facade.cake_gdn_nondet_train_kcp_packed_qkv_views(t, H_qk=2, HV=6)\n"
+        "facade.cake_gdn_nondet_train_kcp_workspace_bytes(ctx, H_qk=2, HV=6)\n"
+        "facade.cake_gdn_nondet_train_kcp_saved_bytes(ctx, H_qk=2, HV=6)\n"
+        "facade.cake_gdn_nondet_train_kcp_comm_bytes(ctx, H_qk=2, HV=6)\n"
+        "facade.is_cake_gdn_nondet_train_kcp_supported('cpu')\n"
+        "facade.is_cake_gdn_nondet_train_kcp_supported()\n"
+        "new = sorted({m for m in sys.modules if 'cake_gdn_det' in m} - before)\n"
+        "assert not new, new\n"
+    )
+    root = pathlib.Path(__file__).resolve().parents[2]
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert proc.returncode == 0, proc.stderr[-4000:]
 
 
 def _facade_calls(facade) -> dict:
@@ -1995,12 +2024,9 @@ def test_program_vocabulary_is_the_design_list() -> None:
 
 def test_program_args_are_the_registry_logical_names() -> None:
     """Every value the host passes is a logical name of the registry, and every logical argument of every registry
-    record is provided by the host (skipped until ``cake_jit`` is in the package)."""
+    record is provided by the host."""
     kcp = _mod("cake_kcp")
-    try:
-        jit = _mod("cake_jit")
-    except ImportError:
-        pytest.skip("cake_jit not in the package yet")
+    jit = _mod("cake_jit")
     vocab = set(jit.LOGICAL_TENSORS) | set(jit.LOGICAL_SCALARS)
     host_only = set(kcp.HOST_ONLY_ARGS) | set(kcp.PROVISIONAL_ARGS)
     for prog, names in kcp.PROGRAM_ARGS.items():
@@ -2058,10 +2084,7 @@ def test_fwdh_form_rule_follows_the_chain_clause() -> None:
     assert not kcp.walk_vh64_fits((), 48, 148)
     assert not kcp.walk_vh64_fits(k3e, 48, 0)
     assert kcp.VH64_SUFFIX == "_vh64"
-    try:
-        jit = _mod("cake_jit")
-    except ImportError:
-        return
+    jit = _mod("cake_jit")
     if "kcp_fwdh_offset_vh64" in jit.MODULES:  # the registry of record ships both forms
         for prog in kcp.FWDH_PROGRAMS:
             assert jit.select_record(prog) == prog
@@ -2605,10 +2628,7 @@ def test_dhu_form_rule_follows_the_architecture_recommendation() -> None:
     assert kcp.dhu_vh(9, 48, 212, arch=r) == 128  # 864 > 848
     assert kcp.dhu_vh(9, 48, 212, forced=64, arch=r) == 64
     assert kcp.dhu_vh(1, 48, 152, forced=128) == 128
-    try:
-        jit = _mod("cake_jit")
-    except ImportError:
-        return
+    jit = _mod("cake_jit")
     ships_vh64 = all((p + kcp.VH64_SUFFIX) in jit.MODULES for p in kcp.DHU_PROGRAMS)
     for prog in kcp.DHU_PROGRAMS:
         assert (

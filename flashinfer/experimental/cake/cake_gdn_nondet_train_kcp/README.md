@@ -92,7 +92,7 @@ plus `CakeGDNNondetKcpFragment`, `CakeGDNNondetKcpCall` and
 public.  Every switch is a keyword argument of the public call
 (`CakeGDNNondetKcpOptions` fields); no module-level global and no environment
 variable selects anything.  An options instance of another package is a
-`TypeError`; pass a mapping or this package's `CakeGDNNondetKcpOptions`.
+`TypeError`; pass a dict or this package's `CakeGDNNondetKcpOptions`.
 
 ### Migration from the former names
 

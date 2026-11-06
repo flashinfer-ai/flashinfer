@@ -108,7 +108,7 @@ def _pkg():
 
 
 def _options_for(options: Any) -> Any:
-    """``options`` for the package: ``None``, a mapping (the package validates it) or this package's own
+    """``options`` for the package: ``None``, a dict (the package validates it) or this package's own
     ``CakeGDNNondetKcpOptions`` pass through.  An options instance of another package (the deterministic one's
     included) is a ``TypeError``: its fields are not converted."""
     if options is None or isinstance(options, dict):
