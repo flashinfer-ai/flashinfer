@@ -33,10 +33,10 @@ Every shipped training module after the renames. Each module has a backend packa
 | mHC | `flashinfer.cake_mhc_det_train` | det | single rank | #8907 (open) |
 |  | `flashinfer.cake_mhc_nondet_train` | nondet | single rank | #8907 (open) |
 | mHC head | `flashinfer.cake_mhc_head_det_train` | det | single rank | #8907 (open) |
-| GDN | `flashinfer.cake_gdn_det_train` | det | single rank | planned |
-|  | `flashinfer.cake_gdn_det_train_kcp` | det | KCP | planned |
-|  | `flashinfer.cake_gdn_nondet_train` | nondet | single rank | planned |
-|  | `flashinfer.cake_gdn_nondet_train_kcp` | nondet | KCP | planned |
+| GDN | `flashinfer.cake_gdn_det_train` | det | single rank | #8959 (open) |
+|  | `flashinfer.cake_gdn_det_train_kcp` | det | KCP | #8959 (open) |
+|  | `flashinfer.cake_gdn_nondet_train` | nondet | single rank | #8959 (open) |
+|  | `flashinfer.cake_gdn_nondet_train_kcp` | nondet | KCP | #8959 (open) |
 | KDA | `flashinfer.cake_kda_det_train` | det | single rank | planned |
 |  | `flashinfer.cake_kda_det_train_kcp` | det | KCP | planned |
 |  | `flashinfer.cake_kda_nondet_train` | nondet | single rank | planned |
@@ -88,11 +88,11 @@ For vendoring builds that copy a backend directory.
 | `flashinfer/experimental/cake/cake_mhc_train_backend/` | - | nondet, det by default | `flashinfer/experimental/cake/cake_mhc_nondet_train/` | #8907 (open) |  |
 | `flashinfer/cake_mhc_train_head_backend/` | det | det alias | `flashinfer/experimental/cake/cake_mhc_head_det_train/` | #8907 (open), #8900 (merged) |  |
 | `flashinfer/cake_mhc_det_train_head_backend/` | - | det | `flashinfer/experimental/cake/cake_mhc_head_det_train/` | #8907 (open) |  |
-| `flashinfer/experimental/cake_gdn_det_train/` | det | det | `flashinfer/experimental/cake/cake_gdn_det_train/` | planned |  |
-| `flashinfer/experimental/cake_gdn_train/` | det | det alias | `flashinfer/experimental/cake/cake_gdn_det_train_kcp/` | #8921 (merged; removed the old path), planned |  |
-| `flashinfer/experimental/cake_gdn_det_train_kcp/` | - | det | `flashinfer/experimental/cake/cake_gdn_det_train_kcp/` | planned |  |
-| `flashinfer/experimental/cake/cake_gdn_train/` | - | nondet, det by default | `flashinfer/experimental/cake/cake_gdn_nondet_train/` | planned |  |
-| `flashinfer/experimental/cake_gdn_train_kcp/` | - | nondet, det by default | `flashinfer/experimental/cake/cake_gdn_nondet_train_kcp/` | planned |  |
+| `flashinfer/experimental/cake_gdn_det_train/` | det | det | `flashinfer/experimental/cake/cake_gdn_det_train/` | #8959 (open) |  |
+| `flashinfer/experimental/cake_gdn_train/` | det | det alias | `flashinfer/experimental/cake/cake_gdn_det_train_kcp/` | #8921 (merged; removed the old path), #8959 (open) |  |
+| `flashinfer/experimental/cake_gdn_det_train_kcp/` | - | det | `flashinfer/experimental/cake/cake_gdn_det_train_kcp/` | #8959 (open) |  |
+| `flashinfer/experimental/cake/cake_gdn_train/` | - | nondet, det by default | `flashinfer/experimental/cake/cake_gdn_nondet_train/` | #8959 (open) |  |
+| `flashinfer/experimental/cake_gdn_train_kcp/` | - | nondet, det by default | `flashinfer/experimental/cake/cake_gdn_nondet_train_kcp/` | #8959 (open) |  |
 | `flashinfer/experimental/cake_kda_train/` (single-rank part) | det | det alias | `flashinfer/experimental/cake/cake_kda_det_train/` | planned |  |
 | `flashinfer/experimental/cake_kda_det_train/` | - | det | `flashinfer/experimental/cake/cake_kda_det_train/` | planned |  |
 | `flashinfer/experimental/cake_kda_train/` (KCP part) | det | det alias | `flashinfer/experimental/cake/cake_kda_det_train_kcp/` | planned | Vendor together with its single-rank sibling directory. |
@@ -271,59 +271,59 @@ For vendoring builds that copy a backend directory.
 
 | Old name | In | New name | PR |
 | --- | --- | --- | --- |
-| module flashinfer.experimental.cake_gdn_det_train (backend package imported directly; no top-level facade existed) | 0.7.3, 0.7.4rc1 | flashinfer.cake_gdn_det_train (new top-level facade); backend flashinfer.experimental.cake.cake_gdn_det_train | planned |
-| chunk_gated_delta_rule_det (flashinfer.experimental.cake_gdn_det_train) | 0.7.4rc1 | flashinfer.cake_gdn_det_train.cake_gdn_det | planned |
-| chunk_gated_delta_rule (flashinfer.experimental.cake_gdn_det_train; det entry at 0.7.3, det alias at 0.7.4rc1) | 0.7.3, 0.7.4rc1 | flashinfer.cake_gdn_det_train.cake_gdn_det (alias dropped) | planned |
-| ChunkGatedDeltaRuleDetFunction | 0.7.4rc1 | CakeGDNDetFunction | planned |
-| ChunkGatedDeltaRuleFunction (det package; class at 0.7.3, alias at 0.7.4rc1) | 0.7.3, 0.7.4rc1 | CakeGDNDetFunction (alias dropped) | planned |
-| gdn_chunk_det_forward / gdn_chunk_det_backward | 0.7.4rc1 | cake_gdn_det_train_forward / cake_gdn_det_train_backward | planned |
-| gdn_chunk_forward / gdn_chunk_backward (det package; functions at 0.7.3, aliases at 0.7.4rc1) | 0.7.3, 0.7.4rc1 | cake_gdn_det_train_forward / cake_gdn_det_train_backward (aliases dropped) | planned |
+| module flashinfer.experimental.cake_gdn_det_train (backend package imported directly; no top-level facade existed) | 0.7.3, 0.7.4rc1 | flashinfer.cake_gdn_det_train (new top-level facade); backend flashinfer.experimental.cake.cake_gdn_det_train | #8959 (open) |
+| chunk_gated_delta_rule_det (flashinfer.experimental.cake_gdn_det_train) | 0.7.4rc1 | flashinfer.cake_gdn_det_train.cake_gdn_det | #8959 (open) |
+| chunk_gated_delta_rule (flashinfer.experimental.cake_gdn_det_train; det entry at 0.7.3, det alias at 0.7.4rc1) | 0.7.3, 0.7.4rc1 | flashinfer.cake_gdn_det_train.cake_gdn_det (alias dropped) | #8959 (open) |
+| ChunkGatedDeltaRuleDetFunction | 0.7.4rc1 | CakeGDNDetFunction | #8959 (open) |
+| ChunkGatedDeltaRuleFunction (det package; class at 0.7.3, alias at 0.7.4rc1) | 0.7.3, 0.7.4rc1 | CakeGDNDetFunction (alias dropped) | #8959 (open) |
+| gdn_chunk_det_forward / gdn_chunk_det_backward | 0.7.4rc1 | cake_gdn_det_train_forward / cake_gdn_det_train_backward | #8959 (open) |
+| gdn_chunk_forward / gdn_chunk_backward (det package; functions at 0.7.3, aliases at 0.7.4rc1) | 0.7.3, 0.7.4rc1 | cake_gdn_det_train_forward / cake_gdn_det_train_backward (aliases dropped) | #8959 (open) |
 
 ### GDN det KCP (cake_gdn_det_train_kcp)
 
 | Old name | In | New name | PR |
 | --- | --- | --- | --- |
-| module flashinfer.gdn_train (det KCP facade at 0.7.3; legacy alias module at 0.7.4rc1) | 0.7.3, 0.7.4rc1 | flashinfer.cake_gdn_det_train_kcp | planned |
-| backend package flashinfer.experimental.cake_gdn_train (det KCP at 0.7.3; alias at 0.7.4rc1) | 0.7.3, 0.7.4rc1 | flashinfer.experimental.cake.cake_gdn_det_train_kcp | planned |
-| module flashinfer.cake_gdn_det_train_kcp | 0.7.4rc1 | flashinfer.cake_gdn_det_train_kcp (name unchanged; backend moves) | planned |
-| backend package flashinfer.experimental.cake_gdn_det_train_kcp | 0.7.4rc1 | flashinfer.experimental.cake.cake_gdn_det_train_kcp | planned |
-| chunk_gdn_det_kcp (flashinfer.cake_gdn_det_train_kcp) | 0.7.4rc1 | cake_gdn_det_kcp | planned |
-| chunk_gdn_kcp (flashinfer.gdn_train / experimental.cake_gdn_train; det; alias at 0.7.4rc1) | 0.7.3, 0.7.4rc1 | flashinfer.cake_gdn_det_train_kcp.cake_gdn_det_kcp | planned |
-| ChunkGDNDetFunctionKcp; ChunkGDNKcpFunction (0.7.3 class, 0.7.4rc1 alias) | 0.7.3 (ChunkGDNKcpFunction), 0.7.4rc1 (both) | CakeGDNDetKcpFunction | planned |
-| chunk_gdn_det_fwd_kcp / chunk_gdn_det_bwd_kcp; chunk_gdn_kcp_fwd / chunk_gdn_kcp_bwd (flashinfer.gdn_train, 0.7.4rc1 alias) | 0.7.3 (chunk_gdn_kcp_fwd/bwd), 0.7.4rc1 (both) | cake_gdn_det_train_kcp_forward / cake_gdn_det_train_kcp_backward | planned |
-| partition_det_kcp; kcp_partition (flashinfer.gdn_train, 0.7.4rc1 alias) | 0.7.3 (kcp_partition), 0.7.4rc1 (both) | cake_gdn_det_train_kcp_partition | planned |
-| build_context_det_kcp; build_kcp_context (flashinfer.gdn_train, 0.7.4rc1 alias) | 0.7.3 (build_kcp_context), 0.7.4rc1 (both) | cake_gdn_det_train_kcp_build_context | planned |
-| gdn_det_workspace_bytes_kcp / gdn_det_saved_bytes_kcp / gdn_det_comm_bytes_kcp; gdn_kcp_workspace_bytes / gdn_kcp_saved_bytes / gdn_kcp_comm_bytes (flashinfer.gdn_train, 0.7.4rc1 alias) | 0.7.3 (gdn_kcp_*), 0.7.4rc1 (both) | cake_gdn_det_train_kcp_workspace_bytes / cake_gdn_det_train_kcp_saved_bytes / cake_gdn_det_train_kcp_comm_bytes | planned |
-| is_gdn_det_train_kcp_supported; is_gdn_train_supported (flashinfer.gdn_train, 0.7.4rc1 alias) | 0.7.3 (is_gdn_train_supported), 0.7.4rc1 (both) | is_cake_gdn_det_train_kcp_supported | planned |
-| ContextDetKcp, OptionsDetKcp, PartitionDetKcp, RecomputeHandleDetKcp, SavedDetKcp, WorkspaceDetKcp | 0.7.4rc1 | CakeGDNDetKcpContext, CakeGDNDetKcpOptions, CakeGDNDetKcpPartition, CakeGDNDetKcpRecomputeHandle, CakeGDNDetKcpSaved, CakeGDNDetKcpWorkspace | planned |
-| KcpContext, KcpOptions, KcpPartition, KcpRecomputeHandle, KcpSaved, KcpWorkspace (flashinfer.gdn_train / experimental.cake_gdn_train; aliases at 0.7.4rc1) | 0.7.3, 0.7.4rc1 | CakeGDNDetKcpContext, CakeGDNDetKcpOptions, CakeGDNDetKcpPartition, CakeGDNDetKcpRecomputeHandle, CakeGDNDetKcpSaved, CakeGDNDetKcpWorkspace | planned |
-| packed_qkv_views_det_kcp | 0.7.4rc1 | cake_gdn_det_train_kcp_packed_qkv_views | planned |
+| module flashinfer.gdn_train (det KCP facade at 0.7.3; legacy alias module at 0.7.4rc1) | 0.7.3, 0.7.4rc1 | flashinfer.cake_gdn_det_train_kcp | #8959 (open) |
+| backend package flashinfer.experimental.cake_gdn_train (det KCP at 0.7.3; alias at 0.7.4rc1) | 0.7.3, 0.7.4rc1 | flashinfer.experimental.cake.cake_gdn_det_train_kcp | #8959 (open) |
+| module flashinfer.cake_gdn_det_train_kcp | 0.7.4rc1 | flashinfer.cake_gdn_det_train_kcp (name unchanged; backend moves) | #8959 (open) |
+| backend package flashinfer.experimental.cake_gdn_det_train_kcp | 0.7.4rc1 | flashinfer.experimental.cake.cake_gdn_det_train_kcp | #8959 (open) |
+| chunk_gdn_det_kcp (flashinfer.cake_gdn_det_train_kcp) | 0.7.4rc1 | cake_gdn_det_kcp | #8959 (open) |
+| chunk_gdn_kcp (flashinfer.gdn_train / experimental.cake_gdn_train; det; alias at 0.7.4rc1) | 0.7.3, 0.7.4rc1 | flashinfer.cake_gdn_det_train_kcp.cake_gdn_det_kcp | #8959 (open) |
+| ChunkGDNDetFunctionKcp; ChunkGDNKcpFunction (0.7.3 class, 0.7.4rc1 alias) | 0.7.3 (ChunkGDNKcpFunction), 0.7.4rc1 (both) | CakeGDNDetKcpFunction | #8959 (open) |
+| chunk_gdn_det_fwd_kcp / chunk_gdn_det_bwd_kcp; chunk_gdn_kcp_fwd / chunk_gdn_kcp_bwd (flashinfer.gdn_train, 0.7.4rc1 alias) | 0.7.3 (chunk_gdn_kcp_fwd/bwd), 0.7.4rc1 (both) | cake_gdn_det_train_kcp_forward / cake_gdn_det_train_kcp_backward | #8959 (open) |
+| partition_det_kcp; kcp_partition (flashinfer.gdn_train, 0.7.4rc1 alias) | 0.7.3 (kcp_partition), 0.7.4rc1 (both) | cake_gdn_det_train_kcp_partition | #8959 (open) |
+| build_context_det_kcp; build_kcp_context (flashinfer.gdn_train, 0.7.4rc1 alias) | 0.7.3 (build_kcp_context), 0.7.4rc1 (both) | cake_gdn_det_train_kcp_build_context | #8959 (open) |
+| gdn_det_workspace_bytes_kcp / gdn_det_saved_bytes_kcp / gdn_det_comm_bytes_kcp; gdn_kcp_workspace_bytes / gdn_kcp_saved_bytes / gdn_kcp_comm_bytes (flashinfer.gdn_train, 0.7.4rc1 alias) | 0.7.3 (gdn_kcp_*), 0.7.4rc1 (both) | cake_gdn_det_train_kcp_workspace_bytes / cake_gdn_det_train_kcp_saved_bytes / cake_gdn_det_train_kcp_comm_bytes | #8959 (open) |
+| is_gdn_det_train_kcp_supported; is_gdn_train_supported (flashinfer.gdn_train, 0.7.4rc1 alias) | 0.7.3 (is_gdn_train_supported), 0.7.4rc1 (both) | is_cake_gdn_det_train_kcp_supported | #8959 (open) |
+| ContextDetKcp, OptionsDetKcp, PartitionDetKcp, RecomputeHandleDetKcp, SavedDetKcp, WorkspaceDetKcp | 0.7.4rc1 | CakeGDNDetKcpContext, CakeGDNDetKcpOptions, CakeGDNDetKcpPartition, CakeGDNDetKcpRecomputeHandle, CakeGDNDetKcpSaved, CakeGDNDetKcpWorkspace | #8959 (open) |
+| KcpContext, KcpOptions, KcpPartition, KcpRecomputeHandle, KcpSaved, KcpWorkspace (flashinfer.gdn_train / experimental.cake_gdn_train; aliases at 0.7.4rc1) | 0.7.3, 0.7.4rc1 | CakeGDNDetKcpContext, CakeGDNDetKcpOptions, CakeGDNDetKcpPartition, CakeGDNDetKcpRecomputeHandle, CakeGDNDetKcpSaved, CakeGDNDetKcpWorkspace | #8959 (open) |
+| packed_qkv_views_det_kcp | 0.7.4rc1 | cake_gdn_det_train_kcp_packed_qkv_views | #8959 (open) |
 
 ### GDN nondet, single rank (cake_gdn_nondet_train)
 
 | Old name | In | New name | PR |
 | --- | --- | --- | --- |
-| module flashinfer.experimental.cake.cake_gdn_train | 0.7.4rc1 | flashinfer.cake_gdn_nondet_train (new top-level facade); backend flashinfer.experimental.cake.cake_gdn_nondet_train | planned |
-| chunk_gated_delta_rule(..., deterministic=False) (flashinfer.experimental.cake.cake_gdn_train) | 0.7.4rc1 | flashinfer.cake_gdn_nondet_train.cake_gdn_nondet(...) (no deterministic keyword) | planned |
-| ChunkGatedDeltaRuleFunction (flashinfer.experimental.cake.cake_gdn_train) | 0.7.4rc1 | CakeGDNNondetFunction | planned |
-| gdn_chunk_forward / gdn_chunk_backward (..., deterministic=False) (flashinfer.experimental.cake.cake_gdn_train) | 0.7.4rc1 | cake_gdn_nondet_train_forward / cake_gdn_nondet_train_backward | planned |
+| module flashinfer.experimental.cake.cake_gdn_train | 0.7.4rc1 | flashinfer.cake_gdn_nondet_train (new top-level facade); backend flashinfer.experimental.cake.cake_gdn_nondet_train | #8959 (open) |
+| chunk_gated_delta_rule(..., deterministic=False) (flashinfer.experimental.cake.cake_gdn_train) | 0.7.4rc1 | flashinfer.cake_gdn_nondet_train.cake_gdn_nondet(...) (no deterministic keyword) | #8959 (open) |
+| ChunkGatedDeltaRuleFunction (flashinfer.experimental.cake.cake_gdn_train) | 0.7.4rc1 | CakeGDNNondetFunction | #8959 (open) |
+| gdn_chunk_forward / gdn_chunk_backward (..., deterministic=False) (flashinfer.experimental.cake.cake_gdn_train) | 0.7.4rc1 | cake_gdn_nondet_train_forward / cake_gdn_nondet_train_backward | #8959 (open) |
 
 ### GDN nondet KCP (cake_gdn_nondet_train_kcp)
 
 | Old name | In | New name | PR |
 | --- | --- | --- | --- |
-| module flashinfer.cake_gdn_train_kcp | 0.7.4rc1 | flashinfer.cake_gdn_nondet_train_kcp | planned |
-| a flashinfer.cake_gdn_train_kcp entry called with the default deterministic (or deterministic=True) | 0.7.4rc1 | the matching det KCP entry: flashinfer.cake_gdn_det_train_kcp.cake_gdn_det_kcp, cake_gdn_det_train_kcp_forward/_backward/_partition/_build_context/_*_bytes, is_cake_gdn_det_train_kcp_supported | planned |
-| backend package flashinfer.experimental.cake_gdn_train_kcp | 0.7.4rc1 | flashinfer.experimental.cake.cake_gdn_nondet_train_kcp | planned |
-| chunk_gdn_kcp(..., deterministic=False) (flashinfer.cake_gdn_train_kcp) | 0.7.4rc1 | cake_gdn_nondet_kcp(...) (no deterministic keyword) | planned |
-| ChunkGDNFunctionKcp (flashinfer.experimental.cake_gdn_train_kcp) | 0.7.4rc1 | CakeGDNNondetKcpFunction | planned |
-| chunk_gdn_fwd_kcp / chunk_gdn_bwd_kcp (..., deterministic=False) | 0.7.4rc1 | cake_gdn_nondet_train_kcp_forward / cake_gdn_nondet_train_kcp_backward | planned |
-| partition_kcp | 0.7.4rc1 | cake_gdn_nondet_train_kcp_partition | planned |
-| build_context_kcp | 0.7.4rc1 | cake_gdn_nondet_train_kcp_build_context | planned |
-| gdn_workspace_bytes_kcp / gdn_saved_bytes_kcp / gdn_comm_bytes_kcp | 0.7.4rc1 | cake_gdn_nondet_train_kcp_workspace_bytes / cake_gdn_nondet_train_kcp_saved_bytes / cake_gdn_nondet_train_kcp_comm_bytes | planned |
-| is_gdn_train_kcp_supported | 0.7.4rc1 | is_cake_gdn_nondet_train_kcp_supported | planned |
-| ContextKcp, OptionsKcp, PartitionKcp, RecomputeHandleKcp, SavedKcp, WorkspaceKcp | 0.7.4rc1 | CakeGDNNondetKcpContext, CakeGDNNondetKcpOptions, CakeGDNNondetKcpPartition, CakeGDNNondetKcpRecomputeHandle, CakeGDNNondetKcpSaved, CakeGDNNondetKcpWorkspace | planned |
-| packed_qkv_views_kcp (flashinfer.experimental.cake_gdn_train_kcp) | 0.7.4rc1 | cake_gdn_nondet_train_kcp_packed_qkv_views | planned |
+| module flashinfer.cake_gdn_train_kcp | 0.7.4rc1 | flashinfer.cake_gdn_nondet_train_kcp | #8959 (open) |
+| a flashinfer.cake_gdn_train_kcp entry called with the default deterministic (or deterministic=True) | 0.7.4rc1 | the matching det KCP entry: flashinfer.cake_gdn_det_train_kcp.cake_gdn_det_kcp, cake_gdn_det_train_kcp_forward/_backward/_partition/_build_context/_*_bytes, is_cake_gdn_det_train_kcp_supported | #8959 (open) |
+| backend package flashinfer.experimental.cake_gdn_train_kcp | 0.7.4rc1 | flashinfer.experimental.cake.cake_gdn_nondet_train_kcp | #8959 (open) |
+| chunk_gdn_kcp(..., deterministic=False) (flashinfer.cake_gdn_train_kcp) | 0.7.4rc1 | cake_gdn_nondet_kcp(...) (no deterministic keyword) | #8959 (open) |
+| ChunkGDNFunctionKcp (flashinfer.experimental.cake_gdn_train_kcp) | 0.7.4rc1 | CakeGDNNondetKcpFunction | #8959 (open) |
+| chunk_gdn_fwd_kcp / chunk_gdn_bwd_kcp (..., deterministic=False) | 0.7.4rc1 | cake_gdn_nondet_train_kcp_forward / cake_gdn_nondet_train_kcp_backward | #8959 (open) |
+| partition_kcp | 0.7.4rc1 | cake_gdn_nondet_train_kcp_partition | #8959 (open) |
+| build_context_kcp | 0.7.4rc1 | cake_gdn_nondet_train_kcp_build_context | #8959 (open) |
+| gdn_workspace_bytes_kcp / gdn_saved_bytes_kcp / gdn_comm_bytes_kcp | 0.7.4rc1 | cake_gdn_nondet_train_kcp_workspace_bytes / cake_gdn_nondet_train_kcp_saved_bytes / cake_gdn_nondet_train_kcp_comm_bytes | #8959 (open) |
+| is_gdn_train_kcp_supported | 0.7.4rc1 | is_cake_gdn_nondet_train_kcp_supported | #8959 (open) |
+| ContextKcp, OptionsKcp, PartitionKcp, RecomputeHandleKcp, SavedKcp, WorkspaceKcp | 0.7.4rc1 | CakeGDNNondetKcpContext, CakeGDNNondetKcpOptions, CakeGDNNondetKcpPartition, CakeGDNNondetKcpRecomputeHandle, CakeGDNNondetKcpSaved, CakeGDNNondetKcpWorkspace | #8959 (open) |
+| packed_qkv_views_kcp (flashinfer.experimental.cake_gdn_train_kcp) | 0.7.4rc1 | cake_gdn_nondet_train_kcp_packed_qkv_views | #8959 (open) |
 
 ### KDA det (single rank): cake_kda_det_train
 
