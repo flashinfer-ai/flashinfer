@@ -5046,7 +5046,6 @@ def test_k64_split_plan_pins(tokens, sparse_topk):
         {"route": "fp8_h128_prefill_source_persistent"},
         {"route": "fp8_h64_prefill_source_persistent_m64_multi_tile"},
         {"route": "bf16_h128_topk4x_v52"},
-        {"num_heads": 64},
         {"num_heads": 32},
         {"num_heads": 16},
         {"num_heads": 8},
@@ -5437,14 +5436,23 @@ def test_split_fallbacks_launch_the_route_as_main(monkeypatch, tokens, fallback)
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "tokens,num_heads,sparse_topk",
-    [(18, 128, 1152), (24, 128, 1152), (8, 128, 1024), (8, 128, 640), (8, 64, 1152)],
+    [
+        (18, 128, 1152),
+        (24, 128, 1152),
+        (8, 128, 1024),
+        (8, 128, 640),
+        (21, 64, 1152),
+        (10, 64, 640),
+        (5, 64, 512),
+    ],
 )
 def test_split_keeps_the_route_outside_its_rule(
     monkeypatch, tokens, num_heads, sparse_topk
 ):
-    """Uniform-route launches outside the rule (more than 17 rows, items of
-    fewer than nine tiles, the 64-head rows this route also runs) keep the
-    route's single launch on SM107 with the split programs registered."""
+    """Uniform-route launches outside the rules (128 heads: more than 17 rows
+    or items of fewer than nine tiles; 64 heads: rows past those of the rule
+    of their item width) keep the route's single launch on SM107 with the
+    split programs registered."""
     inputs = _split_inputs(tokens, num_heads=num_heads, sparse_topk=sparse_topk)
     got = _run_split(monkeypatch, inputs)
     main = _run_split(monkeypatch, inputs, routed=False)
@@ -5515,19 +5523,14 @@ def test_workspace_requirement_covers_the_split_launch(arch, sm_count):
                     arch=arch,
                 )
                 own = cake._launch_workspace_bytes(req.plan, tokens, num_heads, 0)
-                split = (
-                    req.route == _UNIFORM_ROUTE
-                    and num_heads == 128
-                    and sparse_topk > 1024
-                    and tokens in _SPLIT_PIECES
-                )
-                if split:
+                pieces = _planned_pieces(num_heads, sparse_topk, tokens)
+                if req.route == _UNIFORM_ROUTE and pieces is not None:
                     carve = cake_dsv4_workspace_layout(
-                        tokens, 128, _SPLIT_PIECES[tokens]
+                        tokens, num_heads, pieces
                     ).total_bytes
                     assert req.single_launch_bytes == carve > own
                     assert carve <= get_cake_dsv4_workspace_bytes(
-                        tokens, 128, sparse_topk, torch.float8_e4m3fn
+                        tokens, num_heads, sparse_topk, torch.float8_e4m3fn
                     )
                 else:
                     assert req.single_launch_bytes == own, (tokens, sparse_topk)
@@ -5547,3 +5550,406 @@ def test_workspace_requirement_covers_the_split_launch(arch, sm_count):
         == 6_184_448
         == 263168 + 45 * (131072 + 512)
     )
+
+
+# --------------------------------------------------------------------------- #
+# SM107 split-KV launches of the uniform route with 64 heads                  #
+# --------------------------------------------------------------------------- #
+
+# Pieces per row of the 64-head split launches SM107 runs with PDL, per item
+# width in tiles (``_K64_SPLIT_RULES_H64``): rows -> pieces.
+_H64_SPLIT_PIECES = {
+    4: dict.fromkeys(range(1, 5), 4),
+    5: dict.fromkeys(range(1, 10), 5),
+    6: {**dict.fromkeys(range(1, 10), 6), **dict.fromkeys(range(10, 19), 3)},
+    7: {**dict.fromkeys(range(1, 10), 7), **dict.fromkeys(range(10, 18), 4)},
+    8: {
+        **dict.fromkeys(range(1, 8), 8),
+        **dict.fromkeys(range(8, 16), 4),
+        **dict.fromkeys(range(16, 21), 3),
+    },
+    9: {
+        **dict.fromkeys(range(1, 7), 9),
+        **dict.fromkeys(range(7, 13), 5),
+        **dict.fromkeys(range(13, 21), 3),
+    },
+}
+# The narrowest and the widest item of every tile count with a 64-head rule.
+_H64_SPLIT_WIDTHS = [
+    width for tiles in _H64_SPLIT_PIECES for width in (128 * tiles - 124, 128 * tiles)
+]
+
+
+def _planned_pieces(num_heads, sparse_topk, tokens):
+    """Pieces per row SM107 plans for a PDL launch of the uniform route of this
+    shape (``None``: no split)."""
+    tiles = -(-sparse_topk // 128)
+    if num_heads == 128:
+        return _SPLIT_PIECES.get(tokens) if tiles == 9 else None
+    if num_heads == 64:
+        return _H64_SPLIT_PIECES.get(tiles, {}).get(tokens)
+    return None
+
+
+@pytest.mark.cpu_only
+def test_k64_split_h64_rules_are_sm107a_only():
+    """Only SM107 splits 64-head launches, and only with PDL: one rule per item
+    width of four to nine tiles, at most nine pieces per row (the split
+    programs' limit) and never more pieces than tiles.  The 128-head rule
+    stays a table of its own."""
+    assert cake._K64_SPLIT_HEADS_H64 == 64 != cake._K64_SPLIT_HEADS
+    assert set(cake._K64_SPLIT_RULES_H64) == {"sm_107a"}
+    rules = cake._K64_SPLIT_RULES_H64["sm_107a"]
+    assert [rule.num_tiles for rule in rules] == sorted(_H64_SPLIT_PIECES)
+    for rule in rules:
+        assert rule.max_tokens_no_pdl == 0
+        assert rule.max_tokens_pdl == max(_H64_SPLIT_PIECES[rule.num_tiles])
+        assert max(s for s, _ in rule.splits) <= min(rule.num_tiles, 9)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("sparse_topk", [*_H64_SPLIT_WIDTHS, 128, 256, 260, 384, 1156])
+def test_k64_split_plan_h64_pins(sparse_topk):
+    """64-head SM107 PDL launches split by the rule of their item width in
+    tiles, with no whole rows; items of at most three tiles or of more than
+    nine never split, no 64-head launch splits without PDL and no other
+    architecture splits one."""
+    for tokens in (*range(0, 22), 24, 48, 127):
+        pieces = _planned_pieces(64, sparse_topk, tokens)
+        expected = None if pieces is None else (0, tokens, pieces)
+        shape = dict(num_heads=64, num_query_tokens=tokens, sparse_topk=sparse_topk)
+        assert _split_plan(**shape) == expected, tokens
+        assert _split_plan(**shape, enable_pdl=False) is None, tokens
+        for arch in ("sm_100a", "sm_103a", "sm_120a"):
+            for enable_pdl in (False, True):
+                plan = _split_plan(**shape, arch=arch, enable_pdl=enable_pdl)
+                assert plan is None, (arch, tokens)
+
+
+def _h64_plans(enable_pdl=True):
+    """SM107 plans of every 64-head width class at 0-21 rows."""
+    return [
+        _split_plan(
+            num_heads=64,
+            num_query_tokens=tokens,
+            sparse_topk=width,
+            enable_pdl=enable_pdl,
+        )
+        for width in _H64_SPLIT_WIDTHS
+        for tokens in range(0, 22)
+    ]
+
+
+def _h128_plans(enable_pdl=True):
+    """SM107 plans of nine-tile 128-head launches of 0-18 rows."""
+    return [
+        _split_plan(num_query_tokens=tokens, sparse_topk=width, enable_pdl=enable_pdl)
+        for width in (1028, 1152)
+        for tokens in range(0, 19)
+    ]
+
+
+@pytest.mark.cpu_only
+def test_k64_split_rule_tables_are_independent(monkeypatch):
+    """The 64-head plans read only ``_K64_SPLIT_RULES_H64`` and the 128-head
+    plans only ``_K64_SPLIT_RULES``: changing or emptying one table leaves
+    the other's plans, with and without PDL, as they are."""
+    import dataclasses
+
+    h64 = [_h64_plans(pdl) for pdl in (False, True)]
+    h128 = [_h128_plans(pdl) for pdl in (False, True)]
+    rule = cake._K64_SPLIT_RULES["sm_107a"]
+    splits = tuple((s, 45) for s, _ in rule.splits)
+    changed = dataclasses.replace(rule, splits=splits, max_tokens_no_pdl=13)
+    for table in ({"sm_107a": changed}, {}):
+        monkeypatch.setattr(cake, "_K64_SPLIT_RULES", table)
+        assert [_h64_plans(pdl) for pdl in (False, True)] == h64
+    monkeypatch.undo()
+    monkeypatch.setattr(cake, "_K64_SPLIT_RULES_H64", {})
+    assert [_h128_plans(pdl) for pdl in (False, True)] == h128
+    assert set(_h64_plans()) == {None}
+
+
+@pytest.mark.cpu_only
+def test_k64_split_plan_h64_without_pdl_follows_its_own_ceiling(monkeypatch):
+    """64-head launches without PDL split up to their rule's PDL-off row
+    ceiling (0 on main: none; 7 or the PDL ceiling here) with the same pieces
+    as with PDL."""
+    import dataclasses
+
+    rules = cake._K64_SPLIT_RULES_H64["sm_107a"]
+    ceiling = tuple(
+        dataclasses.replace(rule, max_tokens_no_pdl=min(7, rule.max_tokens_pdl))
+        for rule in rules
+    )
+    monkeypatch.setattr(cake, "_K64_SPLIT_RULES_H64", {"sm_107a": ceiling})
+    for width in _H64_SPLIT_WIDTHS:
+        for tokens in range(0, 22):
+            shape = dict(num_heads=64, num_query_tokens=tokens, sparse_topk=width)
+            expected = _split_plan(**shape) if tokens <= 7 else None
+            assert _split_plan(**shape, enable_pdl=False) == expected, (width, tokens)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"arch": "sm_100a"},
+        {"arch": "sm_103a"},
+        {"arch": "sm_120a"},
+        {"route": "fp8_h128_prefill_source_persistent"},
+        {"route": "fp8_h64_prefill_source_persistent_m64"},
+        {"route": "fp8_h64_prefill_source_persistent_m64_multi_tile"},
+        {"route": "fp8_h64_source_exact"},
+        {"route": "fp8_lowhead_h64"},
+        {"num_heads": 128},
+        {"num_heads": 32},
+        {"num_heads": 16},
+        {"num_heads": 8},
+        {"sparse_topk": 384},
+        {"sparse_topk": 256},
+        {"sparse_topk": 128},
+        {"enable_pdl": False},
+        {"num_query_tokens": 0},
+        {"num_query_tokens": 10},
+    ],
+    ids=lambda change: ",".join(f"{k}={v}" for k, v in change.items()),
+)
+def test_k64_split_plan_h64_keeps_every_other_launch(change):
+    """A 64-head SM107 PDL launch of 8 rows over 640-wide items splits into
+    five pieces; another architecture or route, another head count, an item of
+    at most three tiles, a launch without PDL and rows past the five-tile rule
+    keep the route."""
+    shape = dict(num_heads=64, sparse_topk=640)
+    assert _split_plan(**shape) == (0, 8, 5)
+    assert _split_plan(**{**shape, **change}) is None
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("sm_count", [148, 208, 212, 216])
+@pytest.mark.parametrize("kv4", [False, True])
+def test_h64_split_rows_already_take_the_uniform_route(sm_count, kv4):
+    """Every 64-head SM107 decode launch the 64-head rules split already runs
+    the uniform route, so the split needs no route change: every row count of
+    every rule, both widths of each tile count, q_len 1 and 4, dense and
+    ragged, both cache layouts, with and without the four-stage M64 sibling."""
+    for sparse_topk in _H64_SPLIT_WIDTHS:
+        for tokens in _H64_SPLIT_PIECES[-(-sparse_topk // 128)]:
+            for max_q_len, ragged in ((1, False), (4, False), (4, True)):
+                if not ragged and tokens % max_q_len:
+                    continue
+                for page_size in (64, 2):
+                    route = _route(
+                        dtype=torch.float8_e4m3fn,
+                        num_heads=64,
+                        max_q_len=max_q_len,
+                        ragged=ragged,
+                        sparse_topk=sparse_topk,
+                        batch_size=-(-tokens // max_q_len),
+                        compressed_page_size=page_size,
+                        num_query_tokens=tokens,
+                        sm_count=sm_count,
+                        arch="sm_107a",
+                        kv4=kv4,
+                    )
+                    assert route == cake._K64_SPLIT_ROUTE, (sparse_topk, tokens)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("kv4", [False, True])
+def test_h64_split_leaves_three_tile_and_prefill_rows(kv4):
+    """Three-tile decode items run the multi-tile M64 route with the
+    four-stage sibling and the uniform route without it, with no rule either
+    way; prefill rows (at least 257 query tokens per request, past every
+    rule) run the multi-tile M64 route.  None of them splits."""
+    shapes = [(tokens, 384, 1, False) for tokens in (1, 4, 8, 16)]
+    shapes += [(257, 640, 257, True), (512, 1152, 512, False)]
+    for tokens, sparse_topk, max_q_len, ragged in shapes:
+        route = _route(
+            dtype=torch.float8_e4m3fn,
+            num_heads=64,
+            max_q_len=max_q_len,
+            ragged=ragged,
+            sparse_topk=sparse_topk,
+            batch_size=-(-tokens // max_q_len),
+            compressed_page_size=64,
+            num_query_tokens=tokens,
+            sm_count=212,
+            arch="sm_107a",
+            kv4=kv4,
+        )
+        uniform = not kv4 and max_q_len < 257
+        expected = _UNIFORM_ROUTE if uniform else _M64_MULTI_TILE_ROUTE
+        assert route == expected, (route, tokens)
+        plan = _split_plan(
+            route=route, num_heads=64, num_query_tokens=tokens, sparse_topk=sparse_topk
+        )
+        assert plan is None, (route, tokens)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+def test_h64_workspace_requirement_covers_the_split_launch(arch):
+    """At a 64-head split shape the requirement reports the split carve on
+    every architecture, as for 128 heads (the number reads neither the
+    architecture nor PDL; only SM107 launches the split); elsewhere it reports
+    the route's own numbers, and get_cake_dsv4_workspace_bytes bounds every
+    carve."""
+    for sparse_topk in (*_H64_SPLIT_WIDTHS, 384):
+        for tokens in (*range(1, 22), 24):
+            req = cake.cake_dsv4_workspace_requirement(
+                dtype=torch.float8_e4m3fn,
+                num_heads=64,
+                num_query_tokens=tokens,
+                sm_count=212,
+                sparse_topk=sparse_topk,
+                compressed_page_size=64,
+                max_q_len=1,
+                batch_size=tokens,
+                ragged=False,
+                arch=arch,
+            )
+            assert req.route == _UNIFORM_ROUTE
+            own = cake._launch_workspace_bytes(req.plan, tokens, 64, 0)
+            pieces = _planned_pieces(64, sparse_topk, tokens)
+            if pieces is None:
+                assert req.single_launch_bytes == own, (tokens, sparse_topk)
+                continue
+            carve = cake_dsv4_workspace_layout(tokens, 64, pieces).total_bytes
+            assert req.single_launch_bytes == carve > own
+            assert carve <= get_cake_dsv4_workspace_bytes(
+                tokens, 64, sparse_topk, torch.float8_e4m3fn
+            )
+    # The largest carve: 17 rows of four pieces over seven tiles (68 pieces).
+    assert (
+        max(
+            cake._k64_split_workspace_bytes(
+                _UNIFORM_ROUTE, num_heads=64, num_query_tokens=tokens, sparse_topk=width
+            )
+            for width in _H64_SPLIT_WIDTHS
+            for tokens in range(1, 22)
+        )
+        == 4_737_024
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "tokens,sparse_topk",
+    [
+        (1, 512),
+        (4, 388),
+        (9, 640),
+        (9, 768),
+        (18, 644),
+        (10, 896),
+        (17, 772),
+        (7, 1024),
+        (20, 900),
+        (6, 1152),
+        (12, 1028),
+        (20, 1152),
+    ],
+)
+def test_run_cake_dsv4_h64_split_launch_binds_the_piece_views(
+    monkeypatch, tokens, sparse_topk
+):
+    """A 64-head split launch binds like a 128-head one with H = 64: the
+    producer, two CTAs per piece, stores through the [T * s, 64, 512] partial-O
+    view at byte 263168 and the LSE right after it; the merge, one CTA per
+    (row, head), reads the same views and writes O; both bind the call's PDL
+    and run in one run_sequence call."""
+    splits = _planned_pieces(64, sparse_topk, tokens)
+    pieces = tokens * splits
+    inputs = _split_inputs(tokens, num_heads=64, sparse_topk=sparse_topk)
+    record = _run_split(monkeypatch, inputs)
+    assert record.sequences == [2]
+    (producer, p), (merge, m) = record.calls
+    assert (producer, merge) == (cake._K64_SPLIT_VARIANT, cake._K64_SPLIT_MERGE)
+    base = inputs["workspace_buffer"].data_ptr()
+    out = inputs["out"]
+    lse_offset = 263168 + pieces * 65536
+    layout = cake_dsv4_workspace_layout(tokens, 64, splits)
+    assert layout.partial_o == (263168, pieces * 64 * 512 * 2)
+    assert layout.partial_lse == (lse_offset, pieces * 64 * 4)
+    # Producer.
+    view = p["tmap_partial_o"]
+    assert view.data_ptr() == base + 263168 and view.is_contiguous()
+    assert view.shape == (pieces, 64, 512) and view.dtype == torch.bfloat16
+    assert p["partial_lse"].data_ptr() == base + lse_offset
+    assert p["partial_lse"].numel() == pieces * 64
+    assert p["partial_lse"].dtype == torch.float32
+    assert p["tmap_o"] is p["O"] and p["O"].data_ptr() == out.data_ptr()
+    assert p["O"].shape == (tokens, 64, 512)
+    # The 64-head query rows: the producer's second 64-head Q box lies past
+    # them (zero-filled by the tensor map).
+    assert p["tmap_q"].data_ptr() == inputs["query"].data_ptr()
+    assert p["tmap_q"].shape == (tokens, 64, 512)
+    assert (p["grid_x"], p["grid_y"], p["grid_z"]) == (2 * pieces, 1, 1)
+    assert p["total_work_items"] == pieces and p["num_whole_items"] == 0
+    assert p["num_splits"] == splits and p["num_query_tokens"] == tokens
+    assert p["num_heads"] == 64 and p["sparse_topk"] == sparse_topk
+    assert p["enable_pdl"] == 1
+    # Merge.
+    assert m["partial_O"].data_ptr() == base + 263168
+    assert m["partial_O"].numel() == pieces * 64 * 512
+    assert m["partial_lse"].data_ptr() == base + lse_offset
+    assert m["partial_lse"].numel() == pieces * 64
+    assert m["O"].data_ptr() == out.data_ptr() and m["O"].shape == (tokens, 64, 512)
+    assert m["num_splits"] == splits and m["num_heads"] == 64
+    assert (m["grid_x"], m["grid_y"], m["grid_z"]) == (tokens, 64, 1)
+    assert m["enable_pdl"] == 1
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("tokens,sparse_topk", [(1, 1152), (9, 640), (20, 1024)])
+@pytest.mark.parametrize(
+    "fallback", ["workspace", "no_pdl", "sm_100a", "sm_103a", "gate", "unrouted"]
+)
+def test_h64_split_fallbacks_launch_the_route_as_main(
+    monkeypatch, tokens, sparse_topk, fallback
+):
+    """As for 128 heads: a workspace one byte short of the split carve, a call
+    without PDL, SM100 / SM103, a process that cannot launch the K=64 programs
+    and a registry without the split programs each run the route's own single
+    launch of a 64-head split shape, argument for argument as without the
+    split."""
+    splits = _planned_pieces(64, sparse_topk, tokens)
+    carve = cake_dsv4_workspace_layout(tokens, 64, splits).total_bytes
+    inputs = _split_inputs(
+        tokens,
+        num_heads=64,
+        sparse_topk=sparse_topk,
+        workspace_bytes=carve - 1 if fallback == "workspace" else carve,
+    )
+    arch = fallback if fallback.startswith("sm_") else "sm_107a"
+    enable_pdl = fallback != "no_pdl"
+    asked = []
+    if fallback == "gate":
+        monkeypatch.setattr(
+            cake,
+            "_k64_sibling_launchable",
+            lambda gate_arch, device: asked.append((gate_arch, device)) or False,
+        )
+    got = _run_split(
+        monkeypatch,
+        inputs,
+        arch=arch,
+        enable_pdl=enable_pdl,
+        routed=fallback != "unrouted",
+    )
+    main = _run_split(
+        monkeypatch, inputs, arch=arch, enable_pdl=enable_pdl, routed=False
+    )
+    assert _launch_record(got.calls) == _launch_record(main.calls)
+    assert got.sequences == []
+    ((variant, args),) = got.calls
+    assert variant == _UNIFORM_ROUTE
+    assert (args["grid_x"], args["grid_y"], args["grid_z"]) == (2 * tokens, 1, 1)
+    assert args["num_heads"] == 64 and args["total_work_items"] == tokens
+    base = inputs["workspace_buffer"].data_ptr()
+    assert args["partial_lse"].data_ptr() == base + 263168
+    assert args["partial_lse"].numel() == tokens * 64
+    assert args["O"].data_ptr() == inputs["out"].data_ptr()
+    assert args["enable_pdl"] == int(enable_pdl)
+    assert asked == ([("sm_107a", torch.device("cpu"))] if fallback == "gate" else [])

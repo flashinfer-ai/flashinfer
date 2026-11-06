@@ -74,7 +74,7 @@ Host contract (flashinfer#4671 hardening)
   :func:`_route_plan` table the dispatcher launches with): routes without
   partial buffers need no workspace bytes, one-split routes need the LSE
   region only, split routes the partial O and LSE regions. The one-split
-  FP8/H128 uniform-gather route at the shapes of the SM107 split rule is
+  FP8/H128 uniform-gather route at the shapes of the SM107 split rules is
   the exception: its ``single_launch_bytes`` is the split launch's carve
   ``cake_dsv4_workspace_layout(T, H, s)`` ("Split-KV pieces" below), so
   size those calls with ``single_launch_bytes`` or with
@@ -669,9 +669,9 @@ def get_cake_dsv4_workspace_bytes(
     validated only. Pass ``num_splits`` to size for a known route (routes use
     ``ceil(sparse_topk / 128)`` or a fixed 1..5 splits). The FP8/H128
     uniform-gather route runs one split, but at the shapes of the SM107 split
-    rule its split-KV launch carves ``cake_dsv4_workspace_layout(T, H, s)``
+    rules its split-KV launch carves ``cake_dsv4_workspace_layout(T, H, s)``
     (module docstring, "Split-KV pieces"): size those calls without
-    ``num_splits`` (``S = 9 >= s``) or with
+    ``num_splits`` (``S >= s``: a split has at most one piece per tile) or with
     :func:`cake_dsv4_workspace_requirement`'s ``single_launch_bytes``, not
     with ``num_splits=1``, which runs the route's own launch. A smaller buffer is
     not an error: the host tiles the metadata rows into launches that fit,
@@ -1773,7 +1773,7 @@ class WorkspaceRequirement:
 
     ``single_launch_bytes`` is what one launch over all metadata rows carves
     (0 for routes without partial buffers; at the shapes of the SM107 split
-    rule, the split launch's carve, while ``num_splits`` stays the route's
+    rules, the split launch's carve, while ``num_splits`` stays the route's
     own count, 1); ``minimum_bytes`` is the smallest
     workspace the call accepts (one row per launch, row tiling); any size in
     between works with :meth:`rows_per_launch` rows per launch.
@@ -1834,6 +1834,9 @@ def cake_dsv4_workspace_requirement(
     ``ValueError`` for a shape ``backend="cake"`` has no kernel for.
     ``single_launch_bytes`` covers the SM107 split-KV launch of the shape
     (:func:`_k64_split_plan`, with or without PDL) on every architecture.
+    Below 69 SMs some 64-head split shapes take an M64 route, which never
+    splits, so their ``single_launch_bytes`` can depend on ``sm_count``,
+    ``arch`` and ``kv4``.
     """
     device_arch = arch is None
     if sm_count is None:
@@ -2407,6 +2410,36 @@ _K64_SPLIT_RULES: Mapping[str, _K64SplitRule] = {
     ),
 }
 
+# 64-head launches of the same route, per architecture: one rule per item
+# width in tiles.  VR200 (sm_107a, 212 SMs), eight back-to-back calls per
+# CUDA graph with PDL over one input set and over eight, L2 flushed before
+# each replay, q_len 1 and 4, items n x 128 wide whose rows use every tile,
+# split launch vs the K=32 program, lowest of four rounds and both input
+# protocols, at 1-5, 8, 9, 12-14, 16-18, 20 and 24 rows (1, 4, 8 and 16 at
+# four tiles): four tiles (width 512) 1.05-1.18x at 1 and 4 rows, five (640)
+# 1.03-1.22x up to 9 rows, six (768) 1.02-1.34x up to 18, seven (896)
+# 1.02-1.41x up to 17, eight (1024) 1.04-1.51x up to 20 and nine (1152)
+# 1.10-1.63x up to 20; at the next measured row count a split gains under
+# 2 % or loses.  Three tiles have no rule: where the four-stage M64 body runs
+# them, a split lost against it from 4 rows.  A launch whose every row fits
+# in one piece measured 0.83-0.98x (1152 and 640 wide); as for 128 heads,
+# those launches split as well, and no launch without PDL splits.
+_K64_SPLIT_HEADS_H64 = 64
+_K64_SPLIT_RULES_H64: Mapping[str, tuple[_K64SplitRule, ...]] = {
+    "sm_107a": (
+        # num_tiles, max_tokens_pdl, max_tokens_no_pdl, splits.  Rows 1-4 in
+        # four pieces; 1-9 in five; 1-9 in six, 10-18 in three; 1-9 in seven,
+        # 10-17 in four; 1-7 in eight, 8-15 in four, 16-20 in three; 1-6 in
+        # nine, 7-12 in five, 13-20 in three.
+        _K64SplitRule(4, 4, 0, ((4, 16),)),
+        _K64SplitRule(5, 9, 0, ((5, 45),)),
+        _K64SplitRule(6, 18, 0, ((6, 54), (3, 54))),
+        _K64SplitRule(7, 17, 0, ((7, 63), (4, 68))),
+        _K64SplitRule(8, 20, 0, ((8, 56), (4, 60), (3, 60))),
+        _K64SplitRule(9, 20, 0, ((9, 54), (5, 60), (3, 60))),
+    ),
+}
+
 
 def _k64_split_plan(
     route: str,
@@ -2418,13 +2451,20 @@ def _k64_split_plan(
     enable_pdl: bool,
 ) -> Optional[tuple[int, int, int]]:
     """The split of a launch of ``route`` over ``num_query_tokens`` rows by
-    ``arch``'s rule in ``_K64_SPLIT_RULES``: ``(W, R, s)`` with ``W = 0``
+    ``arch``'s rule in ``_K64_SPLIT_RULES`` (128 heads) or its rule for the
+    item width in ``_K64_SPLIT_RULES_H64`` (64 heads): ``(W, R, s)`` with ``W = 0``
     whole rows, ``R = num_query_tokens`` split rows and ``s`` pieces per row,
     or ``None`` (the route's own launch).  A function of the launch shape
     alone; :func:`_k64_split` adds the registry, workspace and device checks.
     """
     rule = _K64_SPLIT_RULES.get(arch)
-    if rule is None or route != _K64_SPLIT_ROUTE or num_heads != _K64_SPLIT_HEADS:
+    if num_heads == _K64_SPLIT_HEADS_H64:
+        tiles = max(_ceil_div(sparse_topk, _TILE_KV), 1)
+        rules = _K64_SPLIT_RULES_H64.get(arch, ())
+        rule = next((r for r in rules if r.num_tiles == tiles), None)
+    elif num_heads != _K64_SPLIT_HEADS:
+        rule = None
+    if rule is None or route != _K64_SPLIT_ROUTE:
         return None
     if max(_ceil_div(sparse_topk, _TILE_KV), 1) != rule.num_tiles:
         return None
@@ -2443,7 +2483,7 @@ def _k64_split_workspace_bytes(
     """The largest workspace carve of a split launch of this shape on any
     architecture, with or without PDL (0: such a launch never splits)."""
     carve = 0
-    for arch in _K64_SPLIT_RULES:
+    for arch in {*_K64_SPLIT_RULES, *_K64_SPLIT_RULES_H64}:
         for enable_pdl in (False, True):
             split = _k64_split_plan(
                 route,
@@ -2628,10 +2668,12 @@ def run_cake_dsv4(
     programs launch without the attribute.  Without ``enable_pdl`` the FP8
     H128 persistent route launches its PDL-free twin on SM103 from 384 query
     rows per launch and on SM100 when the longest request has at least 257
-    query tokens (``_pdl_variant``).  On SM107, FP8/H128 launches of few
-    metadata rows over items 1025-1152 wide (``_K64_SPLIT_RULES``) run a
-    split-KV producer and a merge when the workspace holds their carve
-    (:func:`_k64_split`; :func:`cake_dsv4_workspace_requirement` includes it).
+    query tokens (``_pdl_variant``).  On SM107, PDL launches of FP8/H128 of few
+    metadata rows over items 1025-1152 wide (``_K64_SPLIT_RULES``) and of
+    FP8/H64 of few rows over items of four to nine tiles
+    (``_K64_SPLIT_RULES_H64``) run a split-KV producer and a merge when the
+    workspace holds their carve (:func:`_k64_split`;
+    :func:`cake_dsv4_workspace_requirement` includes it).
 
     ``out=None`` allocates the output here, after the route is known, so the
     routes in ``_OUT_PHASE_BY_ROUTE`` get their measured-fast base phase;
