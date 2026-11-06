@@ -301,8 +301,8 @@ def _det_callables():
 
 def test_det_entries_have_no_mode_parameter():
     """No deterministic entry point has a ``deterministic`` parameter; the autograd
-    function's ``forward`` takes ``x``, ``w``, ``offs`` and the internal deferred-launch
-    slot only."""
+    function's ``forward`` takes ``x``, ``w``, ``offs``, the internal deferred-launch
+    slot and the ``fuse_wgrad_accumulation`` switch only."""
     for name, fn in _det_callables().items():
         if inspect.isclass(fn):
             continue
@@ -310,7 +310,14 @@ def test_det_entries_have_no_mode_parameter():
     from flashinfer.experimental.cake_moe_grouped_det_gemm import cake_autograd
 
     forward = inspect.signature(cake_autograd.CakeGroupedDetMm.forward)
-    assert list(forward.parameters) == ["ctx", "x", "w", "offs", "_launch"]
+    assert list(forward.parameters) == [
+        "ctx",
+        "x",
+        "w",
+        "offs",
+        "_launch",
+        "fuse_wgrad_accumulation",
+    ]
 
 
 def _cpu_operands():

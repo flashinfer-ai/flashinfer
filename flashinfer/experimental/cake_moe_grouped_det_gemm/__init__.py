@@ -20,7 +20,8 @@ limitations under the License.
 # projection ``Y = X @ W[e].T`` (``grouped_det_gemm_fwd``), the activation gradient
 # ``dX = G @ W[e]`` (``grouped_det_gemm_dgrad``) and the weight gradient
 # ``dW[e] = G[e].T @ X[e]`` with bf16 or fp32 output (``grouped_det_gemm_wgrad``),
-# also added into a caller's fp32 / bf16 buffer (``accumulate=True``).
+# also added into a caller's fp32 / bf16 buffer (``accumulate=True``; the autograd
+# wrapper's ``fuse_wgrad_accumulation`` adds into ``w.main_grad``).
 #
 # The public (experimental) entry points are the core functions
 # ``flashinfer.grouped_mm.grouped_det_gemm_fwd`` / ``grouped_det_gemm_dgrad`` /

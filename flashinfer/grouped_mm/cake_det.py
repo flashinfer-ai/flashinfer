@@ -138,6 +138,8 @@ def cake_grouped_det_mm(
     x: torch.Tensor,
     w: torch.Tensor,
     offs: torch.Tensor,
+    *,
+    fuse_wgrad_accumulation: bool = False,
 ) -> torch.Tensor:
     """Differentiable ragged grouped GEMM ``Y[offs[e-1]:offs[e]] = X[offs[e-1]:offs[e]] @ W[e].T``.
 
@@ -150,13 +152,48 @@ def cake_grouped_det_mm(
     offs : torch.Tensor
         int32 device tensor: ``[E]`` cumulative end offsets or ``m_indptr``
         ``[E + 1]``.  Read by the kernels, never on the host.
+    fuse_wgrad_accumulation : bool
+        Keyword-only.  ``False`` (default): the backward returns ``w``'s
+        gradient as below.  ``True`` (Megatron's
+        ``gradient_accumulation_fusion``): ``w.main_grad`` must be an fp32 or
+        bf16 tensor of ``w``'s shape on its device with unit stride along the
+        last dimension (``ValueError``, checked at the forward call when
+        autograd records it: ``w`` requires grad, grad mode is on and the call
+        is not a checkpoint recompute inside a backward; and again at the
+        backward, which reads ``w.main_grad`` then).  Under
+        ``torch.no_grad()`` or inference mode the forward needs no
+        ``main_grad``.  The backward adds the deterministic ``dW`` into it in
+        place (``main_grad[e] += G[e].T @ X[e]``: ``dW`` in ``main_grad``'s
+        dtype into a scratch, then ``main_grad.add_`` on the same stream, the
+        package's accumulate mode), which gives AccumulateGrad's bits of that
+        ``dW``, bitwise reproducible run to run, and returns for ``w`` a fresh
+        ``torch.empty`` of ``w``'s shape and dtype when ``w`` has the attribute
+        ``grad_added_to_main_grad`` (set to ``True``; ``torch.zeros`` when
+        ``w.zero_out_wgrad`` is true), else ``None``: ``w.grad`` is then
+        untouched and no gradient hook of ``w`` fires.  Every backward adds
+        (``retain_graph`` twice adds twice), also a ``torch.autograd.grad``
+        whose ``inputs`` exclude ``w`` (split backward-weight schedules are not
+        supported); a ``w`` that does not require grad is never added to.  Not
+        supported (``NotImplementedError``) under ``torch.jit.trace``,
+        ``torch.compile`` and a ``create_graph`` backward; under a reentrant
+        checkpoint ``w`` arrives detached, without ``main_grad``
+        (``ValueError``).  Cost: the weight-gradient launch holds a scratch of
+        ``E * N * K`` elements of ``main_grad``'s dtype (``4 * E * N * K``
+        bytes for fp32, freed after the add), which the programs write and the
+        add reads back besides its read and write of ``main_grad``; the
+        placeholder takes ``2 * E * N * K`` bytes.  Under
+        ``torch.use_deterministic_algorithms(True)`` with
+        ``torch.utils.deterministic.fill_uninitialized_memory`` on (the
+        default) torch also fills the scratch and the ``torch.empty``
+        placeholder with NaN when it allocates them.
 
     Returns
     -------
     torch.Tensor
         ``[sum_m, N]`` bfloat16.  ``backward`` produces ``x.grad`` ``[sum_m, K]``
         bfloat16 and ``w.grad`` ``[E, N, K]`` in ``w``'s dtype (bfloat16); use
-        :func:`grouped_det_gemm_wgrad` directly for an fp32 weight gradient.
+        :func:`grouped_det_gemm_wgrad` directly for an fp32 weight gradient, or
+        ``fuse_wgrad_accumulation=True`` to add it into an fp32 ``main_grad``.
         The forward GEMM runs after autograd saved ``x``, ``w`` and ``offs``:
         under a non-reentrant checkpoint with early stop on, the recomputation
         skips it when these are the last saves of the innermost checkpointed
@@ -165,8 +202,9 @@ def cake_grouped_det_mm(
     Notes
     -----
     Deterministic only: the forward and both gradients reduce in a fixed order
-    and are bitwise reproducible run to run.  There is no ``deterministic``
-    parameter (passing one raises ``TypeError``) and
+    and are bitwise reproducible run to run, with or without
+    ``fuse_wgrad_accumulation``.  There is no ``deterministic`` parameter
+    (passing one raises ``TypeError``) and
     ``torch.use_deterministic_algorithms(True)`` changes nothing (no alert, no
     warning).  The non-deterministic wrapper is
     ``flashinfer.experimental.cake.cake_moe_grouped_gemm.cake_grouped_mm(...,
@@ -176,4 +214,4 @@ def cake_grouped_det_mm(
         cake_grouped_det_mm as _impl,
     )
 
-    return _impl(x, w, offs)
+    return _impl(x, w, offs, fuse_wgrad_accumulation=fuse_wgrad_accumulation)
