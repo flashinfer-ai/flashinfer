@@ -94,6 +94,8 @@ The kernels, the host planning, the autograd wrapper and the JIT registration
 live in the package, which every function imports inside its body (a deferred
 import), so importing this module loads none of it; the prepared launch and the
 ``torch.autograd.Function`` resolve from the package on first access.
+:func:`is_cake_moe_grouped_gemm_nondet_train_supported` tells whether a device has
+the programs of every operation.
 """
 
 from __future__ import annotations
@@ -122,6 +124,7 @@ __all__ = [
     "cake_moe_grouped_gemm_nondet_train_prepare_forward",
     "cake_moe_grouped_gemm_nondet_train_prepare_wgrad",
     "cake_moe_grouped_gemm_nondet_train_wgrad",
+    "is_cake_moe_grouped_gemm_nondet_train_supported",
 ]
 
 _PACKAGE = "flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train"
@@ -438,6 +441,35 @@ def cake_moe_grouped_gemm_nondet(
     )
 
     return _impl(x, w, offs, fuse_wgrad_accumulation=fuse_wgrad_accumulation)
+
+
+def is_cake_moe_grouped_gemm_nondet_train_supported(
+    device: Optional[torch.device] = None,
+) -> bool:
+    """Whether the non-deterministic MoE grouped GEMM runs on ``device``.
+
+    True when ``device`` (default: the current CUDA device) is a CUDA device whose
+    architecture this checkout registers a program for, for every operation of the
+    module: the forward, the data gradient and the weight gradient (either output
+    dtype).  False without CUDA, for a device that is not CUDA or not visible, and
+    for an architecture without the programs.  The query loads no program and
+    launches nothing.
+    """
+    if not torch.cuda.is_available():
+        return False
+    device = torch.device("cuda") if device is None else torch.device(device)
+    if device.type != "cuda":
+        return False
+    if device.index is not None and device.index >= torch.cuda.device_count():
+        return False
+    from .experimental.cake.cake_moe_grouped_gemm_nondet_train import (
+        cake_backend,
+        cake_jit,
+    )
+
+    return all(
+        cake_backend.generated_program_available(device, op) for op in cake_jit.OPS
+    )
 
 
 # The two types of the module, resolved from the package on first access (importing this module

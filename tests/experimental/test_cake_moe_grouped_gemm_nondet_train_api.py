@@ -382,6 +382,53 @@ def test_importing_the_facade_imports_neither_package():
     assert json.loads(_run_cpu_subprocess(code)) == []
 
 
+_SUPPORT_OFF_CUDA = """
+import json
+import sys
+
+import torch
+
+import flashinfer.cake_moe_grouped_gemm_nondet_train as facade
+
+assert not torch.cuda.is_available()
+query = facade.is_cake_moe_grouped_gemm_nondet_train_supported
+devices = (None, "cuda", torch.device("cuda", 0), "cpu")
+answers = [query()] + [query(device) for device in devices]
+loaded = sorted(m for m in sys.modules if m.startswith(facade._PACKAGE))
+print(json.dumps([answers, loaded]))
+"""
+
+
+def test_support_query_is_false_off_cuda():
+    """``is_cake_moe_grouped_gemm_nondet_train_supported`` is a plain function (not marked
+    experimental) that is ``False`` without CUDA (the default device, an explicit CUDA
+    device, a CPU device) and then imports none of the package; a device that is not
+    CUDA is ``False`` on any host."""
+    answers, loaded = json.loads(_run_cpu_subprocess(_SUPPORT_OFF_CUDA))
+    assert answers == [False] * 5 and loaded == []
+    query = facade.is_cake_moe_grouped_gemm_nondet_train_supported
+    for device in ("cpu", torch.device("cpu"), "meta"):
+        assert query(device) is False, device
+    assert not hasattr(query, "is_experimental")
+    assert "is_cake_moe_grouped_gemm_nondet_train_supported" in facade.__all__
+    assert list(inspect.signature(query).parameters) == ["device"]
+    assert inspect.signature(query).parameters["device"].default is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_support_query_on_this_device():
+    """On a CUDA device the support query is the backend's program query of every
+    operation (``cake_jit.OPS``), for the default device and an explicit index; an
+    index past the visible devices is ``False``."""
+    from flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train import cake_jit
+
+    query = facade.is_cake_moe_grouped_gemm_nondet_train_supported
+    device = torch.device("cuda", torch.cuda.current_device())
+    want = all(cb.generated_program_available(device, op) for op in cake_jit.OPS)
+    assert query() is want and query(device) is want
+    assert query(torch.device("cuda", torch.cuda.device_count())) is False
+
+
 # ---------------------------------------------------------------------------
 # The package's deterministic-mode alert (CPU)
 # ---------------------------------------------------------------------------

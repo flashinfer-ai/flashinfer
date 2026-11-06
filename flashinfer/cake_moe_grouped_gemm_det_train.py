@@ -22,7 +22,8 @@ the backend package
 experimental-API marking and hands off to it.  The prepared launch and the
 ``torch.autograd.Function`` resolve from the package on first access.  Every
 function imports the package inside its body (a deferred import), so importing
-this module loads none of it.
+this module loads none of it.  :func:`is_cake_moe_grouped_gemm_det_train_supported`
+tells whether a device has the programs of every operation.
 
 Usage::
 
@@ -62,6 +63,7 @@ __all__ = [
     "cake_moe_grouped_gemm_det_train_prepare_forward",
     "cake_moe_grouped_gemm_det_train_prepare_wgrad",
     "cake_moe_grouped_gemm_det_train_wgrad",
+    "is_cake_moe_grouped_gemm_det_train_supported",
 ]
 
 _PACKAGE = "flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train"
@@ -372,6 +374,35 @@ def cake_moe_grouped_gemm_det(
     )
 
     return _impl(x, w, offs, fuse_wgrad_accumulation=fuse_wgrad_accumulation)
+
+
+def is_cake_moe_grouped_gemm_det_train_supported(
+    device: Optional[torch.device] = None,
+) -> bool:
+    """Whether the deterministic MoE grouped GEMM runs on ``device``.
+
+    True when ``device`` (default: the current CUDA device) is a CUDA device whose
+    architecture this checkout registers a program for, for every operation of the
+    module: the forward, the data gradient and the weight gradient (either output
+    dtype).  False without CUDA, for a device that is not CUDA or not visible, and
+    for an architecture without the programs.  The query loads no program and
+    launches nothing.
+    """
+    if not torch.cuda.is_available():
+        return False
+    device = torch.device("cuda") if device is None else torch.device(device)
+    if device.type != "cuda":
+        return False
+    if device.index is not None and device.index >= torch.cuda.device_count():
+        return False
+    from .experimental.cake.cake_moe_grouped_gemm_det_train import (
+        cake_backend,
+        cake_jit,
+    )
+
+    return all(
+        cake_backend.generated_program_available(device, op) for op in cake_jit.OPS
+    )
 
 
 # The two types of the module, resolved from the package on first access (importing this module
