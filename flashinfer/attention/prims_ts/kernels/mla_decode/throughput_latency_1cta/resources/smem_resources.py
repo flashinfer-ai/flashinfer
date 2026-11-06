@@ -156,7 +156,9 @@ class SmemQResource(MlaResource):
             self._alloc = SmemAllocation(
                 name=f"{self.name}",
                 size_bytes=(
-                    4096 if self.cfg.q_nope_tmem else self.cfg.qk_smem_tile_bytes
+                    4096
+                    if self.cfg.q_nope_tmem and not self.cfg.q_tmem_mma_copy
+                    else self.cfg.qk_smem_tile_bytes
                 )
                 * self.cfg.q_stages,
                 alignment=self.cfg.stensor_align,
@@ -177,7 +179,11 @@ class SmemQResource(MlaResource):
         if cutlass.const_expr(self.cfg.q_tma_stage):
             self.q_temp_state = smem_array(context, self.q_temp_alloc, Int64, 4)
         elem_count = (
-            (4096 if self.cfg.q_nope_tmem else self.cfg.qk_smem_tile_bytes)
+            (
+                4096
+                if self.cfg.q_nope_tmem and not self.cfg.q_tmem_mma_copy
+                else self.cfg.qk_smem_tile_bytes
+            )
             * self.cfg.q_stages
         ) // self.cfg.qkv_dtype_bytes
         self._smem_q = smem_array(context, self._alloc, qkv_dtype(self.cfg), elem_count)
@@ -292,7 +298,7 @@ class SmemQResource(MlaResource):
             == qk_stage_idx % self.cfg.load_num_warps
         ):
             smem_offset = Int32(q_stage_smem_element_offset(self.cfg, qk_stage_idx))
-            if cutlass.const_expr(self.cfg.q_nope_tmem):
+            if cutlass.const_expr(self.cfg.q_nope_tmem and not self.cfg.q_tmem_mma_copy):
                 smem_offset = Int32(0)
             prims.cp_async_bulk_tensor_shared_cta_global(
                 stage_base.data_ptr(smem_offset),
@@ -473,9 +479,10 @@ class SmemQResource(MlaResource):
         if cutlass.const_expr(cfg.q_tma_stage):
             self.stage_q_via_tma(stage_info, stage_base)
             return
-        if cutlass.const_expr(cfg.q_nope_tmem):
+        if cutlass.const_expr(cfg.q_nope_tmem and not cfg.q_tmem_mma_copy):
             self.copy_nope_to_tmem(stage_info)
         else:
+            # An MMA-copied Q lands in the ordinary SW128 panels the copy reads.
             for qk_stage_idx in cutlass.range_constexpr(latent_stages):
                 dim_offset = Int32(qk_stage_idx * cfg.head_dim_per_stage_kv)
                 self._load_q_stage(
@@ -548,9 +555,13 @@ class SmemQResource(MlaResource):
         if cutlass.const_expr(self.cfg.q_nope_tmem):
             prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
             cache = decode_gen_task_cache(stage_info)
-            desc_q = Int64(
-                cache[_TASK_CACHE_TMEM_BASE_OFFSET] + Int32(self._tmem_alloc.offset)
-            )
+            tmem_q = cache[_TASK_CACHE_TMEM_BASE_OFFSET] + Int32(self._tmem_alloc.offset)
+            if cutlass.const_expr(self.cfg.q_tmem_mma_copy):
+                # The MMA thread issues the copy after the previous tile's QK and
+                # before this tile's; tcgen05 executes its operations in order.
+                if prims.elect_sync():
+                    copy_q_fp8_to_tmem(stage_base.data_ptr(Int32(0)), tmem_q, cta_group=1)
+            desc_q = Int64(tmem_q)
         return desc_q, desc_q_rope
 
 
@@ -2150,9 +2161,17 @@ class SmemKvResource(MlaResource):
             if cutlass.const_expr(reuse_k):
                 # K waits advance independently of releases. Keep its payload
                 # live until the corresponding delayed PV has consumed it.
-                stage_base = self._smem_kv.subview(
-                    self.kv_stage_offset(self.consumer_release_state.index)
-                )
+                stage_idx = self.consumer_release_state.index
+                if cutlass.const_expr(self.cfg.num_ctas_per_head_dim > 1):
+                    # A V split reads its own columns' K slices, which start
+                    # v_head_dim_stages slices per lower V owner into the tile.
+                    v_partition = cta_idx_head_dim_v_for_stage(
+                        self.cta_idx_head_dim_v, stage_info
+                    )
+                    stage_idx = (
+                        stage_idx + v_partition * Int32(self.cfg.v_head_dim_stages)
+                    ) % Int32(self.cfg.kv_stages)
+                stage_base = self._smem_kv.subview(self.kv_stage_offset(stage_idx))
             if cutlass.const_expr(self.cfg.whole_kv_tile):
                 stage_base = stage_base.subview(Int32(k_subtile_idx * 16384))
             v_leading_byte_offset = (
