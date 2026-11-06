@@ -225,6 +225,22 @@ change workspace sizing. One-shot MLA exposes the same flag.
 See the [MLA contract](kernels/mla_decode/README.md) for validation,
 empty-cache, and workspace details.
 
+### Programmatic dependent launch
+
+Every planning and one-shot entry point takes `enable_pdl`, as does the
+VC-Attention preparation. It launches the PrimTS kernels of a run with
+programmatic dependent launch (PDL): a kernel may start while the grid ahead of
+it on the stream finishes, and it waits for that grid in-kernel before it reads
+memory an earlier grid may write, including device
+[global scale operands](#global-scale-operands). `None` (default) enables it on
+devices that support PDL; `False` keeps plain stream ordering. The flag is fixed
+when the plan is built (the CuTe DSL kernels compile it in), so wrappers take it
+in `plan()`; it changes neither kernel selection nor workspace sizes. Split FMHA
+decode launches (`BatchDecodePagedTSWrapper`, `batch_decode_with_paged_kv_cache`,
+`prepare_prims_ts_batch_decode_with_kv_cache`) whose reduction is fused into
+attention or runs across a cluster keep plain stream ordering, and the
+synchronous inspection of the block-sparse one-shot APIs is a plain launch.
+
 ## QToken-KvBlock-Sparse-Attention interface
 
 QToken-KvBlock-Sparse-Attention consumes per-query indexer output directly.
@@ -370,16 +386,18 @@ spellings intentionally match paged block-sparse attention: `q`,
 The convenience API infers physical page size from `paged_kv_cache`; only
 the prepared wrapper's `plan` takes `page_size` explicitly.
 
-On SM90 and newer, the combined route-builder and attention launch use PDL.
+With `enable_pdl`
+([Programmatic dependent launch](#programmatic-dependent-launch)), the metadata
+kernel, attention and the split-KV reducer are programmatic dependent launches.
+The metadata kernel waits for the preceding grid before reading its inputs.
 Each metadata CTA releases attention after its last output store, so the
 attention prologue overlaps the metadata tail without leaving attention CTAs
 resident for the whole metadata grid; the attention dependency wait covers all
-metadata stores.
-Attention initializes its independent resources before acquiring immediately
-ahead of the first metadata-dependent read. Split-KV attention releases its
-reducer only after producer completion and TMEM teardown; the reducer
-initializes local resources before all threads acquire. Older architectures
-retain stream ordering.
+metadata stores. Attention initializes its independent resources before
+acquiring immediately ahead of the first metadata-dependent read, and the
+reducer waits before its first read of memory a preceding grid may write.
+Split-KV attention releases its reducer only after producer completion and
+TMEM teardown. `enable_pdl=False` keeps these launches in stream order.
 
 For `BlockSparsePagedTSWrapper`, `plan` freezes only the compact fixed-Q
 geometry, dtypes, sparse-route capacity, and `max_seq_len_kv`; it retains no
@@ -518,10 +536,14 @@ when a mean is used).
 Every run first launches a small kernel that gathers the plan's scales into
 one buffer in the order the attention kernel reads them: the K scales per
 64-token atom, the Q scales per Q-tile row and the V scales (and means) per
-KV head; attention reads that buffer alone. A block-sparse run's route
-prepare follows it as a programmatic dependent launch, starting while the
-scale kernel drains and acquiring it before exiting, so the attention launch
-that follows in stream order finds both the scales and the routes complete.
+KV head; attention reads that buffer alone. A block-sparse run launches its
+route prepare between the scale kernel and attention. With `enable_pdl`
+([Programmatic dependent launch](#programmatic-dependent-launch)) each of these
+launches is a programmatic dependent launch: it may start while the kernel
+ahead of it drains, and it waits for that kernel in-kernel before its first
+read of memory an earlier kernel may write, so attention finds the scales, and
+in a block-sparse run the routes, complete. `enable_pdl=False` keeps them in
+stream order.
 
 ### Kernels and features
 
