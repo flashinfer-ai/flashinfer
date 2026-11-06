@@ -98,7 +98,12 @@ variable selects anything.  An options instance of another package is a
 
 ### Migration from the former names
 
-The former names fail at import; there are no aliases.
+The former names fail at import; there are no aliases.  The rows are for
+callers of the non-deterministic route.  The former facade
+`flashinfer.cake_gdn_train_kcp` ran this package only with
+`deterministic=False`; in earlier releases its default `deterministic=True`
+ran the deterministic package, and a caller that relied on that default
+migrates to `flashinfer.cake_gdn_det_train_kcp` (see its README).
 
 | former name | new name |
 |---|---|
@@ -114,7 +119,7 @@ The former names fail at import; there are no aliases.
 | `is_gdn_train_kcp_supported` | `is_cake_gdn_nondet_train_kcp_supported` |
 | `ContextKcp`, `PartitionKcp`, `FragmentKcp`, `OptionsKcp`, `RecomputeHandleKcp`, `SavedKcp`, `WorkspaceKcp`, `CallKcp` | `CakeGDNNondetKcpContext`, `...Partition`, `...Fragment`, `...Options`, `...RecomputeHandle`, `...Saved`, `...Workspace`, `...Call` |
 | `PackedQKVSplitKcp` | `CakeGDNNondetKcpPackedQKVSplitFunction` |
-| `deterministic=False` on every entry | removed (no keyword) |
+| the `deterministic=` keyword (facade entries; `False` selected this package) | removed (no keyword); the mode is the package name |
 | `MODE`, `check_mode`, `ND_ONLY_SAVE_MODES` | removed |
 | package-root re-exports of `cake_kcp` internals: `KCP_SAVED_VERSION`, `LAST_CALL`, `PROGRAMS`, `SCALE`, `Backend`, `FakeBackend`, `KernelBackend`, `get_backend`, `set_backend`, `graph_cache_clear` | `cake_kcp.<name>` (same name) |
 | package-root re-exports of `cake_options` helpers: `make_options`, `validate_heads`, `validate_ring` | `cake_options.<name>` (same name) |
