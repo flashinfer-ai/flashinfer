@@ -1205,7 +1205,7 @@ def test_forward_gate_edges_match_the_deterministic_package(
 
 
 # The rows per SM from which each architecture runs the long backward.
-LONG_BACKWARD_ROWS_PER_SM = {"sm_100a": 12000, "sm_103a": 12000, "sm_107a": 1024}
+LONG_BACKWARD_ROWS_PER_SM = {"sm_100a": 12000, "sm_103a": 12000, "sm_107a": 3200}
 # Backward inputs around and past the long backward's threshold: (tokens,
 # heads, layout); ``heads=None`` takes ``threshold * SMs + tokens`` rows as one
 # flat [rows, 128] tensor.
@@ -1279,7 +1279,7 @@ def test_backward_around_the_long_threshold_matches_the_deterministic_package(
 
 
 # The rows per SM from which an architecture runs the mid backward.
-MID_BACKWARD_ROWS_PER_SM = {"sm_100a": 800, "sm_103a": 700}
+MID_BACKWARD_ROWS_PER_SM = {"sm_100a": 800, "sm_103a": 700, "sm_107a": 1024}
 # Backward inputs around and in the mid backward's rows: (tokens, heads,
 # layout); ``heads=None`` takes ``threshold * SMs + tokens`` rows as one flat
 # [rows, 128] tensor.
