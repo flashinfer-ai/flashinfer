@@ -11,6 +11,8 @@ SM100 (B200 / GB200), SM103 (B300 / GB300) and SM107 (R200).  Its functions are 
 FlashInfer APIs: each one hands off to the function of the same name in the backend
 package :mod:`flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train`, which holds
 the generated programs.  Importing the module loads none of the backend package.
+``flashinfer`` binds the module's names on first access, so for example
+``flashinfer.cake_moe_grouped_gemm_det`` needs no import of the module.
 
 Groups are consecutive row ranges of the packed activations, described by an int32
 **device** tensor: either ``offs[E]`` of cumulative end offsets or ``m_indptr[E + 1]``

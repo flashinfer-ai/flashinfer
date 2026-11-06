@@ -178,6 +178,24 @@ _PRIMS_TS_LAZY_EXPORTS = frozenset(
 # import the experimental tree.
 _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     **{name: (".fused_moe", name) for name in sorted(_PRIMS_TS_LAZY_EXPORTS)},
+    # The deterministic Cake MoE grouped GEMM: the names of its module.
+    **{
+        name: (".cake_moe_grouped_gemm_det_train", name)
+        for name in (
+            "CakeMoEGroupedGemmDetFunction",
+            "CakeMoEGroupedGemmDetLaunch",
+            "cake_moe_grouped_gemm_det",
+            "cake_moe_grouped_gemm_det_train_dgrad",
+            "cake_moe_grouped_gemm_det_train_forward",
+            "cake_moe_grouped_gemm_det_train_prepare_dgrad",
+            "cake_moe_grouped_gemm_det_train_prepare_forward",
+            "cake_moe_grouped_gemm_det_train_prepare_wgrad",
+            "cake_moe_grouped_gemm_det_train_wgrad",
+            "is_cake_moe_grouped_gemm_det_train_supported",
+        )
+    },
+    # Its non-deterministic counterpart is reached through its module only.
+    "cake_moe_grouped_gemm_nondet_train": (".cake_moe_grouped_gemm_nondet_train", None),
 }
 
 

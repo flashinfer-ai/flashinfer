@@ -258,3 +258,20 @@ def test_the_objects_are_named_after_themselves(name):
     assert entry is not obj
     assert entry.__name__ == entry.__qualname__ == name
     assert inspect.unwrap(entry).__module__ == FACADE
+
+
+def test_flashinfer_binds_the_names_on_first_access():
+    """``flashinfer`` binds every name of the module, and no other name of it, through
+    a row of ``flashinfer._LAZY_EXPORTS`` (on first access, so ``import flashinfer``
+    loads no backend); the module itself has no row."""
+    import flashinfer
+
+    rows = {
+        name: row
+        for name, row in flashinfer._LAZY_EXPORTS.items()
+        if row[0] == f".{MODULE}"
+    }
+    facade = _module(FACADE)
+    assert rows == {name: (f".{MODULE}", name) for name in facade.__all__}
+    for name in facade.__all__:
+        assert getattr(flashinfer, name) is getattr(facade, name), name

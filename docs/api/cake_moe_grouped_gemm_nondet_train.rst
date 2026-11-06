@@ -13,7 +13,8 @@ gradient whose 512-wide k tile adds its split tail with unordered fp32 reduction
 functions are stable FlashInfer APIs: each one hands off to the function of the same
 name in the backend package
 :mod:`flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train`.  Importing the
-module loads none of the backend package.
+module loads none of the backend package.  ``flashinfer`` binds the module itself on
+first access, not its names: they are reached through the module only.
 
 Mode rules
 ----------
