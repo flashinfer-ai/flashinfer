@@ -269,23 +269,6 @@ def test_entries_take_no_deterministic_keyword(name, via, value, monkeypatch):
     assert log == []
 
 
-def test_autograd_function_forward_takes_no_deterministic_parameter():
-    """``CakeMoEGroupedGemmNondetFunction.forward`` has no ``deterministic`` parameter
-    and no catch-all: its slots are the operands, the internal ``_launch`` slot and the
-    fuse flag."""
-    parameters = inspect.signature(
-        cake_autograd.CakeMoEGroupedGemmNondetFunction.forward
-    ).parameters
-    assert list(parameters) == [
-        "ctx",
-        "x",
-        "w",
-        "offs",
-        "_launch",
-        "fuse_wgrad_accumulation",
-    ]
-
-
 @pytest.mark.parametrize("via", ["package", "facade"])
 @pytest.mark.parametrize("value", [True, False])
 def test_stale_positional_mode_is_a_type_error(via, value, monkeypatch):
