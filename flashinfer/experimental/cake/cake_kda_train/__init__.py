@@ -18,7 +18,7 @@ limitations under the License.
 # training forward and backward in the GLM-5.3-Flash geometry (head dimension
 # 128, chunk 64, per-document zero initial state) on SM100 / SM103 / SM107, the
 # ``deterministic=False`` counterpart of
-# ``flashinfer.experimental.cake_kda_det_train``.  The public entry points are
+# ``flashinfer.experimental.cake.cake_kda_det_train``.  The public entry points are
 # ``flashinfer.cake_kda_train.chunk_kda_fwd``, ``chunk_kda_bwd`` and
 # ``chunk_kda`` with ``deterministic=False``; the host plan, workspace, launch
 # sequences, autograd Function, registry and generated sources live here.
