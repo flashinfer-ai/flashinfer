@@ -659,9 +659,9 @@ def test_facade_exposes_the_contract_names_keyword_only() -> None:
     pkg = _mod()
     for n in FACADE_TYPES:
         assert getattr(facade, n) is getattr(pkg, n), n
-    # the default scale is private (no mode word): the package's SCALE
-    assert "_DEFAULT_SCALE" not in facade.__all__
-    assert facade._DEFAULT_SCALE == 128**-0.5 == _mod("cake_kcp").SCALE
+    # the default scale keeps its name (an ALL_CAPS constant, not in ``__all__``): the package's SCALE
+    assert "DEFAULT_SCALE" not in facade.__all__
+    assert facade.DEFAULT_SCALE == 128**-0.5 == _mod("cake_kcp").SCALE
     with pytest.raises(AttributeError):
         facade.no_such_name  # noqa: B018
 
@@ -877,7 +877,6 @@ OLD_NAMES = frozenset(
         "PackedQKVSplitKcp",
         "MODE",
         "check_mode",
-        "DEFAULT_SCALE",
         "ND_ONLY_SAVE_MODES",
         # the deterministic package's pre-rename spellings
         "kcp_partition",
@@ -1752,7 +1751,7 @@ def test_facade_compute_runs_the_package_under_torch_deterministic_mode(
     kcp = _mod("cake_kcp")
     ctx, ops = _mode_case()
     args = [ops[n] for n in ("q", "k", "v", "g", "beta")]
-    nd = dict(scale=facade._DEFAULT_SCALE, backend="fake")
+    nd = dict(scale=facade.DEFAULT_SCALE, backend="fake")
     want_out, want_saved = kcp.cake_gdn_nondet_train_kcp_forward(*args, ctx, **nd)
     want_grads = kcp.cake_gdn_nondet_train_kcp_backward(
         *args, ctx, ops["dout"], saved=want_saved, **nd

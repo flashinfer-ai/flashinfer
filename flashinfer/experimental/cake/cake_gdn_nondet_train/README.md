@@ -129,7 +129,7 @@ The old names fail at import; there are no aliases.
 | `ChunkGatedDeltaRuleFunction` | `CakeGDNNondetFunction` |
 | `gdn_chunk_forward(..., deterministic=False)` | `cake_gdn_nondet_train_forward(...)` |
 | `gdn_chunk_backward(..., deterministic=False)` | `cake_gdn_nondet_train_backward(...)` |
-| package-root re-exports of `cake_chain` internals (`make_options`, `ChainOptions`, `CHUNK`, ...) | `cake_chain.<name>` |
+| package-root re-exports of `cake_chain` internals: `CHUNK`, `FINALIZE_STAGES`, `FULL`, `HEAD_DIM`, `PRESCAN_CONFIGS`, `REG_SCAN_CONFIGS`, `ChainOptions`, `ChunkMeta`, `ScanPlan`, `SegmentTable`, `StageSet`, `StreamGroups`, `build_chunk_meta`, `build_chunk_meta_from_cu_seqlens`, `choose_scan_plan`, `dhu_tc_pricing`, `finalize_stage`, `lpt_sequence_order`, `lpt_walk`, `make_options`, `scan_plans`, `sdt_pricing`, `sequence_groups`, `stage_set`, `two_stream_split`, `use_prep_tma` | `cake_chain.<name>` (same name) |
 | `benchmarks/bench_cake_gdn_train.py` | `benchmarks/bench_cake_gdn_nondet_train.py` |
 
 ## Chain

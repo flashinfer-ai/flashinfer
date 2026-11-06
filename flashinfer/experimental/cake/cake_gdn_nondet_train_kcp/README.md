@@ -115,7 +115,10 @@ The former names fail at import; there are no aliases.
 | `ContextKcp`, `PartitionKcp`, `FragmentKcp`, `OptionsKcp`, `RecomputeHandleKcp`, `SavedKcp`, `WorkspaceKcp`, `CallKcp` | `CakeGDNNondetKcpContext`, `...Partition`, `...Fragment`, `...Options`, `...RecomputeHandle`, `...Saved`, `...Workspace`, `...Call` |
 | `PackedQKVSplitKcp` | `CakeGDNNondetKcpPackedQKVSplitFunction` |
 | `deterministic=False` on every entry | removed (no keyword) |
-| `MODE`, `check_mode`, `DEFAULT_SCALE`, `ND_ONLY_SAVE_MODES` | removed |
+| `MODE`, `check_mode`, `ND_ONLY_SAVE_MODES` | removed |
+| package-root re-exports of `cake_kcp` internals: `KCP_SAVED_VERSION`, `LAST_CALL`, `PROGRAMS`, `SCALE`, `Backend`, `FakeBackend`, `KernelBackend`, `get_backend`, `set_backend`, `graph_cache_clear` | `cake_kcp.<name>` (same name) |
+| package-root re-exports of `cake_options` helpers: `make_options`, `validate_heads`, `validate_ring` | `cake_options.<name>` (same name) |
+| `benchmarks/bench_cake_gdn_train_kcp.py` | `benchmarks/bench_cake_gdn_nondet_train_kcp.py` |
 
 ### Library names
 

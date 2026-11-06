@@ -95,7 +95,7 @@ import torch
 from .api_logging import flashinfer_api
 
 # The default scale of the contract: ``head_dim ** -0.5`` with head dimension 128.
-_DEFAULT_SCALE = 128**-0.5
+DEFAULT_SCALE = 128**-0.5
 
 
 # The package is imported on first use and cached: a call does not repeat the import.
@@ -248,7 +248,7 @@ def cake_gdn_nondet_train_kcp_forward(
         g,
         beta,
         ctx,
-        scale=_DEFAULT_SCALE if scale is None else scale,
+        scale=DEFAULT_SCALE if scale is None else scale,
         save_for_backward=save_for_backward,
         workspace=workspace,
         options=_options_for(options),
@@ -301,7 +301,7 @@ def cake_gdn_nondet_train_kcp_backward(
         ctx,
         dout,
         saved=saved,
-        scale=_DEFAULT_SCALE if scale is None else scale,
+        scale=DEFAULT_SCALE if scale is None else scale,
         workspace=workspace,
         options=_options_for(options),
         **knobs,
@@ -409,7 +409,7 @@ def cake_gdn_nondet_kcp(
         g,
         beta,
         ctx,
-        scale=_DEFAULT_SCALE if scale is None else scale,
+        scale=DEFAULT_SCALE if scale is None else scale,
         save_mode=save_mode,
         boundary_mode=boundary_mode,
         workspace=workspace,
