@@ -51,7 +51,7 @@ Module names are under `flashinfer.`. "Planned" marks versions that do not exist
 | mHC | det | single rank | `cake_mhc_det_train` | `cake_mhc_det_train_prepare`, `cake_mhc_det_train_finish` | `CakeMHCDetPrepareFunction`, `CakeMHCDetFinishFunction` | functions unchanged; classes `CakeMHCDetTrain*Function` |
 | | nondet | single rank | `cake_mhc_nondet_train` | `cake_mhc_nondet_train_prepare`, `cake_mhc_nondet_train_finish` | `CakeMHCNondetPrepareFunction`, `CakeMHCNondetFinishFunction` | `experimental.cake.cake_mhc_train` / `cake_mhc_train_*` |
 | mHC head | det | single rank | `cake_mhc_head_det_train` | `cake_mhc_head_det` | `CakeMHCHeadDetFunction` | `cake_mhc_det_train_head` / `CakeMHCDetTrainHeadFunction` |
-| | nondet | single rank | `cake_mhc_head_nondet_train` | `cake_mhc_head_nondet` | `CakeMHCHeadNondetFunction` | planned |
+| | nondet | single rank | `cake_mhc_head_nondet_train` | `cake_mhc_head_nondet` | `CakeMHCHeadNondetFunction` | new; no former name |
 | GDN | det | single rank | `cake_gdn_det_train` (new top-level facade) | `cake_gdn_det` | `CakeGDNDetFunction` | `experimental.cake_gdn_det_train` / `chunk_gated_delta_rule_det` |
 | | det | KCP | `cake_gdn_det_train_kcp` | `cake_gdn_det_kcp` | `CakeGDNDetKcpFunction` | `chunk_gdn_det_kcp` / `ChunkGDNDetFunctionKcp` |
 | | nondet | single rank | `cake_gdn_nondet_train` | `cake_gdn_nondet` | `CakeGDNNondetFunction` | `experimental.cake.cake_gdn_train` / `chunk_gated_delta_rule(deterministic=False)` |
@@ -89,8 +89,8 @@ GDN and conv1d use the same pattern with their own stem. For `nondet`, replace `
 ## Decisions
 
 - **GDN `nondet` stays.** Today it is fixed-order in practice; its contract does not promise run-to-run bits.
-- **mHC head becomes its own family.** It ships `det` now; `nondet` is planned.
-- **Missing versions keep their reserved names:** mHC head `nondet`, DSA indexer `nondet`, DSA sparse attention `det` and GQA `det`.
+- **mHC head becomes its own family.** It ships `det` and `nondet`. Like GDN `nondet`, the head's `nondet` is fixed-order (the same kernels as `det`); its contract does not promise run-to-run bits.
+- **Missing versions keep their reserved names:** DSA indexer `nondet`, DSA sparse attention `det` and GQA `det`.
 
 ## Current names
 
