@@ -343,21 +343,37 @@ the call, so later graph operations cannot overwrite the saved outputs.
 The copies run again on every replay; CPU transfers and file writes remain
 outside capture.
 
+Public wrappers that delegate to an internal custom op must declare mutations
+at the logged boundary, using ``@flashinfer_api(mutates_args=("q", "k"))``.
+The internal custom op's declaration alone does not describe its caller's
+arguments. The public in-place RoPE APIs carry these declarations; arbitrary
+undeclared mutations cannot be inferred by the logger.
+
 For APIs returning ``None``, the mutated tensors are saved under
 ``mutated_input__<input-key>`` in ``outputs.pt``. ``replay_from_dump(...,
 run=True, compare_outputs=True)`` compares these tensors after executing the
-reconstructed call, as well as any returned tensors. Existing dumps keep their
-original replay behavior. With this flag enabled, eager dumps also save and
+reconstructed call, as well as any returned tensors. With this flag enabled,
+eager dumps also save and
 compare named mutated arguments, allowing eager/graph replay comparisons.
+Nested returned tensors use the same keys for dumping and comparison. An
+incomplete output dump (including one rejected by the size limit) reports
+``comparison_match=None`` and ``comparison_error="Output dump is incomplete"``;
+it cannot establish a match. A completed call with no tensor outputs can still
+compare successfully without an output tensor file.
 
 Snapshots support strided, same-dtype storage aliases. Replay restores shared
-storage, shapes, strides and relative offsets. Only the span used by the
+storage, repeated tensor references, shapes, strides and relative offsets.
+Distinct tensor objects with identical view geometry remain distinct. Older dumps
+without object identity metadata can restore storage aliases but cannot recover
+which references were the same tensor object. Only the span used by the
 participating views is retained; absolute storage offsets may therefore be
 rebased. Metadata records ``original_storage_offset`` for provenance. Mixed-dtype
-storage aliases, internally overlapping views, conjugate/negative views, and
-unnamed mutation declarations are rejected with a dump error rather than
+storage aliases, views whose non-overlap cannot be proven from their strides,
+conjugate/negative views, and unnamed mutation declarations are rejected with a dump error rather than
 producing an incorrect snapshot. Read-only inputs outside a mutated storage
 group retain the default deferred-reference behavior.
+Gaps between read-only alias views are zeroed during CPU materialization,
+without adding device copy nodes during capture.
 
 This mode adds persistent device buffers and copy nodes to the captured graph.
 Use dump filters and size limits to bound it, and clear the registry when the

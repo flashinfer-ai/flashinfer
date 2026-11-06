@@ -51,6 +51,21 @@ def _graph_snapshot_alias_op(
     odd.add_(3)
 
 
+def _snapshot_review_identity(x, repeated, distinct):
+    assert x is repeated
+    assert x is not distinct
+    assert x.untyped_storage().data_ptr() == distinct.untyped_storage().data_ptr()
+    return {"value": [x + 1, (x + 2,)]}
+
+
+def _snapshot_review_result(x):
+    return x + 1
+
+
+def _snapshot_review_none(x):
+    return None
+
+
 @pytest.fixture
 def snapshot_logging(tmp_path, monkeypatch, request):
     """Reload only logging after its import-time snapshot opt-in is configured."""
@@ -64,7 +79,8 @@ def snapshot_logging(tmp_path, monkeypatch, request):
     monkeypatch.setenv("FLASHINFER_DUMP_MAX_SIZE_GB", "1")
     monkeypatch.setenv(
         "FLASHINFER_DUMP_INCLUDE",
-        "_graph_snapshot_alias_op,fused_add_rmsnorm,BatchDecodeWithPagedKVCacheWrapper.run",
+        "_graph_snapshot_alias_op,_snapshot_review_*,apply_rope_inplace,"
+        "fused_add_rmsnorm,BatchDecodeWithPagedKVCacheWrapper.run",
     )
     monkeypatch.delenv("FLASHINFER_DUMP_EXCLUDE", raising=False)
     monkeypatch.setattr(
@@ -252,6 +268,172 @@ def test_graph_snapshot_admission_cpu(snapshot_logging, monkeypatch, admission):
         assert logged_op(x, x, x[:, ::2], x[:, 1::2]) is None
     stage.assert_not_called()
     assert not list(root.glob("*/metadata.jsonl"))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("captured", [False, True])
+def test_snapshot_identity_and_nested_outputs(snapshot_logging, monkeypatch, captured):
+    logging, root = snapshot_logging
+    x = torch.arange(8, dtype=torch.float32)
+    with monkeypatch.context() as capture:
+        capture.setattr(logging, "_is_current_stream_capturing", lambda: captured)
+        logging.flashinfer_api(_snapshot_review_identity)(x, x, x.view_as(x))
+    if captured:
+        logging.flush_graph_dumps(synchronize=False)
+    call = _calls(root, "_snapshot_review_identity")[0]
+    replay = logging.replay_from_dump(
+        str(call), device="cpu", run=True, compare_outputs=True
+    )
+    assert "execution_error" not in replay
+    assert replay["args"][0] is replay["args"][1]
+    assert replay["args"][0] is not replay["args"][2]
+    assert replay["comparison_match"] is True
+    outputs = _load(call, "outputs")
+    outputs["result__value_0__1__0"].add_(10)
+    torch.save(outputs, call / "outputs.pt")
+    replay = logging.replay_from_dump(
+        str(call), device="cpu", run=True, compare_outputs=True
+    )
+    assert replay["comparison_match"] is False
+
+
+@pytest.mark.cpu_only
+def test_snapshot_rejects_uncertain_overlap(snapshot_logging):
+    logging, _ = snapshot_logging
+    backing = torch.arange(16, dtype=torch.float32)
+    overlap = backing.as_strided((2, 2), (2, 2))
+    assert torch._debug_has_internal_overlap(overlap) == 2
+    with pytest.raises(ValueError, match="non-overlapping"):
+        logging._graph_tensor_plan({"x": overlap}, ["x"])
+    # A strided, non-dense view also reports status 2 but is provably disjoint.
+    sliced = backing.reshape(2, 8)[:, ::2]
+    assert logging._graph_tensor_plan({"x": sliced}, ["x"])
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("tensor_format", ["torch", "safetensors"])
+def test_readonly_alias_gaps_are_zero(
+    snapshot_logging, monkeypatch, tmp_path, tensor_format
+):
+    logging, _ = snapshot_logging
+    if tensor_format == "safetensors":
+        safetensors = pytest.importorskip("safetensors.torch")
+    backing = torch.full((12,), 9876.0)
+    tensors = {"a": backing[:2], "b": backing[-2:]}
+    plan = logging._graph_tensor_plan(tensors, [])
+    with monkeypatch.context() as capture:
+        capture.setattr(
+            torch,
+            "zeros",
+            Mock(side_effect=AssertionError("Read-only capture allocated a copy")),
+        )
+        staged, aliases = logging._stage_graph_tensor_plan(tensors, plan)
+    # The readonly values must still be deferred until materialization.
+    backing[:2] = 1
+    backing[-2:] = 2
+    logging._save_dump_tensors(staged, tensor_format, tmp_path, "inputs", aliases)
+    saved = (
+        _load(tmp_path, "inputs")
+        if tensor_format == "torch"
+        else safetensors.load_file(str(tmp_path / "inputs.safetensors"))
+    )
+    base = saved[aliases["a"]["base"]]
+    torch.testing.assert_close(
+        base, torch.tensor([1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0, 2.0])
+    )
+    logging._restore_tensor_aliases(saved, aliases)
+    assert saved["b"].storage_offset() == 10
+    assert (
+        saved["a"].untyped_storage().data_ptr()
+        == saved["b"].untyped_storage().data_ptr()
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("captured", [False, True])
+@pytest.mark.parametrize("complete", [False, True])
+def test_snapshot_output_completion(snapshot_logging, monkeypatch, captured, complete):
+    logging, _ = snapshot_logging
+    func = _snapshot_review_none if complete else _snapshot_review_result
+    x = torch.arange(8, dtype=torch.float32)
+    with monkeypatch.context() as capture:
+        capture.setattr(logging, "_is_current_stream_capturing", lambda: captured)
+        call = logging._dump_function_inputs(func, func.__name__, (x,), {})
+        if not complete:
+            capture.setattr(
+                logging, "_DUMP_MAX_SIZE_GB", logging._dump_total_size_bytes / 1024**3
+            )
+        logging._dump_function_outputs(call, func(x), args=(x,))
+    if captured:
+        logging.flush_graph_dumps(synchronize=False)
+    replay = logging.replay_from_dump(
+        call, device="cpu", run=True, compare_outputs=True
+    )
+    assert "execution_error" not in replay
+    if complete:
+        assert replay["execution_result"] is None
+        assert replay["comparison_match"] is True
+    else:
+        assert replay["comparison_match"] is None
+        assert replay["comparison_error"] == "Output dump is incomplete"
+
+
+@pytest.mark.cpu_only
+def test_public_rope_mutation_declarations(snapshot_logging, monkeypatch):
+    import flashinfer.rope as rope
+
+    logging, _ = snapshot_logging
+    for name in (
+        "apply_rope_inplace",
+        "apply_rope_pos_ids_inplace",
+        "apply_llama31_rope_inplace",
+        "apply_llama31_rope_pos_ids_inplace",
+    ):
+        assert inspect.unwrap(getattr(rope, name))._flashinfer_mutates_args == (
+            "q",
+            "k",
+        )
+    assert inspect.unwrap(
+        rope.apply_rope_with_cos_sin_cache_inplace
+    )._flashinfer_mutates_args == ("query", "key")
+    # Declarations are attached at decoration time, including loglevel zero.
+    monkeypatch.setattr(logging, "_API_LOG_LEVEL", 0)
+    original = lambda x: None
+    assert logging.flashinfer_api(original, mutates_args=("x",)) is original
+    assert original._flashinfer_mutates_args == ("x",)
+
+
+def test_public_rope_inplace_snapshots(cuda_device, snapshot_logging):
+    from flashinfer.rope import apply_rope_inplace
+
+    logging, root = snapshot_logging
+    raw_rope = inspect.unwrap(apply_rope_inplace)
+    logged_rope = logging.flashinfer_api(raw_rope)
+    q = torch.randn(4, 2, 64, device=cuda_device, dtype=torch.float16)
+    k = torch.randn(4, 1, 64, device=cuda_device, dtype=torch.float16)
+    indptr = torch.tensor([0, 4], device=cuda_device, dtype=torch.int32)
+    offsets = torch.tensor([3], device=cuda_device, dtype=torch.int32)
+    _warmup(cuda_device, lambda: raw_rope(q, k, indptr, offsets))
+    q0, k0 = q.clone(), k.clone()
+    logged_rope(q, k, indptr, offsets)
+    eager = _calls(root, "apply_rope_inplace")[0]
+    torch.testing.assert_close(_load(eager, "inputs")["arg_0"], q0.cpu())
+    _assert_none_replay(logging, eager, cuda_device)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        logged_rope(q, k, indptr, offsets)
+    capture = _calls(root, "apply_rope_inplace")[-1]
+    for i, scale in enumerate((1.0, 2.0), start=1):
+        q.copy_(q0 * scale)
+        k.copy_(k0 / scale)
+        graph.replay()
+        snapshot = capture / "graph_flushes" / f"flush_{i:04d}"
+        inputs, outputs = _load(snapshot, "inputs"), _load(snapshot, "outputs")
+        torch.testing.assert_close(inputs["arg_0"], (q0 * scale).cpu())
+        torch.testing.assert_close(inputs["arg_1"], (k0 / scale).cpu())
+        torch.testing.assert_close(outputs["mutated_input__arg_0"], q.cpu())
+        torch.testing.assert_close(outputs["mutated_input__arg_1"], k.cpu())
+        _assert_none_replay(logging, snapshot, cuda_device)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])

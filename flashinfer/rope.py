@@ -452,7 +452,7 @@ def _check_rotary_dim(rotary_dim: int, q: torch.Tensor, k: torch.Tensor) -> None
         )
 
 
-@flashinfer_api(trace=apply_rope_inplace_trace)
+@flashinfer_api(trace=apply_rope_inplace_trace, mutates_args=("q", "k"))
 def apply_rope_inplace(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -541,7 +541,7 @@ def apply_rope_inplace(
     )
 
 
-@flashinfer_api(trace=apply_rope_pos_ids_inplace_trace)
+@flashinfer_api(trace=apply_rope_pos_ids_inplace_trace, mutates_args=("q", "k"))
 def apply_rope_pos_ids_inplace(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -598,7 +598,7 @@ def apply_rope_pos_ids_inplace(
     )
 
 
-@flashinfer_api(trace=apply_llama31_rope_inplace_trace)
+@flashinfer_api(trace=apply_llama31_rope_inplace_trace, mutates_args=("q", "k"))
 def apply_llama31_rope_inplace(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -708,7 +708,7 @@ def apply_llama31_rope_inplace(
     )
 
 
-@flashinfer_api(trace=apply_llama31_rope_pos_ids_inplace_trace)
+@flashinfer_api(trace=apply_llama31_rope_pos_ids_inplace_trace, mutates_args=("q", "k"))
 def apply_llama31_rope_pos_ids_inplace(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1243,7 +1243,9 @@ def apply_rope_with_cos_sin_cache(
     return query_out, key_out
 
 
-@flashinfer_api(trace=apply_rope_with_cos_sin_cache_inplace_trace)
+@flashinfer_api(
+    trace=apply_rope_with_cos_sin_cache_inplace_trace, mutates_args=("query", "key")
+)
 def apply_rope_with_cos_sin_cache_inplace(
     positions: torch.Tensor,
     query: torch.Tensor,
