@@ -1,18 +1,32 @@
 # CAKE training renames (#8928): migration from 0.7.3 and 0.7.4rc1
 
-FlashInfer issue #8928 renames every CAKE training module to `flashinfer.cake_<op>_<det|nondet>_train`, with `_kcp` appended for a context-parallel (KCP) route. The module you import selects the mode: no entry point takes a `deterministic=` keyword, and no environment variable selects the mode. Each backend package moves as a whole directory, with its `build.json`, `cake_build.py` and csrc sources, to `flashinfer/experimental/cake/<module>/`. Old names and paths are removed without aliases, so importing an old name fails. Some old paths changed mode between releases, so look up your release (0.7.3 or 0.7.4rc1) and your old name or directory in the tables below; detailed naming rules are in `docs/training_backend_names.md`.
+Issue #8928 gives every CAKE training family one naming scheme. The facade module is `flashinfer.cake_<op>_<mode>_train[_kcp]`, and its backend package is `flashinfer/experimental/cake/<module>/`. `<mode>` is `det` (run-to-run bitwise deterministic) or `nondet` (no run-to-run bitwise promise). Each family moves in its own PR. This page maps the modules, names and backend directories of FlashInfer 0.7.3 and 0.7.4rc1 to their new names.
+
+The mode is part of the name. No new entry takes `deterministic=`. The old names are removed without aliases, by the family PR or by an earlier PR that a row or a table note names. In 0.7.4rc1 several modules selected the mode with `deterministic: bool = True`. A call that kept the default ran deterministic programs, also in the modules that later became the `nondet` ones. Callers that kept the default move to the `det` module; only `deterministic=False` callers move to the `nondet` module.
 
 ## Status and mode labels
 
-- **PR** column: the PR that renames the family (or removed the old path). Each family is renamed in its own PR, and all renames are released together, so you migrate once.
-  - `planned`: no PR exists yet. #8928 fixes the target name.
-- Mode cells:
-  - `det`: run-to-run bitwise deterministic forward and backward for fixed inputs, hardware and plan.
-  - `nondet`: no run-to-run bitwise promise.
-  - `nondet, det by default`: the package ran its non-deterministic programs only when called with `deterministic=False`. Its default call ran the deterministic programs.
-  - `det alias of <dir>`: a directory without sources of its own that re-exported the deterministic package `<dir>`.
-  - `-`: absent in that release.
-- **In** column (Public names): the releases that shipped the old name. Names that existed only on main between releases are not listed.
+PR column, and the PR after each name in the Use now column:
+
+- `#N`: the PR that renames the family, or the PR that removed the old path. Each family is renamed in its own PR, and the renames are released together, so you migrate once. Names in a PR that has not merged yet can still change before it merges.
+- `planned`: no PR has the new name yet. The new name is the #8928 target name, from the target table and naming rules in `docs/training_backend_names.md`.
+
+Mode columns (0.7.3, 0.7.4rc1):
+
+- `det`: deterministic programs only: run-to-run bitwise reproducible.
+- `nondet`: programs that do not promise run-to-run bitwise results, with no deterministic route.
+- `nondet, det by default`: the `nondet` programs ran only with `deterministic=False`. The default call ran deterministic programs, loaded by the directory itself or by its facade module. For a directory, the Note column of the Backend directories table says which.
+- `det alias of <dir>`: no sources of its own. It re-exported the det package in `<dir>`.
+- `-`: absent in that release. In a row marked "(as in 0.7.3)" or "(as in 0.7.4rc1)", `-` marks the release that the other row covers.
+
+In column (Public names): the releases that shipped the old name. Names that existed only on main between releases are not listed.
+
+Call forms in the Public names tables:
+
+- `(default)`: a call that did not pass `deterministic=False`.
+- `(..., deterministic=False)`: a call that passed `deterministic=False`. After a module or package name, `(deterministic=False calls)` means the calls of its entries that passed `deterministic=False`.
+- `{a, b}`: several names in one row. They map in order to the names in the New name cell. A single new name receives all of them.
+- A name that keeps its spelling in the new module or package (for example the ALL_CAPS constants such as `ARCHES`) has no row of its own. The row of its module or package gives its new location.
 
 ## Target modules
 
@@ -61,555 +75,421 @@ Every shipped training module after the renames. Each module has a backend packa
 ## Old paths whose mode changed
 
 | Old path | 0.7.3 | 0.7.4rc1 | Use now |
-| --- | --- | --- | --- |
-| `flashinfer/cake_rmsnorm_train_backend` (module `flashinfer.cake_rmsnorm_train`) | det | nondet, det by default (nondet since #8208) | 0.7.3 callers and 0.7.4rc1 default callers: `flashinfer.cake_rmsnorm_det_train`; 0.7.4rc1 `deterministic=False` callers: `flashinfer.cake_rmsnorm_nondet_train` |
-| `flashinfer/cake_rmsnorm_silu_gate_train_backend` (module `flashinfer.cake_rmsnorm_silu_gate_train`) | det | nondet, det by default | 0.7.3 callers and 0.7.4rc1 default callers: `flashinfer.cake_rmsnorm_silu_gate_det_train`; 0.7.4rc1 `deterministic=False` callers: `flashinfer.cake_rmsnorm_silu_gate_nondet_train` |
-| `flashinfer/experimental/dense_projection_gemm` | det | nondet, det by default | 0.7.3 callers and 0.7.4rc1 default callers: `cake_dense_gemm_det_train`; 0.7.4rc1 `deterministic=False` callers: `cake_dense_gemm_nondet_train` |
+|---|---|---|---|
+| `flashinfer/cake_rmsnorm_train_backend/` | det | nondet, det by default | 0.7.3, and 0.7.4rc1 default calls: `flashinfer.cake_rmsnorm_det_train`, #8910. 0.7.4rc1 `deterministic=False`: `flashinfer.cake_rmsnorm_nondet_train`, #8910. |
+| `flashinfer.cake_rmsnorm_train` | det | nondet, det by default | 0.7.3, and 0.7.4rc1 default calls: `flashinfer.cake_rmsnorm_det_train`, #8910. 0.7.4rc1 `deterministic=False`: `flashinfer.cake_rmsnorm_nondet_train`, #8910. |
+| `flashinfer/cake_rmsnorm_silu_gate_train_backend/` | det | nondet, det by default | 0.7.3, and 0.7.4rc1 default calls (made through `flashinfer.cake_rmsnorm_silu_gate_train`): `flashinfer.cake_rmsnorm_silu_gate_det_train`, #8922. 0.7.4rc1 `deterministic=False`: `flashinfer.cake_rmsnorm_silu_gate_nondet_train`, #8922. |
+| `flashinfer.cake_rmsnorm_silu_gate_train` | det | nondet, det by default | 0.7.3, and 0.7.4rc1 default calls: `flashinfer.cake_rmsnorm_silu_gate_det_train`, #8922. 0.7.4rc1 `deterministic=False`: `flashinfer.cake_rmsnorm_silu_gate_nondet_train`, #8922. |
+| `flashinfer.experimental.cake.cake_causal_conv1d_train` | - | nondet, det by default | Default calls: `flashinfer.cake_causal_conv1d_det_train`, #8906. `deterministic=False`: `flashinfer.cake_causal_conv1d_nondet_train`, #8906. |
+| `flashinfer.cake_causal_conv1d_train_kcp` | - | nondet, det by default | Default calls: `flashinfer.cake_causal_conv1d_det_train_kcp`, #8906. `deterministic=False`: `flashinfer.cake_causal_conv1d_nondet_train_kcp`, #8906. |
+| `flashinfer.experimental.cake.cake_mhc_train` | - | nondet, det by default | Default calls: `flashinfer.cake_mhc_det_train`, #8907. `deterministic=False`: `flashinfer.cake_mhc_nondet_train`, #8907. |
+| `flashinfer.cake_gdn_train_kcp` | - | nondet, det by default | Default calls: `flashinfer.cake_gdn_det_train_kcp`, #8920. `deterministic=False`: `flashinfer.cake_gdn_nondet_train_kcp`, #8959. |
+| `flashinfer.cake_kda_train` | - | nondet, det by default | Default calls: `flashinfer.cake_kda_det_train`, planned. `deterministic=False`: `flashinfer.cake_kda_nondet_train`, planned. |
+| `flashinfer.cake_kda_train_kcp` | - | nondet, det by default | Default calls: `flashinfer.cake_kda_det_train_kcp`, planned. `deterministic=False`: `flashinfer.cake_kda_nondet_train_kcp`, planned. |
+| `flashinfer.experimental.cake.grouped_mm` | - | nondet, det by default | Default calls: `flashinfer.cake_moe_grouped_gemm_det_train`, planned. `deterministic=False`: `flashinfer.cake_moe_grouped_gemm_nondet_train`, planned. |
+| `flashinfer/experimental/dense_projection_gemm/` | det | nondet, det by default | 0.7.3, and 0.7.4rc1 default calls: `flashinfer.cake_dense_gemm_det_train`, #8926. 0.7.4rc1 `deterministic=False`: `flashinfer.cake_dense_gemm_nondet_train`, #8926. |
+| `flashinfer.chunked_lm_head` (the `chunked_lm_head_*` entries without `det`) | det | nondet, det by default | 0.7.3, and 0.7.4rc1 default calls: `flashinfer.cake_lm_head_det_train`, #8925. 0.7.4rc1 `deterministic=False`: `flashinfer.cake_lm_head_nondet_train`, #8952. |
 
 ## Backend directories
 
 For vendoring builds that copy a backend directory.
 
 | Old directory | 0.7.3 | 0.7.4rc1 | New directory | PR | Note |
-| --- | --- | --- | --- | --- | --- |
-| `flashinfer/cake_rmsnorm_det_train_backend/` | - | det | `flashinfer/experimental/cake/cake_rmsnorm_det_train/` | #8910 |  |
-| `flashinfer/cake_rmsnorm_train_backend/` (as in 0.7.3) | det | nondet, det by default | `flashinfer/experimental/cake/cake_rmsnorm_det_train/` | #8910 |  |
-| `flashinfer/cake_rmsnorm_train_backend/` (as in 0.7.4rc1) | det | nondet, det by default | `flashinfer/experimental/cake/cake_rmsnorm_nondet_train/` | #8910 |  |
-| `flashinfer/cake_rmsnorm_silu_gate_det_train_backend/` | - | det | `flashinfer/experimental/cake/cake_rmsnorm_silu_gate_det_train/` | #8922 |  |
-| `flashinfer/cake_rmsnorm_silu_gate_train_backend/` (as in 0.7.3) | det | nondet, det by default | `flashinfer/experimental/cake/cake_rmsnorm_silu_gate_det_train/` | #8922 |  |
-| `flashinfer/cake_rmsnorm_silu_gate_train_backend/` (as in 0.7.4rc1) | det | nondet, det by default | `flashinfer/experimental/cake/cake_rmsnorm_silu_gate_nondet_train/` | #8922 |  |
-| `flashinfer/experimental/cake/cake_causal_conv1d_train_backend` | - | nondet, det by default | `flashinfer/experimental/cake/cake_causal_conv1d_nondet_train` | #8906 |  |
-| `flashinfer/cake_causal_conv1d_train_backend` | det | det alias | `flashinfer/experimental/cake/cake_causal_conv1d_det_train` | #8912, #8953 |  |
-| `flashinfer/cake_causal_conv1d_det_train_backend` | - | det | `flashinfer/experimental/cake/cake_causal_conv1d_det_train` | #8953 |  |
-| `flashinfer/cake_mhc_train_backend/` | det | det alias | `flashinfer/experimental/cake/cake_mhc_det_train/` | #8907, #8900 |  |
-| `flashinfer/cake_mhc_det_train_backend/` | - | det | `flashinfer/experimental/cake/cake_mhc_det_train/` | #8907 |  |
-| `flashinfer/experimental/cake/cake_mhc_train_backend/` | - | nondet, det by default | `flashinfer/experimental/cake/cake_mhc_nondet_train/` | #8907 |  |
-| `flashinfer/cake_mhc_train_head_backend/` | det | det alias | `flashinfer/experimental/cake/cake_mhc_head_det_train/` | #8907, #8900 |  |
-| `flashinfer/cake_mhc_det_train_head_backend/` | - | det | `flashinfer/experimental/cake/cake_mhc_head_det_train/` | #8907 |  |
-| `flashinfer/experimental/cake_gdn_det_train/` | det | det | `flashinfer/experimental/cake/cake_gdn_det_train/` | #8959 |  |
-| `flashinfer/experimental/cake_gdn_train/` | det | det alias | `flashinfer/experimental/cake/cake_gdn_det_train_kcp/` | #8921 (removed the old path), #8959 |  |
-| `flashinfer/experimental/cake_gdn_det_train_kcp/` | - | det | `flashinfer/experimental/cake/cake_gdn_det_train_kcp/` | #8959 |  |
-| `flashinfer/experimental/cake/cake_gdn_train/` | - | nondet, det by default | `flashinfer/experimental/cake/cake_gdn_nondet_train/` | #8959 |  |
-| `flashinfer/experimental/cake_gdn_train_kcp/` | - | nondet, det by default | `flashinfer/experimental/cake/cake_gdn_nondet_train_kcp/` | #8959 |  |
-| `flashinfer/experimental/cake_kda_train/` (single-rank part) | det | det alias | `flashinfer/experimental/cake/cake_kda_det_train/` | planned |  |
-| `flashinfer/experimental/cake_kda_det_train/` | - | det | `flashinfer/experimental/cake/cake_kda_det_train/` | planned |  |
-| `flashinfer/experimental/cake_kda_train/` (KCP part) | det | det alias | `flashinfer/experimental/cake/cake_kda_det_train_kcp/` | planned | Vendor together with its single-rank sibling directory. |
-| `flashinfer/experimental/cake_kda_det_train_kcp/` | - | det | `flashinfer/experimental/cake/cake_kda_det_train_kcp/` | planned | Vendor together with its single-rank sibling directory. |
-| `flashinfer/experimental/cake/cake_kda_train/` | - | nondet, det by default | `flashinfer/experimental/cake/cake_kda_nondet_train/` | planned |  |
-| `flashinfer/experimental/cake_kda_train_kcp/` | - | nondet, det by default | `flashinfer/experimental/cake/cake_kda_nondet_train_kcp/` | planned | Vendor together with its single-rank sibling directory. |
-| `flashinfer/experimental/cake_moe_grouped_gemm/` | det | det alias | `flashinfer/experimental/cake/cake_moe_grouped_gemm_det_train/` | #8924 (removed the old path), planned |  |
-| `flashinfer/experimental/cake_moe_grouped_det_gemm/` | - | det | `flashinfer/experimental/cake/cake_moe_grouped_gemm_det_train/` | planned |  |
-| `flashinfer/experimental/cake/cake_moe_grouped_gemm/` | - | nondet, det by default | `flashinfer/experimental/cake/cake_moe_grouped_gemm_nondet_train/` | planned |  |
-| `flashinfer/experimental/dense_projection_det_gemm/` | - | det | `flashinfer/experimental/cake/cake_dense_gemm_det_train/` | #8926 |  |
-| `flashinfer/experimental/dense_projection_gemm/` (as in 0.7.3) | det | nondet, det by default | `flashinfer/experimental/cake/cake_dense_gemm_det_train/` | #8926 |  |
-| `flashinfer/experimental/dense_projection_gemm/` (as in 0.7.4rc1) | det | nondet, det by default | `flashinfer/experimental/cake/cake_dense_gemm_nondet_train/` | #8926 | Needs its det sibling directory. |
-| `flashinfer/experimental/cake_lm_head_loss` | det | det alias | `flashinfer/experimental/cake/cake_lm_head_det_train` | #8925 |  |
-| `flashinfer/experimental/cake_lm_head_det_loss` | - | det | `flashinfer/experimental/cake/cake_lm_head_det_train` | #8925 |  |
-| `flashinfer/experimental/cake/cake_lm_head_loss` | - | nondet, det by default | `flashinfer/experimental/cake/cake_lm_head_nondet_train` | #8952 |  |
-| `flashinfer/experimental/cake_dsa_indexer/` | det | det alias | `flashinfer/experimental/cake/cake_dsa_indexer_det_train/` | #8936 |  |
-| `flashinfer/experimental/cake_dsa_indexer_det/` | - | det | `flashinfer/experimental/cake/cake_dsa_indexer_det_train/` | #8936 |  |
-| `flashinfer/experimental/cake_dsa_train/` | nondet | nondet | `flashinfer/experimental/cake/cake_dsa_sparse_attention_nondet_train/` | #8942 |  |
-| `flashinfer/experimental/cake_gqa_train/` | nondet | nondet | `flashinfer/experimental/cake/cake_gqa_nondet_train/` | #8939 |  |
+|---|---|---|---|---|---|
+| `flashinfer/cake_rmsnorm_train_backend/` (as in 0.7.3) | det | - | `flashinfer/experimental/cake/cake_rmsnorm_det_train/` | #8910 | |
+| `flashinfer/cake_rmsnorm_train_backend/` (as in 0.7.4rc1) | - | nondet, det by default | `flashinfer/experimental/cake/cake_rmsnorm_nondet_train/` | #8910 | Since #8208 (first released in 0.7.4rc1), this directory has held the nondet programs. In 0.7.4rc1 the default call loaded the sibling `flashinfer/cake_rmsnorm_det_train_backend/`. The new directory has no det route; default callers take `flashinfer/experimental/cake/cake_rmsnorm_det_train/`. |
+| `flashinfer/cake_rmsnorm_det_train_backend/` | - | det | `flashinfer/experimental/cake/cake_rmsnorm_det_train/` | #8910 | |
+| `flashinfer/cake_rmsnorm_silu_gate_train_backend/` (as in 0.7.3) | det | - | `flashinfer/experimental/cake/cake_rmsnorm_silu_gate_det_train/` | #8922 | |
+| `flashinfer/cake_rmsnorm_silu_gate_train_backend/` (as in 0.7.4rc1) | - | nondet, det by default | `flashinfer/experimental/cake/cake_rmsnorm_silu_gate_nondet_train/` | #8922 | The facade `flashinfer.cake_rmsnorm_silu_gate_train` routed the default to det; the directory accepted only `deterministic=False`. |
+| `flashinfer/cake_rmsnorm_silu_gate_det_train_backend/` | - | det | `flashinfer/experimental/cake/cake_rmsnorm_silu_gate_det_train/` | #8922 | |
+| `flashinfer/cake_causal_conv1d_train_backend/` | det | det alias of `flashinfer/cake_causal_conv1d_det_train_backend/` | `flashinfer/experimental/cake/cake_causal_conv1d_det_train/` | #8953 | Single rank and KCP in one directory. Removed from main by #8912. |
+| `flashinfer/cake_causal_conv1d_det_train_backend/` | - | det | `flashinfer/experimental/cake/cake_causal_conv1d_det_train/` | #8953 | Single rank and KCP in one directory. |
+| `flashinfer/experimental/cake/cake_causal_conv1d_train_backend/` | - | nondet, det by default | `flashinfer/experimental/cake/cake_causal_conv1d_nondet_train/` | #8906 | Single rank and KCP in one directory. The facades `flashinfer.experimental.cake.cake_causal_conv1d_train` and `flashinfer.cake_causal_conv1d_train_kcp` routed the default to det; the directory accepted only `deterministic=False`. |
+| `flashinfer/cake_mhc_train_backend/` | det | det alias of `flashinfer/cake_mhc_det_train_backend/` | `flashinfer/experimental/cake/cake_mhc_det_train/` | #8907 | Removed from main by #8900. |
+| `flashinfer/cake_mhc_det_train_backend/` | - | det | `flashinfer/experimental/cake/cake_mhc_det_train/` | #8907 | |
+| `flashinfer/experimental/cake/cake_mhc_train_backend/` | - | nondet, det by default | `flashinfer/experimental/cake/cake_mhc_nondet_train/` | #8907 | The facade `flashinfer.experimental.cake.cake_mhc_train` routed the default to det; the directory accepted only `deterministic=False`. |
+| `flashinfer/cake_mhc_train_head_backend/` | det | det alias of `flashinfer/cake_mhc_det_train_head_backend/` | `flashinfer/experimental/cake/cake_mhc_head_det_train/` | #8907 | Removed from main by #8900. |
+| `flashinfer/cake_mhc_det_train_head_backend/` | - | det | `flashinfer/experimental/cake/cake_mhc_head_det_train/` | #8907 | |
+| `flashinfer/experimental/cake_gdn_det_train/` | det | det | `flashinfer/experimental/cake/cake_gdn_det_train/` | #8959 | Single rank. |
+| `flashinfer/experimental/cake_gdn_train/` | det | det alias of `flashinfer/experimental/cake_gdn_det_train_kcp/` | `flashinfer/experimental/cake/cake_gdn_det_train_kcp/` | #8959 | KCP. Not the same directory as `flashinfer/experimental/cake/cake_gdn_train/`. Removed from main by #8921. |
+| `flashinfer/experimental/cake_gdn_det_train_kcp/` | - | det | `flashinfer/experimental/cake/cake_gdn_det_train_kcp/` | #8959 | KCP. |
+| `flashinfer/experimental/cake/cake_gdn_train/` | - | nondet | `flashinfer/experimental/cake/cake_gdn_nondet_train/` | #8959 | Single rank. Not the same directory as `flashinfer/experimental/cake_gdn_train/`. |
+| `flashinfer/experimental/cake_gdn_train_kcp/` | - | nondet, det by default | `flashinfer/experimental/cake/cake_gdn_nondet_train_kcp/` | #8959 | KCP. The facade `flashinfer.cake_gdn_train_kcp` routed the default to det; the directory accepted only `deterministic=False`. |
+| `flashinfer/experimental/cake_kda_train/` | det | det alias of `flashinfer/experimental/cake_kda_det_train/` and `flashinfer/experimental/cake_kda_det_train_kcp/` | `flashinfer/experimental/cake/cake_kda_det_train/` and `flashinfer/experimental/cake/cake_kda_det_train_kcp/` | planned | Held single rank and KCP. A KCP build needs both new directories. Not the same directory as `flashinfer/experimental/cake/cake_kda_train/`. |
+| `flashinfer/experimental/cake_kda_det_train/` | - | det | `flashinfer/experimental/cake/cake_kda_det_train/` | planned | Single rank. |
+| `flashinfer/experimental/cake_kda_det_train_kcp/` | - | det | `flashinfer/experimental/cake/cake_kda_det_train_kcp/` | planned | KCP. Needs its single-rank sibling `flashinfer/experimental/cake/cake_kda_det_train/` (in 0.7.4rc1: `flashinfer/experimental/cake_kda_det_train/`). |
+| `flashinfer/experimental/cake/cake_kda_train/` | - | nondet, det by default | `flashinfer/experimental/cake/cake_kda_nondet_train/` | planned | Single rank. The facade `flashinfer.cake_kda_train` routed the default to det; the directory accepted only `deterministic=False`. Not the same directory as `flashinfer/experimental/cake_kda_train/`. |
+| `flashinfer/experimental/cake_kda_train_kcp/` | - | nondet, det by default | `flashinfer/experimental/cake/cake_kda_nondet_train_kcp/` | planned | KCP. The facade `flashinfer.cake_kda_train_kcp` routed the default to det. Needs its single-rank sibling `flashinfer/experimental/cake/cake_kda_nondet_train/` (in 0.7.4rc1: `flashinfer/experimental/cake/cake_kda_train/`). |
+| `flashinfer/experimental/cake_moe_grouped_gemm/` | det | det alias of `flashinfer/experimental/cake_moe_grouped_det_gemm/` | `flashinfer/experimental/cake/cake_moe_grouped_gemm_det_train/` | planned | In 0.7.3, `deterministic=False` also ran the det programs. Not the same directory as `flashinfer/experimental/cake/cake_moe_grouped_gemm/`. Removed from main by #8924. |
+| `flashinfer/experimental/cake_moe_grouped_det_gemm/` | - | det | `flashinfer/experimental/cake/cake_moe_grouped_gemm_det_train/` | planned | |
+| `flashinfer/experimental/cake/cake_moe_grouped_gemm/` | - | nondet, det by default | `flashinfer/experimental/cake/cake_moe_grouped_gemm_nondet_train/` | planned | The facade `flashinfer.experimental.cake.grouped_mm` routed the default to det; the directory accepted only `deterministic=False`. |
+| `flashinfer/experimental/dense_projection_gemm/` (as in 0.7.3) | det | - | `flashinfer/experimental/cake/cake_dense_gemm_det_train/` | #8926 | |
+| `flashinfer/experimental/dense_projection_gemm/` (as in 0.7.4rc1) | - | nondet, det by default | `flashinfer/experimental/cake/cake_dense_gemm_nondet_train/` | #8926 | In 0.7.4rc1 the default call loaded the sibling `flashinfer/experimental/dense_projection_det_gemm/`. The new directory has no det route but imports its sibling `flashinfer/experimental/cake/cake_dense_gemm_det_train/`; copy both. |
+| `flashinfer/experimental/dense_projection_det_gemm/` | - | det | `flashinfer/experimental/cake/cake_dense_gemm_det_train/` | #8926 | |
+| `flashinfer/experimental/cake_lm_head_loss/` | det | det alias of `flashinfer/experimental/cake_lm_head_det_loss/` | `flashinfer/experimental/cake/cake_lm_head_det_train/` | #8925 | Not the same directory as `flashinfer/experimental/cake/cake_lm_head_loss/`. |
+| `flashinfer/experimental/cake_lm_head_det_loss/` | - | det | `flashinfer/experimental/cake/cake_lm_head_det_train/` | #8925 | |
+| `flashinfer/experimental/cake/cake_lm_head_loss/` | - | nondet, det by default | `flashinfer/experimental/cake/cake_lm_head_nondet_train/` | #8952 | The facade `flashinfer.chunked_lm_head` routed the default to det; the directory accepted only `deterministic=False`. |
+| `flashinfer/experimental/cake_dsa_indexer/` | det | det alias of `flashinfer/experimental/cake_dsa_indexer_det/` | `flashinfer/experimental/cake/cake_dsa_indexer_det_train/` | #8936 | |
+| `flashinfer/experimental/cake_dsa_indexer_det/` | - | det | `flashinfer/experimental/cake/cake_dsa_indexer_det_train/` | #8936 | |
+| `flashinfer/experimental/cake_dsa_train/` | nondet | nondet | `flashinfer/experimental/cake/cake_dsa_sparse_attention_nondet_train/` | #8942 | |
+| `flashinfer/experimental/cake_gqa_train/` | nondet | nondet | `flashinfer/experimental/cake/cake_gqa_nondet_train/` | #8939 | |
 
 ## Public names
 
-### RMSNorm (cake_rmsnorm_det_train / cake_rmsnorm_nondet_train)
+### RMSNorm
 
 | Old name | In | New name | PR |
-| --- | --- | --- | --- |
-| module flashinfer.cake_rmsnorm_train (0.7.3; rc1 default deterministic=True) | 0.7.3, 0.7.4rc1 | flashinfer.cake_rmsnorm_det_train | #8910 |
-| module flashinfer.cake_rmsnorm_train with deterministic=False | 0.7.4rc1 | flashinfer.cake_rmsnorm_nondet_train | #8910 |
-| module flashinfer.cake_rmsnorm_det_train | 0.7.4rc1 | flashinfer.cake_rmsnorm_det_train (path unchanged; no-mode aliases and deterministic= removed; backend loaded on first use) | #8910 |
-| package flashinfer.cake_rmsnorm_det_train_backend | 0.7.4rc1 | flashinfer.experimental.cake.cake_rmsnorm_det_train | #8910 |
-| package flashinfer.cake_rmsnorm_train_backend (as in 0.7.3) | 0.7.3 | flashinfer.experimental.cake.cake_rmsnorm_det_train | #8910 |
-| package flashinfer.cake_rmsnorm_train_backend (as in 0.7.4rc1) | 0.7.4rc1 | flashinfer.experimental.cake.cake_rmsnorm_nondet_train | #8910 |
-| cake_rmsnorm (default / deterministic=True) | 0.7.3, 0.7.4rc1 | cake_rmsnorm_det | #8910 |
-| cake_rmsnorm(..., deterministic=False) | 0.7.4rc1 | cake_rmsnorm_nondet | #8910 |
-| CakeRMSNormFunction (default / deterministic=True) | 0.7.3, 0.7.4rc1 | CakeRMSNormDetFunction | #8910 |
-| CakeRMSNormFunction.apply(..., deterministic=False) | 0.7.4rc1 | CakeRMSNormNondetFunction | #8910 |
-| cake_rmsnorm_train_forward (default) | 0.7.3, 0.7.4rc1 | cake_rmsnorm_det_train_forward | #8910 |
-| cake_rmsnorm_train_forward(..., deterministic=False) | 0.7.4rc1 | cake_rmsnorm_nondet_train_forward | #8910 |
-| cake_rmsnorm_train_backward (default) | 0.7.3, 0.7.4rc1 | cake_rmsnorm_det_train_backward | #8910 |
-| cake_rmsnorm_train_backward(..., deterministic=False) | 0.7.4rc1 | cake_rmsnorm_nondet_train_backward | #8910 |
-| cake_rmsnorm_train_backward_workspace (default) | 0.7.3, 0.7.4rc1 | cake_rmsnorm_det_train_backward_workspace | #8910 |
-| cake_rmsnorm_train_backward_workspace(..., deterministic=False) | 0.7.4rc1 | cake_rmsnorm_nondet_train_backward_workspace | #8910 |
-| cake_rmsnorm_train_backward_workspace_bytes (default) | 0.7.3, 0.7.4rc1 | cake_rmsnorm_det_train_backward_workspace_bytes | #8910 |
-| cake_rmsnorm_train_backward_workspace_bytes(..., deterministic=False) | 0.7.4rc1 | cake_rmsnorm_nondet_train_backward_workspace_bytes | #8910 |
-| is_cake_rmsnorm_train_supported (default) | 0.7.3, 0.7.4rc1 | is_cake_rmsnorm_det_train_supported | #8910 |
-| is_cake_rmsnorm_train_supported(..., deterministic=False) | 0.7.4rc1 | is_cake_rmsnorm_nondet_train_supported | #8910 |
-| route_key on flashinfer.cake_rmsnorm_train / cake_rmsnorm_train_backend (0.7.3: det registry) | 0.7.3 | cake_rmsnorm_det_train_route_key | #8910 |
-| route_key on flashinfer.cake_rmsnorm_train / cake_rmsnorm_train_backend (0.7.4rc1: nondet registry) | 0.7.4rc1 | cake_rmsnorm_nondet_train_route_key | #8910 |
-| route_key on flashinfer.cake_rmsnorm_det_train / det backend | 0.7.4rc1 | cake_rmsnorm_det_train_route_key | #8910 |
-| program_windows (cake_rmsnorm_det_train / det backend) | 0.7.4rc1 | cake_rmsnorm_det_train_program_windows | #8910 |
-| weight_dtypes (cake_rmsnorm_det_train / det backend) | 0.7.4rc1 | cake_rmsnorm_det_train_weight_dtypes | #8910 |
-| flashinfer.cake_rmsnorm_train.{CakeRMSNormDetFunction, cake_rmsnorm_det, cake_rmsnorm_det_train_forward, cake_rmsnorm_det_train_backward, cake_rmsnorm_det_train_backward_workspace, cake_rmsnorm_det_train_backward_workspace_bytes, is_cake_rmsnorm_det_train_supported} (lazy __getattr__; same on cake_rmsnorm_train_backend) | 0.7.4rc1 | same names from flashinfer.cake_rmsnorm_det_train (or flashinfer.experimental.cake.cake_rmsnorm_det_train) | #8910 |
-| top-level flashinfer.{cake_rmsnorm, CakeRMSNormFunction, cake_rmsnorm_train_forward, cake_rmsnorm_train_backward, cake_rmsnorm_train_backward_workspace_bytes} | 0.7.3, 0.7.4rc1 | flashinfer.{cake_rmsnorm_det, CakeRMSNormDetFunction, cake_rmsnorm_det_train_forward, cake_rmsnorm_det_train_backward, cake_rmsnorm_det_train_backward_workspace_bytes} (lazy rows). No nondet name at top level: use flashinfer.cake_rmsnorm_nondet_train.<name> | #8910 |
-| top-level module attributes flashinfer.cake_rmsnorm_train, flashinfer.cake_rmsnorm_train_backend | 0.7.4rc1 | flashinfer.cake_rmsnorm_det_train / flashinfer.cake_rmsnorm_nondet_train (lazy module rows); backends are not bound at top level | #8910 |
-| keyword deterministic= (0.7.3: cake_rmsnorm, cake_rmsnorm_train_backward, CakeRMSNormFunction.forward, True only; rc1: every cake_rmsnorm_train entry, plus cake_rmsnorm_det / cake_rmsnorm_det_train_backward, True only) | 0.7.3, 0.7.4rc1 | removed; passing it raises TypeError | #8910 |
+|---|---|---|---|
+| `flashinfer.cake_rmsnorm_train` (default) | 0.7.3, 0.7.4rc1 | `flashinfer.cake_rmsnorm_det_train` | #8910 |
+| `flashinfer.cake_rmsnorm_train` (deterministic=False calls) | 0.7.4rc1 | `flashinfer.cake_rmsnorm_nondet_train` | #8910 |
+| `flashinfer.cake_rmsnorm_train.cake_rmsnorm` (default) | 0.7.3, 0.7.4rc1 | `flashinfer.cake_rmsnorm_det_train.cake_rmsnorm_det` | #8910 |
+| `flashinfer.cake_rmsnorm_train.cake_rmsnorm(..., deterministic=False)` | 0.7.4rc1 | `flashinfer.cake_rmsnorm_nondet_train.cake_rmsnorm_nondet` | #8910 |
+| `flashinfer.cake_rmsnorm_train.CakeRMSNormFunction` (default) | 0.7.3, 0.7.4rc1 | `flashinfer.cake_rmsnorm_det_train.CakeRMSNormDetFunction` | #8910 |
+| `flashinfer.cake_rmsnorm_train.CakeRMSNormFunction.apply(..., deterministic=False)` | 0.7.4rc1 | `flashinfer.cake_rmsnorm_nondet_train.CakeRMSNormNondetFunction` | #8910 |
+| `flashinfer.cake_rmsnorm_train.cake_rmsnorm_train_{forward, backward, backward_workspace, backward_workspace_bytes}` (default) | 0.7.3, 0.7.4rc1 | `flashinfer.cake_rmsnorm_det_train.cake_rmsnorm_det_train_{forward, backward, backward_workspace, backward_workspace_bytes}` | #8910 |
+| `flashinfer.cake_rmsnorm_train.cake_rmsnorm_train_{forward, backward, backward_workspace, backward_workspace_bytes}(..., deterministic=False)` | 0.7.4rc1 | `flashinfer.cake_rmsnorm_nondet_train.cake_rmsnorm_nondet_train_{forward, backward, backward_workspace, backward_workspace_bytes}` | #8910 |
+| `flashinfer.cake_rmsnorm_train.is_cake_rmsnorm_train_supported` (default) | 0.7.3, 0.7.4rc1 | `flashinfer.cake_rmsnorm_det_train.is_cake_rmsnorm_det_train_supported` | #8910 |
+| `flashinfer.cake_rmsnorm_train.is_cake_rmsnorm_train_supported(..., deterministic=False)` | 0.7.4rc1 | `flashinfer.cake_rmsnorm_nondet_train.is_cake_rmsnorm_nondet_train_supported` | #8910 |
+| `flashinfer.cake_rmsnorm_train.route_key` | 0.7.3 | `flashinfer.cake_rmsnorm_det_train.cake_rmsnorm_det_train_route_key` | #8910 |
+| `flashinfer.cake_rmsnorm_train.route_key` | 0.7.4rc1 | `flashinfer.cake_rmsnorm_nondet_train.cake_rmsnorm_nondet_train_route_key` | #8910 |
+| `flashinfer.cake_rmsnorm_train.{CakeRMSNormDetFunction, cake_rmsnorm_det, cake_rmsnorm_det_train_forward, cake_rmsnorm_det_train_backward, cake_rmsnorm_det_train_backward_workspace, cake_rmsnorm_det_train_backward_workspace_bytes, is_cake_rmsnorm_det_train_supported}` | 0.7.4rc1 | `flashinfer.cake_rmsnorm_det_train.{CakeRMSNormDetFunction, cake_rmsnorm_det, cake_rmsnorm_det_train_forward, cake_rmsnorm_det_train_backward, cake_rmsnorm_det_train_backward_workspace, cake_rmsnorm_det_train_backward_workspace_bytes, is_cake_rmsnorm_det_train_supported}` | #8910 |
+| `flashinfer.cake_rmsnorm_det_train.{CakeRMSNormFunction, cake_rmsnorm, cake_rmsnorm_train_forward, cake_rmsnorm_train_backward, cake_rmsnorm_train_backward_workspace, cake_rmsnorm_train_backward_workspace_bytes, is_cake_rmsnorm_train_supported}` | 0.7.4rc1 | `flashinfer.cake_rmsnorm_det_train.{CakeRMSNormDetFunction, cake_rmsnorm_det, cake_rmsnorm_det_train_forward, cake_rmsnorm_det_train_backward, cake_rmsnorm_det_train_backward_workspace, cake_rmsnorm_det_train_backward_workspace_bytes, is_cake_rmsnorm_det_train_supported}` | #8910 |
+| `flashinfer.cake_rmsnorm_det_train.{route_key, program_windows, weight_dtypes}` | 0.7.4rc1 | `flashinfer.cake_rmsnorm_det_train.cake_rmsnorm_det_train_{route_key, program_windows, weight_dtypes}` | #8910 |
+| `flashinfer.{cake_rmsnorm, CakeRMSNormFunction, cake_rmsnorm_train_forward, cake_rmsnorm_train_backward, cake_rmsnorm_train_backward_workspace_bytes}` (default) | 0.7.3, 0.7.4rc1 | `flashinfer.{cake_rmsnorm_det, CakeRMSNormDetFunction, cake_rmsnorm_det_train_forward, cake_rmsnorm_det_train_backward, cake_rmsnorm_det_train_backward_workspace_bytes}` | #8910 |
+| `flashinfer.{cake_rmsnorm, CakeRMSNormFunction, cake_rmsnorm_train_forward, cake_rmsnorm_train_backward, cake_rmsnorm_train_backward_workspace_bytes}(..., deterministic=False)` | 0.7.4rc1 | `flashinfer.cake_rmsnorm_nondet_train.{cake_rmsnorm_nondet, CakeRMSNormNondetFunction, cake_rmsnorm_nondet_train_forward, cake_rmsnorm_nondet_train_backward, cake_rmsnorm_nondet_train_backward_workspace_bytes}` | #8910 |
+| package `flashinfer.cake_rmsnorm_train_backend` (default) | 0.7.3, 0.7.4rc1 | package `flashinfer.experimental.cake.cake_rmsnorm_det_train` | #8910 |
+| package `flashinfer.cake_rmsnorm_train_backend` (deterministic=False calls) | 0.7.4rc1 | package `flashinfer.experimental.cake.cake_rmsnorm_nondet_train` | #8910 |
+| package `flashinfer.cake_rmsnorm_det_train_backend` | 0.7.4rc1 | package `flashinfer.experimental.cake.cake_rmsnorm_det_train` | #8910 |
+| `flashinfer.cake_rmsnorm_train_backend.{CakeRMSNormFunction, cake_rmsnorm, cake_rmsnorm_train_forward, cake_rmsnorm_train_backward, cake_rmsnorm_train_backward_workspace, cake_rmsnorm_train_backward_workspace_bytes, is_cake_rmsnorm_train_supported}` (default) | 0.7.3, 0.7.4rc1 | `flashinfer.experimental.cake.cake_rmsnorm_det_train.{CakeRMSNormDetFunction, cake_rmsnorm_det, cake_rmsnorm_det_train_forward, cake_rmsnorm_det_train_backward, cake_rmsnorm_det_train_backward_workspace, cake_rmsnorm_det_train_backward_workspace_bytes, is_cake_rmsnorm_det_train_supported}` | #8910 |
+| `flashinfer.cake_rmsnorm_train_backend.{CakeRMSNormFunction, cake_rmsnorm, cake_rmsnorm_train_forward, cake_rmsnorm_train_backward, cake_rmsnorm_train_backward_workspace, cake_rmsnorm_train_backward_workspace_bytes, is_cake_rmsnorm_train_supported}(..., deterministic=False)` | 0.7.4rc1 | `flashinfer.experimental.cake.cake_rmsnorm_nondet_train.{CakeRMSNormNondetFunction, cake_rmsnorm_nondet, cake_rmsnorm_nondet_train_forward, cake_rmsnorm_nondet_train_backward, cake_rmsnorm_nondet_train_backward_workspace, cake_rmsnorm_nondet_train_backward_workspace_bytes, is_cake_rmsnorm_nondet_train_supported}` | #8910 |
+| `flashinfer.cake_rmsnorm_train_backend.route_key` | 0.7.3 | `flashinfer.experimental.cake.cake_rmsnorm_det_train.cake_rmsnorm_det_train_route_key` | #8910 |
+| `flashinfer.cake_rmsnorm_train_backend.route_key` | 0.7.4rc1 | `flashinfer.experimental.cake.cake_rmsnorm_nondet_train.cake_rmsnorm_nondet_train_route_key` | #8910 |
+| `flashinfer.cake_rmsnorm_det_train_backend.{CakeRMSNormFunction, cake_rmsnorm, cake_rmsnorm_train_forward, cake_rmsnorm_train_backward, cake_rmsnorm_train_backward_workspace, cake_rmsnorm_train_backward_workspace_bytes, is_cake_rmsnorm_train_supported}` | 0.7.4rc1 | `flashinfer.experimental.cake.cake_rmsnorm_det_train.{CakeRMSNormDetFunction, cake_rmsnorm_det, cake_rmsnorm_det_train_forward, cake_rmsnorm_det_train_backward, cake_rmsnorm_det_train_backward_workspace, cake_rmsnorm_det_train_backward_workspace_bytes, is_cake_rmsnorm_det_train_supported}` | #8910 |
+| `flashinfer.cake_rmsnorm_det_train_backend.{route_key, program_windows, weight_dtypes}` | 0.7.4rc1 | `flashinfer.experimental.cake.cake_rmsnorm_det_train.cake_rmsnorm_det_train_{route_key, program_windows, weight_dtypes}` | #8910 |
 
-### SiLU-gated RMSNorm (cake_rmsnorm_silu_gate_det_train / cake_rmsnorm_silu_gate_nondet_train)
+### SiLU-gated RMSNorm
 
 | Old name | In | New name | PR |
-| --- | --- | --- | --- |
-| module flashinfer.cake_rmsnorm_silu_gate_train (0.7.3; rc1 default deterministic=True) | 0.7.3, 0.7.4rc1 | flashinfer.cake_rmsnorm_silu_gate_det_train | #8922 |
-| module flashinfer.cake_rmsnorm_silu_gate_train with deterministic=False | 0.7.4rc1 | flashinfer.cake_rmsnorm_silu_gate_nondet_train | #8922 |
-| module flashinfer.cake_rmsnorm_silu_gate_det_train | 0.7.4rc1 | flashinfer.cake_rmsnorm_silu_gate_det_train (path unchanged; no-mode aliases removed; backend loaded on first use) | #8922 |
-| package flashinfer.cake_rmsnorm_silu_gate_det_train_backend | 0.7.4rc1 | flashinfer.experimental.cake.cake_rmsnorm_silu_gate_det_train | #8922 |
-| package flashinfer.cake_rmsnorm_silu_gate_train_backend (as in 0.7.3) | 0.7.3 | flashinfer.experimental.cake.cake_rmsnorm_silu_gate_det_train | #8922 |
-| package flashinfer.cake_rmsnorm_silu_gate_train_backend (as in 0.7.4rc1) | 0.7.4rc1 | flashinfer.experimental.cake.cake_rmsnorm_silu_gate_nondet_train | #8922 |
-| cake_rmsnorm_silu_gate (default) | 0.7.3, 0.7.4rc1 | cake_rmsnorm_silu_gate_det | #8922 |
-| cake_rmsnorm_silu_gate(..., deterministic=False) | 0.7.4rc1 | cake_rmsnorm_silu_gate_nondet | #8922 |
-| CakeRMSNormSiLUGateFunction (default) | 0.7.3, 0.7.4rc1 | CakeRMSNormSiLUGateDetFunction | #8922 |
-| CakeRMSNormSiLUGateFunction.apply(..., deterministic=False) | 0.7.4rc1 | CakeRMSNormSiLUGateNondetFunction | #8922 |
-| cake_rmsnorm_silu_gate_train_forward (default) | 0.7.3, 0.7.4rc1 | cake_rmsnorm_silu_gate_det_train_forward | #8922 |
-| cake_rmsnorm_silu_gate_train_forward(..., deterministic=False) | 0.7.4rc1 | cake_rmsnorm_silu_gate_nondet_train_forward | #8922 |
-| cake_rmsnorm_silu_gate_train_backward (default) | 0.7.3, 0.7.4rc1 | cake_rmsnorm_silu_gate_det_train_backward | #8922 |
-| cake_rmsnorm_silu_gate_train_backward(..., deterministic=False) | 0.7.4rc1 | cake_rmsnorm_silu_gate_nondet_train_backward | #8922 |
-| cake_rmsnorm_silu_gate_train_backward_workspace_bytes (default) | 0.7.3, 0.7.4rc1 | cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes | #8922 |
-| cake_rmsnorm_silu_gate_train_backward_workspace_bytes(..., deterministic=False) | 0.7.4rc1 | cake_rmsnorm_silu_gate_nondet_train_backward_workspace_bytes | #8922 |
-| cake_rmsnorm_silu_gate_train_backward_workspace (default) | 0.7.3, 0.7.4rc1 | cake_rmsnorm_silu_gate_det_train_backward_workspace | #8922 |
-| cake_rmsnorm_silu_gate_train_backward_workspace(..., deterministic=False) | 0.7.4rc1 | cake_rmsnorm_silu_gate_nondet_train_backward_workspace | #8922 |
-| cake_rmsnorm_silu_gate_train_reset_workspace | 0.7.4rc1 | cake_rmsnorm_silu_gate_nondet_train_reset_workspace (det: none; the det workspace needs no reset) | #8922 |
-| is_cake_rmsnorm_silu_gate_train_supported (default) | 0.7.3, 0.7.4rc1 | is_cake_rmsnorm_silu_gate_det_train_supported | #8922 |
-| is_cake_rmsnorm_silu_gate_train_supported(..., deterministic=False) | 0.7.4rc1 | is_cake_rmsnorm_silu_gate_nondet_train_supported | #8922 |
-| top-level flashinfer.{cake_rmsnorm_silu_gate, CakeRMSNormSiLUGateFunction, cake_rmsnorm_silu_gate_train_forward, cake_rmsnorm_silu_gate_train_backward, cake_rmsnorm_silu_gate_train_backward_workspace_bytes} (default) | 0.7.3, 0.7.4rc1 | flashinfer.{cake_rmsnorm_silu_gate_det, CakeRMSNormSiLUGateDetFunction, cake_rmsnorm_silu_gate_det_train_forward, cake_rmsnorm_silu_gate_det_train_backward, cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes} (lazy rows) | #8922 |
-| same top-level names called with deterministic=False | 0.7.4rc1 | flashinfer.{cake_rmsnorm_silu_gate_nondet, CakeRMSNormSiLUGateNondetFunction, cake_rmsnorm_silu_gate_nondet_train_forward, cake_rmsnorm_silu_gate_nondet_train_backward, cake_rmsnorm_silu_gate_nondet_train_backward_workspace_bytes} (lazy rows) | #8922 |
-| top-level module attributes flashinfer.cake_rmsnorm_silu_gate_train, flashinfer.cake_rmsnorm_silu_gate_train_backend, flashinfer.cake_rmsnorm_silu_gate_det_train_backend | 0.7.4rc1 | flashinfer.cake_rmsnorm_silu_gate_det_train / flashinfer.cake_rmsnorm_silu_gate_nondet_train (lazy module rows); backends are not bound at top level | #8922 |
-| keyword deterministic= (rc1: every entry of the facade and the nondet backend; absent in 0.7.3) | 0.7.4rc1 | removed; passing it raises TypeError | #8922 |
+|---|---|---|---|
+| `flashinfer.cake_rmsnorm_silu_gate_train` (default) | 0.7.3, 0.7.4rc1 | `flashinfer.cake_rmsnorm_silu_gate_det_train` | #8922 |
+| `flashinfer.cake_rmsnorm_silu_gate_train` (deterministic=False calls) | 0.7.4rc1 | `flashinfer.cake_rmsnorm_silu_gate_nondet_train` | #8922 |
+| `flashinfer.cake_rmsnorm_silu_gate_train.cake_rmsnorm_silu_gate` (default) | 0.7.3, 0.7.4rc1 | `flashinfer.cake_rmsnorm_silu_gate_det_train.cake_rmsnorm_silu_gate_det` | #8922 |
+| `flashinfer.cake_rmsnorm_silu_gate_train.cake_rmsnorm_silu_gate(..., deterministic=False)` | 0.7.4rc1 | `flashinfer.cake_rmsnorm_silu_gate_nondet_train.cake_rmsnorm_silu_gate_nondet` | #8922 |
+| `flashinfer.cake_rmsnorm_silu_gate_train.CakeRMSNormSiLUGateFunction` (default) | 0.7.3, 0.7.4rc1 | `flashinfer.cake_rmsnorm_silu_gate_det_train.CakeRMSNormSiLUGateDetFunction` | #8922 |
+| `flashinfer.cake_rmsnorm_silu_gate_train.CakeRMSNormSiLUGateFunction.apply(..., deterministic=False)` | 0.7.4rc1 | `flashinfer.cake_rmsnorm_silu_gate_nondet_train.CakeRMSNormSiLUGateNondetFunction` | #8922 |
+| `flashinfer.cake_rmsnorm_silu_gate_train.cake_rmsnorm_silu_gate_train_{forward, backward, backward_workspace, backward_workspace_bytes}` (default) | 0.7.3, 0.7.4rc1 | `flashinfer.cake_rmsnorm_silu_gate_det_train.cake_rmsnorm_silu_gate_det_train_{forward, backward, backward_workspace, backward_workspace_bytes}` | #8922 |
+| `flashinfer.cake_rmsnorm_silu_gate_train.cake_rmsnorm_silu_gate_train_{forward, backward, backward_workspace, backward_workspace_bytes}(..., deterministic=False)` | 0.7.4rc1 | `flashinfer.cake_rmsnorm_silu_gate_nondet_train.cake_rmsnorm_silu_gate_nondet_train_{forward, backward, backward_workspace, backward_workspace_bytes}` | #8922 |
+| `flashinfer.cake_rmsnorm_silu_gate_train.cake_rmsnorm_silu_gate_train_reset_workspace` (default) | 0.7.4rc1 | removed, no replacement (the det workspace needs no reset) | #8922 |
+| `flashinfer.cake_rmsnorm_silu_gate_train.cake_rmsnorm_silu_gate_train_reset_workspace(..., deterministic=False)` | 0.7.4rc1 | `flashinfer.cake_rmsnorm_silu_gate_nondet_train.cake_rmsnorm_silu_gate_nondet_train_reset_workspace` | #8922 |
+| `flashinfer.cake_rmsnorm_silu_gate_train.is_cake_rmsnorm_silu_gate_train_supported` (default) | 0.7.3, 0.7.4rc1 | `flashinfer.cake_rmsnorm_silu_gate_det_train.is_cake_rmsnorm_silu_gate_det_train_supported` | #8922 |
+| `flashinfer.cake_rmsnorm_silu_gate_train.is_cake_rmsnorm_silu_gate_train_supported(..., deterministic=False)` | 0.7.4rc1 | `flashinfer.cake_rmsnorm_silu_gate_nondet_train.is_cake_rmsnorm_silu_gate_nondet_train_supported` | #8922 |
+| `flashinfer.cake_rmsnorm_silu_gate_det_train.{CakeRMSNormSiLUGateFunction, cake_rmsnorm_silu_gate, cake_rmsnorm_silu_gate_train_forward, cake_rmsnorm_silu_gate_train_backward, cake_rmsnorm_silu_gate_train_backward_workspace, cake_rmsnorm_silu_gate_train_backward_workspace_bytes, is_cake_rmsnorm_silu_gate_train_supported}` | 0.7.4rc1 | `flashinfer.cake_rmsnorm_silu_gate_det_train.{CakeRMSNormSiLUGateDetFunction, cake_rmsnorm_silu_gate_det, cake_rmsnorm_silu_gate_det_train_forward, cake_rmsnorm_silu_gate_det_train_backward, cake_rmsnorm_silu_gate_det_train_backward_workspace, cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes, is_cake_rmsnorm_silu_gate_det_train_supported}` | #8922 |
+| `flashinfer.{cake_rmsnorm_silu_gate, CakeRMSNormSiLUGateFunction, cake_rmsnorm_silu_gate_train_forward, cake_rmsnorm_silu_gate_train_backward, cake_rmsnorm_silu_gate_train_backward_workspace_bytes}` (default) | 0.7.3, 0.7.4rc1 | `flashinfer.{cake_rmsnorm_silu_gate_det, CakeRMSNormSiLUGateDetFunction, cake_rmsnorm_silu_gate_det_train_forward, cake_rmsnorm_silu_gate_det_train_backward, cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes}` | #8922 |
+| `flashinfer.{cake_rmsnorm_silu_gate, CakeRMSNormSiLUGateFunction, cake_rmsnorm_silu_gate_train_forward, cake_rmsnorm_silu_gate_train_backward, cake_rmsnorm_silu_gate_train_backward_workspace_bytes}(..., deterministic=False)` | 0.7.4rc1 | `flashinfer.{cake_rmsnorm_silu_gate_nondet, CakeRMSNormSiLUGateNondetFunction, cake_rmsnorm_silu_gate_nondet_train_forward, cake_rmsnorm_silu_gate_nondet_train_backward, cake_rmsnorm_silu_gate_nondet_train_backward_workspace_bytes}` | #8922 |
+| package `flashinfer.cake_rmsnorm_silu_gate_train_backend` | 0.7.3 | package `flashinfer.experimental.cake.cake_rmsnorm_silu_gate_det_train` | #8922 |
+| package `flashinfer.cake_rmsnorm_silu_gate_train_backend` | 0.7.4rc1 | package `flashinfer.experimental.cake.cake_rmsnorm_silu_gate_nondet_train` | #8922 |
+| package `flashinfer.cake_rmsnorm_silu_gate_det_train_backend` | 0.7.4rc1 | package `flashinfer.experimental.cake.cake_rmsnorm_silu_gate_det_train` | #8922 |
+| `flashinfer.cake_rmsnorm_silu_gate_train_backend.{CakeRMSNormSiLUGateFunction, cake_rmsnorm_silu_gate, cake_rmsnorm_silu_gate_train_forward, cake_rmsnorm_silu_gate_train_backward, cake_rmsnorm_silu_gate_train_backward_workspace, cake_rmsnorm_silu_gate_train_backward_workspace_bytes, is_cake_rmsnorm_silu_gate_train_supported}` | 0.7.3 | `flashinfer.experimental.cake.cake_rmsnorm_silu_gate_det_train.{CakeRMSNormSiLUGateDetFunction, cake_rmsnorm_silu_gate_det, cake_rmsnorm_silu_gate_det_train_forward, cake_rmsnorm_silu_gate_det_train_backward, cake_rmsnorm_silu_gate_det_train_backward_workspace, cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes, is_cake_rmsnorm_silu_gate_det_train_supported}` | #8922 |
+| `flashinfer.cake_rmsnorm_silu_gate_train_backend.{CakeRMSNormSiLUGateFunction, cake_rmsnorm_silu_gate, cake_rmsnorm_silu_gate_train_forward, cake_rmsnorm_silu_gate_train_backward, cake_rmsnorm_silu_gate_train_backward_workspace, cake_rmsnorm_silu_gate_train_backward_workspace_bytes, cake_rmsnorm_silu_gate_train_reset_workspace, is_cake_rmsnorm_silu_gate_train_supported}` | 0.7.4rc1 | `flashinfer.experimental.cake.cake_rmsnorm_silu_gate_nondet_train.{CakeRMSNormSiLUGateNondetFunction, cake_rmsnorm_silu_gate_nondet, cake_rmsnorm_silu_gate_nondet_train_forward, cake_rmsnorm_silu_gate_nondet_train_backward, cake_rmsnorm_silu_gate_nondet_train_backward_workspace, cake_rmsnorm_silu_gate_nondet_train_backward_workspace_bytes, cake_rmsnorm_silu_gate_nondet_train_reset_workspace, is_cake_rmsnorm_silu_gate_nondet_train_supported}` | #8922 |
+| `flashinfer.cake_rmsnorm_silu_gate_det_train_backend.{CakeRMSNormSiLUGateFunction, cake_rmsnorm_silu_gate, cake_rmsnorm_silu_gate_train_forward, cake_rmsnorm_silu_gate_train_backward, cake_rmsnorm_silu_gate_train_backward_workspace, cake_rmsnorm_silu_gate_train_backward_workspace_bytes, is_cake_rmsnorm_silu_gate_train_supported}` | 0.7.4rc1 | `flashinfer.experimental.cake.cake_rmsnorm_silu_gate_det_train.{CakeRMSNormSiLUGateDetFunction, cake_rmsnorm_silu_gate_det, cake_rmsnorm_silu_gate_det_train_forward, cake_rmsnorm_silu_gate_det_train_backward, cake_rmsnorm_silu_gate_det_train_backward_workspace, cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes, is_cake_rmsnorm_silu_gate_det_train_supported}` | #8922 |
 
-### causal conv1d nondet (+KCP): cake_causal_conv1d_nondet_train[_kcp]
+### causal conv1d
 
 | Old name | In | New name | PR |
-| --- | --- | --- | --- |
-| module flashinfer.experimental.cake.cake_causal_conv1d_train | 0.7.4rc1 | flashinfer.cake_causal_conv1d_nondet_train | #8906 |
-| module flashinfer.cake_causal_conv1d_train_kcp | 0.7.4rc1 | flashinfer.cake_causal_conv1d_nondet_train_kcp | #8906 |
-| package flashinfer.experimental.cake.cake_causal_conv1d_train_backend (+ .cake_build, .cake_jit, .kcp, .kcp_jit) | 0.7.4rc1 | flashinfer.experimental.cake.cake_causal_conv1d_nondet_train (same submodules) | #8906 |
-| cake_causal_conv1d (experimental.cake.cake_causal_conv1d_train + backend) | 0.7.4rc1 | cake_causal_conv1d_nondet | #8906 |
-| CakeCausalConv1dFunction (experimental.cake.cake_causal_conv1d_train + backend) | 0.7.4rc1 | CakeCausalConv1dNondetFunction | #8906 |
-| cake_causal_conv1d_train_forward / cake_causal_conv1d_train_backward (experimental.cake facade + backend) | 0.7.4rc1 | cake_causal_conv1d_nondet_train_forward / cake_causal_conv1d_nondet_train_backward | #8906 |
-| cake_causal_conv1d_train_{forward,backward}_workspace{,_bytes} (experimental.cake facade + backend) | 0.7.4rc1 | cake_causal_conv1d_nondet_train_{forward,backward}_workspace{,_bytes} | #8906 |
-| is_cake_causal_conv1d_train_supported (experimental.cake facade + backend) | 0.7.4rc1 | is_cake_causal_conv1d_nondet_train_supported | #8906 |
-| cake_causal_conv1d_kcp (flashinfer.cake_causal_conv1d_train_kcp + backend .kcp) | 0.7.4rc1 | cake_causal_conv1d_nondet_kcp | #8906 |
-| cake_causal_conv1d_multi_kcp (flashinfer.cake_causal_conv1d_train_kcp + backend .kcp) | 0.7.4rc1 | cake_causal_conv1d_nondet_kcp_multi | #8906 |
-| RecomputeHandleKcp (flashinfer.cake_causal_conv1d_train_kcp + backend .kcp) | 0.7.4rc1 | CakeCausalConv1dNondetKcpRecomputeHandle | #8906 |
-| backend .kcp CakeCausalConv1dFunctionKcp | 0.7.4rc1 | CakeCausalConv1dNondetKcpFunction | #8906 |
-| backend .kcp CakeCausalConv1dMultiFunctionKcp | 0.7.4rc1 | CakeCausalConv1dNondetKcpMultiFunction | #8906 |
-| backend .kcp cake_causal_conv1d_forward_kcp / cake_causal_conv1d_backward_kcp | 0.7.4rc1 | cake_causal_conv1d_nondet_train_kcp_forward / cake_causal_conv1d_nondet_train_kcp_backward | #8906 |
-| backend .kcp cake_causal_conv1d_multi_forward_kcp / cake_causal_conv1d_multi_backward_kcp | 0.7.4rc1 | cake_causal_conv1d_nondet_train_kcp_multi_forward / cake_causal_conv1d_nondet_train_kcp_multi_backward | #8906 |
-| backend .kcp graph_cache_clear / host_cache_clear | 0.7.4rc1 | cake_causal_conv1d_nondet_train_kcp_graph_cache_clear / cake_causal_conv1d_nondet_train_kcp_host_cache_clear | #8906 |
-| deterministic= keyword (every rc1 nondet facade and backend entry, default True) | 0.7.4rc1 | removed (the module selects the mode); passing it raises TypeError | #8906 |
+|---|---|---|---|
+| `flashinfer.cake_causal_conv1d_train` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_causal_conv1d_det_train` | #8912 |
+| `flashinfer.cake_causal_conv1d_train.{cake_causal_conv1d, CakeCausalConv1dFunction, is_cake_causal_conv1d_train_supported}` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_causal_conv1d_det_train.{cake_causal_conv1d_det, CakeCausalConv1dDetFunction, is_cake_causal_conv1d_det_train_supported}` | #8912 |
+| `flashinfer.cake_causal_conv1d_train.cake_causal_conv1d_train_{forward, backward, forward_workspace, backward_workspace, forward_workspace_bytes, backward_workspace_bytes}` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_causal_conv1d_det_train.cake_causal_conv1d_det_train_{forward, backward, forward_workspace, backward_workspace, forward_workspace_bytes, backward_workspace_bytes}` | #8912 |
+| `flashinfer.cake_causal_conv1d_det_train.{cake_causal_conv1d, CakeCausalConv1dFunction, is_cake_causal_conv1d_train_supported}` | 0.7.4rc1 | `flashinfer.cake_causal_conv1d_det_train.{cake_causal_conv1d_det, CakeCausalConv1dDetFunction, is_cake_causal_conv1d_det_train_supported}` | #8912 |
+| `flashinfer.cake_causal_conv1d_det_train.cake_causal_conv1d_train_{forward, backward, forward_workspace, backward_workspace, forward_workspace_bytes, backward_workspace_bytes}` | 0.7.4rc1 | `flashinfer.cake_causal_conv1d_det_train.cake_causal_conv1d_det_train_{forward, backward, forward_workspace, backward_workspace, forward_workspace_bytes, backward_workspace_bytes}` | #8912 |
+| `flashinfer.{cake_causal_conv1d, CakeCausalConv1dFunction, cake_causal_conv1d_train_forward, cake_causal_conv1d_train_backward, cake_causal_conv1d_train_forward_workspace_bytes, cake_causal_conv1d_train_backward_workspace_bytes}` | 0.7.3, 0.7.4rc1 | `flashinfer.{cake_causal_conv1d_det, CakeCausalConv1dDetFunction, cake_causal_conv1d_det_train_forward, cake_causal_conv1d_det_train_backward, cake_causal_conv1d_det_train_forward_workspace_bytes, cake_causal_conv1d_det_train_backward_workspace_bytes}` | #8912 |
+| `flashinfer.cake_causal_conv1d_train.cake_causal_conv1d_kcp` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_causal_conv1d_det_train_kcp.cake_causal_conv1d_det_kcp` | #8912 |
+| `flashinfer.cake_causal_conv1d_det_train.cake_causal_conv1d_kcp` | 0.7.4rc1 | `flashinfer.cake_causal_conv1d_det_train_kcp.cake_causal_conv1d_det_kcp` | #8912 |
+| `flashinfer.cake_causal_conv1d_train.cake_causal_conv1d_kcp_multi`, `flashinfer.cake_causal_conv1d_det_train.cake_causal_conv1d_kcp_multi`, `flashinfer.cake_causal_conv1d_det_train_kcp.cake_causal_conv1d_det_multi_kcp` | 0.7.4rc1 | `flashinfer.cake_causal_conv1d_det_train_kcp.cake_causal_conv1d_det_kcp_multi` | #8953 |
+| `flashinfer.cake_causal_conv1d_train.KcpRecomputeHandle` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_causal_conv1d_det_train_kcp.CakeCausalConv1dDetKcpRecomputeHandle` | #8953 |
+| `flashinfer.cake_causal_conv1d_det_train.KcpRecomputeHandle`, `flashinfer.cake_causal_conv1d_det_train_kcp.RecomputeHandleDetKcp` | 0.7.4rc1 | `flashinfer.cake_causal_conv1d_det_train_kcp.CakeCausalConv1dDetKcpRecomputeHandle` | #8953 |
+| package `flashinfer.cake_causal_conv1d_train_backend` (with `.kcp`) | 0.7.3, 0.7.4rc1 | package `flashinfer.experimental.cake.cake_causal_conv1d_det_train` (with `.kcp`) | #8953 |
+| package `flashinfer.cake_causal_conv1d_det_train_backend` (with `.kcp`) | 0.7.4rc1 | package `flashinfer.experimental.cake.cake_causal_conv1d_det_train` (with `.kcp`) | #8953 |
+| `flashinfer.cake_causal_conv1d_train_backend.{cake_causal_conv1d, CakeCausalConv1dFunction, is_cake_causal_conv1d_train_supported}` | 0.7.3, 0.7.4rc1 | `flashinfer.experimental.cake.cake_causal_conv1d_det_train.{cake_causal_conv1d_det, CakeCausalConv1dDetFunction, is_cake_causal_conv1d_det_train_supported}` | #8953 |
+| `flashinfer.cake_causal_conv1d_train_backend.cake_causal_conv1d_train_{forward, backward, forward_workspace, backward_workspace, forward_workspace_bytes, backward_workspace_bytes}` | 0.7.3, 0.7.4rc1 | `flashinfer.experimental.cake.cake_causal_conv1d_det_train.cake_causal_conv1d_det_train_{forward, backward, forward_workspace, backward_workspace, forward_workspace_bytes, backward_workspace_bytes}` | #8953 |
+| `flashinfer.cake_causal_conv1d_det_train_backend.{cake_causal_conv1d, CakeCausalConv1dFunction, is_cake_causal_conv1d_train_supported}` | 0.7.4rc1 | `flashinfer.experimental.cake.cake_causal_conv1d_det_train.{cake_causal_conv1d_det, CakeCausalConv1dDetFunction, is_cake_causal_conv1d_det_train_supported}` | #8953 |
+| `flashinfer.cake_causal_conv1d_det_train_backend.cake_causal_conv1d_train_{forward, backward, forward_workspace, backward_workspace, forward_workspace_bytes, backward_workspace_bytes}` | 0.7.4rc1 | `flashinfer.experimental.cake.cake_causal_conv1d_det_train.cake_causal_conv1d_det_train_{forward, backward, forward_workspace, backward_workspace, forward_workspace_bytes, backward_workspace_bytes}` | #8953 |
+| `flashinfer.cake_causal_conv1d_train_backend.kcp.{cake_causal_conv1d_kcp, KcpRecomputeHandle, CakeCausalConv1dKcpFunction, cake_causal_conv1d_kcp_forward, cake_causal_conv1d_kcp_backward, graph_cache_clear, host_cache_clear}` | 0.7.3, 0.7.4rc1 | `flashinfer.experimental.cake.cake_causal_conv1d_det_train.kcp.{cake_causal_conv1d_det_kcp, CakeCausalConv1dDetKcpRecomputeHandle, CakeCausalConv1dDetKcpFunction, cake_causal_conv1d_det_train_kcp_forward, cake_causal_conv1d_det_train_kcp_backward, cake_causal_conv1d_det_train_kcp_graph_cache_clear, cake_causal_conv1d_det_train_kcp_host_cache_clear}` | #8953 |
+| `flashinfer.cake_causal_conv1d_train_backend.kcp.{cake_causal_conv1d_kcp_multi, CakeCausalConv1dKcpMultiFunction, cake_causal_conv1d_kcp_multi_forward, cake_causal_conv1d_kcp_multi_backward}` | 0.7.4rc1 | `flashinfer.experimental.cake.cake_causal_conv1d_det_train.kcp.{cake_causal_conv1d_det_kcp_multi, CakeCausalConv1dDetKcpMultiFunction, cake_causal_conv1d_det_train_kcp_multi_forward, cake_causal_conv1d_det_train_kcp_multi_backward}` | #8953 |
+| `flashinfer.cake_causal_conv1d_det_train_backend.kcp.{cake_causal_conv1d_det_multi_kcp, RecomputeHandleDetKcp, CakeCausalConv1dDetFunctionKcp, CakeCausalConv1dDetMultiFunctionKcp, cake_causal_conv1d_det_forward_kcp, cake_causal_conv1d_det_backward_kcp, cake_causal_conv1d_det_multi_forward_kcp, cake_causal_conv1d_det_multi_backward_kcp, graph_cache_clear, host_cache_clear}` | 0.7.4rc1 | `flashinfer.experimental.cake.cake_causal_conv1d_det_train.kcp.{cake_causal_conv1d_det_kcp_multi, CakeCausalConv1dDetKcpRecomputeHandle, CakeCausalConv1dDetKcpFunction, CakeCausalConv1dDetKcpMultiFunction, cake_causal_conv1d_det_train_kcp_forward, cake_causal_conv1d_det_train_kcp_backward, cake_causal_conv1d_det_train_kcp_multi_forward, cake_causal_conv1d_det_train_kcp_multi_backward, cake_causal_conv1d_det_train_kcp_graph_cache_clear, cake_causal_conv1d_det_train_kcp_host_cache_clear}` | #8953 |
+| `flashinfer.cake_causal_conv1d_det_train_backend.kcp.{cake_causal_conv1d_kcp, cake_causal_conv1d_kcp_multi, KcpRecomputeHandle, CakeCausalConv1dKcpFunction, CakeCausalConv1dKcpMultiFunction, cake_causal_conv1d_kcp_forward, cake_causal_conv1d_kcp_backward, cake_causal_conv1d_kcp_multi_forward, cake_causal_conv1d_kcp_multi_backward}` | 0.7.4rc1 | `flashinfer.experimental.cake.cake_causal_conv1d_det_train.kcp.{cake_causal_conv1d_det_kcp, cake_causal_conv1d_det_kcp_multi, CakeCausalConv1dDetKcpRecomputeHandle, CakeCausalConv1dDetKcpFunction, CakeCausalConv1dDetKcpMultiFunction, cake_causal_conv1d_det_train_kcp_forward, cake_causal_conv1d_det_train_kcp_backward, cake_causal_conv1d_det_train_kcp_multi_forward, cake_causal_conv1d_det_train_kcp_multi_backward}` | #8953 |
+| `flashinfer.cake_causal_conv1d_det_train_backend.kcp.launch_grid` | 0.7.4rc1 | removed, no replacement | #8953 |
+| `flashinfer.experimental.cake.cake_causal_conv1d_train` (default) | 0.7.4rc1 | `flashinfer.cake_causal_conv1d_det_train` | #8906 |
+| `flashinfer.experimental.cake.cake_causal_conv1d_train` (deterministic=False calls) | 0.7.4rc1 | `flashinfer.cake_causal_conv1d_nondet_train` | #8906 |
+| `flashinfer.experimental.cake.cake_causal_conv1d_train.{cake_causal_conv1d, is_cake_causal_conv1d_train_supported}` (default) | 0.7.4rc1 | `flashinfer.cake_causal_conv1d_det_train.{cake_causal_conv1d_det, is_cake_causal_conv1d_det_train_supported}` | #8906 |
+| `flashinfer.experimental.cake.cake_causal_conv1d_train.{cake_causal_conv1d, is_cake_causal_conv1d_train_supported}(..., deterministic=False)` | 0.7.4rc1 | `flashinfer.cake_causal_conv1d_nondet_train.{cake_causal_conv1d_nondet, is_cake_causal_conv1d_nondet_train_supported}` | #8906 |
+| `flashinfer.experimental.cake.cake_causal_conv1d_train.cake_causal_conv1d_train_{forward, backward, forward_workspace, backward_workspace, forward_workspace_bytes, backward_workspace_bytes}` (default) | 0.7.4rc1 | `flashinfer.cake_causal_conv1d_det_train.cake_causal_conv1d_det_train_{forward, backward, forward_workspace, backward_workspace, forward_workspace_bytes, backward_workspace_bytes}` | #8906 |
+| `flashinfer.experimental.cake.cake_causal_conv1d_train.cake_causal_conv1d_train_{forward, backward, forward_workspace, backward_workspace, forward_workspace_bytes, backward_workspace_bytes}(..., deterministic=False)` | 0.7.4rc1 | `flashinfer.cake_causal_conv1d_nondet_train.cake_causal_conv1d_nondet_train_{forward, backward, forward_workspace, backward_workspace, forward_workspace_bytes, backward_workspace_bytes}` | #8906 |
+| `flashinfer.experimental.cake.cake_causal_conv1d_train.CakeCausalConv1dFunction` | 0.7.4rc1 | `flashinfer.cake_causal_conv1d_nondet_train.CakeCausalConv1dNondetFunction` | #8906 |
+| `flashinfer.cake_causal_conv1d_train_kcp` (default) | 0.7.4rc1 | `flashinfer.cake_causal_conv1d_det_train_kcp` | #8906 |
+| `flashinfer.cake_causal_conv1d_train_kcp` (deterministic=False calls) | 0.7.4rc1 | `flashinfer.cake_causal_conv1d_nondet_train_kcp` | #8906 |
+| `flashinfer.cake_causal_conv1d_train_kcp.cake_causal_conv1d_kcp` (default) | 0.7.4rc1 | `flashinfer.cake_causal_conv1d_det_train_kcp.cake_causal_conv1d_det_kcp` | #8906 |
+| `flashinfer.cake_causal_conv1d_train_kcp.cake_causal_conv1d_kcp(..., deterministic=False)` | 0.7.4rc1 | `flashinfer.cake_causal_conv1d_nondet_train_kcp.cake_causal_conv1d_nondet_kcp` | #8906 |
+| `flashinfer.cake_causal_conv1d_train_kcp.cake_causal_conv1d_multi_kcp` (default) | 0.7.4rc1 | `flashinfer.cake_causal_conv1d_det_train_kcp.cake_causal_conv1d_det_kcp_multi` | #8953 |
+| `flashinfer.cake_causal_conv1d_train_kcp.cake_causal_conv1d_multi_kcp(..., deterministic=False)` | 0.7.4rc1 | `flashinfer.cake_causal_conv1d_nondet_train_kcp.cake_causal_conv1d_nondet_kcp_multi` | #8906 |
+| `flashinfer.cake_causal_conv1d_train_kcp.RecomputeHandleKcp` | 0.7.4rc1 | `flashinfer.cake_causal_conv1d_nondet_train_kcp.CakeCausalConv1dNondetKcpRecomputeHandle` | #8906 |
+| package `flashinfer.experimental.cake.cake_causal_conv1d_train_backend` (with `.kcp`) | 0.7.4rc1 | package `flashinfer.experimental.cake.cake_causal_conv1d_nondet_train` (with `.kcp`) | #8906 |
+| `flashinfer.experimental.cake.cake_causal_conv1d_train_backend.{cake_causal_conv1d, CakeCausalConv1dFunction, is_cake_causal_conv1d_train_supported}` | 0.7.4rc1 | `flashinfer.experimental.cake.cake_causal_conv1d_nondet_train.{cake_causal_conv1d_nondet, CakeCausalConv1dNondetFunction, is_cake_causal_conv1d_nondet_train_supported}` | #8906 |
+| `flashinfer.experimental.cake.cake_causal_conv1d_train_backend.cake_causal_conv1d_train_{forward, backward, forward_workspace, backward_workspace, forward_workspace_bytes, backward_workspace_bytes}` | 0.7.4rc1 | `flashinfer.experimental.cake.cake_causal_conv1d_nondet_train.cake_causal_conv1d_nondet_train_{forward, backward, forward_workspace, backward_workspace, forward_workspace_bytes, backward_workspace_bytes}` | #8906 |
+| `flashinfer.experimental.cake.cake_causal_conv1d_train_backend.kcp.{cake_causal_conv1d_kcp, cake_causal_conv1d_multi_kcp, RecomputeHandleKcp, CakeCausalConv1dFunctionKcp, CakeCausalConv1dMultiFunctionKcp, cake_causal_conv1d_forward_kcp, cake_causal_conv1d_backward_kcp, cake_causal_conv1d_multi_forward_kcp, cake_causal_conv1d_multi_backward_kcp, graph_cache_clear, host_cache_clear}` | 0.7.4rc1 | `flashinfer.experimental.cake.cake_causal_conv1d_nondet_train.kcp.{cake_causal_conv1d_nondet_kcp, cake_causal_conv1d_nondet_kcp_multi, CakeCausalConv1dNondetKcpRecomputeHandle, CakeCausalConv1dNondetKcpFunction, CakeCausalConv1dNondetKcpMultiFunction, cake_causal_conv1d_nondet_train_kcp_forward, cake_causal_conv1d_nondet_train_kcp_backward, cake_causal_conv1d_nondet_train_kcp_multi_forward, cake_causal_conv1d_nondet_train_kcp_multi_backward, cake_causal_conv1d_nondet_train_kcp_graph_cache_clear, cake_causal_conv1d_nondet_train_kcp_host_cache_clear}` | #8906 |
 
-### causal conv1d det (+KCP): cake_causal_conv1d_det_train[_kcp]
-
-| Old name | In | New name | PR |
-| --- | --- | --- | --- |
-| module flashinfer.cake_causal_conv1d_train | 0.7.3, 0.7.4rc1 | flashinfer.cake_causal_conv1d_det_train | #8912 |
-| module flashinfer.cake_causal_conv1d_det_train | 0.7.4rc1 | flashinfer.cake_causal_conv1d_det_train (unchanged) | #8953 |
-| module flashinfer.cake_causal_conv1d_det_train_kcp | 0.7.4rc1 | flashinfer.cake_causal_conv1d_det_train_kcp (unchanged) | #8953 |
-| package flashinfer.cake_causal_conv1d_train_backend (+ .cake_build, .cake_jit, .kcp, .kcp_jit) | 0.7.3, 0.7.4rc1 | flashinfer.experimental.cake.cake_causal_conv1d_det_train (same submodules) | #8912, #8953 |
-| package flashinfer.cake_causal_conv1d_det_train_backend (+ .cake_build, .cake_jit, .kcp, .kcp_jit) | 0.7.4rc1 | flashinfer.experimental.cake.cake_causal_conv1d_det_train (same submodules) | #8953 |
-| flashinfer.cake_causal_conv1d (top level) | 0.7.3, 0.7.4rc1 | flashinfer.cake_causal_conv1d_det | #8912 |
-| flashinfer.CakeCausalConv1dFunction (top level) | 0.7.3, 0.7.4rc1 | flashinfer.CakeCausalConv1dDetFunction | #8912 |
-| flashinfer.cake_causal_conv1d_train_forward / flashinfer.cake_causal_conv1d_train_backward (top level) | 0.7.3, 0.7.4rc1 | flashinfer.cake_causal_conv1d_det_train_forward / flashinfer.cake_causal_conv1d_det_train_backward | #8912 |
-| flashinfer.cake_causal_conv1d_train_forward_workspace_bytes / flashinfer.cake_causal_conv1d_train_backward_workspace_bytes (top level) | 0.7.3, 0.7.4rc1 | flashinfer.cake_causal_conv1d_det_train_forward_workspace_bytes / flashinfer.cake_causal_conv1d_det_train_backward_workspace_bytes | #8912 |
-| cake_causal_conv1d (in flashinfer.cake_causal_conv1d_train and its backend; rc1 alias in det_train + det backend) | 0.7.3, 0.7.4rc1 | cake_causal_conv1d_det (flashinfer.cake_causal_conv1d_det_train) | #8912 |
-| CakeCausalConv1dFunction (facade + backend; rc1 alias in det_train + det backend) | 0.7.3, 0.7.4rc1 | CakeCausalConv1dDetFunction | #8912 |
-| cake_causal_conv1d_train_forward / cake_causal_conv1d_train_backward (facade + backend) | 0.7.3, 0.7.4rc1 | cake_causal_conv1d_det_train_forward / cake_causal_conv1d_det_train_backward | #8912 |
-| cake_causal_conv1d_train_{forward,backward}_workspace{,_bytes} (facade + backend) | 0.7.3, 0.7.4rc1 | cake_causal_conv1d_det_train_{forward,backward}_workspace{,_bytes} | #8912 |
-| is_cake_causal_conv1d_train_supported (facade + backend) | 0.7.3, 0.7.4rc1 | is_cake_causal_conv1d_det_train_supported | #8912 |
-| cake_causal_conv1d_kcp (facade flashinfer.cake_causal_conv1d_train at 0.7.3 / flashinfer.cake_causal_conv1d_det_train alias at rc1; backend .kcp) | 0.7.3, 0.7.4rc1 | flashinfer.cake_causal_conv1d_det_train_kcp.cake_causal_conv1d_det_kcp (backend .kcp cake_causal_conv1d_det_kcp) | #8912 |
-| cake_causal_conv1d_kcp_multi (rc1 alias on flashinfer.cake_causal_conv1d_det_train and det backend .kcp) | 0.7.4rc1 | flashinfer.cake_causal_conv1d_det_train_kcp.cake_causal_conv1d_det_kcp_multi | #8912, #8953 |
-| cake_causal_conv1d_det_multi_kcp (flashinfer.cake_causal_conv1d_det_train_kcp + det backend .kcp) | 0.7.4rc1 | cake_causal_conv1d_det_kcp_multi | #8953 |
-| KcpRecomputeHandle (facade flashinfer.cake_causal_conv1d_train at 0.7.3 / flashinfer.cake_causal_conv1d_det_train at rc1; backend .kcp) | 0.7.3, 0.7.4rc1 | flashinfer.cake_causal_conv1d_det_train_kcp.CakeCausalConv1dDetKcpRecomputeHandle | #8912, #8953 |
-| RecomputeHandleDetKcp (flashinfer.cake_causal_conv1d_det_train_kcp + det backend .kcp) | 0.7.4rc1 | CakeCausalConv1dDetKcpRecomputeHandle | #8953 |
-| backend .kcp CakeCausalConv1dKcpFunction | 0.7.3, 0.7.4rc1 | CakeCausalConv1dDetKcpFunction (also exported by flashinfer.cake_causal_conv1d_det_train_kcp) | #8912, #8953 |
-| backend .kcp CakeCausalConv1dDetFunctionKcp | 0.7.4rc1 | CakeCausalConv1dDetKcpFunction (also exported by flashinfer.cake_causal_conv1d_det_train_kcp) | #8953 |
-| backend .kcp CakeCausalConv1dDetMultiFunctionKcp (and its rc1 alias CakeCausalConv1dKcpMultiFunction) | 0.7.4rc1 | CakeCausalConv1dDetKcpMultiFunction (also exported by flashinfer.cake_causal_conv1d_det_train_kcp) | #8953, #8912 |
-| backend .kcp cake_causal_conv1d_kcp_forward / cake_causal_conv1d_kcp_backward | 0.7.3, 0.7.4rc1 | cake_causal_conv1d_det_train_kcp_forward / cake_causal_conv1d_det_train_kcp_backward | #8912, #8953 |
-| backend .kcp cake_causal_conv1d_det_forward_kcp / cake_causal_conv1d_det_backward_kcp | 0.7.4rc1 | cake_causal_conv1d_det_train_kcp_forward / cake_causal_conv1d_det_train_kcp_backward | #8953 |
-| backend .kcp cake_causal_conv1d_det_multi_forward_kcp / cake_causal_conv1d_det_multi_backward_kcp (and rc1 aliases cake_causal_conv1d_kcp_multi_forward / _backward) | 0.7.4rc1 | cake_causal_conv1d_det_train_kcp_multi_forward / cake_causal_conv1d_det_train_kcp_multi_backward | #8953, #8912 |
-| backend .kcp graph_cache_clear / host_cache_clear | 0.7.3, 0.7.4rc1 | cake_causal_conv1d_det_train_kcp_graph_cache_clear / cake_causal_conv1d_det_train_kcp_host_cache_clear | #8953 |
-| backend .kcp launch_grid | 0.7.4rc1 | _launch_grid (private, no public replacement) | #8953 |
-| error text "recompute_handle: the 'conv' entry belongs to another KcpContext" | 0.7.3, 0.7.4rc1 | "... belongs to another KCP context" | #8953 |
-
-### mHC (cake_mhc_det_train, cake_mhc_nondet_train)
+### mHC
 
 | Old name | In | New name | PR |
-| --- | --- | --- | --- |
-| flashinfer.cake_mhc_train (module; det at 0.7.3, det compatibility alias at 0.7.4rc1) | 0.7.3, 0.7.4rc1 | flashinfer.cake_mhc_det_train (head entries -> flashinfer.cake_mhc_head_det_train) | #8907, #8900 |
-| flashinfer.cake_mhc_det_train (module) | 0.7.4rc1 | flashinfer.cake_mhc_det_train (name unchanged; head entries split out; classes and route_key renamed; backend now under experimental/cake) | #8907 |
-| flashinfer.cake_mhc_train.cake_mhc_train_<verb> for verb in forward_prepare, forward_stats, forward_finish, backward_prepare, backward_finish, prepare, finish, forward_workspace_bytes, backward_workspace_bytes, forward_workspace, backward_workspace, reset_workspace; and the top-level flashinfer.cake_mhc_train_<verb> (top level has all of these except forward_workspace, backward_workspace and reset_workspace) | 0.7.3, 0.7.4rc1 | flashinfer.cake_mhc_det_train.cake_mhc_det_train_<verb>; the same 9 names are also at the top level as flashinfer.cake_mhc_det_train_<verb> | #8907, #8900 |
-| flashinfer.cake_mhc_det_train.cake_mhc_det_train_<verb> (same 12 verbs; 9 also at top level) | 0.7.4rc1 | unchanged: flashinfer.cake_mhc_det_train.cake_mhc_det_train_<verb> | #8907 |
-| flashinfer.cake_mhc_train.CakeMHCTrain{Prepare,Finish}Function and top-level flashinfer.CakeMHCTrain{Prepare,Finish}Function | 0.7.3, 0.7.4rc1 | flashinfer.cake_mhc_det_train.CakeMHCDet{Prepare,Finish}Function (also top-level flashinfer.CakeMHCDet{Prepare,Finish}Function through _LAZY_EXPORTS) | #8907, #8900 |
-| flashinfer.cake_mhc_det_train.CakeMHCDetTrain{Prepare,Finish}Function and top-level flashinfer.CakeMHCDetTrain{Prepare,Finish}Function | 0.7.4rc1 | flashinfer.cake_mhc_det_train.CakeMHCDet{Prepare,Finish}Function (also top level, lazy) | #8907 |
-| flashinfer.cake_mhc_train.is_cake_mhc_train_supported | 0.7.3, 0.7.4rc1 | flashinfer.cake_mhc_det_train.is_cake_mhc_det_train_supported | #8907, #8900 |
-| flashinfer.cake_mhc_train.route_key (0.7.3, 0.7.4rc1) and flashinfer.cake_mhc_det_train.route_key (0.7.4rc1) | 0.7.3, 0.7.4rc1 | flashinfer.cake_mhc_det_train.cake_mhc_det_train_route_key | #8907 |
-| flashinfer.cake_mhc_train_backend (0.7.3 det package; 0.7.4rc1 det alias) and flashinfer.cake_mhc_det_train_backend (0.7.4rc1) | 0.7.3, 0.7.4rc1 | flashinfer.experimental.cake.cake_mhc_det_train | #8907, #8900 |
-| flashinfer.experimental.cake.cake_mhc_train (module; selector, deterministic: bool = True) | 0.7.4rc1 | flashinfer.cake_mhc_nondet_train for deterministic=False callers; flashinfer.cake_mhc_det_train for default (deterministic=True) callers | #8907 |
-| flashinfer.experimental.cake.cake_mhc_train.cake_mhc_train_<verb>(..., deterministic=False) for the same 12 verbs (finish takes no keyword and follows the handle) | 0.7.4rc1 | flashinfer.cake_mhc_nondet_train.cake_mhc_nondet_train_<verb> (no deterministic keyword; not exported at top level) | #8907 |
-| flashinfer.experimental.cake.cake_mhc_train.cake_mhc_train_<verb>(...) with the default deterministic=True | 0.7.4rc1 | flashinfer.cake_mhc_det_train.cake_mhc_det_train_<verb> | #8907 |
-| flashinfer.experimental.cake.cake_mhc_train.is_cake_mhc_train_supported | 0.7.4rc1 | flashinfer.cake_mhc_nondet_train.is_cake_mhc_nondet_train_supported (deterministic=False); flashinfer.cake_mhc_det_train.is_cake_mhc_det_train_supported (default deterministic=True) | #8907 |
-| flashinfer.experimental.cake.cake_mhc_train.CakeMHCTrain{Prepare,Finish}Function (the nondet package's classes) | 0.7.4rc1 | flashinfer.cake_mhc_nondet_train.CakeMHCNondet{Prepare,Finish}Function | #8907 |
-| flashinfer.experimental.cake.cake_mhc_train.route_key | 0.7.4rc1 | flashinfer.cake_mhc_nondet_train.cake_mhc_nondet_train_route_key | #8907 |
-| flashinfer.experimental.cake.cake_mhc_train_backend (its own cake_mhc_train_* entries accept only deterministic=False) | 0.7.4rc1 | flashinfer.experimental.cake.cake_mhc_nondet_train (cake_mhc_nondet_train_* entries, no keyword) | #8907 |
+|---|---|---|---|
+| `flashinfer.cake_mhc_train` (non-head entries) | 0.7.3, 0.7.4rc1 | `flashinfer.cake_mhc_det_train` | #8900 |
+| `flashinfer.cake_mhc_train.cake_mhc_train_{forward_prepare, forward_stats, forward_finish, backward_prepare, backward_finish, prepare, finish, forward_workspace, backward_workspace, forward_workspace_bytes, backward_workspace_bytes, reset_workspace}` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_mhc_det_train.cake_mhc_det_train_{forward_prepare, forward_stats, forward_finish, backward_prepare, backward_finish, prepare, finish, forward_workspace, backward_workspace, forward_workspace_bytes, backward_workspace_bytes, reset_workspace}` | #8900 |
+| `flashinfer.cake_mhc_train.is_cake_mhc_train_supported` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_mhc_det_train.is_cake_mhc_det_train_supported` | #8900 |
+| `flashinfer.cake_mhc_train.CakeMHCTrain{Prepare, Finish}Function` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_mhc_det_train.CakeMHCDet{Prepare, Finish}Function` | #8907 |
+| `flashinfer.cake_mhc_train.route_key` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_mhc_det_train.cake_mhc_det_train_route_key` | #8907 |
+| `flashinfer.cake_mhc_det_train.CakeMHCDetTrain{Prepare, Finish}Function` | 0.7.4rc1 | `flashinfer.cake_mhc_det_train.CakeMHCDet{Prepare, Finish}Function` | #8907 |
+| `flashinfer.cake_mhc_det_train.route_key` | 0.7.4rc1 | `flashinfer.cake_mhc_det_train.cake_mhc_det_train_route_key` | #8907 |
+| `flashinfer.cake_mhc_train_{forward_prepare, forward_stats, forward_finish, backward_prepare, backward_finish, prepare, finish, forward_workspace_bytes, backward_workspace_bytes}` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_mhc_det_train_{forward_prepare, forward_stats, forward_finish, backward_prepare, backward_finish, prepare, finish, forward_workspace_bytes, backward_workspace_bytes}` | #8900 |
+| `flashinfer.CakeMHCTrain{Prepare, Finish}Function` | 0.7.3, 0.7.4rc1 | `flashinfer.CakeMHCDet{Prepare, Finish}Function` | #8907 |
+| `flashinfer.CakeMHCDetTrain{Prepare, Finish}Function` | 0.7.4rc1 | `flashinfer.CakeMHCDet{Prepare, Finish}Function` | #8907 |
+| `flashinfer.experimental.cake.cake_mhc_train` (default) | 0.7.4rc1 | `flashinfer.cake_mhc_det_train` | #8907 |
+| `flashinfer.experimental.cake.cake_mhc_train` (deterministic=False calls) | 0.7.4rc1 | `flashinfer.cake_mhc_nondet_train` | #8907 |
+| `flashinfer.experimental.cake.cake_mhc_train.cake_mhc_train_{forward_prepare, forward_stats, forward_finish, backward_prepare, backward_finish, prepare, forward_workspace, backward_workspace, forward_workspace_bytes, backward_workspace_bytes}` (default) | 0.7.4rc1 | `flashinfer.cake_mhc_det_train.cake_mhc_det_train_{forward_prepare, forward_stats, forward_finish, backward_prepare, backward_finish, prepare, forward_workspace, backward_workspace, forward_workspace_bytes, backward_workspace_bytes}` | #8907 |
+| `flashinfer.experimental.cake.cake_mhc_train.cake_mhc_train_{forward_prepare, forward_stats, forward_finish, backward_prepare, backward_finish, prepare, forward_workspace, backward_workspace, forward_workspace_bytes, backward_workspace_bytes}(..., deterministic=False)` | 0.7.4rc1 | `flashinfer.cake_mhc_nondet_train.cake_mhc_nondet_train_{forward_prepare, forward_stats, forward_finish, backward_prepare, backward_finish, prepare, forward_workspace, backward_workspace, forward_workspace_bytes, backward_workspace_bytes}` | #8907 |
+| `flashinfer.experimental.cake.cake_mhc_train.{cake_mhc_train_finish, cake_mhc_train_reset_workspace}` | 0.7.4rc1 | `flashinfer.cake_mhc_det_train.{cake_mhc_det_train_finish, cake_mhc_det_train_reset_workspace}` for a det handle or workspace; `flashinfer.cake_mhc_nondet_train.{cake_mhc_nondet_train_finish, cake_mhc_nondet_train_reset_workspace}` for a nondet one | #8907 |
+| `flashinfer.experimental.cake.cake_mhc_train.is_cake_mhc_train_supported` (default) | 0.7.4rc1 | `flashinfer.cake_mhc_det_train.is_cake_mhc_det_train_supported` | #8907 |
+| `flashinfer.experimental.cake.cake_mhc_train.is_cake_mhc_train_supported(..., deterministic=False)` | 0.7.4rc1 | `flashinfer.cake_mhc_nondet_train.is_cake_mhc_nondet_train_supported` | #8907 |
+| `flashinfer.experimental.cake.cake_mhc_train.CakeMHCTrain{Prepare, Finish}Function` | 0.7.4rc1 | `flashinfer.cake_mhc_nondet_train.CakeMHCNondet{Prepare, Finish}Function` | #8907 |
+| `flashinfer.experimental.cake.cake_mhc_train.route_key` | 0.7.4rc1 | `flashinfer.cake_mhc_nondet_train.cake_mhc_nondet_train_route_key` | #8907 |
+| package `flashinfer.cake_mhc_train_backend` | 0.7.3, 0.7.4rc1 | package `flashinfer.experimental.cake.cake_mhc_det_train` | #8907 |
+| package `flashinfer.cake_mhc_det_train_backend` | 0.7.4rc1 | package `flashinfer.experimental.cake.cake_mhc_det_train` | #8907 |
+| package `flashinfer.experimental.cake.cake_mhc_train_backend` | 0.7.4rc1 | package `flashinfer.experimental.cake.cake_mhc_nondet_train` | #8907 |
 
-### mHC head (cake_mhc_head_det_train; nondet planned)
-
-| Old name | In | New name | PR |
-| --- | --- | --- | --- |
-| head part of flashinfer.cake_mhc_train (0.7.3; rc1 alias) and of flashinfer.cake_mhc_det_train (0.7.4rc1) | 0.7.3, 0.7.4rc1 | flashinfer.cake_mhc_head_det_train (new top-level facade module) | #8907 |
-| flashinfer.cake_mhc_train.cake_mhc_train_head_{forward,backward} and top-level flashinfer.cake_mhc_train_head_{forward,backward} (0.7.3, 0.7.4rc1); flashinfer.cake_mhc_det_train.cake_mhc_det_train_head_{forward,backward} and top-level flashinfer.cake_mhc_det_train_head_{forward,backward} (0.7.4rc1) | 0.7.3, 0.7.4rc1 | flashinfer.cake_mhc_head_det_train.cake_mhc_head_det_train_{forward,backward} (also top level) | #8907, #8900 |
-| flashinfer.cake_mhc_train.cake_mhc_train_head and top-level flashinfer.cake_mhc_train_head (0.7.3, 0.7.4rc1); flashinfer.cake_mhc_det_train.cake_mhc_det_train_head and top-level flashinfer.cake_mhc_det_train_head (0.7.4rc1) | 0.7.3, 0.7.4rc1 | flashinfer.cake_mhc_head_det_train.cake_mhc_head_det (also top level) | #8907, #8900 |
-| flashinfer.cake_mhc_train.CakeMHCTrainHeadFunction and top-level flashinfer.CakeMHCTrainHeadFunction (0.7.3, 0.7.4rc1); flashinfer.cake_mhc_det_train.CakeMHCDetTrainHeadFunction and top-level flashinfer.CakeMHCDetTrainHeadFunction (0.7.4rc1) | 0.7.3, 0.7.4rc1 | flashinfer.cake_mhc_head_det_train.CakeMHCHeadDetFunction (also top level, lazy) | #8907, #8900 |
-| flashinfer.cake_mhc_train.is_cake_mhc_train_head_supported (0.7.3, 0.7.4rc1); flashinfer.cake_mhc_det_train.is_cake_mhc_det_train_head_supported (0.7.4rc1) | 0.7.3, 0.7.4rc1 | flashinfer.cake_mhc_head_det_train.is_cake_mhc_head_det_train_supported | #8907 |
-| flashinfer.cake_mhc_train_head_backend (0.7.3 det package; 0.7.4rc1 det alias) and flashinfer.cake_mhc_det_train_head_backend (0.7.4rc1) | 0.7.3, 0.7.4rc1 | flashinfer.experimental.cake.cake_mhc_head_det_train | #8907, #8900 |
-| (none) | none | flashinfer.cake_mhc_head_nondet_train / cake_mhc_head_nondet / CakeMHCHeadNondetFunction (reserved) | planned |
-
-### GDN det, single rank (cake_gdn_det_train)
+### mHC head
 
 | Old name | In | New name | PR |
-| --- | --- | --- | --- |
-| module flashinfer.experimental.cake_gdn_det_train (backend package imported directly; no top-level facade existed) | 0.7.3, 0.7.4rc1 | flashinfer.cake_gdn_det_train (new top-level facade); backend flashinfer.experimental.cake.cake_gdn_det_train | #8959 |
-| chunk_gated_delta_rule_det (flashinfer.experimental.cake_gdn_det_train) | 0.7.4rc1 | flashinfer.cake_gdn_det_train.cake_gdn_det | #8959 |
-| chunk_gated_delta_rule (flashinfer.experimental.cake_gdn_det_train; det entry at 0.7.3, det alias at 0.7.4rc1) | 0.7.3, 0.7.4rc1 | flashinfer.cake_gdn_det_train.cake_gdn_det (alias dropped) | #8959 |
-| ChunkGatedDeltaRuleDetFunction | 0.7.4rc1 | CakeGDNDetFunction | #8959 |
-| ChunkGatedDeltaRuleFunction (det package; class at 0.7.3, alias at 0.7.4rc1) | 0.7.3, 0.7.4rc1 | CakeGDNDetFunction (alias dropped) | #8959 |
-| gdn_chunk_det_forward / gdn_chunk_det_backward | 0.7.4rc1 | cake_gdn_det_train_forward / cake_gdn_det_train_backward | #8959 |
-| gdn_chunk_forward / gdn_chunk_backward (det package; functions at 0.7.3, aliases at 0.7.4rc1) | 0.7.3, 0.7.4rc1 | cake_gdn_det_train_forward / cake_gdn_det_train_backward (aliases dropped) | #8959 |
+|---|---|---|---|
+| `flashinfer.cake_mhc_train` (head entries) | 0.7.3, 0.7.4rc1 | `flashinfer.cake_mhc_head_det_train` | #8907 |
+| `flashinfer.cake_mhc_det_train` (head entries) | 0.7.4rc1 | `flashinfer.cake_mhc_head_det_train` | #8907 |
+| `flashinfer.cake_mhc_train.{cake_mhc_train_head, cake_mhc_train_head_forward, cake_mhc_train_head_backward, CakeMHCTrainHeadFunction, is_cake_mhc_train_head_supported}` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_mhc_head_det_train.{cake_mhc_head_det, cake_mhc_head_det_train_forward, cake_mhc_head_det_train_backward, CakeMHCHeadDetFunction, is_cake_mhc_head_det_train_supported}` | #8907 |
+| `flashinfer.cake_mhc_det_train.{cake_mhc_det_train_head, cake_mhc_det_train_head_forward, cake_mhc_det_train_head_backward, CakeMHCDetTrainHeadFunction, is_cake_mhc_det_train_head_supported}` | 0.7.4rc1 | `flashinfer.cake_mhc_head_det_train.{cake_mhc_head_det, cake_mhc_head_det_train_forward, cake_mhc_head_det_train_backward, CakeMHCHeadDetFunction, is_cake_mhc_head_det_train_supported}` | #8907 |
+| `flashinfer.{cake_mhc_train_head, cake_mhc_train_head_forward, cake_mhc_train_head_backward, CakeMHCTrainHeadFunction}` | 0.7.3, 0.7.4rc1 | `flashinfer.{cake_mhc_head_det, cake_mhc_head_det_train_forward, cake_mhc_head_det_train_backward, CakeMHCHeadDetFunction}` | #8907 |
+| `flashinfer.{cake_mhc_det_train_head, cake_mhc_det_train_head_forward, cake_mhc_det_train_head_backward, CakeMHCDetTrainHeadFunction}` | 0.7.4rc1 | `flashinfer.{cake_mhc_head_det, cake_mhc_head_det_train_forward, cake_mhc_head_det_train_backward, CakeMHCHeadDetFunction}` | #8907 |
+| package `flashinfer.cake_mhc_train_head_backend` | 0.7.3, 0.7.4rc1 | package `flashinfer.experimental.cake.cake_mhc_head_det_train` | #8907 |
+| package `flashinfer.cake_mhc_det_train_head_backend` | 0.7.4rc1 | package `flashinfer.experimental.cake.cake_mhc_head_det_train` | #8907 |
 
-### GDN det KCP (cake_gdn_det_train_kcp)
-
-| Old name | In | New name | PR |
-| --- | --- | --- | --- |
-| module flashinfer.gdn_train (det KCP facade at 0.7.3; legacy alias module at 0.7.4rc1) | 0.7.3, 0.7.4rc1 | flashinfer.cake_gdn_det_train_kcp | #8959 |
-| backend package flashinfer.experimental.cake_gdn_train (det KCP at 0.7.3; alias at 0.7.4rc1) | 0.7.3, 0.7.4rc1 | flashinfer.experimental.cake.cake_gdn_det_train_kcp | #8959 |
-| module flashinfer.cake_gdn_det_train_kcp | 0.7.4rc1 | flashinfer.cake_gdn_det_train_kcp (name unchanged; backend moves) | #8959 |
-| backend package flashinfer.experimental.cake_gdn_det_train_kcp | 0.7.4rc1 | flashinfer.experimental.cake.cake_gdn_det_train_kcp | #8959 |
-| chunk_gdn_det_kcp (flashinfer.cake_gdn_det_train_kcp) | 0.7.4rc1 | cake_gdn_det_kcp | #8959 |
-| chunk_gdn_kcp (flashinfer.gdn_train / experimental.cake_gdn_train; det; alias at 0.7.4rc1) | 0.7.3, 0.7.4rc1 | flashinfer.cake_gdn_det_train_kcp.cake_gdn_det_kcp | #8959 |
-| ChunkGDNDetFunctionKcp; ChunkGDNKcpFunction (0.7.3 class, 0.7.4rc1 alias) | 0.7.3 (ChunkGDNKcpFunction), 0.7.4rc1 (both) | CakeGDNDetKcpFunction | #8959 |
-| chunk_gdn_det_fwd_kcp / chunk_gdn_det_bwd_kcp; chunk_gdn_kcp_fwd / chunk_gdn_kcp_bwd (flashinfer.gdn_train, 0.7.4rc1 alias) | 0.7.3 (chunk_gdn_kcp_fwd/bwd), 0.7.4rc1 (both) | cake_gdn_det_train_kcp_forward / cake_gdn_det_train_kcp_backward | #8959 |
-| partition_det_kcp; kcp_partition (flashinfer.gdn_train, 0.7.4rc1 alias) | 0.7.3 (kcp_partition), 0.7.4rc1 (both) | cake_gdn_det_train_kcp_partition | #8959 |
-| build_context_det_kcp; build_kcp_context (flashinfer.gdn_train, 0.7.4rc1 alias) | 0.7.3 (build_kcp_context), 0.7.4rc1 (both) | cake_gdn_det_train_kcp_build_context | #8959 |
-| gdn_det_workspace_bytes_kcp / gdn_det_saved_bytes_kcp / gdn_det_comm_bytes_kcp; gdn_kcp_workspace_bytes / gdn_kcp_saved_bytes / gdn_kcp_comm_bytes (flashinfer.gdn_train, 0.7.4rc1 alias) | 0.7.3 (gdn_kcp_*), 0.7.4rc1 (both) | cake_gdn_det_train_kcp_workspace_bytes / cake_gdn_det_train_kcp_saved_bytes / cake_gdn_det_train_kcp_comm_bytes | #8959 |
-| is_gdn_det_train_kcp_supported; is_gdn_train_supported (flashinfer.gdn_train, 0.7.4rc1 alias) | 0.7.3 (is_gdn_train_supported), 0.7.4rc1 (both) | is_cake_gdn_det_train_kcp_supported | #8959 |
-| ContextDetKcp, OptionsDetKcp, PartitionDetKcp, RecomputeHandleDetKcp, SavedDetKcp, WorkspaceDetKcp | 0.7.4rc1 | CakeGDNDetKcpContext, CakeGDNDetKcpOptions, CakeGDNDetKcpPartition, CakeGDNDetKcpRecomputeHandle, CakeGDNDetKcpSaved, CakeGDNDetKcpWorkspace | #8959 |
-| KcpContext, KcpOptions, KcpPartition, KcpRecomputeHandle, KcpSaved, KcpWorkspace (flashinfer.gdn_train / experimental.cake_gdn_train; aliases at 0.7.4rc1) | 0.7.3, 0.7.4rc1 | CakeGDNDetKcpContext, CakeGDNDetKcpOptions, CakeGDNDetKcpPartition, CakeGDNDetKcpRecomputeHandle, CakeGDNDetKcpSaved, CakeGDNDetKcpWorkspace | #8959 |
-| packed_qkv_views_det_kcp | 0.7.4rc1 | cake_gdn_det_train_kcp_packed_qkv_views | #8959 |
-
-### GDN nondet, single rank (cake_gdn_nondet_train)
+### GDN
 
 | Old name | In | New name | PR |
-| --- | --- | --- | --- |
-| module flashinfer.experimental.cake.cake_gdn_train | 0.7.4rc1 | flashinfer.cake_gdn_nondet_train (new top-level facade); backend flashinfer.experimental.cake.cake_gdn_nondet_train | #8959 |
-| chunk_gated_delta_rule(..., deterministic=False) (flashinfer.experimental.cake.cake_gdn_train) | 0.7.4rc1 | flashinfer.cake_gdn_nondet_train.cake_gdn_nondet(...) (no deterministic keyword) | #8959 |
-| ChunkGatedDeltaRuleFunction (flashinfer.experimental.cake.cake_gdn_train) | 0.7.4rc1 | CakeGDNNondetFunction | #8959 |
-| gdn_chunk_forward / gdn_chunk_backward (..., deterministic=False) (flashinfer.experimental.cake.cake_gdn_train) | 0.7.4rc1 | cake_gdn_nondet_train_forward / cake_gdn_nondet_train_backward | #8959 |
+|---|---|---|---|
+| package `flashinfer.experimental.cake_gdn_det_train` (no facade existed) | 0.7.3, 0.7.4rc1 | `flashinfer.cake_gdn_det_train`; package `flashinfer.experimental.cake.cake_gdn_det_train` | #8959 |
+| `flashinfer.experimental.cake_gdn_det_train.chunk_gated_delta_rule` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_gdn_det_train.cake_gdn_det` | #8959 |
+| `flashinfer.experimental.cake_gdn_det_train.chunk_gated_delta_rule_det` | 0.7.4rc1 | `flashinfer.cake_gdn_det_train.cake_gdn_det` | #8959 |
+| `flashinfer.experimental.cake_gdn_det_train.ChunkGatedDeltaRuleFunction` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_gdn_det_train.CakeGDNDetFunction` | #8959 |
+| `flashinfer.experimental.cake_gdn_det_train.ChunkGatedDeltaRuleDetFunction` | 0.7.4rc1 | `flashinfer.cake_gdn_det_train.CakeGDNDetFunction` | #8959 |
+| `flashinfer.gdn_train` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_gdn_det_train_kcp` | #8921 |
+| `flashinfer.gdn_train.chunk_gdn_kcp` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_gdn_det_train_kcp.cake_gdn_det_kcp` | #8959 |
+| `flashinfer.cake_gdn_det_train_kcp.chunk_gdn_det_kcp` | 0.7.4rc1 | `flashinfer.cake_gdn_det_train_kcp.cake_gdn_det_kcp` | #8959 |
+| `flashinfer.experimental.cake_gdn_train.ChunkGDNKcpFunction` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_gdn_det_train_kcp.CakeGDNDetKcpFunction` | #8959 |
+| `flashinfer.experimental.cake_gdn_det_train_kcp.ChunkGDNDetFunctionKcp` | 0.7.4rc1 | `flashinfer.cake_gdn_det_train_kcp.CakeGDNDetKcpFunction` | #8959 |
+| `flashinfer.gdn_train.{chunk_gdn_kcp_fwd, chunk_gdn_kcp_bwd, kcp_partition, build_kcp_context, gdn_kcp_workspace_bytes, gdn_kcp_saved_bytes, gdn_kcp_comm_bytes}` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_gdn_det_train_kcp.cake_gdn_det_train_kcp_{forward, backward, partition, build_context, workspace_bytes, saved_bytes, comm_bytes}` | #8959 |
+| `flashinfer.cake_gdn_det_train_kcp.{chunk_gdn_det_fwd_kcp, chunk_gdn_det_bwd_kcp, partition_det_kcp, build_context_det_kcp, gdn_det_workspace_bytes_kcp, gdn_det_saved_bytes_kcp, gdn_det_comm_bytes_kcp}` | 0.7.4rc1 | `flashinfer.cake_gdn_det_train_kcp.cake_gdn_det_train_kcp_{forward, backward, partition, build_context, workspace_bytes, saved_bytes, comm_bytes}` | #8959 |
+| `flashinfer.gdn_train.{KcpContext, KcpOptions, KcpPartition, KcpRecomputeHandle}` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_gdn_det_train_kcp.{CakeGDNDetKcpContext, CakeGDNDetKcpOptions, CakeGDNDetKcpPartition, CakeGDNDetKcpRecomputeHandle}` | #8959 |
+| `flashinfer.cake_gdn_det_train_kcp.{ContextDetKcp, OptionsDetKcp, PartitionDetKcp, RecomputeHandleDetKcp}` | 0.7.4rc1 | `flashinfer.cake_gdn_det_train_kcp.{CakeGDNDetKcpContext, CakeGDNDetKcpOptions, CakeGDNDetKcpPartition, CakeGDNDetKcpRecomputeHandle}` | #8959 |
+| `flashinfer.gdn_train.is_gdn_train_supported` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_gdn_det_train_kcp.is_cake_gdn_det_train_kcp_supported` | #8959 |
+| `flashinfer.cake_gdn_det_train_kcp.is_gdn_det_train_kcp_supported` | 0.7.4rc1 | `flashinfer.cake_gdn_det_train_kcp.is_cake_gdn_det_train_kcp_supported` | #8959 |
+| package `flashinfer.experimental.cake_gdn_train` | 0.7.3, 0.7.4rc1 | package `flashinfer.experimental.cake.cake_gdn_det_train_kcp` | #8959 |
+| package `flashinfer.experimental.cake_gdn_det_train_kcp` | 0.7.4rc1 | package `flashinfer.experimental.cake.cake_gdn_det_train_kcp` | #8959 |
+| package `flashinfer.experimental.cake.cake_gdn_train` (no facade existed) | 0.7.4rc1 | `flashinfer.cake_gdn_nondet_train`; package `flashinfer.experimental.cake.cake_gdn_nondet_train` | #8959 |
+| `flashinfer.experimental.cake.cake_gdn_train.chunk_gated_delta_rule(..., deterministic=False)` | 0.7.4rc1 | `flashinfer.cake_gdn_nondet_train.cake_gdn_nondet` | #8959 |
+| `flashinfer.experimental.cake.cake_gdn_train.ChunkGatedDeltaRuleFunction` | 0.7.4rc1 | `flashinfer.cake_gdn_nondet_train.CakeGDNNondetFunction` | #8959 |
+| `flashinfer.experimental.cake.cake_gdn_train.{gdn_chunk_forward, gdn_chunk_backward}(..., deterministic=False)` | 0.7.4rc1 | `flashinfer.experimental.cake.cake_gdn_nondet_train.{cake_gdn_nondet_train_forward, cake_gdn_nondet_train_backward}` | #8959 |
+| `flashinfer.experimental.cake.cake_gdn_train.{CHUNK, FINALIZE_STAGES, FULL, HEAD_DIM, PRESCAN_CONFIGS, REG_SCAN_CONFIGS, ChainOptions, ChunkMeta, ScanPlan, SegmentTable, StageSet, StreamGroups, build_chunk_meta, build_chunk_meta_from_cu_seqlens, choose_scan_plan, dhu_tc_pricing, finalize_stage, lpt_sequence_order, lpt_walk, make_options, scan_plans, sdt_pricing, sequence_groups, stage_set, two_stream_split, use_prep_tma}` | 0.7.4rc1 | the same names in `flashinfer.experimental.cake.cake_gdn_nondet_train.cake_chain` | #8959 |
+| `flashinfer.cake_gdn_train_kcp` (default) | 0.7.4rc1 | `flashinfer.cake_gdn_det_train_kcp` | #8920 |
+| `flashinfer.cake_gdn_train_kcp` (deterministic=False calls) | 0.7.4rc1 | `flashinfer.cake_gdn_nondet_train_kcp` | #8959 |
+| `flashinfer.cake_gdn_train_kcp.chunk_gdn_kcp` (default) | 0.7.4rc1 | `flashinfer.cake_gdn_det_train_kcp.cake_gdn_det_kcp` | #8959 |
+| `flashinfer.cake_gdn_train_kcp.chunk_gdn_kcp(..., deterministic=False)` | 0.7.4rc1 | `flashinfer.cake_gdn_nondet_train_kcp.cake_gdn_nondet_kcp` | #8959 |
+| `flashinfer.cake_gdn_train_kcp.{chunk_gdn_fwd_kcp, chunk_gdn_bwd_kcp, partition_kcp, build_context_kcp, gdn_workspace_bytes_kcp, gdn_saved_bytes_kcp, gdn_comm_bytes_kcp}` (default) | 0.7.4rc1 | `flashinfer.cake_gdn_det_train_kcp.cake_gdn_det_train_kcp_{forward, backward, partition, build_context, workspace_bytes, saved_bytes, comm_bytes}` | #8959 |
+| `flashinfer.cake_gdn_train_kcp.{chunk_gdn_fwd_kcp, chunk_gdn_bwd_kcp, partition_kcp, build_context_kcp, gdn_workspace_bytes_kcp, gdn_saved_bytes_kcp, gdn_comm_bytes_kcp}(..., deterministic=False)` | 0.7.4rc1 | `flashinfer.cake_gdn_nondet_train_kcp.cake_gdn_nondet_train_kcp_{forward, backward, partition, build_context, workspace_bytes, saved_bytes, comm_bytes}` | #8959 |
+| `flashinfer.cake_gdn_train_kcp.is_gdn_train_kcp_supported` (default) | 0.7.4rc1 | `flashinfer.cake_gdn_det_train_kcp.is_cake_gdn_det_train_kcp_supported` | #8959 |
+| `flashinfer.cake_gdn_train_kcp.is_gdn_train_kcp_supported(..., deterministic=False)` | 0.7.4rc1 | `flashinfer.cake_gdn_nondet_train_kcp.is_cake_gdn_nondet_train_kcp_supported` | #8959 |
+| `flashinfer.cake_gdn_train_kcp.{ContextKcp, OptionsKcp, PartitionKcp, RecomputeHandleKcp}` | 0.7.4rc1 | `flashinfer.cake_gdn_nondet_train_kcp.{CakeGDNNondetKcpContext, CakeGDNNondetKcpOptions, CakeGDNNondetKcpPartition, CakeGDNNondetKcpRecomputeHandle}` | #8959 |
+| `flashinfer.experimental.cake_gdn_train_kcp.ChunkGDNFunctionKcp` | 0.7.4rc1 | `flashinfer.cake_gdn_nondet_train_kcp.CakeGDNNondetKcpFunction` | #8959 |
+| package `flashinfer.experimental.cake_gdn_train_kcp` | 0.7.4rc1 | package `flashinfer.experimental.cake.cake_gdn_nondet_train_kcp` | #8959 |
+| `flashinfer.experimental.cake_gdn_train_kcp.{chunk_gdn_kcp, chunk_gdn_fwd_kcp, chunk_gdn_bwd_kcp, partition_kcp, build_context_kcp, packed_qkv_views_kcp, gdn_workspace_bytes_kcp, gdn_saved_bytes_kcp, gdn_comm_bytes_kcp}` | 0.7.4rc1 | `flashinfer.experimental.cake.cake_gdn_nondet_train_kcp.{cake_gdn_nondet_kcp, cake_gdn_nondet_train_kcp_forward, cake_gdn_nondet_train_kcp_backward, cake_gdn_nondet_train_kcp_partition, cake_gdn_nondet_train_kcp_build_context, cake_gdn_nondet_train_kcp_packed_qkv_views, cake_gdn_nondet_train_kcp_workspace_bytes, cake_gdn_nondet_train_kcp_saved_bytes, cake_gdn_nondet_train_kcp_comm_bytes}` | #8959 |
+| `flashinfer.experimental.cake_gdn_train_kcp.{ContextKcp, PartitionKcp, FragmentKcp, OptionsKcp, RecomputeHandleKcp, SavedKcp, WorkspaceKcp, CallKcp, PackedQKVSplitKcp}` | 0.7.4rc1 | `flashinfer.experimental.cake.cake_gdn_nondet_train_kcp.{CakeGDNNondetKcpContext, CakeGDNNondetKcpPartition, CakeGDNNondetKcpFragment, CakeGDNNondetKcpOptions, CakeGDNNondetKcpRecomputeHandle, CakeGDNNondetKcpSaved, CakeGDNNondetKcpWorkspace, CakeGDNNondetKcpCall, CakeGDNNondetKcpPackedQKVSplitFunction}` | #8959 |
+| `flashinfer.experimental.cake_gdn_train_kcp.cake_bytes.{gdn_workspace_layout_kcp, gdn_saved_layout_kcp}` | 0.7.4rc1 | `flashinfer.experimental.cake.cake_gdn_nondet_train_kcp.cake_bytes.{cake_gdn_nondet_train_kcp_workspace_layout, cake_gdn_nondet_train_kcp_saved_layout}` | #8959 |
+| `flashinfer.experimental.cake_gdn_train_kcp.{KCP_SAVED_VERSION, LAST_CALL, PROGRAMS, SCALE, Backend, FakeBackend, KernelBackend, get_backend, set_backend, graph_cache_clear}` | 0.7.4rc1 | the same names in `flashinfer.experimental.cake.cake_gdn_nondet_train_kcp.cake_kcp` | #8959 |
+| `flashinfer.experimental.cake_gdn_train_kcp.{make_options, validate_heads, validate_ring}` | 0.7.4rc1 | the same names in `flashinfer.experimental.cake.cake_gdn_nondet_train_kcp.cake_options` | #8959 |
+| `flashinfer.experimental.cake_gdn_train_kcp.{MODE, check_mode}` | 0.7.4rc1 | removed, no replacement | #8959 |
 
-### GDN nondet KCP (cake_gdn_nondet_train_kcp)
+The GDN PR #8959 renames both modes. Its det half is not on its branch yet, so the det rows give the #8928 target names. Planned: the other det names (for example `flashinfer.experimental.cake_gdn_det_train.gdn_chunk_det_forward` and `flashinfer.cake_gdn_det_train_kcp.packed_qkv_views_det_kcp`) get their final names in its det half.
 
-| Old name | In | New name | PR |
-| --- | --- | --- | --- |
-| module flashinfer.cake_gdn_train_kcp | 0.7.4rc1 | flashinfer.cake_gdn_nondet_train_kcp | #8959 |
-| a flashinfer.cake_gdn_train_kcp entry called with the default deterministic (or deterministic=True) | 0.7.4rc1 | the matching det KCP entry: flashinfer.cake_gdn_det_train_kcp.cake_gdn_det_kcp, cake_gdn_det_train_kcp_forward/_backward/_partition/_build_context/_*_bytes, is_cake_gdn_det_train_kcp_supported | #8959 |
-| backend package flashinfer.experimental.cake_gdn_train_kcp | 0.7.4rc1 | flashinfer.experimental.cake.cake_gdn_nondet_train_kcp | #8959 |
-| chunk_gdn_kcp(..., deterministic=False) (flashinfer.cake_gdn_train_kcp) | 0.7.4rc1 | cake_gdn_nondet_kcp(...) (no deterministic keyword) | #8959 |
-| ChunkGDNFunctionKcp (flashinfer.experimental.cake_gdn_train_kcp) | 0.7.4rc1 | CakeGDNNondetKcpFunction | #8959 |
-| chunk_gdn_fwd_kcp / chunk_gdn_bwd_kcp (..., deterministic=False) | 0.7.4rc1 | cake_gdn_nondet_train_kcp_forward / cake_gdn_nondet_train_kcp_backward | #8959 |
-| partition_kcp | 0.7.4rc1 | cake_gdn_nondet_train_kcp_partition | #8959 |
-| build_context_kcp | 0.7.4rc1 | cake_gdn_nondet_train_kcp_build_context | #8959 |
-| gdn_workspace_bytes_kcp / gdn_saved_bytes_kcp / gdn_comm_bytes_kcp | 0.7.4rc1 | cake_gdn_nondet_train_kcp_workspace_bytes / cake_gdn_nondet_train_kcp_saved_bytes / cake_gdn_nondet_train_kcp_comm_bytes | #8959 |
-| is_gdn_train_kcp_supported | 0.7.4rc1 | is_cake_gdn_nondet_train_kcp_supported | #8959 |
-| ContextKcp, OptionsKcp, PartitionKcp, RecomputeHandleKcp, SavedKcp, WorkspaceKcp | 0.7.4rc1 | CakeGDNNondetKcpContext, CakeGDNNondetKcpOptions, CakeGDNNondetKcpPartition, CakeGDNNondetKcpRecomputeHandle, CakeGDNNondetKcpSaved, CakeGDNNondetKcpWorkspace | #8959 |
-| packed_qkv_views_kcp (flashinfer.experimental.cake_gdn_train_kcp) | 0.7.4rc1 | cake_gdn_nondet_train_kcp_packed_qkv_views | #8959 |
-
-### KDA det (single rank): cake_kda_det_train
-
-| Old name | In | New name | PR |
-| --- | --- | --- | --- |
-| module flashinfer.kda_train (single-rank entries) | 0.7.3, 0.7.4rc1 | flashinfer.cake_kda_det_train | #8908 |
-| flashinfer.kda_train.chunk_kda_fwd | 0.7.3, 0.7.4rc1 | flashinfer.cake_kda_det_train.cake_kda_det_train_forward | planned |
-| flashinfer.kda_train.chunk_kda_bwd | 0.7.3, 0.7.4rc1 | flashinfer.cake_kda_det_train.cake_kda_det_train_backward | planned |
-| flashinfer.kda_train.chunk_kda | 0.7.3, 0.7.4rc1 | flashinfer.cake_kda_det_train.cake_kda_det | planned |
-| flashinfer.kda_train.kda_train_arena | 0.7.3, 0.7.4rc1 | flashinfer.cake_kda_det_train.cake_kda_det_train_arena | planned |
-| flashinfer.kda_train.kda_train_workspace | 0.7.3, 0.7.4rc1 | flashinfer.cake_kda_det_train.cake_kda_det_train_workspace | planned |
-| flashinfer.kda_train.kda_train_workspace_bytes | 0.7.3, 0.7.4rc1 | flashinfer.cake_kda_det_train.cake_kda_det_train_workspace_bytes | planned |
-| flashinfer.kda_train.kda_train_saved_bytes | 0.7.3, 0.7.4rc1 | flashinfer.cake_kda_det_train.cake_kda_det_train_saved_bytes | planned |
-| flashinfer.kda_train.is_kda_train_supported | 0.7.3, 0.7.4rc1 | flashinfer.cake_kda_det_train.is_cake_kda_det_train_supported | planned |
-| module flashinfer.cake_kda_det_train | 0.7.4rc1 | flashinfer.cake_kda_det_train (unchanged) | planned |
-| flashinfer.cake_kda_det_train.chunk_kda_det_fwd | 0.7.4rc1 | cake_kda_det_train_forward | planned |
-| flashinfer.cake_kda_det_train.chunk_kda_det_bwd | 0.7.4rc1 | cake_kda_det_train_backward | planned |
-| flashinfer.cake_kda_det_train.chunk_kda_det | 0.7.4rc1 | cake_kda_det | planned |
-| flashinfer.cake_kda_det_train.kda_det_train_arena | 0.7.4rc1 | cake_kda_det_train_arena | planned |
-| flashinfer.cake_kda_det_train.kda_det_train_workspace | 0.7.4rc1 | cake_kda_det_train_workspace | planned |
-| flashinfer.cake_kda_det_train.kda_det_train_workspace_bytes | 0.7.4rc1 | cake_kda_det_train_workspace_bytes | planned |
-| flashinfer.cake_kda_det_train.kda_det_train_saved_bytes | 0.7.4rc1 | cake_kda_det_train_saved_bytes | planned |
-| flashinfer.cake_kda_det_train.is_kda_det_train_supported | 0.7.4rc1 | is_cake_kda_det_train_supported | planned |
-| package flashinfer.experimental.cake_kda_train (and submodules cake_backend, cake_jit, cake_build) | 0.7.3, 0.7.4rc1 | flashinfer.experimental.cake.cake_kda_det_train (same submodule names) | planned |
-| package flashinfer.experimental.cake_kda_det_train | 0.7.4rc1 | flashinfer.experimental.cake.cake_kda_det_train | planned |
-| ChunkKDAFunction (experimental.cake_kda_train[.cake_backend]; rc1 alias also in experimental.cake_kda_det_train[.cake_backend]) | 0.7.3, 0.7.4rc1 | CakeKDADetFunction | planned |
-| ChunkKDADetFunction | 0.7.4rc1 | CakeKDADetFunction | planned |
-| KdaChunkSaved | 0.7.3, 0.7.4rc1 | CakeKDADetChunkSaved | planned |
-| KdaDetChunkSaved | 0.7.4rc1 | CakeKDADetChunkSaved | planned |
-| KdaWorkspace | 0.7.3, 0.7.4rc1 | CakeKDADetWorkspace | planned |
-| KdaDetWorkspace | 0.7.4rc1 | CakeKDADetWorkspace | planned |
-| KdaArena (cake_backend) | 0.7.3, 0.7.4rc1 | CakeKDADetArena | planned |
-| KdaDetArena (cake_backend) | 0.7.4rc1 | CakeKDADetArena | planned |
-| backend chunk_kda / chunk_kda_fwd / chunk_kda_bwd (experimental.cake_kda_train; rc1 aliases in experimental.cake_kda_det_train[.cake_backend]) | 0.7.3, 0.7.4rc1 | cake_kda_det / cake_kda_det_train_forward / cake_kda_det_train_backward | planned |
-| backend chunk_kda_det / chunk_kda_det_fwd / chunk_kda_det_bwd | 0.7.4rc1 | cake_kda_det / cake_kda_det_train_forward / cake_kda_det_train_backward | planned |
-| tests.test_helpers.cake_kda_train_reference | 0.7.3, 0.7.4rc1 | tests.test_helpers.cake_kda_det_train_reference | #8908 |
-
-### KDA det KCP: cake_kda_det_train_kcp
+### KDA
 
 | Old name | In | New name | PR |
-| --- | --- | --- | --- |
-| module flashinfer.kda_train (KCP entries) | 0.7.3, 0.7.4rc1 | flashinfer.cake_kda_det_train_kcp | #8908 |
-| kcp_partition (flashinfer.kda_train; experimental.cake_kda_train.cake_kcp_plan; rc1 alias in det cake_kcp_plan) | 0.7.3, 0.7.4rc1 | cake_kda_det_train_kcp_partition | planned |
-| build_kcp_context | 0.7.3, 0.7.4rc1 | cake_kda_det_train_kcp_build_context | planned |
-| chunk_kda_kcp_fwd | 0.7.3, 0.7.4rc1 | cake_kda_det_train_kcp_forward | planned |
-| chunk_kda_kcp_bwd | 0.7.3, 0.7.4rc1 | cake_kda_det_train_kcp_backward | planned |
-| chunk_kda_kcp (flashinfer.kda_train / det backend) | 0.7.3, 0.7.4rc1 | cake_kda_det_kcp | planned |
-| kcp_workspace_bytes | 0.7.3, 0.7.4rc1 | cake_kda_det_train_kcp_workspace_bytes | planned |
-| kcp_saved_bytes | 0.7.3, 0.7.4rc1 | cake_kda_det_train_kcp_saved_bytes | planned |
-| kcp_comm_bytes | 0.7.3, 0.7.4rc1 | cake_kda_det_train_kcp_comm_bytes | planned |
-| kcp_reduce_gate_param_grads (flashinfer.kda_train only) | 0.7.4rc1 | cake_kda_det_train_kcp_reduce_gate_param_grads | planned |
-| KcpRecomputeHandle | 0.7.3, 0.7.4rc1 | CakeKDADetKcpRecomputeHandle | planned |
-| KcpContext | 0.7.3, 0.7.4rc1 | CakeKDADetKcpContext | planned |
-| KcpPartition | 0.7.3, 0.7.4rc1 | CakeKDADetKcpPartition | planned |
-| KcpFragment | 0.7.3, 0.7.4rc1 | CakeKDADetKcpFragment | planned |
-| KcpWorkspace | 0.7.3, 0.7.4rc1 | CakeKDADetKcpWorkspace | planned |
-| KcpSaved | 0.7.3, 0.7.4rc1 | CakeKDADetKcpSaved | planned |
-| KcpOptions | 0.7.3, 0.7.4rc1 | CakeKDADetKcpOptions | planned |
-| KcpCall | 0.7.3, 0.7.4rc1 | CakeKDADetKcpCall | planned |
-| ChunkKDAKcpFunction | 0.7.3, 0.7.4rc1 | CakeKDADetKcpFunction | planned |
-| module flashinfer.cake_kda_det_train_kcp | 0.7.4rc1 | flashinfer.cake_kda_det_train_kcp (unchanged) | planned |
-| partition_det_kcp | 0.7.4rc1 | cake_kda_det_train_kcp_partition | planned |
-| build_context_det_kcp | 0.7.4rc1 | cake_kda_det_train_kcp_build_context | planned |
-| chunk_kda_det_fwd_kcp | 0.7.4rc1 | cake_kda_det_train_kcp_forward | planned |
-| chunk_kda_det_bwd_kcp | 0.7.4rc1 | cake_kda_det_train_kcp_backward | planned |
-| chunk_kda_det_kcp | 0.7.4rc1 | cake_kda_det_kcp | planned |
-| kda_det_workspace_bytes_kcp | 0.7.4rc1 | cake_kda_det_train_kcp_workspace_bytes | planned |
-| kda_det_saved_bytes_kcp | 0.7.4rc1 | cake_kda_det_train_kcp_saved_bytes | planned |
-| kda_det_comm_bytes_kcp | 0.7.4rc1 | cake_kda_det_train_kcp_comm_bytes | planned |
-| reduce_gate_param_grads_det_kcp | 0.7.4rc1 | cake_kda_det_train_kcp_reduce_gate_param_grads | planned |
-| ContextDetKcp | 0.7.4rc1 | CakeKDADetKcpContext | planned |
-| PartitionDetKcp | 0.7.4rc1 | CakeKDADetKcpPartition | planned |
-| WorkspaceDetKcp | 0.7.4rc1 | CakeKDADetKcpWorkspace | planned |
-| SavedDetKcp | 0.7.4rc1 | CakeKDADetKcpSaved | planned |
-| RecomputeHandleDetKcp | 0.7.4rc1 | CakeKDADetKcpRecomputeHandle | planned |
-| OptionsDetKcp | 0.7.4rc1 | CakeKDADetKcpOptions | planned |
-| FragmentDetKcp (package only) | 0.7.4rc1 | CakeKDADetKcpFragment | planned |
-| CallDetKcp (package only) | 0.7.4rc1 | CakeKDADetKcpCall | planned |
-| ChunkKDADetFunctionKcp (package only) | 0.7.4rc1 | CakeKDADetKcpFunction | planned |
-| package flashinfer.experimental.cake_kda_det_train_kcp (submodules cake_kcp, cake_kcp_plan, cake_kcp_jit, cake_build) | 0.7.4rc1 | flashinfer.experimental.cake.cake_kda_det_train_kcp (same submodules) | planned |
-| modules flashinfer.experimental.cake_kda_train.cake_kcp / .cake_kcp_plan / .cake_kcp_jit | 0.7.3, 0.7.4rc1 | flashinfer.experimental.cake.cake_kda_det_train_kcp.cake_kcp / .cake_kcp_plan / .cake_kcp_jit | planned |
+|---|---|---|---|
+| `flashinfer.kda_train` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_kda_det_train` (single-rank names) and `flashinfer.cake_kda_det_train_kcp` (KCP names) | #8908 |
+| `flashinfer.kda_train.chunk_kda` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_kda_det_train.cake_kda_det` | planned |
+| `flashinfer.cake_kda_det_train.chunk_kda_det` | 0.7.4rc1 | `flashinfer.cake_kda_det_train.cake_kda_det` | planned |
+| `flashinfer.experimental.cake_kda_train.ChunkKDAFunction` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_kda_det_train.CakeKDADetFunction` | planned |
+| `flashinfer.experimental.cake_kda_det_train.ChunkKDADetFunction` | 0.7.4rc1 | `flashinfer.cake_kda_det_train.CakeKDADetFunction` | planned |
+| `flashinfer.kda_train.{chunk_kda_fwd, chunk_kda_bwd, is_kda_train_supported, kda_train_arena, kda_train_workspace, kda_train_workspace_bytes, kda_train_saved_bytes}` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_kda_det_train.{cake_kda_det_train_forward, cake_kda_det_train_backward, is_cake_kda_det_train_supported, cake_kda_det_train_arena, cake_kda_det_train_workspace, cake_kda_det_train_workspace_bytes, cake_kda_det_train_saved_bytes}` | planned |
+| `flashinfer.cake_kda_det_train.{chunk_kda_det_fwd, chunk_kda_det_bwd, is_kda_det_train_supported, kda_det_train_arena, kda_det_train_workspace, kda_det_train_workspace_bytes, kda_det_train_saved_bytes}` | 0.7.4rc1 | `flashinfer.cake_kda_det_train.{cake_kda_det_train_forward, cake_kda_det_train_backward, is_cake_kda_det_train_supported, cake_kda_det_train_arena, cake_kda_det_train_workspace, cake_kda_det_train_workspace_bytes, cake_kda_det_train_saved_bytes}` | planned |
+| `flashinfer.kda_train.chunk_kda_kcp` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_kda_det_train_kcp.cake_kda_det_kcp` | planned |
+| `flashinfer.cake_kda_det_train_kcp.chunk_kda_det_kcp` | 0.7.4rc1 | `flashinfer.cake_kda_det_train_kcp.cake_kda_det_kcp` | planned |
+| `flashinfer.experimental.cake_kda_train.cake_kcp.ChunkKDAKcpFunction` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_kda_det_train_kcp.CakeKDADetKcpFunction` | planned |
+| `flashinfer.experimental.cake_kda_det_train_kcp.ChunkKDADetFunctionKcp` | 0.7.4rc1 | `flashinfer.cake_kda_det_train_kcp.CakeKDADetKcpFunction` | planned |
+| `flashinfer.kda_train.{chunk_kda_kcp_fwd, chunk_kda_kcp_bwd, kcp_partition, build_kcp_context, kcp_workspace_bytes, kcp_saved_bytes, kcp_comm_bytes}` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_kda_det_train_kcp.cake_kda_det_train_kcp_{forward, backward, partition, build_context, workspace_bytes, saved_bytes, comm_bytes}` | planned |
+| `flashinfer.kda_train.kcp_reduce_gate_param_grads` | 0.7.4rc1 | `flashinfer.cake_kda_det_train_kcp.cake_kda_det_train_kcp_reduce_gate_param_grads` | planned |
+| `flashinfer.cake_kda_det_train_kcp.{chunk_kda_det_fwd_kcp, chunk_kda_det_bwd_kcp, partition_det_kcp, build_context_det_kcp, kda_det_workspace_bytes_kcp, kda_det_saved_bytes_kcp, kda_det_comm_bytes_kcp, reduce_gate_param_grads_det_kcp}` | 0.7.4rc1 | `flashinfer.cake_kda_det_train_kcp.cake_kda_det_train_kcp_{forward, backward, partition, build_context, workspace_bytes, saved_bytes, comm_bytes, reduce_gate_param_grads}` | planned |
+| `flashinfer.kda_train.KcpRecomputeHandle` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_kda_det_train_kcp.CakeKDADetKcpRecomputeHandle` | planned |
+| `flashinfer.kda_train.{KcpContext, KcpOptions, KcpPartition, KcpWorkspace, KcpSaved}` | 0.7.4rc1 | `flashinfer.cake_kda_det_train_kcp.{CakeKDADetKcpContext, CakeKDADetKcpOptions, CakeKDADetKcpPartition, CakeKDADetKcpWorkspace, CakeKDADetKcpSaved}` | planned |
+| `flashinfer.experimental.cake_kda_train.cake_kcp_plan.{KcpContext, KcpPartition}` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_kda_det_train_kcp.{CakeKDADetKcpContext, CakeKDADetKcpPartition}` | planned |
+| `flashinfer.experimental.cake_kda_train.cake_kcp.{KcpOptions, KcpWorkspace, KcpSaved, KcpRecomputeHandle}` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_kda_det_train_kcp.{CakeKDADetKcpOptions, CakeKDADetKcpWorkspace, CakeKDADetKcpSaved, CakeKDADetKcpRecomputeHandle}` | planned |
+| `flashinfer.cake_kda_det_train_kcp.{ContextDetKcp, OptionsDetKcp, PartitionDetKcp, WorkspaceDetKcp, SavedDetKcp, RecomputeHandleDetKcp}` | 0.7.4rc1 | `flashinfer.cake_kda_det_train_kcp.{CakeKDADetKcpContext, CakeKDADetKcpOptions, CakeKDADetKcpPartition, CakeKDADetKcpWorkspace, CakeKDADetKcpSaved, CakeKDADetKcpRecomputeHandle}` | planned |
+| package `flashinfer.experimental.cake_kda_train` | 0.7.3, 0.7.4rc1 | package `flashinfer.experimental.cake.cake_kda_det_train`; its modules `cake_kcp`, `cake_kcp_plan` and `cake_kcp_jit` go to package `flashinfer.experimental.cake.cake_kda_det_train_kcp` | planned |
+| package `flashinfer.experimental.cake_kda_det_train` | 0.7.4rc1 | package `flashinfer.experimental.cake.cake_kda_det_train` | planned |
+| package `flashinfer.experimental.cake_kda_det_train_kcp` | 0.7.4rc1 | package `flashinfer.experimental.cake.cake_kda_det_train_kcp` | planned |
+| `flashinfer.cake_kda_train` (default) | 0.7.4rc1 | `flashinfer.cake_kda_det_train` | planned |
+| `flashinfer.cake_kda_train` (deterministic=False calls) | 0.7.4rc1 | `flashinfer.cake_kda_nondet_train` | planned |
+| `flashinfer.cake_kda_train.chunk_kda` (default) | 0.7.4rc1 | `flashinfer.cake_kda_det_train.cake_kda_det` | planned |
+| `flashinfer.cake_kda_train.chunk_kda(..., deterministic=False)` | 0.7.4rc1 | `flashinfer.cake_kda_nondet_train.cake_kda_nondet` | planned |
+| `flashinfer.cake_kda_train.{chunk_kda_fwd, chunk_kda_bwd, is_kda_train_supported, kda_train_arena, kda_train_workspace, kda_train_workspace_bytes, kda_train_saved_bytes}` (default) | 0.7.4rc1 | `flashinfer.cake_kda_det_train.{cake_kda_det_train_forward, cake_kda_det_train_backward, is_cake_kda_det_train_supported, cake_kda_det_train_arena, cake_kda_det_train_workspace, cake_kda_det_train_workspace_bytes, cake_kda_det_train_saved_bytes}` | planned |
+| `flashinfer.cake_kda_train.{chunk_kda_fwd, chunk_kda_bwd, is_kda_train_supported, kda_train_arena, kda_train_workspace, kda_train_workspace_bytes, kda_train_saved_bytes}(..., deterministic=False)` | 0.7.4rc1 | `flashinfer.cake_kda_nondet_train.{cake_kda_nondet_train_forward, cake_kda_nondet_train_backward, is_cake_kda_nondet_train_supported, cake_kda_nondet_train_arena, cake_kda_nondet_train_workspace, cake_kda_nondet_train_workspace_bytes, cake_kda_nondet_train_saved_bytes}` | planned |
+| `flashinfer.experimental.cake.cake_kda_train.ChunkKDAFunction` | 0.7.4rc1 | `flashinfer.cake_kda_nondet_train.CakeKDANondetFunction` | planned |
+| package `flashinfer.experimental.cake.cake_kda_train` | 0.7.4rc1 | package `flashinfer.experimental.cake.cake_kda_nondet_train` | planned |
+| `flashinfer.cake_kda_train_kcp` (default) | 0.7.4rc1 | `flashinfer.cake_kda_det_train_kcp` | planned |
+| `flashinfer.cake_kda_train_kcp` (deterministic=False calls) | 0.7.4rc1 | `flashinfer.cake_kda_nondet_train_kcp` | planned |
+| `flashinfer.cake_kda_train_kcp.chunk_kda_kcp` (default) | 0.7.4rc1 | `flashinfer.cake_kda_det_train_kcp.cake_kda_det_kcp` | planned |
+| `flashinfer.cake_kda_train_kcp.chunk_kda_kcp(..., deterministic=False)` | 0.7.4rc1 | `flashinfer.cake_kda_nondet_train_kcp.cake_kda_nondet_kcp` | planned |
+| `flashinfer.cake_kda_train_kcp.{chunk_kda_fwd_kcp, chunk_kda_bwd_kcp, partition_kcp, build_context_kcp, kda_workspace_bytes_kcp, kda_saved_bytes_kcp, kda_comm_bytes_kcp, reduce_gate_param_grads_kcp}` (default) | 0.7.4rc1 | `flashinfer.cake_kda_det_train_kcp.cake_kda_det_train_kcp_{forward, backward, partition, build_context, workspace_bytes, saved_bytes, comm_bytes, reduce_gate_param_grads}` | planned |
+| `flashinfer.cake_kda_train_kcp.{chunk_kda_fwd_kcp, chunk_kda_bwd_kcp, partition_kcp, build_context_kcp, kda_workspace_bytes_kcp, kda_saved_bytes_kcp, kda_comm_bytes_kcp, reduce_gate_param_grads_kcp}(..., deterministic=False)` | 0.7.4rc1 | `flashinfer.cake_kda_nondet_train_kcp.cake_kda_nondet_train_kcp_{forward, backward, partition, build_context, workspace_bytes, saved_bytes, comm_bytes, reduce_gate_param_grads}` | planned |
+| `flashinfer.cake_kda_train_kcp.{ContextKcp, OptionsKcp, PartitionKcp, WorkspaceKcp, SavedKcp, RecomputeHandleKcp}` | 0.7.4rc1 | `flashinfer.cake_kda_nondet_train_kcp.{CakeKDANondetKcpContext, CakeKDANondetKcpOptions, CakeKDANondetKcpPartition, CakeKDANondetKcpWorkspace, CakeKDANondetKcpSaved, CakeKDANondetKcpRecomputeHandle}` | planned |
+| `flashinfer.experimental.cake_kda_train_kcp.ChunkKDAFunctionKcp` | 0.7.4rc1 | `flashinfer.cake_kda_nondet_train_kcp.CakeKDANondetKcpFunction` | planned |
+| package `flashinfer.experimental.cake_kda_train_kcp` | 0.7.4rc1 | package `flashinfer.experimental.cake.cake_kda_nondet_train_kcp` | planned |
 
-### KDA nondet (single rank): cake_kda_nondet_train
+Planned: the other public names of these modules (for example `flashinfer.cake_kda_train_kcp.{kda_handoff_bytes_kcp, kcp_handoff_stats}`) get their final names in the KDA family PRs.
 
-| Old name | In | New name | PR |
-| --- | --- | --- | --- |
-| module flashinfer.cake_kda_train | 0.7.4rc1 | flashinfer.cake_kda_nondet_train (for deterministic=False callers); default deterministic=True callers go to flashinfer.cake_kda_det_train | planned |
-| flashinfer.cake_kda_train.chunk_kda_fwd | 0.7.4rc1 | flashinfer.cake_kda_nondet_train.cake_kda_nondet_train_forward | planned |
-| flashinfer.cake_kda_train.chunk_kda_bwd | 0.7.4rc1 | flashinfer.cake_kda_nondet_train.cake_kda_nondet_train_backward | planned |
-| flashinfer.cake_kda_train.chunk_kda | 0.7.4rc1 | flashinfer.cake_kda_nondet_train.cake_kda_nondet | planned |
-| flashinfer.cake_kda_train.kda_train_arena | 0.7.4rc1 | flashinfer.cake_kda_nondet_train.cake_kda_nondet_train_arena | planned |
-| flashinfer.cake_kda_train.kda_train_workspace | 0.7.4rc1 | flashinfer.cake_kda_nondet_train.cake_kda_nondet_train_workspace | planned |
-| flashinfer.cake_kda_train.kda_train_workspace_bytes | 0.7.4rc1 | flashinfer.cake_kda_nondet_train.cake_kda_nondet_train_workspace_bytes | planned |
-| flashinfer.cake_kda_train.kda_train_saved_bytes | 0.7.4rc1 | flashinfer.cake_kda_nondet_train.cake_kda_nondet_train_saved_bytes | planned |
-| flashinfer.cake_kda_train.is_kda_train_supported | 0.7.4rc1 | flashinfer.cake_kda_nondet_train.is_cake_kda_nondet_train_supported | planned |
-| keyword deterministic= on every flashinfer.cake_kda_train entry (default True) | 0.7.4rc1 | removed: True (default) -> the matching flashinfer.cake_kda_det_train entry; False -> the cake_kda_nondet_train entry without the keyword | planned |
-| package flashinfer.experimental.cake.cake_kda_train (submodules cake_backend, cake_jit, cake_build) | 0.7.4rc1 | flashinfer.experimental.cake.cake_kda_nondet_train (same submodules) | planned |
-| ChunkKDAFunction (experimental.cake.cake_kda_train) | 0.7.4rc1 | CakeKDANondetFunction | planned |
-| KdaWorkspace (experimental.cake.cake_kda_train) | 0.7.4rc1 | CakeKDANondetWorkspace | planned |
-| KdaChunkSaved (experimental.cake.cake_kda_train) | 0.7.4rc1 | CakeKDANondetChunkSaved | planned |
-| KdaArena (experimental.cake.cake_kda_train.cake_backend) | 0.7.4rc1 | CakeKDANondetArena | planned |
-| backend chunk_kda / chunk_kda_fwd / chunk_kda_bwd (experimental.cake.cake_kda_train) | 0.7.4rc1 | cake_kda_nondet / cake_kda_nondet_train_forward / cake_kda_nondet_train_backward | planned |
-
-### KDA nondet KCP: cake_kda_nondet_train_kcp
+### MoE grouped GEMM
 
 | Old name | In | New name | PR |
-| --- | --- | --- | --- |
-| module flashinfer.cake_kda_train_kcp | 0.7.4rc1 | flashinfer.cake_kda_nondet_train_kcp (for deterministic=False callers); default deterministic=True callers go to flashinfer.cake_kda_det_train_kcp | planned |
-| flashinfer.cake_kda_train_kcp.chunk_kda_kcp | 0.7.4rc1 | cake_kda_nondet_kcp | planned |
-| chunk_kda_fwd_kcp | 0.7.4rc1 | cake_kda_nondet_train_kcp_forward | planned |
-| chunk_kda_bwd_kcp | 0.7.4rc1 | cake_kda_nondet_train_kcp_backward | planned |
-| partition_kcp | 0.7.4rc1 | cake_kda_nondet_train_kcp_partition | planned |
-| build_context_kcp | 0.7.4rc1 | cake_kda_nondet_train_kcp_build_context | planned |
-| kda_workspace_bytes_kcp | 0.7.4rc1 | cake_kda_nondet_train_kcp_workspace_bytes | planned |
-| kda_saved_bytes_kcp | 0.7.4rc1 | cake_kda_nondet_train_kcp_saved_bytes | planned |
-| kda_comm_bytes_kcp | 0.7.4rc1 | cake_kda_nondet_train_kcp_comm_bytes | planned |
-| reduce_gate_param_grads_kcp | 0.7.4rc1 | cake_kda_nondet_train_kcp_reduce_gate_param_grads | planned |
-| kda_handoff_bytes_kcp (nondet only) | 0.7.4rc1 | cake_kda_nondet_train_kcp_handoff_bytes | planned |
-| kcp_handoff_stats (nondet only) | 0.7.4rc1 | cake_kda_nondet_train_kcp_handoff_stats | planned |
-| ContextKcp | 0.7.4rc1 | CakeKDANondetKcpContext | planned |
-| PartitionKcp | 0.7.4rc1 | CakeKDANondetKcpPartition | planned |
-| WorkspaceKcp | 0.7.4rc1 | CakeKDANondetKcpWorkspace | planned |
-| SavedKcp | 0.7.4rc1 | CakeKDANondetKcpSaved | planned |
-| RecomputeHandleKcp | 0.7.4rc1 | CakeKDANondetKcpRecomputeHandle | planned |
-| OptionsKcp | 0.7.4rc1 | CakeKDANondetKcpOptions | planned |
-| ChunkKDAFunctionKcp (package only) | 0.7.4rc1 | CakeKDANondetKcpFunction | planned |
-| CallKcp (package only) | 0.7.4rc1 | CakeKDANondetKcpCall | planned |
-| FragmentKcp (package only) | 0.7.4rc1 | CakeKDANondetKcpFragment | planned |
-| keyword deterministic= on every flashinfer.cake_kda_train_kcp entry except kcp_handoff_stats (default True) | 0.7.4rc1 | removed: True (default) -> the matching flashinfer.cake_kda_det_train_kcp entry; False -> the cake_kda_nondet_train_kcp entry without the keyword | planned |
-| package flashinfer.experimental.cake_kda_train_kcp (submodules cake_kcp, cake_kcp_plan, cake_kcp_jit, cake_build) | 0.7.4rc1 | flashinfer.experimental.cake.cake_kda_nondet_train_kcp (same submodules) | planned |
+|---|---|---|---|
+| `flashinfer.grouped_mm.cake` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_det_train` | planned |
+| `flashinfer.grouped_mm.cake_grouped_mm`, `flashinfer.grouped_mm.cake.cake_grouped_mm` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_det_train.cake_moe_grouped_gemm_det` | planned |
+| `flashinfer.grouped_mm.cake_grouped_det_mm`, `flashinfer.grouped_mm.cake.cake_grouped_det_mm` | 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_det_train.cake_moe_grouped_gemm_det` | planned |
+| `flashinfer.experimental.cake_moe_grouped_gemm.cake_grouped_mm` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_det_train.cake_moe_grouped_gemm_det` | planned |
+| `flashinfer.experimental.cake_moe_grouped_det_gemm.{cake_grouped_det_mm, cake_grouped_mm}` | 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_det_train.cake_moe_grouped_gemm_det` | planned |
+| `flashinfer.experimental.cake_moe_grouped_gemm.CakeGroupedMm` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_det_train.CakeMoEGroupedGemmDetFunction` | planned |
+| `flashinfer.experimental.cake_moe_grouped_det_gemm.{CakeGroupedDetMm, CakeGroupedMm}` | 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_det_train.CakeMoEGroupedGemmDetFunction` | planned |
+| package `flashinfer.experimental.cake_moe_grouped_gemm` | 0.7.3, 0.7.4rc1 | package `flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train` | planned |
+| package `flashinfer.experimental.cake_moe_grouped_det_gemm` | 0.7.4rc1 | package `flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train` | planned |
+| `flashinfer.experimental.cake.grouped_mm` (default) | 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_det_train` | planned |
+| `flashinfer.experimental.cake.grouped_mm` (deterministic=False calls) | 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_nondet_train` | planned |
+| `flashinfer.experimental.cake.grouped_mm.cake_grouped_mm` (default) | 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_det_train.cake_moe_grouped_gemm_det` | planned |
+| `flashinfer.experimental.cake.grouped_mm.cake_grouped_mm(..., deterministic=False)` | 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_nondet_train.cake_moe_grouped_gemm_nondet` | planned |
+| `flashinfer.experimental.cake.cake_moe_grouped_gemm.cake_grouped_mm` | 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_nondet_train.cake_moe_grouped_gemm_nondet` | planned |
+| `flashinfer.experimental.cake.cake_moe_grouped_gemm.CakeGroupedMm` | 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_nondet_train.CakeMoEGroupedGemmNondetFunction` | planned |
+| package `flashinfer.experimental.cake.cake_moe_grouped_gemm` | 0.7.4rc1 | package `flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train` | planned |
 
-### MoE grouped GEMM (det + nondet): cake_moe_grouped_gemm_det_train / cake_moe_grouped_gemm_nondet_train
+On main, #8924 already removed the module `flashinfer.grouped_mm.cake`, the names without `det` in `flashinfer.grouped_mm` and in `flashinfer.experimental.cake_moe_grouped_det_gemm`, and the package `flashinfer.experimental.cake_moe_grouped_gemm`. Since #8924, a call of `flashinfer.experimental.cake.grouped_mm` that does not pass `deterministic=False` raises `ValueError`. Planned: the other public names of these modules (`grouped_gemm_*`, `grouped_det_gemm_*`, `prepare_grouped_*`, `GroupedGemmLaunch`, `GroupedDetGemmLaunch`) get their final names in the MoE family PR.
+
+### dense projection GEMM
 
 | Old name | In | New name | PR |
-| --- | --- | --- | --- |
-| package flashinfer.experimental.cake_moe_grouped_gemm (one level) + submodules cake_autograd, cake_backend, cake_build, cake_jit | 0.7.3, 0.7.4rc1 | removed, no alias (#8924); det target module flashinfer.cake_moe_grouped_gemm_det_train (planned) | planned |
-| package flashinfer.experimental.cake_moe_grouped_det_gemm | 0.7.4rc1 | module flashinfer.cake_moe_grouped_gemm_det_train (backend package flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train) | planned |
-| package flashinfer.experimental.cake.cake_moe_grouped_gemm | 0.7.4rc1 | module flashinfer.cake_moe_grouped_gemm_nondet_train (backend package flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train) | planned |
-| facade module flashinfer.experimental.cake.grouped_mm (cake_grouped_mm, grouped_gemm_{fwd,dgrad,wgrad}) | 0.7.4rc1 | no #8928 target stated. Callers that passed deterministic=False move to flashinfer.cake_moe_grouped_gemm_nondet_train. Callers that used the default (deterministic=True) move to flashinfer.cake_moe_grouped_gemm_det_train. | planned |
-| module flashinfer.grouped_mm.cake | 0.7.3, 0.7.4rc1 | interim flashinfer.grouped_mm.cake_det (#8924, main only); #8928 final target not stated (det family module: flashinfer.cake_moe_grouped_gemm_det_train) | planned |
-| cake_grouped_det_mm (det package root and cake_autograd, flashinfer.grouped_mm, flashinfer.grouped_mm.cake) | 0.7.4rc1 | cake_moe_grouped_gemm_det | planned |
-| cake_grouped_mm, det side (flashinfer.grouped_mm, flashinfer.grouped_mm.cake, experimental.cake_moe_grouped_gemm[.cake_autograd]) | 0.7.3 (0.7.4rc1: deprecated det alias) | cake_moe_grouped_gemm_det | planned |
-| CakeGroupedDetMm | 0.7.4rc1 | CakeMoEGroupedGemmDetFunction | planned |
-| CakeGroupedMm, det side (experimental.cake_moe_grouped_gemm[.cake_autograd]) | 0.7.3 (0.7.4rc1: deprecated det alias) | CakeMoEGroupedGemmDetFunction | planned |
-| cake_grouped_mm, nondet side (experimental.cake.cake_moe_grouped_gemm[.cake_autograd]; facade experimental.cake.grouped_mm.cake_grouped_mm(deterministic=False)) | 0.7.4rc1 | cake_moe_grouped_gemm_nondet | planned |
-| CakeGroupedMm, nondet side (experimental.cake.cake_moe_grouped_gemm[.cake_autograd]) | 0.7.4rc1 | CakeMoEGroupedGemmNondetFunction | planned |
-| grouped_det_gemm_{fwd,dgrad,wgrad} (det package, flashinfer.grouped_mm, flashinfer.grouped_mm.cake) | 0.7.4rc1 | cake_moe_grouped_gemm_det_train_* (checklist; exact verb spelling not fixed; rule 4 requires forward, not fwd) | planned |
-| grouped_gemm_{fwd,dgrad,wgrad}, det side (flashinfer.grouped_mm, flashinfer.grouped_mm.cake, experimental.cake_moe_grouped_gemm) | 0.7.3 (0.7.4rc1: deprecated det aliases) | cake_moe_grouped_gemm_det_train_* (exact verbs not fixed) | planned |
-| prepare_grouped_gemm_{fwd,dgrad,wgrad}, GroupedGemmLaunch (0.7.3 det) / prepare_grouped_det_gemm_{fwd,dgrad,wgrad}, GroupedDetGemmLaunch (rc1 det) | 0.7.3, 0.7.4rc1 | not stated in #8928 (by rules 4/6: cake_moe_grouped_gemm_det_train_<verb>, CakeMoEGroupedGemmDet<Noun>) | planned |
-| nondet grouped_gemm_{fwd,dgrad,wgrad}, prepare_grouped_gemm_{fwd,dgrad,wgrad}, GroupedGemmLaunch (experimental.cake.cake_moe_grouped_gemm; facade grouped_gemm_* with deterministic=False) | 0.7.4rc1 | not stated in #8928 (by rules 4/6: cake_moe_grouped_gemm_nondet_train_<verb>, CakeMoEGroupedGemmNondet<Noun>) | planned |
-| keyword deterministic= (0.7.3: cake_grouped_mm(deterministic=True), and False ran the same det programs; rc1: det entries the same, nondet entries required False, facade selected the mode) | 0.7.3, 0.7.4rc1 | removed; the module selects the mode | planned |
+|---|---|---|---|
+| package `flashinfer.experimental.dense_projection_gemm` (default) | 0.7.3, 0.7.4rc1 | `flashinfer.cake_dense_gemm_det_train`; package `flashinfer.experimental.cake.cake_dense_gemm_det_train` | #8926 |
+| package `flashinfer.experimental.dense_projection_gemm` (deterministic=False calls) | 0.7.4rc1 | `flashinfer.cake_dense_gemm_nondet_train`; package `flashinfer.experimental.cake.cake_dense_gemm_nondet_train` | #8926 |
+| package `flashinfer.experimental.dense_projection_det_gemm` | 0.7.4rc1 | `flashinfer.cake_dense_gemm_det_train`; package `flashinfer.experimental.cake.cake_dense_gemm_det_train` | #8926 |
+| `flashinfer.experimental.dense_projection_gemm.cake_backend.{dense_projection_gemm, projection_forward, projection_dgrad, projection_wgrad, plan_dense_projection_gemm, prepare_dense_projection_gemm, prepare_projection_wgrad}` (default) | 0.7.3, 0.7.4rc1 | `flashinfer.cake_dense_gemm_det_train.cake_dense_gemm_det_train_{projection, projection_forward, projection_dgrad, projection_wgrad, projection_plan, projection_prepare, projection_wgrad_prepare}` | #8926 |
+| `flashinfer.experimental.dense_projection_gemm.cake_backend.{dense_projection_gemm, projection_forward, projection_dgrad, projection_wgrad, plan_dense_projection_gemm, prepare_dense_projection_gemm, prepare_projection_wgrad}(..., deterministic=False)` | 0.7.4rc1 | `flashinfer.cake_dense_gemm_nondet_train.cake_dense_gemm_nondet_train_{projection, projection_forward, projection_dgrad, projection_wgrad, projection_plan, projection_prepare, projection_wgrad_prepare}` | #8926 |
+| `flashinfer.experimental.dense_projection_gemm.cake_backend.{router_fp32_gemm, router_forward, router_dgrad, router_wgrad, plan_router_fp32_gemm, prepare_router_fp32_gemm}` (default) | 0.7.3, 0.7.4rc1 | `flashinfer.cake_dense_gemm_det_train.cake_dense_gemm_det_train_{router, router_forward, router_dgrad, router_wgrad, router_plan, router_prepare}` | #8926 |
+| `flashinfer.experimental.dense_projection_gemm.cake_backend.{router_fp32_gemm, router_forward, router_dgrad, router_wgrad, plan_router_fp32_gemm, prepare_router_fp32_gemm}(..., deterministic=False)` | 0.7.4rc1 | `flashinfer.cake_dense_gemm_nondet_train.cake_dense_gemm_nondet_train_{router, router_forward, router_dgrad, router_wgrad, router_plan, router_prepare}` | #8926 |
+| `flashinfer.experimental.dense_projection_gemm.cake_backend.{GemmPlan, PreparedGemm, RouterPlan, PreparedRouterGemm}` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_dense_gemm_det_train.{CakeDenseGemmDetProjectionPlan, CakeDenseGemmDetProjectionLaunch, CakeDenseGemmDetRouterPlan, CakeDenseGemmDetRouterLaunch}` | #8926 |
+| `flashinfer.experimental.dense_projection_gemm.cake_backend.{AtomicGemmPlan, PreparedAtomicGemm, AtomicRouterPlan, PreparedAtomicRouterGemm}` | 0.7.4rc1 | `flashinfer.cake_dense_gemm_nondet_train.{CakeDenseGemmNondetProjectionPlan, CakeDenseGemmNondetProjectionLaunch, CakeDenseGemmNondetRouterPlan, CakeDenseGemmNondetRouterLaunch}` | #8926 |
+| `flashinfer.experimental.dense_projection_gemm.cake_backend.clear_convenience_caches` | 0.7.3 | `flashinfer.cake_dense_gemm_det_train.cake_dense_gemm_det_train_convenience_cache_clear` | #8926 |
+| `flashinfer.experimental.dense_projection_gemm.cake_backend.clear_convenience_caches` | 0.7.4rc1 | `flashinfer.cake_dense_gemm_nondet_train.cake_dense_gemm_nondet_train_convenience_cache_clear` | #8926 |
+| `flashinfer.experimental.dense_projection_gemm.cake_backend.split_fp32_to_bf16x3_` | 0.7.3, 0.7.4rc1 | `flashinfer.experimental.cake.cake_dense_gemm_det_train.cake_backend.split_fp32_to_bf16x3_det_` (not exported by the facade) | #8926 |
+| `flashinfer.experimental.dense_projection_gemm.cake_backend.instance_symbol` and the other det names that its module read through from the det package (for example `ROW_RULES`, `stream_k_plan`, `wgrad_views`) | 0.7.4rc1 | the same names in `flashinfer.experimental.cake.cake_dense_gemm_det_train.cake_backend` | #8926 |
+| `flashinfer.experimental.dense_projection_gemm.cake_backend.DETERMINISTIC_NAMES` | 0.7.4rc1 | removed, no replacement | #8926 |
+| `flashinfer.experimental.dense_projection_gemm.cake_jit.load_cake_dense_projection_gemm_module` | 0.7.3 | `flashinfer.experimental.cake.cake_dense_gemm_det_train.cake_jit.load_cake_dense_projection_det_gemm_module` | #8926 |
+| `flashinfer.experimental.dense_projection_det_gemm.cake_backend.{dense_projection_det_gemm, projection_det_forward, projection_det_dgrad, projection_det_wgrad, plan_dense_projection_det_gemm, prepare_dense_projection_det_gemm, prepare_projection_det_wgrad}` | 0.7.4rc1 | `flashinfer.cake_dense_gemm_det_train.cake_dense_gemm_det_train_{projection, projection_forward, projection_dgrad, projection_wgrad, projection_plan, projection_prepare, projection_wgrad_prepare}` | #8926 |
+| `flashinfer.experimental.dense_projection_det_gemm.cake_backend.{router_fp32_det_gemm, router_det_forward, router_det_dgrad, router_det_wgrad, plan_router_fp32_det_gemm, prepare_router_fp32_det_gemm}` | 0.7.4rc1 | `flashinfer.cake_dense_gemm_det_train.cake_dense_gemm_det_train_{router, router_forward, router_dgrad, router_wgrad, router_plan, router_prepare}` | #8926 |
+| `flashinfer.experimental.dense_projection_det_gemm.cake_backend.{dense_projection_gemm, projection_forward, projection_dgrad, projection_wgrad, plan_dense_projection_gemm, prepare_dense_projection_gemm, prepare_projection_wgrad}` | 0.7.4rc1 | `flashinfer.cake_dense_gemm_det_train.cake_dense_gemm_det_train_{projection, projection_forward, projection_dgrad, projection_wgrad, projection_plan, projection_prepare, projection_wgrad_prepare}` | #8926 |
+| `flashinfer.experimental.dense_projection_det_gemm.cake_backend.{router_fp32_gemm, router_forward, router_dgrad, router_wgrad, plan_router_fp32_gemm, prepare_router_fp32_gemm}` | 0.7.4rc1 | `flashinfer.cake_dense_gemm_det_train.cake_dense_gemm_det_train_{router, router_forward, router_dgrad, router_wgrad, router_plan, router_prepare}` | #8926 |
+| `flashinfer.experimental.dense_projection_det_gemm.cake_backend.{DetGemmPlan, PreparedDetGemm, RouterDetPlan, PreparedRouterDetGemm}` | 0.7.4rc1 | `flashinfer.cake_dense_gemm_det_train.{CakeDenseGemmDetProjectionPlan, CakeDenseGemmDetProjectionLaunch, CakeDenseGemmDetRouterPlan, CakeDenseGemmDetRouterLaunch}` | #8926 |
+| `flashinfer.experimental.dense_projection_det_gemm.cake_backend.{GemmPlan, PreparedGemm, RouterPlan, PreparedRouterGemm}` | 0.7.4rc1 | `flashinfer.cake_dense_gemm_det_train.{CakeDenseGemmDetProjectionPlan, CakeDenseGemmDetProjectionLaunch, CakeDenseGemmDetRouterPlan, CakeDenseGemmDetRouterLaunch}` | #8926 |
+| `flashinfer.experimental.dense_projection_det_gemm.cake_backend.clear_convenience_caches` | 0.7.4rc1 | `flashinfer.cake_dense_gemm_det_train.cake_dense_gemm_det_train_convenience_cache_clear` | #8926 |
+| `flashinfer.experimental.dense_projection_det_gemm.cake_backend.split_fp32_to_bf16x3_` | 0.7.4rc1 | `flashinfer.experimental.cake.cake_dense_gemm_det_train.cake_backend.split_fp32_to_bf16x3_det_` (not exported by the facade) | #8926 |
+| `flashinfer.experimental.dense_projection_det_gemm.cake_jit.load_cake_dense_projection_gemm_module` | 0.7.4rc1 | `flashinfer.experimental.cake.cake_dense_gemm_det_train.cake_jit.load_cake_dense_projection_det_gemm_module` | #8926 |
 
-### dense projection GEMM (det + nondet): cake_dense_gemm_det_train / cake_dense_gemm_nondet_train
-
-| Old name | In | New name | PR |
-| --- | --- | --- | --- |
-| package flashinfer.experimental.dense_projection_det_gemm (cake_backend, cake_jit, cake_build) | 0.7.4rc1 | module flashinfer.cake_dense_gemm_det_train (backend package flashinfer.experimental.cake.cake_dense_gemm_det_train) | #8926 |
-| package flashinfer.experimental.dense_projection_gemm, as used at 0.7.3 or through the rc1 default deterministic=True | 0.7.3, 0.7.4rc1 | module flashinfer.cake_dense_gemm_det_train | #8926 |
-| package flashinfer.experimental.dense_projection_gemm called with deterministic=False | 0.7.4rc1 | module flashinfer.cake_dense_gemm_nondet_train (backend package flashinfer.experimental.cake.cake_dense_gemm_nondet_train) | #8926 |
-| dense_projection_det_gemm (rc1 det cake_backend); dense_projection_gemm (0.7.3 det; rc1 det alias; rc1 nondet package default) | 0.7.3, 0.7.4rc1 | cake_dense_gemm_det_train_projection | #8926 |
-| dense_projection_gemm(..., deterministic=False) (rc1 dense_projection_gemm.cake_backend) | 0.7.4rc1 | cake_dense_gemm_nondet_train_projection | #8926 |
-| projection_det_{forward,dgrad,wgrad} (rc1); projection_{forward,dgrad,wgrad} (0.7.3 det; rc1 det aliases / nondet default) | 0.7.3, 0.7.4rc1 | cake_dense_gemm_det_train_projection_{forward,dgrad,wgrad} | #8926 |
-| projection_{forward,dgrad,wgrad}(..., deterministic=False) (rc1) | 0.7.4rc1 | cake_dense_gemm_nondet_train_projection_{forward,dgrad,wgrad} | #8926 |
-| plan_dense_projection_det_gemm / prepare_dense_projection_det_gemm / prepare_projection_det_wgrad (rc1); plan_dense_projection_gemm / prepare_dense_projection_gemm / prepare_projection_wgrad (0.7.3 det; rc1 det aliases) | 0.7.3, 0.7.4rc1 | cake_dense_gemm_det_train_projection_plan / _projection_prepare / _projection_wgrad_prepare | #8926 |
-| plan_dense_projection_gemm / prepare_dense_projection_gemm / prepare_projection_wgrad (..., deterministic=False, **kwargs) (rc1) | 0.7.4rc1 | cake_dense_gemm_nondet_train_projection_plan / _projection_prepare / _projection_wgrad_prepare (no **kwargs; explicit keyword-only knobs = det planner knobs + splits, chains) | #8926 |
-| router_fp32_det_gemm (rc1); router_fp32_gemm (0.7.3 det; rc1 det alias) | 0.7.3, 0.7.4rc1 | cake_dense_gemm_det_train_router | #8926 |
-| router_fp32_gemm(..., deterministic=False) (rc1) | 0.7.4rc1 | cake_dense_gemm_nondet_train_router | #8926 |
-| router_det_{forward,dgrad,wgrad} (rc1); router_{forward,dgrad,wgrad} (0.7.3 det; rc1 det aliases) | 0.7.3, 0.7.4rc1 | cake_dense_gemm_det_train_router_{forward,dgrad,wgrad} | #8926 |
-| router_{forward,dgrad,wgrad}(..., deterministic=False) (rc1) | 0.7.4rc1 | cake_dense_gemm_nondet_train_router_{forward,dgrad,wgrad} | #8926 |
-| plan_router_fp32_det_gemm / prepare_router_fp32_det_gemm (rc1); plan_router_fp32_gemm / prepare_router_fp32_gemm (0.7.3 det; rc1 det aliases) | 0.7.3, 0.7.4rc1 | cake_dense_gemm_det_train_router_plan / _router_prepare | #8926 |
-| plan_router_fp32_gemm / prepare_router_fp32_gemm (..., deterministic=False) (rc1) | 0.7.4rc1 | cake_dense_gemm_nondet_train_router_plan / _router_prepare | #8926 |
-| clear_convenience_caches (0.7.3 det; rc1 in both packages) | 0.7.3, 0.7.4rc1 | cake_dense_gemm_det_train_convenience_cache_clear / cake_dense_gemm_nondet_train_convenience_cache_clear | #8926 |
-| DetGemmPlan / PreparedDetGemm / RouterDetPlan / PreparedRouterDetGemm (rc1); GemmPlan / PreparedGemm / RouterPlan / PreparedRouterGemm (0.7.3 det; rc1 det aliases and nondet read-through) | 0.7.3, 0.7.4rc1 | CakeDenseGemmDetProjectionPlan / CakeDenseGemmDetProjectionLaunch / CakeDenseGemmDetRouterPlan / CakeDenseGemmDetRouterLaunch | #8926 |
-| AtomicGemmPlan / PreparedAtomicGemm / AtomicRouterPlan / PreparedAtomicRouterGemm (rc1) | 0.7.4rc1 | CakeDenseGemmNondetProjectionPlan / CakeDenseGemmNondetProjectionLaunch / CakeDenseGemmNondetRouterPlan / CakeDenseGemmNondetRouterLaunch | #8926 |
-| (none) | new (no old name) | is_cake_dense_gemm_det_train_supported(device) / is_cake_dense_gemm_nondet_train_supported(device) | #8926 |
-| keyword deterministic= (rc1 dense_projection_gemm.cake_backend entries, default True) | 0.7.4rc1 | removed (TypeError); the module selects the mode | #8926 |
-| det former aliases (GemmPlan, PreparedGemm, PreparedRouterGemm, RouterPlan, the 13 mode-less functions, split_fp32_to_bf16x3_) in dense_projection_det_gemm.cake_backend; det cake_jit.load_cake_dense_projection_gemm_module; nondet cake_backend read-through (__getattr__/_DET_TYPES), DETERMINISTIC_NAMES, nondet instance_symbol / split_fp32_to_bf16x3_ | 0.7.4rc1 (the mode-less spellings were the det originals at 0.7.3; see rows above) | removed, no alias (det cake_backend.instance_symbol and nondet cake_jit.load_cake_dense_projection_gemm_module stay as backend internals) | #8926 |
-
-### LM head det (cake_lm_head_det_train)
+### LM head + loss
 
 | Old name | In | New name | PR |
-| --- | --- | --- | --- |
-| module flashinfer.chunked_lm_head (det entries / default-mode calls) | 0.7.3, 0.7.4rc1 | module flashinfer.cake_lm_head_det_train (stable API, @flashinfer_api; also lazy top-level attribute flashinfer.cake_lm_head_det_train) | #8925 |
-| flashinfer.chunked_lm_head.chunked_lm_head_det_loss | 0.7.4rc1 | flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_loss | #8925 |
-| flashinfer.chunked_lm_head.chunked_lm_head_det_logprob | 0.7.4rc1 | flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_logprob | #8925 |
-| flashinfer.chunked_lm_head.chunked_lm_head_det_preload | 0.7.4rc1 | flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_preload | #8925 |
-| flashinfer.chunked_lm_head.chunked_lm_head_det_support_logprob | 0.7.4rc1 | flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_support_logprob | #8925 |
-| flashinfer.chunked_lm_head.chunked_lm_head_det_support_kl | 0.7.4rc1 | flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_support_kl | #8925 |
-| flashinfer.chunked_lm_head.chunked_lm_head_loss(...) with default / deterministic=True | 0.7.3, 0.7.4rc1 | flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_loss(...) | #8925 |
-| flashinfer.chunked_lm_head.chunked_lm_head_logprob(...) with default / deterministic=True | 0.7.3, 0.7.4rc1 | flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_logprob(...) | #8925 |
-| flashinfer.chunked_lm_head.chunked_lm_head_preload(...) with default / deterministic=True | 0.7.3, 0.7.4rc1 | flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_preload(...) | #8925 |
-| flashinfer.chunked_lm_head.chunked_lm_head_support_logprob(...) / chunked_lm_head_support_kl(...) with default / deterministic=True | 0.7.4rc1 | flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_support_logprob(...) / cake_lm_head_det_train_support_kl(...) | #8925 |
-| chunked_lm_head_*(...) without deterministic=False (det call form) | 0.7.3, 0.7.4rc1 | ValueError naming the det entry (interim, #8925 only); module removed by #8952 | #8925 |
-| package flashinfer.experimental.cake_lm_head_det_loss (submodules cake_backend, cake_backend_opt_in, cake_support, cake_jit, cake_build) | 0.7.4rc1 | package flashinfer.experimental.cake.cake_lm_head_det_train (same submodules) | #8925 |
-| package flashinfer.experimental.cake_lm_head_loss (one level; det package at 0.7.3, det alias package at 0.7.4rc1) | 0.7.3, 0.7.4rc1 | package flashinfer.experimental.cake.cake_lm_head_det_train (alias removed, no replacement alias) | #8925 |
-| cake_lm_head_det_loss.cake_backend.chunked_lm_head_det_{loss,logprob,logprob_temperature,logprob_keep}; cake_backend_opt_in.chunked_lm_head_det_{loss,logprob,logprob_temperature} | 0.7.4rc1 | cake_lm_head_det_train.cake_backend.cake_lm_head_det_train_{loss,logprob,logprob_temperature,logprob_keep}; cake_backend_opt_in.cake_lm_head_det_train_{loss,logprob,logprob_temperature} | #8925 |
-| flashinfer.experimental.cake_lm_head_loss.cake_backend.chunked_lm_head_{loss,logprob} and cake_backend_opt_in.chunked_lm_head_{loss,logprob} (0.7.3 det names; at 0.7.4rc1 pre-det aliases in cake_lm_head_det_loss and via the alias package) | 0.7.3, 0.7.4rc1 | cake_lm_head_det_train.cake_backend.cake_lm_head_det_train_{loss,logprob} (same in cake_backend_opt_in) | #8925 |
-| cake_backend_opt_in.preload (flashinfer.experimental.cake_lm_head_loss at 0.7.3; flashinfer.experimental.cake_lm_head_det_loss at 0.7.4rc1) | 0.7.3, 0.7.4rc1 | cake_lm_head_det_train.cake_backend_opt_in.cake_lm_head_det_train_preload | #8925 |
-| cake_lm_head_det_loss.cake_support.chunked_lm_head_det_support_{logprob,kl} | 0.7.4rc1 | cake_lm_head_det_train.cake_support.cake_lm_head_det_train_support_{logprob,kl} | #8925 |
-| cake_lm_head_det_loss.cake_support.chunked_lm_head_support_{logprob,kl} (pre-det aliases; also via flashinfer.experimental.cake_lm_head_loss.cake_support) | 0.7.4rc1 | cake_lm_head_det_train.cake_support.cake_lm_head_det_train_support_{logprob,kl} | #8925 |
-| ChunkedLmHeadDet{Loss,Logprob,LogprobTemperature}Function (cake_backend and cake_backend_opt_in of cake_lm_head_det_loss) | 0.7.4rc1 | CakeLMHeadDet{Loss,Logprob,LogprobTemperature}Function (same modules of cake_lm_head_det_train) | #8925 |
-| cake_backend.ChunkedLmHeadDetLogprobKeepFunction | 0.7.4rc1 | cake_backend.CakeLMHeadDetLogprobKeepFunction | #8925 |
-| ChunkedLmHead{Loss,Logprob}Function in cake_backend / cake_backend_opt_in (0.7.3 det classes of flashinfer.experimental.cake_lm_head_loss; 0.7.4rc1 pre-det aliases in cake_lm_head_det_loss) | 0.7.3, 0.7.4rc1 | CakeLMHeadDet{Loss,Logprob}Function | #8925 |
-| cake_support.SupportDetLogprobFunction | 0.7.4rc1 | cake_support.CakeLMHeadDetSupportFunction (serves both support entries) | #8925 |
-| cake_lm_head_det_loss.cake_support.SupportLogprobFunction (pre-det alias) | 0.7.4rc1 | cake_support.CakeLMHeadDetSupportFunction | #8925 |
-| pre-det internal names validate_lm_head_inputs, lm_head_loss_workspace_size, LmHeadLossRunner, prepare_lm_head_loss (cake_backend, cake_backend_opt_in), load_cake_lm_head_loss_module (cake_jit, cake_backend, cake_backend_opt_in) | 0.7.3, 0.7.4rc1 | removed, no alias; internal det names kept (not forwarded): validate_lm_head_det_inputs, lm_head_det_loss_workspace_size, LmHeadDetLossRunner, prepare_lm_head_det_loss, cake_jit.load_cake_lm_head_det_loss_module in flashinfer.experimental.cake.cake_lm_head_det_train | #8925 |
-| deterministic= keyword on det entries, backend entries and autograd Function.forward (only True accepted) | 0.7.3, 0.7.4rc1 | removed; passing it raises TypeError; torch.use_deterministic_algorithms has no effect | #8925 |
+|---|---|---|---|
+| `flashinfer.chunked_lm_head` (default) | 0.7.3, 0.7.4rc1 | `flashinfer.cake_lm_head_det_train` | #8925 |
+| `flashinfer.chunked_lm_head` (deterministic=False calls) | 0.7.4rc1 | `flashinfer.cake_lm_head_nondet_train` | #8952 |
+| `flashinfer.chunked_lm_head.{chunked_lm_head_loss, chunked_lm_head_logprob, chunked_lm_head_preload}` (default) | 0.7.3, 0.7.4rc1 | `flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_{loss, logprob, preload}` | #8925 |
+| `flashinfer.chunked_lm_head.{chunked_lm_head_support_logprob, chunked_lm_head_support_kl}` (default) | 0.7.4rc1 | `flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_{support_logprob, support_kl}` | #8925 |
+| `flashinfer.chunked_lm_head.{chunked_lm_head_loss, chunked_lm_head_logprob, chunked_lm_head_preload, chunked_lm_head_support_logprob, chunked_lm_head_support_kl}(..., deterministic=False)` | 0.7.4rc1 | `flashinfer.cake_lm_head_nondet_train.cake_lm_head_nondet_train_{loss, logprob, preload, support_logprob, support_kl}` | #8952 |
+| `flashinfer.chunked_lm_head.chunked_lm_head_det_{loss, logprob, preload, support_logprob, support_kl}` | 0.7.4rc1 | `flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_{loss, logprob, preload, support_logprob, support_kl}` | #8925 |
+| package `flashinfer.experimental.cake_lm_head_loss` | 0.7.3, 0.7.4rc1 | package `flashinfer.experimental.cake.cake_lm_head_det_train` | #8925 |
+| package `flashinfer.experimental.cake_lm_head_det_loss` | 0.7.4rc1 | package `flashinfer.experimental.cake.cake_lm_head_det_train` | #8925 |
+| package `flashinfer.experimental.cake.cake_lm_head_loss` | 0.7.4rc1 | package `flashinfer.experimental.cake.cake_lm_head_nondet_train` | #8952 |
+| `flashinfer.experimental.cake_lm_head_loss.cake_backend.{chunked_lm_head_loss, chunked_lm_head_logprob, ChunkedLmHeadLossFunction, ChunkedLmHeadLogprobFunction}` | 0.7.3, 0.7.4rc1 | `flashinfer.experimental.cake.cake_lm_head_det_train.cake_backend.{cake_lm_head_det_train_loss, cake_lm_head_det_train_logprob, CakeLMHeadDetLossFunction, CakeLMHeadDetLogprobFunction}` | #8925 |
+| `flashinfer.experimental.cake_lm_head_loss.cake_backend_opt_in.{chunked_lm_head_loss, chunked_lm_head_logprob, preload, ChunkedLmHeadLossFunction, ChunkedLmHeadLogprobFunction}` | 0.7.3, 0.7.4rc1 | `flashinfer.experimental.cake.cake_lm_head_det_train.cake_backend_opt_in.{cake_lm_head_det_train_loss, cake_lm_head_det_train_logprob, cake_lm_head_det_train_preload, CakeLMHeadDetLossFunction, CakeLMHeadDetLogprobFunction}` | #8925 |
+| `flashinfer.experimental.cake_lm_head_loss.cake_backend.{validate_lm_head_inputs, lm_head_loss_workspace_size, LmHeadLossRunner, prepare_lm_head_loss}`, `flashinfer.experimental.cake_lm_head_loss.cake_jit.load_cake_lm_head_loss_module` | 0.7.3, 0.7.4rc1 | `flashinfer.experimental.cake.cake_lm_head_det_train.cake_backend.{validate_lm_head_det_inputs, lm_head_det_loss_workspace_size, LmHeadDetLossRunner, prepare_lm_head_det_loss}`, `flashinfer.experimental.cake.cake_lm_head_det_train.cake_jit.load_cake_lm_head_det_loss_module` | #8925 |
+| `flashinfer.experimental.cake_lm_head_loss.cake_backend_opt_in.{validate_lm_head_inputs, LmHeadLossRunner, prepare_lm_head_loss, load_cake_lm_head_loss_module}` | 0.7.3, 0.7.4rc1 | `flashinfer.experimental.cake.cake_lm_head_det_train.cake_backend_opt_in.{validate_lm_head_det_inputs, LmHeadDetLossRunner, prepare_lm_head_det_loss, load_cake_lm_head_det_loss_module}` | #8925 |
+| `flashinfer.experimental.cake_lm_head_det_loss.cake_backend.{chunked_lm_head_det_loss, chunked_lm_head_det_logprob, chunked_lm_head_det_logprob_temperature, chunked_lm_head_det_logprob_keep, ChunkedLmHeadDetLossFunction, ChunkedLmHeadDetLogprobFunction, ChunkedLmHeadDetLogprobTemperatureFunction, ChunkedLmHeadDetLogprobKeepFunction}` | 0.7.4rc1 | `flashinfer.experimental.cake.cake_lm_head_det_train.cake_backend.{cake_lm_head_det_train_loss, cake_lm_head_det_train_logprob, cake_lm_head_det_train_logprob_temperature, cake_lm_head_det_train_logprob_keep, CakeLMHeadDetLossFunction, CakeLMHeadDetLogprobFunction, CakeLMHeadDetLogprobTemperatureFunction, CakeLMHeadDetLogprobKeepFunction}` | #8925 |
+| `flashinfer.experimental.cake_lm_head_det_loss.cake_backend_opt_in.{chunked_lm_head_det_loss, chunked_lm_head_det_logprob, chunked_lm_head_det_logprob_temperature, preload, ChunkedLmHeadDetLossFunction, ChunkedLmHeadDetLogprobFunction, ChunkedLmHeadDetLogprobTemperatureFunction}` | 0.7.4rc1 | `flashinfer.experimental.cake.cake_lm_head_det_train.cake_backend_opt_in.{cake_lm_head_det_train_loss, cake_lm_head_det_train_logprob, cake_lm_head_det_train_logprob_temperature, cake_lm_head_det_train_preload, CakeLMHeadDetLossFunction, CakeLMHeadDetLogprobFunction, CakeLMHeadDetLogprobTemperatureFunction}` | #8925 |
+| `flashinfer.experimental.cake_lm_head_det_loss.cake_backend.{chunked_lm_head_loss, chunked_lm_head_logprob, ChunkedLmHeadLossFunction, ChunkedLmHeadLogprobFunction}` and the same names in `.cake_backend_opt_in` | 0.7.4rc1 | `flashinfer.experimental.cake.cake_lm_head_det_train.cake_backend.{cake_lm_head_det_train_loss, cake_lm_head_det_train_logprob, CakeLMHeadDetLossFunction, CakeLMHeadDetLogprobFunction}` and the same names in `.cake_backend_opt_in` | #8925 |
+| `flashinfer.experimental.cake_lm_head_det_loss.cake_backend.{validate_lm_head_inputs, lm_head_loss_workspace_size, LmHeadLossRunner, prepare_lm_head_loss}`, `flashinfer.experimental.cake_lm_head_det_loss.cake_jit.load_cake_lm_head_loss_module` | 0.7.4rc1 | `flashinfer.experimental.cake.cake_lm_head_det_train.cake_backend.{validate_lm_head_det_inputs, lm_head_det_loss_workspace_size, LmHeadDetLossRunner, prepare_lm_head_det_loss}`, `flashinfer.experimental.cake.cake_lm_head_det_train.cake_jit.load_cake_lm_head_det_loss_module` | #8925 |
+| `flashinfer.experimental.cake_lm_head_det_loss.cake_backend_opt_in.{validate_lm_head_inputs, LmHeadLossRunner, prepare_lm_head_loss, load_cake_lm_head_loss_module}` | 0.7.4rc1 | `flashinfer.experimental.cake.cake_lm_head_det_train.cake_backend_opt_in.{validate_lm_head_det_inputs, LmHeadDetLossRunner, prepare_lm_head_det_loss, load_cake_lm_head_det_loss_module}` | #8925 |
+| `flashinfer.experimental.cake_lm_head_det_loss.cake_support.chunked_lm_head_det_support_{logprob, kl}`, `flashinfer.experimental.cake_lm_head_det_loss.cake_support.chunked_lm_head_support_{logprob, kl}` | 0.7.4rc1 | `flashinfer.experimental.cake.cake_lm_head_det_train.cake_support.cake_lm_head_det_train_support_{logprob, kl}` | #8925 |
+| `flashinfer.experimental.cake_lm_head_det_loss.cake_support.{SupportDetLogprobFunction, SupportLogprobFunction}` | 0.7.4rc1 | `flashinfer.experimental.cake.cake_lm_head_det_train.cake_support.CakeLMHeadDetSupportFunction` | #8925 |
+| `flashinfer.experimental.cake.cake_lm_head_loss.cake_backend.{chunked_lm_head_loss, chunked_lm_head_logprob, chunked_lm_head_logprob_temperature, chunked_lm_head_logprob_keep, ChunkedLmHeadLossFunction, ChunkedLmHeadLogprobFunction, ChunkedLmHeadLogprobTemperatureFunction, ChunkedLmHeadLogprobKeepFunction}` | 0.7.4rc1 | `flashinfer.experimental.cake.cake_lm_head_nondet_train.cake_backend.{cake_lm_head_nondet_train_loss, cake_lm_head_nondet_train_logprob, cake_lm_head_nondet_train_logprob_temperature, cake_lm_head_nondet_train_logprob_keep, CakeLMHeadNondetLossFunction, CakeLMHeadNondetLogprobFunction, CakeLMHeadNondetLogprobTemperatureFunction, CakeLMHeadNondetLogprobKeepFunction}` | #8952 |
+| `flashinfer.experimental.cake.cake_lm_head_loss.cake_backend_opt_in.{chunked_lm_head_loss, chunked_lm_head_logprob, chunked_lm_head_logprob_temperature, preload, ChunkedLmHeadLossFunction, ChunkedLmHeadLogprobFunction, ChunkedLmHeadLogprobTemperatureFunction}` | 0.7.4rc1 | `flashinfer.experimental.cake.cake_lm_head_nondet_train.cake_backend_opt_in.{cake_lm_head_nondet_train_loss, cake_lm_head_nondet_train_logprob, cake_lm_head_nondet_train_logprob_temperature, cake_lm_head_nondet_train_preload, CakeLMHeadNondetLossFunction, CakeLMHeadNondetLogprobFunction, CakeLMHeadNondetLogprobTemperatureFunction}` | #8952 |
+| `flashinfer.experimental.cake.cake_lm_head_loss.cake_support.{chunked_lm_head_support_logprob, chunked_lm_head_support_kl}` | 0.7.4rc1 | `flashinfer.experimental.cake.cake_lm_head_nondet_train.cake_support.{cake_lm_head_nondet_train_support_logprob, cake_lm_head_nondet_train_support_kl}` | #8952 |
+| `flashinfer.experimental.cake.cake_lm_head_loss.cake_support.SupportLogprobFunction` | 0.7.4rc1 | `flashinfer.experimental.cake.cake_lm_head_nondet_train.cake_support.CakeLMHeadNondetSupportFunction` | #8952 |
 
-### LM head nondet (cake_lm_head_nondet_train)
-
-| Old name | In | New name | PR |
-| --- | --- | --- | --- |
-| module flashinfer.chunked_lm_head (its chunked_lm_head_* dispatchers, deterministic=False path) | 0.7.4rc1 (module also in 0.7.3, but it had no nondet path there) | module flashinfer.cake_lm_head_nondet_train (stable API, @flashinfer_api; also lazy top-level attribute flashinfer.cake_lm_head_nondet_train) | #8952 |
-| flashinfer.chunked_lm_head.chunked_lm_head_loss(..., deterministic=False) | 0.7.4rc1 | flashinfer.cake_lm_head_nondet_train.cake_lm_head_nondet_train_loss(...) | #8952 |
-| flashinfer.chunked_lm_head.chunked_lm_head_logprob(..., deterministic=False) | 0.7.4rc1 | flashinfer.cake_lm_head_nondet_train.cake_lm_head_nondet_train_logprob(...) | #8952 |
-| flashinfer.chunked_lm_head.chunked_lm_head_preload(..., deterministic=False) | 0.7.4rc1 | flashinfer.cake_lm_head_nondet_train.cake_lm_head_nondet_train_preload(...) | #8952 |
-| flashinfer.chunked_lm_head.chunked_lm_head_support_logprob(..., deterministic=False) | 0.7.4rc1 | flashinfer.cake_lm_head_nondet_train.cake_lm_head_nondet_train_support_logprob(...) | #8952 |
-| flashinfer.chunked_lm_head.chunked_lm_head_support_kl(..., deterministic=False) | 0.7.4rc1 | flashinfer.cake_lm_head_nondet_train.cake_lm_head_nondet_train_support_kl(...) | #8952 |
-| package flashinfer.experimental.cake.cake_lm_head_loss (cake_backend, cake_backend_opt_in, cake_support, cake_jit, cake_build) | 0.7.4rc1 | package flashinfer.experimental.cake.cake_lm_head_nondet_train (same submodules) | #8952 |
-| cake.cake_lm_head_loss.cake_backend.chunked_lm_head_{loss,logprob,logprob_temperature,logprob_keep}; cake_backend_opt_in.chunked_lm_head_{loss,logprob,logprob_temperature} | 0.7.4rc1 | cake_lm_head_nondet_train.cake_backend.cake_lm_head_nondet_train_{loss,logprob,logprob_temperature,logprob_keep}; cake_backend_opt_in.cake_lm_head_nondet_train_{loss,logprob,logprob_temperature} | #8952 |
-| cake.cake_lm_head_loss.cake_backend_opt_in.preload | 0.7.4rc1 | cake_lm_head_nondet_train.cake_backend_opt_in.cake_lm_head_nondet_train_preload | #8952 |
-| cake.cake_lm_head_loss.cake_support.chunked_lm_head_support_{logprob,kl} | 0.7.4rc1 | cake_lm_head_nondet_train.cake_support.cake_lm_head_nondet_train_support_{logprob,kl} | #8952 |
-| ChunkedLmHead{Loss,Logprob,LogprobTemperature}Function (cake_backend and cake_backend_opt_in of cake.cake_lm_head_loss) | 0.7.4rc1 | CakeLMHeadNondet{Loss,Logprob,LogprobTemperature}Function (both backend modules) | #8952 |
-| cake.cake_lm_head_loss.cake_backend.ChunkedLmHeadLogprobKeepFunction | 0.7.4rc1 | cake_lm_head_nondet_train.cake_backend.CakeLMHeadNondetLogprobKeepFunction | #8952 |
-| cake.cake_lm_head_loss.cake_support.SupportLogprobFunction | 0.7.4rc1 | cake_lm_head_nondet_train.cake_support.CakeLMHeadNondetSupportFunction (serves both support entries) | #8952 |
-| cake_support.__all__ also listing SupportReferenceEngine, SupportRows, decode_support_error, describe_support_error, support_error_word, support_memory_report, support_program_available, validate_support_inputs | 0.7.4rc1 | __all__ = the two support entries, CakeLMHeadNondetSupportFunction and the contract constants; the helpers stay module attributes | #8952 |
-| deterministic keyword of every ND entry (facade dispatchers and backend entries; backend default True raised ValueError) and the deterministic position of every autograd Function | 0.7.4rc1 | removed; passing it raises Python's TypeError | #8952 |
-
-### DSA indexer det (cake_dsa_indexer_det_train)
+### DSA indexer
 
 | Old name | In | New name | PR |
-| --- | --- | --- | --- |
-| flashinfer.dsa_indexer (Cake route, backend="cake") | 0.7.3, 0.7.4rc1 | flashinfer.cake_dsa_indexer_det_train (new stable facade, @flashinfer_api; __all__ = cake_dsa_indexer_det_train_topk, cake_dsa_indexer_det_train_topk_workspace_size) | #8936 |
-| flashinfer.dsa_indexer.dsa_indexer_topk(..., backend="cake") | 0.7.3 (entry, default backend='cake'), 0.7.4rc1 (alias of dsa_indexer_det_topk) | flashinfer.cake_dsa_indexer_det_train.cake_dsa_indexer_det_train_topk(...) | #8936 |
-| flashinfer.dsa_indexer.dsa_indexer_topk_workspace_size | 0.7.3 (entry), 0.7.4rc1 (alias) | flashinfer.cake_dsa_indexer_det_train.cake_dsa_indexer_det_train_topk_workspace_size | #8936 |
-| flashinfer.dsa_indexer.dsa_indexer_det_topk(..., backend="cake") | 0.7.4rc1 | flashinfer.cake_dsa_indexer_det_train.cake_dsa_indexer_det_train_topk(...) (same arguments without backend, q_scale, block_table, context_lens, enable_pdl) | #8936 |
-| flashinfer.dsa_indexer.dsa_indexer_det_topk_workspace_size | 0.7.4rc1 | flashinfer.cake_dsa_indexer_det_train.cake_dsa_indexer_det_train_topk_workspace_size | #8936 |
-| flashinfer.experimental.cake_dsa_indexer (backend package) | 0.7.3 (backend), 0.7.4rc1 (previous-path alias package) | flashinfer.experimental.cake.cake_dsa_indexer_det_train | #8936 |
-| flashinfer.experimental.cake_dsa_indexer_det (backend package) | 0.7.4rc1 | flashinfer.experimental.cake.cake_dsa_indexer_det_train | #8936 |
-| cake_backend.dsa_indexer_topk | 0.7.3 (cake_dsa_indexer, real), 0.7.4rc1 (cake_dsa_indexer_det, alias) | cake_backend.cake_dsa_indexer_det_train_topk | #8936 |
-| cake_backend.dsa_indexer_workspace_size | 0.7.3 (real), 0.7.4rc1 (alias) | cake_backend.cake_dsa_indexer_det_train_topk_workspace_size | #8936 |
-| cake_backend.dsa_indexer_det_topk | 0.7.4rc1 | cake_backend.cake_dsa_indexer_det_train_topk | #8936 |
-| cake_backend.dsa_indexer_det_workspace_size | 0.7.4rc1 | cake_backend.cake_dsa_indexer_det_train_topk_workspace_size | #8936 |
-| cake_backend.DSAIndexerRunner | 0.7.3 (real), 0.7.4rc1 (alias) | removed; use cake_backend.DSAIndexerDetRunner (name unchanged since 0.7.4rc1) | #8936 |
-| cake_backend.plan_dsa_indexer_topk | 0.7.3 (real), 0.7.4rc1 (alias) | removed; use cake_backend.plan_dsa_indexer_det_topk | #8936 |
-| cake_backend.prepare_dsa_indexer_topk | 0.7.3 (real), 0.7.4rc1 (alias) | removed; use cake_backend.prepare_dsa_indexer_det_topk | #8936 |
-| cake_backend.validate_dsa_indexer_inputs | 0.7.3 (real), 0.7.4rc1 (alias) | removed; use cake_backend.validate_dsa_indexer_det_inputs | #8936 |
-| tests/experimental/test_cake_dsa_indexer.py, test_cake_dsa_indexer_api.py | 0.7.3, 0.7.4rc1 | tests/experimental/test_cake_dsa_indexer_det_train.py, test_cake_dsa_indexer_det_train_api.py | #8936 |
-| tests/experimental/test_cake_dsa_indexer_fp8.py | 0.7.4rc1 | tests/experimental/test_cake_dsa_indexer_det_train_fp8.py | #8936 |
-| (none) | - | tests/experimental/test_cake_dsa_indexer_det_train_names.py | #8936 |
-| benchmarks/bench_cake_dsa_indexer.py, benchmarks/diag_cake_dsa_indexer_sampling.py | 0.7.3, 0.7.4rc1 | benchmarks/bench_cake_dsa_indexer_det_train.py, benchmarks/diag_cake_dsa_indexer_det_train_sampling.py | #8936 |
-| tests/test_helpers/cake_package.py PACKAGES key cake_dsa_indexer (0.7.3, rc1) / cake_dsa_indexer_det (rc1) | 0.7.3 (cake_dsa_indexer), 0.7.4rc1 (both keys) | cake.cake_dsa_indexer_det_train | #8936 |
-| (none) | - | flashinfer.cake_dsa_indexer_nondet_train (reserved, not added) | planned |
+|---|---|---|---|
+| `flashinfer.dsa_indexer` (Cake route) | 0.7.3, 0.7.4rc1 | `flashinfer.cake_dsa_indexer_det_train` | #8936 |
+| `flashinfer.dsa_indexer.{dsa_indexer_topk, dsa_indexer_topk_workspace_size}` (Cake route) | 0.7.3, 0.7.4rc1 | `flashinfer.cake_dsa_indexer_det_train.{cake_dsa_indexer_det_train_topk, cake_dsa_indexer_det_train_topk_workspace_size}` | #8936 |
+| `flashinfer.dsa_indexer.dsa_indexer_topk(..., backend="sm120")` | 0.7.4rc1 | `flashinfer.dsa_indexer.dsa_indexer_det_topk(..., backend="sm120")` (`backend=` is now required) | #8936 |
+| `flashinfer.dsa_indexer.{dsa_indexer_det_topk, dsa_indexer_det_topk_workspace_size}` (Cake route) | 0.7.4rc1 | `flashinfer.cake_dsa_indexer_det_train.{cake_dsa_indexer_det_train_topk, cake_dsa_indexer_det_train_topk_workspace_size}` | #8936 |
+| package `flashinfer.experimental.cake_dsa_indexer` | 0.7.3, 0.7.4rc1 | package `flashinfer.experimental.cake.cake_dsa_indexer_det_train` | #8936 |
+| package `flashinfer.experimental.cake_dsa_indexer_det` | 0.7.4rc1 | package `flashinfer.experimental.cake.cake_dsa_indexer_det_train` | #8936 |
+| `flashinfer.experimental.cake_dsa_indexer.cake_backend.{dsa_indexer_topk, dsa_indexer_workspace_size, DSAIndexerRunner, plan_dsa_indexer_topk, prepare_dsa_indexer_topk, validate_dsa_indexer_inputs}` | 0.7.3, 0.7.4rc1 | `flashinfer.experimental.cake.cake_dsa_indexer_det_train.cake_backend.{cake_dsa_indexer_det_train_topk, cake_dsa_indexer_det_train_topk_workspace_size, DSAIndexerDetRunner, plan_dsa_indexer_det_topk, prepare_dsa_indexer_det_topk, validate_dsa_indexer_det_inputs}` | #8936 |
+| `flashinfer.experimental.cake_dsa_indexer_det.cake_backend.{dsa_indexer_det_topk, dsa_indexer_det_workspace_size}` | 0.7.4rc1 | `flashinfer.experimental.cake.cake_dsa_indexer_det_train.cake_backend.{cake_dsa_indexer_det_train_topk, cake_dsa_indexer_det_train_topk_workspace_size}` | #8936 |
+| `flashinfer.experimental.cake_dsa_indexer_det.cake_backend.{dsa_indexer_topk, dsa_indexer_workspace_size, DSAIndexerRunner, plan_dsa_indexer_topk, prepare_dsa_indexer_topk, validate_dsa_indexer_inputs}` | 0.7.4rc1 | `flashinfer.experimental.cake.cake_dsa_indexer_det_train.cake_backend.{cake_dsa_indexer_det_train_topk, cake_dsa_indexer_det_train_topk_workspace_size, DSAIndexerDetRunner, plan_dsa_indexer_det_topk, prepare_dsa_indexer_det_topk, validate_dsa_indexer_det_inputs}` | #8936 |
 
-### DSA sparse attention nondet (cake_dsa_sparse_attention_nondet_train)
+### DSA sparse attention
 
 | Old name | In | New name | PR |
-| --- | --- | --- | --- |
-| flashinfer.dsa_sparse_attention (module) | 0.7.3, 0.7.4rc1 | flashinfer.cake_dsa_sparse_attention_nondet_train (stable, @flashinfer_api) | #8942 |
-| flashinfer.experimental.cake_dsa_train (backend package) | 0.7.3, 0.7.4rc1 | flashinfer.experimental.cake.cake_dsa_sparse_attention_nondet_train (same submodules cake_backend, cake_jit, cake_launch, cake_build) | #8942 |
-| dsa_sparse_attention | 0.7.3, 0.7.4rc1 | cake_dsa_sparse_attention_nondet | #8942 |
-| dsa_sparse_attention_varlen | 0.7.3, 0.7.4rc1 | cake_dsa_sparse_attention_nondet_varlen | #8942 |
-| dsa_sparse_attention_nope | 0.7.3, 0.7.4rc1 | cake_dsa_sparse_attention_nondet_nope | #8942 |
-| dsa_sparse_attention_nope_varlen | 0.7.3, 0.7.4rc1 | cake_dsa_sparse_attention_nondet_nope_varlen | #8942 |
-| backend DSASparseAttentionFunction | 0.7.3, 0.7.4rc1 | CakeDSASparseAttentionNondetFunction (both rope entries; re-exported by the facade) | #8942 |
-| backend DSASparseAttentionNopeFunction | 0.7.3, 0.7.4rc1 | CakeDSASparseAttentionNondetNopeFunction | #8942 |
-| backend DSASparseAttentionNopeVarlenFunction | 0.7.3, 0.7.4rc1 | CakeDSASparseAttentionNondetNopeVarlenFunction | #8942 |
-| (none) | - | flashinfer.cake_dsa_sparse_attention_det_train (reserved, not added) | planned |
+|---|---|---|---|
+| `flashinfer.dsa_sparse_attention` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_dsa_sparse_attention_nondet_train` | #8942 |
+| `flashinfer.dsa_sparse_attention.{dsa_sparse_attention, dsa_sparse_attention_varlen, dsa_sparse_attention_nope, dsa_sparse_attention_nope_varlen}` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_dsa_sparse_attention_nondet_train.{cake_dsa_sparse_attention_nondet, cake_dsa_sparse_attention_nondet_varlen, cake_dsa_sparse_attention_nondet_nope, cake_dsa_sparse_attention_nondet_nope_varlen}` | #8942 |
+| package `flashinfer.experimental.cake_dsa_train` | 0.7.3, 0.7.4rc1 | package `flashinfer.experimental.cake.cake_dsa_sparse_attention_nondet_train` | #8942 |
+| `flashinfer.experimental.cake_dsa_train.cake_backend.{dsa_sparse_attention, dsa_sparse_attention_varlen, dsa_sparse_attention_nope, dsa_sparse_attention_nope_varlen}` | 0.7.3, 0.7.4rc1 | `flashinfer.experimental.cake.cake_dsa_sparse_attention_nondet_train.cake_backend.{cake_dsa_sparse_attention_nondet, cake_dsa_sparse_attention_nondet_varlen, cake_dsa_sparse_attention_nondet_nope, cake_dsa_sparse_attention_nondet_nope_varlen}` | #8942 |
+| `flashinfer.experimental.cake_dsa_train.cake_backend.{DSASparseAttentionFunction, DSASparseAttentionNopeFunction, DSASparseAttentionNopeVarlenFunction}` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_dsa_sparse_attention_nondet_train.{CakeDSASparseAttentionNondetFunction, CakeDSASparseAttentionNondetNopeFunction, CakeDSASparseAttentionNondetNopeVarlenFunction}` | #8942 |
 
-### GQA HD256 nondet (cake_gqa_nondet_train)
+### GQA HD256
 
 | Old name | In | New name | PR |
-| --- | --- | --- | --- |
-| flashinfer.gqa_train (module) | 0.7.3, 0.7.4rc1 | flashinfer.cake_gqa_nondet_train (stable, @flashinfer_api) | #8939 |
-| flashinfer.experimental.cake_gqa_train (backend package) | 0.7.3, 0.7.4rc1 | flashinfer.experimental.cake.cake_gqa_nondet_train (same submodules cake_backend, cake_jit, cake_build) | #8939 |
-| varlen_gqa_attention (facade + backend) | 0.7.3, 0.7.4rc1 | cake_gqa_nondet | #8939 |
-| varlen_gqa_attention_fwd / backend gqa_attention_fwd | 0.7.3, 0.7.4rc1 | cake_gqa_nondet_train_forward | #8939 |
-| varlen_gqa_attention_bwd / backend gqa_attention_bwd | 0.7.3, 0.7.4rc1 | cake_gqa_nondet_train_backward | #8939 |
-| gqa_train_workspace | 0.7.3, 0.7.4rc1 | cake_gqa_nondet_train_workspace | #8939 |
-| gqa_train_workspace_bytes / backend workspace_bytes | 0.7.3, 0.7.4rc1 | cake_gqa_nondet_train_workspace_bytes | #8939 |
-| backend VarlenGQAAttentionFunction | 0.7.3, 0.7.4rc1 | CakeGQANondetFunction (re-exported by the facade) | #8939 |
-| backend Workspace | 0.7.3, 0.7.4rc1 | CakeGQANondetWorkspace (re-exported by the facade) | #8939 |
-| backend DkvAccSource | 0.7.3, 0.7.4rc1 | CakeGQANondetDkvAccSource (re-exported by the facade) | #8939 |
-| (none) | - | flashinfer.cake_gqa_det_train (cake_gqa_det, CakeGQADetFunction; reserved, not added) | planned |
+|---|---|---|---|
+| `flashinfer.gqa_train` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_gqa_nondet_train` | #8939 |
+| `flashinfer.gqa_train.{varlen_gqa_attention, varlen_gqa_attention_fwd, varlen_gqa_attention_bwd, gqa_train_workspace, gqa_train_workspace_bytes}` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_gqa_nondet_train.{cake_gqa_nondet, cake_gqa_nondet_train_forward, cake_gqa_nondet_train_backward, cake_gqa_nondet_train_workspace, cake_gqa_nondet_train_workspace_bytes}` | #8939 |
+| package `flashinfer.experimental.cake_gqa_train` | 0.7.3, 0.7.4rc1 | package `flashinfer.experimental.cake.cake_gqa_nondet_train` | #8939 |
+| `flashinfer.experimental.cake_gqa_train.{varlen_gqa_attention, gqa_attention_fwd, gqa_attention_bwd, workspace_bytes, VarlenGQAAttentionFunction, Workspace, DkvAccSource}` | 0.7.3, 0.7.4rc1 | `flashinfer.experimental.cake.cake_gqa_nondet_train.{cake_gqa_nondet, cake_gqa_nondet_train_forward, cake_gqa_nondet_train_backward, cake_gqa_nondet_train_workspace_bytes, CakeGQANondetFunction, CakeGQANondetWorkspace, CakeGQANondetDkvAccSource}` | #8939 |
+| `flashinfer.experimental.cake_gqa_train.cake_backend.{varlen_gqa_attention, gqa_attention_fwd, gqa_attention_bwd, workspace_bytes}` | 0.7.3, 0.7.4rc1 | `flashinfer.experimental.cake.cake_gqa_nondet_train.cake_backend.{cake_gqa_nondet, cake_gqa_nondet_train_forward, cake_gqa_nondet_train_backward, cake_gqa_nondet_train_workspace_bytes}` | #8939 |
+| `flashinfer.experimental.cake_gqa_train.cake_backend.{VarlenGQAAttentionFunction, Workspace, DkvAccSource}` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_gqa_nondet_train.{CakeGQANondetFunction, CakeGQANondetWorkspace, CakeGQANondetDkvAccSource}` | #8939 |
 
 ## Reserved names
 
-- `flashinfer.cake_mhc_head_nondet_train`
-- `flashinfer.cake_dsa_indexer_nondet_train`
-- `flashinfer.cake_dsa_sparse_attention_det_train`
-- `flashinfer.cake_gqa_det_train`
+- `flashinfer.cake_mhc_head_nondet_train` (`cake_mhc_head_nondet`, `CakeMHCHeadNondetFunction`): mHC head `nondet`, not implemented.
+- `flashinfer.cake_dsa_indexer_nondet_train`: DSA indexer `nondet`, not implemented.
+- `flashinfer.cake_dsa_sparse_attention_det_train`: DSA sparse attention `det`, not implemented.
+- `flashinfer.cake_gqa_det_train` (`cake_gqa_det`, `CakeGQADetFunction`): GQA HD256 `det`, not implemented.
