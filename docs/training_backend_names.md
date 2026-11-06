@@ -201,6 +201,14 @@ dispatchers, and its binding caches take the same two binding-cache settings.
 Each table below takes effect when that family's rename PR merges; until then
 the family's current names stay in effect.
 
+Family rename PRs:
+
+| Family | Mode | PR |
+|---|---|---|
+| LM head + loss | det | #8925 |
+| DSA indexer | det | #8936 |
+| GQA HD256 | nondet | #8939 |
+
 ### GQA HD256: non-deterministic package
 
 | Old | New |
