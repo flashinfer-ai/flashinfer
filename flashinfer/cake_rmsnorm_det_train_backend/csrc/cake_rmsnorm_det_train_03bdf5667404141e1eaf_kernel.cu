@@ -47,17 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define SMEM_PARTIALS_OFF 0
-#define SMEM_PARTIALS_STAGE_BYTES 32
-#define SMEM_PARTIALS_STRIDE 32
-#define SMEM_TOTAL 128
-#define THREADS 128
-#define ROWS_PER_CTA 1
-#define GROUP_THREADS 128
-#define LAUNCH_BOUNDS_THREADS 128
-
 #include <math_constants.h>
 
 
@@ -90,7 +79,7 @@ __device__ __forceinline__ float2 cake_bf16x2_to_f32x2(__nv_bfloat162 v) {
 
 extern "C" {
 
-__global__ __launch_bounds__(LAUNCH_BOUNDS_THREADS) void
+__global__ __launch_bounds__(128) void
 kernel_cake_rmsnorm_det_train_03bdf5667404141e1eaf(__nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ u, __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ y, __nv_bfloat16* __restrict__ h_new, float* __restrict__ r, int T, float eps, long long x_stride_p0, long long u_stride_p0)
 {
     const int tid = threadIdx.x;
@@ -111,18 +100,18 @@ kernel_cake_rmsnorm_det_train_03bdf5667404141e1eaf(__nv_bfloat16* __restrict__ x
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* partials = reinterpret_cast<float*>(smem_raw + 0);
     const int partials_addr = smem + 0;
 
     // === Task calls (declaration order) ===
     int warp_0 = warp;
-    int group = tid / GROUP_THREADS;
-    int gtid = tid - group * GROUP_THREADS;
+    int group = tid / 128;
+    int gtid = tid - group * 128;
     float h_f = 6144.0f;
     int it = 0;
     #pragma unroll 1
-    for (int row0 = bid * ROWS_PER_CTA; row0 < T; row0 += num_bids * ROWS_PER_CTA) {
+    for (int row0 = bid * 1; row0 < T; row0 += num_bids * 1) {
         int row = row0 + group;
         long long row64 = (long long)row;
         long long xbase = row64 * x_stride_p0;
@@ -135,7 +124,7 @@ kernel_cake_rmsnorm_det_train_03bdf5667404141e1eaf(__nv_bfloat16* __restrict__ x
             #pragma unroll
             for (int v = 0; v < 6; v++) {
                 {
-                    const uint4* _vptr_0 = reinterpret_cast<const uint4*>(x + (xbase + (long long)(gtid * 8 + v * (GROUP_THREADS * 8))) + 0);
+                    const uint4* _vptr_0 = reinterpret_cast<const uint4*>(x + (xbase + (long long)(gtid * 8 + v * (128 * 8))) + 0);
                     uint4* _vdst_0 = reinterpret_cast<uint4*>(&x_words[v * 4]);
                     #pragma unroll
                     for (int _blk = 0; _blk < 1; _blk++) {
@@ -144,7 +133,7 @@ kernel_cake_rmsnorm_det_train_03bdf5667404141e1eaf(__nv_bfloat16* __restrict__ x
                     }
                 }
                 {
-                    const uint4* _vptr_1 = reinterpret_cast<const uint4*>(u + (ubase + (long long)(gtid * 8 + v * (GROUP_THREADS * 8))) + 0);
+                    const uint4* _vptr_1 = reinterpret_cast<const uint4*>(u + (ubase + (long long)(gtid * 8 + v * (128 * 8))) + 0);
                     uint4* _vdst_1 = reinterpret_cast<uint4*>(&u_words[v * 4]);
                     #pragma unroll
                     for (int _blk = 0; _blk < 1; _blk++) {
@@ -207,7 +196,7 @@ kernel_cake_rmsnorm_det_train_03bdf5667404141e1eaf(__nv_bfloat16* __restrict__ x
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(hsum[_lp*2 + 6], hsum[_lp*2+1 + 6]));
                     packed_1[_lp + 3] = *(uint32_t*)&_bf2;
                 }
-                reinterpret_cast<int4*>(h_new + (obase + (long long)(gtid * 8 + v_1 * (GROUP_THREADS * 8))))[0] = reinterpret_cast<int4*>(packed_1)[0];
+                reinterpret_cast<int4*>(h_new + (obase + (long long)(gtid * 8 + v_1 * (128 * 8))))[0] = reinterpret_cast<int4*>(packed_1)[0];
             }
         }
         float _warp_reduce_4 = sum_sq;
@@ -238,7 +227,7 @@ kernel_cake_rmsnorm_det_train_03bdf5667404141e1eaf(__nv_bfloat16* __restrict__ x
             for (int v_2 = 0; v_2 < 6; v_2++) {
                 unsigned int wwords[4];
                 {
-                    const uint4* _vptr_6 = reinterpret_cast<const uint4*>(w + (gtid * 8 + v_2 * (GROUP_THREADS * 8)) + 0);
+                    const uint4* _vptr_6 = reinterpret_cast<const uint4*>(w + (gtid * 8 + v_2 * (128 * 8)) + 0);
                     uint4* _vdst_6 = reinterpret_cast<uint4*>(&wwords[0]);
                     #pragma unroll
                     for (int _blk = 0; _blk < 1; _blk++) {
@@ -275,7 +264,7 @@ kernel_cake_rmsnorm_det_train_03bdf5667404141e1eaf(__nv_bfloat16* __restrict__ x
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out[_lp*2 + 6], out[_lp*2+1 + 6]));
                     packed_1_1[_lp + 3] = *(uint32_t*)&_bf2;
                 }
-                reinterpret_cast<int4*>(y + (obase + (long long)(gtid * 8 + v_2 * (GROUP_THREADS * 8))))[0] = reinterpret_cast<int4*>(packed_1_1)[0];
+                reinterpret_cast<int4*>(y + (obase + (long long)(gtid * 8 + v_2 * (128 * 8))))[0] = reinterpret_cast<int4*>(packed_1_1)[0];
             }
         }
     }

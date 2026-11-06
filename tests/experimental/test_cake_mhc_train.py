@@ -15,8 +15,8 @@ limitations under the License.
 
 Backend suite of the Cake four-stream mHC training package with the opt-in
 non-deterministic backward
-(``flashinfer.experimental.cake.cake_mhc_train_backend``; hidden 4096, 4
-streams; SM100 / SM103 / SM107; FlashInfer issue #8068).
+(``flashinfer.experimental.cake.cake_mhc_train_backend``; hidden 4096, 5120
+and 7168 on SM100 / SM103, 4096 on SM107; 4 streams; FlashInfer issue #8068).
 
 The package is standalone: its forward, statistics replay, residual mixing and
 backward prepare run its own copies of the deterministic programs, and
@@ -26,14 +26,19 @@ token-owner pass as its programmatic dependent; it also clears ``dfn`` without
 ``accumulate``) and its atomic column-slab pass, which adds
 the ``dfn`` partial of every (column slab, token chunk) unit into ``dfn`` with
 FP32 reductions and folds ``dscale`` / ``dbase`` in fixed order; there is no
-reduction kernel.  ``dX``, ``dscale`` and ``dbase`` are the deterministic
-package's bits; each ``dfn`` element sums ``P`` per-chunk FP32 partials (``P``
-the chunk count of ``cake_jit.k7_chunks``, at most 32) in an order that may
-change from run to run.  Every entry point takes ``deterministic=False`` (any
-other value is a ``ValueError``, checked without a device by
-``test_cake_mhc_train_rules.py``).  The deterministic package
-(``flashinfer.cake_mhc_det_train_backend``) is the same-input reference
-throughout, never a source of tolerances.  This module checks:
+reduction kernel.  ``dX`` is the deterministic package's bits, ``dscale`` and
+``dbase`` the bits of its per-CTA reduction (inside its group-row bands,
+``BWD_ROW_BANDS``, the deterministic package sums them in another fixed order,
+which this package does not copy: the reference there is its backward with
+those forms off, :func:`_det_backward`); each ``dfn`` element sums ``P``
+per-chunk FP32 partials (``P`` the column slab's chunk count:
+``cake_jit.k7_chunks``, or the two-size geometry where ``cake_jit.lpt_chunks``
+fires; at most 32) in an order that may change from run to run.  Every entry
+point takes ``deterministic=False`` (any other value is a ``ValueError``,
+checked without a device by ``test_cake_mhc_train_rules.py``).  The
+deterministic package (``flashinfer.cake_mhc_det_train_backend``) is the
+same-input reference throughout, never a source of tolerances.  This module
+checks:
 
 * accuracy against the FP64 reference of ``test_cake_mhc_det_train.py`` under
   its bars, on the worst of 5 launches of every draw: BF16 ``dX`` at atol =
@@ -43,17 +48,38 @@ throughout, never a source of tolerances.  This module checks:
   the saturated-sigmoid tail clause and the single-cast cancellation band in
   the deterministic suite's form;
 * against the deterministic backward on the same inputs: ``dX``, ``dscale``,
-  ``dbase`` bitwise; ``|dfn - dfn_det| <= 2 P u (|carried| + 1.02 sum_t |dz'_t|
+  ``dbase`` bitwise (``dscale`` / ``dbase``: its per-CTA reduction's, as
+  above); ``|dfn - dfn_det| <= F u (|carried| + 1.02 sum_t |dz'_t|
   |x_t|)`` per element (``u = 2^-24``; the FP64 absolute-value contraction of
-  the reference bounds the magnitude of every partial sum either order forms;
-  ``2 P`` roundings covers ``P`` per side), the largest ratio printed; run to
-  run, ``dX`` / ``dscale`` / ``dbase`` identical and the ``dfn`` bits that
-  differ counted and printed (never asserted);
+  the reference bounds the magnitude of every partial sum either order forms):
+  ``F = 2 P`` where the column slab runs ``dynr`` or its slab-fastest copy
+  ``dynr_os`` (both sides sum the same per-chunk partials, ``P`` roundings
+  each) and ``F = 2 max(P, P_k7) + 10`` where it runs ``lpt`` or ``lpt_os``
+  (the partials are another partition's; see :func:`_dfn_factor`), the largest
+  ratio printed, also with the unit order forced to each of ``"chunk"`` and
+  ``"slab"`` where the device's route holds that order's records (the board
+  cells of ``BWD_SLAB_ORDER_OVERRIDES`` / ``BWD_SLAB_LPT_OVERRIDES`` emptied,
+  so the forced order holds on every board, the 212-SM sm_107a and 152-SM
+  sm_103a ones too); run to run, ``dX`` / ``dscale`` / ``dbase`` identical
+  and the ``dfn`` bits that differ counted and printed (never asserted);
+* the two-size schedule at forced geometries (``cake_jit.lpt_chunks`` replaced
+  for one token count: one size, one small chunk, several, small chunks past
+  ``T``, empty small chunks, 32 chunks, one round of units, a short odd row,
+  with and without ``accumulate``, and the screen's best geometry at 16263
+  tokens; at hidden 5120 and 7168, where the device's route holds the size's
+  ``lpt`` record, a subset of these and the screen's best geometry at a
+  measured token count of the size), in each unit order whose record the
+  device's route holds (``lpt_os`` at hidden 4096 on every architecture, at
+  5120 and 7168 on sm_100a alone): the ``lpt`` record
+  (``lpt_os`` with the slab-fastest order forced) launches over
+  ``min(SMs, H / 64 x P)`` CTAs, ``dX`` / ``dscale`` / ``dbase`` bitwise the
+  deterministic package's on two launches (fresh outputs, then a poisoned
+  caller workspace), ``dfn`` within the bound, the ticket word back to 0;
 * the forward entry points (forward prepare, statistics replay, residual
   mixing, backward prepare) bitwise the deterministic package's, and every
   launch one of this package's records (the deterministic package launches
   nothing; the backward loads exactly the token-owner record, the atomic fn
-  split and the atomic column slab, in that order);
+  split and the column slab's form of the call, in that order);
 * PyTorch's deterministic algorithms: ``backward_finish`` raises PyTorch's
   alert (``RuntimeError`` before any launch; under ``warn_only`` one
   ``UserWarning`` per call, then the non-deterministic backward runs, never a
@@ -71,7 +97,14 @@ throughout, never a source of tolerances.  This module checks:
   ``retain_graph``, reentrant checkpoints, a backward without the prepare node,
   interleaved connections; a zero row of ``X``, ``fn x 1e3`` logits, a changed
   token count without a rebuild and the argument validation;
-* concurrent launches on several streams; ``T == 0``; the build manifest.
+* concurrent launches on several streams; ``T == 0``; the build manifest;
+* the hidden sizes: the contract cases above that take ``hidden`` run at
+  every size the device's architecture routes (5120 and 7168 on a
+  representative subset of their token counts: small, a middle one and large
+  ones where the token-owner grid reaches its per-SM bound; the forward
+  entry points and the backward's exact outputs also at the 19 benchmark
+  token counts), and the sizes mixed in one process (the host caches keyed by
+  the hidden size) give each size's bits.
 
 The siblings hold the rest of the deterministic suite's organization:
 ``test_cake_mhc_train_graphs.py`` (CUDA Graph capture and replay),
@@ -126,7 +159,11 @@ backward_prepare = functools.partial(
 det_backward_finish = det.cake_mhc_det_train_backward_finish
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
+# HIDDEN / N: the hidden size and flattened token of the cases that take no ``hidden`` (the argument checks run at
+# H 4096 only).
 STREAMS, HIDDEN, N, MAPPING_ROWS = 4, 4096, 16384, 24
+# The package's hidden sizes; a case of a size runs where the device's architecture routes it (:func:`_require_hidden`).
+HIDDEN_SIZES = (4096, 5120, 7168)
 RMS_EPS, HC_EPS, SINKHORN_ITERS = 1e-5, 1e-6, 20
 BF16_ATOL = BF16_RTOL = 1e-2
 FP32_REL_L2_MAX = 1e-5
@@ -153,12 +190,45 @@ TICKET_BYTES = (
 T_ACCURACY = (1, 7, 64, 257, 1024, 2049, 4096, 16263, 32768)
 T_DISTRIBUTION = (1, 2, 3, 7, 63, 129, 255, 1000, 2049)
 T_COMPARE = (1, 7, 64, 65, 257, 1000, 1024, 2049, 4096, 5000, 8192, 14928, 16263, 32768)
+# The token counts of hidden 5120 and 7168 in the cases above: small ones, a middle one (2049: 257 token groups, below
+# the token owner's 2 x SMs at 5120 and above its SM count at 7168) and large ones where the token owner's grid G6 =
+# min(K6_CTAS_PER_SM x SMs, ceil(T / 8)) reaches its bound at both sizes (4096, 16263, 32768).
+T_ACCURACY_NEW = (1, 257, 2049, 16263)
+T_COMPARE_NEW = (1, 7, 65, 1000, 2049, 4096, 16263, 32768)
+# The 19 benchmark token counts of the performance tables.
+T_BENCH = (1024, 1536, 2048, 2304, 2560, 3072, 3584, 4096, 8192, 14928, 15288, 15566, 15590, 16114, 16132, 16164,
+           16263, 32768, 65536)  # fmt: skip
 BF16, F32, F64 = torch.bfloat16, torch.float32, torch.float64
 _PARAMETER = ("dfn", "dscale", "dbase")
 _OUTPUTS = ("dX", "dfn", "dscale", "dbase")
-_EXACT = ("dX", "dscale", "dbase")  # bitwise the deterministic package's
+# Bitwise the deterministic package's (dscale / dbase: its per-CTA reduction's, _det_backward).
+_EXACT = ("dX", "dscale", "dbase")
 _ALERT = "does not have a deterministic implementation"
 SLAB = "cake_mhc_train_bwd_slab_atomic__dynr"
+LPT = "cake_mhc_train_bwd_slab_atomic__lpt"
+# The slab-fastest copies of the column slab's two forms (program keys ``dynr_os`` / ``lpt_os``).
+SLAB_OS = "cake_mhc_train_bwd_slab_atomic__dynr_os"
+LPT_OS = "cake_mhc_train_bwd_slab_atomic__lpt_os"
+# The column-slab record of each program key (the size suffix appended at 5120 and 7168).
+SLAB_RECORDS = {"dynr": SLAB, "lpt": LPT, "dynr_os": SLAB_OS, "lpt_os": LPT_OS}
+# The lpt record's chunk scalars (cake_jit.slab_plan), in kernel-parameter order (P, rpc, p_big, rpc_small).
+LPT_HOST_KEYS = (
+    "lpt_parts",
+    "lpt_rows_per_chunk",
+    "lpt_big_parts",
+    "lpt_small_rows_per_chunk",
+)
+# Forced two-size geometries (P, rpc, p_big, rpc_small) at T = 2049 (33 tiles, the last one token).
+LPT_FORCED = (
+    (7, 320, 7, 320),  # p_big = P: one size, 7 chunks of 5 tiles
+    (5, 448, 4, 320),  # one small chunk: 4 x 7 tiles, then 5 tiles
+    (6, 512, 3, 192),  # several small chunks: 3 x 8 tiles, then 3 x 3 tiles
+    (8, 512, 3, 192),  # small chunks past T: 3 x 8 tiles, then 5 x 3 tiles of which the last 2 hold no token
+    (6, 512, 4, 256),  # a small chunk longer than the tokens left: 4 x 8 tiles leave 1 token, the second small is empty
+    (5, 768, 3, 128),  # big chunks that reach T (12, 12 and 9 tiles): both small chunks are empty
+    (32, 128, 12, 64),  # 32 chunks: 12 x 2 tiles, then 20 x 1 tile of which the last 11 are empty
+    (2, 1280, 1, 832),  # 128 units, one round on every board: 20 tiles, then 13
+)  # fmt: skip
 
 
 def _device() -> torch.device:
@@ -217,14 +287,117 @@ def _sm_count() -> int:
     return loader.sm_count(_device().index)
 
 
-def _parts(T: int) -> int:
-    """``P``: the chunk count of the column-slab pass, the number of partials each ``dfn`` element sums."""
-    parts = loader.host_plan(T, _sm_count(), _arch())["parts"]
-    assert parts == loader.k7_chunks(T, _sm_count())[0] and 1 <= parts <= 32, (
-        T,
-        parts,
-    )
+def _hidden_sizes() -> tuple[int, ...]:
+    """The hidden sizes the device's architecture routes every kind of."""
+    arch = _arch()
+    return tuple(loader.supported_hidden_sizes(arch)) if arch else ()
+
+
+def _require_hidden(hidden: int) -> int:
+    if hidden not in _hidden_sizes():
+        pytest.skip(
+            f"hidden {hidden} has no exported route on {_arch()} "
+            f"(exported hidden sizes: {_hidden_sizes()})"
+        )
+    return hidden
+
+
+def _require_lpt(hidden: int, order: str = "chunk") -> int:
+    """Skip a case of the two-size column slab at ``hidden`` in the unit order ``order`` where the device's
+    ``bwd_finish`` route of the size holds no such record (``lpt``, or ``lpt_os`` for ``"slab"``): where neither the
+    size's table nor a board cell of ``BWD_SLAB_LPT_OVERRIDES`` at the size has a two-size calibration of the
+    architecture (sm_103a at 5120 and 7168), or for ``"slab"`` where neither its ``BWD_SLAB_ORDER`` of the size nor a
+    board cell of ``BWD_SLAB_ORDER_OVERRIDES`` at the size has a ``"slab"`` band; a calibrated size without the
+    record fails (every architecture's route holds ``lpt`` and ``lpt_os`` at hidden 4096)."""
+    _require_hidden(hidden)
+    arch = _arch()
+    name = (LPT_OS if order == "slab" else LPT) + _suffix(hidden)
+    if name not in loader.route_modules(arch, hidden, "bwd_finish"):
+        table = (
+            loader.BWD_SLAB_LPT
+            if hidden == HIDDEN
+            else loader.BWD_SLAB_LPT_HIDDEN[hidden]
+        )
+        entries = [table[arch]] + [
+            cell
+            for (a, _sm, h), cell in loader.BWD_SLAB_LPT_OVERRIDES.items()
+            if (a, h) == (arch, hidden)
+        ]
+        orders = [loader.BWD_SLAB_ORDER[hidden][arch]] + [
+            cell
+            for (a, _sm, h), cell in loader.BWD_SLAB_ORDER_OVERRIDES.items()
+            if (a, h) == (arch, hidden)
+        ]
+        calibrated = any(entry is not None for entry in entries)
+        slab_band = any(o == "slab" for bands in orders for _, o in bands)
+        assert not (calibrated and (order == "chunk" or slab_band)), (
+            f"the {arch} route of hidden {hidden} holds no {name}"
+        )
+        pytest.skip(f"hidden {hidden} has no {name} on {arch}")
+    return hidden
+
+
+def _hidden_cases(Ts: tuple, new_Ts: tuple) -> list:
+    """``(hidden, T)`` parameters: the token counts ``Ts`` at hidden 4096, ``new_Ts`` at 5120 and 7168 (each case
+    skipped where the architecture has no route of its size)."""
+    return [
+        pytest.param(hidden, T, id=f"H{hidden}-{T}")
+        for hidden in HIDDEN_SIZES
+        for T in (Ts if hidden == HIDDEN else new_Ts)
+    ]
+
+
+def _suffix(hidden: int) -> str:
+    """The library suffix of this package's records of ``hidden``: none at 4096, ``__h<H>`` otherwise."""
+    return "" if hidden == HIDDEN else f"__h{hidden}"
+
+
+def _hidden_of(i: dict) -> int:
+    return int(i["X"].shape[2])
+
+
+def _parts(T: int, hidden: int = HIDDEN) -> int:
+    """``P``: the chunk count of the column-slab pass, the number of partials each ``dfn`` element sums (the
+    deterministic backward's chunk count too: both sum the partials of the same chunks)."""
+    parts = loader.host_plan(T, _sm_count(), _arch(), hidden)["parts"]
+    assert parts == loader.k7_chunks(T, _sm_count(), hidden=hidden)[0], (T, hidden)
+    assert parts == det_loader.host_plan(T, _sm_count(), _arch(), hidden)["parts"]
+    assert 1 <= parts <= 32, (T, hidden, parts)
     return parts
+
+
+def _lpt_runs(T: int, hidden: int = HIDDEN) -> bool:
+    """Whether the column slab runs a two-size record of ``hidden`` (``lpt`` or its slab-fastest copy ``lpt_os``) at
+    ``T`` on this device (read at call time, so a replaced ``cake_jit.lpt_chunks`` counts; at hidden 5120 and 7168
+    only where the size's table calibrates the architecture)."""
+    program = loader.bwd_slab_atomic_program(T, _sm_count(), _arch(), hidden)
+    return program.startswith("lpt")
+
+
+def _slab_parts(T: int, hidden: int = HIDDEN) -> int:
+    """The chunk count the column slab launches: ``slab_plan``'s ``lpt_parts`` under ``lpt`` / ``lpt_os``, else
+    :func:`_parts`."""
+    if not _lpt_runs(T, hidden):
+        return _parts(T, hidden)
+    parts = loader.slab_plan(T, _sm_count(), _arch(), hidden)["lpt_parts"]
+    assert 1 <= parts <= 32, (T, parts)
+    return parts
+
+
+def _dfn_factor(T: int, hidden: int = HIDDEN) -> float:
+    """F of the dfn bound F u (|carried| + ABS_SLACK sum_t |dz'_t| |x_t|) at T.  F = 2 P where the column slab runs
+    dynr or dynr_os: both sides sum the same per-chunk partials, at most P roundings each (the unit order changes
+    only the order of the additions).  Under lpt or lpt_os the partials are another partition's.  Every chunk starts
+    on a 64-token tile and each tile's leading-piece product starts a fresh accumulator, so those products are
+    bitwise the same on both sides.  Each side then differs from the exact sum of those products and the trailing
+    terms by its own compensated summation of its tiles (2u), the rounding of acc - comp (u) and the FP32
+    accumulation of the trailing dz' pieces (at most 2^-8 of each term) over 16-tile groups (at most 128 accumulate
+    steps of at most 2u each: about 1.1u).  That is about 4.1u per side.  The cross-chunk roundings are P on this
+    side and at most P_k7 on the deterministic side.  So F = 2 max(P, P_k7) + 10 >= P + P_k7 + 8.2, which also
+    covers two launches of the same lpt partition (2 P)."""
+    if not _lpt_runs(T, hidden):
+        return 2.0 * _parts(T, hidden)
+    return 2.0 * max(_slab_parts(T, hidden), _parts(T, hidden)) + 10.0
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -329,7 +502,7 @@ def _block(
         fnd = fn.detach().to(dtype).requires_grad_(True)
         scaled = scale.detach().to(dtype).requires_grad_(True)
         based = base.detach().to(dtype).requires_grad_(True)
-        u = Xd.reshape(T, N)
+        u = Xd.reshape(T, Xd.shape[1] * Xd.shape[2])
         r = torch.rsqrt(u.square().mean(dim=-1, keepdim=True) + rms_eps)
         z = (u * r) @ fnd.T
         pre, post, C = _coefficients(z, scaled, based, hc_eps, iters)
@@ -394,7 +567,7 @@ def _dzp(i: dict) -> torch.Tensor:
     """The FP64 ``dz' = r dL/dz`` of the reference, ``[T, 24]``: ``dfn = dz'^T X_flat`` sums one product per token.
 
     ``dL/dz`` is the backward of the coefficients alone (sigmoids and Sinkhorn chain) from the per-token gradients
-    of ``pre``, ``post`` and ``C``, so no ``[T, 16384]`` autograd graph is held."""
+    of ``pre``, ``post`` and ``C``, so no ``[T, 4H]`` autograd graph is held."""
     T = i["X"].shape[0]
     rms_eps = i.get("rms_eps", RMS_EPS)
     hc_eps = i.get("hc_eps", HC_EPS)
@@ -407,7 +580,7 @@ def _dzp(i: dict) -> torch.Tensor:
         dY = i["dY"][lo:hi].double()
         dU = i["dU"][lo:hi].double()
         B = i["B"][lo:hi].double()
-        u = X.reshape(hi - lo, N)
+        u = X.reshape(hi - lo, -1)
         r = torch.rsqrt(u.square().mean(dim=-1, keepdim=True) + rms_eps)
         with torch.enable_grad():
             z = ((u * r) @ fn.T).requires_grad_(True)
@@ -426,30 +599,34 @@ def _dzp(i: dict) -> torch.Tensor:
 
 
 def _abs_contraction(i: dict) -> torch.Tensor:
-    """``sum_t |dz'[t, m]| |x[t, k]|`` (FP64 ``[24, 16384]``): the magnitudes of every term of ``dfn``, summed."""
+    """``sum_t |dz'[t, m]| |x[t, k]|`` (FP64 ``[24, 4H]``): the magnitudes of every term of ``dfn``, summed."""
     T = i["X"].shape[0]
     dzp = _dzp(i).abs()
-    A = torch.zeros((MAPPING_ROWS, N), dtype=F64, device=_device())
+    A = torch.zeros(
+        (MAPPING_ROWS, STREAMS * _hidden_of(i)), dtype=F64, device=_device()
+    )
     for lo in range(0, T, BLOCK_TOKENS):
         hi = min(T, lo + BLOCK_TOKENS)
-        A += dzp[lo:hi].T @ i["X"][lo:hi].reshape(hi - lo, N).double().abs()
+        A += dzp[lo:hi].T @ i["X"][lo:hi].reshape(hi - lo, -1).double().abs()
     return A
 
 
 def _dfn_bound(
-    i: dict, parts: int, *, carried: torch.Tensor | None = None
+    i: dict, factor: float, *, carried: torch.Tensor | None = None
 ) -> torch.Tensor:
-    """Per-element bound of ``|dfn_a - dfn_b|`` for two sums of the same per-chunk partials in two orders.
+    """Per-element bound of ``|dfn_a - dfn_b|`` for two sums of per-chunk partials in two orders:
+    ``factor u (|carried| + sum_t |dz'_t| |x_t|)`` (``factor`` = :func:`_dfn_factor` of the token count).
 
     Each side adds ``P`` partials (onto the carried-in value with ``accumulate``) with at most ``P`` FP32 roundings,
     each at most ``u`` times the running sum, whose magnitude never exceeds ``|carried| + sum_j |partial_j| <=
-    |carried| + sum_t |terms_t|``: ``|dfn_a - dfn_b| <= 2 P u (|carried| + sum_t |dz'_t| |x_t|)``.  The bound holds
-    for any partition of the tokens into the ``P`` chunks (``sum_j |partial_j| <= sum_t |terms_t|`` up to the
-    within-chunk rounding, which ``ABS_SLACK`` absorbs); it assumes both sides form the same per-chunk partials."""
+    |carried| + sum_t |terms_t|``: two sums of the same partials differ by at most ``2 P u (|carried| + sum_t |dz'_t|
+    |x_t|)``.  The bound holds for any partition of the tokens into the ``P`` chunks (``sum_j |partial_j| <= sum_t
+    |terms_t|`` up to the within-chunk rounding, which ``ABS_SLACK`` absorbs); where the two sides form the partials
+    of two partitions, ``factor`` adds both partitions' roundings and the within-chunk differences."""
     total = ABS_SLACK * _abs_contraction(i)
     if carried is not None:
         total = total + carried.double().abs()
-    return 2.0 * parts * FP32_UNIT_ROUNDOFF * total
+    return float(factor) * FP32_UNIT_ROUNDOFF * total
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -459,6 +636,7 @@ def _dfn_bound(
 def _make_inputs(
     T: int,
     *,
+    hidden: int = HIDDEN,
     mode: str = "unit",
     seed: int = SEED,
     fn_scale: float = 1.0,
@@ -468,22 +646,23 @@ def _make_inputs(
     ``fn ~ 1e-2 N(0, 1)`` (``1e-4`` in the ``tail`` and ``cancel`` regimes, times ``fn_scale``); ``scale ~ 1 +
     0.1 N``; ``base ~ 0.1 N`` (``base[:8] = 20`` in ``tail``); the tokens of ``zero_rows`` zeroed in ``X``; in
     ``cancel`` ``dU := BF16(-(sum_j C_0j dY_j) / pre_0)`` from the FP64 statistics, so the collapse and
-    residual-mixing contributions of stream 0 to ``dX`` cancel."""
+    residual-mixing contributions of stream 0 to ``dX`` cancel.  ``X`` / ``dY`` are ``[T, 4, hidden]``, ``B`` /
+    ``dU`` ``[T, hidden]`` and ``fn`` ``[24, 4 hidden]``."""
     g = torch.Generator(device=_device()).manual_seed(seed)
 
     def randn(*shape: int, dtype: torch.dtype = F32) -> torch.Tensor:
         return torch.randn(*shape, generator=g, device=_device(), dtype=F32).to(dtype)
 
     fs = {"unit": 1e-2, "tail": 1e-4, "cancel": 1e-4}[mode]
-    X = randn(T, STREAMS, HIDDEN, dtype=BF16)
-    fn = (randn(MAPPING_ROWS, N) * fs).contiguous()
+    X = randn(T, STREAMS, hidden, dtype=BF16)
+    fn = (randn(MAPPING_ROWS, STREAMS * hidden) * fs).contiguous()
     scale = 1.0 + 0.1 * randn(3)
     base = 0.1 * randn(MAPPING_ROWS)
     if mode == "tail":
         base[:8] = 20.0
-    B = randn(T, HIDDEN, dtype=BF16)
-    dY = randn(T, STREAMS, HIDDEN, dtype=BF16)
-    dU = randn(T, HIDDEN, dtype=BF16)
+    B = randn(T, hidden, dtype=BF16)
+    dY = randn(T, STREAMS, hidden, dtype=BF16)
+    dU = randn(T, hidden, dtype=BF16)
     if fn_scale != 1.0:
         fn = (fn * float(fn_scale)).contiguous()
     if zero_rows:
@@ -493,7 +672,7 @@ def _make_inputs(
             dU_new = torch.empty_like(dU)
             for lo in range(0, T, BLOCK_TOKENS):
                 hi = min(T, lo + BLOCK_TOKENS)
-                u = X[lo:hi].double().reshape(hi - lo, N)
+                u = X[lo:hi].double().reshape(hi - lo, -1)
                 r = torch.rsqrt(u.square().mean(dim=-1, keepdim=True) + RMS_EPS)
                 z = (u * r) @ fn.double().T
                 pre, _post, C = _coefficients(z, scale.double(), base.double())
@@ -533,8 +712,51 @@ def _nd_backward(i: dict, prep: dict, **kwargs) -> dict:
     return _backward(backward_finish, i, prep, deterministic=False, **kwargs)
 
 
+def _clear_det_caches() -> None:
+    """Drop the deterministic package's cached host plans, workspace envelopes, layouts and route plans (each binds
+    the token-owner and reduction forms and the parameter region of its token count)."""
+    det_loader.host_plan.cache_clear()
+    det_loader.workspace_bytes_upto.cache_clear()
+    det._LAYOUTS.clear()
+    det._PLANS.clear()
+    det._FAST_ROUTES.clear()
+
+
+@contextlib.contextmanager
+def _det_per_cta():
+    """The deterministic package with its group-row forms off (``cake_jit.bwd_group_rows`` False at every call): the
+    per-CTA token owner and reduction whose ``dscale`` / ``dbase`` this package's column slab reproduces.  Its caches
+    are dropped on entry and on exit, also when the body fails (:func:`_clear_det_caches`)."""
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(det_loader, "bwd_group_rows", lambda *_args, **_kwargs: False)
+        _clear_det_caches()
+        try:
+            yield
+        finally:
+            patch.undo()
+            _clear_det_caches()
+
+
 def _det_backward(i: dict, prep: dict, **kwargs) -> dict:
-    return _backward(det_backward_finish, i, prep, **kwargs)
+    """The deterministic backward of a case.  Where it runs its group-row forms (``cake_jit.bwd_group_rows`` of the
+    case's token count and hidden size on this device: ``BWD_ROW_BANDS``, which this package does not copy), its
+    ``dscale`` and ``dbase`` are overwritten in place with those of its per-CTA run (:func:`_det_per_cta`) on copies
+    of the call's arguments and a workspace of the per-CTA sizing; ``dX`` and ``dfn`` stay the shipped backward's."""
+    T, hidden = i["X"].shape[0], _hidden_of(i)
+    if not det_loader.bwd_group_rows(T, _sm_count(), _arch(), hidden):
+        return _backward(det_backward_finish, i, prep, **kwargs)
+    copies = {
+        k: v.clone() if isinstance(v, torch.Tensor) else v
+        for k, v in kwargs.items()
+        if k != "workspace"
+    }
+    out = _backward(det_backward_finish, i, prep, **kwargs)
+    with _det_per_cta():
+        ws = det.cake_mhc_det_train_backward_workspace(T, _device(), hidden=hidden)
+        per_cta = _backward(det_backward_finish, i, prep, workspace=ws, **copies)
+    for k in ("dscale", "dbase"):
+        out[k].copy_(per_cta[k])
+    return out
 
 
 def _snapshot(out: dict) -> dict:
@@ -552,21 +774,23 @@ def _nd_repeats(i: dict, prep: dict, n: int = REPEATS, **kwargs) -> list[dict]:
     return outs
 
 
-def _poisoned_outputs(T: int) -> dict:
+def _poisoned_outputs(T: int, hidden: int = HIDDEN) -> dict:
     """Caller-provided outputs holding NaN in every element (what the kernels must overwrite)."""
     nan = float("nan")
     return {
-        "dX": torch.full((T, STREAMS, HIDDEN), nan, dtype=BF16, device=_device()),
-        "dfn": torch.full((MAPPING_ROWS, N), nan, dtype=F32, device=_device()),
+        "dX": torch.full((T, STREAMS, hidden), nan, dtype=BF16, device=_device()),
+        "dfn": torch.full(
+            (MAPPING_ROWS, STREAMS * hidden), nan, dtype=F32, device=_device()
+        ),
         "dscale": torch.full((3,), nan, dtype=F32, device=_device()),
         "dbase": torch.full((MAPPING_ROWS,), nan, dtype=F32, device=_device()),
     }
 
 
-def _nd_workspace_exact(T: int) -> torch.Tensor:
-    """A fresh zeroed non-deterministic backward workspace of exactly ``T`` tokens' layout."""
+def _nd_workspace_exact(T: int, hidden: int = HIDDEN) -> torch.Tensor:
+    """A fresh zeroed non-deterministic backward workspace of exactly ``T`` tokens' layout at ``hidden``."""
     return torch.zeros(
-        loader.workspace_bytes("bwd", T, _sm_count(), _arch()),
+        loader.workspace_bytes("bwd", T, _sm_count(), _arch(), hidden),
         dtype=torch.uint8,
         device=_device(),
     )
@@ -642,7 +866,8 @@ def _assert_dfn_within(
 ) -> dict:
     """``|got - want| <= bound`` on every ``dfn`` element; returns the figures (differing elements, the largest
     ulp distance, the largest ratio to the bound)."""
-    assert got.dtype == F32 and tuple(got.shape) == (MAPPING_ROWS, N), label
+    assert got.dtype == F32 and tuple(got.shape) == tuple(want.shape), label
+    assert got.shape[0] == MAPPING_ROWS and got.shape[1] % STREAMS == 0, label
     assert torch.isfinite(got).all(), f"{label}: non-finite dfn"
     diff = (got.double() - want.double()).abs()
     over = int((diff > bound).sum())
@@ -653,7 +878,7 @@ def _assert_dfn_within(
         "max_ratio": ratio,
     }
     assert over == 0, (
-        f"{label}: {over} dfn elements beyond 2 P u (|carried| + sum_t |dz'_t| |x_t|) (largest ratio {ratio:.3e})"
+        f"{label}: {over} dfn elements beyond F u (|carried| + sum_t |dz'_t| |x_t|) (largest ratio {ratio:.3e})"
     )
     return figures
 
@@ -884,17 +1109,18 @@ def _cancellation_band_report(
 # Accuracy against the FP64 reference
 
 
-@pytest.mark.parametrize("T", T_ACCURACY)
-def test_nondeterministic_backward_matches_fp64(T: int) -> None:
+@pytest.mark.parametrize(("hidden", "T"), _hidden_cases(T_ACCURACY, T_ACCURACY_NEW))
+def test_nondeterministic_backward_matches_fp64(hidden: int, T: int) -> None:
     """``deterministic=False`` against the FP64 reference on the worst of REPEATS launches: BF16 ``dX`` with no
     mismatch at atol = rtol = 1e-2 (the launches' ``dX`` bitwise equal); ``dfn`` / ``dscale`` / ``dbase`` rel-L2
     <= 1e-5, ``dscale`` / ``dbase`` per element <= 1e-4."""
-    i = _make_inputs(T)
+    _require_hidden(hidden)
+    i = _make_inputs(T, hidden=hidden)
     prep = _forward(i)
     outs = _nd_repeats(i, prep)
     ref = _oracle(i)
     comp = _oracle(i, dtype=F32, block_tokens=None)
-    label = f"T={T} P={_parts(T)} deterministic=False"
+    label = f"T={T} H={hidden} P={_slab_parts(T, hidden)} deterministic=False"
     _assert_bf16(outs[0]["dX"], ref["dX32"], f"dX {label}")
     for repeat, out in enumerate(outs[1:], start=1):
         _assert_same_bits(out["dX"], outs[0]["dX"], f"dX {label} launch {repeat}")
@@ -991,25 +1217,24 @@ def test_single_cast_cancellation(T: int) -> None:
 # Against the deterministic backward
 
 
-@pytest.mark.parametrize("T", T_COMPARE)
-def test_matches_the_deterministic_backward(T: int) -> None:
-    """On the same inputs as the deterministic backward: ``dX``, ``dscale``, ``dbase`` bitwise; every ``dfn`` element
-    within ``2 P u sum_t |dz'_t| |x_t|``.  The launches alternate between the default workspace with fresh outputs
-    and one caller workspace (non-ticket bytes 0xFF before each launch) with NaN-filled outputs; the largest ratio to
-    the bound and the differing bits are printed."""
-    i = _make_inputs(T, seed=SEED + 1)
+def _matches_the_deterministic_backward(hidden: int, T: int) -> None:
+    """:func:`test_matches_the_deterministic_backward` at ``(hidden, T)`` under the tables read at call time."""
+    program = loader.bwd_slab_atomic_program(T, _sm_count(), _arch(), hidden)
+    i = _make_inputs(T, hidden=hidden, seed=SEED + 1)
     prep = _forward(i)
     want = _snapshot(_det_backward(i, prep))
-    parts = _parts(T)
-    bound = _dfn_bound(i, parts)
-    ws = pkg.cake_mhc_train_backward_workspace(T, _device(), deterministic=False)
+    parts, lpt = _slab_parts(T, hidden), _lpt_runs(T, hidden)
+    bound = _dfn_bound(i, _dfn_factor(T, hidden))
+    ws = pkg.cake_mhc_train_backward_workspace(
+        T, _device(), hidden=hidden, deterministic=False
+    )
     figures = []
     for repeat in range(REPEATS):
-        label = f"T={T} P={parts} launch {repeat}"
+        label = f"T={T} H={hidden} {program} P={parts} launch {repeat}"
         kwargs = {}
         if repeat % 2:
             _poison_workspace(ws)
-            kwargs = {"workspace": ws, **_poisoned_outputs(T)}
+            kwargs = {"workspace": ws, **_poisoned_outputs(T, hidden)}
         got = _snapshot(_nd_backward(i, prep, **kwargs))
         if repeat % 2:
             _assert_ticket_zero(ws, label)
@@ -1020,29 +1245,91 @@ def test_matches_the_deterministic_backward(T: int) -> None:
             )
         )
     print(
-        f"dfn T={T} P={parts}: vs the deterministic backward over {REPEATS} launches: largest |nd - det| / bound "
-        f"{max(f['max_ratio'] for f in figures):.3e}, elements differing up to {max(f['differ'] for f in figures)} "
-        f"of {MAPPING_ROWS * N} (largest {max(f['max_ulp'] for f in figures)} ulp)"
+        f"dfn T={T} H={hidden} {program} P={parts}: vs the deterministic backward over {REPEATS} launches: largest "
+        f"|nd - det| / bound {max(f['max_ratio'] for f in figures):.3e}, elements differing up to "
+        f"{max(f['differ'] for f in figures)} of {want['dfn'].numel()} "
+        f"(largest {max(f['max_ulp'] for f in figures)} ulp)"
         + (
             f"; P = 1: equal to the deterministic dfn on every launch: {all(f['max_ulp'] == 0 for f in figures)}"
-            if parts == 1
+            if parts == 1 and not lpt
             else ""
         ),
         flush=True,
     )
 
 
-@pytest.mark.parametrize("T", (2049, 16263))
-def test_run_to_run(T: int) -> None:
+@pytest.mark.parametrize(("hidden", "T"), _hidden_cases(T_COMPARE, T_COMPARE_NEW))
+def test_matches_the_deterministic_backward(hidden: int, T: int) -> None:
+    """On the same inputs as the deterministic backward: ``dX``, ``dscale``, ``dbase`` bitwise (``dscale`` / ``dbase``
+    against its per-CTA reduction where it runs its group-row forms, :func:`_det_backward`); every ``dfn`` element
+    within ``F u sum_t |dz'_t| |x_t|`` (``F`` = :func:`_dfn_factor`: ``2 P`` under ``dynr`` / ``dynr_os``,
+    ``2 max(P, P_k7) + 10`` where the column slab runs ``lpt`` / ``lpt_os`` at ``T`` on this device).  The launches
+    alternate between the default workspace with fresh outputs and one caller workspace (non-ticket bytes 0xFF before
+    each launch) with NaN-filled outputs; the largest ratio to the bound and the differing bits are printed."""
+    _require_hidden(hidden)
+    _matches_the_deterministic_backward(hidden, T)
+
+
+@pytest.fixture
+def forced_order():
+    """``force(hidden, order)``: the board cells of ``cake_jit.BWD_SLAB_ORDER_OVERRIDES`` and
+    ``cake_jit.BWD_SLAB_LPT_OVERRIDES`` emptied (a board cell would replace the forced order, as on sm_107a with 212
+    SMs at hidden 4096 and on sm_103a with 152 SMs at 7168, and its calibration the architecture's) and
+    ``cake_jit.BWD_SLAB_ORDER`` of the device's architecture at ``hidden`` set to ``order`` (``"chunk"`` or
+    ``"slab"``) at every token count, with the package's route-plan caches cleared on entry, after each edit and after
+    the restore (a plan binds the selection of its token count)."""
+    with pytest.MonkeyPatch.context() as patch:
+
+        def force(hidden: int, order: str) -> None:
+            patch.setattr(loader, "BWD_SLAB_ORDER_OVERRIDES", {})
+            patch.setattr(loader, "BWD_SLAB_LPT_OVERRIDES", {})
+            patch.setitem(loader.BWD_SLAB_ORDER[hidden], _arch(), ((None, order),))
+            pkg._PLANS.clear()
+            pkg._FAST_ROUTES.clear()
+
+        pkg._PLANS.clear()
+        pkg._FAST_ROUTES.clear()
+        try:
+            yield force
+        finally:
+            patch.undo()
+            pkg._PLANS.clear()
+            pkg._FAST_ROUTES.clear()
+
+
+@pytest.mark.parametrize("order", ("chunk", "slab"))
+@pytest.mark.parametrize(("hidden", "T"), _hidden_cases((2049, 16263), (2049, 16263)))
+def test_matches_the_deterministic_backward_in_each_unit_order(
+    forced_order, hidden: int, T: int, order: str
+) -> None:
+    """:func:`test_matches_the_deterministic_backward` with the size's unit order forced to ``order`` at every token
+    count (the board cells emptied: :func:`forced_order`): the chunk-order records (``dynr`` / ``lpt``) and the
+    slab-fastest ones (``dynr_os`` / ``lpt_os``) both run where the device's route holds them, whichever order the
+    tables of record pick on this device (skipped where the route holds no record of the order)."""
+    _require_hidden(hidden)
+    forced_order(hidden, order)
+    program = loader.bwd_slab_atomic_program(T, _sm_count(), _arch(), hidden)
+    assert program.endswith("_os") == (order == "slab"), program
+    name = SLAB_RECORDS[program] + _suffix(hidden)
+    if name not in loader.route_modules(_arch(), hidden, "bwd_finish"):
+        pytest.skip(f"hidden {hidden} has no {name} on {_arch()}")
+    _matches_the_deterministic_backward(hidden, T)
+
+
+@pytest.mark.parametrize(("hidden", "T"), _hidden_cases((2049, 16263), (2049, 16263)))
+def test_run_to_run(hidden: int, T: int) -> None:
     """Repeated launches on the same inputs: ``dX``, ``dscale``, ``dbase`` identical bits; the ``dfn`` elements and
     bits that differ from the first launch are counted and printed (the summation order of the atomic reductions may
     change; never asserted either way)."""
-    i = _make_inputs(T, seed=SEED + 2)
+    _require_hidden(hidden)
+    i = _make_inputs(T, hidden=hidden, seed=SEED + 2)
     prep = _forward(i)
     outs = _nd_repeats(i, prep, n=RUN_TO_RUN_REPEATS)
     tallies = []
     for repeat, out in enumerate(outs[1:], start=1):
-        _assert_exact_outputs(out, outs[0], f"T={T} launch {repeat} vs launch 0")
+        _assert_exact_outputs(
+            out, outs[0], f"T={T} H={hidden} launch {repeat} vs launch 0"
+        )
         tallies.append(
             (
                 _differing(out["dfn"], outs[0]["dfn"]),
@@ -1051,8 +1338,167 @@ def test_run_to_run(T: int) -> None:
             )
         )
     print(
-        f"dfn T={T} P={_parts(T)} run to run (launches 1..{RUN_TO_RUN_REPEATS - 1} vs launch 0; elements, bits, "
-        f"largest ulp distance): {tallies}",
+        f"dfn T={T} H={hidden} P={_slab_parts(T, hidden)} run to run (launches 1..{RUN_TO_RUN_REPEATS - 1} vs launch "
+        f"0; elements, bits, largest ulp distance): {tallies}",
+        flush=True,
+    )
+
+
+@pytest.fixture
+def forced_lpt():
+    """``forced[T] = (P, rpc, p_big, rpc_small)``: the geometry ``cake_jit.lpt_chunks`` returns at ``T`` instead of
+    the host rule's at every hidden size (every other token count keeps the rule), with the package's route-plan
+    caches cleared on entry and exit (a plan binds the selection and the chunk scalars of its token count)."""
+    forced: dict[int, tuple[int, int, int, int]] = {}
+    rule = loader.lpt_chunks
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(
+            loader,
+            "lpt_chunks",
+            lambda T, sm, arch, hidden=HIDDEN: (
+                forced[T] if T in forced else rule(T, sm, arch, hidden=hidden)
+            ),
+        )
+        pkg._PLANS.clear()
+        pkg._FAST_ROUTES.clear()
+        try:
+            yield forced
+        finally:
+            pkg._PLANS.clear()
+            pkg._FAST_ROUTES.clear()
+
+
+# (hidden, T, forced geometry or None for the screen's best geometry on this device, accumulate)
+_FORCED_CASES = (
+    *((HIDDEN, 2049, geometry, False) for geometry in LPT_FORCED),
+    (HIDDEN, 257, (3, 128, 2, 64), False),  # 5 tiles: 2 x 2 tiles, then one token
+    (HIDDEN, 2049, LPT_FORCED[2], True),
+    (HIDDEN, 2049, LPT_FORCED[6], True),
+    (HIDDEN, 16263, None, False),
+    # hidden 5120 and 7168 (80 / 112 column slabs): one small chunk, an empty small chunk, the short odd row, 32
+    # chunks under accumulate, and the screen's best geometry at a token count the size's kernel-level pairs measured
+    *(
+        (hidden, T, geometry, accumulate)
+        for hidden in HIDDEN_SIZES[1:]
+        for T, geometry, accumulate in (
+            (2049, LPT_FORCED[1], False),
+            (2049, LPT_FORCED[4], False),
+            (257, (3, 128, 2, 64), False),
+            (2049, LPT_FORCED[6], True),
+        )
+    ),
+    (5120, 15566, None, False),
+    (7168, 15288, None, False),
+)
+
+
+def _forced_id(case: tuple) -> str:
+    hidden, T, geometry, accumulate = case
+    shape = "screen" if geometry is None else "x".join(str(v) for v in geometry)
+    return f"H{hidden}-T{T}-{shape}" + ("-accumulate" if accumulate else "")
+
+
+@pytest.mark.parametrize("order", ("chunk", "slab"))
+@pytest.mark.parametrize(
+    ("hidden", "T", "geometry", "accumulate"),
+    _FORCED_CASES,
+    ids=[_forced_id(case) for case in _FORCED_CASES],
+)
+def test_two_size_schedule_at_forced_geometries(
+    forced_lpt,
+    forced_order,
+    monkeypatch,
+    hidden: int,
+    T: int,
+    geometry,
+    accumulate: bool,
+    order: str,
+) -> None:
+    """The column slab's ``lpt`` record of ``hidden`` (under ``order="slab"`` its slab-fastest copy ``lpt_os``; where
+    the device's route holds the record, see :func:`_require_lpt`), with the size's unit order forced to ``order`` at
+    every token count, at a forced geometry (``geometry`` None: the screen's best two-size geometry of the size at
+    ``T`` on this device, ``_lpt_plan`` at ``o_tiles = 1``, also where the table of record is ``None``): the
+    selection's column slab is that record, the only column slab ``backward_finish`` loads, launched over
+    ``min(SMs, H / 64 x P)`` CTAs with ``slab_plan`` = the geometry.  On two launches -- fresh outputs on the default
+    workspace, then NaN outputs (the carried-in values under ``accumulate``) on a caller workspace whose non-ticket
+    bytes are 0xFF -- ``dX``, ``dscale``, ``dbase`` are bitwise the deterministic backward's (:func:`_det_backward`),
+    every ``dfn`` element lies within ``_dfn_factor(T, hidden) u (|carried| + sum_t |dz'_t| |x_t|)`` and the ticket
+    region is zero; the largest ratio to the bound is printed."""
+    _require_lpt(hidden, order)
+    arch, sm, index = _arch(), _sm_count(), _device().index
+    forced_order(hidden, order)
+    suffix = "_os" if order == "slab" else ""
+    slab = SLAB_RECORDS["dynr" + suffix] + _suffix(hidden)
+    lpt = SLAB_RECORDS["lpt" + suffix] + _suffix(hidden)
+    if geometry is None:
+        plan = loader._lpt_plan(T, sm, 1.0, hidden=hidden)
+        assert plan is not None, (T, sm, hidden)
+        geometry = plan[2]
+    forced_lpt[T] = geometry
+    P = geometry[0]
+    assert loader.slab_plan(T, sm, arch, hidden) == dict(
+        zip(LPT_HOST_KEYS, geometry, strict=True)
+    )
+    selection = loader.selected_modules(arch, hidden, "bwd_finish", rows=T, sm_count=sm)
+    assert selection[-1] == lpt and slab not in selection, selection
+    assert loader.launch_grid(loader.MODULES[lpt], T, device_index=index) == (
+        min(sm, hidden // loader.SLAB_D * P),
+        1,
+        1,
+    )
+    n = STREAMS * hidden
+    i = _make_inputs(T, hidden=hidden, seed=SEED + 71)
+    prep = _forward(i)
+    carried = None
+    if accumulate:
+        g = torch.Generator(device=_device()).manual_seed(SEED + 72)
+        carried = {
+            "dfn": torch.randn((MAPPING_ROWS, n), generator=g, device=_device()) * 1e-3,
+            "dscale": torch.randn((3,), generator=g, device=_device()) * 1e-3,
+            "dbase": torch.randn((MAPPING_ROWS,), generator=g, device=_device()) * 1e-3,
+        }
+
+    def outputs(poisoned: bool) -> dict:
+        if carried is not None:
+            return {k: v.clone() for k, v in carried.items()}
+        return _poisoned_outputs(T, hidden) if poisoned else {}
+
+    want = _snapshot(_det_backward(i, prep, accumulate=accumulate, **outputs(False)))
+    factor = _dfn_factor(T, hidden)
+    bound = _dfn_bound(i, factor, carried=None if carried is None else carried["dfn"])
+    ws = pkg.cake_mhc_train_backward_workspace(
+        T, _device(), hidden=hidden, deterministic=False
+    )
+    loaded: list[str] = []
+    load = loader.load
+
+    def recording_load(name: str, record_arch: str):
+        loaded.append(name)
+        return load(name, record_arch)
+
+    monkeypatch.setattr(loader, "load", recording_load)
+    figures = []
+    for launch in range(2):
+        label = f"T={T} H={hidden} {order} order lpt {geometry} accumulate={accumulate} launch {launch}"
+        kwargs = {"accumulate": accumulate, **outputs(launch == 1)}
+        if launch:
+            _poison_workspace(ws)
+            kwargs["workspace"] = ws
+        got = _snapshot(_nd_backward(i, prep, **kwargs))
+        if launch:
+            _assert_ticket_zero(ws, label)
+        _assert_exact_outputs(got, want, f"{label} vs deterministic")
+        figures.append(
+            _assert_dfn_within(
+                got["dfn"], want["dfn"], bound, f"dfn {label} vs deterministic"
+            )
+        )
+    assert loaded == list(selection), loaded
+    print(
+        f"dfn T={T} H={hidden} {order} order lpt {geometry} (P_k7 {_parts(T, hidden)}, F {factor:g}) "
+        f"accumulate={accumulate}: "
+        f"largest |nd - det| / bound over two launches {max(f['max_ratio'] for f in figures):.3e}, elements "
+        f"differing up to {max(f['differ'] for f in figures)} of {MAPPING_ROWS * n}",
         flush=True,
     )
 
@@ -1071,56 +1517,119 @@ def _grads(leaves: list) -> list:
     return [t.grad for t in leaves]
 
 
-@pytest.mark.parametrize("T", (1, 7, 129, 2049, 16263))
-def test_forward_entry_points_are_the_deterministic_programs(T: int) -> None:
+def _forward_outputs(i: dict, **workspace) -> dict:
+    """The forward entry points and the backward prepare of this package on ``i`` (``workspace``: the forward
+    workspace keyword of the forward prepare and the statistics replay)."""
+    X, fn, scale, base = (i[k] for k in ("X", "fn", "scale", "base"))
+    U, stats = forward_prepare(X, fn, scale, base, **workspace)
+    dB, gstats = backward_prepare(i["dY"], i["B"], X, stats)
+    return {
+        "U": U,
+        "stats": stats,
+        "replay": forward_stats(X, fn, scale, base, **workspace),
+        "Y": forward_finish(X, i["B"], stats),
+        "dB": dB,
+        "gstats": gstats,
+    }
+
+
+def _reference_forward_outputs(i: dict) -> dict:
+    """:func:`_forward_outputs` of the deterministic package (its default workspaces)."""
+    X, fn, scale, base = (i[k] for k in ("X", "fn", "scale", "base"))
+    U, stats = det.cake_mhc_det_train_forward_prepare(X, fn, scale, base)
+    dB, gstats = det.cake_mhc_det_train_backward_prepare(i["dY"], i["B"], X, stats)
+    return {
+        "U": U,
+        "stats": stats,
+        "replay": det.cake_mhc_det_train_forward_stats(X, fn, scale, base),
+        "Y": det.cake_mhc_det_train_forward_finish(X, i["B"], stats),
+        "dB": dB,
+        "gstats": gstats,
+    }
+
+
+@pytest.mark.parametrize(
+    ("hidden", "T"), _hidden_cases((1, 7, 129, 2049, 16263), (1, 7, 129, 2049, 16263))
+)
+def test_forward_entry_points_are_the_deterministic_programs(
+    hidden: int, T: int
+) -> None:
     """The package's forward prepare, statistics replay, residual mixing and backward prepare (its copies of the
     deterministic programs) give the deterministic package's bits, on the default workspaces and on a caller forward
     workspace of this package (the deterministic forward layout: the same size, zero-initialized)."""
-    i = _make_inputs(T, seed=SEED + 12)
-    X, fn, scale, base = (i[k] for k in ("X", "fn", "scale", "base"))
-    U_det, stats_det = det.cake_mhc_det_train_forward_prepare(X, fn, scale, base)
-    dB_det, gstats_det = det.cake_mhc_det_train_backward_prepare(
-        i["dY"], i["B"], X, stats_det
-    )
-    want = _snapshot(
-        {
-            "U": U_det,
-            "stats": stats_det,
-            "replay": det.cake_mhc_det_train_forward_stats(X, fn, scale, base),
-            "Y": det.cake_mhc_det_train_forward_finish(X, i["B"], stats_det),
-            "dB": dB_det,
-            "gstats": gstats_det,
-        }
-    )
+    _require_hidden(hidden)
+    i = _make_inputs(T, hidden=hidden, seed=SEED + 12)
+    want = _snapshot(_reference_forward_outputs(i))
     nbytes = pkg.cake_mhc_train_forward_workspace_bytes(
-        T, _device(), deterministic=False
+        T, _device(), hidden=hidden, deterministic=False
     )
-    assert nbytes == det.cake_mhc_det_train_forward_workspace_bytes(T, _device())
-    ws = pkg.cake_mhc_train_forward_workspace(T, _device(), deterministic=False)
+    assert nbytes == det.cake_mhc_det_train_forward_workspace_bytes(
+        T, _device(), hidden=hidden
+    )
+    ws = pkg.cake_mhc_train_forward_workspace(
+        T, _device(), hidden=hidden, deterministic=False
+    )
     assert ws.numel() == nbytes and int(torch.count_nonzero(ws)) == 0
     for workspace in (None, ws):
-        U, stats = forward_prepare(X, fn, scale, base, workspace=workspace)
-        dB, gstats = backward_prepare(i["dY"], i["B"], X, stats)
-        got = {
-            "U": U,
-            "stats": stats,
-            "replay": forward_stats(X, fn, scale, base, workspace=workspace),
-            "Y": forward_finish(X, i["B"], stats),
-            "dB": dB,
-            "gstats": gstats,
-        }
+        got = _forward_outputs(i, workspace=workspace)
         for k, v in want.items():
             _assert_same_bits(
-                got[k], v, f"{k} T={T} caller workspace={workspace is not None}"
+                got[k],
+                v,
+                f"{k} T={T} H={hidden} caller workspace={workspace is not None}",
             )
 
 
-def test_launches_are_this_packages_records(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("hidden", "T"),
+    [pytest.param(h, T, id=f"H{h}-{T}") for h in HIDDEN_SIZES[1:] for T in T_BENCH],
+)
+def test_benchmark_token_counts_at_the_new_hidden_sizes(hidden: int, T: int) -> None:
+    """At hidden 5120 and 7168 on the 19 benchmark token counts (their copies of the deterministic programs are
+    renders of their own; H 4096 is the cases above): the forward entry points and the backward prepare give the
+    deterministic package's bits, and one ``backward_finish`` (the column slab's form of the call: ``lpt`` where the
+    size's table fires on this device; on B200 at the token counts its kernel-level pairs measured, H 5120 15566 /
+    15590 / 16263 and H 7168 15288, and at those the screen picks that no pair has measured yet, 1024 at both sizes
+    and 2048 / 3072 at 7168; else ``dynr``; each as its ``_os`` copy where the size's ``BWD_SLAB_ORDER`` band is
+    ``"slab"``) gives its ``dX`` / ``dscale`` / ``dbase`` bits and a ``dfn`` within the bound of
+    :func:`test_matches_the_deterministic_backward`, the ticket region of a caller workspace back to zero."""
+    _require_hidden(hidden)
+    i = _make_inputs(T, hidden=hidden, seed=SEED + 14)
+    want = _snapshot(_reference_forward_outputs(i))
+    got = _snapshot(_forward_outputs(i))
+    label = f"T={T} H={hidden}"
+    for k, v in want.items():
+        _assert_same_bits(got[k], v, f"{k} {label}")
+    prep = {"stats": got["stats"], "gstats": got["gstats"]}
+    want = _snapshot(_det_backward(i, prep))
+    ws = pkg.cake_mhc_train_backward_workspace(
+        T, _device(), hidden=hidden, deterministic=False
+    )
+    got = _snapshot(_nd_backward(i, prep, workspace=ws))
+    _assert_ticket_zero(ws, label)
+    _assert_exact_outputs(got, want, f"{label} vs deterministic")
+    figures = _assert_dfn_within(
+        got["dfn"],
+        want["dfn"],
+        _dfn_bound(i, _dfn_factor(T, hidden)),
+        f"dfn {label} vs deterministic",
+    )
+    print(
+        f"dfn {label} P={_slab_parts(T, hidden)} lpt={_lpt_runs(T, hidden)}: largest |nd - det| / bound "
+        f"{figures['max_ratio']:.3e}",
+        flush=True,
+    )
+
+
+@pytest.mark.parametrize("hidden", HIDDEN_SIZES, ids=lambda h: f"H{h}")
+def test_launches_are_this_packages_records(monkeypatch, hidden: int) -> None:
     """Every module the package's entry points load (both forwards, the residual mixing, both backward passes, the
     autograd connection with the statistics saved and replayed, a run-time Sinkhorn count) is one of this package's
-    records for the local architecture, and the deterministic package launches nothing (its launch paths refuse);
-    ``backward_finish`` loads exactly its ``bwd_finish`` selection, in launch order: one token-owner record, the
-    architecture's atomic fn split and the atomic column slab."""
+    records for the local architecture and the call's hidden size, and the deterministic package launches nothing
+    (its launch paths refuse); ``backward_finish`` loads exactly its ``bwd_finish`` selection, in launch order: one
+    token-owner record, the atomic fn split of the architecture and size and the column slab's form of the call
+    (``bwd_slab_atomic_program``: the size's ``dynr``, ``lpt``, ``dynr_os`` or ``lpt_os`` record)."""
+    _require_hidden(hidden)
 
     def refuse(*_args, **_kwargs):
         raise AssertionError("the deterministic package launched a kernel")
@@ -1139,19 +1648,25 @@ def test_launches_are_this_packages_records(monkeypatch) -> None:
 
     monkeypatch.setattr(loader, "load", recording_load)
     T, arch, sm = 2049, _arch(), _sm_count()
-    i = _make_inputs(T, seed=SEED + 13)
+    i = _make_inputs(T, hidden=hidden, seed=SEED + 13)
     prep = _forward(i)
     forward_stats(i["X"], i["fn"], i["scale"], i["base"])
     forward_finish(i["X"], i["B"], prep["stats"])
     start = len(loaded)
     out = _nd_backward(i, prep)
-    selection = loader.selected_modules(arch, HIDDEN, "bwd_finish", rows=T, sm_count=sm)
+    selection = loader.selected_modules(arch, hidden, "bwd_finish", rows=T, sm_count=sm)
     assert [name for name, _ in loaded[start:]] == list(selection), loaded[start:]
     assert loader.MODULES[selection[0]]["role"] == "bwd_token", selection
     assert selection[1] == (
-        f"cake_mhc_train_fn_split_atomic__{loader.fn_split_program(arch, 1)}_dep"
+        f"cake_mhc_train_fn_split_atomic__{loader.fn_split_program(arch, 1, hidden)}_dep"
+        + _suffix(hidden)
     )
-    assert selection[-1] == SLAB and len(selection) == 3, selection
+    program = loader.bwd_slab_atomic_program(T, sm, arch, hidden)
+    assert selection[-1] == SLAB_RECORDS[program] + _suffix(hidden), (
+        program,
+        selection,
+    )
+    assert len(selection) == 3, selection
     assert all(torch.isfinite(v).all() for v in out.values())
     for save_stats in (True, False):
         leaves = _leaves(i)
@@ -1166,7 +1681,8 @@ def test_launches_are_this_packages_records(monkeypatch) -> None:
     for name, record_arch in loaded:
         assert name in loader.MODULES and name.startswith("cake_mhc_train_"), name
         assert record_arch == arch and arch in loader.MODULES[name]["arches"], name
-    assert SLAB in {name for name, _ in loaded}
+        assert loader.MODULES[name]["hidden"] == hidden, name
+    assert selection[-1] in {name for name, _ in loaded}
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -1200,7 +1716,7 @@ def test_policy_strict_alerts_the_direct_backward_only(
     want_prep = _snapshot(_forward(i))
     want_replay = forward_stats(i["X"], i["fn"], i["scale"], i["base"]).clone()
     want = _snapshot(_det_backward(i, want_prep))
-    bound = _dfn_bound(i, _parts(T))
+    bound = _dfn_bound(i, _dfn_factor(T))
     ws = pkg.cake_mhc_train_backward_workspace(T, _device(), deterministic=False)
     deterministic_algorithms(True)
     with warnings.catch_warnings():
@@ -1249,7 +1765,7 @@ def test_policy_warn_only_warns_once_and_runs_the_nondeterministic_backward(
     i = _make_inputs(T, seed=SEED + 7)
     prep = _forward(i)
     want = _snapshot(_det_backward(i, prep))
-    bound = _dfn_bound(i, _parts(T))
+    bound = _dfn_bound(i, _dfn_factor(T))
     det_sized = det.cake_mhc_det_train_backward_workspace(T, _device())
     nd_sized = _nd_workspace_exact(T)
     with pytest.raises(ValueError, match="workspace holds"):
@@ -1335,25 +1851,27 @@ def test_policy_prepare_node_alerts_its_backward(
 # accumulate
 
 
-@pytest.mark.parametrize("T", (1000, 4096))
-def test_accumulate_four_times(T: int) -> None:
+@pytest.mark.parametrize(("hidden", "T"), _hidden_cases((1000, 4096), (4096,)))
+def test_accumulate_four_times(hidden: int, T: int) -> None:
     """Four consecutive ``accumulate=True`` passes on four input sets into caller buffers that start from non-zero
     values, beside the deterministic chain on the same values: the returned tensors are the caller's buffers; ``dX``,
     ``dscale``, ``dbase`` bitwise at every step; ``dfn`` within the sum of the per-pass bounds (each with the larger
     carried-in magnitude of the two chains)."""
+    _require_hidden(hidden)
+    n = STREAMS * hidden
     g = torch.Generator(device=_device()).manual_seed(SEED + 7919)
     carried = {
-        "dfn": torch.randn((MAPPING_ROWS, N), generator=g, device=_device()) * 1e-3,
+        "dfn": torch.randn((MAPPING_ROWS, n), generator=g, device=_device()) * 1e-3,
         "dscale": torch.randn((3,), generator=g, device=_device()) * 1e-3,
         "dbase": torch.randn((MAPPING_ROWS,), generator=g, device=_device()) * 1e-3,
     }
     acc_nd = {k: v.clone() for k, v in carried.items()}
     acc_det = {k: v.clone() for k, v in carried.items()}
-    parts = _parts(T)
-    bound = torch.zeros((MAPPING_ROWS, N), dtype=F64, device=_device())
+    parts, factor = _slab_parts(T, hidden), _dfn_factor(T, hidden)
+    bound = torch.zeros((MAPPING_ROWS, n), dtype=F64, device=_device())
     figures = []
     for step in range(4):
-        i = _make_inputs(T, seed=SEED + 100 + step)
+        i = _make_inputs(T, hidden=hidden, seed=SEED + 100 + step)
         prep = _forward(i)
         before = torch.maximum(
             acc_nd["dfn"].double().abs(), acc_det["dfn"].double().abs()
@@ -1362,15 +1880,15 @@ def test_accumulate_four_times(T: int) -> None:
         want = _det_backward(i, prep, accumulate=True, **acc_det)
         for k in _PARAMETER:
             assert got[k] is acc_nd[k] and want[k] is acc_det[k], (k, step)
-        bound = bound + _dfn_bound(i, parts, carried=before)
-        label = f"accumulate x4 T={T} P={parts} step {step}"
+        bound = bound + _dfn_bound(i, factor, carried=before)
+        label = f"accumulate x4 T={T} H={hidden} P={parts} step {step}"
         _assert_exact_outputs(got, want, label)
         figures.append(
             _assert_dfn_within(acc_nd["dfn"], acc_det["dfn"], bound, f"dfn {label}")
         )
         del i, prep
     print(
-        f"dfn accumulate x4 T={T} P={parts}: largest |nd - det| / bound per step "
+        f"dfn accumulate x4 T={T} H={hidden} P={parts}: largest |nd - det| / bound per step "
         f"{[round(f['max_ratio'], 4) for f in figures]}, elements differing {[f['differ'] for f in figures]}",
         flush=True,
     )
@@ -1446,7 +1964,8 @@ def test_autograd_matches_the_deterministic_gradients(
     (Y_det.float() * i["dY"].float()).sum().backward()
     assert record["U"].grad is not None and record["U"].grad.dtype == BF16
     bound = _dfn_bound(
-        {**i, "B": record["B"].detach(), "dU": record["U"].grad.detach()}, _parts(T)
+        {**i, "B": record["B"].detach(), "dU": record["U"].grad.detach()},
+        _dfn_factor(T),
     )
     connection = _connection(
         _nd_prepare,
@@ -1501,7 +2020,7 @@ def _connection_bound(i: dict, T: int) -> torch.Tensor:
     U, stats = forward_prepare(i["X"], i["fn"], i["scale"], i["base"])
     B = (U.float() + i["B"].float()).to(BF16)
     dB, _gstats = backward_prepare(i["dY"], B, i["X"], stats)
-    return _dfn_bound({**i, "B": B, "dU": dB}, _parts(T))
+    return _dfn_bound({**i, "B": B, "dU": dB}, _dfn_factor(T, _hidden_of(i)))
 
 
 def _assert_grads(got, want, bound: torch.Tensor, label: str) -> dict:
@@ -1550,12 +2069,13 @@ def _assert_kept(
     assert kept == expected, f"{kept - expected} bytes kept alive after {what}"
 
 
-@pytest.mark.parametrize("T", (129, 2049))
-def test_checkpoint_replay(T: int) -> None:
+@pytest.mark.parametrize(("hidden", "T"), _hidden_cases((129, 2049), (129, 2049)))
+def test_checkpoint_replay(hidden: int, T: int) -> None:
     """``forward_stats`` is bitwise the ``forward_prepare`` record, and the ``deterministic=False`` gradients with the
     statistics saved (``save_stats=True``) and replayed in the backward (``False``, the checkpoint path) agree with
     each other and with the deterministic gradients: ``X`` / ``scale`` / ``base`` bitwise, ``fn`` within the bound."""
-    i = _make_inputs(T, seed=SEED + 11)
+    _require_hidden(hidden)
+    i = _make_inputs(T, hidden=hidden, seed=SEED + 11)
     _U, stats = forward_prepare(i["X"], i["fn"], i["scale"], i["base"])
     replay = forward_stats(i["X"], i["fn"], i["scale"], i["base"])
     assert torch.equal(stats, replay), (
@@ -1569,10 +2089,16 @@ def test_checkpoint_replay(T: int) -> None:
     }
     for save_stats, got in grads.items():
         _assert_grads(
-            got, want, bound, f"T={T} save_stats={save_stats} vs deterministic"
+            got,
+            want,
+            bound,
+            f"T={T} H={hidden} save_stats={save_stats} vs deterministic",
         )
     _assert_grads(
-        grads[False], grads[True], bound, f"T={T} replayed vs saved statistics"
+        grads[False],
+        grads[True],
+        bound,
+        f"T={T} H={hidden} replayed vs saved statistics",
     )
 
 
@@ -1689,7 +2215,7 @@ def _chain_bounds(X: torch.Tensor, params: list, dY: torch.Tensor, T: int) -> li
             "dY": g,
             "dU": dB,
         }
-        bounds[c] = _dfn_bound(case, _parts(T))
+        bounds[c] = _dfn_bound(case, _dfn_factor(T))
         g = det_backward_finish(
             xs[c], g, dB, us[c], fn, scale, base, records[c], gstats
         )[0]
@@ -1759,7 +2285,7 @@ def test_repeated_backward_with_retain_graph(T: int, save_stats: bool) -> None:
 
     bound = _connection_bound(i, T)
     # The U-only pass: dY and the gradient statistics are zero, dU is the loss gradient.
-    bound_u = _dfn_bound({**i, "dY": torch.zeros_like(i["dY"])}, _parts(T))
+    bound_u = _dfn_bound({**i, "dY": torch.zeros_like(i["dY"])}, _dfn_factor(T))
     leaves = _leaves(i)
     U, Y = graph(leaves)
     first = torch.autograd.grad(Y, leaves, i["dY"], retain_graph=True)
@@ -1891,7 +2417,7 @@ def _check_case(T: int, *, seed: int = SEED, zero_rows=()) -> None:
     prep = _forward(i)
     outs = _nd_repeats(i, prep)
     want = _snapshot(_det_backward(i, prep))
-    bound = _dfn_bound(i, _parts(T))
+    bound = _dfn_bound(i, _dfn_factor(T))
     label = f"T={T}" + (f" zero_rows={tuple(zero_rows)}" if zero_rows else "")
     for repeat, out in enumerate(outs):
         _assert_exact_outputs(out, want, f"{label} launch {repeat}")
@@ -1969,8 +2495,9 @@ def test_argument_validation() -> None:
     an output is a ``ValueError``, as are out-of-range epsilons and Sinkhorn counts (a count above
     ``SINKHORN_ITERS_MAX`` a ``NotImplementedError``) and ``accumulate=True`` without its buffers; the workspace must
     be a 1-D, 256-byte aligned ``uint8`` CUDA tensor of the non-deterministic size (a non-tensor a ``TypeError``).
-    ``B`` is optional: ``None`` gives the same ``dX`` / ``dscale`` / ``dbase`` bits and a ``dfn`` within the
-    bound."""
+    An operand or output of another hidden size than ``X``, and a call whose hidden size the package does not list
+    (6144) or the architecture does not route (5120 and 7168 on sm_107a), is a ``ValueError``.  ``B`` is optional:
+    ``None`` gives the same ``dX`` / ``dscale`` / ``dbase`` bits and a ``dfn`` within the bound."""
     T = 8
     i = _make_inputs(T, seed=SEED + 9)
     X, fn, scale, base = i["X"], i["fn"], i["scale"], i["base"]
@@ -2021,9 +2548,28 @@ def test_argument_validation() -> None:
         {"workspace": torch.zeros(2, nbytes, dtype=torch.uint8, device=dev)},
         {"workspace": shifted},
         {"workspace": torch.zeros(256, dtype=torch.uint8, device=dev)},
+        # operands and outputs of another hidden size than X's
+        {"fn": torch.zeros(MAPPING_ROWS, STREAMS * 5120, dtype=F32, device=dev)},
+        {"dY": torch.zeros(T, STREAMS, 7168, dtype=BF16, device=dev)},
+        {"dU": torch.zeros(T, 5120, dtype=BF16, device=dev)},
+        {"B": torch.zeros(T, 7168, dtype=BF16, device=dev)},
+        {"dX": torch.empty(T, STREAMS, 5120, dtype=BF16, device=dev)},
+        {"dfn": torch.empty(MAPPING_ROWS, STREAMS * 7168, dtype=F32, device=dev)},
     ):
         with pytest.raises(ValueError):
             call(**change)
+    # every operand of a hidden size the package does not list, or that the architecture does not route
+    for hidden in (6144, *(h for h in HIDDEN_SIZES if h not in _hidden_sizes())):
+        j = _make_inputs(T, hidden=hidden, seed=SEED + 10)
+        with pytest.raises(ValueError):
+            backward_finish(
+                j["X"], j["dY"], j["dU"], j["B"], j["fn"], j["scale"], j["base"], prep["stats"], prep["gstats"],
+                deterministic=False,
+            )  # fmt: skip
+        with pytest.raises(ValueError):
+            forward_prepare(j["X"], j["fn"], j["scale"], j["base"])
+        with pytest.raises(ValueError):
+            _nd_prepare(j["X"], j["fn"], j["scale"], j["base"])
     with pytest.raises(NotImplementedError):
         call(sinkhorn_iters=det.SINKHORN_ITERS_MAX + 1)
     with pytest.raises(TypeError):
@@ -2035,7 +2581,7 @@ def test_argument_validation() -> None:
     without_b = _snapshot(dict(zip(_OUTPUTS, call(B=None), strict=True)))
     _assert_exact_outputs(without_b, with_b, "B=None")
     _assert_dfn_within(
-        without_b["dfn"], with_b["dfn"], _dfn_bound(i, _parts(T)), "dfn B=None"
+        without_b["dfn"], with_b["dfn"], _dfn_bound(i, _dfn_factor(T)), "dfn B=None"
     )
     with pytest.raises(ValueError):
         _nd_prepare(X.float(), fn, scale, base)
@@ -2072,7 +2618,7 @@ def test_concurrent_streams(Ts: tuple) -> None:
                 "ws": ws,
                 "serial": serial,
                 "want": want,
-                "bound": _dfn_bound(i, _parts(T)),
+                "bound": _dfn_bound(i, _dfn_factor(T)),
                 "outs": _poisoned_outputs(T),
             }
         )
@@ -2111,29 +2657,228 @@ def test_concurrent_streams(Ts: tuple) -> None:
 
 
 # ----------------------------------------------------------------------------------------------------------------
+# Hidden sizes mixed in one process (test_cake_mhc_det_train.py's cases: the host caches -- layouts, default
+# workspaces and their views, caller-workspace views, launch plans, fast routes, route checks -- are keyed by the
+# hidden size; one keyed by the token count alone would serve a size's views or plan to another size's call)
+
+_MIXED_T = (129, 2049)
+_WORKSPACE_MODES = ("default", "per_hidden", "shared")
+
+
+def _mixed_hidden_sizes() -> tuple[int, ...]:
+    """Every routed hidden size, for the cases that mix sizes in one process (4096 and 7168 at least)."""
+    sizes = _hidden_sizes()
+    if not {4096, 7168} <= set(sizes):
+        pytest.skip(
+            f"mixing hidden sizes needs 4096 and 7168 on one device; {_arch()} exports {sizes}"
+        )
+    return sizes
+
+
+def _mixed_workspaces(sizes: tuple[int, ...], T: int, mode: str) -> dict:
+    """``{H: (forward workspace, backward workspace)}`` of a mixed-size case: ``default`` (``None``: the per-device
+    default buffers), ``per_hidden`` (one caller buffer per size, ``hidden=H``) or ``shared`` (one zeroed caller
+    buffer per kind serving every size, as large as the largest size's request)."""
+    dev = _device()
+    if mode == "default":
+        return {H: (None, None) for H in sizes}
+    nbytes = {
+        "fwd": pkg.cake_mhc_train_forward_workspace_bytes,
+        "bwd": pkg.cake_mhc_train_backward_workspace_bytes,
+    }
+    if mode == "per_hidden":
+        return {
+            H: tuple(
+                torch.zeros(
+                    size(T, dev, hidden=H, deterministic=False),
+                    dtype=torch.uint8,
+                    device=dev,
+                )
+                for size in nbytes.values()
+            )
+            for H in sizes
+        }
+    assert mode == "shared", mode
+    shared = tuple(
+        torch.zeros(
+            max(size(T, dev, hidden=H, deterministic=False) for H in sizes),
+            dtype=torch.uint8,
+            device=dev,
+        )
+        for size in nbytes.values()
+    )
+    return {H: shared for H in sizes}
+
+
+def _staged_run(cases: dict, order: tuple[int, ...], ws: dict) -> dict:
+    """This package's entry points of every case stage by stage: each stage is issued for every hidden size (in
+    ``order``, the next stage in the reverse order) before the next stage, so consecutive calls switch the hidden size
+    at one token count.  ``replay`` is the ``forward_stats`` record of each size."""
+    out: dict[int, dict] = {H: {} for H in order}
+    back = tuple(reversed(order))
+    for H in order:
+        i = cases[H]
+        out[H]["U"], out[H]["stats"] = forward_prepare(
+            i["X"], i["fn"], i["scale"], i["base"], workspace=ws[H][0]
+        )
+    for H in back:
+        i = cases[H]
+        out[H]["replay"] = forward_stats(
+            i["X"], i["fn"], i["scale"], i["base"], workspace=ws[H][0]
+        )
+    for H in order:
+        i = cases[H]
+        out[H]["Y"] = forward_finish(i["X"], i["B"], out[H]["stats"])
+    for H in back:
+        i, o = cases[H], out[H]
+        o["dB"], o["gstats"] = backward_prepare(i["dY"], i["B"], i["X"], o["stats"])
+    for H in order:
+        i, o = cases[H], out[H]
+        o["dX"], o["dfn"], o["dscale"], o["dbase"] = backward_finish(
+            i["X"], i["dY"], i["dU"], i["B"], i["fn"], i["scale"], i["base"], o["stats"], o["gstats"],
+            workspace=ws[H][1], deterministic=False,
+        )  # fmt: skip
+    return {H: _snapshot(o) for H, o in out.items()}
+
+
+def _assert_mixed_case(got: dict, want: dict, bound: torch.Tensor, what: str) -> None:
+    """Every output of ``want`` but ``dfn`` bitwise; ``dfn`` within the bound."""
+    for k, v in want.items():
+        if k == "dfn":
+            _assert_dfn_within(got[k], v, bound, f"dfn {what}")
+        else:
+            _assert_same_bits(got[k], v, f"{k} {what}")
+
+
+@pytest.mark.parametrize("T", _MIXED_T)
+@pytest.mark.parametrize("workspaces", _WORKSPACE_MODES)
+def test_mixed_hidden_sizes_same_token_count(T: int, workspaces: str) -> None:
+    """Calls of every routed hidden size at the same token count, interleaved stage by stage through the direct
+    entry points (default workspaces, one caller workspace per size, one caller workspace shared by the sizes), in
+    two rounds of opposite size order: ``forward_stats`` is bitwise the ``forward_prepare`` record, every output but
+    ``dfn`` is bitwise the sizes run one after the other and the deterministic package's on the same inputs, ``dfn``
+    within the bound of both, and a caller backward workspace keeps its ticket region zero."""
+    sizes = _mixed_hidden_sizes()
+    cases = {H: _make_inputs(T, hidden=H, seed=SEED + 71 + H) for H in sizes}
+    ws = _mixed_workspaces(sizes, T, workspaces)
+    bounds = {H: _dfn_bound(cases[H], _dfn_factor(T, H)) for H in sizes}
+    alone = {H: _staged_run({H: cases[H]}, (H,), ws)[H] for H in sizes}
+    reference = {}
+    for H in sizes:
+        i = cases[H]
+        want = _reference_forward_outputs(i)
+        want.update(
+            _det_backward(i, {"stats": want["stats"], "gstats": want["gstats"]})
+        )
+        reference[H] = _snapshot(want)
+    for rnd, order in enumerate((sizes, tuple(reversed(sizes)))):
+        got = _staged_run(cases, order, ws)
+        for H in sizes:
+            what = (
+                f"T={T} H={H} mixed with {sizes} ({workspaces} workspaces, round {rnd})"
+            )
+            assert torch.equal(got[H]["replay"], got[H]["stats"]), (
+                f"{what}: forward_stats is not bitwise the forward_prepare record"
+            )
+            _assert_mixed_case(got[H], alone[H], bounds[H], f"{what} vs alone")
+            _assert_mixed_case(
+                got[H], reference[H], bounds[H], f"{what} vs deterministic"
+            )
+            if ws[H][1] is not None:
+                _assert_ticket_zero(ws[H][1], what)
+        del got
+
+
+@pytest.mark.parametrize("T", _MIXED_T)
+@pytest.mark.parametrize("save_stats", (True, False))
+@pytest.mark.parametrize("workspaces", _WORKSPACE_MODES)
+def test_mixed_hidden_sizes_autograd(T: int, save_stats: bool, workspaces: str) -> None:
+    """The ``deterministic=False`` autograd connections with every routed hidden size at the same token count: the
+    prepares of every size, then the finishes in the reverse order, then one backward over the sum of the losses.
+    Each size's ``U`` and ``Y`` are bitwise those of the sizes run one after the other, its gradients equal theirs
+    and the deterministic connection's (``X`` / ``scale`` / ``base`` bitwise, ``fn`` within the bound)."""
+    sizes = _mixed_hidden_sizes()
+    cases = {H: _make_inputs(T, hidden=H, seed=SEED + 81 + H) for H in sizes}
+    ws = _mixed_workspaces(sizes, T, workspaces)
+    bounds = {H: _connection_bound(cases[H], T) for H in sizes}
+
+    def prepare(H: int) -> tuple:
+        leaves = _leaves(cases[H])
+        U, handle = _nd_prepare(
+            *leaves,
+            save_stats=save_stats,
+            workspace=ws[H][0],
+            backward_workspace=ws[H][1],
+        )
+        return leaves, U, handle
+
+    def finish(H: int, connection: tuple) -> torch.Tensor:
+        leaves, U, handle = connection
+        return _nd_finish(
+            leaves[0], (U.float() + cases[H]["B"].float()).to(BF16), handle
+        )
+
+    def loss(H: int, Y: torch.Tensor) -> torch.Tensor:
+        return (Y.float() * cases[H]["dY"].float()).sum()
+
+    alone = {}
+    for H in sizes:
+        connection = prepare(H)
+        Y = finish(H, connection)
+        loss(H, Y).backward()
+        alone[H] = (
+            connection[1].detach().clone(),
+            Y.detach().clone(),
+            _grads(connection[0]),
+        )
+        del connection, Y
+    reference = {
+        H: _plain_grads(cases[H], DET_API, save_stats=save_stats) for H in sizes
+    }
+    connections = {H: prepare(H) for H in sizes}
+    Ys = {H: finish(H, connections[H]) for H in reversed(sizes)}
+    torch.stack([loss(H, Ys[H]) for H in sizes]).sum().backward()
+    for H in sizes:
+        what = f"T={T} H={H} mixed with {sizes} ({save_stats=}, {workspaces=})"
+        U_alone, Y_alone, grads_alone = alone[H]
+        _assert_same_bits(connections[H][1].detach(), U_alone, f"U {what}")
+        _assert_same_bits(Ys[H].detach(), Y_alone, f"Y {what}")
+        grads = _grads(connections[H][0])
+        _assert_grads(grads, grads_alone, bounds[H], f"{what} vs alone")
+        _assert_grads(grads, reference[H], bounds[H], f"{what} vs deterministic")
+
+
+# ----------------------------------------------------------------------------------------------------------------
 # Zero tokens, the build manifest
 
 
-def test_zero_tokens_launch_nothing() -> None:
+@pytest.mark.parametrize("hidden", HIDDEN_SIZES, ids=lambda h: f"H{h}")
+def test_zero_tokens_launch_nothing(hidden: int) -> None:
     """``T == 0`` behaves as the deterministic package: ``dX`` is empty; the parameter gradients are zeroed without
     ``accumulate`` (also caller buffers holding other values) and left untouched with it; the workspace needs no
     bytes and an empty one is accepted; PyTorch's deterministic mode raises no alert (nothing is reduced)."""
-    i = _make_inputs(0)
+    _require_hidden(hidden)
+    i = _make_inputs(0, hidden=hidden)
     prep = _forward(i)
     want = _det_backward(i, prep)
-    empty_ws = pkg.cake_mhc_train_backward_workspace(0, _device(), deterministic=False)
+    empty_ws = pkg.cake_mhc_train_backward_workspace(
+        0, _device(), hidden=hidden, deterministic=False
+    )
     assert empty_ws.numel() == 0
     for workspace in (None, empty_ws):
         got = _nd_backward(i, prep, workspace=workspace)
         assert (
-            tuple(got["dX"].shape) == (0, STREAMS, HIDDEN) and got["dX"].dtype == BF16
+            tuple(got["dX"].shape) == (0, STREAMS, hidden) and got["dX"].dtype == BF16
         )
+        assert tuple(got["dfn"].shape) == (MAPPING_ROWS, STREAMS * hidden)
         for k in _PARAMETER:
             assert torch.equal(got[k], torch.zeros_like(got[k])), k
-            _assert_same_bits(got[k], want[k], f"{k} T=0")
+            _assert_same_bits(got[k], want[k], f"{k} T=0 H={hidden}")
     for accumulate in (False, True):
         buffers = {
-            "dfn": torch.full((MAPPING_ROWS, N), 3.0, dtype=F32, device=_device()),
+            "dfn": torch.full(
+                (MAPPING_ROWS, STREAMS * hidden), 3.0, dtype=F32, device=_device()
+            ),
             "dscale": torch.full((3,), 5.0, dtype=F32, device=_device()),
             "dbase": torch.full((MAPPING_ROWS,), 7.0, dtype=F32, device=_device()),
         }
@@ -2152,7 +2897,7 @@ def test_zero_tokens_launch_nothing() -> None:
         with warnings.catch_warnings():
             warnings.simplefilter("error")
             got = _nd_backward(i, prep)
-        assert tuple(got["dX"].shape) == (0, STREAMS, HIDDEN)
+        assert tuple(got["dX"].shape) == (0, STREAMS, hidden)
     finally:
         torch.use_deterministic_algorithms(prev[0], warn_only=prev[1])
 

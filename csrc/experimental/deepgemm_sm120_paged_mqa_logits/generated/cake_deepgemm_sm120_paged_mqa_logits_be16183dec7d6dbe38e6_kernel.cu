@@ -49,34 +49,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_Q_PIPE_STAGES 2
-#define NUM_KV_PIPE_STAGES 4
-#define NUM_IT_PIPE_STAGES 8
-#define NUM_CG_PIPE_STAGES 1
-#define SMEM_SMEM_Q_OFF 1024
-#define SMEM_SMEM_Q_STAGE_BYTES 8192
-#define SMEM_SMEM_Q_STRIDE 8192
-#define SMEM_SMEM_W_OFF 17408
-#define SMEM_SMEM_W_STAGE_BYTES 256
-#define SMEM_SMEM_W_STRIDE 1024
-#define SMEM_SMEM_KV_G0_OFF 19456
-#define SMEM_SMEM_KV_G0_STAGE_BYTES 8192
-#define SMEM_SMEM_KV_G0_STRIDE 8192
-#define SMEM_SMEM_KV_G1_OFF 52224
-#define SMEM_SMEM_KV_G1_STAGE_BYTES 8192
-#define SMEM_SMEM_KV_G1_STRIDE 8192
-#define SMEM_SMEM_SC_G0_OFF 84992
-#define SMEM_SMEM_SC_G0_STAGE_BYTES 256
-#define SMEM_SMEM_SC_G0_STRIDE 1024
-#define SMEM_SMEM_SC_G1_OFF 89088
-#define SMEM_SMEM_SC_G1_STAGE_BYTES 256
-#define SMEM_SMEM_SC_G1_STRIDE 1024
-#define SMEM_SMEM_IT_OFF 93184
-#define SMEM_SMEM_IT_STAGE_BYTES 256
-#define SMEM_SMEM_IT_STRIDE 256
-#define SMEM_TOTAL 93440
-#define THREADS 384
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -188,7 +160,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_be16183dec7d6dbe38e6(const __grid_co
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     uint8_t* smem_q = reinterpret_cast<uint8_t*>(smem_raw + 1024);
     const int smem_q_addr = smem + 1024;
     float* smem_w = reinterpret_cast<float*>(smem_raw + 17408);
@@ -203,11 +175,12 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_be16183dec7d6dbe38e6(const __grid_co
     const int smem_sc_g1_addr = smem + 89088;
     int* smem_it = reinterpret_cast<int*>(smem_raw + 93184);
     const int smem_it_addr = smem + 93184;
-    if (tid == 0) { asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(schedule_meta + (bid * 2)))); }
+
+    // Kernel setup ops
+    if (tid == 0) { asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(schedule_meta + bid * 2))); }
     if (tid == 0) { asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(schedule_meta + (bid * 2 + 3)))); }
 
-    // Mbarrier init (10 pipeline groups, 0 ordered-sequence groups, 38 barriers)
-    // Mbarriers at smem_raw[0..304)
+    // Mbarrier init (38 barriers at smem_raw[0..304))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -654,19 +627,19 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_be16183dec7d6dbe38e6(const __grid_co
                             partial0_6 += __fmaf_rn(r0_1, w0_1, r1_1 * w1_1);
                             partial1_7 += __fmaf_rn(r2_1, w0_1, r3_1 * w1_1);
                         }
-                        float v0_8 = partial0_6 * scale0;
-                        float v1_9 = partial1_7 * scale1;
-                        float _shfl_xor_sync_4 = __shfl_xor_sync(0xFFFFFFFF, v0_8, 1);
-                        v0_8 = v0_8 + _shfl_xor_sync_4;
-                        float _shfl_xor_sync_5 = __shfl_xor_sync(0xFFFFFFFF, v1_9, 1);
-                        v1_9 = v1_9 + _shfl_xor_sync_5;
-                        float _shfl_xor_sync_6 = __shfl_xor_sync(0xFFFFFFFF, v0_8, 2);
-                        v0_8 = v0_8 + _shfl_xor_sync_6;
-                        float _shfl_xor_sync_7 = __shfl_xor_sync(0xFFFFFFFF, v1_9, 2);
-                        v1_9 = v1_9 + _shfl_xor_sync_7;
-                        int out0_10 = kv_offset + logits_stride + quad;
-                        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(Logits + out0_10)), "f"(v0_8), "r"((unsigned int)(tq == 0)));
-                        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(Logits + (out0_10 + 8))), "f"(v1_9), "r"((unsigned int)(tq == 0)));
+                        float v0_2 = partial0_6 * scale0;
+                        float v1_3 = partial1_7 * scale1;
+                        float _shfl_xor_sync_4 = __shfl_xor_sync(0xFFFFFFFF, v0_2, 1);
+                        v0_2 = v0_2 + _shfl_xor_sync_4;
+                        float _shfl_xor_sync_5 = __shfl_xor_sync(0xFFFFFFFF, v1_3, 1);
+                        v1_3 = v1_3 + _shfl_xor_sync_5;
+                        float _shfl_xor_sync_6 = __shfl_xor_sync(0xFFFFFFFF, v0_2, 2);
+                        v0_2 = v0_2 + _shfl_xor_sync_6;
+                        float _shfl_xor_sync_7 = __shfl_xor_sync(0xFFFFFFFF, v1_3, 2);
+                        v1_3 = v1_3 + _shfl_xor_sync_7;
+                        int out0_4 = kv_offset + logits_stride + quad;
+                        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(Logits + out0_4)), "f"(v0_2), "r"((unsigned int)(tq == 0)));
+                        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(Logits + (out0_4 + 8))), "f"(v1_3), "r"((unsigned int)(tq == 0)));
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         mbarrier_arrive(kv_empty_g0_addr + (kv_stage_m) * 8);
                         kv_stage_m += 1;
@@ -1016,19 +989,19 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_be16183dec7d6dbe38e6(const __grid_co
                             partial0_6_1 += __fmaf_rn(r0_3, w0_3, r1_3 * w1_3);
                             partial1_7_1 += __fmaf_rn(r2_3, w0_3, r3_3 * w1_3);
                         }
-                        float v0_8_1 = partial0_6_1 * scale0_1;
-                        float v1_9_1 = partial1_7_1 * scale1_1;
-                        float _shfl_xor_sync_12 = __shfl_xor_sync(0xFFFFFFFF, v0_8_1, 1);
-                        v0_8_1 = v0_8_1 + _shfl_xor_sync_12;
-                        float _shfl_xor_sync_13 = __shfl_xor_sync(0xFFFFFFFF, v1_9_1, 1);
-                        v1_9_1 = v1_9_1 + _shfl_xor_sync_13;
-                        float _shfl_xor_sync_14 = __shfl_xor_sync(0xFFFFFFFF, v0_8_1, 2);
-                        v0_8_1 = v0_8_1 + _shfl_xor_sync_14;
-                        float _shfl_xor_sync_15 = __shfl_xor_sync(0xFFFFFFFF, v1_9_1, 2);
-                        v1_9_1 = v1_9_1 + _shfl_xor_sync_15;
-                        int out0_10_1 = kv_offset_1 + logits_stride + quad;
-                        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(Logits + out0_10_1)), "f"(v0_8_1), "r"((unsigned int)(tq == 0)));
-                        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(Logits + (out0_10_1 + 8))), "f"(v1_9_1), "r"((unsigned int)(tq == 0)));
+                        float v0_2_1 = partial0_6_1 * scale0_1;
+                        float v1_3_1 = partial1_7_1 * scale1_1;
+                        float _shfl_xor_sync_12 = __shfl_xor_sync(0xFFFFFFFF, v0_2_1, 1);
+                        v0_2_1 = v0_2_1 + _shfl_xor_sync_12;
+                        float _shfl_xor_sync_13 = __shfl_xor_sync(0xFFFFFFFF, v1_3_1, 1);
+                        v1_3_1 = v1_3_1 + _shfl_xor_sync_13;
+                        float _shfl_xor_sync_14 = __shfl_xor_sync(0xFFFFFFFF, v0_2_1, 2);
+                        v0_2_1 = v0_2_1 + _shfl_xor_sync_14;
+                        float _shfl_xor_sync_15 = __shfl_xor_sync(0xFFFFFFFF, v1_3_1, 2);
+                        v1_3_1 = v1_3_1 + _shfl_xor_sync_15;
+                        int out0_4_1 = kv_offset_1 + logits_stride + quad;
+                        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(Logits + out0_4_1)), "f"(v0_2_1), "r"((unsigned int)(tq == 0)));
+                        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(Logits + (out0_4_1 + 8))), "f"(v1_3_1), "r"((unsigned int)(tq == 0)));
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         mbarrier_arrive(kv_empty_g0_addr + (kv_stage_m) * 8);
                         kv_stage_m += 1;
@@ -1391,18 +1364,18 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_be16183dec7d6dbe38e6(const __grid_co
                             partial0_2 += __fmaf_rn(r0_4, w0_4, r1_4 * w1_4);
                             partial1_2 += __fmaf_rn(r2_4, w0_4, r3_4 * w1_4);
                         }
-                        float v0_2 = partial0_2 * scale0_2;
+                        float v0_3 = partial0_2 * scale0_2;
                         float v1_2 = partial1_2 * scale1_2;
-                        float _shfl_xor_sync_0_1 = __shfl_xor_sync(0xFFFFFFFF, v0_2, 1);
-                        v0_2 = v0_2 + _shfl_xor_sync_0_1;
+                        float _shfl_xor_sync_0_1 = __shfl_xor_sync(0xFFFFFFFF, v0_3, 1);
+                        v0_3 = v0_3 + _shfl_xor_sync_0_1;
                         float _shfl_xor_sync_1_1 = __shfl_xor_sync(0xFFFFFFFF, v1_2, 1);
                         v1_2 = v1_2 + _shfl_xor_sync_1_1;
-                        float _shfl_xor_sync_2_1 = __shfl_xor_sync(0xFFFFFFFF, v0_2, 2);
-                        v0_2 = v0_2 + _shfl_xor_sync_2_1;
+                        float _shfl_xor_sync_2_1 = __shfl_xor_sync(0xFFFFFFFF, v0_3, 2);
+                        v0_3 = v0_3 + _shfl_xor_sync_2_1;
                         float _shfl_xor_sync_3_1 = __shfl_xor_sync(0xFFFFFFFF, v1_2, 2);
                         v1_2 = v1_2 + _shfl_xor_sync_3_1;
                         int out0_2 = kv_offset_2 + quad_1;
-                        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(Logits + out0_2)), "f"(v0_2), "r"((unsigned int)(tq_1 == 0)));
+                        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(Logits + out0_2)), "f"(v0_3), "r"((unsigned int)(tq_1 == 0)));
                         asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(Logits + (out0_2 + 8))), "f"(v1_2), "r"((unsigned int)(tq_1 == 0)));
                         float partial0_6_2 = 0.0f;
                         float partial1_7_2 = 0.0f;
@@ -1434,19 +1407,19 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_be16183dec7d6dbe38e6(const __grid_co
                             partial0_6_2 += __fmaf_rn(r0_5, w0_5, r1_5 * w1_5);
                             partial1_7_2 += __fmaf_rn(r2_5, w0_5, r3_5 * w1_5);
                         }
-                        float v0_8_2 = partial0_6_2 * scale0_2;
-                        float v1_9_2 = partial1_7_2 * scale1_2;
-                        float _shfl_xor_sync_4_1 = __shfl_xor_sync(0xFFFFFFFF, v0_8_2, 1);
-                        v0_8_2 = v0_8_2 + _shfl_xor_sync_4_1;
-                        float _shfl_xor_sync_5_1 = __shfl_xor_sync(0xFFFFFFFF, v1_9_2, 1);
-                        v1_9_2 = v1_9_2 + _shfl_xor_sync_5_1;
-                        float _shfl_xor_sync_6_1 = __shfl_xor_sync(0xFFFFFFFF, v0_8_2, 2);
-                        v0_8_2 = v0_8_2 + _shfl_xor_sync_6_1;
-                        float _shfl_xor_sync_7_1 = __shfl_xor_sync(0xFFFFFFFF, v1_9_2, 2);
-                        v1_9_2 = v1_9_2 + _shfl_xor_sync_7_1;
-                        int out0_10_2 = kv_offset_2 + logits_stride + quad_1;
-                        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(Logits + out0_10_2)), "f"(v0_8_2), "r"((unsigned int)(tq_1 == 0)));
-                        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(Logits + (out0_10_2 + 8))), "f"(v1_9_2), "r"((unsigned int)(tq_1 == 0)));
+                        float v0_2_2 = partial0_6_2 * scale0_2;
+                        float v1_3_2 = partial1_7_2 * scale1_2;
+                        float _shfl_xor_sync_4_1 = __shfl_xor_sync(0xFFFFFFFF, v0_2_2, 1);
+                        v0_2_2 = v0_2_2 + _shfl_xor_sync_4_1;
+                        float _shfl_xor_sync_5_1 = __shfl_xor_sync(0xFFFFFFFF, v1_3_2, 1);
+                        v1_3_2 = v1_3_2 + _shfl_xor_sync_5_1;
+                        float _shfl_xor_sync_6_1 = __shfl_xor_sync(0xFFFFFFFF, v0_2_2, 2);
+                        v0_2_2 = v0_2_2 + _shfl_xor_sync_6_1;
+                        float _shfl_xor_sync_7_1 = __shfl_xor_sync(0xFFFFFFFF, v1_3_2, 2);
+                        v1_3_2 = v1_3_2 + _shfl_xor_sync_7_1;
+                        int out0_4_2 = kv_offset_2 + logits_stride + quad_1;
+                        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(Logits + out0_4_2)), "f"(v0_2_2), "r"((unsigned int)(tq_1 == 0)));
+                        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(Logits + (out0_4_2 + 8))), "f"(v1_3_2), "r"((unsigned int)(tq_1 == 0)));
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         mbarrier_arrive(kv_empty_g1_addr + (kv_stage_m_1) * 8);
                         kv_stage_m_1 += 1;
@@ -1753,19 +1726,19 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_be16183dec7d6dbe38e6(const __grid_co
                             partial0_3 += __fmaf_rn(r0_6, w0_6, r1_6 * w1_6);
                             partial1_3 += __fmaf_rn(r2_6, w0_6, r3_6 * w1_6);
                         }
-                        float v0_3 = partial0_3 * scale0_3;
-                        float v1_3 = partial1_3 * scale1_3;
-                        float _shfl_xor_sync_8_1 = __shfl_xor_sync(0xFFFFFFFF, v0_3, 1);
-                        v0_3 = v0_3 + _shfl_xor_sync_8_1;
-                        float _shfl_xor_sync_9_1 = __shfl_xor_sync(0xFFFFFFFF, v1_3, 1);
-                        v1_3 = v1_3 + _shfl_xor_sync_9_1;
-                        float _shfl_xor_sync_10_1 = __shfl_xor_sync(0xFFFFFFFF, v0_3, 2);
-                        v0_3 = v0_3 + _shfl_xor_sync_10_1;
-                        float _shfl_xor_sync_11_1 = __shfl_xor_sync(0xFFFFFFFF, v1_3, 2);
-                        v1_3 = v1_3 + _shfl_xor_sync_11_1;
+                        float v0_4 = partial0_3 * scale0_3;
+                        float v1_4 = partial1_3 * scale1_3;
+                        float _shfl_xor_sync_8_1 = __shfl_xor_sync(0xFFFFFFFF, v0_4, 1);
+                        v0_4 = v0_4 + _shfl_xor_sync_8_1;
+                        float _shfl_xor_sync_9_1 = __shfl_xor_sync(0xFFFFFFFF, v1_4, 1);
+                        v1_4 = v1_4 + _shfl_xor_sync_9_1;
+                        float _shfl_xor_sync_10_1 = __shfl_xor_sync(0xFFFFFFFF, v0_4, 2);
+                        v0_4 = v0_4 + _shfl_xor_sync_10_1;
+                        float _shfl_xor_sync_11_1 = __shfl_xor_sync(0xFFFFFFFF, v1_4, 2);
+                        v1_4 = v1_4 + _shfl_xor_sync_11_1;
                         int out0_3 = kv_offset_3 + quad_1;
-                        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(Logits + out0_3)), "f"(v0_3), "r"((unsigned int)(tq_1 == 0)));
-                        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(Logits + (out0_3 + 8))), "f"(v1_3), "r"((unsigned int)(tq_1 == 0)));
+                        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(Logits + out0_3)), "f"(v0_4), "r"((unsigned int)(tq_1 == 0)));
+                        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(Logits + (out0_3 + 8))), "f"(v1_4), "r"((unsigned int)(tq_1 == 0)));
                         float partial0_6_3 = 0.0f;
                         float partial1_7_3 = 0.0f;
                         #pragma unroll
@@ -1796,19 +1769,19 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_be16183dec7d6dbe38e6(const __grid_co
                             partial0_6_3 += __fmaf_rn(r0_7, w0_7, r1_7 * w1_7);
                             partial1_7_3 += __fmaf_rn(r2_7, w0_7, r3_7 * w1_7);
                         }
-                        float v0_8_3 = partial0_6_3 * scale0_3;
-                        float v1_9_3 = partial1_7_3 * scale1_3;
-                        float _shfl_xor_sync_12_1 = __shfl_xor_sync(0xFFFFFFFF, v0_8_3, 1);
-                        v0_8_3 = v0_8_3 + _shfl_xor_sync_12_1;
-                        float _shfl_xor_sync_13_1 = __shfl_xor_sync(0xFFFFFFFF, v1_9_3, 1);
-                        v1_9_3 = v1_9_3 + _shfl_xor_sync_13_1;
-                        float _shfl_xor_sync_14_1 = __shfl_xor_sync(0xFFFFFFFF, v0_8_3, 2);
-                        v0_8_3 = v0_8_3 + _shfl_xor_sync_14_1;
-                        float _shfl_xor_sync_15_1 = __shfl_xor_sync(0xFFFFFFFF, v1_9_3, 2);
-                        v1_9_3 = v1_9_3 + _shfl_xor_sync_15_1;
-                        int out0_10_3 = kv_offset_3 + logits_stride + quad_1;
-                        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(Logits + out0_10_3)), "f"(v0_8_3), "r"((unsigned int)(tq_1 == 0)));
-                        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(Logits + (out0_10_3 + 8))), "f"(v1_9_3), "r"((unsigned int)(tq_1 == 0)));
+                        float v0_2_3 = partial0_6_3 * scale0_3;
+                        float v1_3_3 = partial1_7_3 * scale1_3;
+                        float _shfl_xor_sync_12_1 = __shfl_xor_sync(0xFFFFFFFF, v0_2_3, 1);
+                        v0_2_3 = v0_2_3 + _shfl_xor_sync_12_1;
+                        float _shfl_xor_sync_13_1 = __shfl_xor_sync(0xFFFFFFFF, v1_3_3, 1);
+                        v1_3_3 = v1_3_3 + _shfl_xor_sync_13_1;
+                        float _shfl_xor_sync_14_1 = __shfl_xor_sync(0xFFFFFFFF, v0_2_3, 2);
+                        v0_2_3 = v0_2_3 + _shfl_xor_sync_14_1;
+                        float _shfl_xor_sync_15_1 = __shfl_xor_sync(0xFFFFFFFF, v1_3_3, 2);
+                        v1_3_3 = v1_3_3 + _shfl_xor_sync_15_1;
+                        int out0_4_3 = kv_offset_3 + logits_stride + quad_1;
+                        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(Logits + out0_4_3)), "f"(v0_2_3), "r"((unsigned int)(tq_1 == 0)));
+                        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(Logits + (out0_4_3 + 8))), "f"(v1_3_3), "r"((unsigned int)(tq_1 == 0)));
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         mbarrier_arrive(kv_empty_g1_addr + (kv_stage_m_1) * 8);
                         kv_stage_m_1 += 1;

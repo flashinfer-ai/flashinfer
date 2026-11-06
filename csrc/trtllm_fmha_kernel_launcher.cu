@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <flashinfer/math.cuh>
 #include <flashinfer/trtllm/fmha/fmhaRunner.cuh>
 #include <flashinfer/utils.cuh>
 #include <iostream>
@@ -285,7 +286,7 @@ void trtllm_paged_attention_launcher(
   runner_params.outputScalePtr = bmm2_scale_ptr;
   runner_params.mScaleSfKv = 1.0f;  // which should be fused into bmm1_scale(k)/bmm2_scale(v/o)
   runner_params.kvSfScalePtr = nullptr;
-  runner_params.scaleSoftmaxLog2 = bmm1_scale * M_LOG2E;
+  runner_params.scaleSoftmaxLog2 = bmm1_scale * flashinfer::math::log2e_d;
   runner_params.scaleSoftmaxLog2Ptr = bmm1_scale_log2_ptr;
   runner_params.oSfPtr = out_scale_factor;
   runner_params.dsv4InvRopeCosSinCachePtr = dsv4_inv_rope_cos_sin_cache;
@@ -363,6 +364,30 @@ void trtllm_paged_attention_launcher(
 
     runner_params.cumSeqLensQPtr = cum_seq_lens_q;
     runner_params.cumSeqLensKvPtr = cum_seq_lens_kv;
+
+    // With two query tokens and small KV, context schedules one CTA per query head.
+    // Grouping query tokens and heads in the generation kernel avoids those mostly
+    // empty tiles. Keep this choice within the measured SM103 BF16 shape and retain
+    // the context workspace contract (no split-KV scratch or counters are needed).
+    bool const use_tiny_gqa_generation =
+        fmha_runner->smVersion() == kSM_103 && q_data_type == DATA_TYPE_BF16 &&
+        kv_data_type == DATA_TYPE_BF16 && o_data_type == DATA_TYPE_BF16 && batch_size >= 4 &&
+        batch_size <= 256 && max_q_len == 2 && sum_seq_q == 2 * batch_size && max_kv_len >= 1 &&
+        max_kv_len <= 32 && num_qo_heads == 16 && num_kv_heads == 1 && head_dim_qk == 128 &&
+        head_dim_vo == 128 && page_size == 128 && q_stride_tokens == 16 * 128 &&
+        q_stride_heads == 128 && kv_stride_keys_values == 128 && kv_stride_heads == 128 * 128 &&
+        kv_stride_batch == 2 * 128 * 128 && max_num_blocks_per_seq == 1 &&
+        uses_shared_paged_kv_idx && is_causal && window_left == -1 &&
+        (window_right == -1 || window_right == 0) && variable_window_token_starts == nullptr &&
+        attention_sinks == nullptr && lse == nullptr && k_block_scales_ptr == nullptr &&
+        v_block_scales_ptr == nullptr && out_scale_factor == nullptr && !skips_softmax &&
+        !use_fp16_softmax && !uses_spcompress;
+    if (use_tiny_gqa_generation) {
+      runner_params.mKernelType = FmhaKernelType::Generation;
+      // Keep both query rows in one CTA, including a fully masked leading row.
+      runner_params.mKeepGqaGenerationQueryTile = true;
+      runner_params.cumSeqLensKvPtr = nullptr;
+    }
   } else {
     // Generation.
     // Note that kernel names are still labeled as using a dense mask even when maskType is
@@ -925,7 +950,7 @@ void trtllm_ragged_attention_launcher(
   // outputScale. if they are not nullptr, then scaleSoftmaxLog2 and outputScale will be ignored
   runner_params.outputScale = bmm2_scale;
   runner_params.outputScalePtr = bmm2_scale_ptr;
-  runner_params.scaleSoftmaxLog2 = bmm1_scale * M_LOG2E;
+  runner_params.scaleSoftmaxLog2 = bmm1_scale * flashinfer::math::log2e_d;
   runner_params.scaleSoftmaxLog2Ptr = bmm1_scale_log2_ptr;
   runner_params.mScaleSfO = o_sf_scale;
   // FlashInfer does not expose chunked attention; zero disables it. The downstream chunked paths

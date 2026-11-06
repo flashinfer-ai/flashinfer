@@ -339,7 +339,12 @@ size, device and split capability. Allocate contiguous, 32-byte-aligned CUDA
 standalone launch and whenever workspace-layout inputs change. Wrappers
 initialize control storage by default; `initialize_workspace=False` transfers
 that responsibility to the caller. Tensor-bound prepared plans also require
-reinitialization before sharing scratch with a different prepared layout. Do not share it
+reinitialization before sharing scratch with a different prepared layout.
+Alternatively, plans for one device may share one buffer of at least the
+largest size returned for them: zero the whole buffer once, bind the same full
+tensor to every plan (not slices), and plan and launch them on one stream.
+PrimTS may use any byte of the passed buffer; its control state sits at the
+buffer end and launches leave it zero. Do not share it
 between concurrent launches or captured graphs. It must not overlap Q, K/V
 cache, metadata, or output storage. The standalone hot path trusts
 `block_tables`, `seq_lens_kv`, and

@@ -47,17 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define SMEM_SVIEW_OFF 0
-#define SMEM_SVIEW_STAGE_BYTES 12288
-#define SMEM_SVIEW_STRIDE 12288
-#define SMEM_QVIEW_OFF 12288
-#define SMEM_QVIEW_STAGE_BYTES 512
-#define SMEM_QVIEW_STRIDE 512
-#define SMEM_TOTAL 12800
-#define THREADS 128
-
 #include <math_constants.h>
 
 extern "C" __device__ float __nv_expf(float);
@@ -85,7 +74,7 @@ kernel_cake_mhc_det_train_fwd_coef__st16_lp2_as_el_qd(float* __restrict__ spart,
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* sview = reinterpret_cast<float*>(smem_raw + 0);
     const int sview_addr = smem + 0;
     float* qview = reinterpret_cast<float*>(smem_raw + 12288);
@@ -135,7 +124,7 @@ kernel_cake_mhc_det_train_fwd_coef__st16_lp2_as_el_qd(float* __restrict__ spart,
         #pragma unroll
         for (int j_1 = 0; j_1 < 2; j_1++) {
             tokr[j_1] = g * 8 + tin[j_1];
-            tcr[j_1] = (long long)(((tokr[j_1] < T) ? tokr[j_1] : T - 1));
+            tcr[j_1] = (long long)((tokr[j_1] < T) ? tokr[j_1] : T - 1);
             s_acc[j_1] = 0.0f;
         }
         #pragma unroll
@@ -144,7 +133,18 @@ kernel_cake_mhc_det_train_fwd_coef__st16_lp2_as_el_qd(float* __restrict__ spart,
         }
         if (p_k <= 16) {
             long long sa_row = (long long)g * 8;
-            int sa_i0_1_0 = tid_2;
+            int sa_i0_1 = tid_2;
+            int sa_plane0_1 = sa_i0_1 / 48;
+            int sa_within0_1 = sa_i0_1 - sa_plane0_1 * 48;
+            long long sa_src0_1 = ((long long)sa_plane0_1 * tp64 + sa_row) * 24 + (long long)(sa_within0_1 * 4);
+            asm volatile(
+                "{\n\t"
+                ".reg .pred p;\n\t"
+                "setp.ne.b32 p, %0, 0;\n\t"
+                "@p cp.async.cg.shared::cta.global.L2::cache_hint [%1], [%2], 16, %3;\n\t"
+                "}"
+                :: "r"((sa_i0_1 < nf4) ? 1 : 0), "r"(sview_addr + (unsigned int)((boff + 4 * sa_i0_1) * 4)), "l"(spart + sa_src0_1), "l"(0x14F0000000000000ULL));
+            int sa_i0_1_0 = tid_2 + 128;
             int sa_plane0_1_0 = sa_i0_1_0 / 48;
             int sa_within0_1_0 = sa_i0_1_0 - sa_plane0_1_0 * 48;
             long long sa_src0_1_0 = ((long long)sa_plane0_1_0 * tp64 + sa_row) * 24 + (long long)(sa_within0_1_0 * 4);
@@ -155,7 +155,7 @@ kernel_cake_mhc_det_train_fwd_coef__st16_lp2_as_el_qd(float* __restrict__ spart,
                 "@p cp.async.cg.shared::cta.global.L2::cache_hint [%1], [%2], 16, %3;\n\t"
                 "}"
                 :: "r"((sa_i0_1_0 < nf4) ? 1 : 0), "r"(sview_addr + (unsigned int)((boff + 4 * sa_i0_1_0) * 4)), "l"(spart + sa_src0_1_0), "l"(0x14F0000000000000ULL));
-            int sa_i0_1_1 = tid_2 + 128;
+            int sa_i0_1_1 = tid_2 + 256;
             int sa_plane0_1_1 = sa_i0_1_1 / 48;
             int sa_within0_1_1 = sa_i0_1_1 - sa_plane0_1_1 * 48;
             long long sa_src0_1_1 = ((long long)sa_plane0_1_1 * tp64 + sa_row) * 24 + (long long)(sa_within0_1_1 * 4);
@@ -166,7 +166,7 @@ kernel_cake_mhc_det_train_fwd_coef__st16_lp2_as_el_qd(float* __restrict__ spart,
                 "@p cp.async.cg.shared::cta.global.L2::cache_hint [%1], [%2], 16, %3;\n\t"
                 "}"
                 :: "r"((sa_i0_1_1 < nf4) ? 1 : 0), "r"(sview_addr + (unsigned int)((boff + 4 * sa_i0_1_1) * 4)), "l"(spart + sa_src0_1_1), "l"(0x14F0000000000000ULL));
-            int sa_i0_1_2 = tid_2 + 256;
+            int sa_i0_1_2 = tid_2 + 384;
             int sa_plane0_1_2 = sa_i0_1_2 / 48;
             int sa_within0_1_2 = sa_i0_1_2 - sa_plane0_1_2 * 48;
             long long sa_src0_1_2 = ((long long)sa_plane0_1_2 * tp64 + sa_row) * 24 + (long long)(sa_within0_1_2 * 4);
@@ -177,7 +177,7 @@ kernel_cake_mhc_det_train_fwd_coef__st16_lp2_as_el_qd(float* __restrict__ spart,
                 "@p cp.async.cg.shared::cta.global.L2::cache_hint [%1], [%2], 16, %3;\n\t"
                 "}"
                 :: "r"((sa_i0_1_2 < nf4) ? 1 : 0), "r"(sview_addr + (unsigned int)((boff + 4 * sa_i0_1_2) * 4)), "l"(spart + sa_src0_1_2), "l"(0x14F0000000000000ULL));
-            int sa_i0_1_3 = tid_2 + 384;
+            int sa_i0_1_3 = tid_2 + 512;
             int sa_plane0_1_3 = sa_i0_1_3 / 48;
             int sa_within0_1_3 = sa_i0_1_3 - sa_plane0_1_3 * 48;
             long long sa_src0_1_3 = ((long long)sa_plane0_1_3 * tp64 + sa_row) * 24 + (long long)(sa_within0_1_3 * 4);
@@ -188,7 +188,7 @@ kernel_cake_mhc_det_train_fwd_coef__st16_lp2_as_el_qd(float* __restrict__ spart,
                 "@p cp.async.cg.shared::cta.global.L2::cache_hint [%1], [%2], 16, %3;\n\t"
                 "}"
                 :: "r"((sa_i0_1_3 < nf4) ? 1 : 0), "r"(sview_addr + (unsigned int)((boff + 4 * sa_i0_1_3) * 4)), "l"(spart + sa_src0_1_3), "l"(0x14F0000000000000ULL));
-            int sa_i0_1_4 = tid_2 + 512;
+            int sa_i0_1_4 = tid_2 + 640;
             int sa_plane0_1_4 = sa_i0_1_4 / 48;
             int sa_within0_1_4 = sa_i0_1_4 - sa_plane0_1_4 * 48;
             long long sa_src0_1_4 = ((long long)sa_plane0_1_4 * tp64 + sa_row) * 24 + (long long)(sa_within0_1_4 * 4);
@@ -199,17 +199,6 @@ kernel_cake_mhc_det_train_fwd_coef__st16_lp2_as_el_qd(float* __restrict__ spart,
                 "@p cp.async.cg.shared::cta.global.L2::cache_hint [%1], [%2], 16, %3;\n\t"
                 "}"
                 :: "r"((sa_i0_1_4 < nf4) ? 1 : 0), "r"(sview_addr + (unsigned int)((boff + 4 * sa_i0_1_4) * 4)), "l"(spart + sa_src0_1_4), "l"(0x14F0000000000000ULL));
-            int sa_i0_1_5 = tid_2 + 640;
-            int sa_plane0_1_5 = sa_i0_1_5 / 48;
-            int sa_within0_1_5 = sa_i0_1_5 - sa_plane0_1_5 * 48;
-            long long sa_src0_1_5 = ((long long)sa_plane0_1_5 * tp64 + sa_row) * 24 + (long long)(sa_within0_1_5 * 4);
-            asm volatile(
-                "{\n\t"
-                ".reg .pred p;\n\t"
-                "setp.ne.b32 p, %0, 0;\n\t"
-                "@p cp.async.cg.shared::cta.global.L2::cache_hint [%1], [%2], 16, %3;\n\t"
-                "}"
-                :: "r"((sa_i0_1_5 < nf4) ? 1 : 0), "r"(sview_addr + (unsigned int)((boff + 4 * sa_i0_1_5) * 4)), "l"(spart + sa_src0_1_5), "l"(0x14F0000000000000ULL));
             asm volatile("cp.async.commit_group;");
             #pragma unroll
             for (int j_3 = 0; j_3 < 2; j_3++) {

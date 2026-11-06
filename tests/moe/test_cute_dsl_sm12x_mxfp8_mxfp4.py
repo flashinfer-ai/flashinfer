@@ -216,3 +216,211 @@ def test_cute_dsl_sm12x_fc2_finalize_mxfp8_mxfp4_smoke():
         a, a_sf, b, b_sf, offsets, tok, torch.rand(rows, device="cuda"), rows
     )
     assert out.shape == (rows, 512) and not torch.isnan(out.float()).any()
+
+
+@pytest.mark.parametrize("k", [512, 1024])
+@pytest.mark.parametrize("tile_m", [64, 128])
+def test_fc2_finalize_ignores_bytes_outside_logical_scale_tensor(k: int, tile_m: int):
+    """Padded TMA rows must not read poisoned bytes outside the scale operand."""
+    skip_if_not_sm120()
+    from flashinfer.fused_moe import cute_dsl_sm12x_fc2_finalize_mxfp8_mxfp4
+
+    a, a_sf, b, b_sf, offsets, gemm_ref = make_inputs([64] * 4, 512, k)
+    assert a_sf.dtype == torch.uint8 and a_sf.is_contiguous()
+    # Preserve the logical tensor's values, shape, strides, and alignment.
+    # Extra backing storage makes an overstated descriptor read NaN scales
+    # deterministically, without depending on a neighboring allocation.
+    backing = torch.full(
+        (4 * a_sf.numel() + 512,), 0xFF, dtype=torch.uint8, device=a_sf.device
+    )
+    logical_scales = backing[: a_sf.numel()].view(a_sf.shape)
+    logical_scales.copy_(a_sf)
+    assert logical_scales.stride() == a_sf.stride()
+    assert logical_scales.data_ptr() % 16 == 0
+    rows = a.shape[0]
+    tokens = torch.arange(rows, device=a.device, dtype=torch.int32)
+    route_weights = torch.rand(rows, device=a.device)
+    actual = cute_dsl_sm12x_fc2_finalize_mxfp8_mxfp4(
+        a,
+        logical_scales,
+        b,
+        b_sf,
+        offsets,
+        tokens,
+        route_weights,
+        rows,
+        tile=(tile_m, 128, 128),
+        tune=False,
+    )
+    torch.cuda.synchronize()
+    expected = (gemm_ref.float() * route_weights[:, None]).to(actual.dtype)
+    assert torch.isfinite(actual).all()
+    diff = calc_diff(actual.float(), expected.float())
+    assert diff < 5e-3, f"calc_diff={diff:.6e}"
+
+
+def poisoned_scale_view(a_sf, dtype):
+    """Preserve packed scale bytes and poison only backing beyond the tensor."""
+    assert a_sf.dtype == torch.uint8 and a_sf.is_contiguous()
+    backing = torch.full(
+        (4 * a_sf.numel() + 512,), 0xFF, dtype=torch.uint8, device=a_sf.device
+    )
+    logical = backing[: a_sf.numel()].view(a_sf.shape)
+    logical.copy_(a_sf)
+    assert logical.stride() == a_sf.stride()
+    assert logical.data_ptr() % 16 == 0
+    return logical.view(dtype)
+
+
+def dequantize_mxfp8_moe_output(q, sf, offsets):
+    """Unpack Q1's expert-padded UE8M0 scales for a numerical reference check."""
+    assert sf.dtype == torch.int32 and sf.is_contiguous()
+    encoded = sf.view(torch.uint8).reshape(sf.shape[0], sf.shape[1], 4)
+    encoded = encoded.permute(1, 0, 2).reshape(sf.shape[1], -1)
+    scales = torch.ldexp(
+        torch.ones_like(encoded, dtype=torch.float32), encoded.int() - 127
+    )
+    actual = torch.empty_like(q, dtype=torch.float32)
+    off = offsets.tolist()
+    blocks = q.shape[1] // 128
+    for e, (start, end) in enumerate(zip(off[:-1], off[1:], strict=True)):
+        if start < end:
+            padded = compute_padded_offset(start, e)
+            actual[start:end] = (
+                q[start:end].float().reshape(end - start, blocks, 128)
+                * scales[padded : padded + end - start, :blocks, None]
+            ).reshape(end - start, q.shape[1])
+    return actual
+
+
+@pytest.mark.parametrize("op_name", ["gemm", "fc1", "fc1_q1"])
+@pytest.mark.parametrize("k", [512, 1024])
+@pytest.mark.parametrize("tile_m", [8, 64])
+@pytest.mark.parametrize(
+    "scale_dtype", [torch.uint8, torch.int32], ids=["uint8", "int32"]
+)
+def test_mxfp8_mxfp4_sibling_scale_extent(op_name, k, tile_m, scale_dtype):
+    """Check scale extent and K-plane stride for normal and swapped operands."""
+    skip_if_not_sm120()
+    from flashinfer.fused_moe import (
+        cute_dsl_sm12x_fc1_act_mxfp8_mxfp4,
+        cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4,
+        cute_dsl_sm12x_moe_gemm_mxfp8_mxfp4,
+    )
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x._moe_utils.moe_epilogue import (
+        EpiMethod,
+    )
+
+    make = make_inputs if op_name == "gemm" else make_gated_inputs
+    a, a_sf, b, b_sf, offsets, expected = make([64] * 4, 512, k)
+    logical_scales = poisoned_scale_view(a_sf, scale_dtype)
+    ops = {
+        "gemm": cute_dsl_sm12x_moe_gemm_mxfp8_mxfp4,
+        "fc1": cute_dsl_sm12x_fc1_act_mxfp8_mxfp4,
+        "fc1_q1": cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4,
+    }
+    if op_name == "fc1_q1":
+        epi = EpiMethod.WG_QUANT_SWAP if tile_m == 8 else EpiMethod.WG_S2R_QUANT
+    else:
+        epi = EpiMethod.DIRECT_STG if tile_m == 8 else EpiMethod.R2G_WG
+    actual = ops[op_name](
+        a,
+        logical_scales,
+        b,
+        b_sf,
+        offsets,
+        tile=(tile_m, 128, 128),
+        epi=epi,
+        tune=False,
+    )
+    if op_name == "fc1_q1":
+        q, sf = actual
+        assert torch.isfinite(q.float()).all()
+        actual = dequantize_mxfp8_moe_output(q, sf, offsets)
+    torch.cuda.synchronize()
+    assert torch.isfinite(actual).all()
+    diff = calc_diff(actual.float(), expected.float())
+    limit = 5e-3 if op_name == "gemm" else 8e-3
+    assert diff < limit, f"calc_diff={diff:.6e}"
+
+
+@pytest.mark.parametrize("k", [512, 1024])
+@pytest.mark.parametrize("tile_m", [64, 128])
+def test_fc2_finalize_int32_scale_extent(k, tile_m):
+    """Keep the already-packed Int32 scale ABI valid when fixing byte views."""
+    skip_if_not_sm120()
+    from flashinfer.fused_moe import cute_dsl_sm12x_fc2_finalize_mxfp8_mxfp4
+
+    a, a_sf, b, b_sf, offsets, gemm_ref = make_inputs([64] * 4, 512, k)
+    logical_scales = poisoned_scale_view(a_sf, torch.int32)
+    rows = a.shape[0]
+    route_weights = torch.rand(rows, device=a.device)
+    actual = cute_dsl_sm12x_fc2_finalize_mxfp8_mxfp4(
+        a,
+        logical_scales,
+        b,
+        b_sf,
+        offsets,
+        torch.arange(rows, device=a.device, dtype=torch.int32),
+        route_weights,
+        rows,
+        tile=(tile_m, 128, 128),
+        tune=False,
+    )
+    torch.cuda.synchronize()
+    expected = (gemm_ref.float() * route_weights[:, None]).to(actual.dtype)
+    assert torch.isfinite(actual).all()
+    diff = calc_diff(actual.float(), expected.float())
+    assert diff < 5e-3, f"calc_diff={diff:.6e}"
+
+
+@pytest.mark.parametrize("op_name", ["gemm", "fc1", "fc1_q1", "fc2"])
+@pytest.mark.parametrize(
+    "first_dtype", [torch.uint8, torch.int32], ids=["uint8-first", "int32-first"]
+)
+def test_mxfp8_mxfp4_scale_dtype_cache_transition(op_name, first_dtype, monkeypatch):
+    """One operation must accept both packed scale views in either call order."""
+    skip_if_not_sm120()
+    import importlib
+
+    suffix = {
+        "gemm": "gemm",
+        "fc1": "fc1_act",
+        "fc1_q1": "fc1_act_q1",
+        "fc2": "fc2_finalize",
+    }[op_name]
+    module = importlib.import_module(
+        "flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_mxfp8_mxfp4_" + suffix
+    )
+    api_name = "moe_gemm" if op_name == "gemm" else suffix
+    op = getattr(module, "cute_dsl_sm12x_" + api_name + "_mxfp8_mxfp4")
+    # Isolate this call-order test, but preserve the cache across both calls.
+    monkeypatch.setattr(module, "_COMPILED", {})
+    make = make_gated_inputs if op_name in ("fc1", "fc1_q1") else make_inputs
+    a, a_sf, b, b_sf, offsets, expected = make([64] * 4, 512, 1024)
+    rows = a.shape[0]
+    tokens = torch.arange(rows, device=a.device, dtype=torch.int32)
+    route_weights = torch.rand(rows, device=a.device)
+    if op_name == "fc2":
+        expected = (expected.float() * route_weights[:, None]).to(torch.bfloat16)
+    second_dtype = torch.int32 if first_dtype == torch.uint8 else torch.uint8
+    for scale_dtype in (first_dtype, second_dtype):
+        args = (
+            a,
+            poisoned_scale_view(a_sf, scale_dtype),
+            b,
+            b_sf.view(scale_dtype),
+            offsets,
+        )
+        if op_name == "fc2":
+            args += (tokens, route_weights, rows)
+        actual = op(*args, tile=(64, 128, 128), tune=False)
+        if op_name == "fc1_q1":
+            q, sf = actual
+            assert torch.isfinite(q.float()).all()
+            actual = dequantize_mxfp8_moe_output(q, sf, offsets)
+        torch.cuda.synchronize()
+        assert torch.isfinite(actual).all()
+        diff = calc_diff(actual.float(), expected.float())
+        limit = 8e-3 if op_name in ("fc1", "fc1_q1") else 5e-3
+        assert diff < limit, f"{scale_dtype}: calc_diff={diff:.6e}"

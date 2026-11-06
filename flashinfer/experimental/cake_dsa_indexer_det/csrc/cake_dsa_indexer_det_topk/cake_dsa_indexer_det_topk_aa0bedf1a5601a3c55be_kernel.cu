@@ -54,55 +54,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define CAKE_PROGRAM_KERNEL kernel_cake_dsa_indexer_det_topk_aa0bedf1a5601a3c55be
 #endif
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define SMEM_S_OUT_ID_OFF 1024
-#define SMEM_S_OUT_ID_STAGE_BYTES 16384
-#define SMEM_S_OUT_ID_STRIDE 16384
-#define SMEM_S_OUT_SC_OFF 17408
-#define SMEM_S_OUT_SC_STAGE_BYTES 16384
-#define SMEM_S_OUT_SC_STRIDE 16384
-#define SMEM_S_BITS_OFF 33792
-#if CAKE_INDEXER_WINDOW == 65536
-#define SMEM_S_BITS_STAGE_BYTES 8192
-#define SMEM_S_BITS_STRIDE 8192
-#define SMEM_S_PREF_OFF 41984
-#define SMEM_S_PREF_STAGE_BYTES 4096
-#define SMEM_S_PREF_STRIDE 4096
-#define SMEM_S_XCH_OFF 46080
-#define SMEM_S_XCH_STAGE_BYTES 544
-#define SMEM_S_XCH_STRIDE 544
-#define SMEM_TOTAL 46720
-#elif CAKE_INDEXER_WINDOW == 16384
-#define SMEM_S_BITS_STAGE_BYTES 2048
-#define SMEM_S_BITS_STRIDE 2048
-#define SMEM_S_PREF_OFF 35840
-#define SMEM_S_PREF_STAGE_BYTES 1024
-#define SMEM_S_PREF_STRIDE 1024
-#define SMEM_S_XCH_OFF 36864
-#define SMEM_S_XCH_STAGE_BYTES 352
-#define SMEM_S_XCH_STRIDE 352
-#define SMEM_TOTAL 37248
-#else
-#define SMEM_S_BITS_STAGE_BYTES 1024
-#define SMEM_S_BITS_STRIDE 1024
-#define SMEM_S_PREF_OFF 34816
-#define SMEM_S_PREF_STAGE_BYTES 512
-#define SMEM_S_PREF_STRIDE 512
-#define SMEM_S_XCH_OFF 35328
-#define SMEM_S_XCH_STAGE_BYTES 320
-#define SMEM_S_XCH_STRIDE 320
-#define SMEM_TOTAL 35712
-#endif
-#define THREADS 256
-#if CAKE_INDEXER_WINDOW == 65536
-#define RANK_XCH_PAD 64
-#elif CAKE_INDEXER_WINDOW == 16384
-#define RANK_XCH_PAD 16
-#else
-#define RANK_XCH_PAD 8
-#endif
-
 #include <math_constants.h>
 
 __device__ __forceinline__ uint32_t elect_sync() {
@@ -189,7 +140,7 @@ CAKE_PROGRAM_KERNEL(int* __restrict__ Indices, float* __restrict__ Scores, int* 
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     int* s_out_id = reinterpret_cast<int*>(smem_raw + 1024);
     const int s_out_id_addr = smem + 1024;
     unsigned int* s_out_sc = reinterpret_cast<unsigned int*>(smem_raw + 17408);
@@ -213,8 +164,7 @@ CAKE_PROGRAM_KERNEL(int* __restrict__ Indices, float* __restrict__ Scores, int* 
     const int s_xch_addr = smem + 35328;
 #endif
 
-    // Mbarrier init (2 pipeline groups, 0 ordered-sequence groups, 2 barriers)
-    // Mbarriers at smem_raw[0..16)
+    // Mbarrier init (2 barriers at smem_raw[0..16))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -247,8 +197,8 @@ CAKE_PROGRAM_KERNEL(int* __restrict__ Indices, float* __restrict__ Scores, int* 
             if (elect_sync()) {
                 long long base_p = (long long)bid * (long long)top_k;
                 mbarrier_arrive_expect_tx(rank_row_full0_addr, top_k * 8);
-                cp_async_bulk_gmem2smem(s_out_id_addr, reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(Indices) + ((unsigned long long)base_p * (unsigned long long)4)), top_k * 4, rank_row_full0_addr);
-                cp_async_bulk_gmem2smem(s_out_sc_addr, reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(Scores) + ((unsigned long long)base_p * (unsigned long long)4)), top_k * 4, rank_row_full0_addr);
+                cp_async_bulk_gmem2smem(s_out_id_addr, reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(Indices) + (unsigned long long)base_p * (unsigned long long)4), top_k * 4, rank_row_full0_addr);
+                cp_async_bulk_gmem2smem(s_out_sc_addr, reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(Scores) + (unsigned long long)base_p * (unsigned long long)4), top_k * 4, rank_row_full0_addr);
             }
         }
     }
@@ -267,12 +217,12 @@ CAKE_PROGRAM_KERNEL(int* __restrict__ Indices, float* __restrict__ Scores, int* 
                     long long base_n = (long long)row_n * (long long)top_k;
                     if (h == 0) {
                         mbarrier_arrive_expect_tx(rank_row_full1_addr, top_k * 8);
-                        cp_async_bulk_gmem2smem(s_out_id_addr + 8192, reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(Indices) + ((unsigned long long)base_n * (unsigned long long)4)), top_k * 4, rank_row_full1_addr);
-                        cp_async_bulk_gmem2smem(s_out_sc_addr + 8192, reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(Scores) + ((unsigned long long)base_n * (unsigned long long)4)), top_k * 4, rank_row_full1_addr);
+                        cp_async_bulk_gmem2smem(s_out_id_addr + 8192, reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(Indices) + (unsigned long long)base_n * (unsigned long long)4), top_k * 4, rank_row_full1_addr);
+                        cp_async_bulk_gmem2smem(s_out_sc_addr + 8192, reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(Scores) + (unsigned long long)base_n * (unsigned long long)4), top_k * 4, rank_row_full1_addr);
                     } else {
                         mbarrier_arrive_expect_tx(rank_row_full0_addr, top_k * 8);
-                        cp_async_bulk_gmem2smem(s_out_id_addr, reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(Indices) + ((unsigned long long)base_n * (unsigned long long)4)), top_k * 4, rank_row_full0_addr);
-                        cp_async_bulk_gmem2smem(s_out_sc_addr, reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(Scores) + ((unsigned long long)base_n * (unsigned long long)4)), top_k * 4, rank_row_full0_addr);
+                        cp_async_bulk_gmem2smem(s_out_id_addr, reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(Indices) + (unsigned long long)base_n * (unsigned long long)4), top_k * 4, rank_row_full0_addr);
+                        cp_async_bulk_gmem2smem(s_out_sc_addr, reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(Scores) + (unsigned long long)base_n * (unsigned long long)4), top_k * 4, rank_row_full0_addr);
                     }
                 }
             }
@@ -313,7 +263,13 @@ CAKE_PROGRAM_KERNEL(int* __restrict__ Indices, float* __restrict__ Scores, int* 
             }
             unsigned int pad_mask = __ballot_sync(0xFFFFFFFF, is_pad != 0);
             if (lane_1 == 0) {
-                s_xch[RANK_XCH_PAD + i * 8 + warp_1] = (unsigned int)__popc(pad_mask);
+#if CAKE_INDEXER_WINDOW == 65536
+                s_xch[64 + i * 8 + warp_1] = (unsigned int)__popc(pad_mask);
+#elif CAKE_INDEXER_WINDOW == 16384
+                s_xch[16 + i * 8 + warp_1] = (unsigned int)__popc(pad_mask);
+#else
+                s_xch[8 + i * 8 + warp_1] = (unsigned int)__popc(pad_mask);
+#endif
             }
         }
         #pragma unroll 1
@@ -323,9 +279,21 @@ CAKE_PROGRAM_KERNEL(int* __restrict__ Indices, float* __restrict__ Scores, int* 
         __syncthreads();
         if (warp_1 == 0) {
             unsigned int pad_sum = 0;
-            unsigned int pad_e_0 = s_xch[RANK_XCH_PAD + lane_1 * 2];
+#if CAKE_INDEXER_WINDOW == 65536
+            unsigned int pad_e_0 = s_xch[64 + lane_1 * 2];
+#elif CAKE_INDEXER_WINDOW == 16384
+            unsigned int pad_e_0 = s_xch[16 + lane_1 * 2];
+#else
+            unsigned int pad_e_0 = s_xch[8 + lane_1 * 2];
+#endif
             pad_sum += pad_e_0;
-            unsigned int pad_e_1 = s_xch[RANK_XCH_PAD + lane_1 * 2 + 1];
+#if CAKE_INDEXER_WINDOW == 65536
+            unsigned int pad_e_1 = s_xch[64 + lane_1 * 2 + 1];
+#elif CAKE_INDEXER_WINDOW == 16384
+            unsigned int pad_e_1 = s_xch[16 + lane_1 * 2 + 1];
+#else
+            unsigned int pad_e_1 = s_xch[8 + lane_1 * 2 + 1];
+#endif
             pad_sum += pad_e_1;
             uint32_t pad_run = pad_sum;
             {
@@ -337,11 +305,27 @@ CAKE_PROGRAM_KERNEL(int* __restrict__ Indices, float* __restrict__ Scores, int* 
                 { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, pad_run, 16, 32); if (lane >= 16) { pad_run += peer; } }
                 pad_run -= pad_run_own;
             }
-            unsigned int pad_f_0 = s_xch[RANK_XCH_PAD + lane_1 * 2];
-            s_xch[RANK_XCH_PAD + lane_1 * 2] = pad_run;
+#if CAKE_INDEXER_WINDOW == 65536
+            unsigned int pad_f_0 = s_xch[64 + lane_1 * 2];
+            s_xch[64 + lane_1 * 2] = pad_run;
+#elif CAKE_INDEXER_WINDOW == 16384
+            unsigned int pad_f_0 = s_xch[16 + lane_1 * 2];
+            s_xch[16 + lane_1 * 2] = pad_run;
+#else
+            unsigned int pad_f_0 = s_xch[8 + lane_1 * 2];
+            s_xch[8 + lane_1 * 2] = pad_run;
+#endif
             pad_run += pad_f_0;
-            unsigned int pad_f_1 = s_xch[RANK_XCH_PAD + lane_1 * 2 + 1];
-            s_xch[RANK_XCH_PAD + lane_1 * 2 + 1] = pad_run;
+#if CAKE_INDEXER_WINDOW == 65536
+            unsigned int pad_f_1 = s_xch[64 + lane_1 * 2 + 1];
+            s_xch[64 + lane_1 * 2 + 1] = pad_run;
+#elif CAKE_INDEXER_WINDOW == 16384
+            unsigned int pad_f_1 = s_xch[16 + lane_1 * 2 + 1];
+            s_xch[16 + lane_1 * 2 + 1] = pad_run;
+#else
+            unsigned int pad_f_1 = s_xch[8 + lane_1 * 2 + 1];
+            s_xch[8 + lane_1 * 2 + 1] = pad_run;
+#endif
             pad_run += pad_f_1;
         }
         #pragma unroll
@@ -429,7 +413,13 @@ CAKE_PROGRAM_KERNEL(int* __restrict__ Indices, float* __restrict__ Scores, int* 
                     unsigned int masked_o = bw_o & below_o;
                     dst = pref_o + (unsigned int)__popc(masked_o);
                 } else {
-                    unsigned int pad_before = s_xch[RANK_XCH_PAD + i_2 * 8 + warp_1];
+#if CAKE_INDEXER_WINDOW == 65536
+                    unsigned int pad_before = s_xch[64 + i_2 * 8 + warp_1];
+#elif CAKE_INDEXER_WINDOW == 16384
+                    unsigned int pad_before = s_xch[16 + i_2 * 8 + warp_1];
+#else
+                    unsigned int pad_before = s_xch[8 + i_2 * 8 + warp_1];
+#endif
                     uint32_t _rank_in_mask_0 = (uint32_t)__popc(pad_mask_o & ((1u << (unsigned int)lane) - 1u));
                     dst = n_valid + pad_before + _rank_in_mask_0;
                 }

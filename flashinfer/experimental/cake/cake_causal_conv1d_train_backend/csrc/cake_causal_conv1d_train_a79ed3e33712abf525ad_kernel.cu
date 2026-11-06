@@ -47,15 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_RED_OFF 1024
-#define SMEM_RED_STAGE_BYTES 65536
-#define SMEM_RED_STRIDE 65536
-#define SMEM_STAGE_BUF_OFF 1024
-#define SMEM_STAGE_BUF_STAGE_BYTES 65536
-#define SMEM_STAGE_BUF_STRIDE 65536
-#define SMEM_TOTAL 66560
-#define THREADS 128
 #define LAUNCH_MIN_BLOCKS 2
 
 #include <math_constants.h>
@@ -1292,31 +1283,37 @@ kernel_cake_causal_conv1d_train_a79ed3e33712abf525ad(__nv_bfloat16* __restrict__
     }
     #pragma unroll
     for (int i_6 = 0; i_6 < 32; i_6++) {
-        red[(tid >> 5) * 4096 + i_6 * 32 + (tid & 31)] = acc[i_6];
+        red[(tid >> 5) * 4096 + i_6 * 32 + (tid & 31 ^ i_6 & 28)] = acc[i_6];
     }
     __syncthreads();
-    int c0_0 = (ct * ct_vec + v) * 8;
-    if (sub == 0 && c0_0 < C) {
-        float tot[32];
-        #pragma unroll
-        for (int i_7 = 0; i_7 < 32; i_7++) {
-            tot[i_7] = red[(v >> 5) * 4096 + i_7 * 32 + (v & 31)];
-        }
-        #pragma unroll 1
-        for (int s_1 = 1; s_1 < n_sub; s_1++) {
-            int ts = s_1 * ct_vec + v;
+    int cb0 = ct * ct_vec * 8;
+    #pragma unroll 1
+    for (int q_1 = tid; q_1 < ct_vec * 8; q_1 += 128) {
+        if (sub <= n_sub && cb0 + q_1 < C) {
+            int vq = q_1 >> 3;
+            int jq = q_1 & 7;
+            float t4[4];
+            float u4[4];
             #pragma unroll
-            for (int i_8 = 0; i_8 < 32; i_8++) {
-                tot[i_8] = tot[i_8] + red[(ts >> 5) * 4096 + i_8 * 32 + (ts & 31)];
+            for (int k_2 = 0; k_2 < 4; k_2++) {
+                t4[k_2] = red[(vq >> 5) * 4096 + (jq * 4 + k_2) * 32 + (vq & 31 ^ jq * 4)];
             }
-        }
-        #pragma unroll
-        for (int j_4 = 0; j_4 < 8; j_4++) {
-            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&dw_acc[(c0_0 + j_4) * 4])), "f"(tot[j_4 * 4]), "f"(tot[j_4 * 4 + 1]), "f"(tot[j_4 * 4 + 2]), "f"(tot[j_4 * 4 + 3]) : "memory");
+            #pragma unroll 1
+            for (int s_1 = 1; s_1 < n_sub; s_1++) {
+                int rq = s_1 * ct_vec + vq;
+                #pragma unroll
+                for (int k_3 = 0; k_3 < 4; k_3++) {
+                    u4[k_3] = red[(rq >> 5) * 4096 + (jq * 4 + k_3) * 32 + (rq & 31 ^ jq * 4)];
+                }
+                #pragma unroll
+                for (int k_4 = 0; k_4 < 4; k_4++) {
+                    t4[k_4] = t4[k_4] + u4[k_4];
+                }
+            }
+            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&dw_acc[(cb0 + q_1) * 4])), "f"(t4[0]), "f"(t4[1]), "f"(t4[2]), "f"(t4[3]) : "memory");
         }
     }
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
-    __threadfence();
     __syncthreads();
     if (tid == 0) {
         uint32_t done;
@@ -1331,33 +1328,45 @@ kernel_cake_causal_conv1d_train_a79ed3e33712abf525ad(__nv_bfloat16* __restrict__
     __syncthreads();
     float last = red[0];
     if (last != 0.0f) {
-        __threadfence();
         int ch0 = ct * ct_vec * 8;
-        float a4[4];
-        float tb_2[1];
+        int lim = ((C) < (ch0 + ct_vec * 8) ? (C) : (ch0 + ct_vec * 8));
         float z4[4];
         #pragma unroll
         for (int e = 0; e < 4; e++) {
             z4[e] = 0.0f;
         }
+        float a[16];
+        float tb_2[4];
         #pragma unroll 1
-        for (int c = ch0 + tid; c < ch0 + ct_vec * 8; c += 128) {
-            if (c < C) {
-                long long c64_2 = (long long)c;
-                {
-                    float4 _v4 = *reinterpret_cast<const float4*>(dw_acc + c64_2 * 4);
-                    a4[0 + 0] = _v4.x;
-                    a4[0 + 1] = _v4.y;
-                    a4[0 + 2] = _v4.z;
-                    a4[0 + 3] = _v4.w;
+        for (int c0_0 = ch0 + tid; c0_0 < ch0 + ct_vec * 8; c0_0 += 512) {
+            #pragma unroll
+            for (int j_4 = 0; j_4 < 4; j_4++) {
+                int cl = c0_0 + 128 * j_4;
+                if (cl < lim) {
+                    long long cl64 = (long long)cl;
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(dw_acc + cl64 * 4);
+                        a[4 * j_4 + 0] = _v4.x;
+                        a[4 * j_4 + 1] = _v4.y;
+                        a[4 * j_4 + 2] = _v4.z;
+                        a[4 * j_4 + 3] = _v4.w;
+                    }
                 }
-                {
-                    float4 _v4 = make_float4(z4[0 + 0], z4[0 + 1], z4[0 + 2], z4[0 + 3]);
-                    *reinterpret_cast<float4*>(dw_acc + c64_2 * 4) = _v4;
-                }
-                {
-                    float4 _v4 = make_float4(a4[0 + 0], a4[0 + 1], a4[0 + 2], a4[0 + 3]);
-                    *reinterpret_cast<float4*>(dw + c64_2 * 4) = _v4;
+            }
+            #pragma unroll
+            for (int j_5 = 0; j_5 < 4; j_5++) {
+                int c = c0_0 + 128 * j_5;
+                if (c < lim) {
+                    long long c64_2 = (long long)c;
+                    long long bi = (long long)C * 4 + c64_2;
+                    {
+                        float4 _v4 = make_float4(z4[0 + 0], z4[0 + 1], z4[0 + 2], z4[0 + 3]);
+                        *reinterpret_cast<float4*>(dw_acc + c64_2 * 4) = _v4;
+                    }
+                    {
+                        float4 _v4 = make_float4(a[4 * j_5 + 0], a[4 * j_5 + 1], a[4 * j_5 + 2], a[4 * j_5 + 3]);
+                        *reinterpret_cast<float4*>(dw + c64_2 * 4) = _v4;
+                    }
                 }
             }
         }

@@ -221,11 +221,13 @@ OP_A_PLAIN_ORDER = ("c2", "c4", "rsa", "pro", "psb")
 OP_A_LATE_STORE = {"psb_late": {"planes_path": "sts_late"}}
 # The L2-prefetch forms of the prologue program on sm_103a (the prologue program's plain build with these keywords
 # changed, shipped on sm_103a alone): each CTA issues one bulk L2 prefetch of the row 304 rows ahead of its own (l2),
-# or of that row's residual alone (l2r). In mode 0 l2 owns 1024-8192 rows and l2r the rows above; in mode 1 l2 owns
-# every row from 1024 up. The PDL routes run the PDL build of l2 too.
+# or of that row's residual alone (l2r); l2b also brings the alpha / beta planes into shared memory by bulk copies.
+# In mode 0 l2 owns 1024-8192 rows and l2r the rows above; in mode 1 l2 owns 1024-17408 rows and l2b the rows
+# above. The PDL routes run the PDL build of l2 too.
 OP_A_L2_PREFETCH = {
     "l2": {"l2_prefetch": 304},
     "l2r": {"l2_prefetch": 304, "l2pf_form": "res"},
+    "l2b": {"l2_prefetch": 304, "planes_bulk": True},
 }
 # Op A's Blackwell plain routes per (arch, mode): (place, windows) rows in route order, a window (above, at_most).
 # The whole-row programs follow the three small-M composites: on sm_100a the prologue program owns 129-383 and the
@@ -233,8 +235,8 @@ OP_A_L2_PREFETCH = {
 # program at 384-511 and 1025-2048 around the late-store form's 512-1024, the late-store form again at 2049-4096 and
 # the prologue program from 4097); on sm_103a, re-measured on GB300, mode 0 parks 129-224 and 257-1023 around the
 # prologue program's 225-256 and gives the rows from 1024 up to the L2-prefetch forms, and mode 1 gives 129-1023 to
-# the late-store form and the rows from 1024 up to the L2-prefetch form (neither the parked program's own build nor
-# the prologue program's plain build is in that route).
+# the late-store form, 1024-17408 to the L2-prefetch form and the rows above to its bulk-plane form (neither the
+# parked program's own build nor the prologue program's plain build is in that route).
 OP_A_PLAIN_WINDOWS = {
     ("sm_100a", 0): (
         ("c2", [(0, 16)]),
@@ -265,7 +267,8 @@ OP_A_PLAIN_WINDOWS = {
         ("c4", [(16, 64)]),
         ("rsa", [(64, 128)]),
         ("psb_late", [(128, 1023)]),
-        ("l2", [(1023, None)]),
+        ("l2", [(1023, 17408)]),
+        ("l2b", [(17408, None)]),
     ),
 }
 # The forms of the prologue whole-row program that ship under PDL only (no plain-route record): the prologue
@@ -273,7 +276,8 @@ OP_A_PLAIN_WINDOWS = {
 # is the packed form and h the hoisted form; the l2 forms, on sm_103a alone, add one change to the L2 prefetch of
 # OP_A_L2_PREFETCH: l2x rebuilds the row's values after the reduction barrier instead of holding them in registers,
 # l2i brings the residual row into shared memory by one bulk copy, l2w has the first wave of CTAs prefetch its own
-# rows as well, and l2o writes the output row from shared memory by one bulk store.
+# rows as well, l2o writes the output row from shared memory by one bulk store, and l2s has one warp fold the row's
+# partial sums.
 OP_A_PDL_ONLY = {
     "abel": {"ab_hint": "el"},
     "pk": {"packed": True},
@@ -282,11 +286,13 @@ OP_A_PDL_ONLY = {
     "l2i": {"l2_prefetch": 304, "in_bulk": "res"},
     "l2w": {"l2_prefetch": 304, "wave0": "own"},
     "l2o": {"l2_prefetch": 304, "out_bulk": True},
+    "l2s": {"l2_prefetch": 304, "fold_one": True},
 }
 # On sm_103a the L2-prefetch forms own the PDL routes from 513 rows up in both modes: in mode 0 the
-# late-rebuild form at 513-768, l2 at 769-1536 and 2049-5120 around a gap at 1537-2048, the bulk-residual form at
-# 5121-7168, the first-wave form at 7169-8191 and the bulk-store form from 8192; in mode 1 l2 at 513-5632 and
-# 7169-8191 around the first-wave form's 5633-7168, the bulk-store form from 8192.
+# late-rebuild form at 513-768, the one-warp-fold form at 769-1024, l2 at 1025-1536 and 2049-5120 around a gap at
+# 1537-2048, the bulk-residual form at 5121-7168, the first-wave form at 7169-8191 and the bulk-store form from 8192;
+# in mode 1 l2 at 513-5632 and 7169-7680, the first-wave form at 5633-7168 and 7681-8191, the bulk-store form from
+# 8192.
 OP_A_PDL_WINDOWS = {
     ("sm_100a", 0): (
         (16, "c2"),
@@ -319,6 +325,7 @@ OP_A_PDL_WINDOWS = {
         (384, "pk"),
         (512, "pro"),
         (768, "l2x"),
+        (1024, "l2s"),
         (1536, "l2"),
         (2048, None),
         (5120, "l2"),
@@ -334,7 +341,8 @@ OP_A_PDL_WINDOWS = {
         (512, "pro"),
         (5632, "l2"),
         (7168, "l2w"),
-        (8191, "l2"),
+        (7680, "l2"),
+        (8191, "l2w"),
         (None, "l2o"),
     ),
 }
@@ -1272,10 +1280,14 @@ OP_A_PROBE_ROWS = (
     5633,
     7168,
     7169,
+    7680,
+    7681,
     8191,
     8192,
     8193,
     16384,
+    17408,
+    17409,
     10**6,
 )
 
@@ -1286,9 +1298,9 @@ def test_gated_residual_rmsnorm_routes_window_the_row_count():
     partition the rows above 128 (the parked program's late-store form a sixth record on sm_100a in mode 1 and in
     the parked program's place on sm_103a in mode 1; on sm_103a the prologue program's L2-prefetch forms own the
     rows from 1024 up: in mode 0 the plain prefetch form up to 8192 rows and the residual-only form above, beside
-    the parked program and the prologue program (seven records), in mode 1 the plain prefetch form alone beside the
-    late-store form (five records)); the records appear in the route in window order, each once, and the programs
-    of a variant differ only by their windows."""
+    the parked program and the prologue program (seven records), in mode 1 the plain prefetch form up to 17408 rows
+    and its bulk-plane form above, beside the late-store form (six records)); the records appear in the route in
+    window order, each once, and the programs of a variant differ only by their windows."""
     for (arch, mode), table in OP_A_PLAIN_WINDOWS.items():
         route = loader.route_key(OP_A, f"mode{mode}")
         names = loader.route_modules(arch, route)
@@ -1320,7 +1332,7 @@ def test_gated_residual_rmsnorm_routes_window_the_row_count():
             late_form = loader.MODULES[programs["psb_late"]]["build"]
             assert late_form["planes_smem"] == "beta"
             assert late_form["planes_path"] == "sts_late"
-        for place in ("rsa", "pro", "psb", "psb_late", "l2", "l2r"):
+        for place in ("rsa", "pro", "psb", "psb_late", "l2", "l2r", "l2b"):
             if place not in programs:
                 continue
             window = loader.MODULES[programs[place]]

@@ -18,8 +18,10 @@ kernels (SM100 / SM103 / SM107): the ``flashinfer.cake_mhc_det_train`` facade an
 its re-exports from the ``flashinfer`` top-level package.  The facade's entry
 points are pass-throughs to ``flashinfer.cake_mhc_det_train_backend``; this module
 checks that identity (same objects at the top level, same bits as the backend,
-documented keyword arguments) and leaves the numerical contract to
-``test_cake_mhc_det_train.py``, which imports only the backend package.
+documented keyword arguments, the ``hidden`` keyword of the workspace helpers)
+at each hidden size (4096, 5120, 7168) the device exports, and leaves the
+numerical contract to ``test_cake_mhc_det_train.py``, which imports only the
+backend package.
 """
 
 from __future__ import annotations
@@ -52,6 +54,13 @@ HELPERS = (
     "CakeMHCDetTrainPrepareFunction",
     "CakeMHCDetTrainFinishFunction",
 )
+WORKSPACE_HELPERS = (
+    "cake_mhc_det_train_forward_workspace",
+    "cake_mhc_det_train_backward_workspace",
+    "cake_mhc_det_train_forward_workspace_bytes",
+    "cake_mhc_det_train_backward_workspace_bytes",
+)
+HIDDEN_SIZES = tuple(loader.HIDDEN_SIZES)
 SEED = 2032
 
 
@@ -99,6 +108,20 @@ def test_entry_points_document_every_keyword() -> None:
         assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
 
 
+def test_workspace_helpers_take_the_hidden_size() -> None:
+    """The four workspace helpers size for one hidden size: a keyword-only ``hidden`` defaulting to 4096, named in
+    the docstring; the facade re-exports the backend's objects."""
+    assert HIDDEN_SIZES == (4096, 5120, 7168)
+    for name in WORKSPACE_HELPERS:
+        function = getattr(facade, name)
+        assert function is getattr(backend, name), name
+        parameter = inspect.signature(function).parameters.get("hidden")
+        assert parameter is not None, name
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY, name
+        assert parameter.default == 4096, name
+        assert "hidden" in (inspect.getdoc(function) or ""), name
+
+
 pytestmark_gpu = pytest.mark.skipif(
     not _supported(),
     reason="cake_mhc_det_train needs an SM100 / SM103 / SM107 device with exported routes",
@@ -113,7 +136,7 @@ def warmup_jit():
     yield
 
 
-def _inputs(T: int) -> dict[str, torch.Tensor]:
+def _inputs(T: int, hidden: int) -> dict[str, torch.Tensor]:
     generator = torch.Generator(device=_device()).manual_seed(SEED)
 
     def randn(*shape: int, dtype: torch.dtype = torch.float32) -> torch.Tensor:
@@ -122,21 +145,32 @@ def _inputs(T: int) -> dict[str, torch.Tensor]:
         ).to(dtype)
 
     return {
-        "X": randn(T, 4, 4096, dtype=torch.bfloat16),
-        "fn": (randn(24, 16384) * 1e-2).contiguous(),
+        "X": randn(T, 4, hidden, dtype=torch.bfloat16),
+        "fn": (randn(24, 4 * hidden) * 1e-2).contiguous(),
         "scale": 1.0 + 0.1 * randn(3),
         "base": 0.1 * randn(24),
-        "B": randn(T, 4096, dtype=torch.bfloat16),
-        "dY": randn(T, 4, 4096, dtype=torch.bfloat16),
-        "dU": randn(T, 4096, dtype=torch.bfloat16),
+        "B": randn(T, hidden, dtype=torch.bfloat16),
+        "dY": randn(T, 4, hidden, dtype=torch.bfloat16),
+        "dU": randn(T, hidden, dtype=torch.bfloat16),
     }
+
+
+@pytest.fixture(params=HIDDEN_SIZES, ids=lambda h: f"H{h}")
+def hidden(request) -> int:
+    """Each hidden size of the package; skipped where the device's architecture exports no route for it."""
+    if not facade.is_cake_mhc_det_train_supported(_device(), request.param):
+        pytest.skip(
+            f"hidden {request.param} has no exported route on this device "
+            f"(compute capability {get_compute_capability(_device())})"
+        )
+    return request.param
 
 
 @pytestmark_gpu
 @pytest.mark.parametrize("T", (129,))
-def test_facade_entry_points_match_the_backend(T: int) -> None:
+def test_facade_entry_points_match_the_backend(T: int, hidden: int) -> None:
     """The facade forwards every argument: each entry point returns the same bits as the backend package's."""
-    i = _inputs(T)
+    i = _inputs(T, hidden)
     U, stats = facade.cake_mhc_det_train_forward_prepare(
         i["X"], i["fn"], i["scale"], i["base"]
     )
@@ -173,15 +207,24 @@ def test_facade_entry_points_match_the_backend(T: int) -> None:
     outputs = facade.cake_mhc_det_train_backward_finish(*args)
     outputs_b = backend.cake_mhc_det_train_backward_finish(*args)
     assert all(torch.equal(a, b) for a, b in zip(outputs, outputs_b, strict=False))
-    assert facade.cake_mhc_det_train_forward_workspace_bytes(
-        T, _device()
-    ) == backend.cake_mhc_det_train_forward_workspace_bytes(T, _device())
+    for name in WORKSPACE_HELPERS[2:]:
+        assert getattr(facade, name)(T, _device(), hidden=hidden) == getattr(
+            backend, name
+        )(T, _device(), hidden=hidden), (name, hidden)
+    ws_f = facade.cake_mhc_det_train_forward_workspace(T, _device(), hidden=hidden)
+    ws_b = facade.cake_mhc_det_train_backward_workspace(T, _device(), hidden=hidden)
+    U_w, stats_w = facade.cake_mhc_det_train_forward_prepare(
+        i["X"], i["fn"], i["scale"], i["base"], workspace=ws_f
+    )
+    assert torch.equal(U_w, U) and torch.equal(stats_w, stats)
+    outputs_w = facade.cake_mhc_det_train_backward_finish(*args, workspace=ws_b)
+    assert all(torch.equal(a, b) for a, b in zip(outputs_w, outputs, strict=True))
 
 
 @pytestmark_gpu
-def test_autograd_wrappers_match_the_backend() -> None:
+def test_autograd_wrappers_match_the_backend(hidden: int) -> None:
     T = 65
-    i = _inputs(T)
+    i = _inputs(T, hidden)
     grads = []
     for module in (facade, backend):
         X = i["X"].clone().requires_grad_(True)

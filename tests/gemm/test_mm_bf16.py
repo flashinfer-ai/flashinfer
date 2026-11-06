@@ -42,8 +42,6 @@ _SMOKE_CASES = [
     (8, 768, 7168, torch.bfloat16, True, True, "cute-dsl", True),
     (17, 2304, 1536, torch.bfloat16, False, False, "cute-dsl", False),
     (8, 768, 8320, torch.bfloat16, False, False, "cute-dsl", False),
-    (33, 256, 512, torch.bfloat16, True, True, "cute-dsl", False),
-    (64, 256, 512, torch.bfloat16, True, True, "cute-dsl", False),
     (64, 4096, 2048, torch.bfloat16, False, False, "auto", True),
     (1, 2048, 3072, torch.float16, False, False, "auto", False),
     # pdl=None: untuned runs without PDL; autotuning also profiles PDL variants.
@@ -169,6 +167,86 @@ def test_mm_bf16_autotune_weight_layouts(monkeypatch, backend, padded):
     with autotune(True, tuning_buckets=[16]):
         out = mm_bf16(a, b, backend=backend)
     torch.testing.assert_close(out, a @ b, rtol=2e-2, atol=5e-2)
+
+
+@pytest.mark.parametrize("n,k", [(1, 2560), (12, 5120)])
+def test_mm_bf16_autotune_unaligned_n(monkeypatch, n, k):
+    """Tuning auto must skip CUTLASS, not abort, when N breaks its 16-byte rows.
+
+    N=1 is an MoE shared_expert_gate, N=12 a linear-attention in_proj_ba at TP8.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("The CUTLASS BF16 backend is used on SM100-family.")
+
+    monkeypatch.setattr(AutoTuner, "_instance", AutoTuner())
+
+    # Correctness alone does not pin this down: the tuner already caught
+    # CUTLASS's host-side can_implement rejection and moved on, so the result
+    # was right either way. Assert the shape never reaches CUTLASS at all.
+    profiled = set()
+    profile_single_kernel = AutoTuner._profile_single_kernel
+
+    def record_runner(self, runner, *args, **kwargs):
+        profiled.add(type(runner).__name__)
+        return profile_single_kernel(self, runner, *args, **kwargs)
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", record_runner)
+
+    torch.manual_seed(0)
+    a = torch.randn(64, k, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    with autotune(True, tuning_buckets=[1, 32, 64]):
+        mm_bf16(a, w.T, backend="auto")
+
+    assert profiled, "autotuning profiled nothing, so the assertion below is vacuous"
+    assert "CutlassBf16GemmRunner" not in profiled, profiled
+
+    for m in (1, 32, 64):
+        out = mm_bf16(a[:m], w.T, backend="auto")
+        reference = (a[:m].float() @ w.float().T).to(torch.bfloat16)
+        torch.testing.assert_close(out, reference, rtol=2e-2, atol=5e-2)
+
+
+@pytest.mark.parametrize("pdl", [False, True])
+def test_mm_bf16_tgv_single_element_output(pdl):
+    """M = N = 1: the 1x1 output's batch dim also has stride 1."""
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    cc_num = compute_capability[0] * 10 + compute_capability[1]
+    if not mm_bf16.is_backend_supported("tgv", cc_num):
+        pytest.skip("TGV backend not supported on current compute capability.")
+
+    torch.manual_seed(0)
+    a = torch.randn(1, 2560, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(1, 2560, device="cuda", dtype=torch.bfloat16)
+    out = mm_bf16(a, w.T, pdl=pdl, backend="tgv")
+    reference = (a.float() @ w.float().T).to(torch.bfloat16)
+    torch.testing.assert_close(out, reference, rtol=2e-2, atol=5e-2)
+
+
+@pytest.mark.parametrize(
+    "n,k,out_dtype,supported",
+    [
+        (12, 2560, torch.bfloat16, False),
+        (16, 2564, torch.bfloat16, False),
+        (12, 2560, torch.float32, True),
+    ],
+)
+def test_mm_bf16_cutlass_alignment(n, k, out_dtype, supported):
+    """CUTLASS needs K % 8 == 0 and 16-byte output rows; reject others up front."""
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    cc_num = compute_capability[0] * 10 + compute_capability[1]
+    if not mm_bf16.is_backend_supported("cutlass", cc_num):
+        pytest.skip("cutlass backend not supported on current compute capability.")
+
+    torch.manual_seed(0)
+    a = torch.randn(16, k, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    if not supported:
+        with pytest.raises(ValueError, match="CUTLASS backend requires K divisible"):
+            mm_bf16(a, w.T, out_dtype=out_dtype, backend="cutlass")
+        return
+    out = mm_bf16(a, w.T, out_dtype=out_dtype, backend="cutlass")
+    torch.testing.assert_close(out, a.float() @ w.float().T, rtol=2e-2, atol=5e-2)
 
 
 @pytest.mark.parametrize("backend", ["tinygemm", "tgv"])
@@ -471,6 +549,42 @@ def test_mm_bf16_cute_dsl_one_stage_splitk(enable_bias: bool):
     reference = F.linear(a, b, bias)
     cos_sim = F.cosine_similarity(reference.reshape(-1), out.reshape(-1), dim=0)
     assert cos_sim > 0.99
+
+
+@pytest.mark.parametrize("pdl", [False, None])
+def test_mm_bf16_cute_dsl_low_m_only(monkeypatch, pdl):
+    """backend="cute-dsl" serves M <= 32 only. Under "auto", a larger M still
+    lists its low-M runners (one large-M warm-up tunes the M <= 32 buckets)
+    and cuBLASLt only once, as its own backend."""
+    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("CuTeDSL low-M backend requires SM100/SM103/SM107.")
+
+    from flashinfer.cute_dsl.utils import is_cute_dsl_available
+    from flashinfer.gemm import gemm_base
+
+    if not is_cute_dsl_available():
+        pytest.skip("nvidia-cutlass-dsl is not available.")
+
+    a = torch.randn(64, 1024, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(2048, 1024, device="cuda", dtype=torch.bfloat16).T
+    with pytest.raises(ValueError, match="M <= 32"):
+        mm_bf16(a, b, pdl=pdl, backend="cute-dsl")
+
+    choose_one = AutoTuner.choose_one
+    runner_lists = []
+
+    def record(self, custom_op, runners, *args, **kwargs):
+        if custom_op.startswith("bf16_gemm"):
+            runner_lists.append(runners)
+        return choose_one(self, custom_op, runners, *args, **kwargs)
+
+    monkeypatch.setattr(AutoTuner, "choose_one", record)
+    out = mm_bf16(a, b, pdl=pdl, backend="auto")
+    (runners,) = runner_lists
+    names = [type(runner).__name__ for runner in runners]
+    assert sum("Cublaslt" in name for name in names) == 1, names
+    assert any(isinstance(r, gemm_base._CuteDSLBf16Runner) for r in runners), names
+    torch.testing.assert_close(out, a @ b, rtol=2e-2, atol=5e-2)
 
 
 if __name__ == "__main__":

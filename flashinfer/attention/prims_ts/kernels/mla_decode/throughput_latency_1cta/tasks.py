@@ -1264,6 +1264,7 @@ def create_throughput_latency_load_task(
             """Select the native paged swaps cache or the existing load path."""
             nonlocal cached_page_ids
             if reuse_delayed_v_page_ids:
+                assert not cfg.early_raw_snapshot
                 cached_page_ids = _staged_kv_load_with_reused_page_ids(
                     smem_kv,
                     head_dim_stages=head_dim_stages,
@@ -1278,6 +1279,12 @@ def create_throughput_latency_load_task(
                 cached_page_ids = staged_kv_load(
                     smem_kv,
                     whole_kv=cfg.whole_kv_tile,
+                    pre_acquire_label=(
+                        "snapshot_raw_record"
+                        if cfg.early_raw_snapshot
+                        and producer_label.startswith("load_k")
+                        else None
+                    ),
                     head_dim_stages=head_dim_stages,
                     producer_label=producer_label,
                     section=section,

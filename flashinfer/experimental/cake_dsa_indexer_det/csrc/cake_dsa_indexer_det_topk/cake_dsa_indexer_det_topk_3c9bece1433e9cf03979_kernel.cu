@@ -40,37 +40,6 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 384
-#define TMEM_TMEM_ACC_OFFSET 0
-#define NUM_Q_PIPE_STAGES 1
-#define NUM_K_PIPE_STAGES 4
-#define NUM_TMEM_PIPE_STAGES 2
-#define NUM_TMEM_LAP_PIPE_STAGES 1
-#define NUM_VERDICT_PIPE_STAGES 1
-#define SMEM_SMEM_Q_OFF 1024
-#define SMEM_SMEM_Q_STAGE_BYTES 49152
-#define SMEM_SMEM_Q_STRIDE 49152
-#define SMEM_SMEM_W_OFF 50176
-#define SMEM_SMEM_W_STAGE_BYTES 768
-#define SMEM_SMEM_W_STRIDE 768
-#define SMEM_SMEM_K_OFF 51200
-#define SMEM_SMEM_K_STAGE_BYTES 32768
-#define SMEM_SMEM_K_STRIDE 32768
-#define SMEM_S_HIST_OFF 182272
-#define SMEM_S_HIST_STAGE_BYTES 12288
-#define SMEM_S_HIST_STRIDE 12288
-#define SMEM_S_COUNT_OFF 194560
-#define SMEM_S_COUNT_STAGE_BYTES 72
-#define SMEM_S_COUNT_STRIDE 72
-#define SMEM_S_TAU_OFF 194632
-#define SMEM_S_TAU_STAGE_BYTES 144
-#define SMEM_S_TAU_STRIDE 144
-#define SMEM_S_FAIL_OFF 194776
-#define SMEM_S_FAIL_STAGE_BYTES 24
-#define SMEM_S_FAIL_STRIDE 24
-#define SMEM_TOTAL 194944
-#define TILE_UNROLL 1
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -194,7 +163,7 @@ __device__ __forceinline__ void tcgen05_commit(int mbar_addr) {
 
 __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
     uint32_t result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xFFFFFFFF;"
         : "=r"(result) : "r"(val));
     return result;
 }
@@ -202,7 +171,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) void
-kernel_cake_dsa_indexer_det_topk_3c9bece1433e9cf03979(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap W, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, long long* __restrict__ q_offsets, int* __restrict__ Indices, float* __restrict__ Scores, long long* __restrict__ Cand, int num_segments, int top_k, int ratio, int has_offsets, int cand_cap, int first_cap, int sample_tiles_max, int sample_shift_permille, int far_sample, int check_period, int grid_ctas, float softmax_scale, int n_split)
+kernel_cake_dsa_indexer_det_topk_3c9bece1433e9cf03979(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap W, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, long long* __restrict__ q_offsets, int* __restrict__ Indices, float* __restrict__ Scores, long long* __restrict__ Cand, int num_segments, int top_k, int ratio, int has_offsets, int cand_cap, int first_cap, int sample_tiles_max, int sample_shift_permille, int far_sample, int check_period, int grid_ctas, float softmax_scale, int n_split, float* __restrict__ K_scale, unsigned int* __restrict__ TicketWord)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -225,13 +194,14 @@ kernel_cake_dsa_indexer_det_topk_3c9bece1433e9cf03979(const __grid_constant__ CU
     #define umma_full_addr (mbar_base + 80)
     #define umma_empty_addr (mbar_base + 96)
     #define verdict_bar_addr (mbar_base + 112)
+    #define verdict_ack_addr (mbar_base + 120)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* smem_q = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int smem_q_addr = smem + 1024;
     float* smem_w = reinterpret_cast<float*>(smem_raw + 50176);
@@ -246,12 +216,13 @@ kernel_cake_dsa_indexer_det_topk_3c9bece1433e9cf03979(const __grid_constant__ CU
     const int s_tau_addr = smem + 194632;
     int* s_fail = reinterpret_cast<int*>(smem_raw + 194776);
     const int s_fail_addr = smem + 194776;
+
+    // Kernel setup ops
     if (warp == 12) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&Q))) : "memory"); }
     if (warp == 12) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&K))) : "memory"); }
     if (warp == 12) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&W))) : "memory"); }
 
-    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 15 barriers)
-    // Mbarriers at smem_raw[0..120)
+    // Mbarrier init (16 barriers at smem_raw[0..128))
 
     if (warp == 13) {
         uint32_t leader = elect_sync();
@@ -282,6 +253,8 @@ kernel_cake_dsa_indexer_det_topk_3c9bece1433e9cf03979(const __grid_constant__ CU
             // --- pipeline 'verdict_pipe' ---
             // verdict_bar: 1 barriers, init_count=12
             mbarrier_init(smem + 112, 12);
+            // verdict_ack: 1 barriers, init_count=2
+            mbarrier_init(smem + 120, 2);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -289,9 +262,9 @@ kernel_cake_dsa_indexer_det_topk_3c9bece1433e9cf03979(const __grid_constant__ CU
     __syncwarp();
 
     // TMEM alloc (512 columns, 384 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 120);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 128);
     if (warp == 14) {
-        int _tmem_hold = smem + 120;
+        int _tmem_hold = smem + 128;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
         __syncwarp();
     }
@@ -299,10 +272,10 @@ kernel_cake_dsa_indexer_det_topk_3c9bece1433e9cf03979(const __grid_constant__ CU
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_tmem_acc = taddr;
 
     // Kernel post-init ops
-    const int tmem_tmem_acc = taddr;
     asm volatile("griddepcontrol.wait;" ::: "memory");
 
     // ---- Role: load_q ----
@@ -310,6 +283,7 @@ kernel_cake_dsa_indexer_det_topk_3c9bece1433e9cf03979(const __grid_constant__ CU
         asm volatile("setmaxnreg.dec.sync.aligned.u32 56;");
         { // load_q_main
             unsigned int _phase_q_empty = 1;
+            unsigned int _phase_verdict_ack = 1;
             unsigned int _phase_verdict_bar = 0;
             if (elect_sync()) {
                 int unit_base_q = 0;
@@ -332,6 +306,10 @@ kernel_cake_dsa_indexer_det_topk_3c9bece1433e9cf03979(const __grid_constant__ CU
                                 mbarrier_wait(q_empty_addr, _phase_q_empty);
                                 tma_3d_gmem2smem(smem_q_addr + 0 * 49152, (&Q), 0, (q0 + blk * 6) * 32, 0, q_full_addr);
                                 tma_2d_gmem2smem(smem_w_addr + 0 * 768, (&W), 0, q0 + blk * 6, q_full_addr);
+                                if (attempt == 0) {
+                                    mbarrier_wait(verdict_ack_addr, _phase_verdict_ack);
+                                    _phase_verdict_ack ^= 1;
+                                }
                                 mbarrier_arrive_expect_tx(q_full_addr, 49920);
                                 _phase_q_empty ^= 1;
                                 if (attempt == 0) {
@@ -376,8 +354,8 @@ kernel_cake_dsa_indexer_det_topk_3c9bece1433e9cf03979(const __grid_constant__ CU
                         int _min_0_1 = ((unit_1 - unit_base_k) < (unit_base_k + nb_1 - 1 - unit_1) ? (unit_1 - unit_base_k) : (unit_base_k + nb_1 - 1 - unit_1));
                         if (_min_0_1 >= 0) {
                             int blk_1 = nb_1 - 1 - (unit_1 - unit_base_k);
-                            int q0_0 = cu_seqlens_q[seg_1];
-                            int lq_0 = cu_seqlens_q[seg_1 + 1] - q0_0;
+                            int q0_1_1 = cu_seqlens_q[seg_1];
+                            int lq_0 = cu_seqlens_q[seg_1 + 1] - q0_1_1;
                             int lk = cu_seqlens_k[seg_1 + 1] - cu_seqlens_k[seg_1];
                             long long off = 0;
                             if (has_offsets != 0) {
@@ -450,6 +428,7 @@ kernel_cake_dsa_indexer_det_topk_3c9bece1433e9cf03979(const __grid_constant__ CU
                                     int f_1 = s_fail[0] | s_fail[1] | s_fail[2] | s_fail[3];
                                     f_1 = f_1 | s_fail[4];
                                     f_1 = f_1 | s_fail[5];
+                                    mbarrier_arrive(verdict_ack_addr);
                                     if (f_1 == 0) {
                                         break;
                                     }
@@ -487,8 +466,8 @@ kernel_cake_dsa_indexer_det_topk_3c9bece1433e9cf03979(const __grid_constant__ CU
                     int _min_0_2 = ((unit_2 - unit_base_m) < (unit_base_m + nb_2 - 1 - unit_2) ? (unit_2 - unit_base_m) : (unit_base_m + nb_2 - 1 - unit_2));
                     if (_min_0_2 >= 0) {
                         int blk_2 = nb_2 - 1 - (unit_2 - unit_base_m);
-                        int q0_1_1 = cu_seqlens_q[seg_2];
-                        int lq_2_1 = cu_seqlens_q[seg_2 + 1] - q0_1_1;
+                        int q0_2_1 = cu_seqlens_q[seg_2];
+                        int lq_2_1 = cu_seqlens_q[seg_2 + 1] - q0_2_1;
                         int lk_1 = cu_seqlens_k[seg_2 + 1] - cu_seqlens_k[seg_2];
                         long long off_2 = 0;
                         if (has_offsets != 0) {
@@ -602,6 +581,9 @@ kernel_cake_dsa_indexer_det_topk_3c9bece1433e9cf03979(const __grid_constant__ CU
                                     vread_m = (int)f_2;
                                 }
                                 int vword_m = __shfl_sync(0xFFFFFFFF, vread_m, 0);
+                                if (lane == 0) {
+                                    mbarrier_arrive(verdict_ack_addr);
+                                }
                                 if (vword_m == 0) {
                                     break;
                                 }
@@ -672,18 +654,18 @@ kernel_cake_dsa_indexer_det_topk_3c9bece1433e9cf03979(const __grid_constant__ CU
                     if (_min_0_3 >= 0) {
                         int blk_3 = nb_3 - 1 - (unit_3 - unit_base);
                         int u_base = blk_3 * 6;
-                        int q0_2_1 = cu_seqlens_q[seg_3];
-                        int lq_3_1 = cu_seqlens_q[seg_3 + 1] - q0_2_1;
+                        int q0_3_1 = cu_seqlens_q[seg_3];
+                        int lq_3_1 = cu_seqlens_q[seg_3 + 1] - q0_3_1;
                         int lk_0 = cu_seqlens_k[seg_3 + 1] - cu_seqlens_k[seg_3];
-                        long long off_1_2 = 0;
+                        long long off_3_1 = 0;
                         if (has_offsets != 0) {
-                            off_1_2 = q_offsets[seg_3];
+                            off_3_1 = q_offsets[seg_3];
                         } else if (ratio == 1) {
-                            off_1_2 = (long long)lk_0 - (long long)lq_3_1;
+                            off_3_1 = (long long)lk_0 - (long long)lq_3_1;
                         }
-                        long long off_1_0 = off_1_2;
+                        long long off_1_2 = off_3_1;
                         int last_u_2 = ((blk_3 * 6 + 5) < (lq_3_1 - 1) ? (blk_3 * 6 + 5) : (lq_3_1 - 1));
-                        long long num_2 = off_1_0 + (long long)last_u_2 + 1;
+                        long long num_2 = off_1_2 + (long long)last_u_2 + 1;
                         int vis_2 = 0;
                         if (num_2 > 0) {
                             long long quotient_2 = num_2 / (long long)ratio;
@@ -775,7 +757,7 @@ kernel_cake_dsa_indexer_det_topk_3c9bece1433e9cf03979(const __grid_constant__ CU
                             int d_pos = 0;
                             int r_pos = 0;
                             int until_check = check_period - 1;
-                            constexpr int ti_2_unroll = TILE_UNROLL;
+                            constexpr int ti_2_unroll = 1;
                             #pragma unroll ti_2_unroll
                             for (int ti_2 = 0; ti_2 < n_tiles_5; ti_2++) {
                                 int tile_1 = d_pos;
@@ -888,8 +870,8 @@ kernel_cake_dsa_indexer_det_topk_3c9bece1433e9cf03979(const __grid_constant__ CU
                                     if (magnitude_1 > nan_floor) {
                                         key32_1 = zero_u;
                                     }
-                                    unsigned long long key64_1 = (unsigned long long)key32_1 << 32 | (unsigned long long)(unsigned int)kid;
-                                    unsigned long long okey = key64_1;
+                                    unsigned long long key64_2 = (unsigned long long)key32_1 << 32 | (unsigned long long)(unsigned int)kid;
+                                    unsigned long long okey = key64_2;
                                     unsigned long long flag_o = ((bits2[0] == sign_mask) ? flag64 : zero_u64);
                                     okey = okey | flag_o;
                                     Cand[slot_1_0] = (long long)okey;
@@ -903,8 +885,8 @@ kernel_cake_dsa_indexer_det_topk_3c9bece1433e9cf03979(const __grid_constant__ CU
                                     if (magnitude_2 > nan_floor) {
                                         key32_2 = zero_u;
                                     }
-                                    unsigned long long key64_2 = (unsigned long long)key32_2 << 32 | (unsigned long long)(unsigned int)kid;
-                                    unsigned long long okey_1 = key64_2;
+                                    unsigned long long key64_4 = (unsigned long long)key32_2 << 32 | (unsigned long long)(unsigned int)kid;
+                                    unsigned long long okey_1 = key64_4;
                                     unsigned long long flag_o_1 = ((bits2[1] == sign_mask) ? flag64 : zero_u64);
                                     okey_1 = okey_1 | flag_o_1;
                                     Cand[slot_1_1] = (long long)okey_1;
@@ -1183,7 +1165,7 @@ kernel_cake_dsa_indexer_det_topk_3c9bece1433e9cf03979(const __grid_constant__ CU
                                                 }
                                                 cum_above += lane_bins[0];
                                                 int target_lane;
-                                                asm volatile("redux.sync.max.s32 %0, %1, 0xffffffff;" : "=r"(target_lane) : "r"(is_target * lane_0));
+                                                asm volatile("redux.sync.max.s32 %0, %1, 0xFFFFFFFF;" : "=r"(target_lane) : "r"(is_target * lane_0));
                                                 int digit_sel = __shfl_sync(0xFFFFFFFF, d_sel, target_lane);
                                                 int above_cnt = __shfl_sync(0xFFFFFFFF, above_sel, target_lane);
                                                 int bucket_cnt = __shfl_sync(0xFFFFFFFF, count_sel, target_lane);
@@ -1460,7 +1442,7 @@ kernel_cake_dsa_indexer_det_topk_3c9bece1433e9cf03979(const __grid_constant__ CU
                                         }
                                         cum_above_1 += lane_bins_1[0];
                                         int target_lane_1;
-                                        asm volatile("redux.sync.max.s32 %0, %1, 0xffffffff;" : "=r"(target_lane_1) : "r"(is_target_1 * lane_0));
+                                        asm volatile("redux.sync.max.s32 %0, %1, 0xFFFFFFFF;" : "=r"(target_lane_1) : "r"(is_target_1 * lane_0));
                                         int digit_sel_1 = __shfl_sync(0xFFFFFFFF, d_sel_1, target_lane_1);
                                         int above_cnt_1 = __shfl_sync(0xFFFFFFFF, above_sel_1, target_lane_1);
                                         int bucket_cnt_1 = __shfl_sync(0xFFFFFFFF, count_sel_1, target_lane_1);

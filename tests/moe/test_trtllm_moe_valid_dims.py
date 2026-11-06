@@ -25,7 +25,12 @@ from flashinfer.fused_moe.core import (
     _round_up,
     _trtllm_moe_output_width,
 )
-from flashinfer.utils import device_support_pdl, get_compute_capability
+from flashinfer.utils import (
+    device_support_pdl,
+    get_compute_capability,
+    get_shuffle_matrix_a_row_indices,
+    get_shuffle_matrix_sf_a_row_indices,
+)
 
 # The contract mirrored by this file (identical to TensorRT-LLM's
 # mxFp4BlockScaleMoe.cpp / fp4BlockScaleMoe.cpp), for a declared valid_hidden_size:
@@ -149,6 +154,37 @@ def test_check_valid_hidden_size_supports_finalize_rejects(
         _check_valid_hidden_size_supports_finalize(
             valid_hidden_size, False, hidden_size
         )
+
+
+_SHUFFLE_ROW_INDEX_HELPERS = [
+    pytest.param(get_shuffle_matrix_a_row_indices, 32, id="a"),
+    pytest.param(get_shuffle_matrix_sf_a_row_indices, 128, id="sf_a"),
+]
+
+
+@pytest.mark.parametrize(
+    ("helper", "num_rows"),
+    [
+        # Nemotron Nano intermediate sizes (TP1 / TP2) and the #3206 TP4 shard.
+        pytest.param(get_shuffle_matrix_sf_a_row_indices, 1856, id="sf_a-1856"),
+        pytest.param(get_shuffle_matrix_sf_a_row_indices, 928, id="sf_a-928"),
+        pytest.param(get_shuffle_matrix_sf_a_row_indices, 176, id="sf_a-176"),
+        pytest.param(get_shuffle_matrix_a_row_indices, 176, id="a-176"),
+    ],
+)
+def test_shuffle_row_indices_unaligned_rows_name_valid_dims(helper, num_rows):
+    weight = torch.empty(num_rows, 64, dtype=torch.uint8)
+    with pytest.raises(AssertionError, match="valid_intermediate_size"):
+        helper(weight, epilogue_tile_m=128)
+
+
+@pytest.mark.parametrize(("helper", "alignment"), _SHUFFLE_ROW_INDEX_HELPERS)
+@pytest.mark.parametrize("num_rows", [1920, 3712])
+def test_shuffle_row_indices_aligned_rows_is_permutation(helper, alignment, num_rows):
+    assert num_rows % alignment == 0
+    weight = torch.empty(num_rows, 64, dtype=torch.uint8)
+    row_indices = helper(weight, epilogue_tile_m=128)
+    assert torch.equal(row_indices.sort().values, torch.arange(num_rows))
 
 
 # Numerical test for valid_hidden_size.

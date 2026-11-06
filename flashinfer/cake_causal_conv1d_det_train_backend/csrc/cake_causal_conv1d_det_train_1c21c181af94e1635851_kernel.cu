@@ -47,13 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define SMEM_RED_OFF 0
-#define SMEM_RED_STAGE_BYTES 2560
-#define SMEM_RED_STRIDE 2560
-#define SMEM_TOTAL 2560
-#define THREADS 128
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -81,7 +74,7 @@ kernel_cake_causal_conv1d_det_train_1c21c181af94e1635851(float* __restrict__ par
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* red = reinterpret_cast<float*>(smem_raw + 0);
     const int red_addr = smem + 0;
 

@@ -1,0 +1,6 @@
+--routine causal_conv1d_fn --batch_size 32 --seq_len 512 --dim 4096 --has_initial_state --backends flashinfer triton --refcheck --dry_run_iters 10 --num_iters 20 --case_tag prefill-n32
+--routine causal_conv1d_fn --batch_size 33 --seq_lens 497 497 497 497 497 497 497 497 497 497 497 497 497 497 497 497 497 497 497 497 497 497 497 497 497 497 497 497 497 497 497 497 480 --dim 4096 --has_initial_state --backends triton flashinfer --refcheck --dry_run_iters 10 --num_iters 20 --case_tag prefill-n33
+--routine causal_conv1d_fn --batch_size 64 --seq_len 256 --dim 4096 --has_initial_state --backends flashinfer triton --refcheck --dry_run_iters 10 --num_iters 20 --case_tag prefill-n64
+--routine causal_conv1d_fn --batch_size 128 --seq_len 128 --dim 8192 --has_initial_state --backends triton flashinfer --refcheck --dry_run_iters 10 --num_iters 20 --case_tag prefill-n128
+--routine causal_conv1d_fn --batch_size 256 --seq_len 64 --dim 8192 --has_initial_state --backends flashinfer triton --refcheck --dry_run_iters 10 --num_iters 20 --case_tag prefill-n256
+--routine causal_conv1d_fn --batch_size 64 --seq_len 512 --dim 4096 --varlen --has_initial_state --backends triton flashinfer --refcheck --dry_run_iters 10 --num_iters 20 --case_tag prefill-n64-varlen

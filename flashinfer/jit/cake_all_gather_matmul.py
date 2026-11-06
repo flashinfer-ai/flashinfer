@@ -112,7 +112,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_378badfea679e1bc51d7_kernel.cu",
         ],
-        "arches": ["sm_103a"],
+        "arches": ["sm_100a", "sm_103a"],
         "block": [192, 1, 1],
         "dynamic_smem_bytes": 197632,
     },
@@ -600,6 +600,7 @@ SEQUENCES: dict[str, dict[str, Any]] = {
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c37bb42697799791a7c5_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_17f60837feb11a634b34_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_9d5d20282a6a1082a079_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_378badfea679e1bc51d7_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws8_k_major_sm_100a.cu",
         ],
         "arches": ["sm_100a"],
@@ -615,6 +616,7 @@ SEQUENCES: dict[str, dict[str, Any]] = {
             "main_n128": "cake_all_gather_matmul_c37bb42697799791a7c5",
             "main_cg2": "cake_all_gather_matmul_17f60837feb11a634b34",
             "main_cg2s2": "cake_all_gather_matmul_9d5d20282a6a1082a079",
+            "main_cg1s2": "cake_all_gather_matmul_378badfea679e1bc51d7",
         },
     },
     "bfloat16_ws8_k_major_sm_103a": {
@@ -1130,7 +1132,7 @@ TILE_ORDER_POINTS: dict[str, list[list[Any]]] = {
 # idle CTAs; the one-CTA launch), per architecture; ``main_form`` selects a
 # point's program only inside this table.
 CG1S_CLASSES: dict[str, list[list[Any]]] = {
-    "sm_100a": [],
+    "sm_100a": [[8, "bfloat16", "k_major", "cg1s2"]],
     "sm_103a": [[8, "bfloat16", "k_major", "cg1s2"]],
 }
 # Frozen refinement of the one-CTA selection, copied from the kernel module:
@@ -1140,7 +1142,7 @@ CG1S_CLASSES: dict[str, list[list[Any]]] = {
 # the point's last-pass N-split twin iff its class, ``ceil128(rows)`` and exact
 # ``N`` match a point.
 CG1S_POINTS: dict[str, list[list[Any]]] = {
-    "sm_100a": [],
+    "sm_100a": [[8, "bfloat16", "k_major", 1152, 1280, "cg1s2"]],
     "sm_103a": [[8, "bfloat16", "k_major", 1152, 1280, "cg1s2"]],
 }
 

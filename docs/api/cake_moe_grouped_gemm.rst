@@ -38,13 +38,18 @@ Numerical contract of ``deterministic=False``
 
 Only the run-to-run bitwise reproducibility of the weight gradient ``dW`` is relaxed.  The
 forward ``Y`` and the data gradient ``dX`` are bitwise the deterministic package's (copies
-of the same programs), and so is ``dW`` wherever the 256-wide k tile runs.  With the
+of the same programs; on sm_100a the data gradient's L2 evict-first twin is the package's
+own build of the deterministic wide program, whose cache policy changes no arithmetic), and
+so is ``dW`` wherever the 256-wide k tile runs.  With the
 512-wide k tile, the tiles of the last partial wave are split into k-step units over the
 clusters; each unit adds its fp32 accumulator into the tile's fp32 sum with unordered
 reductions, and the last unit to arrive rounds the sum once and stores it, in the same
 launch (the deterministic package writes fp32 partials and sums them in a fixed order in
-a second launch).  Every whole tile is reduced by one CTA pair over the group's rows in a
-fixed order.  The operands (bf16), the accumulation (fp32), the one round-to-nearest
+a second launch).  With the slack tail placement, a launch whose tail tiles all fit in
+the room the full waves leave on the least-loaded clusters runs each tail tile whole on
+one cluster instead and touches no sum or ticket; otherwise its tail splits as above.
+Every whole tile is reduced by one CTA pair over the group's rows in a fixed order.  The
+operands (bf16), the accumulation (fp32), the one round-to-nearest
 rounding to bf16 (or the fp32 store), the layouts, the device-resident group offsets (no
 host synchronisation, no caller padding), the exact zeros of empty groups and the error
 budgets are those of the deterministic package.  The split tail's fp32 sums and tickets
@@ -54,6 +59,55 @@ a CUDA graph capture takes zeroed buffers of its own.
 The operator is local: on a context-parallel rank it runs on the rank's local rows, adds
 no collective, and leaves the reduction of a parameter gradient across ranks to the
 caller.
+
+Weight-gradient accumulation
+----------------------------
+
+``grouped_gemm_wgrad(..., out=out, accumulate=True)`` adds the weight gradient into the
+caller's bf16 or fp32 ``out`` (``out[e] += G[e].T @ X[e]``, Megatron's gradient-accumulation
+fusion) and ``cake_grouped_mm(..., fuse_wgrad_accumulation=True)`` adds it into
+``w.main_grad`` in its backward.  Both default to off; with the defaults nothing changes.
+The fused accumulate builds of this release add into an fp32 ``out`` only; a bf16 ``out``
+always takes the composed route (the bf16 overwrite, then the same-dtype ``out.add_``:
+autograd's AccumulateGrad bits and cost).  The host plans the launch exactly as the
+overwrite of ``out``'s dtype and records the route in ``plan["accumulate"]``:
+
+============== ======================================================================== =========================================================
+route          when                                                                     what runs
+============== ======================================================================== =========================================================
+``"fused"``    512-wide k tile with its unordered split tail, the selected stage has an  one launch whose epilogue adds the tile into ``out``
+               accumulate build on the architecture whose library can load, ``out``
+               32-byte aligned
+``"composed"`` otherwise (``plan["accumulate_reason"]``, the first that fails:          the overwrite into a scratch of ``out``'s dtype, then
+               ``"tile_k"``, ``"tail"``, ``"stage"`` -- every bf16 ``out`` --,          ``out.add_``
+               ``"min_cuda"``, ``"alignment"``; the last two warn once per process)
+============== ======================================================================== =========================================================
+
+An accumulate build is bound by a static rule (nothing is compiled, loaded or test-built to
+decide it): its prebuilt library exists, or the version of FlashInfer's JIT toolkit reaches
+its ``build.json`` ``min_cuda``.  The fp32 accumulate builds need CUDA 13.4; below it the
+call composes instead of failing.  ``out`` must not overlap itself, ``g``, ``x`` or ``offs``
+(``ValueError`` on both routes, before anything runs).  Every launch and every CUDA graph
+replay adds again.  Numerical contract: the fused route adds the tile's fp32 sum into the
+fp32 ``out`` with one round-to-nearest add that keeps subnormals (bitwise
+``out0.add_(dW32)`` on every whole tile); a split tail tile adds its unordered sum ``S``
+once (``S`` is the overwrite's partial sum, whose unit reductions flush subnormals; the
+nondeterminism scope is unchanged); the composed route is ``out.add_`` of the overwrite in
+``out``'s dtype; an empty group is not touched by the fused route, while the composed
+route has ``out.add_``'s semantics (values kept, ``-0.0`` may become ``+0.0``).  The
+composed scratch (the size of the weight gradient) is owned by the prepared launch: keep
+the launch alive while a CUDA graph that captured it may replay.  The autograd flag returns
+a placeholder gradient for ``w`` when ``w`` has ``grad_added_to_main_grad``
+(``torch.zeros`` under ``zero_out_wgrad``), else none; it adds at every backward, also when
+``torch.autograd.grad``'s ``inputs`` exclude ``w`` (split backward-weight schedules are not
+supported), and raises ``NotImplementedError`` under ``torch.jit.trace``, ``torch.compile``
+and a ``create_graph`` backward.
+
+Through the facade, ``accumulate=True`` on the deterministic route (``deterministic=True``,
+or torch's deterministic mode with its one-time warning) computes the deterministic weight
+gradient in ``out``'s dtype and adds it with ``out.add_`` after the same checks;
+``fuse_wgrad_accumulation=True`` on the deterministic route raises ``NotImplementedError``
+(the deterministic package has not adopted it yet).
 
 Functions
 ---------
@@ -66,9 +120,11 @@ autodoc before graduation):
 - ``grouped_gemm_dgrad(g, w, offs, out=None, *, deterministic=True)``: ``dX = G @ W[e]``
   per group (``W`` read in place), bf16 ``[sum_m, K]``;
 - ``grouped_gemm_wgrad(g, x, offs, out=None, out_dtype=None, num_groups=None, *,
-  deterministic=True)``: ``dW[e] = G[e].T @ X[e]``, bf16 or fp32 ``[E, N, K]``;
-- ``cake_grouped_mm(x, w, offs, deterministic=True)``: the autograd wrapper (``Y``, with
-  ``dX`` and ``dW`` in the backward, ``dW`` in the dtype of ``w``).
+  deterministic=True, accumulate=False)``: ``dW[e] = G[e].T @ X[e]``, bf16 or fp32
+  ``[E, N, K]`` (with ``accumulate=True``, ``out[e] += dW[e]``);
+- ``cake_grouped_mm(x, w, offs, deterministic=True, *, fuse_wgrad_accumulation=False)``: the
+  autograd wrapper (``Y``, with ``dX`` and ``dW`` in the backward, ``dW`` in the dtype of
+  ``w``, or added into ``w.main_grad``).
 
 The shapes, the group offsets (``offs[E]`` end offsets or ``m_indptr[E + 1]``) and the
 alignment rules are those of :ref:`apicake_moe_grouped_det_gemm`.  The prepare-once /
@@ -112,13 +168,15 @@ feature                                         sm_100a         sm_103a         
 =============================================== =============== =============== ===============
 ``fwd`` / ``dgrad`` 256- and 512-column tiles   domain schedule domain schedule static schedule
 ``fwd`` evict-first / 3-3 head-tail twin        -- / --         -- / yes        yes / --
-``dgrad`` evict-first / 3-3 head-tail twin      -- / --         -- / yes        yes / --
+``dgrad`` evict-first / 3-3 head-tail twin      yes / --        -- / yes        yes / --
 ``dgrad`` probed queue split                    yes             yes             --
 ``wgrad`` 256-wide k tile, ordered tail reduce  yes             yes             yes
 ``wgrad`` 512-wide k tile, unordered split tail yes             yes             yes
 ``wgrad`` 512 wave-synchronised builds          yes             yes             --
-``wgrad`` 512 half-release builds               planned walk    planned walk    yes
-``wgrad`` 512 k256-tail twin                    --              --              yes
+``wgrad`` 512 half-release builds               planned, slack  planned, slack  planned, slack
+``wgrad`` 512 k256-tail twin                    --              --              slack tail
 ``wgrad`` output dtypes                         bf16, fp32      bf16, fp32      bf16, fp32
+``wgrad`` accumulate, fused, fp32 ``out``       planned, wave   planned, wave   planned, k256t
 CUDA toolkit floor                              12.8            12.9            13.4
+CUDA toolkit floor, fp32 accumulate builds      13.4            13.4            13.4
 =============================================== =============== =============== ===============

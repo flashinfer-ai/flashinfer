@@ -47,70 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 512
-#define TMEM_TM_STATE_OFFSET 0
-#define TMEM_TM_ACCV_OFFSET 128
-#define TMEM_TM_DVL_OFFSET 192
-#define TMEM_TM_S_OFFSET 320
-#define NUM_RING_STAGES 2
-#define NUM_ONE_STAGES 1
-#define SMEM_S_KN_OFF 0
-#define SMEM_S_KN_STAGE_BYTES 16384
-#define SMEM_S_KN_STRIDE 65536
-#define SMEM_S_QN_OFF 16384
-#define SMEM_S_QN_STAGE_BYTES 16384
-#define SMEM_S_QN_STRIDE 65536
-#define SMEM_S_QNT_OFF 16384
-#define SMEM_S_QNT_STAGE_BYTES 16384
-#define SMEM_S_QNT_STRIDE 65536
-#define SMEM_S_W_OFF 32768
-#define SMEM_S_W_STAGE_BYTES 16384
-#define SMEM_S_W_STRIDE 65536
-#define SMEM_S_WT_OFF 32768
-#define SMEM_S_WT_STAGE_BYTES 16384
-#define SMEM_S_WT_STRIDE 65536
-#define SMEM_S_DO_OFF 49152
-#define SMEM_S_DO_STAGE_BYTES 16384
-#define SMEM_S_DO_STRIDE 65536
-#define SMEM_S_DOT_OFF 49152
-#define SMEM_S_DOT_STAGE_BYTES 16384
-#define SMEM_S_DOT_STRIDE 65536
-#define SMEM_S_DOG_OFF 131072
-#define SMEM_S_DOG_STAGE_BYTES 16384
-#define SMEM_S_DOG_STRIDE 16384
-#define SMEM_S_DOGT_OFF 131072
-#define SMEM_S_DOGT_STAGE_BYTES 16384
-#define SMEM_S_DOGT_STRIDE 16384
-#define SMEM_S_DHS_OFF 147456
-#define SMEM_S_DHS_STAGE_BYTES 32768
-#define SMEM_S_DHS_STRIDE 32768
-#define SMEM_S_BDVT_OFF 180224
-#define SMEM_S_BDVT_STAGE_BYTES 16384
-#define SMEM_S_BDVT_STRIDE 16384
-#define SMEM_S_BDVS_OFF 196608
-#define SMEM_S_BDVS_STAGE_BYTES 16384
-#define SMEM_S_BDVS_STRIDE 16384
-#define SMEM_S_ST_OFF 212992
-#define SMEM_S_ST_STAGE_BYTES 8192
-#define SMEM_S_ST_STRIDE 8192
-#define SMEM_S_STT_OFF 212992
-#define SMEM_S_STT_STAGE_BYTES 8192
-#define SMEM_S_STT_STRIDE 8192
-#define SMEM_S_G_OFF 221184
-#define SMEM_S_G_STAGE_BYTES 512
-#define SMEM_S_G_STRIDE 512
-#define SMEM_S_DECAY_OFF 221696
-#define SMEM_S_DECAY_STAGE_BYTES 512
-#define SMEM_S_DECAY_STRIDE 512
-#define SMEM_S_GAIN_OFF 222208
-#define SMEM_S_GAIN_STAGE_BYTES 512
-#define SMEM_S_GAIN_STRIDE 512
-#define SMEM_S_GL_OFF 222720
-#define SMEM_S_GL_STAGE_BYTES 8
-#define SMEM_S_GL_STRIDE 8
-#define SMEM_TOTAL 222976
-#define THREADS 384
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -297,7 +233,7 @@ kernel_cake_gdn_det_train_4986279bc281c501d983(const __grid_constant__ CUtensorM
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* s_kn = reinterpret_cast<__nv_bfloat16*>(smem_raw + 0);
     const int s_kn_addr = smem + 0;
     __nv_bfloat16* s_qn = reinterpret_cast<__nv_bfloat16*>(smem_raw + 16384);
@@ -335,8 +271,7 @@ kernel_cake_gdn_det_train_4986279bc281c501d983(const __grid_constant__ CUtensorM
     float* s_gl = reinterpret_cast<float*>(smem_raw + 222720);
     const int s_gl_addr = smem + 222720;
 
-    // Mbarrier init (20 pipeline groups, 0 ordered-sequence groups, 29 barriers)
-    // Mbarriers at smem_raw[222736..222968)
+    // Mbarrier init (29 barriers at smem_raw[222736..222968))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -410,13 +345,11 @@ kernel_cake_gdn_det_train_4986279bc281c501d983(const __grid_constant__ CUtensorM
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tm_state = taddr;
-    const int tm_accv = taddr + 128;
-    const int tm_dvl = taddr + 192;
-    const int tm_s = taddr + 320;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tm_state = taddr;
+    const unsigned int tm_accv = taddr + 128;
+    const unsigned int tm_dvl = taddr + 192;
+    const unsigned int tm_s = taddr + 320;
 
     // ---- Role: chain ----
     if (warp <= 3) {
@@ -444,9 +377,9 @@ kernel_cake_gdn_det_train_4986279bc281c501d983(const __grid_constant__ CUtensorM
             int warp_c = warp;
             int vrow = warp_c * 32 + lane_c;
             int quad = lane_c % 4;
-            unsigned int ta_state = (unsigned int)tm_state + (unsigned int)(warp_c * 32 << 16);
-            unsigned int ta_accv = (unsigned int)tm_accv + (unsigned int)(warp_c * 32 << 16);
-            unsigned int ta_dvl = (unsigned int)tm_dvl + (unsigned int)(warp_c * 32 << 16);
+            unsigned int ta_state = tm_state + (unsigned int)(warp_c * 32 << 16);
+            unsigned int ta_accv = tm_accv + (unsigned int)(warp_c * 32 << 16);
+            unsigned int ta_dvl = tm_dvl + (unsigned int)(warp_c * 32 << 16);
             int st_v = lane_c / 8 % 2 * 8 + lane_c % 8;
             int st_t = lane_c / 16 * 8;
             int stT_t = lane_c / 16 * 8 + lane_c % 8;
@@ -651,7 +584,7 @@ kernel_cake_gdn_det_train_4986279bc281c501d983(const __grid_constant__ CUtensorM
             int row_a = q_a * 16 + lane_a / 4;
             int row_b = row_a + 8;
             int col_q = lane_a % 4 * 2;
-            unsigned int ta_s = (unsigned int)tm_s + (unsigned int)(q_a * 32 << 16);
+            unsigned int ta_s = tm_s + (unsigned int)(q_a * 32 << 16);
             int st_row = q_a * 16 + lane_a / 8 % 2 * 8 + lane_a % 8;
             int st_col = lane_a / 16 * 8;
             int t_dog = tid_a / 16;

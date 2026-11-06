@@ -45,11 +45,13 @@ PREFIX = "cake_gdn_det_train"
 KCP_SUFFIX = "_kcp"  # the context-parallel-only programs (``kcp_*``)
 _W = "sm100_sm103_sm107"
 
-# The nine programs of a step (the shipped records by program name: sixteen libraries) and the two test-only records.
+# The nine programs of a step and the output walk (the shipped records by program name: eighteen libraries), the three
+# programs of the in-kernel Q / K L2 norm (one library each) and the two test-only records.
 SHIPPED_PROGRAMS = (
     "fwd_prep",
     "kcp_fwdh_offset",
     "kcp_fwdh_tape",
+    "kcp_fwdh_out",
     "kcp_transfer_walk",
     "kcp_affine_merge",
     "fwd_o",
@@ -58,6 +60,9 @@ SHIPPED_PROGRAMS = (
     "kcp_dhu_tape",
     "bwd_dqkg",
     "gate_epilogue",
+    "fwd_prep_l2n",
+    "bwd_dqkg_l2n",
+    "qk_apply",
 )
 TEST_RECORDS = ("kcp_transfer_walk_three_mma", "kcp_transfer_walk_plain_tf32")
 # The identity rule: ``cake_gdn_det_train_<20 hex of sha256("<kernel module>\\n<sorted JSON of the build keywords>")>``,
@@ -85,6 +90,11 @@ IDENTITIES = {
     "kcp_fwdh_tape_vh64": (
         f"tart.gdn_chunk_kcp_fwd_h.{_W}.gdn_chunk_det_fwdh_v1_kcp",
         {"program": "tape", "vh": 64},
+    ),
+    "kcp_fwdh_out": (f"tart.gdn_chunk_kcp_fwd_h.{_W}.gdn_chunk_fwdh_out_v1_kcp", {}),
+    "kcp_fwdh_out_vh64": (
+        f"tart.gdn_chunk_kcp_fwd_h.{_W}.gdn_chunk_fwdh_out_v1_kcp",
+        {"vh": 64},
     ),
     "kcp_transfer_walk": (
         f"tart.gdn_chunk_kcp_transfer_walk.{_W}.gdn_chunk_det_transfer_walk_v1_kcp",
@@ -133,6 +143,18 @@ IDENTITIES = {
     ),
     "gate_epilogue": (
         f"tart.gdn_chunk_train_gate_epilogue.{_W}.gdn_chunk_det_train_gate_epilogue_v1",
+        {},
+    ),
+    "fwd_prep_l2n": (
+        f"tart.gdn_chunk_train_fwd_prep.{_W}.gdn_chunk_det_train_fwd_prep_l2n_v1",
+        {},
+    ),
+    "bwd_dqkg_l2n": (
+        f"tart.gdn_chunk_train_bwd_dqkg_fused.{_W}.gdn_chunk_det_train_bwd_dqkg_l2n_v1",
+        {},
+    ),
+    "qk_apply": (
+        f"tart.gdn_chunk_train_qk_apply.{_W}.gdn_chunk_det_train_qk_apply_v1",
         {},
     ),
 }

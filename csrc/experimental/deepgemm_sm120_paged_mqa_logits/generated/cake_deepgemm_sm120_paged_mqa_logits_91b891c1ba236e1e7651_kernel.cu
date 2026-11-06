@@ -49,26 +49,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_Q_PIPE_STAGES 2
-#define NUM_KV_PIPE_STAGES 2
-#define SMEM_SMEM_Q_OFF 1024
-#define SMEM_SMEM_Q_STAGE_BYTES 32768
-#define SMEM_SMEM_Q_STRIDE 32768
-#define SMEM_SMEM_KV_G0_OFF 66560
-#define SMEM_SMEM_KV_G0_STAGE_BYTES 8192
-#define SMEM_SMEM_KV_G0_STRIDE 8192
-#define SMEM_SMEM_KV_G1_OFF 82944
-#define SMEM_SMEM_KV_G1_STAGE_BYTES 8192
-#define SMEM_SMEM_KV_G1_STRIDE 8192
-#define SMEM_SMEM_SC_G0_OFF 99328
-#define SMEM_SMEM_SC_G0_STAGE_BYTES 256
-#define SMEM_SMEM_SC_G0_STRIDE 256
-#define SMEM_SMEM_SC_G1_OFF 99840
-#define SMEM_SMEM_SC_G1_STAGE_BYTES 256
-#define SMEM_SMEM_SC_G1_STRIDE 256
-#define SMEM_TOTAL 100352
-#define THREADS 384
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -166,7 +146,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_91b891c1ba236e1e7651(const __grid_co
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     uint8_t* smem_q = reinterpret_cast<uint8_t*>(smem_raw + 1024);
     const int smem_q_addr = smem + 1024;
     uint8_t* smem_kv_g0 = reinterpret_cast<uint8_t*>(smem_raw + 66560);
@@ -177,11 +157,12 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_91b891c1ba236e1e7651(const __grid_co
     const int smem_sc_g0_addr = smem + 99328;
     float* smem_sc_g1 = reinterpret_cast<float*>(smem_raw + 99840);
     const int smem_sc_g1_addr = smem + 99840;
-    if (tid == 0) { asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(schedule_meta + (bid * 2)))); }
+
+    // Kernel setup ops
+    if (tid == 0) { asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(schedule_meta + bid * 2))); }
     if (tid == 0) { asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(schedule_meta + (bid * 2 + 3)))); }
 
-    // Mbarrier init (6 pipeline groups, 0 ordered-sequence groups, 12 barriers)
-    // Mbarriers at smem_raw[0..96)
+    // Mbarrier init (12 barriers at smem_raw[0..96))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();

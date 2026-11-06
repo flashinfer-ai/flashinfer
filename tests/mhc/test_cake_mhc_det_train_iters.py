@@ -31,6 +31,10 @@ token-owner pass, which take the count as a kernel argument.  This module checks
   autograd functions (``save_stats`` True and False) give bitwise the outputs and gradients of the direct entry points;
 * that changing the count in one process loads no module after the first run-time-count call, and the argument checks.
 
+The cases above run at ``H = 4096``; ``test_counts_match_fp64_at_every_hidden_size`` and
+``test_paths_agree_bitwise_at_every_hidden_size`` repeat the numerics and the paths at the counts 1, 7, 20 and 64 at
+every hidden size the device's architecture exports (4096, 5120 and 7168 on SM100 / SM103; 4096 on SM107).
+
 The reference is the same arithmetic as ``test_cake_mhc_det_train.py``'s with the count as a parameter.
 """
 
@@ -53,7 +57,9 @@ backward_prepare = pkg.cake_mhc_det_train_backward_prepare
 backward_finish = pkg.cake_mhc_det_train_backward_finish
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
-STREAMS, HIDDEN, N, MAPPING_ROWS = 4, 4096, 16384, 24
+STREAMS, HIDDEN, MAPPING_ROWS = 4, 4096, 24
+HIDDEN_SIZES = (4096, 5120, 7168)
+HIDDEN_COUNTS = (1, 7, 20, 64)
 RMS_EPS, HC_EPS, SINKHORN_ITERS, SINKHORN_ITERS_MAX = 1e-5, 1e-6, 20, 64
 COUNTS = (1, 2, 5, 10, 19, 21, 30, 50, 64)
 T_COUNTS = (1, 7, 1024, 16263)
@@ -85,6 +91,17 @@ needs_device = pytest.mark.skipif(
 )
 
 
+def _require_hidden(hidden: int) -> int:
+    """``hidden`` if the device's architecture exports every route of it, else the case is skipped."""
+    arch = loader.arch_for_capability(torch.cuda.get_device_capability(_device()))
+    sizes = tuple(loader.supported_hidden_sizes(arch)) if arch else ()
+    if hidden not in sizes:
+        pytest.skip(
+            f"hidden {hidden} has no exported route on {arch} (exported: {sizes})"
+        )
+    return hidden
+
+
 # ----------------------------------------------------------------------------------------------------------------
 # Reference (the arithmetic of test_cake_mhc_det_train.py with the Sinkhorn count as a parameter)
 
@@ -112,7 +129,7 @@ def _block(X, fn, scale, base, B, dY, dU, *, dtype, iters: int) -> dict:
         scaled = scale.detach().to(dtype).requires_grad_(True)
         based = base.detach().to(dtype).requires_grad_(True)
         Bd = B.detach().to(dtype).requires_grad_(True)
-        u = Xd.reshape(T, N)
+        u = Xd.reshape(T, -1)
         r = torch.rsqrt(u.square().mean(dim=-1, keepdim=True) + RMS_EPS)
         z = (u * r) @ fnd.T
         pre = torch.sigmoid(z[:, 0:4] * scaled[0] + based[0:4]) + HC_EPS
@@ -164,16 +181,16 @@ def _oracle(i: dict, iters: int, *, dtype=F64) -> dict:
     return out
 
 
-def _make_inputs(T: int, *, seed: int = SEED) -> dict:
+def _make_inputs(T: int, *, seed: int = SEED, hidden: int = HIDDEN) -> dict:
     g = torch.Generator(device=_device()).manual_seed(seed)
 
     def randn(*shape: int, dtype: torch.dtype = F32) -> torch.Tensor:
         return torch.randn(*shape, generator=g, device=_device(), dtype=F32).to(dtype)
 
     return {
-        "X": randn(T, STREAMS, HIDDEN, dtype=BF16), "fn": (randn(MAPPING_ROWS, N) * 1e-2).contiguous(),
-        "scale": 1.0 + 0.1 * randn(3), "base": 0.1 * randn(MAPPING_ROWS), "B": randn(T, HIDDEN, dtype=BF16),
-        "dY": randn(T, STREAMS, HIDDEN, dtype=BF16), "dU": randn(T, HIDDEN, dtype=BF16),
+        "X": randn(T, STREAMS, hidden, dtype=BF16), "fn": (randn(MAPPING_ROWS, STREAMS * hidden) * 1e-2).contiguous(),
+        "scale": 1.0 + 0.1 * randn(3), "base": 0.1 * randn(MAPPING_ROWS), "B": randn(T, hidden, dtype=BF16),
+        "dY": randn(T, STREAMS, hidden, dtype=BF16), "dU": randn(T, hidden, dtype=BF16),
     }  # fmt: skip
 
 
@@ -248,11 +265,11 @@ def _assert_fp32(
         )
 
 
-def _check(T: int, iters: int, *, seed: int = SEED) -> dict:
-    i = _make_inputs(T, seed=seed)
+def _check(T: int, iters: int, *, seed: int = SEED, hidden: int = HIDDEN) -> dict:
+    i = _make_inputs(T, seed=seed, hidden=hidden)
     res = _run(i, iters)
     ref = _oracle(i, iters)
-    label = f"T={T} sinkhorn_iters={iters}"
+    label = f"T={T} sinkhorn_iters={iters} H={hidden}"
     for out, key in (("U", "U32"), ("Y", "Y32"), ("dB", "dB32"), ("dX", "dX32")):
         _assert_bf16(res[out], ref[key], f"{out} {label}")
     for name, out in _stats_columns(res["stats"]).items():
@@ -280,7 +297,23 @@ def _check(T: int, iters: int, *, seed: int = SEED) -> dict:
 @pytest.mark.parametrize("iters", COUNTS)
 @pytest.mark.parametrize("T", T_COUNTS)
 def test_counts_match_fp64(T: int, iters: int) -> None:
-    out = _check(T, iters)
+    _check_counts(T, iters, HIDDEN)
+
+
+@needs_device
+@pytest.mark.parametrize("iters", HIDDEN_COUNTS)
+@pytest.mark.parametrize("T", T_COUNTS)
+@pytest.mark.parametrize("hidden", HIDDEN_SIZES[1:], ids=lambda h: f"H{h}")
+def test_counts_match_fp64_at_every_hidden_size(
+    hidden: int, T: int, iters: int
+) -> None:
+    """The counts 1, 7, 20 and 64 at hidden 5120 and 7168 against the FP64 reference of the size (H 4096 is
+    ``test_counts_match_fp64``)."""
+    _check_counts(T, iters, _require_hidden(hidden))
+
+
+def _check_counts(T: int, iters: int, hidden: int) -> None:
+    out = _check(T, iters, hidden=hidden)
     # The count reaches the kernels: where the FP64 Sinkhorn matrices of this count and of 20 lie apart at the test's
     # tolerance, the record's matrix is nearer this count's. A chain at its fixed point (T=1 from about 19 steps on)
     # leaves the two FP64 matrices closer than that and nothing to tell apart; the values alone are checked there.
@@ -288,7 +321,7 @@ def test_counts_match_fp64(T: int, iters: int) -> None:
     ref_n, ref_20 = out["ref"]["C"], _oracle(out["inputs"], SINKHORN_ITERS)["C"]
     if _rel_l2(ref_n, ref_20) > 4 * FP32_REL_L2_MAX:
         assert _rel_l2(C, ref_n) < _rel_l2(C, ref_20), (
-            f"stats C at sinkhorn_iters={iters} is nearer the count of 20's"
+            f"stats C at sinkhorn_iters={iters} H={hidden} is nearer the count of 20's"
         )
 
 
@@ -343,7 +376,22 @@ def test_parameter_gradients_within_2x_comparator_over_draws(
 def test_paths_agree_bitwise(T: int, iters: int) -> None:
     """At each count: the checkpoint replay is bitwise the forward record, and the autograd functions (statistics saved
     or replayed) give bitwise the outputs and gradients of the direct entry points on the same branch."""
-    i = _make_inputs(T, seed=SEED + 41)
+    _check_paths(T, iters, HIDDEN)
+
+
+@needs_device
+@pytest.mark.parametrize("iters", HIDDEN_COUNTS)
+@pytest.mark.parametrize("T", (129, 2049))
+@pytest.mark.parametrize("hidden", HIDDEN_SIZES[1:], ids=lambda h: f"H{h}")
+def test_paths_agree_bitwise_at_every_hidden_size(
+    hidden: int, T: int, iters: int
+) -> None:
+    """``test_paths_agree_bitwise`` at hidden 5120 and 7168 and the counts 1, 7, 20 and 64."""
+    _check_paths(T, iters, _require_hidden(hidden))
+
+
+def _check_paths(T: int, iters: int, hidden: int) -> None:
+    i = _make_inputs(T, seed=SEED + 41, hidden=hidden)
     U, stats = forward_prepare(
         i["X"], i["fn"], i["scale"], i["base"], sinkhorn_iters=iters
     )
@@ -380,7 +428,7 @@ def test_paths_agree_bitwise(T: int, iters: int) -> None:
         Ba = (Ua.float() + i["B"].float()).to(BF16)
         Ya = pkg.cake_mhc_det_train_finish(X, Ba, handle)
         (Ya.float() * i["dY"].float()).sum().backward()
-        label = f"T={T} sinkhorn_iters={iters} save_stats={save_stats}"
+        label = f"T={T} sinkhorn_iters={iters} save_stats={save_stats} H={hidden}"
         assert torch.equal(Ua.detach(), U) and torch.equal(Ya.detach(), Y), label
         assert torch.equal(Ua.grad, dB), label
         for got, want, name in zip(

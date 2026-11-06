@@ -47,16 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define SMEM_GRAW_OFF 0
-#define SMEM_GRAW_STAGE_BYTES 32768
-#define SMEM_GRAW_STRIDE 32768
-#define SMEM_GTOT_OFF 32768
-#define SMEM_GTOT_STAGE_BYTES 4096
-#define SMEM_GTOT_STRIDE 4096
-#define SMEM_TOTAL 36864
-#define THREADS 256
 #define LAUNCH_MIN_BLOCKS 4
 
 #include <math_constants.h>
@@ -90,7 +80,7 @@ kernel_cake_kda_det_train_0e7c693f766175f4406c(float* __restrict__ g, __nv_bfloa
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* graw = reinterpret_cast<float*>(smem_raw + 0);
     const int graw_addr = smem + 0;
     float* gtot = reinterpret_cast<float*>(smem_raw + 32768);

@@ -47,7 +47,8 @@ PagedKVScaleFactors = tuple[torch.Tensor, torch.Tensor]
 if TYPE_CHECKING:
     from .kernels.fmha_decode.fmha_decode_config import FmhaDecodeConfig
 
-_SUPPORTED_HEAD_DIMS = (64, 128, 192, 256)
+_GENERIC_HEAD_DIMS = (64, 128, 192, 256)
+_SUPPORTED_HEAD_DIMS = (*_GENERIC_HEAD_DIMS, 512)
 _SUPPORTED_PAGE_SIZES = (4, 8, 16, 32, 64, 128)
 _MAX_INT32 = 2**31 - 1
 # Decode K/V masks form an exclusive tile endpoint as
@@ -110,6 +111,9 @@ class _DecodeLaunchSpec:
     policy: tuple[tuple[str, object], ...]
     scratch_shapes: tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]
     requested_splits: Optional[int] = None
+    # Split-counter entries reserved at the buffer tail (at least two device
+    # waves), so plans sharing one buffer keep counters at the same bytes.
+    scratch_reserve: int = 0
 
 
 @dataclass(frozen=True)
@@ -169,6 +173,8 @@ class _DecodeRuntime:
     v_page_stride: int
     v_head_stride: int
     v_token_stride: int
+    k_sf_page_stride: int
+    v_sf_page_stride: int
     softmax_scale: float
     output_scale: float
 
@@ -282,12 +288,14 @@ def _append_workspace_section(
     byte_end: int,
     shape: tuple[int, ...],
     dtype: torch.dtype,
+    reserve_elems: int = 0,
 ) -> tuple[_WorkspaceSection, int]:
     byte_offset = _align_up(byte_end)
     byte_size = math.prod(shape) * _dtype_itemsize(dtype)
+    reserved = max(byte_size, reserve_elems * _dtype_itemsize(dtype))
     return (
         _WorkspaceSection(byte_offset, byte_size, shape, dtype),
-        byte_offset + byte_size,
+        byte_offset + reserved,
     )
 
 
@@ -297,7 +305,13 @@ def _make_decode_workspace_layout(
     *,
     use_separate_reduction_kernel: bool,
     use_split_kv: bool = False,
+    scratch_reserve: int = 0,
 ) -> _DecodeWorkspaceLayout:
+    """Lay out partials first, then zero-at-rest state.
+
+    The state (Q offsets, sinks, ``scratch_reserve`` split counters) comes
+    last; binding anchors it to the buffer end (see ``_bind_decode_workspace``).
+    """
     partial_o_shape, partial_stats_shape, counter_shape = scratch_shapes
     partial_o_dtype = out_dtype
     if use_separate_reduction_kernel and out_dtype in (
@@ -315,11 +329,11 @@ def _make_decode_workspace_layout(
     partial_stats, byte_end = _append_workspace_section(
         byte_end, partial_stats_shape, torch.float32
     )
-    split_kv_counter, byte_end = _append_workspace_section(
-        byte_end, counter_shape, torch.int32
-    )
     cu_seqlens_q, byte_end = _append_workspace_section(byte_end, (1,), torch.int32)
     attention_sinks, byte_end = _append_workspace_section(byte_end, (1,), torch.float32)
+    split_kv_counter, byte_end = _append_workspace_section(
+        byte_end, counter_shape, torch.int32, scratch_reserve
+    )
     return _DecodeWorkspaceLayout(
         partial_o=partial_o,
         partial_stats=partial_stats,
@@ -370,16 +384,27 @@ def _workspace_section_view(
 def _bind_decode_workspace(
     workspace_buffer: torch.Tensor, layout: _DecodeWorkspaceLayout
 ) -> _DecodeWorkspaceViews:
+    # Anchor the zero-at-rest state (Q offsets, sinks, counters) to the buffer
+    # end so plans sharing one buffer keep it at the same bytes; partials stay
+    # at offset 0.
+    shift = max(
+        workspace_buffer.numel() * workspace_buffer.element_size() - layout.total_bytes,
+        0,
+    )
+    shift -= shift % _WORKSPACE_ALIGNMENT
+
+    def state_view(section: _WorkspaceSection) -> torch.Tensor:
+        return _workspace_section_view(
+            workspace_buffer,
+            replace(section, byte_offset=section.byte_offset + shift),
+        )
+
     return _DecodeWorkspaceViews(
         partial_o=_workspace_section_view(workspace_buffer, layout.partial_o),
         partial_stats=_workspace_section_view(workspace_buffer, layout.partial_stats),
-        split_kv_counter=_workspace_section_view(
-            workspace_buffer, layout.split_kv_counter
-        ),
-        cu_seqlens_q=_workspace_section_view(workspace_buffer, layout.cu_seqlens_q),
-        attention_sinks=_workspace_section_view(
-            workspace_buffer, layout.attention_sinks
-        ),
+        split_kv_counter=state_view(layout.split_kv_counter),
+        cu_seqlens_q=state_view(layout.cu_seqlens_q),
+        attention_sinks=state_view(layout.attention_sinks),
     )
 
 
@@ -988,7 +1013,7 @@ def _normalize_paged_kv_scale_factors(
     *,
     k_cache: torch.Tensor,
     logical_head_dim: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, int, int]:
     """Validate NVFP4 scale tensors or create homogeneous-mode placeholders."""
 
     if k_cache.dtype != torch.uint8:
@@ -997,7 +1022,7 @@ def _normalize_paged_kv_scale_factors(
                 "kv_scale_factors are accepted only with packed NVFP4 torch.uint8 K/V"
             )
         placeholder = k_cache[0, 0, 0, :1].view(torch.uint8)[:1]
-        return placeholder, placeholder
+        return placeholder, placeholder, 0, 0
     if kv_scale_factors is None:
         raise ValueError(
             "packed NVFP4 torch.uint8 K/V requires kv_scale_factors=(K_SF, V_SF)"
@@ -1010,6 +1035,7 @@ def _normalize_paged_kv_scale_factors(
     ):
         raise TypeError("kv_scale_factors tuple members must be torch.Tensor")
     expected_shape = (*k_cache.shape[:-1], logical_head_dim // 16)
+    page_strides = []
     for scale, name in (
         (k_sf_cache, "K scale factors"),
         (v_sf_cache, "V scale factors"),
@@ -1024,13 +1050,8 @@ def _normalize_paged_kv_scale_factors(
             )
         if scale.device != k_cache.device:
             raise ValueError(f"{name} must be on {k_cache.device}, got {scale.device}")
-        _validate_exact_compact_strides(
-            scale,
-            name,
-            "[pages, Hkv, page_size, D/16]",
-        )
-        _validate_16byte_alignment(scale, name)
-    return k_sf_cache, v_sf_cache
+        page_strides.append(_validate_hnd_inner_strides(scale, name))
+    return k_sf_cache, v_sf_cache, page_strides[0], page_strides[1]
 
 
 def _validate_block_tables(
@@ -1154,6 +1175,7 @@ def _decode_scratch_shapes(
     num_kv_heads: int,
     head_dim: int,
     seq_len_q: int,
+    requested_splits: Optional[int] = None,
 ):
     """Return split-workspace shapes for a static config and batch extent."""
 
@@ -1180,13 +1202,26 @@ def _decode_scratch_shapes(
         num_q_groups = cute.sym_int()
     else:
         num_q_groups = seq_len_q * geometry.head_ctas_per_token
-    partial_o_shape = (
-        batch_size,
-        num_kv_heads,
-        int(cfg.max_splits_kv),
-        head_ratio * seq_len_q,
-        head_dim,
-    )
+    partial_o_shape: tuple[int, ...]
+    if cfg.uses_compact_split_grid:
+        # Partials are packed by the launch fanout: slot (b * Hkv + h) *
+        # requested + split. The slot count is a runtime extent, so the
+        # compiled kernel does not depend on the plan's batch or fanout.
+        if requested_splits is None:
+            import cutlass.cute as cute
+
+            num_slots = cute.sym_int()
+        else:
+            num_slots = batch_size * num_kv_heads * int(requested_splits)
+        partial_o_shape = (num_slots, head_ratio * seq_len_q, head_dim)
+    else:
+        partial_o_shape = (
+            batch_size,
+            num_kv_heads,
+            int(cfg.max_splits_kv),
+            head_ratio * seq_len_q,
+            head_dim,
+        )
     partial_stats_shape = (
         partial_o_shape[:-1]
         if cfg.use_separate_reduction_kernel
@@ -1205,6 +1240,7 @@ def _decode_launch_spec_from_config(
     head_dim: int,
     seq_len_q: int,
     max_active_clusters: int,
+    requested_splits: Optional[int] = None,
 ) -> _DecodeLaunchSpec:
     """Derive policy and scratch geometry from one finalized FMHA config."""
 
@@ -1215,13 +1251,20 @@ def _decode_launch_spec_from_config(
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
         seq_len_q=seq_len_q,
+        requested_splits=requested_splits,
     )
+    # Every plan, split or not, reserves counters for two device-wide waves of
+    # logical Q CTAs, so plans sharing one buffer keep the same state bytes.
+    # Larger counts keep their exact size; outside the sparse route (own slice),
+    # only separate-reduction plans reach them, and those never read the counters.
+    scratch_reserve = max(2 * int(max_active_clusters), math.prod(scratch_shapes[2]))
 
     return _DecodeLaunchSpec(
         config=cfg,
         max_active_clusters=int(max_active_clusters),
         policy=_decode_policy_from_config(cfg),
         scratch_shapes=scratch_shapes,
+        scratch_reserve=scratch_reserve,
     )
 
 
@@ -1458,6 +1501,8 @@ def _resolve_decode_launch_spec(
         sm_count = get_device_sm_count(torch.device("cuda", device_index))
         requested_splits = min(requested_splits, sm_count)
         # GMEM capacity is a device bound, independent of the runtime fanout.
+        # It only bounds the fanout: compact partials are strided by the
+        # runtime fanout, so capacity does not size scratch.
         # Keep Q/batch fusion within CUDA's grid-Z limit; larger grids retain
         # the original exact-fanout launch. Cluster sizes remain resident topology.
         compact_grid = batch_size * q_ctas(cfg) <= 65535
@@ -1481,7 +1526,17 @@ def _resolve_decode_launch_spec(
         head_dim=head_dim,
         seq_len_q=seq_len_q,
         max_active_clusters=int(max_active_clusters),
+        requested_splits=requested_splits if cfg.use_split_kv else None,
     )
+    # Fused GMEM split plans publish through the counters, so they must fit the
+    # shared reserve. Separate-reduction plans (e.g. FP8 page-4 encoded-subpage,
+    # which always splits) never touch the counters and may exceed it.
+    assert (
+        use_q_token_kv_block_sparse_route
+        or not cfg.use_split_kv
+        or cfg.use_separate_reduction_kernel
+        or resolved.scratch_reserve == 2 * int(max_active_clusters)
+    ), "fused GMEM split counters exceed the shared workspace reserve"
     # Report the runtime fanout separately from the SM-bound workspace capacity.
     policy = dict(resolved.policy)
     policy["splits_kv"] = requested_splits
@@ -1651,6 +1706,8 @@ def _get_compiled_decode(
         v_page_stride: cutlass.Int64,
         v_head_stride: cutlass.Int64,
         v_token_stride: cutlass.Int64,
+        k_sf_page_stride: cutlass.Int64,
+        v_sf_page_stride: cutlass.Int64,
         softmax_scale: cutlass.Float32,
         output_scale: cutlass.Float32,
         requested_splits: cutlass.Int32,
@@ -1758,6 +1815,8 @@ def _get_compiled_decode(
             v_page_stride,
             v_head_stride,
             v_token_stride,
+            k_sf_page_stride,
+            v_sf_page_stride,
             static_full_split_prefix,
             static_native_uniform_kv,
             lse_ptr=lse.iterator if lse is not None else None,
@@ -1862,6 +1921,8 @@ def _get_compiled_decode(
     v_outer_stride = cute.sym_int64(divisibility=1)
     v_head_stride = cute.sym_int64(divisibility=1)
     v_token_stride = cute.sym_int64(divisibility=1)
+    k_sf_outer_stride = cute.sym_int64(divisibility=1)
+    v_sf_outer_stride = cute.sym_int64(divisibility=1)
     batch_size = cute.sym_int()
     total_q_tokens = cute.sym_int()
     runtime_num_q_offsets = cute.sym_int()
@@ -1961,8 +2022,23 @@ def _get_compiled_decode(
     )
     if cfg.use_nvfp4_kv:
         sf_shape = (physical_pages, num_kv_heads, storage_page_size, head_dim // 16)
-        k_sf_fake = fake_compact(cutlass.Float8E4M3FN, sf_shape, 16)
-        v_sf_fake = fake_compact(cutlass.Float8E4M3FN, sf_shape, 16)
+        sf_inner_strides = (
+            storage_page_size * (head_dim // 16),
+            head_dim // 16,
+            1,
+        )
+        k_sf_fake = cute.runtime.make_fake_tensor(
+            cutlass.Float8E4M3FN,
+            sf_shape,
+            stride=(k_sf_outer_stride, *sf_inner_strides),
+            assumed_align=16,
+        )
+        v_sf_fake = cute.runtime.make_fake_tensor(
+            cutlass.Float8E4M3FN,
+            sf_shape,
+            stride=(v_sf_outer_stride, *sf_inner_strides),
+            assumed_align=16,
+        )
     else:
         k_sf_fake = fake_compact(cutlass.Uint8, (1,), 1)
         v_sf_fake = fake_compact(cutlass.Uint8, (1,), 1)
@@ -2029,6 +2105,8 @@ def _get_compiled_decode(
                 partial_stats_fake,
                 counter_fake,
                 attention_sinks_fake,
+                Int64(1),
+                Int64(1),
                 Int64(1),
                 Int64(1),
                 Int64(1),
@@ -2121,9 +2199,14 @@ def get_prims_ts_batch_decode_workspace_size(
     ``torch.int8`` or ``torch.uint8`` CUDA tensor and zero it before its first
     FMHA launch. Re-zero a reused buffer whenever any workspace-layout input,
     including ``batch_size``, changes because the internal section offsets can
-    move even when the compiled callable is reused. Fixed-Q launches use
-    ``seq_len_q``. Packed-Q launches provide ``qo_indptr`` and the explicit
-    static ``max_q_len`` bound used for workspace geometry and JIT policy.
+    move even when the compiled callable is reused. Alternatively, plans for one
+    device may share one buffer of at least the largest size returned for them:
+    zero the whole buffer once, bind the same full tensor to every plan (not
+    slices), and plan and launch them on one stream. PrimTS may use any byte
+    of the passed buffer: its zero-at-rest control state sits at the buffer
+    end, and launches leave it zero. Fixed-Q launches use ``seq_len_q``.
+    Packed-Q launches provide ``qo_indptr`` and the explicit static
+    ``max_q_len`` bound used for workspace geometry and JIT policy.
     ``max_kv_len`` must be no larger than ``2,147,483,392`` so the padded
     256-token K/V tile endpoint remains representable as signed Int32.
     ``storage_page_size`` defaults to the semantic ``page_size``. A larger
@@ -2272,7 +2355,12 @@ def _prepare_decode_runtime(
             f"K/V dtype must match the launch (K {k_dtype}, V {v_dtype}), got K "
             f"{k_cache.dtype} and V {v_cache.dtype}"
         )
-    k_sf_cache, v_sf_cache = _normalize_paged_kv_scale_factors(
+    (
+        k_sf_cache,
+        v_sf_cache,
+        k_sf_page_stride,
+        v_sf_page_stride,
+    ) = _normalize_paged_kv_scale_factors(
         kv_scale_factors,
         k_cache=k_cache,
         logical_head_dim=head_dim,
@@ -2314,6 +2402,8 @@ def _prepare_decode_runtime(
         v_page_stride=normalized_cache.v_page_stride,
         v_head_stride=normalized_cache.v_head_stride,
         v_token_stride=normalized_cache.v_token_stride,
+        k_sf_page_stride=k_sf_page_stride,
+        v_sf_page_stride=v_sf_page_stride,
         softmax_scale=effective_softmax_scale,
         output_scale=effective_output_scale,
     )
@@ -2361,6 +2451,8 @@ def _launch_decode(
         runtime.v_page_stride,
         runtime.v_head_stride,
         runtime.v_token_stride,
+        runtime.k_sf_page_stride,
+        runtime.v_sf_page_stride,
         runtime.softmax_scale,
         runtime.output_scale,
         requested_splits,
@@ -2459,9 +2551,13 @@ def _prepare_decode_runtime_unchecked(
         v_cache = v_cache.transpose(1, 2)
     if k_cache.dtype == torch.uint8:
         k_sf_cache, v_sf_cache = cast(PagedKVScaleFactors, kv_scale_factors)
+        k_sf_page_stride = int(k_sf_cache.stride(0))
+        v_sf_page_stride = int(v_sf_cache.stride(0))
     else:
         placeholder = k_cache[0, 0, 0, :1].view(torch.uint8)[:1]
         k_sf_cache, v_sf_cache = placeholder, placeholder
+        k_sf_page_stride = 0
+        v_sf_page_stride = 0
     if out is None:
         out = torch.empty(
             q.shape,
@@ -2482,6 +2578,8 @@ def _prepare_decode_runtime_unchecked(
         v_page_stride=int(v_cache.stride(0)),
         v_head_stride=int(v_cache.stride(1)),
         v_token_stride=int(v_cache.stride(2)),
+        k_sf_page_stride=k_sf_page_stride,
+        v_sf_page_stride=v_sf_page_stride,
         softmax_scale=(
             1.0 / math.sqrt(int(q.shape[-1]))
             if softmax_scale is None
@@ -2627,6 +2725,8 @@ class PrimsTSBatchDecodePlan:
     _cache: _NativePagedKVCache
     _k_sf_cache: torch.Tensor
     _v_sf_cache: torch.Tensor
+    _k_sf_page_stride: int
+    _v_sf_page_stride: int
     _seq_lens_kv: torch.Tensor
     _qo_indptr: Optional[torch.Tensor]
     _block_table: torch.Tensor
@@ -2767,6 +2867,8 @@ class PrimsTSBatchDecodePlan:
             self._cache.v_page_stride,
             self._cache.v_head_stride,
             self._cache.v_token_stride,
+            self._k_sf_page_stride,
+            self._v_sf_page_stride,
             softmax_scale,
             output_scale,
             self._requested_splits,
@@ -2852,6 +2954,7 @@ def _resolve_decode_workspace_layout(
         out_dtype,
         use_separate_reduction_kernel=spec.config.use_separate_reduction_kernel,
         use_split_kv=spec.config.use_split_kv,
+        scratch_reserve=spec.scratch_reserve,
     )
 
 
@@ -3114,7 +3217,7 @@ def _resolve_q_token_kv_block_sparse_decode_config(
     )
     if not (
         page_size in _SUPPORTED_PAGE_SIZES
-        and head_dim in _SUPPORTED_HEAD_DIMS
+        and head_dim in _GENERIC_HEAD_DIMS
         and q_token_kv_block_sparse_dtype_supported
         and mask_type == "causal"
         and window_left < 0
@@ -3663,7 +3766,12 @@ def _prepare_prims_ts_batch_decode_plan(
         v_cache.dtype,
         out_dtype,
     )
-    k_sf_cache, v_sf_cache = _normalize_paged_kv_scale_factors(
+    (
+        k_sf_cache,
+        v_sf_cache,
+        k_sf_page_stride,
+        v_sf_page_stride,
+    ) = _normalize_paged_kv_scale_factors(
         kv_scale_factors,
         k_cache=k_cache,
         logical_head_dim=head_dim,
@@ -3729,6 +3837,7 @@ def _prepare_prims_ts_batch_decode_plan(
         out_dtype,
         use_separate_reduction_kernel=spec.config.use_separate_reduction_kernel,
         use_split_kv=spec.config.use_split_kv,
+        scratch_reserve=spec.scratch_reserve,
     )
     _validate_workspace_buffer(
         workspace_buffer,
@@ -3813,6 +3922,8 @@ def _prepare_prims_ts_batch_decode_plan(
         _cache=normalized_cache,
         _k_sf_cache=k_sf_cache,
         _v_sf_cache=v_sf_cache,
+        _k_sf_page_stride=k_sf_page_stride,
+        _v_sf_page_stride=v_sf_page_stride,
         _seq_lens_kv=seq_lens_kv,
         _qo_indptr=(
             qo_indptr
@@ -4177,7 +4288,21 @@ class BatchDecodePagedTSWrapper:
             if fixed_uniform_kv and spec.requested_splits == cfg.splits_kv:
                 # The live bound equals this declared topology; partial activity
                 # is still derived from the owned lengths, as before runtime buckets.
-                spec = replace(spec, config=replace(cfg, runtime_split_kv=False))
+                # Static kernels use the capacity-strided layout; same bytes
+                # since requested == capacity.
+                static_cfg = replace(cfg, runtime_split_kv=False)
+                spec = replace(
+                    spec,
+                    config=static_cfg,
+                    scratch_shapes=_decode_scratch_shapes(
+                        static_cfg,
+                        batch_size=batch_size,
+                        num_qo_heads=num_qo_heads,
+                        num_kv_heads=num_kv_heads,
+                        head_dim=head_dim,
+                        seq_len_q=seq_len_q,
+                    ),
+                )
         compile_spec = _make_decode_compile_spec(
             spec,
             device_index=device_index,
@@ -4207,6 +4332,7 @@ class BatchDecodePagedTSWrapper:
             out_dtype,
             use_separate_reduction_kernel=(spec.config.use_separate_reduction_kernel),
             use_split_kv=spec.config.use_split_kv,
+            scratch_reserve=spec.scratch_reserve,
         )
         if workspace_buffer is None:
             initialize_workspace = True

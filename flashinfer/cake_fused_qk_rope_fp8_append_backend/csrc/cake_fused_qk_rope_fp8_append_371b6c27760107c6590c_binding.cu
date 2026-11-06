@@ -37,7 +37,58 @@ void CheckCuda(cudaError_t status, const char* what) {
 
 void* DataPtr(const TensorView& t) { return static_cast<char*>(t.data_ptr()) + t.byte_offset(); }
 
-void Run(TensorView a_qkv, TensorView a_cos_sin, TensorView a_seq_lens, TensorView a_q_indptr, TensorView a_page_indices, TensorView a_q_norm_weight, TensorView a_k_norm_weight, TensorView a_k_scale, TensorView a_v_scale, TensorView a_q_scale_inv, TensorView a_out_q, TensorView a_key_cache, TensorView a_value_cache, TensorView a_out_k, TensorView a_out_v, TensorView a_q_scale, TensorView a_split_k_flag, int64_t a_num_rows, int64_t a_num_requests, int64_t a_num_q_heads, int64_t a_num_kv_heads, int64_t a_page_size, int64_t a_max_pages_per_request, int64_t a_max_seqlen, int64_t a_max_seqlen_aligned, int64_t a_quant_policy, int64_t a_norm_policy, bool a_is_prefill, bool a_has_out_kv, double a_upper_max, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+// The smallest dynamic shared memory (16-byte steps) at which at most `cap` CTAs of the kernel are resident on one
+// SM of `device`, or 0 when the kernel holds at most `cap` without it.  The kernel's dynamic shared-memory limit is
+// raised to the device's opt-in maximum first; the bytes are cached per device and cap on each thread.
+size_t CtaCapSmemBytes(int device, int64_t cap) {
+  struct Entry {
+    int device;
+    int64_t cap;
+    size_t bytes;
+  };
+  thread_local Entry cache[32];
+  thread_local int cached = 0;
+  for (int i = 0; i < cached; ++i) {
+    if (cache[i].device == device && cache[i].cap == cap) return cache[i].bytes;
+  }
+  const void* kernel = reinterpret_cast<const void*>(kernel_cake_fused_qk_rope_fp8_append_371b6c27760107c6590c);
+  auto occupancy = [&](size_t bytes) {
+    int blocks = 0;
+    CheckCuda(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel, 96, bytes),
+              "cudaOccupancyMaxActiveBlocksPerMultiprocessor");
+    return static_cast<int64_t>(blocks);
+  };
+  size_t bytes = 0;
+  if (occupancy(0) > cap) {
+    cudaFuncAttributes attributes{};
+    CheckCuda(cudaFuncGetAttributes(&attributes, kernel), "cudaFuncGetAttributes");
+    int optin = 0;
+    CheckCuda(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device),
+              "cudaDeviceGetAttribute");
+    const size_t most = static_cast<size_t>(optin) - attributes.sharedSizeBytes;
+    CheckCuda(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(most)),
+              "cudaFuncSetAttribute");
+    TVM_FFI_CHECK(occupancy(most) <= cap, RuntimeError)
+        << KERNEL_NAME << ": no dynamic shared memory holds the kernel to " << cap << " CTAs per SM";
+    size_t low = 0, high = most;  // occupancy(low) > cap >= occupancy(high)
+    while (high - low > 16) {
+      size_t middle = (low + (high - low) / 2) / 16 * 16;
+      if (middle <= low) middle = low + 16;
+      if (occupancy(middle) <= cap) {
+        high = middle;
+      } else {
+        low = middle;
+      }
+    }
+    bytes = high;
+  }
+  if (cached < 32) cache[cached++] = Entry{device, cap, bytes};
+  return bytes;
+}
+
+void Run(TensorView a_qkv, TensorView a_cos_sin, TensorView a_seq_lens, TensorView a_q_indptr, TensorView a_page_indices, TensorView a_q_norm_weight, TensorView a_k_norm_weight, TensorView a_k_scale, TensorView a_v_scale, TensorView a_q_scale_inv, TensorView a_out_q, TensorView a_key_cache, TensorView a_value_cache, TensorView a_out_k, TensorView a_out_v, TensorView a_q_scale, TensorView a_split_k_flag, int64_t a_num_rows, int64_t a_num_requests, int64_t a_num_q_heads, int64_t a_num_kv_heads, int64_t a_page_size, int64_t a_max_pages_per_request, int64_t a_max_seqlen, int64_t a_max_seqlen_aligned, int64_t a_quant_policy, int64_t a_norm_policy, bool a_is_prefill, bool a_has_out_kv, double a_upper_max, int64_t a_max_ctas_per_sm, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+  TVM_FFI_CHECK(a_max_ctas_per_sm >= 0, ValueError)
+      << KERNEL_NAME << ": 'max_ctas_per_sm' = " << a_max_ctas_per_sm << " is negative";
   DLDevice dev = a_qkv.device();
   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
   check_cuda_tensor(a_qkv, "qkv");
@@ -179,6 +230,11 @@ void Run(TensorView a_qkv, TensorView a_cos_sin, TensorView a_seq_lens, TensorVi
   config.gridDim = dim3(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y), static_cast<unsigned>(grid_z));
   config.blockDim = dim3(96, 1, 1);
   config.dynamicSmemBytes = 0;
+  if (a_max_ctas_per_sm > 0) {
+    // At most `max_ctas_per_sm` CTAs per SM: CTAs that start while the preceding kernel still holds SMs do not pile up
+    // on the SMs it has already left.
+    config.dynamicSmemBytes = CtaCapSmemBytes(dev.device_id, a_max_ctas_per_sm);
+  }
   config.stream = stream;
   cudaLaunchAttribute attrs[1] = {};
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;

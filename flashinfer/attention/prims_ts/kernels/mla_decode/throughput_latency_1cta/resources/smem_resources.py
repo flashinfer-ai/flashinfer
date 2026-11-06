@@ -45,6 +45,9 @@ from ...helpers.nvfp4_kv import (
     load_nvfp4_panels,
     issue_whole_record,
     convert_nvfp4_record,
+    snapshot_nvfp4_record,
+    release_raw_record,
+    store_nvfp4_record,
 )
 from ...helpers.gather import (
     gather4,
@@ -830,22 +833,45 @@ class SmemPageOffsetsResource(MlaResource):
                             cfg,
                         )
                 if cutlass.const_expr(cfg.single_raw_prefetch):
-                    # PG has two stages; its index alternates once per tile,
-                    # exactly matching the one raw-empty barrier's epochs.
+                    # Tile n uses PG stage i = n % P (P = 2 or 4) and the
+                    # raw-full barrier n & 1 == i & 1, completed once per
+                    # two tiles: its k-th epoch (k = n >> 1) has parity
+                    # phase ^ 1 for P == 2 and (i >> 1) & 1 for P == 4.
+                    assert cfg.page_offsets_stages in (2, 4)
+                    stage = stage_info.stage_idx
+                    full_idx = stage & Int32(1)
+                    if cutlass.const_expr(cfg.page_offsets_stages == 2):
+                        full_parity = self.producer_state.phase ^ Int32(1)
+                    else:
+                        full_parity = (stage >> Int32(1)) & Int32(1)
+                    if cutlass.const_expr(cfg.raw_record_stages == 2):
+                        # Raw slot n & 1 follows the raw-full barrier;
+                        # wait for the converters' release of its
+                        # previous epoch k - 1.
+                        raw_slot = full_idx
+                        raw_empty_parity = full_parity ^ Int32(1)
+                    else:
+                        # One raw buffer released once per tile: wait for
+                        # epoch n - 1, parity (n & 1) ^ 1 for even P.
+                        raw_slot = Int32(0)
+                        raw_empty_parity = full_idx ^ Int32(1)
                     while not prims.mbarrier_try_wait_parity(
-                        target._nv_barriers.data_ptr(2), stage_info.stage_idx ^ Int32(1)
+                        target._nv_barriers.data_ptr(Int32(2) + raw_slot),
+                        raw_empty_parity,
                     ):
                         pass
                     cute.arch.fence_view_async_shared()
-                    destinations = (target._nv_raw.data_ptr(),)
+                    destinations = (
+                        target._nv_raw.data_ptr(
+                            raw_slot * Int32(cfg.raw_record_stage_bytes)
+                        ),
+                    )
                     if issuer == Int32(0) and prims.elect_sync():
-                        header = stage_info.stage_idx * Int32(
+                        header = stage * Int32(
                             cfg.page_offsets_entries_per_stage
                         ) + Int32(128)
-                        self._smem_page_offsets[header] = stage_info.stage_idx
-                        self._smem_page_offsets[header + Int32(1)] = (
-                            self.producer_state.phase ^ Int32(1)
-                        )
+                        self._smem_page_offsets[header] = full_idx
+                        self._smem_page_offsets[header + Int32(1)] = full_parity
                 else:
                     destinations = ()
                     for part in cutlass.range_constexpr(5):
@@ -861,7 +887,11 @@ class SmemPageOffsetsResource(MlaResource):
                     record_bytes = Int32(512)
                 issue_whole_record(
                     destinations[0],
-                    target._nv_barriers.data_ptr(stage_info.stage_idx),
+                    target._nv_barriers.data_ptr(
+                        stage_info.stage_idx & Int32(1)
+                        if cfg.single_raw_prefetch
+                        else stage_info.stage_idx
+                    ),
                     raw,
                     target.tma_desc_c_latent,
                     target.tma_desc_c_rope,
@@ -1154,6 +1184,10 @@ class SmemKvResource(MlaResource):
     _nv_barrier_alloc: object = None
     _nv_scratch: object = None
     _nv_barriers: object = None
+    # Register snapshot of one raw NVFP4 record tile (early_raw_snapshot).
+    _nv_packed: object = None
+    _nv_scales: object = None
+    _nv_rope: object = None
 
     def get_smem_requirements(self):
         """Return the SMEM allocation used for staged K/V tiles."""
@@ -1196,7 +1230,8 @@ class SmemKvResource(MlaResource):
                 if self._nv_raw_alloc is None:
                     self._nv_raw_alloc = SmemAllocation(
                         name=f"{self.name}_raw_record",
-                        size_bytes=128 * self.cfg.raw_record_stride,
+                        size_bytes=self.cfg.raw_record_stages
+                        * self.cfg.raw_record_stage_bytes,
                         alignment=1024,
                     )
                 allocations.append(self._nv_raw_alloc)
@@ -1225,7 +1260,7 @@ class SmemKvResource(MlaResource):
                 context,
                 self._nv_raw_alloc,
                 cutlass.Uint8,
-                128 * self.cfg.raw_record_stride,
+                self.cfg.raw_record_stages * self.cfg.raw_record_stage_bytes,
             )
         if cutlass.const_expr(self.cfg.has_nvfp4_kv):
             self._nv_scratch = smem_array(
@@ -1275,6 +1310,10 @@ class SmemKvResource(MlaResource):
 
         # Producer aux work initializes K/V SMEM views for the load task.
         self._init_smem_state(stage_info)
+        if cutlass.const_expr(self.cfg.early_raw_snapshot):
+            self._nv_packed = cutlass.Array(Int32, 32, space=cutlass.AddressSpace.rmem)
+            self._nv_scales = cutlass.Array(Int32, 8, space=cutlass.AddressSpace.rmem)
+            self._nv_rope = cutlass.Array(Int32, 8, space=cutlass.AddressSpace.rmem)
         if cutlass.const_expr(self.cfg.has_nvfp4_kv):
             warp = cute.arch.thread_idx()[0] // 32 - self.cfg.load_warp_idx
             if prims.elect_sync():
@@ -1284,7 +1323,10 @@ class SmemKvResource(MlaResource):
                     else 1
                 )
                 if cutlass.const_expr(self.cfg.single_raw_prefetch):
-                    if warp == Int32(2):
+                    # Raw-empty barriers: [2], plus [3] for a two-slot ring.
+                    if warp == Int32(2) or (
+                        self.cfg.raw_record_stages == 2 and warp == Int32(3)
+                    ):
                         count = Int32(self.cfg.load_num_warps)
                 prims.mbarrier_init(self._nv_barriers.data_ptr(warp), count)
             cute.arch.mbarrier_init_fence()
@@ -1361,6 +1403,55 @@ class SmemKvResource(MlaResource):
             )
 
     @cute.jit
+    def _raw_record_view(self, cached_page_ids, page_id_slot):
+        """Return (raw-full barrier, parity, raw buffer, raw-empty barrier) for a tile."""
+        cfg = self.cfg
+        raw_slot = cached_page_ids[page_id_slot * cfg.sparse_cache_words + 4]
+        raw_phase = cached_page_ids[page_id_slot * cfg.sparse_cache_words + 5]
+        raw_buffer = Int32(0)
+        if cutlass.const_expr(cfg.raw_record_stages == 2):
+            raw_buffer = raw_slot
+        return (
+            self._nv_barriers.data_ptr(raw_slot),
+            raw_phase,
+            self._nv_raw.data_ptr(raw_buffer * Int32(cfg.raw_record_stage_bytes)),
+            self._nv_barriers.data_ptr(Int32(2) + raw_buffer),
+        )
+
+    @producer_work(work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def snapshot_raw_record(
+        self,
+        stage_info: StageInfo,
+        *,
+        cached_page_ids,
+        page_id_slot: cutlass.Constexpr[int] = 0,
+    ):
+        """Snapshot the next raw NVFP4 tile into registers before KV acquire.
+
+        Releasing the raw slot here, rather than after the whole-tile KV
+        stage is acquired (i.e. after PV of tile i-2), lets metadata warps
+        gather ahead while PV holds both retained tiles. The later producer
+        step only converts and stores the register snapshot.
+        """
+        cfg = self.cfg
+        assert cfg.early_raw_snapshot and cfg.kv_cache_format != "fp8"
+        raw_full, raw_phase, raw, raw_empty = self._raw_record_view(
+            cached_page_ids, page_id_slot
+        )
+        while not prims.mbarrier_try_wait_parity(raw_full, raw_phase):
+            pass
+        snapshot_nvfp4_record(
+            raw,
+            cute.arch.thread_idx()[0] - Int32(cfg.load_warp_idx * 32),
+            self._nv_packed,
+            self._nv_scales,
+            self._nv_rope,
+            rope_dim=cfg.rope_dim,
+        )
+        release_raw_record(raw_empty)
+
+    @cute.jit
     def load_nvfp4_stage_payload(
         self,
         stage_info,
@@ -1414,36 +1505,56 @@ class SmemKvResource(MlaResource):
                             else self.kv_stage_offset(slot)
                         ),
                     )
-                # The metadata warp issues gathers independently, so
-                # all eight original load warps can convert in parallel.
-                while not prims.mbarrier_try_wait_parity(raw_barrier, raw_phase):
-                    pass
-                if source_is_fp8(
-                    cfg,
-                    cached_page_ids[page_id_slot * cfg.sparse_cache_words] < Int32(0),
-                ):
-                    copy_fp8_record(
-                        destinations[0],
-                        self._nv_raw.data_ptr(),
-                        cute.arch.thread_idx()[0] - Int32(cfg.load_warp_idx * 32),
-                        self._nv_barriers.data_ptr(2),
-                    )
-                elif cutlass.const_expr(cfg.single_raw_prefetch):
-                    convert_nvfp4_record(
+                if cutlass.const_expr(cfg.early_raw_snapshot):
+                    # snapshot_raw_record already waited, read and released
+                    # this tile's raw slot before the KV acquire.
+                    store_nvfp4_record(
                         destinations[0],
                         cute.arch.thread_idx()[0] - Int32(cfg.load_warp_idx * 32),
+                        self._nv_packed,
+                        self._nv_scales,
+                        self._nv_rope,
                         stage_bytes=cfg.kv_smem_tile_bytes,
                         rope_dim=cfg.rope_dim,
-                        raw=self._nv_raw.data_ptr(),
-                        raw_empty=self._nv_barriers.data_ptr(2),
                     )
                 else:
-                    convert_nvfp4_record(
-                        destinations[0],
-                        cute.arch.thread_idx()[0] - Int32(cfg.load_warp_idx * 32),
-                        stage_bytes=cfg.kv_smem_tile_bytes,
-                        rope_dim=cfg.rope_dim,
-                    )
+                    # The metadata warp issues gathers independently, so
+                    # all eight original load warps can convert in parallel.
+                    while not prims.mbarrier_try_wait_parity(raw_barrier, raw_phase):
+                        pass
+                    raw_ptr = None
+                    raw_empty = None
+                    if cutlass.const_expr(cfg.single_raw_prefetch):
+                        _, _, raw_ptr, raw_empty = self._raw_record_view(
+                            cached_page_ids, page_id_slot
+                        )
+                    if source_is_fp8(
+                        cfg,
+                        cached_page_ids[page_id_slot * cfg.sparse_cache_words]
+                        < Int32(0),
+                    ):
+                        copy_fp8_record(
+                            destinations[0],
+                            raw_ptr,
+                            cute.arch.thread_idx()[0] - Int32(cfg.load_warp_idx * 32),
+                            raw_empty,
+                        )
+                    elif cutlass.const_expr(cfg.single_raw_prefetch):
+                        convert_nvfp4_record(
+                            destinations[0],
+                            cute.arch.thread_idx()[0] - Int32(cfg.load_warp_idx * 32),
+                            stage_bytes=cfg.kv_smem_tile_bytes,
+                            rope_dim=cfg.rope_dim,
+                            raw=raw_ptr,
+                            raw_empty=raw_empty,
+                        )
+                    else:
+                        convert_nvfp4_record(
+                            destinations[0],
+                            cute.arch.thread_idx()[0] - Int32(cfg.load_warp_idx * 32),
+                            stage_bytes=cfg.kv_smem_tile_bytes,
+                            rope_dim=cfg.rope_dim,
+                        )
             return
         if cutlass.const_expr(cfg.sparse_reuse_kv and not is_v):
             if cutlass.const_expr(qk_stage_idx == 0):

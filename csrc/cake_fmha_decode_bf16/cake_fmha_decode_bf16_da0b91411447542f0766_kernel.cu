@@ -40,67 +40,12 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 128
-#define TMEM_TMEM_S0_OFFSET 0
-#define TMEM_TMEM_S1_OFFSET 8
-#define TMEM_TMEM_STATS0_OFFSET 16
-#define TMEM_TMEM_STATS1_OFFSET 48
-#define TMEM_TMEM_O0_OFFSET 80
-#define TMEM_TMEM_O1_OFFSET 88
-#define NUM_Q_PIPE_STAGES 2
-#define NUM_KV_PIPE_STAGES 4
-#define NUM_PAGE_PIPE_STAGES 6
-#define NUM_OP01_PIPE_STAGES 1
-#define SMEM_SMEM_QT_OFF 1024
-#define SMEM_SMEM_QT_STAGE_BYTES 2048
-#define SMEM_SMEM_QT_STRIDE 2048
-#define SMEM_SMEM_KV_OFF 5120
-#define SMEM_SMEM_KV_STAGE_BYTES 32768
-#define SMEM_SMEM_KV_STRIDE 32768
-#define SMEM_SMEM_V_OFF 5120
-#define SMEM_SMEM_V_STAGE_BYTES 32768
-#define SMEM_SMEM_V_STRIDE 32768
-#define SMEM_SMEM_P0_OFF 136192
-#define SMEM_SMEM_P0_STAGE_BYTES 2048
-#define SMEM_SMEM_P0_STRIDE 2048
-#define SMEM_SMEM_P1_OFF 138240
-#define SMEM_SMEM_P1_STAGE_BYTES 2048
-#define SMEM_SMEM_P1_STRIDE 2048
-#define SMEM_SMEM_PAGE_OFFSETS_OFF 140288
-#define SMEM_SMEM_PAGE_OFFSETS_STAGE_BYTES 128
-#define SMEM_SMEM_PAGE_OFFSETS_STRIDE 128
-#define SMEM_SMEM_CGA_O_OFF 141056
-#define SMEM_SMEM_CGA_O_STAGE_BYTES 32768
-#define SMEM_SMEM_CGA_O_STRIDE 32768
-#define SMEM_SMEM_CGA_STATS_OFF 149248
-#define SMEM_SMEM_CGA_STATS_STAGE_BYTES 256
-#define SMEM_SMEM_CGA_STATS_STRIDE 256
-#define SMEM_SMEM_EXCH0_OFF 174848
-#define SMEM_SMEM_EXCH0_STAGE_BYTES 128
-#define SMEM_SMEM_EXCH0_STRIDE 128
-#define SMEM_SMEM_EXCH1_OFF 174976
-#define SMEM_SMEM_EXCH1_STAGE_BYTES 128
-#define SMEM_SMEM_EXCH1_STRIDE 128
-#define SMEM_SMEM_EXCH0_U32_OFF 174848
-#define SMEM_SMEM_EXCH0_U32_STAGE_BYTES 128
-#define SMEM_SMEM_EXCH0_U32_STRIDE 128
-#define SMEM_SMEM_EXCH1_U32_OFF 174976
-#define SMEM_SMEM_EXCH1_U32_STAGE_BYTES 128
-#define SMEM_SMEM_EXCH1_U32_STRIDE 128
-#define SMEM_SMEM_CORR0_OFF 175104
-#define SMEM_SMEM_CORR0_STAGE_BYTES 64
-#define SMEM_SMEM_CORR0_STRIDE 64
-#define SMEM_SMEM_CORR1_OFF 175168
-#define SMEM_SMEM_CORR1_STAGE_BYTES 64
-#define SMEM_SMEM_CORR1_STRIDE 64
-#define SMEM_TOTAL 175360
-#define THREADS 512
 #define BLOCK_N 128
 #define HEAD_DIM 128
 #define TILE_Q 8
 #define PAGE_SIZE 16
 #define NUM_KV_STAGES 4
+#define TMEM_NCOLS 128
 #define BATCH_SIZE 4
 #define NUM_Q_HEADS 32
 #define NUM_KV_HEADS 4
@@ -526,7 +471,7 @@ kernel_cake_fmha_decode_bf16_da0b91411447542f0766(const __grid_constant__ CUtens
                     causal_prefix = kv_len_b - Q_LEN;
                 }
                 int global_q_pos = causal_prefix + q_row_idx;
-                int visible_local_keys = global_q_pos + 1;
+                int visible_local_keys = ((global_q_pos + 1) < (kv_len_b) ? (global_q_pos + 1) : (kv_len_b));
                 int win_start = 0;
                 int split_start_block = cta_rank * 2;
                 float row_max_pair[2];
@@ -860,7 +805,7 @@ kernel_cake_fmha_decode_bf16_da0b91411447542f0766(const __grid_constant__ CUtens
                     causal_prefix_1 = kv_len_b_1 - Q_LEN;
                 }
                 int global_q_pos_1 = causal_prefix_1 + q_row_idx_1;
-                int visible_local_keys_1 = global_q_pos_1 + 1;
+                int visible_local_keys_1 = ((global_q_pos_1 + 1) < (kv_len_b_1) ? (global_q_pos_1 + 1) : (kv_len_b_1));
                 int win_start_1 = 0;
                 mbarrier_wait(corr_scale_0_addr, _phase_corr_scale_0_0);
                 _phase_corr_scale_0_0 ^= 1;
@@ -1226,7 +1171,7 @@ kernel_cake_fmha_decode_bf16_da0b91411447542f0766(const __grid_constant__ CUtens
                     causal_prefix_2 = kv_len_b_2 - Q_LEN;
                 }
                 int global_q_pos_2 = causal_prefix_2 + q_row_idx_2;
-                int visible_local_keys_2 = global_q_pos_2 + 1;
+                int visible_local_keys_2 = ((global_q_pos_2 + 1) < (kv_len_b_2) ? (global_q_pos_2 + 1) : (kv_len_b_2));
                 int win_start_2 = 0;
                 int kv_trip = 0;
                 int first_pv0 = 1;
@@ -1675,7 +1620,7 @@ kernel_cake_fmha_decode_bf16_da0b91411447542f0766(const __grid_constant__ CUtens
                     causal_prefix_3 = kv_len_b_3 - Q_LEN;
                 }
                 int global_q_pos_3 = causal_prefix_3 + q_row_idx_3;
-                int visible_local_keys_3 = global_q_pos_3 + 1;
+                int visible_local_keys_3 = ((global_q_pos_3 + 1) < (kv_len_b_3) ? (global_q_pos_3 + 1) : (kv_len_b_3));
                 int win_start_3 = 0;
                 int pt_base_p = batch_idx_3 * max_pages_per_seq;
                 #pragma unroll 1
@@ -1728,7 +1673,7 @@ kernel_cake_fmha_decode_bf16_da0b91411447542f0766(const __grid_constant__ CUtens
                     causal_prefix_4 = kv_len_b_4 - Q_LEN;
                 }
                 int global_q_pos_4 = causal_prefix_4 + q_row_idx_4;
-                int visible_local_keys_4 = global_q_pos_4 + 1;
+                int visible_local_keys_4 = ((global_q_pos_4 + 1) < (kv_len_b_4) ? (global_q_pos_4 + 1) : (kv_len_b_4));
                 int win_start_4 = 0;
                 int split_start_block_1 = cta_rank * 2;
                 mbarrier_wait(q_empty_addr + (q_stage_l) * 8, _phase_q_empty);
@@ -1799,6 +1744,13 @@ kernel_cake_fmha_decode_bf16_da0b91411447542f0766(const __grid_constant__ CUtens
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&pg_v[4])), "=r"(*reinterpret_cast<uint32_t*>(&pg_v[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&pg_v[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&pg_v[(4) + 3]))
                             : "r"(page_addr_1 + 16));
+                        int keys_left = visible_local_keys_4 - n_block_1 * 8 * 16;
+                        #pragma unroll
+                        for (int j = 0; j < 8; j++) {
+                            if (j * 16 >= keys_left) {
+                                pg_v[j] = 1073741824;
+                            }
+                        }
                         int page_group_done = ((ni_1 % 4 == 3) ? 1 : 0);
                         page_group_done = page_group_done | ((ni_1 + 1 == 2) ? 1 : 0);
                         if (page_group_done != 0) {
@@ -1873,6 +1825,13 @@ kernel_cake_fmha_decode_bf16_da0b91411447542f0766(const __grid_constant__ CUtens
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&tpg_v[4])), "=r"(*reinterpret_cast<uint32_t*>(&tpg_v[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&tpg_v[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&tpg_v[(4) + 3]))
                             : "r"(page_addr_2 + 16));
+                        int keys_left_1 = visible_local_keys_4 - tn_block * 8 * 16;
+                        #pragma unroll
+                        for (int j_1 = 0; j_1 < 8; j_1++) {
+                            if (j_1 * 16 >= keys_left_1) {
+                                tpg_v[j_1] = 1073741824;
+                            }
+                        }
                         int page_group_done_tail = ((tail_ni % 4 == 3) ? 1 : 0);
                         page_group_done_tail = page_group_done_tail | ((tail_ni + 1 == 2) ? 1 : 0);
                         if (page_group_done_tail != 0) {
