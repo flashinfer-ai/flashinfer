@@ -17,7 +17,7 @@ to the caller's split permission. Sliding-window plans remain nonsplit, but
 may use direct or CLC-persistent execution. There is no public scheduler or
 tuning knob and no fallback to another attention backend.
 
-Fixed multi-query paged plans compare legal Swaps Q8/Q16/Q32 and Keeps Q64/Q128 candidates, plus Swaps Q48/Q64/Q128 for transformed FP8-compute K/V, across page sizes 4, 8, 16, 32, 64, and 128. Each candidate passes the shared profile validator; eligibility does not imply every dtype, MMA orientation, or reducer supports every combination. Sliding-window scoring uses the visible union, bounded by `window_size + Q - 1`, instead of the model context capacity. Partial final query groups remain candidates: the cost model uses the ceil-divided Q grid and complete per-CTA cost. Q1, packed variable-Q, and explicitly pinned choices retain their existing selection paths. Windowed split-KV remains disabled.
+Fixed multi-query paged plans compare legal Swaps Q8/Q16/Q32 and Keeps Q64/Q128 candidates, plus Swaps Q48/Q64/Q128 for transformed FP8-compute K/V, across page sizes 4, 8, 16, 32, 64, and 128. Each candidate passes the shared profile validator; eligibility does not imply every dtype, MMA orientation, or reducer supports every combination. Sliding-window scoring uses the visible union, bounded by `window_size + Q - 1`, instead of the model context capacity. Partial final query groups remain candidates: the cost model uses the ceil-divided Q grid and complete per-CTA cost. Q1 (except transformed NVFP4 K/V whose direct grid already fills a wave), packed variable-Q, and explicitly pinned choices retain their existing selection paths. Transformed NVFP4 K/V also scores multi-wave split fanouts for full grids, keeping at least 8K KV tokens per split. Windowed split-KV remains disabled.
 
 Q tiles of 48 rows or more, for fixed grouped paged queries:
 
@@ -28,15 +28,16 @@ Q tiles of 48 rows or more, for fixed grouped paged queries:
 | Swaps Q64 | 256, 512 | FP8 / NVFP4 | FP16, BF16 | 1 |
 | Swaps Q128 | 128, 256 | FP8 / NVFP4 | FP16, BF16 | 1 |
 | Keeps Q128 | 128 | FP8 / FP8 | FP16, BF16 | 1 |
-| Keeps Q64 | 128 | FP8 / NVFP4 | FP16, BF16 | 1 |
+| Keeps Q64 | 128, 256 | FP8 / NVFP4 | FP16, BF16 | 1 |
 
 The Swaps rows support dense or causal masks and direct or GMEM split-KV
 reduction (fused or separate kernel). Packed queries, persistent scheduling,
 sparse routes, sliding windows, attention sinks, cluster-SMEM reduction, and
 FP8 output keep their narrower tiles. D512/Q128 is rejected: its PV
 accumulators alone need all 512 TMEM columns. D512 converts K and V in
-separate warp groups. Keeps Q64 NVFP4 converts each KV instance's K/V into
-its own FP8 SMEM ring in a separate warp group.
+separate warp groups. Keeps Q64 NVFP4 converts K/V into FP8 SMEM rings in
+separate warp groups: one per KV instance at D128, one per operand at D256.
+It requires the grouped token/head layout.
 
 D192 Keeps retains 128-wide SMEM stages while issuing PV N128+N64 into 192 logical O columns. Swaps keeps its padded PV computation and transposed output staging; output stores mask channels beyond D192. `smem_q_head_dim` expresses the 128-byte TMA fragment alignment: 192 elements for FP16/BF16, 256 for FP8. It does not widen the public Q tensor.
 
