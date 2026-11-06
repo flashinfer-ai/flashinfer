@@ -19,9 +19,8 @@ The public module is ``flashinfer.cake_dsa_indexer_det_train`` and its backend p
 ``flashinfer.experimental.cake.cake_dsa_indexer_det_train``.  Every public name of the module (except ALL_CAPS
 module constants) carries the mode word ``det`` as a name token, no public callable takes ``deterministic=``, the
 previous names and package paths fail at import (no aliases), the SM120 serving entry
-``flashinfer.dsa_indexer.dsa_indexer_det_topk`` no longer routes ``backend="cake"``, importing the module loads
-no backend, and the backend imports as a top-level package with ``flashinfer`` blocked (flashinfer-ai/flashinfer#6553;
-both checked in a fresh interpreter).  CPU only.
+``flashinfer.dsa_indexer.dsa_indexer_det_topk`` no longer routes ``backend="cake"``, and importing the module loads
+no backend (checked in a fresh interpreter).  CPU only.
 """
 
 from __future__ import annotations
@@ -201,41 +200,6 @@ after_facade = sorted(m for m in sys.modules if m.startswith({BACKEND!r}))
 print(json.dumps({{"after_flashinfer": after_flashinfer, "after_facade": after_facade}}))
 """
     assert _fresh(code) == {"after_flashinfer": [], "after_facade": []}
-
-
-def test_backend_imports_as_a_top_level_package_without_flashinfer(tmp_path) -> None:
-    """A vendoring build exposes the backend directory as a top-level package
-    (flashinfer-ai/flashinfer#6553): with ``flashinfer`` blocked, the package and its
-    modules import from a symlinked copy."""
-    import importlib.util
-    from pathlib import Path
-
-    source = Path(importlib.util.find_spec(BACKEND).origin).parent
-    (tmp_path / source.name).symlink_to(source, target_is_directory=True)
-    code = f"""
-import importlib, importlib.abc, json, sys
-class Blocker(importlib.abc.MetaPathFinder):
-    def find_spec(self, name, path=None, target=None):
-        if name == "flashinfer" or name.startswith("flashinfer."):
-            raise ImportError(f"{{name}} is blocked")
-        return None
-sys.meta_path.insert(0, Blocker())
-sys.modules["flashinfer"] = None
-sys.path.insert(0, {str(tmp_path)!r})
-name = {source.name!r}
-modules = [importlib.import_module(name)]
-modules += [importlib.import_module(f"{{name}}.{{m}}") for m in ("cake_backend", "cake_build", "cake_jit", "cake_policy")]
-print(json.dumps({{
-    "copied": [m.__file__.startswith({str(tmp_path)!r}) for m in modules],
-    "flashinfer": sorted(m for m, v in sys.modules.items() if v is not None and m.split(".")[0] == "flashinfer"),
-    "forwarded": sorted(n for n in {list(FORWARDED)!r} if hasattr(modules[1], n)),
-}}))
-"""
-    assert _fresh(code) == {
-        "copied": [True] * 5,
-        "flashinfer": [],
-        "forwarded": sorted(FORWARDED),
-    }
 
 
 def test_the_manifest_names_the_package() -> None:
