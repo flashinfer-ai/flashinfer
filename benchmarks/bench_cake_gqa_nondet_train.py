@@ -1,4 +1,5 @@
-"""Benchmark of the Cake packed-varlen HD256 GQA training attention against FlashAttention CuTe.
+"""Benchmark of the Cake non-deterministic packed-varlen HD256 GQA training attention
+(``flashinfer.cake_gqa_nondet_train``) against FlashAttention CuTe.
 
 One training step of one attention layer under non-reentrant activation checkpointing is the forward, the
 checkpoint replay (a second forward) and the backward, ``2 x forward + backward``.  The dK / dV of the step go to
@@ -12,7 +13,7 @@ Layouts are context-parallel zigzag packs: each document is cut into ``2 CP`` ch
 and ``2 CP - 1 - r``, and a chunk's key window is the document's prefix up to the chunk's end (bottom-right causal).
 ``issue1``-``issue3`` reproduce the issue's (T_q, T_k, segments, max Q, max K) rows exactly.
 
-    python benchmarks/bench_cake_gqa_train.py --layouts issue1,issue2,issue3 --out results.json
+    python benchmarks/bench_cake_gqa_nondet_train.py --layouts issue1,issue2,issue3 --out results.json
 """
 
 from __future__ import annotations
@@ -26,12 +27,12 @@ from typing import Any, Callable
 
 import torch
 
-from flashinfer.gqa_train import (
-    gqa_train_workspace,
-    gqa_train_workspace_bytes,
-    varlen_gqa_attention_bwd,
+from flashinfer.cake_gqa_nondet_train import (
+    cake_gqa_nondet_train_backward,
+    cake_gqa_nondet_train_forward,
+    cake_gqa_nondet_train_workspace,
+    cake_gqa_nondet_train_workspace_bytes,
 )
-from flashinfer.gqa_train import varlen_gqa_attention_fwd
 
 H_Q, H_KV, D = 24, 4, 256
 SCALE = 0.0625
@@ -178,13 +179,13 @@ class CakeArm:
     name = "cake"
 
     def __init__(self, x: dict[str, Any]) -> None:
-        self.ws = gqa_train_workspace(x["q"].device)
+        self.ws = cake_gqa_nondet_train_workspace(x["q"].device)
 
     def stages(self, x: dict[str, Any]) -> list[tuple[str, Callable[[], Any]]]:
         state: dict[str, Any] = {}
 
         def fwd():
-            state["out"], state["lse"] = varlen_gqa_attention_fwd(
+            state["out"], state["lse"] = cake_gqa_nondet_train_forward(
                 x["q"],
                 x["k"],
                 x["v"],
@@ -197,7 +198,7 @@ class CakeArm:
         def bwd():
             x["dk_dst"].zero_()
             x["dv_dst"].zero_()
-            varlen_gqa_attention_bwd(
+            cake_gqa_nondet_train_backward(
                 x["q"],
                 x["k"],
                 x["v"],
@@ -304,7 +305,9 @@ def main() -> int:
             "segments": len(lay[0]),
             "max_q": max(lay[0]),
             "max_k": max(lay[1]),
-            "workspace_bytes": gqa_train_workspace_bytes(sum(lay[0]), H_Q, len(lay[0])),
+            "workspace_bytes": cake_gqa_nondet_train_workspace_bytes(
+                sum(lay[0]), H_Q, len(lay[0])
+            ),
             "gpu": torch.cuda.get_device_name(device),
             "cuda": torch.version.cuda,
         }

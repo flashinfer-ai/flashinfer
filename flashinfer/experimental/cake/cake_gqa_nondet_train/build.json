@@ -427,6 +427,6 @@
       ]
     }
   ],
-  "package": "flashinfer.experimental.cake_gqa_train",
+  "package": "flashinfer.experimental.cake.cake_gqa_nondet_train",
   "schema": "cake-build/1"
 }
