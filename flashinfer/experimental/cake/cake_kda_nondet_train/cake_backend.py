@@ -14,20 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Host backend of the Cake packed KDA chunked training kernels (SM100 / SM103 /
-SM107), the ``deterministic=False`` package: the host plan, the workspace
-arena, the saved set, the forward and backward launch sequences and the
-autograd Function.
+SM107), the non-deterministic package: the host plan, the workspace arena, the
+saved set, the forward and backward launch sequences and the autograd
+Function.
 
-Numerical mode.  This package is the counterpart of
-``flashinfer.experimental.cake.cake_kda_det_train`` (the deterministic package)
-selected with ``deterministic=False``; it imports nothing from it and ships its
-own copies of every program.  The entry points :func:`cake_kda_nondet_train_forward`,
-:func:`cake_kda_nondet_train_backward` and :func:`cake_kda_nondet`, the workspace :class:`CakeKDANondetWorkspace`
-(its constructor, ``for_problem`` and ``for_budget``) and
-``CakeKDANondetFunction.apply`` (a trailing argument) take ``deterministic: bool =
-True`` and raise ``ValueError`` unless it is ``False``, so a call that only
-swaps the import path of the deterministic package fails instead of changing
-mode.  The
+Numerical mode.  This package is the non-deterministic counterpart of the
+deterministic package ``flashinfer.experimental.cake.cake_kda_det_train``; it
+imports nothing from it and ships its own copies of every program.  The entry
+points :func:`cake_kda_nondet_train_forward`, :func:`cake_kda_nondet_train_backward`
+and :func:`cake_kda_nondet` take no mode argument and always run this package.
+They refuse a workspace, a saved set or an arena option that is not this
+package's type (the deterministic package's included) with ``ValueError``
+naming the mode (:func:`_check_nondet_package`), before any other check.  The
 forward and every backward stage but two run copies of the deterministic
 programs.  On the backward rows of :data:`cake_jit.S1_RECORDS`, the fused
 gradient (``dqkg``) no longer forms the ``q * dq`` term of the gate gradient
@@ -47,8 +45,10 @@ included (``param_finalize_l2n``, the deterministic ``param_finalize``, on every
 architecture), so its outputs are bitwise the deterministic package's in the
 same mode.  No launch of this package reduces in an unordered order, so no
 entry raises PyTorch's non-determinism alert under
-``torch.use_deterministic_algorithms(True)``; a launch whose result can vary
-from run to run must raise it immediately before that launch.
+``torch.use_deterministic_algorithms(True)`` (also with ``warn_only=True``),
+and no entry reads that setting or runs the deterministic package; a launch
+whose result can vary from run to run must raise the alert immediately before
+that launch.
 
 Operands (one packed batch of documents, GLM-5.3-Flash geometry): ``q, k, v``
 BF16 ``[1, S, H, 128]`` (``q`` / ``k`` L2-normalized by the caller), ``g`` FP32
@@ -2740,10 +2740,10 @@ class CakeKDANondetChunkSaved:
     deterministic package's field names: the backward reads the caller's raw q / k again with them, so no
     normalized row is retained from the forward to the backward.  Both versions carry it; a backward in the other
     mode is refused (:func:`_check_saved_l2n`).
-    ``deterministic`` is the mode of the forward that wrote the set (``False``: this package).  The forward
-    programs are copies of the deterministic package's, so both packages write the same versions in the same
-    format, and the backward of either reads a set of the other in both gate modes and both in-kernel Q/K L2 norm
-    modes.
+    The forward programs are copies of the deterministic package's, so both packages write the same versions in the
+    same format; this package's backward reads its own ``CakeKDANondetChunkSaved`` only and refuses any other saved
+    set, the deterministic package's ``CakeKDADetChunkSaved`` included, with ``ValueError`` naming the mode
+    (:func:`_check_nondet_package`).
     """
 
     version: int
@@ -2774,8 +2774,6 @@ class CakeKDANondetChunkSaved:
     qk_rstd: torch.Tensor | None = None
     # the in-kernel Q/K L2 norm mode of the forward that wrote the set (metadata, like gate)
     qk_l2norm: bool = False
-    # the mode of the forward that wrote the set (this package's forward: False)
-    deterministic: bool = False
 
 
 def _device_index(device: torch.device) -> int:
@@ -3017,10 +3015,9 @@ class CakeKDANondetWorkspace:
     read the activated FP32 gate).  :attr:`l2n` is the in-kernel Q/K L2 norm mode of the plan (:attr:`Plan.l2n`;
     ``l2n=`` must match it when given): a call with ``use_qk_l2norm_in_kernel=True`` runs on a ``"fused"`` or
     ``"fallback"`` workspace (the latter only as an explicit test route), a call without it on an ``"off"`` one.
-    ``deterministic`` must be ``False`` (:func:`_require_deterministic_false`; also in :meth:`for_problem` and
-    :meth:`for_budget`): the workspace launches this package's programs, so a construction that swaps only the
-    import path of the deterministic package's workspace fails instead of handing its entries this package's
-    pairs.
+    The workspace launches this package's programs: an arena option that is not a :class:`CakeKDANondetArena` (the
+    deterministic package's included) is refused with ``ValueError`` naming the mode (:func:`_check_nondet_package`),
+    and this package's entries refuse a workspace of any other type the same way.
     """
 
     def __init__(
@@ -3038,9 +3035,7 @@ class CakeKDANondetWorkspace:
         layouts: Sequence[tuple[str, int]] | None = None,
         gate: str | None = None,
         l2n: str | None = None,
-        deterministic: bool = True,
     ) -> None:
-        _require_deterministic_false(deterministic, "CakeKDANondetWorkspace")
         if save_mode not in SAVE_MODES:
             raise ValueError(
                 f"CakeKDANondetWorkspace: save_mode must be one of {SAVE_MODES}, got {save_mode!r}"
@@ -3071,6 +3066,7 @@ class CakeKDANondetWorkspace:
                 f"CakeKDANondetWorkspace: layouts takes another route's modes; {LEAN_MODES} take their tail passes from the "
                 f"arena option, got layouts={layouts!r}"
             )
+        _check_nondet_package(arena=arena)
         self.arena_option = CakeKDANondetArena() if arena is None else arena
         plan.check_arena(self.arena_option, backward=backward)
         self.doc_lengths = (
@@ -3250,13 +3246,11 @@ class CakeKDANondetWorkspace:
         fwd_layout: str = "fwd",
         gate: str = "g",
         l2n: str = "off",
-        deterministic: bool = True,
     ) -> CakeKDANondetWorkspace:
         """A workspace for ``S`` tokens in ``num_docs`` documents with ``H`` heads on ``device`` in gate mode
         ``gate`` (``"raw"``: the calls with ``use_gate_in_kernel=True``) and in-kernel Q/K L2 norm mode ``l2n``
-        (``"fused"``: the calls with ``use_qk_l2norm_in_kernel=True``); ``deterministic=False`` required, ``gate``
-        and ``l2n`` checked, all before the device is read."""
-        _require_deterministic_false(deterministic, "CakeKDANondetWorkspace")
+        (``"fused"``: the calls with ``use_qk_l2norm_in_kernel=True``); ``gate`` and ``l2n`` are checked before the
+        device is read."""
         _check_gate(gate)
         _check_l2n(l2n)
         index = _device_index(torch.device(device))
@@ -3277,7 +3271,6 @@ class CakeKDANondetWorkspace:
             arena=arena,
             doc_lengths=doc_lengths,
             fwd_layout=fwd_layout,
-            deterministic=deterministic,
         )
 
     @classmethod
@@ -3295,14 +3288,11 @@ class CakeKDANondetWorkspace:
         launcher: Launcher | None = None,
         gate: str = "g",
         l2n: str = "off",
-        deterministic: bool = True,
     ) -> CakeKDANondetWorkspace:
         """A workspace of the first arena option whose arena fits ``arena_budget_bytes`` (:func:`arena_for_budget`:
         the default, lean, two tail passes, four, then four passes over document groups halving from half the pack
-        down to one document per group, which needs ``doc_lengths``); ``ValueError`` when none fits
-        (``deterministic=False`` required, refused before the device is read).  ``gate`` / ``l2n``: the modes, as
-        :meth:`for_problem`."""
-        _require_deterministic_false(deterministic, "CakeKDANondetWorkspace")
+        down to one document per group, which needs ``doc_lengths``); ``ValueError`` when none fits.  ``gate`` /
+        ``l2n``: the modes, as :meth:`for_problem` (checked before the device is read)."""
         _check_gate(gate)
         _check_l2n(l2n)
         index = _device_index(torch.device(device))
@@ -3330,7 +3320,6 @@ class CakeKDANondetWorkspace:
             launcher=launcher,
             arena=option,
             doc_lengths=doc_lengths,
-            deterministic=deterministic,
         )
 
     def _view(self, plan: Plan) -> CakeKDANondetWorkspace:
@@ -3630,9 +3619,7 @@ class _HandoffWorkspace(CakeKDANondetWorkspace):
                 f"_HandoffWorkspace: layout must be 'bwd_tape' or {HANDOFF_LAYOUT!r}, got {layout!r}"
             )
         self.layout = layout  # read by _arena_size during the base constructor
-        super().__init__(
-            plan, device, backward=True, save_mode="tape", deterministic=False
-        )
+        super().__init__(plan, device, backward=True, save_mode="tape")
 
     def _arena_size(
         self, plan: Plan, *, backward: bool, save_mode: str, fwd_layout: str
@@ -3690,7 +3677,6 @@ def _entry_acquire(
             doc_lengths=doc_lengths,
             gate=gate,
             l2n=l2n,
-            deterministic=False,
         )
 
     if torch.cuda.is_current_stream_capturing():
@@ -3749,6 +3735,42 @@ def _entry_release(ws: CakeKDANondetWorkspace, key: tuple[Any, ...] | None) -> N
             _entry_pool.popitem(last=False)
 
 
+# What the non-deterministic entries take, by argument: (the type, what it is, where a caller gets one).
+_NONDET_KINDS: dict[str, tuple[type, str, str]] = {
+    "workspace": (
+        CakeKDANondetWorkspace,
+        "workspace",
+        "flashinfer.cake_kda_nondet_train.cake_kda_nondet_train_workspace",
+    ),
+    "saved": (
+        CakeKDANondetChunkSaved,
+        "saved set",
+        "the saved set of cake_kda_nondet_train_forward",
+    ),
+    "arena": (
+        CakeKDANondetArena,
+        "arena option",
+        "flashinfer.cake_kda_nondet_train.cake_kda_nondet_train_arena",
+    ),
+}
+
+
+def _check_nondet_package(**objects: Any) -> None:
+    """Refuse a ``workspace`` / ``saved`` / ``arena`` argument that is not this package's type with ``ValueError``
+    naming the mode.  The deterministic package's ``CakeKDADetWorkspace`` / ``CakeKDADetChunkSaved`` /
+    ``CakeKDADetArena`` carry the attributes the other checks read, so the type alone tells them apart; ``None``
+    passes."""
+    for name, value in objects.items():
+        cls, kind, source = _NONDET_KINDS[name]
+        if value is None or isinstance(value, cls):
+            continue
+        raise ValueError(
+            f"{name}: a {type(value).__name__} from {type(value).__module__} is not a non-deterministic-package "
+            f"{kind}; the non-deterministic entries take a {cls.__name__} ({source}); the deterministic package "
+            "is flashinfer.cake_kda_det_train / flashinfer.cake_kda_det_train_kcp"
+        )
+
+
 @contextlib.contextmanager
 def _workspace(
     workspace: CakeKDANondetWorkspace | None,
@@ -3770,7 +3792,9 @@ def _workspace(
     workspace of a backward that took a checkpoint hand-off record, :class:`_HandoffWorkspace`).  A caller's
     workspace serves as it is.  ``l2n`` is the call's in-kernel Q/K L2 norm mode: ``"off"`` or ``"fused"``
     (``use_qk_l2norm_in_kernel``); a caller's workspace of mode ``"fallback"`` serves a ``"fused"`` call (the
-    explicit test route), every other difference is refused."""
+    explicit test route), every other difference is refused.  A workspace or an arena option of another package
+    (the deterministic one) is refused by its type."""
+    _check_nondet_package(workspace=workspace, arena=arena)
     if workspace is None:
         ws, key = _entry_acquire(
             S,
@@ -3790,13 +3814,6 @@ def _workspace(
         finally:
             _entry_release(ws, key)
         return
-    if not isinstance(workspace, CakeKDANondetWorkspace):
-        # a workspace launches the records of its own plan: another package's would run that package's programs
-        raise TypeError(
-            f"workspace: a {CakeKDANondetWorkspace.__module__}.CakeKDANondetWorkspace (deterministic=False) is required, got "
-            f"{type(workspace).__module__}.{type(workspace).__qualname__}; a deterministic workspace serves the "
-            "deterministic package only"
-        )
     if arena is not None and arena != workspace.arena_option:
         raise ValueError(
             f"workspace: allocated with arena={workspace.arena_option}, the call asks for arena={arena}; pass "
@@ -4698,17 +4715,6 @@ def _forward_launches(
     )
 
 
-def _require_deterministic_false(deterministic: object, entry: str) -> None:
-    """Refuse every numerical mode but ``deterministic=False``: the deterministic programs are another package's
-    (a call that swaps only the import path must fail, not change mode)."""
-    if not isinstance(deterministic, bool) or deterministic:
-        raise ValueError(
-            f"{entry} is the non-deterministic packed KDA training (deterministic=False), got "
-            f"deterministic={deterministic!r}; the deterministic programs are "
-            "flashinfer.experimental.cake.cake_kda_det_train (or flashinfer.cake_kda_nondet_train with deterministic=True)"
-        )
-
-
 def cake_kda_nondet_train_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -4728,7 +4734,6 @@ def cake_kda_nondet_train_forward(
     dt_bias: torch.Tensor | None = None,
     lower_bound: float | None = None,
     use_qk_l2norm_in_kernel: bool = False,
-    deterministic: bool = True,
 ) -> tuple[torch.Tensor, CakeKDANondetChunkSaved | None]:
     """The forward: ``out`` BF16 like ``v`` (a fresh tensor) and the saved set (``None`` without
     ``save_for_backward``; fresh ``Aqk`` / ``Akk`` and tables and, with ``save_mode="light"`` (version 4), the
@@ -4767,7 +4772,7 @@ def cake_kda_nondet_train_forward(
     (ranked on the host from ``doc_lengths`` by the tables' rule): where a group's blocks are one run of them, the
     carry writes its carried states straight into the saved ``hseg`` and its offsets / transfers are contiguous
     copies; otherwise they are scattered by index.  The outputs are bitwise the whole problem's (:class:`CakeKDANondetArena`
-    on the sign of exact zeros).  ``deterministic`` must be ``False`` (:func:`_require_deterministic_false`).
+    on the sign of exact zeros).
 
     ``use_gate_in_kernel=True`` (raw gate mode) takes ``g`` as the raw gate BF16 ``[1, S, H, 128]`` (a strided
     view is accepted under :func:`_check_raw`'s rule, never copied) with ``A_log`` FP32 ``[H]``, ``dt_bias`` FP32
@@ -4784,9 +4789,10 @@ def cake_kda_nondet_train_forward(
     overwrites them) and, with ``save_for_backward``, ``qk_rstd`` FP32 ``[2, S, H]`` into the saved set, which
     records the mode; no launch is added and no normalized row is kept.  The programs are the deterministic
     package's l2n records, so ``out`` and the saved set are bitwise its own, in either gate mode.  The workspace
-    must be of an l2n mode (:attr:`CakeKDANondetWorkspace.l2n`).
+    must be of an l2n mode (:attr:`CakeKDANondetWorkspace.l2n`).  A workspace or an arena option of the
+    deterministic package is refused with ``ValueError`` (:func:`_check_nondet_package`).
     """
-    _require_deterministic_false(deterministic, "cake_kda_nondet_train_forward")
+    _check_nondet_package(workspace=workspace, arena=arena)
     return _fwd_call(
         q,
         k,
@@ -5445,7 +5451,6 @@ def cake_kda_nondet_train_backward(
     dt_bias: torch.Tensor | None = None,
     lower_bound: float | None = None,
     use_qk_l2norm_in_kernel: bool = False,
-    deterministic: bool = True,
 ) -> tuple[torch.Tensor, ...]:
     """The backward: fresh ``(dq, dk, dv, dbeta, dg)`` ranked like the inputs; with ``use_gate_in_kernel=True``
     fresh ``(dq, dk, dv, dbeta, dg, dA_log, ddt_bias)``, ``dg`` the BF16 gradient of the raw gate (contiguous,
@@ -5483,11 +5488,11 @@ def cake_kda_nondet_train_backward(
     (:func:`_group_tail_passes`) with their chunk counts from the host.  The gradients are bitwise the whole
     problem's (:class:`CakeKDANondetArena` on the sign of exact zeros).
 
-    ``deterministic`` must be ``False`` (:func:`_require_deterministic_false`).  The pair of the fused gradient
-    and the GLM intra program follows the path: the checkpoint replay and a saved-set backward can take different
-    pairs on some rows (:data:`cake_jit.S1_RECORDS`), and their ``dg`` then differ by FP32 rounding.  A saved set
-    of the deterministic package's forward has the same format and is read as it is, in either gate mode and
-    either in-kernel Q/K L2 norm mode.
+    The pair of the fused gradient and the GLM intra program follows the path: the checkpoint replay and a
+    saved-set backward can take different pairs on some rows (:data:`cake_jit.S1_RECORDS`), and their ``dg`` then
+    differ by FP32 rounding.  A saved set, a workspace or an arena option of the deterministic package is refused
+    with ``ValueError`` naming the mode (:func:`_check_nondet_package`), before any other check: the deterministic
+    package's saved set has the same format, but this backward reads its own ``CakeKDANondetChunkSaved`` only.
 
     Raw gate mode (``use_gate_in_kernel=True``, the forward's ``A_log`` / ``dt_bias`` / ``lower_bound``): the raw
     prep and intra records activate the gate again, the fused gradient is the deterministic package's on every row
@@ -5514,7 +5519,7 @@ def cake_kda_nondet_train_backward(
     writing the same ``w`` -- and the results are bitwise its own on every path and arena option, in either gate
     mode.  A saved set of the other mode is refused.
     """
-    _require_deterministic_false(deterministic, "cake_kda_nondet_train_backward")
+    _check_nondet_package(saved=saved, workspace=workspace, arena=arena)
     return _bwd_call(
         q,
         k,
@@ -5557,12 +5562,12 @@ def _bwd_call(
     use_qk_l2norm_in_kernel: bool = False,
     handoff: _HandoffRecord | None = None,
 ) -> tuple[torch.Tensor, ...]:
-    """:func:`cake_kda_nondet_train_backward` after its mode check; ``handoff`` is a checkpoint hand-off record the autograd node
-    took (:func:`_handoff_take`; ``"g"`` mode without the in-kernel Q/K L2 norm only), accepted or refused here
-    before any workspace is acquired (:func:`_handoff_accept`).  An accepted record runs the tape path
+    """:func:`cake_kda_nondet_train_backward` after its package check; ``handoff`` is a checkpoint hand-off record the
+    autograd node took (:func:`_handoff_take`; ``"g"`` mode without the in-kernel Q/K L2 norm only), accepted or refused
+    here before any workspace is acquired (:func:`_handoff_accept`).  An accepted record runs the tape path
     (:func:`_backward`): without a caller workspace on a per-call arena of its one layout (``bwd_tape``, or
-    :data:`HANDOFF_LAYOUT` for a row record), on a caller's workspace as it is (a backward arena holds both
-    layouts).  A refused record leaves the call exactly as without one."""
+    :data:`HANDOFF_LAYOUT` for a row record), on a caller's workspace as it is (a backward arena holds both layouts).  A
+    refused record leaves the call exactly as without one."""
     gate = _gate_mode(use_gate_in_kernel)
     l2n = _l2n_mode(use_qk_l2norm_in_kernel)
     raw_batched = g.dim() == 4
@@ -6069,8 +6074,8 @@ def _backward(
 
 
 class _GateSaved(Protocol):
-    """What :func:`_check_saved_gate` reads of a saved set (``CakeKDANondetChunkSaved``, the deterministic package's set and
-    the KCP saved sets)."""
+    """What :func:`_check_saved_gate` reads of a saved set (``CakeKDANondetChunkSaved`` and the context-parallel
+    package's saved sets)."""
 
     @property
     def gate(self) -> str: ...
@@ -6082,7 +6087,8 @@ class _GateSaved(Protocol):
 def _check_saved_gate(saved: _GateSaved, gp: _GateParams | None) -> None:
     """``ValueError`` when the saved set's gate mode or (raw mode) the FP32 bits of its ``lower_bound`` differ from
     the call's: the set's tensors were formed from the other gate.  The same fields and rule as the deterministic
-    package's, so either package's backward reads the other's set of either mode."""
+    package's; this package's backward reads its own ``CakeKDANondetChunkSaved`` only
+    (:func:`_check_nondet_package`)."""
     gate = "g" if gp is None else "raw"
     saved_gate = saved.gate
     if saved_gate != gate:
@@ -7042,24 +7048,21 @@ def _saved_extra(
 
 class CakeKDANondetFunction(torch.autograd.Function):
     """:func:`cake_kda_nondet` as an autograd node: the forward saves the inputs and the saved set, the backward runs
-    :func:`cake_kda_nondet_train_backward` from them.  Under ``torch.utils.checkpoint`` (``use_reentrant=False``) the forward is
-    re-run in the backward and the saved set recomputed; the re-run forward may also hand its tapes to the backward
-    (the checkpoint hand-off, the module docstring).  The node keeps nothing but the saved
-    tensors alive: the caller's workspace is held through a weak reference, so a workspace the caller dropped
-    after the forward (a per-call one, or any workspace of a checkpointed forward whose frame is gone) is freed,
-    and the backward then allocates its own (:func:`cake_kda_nondet_train_backward` without ``workspace``).  The argument
-    ``deterministic`` (after ``checkpoint_handoff``) must be ``False`` (:func:`_require_deterministic_false`): an
-    ``apply`` that swaps only the import path of the deterministic package's Function fails instead of changing
-    mode; the node records it and its backward passes it on.  ``checkpoint_handoff`` is the positional argument
-    before it (``None``: ``"auto"``; a ``bool`` there raises ``TypeError``: an ``apply`` written without the slot,
-    or with the deterministic Function's raw gate arguments after ``doc_lengths``); :func:`cake_kda_nondet` applies the
-    environment override and passes ``"off"`` under ``no_grad``.  The raw gate mode's arguments follow
-    ``deterministic`` (``use_gate_in_kernel``, ``A_log``, ``dt_bias``, ``lower_bound``): the node then saves the
-    raw gate (the caller's view) and ``A_log`` / ``dt_bias`` in place of an FP32 gate, records the mode and
-    ``lower_bound``, returns the gradients of the raw gate, ``A_log`` and ``dt_bias`` and engages no checkpoint
-    hand-off.  ``use_qk_l2norm_in_kernel`` follows ``lower_bound``: with it the node saves the caller's raw ``q`` /
-    ``k`` (as always) and the set's ``qk_rstd`` (the last extra field), records the mode and engages no checkpoint
-    hand-off; ``dq`` / ``dk`` are the raw rows' gradients."""
+    :func:`cake_kda_nondet_train_backward` from them.  Under ``torch.utils.checkpoint`` (``use_reentrant=False``) the
+    forward is re-run in the backward and the saved set recomputed; the re-run forward may also hand its tapes to the
+    backward (the checkpoint hand-off, the module docstring).  The node keeps nothing but the saved tensors alive: the
+    caller's workspace is held through a weak reference, so a workspace the caller dropped after the forward (a per-call
+    one, or any workspace of a checkpointed forward whose frame is gone) is freed, and the backward then allocates its
+    own (:func:`cake_kda_nondet_train_backward` without ``workspace``).  The node takes no mode argument: its forward
+    and its backward run this package.  ``checkpoint_handoff`` is the positional argument after ``doc_lengths``
+    (``None``: ``"auto"``; a ``bool`` there raises ``TypeError``: an ``apply`` written with the deterministic Function's
+    raw gate arguments after ``doc_lengths``); :func:`cake_kda_nondet` applies the environment override and passes
+    ``"off"`` under ``no_grad``.  The raw gate mode's arguments follow ``checkpoint_handoff`` (``use_gate_in_kernel``,
+    ``A_log``, ``dt_bias``, ``lower_bound``): the node then saves the raw gate (the caller's view) and ``A_log`` /
+    ``dt_bias`` in place of an FP32 gate, records the mode and ``lower_bound``, returns the gradients of the raw gate,
+    ``A_log`` and ``dt_bias`` and engages no checkpoint hand-off.  ``use_qk_l2norm_in_kernel`` follows ``lower_bound``:
+    with it the node saves the caller's raw ``q`` / ``k`` (as always) and the set's ``qk_rstd`` (the last extra field),
+    records the mode and engages no checkpoint hand-off; ``dq`` / ``dk`` are the raw rows' gradients."""
 
     @staticmethod
     def forward(
@@ -7076,7 +7079,6 @@ class CakeKDANondetFunction(torch.autograd.Function):
         arena,
         doc_lengths,
         checkpoint_handoff=None,
-        deterministic=True,
         use_gate_in_kernel=False,
         A_log=None,
         dt_bias=None,
@@ -7084,12 +7086,11 @@ class CakeKDANondetFunction(torch.autograd.Function):
         use_qk_l2norm_in_kernel=False,
     ):
         if isinstance(checkpoint_handoff, bool):
-            # an apply written for the signature without the slot passes its deterministic flag here
+            # an apply written for the deterministic Function's signature passes its use_gate_in_kernel flag here
             raise TypeError(
                 "CakeKDANondetFunction: the positional argument after doc_lengths is checkpoint_handoff (None, "
-                f"'auto', 'on' or 'off'), got {checkpoint_handoff!r}; deterministic follows it: pass None, False"
+                f"'auto', 'on' or 'off'), got {checkpoint_handoff!r}; the raw gate arguments follow it"
             )
-        _require_deterministic_false(deterministic, "CakeKDANondetFunction")
         mode = "auto" if checkpoint_handoff is None else checkpoint_handoff
         if mode not in HANDOFF_MODES:
             raise ValueError(
@@ -7148,7 +7149,6 @@ class CakeKDANondetFunction(torch.autograd.Function):
         ctx.gate, ctx.lower_bound = saved.gate, saved.lower_bound
         ctx.qk_l2norm = saved.qk_l2norm
         ctx.scale = scale
-        ctx.deterministic = deterministic
         # a weak reference: the node must not keep a per-call arena alive until the backward (under activation
         # checkpointing that would be one arena per layer)
         ctx.workspace_ref = None if workspace is None else weakref.ref(workspace)
@@ -7192,7 +7192,6 @@ class CakeKDANondetFunction(torch.autograd.Function):
                 dout.contiguous()
             )  # autograd may hand over an expanded or permuted gradient
         workspace = None if ctx.workspace_ref is None else ctx.workspace_ref()
-        _require_deterministic_false(ctx.deterministic, "cake_kda_nondet_train_backward")
         # the checkpoint recompute's record of this node (None without one, or when a stamp mismatches; none in raw
         # gate mode nor with the in-kernel Q/K L2 norm)
         record = (
@@ -7223,7 +7222,7 @@ class CakeKDANondetFunction(torch.autograd.Function):
         dq, dk, dv, dbeta, dg = grads[:5]
         dA_log, ddt_bias = grads[5:] if raw else (None, None)
         # (q, k, v, g, beta), (cu_seqlens, scale, workspace, save_mode, arena, doc_lengths), checkpoint_handoff,
-        # deterministic, use_gate_in_kernel, A_log, dt_bias, lower_bound, use_qk_l2norm_in_kernel
+        # use_gate_in_kernel, A_log, dt_bias, lower_bound, use_qk_l2norm_in_kernel
         return (
             dq,
             dk,
@@ -7231,7 +7230,6 @@ class CakeKDANondetFunction(torch.autograd.Function):
             dg,
             dbeta,
             *(None,) * 6,
-            None,
             None,
             None,
             dA_log,
@@ -7260,7 +7258,6 @@ def cake_kda_nondet(
     lower_bound: float | None = None,
     use_qk_l2norm_in_kernel: bool = False,
     checkpoint_handoff: str = "auto",
-    deterministic: bool = True,
 ) -> torch.Tensor:
     """The autograd entry: ``out`` with gradients to ``q, k, v, g, beta`` (and with ``use_gate_in_kernel=True`` to
     the raw gate ``g``, BF16, and to ``A_log`` / ``dt_bias``, FP32: :func:`cake_kda_nondet_train_forward` for the raw operands;
@@ -7282,11 +7279,10 @@ def cake_kda_nondet(
     the backward's own workspace (a per-call or checkpointed forward) takes the same option.  ``doc_lengths``
     (the documents' token counts, host integers) is required under a batched option and recorded by the node.
     ``checkpoint_handoff`` (``"auto"``, ``"on"`` or ``"off"``) and ``CAKE_KDA_CKPT_HANDOFF``: the checkpoint
-    hand-off (the module docstring).
-    ``deterministic`` must be ``False`` (:func:`_require_deterministic_false`); the node's backward is this
-    package's.
+    hand-off (the module docstring).  The node's backward is this package's.  A workspace or an arena option of the
+    deterministic package is refused with ``ValueError`` (:func:`_check_nondet_package`).
     """
-    _require_deterministic_false(deterministic, "cake_kda_nondet")
+    _check_nondet_package(workspace=workspace, arena=arena)
     _l2n_mode(use_qk_l2norm_in_kernel)
     mode = _handoff_mode(checkpoint_handoff)
     if not torch.is_grad_enabled():
@@ -7304,7 +7300,6 @@ def cake_kda_nondet(
         arena,
         doc_lengths,
         mode,
-        False,
         use_gate_in_kernel,
         A_log,
         dt_bias,
@@ -7360,9 +7355,9 @@ __all__ = [
     "SLOTS",
     "TABLE_NAMES",
     "TAPE_WY_VERIFIED",
-    "CakeKDANondetFunction",
     "CakeKDANondetArena",
     "CakeKDANondetChunkSaved",
+    "CakeKDANondetFunction",
     "CakeKDANondetWorkspace",
     "Launcher",
     "Plan",

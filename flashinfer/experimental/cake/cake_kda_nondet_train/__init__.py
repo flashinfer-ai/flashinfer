@@ -17,14 +17,14 @@ limitations under the License.
 # Experimental Cake backend: packed KDA (Kimi Delta Attention) chunked
 # training forward and backward in the GLM-5.3-Flash geometry (head dimension
 # 128, chunk 64, per-document zero initial state) on SM100 / SM103 / SM107, the
-# ``deterministic=False`` counterpart of
-# ``flashinfer.experimental.cake.cake_kda_det_train``.  The public entry points are
-# ``flashinfer.cake_kda_nondet_train.cake_kda_nondet_train_forward``, ``cake_kda_nondet_train_backward`` and
-# ``cake_kda_nondet`` with ``deterministic=False``; the host plan, workspace, launch
-# sequences, autograd Function, registry and generated sources live here.
-# ``cake_kda_nondet_train_forward``, ``cake_kda_nondet_train_backward`` and ``cake_kda_nondet`` of this package take
-# ``deterministic: bool = True`` and raise ``ValueError`` unless it is
-# ``False``.  The package imports nothing from the deterministic package.
+# non-deterministic counterpart of the deterministic package
+# ``flashinfer.experimental.cake.cake_kda_det_train``.  The public entry points
+# are ``flashinfer.cake_kda_nondet_train.cake_kda_nondet_train_forward``,
+# ``cake_kda_nondet_train_backward`` and ``cake_kda_nondet``; the host plan,
+# workspace, launch sequences, autograd Function, registry and generated sources
+# live here.  The entries take no mode argument and refuse a workspace, saved
+# set or arena option of the deterministic package with ``ValueError``.  The
+# package imports nothing from the deterministic package.
 
 from .cake_backend import (
     SAVE_MODES,
@@ -32,20 +32,13 @@ from .cake_backend import (
     SAVED_VERSION_TAPE,
     SCALE,
     SEG_SAVE_MIN_TOKENS_PER_SEG,
-    CakeKDANondetFunction,
+    CakeKDANondetArena,
     CakeKDANondetChunkSaved,
+    CakeKDANondetFunction,
     CakeKDANondetWorkspace,
-    Plan,
     cake_kda_nondet,
     cake_kda_nondet_train_backward,
     cake_kda_nondet_train_forward,
-    is_supported,
-    memory_report,
-    output_bytes,
-    plan,
-    saved_bytes,
-    seg_states_saved,
-    workspace_bytes,
 )
 from .cake_jit import ARCH_BY_CAPABILITY, ARCHES, S1_RECORDS
 
@@ -58,18 +51,11 @@ __all__ = [
     "SAVED_VERSION_TAPE",
     "SCALE",
     "SEG_SAVE_MIN_TOKENS_PER_SEG",
-    "CakeKDANondetFunction",
+    "CakeKDANondetArena",
     "CakeKDANondetChunkSaved",
+    "CakeKDANondetFunction",
     "CakeKDANondetWorkspace",
-    "Plan",
     "cake_kda_nondet",
     "cake_kda_nondet_train_backward",
     "cake_kda_nondet_train_forward",
-    "is_supported",
-    "memory_report",
-    "output_bytes",
-    "plan",
-    "saved_bytes",
-    "seg_states_saved",
-    "workspace_bytes",
 ]
