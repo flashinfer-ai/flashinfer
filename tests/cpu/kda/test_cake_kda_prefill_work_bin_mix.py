@@ -392,24 +392,24 @@ def test_e128_scope_and_program_lookup(monkeypatch):
 
 
 def test_shipped_loader_names_the_bounded_e128_builds():
-    # The 128-token turnover builds, on sm_103a alone: one per bounded N32
-    # direct module, beside its turnover build (which ships for both
-    # architectures and stays the route of every other turnover launch).
+    # The 128-token turnover builds, on both architectures: one per bounded N32
+    # direct module, beside its turnover build (which stays the route of every
+    # other turnover launch); one program ships for both architectures.
     routes = registry._RENDERED_WORK_BIN_TURN_E128_ROUTES
-    assert set(routes) == {"sm_100a", "sm_103a"} and routes["sm_100a"] == {}
-    assert len(routes["sm_103a"]) == 3
-    for module, program in routes["sm_103a"].items():
-        turnover = TURN["sm_103a"][module]
-        assert program != turnover and program not in TURN["sm_100a"].values()
-        assert registry._RENDERED_MODULES[program]["arches"] == ["sm_103a"]
-        assert set(registry._RENDERED_MODULES[turnover]["arches"]) == {
-            "sm_100a",
-            "sm_103a",
-        }
-        lookup = runtime._work_bin_turn_e128_program
-        assert lookup(turnover, "sm_103a", [128] * 16) == program
-        assert lookup(turnover, "sm_103a", [128] * 15 + [127]) is None
-        assert lookup(TURN["sm_100a"][module], "sm_100a", [128] * 16) is None
+    assert set(routes) == {"sm_100a", "sm_103a"}
+    assert routes["sm_100a"] == routes["sm_103a"] and len(routes["sm_103a"]) == 3
+    lookup = runtime._work_bin_turn_e128_program
+    for arch in ("sm_100a", "sm_103a"):
+        for module, program in routes[arch].items():
+            turnover = TURN[arch][module]
+            assert program != turnover and program not in TURN[arch].values()
+            for name in (program, turnover):
+                assert set(registry._RENDERED_MODULES[name]["arches"]) == {
+                    "sm_100a",
+                    "sm_103a",
+                }
+            assert lookup(turnover, arch, [128] * 16) == program
+            assert lookup(turnover, arch, [128] * 15 + [127]) is None
 
 
 def test_long_task_program_lookup(monkeypatch):

@@ -22,7 +22,7 @@ authors = [{ name = "FlashInfer team" }]
 license = "Apache-2.0"
 readme = "README.md"
 urls = { Homepage = "https://github.com/flashinfer-ai/flashinfer" }
-license-files = ["LICENSE", "LICENSE*.txt", "licenses/LICENSE.kda-for-kda", "licenses/LICENSE.cudnn-frontend-MIT.txt"]
+license-files = ["LICENSE", "NOTICE", "LICENSE*.txt", "licenses/LICENSE.kda-for-kda", "licenses/LICENSE.cudnn-frontend-MIT.txt", "licenses/LICENSE.batch-invariant-ops.txt"]
 
 [project.optional-dependencies]
 b12x = ["torch>=2.12.0", "nvidia-cutlass-dsl[cu13]>=4.8.0", "rich>=13", "safetensors>=0.6"]
@@ -57,7 +57,7 @@ skip = ["build", "3rdparty", "dist", ".venv"]
 
 [tool.setuptools]
 include-package-data = false
-py-modules = ["build_backend", "build_utils"]
+py-modules = ["build_backend", "build_utils", "_flashinfer_filelock"]
 
 [tool.setuptools.dynamic]
 version = { attr = "flashinfer._build_meta.__version__" }
@@ -72,6 +72,7 @@ exclude = [
   "flashinfer.experimental.b12x._compat*",
   "flashinfer.prims_ts.moe.tools*",
   "flashinfer.batch_invariant.lean*",
+  "flashinfer.moe_ep.kernel_src.sm100.kimi-k3-megamoe*",
 ]
 
 [tool.setuptools.package-dir]
@@ -82,6 +83,7 @@ exclude = [
 "flashinfer.data.cccl" = "3rdparty/cccl"
 
 [tool.setuptools.package-data]
+"flashinfer.experimental.hc_sum_sm100" = ["csrc/**", "README.md", "SOURCES.md"]
 "flashinfer.experimental.b12x.comm.roce" = ["*.c"]
 "flashinfer.experimental.b12x.loader" = ["*.c", "*.h"]
 # Cake-exported packages (flashinfer-ai/flashinfer#6553): the generated csrc tree plus the
@@ -153,7 +155,15 @@ exclude = [
 # next to its module.
 "flashinfer.experimental.deepgemm_dense_mqa" = ["*.json"]
 "flashinfer" = ["_build_meta.py", "mla_kv_pack_fp8_workloads.json"]
-# The batch-invariant GEMM dispatcher's fitted constants, read at runtime next to its module.
+# The private loader imports this hyphenated source tree from package data.
+"flashinfer.moe_ep.kernel_src.sm100" = [
+  "kimi-k3-megamoe/**/*.py",
+  "kimi-k3-megamoe/*.py",
+  "kimi-k3-megamoe/*.md",
+  "kimi-k3-megamoe/*.json",
+  "kimi-k3-megamoe/LICENSE",
+  "kimi-k3-megamoe/NOTICE",
+]
 "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe" = ["*.md"]
 "flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe" = ["*.md"]
 "flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe" = ["*.md"]
@@ -282,6 +292,8 @@ exclude = [
   "flashinfer/prims_ts/",
   "flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/",
   "flashinfer/moe_ep/kernel_src/sm100/next_cutedsl_megamoe/src/",
+  # Mypy cannot name the private loader's hyphenated package-data directory.
+  "flashinfer/moe_ep/kernel_src/sm100/kimi-k3-megamoe/",
   "flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src/",
   "flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/",
   "flashinfer/moe_ep/kernel_src/sm120/swapab_cutedsl_megakernel/src/",
@@ -329,6 +341,7 @@ extend-exclude = [
   "flashinfer/cute_dsl/attention/fmha/helpers",
   "flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src",
   "flashinfer/moe_ep/kernel_src/sm100/next_cutedsl_megamoe/src",
+  "flashinfer/moe_ep/kernel_src/sm100/kimi-k3-megamoe/src",
   "flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src",
   "flashinfer/experimental/cake_mxfp8_megamoe_ep16/csrc/cake_mxfp8_megamoe_ep16/cute",
   "flashinfer/topk_varlen/kernels/gvr_topk_decode.py",

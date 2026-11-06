@@ -965,6 +965,9 @@ Used by `flashinfer.trace` / `fi_trace`.
 | `FLASHINFER_TRACE_DUMP_DIR` | cwd | `flashinfer/fi_trace.py` | Directory where the trace JSON files are written. |
 | `FLASHINFER_TRACE_APPLY` | `0` | `flashinfer/__init__.py`, `flashinfer/trace_apply/config.py` | Set to `1` to enable Trace Apply (runtime kernel substitution) when FlashInfer is imported. |
 | `FLASHINFER_TRACE_APPLY_PATH` | unset | `flashinfer/trace_apply/config.py` | Directory from which deployment-configured solutions are loaded for Trace Apply. |
+| `FLASHINFER_KERNEL_PACKAGES` | unset | `flashinfer/__init__.py`, `flashinfer/trace_apply/packages.py` | Comma-separated sha256 digests of sealed kernel packages to verify, import and enable when FlashInfer is imported (best effort: a bad package warns). |
+| `FLASHINFER_KERNEL_PACKAGE_ROOT` | `/opt/flashinfer/kernel_packages` | `flashinfer/__init__.py`, `flashinfer/trace_apply/packages.py` | Directory holding the digest-named sealed package directories. |
+| `FLASHINFER_KERNEL_PLUGINS_DISABLE` | unset | `flashinfer/trace_apply/packages.py` | Kill switch for the environment-triggered loading above: when truthy, the import-time hook refuses with a warning even if the two variables are set. A program that calls `load_packages()` itself is not affected. |
 
 ##### Validation / Autotuning / Routing / Kernel Selection
 
@@ -1129,6 +1132,11 @@ for every provider and its shim when producing CUDA-specific or nightly wheels.
 
 ## Build System Details
 
+- **Portable descriptor locks**: `_flashinfer_filelock` uses stdlib `fcntl.flock`
+  on Unix and Portalocker's `Win32Locker` on Windows for shared/exclusive locks.
+  Callers own file opening, timeout policy and cleanup; nonblocking contention
+  raises `BlockingIOError`. The top-level module keeps standalone tools free of
+  GPU imports. Existing `filelock.FileLock` users remain unchanged.
 - **Build backend**: Custom PEP 517 backend in `build_backend.py`
 - **Data directories**: Build creates symlinks for editable installs:
   - `3rdparty/cutlass` → `flashinfer/data/cutlass`
