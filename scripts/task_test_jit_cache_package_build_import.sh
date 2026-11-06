@@ -197,6 +197,9 @@ echo "Setting up sccache"
 echo "========================================"
 
 export SCCACHE_BUCKET="${SCCACHE_BUCKET:-flashinfer-build-cache}"
+# The PR AOT lane caches nvcc with the rapidsai/sccache fork (see setup_sccache);
+# release/nightly builds and the GPU test lanes stay on upstream sccache.
+export FLASHINFER_SCCACHE_NVCC_IMPL="${FLASHINFER_SCCACHE_NVCC_IMPL:-rapids}"
 setup_sccache "cuda${CUDA_VERSION}-$(uname -m)" "$(pwd -P)"
 
 echo ""
