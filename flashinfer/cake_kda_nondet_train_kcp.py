@@ -17,18 +17,18 @@ Context-parallel (KCP) packed KDA (Kimi Delta Attention) chunked training
 (SM100 / SM103 / SM107), the Cake backend, with a choice of numerical mode.
 
 Every entry takes ``deterministic: bool = True`` and rejects a value that is not
-a ``bool`` (``TypeError``); ``kcp_handoff_stats`` (the non-deterministic
+a ``bool`` (``TypeError``); ``cake_kda_nondet_train_kcp_handoff_stats`` (the non-deterministic
 package's checkpoint hand-off counters) takes none:
 
 * ``deterministic=True`` (the default) runs the deterministic package
-  ``flashinfer.experimental.cake_kda_det_train_kcp`` (the objects behind
+  ``flashinfer.experimental.cake.cake_kda_det_train_kcp`` (the objects behind
   ``flashinfer.cake_kda_det_train_kcp``): the same inputs, hardware, plan and
   process group give bitwise the same outputs and gradients.
 * ``deterministic=False`` runs the package
-  ``flashinfer.experimental.cake_kda_train_kcp``.  Its KCP programs and
+  ``flashinfer.experimental.cake.cake_kda_nondet_train_kcp``.  Its KCP programs and
   exchanges are the deterministic package's; its rank-local chunk stages are
-  those of ``flashinfer.experimental.cake.cake_kda_train``
-  (``flashinfer.cake_kda_train`` with ``deterministic=False``), whose backward
+  those of ``flashinfer.experimental.cake.cake_kda_nondet_train``
+  (``flashinfer.cake_kda_nondet_train`` with ``deterministic=False``), whose backward
   moves the ``q * dq`` term of the gate gradient ``dg`` from the fused
   dq / dk / dg program into the GLM intra program on the rows its registry
   lists.  The schedule has a fixed order: at the same topology repeated calls
@@ -40,11 +40,11 @@ package's checkpoint hand-off counters) takes none:
 
 The mode is never stored in the context: a partition, a context and the byte
 queries of either package describe the same plan, a partition of either
-package builds the context of both (``build_context_kcp`` converts it to the
+package builds the context of both (``cake_kda_nondet_train_kcp_build_context`` converts it to the
 type of the package it routes to), and a context of either package serves the
-calls of both (``partition_kcp`` / ``build_context_kcp`` build it with the
+calls of both (``cake_kda_nondet_train_kcp_partition`` / ``cake_kda_nondet_train_kcp_build_context`` build it with the
 package ``deterministic`` selects).  The mode of
-:func:`chunk_kda_kcp` is fixed at its forward call: the autograd node's backward
+:func:`cake_kda_nondet_kcp` is fixed at its forward call: the autograd node's backward
 is the forward's package.  A saved set is read by the backward of the package
 that wrote it (the other one raises ``ValueError``), and a workspace serves its
 own package: allocate it with the ``deterministic`` value of the calls that use
@@ -61,41 +61,41 @@ is a keyword argument; no environment variable is read.
 Name map (the deterministic names are unchanged and always deterministic)::
 
     flashinfer.cake_kda_det_train_kcp      this module (deterministic=...)
-      partition_det_kcp                      partition_kcp
-      build_context_det_kcp                  build_context_kcp
-      chunk_kda_det_fwd_kcp                  chunk_kda_fwd_kcp
-      chunk_kda_det_bwd_kcp                  chunk_kda_bwd_kcp
-      chunk_kda_det_kcp                      chunk_kda_kcp
-      kda_det_workspace_bytes_kcp            kda_workspace_bytes_kcp
-      kda_det_saved_bytes_kcp                kda_saved_bytes_kcp
-      kda_det_comm_bytes_kcp                 kda_comm_bytes_kcp
-      reduce_gate_param_grads_det_kcp        reduce_gate_param_grads_kcp
-      (none)                                 kda_handoff_bytes_kcp (0 under deterministic=True)
-      (none)                                 kcp_handoff_stats (the non-deterministic package's counters)
-      ContextDetKcp, PartitionDetKcp, ...    ContextKcp, PartitionKcp, ... (the non-deterministic package's types)
+      cake_kda_det_train_kcp_partition                      cake_kda_nondet_train_kcp_partition
+      cake_kda_det_train_kcp_build_context                  cake_kda_nondet_train_kcp_build_context
+      cake_kda_det_train_kcp_forward                  cake_kda_nondet_train_kcp_forward
+      cake_kda_det_train_kcp_backward                  cake_kda_nondet_train_kcp_backward
+      cake_kda_det_kcp                      cake_kda_nondet_kcp
+      cake_kda_det_train_kcp_workspace_bytes            cake_kda_nondet_train_kcp_workspace_bytes
+      cake_kda_det_train_kcp_saved_bytes                cake_kda_nondet_train_kcp_saved_bytes
+      cake_kda_det_train_kcp_comm_bytes                 cake_kda_nondet_train_kcp_comm_bytes
+      cake_kda_det_train_kcp_reduce_gate_param_grads        cake_kda_nondet_train_kcp_reduce_gate_param_grads
+      (none)                                 cake_kda_nondet_train_kcp_handoff_bytes (0 under deterministic=True)
+      (none)                                 cake_kda_nondet_train_kcp_handoff_stats (the non-deterministic package's counters)
+      CakeKDADetKcpContext, CakeKDADetKcpPartition, ...    CakeKDANondetKcpContext, CakeKDANondetKcpPartition, ... (the non-deterministic package's types)
 
-``flashinfer.kda_train.chunk_kda_kcp`` stays the deterministic entry (the name
+``flashinfer.kda_train.cake_kda_nondet_kcp`` stays the deterministic entry (the name
 it had before the deterministic rename), without a ``deterministic`` keyword;
 this module is the explicit namespace of the selectable mode.
 
 Usage::
 
-    from flashinfer.cake_kda_train_kcp import (partition_kcp, build_context_kcp, chunk_kda_kcp,
-                                               chunk_kda_fwd_kcp, chunk_kda_bwd_kcp)
+    from flashinfer.cake_kda_nondet_train_kcp import (cake_kda_nondet_train_kcp_partition, cake_kda_nondet_train_kcp_build_context, cake_kda_nondet_kcp,
+                                               cake_kda_nondet_train_kcp_forward, cake_kda_nondet_train_kcp_backward)
 
-    part = partition_kcp(cu_seqlens_global_cpu, world_size, deterministic=False)       # once per batch layout
-    ctx = build_context_kcp(part, group, rank, device, deterministic=False)            # this rank's tables
-    out_local = chunk_kda_kcp(q_local, k_local, v_local, g_local, beta_local, ctx, deterministic=False)
-    out_local, saved = chunk_kda_fwd_kcp(q_local, k_local, v_local, g_local, beta_local, ctx, deterministic=False)
-    grads = chunk_kda_bwd_kcp(q_local, k_local, v_local, g_local, beta_local, ctx, dout_local, saved=saved,
+    part = cake_kda_nondet_train_kcp_partition(cu_seqlens_global_cpu, world_size, deterministic=False)       # once per batch layout
+    ctx = cake_kda_nondet_train_kcp_build_context(part, group, rank, device, deterministic=False)            # this rank's tables
+    out_local = cake_kda_nondet_kcp(q_local, k_local, v_local, g_local, beta_local, ctx, deterministic=False)
+    out_local, saved = cake_kda_nondet_train_kcp_forward(q_local, k_local, v_local, g_local, beta_local, ctx, deterministic=False)
+    grads = cake_kda_nondet_train_kcp_backward(q_local, k_local, v_local, g_local, beta_local, ctx, dout_local, saved=saved,
                               deterministic=False)
 
 Raw gate mode (``use_gate_in_kernel=True`` with ``A_log``, ``dt_bias`` and
 ``lower_bound``; FlashInfer #7816) runs on both packages: the compute entries
-forward the keywords, ``chunk_kda_bwd_kcp`` then returns seven tensors
+forward the keywords, ``cake_kda_nondet_train_kcp_backward`` then returns seven tensors
 (``dA_log`` / ``ddt_bias`` this rank's partial sums, summed over the group with
-:func:`reduce_gate_param_grads_kcp`), and ``kda_workspace_bytes_kcp`` /
-``kda_saved_bytes_kcp`` take ``use_gate_in_kernel``.  With ``deterministic=False``
+:func:`cake_kda_nondet_train_kcp_reduce_gate_param_grads`), and ``cake_kda_nondet_train_kcp_workspace_bytes`` /
+``cake_kda_nondet_train_kcp_saved_bytes`` take ``use_gate_in_kernel``.  With ``deterministic=False``
 the rank-local stages run the non-deterministic single-rank package's raw
 records, copies of the deterministic raw programs on every row, so every output,
 the raw gate's gradient and the parameter partial sums are bitwise those of
@@ -103,7 +103,7 @@ the raw gate's gradient and the parameter partial sums are bitwise those of
 it.  The checkpoint hand-off does not engage in the raw mode.
 The in-kernel q / k L2 norm (``use_qk_l2norm_in_kernel=True``, #7817) runs on
 both packages too, in either gate mode: the compute entries forward it, and
-``kda_workspace_bytes_kcp`` / ``kda_saved_bytes_kcp`` take it.  With
+``cake_kda_nondet_train_kcp_workspace_bytes`` / ``cake_kda_nondet_train_kcp_saved_bytes`` take it.  With
 ``deterministic=False`` the rank-local stages run the non-deterministic
 single-rank package's in-kernel-norm records, copies of the deterministic
 programs on every row (no ``S1`` pair; in the raw gate mode the deterministic
@@ -124,26 +124,26 @@ from typing import Any, Optional
 import torch
 
 from .api_logging import flashinfer_experimental_api
-from .cake_kda_train import _FEATURE, DEFAULT_SCALE, _deterministic
+from .cake_kda_nondet_train import _FEATURE, DEFAULT_SCALE, _deterministic
 
 # The module of the non-deterministic package's workspace and saved-set types (recognized without importing the
 # package: none exists before the package is imported).
-_ND_KCP = f"{__package__}.experimental.cake_kda_train_kcp.cake_kcp"
+_ND_KCP = f"{__package__}.experimental.cake.cake_kda_nondet_train_kcp.cake_kcp"
 # The plan modules of the two packages, whose partition types are recognized the same way.
-_ND_PLAN = f"{__package__}.experimental.cake_kda_train_kcp.cake_kcp_plan"
-_DET_PLAN = f"{__package__}.experimental.cake_kda_det_train_kcp.cake_kcp_plan"
+_ND_PLAN = f"{__package__}.experimental.cake.cake_kda_nondet_train_kcp.cake_kcp_plan"
+_DET_PLAN = f"{__package__}.experimental.cake.cake_kda_det_train_kcp.cake_kcp_plan"
 
 
 def _det_kcp() -> Any:
     """The deterministic package's host module, imported on first use."""
-    from .experimental.cake_kda_det_train_kcp import cake_kcp  # noqa: PLC0415
+    from .experimental.cake.cake_kda_det_train_kcp import cake_kcp  # noqa: PLC0415
 
     return cake_kcp
 
 
 def _det_plan() -> Any:
     """The deterministic package's plan module, imported on first use."""
-    from .experimental.cake_kda_det_train_kcp import cake_kcp_plan  # noqa: PLC0415
+    from .experimental.cake.cake_kda_det_train_kcp import cake_kcp_plan  # noqa: PLC0415
 
     return cake_kcp_plan
 
@@ -157,7 +157,7 @@ def _nd_kcp() -> Any:
     """The non-deterministic package's host module, imported on first use."""
     mod = _ND_MODULES.get("cake_kcp")
     if mod is None:
-        from .experimental.cake_kda_train_kcp import cake_kcp  # noqa: PLC0415
+        from .experimental.cake.cake_kda_nondet_train_kcp import cake_kcp  # noqa: PLC0415
 
         mod = _ND_MODULES["cake_kcp"] = cake_kcp
     return mod
@@ -167,7 +167,7 @@ def _nd_plan() -> Any:
     """The non-deterministic package's plan module, imported on first use."""
     mod = _ND_MODULES.get("cake_kcp_plan")
     if mod is None:
-        from .experimental.cake_kda_train_kcp import cake_kcp_plan  # noqa: PLC0415
+        from .experimental.cake.cake_kda_nondet_train_kcp import cake_kcp_plan  # noqa: PLC0415
 
         mod = _ND_MODULES["cake_kcp_plan"] = cake_kcp_plan
     return mod
@@ -178,12 +178,12 @@ def _det_workspace(workspace: Any, deterministic: bool, entry: str) -> Any:
     package's local records: it is refused under ``deterministic=True``, and under torch's deterministic algorithms
     the call runs on a workspace of its own (``None``)."""
     nd = sys.modules.get(_ND_KCP)
-    if workspace is None or nd is None or not isinstance(workspace, nd.WorkspaceKcp):
+    if workspace is None or nd is None or not isinstance(workspace, nd.CakeKDANondetKcpWorkspace):
         return workspace
     if deterministic:
         raise TypeError(
-            f"{entry}: the workspace is a WorkspaceKcp of deterministic=False; a deterministic=True call needs a "
-            "WorkspaceDetKcp (flashinfer.cake_kda_det_train_kcp)"
+            f"{entry}: the workspace is a CakeKDANondetKcpWorkspace of deterministic=False; a deterministic=True call needs a "
+            "CakeKDADetKcpWorkspace (flashinfer.cake_kda_det_train_kcp)"
         )
     return None
 
@@ -197,11 +197,11 @@ def _partition_for(det: bool, part: Any) -> Any:
     other = sys.modules.get(_ND_PLAN if det else _DET_PLAN)
     if other is None:
         return part
-    if not isinstance(part, other.PartitionKcp if det else other.PartitionDetKcp):
+    if not isinstance(part, other.CakeKDANondetKcpPartition if det else other.CakeKDADetKcpPartition):
         return part
     plan = _det_plan() if det else _nd_plan()
-    own = plan.PartitionDetKcp if det else plan.PartitionKcp
-    fragment = plan.FragmentDetKcp if det else plan.FragmentKcp
+    own = plan.CakeKDADetKcpPartition if det else plan.CakeKDANondetKcpPartition
+    fragment = plan.CakeKDADetKcpFragment if det else plan.CakeKDANondetKcpFragment
 
     def fields(obj: Any) -> dict[str, Any]:
         return {f.name: getattr(obj, f.name) for f in dataclasses.fields(obj)}
@@ -217,7 +217,7 @@ def _det_saved(saved: Any, entry: str) -> Any:
     """``saved`` of a backward routed to the deterministic package: a saved set of the non-deterministic package is
     refused (``ValueError``) before it reaches the deterministic backward."""
     nd = sys.modules.get(_ND_KCP)
-    if saved is not None and nd is not None and isinstance(saved, nd.SavedKcp):
+    if saved is not None and nd is not None and isinstance(saved, nd.CakeKDANondetKcpSaved):
         raise ValueError(
             f"{entry}: the saved set comes from the non-deterministic package (deterministic=False); the "
             "deterministic backward reads its own forward's saved set only"
@@ -226,7 +226,7 @@ def _det_saved(saved: Any, entry: str) -> Any:
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
-def partition_kcp(
+def cake_kda_nondet_train_kcp_partition(
     cu_seqlens_global_cpu: Any,
     world_size: int,
     layout: str = "contiguous",
@@ -252,20 +252,20 @@ def partition_kcp(
 
     Returns
     -------
-    ``PartitionKcp`` (``PartitionDetKcp`` with ``deterministic=True``): per rank its fragments (document, token range)
-    of the batch; the input of :func:`build_context_kcp` on every rank.
+    ``CakeKDANondetKcpPartition`` (``CakeKDADetKcpPartition`` with ``deterministic=True``): per rank its fragments (document, token range)
+    of the batch; the input of :func:`cake_kda_nondet_train_kcp_build_context` on every rank.
     """
-    if _deterministic(deterministic, "partition_kcp"):
-        return _det_plan().partition_det_kcp(
+    if _deterministic(deterministic, "cake_kda_nondet_train_kcp_partition"):
+        return _det_plan().cake_kda_det_train_kcp_partition(
             cu_seqlens_global_cpu, world_size, layout, fragments, cut_points=cut_points
         )
-    return _nd_plan().partition_kcp(
+    return _nd_plan().cake_kda_nondet_train_kcp_partition(
         cu_seqlens_global_cpu, world_size, layout, fragments, cut_points=cut_points
     )
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
-def build_context_kcp(
+def cake_kda_nondet_train_kcp_build_context(
     part: Any,
     group: Any,
     rank: int,
@@ -282,8 +282,8 @@ def build_context_kcp(
 
     Parameters
     ----------
-    part : PartitionKcp
-        From :func:`partition_kcp`, the same object on every rank.  A partition of either package serves both: one of
+    part : CakeKDANondetKcpPartition
+        From :func:`cake_kda_nondet_train_kcp_partition`, the same object on every rank.  A partition of either package serves both: one of
         the other package than the call runs (another ``deterministic``, or torch's deterministic algorithms switched
         on between the two calls) is converted to the routed package's type with the same fields.
     group
@@ -300,20 +300,20 @@ def build_context_kcp(
         Head counts whose head plans are derived now (host work only) instead of at the first call.
     stream : torch.cuda.Stream, optional
         The stream of the context's one asynchronous table copy (default: the current stream of ``device``); see
-        :func:`flashinfer.cake_kda_det_train_kcp.build_context_det_kcp`.
+        :func:`flashinfer.cake_kda_det_train_kcp.cake_kda_det_train_kcp_build_context`.
     deterministic : bool
         The package that builds the context (see the module docstring).  The context holds no mode: a context of
         either package serves the calls of both.
 
     Returns
     -------
-    ``ContextKcp`` (``ContextDetKcp`` with ``deterministic=True``): the argument every KCP entry point takes;
+    ``CakeKDANondetKcpContext`` (``CakeKDADetKcpContext`` with ``deterministic=True``): the argument every KCP entry point takes;
     reusable across calls of the same batch layout.
     """
-    det = _deterministic(deterministic, "build_context_kcp")
+    det = _deterministic(deterministic, "cake_kda_nondet_train_kcp_build_context")
     part = _partition_for(det, part)
     if det:
-        return _det_plan().build_context_det_kcp(
+        return _det_plan().cake_kda_det_train_kcp_build_context(
             part,
             group,
             rank,
@@ -323,7 +323,7 @@ def build_context_kcp(
             heads=heads,
             stream=stream,
         )
-    return _nd_plan().build_context_kcp(
+    return _nd_plan().cake_kda_nondet_train_kcp_build_context(
         part,
         group,
         rank,
@@ -336,7 +336,7 @@ def build_context_kcp(
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
-def chunk_kda_fwd_kcp(
+def cake_kda_nondet_train_kcp_forward(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -357,17 +357,17 @@ def chunk_kda_fwd_kcp(
     Parameters
     ----------
     q, k, v, g, beta : torch.Tensor
-        This rank's shard of the operands of :func:`~flashinfer.cake_kda_train.chunk_kda_fwd` (the tokens of its
+        This rank's shard of the operands of :func:`~flashinfer.cake_kda_nondet_train.cake_kda_nondet_train_forward` (the tokens of its
         fragments, in the partition's order): BF16 ``[1, S_local, H, 128]`` ``q, k, v``, FP32 ``g``, BF16
         ``[1, S_local, H]`` ``beta``.
-    ctx : ContextKcp
-        From :func:`build_context_kcp`.
+    ctx : CakeKDANondetKcpContext
+        From :func:`cake_kda_nondet_train_kcp_build_context`.
     scale : float, optional
         Output scale; ``128 ** -0.5`` when ``None``.
     save_for_backward, save_mode, boundary_mode
-        As for :func:`flashinfer.cake_kda_det_train_kcp.chunk_kda_det_fwd_kcp`.
+        As for :func:`flashinfer.cake_kda_det_train_kcp.cake_kda_det_train_kcp_forward`.
     workspace : optional
-        A reused workspace of this rank of the same ``deterministic`` (``WorkspaceKcp`` / ``WorkspaceDetKcp``);
+        A reused workspace of this rank of the same ``deterministic`` (``CakeKDANondetKcpWorkspace`` / ``CakeKDADetKcpWorkspace``);
         without one the call allocates its own.
     deterministic : bool
         ``True`` runs the deterministic package, ``False`` the non-deterministic one (see the module docstring).
@@ -375,7 +375,7 @@ def chunk_kda_fwd_kcp(
     **options
         Further KCP options (``save_transfer``, ``exchange``, ``head_groups``, ``offset_class``, ``graph``),
         forwarded; also the raw gate keywords of
-        :func:`flashinfer.cake_kda_det_train_kcp.chunk_kda_det_fwd_kcp` (``use_gate_in_kernel``, ``A_log``,
+        :func:`flashinfer.cake_kda_det_train_kcp.cake_kda_det_train_kcp_forward` (``use_gate_in_kernel``, ``A_log``,
         ``dt_bias``, ``lower_bound``) and its ``use_qk_l2norm_in_kernel`` (the in-kernel q / k L2 norm; the
         workspace must be of the same mode), on both packages (see the module docstring).
 
@@ -384,8 +384,8 @@ def chunk_kda_fwd_kcp(
     ``(out, saved)``: ``out`` BF16 like ``v`` (this rank's tokens); ``saved`` the package's saved set or ``None``
     (readable by the same package's backward only).
     """
-    if _deterministic(deterministic, "chunk_kda_fwd_kcp"):
-        return _det_kcp().chunk_kda_det_fwd_kcp(
+    if _deterministic(deterministic, "cake_kda_nondet_train_kcp_forward"):
+        return _det_kcp().cake_kda_det_train_kcp_forward(
             q,
             k,
             v,
@@ -396,10 +396,10 @@ def chunk_kda_fwd_kcp(
             save_for_backward=save_for_backward,
             save_mode=save_mode,
             boundary_mode=boundary_mode,
-            workspace=_det_workspace(workspace, deterministic, "chunk_kda_fwd_kcp"),
+            workspace=_det_workspace(workspace, deterministic, "cake_kda_nondet_train_kcp_forward"),
             **options,
         )
-    return _nd_kcp().chunk_kda_fwd_kcp(
+    return _nd_kcp().cake_kda_nondet_train_kcp_forward(
         q,
         k,
         v,
@@ -417,7 +417,7 @@ def chunk_kda_fwd_kcp(
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
-def chunk_kda_bwd_kcp(
+def cake_kda_nondet_train_kcp_backward(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -438,14 +438,14 @@ def chunk_kda_bwd_kcp(
     Parameters
     ----------
     q, k, v, g, beta, ctx
-        The forward's inputs (same contracts as :func:`chunk_kda_fwd_kcp`).
+        The forward's inputs (same contracts as :func:`cake_kda_nondet_train_kcp_forward`).
     dout : torch.Tensor
         BF16 gradient of this rank's ``out``.
     saved : optional
         The forward's saved set, written by the package ``deterministic`` selects (the other package's set raises
         ``ValueError``); without one the forward is replayed (checkpointing).
     scale, save_mode, workspace, **options
-        As for :func:`chunk_kda_fwd_kcp`; the backward reads its own options (``spec3_probe`` among them).
+        As for :func:`cake_kda_nondet_train_kcp_forward`; the backward reads its own options (``spec3_probe`` among them).
     deterministic : bool
         ``True`` runs the deterministic package, ``False`` the non-deterministic one (see the module docstring); the
         forward's value.
@@ -454,13 +454,13 @@ def chunk_kda_bwd_kcp(
     -------
     ``(dq, dk, dv, dbeta, dg)`` of this rank's tokens: BF16 ``dq, dk, dv, dbeta``, FP32 ``dg``.  Bitwise
     reproducible at the same topology in both modes.  In raw gate mode seven tensors,
-    ``(dq, dk, dv, dbeta, dg, dA_log, ddt_bias)``, as :func:`flashinfer.cake_kda_det_train_kcp.chunk_kda_det_bwd_kcp`
+    ``(dq, dk, dv, dbeta, dg, dA_log, ddt_bias)``, as :func:`flashinfer.cake_kda_det_train_kcp.cake_kda_det_train_kcp_backward`
     returns them; both packages give the same bits, bitwise reproducible at the same topology.  With
     ``use_qk_l2norm_in_kernel=True`` (the forward's value) ``dq`` / ``dk`` are the gradients of the raw rows, and
     both packages give the same bits in either gate mode.
     """
-    if _deterministic(deterministic, "chunk_kda_bwd_kcp"):
-        return _det_kcp().chunk_kda_det_bwd_kcp(
+    if _deterministic(deterministic, "cake_kda_nondet_train_kcp_backward"):
+        return _det_kcp().cake_kda_det_train_kcp_backward(
             q,
             k,
             v,
@@ -468,13 +468,13 @@ def chunk_kda_bwd_kcp(
             beta,
             ctx,
             dout,
-            saved=_det_saved(saved, "chunk_kda_bwd_kcp"),
+            saved=_det_saved(saved, "cake_kda_nondet_train_kcp_backward"),
             scale=scale,
             save_mode=save_mode,
-            workspace=_det_workspace(workspace, deterministic, "chunk_kda_bwd_kcp"),
+            workspace=_det_workspace(workspace, deterministic, "cake_kda_nondet_train_kcp_backward"),
             **options,
         )
-    return _nd_kcp().chunk_kda_bwd_kcp(
+    return _nd_kcp().cake_kda_nondet_train_kcp_backward(
         q,
         k,
         v,
@@ -492,7 +492,7 @@ def chunk_kda_bwd_kcp(
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
-def chunk_kda_kcp(
+def cake_kda_nondet_kcp(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -511,7 +511,7 @@ def chunk_kda_kcp(
     **options: Any,
 ) -> torch.Tensor:
     r"""Autograd-enabled context-parallel packed KDA chunked training step of this rank's fragments (the forward of
-    :func:`chunk_kda_fwd_kcp`; the backward of :func:`chunk_kda_bwd_kcp` from its saved set).
+    :func:`cake_kda_nondet_train_kcp_forward`; the backward of :func:`cake_kda_nondet_train_kcp_backward` from its saved set).
 
     ``checkpoint_handoff`` (``"auto"``, ``"on"`` or ``"off"``; another value raises ``ValueError`` in both modes): the
     non-deterministic package's checkpoint hand-off (its README): under ``torch.utils.checkpoint`` the forward keeps
@@ -519,14 +519,14 @@ def chunk_kda_kcp(
     ``KCP_HANDOFF_VERIFIED`` the outputs and gradients are bitwise those of ``"off"``; ``"on"`` elsewhere has no such
     evidence.  ``"auto"`` (the default) engages where ``cake_kcp_plan.kcp_handoff_auto_refusal`` admits the call (a
     verified device, ``H`` in ``KCP_HANDOFF_HEADS``, ``H * (total tokens // world size) >= 393216``).  An engaged
-    call raises the checkpoint peak of this rank by at most :func:`kda_handoff_bytes_kcp` (its saved set is
-    ``kda_saved_bytes_kcp(..., checkpoint_handoff=True)``: no carry plane); ``"off"`` opts out.  The deterministic
+    call raises the checkpoint peak of this rank by at most :func:`cake_kda_nondet_train_kcp_handoff_bytes` (its saved set is
+    ``cake_kda_nondet_train_kcp_saved_bytes(..., checkpoint_handoff=True)``: no carry plane); ``"off"`` opts out.  The deterministic
     package has no hand-off: ``deterministic=True`` ignores the value and never engages.  In raw gate mode
     (``use_gate_in_kernel=True``, forwarded through ``**options``) and with the in-kernel q / k L2 norm
     (``use_qk_l2norm_in_kernel=True``, likewise) the hand-off does not engage either.
 
     ``recompute_handle`` / ``checkpoint_keep``: the checkpoint recompute without the forward state exchange, as for
-    :func:`flashinfer.cake_kda_det_train_kcp.chunk_kda_det_kcp` (a ``RecomputeHandleKcp`` or any object with an
+    :func:`flashinfer.cake_kda_det_train_kcp.cake_kda_det_kcp` (a ``CakeKDANondetKcpRecomputeHandle`` or any object with an
     ``entries`` dict; every rank passes a handle for the same call or none).  ``deterministic`` selects the package at
     the forward call; the node's backward runs the same package, and the checkpoint recompute of a forward runs the
     forward's package as long as torch's deterministic-algorithms setting does not change in between.
@@ -538,10 +538,10 @@ def chunk_kda_kcp(
     """
     if checkpoint_handoff not in ("auto", "on", "off"):
         raise ValueError(
-            f"chunk_kda_kcp: checkpoint_handoff must be 'auto', 'on' or 'off', got {checkpoint_handoff!r}"
+            f"cake_kda_nondet_kcp: checkpoint_handoff must be 'auto', 'on' or 'off', got {checkpoint_handoff!r}"
         )
-    if _deterministic(deterministic, "chunk_kda_kcp"):
-        return _det_kcp().chunk_kda_det_kcp(
+    if _deterministic(deterministic, "cake_kda_nondet_kcp"):
+        return _det_kcp().cake_kda_det_kcp(
             q,
             k,
             v,
@@ -551,12 +551,12 @@ def chunk_kda_kcp(
             scale=scale,
             save_mode=save_mode,
             boundary_mode=boundary_mode,
-            workspace=_det_workspace(workspace, deterministic, "chunk_kda_kcp"),
+            workspace=_det_workspace(workspace, deterministic, "cake_kda_nondet_kcp"),
             recompute_handle=recompute_handle,
             checkpoint_keep=checkpoint_keep,
             **options,
         )
-    return _nd_kcp().chunk_kda_kcp(
+    return _nd_kcp().cake_kda_nondet_kcp(
         q,
         k,
         v,
@@ -576,7 +576,7 @@ def chunk_kda_kcp(
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
-def kda_workspace_bytes_kcp(
+def cake_kda_nondet_train_kcp_workspace_bytes(
     ctx: Any,
     *,
     H: int = 64,
@@ -591,19 +591,19 @@ def kda_workspace_bytes_kcp(
     deterministic: bool = True,
 ) -> int:
     """Bytes of this rank's KCP workspace for ``H`` heads on the package ``deterministic`` selects (the same for both
-    values); see :func:`flashinfer.cake_kda_det_train_kcp.kda_det_workspace_bytes_kcp`.  ``ctx`` may be a list of
+    values); see :func:`flashinfer.cake_kda_det_train_kcp.cake_kda_det_train_kcp_workspace_bytes`.  ``ctx`` may be a list of
     contexts (one workspace that serves all of them).  ``local_arena`` / ``lean_passes`` are those of the workspace
-    (``WorkspaceKcp`` / ``WorkspaceDetKcp`` ``(local_arena="lean", lean_passes=...)``, opt-in: the backward's lean
+    (``CakeKDANondetKcpWorkspace`` / ``CakeKDADetKcpWorkspace`` ``(local_arena="lean", lean_passes=...)``, opt-in: the backward's lean
     local arena, its tail in ``lean_passes`` passes, two by default); ``None`` keeps the replay arena.
-    ``use_gate_in_kernel``: the workspace's gate mode (``WorkspaceKcp`` / ``WorkspaceDetKcp``
+    ``use_gate_in_kernel``: the workspace's gate mode (``CakeKDANondetKcpWorkspace`` / ``CakeKDADetKcpWorkspace``
     ``(use_gate_in_kernel=True)``, the raw gate mode; the same for both values of ``deterministic``);
-    ``use_qk_l2norm_in_kernel``: its in-kernel q / k L2 norm mode (``WorkspaceKcp`` / ``WorkspaceDetKcp``
+    ``use_qk_l2norm_in_kernel``: its in-kernel q / k L2 norm mode (``CakeKDANondetKcpWorkspace`` / ``CakeKDADetKcpWorkspace``
     ``(use_qk_l2norm_in_kernel=True)``; the same for both values of ``deterministic``)."""
-    det = _deterministic(deterministic, "kda_workspace_bytes_kcp")
+    det = _deterministic(deterministic, "cake_kda_nondet_train_kcp_workspace_bytes")
     plan = _det_plan() if det else _nd_plan()
     if save_transfer is None:
         save_transfer = plan.SAVE_TRANSFER_DEFAULT
-    query = plan.kda_det_workspace_bytes_kcp if det else plan.kda_workspace_bytes_kcp
+    query = plan.cake_kda_det_train_kcp_workspace_bytes if det else plan.cake_kda_nondet_train_kcp_workspace_bytes
     return query(
         ctx,
         H=H,
@@ -619,7 +619,7 @@ def kda_workspace_bytes_kcp(
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
-def reduce_gate_param_grads_kcp(
+def cake_kda_nondet_train_kcp_reduce_gate_param_grads(
     ctx: Any,
     dA_log: torch.Tensor,
     ddt_bias: torch.Tensor,
@@ -627,17 +627,17 @@ def reduce_gate_param_grads_kcp(
     deterministic: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """The raw gate mode's full ``(dA_log, ddt_bias)`` from every rank's partial sums (the last two tensors of
-    :func:`chunk_kda_bwd_kcp`), bitwise reproducible, on the package ``deterministic`` selects (the same algorithm
+    :func:`cake_kda_nondet_train_kcp_backward`), bitwise reproducible, on the package ``deterministic`` selects (the same algorithm
     and the same bits for both values); see
-    :func:`flashinfer.cake_kda_det_train_kcp.reduce_gate_param_grads_det_kcp`.  A collective: every rank of
+    :func:`flashinfer.cake_kda_det_train_kcp.cake_kda_det_train_kcp_reduce_gate_param_grads`.  A collective: every rank of
     ``ctx.group`` calls it."""
-    if _deterministic(deterministic, "reduce_gate_param_grads_kcp"):
-        return _det_kcp().reduce_gate_param_grads_det_kcp(ctx, dA_log, ddt_bias)
-    return _nd_kcp().reduce_gate_param_grads_kcp(ctx, dA_log, ddt_bias)
+    if _deterministic(deterministic, "cake_kda_nondet_train_kcp_reduce_gate_param_grads"):
+        return _det_kcp().cake_kda_det_train_kcp_reduce_gate_param_grads(ctx, dA_log, ddt_bias)
+    return _nd_kcp().cake_kda_nondet_train_kcp_reduce_gate_param_grads(ctx, dA_log, ddt_bias)
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
-def kda_saved_bytes_kcp(
+def cake_kda_nondet_train_kcp_saved_bytes(
     ctx: Any,
     *,
     H: int = 64,
@@ -652,29 +652,29 @@ def kda_saved_bytes_kcp(
     deterministic: bool = True,
 ) -> int:
     """Bytes of this rank's KCP saved set for ``H`` heads on the package ``deterministic`` selects (the same for both
-    values, except ``checkpoint_handoff=True``); see :func:`flashinfer.cake_kda_det_train_kcp.kda_det_saved_bytes_kcp`
+    values, except ``checkpoint_handoff=True``); see :func:`flashinfer.cake_kda_det_train_kcp.cake_kda_det_train_kcp_saved_bytes`
     for ``save_transfer``, ``with_conv``, ``C``, ``checkpoint_keep``, ``use_gate_in_kernel`` (the saved set's gate
-    mode, the raw gate mode of ``WorkspaceKcp`` / ``WorkspaceDetKcp`` ``(use_gate_in_kernel=True)``; the same bytes
+    mode, the raw gate mode of ``CakeKDANondetKcpWorkspace`` / ``CakeKDADetKcpWorkspace`` ``(use_gate_in_kernel=True)``; the same bytes
     in both gate modes and for both values of ``deterministic``) and ``use_qk_l2norm_in_kernel`` (the saved set of
     the in-kernel q / k L2 norm; the same bytes for both values of ``deterministic``).
-    ``checkpoint_handoff`` (a ``bool``, the hand-off decision, not :func:`chunk_kda_kcp`'s mode; another value raises
+    ``checkpoint_handoff`` (a ``bool``, the hand-off decision, not :func:`cake_kda_nondet_kcp`'s mode; another value raises
     ``TypeError``; ``False`` by default: the light set): ``True`` is the saved set, at the same ``save_transfer``, of
-    a ``deterministic=False`` forward that the checkpoint hand-off engages on (plus :func:`kda_handoff_bytes_kcp`,
-    without the carry plane; see :func:`chunk_kda_kcp`); the hand-off engages neither in the raw gate mode nor with
+    a ``deterministic=False`` forward that the checkpoint hand-off engages on (plus :func:`cake_kda_nondet_train_kcp_handoff_bytes`,
+    without the carry plane; see :func:`cake_kda_nondet_kcp`); the hand-off engages neither in the raw gate mode nor with
     the in-kernel q / k L2 norm, so with ``deterministic=False`` ``True`` beside ``use_gate_in_kernel=True`` or
     ``use_qk_l2norm_in_kernel=True`` raises ``ValueError``.  The deterministic package has no hand-off:
     ``deterministic=True`` ignores it and returns that package's figure."""
     if not isinstance(checkpoint_handoff, bool):
         raise TypeError(
-            "kda_saved_bytes_kcp: checkpoint_handoff is the hand-off decision (a bool), not chunk_kda_kcp's mode; "
+            "cake_kda_nondet_train_kcp_saved_bytes: checkpoint_handoff is the hand-off decision (a bool), not cake_kda_nondet_kcp's mode; "
             f"got {checkpoint_handoff!r}"
         )
-    det = _deterministic(deterministic, "kda_saved_bytes_kcp")
+    det = _deterministic(deterministic, "cake_kda_nondet_train_kcp_saved_bytes")
     plan = _det_plan() if det else _nd_plan()
     if save_transfer is None and checkpoint_keep is None:
         save_transfer = False
     if det:
-        return plan.kda_det_saved_bytes_kcp(
+        return plan.cake_kda_det_train_kcp_saved_bytes(
             ctx,
             H=H,
             save_mode=save_mode,
@@ -685,7 +685,7 @@ def kda_saved_bytes_kcp(
             use_gate_in_kernel=use_gate_in_kernel,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         )
-    return plan.kda_saved_bytes_kcp(
+    return plan.cake_kda_nondet_train_kcp_saved_bytes(
         ctx,
         H=H,
         save_mode=save_mode,
@@ -700,31 +700,31 @@ def kda_saved_bytes_kcp(
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
-def kda_handoff_bytes_kcp(
+def cake_kda_nondet_train_kcp_handoff_bytes(
     ctx: Any,
     *,
     H: int = 64,
     deterministic: bool = True,
 ) -> int:
     """Bytes of the checkpoint hand-off's tape set for one engaged call with ``H`` heads on this rank (``1280 * R *
-    H``), the most by which it raises this rank's checkpoint peak (see :func:`chunk_kda_kcp`).  ``deterministic=False``
+    H``), the most by which it raises this rank's checkpoint peak (see :func:`cake_kda_nondet_kcp`).  ``deterministic=False``
     reads the non-deterministic package; ``deterministic=True`` returns ``0`` (the deterministic package has no
     hand-off)."""
-    if _deterministic(deterministic, "kda_handoff_bytes_kcp"):
+    if _deterministic(deterministic, "cake_kda_nondet_train_kcp_handoff_bytes"):
         return 0
-    return _nd_plan().kda_handoff_bytes_kcp(ctx, H=H)
+    return _nd_plan().cake_kda_nondet_train_kcp_handoff_bytes(ctx, H=H)
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
-def kcp_handoff_stats() -> dict:
+def cake_kda_nondet_train_kcp_handoff_stats() -> dict:
     """A copy of the non-deterministic package's checkpoint hand-off counters (``"save"``: forwards that kept a tape
     set, ``"bound"``: backwards that read one, ``"refused_<reason>"``: requests the static keys refused); calls with
     ``deterministic=True`` never change them."""
-    return _nd_kcp().kcp_handoff_stats()
+    return _nd_kcp().cake_kda_nondet_train_kcp_handoff_stats()
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
-def kda_comm_bytes_kcp(
+def cake_kda_nondet_train_kcp_comm_bytes(
     ctx: Any,
     *,
     H: int = 64,
@@ -736,12 +736,12 @@ def kda_comm_bytes_kcp(
 ) -> dict:
     """Bytes this rank sends and receives in one training step for ``H`` heads and ``C`` convolution channels, per
     collective and per boundary, on the package ``deterministic`` selects (the same for both values); see
-    :func:`flashinfer.cake_kda_det_train_kcp.kda_det_comm_bytes_kcp`."""
-    det = _deterministic(deterministic, "kda_comm_bytes_kcp")
+    :func:`flashinfer.cake_kda_det_train_kcp.cake_kda_det_train_kcp_comm_bytes`."""
+    det = _deterministic(deterministic, "cake_kda_nondet_train_kcp_comm_bytes")
     plan = _det_plan() if det else _nd_plan()
     if save_transfer is None and checkpoint_keep is None:
         save_transfer = False
-    query = plan.kda_det_comm_bytes_kcp if det else plan.kda_comm_bytes_kcp
+    query = plan.cake_kda_det_train_kcp_comm_bytes if det else plan.cake_kda_nondet_train_kcp_comm_bytes
     return query(
         ctx,
         H=H,
@@ -756,12 +756,12 @@ def kda_comm_bytes_kcp(
 # neither the KCP host module (torch.distributed, the KCP loader) nor the plan: public name -> the submodule that
 # defines it.  The deterministic package's types are those of ``flashinfer.cake_kda_det_train_kcp``.
 _LAZY_TYPES = {
-    "ContextKcp": "cake_kcp_plan",
-    "OptionsKcp": "cake_kcp",
-    "PartitionKcp": "cake_kcp_plan",
-    "RecomputeHandleKcp": "cake_kcp",
-    "SavedKcp": "cake_kcp",
-    "WorkspaceKcp": "cake_kcp",
+    "CakeKDANondetKcpContext": "cake_kcp_plan",
+    "CakeKDANondetKcpOptions": "cake_kcp",
+    "CakeKDANondetKcpPartition": "cake_kcp_plan",
+    "CakeKDANondetKcpRecomputeHandle": "cake_kcp",
+    "CakeKDANondetKcpSaved": "cake_kcp",
+    "CakeKDANondetKcpWorkspace": "cake_kcp",
 }
 
 
@@ -772,7 +772,7 @@ def __getattr__(name: str) -> Any:
     from importlib import import_module  # noqa: PLC0415
 
     return getattr(
-        import_module(f"flashinfer.experimental.cake_kda_train_kcp.{submodule}"),
+        import_module(f"flashinfer.experimental.cake.cake_kda_nondet_train_kcp.{submodule}"),
         name,
     )
 
@@ -783,21 +783,21 @@ def __dir__() -> list[str]:
 
 __all__ = [
     "DEFAULT_SCALE",
-    "ContextKcp",  # noqa: F822 - resolved by __getattr__
-    "OptionsKcp",  # noqa: F822
-    "PartitionKcp",  # noqa: F822
-    "RecomputeHandleKcp",  # noqa: F822
-    "SavedKcp",  # noqa: F822
-    "WorkspaceKcp",  # noqa: F822
-    "build_context_kcp",
-    "chunk_kda_bwd_kcp",
-    "chunk_kda_fwd_kcp",
-    "chunk_kda_kcp",
-    "kcp_handoff_stats",
-    "kda_comm_bytes_kcp",
-    "kda_handoff_bytes_kcp",
-    "kda_saved_bytes_kcp",
-    "kda_workspace_bytes_kcp",
-    "partition_kcp",
-    "reduce_gate_param_grads_kcp",
+    "CakeKDANondetKcpContext",  # noqa: F822 - resolved by __getattr__
+    "CakeKDANondetKcpOptions",  # noqa: F822
+    "CakeKDANondetKcpPartition",  # noqa: F822
+    "CakeKDANondetKcpRecomputeHandle",  # noqa: F822
+    "CakeKDANondetKcpSaved",  # noqa: F822
+    "CakeKDANondetKcpWorkspace",  # noqa: F822
+    "cake_kda_nondet_train_kcp_build_context",
+    "cake_kda_nondet_train_kcp_backward",
+    "cake_kda_nondet_train_kcp_forward",
+    "cake_kda_nondet_kcp",
+    "cake_kda_nondet_train_kcp_handoff_stats",
+    "cake_kda_nondet_train_kcp_comm_bytes",
+    "cake_kda_nondet_train_kcp_handoff_bytes",
+    "cake_kda_nondet_train_kcp_saved_bytes",
+    "cake_kda_nondet_train_kcp_workspace_bytes",
+    "cake_kda_nondet_train_kcp_partition",
+    "cake_kda_nondet_train_kcp_reduce_gate_param_grads",
 ]

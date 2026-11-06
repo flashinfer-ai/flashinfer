@@ -13,33 +13,33 @@ are the deterministic package's; its README
 (`flashinfer/experimental/cake/cake_kda_det_train/README.md`) describes them.  This
 package imports nothing from it and ships its own copies of every program.
 This README describes what differs, including the checkpoint hand-off of
-`chunk_kda`, which the deterministic package does not have.
+`cake_kda_nondet`, which the deterministic package does not have.
 
 ## Entry points and numerical mode
 
-The public entry points are the facade functions of `flashinfer.cake_kda_train`:
+The public entry points are the facade functions of `flashinfer.cake_kda_nondet_train`:
 
 ```python
-from flashinfer.cake_kda_train import chunk_kda, chunk_kda_fwd, chunk_kda_bwd, kda_train_workspace
+from flashinfer.cake_kda_nondet_train import cake_kda_nondet, cake_kda_nondet_train_forward, cake_kda_nondet_train_backward, cake_kda_nondet_train_workspace
 
-out = chunk_kda(q, k, v, g, beta, cu_seqlens, deterministic=False)                  # autograd
-ws = kda_train_workspace(S, num_docs, H, device, deterministic=False)               # caller-owned
-out, saved = chunk_kda_fwd(q, k, v, g, beta, cu_seqlens, workspace=ws, deterministic=False)
-dq, dk, dv, dbeta, dg = chunk_kda_bwd(q, k, v, g, beta, cu_seqlens, dout, saved=saved,
+out = cake_kda_nondet(q, k, v, g, beta, cu_seqlens, deterministic=False)                  # autograd
+ws = cake_kda_nondet_train_workspace(S, num_docs, H, device, deterministic=False)               # caller-owned
+out, saved = cake_kda_nondet_train_forward(q, k, v, g, beta, cu_seqlens, workspace=ws, deterministic=False)
+dq, dk, dv, dbeta, dg = cake_kda_nondet_train_backward(q, k, v, g, beta, cu_seqlens, dout, saved=saved,
                                       workspace=ws, deterministic=False)
 
 # raw gate mode: the kernels activate the gate (FLA's use_gate_in_kernel keywords)
 raw_kw = dict(use_gate_in_kernel=True, A_log=A_log, dt_bias=dt_bias, lower_bound=-5.0)
-out = chunk_kda(q, k, v, raw, beta, cu_seqlens, deterministic=False, **raw_kw)  # grads to raw, A_log, dt_bias
-ws = kda_train_workspace(S, num_docs, H, device, deterministic=False, use_gate_in_kernel=True)
-out, saved = chunk_kda_fwd(q, k, v, raw, beta, cu_seqlens, workspace=ws, deterministic=False, **raw_kw)
-dq, dk, dv, dbeta, draw, dA_log, ddt_bias = chunk_kda_bwd(
+out = cake_kda_nondet(q, k, v, raw, beta, cu_seqlens, deterministic=False, **raw_kw)  # grads to raw, A_log, dt_bias
+ws = cake_kda_nondet_train_workspace(S, num_docs, H, device, deterministic=False, use_gate_in_kernel=True)
+out, saved = cake_kda_nondet_train_forward(q, k, v, raw, beta, cu_seqlens, workspace=ws, deterministic=False, **raw_kw)
+dq, dk, dv, dbeta, draw, dA_log, ddt_bias = cake_kda_nondet_train_backward(
     q, k, v, raw, beta, cu_seqlens, dout, saved=saved, workspace=ws, deterministic=False, **raw_kw)
 ```
 
-Every facade function (`chunk_kda_fwd`, `chunk_kda_bwd`, `chunk_kda`,
-`kda_train_arena`, `kda_train_workspace`, `kda_train_workspace_bytes`,
-`kda_train_saved_bytes`, `is_kda_train_supported`) takes
+Every facade function (`cake_kda_nondet_train_forward`, `cake_kda_nondet_train_backward`, `cake_kda_nondet`,
+`cake_kda_nondet_train_arena`, `cake_kda_nondet_train_workspace`, `cake_kda_nondet_train_workspace_bytes`,
+`cake_kda_nondet_train_saved_bytes`, `is_cake_kda_nondet_train_supported`) takes
 `deterministic: bool = True` and raises `TypeError` for a value that is not a
 `bool`:
 
@@ -49,19 +49,19 @@ Every facade function (`chunk_kda_fwd`, `chunk_kda_bwd`, `chunk_kda`,
 | `False` | `False` | this package |
 | `False` | `True` | the deterministic package, one `UserWarning` per process |
 
-This package's `chunk_kda_fwd`, `chunk_kda_bwd` and `chunk_kda`, its
-workspace `KdaWorkspace` (the constructor, `for_problem` and `for_budget`) and
-its autograd node `ChunkKDAFunction.apply` (a trailing argument) take
+This package's `cake_kda_nondet_train_forward`, `cake_kda_nondet_train_backward` and `cake_kda_nondet`, its
+workspace `CakeKDANondetWorkspace` (the constructor, `for_problem` and `for_budget`) and
+its autograd node `CakeKDANondetFunction.apply` (a trailing argument) take
 `deterministic: bool = True` too and raise `ValueError` unless it is `False`:
 a call that only swaps the import path of the deterministic package fails
 instead of changing mode.
 
-`ChunkKDAFunction.apply` takes `checkpoint_handoff` (`None`, `"auto"`, `"on"`
+`CakeKDANondetFunction.apply` takes `checkpoint_handoff` (`None`, `"auto"`, `"on"`
 or `"off"`; see below) as the positional argument after `doc_lengths`, before
 `deterministic`.  This changes the positional signature: an `apply` written
 for the previous one passes its `bool` in that slot and raises `TypeError`.
 
-- The mode of `chunk_kda` is fixed at its forward call: the autograd node's
+- The mode of `cake_kda_nondet` is fixed at its forward call: the autograd node's
   backward is the forward's package.
 - Both packages write the saved set in the same format (the forward programs
   are the same), so either backward reads it.  This package's saved set
@@ -79,11 +79,11 @@ for the previous one passes its `bool` in that slot and raises `TypeError`.
   (`use_gate_in_kernel=True` with `A_log`, `dt_bias` and `lower_bound`,
   FlashInfer #7816) under the deterministic package's contract for that mode
   (its README, "Raw gate mode"): the same operands, stride rule and refusals,
-  the 7-tuple `(dq, dk, dv, dbeta, dg, dA_log, ddt_bias)` of `chunk_kda_bwd`,
-  gradients to `g`, `A_log` and `dt_bias` from `chunk_kda`, and one
+  the 7-tuple `(dq, dk, dv, dbeta, dg, dA_log, ddt_bias)` of `cake_kda_nondet_train_backward`,
+  gradients to `g`, `A_log` and `dt_bias` from `cake_kda_nondet`, and one
   `param_finalize` launch per backward.  The mode is part of the plan
   (`cake_backend.plan(..., gate="raw")`), of the workspace
-  (`KdaWorkspace.for_problem` / `for_budget` and `workspace_bytes` with
+  (`CakeKDANondetWorkspace.for_problem` / `for_budget` and `workspace_bytes` with
   `gate="raw"`; a call in the other mode is refused with `ValueError`, in both
   directions) and of the saved set.  The facade forwards the keywords to the
   package of the call's mode.
@@ -191,7 +191,7 @@ deterministic `param_finalize`.
 
 ## Checkpoint hand-off
 
-`chunk_kda(..., checkpoint_handoff="auto")` applies under
+`cake_kda_nondet(..., checkpoint_handoff="auto")` applies under
 `torch.utils.checkpoint` (reentrant or not).  The forward that torch re-runs
 inside the backward also writes the `h` / `v_new` tapes and keeps the
 forward's `w` and the segment transfers in a per-device record.  The node's
@@ -229,7 +229,7 @@ saved set do not change.
   A new device, toolkit or registry needs the suite on that device before it
   enters `HANDOFF_VERIFIED`.
 - The environment variable `CAKE_KDA_CKPT_HANDOFF` (`off` / `on`) is read by
-  `chunk_kda` at each call, not by `ChunkKDAFunction.apply`.  `off` turns
+  `cake_kda_nondet` at each call, not by `CakeKDANondetFunction.apply`.  `off` turns
   every call off; `on` turns `"auto"` into `"on"`.  An explicit `"off"` stays
   off.
 - Row records: the registry maps each forward intra record to a twin
@@ -304,16 +304,16 @@ No rule selects the twin.
 
 | deterministic package (unchanged) | this package |
 | --- | --- |
-| `flashinfer.cake_kda_det_train` (facade) | `flashinfer.cake_kda_train` (facade, `deterministic=...`) |
-| `flashinfer.experimental.cake.cake_kda_det_train` | `flashinfer.experimental.cake.cake_kda_train` |
-| `cake_kda_det_train_forward`, `cake_kda_det_train_backward`, `cake_kda_det` | `chunk_kda_fwd`, `chunk_kda_bwd`, `chunk_kda` |
-| `cake_kda_det_train_arena`, `cake_kda_det_train_workspace(_bytes)`, `cake_kda_det_train_saved_bytes`, `is_cake_kda_det_train_supported` | `kda_train_arena`, `kda_train_workspace(_bytes)`, `kda_train_saved_bytes`, `is_kda_train_supported` |
-| `CakeKDADetFunction`, `CakeKDADetChunkSaved`, `CakeKDADetWorkspace`, `CakeKDADetArena` | `ChunkKDAFunction`, `KdaChunkSaved`, `KdaWorkspace`, `KdaArena` |
+| `flashinfer.cake_kda_det_train` (facade) | `flashinfer.cake_kda_nondet_train` (facade, `deterministic=...`) |
+| `flashinfer.experimental.cake.cake_kda_det_train` | `flashinfer.experimental.cake.cake_kda_nondet_train` |
+| `cake_kda_det_train_forward`, `cake_kda_det_train_backward`, `cake_kda_det` | `cake_kda_nondet_train_forward`, `cake_kda_nondet_train_backward`, `cake_kda_nondet` |
+| `cake_kda_det_train_arena`, `cake_kda_det_train_workspace(_bytes)`, `cake_kda_det_train_saved_bytes`, `is_cake_kda_det_train_supported` | `cake_kda_nondet_train_arena`, `cake_kda_nondet_train_workspace(_bytes)`, `cake_kda_nondet_train_saved_bytes`, `is_cake_kda_nondet_train_supported` |
+| `CakeKDADetFunction`, `CakeKDADetChunkSaved`, `CakeKDADetWorkspace`, `CakeKDADetArena` | `CakeKDANondetFunction`, `CakeKDANondetChunkSaved`, `CakeKDANondetWorkspace`, `CakeKDANondetArena` |
 | libraries `cake_kda_det_train_<digest>` | `cake_kda_train_<digest>` |
 
 The previous names keep their deterministic meaning: `flashinfer.kda_train`
-(`chunk_kda`, `chunk_kda_fwd`, `chunk_kda_bwd`, `kda_train_*`,
-`is_kda_train_supported`) and the compatibility package
+(`cake_kda_nondet`, `cake_kda_nondet_train_forward`, `cake_kda_nondet_train_backward`, `kda_train_*`,
+`is_cake_kda_nondet_train_supported`) and the compatibility package
 `flashinfer.experimental.cake_kda_train` bind the deterministic objects and
 take no `deterministic` keyword.  The copies of unchanged programs keep their
 digest under this package's prefix.
@@ -374,14 +374,14 @@ no l2n stage).
 
 Tests:
 
-* `tests/experimental/test_cake_kda_train.py`: the backend suite against the
+* `tests/experimental/test_cake_kda_nondet_train.py`: the backend suite against the
   FP64 reference of `tests/test_helpers/cake_kda_det_train_reference.py`,
   the comparison with the deterministic package, the hand-off twins'
   records and rows, and the tape WY twin's record, rule and tape backward.
-* `tests/experimental/test_cake_kda_train_api.py`: the facade, the mode
+* `tests/experimental/test_cake_kda_nondet_train_api.py`: the facade, the mode
   keyword and the dispatch.
-* `tests/experimental/test_cake_kda_train_handoff.py`: the checkpoint
+* `tests/experimental/test_cake_kda_nondet_train_handoff.py`: the checkpoint
   hand-off with tape and row records, with and without the tape WY twin.
 
-Benchmark: `benchmarks/bench_cake_kda_train.py`.  The context-parallel path
+Benchmark: `benchmarks/bench_cake_kda_nondet_train.py`.  The context-parallel path
 is not part of this package.

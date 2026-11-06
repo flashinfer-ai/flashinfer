@@ -15,7 +15,7 @@ limitations under the License.
 
 Benchmark of the Cake packed KDA chunked training kernels with a selectable
 numerical mode: the non-deterministic package
-(``flashinfer.experimental.cake.cake_kda_train``, ``deterministic=False``)
+(``flashinfer.experimental.cake.cake_kda_nondet_train``, ``deterministic=False``)
 against the deterministic package
 (``flashinfer.experimental.cake.cake_kda_det_train``) and flash-linear-attention's
 ``chunk_kda`` (when it is installed), on the same inputs, on the boundaries of
@@ -130,12 +130,12 @@ call beside it ended).  Information, not a gate.
 
 Example::
 
-    python benchmarks/bench_cake_kda_train.py --seqlen 16384 65536 --docs 3 --heads 4 64
-    python benchmarks/bench_cake_kda_train.py --seqlen 261393 --docs 4 --heads 4 --rounds 5 --json out.json
-    python benchmarks/bench_cake_kda_train.py --seqlen 65536 --docs 3 --heads 16 --side-stream
-    python benchmarks/bench_cake_kda_train.py --seqlen 16384 65536 --docs 3 --heads 4 64 --gate g raw
-    python benchmarks/bench_cake_kda_train.py --seqlen 16384 --docs 1 3 --heads 4 64 --gate raw --build-order both
-    python benchmarks/bench_cake_kda_train.py --seqlen 65536 --docs 3 --heads 4 64 --gate g raw --l2n --build-order both
+    python benchmarks/bench_cake_kda_nondet_train.py --seqlen 16384 65536 --docs 3 --heads 4 64
+    python benchmarks/bench_cake_kda_nondet_train.py --seqlen 261393 --docs 4 --heads 4 --rounds 5 --json out.json
+    python benchmarks/bench_cake_kda_nondet_train.py --seqlen 65536 --docs 3 --heads 16 --side-stream
+    python benchmarks/bench_cake_kda_nondet_train.py --seqlen 16384 65536 --docs 3 --heads 4 64 --gate g raw
+    python benchmarks/bench_cake_kda_nondet_train.py --seqlen 16384 --docs 1 3 --heads 4 64 --gate raw --build-order both
+    python benchmarks/bench_cake_kda_nondet_train.py --seqlen 65536 --docs 3 --heads 4 64 --gate g raw --l2n --build-order both
 """
 
 from __future__ import annotations
@@ -155,10 +155,10 @@ from torch.utils.checkpoint import checkpoint
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from flashinfer.experimental.cake.cake_kda_train import (  # noqa: E402
+from flashinfer.experimental.cake.cake_kda_nondet_train import (  # noqa: E402
     cake_backend as nd_backend,
 )
-from flashinfer.experimental.cake.cake_kda_train import cake_jit  # noqa: E402
+from flashinfer.experimental.cake.cake_kda_nondet_train import cake_jit  # noqa: E402
 from flashinfer.experimental.cake.cake_kda_det_train import (  # noqa: E402
     cake_backend as det_backend,
 )
@@ -344,7 +344,7 @@ def cake_workspace(
             seqlen, docs, heads, device, **mode
         )
     else:
-        ws = nd_backend.KdaWorkspace.for_problem(
+        ws = nd_backend.CakeKDANondetWorkspace.for_problem(
             seqlen, docs, heads, device, deterministic=False, **mode
         )
     ws.load()
@@ -366,9 +366,9 @@ def cake_boundaries(
         autograd_fn = det_backend.cake_kda_det
         mode = {}
     else:
-        fwd_fn = nd_backend.chunk_kda_fwd
-        bwd_fn = nd_backend.chunk_kda_bwd
-        autograd_fn = nd_backend.chunk_kda
+        fwd_fn = nd_backend.cake_kda_nondet_train_forward
+        bwd_fn = nd_backend.cake_kda_nondet_train_backward
+        autograd_fn = nd_backend.cake_kda_nondet
         mode = {"deterministic": False}
     raw = _raw_kw(inputs)
     l2n = _l2n_kw(inputs)
@@ -519,10 +519,10 @@ def _results(inputs: dict, ws, *, deterministic: bool, replay: bool) -> dict:
             **l2n,
         )
     else:
-        out, saved = nd_backend.chunk_kda_fwd(
+        out, saved = nd_backend.cake_kda_nondet_train_forward(
             q, k, v, g, beta, cu, workspace=ws, deterministic=False, **raw, **l2n
         )
-        grads = nd_backend.chunk_kda_bwd(
+        grads = nd_backend.cake_kda_nondet_train_backward(
             q,
             k,
             v,

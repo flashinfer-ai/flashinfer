@@ -19,10 +19,10 @@ limitations under the License.
 # 128, chunk 64, per-document zero initial state) on SM100 / SM103 / SM107, the
 # ``deterministic=False`` counterpart of
 # ``flashinfer.experimental.cake.cake_kda_det_train``.  The public entry points are
-# ``flashinfer.cake_kda_train.chunk_kda_fwd``, ``chunk_kda_bwd`` and
-# ``chunk_kda`` with ``deterministic=False``; the host plan, workspace, launch
+# ``flashinfer.cake_kda_nondet_train.cake_kda_nondet_train_forward``, ``cake_kda_nondet_train_backward`` and
+# ``cake_kda_nondet`` with ``deterministic=False``; the host plan, workspace, launch
 # sequences, autograd Function, registry and generated sources live here.
-# ``chunk_kda_fwd``, ``chunk_kda_bwd`` and ``chunk_kda`` of this package take
+# ``cake_kda_nondet_train_forward``, ``cake_kda_nondet_train_backward`` and ``cake_kda_nondet`` of this package take
 # ``deterministic: bool = True`` and raise ``ValueError`` unless it is
 # ``False``.  The package imports nothing from the deterministic package.
 
@@ -32,13 +32,13 @@ from .cake_backend import (
     SAVED_VERSION_TAPE,
     SCALE,
     SEG_SAVE_MIN_TOKENS_PER_SEG,
-    ChunkKDAFunction,
-    KdaChunkSaved,
-    KdaWorkspace,
+    CakeKDANondetFunction,
+    CakeKDANondetChunkSaved,
+    CakeKDANondetWorkspace,
     Plan,
-    chunk_kda,
-    chunk_kda_bwd,
-    chunk_kda_fwd,
+    cake_kda_nondet,
+    cake_kda_nondet_train_backward,
+    cake_kda_nondet_train_forward,
     is_supported,
     memory_report,
     output_bytes,
@@ -58,13 +58,13 @@ __all__ = [
     "SAVED_VERSION_TAPE",
     "SCALE",
     "SEG_SAVE_MIN_TOKENS_PER_SEG",
-    "ChunkKDAFunction",
-    "KdaChunkSaved",
-    "KdaWorkspace",
+    "CakeKDANondetFunction",
+    "CakeKDANondetChunkSaved",
+    "CakeKDANondetWorkspace",
     "Plan",
-    "chunk_kda",
-    "chunk_kda_bwd",
-    "chunk_kda_fwd",
+    "cake_kda_nondet",
+    "cake_kda_nondet_train_backward",
+    "cake_kda_nondet_train_forward",
     "is_supported",
     "memory_report",
     "output_bytes",

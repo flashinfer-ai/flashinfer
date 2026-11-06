@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 The KCP registry (``cake_kcp_jit``) and manifests of the non-deterministic Cake packed KDA training package
-``flashinfer.experimental.cake_kda_train_kcp``: the records against the frozen kernel ABIs, the program names against
+``flashinfer.experimental.cake.cake_kda_nondet_train_kcp``: the records against the frozen kernel ABIs, the program names against
 the identity rule (under this package's ``cake_kda_train_`` prefix), ``build.json`` (the shipped programs, never a
 test-only one) and ``build.test.json`` (the test-only programs, loadable only after ``cake_kcp_plan.enable_test_knobs()``),
 and the carried programs: every record and unit is the deterministic package's under this package's names (the KCP
@@ -32,11 +32,11 @@ import pytest
 
 from tests.test_helpers.cake_package import cake_package
 
-cake_build = cake_package("cake_kda_train_kcp", "cake_build")
-det_kcp_jit = cake_package("cake_kda_det_train_kcp", "cake_kcp_jit")
-cake_jit = cake_package("cake.cake_kda_train", "cake_jit")
-kcp_jit = cake_package("cake_kda_train_kcp", "cake_kcp_jit")
-kcp_plan = cake_package("cake_kda_train_kcp", "cake_kcp_plan")
+cake_build = cake_package("cake.cake_kda_nondet_train_kcp", "cake_build")
+det_kcp_jit = cake_package("cake.cake_kda_det_train_kcp", "cake_kcp_jit")
+cake_jit = cake_package("cake.cake_kda_nondet_train", "cake_jit")
+kcp_jit = cake_package("cake.cake_kda_nondet_train_kcp", "cake_kcp_jit")
+kcp_plan = cake_package("cake.cake_kda_nondet_train_kcp", "cake_kcp_plan")
 
 PACKAGE_DIR = Path(cake_build.__file__).parent
 ARCHES = ("sm_100a", "sm_103a", "sm_107a")
@@ -713,7 +713,7 @@ def test_test_manifest_is_the_test_only_programs_under_the_opt_in(
     assert (
         document["package"]
         == shipped["package"]
-        == "flashinfer.experimental.cake_kda_train_kcp"
+        == "flashinfer.experimental.cake.cake_kda_nondet_train_kcp"
     )
     # the shipped manifest is re-rendered by every kernel update of the package, the test-only manifest only when its
     # programs change: the two generator records share their form, not their stamp
@@ -818,7 +818,7 @@ def test_the_units_are_the_deterministic_units_under_this_packages_names(
         ):
             text = (PACKAGE_DIR / source).read_text()
             det_text = (det_dir / det_source).read_text()
-            assert text == det_text.replace("cake_kda_det_train", "cake_kda_train"), (
+            assert text == det_text.replace("cake_kda_det_train", "cake_kda_nondet_train"), (
                 name,
                 source,
             )

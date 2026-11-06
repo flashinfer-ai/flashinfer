@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Checkpoint hand-off suite of the Cake non-deterministic packed KDA chunked training package
-(``flashinfer.experimental.cake.cake_kda_train``: ``chunk_kda(..., checkpoint_handoff="auto" | "on" | "off")``,
+(``flashinfer.experimental.cake.cake_kda_nondet_train``: ``cake_kda_nondet(..., checkpoint_handoff="auto" | "on" | "off")``,
 every call with ``deterministic=False``).  On a GPU: the gradients under both checkpoint modes are bitwise those of
 ``"off"`` on every plan family of the device the packs below reach, with both kinds of record (a tape record: the
 tapes; a row record: the recompute launches the intra twin, ``cake_jit.HANDOFF_TWINS``, and the record also keeps the
@@ -44,11 +44,11 @@ from torch.utils.checkpoint import checkpoint
 from tests.test_helpers.cake_kda_det_train_reference import make_inputs
 from tests.test_helpers.cake_package import cake_package
 
-cake_backend = cake_package("cake.cake_kda_train", "cake_backend")
-cake_build = cake_package("cake.cake_kda_train", "cake_build")
-cake_jit = cake_package("cake.cake_kda_train", "cake_jit")
+cake_backend = cake_package("cake.cake_kda_nondet_train", "cake_backend")
+cake_build = cake_package("cake.cake_kda_nondet_train", "cake_build")
+cake_jit = cake_package("cake.cake_kda_nondet_train", "cake_jit")
 PACKAGE_DIR = Path(cake_jit.__file__).resolve().parent
-KdaWorkspace = cake_backend.KdaWorkspace
+CakeKDANondetWorkspace = cake_backend.CakeKDANondetWorkspace
 D, SCALE = cake_backend.D, cake_backend.SCALE
 ARCHES = tuple(cake_jit.ARCHES)
 ENV = cake_backend.HANDOFF_ENV
@@ -209,17 +209,17 @@ def tape_wy(request, monkeypatch) -> bool:
 
 
 def _tape_wy_runs(monkeypatch) -> list:
-    """Record the ``record`` override of every ``wy`` launch on the tape path through ``KdaWorkspace.run`` (``None``:
+    """Record the ``record`` override of every ``wy`` launch on the tape path through ``CakeKDANondetWorkspace.run`` (``None``:
     the plan's WY record)."""
     runs: list = []
-    real_run = KdaWorkspace.run
+    real_run = CakeKDANondetWorkspace.run
 
     def run(self, stage, values, *, path, **kwargs):
         if stage == "wy" and path == "tape":
             runs.append(kwargs.get("record"))
         return real_run(self, stage, values, path=path, **kwargs)
 
-    monkeypatch.setattr(KdaWorkspace, "run", run)
+    monkeypatch.setattr(CakeKDANondetWorkspace, "run", run)
     return runs
 
 
@@ -232,9 +232,9 @@ def _fresh_registry(monkeypatch):
     cake_backend._handoff_reset()
 
 
-def chunk_kda(*args, **kwargs):
+def cake_kda_nondet(*args, **kwargs):
     """The package's autograd entry with the mode it requires."""
-    return cake_backend.chunk_kda(*args, deterministic=False, **kwargs)
+    return cake_backend.cake_kda_nondet(*args, deterministic=False, **kwargs)
 
 
 def _bits_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
@@ -317,7 +317,7 @@ def _grads(leaves) -> dict:
 
 
 def _checkpointed_step(inputs: dict, *, reentrant: bool, handoff, workspace=None):
-    """One forward of ``chunk_kda`` under ``torch.utils.checkpoint`` and its backward on fresh leaves: ``out``
+    """One forward of ``cake_kda_nondet`` under ``torch.utils.checkpoint`` and its backward on fresh leaves: ``out``
     (detached) and the leaves' gradients by name.  ``handoff=None`` passes no ``checkpoint_handoff`` (the
     default)."""
     leaves = _leaves(inputs)
@@ -325,7 +325,7 @@ def _checkpointed_step(inputs: dict, *, reentrant: bool, handoff, workspace=None
     kw = {} if handoff is None else {"checkpoint_handoff": handoff}
 
     def layer(q, k, v, g, beta):
-        return chunk_kda(q, k, v, g, beta, cu, workspace=workspace, **kw)
+        return cake_kda_nondet(q, k, v, g, beta, cu, workspace=workspace, **kw)
 
     out = checkpoint(layer, *leaves, use_reentrant=reentrant)
     out.backward(inputs["dout"])
@@ -650,7 +650,7 @@ def test_the_kept_forward_w_is_the_tape_wy_w(
 
     # the tape set from a per-call forward; its backward on a tape-mode workspace whose launcher captures wy's w
     _, tape = cake_backend._fwd_call(*ops, save_mode="tape", workspace=None, **common)
-    ws = KdaWorkspace(
+    ws = CakeKDANondetWorkspace(
         p,
         device,
         backward=True,
@@ -760,7 +760,7 @@ def test_the_handoff_backward_launches_the_tape_path_with_the_light_prep(
             intra_grids.append((name, tuple(grid)))
         cake_jit.run_module(name, values, grid=grid, device_index=device_index)
 
-    ws = KdaWorkspace(p, device, backward=True, launcher=recording, deterministic=False)
+    ws = CakeKDANondetWorkspace(p, device, backward=True, launcher=recording, deterministic=False)
     cu = inputs["cu_seqlens"]
     fwd = _expected_fwd(p)
     recompute = _expected_fwd(p, intra=p.handoff_twin if with_rows else None)
@@ -784,7 +784,7 @@ def test_the_handoff_backward_launches_the_tape_path_with_the_light_prep(
         leaves = _leaves(inputs)
         launched.clear()
         out = checkpoint(
-            lambda *a, m=mode: chunk_kda(*a, cu, workspace=ws, checkpoint_handoff=m),
+            lambda *a, m=mode: cake_kda_nondet(*a, cu, workspace=ws, checkpoint_handoff=m),
             *leaves,
             use_reentrant=False,
         )
@@ -857,7 +857,7 @@ def test_a_stale_record_falls_back_and_stays_correct(
                     g_leaf.mul_(0.5)
 
         def layer(q, k, v, g, beta):
-            o = chunk_kda(q, k, v, g, beta, cu, checkpoint_handoff=mode)
+            o = cake_kda_nondet(q, k, v, g, beta, cu, checkpoint_handoff=mode)
             return _AfterRecompute.apply(o, action if change else None)
 
         out = checkpoint(layer, *leaves, use_reentrant=False)
@@ -899,7 +899,7 @@ def test_inputs_changed_in_place_before_the_checkpointed_call_still_hand_off(
             leaves[0].mul_(1)
         assert cu._version > 0 and leaves[0]._version > 0
         out = checkpoint(
-            lambda *a: chunk_kda(*a, cu, checkpoint_handoff=mode),
+            lambda *a: cake_kda_nondet(*a, cu, checkpoint_handoff=mode),
             *leaves,
             use_reentrant=reentrant,
         )
@@ -962,7 +962,7 @@ def test_a_record_the_backward_refuses_is_released_and_stays_correct(
     assert rec.h is None and rec.v_new is None and rec.w is None and rec.aqk is None
     assert rec.seg_m is None and rec.aliases == ()
     assert rec.gk is None and rec.kg is None and rec.beta_int is None and rec.kb is None
-    assert backward_arenas == [(None, "KdaWorkspace", p.arena_bytes())], backward_arenas
+    assert backward_arenas == [(None, "CakeKDANondetWorkspace", p.arena_bytes())], backward_arenas
     _check_grads(on, off, "refused in _backward")
 
 
@@ -985,7 +985,7 @@ def test_records_of_a_failed_backward_are_dropped_by_the_next_forward(
         raise _HandoffTestFailure("the backward fails after the recompute")
 
     def layer(q, k, v, g, beta):
-        o = chunk_kda(q, k, v, g, beta, cu, checkpoint_handoff="on")
+        o = cake_kda_nondet(q, k, v, g, beta, cu, checkpoint_handoff="on")
         return _AfterRecompute.apply(o, fail)
 
     leaves = _leaves(inputs)
@@ -998,7 +998,7 @@ def test_records_of_a_failed_backward_are_dropped_by_the_next_forward(
     assert s["published"] == 1 and s["hits"] == 0, s
     assert s["live_records"] in (0, 1), s  # 1 when torch skipped the final callbacks
     with torch.no_grad():
-        chunk_kda(*_leaves(inputs), cu, checkpoint_handoff="on")
+        cake_kda_nondet(*_leaves(inputs), cu, checkpoint_handoff="on")
     s = _stats(device)
     assert s["live_records"] == 0 and s["live_bytes"] == 0 and s["misses"] == 1, s
     _checkpointed_step(inputs, reentrant=reentrant, handoff="on")
@@ -1026,7 +1026,7 @@ def test_an_untaken_record_is_dropped_and_repeated_misses_turn_the_handoff_off(
         def region(q, k, v, g, beta, x_):
             # the KDA output leaves the graph (a reentrant region would otherwise run its node with a zero
             # gradient): the recompute publishes, no backward takes the record
-            o = chunk_kda(q, k, v, g, beta, cu, checkpoint_handoff="on")
+            o = cake_kda_nondet(q, k, v, g, beta, cu, checkpoint_handoff="on")
             return o.detach(), x_ * x_
 
         _o, y = checkpoint(region, *leaves, x, use_reentrant=reentrant)
@@ -1077,7 +1077,7 @@ def test_nested_checkpoint_regions_publish_only_the_recompute(
         leaves = [_leaves(s) for s in sets]
 
         def kda(v_in, q, k, g, beta):
-            return chunk_kda(q, k, v_in, g, beta, cu, checkpoint_handoff=mode)
+            return cake_kda_nondet(q, k, v_in, g, beta, cu, checkpoint_handoff=mode)
 
         def block(v_in, q, k, g, beta):
             o = checkpoint(kda, v_in, q, k, g, beta, use_reentrant=False)
@@ -1129,7 +1129,7 @@ def test_a_second_backward_with_retain_graph_hands_off_again(device, manifest) -
         cake_backend._handoff_reset()
         leaves = _leaves(inputs)
         out = checkpoint(
-            lambda *a: chunk_kda(*a, cu, checkpoint_handoff=mode),
+            lambda *a: cake_kda_nondet(*a, cu, checkpoint_handoff=mode),
             *leaves,
             use_reentrant=False,
         )
@@ -1161,7 +1161,7 @@ def _layer_step(first, second, *, ws, handoff, reentrant, regions, layers=2):
     leaves = [_leaves(s) for s in sets]
 
     def layer(v_in, q, k, g, beta):
-        return chunk_kda(
+        return cake_kda_nondet(
             q, k, v_in, g, beta, cu, workspace=ws, checkpoint_handoff=handoff
         )
 
@@ -1208,7 +1208,7 @@ def test_two_checkpointed_layers_share_one_workspace(
     lengths, heads = shape
     with_rows = int(_with_rows(_plan(lengths, heads, device), record_kind))
     first, second = _two_layer_inputs(lengths, heads, device)
-    ws = KdaWorkspace.for_problem(
+    ws = CakeKDANondetWorkspace.for_problem(
         sum(lengths), len(lengths), heads, device, deterministic=False
     )
     for regions in ("each", "one"):
@@ -1244,7 +1244,7 @@ def test_the_byte_budget_admits_two_records_of_the_shape(
     lengths, heads = (100, 640, 77, 1000, 129), 2
     with_rows = int(_with_rows(_plan(lengths, heads, device), record_kind))
     first, second = _two_layer_inputs(lengths, heads, device)
-    ws = KdaWorkspace.for_problem(
+    ws = CakeKDANondetWorkspace.for_problem(
         sum(lengths), len(lengths), heads, device, deterministic=False
     )
     for reentrant in (False, True):
@@ -1446,9 +1446,9 @@ def test_a_row_record_falls_back_to_a_tape_record_where_the_rule_refuses_it(
         monkeypatch.setattr(cake_jit, "load", load)
     workspace = None
     if case == "caller_workspace":
-        workspace = KdaWorkspace(p, device, backward=True, deterministic=False)
+        workspace = CakeKDANondetWorkspace(p, device, backward=True, deterministic=False)
     runs: list[tuple[str, str | None]] = []
-    real_run = KdaWorkspace.run
+    real_run = CakeKDANondetWorkspace.run
 
     def run(self, stage, values, *, path, **kwargs):
         runs.append((stage, kwargs.get("record")))
@@ -1457,11 +1457,11 @@ def test_a_row_record_falls_back_to_a_tape_record_where_the_rule_refuses_it(
     inputs = make_inputs(lengths, heads, device)
     _, off = _checkpointed_step(inputs, reentrant=False, handoff="off")
     cake_backend._handoff_reset()
-    monkeypatch.setattr(KdaWorkspace, "run", run)
+    monkeypatch.setattr(CakeKDANondetWorkspace, "run", run)
     _, on = _checkpointed_step(
         inputs, reentrant=False, handoff="on", workspace=workspace
     )
-    monkeypatch.setattr(KdaWorkspace, "run", real_run)
+    monkeypatch.setattr(CakeKDANondetWorkspace, "run", real_run)
     s = _stats(device)
     with_rows = case == "verified"
     assert s["published"] == s["hits"] == 1 and s["live_records"] == 0, (case, s)
@@ -1477,7 +1477,7 @@ def test_a_row_record_falls_back_to_a_tape_record_where_the_rule_refuses_it(
 
 
 def test_the_environment_override_end_to_end(device, manifest, monkeypatch) -> None:
-    """Through ``chunk_kda``, with ``"auto"`` engaging nowhere (an empty verified set): ``CAKE_KDA_CKPT_HANDOFF=off``
+    """Through ``cake_kda_nondet``, with ``"auto"`` engaging nowhere (an empty verified set): ``CAKE_KDA_CKPT_HANDOFF=off``
     turns ``"on"`` off and ``=on`` turns ``"auto"`` into ``"on"``; the gradients agree bitwise.  The host tests
     cover the other combinations."""
     monkeypatch.setattr(cake_backend, "HANDOFF_VERIFIED", frozenset())
@@ -1501,7 +1501,7 @@ def test_plain_and_original_forwards_publish_nothing(device, manifest) -> None:
     inputs = make_inputs(lengths, heads, device)
     cu = inputs["cu_seqlens"]
     leaves = _leaves(inputs)
-    out = chunk_kda(*leaves, cu, checkpoint_handoff="on")
+    out = cake_kda_nondet(*leaves, cu, checkpoint_handoff="on")
     assert _stats(device)["published"] == 0
     out.backward(inputs["dout"])
     s = _stats(device)
@@ -1509,9 +1509,9 @@ def test_plain_and_original_forwards_publish_nothing(device, manifest) -> None:
     assert s["live_records"] == 0
     plain = _grads(leaves)
     with torch.no_grad():
-        chunk_kda(*_leaves(inputs), cu, checkpoint_handoff="on")
+        cake_kda_nondet(*_leaves(inputs), cu, checkpoint_handoff="on")
     assert _stats(device)["published"] == 0
-    cake_backend.chunk_kda_fwd(
+    cake_backend.cake_kda_nondet_train_forward(
         *(inputs[n] for n in (*LEAVES, "cu_seqlens")), deterministic=False
     )
     assert _stats(device)["published"] == 0
@@ -1521,7 +1521,7 @@ def test_plain_and_original_forwards_publish_nothing(device, manifest) -> None:
     torch.cuda.synchronize(device)
     before = torch.cuda.memory_allocated(device)
     out = checkpoint(
-        lambda *a: chunk_kda(*a, cu, checkpoint_handoff="on"),
+        lambda *a: cake_kda_nondet(*a, cu, checkpoint_handoff="on"),
         *leaves,
         use_reentrant=False,
     )
@@ -1755,7 +1755,7 @@ def test_handoff_mode_reads_the_environment_at_each_call(monkeypatch) -> None:
 
 
 def test_chunk_kda_passes_the_mode_to_the_node(monkeypatch) -> None:
-    """Host only: ``chunk_kda`` hands ``ChunkKDAFunction`` the mode after the environment override, and ``"off"``
+    """Host only: ``cake_kda_nondet`` hands ``CakeKDANondetFunction`` the mode after the environment override, and ``"off"``
     under ``no_grad`` (no node is recorded: no backward would take a record) whatever the variable says."""
     seen: list = []
 
@@ -1764,27 +1764,27 @@ def test_chunk_kda_passes_the_mode_to_the_node(monkeypatch) -> None:
         def apply(*args):
             seen.append(args[11])
 
-    monkeypatch.setattr(cake_backend, "ChunkKDAFunction", Spy)
+    monkeypatch.setattr(cake_backend, "CakeKDANondetFunction", Spy)
     ops = [torch.zeros(1) for _ in range(6)]
     monkeypatch.setenv(ENV, "on")
-    cake_backend.chunk_kda(*ops, deterministic=False)
+    cake_backend.cake_kda_nondet(*ops, deterministic=False)
     with torch.no_grad():
-        cake_backend.chunk_kda(*ops, checkpoint_handoff="on", deterministic=False)
+        cake_backend.cake_kda_nondet(*ops, checkpoint_handoff="on", deterministic=False)
     assert seen == ["on", "off"], seen
 
 
 def test_the_apply_slot_refusals() -> None:
-    """Host only: ``ChunkKDAFunction.apply`` written for the signature without ``checkpoint_handoff`` (its trailing
+    """Host only: ``CakeKDANondetFunction.apply`` written for the signature without ``checkpoint_handoff`` (its trailing
     ``bool`` lands in the slot) fails with a ``TypeError`` naming the slot, and an unknown mode with a
     ``ValueError``, before any operand check or launch."""
     ops = [torch.zeros(1) for _ in range(6)]
     for flag in (False, True):
         with pytest.raises(TypeError, match="checkpoint_handoff"):
-            cake_backend.ChunkKDAFunction.apply(
+            cake_backend.CakeKDANondetFunction.apply(
                 *ops, SCALE, None, None, None, None, flag
             )
     with pytest.raises(ValueError, match="checkpoint_handoff"):
-        cake_backend.ChunkKDAFunction.apply(
+        cake_backend.CakeKDANondetFunction.apply(
             *ops, SCALE, None, None, None, None, "force", False
         )
 
@@ -1831,7 +1831,7 @@ def test_the_recompute_is_told_apart_by_its_saved_tensor_hooks() -> None:
 
 class _ProbeFunction(torch.autograd.Function):
     """Identity whose forward records what ``_handoff_request`` reads there (it runs inside
-    ``ChunkKDAFunction.forward``): the hooks, whether a graph task runs, grad mode and ``needs_input_grad``."""
+    ``CakeKDANondetFunction.forward``): the hooks, whether a graph task runs, grad mode and ``needs_input_grad``."""
 
     @staticmethod
     def forward(ctx, x, seen):
@@ -1853,7 +1853,7 @@ class _ProbeFunction(torch.autograd.Function):
 
 def test_a_function_forward_sees_the_recompute_hooks_without_grad_mode() -> None:
     """Host only (CPU tensors): torch runs an autograd Function's forward with grad mode off, also in the checkpoint
-    recompute (so ``_handoff_request`` cannot use ``torch.is_grad_enabled()``; ``chunk_kda`` passes ``"off"`` when
+    recompute (so ``_handoff_request`` cannot use ``torch.is_grad_enabled()``; ``cake_kda_nondet`` passes ``"off"`` when
     grad mode is off at its call), while the saved-tensor hooks, the graph task and ``needs_input_grad`` there tell
     the recompute apart."""
     seen: list = []

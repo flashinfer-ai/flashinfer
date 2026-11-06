@@ -16,7 +16,7 @@ limitations under the License.
 Registry and loader glue of the Cake packed KDA chunked training kernels on
 the context-parallel (KCP) route (SM100 / SM103 / SM107): the state walks,
 the transfer walk and the affine merge that :mod:`.cake_kcp` composes with the
-chunk stages of :mod:`..cake.cake_kda_train.cake_jit`, whose records this
+chunk stages of :mod:`..cake.cake_kda_nondet_train.cake_jit`, whose records this
 module never edits.
 
 This is the registry of the non-deterministic KCP package
@@ -139,7 +139,7 @@ from typing import Any
 
 import tvm_ffi
 
-from ..cake.cake_kda_train import cake_jit
+from ..cake.cake_kda_nondet_train import cake_jit
 from . import cake_build, cake_kcp_plan
 
 # One verified build per architecture: B200 (``sm_100a``), B300 / GB300
@@ -2234,7 +2234,7 @@ def test_specs_for_arch(arch: str) -> list[Any]:
 # The composition's launches (``cake_kcp.KernelBackend.run`` -> :func:`run_program`)
 
 # Per walk program: the compact pool its initial state / final adjoint comes from (``None``: none) and the pool it
-# writes, by the argument names of ``cake_kcp.CallKcp.walk`` (= the records' logical names).
+# writes, by the argument names of ``cake_kcp.CakeKDANondetKcpCall.walk`` (= the records' logical names).
 _WALK_POOLS: dict[str, tuple[str | None, str | None]] = {
     "kcp_fwdh_offset": ("h0", "out"),
     "kcp_fwdh_tape": ("h0", "out"),
@@ -2244,7 +2244,7 @@ _WALK_POOLS: dict[str, tuple[str | None, str | None]] = {
     "kcp_fwdh_o": ("h0", None),  # writes no pool: its ``out`` is the call's BF16 output
 }
 # Per walk program: the local stage values it reads (the logical names of ``cake_backend``'s value dict, which the
-# composition holds under ``CallKcp.local_values``): the prep stages' operands and the tapes; the fused forward walk
+# composition holds under ``CakeKDANondetKcpCall.local_values``): the prep stages' operands and the tapes; the fused forward walk
 # reads the intra stage's ``qg`` / ``Aqk`` rows and the chunk tables in place of the tapes.
 _WALK_OPERANDS: dict[str, tuple[str, ...]] = {
     "kcp_fwdh_offset": ("w", "kg", "u", "gk", "h", "v_new"),
@@ -2349,7 +2349,7 @@ def _local_values(call: Any) -> Mapping[str, Any]:
     local = getattr(call, "local_values", None)
     if local is None:
         raise RuntimeError(
-            "the KCP kernel backend needs the call's local stage values (CallKcp.local_values: the logical value "
+            "the KCP kernel backend needs the call's local stage values (CakeKDANondetKcpCall.local_values: the logical value "
             "dict of the chunk stages, cake_backend's vocabulary) before the first walk launch"
         )
     return local
@@ -2476,7 +2476,7 @@ def _walk(name: str, args: Mapping[str, Any], call: Any, device_index: int) -> N
 
 
 def _call_knob(call: Any, knob: str, default: Any) -> Any:
-    """A test knob of the call: ``CallKcp.<knob>``, else ``CallKcp.opts.<knob>``, else ``default``."""
+    """A test knob of the call: ``CakeKDANondetKcpCall.<knob>``, else ``CakeKDANondetKcpCall.opts.<knob>``, else ``default``."""
     value = getattr(call, knob, None)
     if value is None:
         value = getattr(getattr(call, "opts", None), knob, None)
@@ -2566,7 +2566,7 @@ def run_program(name: str, args: Mapping[str, Any], *, device_index: int) -> Non
     reads ``h0`` and writes the call's output, no pool), the transfer walk's ``init_mode`` / ``use_u`` /
     ``write_transposed``; for the merge the tile pools ``m`` / ``c`` / ``x0`` /
     ``y`` (``c`` / ``x0`` may be ``None``), the ``chains`` tables and ``transpose_m`` / ``write_states``; and
-    ``_call``, the ``CallKcp`` of the launch, which supplies the head count, the segment table, the operand and
+    ``_call``, the ``CakeKDANondetKcpCall`` of the launch, which supplies the head count, the segment table, the operand and
     tape tensors (``local_values``), ``scale`` and ``precision_mode``.  The record is selected from the launch's
     scalars (:func:`select_record`), the grid is its rule's (:func:`launch_grid`), and the kernel runs on the
     current torch stream of the device.
@@ -2574,7 +2574,7 @@ def run_program(name: str, args: Mapping[str, Any], *, device_index: int) -> Non
     call = args.get("_call")
     if call is None:
         raise ValueError(
-            "run_program needs the CallKcp of the launch under args['_call']"
+            "run_program needs the CakeKDANondetKcpCall of the launch under args['_call']"
         )
     if name == "kcp_affine_merge":
         _merge(args, call, device_index)

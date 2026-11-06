@@ -26,9 +26,9 @@ Arms (``--arms``), every one the same packed batch split by the same partition
 
 * ``det``: the deterministic package, the objects of
   ``flashinfer.cake_kda_det_train_kcp`` (what ``deterministic=True`` of
-  ``flashinfer.cake_kda_train_kcp`` runs), with its own partition and context;
-* ``nd``: ``flashinfer.cake_kda_train_kcp`` with ``deterministic=False`` (the
-  package ``flashinfer.experimental.cake_kda_train_kcp``), with its own
+  ``flashinfer.cake_kda_nondet_train_kcp`` runs), with its own partition and context;
+* ``nd``: ``flashinfer.cake_kda_nondet_train_kcp`` with ``deterministic=False`` (the
+  package ``flashinfer.experimental.cake.cake_kda_nondet_train_kcp``), with its own
   partition and context;
 * ``control``: the ``nd`` path again (the same programs; its ratio to ``nd``
   measures the protocol's own noise and must stay within the control band);
@@ -39,7 +39,7 @@ Arms (``--arms``), every one the same packed batch split by the same partition
   ``nd_off / nd`` is the hand-off's gain on ``ckpt`` (and ~1 on the other
   boundaries, where it never engages);
 * ``local``: the single-rank non-deterministic Cake kernels
-  (``flashinfer.cake_kda_train.chunk_kda`` with ``deterministic=False``, after
+  (``flashinfer.cake_kda_nondet_train.cake_kda_nondet`` with ``deterministic=False``, after
   the single-rank convolution) on the rank's shard as if it were a batch of its
   own (no exchange; the per-rank work without the boundaries);
 * ``fla``: flash-linear-attention's ``chunk_kda`` on the rank's shard (after the
@@ -121,8 +121,8 @@ those of the deterministic KCP benchmark's ``R`` arm) on the same shards.
 ``det``, ``nd``, ``control`` and ``nd_off`` call the KCP entries of their
 package with the raw keywords; ``A_log`` and ``dt_bias`` are leaves of every
 boundary, and every backward ends with the cross-rank sum of their gradients'
-per-rank partial sums (``reduce_gate_param_grads_det_kcp`` /
-``reduce_gate_param_grads_kcp``, the step of the deterministic benchmark's
+per-rank partial sums (``cake_kda_det_train_kcp_reduce_gate_param_grads`` /
+``cake_kda_nondet_train_kcp_reduce_gate_param_grads``, the step of the deterministic benchmark's
 ``R`` arm).  ``local`` runs the single-rank package's raw mode on the shard;
 ``fla`` and ``fla_cp`` run flash-linear-attention's ``chunk_kda`` with
 ``use_gate_in_kernel=True``, ``A_log``, ``dt_bias`` and the lower bound (their
@@ -161,12 +161,12 @@ and read a difference as the packages' only when it holds in both.
 
 Example::
 
-    torchrun --nproc_per_node 4 benchmarks/bench_cake_kda_train_kcp.py \\
+    torchrun --nproc_per_node 4 benchmarks/bench_cake_kda_nondet_train_kcp.py \\
         --seqlen 65536 --docs 3 --heads 16 --channels 4096 --groups 3 --samples 8 \\
         --boundaries fwd bwd step ckpt --json kcp_nd.json
-    torchrun --nproc_per_node 4 benchmarks/bench_cake_kda_train_kcp.py \\
+    torchrun --nproc_per_node 4 benchmarks/bench_cake_kda_nondet_train_kcp.py \\
         --seqlen 65536 --docs 3 --heads 16 --no-conv --gate raw --json kcp_nd_raw.json
-    torchrun --nproc_per_node 4 benchmarks/bench_cake_kda_train_kcp.py \\
+    torchrun --nproc_per_node 4 benchmarks/bench_cake_kda_nondet_train_kcp.py \\
         --seqlen 65536 --docs 3 --heads 16 --no-conv --l2n --build-order nd-first --json kcp_nd_l2n.json
 """
 
@@ -197,30 +197,30 @@ from flashinfer.cake_causal_conv1d_det_train_kcp import (  # noqa: E402
     cake_causal_conv1d_det_kcp,
 )
 from flashinfer.cake_kda_det_train_kcp import (  # noqa: E402
-    build_context_det_kcp,
-    chunk_kda_det_kcp,
-    kda_det_comm_bytes_kcp,
-    kda_det_saved_bytes_kcp,
-    kda_det_workspace_bytes_kcp,
-    partition_det_kcp,
-    reduce_gate_param_grads_det_kcp,
+    cake_kda_det_train_kcp_build_context,
+    cake_kda_det_kcp,
+    cake_kda_det_train_kcp_comm_bytes,
+    cake_kda_det_train_kcp_saved_bytes,
+    cake_kda_det_train_kcp_workspace_bytes,
+    cake_kda_det_train_kcp_partition,
+    cake_kda_det_train_kcp_reduce_gate_param_grads,
 )
-from flashinfer.cake_kda_train import chunk_kda  # noqa: E402
-from flashinfer.cake_kda_train_kcp import (  # noqa: E402
-    build_context_kcp,
-    chunk_kda_kcp,
-    kcp_handoff_stats,
-    kda_comm_bytes_kcp,
-    kda_handoff_bytes_kcp,
-    kda_saved_bytes_kcp,
-    kda_workspace_bytes_kcp,
-    partition_kcp,
-    reduce_gate_param_grads_kcp,
+from flashinfer.cake_kda_nondet_train import cake_kda_nondet  # noqa: E402
+from flashinfer.cake_kda_nondet_train_kcp import (  # noqa: E402
+    cake_kda_nondet_train_kcp_build_context,
+    cake_kda_nondet_kcp,
+    cake_kda_nondet_train_kcp_handoff_stats,
+    cake_kda_nondet_train_kcp_comm_bytes,
+    cake_kda_nondet_train_kcp_handoff_bytes,
+    cake_kda_nondet_train_kcp_saved_bytes,
+    cake_kda_nondet_train_kcp_workspace_bytes,
+    cake_kda_nondet_train_kcp_partition,
+    cake_kda_nondet_train_kcp_reduce_gate_param_grads,
 )
-from flashinfer.experimental.cake_kda_det_train_kcp import (  # noqa: E402
+from flashinfer.experimental.cake.cake_kda_det_train_kcp import (  # noqa: E402
     cake_kcp as det_kcp,
 )
-from flashinfer.experimental.cake_kda_train_kcp import (  # noqa: E402
+from flashinfer.experimental.cake.cake_kda_nondet_train_kcp import (  # noqa: E402
     cake_kcp as nd_kcp,
 )
 from tests.test_helpers.cake_kda_det_train_reference import (  # noqa: E402
@@ -331,15 +331,15 @@ def make_problem(args, rank: int, world: int, device: torch.device) -> dict[str,
     )
     weight = (torch.randn(args.channels, WIDTH, generator=gen) * 0.3).to(device)
     group = dist.group.WORLD
-    part_det = partition_det_kcp(cu_cpu, world, args.layout)
-    part_nd = partition_kcp(cu_cpu, world, args.layout, deterministic=False)
+    part_det = cake_kda_det_train_kcp_partition(cu_cpu, world, args.layout)
+    part_nd = cake_kda_nondet_train_kcp_partition(cu_cpu, world, args.layout, deterministic=False)
     if _fragment_key(part_det) != _fragment_key(part_nd):
         raise RuntimeError(
             "the two packages' partitions of the batch differ; the arms would not time the same shards"
         )
     build = {
-        "det": lambda: build_context_det_kcp(part_det, group, rank, device),
-        "nd": lambda: build_context_kcp(
+        "det": lambda: cake_kda_det_train_kcp_build_context(part_det, group, rank, device),
+        "nd": lambda: cake_kda_nondet_train_kcp_build_context(
             part_nd, group, rank, device, deterministic=False
         ),
     }
@@ -583,14 +583,14 @@ def _forward(arm: str, problem: dict[str, Any], conv: bool, fla_chunk_kda=None):
 
         def fwd(x, w, q, k, v, g, beta, *params):
             y = cake_causal_conv1d_det_kcp(x, w, ctx) if conv else None
-            return y, chunk_kda_det_kcp(
+            return y, cake_kda_det_kcp(
                 q, k, v, g, beta, ctx, **_raw_kw(problem, params), **l2n
             )
 
         return _with_reduce(
             fwd,
             problem,
-            lambda da, db: reduce_gate_param_grads_det_kcp(ctx, da, db),
+            lambda da, db: cake_kda_det_train_kcp_reduce_gate_param_grads(ctx, da, db),
         )
 
     elif arm in ("nd", "control", "nd_off"):
@@ -599,7 +599,7 @@ def _forward(arm: str, problem: dict[str, Any], conv: bool, fla_chunk_kda=None):
 
         def fwd(x, w, q, k, v, g, beta, *params):
             y = cake_causal_conv1d_det_kcp(x, w, ctx) if conv else None
-            return y, chunk_kda_kcp(
+            return y, cake_kda_nondet_kcp(
                 q,
                 k,
                 v,
@@ -615,7 +615,7 @@ def _forward(arm: str, problem: dict[str, Any], conv: bool, fla_chunk_kda=None):
         return _with_reduce(
             fwd,
             problem,
-            lambda da, db: reduce_gate_param_grads_kcp(
+            lambda da, db: cake_kda_nondet_train_kcp_reduce_gate_param_grads(
                 ctx, da, db, deterministic=False
             ),
         )
@@ -624,7 +624,7 @@ def _forward(arm: str, problem: dict[str, Any], conv: bool, fla_chunk_kda=None):
 
         def fwd(x, w, q, k, v, g, beta, *params):
             y = cake_causal_conv1d_det(x, w, cu) if conv else None
-            return y, chunk_kda(
+            return y, cake_kda_nondet(
                 q,
                 k,
                 v,
@@ -846,7 +846,7 @@ def _equal(a: torch.Tensor | None, b: torch.Tensor | None) -> bool:
 
 
 def _handoff_counts() -> dict[str, int]:
-    return kcp_handoff_stats()
+    return cake_kda_nondet_train_kcp_handoff_stats()
 
 
 def _bits(t: torch.Tensor) -> torch.Tensor:
@@ -1135,30 +1135,30 @@ def run(args, rank: int, world: int, device: torch.device) -> dict[str, Any]:
     ctx_det, ctx_nd = problem["ctx"]["det"], problem["ctx"]["nd"]
     nbytes = {
         "det": {
-            "workspace": kda_det_workspace_bytes_kcp(ctx_det, H=H, C=C, **modes),
-            "saved": kda_det_saved_bytes_kcp(ctx_det, H=H, C=C, **modes),
-            "comm": kda_det_comm_bytes_kcp(ctx_det, H=H, C=C),
+            "workspace": cake_kda_det_train_kcp_workspace_bytes(ctx_det, H=H, C=C, **modes),
+            "saved": cake_kda_det_train_kcp_saved_bytes(ctx_det, H=H, C=C, **modes),
+            "comm": cake_kda_det_train_kcp_comm_bytes(ctx_det, H=H, C=C),
         },
         "nd": {
-            "workspace": kda_workspace_bytes_kcp(
+            "workspace": cake_kda_nondet_train_kcp_workspace_bytes(
                 ctx_nd, H=H, C=C, deterministic=False, **modes
             ),
-            "saved": kda_saved_bytes_kcp(
+            "saved": cake_kda_nondet_train_kcp_saved_bytes(
                 ctx_nd, H=H, C=C, deterministic=False, **modes
             ),
             "saved_handoff": (
-                kda_saved_bytes_kcp(
+                cake_kda_nondet_train_kcp_saved_bytes(
                     ctx_nd, H=H, C=C, checkpoint_handoff=True, deterministic=False
                 )
                 if handoff_mode
                 else None
             ),
             "handoff": (
-                kda_handoff_bytes_kcp(ctx_nd, H=H, deterministic=False)
+                cake_kda_nondet_train_kcp_handoff_bytes(ctx_nd, H=H, deterministic=False)
                 if handoff_mode
                 else None
             ),
-            "comm": kda_comm_bytes_kcp(ctx_nd, H=H, C=C, deterministic=False),
+            "comm": cake_kda_nondet_train_kcp_comm_bytes(ctx_nd, H=H, C=C, deterministic=False),
         },
     }
     try:

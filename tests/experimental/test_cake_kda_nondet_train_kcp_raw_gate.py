@@ -11,7 +11,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 The raw gate mode of the non-deterministic context-parallel (KCP) KDA training route (``use_gate_in_kernel=True`` of
-``cake_kcp.chunk_kda_kcp`` / ``chunk_kda_fwd_kcp`` / ``chunk_kda_bwd_kcp`` with ``deterministic=False``, issue #7816),
+``cake_kcp.cake_kda_nondet_kcp`` / ``cake_kda_nondet_train_kcp_forward`` / ``cake_kda_nondet_train_kcp_backward`` with ``deterministic=False``, issue #7816),
 the mirror of ``test_cake_kda_det_train_kcp_raw_gate.py``.
 
 CPU rows: the keywords and their refusals, the gate-aware workspace and its byte query (one context or a list of
@@ -26,7 +26,7 @@ GPU rows at W = 1: one reserved raw-mode workspace shared by four packs is bitwi
 such warning, eagerly and on a captured graph's replay, and its results are bitwise the deterministic package's.
 
 GPU rows (one process per rank; ``W = 1`` in the pytest process, ``W > 1`` spawned or one process per Slurm task as in
-``test_cake_kda_train_kcp_dist.py``): every rank runs the raw-mode KCP forward / backward in every mode and must be
+``test_cake_kda_nondet_train_kcp_dist.py``): every rank runs the raw-mode KCP forward / backward in every mode and must be
 bitwise repeatable (saved == replay, repeat and ``REPEATS`` more saved passes, autograd == explicit calls,
 checkpoint == direct, checkpoint with a recompute handle == plain checkpoint, checkpoint with
 ``checkpoint_handoff="on"`` == plain checkpoint with no hand-off decision taken, save_transfer, ring == a2a, graph
@@ -65,7 +65,7 @@ from tests.experimental.test_cake_kda_det_train_raw_gate_accuracy import (
     _max_normalized_error,
     torch_gate,
 )
-from tests.experimental.test_cake_kda_train_kcp_dist import (
+from tests.experimental.test_cake_kda_nondet_train_kcp_dist import (
     _init_group,
     _local_slices,
     _partition,
@@ -82,14 +82,14 @@ from tests.test_helpers.cake_kda_det_train_reference import (
 )
 from tests.test_helpers.cake_package import cake_package
 
-cake_kcp = cake_package("cake_kda_train_kcp", "cake_kcp")
-cake_kcp_plan = cake_package("cake_kda_train_kcp", "cake_kcp_plan")
-cake_backend = cake_package("cake.cake_kda_train", "cake_backend")
-cake_jit = cake_package("cake.cake_kda_train", "cake_jit")
-cake_kcp_jit = cake_package("cake_kda_train_kcp", "cake_kcp_jit")
+cake_kcp = cake_package("cake.cake_kda_nondet_train_kcp", "cake_kcp")
+cake_kcp_plan = cake_package("cake.cake_kda_nondet_train_kcp", "cake_kcp_plan")
+cake_backend = cake_package("cake.cake_kda_nondet_train", "cake_backend")
+cake_jit = cake_package("cake.cake_kda_nondet_train", "cake_jit")
+cake_kcp_jit = cake_package("cake.cake_kda_nondet_train_kcp", "cake_kcp_jit")
 # the deterministic package: the baseline of the bitwise rows (imported by the test, never by the package)
-det_kcp = cake_package("cake_kda_det_train_kcp", "cake_kcp")
-det_kcp_plan = cake_package("cake_kda_det_train_kcp", "cake_kcp_plan")
+det_kcp = cake_package("cake.cake_kda_det_train_kcp", "cake_kcp")
+det_kcp_plan = cake_package("cake.cake_kda_det_train_kcp", "cake_kcp_plan")
 det_backend = cake_package("cake.cake_kda_det_train", "cake_backend")
 
 D = cake_kcp.D
@@ -114,7 +114,7 @@ def _graph_events_ok(events: list) -> bool:
     captures one call early: at W = 1 the allocator may give the captured forward's ``S_in`` the freed eager
     address; a rank with one token keeps empty saved tensors (address 0).  The explicit mode does the same (the
     W8 ragged row, rank 6).  A capture replays at once, so the collectives stay aligned across ranks.  The rule is
-    the single-rank rule of test_cake_kda_train_kcp: one capture, eager calls before it, replays after it."""
+    the single-rank rule of test_cake_kda_nondet_train_kcp: one capture, eager calls before it, replays after it."""
     if [e[0] for e in events] != [e[0] for e in GRAPH_EVENTS]:
         return False
     bwd = [e[1] for e in events]
@@ -135,12 +135,12 @@ def _cpu_ctx(
     for n in lengths:
         cu.append(cu[-1] + n)
     if plan is det_kcp_plan:
-        part = det_kcp_plan.partition_det_kcp(cu, W, layout="zigzag_per_document")
-        return det_kcp_plan.build_context_det_kcp(
+        part = det_kcp_plan.cake_kda_det_train_kcp_partition(cu, W, layout="zigzag_per_document")
+        return det_kcp_plan.cake_kda_det_train_kcp_build_context(
             part, None, rank, "cpu", 4, sm_count=sm
         )
-    part = cake_kcp_plan.partition_kcp(cu, W, layout="zigzag_per_document")
-    return cake_kcp_plan.build_context_kcp(part, None, rank, "cpu", 4, sm_count=sm)
+    part = cake_kcp_plan.cake_kda_nondet_train_kcp_partition(cu, W, layout="zigzag_per_document")
+    return cake_kcp_plan.cake_kda_nondet_train_kcp_build_context(part, None, rank, "cpu", 4, sm_count=sm)
 
 
 def _cpu_ops(ctx, H: int, *, raw: bool = True) -> dict:
@@ -178,57 +178,57 @@ def test_raw_keywords_are_checked_before_any_launch() -> None:
     g_ops = _cpu_ops(ctx, H, raw=False)
     g_args = tuple(g_ops[n] for n in ("q", "k", "v", "g", "beta")) + (ctx,)
     with pytest.raises(ValueError, match="use_gate_in_kernel=True only"):
-        cake_kcp.chunk_kda_fwd_kcp(*g_args, A_log=kw["A_log"], deterministic=False)
+        cake_kcp.cake_kda_nondet_train_kcp_forward(*g_args, A_log=kw["A_log"], deterministic=False)
     with pytest.raises(ValueError, match="use_gate_in_kernel=True only"):
-        cake_kcp.chunk_kda_bwd_kcp(
+        cake_kcp.cake_kda_nondet_train_kcp_backward(
             *g_args, g_ops["q"], lower_bound=LB, deterministic=False
         )
     with pytest.raises(ValueError, match="lower_bound"):
-        cake_kcp.chunk_kda_fwd_kcp(
+        cake_kcp.cake_kda_nondet_train_kcp_forward(
             *args, **{**kw, "lower_bound": None}, deterministic=False
         )
     for bad in (0.0, -5.5, float("nan"), True):
         with pytest.raises(ValueError, match="lower_bound"):
-            cake_kcp.chunk_kda_fwd_kcp(
+            cake_kcp.cake_kda_nondet_train_kcp_forward(
                 *args, **{**kw, "lower_bound": bad}, deterministic=False
             )
     with pytest.raises(ValueError, match="use_gate_in_kernel must be a bool"):
-        cake_kcp.chunk_kda_fwd_kcp(
+        cake_kcp.cake_kda_nondet_train_kcp_forward(
             *args, **{**kw, "use_gate_in_kernel": 1}, deterministic=False
         )
     fp32 = (*args[:3], ops["g"].float(), *args[4:])
     with pytest.raises(ValueError, match="torch.bfloat16"):
-        cake_kcp.chunk_kda_fwd_kcp(*fp32, **kw, deterministic=False)
+        cake_kcp.cake_kda_nondet_train_kcp_forward(*fp32, **kw, deterministic=False)
     # an overlapping view is refused (the strided-pointer bindings check no layout of their own)
     over = ops["g"].as_strided(ops["g"].shape, (8, 8, 1))
     with pytest.raises(ValueError, match="strides"):
-        cake_kcp.chunk_kda_fwd_kcp(
+        cake_kcp.cake_kda_nondet_train_kcp_forward(
             *args[:3], over, *args[4:], **kw, deterministic=False
         )
     with pytest.raises(ValueError, match="A_log"):
-        cake_kcp.chunk_kda_fwd_kcp(
+        cake_kcp.cake_kda_nondet_train_kcp_forward(
             *args, **{**kw, "A_log": torch.zeros(H + 1)}, deterministic=False
         )
     with pytest.raises(ValueError, match="dt_bias"):
-        cake_kcp.chunk_kda_fwd_kcp(
+        cake_kcp.cake_kda_nondet_train_kcp_forward(
             *args, **{**kw, "dt_bias": torch.zeros(H, D - 1)}, deterministic=False
         )
     # the workspace's mode: a g workspace refuses a raw call and a raw workspace a g call (both directions)
-    ws_g = cake_kcp.WorkspaceKcp()
-    ws_r = cake_kcp.WorkspaceKcp(use_gate_in_kernel=True)
+    ws_g = cake_kcp.CakeKDANondetKcpWorkspace()
+    ws_r = cake_kcp.CakeKDANondetKcpWorkspace(use_gate_in_kernel=True)
     assert (ws_g.gate, ws_r.gate) == ("g", "raw")
     with pytest.raises(ValueError, match="use_gate_in_kernel=True"):
-        cake_kcp.chunk_kda_fwd_kcp(*args, workspace=ws_g, **kw, deterministic=False)
+        cake_kcp.cake_kda_nondet_train_kcp_forward(*args, workspace=ws_g, **kw, deterministic=False)
     with pytest.raises(ValueError, match="use_gate_in_kernel=False"):
-        cake_kcp.chunk_kda_fwd_kcp(*g_args, workspace=ws_r, deterministic=False)
+        cake_kcp.cake_kda_nondet_train_kcp_forward(*g_args, workspace=ws_r, deterministic=False)
     with pytest.raises(ValueError, match="use_gate_in_kernel must be a bool"):
-        cake_kcp.WorkspaceKcp(use_gate_in_kernel="raw")
+        cake_kcp.CakeKDANondetKcpWorkspace(use_gate_in_kernel="raw")
     # a backend without the local kernel stages (an emulation) has no raw gate
     stub = type("Stub", (cake_kcp.Backend,), {"name": "stub", "local_stages": False})()
     prev = cake_kcp.set_backend(stub)
     try:
         with pytest.raises(NotImplementedError, match="local kernel stages"):
-            cake_kcp.chunk_kda_fwd_kcp(*args, **kw, deterministic=False)
+            cake_kcp.cake_kda_nondet_train_kcp_forward(*args, **kw, deterministic=False)
     finally:
         cake_kcp.set_backend(prev)
 
@@ -245,11 +245,11 @@ def test_raw_saved_set_metadata_round_trips() -> None:
         n_frag=1, P=1, Hg=1, scale=0.5, save_mode="light", save_transfer=False,
         offset_class="fla", exchange="a2a", precision_mode=0, ctx=None,
     )  # fmt: skip
-    g = cake_kcp.SavedKcp(**base)
-    raw = cake_kcp.SavedKcp(**base, gate="raw", lower_bound=-5.0)
+    g = cake_kcp.CakeKDANondetKcpSaved(**base)
+    raw = cake_kcp.CakeKDANondetKcpSaved(**base, gate="raw", lower_bound=-5.0)
     assert (g.gate, g.lower_bound) == ("g", None)
     assert raw.tensors() == g.tensors() and raw.flags() == g.flags()
-    back = cake_kcp.SavedKcp.from_tensors(raw.tensors(), raw.flags(), raw.meta(), None)
+    back = cake_kcp.CakeKDANondetKcpSaved.from_tensors(raw.tensors(), raw.flags(), raw.meta(), None)
     assert back.meta() == raw.meta() and (back.gate, back.lower_bound) == (
         "raw",
         -5.0,
@@ -268,8 +268,8 @@ def test_raw_saved_set_metadata_round_trips() -> None:
     )
     with pytest.raises(ValueError, match="lower_bound"):
         cake_backend._check_saved_gate(raw, other)
-    det_raw = det_kcp.SavedDetKcp(**base, gate="raw", lower_bound=-5.0)
-    det_g = det_kcp.SavedDetKcp(**base)
+    det_raw = det_kcp.CakeKDADetKcpSaved(**base, gate="raw", lower_bound=-5.0)
+    det_g = det_kcp.CakeKDADetKcpSaved(**base)
     assert det_raw.meta() == raw.meta() and det_g.meta() == g.meta()
     det_gp = det_backend._gate_params(
         "raw", torch.zeros(1), torch.zeros(D), -5.0, 1, torch.device("cpu")
@@ -293,7 +293,7 @@ def test_raw_saved_set_metadata_round_trips() -> None:
 
 
 def test_raw_workspace_bytes_and_local_plan() -> None:
-    """``kda_workspace_bytes_kcp(..., use_gate_in_kernel=True)`` is the raw plan's local arena (the existing backend's
+    """``cake_kda_nondet_train_kcp_workspace_bytes(..., use_gate_in_kernel=True)`` is the raw plan's local arena (the existing backend's
     ``workspace_bytes(gate="raw")`` plus the scratch table set of the raw plan's intra record) plus the same KCP
     pools as the explicit mode; the raw arena is never larger (the gate epilogue's ``dg_int`` / ``db_int`` leave
     the backward layouts); the forward-only workspace does not depend on the mode; every answer is the deterministic
@@ -315,8 +315,8 @@ def test_raw_workspace_bytes_and_local_plan() -> None:
         for rank in (0, 1):
             ctx = _cpu_ctx(rank=rank)
             for backward in (True, False):
-                g = cake_kcp_plan.kda_workspace_bytes_kcp(ctx, H=H, backward=backward)
-                r = cake_kcp_plan.kda_workspace_bytes_kcp(
+                g = cake_kcp_plan.cake_kda_nondet_train_kcp_workspace_bytes(ctx, H=H, backward=backward)
+                r = cake_kcp_plan.cake_kda_nondet_train_kcp_workspace_bytes(
                     ctx, H=H, backward=backward, use_gate_in_kernel=True
                 )
                 lr, lg = local(ctx, H, backward, "raw"), local(ctx, H, backward, "g")
@@ -326,22 +326,22 @@ def test_raw_workspace_bytes_and_local_plan() -> None:
                     assert r == g, "the forward layouts do not depend on the gate mode"
                 det_ctx = _cpu_ctx(rank=rank, plan=det_kcp_plan)
                 for gate_on, mine in ((True, r), (False, g)):
-                    assert mine == det_kcp_plan.kda_det_workspace_bytes_kcp(
+                    assert mine == det_kcp_plan.cake_kda_det_train_kcp_workspace_bytes(
                         det_ctx, H=H, backward=backward, use_gate_in_kernel=gate_on
                     ), (H, rank, backward, gate_on)
     with pytest.raises(ValueError, match="use_gate_in_kernel must be a bool"):
-        cake_kcp_plan.kda_workspace_bytes_kcp(_cpu_ctx(), H=4, use_gate_in_kernel="raw")
+        cake_kcp_plan.cake_kda_nondet_train_kcp_workspace_bytes(_cpu_ctx(), H=4, use_gate_in_kernel="raw")
 
 
 def test_raw_workspace_refuses_the_lean_arena() -> None:
-    """The raw gate mode runs on the replay local arena: ``WorkspaceKcp`` and ``kda_workspace_bytes_kcp``
+    """The raw gate mode runs on the replay local arena: ``CakeKDANondetKcpWorkspace`` and ``cake_kda_nondet_train_kcp_workspace_bytes``
     (backward and forward-only) refuse ``local_arena="lean"`` with ``use_gate_in_kernel=True``."""
     with pytest.raises(NotImplementedError, match='local_arena="lean"'):
-        cake_kcp.WorkspaceKcp(use_gate_in_kernel=True, local_arena="lean")
+        cake_kcp.CakeKDANondetKcpWorkspace(use_gate_in_kernel=True, local_arena="lean")
     ctx = _cpu_ctx()
     for backward in (True, False):
         with pytest.raises(NotImplementedError, match='local_arena="lean"'):
-            cake_kcp_plan.kda_workspace_bytes_kcp(
+            cake_kcp_plan.cake_kda_nondet_train_kcp_workspace_bytes(
                 ctx, H=4, backward=backward, use_gate_in_kernel=True, local_arena="lean"
             )
 
@@ -375,20 +375,20 @@ def test_raw_workspace_bytes_of_a_list_of_contexts() -> None:
     ]
     for H in (4, 64):
         for backward in (True, False):
-            g = cake_kcp_plan.kda_workspace_bytes_kcp(ctxs, H=H, backward=backward)
-            r = cake_kcp_plan.kda_workspace_bytes_kcp(
+            g = cake_kcp_plan.cake_kda_nondet_train_kcp_workspace_bytes(ctxs, H=H, backward=backward)
+            r = cake_kcp_plan.cake_kda_nondet_train_kcp_workspace_bytes(
                 ctxs, H=H, backward=backward, use_gate_in_kernel=True
             )
             lr, lg = local(ctxs, H, backward, "raw"), local(ctxs, H, backward, "g")
             assert r - lr == g - lg > 0, (H, backward)  # the same KCP pools
             assert r <= g, (H, backward, r, g)
-            assert r == det_kcp_plan.kda_det_workspace_bytes_kcp(
+            assert r == det_kcp_plan.cake_kda_det_train_kcp_workspace_bytes(
                 det_ctxs, H=H, backward=backward, use_gate_in_kernel=True
             ), (H, backward)
             for c in ctxs:
-                assert cake_kcp_plan.kda_workspace_bytes_kcp(
+                assert cake_kcp_plan.cake_kda_nondet_train_kcp_workspace_bytes(
                     [c], H=H, backward=backward, use_gate_in_kernel=True
-                ) == cake_kcp_plan.kda_workspace_bytes_kcp(
+                ) == cake_kcp_plan.cake_kda_nondet_train_kcp_workspace_bytes(
                     c, H=H, backward=backward, use_gate_in_kernel=True
                 )
 
@@ -397,7 +397,7 @@ def test_gpu_raw_reserved_shared_workspace_matches_one_workspace_per_pack() -> N
     """Four raw-mode packs of one rank (different ``T_r`` / ``n_frag``) at H = 4 and 64 on ONE reserved raw
     workspace, interleaved (saving forwards in pack order, their backwards in reverse order, replay-mode forwards
     and backwards): every output, the raw gate's gradient and the parameter partial sums are bitwise those of one
-    raw workspace per pack; ``reserve`` returns ``kda_workspace_bytes_kcp(ctxs, H=H, use_gate_in_kernel=True)``, the
+    raw workspace per pack; ``reserve`` returns ``cake_kda_nondet_train_kcp_workspace_bytes(ctxs, H=H, use_gate_in_kernel=True)``, the
     schedule changes no byte count, and an explicit-mode call on the raw workspace is refused."""
     _skip_unless_runnable(1)
     device = torch.device("cuda", torch.cuda.current_device())
@@ -405,7 +405,7 @@ def test_gpu_raw_reserved_shared_workspace_matches_one_workspace_per_pack() -> N
         ctxs, ops = [], []
         for i, lengths in enumerate(SHARED_PACKS):
             part, cu = _partition(lengths, 1, "contiguous")
-            ctxs.append(cake_kcp_plan.build_context_kcp(part, None, 0, device))
+            ctxs.append(cake_kcp_plan.cake_kda_nondet_train_kcp_build_context(part, None, 0, device))
             glob = make_raw_inputs(lengths, H, device, seed=0x7816 + i)
             o = _local_slices(
                 part, 0, cu, {n: glob[n] for n in ("q", "k", "v", "g", "beta", "dout")}
@@ -422,37 +422,37 @@ def test_gpu_raw_reserved_shared_workspace_matches_one_workspace_per_pack() -> N
             n, res, saved = len(ctxs), [{} for _ in ctxs], [None] * len(ctxs)
             for i in range(n):
                 o = ops[i]
-                out, saved[i] = cake_kcp.chunk_kda_fwd_kcp(
+                out, saved[i] = cake_kcp.cake_kda_nondet_train_kcp_forward(
                     o["q"], o["k"], o["v"], o["g"], o["beta"], ctxs[i], workspace=wss[i], **o["GK"], deterministic=False
                 )  # fmt: skip
                 res[i]["out"] = out
             for i in reversed(range(n)):
                 o = ops[i]
-                res[i]["grads"] = cake_kcp.chunk_kda_bwd_kcp(
+                res[i]["grads"] = cake_kcp.cake_kda_nondet_train_kcp_backward(
                     o["q"], o["k"], o["v"], o["g"], o["beta"], ctxs[i], o["dout"], saved=saved[i],
                     workspace=wss[i], **o["GK"], deterministic=False,
                 )  # fmt: skip
             for i in reversed(range(n)):
                 o = ops[i]
-                out, none = cake_kcp.chunk_kda_fwd_kcp(
+                out, none = cake_kcp.cake_kda_nondet_train_kcp_forward(
                     o["q"], o["k"], o["v"], o["g"], o["beta"], ctxs[i], workspace=wss[i],
                     boundary_mode="replay", **o["GK"], deterministic=False,
                 )  # fmt: skip
                 assert none is None
                 res[i]["out_replay"] = out
-                res[i]["grads_replay"] = cake_kcp.chunk_kda_bwd_kcp(
+                res[i]["grads_replay"] = cake_kcp.cake_kda_nondet_train_kcp_backward(
                     o["q"], o["k"], o["v"], o["g"], o["beta"], ctxs[i], o["dout"], saved=None,
                     workspace=wss[i], **o["GK"], deterministic=False,
                 )  # fmt: skip
             return res
 
-        ref = schedule([cake_kcp.WorkspaceKcp(use_gate_in_kernel=True) for _ in ctxs])
-        ws = cake_kcp.WorkspaceKcp(use_gate_in_kernel=True)
+        ref = schedule([cake_kcp.CakeKDANondetKcpWorkspace(use_gate_in_kernel=True) for _ in ctxs])
+        ws = cake_kcp.CakeKDANondetKcpWorkspace(use_gate_in_kernel=True)
         got = ws.reserve(ctxs, H)
         assert (
             got
             == ws.bytes
-            == cake_kcp_plan.kda_workspace_bytes_kcp(ctxs, H=H, use_gate_in_kernel=True)
+            == cake_kcp_plan.cake_kda_nondet_train_kcp_workspace_bytes(ctxs, H=H, use_gate_in_kernel=True)
         ), H
         for rnd in range(2):
             res = schedule([ws] * len(ctxs))
@@ -474,7 +474,7 @@ def test_gpu_raw_reserved_shared_workspace_matches_one_workspace_per_pack() -> N
             assert ws.bytes == got, (H, rnd)
         o = ops[0]
         with pytest.raises(ValueError, match="gate mode"):
-            cake_kcp.chunk_kda_fwd_kcp(
+            cake_kcp.cake_kda_nondet_train_kcp_forward(
                 o["q"], o["k"], o["v"], torch_gate(o["g"], o["GK"]["A_log"], o["GK"]["dt_bias"]),
                 o["beta"], ctxs[0], workspace=ws, deterministic=False,
             )  # fmt: skip
@@ -527,17 +527,17 @@ def test_reduce_gate_param_grads_one_rank_and_checks() -> None:
     ctx = types.SimpleNamespace(world_size=1, group=None)
     a = torch.arange(4, dtype=torch.float32)
     for b in (torch.ones(4 * D), torch.ones(4, D)):
-        ra, rb = cake_kcp.reduce_gate_param_grads_kcp(ctx, a, b)
+        ra, rb = cake_kcp.cake_kda_nondet_train_kcp_reduce_gate_param_grads(ctx, a, b)
         assert torch.equal(ra, a) and torch.equal(rb, b) and rb.shape == b.shape
         assert ra.data_ptr() != a.data_ptr() and rb.data_ptr() != b.data_ptr()
-        da, db = det_kcp.reduce_gate_param_grads_det_kcp(ctx, a, b)
+        da, db = det_kcp.cake_kda_det_train_kcp_reduce_gate_param_grads(ctx, a, b)
         assert _bits_equal(ra, da) and _bits_equal(rb, db)
     with pytest.raises(ValueError, match="float32"):
-        cake_kcp.reduce_gate_param_grads_kcp(ctx, a.double(), torch.ones(4 * D))
+        cake_kcp.cake_kda_nondet_train_kcp_reduce_gate_param_grads(ctx, a.double(), torch.ones(4 * D))
     with pytest.raises(ValueError, match="ddt_bias"):
-        cake_kcp.reduce_gate_param_grads_kcp(ctx, a, torch.ones(4 * D + 1))
+        cake_kcp.cake_kda_nondet_train_kcp_reduce_gate_param_grads(ctx, a, torch.ones(4 * D + 1))
     with pytest.raises(RuntimeError, match="process group"):
-        cake_kcp.reduce_gate_param_grads_kcp(
+        cake_kcp.cake_kda_nondet_train_kcp_reduce_gate_param_grads(
             types.SimpleNamespace(world_size=2, group=None), a, torch.ones(4 * D)
         )
 
@@ -839,7 +839,7 @@ def _param_check(cand: torch.Tensor, ref: torch.Tensor, bound: float) -> bool:
 def param_vs_explicit(cand, expl, ref, W: int, *, parts_of: str, parts: list) -> dict:
     """Criterion (d) of #7816 for one parameter gradient of one row: the raw route is no less accurate against FP64
     than the explicit route.  On one seed this is the sanity rule of the single-rank protocol
-    (``test_cake_kda_train_raw_gate_accuracy``): the worst normalized error ``|err| / (atol + rtol |ref|)`` is at most
+    (``test_cake_kda_nondet_train_raw_gate_accuracy``): the worst normalized error ``|err| / (atol + rtol |ref|)`` is at most
     ``max(1, PARAM_SANITY_FACTOR x`` the explicit route's ``)``; the seeded statistic is
     :func:`test_raw_gate_kcp_param_grads_no_less_accurate_than_explicit`.  Negative controls must fail the same rule:
     the raw error stretched to 1.5 x the bound and, at W > 1, the rank-order sum without the largest partial."""
@@ -891,7 +891,7 @@ def _run_rank(rank: int, W: int, row, rdzv: str | None, result_dir: str | None) 
         _init_group(rank, W, device, rdzv)
     group = dist.group.WORLD if W > 1 else None
     part, cu = _partition(lengths, W, layout)
-    ctx = cake_kcp_plan.build_context_kcp(part, group, rank, device)
+    ctx = cake_kcp_plan.cake_kda_nondet_train_kcp_build_context(part, group, rank, device)
     total = cu[-1]
     glob = make_raw_inputs(lengths, H, device)
     A_log, dt_bias = glob["A_log"], glob["dt_bias"]
@@ -899,11 +899,11 @@ def _run_rank(rank: int, W: int, row, rdzv: str | None, result_dir: str | None) 
     ops = _local_slices(part, rank, cu, tokens)
     q, k, v, g, beta, dout = (ops[n] for n in ("q", "k", "v", "g", "beta", "dout"))
     GK = dict(use_gate_in_kernel=True, A_log=A_log, dt_bias=dt_bias, lower_bound=LB)
-    ws = cake_kcp.WorkspaceKcp(use_gate_in_kernel=True)
+    ws = cake_kcp.CakeKDANondetKcpWorkspace(use_gate_in_kernel=True)
     recs: dict = {}
 
     def saved_pass(raw=g, workspace=ws, tag=None, **opts):
-        out, saved = cake_kcp.chunk_kda_fwd_kcp(
+        out, saved = cake_kcp.cake_kda_nondet_train_kcp_forward(
             q,
             k,
             v,
@@ -917,7 +917,7 @@ def _run_rank(rank: int, W: int, row, rdzv: str | None, result_dir: str | None) 
         )
         rec_f = dict(cake_kcp.LAST_CALL["fwd"])
         bwd_opts = {key: val for key, val in opts.items() if key != "boundary_mode"}
-        grads = cake_kcp.chunk_kda_bwd_kcp(
+        grads = cake_kcp.cake_kda_nondet_train_kcp_backward(
             q, k, v, raw, beta, ctx, dout, saved=saved, workspace=workspace, **GK, **bwd_opts, deterministic=False
         )  # fmt: skip
         if tag is not None:
@@ -931,7 +931,7 @@ def _run_rank(rank: int, W: int, row, rdzv: str | None, result_dir: str | None) 
         ]
 
         def fn(q_, k_, v_, g_, b_, a_, d_, *h):
-            return cake_kcp.chunk_kda_kcp(
+            return cake_kcp.cake_kda_nondet_kcp(
                 q_, k_, v_, g_, b_, ctx, None, "light", "saved", workspace,
                 recompute_handle=h[0] if h else None, checkpoint_handoff=handoff,
                 use_gate_in_kernel=True, A_log=a_, dt_bias=d_, lower_bound=LB, deterministic=False,
@@ -951,26 +951,26 @@ def _run_rank(rank: int, W: int, row, rdzv: str | None, result_dir: str | None) 
         }
 
     def reduced(res: dict) -> tuple[torch.Tensor, torch.Tensor]:
-        return cake_kcp.reduce_gate_param_grads_kcp(ctx, res["dA_log"], res["ddt_bias"])
+        return cake_kcp.cake_kda_nondet_train_kcp_reduce_gate_param_grads(ctx, res["dA_log"], res["ddt_bias"])
 
     pending = bool(getattr(cake_kcp.get_backend(), "_spec3_pending", False))
     res = saved_pass(tag="raw", spec3_probe="record")
     spec3 = (cake_kcp.LAST_CALL.get("bwd") or {}).get("spec3")
-    handoff_stats = cake_kcp.kcp_handoff_stats()
+    handoff_stats = cake_kcp.cake_kda_nondet_train_kcp_handoff_stats()
     runs = {
         "saved_eq_replay": saved_pass(boundary_mode="replay"),
         "repeat": saved_pass(),
         "autograd_eq_saved": autograd_pass(),
         "ckpt_eq_direct": autograd_pass(ckpt=True),
         "handle_eq_ckpt": autograd_pass(
-            ckpt=True, handle=cake_kcp.RecomputeHandleKcp()
+            ckpt=True, handle=cake_kcp.CakeKDANondetKcpRecomputeHandle()
         ),
         # the checkpoint hand-off never engages in raw mode, even when forced on: the light set, no decision taken
         "handoff_on_eq_ckpt": autograd_pass(ckpt=True, handoff="on"),
         "save_transfer_eq": saved_pass(save_transfer=False),
         "ws_none_eq": autograd_pass(workspace=None),
     }
-    handoff_untouched = cake_kcp.kcp_handoff_stats() == handoff_stats
+    handoff_untouched = cake_kcp.cake_kda_nondet_train_kcp_handoff_stats() == handoff_stats
     # run to run: REPEATS more saved passes, each compared with the first as it comes (no early exit: the passes
     # exchange, so every rank runs all of them)
     repeats_eq = True
@@ -989,12 +989,12 @@ def _run_rank(rank: int, W: int, row, rdzv: str | None, result_dir: str | None) 
     # the deterministic package's raw KCP route on the same operands and the same context (the context holds no mode
     # and serves both packages): every output, the raw gate's gradient and the partial sums bitwise, the same launch
     # sequence, and the deterministic reduction helper gives the same bits
-    ws_det = det_kcp.WorkspaceDetKcp(use_gate_in_kernel=True)
-    out_d, saved_d = det_kcp.chunk_kda_det_fwd_kcp(
+    ws_det = det_kcp.CakeKDADetKcpWorkspace(use_gate_in_kernel=True)
+    out_d, saved_d = det_kcp.cake_kda_det_train_kcp_forward(
         q, k, v, g, beta, ctx, workspace=ws_det, **GK
     )
     rec_fd = dict(det_kcp.LAST_CALL["fwd"])
-    grads_d = det_kcp.chunk_kda_det_bwd_kcp(
+    grads_d = det_kcp.cake_kda_det_train_kcp_backward(
         q, k, v, g, beta, ctx, dout, saved=saved_d, workspace=ws_det, **GK
     )
     rec_bd = dict(det_kcp.LAST_CALL["bwd"])
@@ -1002,10 +1002,10 @@ def _run_rank(rank: int, W: int, row, rdzv: str | None, result_dir: str | None) 
         "out": out_d,
         **dict(zip(TOKEN_GRADS + PARAM_GRADS, grads_d, strict=True)),
     }
-    out_dr, _ = det_kcp.chunk_kda_det_fwd_kcp(
+    out_dr, _ = det_kcp.cake_kda_det_train_kcp_forward(
         q, k, v, g, beta, ctx, workspace=ws_det, boundary_mode="replay", **GK
     )
-    grads_dr = det_kcp.chunk_kda_det_bwd_kcp(
+    grads_dr = det_kcp.cake_kda_det_train_kcp_backward(
         q, k, v, g, beta, ctx, dout, saved=None, workspace=ws_det, **GK
     )
     det_replay = {
@@ -1018,7 +1018,7 @@ def _run_rank(rank: int, W: int, row, rdzv: str | None, result_dir: str | None) 
         and recs["raw"][1]["sequence"] == rec_bd["sequence"]
         and rec_fd["gate"] == rec_bd["gate"] == "raw"
     )
-    det_red = det_kcp.reduce_gate_param_grads_det_kcp(
+    det_red = det_kcp.cake_kda_det_train_kcp_reduce_gate_param_grads(
         ctx, det_res["dA_log"], det_res["ddt_bias"]
     )
     det_mism = {
@@ -1047,7 +1047,7 @@ def _run_rank(rank: int, W: int, row, rdzv: str | None, result_dir: str | None) 
     flags["graph_replay"] = _graph_events_ok(events) and _same(res, res_graph)
     runs["graph_replay"] = res_graph
     # the mode is checked against the saved set and the workspace: symmetric on every rank, before any collective
-    _, saved_r = cake_kcp.chunk_kda_fwd_kcp(
+    _, saved_r = cake_kcp.cake_kda_nondet_train_kcp_forward(
         q, k, v, g, beta, ctx, workspace=ws, **GK, deterministic=False
     )
     refusals = []
@@ -1056,9 +1056,9 @@ def _run_rank(rank: int, W: int, row, rdzv: str | None, result_dir: str | None) 
         ({}, "gate mode"),
     ):
         try:
-            cake_kcp.chunk_kda_bwd_kcp(
+            cake_kcp.cake_kda_nondet_train_kcp_backward(
                 q, k, v, (g if kw else g.float()), beta, ctx, dout, saved=saved_r,
-                workspace=ws if kw else cake_kcp.WorkspaceKcp(), **kw, deterministic=False,
+                workspace=ws if kw else cake_kcp.CakeKDANondetKcpWorkspace(), **kw, deterministic=False,
             )  # fmt: skip
             refusals.append(False)
         except ValueError as exc:
@@ -1068,12 +1068,12 @@ def _run_rank(rank: int, W: int, row, rdzv: str | None, result_dir: str | None) 
     # the explicit mode on the same activated gate (torch FP32): the same launches in the same order with the same
     # collectives -- gate_epilogue (a stage that launches only on sm_100a) in place of param_finalize
     g_exp = raw_gate(g, A_log, dt_bias, LB, torch.float32).contiguous()
-    ws_g = cake_kcp.WorkspaceKcp()
-    out_e, saved_e = cake_kcp.chunk_kda_fwd_kcp(
+    ws_g = cake_kcp.CakeKDANondetKcpWorkspace()
+    out_e, saved_e = cake_kcp.cake_kda_nondet_train_kcp_forward(
         q, k, v, g_exp, beta, ctx, workspace=ws_g, deterministic=False
     )
     rec_fe = dict(cake_kcp.LAST_CALL["fwd"])
-    grads_e = cake_kcp.chunk_kda_bwd_kcp(
+    grads_e = cake_kcp.cake_kda_nondet_train_kcp_backward(
         q,
         k,
         v,
@@ -1120,7 +1120,7 @@ def _run_rank(rank: int, W: int, row, rdzv: str | None, result_dir: str | None) 
     for name, r in (("res", res), *runs.items()):
         ra, rb = reds[name]
         red_ok &= _bits_equal_counted(ra, red[0]) and _bits_equal_counted(rb, red[1])
-        da, db = det_kcp.reduce_gate_param_grads_det_kcp(
+        da, db = det_kcp.cake_kda_det_train_kcp_reduce_gate_param_grads(
             ctx, r["dA_log"], r["ddt_bias"]
         )
         det_helper_ok &= _bits_equal_counted(ra, da) and _bits_equal_counted(rb, db)
@@ -1201,7 +1201,7 @@ def _run_rank(rank: int, W: int, row, rdzv: str | None, result_dir: str | None) 
     if rank == 0:
         cu_t = torch.tensor(cu, dtype=torch.int32, device=device)
         # the single-rank raw path on the whole pack
-        out_s, saved_s = cake_backend.chunk_kda_fwd(
+        out_s, saved_s = cake_backend.cake_kda_nondet_train_forward(
             glob["q"],
             glob["k"],
             glob["v"],
@@ -1211,7 +1211,7 @@ def _run_rank(rank: int, W: int, row, rdzv: str | None, result_dir: str | None) 
             **GK,
             deterministic=False,
         )
-        grads_s = cake_backend.chunk_kda_bwd(
+        grads_s = cake_backend.cake_kda_nondet_train_backward(
             glob["q"], glob["k"], glob["v"], glob["g"], glob["beta"], cu_t, glob["dout"],
             saved=saved_s, **GK, deterministic=False,
         )  # fmt: skip
@@ -1371,7 +1371,7 @@ def test_gpu_raw_raises_no_alert_under_torch_deterministic_mode(
     alert = "does not have a deterministic implementation"
     lengths, H = (100, 640, 77), 4
     part, cu = _partition(lengths, 1, "contiguous")
-    ctx = cake_kcp_plan.build_context_kcp(part, None, 0, device)
+    ctx = cake_kcp_plan.cake_kda_nondet_train_kcp_build_context(part, None, 0, device)
     glob = make_raw_inputs(lengths, H, device, seed=0x7816)
     o = _local_slices(
         part, 0, cu, {n: glob[n] for n in ("q", "k", "v", "g", "beta", "dout")}
@@ -1383,14 +1383,14 @@ def test_gpu_raw_raises_no_alert_under_torch_deterministic_mode(
         lower_bound=LB,
     )
     ops = tuple(o[n] for n in ("q", "k", "v", "g", "beta"))
-    ws = cake_kcp.WorkspaceKcp(use_gate_in_kernel=True, **L2)
+    ws = cake_kcp.CakeKDANondetKcpWorkspace(use_gate_in_kernel=True, **L2)
     mode = (
         torch.are_deterministic_algorithms_enabled(),
         torch.is_deterministic_algorithms_warn_only_enabled(),
     )
 
     def bwd(saved, **kw):
-        return cake_kcp.chunk_kda_bwd_kcp(
+        return cake_kcp.cake_kda_nondet_train_kcp_backward(
             *ops, ctx, o["dout"], saved=saved, workspace=ws, **GK, **L2, **kw, deterministic=False
         )  # fmt: skip
 
@@ -1415,21 +1415,21 @@ def test_gpu_raw_raises_no_alert_under_torch_deterministic_mode(
     try:
         torch.use_deterministic_algorithms(False)
         # the reference: an eager backward with the mode off, bitwise the deterministic package's raw KCP backward
-        _, saved = cake_kcp.chunk_kda_fwd_kcp(
+        _, saved = cake_kcp.cake_kda_nondet_train_kcp_forward(
             *ops, ctx, workspace=ws, **GK, **L2, deterministic=False
         )
         ref = tuple(t.clone() for t in bwd(saved))
-        ws_det = det_kcp.WorkspaceDetKcp(use_gate_in_kernel=True, **L2)
-        _, saved_d = det_kcp.chunk_kda_det_fwd_kcp(
+        ws_det = det_kcp.CakeKDADetKcpWorkspace(use_gate_in_kernel=True, **L2)
+        _, saved_d = det_kcp.cake_kda_det_train_kcp_forward(
             *ops, ctx, workspace=ws_det, **GK, **L2
         )
-        grads_d = det_kcp.chunk_kda_det_bwd_kcp(
+        grads_d = det_kcp.cake_kda_det_train_kcp_backward(
             *ops, ctx, o["dout"], saved=saved_d, workspace=ws_det, **GK, **L2
         )
         check(grads_d, ref, "deterministic package")
         del ws_det, saved_d, grads_d
         # a captured backward to replay below
-        _, saved_g = cake_kcp.chunk_kda_fwd_kcp(
+        _, saved_g = cake_kcp.cake_kda_nondet_train_kcp_forward(
             *ops, ctx, workspace=ws, graph="replay", **GK, **L2, deterministic=False
         )
         bwd(saved_g)  # the backward arena: a graph key sees the workspace's pools

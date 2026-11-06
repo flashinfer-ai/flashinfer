@@ -11,10 +11,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Checkpoint hand-off of the non-deterministic context-parallel (KCP) KDA training route
-(``chunk_kda_kcp(..., checkpoint_handoff=)``): under ``torch.utils.checkpoint`` the forward keeps its tape set and
+(``cake_kda_nondet_kcp(..., checkpoint_handoff=)``): under ``torch.utils.checkpoint`` the forward keeps its tape set and
 the backward reads it instead of re-running the intra program, WY and the K1 tape walk.
 
-Multi-GPU rows (``HANDOFF_ROWS``: the checkpoint rows ``CKPT_ROWS`` of ``test_cake_kda_train_kcp_dist.py``, the
+Multi-GPU rows (``HANDOFF_ROWS``: the checkpoint rows ``CKPT_ROWS`` of ``test_cake_kda_nondet_train_kcp_dist.py``, the
 same launch forms, and two rows at H8 and H32): ``out``, the five gradients and ``dw`` (the checkpointed function
 returns ``out * w``) with the hand-off on are bitwise those with it off and those of the direct pass, for
 ``use_reentrant`` False and True, with a recompute handle (both tiers), on a lean arena and a per-call workspace,
@@ -28,7 +28,7 @@ state such as a CUDA-graph capture, a selective-checkpoint policy) keep the ligh
 bit; a Python dispatch mode in one pass only follows the original forward's decision in both; ``"auto"`` follows the
 admission rule: the shipped work bound refuses these small rows, with the bound at 0 it engages on a verified device
 at an admitted head count and refuses as ``"unverified"`` with the verified set emptied (each refusal counted once);
-the facade ``flashinfer.cake_kda_train_kcp`` forwards the mode under ``deterministic=False`` and never engages under
+the facade ``flashinfer.cake_kda_nondet_train_kcp`` forwards the mode under ``deterministic=False`` and never engages under
 ``deterministic=True``; a checkpointed forward with the hand-off retains nothing.  A check whose light path does not
 run under its dispatch mode or policy has nothing to compare: the row lists it under ``not_run``.
 Single-process rows: the static rule, the admission table, the phase probe, the once-per-call decision (a refusal by
@@ -53,8 +53,8 @@ import torch
 import torch.distributed as dist
 from torch.utils._python_dispatch import TorchDispatchMode
 
-import flashinfer.cake_kda_train_kcp as kcp_api
-from tests.experimental.test_cake_kda_train_kcp_dist import (
+import flashinfer.cake_kda_nondet_train_kcp as kcp_api
+from tests.experimental.test_cake_kda_nondet_train_kcp_dist import (
     CKPT_ROWS,
     _bound_rank_threads,
     _init_group,
@@ -152,12 +152,12 @@ def _run_rank_handoff(
         _init_group(rank, W, device, rdzv)
     group = dist.group.WORLD
     part, cu = _partition(lengths, W, layout)
-    ctx = cake_kcp_plan.build_context_kcp(part, group, rank, device)
+    ctx = cake_kcp_plan.cake_kda_nondet_train_kcp_build_context(part, group, rank, device)
     glob = make_inputs(lengths, H, device)
     ops = _local_slices(part, rank, cu, glob)
     q, k, v, g, beta, dout = (ops[n] for n in ("q", "k", "v", "g", "beta", "dout"))
-    ws = cake_kcp.WorkspaceKcp()
-    ws_lean = cake_kcp.WorkspaceKcp(local_arena="lean")
+    ws = cake_kcp.CakeKDANondetKcpWorkspace()
+    ws_lean = cake_kcp.CakeKDANondetKcpWorkspace(local_arena="lean")
     T_r = int(q.shape[0])
     index = device.index if device.index is not None else torch.cuda.current_device()
     arch = cake_kcp.cake_jit.device_arch(index)
@@ -211,7 +211,7 @@ def _run_rank_handoff(
             kw["checkpoint_keep"] = keep
 
         def top(q_, k_, v_, g_, b_, w_):
-            y = cake_kcp.chunk_kda_kcp(
+            y = cake_kcp.cake_kda_nondet_kcp(
                 q_,
                 k_,
                 v_,
@@ -311,7 +311,7 @@ def _run_rank_handoff(
     flags["on_nonreentrant_bitwise"] = _same(on_nr, base)
     flags["on_nonreentrant_engaged"] = engaged(recs_on)
     flags["on_launches"] = skips(recs_on, recs_base)
-    want_bytes = cake_kcp.kda_handoff_bytes_kcp(ctx, H=H) if T_r > 0 else None
+    want_bytes = cake_kcp.cake_kda_nondet_train_kcp_handoff_bytes(ctx, H=H) if T_r > 0 else None
     flags["on_bytes"] = (
         recs_on["fwd"].get("checkpoint_handoff_bytes") == want_bytes
         and recs_on["bwd"].get("checkpoint_handoff_bytes") == want_bytes
@@ -320,7 +320,7 @@ def _run_rank_handoff(
     # in, the carry plane out); the absolute figures are recorded (the query also counts the int32 tables)
     st = recs_on["fwd"]["save_transfer"]
     query = {
-        flag: cake_kcp_plan.kda_saved_bytes_kcp(
+        flag: cake_kcp_plan.cake_kda_nondet_train_kcp_saved_bytes(
             ctx, H=H, with_conv=False, save_transfer=st, checkpoint_handoff=flag
         )
         for flag in (False, True)
@@ -347,8 +347,8 @@ def _run_rank_handoff(
     )
     # with a recompute handle (both tiers: "states" runs save_transfer=False, so a P > 1 backward re-walks K3)
     for keep in ("states", "transfer"):
-        _, recs_h_off = run("off", handle=cake_kcp.RecomputeHandleKcp(), keep=keep)
-        res_h, recs_h = run("on", handle=cake_kcp.RecomputeHandleKcp(), keep=keep)
+        _, recs_h_off = run("off", handle=cake_kcp.CakeKDANondetKcpRecomputeHandle(), keep=keep)
+        res_h, recs_h = run("on", handle=cake_kcp.CakeKDANondetKcpRecomputeHandle(), keep=keep)
         flags[f"handle_{keep}_bitwise"] = _same(res_h, base)
         flags[f"handle_{keep}_engaged"] = engaged(recs_h)
         flags[f"handle_{keep}_launches"] = skips(recs_h, recs_h_off)
@@ -491,9 +491,9 @@ def _run_rank_handoff(
         ("bound0_unverified", (0, frozenset())),
     ):
         with auto_rule(*rule) as reason:
-            before = cake_kcp.kcp_handoff_stats()
+            before = cake_kcp.cake_kda_nondet_train_kcp_handoff_stats()
             res_a, recs_a = run("auto")
-            after = cake_kcp.kcp_handoff_stats()
+            after = cake_kcp.cake_kda_nondet_train_kcp_handoff_stats()
         reasons[case] = reason
         delta = {n: after[n] - before[n] for n in after if after[n] != before[n]}
         if reason is None:
@@ -515,7 +515,7 @@ def _run_rank_handoff(
         wl = torch.ones_like(dout).requires_grad_(True)
 
         def top(q_, k_, v_, g_, b_, w_):
-            y = kcp_api.chunk_kda_kcp(
+            y = kcp_api.cake_kda_nondet_kcp(
                 q_,
                 k_,
                 v_,
@@ -528,10 +528,10 @@ def _run_rank_handoff(
             )
             return y * w_
 
-        before = kcp_api.kcp_handoff_stats()
+        before = kcp_api.cake_kda_nondet_train_kcp_handoff_stats()
         out = checkpoint(top, *lv, wl, use_reentrant=False)
         out.backward(dout)
-        after = kcp_api.kcp_handoff_stats()
+        after = kcp_api.cake_kda_nondet_train_kcp_handoff_stats()
         res = {"out": out.detach(), "dw": wl.grad}
         res.update(
             {
@@ -563,11 +563,11 @@ def _run_rank_handoff(
     for form, wsp in (
         ("per_call", None),
         ("caller_ws", ws),
-        ("fresh_ws", cake_kcp.WorkspaceKcp()),
+        ("fresh_ws", cake_kcp.CakeKDANondetKcpWorkspace()),
     ):
 
         def fn0(*a, _w=wsp):
-            return cake_kcp.chunk_kda_kcp(
+            return cake_kcp.cake_kda_nondet_kcp(
                 *a, ctx, workspace=_w, checkpoint_handoff="on", deterministic=False
             )
 
@@ -677,7 +677,7 @@ def test_handoff_static_rule_and_modes() -> None:
     )
     assert cake_kcp_plan.KCP_HANDOFF_VERIFIED == VERIFIED_KEYS
     assert cake_kcp_plan.KCP_HANDOFF_HEADS == AUTO_HEADS
-    assert cake_kcp_plan.KCP_HANDOFF_BUFFERS == cake_kcp.SavedKcp._TAPE
+    assert cake_kcp_plan.KCP_HANDOFF_BUFFERS == cake_kcp.CakeKDANondetKcpSaved._TAPE
     with pytest.raises(ValueError, match="checkpoint_handoff"):
         cake_kcp._handoff_mode("yes")
     opts = cake_kcp._options({})
@@ -758,7 +758,7 @@ def test_handoff_auto_decides_alike_on_every_rank(monkeypatch) -> None:
     for W, layout in layouts.items():
         part, _cu = _partition(lengths, W, layout)
         contexts[W] = [
-            cake_kcp_plan.build_context_kcp(part, None, r, "cpu", 4, sm_count=148)
+            cake_kcp_plan.cake_kda_nondet_train_kcp_build_context(part, None, r, "cpu", 4, sm_count=148)
             for r in range(W)
         ]
     for key in (("sm_103a", 152, "13.4"), ("sm_90a", 132, "13.4")):
@@ -944,12 +944,12 @@ def test_handoff_argument_refusals_record_nothing(monkeypatch) -> None:
         seen.clear()
         frames.clear()
         blocked.clear()
-        before = cake_kcp.kcp_handoff_stats()
+        before = cake_kcp.cake_kda_nondet_train_kcp_handoff_stats()
         x = torch.ones(4, requires_grad=True)
         with _PassThroughMode() if fwd_mode else contextlib.nullcontext():
             y = checkpoint(fn, x, use_reentrant=reentrant).sum()
         y.backward()
-        after = cake_kcp.kcp_handoff_stats()
+        after = cake_kcp.cake_kda_nondet_train_kcp_handoff_stats()
         delta = {n: after[n] - before[n] for n in after if after[n] != before[n]}
         return list(seen), delta, list(frames)
 
@@ -1033,9 +1033,9 @@ def test_host_values_kept_across_calls_are_exact() -> None:
     with pytest.raises(TypeError, match="unexpected keyword"):
         cake_kcp._options({"no_such_option": 1})
     cu = torch.tensor([0, 1000, 1700, 3000], dtype=torch.int64)
-    part = cake_kcp_plan.partition_kcp(cu, 2, layout="zigzag_per_document")
-    ctx = cake_kcp_plan.build_context_kcp(part, None, 0, "cpu", 4, sm_count=148)
-    tb = cake_kcp.WorkspaceKcp(local=False).tables(ctx, 4)
+    part = cake_kcp_plan.cake_kda_nondet_train_kcp_partition(cu, 2, layout="zigzag_per_document")
+    ctx = cake_kcp_plan.cake_kda_nondet_train_kcp_build_context(part, None, 0, "cpu", 4, sm_count=148)
+    tb = cake_kcp.CakeKDANondetKcpWorkspace(local=False).tables(ctx, 4)
     for backward in (True, False):
         lazy = cake_kcp_plan.LAZY_POOLS + (
             () if backward else cake_kcp_plan.FWD_LAZY_POOLS
@@ -1044,10 +1044,10 @@ def test_host_values_kept_across_calls_are_exact() -> None:
         for pair in cake_kcp_plan.SHARED_POOLS:
             top = max((want[m] for m in pair if m in want), default=0)
             want.update((m, top) for m in pair if m in want)
-        first = cake_kcp.WorkspaceKcp._pool_need(tb, backward)
+        first = cake_kcp.CakeKDANondetKcpWorkspace._pool_need(tb, backward)
         assert first == want
         first[next(iter(first))] = -1  # a caller's change stays its own
-        again = cake_kcp.WorkspaceKcp._pool_need(tb, backward)
+        again = cake_kcp.CakeKDANondetKcpWorkspace._pool_need(tb, backward)
         assert again == want and again is not first
     for S, N, H in ((3000, 3, 4), (1300, 2, 64)):
         plan = cake_kcp.cake_backend.plan(S, N, H, 148, "sm_100a")
@@ -1067,7 +1067,7 @@ def test_per_call_workspaces_share_one_identity_tile() -> None:
     eye = torch.eye(cake_kcp.D, dtype=torch.float32, device=device)
 
     def grown(shared: bool):
-        ws = cake_kcp.WorkspaceKcp(local=False)
+        ws = cake_kcp.CakeKDANondetKcpWorkspace(local=False)
         ws._shared_eye = shared
         assert ws._grow("eye", cake_kcp.TILE, device)
         return ws
@@ -1100,7 +1100,7 @@ def test_per_call_workspaces_share_one_identity_tile() -> None:
     if torch.cuda.device_count() > 1:
         other = torch.device("cuda", (device.index + 1) % torch.cuda.device_count())
         with torch.cuda.device(device):  # the current device stays the first one
-            ws = cake_kcp.WorkspaceKcp(local=False)
+            ws = cake_kcp.CakeKDANondetKcpWorkspace(local=False)
             ws._shared_eye = True
             assert ws._grow("eye", cake_kcp.TILE, other)
             far = ws.pool("eye")
@@ -1111,84 +1111,84 @@ def test_per_call_workspaces_share_one_identity_tile() -> None:
 
 
 def test_handoff_byte_queries_and_counters_are_public() -> None:
-    """The package root and the facade export ``kda_handoff_bytes_kcp`` and ``kcp_handoff_stats``; the facade's
-    ``kda_saved_bytes_kcp`` takes ``checkpoint_handoff`` (default ``False``, the light set), forwards it under
+    """The package root and the facade export ``cake_kda_nondet_train_kcp_handoff_bytes`` and ``cake_kda_nondet_train_kcp_handoff_stats``; the facade's
+    ``cake_kda_nondet_train_kcp_saved_bytes`` takes ``checkpoint_handoff`` (default ``False``, the light set), forwards it under
     ``deterministic=False`` and ignores it under ``deterministic=True`` (the deterministic package's figure); the
-    facade's ``kda_handoff_bytes_kcp`` is the package's under ``deterministic=False`` and ``0`` under ``True``.  The
+    facade's ``cake_kda_nondet_train_kcp_handoff_bytes`` is the package's under ``deterministic=False`` and ``0`` under ``True``.  The
     byte queries' ``checkpoint_handoff`` is the decision (a ``bool``): the entry's modes raise ``TypeError`` (in both
-    modes of the facade), as does a non-bool ``deterministic`` of ``kda_handoff_bytes_kcp``."""
+    modes of the facade), as does a non-bool ``deterministic`` of ``cake_kda_nondet_train_kcp_handoff_bytes``."""
     import importlib
     import inspect
 
-    package = importlib.import_module("flashinfer.experimental.cake_kda_train_kcp")
-    assert package.kda_handoff_bytes_kcp is cake_kcp_plan.kda_handoff_bytes_kcp
-    assert package.kcp_handoff_stats is cake_kcp.kcp_handoff_stats
-    for name in ("kda_handoff_bytes_kcp", "kcp_handoff_stats"):
+    package = importlib.import_module("flashinfer.experimental.cake.cake_kda_nondet_train_kcp")
+    assert package.cake_kda_nondet_train_kcp_handoff_bytes is cake_kcp_plan.cake_kda_nondet_train_kcp_handoff_bytes
+    assert package.cake_kda_nondet_train_kcp_handoff_stats is cake_kcp.cake_kda_nondet_train_kcp_handoff_stats
+    for name in ("cake_kda_nondet_train_kcp_handoff_bytes", "cake_kda_nondet_train_kcp_handoff_stats"):
         assert name in package.__all__ and name in kcp_api.__all__, name
-    p = inspect.signature(kcp_api.kda_saved_bytes_kcp).parameters["checkpoint_handoff"]
+    p = inspect.signature(kcp_api.cake_kda_nondet_train_kcp_saved_bytes).parameters["checkpoint_handoff"]
     assert p.kind is inspect.Parameter.KEYWORD_ONLY and p.default is False
-    p = inspect.signature(kcp_api.kda_handoff_bytes_kcp).parameters["deterministic"]
+    p = inspect.signature(kcp_api.cake_kda_nondet_train_kcp_handoff_bytes).parameters["deterministic"]
     assert p.kind is inspect.Parameter.KEYWORD_ONLY and p.default is True
-    stats = kcp_api.kcp_handoff_stats()
-    assert stats == cake_kcp.kcp_handoff_stats() and stats is not cake_kcp.HANDOFF_STATS
+    stats = kcp_api.cake_kda_nondet_train_kcp_handoff_stats()
+    assert stats == cake_kcp.cake_kda_nondet_train_kcp_handoff_stats() and stats is not cake_kcp.HANDOFF_STATS
     assert set(stats) == set(cake_kcp.HANDOFF_STATS)
     det_plan = importlib.import_module(
-        "flashinfer.experimental.cake_kda_det_train_kcp.cake_kcp_plan"
+        "flashinfer.experimental.cake.cake_kda_det_train_kcp.cake_kcp_plan"
     )
     cu = [0, 1000, 1700, 3000]
     for W in (1, 2, 4):
-        nd_part = kcp_api.partition_kcp(
+        nd_part = kcp_api.cake_kda_nondet_train_kcp_partition(
             cu, W, "zigzag_per_document", deterministic=False
         )
-        det_part = kcp_api.partition_kcp(cu, W, "zigzag_per_document")
+        det_part = kcp_api.cake_kda_nondet_train_kcp_partition(cu, W, "zigzag_per_document")
         for rank in range(W):
-            nd_ctx = kcp_api.build_context_kcp(
+            nd_ctx = kcp_api.cake_kda_nondet_train_kcp_build_context(
                 nd_part, None, rank, "cpu", sm_count=148, deterministic=False
             )
-            det_ctx = kcp_api.build_context_kcp(
+            det_ctx = kcp_api.cake_kda_nondet_train_kcp_build_context(
                 det_part, None, rank, "cpu", sm_count=148
             )
             for H in (4, 64):
-                hb = cake_kcp_plan.kda_handoff_bytes_kcp(nd_ctx, H=H)
+                hb = cake_kcp_plan.cake_kda_nondet_train_kcp_handoff_bytes(nd_ctx, H=H)
                 assert (
-                    kcp_api.kda_handoff_bytes_kcp(nd_ctx, H=H, deterministic=False)
+                    kcp_api.cake_kda_nondet_train_kcp_handoff_bytes(nd_ctx, H=H, deterministic=False)
                     == hb
                 )
-                assert kcp_api.kda_handoff_bytes_kcp(det_ctx, H=H) == 0
+                assert kcp_api.cake_kda_nondet_train_kcp_handoff_bytes(det_ctx, H=H) == 0
                 for handoff in (False, True):
-                    assert kcp_api.kda_saved_bytes_kcp(
+                    assert kcp_api.cake_kda_nondet_train_kcp_saved_bytes(
                         nd_ctx, H=H, checkpoint_handoff=handoff, deterministic=False
-                    ) == cake_kcp_plan.kda_saved_bytes_kcp(
+                    ) == cake_kcp_plan.cake_kda_nondet_train_kcp_saved_bytes(
                         nd_ctx, H=H, save_transfer=False, checkpoint_handoff=handoff
                     )
-                    assert kcp_api.kda_saved_bytes_kcp(
+                    assert kcp_api.cake_kda_nondet_train_kcp_saved_bytes(
                         det_ctx, H=H, checkpoint_handoff=handoff
-                    ) == det_plan.kda_det_saved_bytes_kcp(
+                    ) == det_plan.cake_kda_det_train_kcp_saved_bytes(
                         det_ctx, H=H, save_transfer=False
                     )
-                assert kcp_api.kda_saved_bytes_kcp(
+                assert kcp_api.cake_kda_nondet_train_kcp_saved_bytes(
                     nd_ctx, H=H, checkpoint_handoff=False, deterministic=False
-                ) == kcp_api.kda_saved_bytes_kcp(det_ctx, H=H)
+                ) == kcp_api.cake_kda_nondet_train_kcp_saved_bytes(det_ctx, H=H)
             for bad in ("auto", "on", "off", 1, None):
                 with pytest.raises(TypeError, match="checkpoint_handoff"):
-                    cake_kcp_plan.kda_saved_bytes_kcp(nd_ctx, checkpoint_handoff=bad)
+                    cake_kcp_plan.cake_kda_nondet_train_kcp_saved_bytes(nd_ctx, checkpoint_handoff=bad)
                 for det, ctx in ((False, nd_ctx), (True, det_ctx)):
                     with pytest.raises(TypeError, match="checkpoint_handoff"):
-                        kcp_api.kda_saved_bytes_kcp(
+                        kcp_api.cake_kda_nondet_train_kcp_saved_bytes(
                             ctx, checkpoint_handoff=bad, deterministic=det
                         )
             with pytest.raises(TypeError, match="deterministic"):
-                kcp_api.kda_handoff_bytes_kcp(nd_ctx, deterministic=1)
+                kcp_api.cake_kda_nondet_train_kcp_handoff_bytes(nd_ctx, deterministic=1)
 
 
 def test_facade_checkpoint_handoff_routing(monkeypatch) -> None:
-    """The facade's ``chunk_kda_kcp`` refuses a mode outside ``auto`` / ``on`` / ``off`` under both values of
+    """The facade's ``cake_kda_nondet_kcp`` refuses a mode outside ``auto`` / ``on`` / ``off`` under both values of
     ``deterministic`` before any work, forwards the mode to this package under ``deterministic=False`` and never
     passes it to the deterministic package."""
     import importlib
 
     det_kcp = importlib.import_module(
-        "flashinfer.experimental.cake_kda_det_train_kcp.cake_kcp"
+        "flashinfer.experimental.cake.cake_kda_det_train_kcp.cake_kcp"
     )
     seen: list = []
 
@@ -1199,26 +1199,26 @@ def test_facade_checkpoint_handoff_routing(monkeypatch) -> None:
 
         return fn
 
-    monkeypatch.setattr(cake_kcp, "chunk_kda_kcp", recorder("nd"))
-    monkeypatch.setattr(det_kcp, "chunk_kda_det_kcp", recorder("det"))
+    monkeypatch.setattr(cake_kcp, "cake_kda_nondet_kcp", recorder("nd"))
+    monkeypatch.setattr(det_kcp, "cake_kda_det_kcp", recorder("det"))
     t = torch.zeros(1)
     for det in (True, False):
         for bad in ("yes", None, True, "ON"):
             with pytest.raises(ValueError, match="checkpoint_handoff"):
-                kcp_api.chunk_kda_kcp(
+                kcp_api.cake_kda_nondet_kcp(
                     t, t, t, t, t, object(), checkpoint_handoff=bad, deterministic=det
                 )
     assert seen == []
     for mode in ("auto", "on", "off"):
         assert (
-            kcp_api.chunk_kda_kcp(
+            kcp_api.cake_kda_nondet_kcp(
                 t, t, t, t, t, object(), checkpoint_handoff=mode, deterministic=False
             )
             == "nd"
         )
         assert seen[-1][1]["checkpoint_handoff"] == mode
         assert (
-            kcp_api.chunk_kda_kcp(
+            kcp_api.cake_kda_nondet_kcp(
                 t, t, t, t, t, object(), checkpoint_handoff=mode, deterministic=True
             )
             == "det"
@@ -1245,9 +1245,9 @@ def test_saved_set_tape_members_round_trip() -> None:
         transfer_walk="bf16x3_hw64",
     )
     s_in, c1 = (torch.zeros(n) for n in (3, 5))
-    tape = {n: torch.zeros(i + 1) for i, n in enumerate(cake_kcp.SavedKcp._TAPE)}
-    light = cake_kcp.SavedKcp(S_in=s_in, c1_recv=c1, M_seg=None, ctx=None, **meta)
-    kept = cake_kcp.SavedKcp(
+    tape = {n: torch.zeros(i + 1) for i, n in enumerate(cake_kcp.CakeKDANondetKcpSaved._TAPE)}
+    light = cake_kcp.CakeKDANondetKcpSaved(S_in=s_in, c1_recv=c1, M_seg=None, ctx=None, **meta)
+    kept = cake_kcp.CakeKDANondetKcpSaved(
         S_in=s_in, c1_recv=c1, M_seg=None, ctx=None, **tape, **meta
     )
     assert light.tape is None and light.flags() == (True, False, False)
@@ -1255,7 +1255,7 @@ def test_saved_set_tape_members_round_trip() -> None:
     assert [t.numel() for t in kept.tensors()] == [3, 5, 1, 2, 3, 4, 5]
     assert kept.bytes - light.bytes == sum(t.numel() * 4 for t in tape.values())
     for saved in (light, kept):
-        back = cake_kcp.SavedKcp.from_tensors(
+        back = cake_kcp.CakeKDANondetKcpSaved.from_tensors(
             saved.tensors(), saved.flags(), saved.meta(), None
         )
         assert back.flags() == saved.flags() and back.meta() == saved.meta()
@@ -1263,24 +1263,24 @@ def test_saved_set_tape_members_round_trip() -> None:
         if saved.tape is not None:
             assert all(back.tape[n] is saved.tape[n] for n in saved.tape)
     with pytest.raises(ValueError, match="flags"):
-        cake_kcp.SavedKcp.from_tensors(light.tensors(), (True,), light.meta(), None)
+        cake_kcp.CakeKDANondetKcpSaved.from_tensors(light.tensors(), (True,), light.meta(), None)
 
 
 def test_handoff_bytes_query() -> None:
-    """``kda_handoff_bytes_kcp`` = ``NC_pad * H * 32768 + R * H * 768``; the hand-off's saved set adds it and drops
+    """``cake_kda_nondet_train_kcp_handoff_bytes`` = ``NC_pad * H * 32768 + R * H * 768``; the hand-off's saved set adds it and drops
     the carry plane."""
     cu = torch.tensor([0, 1000, 1700, 3000], dtype=torch.int64)
     for W in (1, 2, 4):
-        part = cake_kcp_plan.partition_kcp(cu, W, layout="zigzag_per_document")
+        part = cake_kcp_plan.cake_kda_nondet_train_kcp_partition(cu, W, layout="zigzag_per_document")
         for rank in range(W):
-            ctx = cake_kcp_plan.build_context_kcp(
+            ctx = cake_kcp_plan.cake_kda_nondet_train_kcp_build_context(
                 part, None, rank, "cpu", 4, sm_count=148
             )
             for H in (4, 64):
-                hb = cake_kcp_plan.kda_handoff_bytes_kcp(ctx, H=H)
+                hb = cake_kcp_plan.cake_kda_nondet_train_kcp_handoff_bytes(ctx, H=H)
                 assert hb == ctx.NC_pad * H * 32768 + ctx.R * H * 768
                 assert (
-                    cake_kcp_plan.kda_saved_bytes_kcp(ctx, H=H, checkpoint_handoff=True)
-                    == cake_kcp_plan.kda_saved_bytes_kcp(ctx, H=H, saved_carry=False)
+                    cake_kcp_plan.cake_kda_nondet_train_kcp_saved_bytes(ctx, H=H, checkpoint_handoff=True)
+                    == cake_kcp_plan.cake_kda_nondet_train_kcp_saved_bytes(ctx, H=H, saved_carry=False)
                     + hb
                 )

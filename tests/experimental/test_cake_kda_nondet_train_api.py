@@ -14,14 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 flashinfer public-API tests of the Cake packed KDA chunked training with a selectable numerical mode: the facade
-``flashinfer.cake_kda_train`` and the non-deterministic package ``flashinfer.experimental.cake.cake_kda_train``.
+``flashinfer.cake_kda_nondet_train`` and the non-deterministic package ``flashinfer.experimental.cake.cake_kda_nondet_train``.
 
 Every facade entry takes ``deterministic: bool = True``: ``True`` (the default) runs the deterministic package
 ``flashinfer.experimental.cake.cake_kda_det_train``, ``False`` the non-deterministic one, and torch's deterministic mode
 turns ``False`` into the deterministic package with one ``UserWarning`` per process.  On the CPU this suite covers the
 facade's marking, signatures and dispatch table (the package functions replaced by recorders), its refusal of a
 non-bool mode, the refusal of every mode but ``deterministic=False`` by the package entries, its autograd node
-``ChunkKDAFunction`` and its workspace ``KdaWorkspace`` (also under torch's
+``CakeKDANondetFunction`` and its workspace ``CakeKDANondetWorkspace`` (also under torch's
 deterministic mode, which they do not alert: the S1 schedule has no unordered reduction), the raw gate mode (#7816)
 on both packages (the facade forwards its keywords to the package of the call's mode, this package takes them with
 the deterministic package's checks, a workspace serves one gate mode, either backward reads either package's saved
@@ -53,7 +53,7 @@ import pytest
 import torch
 
 import flashinfer.cake_kda_det_train as det_api
-import flashinfer.cake_kda_train as facade
+import flashinfer.cake_kda_nondet_train as facade
 from flashinfer.api_logging import ExperimentalWarning
 from tests.test_helpers.cake_kda_det_train_reference import (
     LOWER_BOUND,
@@ -62,9 +62,9 @@ from tests.test_helpers.cake_kda_det_train_reference import (
 )
 from tests.test_helpers.cake_package import cake_package
 
-pkg = cake_package("cake.cake_kda_train")
-cake_backend = cake_package("cake.cake_kda_train", "cake_backend")
-cake_jit = cake_package("cake.cake_kda_train", "cake_jit")
+pkg = cake_package("cake.cake_kda_nondet_train")
+cake_backend = cake_package("cake.cake_kda_nondet_train", "cake_backend")
+cake_jit = cake_package("cake.cake_kda_nondet_train", "cake_jit")
 det_pkg = cake_package("cake.cake_kda_det_train")
 det_backend = cake_package("cake.cake_kda_det_train", "cake_backend")
 
@@ -72,24 +72,24 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 GRAD_ORDER = ("dq", "dk", "dv", "dbeta", "dg")  # the order the backward returns
 # facade entry -> its deterministic facade name (the shared spellings of flashinfer.kda_train)
 NAME_MAP = {
-    "chunk_kda_fwd": "cake_kda_det_train_forward",
-    "chunk_kda_bwd": "cake_kda_det_train_backward",
-    "chunk_kda": "cake_kda_det",
-    "kda_train_arena": "cake_kda_det_train_arena",
-    "kda_train_workspace": "cake_kda_det_train_workspace",
-    "kda_train_workspace_bytes": "cake_kda_det_train_workspace_bytes",
-    "kda_train_saved_bytes": "cake_kda_det_train_saved_bytes",
-    "is_kda_train_supported": "is_cake_kda_det_train_supported",
+    "cake_kda_nondet_train_forward": "cake_kda_det_train_forward",
+    "cake_kda_nondet_train_backward": "cake_kda_det_train_backward",
+    "cake_kda_nondet": "cake_kda_det",
+    "cake_kda_nondet_train_arena": "cake_kda_det_train_arena",
+    "cake_kda_nondet_train_workspace": "cake_kda_det_train_workspace",
+    "cake_kda_nondet_train_workspace_bytes": "cake_kda_det_train_workspace_bytes",
+    "cake_kda_nondet_train_saved_bytes": "cake_kda_det_train_saved_bytes",
+    "is_cake_kda_nondet_train_supported": "is_cake_kda_det_train_supported",
 }
-EXPERIMENTAL_ENTRIES = ("chunk_kda_fwd", "chunk_kda_bwd", "chunk_kda")
+EXPERIMENTAL_ENTRIES = ("cake_kda_nondet_train_forward", "cake_kda_nondet_train_backward", "cake_kda_nondet")
 # The backend function each facade entry hands off to: (deterministic backend attribute, this package's).
 TARGETS = {
-    "chunk_kda_fwd": ("cake_kda_det_train_forward", "chunk_kda_fwd"),
-    "chunk_kda_bwd": ("cake_kda_det_train_backward", "chunk_kda_bwd"),
-    "chunk_kda": ("cake_kda_det", "chunk_kda"),
-    "kda_train_workspace_bytes": ("workspace_bytes", "workspace_bytes"),
-    "kda_train_saved_bytes": ("saved_bytes", "saved_bytes"),
-    "is_kda_train_supported": ("is_supported", "is_supported"),
+    "cake_kda_nondet_train_forward": ("cake_kda_det_train_forward", "cake_kda_nondet_train_forward"),
+    "cake_kda_nondet_train_backward": ("cake_kda_det_train_backward", "cake_kda_nondet_train_backward"),
+    "cake_kda_nondet": ("cake_kda_det", "cake_kda_nondet"),
+    "cake_kda_nondet_train_workspace_bytes": ("workspace_bytes", "workspace_bytes"),
+    "cake_kda_nondet_train_saved_bytes": ("saved_bytes", "saved_bytes"),
+    "is_cake_kda_nondet_train_supported": ("is_supported", "is_supported"),
 }
 _FALLBACK = "runs the deterministic package"
 _ALERT = "does not have a deterministic implementation"
@@ -188,11 +188,11 @@ def test_facade_exports_and_marking() -> None:
 
 def test_signatures_mirror_the_deterministic_facade() -> None:
     """Each entry takes the parameters of its deterministic facade entry, in order, kinds and defaults the same, and
-    a keyword-only ``deterministic: bool = True`` after them; ``chunk_kda`` also takes the keyword-only
+    a keyword-only ``deterministic: bool = True`` after them; ``cake_kda_nondet`` also takes the keyword-only
     ``checkpoint_handoff="auto"`` (the non-deterministic package's checkpoint hand-off) before ``deterministic``."""
     for name, det_name in NAME_MAP.items():
         params = list(inspect.signature(getattr(facade, name)).parameters.values())
-        if name == "chunk_kda":
+        if name == "cake_kda_nondet":
             handoff = params.pop(-2)
             assert handoff.name == "checkpoint_handoff", name
             assert handoff.kind is inspect.Parameter.KEYWORD_ONLY, name
@@ -234,11 +234,11 @@ def _recorders(monkeypatch) -> list:
             monkeypatch.setattr(module, attr, record)
     for side, cls in (
         ("det", det_backend.CakeKDADetWorkspace),
-        ("nd", cake_backend.KdaWorkspace),
+        ("nd", cake_backend.CakeKDANondetWorkspace),
     ):
 
         def for_problem(*args, _side=side, **kwargs):
-            log.append(("kda_train_workspace", _side, kwargs))
+            log.append(("cake_kda_nondet_train_workspace", _side, kwargs))
             return _side
 
         monkeypatch.setattr(cls, "for_problem", for_problem)
@@ -253,17 +253,17 @@ def _call(name: str, deterministic=_OMIT):
     """One call of facade entry ``name`` on placeholder operands (the recorders never read them)."""
     operands = tuple(object() for _ in range(6))
     args = {
-        "chunk_kda_fwd": operands,
-        "chunk_kda_bwd": (*operands, object()),
-        "chunk_kda": operands,
-        "kda_train_arena": (),
-        "kda_train_workspace": (1, 1, 1, "cpu"),
-        "kda_train_workspace_bytes": (1, 1, 1),
-        "kda_train_saved_bytes": (1, 1),
-        "is_kda_train_supported": (),
+        "cake_kda_nondet_train_forward": operands,
+        "cake_kda_nondet_train_backward": (*operands, object()),
+        "cake_kda_nondet": operands,
+        "cake_kda_nondet_train_arena": (),
+        "cake_kda_nondet_train_workspace": (1, 1, 1, "cpu"),
+        "cake_kda_nondet_train_workspace_bytes": (1, 1, 1),
+        "cake_kda_nondet_train_saved_bytes": (1, 1),
+        "is_cake_kda_nondet_train_supported": (),
     }[name]
     kwargs = {} if deterministic is _OMIT else {"deterministic": deterministic}
-    if name == "kda_train_workspace_bytes":
+    if name == "cake_kda_nondet_train_workspace_bytes":
         kwargs["sm_count"] = 148
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ExperimentalWarning)
@@ -272,8 +272,8 @@ def _call(name: str, deterministic=_OMIT):
 
 def _side_of(name: str, result) -> str:
     """Which package served a call: the recorder's tag, or the arena option's type."""
-    if name == "kda_train_arena":
-        if isinstance(result, cake_backend.KdaArena):
+    if name == "cake_kda_nondet_train_arena":
+        if isinstance(result, cake_backend.CakeKDANondetArena):
             return "nd"
         assert isinstance(result, det_backend.CakeKDADetArena), type(result)
         return "det"
@@ -295,7 +295,7 @@ def test_facade_dispatch_table(name, monkeypatch) -> None:
         assert entry == name
         if side == "det":
             assert "deterministic" not in kwargs, kwargs
-        elif name in (*EXPERIMENTAL_ENTRIES, "kda_train_workspace"):
+        elif name in (*EXPERIMENTAL_ENTRIES, "cake_kda_nondet_train_workspace"):
             assert kwargs["deterministic"] is False, kwargs
     log.clear()
     for warn_only in (False, True):
@@ -338,24 +338,24 @@ def test_facade_routes_the_arena_option_to_the_package(monkeypatch) -> None:
     """An arena option of either package serves both: the call hands the routed package its own type with the same
     fields; the option factory returns the routed package's type."""
     log = _recorders(monkeypatch)
-    det_arena = facade.kda_train_arena(lean=True, tail_passes=2)
-    nd_arena = facade.kda_train_arena(lean=True, tail_passes=2, deterministic=False)
+    det_arena = facade.cake_kda_nondet_train_arena(lean=True, tail_passes=2)
+    nd_arena = facade.cake_kda_nondet_train_arena(lean=True, tail_passes=2, deterministic=False)
     assert isinstance(det_arena, det_backend.CakeKDADetArena)
-    assert isinstance(nd_arena, cake_backend.KdaArena)
+    assert isinstance(nd_arena, cake_backend.CakeKDANondetArena)
     assert det_arena == det_backend.CakeKDADetArena(lean=True, tail_passes=2)
-    assert nd_arena == cake_backend.KdaArena(lean=True, tail_passes=2)
+    assert nd_arena == cake_backend.CakeKDANondetArena(lean=True, tail_passes=2)
     operands = tuple(object() for _ in range(6))
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ExperimentalWarning)
         for arena in (det_arena, nd_arena):
-            facade.chunk_kda_fwd(*operands, arena=arena)
-            facade.chunk_kda_fwd(*operands, arena=arena, deterministic=False)
+            facade.cake_kda_nondet_train_forward(*operands, arena=arena)
+            facade.cake_kda_nondet_train_forward(*operands, arena=arena, deterministic=False)
     # the calls in order: each option to the deterministic package, then to this one
     sources = (det_arena, det_arena, nd_arena, nd_arena)
     assert [side for _entry, side, _kw in log] == ["det", "nd", "det", "nd"]
     for (_entry, side, kwargs), source in zip(log, sources, strict=True):
         got = kwargs["arena"]
-        own = det_backend.CakeKDADetArena if side == "det" else cake_backend.KdaArena
+        own = det_backend.CakeKDADetArena if side == "det" else cake_backend.CakeKDANondetArena
         assert isinstance(got, own), (side, type(got))
         assert dataclasses.astuple(got) == dataclasses.astuple(source)
         assert (got is source) is isinstance(source, own)
@@ -366,36 +366,36 @@ def test_byte_queries_are_the_packages_and_agree() -> None:
     # size (the layouts are the same; the S1 programs bind the deterministic forms' buffers).
     for S, N, H in ((1, 1, 1), (129, 2, 4), (4096, 3, 16), (261393, 4, 64)):
         for kwargs in ({}, {"backward": False}, {"save_mode": "tape"}):
-            nd = facade.kda_train_workspace_bytes(
+            nd = facade.cake_kda_nondet_train_workspace_bytes(
                 S, N, H, sm_count=148, deterministic=False, **kwargs
             )
             assert nd == cake_backend.workspace_bytes(S, N, H, sm_count=148, **kwargs)
-            assert nd == facade.kda_train_workspace_bytes(
+            assert nd == facade.cake_kda_nondet_train_workspace_bytes(
                 S, N, H, sm_count=148, **kwargs
             )
             assert nd == det_backend.workspace_bytes(S, N, H, sm_count=148, **kwargs)
         for kwargs in ({}, {"save_mode": "tape"}):
-            nd = facade.kda_train_saved_bytes(
+            nd = facade.cake_kda_nondet_train_saved_bytes(
                 S, H, N, sm_count=148, deterministic=False, **kwargs
             )
             assert nd == cake_backend.saved_bytes(S, H, N, sm_count=148, **kwargs)
             assert nd == det_backend.saved_bytes(S, H, N, sm_count=148, **kwargs)
-        assert facade.kda_train_saved_bytes(S, H, deterministic=False) == 256 * S * H
+        assert facade.cake_kda_nondet_train_saved_bytes(S, H, deterministic=False) == 256 * S * H
 
 
 def test_support_query_follows_the_capability_table() -> None:
     for deterministic in (True, False):
         if not torch.cuda.is_available():
-            assert facade.is_kda_train_supported(deterministic=deterministic) is False
+            assert facade.is_cake_kda_nondet_train_supported(deterministic=deterministic) is False
             continue
         index = torch.cuda.current_device()
         expected = (
             cake_jit.arch_for_capability(tuple(torch.cuda.get_device_capability(index)))
             is not None
         )
-        assert facade.is_kda_train_supported(deterministic=deterministic) is expected
+        assert facade.is_cake_kda_nondet_train_supported(deterministic=deterministic) is expected
         assert (
-            facade.is_kda_train_supported(index, deterministic=deterministic)
+            facade.is_cake_kda_nondet_train_supported(index, deterministic=deterministic)
             is expected
         )
 
@@ -405,19 +405,19 @@ import warnings
 
 import torch
 
-import flashinfer.cake_kda_train as facade
+import flashinfer.cake_kda_nondet_train as facade
 
 assert not torch.cuda.is_available()
 torch.use_deterministic_algorithms(True)
 caught = []
 for name, args in (
-    ("kda_train_saved_bytes", (1, 1)),
-    ("kda_train_workspace_bytes", (1, 1, 1)),
-    ("kda_train_saved_bytes", (64, 2)),
+    ("cake_kda_nondet_train_saved_bytes", (1, 1)),
+    ("cake_kda_nondet_train_workspace_bytes", (1, 1, 1)),
+    ("cake_kda_nondet_train_saved_bytes", (64, 2)),
 ):
     with warnings.catch_warnings(record=True) as rec:
         warnings.simplefilter("always")
-        kwargs = {"sm_count": 148} if name == "kda_train_workspace_bytes" else {}
+        kwargs = {"sm_count": 148} if name == "cake_kda_nondet_train_workspace_bytes" else {}
         getattr(facade, name)(*args, deterministic=False, **kwargs)
     caught += [w for w in rec if w.category is UserWarning]
 assert len(caught) == 1, [str(w.message) for w in caught]
@@ -436,10 +436,10 @@ def test_importing_the_facade_imports_neither_package() -> None:
     """The facade reaches both packages through deferred imports only."""
     code = (
         "import json, sys\n"
-        "import flashinfer.cake_kda_train\n"
+        "import flashinfer.cake_kda_nondet_train\n"
         "print(json.dumps(sorted(m for m in sys.modules"
         " if m.startswith('flashinfer.experimental.cake.cake_kda_det_train')"
-        " or m.startswith('flashinfer.experimental.cake.cake_kda_train'))))\n"
+        " or m.startswith('flashinfer.experimental.cake.cake_kda_nondet_train'))))\n"
     )
     assert json.loads(_run_cpu_subprocess(code)) == []
 
@@ -452,14 +452,14 @@ def test_importing_the_package_imports_no_deterministic_module() -> None:
         "import json, sys\n"
         "import flashinfer\n"
         "before = set(sys.modules)\n"
-        "import flashinfer.experimental.cake.cake_kda_train\n"
-        "from flashinfer.experimental.cake.cake_kda_train import cake_backend, cake_build, cake_jit\n"
+        "import flashinfer.experimental.cake.cake_kda_nondet_train\n"
+        "from flashinfer.experimental.cake.cake_kda_nondet_train import cake_backend, cake_build, cake_jit\n"
         "new = set(sys.modules) - before\n"
-        "assert 'flashinfer.experimental.cake.cake_kda_train.cake_backend' in new\n"
+        "assert 'flashinfer.experimental.cake.cake_kda_nondet_train.cake_backend' in new\n"
         "bad = sorted(m for m in sys.modules if 'cake_kda_det_train' in m"
         " or m == 'flashinfer.experimental.cake_kda_train'"
         " or m.startswith('flashinfer.experimental.cake_kda_train.')"
-        " or m in ('flashinfer.kda_train', 'flashinfer.cake_kda_train'))\n"
+        " or m in ('flashinfer.kda_train', 'flashinfer.cake_kda_nondet_train'))\n"
         "print(json.dumps(bad))\n"
     )
     assert json.loads(_run_cpu_subprocess(code)) == []
@@ -479,14 +479,14 @@ def _bad_operands():
 
 
 PACKAGE_CALLS = {
-    "chunk_kda_fwd": lambda **kw: cake_backend.chunk_kda_fwd(*_bad_operands(), **kw),
-    "chunk_kda_bwd": lambda **kw: cake_backend.chunk_kda_bwd(
+    "cake_kda_nondet_train_forward": lambda **kw: cake_backend.cake_kda_nondet_train_forward(*_bad_operands(), **kw),
+    "cake_kda_nondet_train_backward": lambda **kw: cake_backend.cake_kda_nondet_train_backward(
         *_bad_operands(), torch.zeros(4, 1, 128, dtype=torch.bfloat16), **kw
     ),
-    "chunk_kda": lambda **kw: cake_backend.chunk_kda(*_bad_operands(), **kw),
+    "cake_kda_nondet": lambda **kw: cake_backend.cake_kda_nondet(*_bad_operands(), **kw),
     # the autograd node: the mode is its trailing positional argument (omitted: the refused default), after the
     # checkpoint hand-off's (None: "auto")
-    "ChunkKDAFunction": lambda **kw: cake_backend.ChunkKDAFunction.apply(
+    "CakeKDANondetFunction": lambda **kw: cake_backend.CakeKDANondetFunction.apply(
         *_bad_operands(), cake_backend.SCALE, None, None, None, None, None, *kw.values()
     ),
 }
@@ -534,12 +534,12 @@ def test_package_entries_do_not_alert_under_torch_deterministic_mode(name) -> No
 def test_package_workspace_refuses_every_mode_but_false() -> None:
     """The workspace launches this package's programs: its constructor, ``for_problem`` and ``for_budget`` raise
     ``ValueError`` naming ``deterministic=False`` and the deterministic package unless ``deterministic=False`` (a
-    workspace whose import path alone was swapped from the deterministic package's ``KdaWorkspace`` fails instead
+    workspace whose import path alone was swapped from the deterministic package's ``CakeKDANondetWorkspace`` fails instead
     of handing a deterministic entry this package's pairs); the refusal comes before the device is read, under
     torch's deterministic mode too; with ``False`` the construction reaches its device check."""
     S, N, H = 129, 1, 4
     plan = cake_backend.plan(S, N, H, 148, "sm_100a")
-    ws_type = cake_backend.KdaWorkspace
+    ws_type = cake_backend.CakeKDANondetWorkspace
     calls = {
         "constructor": lambda **kw: ws_type(plan, "cpu", **kw),
         "for_problem": lambda **kw: ws_type.for_problem(S, N, H, "cpu", **kw),
@@ -562,7 +562,7 @@ def test_package_workspace_refuses_every_mode_but_false() -> None:
                 ):
                     call(**kwargs)
                 assert "cake_kda_det_train" in str(info.value), (name, kwargs)
-                assert str(info.value).startswith("KdaWorkspace"), (
+                assert str(info.value).startswith("CakeKDANondetWorkspace"), (
                     name,
                     str(info.value),
                 )
@@ -631,13 +631,13 @@ def test_package_accepts_the_raw_gate(name) -> None:
     ops, raw = _raw_cpu_call()
     dout = (
         (torch.zeros(4, 1, 128, dtype=torch.bfloat16),)
-        if name == "chunk_kda_bwd"
+        if name == "cake_kda_nondet_train_backward"
         else ()
     )
     g32 = (*ops[:3], torch.zeros(4, 1, 128), *ops[4:])
     # the arena option given: the backward reads no option from the stand-in workspace
-    stand_in = {"workspace": object(), "arena": cake_backend.KdaArena()}
-    with pytest.raises(TypeError, match="KdaWorkspace") as info:
+    stand_in = {"workspace": object(), "arena": cake_backend.CakeKDANondetArena()}
+    with pytest.raises(TypeError, match="CakeKDANondetWorkspace") as info:
         entry(*ops, *dout, deterministic=False, **stand_in, **raw)
     assert "deterministic=False" in str(info.value), name
     with pytest.raises(ValueError, match="is torch.bfloat16"):
@@ -651,23 +651,23 @@ def test_package_accepts_the_raw_gate(name) -> None:
 
 
 def test_autograd_node_takes_the_raw_gate_after_the_mode() -> None:
-    """``ChunkKDAFunction.apply`` takes the raw gate mode's arguments after ``deterministic`` (``use_gate_in_kernel``,
+    """``CakeKDANondetFunction.apply`` takes the raw gate mode's arguments after ``deterministic`` (``use_gate_in_kernel``,
     ``A_log``, ``dt_bias``, ``lower_bound``): a raw call on CPU tensors with a stand-in workspace passes the raw
     checks and reaches the workspace's type check, and an ``apply`` written for the deterministic Function's
     signature (the raw arguments right after ``doc_lengths``) passes a ``bool`` in the ``checkpoint_handoff`` slot
     and raises ``TypeError`` naming it."""
     ops, raw = _raw_cpu_call()
     scale = cake_backend.SCALE
-    with pytest.raises(TypeError, match="KdaWorkspace"):
-        cake_backend.ChunkKDAFunction.apply(
+    with pytest.raises(TypeError, match="CakeKDANondetWorkspace"):
+        cake_backend.CakeKDANondetFunction.apply(
             *ops, scale, object(), None, None, None, None, False, *raw.values()
         )
     with pytest.raises(TypeError, match="checkpoint_handoff"):
-        cake_backend.ChunkKDAFunction.apply(
+        cake_backend.CakeKDANondetFunction.apply(
             *ops, scale, None, None, None, None, *raw.values()
         )
     with pytest.raises(ValueError, match="use_gate_in_kernel must be a bool"):
-        cake_backend.ChunkKDAFunction.apply(
+        cake_backend.CakeKDANondetFunction.apply(
             *ops, scale, None, None, None, None, None, False, 1, *list(raw.values())[1:]
         )
 
@@ -686,7 +686,7 @@ def test_either_backward_reads_either_packages_saved_set_by_gate_mode() -> None:
         (cake_backend._check_saved_gate, cake_backend._GateParams(*params)),
         (det_backend._check_saved_gate, det_backend._GateParams(*params)),
     )
-    for saved_type in (cake_backend.KdaChunkSaved, det_backend.CakeKDADetChunkSaved):
+    for saved_type in (cake_backend.CakeKDANondetChunkSaved, det_backend.CakeKDADetChunkSaved):
         raw = saved_type(
             4, t, t, None, 1, H, 1, scale, qg=t, gate="raw", lower_bound=-5.0
         )
@@ -708,13 +708,13 @@ def test_either_backward_reads_either_packages_saved_set_by_gate_mode() -> None:
     l2n_raw = types.SimpleNamespace(gate="raw", lower_bound=-5.0, qk_l2norm=True)
     for saved in (l2n, l2n_raw):
         with pytest.raises(ValueError, match="v: expected 3-D"):
-            PACKAGE_CALLS["chunk_kda_bwd"](
+            PACKAGE_CALLS["cake_kda_nondet_train_backward"](
                 saved=saved, deterministic=False, use_qk_l2norm_in_kernel=True
             )
 
 
 def test_package_workspace_takes_the_gate_mode() -> None:
-    """``workspace_bytes`` and ``KdaWorkspace`` take the gate mode of the calls they serve (``"g"``, the default,
+    """``workspace_bytes`` and ``CakeKDANondetWorkspace`` take the gate mode of the calls they serve (``"g"``, the default,
     or ``"raw"``): the raw mode's bytes are the deterministic package's raw bytes on every architecture, forward or
     backward, any other value is a ``ValueError`` raised before the device is read, a known one reaches the device
     check, and a constructor whose ``gate`` is not its plan's is refused."""
@@ -730,7 +730,7 @@ def test_package_workspace_takes_the_gate_mode() -> None:
                 ) == det_backend.workspace_bytes(
                     S, N, h, sm_count=148, arch=arch, gate="raw", backward=backward
                 ), (arch, h, backward)
-    ws_type = cake_backend.KdaWorkspace
+    ws_type = cake_backend.CakeKDANondetWorkspace
     for gate in (None, "G", "activated"):
         with pytest.raises(ValueError, match="gate must be one of"):
             cake_backend.workspace_bytes(S, N, H, sm_count=148, gate=gate)
@@ -770,9 +770,9 @@ def test_facade_forwards_the_raw_gate(monkeypatch) -> None:
         "lower_bound": -5.0,
     }
     calls = {
-        "chunk_kda_fwd": lambda **kw: facade.chunk_kda_fwd(*operands, **kw),
-        "chunk_kda_bwd": lambda **kw: facade.chunk_kda_bwd(*operands, object(), **kw),
-        "chunk_kda": lambda **kw: facade.chunk_kda(*operands, **kw),
+        "cake_kda_nondet_train_forward": lambda **kw: facade.cake_kda_nondet_train_forward(*operands, **kw),
+        "cake_kda_nondet_train_backward": lambda **kw: facade.cake_kda_nondet_train_backward(*operands, object(), **kw),
+        "cake_kda_nondet": lambda **kw: facade.cake_kda_nondet(*operands, **kw),
     }
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -789,16 +789,16 @@ def test_facade_forwards_the_raw_gate(monkeypatch) -> None:
                 assert log[-1][2]["use_gate_in_kernel"] is True, name
         for mode, side in (({}, "det"), ({"deterministic": False}, "nd")):
             assert (
-                facade.kda_train_workspace(
+                facade.cake_kda_nondet_train_workspace(
                     1, 1, 1, "cpu", use_gate_in_kernel=True, **mode
                 )
                 == side
             )
             assert log[-1][2]["gate"] == "raw"
-            assert facade.kda_train_workspace(1, 1, 1, "cpu", **mode) == side
+            assert facade.cake_kda_nondet_train_workspace(1, 1, 1, "cpu", **mode) == side
             assert log[-1][2]["gate"] == "g"
             assert (
-                facade.kda_train_workspace_bytes(
+                facade.cake_kda_nondet_train_workspace_bytes(
                     1, 1, 1, sm_count=148, use_gate_in_kernel=True, **mode
                 )
                 == side
@@ -806,7 +806,7 @@ def test_facade_forwards_the_raw_gate(monkeypatch) -> None:
             assert log[-1][2]["gate"] == "raw"
         for bad in (1, None, "True"):
             with pytest.raises(ValueError, match="use_gate_in_kernel must be a bool"):
-                facade.kda_train_workspace_bytes(
+                facade.cake_kda_nondet_train_workspace_bytes(
                     1, 1, 1, sm_count=148, use_gate_in_kernel=bad
                 )
 
@@ -817,9 +817,9 @@ def test_facade_runs_the_raw_gate_on_the_non_deterministic_package() -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ExperimentalWarning)
         for name, args in (
-            ("chunk_kda_fwd", _bad_operands()),
-            ("chunk_kda_bwd", (*_bad_operands(), torch.zeros(4, 1, 128))),
-            ("chunk_kda", _bad_operands()),
+            ("cake_kda_nondet_train_forward", _bad_operands()),
+            ("cake_kda_nondet_train_backward", (*_bad_operands(), torch.zeros(4, 1, 128))),
+            ("cake_kda_nondet", _bad_operands()),
         ):
             with pytest.raises(ValueError, match="v: expected 3-D") as info:
                 getattr(facade, name)(
@@ -827,7 +827,7 @@ def test_facade_runs_the_raw_gate_on_the_non_deterministic_package() -> None:
                 )
             assert "cake_kda_det_train" not in str(info.value), name
         for backward in (True, False):
-            got = facade.kda_train_workspace_bytes(
+            got = facade.cake_kda_nondet_train_workspace_bytes(
                 129,
                 1,
                 4,
@@ -839,7 +839,7 @@ def test_facade_runs_the_raw_gate_on_the_non_deterministic_package() -> None:
             assert got == cake_backend.workspace_bytes(
                 129, 1, 4, sm_count=148, backward=backward, gate="raw"
             )
-            assert got == facade.kda_train_workspace_bytes(
+            assert got == facade.cake_kda_nondet_train_workspace_bytes(
                 129, 1, 4, sm_count=148, backward=backward, use_gate_in_kernel=True
             )
 
@@ -878,7 +878,7 @@ def test_either_packages_check_reads_either_packages_l2n_saved_set() -> None:
     rstd = torch.zeros(2, S, H, dtype=torch.float32)
     checks = (cake_backend._check_saved_l2n, det_backend._check_saved_l2n)
     passed = 0
-    for saved_type in (cake_backend.KdaChunkSaved, det_backend.CakeKDADetChunkSaved):
+    for saved_type in (cake_backend.CakeKDANondetChunkSaved, det_backend.CakeKDADetChunkSaved):
         on = _l2n_saved(saved_type, S, H, qk_rstd=rstd, qk_l2norm=True)
         off = _l2n_saved(saved_type, S, H)
         assert (off.qk_rstd, off.qk_l2norm) == (None, False)
@@ -916,9 +916,9 @@ def test_either_packages_check_reads_either_packages_l2n_saved_set() -> None:
     assert passed == 2 * 2 * 3
     # the entry: an l2n set reaches the host checks of a call with the flag
     with pytest.raises(ValueError, match="v: expected 3-D"):
-        PACKAGE_CALLS["chunk_kda_bwd"](
+        PACKAGE_CALLS["cake_kda_nondet_train_backward"](
             saved=_l2n_saved(
-                cake_backend.KdaChunkSaved, 4, 1, qk_rstd=rstd, qk_l2norm=True
+                cake_backend.CakeKDANondetChunkSaved, 4, 1, qk_rstd=rstd, qk_l2norm=True
             ),
             deterministic=False,
             use_qk_l2norm_in_kernel=True,
@@ -926,7 +926,7 @@ def test_either_packages_check_reads_either_packages_l2n_saved_set() -> None:
 
 
 def test_package_queries_take_the_in_kernel_qk_l2norm_layout() -> None:
-    """``workspace_bytes``, ``saved_bytes``, ``output_bytes`` and ``KdaWorkspace.for_problem`` take the
+    """``workspace_bytes``, ``saved_bytes``, ``output_bytes`` and ``CakeKDANondetWorkspace.for_problem`` take the
     deterministic package's ``l2n``: ``"off"`` gives the bytes of the omitted keyword, an l2n mode (``"fused"`` /
     ``"fallback"``, which runs the deterministic package's records in either gate mode) the deterministic package's
     bytes of that mode, and the saved set adds the reciprocal norms (``8 S H`` bytes); any other value is a
@@ -951,7 +951,7 @@ def test_package_queries_take_the_in_kernel_qk_l2norm_layout() -> None:
     for l2n in cake_backend.L2N_MODES:
         for gate in ("g", "raw"):
             if (gate, l2n) == ("g", "off"):
-                continue  # the S1 pairs' cells: test_cake_kda_train.py's byte tests
+                continue  # the S1 pairs' cells: test_cake_kda_nondet_train.py's byte tests
             for backward in (True, False):
                 for save_mode in ("light", "tape"):
                     kw = dict(
@@ -977,7 +977,7 @@ def test_package_queries_take_the_in_kernel_qk_l2norm_layout() -> None:
             if l2n != "off":
                 assert nd == det_backend.saved_bytes(S, H, N, **q, l2n=l2n)
         with pytest.raises(ValueError, match="CUDA devices"):
-            cake_backend.KdaWorkspace.for_problem(
+            cake_backend.CakeKDANondetWorkspace.for_problem(
                 S, N, H, "cpu", l2n=l2n, deterministic=False
             )
     assert compared == (3 * 2 - 1) * 2 * 2
@@ -987,7 +987,7 @@ def test_package_queries_take_the_in_kernel_qk_l2norm_layout() -> None:
         with pytest.raises(ValueError, match="l2n must be one of"):
             cake_backend.saved_bytes(S, H, N, sm_count=148, l2n=l2n)
         with pytest.raises(ValueError, match="l2n must be one of"):
-            cake_backend.KdaWorkspace.for_problem(
+            cake_backend.CakeKDANondetWorkspace.for_problem(
                 S, N, H, "cpu", l2n=l2n, deterministic=False
             )
 
@@ -999,18 +999,18 @@ def test_facade_forwards_the_in_kernel_qk_l2norm(monkeypatch) -> None:
     log = _recorders(monkeypatch)
     operands = tuple(object() for _ in range(6))
     calls = {
-        "chunk_kda_fwd": lambda **kw: facade.chunk_kda_fwd(*operands, **kw),
-        "chunk_kda_bwd": lambda **kw: facade.chunk_kda_bwd(*operands, object(), **kw),
-        "chunk_kda": lambda **kw: facade.chunk_kda(*operands, **kw),
+        "cake_kda_nondet_train_forward": lambda **kw: facade.cake_kda_nondet_train_forward(*operands, **kw),
+        "cake_kda_nondet_train_backward": lambda **kw: facade.cake_kda_nondet_train_backward(*operands, object(), **kw),
+        "cake_kda_nondet": lambda **kw: facade.cake_kda_nondet(*operands, **kw),
     }
     queries = {
-        "kda_train_workspace": lambda **kw: facade.kda_train_workspace(
+        "cake_kda_nondet_train_workspace": lambda **kw: facade.cake_kda_nondet_train_workspace(
             1, 1, 1, "cpu", **kw
         ),
-        "kda_train_workspace_bytes": lambda **kw: facade.kda_train_workspace_bytes(
+        "cake_kda_nondet_train_workspace_bytes": lambda **kw: facade.cake_kda_nondet_train_workspace_bytes(
             1, 1, 1, sm_count=148, **kw
         ),
-        "kda_train_saved_bytes": lambda **kw: facade.kda_train_saved_bytes(1, 1, **kw),
+        "cake_kda_nondet_train_saved_bytes": lambda **kw: facade.cake_kda_nondet_train_saved_bytes(1, 1, **kw),
     }
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -1045,40 +1045,40 @@ def test_facade_runs_the_in_kernel_qk_l2norm_on_the_non_deterministic_package() 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ExperimentalWarning)
         for name, args in (
-            ("chunk_kda_fwd", _bad_operands()),
-            ("chunk_kda_bwd", (*_bad_operands(), torch.zeros(4, 1, 128))),
-            ("chunk_kda", _bad_operands()),
+            ("cake_kda_nondet_train_forward", _bad_operands()),
+            ("cake_kda_nondet_train_backward", (*_bad_operands(), torch.zeros(4, 1, 128))),
+            ("cake_kda_nondet", _bad_operands()),
         ):
             with pytest.raises(ValueError, match="v: expected 3-D") as info:
                 getattr(facade, name)(*args, **on)
             assert "cake_kda_det_train" not in str(info.value), name
         for backward in (True, False):
-            got = facade.kda_train_workspace_bytes(
+            got = facade.cake_kda_nondet_train_workspace_bytes(
                 129, 1, 4, sm_count=148, backward=backward, **on
             )
             assert got == cake_backend.workspace_bytes(
                 129, 1, 4, sm_count=148, backward=backward, l2n="fused"
             )
-            assert got == facade.kda_train_workspace_bytes(
+            assert got == facade.cake_kda_nondet_train_workspace_bytes(
                 129, 1, 4, sm_count=148, backward=backward, use_qk_l2norm_in_kernel=True
             )
-        got = facade.kda_train_saved_bytes(129, 4, 1, sm_count=148, **on)
+        got = facade.cake_kda_nondet_train_saved_bytes(129, 4, 1, sm_count=148, **on)
         assert got == cake_backend.saved_bytes(129, 4, 1, sm_count=148, l2n="fused")
-        assert got == facade.kda_train_saved_bytes(
+        assert got == facade.cake_kda_nondet_train_saved_bytes(
             129, 4, 1, sm_count=148, use_qk_l2norm_in_kernel=True
         )
         with pytest.raises(ValueError, match="CUDA devices"):
-            facade.kda_train_workspace(129, 1, 4, "cpu", **on)
+            facade.cake_kda_nondet_train_workspace(129, 1, 4, "cpu", **on)
 
 
 def test_package_exports_the_det_free_names_only() -> None:
     for name in (
-        "chunk_kda",
-        "chunk_kda_bwd",
-        "chunk_kda_fwd",
-        "ChunkKDAFunction",
-        "KdaChunkSaved",
-        "KdaWorkspace",
+        "cake_kda_nondet",
+        "cake_kda_nondet_train_backward",
+        "cake_kda_nondet_train_forward",
+        "CakeKDANondetFunction",
+        "CakeKDANondetChunkSaved",
+        "CakeKDANondetWorkspace",
     ):
         assert name in pkg.__all__, name
         assert getattr(pkg, name) is getattr(cake_backend, name), name
@@ -1095,7 +1095,7 @@ def test_package_exports_the_det_free_names_only() -> None:
         "CakeKDADetArena",
     ):
         assert not hasattr(pkg, name) and not hasattr(cake_backend, name), name
-    assert pkg.__name__ == "flashinfer.experimental.cake.cake_kda_train"
+    assert pkg.__name__ == "flashinfer.experimental.cake.cake_kda_nondet_train"
     assert set(cake_jit.S1_RECORDS) == S1_RECORDS
 
 
@@ -1118,17 +1118,17 @@ def test_legacy_names_stay_deterministic() -> None:
         )
     assert legacy.DEFAULT_SCALE == facade.DEFAULT_SCALE
     for name, det_name in (
-        ("chunk_kda", "cake_kda_det"),
-        ("chunk_kda_fwd", "cake_kda_det_train_forward"),
-        ("chunk_kda_bwd", "cake_kda_det_train_backward"),
-        ("ChunkKDAFunction", "CakeKDADetFunction"),
-        ("KdaChunkSaved", "CakeKDADetChunkSaved"),
-        ("KdaWorkspace", "CakeKDADetWorkspace"),
+        ("cake_kda_nondet", "cake_kda_det"),
+        ("cake_kda_nondet_train_forward", "cake_kda_det_train_forward"),
+        ("cake_kda_nondet_train_backward", "cake_kda_det_train_backward"),
+        ("CakeKDANondetFunction", "CakeKDADetFunction"),
+        ("CakeKDANondetChunkSaved", "CakeKDADetChunkSaved"),
+        ("CakeKDANondetWorkspace", "CakeKDADetWorkspace"),
     ):
         assert getattr(legacy_pkg, det_name) is getattr(det_pkg, det_name), name
         assert getattr(legacy_pkg, det_name) is not getattr(pkg, name), name
     assert cake_package("cake.cake_kda_det_train") is det_pkg
-    assert cake_package("cake.cake_kda_train") is pkg
+    assert cake_package("cake.cake_kda_nondet_train") is pkg
     assert legacy_pkg is not pkg and det_pkg is not pkg
 
 
@@ -1447,10 +1447,10 @@ def test_public_entries_run_the_packages(shape) -> None:
     det_grads = det_backend.cake_kda_det_train_backward(
         q, k, v, g, beta, cu, dout, saved=det_saved, scale=facade.DEFAULT_SCALE
     )
-    nd_out, nd_saved = cake_backend.chunk_kda_fwd(
+    nd_out, nd_saved = cake_backend.cake_kda_nondet_train_forward(
         q, k, v, g, beta, cu, scale=facade.DEFAULT_SCALE, deterministic=False
     )
-    nd_grads = cake_backend.chunk_kda_bwd(
+    nd_grads = cake_backend.cake_kda_nondet_train_backward(
         q,
         k,
         v,
@@ -1470,27 +1470,27 @@ def test_public_entries_run_the_packages(shape) -> None:
             ({"deterministic": True}, det_out, det_grads),
             ({"deterministic": False}, nd_out, nd_grads),
         ):
-            ws = facade.kda_train_workspace(S, N, heads, device, **mode)
+            ws = facade.cake_kda_nondet_train_workspace(S, N, heads, device, **mode)
             own = (
-                cake_backend.KdaWorkspace
+                cake_backend.CakeKDANondetWorkspace
                 if mode.get("deterministic") is False
                 else det_backend.CakeKDADetWorkspace
             )
             assert type(ws) is own, mode
-            assert ws.bytes == facade.kda_train_workspace_bytes(S, N, heads, **mode)
+            assert ws.bytes == facade.cake_kda_nondet_train_workspace_bytes(S, N, heads, **mode)
             for workspace in (None, ws):
-                out, saved = facade.chunk_kda_fwd(
+                out, saved = facade.cake_kda_nondet_train_forward(
                     q, k, v, g, beta, cu, workspace=workspace, **mode
                 )
                 assert _bits_equal(out, out_want), mode
-                grads = facade.chunk_kda_bwd(
+                grads = facade.cake_kda_nondet_train_backward(
                     q, k, v, g, beta, cu, dout, saved=saved, workspace=workspace, **mode
                 )
                 assert _same(grads, grads_want), mode
             leaves = [
                 t.detach().clone().requires_grad_(True) for t in (q, k, v, g, beta)
             ]
-            o = facade.chunk_kda(*leaves, cu, **mode)
+            o = facade.cake_kda_nondet(*leaves, cu, **mode)
             assert _bits_equal(o, out_want), mode
             o.backward(dout)
             for leaf, want in zip(
@@ -1507,12 +1507,12 @@ def test_public_entries_run_the_packages(shape) -> None:
                 assert _bits_equal(leaf.grad, want), mode
         # a workspace serves its own package: a deterministic=True call refuses this package's, this package
         # refuses the deterministic one's
-        nd_ws = facade.kda_train_workspace(S, N, heads, device, deterministic=False)
-        det_ws = facade.kda_train_workspace(S, N, heads, device)
+        nd_ws = facade.cake_kda_nondet_train_workspace(S, N, heads, device, deterministic=False)
+        det_ws = facade.cake_kda_nondet_train_workspace(S, N, heads, device)
         with pytest.raises(TypeError, match="deterministic=False"):
-            facade.chunk_kda_fwd(q, k, v, g, beta, cu, workspace=nd_ws)
-        with pytest.raises(TypeError, match="KdaWorkspace"):
-            facade.chunk_kda_fwd(
+            facade.cake_kda_nondet_train_forward(q, k, v, g, beta, cu, workspace=nd_ws)
+        with pytest.raises(TypeError, match="CakeKDANondetWorkspace"):
+            facade.cake_kda_nondet_train_forward(
                 q, k, v, g, beta, cu, workspace=det_ws, deterministic=False
             )
 
@@ -1532,7 +1532,7 @@ def test_torch_deterministic_mode_runs_the_deterministic_package(monkeypatch) ->
     )
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ExperimentalWarning)
-        nd_ws = facade.kda_train_workspace(
+        nd_ws = facade.cake_kda_nondet_train_workspace(
             sum(lengths), len(lengths), heads, device, deterministic=False
         )
     monkeypatch.setattr(facade, "_DET_FALLBACK_WARNED", False)
@@ -1543,11 +1543,11 @@ def test_torch_deterministic_mode_runs_the_deterministic_package(monkeypatch) ->
         ):
             warnings.simplefilter("always")
             for workspace in (None, nd_ws):
-                out, saved = facade.chunk_kda_fwd(
+                out, saved = facade.cake_kda_nondet_train_forward(
                     q, k, v, g, beta, cu, workspace=workspace, deterministic=False
                 )
                 assert type(saved) is det_backend.CakeKDADetChunkSaved
-                grads = facade.chunk_kda_bwd(
+                grads = facade.cake_kda_nondet_train_backward(
                     q,
                     k,
                     v,
@@ -1565,7 +1565,7 @@ def test_torch_deterministic_mode_runs_the_deterministic_package(monkeypatch) ->
             leaves = [
                 t.detach().clone().requires_grad_(True) for t in (q, k, v, g, beta)
             ]
-            o = facade.chunk_kda(*leaves, cu, deterministic=False)
+            o = facade.cake_kda_nondet(*leaves, cu, deterministic=False)
             assert o.grad_fn._forward_cls is det_backend.CakeKDADetFunction
             o.backward(dout)
             for leaf, want in zip(
@@ -1596,7 +1596,7 @@ def test_autograd_records_the_forward_mode() -> None:
     q, k, v, g, beta, cu, dout = _operands(inputs)
     want = {}
     for mode, fwd, bwd in (
-        (False, cake_backend.chunk_kda_fwd, cake_backend.chunk_kda_bwd),
+        (False, cake_backend.cake_kda_nondet_train_forward, cake_backend.cake_kda_nondet_train_backward),
         (
             True,
             det_backend.cake_kda_det_train_forward,
@@ -1611,13 +1611,13 @@ def test_autograd_records_the_forward_mode() -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ExperimentalWarning)
         for mode, node in (
-            (False, cake_backend.ChunkKDAFunction),
+            (False, cake_backend.CakeKDANondetFunction),
             (True, det_backend.CakeKDADetFunction),
         ):
             leaves = [
                 t.detach().clone().requires_grad_(True) for t in (q, k, v, g, beta)
             ]
-            o = facade.chunk_kda(*leaves, cu, deterministic=mode)
+            o = facade.cake_kda_nondet(*leaves, cu, deterministic=mode)
             assert o.grad_fn._forward_cls is node, mode
             with (
                 _TorchDeterministic(warn_only=True),
@@ -1641,7 +1641,7 @@ def test_the_backward_reads_a_saved_set_of_either_package() -> None:
     q, k, v, g, beta, cu, dout = _operands(make_inputs(lengths, heads, device))
     scale = facade.DEFAULT_SCALE
     for save_mode in (None, "tape"):
-        nd_out, nd_saved = cake_backend.chunk_kda_fwd(
+        nd_out, nd_saved = cake_backend.cake_kda_nondet_train_forward(
             q, k, v, g, beta, cu, scale=scale, save_mode=save_mode, deterministic=False
         )
         det_out, det_saved = det_backend.cake_kda_det_train_forward(
@@ -1654,10 +1654,10 @@ def test_the_backward_reads_a_saved_set_of_either_package() -> None:
         for name in ("qg", "w", "u", "h", "v_new", "seg_m", "hseg", "seg_state"):
             a, b = getattr(nd_saved, name), getattr(det_saved, name)
             assert (a is None) == (b is None), (save_mode, name)
-        own = cake_backend.chunk_kda_bwd(
+        own = cake_backend.cake_kda_nondet_train_backward(
             q, k, v, g, beta, cu, dout, saved=nd_saved, scale=scale, deterministic=False
         )
-        other = cake_backend.chunk_kda_bwd(
+        other = cake_backend.cake_kda_nondet_train_backward(
             q,
             k,
             v,
@@ -1699,20 +1699,20 @@ def test_public_entries_run_the_raw_gate_on_both_packages() -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ExperimentalWarning)
         for det in (True, False):
-            ws = facade.kda_train_workspace(
+            ws = facade.cake_kda_nondet_train_workspace(
                 S, N, heads, device, use_gate_in_kernel=True, deterministic=det
             )
             assert ws.gate == "raw", det
-            assert ws.bytes == facade.kda_train_workspace_bytes(
+            assert ws.bytes == facade.cake_kda_nondet_train_workspace_bytes(
                 S, N, heads, use_gate_in_kernel=True, deterministic=det
             )
             runs = []
             for workspace in (None, ws):
-                out, saved = facade.chunk_kda_fwd(
+                out, saved = facade.cake_kda_nondet_train_forward(
                     q, k, v, raw, beta, cu, workspace=workspace, deterministic=det, **kw
                 )
                 assert saved.gate == "raw", det
-                grads = facade.chunk_kda_bwd(
+                grads = facade.cake_kda_nondet_train_backward(
                     q,
                     k,
                     v,
@@ -1731,7 +1731,7 @@ def test_public_entries_run_the_raw_gate_on_both_packages() -> None:
                 t.detach().clone().requires_grad_(True)
                 for t in (q, k, v, raw, beta, inputs["A_log"], inputs["dt_bias"])
             ]
-            o = facade.chunk_kda(
+            o = facade.cake_kda_nondet(
                 *leaves[:5],
                 cu,
                 use_gate_in_kernel=True,
@@ -1744,9 +1744,9 @@ def test_public_entries_run_the_raw_gate_on_both_packages() -> None:
             # the leaves' order (q, k, v, raw, beta, A_log, dt_bias) -> the backward's
             gr = [leaf.grad for leaf in leaves]
             runs.append((o.detach(), (gr[0], gr[1], gr[2], gr[4], gr[3], gr[5], gr[6])))
-            g_ws = facade.kda_train_workspace(S, N, heads, device, deterministic=det)
+            g_ws = facade.cake_kda_nondet_train_workspace(S, N, heads, device, deterministic=det)
             with pytest.raises(ValueError, match="gate mode"):
-                facade.chunk_kda_fwd(
+                facade.cake_kda_nondet_train_forward(
                     q, k, v, raw, beta, cu, workspace=g_ws, deterministic=det, **kw
                 )
             results[det] = runs
