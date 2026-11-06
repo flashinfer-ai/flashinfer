@@ -13,10 +13,10 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Multi-GPU rows of the non-deterministic ``cake_causal_conv1d_multi_kcp(..., deterministic=False)`` (the q / k / v
-convolutions of a layer with one halo exchange per direction) on the deterministic multi suite's partitions, W = 2 /
-4 / 8 over NCCL, plus W = 16 rows (``-k w16``) on zigzag and per-document zigzag partitions (eager, and graph replay
-on the per-document one).  Per row and rank, for every tensor:
+Multi-GPU rows of the non-deterministic ``cake_causal_conv1d_nondet_kcp_multi`` (the q / k / v convolutions of a
+layer with one halo exchange per direction) on the deterministic multi suite's partitions, W = 2 / 4 / 8 over NCCL,
+plus W = 16 rows (``-k w16``) on zigzag and per-document zigzag partitions (eager, and graph replay on the
+per-document one).  Per row and rank, for every tensor:
 
 - ``y`` and ``dx`` are bitwise the non-deterministic single calls' and the deterministic multi call's; ``y`` is also
   bitwise the single-rank zero-history convolution; each ``dweight`` partial is within the package budget of the
@@ -62,7 +62,6 @@ from tests.test_cake_causal_conv1d_det_train_kcp_multi_dist import (
 from tests.test_helpers.kcp_collective_shims import CollectiveCounter, RecomputePhase
 
 DW_ATOL, DW_RTOL = 5e-2, 1e-4
-NONDET = {"deterministic": False}
 # W = 16 (16-way context parallelism) on the deterministic rows' packs, for the layouts any world size partitions;
 # the per-document zigzag row also runs under graph replay.
 ROWS_W16 = [
@@ -122,8 +121,8 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir, local_id: int) -> d
 
     from flashinfer import cake_causal_conv1d_det_train as conv
     from flashinfer import cake_causal_conv1d_det_train_kcp as det_api
-    from flashinfer import cake_causal_conv1d_train_kcp as kcp_api
-    from flashinfer.experimental.cake.cake_causal_conv1d_train_backend import (
+    from flashinfer import cake_causal_conv1d_nondet_train_kcp as kcp_api
+    from flashinfer.experimental.cake.cake_causal_conv1d_nondet_train import (
         kcp as conv_kcp,
     )
 
@@ -143,11 +142,11 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir, local_id: int) -> d
             if det:
                 return det_api.cake_causal_conv1d_det_multi_kcp(a_x, a_w, ctx)
             if multi:
-                return kcp_api.cake_causal_conv1d_multi_kcp(
-                    a_x, a_w, ctx, recompute_handle=a_h[0], **NONDET
+                return kcp_api.cake_causal_conv1d_nondet_kcp_multi(
+                    a_x, a_w, ctx, recompute_handle=a_h[0]
                 )
             return tuple(
-                kcp_api.cake_causal_conv1d_kcp(x, w, ctx, recompute_handle=h, **NONDET)
+                kcp_api.cake_causal_conv1d_nondet_kcp(x, w, ctx, recompute_handle=h)
                 for x, w, h in zip(a_x, a_w, a_h, strict=True)
             )
 
@@ -175,7 +174,7 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir, local_id: int) -> d
 
                 def outer(*args):
                     hh = (
-                        [conv_kcp.RecomputeHandleKcp()]
+                        [conv_kcp.CakeCausalConv1dNondetKcpRecomputeHandle()]
                         if mode == "nested_in"
                         else list(args[2 * n :])
                     )
@@ -212,14 +211,25 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir, local_id: int) -> d
     s_direct, cs_direct = run(False, "direct")
     m_direct, cm_direct = run(True, "direct")
     m_plain, cm_plain = run(True, "ckpt")
-    m_handle, cm_handle = run(True, "ckpt", [conv_kcp.RecomputeHandleKcp()])
+    m_handle, cm_handle = run(
+        True, "ckpt", [conv_kcp.CakeCausalConv1dNondetKcpRecomputeHandle()]
+    )
     m_plain_re, _ = run(True, "ckpt", reentrant=True)
     m_handle_re, cm_handle_re = run(
-        True, "ckpt", [conv_kcp.RecomputeHandleKcp()], reentrant=True
+        True,
+        "ckpt",
+        [conv_kcp.CakeCausalConv1dNondetKcpRecomputeHandle()],
+        reentrant=True,
     )
-    m_twice, cm_twice = run(True, "ckpt", [conv_kcp.RecomputeHandleKcp()], twice=True)
-    m_nest_out, cm_nest_out = run(True, "nested_out", [conv_kcp.RecomputeHandleKcp()])
-    m_nest_in, cm_nest_in = run(True, "nested_in", [conv_kcp.RecomputeHandleKcp()])
+    m_twice, cm_twice = run(
+        True, "ckpt", [conv_kcp.CakeCausalConv1dNondetKcpRecomputeHandle()], twice=True
+    )
+    m_nest_out, cm_nest_out = run(
+        True, "nested_out", [conv_kcp.CakeCausalConv1dNondetKcpRecomputeHandle()]
+    )
+    m_nest_in, cm_nest_in = run(
+        True, "nested_in", [conv_kcp.CakeCausalConv1dNondetKcpRecomputeHandle()]
+    )
     info["counts"] = {
         "single_direct": cs_direct, "multi_direct": cm_direct, "multi_plain": cm_plain, "multi_handle": cm_handle,
         "multi_handle_reentrant": cm_handle_re, "multi_twice": cm_twice, "nested_out": cm_nest_out,
@@ -299,25 +309,27 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir, local_id: int) -> d
 def _run_rank_graph(
     rank: int, W: int, row, port: int, result_dir, local_id: int
 ) -> dict:
-    from flashinfer.experimental.cake.cake_causal_conv1d_train_backend import (
+    from flashinfer.experimental.cake.cake_causal_conv1d_nondet_train import (
         kcp as conv_kcp,
     )
 
     device, part, cu, ctx, xs_all, xs, ws, dys = _setup(rank, W, row, port, local_id)
     ref = []
     for x, w, dy in zip(xs, ws, dys, strict=True):
-        y, hist = conv_kcp.cake_causal_conv1d_forward_kcp(x, w, ctx, **NONDET)
-        dx, dw = conv_kcp.cake_causal_conv1d_backward_kcp(x, w, ctx, dy, hist, **NONDET)
+        y, hist = conv_kcp.cake_causal_conv1d_nondet_train_kcp_forward(x, w, ctx)
+        dx, dw = conv_kcp.cake_causal_conv1d_nondet_train_kcp_backward(
+            x, w, ctx, dy, hist
+        )
         ref.append((y, hist, dx, dw))
     events, ok, worst = [], True, 0.0
     try:
         for _ in range(4):
-            ys, hists = conv_kcp.cake_causal_conv1d_multi_forward_kcp(
-                xs, ws, ctx, graph="replay", **NONDET
+            ys, hists = conv_kcp.cake_causal_conv1d_nondet_train_kcp_multi_forward(
+                xs, ws, ctx, graph="replay"
             )
             events.append(conv_kcp.LAST_CALL["fwd_multi"]["graph_event"])
-            dxs, dws = conv_kcp.cake_causal_conv1d_multi_backward_kcp(
-                xs, ws, ctx, dys, hists, graph="replay", **NONDET
+            dxs, dws = conv_kcp.cake_causal_conv1d_nondet_train_kcp_multi_backward(
+                xs, ws, ctx, dys, hists, graph="replay"
             )
             events.append(conv_kcp.LAST_CALL["bwd_multi"]["graph_event"])
             torch.cuda.synchronize(device)
@@ -331,7 +343,7 @@ def _run_rank_graph(
                 worst = max(worst, _ratio(dws[i], dw))
     finally:
         torch.cuda.synchronize(device)
-        conv_kcp.graph_cache_clear()
+        conv_kcp.cake_causal_conv1d_nondet_train_kcp_graph_cache_clear()
     if int(xs[0].shape[0]) == 0:
         expected = ["eager"] * 8
     elif int(ctx.halo.n_hist_rows) == 0:
@@ -372,11 +384,11 @@ def _spawn_entry(
 def _supported() -> bool:
     if not torch.cuda.is_available():
         return False
-    from flashinfer.experimental.cake.cake_causal_conv1d_train_backend import (
-        is_cake_causal_conv1d_train_supported,
+    from flashinfer.experimental.cake.cake_causal_conv1d_nondet_train import (
+        is_cake_causal_conv1d_nondet_train_supported,
     )
 
-    return is_cake_causal_conv1d_train_supported(torch.device("cuda"))
+    return is_cake_causal_conv1d_nondet_train_supported(torch.device("cuda"))
 
 
 def _launch(row, graph: bool) -> None:

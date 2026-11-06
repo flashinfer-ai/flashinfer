@@ -1549,7 +1549,7 @@ def load_cake_batch_deepgemm_fp8_module(name: str):
 # ``CTA = B * ceil(expected_m / 128)`` is the band coordinate of the masked
 # BLOCK_N family.
 #
-#   point     (B, M, N, K) in points [and expected_m == em]
+#   point     (B, M, N, K) in points [and expected_m == em] [and expected_m >= em_min]
 #   band      (N, K) == nk, (B, M) not in the family's exclusions for the
 #             architecture, B <= the family's B bound when it has one, and
 #             CTA inside one of the row's inclusive intervals (None = open), and
@@ -1627,10 +1627,13 @@ def _point(
     *,
     parent: str | None = None,
     workspaces: str | None = None,
+    em_min: int | None = None,
 ) -> _Route:
-    """Exact (B, M, N, K) points, optionally pinned to one ``expected_m``."""
+    """Exact (B, M, N, K) points, optionally pinned to one ``expected_m`` or bounded below by ``em_min``."""
     arches = (arches,) if isinstance(arches, str) else tuple(arches)
-    where = {"points": tuple(points), "expected_m": expected_m}
+    where: dict[str, Any] = {"points": tuple(points), "expected_m": expected_m}
+    if em_min is not None:
+        where["em_min"] = em_min
     return _Route(
         arches, route, parent or route, "point", where, tuple(stages), workspaces
     )
@@ -1932,6 +1935,11 @@ _ROUTES: tuple[_Route, ...] = (
            ((64, 128, 7168, 2048),), None,
            (("cake_batch_deepgemm_fp8_abae21f2baf86ce43ebc", "masked_bn", 128, 128),),
            parent="seed_swap_bm"),
+    # The B=1, M=8192, N=4096, K=7168 point from expected_m 5890 on: the BLOCK_M 192 build.
+    _point("sm_103a", "seed_swap_bm__bm192",
+           ((1, 8192, 4096, 7168),), None,
+           (("cake_batch_deepgemm_fp8_802de3de969a71fa24ba", "masked_bn", 128, 128),),
+           parent="seed_swap_bm", em_min=5890),
     _point("sm_103a", "seed_swap_bm",
            ((1, 8192, 4096, 7168), (8, 128, 4096, 7168), (8, 256, 7168, 2048),
             (64, 256, 4096, 7168), (64, 256, 7168, 2048)), None,
@@ -2233,8 +2241,10 @@ def _matches(
 ) -> bool:
     where = row.where
     if row.form == "point":
-        return (B, M, N, K) in where["points"] and (
-            where["expected_m"] is None or expected_m == where["expected_m"]
+        return (
+            (B, M, N, K) in where["points"]
+            and (where["expected_m"] is None or expected_m == where["expected_m"])
+            and ("em_min" not in where or expected_m >= where["em_min"])
         )
     if row.form == "band":
         nk = where["nk"]
