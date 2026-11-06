@@ -20,8 +20,8 @@ and reach its host-side checks on its own: under another top-level name, in a
 ``python -I`` subprocess with ``flashinfer`` blocked (the form of a vendoring
 gate, ``scripts/check_cake_build_manifests.py --vendored-gate``).  The package
 imports only itself, ``torch`` and ``tvm_ffi`` (#6553 rule 1: nothing of the
-deterministic package or the rest of FlashInfer); the experimental marking and
-the environment switches belong to the public entry points
+deterministic package or the rest of FlashInfer); the environment switches
+belong to the stable public entry points
 ``flashinfer.cake_lm_head_nondet_train.cake_lm_head_nondet_train_loss`` /
 ``cake_lm_head_nondet_train_logprob`` (covered by
 ``test_cake_lm_head_nondet_train_api.py``), so a direct call of the package emits
@@ -107,6 +107,14 @@ cake_jit = importlib.import_module(PKG_NAME + ".cake_jit")
 cake_build = importlib.import_module(PKG_NAME + ".cake_build")
 for name in cake_build.__all__:
     getattr(cake_build, name)
+support = importlib.import_module(PKG_NAME + ".cake_support")
+for name in support.__all__:
+    getattr(support, name)
+assert {
+    "CakeLMHeadNondetSupportFunction",
+    "cake_lm_head_nondet_train_support_logprob",
+    "cake_lm_head_nondet_train_support_kl",
+}.issubset(support.__all__), support.__all__
 
 # The backend's public surface: its ``__all__`` when it defines one, else every
 # public callable the module itself defines.  Resolving each name imports
@@ -221,11 +229,12 @@ print("OK")
 def test_vendored_copy_imports_with_flashinfer_blocked(tmp_path):
     """A copy of the package under another top-level name imports in a ``python -I``
     subprocess with ``flashinfer`` blocked (meta-path finder plus
-    ``sys.modules["flashinfer"] = None``), resolves the backend's public names and
-    the loader's ``__all__``, raises the host-side ``ValueError`` of twelve entry
-    point calls on CPU operands (the temperature checks among them) without
-    emitting a warning of any kind, refuses a ``deterministic`` keyword with
-    ``TypeError``, and loads no ``flashinfer`` module."""
+    ``sys.modules["flashinfer"] = None``), resolves the public names of the backend
+    and ``cake_support`` and the loader's ``__all__``, raises the host-side
+    ``ValueError`` of twelve entry point calls on CPU operands (the temperature
+    checks among them) without emitting a warning of any kind, refuses a
+    ``deterministic`` keyword with ``TypeError``, and loads no ``flashinfer``
+    module."""
     root = tmp_path / "site"
     shutil.copytree(
         PACKAGE_DIR,
