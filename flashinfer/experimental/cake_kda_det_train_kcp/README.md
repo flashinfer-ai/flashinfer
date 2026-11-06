@@ -11,39 +11,6 @@ Both the API and the backend are experimental: no compatibility guarantee.
 The path is deterministic: the same inputs, hardware, plan and process group
 give bitwise the same outputs and gradients.
 
-### Names
-
-The names before the det rename stay bound to the same objects:
-`flashinfer.kda_train` (`chunk_kda_kcp`, `chunk_kda_kcp_fwd`,
-`chunk_kda_kcp_bwd`, `kcp_partition`, `build_kcp_context`,
-`kcp_workspace_bytes`, `kcp_saved_bytes`, `kcp_comm_bytes`,
-`KcpRecomputeHandle`, `KcpContext`, `KcpPartition`, `KcpOptions`,
-`KcpSaved`, `KcpWorkspace`, `kcp_reduce_gate_param_grads`), the modules
-`flashinfer.experimental.cake_kda_train.cake_kcp` / `cake_kcp_plan` /
-`cake_kcp_jit` (the same module objects) and the previous names inside
-`cake_kcp` and `cake_kcp_plan`.
-
-| previous name | det name |
-|---|---|
-| `chunk_kda_kcp_fwd` | `chunk_kda_det_fwd_kcp` |
-| `chunk_kda_kcp_bwd` | `chunk_kda_det_bwd_kcp` |
-| `chunk_kda_kcp` | `chunk_kda_det_kcp` |
-| `kcp_partition` | `partition_det_kcp` |
-| `build_kcp_context` | `build_context_det_kcp` |
-| `kcp_workspace_bytes` | `kda_det_workspace_bytes_kcp` |
-| `kcp_saved_bytes` | `kda_det_saved_bytes_kcp` |
-| `kcp_comm_bytes` | `kda_det_comm_bytes_kcp` |
-| `kcp_reduce_gate_param_grads` | `reduce_gate_param_grads_det_kcp` |
-| `KcpRecomputeHandle` | `RecomputeHandleDetKcp` |
-| `KcpWorkspace` | `WorkspaceDetKcp` |
-| `KcpSaved` | `SavedDetKcp` |
-| `KcpOptions` | `OptionsDetKcp` |
-| `KcpCall` | `CallDetKcp` |
-| `KcpContext` | `ContextDetKcp` |
-| `KcpPartition` | `PartitionDetKcp` |
-| `KcpFragment` | `FragmentDetKcp` |
-| `ChunkKDAKcpFunction` | `ChunkKDADetFunctionKcp` |
-
 ## Usage
 
 The packed batch of one training step may be split over the ranks of a
