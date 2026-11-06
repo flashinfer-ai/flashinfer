@@ -1016,9 +1016,15 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
     from flashinfer.attention.batch_invariant import engine as eng
 
     planned = w._batch_invariant._planned
+    padded = torch.empty(
+        k.shape[:-1] + (k.shape[-1] + 4,), dtype=k.dtype, device=k.device
+    )[..., : k.shape[-1]]
     for bad in (
         dict(q=qoff),
         dict(k_cache=off),
+        dict(
+            k_cache=padded
+        ),  # unit head-dim stride, outer strides not multiples of 8 elements
         dict(out=k.flatten()[: pr.q.numel()].view(pr.q.shape)),
         dict(out=v.flatten()[: pr.q.numel()].view(pr.q.shape)),
     ):

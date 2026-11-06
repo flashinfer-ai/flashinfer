@@ -527,6 +527,11 @@ def run_attention(
             raise ValueError(
                 f"{name} must be 16-byte aligned (the TMA descriptors' requirement); its base address is not"
             )
+    for name, t in (("k_cache", k_cache), ("v_cache", v_cache)):
+        if any(st % 8 for st in t.stride()[:-1]):
+            raise ValueError(
+                f"{name} outer strides must be multiples of 8 elements (16 bytes: the TMA descriptors' requirement); got {tuple(t.stride())}"
+            )
     if out is None:
         out = torch.empty_like(q)
     assert out.shape == q.shape and out.dtype == torch.bfloat16 and out.is_contiguous()
