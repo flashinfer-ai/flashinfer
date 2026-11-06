@@ -3787,3 +3787,284 @@ def test_attention_ts_mla_decode_2cta_runtime_small_split_reduction(seq_len_q, k
         _policy_dict(wrapper),
         exercise_all_paths=True,
     )
+
+
+# Triggers its dependents first, spins, and only then copies the real query into
+# the buffer MLA decode reads, so a decode grid that begins before the preceding
+# grid has retired sees the NaN left in that buffer.
+_PDL_EARLY_TRIGGER_PRIMARY_CUDA = r"""
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
+#include <torch/extension.h>
+
+#include <cstdint>
+
+__global__ void trigger_then_copy_kernel(uint8_t* dst, const uint8_t* src, int64_t n,
+                                         int64_t spin_cycles) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
+  int64_t start = clock64();
+  while (clock64() - start < spin_cycles) {
+  }
+  int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < n;
+       i += stride) {
+    dst[i] = src[i];
+  }
+}
+
+void pdl_early_trigger_copy(at::Tensor dst, at::Tensor src, int64_t spin_cycles) {
+  TORCH_CHECK(dst.numel() * dst.element_size() == src.numel() * src.element_size());
+  trigger_then_copy_kernel<<<132, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+      static_cast<uint8_t*>(dst.data_ptr()), static_cast<const uint8_t*>(src.data_ptr()),
+      dst.numel() * dst.element_size(), spin_cycles);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+"""
+
+
+@functools.cache
+def _pdl_early_trigger_primary():
+    """Build the early-triggering predecessor grid once per session."""
+
+    from torch.utils.cpp_extension import load_inline
+
+    major, minor = torch.cuda.get_device_capability()
+    return load_inline(
+        name="test_attention_ts_mla_pdl_early_trigger_primary",
+        cpp_sources=[
+            "void pdl_early_trigger_copy(at::Tensor dst, at::Tensor src, "
+            "int64_t spin_cycles);"
+        ],
+        cuda_sources=[_PDL_EARLY_TRIGGER_PRIMARY_CUDA],
+        extra_cuda_cflags=[
+            f"-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}"
+        ],
+        functions=["pdl_early_trigger_copy"],
+        verbose=False,
+    )
+
+
+def _require_pdl_launched_producer(
+    *, selected: bool, device: torch.device, detail: object
+) -> None:
+    """Gate a PDL wait-hazard cell on this device planning the hazardous schedule.
+
+    Only a nonpersistent 2CTA producer with more than one KV split carries
+    ``use_pdl`` on its launch (``use_one_wave_reducer_pdl`` in
+    ``throughput_2cta/kernel.py``), so only that schedule can exhibit a
+    missing-wait hazard. Both the dense auto policy and
+    :func:`select_sparse_mla_profile` resolve the schedule from the device SM
+    count, so the expectation is pinned on B200 -- the convention
+    :func:`_assert_auto_policy` already uses for device-specific schedule
+    expectations -- while any other supported device that plans a different
+    schedule skips. A planner change still fails loudly where the expected
+    schedule is known, and a device that legitimately plans elsewhere does not
+    report an AssertionError against a kernel that is not at fault.
+    """
+
+    if torch.cuda.get_device_capability(device) == (10, 0):
+        assert selected, detail
+        return
+    if not selected:
+        pytest.skip("auto policy does not select the PDL-launched 2CTA producer here")
+
+
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_decode_2cta_waits_for_early_triggering_predecessor():
+    """A split, nonpersistent 2CTA producer is PDL-launched, so it must wait for
+    the preceding grid before reading any input that grid writes."""
+
+    primary = _pdl_early_trigger_primary()
+    case = _make_mla_case(
+        batch_size=1,
+        num_qo_heads=128,
+        max_kv_len=32768,
+        qkv_dtype=torch.bfloat16,
+        device="cuda",
+        seed=41801,
+    )
+    wrapper = _plan_case(case)
+    policy = _policy_dict(wrapper)
+    _assert_auto_policy(
+        policy,
+        {"kernel": "throughput_2cta", "use_persistent_scheduler": False},
+        device=case.query.device,
+    )
+    # Only this schedule carries use_pdl on its producer launch, so only this
+    # schedule can exhibit the hazard.
+    _require_pdl_launched_producer(
+        selected=(
+            policy["kernel"] == "throughput_2cta"
+            and int(policy["split_kv"]) > 1
+            and not bool(policy["use_persistent_scheduler"])
+        ),
+        device=case.query.device,
+        detail=policy,
+    )
+
+    real_query = case.query
+    query_buffer = torch.empty_like(real_query)
+    staged = replace(case, query=query_buffer)
+    output = torch.empty(
+        (*real_query.shape[:3], _LATENT_DIM),
+        dtype=case.out_dtype,
+        device=real_query.device,
+    )
+    # Warm up so compilation cannot run between the primary and the decode.
+    query_buffer.copy_(real_query)
+    _run_case(wrapper, staged, out=output, validate=False)
+    torch.cuda.synchronize()
+    _assert_case_correct(output, case, policy)
+
+    for _ in range(5):
+        query_buffer.fill_(float("nan"))
+        output.fill_(float("nan"))
+        torch.cuda.synchronize()
+        primary.pdl_early_trigger_copy(query_buffer, real_query, 20_000_000)
+        _run_case(wrapper, staged, out=output, validate=False)
+        torch.cuda.synchronize()
+        assert torch.isfinite(output).all(), (
+            "2CTA MLA decode read Q before the preceding kernel wrote it"
+        )
+        _assert_case_correct(output, case, policy)
+
+
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_sparse_2cta_waits_for_early_triggering_predecessor():
+    """The fused-reduction sparse 2CTA plan is PDL-launched too, and binds live
+    top-k lengths in its first statement, so it must wait at the same point."""
+
+    from flashinfer.attention.prims_ts import BatchSparseMLADecodePagedTSWrapper
+    from flashinfer.attention.prims_ts.kernels.mla_decode.sparse_policy import (
+        select_sparse_mla_profile,
+    )
+    from tests.attention.test_attention_ts_sparse_mla import (
+        prepare_sparse_mla_indices,
+    )
+
+    primary = _pdl_early_trigger_primary()
+    batch_size, max_q_len, num_qo_heads = 16, 1, 128
+    max_topk, max_extra_topk = 128, 2049
+    rows = batch_size * max_q_len
+    device = torch.device("cuda")
+
+    generator = torch.Generator(device=device).manual_seed(41802)
+
+    def native_pool(pages: int, page_size: int) -> torch.Tensor:
+        real = 0.15 * torch.randn(
+            pages, page_size, _LATENT_DIM, generator=generator, device=device
+        )
+        return real.to(_FP8)
+
+    real_query = (
+        0.15
+        * torch.randn(
+            batch_size,
+            max_q_len,
+            num_qo_heads,
+            _LATENT_DIM,
+            generator=generator,
+            device=device,
+        )
+    ).to(_FP8)
+    primary_pool = native_pool(4, 32)
+    extra_pool = native_pool(7, 16)
+    primary_slots = primary_pool.shape[0] * primary_pool.shape[1]
+    extra_slots = extra_pool.shape[0] * extra_pool.shape[1]
+    indices = (
+        torch.arange(max_topk, device=device, dtype=torch.int32) % primary_slots
+    ).repeat(rows, 1)
+    lengths = torch.full((rows,), max_topk, device=device, dtype=torch.int32)
+    extra_indices = (
+        torch.arange(max_extra_topk, device=device, dtype=torch.int32) % extra_slots
+    ).repeat(rows, 1)
+    extra_lengths = torch.full(
+        (rows,), max_extra_topk, device=device, dtype=torch.int32
+    )
+
+    wrapper = BatchSparseMLADecodePagedTSWrapper()
+    wrapper.plan(
+        device,
+        batch_size,
+        num_qo_heads,
+        max_topk=max_topk,
+        max_extra_topk=max_extra_topk,
+        max_q_len=max_q_len,
+        q_dtype=_FP8,
+    )
+    # The sparse reduction is fused into the producer only for a 2CTA family
+    # with more than one split, which is also exactly the PDL-launched
+    # schedule. Recompute the schedule from this device's SM count, using the
+    # same capacity formula the plan uses, and gate the cell on it.
+    capacity = max(
+        256,
+        ((max_topk + 127) // 128 + (max_extra_topk + 127) // 128) * 128,
+    )
+    profile = select_sparse_mla_profile(
+        rows=rows,
+        heads=num_qo_heads,
+        query_length=max_q_len,
+        capacity=capacity,
+        dtype="fp8",
+        sm_count=torch.cuda.get_device_properties(device).multi_processor_count,
+        rope_dim=0,
+    )
+    _require_pdl_launched_producer(
+        selected=(
+            profile.family == "2cta"
+            and int(wrapper._state["requested_splits"]) > 1
+            and profile.scheduler == "nonpersistent"
+        ),
+        device=device,
+        detail=profile,
+    )
+    assert wrapper._state["reload_d576"] is False
+    # The recomputation above must agree with the schedule the plan actually
+    # chose, or the gate was reading a different schedule than the cell runs.
+    assert wrapper._state["requested_splits"] == profile.split_kv
+
+    query_buffer = torch.empty_like(real_query)
+    metadata = prepare_sparse_mla_indices(
+        wrapper,
+        query_buffer,
+        primary_pool,
+        indices,
+        lengths,
+        extra_kv_cache=extra_pool,
+        extra_indices=extra_indices,
+        extra_lengths=extra_lengths,
+    )
+    output = torch.empty_like(real_query, dtype=torch.bfloat16)
+
+    def run() -> None:
+        wrapper.run(
+            query_buffer,
+            primary_pool,
+            **metadata,
+            extra_kv_cache=extra_pool,
+            softmax_scale=_LATENT_DIM**-0.5,
+            output_scale=1.0,
+            out=output,
+            validate=False,
+        )
+
+    # Warm up so compilation cannot run between the primary and the decode.
+    query_buffer.copy_(real_query)
+    run()
+    torch.cuda.synchronize()
+    assert torch.isfinite(output).all()
+    serialized = output.clone()
+
+    for _ in range(5):
+        query_buffer.fill_(float("nan"))
+        output.fill_(float("nan"))
+        torch.cuda.synchronize()
+        primary.pdl_early_trigger_copy(query_buffer, real_query, 20_000_000)
+        run()
+        torch.cuda.synchronize()
+        assert torch.isfinite(output).all(), (
+            "sparse 2CTA MLA decode read Q before the preceding kernel wrote it"
+        )
+        torch.testing.assert_close(output, serialized, rtol=2e-2, atol=2e-2)
