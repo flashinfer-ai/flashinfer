@@ -106,7 +106,7 @@ import torch
 import torch.profiler
 import torch.utils.checkpoint
 
-from flashinfer.experimental.cake import cake_moe_grouped_gemm as pkg
+import flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train as pkg
 from flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train import (
     cake_backend as cb,
 )
