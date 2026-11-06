@@ -178,9 +178,12 @@ an autograd wrapper that saves only its inputs.
    at import, and the former names without a mode word are attributes of
    neither ``flashinfer`` nor either module.
 
-The former names and their names in each mode.  A former entry ran the
-deterministic package by default (``deterministic=True``) and the
-non-deterministic package with ``deterministic=False``:
+The former names and their names in each mode.  In v0.7.3 the former
+module had no ``deterministic`` keyword and every former name ran the
+deterministic programs, so v0.7.3 callers use the deterministic column.
+From v0.7.4rc1 a former entry ran the deterministic package by default
+(``deterministic=True``) and the non-deterministic package with
+``deterministic=False``:
 
 .. list-table::
     :header-rows: 1
@@ -191,11 +194,16 @@ non-deterministic package with ``deterministic=False``:
     * - ``flashinfer.cake_rmsnorm_silu_gate_train`` (module)
       - ``flashinfer.cake_rmsnorm_silu_gate_det_train``
       - ``flashinfer.cake_rmsnorm_silu_gate_nondet_train``
-    * - ``flashinfer.cake_rmsnorm_silu_gate_det_train_backend`` (package)
+    * - ``flashinfer.cake_rmsnorm_silu_gate_det_train_backend`` (package;
+        from v0.7.4rc1)
       - ``flashinfer.experimental.cake.cake_rmsnorm_silu_gate_det_train``
       - (none)
-    * - ``flashinfer.cake_rmsnorm_silu_gate_train_backend`` (package; it took
-        ``deterministic=False`` only)
+    * - ``flashinfer.cake_rmsnorm_silu_gate_train_backend`` (package) in
+        v0.7.3, where it held the deterministic programs
+      - ``flashinfer.experimental.cake.cake_rmsnorm_silu_gate_det_train``
+      - (none)
+    * - ``flashinfer.cake_rmsnorm_silu_gate_train_backend`` (package) from
+        v0.7.4rc1, where it took ``deterministic=False`` only
       - (none)
       - ``flashinfer.experimental.cake.cake_rmsnorm_silu_gate_nondet_train``
     * - ``cake_rmsnorm_silu_gate``
