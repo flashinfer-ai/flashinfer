@@ -769,7 +769,10 @@ def test_benchmark_times_canonical_public_replay_with_caller_storage():
         for node in ast.walk(main_function)
         if isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == "graphs"
     )
-    assert ast.unparse(graphs) == "{name: graph(fn) for name, fn in fns.items()}"
+    # Compare structure: Python 3.10's unparse parenthesizes the tuple target.
+    assert ast.dump(graphs) == ast.dump(
+        ast.parse("{name: graph(fn) for name, fn in fns.items()}", mode="eval").body
+    )
     report = next(
         node.value
         for node in main_function.body
