@@ -40,6 +40,10 @@ Launches go through :func:`run_module`: the record maps its kernel
 parameters onto the package's logical vocabulary (``cake_jit.LOGICAL_TENSORS``
 / ``LOGICAL_SCALARS``), the grid comes from the host plan
 (``cake_jit.launch_grid``) and the kernel runs on the current torch stream.
+A launch binds torch's current stream as tvm-ffi's environment stream
+(:func:`stream_context`: ``tvm_ffi.use_raw_stream`` with the stream's device
+and raw handle, the stream ``tvm_ffi.use_torch_stream()`` sets, without
+building a ``torch.cuda.Stream`` per launch).
 Every launch is a plain stream-ordered launch: nothing cooperative, no PDL.
 Nothing here synchronizes, reads device memory or allocates.
 """
@@ -71,6 +75,7 @@ __all__ = [
     "run_module",
     "sm_count",
     "specs_for_arch",
+    "stream_context",
     "test_jit_spec",
     "test_library_name",
     "test_manifest",
@@ -292,6 +297,33 @@ def _argument_plan(name: str) -> tuple[tuple[str | None, int], ...]:
     return tuple(plan)
 
 
+def _current_stream() -> tuple[int, int]:
+    """``(device index, raw handle)`` of torch's current stream on the current device: what
+    ``tvm_ffi.use_torch_stream()`` binds."""
+    import torch
+
+    index = torch.cuda.current_device()
+    raw = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+    if raw is not None:
+        return index, int(raw(index))
+    return index, int(torch.cuda.current_stream(index).cuda_stream)
+
+
+@functools.cache
+def _ffi_device(index: int) -> Any:
+    """tvm-ffi's CUDA device ``index`` (built once per index)."""
+    return tvm_ffi.device("cuda", index)
+
+
+def stream_context(stream: tuple[int, int]) -> Any:
+    """The tvm-ffi stream context of ``stream`` = ``(device index, raw handle)`` (:func:`_current_stream`): it sets
+    the environment stream ``tvm_ffi.use_torch_stream()`` sets for that current stream -- the CUDA device ``index``
+    and the raw ``cudaStream_t`` -- through ``tvm_ffi.use_raw_stream``, without building a ``torch.cuda.Stream``, a
+    device string and its parsed device on every launch."""
+    index, raw = stream
+    return tvm_ffi.use_raw_stream(_ffi_device(index), raw)
+
+
 def run_module(
     name: str,
     values: Mapping[str, Any],
@@ -306,7 +338,7 @@ def run_module(
     the record maps its kernel parameters onto that vocabulary and ``grid`` is the plan's launch grid
     (``cake_jit.launch_grid``).  ``module`` overrides the loaded library (a test-only build from :func:`load_test`);
     by default the shipped record's library of the device's architecture runs.  The kernel runs on the current
-    torch stream.
+    torch stream (:func:`stream_context` of :func:`_current_stream`).
     """
     found = record(name)
     args: list[Any] = []
@@ -322,5 +354,5 @@ def run_module(
                 ) from None
     if module is None:
         module = load(name, device_arch(device_index))
-    with tvm_ffi.use_torch_stream():
+    with stream_context(_current_stream()):
         getattr(module, found["ffi_entry"])(*args)

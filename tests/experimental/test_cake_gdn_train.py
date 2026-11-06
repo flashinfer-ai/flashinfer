@@ -355,24 +355,24 @@ def test_registry_records_are_well_formed() -> None:
         assert sorted(params) == sorted(cake_chain.LAUNCH_ARGS[rec["stage"]]), name
         libraries.add(rec["library"])
     # one program per record: a kernel swap renames exactly the records it touches; the one shared library is the
-    # sm_107a wy_tc2, which is that architecture's wy_tc program
+    # sm_107a wy_tc2, which is the sm_100a / sm_103a wy_tc2 program
     wy, wy2, wy2_107 = (
         cake_jit.MODULES[name] for name in ("wy_tc", "wy_tc2", "wy_tc2_sm_107a")
     )
     assert wy2["arches"] == ["sm_100a", "sm_103a"] and wy2_107["arches"] == ["sm_107a"]
     assert (
-        wy2_107["library"] == wy["library"] != wy2["library"]
+        wy2_107["library"] == wy2["library"] != wy["library"]
         and "sm_107a" in wy["arches"]
     )
     assert len(libraries) == len(cake_jit.MODULES) - 1
 
 
 def test_the_wy_stage_follows_the_architecture() -> None:
-    assert cake_chain.WY_TC2_ARCHS == ("sm_100a", "sm_103a")
+    assert cake_chain.WY_TC2_ARCHS == ("sm_100a", "sm_103a", "sm_107a")
     assert {arch: cake_chain.wy_stage(arch) for arch in ARCHES} == {
         "sm_100a": "wy_tc2",
         "sm_103a": "wy_tc2",
-        "sm_107a": "wy_tc",
+        "sm_107a": "wy_tc2",
     }
     assert cake_chain.LAUNCH_ARGS["wy_tc2"] == cake_chain.LAUNCH_ARGS["wy_tc"]
     assert (
@@ -1556,8 +1556,8 @@ def test_prep_forms_agree(route, beta_dtype, device, monkeypatch) -> None:
 def test_the_wy_stage_of_the_device_gives_the_wy_tc_bits(
     save_state, device, monkeypatch
 ) -> None:
-    # every forward WY launch (and the backward's recompute) runs the device's stage, wy_tc2 on sm_100a / sm_103a;
-    # wy_tc in its place gives the same bits
+    # every forward WY launch (and the backward's recompute) runs the device's stage, wy_tc2; wy_tc in its place
+    # gives the same bits
     seq_lens = (300, 77, 640, 17)
     inputs = _inputs(seq_lens, (2, 6), torch.bfloat16, device, seed=29)
     wy = cake_chain.wy_stage(cake_backend.device_arch(torch.cuda.current_device()))
@@ -1820,15 +1820,11 @@ def test_the_package_exports_the_det_free_names_only() -> None:
     for name in DET_NAMES:
         for module in (cake_gdn_train, cake_chain):
             assert not hasattr(module, name) and name not in module.__all__, name
-    # the deterministic package keeps its names and its aliases, distinct objects from this package's entries
-    assert (
-        cake_gdn_det_train.chunk_gated_delta_rule
-        is cake_gdn_det_train.chunk_gated_delta_rule_det
-    )
-    assert (
-        cake_gdn_train.chunk_gated_delta_rule
-        is not cake_gdn_det_train.chunk_gated_delta_rule
-    )
+    # the deterministic package's entries (its det names) are distinct objects from this package's entries
+    for name, det_name in zip(ENTRY_NAMES, DET_NAMES, strict=True):
+        assert getattr(cake_gdn_train, name) is not getattr(
+            cake_gdn_det_train, det_name
+        ), name
     assert cake_jit.PACKAGE == "flashinfer.experimental.cake.cake_gdn_train"
     assert cake_jit.LIBRARY_PREFIX == "cake_gdn_train"
 
@@ -1892,6 +1888,16 @@ def test_every_entry_requires_deterministic_false(mode) -> None:
             match=f"^{name} is the non-deterministic route and takes deterministic=False",
         ):
             call()
+    # the refusal names the entry's deterministic counterpart
+    for (name, call), det_name in zip(
+        _entry_calls(**mode).items(), DET_NAMES, strict=True
+    ):
+        with pytest.raises(ValueError) as info:
+            call()
+        assert str(info.value).endswith(
+            "pass deterministic=False for the non-deterministic path; the deterministic entry is "
+            f"flashinfer.experimental.cake_gdn_det_train.{det_name}"
+        ), (name, str(info.value))
     # the refusal comes first, also with PyTorch's deterministic algorithms on
     with _deterministic_algorithms(True):
         for name, call in _entry_calls(**mode).items():

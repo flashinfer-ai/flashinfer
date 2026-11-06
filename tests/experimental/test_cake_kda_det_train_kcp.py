@@ -22,6 +22,7 @@ reference from ``tests/test_helpers/cake_kda_kcp_reference.py``.
 """
 
 import ctypes
+import dataclasses
 import gc
 import json
 import os
@@ -3506,7 +3507,7 @@ CKPT_IDS = [f"s{'_'.join(map(str, lens))}-h{H}" for lens, H in CKPT_ROWS]
 
 def _ckpt_problem(device, lengths, H):
     """A one-rank problem: the context, the operands (the delta rule's contract) and ``dout``."""
-    from tests.test_helpers.cake_kda_train_reference import make_inputs
+    from tests.test_helpers.cake_kda_det_train_reference import make_inputs
 
     cu = [0]
     for n in lengths:
@@ -4229,6 +4230,105 @@ def test_recompute_handle_byte_queries(W) -> None:
     ) == kp.kda_det_saved_bytes_kcp(ctx, save_transfer=kp.SAVE_TRANSFER_DEFAULT)
 
 
+# --------------------------------------------------------------------------- the non-deterministic package's objects
+
+SAVED_MODE_RE = (
+    r"saved: a \S+\.SavedDetKcp \(the deterministic KCP forward\) is required, got {}; a saved set of the "
+    r"non-deterministic package \(deterministic=False\) is read by that package's backward"
+)
+WORKSPACE_MODE_RE = (
+    r"workspace: a \S+\.WorkspaceDetKcp is required, got {}\.WorkspaceKcp; a workspace of the non-deterministic "
+    r"package \(deterministic=False\) serves that package's calls only"
+)
+
+
+def test_backward_refuses_the_other_modes_saved_set_and_workspace() -> None:
+    """Host only: :func:`chunk_kda_det_bwd_kcp` refuses a saved set that is not a ``SavedDetKcp`` -- the
+    non-deterministic package's ``SavedKcp`` (the same version, members and metadata) or any other object -- and a
+    workspace of the non-deterministic package with ``ValueError`` naming the mode, before it reads an option, a graph
+    key, an operand or a tensor (the operands here are placeholders); ``_call_workspace`` (the workspace check of
+    every entry point) refuses that workspace alike and keeps ``TypeError`` for any other object.  The
+    non-deterministic package's backward refuses this package's saved set in the same way."""
+    nd_kcp = cake_package("cake_kda_train_kcp", "cake_kcp")
+    t = torch.zeros(1)
+    meta = dict(
+        version=cake_kcp.KCP_SAVED_VERSION, T_r=1, H=1, n_frag=1, P=1, Hg=1, scale=0.5, save_mode="light",
+        save_transfer=False, offset_class="fla", exchange="a2a", precision_mode=0,
+    )  # fmt: skip
+    nd_saved = nd_kcp.SavedKcp(S_in=t, c1_recv=None, M_seg=None, ctx=None, **meta)
+    saved = cake_kcp.SavedDetKcp(S_in=t, c1_recv=None, M_seg=None, ctx=None, **meta)
+    assert nd_kcp.KCP_SAVED_VERSION == cake_kcp.KCP_SAVED_VERSION
+    assert nd_saved.meta() == saved.meta() and nd_saved.flags() == saved.flags()
+    nd_ws = nd_kcp.WorkspaceKcp()
+    ops = (t, t, t, t, t, object(), t)
+    for graph in ("off", "replay"):
+        for bad, name in (
+            (nd_saved, f"{nd_kcp.__name__}.SavedKcp"),
+            (object(), "builtins.object"),
+        ):
+            with pytest.raises(ValueError, match=SAVED_MODE_RE.format(name)):
+                cake_kcp.chunk_kda_det_bwd_kcp(*ops, saved=bad, graph=graph)
+        for kw in ({"saved": saved}, {}):
+            with pytest.raises(
+                ValueError, match=WORKSPACE_MODE_RE.format(nd_kcp.__name__)
+            ):
+                cake_kcp.chunk_kda_det_bwd_kcp(*ops, workspace=nd_ws, graph=graph, **kw)
+    backend = types.SimpleNamespace(dtypes={"state": torch.float32})
+    with pytest.raises(ValueError, match=WORKSPACE_MODE_RE.format(nd_kcp.__name__)):
+        cake_kcp._call_workspace(nd_ws, backend, "light", "g", False, "cpu")
+    with pytest.raises(TypeError, match="workspace must be a WorkspaceDetKcp"):
+        cake_kcp._call_workspace(object(), backend, "light", "g", False, "cpu")
+    with pytest.raises(ValueError, match="a saved set of the deterministic package"):
+        nd_kcp.chunk_kda_bwd_kcp(*ops, saved=saved, deterministic=False)
+
+
+def test_gpu_backward_refuses_the_other_modes_saved_set_and_workspace(device) -> None:
+    """One rank: a real forward of the non-deterministic package (``deterministic=False``) on this package's context
+    writes a ``SavedKcp`` of the same version and context and fills a ``WorkspaceKcp``.  This package's backward
+    refuses either (saved and replay mode, eager and graph replay) with ``ValueError`` naming the mode, its forward
+    and autograd entry refuse that workspace alike; nothing completes (no launch inventory), and the backward on
+    this package's own saved set and workspace afterwards is bitwise the one before."""
+    nd_kcp = cake_package("cake_kda_train_kcp", "cake_kcp")
+    ctx, ops = _ckpt_problem(device, (300, 724, 476), 2)
+    args = [ops[n] for n in ("q", "k", "v", "g", "beta")]
+    nd_ws = nd_kcp.WorkspaceKcp()
+    _, nd_saved = nd_kcp.chunk_kda_fwd_kcp(
+        *args, ctx, workspace=nd_ws, deterministic=False
+    )
+    assert isinstance(nd_saved, nd_kcp.SavedKcp) and nd_saved.ctx is ctx
+    assert nd_saved.version == cake_kcp.KCP_SAVED_VERSION
+    ws = cake_kcp.WorkspaceDetKcp()
+    _, saved = cake_kcp.chunk_kda_det_fwd_kcp(*args, ctx, workspace=ws)
+
+    def bwd(**kw):
+        return cake_kcp.chunk_kda_det_bwd_kcp(*args, ctx, ops["dout"], **kw)
+
+    ref = bwd(saved=saved, workspace=ws)
+    saved_re = SAVED_MODE_RE.format(f"{nd_kcp.__name__}.SavedKcp")
+    ws_re = WORKSPACE_MODE_RE.format(nd_kcp.__name__)
+    cake_kcp.LAST_CALL.clear()
+    try:
+        for graph in ("off", "replay"):
+            for kw, match in (
+                ({"saved": nd_saved, "workspace": ws}, saved_re),
+                ({"saved": nd_saved}, saved_re),
+                ({"saved": saved, "workspace": nd_ws}, ws_re),
+                ({"workspace": nd_ws}, ws_re),
+            ):
+                with pytest.raises(ValueError, match=match):
+                    bwd(graph=graph, **kw)
+            with pytest.raises(ValueError, match=ws_re):
+                cake_kcp.chunk_kda_det_fwd_kcp(*args, ctx, workspace=nd_ws, graph=graph)
+            leaves = [x.detach().clone().requires_grad_(True) for x in args]
+            with pytest.raises(ValueError, match=ws_re):
+                cake_kcp.chunk_kda_det_kcp(*leaves, ctx, workspace=nd_ws, graph=graph)
+        assert cake_kcp.LAST_CALL == {}, "a refused call completed"
+    finally:  # a cached graph entry would pin ws / ctx
+        cake_kcp.graph_cache_clear()
+    again = bwd(saved=saved, workspace=ws)
+    assert all(torch.equal(a, b) for a, b in zip(again, ref, strict=True))
+
+
 # --------------------------------------------------------------------------- FP64 fake backend (`-k fake`)
 
 
@@ -4417,7 +4517,8 @@ def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap, walk_form) 
     full-width launches of the capped programs only (a two-CTA launch runs uncapped), so the expectations follow the
     forms the calls launched (``LAST_CALL[kind]["walk_forms"]``): under ``walk_form="auto"`` the registry's rule
     decides per launch, under ``"full"`` every launch is full-width and the bracket / skip / node-attribute paths are
-    exercised."""
+    exercised.  The forward's state walk is the fused ``kcp_fwdh_o`` (no tape, never capped): the capped launches
+    are the backward's tape walks."""
     monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
     knobs = {"_kcp_test_knobs": {"graph_cap": graph_cap, "walk_form": walk_form}}
     backend = cake_kcp.get_backend()
@@ -4494,10 +4595,18 @@ def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap, walk_form) 
         eager_cc(recs0[0]),
         eager_cc(recs0[1]),
     ), recs0
+    if isinstance(programs, cake_kcp._FiPrograms):
+        # the forward's state walk is the fused kcp_fwdh_o (no tape program: never capped); the tape walks are the
+        # backward's
+        assert any(
+            cake_kcp._PROGRAM_OF[name] == "fwdh_o"
+            for name, _, _ in recs0[0]["walk_forms"]
+        ), recs0
+        assert n_capped(recs0[0]) == 0, recs0
     if (
         capped and walk_form == "full"
-    ):  # every tape launch full-width: the eager bracket on both calls
-        assert n_capped(recs0[0]) >= 1 and n_capped(recs0[1]) >= 1, recs0
+    ):  # every tape launch full-width: the eager bracket on the backward
+        assert n_capped(recs0[1]) >= 1, recs0
     fallback0 = cake_kcp.GRAPH_STATS["fallback"]
     skips0 = programs.capture_skips if capped else None
     nodes0 = programs.node_attrs if capped else None
@@ -4545,9 +4654,9 @@ def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap, walk_form) 
             caps[1][0] + caps[cap_b][1]
         )  # the capped (full-width tape) launches inside the two captures
         if capped and walk_form == "full":
-            assert n_cap_captured >= 2, (
+            assert caps[1][0] == 0 and caps[cap_b][1] >= 1, (
                 caps
-            )  # both captures hold full-width tape launches
+            )  # the backward's capture holds full-width tape launches, the forward's none (its fused walk)
         if capped and graph_cap in cake_kcp.GRAPH_NODE_CAPS:
             # kernel-node cap forms: nothing launched bare; every captured capped launch carries the node attribute
             assert programs.capture_skips == skips0, (programs.capture_skips, skips0)
@@ -5009,7 +5118,7 @@ def test_forward_only_layout_bytes_and_prediction() -> None:
                 {
                     "backward": False,
                     "fwd_layout": "fwd_kcp",
-                    "arena": cake_backend.KdaArena(batch_tokens=S),
+                    "arena": cake_backend.KdaDetArena(batch_tokens=S),
                 }
             )
         for kw in bad:
@@ -5253,23 +5362,35 @@ def test_host_trim_kernel_backend_run_skips_the_discarded_abi() -> None:
 
 def test_walk_form_of_decides_once_per_table_set() -> None:
     """``_walk_form_of`` (the record form of a K1 / K2 walk launch) evaluates the registry's rule once per
-    ``(program, walk list, H, SM count, knob)`` of the call's table set and looks the form up on every later launch:
-    the forms of a per-launch evaluation (the rule's inputs are static per ``(ctx, H)``), a fresh equal list finding
-    the same entry, the knob's forced forms passing through; a provider without a form rule gives ``"full"``."""
+    ``(program, walk list, H, SM count, knob, device)`` of the call's table set and looks the form up on every later
+    launch: the forms of a per-launch evaluation (the rule's inputs are static per ``(ctx, H)``; the device's
+    architecture is read, for the per-architecture rule alone, on the first launch of a key only), a fresh equal list
+    finding the same entry, the knob's forced forms passing through; a provider without a form rule gives ``"full"``."""
     part = kp.partition_det_kcp((0, 64 * 200, 64 * 350), 4, layout="contiguous")
     ctx = kp.build_context_det_kcp(part, None, 0, "cpu", 4, sm_count=148)
     tb = cake_kcp._Tables(ctx, 64)
     evaluated: list[tuple] = []
+    arch_reads: list = []
 
-    def rule(program, chains, num_heads, sm_count, *, knob="auto"):
+    def rule(program, chains, num_heads, sm_count, *, knob="auto", arch=None):
         evaluated.append((program, tuple(chains), num_heads, sm_count, knob))
-        return cake_kcp_jit.walk_form(program, chains, num_heads, sm_count, knob=knob)
+        # the architecture reaches the per-architecture rule (a mapping) alone
+        per_arch = not isinstance(cake_kcp_jit.WALK_FORM_RULES[program], str)
+        assert arch == ("sm_100a" if per_arch else None), (program, arch)
+        return cake_kcp_jit.walk_form(
+            program, chains, num_heads, sm_count, knob=knob, arch=arch
+        )
+
+    def device_arch(index):
+        arch_reads.append(index)
+        return "sm_100a"
 
     programs = types.SimpleNamespace(
         jit=types.SimpleNamespace(
             walk_form=rule,
             WALK_FORM_RULES=cake_kcp_jit.WALK_FORM_RULES,
             sm_count=lambda index: 148,
+            device_arch=device_arch,
         )
     )
     seg = [int(x) for x in tb.hp.seg_chunk_start]
@@ -5295,7 +5416,12 @@ def test_walk_form_of_decides_once_per_table_set() -> None:
                 if not lst:
                     continue
                 want = cake_kcp_jit.walk_form(
-                    name, [seg[s + 1] - seg[s] for s in lst], 64, 148, knob=knob
+                    name,
+                    [seg[s + 1] - seg[s] for s in lst],
+                    64,
+                    148,
+                    knob=knob,
+                    arch="sm_100a",
                 )
                 forms[(knob, name, tuple(lst))] = want
                 for _ in range(3):  # the first launch evaluates, the others look up
@@ -5314,6 +5440,12 @@ def test_walk_form_of_decides_once_per_table_set() -> None:
         for (knob, name, walk) in forms
     ), (len(evaluated), len(forms))
     assert all(form == knob for (knob, _, _), form in forms.items() if knob != "auto")
+    assert (
+        len(arch_reads)
+        == sum(
+            not isinstance(cake_kcp_jit.WALK_FORM_RULES[e[0]], str) for e in evaluated
+        )
+    )  # the architecture on a key's first launch only, for the per-architecture rule alone
     assert {
         forms[("auto", name, tuple(tb.walk_offset))]
         for name in cake_kcp_jit.WALK_FORM_RULES
@@ -5324,6 +5456,79 @@ def test_walk_form_of_decides_once_per_table_set() -> None:
             types.SimpleNamespace(), bare, "kcp_fwdh_offset", {"walk": tb.walk_offset}
         )
         == "full"
+    )
+
+
+def test_walk_form_of_passes_arch_to_a_per_architecture_rule_alone() -> None:
+    """A provider whose ``walk_form`` takes ``(program, chains, num_heads, sm_count, *, knob)`` and no ``arch``, beside
+    a ``device_arch``, serves its string rules (``"fit"`` / ``"split"``) without a ``TypeError`` and without an
+    architecture read: ``_walk_form_of`` passes ``arch`` only for a per-architecture rule (a mapping of
+    ``WALK_FORM_RULES``), which still receives it."""
+    part = kp.partition_det_kcp((0, 64 * 200, 64 * 350), 4, layout="contiguous")
+    ctx = kp.build_context_det_kcp(part, None, 0, "cpu", 4, sm_count=148)
+    tb = cake_kcp._Tables(ctx, 64)
+    walk = tb.walk_offset
+    assert walk
+    arch_reads: list = []
+
+    def device_arch(index):
+        arch_reads.append(index)
+        return "sm_103a"
+
+    def call():
+        return types.SimpleNamespace(
+            tb=tb, H=64, device=torch.device("cpu"), walk_form="auto"
+        )
+
+    old_calls: list = []
+
+    def old_rule(program, chains, num_heads, sm_count, *, knob="auto"):
+        old_calls.append((program, knob))
+        return {"kcp_fwdh_offset": "full", "kcp_fwdh_tape": "split"}[program]
+
+    old = types.SimpleNamespace(
+        jit=types.SimpleNamespace(
+            walk_form=old_rule,
+            WALK_FORM_RULES={"kcp_fwdh_offset": "fit", "kcp_fwdh_tape": "split"},
+            sm_count=lambda index: 148,
+            device_arch=device_arch,
+        )
+    )
+    assert (
+        cake_kcp._walk_form_of(call(), old, "kcp_fwdh_offset", {"walk": walk}) == "full"
+    )
+    assert (
+        cake_kcp._walk_form_of(call(), old, "kcp_fwdh_tape", {"walk": walk}) == "split"
+    )
+    assert old_calls == [("kcp_fwdh_offset", "auto"), ("kcp_fwdh_tape", "auto")]
+    assert arch_reads == []
+
+    seen: list = []
+
+    def rule(program, chains, num_heads, sm_count, *, knob="auto", arch=None):
+        seen.append((program, arch))
+        return cake_kcp_jit.walk_form(
+            program, chains, num_heads, sm_count, knob=knob, arch=arch
+        )
+
+    registry = types.SimpleNamespace(
+        jit=types.SimpleNamespace(
+            walk_form=rule,
+            WALK_FORM_RULES=cake_kcp_jit.WALK_FORM_RULES,
+            sm_count=lambda index: 148,
+            device_arch=device_arch,
+        )
+    )
+    seg = [int(x) for x in tb.hp.seg_chunk_start]
+    chains = [seg[s + 1] - seg[s] for s in walk]
+    for name, form_rule in cake_kcp_jit.WALK_FORM_RULES.items():
+        want = cake_kcp_jit.walk_form(name, chains, 64, 148, arch="sm_103a")
+        assert cake_kcp._walk_form_of(call(), registry, name, {"walk": walk}) == want
+        assert seen[-1] == (name, None if isinstance(form_rule, str) else "sm_103a")
+    assert (
+        len(arch_reads)
+        == sum(not isinstance(r, str) for r in cake_kcp_jit.WALK_FORM_RULES.values())
+        >= 1
     )
 
 
@@ -5971,6 +6176,369 @@ def test_local_stage_values_cover_the_records(H, arch, sm) -> None:
                 values
             )
             assert not missing, (record, sorted(missing))
+
+
+# The reader / launch-count test of the forward tapes: the real drivers (:func:`cake_kcp._forward` /
+# :func:`cake_kcp._backward`) on the CPU, every local launch and every KCP walk logged in one ordered list.
+# Candidate ranks (W, rank, document lengths, H); the test takes the first with a segment plan of P = 1 and of P > 1.
+TAPE_CASES = (
+    (2, 0, (700, 1, 1300, 999), 64),
+    (2, 1, (700, 1, 1300, 999), 4),
+    (4, 1, (700, 1, 1300, 999), 4),
+    (1, 0, (16384,), 64),
+    (2, 0, (16384,), 64),
+    (1, 0, (16384,), 4),
+    (2, 0, (16384,), 4),
+)
+TAPE_SCHEDULES = (("wait_first", 1), ("wait_first", 0), ("overlap", 1), ("overlap", 0))
+# The local stages that bind the ``v_new`` tape view before a tape walk writes it: they write its pad rows.
+TAPE_PAD_WRITERS = ("fwd_intra", "bwd_prep")
+
+
+def _tape_ctx(segmented: bool, sm: int):
+    """The first rank of :data:`TAPE_CASES` with tokens whose segment plan has ``P > 1`` (``segmented``) or ``P = 1``,
+    with its head count."""
+    for W, rank, lengths, H in TAPE_CASES:
+        ctx = kp.build_context_det_kcp(
+            _small_partition(W, lengths), None, rank, "cpu", 4, sm_count=sm
+        )
+        if (
+            int(ctx.T_r) > 0
+            and (cake_kcp._Tables(ctx, H, fused_walks=1).P > 1) == segmented
+        ):
+            return ctx, H
+    raise AssertionError(
+        f"no rank of TAPE_CASES has {'P > 1' if segmented else 'P = 1'}"
+    )
+
+
+class _TapeCall(types.SimpleNamespace):
+    """A call for the real :func:`cake_kcp._forward` / :func:`cake_kcp._backward` on the CPU: its local stages run the
+    kernel backend's ``stage`` (the test's arena and program provider log each launch with its values in ``log``); a
+    walk over a non-empty segment list is logged as ``("walk", program, None, values)`` in the same list (its local
+    operands, its segment list and its pool arguments) and launches nothing; every other KCP method (merges,
+    collectives, pool views) does nothing."""
+
+    def __getattr__(self, name: str):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return lambda *_a, **_k: None
+
+    def walk(self, name: str, walk, **args) -> None:
+        if len(walk) == 0:
+            return
+        local = self.local_values
+        missing = set(cake_kcp_jit._WALK_OPERANDS[name]) - set(local)
+        assert not missing, (name, sorted(missing))
+        operands = {key: local[key] for key in cake_kcp_jit._WALK_OPERANDS[name]}
+        self.log.append(("walk", name, None, {**operands, **args, "walk": list(walk)}))
+
+    def fresh(self, name: str) -> torch.Tensor:
+        self.bufs[name] = torch.zeros(1)
+        return self.bufs[name]
+
+    def stage(self, name: str, **extra) -> None:
+        self.backend.stage(name, self, **extra)
+
+
+@pytest.mark.parametrize("fuse", (1, 0), ids=("fwd_o_fuse1", "fwd_o_fuse0"))
+@pytest.mark.parametrize(
+    "schedule,fused_walks",
+    TAPE_SCHEDULES,
+    ids=[f"{s}-fw{f}" for s, f in TAPE_SCHEDULES],
+)
+@pytest.mark.parametrize("segmented", (False, True), ids=("p1", "pN"))
+@pytest.mark.parametrize("gate", ("g", "raw"))
+@pytest.mark.parametrize(
+    "fwd_layout", (cake_kcp.LOCAL_LAYOUT_FWD, cake_kcp.LOCAL_LAYOUT_FWD_ONLY)
+)
+def test_forward_tapes_have_no_reader_outside_the_call(
+    monkeypatch, fwd_layout, gate, segmented, schedule, fused_walks, fuse
+) -> None:
+    """The forward's ``h`` / ``v_new`` tapes have no reader outside the forward that writes them, in every save mode:
+    the real drivers on the flag-off plan, a saving, a non-saving and a recomputing (bound ``S_in``) forward, a
+    saved-mode and a replay-mode backward.  A forward launches ``kcp_fwdh_o`` (``fwd_o_fuse=1``, shipped) wherever
+    the tape form launches ``kcp_fwdh_tape`` -- the same segment lists, in the same order -- and no ``kcp_fwd_o``
+    (one launch fewer); no launch of it but the pad-row writer binds the forward views' tapes (the offset walk's
+    unused pointers aside), under the tape form only the tape walk and ``kcp_fwd_o`` do.  A backward launches no
+    fused walk; it binds only its own views' tapes, and before its first tape walk only the pad-row writers and the
+    offset walk do.  The saved set holds no tape and ``save_mode="tape"`` is refused."""
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
+    arch, sm = "sm_103a", 152
+    ctx, H = _tape_ctx(segmented, sm)
+    T = int(ctx.T_r)
+    D = cake_kcp.D
+    plan = cake_backend.plan(ctx.T_r, ctx.n_frag, H, sm, arch, gate=gate)
+    log: list = []
+
+    class Arena:
+        def __init__(self) -> None:
+            self.plan = plan
+            self.device = torch.device("cpu")
+            self.device_index = 0
+            self.arch = arch
+            self.launcher = self._launch
+            self.fwd_layout = fwd_layout
+            self._views: dict = {}
+
+        def views(self, mode: str):
+            ns = self._views.get(mode)
+            if ns is None:
+                ns = types.SimpleNamespace()
+                for r in plan.layout(mode):
+                    small = (
+                        torch.zeros(2, D) if r.name in ("h", "dh") else torch.zeros(1)
+                    )
+                    setattr(ns, r.name, small)
+                self._views[mode] = ns
+            return ns
+
+        def _launch(self, record, values, *, grid, device_index) -> None:
+            log.append(("backend", record, grid, dict(values)))
+
+    class Provider:
+        def run_record(self, record, values, *, grid, device_index) -> None:
+            log.append(("kcp", record, grid, dict(values)))
+
+    arena = Arena()
+    backend = cake_kcp.KernelBackend(programs=Provider())
+    knobs = {"schedule": schedule, "fused_walks": fused_walks}
+    tb = cake_kcp._Tables(ctx, H, fused_walks=fused_walks)
+    assert (tb.P > 1) == segmented
+    ops = {n: torch.zeros(1) for n in ("q", "k", "v", "beta")}
+    if gate == "raw":
+        gp = cake_backend._gate_params(
+            "raw", torch.zeros(H), torch.zeros(H * D), -5.0, H, torch.device("cpu")
+        )
+        ops.update(
+            cake_backend._raw_values(torch.zeros(T, H, D, dtype=torch.bfloat16), gp)
+        )
+        grad_names = (
+            "dq",
+            "dk",
+            "dv",
+            "dbeta",
+            "dg_raw",
+            "dA_part",
+            "db_part",
+            "dA_log",
+            "ddt_bias",
+        )
+    else:
+        ops["g"] = torch.zeros(1)
+        grad_names = ("dq", "dk", "dv", "dg", "dbeta")
+    grads = {n: torch.zeros(1) for n in grad_names}
+    fin_scratch: dict = {}
+    if gate == "raw":
+        fin = cake_backend._raw_finalize_scratch(
+            int(plan.NC_pad), H, torch.device("cpu")
+        )
+        grads.update(part2=fin["part2"], ticket=fin["ticket"])
+        fin_scratch["seg_cap"] = int(fin["seg_cap"])
+
+    def drive(kind: str, fwd_o_fuse: int):
+        opts = cake_kcp._options(
+            {
+                "spec3_probe": "off",
+                "_kcp_test_knobs": {**knobs, "fwd_o_fuse": fwd_o_fuse},
+            }
+        )
+        assert (opts.schedule, opts.fused_walks, opts.fwd_o_fuse) == (
+            schedule,
+            fused_walks,
+            fwd_o_fuse,
+        )
+        backward = kind.startswith("bwd")
+        call = _TapeCall(
+            local=arena, ctx=ctx, tb=tb, T_r=T, H=H, backward=backward, host_trim=int(opts.host_trim),
+            ops={**ops, **({"dout": torch.zeros(1)} if backward else {})}, scale=0.5, scratch=dict(fin_scratch),
+            local_values=None, out=None if backward else torch.zeros(1), grads=dict(grads) if backward else None,
+            device=torch.device("cpu"), opts=opts, gate=gate, l2n=False, l2n_mode="off", l2n_values=None,
+            backend=backend, schedule=str(opts.schedule), exchange="a2a", merge_fuse=str(opts.merge_fuse),
+            saved_carry=int(opts.saved_carry), fwd_o_fuse=int(opts.fwd_o_fuse), bufs={}, log=log,
+        )  # fmt: skip
+        backend.begin_call(call)
+        if kind == "bwd_saved":
+            plane = (
+                torch.zeros(1) if tb.P > 1 else None
+            )  # the shipped saved carry plane
+            saved = types.SimpleNamespace(
+                S_in=torch.zeros(1), c1_recv=None, M_seg=None, carry=plane
+            )
+            cake_kcp._backward(call, saved)
+        elif kind == "bwd_replay":
+            cake_kcp._backward(call, None)
+        else:
+            bound = (
+                {"S_in": torch.zeros(1), "c1_recv": torch.zeros(1)}
+                if kind == "fwd_recompute"
+                else None
+            )
+            cake_kcp._forward(
+                call, save=kind != "fwd_nosave", replay=False, bound=bound
+            )
+        done = list(log)
+        log.clear()
+        return done, call
+
+    def tapes(mode: str) -> dict[int, str]:
+        views = arena.views(mode)
+        return {views.h.data_ptr(): "h", views.v_new.data_ptr(): "v_new"}
+
+    def bound_tapes(entry, ptrs: dict[int, str]) -> set[str]:
+        """The tapes of ``ptrs`` a logged launch binds (a walk: its operands; a record: its logical names)."""
+        src, record, _grid, values = entry
+        if src == "walk":
+            names = cake_kcp_jit._WALK_OPERANDS[record]
+        else:
+            names = (
+                (cake_jit if src == "backend" else cake_kcp_jit)
+                .MODULES[record]["logical"]
+                .values()
+            )
+        hit = set()
+        for name in names:
+            value = values.get(name)
+            if isinstance(value, torch.Tensor) and value.data_ptr() in ptrs:
+                hit.add(ptrs[value.data_ptr()])
+        return hit
+
+    def pad_writer(entry) -> bool:
+        return (
+            entry[0] == "backend"
+            and cake_jit.MODULES[entry[1]]["stage"] in TAPE_PAD_WRITERS
+        )
+
+    def form(entries, rename: dict[str, str]) -> list:
+        """The launches as (source, program, segment list or grid), ``kcp_fwd_o`` left out."""
+        return [
+            (
+                src,
+                rename.get(record, record),
+                tuple(values["walk"]) if src == "walk" else grid,
+            )
+            for src, record, grid, values in entries
+            if record != "kcp_fwd_o"
+        ]
+
+    fwd_tapes = tapes(fwd_layout)
+    bwd_tapes = tapes(cake_kcp._bwd_layout(arena))
+    assert not set(fwd_tapes) & set(
+        bwd_tapes
+    )  # the backward's tape views are not the forward's
+    for kind in ("fwd_save", "fwd_nosave", "fwd_recompute", "bwd_saved", "bwd_replay"):
+        res, call = drive(kind, fuse)
+        walks = [record for src, record, _g, _v in res if src == "walk"]
+        if kind.startswith("fwd"):
+            # A2 / A3: the forward's state walk program, and fwd_o once under the tape form only
+            assert call.fwd_walk == ("kcp_fwdh_o" if fuse else "kcp_fwdh_tape"), kind
+            assert ("kcp_fwdh_tape" in walks, "kcp_fwdh_o" in walks) == (
+                not fuse,
+                bool(fuse),
+            ), (kind, walks)
+            fwd_o = [record for src, record, _g, _v in res if record == "kcp_fwd_o"]
+            assert len(fwd_o) == (0 if fuse else 1), (kind, fwd_o)
+            # A1: the forward views' tapes are bound only by the pad-row writer, the offset walk (unused pointers)
+            # and, under the tape form, by their producer and their one reader
+            for entry in res:
+                hit = bound_tapes(entry, fwd_tapes)
+                if not hit or entry[1] == "kcp_fwdh_offset":
+                    continue
+                if pad_writer(entry):
+                    assert hit == {"v_new"}, (kind, entry[1], hit)
+                else:
+                    assert not fuse and entry[1] in ("kcp_fwdh_tape", "kcp_fwd_o"), (
+                        kind,
+                        entry[1],
+                        hit,
+                    )
+            assert not any(bound_tapes(entry, bwd_tapes) for entry in res), kind
+            if fuse:  # the tape form's launches with the walk program renamed, one launch fewer
+                ref, _ = drive(kind, 0)
+                assert form(res, {"kcp_fwdh_o": "kcp_fwdh_tape"}) == form(ref, {}), kind
+                assert len(res) == len(ref) - 1, kind
+        else:
+            # A4: the backward walks the tape itself and reads only its own views' tapes, after its first tape walk
+            assert "kcp_fwdh_o" not in walks and "kcp_fwdh_tape" in walks, (kind, walks)
+            first = next(
+                i
+                for i, e in enumerate(res)
+                if e[0] == "walk" and e[1] == "kcp_fwdh_tape"
+            )
+            for i, entry in enumerate(res):
+                assert not bound_tapes(entry, fwd_tapes), (kind, entry[1])
+                hit = bound_tapes(entry, bwd_tapes)
+                if hit and i < first and entry[1] != "kcp_fwdh_offset":
+                    assert pad_writer(entry) and hit == {"v_new"}, (kind, entry[1], hit)
+            if fuse:  # the backward is the same under both knob values
+                ref, _ = drive(kind, 0)
+                assert form(res, {}) == form(ref, {}), kind
+    # A5: the saved set holds no tape; the tape save mode stays refused
+    assert {f.name for f in dataclasses.fields(cake_kcp.SavedDetKcp)} == {
+        "version", "S_in", "c1_recv", "M_seg", "T_r", "H", "n_frag", "P", "Hg", "scale", "save_mode",
+        "save_transfer", "offset_class", "exchange", "precision_mode", "ctx", "transfer_walk", "carry", "gate",
+        "lower_bound", "qk_rstd", "qk_l2norm",
+    }  # fmt: skip
+    assert cake_kcp.SavedDetKcp._OPTIONAL == ("c1_recv", "M_seg", "carry")
+    with pytest.raises(NotImplementedError, match="save_mode='tape'"):
+        cake_kcp._prepare(
+            *(torch.zeros(1),) * 5, ctx, scale=0.5, save_mode="tape", workspace=None, options={}, backward=False
+        )  # fmt: skip
+
+
+@pytest.mark.parametrize("lengths,H", CKPT_ROWS, ids=CKPT_IDS)
+def test_gpu_fused_forward_output_is_bitwise_and_one_launch_fewer(
+    device, monkeypatch, lengths, H
+) -> None:
+    """The fused forward walk (``fwd_o_fuse=1``, shipped) against the tape walk(s) + ``fwd_o`` (knob ``0``), one rank:
+    the output (with and without a saved set and a workspace), the saved set and the gradients of both backward modes
+    bitwise; the forward launches ``kcp_fwdh_o`` in place of every ``kcp_fwdh_tape`` launch and no ``fwd_o`` (one
+    launch fewer, the sequence otherwise the same); the two backward modes' sequences are the same under both values
+    and launch no fused walk."""
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
+    ctx, ops = _ckpt_problem(device, lengths, H)
+    args = [ops[n] for n in ("q", "k", "v", "g", "beta")]
+    res: dict = {}
+    recs: dict = {}
+    for fuse in (0, 1):
+        knobs = {"_kcp_test_knobs": {"fwd_o_fuse": fuse}}
+        ws = cake_kcp.WorkspaceDetKcp()
+        out, saved = cake_kcp.chunk_kda_det_fwd_kcp(*args, ctx, workspace=ws, **knobs)
+        fwd = dict(cake_kcp.LAST_CALL["fwd"])
+        light, _ = cake_kcp.chunk_kda_det_fwd_kcp(
+            *args, ctx, save_for_backward=False, **knobs
+        )
+        g_saved = cake_kcp.chunk_kda_det_bwd_kcp(
+            *args, ctx, ops["dout"], saved=saved, workspace=ws, **knobs
+        )
+        bwd_saved = dict(cake_kcp.LAST_CALL["bwd"])
+        g_replay = cake_kcp.chunk_kda_det_bwd_kcp(
+            *args, ctx, ops["dout"], saved=None, workspace=ws, **knobs
+        )
+        bwd_replay = dict(cake_kcp.LAST_CALL["bwd"])
+        torch.cuda.synchronize(device)
+        res[fuse] = (out, light, *saved.tensors(), *g_saved, *g_replay)
+        recs[fuse] = (fwd, bwd_saved, bwd_replay)
+        assert fwd["fwd_o_fuse"] == fuse
+    for a, b in zip(res[0], res[1], strict=True):
+        assert (
+            a.shape == b.shape
+            and a.dtype == b.dtype
+            and torch.equal(_bits(a), _bits(b))
+        )
+    (f0, s0, r0), (f1, s1, r1) = recs[0], recs[1]
+    assert "fwd_o" in f0["sequence"] and "kcp_fwdh_o" not in f0["sequence"]
+    assert "fwd_o" not in f1["sequence"] and "kcp_fwdh_tape" not in f1["sequence"]
+    assert (
+        f1["sequence"].count("kcp_fwdh_o") == f0["sequence"].count("kcp_fwdh_tape") > 0
+    )
+    renamed = ["kcp_fwdh_tape" if s == "kcp_fwdh_o" else s for s in f1["sequence"]]
+    assert renamed == [s for s in f0["sequence"] if s != "fwd_o"]
+    assert f0["n_launches"] - f1["n_launches"] == 1
+    assert {name for name, _form, _n in f1["walk_forms"]} >= {"kcp_fwdh_o"}
+    for b0, b1 in ((s0, s1), (r0, r1)):
+        assert b0["sequence"] == b1["sequence"] and "kcp_fwdh_o" not in b1["sequence"]
+        assert b0["n_launches"] == b1["n_launches"]
 
 
 def test_gpu_host_trim_fresh_context_per_call_releases_everything(device) -> None:

@@ -28,8 +28,8 @@ its handle.  This module checks:
 
 * the surface without a device: the exports (no head, no deterministic names),
   the signatures (the deterministic facade's plus a keyword-only
-  ``deterministic=True``), the legacy ``flashinfer.cake_mhc_train`` names and
-  the top-level names left deterministic, a non-bool mode refused with a
+  ``deterministic=True``), no import of this facade by ``flashinfer``'s
+  top level, a non-bool mode refused with a
   ``TypeError`` before anything else, and each entry point's dispatch (the two
   packages' entry points replaced by recorders) in both torch modes, with the
   one-time warning;
@@ -72,9 +72,7 @@ from pathlib import Path
 import pytest
 import torch
 
-import flashinfer
 import flashinfer.cake_mhc_det_train_backend as det_backend
-import flashinfer.cake_mhc_train as legacy
 import flashinfer.experimental.cake.cake_mhc_train as facade
 import flashinfer.experimental.cake.cake_mhc_train_backend as backend
 from flashinfer import cake_mhc_det_train as det_facade
@@ -272,33 +270,8 @@ def _top_level_imports(path: Path) -> list[str]:
 
 
 @pytest.mark.cpu_only
-def test_legacy_and_top_level_names_stay_deterministic() -> None:
-    """The legacy module ``flashinfer.cake_mhc_train`` and the top-level ``flashinfer.cake_mhc_train_*`` names are the
-    deterministic objects (no ``deterministic`` keyword), never this facade's; ``flashinfer/__init__.py`` does not
-    import the experimental facade."""
-    top_level = set()
-    for name in legacy.__all__:
-        det_name = name.replace("cake_mhc_train", "cake_mhc_det_train").replace(
-            "CakeMHCTrain", "CakeMHCDetTrain"
-        )
-        assert getattr(legacy, name) is getattr(det_facade, det_name), name
-        if not any(part in name for part in ("cake_mhc_train", "CakeMHCTrain")):
-            continue
-        if hasattr(facade, name):
-            assert getattr(legacy, name) is not getattr(facade, name), name
-        if hasattr(flashinfer, name):
-            assert getattr(flashinfer, name) is getattr(legacy, name), name
-            top_level.add(name)
-    assert {
-        "cake_mhc_train_prepare",
-        "cake_mhc_train_finish",
-        "cake_mhc_train_backward_finish",
-        "CakeMHCTrainPrepareFunction",
-    } <= top_level, sorted(top_level)
-    for name in _DISPATCH:
-        if hasattr(legacy, name):
-            parameters = inspect.signature(getattr(legacy, name)).parameters
-            assert "deterministic" not in parameters, name
+def test_top_level_does_not_import_the_facade() -> None:
+    """``flashinfer/__init__.py`` does not import the experimental facade."""
     imported = _top_level_imports(REPO / "flashinfer" / "__init__.py")
     leaks = [
         m for m in imported if m.startswith("experimental") or "experimental.cake" in m

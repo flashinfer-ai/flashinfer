@@ -1084,7 +1084,7 @@ class BlockSparseAttentionWrapper:
             self._vsa_v_scale = v_scale
             return
 
-        # ---- VSA SM120 blk64 backend (sm120_blk64 CuTe-DSL kernel) ---------------
+        # ---- VSA SM120 blk64 backend (persistent Cake program) --------------------
         if self._backend == "vsa_sm120_blk64":
             cc = get_compute_capability(self.device)
             arch = cc[0] * 10 + cc[1]
@@ -1122,8 +1122,15 @@ class BlockSparseAttentionWrapper:
 
             MB = M // R
             NB = N // C
-            # sm120 handles GQA natively via gqa_ratio; index is per QO head.
+            # The persistent Cake program reads each QO head's row of the
+            # selection (GQA heads map to their KV head in the kernel).
             H = num_qo_heads
+            from . import cake_vsa_sm120  # noqa: PLC0415
+
+            num_sms = torch.cuda.get_device_properties(
+                self.device
+            ).multi_processor_count
+            group_size = num_qo_heads // num_kv_heads
 
             if block_mask is not None:
                 if block_mask.shape != (H, MB, NB):
@@ -1131,8 +1138,8 @@ class BlockSparseAttentionWrapper:
                         f"block_mask must have shape (num_qo_heads={H}, MB={MB}, NB={NB}), "
                         f"got {tuple(block_mask.shape)}"
                     )
-                self._vsa_q2k_index, self._vsa_q2k_num = _block_mask_to_vsa_index(
-                    block_mask, self.device, non_blocking
+                self._vsa_sm120_plan = cake_vsa_sm120.plan_block_mask(
+                    block_mask, group_size, num_sms, self.device
                 )
             else:
                 if indptr is None or indices is None:
@@ -1140,8 +1147,8 @@ class BlockSparseAttentionWrapper:
                         "vsa_sm120_blk64 backend requires either block_mask or "
                         "(indptr, indices) to be provided."
                     )
-                self._vsa_q2k_index, self._vsa_q2k_num = _bsr_to_vsa_index(
-                    indptr, indices, MB, NB, H, self.device, non_blocking
+                self._vsa_sm120_plan = cake_vsa_sm120.plan_bsr(
+                    indptr, indices, MB, H, NB, group_size, num_sms, self.device
                 )
 
             self.M = M
@@ -1529,19 +1536,15 @@ class BlockSparseAttentionWrapper:
                 self._vsa_sage_fp8_block_sparse_num,
             )
 
-        # ---- VSA SM120 blk64 backend (sm120_blk64 CuTe-DSL kernel) ---------------
+        # ---- VSA SM120 blk64 backend (persistent Cake program) --------------------
         if self._backend == "vsa_sm120_blk64":
-            from flashinfer.cute_dsl.sparse.bsa_attn_sm120 import (
-                bsa_attn_sm120_blk64_fwd,
-            )  # noqa: PLC0415
+            from . import cake_vsa_sm120  # noqa: PLC0415
 
-            return _vsa_run_core(
-                bsa_attn_sm120_blk64_fwd,
+            return cake_vsa_sm120.run(
+                self._vsa_sm120_plan,
                 q,
                 k,
                 v,
-                self._vsa_q2k_index,
-                self._vsa_q2k_num,
                 self._sm_scale,
                 out,
                 lse,

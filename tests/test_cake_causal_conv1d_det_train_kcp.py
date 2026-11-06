@@ -30,7 +30,7 @@ the history rows, the backward's head rows and the tail fold all run through the
     the direct forward / backward calls, and the fold of the received ``dpre`` rows reproduces the unpartitioned
     launch's ``dx`` through the same host flow.
 
-A ``KcpContext`` is built with ``build_kcp_context`` when the KCP plan module is importable, else from the same
+A ``ContextDetKcp`` is built with ``build_context_det_kcp`` when the KCP plan module is importable, else from the same
 tables hand-built here (the plan's halo layout for one rank).
 """
 
@@ -176,19 +176,19 @@ def _halo_tables(lens, frags):
 
 
 def _context(lens, cuts, device):
-    """A one-rank ``KcpContext`` for ``cuts`` over documents ``lens``: ``build_kcp_context`` when the plan module
+    """A one-rank ``ContextDetKcp`` for ``cuts`` over documents ``lens``: ``build_context_det_kcp`` when the plan module
     is importable, else a stand-in with the same fields the conv host module reads."""
     S, cu_global, frags = _fragments(lens, cuts)
     try:
-        from flashinfer.experimental.cake_kda_train.cake_kcp_plan import (
-            build_kcp_context,
-            kcp_partition,
+        from flashinfer.experimental.cake_kda_det_train_kcp.cake_kcp_plan import (
+            build_context_det_kcp,
+            partition_det_kcp,
         )
 
-        part = kcp_partition(
+        part = partition_det_kcp(
             torch.tensor(cu_global, dtype=torch.int64), 1, fragments=[frags]
         )
-        ctx = build_kcp_context(part, None, 0, device, conv_kernel_size=WIDTH)
+        ctx = build_context_det_kcp(part, None, 0, device, conv_kernel_size=WIDTH)
         return ctx, S, cu_global, frags
     except ImportError:
         pass

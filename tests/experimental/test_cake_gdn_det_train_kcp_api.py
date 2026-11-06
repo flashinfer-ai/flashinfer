@@ -12,7 +12,7 @@ limitations under the License.
 
 CPU tests of the public surface of the context-parallel packed GDN training route: the options validator
 (``cake_gdn_det_train_kcp.cake_options``), the keyword-only signatures, the facade ``flashinfer.cake_gdn_det_train_kcp`` (the contract names),
-the package hygiene rules (no environment variable, no ``cake_kda_train`` import, the host module's import allow-list)
+the package hygiene rules (no environment variable, no KDA package import, the host module's import allow-list)
 and the host tables built on the CPU for the correctness rows' partitions.  No kernel runs here.
 """
 
@@ -591,7 +591,7 @@ def test_facade_exposes_the_contract_names_keyword_only() -> None:
     assert facade.PartitionDetKcp is pkg.PartitionDetKcp
     assert facade.RecomputeHandleDetKcp is pkg.RecomputeHandleDetKcp
     assert facade.SavedDetKcp is pkg.SavedDetKcp
-    assert facade.DEFAULT_SCALE == 128**-0.5 == pkg.SCALE
+    assert facade.DEFAULT_SCALE == 128**-0.5 == _mod("cake_kcp").SCALE
     with pytest.raises(AttributeError):
         facade.no_such_name  # noqa: B018
 
@@ -617,35 +617,7 @@ def test_package_init_re_exports_the_route() -> None:
         assert n in pkg.__all__
 
 
-# The pre-rename names: legacy facade name -> canonical facade name, legacy package-only name -> canonical name,
-# and the legacy package's submodules.
-LEGACY_FACADE_NAMES = {
-    "kcp_partition": "partition_det_kcp",
-    "build_kcp_context": "build_context_det_kcp",
-    "chunk_gdn_kcp": "chunk_gdn_det_kcp",
-    "chunk_gdn_kcp_fwd": "chunk_gdn_det_fwd_kcp",
-    "chunk_gdn_kcp_bwd": "chunk_gdn_det_bwd_kcp",
-    "gdn_kcp_workspace_bytes": "gdn_det_workspace_bytes_kcp",
-    "gdn_kcp_saved_bytes": "gdn_det_saved_bytes_kcp",
-    "gdn_kcp_comm_bytes": "gdn_det_comm_bytes_kcp",
-    "is_gdn_train_supported": "is_gdn_det_train_kcp_supported",
-    "KcpOptions": "OptionsDetKcp",
-    "KcpContext": "ContextDetKcp",
-    "KcpPartition": "PartitionDetKcp",
-    "KcpRecomputeHandle": "RecomputeHandleDetKcp",
-    "KcpSaved": "SavedDetKcp",
-    "KcpWorkspace": "WorkspaceDetKcp",
-}
-LEGACY_PACKAGE_NAMES = {
-    **{
-        k: v
-        for k, v in LEGACY_FACADE_NAMES.items()
-        if k not in ("is_gdn_train_supported",)
-    },
-    "ChunkGDNKcpFunction": "ChunkGDNDetFunctionKcp",
-    "KcpCall": "CallDetKcp",
-    "KcpFragment": "FragmentDetKcp",
-}
+# The pre-rename names, removed without aliases: the legacy modules and every legacy spelling of a det object.
 LEGACY_SUBMODULES = (
     "cake_backend",
     "cake_build",
@@ -657,63 +629,123 @@ LEGACY_SUBMODULES = (
     "cake_options",
     "cake_tables",
 )
+LEGACY_MODULES = (
+    "flashinfer.gdn_train",
+    "flashinfer.experimental.cake_gdn_train",
+    *(f"flashinfer.experimental.cake_gdn_train.{sub}" for sub in LEGACY_SUBMODULES),
+)
+LEGACY_NAMES = (
+    "kcp_partition",
+    "build_kcp_context",
+    "chunk_gdn_kcp",
+    "chunk_gdn_kcp_fwd",
+    "chunk_gdn_kcp_bwd",
+    "gdn_kcp_workspace_bytes",
+    "gdn_kcp_saved_bytes",
+    "gdn_kcp_comm_bytes",
+    "gdn_kcp_saved_layout",
+    "gdn_kcp_workspace_layout",
+    "is_gdn_train_supported",
+    "KcpOptions",
+    "KcpContext",
+    "KcpPartition",
+    "KcpRecomputeHandle",
+    "KcpSaved",
+    "KcpWorkspace",
+    "KcpCall",
+    "KcpFragment",
+    "ChunkGDNKcpFunction",
+)
+# The package-level names without ``det``: they stay in their modules and are not exported by the package.
+DET_FREE_NAMES = (
+    "KCP_SAVED_VERSION",
+    "LAST_CALL",
+    "PROGRAMS",
+    "SCALE",
+    "Backend",
+    "FakeBackend",
+    "KernelBackend",
+    "get_backend",
+    "graph_cache_clear",
+    "make_options",
+    "set_backend",
+    "validate_heads",
+    "validate_ring",
+)
 
 
-def test_legacy_names_are_aliases_of_the_canonical_objects() -> None:
-    """``flashinfer.gdn_train`` and ``flashinfer.experimental.cake_gdn_train`` are compatibility paths: every legacy
-    name is the very object of its canonical name, and every legacy submodule is the canonical module object."""
+def test_legacy_names_are_removed() -> None:
+    """``flashinfer.gdn_train`` and ``flashinfer.experimental.cake_gdn_train`` (and its modules) do not import, and no
+    module of the deterministic route binds a pre-rename name."""
+    for name in LEGACY_MODULES:
+        with pytest.raises(ModuleNotFoundError):
+            importlib.import_module(name)
     facade = importlib.import_module("flashinfer.cake_gdn_det_train_kcp")
-    legacy = importlib.import_module("flashinfer.gdn_train")
-    assert set(legacy.__all__) == {
-        n for n in LEGACY_FACADE_NAMES if n not in ("KcpSaved", "KcpWorkspace")
-    }
-    for old, new in LEGACY_FACADE_NAMES.items():
-        assert getattr(legacy, old) is getattr(facade, new), old
-        assert old not in facade.__all__, old
-    assert legacy.DEFAULT_SCALE == facade.DEFAULT_SCALE
-    with pytest.raises(AttributeError):
-        legacy.no_such_name  # noqa: B018
+    modules = [facade, _mod()] + [_mod(sub) for sub in (*LEGACY_SUBMODULES, "cake_l2n")]
+    for module in modules:
+        for old in LEGACY_NAMES:
+            assert not hasattr(module, old), (module.__name__, old)
 
-    pkg = importlib.import_module(PACKAGE)
-    legacy_pkg = importlib.import_module("flashinfer.experimental.cake_gdn_train")
-    # star-import of the legacy package binds the canonical names and the pre-rename ones
-    assert set(legacy_pkg.__all__) == set(pkg.__all__) | set(LEGACY_PACKAGE_NAMES)
-    assert len(legacy_pkg.__all__) == len(set(legacy_pkg.__all__))
-    for old in LEGACY_PACKAGE_NAMES:
-        assert old in legacy_pkg.__all__, old
-    for n in pkg.__all__:
-        assert getattr(legacy_pkg, n) is getattr(pkg, n), n
-    for old, new in LEGACY_PACKAGE_NAMES.items():
-        assert old not in pkg.__all__, old
-        assert getattr(pkg, old) is getattr(pkg, new), old
-        assert getattr(legacy_pkg, old) is getattr(pkg, new), old
-    for sub in LEGACY_SUBMODULES:
-        canonical = importlib.import_module(f"{PACKAGE}.{sub}")
-        # bound as an attribute by the legacy package's import, before any import of the legacy submodule path
-        assert getattr(legacy_pkg, sub) is canonical, sub
-        assert (
-            importlib.import_module(f"flashinfer.experimental.cake_gdn_train.{sub}")
-            is canonical
-        ), sub
-    # the defining modules keep the old names as aliases too (``from <old path>.cake_kcp_plan import KcpContext``)
-    plan = importlib.import_module(
-        "flashinfer.experimental.cake_gdn_train.cake_kcp_plan"
-    )
-    assert plan.KcpContext is plan.ContextDetKcp is pkg.ContextDetKcp
-    assert plan.build_kcp_context is plan.build_context_det_kcp
-    assert plan.kcp_partition is plan.partition_det_kcp
-    kcp = importlib.import_module(f"{PACKAGE}.cake_kcp")
-    assert kcp.chunk_gdn_kcp is kcp.chunk_gdn_det_kcp
-    gb = importlib.import_module(f"{PACKAGE}.cake_bytes")
-    assert gb.gdn_kcp_saved_layout is gb.gdn_det_saved_layout_kcp
-    assert gb.gdn_kcp_workspace_layout is gb.gdn_det_workspace_layout_kcp
-    assert kcp.KcpOptions is kcp.OptionsDetKcp is _mod("cake_options").KcpOptions
-    assert pkg.ContextDetKcp.__qualname__ == "ContextDetKcp"
-    assert pkg.chunk_gdn_det_kcp.__name__ == "chunk_gdn_det_kcp"
+
+def test_package_exports_the_det_names_only() -> None:
+    """The package's ``__all__`` holds the names that carry ``det`` only, each bound; the constants and backend
+    controls without ``det`` are neither exported nor bound by the package, and are read from their modules."""
+    pkg = _mod()
+    assert pkg.__all__ and [n for n in pkg.__all__ if "det" not in n.lower()] == []
+    assert all(hasattr(pkg, n) for n in pkg.__all__)
+    holders = (_mod("cake_kcp"), _mod("cake_options"))
+    for n in DET_FREE_NAMES:
+        assert n not in pkg.__all__ and not hasattr(pkg, n), n
+        assert any(hasattr(m, n) for m in holders), n
+
+
+def test_det_entries_take_no_deterministic_keyword() -> None:
+    """The det entries of the facade and the package take no ``deterministic`` keyword: any value is a
+    ``TypeError``; the same call without it runs (fake backend, CPU)."""
+    facade = importlib.import_module("flashinfer.cake_gdn_det_train_kcp")
+    pkg = _mod()
+    cpu = torch.device("cpu")
+    cu = torch.tensor([0, 300], dtype=torch.int64)
+    part = pkg.partition_det_kcp(cu, 1)
+    ctx = pkg.build_context_det_kcp(part, None, 0, cpu)
+    T, H_qk, HV = 300, 1, 1
+    q = torch.zeros(T, H_qk, 128, dtype=torch.bfloat16)
+    v = torch.zeros(T, HV, 128, dtype=torch.bfloat16)
+    g = torch.zeros(T, HV)
+    beta = torch.full((T, HV), 0.5)
+    qkv = torch.zeros(T, (2 * H_qk + HV) * 128, dtype=torch.bfloat16)
+    calls = {
+        "partition_det_kcp": lambda f, **kw: f(cu, 1, **kw),
+        "build_context_det_kcp": lambda f, **kw: f(part, None, 0, cpu, **kw),
+        "chunk_gdn_det_kcp": lambda f, **kw: f(
+            q, q, v, g, beta, ctx, backend="fake", **kw
+        ),
+        "chunk_gdn_det_fwd_kcp": lambda f, **kw: f(
+            q, q, v, g, beta, ctx, backend="fake", **kw
+        ),
+        "chunk_gdn_det_bwd_kcp": lambda f, **kw: f(
+            q, q, v, g, beta, ctx, v, backend="fake", **kw
+        ),
+        "gdn_det_workspace_bytes_kcp": lambda f, **kw: f(ctx, H_qk=H_qk, HV=HV, **kw),
+        "gdn_det_saved_bytes_kcp": lambda f, **kw: f(ctx, H_qk=H_qk, HV=HV, **kw),
+        "gdn_det_comm_bytes_kcp": lambda f, **kw: f(ctx, H_qk=H_qk, HV=HV, **kw),
+        "packed_qkv_views_det_kcp": lambda f, **kw: f(qkv, H_qk=H_qk, HV=HV, **kw),
+    }
+    for name, call in calls.items():
+        for fn in (getattr(facade, name), getattr(pkg, name)):
+            assert "deterministic" not in inspect.signature(fn).parameters, name
+            call(fn)
+            for value in (True, False, None):
+                with pytest.raises(TypeError, match="deterministic"):
+                    call(fn, deterministic=value)
+    fn = facade.is_gdn_det_train_kcp_supported
+    assert "deterministic" not in inspect.signature(fn).parameters
+    with pytest.raises(TypeError, match="deterministic"):
+        fn(None, deterministic=True)
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# package hygiene (no cake_kda_train import; no os.environ; the host module's import allow-list)
+# package hygiene (no KDA package import; no os.environ; the host module's import allow-list)
 
 
 def _package_sources() -> list[pathlib.Path]:
@@ -729,25 +761,20 @@ def _facade_source() -> pathlib.Path:
     ).resolve()
 
 
-def test_package_never_imports_cake_kda_train() -> None:
+def test_package_never_imports_a_kda_package() -> None:
     for path in _package_sources() + [_facade_source()]:
         tree = ast.parse(path.read_text())
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for a in node.names:
-                    assert "cake_kda_train" not in a.name, (path.name, a.name)
+                    assert "cake_kda" not in a.name, (path.name, a.name)
             elif isinstance(node, ast.ImportFrom):
-                assert "cake_kda_train" not in (node.module or ""), (
+                assert "cake_kda" not in (node.module or ""), (
                     path.name,
                     node.module,
                 )
                 for a in node.names:
-                    assert a.name != "cake_kda_train", (path.name, a.name)
-        assert (
-            "cake_kda_train"
-            not in path.read_text().replace("Provenance", "").split("import os")[0]
-            or True
-        )
+                    assert "cake_kda" not in a.name, (path.name, a.name)
 
 
 def test_package_reads_no_environment_variable() -> None:
@@ -820,6 +847,7 @@ def test_program_vocabulary_is_the_design_list() -> None:
         "fwd_prep",
         "kcp_fwdh_offset",
         "kcp_fwdh_tape",
+        "kcp_fwdh_out",
         "kcp_transfer_walk",
         "kcp_affine_merge",
         "fwd_o",
@@ -844,10 +872,14 @@ def test_program_vocabulary_is_the_design_list() -> None:
     assert (
         kcp.TART_MODULE_OF["kcp_affine_merge"] == "kda_chunk_kcp_affine_merge_fp32_v1"
     )  # reused verbatim
+    # the output walk: a det-neutral module (the non-deterministic package ships the same program)
+    assert kcp.TART_MODULE_OF["kcp_fwdh_out"] == "gdn_chunk_fwdh_out_v1_kcp"
     for name, module in kcp.TART_MODULE_OF.items():
-        if name != "kcp_affine_merge":
-            # the deterministic family's stems; the context-parallel-only programs carry the ``_kcp`` suffix
+        if name not in ("kcp_affine_merge", "kcp_fwdh_out"):
+            # the deterministic family's stems
             assert module.startswith("gdn_chunk_det_"), (name, module)
+        if name != "kcp_affine_merge":
+            # the context-parallel-only programs carry the ``_kcp`` suffix
             assert module.endswith("_kcp") == name.startswith("kcp_"), (name, module)
     assert kcp.FWD_TAPES == (
         "w",
@@ -869,7 +901,12 @@ def test_program_vocabulary_is_the_design_list() -> None:
         "dg_part",
         "gamma_dot",
     )
-    for prog in ("kcp_fwdh_offset", "kcp_transfer_walk", "kcp_dhu_offset"):
+    for prog in (
+        "kcp_fwdh_offset",
+        "kcp_fwdh_out",
+        "kcp_transfer_walk",
+        "kcp_dhu_offset",
+    ):
         args = kcp.PROGRAM_ARGS[prog]
         assert (
             "num_heads" in args
@@ -891,6 +928,13 @@ def test_program_vocabulary_is_the_design_list() -> None:
     assert "group_reduce" in kcp.PROGRAM_ARGS["bwd_dqkg"]
     assert set(kcp.HOST_ONLY_ARGS) <= set(kcp.PROGRAM_ARGS["bwd_dqkg"])
     assert "o" in kcp.PROGRAM_ARGS["fwd_o"] and "out" not in kcp.PROGRAM_ARGS["fwd_o"]
+    # the output walk: the tape walk's inputs and #5's operands, writes o and neither tape nor final-state pool
+    fused = kcp.PROGRAM_ARGS["kcp_fwdh_out"]
+    assert {"q", "aqk", "qscale", "o", "h0", "h0_index"} <= set(fused)
+    assert not {"h_tape", "v_new", "out", "out_index", "ticket"} & set(fused)
+    assert set(fused) - {"q", "aqk", "qscale", "o"} <= set(
+        kcp.PROGRAM_ARGS["kcp_fwdh_tape"]
+    )
     assert (
         "do" in kcp.PROGRAM_ARGS["bwd_prep"]
         and "dout" not in kcp.PROGRAM_ARGS["bwd_prep"]
@@ -957,7 +1001,7 @@ def test_fwdh_form_rule_follows_the_chain_clause() -> None:
     its longest chain (``walk_vh64_fits``: LPT of ``2 * HV`` CTAs per segment over ``2 * sm_count`` slots), else
     vh = 128; the test knob ``fwdh_vh`` forces a form (both forms are bitwise twins)."""
     kcp = _mod("cake_kcp")
-    assert kcp.FWDH_PROGRAMS == ("kcp_fwdh_offset", "kcp_fwdh_tape")
+    assert kcp.FWDH_PROGRAMS == ("kcp_fwdh_offset", "kcp_fwdh_tape", "kcp_fwdh_out")
     assert kcp.fwdh_vh(3, 48, 152) == 64  # 144 head-CTAs <= 152 SMs (GB300)
     assert kcp.fwdh_vh(4, 48, 152) == 128  # 192 > 152, no chain clause
     assert kcp.fwdh_vh(4, 48, 152, fits=True) == 64
@@ -1132,8 +1176,9 @@ def test_forward_walk_form_follows_the_plan_chains() -> None:
     """Plan test of the #2 chain clause: one contiguous rank of four documents of 24 / 16 / 14 / 10 chunks at HV 6,
     one segment per document.  ``n_walk * HV = 24`` exceeds both SM counts below, so the one-wave clause alone takes
     vh = 128; at 20 SMs the 48 two-CTA items on 40 slots end at the longest chain (LPT makespan 24), so the forward's
-    tape walk launches the ``_vh64`` record; at 12 SMs (makespan 34) it stays vh = 128.  The fake backend runs the
-    forward the plan launches (the record list of ``LAST_CALL``)."""
+    walk launches the ``_vh64`` record; at 12 SMs (makespan 34) it stays vh = 128.  The rule is the same for the output
+    walk ``kcp_fwdh_out`` of the shipped forward-only call and for the tape walk of the split forward (test knob
+    ``fused_o=0``).  The fake backend runs the forward the plan launches (the record list of ``LAST_CALL``)."""
     kcp, plan = _mod("cake_kcp"), _mod("cake_kcp_plan")
     cu = _cu((24 * 64, 16 * 64, 14 * 64, 10 * 64))
     ops = _walk_form_ops(cu, 2, 6)
@@ -1145,16 +1190,18 @@ def test_forward_walk_form_follows_the_plan_chains() -> None:
         tb = kcp._Tables(ctx, 6, P=1)
         assert len(tb.walk_live) == 4 and tb.walk_fits(tb.walk_live, sm) is want
         assert kcp.fwdh_vh(4, 6, sm) == 128
-        kcp.chunk_gdn_det_fwd_kcp(*args, ctx, backend="fake", segments=1)
-        walks = [
-            r
-            for r, _ in kcp.LAST_CALL["fwd"]["records"]
-            if r.startswith("kcp_fwdh_tape")
-        ]
-        assert walks and all(r.endswith(kcp.VH64_SUFFIX) is want for r in walks), (
-            sm,
-            walks,
-        )
+        for knobs, prog in (
+            ({}, "kcp_fwdh_out"),  # the shipped forward-only call: the output walk
+            ({"test_knobs": {"fused_o": 0}}, "kcp_fwdh_tape"),  # the split forward
+        ):
+            kcp.chunk_gdn_det_fwd_kcp(*args, ctx, backend="fake", segments=1, **knobs)
+            walks = [
+                r
+                for r, _ in kcp.LAST_CALL["fwd"]["records"]
+                if r.removesuffix(kcp.VH64_SUFFIX) == prog
+            ]
+            forms = {r.endswith(kcp.VH64_SUFFIX) for r in walks}
+            assert walks and forms == {want}, (sm, prog, walks)
 
 
 @pytest.mark.parametrize(("sm", "want"), [(20, True), (12, False)])
@@ -1232,6 +1279,104 @@ def test_walk_forms_agree_across_forward_recompute_and_handle(
         assert fwdh and dhu, (name, forms)
         assert all(forms[b] == {want} for b in fwdh), (name, sm, forms)
         assert all(forms[b] == {True} for b in dhu), (name, forms)
+    assert paths["recompute"]["forms"] == paths["forward"]["forms"]
+    assert paths["handle"]["forms"] == paths["forward"]["forms"]
+
+
+def test_long_chain_dhu_forms_agree_across_forward_recompute_and_handle_on_sm_100a(
+    monkeypatch,
+) -> None:
+    """The three paths of :func:`test_walk_forms_agree_across_forward_recompute_and_handle` through the kernel
+    backend's host path on an ``sm_100a`` device: a :class:`KernelBackend` whose stub launcher reports ``sm_100a``
+    and runs every record through the torch emulation (no GPU).  With the long-chain threshold lowered to 24, the
+    rank of :func:`test_dhu_long_chain_flag_follows_the_plan_chains` (24 / 10 x 5 chunks, HV 6) on 17 SMs is a
+    long-chain #7 walk whose two-CTA grid ``2 * 6 * 6 = 72`` exceeds ``4 * 17 = 68``, so ``sm_100a``'s two-wave
+    rule takes vh = 128 for every #7 walk of the forward's backward, of torch's checkpoint recompute and of a
+    :class:`RecomputeHandleDetKcp` recompute (the fake backend, which has no architecture, takes vh = 64)."""
+    kcp, plan = _mod("cake_kcp"), _mod("cake_kcp_plan")
+    fake = _mod("cake_fake_backend")
+    monkeypatch.setattr(kcp, "DHU_LONG_CHAIN_MIN_CHUNKS", 24)
+    sm = 17
+    cu = _cu((24 * 64,) + (10 * 64,) * 5)
+    ops = _walk_form_ops(cu, 2, 6)
+    ctx = plan.build_context_det_kcp(
+        plan.partition_det_kcp(cu, 1, "contiguous"), None, 0, "cpu", sm_count=sm
+    )
+    tb = kcp._Tables(ctx, 6, P=1)
+    n_walk = len(tb.walk_live)
+    assert n_walk == 6 and tb.walk_long_chain(tb.walk_live, sm)
+    assert kcp.dhu_vh(n_walk, 6, sm, arch="sm_100a", long_chain=True) == 128
+    assert kcp.dhu_vh(n_walk, 6, sm, arch=None, long_chain=True) == 64
+
+    class Launcher:
+        @staticmethod
+        def device_arch(index):
+            return "sm_100a"
+
+        @staticmethod
+        def run_module(record, values, *, grid, device_index, module=None):
+            fake.run_module(record, values, grid=grid, device_index=None)
+
+    monkeypatch.setitem(kcp._BACKENDS, "fake", kcp.KernelBackend(launcher=Launcher()))
+    # a CPU call's launch device index (KernelBackend.run asks torch for it; no CUDA here)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    log: list = []
+    record = kcp._record
+
+    def recording(kind, call):
+        record(kind, call)
+        log.append((kind, [r for r, _ in kcp.LAST_CALL[kind]["records"]]))
+
+    monkeypatch.setattr(kcp, "_record", recording)
+
+    def run(ckpt: bool, handle: bool) -> dict:
+        del log[:]
+        leaves = [
+            ops[n].detach().clone().requires_grad_(True)
+            for n in ("q", "k", "v", "g", "beta")
+        ]
+        hd = kcp.RecomputeHandleDetKcp() if handle else None
+
+        def fn(q, k, v, g, beta, h):
+            return kcp.chunk_gdn_det_kcp(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ctx,
+                recompute_handle=h,
+                backend="fake",
+                segments=1,
+            )
+
+        if ckpt:
+            from torch.utils.checkpoint import checkpoint
+
+            out = checkpoint(fn, *leaves, hd, use_reentrant=False)
+        else:
+            out = fn(*leaves, hd)
+        out.backward(ops["dout"])
+        forms: dict = {}
+        for _kind, records in log:
+            for r in records:
+                base = r.removesuffix(kcp.VH64_SUFFIX)
+                if base in kcp.FWDH_PROGRAMS + kcp.DHU_PROGRAMS:
+                    forms.setdefault(base, set()).add(r.endswith(kcp.VH64_SUFFIX))
+        return {"kinds": [k for k, _ in log], "forms": forms}
+
+    paths = {
+        "forward": run(False, False),
+        "recompute": run(True, False),
+        "handle": run(True, True),
+    }
+    for name in ("recompute", "handle"):
+        assert paths[name]["kinds"].count("fwd") == 2, (name, paths[name]["kinds"])
+    for name, p in paths.items():
+        forms = p["forms"]
+        dhu = [b for b in forms if b in kcp.DHU_PROGRAMS]
+        assert "kcp_dhu_tape" in dhu, (name, forms)
+        assert all(forms[b] == {False} for b in dhu), (name, forms)
     assert paths["recompute"]["forms"] == paths["forward"]["forms"]
     assert paths["handle"]["forms"] == paths["forward"]["forms"]
 
@@ -1391,6 +1536,7 @@ def test_host_tables_build_on_the_cpu_for_every_rank(row) -> None:
         for prog in (
             "kcp_fwdh_offset",
             "kcp_fwdh_tape",
+            "kcp_fwdh_out",
             "kcp_transfer_walk",
             "kcp_affine_merge",
             "fwd_o",
@@ -1777,6 +1923,63 @@ def test_dhu_long_chain_flag_follows_the_plan_chains(monkeypatch, longest) -> No
     out.backward(ops["dout"])
     assert seen and all(isinstance(x, bool) for x in seen)
     assert any(seen) is (longest == 24), seen
+
+
+@pytest.mark.parametrize(
+    ("arch", "prog", "n_walk", "sm", "long_chain", "want"),
+    [
+        # sm_107a: the tape walk's two-wave rule, 2 * 12 * 48 = 1152 > 4 * 208 -> vh 128
+        ("sm_107a", "kcp_dhu_tape", 12, 208, False, 128),
+        ("sm_107a", "kcp_dhu_offset", 12, 208, False, 64),
+        # sm_100a: a long-chain walk takes the two-wave rule, 1152 > 4 * 148 -> vh 128
+        ("sm_100a", "kcp_dhu_tape", 12, 148, True, 128),
+        ("sm_100a", "kcp_dhu_offset", 12, 148, True, 128),
+        ("sm_100a", "kcp_dhu_tape", 12, 148, False, 64),
+        # sm_103a: the tape walk runs vh 64 at every load, long chain or not
+        ("sm_103a", "kcp_dhu_tape", 12, 152, True, 64),
+    ],
+)
+def test_kernel_backend_dhu_launch_reads_the_device_architecture(
+    arch, prog, n_walk, sm, long_chain, want
+) -> None:
+    """:meth:`KernelBackend.run` reads the architecture of the launch's device (``launcher().device_arch``) for a #7
+    launch, so the record it runs is the form :func:`dhu_vh` picks for that architecture.  A stub launcher stands in
+    for the launch glue (no GPU): its ``device_arch`` reports ``arch`` and its ``run_module`` records the record name
+    and grid of the launch."""
+    kcp, jit = _mod("cake_kcp"), _mod("cake_jit")
+    assert all((p + kcp.VH64_SUFFIX) in jit.MODULES for p in kcp.DHU_PROGRAMS)
+    asked: list = []
+    runs: list = []
+
+    class Launcher:
+        @staticmethod
+        def device_arch(index):
+            asked.append(index)
+            return arch
+
+        @staticmethod
+        def run_module(record, values, *, grid, device_index, module=None):
+            runs.append((record, grid, device_index, module))
+
+    tape = prog == "kcp_dhu_tape"
+    assert (
+        kcp.dhu_vh(n_walk, 48, sm, tape=tape, arch=arch, long_chain=long_chain) == want
+    )
+    call = types.SimpleNamespace(device=torch.device("cuda", 0), records=[])
+    args = {
+        "_call": call,
+        "_grid_args": {"n_walk": n_walk, "num_heads": 48},
+        "_sm_count": sm,
+        "_dhu_vh": None,
+        "_dhu_long_chain": long_chain,
+        "_grid": n_walk * 48,
+    }
+    kcp.KernelBackend(launcher=Launcher()).run(prog, args)
+    record = prog + kcp.VH64_SUFFIX if want == 64 else prog
+    grid = (n_walk * 48 * (2 if want == 64 else 1), 1, 1)
+    assert asked == [0]
+    assert runs == [(record, grid, 0, None)], (arch, prog, runs)
+    assert call.records == [(record, grid)]
 
 
 # The #7 long-chain clause rows of test_vectors_v3.json (R7C, schema r7c-walk-width-test-vectors-v2): every row with

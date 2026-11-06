@@ -6,8 +6,10 @@ checkpoint replay over a process group whose ranks each hold fragments of the
 documents of one packed batch, with precise (FP32 / TF32x3-class) cross-rank
 passing of the per-document recurrent state.  Tokens never move between ranks;
 only affine summaries of the state do.  The deterministic twin of this package is
-`flashinfer.experimental.cake_gdn_det_train_kcp`: the same contract and the
-same accuracy budgets, bitwise reproducible.  This package's results stay
+`flashinfer.experimental.cake_gdn_det_train_kcp`: the same entry points and
+the same accuracy budgets, bitwise reproducible; it does not take this
+package's non-deterministic-only `save_mode` values (`"light_akk"`, see
+"Options").  This package's results stay
 within the deterministic route's accuracy budgets and are not bitwise equal
 to its results; today they are run-to-run reproducible for a fixed plan and
 partition, and later versions may use unordered reductions
@@ -26,6 +28,31 @@ the twin) and reads no environment variable.
 
 The numbers of this file (shapes, bytes, limits) are the contract.
 
+## Mode and dispatch rules
+
+| call | `deterministic=False` | any other value (the default, `True`, `None`, `0`, `1`, `"False"`) | under `torch.use_deterministic_algorithms(True)` (strict or `warn_only=True`) |
+|---|---|---|---|
+| `flashinfer.cake_gdn_train_kcp.*` (every entry, the byte queries and `is_gdn_train_kcp_supported` included) | runs this package | `ValueError` naming the deterministic entry, before any work | runs this package; no reroute, no mode or fallback warning (each entry's one-time `ExperimentalWarning` is unrelated to the mode) |
+| this package's compute entries (`chunk_gdn_kcp`, `chunk_gdn_fwd_kcp`, `chunk_gdn_bwd_kcp`) | runs | `ValueError` naming the deterministic entry | runs; no alert (every launch is fixed-order) |
+| `flashinfer.cake_gdn_det_train_kcp.*_det_*` (the deterministic route) | no `deterministic` keyword (`TypeError`) | no `deterministic` keyword | unchanged: every launch is fixed-order |
+
+* This package and its facade `flashinfer.cake_gdn_train_kcp` are the
+  non-deterministic route only.  Nothing routes a call to the deterministic
+  package and nothing falls back to it: a caller who wants the deterministic
+  route calls `flashinfer.cake_gdn_det_train_kcp` (`partition_det_kcp`,
+  `build_context_det_kcp`, `chunk_gdn_det_kcp`, ...).
+* Every call states the mode: pass `deterministic=False` on every facade
+  call, the partition, the context and the byte queries included.
+* PyTorch's deterministic algorithms do not change the route.  A launch whose
+  result can vary run to run raises PyTorch's alert immediately before it runs
+  (`RuntimeError`; a `UserWarning` and then the launch under
+  `warn_only=True`).  Every launch of this version is fixed-order, so no call
+  raises it.
+* The partition / context / byte-query functions of this package
+  (`partition_kcp`, `build_context_kcp`, `gdn_*_bytes_kcp`) take no mode
+  keyword; their facade copies take `deterministic=False` like every facade
+  entry.
+
 ## Public entry points (`flashinfer/cake_gdn_train_kcp.py`)
 
 ```python
@@ -36,15 +63,16 @@ from flashinfer.cake_gdn_train_kcp import (
     is_gdn_train_kcp_supported,
 )
 
-part = partition_kcp(cu_seqlens_global_cpu, world_size, layout="zigzag_per_document")   # once per batch layout
-ctx = build_context_kcp(part, group, rank, device, conv_kernel_size=4)                 # tables and collectives of this rank
+nd = dict(deterministic=False)                                                         # required on every call
+part = partition_kcp(cu_seqlens_global_cpu, world_size, layout="zigzag_per_document", **nd)  # once per batch layout
+ctx = build_context_kcp(part, group, rank, device, conv_kernel_size=4, **nd)          # tables and collectives of this rank
 
-out = chunk_gdn_kcp(q, k, v, g, beta, ctx)                                             # autograd
-out, saved = chunk_gdn_fwd_kcp(q, k, v, g, beta, ctx, save_for_backward=True)
-dq, dk, dv, dbeta, dg = chunk_gdn_bwd_kcp(q, k, v, g, beta, ctx, dout, saved=saved)
-dq, dk, dv, dbeta, dg = chunk_gdn_bwd_kcp(q, k, v, g, beta, ctx, dout)                 # saved=None: checkpoint replay
+out = chunk_gdn_kcp(q, k, v, g, beta, ctx, **nd)                                       # autograd
+out, saved = chunk_gdn_fwd_kcp(q, k, v, g, beta, ctx, save_for_backward=True, **nd)
+dq, dk, dv, dbeta, dg = chunk_gdn_bwd_kcp(q, k, v, g, beta, ctx, dout, saved=saved, **nd)
+dq, dk, dv, dbeta, dg = chunk_gdn_bwd_kcp(q, k, v, g, beta, ctx, dout, **nd)           # saved=None: checkpoint replay
 
-ws = gdn_workspace_bytes_kcp(ctx, H_qk=16, HV=48)                                      # per rank, pure CPU: a fresh workspace's first call
+ws = gdn_workspace_bytes_kcp(ctx, H_qk=16, HV=48, **nd)                                # per rank, pure CPU: a fresh workspace's first call
 ```
 
 These thirteen names are the whole public surface (the `__all__` of
@@ -74,12 +102,10 @@ Every name of this package is the deterministic twin's name without `det`:
 | `ChunkGDNDetFunctionKcp` | `ChunkGDNFunctionKcp` |
 | `packed_qkv_views_det_kcp`, `PackedQKVSplitDetKcp` | `packed_qkv_views_kcp`, `PackedQKVSplitKcp` (package level) |
 
-The legacy names of the deterministic package keep meaning the deterministic
-objects: `flashinfer.gdn_train.chunk_gdn_kcp`, `KcpContext`, ... and the
-legacy package path `flashinfer.experimental.cake_gdn_train` (with its
-`chunk_gdn_kcp`) are aliases of `cake_gdn_det_train_kcp` objects, never of
-this package's.  The name `chunk_gdn_kcp` of this package is a different
-object from the legacy alias of the same spelling.
+The deterministic package is named by its det names (left column) only.
+This package binds none of the deterministic package's former no-det names
+(such as `kcp_partition` or `KcpContext`), and `chunk_gdn_kcp` is this
+package's own non-deterministic entry, never a deterministic object.
 
 The generated libraries are named `cake_gdn_train_<20 hex>` for the
 per-chunk programs and `cake_gdn_train_<20 hex>_kcp` for the
@@ -98,15 +124,11 @@ The packed GDN training routes come in four combinations:
 | deterministic | `flashinfer.experimental.cake_gdn_det_train` | `flashinfer.cake_gdn_det_train_kcp` -> `flashinfer.experimental.cake_gdn_det_train_kcp` |
 | non-deterministic | `flashinfer.experimental.cake.cake_gdn_train` | `flashinfer.cake_gdn_train_kcp` with `deterministic=False` -> this package |
 
-* The facade `flashinfer.cake_gdn_train_kcp` takes `deterministic: bool = True`
-  on every entry: `True` runs the deterministic package's objects, `False`
-  runs this package.  With `torch.use_deterministic_algorithms(True)`,
-  `deterministic=False` runs the deterministic package and warns once per
-  process.
-* This package's compute entries (`chunk_gdn_kcp`, `chunk_gdn_fwd_kcp`,
-  `chunk_gdn_bwd_kcp`) take `deterministic: bool = True` as well and raise
-  `ValueError` unless it is `False`: the package holds no deterministic
-  program and never falls back.
+* The facade `flashinfer.cake_gdn_train_kcp` and this package's compute
+  entries take `deterministic: bool = True` on every entry and raise
+  `ValueError` unless it is `False` (see "Mode and dispatch rules"): the
+  package holds no deterministic program, never routes to the deterministic
+  package and never falls back.
 * Faster schedule: the default segment plan of this package (`fill_small_guard`)
   walks fewer intra-rank segments than the deterministic package's plan where
   segment merges cost more than they save: at `HV <= 12`, when no fragment
@@ -138,8 +160,7 @@ The packed GDN training routes come in four combinations:
 * The mode is not stored in the context, the partition or the options: both
   routes build the same plan objects.  The autograd node records its
   forward's mode and its backward refuses another; `chunk_gdn_bwd_kcp`
-  refuses a saved set that is not this package's (`SavedKcp`), and the
-  facade's deterministic backward refuses this package's saved set.
+  refuses a saved set that is not this package's (`SavedKcp`).
 * Accuracy: every output stays within the deterministic route's budgets
   against the FP64 reference (`rel-RMS <= 1e-2`, `max-abs <= 2e-2` of
   `max|ref|`; the per-tensor KCP budgets of the deterministic tests).  The
@@ -266,7 +287,7 @@ eager calls too.
 
 | option | values | meaning |
 |---|---|---|
-| `save_mode` | **`"light"`**, `"full"` | `"light"` keeps the boundary states (with `save_transfer=True` also the received summary pairs and `M_seg`) and no tape: the backward re-runs the chunk preparation and replays the intra-rank tapes; `"full"` also keeps `M_seg` and every forward tape (the ten tapes `h`, `v_new`, `w`, `u`, `Aqk`, `Akk`, `gamma`, `gcum`, `rowscale`, `qscale`: 74,307 B per padded token row at `HV = 48`) |
+| `save_mode` | **`"light"`**, `"light_akk"`, `"full"` | `"light"` keeps the boundary states (with `save_transfer=True` also the received summary pairs and `M_seg`) and no tape: the backward re-runs the chunk preparation and replays the intra-rank tapes; `"light_akk"` (opt-in, `use_qk_l2norm_in_kernel=True` only) is `"light"` plus the chunk preparation's BF16 `Akk` tape (6,144 B per padded token row at `HV = 48`): the light replay then runs `fwd_prep_replay_l2n`, the chunk preparation reading that tape instead of forming it (no `K K^T` Gram, no block inverse; every other output bitwise the same), and under `torch.utils.checkpoint(use_reentrant=False)` it saves as `"light"`; `"full"` also keeps `M_seg` and every forward tape (the ten tapes `h`, `v_new`, `w`, `u`, `Aqk`, `Akk`, `gamma`, `gcum`, `rowscale`, `qscale`: 74,307 B per padded token row at `HV = 48`) |
 | `boundary_mode` | **`"saved"`**, `"replay"` | whether the cross-rank boundary states (`S_in`, the owner's received summaries) are kept in the saved set or recomputed (exchange included) in the backward; `"replay"` keeps no tape and no `qk_rstd` either: `save_mode="full"` there runs the same backward as `"light"` (the whole-forward replay) |
 | `exchange` | **`"a2a"`**, `"ring"` | the collective schedule; `"ring"` only when every document crosses at most 3 ranks (`n_d_max - 1 <= 2`) and `save_transfer=False` |
 | `save_transfer` | **`True`**, `False` | keep the received summary pairs for the backward (`False` re-sends the transposed transfers) |
@@ -308,10 +329,13 @@ bytes per padded token row, `R = 64 * NC_pad` rows per rank, at `HV = 48`):
 | `h` tape, `v_new`, `w`, `u`, `Aqk` | yes | **no** (replayed in the backward) | 67,584 B per token |
 | `qk_rstd` (`use_qk_l2norm_in_kernel=True`; `boundary_mode="saved"` only) FP32 | yes | yes | `8 * T_r * H_qk` |
 
+`save_mode="light_akk"` is the `"light"` column plus `Akk` (BF16
+`[R, HV, 64]`, 6,144 B per padded token row at `HV = 48`).
+
 With `boundary_mode="replay"` the saved set keeps no boundary state, no
-`M_seg`, no tape and no `qk_rstd` in either `save_mode`: the backward replays
-the whole forward, and `save_mode="full"` runs the same backward as
-`"light"`.
+`M_seg`, no tape and no `qk_rstd` in any `save_mode`: the backward replays
+the whole forward, and `save_mode="full"` / `"light_akk"` run the same
+backward as `"light"`.
 
 Everything is attached through the autograd `save_for_backward` only, so a
 `torch.utils.checkpoint(use_reentrant=False)` forward retains 0 B per entry
@@ -334,7 +358,8 @@ Two replays exist, and they differ:
   unless `reuse_recompute_tapes` keeps the recompute's tapes for it; with
   `recompute_output="auto"` the re-run may leave the output program out).
   Under `boundary_mode="replay"` the backward itself replays the whole forward
-  in either `save_mode`; it is the minimum-memory option.
+  in any `save_mode` (`save_mode="full"` / `"light_akk"` there run the same
+  backward as `"light"`); it is the minimum-memory option.
 
 Both replays give bitwise the gradients of the saved-set backward.
 
@@ -344,7 +369,7 @@ a `RecomputeHandleKcp` to the checkpointed function and to `chunk_gdn_kcp`:
 ```python
 def layer(x, handle):
     ...                                   # convolution, split, gates
-    return chunk_gdn_kcp(q, k, v, g, beta, ctx, recompute_handle=handle)
+    return chunk_gdn_kcp(q, k, v, g, beta, ctx, recompute_handle=handle, deterministic=False)
 
 y = torch.utils.checkpoint.checkpoint(layer, x, RecomputeHandleKcp(), use_reentrant=False)
 ```
@@ -489,11 +514,15 @@ gdn_workspace_bytes_kcp(ctx, *, H_qk, HV, save_mode="light", boundary_mode="save
     At P > 1 the c1 send pool also holds the M_f^T tiles (`c1_send_mf` = s * n_out(r)) and, with the fused walks, the
     carry plane max(n_in(r), n_out(r)) more slots (`fused_walks=0` is the test knob's split form); graph=,
     save_for_backward= and fused_walks= are keywords of this package's query only (the deterministic twin's query
-    has none: through the facade they need deterministic=False with torch's deterministic algorithms off); the b1
+    has none; through the facade they need deterministic=False, like every facade call, and
+    torch.use_deterministic_algorithms does not change the route); the b1
     pools take the larger split form; a backward on a caller-held workspace also sizes the forward exchange pools
     (c1_send, c2_send, c1_recv unless saved); with_conv=True (default) adds the layer convolution's halo rows, which
     the entry points do not allocate (with_conv=False: what a call binds); boundary_mode="replay" gives the same
-    figures for both save_mode values
+    figures for every save_mode value (the light replay form).  save_mode="light_akk" (use_qk_l2norm_in_kernel=True)
+    gives the light figures without Akk in the arena (the forward writes it into the saved set, the backward binds
+    it from there) for a call outside a checkpoint; under torch.utils.checkpoint(use_reentrant=False) the call runs
+    as save_mode="light" and binds the light figure: size a checkpointed light_akk layer with save_mode="light"
 ```
 
 `H_qk` enters the halo and strided-view terms; the exchange terms depend on
@@ -525,7 +554,7 @@ other reader (#2, #3, #5, #2+5, #2+5t, #7) is the unchanged program bound to `qn
 | path | `qn` / `kn` from | `r` the pullback reads | dropped |
 |---|---|---|---|
 | forward | `fwd_prep_l2n` | -- | `kn` before `out`, `qn` after #5 (a fused forward: both after its output walks; a hand-off forward hands both over with its tapes); the arena `r` after #1 (the saved `r` is a fresh tensor) |
-| light backward | the replay's `fwd_prep_l2n` | saved | after #8 |
+| light backward | the replay's `fwd_prep_l2n` (`save_mode="light_akk"`: `fwd_prep_replay_l2n`) | saved | after #8 |
 | kept recompute tapes | the recompute forward's `fwd_prep_l2n` (handed over with the tapes; no `qk_apply`) | saved | after #8 |
 | `save_mode="full"` | `qk_apply` after #6 | saved | after #8 |
 | `boundary_mode="replay"` | the replayed forward's `fwd_prep_l2n` | arena | after #8 |
@@ -592,6 +621,7 @@ with the `_kcp` suffix; its 20-hex digests equal that package's):
 | # | program | role |
 |---|---|---|
 | 1 | `fwd_prep` | per chunk: cumulative gate, `gamma`, the WY representation (`w`, `u`), `Aqk`, `Akk` |
+| 1r | `fwd_prep_replay_l2n` | the light replay of `save_mode="light_akk"` (in-kernel norm): `fwd_prep_l2n` reading the forward's saved `Akk` tape into the WY operand instead of forming it (no `K K^T` Gram, no block inverse, no `Akk` store); every other output bitwise `fwd_prep_l2n`'s; this package's own program (no deterministic twin) |
 | 2 | `kcp_fwdh` (`offset` / `tape` forms, each at value width `vh` 128 or 64) | the forward state walk over the rank's segments: from zero for the summary offset `B_f`, from `S_in` for the `h` / `v_new` tapes; the `vh` 64 form (two CTAs per segment and head, the `_vh64` records) runs when `n_walk × HV ≤ SM count` or when its two-CTA grid finishes within the longest walked segment (LPT over two CTAs per SM) and writes bitwise-identical results |
 | 3 | `kcp_transfer_walk` | the transfer `M_f` of a segment, TF32 hi/lo on the tensor cores (`precision_mode` 0) on eight compute warps (a column half each); its `precision_mode` 1 / 2 forms are four-warp test-only programs of `build.test.json` with bitwise the same results |
 | 4 | `kcp_affine_merge` (`c8` / `c16`) | FP32 affine chains over state (`S = M S + B`) and map (compose) tiles; transposed for the adjoint |

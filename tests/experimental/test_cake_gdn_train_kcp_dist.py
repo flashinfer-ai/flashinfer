@@ -32,9 +32,11 @@ what stays exact is structural (zero gradients, collective counts, byte counts, 
   same budget constants; ``.backward()`` twice: half the
   accumulated gradient against the FP64 gradient; ``save_mode="full"`` with ``save_transfer=False`` (a2a and, where
   the partition allows it, ring) runs with every package allocation filled with NaN bytes, and its saved set carries
-  ``M_seg`` exactly at ``P > 1`` (the full backward's merges read that plane; it runs no transfer walk); the rows plan
-  ``P = 1``, so the same forms run again at the forced ``P = 2`` (``segments=2``, where every rank's fragments take it)
-  against the light form at ``P = 2``, all under NaN-filled allocations;
+  ``M_seg`` exactly at ``P > 1`` (the full backward's merges read that plane; it runs no transfer walk); a row whose
+  ranks all plan ``P = 1`` reads no ``M_seg`` at its plan, so the same forms run again at the forced ``P = 2``
+  (``segments=2``, where every rank's fragments take it) against the light form at ``P = 2``, all under NaN-filled
+  allocations (a row that plans ``P > 1`` reads the plane at its plan and runs no forced form: the G1 cells are
+  budgets of the planned schedule);
 * worst case: ``N_REPEAT`` forward + backward runs per row, all recorded, the worst run per tensor gated;
 * semantics (G4): the zero-gradient leak stays exact (``dout`` zero outside one document -> exactly zero gradients on
   the others); independence (the other documents' operands replaced) within the budget constants;
@@ -51,8 +53,8 @@ what stays exact is structural (zero gradients, collective counts, byte counts, 
 ``test_poisoned_workspace_pairs``: one ``WorkspaceKcp`` reused across two rows of different token layouts on one group,
 every pool and tape of the workspace filled with NaN in between; both rows within the FP64 budgets, each also in the
 ``save_mode="full"`` / ``save_transfer=False`` form (and its ring form where eligible), at the plan's ``P`` and at the forced
-``P = 2`` where every rank's fragments take it, under NaN-filled allocations.  The convolution
-halo row C7 (``cake_causal_conv1d_kcp`` through this package's context) and the whole-layer checkpoint rows
+``P = 2`` where every rank plans ``P = 1`` and its fragments take it, under NaN-filled allocations.  The convolution
+halo row C7 (``cake_causal_conv1d_det_kcp`` through this package's context) and the whole-layer checkpoint rows
 (``RecomputeHandleKcp``: the recompute exchanges nothing; out / dx / dweight / dg / dbeta within the budget constants of
 the plain checkpoint and the direct pass and within the correctness clause of the FP64 layer oracle; the backward's
 collectives are the deterministic layer's) run under Slurm.
@@ -62,8 +64,8 @@ Packed QKV (#7817): under ``layout="tma"`` the backward of strided packed views 
 call); plain ``split`` views of the leaf, direct and checkpointed, get three contiguous gradients and keep torch's
 split backward and their hooks and ``retain_grad`` (issue #8367; within the same budgets).  ``test_l2n_rows`` / ``test_l2n_layer_checkpoint_rows``: the in-kernel Q / K L2 norm
 (``use_qk_l2norm_in_kernel=True``) on raw rows, every form within the FP64 budgets of the norm-off rows and of its
-partner, the deterministic package with the norm within the same constants, the token-local program outputs exact
-(see the block comment before ``V1_LIBRARIES``).
+partner, the deterministic package with the norm within the same constants, the token-local program outputs exact,
+and ``save_mode="light_akk"`` against the light form (see the block comment before ``V1_LIBRARIES``).
 
 Two launch forms: ``torch.multiprocessing.spawn`` (``pytest`` on a node with >= ``W`` GPUs) and one process per Slurm
 task (``SLURM_PROCID`` / ``SLURM_NTASKS``: the WORLD group is initialised once per process, every row runs on a
@@ -107,7 +109,23 @@ DET_PACKAGE = "flashinfer.experimental.cake_gdn_det_train_kcp"
 DET_API = (
     "flashinfer.cake_gdn_det_train_kcp"  # the deterministic route's public objects
 )
-FACADE = "flashinfer.cake_gdn_train_kcp"  # the mode-dispatching facade (deterministic=False -> this package)
+FACADE = "flashinfer.cake_gdn_train_kcp"  # this package's facade (takes deterministic=False only)
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _few_cpu_threads():
+    """The CPU emulation runs many small matmuls and elementwise ops.  On a host with hundreds of CPUs, torch's default
+    intra-op pool and the oneDNN matmul path (its own pool, which torch.set_num_threads does not resize) spend far more
+    time synchronizing threads than computing (see ``test_cake_gdn_train_kcp.py``), so this module runs with at most 8
+    threads and oneDNN off, as that suite does."""
+    threads, onednn = torch.get_num_threads(), torch.backends.mkldnn.enabled
+    torch.set_num_threads(min(threads, 8))
+    torch.backends.mkldnn.enabled = False
+    try:
+        yield
+    finally:
+        torch.backends.mkldnn.enabled = onednn
+        torch.set_num_threads(threads)
 
 
 def _mod(sub: str | None = None):
@@ -1920,7 +1938,7 @@ def _run_rank(
         flags["ring_full_saves_m_seg"] = info["ring_full"]["ok"]
         del res_ring, res_ring_full
     del res_recompute
-    # these rows plan P = 1: the same full / ring + full forms again at the forced P = 2 (segments override)
+    # rows whose ranks all plan P = 1: the same full / ring + full forms again at the forced P = 2 (segments override)
     info["p2_eligible"] = _p2_group_ok(ctx, HV, group, W, device)
     if info["p2_eligible"]:
         _p2_full_arms(saved_pass, arm, info, flags, ring=ring_eligible)
@@ -2646,11 +2664,14 @@ def _bitwise(a: dict, b: dict, names=TENSORS) -> dict[str, bool]:
 
 
 def _p2_group_ok(ctx, HV: int, group, W: int, device: torch.device) -> bool:
-    """Every rank's fragments take the segments override ``P = 2`` (the longest fragment of each rank has at least
-    two chunks).  The int1 rows plan ``P = 1``; the forced ``P = 2`` arms put the full form's read of the saved
-    ``M_seg^T`` plane on these rows.  A group decision (MIN over the ranks): every rank runs the same calls."""
+    """Every rank plans ``P = 1`` and its fragments take the segments override ``P = 2`` (the longest fragment of
+    each rank has at least two chunks).  Such a row reads no saved ``M_seg^T`` plane at its plan; the forced
+    ``P = 2`` arms put the full form's read of that plane on it.  A row that plans ``P > 1`` on some rank already
+    reads the plane in its planned forms, and forcing ``P = 2`` there lowers its plan (A4 int3 plans ``P = 24``):
+    a schedule its G1 cells (budgets of the planned schedule) do not cover, so it runs no forced form.  A group
+    decision (MIN over the ranks): every rank runs the same calls."""
     try:
-        ok = int(ctx.heads(HV, P=2).P) == 2
+        ok = int(ctx.heads(HV).P) == 1 and int(ctx.heads(HV, P=2).P) == 2
     except ValueError:
         ok = False
     flag = torch.tensor([1 if ok else 0], dtype=torch.int32, device=device)
@@ -2767,7 +2788,7 @@ def _run_rank_poison(
         del res
         # save_mode="full" without save_transfer on the same workspace under NaN-filled allocations (and its ring
         # form where the partition allows it): at P > 1 its backward reads the saved M_seg^T plane
-        # (+ the forced P = 2 forms where every rank's fragments take it: the pairs' rows plan P = 1)
+        # (+ the forced P = 2 forms where every rank plans P = 1 and its fragments take P = 2: _p2_group_ok)
         ring_ok = W > 1 and int(ctx.n_d_max) - 1 <= kcp.RING_MAX_HOPS
         forms = [("full_no_save_transfer", {})]
         if ring_ok:
@@ -3253,7 +3274,7 @@ def test_poison_pairs_change_the_layout() -> None:
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# C7: the convolution halo row.  The user calls FlashInfer's ``cake_causal_conv1d_kcp(x_local, weight, ctx)`` with
+# C7: the convolution halo row.  The user calls FlashInfer's ``cake_causal_conv1d_det_kcp(x_local, weight, ctx)`` with
 # THIS package's context: the conv package reads the halo plan (``ctx.halo``, ``ctx.halo_tables``), the local
 # ``cu_seqlens`` and the process group by duck typing.  The row's partition: document 0 = [1, 2, 300] on ranks 0,
 # 1 and 3 (the three history rows of rank 3's first outputs come from TWO predecessor ranks), rank 2 holds no token
@@ -3356,7 +3377,8 @@ def _run_rank_conv(
     """C7 on one rank: ``y`` / ``dx`` / ``dweight`` of the rank's tokens against the FP64 oracle of the whole pack,
     ``y`` bitwise equal to the conv package's single-rank conv of the whole pack on the rank's tokens, its repeat
     bitwise, and the halo-row gradients delivered to the predecessor ranks (rank 0 / 1: 1 / 2 tokens of document 0)."""
-    from flashinfer import cake_causal_conv1d_train as conv
+    from flashinfer import cake_causal_conv1d_det_train as conv
+    from flashinfer import cake_causal_conv1d_det_train_kcp as conv_kcp
 
     part, cu = _partition(row)
     ctx = plan.build_context_kcp(part, group, rank, device)
@@ -3370,10 +3392,10 @@ def _run_rank_conv(
     w_dev = w.to(device).requires_grad_(True)
     dy_local = dy_all[l2g].to(device)
     t0 = time.time()
-    y = conv.cake_causal_conv1d_kcp(x_local, w_dev, ctx)
+    y = conv_kcp.cake_causal_conv1d_det_kcp(x_local, w_dev, ctx)
     y.backward(dy_local)
     dx, dw = x_local.grad, w_dev.grad
-    y2 = conv.cake_causal_conv1d_kcp(x_local.detach(), w_dev.detach(), ctx)
+    y2 = conv_kcp.cake_causal_conv1d_det_kcp(x_local.detach(), w_dev.detach(), ctx)
     torch.cuda.synchronize(device)
     # the oracle (FP64 on this rank's device, the whole pack) and the single-rank conv of the whole pack
     y_ref, dx_ref, dpre, taps = _conv_reference(
@@ -3384,7 +3406,7 @@ def _run_rank_conv(
         [(dpre[sel] * tap[sel]).sum(0) for tap in taps], dim=1
     )  # this rank's partial of dweight (the framework reduces the ranks)
     cu_dev = torch.tensor(cu, dtype=torch.int32, device=device)
-    y_single = conv.cake_causal_conv1d(x_all.to(device), w.to(device), cu_dev)
+    y_single = conv.cake_causal_conv1d_det(x_all.to(device), w.to(device), cu_dev)
     flags: dict[str, bool] = {}
     metrics: dict[str, dict] = {}
     metrics["y"] = _outside(y, y_ref[sel], atol=CONV_Y_ATOL, rtol=CONV_Y_RTOL)
@@ -3441,13 +3463,13 @@ def _run_rank_conv(
 
 
 def test_conv_halo_row(slurm) -> None:
-    """C7: FlashInfer's ``cake_causal_conv1d_kcp`` through this package's context (duck typing): ``y`` / ``dx`` /
+    """C7: FlashInfer's ``cake_causal_conv1d_det_kcp`` through this package's context (duck typing): ``y`` / ``dx`` /
     ``dweight`` vs FP64 on every rank, ``y`` bitwise the conv package's single-rank conv, history rows from two
     predecessor ranks, an empty predecessor and a document start.  Runs under Slurm with >= 4 ranks."""
     if slurm is None:
         pytest.skip("the conv halo row runs under Slurm (4 ranks)")
-    conv = pytest.importorskip("flashinfer.cake_causal_conv1d_train")
-    if not conv.is_cake_causal_conv1d_train_supported(slurm.device):
+    conv = pytest.importorskip("flashinfer.cake_causal_conv1d_det_train")
+    if not conv.is_cake_causal_conv1d_det_train_supported(slurm.device):
         pytest.skip("the conv package does not support this device")
     _slurm_row(C7_ROW, slurm, "conv", _run_rank_conv)
 
@@ -3509,7 +3531,7 @@ def _layer_reference(
     x_dev, w_dev = x_all.to(device), w_all.to(device)
     cu_dev = torch.tensor(cu, dtype=torch.int32, device=device)
     with torch.no_grad():
-        y = conv.cake_causal_conv1d(x_dev, w_dev, cu_dev)
+        y = conv.cake_causal_conv1d_det(x_dev, w_dev, cu_dev)
     qkv = y.view(total, 2 * H_qk + HV, 128)
     q = _l2_normalize(qkv[:, :H_qk])
     k = _l2_normalize(qkv[:, H_qk : 2 * H_qk])
@@ -3563,7 +3585,8 @@ def _run_rank_layer(
 ) -> dict:
     """One whole-layer row (``l2n``: #7817, the in-kernel L2 norm on the raw convolution output views instead of the
     caller's norm)."""
-    from flashinfer import cake_causal_conv1d_train as conv
+    from flashinfer import cake_causal_conv1d_det_train as conv
+    from flashinfer import cake_causal_conv1d_det_train_kcp as conv_kcp
 
     H_qk, HV = row.heads
     C = (2 * H_qk + HV) * 128
@@ -3577,12 +3600,13 @@ def _run_rank_layer(
     ops = _local_inputs(row, part, cu, rank, device)
     g, beta, dout = ops["g"], ops["beta"], ops["dout"]
     conv_takes_handle = (
-        "recompute_handle" in inspect.signature(conv.cake_causal_conv1d_kcp).parameters
+        "recompute_handle"
+        in inspect.signature(conv_kcp.cake_causal_conv1d_det_kcp).parameters
     )
 
     def layer(x, w, g_, b_, h):
         ckw = {"recompute_handle": h} if (h is not None and conv_takes_handle) else {}
-        y = conv.cake_causal_conv1d_kcp(x, w, ctx, **ckw)
+        y = conv_kcp.cake_causal_conv1d_det_kcp(x, w, ctx, **ckw)
         qkv = y.view(y.shape[0], 2 * H_qk + HV, 128)
         if l2n:  # #7817: the raw views; the recurrence normalizes q / k itself
             q, k = qkv[:, :H_qk], qkv[:, H_qk : 2 * H_qk]
@@ -3640,7 +3664,7 @@ def _run_rank_layer(
 
     # the convolution's own forward collectives (its halo exchange), for the pending whole-layer count
     with CollectiveCounter() as cc_conv:
-        conv.cake_causal_conv1d_kcp(x_local, w_all.to(device), ctx)
+        conv_kcp.cake_causal_conv1d_det_kcp(x_local, w_all.to(device), ctx)
     conv_fwd = cc_conv.record()
     t0 = time.time()
     res_d, rec_d = run("direct")
@@ -3653,7 +3677,7 @@ def _run_rank_layer(
     det_ctx = det_api.build_context_det_kcp(det_part, group, rank, device)
     det_leaves = leaves_of()
     with _NamedCounter() as cc_det:
-        y_d = conv.cake_causal_conv1d_kcp(det_leaves[0], det_leaves[1], det_ctx)
+        y_d = conv_kcp.cake_causal_conv1d_det_kcp(det_leaves[0], det_leaves[1], det_ctx)
         qkv_d = y_d.view(y_d.shape[0], 2 * H_qk + HV, 128)
         if l2n:  # the deterministic layer with the norm on the same raw views
             qd, kd = qkv_d[:, :H_qk], qkv_d[:, H_qk : 2 * H_qk]
@@ -3765,8 +3789,8 @@ def test_layer_checkpoint_rows(row: Row, slurm) -> None:
     region with one recompute handle (see the block comment above).  Runs under Slurm with >= the row's ranks."""
     if slurm is None:
         pytest.skip("the layer rows run under Slurm")
-    conv = pytest.importorskip("flashinfer.cake_causal_conv1d_train")
-    if not conv.is_cake_causal_conv1d_train_supported(slurm.device):
+    conv = pytest.importorskip("flashinfer.cake_causal_conv1d_det_train")
+    if not conv.is_cake_causal_conv1d_det_train_supported(slurm.device):
         pytest.skip("the conv package does not support this device")
     _slurm_row(row, slurm, _backend_name(), _run_rank_layer)
 
@@ -3797,7 +3821,16 @@ def test_layer_checkpoint_rows(row: Row, slurm) -> None:
 # * packed QKV views with the norm: within the budgets of the contiguous call; the backward writes one packed dQKV
 #   row and ``packed_qkv_views_kcp`` hands it to the packed leaf without a concatenation;
 # * memory: no ``qn`` / ``kn`` / ``qk_rstd`` in the arena after a forward or a backward; the bytes a forward retains
-#   with the norm == without + ``8 T_r H_qk`` (the saved r); saved bytes on - off == the query's ``qk_rstd`` term.
+#   with the norm == without + ``8 T_r H_qk`` (the saved r); saved bytes on - off == the query's ``qk_rstd`` term;
+# * ``save_mode="light_akk"`` (the light set plus #1_l2n's ``Akk`` tape; the light replay runs ``fwd_prep_replay_l2n``,
+#   #1_l2n reading that tape): within the FP64 budgets and against the light form in every form (a2a / ring,
+#   ``save_transfer`` on / off, the plan's ``P`` and the forced ``P = 2``, autograd, checkpoint, CUDA-graph replay
+#   steps on the light steps' workspace); exact: the launch census (the backward's ``fwd_prep_l2n`` becomes the
+#   replay, once per light replay; the forward is light's), the saved ``Akk`` bytes (``128 R HV``, the byte query's
+#   difference), the checkpoint saving as ``"light"``, and on the kernel backend every form under NaN-filled
+#   allocations within the budgets of the light form of the same options, with the replay run; whether the two
+#   forms' bits agree (and whether the light form repeats its own) is recorded as data, not gated (the package
+#   has no bitwise contract).
 #
 # The rows skip with a clear reason while the registry does not ship the three records (the kernel backend refuses
 # the option then); ``KCP_TEST_BACKEND=fake`` runs them on the torch emulation.
@@ -4209,6 +4242,106 @@ def _run_rank_l2n(
             ring=W > 1 and int(ctx.n_d_max) - 1 <= kcp.RING_MAX_HOPS,
             **L2N,
         )
+    # (a2) save_mode="light_akk": the light set plus #1_l2n's BF16 Akk tape, whose light replay runs
+    # fwd_prep_replay_l2n (#1_l2n reading that tape).  Every form within the FP64 budgets and against its light
+    # partner; the launch census (the backward's fwd_prep_l2n becomes the replay, once per light replay; the forward
+    # is light's), the saved Akk bytes (128 R HV, the byte query's difference); on the kernel backend each form under
+    # NaN-filled allocations within the budgets of the light form of the same options (the arm below), the replay
+    # run gated, the bits against light and light's own repeat recorded as data only; autograd (the saved set
+    # through save_for_backward) and a non-reentrant checkpoint (the mode saves as "light" there).
+    akk_replay = kcp.AKK_REPLAY_OF["fwd_prep_l2n"]
+    akk_info: dict[str, object] = {"shipped": bool(jit.records_of_program(akk_replay))}
+    if not kernels or akk_info["shipped"]:
+        res_akk = saved_pass(save_mode="light_akk", **L2N)
+        arm("light_akk", res_akk, res, "run0")
+        lb, ab = res["bwd"], res_akk["bwd"]
+        n_l2n = lb["sequence"].count("fwd_prep_l2n")
+        flags["light_akk_census"] = bool(
+            res_akk["fwd"]["sequence"] == res["fwd"]["sequence"]
+            and ab["sequence"]
+            == [akk_replay if p_ == "fwd_prep_l2n" else p_ for p_ in lb["sequence"]]
+            and ab["sequence"].count(akk_replay) == n_l2n
+            and "fwd_prep_l2n" not in ab["sequence"]
+            and (T_r == 0 or (n_l2n >= 1 and ab["akk_source"] == "saved"))
+        )
+        replay_records = set(jit.records_of_program(akk_replay)) if kernels else set()
+        if kernels:
+            flags["light_akk_replay_records"] = sum(
+                r_ in replay_records for r_, _g in ab["records"]
+            ) == ab["sequence"].count(akk_replay) and [
+                g_ for _r, g_ in ab["records"]
+            ] == [g_ for _r, g_ in lb["records"]]
+        tape = int(ctx.R) * HV * 128
+        q_light = int(
+            gb.gdn_saved_bytes_kcp(ctx, H_qk=H_qk, HV=HV, with_conv=False, **L2N)
+        )
+        q_akk = int(
+            gb.gdn_saved_bytes_kcp(
+                ctx, H_qk=H_qk, HV=HV, save_mode="light_akk", with_conv=False, **L2N
+            )
+        )
+        flags["light_akk_saved_bytes"] = (
+            int(res_akk["saved"].bytes) - int(res["saved"].bytes)
+            == tape
+            == q_akk - q_light
+        )
+        akk_info["census"] = {
+            "light_bwd": list(lb["sequence"]),
+            "light_akk_bwd": list(ab["sequence"]),
+            "akk_source": ab["akk_source"],
+        }
+        akk_info["saved_bytes"] = {
+            "light": int(res["saved"].bytes),
+            "light_akk": int(res_akk["saved"].bytes),
+            "tape": tape,
+            "query_difference": q_akk - q_light,
+        }
+        del res_akk
+        if kernels:
+            forms = [("akk", {}), ("akk_no_save_transfer", {"save_transfer": False})]
+            if info["p2_eligible"]:
+                forms += [
+                    ("p2_akk", {"segments": 2}),
+                    (
+                        "p2_akk_no_save_transfer",
+                        {"segments": 2, "save_transfer": False},
+                    ),
+                ]
+            if W > 1 and int(ctx.n_d_max) - 1 <= kcp.RING_MAX_HOPS:
+                forms.append(("ring_akk", {"exchange": "ring", "save_transfer": False}))
+            for name, opts in forms:
+                o = {**opts, **L2N}
+                lt = _nan_allocations_pass(lambda o=o: saved_pass(**o))
+                lt2 = _nan_allocations_pass(lambda o=o: saved_pass(**o))
+                ak = _nan_allocations_pass(
+                    lambda o=o: saved_pass(save_mode="light_akk", **o)
+                )
+                arm(f"{name}_light", lt)
+                arm(f"{name}_light_akk", ak, lt, f"{name}_light")
+                repeat, bits = _bitwise(lt2, lt), _bitwise(ak, lt)
+                akk_info[name] = {
+                    "P": None if ak["saved"] is None else int(ak["saved"].P),
+                    "bitwise_vs_light": bits,
+                    "light_repeat_bitwise": repeat,
+                    "akk_source": ak["bwd"]["akk_source"],
+                }
+                flags[f"{name}_replay_ran"] = (
+                    T_r == 0 or ak["bwd"]["akk_source"] == "saved"
+                )
+                del lt, lt2, ak
+        res_aa = autograd_pass(False, save_mode="light_akk", **L2N)
+        flags["light_akk_autograd_replay_ran"] = (
+            T_r == 0 or kcp.LAST_CALL["bwd"]["akk_source"] == "saved"
+        )
+        arm("light_akk_autograd", res_aa, res_auto, "autograd")
+        res_ck = autograd_pass(True, save_mode="light_akk", **L2N)
+        flags["light_akk_ckpt_saves_light"] = (
+            kcp.LAST_CALL["bwd"]["save_mode"] == "light"
+            and akk_replay not in kcp.LAST_CALL["bwd"]["sequence"]
+        )
+        arm("light_akk_ckpt", res_ck, res_auto, "autograd")
+        del res_aa, res_ck
+    info["light_akk"] = akk_info
     res_host = saved_pass(group_reduce="host", **L2N)
     arm(
         "host_reduce", res_host, res, "run0", gate=False
@@ -4456,6 +4589,85 @@ def _run_rank_l2n(
     flags["l2n_graph_capture"] = bool(graph_ok)
     del g_res, g_cmp
 
+    # (e2) the same four steps with save_mode="light_akk" on the same workspace (its arena holds the light steps'
+    # tapes): the fourth replays both graphs and launches the replay in place of fwd_prep_l2n; within the budgets
+    akk_graph: dict[str, object] = {}
+    a_res = None
+    akk_graph_ok = (
+        True  # the replay not rendered (kernel backend): nothing of the mode runs
+    )
+    if not kernels or akk_info["shipped"]:
+        try:
+            kcp.graph_cache_clear()
+            events, sources = [], []
+            for _ in range(4):
+                out_g, saved_g = kcp.chunk_gdn_fwd_kcp(
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    ctx,
+                    workspace=ws,
+                    graph="replay",
+                    save_mode="light_akk",
+                    deterministic=False,
+                    **base,
+                    **L2N,
+                )
+                grads_g = kcp.chunk_gdn_bwd_kcp(
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    ctx,
+                    dout,
+                    saved=saved_g,
+                    workspace=ws,
+                    graph="replay",
+                    save_mode="light_akk",
+                    deterministic=False,
+                    **base,
+                    **L2N,
+                )
+                a_res = {
+                    "out": out_g.clone(),
+                    **{
+                        n: t.clone()
+                        for n, t in zip(
+                            ("dq", "dk", "dv", "dbeta", "dg"), grads_g, strict=True
+                        )
+                    },
+                }
+                events.append(
+                    [
+                        str(kcp.LAST_CALL["fwd"]["graph_event"]),
+                        str(kcp.LAST_CALL["bwd"]["graph_event"]),
+                    ]
+                )
+                sources.append(kcp.LAST_CALL["bwd"].get("akk_source"))
+            akk_graph["events"], akk_graph["akk_source"] = events, sources
+            akk_graph_ok = events[-1] == ["replay", "replay"] and (
+                T_r == 0 or all(src == "saved" for src in sources)
+            )
+            torch.cuda.synchronize(device)
+            kcp.graph_cache_clear()
+        except Exception as exc:  # noqa: BLE001 - recorded; the gate decides
+            akk_graph["error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
+            akk_graph_ok = False
+            a_res = None
+            kcp.graph_cache_clear()
+        a_cmp = (
+            a_res
+            if a_res is not None
+            else {n: torch.zeros_like(res[n]) for n in TENSORS}
+        )
+        arm("graph_replay_light_akk", a_cmp, res, "run0", gate=kernels)
+        del a_res, a_cmp
+    info["graph_light_akk"] = akk_graph
+    flags["l2n_graph_capture_light_akk"] = bool(akk_graph_ok)
+
     # (f) memory: nothing of the norm in the arena after a forward / a backward; retained after a forward = off + r
     wsm = kcp.WorkspaceKcp()
     bad = {*kcp.QK_TAPES, kcp.QK_RSTD}
@@ -4568,7 +4780,13 @@ def _run_rank_l2n(
                 keys.append(key)
     # a rank without tokens has no rows to compare: the token-local flags exist on the ranks with tokens only
     padded = [{key: fl.get(key, True) for key in keys} for fl in flag_list]
-    _fold(report, padded, verdicts, backend=backend, kernel_only={"l2n_graph_capture"})
+    _fold(
+        report,
+        padded,
+        verdicts,
+        backend=backend,
+        kernel_only={"l2n_graph_capture", "l2n_graph_capture_light_akk"},
+    )
     report["metrics"] = {n: verdicts.get(f"fp64:run0:{n}") for n in TENSORS}
     report["repeats"] = _worst_of_runs(verdicts, N_REPEAT)
     for n in TENSORS:
@@ -4599,8 +4817,8 @@ def test_l2n_layer_checkpoint_rows(row: Row, slurm) -> None:
     and without a recompute handle, against the FP64 layer oracle and one another within the budgets."""
     if slurm is None:
         pytest.skip("the layer rows run under Slurm")
-    conv = pytest.importorskip("flashinfer.cake_causal_conv1d_train")
-    if not conv.is_cake_causal_conv1d_train_supported(slurm.device):
+    conv = pytest.importorskip("flashinfer.cake_causal_conv1d_det_train")
+    if not conv.is_cake_causal_conv1d_det_train_supported(slurm.device):
         pytest.skip("the conv package does not support this device")
     backend = _backend_name()
     _skip_unless_l2n(backend)

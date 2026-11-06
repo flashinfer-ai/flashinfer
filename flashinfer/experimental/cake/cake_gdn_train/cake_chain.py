@@ -167,15 +167,24 @@ STITCH_VSPLIT = 4  # CTAs per (sequence, value head) of the stitch launch
 _MODE_CHECKED = object()
 
 
+# Each entry's deterministic counterpart in ``flashinfer.experimental.cake_gdn_det_train`` (named in the refusal).
+_DET_ENTRIES = {
+    "chunk_gated_delta_rule": "chunk_gated_delta_rule_det",
+    "ChunkGatedDeltaRuleFunction": "ChunkGatedDeltaRuleDetFunction",
+    "gdn_chunk_forward": "gdn_chunk_det_forward",
+    "gdn_chunk_backward": "gdn_chunk_det_backward",
+}
+
+
 def _require_nondeterministic(deterministic: Any, entry: str) -> None:
     """The mode contract of every entry: the package is the non-deterministic route (its results match the
     deterministic package within that package's accuracy budgets, not bitwise), so an entry takes
-    ``deterministic=False`` and raises ``ValueError`` for any other value (the deterministic package is
-    ``flashinfer.experimental.cake_gdn_det_train``)."""
+    ``deterministic=False`` and raises ``ValueError`` for any other value, naming the entry's deterministic
+    counterpart in ``flashinfer.experimental.cake_gdn_det_train``."""
     if deterministic is not False:
         raise ValueError(f"{entry} is the non-deterministic route and takes deterministic=False (got "
-                         f"{deterministic!r}); flashinfer.experimental.cake_gdn_det_train is the deterministic "
-                         "package")  # fmt: skip
+                         f"{deterministic!r}): pass deterministic=False for the non-deterministic path; the "
+                         f"deterministic entry is flashinfer.experimental.cake_gdn_det_train.{_DET_ENTRIES[entry]}")  # fmt: skip
 
 
 # Kernel parameter names of every stage in call-site order; a delivered record whose parameters are these names in
@@ -1984,8 +1993,8 @@ def _side_stream(device_index: int, main: torch.cuda.Stream) -> torch.cuda.Strea
 # The forward WY stage: on an architecture of ``WY_TC2_ARCHS`` every ``wy_tc`` launch (the forward, both sequence
 # groups of the P form and the backward's recompute) runs ``wy_tc2`` instead, the same per-element chains, grid and
 # outputs (so the same bits) with a 64-column TMEM accumulator and packed shared-memory operands, so five CTAs fit
-# on an SM where ``wy_tc`` fits four.  On sm_107a the stage runs ``wy_tc``.
-WY_TC2_ARCHS = ("sm_100a", "sm_103a")
+# on an SM where ``wy_tc`` fits four.
+WY_TC2_ARCHS = ("sm_100a", "sm_103a", "sm_107a")
 
 
 def wy_stage(arch: str) -> str:

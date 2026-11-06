@@ -84,7 +84,10 @@ column slab too (``cake_mhc_train_bwd_slab_atomic__lpt__h<H>``,
 ``cake_mhc_train_bwd_slab_atomic__lpt_os__h<H>``), picked as at hidden 4096.
 sm_103a has no ``lpt`` calibration of these sizes yet (``BWD_SLAB_LPT_HIDDEN`` is
 ``None`` there): its column slab runs ``dynr`` in the ``"chunk"`` band of
-``BWD_SLAB_ORDER`` and ``dynr_os`` in the ``"slab"`` band above it.
+``BWD_SLAB_ORDER`` and ``dynr_os`` in the ``"slab"`` band above it (on the
+152-SM board at 7168 in the bands of its cell of ``BWD_SLAB_ORDER_OVERRIDES``:
+``"slab"`` also on 47 of the 48 token-count segments in 33793..63091 whose
+column-slab chunk count is at least 19; 34817..35264 keeps ``"chunk"``).
 
 So ``bwd_finish`` is the deterministic token-owner pass, the fn split and the
 column slab: no final reduction, and the ``bwd`` workspace has no per-chunk
@@ -207,8 +210,9 @@ edges, measured at hidden 4096 and applied at every hidden size), where the
 early launch would hold the dependent's CTAs resident while the predecessor
 still runs.  The column-slab pass (every form) sits on the deterministic
 ``K6->K7`` edge: the token-owner pass releases the fn split at once and the fn
-split releases the column-slab pass at once, so the column-slab pass's early
-launch overlaps the token-owner pass as in the deterministic route.
+split releases the column-slab pass at once, so the column-slab pass may
+launch before the token-owner pass ends; it waits only for the fn split, whose
+last instruction waits for the token-owner pass.
 ``PDL_BAND_OVERRIDES`` holds this package's own bands, measured on its kernels
 per architecture, SM count and hidden size (the route plan passes the device's
 SM count): a cell replaces the ``PDL_OFF_BANDS`` cell of its edge and path for
@@ -220,7 +224,10 @@ hidden size; on GB200 (sm_100a with 152 SMs) the collapse and the backward
 prepare are off in (2944, 3584] tokens, 24 to 28 token tiles, and the
 column-slab pass has its own bands per hidden size; on GB300 with 152 SMs the
 column-slab pass (checkpointed backward) has its own bands per hidden size;
-every other board keeps ``PDL_OFF_BANDS``.
+on sm_107a the column-slab pass keeps the attribute on at every token count
+and SM count (hidden 4096: a cell without a band in place of the
+deterministic column slab's checkpointed-backward band); every other board
+keeps ``PDL_OFF_BANDS``.
 """
 
 from __future__ import annotations
@@ -7710,8 +7717,13 @@ FWD_MAP_CLAIM = {
 # 65536, checkpoint 0.996 / 0.995, 0.980 / 0.988, 0.973 / 0.975, 0.991 / 0.986, 0.995 / 0.995 and 0.995 / 0.995: every
 # path reads faster with the hint from 65 to 65536 tokens except 14929-15288, where the checkpoint path reads 0.9997 /
 # 1.0001 at 15288 (forward 0.990 / 0.991) and the form itself runs.
+# On sm_100a the band runs on to 7168 tokens: against the 6144-token band (B200, two sessions, CUPTI active) every
+# path reads faster in both sessions -- forward 0.979 / 0.978 at 6656 and 0.986 / 0.987 at 7168, forward_pf 0.983 /
+# 0.982 and 0.983 / 0.985, checkpoint 0.983 / 0.983 and 0.989 / 0.990 (identical-program control 0.999-1.000); at
+# 7680 forward reads 0.998 / 0.998 there but 1.000 / 1.002 against main in two record sessions, so the band stops
+# at 7168.
 FWD_MAP_XNRM = {
-    "sm_100a": ((64, 6144),),
+    "sm_100a": ((64, 7168),),
     "sm_103a": ((64, 6144),),
     "sm_107a": ((64, 14928), (15288, 65536)),
 }
@@ -7930,13 +7942,13 @@ BWD_SLAB_LPT_HIDDEN = {
 # from 28826 (48 counts) no count is slower in either of 2 runs, -557..-859 us in sum; between 16132 and 27973 six
 # counts read +1.3..+3.9 us slower in one run. At 7168 from 63092 (5 counts) none is slower in any of 3 runs, -142..-182
 # us in sum; below it slower and faster counts interleave by geometry (44 of 103 counts slower in all 3 runs, 59 in at
-# least one). At 73728 / 98304 / 122880 (4096) and 73728 / 98304 (5120, 7168) the slab order is faster in 16 of 16
-# groups (-19..-61 us). sm_107a: "chunk" at every size. At 4096 a 212-SM A/B (2 runs) reads the slab order faster at 84
-# of the 96 token counts from 1877 and slower at none, -853..-935 us in sum per run; its slab arm also ran a banded
-# two-size calibration, which picks another geometry at 9 counts, where the slab order under the chunk arm's (0.5, 0.97)
-# reads faster in both runs as well. The 208- and 216-SM boards are not measured, so they keep the chunk order; the
-# 212-SM board's slab order from 1877 tokens is BWD_SLAB_ORDER_OVERRIDES's. sm_107a routes no column slab of 5120 /
-# 7168.
+# least one): the 152-SM board's bands in 33793..63091 are BWD_SLAB_ORDER_OVERRIDES's, by the chunk count. At 73728 /
+# 98304 / 122880 (4096) and 73728 / 98304 (5120, 7168) the slab order is faster in 16 of 16 groups (-19..-61 us).
+# sm_107a: "chunk" at every size. At 4096 a 212-SM A/B (2 runs) reads the slab order faster at 84 of the 96 token counts
+# from 1877 and slower at none, -853..-935 us in sum per run; its slab arm also ran a banded two-size calibration, which
+# picks another geometry at 9 counts, where the slab order under the chunk arm's (0.5, 0.97) reads faster in both runs
+# as well. The 208- and 216-SM boards are not measured, so they keep the chunk order; the 212-SM board's slab order from
+# 1877 tokens is BWD_SLAB_ORDER_OVERRIDES's. sm_107a routes no column slab of 5120 / 7168.
 # sm_100a (GB200, 152 SMs): at 4096 from 2048 (95 counts) no count is slower in both of 2 runs and only 2670 in one
 # (backward +0.6 us), backward / checkpointed step -1381..-1820 us in sum per run; below it no count is faster in either
 # run (backward +1.7..+1.8 us, checkpointed step -0.4..-0.9 us in sum). At 5120 the slab order is faster at 96 of the
@@ -7975,7 +7987,8 @@ BWD_SLAB_ORDER = {
 # pass the device's, so the selection, the launch grid and the route plans follow it); every other board and a call
 # without an SM count read the tables above. A key names its hidden size: a cell of every size would apply a 4096
 # calibration at 5120 and 7168, where None routes no lpt__h<H> record. The SM count stands for the board: every sm_107a
-# device with 212 SMs reads the cells below.
+# device with 212 SMs reads the cells of ("sm_107a", 212, 4096) below, every sm_103a device with 152 SMs the order cell
+# of ("sm_103a", 152, 7168).
 # sm_107a with 212 SMs (R200) at hidden 4096, by the package-level A/B of BWD_SLAB_ORDER (2 runs, 16 replay groups x 30
 # replays, each after a 512 MiB L2 flush, backward and checkpointed-step graphs, 103 token counts in 256..65592): the
 # slab arm (the slab order, with (0.5, 0.985) to 33600 tokens, (0.5, 0.98) to 34368 and (0.5, 0.97) above, at every
@@ -8000,11 +8013,91 @@ BWD_SLAB_ORDER = {
 # and (27, 1408, 23, 256) at 33287..33401 faster in every group (-7.1..-10.6 us): the 0.985 band ends at 33600, between
 # the two (no firing token count in 33402..33902 is measured); above 34368 (0.5, 0.97) stays (keep 0.98 adds token
 # counts that read up to +15 us: BWD_SLAB_LPT). The 208- and 216-SM boards are not measured and keep the tables above.
+# sm_103a with 152 SMs (GB300) at hidden 7168: an order cell alone (BWD_SLAB_LPT_HIDDEN routes no lpt__h7168 record
+# there, so the cell moves dynr__h7168 to dynr_os__h7168 and nothing else). In 33793..63091, where BWD_SLAB_ORDER runs
+# the chunk order, the faster order follows the column slab's chunk count P (k7_chunks at 152 SMs). By a package-level
+# A/B of the two orders (the plan otherwise the same; 4 fresh concurrent 1-GPU processes on each of two nodes, eager
+# calls timed with CUDA events and CUDA-graph replays, each after a 512 MiB L2 flush, on the backward and
+# checkpointed-step graphs; a token count is faster where the slab order is faster by at least 0.15 % and beyond its
+# null controls in 3 of 4 processes in both timing modes on both graphs, slower where it is slower beyond them in 2 of 4
+# in either timing mode on either graph), the cell runs the slab order on each segment of one P >= 19 in 33793..63091
+# (48 segments, P 19 / 23 / 27 / 31) whose token count measured on both nodes is faster on both and where neither that
+# token count nor the segment's lowest is slower on the second node: 47 segments, 18355 token counts, the lowest token
+# count of each faster but 33793 (a tie); 34817..35264 (P 19) reads a tie on the second node and keeps the chunk order.
+# At the 47 token counts measured on both nodes the slab order is -0.34..-2.12 % on the backward and -0.21..-1.15 % on
+# the checkpointed step (eager, the second node's median), -1591.4 / -1548.9 us in sum. Below 33793 the P 19 token
+# counts 13344 and 21824 read slower on both nodes, 24192 faster and 32768 a tie, so the bands start at 33793. The
+# segments of P 4 keep the chunk order (at none of the 5 P 4 token counts measured, 33312 / 47605 / 49152 / 52384 /
+# 56128, is the slab order faster on both graphs; it reads beyond its null controls on one graph alone at 49152, the
+# backward on the second node, and at 47605, the checkpointed step on the first). From 63092 the cell's last band is the
+# table's "slab" band. The 148-SM sm_103a board (B300) is not measured and keeps BWD_SLAB_ORDER.
 # Pure literals, outside H_TABLES (as BWD_SLAB_ORDER).
 BWD_SLAB_ORDER_OVERRIDES: dict[
     tuple[str, int, int], tuple[tuple[int | None, str], ...]
 ] = {
     ("sm_107a", 212, 4096): ((1876, "chunk"), (None, "slab")),
+    ("sm_103a", 152, 7168): (
+        (33792, "chunk"),
+        (34048, "slab"),
+        (35264, "chunk"),
+        (35328, "slab"),
+        (36096, "chunk"),
+        (36480, "slab"),
+        (36608, "chunk"),
+        (36800, "slab"),
+        (37376, "chunk"),
+        (37696, "slab"),
+        (37888, "chunk"),
+        (38016, "slab"),
+        (38144, "chunk"),
+        (38272, "slab"),
+        (38400, "chunk"),
+        (38912, "slab"),
+        (39424, "chunk"),
+        (40128, "slab"),
+        (40960, "chunk"),
+        (41344, "slab"),
+        (41984, "chunk"),
+        (42688, "slab"),
+        (43008, "chunk"),
+        (43200, "slab"),
+        (43264, "chunk"),
+        (44160, "slab"),
+        (44544, "chunk"),
+        (44992, "slab"),
+        (45312, "chunk"),
+        (46208, "slab"),
+        (46592, "chunk"),
+        (46656, "slab"),
+        (46848, "chunk"),
+        (47424, "slab"),
+        (48128, "chunk"),
+        (48640, "slab"),
+        (49152, "chunk"),
+        (50112, "slab"),
+        (50432, "chunk"),
+        (51072, "slab"),
+        (51200, "chunk"),
+        (51584, "slab"),
+        (51712, "chunk"),
+        (52288, "slab"),
+        (52480, "chunk"),
+        (53568, "slab"),
+        (54016, "chunk"),
+        (54720, "slab"),
+        (55040, "chunk"),
+        (55936, "slab"),
+        (56320, "chunk"),
+        (57536, "slab"),
+        (57600, "chunk"),
+        (59584, "slab"),
+        (59904, "chunk"),
+        (60800, "slab"),
+        (61184, "chunk"),
+        (62208, "slab"),
+        (62464, "chunk"),
+        (None, "slab"),
+    ),
 }
 BWD_SLAB_LPT_OVERRIDES: dict[tuple[str, int, int], Any] = {
     ("sm_107a", 212, 4096): (
@@ -8029,7 +8122,8 @@ K6_CTAS_PER_SM = 2
 # it does not spell is an error, never the H 4096 value. The column slab's calibration of those sizes is no H_TABLES
 # entry: lpt_chunks reads BWD_SLAB_LPT_HIDDEN (BWD_SLAB_LPT is the H 4096 table), and bwd_slab_order reads
 # BWD_SLAB_ORDER at every size; the board cells of BWD_SLAB_LPT_OVERRIDES / BWD_SLAB_ORDER_OVERRIDES name their hidden
-# size in the key.
+# size in the key. BWD_DPL_BANDS (the bands of the deterministic column slab's and reduction's L2-hint forms) goes
+# with the dropped column-slab and final-reduction tables.
 H_TABLE_NAMES = (
     "PK_BANDS", "FN_SPLIT_PROGRAM", "FN_SPLIT_GRID", "FWD_MAP_PRODUCTION", "FWD_MAP_BANDS", "FWD_MAP_FIT",
     "FWD_MAP_CLAIM", "FWD_COEF_REGIMES", "BWD_TOKEN_PROGRAM", "BWD_TOKEN_REGIMES", "BWD_TOKEN_BANDS",
@@ -9128,7 +9222,8 @@ PDL_PATHS = ("forward", "backward", "checkpoint")
 # bands of PDL_OFF_BANDS are the deterministic package's on the edges this
 # package has (the atomic column slab (every form), launched behind the fn
 # split that the token-owner pass releases at once, takes the deterministic
-# column slab's K6->K7 bands; there is no K7->K8 edge).
+# column slab's K6->K7 bands, except on sm_107a, where its own cell of
+# PDL_BAND_OVERRIDES keeps the attribute on; there is no K7->K8 edge).
 PDL_EDGES = {
     "cake_mhc_train_bwd_prepare": "K1->K5",
     "cake_mhc_train_bwd_slab_atomic": "K6->K7",
@@ -9157,7 +9252,11 @@ PDL_OFF_BANDS: dict[str, dict[str, dict[str, tuple[tuple[int, int], ...]]]] = {
             "checkpoint": ((4096, 8192),),
         },
     },
-    "sm_107a": {},
+    "sm_107a": {
+        "K6->K7": {
+            "checkpoint": ((3583, 4096),),
+        },
+    },
 }
 # This package's own bands, measured on its kernels on B200 (sm_100a, 148 SMs):
 # package-level A/B of these bands against PDL_OFF_BANDS on the forward and
@@ -9197,7 +9296,14 @@ PDL_OFF_BANDS: dict[str, dict[str, dict[str, tuple[tuple[int, int], ...]]]] = {
 # 2160) and on above, off in (1024, 1984] and (7168, 8192] at 5120 (on was
 # 0.67..1.39 us faster from 1985 to 2046 tokens, 16 of 16 groups, and 0.39 us
 # slower at 8192) and on between, and off from 769 tokens on at 7168.
-# B300 (sm_103a, 148 SMs) and sm_107a are not measured and keep PDL_OFF_BANDS.
+# On sm_107a (R200) the column slab (K6->K7, checkpoint) keeps the attribute on at every token count and SM count
+# (hidden 4096): the deterministic band (3583, 4096] is the deterministic column slab's, measured on its own kernel,
+# and this package's column slab launches behind the atomic fn split. On R200 with 212 SMs (HBM at 3186 MHz), the
+# checkpointed step with the attribute off at every token count against on (4 processes, one per GPU; events with a
+# 512 MiB L2 flush before every call, and CUDA graphs): off is slower beyond the identical-arm control in both
+# timings at 2048, 2880, 2944, 3072, 3456, 3584, 3840 and 4096 tokens (events: 0.79..2.14 us per call, 4 of 4
+# processes; CUDA graphs: 3 or 4 of 4) and not faster at 8192.
+# B300 (sm_103a, 148 SMs) is not measured and keeps PDL_OFF_BANDS.
 PDL_BAND_OVERRIDES: dict[
     tuple[str, int | None, int | None],
     dict[str, dict[str, tuple[tuple[int, int | None], ...]]],
@@ -9263,6 +9369,11 @@ PDL_BAND_OVERRIDES: dict[
             "checkpoint": ((831, None),),
         },
     },
+    ("sm_107a", None, 4096): {
+        "K6->K7": {
+            "checkpoint": (),
+        },
+    },
 }
 
 
@@ -9282,7 +9393,8 @@ def enable_pdl(
     of :data:`PDL_BAND_OVERRIDES` under the most specific key that holds one --
     ``(arch, sm_count, hidden)``, ``(arch, sm_count, None)``, ``(arch, None,
     hidden)``, with the record's hidden size -- else the cell of
-    :data:`PDL_OFF_BANDS`."""
+    :data:`PDL_OFF_BANDS`.  An override cell without a band still counts as one:
+    it keeps the attribute on at every token count."""
 
     if path not in PDL_PATHS:
         raise ValueError(f"unknown Cake mHC training call path: {path!r}")

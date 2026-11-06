@@ -1,44 +1,61 @@
 .. _apicake_moe_grouped_gemm:
 
-Cake ragged BF16 grouped GEMM with a selectable numerical mode (experimental)
-=============================================================================
+Cake ragged BF16 grouped GEMM, non-deterministic weight gradient (experimental)
+================================================================================
 
 The functions of ``flashinfer.experimental.cake.grouped_mm`` compute the ragged BF16
 grouped GEMM of :ref:`apicake_moe_grouped_det_gemm` -- the forward projection, the data
 gradient and the weight gradient of the expert projections of Mixture-of-Experts layers
-on SM100 (B200 / GB200), SM103 (B300 / GB300) and SM107 (R200) -- and take a
-``deterministic: bool = True`` keyword that selects the implementation.  Both the API and
-the backends are experimental (see :ref:`experimental`); calling one of the functions is
-the explicit opt-in and emits an ``ExperimentalWarning`` once.
+on SM100 (B200 / GB200), SM103 (B300 / GB300) and SM107 (R200) -- with the
+non-deterministic package ``flashinfer.experimental.cake.cake_moe_grouped_gemm``, whose
+512-wide k tile adds the split tail of the weight gradient with unordered fp32
+reductions.  Both the API and the backends are experimental (see :ref:`experimental`);
+calling one of the functions is the explicit opt-in and emits an ``ExperimentalWarning``
+once.  The deterministic implementation is a separate package with ``det`` in every
+name (:ref:`apicake_moe_grouped_det_gemm`).
 
-Dispatch
---------
+Mode and dispatch rules
+-----------------------
 
-================== ================================================ ==================================================================================
-``deterministic``  ``torch.are_deterministic_algorithms_enabled()`` runs
-================== ================================================ ==================================================================================
-``True`` (default) any                                              the deterministic package ``flashinfer.experimental.cake_moe_grouped_det_gemm``
-``False``          ``False``                                        ``flashinfer.experimental.cake.cake_moe_grouped_gemm``
-``False``          ``True``                                         the deterministic package, with one ``UserWarning`` per entry point
-================== ================================================ ==================================================================================
+The facade functions and the package are non-deterministic only; every ND example passes
+``deterministic=False``.
 
-Determinism requested anywhere is never silently dropped.  Called directly, the package
-``flashinfer.experimental.cake.cake_moe_grouped_gemm`` accepts only ``deterministic=False``
-(``ValueError`` otherwise); under ``torch.use_deterministic_algorithms(True)`` its weight
-gradient entry points (``prepare_grouped_gemm_wgrad``, ``grouped_gemm_wgrad`` and the
-backward of ``CakeGroupedMm``) raise PyTorch's non-determinism alert (a
-``RuntimeError``, or a ``UserWarning`` with ``warn_only=True``) and do not fall back; a
-prepared weight gradient checks again at every launch (under CUDA graph capture, when
-the launch is captured).  The mode of
-``cake_grouped_mm`` is fixed at its forward call; a non-reentrant activation-checkpoint
-replay re-runs the same forward, bitwise.
+- ``deterministic`` is keyword-only on every entry (``cake_grouped_mm`` included; the
+  autograd function ``CakeGroupedMm.apply`` takes it fourth, ``True`` when omitted, and
+  refuses anything but ``None`` in its fifth, internal slot with ``TypeError``) and must
+  be the bool ``False``: the call runs the non-deterministic package.
+- Every other value -- the default ``True``, ``None``, ``0``, ``1``, ``"False"`` --
+  raises ``ValueError`` naming the deterministic entry (``grouped_det_gemm_fwd`` /
+  ``_dgrad`` / ``_wgrad``, ``prepare_grouped_det_gemm_*``, ``cake_grouped_det_mm``) and
+  saying "pass deterministic=False for the non-deterministic path"; nothing runs.
+  Nothing here routes to the deterministic package, also not as a fallback.
+- Under ``torch.use_deterministic_algorithms(True)`` PyTorch's non-determinism alert is
+  raised immediately before an order-varying launch only: the weight gradient whose
+  512-wide k tile splits its tail (``plan["unordered_tail"]`` and
+  ``plan["tail_splits"] > 1``; ``GroupedGemmLaunch.order_varying``), in overwrite or
+  accumulate mode -- ``grouped_gemm_wgrad``, a prepared launch's ``launch()`` (also
+  when the mode was switched on after the preparation; under CUDA graph capture, when
+  the launch is captured) and the backward of ``CakeGroupedMm`` when it computes
+  ``dW``.  The alert names the deterministic entry; it is a ``RuntimeError`` (nothing
+  launches), or with ``warn_only=True`` a ``UserWarning``, after which the launch runs
+  (it names the caller's line for a direct call of ``grouped_gemm_wgrad`` or
+  ``launch()``, a frame of PyTorch's autograd for the backward).  The preparation, the
+  forward, the data gradient, the 256-wide k tile's weight
+  gradient (ordered tail reduce) and an unsplit tail have a fixed order and never alert.
+- No tape, saved tensor or workspace crosses between the two packages: each autograd
+  function's backward reads only its own saved tensors.
+
+The mode of ``cake_grouped_mm`` is fixed at its forward call; a non-reentrant
+activation-checkpoint replay re-runs the same forward, bitwise.
 
 Numerical contract of ``deterministic=False``
 ---------------------------------------------
 
 Only the run-to-run bitwise reproducibility of the weight gradient ``dW`` is relaxed.  The
 forward ``Y`` and the data gradient ``dX`` are bitwise the deterministic package's (copies
-of the same programs), and so is ``dW`` wherever the 256-wide k tile runs.  With the
+of the same programs; on sm_100a the data gradient's L2 evict-first twin is the package's
+own build of the deterministic wide program, whose cache policy changes no arithmetic), and
+so is ``dW`` wherever the 256-wide k tile runs.  With the
 512-wide k tile, the tiles of the last partial wave are split into k-step units over the
 clusters; each unit adds its fp32 accumulator into the tile's fp32 sum with unordered
 reductions, and the last unit to arrive rounds the sum once and stores it, in the same
@@ -101,11 +118,10 @@ a placeholder gradient for ``w`` when ``w`` has ``grad_added_to_main_grad``
 supported), and raises ``NotImplementedError`` under ``torch.jit.trace``, ``torch.compile``
 and a ``create_graph`` backward.
 
-Through the facade, ``accumulate=True`` on the deterministic route (``deterministic=True``,
-or torch's deterministic mode with its one-time warning) computes the deterministic weight
-gradient in ``out``'s dtype and adds it with ``out.add_`` after the same checks;
-``fuse_wgrad_accumulation=True`` on the deterministic route raises ``NotImplementedError``
-(the deterministic package has not adopted it yet).
+The facade hands ``accumulate`` and ``fuse_wgrad_accumulation`` to the package with the
+same mode rules; it has no deterministic route.  The deterministic package takes the same two
+switches and always composes (its deterministic overwrite into a scratch, then
+``out.add_``), bitwise reproducible run to run: see :ref:`apicake_moe_grouped_det_gemm`.
 
 Functions
 ---------
@@ -120,9 +136,17 @@ autodoc before graduation):
 - ``grouped_gemm_wgrad(g, x, offs, out=None, out_dtype=None, num_groups=None, *,
   deterministic=True, accumulate=False)``: ``dW[e] = G[e].T @ X[e]``, bf16 or fp32
   ``[E, N, K]`` (with ``accumulate=True``, ``out[e] += dW[e]``);
-- ``cake_grouped_mm(x, w, offs, deterministic=True, *, fuse_wgrad_accumulation=False)``: the
+- ``cake_grouped_mm(x, w, offs, *, deterministic=True, fuse_wgrad_accumulation=False)``: the
   autograd wrapper (``Y``, with ``dX`` and ``dW`` in the backward, ``dW`` in the dtype of
   ``w``, or added into ``w.main_grad``).
+
+Each takes ``deterministic=False`` only (the default ``True`` raises ``ValueError``,
+above)::
+
+    from flashinfer.experimental.cake.grouped_mm import cake_grouped_mm, grouped_gemm_wgrad
+
+    y = cake_grouped_mm(x, w, offs, deterministic=False)
+    dw = grouped_gemm_wgrad(g, x, offs, out_dtype=torch.float32, deterministic=False)
 
 The shapes, the group offsets (``offs[E]`` end offsets or ``m_indptr[E + 1]``) and the
 alignment rules are those of :ref:`apicake_moe_grouped_det_gemm`.  The prepare-once /
@@ -137,11 +161,10 @@ on the deterministic package.
 Names
 -----
 
-The deterministic names and their compatibility aliases are unchanged and always
-deterministic:
+The deterministic names carry ``det``; the non-deterministic names omit it:
 
 ======================================================== ==============================================================
-deterministic (unchanged)                                selectable mode
+deterministic (no ``deterministic`` argument)            non-deterministic (``deterministic=False`` only)
 ======================================================== ==============================================================
 ``flashinfer.grouped_mm.grouped_det_gemm_fwd``           ``flashinfer.experimental.cake.grouped_mm.grouped_gemm_fwd``
 ``flashinfer.grouped_mm.grouped_det_gemm_dgrad``         ``flashinfer.experimental.cake.grouped_mm.grouped_gemm_dgrad``
@@ -152,11 +175,10 @@ deterministic (unchanged)                                selectable mode
 ``cake_moe_grouped_det_gemm.CakeGroupedDetMm``           ``cake.cake_moe_grouped_gemm.CakeGroupedMm``
 ======================================================== ==============================================================
 
-The legacy names without ``det`` -- ``flashinfer.experimental.cake_moe_grouped_gemm`` and
-its ``grouped_gemm_*``, ``prepare_grouped_gemm_*``, ``GroupedGemmLaunch``,
-``CakeGroupedMm`` and ``cake_grouped_mm``, and ``flashinfer.grouped_mm.grouped_gemm_fwd`` /
-``grouped_gemm_dgrad`` / ``grouped_gemm_wgrad`` / ``cake_grouped_mm`` -- remain aliases of
-the deterministic objects.
+The former det-free aliases of the deterministic objects (the package path
+``flashinfer.experimental.cake_moe_grouped_gemm``, the module ``flashinfer.grouped_mm.cake``
+and ``flashinfer.grouped_mm.grouped_gemm_*`` / ``cake_grouped_mm``) were removed with no
+alias; the det-free spellings name only the non-deterministic objects above.
 
 Features by architecture
 ------------------------
@@ -166,7 +188,7 @@ feature                                         sm_100a         sm_103a         
 =============================================== =============== =============== ===============
 ``fwd`` / ``dgrad`` 256- and 512-column tiles   domain schedule domain schedule static schedule
 ``fwd`` evict-first / 3-3 head-tail twin        -- / --         -- / yes        yes / --
-``dgrad`` evict-first / 3-3 head-tail twin      -- / --         -- / yes        yes / --
+``dgrad`` evict-first / 3-3 head-tail twin      yes / --        -- / yes        yes / --
 ``dgrad`` probed queue split                    yes             yes             --
 ``wgrad`` 256-wide k tile, ordered tail reduce  yes             yes             yes
 ``wgrad`` 512-wide k tile, unordered split tail yes             yes             yes
