@@ -4395,11 +4395,13 @@ class _BatchedGemmExecutable:
 def _fused_finalize_args(io: dict) -> tuple:
     """MoE output, expanded-to-permuted map and routing weight pointers of a
     fused-finalize launch; other launches pass typed placeholders."""
-    return (
-        io.get("finalize_out_dp", io["c0_dp"]),
-        io.get("expanded_idx_dp", io["route_map_dp"]),
-        io.get("expert_weights_dp", io["scale_c_dp"]),
-    )
+    names = ("finalize_out_dp", "expanded_idx_dp", "expert_weights_dp")
+    if io["cfg"].fused_finalize_top_k:
+        missing = [name for name in names if name not in io]
+        if missing:
+            raise ValueError(f"a fused-finalize launch needs {', '.join(missing)}")
+        return tuple(io[name] for name in names)
+    return (io["c0_dp"], io["route_map_dp"], io["scale_c_dp"])
 
 
 def _compile_arg_tuple(io: dict, stream) -> tuple:

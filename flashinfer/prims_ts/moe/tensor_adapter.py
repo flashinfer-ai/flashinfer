@@ -547,13 +547,18 @@ def _fused_finalize_io(
     expanded_idx_to_permuted_idx: torch.Tensor | None,
     expert_weights: torch.Tensor | None,
     num_tokens: int,
+    top_k: int,
     hidden_size: int,
 ) -> dict:
     """Pointers of an FC2 launch with a fused finalize epilogue."""
     from cutlass.cute.runtime import make_ptr
     import cutlass
 
-    top_k = int(cfg.fused_finalize_top_k)
+    if int(cfg.fused_finalize_top_k) != top_k:
+        raise ValueError(
+            f"fused_finalize_top_k {cfg.fused_finalize_top_k} does not match "
+            f"top_k {top_k}"
+        )
     if finalize_output is None or expanded_idx_to_permuted_idx is None:
         raise ValueError("a fused finalize needs the MoE output and expanded map")
     if expert_weights is None:
@@ -1709,6 +1714,7 @@ def build_mxfp4_mxfp8_launch_io(
                 expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
                 expert_weights=expert_weights,
                 num_tokens=num_tokens,
+                top_k=top_k,
                 hidden_size=hidden_size,
             )
         )

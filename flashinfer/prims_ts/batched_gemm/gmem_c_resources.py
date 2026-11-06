@@ -19,7 +19,7 @@ from typing import Any, Optional
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Float32
+from cutlass import Int32, Int64, Float32
 from cutlass._mlir import ir as _ir
 from cutlass._mlir.dialects import llvm, nvvm as _nvvm_dialect
 from cutlass.cutlass_dsl import T, dsl_user_op
@@ -1158,7 +1158,10 @@ class GmemCResource(MemoryResource):
         """Store four consecutive hidden values of one token-tile column.
 
         A column of a single-expert token is scaled by its routing weight and
-        goes to the token's MoE output row; other valid columns go to C.
+        goes to the token's MoE output row; other valid columns go to C. Rows
+        from ``output_m`` on (the second CTA of a two-CTA tile past the end of
+        the hidden dimension) are not stored. Row offsets are 64-bit: rows
+        times the row pitch may exceed ``Int32``.
         """
         out_row = self.sFinalizeOutRow.load(idx=col, vector_size=1)[0]
         c_row = self.sFinalizeCRow.load(idx=col, vector_size=1)[0]
@@ -1171,17 +1174,21 @@ class GmemCResource(MemoryResource):
             self._to_output_value(val2),
             self._to_output_value(val3),
         )
-        if out_row != Int32(_SKIP_ROW):
-            self.gFinalizeOut.store(
-                packed, idx=out_row * output_m + m_row, vector_size=4, alignment=8
-            )
-        elif c_row != Int32(_SKIP_ROW):
-            self.gCRows.store(
-                packed,
-                idx=c_row * self._c_pitch(output_m) + m_row,
-                vector_size=4,
-                alignment=8,
-            )
+        if m_row < output_m:
+            if out_row != Int32(_SKIP_ROW):
+                self.gFinalizeOut.store(
+                    packed,
+                    idx=Int64(out_row) * Int64(output_m) + Int64(m_row),
+                    vector_size=4,
+                    alignment=8,
+                )
+            elif c_row != Int32(_SKIP_ROW):
+                self.gCRows.store(
+                    packed,
+                    idx=Int64(c_row) * Int64(self._c_pitch(output_m)) + Int64(m_row),
+                    vector_size=4,
+                    alignment=8,
+                )
 
     @producer_work
     @cute.jit
