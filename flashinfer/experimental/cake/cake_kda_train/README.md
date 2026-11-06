@@ -73,22 +73,16 @@ for the previous one passes its `bool` in that slot and raises `TypeError`.
   deterministic, the call runs on a workspace of its own with the same arena
   option.  The facade accepts an arena option of either package in both
   modes.
-- Only the raw gate mode's backward on `sm_100a` / `sm_103a` reduces in no
-  fixed order (the `R1c` pairs, below).  It raises PyTorch's
-  non-determinism alert before any allocation or launch: `RuntimeError` under
-  `torch.use_deterministic_algorithms(True)`, a `UserWarning` under
-  `warn_only=True`.  Every other call has a fixed order and raises no alert.
-  The facade runs the deterministic package under torch's deterministic
-  algorithms, so a facade call never alerts.
+- The schedule below has no unordered reduction, so this package raises no
+  PyTorch non-determinism alert.
 - This package runs the explicit FP32 gate and the raw gate mode
   (`use_gate_in_kernel=True` with `A_log`, `dt_bias` and `lower_bound`,
   FlashInfer #7816) under the deterministic package's contract for that mode
   (its README, "Raw gate mode"): the same operands, stride rule and refusals,
   the 7-tuple `(dq, dk, dv, dbeta, dg, dA_log, ddt_bias)` of `chunk_kda_bwd`,
-  gradients to `g`, `A_log` and `dt_bias` from `chunk_kda`, and one launch of
-  the `param_finalize` stage per backward (the deterministic `param_finalize`
-  on `sm_107a`, the `R1c` cast on `sm_100a` / `sm_103a`).  The mode is part
-  of the plan (`cake_backend.plan(..., gate="raw")`), of the workspace
+  gradients to `g`, `A_log` and `dt_bias` from `chunk_kda`, and one
+  `param_finalize` launch per backward.  The mode is part of the plan
+  (`cake_backend.plan(..., gate="raw")`), of the workspace
   (`KdaWorkspace.for_problem` / `for_budget` and `workspace_bytes` with
   `gate="raw"`; a call in the other mode is refused with `ValueError`, in both
   directions) and of the saved set.  The facade forwards the keywords to the
@@ -96,15 +90,16 @@ for the previous one passes its `bool` in that slot and raises `TypeError`.
 - Both packages' saved sets carry `gate` / `lower_bound`, so either backward
   reads the other's set of either gate mode; a backward in the other mode or
   with another `lower_bound` is refused.
-- The in-kernel q / k L2 norm (`use_qk_l2norm_in_kernel=True`, raw `q` / `k`
-  normalized inside the kernels, FlashInfer #7817) runs on the deterministic
-  package only, in either gate mode: the facade forwards the keyword to it
-  with `deterministic=True`, and this package's entry points raise
-  `ValueError` for it (`KdaWorkspace.for_problem`, `workspace_bytes` and
-  `saved_bytes` for `l2n` other than `"off"`).  `False` is accepted, so a
-  call that spells it out runs unchanged.  The saved set carries the
-  deterministic package's `qk_rstd` / `qk_l2norm` fields (`None` / `False`
-  here), and the backward refuses a set of that mode (`ValueError`).
+- This package runs the in-kernel q / k L2 norm (`use_qk_l2norm_in_kernel=True`,
+  raw `q` / `k` normalized inside the kernels, FlashInfer #7817) in either gate
+  mode under the deterministic package's contract for it: the same keyword and
+  modes (`cake_jit.L2N_MODES`: `"off"`, `"fused"`, and the `"fallback"` test
+  route), operands, saved `qk_rstd`, workspace and byte queries.  The mode is
+  part of the plan, the workspace and the saved set, as in the deterministic
+  package.  The registry copies the deterministic package's records of the
+  mode (see "Registry"), so an l2n call launches the deterministic programs,
+  and on the tape backward possibly the tape WY twin (see "Tape WY twin"),
+  which writes the WY program's `w` bit for bit.
 
 ## What changes: the `S1` backward pairs
 
@@ -145,53 +140,23 @@ records ship again (their programs ship on `sm_107a` already, for the raw gate
 mode).
 
 The raw gate mode has no `S1` pair: its backward runs the deterministic
-package's raw-mode fused gradient on every row (`dqkg_raw`, `dqkg_int_raw`,
+package's raw-mode pair on every row (`dqkg_raw`, `dqkg_int_raw`,
 `dqkg_davq_raw`, `dqkg_int_davq_raw`, `dqkg_davq_nohint_raw`,
-`dqkg_int_davq_nohint_raw`) before a GLM intra program that adds no `q * dq`
-term (`glm_intra_raw` or an `R1c` program; see "Registry").
+`dqkg_int_davq_nohint_raw` with `glm_intra_raw`, which adds no `q * dq` term;
+see "Registry").  Its parameter gradients are the deterministic package's
+too: `glm_intra_raw` writes per-chunk FP32 `(hi, lo)` partials of `dA_log` /
+`ddt_bias` and `param_finalize` merges them in a fixed order (the global chunk
+order), on every architecture.
 
-## What changes: the `R1c` parameter reduce (raw gate mode)
-
-The deterministic raw backward writes per-chunk FP32 `(hi, lo)` partials of
-the parameter gradients from its GLM intra program (`glm_intra_raw`) and
-merges them in a fixed order in `param_finalize`.  In an `R1c` pair:
-
-- the GLM intra program (`glm_intra_v20c`) is `glm_intra_raw`'s up to each
-  chunk's merged `(hi, lo)` pairs, which it adds in FP64 into the
-  accumulators `param_acc` (FP64 `[stripes, H, 2, 128]`; chunk `c` adds into
-  replica `c mod stripes`) instead of writing the partials;
-- the cast (`param_finalize_cast`) sums the replicas of each head in
-  ascending order, rounds once to FP32 `dA_log` / `ddt_bias` and writes `+0`
-  back, so the accumulators are zero for the next backward.
-
-`glm_intra_v20c_r8` / `param_finalize_cast_r8` are the same pair with 8
-replicas.  `cake_jit.R1C_PAIRS` maps each GLM intra record to its cast and
-`cake_jit.R1C_STRIPES` gives its replica count; the host plan refuses a plan
-whose two records disagree on a path (a cast after `glm_intra_raw`, or
-`param_finalize` after an `R1c` program, reads values nothing wrote).
-`param_acc` is a buffer of the workspace outside the arena (2 KiB per head
-with one replica, 16 KiB per head with 8), shared by the workspace's plan
-views.  `KdaWorkspace.bytes` is the arena alone, `param_acc_bytes` the
-accumulators, and `workspace_bytes` / `memory_report` count both.  A
-backward workspace of an `R1c` plan allocates `param_acc` with its arena (a
-per-call workspace at its call), unfilled: the workspace is marked, so its
-first backward zeroes the buffer on its own stream (a fill on the stream that
-built the workspace would not be ordered before a backward on another
-stream).  A backward that stops between the
-two programs leaves sums in it and marks the workspace, and so does a backward
-captured into a CUDA graph (its launches run at the replays).  The next
-backward outside a capture then zeroes the whole buffer before its GLM intra
-launch.  A graph captured earlier does not: after such an exception, run one
-backward outside the capture on the workspace before the next replay.
-
-| arch | raw gate backward (every path) |
-| --- | --- |
-| `sm_100a` | `H < 32`: `glm_intra_v20c` + `param_finalize_cast`; `H >= 32`: `glm_intra_v20c_r8` + `param_finalize_cast_r8` |
-| `sm_103a` | `glm_intra_v20c` + `param_finalize_cast` |
-| `sm_107a` | the deterministic pair `glm_intra_raw` + `param_finalize` |
-
-`R1c` serves the raw rows with the in-kernel q / k L2 norm off, the only mode
-this package runs.
+The in-kernel q / k L2 norm has no `S1` pair either: no GLM intra program of
+its modes (`glm_intra_l2n`, `glm_intra_raw_l2n` and the fallback route's
+`glm_intra_l2n_capture` / `glm_intra_raw_l2n_capture`) adds the `q * dq` term.
+Its backward runs the deterministic fused gradient on every row: in g mode the
+`_l2n` records of the `dqkg` stage (`dqkg_l2n`, `dqkg_int_l2n`,
+`dqkg_davq_l2n`, `dqkg_int_davq_l2n`, `dqkg_davq_nohint_l2n`,
+`dqkg_int_davq_nohint_l2n`), in raw mode the raw records above.  Its raw
+backward finishes the parameter gradients with `param_finalize_l2n`, the
+deterministic `param_finalize`.
 
 ## Numerical contract
 
@@ -205,25 +170,24 @@ this package runs.
   package's by FP32 rounding.  The accuracy budget against the FP64 reference
   is the deterministic package's.
 - Repeated calls on the same inputs and path give bitwise the same outputs
-  (fixed order, no atomic adds), except `dA_log` / `ddt_bias` of the raw gate
-  mode on `sm_100a` / `sm_103a` (below).  The checkpoint replay and a saved-set
+  (fixed order, no atomic adds).  The checkpoint replay and a saved-set
   backward take different pairs on the `sm_100a` rows up to 8 heads and the
   `sm_103a` rows from 16 heads, so their `dg` differ there by FP32 rounding;
   every other gradient stays bitwise the same.  A torch checkpoint re-runs the
   saving forward and takes the saved-set pair, so checkpointed and direct
   training agree bitwise.
-- In the raw gate mode `out`, the saved set, `dq`, `dk`, `dv`, `dbeta` and the
-  raw gate's `dg` are bitwise the deterministic package's raw mode on every
-  path (saved set, replay, batched groups, arena options, autograd and
-  `torch.utils.checkpoint`) and architecture.  On `sm_107a` `dA_log` and
-  `ddt_bias` are bitwise too (the same programs run in the same order).  On
-  `sm_100a` / `sm_103a` they are the `R1c` FP64 sums rounded once to FP32:
-  the FP64 additions arrive in no fixed order, so they can differ from run
-  to run and from the deterministic package: from run to run by one FP32 ulp
-  at most while the FP64 sum's order error stays below half an FP32 ulp of
-  the result (only per-chunk terms that nearly cancel exceed it), and their
-  error against the FP64 reference stays within the deterministic package's
-  plus the FP64 sum's own error.
+- In the raw gate mode every output (`out`, the saved set, `dq`, `dk`, `dv`,
+  `dbeta`, the raw gate's `dg`, `dA_log` and `ddt_bias`) is bitwise the
+  deterministic package's raw mode on every path (saved set, replay, batched
+  groups, arena options, autograd and `torch.utils.checkpoint`) and
+  architecture: the same programs run in the same order.
+- With the in-kernel q / k L2 norm, in either gate mode, every output (the
+  outputs above, the raw gate mode's `dA_log` / `ddt_bias` included, and the
+  saved `qk_rstd`) is bitwise the deterministic package's in the same mode,
+  on the same paths and architectures: the same programs run in the same
+  order (the raw gate mode's parameter reduce is the deterministic
+  `param_finalize`, as `param_finalize_l2n`; the tape path's WY twin below
+  writes the same `w`).
 
 ## Checkpoint hand-off
 
@@ -237,7 +201,7 @@ saved set do not change.
 
 | `checkpoint_handoff` | engages |
 | --- | --- |
-| `"auto"` (default) | at the head counts of `cake_backend.HANDOFF_HEADS` (2, 4, 8, 12, 16, 32, 64) on the devices of `cake_backend.HANDOFF_VERIFIED` (architecture, SM count, Cake build toolkit): `sm_100a` and `sm_103a` with 148 or 152 SMs, `sm_107a` with 212 SMs, toolkit 13.4 |
+| `"auto"` (default) | at the head counts of `cake_backend.HANDOFF_HEADS` (2, 4, 8, 12, 16, 32, 64) on the devices of `cake_backend.HANDOFF_VERIFIED` (architecture, SM count, Cake build toolkit): `sm_100a` and `sm_103a` with 148 or 152 SMs, `sm_107a` with 212 SMs, toolkit 13.4; on a problem of `S` tokens in `N` documents at `H` heads with `H * S >= cake_backend.HANDOFF_MIN_HEAD_TOKENS` (196608) and `S >= cake_backend.HANDOFF_MIN_DOC_TOKENS * N` (8192 tokens per document on average) |
 | `"on"` | every call it supports (tests and benchmarks) |
 | `"off"` | never |
 
@@ -246,6 +210,21 @@ saved set do not change.
   its packs reach, under both checkpoint modes.  Other head counts select
   record combinations the suite has not run.  At one head the step is
   host-bound and the hand-off gains nothing.
+- The size bounds: a record adds a fixed host cost to each checkpointed
+  call, and saves kernel time that grows with the token-heads and the
+  document length (mostly the recurrence recompute, which walks each
+  document's chunks in order).  On a smaller problem the step is host-bound,
+  and the hand-off makes it slower.  Measured at 12 heads on B200 and B300
+  (x86 hosts), checkpointed step det / ND: `S = 32768` in one or four
+  documents and `S = 16384` in one document 1.04-1.14 (admitted);
+  `S = 16384` in four documents and `S = 8192` in one or four documents
+  0.92-0.98 with the hand-off on (refused now; about 0.98 at `S = 8192` in
+  four documents with it off).  The other head counts and devices take the
+  same bounds until rows of their own are measured.
+- `N` counts every document of `cu_seqlens`, zero-length ones too (the
+  check reads its shape only, with no device sync): a pack padded to a fixed
+  document count with empty documents can fall under the mean-length bound
+  although its real documents are long; pass `checkpoint_handoff="on"` there.
 - Elsewhere `"auto"` runs as `"off"`, also when the toolkit cannot be read.
   A new device, toolkit or registry needs the suite on that device before it
   enters `HANDOFF_VERIFIED`.
@@ -294,9 +273,10 @@ saved set do not change.
   `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` avoids it.
 - The record is stamped with the inputs, their versions, the plan and the
   stream.  Any mismatch, an arena option, `doc_lengths`, CUDA-graph capture,
-  `torch.compile`, compiled autograd, a Python dispatch mode or the raw gate
-  mode runs the light path (the raw mode writes and takes no record, and
-  `memory_report(..., gate="raw")` reports no hand-off bytes);
+  `torch.compile`, compiled autograd, a Python dispatch mode, the raw gate
+  mode or the in-kernel q / k L2 norm runs the light path (those modes write
+  and take no record, and `memory_report` reports no hand-off bytes for
+  them);
   `save_mode="tape"` runs the tape path without the hand-off.
   Repeated misses turn the hand-off off on the device.
 
@@ -340,7 +320,7 @@ digest under this package's prefix.
 
 ## Registry
 
-93 records naming 87 programs.  The records of the
+118 records naming 105 programs.  The records of the
 deterministic package are copied under this package's prefix, with these
 changes:
 
@@ -352,26 +332,32 @@ changes:
 | `dqkg_davq`, `dqkg_int_davq` | the same programs; rules narrowed to the deterministic-pair rows of the explicit gate (`dqkg_davq`: `sm_100a`; `dqkg_int_davq`: `sm_103a`); the programs are built on all three architectures for the raw class |
 | `glm_intra`, `glm_intra_v14`, `glm_intra_v18` | the same programs; rules narrowed to the deterministic-pair rows |
 | `dqkg_davq_nohint`, `dqkg_int_davq_nohint` | not shipped (`sm_107a` runs the `S1` pairs from 16 heads); their programs ship as `dqkg_davq_nohint_raw` / `dqkg_int_davq_nohint_raw` |
-| `fwd_intra_raw`, `fwd_intra_v14_raw`, `bwd_prep_g8_raw`, `bwd_prep_g8_replay_raw`, `bwd_prep_g8_noqg_raw`, `bwd_prep_g8_noqg_nokb_raw` | the raw gate mode's records, unchanged (all three architectures) |
-| `glm_intra_raw`, `param_finalize` | the raw gate mode's parameter-gradient pair, the same programs; architectures and rules narrowed to `sm_107a` (`glm_intra_raw`: `arch_in sm_107a`; `param_finalize`: its backward paths and `arch_in sm_107a`) |
-| `glm_intra_v20c`, `param_finalize_cast` | new: the `R1c` pair with one replica (`sm_100a` below 32 heads, `sm_103a`) |
-| `glm_intra_v20c_r8`, `param_finalize_cast_r8` | new: the `R1c` pair with 8 replicas (`sm_100a` from 32 heads) |
+| `fwd_intra_raw`, `fwd_intra_v14_raw`, `bwd_prep_g8_raw`, `bwd_prep_g8_replay_raw`, `bwd_prep_g8_noqg_raw`, `bwd_prep_g8_noqg_nokb_raw`, `glm_intra_raw`, `param_finalize` | the raw gate mode's records, unchanged (all three architectures) |
 | `dqkg_raw`, `dqkg_int_raw`, `dqkg_davq_raw`, `dqkg_int_davq_raw`, `dqkg_davq_nohint_raw`, `dqkg_int_davq_nohint_raw` | new: the raw gate mode's `dqkg` class (`gate: "raw"`), the deterministic package's `dqkg` records of the same names without the suffix and their rules, so the raw mode selects the deterministic fused gradient on every row (on the deterministic records' architectures: the `_nohint` forms on `sm_107a`, the others on all three) |
-| `fwd_intra_l2n`, `fwd_intra_v14_l2n`, `fwd_intra_v37_l2n`, `bwd_prep_g8_l2n`, `bwd_prep_g8_replay_l2n`, `bwd_prep_g8_noqg_l2n`, `bwd_prep_g8_noqg_nokb_l2n`, `glm_intra_l2n`, `glm_intra_l2n_capture`, `qk_l2norm`, `qk_l2norm_apply`, `qk_pullback`, `fwd_intra_raw_l2n`, `fwd_intra_v14_raw_l2n`, `bwd_prep_g8_raw_l2n`, `bwd_prep_g8_replay_raw_l2n`, `bwd_prep_g8_noqg_raw_l2n`, `bwd_prep_g8_noqg_nokb_raw_l2n`, `glm_intra_raw_l2n`, `glm_intra_raw_l2n_capture` | not shipped (the in-kernel Q/K L2 norm, which this package refuses) |
+| `fwd_intra_l2n`, `fwd_intra_v14_l2n`, `fwd_intra_v37_l2n`, `bwd_prep_g8_l2n`, `bwd_prep_g8_replay_l2n`, `bwd_prep_g8_replay_saved_l2n`, `bwd_prep_g8_noqg_l2n`, `bwd_prep_g8_noqg_nokb_l2n`, `glm_intra_l2n`, `glm_intra_v30_l2n`, `glm_intra_l2n_capture`, `qk_l2norm`, `qk_l2norm_apply`, `qk_pullback`, `fwd_intra_raw_l2n`, `fwd_intra_v14_raw_l2n`, `bwd_prep_g8_raw_l2n`, `bwd_prep_g8_replay_raw_l2n`, `bwd_prep_g8_noqg_raw_l2n`, `bwd_prep_g8_noqg_nokb_raw_l2n`, `glm_intra_raw_l2n`, `glm_intra_raw_l2n_capture` | the in-kernel Q/K L2 norm's records, unchanged (`fwd_intra_v37_l2n` and `glm_intra_v30_l2n` on `sm_103a`, the saved-rstd twin `bwd_prep_g8_replay_saved_l2n` on `sm_100a` / `sm_103a`, the others on all three architectures; no path selects the twin) |
+| `dqkg_l2n`, `dqkg_int_l2n`, `dqkg_davq_l2n`, `dqkg_int_davq_l2n`, `dqkg_davq_nohint_l2n`, `dqkg_int_davq_nohint_l2n` | new: the in-kernel Q/K L2 norm's `dqkg` records of the g class (`l2n: ["fused", "fallback"]`), the deterministic package's `dqkg` records of the same names without the suffix and their rules, so an l2n mode selects the deterministic pair on every row; each shares its program with the raw class record of the same build |
+| `param_finalize_l2n` | new: the in-kernel Q/K L2 norm's `param_finalize` record of the raw class (`l2n: ["fused", "fallback"]`), the deterministic package's `param_finalize` record and its rule on all three architectures, so the raw gate mode's l2n backward finishes the deterministic GLM intra programs' partials as the deterministic package does; it shares its program with `param_finalize` |
 | `fwd_intra_v19`, `fwd_intra_v20` | new: the checkpoint hand-off's intra twins of `fwd_intra_v14` and `fwd_intra` (all three architectures); no path selects them |
 | `wy_bwd_v9` | new: the tape WY twin of `wy_bwd`, writing `w` alone (all three architectures); no path selects it |
 
 The stages of `cake_jit.GATE_STAGES` select among the records of the call's
-gate mode (a record's `gate`, `"g"` when absent).
+gate mode (a record's `gate`, `"g"` when absent), and the stages of
+`cake_jit.L2N_STAGES` (the deterministic package's, `dqkg` and
+`param_finalize`) among the records of the call's in-kernel Q/K L2 norm
+mode (a record's `l2n`, `["off"]` when absent).  The copies of the plain
+records keep the deterministic records' `l2n` modes; the `S1` records and
+the hand-off twins serve `"off"` alone; the raw class's
+`dqkg` records serve every mode, as does the tape WY twin (its stage `wy` is
+no l2n stage).
 
-`build.json` has 229 entries: 77 on `sm_100a`, 74 on `sm_103a` and 78 on
+`build.json` has 288 entries: 95 on `sm_100a`, 96 on `sm_103a` and 97 on
 `sm_107a`.
 
 ## Layout of this package
 
 * `cake_jit.py` -- the `MODULES` registry, `S1_RECORDS`, `HANDOFF_TWINS`,
-  `TAPE_TWINS`, `R1C_PAIRS`, `R1C_STRIPES`, the paths, the stage order, the
-  optional stages and the segmented route's constants, the logical vocabulary, the loader glue and
+  `TAPE_TWINS`, the paths, the stage order, the optional stages and the
+  segmented route's constants, the logical vocabulary, the loader glue and
   `run_module`.  The derived leaves `kernel_symbol`, `launch`, `arg_plan` and
   `logical` are rewritten by the export.
 * `cake_build.py` + `build.json` -- the loader shared by every Cake-exported

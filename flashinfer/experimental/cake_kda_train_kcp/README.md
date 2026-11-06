@@ -46,17 +46,12 @@ backend are experimental: no compatibility guarantee.
   checkpoint-replay backwards run the same programs (bitwise equal, as in the
   deterministic package).  `out`, `dq`, `dk`, `dv` and `dbeta` are bitwise the
   deterministic package's; `dg` differs from it by FP32 rounding on the `S1`
-  rows (the same FP64-referenced accuracy budget).  The one unordered
-  reduction is the raw gate mode's parameter-gradient reduce on `sm_100a` /
-  `sm_103a` (below): only that backward raises torch's
-  deterministic-algorithms alert, on every rank before any exchange.
+  rows (the same FP64-referenced accuracy budget).  No path launches an
+  unordered reduction, so no entry raises torch's deterministic-algorithms
+  alert.
 * A partition, a context and the byte queries hold no mode: they describe the
   same plan in both packages, and a context of either package serves the calls
-  of both (each package keeps its own launch tables on it).  The workspace
-  query of a raw gate mode backward on `sm_100a` / `sm_103a` here also counts
-  the local arena's FP64 parameter-gradient accumulators (`param_acc`, 2 KiB
-  per head; 16 KiB per head on `sm_100a` from 32 heads), which the
-  deterministic package does not hold.  The autograd node
+  of both (each package keeps its own launch tables on it).  The autograd node
   records its forward's mode and its backward runs it; a saved set is read by
   the backward of the package that wrote it (`SavedKcp` here, the other
   package's set raises `ValueError`), and a workspace (`WorkspaceKcp`) serves
@@ -64,17 +59,16 @@ backend are experimental: no compatibility guarantee.
 * The raw gate mode (`use_gate_in_kernel=True` with `A_log`, `dt_bias` and
   `lower_bound`, FlashInfer #7816) runs on this package too ("Raw gate mode"
   below): the rank's local stages take the single-rank package's raw records,
-  the deterministic programs on every row (no `S1` row runs in this mode) but
-  for the parameter-gradient reduce, so every output and the raw gate's
-  gradient are bitwise those of the deterministic package.  On `sm_107a` the
-  per-rank parameter partial sums are bitwise too; on `sm_100a` / `sm_103a`
-  they come from the `R1c` pairs (an unordered FP64 sum rounded once to FP32)
-  and can differ by about one FP32 ulp from run to run (below).  The in-kernel q / k
-  L2 norm (`use_qk_l2norm_in_kernel=True`, #7817) is not available here: the
-  entry points, `kda_workspace_bytes_kcp` and `kda_saved_bytes_kcp` raise
-  `ValueError` for it, naming `deterministic=True`.  Its off value
-  (`use_qk_l2norm_in_kernel=False`) is accepted, so a call that spells it out
-  runs unchanged.
+  the deterministic programs on every row (no `S1` row runs in this mode), so
+  every output, the raw gate's gradient and the per-rank parameter partial
+  sums are bitwise those of the deterministic package, with the in-kernel
+  q / k L2 norm and without it.
+* The in-kernel q / k L2 norm (`use_qk_l2norm_in_kernel=True`, #7817) runs on
+  this package too ("In-kernel Q / K L2 norm" below): the rank's local stages
+  take the single-rank package's records of the mode, copies of the
+  deterministic programs (no `S1` row runs in this mode, in either gate mode),
+  so every output, the saved rstd and every gradient are bitwise those of the
+  deterministic package.
 
 ### Names
 
@@ -378,7 +372,10 @@ re-running the intra program, WY, the K1 tape walk and, at `P > 1`, the
 offset re-walk and the carry merges.  Non-reentrant checkpoint keeps the set
 in both passes (the original forward's goes at its return); reentrant
 checkpoint runs its first pass under no_grad, so only its recompute keeps
-one.  The forward's launch list and every collective are unchanged.  On the
+one.  An engaged forward runs the tape walk and `kcp_fwd_o` where the light
+forward runs the fused walk `kcp_fwdh_o` (the backward reads the `h` /
+`v_new` tapes the tape walk writes); every other launch and every collective
+are unchanged.  On the
 devices of `KCP_HANDOFF_VERIFIED` the outputs and gradients are bitwise those
 of `"off"` (the hand-off rows of
 `tests/experimental/test_cake_kda_train_kcp_handoff.py`); `"on"` on another
@@ -412,7 +409,9 @@ every H16 and H64 row 5 % or more faster.  H8 at CP8 (261392) is refused as
 `"work"` on the 8-GPU parts.  The bound admits every measured row that gains
 5 % or more and refuses every measured loss.  A new device, toolkit or head
 count needs these rows and the hand-off rows before it enters
-`KCP_HANDOFF_VERIFIED` or `KCP_HANDOFF_HEADS`.  H, the batch's total and the
+`KCP_HANDOFF_VERIFIED` or `KCP_HANDOFF_HEADS`.  These rows predate the fused
+forward walk, which the light path's forwards run and an engaged forward does
+not.  H, the batch's total and the
 world size are the same on every rank, so the ranks of a group of one device
 kind decide alike; a rank that decides otherwise (a rank without tokens never
 keeps a set) still runs the same collectives, because the launches the
@@ -504,48 +503,25 @@ dA_log, ddt_bias = reduce_gate_param_grads_kcp(ctx, dA_log_r, ddt_bias_r, **nd) 
 
 * The local stages run the raw records of the rank's plan
   (`cake_backend.plan(..., gate="raw")` of the single-rank package: copies of
-  the deterministic raw programs but for the parameter-gradient reduce; the
-  intra and prep programs activate the gate, the raw GLM intra program writes
-  `draw`; no gate epilogue, no `S1` pair).  On `sm_107a` `glm_intra_raw` also
-  writes the per-chunk partials and one `param_finalize` launch reduces them
-  in a fixed order.  On `sm_100a` / `sm_103a` the `R1c` GLM intra program
-  (`glm_intra_v20c`, on `sm_100a` from 32 heads `glm_intra_v20c_r8`) adds
-  them in FP64 into the local arena's accumulators `param_acc` and its cast
-  rounds them once and zeroes the accumulators.
+  the deterministic raw programs; the intra and prep programs activate the
+  gate, the raw GLM intra program writes `draw` and the per-chunk partials,
+  one `param_finalize` launch reduces them; no gate epilogue, no `S1` pair).
   The `gk` rows the K1 / K2 / K3 walks read are the explicit path's bits for
   the same activated gate, so every KCP program, collective and exchanged
   byte is the explicit path's; no full-size FP32 gate or gate gradient exists
-  on the route.  Every output and `draw` are bitwise those of
-  `chunk_kda_det_bwd_kcp` on the same rank, and so are the parameter partial
-  sums on `sm_107a`.  On `sm_100a` / `sm_103a` the FP64 additions arrive in no
-  fixed order, so the partial sums can differ from run to run and from the
-  deterministic route: from run to run by one FP32 ulp at most while the FP64
-  sum's order error stays below half an FP32 ulp of the result (only per-chunk
-  terms that nearly cancel exceed it), and their error against the FP64
-  reference stays within the deterministic route's plus the FP64 sum's own
-  error.  Such
-  a backward raises torch's
-  non-determinism alert under `torch.use_deterministic_algorithms(True)`
-  (`RuntimeError`; a `UserWarning` with `warn_only=True`) on every rank before
-  it allocates, exchanges or launches anything: the decision reads the
-  architecture and `H` alone, so a rank without tokens alerts too.
+  on the route.  Every output, `draw` and the parameter partial sums are
+  bitwise those of `chunk_kda_det_bwd_kcp` on the same rank.
 * `dA_log` / `ddt_bias` of a rank are its partial sums: the gradients through
-  its own tokens, reduced on the rank.  On `sm_107a` the order is fixed by its
-  local chunks: bitwise repeatable, the same under every exchange, schedule,
-  graph replay and recompute.  On the `R1c` rows the unordered FP64 sum makes
-  each partial sum vary from run to run by about one FP32 ulp of itself.  The
-  full gradient is their sum over `ctx.group`; a
+  its own tokens, reduced on the rank in an order fixed by its local chunks
+  (bitwise repeatable, the same under every exchange, schedule, graph replay
+  and recompute).  The full gradient is their sum over `ctx.group`; a
   training framework sums them as it sums the gradients of any parameter
   replicated across the context-parallel ranks.  An NCCL all-reduce gives
   that sum to FP32 rounding but does not fix its summation order, so it is
   not bitwise reproducible; `reduce_gate_param_grads_kcp(ctx, dA_log,
-  ddt_bias)` is, from the same partials: one `all_gather_into_tensor` of the
-  `H + 128 H` values, then an FP32 sum in rank order on every rank (the same
-  bits everywhere, and the same bits as the deterministic package's
-  `reduce_gate_param_grads_det_kcp` from the same partials).  On the `R1c`
-  rows the partials vary from run to run, so that sum does too: by a few FP32
-  ulps that grow with the world size `W` (each partial by about one ulp, each
-  of the `W - 1` additions rounding either way).
+  ddt_bias)` is: one `all_gather_into_tensor` of the `H + 128 H` values, then
+  an FP32 sum in rank order on every rank (the same bits everywhere, and the
+  same bits as the deterministic package's `reduce_gate_param_grads_det_kcp`).
 * The mode is fixed per workspace (`WorkspaceKcp(use_gate_in_kernel=True)`:
   its local arena is the replay arena planned in raw mode, whose backward
   layouts carry no gate epilogue buffers; the KCP pools do not change;
@@ -553,24 +529,93 @@ dA_log, ddt_bias = reduce_gate_param_grads_kcp(ctx, dA_log_r, ddt_bias_r, **nd) 
   (`SavedKcp.gate`, `.lower_bound`) and in a recompute handle's fingerprint;
   a call in the other mode, a backward with another `lower_bound` and a
   recompute of another mode are refused with `ValueError`.
-  `kda_workspace_bytes_kcp(ctx, H=..., use_gate_in_kernel=True)` sizes it
-  (the `R1c` accumulators included: 2 KiB per head with one replica, 16 KiB
-  per head with 8);
+  `kda_workspace_bytes_kcp(ctx, H=..., use_gate_in_kernel=True)` sizes it;
   `kda_saved_bytes_kcp` and `kda_comm_bytes_kcp` do not depend on the mode.
-* The `R1c` accumulators are one buffer of the local arena, shared by its
-  plan views.  A pack of more heads than the buffer holds grows it before its
-  backward and drops the cached graphs of the arena, whose launches add into
-  the old buffer; `reserve` sizes it for its contexts, and `bytes` counts it
-  once.  A backward that stops between the GLM intra launches and the cast
-  leaves sums in it; the next backward, or a `graph="replay"` replay, zeroes
-  the whole buffer first.
 * The checkpoint hand-off does not engage in raw mode (its tape set is
   verified on the explicit gate only): a raw call keeps the light set under
   every `checkpoint_handoff` value and records no decision.
-* The backward allocates the raw gate's BF16 gradient, on `sm_107a` the
-  partials (two FP32 `[NC_pad, H, 128, 2]` buffers of the rank's chunks, for
-  the duration of the call) and the two parameter gradients; a rank without
-  tokens returns zero parameter gradients.
+* The backward allocates the raw gate's BF16 gradient, the partials (two FP32
+  `[NC_pad, H, 128, 2]` buffers of the rank's chunks, for the duration of the
+  call) and the two parameter gradients; a rank without tokens returns zero
+  parameter gradients.
+
+In-kernel Q / K L2 norm on the KCP route (issue #7817): the three KDA entry
+points, `WorkspaceKcp` and the workspace and saved byte queries take the
+keyword-only `use_qk_l2norm_in_kernel=False`.  With `True` the local stages
+normalize `q` and `k` per token and per 128-channel head (FP32 sum of squares,
+`r = 1 / sqrt(ss + 1e-6)`, `x_hat = bf16(x * r)`; `v` is not normalized) and
+the GLM intra programs fuse the FP32 pullback into the BF16 `dq` / `dk`, so
+`q_local` / `k_local` are the rank's raw rows and the gradients are theirs.
+
+```python
+nd = dict(deterministic=False)
+ws = WorkspaceKcp(use_qk_l2norm_in_kernel=True)                   # the workspace's mode, fixed
+out_local, saved = chunk_kda_fwd_kcp(q_raw, k_raw, v_local, g_local, beta_local, ctx,
+                                     workspace=ws, use_qk_l2norm_in_kernel=True, **nd)
+dq_raw, dk_raw, dv, dbeta, dg = chunk_kda_bwd_kcp(
+    q_raw, k_raw, v_local, g_local, beta_local, ctx, dout_local, saved=saved, workspace=ws,
+    use_qk_l2norm_in_kernel=True, **nd)
+```
+
+* `q_raw` / `k_raw` may be strided views, such as columns of a packed
+  projection or convolution output `[S_local, (2 H + HV) * 128]`: innermost
+  stride 1, head stride 128 elements, token stride a multiple of 8 elements
+  and at least `H * 128` (no overlapping rows), base address 16-byte aligned
+  (the single-rank rule).  They are never copied; any other view raises
+  `ValueError`.  Without the flag `q` / `k` must stay contiguous.  `v` keeps
+  its rules.  Every rank checks the metadata (shape, dtype, device, the three
+  strides), a rank with zero or one token too, so all ranks refuse a view
+  alike.  The base-address alignment is the one per-rank check: it is a
+  property of each rank's own storage, checked where the rank has tokens.
+* The normalization is token-local: the halo, the context, the KCP programs,
+  every collective and its byte count are those of the flag-off route.
+* The local stages run the single-rank package's records of the mode, copies
+  of the deterministic package's programs; its plan selects no `S1` pair in
+  the mode.  Every output, the saved rstd and every gradient are bitwise
+  those of `chunk_kda_det_fwd_kcp` / `chunk_kda_det_bwd_kcp` on the same rank,
+  in both gate modes (`use_gate_in_kernel=True` combines with the flag).
+* The saved set keeps the raw `q` / `k` (the caller's tensors) and adds the
+  FP32 rstd `SavedKcp.qk_rstd` `[2, S_local, H]` (plane 0 q, plane 1 k;
+  empty on a rank without tokens): `kda_saved_bytes_kcp(...,
+  use_qk_l2norm_in_kernel=True)` is `8 * S_local * H` bytes more.  The
+  normalized q / k are never saved: the backward rebuilds them bitwise from
+  the raw rows and the rstd, and a checkpoint recompute writes its rstd
+  afresh, so a recompute handle's entry and bytes do not change.  The
+  backward keeps the rebuilt rows in its local arena, in the bytes of two
+  internal buffers that it moves into the bytes of its own outputs (dq / dk
+  and the gate gradient) until the GLM intra program writes those, so it
+  needs no memory beyond the flag-off backward's.  Where an output is too
+  small for its buffer (more than `2 * S_local` internal rows; in raw gate
+  mode more than `S_local` for the gate gradient), that row set takes a
+  per-call buffer (`256 * S_local * H` bytes each) instead.
+* The mode is fixed per workspace (the replay local arena of that mode;
+  `local_arena="lean"` is refused with it), recorded in the saved set
+  (`SavedKcp.qk_l2norm`), the graph validity key and a recompute handle's
+  fingerprint; a call, a saved set or a recompute of the other mode is
+  refused with `ValueError`.  `spec3_probe` is refused with the flag.
+* The checkpoint hand-off does not engage with the flag (its tape set is
+  verified without the norm): such a call keeps the light set under every
+  `checkpoint_handoff` value and records no decision.
+* With `use_qk_l2norm_in_kernel=False` (the default) every launch, saved
+  tensor, key, fingerprint and byte is unchanged.
+* The local programs of the mode are the single-rank backend's (its plan mode
+  `l2n="fused"`: the first q / k reader normalizes, the GLM intra program
+  pulls back; a saved-mode backward reads the saved rstd).  Until the
+  single-rank registry selects a record of the mode for every such stage of
+  the forward and replay paths over a fixed grid of problem sizes (at most
+  and above 256 documents, few and many heads, the architecture's SM
+  counts), each delivered and exported for the device's architecture, with
+  exactly one normalizing first reader on the replay, and its forward and
+  replay layouts carry the normalized slot views `qn_int` / `kn_int`, a
+  call, a `WorkspaceKcp` and the byte queries with the flag on raise
+  `NotImplementedError` before any workspace build, plan, launch or
+  collective.  The check reads rank-independent inputs only (the
+  architecture of the context's device, the registry's selection over that
+  grid and its exports, the flags and gate mode, the static layout tables),
+  so every rank, one without tokens or with a misaligned view too, raises
+  the same error with the same message.  The saved byte query takes the
+  call's `use_gate_in_kernel` for this check.  With the flag off the byte
+  queries make no CUDA call for it.
 
 The segment plan splits every fragment into `P` segments: above the 256-chunk
 chain cap the equal-segment wave rule on ranks with at most three fragments,
@@ -590,15 +635,22 @@ families of a phase in one launch; off by default).
 
 The files of this package:
 
-* `cake_kcp_jit.py` -- the `MODULES` registry of the eleven shipped programs (copies of the deterministic
+* `cake_kcp_jit.py` -- the `MODULES` registry of the sixteen shipped programs (copies of the deterministic
   package's records under the `cake_kda_train_` library prefix, the same twenty hex digits; the
   fragment walks of the forward and backward state recurrences in their
   `offset` and `tape` forms, the BF16x3 transfer walk (two CTAs per segment
   and head, each over one 64-column half of the state), the affine
-  merge at `cols_per_cta` 8 and 16, and the two chunk stages of the
+  merge in one record per register-blocked build, and the two chunk stages of the
   context-parallel route, `kcp_fwd_o` (the output from the K1 tapes) and
-  `kcp_dav` (`dA_qk` and the `dv1` K2 reads); selection by `always` or by
-  `columns` on the merge's `ncols`, grids by `kcp_segments_heads`,
+  `kcp_dav` (`dA_qk` and the `dv1` K2 reads), and the fused forward walk
+  `kcp_fwdh_o` (the forward state walk with the chunk output inside it: the
+  same bits as the tape walk followed by `kcp_fwd_o`, no tape written; in its
+  full-width and two-CTA records), which the forward that keeps no tape
+  launches in place of those two; selection by `always`, by
+  `walk_form`, by `walk_heads` (the `WALK_HEADS_RULE` bands of the launch's
+  head count: the plain or the overlap-schedule full-width adjoint offset
+  walk), or by `merge_rule` (the `MERGE_RULE` bands of the merge
+  launch's 128-column chain blocks per architecture), grids by `kcp_segments_heads`,
   `kcp_chains`, `kcp_tile_items` or `kcp_pairs`), the logical vocabulary of
   the KCP arguments, `run_program(name, args, device_index=)`, the lowering
   of the host backend's walk and merge requests to the registry's launches,
@@ -618,11 +670,11 @@ The files of this package:
   tests; without the file those tests skip.  The package reads no
   environment variable.
 * `cake_build.py` + `build.json` -- the loader shared by every Cake-exported
-  package (byte-identical copies) and the manifest of the eleven shipped
+  package (byte-identical copies) and the manifest of the sixteen shipped
   programs (schema `cake-build/1`, one entry per `<library>_<arch>`);
   `aot/` is never tracked (`.gitignore`).
 * `csrc/cake_ffi_checks.h` -- the TVM-FFI helper header the bindings include.
-* `csrc/cake_kda_train_<digest>_kcp_{kernel,binding}.cu` of the sixteen
+* `csrc/cake_kda_train_<digest>_kcp_{kernel,binding}.cu` of the twenty-one
   context-parallel programs (the chunk stage `kcp_fwd_o` among them) and
   `csrc/cake_kda_train_<digest>_{kernel,binding}.cu` of the chunk stage
   `kcp_dav`, rendered like the single-rank ones (digests in `build.json` and
@@ -631,7 +683,7 @@ The files of this package:
 
 ## Status
 
-The registry holds eleven shipped programs (`cake_kcp_jit.MODULES`, in
+The registry holds sixteen shipped programs (`cake_kcp_jit.MODULES`, in
 `build.json`) and six test-only programs (`cake_kcp_jit.TEST_MODULES`, in
 `build.test.json`) for `sm_100a`, `sm_103a` and `sm_107a`.
 
@@ -653,6 +705,10 @@ the keywords, the workspace and its byte query, the saved set, the reduction
 helper, the local stages' records; multi-GPU rows against the single-rank raw
 path, the FP64 reference and, bitwise, the deterministic package's raw KCP
 route),
+`tests/experimental/test_cake_kda_train_kcp_l2n.py` (the in-kernel Q / K L2
+norm: the keywords, the strided views, the workspace, the byte queries and
+the saved set; multi-GPU rows against the single-rank path, the FP64
+reference and, bitwise, the deterministic package's KCP route in the mode),
 `_fsdp_walk.py`, `_shared_ws.py` and `_upload.py`; benchmark
 `benchmarks/bench_cake_kda_train_kcp.py` (`torchrun`, one process per
 rank; the deterministic and the non-deterministic package interleaved).

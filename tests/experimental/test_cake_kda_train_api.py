@@ -25,13 +25,15 @@ non-bool mode, the refusal of every mode but ``deterministic=False`` by the pack
 deterministic mode, which they do not alert: the S1 schedule has no unordered reduction), the raw gate mode (#7816)
 on both packages (the facade forwards its keywords to the package of the call's mode, this package takes them with
 the deterministic package's checks, a workspace serves one gate mode, either backward reads either package's saved
-set of either gate mode), the deterministic package's in-kernel Q/K L2 norm (#7817: the facade forwards
-``use_qk_l2norm_in_kernel`` with ``deterministic=True``; the package refuses it and a saved set of it), the legacy names
+set of either gate mode), the in-kernel Q/K L2 norm (#7817) on both packages (the facade forwards
+``use_qk_l2norm_in_kernel`` to the package of the call's mode, this package takes it with the deterministic package's
+checks and byte counts, either package's saved-set check reads either package's l2n set), the legacy names
 (``flashinfer.kda_train``, ``flashinfer.experimental.cake_kda_train``) that stay the deterministic objects, the
 deferred imports of the facade and the package's isolation from the deterministic modules, and a dispatch sweep
 over architecture x path x heads 1..128 (one record per stage, the fused gradient and the GLM intra program agreeing
 on S1 as the independent table says, the plan's records the registry's, every record of the pair stages launched
-on every architecture it ships for) with the plan's pairing guard.  On a GPU: the public entries against both packages, the workspaces of
+on every architecture it ships for; the in-kernel Q/K L2 norm modes select the deterministic pair on every cell)
+with the plan's pairing guard.  On a GPU: the public entries against both packages, the workspaces of
 either mode, torch's deterministic mode, the mode the autograd node records at its forward, the saved set of
 either package and the raw gate mode of both packages (bitwise the same results).
 """
@@ -674,8 +676,8 @@ def test_either_backward_reads_either_packages_saved_set_by_gate_mode() -> None:
     """Both packages' saved sets carry ``gate`` / ``lower_bound`` and both backwards apply the same rule
     (``_check_saved_gate``): a set of the call's gate mode passes, of either package's type, and in raw mode the
     FP32 bits of ``lower_bound`` decide; a set of the other gate mode or of another lower bound is refused with
-    ``ValueError`` by either package, in both directions.  The in-kernel q / k L2 norm's set (``qk_l2norm``) stays
-    refused before the host checks."""
+    ``ValueError`` by either package, in both directions.  A set of the in-kernel Q/K L2 norm (``qk_l2norm``) of
+    either gate mode reaches the host checks of a call with ``use_qk_l2norm_in_kernel=True``."""
     t = torch.empty(0)
     scale = cake_backend.SCALE
     H = 2
@@ -703,43 +705,30 @@ def test_either_backward_reads_either_packages_saved_set_by_gate_mode() -> None:
                 with pytest.raises(ValueError, match="lower_bound"):
                     check(dataclasses.replace(raw, lower_bound=bound), gp)
     l2n = types.SimpleNamespace(gate="g", qk_l2norm=True)
-    with pytest.raises(ValueError, match="in-kernel q / k L2 norm"):
-        PACKAGE_CALLS["chunk_kda_bwd"](saved=l2n, deterministic=False)
     l2n_raw = types.SimpleNamespace(gate="raw", lower_bound=-5.0, qk_l2norm=True)
-    with pytest.raises(ValueError, match="in-kernel q / k L2 norm"):
-        PACKAGE_CALLS["chunk_kda_bwd"](saved=l2n_raw, deterministic=False)
+    for saved in (l2n, l2n_raw):
+        with pytest.raises(ValueError, match="v: expected 3-D"):
+            PACKAGE_CALLS["chunk_kda_bwd"](
+                saved=saved, deterministic=False, use_qk_l2norm_in_kernel=True
+            )
 
 
 def test_package_workspace_takes_the_gate_mode() -> None:
     """``workspace_bytes`` and ``KdaWorkspace`` take the gate mode of the calls they serve (``"g"``, the default,
-    or ``"raw"``): the raw mode's bytes are the deterministic package's raw bytes plus, on a backward workspace of
-    the R1c rows (``sm_100a`` / ``sm_103a``), the FP64 accumulators ``param_acc`` (``8 * stripes * H * 2 * 128``
-    bytes; none on ``sm_107a`` or a forward workspace), any other value is a ``ValueError`` raised before the device
-    is read, a known one reaches the device check, and a constructor whose ``gate`` is not its plan's is refused."""
+    or ``"raw"``): the raw mode's bytes are the deterministic package's raw bytes on every architecture, forward or
+    backward, any other value is a ``ValueError`` raised before the device is read, a known one reaches the device
+    check, and a constructor whose ``gate`` is not its plan's is refused."""
     S, N, H = 129, 1, 4
     assert cake_backend.workspace_bytes(
         S, N, H, sm_count=148, gate="g"
     ) == cake_backend.workspace_bytes(S, N, H, sm_count=148)
     for arch in ("sm_100a", "sm_103a", "sm_107a"):
         for h in (H, 64):
-            # one replica, but 8 on sm_100a from 32 heads
-            stripes = (
-                None
-                if arch == "sm_107a"
-                else (8 if arch == "sm_100a" and h >= 32 else 1)
-            )
-            p = cake_backend.plan(S, N, h, 148, arch, gate="raw")
-            assert cake_backend._r1c_stripes(p) == stripes, (arch, h)
             for backward in (True, False):
-                acc = 8 * stripes * h * 2 * 128 if stripes and backward else 0
-                assert (
-                    cake_backend.workspace_bytes(
-                        S, N, h, sm_count=148, arch=arch, gate="raw", backward=backward
-                    )
-                    == det_backend.workspace_bytes(
-                        S, N, h, sm_count=148, arch=arch, gate="raw", backward=backward
-                    )
-                    + acc
+                assert cake_backend.workspace_bytes(
+                    S, N, h, sm_count=148, arch=arch, gate="raw", backward=backward
+                ) == det_backend.workspace_bytes(
+                    S, N, h, sm_count=148, arch=arch, gate="raw", backward=backward
                 ), (arch, h, backward)
     ws_type = cake_backend.KdaWorkspace
     for gate in (None, "G", "activated"):
@@ -824,8 +813,7 @@ def test_facade_forwards_the_raw_gate(monkeypatch) -> None:
 
 def test_facade_runs_the_raw_gate_on_the_non_deterministic_package() -> None:
     """Without recorders: ``deterministic=False`` with the raw gate reaches this package, whose entries go on to
-    their host checks, and whose byte query gives the raw mode's bytes (the deterministic package's, plus on a
-    backward workspace of an R1c row, ``sm_100a`` / ``sm_103a``, the FP64 parameter-gradient accumulators)."""
+    their host checks, and whose byte query gives the raw mode's bytes (the deterministic package's)."""
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ExperimentalWarning)
         for name, args in (
@@ -851,81 +839,163 @@ def test_facade_runs_the_raw_gate_on_the_non_deterministic_package() -> None:
             assert got == cake_backend.workspace_bytes(
                 129, 1, 4, sm_count=148, backward=backward, gate="raw"
             )
-            acc = cake_backend._param_acc_bytes(
-                cake_backend.plan(129, 1, 4, 148, gate="raw")
-            )
             assert got == facade.kda_train_workspace_bytes(
                 129, 1, 4, sm_count=148, backward=backward, use_gate_in_kernel=True
-            ) + (acc if backward else 0)
+            )
 
 
-# the in-kernel Q/K L2 norm (#7817): the deterministic package's keyword, off at False
-_QK_L2NORM = "in-kernel Q/K L2 norm runs on the deterministic package only"
+# the in-kernel Q/K L2 norm (#7817): the deterministic package's keyword, on both packages
+_NOT_BOOL = "use_qk_l2norm_in_kernel must be a bool"
 
 
 @pytest.mark.parametrize("name", EXPERIMENTAL_ENTRIES)
-def test_package_refuses_the_in_kernel_qk_l2norm(name) -> None:
-    """The in-kernel Q/K L2 norm runs on the deterministic package only: with ``deterministic=False`` each entry
-    raises ``ValueError`` naming ``deterministic=True`` for ``use_qk_l2norm_in_kernel`` other than ``False``, before
-    its host checks; ``False`` reaches the host checks, as the omitted keyword does."""
+def test_package_takes_the_in_kernel_qk_l2norm(name) -> None:
+    """The in-kernel Q/K L2 norm runs on this package too: with ``deterministic=False`` each entry takes
+    ``use_qk_l2norm_in_kernel=True`` (and ``False``, as the omitted keyword) on to its host checks, and raises
+    ``ValueError`` for a value that is not a bool before them."""
     call = PACKAGE_CALLS[name]
-    for value in (True, 1, "True", None):
-        with pytest.raises(ValueError, match=_QK_L2NORM) as info:
+    for value in (True, False):
+        with pytest.raises(ValueError, match="v: expected 3-D") as info:
+            call(deterministic=False, use_qk_l2norm_in_kernel=value, **GATE_OFF)
+        assert "L2 norm" not in str(info.value), (value, str(info.value))
+    for value in (1, 0, "True", None):
+        with pytest.raises(ValueError, match=_NOT_BOOL):
             call(deterministic=False, use_qk_l2norm_in_kernel=value)
-        assert str(info.value).startswith(name), (value, str(info.value))
-        assert "deterministic=True" in str(info.value), value
-    with pytest.raises(ValueError, match="v: expected 3-D"):
-        call(deterministic=False, use_qk_l2norm_in_kernel=False, **GATE_OFF)
 
 
-def test_package_backward_refuses_a_saved_set_of_the_in_kernel_qk_l2norm() -> None:
-    """A saved set written with the in-kernel Q/K L2 norm (``qk_l2norm`` true, its reciprocal norms in ``qk_rstd``)
-    holds tensors formed from normalized q / k: the backward refuses it, of either package's type (both carry the
-    fields), before its host checks; the set with the mode off passes the refusal."""
+def _l2n_saved(saved_type, S: int, H: int, **fields):
     t = torch.empty(0)
-    scale = cake_backend.SCALE
+    return saved_type(4, t, t, None, S, H, 1, cake_backend.SCALE, qg=t, **fields)
+
+
+def test_either_packages_check_reads_either_packages_l2n_saved_set() -> None:
+    """Both packages' saved sets carry ``qk_rstd`` / ``qk_l2norm`` under the same names and both backwards apply the
+    same rule (``_check_saved_l2n``): a set of the call's in-kernel Q/K L2 norm mode passes, of either package's
+    type, in both directions; a set of the other mode, a missing or stray ``qk_rstd`` and a ``qk_rstd`` that is not
+    FP32 ``[2, S, H]`` contiguous are refused with ``ValueError`` by either package."""
+    S, H = 3, 2
+    cpu = torch.device("cpu")
+    rstd = torch.zeros(2, S, H, dtype=torch.float32)
+    checks = (cake_backend._check_saved_l2n, det_backend._check_saved_l2n)
+    passed = 0
     for saved_type in (cake_backend.KdaChunkSaved, det_backend.KdaDetChunkSaved):
-        l2n = saved_type(4, t, t, None, 1, 1, 1, scale, qg=t, qk_rstd=t, qk_l2norm=True)
-        with pytest.raises(ValueError, match="in-kernel q / k L2 norm") as info:
-            PACKAGE_CALLS["chunk_kda_bwd"](saved=l2n, deterministic=False)
-        assert "deterministic=True" in str(info.value), saved_type
-        off = saved_type(4, t, t, None, 1, 1, 1, scale, qg=t)
-        with pytest.raises(Exception) as info:  # noqa: B017 - the stand-in operands' error, never the refusal
-            PACKAGE_CALLS["chunk_kda_bwd"](saved=off, deterministic=False)
-        assert "L2 norm" not in str(info.value), str(info.value)
+        on = _l2n_saved(saved_type, S, H, qk_rstd=rstd, qk_l2norm=True)
+        off = _l2n_saved(saved_type, S, H)
+        assert (off.qk_rstd, off.qk_l2norm) == (None, False)
+        for check in checks:
+            for mode in ("fused", "fallback"):
+                check(on, mode, S, H, cpu)
+                passed += 1
+            check(off, "off", S, H, cpu)
+            passed += 1
+            with pytest.raises(
+                ValueError, match="use_qk_l2norm_in_kernel=True; this backward"
+            ):
+                check(on, "off", S, H, cpu)
+            with pytest.raises(
+                ValueError, match="use_qk_l2norm_in_kernel=False; this backward"
+            ):
+                check(off, "fused", S, H, cpu)
+            with pytest.raises(ValueError, match="carries none|has none"):
+                check(_l2n_saved(saved_type, S, H, qk_l2norm=True), "fused", S, H, cpu)
+            with pytest.raises(ValueError, match="without the in-kernel"):
+                check(_l2n_saved(saved_type, S, H, qk_rstd=rstd), "off", S, H, cpu)
+            for bad in (
+                torch.zeros(2, S + 1, H),
+                torch.zeros(2, S, H, dtype=torch.float64),
+                torch.zeros(2, H, S).transpose(1, 2),
+            ):
+                with pytest.raises(ValueError):
+                    check(
+                        _l2n_saved(saved_type, S, H, qk_rstd=bad, qk_l2norm=True),
+                        "fused",
+                        S,
+                        H,
+                        cpu,
+                    )
+    assert passed == 2 * 2 * 3
+    # the entry: an l2n set reaches the host checks of a call with the flag
+    with pytest.raises(ValueError, match="v: expected 3-D"):
+        PACKAGE_CALLS["chunk_kda_bwd"](
+            saved=_l2n_saved(
+                cake_backend.KdaChunkSaved, 4, 1, qk_rstd=rstd, qk_l2norm=True
+            ),
+            deterministic=False,
+            use_qk_l2norm_in_kernel=True,
+        )
 
 
-def test_package_queries_refuse_the_in_kernel_qk_l2norm_layout() -> None:
-    """``workspace_bytes``, ``saved_bytes`` and ``KdaWorkspace.for_problem`` take the deterministic package's ``l2n``:
-    ``"off"`` only (the bytes of the omitted keyword); any other value is a ``ValueError`` naming
-    ``deterministic=True``, raised before the device is read."""
+def test_package_queries_take_the_in_kernel_qk_l2norm_layout() -> None:
+    """``workspace_bytes``, ``saved_bytes``, ``output_bytes`` and ``KdaWorkspace.for_problem`` take the
+    deterministic package's ``l2n``: ``"off"`` gives the bytes of the omitted keyword, an l2n mode (``"fused"`` /
+    ``"fallback"``, which runs the deterministic package's records in either gate mode) the deterministic package's
+    bytes of that mode, and the saved set adds the reciprocal norms (``8 S H`` bytes); any other value is a
+    ``ValueError`` raised before the device is read, a known one reaches the device check."""
     S, N, H = 129, 1, 4
+    assert (
+        tuple(cake_backend.L2N_MODES)
+        == tuple(det_backend.L2N_MODES)
+        == (
+            "off",
+            "fused",
+            "fallback",
+        )
+    )
     assert cake_backend.workspace_bytes(
         S, N, H, sm_count=148, l2n="off"
     ) == cake_backend.workspace_bytes(S, N, H, sm_count=148)
     assert cake_backend.saved_bytes(
         S, H, N, sm_count=148, l2n="off"
     ) == cake_backend.saved_bytes(S, H, N, sm_count=148)
-    for l2n in ("fused", "fallback", None, "OFF"):
-        with pytest.raises(ValueError, match="deterministic=True"):
-            cake_backend.workspace_bytes(S, N, H, sm_count=148, l2n=l2n)
-        with pytest.raises(ValueError, match="deterministic=True"):
-            cake_backend.saved_bytes(S, H, N, sm_count=148, l2n=l2n)
-        with pytest.raises(ValueError, match="deterministic=True"):
+    compared = 0
+    for l2n in cake_backend.L2N_MODES:
+        for gate in ("g", "raw"):
+            if (gate, l2n) == ("g", "off"):
+                continue  # the S1 pairs' cells: test_cake_kda_train.py's byte tests
+            for backward in (True, False):
+                for save_mode in ("light", "tape"):
+                    kw = dict(
+                        backward=backward,
+                        save_mode=save_mode,
+                        sm_count=148,
+                        arch="sm_100a",
+                        gate=gate,
+                        l2n=l2n,
+                    )
+                    assert cake_backend.workspace_bytes(
+                        S, N, H, **kw
+                    ) == det_backend.workspace_bytes(S, N, H, **kw), kw
+                    compared += 1
+            assert cake_backend.output_bytes(
+                S, H, backward=True, gate=gate, l2n=l2n
+            ) == det_backend.output_bytes(S, H, backward=True, gate=gate, l2n=l2n)
+        for save_mode in ("light", "tape"):
+            q = dict(save_mode=save_mode, sm_count=148, arch="sm_100a")
+            nd = cake_backend.saved_bytes(S, H, N, **q, l2n=l2n)
+            off = cake_backend.saved_bytes(S, H, N, **q)
+            assert nd == off + (0 if l2n == "off" else 8 * S * H), (l2n, save_mode)
+            if l2n != "off":
+                assert nd == det_backend.saved_bytes(S, H, N, **q, l2n=l2n)
+        with pytest.raises(ValueError, match="CUDA devices"):
             cake_backend.KdaWorkspace.for_problem(
                 S, N, H, "cpu", l2n=l2n, deterministic=False
             )
-    with pytest.raises(ValueError, match="CUDA devices"):
-        cake_backend.KdaWorkspace.for_problem(
-            S, N, H, "cpu", l2n="off", deterministic=False
-        )
+    assert compared == (3 * 2 - 1) * 2 * 2
+    for l2n in (None, "OFF", "on", True):
+        with pytest.raises(ValueError, match="l2n must be one of"):
+            cake_backend.workspace_bytes(S, N, H, sm_count=148, l2n=l2n)
+        with pytest.raises(ValueError, match="l2n must be one of"):
+            cake_backend.saved_bytes(S, H, N, sm_count=148, l2n=l2n)
+        with pytest.raises(ValueError, match="l2n must be one of"):
+            cake_backend.KdaWorkspace.for_problem(
+                S, N, H, "cpu", l2n=l2n, deterministic=False
+            )
 
 
 def test_facade_forwards_the_in_kernel_qk_l2norm(monkeypatch) -> None:
-    """``deterministic=True`` hands ``use_qk_l2norm_in_kernel`` (the same object) to the deterministic package, and
-    to its workspace and byte queries as ``l2n="fused"``; ``deterministic=False`` hands ``False`` / ``"off"`` to
-    this package (whose entries refuse any other); under torch's deterministic mode the deterministic package
-    receives it; the workspace and the byte queries refuse a non-bool."""
+    """Both modes hand ``use_qk_l2norm_in_kernel`` (the same object) to their package, and to its workspace and
+    byte queries as ``l2n="fused"`` (``"off"`` without it); under torch's deterministic mode the deterministic
+    package receives it; the workspace and the byte queries refuse a non-bool."""
     log = _recorders(monkeypatch)
     operands = tuple(object() for _ in range(6))
     calls = {
@@ -945,19 +1015,21 @@ def test_facade_forwards_the_in_kernel_qk_l2norm(monkeypatch) -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         for name, call in calls.items():
-            assert call(use_qk_l2norm_in_kernel=True) == "det", name
-            assert log[-1][2]["use_qk_l2norm_in_kernel"] is True, name
-            assert call(deterministic=False) == "nd", name
-            assert log[-1][2]["use_qk_l2norm_in_kernel"] is False, name
+            for mode, side in (({}, "det"), ({"deterministic": False}, "nd")):
+                assert call(use_qk_l2norm_in_kernel=True, **mode) == side, name
+                assert log[-1][2]["use_qk_l2norm_in_kernel"] is True, (name, side)
+                assert call(**mode) == side, name
+                assert log[-1][2]["use_qk_l2norm_in_kernel"] is False, (name, side)
         with _TorchDeterministic():
             for name, call in calls.items():
                 assert call(deterministic=False, use_qk_l2norm_in_kernel=True) == "det"
                 assert log[-1][2]["use_qk_l2norm_in_kernel"] is True, name
         for name, query in queries.items():
-            assert query(use_qk_l2norm_in_kernel=True) == "det", name
-            assert log[-1][2]["l2n"] == "fused", name
-            assert query(deterministic=False) == "nd", name
-            assert log[-1][2]["l2n"] == "off", name
+            for mode, side in (({}, "det"), ({"deterministic": False}, "nd")):
+                assert query(use_qk_l2norm_in_kernel=True, **mode) == side, name
+                assert log[-1][2]["l2n"] == "fused", (name, side)
+                assert query(**mode) == side, name
+                assert log[-1][2]["l2n"] == "off", (name, side)
             for bad in (1, None, "True"):
                 with pytest.raises(
                     ValueError, match="use_qk_l2norm_in_kernel must be a bool"
@@ -965,11 +1037,10 @@ def test_facade_forwards_the_in_kernel_qk_l2norm(monkeypatch) -> None:
                     query(use_qk_l2norm_in_kernel=bad)
 
 
-def test_facade_refuses_the_in_kernel_qk_l2norm_on_the_non_deterministic_package() -> (
-    None
-):
-    """Without recorders: ``deterministic=False`` reaches this package, whose entries, workspace and byte queries
-    refuse ``use_qk_l2norm_in_kernel=True`` (``ValueError`` naming ``deterministic=True``)."""
+def test_facade_runs_the_in_kernel_qk_l2norm_on_the_non_deterministic_package() -> None:
+    """Without recorders: ``deterministic=False`` with ``use_qk_l2norm_in_kernel=True`` reaches this package, whose
+    entries go on to their host checks, whose byte queries give the l2n mode's bytes (the deterministic package's)
+    and whose workspace reaches its device check."""
     on = {"use_qk_l2norm_in_kernel": True, "deterministic": False}
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ExperimentalWarning)
@@ -978,15 +1049,26 @@ def test_facade_refuses_the_in_kernel_qk_l2norm_on_the_non_deterministic_package
             ("chunk_kda_bwd", (*_bad_operands(), torch.zeros(4, 1, 128))),
             ("chunk_kda", _bad_operands()),
         ):
-            with pytest.raises(ValueError, match=_QK_L2NORM):
+            with pytest.raises(ValueError, match="v: expected 3-D") as info:
                 getattr(facade, name)(*args, **on)
-        for query in (
-            lambda: facade.kda_train_workspace_bytes(129, 1, 4, sm_count=148, **on),
-            lambda: facade.kda_train_saved_bytes(129, 4, 1, sm_count=148, **on),
-            lambda: facade.kda_train_workspace(129, 1, 4, "cpu", **on),
-        ):
-            with pytest.raises(ValueError, match="deterministic=True"):
-                query()
+            assert "cake_kda_det_train" not in str(info.value), name
+        for backward in (True, False):
+            got = facade.kda_train_workspace_bytes(
+                129, 1, 4, sm_count=148, backward=backward, **on
+            )
+            assert got == cake_backend.workspace_bytes(
+                129, 1, 4, sm_count=148, backward=backward, l2n="fused"
+            )
+            assert got == facade.kda_train_workspace_bytes(
+                129, 1, 4, sm_count=148, backward=backward, use_qk_l2norm_in_kernel=True
+            )
+        got = facade.kda_train_saved_bytes(129, 4, 1, sm_count=148, **on)
+        assert got == cake_backend.saved_bytes(129, 4, 1, sm_count=148, l2n="fused")
+        assert got == facade.kda_train_saved_bytes(
+            129, 4, 1, sm_count=148, use_qk_l2norm_in_kernel=True
+        )
+        with pytest.raises(ValueError, match="CUDA devices"):
+            facade.kda_train_workspace(129, 1, 4, "cpu", **on)
 
 
 def test_package_exports_the_det_free_names_only() -> None:
@@ -1001,6 +1083,8 @@ def test_package_exports_the_det_free_names_only() -> None:
         assert name in pkg.__all__, name
         assert getattr(pkg, name) is getattr(cake_backend, name), name
     assert "S1_RECORDS" in pkg.__all__ and pkg.S1_RECORDS is cake_jit.S1_RECORDS
+    # the in-kernel Q/K L2 norm modes are the backend's, as in the deterministic package
+    assert "L2N_MODES" in cake_backend.__all__ and "L2N_MODES" not in pkg.__all__
     for name in (
         "chunk_kda_det",
         "chunk_kda_det_fwd",
@@ -1054,15 +1138,26 @@ SWEEP_ROWS = ((4096, 1, 148), (65536, 300, 160))  # (S, num_docs, sm_count)
 PAIR_STAGES = ("dqkg", "glm_intra", "gate_epilogue")
 
 
-def _admitted(stage: str, **scalars) -> list[str]:
-    """Every record of ``stage`` whose rule admits the scalars, the ``otherwise`` fallback included."""
+def _serves(name: str, l2n: str) -> bool:
+    """Whether record ``name`` serves the in-kernel Q/K L2 norm mode ``l2n``: a record of an l2n stage serves the
+    modes its ``l2n`` lists (``["off"]`` when absent), every other record every mode."""
+    record = cake_jit.MODULES[name]
+    return record["stage"] not in cake_jit.L2N_STAGES or l2n in record.get(
+        "l2n", ["off"]
+    )
+
+
+def _admitted(stage: str, gate: str = "g", l2n: str = "off", **scalars) -> list[str]:
+    """Every record of ``stage`` of the gate class ``gate`` serving the mode ``l2n`` whose rule admits the scalars,
+    the ``otherwise`` fallback included."""
     num_segments = cake_jit.segment_plan(
         scalars["num_seqs"], scalars["num_heads"], scalars["sm_count"], scalars["arch"]
     )[2]
     return [
         name
-        for name in cake_jit.records_of_stage(stage)
-        if cake_jit._admits(
+        for name in cake_jit.records_of_stage(stage, gate)
+        if _serves(name, l2n)
+        and cake_jit._admits(
             cake_jit.MODULES[name]["select_rule"],
             ctas=scalars["num_chunks_pad"] * scalars["num_heads"],
             num_seqs=scalars["num_seqs"],
@@ -1071,6 +1166,7 @@ def _admitted(stage: str, **scalars) -> list[str]:
             num_segments=num_segments,
             arch=scalars["arch"],
             path=scalars["path"],
+            l2n=l2n,
         )
     ]
 
@@ -1153,13 +1249,16 @@ def test_the_pairs_agree_on_every_head_count() -> None:
                     assert (by_stage["gate_epilogue"] is not None) is (
                         arch == "sm_100a"
                     ), tag
+    # the flag-off classes (the in-kernel Q/K L2 norm's are swept by test_the_l2n_modes_select_the_deterministic_pair)
     for stage in PAIR_STAGES:
-        assert set(cake_jit.records_of_stage(stage)) == {
+        assert {n for n in cake_jit.records_of_stage(stage) if _serves(n, "off")} == {
             name for name in used if cake_jit.MODULES[name]["stage"] == stage
         }, stage
-        assert set(cake_jit.records_of_stage(stage, "raw")) == {
-            name for name in raw_used if cake_jit.MODULES[name]["stage"] == stage
-        }, stage
+        assert {
+            n for n in cake_jit.records_of_stage(stage, "raw") if _serves(n, "off")
+        } == {name for name in raw_used if cake_jit.MODULES[name]["stage"] == stage}, (
+            stage
+        )
     # every program of the pair stages (the S1 records, the deterministic copies and the raw class) runs on every
     # architecture it ships for, in one mode or the other: no shipped build of these stages is unreachable
     reached = {
@@ -1173,9 +1272,102 @@ def test_the_pairs_agree_on_every_head_count() -> None:
         for stage in PAIR_STAGES
         for gate in ("g", "raw")
         for name in cake_jit.records_of_stage(stage, gate)
+        if _serves(name, "off")
         for arch in cake_jit.MODULES[name]["arches"]
     }
     assert reached == shipped
+
+
+# the raw gate's parameter finalize of the l2n modes: the deterministic param_finalize record (its program shared)
+L2N_PARAM = {"param_finalize_l2n": "param_finalize"}
+
+
+def _det_name(name: str | None) -> str | None:
+    """The deterministic record a record of this package copies: the fused gradient's raw and l2n classes are the
+    deterministic ``dqkg`` records with a class suffix, ``param_finalize_l2n`` is ``param_finalize``; every other copy
+    keeps its name."""
+    if name in L2N_PARAM:
+        return L2N_PARAM[name]
+    if name is not None and name.startswith("dqkg"):
+        return name.removesuffix("_raw").removesuffix("_l2n")
+    return name
+
+
+def test_the_l2n_modes_select_the_deterministic_pair() -> None:
+    """Over architecture x path x heads 1..128 (two packings each), both gate modes and both in-kernel Q/K L2 norm
+    modes (``"fused"``, ``"fallback"``): the plan's records are the deterministic package's plan of the same mode,
+    record for record (the fused gradient's raw and l2n classes and ``param_finalize_l2n`` by their deterministic
+    names), never an S1 record,
+    never the gate epilogue; on the l2n stages each is the only record of its mode class whose rule admits the
+    problem; and every program of the pair stages serving an l2n mode runs on exactly the architectures it ships
+    for, but the deterministic glm_intra_l2n's sm_103a build (kept beside its sm_103a form)."""
+    reached: set = set()
+    cells = 0
+    for arch in cake_jit.ARCHES:
+        for H in range(1, 129):
+            for S, N, sm in SWEEP_ROWS:
+                for gate in ("g", "raw"):
+                    for l2n in ("fused", "fallback"):
+                        p = cake_backend.plan(S, N, H, sm, arch, gate=gate, l2n=l2n)
+                        dp = det_backend.plan(S, N, H, sm, arch, gate=gate, l2n=l2n)
+                        assert (p.gate, p.l2n) == (dp.gate, dp.l2n) == (gate, l2n)
+                        assert set(p.records) == set(dp.records)
+                        for path, by_stage in p.records.items():
+                            tag = (arch, H, N, sm, gate, l2n, path)
+                            assert {
+                                stage: _det_name(name)
+                                for stage, name in by_stage.items()
+                            } == dp.records[path], tag
+                            assert not set(by_stage.values()) & S1_RECORDS, tag
+                            assert by_stage.get("gate_epilogue") is None, tag
+                            for stage, name in by_stage.items():
+                                if stage not in cake_jit.L2N_STAGES:
+                                    continue
+                                scalars = dict(
+                                    num_chunks_pad=p.NC_pad,
+                                    num_seqs=N,
+                                    num_heads=H,
+                                    sm_count=sm,
+                                    arch=arch,
+                                    path=path,
+                                )
+                                assert (
+                                    cake_jit.select_record(
+                                        stage, **scalars, gate=gate, l2n=l2n
+                                    )
+                                    == name
+                                ), (*tag, stage)
+                                admitted = _admitted(stage, gate, l2n, **scalars)
+                                positive = [
+                                    n
+                                    for n in admitted
+                                    if cake_jit.MODULES[n]["select_rule"]["kind"]
+                                    != "otherwise"
+                                ]
+                                assert (positive or admitted) == (
+                                    [name] if name else []
+                                ), (*tag, stage, admitted)
+                                if name is not None and stage in PAIR_STAGES:
+                                    assert arch in cake_jit.MODULES[name]["arches"]
+                                    reached.add(
+                                        (cake_jit.MODULES[name]["library"], arch)
+                                    )
+                            cells += 1
+    assert cells > 0
+    # the gate epilogue never runs in an l2n mode (its GLM intra programs write the gate gradients themselves)
+    shipped = {
+        (cake_jit.MODULES[name]["library"], arch)
+        for stage in ("dqkg", "glm_intra")
+        for gate in ("g", "raw")
+        for name in cake_jit.records_of_stage(stage, gate)
+        if _serves(name, "fused") or _serves(name, "fallback")
+        for arch in cake_jit.MODULES[name]["arches"]
+    }
+    # every reached build ships; every shipped one is reached but the deterministic glm_intra_l2n's sm_103a build,
+    # which the deterministic package keeps while its sm_103a form glm_intra_v30_l2n serves that architecture
+    kept = {(cake_jit.MODULES["glm_intra_l2n"]["library"], "sm_103a")}
+    assert reached <= shipped
+    assert shipped - reached == kept
 
 
 def test_the_plan_refuses_a_mixed_pair(monkeypatch) -> None:
@@ -1486,16 +1678,8 @@ def test_the_backward_reads_a_saved_set_of_either_package() -> None:
 def test_public_entries_run_the_raw_gate_on_both_packages() -> None:
     """The raw gate mode through the facade: ``deterministic=True`` and ``False`` give the same ``out`` and seven
     results bit for bit (explicit calls with and without a workspace of the raw mode, the autograd node: this
-    package runs the deterministic package's raw-mode programs), but for ``dA_log`` / ``ddt_bias`` on an R1c row
-    (``sm_100a`` / ``sm_103a``: the FP64 parameter-gradient reduce), which hold the R1c bound of the deterministic
-    per-chunk partials instead (``test_cake_kda_train._r1c_exact``); each mode's workspace of the raw mode serves
-    its package, with the byte query's size; a workspace of the g mode is refused by a raw call (``ValueError``)."""
-    from tests.experimental.test_cake_kda_train import (
-        RAW_RETURN_NAMES,
-        _r1c_exact,
-        _r1c_param_check,
-    )
-
+    package runs the deterministic package's raw-mode programs); each mode's workspace of the raw mode serves its
+    package, with the byte query's size; a workspace of the g mode is refused by a raw call (``ValueError``)."""
     device = _device_or_skip()
     lengths, heads = (63, 1, 65), 2
     S, N = sum(lengths), len(lengths)
@@ -1515,11 +1699,8 @@ def test_public_entries_run_the_raw_gate_on_both_packages() -> None:
                 S, N, heads, device, use_gate_in_kernel=True, deterministic=det
             )
             assert ws.gate == "raw", det
-            # the arena, and on a non-deterministic workspace of an R1c row its accumulators
-            assert ws.bytes + (0 if det else ws.param_acc_bytes) == (
-                facade.kda_train_workspace_bytes(
-                    S, N, heads, use_gate_in_kernel=True, deterministic=det
-                )
+            assert ws.bytes == facade.kda_train_workspace_bytes(
+                S, N, heads, use_gate_in_kernel=True, deterministic=det
             )
             runs = []
             for workspace in (None, ws):
@@ -1566,19 +1747,7 @@ def test_public_entries_run_the_raw_gate_on_both_packages() -> None:
                 )
             results[det] = runs
     want_out, want_grads = results[True][0]
-    # the R1c bound of this row (None where the device runs the deterministic pair at this head count)
-    r1c = _r1c_exact(
-        inputs, dict(zip(RAW_RETURN_NAMES[5:], want_grads[5:], strict=True))
-    )
     for det, runs in results.items():
         for i, (out, grads) in enumerate(runs):
             assert _bits_equal(out, want_out), (det, i)
-            if det or r1c is None:
-                assert _same(grads, want_grads), (det, i)
-                continue
-            assert _same(grads[:5], want_grads[:5]), (det, i)
-            _r1c_param_check(
-                dict(zip(RAW_RETURN_NAMES[5:], grads[5:], strict=True)),
-                r1c,
-                tag=(det, i),
-            )
+            assert _same(grads, want_grads), (det, i)
