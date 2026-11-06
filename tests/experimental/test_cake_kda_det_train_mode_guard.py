@@ -31,7 +31,7 @@ import torch
 
 import flashinfer.cake_kda_det_train as det_api
 from flashinfer.api_logging import ExperimentalWarning
-from flashinfer.experimental.cake_kda_det_train import cake_backend, cake_jit
+from flashinfer.experimental.cake.cake_kda_det_train import cake_backend, cake_jit
 from tests.test_helpers.cake_kda_det_train_reference import make_inputs
 
 ND_BACKEND = "flashinfer.experimental.cake.cake_kda_train.cake_backend"
@@ -114,11 +114,15 @@ def test_entries_refuse_a_foreign_object_on_cpu(entry: str, name: str) -> None:
         warnings.simplefilter("ignore", ExperimentalWarning)
         with pytest.raises(ValueError, match=_refused(name, foreign, det_type)):
             if entry == "fwd":
-                det_api.chunk_kda_det_fwd(q, k, v, g, beta, cu, **{name: foreign})
+                det_api.cake_kda_det_train_forward(
+                    q, k, v, g, beta, cu, **{name: foreign}
+                )
             elif entry == "bwd":
-                det_api.chunk_kda_det_bwd(q, k, v, g, beta, cu, dout, **{name: foreign})
+                det_api.cake_kda_det_train_backward(
+                    q, k, v, g, beta, cu, dout, **{name: foreign}
+                )
             else:
-                det_api.chunk_kda_det(q, k, v, g, beta, cu, **{name: foreign})
+                det_api.cake_kda_det(q, k, v, g, beta, cu, **{name: foreign})
 
 
 @pytest.mark.parametrize("name", ["workspace", "arena"])
@@ -147,18 +151,22 @@ def test_entries_refuse_nd_host_objects() -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ExperimentalWarning)
         with pytest.raises(
-            ValueError, match=_refused("saved", nd_saved, "KdaDetChunkSaved")
+            ValueError, match=_refused("saved", nd_saved, "CakeKDADetChunkSaved")
         ):
-            det_api.chunk_kda_det_bwd(q, k, v, g, beta, cu, dout, saved=nd_saved)
+            det_api.cake_kda_det_train_backward(
+                q, k, v, g, beta, cu, dout, saved=nd_saved
+            )
         for call in (
-            lambda: det_api.chunk_kda_det_fwd(q, k, v, g, beta, cu, arena=nd_arena),
-            lambda: det_api.chunk_kda_det_bwd(
+            lambda: det_api.cake_kda_det_train_forward(
+                q, k, v, g, beta, cu, arena=nd_arena
+            ),
+            lambda: det_api.cake_kda_det_train_backward(
                 q, k, v, g, beta, cu, dout, arena=nd_arena
             ),
-            lambda: det_api.chunk_kda_det(q, k, v, g, beta, cu, arena=nd_arena),
+            lambda: det_api.cake_kda_det(q, k, v, g, beta, cu, arena=nd_arena),
         ):
             with pytest.raises(
-                ValueError, match=_refused("arena", nd_arena, "KdaDetArena")
+                ValueError, match=_refused("arena", nd_arena, "CakeKDADetArena")
             ):
                 call()
 
@@ -166,7 +174,7 @@ def test_entries_refuse_nd_host_objects() -> None:
 def test_det_objects_pass_the_package_check() -> None:
     S = sum(LENGTHS)
     a = torch.zeros(S, HEADS, 64, dtype=torch.bfloat16)
-    saved = cake_backend.KdaDetChunkSaved(
+    saved = cake_backend.CakeKDADetChunkSaved(
         version=cake_backend.SAVED_VERSION,
         Aqk=a,
         Akk=a.clone(),
@@ -177,7 +185,7 @@ def test_det_objects_pass_the_package_check() -> None:
         scale=cake_backend.SCALE,
     )
     cake_backend._check_det_package(
-        workspace=None, saved=saved, arena=det_api.kda_det_train_arena(lean=True)
+        workspace=None, saved=saved, arena=det_api.cake_kda_det_train_arena(lean=True)
     )
     cake_backend._check_det_package(workspace=None, saved=None, arena=None)
 
@@ -195,20 +203,22 @@ def test_det_entries_refuse_an_nd_workspace_and_saved_set() -> None:
             q, k, v, g, beta, cu, workspace=nd_ws, deterministic=False
         )
         assert type(nd_saved).__module__ == ND_BACKEND
-        _out, saved = det_api.chunk_kda_det_fwd(q, k, v, g, beta, cu)
-        ws_refused = _refused("workspace", nd_ws, "KdaDetWorkspace")
+        _out, saved = det_api.cake_kda_det_train_forward(q, k, v, g, beta, cu)
+        ws_refused = _refused("workspace", nd_ws, "CakeKDADetWorkspace")
         with pytest.raises(ValueError, match=ws_refused):
-            det_api.chunk_kda_det_fwd(q, k, v, g, beta, cu, workspace=nd_ws)
+            det_api.cake_kda_det_train_forward(q, k, v, g, beta, cu, workspace=nd_ws)
         with pytest.raises(ValueError, match=ws_refused):
-            det_api.chunk_kda_det_bwd(
+            det_api.cake_kda_det_train_backward(
                 q, k, v, g, beta, cu, dout, saved=saved, workspace=nd_ws
             )
         with pytest.raises(ValueError, match=ws_refused):
-            det_api.chunk_kda_det(q, k, v, g, beta, cu, workspace=nd_ws)
+            det_api.cake_kda_det(q, k, v, g, beta, cu, workspace=nd_ws)
         with pytest.raises(
-            ValueError, match=_refused("saved", nd_saved, "KdaDetChunkSaved")
+            ValueError, match=_refused("saved", nd_saved, "CakeKDADetChunkSaved")
         ):
-            det_api.chunk_kda_det_bwd(q, k, v, g, beta, cu, dout, saved=nd_saved)
+            det_api.cake_kda_det_train_backward(
+                q, k, v, g, beta, cu, dout, saved=nd_saved
+            )
 
 
 def test_det_workspace_and_arena_still_run() -> None:
@@ -217,28 +227,28 @@ def test_det_workspace_and_arena_still_run() -> None:
     S, N = sum(LENGTHS), len(LENGTHS)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ExperimentalWarning)
-        ref_out, ref_saved = det_api.chunk_kda_det_fwd(q, k, v, g, beta, cu)
+        ref_out, ref_saved = det_api.cake_kda_det_train_forward(q, k, v, g, beta, cu)
         ref_grads = [
             t.clone()
-            for t in det_api.chunk_kda_det_bwd(
+            for t in det_api.cake_kda_det_train_backward(
                 q, k, v, g, beta, cu, dout, saved=ref_saved
             )
         ]
-        arena = det_api.kda_det_train_arena()
-        ws = det_api.kda_det_train_workspace(S, N, HEADS, device, arena=arena)
-        assert isinstance(ws, cake_backend.KdaDetWorkspace)
-        out, saved = det_api.chunk_kda_det_fwd(
+        arena = det_api.cake_kda_det_train_arena()
+        ws = det_api.cake_kda_det_train_workspace(S, N, HEADS, device, arena=arena)
+        assert isinstance(ws, cake_backend.CakeKDADetWorkspace)
+        out, saved = det_api.cake_kda_det_train_forward(
             q, k, v, g, beta, cu, workspace=ws, arena=arena
         )
-        assert isinstance(saved, cake_backend.KdaDetChunkSaved)
+        assert isinstance(saved, cake_backend.CakeKDADetChunkSaved)
         assert torch.equal(out, ref_out)
-        grads = det_api.chunk_kda_det_bwd(
+        grads = det_api.cake_kda_det_train_backward(
             q, k, v, g, beta, cu, dout, saved=saved, workspace=ws, arena=arena
         )
         for mine, theirs in zip(grads, ref_grads, strict=True):
             assert torch.equal(mine, theirs)
         leaves = [t.detach().clone().requires_grad_(True) for t in (q, k, v, g, beta)]
-        o = det_api.chunk_kda_det(*leaves, cu, workspace=ws)
+        o = det_api.cake_kda_det(*leaves, cu, workspace=ws)
         o.backward(dout)
         for leaf, expected in zip(
             leaves,
