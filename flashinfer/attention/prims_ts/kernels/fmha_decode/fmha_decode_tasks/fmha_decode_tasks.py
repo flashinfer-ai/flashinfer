@@ -700,6 +700,9 @@ class DecodeGenTask(Task):
         self.max_seq_len_kv = kwargs.pop("max_seq_len_kv", cutlass.Int32(0))
         self.seq_len_q = kwargs.pop("seq_len_q", None)
         self.domain_bias = kwargs.pop("domain_bias", 0)
+        # Iterations per loop step of the shared domain; the static schedule
+        # bound must already count scaled iterations.
+        self.domain_scale = kwargs.pop("domain_scale", 1)
         self.q_bound_resources = kwargs.pop("q_bound_resources", ())
         super().__init__(**kwargs)
         self._tmem_base_offset = cutlass.Int32(0)
@@ -931,7 +934,19 @@ class DecodeGenTask(Task):
         self.dummy = cutlass.Boolean(True)
 
     def get_domain(self, tile_coord: cute.Coord) -> cutlass.Int32 | int:
-        """Return this task's loop domain for one static or persistent tile."""
+        """Return this task's loop domain for one static or persistent tile.
+
+        ``domain_scale`` multiplies the shared MMA-loop domain for tasks that
+        run several schedule iterations per loop step. A static fallback
+        returns the schedule's own bound, which is already scaled.
+        """
+        domain = self._shared_loop_domain(tile_coord)
+        if self.domain_scale == 1 or domain is self.domain:
+            return domain
+        return domain * cutlass.Int32(self.domain_scale)
+
+    def _shared_loop_domain(self, tile_coord: cute.Coord) -> cutlass.Int32 | int:
+        """Return the MMA-loop domain plus bias, or the static schedule bound."""
         if self.cfg is None:
             return self.domain
         if cutlass.const_expr(not self.cfg.fixed_seqlen and self.seq_len_q is None):
@@ -2852,6 +2867,23 @@ def create_transform_kv_task(
         raise ValueError(
             "create_transform_kv_task requires either smem_kv, or smem_k0, smem_k1, smem_v0, and smem_v1"
         )
+    # One shared raw ring with several head-dimension stages can run its
+    # steady state once per raw stage, letting the TMEM converter pick K or V
+    # and the stage at run time. Unrolling every (operand, stage) pair puts
+    # 2 * num_head_dim_stages_kv converter bodies in the hot loop (about 16 KB
+    # of code at D512). With the larger D512 Q32 softmax and correction code
+    # that overflows the instruction cache (GB300 B128/KV128K/sQ4: 4.39 ->
+    # 3.79 ms); narrower tiles fit and keep the unrolled bodies (D512 Q8/Q16
+    # and D256 Q8/Q16 were 5-12% slower flattened).
+    loop_stages_per_step = 2 * cfg.num_head_dim_stages_kv
+    flatten_loop = (
+        cfg.store_transformed_kv_in_tmem
+        and cfg.num_insts_kv == 1
+        and inst_id is None
+        and not use_split_sources
+        and cfg.num_head_dim_stages_kv == 4
+        and cfg.tile_size_q >= 32
+    )
 
     def transform_kv_schedule_body(
         smem_transformed_kv: MemoryResource,
@@ -2877,9 +2909,18 @@ def create_transform_kv_task(
         # Keep the transformed-K/V steady state as one compact runtime loop.
         # Static decode domains can be large, and the compiler default may
         # otherwise fully unroll this transform body once per K/V tile.
-        with domain_loop(0, domain, 1, unroll=1):
-            for label in loop_labels:
-                transform_one(label)
+        if flatten_loop:
+            source = source_for_label(loop_labels[0])
+            with domain_loop(0, domain * loop_stages_per_step, 1, unroll=1):
+                smem_transformed_kv.acquire()
+                source.wait()
+                smem_transformed_kv.transform_kv_loop_stage()
+                smem_transformed_kv.commit()
+                source.release()
+        else:
+            with domain_loop(0, domain, 1, unroll=1):
+                for label in loop_labels:
+                    transform_one(label)
 
         for label in tail_labels:
             transform_one(label)
@@ -2957,6 +2998,7 @@ def create_transform_kv_task(
             else cfg.transform_kv_task_num_registers
         ),
         name="TransformKv1Task" if inst_id == 1 else "TransformKvTask",
+        domain_scale=loop_stages_per_step if flatten_loop else 1,
         **kw,
     )
 

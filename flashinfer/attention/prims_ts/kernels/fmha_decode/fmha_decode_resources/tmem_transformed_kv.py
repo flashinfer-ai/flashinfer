@@ -244,9 +244,7 @@ class TmemTransformedKvResource(DecodeGenResourceBase):
         )
 
     @cute.jit
-    def _store_k(
-        self, stage_info: StageInfo, head_dim_stage_idx: Constexpr[int]
-    ) -> None:
+    def _store_k(self, stage_info: StageInfo, head_dim_stage_idx: Int32 | int) -> None:
         """Dequantize K with unpacking LDSM and store token-major TMEM."""
         cfg = self.cfg
         task_cache = _decode_gen_task_cache(stage_info)
@@ -353,9 +351,7 @@ class TmemTransformedKvResource(DecodeGenResourceBase):
         cute.arch.fence_view_async_tmem_store()
 
     @cute.jit
-    def _store_v(
-        self, stage_info: StageInfo, head_dim_stage_idx: Constexpr[int]
-    ) -> None:
+    def _store_v(self, stage_info: StageInfo, head_dim_stage_idx: Int32 | int) -> None:
         """Dequantize and transpose V with LDSM into TMEM operand A."""
         cfg = self.cfg
         task_cache = _decode_gen_task_cache(stage_info)
@@ -448,6 +444,26 @@ class TmemTransformedKvResource(DecodeGenResourceBase):
                 cutlass.Vector.from_elements(tuple(dst_regs[2:]), dtype=Int32),
             )
         cute.arch.fence_view_async_tmem_store()
+
+    @producer_work
+    @cute.jit
+    def transform_kv_loop_stage(self, stage_info: StageInfo) -> None:
+        """Transform one raw stage of a steady-state K/V loop step.
+
+        Each one-instance loop step converts the next K tile and then the
+        current V tile, ``num_head_dim_stages_kv`` raw stages each, so loop
+        iteration ``n`` holds V when bit ``log2(stages)`` of ``n`` is set and
+        head-dimension stage ``n % stages``. Selecting both at run time keeps
+        one K and one V body in the hot loop.
+        """
+        stages = self.cfg.num_head_dim_stages_kv
+        assert stages & (stages - 1) == 0, "stage decoding uses bit masks"
+        item = Int32(stage_info.loop_offset) - Int32(stage_info.loop_start)
+        head_dim_stage_idx = item & Int32(stages - 1)
+        if (item & Int32(stages)) == Int32(0):
+            self._store_k(stage_info, head_dim_stage_idx)
+        else:
+            self._store_v(stage_info, head_dim_stage_idx)
 
     @producer_work
     @cute.jit

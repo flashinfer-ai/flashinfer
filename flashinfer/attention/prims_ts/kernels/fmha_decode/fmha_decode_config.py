@@ -2324,6 +2324,16 @@ class FmhaDecodeConfig:
     @property
     def inferred_kv_stages(self) -> int:
         """Return the deepest K/V ring that fits the shared-memory budget."""
+        return self.infer_kv_stages(cap_kv_staging=True)
+
+    def infer_kv_stages(self, *, cap_kv_staging: bool) -> int:
+        """Return the deepest K/V ring that fits the shared-memory budget.
+
+        ``cap_kv_staging`` also bounds the ring by ``MAX_KV_STAGE_SMEM_KIB``,
+        the conservative topology-independent K/V share; without it only the
+        complete ``TOTAL_SMEM_BUDGET_KIB`` budget minus the fixed buffers
+        applies.
+        """
         q_dtype_bits = self.q_dtype_bytes * BITS_PER_BYTE
         q_row_bytes = (
             (
@@ -2378,10 +2388,9 @@ class FmhaDecodeConfig:
 
         # Reserve common buffers for every profile, leaving hardware SMEM
         # above this budget for alignment, barriers, and scheduler state.
-        kv_budget_bytes = min(
-            MAX_KV_STAGE_SMEM_KIB * BYTES_PER_KIB,
-            TOTAL_SMEM_BUDGET_KIB * BYTES_PER_KIB - fixed_bytes,
-        )
+        kv_budget_bytes = TOTAL_SMEM_BUDGET_KIB * BYTES_PER_KIB - fixed_bytes
+        if cap_kv_staging:
+            kv_budget_bytes = min(MAX_KV_STAGE_SMEM_KIB * BYTES_PER_KIB, kv_budget_bytes)
         inferred_stages = max(1, kv_budget_bytes * BITS_PER_BYTE // kv_tile_bits)
         return inferred_stages
 
@@ -4043,6 +4052,30 @@ def _finalize_static_decode_config(
 
     if cfg.tile_size_kv != 256 and cfg.target_ctas_per_sm != 2:
         _set_if_implicit(cfg, "kv_stages", cfg.inferred_kv_stages, explicit_fields)
+    if (
+        cfg.headdim == 512
+        and cfg.use_nvfp4_kv
+        and cfg.store_transformed_kv_in_tmem
+        and not cfg.uses_dual_kv_transform
+        and not cfg.use_keeps_mma_ab
+        and cfg.target_ctas_per_sm == 1
+    ):
+        # One raw ring carries K then V for each of the four head-dimension
+        # stages. A depth of one whole K/V tile (eight stages) keeps the ring
+        # aligned with the converter's K/V order; otherwise use an even depth.
+        # Full rows of NVFP4 scales make the conservative K/V cap stop at
+        # seven. GB300 B128/KV128K: Q8 3.33 -> 3.11 ms, Q16 3.31 -> 3.15 ms
+        # with eight stages, Q32 4.09 -> 4.00 ms with six.
+        tile_stages = 2 * cfg.num_head_dim_stages_kv
+        fitting_stages = cfg.infer_kv_stages(cap_kv_staging=False)
+        _set_if_implicit(
+            cfg,
+            "kv_stages",
+            tile_stages
+            if fitting_stages >= tile_stages
+            else max(2, fitting_stages - fitting_stages % 2),
+            explicit_fields,
+        )
     if cfg.uses_dual_smem_transform:
         # Two FP8 slots per ring hold one D256 tile's two head-dim stages.
         # Eight raw stages (two tiles per K and V ring) keep enough K/V in
