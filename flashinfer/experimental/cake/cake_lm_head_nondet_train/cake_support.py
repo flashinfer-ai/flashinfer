@@ -2317,19 +2317,11 @@ def cake_lm_head_nondet_train_support_kl(
 
 __all__ = [
     "CANONICAL_SEQUENCE",
-    "CakeLMHeadNondetSupportFunction",
     "NO_ERROR",
     "SUPPORT_ERRORS",
     "SUPPORT_M_MAX",
     "SUPPORT_V_MAX",
-    "SupportReferenceEngine",
-    "SupportRows",
+    "CakeLMHeadNondetSupportFunction",
     "cake_lm_head_nondet_train_support_kl",
     "cake_lm_head_nondet_train_support_logprob",
-    "decode_support_error",
-    "describe_support_error",
-    "support_error_word",
-    "support_memory_report",
-    "support_program_available",
-    "validate_support_inputs",
 ]
