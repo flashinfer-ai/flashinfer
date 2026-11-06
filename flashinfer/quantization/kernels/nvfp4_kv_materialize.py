@@ -722,7 +722,23 @@ class NVFP4KVMaterializer:
         device: Union[str, int, torch.device] = "cuda",
         uses_shared_paged_kv_idx: bool = True,
     ) -> None:
-        """Check the layout and device, and compile or load the kernel."""
+        """Check the layout and device, and compile or load the kernel.
+
+        Parameters
+        ----------
+        num_kv_heads : int
+            Number of KV heads per page.
+        page_size : int
+            Tokens per page. Must be divisible by 4.
+        head_dim : int
+            Head dimension. Must be divisible by 64.
+        device : Union[str, int, torch.device]
+            CUDA device that holds the tensors passed to :meth:`run`.
+        uses_shared_paged_kv_idx : bool
+            Whether K and V share page indices. ``block_tables`` is
+            ``[batch_size, max_num_pages]`` if so, else
+            ``[batch_size, 2, max_num_pages]``.
+        """
         device = torch.device(device)
         if device.type != "cuda":
             raise ValueError(f"device must be a CUDA device, got {device}")

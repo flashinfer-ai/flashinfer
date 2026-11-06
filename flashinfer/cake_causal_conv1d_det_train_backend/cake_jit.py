@@ -2325,7 +2325,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "role": "bwd",
         "select_rule": {
             "channels": {
-                "sm_107a": 264,
+                "sm_107a": [264, 296, 416],
             },
             "kind": "channels_at_least",
         },
@@ -2509,6 +2509,97 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "channels_tokens_at_least",
             "tokens": {
                 "sm_103a": 24576,
+            },
+        },
+        "workspace_rule": {
+            "kind": "partial_rows",
+            "taps": 4,
+        },
+    },
+    # Rendered by the exporter from the family adapter's scaffold: the backward
+    # with vec 8, copy tma2d, stage_pair, straddle_rows, threads 256, min_blocks
+    # 1, sm_cta
+    # (1 CTAs per SM); it runs when C reaches a threshold of
+    # select_rule.channels[arch], S >= select_rule.tokens[arch] and no routed
+    # record of a higher threshold admits the call; otherwise the next admitting
+    # record (at a shared threshold, the one without a token floor) or the
+    # fallback record (no select_rule) runs.
+    "cake_causal_conv1d_det_train_5ca7515dd2118dd96241": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "w"],
+            ["buffer", "cu"],
+            ["buffer", "dy"],
+            ["buffer", "dx"],
+            ["buffer", "partial"],
+            ["parameter", "S"],
+            ["parameter", "C"],
+            ["parameter", "num_docs"],
+            ["parameter", "search_steps"],
+            ["parameter", "ct_vec"],
+            ["parameter", "n_sub"],
+            ["parameter", "n_ch_tiles"],
+            ["buffer", "x_map"],
+            ["buffer", "dy_map"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cooperative": False,
+            "ctas_per_sm": 1,
+            "geometry": {
+                "threads": 256,
+                "vec": 8,
+            },
+            "grid_mult": {
+                "sm_107a": 1,
+            },
+            "kind": "occupancy",
+        },
+        "kernel": "cake_causal_conv1d_det_train_5ca7515dd2118dd96241",
+        "kernel_symbol": "kernel_cake_causal_conv1d_det_train_5ca7515dd2118dd96241",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 132096,
+            "use_pdl": False,
+        },
+        "library": "cake_causal_conv1d_det_train_5ca7515dd2118dd96241",
+        "logical": {
+            "C": "C",
+            "S": "S",
+            "ct_vec": "ct_vec",
+            "cu": "cu",
+            "dx": "dx",
+            "dy": "dy",
+            "dy_map": "dy",
+            "n_ch_tiles": "n_ch_tiles",
+            "n_sub": "n_sub",
+            "num_docs": "num_docs",
+            "partial": "partial",
+            "search_steps": "search_steps",
+            "w": "w",
+            "x": "x",
+            "x_map": "x",
+        },
+        "reduce": "cake_causal_conv1d_det_train_86b5ecfbd90aca4b52e5",
+        "role": "bwd",
+        "select_rule": {
+            "channels": {
+                "sm_107a": [
+                    264,
+                    344,
+                ],
+            },
+            "kind": "channels_tokens_at_least",
+            "tokens": {
+                "sm_107a": 32768,
             },
         },
         "workspace_rule": {
@@ -2866,6 +2957,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_causal_conv1d_det_train_aeff6106e2822f313a0c",
             "cake_causal_conv1d_det_train_9a07bcaa0223632640ee",
             "cake_causal_conv1d_det_train_50aa818e2b2338fb34a4",
+            "cake_causal_conv1d_det_train_5ca7515dd2118dd96241",
         ],
         "bwd_bias": [
             "cake_causal_conv1d_det_train_cc7a117aee9c7ae829c4",

@@ -395,7 +395,10 @@ def test_registry_records_reference_the_build_manifest():
     package's kernel and binding sources and the precise-arithmetic flags."""
     manifest = cake_build.manifest()
     assert manifest["schema"] == "cake-build/1"
-    assert manifest["package"] == "flashinfer.cake_rmsnorm_silu_gate_det_train_backend"
+    assert (
+        manifest["package"]
+        == "flashinfer.experimental.cake.cake_rmsnorm_silu_gate_det_train"
+    )
     libraries = cake_build.libraries_by_name()
     package = Path(cake_build.__file__).parent
     for arch in loader.ARCHES:

@@ -850,13 +850,17 @@ def plan_for(
     group_m_scale: Optional[int] = None,
     pair: Optional[bool] = None,
     xband: bool = False,
+    bn128_max_m: Optional[int] = None,
 ) -> tuple[Policy, TilePlan]:
     """Policy and tile plan of one row for one rank (``group_m_scale`` ``None`` = the architecture's default for
     the geometry's world size).  ``pair`` overrides the policy's pair tile (``False`` = the single-CTA producer with
     the policy's tile order and ``group_m``, what a fired ``pair_off_large_m`` gate selects); ``None`` keeps it.
     ``xband`` (what a fired ``xband_min_m`` gate selects) builds the cross-destination-band plan: the
     ``block_n = XBAND_BN`` pair tiles with the policy's tile order and ``group_m``; the policy (``bn`` of the band)
-    must be the pair tile."""
+    must be the pair tile.  ``bn128_max_m`` is the largest row count of the 128-column tile table
+    (:data:`HOPPER_BN128_MAX_M_BY_ARCH_WORLD`; ``None`` = the table's cell of the geometry, ``0`` = off): a row of a
+    256-column band at or below it that is not a cross-destination-band row takes the 128-column tile with the band
+    policy's tile order, ``group_m`` and pair flag."""
 
     policy = plan_policy(
         geometry, arch=arch, pair_available=pair_available, group_m_scale=group_m_scale
@@ -870,6 +874,22 @@ def plan_for(
                 f"pair override {policy.pair} -> {bool(pair)} (row-count gate): the "
                 f"{'pair' if pair else 'single-CTA'} producer with order {policy.order}"
                 f" / group_m {policy.group_m}",
+            ),
+        )
+    max_m = (
+        hopper_bn128_max_m(arch, geometry.world_size, geometry.hidden)
+        if bn128_max_m is None
+        else check_bn128_max_m(bn128_max_m)
+    )
+    if not xband and max_m and policy.bn != HOPPER_BN128_BN and geometry.rows <= max_m:
+        policy = dataclasses.replace(
+            policy,
+            bn=HOPPER_BN128_BN,
+            reasons=(
+                *policy.reasons,
+                f"128-column tile table: ({arch}, W={geometry.world_size}, K {geometry.hidden}) M {geometry.rows} <= "
+                f"{max_m} (HOPPER_BN128_MAX_M_BY_ARCH_WORLD) -> block_n {HOPPER_BN128_BN} (band rule {policy.bn}); "
+                f"order {policy.order} / group_m {policy.group_m} unchanged",
             ),
         )
     if xband:
@@ -1230,6 +1250,66 @@ def default_xband_min_m(arch: str, *, world_size: int) -> int:
     return int(XBAND_MIN_M_DEFAULT_BY_ARCH_WORLD.get((arch, world_size), 0))
 
 
+# The 128-column tile table: per ``(arch, world_size)``, ``hidden -> largest M`` (inclusive) of the rows whose band
+# rule (:func:`block_n_for`) gives 256 columns but which run the 128-column tile (:func:`plan_for`; the tile order,
+# ``group_m`` and the pair flag stay the band policy's, the row-count gates read the band width).  One cell ships, SM90
+# with 4 ranks at ``hidden = 3072``, ``M <= 1024``: there the last persistent wave of the 256-column plan is underfilled
+# (288 tiles on 130 producer SMs, 2.22 waves) while the 128-column tile doubles the tile count (576 tiles, 4.43
+# waves).  Not a cell of the pair architectures.
+HOPPER_BN128_BN = 128
+HOPPER_BN128_MAX_M_BY_ARCH_WORLD: dict[tuple[str, int], dict[int, int]] = {
+    ("sm_90a", 4): {3072: 1024},
+}
+
+
+def check_bn128_max_m(value: Any) -> int:
+    """Validate a 128-column tile bound: an int ``>= 0`` (``0`` = off) below ``SHAPE_GATE_ALL_ROWS``."""
+
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"bn128_max_m must be an int >= 0 (0 = off), got {value!r}")
+    if value >= SHAPE_GATE_ALL_ROWS:
+        raise ValueError(
+            f"bn128_max_m={value} is not below SHAPE_GATE_ALL_ROWS ({SHAPE_GATE_ALL_ROWS})"
+        )
+    return int(value)
+
+
+def _check_hopper_bn128_table() -> None:
+    for (arch, world_size), cells in HOPPER_BN128_MAX_M_BY_ARCH_WORLD.items():
+        if (
+            arch not in SHAPE_GATE_DEFAULT_BY_ARCH
+            or arch in PAIR_ARCHES
+            or world_size not in SUPPORTED_WORLD_SIZES
+        ):
+            raise ValueError(
+                f"HOPPER_BN128_MAX_M_BY_ARCH_WORLD[{(arch, world_size)!r}] is not a delivered SM90 cell"
+            )
+        for hidden, max_m in cells.items():
+            if (
+                isinstance(hidden, bool)
+                or not isinstance(hidden, int)
+                or hidden <= 0
+                or hidden % HEAD_DIM
+                or not check_bn128_max_m(max_m)
+            ):
+                raise ValueError(
+                    f"HOPPER_BN128_MAX_M_BY_ARCH_WORLD[{(arch, world_size)!r}][{hidden!r}] = {max_m!r}: hidden must "
+                    f"be a positive multiple of {HEAD_DIM} and the bound a positive row count; list only the cells "
+                    "that ship it"
+                )
+
+
+_check_hopper_bn128_table()
+
+
+def hopper_bn128_max_m(arch: str, world_size: int, hidden: int) -> int:
+    """The largest row count (inclusive) of ``(arch, world_size, hidden)`` that takes the 128-column tile
+    (:data:`HOPPER_BN128_MAX_M_BY_ARCH_WORLD`); ``0`` = no cell."""
+
+    cells = HOPPER_BN128_MAX_M_BY_ARCH_WORLD.get((arch, int(world_size)), {})
+    return int(cells.get(int(hidden), 0))
+
+
 @dataclass(frozen=True)
 class ShapeGateVerdict:
     """The row-count gates of one call (``rows = batch * s_local``): which fired and what they select.
@@ -1405,13 +1485,15 @@ def plan_row(
     pair_available: bool = True,
     words_capacity_per_dest: int = DEFAULT_WORDS_CAPACITY_PER_DEST,
     group_m_scale: Optional[int] = None,
+    bn128_max_m: Optional[int] = None,
 ) -> tuple[ShapeGateVerdict, Policy, TilePlan]:
     """The host plan of one call: the row-count gate verdict (:func:`gate_rows` on the call's rows, tile width,
     hidden size and cross-destination-band eligibility), then the policy and tile plan of :func:`plan_for` with the
     verdict applied -- one readiness word per destination for a fired small-row gate (otherwise
     ``words_capacity_per_dest``), the single-CTA producer for a fired pair-tile gate, the cross-destination-band plan
-    for a fired ``xband_min_m`` gate.  ``verdict.producer_launches`` / ``verdict.reserved_sms`` are the launch
-    structure of the call."""
+    for a fired ``xband_min_m`` gate, the 128-column tile on a row of the 128-column tile table (``bn128_max_m``, see
+    :func:`plan_for`; the gates read the band width).  ``verdict.producer_launches`` / ``verdict.reserved_sms`` are
+    the launch structure of the call."""
 
     bn = block_n_for(geometry)
     verdict = gate_rows(
@@ -1438,6 +1520,7 @@ def plan_row(
         group_m_scale=group_m_scale,
         pair=verdict.pair,
         xband=bool(verdict.xband),
+        bn128_max_m=bn128_max_m,
     )
     return verdict, policy, plan
 
@@ -1480,6 +1563,8 @@ __all__ = [
     "GROUP_M_SCALE_DEFAULT_BY_ARCH_WORLD",
     "GROUP_M_SCALE_MIN_K",
     "HEAD_DIM",
+    "HOPPER_BN128_BN",
+    "HOPPER_BN128_MAX_M_BY_ARCH_WORLD",
     "LAYOUTS",
     "PAIR_ARCHES",
     "PAIR_BN",
@@ -1507,6 +1592,7 @@ __all__ = [
     "TilePlan",
     "block_n_for",
     "ceil_div",
+    "check_bn128_max_m",
     "check_shape_gate_k_table",
     "check_shape_gates",
     "check_xband_min_m",
@@ -1518,6 +1604,7 @@ __all__ = [
     "dest_parts",
     "gate_rows",
     "heads_divisibility_error",
+    "hopper_bn128_max_m",
     "k_band_index",
     "k_band_threshold",
     "pair_geometry",

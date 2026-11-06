@@ -424,7 +424,7 @@ kernel_cake_dsv4_8afa079cbcc688b8b5b9(const __grid_constant__ CUtensorMap tmap_q
         // s_seeded: 1 barriers, init_count=256
         // q_pair_ready: 1 barriers, init_count=64
         // kv_pair_ready: 1 barriers, init_count=64
-        // pv_pair_ready: 2 barriers, init_count=1
+        // pv_pair_ready: 2 barriers, init_count=64
         // tmem_dealloc: 1 barriers, init_count=448
         // tmem_dealloc_peer: 1 barriers, init_count=32
         // --- pipeline 'source_work_pipe' ---
@@ -449,8 +449,7 @@ kernel_cake_dsv4_8afa079cbcc688b8b5b9(const __grid_constant__ CUtensorMap tmap_q
         asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_32) : "r"(lane), "n"(19), "r"((uint32_t)(1)));
         asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_32) : "r"(lane), "n"(17), "r"((uint32_t)(32)));
         asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_32) : "r"(lane), "n"(16), "r"((uint32_t)(448)));
-        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_32) : "r"(lane), "n"(15), "r"((uint32_t)(1)));
-        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_32) : "r"(lane), "n"(13), "r"((uint32_t)(64)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_32) : "r"(lane), "n"(15), "r"((uint32_t)(64)));
         asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_32) : "r"(lane), "n"(11), "r"((uint32_t)(256)));
         asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_32) : "r"(lane), "n"(10), "r"((uint32_t)(128)));
         asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_32) : "r"(lane), "n"(8), "r"((uint32_t)(32)));
@@ -2206,13 +2205,6 @@ kernel_cake_dsv4_8afa079cbcc688b8b5b9(const __grid_constant__ CUtensorMap tmap_q
                 uint32_t _mbar_token_0_1 = mbarrier_try_wait(s_empty_addr + 8, 1);
                 mbarrier_wait_token(s_empty_addr + 8, 1, _mbar_token_0_1);
             }
-            int pv_qk_cursor = 0;
-            int pv_qk_single_wave = 0;
-            uint32_t _read_special_reg_0;
-            asm("mov.u32 %0, %%nsmid;" : "=r"(_read_special_reg_0));
-            if (num_query_tokens <= (int)_read_special_reg_0) {
-                pv_qk_single_wave = 1;
-            }
             unsigned int _phase_q_full_0 = 0;
             unsigned int _phase_k_full = 0;
             unsigned int _phase_source_work_full_4 = 0;
@@ -2224,10 +2216,10 @@ kernel_cake_dsv4_8afa079cbcc688b8b5b9(const __grid_constant__ CUtensorMap tmap_q
                 int source_work_valid_4 = source_work_z_4 * (unsigned int)max_q_len + source_work_x_4 < (unsigned int)num_query_tokens;
                 int mapped_query_idx_4 = source_work_z_4 * (unsigned int)max_q_len + source_work_x_4;
                 if (source_work_valid_4 != 0) {
-                    int _max_1_4 = ((sparse_topk_lens[mapped_query_idx_4] + sparse_topk_lens_offset) > (0) ? (sparse_topk_lens[mapped_query_idx_4] + sparse_topk_lens_offset) : (0));
-                    int active_topk_4 = ((_max_1_4) < (sparse_topk) ? (_max_1_4) : (sparse_topk));
-                    int _max_2 = ((active_topk_4) > (1) ? (active_topk_4) : (1));
-                    all_num_kv_tiles_4 = (_max_2 + 128 - 1) / 128;
+                    int _max_0_4 = ((sparse_topk_lens[mapped_query_idx_4] + sparse_topk_lens_offset) > (0) ? (sparse_topk_lens[mapped_query_idx_4] + sparse_topk_lens_offset) : (0));
+                    int active_topk_4 = ((_max_0_4) < (sparse_topk) ? (_max_0_4) : (sparse_topk));
+                    int _max_1_4 = ((active_topk_4) > (1) ? (active_topk_4) : (1));
+                    all_num_kv_tiles_4 = (_max_1_4 + 128 - 1) / 128;
                     int tiles_per_split_4 = all_num_kv_tiles_4 + 1 - 1;
                     int first_tile_4 = split_idx_4 * tiles_per_split_4;
                     int num_kv_tiles_3 = tiles_per_split_4;
@@ -2235,357 +2227,357 @@ kernel_cake_dsv4_8afa079cbcc688b8b5b9(const __grid_constant__ CUtensorMap tmap_q
                         mbarrier_wait(q_full_addr, _phase_q_full_0);
                         _phase_q_full_0 ^= 1;
                         asm volatile("tcgen05.fence::after_thread_sync;");
-                        uint32_t _elected_3 = elect_sync();
+                        uint32_t _elected_2 = elect_sync();
                         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
                         #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                         #endif
                         {
-                            uint64_t _tcgen05_cp_desc_4 = ((((uint64_t)(smem_q_full_addr)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+                            uint64_t _tcgen05_cp_desc_3 = ((((uint64_t)(smem_q_full_addr)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
                             asm volatile(
                                 "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
                                 "@leader tcgen05.cp.cta_group::1.64x128b.warpx2::02_13 [%0], %1;\n\t}\n"
-                                :: "r"((uint32_t)(tmem_tmem_scratch + 128)), "l"(_tcgen05_cp_desc_4), "r"(_elected_3)
+                                :: "r"((uint32_t)(tmem_tmem_scratch + 128)), "l"(_tcgen05_cp_desc_3), "r"(_elected_2)
                                 : "memory");
                         }
                         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
                         #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                         #endif
                         {
-                            uint64_t _tcgen05_cp_desc_5 = ((((uint64_t)(smem_q_full_addr + 16)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+                            uint64_t _tcgen05_cp_desc_4 = ((((uint64_t)(smem_q_full_addr + 16)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
                             asm volatile(
                                 "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
                                 "@leader tcgen05.cp.cta_group::1.64x128b.warpx2::02_13 [%0], %1;\n\t}\n"
-                                :: "r"((uint32_t)(tmem_tmem_scratch + 132)), "l"(_tcgen05_cp_desc_5), "r"(_elected_3)
+                                :: "r"((uint32_t)(tmem_tmem_scratch + 132)), "l"(_tcgen05_cp_desc_4), "r"(_elected_2)
                                 : "memory");
                         }
                         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
                         #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                         #endif
                         {
-                            uint64_t _tcgen05_cp_desc_6 = ((((uint64_t)(smem_q_full_addr + 32)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+                            uint64_t _tcgen05_cp_desc_5 = ((((uint64_t)(smem_q_full_addr + 32)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
                             asm volatile(
                                 "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
                                 "@leader tcgen05.cp.cta_group::1.64x128b.warpx2::02_13 [%0], %1;\n\t}\n"
-                                :: "r"((uint32_t)(tmem_tmem_scratch + 136)), "l"(_tcgen05_cp_desc_6), "r"(_elected_3)
+                                :: "r"((uint32_t)(tmem_tmem_scratch + 136)), "l"(_tcgen05_cp_desc_5), "r"(_elected_2)
                                 : "memory");
                         }
                         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
                         #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                         #endif
                         {
-                            uint64_t _tcgen05_cp_desc_7 = ((((uint64_t)(smem_q_full_addr + 48)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+                            uint64_t _tcgen05_cp_desc_6 = ((((uint64_t)(smem_q_full_addr + 48)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
                             asm volatile(
                                 "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
                                 "@leader tcgen05.cp.cta_group::1.64x128b.warpx2::02_13 [%0], %1;\n\t}\n"
-                                :: "r"((uint32_t)(tmem_tmem_scratch + 140)), "l"(_tcgen05_cp_desc_7), "r"(_elected_3)
+                                :: "r"((uint32_t)(tmem_tmem_scratch + 140)), "l"(_tcgen05_cp_desc_6), "r"(_elected_2)
                                 : "memory");
                         }
                         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
                         #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                         #endif
                         {
-                            uint64_t _tcgen05_cp_desc_8 = ((((uint64_t)(smem_q_full_addr + 64)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+                            uint64_t _tcgen05_cp_desc_7 = ((((uint64_t)(smem_q_full_addr + 64)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
                             asm volatile(
                                 "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
                                 "@leader tcgen05.cp.cta_group::1.64x128b.warpx2::02_13 [%0], %1;\n\t}\n"
-                                :: "r"((uint32_t)(tmem_tmem_scratch + 144)), "l"(_tcgen05_cp_desc_8), "r"(_elected_3)
+                                :: "r"((uint32_t)(tmem_tmem_scratch + 144)), "l"(_tcgen05_cp_desc_7), "r"(_elected_2)
                                 : "memory");
                         }
                         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
                         #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                         #endif
                         {
-                            uint64_t _tcgen05_cp_desc_9 = ((((uint64_t)(smem_q_full_addr + 80)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+                            uint64_t _tcgen05_cp_desc_8 = ((((uint64_t)(smem_q_full_addr + 80)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
                             asm volatile(
                                 "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
                                 "@leader tcgen05.cp.cta_group::1.64x128b.warpx2::02_13 [%0], %1;\n\t}\n"
-                                :: "r"((uint32_t)(tmem_tmem_scratch + 148)), "l"(_tcgen05_cp_desc_9), "r"(_elected_3)
+                                :: "r"((uint32_t)(tmem_tmem_scratch + 148)), "l"(_tcgen05_cp_desc_8), "r"(_elected_2)
                                 : "memory");
                         }
                         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
                         #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                         #endif
                         {
-                            uint64_t _tcgen05_cp_desc_10 = ((((uint64_t)(smem_q_full_addr + 96)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+                            uint64_t _tcgen05_cp_desc_9 = ((((uint64_t)(smem_q_full_addr + 96)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
                             asm volatile(
                                 "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
                                 "@leader tcgen05.cp.cta_group::1.64x128b.warpx2::02_13 [%0], %1;\n\t}\n"
-                                :: "r"((uint32_t)(tmem_tmem_scratch + 152)), "l"(_tcgen05_cp_desc_10), "r"(_elected_3)
+                                :: "r"((uint32_t)(tmem_tmem_scratch + 152)), "l"(_tcgen05_cp_desc_9), "r"(_elected_2)
                                 : "memory");
                         }
                         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
                         #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                         #endif
                         {
-                            uint64_t _tcgen05_cp_desc_11 = ((((uint64_t)(smem_q_full_addr + 112)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+                            uint64_t _tcgen05_cp_desc_10 = ((((uint64_t)(smem_q_full_addr + 112)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
                             asm volatile(
                                 "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
                                 "@leader tcgen05.cp.cta_group::1.64x128b.warpx2::02_13 [%0], %1;\n\t}\n"
-                                :: "r"((uint32_t)(tmem_tmem_scratch + 156)), "l"(_tcgen05_cp_desc_11), "r"(_elected_3)
+                                :: "r"((uint32_t)(tmem_tmem_scratch + 156)), "l"(_tcgen05_cp_desc_10), "r"(_elected_2)
                                 : "memory");
                         }
                         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
                         #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                         #endif
                         {
-                            uint64_t _tcgen05_cp_desc_12 = ((((uint64_t)(smem_q_full_addr + 8192)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+                            uint64_t _tcgen05_cp_desc_11 = ((((uint64_t)(smem_q_full_addr + 8192)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
                             asm volatile(
                                 "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
                                 "@leader tcgen05.cp.cta_group::1.64x128b.warpx2::02_13 [%0], %1;\n\t}\n"
-                                :: "r"((uint32_t)(tmem_tmem_scratch + 160)), "l"(_tcgen05_cp_desc_12), "r"(_elected_3)
+                                :: "r"((uint32_t)(tmem_tmem_scratch + 160)), "l"(_tcgen05_cp_desc_11), "r"(_elected_2)
                                 : "memory");
                         }
                         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
                         #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                         #endif
                         {
-                            uint64_t _tcgen05_cp_desc_13 = ((((uint64_t)(smem_q_full_addr + 8208)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+                            uint64_t _tcgen05_cp_desc_12 = ((((uint64_t)(smem_q_full_addr + 8208)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
                             asm volatile(
                                 "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
                                 "@leader tcgen05.cp.cta_group::1.64x128b.warpx2::02_13 [%0], %1;\n\t}\n"
-                                :: "r"((uint32_t)(tmem_tmem_scratch + 164)), "l"(_tcgen05_cp_desc_13), "r"(_elected_3)
+                                :: "r"((uint32_t)(tmem_tmem_scratch + 164)), "l"(_tcgen05_cp_desc_12), "r"(_elected_2)
                                 : "memory");
                         }
                         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
                         #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                         #endif
                         {
-                            uint64_t _tcgen05_cp_desc_14 = ((((uint64_t)(smem_q_full_addr + 8224)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+                            uint64_t _tcgen05_cp_desc_13 = ((((uint64_t)(smem_q_full_addr + 8224)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
                             asm volatile(
                                 "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
                                 "@leader tcgen05.cp.cta_group::1.64x128b.warpx2::02_13 [%0], %1;\n\t}\n"
-                                :: "r"((uint32_t)(tmem_tmem_scratch + 168)), "l"(_tcgen05_cp_desc_14), "r"(_elected_3)
+                                :: "r"((uint32_t)(tmem_tmem_scratch + 168)), "l"(_tcgen05_cp_desc_13), "r"(_elected_2)
                                 : "memory");
                         }
                         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
                         #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                         #endif
                         {
-                            uint64_t _tcgen05_cp_desc_15 = ((((uint64_t)(smem_q_full_addr + 8240)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+                            uint64_t _tcgen05_cp_desc_14 = ((((uint64_t)(smem_q_full_addr + 8240)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
                             asm volatile(
                                 "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
                                 "@leader tcgen05.cp.cta_group::1.64x128b.warpx2::02_13 [%0], %1;\n\t}\n"
-                                :: "r"((uint32_t)(tmem_tmem_scratch + 172)), "l"(_tcgen05_cp_desc_15), "r"(_elected_3)
+                                :: "r"((uint32_t)(tmem_tmem_scratch + 172)), "l"(_tcgen05_cp_desc_14), "r"(_elected_2)
                                 : "memory");
                         }
                         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
                         #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                         #endif
                         {
-                            uint64_t _tcgen05_cp_desc_16 = ((((uint64_t)(smem_q_full_addr + 8256)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+                            uint64_t _tcgen05_cp_desc_15 = ((((uint64_t)(smem_q_full_addr + 8256)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
                             asm volatile(
                                 "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
                                 "@leader tcgen05.cp.cta_group::1.64x128b.warpx2::02_13 [%0], %1;\n\t}\n"
-                                :: "r"((uint32_t)(tmem_tmem_scratch + 176)), "l"(_tcgen05_cp_desc_16), "r"(_elected_3)
+                                :: "r"((uint32_t)(tmem_tmem_scratch + 176)), "l"(_tcgen05_cp_desc_15), "r"(_elected_2)
                                 : "memory");
                         }
                         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
                         #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                         #endif
                         {
-                            uint64_t _tcgen05_cp_desc_17 = ((((uint64_t)(smem_q_full_addr + 8272)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+                            uint64_t _tcgen05_cp_desc_16 = ((((uint64_t)(smem_q_full_addr + 8272)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
                             asm volatile(
                                 "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
                                 "@leader tcgen05.cp.cta_group::1.64x128b.warpx2::02_13 [%0], %1;\n\t}\n"
-                                :: "r"((uint32_t)(tmem_tmem_scratch + 180)), "l"(_tcgen05_cp_desc_17), "r"(_elected_3)
+                                :: "r"((uint32_t)(tmem_tmem_scratch + 180)), "l"(_tcgen05_cp_desc_16), "r"(_elected_2)
                                 : "memory");
                         }
                         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
                         #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                         #endif
                         {
-                            uint64_t _tcgen05_cp_desc_18 = ((((uint64_t)(smem_q_full_addr + 8288)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+                            uint64_t _tcgen05_cp_desc_17 = ((((uint64_t)(smem_q_full_addr + 8288)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
                             asm volatile(
                                 "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
                                 "@leader tcgen05.cp.cta_group::1.64x128b.warpx2::02_13 [%0], %1;\n\t}\n"
-                                :: "r"((uint32_t)(tmem_tmem_scratch + 184)), "l"(_tcgen05_cp_desc_18), "r"(_elected_3)
+                                :: "r"((uint32_t)(tmem_tmem_scratch + 184)), "l"(_tcgen05_cp_desc_17), "r"(_elected_2)
                                 : "memory");
                         }
                         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
                         #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                         #endif
                         {
-                            uint64_t _tcgen05_cp_desc_19 = ((((uint64_t)(smem_q_full_addr + 8304)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+                            uint64_t _tcgen05_cp_desc_18 = ((((uint64_t)(smem_q_full_addr + 8304)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
                             asm volatile(
                                 "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
                                 "@leader tcgen05.cp.cta_group::1.64x128b.warpx2::02_13 [%0], %1;\n\t}\n"
-                                :: "r"((uint32_t)(tmem_tmem_scratch + 188)), "l"(_tcgen05_cp_desc_19), "r"(_elected_3)
+                                :: "r"((uint32_t)(tmem_tmem_scratch + 188)), "l"(_tcgen05_cp_desc_18), "r"(_elected_2)
                                 : "memory");
                         }
                         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
                         #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                         #endif
                         {
-                            uint64_t _tcgen05_cp_desc_20 = ((((uint64_t)(smem_q_full_addr + 16384)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+                            uint64_t _tcgen05_cp_desc_19 = ((((uint64_t)(smem_q_full_addr + 16384)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
                             asm volatile(
                                 "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
                                 "@leader tcgen05.cp.cta_group::1.64x128b.warpx2::02_13 [%0], %1;\n\t}\n"
-                                :: "r"((uint32_t)(tmem_tmem_scratch + 192)), "l"(_tcgen05_cp_desc_20), "r"(_elected_3)
+                                :: "r"((uint32_t)(tmem_tmem_scratch + 192)), "l"(_tcgen05_cp_desc_19), "r"(_elected_2)
                                 : "memory");
                         }
                         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
                         #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                         #endif
                         {
-                            uint64_t _tcgen05_cp_desc_21 = ((((uint64_t)(smem_q_full_addr + 16400)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+                            uint64_t _tcgen05_cp_desc_20 = ((((uint64_t)(smem_q_full_addr + 16400)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
                             asm volatile(
                                 "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
                                 "@leader tcgen05.cp.cta_group::1.64x128b.warpx2::02_13 [%0], %1;\n\t}\n"
-                                :: "r"((uint32_t)(tmem_tmem_scratch + 196)), "l"(_tcgen05_cp_desc_21), "r"(_elected_3)
+                                :: "r"((uint32_t)(tmem_tmem_scratch + 196)), "l"(_tcgen05_cp_desc_20), "r"(_elected_2)
                                 : "memory");
                         }
                         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
                         #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                         #endif
                         {
-                            uint64_t _tcgen05_cp_desc_22 = ((((uint64_t)(smem_q_full_addr + 16416)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+                            uint64_t _tcgen05_cp_desc_21 = ((((uint64_t)(smem_q_full_addr + 16416)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
                             asm volatile(
                                 "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
                                 "@leader tcgen05.cp.cta_group::1.64x128b.warpx2::02_13 [%0], %1;\n\t}\n"
-                                :: "r"((uint32_t)(tmem_tmem_scratch + 200)), "l"(_tcgen05_cp_desc_22), "r"(_elected_3)
+                                :: "r"((uint32_t)(tmem_tmem_scratch + 200)), "l"(_tcgen05_cp_desc_21), "r"(_elected_2)
                                 : "memory");
                         }
                         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
                         #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                         #endif
                         {
-                            uint64_t _tcgen05_cp_desc_23 = ((((uint64_t)(smem_q_full_addr + 16432)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+                            uint64_t _tcgen05_cp_desc_22 = ((((uint64_t)(smem_q_full_addr + 16432)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
                             asm volatile(
                                 "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
                                 "@leader tcgen05.cp.cta_group::1.64x128b.warpx2::02_13 [%0], %1;\n\t}\n"
-                                :: "r"((uint32_t)(tmem_tmem_scratch + 204)), "l"(_tcgen05_cp_desc_23), "r"(_elected_3)
+                                :: "r"((uint32_t)(tmem_tmem_scratch + 204)), "l"(_tcgen05_cp_desc_22), "r"(_elected_2)
                                 : "memory");
                         }
                         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
                         #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                         #endif
                         {
-                            uint64_t _tcgen05_cp_desc_24 = ((((uint64_t)(smem_q_full_addr + 16448)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+                            uint64_t _tcgen05_cp_desc_23 = ((((uint64_t)(smem_q_full_addr + 16448)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
                             asm volatile(
                                 "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
                                 "@leader tcgen05.cp.cta_group::1.64x128b.warpx2::02_13 [%0], %1;\n\t}\n"
-                                :: "r"((uint32_t)(tmem_tmem_scratch + 208)), "l"(_tcgen05_cp_desc_24), "r"(_elected_3)
+                                :: "r"((uint32_t)(tmem_tmem_scratch + 208)), "l"(_tcgen05_cp_desc_23), "r"(_elected_2)
                                 : "memory");
                         }
                         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
                         #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                         #endif
                         {
-                            uint64_t _tcgen05_cp_desc_25 = ((((uint64_t)(smem_q_full_addr + 16464)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+                            uint64_t _tcgen05_cp_desc_24 = ((((uint64_t)(smem_q_full_addr + 16464)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
                             asm volatile(
                                 "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
                                 "@leader tcgen05.cp.cta_group::1.64x128b.warpx2::02_13 [%0], %1;\n\t}\n"
-                                :: "r"((uint32_t)(tmem_tmem_scratch + 212)), "l"(_tcgen05_cp_desc_25), "r"(_elected_3)
+                                :: "r"((uint32_t)(tmem_tmem_scratch + 212)), "l"(_tcgen05_cp_desc_24), "r"(_elected_2)
                                 : "memory");
                         }
                         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
                         #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                         #endif
                         {
-                            uint64_t _tcgen05_cp_desc_26 = ((((uint64_t)(smem_q_full_addr + 16480)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+                            uint64_t _tcgen05_cp_desc_25 = ((((uint64_t)(smem_q_full_addr + 16480)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
                             asm volatile(
                                 "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
                                 "@leader tcgen05.cp.cta_group::1.64x128b.warpx2::02_13 [%0], %1;\n\t}\n"
-                                :: "r"((uint32_t)(tmem_tmem_scratch + 216)), "l"(_tcgen05_cp_desc_26), "r"(_elected_3)
+                                :: "r"((uint32_t)(tmem_tmem_scratch + 216)), "l"(_tcgen05_cp_desc_25), "r"(_elected_2)
                                 : "memory");
                         }
                         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
                         #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                         #endif
                         {
-                            uint64_t _tcgen05_cp_desc_27 = ((((uint64_t)(smem_q_full_addr + 16496)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+                            uint64_t _tcgen05_cp_desc_26 = ((((uint64_t)(smem_q_full_addr + 16496)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
                             asm volatile(
                                 "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
                                 "@leader tcgen05.cp.cta_group::1.64x128b.warpx2::02_13 [%0], %1;\n\t}\n"
-                                :: "r"((uint32_t)(tmem_tmem_scratch + 220)), "l"(_tcgen05_cp_desc_27), "r"(_elected_3)
+                                :: "r"((uint32_t)(tmem_tmem_scratch + 220)), "l"(_tcgen05_cp_desc_26), "r"(_elected_2)
                                 : "memory");
                         }
                         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
                         #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                         #endif
                         {
-                            uint64_t _tcgen05_cp_desc_28 = ((((uint64_t)(smem_q_full_addr + 24576)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+                            uint64_t _tcgen05_cp_desc_27 = ((((uint64_t)(smem_q_full_addr + 24576)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
                             asm volatile(
                                 "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
                                 "@leader tcgen05.cp.cta_group::1.64x128b.warpx2::02_13 [%0], %1;\n\t}\n"
-                                :: "r"((uint32_t)(tmem_tmem_scratch + 224)), "l"(_tcgen05_cp_desc_28), "r"(_elected_3)
+                                :: "r"((uint32_t)(tmem_tmem_scratch + 224)), "l"(_tcgen05_cp_desc_27), "r"(_elected_2)
                                 : "memory");
                         }
                         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
                         #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                         #endif
                         {
-                            uint64_t _tcgen05_cp_desc_29 = ((((uint64_t)(smem_q_full_addr + 24592)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+                            uint64_t _tcgen05_cp_desc_28 = ((((uint64_t)(smem_q_full_addr + 24592)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
                             asm volatile(
                                 "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
                                 "@leader tcgen05.cp.cta_group::1.64x128b.warpx2::02_13 [%0], %1;\n\t}\n"
-                                :: "r"((uint32_t)(tmem_tmem_scratch + 228)), "l"(_tcgen05_cp_desc_29), "r"(_elected_3)
+                                :: "r"((uint32_t)(tmem_tmem_scratch + 228)), "l"(_tcgen05_cp_desc_28), "r"(_elected_2)
                                 : "memory");
                         }
                         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
                         #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                         #endif
                         {
-                            uint64_t _tcgen05_cp_desc_30 = ((((uint64_t)(smem_q_full_addr + 24608)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+                            uint64_t _tcgen05_cp_desc_29 = ((((uint64_t)(smem_q_full_addr + 24608)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
                             asm volatile(
                                 "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
                                 "@leader tcgen05.cp.cta_group::1.64x128b.warpx2::02_13 [%0], %1;\n\t}\n"
-                                :: "r"((uint32_t)(tmem_tmem_scratch + 232)), "l"(_tcgen05_cp_desc_30), "r"(_elected_3)
+                                :: "r"((uint32_t)(tmem_tmem_scratch + 232)), "l"(_tcgen05_cp_desc_29), "r"(_elected_2)
                                 : "memory");
                         }
                         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
                         #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                         #endif
                         {
-                            uint64_t _tcgen05_cp_desc_31 = ((((uint64_t)(smem_q_full_addr + 24624)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+                            uint64_t _tcgen05_cp_desc_30 = ((((uint64_t)(smem_q_full_addr + 24624)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
                             asm volatile(
                                 "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
                                 "@leader tcgen05.cp.cta_group::1.64x128b.warpx2::02_13 [%0], %1;\n\t}\n"
-                                :: "r"((uint32_t)(tmem_tmem_scratch + 236)), "l"(_tcgen05_cp_desc_31), "r"(_elected_3)
+                                :: "r"((uint32_t)(tmem_tmem_scratch + 236)), "l"(_tcgen05_cp_desc_30), "r"(_elected_2)
                                 : "memory");
                         }
                         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
                         #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                         #endif
                         {
-                            uint64_t _tcgen05_cp_desc_32 = ((((uint64_t)(smem_q_full_addr + 24640)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+                            uint64_t _tcgen05_cp_desc_31 = ((((uint64_t)(smem_q_full_addr + 24640)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
                             asm volatile(
                                 "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
                                 "@leader tcgen05.cp.cta_group::1.64x128b.warpx2::02_13 [%0], %1;\n\t}\n"
-                                :: "r"((uint32_t)(tmem_tmem_scratch + 240)), "l"(_tcgen05_cp_desc_32), "r"(_elected_3)
+                                :: "r"((uint32_t)(tmem_tmem_scratch + 240)), "l"(_tcgen05_cp_desc_31), "r"(_elected_2)
                                 : "memory");
                         }
                         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
                         #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                         #endif
                         {
-                            uint64_t _tcgen05_cp_desc_33 = ((((uint64_t)(smem_q_full_addr + 24656)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+                            uint64_t _tcgen05_cp_desc_32 = ((((uint64_t)(smem_q_full_addr + 24656)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
                             asm volatile(
                                 "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
                                 "@leader tcgen05.cp.cta_group::1.64x128b.warpx2::02_13 [%0], %1;\n\t}\n"
-                                :: "r"((uint32_t)(tmem_tmem_scratch + 244)), "l"(_tcgen05_cp_desc_33), "r"(_elected_3)
+                                :: "r"((uint32_t)(tmem_tmem_scratch + 244)), "l"(_tcgen05_cp_desc_32), "r"(_elected_2)
                                 : "memory");
                         }
                         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
                         #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                         #endif
                         {
-                            uint64_t _tcgen05_cp_desc_34 = ((((uint64_t)(smem_q_full_addr + 24672)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+                            uint64_t _tcgen05_cp_desc_33 = ((((uint64_t)(smem_q_full_addr + 24672)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
                             asm volatile(
                                 "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
                                 "@leader tcgen05.cp.cta_group::1.64x128b.warpx2::02_13 [%0], %1;\n\t}\n"
-                                :: "r"((uint32_t)(tmem_tmem_scratch + 248)), "l"(_tcgen05_cp_desc_34), "r"(_elected_3)
+                                :: "r"((uint32_t)(tmem_tmem_scratch + 248)), "l"(_tcgen05_cp_desc_33), "r"(_elected_2)
                                 : "memory");
                         }
                         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
                         #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                         #endif
                         {
-                            uint64_t _tcgen05_cp_desc_35 = ((((uint64_t)(smem_q_full_addr + 24688)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+                            uint64_t _tcgen05_cp_desc_34 = ((((uint64_t)(smem_q_full_addr + 24688)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
                             asm volatile(
                                 "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
                                 "@leader tcgen05.cp.cta_group::1.64x128b.warpx2::02_13 [%0], %1;\n\t}\n"
-                                :: "r"((uint32_t)(tmem_tmem_scratch + 252)), "l"(_tcgen05_cp_desc_35), "r"(_elected_3)
+                                :: "r"((uint32_t)(tmem_tmem_scratch + 252)), "l"(_tcgen05_cp_desc_34), "r"(_elected_2)
                                 : "memory");
                         }
                         elect_commit(q_empty_addr);
@@ -2690,10 +2682,6 @@ kernel_cake_dsv4_8afa079cbcc688b8b5b9(const __grid_constant__ CUtensorMap tmap_q
                         if (mma_k_stage == 4) { mma_k_stage = 0; _phase_k_full ^= 1; }
                         elect_commit(s_full_addr + ((int)((unsigned int)mma_tile_cursor % 2)) * 8);
                     }
-                    int pv_qk_steps = 0;
-                    if (pv_qk_single_wave != 0 && num_kv_tiles_3 >= 4) {
-                        pv_qk_steps = num_kv_tiles_3 - 1;
-                    }
                     #pragma unroll 1
                     for (int tile_3 = 1; tile_3 < num_kv_tiles_3; tile_3++) {
                         int pipeline_tile_2 = mma_tile_cursor + tile_3;
@@ -2701,11 +2689,6 @@ kernel_cake_dsv4_8afa079cbcc688b8b5b9(const __grid_constant__ CUtensorMap tmap_q
                         int score_col = ((phase_2 != 0) ? 128 : 0);
                         if (cta_rank == 0) {
                             mbarrier_wait(k_full_addr + (mma_k_stage) * 8, _phase_k_full);
-                            if (tile_3 <= pv_qk_steps) {
-                                int _stage_pv_pair_ready = (int)((unsigned int)(pv_qk_cursor + tile_3 - 1) % 2);
-                                int _parity_pv_pair_ready = (int)((unsigned int)(pv_qk_cursor + tile_3 - 1) / 2 % 2);
-                                mbarrier_wait(pv_pair_ready_addr + (_stage_pv_pair_ready) * 8, _parity_pv_pair_ready);
-                            }
                             int _stage_s_empty = (int)((unsigned int)(mma_tile_cursor + tile_3 + 1) % 2);
                             int _parity_s_empty = (int)((unsigned int)(mma_tile_cursor + tile_3 + 1) / 2 % 2) ^ 1;
                             uint32_t _mbar_token_s = mbarrier_try_wait(s_empty_addr + (_stage_s_empty) * 8, _parity_s_empty);
@@ -2815,7 +2798,6 @@ kernel_cake_dsv4_8afa079cbcc688b8b5b9(const __grid_constant__ CUtensorMap tmap_q
                         }
                     }
                     mma_tile_cursor += num_kv_tiles_3;
-                    pv_qk_cursor += pv_qk_steps;
                     int last_pipeline_tile = mma_tile_cursor - 1;
                     int last_phase = last_pipeline_tile & 1;
                     int final_s_tile = last_pipeline_tile + 2;
@@ -3041,27 +3023,16 @@ kernel_cake_dsv4_8afa079cbcc688b8b5b9(const __grid_constant__ CUtensorMap tmap_q
             unsigned int source_work_x_5 = blockIdx.x;
             unsigned int source_work_z_5 = blockIdx.z;
             int pv_tile_cursor = 0;
-            int pv_qk_cursor_1 = 0;
-            int pv_qk_single_wave_1 = 0;
-            uint32_t _read_special_reg_0_1;
-            asm("mov.u32 %0, %%nsmid;" : "=r"(_read_special_reg_0_1));
-            if (num_query_tokens <= (int)_read_special_reg_0_1) {
-                pv_qk_single_wave_1 = 1;
-            }
             unsigned int _phase_source_work_full_6 = 0;
             #pragma unroll 1
             for (unsigned int _pv_work = 0; _pv_work < 514; _pv_work++) {
                 int pv_valid = source_work_z_5 * (unsigned int)max_q_len + source_work_x_5 < (unsigned int)num_query_tokens;
                 if (pv_valid != 0) {
                     int pv_query = source_work_z_5 * (unsigned int)max_q_len + source_work_x_5;
-                    int _max_1_5 = ((sparse_topk_lens[pv_query] + sparse_topk_lens_offset) > (0) ? (sparse_topk_lens[pv_query] + sparse_topk_lens_offset) : (0));
-                    int pv_active = ((_max_1_5) < (sparse_topk) ? (_max_1_5) : (sparse_topk));
-                    int _max_2_1 = ((pv_active) > (1) ? (pv_active) : (1));
-                    int pv_tiles = (_max_2_1 + 128 - 1) / 128;
-                    int pv_qk_steps_1 = 0;
-                    if (pv_qk_single_wave_1 != 0 && pv_tiles >= 4) {
-                        pv_qk_steps_1 = pv_tiles - 1;
-                    }
+                    int _max_0_5 = ((sparse_topk_lens[pv_query] + sparse_topk_lens_offset) > (0) ? (sparse_topk_lens[pv_query] + sparse_topk_lens_offset) : (0));
+                    int pv_active = ((_max_0_5) < (sparse_topk) ? (_max_0_5) : (sparse_topk));
+                    int _max_1_5 = ((pv_active) > (1) ? (pv_active) : (1));
+                    int pv_tiles = (_max_1_5 + 128 - 1) / 128;
                     int pv_first = 1;
                     #pragma unroll 1
                     for (int pv_tile = 0; pv_tile < pv_tiles; pv_tile++) {
@@ -3081,49 +3052,49 @@ kernel_cake_dsv4_8afa079cbcc688b8b5b9(const __grid_constant__ CUtensorMap tmap_q
                             int mma_a_lo = (((smem_p_fp8_addr) >> 4) & 0x7FFF) + (pv_phase) * 512;
                             int mma_b_lo = ((((smem_v_full_addr) >> 4) & 0x7FFF) | 0x4000000) + (pv_v_stage) * 4096;
                             {
-                                uint64_t _mma_ss_a_desc_3 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_a_lo);
-                                uint64_t _mma_ss_b_desc_3 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_b_lo);
+                                uint64_t _mma_ss_a_desc_2 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_a_lo);
+                                uint64_t _mma_ss_b_desc_2 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_b_lo);
                                 if (elect_sync()) {
-                                    tcgen05_mma_f8f6f4((tmem_tmem_scratch + (256)), _mma_ss_a_desc_3, _mma_ss_b_desc_3, 69271568, ((pv_first) ? 0 : 1));
+                                    tcgen05_mma_f8f6f4((tmem_tmem_scratch + (256)), _mma_ss_a_desc_2, _mma_ss_b_desc_2, 69271568, ((pv_first) ? 0 : 1));
                                 }
-                                incr_smem_desc_lo(_mma_ss_a_desc_3, 2U);
-                                incr_smem_desc_lo(_mma_ss_b_desc_3, 256U);
+                                incr_smem_desc_lo(_mma_ss_a_desc_2, 2U);
+                                incr_smem_desc_lo(_mma_ss_b_desc_2, 256U);
                                 if (elect_sync()) {
-                                    tcgen05_mma_f8f6f4((tmem_tmem_scratch + (256)), _mma_ss_a_desc_3, _mma_ss_b_desc_3, 69271568, 1);
+                                    tcgen05_mma_f8f6f4((tmem_tmem_scratch + (256)), _mma_ss_a_desc_2, _mma_ss_b_desc_2, 69271568, 1);
                                 }
-                                incr_smem_desc_lo(_mma_ss_a_desc_3, 2U);
-                                incr_smem_desc_lo(_mma_ss_b_desc_3, 256U);
+                                incr_smem_desc_lo(_mma_ss_a_desc_2, 2U);
+                                incr_smem_desc_lo(_mma_ss_b_desc_2, 256U);
                                 if (elect_sync()) {
-                                    tcgen05_mma_f8f6f4((tmem_tmem_scratch + (256)), _mma_ss_a_desc_3, _mma_ss_b_desc_3, 69271568, 1);
+                                    tcgen05_mma_f8f6f4((tmem_tmem_scratch + (256)), _mma_ss_a_desc_2, _mma_ss_b_desc_2, 69271568, 1);
                                 }
-                                incr_smem_desc_lo(_mma_ss_a_desc_3, 2U);
-                                incr_smem_desc_lo(_mma_ss_b_desc_3, 256U);
+                                incr_smem_desc_lo(_mma_ss_a_desc_2, 2U);
+                                incr_smem_desc_lo(_mma_ss_b_desc_2, 256U);
                                 if (elect_sync()) {
-                                    tcgen05_mma_f8f6f4((tmem_tmem_scratch + (256)), _mma_ss_a_desc_3, _mma_ss_b_desc_3, 69271568, 1);
+                                    tcgen05_mma_f8f6f4((tmem_tmem_scratch + (256)), _mma_ss_a_desc_2, _mma_ss_b_desc_2, 69271568, 1);
                                 }
                             }
                             int mma_a_lo_1 = (((smem_p_fp8_addr) >> 4) & 0x7FFF) + (pv_phase) * 512;
                             int mma_b_lo_1 = ((((smem_v_full_addr + 32768) >> 4) & 0x7FFF) | 0x4000000) + (pv_v_stage) * 4096;
                             {
-                                uint64_t _mma_ss_a_desc_4 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_a_lo_1);
-                                uint64_t _mma_ss_b_desc_4 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_b_lo_1);
+                                uint64_t _mma_ss_a_desc_3 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_a_lo_1);
+                                uint64_t _mma_ss_b_desc_3 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_b_lo_1);
                                 if (elect_sync()) {
-                                    tcgen05_mma_f8f6f4((tmem_tmem_scratch + (1048832)), _mma_ss_a_desc_4, _mma_ss_b_desc_4, 69271568, ((pv_first) ? 0 : 1));
+                                    tcgen05_mma_f8f6f4((tmem_tmem_scratch + (1048832)), _mma_ss_a_desc_3, _mma_ss_b_desc_3, 69271568, ((pv_first) ? 0 : 1));
                                 }
-                                incr_smem_desc_lo(_mma_ss_a_desc_4, 2U);
-                                incr_smem_desc_lo(_mma_ss_b_desc_4, 256U);
+                                incr_smem_desc_lo(_mma_ss_a_desc_3, 2U);
+                                incr_smem_desc_lo(_mma_ss_b_desc_3, 256U);
                                 if (elect_sync()) {
-                                    tcgen05_mma_f8f6f4((tmem_tmem_scratch + (1048832)), _mma_ss_a_desc_4, _mma_ss_b_desc_4, 69271568, 1);
+                                    tcgen05_mma_f8f6f4((tmem_tmem_scratch + (1048832)), _mma_ss_a_desc_3, _mma_ss_b_desc_3, 69271568, 1);
                                 }
-                                incr_smem_desc_lo(_mma_ss_a_desc_4, 2U);
-                                incr_smem_desc_lo(_mma_ss_b_desc_4, 256U);
+                                incr_smem_desc_lo(_mma_ss_a_desc_3, 2U);
+                                incr_smem_desc_lo(_mma_ss_b_desc_3, 256U);
                                 if (elect_sync()) {
-                                    tcgen05_mma_f8f6f4((tmem_tmem_scratch + (1048832)), _mma_ss_a_desc_4, _mma_ss_b_desc_4, 69271568, 1);
+                                    tcgen05_mma_f8f6f4((tmem_tmem_scratch + (1048832)), _mma_ss_a_desc_3, _mma_ss_b_desc_3, 69271568, 1);
                                 }
-                                incr_smem_desc_lo(_mma_ss_a_desc_4, 2U);
-                                incr_smem_desc_lo(_mma_ss_b_desc_4, 256U);
+                                incr_smem_desc_lo(_mma_ss_a_desc_3, 2U);
+                                incr_smem_desc_lo(_mma_ss_b_desc_3, 256U);
                                 if (elect_sync()) {
-                                    tcgen05_mma_f8f6f4((tmem_tmem_scratch + (1048832)), _mma_ss_a_desc_4, _mma_ss_b_desc_4, 69271568, 1);
+                                    tcgen05_mma_f8f6f4((tmem_tmem_scratch + (1048832)), _mma_ss_a_desc_3, _mma_ss_b_desc_3, 69271568, 1);
                                 }
                             }
                             elect_commit(o_full_addr);
@@ -3133,64 +3104,58 @@ kernel_cake_dsv4_8afa079cbcc688b8b5b9(const __grid_constant__ CUtensorMap tmap_q
                             int mma_a_lo_0 = (((smem_p_fp8_addr) >> 4) & 0x7FFF) + (pv_phase) * 512;
                             int mma_b_lo_9 = ((((smem_v_full_addr + 16384) >> 4) & 0x7FFF) | 0x4000000) + (pv_v_stage) * 4096;
                             {
-                                uint64_t _mma_ss_a_desc_5 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_a_lo_0);
-                                uint64_t _mma_ss_b_desc_5 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_b_lo_9);
+                                uint64_t _mma_ss_a_desc_4 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_a_lo_0);
+                                uint64_t _mma_ss_b_desc_4 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_b_lo_9);
                                 if (elect_sync()) {
-                                    tcgen05_mma_f8f6f4((tmem_tmem_scratch + (384)), _mma_ss_a_desc_5, _mma_ss_b_desc_5, 69271568, ((pv_first) ? 0 : 1));
+                                    tcgen05_mma_f8f6f4((tmem_tmem_scratch + (384)), _mma_ss_a_desc_4, _mma_ss_b_desc_4, 69271568, ((pv_first) ? 0 : 1));
                                 }
-                                incr_smem_desc_lo(_mma_ss_a_desc_5, 2U);
-                                incr_smem_desc_lo(_mma_ss_b_desc_5, 256U);
+                                incr_smem_desc_lo(_mma_ss_a_desc_4, 2U);
+                                incr_smem_desc_lo(_mma_ss_b_desc_4, 256U);
                                 if (elect_sync()) {
-                                    tcgen05_mma_f8f6f4((tmem_tmem_scratch + (384)), _mma_ss_a_desc_5, _mma_ss_b_desc_5, 69271568, 1);
+                                    tcgen05_mma_f8f6f4((tmem_tmem_scratch + (384)), _mma_ss_a_desc_4, _mma_ss_b_desc_4, 69271568, 1);
                                 }
-                                incr_smem_desc_lo(_mma_ss_a_desc_5, 2U);
-                                incr_smem_desc_lo(_mma_ss_b_desc_5, 256U);
+                                incr_smem_desc_lo(_mma_ss_a_desc_4, 2U);
+                                incr_smem_desc_lo(_mma_ss_b_desc_4, 256U);
                                 if (elect_sync()) {
-                                    tcgen05_mma_f8f6f4((tmem_tmem_scratch + (384)), _mma_ss_a_desc_5, _mma_ss_b_desc_5, 69271568, 1);
+                                    tcgen05_mma_f8f6f4((tmem_tmem_scratch + (384)), _mma_ss_a_desc_4, _mma_ss_b_desc_4, 69271568, 1);
                                 }
-                                incr_smem_desc_lo(_mma_ss_a_desc_5, 2U);
-                                incr_smem_desc_lo(_mma_ss_b_desc_5, 256U);
+                                incr_smem_desc_lo(_mma_ss_a_desc_4, 2U);
+                                incr_smem_desc_lo(_mma_ss_b_desc_4, 256U);
                                 if (elect_sync()) {
-                                    tcgen05_mma_f8f6f4((tmem_tmem_scratch + (384)), _mma_ss_a_desc_5, _mma_ss_b_desc_5, 69271568, 1);
+                                    tcgen05_mma_f8f6f4((tmem_tmem_scratch + (384)), _mma_ss_a_desc_4, _mma_ss_b_desc_4, 69271568, 1);
                                 }
                             }
                             int mma_a_lo_1_0 = (((smem_p_fp8_addr) >> 4) & 0x7FFF) + (pv_phase) * 512;
                             int mma_b_lo_1_0 = ((((smem_v_full_addr + 49152) >> 4) & 0x7FFF) | 0x4000000) + (pv_v_stage) * 4096;
                             {
-                                uint64_t _mma_ss_a_desc_6 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_a_lo_1_0);
-                                uint64_t _mma_ss_b_desc_6 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_b_lo_1_0);
+                                uint64_t _mma_ss_a_desc_5 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_a_lo_1_0);
+                                uint64_t _mma_ss_b_desc_5 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_b_lo_1_0);
                                 if (elect_sync()) {
-                                    tcgen05_mma_f8f6f4((tmem_tmem_scratch + (1048960)), _mma_ss_a_desc_6, _mma_ss_b_desc_6, 69271568, ((pv_first) ? 0 : 1));
+                                    tcgen05_mma_f8f6f4((tmem_tmem_scratch + (1048960)), _mma_ss_a_desc_5, _mma_ss_b_desc_5, 69271568, ((pv_first) ? 0 : 1));
                                 }
-                                incr_smem_desc_lo(_mma_ss_a_desc_6, 2U);
-                                incr_smem_desc_lo(_mma_ss_b_desc_6, 256U);
+                                incr_smem_desc_lo(_mma_ss_a_desc_5, 2U);
+                                incr_smem_desc_lo(_mma_ss_b_desc_5, 256U);
                                 if (elect_sync()) {
-                                    tcgen05_mma_f8f6f4((tmem_tmem_scratch + (1048960)), _mma_ss_a_desc_6, _mma_ss_b_desc_6, 69271568, 1);
+                                    tcgen05_mma_f8f6f4((tmem_tmem_scratch + (1048960)), _mma_ss_a_desc_5, _mma_ss_b_desc_5, 69271568, 1);
                                 }
-                                incr_smem_desc_lo(_mma_ss_a_desc_6, 2U);
-                                incr_smem_desc_lo(_mma_ss_b_desc_6, 256U);
+                                incr_smem_desc_lo(_mma_ss_a_desc_5, 2U);
+                                incr_smem_desc_lo(_mma_ss_b_desc_5, 256U);
                                 if (elect_sync()) {
-                                    tcgen05_mma_f8f6f4((tmem_tmem_scratch + (1048960)), _mma_ss_a_desc_6, _mma_ss_b_desc_6, 69271568, 1);
+                                    tcgen05_mma_f8f6f4((tmem_tmem_scratch + (1048960)), _mma_ss_a_desc_5, _mma_ss_b_desc_5, 69271568, 1);
                                 }
-                                incr_smem_desc_lo(_mma_ss_a_desc_6, 2U);
-                                incr_smem_desc_lo(_mma_ss_b_desc_6, 256U);
+                                incr_smem_desc_lo(_mma_ss_a_desc_5, 2U);
+                                incr_smem_desc_lo(_mma_ss_b_desc_5, 256U);
                                 if (elect_sync()) {
-                                    tcgen05_mma_f8f6f4((tmem_tmem_scratch + (1048960)), _mma_ss_a_desc_6, _mma_ss_b_desc_6, 69271568, 1);
+                                    tcgen05_mma_f8f6f4((tmem_tmem_scratch + (1048960)), _mma_ss_a_desc_5, _mma_ss_b_desc_5, 69271568, 1);
                                 }
                             }
                             elect_commit(o_full_addr + 8);
                             elect_commit(k_empty_addr + ((int)((unsigned int)(pv_tile_cursor + pv_tile) % 4)) * 8);
                             elect_commit(split_pv_p_empty_addr + ((int)((unsigned int)(pv_tile_cursor + pv_tile) % 2)) * 8);
-                            if (pv_tile < pv_qk_steps_1) {
-                                if (lane == 0) {
-                                    mbarrier_arrive(pv_pair_ready_addr + ((int)((unsigned int)(pv_qk_cursor_1 + pv_tile) % 2)) * 8);
-                                }
-                            }
                         }
                         pv_first = 0;
                     }
                     pv_tile_cursor += pv_tiles;
-                    pv_qk_cursor_1 += pv_qk_steps_1;
                 }
                 mbarrier_wait(source_work_full_addr + (source_work_stage_6) * 8, _phase_source_work_full_6);
                 uint32_t clc_valid_6 = 0;

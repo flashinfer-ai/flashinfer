@@ -1380,7 +1380,8 @@ class Backend:
 
 
 def _public_args(args: dict[str, Any]) -> dict[str, Any]:
-    return {k: v for k, v in args.items() if not k.startswith("_")}
+    """``args`` without its private keys (a leading ``_``; ``k[:1]`` is ``k.startswith("_")`` without a method call)."""
+    return {k: v for k, v in args.items() if k[:1] != "_"}
 
 
 def _registry() -> Any | None:
@@ -1392,16 +1393,41 @@ def _registry() -> Any | None:
     return cake_jit
 
 
+# The registry answers of l2n_records_shipped / fused_o_shipped, derived once per registry identity: they are read on
+# every call and launch, and the registry is the package's generated record table (data, never changed at run time).
+# The key is the registry module, its record table and its records_of_program function (a registry or a table put in
+# their place -- a test's stand-in -- is another key); the entry holds the keyed objects, so their ids stay theirs.
+_REGISTRY_ANSWERS: dict[tuple, tuple[bool, tuple]] = {}
+
+
+def _registry_answer(question: tuple, jit: Any, derive: Callable[[], bool]) -> bool:
+    modules = getattr(jit, "MODULES", None)
+    lookup = getattr(jit, "records_of_program", None)
+    try:
+        size = len(modules)
+    except TypeError:  # no record table: nothing to key on, derived per call
+        return derive()
+    key = (*question, id(jit), id(modules), size, id(lookup))
+    hit = _REGISTRY_ANSWERS.get(key)
+    if hit is None:
+        hit = _REGISTRY_ANSWERS[key] = (bool(derive()), (jit, modules, lookup))
+    return hit[0]
+
+
 def l2n_records_shipped() -> bool:
     """Whether the registry ships a record of every in-kernel Q / K L2 norm program (:data:`L2N_PROGRAMS`): the
     kernel backend runs ``use_qk_l2norm_in_kernel=True`` only then; the fake backend emulates them either way."""
     jit = _registry()
     if jit is None:
         return False
-    try:
-        return all(jit.records_of_program(p) for p in L2N_PROGRAMS)
-    except ValueError:  # a registry that does not know the programs
-        return False
+
+    def derive() -> bool:
+        try:
+            return all(jit.records_of_program(p) for p in L2N_PROGRAMS)
+        except ValueError:  # a registry that does not know the programs
+            return False
+
+    return _registry_answer(("l2n",), jit, derive)
 
 
 def fused_o_shipped(arch: str | None = None) -> bool:
@@ -1411,16 +1437,20 @@ def fused_o_shipped(arch: str | None = None) -> bool:
     jit = _registry()
     if jit is None:
         return False
-    try:
-        names = jit.records_of_program("kcp_fwdh_out")
-    except ValueError:  # a registry that does not know the program
-        return False
-    forms = {
-        int(jit.MODULES[n].get("grid_rule", {}).get("ctas_per_head", 1))
-        for n in names
-        if arch is None or arch in jit.MODULES[n].get("arches", ())
-    }
-    return forms >= {1, 2}
+
+    def derive() -> bool:
+        try:
+            names = jit.records_of_program("kcp_fwdh_out")
+        except ValueError:  # a registry that does not know the program
+            return False
+        forms = {
+            int(jit.MODULES[n].get("grid_rule", {}).get("ctas_per_head", 1))
+            for n in names
+            if arch is None or arch in jit.MODULES[n].get("arches", ())
+        }
+        return forms >= {1, 2}
+
+    return _registry_answer(("fused_o", arch), jit, derive)
 
 
 def resolve_launch(
@@ -2547,6 +2577,22 @@ def _identity_tile(
         if isinstance(caches, dict):
             caches[key] = t
     return t
+
+
+def _chunk_tokens(ctx: Any, chunk_len: Sequence[int]) -> int:
+    """The tokens the context's chunk table ``chunk_len`` covers (its sum; the in-kernel L2 norm's coverage check).
+    A context's table is an immutable tuple: its sum is derived once and kept in the context's cache with the table
+    it was taken over (a context without a cache, or a table of another type, sums per call)."""
+    caches = getattr(ctx, "_caches", None)
+    if not isinstance(caches, dict) or type(chunk_len) is not tuple:
+        return sum(int(n) for n in chunk_len)
+    hit = caches.get(("kcp_chunk_tokens",))
+    if hit is None or hit[0] is not chunk_len:
+        hit = caches[("kcp_chunk_tokens",)] = (
+            chunk_len,
+            sum(int(n) for n in chunk_len),
+        )
+    return hit[1]
 
 
 def _context_tables(
@@ -4945,10 +4991,12 @@ def _prepare(
     if opts.use_qk_l2norm_in_kernel:
         # #1_l2n writes qn / kn / r for the tokens of the real chunks only: they must cover [0, T_r) (metadata)
         chunk_len = getattr(ctx, "chunk_len", None)
-        if chunk_len is not None and sum(int(n) for n in chunk_len) != int(T):
-            raise ValueError(
-                f"use_qk_l2norm_in_kernel: the context's chunks cover {sum(int(n) for n in chunk_len)} of {T} tokens"
-            )
+        if chunk_len is not None:
+            covered = _chunk_tokens(ctx, chunk_len)
+            if covered != int(T):
+                raise ValueError(
+                    f"use_qk_l2norm_in_kernel: the context's chunks cover {covered} of {T} tokens"
+                )
     if opts.exchange == "ring":
         validate_ring(ctx.n_d_max)
     device = torch.device(ctx.device)
@@ -5507,6 +5555,23 @@ def _saved_fresh_pools(saved: SavedDetKcp | None) -> tuple[str, ...]:
     return tuple(names)
 
 
+def _check_mode_objects(saved: Any, workspace: Any) -> None:
+    """The deterministic backward reads the deterministic forward's :class:`SavedDetKcp` and a caller-held
+    :class:`WorkspaceDetKcp` only.  A saved set or workspace of the non-deterministic package (or any other object) is
+    refused with ``ValueError`` before any launch.  The check is by type: the saved sets of both modes have the same
+    fields and version, so their fields cannot tell them apart."""
+    for name, obj, cls in (
+        ("saved", saved, SavedDetKcp),
+        ("workspace", workspace, WorkspaceDetKcp),
+    ):
+        if obj is not None and not isinstance(obj, cls):
+            raise ValueError(
+                f"chunk_gdn_det_bwd_kcp: {name} must be a {cls.__name__} of the deterministic mode (got "
+                f"{type(obj).__module__}.{type(obj).__qualname__}); the deterministic backward reads the "
+                f"deterministic forward's {name} only"
+            )
+
+
 def chunk_gdn_det_bwd_kcp(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -5524,7 +5589,10 @@ def chunk_gdn_det_bwd_kcp(
     **knobs: Any,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """The KCP backward: ``(dq, dk, dv, dbeta, dg)``, fresh.  ``saved=None`` replays the forward.
-    ``use_qk_l2norm_in_kernel`` must be the forward's (a saved set of the other form is refused)."""
+    ``use_qk_l2norm_in_kernel`` must be the forward's (a saved set of the other form is refused).  ``saved`` and
+    ``workspace`` must be this package's :class:`SavedDetKcp` / :class:`WorkspaceDetKcp`: a saved set or workspace of
+    the non-deterministic mode is refused with ``ValueError`` (:func:`_check_mode_objects`)."""
+    _check_mode_objects(saved, workspace)
     over = _literal_overrides(
         options,
         (
@@ -6038,17 +6106,3 @@ __all__ = [
     "torch_release",
     "torch_release_verified",
 ]
-
-# Compatibility aliases: the pre-rename names bound to the same objects (not in ``__all__``).
-ChunkGDNKcpFunction = ChunkGDNDetFunctionKcp
-KcpCall = CallDetKcp
-KcpOptions = OptionsDetKcp
-KcpRecomputeHandle = RecomputeHandleDetKcp
-KcpSaved = SavedDetKcp
-KcpWorkspace = WorkspaceDetKcp
-chunk_gdn_kcp = chunk_gdn_det_kcp
-chunk_gdn_kcp_bwd = chunk_gdn_det_bwd_kcp
-chunk_gdn_kcp_fwd = chunk_gdn_det_fwd_kcp
-gdn_kcp_comm_bytes = gdn_det_comm_bytes_kcp
-gdn_kcp_saved_bytes = gdn_det_saved_bytes_kcp
-gdn_kcp_workspace_bytes = gdn_det_workspace_bytes_kcp

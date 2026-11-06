@@ -16,7 +16,7 @@ limitations under the License.
 Benchmark of the context-parallel (KCP) Cake packed KDA training step on both
 numerical modes: one process per rank (``torchrun --nproc_per_node N``), every
 rank timing the module boundary of its fragments -- the KCP causal convolution
-(``flashinfer.cake_causal_conv1d_train.cake_causal_conv1d_kcp``, the same
+(``flashinfer.cake_causal_conv1d_det_train_kcp.cake_causal_conv1d_det_kcp``, the same
 program in every arm; ``--no-conv`` leaves it out) followed by the KCP KDA
 step -- with CUDA events, and the slowest rank's time counting for the
 iteration (the boundary of ``benchmarks/bench_cake_kda_det_train_kcp.py``).
@@ -175,9 +175,11 @@ from torch.utils.checkpoint import checkpoint
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from flashinfer.cake_causal_conv1d_train import (  # noqa: E402
-    cake_causal_conv1d,
-    cake_causal_conv1d_kcp,
+from flashinfer.cake_causal_conv1d_det_train import (  # noqa: E402
+    cake_causal_conv1d_det,
+)
+from flashinfer.cake_causal_conv1d_det_train_kcp import (  # noqa: E402
+    cake_causal_conv1d_det_kcp,
 )
 from flashinfer.cake_kda_det_train_kcp import (  # noqa: E402
     build_context_det_kcp,
@@ -538,7 +540,7 @@ def _forward(arm: str, problem: dict[str, Any], conv: bool, fla_chunk_kda=None):
         ctx = problem["ctx"]["det"]
 
         def fwd(x, w, q, k, v, g, beta, *params):
-            y = cake_causal_conv1d_kcp(x, w, ctx) if conv else None
+            y = cake_causal_conv1d_det_kcp(x, w, ctx) if conv else None
             return y, chunk_kda_det_kcp(
                 q, k, v, g, beta, ctx, **_raw_kw(problem, params)
             )
@@ -554,7 +556,7 @@ def _forward(arm: str, problem: dict[str, Any], conv: bool, fla_chunk_kda=None):
         mode = "off" if arm == "nd_off" else problem["ckpt_handoff"]
 
         def fwd(x, w, q, k, v, g, beta, *params):
-            y = cake_causal_conv1d_kcp(x, w, ctx) if conv else None
+            y = cake_causal_conv1d_det_kcp(x, w, ctx) if conv else None
             return y, chunk_kda_kcp(
                 q,
                 k,
@@ -578,7 +580,7 @@ def _forward(arm: str, problem: dict[str, Any], conv: bool, fla_chunk_kda=None):
     elif arm == "local":
 
         def fwd(x, w, q, k, v, g, beta, *params):
-            y = cake_causal_conv1d(x, w, cu) if conv else None
+            y = cake_causal_conv1d_det(x, w, cu) if conv else None
             return y, chunk_kda(
                 q, k, v, g, beta, cu, deterministic=False, **_raw_kw(problem, params)
             )
@@ -587,7 +589,7 @@ def _forward(arm: str, problem: dict[str, Any], conv: bool, fla_chunk_kda=None):
         safe_gate = problem["fla_safe_gate"]
 
         def fwd(x, w, q, k, v, g, beta, *params):
-            y = cake_causal_conv1d(x, w, cu) if conv else None
+            y = cake_causal_conv1d_det(x, w, cu) if conv else None
             out, _ = fla_chunk_kda(
                 *(t.unsqueeze(0) for t in (q, k, v, g, beta)),
                 scale=None,
@@ -604,7 +606,7 @@ def _forward(arm: str, problem: dict[str, Any], conv: bool, fla_chunk_kda=None):
         def fwd(x, w, q, k, v, g, beta, *params):
             # the convolution of the main arms on the shard, FLA's KDA on its own
             # partition (its cu_seqlens are the context's)
-            y = cake_causal_conv1d_kcp(x, w, ctx) if conv else None
+            y = cake_causal_conv1d_det_kcp(x, w, ctx) if conv else None
             out, _ = fla_chunk_kda(
                 *(t.unsqueeze(0) for t in (q, k, v, g, beta)),
                 scale=None,

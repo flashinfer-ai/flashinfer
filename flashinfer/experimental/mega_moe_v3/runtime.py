@@ -325,6 +325,13 @@ def bind_prepared(
     the same route as long as no launch is in flight on it. ``preparation``
     names the route stages that run at bind time (and on ``update_scales()``)
     instead of inside run().
+
+    On a route whose metadata states ``w2_dense_k`` the program reads ``B2``
+    at the width ``K2`` names: the bindings must pass ``K2`` as the physical
+    intermediate (the padded image) or as ``w2_dense_k`` (the dense image),
+    with ``B2`` rows of ``K2 / 2`` bytes, and a dense image holds one row past
+    the ``num_experts * hidden`` weight rows (its last K step reads into it);
+    anything else is refused.
     """
     import torch
 
@@ -340,6 +347,23 @@ def bind_prepared(
     _, num_sms = _route_arch(route, t.device)
     if tuple(main["grid"]) != route_grid(route, arch, num_sms):
         raise ValueError("No exported scheduling specialization for this prepared grid")
+    w2_dense_k = route["metadata"].get("w2_dense_k")
+    if w2_dense_k is not None:
+        widths = (int(args["intermediate"]), int(w2_dense_k))
+        k2 = int(main["K2"])
+        b2 = main["B2"]
+        if k2 not in widths or 2 * b2.shape[-1] != k2:
+            raise ValueError(
+                f"This route reads B2 at the width K2 names, {widths[0]} (padded) or "
+                f"{widths[1]} (dense); got K2 {k2} with B2 rows of "
+                f"{b2.shape[-1]} bytes"
+            )
+        weight_rows = int(args["num_experts"]) * int(args["hidden"])
+        if k2 == widths[1] and b2.numel() // b2.shape[-1] < weight_rows + 1:
+            raise ValueError(
+                f"This route reads the dense B2 image ({k2} wide) one row past its "
+                f"{weight_rows} weight rows; got {b2.numel() // b2.shape[-1]} rows"
+            )
     return V3Plan(
         route,
         stage_bindings,

@@ -99,12 +99,12 @@ Name map (the deterministic names are unchanged and always deterministic)::
       CakeMHCDetTrainFinishFunction                 CakeMHCTrainFinishFunction (non-deterministic package's)
       route_key                                     route_key
 
-The legacy module ``flashinfer.cake_mhc_train`` (and its backend
-``flashinfer.cake_mhc_train_backend``) keeps the same ``cake_mhc_train_*`` /
-``CakeMHCTrain*`` names as aliases of the deterministic objects, without a
-``deterministic`` keyword; this module is the explicit namespace of the
-selectable mode.  The model's head (``cake_mhc_det_train_head*``) has no
-cross-token reduction and no counterpart here: use
+This module is the namespace of the selectable mode.  The deterministic
+package's functions and classes carry ``det`` in their names
+(``flashinfer.cake_mhc_det_train``); 0.7.3's ``flashinfer.cake_mhc_train``
+names are removed, with no alias.  The model's head
+(``cake_mhc_det_train_head*``) has no cross-token reduction and no counterpart
+here: use
 ``flashinfer.cake_mhc_det_train.cake_mhc_det_train_head_forward`` /
 ``_head_backward`` / ``_head``.
 

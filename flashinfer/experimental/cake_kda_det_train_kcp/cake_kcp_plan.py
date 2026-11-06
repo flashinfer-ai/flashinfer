@@ -2096,6 +2096,16 @@ class ContextDetKcp:
         n = len(self._uploads)
         if not n:
             return
+        if stream is None and self._waited and self.device.type == "cuda":
+            # the current stream's handle without building a Stream: nothing to do once every upload is ordered on it
+            index = self.device.index
+            get = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+            if (
+                get is not None
+                and index is not None
+                and self._waited.get(int(get(index)), 0) >= n
+            ):
+                return
         s = torch.cuda.current_stream(self.device) if stream is None else stream
         key = s.cuda_stream
         i = self._waited.get(key, 0)
@@ -3667,13 +3677,3 @@ __all__ = [
     "wave_rule_lpt_cost_10ns",
     "wave_rule_lpt_P",
 ]
-
-# The names before the det rename, bound to the same objects (not in ``__all__``).
-KcpContext = ContextDetKcp
-KcpFragment = FragmentDetKcp
-KcpPartition = PartitionDetKcp
-build_kcp_context = build_context_det_kcp
-kcp_comm_bytes = kda_det_comm_bytes_kcp
-kcp_partition = partition_det_kcp
-kcp_saved_bytes = kda_det_saved_bytes_kcp
-kcp_workspace_bytes = kda_det_workspace_bytes_kcp

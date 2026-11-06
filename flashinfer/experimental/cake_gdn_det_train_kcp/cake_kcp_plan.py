@@ -2480,10 +2480,3 @@ __all__ = [
     "wave_rule_lpt_cost_10ns",
     "wave_rule_lpt_P",
 ]
-
-# Compatibility aliases: the pre-rename names bound to the same objects (not in ``__all__``).
-KcpContext = ContextDetKcp
-KcpFragment = FragmentDetKcp
-KcpPartition = PartitionDetKcp
-build_kcp_context = build_context_det_kcp
-kcp_partition = partition_det_kcp

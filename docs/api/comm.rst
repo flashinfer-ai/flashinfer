@@ -87,11 +87,11 @@ the eight-rank Blackwell carrier), so no separate all-reduce kernel or
 collective runs. The delivered architectures and world sizes are recorded in
 the loader's route tables (``flashinfer.jit.cake_fp8_rowwise_gemm_allreduce``);
 a device or group outside them raises instead of falling back.
-Operands are contiguous CUDA tensors with ``N`` a positive multiple of the
-delivered route's column tile (256 on SM100 / SM103), ``K_l`` a
-positive multiple of 128, any positive ``M`` with ``M * N <= 2**30``, and the
-process's torch symmetric-memory backend being the default ``CUDA`` backend or
-``NVSHMEM`` (the Cake backend never selects one itself). The symmetric
+Operands are contiguous CUDA tensors starting at a 16-byte aligned address
+(``a``, ``w``, ``w_scale`` and a caller-provided ``out``), with ``N`` a positive
+multiple of 256 and at most ``134184960``, ``K_l`` a positive multiple of 128,
+any positive ``M`` with ``M * N <= 2**30``, and the process's torch
+symmetric-memory backend being the default ``CUDA`` backend or ``NVSHMEM`` (the Cake backend never selects one itself). The symmetric
 workspace of a group grows to the largest ``M`` seen; that growth is the only
 collective after the first call.
 
@@ -667,11 +667,12 @@ for the full integration)::
         o_ = attention(q_, k_, v_)
         o = comm.gather_heads(o_)    # [B,S_global,H_local,D] -> [B,S_local,H,D]
 
-Existing callers can continue passing ``max_elems=...`` instead of
-``max_bytes=...``; the constructor multiplies it by ``dtype.itemsize``.
-Pass only one capacity argument. ``comm.max_elems`` remains available in the
-construction dtype, while ``comm.max_bytes`` is the byte capacity used by the
-new packed-chunk API.
+The v0.7.2 spelling ``max_elems=...`` (a capacity in elements of ``dtype``)
+is still accepted and converted to ``max_elems * dtype.itemsize`` bytes with a
+``DeprecationWarning``; it is deprecated since v0.7.3 and scheduled for
+removal in a future release. Pass exactly one capacity argument. ``comm.max_elems``,
+the v0.7.2 attribute, remains available in the construction dtype;
+``comm.max_bytes`` is the byte capacity used by the packed-chunk API.
 
 Preallocated outputs and NCCL staging can be reused across serialized calls::
 
@@ -772,6 +773,40 @@ Prepared QKV workspaces and ordinary staging workspaces are not interchangeable.
 
 .. autoclass:: UlyssesQKVWorkspace
     :members:
+
+Low-Precision Implementation Primitives
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The following internal helpers support numerical tests, trace definitions,
+and kernel benchmarks. They are not exported from ``flashinfer.comm``;
+applications should use the prepared ``UlyssesCommunicator`` QKV API above.
+
+.. currentmodule:: flashinfer.comm._ulysses_lowp
+
+.. autosummary::
+    :toctree: ../generated
+
+    capability
+    payload_spec
+    k_sum_v_amax
+    q_grouped_amax
+    k_grouped_amax
+    boundary_descriptors
+    merge_boundary_amax
+    k_boundary_minmax
+    derive_k_boundary_amax
+    zero_scale_and_padding
+    quant_q_into_payload
+    quant_kv_into_payload
+    quant_qkv_pack
+    unpack_for_sage
+    local_stats
+    finalize_stats
+    quant_and_pack
+    verify_duplicate_scale_slots
+    quant_v_fp8_with_scale
+
+.. currentmodule:: flashinfer.comm
 
 Head-Chunk Layout and Transport Primitives
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

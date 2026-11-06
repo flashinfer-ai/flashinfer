@@ -255,9 +255,7 @@ kernel_cake_lm_head_loss_41fae70f1613629d1b77(const __grid_constant__ CUtensorMa
         }
     }
 
-    // Publish explicit kernel-setup mbarrier initialization.
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
-
     __syncwarp();
     asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
