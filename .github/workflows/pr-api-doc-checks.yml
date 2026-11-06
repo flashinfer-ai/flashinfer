@@ -26,7 +26,7 @@ jobs:
       - name: Test public API checker
         id: public_api_tests
         continue-on-error: true
-        run: python -m unittest discover -s scripts/tests -p 'test_check_pr_api_diff.py' -v
+        run: python -m unittest discover -s scripts/infra/tests -p 'test_check_pr_api_diff.py' -v
 
       - name: Check public API signature and export changes
         id: public_api
@@ -36,7 +36,7 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -o pipefail
-          if python scripts/check_pr_api_diff.py \
+          if python scripts/infra/check_pr_api_diff.py \
               --base "$BASE_SHA" \
               --head "$HEAD_SHA" \
               --github-actions \
@@ -58,7 +58,7 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -o pipefail
-          if python scripts/check_pr_document.py \
+          if python scripts/infra/check_pr_document.py \
               --base "$BASE_SHA" \
               --head "$HEAD_SHA" \
               --github-actions \

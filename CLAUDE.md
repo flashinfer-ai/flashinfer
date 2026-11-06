@@ -140,7 +140,7 @@ Before each trusted writable job its runner's cache is cleared when it exceeds
 cubins. nvcc modules, tuning results and the generated-source tree are pruned,
 since a fresh checkout rebuilds nvcc modules anyway. Each test job's
 `FLASHINFER_JIT_BUILD_LOG` is summarized per toolchain by
-`scripts/summarize_jit_builds.py` in the job summary.
+`scripts/infra/summarize_jit_builds.py` in the job summary.
 See [`ci/COMPILE_CACHE.md`](ci/COMPILE_CACHE.md) for lifecycle tests and trust
 boundaries.
 
@@ -214,7 +214,7 @@ pytest tests/attention/test_hopper.py::test_single_prefill
 
 The sharded test runner defaults to one worker per visible GPU. H100 PR CI opts
 into `--workers-per-gpu 2`: eight workers on four GPUs. Other CI lanes retain
-the default. Locally, `scripts/task_run_unit_tests.sh --workers-per-gpu 2` enables
+the default. Locally, `scripts/infra/task_run_unit_tests.sh --workers-per-gpu 2` enables
 sharing; `--workers N` sets the total instead. Workers share the existing JIT
 compilation budget.
 
@@ -249,7 +249,7 @@ Allocation telemetry defaults to a 5-second interval (`RESOURCE_MONITOR_INTERVAL
 per-batch sampling defaults to 2 seconds (`MEMORY_MONITOR_INTERVAL`).
 The sampler uses `resource_monitor.py`, with sampling, CSV persistence,
 and summary aggregation kept separate. Allocation and batch monitors share host
-CPU readers in `scripts/test_sharding/host_cpu.py`. Unavailable per-process GPU
+CPU readers in `scripts/infra/test_sharding/host_cpu.py`. Unavailable per-process GPU
 memory stays unknown in snapshots and marks source resource summaries partial.
 `memory_summary.csv` leaves GPU maxima blank when no valid observation exists.
 Host CSV rows are flushed before GPU queries; query costs are in `sampler.csv`.
@@ -257,7 +257,7 @@ Nested runners reuse a sampler only while its exported owner PID is alive.
 Namespace-relative cgroup paths require membership evidence before attribution.
 
 Run the CPU-only coordinator suite with
-`pytest --confcutdir=tests/test_sharding tests/test_sharding/`.
+`pytest --confcutdir=tests/infra/test_sharding tests/infra/test_sharding/`.
 
 Collection stdout/stderr, including best-effort JIT prewarm warnings, is retained
 under `junit/collection-*/*.log` and uploaded with the public CI telemetry. Each
@@ -870,7 +870,7 @@ match what the code uses today; values are strings unless noted.
 | `FLASHINFER_DISABLE_JIT` | unset | `flashinfer/jit/core.py` | If set (any non-empty value), JIT compilation is refused and modules must already exist in the cache or be provided via AOT packages. |
 | `FLASHINFER_CUTE_DSL_DISABLE_CACHE` | `0` | `flashinfer/jit/cute_dsl_core.py` | `1` disables the on-disk cache for JIT-compiled CuTe-DSL kernels (every process recompiles via `cute.compile`). |
 | `FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY` | `0` | `flashinfer/jit/cute_dsl_core.py` | `1` extends each CuTe-DSL disk-cache key from the caller's `extra_key_files` to their in-package import closure, so editing an imported helper invalidates the kernel. Changes every key, so the first run after enabling recompiles. Set by CI's persistent compile cache. |
-| `FLASHINFER_JIT_BUILD_LOG` | unset | `flashinfer/jit/core.py` | Path of a JSONL file that gets one record (`toolchain`, `name`, `seconds`) per build made through `JitSpec.build_and_load()` or a bulk `build_jit_specs()` prebuild: nvcc modules (ninja no-ops included), CuTe-DSL kernels and TIRx modules. Triton, cuTile and the cake nvcc/NVRTC side paths are not recorded. Summarize with `scripts/summarize_jit_builds.py`. |
+| `FLASHINFER_JIT_BUILD_LOG` | unset | `flashinfer/jit/core.py` | Path of a JSONL file that gets one record (`toolchain`, `name`, `seconds`) per build made through `JitSpec.build_and_load()` or a bulk `build_jit_specs()` prebuild: nvcc modules (ninja no-ops included), CuTe-DSL kernels and TIRx modules. Triton, cuTile and the cake nvcc/NVRTC side paths are not recorded. Summarize with `scripts/infra/summarize_jit_builds.py`. |
 | `FLASHINFER_CUDNN_FROST_PTXAS` | unset | `flashinfer/fused_moe/backends/cudnn_frost/compiler.py` | Select an external PTXAS executable path for all Frost dtypes; unset or empty uses the bundled assembler. The executable path, version, and SHA-256 participate in compiler and tactic cache identities. MoE engines snapshot this configuration at build time; call `layer.refresh_backends()` or reconstruct the layer to adopt changes. |
 | `FLASHINFER_DISABLE_VERSION_CHECK` | unset | `flashinfer/jit/env.py` | Skip the check that pins flashinfer-cubin and flashinfer-jit-cache to the installed flashinfer-python. Without it, mismatched kernel wheels (typically left behind by an upgrade) are ignored with a warning at import, falling back to on-demand cubin downloads and JIT compilation until `flashinfer download-kernels` installs matching ones. Set it only when you intentionally mix versions. |
 | `FLASHINFER_JIT_LINEINFO` | `0` | `flashinfer/jit/core.py` | `1` adds `-lineinfo` to nvcc so profiler / `cuda-gdb` can map PTX back to CUDA source. |
@@ -901,7 +901,7 @@ match what the code uses today; values are strings unless noted.
 Release/nightly JIT-cache provider builds run sccache in server-side mode and
 wrap the complete wheel build with a no-output watchdog. They build in the
 container's torch-pinned interpreter rather than a PEP 517 isolated environment
-(`scripts/build_jit_cache_wheel.py`): an isolated environment's random path
+(`scripts/infra/build_jit_cache_wheel.py`): an isolated environment's random path
 reaches every compile command through the tvm_ffi include directory and changes
 the sccache key of each translation unit that includes tvm_ffi on every run.
 Before compiling, the same script gives every installed header one fixed mtime:
@@ -916,14 +916,14 @@ the whole build container, so diagnostics include compiler processes owned by
 the sccache daemon even though they are outside the wrapped process group. The
 CI `docker run --rm` boundary provides final cleanup for those processes.
 
-PR GPU test lanes run their test script through `scripts/run_with_test_sccache.sh`,
+PR GPU test lanes run their test script through `scripts/infra/run_with_test_sccache.sh`,
 which routes JIT compiles through the same S3 cache and prefix as the AOT lanes
 and uploads `sccache-stats-<kind>-<cuda>-<index>` artifacts. Set the repository
 variable `FLASHINFER_GPU_TEST_SCCACHE=0` to turn this off for A/B timing. If the
 sccache install fails, the wrapper runs the lane uncached. Compiles run in the
 sccache server, so a timed-out unit's process-group kill does not reach them, and
 per-unit memory telemetry excludes nvcc. Locally:
-`scripts/run_with_test_sccache.sh scripts/task_run_unit_tests.sh` (read-only without AWS credentials).
+`scripts/infra/run_with_test_sccache.sh scripts/infra/task_run_unit_tests.sh` (read-only without AWS credentials).
 
 ##### Cubin / Artifact Loader
 

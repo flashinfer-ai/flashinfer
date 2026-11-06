@@ -73,7 +73,7 @@ RUN pip3 install pre-commit
 # sccache for the JIT/AOT compiles; a devcontainer activates it by exporting
 # FLASHINFER_{CXX,NVCC}_LAUNCHER. Sourcing the CI helper keeps the pinned
 # version shared with the jit-cache wheel builds.
-COPY scripts/jit_cache_build_common.sh /install/jit_cache_build_common.sh
+COPY scripts/infra/jit_cache_build_common.sh /install/jit_cache_build_common.sh
 RUN bash -c 'source /install/jit_cache_build_common.sh \
     && install_sccache "${SCCACHE_VERSION}" "$(uname -m)"'
 

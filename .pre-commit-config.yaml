@@ -125,7 +125,7 @@ repos:
       # so it needs no environment.
       - id: experimental-test-scope-selftest
         name: experimental test scope selftest
-        entry: python3 scripts/pr_checks/experimental_test_scope.py --selftest
+        entry: python3 scripts/infra/pr_checks/experimental_test_scope.py --selftest
         language: system
         pass_filenames: false
-        files: ^scripts/pr_checks/experimental_test_scope\.py$
+        files: ^scripts/infra/pr_checks/experimental_test_scope\.py$
