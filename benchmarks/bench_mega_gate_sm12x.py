@@ -5,8 +5,8 @@
 """Benchmark the experimental SM120 CuTe DSL Mega Gate (``prepare_mega_gate``).
 
 Each row times one fused launch (BF16 routing GEMM + sqrt-softplus top-k with an
-expert bias, a two-replica physical map and the logical top-k output, as
-DeepInfer calls it for DeepSeek-V4.1-Flash) against the unfused two-kernel path
+expert bias, a two-replica physical map and the logical top-k output, as an
+expert-parallel serving engine calls it) against the unfused two-kernel path
 used on SM12x today: a cuBLAS BF16 GEMM with FP32 logits followed by b12x's
 Triton ``route_topk`` (sqrt-softplus, bias, renormalized top-k; it has no
 physical map, which only favors the baseline). The cuBLAS GEMM alone is

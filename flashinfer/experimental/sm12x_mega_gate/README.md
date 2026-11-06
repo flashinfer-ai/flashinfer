@@ -1,7 +1,7 @@
 # Fused routing gate on SM120 (CuTe DSL)
 
 `from flashinfer.mega_gate import prepare_mega_gate` dispatches compute
-capability 12.x to this backend (SM100a/SM103a keep the generated DeepGEMM
+capability 12.x to this backend (SM100a/SM103a/SM107a keep the generated DeepGEMM
 programs of `../deepgemm_mega_gate`). It fuses the BF16 routing GEMM
 `x[M,K] @ weight[E,K]^T`, `sqrt(softplus)` scoring, biased top-k selection,
 unbiased weight normalization and logical-to-physical expert mapping into one
@@ -40,7 +40,8 @@ producer warp through a multi-stage mbarrier pipeline and `ldmatrix`
   more than 4 tokens of a 64-token or smaller block). Once all L CTAs of a
   block have arrived, every CTA ranks a share of the block's tokens (DeepGEMM's
   order), one warp per token, overlapping the next block's GEMM. When a CTA ranks
-  at most 3 tokens of a block (up to 256 tokens), the gate is cooperative: each
+  at most 3 tokens of a block (on 110 SMs up to 256 tokens with 384 experts, 288
+  with 256), the gate is cooperative: each
   (token, 128-expert wave) item goes to one gate warp (its split-K loads and
   transcendentals), is posted sorted to shared memory, and a selector warp per
   token merges the waves; this takes 4 gate warps for one token and 8 for more,
@@ -65,7 +66,7 @@ producer warp through a multi-stage mbarrier pipeline and `ldmatrix`
   token's replica of every lane expert is looked up before its top-k (a modulo by
   a precomputed reciprocal), so no dependent lookup follows the selection. The
   square roots use `sqrt.rn`'s fast path without its slow-path branch (bitwise
-  equal for every input), so a lane's square roots interleave.
+  equal for every input but NaN payloads), so a lane's square roots interleave.
 - **Proxy fence.** The MMA warps read the pipeline stages with `ldmatrix`
   (generic proxy) and the TMA refills them (async proxy): the producer issues
   `fence.proxy.async.shared::cta` after each empty-barrier wait. Without it the
@@ -86,9 +87,9 @@ producer warp through a multi-stage mbarrier pipeline and `ldmatrix`
   timings are medians over buffer placements: the same schedule moves by up to
   10% with the DRAM placement of its buffers.
 
-Compared to the SM100 programs this backend also accepts other hidden sizes
-(multiples of 64), 1..1024 experts, top-k up to 32 slots, no bias, token masks
-and image bias. Fixed routing (`fix_routing_mask`, e.g. hash-routed layers)
+Compared to the SM10x programs (K=5120, E=384, top-6) this backend also accepts
+other hidden sizes (multiples of 64), up to 1024 experts (a multiple of 4),
+top-k up to 32 slots and no bias. Fixed routing (`fix_routing_mask`, e.g. hash-routed layers)
 takes the flagged tokens' logical experts from `unmapped_topk_idx` instead of
 the top-k and weights them from their unbiased scores, as DeepGEMM does. Random
 routing (`force_random`) is not implemented yet and raises
@@ -98,7 +99,7 @@ uncapped, calls of up to 256 tokens use 30-96 CTAs (5120 x 384) or 32-96 (4096
 x 256); capped at 64 SMs they take up to 1.1 us longer (4096 x 256, 1-240
 tokens) or 1.9 us (5120 x 384 at 140 tokens; 1 token unchanged). A worker
 group's CTAs wait for each other, so they must be resident together: launching
-under an SM budget smaller than one group (30 or 32 CTAs at decode sizes, e.g.
+under an SM budget smaller than one group (up to 30 or 32 CTAs at decode sizes, e.g.
 a green context or an MPS partition), or next to a kernel that holds SMs while
 waiting on the gate, hangs.
 
@@ -119,8 +120,9 @@ the token count is a runtime argument.
 
 Optional caller-owned `scratch` (FP32, `plan.scratch` shape) and
 `score_barriers` (uint64 `[token blocks, 16]`, zeroed once before first use;
-every launch leaves them zeroed again). E must be a multiple of 4 and the
-biases 16-byte aligned (they are read as float4). Preparation owns all allocations and
+every launch leaves them zeroed again). E must be a multiple of 4; x and the
+weight (TMA), the biases, `logical_count` and `scratch` (float4 loads) must be
+16-byte aligned, which preparation checks. Preparation owns all allocations and
 device queries; `run()` only launches, so it can be captured in a CUDA graph.
 Do not use one plan concurrently across streams.
 

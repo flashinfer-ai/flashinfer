@@ -4,11 +4,13 @@
 
 """SM120 CuTe DSL Mega Gate against an FP64 reference.
 
-Covers the production shape over many token counts, other K/E/top-k, padded
-expert counts, shared slots, physical mapping, masks, image bias, the
-no-bias ranking, deterministic batch invariance, bitwise repeatability (the
-arrival counters rearm themselves), CUDA graph replay with changed inputs on a
-side stream, and the schedule invariants (CPU-only).
+Covers both DeepSeek-V4-Flash and V4.1-Flash router shapes over many token
+counts, other K/E/top-k, shared slots, physical mapping, masks, image bias, the
+no-bias ranking, NaN scores, fixed routing, the SM cap, deterministic mode
+(against the reference and batch invariant), bitwise repeatability (the arrival
+counters rearm themselves), CUDA graph replay with changed inputs on a side
+stream, PDL behind a producer that triggers before it writes the tokens, input
+validation, and the schedule invariants (CPU-only).
 """
 
 import functools
@@ -578,36 +580,97 @@ def test_repeated_runs_are_bitwise_identical(num_tokens):
 
 
 @pytest.mark.parametrize("num_tokens", [1, 512])
-def test_pdl_launch_follows_the_token_producer(num_tokens):
-    """Under PDL the gate may start while the kernel writing its tokens finishes: every
-    run must see that kernel's tokens, and PDL must not change the result."""
+def test_pdl_waits_for_a_producer_that_triggers_early(num_tokens):
+    """Under PDL the gate launches once the kernel before it triggers. This producer
+    triggers first and writes the tokens only after a delay, so a gate that read them
+    before ``griddepcontrol.wait`` would route the stale tokens."""
     _skip_unless_sm120()
-    from flashinfer.norm import rmsnorm
+    import cuda.bindings.driver as cuda
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass import Float32
+    from cutlass.cute.runtime import from_dlpack
+
+    @cute.kernel
+    def write_late(src: cute.Tensor, dst: cute.Tensor, sink: cute.Tensor):
+        cute.arch.griddepcontrol_launch_dependents()
+        thread = cute.arch.block_idx()[0] * 256 + cute.arch.thread_idx()[0]
+        # ~0.2 ms of dependent FMAs: the gate is resident long before the tokens land.
+        delay = Float32(thread)
+        for _ in cutlass.range(100000, unroll=1):
+            delay = delay * Float32(1.0000001) + Float32(1.0)
+        if delay == Float32(-1.0):
+            sink[0] = delay
+        for i in cutlass.range(thread, src.shape[0], 8 * 256):
+            dst[i] = src[i]
+
+    @cute.jit
+    def launch(src, dst, sink, stream: cuda.CUstream):
+        write_late(src, dst, sink).launch(
+            grid=(8, 1, 1), block=(256, 1, 1), stream=stream
+        )
 
     x, weight, bias = _make_inputs(num_tokens, 5120, 384, seed=3)
-    source = x.clone()
-    norm_weight = torch.randn(
-        5120,
-        dtype=torch.bfloat16,
-        device="cuda",
-        generator=torch.Generator(device="cuda").manual_seed(4),
-    )
-    plans = {
-        pdl: prepare_mega_gate(x, weight, 6, bias=bias, enable_pdl=pdl)
-        for pdl in (False, True)
-    }
-    assert plans[True].route["enable_pdl"] and not plans[False].route["enable_pdl"]
-    for step in range(4):
-        rolled = source.roll(step * 7, dims=1)
-        # The producer launches its dependents early (PDL), so the gate starts while
-        # the tokens are still being written.
-        rmsnorm(rolled, norm_weight, out=x, enable_pdl=True)
-        indices, weights = (t.clone() for t in plans[True].run())
-        rmsnorm(rolled, norm_weight, out=x, enable_pdl=False)
-        expected = plans[False].run()
+    tokens = x.clone()
+    expected = [
+        t.clone()
+        for t in prepare_mega_gate(tokens, weight, 6, bias=bias, enable_pdl=False).run()
+    ]
+    plan = prepare_mega_gate(x, weight, 6, bias=bias, enable_pdl=True)
+    assert plan.route["enable_pdl"]
+    sink = torch.zeros(1, device="cuda")
+    args = [from_dlpack(t) for t in (tokens.view(-1), x.view(-1), sink)]
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    write_tokens = cute.compile(launch, *args, stream)
+    stale = torch.Generator(device="cuda").manual_seed(5)
+    for _ in range(3):
+        x.copy_(torch.randn(x.shape, dtype=x.dtype, device="cuda", generator=stale))
+        write_tokens(*args, stream)
+        indices, weights = plan.run()
         torch.cuda.synchronize()
         assert torch.equal(indices, expected[0])
         assert torch.equal(weights, expected[1])
+
+
+@pytest.mark.parametrize("with_bias", [True, False])
+def test_nan_scores_rank_last(with_bias):
+    """An expert whose logit is NaN is never chosen; a token whose logits are all NaN has
+    no finite candidate and gets the clamped expert E-1 with weight 0 in every slot."""
+    _skip_unless_sm120()
+    num_tokens, num_experts = 64, 384
+    x, weight, bias = _make_inputs(num_tokens, 5120, num_experts, seed=5)
+    if not with_bias:
+        bias = None
+    weight[7, 0] = float("nan")  # expert 7: a NaN logit for every token
+    x[3, 0] = float("nan")  # token 3: every logit NaN
+    logical = torch.empty((num_tokens, 6), dtype=torch.int64, device="cuda")
+    plan = prepare_mega_gate(
+        x,
+        weight,
+        6,
+        bias=bias,
+        unmapped_topk_idx=logical,
+        routed_scaling_factor=SCALE,
+    )
+    indices, weights = plan.run()
+    torch.cuda.synchronize()
+    assert torch.all(logical[3] == num_experts - 1)
+    assert torch.all(indices[3] == num_experts - 1)
+    assert torch.all(weights[3] == 0)
+    rows = torch.arange(num_tokens, device="cuda") != 3
+    assert not torch.any(logical[rows] == 7)
+    scores, ranking = _reference_scores(x[rows], weight, bias)
+    ranking[:, 7] = float("-inf")
+    _check_routing(
+        indices[rows],
+        weights[rows],
+        logical[rows],
+        scores,
+        ranking,
+        num_topk=6,
+        num_shared=0,
+        num_experts=num_experts,
+    )
 
 
 @pytest.mark.parametrize("shape", [PRODUCTION, V4_FLASH], ids=["E384", "E256"])
@@ -690,3 +753,23 @@ def test_rejects_unsupported_requests():
         )
     with pytest.raises(ValueError):
         prepare_mega_gate(x[:, :100].contiguous(), weight[:, :100].contiguous(), 6)
+
+
+def test_rejects_misplaced_or_misaligned_buffers():
+    """Checked when the plan is prepared, not at its first run (possibly in a capture)."""
+    _skip_unless_sm120()
+    x, weight, bias = _make_inputs(4, 5120, 384)
+    with pytest.raises(ValueError, match="same device"):
+        prepare_mega_gate(x, weight.cpu(), 6, bias=bias)
+    shifted_x = torch.empty(x.numel() + 1, dtype=x.dtype, device="cuda")[1:]
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        prepare_mega_gate(shifted_x.view(x.shape), weight, 6, bias=bias)
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        prepare_mega_gate(x, weight, 6, bias=torch.empty(385, device="cuda")[1:])
+    shared_row = torch.empty((1, 6), dtype=torch.int64, device="cuda").expand(4, 6)
+    with pytest.raises(ValueError, match="overlap"):
+        prepare_mega_gate(x, weight, 6, bias=bias, unmapped_topk_idx=shared_row)
+    scratch = prepare_mega_gate(x, weight, 6, bias=bias).scratch
+    shifted = torch.empty(scratch.numel() + 1, device="cuda")[1:].view(scratch.shape)
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        prepare_mega_gate(x, weight, 6, bias=bias, scratch=shifted)

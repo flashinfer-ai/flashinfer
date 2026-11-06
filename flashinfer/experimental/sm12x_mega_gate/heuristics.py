@@ -7,8 +7,9 @@
 As in DeepGEMM, a token block is computed by ``L = num_expert_groups *
 num_split_k`` logical CTAs (128 experts and one K slice each) and the grid holds
 ``num_sms // L`` worker groups of L CTAs that stride over the token blocks. Up to
-512 tokens the token block grows with the token count so that a call has about
-four blocks (``select_block_tokens``) and the split-K factor is the argmin of a
+512 tokens the token block grows with the token count, from 16 to 64 tokens, so
+that a call of up to 256 tokens has about four blocks (``select_block_tokens``),
+and the split-K factor is the argmin of a
 cost model of one CTA's critical path (``estimated_us``); above, the model picks
 a 96- or 128-token block and the split together. The model was fitted on
 schedules measured on the target board, the 110-SM RTX PRO 5000 (K=5120, E=384,

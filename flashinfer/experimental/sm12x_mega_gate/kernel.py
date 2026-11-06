@@ -4,7 +4,7 @@
 
 """CuTe DSL fused BF16 routing GEMM and sqrt-softplus top-k gate for SM120.
 
-Port of DeepGEMM's ``sm100_bf16_mega_gate`` (the SM100a/SM103a backend lives in
+Port of DeepGEMM's ``sm100_bf16_mega_gate`` (the SM100a/SM103a/SM107a backend lives in
 ``flashinfer/experimental/deepgemm_mega_gate``) to consumer Blackwell, which has
 no tcgen05/TMEM: the GEMM runs on warp-level ``mma.sync.m16n8k16`` fed by TMA
 and ldmatrix, and accumulates in registers.
@@ -30,8 +30,8 @@ Warp roles (DeepGEMM's TMA / MMA / gate split):
 - gate warps (4 or 8, per schedule): once all L logical CTAs of a block have arrived, every logical
   CTA ranks a share of its tokens (DeepGEMM's order: token ``gate_warp * L +
   rank``, stride ``gate_warps * L``), one warp per token, overlapping the MMA of
-  the next block. With at most 3 tokens per CTA and block (up to 256 tokens on the
-  110-SM board) the gate is cooperative instead: every (token, 128-expert wave) item
+  the next block. With at most 3 tokens per CTA and block (on the 110-SM board up to
+  256 tokens with 384 experts, 288 with 256) the gate is cooperative instead: every (token, 128-expert wave) item
   goes to one of gate warps 1.. (its split-K loads and transcendentals), is posted
   sorted to shared memory, and a selector warp per token runs the top-k rounds over
   all waves; gate warp 0 polls the barrier and selects the first token.
@@ -326,7 +326,8 @@ class Sm12xMegaGateKernel:
         if self.cooperative and self.num_gate_warps < 2:
             raise ValueError("a cooperative gate needs at least 2 gate warps")
         # Without a cooperative gate, when a CTA ranks more tokens of a block than it has
-        # gate warps (wide blocks), the MMA warps rank tokens of the CTA's last block too:
+        # gate warps (wide blocks, or smaller blocks over few CTAs), the MMA warps rank
+        # tokens of the CTA's last block too:
         # nothing overlaps that block's gate work, and they have nothing left to do.
         self.mma_warps_rank = mma_warps_rank(
             self.block_tokens,
@@ -1892,12 +1893,13 @@ class Sm12xMegaGateKernel:
         duplicates kept and ids clamped into [0, E) so no lookup leaves the tables. Read
         before the token's logits are needed, so neither load is on the critical path;
         the weights come from the token's unbiased scores as for a ranked token."""
-        given = Int32(
-            unmapped_idx[
-                Int64(token), Int64(cutlass.min(lane, Int32(self.num_topk - 1)))
-            ]
+        given = unmapped_idx[
+            Int64(token), Int64(cutlass.min(lane, Int32(self.num_topk - 1)))
+        ]
+        # Clamped as int64: narrowing first would wrap ids of 2^31 and above.
+        expert = Int32(
+            cutlass.min(cutlass.max(given, Int64(0)), Int64(self.num_experts - 1))
         )
-        expert = cutlass.min(cutlass.max(given, Int32(0)), Int32(self.num_experts - 1))
         return (
             Int32(fix_mask[token]),
             cutlass.select_(lane < Int32(self.num_topk), expert, Int32(NO_EXPERT)),
@@ -1954,7 +1956,10 @@ class Sm12xMegaGateKernel:
 
         # Normalized unbiased weights of the routed slots.
         if const_expr(not self.has_scoring_bias):
-            selected_value = sqrt_softplus(selected_value)
+            # A slot left without a finite candidate keeps weight 0, as with a bias.
+            selected_value = cutlass.select_(
+                no_candidate, Float32(0.0), sqrt_softplus(selected_value)
+            )
         topk_sum = cutlass.select_(is_routed, selected_value, Float32(0.0))
         for step in cutlass.range_constexpr(self.sum_width.bit_length() - 1):
             topk_sum = topk_sum + cute.arch.shuffle_sync_bfly(

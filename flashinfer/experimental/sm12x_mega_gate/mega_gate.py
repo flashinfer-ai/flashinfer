@@ -4,7 +4,7 @@
 
 """Prepared fused BF16 routing GEMM and normalized top-k weights on SM120 (CuTe DSL).
 
-``MegaGateSm12xPlan`` keeps the contract of the SM100a/SM103a
+``MegaGateSm12xPlan`` keeps the contract of the SM100a/SM103a/SM107a
 ``deepgemm_mega_gate.mega_gate.MegaGatePlan``: preparation validates, selects
 the schedule, owns every allocation and compiles the kernel (once per schedule
 and input signature, cached on disk); ``run()`` launches one kernel on the
@@ -195,17 +195,18 @@ def load_kernel(arch: str, device_index: int, spec: KernelSpec):
 class MegaGateSm12xPlan:
     """Bind a fused routing operation on SM120; run() returns (expert_indices, weights).
 
-    x is BF16[M,K] and weight BF16[E,K] (K a multiple of 64, E <= 1024). The
-    optional bias and image bias are FP32[E]; masks are bool[M]. Physical mapping
-    uses int32[E+shared,width] and logical_count int32[E+shared]. The optional
-    logical top-k output is int64[M,topk] with unit column stride. Outputs are
-    int64[M,topk+shared] indices and FP32 weights: the unbiased scores normalized
-    over the top-k and scaled by routed_scaling_factor, weight 1 on shared slots,
-    index -1 and weight 0 for masked tokens. Deterministic mode never splits K.
-    Tokens flagged in fix_routing_mask (bool[M]) skip the top-k and take the logical
-    experts already in their unmapped_topk_idx row (required; read before the row is
-    written back, with ids clamped into [0, E) and masked tokens set to -1), weighted
-    from their unbiased scores; force_random is not supported.
+    x is BF16[M,K] and weight BF16[E,K], both contiguous and 16-byte aligned (K a
+    multiple of 64, E <= 1024 and a multiple of 4). The optional bias and image bias
+    are FP32[E]; masks are bool[M]. Physical mapping uses int32[E+shared,width] and
+    logical_count int32[E+shared]. The optional logical top-k output is
+    int64[M,topk] with unit column stride. Outputs are int64[M,topk+shared] indices
+    and FP32 weights: the unbiased scores normalized over the top-k and scaled by
+    routed_scaling_factor, weight 1 on shared slots, index -1 and weight 0 for
+    masked tokens. Deterministic mode never splits K. Tokens flagged in
+    fix_routing_mask (bool[M]) skip the top-k and take the logical experts already
+    in their unmapped_topk_idx row (required; read before the row is written back,
+    with ids clamped into [0, E) and masked tokens set to -1), weighted from their
+    unbiased scores; force_random is not supported.
 
     Optional scratch (FP32 split-K partial logits) and score_barriers
     (uint64[token blocks,16] arrival counters, zeroed once before first use; the
@@ -278,6 +279,8 @@ class MegaGateSm12xPlan:
             raise ValueError("x and weight must be contiguous and share K")
         if weight.device != x.device:
             raise ValueError("x and weight must be on the same device")
+        if x.data_ptr() % 16 or weight.data_ptr() % 16:
+            raise ValueError("x and weight must be 16-byte aligned (TMA loads them)")
         if K <= 0 or K % BLOCK_K:
             raise ValueError(
                 f"the hidden size must be a positive multiple of {BLOCK_K}"
