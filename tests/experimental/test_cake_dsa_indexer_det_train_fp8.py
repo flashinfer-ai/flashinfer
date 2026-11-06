@@ -22,7 +22,7 @@ limitations under the License.
 # operator tests need a compute capability 10.0 / 10.3 / 10.7 device with
 # registered FP8 programs and skip otherwise.
 #
-# Like ``test_cake_dsa_indexer.py`` this suite names the package once, through
+# Like ``test_cake_dsa_indexer_det_train.py`` this suite names the package once, through
 # ``tests.test_helpers.cake_package``, and imports nothing else from flashinfer.
 
 import copy
@@ -35,14 +35,16 @@ import torch
 from tests.test_helpers import cake_dsa_indexer_reference as ref
 from tests.test_helpers.cake_package import cake_package
 
-cake_backend = cake_package("cake_dsa_indexer_det", "cake_backend")
-cake_jit = cake_package("cake_dsa_indexer_det", "cake_jit")
-cake_policy = cake_package("cake_dsa_indexer_det", "cake_policy")
+cake_backend = cake_package("cake.cake_dsa_indexer_det_train", "cake_backend")
+cake_jit = cake_package("cake.cake_dsa_indexer_det_train", "cake_jit")
+cake_policy = cake_package("cake.cake_dsa_indexer_det_train", "cake_policy")
 HEAD_DIM = cake_backend.HEAD_DIM
 NUM_HEADS = cake_backend.NUM_HEADS
 SUPPORTED_COMPUTE_CAPABILITIES = cake_backend.SUPPORTED_COMPUTE_CAPABILITIES
 arch_for = cake_backend.arch_for
-dsa_indexer_det_workspace_size = cake_backend.dsa_indexer_det_workspace_size
+cake_dsa_indexer_det_train_topk_workspace_size = (
+    cake_backend.cake_dsa_indexer_det_train_topk_workspace_size
+)
 generated_program_available = cake_backend.generated_program_available
 plan_dsa_indexer_det_topk = cake_backend.plan_dsa_indexer_det_topk
 policy_for = cake_backend.policy_for
@@ -586,9 +588,12 @@ def test_bf16_plans_and_workspace_bounds_are_the_unchanged_procedure():
                         == expected
                     )
                 nbytes = max(int(c.workspace_bytes) for c in want)
-                assert dsa_indexer_det_workspace_size(T, Tkv, S, **common) == nbytes
                 assert (
-                    dsa_indexer_det_workspace_size(
+                    cake_dsa_indexer_det_train_topk_workspace_size(T, Tkv, S, **common)
+                    == nbytes
+                )
+                assert (
+                    cake_dsa_indexer_det_train_topk_workspace_size(
                         T, Tkv, S, dtype=torch.bfloat16, **common
                     )
                     == nbytes
@@ -736,7 +741,7 @@ def _require_fp8_program():
 
 
 def _run(inputs: ref.IndexerInputs, **extra):
-    out = cake_backend.dsa_indexer_det_topk(
+    out = cake_backend.cake_dsa_indexer_det_train_topk(
         inputs.q,
         inputs.k,
         inputs.w,
@@ -961,7 +966,7 @@ def test_fp8_ticket_decision_is_per_form_and_exact_on_a_poisoned_workspace():
         )
         extra = {} if sample is None else {"sample_tiles_max": sample}
         expected = _cloned(_run(inputs, **extra))
-        nbytes = dsa_indexer_det_workspace_size(
+        nbytes = cake_dsa_indexer_det_train_topk_workspace_size(
             T, Tkv, S, top_k=2048, device=device, dtype=E4M3
         )
         shared = torch.full((nbytes,), 7, dtype=torch.uint8, device=device)
@@ -1008,7 +1013,7 @@ def test_fp8_workspace_bound_is_respected(shape):
     inputs = ref.make_fp8_inputs(seed=53, device="cuda", **shape)
     if shape is _S1:
         _assert_fp8_wide_on_wide_arches(_plan(inputs))
-    nbytes = dsa_indexer_det_workspace_size(
+    nbytes = cake_dsa_indexer_det_train_topk_workspace_size(
         inputs.num_queries,
         inputs.num_keys,
         inputs.num_segments,

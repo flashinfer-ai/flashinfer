@@ -18,7 +18,7 @@ limitations under the License.
 
 Times the *complete operator* -- scoring, exact selection, ascending-id
 ordering, aligned scores and padding, including the workspace traffic -- of
-``flashinfer.experimental.cake_dsa_indexer_det`` against two torch + FlashInfer
+``flashinfer.experimental.cake.cake_dsa_indexer_det_train`` against two torch + FlashInfer
 compositions of the same contract on representative rows (32 heads, head
 dimension 128, BF16 ``q`` / ``k``, FP32 ``w``, iid Gaussian inputs with a
 peaked variant):
@@ -72,7 +72,7 @@ only where ``narrow`` is registered for the row's fit); the recorded
 ``plan`` and workspace bytes are the forced policy's, see
 ``forced_policy``), ``cake_main`` / ``cake_main_nosample`` (a
 second copy of the package loaded from ``--main-package DIR``, e.g. the
-``flashinfer/experimental/cake_dsa_indexer_det``
+``flashinfer/experimental/cake/cake_dsa_indexer_det_train``
 directory of a FlashInfer main checkout, in the same process: the package is
 self-contained -- relative imports, ``Path(__file__)`` manifest, JIT names
 salted by its own closure digests -- so both versions run on the same input
@@ -145,13 +145,13 @@ compare the Cake arms of one form; the speed ratios are against ``cake_fp8``.
 
 Usage::
 
-    python benchmarks/bench_cake_dsa_indexer.py [--rows P1 S2 ...] [--arms cake,chunked_pipeline,materialized_fp32]
+    python benchmarks/bench_cake_dsa_indexer_det_train.py [--rows P1 S2 ...] [--arms cake,chunked_pipeline,materialized_fp32]
         [--reps 20] [--strided-k] [--verify] [--json out.json]
-    python benchmarks/bench_cake_dsa_indexer.py --rows sink --arms cake,cake_nosample,cake_main,cake_main_nosample
-        --main-package /path/to/main/flashinfer/experimental/cake_dsa_indexer_det --cupti-required --json out.json
-    python benchmarks/bench_cake_dsa_indexer.py --rows sink --arms cake,cake_far,cake_aa,cake_far_aa --cupti-required --json out.json
-    python benchmarks/bench_cake_dsa_indexer.py --rows sink --arms cake,cake_wide,cake_l6,cake_pair_l6,cake_wide_c1 --cupti-required --json out.json
-    python benchmarks/bench_cake_dsa_indexer.py --form fp8 --rows fp8 --arms cake_fp8,cake,deepgemm_topk,deepgemm_ragged_topk
+    python benchmarks/bench_cake_dsa_indexer_det_train.py --rows sink --arms cake,cake_nosample,cake_main,cake_main_nosample
+        --main-package /path/to/main/flashinfer/experimental/cake/cake_dsa_indexer_det_train --cupti-required --json out.json
+    python benchmarks/bench_cake_dsa_indexer_det_train.py --rows sink --arms cake,cake_far,cake_aa,cake_far_aa --cupti-required --json out.json
+    python benchmarks/bench_cake_dsa_indexer_det_train.py --rows sink --arms cake,cake_wide,cake_l6,cake_pair_l6,cake_wide_c1 --cupti-required --json out.json
+    python benchmarks/bench_cake_dsa_indexer_det_train.py --form fp8 --rows fp8 --arms cake_fp8,cake,deepgemm_topk,deepgemm_ragged_topk
         --cupti-required --json out.json
 """
 
@@ -175,7 +175,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import flashinfer  # noqa: E402
 from flashinfer.api_logging import ExperimentalWarning  # noqa: E402
-from flashinfer.experimental.cake_dsa_indexer_det import cake_backend  # noqa: E402
+from flashinfer.experimental.cake.cake_dsa_indexer_det_train import cake_backend  # noqa: E402
 from flashinfer.testing import bench_gpu_time  # noqa: E402
 from flashinfer.topk import TopKTieBreak  # noqa: E402
 from tests.test_helpers import cake_dsa_indexer_reference as ref  # noqa: E402
@@ -792,12 +792,16 @@ def row_extra(inputs) -> dict:
     return {}
 
 
-def backend_api(backend, name: str):
-    """The callable ``name`` of ``backend``; a baseline package copy that predates the ``_det`` names (see
-    ``--main-package``) provides the same callable under its previous name (``plan_dsa_indexer_det_topk`` ->
-    ``plan_dsa_indexer_topk``)."""
-    fn = getattr(backend, name, None)
-    return fn if fn is not None else getattr(backend, name.replace("_det", "", 1))
+def backend_api(backend, name: str, *previous: str):
+    """The callable ``name`` of ``backend``; a baseline package copy that predates the current names (see
+    ``--main-package``) provides the same callable under a previous name: one of ``previous`` (for example the
+    workspace bound's ``dsa_indexer_det_workspace_size`` before flashinfer-ai/flashinfer#8928), else the name
+    without its first ``_det`` (``plan_dsa_indexer_det_topk`` -> ``plan_dsa_indexer_topk``)."""
+    for candidate in (name, *previous):
+        fn = getattr(backend, candidate, None)
+        if fn is not None:
+            return fn
+    return getattr(backend, name.replace("_det", "", 1))
 
 
 def form_extra(inputs) -> dict:
@@ -945,7 +949,10 @@ class CakeArm(Arm):
             scope.enter_context(hidden_fp8_kinds(self.backend, self.fp8_hidden))
         with scope:  # one scope: the workspace bound, the plan record and prepare see the same policy
             self.workspace_bytes = backend_api(
-                self.backend, "dsa_indexer_det_workspace_size"
+                self.backend,
+                "cake_dsa_indexer_det_train_topk_workspace_size",
+                "dsa_indexer_det_workspace_size",
+                "dsa_indexer_workspace_size",
             )(
                 inputs.num_queries,
                 inputs.num_keys,
@@ -1608,7 +1615,7 @@ def main():
     parser.add_argument(
         "--main-package",
         default=None,
-        help="directory of a second copy of the package (e.g. a FlashInfer main checkout's flashinfer/experimental/cake_dsa_indexer_det) for the cake_main arms",
+        help="directory of a second copy of the package (e.g. a FlashInfer main checkout's flashinfer/experimental/cake/cake_dsa_indexer_det_train) for the cake_main arms",
     )
     parser.add_argument(
         "--cupti-required",

@@ -4218,6 +4218,6 @@
       ]
     }
   ],
-  "package": "flashinfer.experimental.cake_dsa_indexer_det",
+  "package": "flashinfer.experimental.cake.cake_dsa_indexer_det_train",
   "schema": "cake-build/1"
 }
