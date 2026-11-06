@@ -71,8 +71,8 @@ def _singles(ctx, xs, ws, dys, *, det=False):
     out = []
     if det:
         forward, backward = (
-            det_kcp.cake_causal_conv1d_det_forward_kcp,
-            det_kcp.cake_causal_conv1d_det_backward_kcp,
+            det_kcp.cake_causal_conv1d_det_train_kcp_forward,
+            det_kcp.cake_causal_conv1d_det_train_kcp_backward,
         )
     else:
         forward, backward = (

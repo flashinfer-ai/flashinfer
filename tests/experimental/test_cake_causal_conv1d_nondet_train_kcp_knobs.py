@@ -461,8 +461,8 @@ def test_facade_reexports_the_handle_lazily() -> None:
         "from flashinfer.experimental.cake.cake_causal_conv1d_nondet_train import kcp\n"
         "assert A is kcp.CakeCausalConv1dNondetKcpRecomputeHandle and H in f.__all__ and H in dir(f)\n"
         "import flashinfer.cake_causal_conv1d_det_train_kcp as d\n"
-        "from flashinfer.cake_causal_conv1d_det_train_kcp import RecomputeHandleDetKcp\n"
-        "assert RecomputeHandleDetKcp is not A\n"
+        "from flashinfer.cake_causal_conv1d_det_train_kcp import CakeCausalConv1dDetKcpRecomputeHandle\n"
+        "assert CakeCausalConv1dDetKcpRecomputeHandle is not A\n"
         "assert d.cake_causal_conv1d_det_kcp is not f.cake_causal_conv1d_nondet_kcp\n"
         "print('FACADE_IMPORT_OK')\n"
     )

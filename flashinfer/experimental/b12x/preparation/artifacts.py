@@ -3,15 +3,11 @@
 from __future__ import annotations
 
 import os
-
-# Windows has no fcntl; publishing then runs without the advisory lock.
-try:
-    import fcntl
-except ImportError:
-    fcntl = None
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
+
+import _flashinfer_filelock as filelock
 
 from b12x._lib.cache_integrity import _fsync_directory, _mkdir_durable, valid_object
 
@@ -44,13 +40,7 @@ class CuTeArtifactCache:
             yield Path(temporary)
 
     def publish(self, key: str, staged: Path) -> bool:
-        """Publish a verified pair without waiting for an active local compiler.
-
-        The per-key lock is ``fcntl.flock``; where ``fcntl`` is unavailable
-        (Windows) the pair is published without it, so two publishers of the
-        same key on one host can leave a mixed pair. One publisher per key is
-        assumed there.
-        """
+        """Publish a verified pair without waiting for an active local compiler."""
         object_path, manifest_path = (
             staged / (key + suffix) for suffix in (".o", ".json")
         )
@@ -58,8 +48,7 @@ class CuTeArtifactCache:
             return False
         with self.path(key, ".lock").open("a") as lock:
             try:
-                if fcntl is not None:
-                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                filelock.lock(lock.fileno(), blocking=False)
             except BlockingIOError:
                 return self.has(key)
             try:
@@ -72,5 +61,4 @@ class CuTeArtifactCache:
                 _fsync_directory(self.path(key, ".o").parent)
                 return True
             finally:
-                if fcntl is not None:
-                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+                filelock.unlock(lock.fileno())
