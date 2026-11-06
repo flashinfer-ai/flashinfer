@@ -885,6 +885,9 @@ class MlaDecodeTs(Nvfp4KVConfig):
     """
 
     lse_base_on_e = False
+    # True launches every grid with PDL, ordered by the matching in-kernel
+    # wait and dependent release; plans set it from their ``enable_pdl``.
+    enable_pdl = True
 
     def __init__(
         self,
@@ -1070,6 +1073,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
             self.acc_dtype,
             self.lse_dtype,
             self.lse_base_on_e,
+            self.enable_pdl,
             self.mma_qk_tiler_mn,
             self.mma_pv_tiler_mn,
             self.max_active_clusters,
@@ -1682,11 +1686,6 @@ class MlaDecodeTs(Nvfp4KVConfig):
             kernel_split_kv,
             workspace,
         )
-        # Nonpersistent producers signal near retirement. The native reducer
-        # can overlap setup, then waits for the complete prerequisite grid
-        # before reading partials. Persistent schedules retain stream ordering.
-        use_one_wave_reducer_pdl = acc_o is not None and not self.is_persistent
-
         # Host FP32 scales enter the device kernel in log2 units. Device
         # buffers retain natural units until they are loaded by the kernel.
         softmax_scale_operand = softmax_scale
@@ -1733,7 +1732,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
             cluster=cfg.cluster_shape_mnk,
             stream=stream,
             min_blocks_per_mp=1,
-            use_pdl=use_one_wave_reducer_pdl,
+            use_pdl=self.enable_pdl,
         )
 
         # Reduction kernel: combine per-split results when split_kv > 1
@@ -1774,7 +1773,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
                     else [topology.cluster_size, 1, 1],
                     stream=stream,
                     min_blocks_per_mp=1,
-                    use_pdl=use_one_wave_reducer_pdl,
+                    use_pdl=self.enable_pdl,
                 )
             else:
                 logical_query_rows = self.num_heads * seq_len_q
@@ -1819,7 +1818,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
                             ),
                             stream=stream,
                             min_blocks_per_mp=2,
-                            use_pdl=use_one_wave_reducer_pdl,
+                            use_pdl=self.enable_pdl,
                         )
                     elif kernel_split_kv <= Int32(4):
                         self.reduction_kernel(
@@ -1853,7 +1852,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
                             ),
                             stream=stream,
                             min_blocks_per_mp=2,
-                            use_pdl=use_one_wave_reducer_pdl,
+                            use_pdl=self.enable_pdl,
                         )
                     else:
                         self.reduction_kernel(
@@ -1889,7 +1888,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
                             ),
                             stream=stream,
                             min_blocks_per_mp=2,
-                            use_pdl=use_one_wave_reducer_pdl,
+                            use_pdl=self.enable_pdl,
                         )
                 else:
                     self.reduction_kernel(
@@ -1925,7 +1924,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
                         ),
                         stream=stream,
                         min_blocks_per_mp=2,
-                        use_pdl=use_one_wave_reducer_pdl,
+                        use_pdl=self.enable_pdl,
                     )
 
     @cute.kernel
@@ -1961,7 +1960,13 @@ class MlaDecodeTs(Nvfp4KVConfig):
     ) -> None:
         """MLA decode TS kernel: persistent tile-scheduled execution."""
         seq_len_q = self.seq_len_q if self.fixed_seqlen else max_q_len
-        if cutlass.const_expr(acc_o is not None and not self.is_persistent):
+        # A PDL launch may start before the preceding grid finishes, so acquire
+        # it before reading any predecessor-written input: the device scale
+        # operands and sparse top-k lengths loaded below, and cache_seqs via the
+        # task manager. The acquire sits at body entry, as in the 1CTA sibling,
+        # so both arms of the later early-exit test are covered by position
+        # instead of by enumerating the reads under each one.
+        if cutlass.const_expr(self.enable_pdl):
             prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
         if cutlass.const_expr(isinstance(softmax_scale_operand, cute.Tensor)):
             scale_softmax_log2 = softmax_scale_operand[0] * LOG2_E
@@ -2538,7 +2543,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
             )
             # Each producer CTA publishes completion only after its paired
             # TMEM lifetime and all scheduled output work have retired.
-            if cutlass.const_expr(acc_o is not None and not self.is_persistent):
+            if cutlass.const_expr(self.enable_pdl):
                 if prims.elect_sync():
                     prims.griddepcontrol(kind=prims.GridDepAction.LAUNCH_DEPENDENTS)
 
@@ -2613,7 +2618,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
             cp_interleave_size=self.cp_interleave_size,
             lse_base_on_e=self.lse_base_on_e,
         )
-        if cutlass.const_expr(not self.is_persistent):
+        if cutlass.const_expr(self.enable_pdl):
             prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
         run_reduction_kernel(
             self,
@@ -2666,7 +2671,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
             cp_interleave_size=self.cp_interleave_size,
             lse_base_on_e=self.lse_base_on_e,
         )
-        if cutlass.const_expr(not self.is_persistent):
+        if cutlass.const_expr(self.enable_pdl):
             prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
         attention_sinks = None
         if cutlass.const_expr(self.fuse_sparse_reduction):

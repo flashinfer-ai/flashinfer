@@ -247,9 +247,11 @@ def run_gmem_reduction_kernel(
     num_reduction_ctas,
     requested_splits=None,
     cp_rank=0,
+    use_pdl: cutlass.Constexpr[bool] = True,
 ):
     """Preserve inactive output and never consume stale split scratch."""
-    prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
+    if cutlass.const_expr(use_pdl):
+        prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
     _, _, batch_idx = cute.arch.block_idx()
     if runtime_request_publishes(cfg, cache_seqs, batch_idx, cp_rank):
         _run_active_gmem_reduction_kernel(
