@@ -19,11 +19,12 @@ The facades ``flashinfer.cake_gdn_det_train`` and ``flashinfer.cake_gdn_det_trai
 backend packages at ``flashinfer.experimental.cake.cake_gdn_det_train[_kcp]``.  Every name the facades and the backend
 packages export carries the mode word ``det`` as a token, right after the op (constants keep their ALL_CAPS names
 and are not exported); no entry binds a ``deterministic`` keyword (``inspect.signature(obj).bind_partial(
-deterministic=False)`` raises ``TypeError``, the autograd ``Function.forward`` / ``backward`` included; the entries whose ``**`` keywords are the KCP option fields or the byte queries' keyword-only arguments
-refuse it where those keywords are bound); the former module paths do not import, and no namespace (the ``flashinfer`` top level, the
-facades, the backend packages and their modules) binds a former name.  Importing a facade loads no backend module until
-first use (checked in fresh interpreters).  The mode-word and keyword checks are the shared ones of
-``tests/test_helpers/cake_mode_names.py``.
+deterministic=False)`` raises ``TypeError``, the autograd ``Function.forward`` / ``backward`` included; the KCP
+entries that take the option fields through ``**`` declare them in their signatures, so no signature has a ``**``
+parameter); the former module paths do not import, and no namespace (the ``flashinfer`` top level, the facades, the
+backend packages and their modules) binds a former name.  Importing a facade loads no backend module until first use
+(checked in fresh interpreters).  The mode-word and keyword checks, and one check of each facade with no exemption
+(``assert_cake_mode_module``), are the shared ones of ``tests/test_helpers/cake_mode_names.py``.
 """
 
 from __future__ import annotations
@@ -40,6 +41,7 @@ import pytest
 
 import flashinfer
 from tests.test_helpers.cake_mode_names import (
+    assert_cake_mode_module,
     assert_mode_names,
     assert_no_deterministic_keyword,
 )
@@ -178,16 +180,19 @@ FORMER_NAMES = (
 # Former Cake names that FlashInfer's own (non-Cake) stable API also uses at the top level: there the name must bind
 # that API's object, never a Cake one.
 STABLE_TOP_LEVEL = {"chunk_gated_delta_rule": "flashinfer.gdn_prefill"}
-# Entries whose ``**`` keywords are the fields of ``CakeGDNDetKcpOptions`` (``make_options`` refuses an unknown name
-# with ``TypeError``) or the keyword-only arguments of the byte queries of ``cake_bytes``: ``bind_partial`` accepts any
-# keyword there, so ``test_the_forwarded_keywords_refuse_deterministic`` checks where those keywords are bound.
-VAR_KEYWORD_ENTRIES = (
+# The facade functions that call the package function of their name (the shared check ties the package object to
+# the facade name through these pairs).
+FORWARDS = ("cake_gdn_det",)
+KCP_FORWARDS = (
     "cake_gdn_det_kcp",
-    "cake_gdn_det_train_kcp_backward",
-    "cake_gdn_det_train_kcp_comm_bytes",
     "cake_gdn_det_train_kcp_forward",
-    "cake_gdn_det_train_kcp_saved_bytes",
+    "cake_gdn_det_train_kcp_backward",
+    "cake_gdn_det_train_kcp_partition",
+    "cake_gdn_det_train_kcp_build_context",
+    "cake_gdn_det_train_kcp_packed_qkv_views",
     "cake_gdn_det_train_kcp_workspace_bytes",
+    "cake_gdn_det_train_kcp_saved_bytes",
+    "cake_gdn_det_train_kcp_comm_bytes",
 )
 
 
@@ -357,20 +362,50 @@ def _callables(module) -> list[tuple[str, object]]:
 
 @pytest.mark.parametrize("module_name", [FACADE, PACKAGE, KCP_FACADE, KCP_PACKAGE])
 def test_no_entry_takes_a_deterministic_parameter(module_name: str) -> None:
-    # the shared check for every exported entry but the listed ``**`` ones (it cannot tell their forwarded keywords
-    # from a catch-all; test_the_forwarded_keywords_refuse_deterministic checks where those are bound)
+    # the shared check on every exported entry, with no exemption: the entries that take the option keywords through
+    # ``**knobs`` / ``**kw`` declare them in their signatures, so no signature has a ``**`` parameter
     module = importlib.import_module(module_name)
-    want = VAR_KEYWORD_ENTRIES if module_name in (KCP_FACADE, KCP_PACKAGE) else ()
-    entries = [getattr(module, name) for name in module.__all__ if name not in want]
-    assert entries
-    assert_no_deterministic_keyword(entries)
-    var_keyword = []
-    for name, fn in _callables(module):
+    assert_no_deterministic_keyword(module)
+    found = _callables(module)
+    assert found
+    for name, fn in found:
         sig = inspect.signature(fn)
         assert "deterministic" not in sig.parameters, (module_name, name)
-        if any(p.kind is p.VAR_KEYWORD for p in sig.parameters.values()):
-            var_keyword.append(name)
-    assert sorted(var_keyword) == sorted(want), module_name
+        assert all(p.kind is not p.VAR_KEYWORD for p in sig.parameters.values()), (
+            module_name,
+            name,
+        )
+
+
+@pytest.mark.parametrize(
+    "facade, package, submodules, forwards",
+    [
+        (FACADE, PACKAGE, SUBMODULES, FORWARDS),
+        (KCP_FACADE, KCP_PACKAGE, KCP_SUBMODULES, KCP_FORWARDS),
+    ],
+    ids=["single-rank", "kcp"],
+)
+def test_the_facade_follows_the_shared_mode_name_rules(
+    facade: str, package: str, submodules, forwards
+) -> None:
+    # the shared check of one facade with no exemption: the mode word right after the op, no ``deterministic`` at any
+    # signature, each object bound under its facade name only (the flashinfer top level, the backend package and its
+    # modules), and the former module paths and names failing at import in a fresh interpreter
+    module = importlib.import_module(facade)
+    pkg = importlib.import_module(package)
+    assert_cake_mode_module(
+        module,
+        "det",
+        namespaces=[
+            flashinfer,
+            pkg,
+            *(importlib.import_module(f"{package}.{sub}") for sub in submodules),
+        ],
+        forwards=[(name, getattr(pkg, name)) for name in forwards],
+        old_modules=REMOVED_MODULES,
+        old_names=[(m, name) for m in (facade, package) for name in FORMER_NAMES],
+        cwd=Path(__file__).resolve().parents[2],
+    )
 
 
 def test_the_forwarded_keywords_refuse_deterministic() -> None:
