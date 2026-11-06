@@ -778,12 +778,16 @@ _PROGRAM_OF = {
 def _walk_form_of(call: Any, programs: Any, name: str, args: dict[str, Any]) -> str:
     """The record form of walk launch ``name`` (``"full"`` / ``"split"``): the registry's rule
     (``cake_kcp_jit.walk_form``) on the launch's chains (the chunk counts of its listed segments), the call's head
-    count, the device's SM count and (a per-architecture rule) its architecture, under the call's ``walk_form`` knob
-    -- decided once per ``(program, walk list)`` of the call's table set and looked up on every later launch
-    (:meth:`_Tables.walk_form`); ``"full"`` with a registry that has no form rule (one record per walk program)."""
+    count, the device's SM count and, for a per-architecture rule, its architecture, under the call's ``walk_form``
+    knob -- decided once per ``(program, walk list)`` of the call's table set and looked up on every later launch
+    (:meth:`_Tables.walk_form`); ``"full"`` with a registry that has no form rule (one record per walk program).
+    The provider's ``walk_form`` is called as ``walk_form(program, chains, num_heads, sm_count, *, knob)``, plus
+    ``arch=`` (the jit's ``device_arch`` of the launch's device) only when ``WALK_FORM_RULES[name]`` is a mapping
+    (a per-architecture rule): a provider whose rules are all strings needs no ``arch`` parameter."""
     jit = getattr(programs, "jit", None)
     rule = getattr(jit, "walk_form", None)
-    if rule is None or name not in getattr(jit, "WALK_FORM_RULES", {}):
+    rules = getattr(jit, "WALK_FORM_RULES", {})
+    if rule is None or name not in rules:
         return "full"
     return call.tb.walk_form(
         name,
@@ -792,7 +796,9 @@ def _walk_form_of(call: Any, programs: Any, name: str, args: dict[str, Any]) -> 
         int(jit.sm_count(call.device.index)),
         str(call.walk_form),
         rule,
-        arch_of=getattr(jit, "device_arch", None),
+        arch_of=getattr(jit, "device_arch", None)
+        if isinstance(rules[name], Mapping)
+        else None,
         device_index=call.device.index,
     )
 
@@ -3442,7 +3448,8 @@ class _Tables:
         """The record form (``"full"`` / ``"split"``) of walk launch ``name`` over the segments ``walk``: the registry's
         rule ``rule`` (``cake_kcp_jit.walk_form``) on the launch's chains (the chunk counts of its listed segments), the
         head count ``H``, the device's SM count, the ``walk_form`` knob and the architecture ``arch_of(device_index)``
-        (passed to the rule where ``arch_of`` is given; read on the first launch of a key only) -- evaluated once per
+        (passed to the rule as ``arch=`` only where ``arch_of`` is given, which :func:`_walk_form_of` does for a
+        per-architecture rule alone; read on the first launch of a key only) -- evaluated once per
         ``(name, walk list, H, SM count, knob, rule, device index)`` of this table set and looked up on every later
         launch.  The rule's inputs are static per
         ``(ctx, H)`` (the walk lists and ``hp.seg_chunk_start`` are this set's, never mutated), so the lookup returns

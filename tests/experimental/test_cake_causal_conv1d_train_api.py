@@ -22,7 +22,7 @@ non-deterministic package with the caller's arguments unchanged when ``determini
 default ``True``, ``None``, ints, strings, tensors) raises ``ValueError`` naming the deterministic entry point before
 anything runs; nothing ever runs the deterministic package, also under ``torch.use_deterministic_algorithms(True)``
 (strict and ``warn_only=True``), where the call reaches the non-deterministic package unchanged and without a
-warning of its own.  The deterministic names take no ``deterministic`` keyword (``TypeError``).  The entry points
+warning of its own.  The deterministic names take no ``deterministic`` keyword (``TypeError``); the deterministic package's names before the det rename are gone.  The entry points
 are marked experimental and mirror the package's signatures; ``import flashinfer`` imports neither module.  The
 opt-in ``bwd_grid_mult`` is refused with the deterministic package's errors.  On a device (once the package is
 rendered): the entry points return the package's bits (``y`` and ``dx`` bitwise the deterministic package's, the
@@ -43,6 +43,7 @@ import warnings
 import pytest
 import torch
 
+import flashinfer
 import flashinfer.cake_causal_conv1d_det_train as det_facade
 import flashinfer.cake_causal_conv1d_det_train_kcp as det_kcp_facade
 import flashinfer.experimental.cake.cake_causal_conv1d_train_kcp as kcp_facade
@@ -560,6 +561,44 @@ def test_deterministic_names_take_no_mode_keyword() -> None:
         assert getattr(kcp_facade, entry) is not getattr(det_kcp_facade, det_name), (
             entry
         )
+
+
+@pytest.mark.cpu_only
+def test_deterministic_names_are_unchanged_and_carry_det() -> None:
+    """Every deterministic name is the deterministic object and carries ``det``; the names the deterministic package
+    had before the det rename are bound nowhere, and the same-spelled non-deterministic names live in these modules
+    only."""
+
+    for name in (
+        "cake_causal_conv1d_det",
+        "cake_causal_conv1d_det_train_forward",
+        "cake_causal_conv1d_det_train_backward",
+        "CakeCausalConv1dDetFunction",
+    ):
+        assert getattr(flashinfer, name) is getattr(det_facade, name), name
+    for name in (
+        "cake_causal_conv1d",
+        "cake_causal_conv1d_train_forward",
+        "cake_causal_conv1d_train_backward",
+        "CakeCausalConv1dFunction",
+        "cake_causal_conv1d_train",
+        "cake_causal_conv1d_train_backend",
+    ):
+        assert not hasattr(flashinfer, name), name
+    for name in (
+        "cake_causal_conv1d_kcp",
+        "cake_causal_conv1d_kcp_multi",
+        "KcpRecomputeHandle",
+    ):
+        assert not hasattr(det_facade, name), name
+        assert not hasattr(det_kcp_facade, name), name
+    for entry in ENTRIES:
+        assert not hasattr(det_facade, entry), entry
+    assert not hasattr(det_facade, "CakeCausalConv1dFunction")
+    assert (
+        det_kcp_facade.cake_causal_conv1d_det_kcp
+        is not kcp_facade.cake_causal_conv1d_kcp
+    )
 
 
 @pytest.mark.cpu_only

@@ -14,9 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Deterministic context-parallel (KCP) packed width-4 depthwise causal convolution + SiLU training
-(SM100 / SM103 / SM107), the Cake backend.  ``flashinfer.cake_causal_conv1d_det_train`` keeps the
-names these entry points had before (``cake_causal_conv1d_kcp``, ``cake_causal_conv1d_kcp_multi``,
-``KcpRecomputeHandle``) as compatibility aliases of the objects defined here.
+(SM100 / SM103 / SM107), the Cake backend.
 
 Every rank convolves its fragments of the packed batch; the first tokens of a fragment that continues a
 document read the history rows of the preceding fragment, exchanged through the halo collective of the

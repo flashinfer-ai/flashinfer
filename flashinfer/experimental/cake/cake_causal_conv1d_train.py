@@ -103,6 +103,13 @@ Name map (deterministic -> this module)::
       cake_causal_conv1d_det_multi_kcp                     cake_causal_conv1d_multi_kcp
       RecomputeHandleDetKcp                                RecomputeHandleKcp
 
+The deterministic package's names before the det rename (the module
+``flashinfer.cake_causal_conv1d_train``, ``flashinfer.cake_causal_conv1d``,
+``flashinfer.cake_causal_conv1d_train_forward`` / ``_backward``,
+``flashinfer.CakeCausalConv1dFunction`` and
+``flashinfer.cake_causal_conv1d_det_train.cake_causal_conv1d_kcp`` /
+``cake_causal_conv1d_kcp_multi`` / ``KcpRecomputeHandle``) are removed.
+
 Usage::
 
     from flashinfer.experimental.cake.cake_causal_conv1d_train import (
