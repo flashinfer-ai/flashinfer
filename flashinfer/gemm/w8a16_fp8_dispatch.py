@@ -603,15 +603,19 @@ def _w8a16_fp8_gemm_sm100(
     k_slice = k // splits
     has_bias = bias is not None
     act_ctype = cutlass.BFloat16 if act.dtype == torch.bfloat16 else cutlass.Float16
+    # Without a bias the stand-in pointer is the scale, which the contract only
+    # promises 4-byte aligned: every spec below declares no more than that (make_ptr
+    # asserts the declared alignment when the kernel compiles).
     bias_tensor = bias if has_bias else weight_scale  # any valid pointer when unused
     bias_ctype = act_ctype if has_bias else cutlass.Float32
+    bias_align = 16 if has_bias else 4
     gemm_out = partials if partials is not None else out
     gemm_out_ctype = cutlass.Float32 if partials is not None else act_ctype
     pointer_specs = (
         (cutlass.Float8E4M3FN, weight.data_ptr(), 16),
         (act_ctype, act.data_ptr(), 16),
         (cutlass.Float32, weight_scale.data_ptr(), 4),
-        (bias_ctype, bias_tensor.data_ptr(), 4),
+        (bias_ctype, bias_tensor.data_ptr(), bias_align),
         (gemm_out_ctype, gemm_out.data_ptr(), 16),
     )
     stream = _raw_stream(act.device)
@@ -636,7 +640,7 @@ def _w8a16_fp8_gemm_sm100(
         reduce_specs = (
             (cutlass.Float32, partials.data_ptr(), 16),
             (cutlass.Float32, weight_scale.data_ptr(), 4),
-            (bias_ctype, bias_tensor.data_ptr(), 16),
+            (bias_ctype, bias_tensor.data_ptr(), bias_align),
             (act_ctype, out.data_ptr(), 16),
         )
         reduce = _get_reduce_kernel(
@@ -1024,13 +1028,15 @@ def _w8a16_fp8_gemm_sm90(
         partials = counters = out
     has_bias = bias is not None
     act_ctype = cutlass.BFloat16 if act.dtype == torch.bfloat16 else cutlass.Float16
+    # Stand-in bias pointer and its declared alignment: see the Blackwell launch.
     bias_tensor = bias if has_bias else weight_scale  # any valid pointer when unused
     bias_ctype = act_ctype if has_bias else cutlass.Float32
+    bias_align = 16 if has_bias else 4
     pointer_specs = (
         (cutlass.Float8E4M3FN, weight.data_ptr(), 16),
         (act_ctype, act.data_ptr(), 16),
         (cutlass.Float32, weight_scale.data_ptr(), 4),
-        (bias_ctype, bias_tensor.data_ptr(), 4),
+        (bias_ctype, bias_tensor.data_ptr(), bias_align),
         (act_ctype, out.data_ptr(), 16),
         (cutlass.Float32, partials.data_ptr(), 16),
         (cutlass.Int64, counters.data_ptr(), 8),

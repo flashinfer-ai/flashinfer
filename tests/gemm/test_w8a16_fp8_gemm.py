@@ -1016,10 +1016,16 @@ def test_w8a16_fp8_gemm_graph_replay_two_graphs():
 
 
 @pytest.mark.parametrize("split", [False, True])
-def test_w8a16_fp8_gemm_scalar_scale_minimally_aligned(split):
+def test_w8a16_fp8_gemm_scalar_scale_minimally_aligned(split, monkeypatch):
     """A legal scale is any one-element fp32 view, so it may be only 4-byte aligned
     (an odd element of a larger buffer); nothing in the launch may declare more for
-    it, with or without a workspace in use."""
+    it, with or without a workspace in use.
+
+    The declared alignments are checked only when a kernel compiles, so the
+    misaligned calls run with both cache layers off (in-process and on-disk): a
+    warm cache from the reference call would hide an over-declaration."""
+    from flashinfer.gemm import w8a16_fp8_dispatch as dispatch
+
     dev = torch.device("cuda")
     if split:
         algo, (m, n, k) = _tail_algo_and_shape(dev)
@@ -1031,8 +1037,10 @@ def test_w8a16_fp8_gemm_scalar_scale_minimally_aligned(split):
     ref = w8a16_fp8_gemm(act, w_fp8, scale, algo=algo)
     buf = torch.zeros(3, device=dev, dtype=torch.float32)
     buf[1] = scale[0]
+    monkeypatch.setenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", "1")
     for view in (buf[1:2], buf[1]):
         assert view.data_ptr() % 16 == 4
+        dispatch._KERNEL_CACHE.clear()
         out = w8a16_fp8_gemm(act, w_fp8, view, algo=algo)
         torch.cuda.synchronize()
         assert torch.equal(out, ref)
