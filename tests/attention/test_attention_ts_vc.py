@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import inspect
 import math
 from dataclasses import dataclass, replace
 
@@ -637,6 +638,42 @@ def test_one_shot_vc_config_requires_the_operands():
                 repair_tiles=repair.repair_tiles,
             ),
         )
+
+
+@pytest.mark.parametrize("enable_pdl", [True, False])
+def test_vc_prepare_compiles_enable_pdl_into_every_pass(monkeypatch, enable_pdl):
+    """enable_pdl is in every pass's cache key and compiled kernel object."""
+    from flashinfer.attention.prims_ts.vc_attention import prepare
+
+    builds = {}
+
+    def record(name, kind, spec, options, compile_fn):
+        builds[kind] = (spec, compile_fn)
+        return compile_fn
+
+    monkeypatch.setattr(prepare, "build_and_load_attention_kernel", record)
+    monkeypatch.setattr(prepare.cute, "compile", lambda kernel, *a, **kw: kernel)
+    # QK8 with repair builds all five passes.
+    prepare._compiled.__wrapped__(
+        torch.bfloat16, False, 1, 1000, 2, 2, 500, 100, enable_pdl
+    )
+    assert set(builds) == {"p1", "p2", "select", "rows", "qk"}
+    for spec, compile_fn in builds.values():
+        assert spec[-1] is enable_pdl
+        assert compile_fn().enable_pdl is enable_pdl
+
+
+def test_vc_quantize_entry_points_take_enable_pdl():
+    for fn in (
+        vc_quantize,
+        vc_quantize_fp8,
+        vc_quantize_repair,
+        VCAttentionPreprocessor.prepare,
+    ):
+        last = list(inspect.signature(fn).parameters.values())[-1]
+        assert last.name == "enable_pdl", fn.__qualname__
+        assert last.kind is inspect.Parameter.KEYWORD_ONLY
+        assert last.default is None
 
 
 @_REQUIRES_CONTEXT_GPU
