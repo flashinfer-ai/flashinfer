@@ -3615,19 +3615,16 @@ kernel_cake_mla_nvfp4_paged_decode_32a47bbfa05aebbc97c5(const __grid_constant__ 
                         _phase_sfa_full_0 ^= 1;
                         _phase_o_empty_0 ^= 1;
                     }
+                    mbarrier_wait(s_empty_addr, _phase_s_empty_0);
+                    mbarrier_wait(o_empty_addr, _phase_o_empty_0);
                 }
             }
         }
     }
 
-    // Kernel teardown ops
-    asm volatile("tcgen05.fence::before_thread_sync;");
-    asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
-    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
-
     // Cleanup
     asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
-    asm volatile("barrier.cluster.arrive.release.aligned;");
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;");
     asm volatile("barrier.cluster.wait.acquire.aligned;");
 
     if (warp == 0) {

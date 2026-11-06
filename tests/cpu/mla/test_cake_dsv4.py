@@ -1331,6 +1331,7 @@ def test_sm107a_registers_the_fp8_decode_route_only():
         "fp8_h64_prefill_source_persistent_m64_multi_tile",
         "fp8_h64_prefill_source_persistent_m64_multi_tile_kv4",
         "fp8_lowhead_prefill",
+        "fp8_lowhead_prefill_overlap",
     }
     for spec in _ARCH_REGISTRATIONS["sm_107a"]["variants"].values():
         assert all(source.startswith("sm_107a/") for source in spec["sources"])
@@ -2925,6 +2926,7 @@ def _run_fake_lowhead_swa_fp8(monkeypatch, *, arch, num_heads, batch_size, q_len
         route: _PERSISTENT_PLAN
         for route in (
             "fp8_lowhead_prefill",
+            "fp8_lowhead_prefill_overlap",
             "fp8_h64_prefill_source_persistent_m64",
             "fp8_h64_prefill_source_persistent_m64_multi_tile",
         )
@@ -5547,3 +5549,237 @@ def test_workspace_requirement_covers_the_split_launch(arch, sm_count):
         == 6_184_448
         == 263168 + 45 * (131072 + 512)
     )
+
+
+# --------------------------------------------------------------------------- #
+# Early-PV sibling: SM107's low-head prefill program up to a row ceiling      #
+# --------------------------------------------------------------------------- #
+
+_LOWHEAD_PREFILL_ROUTE = "fp8_lowhead_prefill"
+_OVERLAP_SIBLING = f"{_LOWHEAD_PREFILL_ROUTE}_overlap"
+_OVERLAP_TOKENS = (1, 12, 48, 61, 62, 63, 64, 65, 72, 80, 104, 108)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+@pytest.mark.parametrize(
+    "sm_count,ceiling", [(216, 64), (212, 62), (208, 61), (264, 64)]
+)
+def test_sm107a_lowhead_launches_take_the_overlap_sibling_up_to_its_ceiling(
+    monkeypatch, arch, sm_count, ceiling
+):
+    """SM107 routes the low-head prefill route's early-PV sibling to a program
+    of its own, with the route's arguments, and runs it on launches of at most
+    64 rows on 216 SMs, a ceiling scaled down with a smaller SM count and kept
+    on a larger one; SM100 and SM103 route the sibling to the route's program
+    and launch the route."""
+    from flashinfer.jit.cake_dsv4 import VARIANTS
+
+    monkeypatch.setattr(cake, "_device_sm_count", lambda device: sm_count)
+    assert {_LOWHEAD_PREFILL_ROUTE} == cake._OVERLAP_SIBLING_ROUTES
+    assert cake._OVERLAP_SIBLING_MAX_TOKENS == {"sm_107a": 64}
+    assert cake._OVERLAP_SIBLING_MEASURED_SMS == {"sm_107a": 216}
+    route, sibling = _LOWHEAD_PREFILL_ROUTE, _OVERLAP_SIBLING
+    own = arch == "sm_107a"
+    assert (VARIANTS[arch][sibling] != VARIANTS[arch][route]) == own
+    assert (
+        get_cake_dsv4_spec(sibling, arch=arch)["arg_plan"]
+        == get_cake_dsv4_spec(route, arch=arch)["arg_plan"]
+    )
+    for tokens in _OVERLAP_TOKENS:
+        expected = sibling if own and tokens <= ceiling else route
+        variant = cake._overlap_variant(
+            route, arch=arch, num_query_tokens=tokens, device=_DEVICE
+        )
+        assert variant == expected, tokens
+    for other in (
+        "fp8_lowhead_one_partition",
+        "fp8_lowhead_h64",
+        "fp8_h128_prefill_source_persistent_uniform",
+        "fp8_h64_prefill_source_persistent_m64",
+        "fp8_h64_prefill_source_persistent_m64_multi_tile",
+    ):
+        variant = cake._overlap_variant(
+            other, arch=arch, num_query_tokens=12, device=_DEVICE
+        )
+        assert variant == other
+
+
+@pytest.mark.cpu_only
+def test_overlap_variant_needs_a_sibling_program_of_its_own(monkeypatch):
+    """A launch takes the early-PV sibling only where its architecture routes
+    the sibling to a program other than the route's: a table without the
+    sibling, one that routes it to the route's program and one of another
+    architecture run the route; an architecture without a ceiling never reads
+    the device's SM count."""
+    import flashinfer.jit.cake_dsv4 as jit
+
+    monkeypatch.setattr(cake, "_device_sm_count", lambda device: 216)
+    route, sibling = _LOWHEAD_PREFILL_ROUTE, _OVERLAP_SIBLING
+    low_head, early_pv = "cake_dsv4_low_head", "cake_dsv4_early_pv"
+    for table, expected in (
+        ({"sm_107a": {route: low_head, sibling: early_pv}}, sibling),
+        ({"sm_107a": {route: low_head}}, route),
+        ({"sm_107a": {route: low_head, sibling: low_head}}, route),
+        ({"sm_103a": {route: low_head, sibling: early_pv}}, route),
+    ):
+        monkeypatch.setattr(jit, "VARIANTS", table)
+        variant = cake._overlap_variant(
+            route, arch="sm_107a", num_query_tokens=12, device=_DEVICE
+        )
+        assert variant == expected
+
+    def no_sm_count(device):
+        raise AssertionError("read the SM count")
+
+    monkeypatch.setattr(cake, "_device_sm_count", no_sm_count)
+    for arch in ("sm_100a", "sm_103a"):
+        variant = cake._overlap_variant(
+            route, arch=arch, num_query_tokens=12, device=_DEVICE
+        )
+        assert variant == route
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+@pytest.mark.parametrize("tokens", [12, 64, 65, 108])
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_fp8_lowhead_prefill_launch_takes_the_overlap_sibling(
+    monkeypatch, arch, tokens, enable_pdl
+):
+    """A low-head prefill launch on 216 SMs runs one CTA per work item over
+    two items per row with ``partials(1)``; SM107 runs it on the early-PV
+    sibling up to 64 rows and on the route's program above, with either PDL
+    switch."""
+    monkeypatch.setattr(cake, "_device_sm_count", lambda device: _SM107_SM_COUNT)
+    L = _RecordingLauncher(
+        arch,
+        Q=torch.empty(0),
+        num_query_tokens=tokens,
+        num_heads=64,
+        sparse_topk=128,
+        max_q_len=4,
+        enable_pdl=enable_pdl,
+    )
+    cake._dispatch_route(_LOWHEAD_PREFILL_ROUTE, L)
+    program = (
+        _OVERLAP_SIBLING
+        if arch == "sm_107a" and tokens <= 64
+        else _LOWHEAD_PREFILL_ROUTE
+    )
+    work = {"grid": (2 * tokens, 1, 1), "total_work_items": 2 * tokens}
+    assert L.calls == [(program, {**work, **L.partials(1)})]
+
+
+@pytest.mark.cpu_only
+def test_sm107a_units_define_and_launch_their_own_program():
+    """Every sm_107a program's kernel unit defines ``kernel_<program>`` and its
+    binding names and launches that kernel; the early-PV sibling is a program
+    of its own whose binding launches it with the dynamic shared memory of the
+    route's program, in the standard mode."""
+    import re
+
+    from flashinfer.jit.cake_dsv4 import MODULES, VARIANTS, _get_csrc_dir
+
+    csrc_dir = _get_csrc_dir()
+    smem = {}
+    for program in sorted(set(VARIANTS["sm_107a"].values())):
+        kernel_unit = f"sm_107a/{program}_kernel.cu"
+        binding_unit = f"sm_107a/{program}_binding.cu"
+        assert {kernel_unit, binding_unit} <= set(MODULES[program]["sources"])
+        kernel = (csrc_dir / kernel_unit).read_text(encoding="utf-8")
+        binding = (csrc_dir / binding_unit).read_text(encoding="utf-8")
+        assert f"kernel_{program}(" in kernel, program
+        assert f'KERNEL_NAME = "kernel_{program}";' in binding, program
+        launched = re.findall(
+            r"reinterpret_cast<const void\*>\((kernel_\w+)\)", binding
+        )
+        assert launched and set(launched) == {f"kernel_{program}"}, program
+        smem[program] = re.findall(r"config\.dynamicSmemBytes = (\d+);", binding)
+    route = VARIANTS["sm_107a"][_LOWHEAD_PREFILL_ROUTE]
+    sibling = VARIANTS["sm_107a"][_OVERLAP_SIBLING]
+    assert sibling != route
+    assert smem[sibling] == smem[route] == ["205952"]
+    binding = (csrc_dir / f"sm_107a/{sibling}_binding.cu").read_text(encoding="utf-8")
+    assert "cudaSharedMemoryModeAllowOversizedSharedMemory" not in binding
+
+
+@pytest.mark.cpu_only
+def test_sm107a_one_wave_lowhead_swa_rows_launch_the_overlap_sibling(monkeypatch):
+    """A dense 64-head SWA-only call of one wave (30 x 2 = 60 rows on 216 SMs)
+    runs the early-PV sibling on SM107 with the route's launch: two CTAs per
+    row, ``seq_lens`` in place of the never-read offsets and the route's
+    output phase."""
+    program, bound, seq_lens, out = _run_fake_lowhead_swa_fp8(
+        monkeypatch, arch="sm_107a", num_heads=64, batch_size=30, q_len=2
+    )
+    assert program == _OVERLAP_SIBLING
+    assert (bound["grid_x"], bound["grid_y"], bound["grid_z"]) == (120, 1, 1)
+    assert bound["total_work_items"] == 120 and bound["num_query_tokens"] == 60
+    assert bound["cum_seq_lens_q"].data_ptr() == seq_lens.data_ptr()
+    assert bound["O"].data_ptr() == out.data_ptr()
+    assert out.data_ptr() % 4096 == 0x800
+
+
+@pytest.mark.cpu_only
+def test_sm107a_lowhead_row_tiles_pick_their_program_per_launch(monkeypatch):
+    """A 100-row FP8 64-head SWA-only call on SM107 (216 SMs) whose workspace
+    holds 70 rows runs two launches: the first 70 rows on the route's program
+    (above the 64-row ceiling) and the last 30 on the early-PV sibling, each
+    with two CTAs and two work items per row."""
+    route, sibling = _LOWHEAD_PREFILL_ROUTE, _OVERLAP_SIBLING
+    recorder = _install_fake_variants(
+        monkeypatch, {route: _PERSISTENT_PLAN, sibling: _PERSISTENT_PLAN}
+    )
+    seen = []
+
+    def module(variant, **kwargs):
+        seen.append(variant)
+        return recorder
+
+    monkeypatch.setattr(cake, "_variant_module", module)
+    monkeypatch.setattr(cake, "_target_arch", lambda device: "sm_107a")
+    monkeypatch.setattr(cake, "_device_sm_count", lambda device: _SM107_SM_COUNT)
+    batch_size, q_len, num_heads = 25, 4, 64
+    rows = batch_size * q_len
+    plan = cake._route_plan(
+        route, num_query_tokens=rows, num_heads=num_heads, sparse_topk=128
+    )
+    workspace_bytes = cake._launch_workspace_bytes(plan, 70, num_heads, batch_size + 1)
+    assert (
+        cake._rows_per_launch(
+            plan,
+            num_query_tokens=rows,
+            num_heads=num_heads,
+            batch_size=batch_size,
+            workspace_bytes=workspace_bytes,
+        )
+        == 70
+    )
+    table, lens = _combined_metadata(rows, 0)
+    cake.run_cake_dsv4(
+        query=torch.zeros((rows, num_heads, 512), dtype=torch.float8_e4m3fn),
+        swa_kv_cache=torch.zeros((4, 1, 256, 512), dtype=torch.float8_e4m3fn),
+        compressed_kv_cache=torch.zeros((4, 1, 256, 512), dtype=torch.float8_e4m3fn),
+        workspace_buffer=_aligned_u8(workspace_bytes),
+        out=None,
+        bmm1_scale=0.5,
+        bmm2_scale=1.0,
+        sinks=None,
+        max_q_len=q_len,
+        cum_seq_lens_q=None,
+        seq_lens=torch.full((batch_size,), 1000, dtype=torch.int32),
+        backend="cake",
+        sparse_indices=table,
+        sparse_topk_lens=lens,
+    )
+    names = [name for _, name in _PERSISTENT_PLAN]
+    launches = [
+        (variant, bound["grid_x"], bound["total_work_items"], bound["num_query_tokens"])
+        for variant, bound in zip(
+            seen,
+            (dict(zip(names, call, strict=True)) for call in recorder.calls),
+            strict=True,
+        )
+    ]
+    assert launches == [(route, 140, 140, 70), (sibling, 60, 60, 30)]
