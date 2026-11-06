@@ -15,17 +15,16 @@ limitations under the License.
 
 flashinfer public-API tests of the deterministic Cake MoE grouped GEMM module.
 
-The experimental entry points of the module ``flashinfer.cake_moe_grouped_gemm_det_train``
+The entry points of the module ``flashinfer.cake_moe_grouped_gemm_det_train``
 (``cake_moe_grouped_gemm_det_train_{forward,dgrad,wgrad}``, the
 ``cake_moe_grouped_gemm_det_train_prepare_*`` builders and the autograd entry
-``cake_moe_grouped_gemm_det``) and the stable entry point
+``cake_moe_grouped_gemm_det``) and the entry point
 ``flashinfer.grouped_mm.grouped_mm_bf16(..., backend="cake")`` hand off to the backend
 package ``flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train``.  This suite
-covers the module's entry points on CPU -- the experimental-API marking, the signatures
-and docstrings they share with the package functions, the two types resolved from the
-package, the once-only ``ExperimentalWarning`` that the package functions never emit,
-and the deferred import that keeps the package out of ``import`` of the module -- and
-checks the stable route on a GPU against the per-group fp64 reference (including the
+covers the module's entry points on CPU -- stable APIs with no experimental marking and
+no warning, the signatures and docstrings they share with the package functions, the
+two types resolved from the package, the support query, and the deferred import that
+keeps the package out of ``import`` of the module -- and checks the stable route on a GPU against the per-group fp64 reference (including the
 rows past ``m_indptr[-1]``, which belong to no group) and against the options the Cake
 backend does not take, and that a non-reentrant checkpoint of the module's
 ``cake_moe_grouped_gemm_det`` with early stop on skips the recomputed forward GEMM.
@@ -70,7 +69,7 @@ ATOL = RTOL = 1e-2  # bf16 outputs
 RAGGED_E4 = [300, 0, 1, 700]
 RAGGED_E6 = [1, 257, 511, 4099, 0, 33]
 
-# The experimental entry points of flashinfer.cake_moe_grouped_gemm_det_train; the package
+# The entry points of flashinfer.cake_moe_grouped_gemm_det_train; the package
 # functions they hand off to carry the same names.
 ENTRY_POINTS = (
     "cake_moe_grouped_gemm_det_train_forward",
@@ -96,8 +95,8 @@ LAZY_TYPES = {
 def _run_cpu_subprocess(code):
     """Run ``code`` in a fresh interpreter with no visible GPU; its last stdout line.
 
-    A subprocess keeps the once-only warning flags and the set of imported
-    modules independent of whatever this test session has already done.
+    A subprocess keeps the warning state and the set of imported modules
+    independent of whatever this test session has already done.
     """
     proc = subprocess.run(
         [sys.executable, "-c", code],
@@ -112,23 +111,21 @@ def _run_cpu_subprocess(code):
     return proc.stdout.strip().splitlines()[-1]
 
 
-def test_facade_entry_points_are_the_experimental_api():
-    """``flashinfer.cake_moe_grouped_gemm_det_train.<name>`` is the experimental API
-    of the package function of the same name: marked with the feature
-    ``cake_moe_grouped_gemm_det_train.<name>``, carrying the package function's
-    signature and its docstring behind the experimental banner, and listed in the
-    module's ``__all__``; the package function itself is unmarked.  The two types
-    of the module are the package's classes, resolved on first access."""
+def test_facade_entry_points_are_stable_handoffs():
+    """``flashinfer.cake_moe_grouped_gemm_det_train.<name>`` is a stable FlashInfer
+    API (``@flashinfer_api``; no experimental marking) with the signature and the
+    docstring of the package function of the same name, and is listed in the
+    module's ``__all__``.  The two types of the module are the package's classes,
+    resolved on first access."""
+    assert "flashinfer_experimental_api" not in Path(facade.__file__).read_text()
     for name in ENTRY_POINTS:
         entry, impl = getattr(facade, name), getattr(pkg, name)
         assert name in facade.__all__, name
-        assert entry.is_experimental is True, name
-        assert (
-            entry.experimental_feature == f"cake_moe_grouped_gemm_det_train.{name}"
-        ), name
+        assert entry is not impl, name
+        assert not getattr(entry, "is_experimental", False), name
+        assert not hasattr(entry, "experimental_feature"), name
         assert inspect.signature(entry) == inspect.signature(impl), name
-        assert entry.__doc__.startswith(".. warning::"), name
-        assert entry.__doc__.endswith(impl.__doc__), name
+        assert entry.__doc__ == impl.__doc__, name
         assert not hasattr(impl, "is_experimental"), name
     for name, submodule in LAZY_TYPES.items():
         assert name in facade.__all__ and name in dir(facade), name
@@ -136,12 +133,11 @@ def test_facade_entry_points_are_the_experimental_api():
         assert getattr(facade, name) is getattr(module, name) is getattr(pkg, name)
 
 
-_WARN_ONCE = """
+_NO_WARNING = """
 import warnings
 
 import torch
 
-import flashinfer.api_logging as api_logging
 import flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train as pkg
 import flashinfer.cake_moe_grouped_gemm_det_train as facade
 
@@ -191,22 +187,19 @@ for name in pkg.__all__:  # load the submodules outside the recorded calls
 
 for name, args in operands.items():
     entry, impl = getattr(facade, name), getattr(pkg, name)
-    [w] = warnings_of(entry, args)  # first call: exactly one warning
-    assert w.category is api_logging.ExperimentalWarning, (name, w.category)
-    message = str(w.message)
-    assert f"'cake_moe_grouped_gemm_det_train.{name}' is an experimental" in message, message
-    assert warnings_of(entry, args) == [], name  # second call: silent
-    assert warnings_of(impl, args) == [], name  # the package function: never
+    for fn in (entry, entry, impl):  # the first call, a second call, the package
+        rec = warnings_of(fn, args)
+        assert rec == [], (name, [f"{w.category.__name__}: {w.message}" for w in rec])
 print("OK")
 """
 
 
-def test_facade_entry_points_warn_once_and_the_package_functions_do_not():
-    """Each entry point emits ``flashinfer.api_logging.ExperimentalWarning`` once,
-    on its first call, before the handoff raises the host-side ``ValueError`` of
-    CPU operands; a second call is silent, and the package functions never warn.
-    Runs in a subprocess so the once-only flags do not depend on test order."""
-    assert _run_cpu_subprocess(_WARN_ONCE) == "OK"
+def test_facade_entry_points_do_not_warn():
+    """Each entry point hands CPU operands to the package function, which raises the
+    host-side ``ValueError``, with no warning: no ``ExperimentalWarning`` on the
+    first call or later, and none from the package function.  Runs in a fresh
+    interpreter, so each call there is the first of its entry point."""
+    assert _run_cpu_subprocess(_NO_WARNING) == "OK"
 
 
 def test_importing_the_facade_does_not_import_the_package():
@@ -253,7 +246,7 @@ def test_support_query_is_false_off_cuda():
     query = facade.is_cake_moe_grouped_gemm_det_train_supported
     for device in ("cpu", torch.device("cpu"), "meta"):
         assert query(device) is False, device
-    assert not hasattr(query, "is_experimental")
+    assert not getattr(query, "is_experimental", False)
     assert "is_cake_moe_grouped_gemm_det_train_supported" in facade.__all__
     assert list(inspect.signature(query).parameters) == ["device"]
     assert inspect.signature(query).parameters["device"].default is None
@@ -297,12 +290,10 @@ def test_det_wrapper_refuses_a_mode_argument(entry, value):
         else facade.cake_moe_grouped_gemm_det
     )
     x, w, offs = _cpu_operands()
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")  # the facade entry's ExperimentalWarning
-        with pytest.raises(TypeError, match="deterministic"):
-            fn(x, w, offs, deterministic=value)
-        with pytest.raises(TypeError):
-            fn(x, w, offs, value)
+    with pytest.raises(TypeError, match="deterministic"):
+        fn(x, w, offs, deterministic=value)
+    with pytest.raises(TypeError):
+        fn(x, w, offs, value)
 
 
 @pytest.mark.parametrize("op", ["forward", "dgrad"])

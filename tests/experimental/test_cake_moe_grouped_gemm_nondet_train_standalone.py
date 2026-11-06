@@ -18,11 +18,10 @@ Standalone-import tests of the non-deterministic Cake MoE grouped GEMM package.
 A copy of ``flashinfer/experimental/cake/cake_moe_grouped_gemm_nondet_train`` must import and
 reach its host-side checks on its own: under another top-level name, in a
 ``python -I`` subprocess with ``flashinfer`` blocked (the form of a vendoring
-gate).  The package imports only itself, ``torch`` and ``tvm_ffi``; the
-experimental-API marking and the once-only warnings belong to the facade
-``flashinfer.cake_moe_grouped_gemm_nondet_train`` (covered by
-``test_cake_moe_grouped_gemm_nondet_train_api.py``), so a direct call of the package emits
-no warning, and the only ``flashinfer`` import is the JIT fallback of
+gate).  The package imports only itself, ``torch`` and ``tvm_ffi``: the API
+logging wrappers belong to the module ``flashinfer.cake_moe_grouped_gemm_nondet_train``
+(covered by ``test_cake_moe_grouped_gemm_nondet_train_api.py``), a direct call of the
+package emits no warning, and the only ``flashinfer`` import is the JIT fallback of
 ``cake_build.py``.  CPU-only: no GPU, no generated program and no JIT build is
 needed, so every test here runs on every lane.
 """
@@ -106,7 +105,7 @@ for name in (
     "cake_moe_grouped_gemm_nondet_train_wgrad",
     "cake_moe_grouped_gemm_nondet",
 ):
-    # plain functions: the experimental marking belongs to the module's entry points
+    # plain functions: no API marking
     assert not hasattr(getattr(pkg, name), "is_experimental"), name
 
 

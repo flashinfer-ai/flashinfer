@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Benchmark the experimental ragged BF16 MoE grouped GEMM on SM100/SM103/SM107.
+"""Benchmark the deterministic ragged BF16 MoE grouped GEMM on SM100/SM103/SM107.
 
 The 58 MoE projection rows of the design: gate/up (N=4096, K=6144) and down
 (N=6144, K=2048) projections, E=4 with balanced / skewed / one-empty group

@@ -22,7 +22,8 @@ raises ``TypeError`` before anything runs), nothing routes to the deterministic
 module, and under ``torch.use_deterministic_algorithms(True)`` PyTorch's
 non-determinism alert is raised immediately before an order-varying launch only (the
 weight gradient whose 512-wide k tile splits its tail).  This suite covers on CPU the
-experimental-API marking and signatures of the module, its handoff (with the package
+stable-API status (no experimental marking, no warning) and signatures of the module,
+the support query, its handoff (with the package
 functions replaced by recorders and the deterministic ones by tripwires), the refusal
 of a stale mode argument, its deferred imports, and the alert contract of prepared
 launches (with recorded launches standing in for the programs: an order-varying one
@@ -182,25 +183,23 @@ def _tripwires(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_facade_entry_points_are_the_experimental_api():
-    """``flashinfer.cake_moe_grouped_gemm_nondet_train.<name>`` is the experimental API
-    of the package function of the same name: marked with the feature
-    ``cake_moe_grouped_gemm_nondet_train.<name>``, carrying the package function's
-    signature (no ``deterministic`` parameter) and its docstring behind the
-    experimental banner, and listed in the module's ``__all__``; the package function
-    itself is unmarked.  The two types of the module are the package's classes,
-    resolved on first access."""
+def test_facade_entry_points_are_stable_handoffs():
+    """``flashinfer.cake_moe_grouped_gemm_nondet_train.<name>`` is a stable
+    FlashInfer API (``@flashinfer_api``; no experimental marking) with the signature
+    (no ``deterministic`` parameter) and the docstring of the package function of the
+    same name, and is listed in the module's ``__all__``.  The two types of the module
+    are the package's classes, resolved on first access."""
+    assert "flashinfer_experimental_api" not in Path(facade.__file__).read_text()
     for name in ENTRY_POINTS:
         entry, impl = getattr(facade, name), _package_function(name)
         assert name in facade.__all__, name
-        assert getattr(pkg, name) is impl, name
-        assert entry.is_experimental is True, name
-        assert entry.experimental_feature == f"{PREFIX}.{name}", name
+        assert getattr(pkg, name) is impl and entry is not impl, name
+        assert not getattr(entry, "is_experimental", False), name
+        assert not hasattr(entry, "experimental_feature"), name
         signature = inspect.signature(entry)
         assert signature == inspect.signature(impl), name
         assert "deterministic" not in signature.parameters, name
-        assert entry.__doc__.startswith(".. warning::"), name
-        assert entry.__doc__.endswith(impl.__doc__), name
+        assert entry.__doc__ == impl.__doc__, name
         assert not hasattr(impl, "is_experimental"), name
     for name, submodule in LAZY_TYPES.items():
         assert name in facade.__all__ and name in dir(facade), name
@@ -285,12 +284,11 @@ def test_stale_positional_mode_is_a_type_error(via, value, monkeypatch):
     assert log == []
 
 
-_WARN_ONCE = """
+_NO_WARNING = """
 import warnings
 
 import torch
 
-import flashinfer.api_logging as api_logging
 import flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train as pkg
 import flashinfer.cake_moe_grouped_gemm_nondet_train as facade
 
@@ -333,22 +331,19 @@ for name in pkg.__all__:  # load the submodules outside the recorded calls
 
 for name, args in operands.items():
     entry, impl = getattr(facade, name), getattr(pkg, name)
-    [w] = warnings_of(entry, args)  # first call: exactly one warning
-    assert w.category is api_logging.ExperimentalWarning, (name, w.category)
-    message = str(w.message)
-    assert f"'{prefix}.{name}' is an experimental" in message, message
-    assert warnings_of(entry, args) == [], name  # second call: silent
-    assert warnings_of(impl, args) == [], name  # the package function: never
+    for fn in (entry, entry, impl):  # the first call, a second call, the package
+        rec = warnings_of(fn, args)
+        assert rec == [], (name, [f"{w.category.__name__}: {w.message}" for w in rec])
 print("OK")
 """
 
 
-def test_facade_entry_points_warn_once_and_the_package_functions_do_not():
-    """Each entry point emits ``flashinfer.api_logging.ExperimentalWarning`` once, on
-    its first call, before the handoff raises the host-side ``ValueError`` of CPU
-    operands; a second call is silent, and the package functions never warn.  Runs in
-    a subprocess so the once-only flags do not depend on test order."""
-    assert _run_cpu_subprocess(_WARN_ONCE) == "OK"
+def test_facade_entry_points_do_not_warn():
+    """Each entry point hands CPU operands to the package function, which raises the
+    host-side ``ValueError``, with no warning: no ``ExperimentalWarning`` on the
+    first call or later, and none from the package function.  Runs in a fresh
+    interpreter, so each call there is the first of its entry point."""
+    assert _run_cpu_subprocess(_NO_WARNING) == "OK"
 
 
 def test_importing_the_facade_imports_neither_package():
@@ -392,7 +387,7 @@ def test_support_query_is_false_off_cuda():
     query = facade.is_cake_moe_grouped_gemm_nondet_train_supported
     for device in ("cpu", torch.device("cpu"), "meta"):
         assert query(device) is False, device
-    assert not hasattr(query, "is_experimental")
+    assert not getattr(query, "is_experimental", False)
     assert "is_cake_moe_grouped_gemm_nondet_train_supported" in facade.__all__
     assert list(inspect.signature(query).parameters) == ["device"]
     assert inspect.signature(query).parameters["device"].default is None

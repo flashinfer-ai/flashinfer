@@ -16,8 +16,8 @@ limitations under the License.
 Cake ragged BF16 MoE grouped GEMM (SM100 / SM103 / SM107), non-deterministic
 training module.
 
-The functions of this module carry the experimental-API marking and hand off
-to the backend package
+The functions of this module are stable FlashInfer APIs (``@flashinfer_api``;
+no experimental marking) and hand off to the backend package
 :mod:`flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train` with the
 same arguments: the weight gradient with the 512-wide k tile adds its split
 tail (the tiles of its last partial wave, cut into k-step units over the
@@ -104,7 +104,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
-from .api_logging import flashinfer_experimental_api
+from .api_logging import flashinfer_api
 
 if TYPE_CHECKING:
     from .experimental.cake.cake_moe_grouped_gemm_nondet_train.cake_autograd import (
@@ -130,9 +130,7 @@ __all__ = [
 _PACKAGE = "flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train"
 
 
-@flashinfer_experimental_api(
-    feature="cake_moe_grouped_gemm_nondet_train.cake_moe_grouped_gemm_nondet_train_forward"
-)
+@flashinfer_api
 def cake_moe_grouped_gemm_nondet_train_forward(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -174,9 +172,7 @@ def cake_moe_grouped_gemm_nondet_train_forward(
     return _impl(x, w, offs, out=out)
 
 
-@flashinfer_experimental_api(
-    feature="cake_moe_grouped_gemm_nondet_train.cake_moe_grouped_gemm_nondet_train_dgrad"
-)
+@flashinfer_api
 def cake_moe_grouped_gemm_nondet_train_dgrad(
     g: torch.Tensor,
     w: torch.Tensor,
@@ -201,9 +197,7 @@ def cake_moe_grouped_gemm_nondet_train_dgrad(
     return _impl(g, w, offs, out=out)
 
 
-@flashinfer_experimental_api(
-    feature="cake_moe_grouped_gemm_nondet_train.cake_moe_grouped_gemm_nondet_train_wgrad"
-)
+@flashinfer_api
 def cake_moe_grouped_gemm_nondet_train_wgrad(
     g: torch.Tensor,
     x: torch.Tensor,
@@ -253,9 +247,7 @@ def cake_moe_grouped_gemm_nondet_train_wgrad(
     )
 
 
-@flashinfer_experimental_api(
-    feature="cake_moe_grouped_gemm_nondet_train.cake_moe_grouped_gemm_nondet_train_prepare_forward"
-)
+@flashinfer_api
 def cake_moe_grouped_gemm_nondet_train_prepare_forward(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -279,9 +271,7 @@ def cake_moe_grouped_gemm_nondet_train_prepare_forward(
     return _impl(x, w, offs, out=out)
 
 
-@flashinfer_experimental_api(
-    feature="cake_moe_grouped_gemm_nondet_train.cake_moe_grouped_gemm_nondet_train_prepare_dgrad"
-)
+@flashinfer_api
 def cake_moe_grouped_gemm_nondet_train_prepare_dgrad(
     g: torch.Tensor,
     w: torch.Tensor,
@@ -306,9 +296,7 @@ def cake_moe_grouped_gemm_nondet_train_prepare_dgrad(
     return _impl(g, w, offs, out=out)
 
 
-@flashinfer_experimental_api(
-    feature="cake_moe_grouped_gemm_nondet_train.cake_moe_grouped_gemm_nondet_train_prepare_wgrad"
-)
+@flashinfer_api
 def cake_moe_grouped_gemm_nondet_train_prepare_wgrad(
     g: torch.Tensor,
     x: torch.Tensor,
@@ -366,9 +354,7 @@ def cake_moe_grouped_gemm_nondet_train_prepare_wgrad(
     )
 
 
-@flashinfer_experimental_api(
-    feature="cake_moe_grouped_gemm_nondet_train.cake_moe_grouped_gemm_nondet"
-)
+@flashinfer_api
 def cake_moe_grouped_gemm_nondet(
     x: torch.Tensor,
     w: torch.Tensor,

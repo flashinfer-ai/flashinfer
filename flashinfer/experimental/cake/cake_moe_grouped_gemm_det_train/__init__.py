@@ -25,11 +25,10 @@ limitations under the License.
 # bf16 buffer (``accumulate=True``; the autograd wrapper's
 # ``fuse_wgrad_accumulation`` adds into ``w.main_grad``).
 #
-# The public (experimental) entry points are the functions of the top-level
-# module ``flashinfer.cake_moe_grouped_gemm_det_train`` and the stable API
-# ``flashinfer.grouped_mm.grouped_mm_bf16(..., backend="cake")``: they carry the
-# experimental-API marking and the once-only warnings and hand off to the plain
-# functions of this package, which have the same names.  The package holds
+# The public entry points are the functions of the top-level module
+# ``flashinfer.cake_moe_grouped_gemm_det_train`` (stable APIs) and
+# ``flashinfer.grouped_mm.grouped_mm_bf16(..., backend="cake")``: they hand off
+# to the plain functions of this package, which have the same names.  The package holds
 # those plain functions (the three one-shot helpers below, which prepare and
 # launch in one call), the ``torch.autograd`` wrapper
 # ``cake_moe_grouped_gemm_det`` / ``CakeMoEGroupedGemmDetFunction`` of

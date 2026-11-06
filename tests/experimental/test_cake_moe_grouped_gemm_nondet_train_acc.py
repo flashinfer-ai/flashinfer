@@ -1095,8 +1095,7 @@ def test_facade_accumulate_rows_take_no_mode_keyword(value, monkeypatch):
         ),
     )
     for mode in (contextlib.nullcontext(), base._torch_deterministic()):
-        with mode, warnings.catch_warnings():
-            warnings.simplefilter("ignore")  # the facade's ExperimentalWarning
+        with mode:
             for call in calls:
                 with pytest.raises(TypeError, match="deterministic"):
                     call()

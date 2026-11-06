@@ -51,8 +51,7 @@ PUBLIC = {
     "CakeMoEGroupedGemmDetLaunch": "cake_backend",
 }
 SUPPORT = f"is_{MODULE}_supported"
-# The mode as a word of a snake_case or a CamelCase name.
-MODE_WORD = re.compile(r"(?:^|_)det(?:_|$)|(?:^|[a-z])Det(?:[A-Z]|$)")
+MODE = "det"  # the mode token of every public name
 
 # The import paths of this family before #8928 and before its deterministic-family
 # rename (no alias module).
@@ -113,6 +112,15 @@ FORMER_HELPER_KEYS = (
 
 def _module(name):
     return importlib.import_module(name)
+
+
+def _tokens(name):
+    """The lower-case tokens of a snake_case or CamelCase name (``nondet`` is one
+    token, so it does not count as ``det``)."""
+    words = []
+    for part in name.split("_"):
+        words += re.findall(r"[A-Z]+(?=[A-Z][a-z]|\d|$)|[A-Z]?[a-z]+|\d+|[A-Z]+", part)
+    return [word.lower() for word in words]
 
 
 def _public_objects():
@@ -179,11 +187,12 @@ def test_the_public_names():
 
 def test_every_public_name_carries_the_mode():
     """Every name of the module's and the package's ``__all__`` but an ALL_CAPS
-    constant carries the mode word ``det`` (``Det`` in a class name)."""
+    constant has the token ``det`` (``Det`` in a class name)."""
+    assert _tokens("CakeMoEGroupedGemmNondetFunction")[-2:] == ["nondet", "function"]
     for where, name, _ in _public_objects():
         if name.isupper():
             continue
-        assert MODE_WORD.search(name), (where, name)
+        assert MODE in _tokens(name), (where, name, _tokens(name))
 
 
 def _callables():
@@ -205,16 +214,19 @@ def _callables():
 
 
 def test_no_callable_takes_a_deterministic_argument():
-    """No public callable has a ``deterministic`` parameter or a catch-all
-    ``**kwargs`` that would swallow one; the autograd function's ``forward`` takes
-    the operands, the internal deferred-launch slot and the fuse flag only."""
+    """No public callable binds ``deterministic=False``: no ``deterministic``
+    parameter and no catch-all ``**kwargs`` that would swallow one.  The autograd
+    function's ``forward`` takes the operands, the internal deferred-launch slot and
+    the fuse flag only."""
     found = _callables()
     labels = {label.rpartition(".")[2] for label, _ in found}
     assert {"forward", "backward", "launch"} <= labels, labels
     for label, fn in found:
-        parameters = inspect.signature(fn).parameters
-        assert "deterministic" not in parameters, label
-        kinds = {p.kind for p in parameters.values()}
+        signature = inspect.signature(fn)
+        with pytest.raises(TypeError):
+            signature.bind_partial(deterministic=False)
+        assert "deterministic" not in signature.parameters, label
+        kinds = {p.kind for p in signature.parameters.values()}
         assert inspect.Parameter.VAR_KEYWORD not in kinds, label
     function = _module(f"{PACKAGE}.cake_autograd").CakeMoEGroupedGemmDetFunction
     assert list(inspect.signature(function.forward).parameters) == [
@@ -231,7 +243,7 @@ def test_no_callable_takes_a_deterministic_argument():
 def test_the_objects_are_named_after_themselves(name):
     """Each object's ``__name__`` and ``__qualname__`` are its public name, it is
     defined in the backend submodule that the package resolves it from, and the
-    module's function of the same name (a thin experimental wrapper) carries the same
+    module's function of the same name (a thin stable wrapper) carries the same
     names and is defined in the module; the module's types are the package's."""
     submodule = PUBLIC[name]
     where = f"{PACKAGE}.{submodule}" if submodule else PACKAGE

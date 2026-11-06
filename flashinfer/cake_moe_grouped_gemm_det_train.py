@@ -15,11 +15,11 @@ one raises ``TypeError``), and ``torch.use_deterministic_algorithms(True)``
 changes nothing here (no alert, no warning).  The non-deterministic module is
 :mod:`flashinfer.cake_moe_grouped_gemm_nondet_train`.
 
-Thin experimental entry points, per ``flashinfer/experimental/README.md``: each
-function below carries the signature and the documentation of its namesake in
-the backend package
-:mod:`flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train`, adds the
-experimental-API marking and hands off to it.  The prepared launch and the
+Each function below is a stable FlashInfer API (``@flashinfer_api``; no
+experimental marking): it carries the signature and the documentation of its
+namesake in the backend package
+:mod:`flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train` and hands
+off to it with the same arguments.  The prepared launch and the
 ``torch.autograd.Function`` resolve from the package on first access.  Every
 function imports the package inside its body (a deferred import), so importing
 this module loads none of it.  :func:`is_cake_moe_grouped_gemm_det_train_supported`
@@ -43,7 +43,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
-from .api_logging import flashinfer_experimental_api
+from .api_logging import flashinfer_api
 
 if TYPE_CHECKING:
     from .experimental.cake.cake_moe_grouped_gemm_det_train.cake_autograd import (
@@ -69,9 +69,7 @@ __all__ = [
 _PACKAGE = "flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train"
 
 
-@flashinfer_experimental_api(
-    feature="cake_moe_grouped_gemm_det_train.cake_moe_grouped_gemm_det_train_forward"
-)
+@flashinfer_api
 def cake_moe_grouped_gemm_det_train_forward(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -111,9 +109,7 @@ def cake_moe_grouped_gemm_det_train_forward(
     return _impl(x, w, offs, out=out)
 
 
-@flashinfer_experimental_api(
-    feature="cake_moe_grouped_gemm_det_train.cake_moe_grouped_gemm_det_train_dgrad"
-)
+@flashinfer_api
 def cake_moe_grouped_gemm_det_train_dgrad(
     g: torch.Tensor,
     w: torch.Tensor,
@@ -134,9 +130,7 @@ def cake_moe_grouped_gemm_det_train_dgrad(
     return _impl(g, w, offs, out=out)
 
 
-@flashinfer_experimental_api(
-    feature="cake_moe_grouped_gemm_det_train.cake_moe_grouped_gemm_det_train_wgrad"
-)
+@flashinfer_api
 def cake_moe_grouped_gemm_det_train_wgrad(
     g: torch.Tensor,
     x: torch.Tensor,
@@ -186,9 +180,7 @@ def cake_moe_grouped_gemm_det_train_wgrad(
     )
 
 
-@flashinfer_experimental_api(
-    feature="cake_moe_grouped_gemm_det_train.cake_moe_grouped_gemm_det_train_prepare_forward"
-)
+@flashinfer_api
 def cake_moe_grouped_gemm_det_train_prepare_forward(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -211,9 +203,7 @@ def cake_moe_grouped_gemm_det_train_prepare_forward(
     return _impl(x, w, offs, out=out)
 
 
-@flashinfer_experimental_api(
-    feature="cake_moe_grouped_gemm_det_train.cake_moe_grouped_gemm_det_train_prepare_dgrad"
-)
+@flashinfer_api
 def cake_moe_grouped_gemm_det_train_prepare_dgrad(
     g: torch.Tensor,
     w: torch.Tensor,
@@ -236,9 +226,7 @@ def cake_moe_grouped_gemm_det_train_prepare_dgrad(
     return _impl(g, w, offs, out=out)
 
 
-@flashinfer_experimental_api(
-    feature="cake_moe_grouped_gemm_det_train.cake_moe_grouped_gemm_det_train_prepare_wgrad"
-)
+@flashinfer_api
 def cake_moe_grouped_gemm_det_train_prepare_wgrad(
     g: torch.Tensor,
     x: torch.Tensor,
@@ -290,9 +278,7 @@ def cake_moe_grouped_gemm_det_train_prepare_wgrad(
     )
 
 
-@flashinfer_experimental_api(
-    feature="cake_moe_grouped_gemm_det_train.cake_moe_grouped_gemm_det"
-)
+@flashinfer_api
 def cake_moe_grouped_gemm_det(
     x: torch.Tensor,
     w: torch.Tensor,

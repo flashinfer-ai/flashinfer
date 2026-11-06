@@ -38,10 +38,10 @@ limitations under the License.
 # runs); the fixed-order launches (forward, activation gradient, the 256-wide k
 # tile and an unsplit tail) never alert.
 #
-# The public (experimental) entry points are the functions of the top-level
-# module ``flashinfer.cake_moe_grouped_gemm_nondet_train``, which take the same
-# arguments, carry the experimental-API marking and the once-only warnings and
-# hand off to the plain functions of this package, which have the same names.
+# The public entry points are the functions of the top-level module
+# ``flashinfer.cake_moe_grouped_gemm_nondet_train`` (stable APIs), which take the
+# same arguments and hand off to the plain functions of this package, which have
+# the same names.
 # The package holds those plain functions (the three one-shot helpers below,
 # which prepare and launch in one call), the ``torch.autograd`` wrapper
 # ``cake_moe_grouped_gemm_nondet`` / ``CakeMoEGroupedGemmNondetFunction`` of
