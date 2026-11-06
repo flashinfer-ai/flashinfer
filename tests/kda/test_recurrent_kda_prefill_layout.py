@@ -173,10 +173,8 @@ def test_prefill_strided_qkv_capture_reads_changed_inputs(
 ):
     device = torch.device("cuda")
     capability = get_compute_capability(device)
-    if capability not in ((10, 0), (10, 3)) and not (
-        capability == (12, 0) and layout in ("transposed", "misaligned")
-    ):
-        pytest.skip("requires SM100/SM103, or SM120 for Q/K packing")
+    if capability not in ((10, 0), (10, 3)):
+        pytest.skip("requires SM100/SM103 KDA prefill")
     values = _strict_prefill_kwargs(
         _make_inputs(
             seq_lens=(33, 65) if packed else (33, 33),

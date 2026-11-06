@@ -612,6 +612,8 @@ def _is_contiguous_cuda_tensor(
 
 def _supports_strided_qkv(tensor: torch.Tensor) -> bool:
     """Layout contract for rank-4 BF16 Q/K/V after shape validation."""
+    if tensor.is_contiguous():
+        return tensor.data_ptr() % 16 == 0
     return (
         tensor.stride()[-2:] == (tensor.shape[-1], 1)
         and tensor.stride(1) >= tensor.shape[2] * tensor.shape[3]
