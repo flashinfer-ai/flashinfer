@@ -4230,6 +4230,105 @@ def test_recompute_handle_byte_queries(W) -> None:
     ) == kp.kda_det_saved_bytes_kcp(ctx, save_transfer=kp.SAVE_TRANSFER_DEFAULT)
 
 
+# --------------------------------------------------------------------------- the non-deterministic package's objects
+
+SAVED_MODE_RE = (
+    r"saved: a \S+\.SavedDetKcp \(the deterministic KCP forward\) is required, got {}; a saved set of the "
+    r"non-deterministic package \(deterministic=False\) is read by that package's backward"
+)
+WORKSPACE_MODE_RE = (
+    r"workspace: a \S+\.WorkspaceDetKcp is required, got {}\.WorkspaceKcp; a workspace of the non-deterministic "
+    r"package \(deterministic=False\) serves that package's calls only"
+)
+
+
+def test_backward_refuses_the_other_modes_saved_set_and_workspace() -> None:
+    """Host only: :func:`chunk_kda_det_bwd_kcp` refuses a saved set that is not a ``SavedDetKcp`` -- the
+    non-deterministic package's ``SavedKcp`` (the same version, members and metadata) or any other object -- and a
+    workspace of the non-deterministic package with ``ValueError`` naming the mode, before it reads an option, a graph
+    key, an operand or a tensor (the operands here are placeholders); ``_call_workspace`` (the workspace check of
+    every entry point) refuses that workspace alike and keeps ``TypeError`` for any other object.  The
+    non-deterministic package's backward refuses this package's saved set in the same way."""
+    nd_kcp = cake_package("cake_kda_train_kcp", "cake_kcp")
+    t = torch.zeros(1)
+    meta = dict(
+        version=cake_kcp.KCP_SAVED_VERSION, T_r=1, H=1, n_frag=1, P=1, Hg=1, scale=0.5, save_mode="light",
+        save_transfer=False, offset_class="fla", exchange="a2a", precision_mode=0,
+    )  # fmt: skip
+    nd_saved = nd_kcp.SavedKcp(S_in=t, c1_recv=None, M_seg=None, ctx=None, **meta)
+    saved = cake_kcp.SavedDetKcp(S_in=t, c1_recv=None, M_seg=None, ctx=None, **meta)
+    assert nd_kcp.KCP_SAVED_VERSION == cake_kcp.KCP_SAVED_VERSION
+    assert nd_saved.meta() == saved.meta() and nd_saved.flags() == saved.flags()
+    nd_ws = nd_kcp.WorkspaceKcp()
+    ops = (t, t, t, t, t, object(), t)
+    for graph in ("off", "replay"):
+        for bad, name in (
+            (nd_saved, f"{nd_kcp.__name__}.SavedKcp"),
+            (object(), "builtins.object"),
+        ):
+            with pytest.raises(ValueError, match=SAVED_MODE_RE.format(name)):
+                cake_kcp.chunk_kda_det_bwd_kcp(*ops, saved=bad, graph=graph)
+        for kw in ({"saved": saved}, {}):
+            with pytest.raises(
+                ValueError, match=WORKSPACE_MODE_RE.format(nd_kcp.__name__)
+            ):
+                cake_kcp.chunk_kda_det_bwd_kcp(*ops, workspace=nd_ws, graph=graph, **kw)
+    backend = types.SimpleNamespace(dtypes={"state": torch.float32})
+    with pytest.raises(ValueError, match=WORKSPACE_MODE_RE.format(nd_kcp.__name__)):
+        cake_kcp._call_workspace(nd_ws, backend, "light", "g", False, "cpu")
+    with pytest.raises(TypeError, match="workspace must be a WorkspaceDetKcp"):
+        cake_kcp._call_workspace(object(), backend, "light", "g", False, "cpu")
+    with pytest.raises(ValueError, match="a saved set of the deterministic package"):
+        nd_kcp.chunk_kda_bwd_kcp(*ops, saved=saved, deterministic=False)
+
+
+def test_gpu_backward_refuses_the_other_modes_saved_set_and_workspace(device) -> None:
+    """One rank: a real forward of the non-deterministic package (``deterministic=False``) on this package's context
+    writes a ``SavedKcp`` of the same version and context and fills a ``WorkspaceKcp``.  This package's backward
+    refuses either (saved and replay mode, eager and graph replay) with ``ValueError`` naming the mode, its forward
+    and autograd entry refuse that workspace alike; nothing completes (no launch inventory), and the backward on
+    this package's own saved set and workspace afterwards is bitwise the one before."""
+    nd_kcp = cake_package("cake_kda_train_kcp", "cake_kcp")
+    ctx, ops = _ckpt_problem(device, (300, 724, 476), 2)
+    args = [ops[n] for n in ("q", "k", "v", "g", "beta")]
+    nd_ws = nd_kcp.WorkspaceKcp()
+    _, nd_saved = nd_kcp.chunk_kda_fwd_kcp(
+        *args, ctx, workspace=nd_ws, deterministic=False
+    )
+    assert isinstance(nd_saved, nd_kcp.SavedKcp) and nd_saved.ctx is ctx
+    assert nd_saved.version == cake_kcp.KCP_SAVED_VERSION
+    ws = cake_kcp.WorkspaceDetKcp()
+    _, saved = cake_kcp.chunk_kda_det_fwd_kcp(*args, ctx, workspace=ws)
+
+    def bwd(**kw):
+        return cake_kcp.chunk_kda_det_bwd_kcp(*args, ctx, ops["dout"], **kw)
+
+    ref = bwd(saved=saved, workspace=ws)
+    saved_re = SAVED_MODE_RE.format(f"{nd_kcp.__name__}.SavedKcp")
+    ws_re = WORKSPACE_MODE_RE.format(nd_kcp.__name__)
+    cake_kcp.LAST_CALL.clear()
+    try:
+        for graph in ("off", "replay"):
+            for kw, match in (
+                ({"saved": nd_saved, "workspace": ws}, saved_re),
+                ({"saved": nd_saved}, saved_re),
+                ({"saved": saved, "workspace": nd_ws}, ws_re),
+                ({"workspace": nd_ws}, ws_re),
+            ):
+                with pytest.raises(ValueError, match=match):
+                    bwd(graph=graph, **kw)
+            with pytest.raises(ValueError, match=ws_re):
+                cake_kcp.chunk_kda_det_fwd_kcp(*args, ctx, workspace=nd_ws, graph=graph)
+            leaves = [x.detach().clone().requires_grad_(True) for x in args]
+            with pytest.raises(ValueError, match=ws_re):
+                cake_kcp.chunk_kda_det_kcp(*leaves, ctx, workspace=nd_ws, graph=graph)
+        assert cake_kcp.LAST_CALL == {}, "a refused call completed"
+    finally:  # a cached graph entry would pin ws / ctx
+        cake_kcp.graph_cache_clear()
+    again = bwd(saved=saved, workspace=ws)
+    assert all(torch.equal(a, b) for a, b in zip(again, ref, strict=True))
+
+
 # --------------------------------------------------------------------------- FP64 fake backend (`-k fake`)
 
 

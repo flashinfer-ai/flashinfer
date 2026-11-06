@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Benchmark the selectable-mode ragged BF16 MoE grouped GEMM on SM100/SM103/SM107.
+"""Benchmark the non-deterministic ragged BF16 MoE grouped GEMM on SM100/SM103/SM107.
 
 The 58 MoE projection rows of the deterministic package's benchmark: gate/up
 (N=4096, K=6144) and down (N=6144, K=2048) projections, E=4 with balanced /
@@ -72,17 +72,22 @@ fp32 ``main_grad``, with Megatron's ``grad_added_to_main_grad`` placeholder),
 (``mgX`` with ``zero_out_wgrad``), ``accX`` (the same into a bf16
 ``main_grad``: the composed route, a bf16 ``dW`` and the same-dtype add),
 ``det_acc`` (the deterministic package: its fp32 ``dW`` into a temporary, then
-``main_grad.add_``, the facade's deterministic ``accumulate=True`` route; in
+``main_grad.add_``, the deterministic weight gradient composed with the add; in
 the step and the backward, through a Function running the deterministic
-forward, data gradient and weight gradient) and ``det_mgB`` (the
+forward, data gradient and weight gradient), ``det_mgB`` (the
 deterministic autograd wrapper's bf16 ``w.grad``, then the fp32
 ``main_grad.add_``; the deterministic bf16 ``dW`` and the add in
-``wgrad_acc``).  The peak memory includes the placeholder gradient and every
-temporary.  A fused arm records ``plan["accumulate"]`` and, where the device
-serves an accumulate build of its dtype, fails unless the row is fused
+``wgrad_acc``) and ``det_mgX`` (the deterministic package's own accumulate:
+``cake_grouped_det_mm(..., fuse_wgrad_accumulation=True)`` into the fp32
+``main_grad`` with the ``grad_added_to_main_grad`` placeholder;
+``prepare_grouped_det_gemm_wgrad(..., accumulate=True)`` in ``wgrad_acc``).
+The peak memory includes the placeholder gradient and every temporary.  A
+fused arm records ``plan["accumulate"]`` and, where the device serves an
+accumulate build of its dtype, fails unless the row is fused
 (``--allow-composed`` turns that into a note).  The JSON's ``acc_ratios``
 holds ``mgX/mgF``, ``mgX/mgB``, ``mgX/mgO``, ``mgX/det_acc``,
-``mgX/det_mgB``, ``accX/acc`` and ``mgF/mgO``.  The non-Cake baselines of
+``mgX/det_mgB``, ``accX/acc``, ``mgF/mgO``, ``det_mgX/det_acc``,
+``det_mgX/det_mgB`` and ``mgX/det_mgX``.  The non-Cake baselines of
 the accumulation rows (Transformer Engine, ``torch._grouped_mm``, per-expert
 cuBLAS) are not arms of this benchmark.
 
@@ -90,7 +95,7 @@ Usage::
 
     python benchmarks/bench_cake_moe_grouped_gemm.py [--ops fwd,wgrad,step] [--rows e4_m112576] [--arms cake_det,cake] [--cupti] [--json out.json]
     python benchmarks/bench_cake_moe_grouped_gemm.py --ops step,step_es,block,block_es --arms cake_det,cake,cake_inforward,torch_grouped_mm [--census]
-    python benchmarks/bench_cake_moe_grouped_gemm.py --ops acc,bwd_acc,wgrad_acc --arms ovw,acc,mgB,mgF,mgO,mgX,mgXn,mgX_zero,accX,det_acc,det_mgB
+    python benchmarks/bench_cake_moe_grouped_gemm.py --ops acc,bwd_acc,wgrad_acc --arms ovw,acc,mgB,mgF,mgO,mgX,mgXn,mgX_zero,accX,det_acc,det_mgB,det_mgX
 """
 
 import argparse
@@ -168,9 +173,10 @@ ACC_ARMS = (
     "accX",
     "det_acc",
     "det_mgB",
+    "det_mgX",
 )
-# The deterministic-package baselines of the accumulation rows.
-DET_ACC_ARMS = ("det_acc", "det_mgB")
+# The deterministic-package arms of the accumulation rows.
+DET_ACC_ARMS = ("det_acc", "det_mgB", "det_mgX")
 # The arms that add with the package's accumulate mode, and the dtype of their main_grad.
 FUSED_ARMS = {
     "mgX": torch.float32,
@@ -186,6 +192,9 @@ ACC_RATIOS = (
     ("mgX", "det_mgB"),
     ("accX", "acc"),
     ("mgF", "mgO"),
+    ("det_mgX", "det_acc"),
+    ("det_mgX", "det_mgB"),
+    ("mgX", "det_mgX"),
 )
 DTYPE_NAMES = {torch.bfloat16: "bfloat16", torch.float32: "float32"}
 MIB = float(1 << 20)
@@ -653,9 +662,9 @@ def _acc_autograd(arm, t, op):
     w = t["w"].detach().requires_grad_(True)
     g, offs = t["g"], t["offs"]
     main_grad = t["main_grad16" if arm == "accX" else "main_grad32"]
-    if arm in ("mgF", "mgO", "det_acc") or arm in FUSED_ARMS:
+    if arm in ("mgF", "mgO", "det_acc", "det_mgX") or arm in FUSED_ARMS:
         w.main_grad = main_grad
-    if arm in ("mgX", "mgX_zero", "accX"):
+    if arm in ("mgX", "mgX_zero", "accX", "det_mgX"):
         w.grad_added_to_main_grad = False
         w.zero_out_wgrad = arm == "mgX_zero"
     if arm in ("ovw", "acc", "mgB"):
@@ -667,6 +676,11 @@ def _acc_autograd(arm, t, op):
 
         def mm(a, b, o):
             return cake_grouped_det_mm(a, b, o)
+
+    elif arm == "det_mgX":
+
+        def mm(a, b, o):
+            return cake_grouped_det_mm(a, b, o, fuse_wgrad_accumulation=True)
 
     elif arm in ("mgF", "mgO", "det_acc"):
 
@@ -719,8 +733,14 @@ def _acc_wgrad(arm, t):
         raise NotImplementedError(
             "the placeholder-gradient arms have autograd rows only"
         )
+    if arm == "det_mgX":
+        # The deterministic package's accumulate: its fp32 dW into the launch's scratch,
+        # then the add.
+        return det_cb.prepare_grouped_det_gemm_wgrad(
+            g, x, offs, out=mg32, accumulate=True
+        ).launch
     if arm in DET_ACC_ARMS:
-        # The deterministic package's dW (fp32: the facade's deterministic accumulate route; bf16:
+        # The deterministic package's dW (fp32: the composed deterministic accumulate; bf16:
         # Megatron's unfused path) into a temporary, then the fp32 add into main_grad.
         dtype = torch.float32 if arm == "det_acc" else torch.bfloat16
         tmp = torch.empty(mg32.shape, dtype=dtype, device=mg32.device)

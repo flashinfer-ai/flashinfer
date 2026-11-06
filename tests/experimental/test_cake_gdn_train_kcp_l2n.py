@@ -1216,7 +1216,7 @@ def test_option_keyword_and_override_rule() -> None:
         p = params["use_qk_l2norm_in_kernel"]
         assert p.kind == p.KEYWORD_ONLY and p.default is False, fn
         assert not any("rstd" in n for n in params), fn
-    # the mode-dispatching facade forwards the option through its keyword arguments to the routed package
+    # the facade forwards the option through its keyword arguments to the package
     for fn in (
         facade.chunk_gdn_kcp,
         facade.chunk_gdn_fwd_kcp,
@@ -1554,8 +1554,8 @@ def test_no_fla_import() -> None:
 
 def test_facade_nondeterministic_route_runs_the_norm() -> None:
     """The ``flashinfer.cake_gdn_train_kcp`` facade with ``deterministic=False`` hands ``use_qk_l2norm_in_kernel``
-    (keyword, mapping or either route's options instance) to this package, which runs the norm: bitwise the package's
-    own call; ``False`` is the norm-off route."""
+    (keyword, mapping, this package's or the deterministic package's options instance) to this package, which runs the
+    norm: bitwise the package's own call; ``False`` is the norm-off route."""
     facade = importlib.import_module("flashinfer.cake_gdn_train_kcp")
     det_options = importlib.import_module(
         "flashinfer.experimental.cake_gdn_det_train_kcp.cake_options"
@@ -1593,20 +1593,22 @@ def test_facade_nondeterministic_route_runs_the_norm() -> None:
     assert kcp.LAST_CALL["fwd"]["qk_l2norm"] is False
 
 
-def test_facade_byte_queries_take_the_option_on_both_routes() -> None:
-    """The facade's byte queries forward ``use_qk_l2norm_in_kernel`` on both routes; the non-deterministic package's
-    norm terms equal the deterministic package's (same plan inputs, same formulas)."""
+def test_facade_byte_queries_take_the_option() -> None:
+    """The facade's byte queries forward ``use_qk_l2norm_in_kernel`` to this package; its norm terms equal those of the
+    deterministic package's own queries (``flashinfer.cake_gdn_det_train_kcp``; same plan inputs, same formulas)."""
     facade = importlib.import_module("flashinfer.cake_gdn_train_kcp")
+    det_facade = importlib.import_module("flashinfer.cake_gdn_det_train_kcp")
     ctx, _ops_ = _setup()
     H_qk, HV = 2, 6
     for query in ("gdn_saved_bytes_kcp", "gdn_workspace_bytes_kcp"):
         q = getattr(facade, query)
+        det_q = getattr(det_facade, query.replace("gdn_", "gdn_det_", 1))
         on = q(ctx, H_qk=H_qk, HV=HV, deterministic=False, use_qk_l2norm_in_kernel=True)
         off = q(
             ctx, H_qk=H_qk, HV=HV, deterministic=False, use_qk_l2norm_in_kernel=False
         )
-        det_on = q(ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=True)
-        det_off = q(ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=False)
+        det_on = det_q(ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=True)
+        det_off = det_q(ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=False)
         assert on > off and det_on > det_off, query
         assert on - off == det_on - det_off, query
     assert (
