@@ -234,7 +234,7 @@ def _fresh_registry(monkeypatch):
 
 def cake_kda_nondet(*args, **kwargs):
     """The package's autograd entry with the mode it requires."""
-    return cake_backend.cake_kda_nondet(*args, deterministic=False, **kwargs)
+    return cake_backend.cake_kda_nondet(*args, **kwargs)
 
 
 def _bits_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
@@ -656,7 +656,6 @@ def test_the_kept_forward_w_is_the_tape_wy_w(
         backward=True,
         save_mode="tape",
         launcher=launcher,
-        deterministic=False,
     )
     cake_backend._bwd_call(
         *ops,
@@ -760,7 +759,7 @@ def test_the_handoff_backward_launches_the_tape_path_with_the_light_prep(
             intra_grids.append((name, tuple(grid)))
         cake_jit.run_module(name, values, grid=grid, device_index=device_index)
 
-    ws = CakeKDANondetWorkspace(p, device, backward=True, launcher=recording, deterministic=False)
+    ws = CakeKDANondetWorkspace(p, device, backward=True, launcher=recording)
     cu = inputs["cu_seqlens"]
     fwd = _expected_fwd(p)
     recompute = _expected_fwd(p, intra=p.handoff_twin if with_rows else None)
@@ -1446,7 +1445,7 @@ def test_a_row_record_falls_back_to_a_tape_record_where_the_rule_refuses_it(
         monkeypatch.setattr(cake_jit, "load", load)
     workspace = None
     if case == "caller_workspace":
-        workspace = CakeKDANondetWorkspace(p, device, backward=True, deterministic=False)
+        workspace = CakeKDANondetWorkspace(p, device, backward=True)
     runs: list[tuple[str, str | None]] = []
     real_run = CakeKDANondetWorkspace.run
 
@@ -1767,9 +1766,9 @@ def test_chunk_kda_passes_the_mode_to_the_node(monkeypatch) -> None:
     monkeypatch.setattr(cake_backend, "CakeKDANondetFunction", Spy)
     ops = [torch.zeros(1) for _ in range(6)]
     monkeypatch.setenv(ENV, "on")
-    cake_backend.cake_kda_nondet(*ops, deterministic=False)
+    cake_backend.cake_kda_nondet(*ops)
     with torch.no_grad():
-        cake_backend.cake_kda_nondet(*ops, checkpoint_handoff="on", deterministic=False)
+        cake_backend.cake_kda_nondet(*ops, checkpoint_handoff="on")
     assert seen == ["on", "off"], seen
 
 

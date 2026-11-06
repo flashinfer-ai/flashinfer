@@ -2798,7 +2798,7 @@ def test_graph_knob_is_gated_and_validated(monkeypatch) -> None:
     for (
         bad_call
     ) in (  # the keyword is validated on the caller's frame, before any device work
-        lambda: cake_kcp.cake_kda_nondet_kcp(*t, ctx, graph="capture", deterministic=False),
+        lambda: cake_kcp.cake_kda_nondet_kcp(*t, ctx, graph="capture"),
         lambda: cake_kcp.cake_kda_nondet_train_kcp_forward(
             *t, ctx, graph="capture", deterministic=False
         ),
@@ -3700,7 +3700,6 @@ def _ckpt_pass(
             ws,
             **kw,
             **opts,
-            deterministic=False,
         )
         outs.append(y.detach().clone())
         return y * w_
@@ -3779,7 +3778,6 @@ def test_gpu_recompute_handle_is_bitwise_and_exchange_free(
         ctx,
         ops["dout"],
         saved=saved_e,
-        deterministic=False,
     )
     explicit = dict(
         zip(("out", "dq", "dk", "dv", "dbeta", "dg"), (out_e, *grads_e), strict=True)
@@ -4029,7 +4027,6 @@ def test_gpu_recompute_handle_misuse_raises(device, monkeypatch) -> None:
             ctx,
             boundary_mode="replay",
             recompute_handle=fresh,
-            deterministic=False,
         )
     with pytest.raises(ValueError, match="needs recompute_handle"):
         cake_kcp.cake_kda_nondet_kcp(
@@ -4050,7 +4047,6 @@ def test_gpu_recompute_handle_misuse_raises(device, monkeypatch) -> None:
             ctx,
             recompute_handle=fresh,
             _kcp_test_knobs={"graph": "replay"},
-            deterministic=False,
         )
     graph = torch.cuda.CUDAGraph()
     with pytest.raises(ValueError, match="capture"), torch.cuda.graph(graph):
@@ -4145,9 +4141,8 @@ def test_gpu_recompute_handle_misuse_raises(device, monkeypatch) -> None:
             beta,
             ctx,
             recompute_handle=cake_kcp.CakeKDANondetKcpRecomputeHandle(),
-            deterministic=False,
         )
-    cake_kcp.cake_kda_nondet_kcp(q, k, v, g, beta, ctx, deterministic=False)
+    cake_kcp.cake_kda_nondet_kcp(q, k, v, g, beta, ctx)
 
 
 def test_recompute_handle_object_phase_rules_and_options(monkeypatch) -> None:
@@ -4525,7 +4520,6 @@ def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap, walk_form) 
             saved=saved,
             workspace=ws,
             **kw,
-            deterministic=False,
         )
         rec_b = dict(cake_kcp.LAST_CALL["bwd"])
         return (
@@ -4666,7 +4660,6 @@ def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap, walk_form) 
             workspace=ws,
             graph="replay",
             **knobs,
-            deterministic=False,
         )
         assert cake_kcp.LAST_CALL["fwd"]["graph_event"] == "eager" and torch.equal(
             out2, ref[0]
@@ -6755,7 +6748,6 @@ def test_gpu_first_training_step_releases_the_forward_arena(device, graph) -> No
             saved=saved,
             workspace=ws,
             graph=graph,
-            deterministic=False,
         )
         assert cake_kcp.LAST_CALL["bwd"].get("spec3") is None, (
             "the default backward ran the SPEC-3 probe"
@@ -6884,7 +6876,6 @@ def test_gpu_forward_only_layout_is_bitwise_and_lean(device) -> None:
                 dout,
                 saved=saved,
                 workspace=ws,
-                deterministic=False,
             )
 
         # the reference: a backward workspace (the forward on the existing backend's fwd views of its arena)
@@ -6979,7 +6970,7 @@ def test_gpu_forward_only_layout_is_bitwise_and_lean(device) -> None:
         assert same(written_tensors(saved_0), written_tensors(saved_b)), row
         assert same(bwd(None, saved_0), grads_b), row
         leaves = [t.detach().clone().requires_grad_(True) for t in (q, k, v, g, beta)]
-        out_a = cake_kcp.cake_kda_nondet_kcp(*leaves, ctx, deterministic=False)
+        out_a = cake_kcp.cake_kda_nondet_kcp(*leaves, ctx)
         out_a.backward(dout)
         dq, dk, dv, dbeta, dg = grads_b
         assert torch.equal(out_a.detach(), out_b), row
@@ -7071,7 +7062,6 @@ def test_gpu_graph_replay_on_the_forward_only_layout_then_backward(device) -> No
             saved=saved,
             workspace=ws,
             graph="replay",
-            deterministic=False,
         )
         assert same(grads, grads_r)
         assert ws.local.backward and ws.local.fwd_layout == "fwd"
@@ -7094,7 +7084,6 @@ def test_gpu_graph_replay_on_the_forward_only_layout_then_backward(device) -> No
                 saved=saved,
                 workspace=ws,
                 graph="replay",
-                deterministic=False,
             )
             events.append(
                 (
@@ -7244,7 +7233,6 @@ def test_gpu_against_the_deterministic_package(device, lengths, H) -> None:
             ops["dout"],
             saved=saved if saved_mode else None,
             workspace=ws,
-            deterministic=False,
         )
         return dict(zip(names, (out, *grads), strict=True))
 

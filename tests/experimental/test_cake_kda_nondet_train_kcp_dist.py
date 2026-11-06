@@ -207,7 +207,6 @@ def _run_rank(rank: int, W: int, row, rdzv: str | None, result_dir: str | None) 
             saved=saved,
             workspace=ws,
             **bwd_opts,
-            deterministic=False,
         )
         return {"out": out, "dq": dq, "dk": dk, "dv": dv, "dg": dg, "dbeta": dbeta}
 
@@ -289,7 +288,6 @@ def _run_rank(rank: int, W: int, row, rdzv: str | None, result_dir: str | None) 
         ctx,
         workspace=ws_n,
         save_for_backward=False,
-        deterministic=False,
     )
     pred_f = cake_kcp_plan.cake_kda_nondet_train_kcp_workspace_bytes(ctx, H=H, backward=False)
     lazy_f = cake_kcp_plan.kcp_arena_layout(ctx, H=H, backward=False)["lazy"]
@@ -322,7 +320,6 @@ def _run_rank(rank: int, W: int, row, rdzv: str | None, result_dir: str | None) 
         ctx,
         workspace=ws_t,
         save_for_backward=False,
-        deterministic=False,
     )
     fwd_only_bytes = (
         fwd_only_bytes and ws_t.bytes == pred_t + lay_t["lazy"] == pred_f + lazy_f
@@ -364,7 +361,7 @@ def _run_rank(rank: int, W: int, row, rdzv: str | None, result_dir: str | None) 
     )
     del ws_f, ws_n, ws_t, out_b, saved_b, out_f, saved_f, out_n, out_t, res_fwd_only
     leaves = [x.detach().clone().requires_grad_(True) for x in (q, k, v, g, beta)]
-    out_0 = cake_kcp.cake_kda_nondet_kcp(*leaves, ctx, deterministic=False)
+    out_0 = cake_kcp.cake_kda_nondet_kcp(*leaves, ctx)
     out_0.backward(dout)
     ws_none_eq = torch.equal(out_0.detach(), res["out"]) and all(
         torch.equal(lf.grad, res[f"d{n}"])
@@ -704,7 +701,6 @@ def _run_upload_rank(
             saved=saved,
             workspace=ws,
             **bwd_opts,
-            deterministic=False,
         )
         return [out, *grads]
 
@@ -1348,7 +1344,6 @@ def _run_rank_ckpt(
                 workspace=ws,
                 recompute_handle=h_,
                 **kw,
-                deterministic=False,
             )
             outs.append(y.detach().clone())
             return y
@@ -1644,7 +1639,6 @@ def _run_rank_ckpt(
                     workspace=_w,
                     recompute_handle=h_,
                     checkpoint_keep=_k,
-                    deterministic=False,
                 )
 
             for step in ("warm", "measure"):
@@ -1736,7 +1730,6 @@ def _run_rank_ckpt(
             ctx,
             workspace=ws,
             recompute_handle=hq,
-            deterministic=False,
         )
         l_outs.append(y.detach().clone())
         return y * w_  # the product's backward reads the (recomputed) KDA out
@@ -1819,7 +1812,6 @@ def _run_rank_ckpt(
             ctx,
             workspace=ws,
             recompute_handle=h,
-            deterministic=False,
         )
         l_outs.append(y.detach().clone())
         return y * w_

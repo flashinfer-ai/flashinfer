@@ -218,10 +218,10 @@ def test_single_rank_layouts_keep_their_bytes() -> None:
     ):
         with pytest.raises(ValueError):
             cake_backend.CakeKDANondetWorkspace(
-                p, "cpu", layouts=((LEAN, 4),), deterministic=False, **bad
+                p, "cpu", layouts=((LEAN, 4),), **bad
             )
     with pytest.raises(ValueError):
-        cake_backend.CakeKDANondetWorkspace(p, "cpu", layouts=(), deterministic=False)
+        cake_backend.CakeKDANondetWorkspace(p, "cpu", layouts=())
 
 
 def test_single_rank_workspace_refuses_its_lean_modes_in_layouts() -> None:
@@ -695,7 +695,7 @@ def test_lean_passes_knob_bytes_on_the_host() -> None:
             )
             prev = got
             print(f"LEAN_PASSES_HOST H={H} b={b} bytes={got} replay={replay}")
-        assert fi_kcp.cake_kda_nondet_train_kcp_workspace_bytes(ctx, H=H, deterministic=False) == replay
+        assert fi_kcp.cake_kda_nondet_train_kcp_workspace_bytes(ctx, H=H) == replay
         # no effect off the lean arena's rows: forward-only workspaces
         assert _lean(
             ctx=ctx, H=H, backward=False, lean_passes=1
@@ -745,7 +745,7 @@ def test_gpu_single_rank_workspace_views_and_route_layouts(device) -> None:
             cake_backend.CakeKDANondetArena(lean=True),
             cake_backend.CakeKDANondetArena(tail_passes=4),
         ):
-            ws = cake_backend.CakeKDANondetWorkspace(p, device, arena=option, deterministic=False)
+            ws = cake_backend.CakeKDANondetWorkspace(p, device, arena=option)
             assert ws.layout_passes == {}
             assert ws.bytes == p.arena_bytes(backward=True, arena=option)
             if option is None:
@@ -766,7 +766,6 @@ def test_gpu_single_rank_workspace_views_and_route_layouts(device) -> None:
                 device,
                 fwd_layout="fwd_kcp",
                 layouts=(("fwd_kcp", 1), (LEAN, b)),
-                deterministic=False,
             )
             assert ws.layout_passes == {"fwd_kcp": 1, LEAN: b}
             assert (

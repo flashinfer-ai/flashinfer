@@ -221,7 +221,7 @@ def test_package_entries_raise_no_alert_under_torch_deterministic_mode(
             "error"
         )  # a warning (the warn-only alert) would surface as the raised exception
         with pytest.raises(Exception) as info:  # noqa: B017 - the stand-in operands' error, never the alert
-            _package_call(entry, deterministic=False)
+            _package_call(entry)
     message = str(info.value)
     assert "use_deterministic_algorithms" not in message, message
     assert "is the non-deterministic" not in message, message
@@ -280,7 +280,7 @@ def test_a_saved_set_is_read_by_its_own_packages_backward_only() -> None:
     nd_saved = kcp.CakeKDANondetKcpSaved(**_saved_kwargs(kcp))
     for bad in (det_saved, object()):
         with pytest.raises(ValueError, match="CakeKDANondetKcpSaved .*is required"):
-            _package_call("cake_kda_nondet_train_kcp_backward", saved=bad, deterministic=False)
+            _package_call("cake_kda_nondet_train_kcp_backward", saved=bad)
     t = torch.zeros(1)
     for kw in ({}, {"deterministic": True}):
         with pytest.raises(
@@ -346,7 +346,7 @@ def test_facade_routes_by_mode(monkeypatch) -> None:
                 entry
             )  # the deterministic package takes no mode
         seen.clear()
-        assert call(deterministic=False) == f"nd:{entry}", entry
+        assert call() == f"nd:{entry}", entry
         if entry in COMPUTE_ENTRIES:
             assert seen[-1][1]["deterministic"] is False, entry
         else:
@@ -371,7 +371,7 @@ def test_facade_under_torch_deterministic_mode_takes_the_deterministic_package_a
         warnings.simplefilter("always")
         for _ in range(2):
             for entry, call in calls.items():
-                assert call(deterministic=False) == f"det:{FACADE_DET_NAMES[entry]}", (
+                assert call() == f"det:{FACADE_DET_NAMES[entry]}", (
                     entry
                 )
                 assert "deterministic" not in seen[-1][1], entry
@@ -425,7 +425,7 @@ def test_facade_converts_a_partition_of_the_other_package(
     ``torch.use_deterministic_algorithms(True)`` and a ``deterministic=False`` context call builds the deterministic
     context and warns once."""
     plan, det_plan = _mod("cake_kcp_plan"), _det("cake_kcp_plan")
-    nd_part = kcp_api.cake_kda_nondet_train_kcp_partition(MODE_CU, 2, "zigzag", deterministic=False)
+    nd_part = kcp_api.cake_kda_nondet_train_kcp_partition(MODE_CU, 2, "zigzag")
     det_part = kcp_api.cake_kda_nondet_train_kcp_partition(MODE_CU, 2, "zigzag")
     for det, part, own, fragment in (
         (True, nd_part, det_plan.CakeKDADetKcpPartition, det_plan.CakeKDADetKcpFragment),
@@ -550,12 +550,12 @@ def test_package_entries_take_the_raw_gate_keywords(entry) -> None:
     with pytest.raises(TypeError, match="unexpected keyword"):
         kcp._options({"use_gate_in_kernel": True})
     with pytest.raises(Exception) as info:  # noqa: B017 - the stand-in operands' error, never the mode's
-        _package_call(entry, deterministic=False, **_raw_gate_keywords())
+        _package_call(entry, **_raw_gate_keywords())
     message = str(info.value)
     for refusal in ("unexpected keyword", RAW_GATE_REFUSAL, QK_NORM):
         assert refusal not in message, message
     with pytest.raises(ValueError, match="use_gate_in_kernel must be a bool"):
-        _package_call(entry, deterministic=False, use_gate_in_kernel=1)
+        _package_call(entry, use_gate_in_kernel=1)
 
 
 @pytest.mark.parametrize("entry", COMPUTE_ENTRIES)
@@ -575,14 +575,14 @@ def test_package_entries_take_the_in_kernel_qk_norm(entry) -> None:
     for kw in ({}, _raw_gate_keywords()):
         with pytest.raises(Exception) as info:  # noqa: B017 - the stand-in operands' error, never the mode's
             _package_call(
-                entry, deterministic=False, use_qk_l2norm_in_kernel=True, **kw
+                entry, use_qk_l2norm_in_kernel=True, **kw
             )
         message = str(info.value)
         for refusal in ("unexpected keyword", RAW_GATE_REFUSAL, QK_NORM):
             assert refusal not in message, message
     for value in (1, 0, None, "true"):
         with pytest.raises(ValueError, match="use_qk_l2norm_in_kernel must be a bool"):
-            _package_call(entry, deterministic=False, use_qk_l2norm_in_kernel=value)
+            _package_call(entry, use_qk_l2norm_in_kernel=value)
 
 
 @pytest.mark.parametrize("entry", COMPUTE_ENTRIES)
@@ -596,7 +596,7 @@ def test_package_entries_accept_the_modes_off(entry) -> None:
             with pytest.raises(TypeError, match="use_qk_l2norm_in_kernel"):
                 mod._options({"use_qk_l2norm_in_kernel": value})
     with pytest.raises(Exception) as info:  # noqa: B017 - the stand-in operands' error, never a keyword's
-        _package_call(entry, deterministic=False, **MODE_OFF)
+        _package_call(entry, **MODE_OFF)
     message = str(info.value)
     for refusal in ("unexpected keyword", RAW_GATE_REFUSAL, QK_NORM):
         assert refusal not in message, message
@@ -610,12 +610,11 @@ def test_package_byte_queries_take_the_raw_gate() -> None:
     either route); a non-bool is a ``ValueError`` and ``True`` with the lean local arena a ``NotImplementedError``."""
     plan, det_plan = _mod("cake_kcp_plan"), _det("cake_kcp_plan")
     ctx = kcp_api.cake_kda_nondet_train_kcp_build_context(
-        kcp_api.cake_kda_nondet_train_kcp_partition(MODE_CU, 2, deterministic=False),
+        kcp_api.cake_kda_nondet_train_kcp_partition(MODE_CU, 2),
         None,
         0,
         "cpu",
         sm_count=148,
-        deterministic=False,
     )
     det_ctx = kcp_api.cake_kda_nondet_train_kcp_build_context(
         kcp_api.cake_kda_nondet_train_kcp_partition(MODE_CU, 2), None, 0, "cpu", sm_count=148
@@ -669,12 +668,11 @@ def test_package_byte_queries_take_the_in_kernel_qk_norm(monkeypatch) -> None:
     larger.  The communication query does not take the keyword."""
     plan, det_plan = _mod("cake_kcp_plan"), _det("cake_kcp_plan")
     ctx = kcp_api.cake_kda_nondet_train_kcp_build_context(
-        kcp_api.cake_kda_nondet_train_kcp_partition(MODE_CU, 2, deterministic=False),
+        kcp_api.cake_kda_nondet_train_kcp_partition(MODE_CU, 2),
         None,
         0,
         "cpu",
         sm_count=148,
-        deterministic=False,
     )
     for query, det_query in (
         ("cake_kda_nondet_train_kcp_workspace_bytes", "cake_kda_det_train_kcp_workspace_bytes"),
@@ -728,7 +726,7 @@ def test_facade_byte_queries_forward_the_in_kernel_qk_norm(
         det_tag = f"det:{FACADE_DET_NAMES[query]}"
         assert getattr(kcp_api, query)(ctx, use_qk_l2norm_in_kernel=True) == det_tag
         assert seen[-1][1]["use_qk_l2norm_in_kernel"] is True, query
-        assert getattr(kcp_api, query)(ctx, deterministic=False) == f"nd:{query}", query
+        assert getattr(kcp_api, query)(ctx) == f"nd:{query}", query
         assert seen[-1][1]["use_qk_l2norm_in_kernel"] is False, query
         assert (
             getattr(kcp_api, query)(
@@ -746,7 +744,7 @@ def test_facade_byte_queries_forward_the_in_kernel_qk_norm(
         ), query
         assert seen[-1][1]["use_gate_in_kernel"] is True, query
         assert seen[-1][1]["use_qk_l2norm_in_kernel"] is True, query
-        assert getattr(kcp_api, query)(ctx, deterministic=False) == f"nd:{query}"
+        assert getattr(kcp_api, query)(ctx) == f"nd:{query}"
         assert seen[-1][1]["use_gate_in_kernel"] is False, query
     owner = sys.modules[kcp_api._deterministic.__module__]
     monkeypatch.setattr(owner, "_DET_FALLBACK_WARNED", True)
@@ -757,7 +755,6 @@ def test_facade_byte_queries_forward_the_in_kernel_qk_norm(
                 ctx,
                 use_gate_in_kernel=True,
                 use_qk_l2norm_in_kernel=True,
-                deterministic=False,
             )
             == f"det:{FACADE_DET_NAMES[query]}"
         ), query
@@ -779,7 +776,7 @@ def test_facade_forwards_the_raw_gate_on_both_routes(
         assert calls[entry](**gate) == f"det:{FACADE_DET_NAMES[entry]}", entry
         for key, value in gate.items():
             assert seen[-1][1][key] is value, (entry, key)
-        assert calls[entry](deterministic=False, **gate) == f"nd:{entry}", entry
+        assert calls[entry](**gate) == f"nd:{entry}", entry
         for key, value in gate.items():
             assert seen[-1][1][key] is value, (entry, key)
         assert seen[-1][1]["deterministic"] is False, entry
@@ -801,7 +798,7 @@ def test_facade_forwards_the_raw_gate_on_both_routes(
     t = torch.zeros(1)
     with pytest.raises(Exception) as info:  # noqa: B017 - the stand-in operands' error, never the mode's
         kcp_api.cake_kda_nondet_kcp(
-            t, t, t, t, t, object(), deterministic=False, use_qk_l2norm_in_kernel=True
+            t, t, t, t, t, object(), use_qk_l2norm_in_kernel=True
         )
     for refusal in ("unexpected keyword", RAW_GATE_REFUSAL, QK_NORM):
         assert refusal not in str(info.value), str(info.value)
@@ -810,7 +807,7 @@ def test_facade_forwards_the_raw_gate_on_both_routes(
     monkeypatch.setattr(owner, "_DET_FALLBACK_WARNED", True)
     torch.use_deterministic_algorithms(True)
     for entry in COMPUTE_ENTRIES:
-        assert calls[entry](deterministic=False, **gate) == (
+        assert calls[entry](**gate) == (
             f"det:{FACADE_DET_NAMES[entry]}"
         ), entry
         assert seen[-1][1]["use_gate_in_kernel"] is True, entry
@@ -857,7 +854,7 @@ def test_facade_reduces_the_gate_parameter_grads_by_mode(
         assert seen == [("det", (ctx, dA_log, ddt_bias), {})]
     seen.clear()
     assert (
-        kcp_api.cake_kda_nondet_train_kcp_reduce_gate_param_grads(ctx, dA_log, ddt_bias, deterministic=False)
+        kcp_api.cake_kda_nondet_train_kcp_reduce_gate_param_grads(ctx, dA_log, ddt_bias)
         == "nd"
     )
     assert seen == [("nd", (ctx, dA_log, ddt_bias), {})]
@@ -870,7 +867,7 @@ def test_facade_reduces_the_gate_parameter_grads_by_mode(
     monkeypatch.setattr(owner, "_DET_FALLBACK_WARNED", True)
     torch.use_deterministic_algorithms(True)
     assert (
-        kcp_api.cake_kda_nondet_train_kcp_reduce_gate_param_grads(ctx, dA_log, ddt_bias, deterministic=False)
+        kcp_api.cake_kda_nondet_train_kcp_reduce_gate_param_grads(ctx, dA_log, ddt_bias)
         == "det"
     )
 
@@ -891,7 +888,7 @@ def test_the_context_holds_no_mode() -> None:
     names += list(part.to_dict())
     bad = sorted({n for n in names if "determin" in n.lower() or n.lower() == "mode"})
     assert not bad, bad
-    nd_part = kcp_api.cake_kda_nondet_train_kcp_partition(MODE_CU, 2, "zigzag", deterministic=False)
+    nd_part = kcp_api.cake_kda_nondet_train_kcp_partition(MODE_CU, 2, "zigzag")
     det_part = kcp_api.cake_kda_nondet_train_kcp_partition(MODE_CU, 2, "zigzag")
     assert isinstance(nd_part, plan.CakeKDANondetKcpPartition)
     assert isinstance(det_part, det_plan.CakeKDADetKcpPartition)
@@ -909,7 +906,7 @@ def test_the_context_holds_no_mode() -> None:
             "cake_kda_nondet_train_kcp_comm_bytes",
         ):
             fn = getattr(kcp_api, query)
-            assert fn(nd_ctx, H=4, deterministic=False) == fn(det_ctx, H=4), (
+            assert fn(nd_ctx, H=4) == fn(det_ctx, H=4), (
                 rank,
                 query,
             )

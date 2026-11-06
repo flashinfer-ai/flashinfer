@@ -178,7 +178,7 @@ def test_raw_keywords_are_checked_before_any_launch() -> None:
     g_ops = _cpu_ops(ctx, H, raw=False)
     g_args = tuple(g_ops[n] for n in ("q", "k", "v", "g", "beta")) + (ctx,)
     with pytest.raises(ValueError, match="use_gate_in_kernel=True only"):
-        cake_kcp.cake_kda_nondet_train_kcp_forward(*g_args, A_log=kw["A_log"], deterministic=False)
+        cake_kcp.cake_kda_nondet_train_kcp_forward(*g_args, A_log=kw["A_log"])
     with pytest.raises(ValueError, match="use_gate_in_kernel=True only"):
         cake_kcp.cake_kda_nondet_train_kcp_backward(
             *g_args, g_ops["q"], lower_bound=LB, deterministic=False
@@ -198,7 +198,7 @@ def test_raw_keywords_are_checked_before_any_launch() -> None:
         )
     fp32 = (*args[:3], ops["g"].float(), *args[4:])
     with pytest.raises(ValueError, match="torch.bfloat16"):
-        cake_kcp.cake_kda_nondet_train_kcp_forward(*fp32, **kw, deterministic=False)
+        cake_kcp.cake_kda_nondet_train_kcp_forward(*fp32, **kw)
     # an overlapping view is refused (the strided-pointer bindings check no layout of their own)
     over = ops["g"].as_strided(ops["g"].shape, (8, 8, 1))
     with pytest.raises(ValueError, match="strides"):
@@ -218,9 +218,9 @@ def test_raw_keywords_are_checked_before_any_launch() -> None:
     ws_r = cake_kcp.CakeKDANondetKcpWorkspace(use_gate_in_kernel=True)
     assert (ws_g.gate, ws_r.gate) == ("g", "raw")
     with pytest.raises(ValueError, match="use_gate_in_kernel=True"):
-        cake_kcp.cake_kda_nondet_train_kcp_forward(*args, workspace=ws_g, **kw, deterministic=False)
+        cake_kcp.cake_kda_nondet_train_kcp_forward(*args, workspace=ws_g, **kw)
     with pytest.raises(ValueError, match="use_gate_in_kernel=False"):
-        cake_kcp.cake_kda_nondet_train_kcp_forward(*g_args, workspace=ws_r, deterministic=False)
+        cake_kcp.cake_kda_nondet_train_kcp_forward(*g_args, workspace=ws_r)
     with pytest.raises(ValueError, match="use_gate_in_kernel must be a bool"):
         cake_kcp.CakeKDANondetKcpWorkspace(use_gate_in_kernel="raw")
     # a backend without the local kernel stages (an emulation) has no raw gate
@@ -228,7 +228,7 @@ def test_raw_keywords_are_checked_before_any_launch() -> None:
     prev = cake_kcp.set_backend(stub)
     try:
         with pytest.raises(NotImplementedError, match="local kernel stages"):
-            cake_kcp.cake_kda_nondet_train_kcp_forward(*args, **kw, deterministic=False)
+            cake_kcp.cake_kda_nondet_train_kcp_forward(*args, **kw)
     finally:
         cake_kcp.set_backend(prev)
 
@@ -430,19 +430,19 @@ def test_gpu_raw_reserved_shared_workspace_matches_one_workspace_per_pack() -> N
                 o = ops[i]
                 res[i]["grads"] = cake_kcp.cake_kda_nondet_train_kcp_backward(
                     o["q"], o["k"], o["v"], o["g"], o["beta"], ctxs[i], o["dout"], saved=saved[i],
-                    workspace=wss[i], **o["GK"], deterministic=False,
+                    workspace=wss[i], **o["GK"],
                 )  # fmt: skip
             for i in reversed(range(n)):
                 o = ops[i]
                 out, none = cake_kcp.cake_kda_nondet_train_kcp_forward(
                     o["q"], o["k"], o["v"], o["g"], o["beta"], ctxs[i], workspace=wss[i],
-                    boundary_mode="replay", **o["GK"], deterministic=False,
+                    boundary_mode="replay", **o["GK"],
                 )  # fmt: skip
                 assert none is None
                 res[i]["out_replay"] = out
                 res[i]["grads_replay"] = cake_kcp.cake_kda_nondet_train_kcp_backward(
                     o["q"], o["k"], o["v"], o["g"], o["beta"], ctxs[i], o["dout"], saved=None,
-                    workspace=wss[i], **o["GK"], deterministic=False,
+                    workspace=wss[i], **o["GK"],
                 )  # fmt: skip
             return res
 
@@ -476,7 +476,7 @@ def test_gpu_raw_reserved_shared_workspace_matches_one_workspace_per_pack() -> N
         with pytest.raises(ValueError, match="gate mode"):
             cake_kcp.cake_kda_nondet_train_kcp_forward(
                 o["q"], o["k"], o["v"], torch_gate(o["g"], o["GK"]["A_log"], o["GK"]["dt_bias"]),
-                o["beta"], ctxs[0], workspace=ws, deterministic=False,
+                o["beta"], ctxs[0], workspace=ws,
             )  # fmt: skip
         del ws, ref, res
         gc.collect()
@@ -913,7 +913,6 @@ def _run_rank(rank: int, W: int, row, rdzv: str | None, result_dir: str | None) 
             workspace=workspace,
             **GK,
             **opts,
-            deterministic=False,
         )
         rec_f = dict(cake_kcp.LAST_CALL["fwd"])
         bwd_opts = {key: val for key, val in opts.items() if key != "boundary_mode"}
@@ -934,7 +933,7 @@ def _run_rank(rank: int, W: int, row, rdzv: str | None, result_dir: str | None) 
             return cake_kcp.cake_kda_nondet_kcp(
                 q_, k_, v_, g_, b_, ctx, None, "light", "saved", workspace,
                 recompute_handle=h[0] if h else None, checkpoint_handoff=handoff,
-                use_gate_in_kernel=True, A_log=a_, dt_bias=d_, lower_bound=LB, deterministic=False,
+                use_gate_in_kernel=True, A_log=a_, dt_bias=d_, lower_bound=LB,
             )  # fmt: skip
 
         extra = (handle,) if handle is not None else ()
@@ -1058,7 +1057,7 @@ def _run_rank(rank: int, W: int, row, rdzv: str | None, result_dir: str | None) 
         try:
             cake_kcp.cake_kda_nondet_train_kcp_backward(
                 q, k, v, (g if kw else g.float()), beta, ctx, dout, saved=saved_r,
-                workspace=ws if kw else cake_kcp.CakeKDANondetKcpWorkspace(), **kw, deterministic=False,
+                workspace=ws if kw else cake_kcp.CakeKDANondetKcpWorkspace(), **kw,
             )  # fmt: skip
             refusals.append(False)
         except ValueError as exc:
@@ -1083,7 +1082,6 @@ def _run_rank(rank: int, W: int, row, rdzv: str | None, result_dir: str | None) 
         dout,
         saved=saved_e,
         workspace=ws_g,
-        deterministic=False,
     )
     rec_be = dict(cake_kcp.LAST_CALL["bwd"])
     rec_fr, rec_br = recs["raw"]
@@ -1209,11 +1207,10 @@ def _run_rank(rank: int, W: int, row, rdzv: str | None, result_dir: str | None) 
             glob["beta"],
             cu_t,
             **GK,
-            deterministic=False,
         )
         grads_s = cake_backend.cake_kda_nondet_train_backward(
             glob["q"], glob["k"], glob["v"], glob["g"], glob["beta"], cu_t, glob["dout"],
-            saved=saved_s, **GK, deterministic=False,
+            saved=saved_s, **GK,
         )  # fmt: skip
         single = {
             "out": out_s,

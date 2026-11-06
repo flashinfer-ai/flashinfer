@@ -162,7 +162,6 @@ def _passes(ctx, o: dict, ws, **opts) -> tuple:
             boundary_mode=mode,
             workspace=ws,
             **opts,
-            deterministic=False,
         )
         grads = cake_kcp.cake_kda_nondet_train_kcp_backward(
             q,
@@ -175,7 +174,6 @@ def _passes(ctx, o: dict, ws, **opts) -> tuple:
             saved=saved,
             workspace=ws,
             **opts,
-            deterministic=False,
         )
         res += [out, *grads]
     leaves = [x.detach().clone().requires_grad_(True) for x in (q, k, v, g, beta)]
@@ -519,7 +517,6 @@ def test_gpu_graph_replay_issues_no_copy(device) -> None:
             saved=saved,
             workspace=ws,
             graph="replay",
-            deterministic=False,
         )
         events = (
             cake_kcp.LAST_CALL["fwd"]["graph_event"],
@@ -708,7 +705,6 @@ def test_gpu_fresh_context_with_conv_halo_releases_everything(device) -> None:
                     ctx,
                     boundary_mode=mode,
                     workspace=None,
-                    deterministic=False,
                 )
                 grads = cake_kcp.cake_kda_nondet_train_kcp_backward(
                     q,
@@ -720,7 +716,6 @@ def test_gpu_fresh_context_with_conv_halo_releases_everything(device) -> None:
                     dout,
                     saved=saved,
                     workspace=None,
-                    deterministic=False,
                 )
                 res += [out, *grads]
                 del out, saved, grads

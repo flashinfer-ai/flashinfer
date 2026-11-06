@@ -96,17 +96,17 @@ ATOL = RTOL = 1e-2  # the package's declared elementwise gate (test_cake_kda_non
 
 def cake_kda_nondet_train_forward(*args, **kwargs):
     """The package's forward with the mode it requires."""
-    return cake_backend.cake_kda_nondet_train_forward(*args, deterministic=False, **kwargs)
+    return cake_backend.cake_kda_nondet_train_forward(*args, **kwargs)
 
 
 def cake_kda_nondet_train_backward(*args, **kwargs):
     """The package's backward with the mode it requires."""
-    return cake_backend.cake_kda_nondet_train_backward(*args, deterministic=False, **kwargs)
+    return cake_backend.cake_kda_nondet_train_backward(*args, **kwargs)
 
 
 def cake_kda_nondet(*args, **kwargs):
     """The package's autograd entry with the mode it requires."""
-    return cake_backend.cake_kda_nondet(*args, deterministic=False, **kwargs)
+    return cake_backend.cake_kda_nondet(*args, **kwargs)
 
 
 def _det_name(name: str | None) -> str | None:
@@ -953,7 +953,6 @@ def test_autograd_node_returns_one_gradient_slot_per_input_and_takes_no_handoff(
         lower_bound=LOWER_BOUND if raw else None,
         qk_l2norm=True,
         scale=SCALE,
-        deterministic=False,
         workspace_ref=None,
         arena=None,
         doc_lengths=None,
@@ -1382,7 +1381,6 @@ def test_l2n_launch_sequences_are_the_deterministic_l2n(
                     gate=gate,
                     l2n=mode,
                     launcher=_recorder(nd_log, cake_jit),
-                    deterministic=False,
                 ),
                 det_backend.CakeKDADetWorkspace.for_problem(
                     S,
@@ -1511,7 +1509,6 @@ def test_l2n_handoff_poison_hook_is_flag_off_only(
                 save_mode=save_mode,
                 gate=gate,
                 l2n=mode,
-                deterministic=False,
             )
             _, saved = _fwd(inputs, gate, workspace=ws)
             sources = [("set", saved)]
@@ -1614,7 +1611,6 @@ def test_l2n_lean_and_batched_arenas_are_bitwise_the_deterministic_l2n(
                 doc_lengths=lengths,
                 gate=gate,
                 l2n="fused",
-                deterministic=False,
             )
             assert len(ws.plan.batches(arena, lengths)) >= 2, tag
             o, saved_b = _fwd(inputs, gate, workspace=ws, doc_lengths=lengths)
@@ -1687,7 +1683,6 @@ def test_l2n_batched_replay_reads_no_unwritten_row_of_the_next_group(
             doc_lengths=lengths,
             gate=gate,
             l2n="fused",
-            deterministic=False,
         )
         ws.arena.fill_(0xFF)
         kw = {"workspace": ws, "doc_lengths": lengths}
@@ -1855,14 +1850,14 @@ def test_l2n_checkpointed_forward_retains_no_workspace(gate: str) -> None:
         gate=gate,
         l2n="fused",
     )
-    shared = cake_backend.CakeKDANondetWorkspace(plan, device, backward=True, deterministic=False)
+    shared = cake_backend.CakeKDANondetWorkspace(plan, device, backward=True)
     assert shared.l2n == "fused" and shared.gate == gate
 
     def implicit(*a):
         return _autograd(list(a), cu, gate)
 
     def per_call(*a):
-        ws = cake_backend.CakeKDANondetWorkspace(plan, device, backward=True, deterministic=False)
+        ws = cake_backend.CakeKDANondetWorkspace(plan, device, backward=True)
         return _autograd(list(a), cu, gate, workspace=ws)
 
     def on_shared(*a):
@@ -2007,7 +2002,7 @@ def test_l2n_refusals_on_device() -> None:
     )
     with pytest.raises(ValueError, match="use_qk_l2norm_in_kernel"):
         _bwd(inputs, off_saved)
-    ws_off = cake_backend.CakeKDANondetWorkspace.for_problem(S, N, H, device, deterministic=False)
+    ws_off = cake_backend.CakeKDANondetWorkspace.for_problem(S, N, H, device)
     with pytest.raises(ValueError, match="use_qk_l2norm_in_kernel"):
         _fwd(inputs, workspace=ws_off)
     ws_on = cake_backend.CakeKDANondetWorkspace.for_problem(

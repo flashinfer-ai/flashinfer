@@ -221,7 +221,6 @@ def _run_rank_handoff(
                 workspace=workspace,
                 checkpoint_handoff=mode,
                 **kw,
-                deterministic=False,
             )
             return y * w_
 
@@ -1151,7 +1150,7 @@ def test_handoff_byte_queries_and_counters_are_public() -> None:
             for H in (4, 64):
                 hb = cake_kcp_plan.cake_kda_nondet_train_kcp_handoff_bytes(nd_ctx, H=H)
                 assert (
-                    kcp_api.cake_kda_nondet_train_kcp_handoff_bytes(nd_ctx, H=H, deterministic=False)
+                    kcp_api.cake_kda_nondet_train_kcp_handoff_bytes(nd_ctx, H=H)
                     == hb
                 )
                 assert kcp_api.cake_kda_nondet_train_kcp_handoff_bytes(det_ctx, H=H) == 0

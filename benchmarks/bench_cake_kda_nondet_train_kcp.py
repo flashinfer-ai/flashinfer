@@ -332,7 +332,7 @@ def make_problem(args, rank: int, world: int, device: torch.device) -> dict[str,
     weight = (torch.randn(args.channels, WIDTH, generator=gen) * 0.3).to(device)
     group = dist.group.WORLD
     part_det = cake_kda_det_train_kcp_partition(cu_cpu, world, args.layout)
-    part_nd = cake_kda_nondet_train_kcp_partition(cu_cpu, world, args.layout, deterministic=False)
+    part_nd = cake_kda_nondet_train_kcp_partition(cu_cpu, world, args.layout)
     if _fragment_key(part_det) != _fragment_key(part_nd):
         raise RuntimeError(
             "the two packages' partitions of the batch differ; the arms would not time the same shards"
@@ -607,7 +607,6 @@ def _forward(arm: str, problem: dict[str, Any], conv: bool, fla_chunk_kda=None):
                 beta,
                 ctx,
                 checkpoint_handoff=mode,
-                deterministic=False,
                 **_raw_kw(problem, params),
                 **l2n,
             )
@@ -631,7 +630,6 @@ def _forward(arm: str, problem: dict[str, Any], conv: bool, fla_chunk_kda=None):
                 g,
                 beta,
                 cu,
-                deterministic=False,
                 **_raw_kw(problem, params),
                 **l2n,
             )
@@ -1141,10 +1139,10 @@ def run(args, rank: int, world: int, device: torch.device) -> dict[str, Any]:
         },
         "nd": {
             "workspace": cake_kda_nondet_train_kcp_workspace_bytes(
-                ctx_nd, H=H, C=C, deterministic=False, **modes
+                ctx_nd, H=H, C=C, **modes
             ),
             "saved": cake_kda_nondet_train_kcp_saved_bytes(
-                ctx_nd, H=H, C=C, deterministic=False, **modes
+                ctx_nd, H=H, C=C, **modes
             ),
             "saved_handoff": (
                 cake_kda_nondet_train_kcp_saved_bytes(
@@ -1154,11 +1152,11 @@ def run(args, rank: int, world: int, device: torch.device) -> dict[str, Any]:
                 else None
             ),
             "handoff": (
-                cake_kda_nondet_train_kcp_handoff_bytes(ctx_nd, H=H, deterministic=False)
+                cake_kda_nondet_train_kcp_handoff_bytes(ctx_nd, H=H)
                 if handoff_mode
                 else None
             ),
-            "comm": cake_kda_nondet_train_kcp_comm_bytes(ctx_nd, H=H, C=C, deterministic=False),
+            "comm": cake_kda_nondet_train_kcp_comm_bytes(ctx_nd, H=H, C=C),
         },
     }
     try:

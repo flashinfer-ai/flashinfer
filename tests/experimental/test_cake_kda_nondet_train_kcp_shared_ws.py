@@ -327,7 +327,6 @@ def _fwd(ctx, o, ws, **kw):
         ctx,
         workspace=ws,
         **kw,
-        deterministic=False,
     )
 
 
@@ -343,7 +342,6 @@ def _bwd(ctx, o, ws, saved, **kw):
         saved=saved,
         workspace=ws,
         **kw,
-        deterministic=False,
     )
 
 
@@ -1153,7 +1151,6 @@ def _handle_pass(ctxs, ops, wss, *, keep=None, order="interleaved", poison=None,
                     "saved",
                     ws,
                     **kw,
-                    deterministic=False,
                 )
                 continue
 
@@ -1172,7 +1169,6 @@ def _handle_pass(ctxs, ops, wss, *, keep=None, order="interleaved", poison=None,
                     recompute_handle=h_,
                     checkpoint_keep=keep,
                     **kw,
-                    deterministic=False,
                 )
                 seen[_i][_layer].append(out.detach().clone())
                 return out * w_

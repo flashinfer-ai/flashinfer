@@ -79,17 +79,17 @@ PACKAGE_DIR = Path(cake_jit.__file__).resolve().parent
 
 def cake_kda_nondet_train_forward(*args, **kwargs):
     """The package's forward with the mode it requires."""
-    return cake_backend.cake_kda_nondet_train_forward(*args, deterministic=False, **kwargs)
+    return cake_backend.cake_kda_nondet_train_forward(*args, **kwargs)
 
 
 def cake_kda_nondet_train_backward(*args, **kwargs):
     """The package's backward with the mode it requires."""
-    return cake_backend.cake_kda_nondet_train_backward(*args, deterministic=False, **kwargs)
+    return cake_backend.cake_kda_nondet_train_backward(*args, **kwargs)
 
 
 def cake_kda_nondet(*args, **kwargs):
     """The package's autograd entry with the mode it requires."""
-    return cake_backend.cake_kda_nondet(*args, deterministic=False, **kwargs)
+    return cake_backend.cake_kda_nondet(*args, **kwargs)
 
 
 ARCHES = tuple(cake_jit.ARCHES)
@@ -4774,7 +4774,7 @@ def test_workspace_reuse_and_byte_counts(device, manifest) -> None:
     lengths, heads = (129,), 2
     S, N = sum(lengths), len(lengths)
     inputs = make_inputs(lengths, heads, device)
-    ws = CakeKDANondetWorkspace.for_problem(S, N, heads, device, deterministic=False)
+    ws = CakeKDANondetWorkspace.for_problem(S, N, heads, device)
     sm = ws.plan.sm_count
     # the byte queries without an architecture take the device's: with its SM count given or taken from it, the
     # same bytes as the workspace (a few-chain row: 37 segments per document on sm_100a, 38 elsewhere)
@@ -4821,7 +4821,7 @@ def test_workspace_reuse_and_byte_counts(device, manifest) -> None:
     )
     with pytest.raises(ValueError, match="backward=False"):
         cake_kda_nondet_train_backward(q, k, v, g, beta, cu, dout, saved=saved, workspace=fwd_only)
-    other = CakeKDANondetWorkspace.for_problem(S + 1, N, heads, device, deterministic=False)
+    other = CakeKDANondetWorkspace.for_problem(S + 1, N, heads, device)
     with pytest.raises(ValueError, match="allocated for"):
         cake_kda_nondet_train_forward(q, k, v, g, beta, cu, workspace=other)
     with pytest.raises(ValueError, match="save_mode"):
@@ -4926,7 +4926,6 @@ def test_launch_sequences_follow_the_plan(device, manifest) -> None:
             device,
             save_mode="tape",
             launcher=recording,
-            deterministic=False,
         )
         cake_kda_nondet_train_backward(q, k, v, g, beta, cu, dout, saved=saved_t, workspace=tape_ws)
         # the WY launch: the tape WY twin where the device's rule admits it, the plan's record elsewhere
@@ -5288,10 +5287,10 @@ def test_a_checkpointed_forward_retains_no_workspace(device, manifest) -> None:
         return cake_kda_nondet(q, k, v, g, beta, cu)
 
     def per_call(q, k, v, g, beta):
-        ws = CakeKDANondetWorkspace(plan, device, backward=True, deterministic=False)
+        ws = CakeKDANondetWorkspace(plan, device, backward=True)
         return cake_kda_nondet(q, k, v, g, beta, cu, workspace=ws)
 
-    shared = CakeKDANondetWorkspace(plan, device, backward=True, deterministic=False)
+    shared = CakeKDANondetWorkspace(plan, device, backward=True)
 
     def on_shared(q, k, v, g, beta):
         return cake_kda_nondet(q, k, v, g, beta, cu, workspace=shared)
@@ -5353,7 +5352,6 @@ def test_the_default_entry_plans_a_repeated_problem_once_and_keeps_no_device_mem
             backward=True,
             arena=arena,
             doc_lengths=doc,
-            deterministic=False,
         )
         ref_out, ref_grads = _autograd_step(inputs, workspace=ws, doc_lengths=doc)
         del ws
@@ -5460,7 +5458,6 @@ def test_the_arena_options_never_synchronize_the_host(device, manifest) -> None:
                 backward=True,
                 arena=arena,
                 doc_lengths=doc,
-                deterministic=False,
             )
             for kwargs in (
                 {"arena": arena},
@@ -5487,7 +5484,7 @@ def test_plan_without_arch_serves_a_workspace_on_the_device(device, manifest) ->
     S, N = sum(lengths), len(lengths)
     p = cake_backend.plan(S, N, heads, cake_jit.sm_count(device.index))
     assert p.arch == cake_jit.device_arch(device.index)
-    ws = CakeKDANondetWorkspace(p, device, deterministic=False)
+    ws = CakeKDANondetWorkspace(p, device)
     inputs = make_inputs(lengths, heads, device)
     out, grads, _ = _run_fwd_bwd(inputs, workspace=ws)
     ref_out, ref_grads, _ = _run_fwd_bwd(inputs)
@@ -5497,7 +5494,7 @@ def test_plan_without_arch_serves_a_workspace_on_the_device(device, manifest) ->
         if arch != p.arch:
             other = cake_backend.plan(S, N, heads, p.sm_count, arch)
             with pytest.raises(ValueError, match=f"records of {arch}, the device is"):
-                CakeKDANondetWorkspace(other, device, deterministic=False)
+                CakeKDANondetWorkspace(other, device)
 
 
 def test_a_batched_default_entry_under_capture_asks_for_a_warmed_workspace(
@@ -5608,7 +5605,7 @@ def test_a_set_planned_for_other_sms_is_refused_by_a_backward_without_its_worksp
         inputs[n].detach().clone().requires_grad_(True)
         for n in ("q", "k", "v", "g", "beta")
     )
-    workspace = CakeKDANondetWorkspace(half, device, backward=True, deterministic=False)
+    workspace = CakeKDANondetWorkspace(half, device, backward=True)
     alive = weakref.ref(workspace)
     out = cake_kda_nondet(q, k, v, g, beta, inputs["cu_seqlens"], workspace=workspace)
     del workspace
@@ -5683,7 +5680,6 @@ def test_arena_content_never_reaches_a_result(device, manifest) -> None:
             backward=True,
             zero_init=True,
             save_mode=save_mode,
-            deterministic=False,
         )
         assert zeroed.zero_init is True and not bool(zeroed.arena.any())
         poisoned = CakeKDANondetWorkspace(
@@ -5691,7 +5687,7 @@ def test_arena_content_never_reaches_a_result(device, manifest) -> None:
         )
         assert poisoned.zero_init is False
         assert (
-            CakeKDANondetWorkspace.for_problem(S, N, heads, device, deterministic=False).zero_init
+            CakeKDANondetWorkspace.for_problem(S, N, heads, device).zero_init
             is False
         )
 
@@ -6020,7 +6016,7 @@ def test_lean_arena_gives_the_default_gradients_bitwise(
     out, grads, saved = _run_fwd_bwd(inputs)
     reference_out, reference_grads = _clone_all(out, grads)
     del out, grads
-    default = CakeKDANondetWorkspace.for_problem(S, N, heads, device, deterministic=False)
+    default = CakeKDANondetWorkspace.for_problem(S, N, heads, device)
     assert default.arena_option == cake_backend.CakeKDANondetArena()
     p = default.plan
     for t in (1, 2, 3):
@@ -6138,7 +6134,6 @@ def test_lean_tail_passes_launch_the_tail_once_per_range(device, manifest) -> No
                 device,
                 arena=arena,
                 launcher=recording,
-                deterministic=False,
             )
             p = ws.plan
             launched.clear()
@@ -6207,7 +6202,6 @@ def test_lean_arena_serves_the_saved_states_and_the_tape_paths(
             device,
             arena=arena,
             launcher=recording,
-            deterministic=False,
         )
         p = ws.plan
         assert p.recur == "seg" and p.seg_save and p.light_path == "light_states"
@@ -6227,7 +6221,6 @@ def test_lean_arena_serves_the_saved_states_and_the_tape_paths(
             save_mode="tape",
             arena=arena,
             launcher=recording,
-            deterministic=False,
         )
         assert tape_ws.bytes == p.workspace_bytes("bwd_tape_lean", t) < ws.bytes
         launched.clear()
@@ -6341,7 +6334,7 @@ def test_lean_arena_under_checkpointing_and_a_dropped_workspace(
     )
     check(held, "dropped")
     # the option given with a kept workspace of another option is refused by the node's forward
-    kept = CakeKDANondetWorkspace(plan, device, backward=True, deterministic=False)
+    kept = CakeKDANondetWorkspace(plan, device, backward=True)
     with pytest.raises(ValueError, match="arena="):
         cake_kda_nondet(*leaves(), cu, workspace=kept, arena=arena)
 
@@ -6377,7 +6370,6 @@ def test_lean_arena_content_never_reaches_a_result(device, manifest) -> None:
             backward=True,
             zero_init=True,
             save_mode=save_mode,
-            deterministic=False,
         )
         out, grads, saved = _run_fwd_bwd(inputs, workspace=zeroed)
         reference_out, reference_grads = _clone_all(out, grads)
@@ -6389,7 +6381,6 @@ def test_lean_arena_content_never_reaches_a_result(device, manifest) -> None:
             backward=True,
             save_mode=save_mode,
             arena=arena,
-            deterministic=False,
         )
         assert poisoned.zero_init is False and poisoned.bytes < zeroed.bytes
 
@@ -6989,7 +6980,7 @@ def test_batched_arena_gives_the_default_results_bitwise(
     out, grads, saved = _run_fwd_bwd(inputs)
     ref_out, ref_grads = _clone_all(out, grads)
     del out, grads
-    default = CakeKDANondetWorkspace.for_problem(S, N, heads, device, deterministic=False)
+    default = CakeKDANondetWorkspace.for_problem(S, N, heads, device)
     p = default.plan
     real = _real_chunks(lengths)
     tape_default = CakeKDANondetWorkspace.for_problem(
@@ -7010,7 +7001,6 @@ def test_batched_arena_gives_the_default_results_bitwise(
                 device,
                 arena=arena,
                 doc_lengths=lengths,
-                deterministic=False,
             )
             assert ws.arena_option == arena and ws.doc_lengths == tuple(lengths)
             assert ws.bytes == p.arena_bytes(arena=arena, doc_lengths=lengths)
@@ -7118,7 +7108,6 @@ def test_batched_arena_gives_the_default_results_bitwise(
                 save_mode="tape",
                 arena=arena,
                 doc_lengths=lengths,
-                deterministic=False,
             )
             assert tws.bytes == p.arena_bytes(
                 save_mode="tape", arena=arena, doc_lengths=lengths
@@ -7286,7 +7275,6 @@ def test_batched_arena_launches_per_group(device, manifest) -> None:
                     arena=arena,
                     launcher=recording,
                     doc_lengths=lengths,
-                    deterministic=False,
                 )
                 p = ws.plan
                 batches = p.batches(arena, lengths)
@@ -7533,7 +7521,6 @@ def test_batched_arena_with_exact_zero_values(device, manifest, monkeypatch) -> 
                 device,
                 arena=arena,
                 doc_lengths=lengths,
-                deterministic=False,
             )
             o, saved_b = cake_kda_nondet_train_forward(
                 q, k, v, g, beta, cu_t, workspace=ws, doc_lengths=lengths
@@ -7563,7 +7550,6 @@ def test_batched_arena_with_exact_zero_values(device, manifest, monkeypatch) -> 
                 save_mode="tape",
                 arena=arena,
                 doc_lengths=lengths,
-                deterministic=False,
             )
             # the saved v_new comes from its allocation filled with NaN: a row no group writes would show
             original_alloc, poisoned = cake_backend._alloc, []
@@ -7678,7 +7664,6 @@ def test_batched_arena_under_checkpointing_and_a_dropped_workspace(
         backward=True,
         arena=arena,
         doc_lengths=lengths,
-        deterministic=False,
     )
     created.clear()
     held = leaves()
@@ -7692,7 +7677,7 @@ def test_batched_arena_under_checkpointing_and_a_dropped_workspace(
     )
     assert created[0].bytes == exact
     check(held, "dropped")
-    kept = CakeKDANondetWorkspace(plan, device, backward=True, deterministic=False)
+    kept = CakeKDANondetWorkspace(plan, device, backward=True)
     with pytest.raises(ValueError, match="arena="):
         cake_kda_nondet(*leaves(), cu, workspace=kept, arena=arena, doc_lengths=lengths)
     with pytest.raises(ValueError, match="doc_lengths"):
@@ -7788,7 +7773,6 @@ def test_batched_arena_content_never_reaches_a_result(device, manifest) -> None:
             backward=True,
             zero_init=True,
             save_mode=save_mode,
-            deterministic=False,
         )
         out, grads, saved = _run_fwd_bwd(inputs, workspace=zeroed)
         reference_out, reference_grads = _clone_all(out, grads)
@@ -7801,7 +7785,6 @@ def test_batched_arena_content_never_reaches_a_result(device, manifest) -> None:
             save_mode=save_mode,
             arena=arena,
             doc_lengths=lengths,
-            deterministic=False,
         )
         assert poisoned.zero_init is False and poisoned.bytes < zeroed.bytes
         assert len(plan.batches(arena, lengths)) >= 2
@@ -8293,7 +8276,6 @@ def test_batched_block_runs_give_the_default_results_bitwise(
                         save_mode=save_mode,
                         arena=arena,
                         doc_lengths=lengths,
-                        deterministic=False,
                     )
                     packing = ws._packing(lengths)
                     for i, b in enumerate(packing.batches):
@@ -8406,7 +8388,6 @@ def test_a_warmed_batched_workspace_captures_its_calls(device, manifest) -> None
         save_mode="tape",
         arena=arena,
         doc_lengths=lengths,
-        deterministic=False,
     )
     assert ws.plan.recur == "seg"
     o, saved = cake_kda_nondet_train_forward(q, k, v, g, beta, cu, workspace=ws, doc_lengths=lengths)
@@ -8451,7 +8432,6 @@ def test_a_warmed_batched_workspace_captures_its_calls(device, manifest) -> None
         save_mode="tape",
         arena=arena,
         doc_lengths=lengths,
-        deterministic=False,
     )
     refused = pytest.raises(RuntimeError, match="under CUDA-graph capture needs")
     with refused, torch.cuda.graph(torch.cuda.CUDAGraph()):
@@ -8491,7 +8471,6 @@ def test_a_batched_workspace_keeps_the_device_copy_its_graph_reads(
         save_mode="tape",
         arena=arena,
         doc_lengths=lengths,
-        deterministic=False,
     )
     assert ws.plan.recur == "seg"
 
@@ -8699,7 +8678,6 @@ def test_launches_are_this_packages_records_and_s1_on_the_s1_cells(
             device,
             save_mode="tape",
             launcher=recording,
-            deterministic=False,
         )
         p = ws.plan
         _, saved = cake_kda_nondet_train_forward(q, k, v, g, beta, cu, workspace=ws)
@@ -8864,7 +8842,7 @@ def test_the_twin_rows_are_the_light_prep_rows(
             captured[name] = {n: t.clone() for n, t in outs.items()}
 
     monkeypatch.setattr(cake_backend, "_alloc", _nan_alloc)
-    ws = CakeKDANondetWorkspace(p, device, backward=True, launcher=launcher, deterministic=False)
+    ws = CakeKDANondetWorkspace(p, device, backward=True, launcher=launcher)
     ops = [inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens")]
     common = dict(
         scale=SCALE,
@@ -9039,7 +9017,6 @@ def test_tape_mode_with_the_tape_wy_twin_is_bitwise_its_wy_record(
         backward=True,
         save_mode="tape",
         launcher=launcher,
-        deterministic=False,
     )
     grads = {}
     for forced in (False, True):
@@ -9085,7 +9062,6 @@ def test_batched_tape_mode_launches_the_tape_wy_twin_per_group(
         save_mode="tape",
         arena=arena,
         doc_lengths=lengths,
-        deterministic=False,
     )
     p = ws.plan
     groups = len(p.batches(arena, lengths))
@@ -9606,7 +9582,7 @@ def test_raw_gate_paths_match_the_deterministic_raw_mode(
         )
         assert ws.gate == ws.plan.gate == "raw"
         _rg_check(_rg_bwd(inputs, other, workspace=ws), ref, tag=name)
-    ws = CakeKDANondetWorkspace.for_problem(S, N, heads, device, gate="raw", deterministic=False)
+    ws = CakeKDANondetWorkspace.for_problem(S, N, heads, device, gate="raw")
     # the arena alone, the deterministic package's bytes (the parameter partials are per call)
     assert (
         ws.bytes
@@ -9680,7 +9656,6 @@ def test_raw_gate_saved_states_match_the_deterministic_raw_mode(
             arena=arena,
             gate="raw",
             launcher=_rg_recorder(launched),
-            deterministic=False,
         )
         launched.clear()
         got = _rg_bwd(inputs, saved, workspace=ws)
@@ -9950,7 +9925,6 @@ def test_raw_gate_launch_sequences_are_the_deterministic_raw_mode(
                     save_mode=save_mode,
                     gate="raw",
                     launcher=_rg_recorder(nd_log),
-                    deterministic=False,
                 ),
                 det_backend.CakeKDADetWorkspace.for_problem(
                     S,
@@ -10085,7 +10059,6 @@ def test_raw_gate_lean_and_batched_arenas_match_the_deterministic_raw_mode(
             arena=arena,
             gate="raw",
             launcher=_rg_recorder(launched),
-            deterministic=False,
         )
         p = ws.plan
         assert ws.bytes == cake_backend.workspace_bytes(
@@ -10126,7 +10099,6 @@ def test_raw_gate_lean_and_batched_arenas_match_the_deterministic_raw_mode(
                 doc_lengths=lengths,
                 gate="raw",
                 launcher=_rg_recorder(launched),
-                deterministic=False,
             )
             p = ws.plan
             assert p.gate == "raw" and len(p.batches(arena, lengths)) >= 2, tag
@@ -10196,10 +10168,10 @@ def test_raw_gate_checkpointed_forward_retains_no_workspace(device, manifest) ->
         return _rg_autograd(list(a), cu)
 
     def per_call(*a):
-        ws = CakeKDANondetWorkspace(plan, device, backward=True, deterministic=False)
+        ws = CakeKDANondetWorkspace(plan, device, backward=True)
         return _rg_autograd(list(a), cu, workspace=ws)
 
-    shared = CakeKDANondetWorkspace(plan, device, backward=True, deterministic=False)
+    shared = CakeKDANondetWorkspace(plan, device, backward=True)
     assert shared.gate == "raw"
 
     def on_shared(*a):
@@ -10262,7 +10234,6 @@ def test_raw_gate_workspace_content_never_reaches_a_result(
             backward=True,
             save_mode=save_mode,
             arena=arena,
-            deterministic=False,
         )
         poisoned.arena.fill_(0xFF)
         torch.cuda.synchronize()
@@ -10298,7 +10269,7 @@ def test_raw_gate_repeats_are_bitwise(device, manifest, heads) -> None:
     S, N = sum(lengths), len(lengths)
     inputs = make_raw_inputs(lengths, heads, device)
     ref_out, ref, _ = _rg_reference(inputs)
-    ws = CakeKDANondetWorkspace.for_problem(S, N, heads, device, gate="raw", deterministic=False)
+    ws = CakeKDANondetWorkspace.for_problem(S, N, heads, device, gate="raw")
     sm = ws.plan.sm_count
     assert (
         ws.bytes
@@ -10361,7 +10332,6 @@ def test_raw_gate_raises_no_alert_under_torch_deterministic_mode(
             gate="raw",
             l2n=l2n,
             launcher=_rg_recorder(launched),
-            deterministic=False,
         )
         g_inputs = make_inputs(lengths, heads, device)
         gq = [g_inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens")]

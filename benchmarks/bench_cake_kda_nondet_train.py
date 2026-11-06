@@ -345,7 +345,7 @@ def cake_workspace(
         )
     else:
         ws = nd_backend.CakeKDANondetWorkspace.for_problem(
-            seqlen, docs, heads, device, deterministic=False, **mode
+            seqlen, docs, heads, device, **mode
         )
     ws.load()
     return ws
@@ -520,7 +520,7 @@ def _results(inputs: dict, ws, *, deterministic: bool, replay: bool) -> dict:
         )
     else:
         out, saved = nd_backend.cake_kda_nondet_train_forward(
-            q, k, v, g, beta, cu, workspace=ws, deterministic=False, **raw, **l2n
+            q, k, v, g, beta, cu, workspace=ws, **raw, **l2n
         )
         grads = nd_backend.cake_kda_nondet_train_backward(
             q,
@@ -532,7 +532,6 @@ def _results(inputs: dict, ws, *, deterministic: bool, replay: bool) -> dict:
             dout,
             saved=None if replay else saved,
             workspace=ws,
-            deterministic=False,
             **raw,
             **l2n,
         )
@@ -823,7 +822,7 @@ def run_row(
         torch.cuda.empty_cache()
         cake_builders = {
             "det": lambda: cake_boundaries(inputs, det_workspace(), deterministic=True),
-            "nd": lambda: cake_boundaries(inputs, nd_workspace(), deterministic=False),
+            "nd": lambda: cake_boundaries(inputs, nd_workspace()),
         }
         builders = {arm: cake_builders[arm] for arm in CAKE_ARMS[build_order]}
         builders[AA_ARM] = cake_builders["det"]
@@ -1010,7 +1009,7 @@ def _fla_out_vs_nd(inputs: dict, fla: dict, nd_ws) -> float:
     L2 norm, as the row's operands take) from this package's on the same operands (an FLA adapter that drops a gate
     term or the norm differs by far more than the two kernels' roundings)."""
     out_fla = fla["fwd"]().detach().double()
-    out_nd = cake_boundaries(inputs, nd_ws, deterministic=False)["fwd"]()[0].double()
+    out_nd = cake_boundaries(inputs, nd_ws)["fwd"]()[0].double()
     return float((out_fla - out_nd).pow(2).mean().sqrt() / out_nd.pow(2).mean().sqrt())
 
 

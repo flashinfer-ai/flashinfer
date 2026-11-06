@@ -339,7 +339,7 @@ def test_facade_routes_the_arena_option_to_the_package(monkeypatch) -> None:
     fields; the option factory returns the routed package's type."""
     log = _recorders(monkeypatch)
     det_arena = facade.cake_kda_nondet_train_arena(lean=True, tail_passes=2)
-    nd_arena = facade.cake_kda_nondet_train_arena(lean=True, tail_passes=2, deterministic=False)
+    nd_arena = facade.cake_kda_nondet_train_arena(lean=True, tail_passes=2)
     assert isinstance(det_arena, det_backend.CakeKDADetArena)
     assert isinstance(nd_arena, cake_backend.CakeKDANondetArena)
     assert det_arena == det_backend.CakeKDADetArena(lean=True, tail_passes=2)
@@ -349,7 +349,7 @@ def test_facade_routes_the_arena_option_to_the_package(monkeypatch) -> None:
         warnings.simplefilter("ignore", ExperimentalWarning)
         for arena in (det_arena, nd_arena):
             facade.cake_kda_nondet_train_forward(*operands, arena=arena)
-            facade.cake_kda_nondet_train_forward(*operands, arena=arena, deterministic=False)
+            facade.cake_kda_nondet_train_forward(*operands, arena=arena)
     # the calls in order: each option to the deterministic package, then to this one
     sources = (det_arena, det_arena, nd_arena, nd_arena)
     assert [side for _entry, side, _kw in log] == ["det", "nd", "det", "nd"]
@@ -367,7 +367,7 @@ def test_byte_queries_are_the_packages_and_agree() -> None:
     for S, N, H in ((1, 1, 1), (129, 2, 4), (4096, 3, 16), (261393, 4, 64)):
         for kwargs in ({}, {"backward": False}, {"save_mode": "tape"}):
             nd = facade.cake_kda_nondet_train_workspace_bytes(
-                S, N, H, sm_count=148, deterministic=False, **kwargs
+                S, N, H, sm_count=148, **kwargs
             )
             assert nd == cake_backend.workspace_bytes(S, N, H, sm_count=148, **kwargs)
             assert nd == facade.cake_kda_nondet_train_workspace_bytes(
@@ -376,11 +376,11 @@ def test_byte_queries_are_the_packages_and_agree() -> None:
             assert nd == det_backend.workspace_bytes(S, N, H, sm_count=148, **kwargs)
         for kwargs in ({}, {"save_mode": "tape"}):
             nd = facade.cake_kda_nondet_train_saved_bytes(
-                S, H, N, sm_count=148, deterministic=False, **kwargs
+                S, H, N, sm_count=148, **kwargs
             )
             assert nd == cake_backend.saved_bytes(S, H, N, sm_count=148, **kwargs)
             assert nd == det_backend.saved_bytes(S, H, N, sm_count=148, **kwargs)
-        assert facade.cake_kda_nondet_train_saved_bytes(S, H, deterministic=False) == 256 * S * H
+        assert facade.cake_kda_nondet_train_saved_bytes(S, H) == 256 * S * H
 
 
 def test_support_query_follows_the_capability_table() -> None:
@@ -418,7 +418,7 @@ for name, args in (
     with warnings.catch_warnings(record=True) as rec:
         warnings.simplefilter("always")
         kwargs = {"sm_count": 148} if name == "cake_kda_nondet_train_workspace_bytes" else {}
-        getattr(facade, name)(*args, deterministic=False, **kwargs)
+        getattr(facade, name)(*args, **kwargs)
     caught += [w for w in rec if w.category is UserWarning]
 assert len(caught) == 1, [str(w.message) for w in caught]
 assert caught[0].filename == "<string>", (caught[0].filename, caught[0].lineno)
@@ -514,7 +514,7 @@ def test_package_refuses_every_mode_but_false(name) -> None:
             assert "cake_kda_det_train" in str(info.value), (name, kwargs)
             assert str(info.value).startswith(name), (name, str(info.value))
     with pytest.raises(ValueError, match="v: expected 3-D") as info:
-        call(deterministic=False)
+        call()
     assert "cake_kda_det_train" not in str(info.value), name
 
 
@@ -527,7 +527,7 @@ def test_package_entries_do_not_alert_under_torch_deterministic_mode(name) -> No
         with _TorchDeterministic(warn_only), warnings.catch_warnings():
             warnings.simplefilter("error")
             with pytest.raises(ValueError, match="v: expected 3-D") as info:
-                PACKAGE_CALLS[name](deterministic=False)
+                PACKAGE_CALLS[name]()
             assert _ALERT not in str(info.value)
 
 
@@ -567,7 +567,7 @@ def test_package_workspace_refuses_every_mode_but_false() -> None:
                     str(info.value),
                 )
         with pytest.raises(ValueError, match="CUDA devices") as info:
-            call(deterministic=False)
+            call()
         assert "cake_kda_det_train" not in str(info.value), name
 
 
@@ -621,12 +621,12 @@ def test_package_accepts_the_raw_gate(name) -> None:
     call = PACKAGE_CALLS[name]
     for kw in _gate_on():
         with pytest.raises(ValueError, match="v: expected 3-D") as info:
-            call(deterministic=False, **kw)
+            call(**kw)
         assert "deterministic=True" not in str(info.value), kw
     with pytest.raises(ValueError, match="v: expected 3-D"):
-        call(deterministic=False, **GATE_OFF)
+        call(**GATE_OFF)
     with pytest.raises(ValueError, match="use_gate_in_kernel must be a bool"):
-        call(deterministic=False, use_gate_in_kernel=1)
+        call(use_gate_in_kernel=1)
     entry = getattr(cake_backend, name)
     ops, raw = _raw_cpu_call()
     dout = (
@@ -638,16 +638,16 @@ def test_package_accepts_the_raw_gate(name) -> None:
     # the arena option given: the backward reads no option from the stand-in workspace
     stand_in = {"workspace": object(), "arena": cake_backend.CakeKDANondetArena()}
     with pytest.raises(TypeError, match="CakeKDANondetWorkspace") as info:
-        entry(*ops, *dout, deterministic=False, **stand_in, **raw)
+        entry(*ops, *dout, **stand_in, **raw)
     assert "deterministic=False" in str(info.value), name
     with pytest.raises(ValueError, match="is torch.bfloat16"):
-        entry(*g32, *dout, deterministic=False, **raw)
+        entry(*g32, *dout, **raw)
     with pytest.raises(ValueError, match="needs the gate's lower bound"):
-        entry(*ops, *dout, deterministic=False, **dict(raw, lower_bound=None))
+        entry(*ops, *dout, **dict(raw, lower_bound=None))
     with pytest.raises(ValueError, match="lower_bound must satisfy"):
-        entry(*ops, *dout, deterministic=False, **dict(raw, lower_bound=-6.0))
+        entry(*ops, *dout, **dict(raw, lower_bound=-6.0))
     with pytest.raises(ValueError, match="taken with use_gate_in_kernel=True only"):
-        entry(*g32, *dout, deterministic=False, A_log=raw["A_log"])
+        entry(*g32, *dout, A_log=raw["A_log"])
 
 
 def test_autograd_node_takes_the_raw_gate_after_the_mode() -> None:
@@ -709,7 +709,7 @@ def test_either_backward_reads_either_packages_saved_set_by_gate_mode() -> None:
     for saved in (l2n, l2n_raw):
         with pytest.raises(ValueError, match="v: expected 3-D"):
             PACKAGE_CALLS["cake_kda_nondet_train_backward"](
-                saved=saved, deterministic=False, use_qk_l2norm_in_kernel=True
+                saved=saved, use_qk_l2norm_in_kernel=True
             )
 
 
@@ -735,7 +735,7 @@ def test_package_workspace_takes_the_gate_mode() -> None:
         with pytest.raises(ValueError, match="gate must be one of"):
             cake_backend.workspace_bytes(S, N, H, sm_count=148, gate=gate)
         with pytest.raises(ValueError, match="gate must be one of"):
-            ws_type.for_problem(S, N, H, "cpu", gate=gate, deterministic=False)
+            ws_type.for_problem(S, N, H, "cpu", gate=gate)
         with pytest.raises(ValueError, match="gate must be one of"):
             ws_type.for_budget(
                 S,
@@ -744,17 +744,16 @@ def test_package_workspace_takes_the_gate_mode() -> None:
                 "cpu",
                 arena_budget_bytes=1 << 40,
                 gate=gate,
-                deterministic=False,
             )
     for gate in ("g", "raw"):
         with pytest.raises(ValueError, match="CUDA devices"):
-            ws_type.for_problem(S, N, H, "cpu", gate=gate, deterministic=False)
+            ws_type.for_problem(S, N, H, "cpu", gate=gate)
         p = cake_backend.plan(S, N, H, 148, "sm_100a", gate=gate)
         other = "g" if gate == "raw" else "raw"
         with pytest.raises(ValueError, match=f"gate={other!r}"):
-            ws_type(p, "cpu", gate=other, deterministic=False)
+            ws_type(p, "cpu", gate=other)
         with pytest.raises(ValueError, match="CUDA devices"):
-            ws_type(p, "cpu", gate=gate, deterministic=False)
+            ws_type(p, "cpu", gate=gate)
 
 
 def test_facade_forwards_the_raw_gate(monkeypatch) -> None:
@@ -785,7 +784,7 @@ def test_facade_forwards_the_raw_gate(monkeypatch) -> None:
                 assert {key: log[-1][2][key] for key in GATE_OFF} == GATE_OFF, name
         with _TorchDeterministic():
             for name, call in calls.items():
-                assert call(deterministic=False, **gate) == "det", name
+                assert call(**gate) == "det", name
                 assert log[-1][2]["use_gate_in_kernel"] is True, name
         for mode, side in (({}, "det"), ({"deterministic": False}, "nd")):
             assert (
@@ -834,7 +833,6 @@ def test_facade_runs_the_raw_gate_on_the_non_deterministic_package() -> None:
                 sm_count=148,
                 backward=backward,
                 use_gate_in_kernel=True,
-                deterministic=False,
             )
             assert got == cake_backend.workspace_bytes(
                 129, 1, 4, sm_count=148, backward=backward, gate="raw"
@@ -856,11 +854,11 @@ def test_package_takes_the_in_kernel_qk_l2norm(name) -> None:
     call = PACKAGE_CALLS[name]
     for value in (True, False):
         with pytest.raises(ValueError, match="v: expected 3-D") as info:
-            call(deterministic=False, use_qk_l2norm_in_kernel=value, **GATE_OFF)
+            call(use_qk_l2norm_in_kernel=value, **GATE_OFF)
         assert "L2 norm" not in str(info.value), (value, str(info.value))
     for value in (1, 0, "True", None):
         with pytest.raises(ValueError, match=_NOT_BOOL):
-            call(deterministic=False, use_qk_l2norm_in_kernel=value)
+            call(use_qk_l2norm_in_kernel=value)
 
 
 def _l2n_saved(saved_type, S: int, H: int, **fields):
@@ -920,7 +918,6 @@ def test_either_packages_check_reads_either_packages_l2n_saved_set() -> None:
             saved=_l2n_saved(
                 cake_backend.CakeKDANondetChunkSaved, 4, 1, qk_rstd=rstd, qk_l2norm=True
             ),
-            deterministic=False,
             use_qk_l2norm_in_kernel=True,
         )
 
@@ -1022,7 +1019,7 @@ def test_facade_forwards_the_in_kernel_qk_l2norm(monkeypatch) -> None:
                 assert log[-1][2]["use_qk_l2norm_in_kernel"] is False, (name, side)
         with _TorchDeterministic():
             for name, call in calls.items():
-                assert call(deterministic=False, use_qk_l2norm_in_kernel=True) == "det"
+                assert call(use_qk_l2norm_in_kernel=True) == "det"
                 assert log[-1][2]["use_qk_l2norm_in_kernel"] is True, name
         for name, query in queries.items():
             for mode, side in (({}, "det"), ({"deterministic": False}, "nd")):
@@ -1460,7 +1457,6 @@ def test_public_entries_run_the_packages(shape) -> None:
         dout,
         saved=nd_saved,
         scale=facade.DEFAULT_SCALE,
-        deterministic=False,
     )
     assert _bits_equal(nd_out, det_out) and _same(nd_grads[:4], det_grads[:4])
     with warnings.catch_warnings():
@@ -1507,7 +1503,7 @@ def test_public_entries_run_the_packages(shape) -> None:
                 assert _bits_equal(leaf.grad, want), mode
         # a workspace serves its own package: a deterministic=True call refuses this package's, this package
         # refuses the deterministic one's
-        nd_ws = facade.cake_kda_nondet_train_workspace(S, N, heads, device, deterministic=False)
+        nd_ws = facade.cake_kda_nondet_train_workspace(S, N, heads, device)
         det_ws = facade.cake_kda_nondet_train_workspace(S, N, heads, device)
         with pytest.raises(TypeError, match="deterministic=False"):
             facade.cake_kda_nondet_train_forward(q, k, v, g, beta, cu, workspace=nd_ws)
@@ -1557,7 +1553,6 @@ def test_torch_deterministic_mode_runs_the_deterministic_package(monkeypatch) ->
                     dout,
                     saved=saved,
                     workspace=workspace,
-                    deterministic=False,
                 )
                 assert _bits_equal(out, out_want) and _same(grads, grads_want), (
                     workspace
@@ -1565,7 +1560,7 @@ def test_torch_deterministic_mode_runs_the_deterministic_package(monkeypatch) ->
             leaves = [
                 t.detach().clone().requires_grad_(True) for t in (q, k, v, g, beta)
             ]
-            o = facade.cake_kda_nondet(*leaves, cu, deterministic=False)
+            o = facade.cake_kda_nondet(*leaves, cu)
             assert o.grad_fn._forward_cls is det_backend.CakeKDADetFunction
             o.backward(dout)
             for leaf, want in zip(
@@ -1667,7 +1662,6 @@ def test_the_backward_reads_a_saved_set_of_either_package() -> None:
             dout,
             saved=det_saved,
             scale=scale,
-            deterministic=False,
         )
         assert _same(other, own), save_mode
         det_own = det_backend.cake_kda_det_train_backward(
