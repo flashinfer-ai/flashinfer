@@ -936,7 +936,8 @@ def autotune(
             operations within this context.  For example,
             ``tuning_buckets=(64, 128, 256, 512, 1024)`` profiles those batch
             sizes.  Listed sizes that an op maps to the same bucket share one
-            tuned entry.  Duplicates are removed and values are sorted
+            tuned entry, profiled at the size equal to that bucket, or else at
+            the largest of them.  Duplicates are removed and values are sorted
             automatically.  Must contain **at least one** value when provided;
             pass ``None`` (or omit) to inherit the current buckets.
 
@@ -2679,11 +2680,22 @@ class AutoTuner:
             new_gen: tuple[int, ...] | Callable[[int], Iterable[int]]
             new_map: Callable[[int], int]
             if buckets is not None:
-                new_gen = tuple(sorted(set(buckets)))
                 # Keep the op's own mapper so tuning and inference build the
                 # same cache key even if the largest bucket is off the op's grid
                 # (e.g. 21504 vs. 32768).
                 new_map = spec.map_to_tuning_buckets
+                # Profile one listed size per key: the size equal to the key,
+                # else the largest.  The smallest would store e.g. the tactic
+                # measured at M=1 under key 1024.
+                sizes_by_key: dict[int, list[int]] = {}
+                for size in sorted(set(buckets)):
+                    sizes_by_key.setdefault(new_map(size), []).append(size)
+                new_gen = tuple(
+                    sorted(
+                        key if key in sizes else sizes[-1]
+                        for key, sizes in sizes_by_key.items()
+                    )
+                )
             elif round_up_flag:
                 if isinstance(spec.gen_tuning_buckets, (list, tuple)):
                     sorted_gen = tuple(sorted(set(spec.gen_tuning_buckets)))

@@ -1341,6 +1341,52 @@ def test_tuning_buckets_off_grid_top_bucket_matches_inference_key(monkeypatch):
     assert tactic == 1, f"Expected the tactic tuned at 24 (key 32), got {tactic}"
 
 
+def test_tuning_buckets_profile_one_size_per_op_bucket(monkeypatch):
+    """Listed sizes that share an op bucket are profiled once, at the size
+    equal to the bucket, or else at the largest of them, not at the smallest.
+    """
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1))
+
+    def coarse_ceil(m):  # op grid (8, 16), coarser than the listed sizes
+        return 8 if m <= 8 else 16
+
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(8, 16),
+                map_to_tuning_buckets=coarse_ceil,
+            ),
+        ),
+    )
+    profiled_shapes = []
+
+    def fake_profile(self, runner_obj, prof_inputs, tactic, tuning_config=None, **kw):
+        n = prof_inputs[0].shape[0]
+        profiled_shapes.append(n)
+        best = 1 if n >= 6 else 0
+        return 1.0 if tactic == best else 5.0
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+
+    # 1, 2, 4, 8 -> key 8 (8 is listed); 10, 12 -> key 16 (16 is not listed).
+    buckets = (1, 2, 4, 8, 10, 12)
+    tune_inputs = [torch.empty((12, 16), dtype=torch.float32)]
+    with autotune(tune_mode=True, tuning_buckets=buckets):
+        tuner.choose_one("op_bucket_size_test", [runner], config, tune_inputs)
+
+    assert set(profiled_shapes) == {8, 12}, sorted(set(profiled_shapes))
+
+    for m in (3, 8, 15):
+        infer_inputs = [torch.empty((m, 16), dtype=torch.float32)]
+        _, tactic = tuner.choose_one(
+            "op_bucket_size_test", [runner], config, infer_inputs
+        )
+        assert tactic == 1, f"m={m}: got {tactic}"
+
+
 def test_tuning_overrides_preserve_tensor_initializers():
     """Bucket overrides must retain the per-input initializer mapping."""
 
