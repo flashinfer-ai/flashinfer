@@ -17,9 +17,9 @@ Tests of the flashinfer public surface of the Cake SiLU-gated RMSNorm training
 kernels (SM100 / SM103 / SM107): the ``flashinfer.cake_rmsnorm_silu_gate_det_train``
 facade and its re-export from the ``flashinfer`` top-level package.  The
 facade's entry points are pass-throughs to
-``flashinfer.cake_rmsnorm_silu_gate_det_train_backend``; this module checks that
-identity (same objects at the top level, same bits as the backend) and the
-mode rules of the deterministic package: no entry point takes a
+``flashinfer.experimental.cake.cake_rmsnorm_silu_gate_det_train``; this
+module checks that identity (same objects at the top level, same bits as the
+backend) and the mode rules of the deterministic package: no entry point takes a
 ``deterministic`` keyword (``TypeError``, checked without a device),
 ``torch.use_deterministic_algorithms(True)`` (strict or ``warn_only``) neither
 raises nor warns in any call, and the backward refuses the non-deterministic
@@ -38,7 +38,7 @@ import torch.utils.checkpoint
 
 import flashinfer
 import flashinfer.cake_rmsnorm_silu_gate_det_train as facade
-import flashinfer.cake_rmsnorm_silu_gate_det_train_backend as backend
+import flashinfer.experimental.cake.cake_rmsnorm_silu_gate_det_train as backend
 from flashinfer.cake_rmsnorm_silu_gate_det_train import (
     CakeRMSNormSiLUGateDetFunction,
     cake_rmsnorm_silu_gate_det,
@@ -268,8 +268,9 @@ def test_backward_refuses_the_nondeterministic_workspace() -> None:
         message = str(info.value)
         assert message == (
             "workspace is FP64, a workspace of the non-deterministic mode "
-            "(flashinfer.cake_rmsnorm_silu_gate_train_backend."
-            "cake_rmsnorm_silu_gate_train_backward_workspace); the deterministic "
+            "(flashinfer.cake_rmsnorm_silu_gate_nondet_train."
+            "cake_rmsnorm_silu_gate_nondet_train_backward_workspace); the "
+            "deterministic "
             "backward needs an FP32 workspace "
             "(flashinfer.cake_rmsnorm_silu_gate_det_train."
             "cake_rmsnorm_silu_gate_det_train_backward_workspace)"

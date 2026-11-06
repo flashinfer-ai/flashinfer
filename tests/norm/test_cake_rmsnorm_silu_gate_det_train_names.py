@@ -13,21 +13,35 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Names of the Cake SiLU-gated RMSNorm training packages.
+Names of the Cake SiLU-gated RMSNorm training family, both modes.
 
-The deterministic namespaces (the ``flashinfer.cake_rmsnorm_silu_gate_det_train`` facade and its backend package)
-bind only ``det`` names: the names the package had before it took its ``det`` names are not attributes of either
-namespace (no alias, no module ``__getattr__``), and every name of their ``__all__`` but the two architecture
-constants carries ``det``.  The names without ``det`` at the ``flashinfer`` top level, the module
-``flashinfer.cake_rmsnorm_silu_gate_train`` and the package ``flashinfer.cake_rmsnorm_silu_gate_train_backend`` are the
-non-deterministic package: their own objects and modules (``deterministic=False`` only;
-``test_cake_rmsnorm_silu_gate_train_api.py`` holds the mode rules).  Both non-deterministic module paths are also
-attributes of the ``flashinfer`` package after a plain ``import flashinfer`` (checked in fresh interpreters).
+The mode is part of every public name, and only of the name.  For each mode
+(``det``, ``nondet``) the facade ``flashinfer.cake_rmsnorm_silu_gate_<mode>_train``
+(top level) and its backend package
+``flashinfer.experimental.cake.cake_rmsnorm_silu_gate_<mode>_train`` export the
+autograd functional ``cake_rmsnorm_silu_gate_<mode>``, the autograd class
+``CakeRMSNormSiLUGate<Mode>Function``, the support query
+``is_cake_rmsnorm_silu_gate_<mode>_train_supported`` and functions named by the
+module plus a verb; the only other names are the two architecture constants
+``ARCHES`` and ``SUPPORTED_COMPUTE_CAPABILITIES`` (module constants, exempt).
+No entry point has a ``deterministic`` parameter.  The modules and names the
+family had before (``flashinfer.cake_rmsnorm_silu_gate_train``, the packages
+``flashinfer.cake_rmsnorm_silu_gate_train_backend`` and
+``flashinfer.cake_rmsnorm_silu_gate_det_train_backend``, and the names without
+a mode word) fail at import: no alias, no module ``__getattr__``, no compat
+module.  The ``flashinfer`` top level binds only names of the family with a
+mode word (checked in this process and in fresh interpreters).  The JIT
+library names of the backends (``cake_rmsnorm_silu_gate_train_<hash>`` and
+``cake_rmsnorm_silu_gate_det_train_<hash>``) are build identities, not Python
+names, and are unchanged.
 """
 
 from __future__ import annotations
 
 import importlib
+import importlib.util
+import inspect
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -35,172 +49,221 @@ from pathlib import Path
 import pytest
 
 import flashinfer
-import flashinfer.cake_rmsnorm_silu_gate_det_train as facade
-import flashinfer.cake_rmsnorm_silu_gate_det_train_backend as backend
-import flashinfer.cake_rmsnorm_silu_gate_train as nd_facade
-import flashinfer.cake_rmsnorm_silu_gate_train_backend as nd_backend
+import flashinfer.cake_rmsnorm_silu_gate_det_train as det_facade
+import flashinfer.cake_rmsnorm_silu_gate_nondet_train as nd_facade
+import flashinfer.experimental.cake.cake_rmsnorm_silu_gate_det_train as det_backend
+import flashinfer.experimental.cake.cake_rmsnorm_silu_gate_nondet_train as nd_backend
 
 pytestmark = pytest.mark.cpu_only
 
-ND_FACADE = "flashinfer.cake_rmsnorm_silu_gate_train"
-DET_FACADE = "flashinfer.cake_rmsnorm_silu_gate_det_train"
-ND_PACKAGE = "flashinfer.cake_rmsnorm_silu_gate_train_backend"
-DET_PACKAGE = "flashinfer.cake_rmsnorm_silu_gate_det_train_backend"
+OP = "cake_rmsnorm_silu_gate"
+MODES = ("det", "nondet")
+FACADE = {mode: f"flashinfer.{OP}_{mode}_train" for mode in MODES}
+BACKEND = {mode: f"flashinfer.experimental.cake.{OP}_{mode}_train" for mode in MODES}
+NAMESPACES = {
+    ("det", "facade"): det_facade,
+    ("det", "backend"): det_backend,
+    ("nondet", "facade"): nd_facade,
+    ("nondet", "backend"): nd_backend,
+}
+NAMESPACE_IDS = [f"{mode}-{kind}" for mode, kind in NAMESPACES]
 SUBMODULES = ("cake_build", "cake_jit")
+# Module constants of every Cake training package (no mode word: the module
+# path carries the mode).
+CONSTANTS = {"ARCHES", "SUPPORTED_COMPUTE_CAPABILITIES"}
+CLASS = {
+    "det": "CakeRMSNormSiLUGateDetFunction",
+    "nondet": "CakeRMSNormSiLUGateNondetFunction",
+}
 
-# (name without det, det name): the non-deterministic package's names and the
-# deterministic package's names of the same work.  The names without det were
-# the deterministic package's names before it took its det names; they are not
-# attributes of the deterministic namespaces.
-PAIRS = (
-    ("CakeRMSNormSiLUGateFunction", "CakeRMSNormSiLUGateDetFunction"),
-    ("cake_rmsnorm_silu_gate", "cake_rmsnorm_silu_gate_det"),
-    (
-        "cake_rmsnorm_silu_gate_train_backward",
-        "cake_rmsnorm_silu_gate_det_train_backward",
-    ),
-    (
-        "cake_rmsnorm_silu_gate_train_backward_workspace",
-        "cake_rmsnorm_silu_gate_det_train_backward_workspace",
-    ),
-    (
-        "cake_rmsnorm_silu_gate_train_backward_workspace_bytes",
-        "cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes",
-    ),
-    (
-        "cake_rmsnorm_silu_gate_train_forward",
-        "cake_rmsnorm_silu_gate_det_train_forward",
-    ),
-    (
-        "is_cake_rmsnorm_silu_gate_train_supported",
-        "is_cake_rmsnorm_silu_gate_det_train_supported",
-    ),
+
+def _public_names(mode: str) -> set:
+    module = f"{OP}_{mode}_train"
+    names = {
+        f"{OP}_{mode}",
+        CLASS[mode],
+        f"is_{module}_supported",
+        f"{module}_forward",
+        f"{module}_backward",
+        f"{module}_backward_workspace",
+        f"{module}_backward_workspace_bytes",
+    }
+    if mode == "nondet":
+        names.add(f"{module}_reset_workspace")
+    return names
+
+
+PUBLIC = {mode: _public_names(mode) for mode in MODES}
+# The names of the family the ``flashinfer`` top level binds.
+TOP_LEVEL = {
+    mode: {
+        CLASS[mode],
+        f"{OP}_{mode}",
+        f"{OP}_{mode}_train_forward",
+        f"{OP}_{mode}_train_backward",
+        f"{OP}_{mode}_train_backward_workspace_bytes",
+    }
+    for mode in MODES
+}
+# The modules and packages the family had before the mode-in-name rule.
+OLD_MODULES = (
+    "flashinfer.cake_rmsnorm_silu_gate_train",
+    "flashinfer.cake_rmsnorm_silu_gate_train_backend",
+    "flashinfer.cake_rmsnorm_silu_gate_det_train_backend",
 )
-NAMES = dict(PAIRS)
-# The names without det the ``flashinfer`` top level exports.
-TOP_LEVEL_NAMES = (
+# The names the family had without a mode word.
+OLD_NAMES = (
     "CakeRMSNormSiLUGateFunction",
     "cake_rmsnorm_silu_gate",
-    "cake_rmsnorm_silu_gate_train_backward",
-    "cake_rmsnorm_silu_gate_train_backward_workspace_bytes",
     "cake_rmsnorm_silu_gate_train_forward",
-)
-NAMESPACES = {"facade": facade, "backend": backend}
-# The names of a det ``__all__`` that are not entry points.
-CONSTANTS = {"ARCHES", "SUPPORTED_COMPUTE_CAPABILITIES"}
-
-
-@pytest.mark.parametrize("namespace", sorted(NAMESPACES))
-@pytest.mark.parametrize("name", sorted(NAMES))
-def test_det_modules_bind_no_pre_det_name(namespace: str, name: str) -> None:
-    module = NAMESPACES[namespace]
-    assert not hasattr(module, name), (namespace, name)
-    assert name not in vars(module), (namespace, name)
-    assert name not in module.__all__, (namespace, name)
-    assert hasattr(module, NAMES[name]), (namespace, NAMES[name])
-
-
-@pytest.mark.parametrize("namespace", sorted(NAMESPACES))
-def test_det_modules_have_no_name_shim(namespace: str) -> None:
-    # No module ``__getattr__`` (PEP 562) that could resolve a removed name.
-    assert "__getattr__" not in vars(NAMESPACES[namespace]), namespace
-
-
-@pytest.mark.parametrize("namespace", sorted(NAMESPACES))
-def test_det_all_lists_only_det_names(namespace: str) -> None:
-    module = NAMESPACES[namespace]
-    names = set(module.__all__)
-    assert names >= CONSTANTS, namespace
-    assert set(NAMES.values()) <= names, namespace
-    for name in names - CONSTANTS:
-        assert "det" in name.lower(), (namespace, name)
-
-
-def test_det_star_import_binds_only_det_names() -> None:
-    for package in (DET_FACADE, DET_PACKAGE):
-        names: dict = {}
-        exec(f"from {package} import *", names)
-        del names["__builtins__"]
-        assert not set(NAMES) & set(names), package
-        assert sorted(names) == sorted(importlib.import_module(package).__all__)
-
-
-@pytest.mark.parametrize("name", TOP_LEVEL_NAMES)
-def test_top_level_name_without_det_is_the_nondeterministic_object(name: str) -> None:
-    det = NAMES[name]
-    assert getattr(flashinfer, name) is getattr(nd_facade, name), name
-    assert getattr(flashinfer, name) is not getattr(flashinfer, det), (name, det)
-    assert getattr(flashinfer, det) is getattr(facade, det), det
-
-
-def test_det_entry_points_are_the_decorated_defs() -> None:
-    # One ``flashinfer_api`` wrapper per entry point, under its det name.
-    for name in (
-        "cake_rmsnorm_silu_gate_det",
-        "cake_rmsnorm_silu_gate_det_train_backward",
-        "cake_rmsnorm_silu_gate_det_train_forward",
-    ):
-        assert getattr(facade, name).__name__ == name
-
-
-# The ``__all__`` of the non-deterministic facade and backend package: the names
-# without det and the workspace reset of the non-deterministic backward.
-ND_ALL = sorted(
-    [
-        "ARCHES",
-        "SUPPORTED_COMPUTE_CAPABILITIES",
-        "cake_rmsnorm_silu_gate_train_reset_workspace",
-        *NAMES,
-    ]
-)
-# The non-deterministic facade's own entry points (``flashinfer_api`` wrappers
-# that check ``deterministic``); its other names, the autograd function
-# included, are the backend package's objects.
-ND_FACADE_DEFS = (
-    "cake_rmsnorm_silu_gate",
     "cake_rmsnorm_silu_gate_train_backward",
     "cake_rmsnorm_silu_gate_train_backward_workspace",
     "cake_rmsnorm_silu_gate_train_backward_workspace_bytes",
-    "cake_rmsnorm_silu_gate_train_forward",
     "cake_rmsnorm_silu_gate_train_reset_workspace",
     "is_cake_rmsnorm_silu_gate_train_supported",
 )
+# A name of the family: it names the op.
+FAMILY = re.compile(r"rmsnorm_silu_gate|RMSNormSiLUGate")
 
 
-def test_nondeterministic_facade_is_its_own_module() -> None:
-    assert importlib.import_module(ND_FACADE) is nd_facade
-    assert sys.modules[ND_FACADE] is not sys.modules[DET_FACADE]
-    assert Path(nd_facade.__file__).name == "cake_rmsnorm_silu_gate_train.py"
-    assert sorted(nd_facade.__all__) == ND_ALL
-    for name in nd_facade.__all__:
-        assert (getattr(nd_facade, name) is getattr(nd_backend, name)) != (
-            name in ND_FACADE_DEFS
-        ), name
-    assert (
-        nd_facade.CakeRMSNormSiLUGateFunction is nd_backend.CakeRMSNormSiLUGateFunction
+def _mode_words(name: str) -> list:
+    """The mode words of a name: its ``_``-separated words for a snake-case
+    name, its capitalized words for a CamelCase one."""
+    if name[:1].isupper():
+        words = [w.lower() for w in re.findall(r"[A-Z][a-z0-9]*", name)]
+    else:
+        words = name.split("_")
+    return [w for w in words if w in MODES]
+
+
+def _entries(module) -> dict:
+    """The callables of ``module.__all__``: functions, and the autograd class's
+    ``forward`` and ``backward``."""
+    entries = {}
+    for name in set(module.__all__) - CONSTANTS:
+        obj = getattr(module, name)
+        if inspect.isclass(obj):
+            entries[f"{name}.forward"] = obj.forward
+            entries[f"{name}.backward"] = obj.backward
+        else:
+            entries[name] = obj
+    return entries
+
+
+# --------------------------------------------------------------------------- the four namespaces
+
+
+@pytest.mark.parametrize("key", list(NAMESPACES), ids=NAMESPACE_IDS)
+def test_all_is_the_mode_names_and_the_constants(key) -> None:
+    mode, _ = key
+    module = NAMESPACES[key]
+    assert set(module.__all__) == PUBLIC[mode] | CONSTANTS, key
+    for name in PUBLIC[mode]:
+        assert hasattr(module, name), (key, name)
+
+
+@pytest.mark.parametrize("key", list(NAMESPACES), ids=NAMESPACE_IDS)
+def test_every_public_name_carries_its_mode(key) -> None:
+    """Every public name but the two constants carries exactly one mode word,
+    its package's; the names follow rules 2 to 6 and 10 of the scheme."""
+    mode, _ = key
+    module = NAMESPACES[key]
+    prefix = f"{OP}_{mode}_train"
+    for name in set(module.__all__) - CONSTANTS:
+        assert _mode_words(name) == [mode], (key, name)
+        obj = getattr(module, name)
+        if inspect.isclass(obj):
+            assert name == CLASS[mode], (key, name)
+        else:
+            assert name in (f"{OP}_{mode}", f"is_{prefix}_supported") or (
+                name.startswith(f"{prefix}_")
+            ), (key, name)
+            assert not {"fwd", "bwd"} & set(name.split("_")), (key, name)
+    for name in vars(module):
+        if FAMILY.search(name) and not name.startswith("_"):
+            assert _mode_words(name) == [mode], (key, name)
+
+
+@pytest.mark.parametrize("key", list(NAMESPACES), ids=NAMESPACE_IDS)
+def test_no_entry_has_a_deterministic_parameter(key) -> None:
+    entries = _entries(NAMESPACES[key])
+    assert len(entries) == len(PUBLIC[key[0]]) + 1, key
+    for name, entry in entries.items():
+        assert "deterministic" not in inspect.signature(entry).parameters, (key, name)
+    cls = getattr(NAMESPACES[key], CLASS[key[0]])
+    assert list(inspect.signature(cls.forward).parameters) == [
+        "ctx",
+        "x",
+        "z",
+        "weight",
+        "eps",
+    ], key
+
+
+@pytest.mark.parametrize("key", list(NAMESPACES), ids=NAMESPACE_IDS)
+def test_old_names_are_not_attributes(key) -> None:
+    module = NAMESPACES[key]
+    for name in OLD_NAMES:
+        assert not hasattr(module, name), (key, name)
+        assert name not in vars(module), (key, name)
+    other = "nondet" if key[0] == "det" else "det"
+    for name in PUBLIC[other]:
+        assert not hasattr(module, name), (key, name)
+
+
+@pytest.mark.parametrize("key", list(NAMESPACES), ids=NAMESPACE_IDS)
+def test_no_name_shim(key) -> None:
+    # No module ``__getattr__`` (PEP 562) that could resolve a removed name.
+    assert "__getattr__" not in vars(NAMESPACES[key]), key
+
+
+@pytest.mark.parametrize("key", list(NAMESPACES), ids=NAMESPACE_IDS)
+def test_star_import_binds_only_the_mode_names(key) -> None:
+    module = NAMESPACES[key]
+    names: dict = {}
+    exec(f"from {module.__name__} import *", names)
+    del names["__builtins__"]
+    assert sorted(names) == sorted(module.__all__), key
+    for name in names:
+        assert names[name] is getattr(module, name), (key, name)
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_modules_sit_at_their_places(mode: str) -> None:
+    """The facade sits at the ``flashinfer`` top level, the backend package at
+    ``flashinfer/experimental/cake/<module>/`` with its own build files."""
+    root = Path(flashinfer.__file__).parent
+    facade = importlib.import_module(FACADE[mode])
+    backend = importlib.import_module(BACKEND[mode])
+    assert Path(facade.__file__) == root / f"{OP}_{mode}_train.py"
+    package = root / "experimental" / "cake" / f"{OP}_{mode}_train"
+    assert Path(backend.__file__) == package / "__init__.py"
+    files = {p.name for p in package.iterdir() if p.name != "__pycache__"}
+    assert {"__init__.py", "cake_build.py", "cake_jit.py", "build.json", "csrc"} <= (
+        files
     )
-    # the det names live in the det facade only
-    assert not hasattr(nd_facade, "cake_rmsnorm_silu_gate_det_train_forward")
+    for submodule in SUBMODULES:
+        loaded = importlib.import_module(f"{BACKEND[mode]}.{submodule}")
+        assert Path(loaded.__file__).parent == package, (mode, submodule)
 
 
-@pytest.mark.parametrize("submodule", SUBMODULES)
-def test_nondeterministic_package_submodule_is_its_own_module(submodule: str) -> None:
-    nd = importlib.import_module(f"{ND_PACKAGE}.{submodule}")
-    det = importlib.import_module(f"{DET_PACKAGE}.{submodule}")
-    assert nd is not det, submodule
-    assert sys.modules[f"{ND_PACKAGE}.{submodule}"] is nd, submodule
-    assert Path(nd.__file__).parent == Path(nd_backend.__file__).parent, submodule
-
-
-def test_nondeterministic_package_is_self_contained() -> None:
-    assert sorted(nd_backend.__all__) == ND_ALL
-    assert not hasattr(nd_backend, "cake_rmsnorm_silu_gate_det_train_forward")
-    # its own registry: the det forward program renamed, the one-kernel backward in both dw dtypes
-    # and the long-input modules
+def test_the_two_modes_are_separate_modules() -> None:
+    assert det_facade is not nd_facade and det_backend is not nd_backend
+    for submodule in SUBMODULES:
+        det = importlib.import_module(f"{BACKEND['det']}.{submodule}")
+        nd = importlib.import_module(f"{BACKEND['nondet']}.{submodule}")
+        assert det is not nd, submodule
+    assert nd_backend.cake_jit.MODULES is not det_backend.cake_jit.MODULES
+    # the JIT library names (build identities) are unchanged
+    assert nd_backend.cake_jit.MODULES and all(
+        name.startswith("cake_rmsnorm_silu_gate_train_")
+        for name in nd_backend.cake_jit.MODULES
+    )
+    assert det_backend.cake_jit.MODULES and all(
+        name.startswith("cake_rmsnorm_silu_gate_det_train_")
+        for name in det_backend.cake_jit.MODULES
+    )
     loader = nd_backend.cake_jit
-    assert loader.MODULES and all(
-        name.startswith("cake_rmsnorm_silu_gate_train_") for name in loader.MODULES
-    )
     roles = {record["role"] for record in loader.MODULES.values()}
     assert roles == (
         set(loader.ROLES)
@@ -209,56 +272,96 @@ def test_nondeterministic_package_is_self_contained() -> None:
         | set(loader.MID_ROLES)
         | set(loader.SHORT_ROLES)
     )
-    nd_dir = Path(nd_backend.__file__).parent
-    files = {p.name for p in nd_dir.iterdir() if p.name != "__pycache__"}
-    assert {
-        "__init__.py",
-        "cake_build.py",
-        "cake_jit.py",
-        "build.json",
-        "csrc",
-    } <= files
 
 
-def test_nondeterministic_package_star_import_binds_its_own_objects() -> None:
-    names: dict = {}
-    exec(f"from {ND_PACKAGE} import *", names)
-    del names["__builtins__"]
-    assert sorted(names) == ND_ALL
-    for name in ND_ALL:
-        assert names[name] is getattr(nd_backend, name), name
+def test_facade_objects() -> None:
+    """Each facade's ``flashinfer_api`` entry points are its own defs; its other
+    names, the autograd class included, are its backend's objects."""
+    det_defs = {
+        f"{OP}_det",
+        f"{OP}_det_train_forward",
+        f"{OP}_det_train_backward",
+    }
+    nd_defs = PUBLIC["nondet"] - {CLASS["nondet"]}
+    for facade, backend, defs in (
+        (det_facade, det_backend, det_defs),
+        (nd_facade, nd_backend, nd_defs),
+    ):
+        for name in facade.__all__:
+            own = getattr(facade, name) is not getattr(backend, name)
+            assert own == (name in defs), (facade.__name__, name)
+            if name in defs:
+                assert getattr(facade, name).__name__ == name, name
 
 
-def test_nondeterministic_package_dir_lists_its_own_names() -> None:
-    listed = set(dir(nd_backend))
-    assert set(ND_ALL) | set(SUBMODULES) <= listed
-    assert not set(NAMES.values()) & listed
+# --------------------------------------------------------------------------- old modules and the top level
 
 
-# Each import form of the non-deterministic package in a fresh interpreter: the
-# submodule path first, then the attributes of flashinfer and a star import of
-# the package.
+@pytest.mark.parametrize("module", OLD_MODULES)
+def test_old_module_fails_at_import(module: str) -> None:
+    assert importlib.util.find_spec(module) is None, module
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module(module)
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module(f"{module}.cake_jit")
+    assert not hasattr(flashinfer, module.rpartition(".")[2]), module
+
+
+@pytest.mark.parametrize("name", OLD_NAMES)
+def test_old_name_fails_at_import(name: str) -> None:
+    assert not hasattr(flashinfer, name), name
+    for module in ("flashinfer", FACADE["det"], FACADE["nondet"]):
+        with pytest.raises(ImportError):
+            exec(f"from {module} import {name}", {})
+
+
+def test_top_level_binds_only_mode_names() -> None:
+    family = {name for name in vars(flashinfer) if FAMILY.search(name)}
+    modules = {f"{OP}_{mode}_train" for mode in MODES}
+    assert family == TOP_LEVEL["det"] | TOP_LEVEL["nondet"] | modules, sorted(family)
+    for mode in MODES:
+        facade = importlib.import_module(FACADE[mode])
+        for name in TOP_LEVEL[mode]:
+            assert getattr(flashinfer, name) is getattr(facade, name), name
+        assert getattr(flashinfer, f"{OP}_{mode}_train") is facade
+
+
+# Each import form in a fresh interpreter: a plain ``import flashinfer`` (the
+# family's names at the top level), the old modules and names (each fails), and
+# the backend submodules first.
 FRESH = {
-    "nd_submodule_first": (
-        "import importlib, sys\n"
-        f"nd = importlib.import_module('{ND_PACKAGE}.cake_jit')\n"
-        f"det = importlib.import_module('{DET_PACKAGE}.cake_jit')\n"
-        "assert nd is not det and nd.MODULES is not det.MODULES\n"
-        f"assert importlib.import_module('{ND_FACADE}') is not importlib.import_module('{DET_FACADE}')\n"
+    "top_level": (
+        "import re, flashinfer\n"
+        "family = sorted(n for n in vars(flashinfer) if re.search("
+        "r'rmsnorm_silu_gate|RMSNormSiLUGate', n))\n"
+        f"want = sorted({sorted(TOP_LEVEL['det'] | TOP_LEVEL['nondet'] | {f'{OP}_{m}_train' for m in MODES})!r})\n"
+        "assert family == want, family\n"
     ),
-    "flashinfer_attributes": (
-        "import sys\nimport flashinfer\n"
-        f"assert flashinfer.{ND_FACADE.rpartition('.')[2]} is sys.modules['{ND_FACADE}']\n"
-        f"assert flashinfer.{ND_PACKAGE.rpartition('.')[2]} is sys.modules['{ND_PACKAGE}']\n"
-        f"assert flashinfer.{PAIRS[0][0]} is sys.modules['{ND_FACADE}'].{PAIRS[0][0]}\n"
-        f"assert not hasattr(sys.modules['{DET_FACADE}'], '{PAIRS[0][0]}')\n"
-    ),
-    "nd_package_star_import": (
+    "old_modules": (
         "import importlib\n"
-        f"from {ND_PACKAGE} import *\n"
-        f"nd = importlib.import_module('{ND_PACKAGE}')\n"
-        "assert all(globals()[n] is getattr(nd, n) for n in nd.__all__)\n"
-        "assert 'cake_rmsnorm_silu_gate_det_train_forward' not in globals()\n"
+        f"for m in {list(OLD_MODULES)!r}:\n"
+        "    try:\n"
+        "        importlib.import_module(m)\n"
+        "    except ModuleNotFoundError:\n"
+        "        continue\n"
+        "    raise AssertionError(m)\n"
+    ),
+    "old_names": (
+        f"for n in {list(OLD_NAMES)!r}:\n"
+        f"    for m in {['flashinfer', FACADE['det'], FACADE['nondet']]!r}:\n"
+        "        try:\n"
+        "            exec(f'from {m} import {n}', {})\n"
+        "        except ImportError:\n"
+        "            continue\n"
+        "        raise AssertionError((m, n))\n"
+    ),
+    "backend_submodule_first": (
+        "import importlib, sys\n"
+        f"nd = importlib.import_module('{BACKEND['nondet']}.cake_jit')\n"
+        f"det = importlib.import_module('{BACKEND['det']}.cake_jit')\n"
+        "assert nd is not det and nd.MODULES is not det.MODULES\n"
+        f"assert importlib.import_module('{FACADE['nondet']}') is not "
+        f"importlib.import_module('{FACADE['det']}')\n"
     ),
 }
 

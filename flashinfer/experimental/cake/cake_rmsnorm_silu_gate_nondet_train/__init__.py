@@ -13,14 +13,14 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Non-deterministic backend of :mod:`flashinfer.cake_rmsnorm_silu_gate_train`: the
+Backend of :mod:`flashinfer.cake_rmsnorm_silu_gate_nondet_train`: the
 Cake SiLU-gated RMSNorm training forward / backward (SM100 / SM103 / SM107) with
-the opt-in non-deterministic weight gradient, as one self-contained package (host
+the non-deterministic weight gradient, as one self-contained package (host
 API bodies, the ``cake_jit`` registry, the pinned ``cake_build`` loader and the
 generated CUDA sources under ``csrc/``).  It imports nothing from other
 flashinfer packages and ships its own copy of every program it launches.  The
 ``@flashinfer_api`` decorations and the user-facing documentation live in
-:mod:`flashinfer.cake_rmsnorm_silu_gate_train`; import that module.  The
+:mod:`flashinfer.cake_rmsnorm_silu_gate_nondet_train`; import that module.  The
 deterministic package is ``flashinfer.cake_rmsnorm_silu_gate_det_train``: no
 call of this package runs it.
 
@@ -79,18 +79,9 @@ CTA sums its rows' terms in FP32 (at most 16 FP32 roundings a term), and CTA
 and rounds the sum into ``dw`` the same way, so ``dw`` is the same bits on
 every call and within the same bound.
 
-Numerical-mode keyword: every compute entry point
-(:func:`cake_rmsnorm_silu_gate_train_forward`,
-:func:`cake_rmsnorm_silu_gate_train_backward`, :func:`cake_rmsnorm_silu_gate`
-and the forward of :class:`CakeRMSNormSiLUGateFunction`) takes the
-keyword-only ``deterministic: bool = True`` and raises ``ValueError`` unless
-it is ``False`` (``deterministic is not False``: the default, ``True``,
-``None``, ``0``, ``1`` and ``"False"`` all raise), naming the deterministic
-entry point; this package has no deterministic weight gradient, so a call
-must opt in, and it never runs the deterministic package.  The support query,
-the workspace size and factory and the workspace reset choose no mode and
-take no mode keyword.  The backward of :class:`CakeRMSNormSiLUGateFunction`
-takes no mode: its forward checked it.
+Mode: the mode is part of the name (``nondet``).  No entry point takes a
+``deterministic`` keyword (passing one is a ``TypeError``), and no call of this
+package runs the deterministic package.
 With ``torch.use_deterministic_algorithms(True)`` a backward that computes the
 weight gradient raises PyTorch's alert for an operation without a
 deterministic implementation (a ``RuntimeError``, or a ``UserWarning`` under
@@ -122,8 +113,8 @@ Host design (the input layout rules are the deterministic package's):
   The kernel leaves all of it zero, so a workspace zeroed once serves every
   later call on its stream, of any shape and either weight-gradient dtype, and
   every CUDA Graph replay, with no host write.  A caller workspace must come
-  from :func:`cake_rmsnorm_silu_gate_train_backward_workspace` (zero-filled),
-  or be zeroed with :func:`cake_rmsnorm_silu_gate_train_reset_workspace` after
+  from :func:`cake_rmsnorm_silu_gate_nondet_train_backward_workspace` (zero-filled),
+  or be zeroed with :func:`cake_rmsnorm_silu_gate_nondet_train_reset_workspace` after
   anything else wrote into it (a launch that did not complete, another use of
   the buffer); the kernel never needs a reset between its own calls.
 - Retained state (FlashInfer issue #7039): the autograd function saves only
@@ -199,7 +190,7 @@ Host design (the input layout rules are the deterministic package's):
   shared memory (each 128-thread CTA of the long backward on sm_107a 10496),
   so a kernel holding every SM with a small shared-memory carveout delays the
   start of those backwards until it exits;
-  :mod:`flashinfer.cake_rmsnorm_silu_gate_train` documents the remedy.  The
+  :mod:`flashinfer.cake_rmsnorm_silu_gate_nondet_train` documents the remedy.  The
   short backward's 256-thread CTAs need 6144 bytes each; measured at 48 and
   240 rows, they started at once beside a kernel holding every SM with one
   128-thread CTA, no shared memory and the default or the maximum-L1 carveout
@@ -239,50 +230,14 @@ SUPPORTED_COMPUTE_CAPABILITIES: tuple[tuple[int, int], ...] = tuple(
 _ALIGNMENT_BYTES = ALIGNMENT_ELEMENTS * 2
 
 
-# The deterministic package and, for each entry point of this package and of
-# the facade module, the deterministic entry point that does the same work:
-# named by the mode refusal and the alert (this package imports nothing from
-# the deterministic package).
+# The deterministic package and, for each entry point of this package that can
+# alert, the deterministic entry point that does the same work: named by the
+# alert (this package imports nothing from the deterministic package).
 _DETERMINISTIC_PACKAGE = "flashinfer.cake_rmsnorm_silu_gate_det_train"
 _DETERMINISTIC_ENTRIES = {
-    "cake_rmsnorm_silu_gate_train_forward": "cake_rmsnorm_silu_gate_det_train_forward",
-    "cake_rmsnorm_silu_gate_train_backward": "cake_rmsnorm_silu_gate_det_train_backward",
-    "cake_rmsnorm_silu_gate_train_backward_workspace": "cake_rmsnorm_silu_gate_det_train_backward_workspace",
-    "cake_rmsnorm_silu_gate_train_backward_workspace_bytes": "cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes",
-    "is_cake_rmsnorm_silu_gate_train_supported": "is_cake_rmsnorm_silu_gate_det_train_supported",
-    "cake_rmsnorm_silu_gate": "cake_rmsnorm_silu_gate_det",
-    "CakeRMSNormSiLUGateFunction": "CakeRMSNormSiLUGateDetFunction",
-    "CakeRMSNormSiLUGateFunction.backward": "CakeRMSNormSiLUGateDetFunction",
+    "cake_rmsnorm_silu_gate_nondet_train_backward": "cake_rmsnorm_silu_gate_det_train_backward",
+    "CakeRMSNormSiLUGateNondetFunction.backward": "CakeRMSNormSiLUGateDetFunction",
 }
-_RESET_ENTRY = "cake_rmsnorm_silu_gate_train_reset_workspace"
-
-
-def _require_nondeterministic(
-    deterministic: Any, entry: str, module: str = __name__
-) -> None:
-    """The mode contract of every compute entry point (and of the facade
-    module's copies of the helpers): this package sums the weight gradient
-    non-deterministically, so an entry point needs ``deterministic=False`` and
-    raises ``ValueError`` for any other value, naming the deterministic entry
-    point that does the same work.  ``module`` is the module of ``entry``."""
-
-    if deterministic is False:
-        return
-    head = (
-        f"{module}.{entry} runs only the non-deterministic kernels and got "
-        f"deterministic={deterministic!r}; pass deterministic=False for the "
-        "non-deterministic path"
-    )
-    if entry == _RESET_ENTRY:
-        raise ValueError(
-            f"{head}; the deterministic backward's workspace "
-            f"({_DETERMINISTIC_PACKAGE}.cake_rmsnorm_silu_gate_det_train_backward_workspace) "
-            "needs no reset"
-        )
-    raise ValueError(
-        f"{head}, or call {_DETERMINISTIC_PACKAGE}.{_DETERMINISTIC_ENTRIES[entry]} "
-        "for the deterministic one"
-    )
 
 
 def _alert_nondeterministic(entry: str) -> None:
@@ -340,11 +295,10 @@ def _device_arch(device: torch.device) -> str:
     return arch
 
 
-def is_cake_rmsnorm_silu_gate_train_supported(device: torch.device) -> bool:
+def is_cake_rmsnorm_silu_gate_nondet_train_supported(device: torch.device) -> bool:
     """Whether ``device`` is a CUDA device with every route of this package.
 
-    A capability probe that launches nothing and chooses no mode (it takes no
-    ``deterministic`` keyword); it does not depend on
+    A capability probe that launches nothing; it does not depend on
     ``torch.use_deterministic_algorithms``.
     """
 
@@ -486,7 +440,7 @@ def _forward(
     *,
     out: Optional[torch.Tensor],
 ) -> torch.Tensor:
-    """The forward of this package's program (``deterministic=False``)."""
+    """The forward of this package's program."""
 
     device = x.device
     arch = _device_arch(device)
@@ -521,14 +475,13 @@ def _forward(
     return y
 
 
-def cake_rmsnorm_silu_gate_train_forward(
+def cake_rmsnorm_silu_gate_nondet_train_forward(
     x: torch.Tensor,
     z: torch.Tensor,
     weight: torch.Tensor,
     eps: float = 1e-6,
     *,
     out: Optional[torch.Tensor] = None,
-    deterministic: bool = True,
 ) -> torch.Tensor:
     r"""SiLU-gated RMSNorm forward of this package:
     ``y = BF16(((x * rstd) * weight) * silu(z))``.
@@ -540,11 +493,9 @@ def cake_rmsnorm_silu_gate_train_forward(
     sm_107a) the mid forward and from 2400 (1740) the long forward (the same
     bits).  The
     arguments are those of
-    :func:`flashinfer.cake_rmsnorm_silu_gate_train.cake_rmsnorm_silu_gate_train_forward`;
-    ``deterministic`` must be ``False``.
+    :func:`flashinfer.cake_rmsnorm_silu_gate_nondet_train.cake_rmsnorm_silu_gate_nondet_train_forward`.
     """
 
-    _require_nondeterministic(deterministic, "cake_rmsnorm_silu_gate_train_forward")
     return _forward(x, z, weight, eps, out=out)
 
 
@@ -560,13 +511,13 @@ def _workspace_elements(arch: str) -> int:
     )
 
 
-def cake_rmsnorm_silu_gate_train_backward_workspace_bytes(
+def cake_rmsnorm_silu_gate_nondet_train_backward_workspace_bytes(
     rows: int, device: torch.device
 ) -> int:
     """Bytes of the caller-owned backward workspace for ``rows`` rows
     (``T * H``) on ``device``: the FP64 weight-gradient accumulators and the
     8-byte word of the arrival ticket and the claim counter, a few KiB whatever
-    ``rows``.  It chooses no mode and takes no ``deterministic`` keyword.
+    ``rows``.
     """
 
     if int(rows) < 0:
@@ -574,19 +525,19 @@ def cake_rmsnorm_silu_gate_train_backward_workspace_bytes(
     return _workspace_elements(_device_arch(torch.device(device))) * 8
 
 
-def cake_rmsnorm_silu_gate_train_backward_workspace(
+def cake_rmsnorm_silu_gate_nondet_train_backward_workspace(
     rows: int, device: torch.device
 ) -> torch.Tensor:
     """A caller-owned backward workspace for ``rows`` rows (``T * H``): a
     zero-filled FP64 tensor of
-    :func:`cake_rmsnorm_silu_gate_train_backward_workspace_bytes` bytes.
+    :func:`cake_rmsnorm_silu_gate_nondet_train_backward_workspace_bytes` bytes.
 
     The backward leaves it zero after every call, so it serves every later call
     on its stream (any ``T`` and ``H``, BF16 or FP32 weight gradient) and every
     CUDA Graph replay without a reset.  A backward that may run at the same time
-    on another stream needs its own workspace.  It chooses no mode and takes no
-    ``deterministic`` keyword; the deterministic package's FP32 buffer is not a
-    workspace of this package (and this one not of that package's backward).
+    on another stream needs its own workspace.  The deterministic package's
+    FP32 buffer is not a workspace of this package (and this one not of that
+    package's backward).
     """
 
     device = torch.device(device)
@@ -597,23 +548,22 @@ def cake_rmsnorm_silu_gate_train_backward_workspace(
     )
 
 
-def cake_rmsnorm_silu_gate_train_reset_workspace(workspace: torch.Tensor) -> None:
+def cake_rmsnorm_silu_gate_nondet_train_reset_workspace(workspace: torch.Tensor) -> None:
     """Return a caller-owned backward workspace to its first-use state: zero its
     FP64 accumulators and the two 32-bit words of its last element (the arrival
     ticket and the claim counter).
 
     Every backward leaves its workspace zero, so reuse across calls, shapes,
     weight-gradient dtypes and CUDA Graph replays needs no reset.  A workspace
-    that did not come from :func:`cake_rmsnorm_silu_gate_train_backward_workspace`,
+    that did not come from :func:`cake_rmsnorm_silu_gate_nondet_train_backward_workspace`,
     or that something else wrote into (a launch that did not complete, another
     use of the buffer), must be reset before its next backward.  The fill runs
     on the current stream of the workspace's device, without a host
     synchronization (it can be captured in a CUDA Graph).  The workspace must be
     a contiguous FP64 CUDA tensor of at least
-    :func:`cake_rmsnorm_silu_gate_train_backward_workspace_bytes` bytes; all of
+    :func:`cake_rmsnorm_silu_gate_nondet_train_backward_workspace_bytes` bytes; all of
     it is zeroed (the deterministic package's FP32 buffer is refused with a
-    ``ValueError``).  It chooses no mode and takes no ``deterministic``
-    keyword.
+    ``ValueError``).
     """
 
     if not isinstance(workspace, torch.Tensor):
@@ -779,7 +729,7 @@ def _check_workspace(
             "workspace is FP32, a workspace of the deterministic mode "
             f"({_DETERMINISTIC_PACKAGE}.cake_rmsnorm_silu_gate_det_train_backward_workspace); "
             "the non-deterministic backward needs its own zero-filled FP64 "
-            f"workspace ({__name__}.cake_rmsnorm_silu_gate_train_backward_workspace)"
+            f"workspace ({__name__}.cake_rmsnorm_silu_gate_nondet_train_backward_workspace)"
         )
     if (
         not isinstance(workspace, torch.Tensor)
@@ -791,8 +741,8 @@ def _check_workspace(
         raise ValueError(
             f"workspace must be a contiguous FP64 tensor on {device} with at least "
             f"{elements} elements, zero before its first use "
-            "(cake_rmsnorm_silu_gate_train_backward_workspace(rows, device), "
-            "or cake_rmsnorm_silu_gate_train_reset_workspace(workspace))"
+            "(cake_rmsnorm_silu_gate_nondet_train_backward_workspace(rows, device), "
+            "or cake_rmsnorm_silu_gate_nondet_train_reset_workspace(workspace))"
         )
     return workspace.view(-1)
 
@@ -827,8 +777,8 @@ def _backward(
     workspace: Optional[torch.Tensor],
     entry: str,
 ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """The backward of this package's program (``deterministic=False``);
-    ``entry`` is the entry point the alert names."""
+    """The backward of this package's program; ``entry`` is the entry point
+    the alert names."""
 
     device = x.device
     arch = _device_arch(device)
@@ -926,7 +876,7 @@ def _backward(
     )
 
 
-def cake_rmsnorm_silu_gate_train_backward(
+def cake_rmsnorm_silu_gate_nondet_train_backward(
     grad_out: torch.Tensor,
     x: torch.Tensor,
     z: torch.Tensor,
@@ -939,7 +889,6 @@ def cake_rmsnorm_silu_gate_train_backward(
     accumulate_grad_weight: bool = False,
     compute_grad_weight: bool = True,
     workspace: Optional[torch.Tensor] = None,
-    deterministic: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     r"""SiLU-gated RMSNorm backward of this package: ``dx``, ``dz`` and the
     weight gradient.
@@ -957,14 +906,11 @@ def cake_rmsnorm_silu_gate_train_backward(
     gradient on chip in a fixed order (the same ``dw`` bits on every call) and
     uses none.  The arguments
     are those of
-    :func:`flashinfer.cake_rmsnorm_silu_gate_train.cake_rmsnorm_silu_gate_train_backward`;
+    :func:`flashinfer.cake_rmsnorm_silu_gate_nondet_train.cake_rmsnorm_silu_gate_nondet_train_backward`;
     ``workspace`` is this package's FP64 buffer
-    (:func:`cake_rmsnorm_silu_gate_train_backward_workspace`) or ``None`` (the
+    (:func:`cake_rmsnorm_silu_gate_nondet_train_backward_workspace`) or ``None`` (the
     buffer of the current device and stream; during CUDA Graph capture, a
-    zero-filled buffer of the capture and capture stream) and
-    ``deterministic`` must be ``False`` (any other value, the default
-    included, is a ``ValueError`` naming
-    ``flashinfer.cake_rmsnorm_silu_gate_det_train.cake_rmsnorm_silu_gate_det_train_backward``).
+    zero-filled buffer of the capture and capture stream).
     Under ``torch.use_deterministic_algorithms(True)`` a call that computes the
     weight gradient on more than 256 rows raises PyTorch's alert
     (``RuntimeError``; a ``UserWarning`` under ``warn_only=True``, then it
@@ -973,7 +919,6 @@ def cake_rmsnorm_silu_gate_train_backward(
     call with ``compute_grad_weight=False`` do not alert.
     """
 
-    _require_nondeterministic(deterministic, "cake_rmsnorm_silu_gate_train_backward")
     return _backward(
         grad_out,
         x,
@@ -986,29 +931,25 @@ def cake_rmsnorm_silu_gate_train_backward(
         accumulate_grad_weight=accumulate_grad_weight,
         compute_grad_weight=compute_grad_weight,
         workspace=workspace,
-        entry="cake_rmsnorm_silu_gate_train_backward",
+        entry="cake_rmsnorm_silu_gate_nondet_train_backward",
     )
 
 
-class CakeRMSNormSiLUGateFunction(torch.autograd.Function):
-    """Autograd of :func:`cake_rmsnorm_silu_gate` in this package: saves ``x``,
+class CakeRMSNormSiLUGateNondetFunction(torch.autograd.Function):
+    """Autograd of :func:`cake_rmsnorm_silu_gate_nondet` in this package: saves ``x``,
     ``z`` and ``weight`` (no FP32 intermediate) and recomputes the rest in the
     backward, so ``torch.utils.checkpoint(..., use_reentrant=False)`` sees only
     the inputs as saved state.
 
-    ``forward(x, z, weight, eps, deterministic=True)``: ``deterministic`` must be
-    ``False`` (any other value, the default included, raises ``ValueError``
-    naming ``flashinfer.cake_rmsnorm_silu_gate_det_train.CakeRMSNormSiLUGateDetFunction``
-    before any launch); both directions run this package's kernels, and the
-    backward takes no mode.  The backward, when ``weight`` needs a gradient,
+    ``forward(x, z, weight, eps)``: both directions run this package's
+    kernels.  The backward, when ``weight`` needs a gradient,
     raises PyTorch's alert if ``torch.use_deterministic_algorithms(True)`` is in
-    effect when it runs, as :func:`cake_rmsnorm_silu_gate_train_backward` does;
+    effect when it runs, as :func:`cake_rmsnorm_silu_gate_nondet_train_backward` does;
     a checkpoint replay reruns the forward.
     """
 
     @staticmethod
-    def forward(ctx, x, z, weight, eps, deterministic=True):
-        _require_nondeterministic(deterministic, "CakeRMSNormSiLUGateFunction")
+    def forward(ctx, x, z, weight, eps):
         y = _forward(x, z, weight, eps, out=None)
         ctx.save_for_backward(x, z, weight)
         ctx.eps = float(eps)
@@ -1029,45 +970,39 @@ class CakeRMSNormSiLUGateFunction(torch.autograd.Function):
             accumulate_grad_weight=False,
             compute_grad_weight=ctx.needs_input_grad[2],
             workspace=None,
-            entry="CakeRMSNormSiLUGateFunction.backward",
+            entry="CakeRMSNormSiLUGateNondetFunction.backward",
         )
         return (
             dx if ctx.needs_input_grad[0] else None,
             dz if ctx.needs_input_grad[1] else None,
             dw,
             None,
-            None,
         )
 
 
-def cake_rmsnorm_silu_gate(
+def cake_rmsnorm_silu_gate_nondet(
     x: torch.Tensor,
     z: torch.Tensor,
     weight: torch.Tensor,
     eps: float = 1e-6,
-    *,
-    deterministic: bool = True,
 ) -> torch.Tensor:
     """Differentiable ``RMSNorm(x) * weight * SiLU(z)`` over the last dimension
-    (128) on this package's kernels: :class:`CakeRMSNormSiLUGateFunction`
-    applied to the arguments.  ``deterministic`` must be ``False`` (any other
-    value, the default included, is a ``ValueError`` naming
-    ``flashinfer.cake_rmsnorm_silu_gate_det_train.cake_rmsnorm_silu_gate_det``).
+    (128) on this package's kernels: :class:`CakeRMSNormSiLUGateNondetFunction`
+    applied to the arguments.
     """
 
-    _require_nondeterministic(deterministic, "cake_rmsnorm_silu_gate")
-    return CakeRMSNormSiLUGateFunction.apply(x, z, weight, eps, False)
+    return CakeRMSNormSiLUGateNondetFunction.apply(x, z, weight, eps)
 
 
 __all__ = [
     "ARCHES",
     "SUPPORTED_COMPUTE_CAPABILITIES",
-    "CakeRMSNormSiLUGateFunction",
-    "cake_rmsnorm_silu_gate",
-    "cake_rmsnorm_silu_gate_train_backward",
-    "cake_rmsnorm_silu_gate_train_backward_workspace",
-    "cake_rmsnorm_silu_gate_train_backward_workspace_bytes",
-    "cake_rmsnorm_silu_gate_train_forward",
-    "cake_rmsnorm_silu_gate_train_reset_workspace",
-    "is_cake_rmsnorm_silu_gate_train_supported",
+    "CakeRMSNormSiLUGateNondetFunction",
+    "cake_rmsnorm_silu_gate_nondet",
+    "cake_rmsnorm_silu_gate_nondet_train_backward",
+    "cake_rmsnorm_silu_gate_nondet_train_backward_workspace",
+    "cake_rmsnorm_silu_gate_nondet_train_backward_workspace_bytes",
+    "cake_rmsnorm_silu_gate_nondet_train_forward",
+    "cake_rmsnorm_silu_gate_nondet_train_reset_workspace",
+    "is_cake_rmsnorm_silu_gate_nondet_train_supported",
 ]

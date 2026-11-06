@@ -147,44 +147,73 @@ an autograd wrapper that saves only its inputs.
 
 .. rubric:: Mode and dispatch rules
 
-1. The deterministic package ``flashinfer.cake_rmsnorm_silu_gate_det_train``
-   (and its backend package
-   ``flashinfer.cake_rmsnorm_silu_gate_det_train_backend``) takes no
-   ``deterministic`` keyword: passing one raises ``TypeError``. Every launch
-   sums in a fixed order, so ``torch.use_deterministic_algorithms`` does not
-   affect any call. Its backward refuses the FP64 workspace of the
-   non-deterministic package (``ValueError``).
-2. The non-deterministic module ``flashinfer.cake_rmsnorm_silu_gate_train``,
-   the ``flashinfer`` top-level names without ``det`` and the compute entry
-   points of ``flashinfer.cake_rmsnorm_silu_gate_train_backend`` run only the
-   non-deterministic kernels. Each needs an explicit ``deterministic=False``;
-   any other value, the default included, raises ``ValueError`` and names the
-   deterministic entry point. No call is routed to the deterministic package.
-   The backend package's support, workspace and reset helpers take no mode
-   keyword; their copies in ``flashinfer.cake_rmsnorm_silu_gate_train`` also
-   need ``deterministic=False``.
-3. Under ``torch.use_deterministic_algorithms(True)`` the non-deterministic
-   forward never alerts. A non-deterministic backward that computes the
-   weight gradient raises PyTorch's alert immediately before its
+1. The mode is part of every name.  Every public name of the deterministic
+   module ``flashinfer.cake_rmsnorm_silu_gate_det_train`` (backend package
+   ``flashinfer.experimental.cake.cake_rmsnorm_silu_gate_det_train``) carries
+   ``det``; every public name of the non-deterministic module
+   ``flashinfer.cake_rmsnorm_silu_gate_nondet_train`` (backend package
+   ``flashinfer.experimental.cake.cake_rmsnorm_silu_gate_nondet_train``)
+   carries ``nondet``.  The ``flashinfer`` top level exports only such names.
+2. No entry point takes a ``deterministic`` keyword: passing one is a
+   ``TypeError``.  A call of one package never runs the other package.
+3. Under ``torch.use_deterministic_algorithms(True)`` no deterministic call
+   alerts: every deterministic launch sums in a fixed order.  The
+   non-deterministic forward never alerts.  A non-deterministic backward that
+   computes the weight gradient raises PyTorch's alert immediately before its
    order-varying launch (``RuntimeError``; with ``warn_only=True`` a
-   ``UserWarning``, then the non-deterministic kernel runs). The one-cluster
+   ``UserWarning``, then the non-deterministic kernel runs).  The one-cluster
    backward of up to 256 rows (a fixed order), a call with no rows and a call
-   with ``compute_grad_weight=False`` do not alert. The check runs on the
+   with ``compute_grad_weight=False`` do not alert.  The check runs on the
    host: a CUDA Graph checks it when it is captured, not when it is replayed.
-4. Autograd: the non-deterministic ``CakeRMSNormSiLUGateFunction`` checks the
-   mode in its forward, and its backward takes no mode. A node of either
-   package saves only ``x``, ``z`` and ``weight`` and runs the backward of its
-   own package. A backward workspace holds the raw partial sums of one
-   package and serves only that package (FP32 for the deterministic package,
-   FP64 for the non-deterministic one).
-5. The names the deterministic package had before it took its ``det`` names
-   (``CakeRMSNormSiLUGateFunction``, ``cake_rmsnorm_silu_gate``,
-   ``cake_rmsnorm_silu_gate_train_forward``,
+4. Autograd: ``CakeRMSNormSiLUGateDetFunction`` and
+   ``CakeRMSNormSiLUGateNondetFunction`` save only ``x``, ``z`` and ``weight``
+   and run the backward of their own package.  A backward workspace holds the
+   raw partial sums of one package and serves only that package (FP32 for the
+   deterministic package, FP64 for the non-deterministic one): each backward
+   refuses the other package's workspace (``ValueError``).
+5. The former names are gone, with no alias or shim: the modules
+   ``flashinfer.cake_rmsnorm_silu_gate_train``,
+   ``flashinfer.cake_rmsnorm_silu_gate_train_backend`` and
+   ``flashinfer.cake_rmsnorm_silu_gate_det_train_backend`` fail at import, and
+   the names without a mode word (``CakeRMSNormSiLUGateFunction``,
+   ``cake_rmsnorm_silu_gate``, ``cake_rmsnorm_silu_gate_train_forward``,
    ``cake_rmsnorm_silu_gate_train_backward``,
    ``cake_rmsnorm_silu_gate_train_backward_workspace``,
-   ``cake_rmsnorm_silu_gate_train_backward_workspace_bytes`` and
-   ``is_cake_rmsnorm_silu_gate_train_supported``) are not attributes of
-   ``flashinfer.cake_rmsnorm_silu_gate_det_train`` or of its backend package.
+   ``cake_rmsnorm_silu_gate_train_backward_workspace_bytes``,
+   ``cake_rmsnorm_silu_gate_train_reset_workspace`` and
+   ``is_cake_rmsnorm_silu_gate_train_supported``) are attributes of neither
+   ``flashinfer`` nor either module.
+
+The former names and their replacements (the deterministic names are
+unchanged):
+
+.. list-table::
+    :header-rows: 1
+
+    * - Former name
+      - Name
+    * - ``flashinfer.cake_rmsnorm_silu_gate_train`` (module)
+      - ``flashinfer.cake_rmsnorm_silu_gate_nondet_train``
+    * - ``flashinfer.cake_rmsnorm_silu_gate_train_backend`` (package)
+      - ``flashinfer.experimental.cake.cake_rmsnorm_silu_gate_nondet_train``
+    * - ``flashinfer.cake_rmsnorm_silu_gate_det_train_backend`` (package)
+      - ``flashinfer.experimental.cake.cake_rmsnorm_silu_gate_det_train``
+    * - ``cake_rmsnorm_silu_gate(..., deterministic=False)``
+      - ``cake_rmsnorm_silu_gate_nondet(...)``
+    * - ``CakeRMSNormSiLUGateFunction``
+      - ``CakeRMSNormSiLUGateNondetFunction``
+    * - ``cake_rmsnorm_silu_gate_train_forward``
+      - ``cake_rmsnorm_silu_gate_nondet_train_forward``
+    * - ``cake_rmsnorm_silu_gate_train_backward``
+      - ``cake_rmsnorm_silu_gate_nondet_train_backward``
+    * - ``cake_rmsnorm_silu_gate_train_backward_workspace_bytes``
+      - ``cake_rmsnorm_silu_gate_nondet_train_backward_workspace_bytes``
+    * - ``cake_rmsnorm_silu_gate_train_backward_workspace``
+      - ``cake_rmsnorm_silu_gate_nondet_train_backward_workspace``
+    * - ``cake_rmsnorm_silu_gate_train_reset_workspace``
+      - ``cake_rmsnorm_silu_gate_nondet_train_reset_workspace``
+    * - ``is_cake_rmsnorm_silu_gate_train_supported``
+      - ``is_cake_rmsnorm_silu_gate_nondet_train_supported``
 
 .. currentmodule:: flashinfer.cake_rmsnorm_silu_gate_det_train
 
@@ -199,12 +228,12 @@ an autograd wrapper that saves only its inputs.
     CakeRMSNormSiLUGateDetFunction
     is_cake_rmsnorm_silu_gate_det_train_supported
 
-Training SiLU-gated RMSNorm, opt-in non-deterministic weight gradient (Cake)
----------------------------------------------------------------------------
+Training SiLU-gated RMSNorm, non-deterministic weight gradient (Cake)
+---------------------------------------------------------------------
 
-The non-deterministic package. Every entry point needs ``deterministic=False``
-(see the mode and dispatch rules above) and runs only the standalone
-non-deterministic kernels (``flashinfer.cake_rmsnorm_silu_gate_train_backend``):
+The non-deterministic package (``nondet`` names; see the mode and dispatch
+rules above). Its entry points run only the standalone non-deterministic
+kernels (``flashinfer.experimental.cake.cake_rmsnorm_silu_gate_nondet_train``):
 
 * The forward is the deterministic package's forward kernel (up to 12 rows
   per SM on SM100 and SM103 and up to 59 on SM107, a forward with 16 threads
@@ -222,23 +251,22 @@ non-deterministic kernels (``flashinfer.cake_rmsnorm_silu_gate_train_backend``):
   Up to 256 rows the backward is one thread-block cluster of 16 CTAs that adds
   the CTAs' partial sums in a fixed order on chip: the same bits on every
   call, within the same bound, and no workspace.
-* The workspace
-  (``cake_rmsnorm_silu_gate_train_backward_workspace(..., deterministic=False)``,
+* The workspace (``cake_rmsnorm_silu_gate_nondet_train_backward_workspace``,
   a few KiB whatever the token count) is zero after every call: zero it once
   and reuse it, one per concurrently running stream. A buffer that anything
   else wrote into is zeroed with
-  ``cake_rmsnorm_silu_gate_train_reset_workspace(..., deterministic=False)``.
+  ``cake_rmsnorm_silu_gate_nondet_train_reset_workspace``.
 
-.. currentmodule:: flashinfer.cake_rmsnorm_silu_gate_train
+.. currentmodule:: flashinfer.cake_rmsnorm_silu_gate_nondet_train
 
 .. autosummary::
     :toctree: ../generated
 
-    cake_rmsnorm_silu_gate
-    cake_rmsnorm_silu_gate_train_forward
-    cake_rmsnorm_silu_gate_train_backward
-    cake_rmsnorm_silu_gate_train_backward_workspace_bytes
-    cake_rmsnorm_silu_gate_train_backward_workspace
-    cake_rmsnorm_silu_gate_train_reset_workspace
-    CakeRMSNormSiLUGateFunction
-    is_cake_rmsnorm_silu_gate_train_supported
+    cake_rmsnorm_silu_gate_nondet
+    cake_rmsnorm_silu_gate_nondet_train_forward
+    cake_rmsnorm_silu_gate_nondet_train_backward
+    cake_rmsnorm_silu_gate_nondet_train_backward_workspace_bytes
+    cake_rmsnorm_silu_gate_nondet_train_backward_workspace
+    cake_rmsnorm_silu_gate_nondet_train_reset_workspace
+    CakeRMSNormSiLUGateNondetFunction
+    is_cake_rmsnorm_silu_gate_nondet_train_supported

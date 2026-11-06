@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Stall regression of the Cake SiLU-gated RMSNorm training forward and the
-non-deterministic backward (``deterministic=False``) beside a kernel resident
+non-deterministic (``nondet``) backward beside a kernel resident
 on another stream (the concurrent-launch contract of issues #7038 and #7548).
 
 The forward launches a plain grid of independent CTAs; up to 12 rows per SM
@@ -53,7 +53,7 @@ CTA of the backward needs 20736 bytes of dynamic shared memory (on SM107 from
 kernel holding every SM with the default carveout delays its start until the
 side kernel exits (observed on B200 with the 20736-byte CTAs and on R200 with
 both sizes; no test here asserts that delay; documented in
-:mod:`flashinfer.cake_rmsnorm_silu_gate_train`).
+:mod:`flashinfer.cake_rmsnorm_silu_gate_nondet_train`).
 The documented remedy is checked here: with the side kernel's preferred
 carveout set to the maximum shared memory, the backward (BF16 and FP32 weight
 gradients) and the forward start beside it and cost at most
@@ -127,17 +127,12 @@ import torch
 
 from tests.test_helpers.cake_package import cake_package
 
-pkg = cake_package("cake_rmsnorm_silu_gate_train")
-loader = cake_package("cake_rmsnorm_silu_gate_train", "cake_jit")
+pkg = cake_package("cake_rmsnorm_silu_gate_nondet_train")
+loader = cake_package("cake_rmsnorm_silu_gate_nondet_train", "cake_jit")
 det_pkg = cake_package("cake_rmsnorm_silu_gate_det_train")
-forward = functools.partial(
-    pkg.cake_rmsnorm_silu_gate_train_forward, deterministic=False
-)
-backward = functools.partial(
-    pkg.cake_rmsnorm_silu_gate_train_backward, deterministic=False
-)
-# The workspace factory chooses no mode and takes no ``deterministic`` keyword.
-workspace_for = pkg.cake_rmsnorm_silu_gate_train_backward_workspace
+forward = pkg.cake_rmsnorm_silu_gate_nondet_train_forward
+backward = pkg.cake_rmsnorm_silu_gate_nondet_train_backward
+workspace_for = pkg.cake_rmsnorm_silu_gate_nondet_train_backward_workspace
 
 D = 128
 H = 48
@@ -158,7 +153,7 @@ SEED = 8067
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
-    or not pkg.is_cake_rmsnorm_silu_gate_train_supported(torch.device("cuda")),
+    or not pkg.is_cake_rmsnorm_silu_gate_nondet_train_supported(torch.device("cuda")),
     reason="Cake SiLU-gated RMSNorm training needs an SM100 / SM103 / SM107 GPU",
 )
 

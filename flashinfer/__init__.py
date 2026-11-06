@@ -323,26 +323,22 @@ from .cake_rmsnorm_silu_gate_det_train import (
     cake_rmsnorm_silu_gate_det_train_forward as cake_rmsnorm_silu_gate_det_train_forward,
 )
 
-# The opt-in non-deterministic SiLU-gated RMSNorm: entry points take
-# deterministic=False; the deterministic names are above.
-from .cake_rmsnorm_silu_gate_train import (
-    CakeRMSNormSiLUGateFunction as CakeRMSNormSiLUGateFunction,
+# The non-deterministic SiLU-gated RMSNorm (``nondet`` names); the
+# deterministic names are above.
+from .cake_rmsnorm_silu_gate_nondet_train import (
+    CakeRMSNormSiLUGateNondetFunction as CakeRMSNormSiLUGateNondetFunction,
 )
-from .cake_rmsnorm_silu_gate_train import (
-    cake_rmsnorm_silu_gate as cake_rmsnorm_silu_gate,
+from .cake_rmsnorm_silu_gate_nondet_train import (
+    cake_rmsnorm_silu_gate_nondet as cake_rmsnorm_silu_gate_nondet,
 )
-from .cake_rmsnorm_silu_gate_train import (
-    cake_rmsnorm_silu_gate_train_backward as cake_rmsnorm_silu_gate_train_backward,
+from .cake_rmsnorm_silu_gate_nondet_train import (
+    cake_rmsnorm_silu_gate_nondet_train_backward as cake_rmsnorm_silu_gate_nondet_train_backward,
 )
-from .cake_rmsnorm_silu_gate_train import (
-    cake_rmsnorm_silu_gate_train_backward_workspace_bytes as cake_rmsnorm_silu_gate_train_backward_workspace_bytes,
+from .cake_rmsnorm_silu_gate_nondet_train import (
+    cake_rmsnorm_silu_gate_nondet_train_backward_workspace_bytes as cake_rmsnorm_silu_gate_nondet_train_backward_workspace_bytes,
 )
-from .cake_rmsnorm_silu_gate_train import (
-    cake_rmsnorm_silu_gate_train_forward as cake_rmsnorm_silu_gate_train_forward,
-)
-from . import cake_rmsnorm_silu_gate_train as cake_rmsnorm_silu_gate_train
-from . import (
-    cake_rmsnorm_silu_gate_train_backend as cake_rmsnorm_silu_gate_train_backend,
+from .cake_rmsnorm_silu_gate_nondet_train import (
+    cake_rmsnorm_silu_gate_nondet_train_forward as cake_rmsnorm_silu_gate_nondet_train_forward,
 )
 from .cake_causal_conv1d_det_train import (
     CakeCausalConv1dDetFunction as CakeCausalConv1dDetFunction,

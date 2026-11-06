@@ -15,9 +15,9 @@ limitations under the License.
 
 Benchmark of the Cake SiLU-gated RMSNorm training kernels
 (``RMSNorm(x) * w * SiLU(z)`` over ``[T, H, 128]``) with the opt-in
-non-deterministic weight gradient (``flashinfer.cake_rmsnorm_silu_gate_train``
-with ``deterministic=False``: one backward kernel whose last CTA finishes the
-FP64 weight-gradient sum) against the deterministic package
+non-deterministic weight gradient (``flashinfer.cake_rmsnorm_silu_gate_nondet_train``:
+one backward kernel whose last CTA finishes the FP64 weight-gradient sum)
+against the deterministic package
 (``flashinfer.cake_rmsnorm_silu_gate_det_train``: its backward kernel and its
 fixed-order weight-gradient reduction), each called through its own entry
 points.
@@ -29,7 +29,7 @@ Every row times, for both modes, on identical generated inputs:
   gradient included (the deterministic reduction kernel, or the last CTA of
   the non-deterministic kernel), with a preallocated caller workspace;
 - ``ckpt``: the activation-checkpointed step through autograd,
-  ``torch.utils.checkpoint(cake_rmsnorm_silu_gate, ..., use_reentrant=False)``
+  ``torch.utils.checkpoint(cake_rmsnorm_silu_gate_nondet, ..., use_reentrant=False)``
   then the backward (which replays the forward): ``2 * fwd + bwd`` measured.
 
 Timing uses CUPTI kernel activity with a cold L2
@@ -48,14 +48,13 @@ in the last place, and the number of distinct ``dw`` bit patterns over
 
 Example::
 
-    python benchmarks/bench_cake_rmsnorm_silu_gate_train.py --tokens 30193 32737 32388 --heads 48
-    python benchmarks/bench_cake_rmsnorm_silu_gate_train.py --json out.json
+    python benchmarks/bench_cake_rmsnorm_silu_gate_nondet_train.py --tokens 30193 32737 32388 --heads 48
+    python benchmarks/bench_cake_rmsnorm_silu_gate_nondet_train.py --json out.json
 """
 
 from __future__ import annotations
 
 import argparse
-import functools
 import json
 import statistics
 from typing import Callable, Optional
@@ -64,12 +63,12 @@ import torch
 import torch.utils.checkpoint
 
 import flashinfer.cake_rmsnorm_silu_gate_det_train as det
-import flashinfer.cake_rmsnorm_silu_gate_train as nd
+import flashinfer.cake_rmsnorm_silu_gate_nondet_train as nd
 from flashinfer.testing import bench_gpu_time
 
 D = 128
-# Each mode's entry points: the deterministic package's det names, the
-# non-deterministic package's with ``deterministic=False``.
+# Each mode's entry points: the deterministic package's ``det`` names and the
+# non-deterministic package's ``nondet`` names.
 API = {
     "deterministic": {
         "forward": det.cake_rmsnorm_silu_gate_det_train_forward,
@@ -79,20 +78,11 @@ API = {
         "autograd": det.cake_rmsnorm_silu_gate_det,
     },
     "nondeterministic": {
-        "forward": functools.partial(
-            nd.cake_rmsnorm_silu_gate_train_forward, deterministic=False
-        ),
-        "backward": functools.partial(
-            nd.cake_rmsnorm_silu_gate_train_backward, deterministic=False
-        ),
-        "workspace": functools.partial(
-            nd.cake_rmsnorm_silu_gate_train_backward_workspace, deterministic=False
-        ),
-        "workspace_bytes": functools.partial(
-            nd.cake_rmsnorm_silu_gate_train_backward_workspace_bytes,
-            deterministic=False,
-        ),
-        "autograd": functools.partial(nd.cake_rmsnorm_silu_gate, deterministic=False),
+        "forward": nd.cake_rmsnorm_silu_gate_nondet_train_forward,
+        "backward": nd.cake_rmsnorm_silu_gate_nondet_train_backward,
+        "workspace": nd.cake_rmsnorm_silu_gate_nondet_train_backward_workspace,
+        "workspace_bytes": nd.cake_rmsnorm_silu_gate_nondet_train_backward_workspace_bytes,
+        "autograd": nd.cake_rmsnorm_silu_gate_nondet,
     },
 }
 MODES = tuple(API)
@@ -305,11 +295,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--json", default=None)
     args = parser.parse_args(argv)
     device = torch.device("cuda", torch.cuda.current_device())
-    if not nd.is_cake_rmsnorm_silu_gate_train_supported(
-        device, deterministic=False
+    if not nd.is_cake_rmsnorm_silu_gate_nondet_train_supported(
+        device
     ) or not det.is_cake_rmsnorm_silu_gate_det_train_supported(device):
         raise SystemExit(
-            "cake_rmsnorm_silu_gate_train(deterministic=False) or "
+            "cake_rmsnorm_silu_gate_nondet_train or "
             "cake_rmsnorm_silu_gate_det_train has no exported route on this device"
         )
     torch.use_deterministic_algorithms(False)

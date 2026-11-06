@@ -41,11 +41,12 @@ Host design (every control is a keyword; no environment variable):
   return the same bits.
 - No call synchronizes the host or the device; every kernel runs on the
   current torch stream with a plain (non-persistent, non-cooperative) grid.
-- Mode: every entry point is deterministic and takes no ``deterministic``
-  keyword (passing one is a ``TypeError``); every launch sums in a fixed
-  order, so ``torch.use_deterministic_algorithms`` does not affect any call.
-  The backward refuses the non-deterministic package's FP64 workspace with a
-  ``ValueError``.
+- Mode: the mode is part of the name (``det``).  Every entry point is
+  deterministic and takes no ``deterministic`` keyword (passing one is a
+  ``TypeError``); every launch sums in a fixed order, so
+  ``torch.use_deterministic_algorithms`` does not affect any call.  The
+  backward refuses the FP64 workspace of the non-deterministic package
+  (``flashinfer.cake_rmsnorm_silu_gate_nondet_train``) with a ``ValueError``.
 """
 
 from __future__ import annotations
@@ -80,8 +81,8 @@ _DETERMINISTIC_WORKSPACE = (
     "cake_rmsnorm_silu_gate_det_train_backward_workspace"
 )
 _NONDETERMINISTIC_WORKSPACE = (
-    "flashinfer.cake_rmsnorm_silu_gate_train_backend."
-    "cake_rmsnorm_silu_gate_train_backward_workspace"
+    "flashinfer.cake_rmsnorm_silu_gate_nondet_train."
+    "cake_rmsnorm_silu_gate_nondet_train_backward_workspace"
 )
 
 
