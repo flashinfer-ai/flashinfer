@@ -2803,6 +2803,11 @@ class FmhaDecodeConfig:
         """
         if not self.supports_grouped_keeps:
             return False
+        if self.uses_per_inst_smem_transform and not self.q_tiles_are_full:
+            # With inactive rows, D128 NVFP4 Keeps adds the row-mask path to
+            # two per-instance converters and overflows the instruction cache
+            # (GB300 B128/KV128K/sQ7: 1.48 ms vs 1.27 ms for Swaps Q64).
+            return False
         profile = self._grouped_keeps_profile_key
         if (
             self.use_paged_kv
@@ -5945,10 +5950,13 @@ def _validate_profile_support(
             cfg.uses_second_smem_converter
             and tile_size_q == 64
             and cfg.transformed_kv_stages > 0
+            and cfg.groups_tokens_heads_q
         ):
+            # Only the grouped token/head layout has been validated; ungrouped
+            # wide-head groups keep the Swaps head bands.
             raise ValueError(
                 "KeepsMmaAb transform-KV supports only FP8 Q with NVFP4 K/V at "
-                "Q64 with D128 per-instance or D256 K/V SMEM converters"
+                "grouped Q64 with D128 per-instance or D256 K/V SMEM converters"
             )
         if headdim not in (64, 128, 192, 256):
             raise ValueError(
