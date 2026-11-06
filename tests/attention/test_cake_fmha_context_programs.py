@@ -4461,11 +4461,17 @@ def _jit_route_of(monkeypatch, case, *, return_lse=False):
     def probe(device, route):
         raise _RouteProbe(route)
 
+    # The route leaves through the exception's own name: a kept ExceptionInfo
+    # would hold its traceback, whose frames keep the calling test's tensors and
+    # CUDA graphs alive until a cyclic collection, which may then run inside a
+    # later test's graph capture.
     with monkeypatch.context() as m:
         m.setattr(cake_api, "get_cake_fmha_context_module", probe)
-        with pytest.raises(_RouteProbe) as caught:
+        try:
             _run_jit_route_batch(case, return_lse=return_lse)
-    return caught.value.args[0]
+        except _RouteProbe as reached:
+            return reached.args[0]
+    pytest.fail("the dispatch reached no context module")
 
 
 def _jit_route_tiles_without_keys(case, route):
