@@ -178,6 +178,7 @@ _PRIMS_TS_LAZY_EXPORTS = frozenset(
 # import the experimental tree.
 _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     **{name: (".fused_moe", name) for name in sorted(_PRIMS_TS_LAZY_EXPORTS)},
+    "cake_lm_head_nondet_train": (".cake_lm_head_nondet_train", None),
 }
 
 
