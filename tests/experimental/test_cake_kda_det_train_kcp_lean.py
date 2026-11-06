@@ -64,8 +64,8 @@ from tests.test_helpers.cake_package import cake_package
 
 kp = cake_package("cake.cake_kda_det_train_kcp", "cake_kcp_plan")
 cake_kcp = cake_package("cake.cake_kda_det_train_kcp", "cake_kcp")
-cake_backend = cake_package("cake_kda_det_train", "cake_backend")
-cake_jit = cake_package("cake_kda_det_train", "cake_jit")
+cake_backend = cake_package("cake.cake_kda_det_train", "cake_backend")
+cake_jit = cake_package("cake.cake_kda_det_train", "cake_jit")
 cake_kcp_jit = cake_package("cake.cake_kda_det_train_kcp", "cake_kcp_jit")
 
 LEAN = kp.LOCAL_LAYOUT_BWD_LEAN
@@ -206,19 +206,19 @@ def test_single_rank_layouts_keep_their_bytes() -> None:
     assert "_ROUTE_SLOTS" not in cake_backend.__all__
     assert p.arena_bytes(backward=True) == 4488 * unit
     assert (
-        p.arena_bytes(backward=True, arena=cake_backend.KdaDetArena(tail_passes=4))
+        p.arena_bytes(backward=True, arena=cake_backend.CakeKDADetArena(tail_passes=4))
         == 2820 * unit
     )
     for bad in (
-        {"arena": cake_backend.KdaDetArena(lean=True)},
-        {"arena": cake_backend.KdaDetArena()},
+        {"arena": cake_backend.CakeKDADetArena(lean=True)},
+        {"arena": cake_backend.CakeKDADetArena()},
         {"doc_lengths": PROXY_PACK},
         {"fwd_layout": "tiny"},
     ):
         with pytest.raises(ValueError):
-            cake_backend.KdaDetWorkspace(p, "cpu", layouts=((LEAN, 4),), **bad)
+            cake_backend.CakeKDADetWorkspace(p, "cpu", layouts=((LEAN, 4),), **bad)
     with pytest.raises(ValueError):
-        cake_backend.KdaDetWorkspace(p, "cpu", layouts=())
+        cake_backend.CakeKDADetWorkspace(p, "cpu", layouts=())
 
 
 def test_single_rank_workspace_refuses_its_lean_modes_in_layouts() -> None:
@@ -229,7 +229,7 @@ def test_single_rank_workspace_refuses_its_lean_modes_in_layouts() -> None:
         for passes in (1, 2, 4):
             for layouts in (((mode, passes),), ((LEAN, 2), (mode, passes))):
                 with pytest.raises(ValueError, match="take their tail passes"):
-                    cake_backend.KdaDetWorkspace(p, "cpu", layouts=layouts)
+                    cake_backend.CakeKDADetWorkspace(p, "cpu", layouts=layouts)
 
 
 def test_route_layout_registration_rules() -> None:
@@ -264,7 +264,7 @@ def test_route_layout_registration_rules() -> None:
     for b in (1, 2, 4):
         assert p.layout(LEAN, b) == p.layout(LEAN, b)
     assert p.layout(LEAN, 2) != p.layout(LEAN, 4)
-    assert cake_backend.KdaDetArena().mode(LEAN) == LEAN
+    assert cake_backend.CakeKDADetArena().mode(LEAN) == LEAN
 
 
 # The single-rank parity rows: every layout mode of the single-rank module at every tail-pass count it takes and the
@@ -312,7 +312,7 @@ def _single_rank_record(arch: str) -> list[str]:
         except (ValueError, KeyError) as e:
             return type(e).__name__
 
-    Arena = cake_backend.KdaDetArena
+    Arena = cake_backend.CakeKDADetArena
     options = (
         ("none", None),
         ("default", Arena()),
@@ -754,10 +754,10 @@ def test_gpu_single_rank_workspace_views_and_route_layouts(device) -> None:
         p = cake_backend.plan(sum(PROXY_PACK), len(PROXY_PACK), H, sm, arch)
         for option in (
             None,
-            cake_backend.KdaDetArena(lean=True),
-            cake_backend.KdaDetArena(tail_passes=4),
+            cake_backend.CakeKDADetArena(lean=True),
+            cake_backend.CakeKDADetArena(tail_passes=4),
         ):
-            ws = cake_backend.KdaDetWorkspace(p, device, arena=option)
+            ws = cake_backend.CakeKDADetWorkspace(p, device, arena=option)
             assert ws.layout_passes == {}
             assert ws.bytes == p.arena_bytes(backward=True, arena=option)
             if option is None:
@@ -766,14 +766,14 @@ def test_gpu_single_rank_workspace_views_and_route_layouts(device) -> None:
             else:
                 check(ws, "bwd", option.tail_passes)  # mapped to bwd_lean
             del ws
-        fwd = cake_backend.KdaDetWorkspace(
+        fwd = cake_backend.CakeKDADetWorkspace(
             p, device, backward=False, fwd_layout="fwd_kcp"
         )
         assert fwd.layout_passes == {} and fwd.bytes == p.workspace_bytes("fwd_kcp")
         check(fwd, "fwd_kcp", 1)
         del fwd
         for b in (1, 2, 4):
-            ws = cake_backend.KdaDetWorkspace(
+            ws = cake_backend.CakeKDADetWorkspace(
                 p,
                 device,
                 fwd_layout="fwd_kcp",

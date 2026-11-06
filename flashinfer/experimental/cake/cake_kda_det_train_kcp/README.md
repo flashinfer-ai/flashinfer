@@ -5,7 +5,7 @@ Attention (KDA) chunked training forward and backward: the packed batch is
 split over the ranks of a `torch.distributed` process group and the
 per-document state recurrences cross the rank boundaries exactly.  The public
 entry points are in `flashinfer/cake_kda_det_train_kcp.py`; each rank runs the
-chunk stages of `flashinfer.experimental.cake_kda_det_train` at its own shape.
+chunk stages of `flashinfer.experimental.cake.cake_kda_det_train` at its own shape.
 The entry points of `flashinfer.cake_kda_det_train_kcp` are a stable top-level
 API; the modules of this package are their backend.
 
@@ -304,7 +304,7 @@ Raw gate mode on the KCP route (issue #7816): the three KDA entry points take
 the single-rank keywords `use_gate_in_kernel=True, A_log=, dt_bias=,
 lower_bound=` with the same operand rules (`g` is the rank's raw BF16 gate,
 any view under the stride rule of "Raw gate mode" in the single-rank README,
-`flashinfer/experimental/cake_kda_det_train/README.md`, never copied;
+`flashinfer/experimental/cake/cake_kda_det_train/README.md`, never copied;
 `A_log` / `dt_bias` are the full parameters, the same tensors on every rank).
 
 ```python

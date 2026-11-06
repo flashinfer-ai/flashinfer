@@ -2819,7 +2819,7 @@ LOCAL_LAYOUT_FWD_ONLY = "fwd_kcp"
 
 
 def local_fwd_layout(backward: bool, save_mode: str = "light") -> str:
-    """The forward layout (``cake_backend.KdaDetWorkspace`` ``fwd_layout``) of a rank's local arena:
+    """The forward layout (``cake_backend.CakeKDADetWorkspace`` ``fwd_layout``) of a rank's local arena:
     :data:`LOCAL_LAYOUT_FWD_ONLY` for a forward-only light workspace, else ``"fwd"`` (a backward workspace keeps the
     existing backend's layouts, so a forward on it runs on that arena's ``fwd`` views)."""
     return LOCAL_LAYOUT_FWD_ONLY if not backward and save_mode == "light" else "fwd"
@@ -2829,7 +2829,7 @@ def intra_writes_tables(plan, path: str = LOCAL_PATH_FWD) -> bool:
     """Whether the existing backend's intra record of ``path`` (a :class:`cake_backend.Plan`) computes the chunk
     layout from ``cu_seqlens`` and writes the tables itself (its logical vocabulary binds ``cu_seqlens``): the kernel
     backend then hands it a scratch table set so the KCP's CPU-built tables are never rewritten by a kernel."""
-    from ...cake_kda_det_train import (
+    from ..cake_kda_det_train import (
         cake_jit,
     )  # the registry literal; imported here so the metadata module stays torch-only
 
@@ -2913,7 +2913,7 @@ def _lean_slots(
     note above it).  ``NSEG`` is unused: the layout has no state blocks.  ``l2n``: the plan's in-kernel Q / K L2 norm
     mode (the slot functions' seventh argument): the KCP never runs this layout with the norm (a lean workspace
     refuses it), so the slots are the flag-off occupants' in every mode."""
-    from ...cake_kda_det_train import cake_backend
+    from ..cake_kda_det_train import cake_backend
 
     R_b = cake_backend.BT * -(-NC // passes)
     unit_w, unit_p = R * H, R_b * H
@@ -2943,7 +2943,7 @@ def _lean_slots(
 def register_lean_layout():
     """Register :data:`LOCAL_LAYOUT_BWD_LEAN` on the existing backend's arenas (``cake_backend._register_route_slots``;
     idempotent) and return that backend module."""
-    from ...cake_kda_det_train import cake_backend
+    from ..cake_kda_det_train import cake_backend
 
     cake_backend._register_route_slots(LOCAL_LAYOUT_BWD_LEAN, _lean_slots)
     return cake_backend
@@ -3022,7 +3022,7 @@ def local_arena_bytes(
     local_arena: str | None = None,
     lean_passes: int | None = None,
 ) -> int:
-    """The local arena (``cake_backend.KdaDetWorkspace.bytes``) a workspace allocates for ``plan``: the lean arena at
+    """The local arena (``cake_backend.CakeKDADetWorkspace.bytes``) a workspace allocates for ``plan``: the lean arena at
     :func:`local_lean_passes` (``lean_passes``; ``None``: :data:`LEAN_PASSES_DEFAULT`) where ``local_arena`` is
     ``"lean"`` and the lean layout serves a light backward workspace, else the existing backend's arena of
     :func:`local_fwd_layout`."""
@@ -3162,7 +3162,7 @@ def _takes(fn: Any, name: str) -> bool:
 @functools.cache
 def _cuda_arch(index: int) -> str | None:
     """The exported architecture of CUDA device ``index``, ``None`` when no record targets it (fixed per process)."""
-    from ...cake_kda_det_train import cake_jit
+    from ..cake_kda_det_train import cake_jit
 
     return cake_jit.arch_for_capability(torch.cuda.get_device_capability(index))
 
@@ -3208,7 +3208,7 @@ def qk_l2norm_twin(record: str) -> bool:
     """Whether the existing backend's record ``record`` is the ``_l2n`` twin of its stage, the program that normalizes
     the raw q / k rows itself: the registry's ``l2n`` key of the record lists the fused mode only (absent:
     ``["off"]``).  The key decides, not the name: a twin may carry a version suffix (``fwd_intra_l2n_v37``)."""
-    from ...cake_kda_det_train import cake_jit
+    from ..cake_kda_det_train import cake_jit
 
     return list(cake_jit.MODULES[record].get("l2n", ("off",))) == ["fused"]
 
@@ -3232,7 +3232,7 @@ def saved_rstd_record(record: str, arch: str | None) -> str:
     twin = SAVED_RSTD_TWINS.get(record)
     if twin is None or arch is None:
         return record
-    from ...cake_kda_det_train import cake_build, cake_jit
+    from ..cake_kda_det_train import cake_build, cake_jit
 
     try:
         entry = cake_jit.MODULES[twin]
@@ -3261,7 +3261,7 @@ def _qk_l2norm_problem(
     not serve mode ``mode``, ``None`` when they do: every stage of :data:`QK_L2NORM_STAGES` selects a record (no
     ``ValueError``, no ``None``) delivered for ``arch`` with a library in ``libraries`` (``build.json``), and the
     readers give the route's order (:func:`_qk_l2norm_readers`)."""
-    from ...cake_kda_det_train import cake_jit
+    from ..cake_kda_det_train import cake_jit
 
     nc, docs, heads = problem
     where = f"{arch}, {sm} SMs, {docs} documents, {heads} heads, {nc} chunks"
@@ -3306,12 +3306,12 @@ def _qk_l2norm_inputs() -> tuple[Any, ...]:
     and libraries query, and this module's stages, grid, SM counts, layouts, slots and helpers."""
     global _QK_L2NORM_MODULES
     if not _QK_L2NORM_MODULES:
-        from ...cake_kda_det_train import cake_backend, cake_build, cake_jit
+        from ..cake_kda_det_train import cake_backend, cake_build, cake_jit
 
         _QK_L2NORM_MODULES = (cake_backend, cake_build, cake_jit)
     cake_backend, cake_build, cake_jit = _QK_L2NORM_MODULES
     return (
-        cake_backend.chunk_kda_det_fwd,
+        cake_backend.cake_kda_det_train_forward,
         cake_backend.plan,
         cake_backend.lifetime_table,
         cake_jit.select_record,
@@ -3365,9 +3365,9 @@ def _qk_l2norm_missing(mode: str, gate: str, arch: str | None) -> str | None:
     """The uncached check of :func:`qk_l2norm_missing`."""
     if mode == "off":
         return None
-    from ...cake_kda_det_train import cake_backend, cake_build, cake_jit
+    from ..cake_kda_det_train import cake_backend, cake_build, cake_jit
 
-    if not _takes(cake_backend.chunk_kda_det_fwd, "use_qk_l2norm_in_kernel"):
+    if not _takes(cake_backend.cake_kda_det_train_forward, "use_qk_l2norm_in_kernel"):
         return "the single-rank backend does not take use_qk_l2norm_in_kernel"
     if (
         not _takes(cake_backend.plan, "l2n")
@@ -3435,7 +3435,7 @@ def cake_kda_det_train_kcp_workspace_bytes(
     use_qk_l2norm_in_kernel: bool = False,
 ) -> int:
     """Caller-held workspace bytes of one rank: the local arena for ``(T_r, n_frag, H)`` (zero on a rank without
-    tokens; the existing backend's arena, ``kda_det_train_workspace_bytes``, or for a backward workspace under
+    tokens; the existing backend's arena, ``cake_kda_det_train_workspace_bytes``, or for a backward workspace under
     ``local_arena="lean"`` (opt-in; the default ``None`` is ``"replay"``) the lean arena of :func:`local_arena_bytes`
     plus its tail-count table, ``4 * local_tail_count_words(arena, H)`` bytes, where the lean layout serves the row;
     a forward-only light
@@ -3501,7 +3501,7 @@ def cake_kda_det_train_kcp_workspace_bytes(
     for c in ctxs:
         if c.T_r <= 0:
             continue
-        from ...cake_kda_det_train import (
+        from ..cake_kda_det_train import (
             cake_backend,
         )  # the existing backend's arena rule; imported here so the metadata module stays torch-only
 
