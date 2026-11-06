@@ -113,13 +113,6 @@ MANIFEST_CHECKER = REPO_ROOT / "scripts" / "check_cake_build_manifests.py"
 # import it names, and the entry once it names none.
 ALLOWLIST = (
     (
-        "flashinfer.experimental.cake_dsa_indexer",
-        ("__init__", "cake_backend", "cake_build", "cake_jit", "cake_policy"),
-        "compatibility alias: __init__.py binds cake_dsa_indexer_det with "
-        "'from .. import', and each module replaces itself with the det "
-        "package's module, imported by its flashinfer path",
-    ),
-    (
         "flashinfer.experimental.cake_kda_det_train_kcp",
         ("cake_kcp", "cake_kcp_jit"),
         "they import the single-rank package across directories "
