@@ -78,11 +78,11 @@ the entry in the same change, and the entry once it lists none; a rename PR
 moves the entry with its package.  The list only shrinks.
 
 CI runs this file in the unit-test run over ``tests/``; it lives in
-``tests/infra/cpu`` because that run does not recurse into ``tests/experimental``.
+``tests/cpu/infra`` because that run does not recurse into ``tests/experimental``.
 The ``experimental-tests`` block of a PR body accepts only
 ``tests/experimental/``, so a PR that changes ``PACKAGES``, a package directory
 or a sibling declaration names this file when it asks for CI:
-``@flashinfer-bot run tests/infra/cpu/test_cake_packages_standalone.py``.
+``@flashinfer-bot run tests/cpu/infra/test_cake_packages_standalone.py``.
 
 CPU-only: the children run with ``CUDA_VISIBLE_DEVICES`` empty, as on a
 CPU-only consumer, and write no bytecode into the repository.  This module

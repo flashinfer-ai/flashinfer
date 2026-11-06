@@ -67,7 +67,7 @@ def test_backend_retains_successful_tuning_result(config_name, package, dtype):
             sys.executable,
             "-c",
             "import sys, pytest; "
-            "from tests.moe_ep.cpu.test_mega_tuned_knobs import _check_tuning_result; "
+            "from tests.cpu.moe_ep.test_mega_tuned_knobs import _check_tuning_result; "
             "_check_tuning_result(pytest.MonkeyPatch(), *sys.argv[1:])",
             config_name,
             package,

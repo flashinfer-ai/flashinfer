@@ -1138,7 +1138,7 @@ for every provider and its shim when producing CUDA-specific or nightly wheels.
   - `csrc` → `flashinfer/data/csrc`
   - `include` → `flashinfer/data/include`
 - **Version**: Generated in `flashinfer/_build_meta.py` from `version.txt`
-- **Wheel post-processing**: `build_backend.build_wheel` rewrites the finished wheel (`_slim_wheel`): level-9 deflate, the vendored 3rdparty Python trees that `packages.find` sweeps in are dropped, and with `FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES=1` (release workflow only) the experimental kernel sources are left out; RECORD is regenerated. Covered by `tests/infra/cpu/test_build_backend_slim_wheel.py`.
+- **Wheel post-processing**: `build_backend.build_wheel` rewrites the finished wheel (`_slim_wheel`): level-9 deflate, the vendored 3rdparty Python trees that `packages.find` sweeps in are dropped, and with `FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES=1` (release workflow only) the experimental kernel sources are left out; RECORD is regenerated. Covered by `tests/cpu/infra/test_build_backend_slim_wheel.py`.
 
 ## External Integrations
 

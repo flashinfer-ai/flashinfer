@@ -38,7 +38,7 @@ from flashinfer.trace_apply.apply import (
     preloaded_entry,
     register_preloaded,
 )
-from tests.trace_apply.cpu.seal_helpers import (
+from tests.cpu.trace_apply.seal_helpers import (
     GOLDEN_DIGEST,
     GOLDEN_ROOT,
     OPERATION,

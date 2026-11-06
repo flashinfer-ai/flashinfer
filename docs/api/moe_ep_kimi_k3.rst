@@ -256,7 +256,7 @@ Run the tests from the repository root:
 
 .. code-block:: bash
 
-   python -m pytest --confcutdir=tests/moe_ep/cpu -q tests/moe_ep/cpu/test_kimi_k3_api.py tests/moe_ep/cpu/test_kimi_k3_packaging.py
+   python -m pytest --confcutdir=tests/cpu/moe_ep -q tests/cpu/moe_ep/test_kimi_k3_api.py tests/cpu/moe_ep/test_kimi_k3_packaging.py
    python -m pytest --confcutdir=tests/moe_ep -q tests/moe_ep/test_kimi_k3_quantization.py
    torchrun --standalone --nproc_per_node=8 -m pytest --confcutdir=tests/moe_ep -q tests/moe_ep/test_sm100_kimi_k3.py
 

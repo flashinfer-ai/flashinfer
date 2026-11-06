@@ -41,7 +41,7 @@ from flashinfer.trace_apply import setup as su
 from flashinfer.trace_apply.apply import preloaded_entry
 from flashinfer.trace_apply.loaders import load as load_solution
 from flashinfer.trace_apply.setup import SetupBoundCallable, SetupStateError
-from tests.trace_apply.cpu.seal_helpers import (
+from tests.cpu.trace_apply.seal_helpers import (
     DEFINITION,
     GOLDEN_DIGEST,
     GOLDEN_ROOT,

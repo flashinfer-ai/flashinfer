@@ -219,7 +219,7 @@ per-solution permission document. FlashInfer's own weight-preparation helpers
 needs the layout a FlashInfer kernel expects produces it there, once.
 
 A complete setup-bearing package is preserved under
-``tests/trace_apply/cpu/data/kernel_package/48812d76b7d3073a961dc996d6968e09998bae895ff83f3a175fe7f98cb26280/``:
+``tests/cpu/trace_apply/data/kernel_package/48812d76b7d3073a961dc996d6968e09998bae895ff83f3a175fe7f98cb26280/``:
 ``bundle/kernel.py`` (``run``), ``bundle/prepare.py`` (``setup`` and
 ``teardown``), ``bundle/solution.json`` with the four fields,
 ``bundle/definition.json`` and a ``manifest.json`` in the ``sealed_files``

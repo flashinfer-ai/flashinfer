@@ -21,7 +21,7 @@ token-owner pass, which take the count as a kernel argument.  This module checks
 
 * the selection (pure host rules: at 20 no run-time-count record launches, at any other count the coefficient
   and token-owner passes launch exactly their run-time-count record) is checked on CPU in
-  ``tests/mhc/cpu/test_cake_mhc_det_train_rules.py``;
+  ``tests/cpu/mhc/test_cake_mhc_det_train_rules.py``;
 * the numerics at counts 1, 2, 5, 10, 19, 21, 30, 50 and 64 on T = 1, 7, 1024 and 16263: every output against an FP64
   reference evaluated at the same count, under the absolute bars of ``test_cake_mhc_det_train.py`` (BF16 outputs at atol =
   rtol = 1e-2 with no mismatch; the FP32 statistics, gradient statistics and parameter gradients at rel-L2 <= 1e-5;

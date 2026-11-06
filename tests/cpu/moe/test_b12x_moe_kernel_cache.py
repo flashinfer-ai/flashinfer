@@ -16,7 +16,7 @@ limitations under the License.
 Naming-contract tests for the b12x MoE CuTe-DSL disk cache adopter.
 
 Replicates the contract enforced for the earlier adopters in
-``tests/jit/cpu/test_cute_dsl_cache.py``, as the design doc's rollout note asks
+``tests/cpu/jit/test_cute_dsl_cache.py``, as the design doc's rollout note asks
 of new adopters. The kernel-name string is the sole per-kernel cache key --
 the module ``meta.json`` guards only arch / DSL version / source hashes -- so
 a name that ignores a codegen parameter makes two different kernels collide
