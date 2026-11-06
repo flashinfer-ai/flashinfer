@@ -211,7 +211,7 @@ def _filter_mxfp8_backends(
     supported_backends = []
     for backend in backends:
         try:
-            flashinfer.mxfp8_quantize.check_inputs(
+            flashinfer.mxfp8_quantize.validate_call(
                 input_tensor,
                 is_sf_swizzled_layout=is_sf_swizzled_layout,
                 alignment=alignment,
@@ -282,7 +282,8 @@ def testMxfp8Quantize(args):
             "Supported dtypes are bfloat16, float16, float32."
         )
     # Keep the cheap rejection before a potentially large allocation. The
-    # dtype rule is shared with the public preflight and native entry point.
+    # dtype rule is shared with full call validation; native execution also
+    # enforces its dtype contract in the binding.
     admitted_backends = []
     for backend in backends:
         if input_dtype in _mxfp8_input_dtypes(device.type, backend):

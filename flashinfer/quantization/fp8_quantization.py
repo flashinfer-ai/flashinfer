@@ -35,6 +35,7 @@ from ..jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
 from ..jit.quantization import gen_quantization_module
 from ..utils import (
     _check_block_scale_quantization_support,
+    backend_requirement,
     device_support_pdl,
     get_compute_capability,
     register_custom_op,
@@ -450,7 +451,7 @@ def _check_mxfp8_cute_dsl_inputs(input, alignment):
     assert k % 32 == 0, f"K ({k}) must be divisible by SF_VEC_SIZE=32"
 
 
-def _check_mxfp8_quantize_inputs(
+def _validate_mxfp8_quantize_call(
     input: torch.Tensor,
     is_sf_swizzled_layout: bool = True,
     alignment: int = 32,
@@ -492,6 +493,16 @@ def _check_mxfp8_quantize_inputs(
         _check_block_scale_quantization_support(input.device, "mxfp8_quantize")
 
 
+# Keep the native policy open to newer architectures, rather than enumerating
+# today's GPUs. CPU host calls are validated by the complete call checker.
+_check_mxfp8_native_inputs.is_compute_capability_supported = lambda cc: cc >= 100  # type: ignore[attr-defined]
+
+
+@backend_requirement(
+    {"cuda": _check_mxfp8_native_inputs, "cute-dsl": _check_mxfp8_cute_dsl_inputs},
+    call_check=_validate_mxfp8_quantize_call,
+    validate_on_call=False,
+)
 @flashinfer_api(trace=mxfp8_quantize_trace)
 def mxfp8_quantize(
     input: torch.Tensor,
@@ -563,7 +574,7 @@ def mxfp8_quantize(
 
     Notes
     -----
-    ``mxfp8_quantize.check_inputs(...)`` accepts the same call arguments and
+    ``mxfp8_quantize.validate_call(...)`` accepts the same call arguments and
     checks known input requirements without loading a quantization module,
     preparing tensors, allocating outputs or detecting PDL support. This is
     useful when filtering benchmark cases or choosing a caller's fallback
@@ -580,7 +591,7 @@ def mxfp8_quantize(
     Check the CPU host contract without compiling or quantizing:
 
     >>> x = torch.empty((2, 32), dtype=torch.float32)
-    >>> mxfp8_quantize.check_inputs(x, backend="cuda")
+    >>> mxfp8_quantize.validate_call(x, backend="cuda")
     """
     sf_swizzle_layout = _mxfp8_scale_layout(is_sf_swizzled_layout, sf_swizzle_layout)
     _check_mxfp8_backend(input, backend, batch_invariant)
@@ -597,7 +608,6 @@ def mxfp8_quantize(
         backend = "cuda"
 
     if backend == "cute-dsl":
-        _check_mxfp8_cute_dsl_inputs(input, alignment)
         _check_mxfp8_scale_layout(sf_swizzle_layout)
         from ..cute_dsl import is_cute_dsl_available
 
@@ -620,7 +630,27 @@ def mxfp8_quantize(
         )
     else:
         # backend == "cuda"
-        _check_mxfp8_native_inputs(input, sf_swizzle_layout, alignment)
+        # The FFI checks CUDA contiguity, rank, dtype and alignment multiples.
+        # Retain what must be checked before its Python preparation or what
+        # the host binding cannot catch; full admission belongs to validate_call.
+        _check_mxfp8_scale_layout(sf_swizzle_layout)
+        if input.device.type == "cpu":
+            if input.layout != torch.strided or not input.is_contiguous():
+                raise ValueError(
+                    "mxfp8_quantize on CPU requires contiguous strided input"
+                )
+            if sf_swizzle_layout == SfLayout.layout_8x4:
+                raise ValueError(
+                    f"{sf_swizzle_layout} is not supported for mxfp8 quantization on CPU."
+                )
+        elif input.device.type == "cuda":
+            if alignment <= 0:
+                raise ValueError("alignment must be positive")
+            if input.shape[-1] == 0:
+                raise ValueError(
+                    "mxfp8_quantize on CUDA requires a nonempty last dimension"
+                )
+        _check_block_scale_quantization_support(input.device, "mxfp8_quantize")
         if enable_pdl is None:
             enable_pdl = device_support_pdl(input.device)
         x_q, sf = get_mxfp8_quantization_sm100_module().mxfp8_quantize_sm100(
@@ -630,9 +660,6 @@ def mxfp8_quantize(
             enable_pdl,
         )
         return x_q, sf
-
-
-mxfp8_quantize.check_inputs = _check_mxfp8_quantize_inputs
 
 
 @functools.cache
