@@ -26,18 +26,27 @@ For ``t < B``, ``h < H`` and ``v < 128``, one launch computes::
 
 The sigmoid is evaluated in FP32 and is not rounded to BF16
 (``sigmoid_precision="fp32"``, the only mode offered).  :func:`prepare_mla_value_gate`
-runs outside CUDA graph capture: it checks the device and the weight, selects
-the program and loads (or JIT-builds) it.  :meth:`MlaValueGateRunner.launch`
-checks host metadata only (shapes, strides, dtypes, devices, alignment,
-overlap), computes the grid on the host and submits one kernel on the current
+runs outside CUDA graph capture: it checks the device and the weight, decides
+which program serves each row count ``B`` and loads (or JIT-builds) those
+programs.  :meth:`MlaValueGateRunner.launch` checks host metadata only (shapes,
+strides, dtypes, devices, alignment, overlap), looks up the program decided for
+``B``, computes its grid on the host and submits one kernel on the current
 torch stream without allocating or synchronising, so it can be captured in a
 CUDA graph.  The kernel reads ``w_uv`` from the storage bound at prepare and
 the other tensors from the pointers of each launch.
+
+An architecture may have two programs that differ only in the token rows one
+CTA owns (``grid_rule["rows"]``: 16 or 8).  They give identical bits; the
+choice affects time only.  :func:`select_tile_rows` is the rule: the 8-row
+program when ``enable_pdl`` is on or when its grid fits one wave
+(``4 * H * ceil(B / 8)`` CTAs, at most the device's SM count), else the 16-row
+program.
 """
 
 from __future__ import annotations
 
 import operator
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -51,9 +60,13 @@ from .cake_jit import (
     MODULES,
     VALUE_DIM,
     device_arch,
+    device_sm_count,
     launch_grid,
     load,
     records_for,
+)
+from .cake_jit import (
+    tile_rows as record_tile_rows,
 )
 
 __all__ = [
@@ -63,6 +76,7 @@ __all__ = [
     "VALUE_DIM",
     "MlaValueGateRunner",
     "prepare_mla_value_gate",
+    "select_tile_rows",
 ]
 
 #: The latent width of one head (the ``K`` of the projection).
@@ -152,24 +166,64 @@ def _argument_plan(record: dict[str, Any]) -> tuple[tuple[str, str], ...]:
     return tuple(plan)
 
 
+def select_tile_rows(
+    records: Mapping[int, dict[str, Any]],
+    *,
+    rows: int,
+    heads: int,
+    enable_pdl: bool,
+    sm_count: int,
+) -> int:
+    """Row tile of the program that serves a launch of ``rows`` token rows of ``heads`` heads.
+
+    ``records`` maps each row tile to its record (the programs of one architecture).  With one
+    program, that program.  With two, the smaller tile when ``enable_pdl`` is on or when its grid
+    fits one wave (``prod(launch_grid)`` -- ``4 * H * ceil(B / 8)`` for the 8-row program -- is at
+    most ``sm_count``), else the larger tile.  The programs give identical bits; the rule
+    affects time only."""
+    tiles = sorted(records)
+    if len(tiles) == 1:
+        return tiles[0]
+    if len(tiles) != 2:
+        raise RuntimeError(f"expected one or two row tiles, got {tiles}")
+    small, large = tiles
+    if enable_pdl:
+        return small
+    grid_x, grid_y, grid_z = launch_grid(records[small], rows=rows, heads=heads)
+    return small if grid_x * grid_y * grid_z <= sm_count else large
+
+
+@dataclass(frozen=True, eq=False)
+class _Program:
+    """One loaded program: its record, argument plan and entry."""
+
+    name: str
+    tile_rows: int
+    record: dict[str, Any] = field(repr=False)
+    plan: tuple[tuple[str, str], ...] = field(repr=False)
+    entry: Any = field(repr=False)
+
+
 @dataclass(frozen=True, eq=False)
 class MlaValueGateRunner:
-    """The prepared program of one bound ``w_uv``.
+    """The prepared programs of one bound ``w_uv``.
 
-    ``launch(latent, gate, valid_lengths, out)`` (or a call) checks host metadata
-    only, submits one kernel on the current torch stream -- no allocation, no
-    synchronisation -- and returns ``out``.  A launch may be captured in a CUDA
-    graph; a replay re-reads the contents of the captured tensors (and of
-    ``w_uv``), so their storage must stay alive and in place.  The runner keeps
-    a reference to ``w_uv``: in-place updates of its contents are seen by the
-    next launch, while a new weight tensor (or a re-aliased one) needs a new
-    :func:`prepare_mla_value_gate` and a new capture.  With ``enable_pdl`` the
-    kernel may start before the preceding kernel of the stream completes: it
-    reads ``w_uv`` before it waits on that kernel and reads ``latent``,
-    ``gate`` and ``valid_lengths`` and writes ``out`` only after, so the
-    preceding kernel must not write ``w_uv``; a following kernel launched
-    with programmatic dependent launch must wait (``griddepcontrol.wait``)
-    before it reads ``out``.
+    ``launch(latent, gate, valid_lengths, out)`` (or a call) checks host
+    metadata only, submits one kernel on the current torch stream -- no
+    allocation, no synchronisation -- and returns ``out``.  Which program serves
+    each row count ``B`` was decided at prepare (:func:`select_tile_rows`) and
+    does not change: :meth:`program_for` and :meth:`tile_rows_for` report it.  A
+    launch may be captured in a CUDA graph; a replay re-reads the contents of
+    the captured tensors (and of ``w_uv``), so their storage must stay alive and
+    in place.  The runner keeps a reference to ``w_uv``: in-place updates of its
+    contents are seen by the next launch, while a new weight tensor (or a
+    re-aliased one) needs a new :func:`prepare_mla_value_gate` and a new
+    capture.  With ``enable_pdl`` the kernel may start before the preceding
+    kernel of the stream completes: it reads ``w_uv`` before it waits on that
+    kernel and reads ``latent``, ``gate`` and ``valid_lengths`` and writes
+    ``out`` only after, so the preceding kernel must not write ``w_uv``; a
+    following kernel launched with programmatic dependent launch must wait
+    (``griddepcontrol.wait``) before it reads ``out``.
     """
 
     w_uv: torch.Tensor
@@ -178,16 +232,35 @@ class MlaValueGateRunner:
     sigmoid_precision: str
     enable_pdl: bool
     arch: str
-    program: str
-    _record: dict[str, Any] = field(repr=False)
-    _plan: tuple[tuple[str, str], ...] = field(repr=False)
-    _entry: Any = field(repr=False)
+    sm_count: int
+    programs: tuple[str, ...]
+    _programs: tuple[_Program, ...] = field(repr=False)
+    _selection: tuple[int, ...] = field(repr=False)
     _w_uv_physical: torch.Tensor = field(repr=False)
     _w_uv_bytes: tuple[int, int] = field(repr=False)
 
     @property
     def heads(self) -> int:
         return int(self.w_uv.shape[0])
+
+    def _program(self, rows: int) -> _Program:
+        rows = _int_arg(rows, "rows")
+        if not 1 <= rows <= self.max_rows:
+            raise ValueError(f"B = {rows} is outside [1, max_rows = {self.max_rows}]")
+        return self._programs[self._selection[rows - 1]]
+
+    def program_for(self, rows: int) -> str:
+        """Name of the program a launch of ``rows`` token rows runs."""
+        return self._program(rows).name
+
+    def tile_rows_for(self, rows: int) -> int:
+        """Token rows per CTA of the program a launch of ``rows`` token rows runs (16 or 8)."""
+        return self._program(rows).tile_rows
+
+    @property
+    def program(self) -> str:
+        """Name of the program a launch of ``max_rows`` rows runs (see :meth:`program_for`)."""
+        return self.program_for(self.max_rows)
 
     @property
     def device(self) -> torch.device:
@@ -285,6 +358,7 @@ class MlaValueGateRunner:
         (row pitch ``gate.stride(0)``), ``valid_lengths`` ``[B // q]`` and the
         caller-owned ``out`` ``[B, H * 128]``; returns ``out``."""
         rows, pitch = self._check(latent, gate, valid_lengths, out)
+        program = self._programs[self._selection[rows - 1]]
         heads = self.heads
         span = (rows - 1) * pitch + heads * VALUE_DIM
         values: dict[str, Any] = {
@@ -300,11 +374,11 @@ class MlaValueGateRunner:
             "gate_pitch": pitch,
             "enable_pdl": int(self.enable_pdl),
         }
-        grid = launch_grid(self._record, rows=rows, heads=heads)
+        grid = launch_grid(program.record, rows=rows, heads=heads)
         values["grid_x"], values["grid_y"], values["grid_z"] = grid
-        arguments = tuple(values[name] for _kind, name in self._plan)
+        arguments = tuple(values[name] for _kind, name in program.plan)
         with tvm_ffi.use_torch_stream():
-            self._entry(*arguments)
+            program.entry(*arguments)
         return out
 
     __call__ = launch
@@ -317,10 +391,14 @@ def prepare_mla_value_gate(
     sigmoid_precision: str,
     rows_per_request: int = 1,
     enable_pdl: bool = True,
+    tile_rows: int | None = None,
 ) -> MlaValueGateRunner:
     """Bind ``w_uv`` (logical BF16 ``[H, 512, 128]`` with strides ``(65536, 1, 512)``,
-    16-byte aligned) and load the program of the device's architecture; see
+    16-byte aligned), decide which program serves each ``B`` in ``[1, max_rows]``
+    (:func:`select_tile_rows`, with the device's SM count) and load those programs; see
     :func:`flashinfer.cake_mla_value_gate.prepare_mla_value_gate` for the contract.
+    ``tile_rows`` (backend only, for tests and measurements) forces the program with that
+    row tile for every ``B`` instead of the rule.
     Raises ``RuntimeError`` under CUDA graph capture, ``TypeError`` / ``ValueError``
     on invalid arguments and ``NotImplementedError`` when the device is not an
     exact SM100a / SM103a part or the checkout registers no program for it."""
@@ -344,6 +422,8 @@ def prepare_mla_value_gate(
         )
     if not isinstance(enable_pdl, bool):
         raise TypeError(f"enable_pdl must be a bool, got {type(enable_pdl).__name__}")
+    if tile_rows is not None:
+        tile_rows = _int_arg(tile_rows, "tile_rows")
     _check_tensor(w_uv, "w_uv", torch.bfloat16)
     if w_uv.ndim != 3 or tuple(w_uv.shape[1:]) != (LATENT_DIM, VALUE_DIM):
         raise ValueError(
@@ -380,20 +460,58 @@ def prepare_mla_value_gate(
             f"this checkout registers no Cake MLA value gate program for {arch} with "
             f"sigmoid_precision={sigmoid_precision!r}"
         )
-    if len(names) > 1:
+    by_tile: dict[int, str] = {}
+    for name in names:
+        tile = record_tile_rows(MODULES[name])
+        if tile in by_tile:
+            raise RuntimeError(
+                f"the registry delivers two {tile}-row programs for ({arch}, "
+                f"{sigmoid_precision!r}): {by_tile[tile]}, {name}"
+            )
+        by_tile[tile] = name
+    if len(by_tile) > 2:
         raise RuntimeError(
-            f"the registry delivers {len(names)} programs for ({arch}, {sigmoid_precision!r}): {names}"
+            f"the registry delivers {len(by_tile)} programs for ({arch}, {sigmoid_precision!r}): "
+            f"{sorted(by_tile.values())}; the host selects between at most two row tiles"
         )
-    name = names[0]
-    record = MODULES[name]
-    use_pdl = record["launch"]["use_pdl"]
-    if use_pdl != "runtime" and bool(use_pdl) != enable_pdl:
+    for name in by_tile.values():
+        use_pdl = MODULES[name]["launch"]["use_pdl"]
+        if use_pdl != "runtime" and bool(use_pdl) != enable_pdl:
+            raise NotImplementedError(
+                f"program {name} always launches with use_pdl={use_pdl}; "
+                f"enable_pdl={enable_pdl} is not available"
+            )
+    sm_count = device_sm_count(device_index)
+    if tile_rows is None:
+        records = {tile: MODULES[name] for tile, name in by_tile.items()}
+        chosen = [
+            select_tile_rows(
+                records,
+                rows=rows,
+                heads=heads,
+                enable_pdl=enable_pdl,
+                sm_count=sm_count,
+            )
+            for rows in range(1, max_rows + 1)
+        ]
+    elif tile_rows in by_tile:
+        chosen = [tile_rows] * max_rows
+    else:
         raise NotImplementedError(
-            f"program {name} always launches with use_pdl={use_pdl}; enable_pdl={enable_pdl} "
-            "is not available"
+            f"this checkout registers no {tile_rows}-row Cake MLA value gate program for "
+            f"{arch}; its row tiles: {sorted(by_tile)}"
         )
-    plan = _argument_plan(record)
-    entry = getattr(load(name, arch), record["ffi_entry"])
+    # Load only the programs some B uses (in registry order).
+    programs = []
+    for tile in [tile for tile in by_tile if tile in chosen]:
+        name = by_tile[tile]
+        record = MODULES[name]
+        plan = _argument_plan(record)
+        entry = getattr(load(name, arch), record["ffi_entry"])
+        programs.append(
+            _Program(name=name, tile_rows=tile, record=record, plan=plan, entry=entry)
+        )
+    index = {program.tile_rows: i for i, program in enumerate(programs)}
     physical = w_uv.transpose(1, 2)
     return MlaValueGateRunner(
         w_uv=w_uv,
@@ -402,10 +520,10 @@ def prepare_mla_value_gate(
         sigmoid_precision=sigmoid_precision,
         enable_pdl=enable_pdl,
         arch=arch,
-        program=name,
-        _record=record,
-        _plan=plan,
-        _entry=entry,
+        sm_count=sm_count,
+        programs=tuple(program.name for program in programs),
+        _programs=tuple(programs),
+        _selection=tuple(index[tile] for tile in chosen),
         _w_uv_physical=physical,
         _w_uv_bytes=_byte_range(physical),
     )

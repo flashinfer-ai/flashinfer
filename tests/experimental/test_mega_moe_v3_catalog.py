@@ -23,6 +23,12 @@ TP_EP_TOKENS = (1, 4, 16, 32, 128, 512, 1024, 4096)
 DIRECT_A_TOKENS = (1, 4)
 DIRECT_A_EP_TOKENS = (16,)
 DIRECT_A_EP_EXPERTS = (48, 96)
+# The TP routes whose sm_103a programs read the down-projection weights as a
+# dense image of the logical width (route metadata ``w2_dense_k`` and
+# ``w2_logical_k``): both TP shapes at 32 tokens and above, each with its
+# (image, logical) widths.
+W2_DENSE_TOKENS = (32, 128, 512, 1024, 4096)
+W2_DENSE_WIDTHS = {(384, 384): (320, 288), (384, 640): (576, 576)}
 
 # The launch form of the TP/EP programs: the generated binding's Run() launches
 # through cudaLaunchKernelExC with three counted attribute slots, the cluster
@@ -215,6 +221,30 @@ def test_only_the_short_sm103a_rank_routes_read_a_from_the_activations():
                 assert arch == "sm_103a" and key in direct, (arch, key)
                 stated.add(key)
     assert stated in (set(), direct_short, direct), sorted(direct ^ stated)
+
+
+def test_only_the_dense_w2_tp_routes_state_their_w2_image_widths():
+    """``w2_dense_k`` and ``w2_logical_k`` name a program that reads ``B2`` as
+    the dense image of the logical down-projection width when ``K2`` is
+    ``w2_dense_k``. Exactly the sm_103a TP routes of ``W2_DENSE_TOKENS`` state
+    them, both together, with their shape's widths; no other route of either
+    architecture states either key."""
+    catalog = _catalog()
+    expected = {
+        tp_ep_route_key(num_experts, intermediate, num_tokens): widths
+        for (num_experts, intermediate), widths in W2_DENSE_WIDTHS.items()
+        for num_tokens in W2_DENSE_TOKENS
+    }
+    assert len(expected) == 10
+    stated = {}
+    for arch in catalog.arches:
+        for key, route in catalog.routes(arch).items():
+            metadata = route["metadata"]
+            keys = [k for k in ("w2_dense_k", "w2_logical_k") if k in metadata]
+            if keys:
+                assert arch == "sm_103a" and len(keys) == 2, (arch, key, keys)
+                stated[key] = (metadata["w2_dense_k"], metadata["w2_logical_k"])
+    assert stated == expected, sorted(set(stated) ^ set(expected))
 
 
 def test_tp_ep_programs_launch_as_programmatic_dependents():
