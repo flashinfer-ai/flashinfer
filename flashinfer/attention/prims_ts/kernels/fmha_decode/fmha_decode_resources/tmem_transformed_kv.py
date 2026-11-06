@@ -381,6 +381,12 @@ class TmemTransformedKvResource(DecodeGenResourceBase):
                 + Int32(sf_head_stage_offset * 4)
                 + warp_idx * Int32(8)
             )
+            if cutlass.const_expr(cfg.swizzles_v_scale_factors):
+                # 128 B swizzle: XOR the 16 B chunk with the row index mod 8.
+                # Both words share one chunk, so they stay adjacent.
+                sf_byte_offset = sf_byte_offset ^ (
+                    ((sf_byte_offset >> Int32(7)) & Int32(7)) << Int32(4)
+                )
             sf_word_idx = sf_byte_offset // Int32(4)
             sf_packed0 = src_sf_words[sf_word_idx]
             sf_packed1 = src_sf_words[sf_word_idx + Int32(1)]

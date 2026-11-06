@@ -4059,7 +4059,9 @@ def fmha_decode_launch(
             v_sf_tma,
             box_dims=(sf_inner, sf_box_tokens_outer, 1, 1),
             stride_order=(0, 1, 2, 3),
-            swizzle=cuda.TensorMapSwizzle.none,
+            swizzle=cuda.TensorMapSwizzle.s128b
+            if cutlass.const_expr(cfg.swizzles_v_scale_factors)
+            else cuda.TensorMapSwizzle.none,
         )
 
     grid_x = q_groups

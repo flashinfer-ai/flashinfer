@@ -1421,6 +1421,25 @@ class FmhaDecodeConfig:
         return self.tile_size_kv * self.smem_kv_sf_bytes_per_token
 
     @property
+    def swizzles_v_scale_factors(self) -> bool:
+        """Whether V scale factors are staged with the 128 B TMA swizzle.
+
+        The TMEM V converter reads one word per four-token group and lane
+        group. At D512 each folded group row is 128 B, so the four groups a
+        warp reads at once share one bank and the loads replay four times;
+        the swizzle moves each row's 16 B chunks to distinct banks. Every page
+        fragment must cover whole 1024 B swizzle atoms (pages of 32+ tokens).
+        GB300 B128/KV128K: sQ4 3.78 -> 3.36 ms, sQ8 3.90 -> 3.63 ms.
+        """
+        return (
+            self.use_nvfp4_kv
+            and self.store_transformed_kv_in_tmem
+            and self.headdim == 512
+            and self.headdim // 16 * self.sf_tma_reshape_factor == 128
+            and self.num_tokens_per_page * (self.headdim // 16) % 1024 == 0
+        )
+
+    @property
     def sf_tma_reshape_factor(self) -> int:
         """Token-fold factor that widens the NVFP4 SF TMA inner box to 128 B."""
         sf_per_token = self.headdim // 16
