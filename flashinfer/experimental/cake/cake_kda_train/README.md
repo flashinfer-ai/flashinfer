@@ -3,14 +3,14 @@
 Experimental backend for the packed Kimi Delta Attention (KDA) chunked
 training forward and backward in the GLM-5.3-Flash geometry, the
 `deterministic=False` counterpart of the deterministic package
-`flashinfer.experimental.cake_kda_det_train`.  Both the API and the backend
+`flashinfer.experimental.cake.cake_kda_det_train`.  Both the API and the backend
 are experimental: no compatibility guarantee.  The feature does not
 participate in automatic backend selection, autotuning or trace-apply.
 
 The operands, shapes, dtypes, saved set (versions 4 and 2), workspace, arena
 options, document groups (`batch_tokens`), launch sequences and byte queries
 are the deterministic package's; its README
-(`flashinfer/experimental/cake_kda_det_train/README.md`) describes them.  This
+(`flashinfer/experimental/cake/cake_kda_det_train/README.md`) describes them.  This
 package imports nothing from it and ships its own copies of every program.
 This README describes what differs, including the checkpoint hand-off of
 `chunk_kda`, which the deterministic package does not have.
@@ -325,10 +325,10 @@ No rule selects the twin.
 | deterministic package (unchanged) | this package |
 | --- | --- |
 | `flashinfer.cake_kda_det_train` (facade) | `flashinfer.cake_kda_train` (facade, `deterministic=...`) |
-| `flashinfer.experimental.cake_kda_det_train` | `flashinfer.experimental.cake.cake_kda_train` |
-| `chunk_kda_det_fwd`, `chunk_kda_det_bwd`, `chunk_kda_det` | `chunk_kda_fwd`, `chunk_kda_bwd`, `chunk_kda` |
-| `kda_det_train_arena`, `kda_det_train_workspace(_bytes)`, `kda_det_train_saved_bytes`, `is_kda_det_train_supported` | `kda_train_arena`, `kda_train_workspace(_bytes)`, `kda_train_saved_bytes`, `is_kda_train_supported` |
-| `ChunkKDADetFunction`, `KdaDetChunkSaved`, `KdaDetWorkspace`, `KdaDetArena` | `ChunkKDAFunction`, `KdaChunkSaved`, `KdaWorkspace`, `KdaArena` |
+| `flashinfer.experimental.cake.cake_kda_det_train` | `flashinfer.experimental.cake.cake_kda_train` |
+| `cake_kda_det_train_forward`, `cake_kda_det_train_backward`, `cake_kda_det` | `chunk_kda_fwd`, `chunk_kda_bwd`, `chunk_kda` |
+| `cake_kda_det_train_arena`, `cake_kda_det_train_workspace(_bytes)`, `cake_kda_det_train_saved_bytes`, `is_cake_kda_det_train_supported` | `kda_train_arena`, `kda_train_workspace(_bytes)`, `kda_train_saved_bytes`, `is_kda_train_supported` |
+| `CakeKDADetFunction`, `CakeKDADetChunkSaved`, `CakeKDADetWorkspace`, `CakeKDADetArena` | `ChunkKDAFunction`, `KdaChunkSaved`, `KdaWorkspace`, `KdaArena` |
 | libraries `cake_kda_det_train_<digest>` | `cake_kda_train_<digest>` |
 
 The previous names keep their deterministic meaning: `flashinfer.kda_train`

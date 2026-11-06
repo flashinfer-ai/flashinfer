@@ -6094,6 +6094,22 @@ def kernel(
 
 
 @cute.jit
+def _token_major_tma_view(tensor: cute.Tensor) -> cute.Tensor:
+    # The packed batch mode is unused; keep its stride small even for a large
+    # token pitch. Token strides remain Int64 runtime values in the descriptor.
+    batch_stride = cutlass.Int64(tensor.shape[3])
+    if tensor.shape[0] != 1:
+        batch_stride = tensor.stride[0]
+    return cute.make_tensor(
+        tensor.iterator,
+        cute.make_layout(
+            (tensor.shape[3], tensor.shape[1], tensor.shape[2], tensor.shape[0]),
+            stride=(1, tensor.stride[1], tensor.stride[2], batch_stride),
+        ),
+    )
+
+
+@cute.jit
 def host(
     q: cute.Tensor,
     k: cute.Tensor,
@@ -6119,35 +6135,13 @@ def host(
     THREADS: cutlass.Constexpr,
     gate_dtype: cutlass.Constexpr,
 ) -> None:
-    packed_batch = q.shape[0]
     num_sequences = cu_seqlens.shape[0] - 1
-    seqlen = q.shape[1]
     heads = q.shape[2]
-    # Token-major activations: memory order [T, H, D] (token stride = D*heads),
-    # so packed [1, T_total, H, D] / batched [B, T, H, D] callers are read
-    # directly with no transpose.
-    # Keep the unused outer stride representable by CuTe IR for packed inputs.
-    # CuTe layouts currently lower strides through signed Int32, so the natural
-    # D*T*H batch stride overflows once a singleton packed token buffer exceeds
-    # that range even though the batch coordinate is always zero.
-    qk_batch_stride = DK
-    v_batch_stride = DV
-    if packed_batch != cutlass.Int32(1):
-        qk_batch_stride = DK * seqlen * heads
-        v_batch_stride = DV * seqlen * heads
-    qk_layout = cute.make_layout(
-        (DK, seqlen, heads, packed_batch),
-        stride=(1, DK * heads, DK, qk_batch_stride),
-    )
-    v_layout = cute.make_layout(
-        (DV, seqlen, heads, packed_batch),
-        stride=(1, DV * heads, DV, v_batch_stride),
-    )
-    q_tma = cute.make_tensor(q.iterator, qk_layout)
-    k_tma = cute.make_tensor(k.iterator, qk_layout)
-    v_tma = cute.make_tensor(v.iterator, v_layout)
-    gate_tma = cute.make_tensor(raw_gate.iterator, qk_layout)
-    out_tma = cute.make_tensor(out.iterator, v_layout)
+    q_tma = _token_major_tma_view(q)
+    k_tma = _token_major_tma_view(k)
+    v_tma = _token_major_tma_view(v)
+    gate_tma = _token_major_tma_view(raw_gate)
+    out_tma = _token_major_tma_view(out)
     raw_f16_tma_box = (RAW_F16_TMA_SWIZZLE_ELEMS, BT, 1, 1)
     raw_f32_tma_box = (RAW_F32_TMA_SWIZZLE_ELEMS, BT, 1, 1)
     o_tma_box = (O_TMA_SWIZZLE_ELEMS, BT, 1, 1)
@@ -6804,30 +6798,24 @@ def host_prep(
     THREADS: cutlass.Constexpr,
     gate_dtype: cutlass.Constexpr,
 ) -> None:
-    seqlen = q.shape[1]
     heads = q.shape[2]
-    # Token-major user activations (see host()).
-    qk_layout = cute.make_layout(
-        (DK, seqlen, heads, 1),
-        stride=(1, DK * heads, DK, DK * seqlen * heads),
-    )
     raw_f16_tma_box = (RAW_F16_TMA_SWIZZLE_ELEMS, BT, 1, 1)
     raw_f32_tma_box = (RAW_F32_TMA_SWIZZLE_ELEMS, BT, 1, 1)
     tma_desc_q = cuda.create_tensor_map_tiled_from_view(
-        cute.make_tensor(q.iterator, qk_layout),
+        _token_major_tma_view(q),
         box_dims=raw_f16_tma_box,
         stride_order=(0, 1, 2, 3),
         swizzle=cuda.TensorMapSwizzle.s128b,
     )
     tma_desc_k = cuda.create_tensor_map_tiled_from_view(
-        cute.make_tensor(k.iterator, qk_layout),
+        _token_major_tma_view(k),
         box_dims=raw_f16_tma_box,
         stride_order=(0, 1, 2, 3),
         swizzle=cuda.TensorMapSwizzle.s128b,
     )
     gate_tma_box = raw_f32_tma_box if gate_dtype_is_f32(gate_dtype) else raw_f16_tma_box
     tma_desc_gate = cuda.create_tensor_map_tiled_from_view(
-        cute.make_tensor(raw_gate.iterator, qk_layout),
+        _token_major_tma_view(raw_gate),
         box_dims=gate_tma_box,
         stride_order=(0, 1, 2, 3),
         swizzle=cuda.TensorMapSwizzle.s128b,
@@ -9409,7 +9397,6 @@ def host_chain_dv2(
     """DV2 host: identical tensor maps to the base chain host, doubled grid-y."""
 
     num_sequences = cu_seqlens.shape[0] - 1
-    seqlen = v.shape[1]
     heads = v.shape[2]
     ws_rows = ws_kd.shape[2]
     num_chunks_total = ws_qk.shape[2]
@@ -9424,10 +9411,6 @@ def host_chain_dv2(
     tile_layout = cute.make_layout(
         (DK, ws_rows, heads, 1),
         stride=(1, DK, tile_head_stride, DK),
-    )
-    v_layout = cute.make_layout(
-        (DV, seqlen, heads, 1),
-        stride=(1, DV * heads, DV, DV * seqlen * heads),
     )
     diag_layout = cute.make_layout(
         (DIAG_REC_ELEMS, num_chunks_total, heads, 1),
@@ -9467,7 +9450,7 @@ def host_chain_dv2(
         swizzle=cuda.TensorMapSwizzle.s128b,
     )
     tma_desc_v = cuda.create_tensor_map_tiled_from_view(
-        cute.make_tensor(v.iterator, v_layout),
+        _token_major_tma_view(v),
         box_dims=f16_box,
         stride_order=(0, 1, 2, 3),
         swizzle=cuda.TensorMapSwizzle.s128b,
@@ -9485,7 +9468,7 @@ def host_chain_dv2(
         swizzle=cuda.TensorMapSwizzle.none,
     )
     tma_desc_o = cuda.create_tensor_map_tiled_from_view(
-        cute.make_tensor(out.iterator, v_layout),
+        _token_major_tma_view(out),
         box_dims=(O_TMA_SWIZZLE_ELEMS, BT, 1, 1),
         stride_order=(0, 1, 2, 3),
         swizzle=cuda.TensorMapSwizzle.s128b,
@@ -9719,9 +9702,16 @@ def _unified_fakes(
     ss = cute.sym_int64(divisibility=1)
     sc = cute.sym_int64(divisibility=1)
     sc16 = cute.sym_int64(divisibility=16)
-    fq = F(dtype, (1, ss, sh, DK), stride_order=(3, 2, 1, 0), assumed_align=16)
-    fk = F(dtype, (1, ss, sh, DK), stride_order=(3, 2, 1, 0), assumed_align=16)
-    fv = F(dtype, (1, ss, sh, DV), stride_order=(3, 2, 1, 0), assumed_align=16)
+
+    def qkv_fake(dim):
+        return cute.runtime.make_fake_tensor(
+            dtype,
+            shape=(1, ss, sh, dim),
+            stride=(cute.sym_int64(), cute.sym_int64(divisibility=8), dim, 1),
+            assumed_align=16,
+        )
+
+    fq, fk, fv = qkv_fake(DK), qkv_fake(DK), qkv_fake(DV)
     fgate = F(gate_dtype, (1, ss, sh, DK), stride_order=(3, 2, 1, 0), assumed_align=16)
     fa_log = F(cutlass.Float32, (sh,), stride_order=(0,), assumed_align=16)
     fdt = F(cutlass.Float32, (sh, DK), stride_order=(1, 0), assumed_align=16)

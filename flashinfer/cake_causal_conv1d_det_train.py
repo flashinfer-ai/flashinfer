@@ -80,8 +80,10 @@ workspace size is the maximum over every backward program of every route, so
 one buffer of ``cake_causal_conv1d_det_train_backward_workspace_bytes(S, C,
 device)`` serves whichever program a call selects.  Before capturing a CUDA
 Graph, build every library of the device's architecture (the backend's
-``cake_jit.specs_for_arch``) so that no JIT build happens inside the capture;
-the captured graph holds the program selected for its shape and route.
+``flashinfer.experimental.cake.cake_causal_conv1d_det_train.cake_jit.specs_for_arch``)
+so that no JIT build happens inside the capture; the captured graph holds the
+program selected for its shape and route.  The backend package is imported on
+first use: importing this module (or ``flashinfer``) loads none of it.
 
 Usage::
 
@@ -122,39 +124,75 @@ Usage::
     # fragments exchanged through the KCP context (FP32 taps, no bias)
     from flashinfer.cake_causal_conv1d_det_train_kcp import (
         cake_causal_conv1d_det_kcp,
-        cake_causal_conv1d_det_multi_kcp,
+        cake_causal_conv1d_det_kcp_multi,
     )
 
     y_local = cake_causal_conv1d_det_kcp(x_local, weight, ctx)
 
     # a layer's q / k / v convolutions with one halo exchange per direction
     # (bitwise three single calls)
-    q, k, v = cake_causal_conv1d_det_multi_kcp((xq, xk, xv), (wq, wk, wv), ctx)
+    q, k, v = cake_causal_conv1d_det_kcp_multi((xq, xk, xv), (wq, wk, wv), ctx)
 """
 
 from __future__ import annotations
 
-from typing import Optional
+from types import ModuleType
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
-from . import cake_causal_conv1d_det_train_backend as _backend
 from .api_logging import flashinfer_api
-from .cake_causal_conv1d_det_train_backend import (  # noqa: F401
-    ARCHES,
-    SUPPORTED_COMPUTE_CAPABILITIES,
-    CakeCausalConv1dDetFunction,
-    cake_causal_conv1d_det_train_backward_workspace,
-    cake_causal_conv1d_det_train_backward_workspace_bytes,
-    cake_causal_conv1d_det_train_forward_workspace,
-    cake_causal_conv1d_det_train_forward_workspace_bytes,
-    is_cake_causal_conv1d_det_train_supported,
+
+if TYPE_CHECKING:
+    from .experimental.cake.cake_causal_conv1d_det_train import (
+        ARCHES,
+        SUPPORTED_COMPUTE_CAPABILITIES,
+        CakeCausalConv1dDetFunction,
+        cake_causal_conv1d_det_train_backward_workspace,
+        cake_causal_conv1d_det_train_backward_workspace_bytes,
+        cake_causal_conv1d_det_train_forward_workspace,
+        cake_causal_conv1d_det_train_forward_workspace_bytes,
+        is_cake_causal_conv1d_det_train_supported,
+    )
+
+# The self-contained backend package next to the generated CUDA sources.  It sits
+# under flashinfer/experimental/cake/, so it is imported on first use only: by a
+# call below or by the first access to one of the re-exported names (module
+# ``__getattr__``), never by importing this module.
+# The backend's names this module re-exports, resolved on first access.
+_LAZY_EXPORTS = frozenset(
+    {
+        "ARCHES",
+        "SUPPORTED_COMPUTE_CAPABILITIES",
+        "CakeCausalConv1dDetFunction",
+        "cake_causal_conv1d_det_train_backward_workspace",
+        "cake_causal_conv1d_det_train_backward_workspace_bytes",
+        "cake_causal_conv1d_det_train_forward_workspace",
+        "cake_causal_conv1d_det_train_forward_workspace_bytes",
+        "is_cake_causal_conv1d_det_train_supported",
+    }
 )
 
+
+def _backend() -> ModuleType:
+    from .experimental.cake import cake_causal_conv1d_det_train as backend
+
+    return backend
+
+
+def __getattr__(name: str) -> Any:
+    if name in _LAZY_EXPORTS:
+        return getattr(_backend(), name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | _LAZY_EXPORTS)
+
+
 # The three stable entry points are real ``def``s here (public-API tooling reads the
-# decorated signatures of this module); their bodies live in the self-contained
-# backend package next to the generated CUDA sources.  The signatures mirror the
-# backend's exactly (a test asserts it).
+# decorated signatures of this module); their bodies live in the backend package.
+# The signatures mirror the backend's exactly (a test asserts it).
 
 
 @flashinfer_api
@@ -207,7 +245,7 @@ def cake_causal_conv1d_det_train_forward(
         first token.  ``S == 0`` returns the empty output without launching.
     """
 
-    return _backend.cake_causal_conv1d_det_train_forward(
+    return _backend().cake_causal_conv1d_det_train_forward(
         x, weight, cu_seqlens, bias=bias, out=out, workspace=workspace
     )
 
@@ -243,8 +281,9 @@ def cake_causal_conv1d_det_train_backward(
     program through a host-side rule of the backend's registry (never the
     data), so a given ``(S, C, device)`` and route always run the same program.
     Before capturing a CUDA Graph, build every library of the device's
-    architecture (the backend's ``cake_jit.specs_for_arch``) so that no JIT
-    build happens inside the capture; the captured graph holds the program
+    architecture (the backend's ``cake_jit.specs_for_arch``, in
+    ``flashinfer.experimental.cake.cake_causal_conv1d_det_train``) so that no
+    JIT build happens inside the capture; the captured graph holds the program
     selected for its shape and route.
 
     Parameters
@@ -298,7 +337,7 @@ def cake_causal_conv1d_det_train_backward(
     returns the empty ``dx`` and zero gradients without launching.
     """
 
-    return _backend.cake_causal_conv1d_det_train_backward(
+    return _backend().cake_causal_conv1d_det_train_backward(
         x,
         weight,
         cu_seqlens,
@@ -353,7 +392,7 @@ def cake_causal_conv1d_det(
         come in the parameters' dtypes.
     """
 
-    return _backend.cake_causal_conv1d_det(
+    return _backend().cake_causal_conv1d_det(
         x,
         weight,
         cu_seqlens,

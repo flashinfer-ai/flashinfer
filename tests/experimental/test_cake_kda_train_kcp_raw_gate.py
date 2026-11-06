@@ -102,7 +102,7 @@ cake_kcp_jit = cake_package("cake_kda_train_kcp", "cake_kcp_jit")
 # the deterministic package: the baseline of the bitwise rows (imported by the test, never by the package)
 det_kcp = cake_package("cake_kda_det_train_kcp", "cake_kcp")
 det_kcp_plan = cake_package("cake_kda_det_train_kcp", "cake_kcp_plan")
-det_backend = cake_package("cake_kda_det_train", "cake_backend")
+det_backend = cake_package("cake.cake_kda_det_train", "cake_backend")
 
 D = cake_kcp.D
 SCALE = cake_kcp.SCALE

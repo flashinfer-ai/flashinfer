@@ -19,7 +19,7 @@ arena, the saved set, the forward and backward launch sequences and the
 autograd Function.
 
 Numerical mode.  This package is the counterpart of
-``flashinfer.experimental.cake_kda_det_train`` (the deterministic package)
+``flashinfer.experimental.cake.cake_kda_det_train`` (the deterministic package)
 selected with ``deterministic=False``; it imports nothing from it and ships its
 own copies of every program.  The entry points :func:`chunk_kda_fwd`,
 :func:`chunk_kda_bwd` and :func:`chunk_kda`, the workspace :class:`KdaWorkspace`
@@ -4224,7 +4224,7 @@ def _require_deterministic_false(deterministic: object, entry: str) -> None:
         raise ValueError(
             f"{entry} is the non-deterministic packed KDA training (deterministic=False), got "
             f"deterministic={deterministic!r}; the deterministic programs are "
-            "flashinfer.experimental.cake_kda_det_train (or flashinfer.cake_kda_train with deterministic=True)"
+            "flashinfer.experimental.cake.cake_kda_det_train (or flashinfer.cake_kda_train with deterministic=True)"
         )
 
 
@@ -4249,7 +4249,7 @@ def _refuse_qk_l2norm(entry: str, use_qk_l2norm_in_kernel: object) -> None:
         raise ValueError(
             f"{entry}: use_qk_l2norm_in_kernel={use_qk_l2norm_in_kernel!r} given: the in-kernel Q/K L2 norm runs on "
             "the deterministic package only; pass deterministic=True (flashinfer.cake_kda_train) or call "
-            "flashinfer.experimental.cake_kda_det_train"
+            "flashinfer.experimental.cake.cake_kda_det_train"
         )
 
 
