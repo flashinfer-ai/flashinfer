@@ -539,6 +539,8 @@ const auto cleanup_workspace = [&]() {
   }
 };
 
+#include <flashinfer/megamoe/detail/remote_dispatch.inl>
+
 // =====================================================================
 // ROLE 1: DISPATCH WARPS
 //   Mirrors SM100 dispatch with two changes:
@@ -589,13 +591,12 @@ if (warp_idx < kNumDispatchWarps) {
   }
   ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
-#include <flashinfer/megamoe/detail/remote_dispatch.inl>
   if (thread_idx == 0) stamp_max(19);
-  // Tokens with an expert on another node: packed slot and outbound copy first,
-  // so the index pass can write their packed index.
-  remote_pack_tokens();
-  ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
-  if (thread_idx == 0) stamp_max(18);
+  // Inter-node: the math warps packed the tokens that have an expert on another
+  // node (slot map and outbound copies) while the counts were staked out; the
+  // index pass below writes their packed index.
+  if constexpr (kNumRemoteNodes > 0)
+    ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
   // Write source token-topk indices to remote ranks
   read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
@@ -1033,6 +1034,26 @@ if (warp_idx < kNumDispatchWarps) {
   FI_MEGAMOE_STATIC_ASSERT(
       kSwapABRequested || (WG_BLOCK_M == L1WGMMA::M and WG_BLOCK_N == L1WGMMA::N),
       "Split-N WGs must each run one M64N128 WGMMA per K-block");
+
+  // Inter-node packing pass: these warps are idle until the dispatch barrier,
+  // so they copy the tokens that have an expert on another node into the
+  // outbound staging (slot map, row, scales, ids, weights) while the dispatch
+  // warps count and stake out. Each math warp takes the token chunks of one
+  // dispatch warp of this SM, so the index pass reads a slot map its own SM
+  // wrote; the barrier hands it over.
+  if constexpr (kNumRemoteNodes > 0) {
+    FI_MEGAMOE_STATIC_ASSERT(kNumEpilogueWarps % kNumActiveDispatchWarps == 0,
+                             "The packing pass splits each dispatch warp's chunks evenly");
+    constexpr uint32_t kChunkStride = kNumSMs * kNumActiveDispatchWarps;
+    constexpr uint32_t kWarpsPerDispatchWarp = kNumEpilogueWarps / kNumActiveDispatchWarps;
+    const uint32_t first_chunk = sm_idx * kNumActiveDispatchWarps +
+                                 epilogue_warp_idx % kNumActiveDispatchWarps +
+                                 (epilogue_warp_idx / kNumActiveDispatchWarps) * kChunkStride;
+    remote_pack_tokens(first_chunk * kNumTokensPerWarp,
+                       kWarpsPerDispatchWarp * kChunkStride * kNumTokensPerWarp);
+    if (epilogue_thread_idx == 0) stamp_max(18);
+    ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
+  }
 
   // Sync with dispatch
   ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);

@@ -1,8 +1,9 @@
-// Inter-node part of the dispatch warps (MXFP4 fused kernel). Included inside
-// ROLE 1 after the per-expert staking pass; every name below is a body local.
-// With one node this file compiles to nothing.
+// Inter-node part of the dispatch (MXFP4 fused kernel). Included at body level
+// before the warp roles; every name below is a body local. With one node this
+// file compiles to nothing.
 //
-//   remote_pack_tokens        one pass over this rank's routing: a token with an
+//   remote_pack_tokens        the math warps, from kernel entry: one pass over
+//                             this SM's share of the routing, a token with an
 //                             expert on another node takes a packed slot per
 //                             such node and is copied once into the outbound
 //                             staging of that node (row, scales, ids, weights).
@@ -18,15 +19,15 @@
 //                             the combine, run while the GEMM still works on the
 //                             blocks that need no return.
 // Pass over the routing: packed slots and the outbound copies. Mirrors the
-// iteration of `read_topk_idx`: `kNumTokensPerWarp` tokens per warp step, the
-// top-k entries of one token on consecutive lanes.
-const auto remote_pack_tokens = [&]() {
+// iteration of `read_topk_idx` (`kNumTokensPerWarp` tokens per warp step, the
+// top-k entries of one token on consecutive lanes); the caller hands the warp
+// the chunks (`first_token`, every `token_step`) that one dispatch warp of the
+// same SM will index, so the index pass reads a slot map its own SM wrote.
+const auto remote_pack_tokens = [&](const uint32_t& first_token, const uint32_t& token_step) {
   if constexpr (kNumRemoteNodes > 0) {
-    if (warp_idx >= kNumActiveDispatchWarps) return;
     constexpr uint32_t kNumActivateLanes = kNumTokensPerWarp * kNumTopk;
     constexpr uint32_t kTokenMask = (1u << kNumTopk) - 1;
-    for (uint32_t i = (sm_idx * kNumActiveDispatchWarps + warp_idx) * kNumTokensPerWarp;
-         i < num_tokens; i += kNumSMs * kNumActiveDispatchWarps * kNumTokensPerWarp) {
+    for (uint32_t i = first_token; i < num_tokens; i += token_step) {
       int expert_idx = -1;
       const uint32_t token_in_warp = lane_idx / kNumTopk;
       if (i + token_in_warp < num_tokens and lane_idx < kNumActivateLanes)
@@ -108,14 +109,14 @@ const auto remote_send = [&]() {
       auto* dst_block = static_cast<uint8_t*>(remote.inbox_input_block(at));
       auto* src_block = static_cast<uint8_t*>(remote.outbound_input_block(j));
       const uint32_t num_packed = *remote.packed_token_count(j);
+      if (num_packed > 0)
+        io.put_warp(j, dst_block, src_block, static_cast<uint64_t>(num_packed) * kHidden, lane_idx,
+                    false, nullptr, 0);
       if (lane_idx == 0) remote.header_control(header)[0] = num_packed;
       for (uint32_t e = lane_idx; e < kNumExpertsPerNode; e += 32)
         counts[e] = static_cast<uint32_t>(
             *workspace.get_expert_send_count_ptr(node * kNumExpertsPerNode + e) & 0xffffffffu);
       __syncwarp();
-      if (num_packed > 0)
-        io.put_warp(j, dst_block, src_block, static_cast<uint64_t>(num_packed) * kHidden, lane_idx,
-                    false, nullptr, 0);
       // Scales, routing ids, weights (whole regions) and the header, contiguous.
       const uint64_t tail =
           static_cast<uint64_t>(remote.input_block_bytes) - sf_block_offset + remote.header_bytes();
