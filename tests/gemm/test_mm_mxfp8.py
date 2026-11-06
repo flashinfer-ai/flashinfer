@@ -1125,7 +1125,7 @@ def test_mm_mxfp8_cudnn_runner_declined_graph_has_no_tactics(
     """A cuDNN graph the backend declines yields no tactics, so ``auto`` tuning keeps the other candidates."""
     cudnn = pytest.importorskip("cudnn")
     runner = gemm_base._cudnn_mm_mxfp8_runner()
-    runner._use_override_shape = override_shape
+    monkeypatch.setattr(runner, "_use_override_shape", override_shape)
 
     def decline(*args, **kwargs):
         raise cudnn.cudnnGraphNotSupportedError("declined")
