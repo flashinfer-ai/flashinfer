@@ -153,7 +153,10 @@ an autograd wrapper that saves only its inputs.
    ``det``; every public name of the non-deterministic module
    ``flashinfer.cake_rmsnorm_silu_gate_nondet_train`` (backend package
    ``flashinfer.experimental.cake.cake_rmsnorm_silu_gate_nondet_train``)
-   carries ``nondet``.  The ``flashinfer`` top level exports only such names.
+   carries ``nondet``.  The module constants ``ARCHES`` and
+   ``SUPPORTED_COMPUTE_CAPABILITIES`` are exempt: they keep their names,
+   without a mode word, in both modules and both backend packages.  The
+   ``flashinfer`` top level exports only names with a mode word.
    Each module imports its backend package on first use (``import
    flashinfer`` loads neither backend package); its autograd class and
    its architecture constants are the backend package's objects.

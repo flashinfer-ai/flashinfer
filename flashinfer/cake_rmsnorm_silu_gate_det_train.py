@@ -41,7 +41,10 @@ Mode and dispatch rules (the same in
    ``det``; every public name of the non-deterministic module
    :mod:`flashinfer.cake_rmsnorm_silu_gate_nondet_train` (backend package
    ``flashinfer.experimental.cake.cake_rmsnorm_silu_gate_nondet_train``)
-   carries ``nondet``.  The ``flashinfer`` top level exports only such names.
+   carries ``nondet``.  The module constants ``ARCHES`` and
+   ``SUPPORTED_COMPUTE_CAPABILITIES`` are exempt: they keep their names,
+   without a mode word, in both modules and both backend packages.  The
+   ``flashinfer`` top level exports only names with a mode word.
    Each module imports its backend package on first use (``import
    flashinfer`` loads neither backend package); its autograd class and
    its architecture constants are the backend package's objects.
@@ -116,7 +119,18 @@ _BACKEND_OBJECTS = (
 
 @flashinfer_api
 def is_cake_rmsnorm_silu_gate_det_train_supported(device: torch.device) -> bool:
-    """Whether ``device`` is a CUDA device of an exported architecture."""
+    """Whether ``device`` is a CUDA device of an exported architecture.
+
+    Parameters
+    ----------
+    device : torch.device
+        The device to check.
+
+    Returns
+    -------
+    bool
+        ``True`` when the deterministic package has kernels for ``device``.
+    """
 
     return _backend().is_cake_rmsnorm_silu_gate_det_train_supported(device)
 
@@ -164,7 +178,20 @@ def cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes(
     rows: int, device: torch.device
 ) -> int:
     """Bytes of the backward's FP32 weight-gradient partial buffer for ``rows``
-    rows (``T * H``) on ``device``: ``chunks * 128 * 4``."""
+    rows (``T * H``) on ``device``: ``chunks * 128 * 4``.
+
+    Parameters
+    ----------
+    rows : int
+        Number of rows of the backward call, ``T * H``.
+    device : torch.device
+        The CUDA device the backward runs on.
+
+    Returns
+    -------
+    int
+        The workspace size in bytes.
+    """
 
     return _backend().cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes(
         rows, device
@@ -177,7 +204,20 @@ def cake_rmsnorm_silu_gate_det_train_backward_workspace(
 ) -> torch.Tensor:
     """A caller-owned backward workspace for ``rows`` rows: an uninitialized
     FP32 tensor of :func:`cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes`
-    bytes (the backward writes every element it reads)."""
+    bytes (the backward writes every element it reads).
+
+    Parameters
+    ----------
+    rows : int
+        Number of rows of the backward call, ``T * H``.
+    device : torch.device
+        The CUDA device the backward runs on.
+
+    Returns
+    -------
+    torch.Tensor
+        The uninitialized FP32 workspace on ``device``.
+    """
 
     return _backend().cake_rmsnorm_silu_gate_det_train_backward_workspace(rows, device)
 
@@ -259,7 +299,24 @@ def cake_rmsnorm_silu_gate_det(
     x: torch.Tensor, z: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6
 ) -> torch.Tensor:
     """Differentiable ``RMSNorm(x) * weight * SiLU(z)`` over the last dimension
-    (128): :class:`CakeRMSNormSiLUGateDetFunction` applied to the arguments."""
+    (128): :class:`CakeRMSNormSiLUGateDetFunction` applied to the arguments.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        BF16 ``[..., 128]`` input (``[T, H, 128]`` or ``[T * H, 128]``).
+    z : torch.Tensor
+        BF16 gate input of the same shape as ``x``.
+    weight : torch.Tensor
+        BF16 ``[128]`` weight shared by every token and head.
+    eps : float
+        Variance epsilon (FP32 inside the kernel).
+
+    Returns
+    -------
+    torch.Tensor
+        BF16 ``y`` of ``x``'s shape.
+    """
 
     return _backend().cake_rmsnorm_silu_gate_det(x, z, weight, eps)
 
