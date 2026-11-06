@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Backend suite of the Cake non-deterministic packed KDA chunked training package
-(``flashinfer.experimental.cake.cake_kda_nondet_train``, every entry called with ``deterministic=False``).
+(``flashinfer.experimental.cake.cake_kda_nondet_train``).
 
 The suite mirrors the deterministic package's suite (``test_cake_kda_det_train.py``): the same shapes, ragged packs,
 short documents, tails, document isolation, workspace reuse, poisoned arenas, lean and batched arenas, CUDA graphs and
@@ -32,8 +32,10 @@ tape path's w-only WY twin (``cake_jit.TAPE_TWINS``): its record against its WY 
 rule that launches it, and on a GPU its ``w`` and the tape backward's gradients against the WY record's at every head
 count.  The in-kernel Q/K L2 norm (``use_qk_l2norm_in_kernel``): its records are the deterministic package's, record
 for record, and the fused gradient's l2n class copies the deterministic records (``L2N_DQKG``), so an l2n mode runs
-the deterministic pair on every row; its host and device rows are in ``test_cake_kda_nondet_train_l2n.py``.  The mode
-keyword, the facade and the legacy names are covered by ``test_cake_kda_nondet_train_api.py``; the hand-off itself by
+the deterministic pair on every row; its host and device rows are in ``test_cake_kda_nondet_train_l2n.py``.  Each
+package's backward reads its own saved sets only: a set of the other package is refused with ``ValueError`` naming
+the mode.  The facade, the refusal of the deterministic package's objects and torch's deterministic mode are covered
+by ``test_cake_kda_nondet_train_api.py``, the names by ``test_cake_kda_nondet_train_names.py``; the hand-off itself by
 ``test_cake_kda_nondet_train_handoff.py``.
 """
 
@@ -77,19 +79,10 @@ det_jit = cake_package("cake.cake_kda_det_train", "cake_jit")
 PACKAGE_DIR = Path(cake_jit.__file__).resolve().parent
 
 
-def cake_kda_nondet_train_forward(*args, **kwargs):
-    """The package's forward with the mode it requires."""
-    return cake_backend.cake_kda_nondet_train_forward(*args, **kwargs)
-
-
-def cake_kda_nondet_train_backward(*args, **kwargs):
-    """The package's backward with the mode it requires."""
-    return cake_backend.cake_kda_nondet_train_backward(*args, **kwargs)
-
-
-def cake_kda_nondet(*args, **kwargs):
-    """The package's autograd entry with the mode it requires."""
-    return cake_backend.cake_kda_nondet(*args, **kwargs)
+# the package's entries (they take no mode argument)
+cake_kda_nondet_train_forward = cake_backend.cake_kda_nondet_train_forward
+cake_kda_nondet_train_backward = cake_backend.cake_kda_nondet_train_backward
+cake_kda_nondet = cake_backend.cake_kda_nondet
 
 
 ARCHES = tuple(cake_jit.ARCHES)
@@ -97,6 +90,10 @@ PATHS = ("fwd", "fwd_nosave", "light", "light_states", "tape", "replay")
 BT, D, SCALE = cake_backend.BT, cake_backend.D, cake_backend.SCALE
 CakeKDANondetChunkSaved = cake_backend.CakeKDANondetChunkSaved
 CakeKDANondetWorkspace = cake_backend.CakeKDANondetWorkspace
+# Each package's entries refuse the other package's saved set, workspace and arena option with ``ValueError`` naming
+# the mode: this package's message, then the deterministic package's.
+ND_REFUSES = "is not a non-deterministic-package"
+DET_REFUSES = "is not a deterministic-package"
 
 # Accuracy gate, declared before the first run: every output elementwise within
 # ``|cand - ref| <= ATOL + RTOL * |ref|`` of the exact FP64 per-document recurrence of the same BF16 / FP32 inputs
@@ -3251,7 +3248,6 @@ def test_saved_set_version_4_fields_and_the_autograd_extras() -> None:
         "lower_bound",
         "qk_rstd",
         "qk_l2norm",
-        "deterministic",
     ]
     for name in ("h", "v_new", "seg_m", "hseg", "seg_state", "qg", "w", "u", "qk_rstd"):
         assert CakeKDANondetChunkSaved.__dataclass_fields__[name].default is None, name
@@ -3262,10 +3258,9 @@ def test_saved_set_version_4_fields_and_the_autograd_extras() -> None:
     # the deterministic package's in-kernel Q/K L2 norm fields (#7817), at its defaults: a forward with the flag
     # writes the reciprocal norms (qk_rstd, FP32 [2, S, H]) and the mode on, as the deterministic package's does
     assert CakeKDANondetChunkSaved.__dataclass_fields__["qk_l2norm"].default is False
-    # the mode of the forward that wrote the set: this package's forward writes False (the deterministic package's
-    # sets have the same format, and the backward reads either)
-    assert CakeKDANondetChunkSaved.__dataclass_fields__["deterministic"].default is False
-    assert [f.name for f in dataclasses.fields(CakeKDANondetChunkSaved)][:-1] == [
+    # the deterministic package's fields, no more: the set records no mode (its type is the package's; each
+    # package's backward reads its own type only and refuses the other's)
+    assert [f.name for f in dataclasses.fields(CakeKDANondetChunkSaved)] == [
         f.name for f in dataclasses.fields(det_backend.CakeKDADetChunkSaved)
     ]
     # the in-kernel Q/K L2 norm's reciprocal norms ride last in both versions (the deterministic package's order)
@@ -4646,7 +4641,7 @@ def test_replay_and_repeats_are_bitwise_identical(device, manifest, shape) -> No
     bare = dataclasses.replace(saved, tables=None)
     for other in (bare, saved):
         ws = CakeKDANondetWorkspace.for_problem(
-            sum(lengths), len(lengths), heads, device, deterministic=False
+            sum(lengths), len(lengths), heads, device
         )
         grads2 = cake_kda_nondet_train_backward(
             q, k, v, g, beta, cu, dout, saved=other, scale=SCALE, workspace=ws
@@ -4664,7 +4659,7 @@ def test_replay_and_repeats_are_bitwise_identical(device, manifest, shape) -> No
     for name, t in grads_t.items():
         assert torch.equal(t, first_grads[name]), name
     tape_ws = CakeKDANondetWorkspace.for_problem(
-        sum(lengths), len(lengths), heads, device, save_mode="tape", deterministic=False
+        sum(lengths), len(lengths), heads, device, save_mode="tape"
     )
     assert tape_ws.bytes == cake_backend.workspace_bytes(
         sum(lengths),
@@ -4791,9 +4786,7 @@ def test_workspace_reuse_and_byte_counts(device, manifest) -> None:
         S, heads, N, sm_count=sm
     ) == cake_backend.saved_bytes(S, heads, N)
     assert cake_backend.memory_report(S, N, heads)["arch"] == ws.plan.arch
-    fwd_only = CakeKDANondetWorkspace.for_problem(
-        S, N, heads, device, backward=False, deterministic=False
-    )
+    fwd_only = CakeKDANondetWorkspace.for_problem(S, N, heads, device, backward=False)
     assert fwd_only.bytes == cake_backend.workspace_bytes(
         S, N, heads, backward=False, sm_count=sm
     )
@@ -4877,9 +4870,7 @@ def test_launch_sequences_follow_the_plan(device, manifest) -> None:
             launched.append(name)
             cake_jit.run_module(name, values, grid=grid, device_index=device_index)
 
-        ws = CakeKDANondetWorkspace.for_problem(
-            S, N, heads, device, launcher=recording, deterministic=False
-        )
+        ws = CakeKDANondetWorkspace.for_problem(S, N, heads, device, launcher=recording)
         p = ws.plan
         assert p.recur == _device_route(device, N, heads)
         assert p.seg_save is False and p.light_path == "light"
@@ -5041,9 +5032,7 @@ def test_the_light_saved_set_carries_qg_and_w_u_where_the_plan_says(
             launched.append(name)
             cake_jit.run_module(name, values, grid=grid, device_index=device_index)
 
-        ws = CakeKDANondetWorkspace.for_problem(
-            S, N, heads, device, launcher=recording, deterministic=False
-        )
+        ws = CakeKDANondetWorkspace.for_problem(S, N, heads, device, launcher=recording)
         p = ws.plan
         wu = _wu_saved(N, heads, sm, arch)
         seen_wu += wu
@@ -5124,7 +5113,7 @@ def test_the_states_saving_set_of_a_segmented_16_head_row_feeds_the_plain_passes
         cake_jit.run_module(name, values, grid=grid, device_index=device_index)
 
     ws = CakeKDANondetWorkspace.for_problem(
-        S, num_docs, heads, device, launcher=recording, deterministic=False
+        S, num_docs, heads, device, launcher=recording
     )
     p = ws.plan
     assert p.recur == "seg" and nseg == p.NSEG and p.seg_save is True
@@ -5151,7 +5140,7 @@ def test_the_states_saving_set_of_a_segmented_16_head_row_feeds_the_plain_passes
     assert launched == _expected_launches(p, "light")
     assert launched[0] == "bwd_prep_g8_noqg_nokb" and "wy_bwd" not in launched
     tape_ws = CakeKDANondetWorkspace.for_problem(
-        S, num_docs, heads, device, save_mode="tape", deterministic=False
+        S, num_docs, heads, device, save_mode="tape"
     )
     from_tape_ws = cake_kda_nondet_train_backward(
         q, k, v, g, beta, cu, dout, saved=saved, workspace=tape_ws
@@ -5200,9 +5189,7 @@ def test_the_two_level_carry_binds_its_group_operands(device, manifest) -> None:
                 assert not {"gsize", "carry_out_tiles"} & set(values), name
             cake_jit.run_module(name, values, grid=grid, device_index=device_index)
 
-        ws = CakeKDANondetWorkspace.for_problem(
-            S, N, heads, device, launcher=recording, deterministic=False
-        )
+        ws = CakeKDANondetWorkspace.for_problem(S, N, heads, device, launcher=recording)
         epoch0 = ws._epoch[0]
         out, saved = cake_kda_nondet_train_forward(q, k, v, g, beta, cu, workspace=ws)
         grads = cake_kda_nondet_train_backward(q, k, v, g, beta, cu, dout, saved=saved, workspace=ws)
@@ -5551,9 +5538,7 @@ def test_the_node_holds_the_workspace_weakly(device, manifest) -> None:
         ):
             assert torch.equal(leaf.grad, reference_grads[name]), name
 
-    kept = CakeKDANondetWorkspace(
-        plan, device, backward=True, launcher=recording, deterministic=False
-    )
+    kept = CakeKDANondetWorkspace(plan, device, backward=True, launcher=recording)
     q, k, v, g, beta = held = leaves()
     o = cake_kda_nondet(q, k, v, g, beta, cu, workspace=kept)
     assert torch.equal(o, reference_out)
@@ -5563,9 +5548,7 @@ def test_the_node_holds_the_workspace_weakly(device, manifest) -> None:
     assert launched == _expected_launches(plan, plan.light_path)
     check(held)
     launched.clear()
-    dropped = CakeKDANondetWorkspace(
-        plan, device, backward=True, launcher=recording, deterministic=False
-    )
+    dropped = CakeKDANondetWorkspace(plan, device, backward=True, launcher=recording)
     alive = weakref.ref(dropped)
     q, k, v, g, beta = held = leaves()
     o = cake_kda_nondet(q, k, v, g, beta, cu, workspace=dropped)
@@ -5683,7 +5666,7 @@ def test_arena_content_never_reaches_a_result(device, manifest) -> None:
         )
         assert zeroed.zero_init is True and not bool(zeroed.arena.any())
         poisoned = CakeKDANondetWorkspace(
-            plan, device, backward=True, save_mode=save_mode, deterministic=False
+            plan, device, backward=True, save_mode=save_mode
         )
         assert poisoned.zero_init is False
         assert (
@@ -5771,7 +5754,7 @@ def test_light_saved_set_carries_the_segment_states_above_the_size_rule(
             cake_jit.run_module(name, values, grid=grid, device_index=device_index)
 
         ws = CakeKDANondetWorkspace.for_problem(
-            S, num_docs, heads, device, launcher=recording, deterministic=False
+            S, num_docs, heads, device, launcher=recording
         )
         p = ws.plan
         assert p.recur == "seg" and nseg == p.NSEG and p.seg_save is saves
@@ -5838,7 +5821,7 @@ def test_light_saved_set_carries_the_segment_states_above_the_size_rule(
             q, k, v, g, beta, cu, dout, saved=stripped, workspace=ws
         )
         tape_ws = CakeKDANondetWorkspace.for_problem(
-            S, num_docs, heads, device, save_mode="tape", deterministic=False
+            S, num_docs, heads, device, save_mode="tape"
         )
         from_tape_ws = cake_kda_nondet_train_backward(
             q, k, v, g, beta, cu, dout, saved=saved, workspace=tape_ws
@@ -5916,9 +5899,7 @@ def test_tape_workspace_serves_light_calls(device, manifest) -> None:
     out, grads, _ = _run_fwd_bwd(inputs)
     out, grads = _clone_all(out, grads)
     S, N = sum(lengths), len(lengths)
-    ws = CakeKDANondetWorkspace.for_problem(
-        S, N, heads, device, save_mode="tape", deterministic=False
-    )
+    ws = CakeKDANondetWorkspace.for_problem(S, N, heads, device, save_mode="tape")
     o, saved = cake_kda_nondet_train_forward(q, k, v, g, beta, cu, workspace=ws, save_mode="light")
     assert saved.version == cake_backend.SAVED_VERSION
     assert torch.equal(o, out)
@@ -5929,7 +5910,7 @@ def test_tape_workspace_serves_light_calls(device, manifest) -> None:
     replay = cake_kda_nondet_train_backward(q, k, v, g, beta, cu, dout, saved=None, workspace=ws)
     _check_replay(replay, grads, arch, heads, tag="tape replay", exact=exact)
     fwd_only = CakeKDANondetWorkspace.for_problem(
-        S, N, heads, device, backward=False, save_mode="tape", deterministic=False
+        S, N, heads, device, backward=False, save_mode="tape"
     )
     o, saved = cake_kda_nondet_train_forward(
         q, k, v, g, beta, cu, workspace=fwd_only, save_for_backward=False
@@ -5945,9 +5926,7 @@ def test_workspace_accepts_an_unindexed_cuda_device(device, manifest) -> None:
         inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens")
     )
     with torch.cuda.device(q.device):
-        ws = CakeKDANondetWorkspace.for_problem(
-            sum(lengths), 1, heads, "cuda", deterministic=False
-        )
+        ws = CakeKDANondetWorkspace.for_problem(sum(lengths), 1, heads, "cuda")
     assert ws.device == q.device
     o, _ = cake_kda_nondet_train_forward(q, k, v, g, beta, cu, workspace=ws)
     assert o.shape == (sum(lengths), heads, D)
@@ -6021,9 +6000,7 @@ def test_lean_arena_gives_the_default_gradients_bitwise(
     p = default.plan
     for t in (1, 2, 3):
         arena = cake_backend.CakeKDANondetArena(lean=True, tail_passes=t)
-        ws = CakeKDANondetWorkspace.for_problem(
-            S, N, heads, device, arena=arena, deterministic=False
-        )
+        ws = CakeKDANondetWorkspace.for_problem(S, N, heads, device, arena=arena)
         assert ws.arena_option == arena and ws.arena.dtype == torch.uint8
         assert (
             ws.bytes
@@ -6319,9 +6296,7 @@ def test_lean_arena_under_checkpointing_and_a_dropped_workspace(
         w.bytes == plan.workspace_bytes("bwd_lean", 2) for w in backward_ws
     )
     # a caller's workspace dropped after the forward: the node recorded its option
-    dropped = CakeKDANondetWorkspace(
-        plan, device, backward=True, arena=arena, deterministic=False
-    )
+    dropped = CakeKDANondetWorkspace(plan, device, backward=True, arena=arena)
     created.clear()
     held = leaves()
     o = cake_kda_nondet(*held, cu, workspace=dropped)
@@ -6984,7 +6959,7 @@ def test_batched_arena_gives_the_default_results_bitwise(
     p = default.plan
     real = _real_chunks(lengths)
     tape_default = CakeKDANondetWorkspace.for_problem(
-        S, N, heads, device, save_mode="tape", deterministic=False
+        S, N, heads, device, save_mode="tape"
     )
     _, saved_t = cake_kda_nondet_train_forward(q, k, v, g, beta, cu, workspace=tape_default)
     ref_h, ref_v_new = saved_t.h[:real].clone(), saved_t.v_new.clone()
@@ -7424,7 +7399,7 @@ def test_batched_arena_on_a_row_that_saves_the_states(device, manifest) -> None:
     for label, kw in _partitions(lengths):
         arena = cake_backend.CakeKDANondetArena(lean=True, tail_passes=4, **kw)
         ws = CakeKDANondetWorkspace.for_problem(
-            S, N, heads, device, arena=arena, doc_lengths=lengths, deterministic=False
+            S, N, heads, device, arena=arena, doc_lengths=lengths
         )
         tag = (label,)
         o, saved_b = cake_kda_nondet_train_forward(
@@ -7506,7 +7481,7 @@ def test_batched_arena_with_exact_zero_values(device, manifest, monkeypatch) -> 
         del out, grads
         real = _real_chunks(lengths)
         tape_default = CakeKDANondetWorkspace.for_problem(
-            S, N, heads, device, save_mode="tape", deterministic=False
+            S, N, heads, device, save_mode="tape"
         )
         _, saved_t = cake_kda_nondet_train_forward(q, k, v, g, beta, cu_t, workspace=tape_default)
         ref_h, ref_v_new = saved_t.h[:real].clone(), saved_t.v_new.clone()
@@ -7696,7 +7671,7 @@ def test_batched_views_share_the_arena_eye_and_epoch(device, manifest) -> None:
     )
     arena = cake_backend.CakeKDANondetArena(batch_tokens=95)
     ws = CakeKDANondetWorkspace.for_problem(
-        S, N, heads, device, arena=arena, doc_lengths=lengths, deterministic=False
+        S, N, heads, device, arena=arena, doc_lengths=lengths
     )
     p = ws.plan
     batches = p.batches(arena, lengths)
@@ -7719,16 +7694,14 @@ def test_batched_views_share_the_arena_eye_and_epoch(device, manifest) -> None:
     # a workspace sized for one document per group refuses a packing whose group is larger, before any launch
     single = cake_backend.CakeKDANondetArena(batch_tokens=S, max_docs_per_batch=1)
     small = CakeKDANondetWorkspace.for_problem(
-        S, N, heads, device, arena=single, doc_lengths=lengths, deterministic=False
+        S, N, heads, device, arena=single, doc_lengths=lengths
     )
     assert small.bytes < ws.bytes
     other = (S, 0, 0, 0)  # the same S and num_docs, one group of every token
     with pytest.raises(ValueError, match="needs"):
         cake_kda_nondet_train_forward(q, k, v, g, beta, cu, workspace=small, doc_lengths=other)
     # the bound sizes a workspace without doc_lengths: every grouping of the budget fits it
-    bound = CakeKDANondetWorkspace.for_problem(
-        S, N, heads, device, arena=arena, deterministic=False
-    )
+    bound = CakeKDANondetWorkspace.for_problem(S, N, heads, device, arena=arena)
     assert bound.doc_lengths is None and bound.bytes >= ws.bytes
     for b in batches:
         bound.batch_view(b).views("bwd")
@@ -8166,9 +8139,7 @@ def test_host_chain_ranks_match_every_seq_order_writer(
         q, k, v, g, beta, cu = (
             inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens")
         )
-        ws = CakeKDANondetWorkspace.for_problem(
-            S, N, heads, device, backward=False, deterministic=False
-        )
+        ws = CakeKDANondetWorkspace.for_problem(S, N, heads, device, backward=False)
         p = ws.plan
         written = [(p.record("table", "light"), original(ws, cu, "light"))]
         # the forward's own tables (above 256 documents the same table program writes them)
@@ -8252,7 +8223,7 @@ def test_batched_block_runs_give_the_default_results_bitwise(
         ref_out, ref_grads = _clone_all(out, grads)
         del out, grads
         tape_default = CakeKDANondetWorkspace.for_problem(
-            S, N, heads, device, save_mode="tape", deterministic=False
+            S, N, heads, device, save_mode="tape"
         )
         _, saved_t = cake_kda_nondet_train_forward(q, k, v, g, beta, cu, workspace=tape_default)
         del tape_default
@@ -8668,9 +8639,7 @@ def test_launches_are_this_packages_records_and_s1_on_the_s1_cells(
             _log.append(name)
             cake_jit.run_module(name, values, grid=grid, device_index=device_index)
 
-        ws = CakeKDANondetWorkspace.for_problem(
-            S, N, heads, device, launcher=recording, deterministic=False
-        )
+        ws = CakeKDANondetWorkspace.for_problem(S, N, heads, device, launcher=recording)
         tape_ws = CakeKDANondetWorkspace.for_problem(
             S,
             N,
@@ -9337,8 +9306,9 @@ def test_the_tape_wy_rule_on_this_device(
 # parameter gradients too.  The raw mode runs the deterministic package's raw-mode programs in the same order (the
 # fused gradient's raw class copies the deterministic records, no S1 pair, no checkpoint hand-off), so every result is
 # bitwise the deterministic package's raw mode on every path: repeats, the replay, the light, light-states and tape
-# sets of either package, caller workspaces, the lean tail passes, the batched groups, strided views, autograd and
-# ``torch.utils.checkpoint``.  The deterministic package's raw mode is the reference of every comparison below.
+# sets (each package's backward reads its own sets and refuses the other package's), caller workspaces, the lean
+# tail passes, the batched groups, strided views, autograd and ``torch.utils.checkpoint``.  The deterministic
+# package's raw mode is the reference of every comparison below.
 #
 # The parameter gradients included: on every architecture the raw backward runs the deterministic package's GLM intra
 # program (``glm_intra_raw``, writing the per-chunk partials) and ``param_finalize`` (reducing them in a fixed order),
@@ -9499,18 +9469,15 @@ def test_raw_gate_matches_the_exact_reference_and_the_deterministic_raw_mode(
     parameters in FP64 (the declared elementwise gate of every output, the parameter gradients included) and against
     the deterministic package's raw mode on the same inputs: ``out``, the saved set's tensors and the seven results
     bit for bit, ``dA_log`` / ``ddt_bias`` included; the result dtypes and shapes (``dg`` the BF16 contiguous gradient
-    of the raw gate, ``dA_log`` FP32 ``[H]``, ``ddt_bias`` FP32 in ``dt_bias``'s shape); the saved set records the
-    gate mode, the lower bound and ``deterministic=False``."""
+    of the raw gate, ``dA_log`` FP32 ``[H]``, ``ddt_bias`` FP32 in ``dt_bias``'s shape); the saved set is this
+    package's type and records the gate mode and the lower bound."""
     lengths, heads = shape
     S = sum(lengths)
     inputs = make_raw_inputs(lengths, heads, device)
     out, grads, saved = _rg_run(inputs)
     torch.cuda.synchronize(device)
-    assert (saved.gate, saved.lower_bound, saved.deterministic) == (
-        "raw",
-        LOWER_BOUND,
-        False,
-    )
+    assert type(saved) is CakeKDANondetChunkSaved
+    assert (saved.gate, saved.lower_bound) == ("raw", LOWER_BOUND)
     assert out.shape == (S, heads, D) and out.dtype == torch.bfloat16
     assert grads["dg"].shape == (S, heads, D) and grads["dg"].dtype == torch.bfloat16
     assert grads["dg"].is_contiguous()
@@ -9559,8 +9526,9 @@ def test_raw_gate_paths_match_the_deterministic_raw_mode(
 ) -> None:
     """On one call's inputs every path gives the deterministic package's raw-mode results bit for bit: repeats, the
     replay (``saved=None``), a saved set without its tables, caller workspaces of the raw mode (and their replay),
-    the tape set from the default entry and from a tape workspace (its replay too), a light set on the tape
-    workspace, and either package's backward from the other package's light and tape sets."""
+    the tape set from the default entry and from a tape workspace (its replay too) and a light set on the tape
+    workspace.  Each package's backward refuses the other package's light and tape sets (``ValueError`` naming the
+    mode)."""
     lengths, heads = shape
     S, N = sum(lengths), len(lengths)
     inputs = make_raw_inputs(lengths, heads, device)
@@ -9577,9 +9545,7 @@ def test_raw_gate_paths_match_the_deterministic_raw_mode(
     bare = dataclasses.replace(saved, tables=None)
     assert (bare.gate, bare.lower_bound) == ("raw", LOWER_BOUND)
     for name, other in (("bare", bare), ("saved", saved)):
-        ws = CakeKDANondetWorkspace.for_problem(
-            S, N, heads, device, gate="raw", deterministic=False
-        )
+        ws = CakeKDANondetWorkspace.for_problem(S, N, heads, device, gate="raw")
         assert ws.gate == ws.plan.gate == "raw"
         _rg_check(_rg_bwd(inputs, other, workspace=ws), ref, tag=name)
     ws = CakeKDANondetWorkspace.for_problem(S, N, heads, device, gate="raw")
@@ -9602,7 +9568,7 @@ def test_raw_gate_paths_match_the_deterministic_raw_mode(
     assert _bits_equal(out_t, ref_out)
     _rg_check(grads_t.values(), ref, tag="tape")
     tape_ws = CakeKDANondetWorkspace.for_problem(
-        S, N, heads, device, save_mode="tape", gate="raw", deterministic=False
+        S, N, heads, device, save_mode="tape", gate="raw"
     )
     out_tw, grads_tw, saved_tw = _rg_run(inputs, workspace=tape_ws)
     assert saved_tw.version == cake_backend.SAVED_VERSION_TAPE
@@ -9610,16 +9576,13 @@ def test_raw_gate_paths_match_the_deterministic_raw_mode(
     _rg_check(grads_tw.values(), ref, tag="tape workspace")
     _rg_check(_rg_bwd(inputs, None, workspace=tape_ws), ref, tag="tape ws replay")
     _rg_check(_rg_bwd(inputs, saved, workspace=tape_ws), ref, tag="light set")
-    # either package's backward from the other's raw sets (light and tape)
+    # each package's backward refuses the other's raw sets (light and tape)
     _, det_saved_t = _rg_fwd(inputs, det=True, save_mode="tape")
-    for tag, nd_set, det_set in (
-        ("light", saved, det_saved),
-        ("tape", saved_t, det_saved_t),
-    ):
-        _rg_check(_rg_bwd(inputs, det_set), ref, tag=(tag, "det set, nd backward"))
-        _rg_check(
-            _rg_bwd(inputs, nd_set, det=True), ref, tag=(tag, "nd set, det backward")
-        )
+    for nd_set, det_set in ((saved, det_saved), (saved_t, det_saved_t)):
+        with pytest.raises(ValueError, match=ND_REFUSES):
+            _rg_bwd(inputs, det_set)
+        with pytest.raises(ValueError, match=DET_REFUSES):
+            _rg_bwd(inputs, nd_set, det=True)
 
 
 @pytest.mark.parametrize(("num_docs", "heads"), STATE_SHAPES, ids=["n1-h1", "n2-h2"])
@@ -10039,9 +10002,11 @@ def test_raw_gate_lean_and_batched_arenas_match_the_deterministic_raw_mode(
     """Lean workspaces of one to four tail passes (each range's tail writes its slice of the per-chunk partials, the
     finalize runs once after the last range) and document groups (two, three, one document each; default and lean
     layouts: the finalize once after the last group over the whole pack) give the deterministic package's default
-    raw-mode results bit for bit: the forward, the backward from either package's default set and from its own, a
+    raw-mode results bit for bit: the forward, the backward from this package's default set and from its own, a
     per-call arena, the replay group by group (not lean), the autograd node carrying the option; the launch lists
-    are the plan's, every group's in turn and the finalize once, last.  A lean workspace refuses the replay."""
+    are the plan's, every group's in turn and the finalize once, last.  A lean workspace refuses the replay; the
+    backward refuses the deterministic package's default set before any launch, and the deterministic package's
+    backward refuses a grouped set of this package (``ValueError`` naming the mode)."""
     lengths, heads = shape
     S, N = sum(lengths), len(lengths)
     inputs = make_raw_inputs(lengths, heads, device)
@@ -10075,9 +10040,12 @@ def test_raw_gate_lean_and_batched_arenas_match_the_deterministic_raw_mode(
         _check_tail_grids([(n, g) for n, g, *_ in launched], p, "light", t)
         _rg_check(got, ref, tag=("lean", t))
         for ws_arg, arena_arg in ((ws, None), (None, arena), (ws, arena)):
-            for set_tag, source in (("nd set", saved), ("det set", det_saved)):
-                got = _rg_bwd(inputs, source, workspace=ws_arg, arena=arena_arg)
-                _rg_check(got, ref, tag=(t, ws_arg is None, arena_arg is None, set_tag))
+            got = _rg_bwd(inputs, saved, workspace=ws_arg, arena=arena_arg)
+            _rg_check(got, ref, tag=(t, ws_arg is None, arena_arg is None, "nd set"))
+            launched.clear()
+            with pytest.raises(ValueError, match=ND_REFUSES):
+                _rg_bwd(inputs, det_saved, workspace=ws_arg, arena=arena_arg)
+            assert launched == [], (t, ws_arg is None, arena_arg is None, "det set")
         with pytest.raises(ValueError, match="lean=False"):
             _rg_bwd(inputs, None, workspace=ws)
         leaves = _rg_leaves(inputs)
@@ -10108,9 +10076,12 @@ def test_raw_gate_lean_and_batched_arenas_match_the_deterministic_raw_mode(
             assert [n for n, *_ in launched] == _expected_batched_launches(
                 p, arena, lengths, "fwd"
             ), tag
+            launched.clear()
+            with pytest.raises(ValueError, match=ND_REFUSES):
+                _rg_bwd(inputs, det_saved, workspace=ws, doc_lengths=lengths)
+            assert launched == [], (*tag, "det default set")
             for name, source in (
                 ("nd default set", saved),
-                ("det default set", det_saved),
                 ("batched set", saved_b),
             ):
                 launched.clear()
@@ -10125,9 +10096,8 @@ def test_raw_gate_lean_and_batched_arenas_match_the_deterministic_raw_mode(
                 _one_finalize_last(names, p, path, tag=(*tag, name))
                 _check_group_launches(launched, p, arena, lengths, path, passes=passes)
             _rg_check(_rg_bwd(inputs, saved_b), ref, tag=(*tag, "default backward"))
-            _rg_check(
-                _rg_bwd(inputs, saved_b, det=True), ref, tag=(*tag, "det backward")
-            )
+            with pytest.raises(ValueError, match=DET_REFUSES):
+                _rg_bwd(inputs, saved_b, det=True)
             got = _rg_bwd(inputs, saved, arena=arena, doc_lengths=lengths)
             _rg_check(got, ref, tag=(*tag, "per-call"))
             if not lean:

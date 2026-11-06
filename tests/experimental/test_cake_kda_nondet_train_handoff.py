@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Checkpoint hand-off suite of the Cake non-deterministic packed KDA chunked training package
-(``flashinfer.experimental.cake.cake_kda_nondet_train``: ``cake_kda_nondet(..., checkpoint_handoff="auto" | "on" | "off")``,
-every call with ``deterministic=False``).  On a GPU: the gradients under both checkpoint modes are bitwise those of
+(``flashinfer.experimental.cake.cake_kda_nondet_train``: ``cake_kda_nondet(..., checkpoint_handoff="auto" | "on" |
+"off")``).  On a GPU: the gradients under both checkpoint modes are bitwise those of
 ``"off"`` on every plan family of the device the packs below reach, with both kinds of record (a tape record: the
 tapes; a row record: the recompute launches the intra twin, ``cake_jit.HANDOFF_TWINS``, and the record also keeps the
 prep's rows), also with the tape WY twin (``cake_jit.TAPE_TWINS``) on the rows whose record keeps no ``w``, the
@@ -232,9 +232,8 @@ def _fresh_registry(monkeypatch):
     cake_backend._handoff_reset()
 
 
-def cake_kda_nondet(*args, **kwargs):
-    """The package's autograd entry with the mode it requires."""
-    return cake_backend.cake_kda_nondet(*args, **kwargs)
+# the package's autograd entry (it takes no mode argument)
+cake_kda_nondet = cake_backend.cake_kda_nondet
 
 
 def _bits_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
@@ -1207,9 +1206,7 @@ def test_two_checkpointed_layers_share_one_workspace(
     lengths, heads = shape
     with_rows = int(_with_rows(_plan(lengths, heads, device), record_kind))
     first, second = _two_layer_inputs(lengths, heads, device)
-    ws = CakeKDANondetWorkspace.for_problem(
-        sum(lengths), len(lengths), heads, device, deterministic=False
-    )
+    ws = CakeKDANondetWorkspace.for_problem(sum(lengths), len(lengths), heads, device)
     for regions in ("each", "one"):
         tag = (lengths, heads, reentrant, regions)
         cake_backend._handoff_reset()
@@ -1243,9 +1240,7 @@ def test_the_byte_budget_admits_two_records_of_the_shape(
     lengths, heads = (100, 640, 77, 1000, 129), 2
     with_rows = int(_with_rows(_plan(lengths, heads, device), record_kind))
     first, second = _two_layer_inputs(lengths, heads, device)
-    ws = CakeKDANondetWorkspace.for_problem(
-        sum(lengths), len(lengths), heads, device, deterministic=False
-    )
+    ws = CakeKDANondetWorkspace.for_problem(sum(lengths), len(lengths), heads, device)
     for reentrant in (False, True):
         cake_backend._handoff_reset()
         kwargs = dict(ws=ws, reentrant=reentrant, regions="one", layers=3)
@@ -1511,7 +1506,7 @@ def test_plain_and_original_forwards_publish_nothing(device, manifest) -> None:
         cake_kda_nondet(*_leaves(inputs), cu, checkpoint_handoff="on")
     assert _stats(device)["published"] == 0
     cake_backend.cake_kda_nondet_train_forward(
-        *(inputs[n] for n in (*LEAVES, "cu_seqlens")), deterministic=False
+        *(inputs[n] for n in (*LEAVES, "cu_seqlens"))
     )
     assert _stats(device)["published"] == 0
     # the plain call's output: freed before the baseline, not inside the measured window
@@ -1753,7 +1748,7 @@ def test_handoff_mode_reads_the_environment_at_each_call(monkeypatch) -> None:
             cake_backend._handoff_mode(bad)
 
 
-def test_chunk_kda_passes_the_mode_to_the_node(monkeypatch) -> None:
+def test_cake_kda_nondet_passes_the_mode_to_the_node(monkeypatch) -> None:
     """Host only: ``cake_kda_nondet`` hands ``CakeKDANondetFunction`` the mode after the environment override, and ``"off"``
     under ``no_grad`` (no node is recorded: no backward would take a record) whatever the variable says."""
     seen: list = []
@@ -1773,9 +1768,9 @@ def test_chunk_kda_passes_the_mode_to_the_node(monkeypatch) -> None:
 
 
 def test_the_apply_slot_refusals() -> None:
-    """Host only: ``CakeKDANondetFunction.apply`` written for the signature without ``checkpoint_handoff`` (its trailing
-    ``bool`` lands in the slot) fails with a ``TypeError`` naming the slot, and an unknown mode with a
-    ``ValueError``, before any operand check or launch."""
+    """Host only: ``CakeKDANondetFunction.apply`` written for the deterministic Function's signature (its
+    ``use_gate_in_kernel`` ``bool`` right after ``doc_lengths`` lands in the slot) fails with a ``TypeError`` naming
+    the slot, and an unknown mode with a ``ValueError``, before any operand check or launch."""
     ops = [torch.zeros(1) for _ in range(6)]
     for flag in (False, True):
         with pytest.raises(TypeError, match="checkpoint_handoff"):
@@ -1784,7 +1779,7 @@ def test_the_apply_slot_refusals() -> None:
             )
     with pytest.raises(ValueError, match="checkpoint_handoff"):
         cake_backend.CakeKDANondetFunction.apply(
-            *ops, SCALE, None, None, None, None, "force", False
+            *ops, SCALE, None, None, None, None, "force"
         )
 
 

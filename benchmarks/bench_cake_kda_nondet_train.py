@@ -13,9 +13,9 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Benchmark of the Cake packed KDA chunked training kernels with a selectable
-numerical mode: the non-deterministic package
-(``flashinfer.experimental.cake.cake_kda_nondet_train``, ``deterministic=False``)
+Benchmark of the Cake packed KDA chunked training kernels in both numerical
+modes: the non-deterministic package
+(``flashinfer.experimental.cake.cake_kda_nondet_train``)
 against the deterministic package
 (``flashinfer.experimental.cake.cake_kda_det_train``) and flash-linear-attention's
 ``chunk_kda`` (when it is installed), on the same inputs, on the boundaries of
@@ -334,12 +334,12 @@ def cake_workspace(
     *,
     gate: str = "g",
     l2n: bool = False,
-    deterministic: bool,
+    det: bool = False,
 ):
-    """A loaded workspace of one Cake arm (the deterministic package's, or this package's with
-    ``deterministic=False``) for the row's gate mode and in-kernel Q/K L2 norm mode."""
+    """A loaded workspace of one Cake arm (``det``: the deterministic package's, else this package's) for the row's
+    gate mode and in-kernel Q/K L2 norm mode."""
     mode = {"gate": gate, "l2n": "fused" if l2n else "off"}
-    if deterministic:
+    if det:
         ws = det_backend.CakeKDADetWorkspace.for_problem(
             seqlen, docs, heads, device, **mode
         )
@@ -352,24 +352,22 @@ def cake_workspace(
 
 
 def cake_boundaries(
-    inputs: dict, ws, *, deterministic: bool
+    inputs: dict, ws, *, det: bool = False
 ) -> dict[str, Callable[[], object]]:
-    """The boundaries of one Cake arm on its workspace: the deterministic package's entries, or this package's
-    with ``deterministic=False``, in the gate mode and in-kernel Q/K L2 norm mode of ``inputs``.  Each closure
-    returns its results (the memory call holds them)."""
+    """The boundaries of one Cake arm on its workspace (``det``: the deterministic package's entries, else this
+    package's), in the gate mode and in-kernel Q/K L2 norm mode of ``inputs``.  Each closure returns its results
+    (the memory call holds them)."""
     q, k, v, g, beta, cu, dout = (
         inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens", "dout")
     )
-    if deterministic:
+    if det:
         fwd_fn = det_backend.cake_kda_det_train_forward
         bwd_fn = det_backend.cake_kda_det_train_backward
         autograd_fn = det_backend.cake_kda_det
-        mode = {}
     else:
         fwd_fn = nd_backend.cake_kda_nondet_train_forward
         bwd_fn = nd_backend.cake_kda_nondet_train_backward
         autograd_fn = nd_backend.cake_kda_nondet
-        mode = {"deterministic": False}
     raw = _raw_kw(inputs)
     l2n = _l2n_kw(inputs)
 
@@ -383,7 +381,6 @@ def cake_boundaries(
             cu,
             save_for_backward=True,
             workspace=ws,
-            **mode,
             **raw,
             **l2n,
         )
@@ -397,19 +394,18 @@ def cake_boundaries(
         cu,
         save_for_backward=True,
         workspace=ws,
-        **mode,
         **raw,
         **l2n,
     )
 
     def bwd() -> object:
         return bwd_fn(
-            q, k, v, g, beta, cu, dout, saved=saved, workspace=ws, **mode, **raw, **l2n
+            q, k, v, g, beta, cu, dout, saved=saved, workspace=ws, **raw, **l2n
         )
 
     def replay() -> object:
         return bwd_fn(
-            q, k, v, g, beta, cu, dout, saved=None, workspace=ws, **mode, **raw, **l2n
+            q, k, v, g, beta, cu, dout, saved=None, workspace=ws, **raw, **l2n
         )
 
     leaves = [
@@ -419,7 +415,7 @@ def cake_boundaries(
     def step(*a):
         # the raw mode's A_log / dt_bias are leaves too (gradients to them)
         return autograd_fn(
-            *a[:5], cu, workspace=ws, **mode, **_raw_kw(inputs, a[5:] or None), **l2n
+            *a[:5], cu, workspace=ws, **_raw_kw(inputs, a[5:] or None), **l2n
         )
 
     def ckpt() -> object:
@@ -493,15 +489,15 @@ def fla_boundaries(inputs: dict) -> dict[str, Callable[[], object]] | None:
     return {"fwd": fwd, "bwd": bwd, "ckpt": ckpt}
 
 
-def _results(inputs: dict, ws, *, deterministic: bool, replay: bool) -> dict:
-    """``out`` and the gradients of one Cake arm (from the saved set, or the replay's), in the gate mode and
-    in-kernel Q/K L2 norm mode of ``inputs``."""
+def _results(inputs: dict, ws, *, det: bool, replay: bool) -> dict:
+    """``out`` and the gradients of one Cake arm (``det``: the deterministic package's, else this package's; from
+    the saved set, or the replay's), in the gate mode and in-kernel Q/K L2 norm mode of ``inputs``."""
     q, k, v, g, beta, cu, dout = (
         inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens", "dout")
     )
     raw = _raw_kw(inputs)
     l2n = _l2n_kw(inputs)
-    if deterministic:
+    if det:
         out, saved = det_backend.cake_kda_det_train_forward(
             q, k, v, g, beta, cu, workspace=ws, **raw, **l2n
         )
@@ -559,7 +555,7 @@ def _nd_vs_det(inputs: dict, det_ws, nd_ws, build_order: str = "det-first") -> d
             arm: _results(
                 inputs,
                 det_ws if arm == "det" else nd_ws,
-                deterministic=arm == "det",
+                det=arm == "det",
                 replay=replay,
             )
             for arm in CAKE_ARMS[build_order]
@@ -682,14 +678,10 @@ def run_row(
     inputs = make_row_inputs(lengths, heads, device, gate=gate, l2n=l2n)
 
     def det_workspace():
-        return cake_workspace(
-            seqlen, docs, heads, device, gate=gate, l2n=l2n, deterministic=True
-        )
+        return cake_workspace(seqlen, docs, heads, device, gate=gate, l2n=l2n, det=True)
 
     def nd_workspace():
-        return cake_workspace(
-            seqlen, docs, heads, device, gate=gate, l2n=l2n, deterministic=False
-        )
+        return cake_workspace(seqlen, docs, heads, device, gate=gate, l2n=l2n)
 
     if build_order == "det-first":
         det_ws, nd_ws = det_workspace(), nd_workspace()
@@ -737,10 +729,10 @@ def run_row(
     if not arms_alone:
         for arm in ("det", "nd") if build_order == "det-first" else ("nd", "det"):
             arms[arm] = cake_boundaries(
-                inputs, det_ws if arm == "det" else nd_ws, deterministic=arm == "det"
+                inputs, det_ws if arm == "det" else nd_ws, det=arm == "det"
             )
         # the A/A arm after the two Cake arms: the deterministic calls again on the deterministic workspace
-        arms[AA_ARM] = cake_boundaries(inputs, det_ws, deterministic=True)
+        arms[AA_ARM] = cake_boundaries(inputs, det_ws, det=True)
     samples: dict[str, dict[str, list[float]]] = {}
 
     def fla_failed(exc: Exception) -> None:
@@ -821,7 +813,7 @@ def run_row(
         gc.collect()
         torch.cuda.empty_cache()
         cake_builders = {
-            "det": lambda: cake_boundaries(inputs, det_workspace(), deterministic=True),
+            "det": lambda: cake_boundaries(inputs, det_workspace(), det=True),
             "nd": lambda: cake_boundaries(inputs, nd_workspace()),
         }
         builders = {arm: cake_builders[arm] for arm in CAKE_ARMS[build_order]}

@@ -14,8 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Tests of the in-kernel Q/K L2 norm (``use_qk_l2norm_in_kernel=True``) of the Cake non-deterministic packed KDA
-chunked training package (``flashinfer.experimental.cake.cake_kda_nondet_train``, every entry called with
-``deterministic=False``).
+chunked training package (``flashinfer.experimental.cake.cake_kda_nondet_train``).
 
 The package runs the deterministic package's l2n programs in the same order on every row: its l2n records are the
 deterministic package's, the fused gradient's l2n class copies the deterministic records (no S1 pair: no GLM intra
@@ -26,15 +25,15 @@ run is the tape WY twin, in place of the WY program on a tape backward, which wr
 of an l2n mode is the deterministic package's l2n result bit for bit, in both gate modes.
 
 On the CPU (no kernel): the host rules this package shares with the deterministic package (the raw q / k operand
-rule, the mode keyword, the saved set's ``qk_rstd`` / ``qk_l2norm`` and its check, the layouts' transient ``qn`` /
+rule, the l2n mode keyword, the saved set's ``qk_rstd`` / ``qk_l2norm`` and its check, the layouts' transient ``qn`` /
 ``kn``, the byte queries, the registry's l2n leaf and the token grid, the values of the l2n launches, the test hook,
 the autograd node's arity) and the plans of the l2n modes against the deterministic package's (records, grids,
 launches, bytes, the pairing guard, no hand-off).  On a GPU: the exact FP64 reference and the deterministic
-package's l2n results bit for bit on every path (repeats, the replay, the light, light-states and tape sets of either
-package, caller workspaces, lean tail passes, document groups, packed q / k views, autograd and
-``torch.utils.checkpoint``), the same launch lists, the fused route against the fallback route, the test hook's rows,
-a checkpointed forward that keeps no workspace and the refusals.  The deterministic package's l2n suite is
-``test_cake_kda_det_train_l2n.py``; its FP64 reference helper is shared.
+package's l2n results bit for bit on every path (repeats, the replay, the light, light-states and tape sets, caller
+workspaces, lean tail passes, document groups, packed q / k views, autograd and ``torch.utils.checkpoint``), the
+same launch lists, the fused route against the fallback route, the test hook's rows, a checkpointed forward that
+keeps no workspace and the refusals (each package's backward refuses the other package's sets).  The deterministic
+package's l2n suite is ``test_cake_kda_det_train_l2n.py``; its FP64 reference helper is shared.
 """
 
 import dataclasses
@@ -94,19 +93,14 @@ SAVED_TENSORS = (
 ATOL = RTOL = 1e-2  # the package's declared elementwise gate (test_cake_kda_nondet_train.py)
 
 
-def cake_kda_nondet_train_forward(*args, **kwargs):
-    """The package's forward with the mode it requires."""
-    return cake_backend.cake_kda_nondet_train_forward(*args, **kwargs)
-
-
-def cake_kda_nondet_train_backward(*args, **kwargs):
-    """The package's backward with the mode it requires."""
-    return cake_backend.cake_kda_nondet_train_backward(*args, **kwargs)
-
-
-def cake_kda_nondet(*args, **kwargs):
-    """The package's autograd entry with the mode it requires."""
-    return cake_backend.cake_kda_nondet(*args, **kwargs)
+# the package's entries (they take no mode argument)
+cake_kda_nondet_train_forward = cake_backend.cake_kda_nondet_train_forward
+cake_kda_nondet_train_backward = cake_backend.cake_kda_nondet_train_backward
+cake_kda_nondet = cake_backend.cake_kda_nondet
+# each package's entries refuse the other package's saved set with ``ValueError`` naming the mode: this package's
+# message, then the deterministic package's
+ND_REFUSES = "is not a non-deterministic-package"
+DET_REFUSES = "is not a deterministic-package"
 
 
 def _det_name(name: str | None) -> str | None:
@@ -146,7 +140,7 @@ def _bits_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
 
 
 # ---------------------------------------------------------------------------------------------------------------
-# the raw q / k operand rule, the mode keyword (the deterministic package's rules, this package's host)
+# the raw q / k operand rule, the l2n mode keyword (the deterministic package's rules, this package's host)
 
 
 def test_qk_raw_accepts_contiguous_and_packed_views_without_a_copy() -> None:
@@ -273,7 +267,8 @@ def _saved(saved_type, S: int, H: int, **fields):
 
 def test_saved_set_fields_and_their_checks_read_either_package() -> None:
     """``qk_rstd`` (FP32 ``[2, S, H]``) and ``qk_l2norm`` default off and ride last in the autograd extras; this
-    package's ``_check_saved_l2n`` and the deterministic package's agree on every set of either package's type."""
+    package's ``_check_saved_l2n`` and the deterministic package's apply the same rule to a set of either package's
+    type (the entries refuse the other package's type before this check)."""
     S, H = 3, 2
     fields = {f.name: f.default for f in dataclasses.fields(cake_backend.CakeKDANondetChunkSaved)}
     assert fields["qk_rstd"] is None and fields["qk_l2norm"] is False
@@ -328,7 +323,8 @@ def test_saved_set_fields_and_their_checks_read_either_package() -> None:
 def test_check_saved_l2n_agrees_in_both_directions() -> None:
     """Each package's ``_check_saved_l2n`` on the other package's saved sets and on its own: over both set types, every
     mode and every ``qk_rstd`` / ``qk_l2norm`` state, the two checks accept the same sets and refuse the others with
-    the same message (a set written by either package's forward is read by either backward)."""
+    the same message: the same rule (each package's backward reads its own type only and refuses the other's
+    before this check)."""
     S, H = 3, 2
     rstd = torch.zeros(2, S, H, dtype=torch.float32)
     states = {
@@ -1164,7 +1160,7 @@ def test_l2n_matches_the_exact_reference_and_the_deterministic_l2n(
     out, grads, saved = _run(inputs, gate)
     torch.cuda.synchronize(device)
     assert saved.qk_l2norm is True and saved.qk_rstd.shape == (2, S, H)
-    assert saved.deterministic is False and saved.gate == gate
+    assert type(saved) is cake_backend.CakeKDANondetChunkSaved and saved.gate == gate
     i = inputs
     if gate == "raw":
         ref_out, ref = ref_l2n.kda_exact_raw_l2n_with_grads(
@@ -1209,8 +1205,8 @@ def test_l2n_matches_the_exact_reference_and_the_deterministic_l2n(
 def test_l2n_paths_are_bitwise_the_deterministic_l2n(shape, gate: str) -> None:
     """On one call's inputs every path gives the deterministic package's l2n results bit for bit: repeats, the
     replay (``saved=None``), a set without its tables, caller workspaces of the mode (and their replay), the tape
-    set from the default entry and from a tape workspace (its replay too), a light set on the tape workspace, and
-    either package's backward from the other package's light and tape sets."""
+    set from the default entry and from a tape workspace (its replay too) and a light set on the tape workspace.
+    Each package's backward refuses the other package's light and tape sets (``ValueError`` naming the mode)."""
     device = _l2n_device()
     lengths, H = shape
     S, N = sum(lengths), len(lengths)
@@ -1229,12 +1225,12 @@ def test_l2n_paths_are_bitwise_the_deterministic_l2n(shape, gate: str) -> None:
     bare = dataclasses.replace(saved, tables=None)
     for tag, other in (("bare", bare), ("saved", saved)):
         ws = cake_backend.CakeKDANondetWorkspace.for_problem(
-            S, N, H, device, gate=gate, l2n="fused", deterministic=False
+            S, N, H, device, gate=gate, l2n="fused"
         )
         assert ws.l2n == ws.plan.l2n == "fused" and ws.gate == gate
         count.grads(_bwd(inputs, other, gate, workspace=ws), ref, gate, tag)
     ws = cake_backend.CakeKDANondetWorkspace.for_problem(
-        S, N, H, device, gate=gate, l2n="fused", deterministic=False
+        S, N, H, device, gate=gate, l2n="fused"
     )
     assert ws.bytes == cake_backend.workspace_bytes(
         S, N, H, sm_count=ws.plan.sm_count, gate=gate, l2n="fused"
@@ -1248,7 +1244,7 @@ def test_l2n_paths_are_bitwise_the_deterministic_l2n(shape, gate: str) -> None:
     count.same(out_t, ref_out, "tape out")
     count.grads(grads_t, ref, gate, "tape")
     tape_ws = cake_backend.CakeKDANondetWorkspace.for_problem(
-        S, N, H, device, save_mode="tape", gate=gate, l2n="fused", deterministic=False
+        S, N, H, device, save_mode="tape", gate=gate, l2n="fused"
     )
     out_tw, grads_tw, saved_tw = _run(inputs, gate, workspace=tape_ws)
     assert saved_tw.version == cake_backend.SAVED_VERSION_TAPE
@@ -1258,27 +1254,19 @@ def test_l2n_paths_are_bitwise_the_deterministic_l2n(shape, gate: str) -> None:
         _bwd(inputs, None, gate, workspace=tape_ws), ref, gate, "tape ws replay"
     )
     count.grads(_bwd(inputs, saved, gate, workspace=tape_ws), ref, gate, "light set")
-    # either package's backward from the other's l2n sets (light and tape)
+    # each package's backward refuses the other's l2n sets (light and tape)
     _, det_saved_t = _fwd(inputs, gate, det=True, save_mode="tape")
     # the tape set's h on its written chunks: one per 64 tokens of each document
     count.saved(
         saved_t, det_saved_t, "tape set", h_chunks=sum(-(-n // 64) for n in lengths)
     )
-    for tag, nd_set, det_set in (
-        ("light", saved, det_saved),
-        ("tape", saved_t, det_saved_t),
-    ):
-        count.grads(
-            _bwd(inputs, det_set, gate), ref, gate, (tag, "det set, nd backward")
-        )
-        count.grads(
-            _bwd(inputs, nd_set, gate, det=True),
-            ref,
-            gate,
-            (tag, "nd set, det backward"),
-        )
+    for nd_set, det_set in ((saved, det_saved), (saved_t, det_saved_t)):
+        with pytest.raises(ValueError, match=ND_REFUSES):
+            _bwd(inputs, det_set, gate)
+        with pytest.raises(ValueError, match=DET_REFUSES):
+            _bwd(inputs, nd_set, gate, det=True)
     n = len(_names(gate))
-    assert count.n >= 9 + 16 * n  # the outs, the sets and every backward above
+    assert count.n >= 9 + 12 * n  # the outs, the sets and every backward above
 
 
 @pytest.mark.parametrize("gate", GATES)
@@ -1536,8 +1524,8 @@ L2N_ARENA_ROWS = [
 
 
 def _partitions(lengths):
-    """``(label, CakeKDANondetArena keywords)`` of the document groupings: two groups and three (where the greedy partition
-    gives exactly that many) and one document per group."""
+    """``(label, CakeKDANondetArena keywords)`` of the document groupings: two groups and three (where the greedy
+    partition gives exactly that many) and one document per group."""
     lengths = tuple(int(n) for n in lengths)
     S, longest = sum(lengths), max(lengths)
     out = []
@@ -1562,10 +1550,11 @@ def test_l2n_lean_and_batched_arenas_are_bitwise_the_deterministic_l2n(
 ) -> None:
     """Lean workspaces of one to three tail passes and document groups (default and lean layouts) give the
     deterministic package's default l2n results bit for bit: the forward; the backward from its own set and, on the
-    workspace and per call with the arena option, from either package's default set (lean); the backward of a
-    grouped workspace from either default set and from its own grouped set, which the default and the deterministic
-    backward read too; and the replay group by group (not lean).  A lean workspace refuses the replay.  The test
-    makes exactly the comparisons it lists."""
+    workspace and per call with the arena option, from this package's default set (lean); the backward of a grouped
+    workspace from this package's default set and from its own grouped set, which the default backward reads too;
+    and the replay group by group (not lean).  A lean workspace refuses the replay; the backward refuses the
+    deterministic package's default set and the deterministic package's backward refuses a grouped set of this
+    package (``ValueError`` naming the mode).  The test makes exactly the comparisons it lists."""
     device = _l2n_device()
     lengths, H = shape
     S, N = sum(lengths), len(lengths)
@@ -1577,7 +1566,7 @@ def test_l2n_lean_and_batched_arenas_are_bitwise_the_deterministic_l2n(
     for t in (1, 2, 3):
         arena = cake_backend.CakeKDANondetArena(lean=True, tail_passes=t)
         ws = cake_backend.CakeKDANondetWorkspace.for_problem(
-            S, N, H, device, arena=arena, gate=gate, l2n="fused", deterministic=False
+            S, N, H, device, arena=arena, gate=gate, l2n="fused"
         )
         assert ws.bytes == cake_backend.workspace_bytes(
             S, N, H, sm_count=ws.plan.sm_count, arena=arena, gate=gate, l2n="fused"
@@ -1585,16 +1574,14 @@ def test_l2n_lean_and_batched_arenas_are_bitwise_the_deterministic_l2n(
         o, saved_l = _fwd(inputs, gate, workspace=ws)
         count.same(o, ref_out, ("lean", t))
         count.grads(_bwd(inputs, saved_l, gate, workspace=ws), ref, gate, ("lean", t))
-        for set_tag, source in (("nd set", saved), ("det set", det_saved)):
-            count.grads(
-                _bwd(inputs, source, gate, workspace=ws), ref, gate, (t, set_tag)
-            )
-            count.grads(
-                _bwd(inputs, source, gate, arena=arena),
-                ref,
-                gate,
-                (t, set_tag, "per call"),
-            )
+        count.grads(_bwd(inputs, saved, gate, workspace=ws), ref, gate, (t, "nd set"))
+        count.grads(
+            _bwd(inputs, saved, gate, arena=arena), ref, gate, (t, "nd set", "per call")
+        )
+        with pytest.raises(ValueError, match=ND_REFUSES):
+            _bwd(inputs, det_saved, gate, workspace=ws)
+        with pytest.raises(ValueError, match=ND_REFUSES):
+            _bwd(inputs, det_saved, gate, arena=arena)
         with pytest.raises(ValueError, match="lean=False"):
             _bwd(inputs, None, gate, workspace=ws)
         del ws
@@ -1617,25 +1604,26 @@ def test_l2n_lean_and_batched_arenas_are_bitwise_the_deterministic_l2n(
             count.same(o, ref_out, tag)
             for name, source in (
                 ("nd default set", saved),
-                ("det default set", det_saved),
                 ("batched set", saved_b),
             ):
                 got = _bwd(inputs, source, gate, workspace=ws, doc_lengths=lengths)
                 count.grads(got, ref, gate, (*tag, name))
+            with pytest.raises(ValueError, match=ND_REFUSES):
+                _bwd(inputs, det_saved, gate, workspace=ws, doc_lengths=lengths)
             count.grads(
                 _bwd(inputs, saved_b, gate), ref, gate, (*tag, "default backward")
             )
-            count.grads(
-                _bwd(inputs, saved_b, gate, det=True), ref, gate, (*tag, "det backward")
-            )
+            with pytest.raises(ValueError, match=DET_REFUSES):
+                _bwd(inputs, saved_b, gate, det=True)
             if not lean:
                 got = _bwd(inputs, None, gate, workspace=ws, doc_lengths=lengths)
                 count.grads(got, ref, gate, (*tag, "replay"))
             del ws
     G = len(_names(gate))
-    # per tail pass: out, the backward from its own set, from both default sets on the workspace and per call; per
-    # grouping: out and six backwards on the default layout (the replay among them), out and five on the lean one
-    assert parts and count.n == 3 * (1 + 5 * G) + len(parts) * (2 + 11 * G)
+    # per tail pass: out, the backward from its own set, from this package's default set on the workspace and per
+    # call; per grouping: out and four backwards on the default layout (the replay among them), out and three on the
+    # lean one
+    assert parts and count.n == 3 * (1 + 3 * G) + len(parts) * (2 + 7 * G)
 
 
 @pytest.mark.parametrize("gate", GATES)
@@ -1704,7 +1692,8 @@ def test_l2n_batched_replay_reads_no_unwritten_row_of_the_next_group(
 def test_l2n_packed_views_are_bitwise_the_deterministic_l2n(gate: str) -> None:
     """q / k as column slices of one packed projection output (NaN outside the views) give the deterministic
     package's contiguous-row results bit for bit: the forward, the saved set, the backward from it and the replay;
-    a set saved from the contiguous rows serves the strided call and the other way round."""
+    a set saved from the contiguous rows serves the strided call and the other way round; the strided call refuses
+    the deterministic package's set (``ValueError`` naming the mode)."""
     device = _l2n_device()
     count = _Count()
     for lengths, H in (((1000, 37, 300), 4), ((2048,), 16)):
@@ -1728,13 +1717,12 @@ def test_l2n_packed_views_are_bitwise_the_deterministic_l2n(gate: str) -> None:
         count.grads(
             _bwd(inputs, None, gate, q=qv, k=kv), ref, gate, (lengths, "replay")
         )
-        count.grads(
-            _bwd(inputs, det_saved, gate, q=qv, k=kv), ref, gate, (lengths, "det set")
-        )
+        with pytest.raises(ValueError, match=ND_REFUSES):
+            _bwd(inputs, det_saved, gate, q=qv, k=kv)
         count.grads(
             _bwd(inputs, saved_v, gate), ref, gate, (lengths, "contiguous call")
         )
-    assert count.n >= 2 * (2 + 4 * len(_names(gate)))
+    assert count.n >= 2 * (2 + 3 * len(_names(gate)))
 
 
 def _leaves(inputs, gate: str) -> list[torch.Tensor]:
@@ -1896,7 +1884,7 @@ def test_l2n_fused_equals_the_fallback_route(shape, gate: str) -> None:
     S, N = sum(lengths), len(lengths)
     inputs = _l2n_inputs(lengths, H, device, gate)
     ws = cake_backend.CakeKDANondetWorkspace.for_problem(
-        S, N, H, device, gate=gate, l2n="fallback", deterministic=False
+        S, N, H, device, gate=gate, l2n="fallback"
     )
     assert ws.l2n == "fallback" and ws.plan.dispatched("qk_pullback", "light")
     det_ws = det_backend.CakeKDADetWorkspace.for_problem(
@@ -1976,8 +1964,8 @@ def test_l2n_hook_rows_are_the_reference_and_the_deterministic_rows(
 
 
 def test_l2n_refusals_on_device() -> None:
-    """Saved sets and workspaces of the other mode are refused (of either package's set); a strided q the rule
-    refuses is never copied."""
+    """Saved sets and workspaces of the other mode are refused, and a set of the deterministic package by its type
+    before the mode; a strided q the rule refuses is never copied."""
     device = _l2n_device()
     lengths, H = (300, 200), 2
     S, N = sum(lengths), len(lengths)
@@ -1985,8 +1973,11 @@ def test_l2n_refusals_on_device() -> None:
     i = inputs
     _, saved = _fwd(inputs)
     _, det_saved = _fwd(inputs, det=True)
-    for source in (saved, det_saved):  # a set of either package
-        with pytest.raises(ValueError, match="use_qk_l2norm_in_kernel"):
+    for source, refused in (
+        (saved, "use_qk_l2norm_in_kernel"),
+        (det_saved, ND_REFUSES),
+    ):
+        with pytest.raises(ValueError, match=refused):
             cake_kda_nondet_train_backward(
                 i["q"].contiguous(),
                 i["k"].contiguous(),
@@ -2006,7 +1997,7 @@ def test_l2n_refusals_on_device() -> None:
     with pytest.raises(ValueError, match="use_qk_l2norm_in_kernel"):
         _fwd(inputs, workspace=ws_off)
     ws_on = cake_backend.CakeKDANondetWorkspace.for_problem(
-        S, N, H, device, l2n="fused", deterministic=False
+        S, N, H, device, l2n="fused"
     )
     with pytest.raises(ValueError, match="use_qk_l2norm_in_kernel"):
         cake_kda_nondet_train_forward(
