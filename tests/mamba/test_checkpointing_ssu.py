@@ -2293,26 +2293,15 @@ def test_checkpointing_ssu_philox_with_checkpoint(
     )
 
 
-@pytest.mark.parametrize("philox_rounds", [0, 5])
-def test_checkpointing_ssu_fp8_flush_keeps_valid_scales(philox_rounds):
-    """A no-op recurrence must preserve tiny FP8 states across a flush."""
-    if philox_rounds and not is_cvt_rs_supported():
-        pytest.skip(f"FP8 SR requires HW cvt.rs on {cvt_rs_supported_arches_text()}")
-    device = "cuda"
-    nheads, dim, dstate, window = 16, 64, 128, 8
-    floor = 2.0**-117
-    row_case = torch.arange(nheads * dim, device=device).reshape(nheads, dim) % 4
-    amplitudes = torch.tensor([1.0, 2.0**-118, 448.0 * floor, 448.0], device=device)
-    state = torch.ones(2, nheads, dim, dstate, device=device).to(torch.float8_e4m3fn)
-    state[1].view(torch.uint8)[row_case == 0] = 0
-    scales = torch.ones(2, nheads, dim, device=device)
-    scales[1] = amplitudes[row_case]
-    before = state[1].float() * scales[1, ..., None]
+def _flush_fp8_slot_without_update(state, scales, philox_rounds):
+    """Flush slot 1 through a recurrence that adds nothing and decays nothing."""
+    device = state.device
+    _, nheads, dim, dstate = state.shape
+    window = 8
     bf16 = dict(device=device, dtype=torch.bfloat16)
     current = torch.zeros(1, 1, nheads, dim, **bf16)
     bc = torch.zeros(1, 1, 1, dstate, **bf16)
     out = torch.empty_like(current)
-
     checkpointing_ssu(
         state=state,
         state_scale=scales,
@@ -2340,6 +2329,26 @@ def test_checkpointing_ssu_fp8_flush_keeps_valid_scales(philox_rounds):
         philox_rounds=philox_rounds,
         enable_pdl=False,
     )
+    return out
+
+
+@pytest.mark.parametrize("philox_rounds", [0, 5])
+def test_checkpointing_ssu_fp8_flush_keeps_valid_scales(philox_rounds):
+    """A no-op recurrence must preserve tiny FP8 states across a flush."""
+    if philox_rounds and not is_cvt_rs_supported():
+        pytest.skip(f"FP8 SR requires HW cvt.rs on {cvt_rs_supported_arches_text()}")
+    device = "cuda"
+    nheads, dim, dstate = 16, 64, 128
+    floor = 2.0**-117
+    row_case = torch.arange(nheads * dim, device=device).reshape(nheads, dim) % 4
+    amplitudes = torch.tensor([1.0, 2.0**-118, 448.0 * floor, 448.0], device=device)
+    state = torch.ones(2, nheads, dim, dstate, device=device).to(torch.float8_e4m3fn)
+    state[1].view(torch.uint8)[row_case == 0] = 0
+    scales = torch.ones(2, nheads, dim, device=device)
+    scales[1] = amplitudes[row_case]
+    before = state[1].float() * scales[1, ..., None]
+
+    out = _flush_fp8_slot_without_update(state, scales, philox_rounds)
 
     expected_scales = torch.tensor([1.0, floor, floor, 1.0], device=device)[row_case]
     expected_state = torch.tensor([0.0, 0.5, 448.0, 448.0], device=device)[row_case]
@@ -2354,6 +2363,31 @@ def test_checkpointing_ssu_fp8_flush_keeps_valid_scales(philox_rounds):
         state[1].float() * scales[1, ..., None], before, rtol=0, atol=0
     )
     assert torch.count_nonzero(out) == 0
+
+
+@pytest.mark.parametrize("philox_rounds", [0, 5])
+def test_checkpointing_ssu_fp8_flush_tiny_row_with_zeros_stays_finite(philox_rounds):
+    """A tiny row with exact zeros must not encode 0 * inf as an FP8 NaN."""
+    if philox_rounds and not is_cvt_rs_supported():
+        pytest.skip(f"FP8 SR requires HW cvt.rs on {cvt_rs_supported_arches_text()}")
+    device = "cuda"
+    nheads, dim, dstate = 16, 64, 128
+    # An unbounded encode scale, 448 / 2^-122, overflows FP32.
+    state = torch.ones(2, nheads, dim, dstate, device=device).to(torch.float8_e4m3fn)
+    state[1].view(torch.uint8)[..., 1::2] = 0
+    scales = torch.ones(2, nheads, dim, device=device)
+    scales[1] = 2.0**-122
+    before = state[1].float() * scales[1, ..., None]
+
+    _flush_fp8_slot_without_update(state, scales, philox_rounds)
+
+    assert not torch.isnan(state[1].float()).any()
+    torch.testing.assert_close(
+        scales[1], torch.full_like(scales[1], 2.0**-117), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        state[1].float() * scales[1, ..., None], before, rtol=0, atol=0
+    )
 
 
 def _quantize_state_int8(state_fp32: torch.Tensor):
