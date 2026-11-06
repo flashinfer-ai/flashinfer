@@ -492,24 +492,6 @@ def test_deterministic_entries_still_refuse_false():
         assert "deterministic" not in inspect.signature(getattr(public, det)).parameters
 
 
-def test_remaining_aliases_are_the_canonical_objects():
-    """Every alias that remains after the dispatchers is an identity: the deterministic modules' former names are
-    their canonical objects.  The package path before the deterministic naming is gone."""
-    with pytest.raises(ModuleNotFoundError):
-        importlib.import_module("flashinfer.experimental.cake_lm_head_loss")
-    det_backend = importlib.import_module(
-        "flashinfer.experimental.cake_lm_head_det_loss.cake_backend"
-    )
-    for old, new in (
-        ("chunked_lm_head_loss", "chunked_lm_head_det_loss"),
-        ("chunked_lm_head_logprob", "chunked_lm_head_det_logprob"),
-        ("prepare_lm_head_loss", "prepare_lm_head_det_loss"),
-        ("LmHeadLossRunner", "LmHeadDetLossRunner"),
-        ("load_cake_lm_head_loss_module", "load_cake_lm_head_det_loss_module"),
-    ):
-        assert getattr(det_backend, old) is getattr(det_backend, new), old
-
-
 def test_non_deterministic_binding_caches_take_the_import_settings():
     """The package's binding caches are configured from the variables read at import, like the deterministic
     package's."""

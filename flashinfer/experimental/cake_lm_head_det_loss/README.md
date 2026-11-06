@@ -30,15 +30,11 @@ logp = chunked_lm_head_det_logprob(X, W, labels, temperature=tau)   # per-token:
 `det`: for fixed inputs, hardware, chunk plan and initial accumulation
 buffers, repeated forward and backward calls give bitwise-identical outputs and
 gradients (not promised across architectures, shapes or chunk plans).  The
-names before this naming (`chunked_lm_head_loss`, `chunked_lm_head_logprob`,
-`chunked_lm_head_preload`, `chunked_lm_head_support_logprob`,
-`chunked_lm_head_support_kl`, the package path
-`flashinfer.experimental.cake_lm_head_loss` and its modules, and the backend's
-`prepare_lm_head_loss`, `validate_lm_head_inputs`,
-`lm_head_loss_workspace_size`, `LmHeadLossRunner`,
-`ChunkedLmHeadLossFunction`, `ChunkedLmHeadLogprobFunction`,
-`SupportLogprobFunction` and `load_cake_lm_head_loss_module`) remain as
-aliases of the same objects.
+five names without `det` (`chunked_lm_head_loss`, `chunked_lm_head_logprob`,
+`chunked_lm_head_preload`, `chunked_lm_head_support_logprob` and
+`chunked_lm_head_support_kl`) are dispatchers, not aliases: their default
+`deterministic=True` runs these entries with the same arguments (see
+`docs/training_backend_names.md`).
 
 * `X [T, H]` BF16 hidden states, row-major with any leading stride (`H` a
   multiple of 256; a row pitch that is not a multiple of 16 bytes is copied

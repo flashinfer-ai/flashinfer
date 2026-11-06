@@ -101,100 +101,58 @@ def test_public_api_is_marked_experimental():
         chunked_lm_head_det_logprob(X, W, labels, backend="reference")
 
 
-# The public names before the deterministic (``det``) naming: since the non-deterministic package they are dispatchers
-# whose default (``deterministic=True``) runs the det entry with the same arguments, not aliases
+# The names before the deterministic (``det``) naming that the deterministic modules no longer define (no
+# aliases), by module.  The det-free public names are the dispatchers of ``flashinfer.chunked_lm_head``
 # (tests/experimental/test_cake_lm_head_loss_api.py checks the dispatch).
-OLD_PUBLIC_NAMES = (
-    "chunked_lm_head_loss",
-    "chunked_lm_head_logprob",
-    "chunked_lm_head_preload",
-    "chunked_lm_head_support_logprob",
-    "chunked_lm_head_support_kl",
-)
-# The names before the deterministic (``det``) naming and the canonical object each one is, by module.
-OLD_NAMES = {
-    "flashinfer.experimental.cake_lm_head_det_loss.cake_backend": {
-        "chunked_lm_head_loss": "chunked_lm_head_det_loss",
-        "chunked_lm_head_logprob": "chunked_lm_head_det_logprob",
-        "prepare_lm_head_loss": "prepare_lm_head_det_loss",
-        "validate_lm_head_inputs": "validate_lm_head_det_inputs",
-        "lm_head_loss_workspace_size": "lm_head_det_loss_workspace_size",
-        "LmHeadLossRunner": "LmHeadDetLossRunner",
-        "ChunkedLmHeadLossFunction": "ChunkedLmHeadDetLossFunction",
-        "ChunkedLmHeadLogprobFunction": "ChunkedLmHeadDetLogprobFunction",
-        "load_cake_lm_head_loss_module": "load_cake_lm_head_det_loss_module",
-    },
-    "flashinfer.experimental.cake_lm_head_det_loss.cake_backend_opt_in": {
-        "chunked_lm_head_loss": "chunked_lm_head_det_loss",
-        "chunked_lm_head_logprob": "chunked_lm_head_det_logprob",
-        "prepare_lm_head_loss": "prepare_lm_head_det_loss",
-        "validate_lm_head_inputs": "validate_lm_head_det_inputs",
-        "LmHeadLossRunner": "LmHeadDetLossRunner",
-        "ChunkedLmHeadLossFunction": "ChunkedLmHeadDetLossFunction",
-        "ChunkedLmHeadLogprobFunction": "ChunkedLmHeadDetLogprobFunction",
-        "load_cake_lm_head_loss_module": "load_cake_lm_head_det_loss_module",
-    },
-    "flashinfer.experimental.cake_lm_head_det_loss.cake_support": {
-        "chunked_lm_head_support_logprob": "chunked_lm_head_det_support_logprob",
-        "chunked_lm_head_support_kl": "chunked_lm_head_det_support_kl",
-        "SupportLogprobFunction": "SupportDetLogprobFunction",
-    },
-    "flashinfer.experimental.cake_lm_head_det_loss.cake_jit": {
-        "load_cake_lm_head_loss_module": "load_cake_lm_head_det_loss_module",
-    },
+REMOVED_NAMES = {
+    "cake_backend": (
+        "chunked_lm_head_loss",
+        "chunked_lm_head_logprob",
+        "prepare_lm_head_loss",
+        "validate_lm_head_inputs",
+        "lm_head_loss_workspace_size",
+        "LmHeadLossRunner",
+        "ChunkedLmHeadLossFunction",
+        "ChunkedLmHeadLogprobFunction",
+        "load_cake_lm_head_loss_module",
+    ),
+    "cake_backend_opt_in": (
+        "chunked_lm_head_loss",
+        "chunked_lm_head_logprob",
+        "prepare_lm_head_loss",
+        "validate_lm_head_inputs",
+        "LmHeadLossRunner",
+        "ChunkedLmHeadLossFunction",
+        "ChunkedLmHeadLogprobFunction",
+        "load_cake_lm_head_loss_module",
+    ),
+    "cake_support": (
+        "chunked_lm_head_support_logprob",
+        "chunked_lm_head_support_kl",
+        "SupportLogprobFunction",
+    ),
+    "cake_jit": ("load_cake_lm_head_loss_module",),
 }
 
 
-def test_old_names_are_the_canonical_objects():
-    """Every name before the ``det`` naming is an alias of the canonical object (the same object, not a copy), the
-    canonical object carries its own name, and the canonical names are the ones the modules define."""
-    for module_name, names in OLD_NAMES.items():
-        module = importlib.import_module(module_name)
-        for old, new in names.items():
-            canonical = getattr(module, new)
-            assert getattr(module, old) is canonical, (module_name, old)
-            assert canonical.__name__ == new, (module_name, new, canonical.__name__)
-
-
-def test_backend_loader_aliases_are_the_jit_loader():
-    """The stage loader's name before the ``det`` naming, read from either backend module (by the new or the old
-    package path), is the package loader itself, ``cake_jit.load_cake_lm_head_det_loss_module``."""
-    jit = importlib.import_module(
-        "flashinfer.experimental.cake_lm_head_det_loss.cake_jit"
-    )
-    loader = jit.load_cake_lm_head_det_loss_module
-    for name in ("cake_backend", "cake_backend_opt_in"):
-        module = importlib.import_module(
-            f"flashinfer.experimental.cake_lm_head_det_loss.{name}"
-        )
-        assert module.load_cake_lm_head_det_loss_module is loader, name
-        assert module.load_cake_lm_head_loss_module is loader, name
-
-
-def test_old_package_path_is_gone():
-    """The package path before the deterministic naming (``flashinfer.experimental.cake_lm_head_loss``) is gone; the
-    modules' former names that remain resolve to the canonical objects."""
+def test_names_before_the_det_naming_are_gone():
+    """The package path before the ``det`` naming (``flashinfer.experimental.cake_lm_head_loss``) and the
+    deterministic modules' former names are gone: no module of the old path imports (a stale ``__pycache__``
+    directory can still make the bare package path import as a namespace package, so a module is imported), and
+    no deterministic module defines or exports a former name."""
     with pytest.raises(ModuleNotFoundError):
-        importlib.import_module("flashinfer.experimental.cake_lm_head_loss")
-    support = importlib.import_module(
-        "flashinfer.experimental.cake_lm_head_det_loss.cake_support"
-    )
-    assert cake_backend.chunked_lm_head_loss is cake_backend.chunked_lm_head_det_loss
-    assert support.SupportLogprobFunction is support.SupportDetLogprobFunction
-    assert set(support.__all__) >= {
-        "SupportDetLogprobFunction",
-        "SupportLogprobFunction",
-        "chunked_lm_head_det_support_logprob",
-        "chunked_lm_head_support_logprob",
-        "chunked_lm_head_det_support_kl",
-        "chunked_lm_head_support_kl",
-    }
-
-
-def test_old_public_names_are_marked_experimental():
-    """The old public names are decorated experimental entries."""
-    for old in OLD_PUBLIC_NAMES:
-        assert getattr(public, old).is_experimental is True, old
+        importlib.import_module(
+            "flashinfer.experimental.cake_lm_head_loss.cake_backend"
+        )
+    assert sum(len(names) for names in REMOVED_NAMES.values()) == 21
+    assert len({name for names in REMOVED_NAMES.values() for name in names}) == 12
+    for module_name, names in REMOVED_NAMES.items():
+        module = importlib.import_module(
+            f"flashinfer.experimental.cake_lm_head_det_loss.{module_name}"
+        )
+        for name in names:
+            assert not hasattr(module, name), (module_name, name)
+            assert name not in getattr(module, "__all__", ()), (module_name, name)
 
 
 def test_public_api_switch_keywords():

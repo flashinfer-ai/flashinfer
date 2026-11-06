@@ -10249,16 +10249,3 @@ def chunked_lm_head_det_logprob_keep(
         logprob_dz=logprob_dz,
         logprob_lbl=logprob_lbl,
     )
-
-
-# The names before the deterministic (``det``) naming, kept as aliases: each is
-# the canonical object above.
-validate_lm_head_inputs = validate_lm_head_det_inputs
-lm_head_loss_workspace_size = lm_head_det_loss_workspace_size
-LmHeadLossRunner = LmHeadDetLossRunner
-prepare_lm_head_loss = prepare_lm_head_det_loss
-ChunkedLmHeadLossFunction = ChunkedLmHeadDetLossFunction
-ChunkedLmHeadLogprobFunction = ChunkedLmHeadDetLogprobFunction
-chunked_lm_head_loss = chunked_lm_head_det_loss
-chunked_lm_head_logprob = chunked_lm_head_det_logprob
-load_cake_lm_head_loss_module = load_cake_lm_head_det_loss_module

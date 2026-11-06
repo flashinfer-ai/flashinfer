@@ -2171,10 +2171,6 @@ def load_cake_lm_head_det_loss_module(name: str, stage: str):
     return cake_build.load_library(library_name(name, stage))
 
 
-# The loader's name before the deterministic (``det``) naming, kept as an alias.
-load_cake_lm_head_loss_module = load_cake_lm_head_det_loss_module
-
-
 def specs_for_arch(arch: str):
     """JIT specs of every ``build.json`` entry of ``arch`` without a prebuilt library (the
     ``flashinfer.jit.build_jit_specs`` warm-up)."""

@@ -2120,12 +2120,6 @@ def chunked_lm_head_det_support_kl(
     return (res["kl"], res["packed"]) if return_logprobs else res["kl"]
 
 
-# The names before the deterministic (``det``) naming, kept as aliases: each is
-# the canonical object above.
-SupportLogprobFunction = SupportDetLogprobFunction
-chunked_lm_head_support_logprob = chunked_lm_head_det_support_logprob
-chunked_lm_head_support_kl = chunked_lm_head_det_support_kl
-
 __all__ = [
     "CANONICAL_SEQUENCE",
     "NO_ERROR",
@@ -2133,13 +2127,10 @@ __all__ = [
     "SUPPORT_M_MAX",
     "SUPPORT_V_MAX",
     "SupportDetLogprobFunction",
-    "SupportLogprobFunction",
     "SupportReferenceEngine",
     "SupportRows",
     "chunked_lm_head_det_support_kl",
     "chunked_lm_head_det_support_logprob",
-    "chunked_lm_head_support_kl",
-    "chunked_lm_head_support_logprob",
     "decode_support_error",
     "describe_support_error",
     "support_error_word",
