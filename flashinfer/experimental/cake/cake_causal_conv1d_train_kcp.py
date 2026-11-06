@@ -239,8 +239,9 @@ def cake_causal_conv1d_multi_kcp(
 
 
 # ``RecomputeHandleKcp`` (the non-deterministic KCP package's recompute handle class) resolves on first access, so
-# importing this module imports neither the experimental package nor a KCP host module (torch.distributed, the KCP
-# loader).
+# importing this module imports neither the non-deterministic package
+# (``flashinfer.experimental.cake.cake_causal_conv1d_train_backend``) nor a KCP host module (torch.distributed, the
+# KCP loader).
 def __getattr__(name: str) -> Any:
     if name == "RecomputeHandleKcp":
         from .cake_causal_conv1d_train_backend.kcp import (  # noqa: PLC0415
