@@ -55,7 +55,7 @@ det_jit = cake_package("cake_dense_gemm_det_train", "cake_jit")
 # FlashInfer tree this names the sibling the package resolves by itself).
 cake_backend.use_deterministic_backend(det_backend)
 
-# Accuracy gates (the deterministic package's, unchanged by the numerical mode).
+# Accuracy gates (the deterministic package's budgets, which this module keeps).
 BF16_ATOL = BF16_RTOL = 1e-2
 F32_REL_FRO_MAX = 5e-5
 F32_MAX_ABS_OVER_REF_ABSMAX = 1e-3
@@ -8385,6 +8385,75 @@ def test_gpu_torch_deterministic_mode_alerts_before_an_order_varying_launch(
     _k1_check(first, ref, "two splits")
     _k1_check(got, ref, "three splits")
     assert _arena_tickets_zero()
+
+
+def test_gpu_the_cluster_program_does_not_alert(torch_determinism):
+    """The shipped cluster row ``4096 -> 64`` FP32 at 2048 tokens of :data:`K1_DSM_RANGES_BY_SM` (152-SM ``sm_100a``
+    parts: the cluster program at three splits, added in cluster-rank order) launches without an alert or a warning
+    under ``torch.use_deterministic_algorithms(True)``, and with ``warn_only=True``: the planning call, the call from
+    the cached key and the prepared launch run the cluster program (by kernel name), and every output meets the
+    deterministic package's FP32 budget against FP64 (:func:`_k1_check`).  ``test_the_cluster_program_does_not_alert``
+    checks the same calls on the CPU binding.  A part of any other SM count or architecture skips."""
+    device, arch = _atomic_device_or_skip()
+    sm_count = det_backend.device_facts(device).sm_count
+    if (arch, sm_count) != ("sm_100a", 152):
+        pytest.skip(
+            f"the cluster row is shipped for 152-SM sm_100a parts, not {arch} on {sm_count} SMs"
+        )
+    T, N, M = 2048, 64, 4096
+    dsm = cake_backend.k1_dsm_plan(
+        arch=arch, L=1, M=M, N=N, K=T, out_f32=True, sm_count=sm_count
+    )
+    assert dsm == (64, 3)
+    _require_template(arch, cake_backend.dsm_k1_template(*dsm))
+    cake_backend.cake_dense_gemm_nondet_train_convenience_cache_clear()
+    g = torch.Generator(device=device).manual_seed(SEED + 99)
+    G, X = _bf16((T, N), device, g), _bf16((T, M), device, g)
+    # the FP64 reference before the mode is on (its cuBLAS GEMM would need CUBLAS_WORKSPACE_CONFIG under it)
+    ref = G.double().t() @ X.double()
+    out = torch.full((N, M), float("nan"), device=device, dtype=torch.float32)
+    got = []
+    torch.use_deterministic_algorithms(True)
+    with _no_warnings():
+        for _ in range(2):  # the planning call, then the call from the cached key
+            out.fill_(float("nan"))
+            assert (
+                cake_backend.cake_dense_gemm_nondet_train_projection_wgrad(G, X, out)
+                is out
+            )
+            got.append(out.clone())
+        prepared = cake_backend.cake_dense_gemm_nondet_train_projection_wgrad_prepare(
+            G, X, out
+        )
+        out.fill_(float("nan"))
+        assert prepared.launch() is out
+        got.append(out.clone())
+        torch.cuda.synchronize()
+    ((_, entry),) = cake_backend._K1_ATOMIC_CACHE.items()
+    assert entry.plan.dsm and entry.arena is None
+    assert (entry.plan.block_n, entry.plan.splits) == dsm and not entry.order_varying
+    assert isinstance(prepared, cake_backend.CakeDenseGemmNondetProjectionLaunch)
+    assert prepared.plan.dsm and prepared.plan.reproducible
+    assert (prepared.plan.block_n, prepared.plan.splits) == dsm
+    # still under the mode: the calls ran the cluster program
+    _assert_ran(
+        lambda: cake_backend.cake_dense_gemm_nondet_train_projection_wgrad(G, X, out),
+        entry.module_name,
+    )
+    _assert_ran(prepared.launch, prepared.module_name)
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    with _no_warnings():
+        out.fill_(float("nan"))
+        cake_backend.cake_dense_gemm_nondet_train_projection_wgrad(G, X, out)
+        got.append(out.clone())
+        out.fill_(float("nan"))
+        prepared.launch()
+        got.append(out.clone())
+        torch.cuda.synchronize()
+    torch.use_deterministic_algorithms(False)
+    for i, result in enumerate(got):
+        _k1_check(result, ref, f"cluster program call {i}")
+    cake_backend.cake_dense_gemm_nondet_train_convenience_cache_clear()
 
 
 def test_gpu_det_then_atomic_share_a_stream_not_a_workspace(k1_rule):

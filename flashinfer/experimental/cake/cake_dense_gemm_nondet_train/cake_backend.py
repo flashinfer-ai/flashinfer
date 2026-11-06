@@ -68,12 +68,12 @@ programs: the single-CTA program, every tile's whole K in one CTA.
 
 Under ``torch.use_deterministic_algorithms(True)`` a launch whose result can vary run to run -- the K1 split-K program
 of CTA pairs at three or more splits, a K2 stream-K partition that gives an element more than two partials -- raises
-PyTorch's alert right before it launches (:func:`_alert_order_varying`): ``RuntimeError`` (nothing launched, ``out``
-untouched), or with ``warn_only=True`` a ``UserWarning``, after which the launch runs.  The fixed-order launches (the
-one- and two-split K1 rows, the K1 cluster program, the K2 SIMT programs, a K2 partition of at most two partials per
-element, every deterministic program) do not alert.  The alert is checked on every launch, never at plan or prepare
-time; a launch captured into a CUDA graph is checked at capture, not at replay.  The PyTorch setting never changes
-which program a call runs, and no call goes to the deterministic package because of it.
+PyTorch's alert right before it launches (:func:`_alert_order_varying`): ``RuntimeError`` (the program is not launched
+and ``out`` is untouched), or with ``warn_only=True`` a ``UserWarning``, after which the launch runs.  The fixed-order
+launches (the one- and two-split K1 rows, the K1 cluster program, the K2 SIMT programs, a K2 partition of at most two
+partials per element, every deterministic program) do not alert.  The alert is checked on every launch, never at plan or
+prepare time; a launch captured into a CUDA graph is checked at capture, not at replay.  The PyTorch setting never
+changes which program a call runs, and no call goes to the deterministic package because of it.
 
 The two packages
 ----------------
@@ -130,7 +130,7 @@ from .cake_jit import (
 from .cake_jit import select_module as select_module
 
 # ---------------------------------------------------------------------------
-# The deterministic package and the mode rules
+# The deterministic package
 # ---------------------------------------------------------------------------
 
 #: The deterministic package's entry points this package calls on the rows that run the deterministic programs
@@ -5094,6 +5094,7 @@ def cake_dense_gemm_nondet_train_projection_plan(
     (``sm_count`` and ``l2_bytes`` included): a knob the caller gives reaches that planner as given, and
     ``transposed_out``, ``arch`` and ``sm_count`` also apply to this package's plan; a knob the caller does not give
     takes the deterministic planner's default."""
+    # must stay the first statement: ``locals()`` holds only the parameters here
     knobs = _given_knobs(locals())
     if _route(_k1_layout(A, B)) == "det":
         return deterministic_backend().cake_dense_gemm_det_train_projection_plan(
@@ -5166,6 +5167,7 @@ def cake_dense_gemm_nondet_train_projection_prepare(
     ``CakeDenseGemmDetProjectionLaunch``).  The other keyword-only knobs are that entry point's public ones, passed
     on only when the caller gives them; ``enable_pdl`` (default: the device supports it) makes either launch a
     programmatic dependent launch."""
+    # must stay the first statement: ``locals()`` holds only the parameters here
     knobs = _given_knobs(locals())
     if _route(_k1_layout(A, B)) == "det":
         return deterministic_backend().cake_dense_gemm_det_train_projection_prepare(

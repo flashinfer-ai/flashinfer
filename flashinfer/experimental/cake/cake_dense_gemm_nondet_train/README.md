@@ -43,7 +43,7 @@ result can vary run to run raises PyTorch's alert right before it launches:
 
 | launch | rows | order of the partials | under `torch.use_deterministic_algorithms(True)` |
 |---|---|---|---|
-| K1 CTA-pair split-K program, three or more splits | the `sm_107a` rows of `K1_SPLIT_RULES` (216 SMs) and `K1_SPLIT_RULES_BY_SM` (208 / 212 SMs); a caller's `splits >= 3` | the order the splits finish | `RuntimeError` before the launch (nothing launched, `out` untouched); with `warn_only=True` a `UserWarning`, then the launch |
+| K1 CTA-pair split-K program, three or more splits | the `sm_107a` rows of `K1_SPLIT_RULES` (216 SMs) and `K1_SPLIT_RULES_BY_SM` (208 / 212 SMs); a caller's `splits >= 3` | the order the splits finish | `RuntimeError` before the launch (the program is not launched and `out` is untouched); with `warn_only=True` a `UserWarning`, then the launch |
 | K1 CTA-pair split-K program, two splits | every `sm_100a` / `sm_103a` row, `sm_107a` `8192 -> 128` | one add of two values (repeats bit for bit) | no alert |
 | K1 one split, the chain programs (`_c3`) | the one-split rows | whole tiles, chains added in order | no alert |
 | K1 cluster program `dense_proj_gemm_dsm_*_s2` / `_s3` | `K1_DSM_RANGES_BY_SM` (152-SM `sm_100a` parts, FP32 out) | cluster-rank order in distributed shared memory (no global atomics, no workspace) | no alert |

@@ -1678,7 +1678,7 @@ def image_identity(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Benchmark the numerical modes of the Cake dense projection GEMMs (the module docstring has the arms, timing and reports).",
+        description="Benchmark the non-deterministic Cake dense GEMMs (flashinfer.cake_dense_gemm_nondet_train) against the deterministic module and the non-Cake SOTA (the module docstring has the arms, timing and reports).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(

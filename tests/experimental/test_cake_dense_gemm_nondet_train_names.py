@@ -469,6 +469,7 @@ def test_the_former_package_is_gone():
 def test_imports_are_lazy():
     code = f"""
 import sys
+import warnings
 import flashinfer
 loaded = sorted(m for m in sys.modules if "cake_dense_gemm_" in m)
 assert loaded == [], loaded
@@ -481,8 +482,12 @@ import {MODULE} as m
 loaded = sorted(n for n in sys.modules if n.startswith("{BACKEND}"))
 assert loaded == [], loaded
 assert not [n for n in sys.modules if n.startswith("{DET_BACKEND}")]
-m.cake_dense_gemm_nondet_train_router_wgrad
+# the first access loads the backend: no ExperimentalWarning (a stable module), no other warning
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    m.cake_dense_gemm_nondet_train_router_wgrad
 assert "{BACKEND}.cake_backend" in sys.modules
+assert not caught, [(w.category.__name__, str(w.message)) for w in caught]
 print("ok")
 """
     result = _run(code)
