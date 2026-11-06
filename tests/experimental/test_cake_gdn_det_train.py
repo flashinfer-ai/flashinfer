@@ -75,6 +75,7 @@ import pytest
 import torch
 from torch.utils.checkpoint import checkpoint
 
+from tests.test_helpers.cake_mode_names import assert_mode_names
 from tests.test_helpers.cake_package import PACKAGES, cake_package
 
 cake_backend = cake_package("cake_gdn_det_train", "cake_backend")
@@ -402,19 +403,10 @@ def test_former_names_are_removed() -> None:
         assert getattr(cake_chain, name).__name__ == name
 
 
-_WORD = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|\d+")
-
-
-def _words(name: str) -> list[str]:
-    """The words of ``name``, lower-cased: split on ``_`` and at CamelCase boundaries (``nondet`` is not ``det``)."""
-    return [w.lower() for part in name.split("_") for w in _WORD.findall(part)]
-
-
 def test_the_package_exports_the_det_names_only() -> None:
     assert sorted(cake_gdn_det_train.__all__) == sorted(DET_NAMES)
-    assert all("det" in _words(name) for name in cake_gdn_det_train.__all__)
-    assert "det" not in _words("cake_gdn_nondet")
-    assert "det" in _words("CakeGDNDetFunction")
+    # the mode word as a token (the shared check; no order check, so a vendored import path passes too)
+    assert_mode_names(cake_gdn_det_train, "det", stem=False)
     for name in CHAIN_ONLY_NAMES:
         assert name in cake_chain.__all__ and hasattr(cake_chain, name), name
         assert not hasattr(cake_gdn_det_train, name), name

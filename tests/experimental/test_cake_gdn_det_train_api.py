@@ -27,7 +27,6 @@ SM107 the facade's results against the package's (bitwise) and under ``torch.use
 import ast
 import inspect
 import math
-import re
 import warnings
 from pathlib import Path
 
@@ -38,6 +37,7 @@ import flashinfer.cake_gdn_det_train as facade
 from flashinfer.api_logging import ExperimentalWarning
 from flashinfer.experimental.cake import cake_gdn_det_train as pkg
 from flashinfer.experimental.cake.cake_gdn_det_train import cake_backend
+from tests.test_helpers.cake_mode_names import assert_mode_names
 
 FACADE_NAMES = (
     "CakeGDNDetFunction",
@@ -58,14 +58,6 @@ FORMER_NAMES = (
 )
 
 
-_WORD = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|\d+")
-
-
-def _words(name: str) -> list[str]:
-    """The words of ``name``, lower-cased: split on ``_`` and at CamelCase boundaries (``nondet`` is not ``det``)."""
-    return [w.lower() for part in name.split("_") for w in _WORD.findall(part)]
-
-
 def _call(fn, *args, **kwargs):
     # a stable API: an ExperimentalWarning would raise
     with warnings.catch_warnings():
@@ -75,7 +67,7 @@ def _call(fn, *args, **kwargs):
 
 def test_the_facade_exports_the_mode_word_names_only() -> None:
     assert sorted(facade.__all__) == sorted(FACADE_NAMES)
-    assert all("det" in _words(name) for name in facade.__all__)
+    assert_mode_names(facade, "det")
     assert facade.CakeGDNDetFunction is pkg.CakeGDNDetFunction
     assert facade.CakeGDNDetFunction.__name__ == "CakeGDNDetFunction"
     assert facade.cake_gdn_det.__name__ == "cake_gdn_det"

@@ -24,7 +24,6 @@ import importlib
 import importlib.util
 import inspect
 import pathlib
-import re
 import types
 
 import pytest
@@ -728,14 +727,6 @@ DET_FREE_NAMES = (
 )
 
 
-_WORD = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|\d+")
-
-
-def _words(name: str) -> list[str]:
-    """The words of ``name``, lower-cased: split on ``_`` and at CamelCase boundaries (``nondet`` is not ``det``)."""
-    return [w.lower() for part in name.split("_") for w in _WORD.findall(part)]
-
-
 def test_legacy_names_are_removed() -> None:
     """``flashinfer.gdn_train`` and ``flashinfer.experimental.cake_gdn_train`` (and its modules) do not import, and no
     module of the deterministic route binds a pre-rename name.  A checkout may keep an untracked leftover of a former
@@ -770,8 +761,11 @@ def test_legacy_names_are_removed() -> None:
 def test_package_exports_the_det_names_only() -> None:
     """The package's ``__all__`` holds the names that carry ``det`` only, each bound; the constants and backend
     controls without ``det`` are neither exported nor bound by the package, and are read from their modules."""
+    from tests.test_helpers.cake_mode_names import assert_mode_names  # noqa: PLC0415
+
     pkg = _mod()
-    assert pkg.__all__ and [n for n in pkg.__all__ if "det" not in _words(n)] == []
+    assert pkg.__all__
+    assert_mode_names(pkg, "det")
     assert all(hasattr(pkg, n) for n in pkg.__all__)
     holders = (_mod("cake_kcp"), _mod("cake_options"))
     for n in DET_FREE_NAMES:

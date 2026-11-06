@@ -17,13 +17,13 @@ Public names of the Cake deterministic GDN training routes (FlashInfer #8928).
 
 The facades ``flashinfer.cake_gdn_det_train`` and ``flashinfer.cake_gdn_det_train_kcp`` sit at the top level and their
 backend packages at ``flashinfer.experimental.cake.cake_gdn_det_train[_kcp]``.  Every name the facades and the backend
-packages export carries the mode word ``det`` as a word (split on ``_`` and at CamelCase boundaries; constants keep
-their ALL_CAPS names and are not exported); no entry binds a ``deterministic`` keyword
-(``inspect.signature(obj).bind_partial(deterministic=False)`` raises ``TypeError``, the autograd ``Function.forward``
-included; the entries whose ``**`` keywords are the KCP option fields or the byte queries' keyword-only arguments
+packages export carries the mode word ``det`` as a token, right after the op (constants keep their ALL_CAPS names
+and are not exported); no entry binds a ``deterministic`` keyword (``inspect.signature(obj).bind_partial(
+deterministic=False)`` raises ``TypeError``, the autograd ``Function.forward`` / ``backward`` included; the entries whose ``**`` keywords are the KCP option fields or the byte queries' keyword-only arguments
 refuse it where those keywords are bound); the former module paths do not import, and no namespace (the ``flashinfer`` top level, the
 facades, the backend packages and their modules) binds a former name.  Importing a facade loads no backend module until
-first use (checked in fresh interpreters).
+first use (checked in fresh interpreters).  The mode-word and keyword checks are the shared ones of
+``tests/test_helpers/cake_mode_names.py``.
 """
 
 from __future__ import annotations
@@ -32,7 +32,6 @@ import ast
 import importlib
 import importlib.util
 import inspect
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -40,6 +39,10 @@ from pathlib import Path
 import pytest
 
 import flashinfer
+from tests.test_helpers.cake_mode_names import (
+    assert_mode_names,
+    assert_no_deterministic_keyword,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -186,41 +189,28 @@ VAR_KEYWORD_ENTRIES = (
     "cake_gdn_det_train_kcp_saved_bytes",
     "cake_gdn_det_train_kcp_workspace_bytes",
 )
-_WORD = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|\d+")
 
 
-def _words(name: str) -> list[str]:
-    """The words of ``name``, lower-cased: split on ``_`` and at CamelCase boundaries (an acronym run is one word)."""
-    return [w.lower() for part in name.split("_") for w in _WORD.findall(part)]
-
-
-def test_the_word_split_finds_the_mode_word_by_token() -> None:
-    assert _words("CakeGDNDetKcpPackedQKVSplitFunction") == [
-        "cake",
-        "gdn",
+def test_the_shared_check_reads_the_mode_word_by_token() -> None:
+    # the shared mode-name check (tests/test_helpers/cake_mode_names.py) passes the det names this suite exports and
+    # fails a nondet name and a word that only starts with "det"
+    module = importlib.import_module(KCP_PACKAGE)
+    assert_mode_names(
+        module,
         "det",
-        "kcp",
-        "packed",
-        "qkv",
-        "split",
-        "function",
-    ]
-    assert _words("is_cake_gdn_det_train_kcp_supported") == [
-        "is",
-        "cake",
-        "gdn",
-        "det",
-        "train",
-        "kcp",
-        "supported",
-    ]
+        names=[
+            "CakeGDNDetKcpPackedQKVSplitFunction",
+            "is_cake_gdn_det_train_kcp_supported",
+        ],
+    )
     for name in (
         "cake_gdn_nondet_kcp",
         "CakeGDNNondetKcpSaved",
         "detach_state",
         "Determinant",
     ):
-        assert "det" not in _words(name), name
+        with pytest.raises(AssertionError):
+            assert_mode_names(module, "det", names=[name], stem=False)
 
 
 def _namespaces() -> dict[str, object]:
@@ -314,8 +304,9 @@ def test_no_namespace_binds_a_former_name(name: str) -> None:
 def test_exports_are_the_mode_word_names(module_name: str, names: tuple) -> None:
     module = importlib.import_module(module_name)
     assert sorted(module.__all__) == sorted(names)
+    # the mode word as a token, right after the op (the shared check)
+    assert_mode_names(module, "det")
     for name in module.__all__:
-        assert "det" in _words(name) or name.isupper(), name
         assert hasattr(module, name), name
 
 
@@ -366,19 +357,19 @@ def _callables(module) -> list[tuple[str, object]]:
 
 @pytest.mark.parametrize("module_name", [FACADE, PACKAGE, KCP_FACADE, KCP_PACKAGE])
 def test_no_entry_takes_a_deterministic_parameter(module_name: str) -> None:
+    # the shared check for every exported entry but the listed ``**`` ones (it cannot tell their forwarded keywords
+    # from a catch-all; test_the_forwarded_keywords_refuse_deterministic checks where those are bound)
     module = importlib.import_module(module_name)
-    found = _callables(module)
-    assert found
+    want = VAR_KEYWORD_ENTRIES if module_name in (KCP_FACADE, KCP_PACKAGE) else ()
+    entries = [getattr(module, name) for name in module.__all__ if name not in want]
+    assert entries
+    assert_no_deterministic_keyword(entries)
     var_keyword = []
-    for name, fn in found:
+    for name, fn in _callables(module):
         sig = inspect.signature(fn)
         assert "deterministic" not in sig.parameters, (module_name, name)
         if any(p.kind is p.VAR_KEYWORD for p in sig.parameters.values()):
             var_keyword.append(name)
-            continue
-        with pytest.raises(TypeError):
-            sig.bind_partial(deterministic=False)
-    want = VAR_KEYWORD_ENTRIES if module_name in (KCP_FACADE, KCP_PACKAGE) else ()
     assert sorted(var_keyword) == sorted(want), module_name
 
 
