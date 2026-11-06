@@ -979,6 +979,6 @@
       ]
     }
   ],
-  "package": "flashinfer.experimental.cake_dsa_train",
+  "package": "flashinfer.experimental.cake.cake_dsa_sparse_attention_nondet_train",
   "schema": "cake-build/1"
 }
