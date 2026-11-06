@@ -28,7 +28,7 @@ from flashinfer.cudnn import linear_attention
 from flashinfer.kda_prefill import RecurrentKDAPrefillWorkspace
 from flashinfer.utils import get_compute_capability
 from tests.test_helpers.cudnn_linear_attention import assert_rel_close
-from tests.test_helpers.kda_prefill import packed_prefill_inputs
+from tests.kda.test_helpers.kda_prefill import packed_prefill_inputs
 
 kda = importlib.import_module("flashinfer.kda")
 cudnn_adapter = importlib.import_module("flashinfer.cudnn")

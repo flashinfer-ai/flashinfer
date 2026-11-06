@@ -51,7 +51,7 @@ import pytest
 import torch
 import torch.utils.checkpoint
 
-from tests.test_helpers import cake_rmsnorm_train_reference as ref
+from tests.norm.test_helpers import cake_rmsnorm_train_reference as ref
 from tests.test_helpers.cake_package import cake_package
 
 pkg = cake_package("cake_rmsnorm_train")

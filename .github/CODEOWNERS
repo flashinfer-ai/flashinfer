@@ -90,6 +90,7 @@ include/flashinfer/sampling.cuh      @kahyunnam @yzh119 @bkryu @yongwww @aleozlx
 tests/topk_varlen/                   @kahyunnam @yzh119 @bkryu @yongwww @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
 tests/utils/test_logits_processor.py @kahyunnam @yzh119 @bkryu @yongwww @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
 tests/utils/test_sampling*.py        @kahyunnam @yzh119 @bkryu @yongwww @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
+tests/utils/test_helpers/sampling.py @kahyunnam @yzh119 @bkryu @yongwww @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
 tests/utils/test_topk.py             @kahyunnam @yzh119 @bkryu @yongwww @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
 
 # ── RoPE ──

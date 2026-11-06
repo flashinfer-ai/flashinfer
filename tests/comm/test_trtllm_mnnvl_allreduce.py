@@ -17,7 +17,7 @@ from flashinfer.utils import get_compute_capability
 from flashinfer.norm import rmsnorm
 
 # Test helpers
-from tests.test_helpers.comm import (
+from tests.comm.test_helpers.comm import (
     _get_rank_info_from_env,
     init_torch_distributed_from_mpi,
 )

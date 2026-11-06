@@ -26,7 +26,7 @@ from tests.test_helpers.parametrize import (
     pairwise_product_cases,
 )
 from tests.test_helpers.pdl import late_store
-from tests.test_helpers.sampling import (
+from tests.utils.test_helpers.sampling import (
     required_num_collision_rows,
     required_num_trials,
 )

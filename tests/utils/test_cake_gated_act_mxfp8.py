@@ -19,7 +19,7 @@ Tests for the Cake fused SwiGLU + MXFP8 quantization training kernels
 Every output byte -- the E4M3 codes of the rowwise and colwise values and the
 E8M0 scale bytes in the swizzled 128 x 4 layout -- is compared exactly, with
 no tolerance, against a plain-torch reference of the same math
-(``tests/test_helpers/cake_gated_act_mxfp8_reference.py``).  Every program of
+(``tests/utils/test_helpers/cake_gated_act_mxfp8_reference.py``).  Every program of
 every route (forward / backward x rowwise / colwise / both) on the device's
 architecture runs directly, whatever the selection rule would pick, on unit
 normals, block-scaled normals, special values (NaN, Inf, zero and subnormal
@@ -45,7 +45,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.test_helpers import cake_gated_act_mxfp8_reference as reference
+from tests.utils.test_helpers import cake_gated_act_mxfp8_reference as reference
 from tests.test_helpers.cake_package import cake_package
 
 pkg = cake_package("cake_gated_act_mxfp8")

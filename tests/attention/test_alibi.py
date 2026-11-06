@@ -16,7 +16,7 @@ limitations under the License.
 
 import pytest
 import torch
-from tests.test_helpers.alibi_reference import alibi_attention
+from tests.attention.test_helpers.alibi_reference import alibi_attention
 from tests.test_helpers.jit_utils import (
     gen_decode_attention_modules,
     gen_prefill_attention_modules,

@@ -472,7 +472,7 @@ def pytest_collection_modifyitems(session, config, items):
         )
     ]
     if prims_ts_items:
-        from tests.test_helpers.prims_ts_attention_prebuild import (
+        from tests.attention.test_helpers.prims_ts_attention_prebuild import (
             prebuild_selected_attention_tests,
         )
 

@@ -28,7 +28,7 @@ from flashinfer.kda import recurrent_kda
 from flashinfer.kda_prefill import RecurrentKDAPrefillWorkspace
 from flashinfer.utils import get_compute_capability
 
-from tests.test_helpers.kda_prefill import (
+from tests.kda.test_helpers.kda_prefill import (
     _chunk16_debug_reference,
     _h12_bf16_residual_carriers,
     _make_inputs,

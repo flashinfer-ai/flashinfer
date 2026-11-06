@@ -16,7 +16,7 @@ limitations under the License.
 
 import pytest
 import torch
-from tests.test_helpers.rope_reference import *
+from tests.attention.test_helpers.rope_reference import *
 from tests.test_helpers.parametrize import (
     parametrize_product,
     pairwise_product_cases,

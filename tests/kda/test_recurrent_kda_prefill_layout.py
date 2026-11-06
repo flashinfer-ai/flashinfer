@@ -21,7 +21,7 @@ import torch
 
 from flashinfer.kda_prefill import RecurrentKDAPrefillWorkspace
 from flashinfer.utils import get_compute_capability
-from tests.test_helpers.kda_prefill import packed_prefill_inputs
+from tests.kda.test_helpers.kda_prefill import packed_prefill_inputs
 
 kda = importlib.import_module("flashinfer.kda")
 

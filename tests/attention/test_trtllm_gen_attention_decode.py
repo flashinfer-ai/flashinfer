@@ -19,7 +19,7 @@ from tests.test_helpers.utils_fp4 import (
 )
 from tests.test_helpers.test_helpers import assert_close_with_mismatch_tolerance
 import einops
-from tests.test_helpers.sink_attention_reference import sink_attention_unified
+from tests.attention.test_helpers.sink_attention_reference import sink_attention_unified
 from flashinfer.fp4_quantization import nvfp4_quantize_paged_kv_cache
 
 import flashinfer
