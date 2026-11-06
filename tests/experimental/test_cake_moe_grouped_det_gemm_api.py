@@ -379,6 +379,13 @@ def test_direct_apply_refuses_a_stale_mode_argument(stale):
         )
 
 
+def _with_main_grad(w):
+    """``w`` requiring grad with a valid fp32 ``main_grad`` (the fuse flag's forward check passes)."""
+    w.requires_grad_(True)
+    w.main_grad = torch.zeros(w.shape, dtype=torch.float32)
+    return w
+
+
 _DET_MODE_CALLS = {
     "grouped_det_gemm_fwd": lambda x, w, offs: pkg.grouped_det_gemm_fwd(x, w, offs),
     "grouped_det_gemm_dgrad": lambda x, w, offs: pkg.grouped_det_gemm_dgrad(
@@ -395,14 +402,25 @@ _DET_MODE_CALLS = {
     "cake_grouped_det_mm": lambda x, w, offs: pkg.cake_grouped_det_mm(
         x, w.requires_grad_(True), offs
     ),
+    "grouped_det_gemm_wgrad_accumulate": lambda x, w, offs: pkg.grouped_det_gemm_wgrad(
+        torch.zeros(4, 256, dtype=torch.bfloat16),
+        x,
+        offs,
+        out=torch.zeros(2, 256, 64),
+        accumulate=True,
+    ),
+    "cake_grouped_det_mm_fuse": lambda x, w, offs: pkg.cake_grouped_det_mm(
+        x, _with_main_grad(w), offs, fuse_wgrad_accumulation=True
+    ),
 }
 
 
 @pytest.mark.parametrize("name", list(_DET_MODE_CALLS))
 def test_torch_deterministic_mode_changes_nothing_for_det_entries(name):
     """Under ``torch.use_deterministic_algorithms(True)`` (strict and ``warn_only``) a
-    deterministic entry raises no alert and no ``UserWarning``: CPU operands reach the
-    same host-side ``ValueError`` (the device check) as with the mode off."""
+    deterministic entry raises no alert and no ``UserWarning``, also with
+    ``accumulate=True`` / ``fuse_wgrad_accumulation=True``: CPU operands reach the same
+    host-side ``ValueError`` (the device check) as with the mode off."""
 
     def outcome():
         x, w, offs = _cpu_operands()
