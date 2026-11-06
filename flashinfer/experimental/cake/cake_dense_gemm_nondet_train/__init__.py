@@ -21,7 +21,7 @@ limitations under the License.
 # the keyword-only ``deterministic: bool = True`` and accepts only
 # ``deterministic=False``: any other value, the default included, raises
 # ``ValueError`` naming the entry point of the deterministic package
-# ``flashinfer.experimental.dense_projection_det_gemm``.  Importing this package
+# ``flashinfer.experimental.cake.cake_dense_gemm_det_train``.  Importing this package
 # imports nothing: ``cake_backend``, ``cake_jit`` and ``cake_build`` load on
 # first attribute access.
 

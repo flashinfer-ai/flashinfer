@@ -26,7 +26,7 @@ from typing import Any, Optional
 from . import cake_build
 
 # Registry of the generated programs of this package (schema v2, the layout of the deterministic package's
-# ``cake_jit``).  Populated verbatim by the generated-program export (``export.families.dense_projection_gemm``); do
+# ``cake_jit``).  Populated verbatim by the generated-program export (the exporter family of this package); do
 # not edit by hand.  Three literals, each wrapped in ``# fmt: off`` / ``# fmt: on`` and rendered one record per line,
 # so the export replaces a literal from its head line up to the next ``# fmt: on`` line:
 #
@@ -128,10 +128,10 @@ TEMPLATE_PREFIXES = (
     "dense_proj_gemm_dsm_",
 )
 
-#: The deterministic package: a sibling of this package (``<parent>.dense_projection_det_gemm``), resolved on first
+#: The deterministic package: a sibling of this package (``<parent>.cake_dense_gemm_det_train``), resolved on first
 #: use and never through an absolute ``flashinfer`` import; a vendored copy binds it explicitly
 #: (``cake_backend.use_deterministic_backend``).
-DETERMINISTIC_PACKAGE = "dense_projection_det_gemm"
+DETERMINISTIC_PACKAGE = "cake_dense_gemm_det_train"
 _det_package: Optional[str] = None
 
 

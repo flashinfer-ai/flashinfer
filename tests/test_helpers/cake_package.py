@@ -31,7 +31,7 @@ PACKAGES: dict[str, str] = {
     # the non-deterministic package (deterministic=False); its key carries the namespace
     "cake.cake_lm_head_loss": "flashinfer.experimental.cake.cake_lm_head_loss",
     "cake_dense_gemm_det_train": "flashinfer.experimental.cake.cake_dense_gemm_det_train",
-    "dense_projection_gemm": "flashinfer.experimental.dense_projection_gemm",
+    "cake_dense_gemm_nondet_train": "flashinfer.experimental.cake.cake_dense_gemm_nondet_train",
     "cake_moe_grouped_det_gemm": "flashinfer.experimental.cake_moe_grouped_det_gemm",
     # the suite name before the deterministic-family rename (compatibility alias)
     "cake_moe_grouped_gemm": "flashinfer.experimental.cake_moe_grouped_det_gemm",
