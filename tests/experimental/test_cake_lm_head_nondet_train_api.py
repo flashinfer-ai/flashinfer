@@ -335,8 +335,8 @@ def test_entries_check_the_arguments_like_the_deterministic_entries(recorders):
 @pytest.mark.parametrize("warn_only", [False, True])
 def test_torch_deterministic_mode_still_runs_the_backend(recorders, warn_only):
     """With torch's deterministic algorithms on (strict or ``warn_only``), every entry still reaches the backend
-    with the call's arguments on every call, and the facade itself warns nothing (the backend's own alert decides;
-    here the backend is a recorder, so no warning at all)."""
+    with the call's positional arguments and every keyword unchanged on every call, and the facade itself warns
+    nothing (the backend's own alert decides; here the backend is a recorder, so no warning at all)."""
     fake = recorders
     was = _torch_deterministic(warn_only)
     try:
@@ -349,8 +349,9 @@ def test_torch_deterministic_mode_still_runs_the_backend(recorders, warn_only):
             assert not [str(w.message) for w in rec], entry
             calls = _backend_calls(fake, entry)
             assert len(calls) == 3, entry
-            for got_args, _ in calls:
+            for got_args, got_kw in calls:
                 assert all(a is b for a, b in zip(got_args, args, strict=True)), entry
+                assert got_kw == kwargs, entry
     finally:
         torch.use_deterministic_algorithms(was[0], warn_only=was[1])
 
