@@ -136,7 +136,7 @@ def _device_or_skip() -> torch.device:
     if not torch.cuda.is_available():
         pytest.skip("CUDA device required")
     index = torch.cuda.current_device()
-    if not gdn_api.is_gdn_det_train_kcp_supported(index):
+    if not gdn_api.is_cake_gdn_det_train_kcp_supported(index):
         pytest.skip("the package does not support this device")
     return torch.device("cuda", index)
 
@@ -148,16 +148,16 @@ def device() -> torch.device:
 
 def _local_context(cu: list[int], device: torch.device):
     """The one-rank context of the local path (the public entry names; group None = single process)."""
-    part = gdn_api.partition_det_kcp(
+    part = gdn_api.cake_gdn_det_train_kcp_partition(
         torch.tensor(cu, dtype=torch.int64), 1, layout="contiguous"
     )
-    return gdn_api.build_context_det_kcp(part, None, 0, device)
+    return gdn_api.cake_gdn_det_train_kcp_build_context(part, None, 0, device)
 
 
 def _run_fwd_bwd(inputs: dict, ctx, device: torch.device) -> dict:
     """Autograd forward + backward of the local path; the results keyed by tensor name (no batch axis)."""
     leaves = [inputs[n].to(device).detach().requires_grad_(True) for n in OPERANDS]
-    out = gdn_api.chunk_gdn_det_kcp(*leaves, ctx)
+    out = gdn_api.cake_gdn_det_kcp(*leaves, ctx)
     grads = torch.autograd.grad(out, leaves, inputs["dout"].to(device))
     res = {"out": out.detach()[0]}
     res.update({n: gr.detach()[0] for n, gr in zip(GRAD_NAMES, grads, strict=True)})
@@ -256,7 +256,7 @@ def test_packed_qkv_strided_view_equals_the_contiguous_input(
 
 def _split_view_pass(form, row0, g0, b0, dout, ctx, heads, *, ckpt, **o) -> dict:
     """One autograd pass with q / k / v taken from the packed ``[1, T, (2 H_qk + HV) * 128]`` row ``row0``:
-    ``"plain"`` = ``split`` + ``view`` head views, ``"packed"`` = ``packed_qkv_views_det_kcp``, ``"contiguous"`` =
+    ``"plain"`` = ``split`` + ``view`` head views, ``"packed"`` = ``cake_gdn_det_train_kcp_packed_qkv_views``, ``"contiguous"`` =
     separate contiguous leaves holding the same values.  A tensor hook (recording the gradient) and ``retain_grad``
     are set on every view (and on the split outputs) of the original forward."""
     H, HV = heads
@@ -286,7 +286,9 @@ def _split_view_pass(form, row0, g0, b0, dout, ctx, heads, *, ckpt, **o) -> dict
                 p.view(1, T, n, D) for p, n in zip(parts, (H, H, HV), strict=True)
             )
         else:
-            q, k, v = gdn_api.packed_qkv_views_det_kcp(row, H_qk=H, HV=HV)
+            q, k, v = gdn_api.cake_gdn_det_train_kcp_packed_qkv_views(
+                row, H_qk=H, HV=HV
+            )
         if not views:  # the original forward (a checkpoint recompute builds a graph no backward runs)
             views.update(q=q, k=k, v=v, **{f"part{i}": p for i, p in enumerate(parts)})
             for name, t in views.items():
@@ -294,7 +296,7 @@ def _split_view_pass(form, row0, g0, b0, dout, ctx, heads, *, ckpt, **o) -> dict
                     lambda gr, name=name: fired.setdefault(name, []).append(gr.clone())
                 )
                 t.retain_grad()
-        return gdn_api.chunk_gdn_det_kcp(q, k, v, g, beta, ctx, **o)
+        return gdn_api.cake_gdn_det_kcp(q, k, v, g, beta, ctx, **o)
 
     if ckpt:
         from torch.utils.checkpoint import checkpoint
@@ -329,7 +331,7 @@ def test_plain_split_views_keep_hooks_and_bitwise_gradients(
     device, lengths, heads, norm, ckpt
 ) -> None:
     """Issue #8367 on the device programs: plain ``split`` / ``view`` head views of one packed QKV row, the
-    ``packed_qkv_views_det_kcp`` views of it and contiguous operands give bitwise the same ``out``, row gradient
+    ``cake_gdn_det_train_kcp_packed_qkv_views`` views of it and contiguous operands give bitwise the same ``out``, row gradient
     (``dq | dk | dv``), ``dg`` and ``dbeta``, with the in-kernel norm off and on, direct and checkpointed.  Plain views
     keep torch's autograd path: their tensor hooks and ``retain_grad`` (and those on the split outputs) fire once
     with the gradient, and only the packed views' split hands the packed dQKV row on without a concatenation."""
@@ -386,8 +388,10 @@ def test_explicit_entries_match_autograd_and_keep_the_output_order(device) -> No
     ctx = _local_context(cu, device)
     ops = [inputs[n].to(device) for n in OPERANDS]
     dout = inputs["dout"].to(device)
-    out, saved = gdn_api.chunk_gdn_det_fwd_kcp(*ops, ctx, save_for_backward=True)
-    grads = gdn_api.chunk_gdn_det_bwd_kcp(*ops, ctx, dout, saved=saved)
+    out, saved = gdn_api.cake_gdn_det_train_kcp_forward(
+        *ops, ctx, save_for_backward=True
+    )
+    grads = gdn_api.cake_gdn_det_train_kcp_backward(*ops, ctx, dout, saved=saved)
     assert len(grads) == len(EXPLICIT_GRAD_ORDER)
     auto = _run_fwd_bwd(inputs, ctx, device)
     assert torch.equal(out[0], auto["out"])
@@ -396,7 +400,7 @@ def test_explicit_entries_match_autograd_and_keep_the_output_order(device) -> No
         assert torch.equal(t[0], auto[n]), (
             f"{n} differs between the explicit entry and autograd"
         )
-    replay = gdn_api.chunk_gdn_det_bwd_kcp(*ops, ctx, dout, saved=None)
+    replay = gdn_api.cake_gdn_det_train_kcp_backward(*ops, ctx, dout, saved=None)
     for n, t_saved, t_replay in zip(EXPLICIT_GRAD_ORDER, grads, replay, strict=True):
         assert torch.equal(t_saved, t_replay), (
             f"{n}: saved-context and replay backward differ"
@@ -432,18 +436,24 @@ def test_backward_refuses_the_non_deterministic_forwards_saved_set_and_workspace
     )
     assert type(nd_saved) is nd.SavedKcp
     ctx = _local_context(cu, device)
-    ws = kcp.WorkspaceDetKcp()
-    _, saved = kcp.chunk_gdn_det_fwd_kcp(*ops, ctx, workspace=ws)
+    ws = kcp.CakeGDNDetKcpWorkspace()
+    _, saved = kcp.cake_gdn_det_train_kcp_forward(*ops, ctx, workspace=ws)
     with pytest.raises(
-        ValueError, match="saved must be a SavedDetKcp of the deterministic mode"
+        ValueError, match="saved must be a CakeGDNDetKcpSaved of the deterministic mode"
     ):
-        kcp.chunk_gdn_det_bwd_kcp(*ops, ctx, dout, saved=nd_saved, workspace=ws)
+        kcp.cake_gdn_det_train_kcp_backward(
+            *ops, ctx, dout, saved=nd_saved, workspace=ws
+        )
     with pytest.raises(
         ValueError,
-        match="workspace must be a WorkspaceDetKcp of the deterministic mode",
+        match="workspace must be a CakeGDNDetKcpWorkspace of the deterministic mode",
     ):
-        kcp.chunk_gdn_det_bwd_kcp(*ops, ctx, dout, saved=saved, workspace=nd_ws)
-    grads = kcp.chunk_gdn_det_bwd_kcp(*ops, ctx, dout, saved=saved, workspace=ws)
+        kcp.cake_gdn_det_train_kcp_backward(
+            *ops, ctx, dout, saved=saved, workspace=nd_ws
+        )
+    grads = kcp.cake_gdn_det_train_kcp_backward(
+        *ops, ctx, dout, saved=saved, workspace=ws
+    )
     assert all(bool(torch.isfinite(t).all()) for t in grads)
 
 
@@ -467,7 +477,7 @@ def test_every_launch_binds_the_caller_stream_once(device, monkeypatch, ckpt) ->
         leaves = [inputs[n].to(device).detach().requires_grad_(True) for n in OPERANDS]
 
         def fn(*xs):
-            return gdn_api.chunk_gdn_det_kcp(*xs, ctx)
+            return gdn_api.cake_gdn_det_kcp(*xs, ctx)
 
         out = checkpoint(fn, *leaves, use_reentrant=False) if ckpt else fn(*leaves)
         grads = torch.autograd.grad(out, leaves, dout)
@@ -517,7 +527,7 @@ ISSUE_CU = [
 
 
 def test_context_preparation_does_not_synchronize(device) -> None:
-    """``partition_det_kcp`` + ``build_context_det_kcp`` + ``prepare`` of a new layout make no synchronizing CUDA call (the
+    """``cake_gdn_det_train_kcp_partition`` + ``cake_gdn_det_train_kcp_build_context`` + ``prepare`` of a new layout make no synchronizing CUDA call (the
     tables travel in pinned, asynchronous copies), and every device table is bitwise the table built on the CPU."""
     plan = importlib.import_module(
         "flashinfer.experimental.cake.cake_gdn_det_train_kcp.cake_kcp_plan"
@@ -525,15 +535,17 @@ def test_context_preparation_does_not_synchronize(device) -> None:
     torch.cuda.synchronize(device)
     torch.cuda.set_sync_debug_mode("error")
     try:
-        part = gdn_api.partition_det_kcp(
+        part = gdn_api.cake_gdn_det_train_kcp_partition(
             torch.tensor(ISSUE_CU, dtype=torch.int64), 1, layout="contiguous"
         )
-        ctx = gdn_api.build_context_det_kcp(part, None, 0, device)
+        ctx = gdn_api.cake_gdn_det_train_kcp_build_context(part, None, 0, device)
         prepared = ctx.prepare(2, 6)
     finally:
         torch.cuda.set_sync_debug_mode("default")
     torch.cuda.synchronize(device)
-    ref = plan.build_context_det_kcp(part, None, 0, "cpu", sm_count=ctx.sm_count)
+    ref = plan.cake_gdn_det_train_kcp_build_context(
+        part, None, 0, "cpu", sm_count=ctx.sm_count
+    )
     ref_prepared = ref.prepare(2, 6)
     pairs = (
         [(f"tables.{k}", ctx.tables[k], ref.tables[k]) for k in ctx.tables]
@@ -565,10 +577,10 @@ def test_context_preparation_does_not_synchronize(device) -> None:
 
 
 class _PeakWorkspace:
-    """A ``WorkspaceDetKcp`` recording the most bytes it binds (every allocation / release path)."""
+    """A ``CakeGDNDetKcpWorkspace`` recording the most bytes it binds (every allocation / release path)."""
 
     def __new__(cls, kcp):
-        class Tracked(kcp.WorkspaceDetKcp):
+        class Tracked(kcp.CakeGDNDetKcpWorkspace):
             def __init__(self, *a, **k):
                 super().__init__(*a, **k)
                 self.peak = 0
@@ -605,7 +617,7 @@ class _PeakWorkspace:
     ids=["issue-2x6", "32k-16x48"],
 )
 def test_workspace_bytes_match_what_the_backward_binds(device, cu, heads) -> None:
-    """``gdn_det_workspace_layout_kcp`` is what a caller-held workspace binds (tolerance 0): the forward's peak (the
+    """``cake_gdn_det_train_kcp_workspace_layout`` is what a caller-held workspace binds (tolerance 0): the forward's peak (the
     fused forward's #1; with test knob ``fused_o=0`` the split forward's tape walk, ``forward_split``), and the
     backward's phase maximum of each tape form -- the kept-tape form (the ten light tapes are the recompute's hand-off
     tensors, the tapes the forward leaves re-adopted after #8) and the replay form (the ten light tapes are
@@ -627,13 +639,13 @@ def test_workspace_bytes_match_what_the_backward_binds(device, cu, heads) -> Non
     leaves = [inputs[n].to(device).detach().requires_grad_(True) for n in OPERANDS]
     dout = inputs["dout"].to(device)
     for form in (True, False):
-        layout = gb.gdn_det_workspace_layout_kcp(
+        layout = gb.cake_gdn_det_train_kcp_workspace_layout(
             ctx, H_qk=H, HV=HV, reuse_recompute_tapes=form
         )
         ws = _PeakWorkspace(kcp)
 
         def fn(*a, _ws=ws, _form=form):
-            return gdn_api.chunk_gdn_det_kcp(
+            return gdn_api.cake_gdn_det_kcp(
                 *a, ctx, workspace=_ws, reuse_recompute_tapes=_form
             )
 
@@ -649,7 +661,7 @@ def test_workspace_bytes_match_what_the_backward_binds(device, cu, heads) -> Non
             ws.bytes,
             layout["bwd.phase.end"],
         )
-        assert gdn_api.gdn_det_workspace_bytes_kcp(
+        assert gdn_api.cake_gdn_det_train_kcp_workspace_bytes(
             ctx, H_qk=H, HV=HV, reuse_recompute_tapes=form
         ) == max(layout["forward"], layout["backward"])
         for lf in leaves:
@@ -661,7 +673,7 @@ def test_workspace_bytes_match_what_the_backward_binds(device, cu, heads) -> Non
         ws = _PeakWorkspace(kcp)
 
         def split(*a, _ws=ws, _form=form):
-            return gdn_api.chunk_gdn_det_kcp(
+            return gdn_api.cake_gdn_det_kcp(
                 *a,
                 ctx,
                 workspace=_ws,
@@ -737,7 +749,7 @@ def test_reuse_recompute_tapes_auto_follows_the_region_shape(
         from torch.utils.checkpoint import checkpoint
 
         def fn(*a):
-            out = gdn_api.chunk_gdn_det_kcp(
+            out = gdn_api.cake_gdn_det_kcp(
                 *a, ctx, **({} if form is None else {"reuse_recompute_tapes": form})
             )
             return out if proj is None else proj(out)
@@ -829,21 +841,21 @@ def _fused_arm(device, cu, heads, form, fused_o: int, log: list) -> dict:
     graph = opts.get("graph") == "replay"
     H, HV = heads
     inputs = make_inputs(cu, H, HV)
-    part = gdn_api.partition_det_kcp(
+    part = gdn_api.cake_gdn_det_train_kcp_partition(
         torch.tensor(cu, dtype=torch.int64), 1, layout="contiguous"
     )
-    ctx = gdn_api.build_context_det_kcp(part, None, 0, device)
+    ctx = gdn_api.cake_gdn_det_train_kcp_build_context(part, None, 0, device)
     kw = {"test_knobs": {"fused_o": fused_o, **knobs}, **opts}
     if graph:
-        kw["workspace"] = gdn_api.WorkspaceDetKcp()
+        kw["workspace"] = gdn_api.CakeGDNDetKcpWorkspace()
     dout = inputs["dout"].to(device)
     del log[:]
     if explicit:
         q, k, v, g, beta = (inputs[n].to(device) for n in OPERANDS)
-        out, saved = gdn_api.chunk_gdn_det_fwd_kcp(
+        out, saved = gdn_api.cake_gdn_det_train_kcp_forward(
             q, k, v, g, beta, ctx, save_for_backward=True, **kw
         )
-        dq, dk, dv, dbeta, dg = gdn_api.chunk_gdn_det_bwd_kcp(
+        dq, dk, dv, dbeta, dg = gdn_api.cake_gdn_det_train_kcp_backward(
             q, k, v, g, beta, ctx, dout, saved=saved, **kw
         )
         torch.cuda.synchronize(device)
@@ -858,7 +870,7 @@ def _fused_arm(device, cu, heads, form, fused_o: int, log: list) -> dict:
         x = v
         for i in range(layers):
             hk = {"recompute_handle": handles[i]} if handles else {}
-            x = gdn_api.chunk_gdn_det_kcp(q, k, x, g, beta, ctx, **hk, **kw)
+            x = gdn_api.cake_gdn_det_kcp(q, k, x, g, beta, ctx, **hk, **kw)
         # a later saver of the region: w's gradient reads the output
         return x if w is None else x * w
 
@@ -866,7 +878,9 @@ def _fused_arm(device, cu, heads, form, fused_o: int, log: list) -> dict:
     for _rep in range(3 if graph else 1):
         leaves = [inputs[n].to(device).detach().requires_grad_(True) for n in OPERANDS]
         handles = (
-            [gdn_api.RecomputeHandleDetKcp() for _ in range(layers)] if handle else []
+            [gdn_api.CakeGDNDetKcpRecomputeHandle() for _ in range(layers)]
+            if handle
+            else []
         )
         out = (
             checkpoint(fn, *leaves, *handles, use_reentrant=False)
@@ -975,7 +989,7 @@ def test_full_backward_without_save_transfer_matches_light_on_poisoned_memory(
         leaves = [inputs[n].to(device).detach().requires_grad_(True) for n in OPERANDS]
 
         def fn(*a):
-            return gdn_api.chunk_gdn_det_kcp(*a, ctx, workspace=workspace, **o, **kw)
+            return gdn_api.cake_gdn_det_kcp(*a, ctx, workspace=workspace, **o, **kw)
 
         if ckpt:
             from torch.utils.checkpoint import checkpoint
@@ -991,7 +1005,7 @@ def test_full_backward_without_save_transfer_matches_light_on_poisoned_memory(
         }
 
     ops = [inputs[n].to(device) for n in OPERANDS]
-    _, saved = gdn_api.chunk_gdn_det_fwd_kcp(
+    _, saved = gdn_api.cake_gdn_det_train_kcp_forward(
         *ops, ctx, save_for_backward=True, save_mode="full", **o
     )
     assert saved.P == 2 and saved.c1_recv is None and saved.M_seg is not None
@@ -1000,10 +1014,10 @@ def test_full_backward_without_save_transfer_matches_light_on_poisoned_memory(
     assert kcp.LAST_CALL["fwd"]["P"] == 2
     for n, t in light.items():
         assert bool(torch.isfinite(t.float()).all()), ("light", n)
-    shared = kcp.WorkspaceDetKcp()
+    shared = kcp.CakeGDNDetKcpWorkspace()
     arms = (
         (None, False),
-        (kcp.WorkspaceDetKcp(), False),
+        (kcp.CakeGDNDetKcpWorkspace(), False),
         (shared, False),
         (shared, False),
         (None, True),

@@ -15,8 +15,8 @@ limitations under the License.
 
 Options of the context-parallel (KCP) packed GDN training route
 (``flashinfer.experimental.cake.cake_gdn_det_train_kcp``): every behaviour switch of the
-entry points is a keyword-only field of :class:`OptionsDetKcp`, validated once
-per call by :meth:`OptionsDetKcp.check`.  No field is read from the environment;
+entry points is a keyword-only field of :class:`CakeGDNDetKcpOptions`, validated once
+per call by :meth:`CakeGDNDetKcpOptions.check`.  No field is read from the environment;
 the package reads ``os.environ`` nowhere.
 
 Public fields (defaults are the shipped behaviour)::
@@ -202,8 +202,8 @@ def validate_ring(n_d_max: int) -> None:
 
 
 @dataclasses.dataclass(kw_only=True)
-class OptionsDetKcp:
-    """The keyword-only options of ``chunk_gdn_det_kcp`` / ``chunk_gdn_det_fwd_kcp`` / ``chunk_gdn_det_bwd_kcp`` (module docstring).
+class CakeGDNDetKcpOptions:
+    """The keyword-only options of ``cake_gdn_det_kcp`` / ``cake_gdn_det_train_kcp_forward`` / ``cake_gdn_det_train_kcp_backward`` (module docstring).
 
     :meth:`check` validates the field values and the cross-field rules (ring needs ``save_transfer=False``;
     ``reuse_recompute_tapes`` needs ``graph="off"``; ``use_qk_l2norm_in_kernel`` a bool; a
@@ -240,7 +240,7 @@ class OptionsDetKcp:
                 REUSE_RECOMPUTE_TAPES_DEFAULT if self.graph == GRAPH_DEFAULT else False
             )
 
-    def check(self) -> OptionsDetKcp:
+    def check(self) -> CakeGDNDetKcpOptions:
         if self.exchange not in EXCHANGES:
             raise ValueError(
                 f"exchange must be one of {EXCHANGES}, got {self.exchange!r}"
@@ -379,13 +379,13 @@ class OptionsDetKcp:
         )
 
 
-OPTION_NAMES = tuple(f.name for f in dataclasses.fields(OptionsDetKcp))
+OPTION_NAMES = tuple(f.name for f in dataclasses.fields(CakeGDNDetKcpOptions))
 
 
-def make_options(options: Any = None, /, **kwargs: Any) -> OptionsDetKcp:
-    """A validated :class:`OptionsDetKcp` from an instance, a mapping, or keyword arguments (unknown names are a
+def make_options(options: Any = None, /, **kwargs: Any) -> CakeGDNDetKcpOptions:
+    """A validated :class:`CakeGDNDetKcpOptions` from an instance, a mapping, or keyword arguments (unknown names are a
     ``TypeError``: no option is ever read from anywhere but the call)."""
-    if isinstance(options, OptionsDetKcp):
+    if isinstance(options, CakeGDNDetKcpOptions):
         if kwargs:
             options = dataclasses.replace(options, **kwargs)
         return options.check()
@@ -393,7 +393,7 @@ def make_options(options: Any = None, /, **kwargs: Any) -> OptionsDetKcp:
     if options is not None:
         if not isinstance(options, dict):
             raise TypeError(
-                f"options must be a OptionsDetKcp, a dict or None, got {type(options).__name__}"
+                f"options must be a CakeGDNDetKcpOptions, a dict or None, got {type(options).__name__}"
             )
         merged.update(options)
     merged.update(kwargs)
@@ -402,7 +402,7 @@ def make_options(options: Any = None, /, **kwargs: Any) -> OptionsDetKcp:
         raise TypeError(
             f"unexpected option(s) {unknown}; known options: {list(OPTION_NAMES)}"
         )
-    return OptionsDetKcp(**merged).check()
+    return CakeGDNDetKcpOptions(**merged).check()
 
 
 __all__ = [
@@ -442,7 +442,7 @@ __all__ = [
     "TRANSFER_WALKS_UNBUILT",
     "TRANSFER_WALK_DEFAULT",
     "USE_QK_L2NORM_DEFAULT",
-    "OptionsDetKcp",
+    "CakeGDNDetKcpOptions",
     "make_options",
     "validate_heads",
     "validate_ring",

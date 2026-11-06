@@ -33,7 +33,7 @@ library from ``aot/`` (``cake_build.load_library``).
 Test-only programs (``build.test.json``, the same ``cake-build/1`` form) are
 reachable through :func:`load_test` alone.  Nothing here reads an environment
 variable: a test selects a test-only record through the keyword-only test
-knobs of the public call (``OptionsDetKcp(test_knobs=...)``), which the
+knobs of the public call (``CakeGDNDetKcpOptions(test_knobs=...)``), which the
 orchestration module validates and maps onto a ``TEST_MODULES`` record.
 
 Launches go through :func:`run_module`: the record maps its kernel

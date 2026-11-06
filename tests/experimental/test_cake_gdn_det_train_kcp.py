@@ -142,7 +142,7 @@ def _ragged_fragments(
 
 
 def _partition_inputs(row: dict) -> dict:
-    """The ``partition_det_kcp`` call of a row JSON (layout C / Z / D / R)."""
+    """The ``cake_gdn_det_train_kcp_partition`` call of a row JSON (layout C / Z / D / R)."""
     cu = torch.tensor(row["cu_seqlens"], dtype=torch.int64)
     W = int(row["cp"])
     if row["layout"] == "R":
@@ -249,7 +249,7 @@ def test_plan_parity_with_kda_on_rows(path, monkeypatch) -> None:
     step-0 row (partition, every rank's context and head plan at ``H := HV``), except the b1 buffer with maps
     (``B1_DM_FIELDS`` and its split / table keys, checked here for tile coverage and offset range instead), and
     reproduces the row's recorded fragment table.  Result 2: ``n_in`` / ``n_out`` / ``max_chain_fragments`` and the
-    exchange bytes of ``gdn_det_comm_bytes_kcp`` equal the row JSON.  Both modules plan under the per-rank rule they
+    exchange bytes of ``cake_gdn_det_train_kcp_comm_bytes`` equal the row JSON.  Both modules plan under the per-rank rule they
     share, ``"wave_fill1"`` (the GDN default is the row rule, the KDA default its own tie rule; each is selected
     explicitly here: the keyword-only ``p_rule`` on the GDN side, the private test hook on the KDA side)."""
     kp = importlib.import_module(
@@ -262,7 +262,7 @@ def test_plan_parity_with_kda_on_rows(path, monkeypatch) -> None:
     H_qk, HV = (int(x) for x in row["heads"])
     W = int(row["cp"])
     args = _partition_inputs(row)
-    part = gp.partition_det_kcp(**args)
+    part = gp.cake_gdn_det_train_kcp_partition(**args)
     kpart = kp.partition_det_kcp(**args)
     assert part.to_dict() == kpart.to_dict(), "partition differs from the KDA module"
     assert _plain(part.to_dict()["fragments"]) == row["fragments"], (
@@ -281,7 +281,7 @@ def test_plan_parity_with_kda_on_rows(path, monkeypatch) -> None:
         kda_bytes = None
     per_rank, records = [], []
     for r in range(W):
-        ctx = gp.build_context_det_kcp(
+        ctx = gp.cake_gdn_det_train_kcp_build_context(
             part, None, r, CPU, 4, sm_count=SM_COUNT, p_rule="wave_fill1"
         )  # the per-rank rule both modules share; the GDN default "row_cost" is tested on the rows below
         kctx = kp.build_context_det_kcp(
@@ -314,7 +314,7 @@ def test_plan_parity_with_kda_on_rows(path, monkeypatch) -> None:
         assert len(hp.b1_m_tile_dm) == hp.n_io_by_rank[r] == n_io
         assert all(0 <= o < hp.numel["b1_recv_dm"] for o in hp.adj_d_off_dm)
         assert all(o == -1 or 0 <= o < hp.numel["b1_recv_dm"] for o in hp.adj_m_off_b1)
-        cb = gb.gdn_det_comm_bytes_kcp(ctx, H_qk=H_qk, HV=HV, C=C_CONV)
+        cb = gb.cake_gdn_det_train_kcp_comm_bytes(ctx, H_qk=H_qk, HV=HV, C=C_CONV)
         entry = {
             "rank": r,
             "n_in": ctx.n_in,
@@ -365,12 +365,14 @@ def test_tables_on_rows(path) -> None:
         row = json.load(fh)
     HV = int(row["heads"][1])
     W = int(row["cp"])
-    part = gp.partition_det_kcp(**_partition_inputs(row))
+    part = gp.cake_gdn_det_train_kcp_partition(**_partition_inputs(row))
     chains = part.chains()
     multi = [c for c in chains if len(c) >= 2]
     summary = []
     for r in range(W):
-        ctx = gp.build_context_det_kcp(part, None, r, CPU, 4, sm_count=SM_COUNT)
+        ctx = gp.cake_gdn_det_train_kcp_build_context(
+            part, None, r, CPU, 4, sm_count=SM_COUNT
+        )
         hp = ctx.heads(HV)
         lt, wt = gt.local_tables(ctx), gt.walk_tables(ctx, HV)
         assert (
@@ -482,7 +484,9 @@ def _small_partition(W: int, lengths=(300, 70, 1000, 5), layout="contiguous"):
     cu = [0]
     for n in lengths:
         cu.append(cu[-1] + n)
-    return gp.partition_det_kcp(torch.tensor(cu, dtype=torch.int64), W, layout)
+    return gp.cake_gdn_det_train_kcp_partition(
+        torch.tensor(cu, dtype=torch.int64), W, layout
+    )
 
 
 @pytest.mark.parametrize("HV,W", OWNERSHIP, ids=[f"HV{h}-W{w}" for h, w in OWNERSHIP])
@@ -512,7 +516,9 @@ def test_owner_table(HV, W) -> None:
         )
     part = _small_partition(W, layout="zigzag")
     ctxs = [
-        gp.build_context_det_kcp(part, None, r, CPU, 4, sm_count=SM_COUNT)
+        gp.cake_gdn_det_train_kcp_build_context(
+            part, None, r, CPU, 4, sm_count=SM_COUNT
+        )
         for r in range(W)
     ]
     for r, ctx in enumerate(ctxs):
@@ -528,7 +534,7 @@ def test_owner_table(HV, W) -> None:
             sum(hp.splits["c1_send"])
             == ctx.n_out * ot["n_owners"] * Hg * gp.SUMMARY_TILE
         )
-        cb = gb.gdn_det_comm_bytes_kcp(ctx, H_qk=1, HV=HV, C=C_CONV)
+        cb = gb.cake_gdn_det_train_kcp_comm_bytes(ctx, H_qk=1, HV=HV, C=C_CONV)
         assert (
             cb["padding"]["padded_owner"] == ot["padded_owner"]
             and cb["padding"]["pad_tiles_per_slot"] == ot["pad_tiles"]
@@ -597,11 +603,15 @@ def test_context_is_a_leaf_for_input_walks(monkeypatch) -> None:
     for n_docs, W in ((2, 8), (64, 8), (64, 16)):
         lengths = [4000] * n_docs
         cu = torch.tensor([0, *itertools.accumulate(lengths)], dtype=torch.int64)
-        part = gp.partition_det_kcp(cu, W, fragments=_zigzag_fragments(lengths, W))
-        ctx = gp.build_context_det_kcp(part, None, 0, CPU, 4, sm_count=SM_COUNT)
+        part = gp.cake_gdn_det_train_kcp_partition(
+            cu, W, fragments=_zigzag_fragments(lengths, W)
+        )
+        ctx = gp.cake_gdn_det_train_kcp_build_context(
+            part, None, 0, CPU, 4, sm_count=SM_COUNT
+        )
         ctx.prepare(1, 48)
-        single = gp.build_context_det_kcp(
-            gp.partition_det_kcp(cu, 1, "contiguous"),
+        single = gp.cake_gdn_det_train_kcp_build_context(
+            gp.cake_gdn_det_train_kcp_partition(cu, 1, "contiguous"),
             None,
             0,
             CPU,
@@ -622,16 +632,22 @@ def test_context_is_a_leaf_for_input_walks(monkeypatch) -> None:
         ctx.rank = 1
     with pytest.raises(dataclasses.FrozenInstanceError):
         del ctx.T_r
-    clone = gp.ContextDetKcp(**{f: getattr(ctx, f) for f in gp.ContextDetKcp._FIELDS})
+    clone = gp.CakeGDNDetKcpContext(
+        **{f: getattr(ctx, f) for f in gp.CakeGDNDetKcpContext._FIELDS}
+    )
     assert clone != ctx and clone == clone and hash(clone) != hash(ctx)
-    assert all(getattr(clone, f) is getattr(ctx, f) for f in gp.ContextDetKcp._FIELDS)
-    assert gp.ContextDetKcp._FIELDS[-4:] == (
+    assert all(
+        getattr(clone, f) is getattr(ctx, f) for f in gp.CakeGDNDetKcpContext._FIELDS
+    )
+    assert gp.CakeGDNDetKcpContext._FIELDS[-4:] == (
         "p_rule",
         "sequence",
         "_head_plans",
         "_caches",
     )
-    fresh = gp.ContextDetKcp(*(getattr(ctx, f) for f in gp.ContextDetKcp._FIELDS[:-4]))
+    fresh = gp.CakeGDNDetKcpContext(
+        *(getattr(ctx, f) for f in gp.CakeGDNDetKcpContext._FIELDS[:-4])
+    )
     assert (
         fresh.p_rule == gp.P_RULE_DEFAULT
         and fresh._head_plans == {}
@@ -642,14 +658,14 @@ def test_context_is_a_leaf_for_input_walks(monkeypatch) -> None:
         and fresh.sequence is not ctx.sequence
     )
     assert (
-        gp.ContextDetKcp(
-            *(getattr(ctx, f) for f in gp.ContextDetKcp._FIELDS[:-3]), None
+        gp.CakeGDNDetKcpContext(
+            *(getattr(ctx, f) for f in gp.CakeGDNDetKcpContext._FIELDS[:-3]), None
         ).sequence
         is None
     )
     text = repr(ctx)
     assert (
-        text.startswith("ContextDetKcp(partition=")
+        text.startswith("CakeGDNDetKcpContext(partition=")
         and f"p_rule={ctx.p_rule!r})" in text
     )
     assert "sequence=" not in text and "_caches" not in text
@@ -657,12 +673,14 @@ def test_context_is_a_leaf_for_input_walks(monkeypatch) -> None:
 
 def test_prepare_tables_first_use() -> None:
     """``ctx.prepare(H_qk, HV)`` builds the device-resident bundle once per ``(HV, sm_count, P)``
-    key at first use (``build_context_det_kcp`` builds no head-dependent table; the second call returns the same
+    key at first use (``cake_gdn_det_train_kcp_build_context`` builds no head-dependent table; the second call returns the same
     object; a ``P`` override gets its own key and plan), rejects ``HV % H_qk != 0`` and an out-of-range ``P``, and
     every table dtype is int32 except the merge's int64 element offsets."""
     cu = torch.tensor([0, 100, 740, 817, 1817, 1946], dtype=torch.int64)  # C1
-    part = gp.partition_det_kcp(cu, 2, "contiguous")
-    ctx = gp.build_context_det_kcp(part, None, 1, CPU, 4, sm_count=SM_COUNT)
+    part = gp.cake_gdn_det_train_kcp_partition(cu, 2, "contiguous")
+    ctx = gp.cake_gdn_det_train_kcp_build_context(
+        part, None, 1, CPU, 4, sm_count=SM_COUNT
+    )
     assert ctx._head_plans == {} and not ctx._caches
     pt = ctx.prepare(2, 6)
     assert pt is ctx.prepare(2, 6) and pt.key == (6, SM_COUNT, pt.P) and pt.H_qk == 2
@@ -704,11 +722,13 @@ def test_prepare_tables_first_use() -> None:
 def test_zero_token_rank_and_small_fragments() -> None:
     """C4b-like explicit table (a rank with 0 tokens) and C5-like 63 / 64 / 65-token fragments: tables and pools."""
     cu = torch.tensor([0, 1700, 3000], dtype=torch.int64)
-    part = gp.partition_det_kcp(
+    part = gp.cake_gdn_det_train_kcp_partition(
         cu, 4, fragments=_ragged_fragments([0, 1700, 3000], [1200, 0, 900, 900])
     )
     ctxs = [
-        gp.build_context_det_kcp(part, None, r, CPU, 4, sm_count=SM_COUNT)
+        gp.cake_gdn_det_train_kcp_build_context(
+            part, None, r, CPU, 4, sm_count=SM_COUNT
+        )
         for r in range(4)
     ]
     assert ctxs[1].T_r == 0 and ctxs[1].n_frag == 0 and gt.local_tables(ctxs[1]).NC == 0
@@ -718,15 +738,17 @@ def test_zero_token_rank_and_small_fragments() -> None:
         wt1.chains["fwd"].n_chains == 2 * wt1.Hg_r
     )  # two document chains of 2 fragments (ranks 0 -> 2, 2 -> 3)
     cu5 = torch.tensor([0, 63 + 64 + 65 + 500], dtype=torch.int64)
-    part5 = gp.partition_det_kcp(
+    part5 = gp.cake_gdn_det_train_kcp_partition(
         cu5, 4, fragments=_ragged_fragments([0, 692], [63, 64, 65, 500])
     )
     for r, want in enumerate((1, 1, 2, 8)):
-        ctx = gp.build_context_det_kcp(part5, None, r, CPU, 4, sm_count=SM_COUNT)
+        ctx = gp.cake_gdn_det_train_kcp_build_context(
+            part5, None, r, CPU, 4, sm_count=SM_COUNT
+        )
         lt = gt.local_tables(ctx)
         assert want == lt.NC and lt.chunk_len[0] == min(64, ctx.T_r)
     with pytest.raises(ValueError, match="p_rule"):
-        gp.build_context_det_kcp(
+        gp.cake_gdn_det_train_kcp_build_context(
             part5, None, 0, CPU, 4, sm_count=SM_COUNT, p_rule="nope"
         )
 
@@ -830,7 +852,7 @@ def test_row_cost_rule_on_rows_of_record(path) -> None:
         row = json.load(fh)
     HV = int(row["heads"][1])
     W = int(row["cp"])
-    part = gp.partition_det_kcp(**_partition_inputs(row))
+    part = gp.cake_gdn_det_train_kcp_partition(**_partition_inputs(row))
     tables = gp.row_tables(part)
     assert len(tables) == W and all(
         len(t) == len(frs) for t, frs in zip(tables, part.fragments, strict=True)
@@ -855,7 +877,7 @@ def test_row_cost_rule_on_rows_of_record(path) -> None:
         seg.p_rule == "row_cost" and seg.n_frag * seg.P == seg.NSEG for seg in plans
     )
     for r in range(W):
-        ctx = gp.build_context_det_kcp(
+        ctx = gp.cake_gdn_det_train_kcp_build_context(
             part, None, r, CPU, 4, sm_count=SM_COUNT, p_rule="row_cost"
         )
         hp = ctx.heads(HV)
@@ -863,7 +885,7 @@ def test_row_cost_rule_on_rows_of_record(path) -> None:
         assert (got[r], plans[r].NSEG) == (hp.P, hp.segments.NSEG)
         # only the segment program differs from the per-rank plan: partition, fragment table, local tables and
         # crossing lists are the same object graph values
-        ref = gp.build_context_det_kcp(
+        ref = gp.cake_gdn_det_train_kcp_build_context(
             part, None, r, CPU, 4, sm_count=SM_COUNT, p_rule="wave_fill1"
         )
         assert ctx.partition.to_dict() == ref.partition.to_dict() == part.to_dict()
@@ -909,7 +931,7 @@ def test_row_cost_lpt_rule_on_rows_of_record(path) -> None:
         row = json.load(fh)
     HV = int(row["heads"][1])
     W = int(row["cp"])
-    part = gp.partition_det_kcp(**_partition_inputs(row))
+    part = gp.cake_gdn_det_train_kcp_partition(**_partition_inputs(row))
     tables = gp.row_tables(part)
     base = gp.kcp_plan_row(tables, HV, SM_COUNT, p_rule="row_cost")
     plans = gp.kcp_plan_row(tables, HV, SM_COUNT, p_rule="row_cost_lpt")
@@ -924,17 +946,19 @@ def test_row_cost_lpt_rule_on_rows_of_record(path) -> None:
     )
     assert all(new.P == 1 for old, new in zip(base, plans, strict=True) if old.P == 1)
     for r in range(W):
-        ctx = gp.build_context_det_kcp(
+        ctx = gp.cake_gdn_det_train_kcp_build_context(
             part, None, r, CPU, 4, sm_count=SM_COUNT, p_rule="row_cost_lpt"
         )
         hp = ctx.heads(HV)
         assert ctx.p_rule == "row_cost_lpt" == hp.segments.p_rule
         assert (got[r], plans[r].NSEG) == (hp.P, hp.segments.NSEG)
-        dflt = gp.build_context_det_kcp(part, None, r, CPU, 4, sm_count=SM_COUNT)
+        dflt = gp.cake_gdn_det_train_kcp_build_context(
+            part, None, r, CPU, 4, sm_count=SM_COUNT
+        )
         assert dflt.p_rule == gp.P_RULE_DEFAULT == "small_one"
         dhp = dflt.heads(HV)
         assert (dhp.P, dhp.segments.NSEG) == (hp.P, hp.segments.NSEG)
-        ref = gp.build_context_det_kcp(
+        ref = gp.cake_gdn_det_train_kcp_build_context(
             part, None, r, CPU, 4, sm_count=SM_COUNT, p_rule="row_cost"
         )
         assert ctx.partition.to_dict() == ref.partition.to_dict() == part.to_dict()
@@ -1017,7 +1041,7 @@ def test_row_cost_rule_is_the_default_and_the_per_rank_rules_stay_selectable() -
     # contexts: the "row_cost_lpt" rule on every rank gives the row's vector, the default ("small_one": HV = 6, fragments
     # of <= 160 chunks) plans P = 1; the selectable row rule and a per-rank rule are honoured when asked for
     cu = torch.tensor([0, 100, 740, 817, 1817, 1946], dtype=torch.int64)
-    part = gp.partition_det_kcp(cu, 2, "contiguous")
+    part = gp.cake_gdn_det_train_kcp_partition(cu, 2, "contiguous")
     want = tuple(
         seg.P
         for seg in gp.kcp_plan_row(
@@ -1029,20 +1053,22 @@ def test_row_cost_rule_is_the_default_and_the_per_rank_rules_stay_selectable() -
         for seg in gp.kcp_plan_row(gp.row_tables(part), 6, SM_COUNT, p_rule="row_cost")
     )
     for r in range(2):
-        ctx = gp.build_context_det_kcp(
+        ctx = gp.cake_gdn_det_train_kcp_build_context(
             part, None, r, CPU, 4, sm_count=SM_COUNT, p_rule="row_cost_lpt"
         )
         assert ctx.p_rule == "row_cost_lpt" and want[r] == ctx.heads(6).P
         assert ctx.heads(6).segments.p_rule == "row_cost_lpt"
-        dflt = gp.build_context_det_kcp(part, None, r, CPU, 4, sm_count=SM_COUNT)
+        dflt = gp.cake_gdn_det_train_kcp_build_context(
+            part, None, r, CPU, 4, sm_count=SM_COUNT
+        )
         assert dflt.p_rule == "small_one" == dflt.heads(6).segments.p_rule
         assert dflt.heads(6).P == 1
-        old = gp.build_context_det_kcp(
+        old = gp.cake_gdn_det_train_kcp_build_context(
             part, None, r, CPU, 4, sm_count=SM_COUNT, p_rule="row_cost"
         )
         assert old.p_rule == "row_cost" and want_old[r] == old.heads(6).P
         assert old.heads(6).segments.p_rule == "row_cost"
-        occ = gp.build_context_det_kcp(
+        occ = gp.cake_gdn_det_train_kcp_build_context(
             part, None, r, CPU, 4, sm_count=SM_COUNT, p_rule="occ"
         )
         seg = occ.heads(6).segments
@@ -1153,22 +1179,24 @@ def test_opt_in_row_rules_give_every_rank_the_same_plan(rule) -> None:
     )
     changed = 0
     for cu, W, layout, HV in cases:
-        part = gp.partition_det_kcp(torch.tensor(cu, dtype=torch.int64), W, layout)
+        part = gp.cake_gdn_det_train_kcp_partition(
+            torch.tensor(cu, dtype=torch.int64), W, layout
+        )
         row = gp.kcp_plan_row(gp.row_tables(part), HV, SM_COUNT, p_rule=rule)
         ship = gp.kcp_plan_row(gp.row_tables(part), HV, SM_COUNT, p_rule="row_cost_lpt")
         changed += int(tuple(s.P for s in row) != tuple(s.P for s in ship))
         for r in range(W):
-            ctx = gp.build_context_det_kcp(
+            ctx = gp.cake_gdn_det_train_kcp_build_context(
                 part, None, r, CPU, 4, sm_count=SM_COUNT, p_rule=rule
             )
-            again = gp.build_context_det_kcp(
+            again = gp.cake_gdn_det_train_kcp_build_context(
                 part, None, r, CPU, 4, sm_count=SM_COUNT, p_rule=rule
             )
             hp = ctx.heads(HV)
             assert ctx.p_rule == rule == hp.segments.p_rule
             assert (hp.P, hp.segments.NSEG) == (row[r].P, row[r].NSEG)
             assert _sha(_context_record(ctx, HV)) == _sha(_context_record(again, HV))
-            ref = gp.build_context_det_kcp(
+            ref = gp.cake_gdn_det_train_kcp_build_context(
                 part, None, r, CPU, 4, sm_count=SM_COUNT, p_rule="row_cost_lpt"
             )
             assert ref.p_rule == "row_cost_lpt"
@@ -1193,7 +1221,7 @@ def test_opt_in_row_rules_keep_the_rows_of_record(path) -> None:
     with open(path) as fh:
         row = json.load(fh)
     HV = int(row["heads"][1])
-    part = gp.partition_det_kcp(**_partition_inputs(row))
+    part = gp.cake_gdn_det_train_kcp_partition(**_partition_inputs(row))
     tables = gp.row_tables(part)
     for sm in (SM_COUNT, 148):
         ship = gp.kcp_plan_row(tables, HV, sm, p_rule="row_cost_lpt")
@@ -1277,18 +1305,20 @@ def test_byte_queries(W) -> None:
     ``save_transfer`` on / off; the exchange terms depend on ``HV`` only, ``H_qk`` enters through the default
     channel count; the validators reject ``HV % H_qk != 0``."""
     cu = torch.tensor([0, 100, 740, 817, 1817, 1946], dtype=torch.int64)  # C1
-    part = gp.partition_det_kcp(cu, W, "contiguous")
+    part = gp.cake_gdn_det_train_kcp_partition(cu, W, "contiguous")
     H_qk, HV = 2, 6
     s = HV * gp.STATE_TILE_BYTES
     records = []
     b1_sums = {"design": 0, "buffers": 0}
     for r in range(W):
-        ctx = gp.build_context_det_kcp(part, None, r, CPU, 4, sm_count=SM_COUNT)
+        ctx = gp.cake_gdn_det_train_kcp_build_context(
+            part, None, r, CPU, 4, sm_count=SM_COUNT
+        )
         hp = ctx.heads(HV)
-        cb = gb.gdn_det_comm_bytes_kcp(ctx, H_qk=H_qk, HV=HV, C=C_CONV)
+        cb = gb.cake_gdn_det_train_kcp_comm_bytes(ctx, H_qk=H_qk, HV=HV, C=C_CONV)
         assert (
             cb["C"] == C_CONV
-            and gb.gdn_det_comm_bytes_kcp(ctx, H_qk=16, HV=48)["C"]
+            and gb.cake_gdn_det_train_kcp_comm_bytes(ctx, H_qk=16, HV=48)["C"]
             == (2 * 16 + 48) * 128
         )
         assert (
@@ -1316,7 +1346,7 @@ def test_byte_queries(W) -> None:
             + cb["b2"]["send"]
             + cb["halo_bwd"]["send"]
         )
-        maps = gb.gdn_det_comm_bytes_kcp(
+        maps = gb.cake_gdn_det_train_kcp_comm_bytes(
             ctx, H_qk=H_qk, HV=HV, C=C_CONV, save_transfer=False
         )
         s_owner = hp.Hg_r * gp.STATE_TILE_BYTES
@@ -1359,19 +1389,19 @@ def test_byte_queries(W) -> None:
         }
         b1_sums["design"] += maps["b1_design"]["send"]
         b1_sums["buffers"] += maps["b1"]["send"]
-        replay = gb.gdn_det_comm_bytes_kcp(
+        replay = gb.cake_gdn_det_train_kcp_comm_bytes(
             ctx, H_qk=H_qk, HV=HV, C=C_CONV, save_transfer=False, boundary_mode="replay"
         )
         assert replay["b1"] == cb["b1_replay"]
         # the exchange terms are HV-only: H_qk = 1, 2, 3, 6 give the same c1 / c2 / b1 / b2
         for hq in (1, 3, 6):
-            other = gb.gdn_det_comm_bytes_kcp(ctx, H_qk=hq, HV=HV, C=C_CONV)
+            other = gb.cake_gdn_det_train_kcp_comm_bytes(ctx, H_qk=hq, HV=HV, C=C_CONV)
             assert all(other[k] == cb[k] for k in ("c1", "c2", "b1", "b2"))
         planes = 0  # kept-form rows that hand the M_seg^T plane over
         for save_mode in gb.SAVE_MODES:
             for boundary_mode in gb.BOUNDARY_MODES:
                 for save_transfer in (True, False):
-                    got = gb.gdn_det_saved_bytes_kcp(
+                    got = gb.cake_gdn_det_train_kcp_saved_bytes(
                         ctx,
                         H_qk=H_qk,
                         HV=HV,
@@ -1384,7 +1414,7 @@ def test_byte_queries(W) -> None:
                         ctx, H_qk, HV, save_mode, boundary_mode, save_transfer, C_CONV
                     )
                     assert got == want, (r, save_mode, boundary_mode, save_transfer)
-                    layout = gb.gdn_det_saved_layout_kcp(
+                    layout = gb.cake_gdn_det_train_kcp_saved_layout(
                         ctx,
                         H_qk=H_qk,
                         HV=HV,
@@ -1396,7 +1426,7 @@ def test_byte_queries(W) -> None:
                     assert sum(layout.values()) == got and all(
                         v >= 0 for v in layout.values()
                     )
-                    ws = gb.gdn_det_workspace_layout_kcp(
+                    ws = gb.cake_gdn_det_train_kcp_workspace_layout(
                         ctx,
                         H_qk=H_qk,
                         HV=HV,
@@ -1408,7 +1438,7 @@ def test_byte_queries(W) -> None:
                     assert (
                         ws["workspace"]
                         == max(ws["forward"], ws["backward"])
-                        == gb.gdn_det_workspace_bytes_kcp(
+                        == gb.cake_gdn_det_train_kcp_workspace_bytes(
                             ctx,
                             H_qk=H_qk,
                             HV=HV,
@@ -1455,7 +1485,7 @@ def test_byte_queries(W) -> None:
                     light_saved = save_mode == "light" and boundary_mode == "saved"
                     for P_q in (None, 2):
                         kept_ws, replay_ws = (
-                            gb.gdn_det_workspace_layout_kcp(
+                            gb.cake_gdn_det_train_kcp_workspace_layout(
                                 ctx,
                                 H_qk=H_qk,
                                 HV=HV,
@@ -1548,13 +1578,15 @@ def test_byte_queries(W) -> None:
                         )
         assert planes > 0  # the P = 2 kept-form rows without save_transfer
         light, full = (
-            gb.gdn_det_saved_bytes_kcp(ctx, H_qk=H_qk, HV=HV, save_mode=m, C=C_CONV)
+            gb.cake_gdn_det_train_kcp_saved_bytes(
+                ctx, H_qk=H_qk, HV=HV, save_mode=m, C=C_CONV
+            )
             for m in ("light", "full")
         )
         assert full - light == ctx.NC_pad * HV * (32768 + 4) + ctx.R * HV * (
             3 * 256 + 2 * 128 + 3 * 4
         )  # h + gamma, v_new / w / u, Aqk / Akk, gcum / rowscale / qscale
-        host = gb.gdn_det_workspace_layout_kcp(
+        host = gb.cake_gdn_det_train_kcp_workspace_layout(
             ctx, H_qk=H_qk, HV=HV, group_reduce="host", C=C_CONV
         )
         assert host["bwd.group_partials"] == 2 * ctx.T_r * HV * 128 * 4
@@ -1568,17 +1600,17 @@ def test_byte_queries(W) -> None:
                 "B3": cb["B3"],
                 "saved_light": light,
                 "saved_full": full,
-                "workspace_light": gb.gdn_det_workspace_bytes_kcp(
+                "workspace_light": gb.cake_gdn_det_train_kcp_workspace_bytes(
                     ctx, H_qk=H_qk, HV=HV, C=C_CONV
                 ),
             }
         )
     with pytest.raises(ValueError, match="multiple"):
-        gb.gdn_det_comm_bytes_kcp(ctx, H_qk=4, HV=6)
+        gb.cake_gdn_det_train_kcp_comm_bytes(ctx, H_qk=4, HV=6)
     with pytest.raises(ValueError, match="save_mode"):
-        gb.gdn_det_saved_bytes_kcp(ctx, H_qk=2, HV=6, save_mode="tape")
+        gb.cake_gdn_det_train_kcp_saved_bytes(ctx, H_qk=2, HV=6, save_mode="tape")
     with pytest.raises(ValueError, match="boundary_mode"):
-        gb.gdn_det_saved_bytes_kcp(ctx, H_qk=2, HV=6, boundary_mode="none")
+        gb.cake_gdn_det_train_kcp_saved_bytes(ctx, H_qk=2, HV=6, boundary_mode="none")
     assert b1_sums["design"] == b1_sums["buffers"]  # same bytes over the group
 
     _evidence(
@@ -1614,11 +1646,13 @@ def test_b1_map_plane_index_on_a_middle_fragment(HV) -> None:
     query (``b1 == b1_design``, padding included).  ``HV = 4``: ``Hg = 2``, owners ``(2, 2, 0)``; ``HV = 5``: owners
     ``(2, 2, 1)``, owner 2 padded by one tile per slot."""
     W = 3
-    part = gp.partition_det_kcp(
+    part = gp.cake_gdn_det_train_kcp_partition(
         torch.tensor(B1_MAP_CU, dtype=torch.int64), W, fragments=B1_MAP_FRAGMENTS
     )
     ctxs = [
-        gp.build_context_det_kcp(part, None, r, CPU, 4, sm_count=SM_COUNT)
+        gp.cake_gdn_det_train_kcp_build_context(
+            part, None, r, CPU, 4, sm_count=SM_COUNT
+        )
         for r in range(W)
     ]
     hps = [ctx.heads(HV) for ctx in ctxs]
@@ -1674,7 +1708,7 @@ def test_b1_map_plane_index_on_a_middle_fragment(HV) -> None:
         )
         assert hp.adj_m_off_b1[2] - sum(hp.b1_splits(True)[1][:1]) == sent, o
     for r, (ctx, hp) in enumerate(zip(ctxs, hps, strict=True)):
-        maps = gb.gdn_det_comm_bytes_kcp(
+        maps = gb.cake_gdn_det_train_kcp_comm_bytes(
             ctx, H_qk=1, HV=HV, C=C_CONV, save_transfer=False
         )
         b1_send, b1_recv = hp.b1_splits(True)
@@ -1961,7 +1995,9 @@ def test_fake_backend_matches_fp64_reference(layout) -> None:
     light / full."""
     H_qk, HV = 2, 6
     cu = FAKE_CU
-    part = gp.partition_det_kcp(torch.tensor(cu, dtype=torch.int64), 2, layout)
+    part = gp.cake_gdn_det_train_kcp_partition(
+        torch.tensor(cu, dtype=torch.int64), 2, layout
+    )
     assert sum(part.crossing_counts()[0]) >= 1  # the row crosses a rank boundary
     ops = _inputs(cu, H_qk, HV)
     res = fake.emulate(part, ops, H_qk=H_qk, HV=HV)
@@ -2013,7 +2049,9 @@ def test_fake_backend_matches_fp64_reference(layout) -> None:
     )
     # the no-CP form (one rank) agrees with the reference too and documents the local error floor
     single = fake.emulate(
-        gp.partition_det_kcp(torch.tensor(cu, dtype=torch.int64), 1, "contiguous"),
+        gp.cake_gdn_det_train_kcp_partition(
+            torch.tensor(cu, dtype=torch.int64), 1, "contiguous"
+        ),
         ops,
         H_qk=H_qk,
         HV=HV,
@@ -2052,7 +2090,9 @@ def test_fake_backend_fragment_state_matches_reference() -> None:
     summaries (the merge's inputs)."""
     H_qk, HV = 2, 6
     cu = FAKE_CU
-    part = gp.partition_det_kcp(torch.tensor(cu, dtype=torch.int64), 2, "zigzag")
+    part = gp.cake_gdn_det_train_kcp_partition(
+        torch.tensor(cu, dtype=torch.int64), 2, "zigzag"
+    )
     ops = _inputs(cu, H_qk, HV)
     ranks = fake.build_ranks(
         part, [fake.slice_local(ops, part, r) for r in range(2)], H_qk=H_qk, HV=HV
@@ -2116,8 +2156,10 @@ def test_dhu_offset_walk_defers_the_dh_tape_to_the_first_tape_walk() -> None:
     kcp = _package("cake_kcp")
     cu = [0, 100, 740, 817, 1817, 1946]
     H_qk, HV = 2, 6
-    part = gp.partition_det_kcp(torch.tensor(cu, dtype=torch.int64), 1, "contiguous")
-    ctx = gp.build_context_det_kcp(part, None, 0, CPU)
+    part = gp.cake_gdn_det_train_kcp_partition(
+        torch.tensor(cu, dtype=torch.int64), 1, "contiguous"
+    )
+    ctx = gp.cake_gdn_det_train_kcp_build_context(part, None, 0, CPU)
     ops = _inputs(cu, H_qk, HV)
     seen: list[tuple[str, bool, bool]] = []
 
@@ -2138,7 +2180,7 @@ def test_dhu_offset_walk_defers_the_dh_tape_to_the_first_tape_walk() -> None:
     previous = kcp._BACKENDS.get("fake")
     kcp._BACKENDS["fake"] = Recording()
     try:
-        out, saved = kcp.chunk_gdn_det_fwd_kcp(
+        out, saved = kcp.cake_gdn_det_train_kcp_forward(
             ops["q"],
             ops["k"],
             ops["v"],
@@ -2148,7 +2190,7 @@ def test_dhu_offset_walk_defers_the_dh_tape_to_the_first_tape_walk() -> None:
             backend="fake",
             segments=2,
         )
-        grads = kcp.chunk_gdn_det_bwd_kcp(
+        grads = kcp.cake_gdn_det_train_kcp_backward(
             ops["q"],
             ops["k"],
             ops["v"],
@@ -2202,8 +2244,10 @@ def test_fwdh_offset_walk_defers_its_tapes_to_the_first_tape_walk(fused_o: int) 
     kcp = _package("cake_kcp")
     cu = [0, 100, 740, 817, 1817, 1946]
     H_qk, HV = 2, 6
-    part = gp.partition_det_kcp(torch.tensor(cu, dtype=torch.int64), 1, "contiguous")
-    ctx = gp.build_context_det_kcp(part, None, 0, CPU)
+    part = gp.cake_gdn_det_train_kcp_partition(
+        torch.tensor(cu, dtype=torch.int64), 1, "contiguous"
+    )
+    ctx = gp.cake_gdn_det_train_kcp_build_context(part, None, 0, CPU)
     ops = _inputs(cu, H_qk, HV)
     seen: list[tuple[str, bool, int, bool, bool]] = []
 
@@ -2231,7 +2275,7 @@ def test_fwdh_offset_walk_defers_its_tapes_to_the_first_tape_walk(fused_o: int) 
     previous = kcp._BACKENDS.get("fake")
     kcp._BACKENDS["fake"] = Recording()
     try:
-        out, saved = kcp.chunk_gdn_det_fwd_kcp(
+        out, saved = kcp.cake_gdn_det_train_kcp_forward(
             ops["q"],
             ops["k"],
             ops["v"],
@@ -2242,7 +2286,7 @@ def test_fwdh_offset_walk_defers_its_tapes_to_the_first_tape_walk(fused_o: int) 
             segments=2,
             test_knobs={"fused_o": fused_o},
         )
-        grads = kcp.chunk_gdn_det_bwd_kcp(
+        grads = kcp.cake_gdn_det_train_kcp_backward(
             ops["q"],
             ops["k"],
             ops["v"],
@@ -2324,10 +2368,12 @@ def test_persistent_programs_receive_the_workspace_ticket_slots() -> None:
     kcp = _package("cake_kcp")
     cu = [0, 100, 740, 817, 1817, 1946]
     H_qk, HV = 2, 6
-    part = gp.partition_det_kcp(torch.tensor(cu, dtype=torch.int64), 1, "contiguous")
-    ctx = gp.build_context_det_kcp(part, None, 0, CPU, sm_count=SM_COUNT)
+    part = gp.cake_gdn_det_train_kcp_partition(
+        torch.tensor(cu, dtype=torch.int64), 1, "contiguous"
+    )
+    ctx = gp.cake_gdn_det_train_kcp_build_context(part, None, 0, CPU, sm_count=SM_COUNT)
     ops = _inputs(cu, H_qk, HV)
-    ws = kcp.WorkspaceDetKcp()
+    ws = kcp.CakeGDNDetKcpWorkspace()
     seen: list[tuple[str, int, bool, bool]] = []
     walks: list[tuple[str, int, str, tuple[int, int, int]]] = []
 
@@ -2355,7 +2401,7 @@ def test_persistent_programs_receive_the_workspace_ticket_slots() -> None:
     previous = kcp._BACKENDS.get("fake")
     kcp._BACKENDS["fake"] = Recording()
     try:
-        out, saved = kcp.chunk_gdn_det_fwd_kcp(
+        out, saved = kcp.cake_gdn_det_train_kcp_forward(
             ops["q"],
             ops["k"],
             ops["v"],
@@ -2368,11 +2414,11 @@ def test_persistent_programs_receive_the_workspace_ticket_slots() -> None:
             test_knobs={"fused_o": 0},
         )
         bwd = dict(saved=saved, backend="fake", segments=2, workspace=ws)
-        grads = kcp.chunk_gdn_det_bwd_kcp(
+        grads = kcp.cake_gdn_det_train_kcp_backward(
             ops["q"], ops["k"], ops["v"], ops["g"], ops["beta"], ctx, ops["dout"], **bwd
         )
         n_rule = len(walks)
-        grads2 = kcp.chunk_gdn_det_bwd_kcp(
+        grads2 = kcp.cake_gdn_det_train_kcp_backward(
             ops["q"],
             ops["k"],
             ops["v"],
@@ -2440,8 +2486,10 @@ def test_dead_pools_are_not_sized_for_the_call() -> None:
     kcp = _package("cake_kcp")
     cu = [0, 100, 740, 817, 1817, 1946]
     H_qk, HV = 2, 6
-    part = gp.partition_det_kcp(torch.tensor(cu, dtype=torch.int64), 1, "contiguous")
-    ctx = gp.build_context_det_kcp(part, None, 0, CPU)
+    part = gp.cake_gdn_det_train_kcp_partition(
+        torch.tensor(cu, dtype=torch.int64), 1, "contiguous"
+    )
+    ctx = gp.cake_gdn_det_train_kcp_build_context(part, None, 0, CPU)
     ops = _inputs(cu, H_qk, HV)
     assert set(kcp.RING_POOLS) == {"ring_out", "ring_in"}
     assert set(kcp.SAVE_TRANSFER_FRESH_POOLS) == {"c1_recv", "stage_m"}
@@ -2450,11 +2498,11 @@ def test_dead_pools_are_not_sized_for_the_call() -> None:
     ) <= set(kcp.BWD_DEAD_BEFORE_TAPES)
     dead = set(kcp.RING_POOLS) | set(kcp.SAVE_TRANSFER_FRESH_POOLS)
     # the full workspace of the public constructor sizes every pool (the caller-held form)
-    full = kcp.WorkspaceDetKcp(ctx, H_qk, HV, device="cpu", backward=True)
+    full = kcp.CakeGDNDetKcpWorkspace(ctx, H_qk, HV, device="cpu", backward=True)
     assert dead <= set(full._pools)
     # a2a + save_transfer (shipped defaults): the dead pools are absent after the forward and after the backward
-    ws = kcp.WorkspaceDetKcp()
-    out, saved = kcp.chunk_gdn_det_fwd_kcp(
+    ws = kcp.CakeGDNDetKcpWorkspace()
+    out, saved = kcp.cake_gdn_det_train_kcp_forward(
         ops["q"],
         ops["k"],
         ops["v"],
@@ -2472,7 +2520,7 @@ def test_dead_pools_are_not_sized_for_the_call() -> None:
         "c1_send" not in ws._pools
     )  # released right after wait(c1) in the eager forward
     assert "eye" in ws._pools
-    grads = kcp.chunk_gdn_det_bwd_kcp(
+    grads = kcp.cake_gdn_det_train_kcp_backward(
         ops["q"],
         ops["k"],
         ops["v"],
@@ -2488,7 +2536,7 @@ def test_dead_pools_are_not_sized_for_the_call() -> None:
     assert all(torch.isfinite(g.float()).all() for g in grads)
     assert not (dead & set(ws._pools)), sorted(dead & set(ws._pools))
     # the same call without the caller workspace records the same absence (per-call workspace)
-    kcp.chunk_gdn_det_fwd_kcp(
+    kcp.cake_gdn_det_train_kcp_forward(
         ops["q"],
         ops["k"],
         ops["v"],
@@ -2500,8 +2548,8 @@ def test_dead_pools_are_not_sized_for_the_call() -> None:
     )
     assert not (dead & set(kcp.LAST_CALL["fwd"]["pool_bytes"]))
     # a replay backward (saved=None) binds no saved tensor: c1_recv / stage_m are sized, the ring pools are not
-    ws2 = kcp.WorkspaceDetKcp()
-    kcp.chunk_gdn_det_bwd_kcp(
+    ws2 = kcp.CakeGDNDetKcpWorkspace()
+    kcp.cake_gdn_det_train_kcp_backward(
         ops["q"],
         ops["k"],
         ops["v"],
@@ -2534,7 +2582,7 @@ def test_dead_pools_are_not_sized_for_the_call() -> None:
     previous = kcp._BACKENDS.get("fake")
     kcp._BACKENDS["fake"] = Recording()
     try:
-        kcp.chunk_gdn_det_fwd_kcp(
+        kcp.cake_gdn_det_train_kcp_forward(
             ops["q"],
             ops["k"],
             ops["v"],
@@ -2545,7 +2593,7 @@ def test_dead_pools_are_not_sized_for_the_call() -> None:
             segments=2,
         )
         seen_pools.append(None)  # type: ignore[arg-type]
-        kcp.chunk_gdn_det_fwd_kcp(
+        kcp.cake_gdn_det_train_kcp_forward(
             ops["q"],
             ops["k"],
             ops["v"],
@@ -2570,7 +2618,7 @@ def test_dead_pools_are_not_sized_for_the_call() -> None:
         ring_pools
     )
     # ensure(skip=...) semantics on a bare workspace
-    ws4 = kcp.WorkspaceDetKcp()
+    ws4 = kcp.CakeGDNDetKcpWorkspace()
     tb = ws4.ensure(ctx, H_qk, HV, device="cpu", backward=True, skip=kcp.RING_POOLS)
     assert not (set(kcp.RING_POOLS) & set(ws4._pools)) and "c1_send" in ws4._pools
     assert set(tb.pool_sizes(True)) >= set(
@@ -2592,7 +2640,7 @@ def _other_mode_twin(cls, name: str):
 
 
 def test_backward_refuses_a_saved_set_or_workspace_of_the_other_mode() -> None:
-    """The package backward reads the deterministic forward's ``SavedDetKcp`` and a caller-held ``WorkspaceDetKcp``
+    """The package backward reads the deterministic forward's ``CakeGDNDetKcpSaved`` and a caller-held ``CakeGDNDetKcpWorkspace``
     only.  A saved set of the other mode with every field of this forward's saved set (same version, same context,
     same problem: it passes every field check of ``_check_saved``) and a workspace of the other mode are refused with
     ``ValueError`` naming the deterministic mode and the expected type, as is any other object; the real saved set
@@ -2600,36 +2648,40 @@ def test_backward_refuses_a_saved_set_or_workspace_of_the_other_mode() -> None:
     kcp = _package("cake_kcp")
     cu = [0, 100, 740, 817]
     H_qk, HV = 2, 6
-    part = gp.partition_det_kcp(torch.tensor(cu, dtype=torch.int64), 1, "contiguous")
-    ctx = gp.build_context_det_kcp(part, None, 0, CPU)
+    part = gp.cake_gdn_det_train_kcp_partition(
+        torch.tensor(cu, dtype=torch.int64), 1, "contiguous"
+    )
+    ctx = gp.cake_gdn_det_train_kcp_build_context(part, None, 0, CPU)
     ops = _inputs(cu, H_qk, HV)
     args = [ops[n] for n in ("q", "k", "v", "g", "beta")]
-    ws = kcp.WorkspaceDetKcp()
-    _, saved = kcp.chunk_gdn_det_fwd_kcp(
+    ws = kcp.CakeGDNDetKcpWorkspace()
+    _, saved = kcp.cake_gdn_det_train_kcp_forward(
         *args, ctx, backend="fake", segments=2, workspace=ws
     )
-    assert type(saved) is kcp.SavedDetKcp
-    saved_twin = _other_mode_twin(kcp.SavedDetKcp, "SavedKcp")(
+    assert type(saved) is kcp.CakeGDNDetKcpSaved
+    saved_twin = _other_mode_twin(kcp.CakeGDNDetKcpSaved, "SavedKcp")(
         **{f.name: getattr(saved, f.name) for f in dataclasses.fields(saved) if f.init}
     )
     assert dataclasses.fields(saved_twin) == dataclasses.fields(saved)
     assert saved_twin.version == saved.version and saved_twin.ctx is ctx
-    ws_twin = object.__new__(_other_mode_twin(kcp.WorkspaceDetKcp, "WorkspaceKcp"))
-    vars(ws_twin).update(vars(kcp.WorkspaceDetKcp()))
+    ws_twin = object.__new__(
+        _other_mode_twin(kcp.CakeGDNDetKcpWorkspace, "WorkspaceKcp")
+    )
+    vars(ws_twin).update(vars(kcp.CakeGDNDetKcpWorkspace()))
     for name, kw, expected in (
-        ("saved", {"saved": saved_twin}, "SavedDetKcp"),
-        ("saved", {"saved": object(), "workspace": ws}, "SavedDetKcp"),
-        ("workspace", {"saved": saved, "workspace": ws_twin}, "WorkspaceDetKcp"),
-        ("workspace", {"workspace": object()}, "WorkspaceDetKcp"),
+        ("saved", {"saved": saved_twin}, "CakeGDNDetKcpSaved"),
+        ("saved", {"saved": object(), "workspace": ws}, "CakeGDNDetKcpSaved"),
+        ("workspace", {"saved": saved, "workspace": ws_twin}, "CakeGDNDetKcpWorkspace"),
+        ("workspace", {"workspace": object()}, "CakeGDNDetKcpWorkspace"),
     ):
         with pytest.raises(
             ValueError,
-            match=rf"chunk_gdn_det_bwd_kcp: {name} must be a {expected} of the deterministic mode",
+            match=rf"cake_gdn_det_train_kcp_backward: {name} must be a {expected} of the deterministic mode",
         ):
-            kcp.chunk_gdn_det_bwd_kcp(
+            kcp.cake_gdn_det_train_kcp_backward(
                 *args, ctx, ops["dout"], backend="fake", segments=2, **kw
             )
-    grads = kcp.chunk_gdn_det_bwd_kcp(
+    grads = kcp.cake_gdn_det_train_kcp_backward(
         *args, ctx, ops["dout"], saved=saved, backend="fake", segments=2, workspace=ws
     )
     assert all(torch.isfinite(g.float()).all() for g in grads)
@@ -2645,10 +2697,12 @@ def test_eager_forward_sizes_c2_send_at_its_first_writer(monkeypatch) -> None:
     kcp = _package("cake_kcp")
     cu = [0, 100, 740, 817, 1817, 1946]
     H_qk, HV = 2, 6
-    part = gp.partition_det_kcp(torch.tensor(cu, dtype=torch.int64), 1, "contiguous")
-    ctx = gp.build_context_det_kcp(part, None, 0, CPU)
+    part = gp.cake_gdn_det_train_kcp_partition(
+        torch.tensor(cu, dtype=torch.int64), 1, "contiguous"
+    )
+    ctx = gp.cake_gdn_det_train_kcp_build_context(part, None, 0, CPU)
     ops = _inputs(cu, H_qk, HV)
-    ws = kcp.WorkspaceDetKcp()
+    ws = kcp.CakeGDNDetKcpWorkspace()
     at_summaries: list[set[str]] = []
     summaries = kcp._summaries
 
@@ -2657,7 +2711,7 @@ def test_eager_forward_sizes_c2_send_at_its_first_writer(monkeypatch) -> None:
         summaries(call)
 
     monkeypatch.setattr(kcp, "_summaries", recording_summaries)
-    out, saved = kcp.chunk_gdn_det_fwd_kcp(
+    out, saved = kcp.cake_gdn_det_train_kcp_forward(
         ops["q"],
         ops["k"],
         ops["v"],
@@ -2678,9 +2732,9 @@ def test_eager_forward_sizes_c2_send_at_its_first_writer(monkeypatch) -> None:
     )  # the saved set stays bound
     # neither receive plane exists at the summaries moment
     assert at_summaries and all(seen == set() for seen in at_summaries)
-    full = kcp.WorkspaceDetKcp(ctx, H_qk, HV, device="cpu", backward=False)
+    full = kcp.CakeGDNDetKcpWorkspace(ctx, H_qk, HV, device="cpu", backward=False)
     assert "c2_send" in full._pools
-    out2, saved2 = kcp.chunk_gdn_det_fwd_kcp(
+    out2, saved2 = kcp.cake_gdn_det_train_kcp_forward(
         ops["q"],
         ops["k"],
         ops["v"],
@@ -2698,32 +2752,34 @@ def test_eager_forward_sizes_c2_send_at_its_first_writer(monkeypatch) -> None:
 
 
 def test_backward_forgets_its_own_saved_set_at_the_last_reader() -> None:
-    """A caller-owned saved set is never mutated by ``chunk_gdn_det_bwd_kcp`` (two backwards from it are bitwise equal and
+    """A caller-owned saved set is never mutated by ``cake_gdn_det_train_kcp_backward`` (two backwards from it are bitwise equal and
     its tensors stay); a set marked ``release_in_backward`` (the autograd Function's own) comes back with ``S_in``,
     ``c1_recv`` and ``M_seg`` forgotten, with the same gradients bitwise; the per-call buffers of a replay backward
     (``saved=None``) are dropped the same way."""
     kcp = _package("cake_kcp")
     cu = [0, 100, 740, 817, 1817, 1946]
     H_qk, HV = 2, 6
-    part = gp.partition_det_kcp(torch.tensor(cu, dtype=torch.int64), 1, "contiguous")
-    ctx = gp.build_context_det_kcp(part, None, 0, CPU)
+    part = gp.cake_gdn_det_train_kcp_partition(
+        torch.tensor(cu, dtype=torch.int64), 1, "contiguous"
+    )
+    ctx = gp.cake_gdn_det_train_kcp_build_context(part, None, 0, CPU)
     ops = _inputs(cu, H_qk, HV)
     args = (ops["q"], ops["k"], ops["v"], ops["g"], ops["beta"], ctx)
-    _, saved = kcp.chunk_gdn_det_fwd_kcp(*args, backend="fake", segments=2)
+    _, saved = kcp.cake_gdn_det_train_kcp_forward(*args, backend="fake", segments=2)
     assert saved is not None and saved.c1_recv is not None and saved.M_seg is not None
     assert saved.release_in_backward is False
-    g1 = kcp.chunk_gdn_det_bwd_kcp(
+    g1 = kcp.cake_gdn_det_train_kcp_backward(
         *args, ops["dout"], saved=saved, backend="fake", segments=2
     )
     assert (
         saved.S_in is not None and saved.c1_recv is not None and saved.M_seg is not None
     )
-    g2 = kcp.chunk_gdn_det_bwd_kcp(
+    g2 = kcp.cake_gdn_det_train_kcp_backward(
         *args, ops["dout"], saved=saved, backend="fake", segments=2
     )
     assert all(torch.equal(a, b) for a, b in zip(g1, g2, strict=True))
     owned = dataclasses.replace(saved, release_in_backward=True)
-    g3 = kcp.chunk_gdn_det_bwd_kcp(
+    g3 = kcp.cake_gdn_det_train_kcp_backward(
         *args, ops["dout"], saved=owned, backend="fake", segments=2
     )
     assert all(torch.equal(a, b) for a, b in zip(g1, g3, strict=True))
@@ -2736,7 +2792,7 @@ def test_backward_forgets_its_own_saved_set_at_the_last_reader() -> None:
     )
     with pytest.raises(KeyError):
         owned.forget("tapes")
-    g4 = kcp.chunk_gdn_det_bwd_kcp(
+    g4 = kcp.cake_gdn_det_train_kcp_backward(
         *args,
         ops["dout"],
         saved=None,
@@ -2763,10 +2819,12 @@ def test_saved_byte_query_counts_the_whole_m_seg_plane(
     kcp = _package("cake_kcp")
     cu = [0, 100, 740, 817, 1817, 1946]
     H_qk, HV = 2, 6
-    part = gp.partition_det_kcp(torch.tensor(cu, dtype=torch.int64), 1, "contiguous")
-    ctx = gp.build_context_det_kcp(part, None, 0, CPU)
+    part = gp.cake_gdn_det_train_kcp_partition(
+        torch.tensor(cu, dtype=torch.int64), 1, "contiguous"
+    )
+    ctx = gp.cake_gdn_det_train_kcp_build_context(part, None, 0, CPU)
     ops = _inputs(cu, H_qk, HV)
-    _, saved = kcp.chunk_gdn_det_fwd_kcp(
+    _, saved = kcp.cake_gdn_det_train_kcp_forward(
         ops["q"],
         ops["k"],
         ops["v"],
@@ -2788,10 +2846,10 @@ def test_saved_byte_query_counts_the_whole_m_seg_plane(
         "save_transfer": save_transfer,
         "P": P,
     }
-    assert gb.gdn_det_saved_layout_kcp(ctx, **q)["M_seg"] == plane
+    assert gb.cake_gdn_det_train_kcp_saved_layout(ctx, **q)["M_seg"] == plane
 
 
-# README saved-set table row (by its item cell's start) -> the gdn_det_saved_layout_kcp terms it states
+# README saved-set table row (by its item cell's start) -> the cake_gdn_det_train_kcp_saved_layout terms it states
 README_SAVED_ROWS = {
     "inputs ": (),
     "`S_in`": ("S_in",),
@@ -2819,7 +2877,7 @@ FULL_TAPE_TERMS = (
 
 
 def test_readme_saved_set_table_matches_the_saved_layout() -> None:
-    """The README's saved-set table states what ``gdn_det_saved_layout_kcp`` counts: every layout term sits in one
+    """The README's saved-set table states what ``cake_gdn_det_train_kcp_saved_layout`` counts: every layout term sits in one
     row; a ``yes`` column is a nonzero term on some rank (under ``save_transfer`` and without it, unless the row is
     conditional on ``save_transfer=True``), a ``**no**`` column a zero term on every rank; the ``M_seg`` row's light
     column holds under ``save_transfer=True`` only (two ranks, a crossing fragment, ``P = 2``, the in-kernel norm
@@ -2845,13 +2903,17 @@ def test_readme_saved_set_table_matches_the_saved_layout() -> None:
     assert set(rows) == set(README_SAVED_ROWS) and len(table) == len(rows)
     cu = [0, 100, 740, 817, 1817, 1946]
     H_qk, HV = 2, 6
-    part = gp.partition_det_kcp(torch.tensor(cu, dtype=torch.int64), 2, "contiguous")
-    ctxs = [gp.build_context_det_kcp(part, None, r, CPU) for r in range(2)]
+    part = gp.cake_gdn_det_train_kcp_partition(
+        torch.tensor(cu, dtype=torch.int64), 2, "contiguous"
+    )
+    ctxs = [
+        gp.cake_gdn_det_train_kcp_build_context(part, None, r, CPU) for r in range(2)
+    ]
     assert sum(c.n_in for c in ctxs) > 0  # a crossing fragment: S_in / hist terms exist
 
     def terms(save_mode: str, save_transfer: bool) -> list[dict[str, int]]:
         return [
-            gb.gdn_det_saved_layout_kcp(
+            gb.cake_gdn_det_train_kcp_saved_layout(
                 c,
                 H_qk=H_qk,
                 HV=HV,
@@ -2880,12 +2942,14 @@ def test_readme_saved_set_table_matches_the_saved_layout() -> None:
                     assert any(t[k] > 0 for t in on), (item, mode, k)
                     assert all(t[k] == 0 for t in off), (item, mode, k)
     # the per-token figures: the layout's bytes per padded token row (R = 64 NC_pad rows) at (16, 48)
-    part = gp.partition_det_kcp(
+    part = gp.cake_gdn_det_train_kcp_partition(
         torch.tensor([0, 4096], dtype=torch.int64), 1, "contiguous"
     )
-    ctx = gp.build_context_det_kcp(part, None, 0, CPU)
+    ctx = gp.cake_gdn_det_train_kcp_build_context(part, None, 0, CPU)
     assert 64 * ctx.NC_pad == ctx.R
-    lay = gb.gdn_det_saved_layout_kcp(ctx, H_qk=16, HV=48, save_mode="full", P=1)
+    lay = gb.cake_gdn_det_train_kcp_saved_layout(
+        ctx, H_qk=16, HV=48, save_mode="full", P=1
+    )
     n_per_token = 0
     for prefix, (item, _, bytes_cell) in rows.items():
         if bytes_cell.endswith("B per token"):
@@ -2906,10 +2970,12 @@ def test_readme_saved_set_table_matches_the_saved_layout() -> None:
     # a padded owner (HV = 48 on five ranks: Hg = 10, five owners, the last holds 8 heads and 2 padding tiles): S_in
     # is n_in s_pad (s_pad = n_owners s_owner, above s) and every owner receives 2 s_owner per crossing-out fragment
     # of the group
-    part5 = gp.partition_det_kcp(
+    part5 = gp.cake_gdn_det_train_kcp_partition(
         torch.tensor([0, 4096], dtype=torch.int64), 5, "contiguous"
     )
-    ctxs5 = [gp.build_context_det_kcp(part5, None, r, CPU) for r in range(5)]
+    ctxs5 = [
+        gp.cake_gdn_det_train_kcp_build_context(part5, None, r, CPU) for r in range(5)
+    ]
     assert all(c.N_out > 0 for c in ctxs5) and any(c.n_in > 0 for c in ctxs5)
     for c in ctxs5:
         hp = c.heads(48)
@@ -2917,19 +2983,21 @@ def test_readme_saved_set_table_matches_the_saved_layout() -> None:
         s_owner = hp.Hg * gp.STATE_TILE_BYTES
         s_pad = hp.n_owners * s_owner
         assert s_pad == (48 + 2) * gp.STATE_TILE_BYTES
-        lay5 = gb.gdn_det_saved_layout_kcp(c, H_qk=16, HV=48, save_transfer=True)
+        lay5 = gb.cake_gdn_det_train_kcp_saved_layout(
+            c, H_qk=16, HV=48, save_transfer=True
+        )
         assert lay5["S_in"] == c.n_in * s_pad, (c.rank, lay5)
         assert lay5["c1_recv"] == 2 * s_owner * c.N_out, (c.rank, lay5)
     for c in ctxs:
         s = 6 * gp.STATE_TILE_BYTES
-        lay2 = gb.gdn_det_saved_layout_kcp(
+        lay2 = gb.cake_gdn_det_train_kcp_saved_layout(
             c, H_qk=H_qk, HV=HV, P=2, use_qk_l2norm_in_kernel=True
         )
         assert lay2["qk_rstd"] == 8 * c.T_r * H_qk
         assert lay2["M_seg"] == 2 * c.n_frag * s and lay2["S_in"] == c.n_in * s
         # the replay boundary keeps no boundary state, M_seg, tape or qk_rstd (only the convolution rows remain)
         for save_mode in ("light", "full"):
-            rep = gb.gdn_det_saved_layout_kcp(
+            rep = gb.cake_gdn_det_train_kcp_saved_layout(
                 c,
                 H_qk=H_qk,
                 HV=HV,
@@ -2981,8 +3049,10 @@ def test_full_backward_without_save_transfer_reads_no_unwritten_plane(
     _nan_filled_allocations(monkeypatch, kcp)
     cu = [0, 100, 740, 817, 1817, 1946]
     H_qk, HV = 2, 6
-    part = gp.partition_det_kcp(torch.tensor(cu, dtype=torch.int64), 1, "contiguous")
-    ctx = gp.build_context_det_kcp(part, None, 0, CPU)
+    part = gp.cake_gdn_det_train_kcp_partition(
+        torch.tensor(cu, dtype=torch.int64), 1, "contiguous"
+    )
+    ctx = gp.cake_gdn_det_train_kcp_build_context(part, None, 0, CPU)
     ops = _inputs(cu, H_qk, HV)
     base = {
         "segments": 2,
@@ -2990,12 +3060,12 @@ def test_full_backward_without_save_transfer_reads_no_unwritten_plane(
         "use_qk_l2norm_in_kernel": use_qk_l2norm_in_kernel,
     }
     args = (ops["q"], ops["k"], ops["v"], ops["g"], ops["beta"], ctx)
-    _, saved = kcp.chunk_gdn_det_fwd_kcp(
+    _, saved = kcp.cake_gdn_det_train_kcp_forward(
         *args, backend="fake", save_mode="full", **base
     )
     assert saved is not None and saved.P == 2 and saved.c1_recv is None
     assert saved.M_seg is not None and torch.isfinite(saved.M_seg).all()
-    m_seg_bytes = gb.gdn_det_saved_layout_kcp(
+    m_seg_bytes = gb.cake_gdn_det_train_kcp_saved_layout(
         ctx,
         H_qk=H_qk,
         HV=HV,
@@ -3009,7 +3079,7 @@ def test_full_backward_without_save_transfer_reads_no_unwritten_plane(
     assert m_seg_bytes == saved.M_seg.numel() * saved.M_seg.element_size()
     # an older full saved set without M_seg would read an unwritten plane: refused
     with pytest.raises(ValueError, match="needs M_seg"):
-        kcp.chunk_gdn_det_bwd_kcp(
+        kcp.cake_gdn_det_train_kcp_backward(
             *args,
             ops["dout"],
             saved=dataclasses.replace(saved, M_seg=None),
@@ -3020,10 +3090,10 @@ def test_full_backward_without_save_transfer_reads_no_unwritten_plane(
     light = _ckpt_autograd(kcp, ctx, ops, ckpt=False, **base)
     for n, t in light.items():
         assert torch.isfinite(t.float()).all(), ("light", n)
-    shared = kcp.WorkspaceDetKcp()
+    shared = kcp.CakeGDNDetKcpWorkspace()
     arms = (
         (None, False),
-        (kcp.WorkspaceDetKcp(), False),
+        (kcp.CakeGDNDetKcpWorkspace(), False),
         (shared, False),
         (shared, False),
         (None, True),
@@ -3065,17 +3135,17 @@ def test_transpose_tiles_scratch_is_bitwise_the_temporary_form() -> None:
         scratch[3 * TILE :]
     ).all()  # the scratch beyond the gathered tiles is untouched
     # the call-level form passes the carry plane as scratch only when it has room; nothing when there is no tile
-    assert "scratch" in kcp.CallDetKcp.transpose_tiles.__kwdefaults__
+    assert "scratch" in kcp.CakeGDNDetKcpCall.transpose_tiles.__kwdefaults__
 
 
 def test_workspace_layout_counts_one_staging_plane_under_save_transfer() -> None:
-    """R2-L1 1a: ``gdn_det_workspace_layout_kcp`` counts the ``stage_m`` plane only when the call sizes it (the replay
+    """R2-L1 1a: ``cake_gdn_det_train_kcp_workspace_layout`` counts the ``stage_m`` plane only when the call sizes it (the replay
     boundary, or the light saved form without ``save_transfer``); when the saved set carries ``M_seg`` -- the shipped
     saved + ``save_transfer`` form and ``save_mode="full"`` with either ``save_transfer`` -- the saved ``M_seg^T``
     stands in for it and the workspace holds ``stage_b`` alone (the ring pools are never workspace terms).  The full
     form without ``save_transfer`` is also checked against the pools a call at ``P = 2`` actually sizes."""
     cu = torch.tensor([0, 100, 740, 817, 1817, 1946], dtype=torch.int64)
-    part = gp.partition_det_kcp(cu, 2, "contiguous")
+    part = gp.cake_gdn_det_train_kcp_partition(cu, 2, "contiguous")
     H_qk, HV = 2, 6
     seen_segmented = False
     # Under the shipped row rule ("small_one" here; "row_cost_lpt" too) this row plans P = 1 on both ranks ("row_cost" plans P = 1 there -- fragments of 2-14
@@ -3083,13 +3153,15 @@ def test_workspace_layout_counts_one_staging_plane_under_save_transfer() -> None
     # segment them 7- and 13-fold to fill the SMs, and the compose chain of those segments costs more than the one-wave
     # walks they save), so the staging plane is 0; the plane term is exercised under the per-rank rule below.
     for r in range(2):
-        ctx_row = gp.build_context_det_kcp(part, None, r, CPU, 4, sm_count=SM_COUNT)
+        ctx_row = gp.cake_gdn_det_train_kcp_build_context(
+            part, None, r, CPU, 4, sm_count=SM_COUNT
+        )
         hp_row = ctx_row.heads(HV)
         assert hp_row.segments.p_rule == gp.P_RULE_DEFAULT and hp_row.P == 1
-        one_row = gb.gdn_det_workspace_layout_kcp(ctx_row, H_qk=H_qk, HV=HV)
+        one_row = gb.cake_gdn_det_train_kcp_workspace_layout(ctx_row, H_qk=H_qk, HV=HV)
         assert one_row["fwd.staging"] == one_row["bwd.staging"] == 0
     for r in range(2):
-        ctx = gp.build_context_det_kcp(
+        ctx = gp.cake_gdn_det_train_kcp_build_context(
             part, None, r, CPU, 4, sm_count=SM_COUNT, p_rule="wave_fill1"
         )
         hp = ctx.heads(
@@ -3097,14 +3169,14 @@ def test_workspace_layout_counts_one_staging_plane_under_save_transfer() -> None
         )  # the layout's staging term uses the plan's own segment count
         plane = hp.NSEG * HV * gp.STATE_TILE_BYTES if hp.P > 1 else 0
         seen_segmented = seen_segmented or hp.P > 1
-        one = gb.gdn_det_workspace_layout_kcp(ctx, H_qk=H_qk, HV=HV)
-        two_a = gb.gdn_det_workspace_layout_kcp(
+        one = gb.cake_gdn_det_train_kcp_workspace_layout(ctx, H_qk=H_qk, HV=HV)
+        two_a = gb.cake_gdn_det_train_kcp_workspace_layout(
             ctx, H_qk=H_qk, HV=HV, boundary_mode="replay"
         )
-        two_b = gb.gdn_det_workspace_layout_kcp(
+        two_b = gb.cake_gdn_det_train_kcp_workspace_layout(
             ctx, H_qk=H_qk, HV=HV, save_transfer=False
         )
-        full_no_st = gb.gdn_det_workspace_layout_kcp(
+        full_no_st = gb.cake_gdn_det_train_kcp_workspace_layout(
             ctx, H_qk=H_qk, HV=HV, save_mode="full", save_transfer=False
         )
         assert one["fwd.staging"] == one["bwd.staging"] == plane
@@ -3114,7 +3186,9 @@ def test_workspace_layout_counts_one_staging_plane_under_save_transfer() -> None
         assert one["fwd.c1_recv"] == 0 and two_b["fwd.c1_recv"] > 0
         assert not any(k.endswith("ring_out") or k.endswith("ring_in") for k in one)
         assert (
-            gb.gdn_det_workspace_layout_kcp(ctx, H_qk=H_qk, HV=HV, P=1)["fwd.staging"]
+            gb.cake_gdn_det_train_kcp_workspace_layout(ctx, H_qk=H_qk, HV=HV, P=1)[
+                "fwd.staging"
+            ]
             == 0
         )
     assert seen_segmented  # the row has a segmented rank: the plane term was exercised
@@ -3123,8 +3197,10 @@ def test_workspace_layout_counts_one_staging_plane_under_save_transfer() -> None
     # context's own plan is P = 2 (the layout's staging term reads the plan's NSEG).
     kcp = _package("cake_kcp")
     cu2 = [0, 2000, 4096]
-    part2 = gp.partition_det_kcp(torch.tensor(cu2, dtype=torch.int64), 1, "contiguous")
-    ctx2 = gp.build_context_det_kcp(
+    part2 = gp.cake_gdn_det_train_kcp_partition(
+        torch.tensor(cu2, dtype=torch.int64), 1, "contiguous"
+    )
+    ctx2 = gp.cake_gdn_det_train_kcp_build_context(
         part2, None, 0, CPU, 4, sm_count=16, p_rule="wave_fill1"
     )
     assert ctx2.heads(HV).P == 2
@@ -3147,9 +3223,9 @@ def test_workspace_layout_counts_one_staging_plane_under_save_transfer() -> None
     previous = kcp._BACKENDS.get("fake")
     kcp._BACKENDS["fake"] = Recording()
     try:
-        _, saved = kcp.chunk_gdn_det_fwd_kcp(*args, **opts)
+        _, saved = kcp.cake_gdn_det_train_kcp_forward(*args, **opts)
         phase[0] = "bwd"
-        kcp.chunk_gdn_det_bwd_kcp(*args, ops["dout"], saved=saved, **opts)
+        kcp.cake_gdn_det_train_kcp_backward(*args, ops["dout"], saved=saved, **opts)
     finally:
         if previous is None:
             kcp._BACKENDS.pop("fake", None)
@@ -3159,7 +3235,7 @@ def test_workspace_layout_counts_one_staging_plane_under_save_transfer() -> None
     assert saved is not None and saved.M_seg is not None
     assert saved.M_seg.numel() * saved.M_seg.element_size() == plane2
     assert held["fwd"] == held["bwd"] == {"stage_b": plane2}, held
-    full2 = gb.gdn_det_workspace_layout_kcp(
+    full2 = gb.cake_gdn_det_train_kcp_workspace_layout(
         ctx2, H_qk=H_qk, HV=HV, save_mode="full", save_transfer=False, P=2
     )
     assert full2["fwd.staging"] == full2["bwd.staging"] == plane2
@@ -3184,9 +3260,9 @@ def _held_pools(kcp, ctx, ops, *, pools=("stage_b", "stage_m", "carry"), **opts)
     args = (ops["q"], ops["k"], ops["v"], ops["g"], ops["beta"], ctx)
     previous = kcp.set_backend("fake", Recording())
     try:
-        _, saved = kcp.chunk_gdn_det_fwd_kcp(*args, backend="fake", **opts)
+        _, saved = kcp.cake_gdn_det_train_kcp_forward(*args, backend="fake", **opts)
         phase[0] = "bwd"
-        kcp.chunk_gdn_det_bwd_kcp(
+        kcp.cake_gdn_det_train_kcp_backward(
             *args,
             ops["dout"],
             saved=saved,
@@ -3209,12 +3285,12 @@ def _held_pools(kcp, ctx, ops, *, pools=("stage_b", "stage_m", "carry"), **opts)
     ],
 )
 def test_workspace_layout_follows_the_segments_override(opts, planes) -> None:
-    """``gdn_det_workspace_layout_kcp(P=...)`` reports the planes of a call at that ``segments`` override: on the
+    """``cake_gdn_det_train_kcp_workspace_layout(P=...)`` reports the planes of a call at that ``segments`` override: on the
     checkpoint pack (one rank, five fragments, the plan's own ``P = 1``) a call with ``segments=2`` holds staging
     planes of ``NSEG = 2 n_frag`` states and a carry plane of ``n_frag`` states in both lifetimes, and the layout at
     ``P = 2`` counts the same bytes in every save form (it read the staging plane from the plan's ``NSEG``, half the
     call's here).  An override outside the range the call accepts is refused by both byte queries, as by
-    ``ContextDetKcp.heads``."""
+    ``CakeGDNDetKcpContext.heads``."""
     kcp, ctx, ops = _ckpt_setup()
     H_qk, HV = CKPT_HEADS
     assert ctx.heads(HV).P == 1 and ctx.n_frag == 5
@@ -3223,7 +3299,9 @@ def test_workspace_layout_follows_the_segments_override(opts, planes) -> None:
     assert plane == 3_932_160
     held, _ = _held_pools(kcp, ctx, ops, segments=2, **opts)
     assert kcp.LAST_CALL["fwd"]["P"] == kcp.LAST_CALL["bwd"]["P"] == 2
-    layout = gb.gdn_det_workspace_layout_kcp(ctx, H_qk=H_qk, HV=HV, P=2, **opts)
+    layout = gb.cake_gdn_det_train_kcp_workspace_layout(
+        ctx, H_qk=H_qk, HV=HV, P=2, **opts
+    )
     for phase in ("fwd", "bwd"):
         staging = held[phase].get("stage_b", 0) + held[phase].get("stage_m", 0)
         assert staging == planes * plane == layout[f"{phase}.staging"], (
@@ -3236,16 +3314,21 @@ def test_workspace_layout_follows_the_segments_override(opts, planes) -> None:
             held,
             layout[f"{phase}.carry"],
         )
-    rule = gb.gdn_det_workspace_layout_kcp(ctx, H_qk=H_qk, HV=HV, **opts)
+    rule = gb.cake_gdn_det_train_kcp_workspace_layout(ctx, H_qk=H_qk, HV=HV, **opts)
     assert rule["fwd.staging"] == rule["fwd.carry"] == 0  # the plan's P = 1
     # the range the call accepts: [1, min(MAX_SEGMENTS, chunks of the longest fragment)] = [1, 16] (1000 tokens)
     for P in (0, 17):
-        for query in (gb.gdn_det_workspace_layout_kcp, gb.gdn_det_saved_layout_kcp):
+        for query in (
+            gb.cake_gdn_det_train_kcp_workspace_layout,
+            gb.cake_gdn_det_train_kcp_saved_layout,
+        ):
             with pytest.raises(ValueError, match=r"override must be in \[1, 16\]"):
                 query(ctx, H_qk=H_qk, HV=HV, P=P, **opts)
         with pytest.raises(ValueError, match=r"override must be in \[1, 16\]"):
             ctx.heads(HV, P=P)
-    top = gb.gdn_det_workspace_layout_kcp(ctx, H_qk=H_qk, HV=HV, P=16, **opts)
+    top = gb.cake_gdn_det_train_kcp_workspace_layout(
+        ctx, H_qk=H_qk, HV=HV, P=16, **opts
+    )
     assert top["fwd.staging"] == planes * 16 * ctx.n_frag * s
 
 
@@ -3256,8 +3339,10 @@ def test_backward_allocates_the_gradients_right_before_dqkg() -> None:
     kcp = _package("cake_kcp")
     cu = [0, 100, 740, 817, 1817, 1946]
     H_qk, HV = 2, 6
-    part = gp.partition_det_kcp(torch.tensor(cu, dtype=torch.int64), 1, "contiguous")
-    ctx = gp.build_context_det_kcp(part, None, 0, CPU)
+    part = gp.cake_gdn_det_train_kcp_partition(
+        torch.tensor(cu, dtype=torch.int64), 1, "contiguous"
+    )
+    ctx = gp.cake_gdn_det_train_kcp_build_context(part, None, 0, CPU)
     ops = _inputs(cu, H_qk, HV)
     seen: list[
         tuple[str, bool, bool]
@@ -3285,7 +3370,7 @@ def test_backward_allocates_the_gradients_right_before_dqkg() -> None:
     previous = kcp._BACKENDS.get("fake")
     kcp._BACKENDS["fake"] = Recording()
     try:
-        out, saved = kcp.chunk_gdn_det_fwd_kcp(
+        out, saved = kcp.cake_gdn_det_train_kcp_forward(
             ops["q"],
             ops["k"],
             ops["v"],
@@ -3295,7 +3380,7 @@ def test_backward_allocates_the_gradients_right_before_dqkg() -> None:
             backend="fake",
             segments=2,
         )
-        grads = kcp.chunk_gdn_det_bwd_kcp(
+        grads = kcp.cake_gdn_det_train_kcp_backward(
             ops["q"],
             ops["k"],
             ops["v"],
@@ -3353,8 +3438,10 @@ def _ckpt_setup():
     kcp = _package("cake_kcp")
     cu = [0, 100, 740, 817, 1817, 1946]
     H_qk, HV = 2, 6
-    part = gp.partition_det_kcp(torch.tensor(cu, dtype=torch.int64), 1, "contiguous")
-    ctx = gp.build_context_det_kcp(part, None, 0, CPU)
+    part = gp.cake_gdn_det_train_kcp_partition(
+        torch.tensor(cu, dtype=torch.int64), 1, "contiguous"
+    )
+    ctx = gp.cake_gdn_det_train_kcp_build_context(part, None, 0, CPU)
     return kcp, ctx, _inputs(cu, H_qk, HV)
 
 
@@ -3369,7 +3456,7 @@ def _ckpt_autograd(
     workspace=None,
     **opts,
 ) -> dict[str, torch.Tensor]:
-    """``out`` and the five gradients of one ``chunk_gdn_det_kcp`` layer (or ``layers`` chained ones: the next layer's
+    """``out`` and the five gradients of one ``cake_gdn_det_kcp`` layer (or ``layers`` chained ones: the next layer's
     ``v`` is the previous output), directly or under a non-reentrant checkpoint; ``twice`` backwards with
     ``retain_graph`` first (accumulation)."""
     leaves = [
@@ -3379,9 +3466,9 @@ def _ckpt_autograd(
     o = {"backend": "fake", **opts}
 
     def fn(q, k, v, g, beta):
-        out = kcp.chunk_gdn_det_kcp(q, k, v, g, beta, ctx, workspace=workspace, **o)
+        out = kcp.cake_gdn_det_kcp(q, k, v, g, beta, ctx, workspace=workspace, **o)
         for _ in range(layers - 1):
-            out = kcp.chunk_gdn_det_kcp(
+            out = kcp.cake_gdn_det_kcp(
                 q, k, out, g, beta, ctx, workspace=workspace, **o
             )
         return out
@@ -3523,7 +3610,7 @@ def test_one_live_kept_set_in_a_multi_layer_checkpoint_segment(
     layers' backwards miss and run the replay.  The gradients of the whole chain are bitwise the direct autograd's
     (the evicted layers included); the registry is empty afterwards."""
     kcp, ctx, ops = _ckpt_setup()
-    ws = kcp.WorkspaceDetKcp()
+    ws = kcp.CakeGDNDetKcpWorkspace()
     base = dict(segments=2, layers=layers, workspace=ws)
     direct = _ckpt_autograd(kcp, ctx, ops, ckpt=False, **base)
     sources: list[str] = []
@@ -3612,7 +3699,7 @@ def test_kept_entry_is_dropped_when_the_node_is_not_in_the_backward() -> None:
     a = torch.randn(3, requires_grad=True)
 
     def fn(a_, q, k, v, g, beta):
-        return a_ * a_, kcp.chunk_gdn_det_kcp(
+        return a_ * a_, kcp.cake_gdn_det_kcp(
             q,
             k,
             v,
@@ -3668,7 +3755,7 @@ def test_kept_entry_of_a_failed_backward_is_evicted_by_the_next_kept_forward() -
 
     def fn(q, k, v, g, beta):
         return Boom.apply(
-            kcp.chunk_gdn_det_kcp(
+            kcp.cake_gdn_det_kcp(
                 q,
                 k,
                 v,
@@ -3893,7 +3980,7 @@ def test_recompute_output_skipped_once_when_the_node_closes_the_segment() -> Non
         leaves = _ckpt_leaves(ops)
 
         def fn(q, k, v, g, beta):
-            return kcp.chunk_gdn_det_kcp(
+            return kcp.cake_gdn_det_kcp(
                 q, k, v, g, beta, ctx, backend="fake", segments=2
             ).sum()
 
@@ -3977,7 +4064,7 @@ def test_recompute_output_launched_when_a_later_op_of_the_segment_saves_the_outp
         w = w0.detach().clone().requires_grad_(True)
 
         def fn(q, k, v, g, beta, w_):
-            out = kcp.chunk_gdn_det_kcp(
+            out = kcp.cake_gdn_det_kcp(
                 q,
                 k,
                 v,
@@ -4024,7 +4111,7 @@ def test_recompute_output_multi_layer_segment_skips_only_the_last_layer() -> Non
     the earlier layers replay)."""
     kcp, ctx, ops = _ckpt_setup()
     layers = 3
-    ws = kcp.WorkspaceDetKcp()
+    ws = kcp.CakeGDNDetKcpWorkspace()
     base = dict(segments=2, layers=layers, workspace=ws, reuse_recompute_tapes=True)
     direct = _ckpt_autograd(kcp, ctx, ops, ckpt=False, **base)
     seen, rec = _fwd_o_launches(kcp)
@@ -4076,7 +4163,7 @@ def test_recompute_output_with_an_untaken_node_and_a_second_backward() -> None:
     a = torch.randn(3, requires_grad=True)
 
     def fn(a_, q, k, v, g, beta):
-        return a_ * a_, kcp.chunk_gdn_det_kcp(
+        return a_ * a_, kcp.cake_gdn_det_kcp(
             q, k, v, g, beta, ctx, backend="fake", segments=2
         )
 
@@ -4149,7 +4236,7 @@ def test_recompute_output_launched_under_a_reentrant_checkpoint() -> None:
         leaves = _ckpt_leaves(ops)
 
         def fn(q, k, v, g, beta):
-            return kcp.chunk_gdn_det_kcp(
+            return kcp.cake_gdn_det_kcp(
                 q,
                 k,
                 v,
@@ -4193,7 +4280,7 @@ def test_recompute_output_launched_for_a_non_executable_layer_before_the_node() 
     kcp, ctx, ops = _ckpt_setup()
     from torch.utils.checkpoint import checkpoint
 
-    ws = kcp.WorkspaceDetKcp()
+    ws = kcp.CakeGDNDetKcpWorkspace()
 
     def run(ckpt: bool, **o) -> list[torch.Tensor]:
         leaves = _ckpt_leaves(ops)
@@ -4202,7 +4289,7 @@ def test_recompute_output_launched_for_a_non_executable_layer_before_the_node() 
         )
 
         def fn(q, k, v, g, beta):
-            first = kcp.chunk_gdn_det_kcp(
+            first = kcp.cake_gdn_det_kcp(
                 q.detach(),
                 k.detach(),
                 v.detach(),
@@ -4212,7 +4299,7 @@ def test_recompute_output_launched_for_a_non_executable_layer_before_the_node() 
                 **opt,
             )
             assert not first.requires_grad
-            return kcp.chunk_gdn_det_kcp(q, k, first, g, beta, ctx, **opt)
+            return kcp.cake_gdn_det_kcp(q, k, first, g, beta, ctx, **opt)
 
         out = checkpoint(fn, *leaves, use_reentrant=False) if ckpt else fn(*leaves)
         out.backward(ops["dout"])
@@ -4267,7 +4354,7 @@ def test_recompute_output_launched_under_no_grad_inside_the_recompute() -> None:
 
         def fn(q, k, v, g, beta, w_):
             with torch.no_grad():
-                out = kcp.chunk_gdn_det_kcp(
+                out = kcp.cake_gdn_det_kcp(
                     q,
                     k,
                     v,
@@ -4321,7 +4408,7 @@ def test_recompute_output_launched_when_early_stop_is_off() -> None:
         leaves = _ckpt_leaves(ops)
 
         def fn(q, k, v, g, beta):
-            return kcp.chunk_gdn_det_kcp(
+            return kcp.cake_gdn_det_kcp(
                 q,
                 k,
                 v,
@@ -4380,7 +4467,7 @@ def test_recompute_output_launched_under_a_users_saved_tensors_hooks() -> None:
 
         def fn(q, k, v, g, beta, w_):
             with torch.autograd.graph.saved_tensors_hooks(lambda t: t, lambda t: t):
-                out = kcp.chunk_gdn_det_kcp(
+                out = kcp.cake_gdn_det_kcp(
                     q,
                     k,
                     v,
@@ -4584,15 +4671,15 @@ def test_recompute_output_auto_resolves_on_every_cuda_build_of_the_release(
         _assert_same(res, direct, build)
 
 
-# --------------------------------------------------------------------------- issue #7074 (4): gdn_det_workspace_layout_kcp follows the arena's lifetimes
+# --------------------------------------------------------------------------- issue #7074 (4): cake_gdn_det_train_kcp_workspace_layout follows the arena's lifetimes
 # What a caller-held workspace binds, per tape form: the forward's tape-walk peak and the backward's phase maximum.
 
 
 class _PeakWorkspace:
-    """A ``WorkspaceDetKcp`` recording the most bytes it binds (every allocation / release path)."""
+    """A ``CakeGDNDetKcpWorkspace`` recording the most bytes it binds (every allocation / release path)."""
 
     def __new__(cls, kcp):
-        class Tracked(kcp.WorkspaceDetKcp):
+        class Tracked(kcp.CakeGDNDetKcpWorkspace):
             def __init__(self, *a, **k):
                 super().__init__(*a, **k)
                 self.peak = 0
@@ -4624,7 +4711,7 @@ class _PeakWorkspace:
 
 
 def test_workspace_layout_follows_the_arena_lifetimes() -> None:
-    """``gdn_det_workspace_layout_kcp`` is what a caller-held workspace binds: the forward's peak (the shipped fused
+    """``cake_gdn_det_train_kcp_workspace_layout`` is what a caller-held workspace binds: the forward's peak (the shipped fused
     forward: #1; with test knob ``fused_o=0``: the tape walk, ``forward_split``), and the backward's phase maximum of
     the form -- the kept-tape form ends with the re-adopted forward tapes (the fused set ``aqk`` / ``qscale``; the
     split forward's four with ``fused_o=0``) beside the backward tapes (the ten kept tapes are hand-off tensors outside
@@ -4650,7 +4737,7 @@ def test_workspace_layout_follows_the_arena_lifetimes() -> None:
 
     layouts = {}
     for form, fused in itertools.product((True, False), (0, 1)):
-        layout = gb.gdn_det_workspace_layout_kcp(
+        layout = gb.cake_gdn_det_train_kcp_workspace_layout(
             ctx, H_qk=H_qk, HV=HV, reuse_recompute_tapes=form
         )
         layouts[form] = layout
@@ -4661,7 +4748,7 @@ def test_workspace_layout_follows_the_arena_lifetimes() -> None:
         ]
 
         def fn(q, k, v, g, beta, _ws=ws, _form=form, _fused=fused):
-            return kcp.chunk_gdn_det_kcp(
+            return kcp.cake_gdn_det_kcp(
                 q,
                 k,
                 v,
@@ -4742,34 +4829,34 @@ def test_workspace_layout_follows_the_arena_lifetimes() -> None:
     )
     assert kept["forward"] == replay["forward"]
     # the keyword resolves through the package default, and the bytes query is the layout's maximum
-    default = gb.gdn_det_workspace_layout_kcp(ctx, H_qk=H_qk, HV=HV)
+    default = gb.cake_gdn_det_train_kcp_workspace_layout(ctx, H_qk=H_qk, HV=HV)
     opt = _package("cake_options")
     assert default == layouts[opt.REUSE_RECOMPUTE_TAPES_DEFAULT is True]
     assert (
-        gb.gdn_det_workspace_layout_kcp(
+        gb.cake_gdn_det_train_kcp_workspace_layout(
             ctx, H_qk=H_qk, HV=HV, reuse_recompute_tapes="auto"
         )
         == replay
     )
     for form in (True, False):
         assert (
-            gb.gdn_det_workspace_bytes_kcp(
+            gb.cake_gdn_det_train_kcp_workspace_bytes(
                 ctx, H_qk=H_qk, HV=HV, reuse_recompute_tapes=form
             )
             == layouts[form]["workspace"]
         )
     with pytest.raises(ValueError, match="reuse_recompute_tapes must be"):
-        gb.gdn_det_workspace_layout_kcp(
+        gb.cake_gdn_det_train_kcp_workspace_layout(
             ctx, H_qk=H_qk, HV=HV, reuse_recompute_tapes="yes"
         )
 
 
 @pytest.mark.parametrize("segments", (1, 2))
 def test_workspace_layout_of_a_forward_without_a_saved_set(segments) -> None:
-    """A caller-held workspace and ``chunk_gdn_det_fwd_kcp`` with the norm: without a saved set
+    """A caller-held workspace and ``cake_gdn_det_train_kcp_forward`` with the norm: without a saved set
     (``save_for_backward=False``) the fused forward's #1 binds the arena ``r`` (``fwd.qk_rstd``, ``8 T_r H_qk``) and the
     workspace pools a saved set replaces (the ``stage_m`` plane at ``P > 1``).  The forward's peak is the ``forward`` of
-    ``gdn_det_workspace_layout_kcp(..., save_for_backward=False, backward=False)`` exactly (with ``fused_o=0`` its
+    ``cake_gdn_det_train_kcp_workspace_layout(..., save_for_backward=False, backward=False)`` exactly (with ``fused_o=0`` its
     ``forward_split``: ``r`` goes before the tape walk); the saved-set forward's peak is the default layout's, which the
     keyword leaves unchanged."""
     kcp, ctx, ops = _ckpt_setup()
@@ -4777,9 +4864,11 @@ def test_workspace_layout_of_a_forward_without_a_saved_set(segments) -> None:
     H_qk, HV = 2, 6
     leaves = [ops[n] for n in LEAVES]
     o = dict(use_qk_l2norm_in_kernel=True)
-    default = gb.gdn_det_workspace_layout_kcp(ctx, H_qk=H_qk, HV=HV, P=segments, **o)
+    default = gb.cake_gdn_det_train_kcp_workspace_layout(
+        ctx, H_qk=H_qk, HV=HV, P=segments, **o
+    )
     for save in (False, True):
-        layout = gb.gdn_det_workspace_layout_kcp(
+        layout = gb.cake_gdn_det_train_kcp_workspace_layout(
             ctx,
             H_qk=H_qk,
             HV=HV,
@@ -4790,7 +4879,7 @@ def test_workspace_layout_of_a_forward_without_a_saved_set(segments) -> None:
         )
         for fused in (1, 0):
             ws = _PeakWorkspace(kcp)
-            _out, saved = kcp.chunk_gdn_det_fwd_kcp(
+            _out, saved = kcp.cake_gdn_det_train_kcp_forward(
                 *leaves,
                 ctx,
                 workspace=ws,
@@ -4811,9 +4900,9 @@ def test_workspace_layout_of_a_forward_without_a_saved_set(segments) -> None:
     # the replay boundary keeps no saved set either way (a saved boundary without one: its backward is the saved=None
     # replay, test_workspace_layout_option_checks)
     replay = dict(boundary_mode="replay", P=segments, **o)
-    assert gb.gdn_det_workspace_layout_kcp(
+    assert gb.cake_gdn_det_train_kcp_workspace_layout(
         ctx, H_qk=H_qk, HV=HV, save_for_backward=False, **replay
-    ) == gb.gdn_det_workspace_layout_kcp(ctx, H_qk=H_qk, HV=HV, **replay)
+    ) == gb.cake_gdn_det_train_kcp_workspace_layout(ctx, H_qk=H_qk, HV=HV, **replay)
 
 
 @pytest.mark.parametrize(
@@ -4843,8 +4932,12 @@ def test_kept_form_at_two_segments_follows_the_arena_and_the_hand_off(
         with_conv=False,
         use_qk_l2norm_in_kernel=l2n,
     )
-    layout = gb.gdn_det_workspace_layout_kcp(ctx, reuse_recompute_tapes=True, **q)
-    replay = gb.gdn_det_workspace_layout_kcp(ctx, reuse_recompute_tapes=False, **q)
+    layout = gb.cake_gdn_det_train_kcp_workspace_layout(
+        ctx, reuse_recompute_tapes=True, **q
+    )
+    replay = gb.cake_gdn_det_train_kcp_workspace_layout(
+        ctx, reuse_recompute_tapes=False, **q
+    )
     handed: list[int] = []
 
     class Recorded(kcp._KeptTapes):
@@ -4876,7 +4969,7 @@ def test_kept_form_at_two_segments_follows_the_arena_and_the_hand_off(
     leaves = [ops[n].detach().clone().requires_grad_(True) for n in LEAVES]
 
     def fn(q_, k_, v_, g_, beta_):
-        return kcp.chunk_gdn_det_kcp(
+        return kcp.cake_gdn_det_kcp(
             q_,
             k_,
             v_,
@@ -4936,18 +5029,20 @@ def test_workspace_layout_of_a_full_forward_without_a_saved_set(segments) -> Non
     for l2n in (False, True):
         o = dict(P=segments, use_qk_l2norm_in_kernel=l2n)
         nosave = dict(backward=False, save_for_backward=False, **o)
-        layout = gb.gdn_det_workspace_layout_kcp(
+        layout = gb.cake_gdn_det_train_kcp_workspace_layout(
             ctx, H_qk=H_qk, HV=HV, save_mode="full", **nosave
         )
-        light = gb.gdn_det_workspace_layout_kcp(ctx, H_qk=H_qk, HV=HV, **nosave)
+        light = gb.cake_gdn_det_train_kcp_workspace_layout(
+            ctx, H_qk=H_qk, HV=HV, **nosave
+        )
         assert layout["forward"] == layout["forward_split"] == light["forward_split"]
-        saved_full = gb.gdn_det_workspace_layout_kcp(
+        saved_full = gb.cake_gdn_det_train_kcp_workspace_layout(
             ctx, H_qk=H_qk, HV=HV, save_mode="full", **o
         )
         assert layout["forward"] > saved_full["forward"], (layout, saved_full)
         for fused in (1, 0):
             ws = _PeakWorkspace(kcp)
-            _out, saved = kcp.chunk_gdn_det_fwd_kcp(
+            _out, saved = kcp.cake_gdn_det_train_kcp_forward(
                 *leaves,
                 ctx,
                 workspace=ws,
@@ -4966,10 +5061,10 @@ def test_workspace_layout_of_a_full_forward_without_a_saved_set(segments) -> Non
             assert left == set(kcp.FWD_TAPES_ARENA_AFTER_FWD), (l2n, fused, left)
         # the replay boundary keeps no saved set: "full" is the light replay, forward and backward
         replay = dict(boundary_mode="replay", **o)
-        layout = gb.gdn_det_workspace_layout_kcp(
+        layout = gb.cake_gdn_det_train_kcp_workspace_layout(
             ctx, H_qk=H_qk, HV=HV, save_mode="full", **replay
         )
-        assert layout == gb.gdn_det_workspace_layout_kcp(
+        assert layout == gb.cake_gdn_det_train_kcp_workspace_layout(
             ctx, H_qk=H_qk, HV=HV, **replay
         )
         ws = _PeakWorkspace(kcp)
@@ -4977,7 +5072,7 @@ def test_workspace_layout_of_a_full_forward_without_a_saved_set(segments) -> Non
             ops[n].detach().clone().requires_grad_(True)
             for n in ("q", "k", "v", "g", "beta")
         ]
-        out = kcp.chunk_gdn_det_kcp(
+        out = kcp.cake_gdn_det_kcp(
             *grads,
             ctx,
             workspace=ws,
@@ -5017,7 +5112,7 @@ def _ckpt_autograd_region(
         o["recompute_handle"] = handle
 
     def fn(q, k, v, g, beta):
-        out = kcp.chunk_gdn_det_kcp(q, k, v, g, beta, ctx, **o)
+        out = kcp.cake_gdn_det_kcp(q, k, v, g, beta, ctx, **o)
         return out * scale if later_saver else out
 
     if ckpt:
@@ -5087,21 +5182,25 @@ def test_reuse_recompute_tapes_auto_is_an_option_value() -> None:
     assert opt.REUSE_RECOMPUTE_TAPES == (True, False, "auto")
     assert opt.REUSE_RECOMPUTE_TAPES_DEFAULT in opt.REUSE_RECOMPUTE_TAPES
     assert (
-        opt.OptionsDetKcp(reuse_recompute_tapes="auto").check().reuse_recompute_tapes
+        opt.CakeGDNDetKcpOptions(reuse_recompute_tapes="auto")
+        .check()
+        .reuse_recompute_tapes
         == "auto"
     )
     assert (
-        opt.OptionsDetKcp().check().reuse_recompute_tapes
+        opt.CakeGDNDetKcpOptions().check().reuse_recompute_tapes
         == opt.REUSE_RECOMPUTE_TAPES_DEFAULT
     )
-    assert opt.OptionsDetKcp(graph="replay").check().reuse_recompute_tapes is False
+    assert (
+        opt.CakeGDNDetKcpOptions(graph="replay").check().reuse_recompute_tapes is False
+    )
     with pytest.raises(ValueError, match="needs graph='off'"):
-        opt.OptionsDetKcp(graph="replay", reuse_recompute_tapes="auto").check()
+        opt.CakeGDNDetKcpOptions(graph="replay", reuse_recompute_tapes="auto").check()
     with pytest.raises(ValueError, match="needs graph='off'"):
-        opt.OptionsDetKcp(graph="replay", reuse_recompute_tapes=True).check()
+        opt.CakeGDNDetKcpOptions(graph="replay", reuse_recompute_tapes=True).check()
     for bad in ("yes", 1, 0, "AUTO"):
         with pytest.raises(TypeError, match="must be a bool or 'auto'"):
-            opt.OptionsDetKcp(reuse_recompute_tapes=bad).check()
+            opt.CakeGDNDetKcpOptions(reuse_recompute_tapes=bad).check()
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -5114,7 +5213,7 @@ def test_reuse_recompute_tapes_auto_is_an_option_value() -> None:
 def _handle_autograd(
     kcp, ctx, ops, *, handle, twice: bool = False, **opts
 ) -> tuple[dict[str, torch.Tensor], list]:
-    """One ``chunk_gdn_det_kcp`` layer under a non-reentrant checkpoint with ``recompute_handle=handle`` (``None``: the
+    """One ``cake_gdn_det_kcp`` layer under a non-reentrant checkpoint with ``recompute_handle=handle`` (``None``: the
     plain checkpoint); returns out + gradients and the ``recompute_handle`` mode of the original forward and of the
     recompute of every backward (read from ``LAST_CALL`` after each: torch's early stop ends the recompute inside the
     node's ``apply``, after the forward recorded itself)."""
@@ -5125,7 +5224,7 @@ def _handle_autograd(
     o = {"backend": "fake", "save_transfer": False, **opts}
 
     def fn(q, k, v, g, beta, h):
-        return kcp.chunk_gdn_det_kcp(q, k, v, g, beta, ctx, recompute_handle=h, **o)
+        return kcp.cake_gdn_det_kcp(q, k, v, g, beta, ctx, recompute_handle=h, **o)
 
     from torch.utils.checkpoint import checkpoint
 
@@ -5171,7 +5270,7 @@ def test_recompute_handle_is_bitwise_the_checkpoint_and_the_direct_pass(
         )
         _assert_same(direct, light, "full direct vs light direct")
     plain, plain_modes = _handle_autograd(kcp, ctx, ops, handle=None, **base)
-    handle = kcp.RecomputeHandleDetKcp()
+    handle = kcp.CakeGDNDetKcpRecomputeHandle()
     got, modes = _handle_autograd(kcp, ctx, ops, handle=handle, **base)
     _assert_same(plain, direct, "plain checkpoint vs direct")
     _assert_same(got, direct, "handle checkpoint vs direct")
@@ -5187,15 +5286,15 @@ def test_recompute_handle_retains_exactly_s_in_and_survives_a_second_backward() 
     twice the gradient."""
     kcp, ctx, ops = _ckpt_setup()
     H_qk, HV = ops["q"].shape[-2], ops["v"].shape[-2]
-    handle = kcp.RecomputeHandleDetKcp()
-    once, _ = _handle_autograd(kcp, ctx, ops, handle=kcp.RecomputeHandleDetKcp())
+    handle = kcp.CakeGDNDetKcpRecomputeHandle()
+    once, _ = _handle_autograd(kcp, ctx, ops, handle=kcp.CakeGDNDetKcpRecomputeHandle())
     twice, modes = _handle_autograd(kcp, ctx, ops, handle=handle, twice=True)
     assert modes == ["capture", "replay", "replay"], modes
     for n in CKPT_GRADS:
         assert torch.equal(twice[n], once[n] + once[n]), n
     s_in = handle.entries[kcp.HANDLE_KEY]["S_in"]
     assert handle.nbytes() == s_in.numel() * s_in.element_size()
-    assert handle.nbytes() == kcp.gdn_det_saved_bytes_kcp(
+    assert handle.nbytes() == kcp.cake_gdn_det_train_kcp_saved_bytes(
         ctx, H_qk=H_qk, HV=HV, save_mode="light", save_transfer=False, with_conv=False
     )
     handle.clear()
@@ -5209,21 +5308,21 @@ def test_recompute_handle_entry_rules() -> None:
     ``debug_sequence`` are refused; an object without an ``entries`` dict is refused."""
     kcp, ctx, ops = _ckpt_setup()
     q, k, v, g, beta = (ops[n] for n in ("q", "k", "v", "g", "beta"))
-    handle = kcp.RecomputeHandleDetKcp()
-    kcp.chunk_gdn_det_kcp(
-        q, k, v, g, beta, ctx, backend="fake", recompute_handle=handle
-    )
+    handle = kcp.CakeGDNDetKcpRecomputeHandle()
+    kcp.cake_gdn_det_kcp(q, k, v, g, beta, ctx, backend="fake", recompute_handle=handle)
     assert kcp.LAST_CALL["fwd"]["recompute_handle"] == "capture"
-    with pytest.raises(RuntimeError, match="new RecomputeHandleDetKcp per micro-step"):
-        kcp.chunk_gdn_det_kcp(
+    with pytest.raises(
+        RuntimeError, match="new CakeGDNDetKcpRecomputeHandle per micro-step"
+    ):
+        kcp.cake_gdn_det_kcp(
             q, k, v, g, beta, ctx, backend="fake", recompute_handle=handle
         )
     leaves = [x.detach().clone().requires_grad_(True) for x in (q, k, v, g, beta)]
-    h2 = kcp.RecomputeHandleDetKcp()
+    h2 = kcp.CakeGDNDetKcpRecomputeHandle()
     from torch.utils.checkpoint import checkpoint
 
     def fn(*a):
-        return kcp.chunk_gdn_det_kcp(
+        return kcp.cake_gdn_det_kcp(
             *a[:5], ctx, backend="fake", save_transfer=False, recompute_handle=a[5]
         )
 
@@ -5239,11 +5338,11 @@ def test_recompute_handle_entry_rules() -> None:
         {"save_transfer": True},
         {"options": {"save_transfer": True}},
         {"boundary_mode": "replay"},
-        {"graph": "replay", "workspace": kcp.WorkspaceDetKcp()},
+        {"graph": "replay", "workspace": kcp.CakeGDNDetKcpWorkspace()},
         {"test_knobs": {"debug_sequence": True}},
     ):
         with pytest.raises(ValueError):
-            kcp.chunk_gdn_det_kcp(
+            kcp.cake_gdn_det_kcp(
                 q,
                 k,
                 v,
@@ -5251,11 +5350,11 @@ def test_recompute_handle_entry_rules() -> None:
                 beta,
                 ctx,
                 backend="fake",
-                recompute_handle=kcp.RecomputeHandleDetKcp(),
+                recompute_handle=kcp.CakeGDNDetKcpRecomputeHandle(),
                 **bad,
             )
     with pytest.raises(TypeError, match="entries"):
-        kcp.chunk_gdn_det_kcp(
+        kcp.cake_gdn_det_kcp(
             q, k, v, g, beta, ctx, backend="fake", recompute_handle=object()
         )
 
@@ -5268,7 +5367,7 @@ def test_recompute_handle_entry_rules() -> None:
 def _packed_autograd(
     kcp, ctx, ops, *, batched: bool = False, ckpt: bool = False, **opts
 ) -> tuple[dict[str, torch.Tensor], list[torch.Tensor]]:
-    """``out`` and the gradients of one layer whose q / k / v come from :func:`packed_qkv_views_det_kcp` of a packed leaf;
+    """``out`` and the gradients of one layer whose q / k / v come from :func:`cake_gdn_det_train_kcp_packed_qkv_views` of a packed leaf;
     ``dq`` / ``dk`` / ``dv`` are read back from the leaf's gradient, which a hook also captures as it arrives."""
     H_qk, HV = ops["q"].shape[-2], ops["v"].shape[-2]
     T = ops["q"].shape[0]
@@ -5284,9 +5383,9 @@ def _packed_autograd(
     o = {"backend": "fake", **opts}
 
     def fn(qkv, g, beta):
-        q, k, v = kcp.packed_qkv_views_det_kcp(qkv, H_qk=H_qk, HV=HV)
+        q, k, v = kcp.cake_gdn_det_train_kcp_packed_qkv_views(qkv, H_qk=H_qk, HV=HV)
         gg, bb = (g.unsqueeze(0), beta.unsqueeze(0)) if batched else (g, beta)
-        return kcp.chunk_gdn_det_kcp(q, k, v, gg, bb, ctx, **o)
+        return kcp.cake_gdn_det_kcp(q, k, v, gg, bb, ctx, **o)
 
     if ckpt:
         from torch.utils.checkpoint import checkpoint
@@ -5361,7 +5460,7 @@ def test_packed_qkv_split_concatenates_any_other_gradient() -> None:
     a = x.clone().requires_grad_(True)
     b = x.clone().requires_grad_(True)
     before = dict(kcp.PACKED_SPLIT_STATS)
-    q, k, v = kcp.packed_qkv_views_det_kcp(a, H_qk=H_qk, HV=HV)
+    q, k, v = kcp.cake_gdn_det_train_kcp_packed_qkv_views(a, H_qk=H_qk, HV=HV)
     assert (
         q.shape == (T, H_qk, 128)
         and k.shape == (T, H_qk, 128)
@@ -5380,11 +5479,15 @@ def test_packed_qkv_views_det_kcp_rejects_a_bad_row() -> None:
     kcp = _package("cake_kcp")
     x = torch.zeros(5, 10 * 128, dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="expected"):
-        kcp.packed_qkv_views_det_kcp(x, H_qk=2, HV=4)  # 8 * 128 channels expected
+        kcp.cake_gdn_det_train_kcp_packed_qkv_views(
+            x, H_qk=2, HV=4
+        )  # 8 * 128 channels expected
     with pytest.raises(ValueError, match="dense"):
-        kcp.packed_qkv_views_det_kcp(x.t().contiguous().t(), H_qk=2, HV=6)
+        kcp.cake_gdn_det_train_kcp_packed_qkv_views(
+            x.t().contiguous().t(), H_qk=2, HV=6
+        )
     with pytest.raises(ValueError):
-        kcp.packed_qkv_views_det_kcp(
+        kcp.cake_gdn_det_train_kcp_packed_qkv_views(
             torch.zeros(5, 9 * 128, dtype=torch.bfloat16), H_qk=2, HV=5
         )
 
@@ -5540,7 +5643,7 @@ def _run_threaded(kcp, world: int, fn, monkeypatch) -> list:
 
 
 def _call_recorder(kcp, comm_of=lambda: None):
-    """A recording fake backend: per rank (the calling thread's, 0 without threads) the :class:`CallDetKcp` objects in
+    """A recording fake backend: per rank (the calling thread's, 0 without threads) the :class:`CakeGDNDetKcpCall` objects in
     first-launch order and, per call, the program names it launched."""
     calls: dict[int, list] = {}
     launched: dict[int, list[str]] = {}
@@ -5687,9 +5790,9 @@ _SHORT_CU = (0, 100, 228)
 def test_workspace_layout_follows_the_arena_of_every_rank(
     monkeypatch, W, segments, opts, fused_walks, cu
 ) -> None:
-    """``gdn_det_workspace_layout_kcp(with_conv=False)`` is the most a caller-held workspace binds on each rank in the
+    """``cake_gdn_det_train_kcp_workspace_layout(with_conv=False)`` is the most a caller-held workspace binds on each rank in the
     forward on a fresh arena and in the backward that follows on the same workspace (the explicit entries; the
-    backward's replay form), every pool term is the size the call gives that pool, and ``gdn_det_saved_bytes_kcp`` is
+    backward's replay form), every pool term is the size the call gives that pool, and ``cake_gdn_det_train_kcp_saved_bytes`` is
     what the saved set holds: on two ranks with a crossing fragment -- at ``P = 2`` the c1 send pool's ``M_f^T`` tiles
     and, with the fused walks, the carry slots of the crossing fragments; the b1 pools at their larger split form; the
     forward exchange pools the backward sizes again; the eager forward's fresh c2 send plane and its c1 send pool
@@ -5705,11 +5808,13 @@ def test_workspace_layout_follows_the_arena_of_every_rank(
     without a saved set: #1's eight tapes, no ``h`` / ``v_new``)."""
     kcp = _package("cake_kcp")
     H_qk, HV = CKPT_HEADS
-    part = gp.partition_det_kcp(
+    part = gp.cake_gdn_det_train_kcp_partition(
         torch.tensor(list(cu), dtype=torch.int64), W, "contiguous"
     )
     ctxs = [
-        gp.build_context_det_kcp(part, None, r, CPU, 4, sm_count=SM_COUNT)
+        gp.cake_gdn_det_train_kcp_build_context(
+            part, None, r, CPU, 4, sm_count=SM_COUNT
+        )
         for r in range(W)
     ]
     assert W == 1 or sum(c.n_in for c in ctxs) == sum(c.n_out for c in ctxs) > 0
@@ -5732,7 +5837,7 @@ def test_workspace_layout_follows_the_arena_of_every_rank(
             **call_opts,
             **knobs,
         )
-        _, saved = kcp.chunk_gdn_det_fwd_kcp(
+        _, saved = kcp.cake_gdn_det_train_kcp_forward(
             *args, ctxs[r], save_for_backward=with_set, **kw
         )
         ws = wss[r]
@@ -5745,7 +5850,9 @@ def test_workspace_layout_follows_the_arena_of_every_rank(
         }
         # without a saved set (saved=None) the backward is the replay
         ws.peak, ws.pool_max, ws.walk_bytes, ws.c1_release_bytes = 0, {}, None, None
-        kcp.chunk_gdn_det_bwd_kcp(*args, ctxs[r], loc["dout"], saved=saved, **kw)
+        kcp.cake_gdn_det_train_kcp_backward(
+            *args, ctxs[r], loc["dout"], saved=saved, **kw
+        )
         got[r].update(
             backward=ws.peak,
             bwd_pools=dict(ws.pool_max),
@@ -5775,7 +5882,7 @@ def test_workspace_layout_follows_the_arena_of_every_rank(
     for r, c in enumerate(ctxs):
         q = dict(H_qk=H_qk, HV=HV, P=segments, with_conv=False, **q_opts)
         l2n = dict(use_qk_l2norm_in_kernel=opts.get("use_qk_l2norm_in_kernel", False))
-        lay = gb.gdn_det_workspace_layout_kcp(
+        lay = gb.cake_gdn_det_train_kcp_workspace_layout(
             c,
             reuse_recompute_tapes=False,
             fused_walks=fused_walks,
@@ -5809,7 +5916,9 @@ def test_workspace_layout_follows_the_arena_of_every_rank(
                 )
                 replay_c1 += 1
         if with_set:
-            assert got[r]["saved"] == gb.gdn_det_saved_bytes_kcp(c, **q, **l2n), (
+            assert got[r]["saved"] == gb.cake_gdn_det_train_kcp_saved_bytes(
+                c, **q, **l2n
+            ), (
                 r,
                 got[r],
             )
@@ -5819,7 +5928,7 @@ def test_workspace_layout_follows_the_arena_of_every_rank(
             assert lay["fwd.c1_send_mf"] == c.n_out * HV * gp.STATE_TILE_BYTES
         if opts.get("boundary_mode") == "replay":
             assert got[r]["saved"] == 0
-            light = gb.gdn_det_workspace_layout_kcp(
+            light = gb.cake_gdn_det_train_kcp_workspace_layout(
                 c,
                 reuse_recompute_tapes=False,
                 H_qk=H_qk,
@@ -5833,7 +5942,7 @@ def test_workspace_layout_follows_the_arena_of_every_rank(
             assert lay == light  # the replay boundary: "full" is the light form's
             if opts.get("graph", "off") == "off":
                 # the runtime never hands tapes over under a replay boundary: True reports the replay form
-                assert lay == gb.gdn_det_workspace_layout_kcp(
+                assert lay == gb.cake_gdn_det_train_kcp_workspace_layout(
                     c,
                     reuse_recompute_tapes=True,
                     H_qk=H_qk,
@@ -5869,11 +5978,13 @@ def test_workspace_reused_across_steps_binds_the_graph_replay_figure(
     pool sizes, not a rule."""
     kcp = _package("cake_kcp")
     H_qk, HV = CKPT_HEADS
-    part = gp.partition_det_kcp(
+    part = gp.cake_gdn_det_train_kcp_partition(
         torch.tensor(CKPT_CU, dtype=torch.int64), 2, "contiguous"
     )
     ctxs = [
-        gp.build_context_det_kcp(part, None, r, CPU, 4, sm_count=SM_COUNT)
+        gp.cake_gdn_det_train_kcp_build_context(
+            part, None, r, CPU, 4, sm_count=SM_COUNT
+        )
         for r in range(2)
     ]
     ops = _inputs(CKPT_CU, H_qk, HV)
@@ -5888,19 +5999,23 @@ def test_workspace_reused_across_steps_binds_the_graph_replay_figure(
         kw = dict(backend="fake", segments=2, workspace=wss[r], **call)
         for _ in range(3):
             wss[r].peak = 0
-            _, saved = kcp.chunk_gdn_det_fwd_kcp(
+            _, saved = kcp.cake_gdn_det_train_kcp_forward(
                 *args, ctxs[r], save_for_backward=with_set, **kw
             )
             fwd = wss[r].peak
             wss[r].peak = 0
-            kcp.chunk_gdn_det_bwd_kcp(*args, ctxs[r], loc["dout"], saved=saved, **kw)
+            kcp.cake_gdn_det_train_kcp_backward(
+                *args, ctxs[r], loc["dout"], saved=saved, **kw
+            )
             steps[r].append((fwd, wss[r].peak))
 
     _run_threaded(kcp, 2, rank_fn, monkeypatch)
     for r, c in enumerate(ctxs):
         q = dict(H_qk=H_qk, HV=HV, P=2, with_conv=False, reuse_recompute_tapes=False)
-        eager = gb.gdn_det_workspace_layout_kcp(c, **q, **opts)
-        graph = gb.gdn_det_workspace_layout_kcp(c, graph="replay", **q, **opts)
+        eager = gb.cake_gdn_det_train_kcp_workspace_layout(c, **q, **opts)
+        graph = gb.cake_gdn_det_train_kcp_workspace_layout(
+            c, graph="replay", **q, **opts
+        )
         assert steps[r][0] == (eager["forward"], eager["backward"]), (r, steps[r])
         assert graph["backward"] > eager["backward"], r
         # without a saved set: the c1 send pool the replayed forward releases before it binds h / v_new, and the
@@ -5935,19 +6050,19 @@ def test_workspace_layout_option_checks() -> None:
     q = dict(H_qk=2, HV=6)
     assert gb.GRAPH_MODES == _package("cake_options").GRAPH_MODES
     with pytest.raises(ValueError, match="graph"):
-        gb.gdn_det_workspace_layout_kcp(ctx, graph="on", **q)
+        gb.cake_gdn_det_train_kcp_workspace_layout(ctx, graph="on", **q)
     for reuse in (True, "auto"):
         with pytest.raises(ValueError, match="needs graph='off'"):
-            gb.gdn_det_workspace_bytes_kcp(
+            gb.cake_gdn_det_train_kcp_workspace_bytes(
                 ctx, graph="replay", reuse_recompute_tapes=reuse, **q
             )
-    assert gb.gdn_det_workspace_layout_kcp(
+    assert gb.cake_gdn_det_train_kcp_workspace_layout(
         ctx, graph="replay", **q
-    ) == gb.gdn_det_workspace_layout_kcp(
+    ) == gb.cake_gdn_det_train_kcp_workspace_layout(
         ctx, graph="replay", reuse_recompute_tapes=False, **q
     )
     for save_mode, reuse in itertools.product(("light", "full"), (True, False)):
-        lay = gb.gdn_det_workspace_layout_kcp(
+        lay = gb.cake_gdn_det_train_kcp_workspace_layout(
             ctx,
             save_for_backward=False,
             save_mode=save_mode,
@@ -5955,8 +6070,10 @@ def test_workspace_layout_option_checks() -> None:
             P=2,
             **q,
         )
-        rep = gb.gdn_det_workspace_layout_kcp(ctx, boundary_mode="replay", P=2, **q)
-        only_fwd = gb.gdn_det_workspace_layout_kcp(
+        rep = gb.cake_gdn_det_train_kcp_workspace_layout(
+            ctx, boundary_mode="replay", P=2, **q
+        )
+        only_fwd = gb.cake_gdn_det_train_kcp_workspace_layout(
             ctx, save_for_backward=False, save_mode=save_mode, backward=False, P=2, **q
         )
         # after the fused forward of a light saved boundary the replayed forward finds no h / v_new before its c1
@@ -5981,12 +6098,14 @@ def test_workspace_layout_option_checks() -> None:
         assert lay["backward"] <= rep["backward"]
         assert lay["forward"] == only_fwd["forward"] and only_fwd["backward"] == 0
     with pytest.raises(TypeError, match="save_for_backward"):
-        gb.gdn_det_workspace_layout_kcp(ctx, save_for_backward=0, backward=False, **q)
+        gb.cake_gdn_det_train_kcp_workspace_layout(
+            ctx, save_for_backward=0, backward=False, **q
+        )
 
 
 def _mr_setup():
     kcp = _package("cake_kcp")
-    part = gp.partition_det_kcp(
+    part = gp.cake_gdn_det_train_kcp_partition(
         torch.tensor(MR_CU, dtype=torch.int64), MR_W, "zigzag_per_document"
     )
     return kcp, part, _mr_inputs()
@@ -6006,7 +6125,9 @@ def _mr_run(kcp, part, ops, monkeypatch, *, sm_count: int = SM_COUNT, knobs=None
     calls, launched, rec = _call_recorder(kcp, lambda: holder.get("comm"))
     # group None: the stand-in collective ignores the group (the rank is the calling thread's)
     ctxs = [
-        gp.build_context_det_kcp(part, None, r, CPU, 4, sm_count=sm_count)
+        gp.cake_gdn_det_train_kcp_build_context(
+            part, None, r, CPU, 4, sm_count=sm_count
+        )
         for r in range(MR_W)
     ]
 
@@ -6014,8 +6135,10 @@ def _mr_run(kcp, part, ops, monkeypatch, *, sm_count: int = SM_COUNT, knobs=None
         holder["comm"] = comm
         loc = fake.slice_local(ops, part, r)
         args = [loc[n] for n in LEAVES]
-        out, saved = kcp.chunk_gdn_det_fwd_kcp(*args, ctxs[r], backend="fake", **knobs)
-        grads = kcp.chunk_gdn_det_bwd_kcp(
+        out, saved = kcp.cake_gdn_det_train_kcp_forward(
+            *args, ctxs[r], backend="fake", **knobs
+        )
+        grads = kcp.cake_gdn_det_train_kcp_backward(
             *args,
             ctxs[r],
             loc["dout"],
@@ -6038,8 +6161,8 @@ def _mr_run(kcp, part, ops, monkeypatch, *, sm_count: int = SM_COUNT, knobs=None
 
 
 def _nan_output(kcp, monkeypatch) -> None:
-    """``CallDetKcp.output`` pre-fills a new output with NaN, so a row that neither an output walk nor #5 writes shows."""
-    original = kcp.CallDetKcp.output
+    """``CakeGDNDetKcpCall.output`` pre-fills a new output with NaN, so a row that neither an output walk nor #5 writes shows."""
+    original = kcp.CakeGDNDetKcpCall.output
 
     def output(self):
         fresh = self.out is None
@@ -6048,7 +6171,7 @@ def _nan_output(kcp, monkeypatch) -> None:
             t.fill_(float("nan"))
         return t
 
-    monkeypatch.setattr(kcp.CallDetKcp, "output", output)
+    monkeypatch.setattr(kcp.CakeGDNDetKcpCall, "output", output)
 
 
 def _split_view(call) -> tuple[list, list]:
@@ -6149,7 +6272,7 @@ def test_fused_output_walk_under_checkpoints_and_handles(segments) -> None:
         for fused in (1, 0):
             run = dict(form)
             if run.pop("handle", False):
-                run["handle"] = kcp.RecomputeHandleDetKcp()
+                run["handle"] = kcp.CakeGDNDetKcpRecomputeHandle()
             seen: list[str] = []
             previous = kcp._BACKENDS.get("fake")
 
@@ -6241,7 +6364,7 @@ def test_recompute_handle_fused_recompute_under_a_later_saver(
                 ops,
                 ckpt=True,
                 later_saver=True,
-                handle=kcp.RecomputeHandleDetKcp(),
+                handle=kcp.CakeGDNDetKcpRecomputeHandle(),
                 segments=segments,
                 reuse_recompute_tapes=reuse,
                 test_knobs={"fused_o": fused},
@@ -6271,9 +6394,9 @@ def test_fused_forward_releases_a_caller_arenas_tapes_and_kept_backward_leaves_t
     split one re-adopts the four.  Every arm's out and gradients are the same bits."""
     kcp, ctx, ops = _ckpt_setup()
     assert kcp.FWD_TAPES_ARENA_AFTER_FUSED == ("aqk", "qscale")
-    ws = kcp.WorkspaceDetKcp()
+    ws = kcp.CakeGDNDetKcpWorkspace()
     leaves = [ops[n] for n in LEAVES]
-    o0, _ = kcp.chunk_gdn_det_fwd_kcp(
+    o0, _ = kcp.cake_gdn_det_train_kcp_forward(
         *leaves,
         ctx,
         workspace=ws,
@@ -6281,13 +6404,15 @@ def test_fused_forward_releases_a_caller_arenas_tapes_and_kept_backward_leaves_t
         test_knobs={"fused_o": 0},
     )
     assert set(ws._tapes) & set(kcp.FWD_TAPES) == set(kcp.FWD_TAPES_ARENA_AFTER_FWD)
-    o1, _ = kcp.chunk_gdn_det_fwd_kcp(*leaves, ctx, workspace=ws, backend="fake")
+    o1, _ = kcp.cake_gdn_det_train_kcp_forward(
+        *leaves, ctx, workspace=ws, backend="fake"
+    )
     assert kcp.LAST_CALL["fwd"]["fwd_o"] == "fused"
     assert set(ws._tapes) & set(kcp.FWD_TAPES) == set(kcp.FWD_TAPES_ARENA_AFTER_FUSED)
     assert torch.equal(o0, o1)
     arms = {}
     for fused in (1, 0):
-        wsk = kcp.WorkspaceDetKcp()
+        wsk = kcp.CakeGDNDetKcpWorkspace()
         arms[fused] = _ckpt_autograd(
             kcp,
             ctx,
