@@ -76,12 +76,10 @@ Every name of this package is the deterministic twin's name without `det`:
 | `ChunkGDNDetFunctionKcp` | `ChunkGDNFunctionKcp` |
 | `packed_qkv_views_det_kcp`, `PackedQKVSplitDetKcp` | `packed_qkv_views_kcp`, `PackedQKVSplitKcp` (package level) |
 
-The legacy names of the deterministic package keep meaning the deterministic
-objects: `flashinfer.gdn_train.chunk_gdn_kcp`, `KcpContext`, ... and the
-legacy package path `flashinfer.experimental.cake_gdn_train` (with its
-`chunk_gdn_kcp`) are aliases of `cake_gdn_det_train_kcp` objects, never of
-this package's.  The name `chunk_gdn_kcp` of this package is a different
-object from the legacy alias of the same spelling.
+The deterministic package is named by its det names (left column) only.
+This package binds none of the deterministic package's former no-det names
+(such as `kcp_partition` or `KcpContext`), and `chunk_gdn_kcp` is this
+package's own non-deterministic entry, never a deterministic object.
 
 The generated libraries are named `cake_gdn_train_<20 hex>` for the
 per-chunk programs and `cake_gdn_train_<20 hex>_kcp` for the
