@@ -119,7 +119,8 @@ Mode and dispatch rules (the same in
    and run the backward of their own package.  A backward workspace holds the
    raw partial sums of one package and serves only that package (FP32 for the
    deterministic package, FP64 for the non-deterministic one): each backward
-   refuses the other package's workspace (``ValueError``).
+   refuses the other package's workspace (``ValueError``), also in a call
+   with no rows.
 5. The former names are gone, with no alias or shim: the former modules fail
    at import, and the former names without a mode word are attributes of
    neither ``flashinfer`` nor either module.  The SiLU-gated RMSNorm section
@@ -483,10 +484,11 @@ def cake_rmsnorm_silu_gate_nondet_train_backward(
         kernel leaves zero (zero it with
         :func:`cake_rmsnorm_silu_gate_nondet_train_reset_workspace` after anything
         else wrote into it); the deterministic package's FP32 buffer is a
-        ``ValueError``.  When omitted, the backward uses one zero-filled buffer
-        per device, stream and backward kernel, kept for later calls (during
-        CUDA Graph capture, one zero-filled buffer per capture and capture
-        stream, from a reserve those calls keep).  One buffer per backward that
+        ``ValueError``, also in a call with no rows.  When omitted, the
+        backward uses one zero-filled buffer per device, stream and backward
+        kernel, kept for later calls (during CUDA Graph capture, one
+        zero-filled buffer per capture and capture stream, from a reserve
+        those calls keep).  One buffer per backward that
         may run at the same time on another stream.
 
     Returns

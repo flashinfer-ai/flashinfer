@@ -23,7 +23,7 @@ backend) and the mode rules of the deterministic package: no entry point takes a
 ``deterministic`` keyword (``TypeError``, checked without a device),
 ``torch.use_deterministic_algorithms(True)`` (strict or ``warn_only``) neither
 raises nor warns in any call, and the backward refuses the non-deterministic
-package's FP64 workspace.  The numerical contract is
+package's FP64 workspace, also in a call with no rows.  The numerical contract is
 ``test_cake_rmsnorm_silu_gate_det_train.py``'s.
 """
 
@@ -287,3 +287,49 @@ def test_backward_refuses_the_nondeterministic_workspace() -> None:
                 EPS,
                 workspace=torch.zeros(1, dtype=torch.float32, device="cuda"),
             )
+
+
+@requires_device
+@pytest.mark.parametrize("shape", [(0, D), (0, 48, D)], ids=["0x128", "0x48x128"])
+def test_backward_with_no_rows_refuses_the_nondeterministic_workspace(
+    shape: tuple,
+) -> None:
+    """A call with no rows refuses the non-deterministic package's FP64
+    workspace with the ``ValueError`` of a call with rows, before it returns
+    (``grad_weight`` keeps its value).  With this package's FP32 workspace it
+    returns zero-sized ``dx`` and ``dz`` and a zero ``dw``, or keeps
+    ``grad_weight`` when accumulating."""
+    empty = torch.empty(shape, dtype=torch.bfloat16, device="cuda")
+    x = torch.randn(129, 48, D, device="cuda").bfloat16()
+    w = torch.ones(D, dtype=torch.bfloat16, device="cuda")
+    fp64 = torch.zeros(4 * D + 1, dtype=torch.float64, device="cuda")
+    ws = cake_rmsnorm_silu_gate_det_train_backward_workspace(0, empty.device)
+    assert ws.dtype == torch.float32
+    for module in NAMESPACES.values():
+        backward = module.cake_rmsnorm_silu_gate_det_train_backward
+        with pytest.raises(ValueError) as with_rows:
+            backward(x, x, x, w, EPS, workspace=fp64)
+        main = torch.full((D,), 1.5, dtype=torch.float32, device="cuda")
+        with pytest.raises(ValueError) as no_rows:
+            backward(empty, empty, empty, w, EPS, grad_weight=main, workspace=fp64)
+        assert str(no_rows.value) == str(with_rows.value), str(no_rows.value)
+        assert str(no_rows.value).startswith(
+            "workspace is FP64, a workspace of the non-deterministic mode "
+        ), str(no_rows.value)
+        assert torch.equal(main, torch.full_like(main, 1.5))
+        dx, dz, dw = backward(empty, empty, empty, w, EPS, workspace=ws)
+        assert dx.shape == dz.shape == empty.shape and dx.numel() == dz.numel() == 0
+        assert dw.dtype == torch.bfloat16 and torch.equal(dw, torch.zeros_like(dw))
+        _, _, dw = backward(
+            empty,
+            empty,
+            empty,
+            w,
+            EPS,
+            grad_weight=main,
+            accumulate_grad_weight=True,
+            workspace=ws,
+        )
+        assert dw is main and torch.equal(main, torch.full_like(main, 1.5))
+        _, _, dw = backward(empty, empty, empty, w, EPS, grad_weight=main, workspace=ws)
+        assert dw is main and torch.equal(main, torch.zeros_like(main))

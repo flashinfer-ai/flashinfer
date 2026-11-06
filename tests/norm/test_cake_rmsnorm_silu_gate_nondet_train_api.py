@@ -44,7 +44,8 @@ This module checks:
   for a node without a weight gradient or of at most 256 rows), the
   ``TypeError`` for a mode keyword on real tensors before any launch; the
   entry points launch only the backend's modules, each package's backward
-  refuses the other's workspace, and on the backend suite's accuracy matrix
+  refuses the other's workspace (also in a call with no rows, with the error
+  of a call with rows), and on the backend suite's accuracy matrix
   and paths (accumulation, ``compute_grad_weight=False``, a reset workspace
   with nonzero scratch reused across shapes, two streams, a side stream, CUDA
   Graph replays, autograd and non-reentrant checkpointing) its ``y``, ``dx``
@@ -716,6 +717,71 @@ def test_nondet_entry_points_run_this_package(
             dy, x, z, w, EPS, workspace=nd_workspace(257 * 48, x.device)
         )
     assert launched == []
+
+
+@requires_device
+@pytest.mark.parametrize("shape", [(0, D), (0, 48, D)], ids=["0x128", "0x48x128"])
+def test_backward_with_no_rows_refuses_the_deterministic_workspace(
+    shape: tuple, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A call with no rows refuses the deterministic package's FP32 buffer
+    with the ``ValueError`` of a call with rows, before it returns
+    (``grad_weight`` keeps its value).  With this package's FP64 workspace it
+    returns zero-sized ``dx`` and ``dz`` and a zero ``dw``, or keeps
+    ``grad_weight`` when accumulating; nothing is launched and the workspace
+    stays zero."""
+    launched = _spy_launches(monkeypatch)
+    empty = torch.empty(shape, dtype=torch.bfloat16, device="cuda")
+    x, z, w, dy = _inputs(65, 48, 14)
+    deterministic_ws = (
+        deterministic_facade.cake_rmsnorm_silu_gate_det_train_backward_workspace(
+            65 * 48, x.device
+        )
+    )
+    assert deterministic_ws.dtype == torch.float32
+    ws = nd_workspace(0, x.device)
+    for module in (facade, backend):
+        backward = module.cake_rmsnorm_silu_gate_nondet_train_backward
+        with pytest.raises(ValueError) as with_rows:
+            backward(dy, x, z, w, EPS, workspace=deterministic_ws)
+        main = torch.full((D,), 1.5, dtype=torch.float32, device="cuda")
+        with pytest.raises(ValueError) as no_rows:
+            backward(
+                empty,
+                empty,
+                empty,
+                w,
+                EPS,
+                grad_weight=main,
+                workspace=deterministic_ws,
+            )
+        assert str(no_rows.value) == str(with_rows.value), str(no_rows.value)
+        assert str(no_rows.value) == (
+            "workspace is FP32, a workspace of the deterministic mode "
+            f"({DET}.cake_rmsnorm_silu_gate_det_train_backward_workspace); the "
+            "non-deterministic backward needs its own zero-filled FP64 workspace "
+            f"({BACKEND}.cake_rmsnorm_silu_gate_nondet_train_backward_workspace)"
+        ), str(no_rows.value)
+        assert torch.equal(main, torch.full_like(main, 1.5))
+        dx, dz, dw = backward(empty, empty, empty, w, EPS, workspace=ws)
+        assert dx.shape == dz.shape == empty.shape and dx.numel() == dz.numel() == 0
+        assert dw.dtype == torch.bfloat16 and torch.equal(dw, torch.zeros_like(dw))
+        _, _, dw = backward(
+            empty,
+            empty,
+            empty,
+            w,
+            EPS,
+            grad_weight=main,
+            accumulate_grad_weight=True,
+            workspace=ws,
+        )
+        assert dw is main and torch.equal(main, torch.full_like(main, 1.5))
+        _, _, dw = backward(empty, empty, empty, w, EPS, grad_weight=main, workspace=ws)
+        assert dw is main and torch.equal(main, torch.zeros_like(main))
+    torch.cuda.synchronize()
+    assert launched == []
+    assert not bool(ws.any())
 
 
 # --------------------------------------------------------------------------- against the deterministic package

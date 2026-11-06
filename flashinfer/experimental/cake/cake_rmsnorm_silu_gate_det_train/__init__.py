@@ -46,7 +46,8 @@ Host design (every control is a keyword; no environment variable):
   ``TypeError``); every launch sums in a fixed order, so
   ``torch.use_deterministic_algorithms`` does not affect any call.  The
   backward refuses the FP64 workspace of the non-deterministic package
-  (``flashinfer.cake_rmsnorm_silu_gate_nondet_train``) with a ``ValueError``.
+  (``flashinfer.cake_rmsnorm_silu_gate_nondet_train``) with a ``ValueError``,
+  also in a call with no rows.
 """
 
 from __future__ import annotations
@@ -374,7 +375,7 @@ def cake_rmsnorm_silu_gate_det_train_backward(
         :func:`cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes` bytes,
         contiguous; allocated on the current stream when omitted.  The FP64
         workspace of the non-deterministic package is refused
-        (``ValueError``).
+        (``ValueError``), also in a call with no rows.
 
     Returns
     -------
@@ -408,6 +409,14 @@ def cake_rmsnorm_silu_gate_det_train_backward(
             dw = grad_weight
     dx, dx_user = _output(grad_x, "grad_x", shape=shape, device=device)
     dz, dz_user = _output(grad_z, "grad_z", shape=shape, device=device)
+    # The other mode's workspace is refused for any row count, so before the
+    # return of a call with no rows; the size check below needs the row count.
+    if isinstance(workspace, torch.Tensor) and workspace.dtype == torch.float64:
+        raise ValueError(
+            "workspace is FP64, a workspace of the non-deterministic mode "
+            f"({_NONDETERMINISTIC_WORKSPACE}); the deterministic backward needs "
+            f"an FP32 workspace ({_DETERMINISTIC_WORKSPACE})"
+        )
     if rows == 0:
         if dw is not None and not accumulate_grad_weight:
             dw.zero_()
@@ -424,12 +433,6 @@ def cake_rmsnorm_silu_gate_det_train_backward(
     if workspace is None:
         partial = torch.empty((chunks, HEAD_DIM), dtype=torch.float32, device=device)
     else:
-        if isinstance(workspace, torch.Tensor) and workspace.dtype == torch.float64:
-            raise ValueError(
-                "workspace is FP64, a workspace of the non-deterministic mode "
-                f"({_NONDETERMINISTIC_WORKSPACE}); the deterministic backward needs "
-                f"an FP32 workspace ({_DETERMINISTIC_WORKSPACE})"
-            )
         if (
             not isinstance(workspace, torch.Tensor)
             or workspace.device != device

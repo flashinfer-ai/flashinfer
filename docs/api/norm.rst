@@ -176,7 +176,8 @@ an autograd wrapper that saves only its inputs.
    and run the backward of their own package.  A backward workspace holds the
    raw partial sums of one package and serves only that package (FP32 for the
    deterministic package, FP64 for the non-deterministic one): each backward
-   refuses the other package's workspace (``ValueError``).
+   refuses the other package's workspace (``ValueError``), also in a call
+   with no rows.
 5. The former names are gone, with no alias or shim: the former modules fail
    at import, and the former names without a mode word are attributes of
    neither ``flashinfer`` nor either module.
