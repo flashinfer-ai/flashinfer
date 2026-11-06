@@ -232,9 +232,7 @@ split take `enable_pdl` too and wait before their first global access.
   device: by architecture, SM count, layout, hidden size H and token-count
   window T 16129-16384:
   `sm_100a` at 148 / 152 SMs, weight gradient H 5120: 9 splits;
-  `sm_100a` at 148 / 152 SMs, weight gradient H 6144: 3 splits;
-  `sm_103a` at 148 / 152 SMs, weight gradient H 5120: 9 splits;
-  `sm_103a` at 148 / 152 SMs, weight gradient H 6144: 3 splits.
+  `sm_103a` at 148 / 152 SMs, weight gradient H 5120: 9 splits.
 * Every `launch()` re-splits the second operand into the retained
   `[3, outer, inner]` BF16 stack in the operand's own layout (exact three-way
   split, no allocation: one launch of the fused split program

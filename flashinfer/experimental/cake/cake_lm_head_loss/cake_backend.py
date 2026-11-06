@@ -291,7 +291,8 @@ MODE_CE, MODE_POLICY, MODE_EXTERNAL, MODE_NONE = 0, 1, 2, 3
 WORKSPACE_ALIGN = 256
 # One registry record and its build.json libraries per architecture (SM107 runs SM103's programs, built for sm_107a;
 # the per-architecture GEMM tile rule tables give sm_107a the sm_103a entries, except DX_LONG_CHUNK_STAGES; the
-# zero-gradient row skip keeps the generic 4097-row floor on sm_107a: ZERO_DLOGP_MIN_ROWS_BY_ARCH has no entry for it).
+# zero-gradient row skip has R200-timed sm_107a entries: the 1946-row floor of ZERO_DLOGP_MIN_ROWS_BY_ARCH and the
+# two-slice counted dX of DX_COUNTED_MIN_SLICES_BY_ARCH).
 SUPPORTED_COMPUTE_CAPABILITIES = {
     (10, 0): "sm_100a",
     (10, 3): "sm_103a",
@@ -1974,8 +1975,13 @@ def plan_dx_slices(
 # architecture not listed keeps the slice rule's counts).  The one-slice plain store has no counted form: it computes
 # every row of its chunk, a chunk past the live rows included, while the K-sliced reduction's counted form skips the
 # work items past the chunk's count.  So a counted plan runs its one-slice chunks as two-slice reductions
-# (:func:`counted_dx_slices`).  sm_107a keeps the slice rule's counts until measured.
-DX_COUNTED_MIN_SLICES_BY_ARCH: dict[str, int] = {"sm_100a": 2, "sm_103a": 2}
+# (:func:`counted_dx_slices`).  sm_107a takes the rule with its 1946-row floor, the two timed together on R200
+# (:data:`ZERO_DLOGP_MIN_ROWS_BY_ARCH`).
+DX_COUNTED_MIN_SLICES_BY_ARCH: dict[str, int] = {
+    "sm_100a": 2,
+    "sm_103a": 2,
+    "sm_107a": 2,
+}
 
 
 def counted_dx_slices(
@@ -2989,8 +2995,30 @@ ZERO_DLOGP_MIN_ROWS_DEFAULT: Optional[int] = DEFAULT_CHUNK_SIZE + 1
 # edge) and 0.984 on each of two clusters alone (each CI95 below the band, fewer steps than the rule needs), so the
 # GB300 floor is 3891.  With 16.6 % zero-gradient rows the step at the shipped floors is 4.6 % to 10.6 % faster on
 # B200 (1946 and 3891 valid rows) and 8.8 % to 9.5 % faster on GB300 (3891 valid rows), each faster under the timing
-# rule.  sm_107a keeps the generic floor until measured.
-ZERO_DLOGP_MIN_ROWS_BY_ARCH: dict[str, int] = {"sm_100a": 1946, "sm_103a": 3891}
+# rule.
+# R200 (sm_107a), floor 1946 valid rows with the two-slice counted dX rule (:data:`DX_COUNTED_MIN_SLICES_BY_ARCH`).
+# The two were chosen together by timing on FlashInfer main ed5b3885 with both set at run time (backward, step and
+# checkpointed step of 1100, 1946 and 3891 valid rows: none slower on either R200 board), then timed in this code at
+# commit 237877ca (PyTorch 2.14.1+cu130, nvcc 13.4), cooled, against the same code without its two sm_107a entries
+# (FlashInfer main d3e87763: the generic floor and the slice rule's dX counts), the 212-SM and the 216-SM R200 board
+# each alone, two machines each: ratio = time without the entries / time with them, with its CI95.  Plain, per-token
+# and scalar temperature log-probability, T = 4600 to 65031 with 0, 16.6 % and 50 % zero-gradient rows (195 cells of
+# the forward, backward, step and checkpointed step per board): none is slower under the timing rule; 21 cells on the
+# 212-SM board and 30 on the 216-SM board are faster, all with zero-gradient rows, up to 1.2225 [1.2158, 1.2342] and
+# 1.2562 [1.2493, 1.2659] (per-token temperature backward, 15419 valid rows, chunk 2048, 50 % zero-gradient rows).
+# The lowest point ratio is 0.9913 [0.9760, 1.0077] on the 212-SM board (checkpointed step, 8550 valid rows, 50 %
+# zero-gradient rows; band 2.35 %) and 0.9815 [0.9751, 1.0000] on the 216-SM board (per-token temperature forward,
+# 61779 valid rows, 50 %; band 1.88 %).  At T = 4600 with 4000 valid rows (on the skip with this floor, off it with
+# the generic one), plain and per-token temperature, none of the 18 cells of the forward, backward and step is slower:
+# with no zero-gradient row the lowest point ratio is 0.9814 [0.9665, 0.9929] on the 212-SM board (plain backward;
+# band 2.23 %) and 0.9973 [0.9951, 0.9993] on the 216-SM board (temperature backward); with 16.6 % and 50 %
+# zero-gradient rows the backward reads 1.0678 to 1.8747 on the 212-SM board and 1.1087 to 1.8036 on the 216-SM
+# board, the step 1.0536 to 1.4244 and 1.0764 to 1.4940, each faster.
+ZERO_DLOGP_MIN_ROWS_BY_ARCH: dict[str, int] = {
+    "sm_100a": 1946,
+    "sm_103a": 3891,
+    "sm_107a": 1946,
+}
 
 
 class _ArchDefaultFloor:

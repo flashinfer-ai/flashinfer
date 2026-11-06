@@ -5265,8 +5265,8 @@ def test_walk_form_of_decides_once_per_table_set() -> None:
     """``_walk_form_of`` (the record form of a K1 / K2 walk launch) evaluates the registry's rule once per
     ``(program, walk list, H, SM count, knob, device)`` of the call's table set and looks the form up on every later
     launch: the forms of a per-launch evaluation (the rule's inputs are static per ``(ctx, H)``; the device's
-    architecture is read on the first launch of a key only), a fresh equal list finding the same entry, the knob's
-    forced forms passing through; a provider without a form rule gives ``"full"``."""
+    architecture is read, for the per-architecture rule alone, on the first launch of a key only), a fresh equal list
+    finding the same entry, the knob's forced forms passing through; a provider without a form rule gives ``"full"``."""
     part = kp.partition_det_kcp((0, 64 * 200, 64 * 350), 4, layout="contiguous")
     ctx = kp.build_context_det_kcp(part, None, 0, "cpu", 4, sm_count=148)
     tb = cake_kcp._Tables(ctx, 64)
@@ -5275,7 +5275,9 @@ def test_walk_form_of_decides_once_per_table_set() -> None:
 
     def rule(program, chains, num_heads, sm_count, *, knob="auto", arch=None):
         evaluated.append((program, tuple(chains), num_heads, sm_count, knob))
-        assert arch == "sm_100a"
+        # the architecture reaches the per-architecture rule (a mapping) alone
+        per_arch = not isinstance(cake_kcp_jit.WALK_FORM_RULES[program], str)
+        assert arch == ("sm_100a" if per_arch else None), (program, arch)
         return cake_kcp_jit.walk_form(
             program, chains, num_heads, sm_count, knob=knob, arch=arch
         )
@@ -5339,9 +5341,12 @@ def test_walk_form_of_decides_once_per_table_set() -> None:
         for (knob, name, walk) in forms
     ), (len(evaluated), len(forms))
     assert all(form == knob for (knob, _, _), form in forms.items() if knob != "auto")
-    assert len(arch_reads) == len(
-        evaluated
-    )  # the architecture on a key's first launch only
+    assert (
+        len(arch_reads)
+        == sum(
+            not isinstance(cake_kcp_jit.WALK_FORM_RULES[e[0]], str) for e in evaluated
+        )
+    )  # the architecture on a key's first launch only, for the per-architecture rule alone
     assert {
         forms[("auto", name, tuple(tb.walk_offset))]
         for name in cake_kcp_jit.WALK_FORM_RULES
@@ -5352,6 +5357,79 @@ def test_walk_form_of_decides_once_per_table_set() -> None:
             types.SimpleNamespace(), bare, "kcp_fwdh_offset", {"walk": tb.walk_offset}
         )
         == "full"
+    )
+
+
+def test_walk_form_of_passes_arch_to_a_per_architecture_rule_alone() -> None:
+    """A provider whose ``walk_form`` takes ``(program, chains, num_heads, sm_count, *, knob)`` and no ``arch``, beside
+    a ``device_arch``, serves its string rules (``"fit"`` / ``"split"``) without a ``TypeError`` and without an
+    architecture read: ``_walk_form_of`` passes ``arch`` only for a per-architecture rule (a mapping of
+    ``WALK_FORM_RULES``), which still receives it."""
+    part = kp.partition_det_kcp((0, 64 * 200, 64 * 350), 4, layout="contiguous")
+    ctx = kp.build_context_det_kcp(part, None, 0, "cpu", 4, sm_count=148)
+    tb = cake_kcp._Tables(ctx, 64)
+    walk = tb.walk_offset
+    assert walk
+    arch_reads: list = []
+
+    def device_arch(index):
+        arch_reads.append(index)
+        return "sm_103a"
+
+    def call():
+        return types.SimpleNamespace(
+            tb=tb, H=64, device=torch.device("cpu"), walk_form="auto"
+        )
+
+    old_calls: list = []
+
+    def old_rule(program, chains, num_heads, sm_count, *, knob="auto"):
+        old_calls.append((program, knob))
+        return {"kcp_fwdh_offset": "full", "kcp_fwdh_tape": "split"}[program]
+
+    old = types.SimpleNamespace(
+        jit=types.SimpleNamespace(
+            walk_form=old_rule,
+            WALK_FORM_RULES={"kcp_fwdh_offset": "fit", "kcp_fwdh_tape": "split"},
+            sm_count=lambda index: 148,
+            device_arch=device_arch,
+        )
+    )
+    assert (
+        cake_kcp._walk_form_of(call(), old, "kcp_fwdh_offset", {"walk": walk}) == "full"
+    )
+    assert (
+        cake_kcp._walk_form_of(call(), old, "kcp_fwdh_tape", {"walk": walk}) == "split"
+    )
+    assert old_calls == [("kcp_fwdh_offset", "auto"), ("kcp_fwdh_tape", "auto")]
+    assert arch_reads == []
+
+    seen: list = []
+
+    def rule(program, chains, num_heads, sm_count, *, knob="auto", arch=None):
+        seen.append((program, arch))
+        return cake_kcp_jit.walk_form(
+            program, chains, num_heads, sm_count, knob=knob, arch=arch
+        )
+
+    registry = types.SimpleNamespace(
+        jit=types.SimpleNamespace(
+            walk_form=rule,
+            WALK_FORM_RULES=cake_kcp_jit.WALK_FORM_RULES,
+            sm_count=lambda index: 148,
+            device_arch=device_arch,
+        )
+    )
+    seg = [int(x) for x in tb.hp.seg_chunk_start]
+    chains = [seg[s + 1] - seg[s] for s in walk]
+    for name, form_rule in cake_kcp_jit.WALK_FORM_RULES.items():
+        want = cake_kcp_jit.walk_form(name, chains, 64, 148, arch="sm_103a")
+        assert cake_kcp._walk_form_of(call(), registry, name, {"walk": walk}) == want
+        assert seen[-1] == (name, None if isinstance(form_rule, str) else "sm_103a")
+    assert (
+        len(arch_reads)
+        == sum(not isinstance(r, str) for r in cake_kcp_jit.WALK_FORM_RULES.values())
+        >= 1
     )
 
 
