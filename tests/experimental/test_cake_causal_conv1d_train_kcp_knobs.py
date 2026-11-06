@@ -17,8 +17,9 @@ CPU tests of the non-deterministic conv KCP module's private test knobs, the boo
 cache, its trimmed host path, its recompute handle and its numerical-mode keyword: the knob is refused without
 ``CAKE_KCP_TEST_KNOBS=1``, validated against ``GRAPH_MODES`` and off by default; the validity key tells operands
 apart by data pointer, shape, stride and dtype, keeps one entry per key, and the first call of a key runs eagerly;
-every public entry refuses ``deterministic`` other than ``False`` before anything else; the facade
-``flashinfer.cake_causal_conv1d_train_kcp`` imports no KCP host module until a call needs one.  No kernel runs here.
+every public entry refuses ``deterministic`` other than ``False`` before anything else; the KCP module
+``flashinfer.experimental.cake.cake_causal_conv1d_train_kcp`` imports no KCP host module until a call needs one.
+No kernel runs here.
 """
 
 from __future__ import annotations
@@ -423,16 +424,16 @@ def test_kcp_signatures_carry_the_deterministic_keyword() -> None:
 
 @pytest.mark.cpu_only
 def test_facade_reexports_the_handle_lazily() -> None:
-    """``flashinfer.cake_causal_conv1d_train_kcp.RecomputeHandleKcp`` is the non-deterministic backend's class;
-    importing the facade imports neither the experimental package nor a KCP host module (``kcp`` imports
-    torch.distributed; ``kcp_jit``) -- checked in a fresh interpreter; both facade entries carry the keyword-only
+    """``flashinfer.experimental.cake.cake_causal_conv1d_train_kcp.RecomputeHandleKcp`` is the non-deterministic
+    backend's class; importing the facade imports neither the non-deterministic package nor a KCP host module
+    (``kcp`` imports torch.distributed; ``kcp_jit``) -- checked in a fresh interpreter; both facade entries carry the keyword-only
     ``recompute_handle=None`` and ``deterministic=True``; the deterministic names are unchanged."""
     import subprocess
     import sys
 
     code = (
         "import inspect, sys\n"
-        "import flashinfer.cake_causal_conv1d_train_kcp as f\n"
+        "import flashinfer.experimental.cake.cake_causal_conv1d_train_kcp as f\n"
         "pkg = 'flashinfer.experimental.cake.cake_causal_conv1d_train_backend'\n"
         "det = 'flashinfer.cake_causal_conv1d_det_train_backend'\n"
         "loaded = sorted(m for m in sys.modules if m.startswith((pkg, det + '.kcp')))\n"
@@ -442,7 +443,7 @@ def test_facade_reexports_the_handle_lazily() -> None:
         "    assert ps['recompute_handle'].kind is inspect.Parameter.KEYWORD_ONLY and ps['recompute_handle'].default is None\n"
         "    assert ps['deterministic'].kind is inspect.Parameter.KEYWORD_ONLY and ps['deterministic'].default is True\n"
         "assert pkg not in sys.modules\n"
-        "from flashinfer.cake_causal_conv1d_train_kcp import RecomputeHandleKcp\n"
+        "from flashinfer.experimental.cake.cake_causal_conv1d_train_kcp import RecomputeHandleKcp\n"
         "from flashinfer.experimental.cake.cake_causal_conv1d_train_backend.kcp import RecomputeHandleKcp as B\n"
         "assert RecomputeHandleKcp is B and 'RecomputeHandleKcp' in f.__all__ and 'RecomputeHandleKcp' in dir(f)\n"
         "import flashinfer.cake_causal_conv1d_det_train_kcp as d\n"

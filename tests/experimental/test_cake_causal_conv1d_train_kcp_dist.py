@@ -81,7 +81,7 @@ def _run_rank(
     from torch.utils.checkpoint import checkpoint
 
     from flashinfer import cake_causal_conv1d_det_train as conv
-    from flashinfer import cake_causal_conv1d_train_kcp as kcp_api
+    from flashinfer.experimental.cake import cake_causal_conv1d_train_kcp as kcp_api
     from flashinfer.cake_causal_conv1d_det_train_backend import kcp as det_kcp
     from flashinfer.experimental.cake.cake_causal_conv1d_train_backend import (
         kcp as conv_kcp,

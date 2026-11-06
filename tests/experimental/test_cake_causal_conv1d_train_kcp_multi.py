@@ -162,7 +162,7 @@ def test_multi_matches_the_fp64_reference(name, lens, cuts, Cs) -> None:
 def test_multi_autograd_and_facade_match_single_calls(
     name, lens, cuts, Cs, batched
 ) -> None:
-    from flashinfer import cake_causal_conv1d_train_kcp as facade
+    from flashinfer.experimental.cake import cake_causal_conv1d_train_kcp as facade
 
     device = torch.device("cuda")
     ctx, xs, ws, dys = _problem(lens, cuts, Cs, device)
@@ -211,7 +211,7 @@ HROWS = MROWS[:3] + MROWS[-3:-1]
 @pytest.mark.parametrize("name,lens,cuts,Cs", HROWS, ids=[r[0] for r in HROWS])
 @pytest.mark.parametrize("reentrant", [False, True], ids=["nonreentrant", "reentrant"])
 def test_multi_checkpoint_and_recompute_handle(name, lens, cuts, Cs, reentrant) -> None:
-    from flashinfer import cake_causal_conv1d_train_kcp as facade
+    from flashinfer.experimental.cake import cake_causal_conv1d_train_kcp as facade
 
     device = torch.device("cuda")
     ctx, xs, ws, dys = _problem(lens, cuts, Cs, device)
@@ -253,7 +253,7 @@ def test_multi_checkpoint_and_recompute_handle(name, lens, cuts, Cs, reentrant) 
 def test_multi_gradient_accumulation_with_retain_graph() -> None:
     from torch.utils.checkpoint import checkpoint
 
-    from flashinfer import cake_causal_conv1d_train_kcp as facade
+    from flashinfer.experimental.cake import cake_causal_conv1d_train_kcp as facade
 
     device = torch.device("cuda")
     ctx, xs, ws, dys = _problem(

@@ -41,7 +41,7 @@ import warnings
 import pytest
 import torch
 
-from flashinfer import cake_causal_conv1d_train_kcp as facade
+from flashinfer.experimental.cake import cake_causal_conv1d_train_kcp as facade
 from flashinfer.api_logging import ExperimentalWarning
 from flashinfer.cake_causal_conv1d_det_train_backend import kcp as det_kcp
 from flashinfer.experimental.cake import cake_causal_conv1d_train_backend as pkg

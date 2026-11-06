@@ -123,8 +123,8 @@ Training causal conv1d (Cake)
    * - context-parallel (KCP)
      - ``flashinfer.cake_causal_conv1d_det_train_kcp``:
        ``cake_causal_conv1d_det_kcp``, ``cake_causal_conv1d_det_multi_kcp``
-     - ``flashinfer.cake_causal_conv1d_train_kcp``: ``cake_causal_conv1d_kcp``,
-       ``cake_causal_conv1d_multi_kcp``
+     - ``flashinfer.experimental.cake.cake_causal_conv1d_train_kcp``:
+       ``cake_causal_conv1d_kcp``, ``cake_causal_conv1d_multi_kcp``
    * - ``deterministic`` keyword
      - none: passing one raises ``TypeError``
      - pass ``deterministic=False``; the default ``True`` and every other value
@@ -207,8 +207,9 @@ deterministic package.
   helpers ``cake_causal_conv1d_train_{forward,backward}_workspace{,_bytes}``
   and ``is_cake_causal_conv1d_train_supported``.  The parameters are the
   deterministic entry points' plus ``deterministic``.
-* ``flashinfer.cake_causal_conv1d_train_kcp``: ``cake_causal_conv1d_kcp``,
-  ``cake_causal_conv1d_multi_kcp`` and ``RecomputeHandleKcp``, with the
+* ``flashinfer.experimental.cake.cake_causal_conv1d_train_kcp``:
+  ``cake_causal_conv1d_kcp``, ``cake_causal_conv1d_multi_kcp`` and
+  ``RecomputeHandleKcp``, with the
   keyword-only ``bwd_reserve_sms`` (SMs the main backward leaves free;
   ``bwd_reserve_sms >= 1`` raises ``ValueError`` on SM107).
   ``cooperative=True`` raises ``ValueError``: the backward is one ordinary

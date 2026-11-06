@@ -15,7 +15,7 @@ limitations under the License.
 
 Tests of the experimental entry points of the non-deterministic Cake causal convolution + SiLU training package: the
 single-rank module ``flashinfer.experimental.cake.cake_causal_conv1d_train`` and the KCP module
-``flashinfer.cake_causal_conv1d_train_kcp``.
+``flashinfer.experimental.cake.cake_causal_conv1d_train_kcp``.
 
 Mode rule (CPU, the packages replaced by recorders): every entry point, helper and support query runs the
 non-deterministic package with the caller's arguments unchanged when ``deterministic=False``; any other value (the
@@ -45,7 +45,7 @@ import torch
 
 import flashinfer.cake_causal_conv1d_det_train as det_facade
 import flashinfer.cake_causal_conv1d_det_train_kcp as det_kcp_facade
-import flashinfer.cake_causal_conv1d_train_kcp as kcp_facade
+import flashinfer.experimental.cake.cake_causal_conv1d_train_kcp as kcp_facade
 import flashinfer.experimental.cake.cake_causal_conv1d_train as facade
 import flashinfer.experimental.cake.cake_causal_conv1d_train_backend as backend
 from flashinfer.api_logging import ExperimentalWarning
@@ -564,17 +564,19 @@ def test_deterministic_names_take_no_mode_keyword() -> None:
 
 @pytest.mark.cpu_only
 def test_core_does_not_import_the_experimental_package() -> None:
-    """``import flashinfer`` imports neither module nor the non-deterministic package; the KCP module imports no
-    package until a call; the single-rank module imports the non-deterministic package but no KCP host module."""
+    """``import flashinfer`` imports neither module nor the non-deterministic package; the KCP module imports
+    neither the package nor the single-rank module until a call; the single-rank module imports the
+    non-deterministic package but no KCP host module."""
 
     code = (
         "import sys\n"
         "import flashinfer\n"
-        "new = ('flashinfer.experimental.cake', 'flashinfer.cake_causal_conv1d_train_kcp')\n"
-        "loaded = sorted(m for m in sys.modules if m in new or m.startswith(tuple(n + '.' for n in new)))\n"
+        "cake = 'flashinfer.experimental.cake'\n"
+        "loaded = sorted(m for m in sys.modules if m == cake or m.startswith(cake + '.'))\n"
         "assert not loaded, loaded\n"
-        "import flashinfer.cake_causal_conv1d_train_kcp\n"
-        "assert 'flashinfer.experimental.cake' not in sys.modules\n"
+        "import flashinfer.experimental.cake.cake_causal_conv1d_train_kcp\n"
+        "loaded = sorted(m for m in sys.modules if m.startswith(cake + '.') and m != cake + '.cake_causal_conv1d_train_kcp')\n"
+        "assert not loaded, loaded\n"
         "import flashinfer.experimental.cake.cake_causal_conv1d_train\n"
         "kcp = [m for m in sys.modules if m.endswith(('.kcp', '.kcp_jit')) and 'conv1d' in m]\n"
         "assert not kcp, kcp\n"

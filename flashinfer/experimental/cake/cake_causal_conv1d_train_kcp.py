@@ -53,7 +53,7 @@ Name map (deterministic -> this module): ``cake_causal_conv1d_det_kcp`` -> :func
 ``cake_causal_conv1d_det_multi_kcp`` -> :func:`cake_causal_conv1d_multi_kcp`, ``RecomputeHandleDetKcp`` ->
 ``RecomputeHandleKcp`` (any object with an ``entries`` dict serves either package)::
 
-    from flashinfer.cake_causal_conv1d_train_kcp import cake_causal_conv1d_kcp, cake_causal_conv1d_multi_kcp
+    from flashinfer.experimental.cake.cake_causal_conv1d_train_kcp import cake_causal_conv1d_kcp, cake_causal_conv1d_multi_kcp
 
     y_local = cake_causal_conv1d_kcp(x_local, weight, ctx, deterministic=False)  # one-launch backward
     q, k, v = cake_causal_conv1d_multi_kcp((xq, xk, xv), (wq, wk, wv), ctx, deterministic=False)
@@ -70,7 +70,7 @@ from typing import Any, Optional, Sequence
 
 import torch
 
-from .api_logging import flashinfer_experimental_api
+from ...api_logging import flashinfer_experimental_api
 
 _FEATURE = "Cake context-parallel causal conv1d + SiLU training, non-deterministic package (SM100/SM103/SM107)"
 
@@ -161,7 +161,7 @@ def cake_causal_conv1d_kcp(
     _nondeterministic_only(
         deterministic, "cake_causal_conv1d_kcp", "cake_causal_conv1d_det_kcp"
     )
-    from .experimental.cake.cake_causal_conv1d_train_backend import (  # noqa: PLC0415
+    from .cake_causal_conv1d_train_backend import (  # noqa: PLC0415
         kcp as _kcp,
     )
 
@@ -224,7 +224,7 @@ def cake_causal_conv1d_multi_kcp(
         "cake_causal_conv1d_multi_kcp",
         "cake_causal_conv1d_det_multi_kcp",
     )
-    from .experimental.cake.cake_causal_conv1d_train_backend import (  # noqa: PLC0415
+    from .cake_causal_conv1d_train_backend import (  # noqa: PLC0415
         kcp as _kcp,
     )
 
@@ -243,7 +243,7 @@ def cake_causal_conv1d_multi_kcp(
 # loader).
 def __getattr__(name: str) -> Any:
     if name == "RecomputeHandleKcp":
-        from .experimental.cake.cake_causal_conv1d_train_backend.kcp import (  # noqa: PLC0415
+        from .cake_causal_conv1d_train_backend.kcp import (  # noqa: PLC0415
             RecomputeHandleKcp,
         )
 

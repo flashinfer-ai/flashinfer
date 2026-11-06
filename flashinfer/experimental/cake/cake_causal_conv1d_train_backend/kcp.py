@@ -21,8 +21,9 @@ before each continuing fragment, received from the ranks that hold them by one
 derivative back to the predecessor fragments, which fold it into their last
 rows' ``dx`` before the one BF16 rounding.  ``cake_causal_conv1d_kcp(x_local,
 weight, ctx, deterministic=False)`` is the autograd entry; its experimental
-entry points are :mod:`flashinfer.cake_causal_conv1d_train_kcp`.  This module imports
-only ``os``, torch, torch.distributed, tvm_ffi and its own package.
+entry points are :mod:`flashinfer.experimental.cake.cake_causal_conv1d_train_kcp`.
+This module imports only ``os``, torch, torch.distributed, tvm_ffi and its own
+package.
 
 The host flow mirrors the deterministic package's
 (``flashinfer.cake_causal_conv1d_det_train_backend.kcp``): the same context

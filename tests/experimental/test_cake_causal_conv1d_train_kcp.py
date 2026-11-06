@@ -390,7 +390,7 @@ def _ckpt_run(p, *, handle=None, reentrant=False, ckpt=True, counter=None, twice
 
     from torch.utils.checkpoint import checkpoint
 
-    from flashinfer import cake_causal_conv1d_train_kcp as facade
+    from flashinfer.experimental.cake import cake_causal_conv1d_train_kcp as facade
 
     x = p.x_local.clone().requires_grad_(True)
     w = p.w.clone().requires_grad_(True)
@@ -579,11 +579,11 @@ def test_torch_deterministic_mode_alerts_on_the_backward() -> None:
 
 @pytest.mark.parametrize("multi", [False, True], ids=["single", "multi"])
 def test_kcp_module_is_nondeterministic_only(multi) -> None:
-    """``flashinfer.cake_causal_conv1d_train_kcp`` on a device: the default and every value but ``False`` raise the
+    """``flashinfer.experimental.cake.cake_causal_conv1d_train_kcp`` on a device: the default and every value but ``False`` raise the
     mode ``ValueError`` before anything runs; with ``False`` it returns the package's bits; under torch's
     deterministic mode the forward runs and the backward raises (strict) or warns and runs (``warn_only``)."""
 
-    from flashinfer import cake_causal_conv1d_train_kcp as facade
+    from flashinfer.experimental.cake import cake_causal_conv1d_train_kcp as facade
 
     device = torch.device("cuda")
     p = _problem((5000, 1003), (1, 2, 4997, 1003), 512, device)

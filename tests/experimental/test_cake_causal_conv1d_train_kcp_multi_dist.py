@@ -122,7 +122,7 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir, local_id: int) -> d
 
     from flashinfer import cake_causal_conv1d_det_train as conv
     from flashinfer import cake_causal_conv1d_det_train_kcp as det_api
-    from flashinfer import cake_causal_conv1d_train_kcp as kcp_api
+    from flashinfer.experimental.cake import cake_causal_conv1d_train_kcp as kcp_api
     from flashinfer.experimental.cake.cake_causal_conv1d_train_backend import (
         kcp as conv_kcp,
     )

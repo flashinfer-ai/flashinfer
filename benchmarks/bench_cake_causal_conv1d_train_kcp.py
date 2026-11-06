@@ -18,7 +18,7 @@ two numerical modes, ``deterministic=True`` (the deterministic KCP backward: a c
 the ``dweight`` partial in a fixed order) against ``deterministic=False`` (one ordinary launch with unordered
 ``dweight`` accumulators): the deterministic mode through ``flashinfer.cake_causal_conv1d_det_train_kcp``
 (``cake_causal_conv1d_det_kcp`` / ``cake_causal_conv1d_det_multi_kcp``), the non-deterministic one through
-``flashinfer.cake_causal_conv1d_train_kcp`` with ``deterministic=False`` (``cake_causal_conv1d_kcp`` /
+``flashinfer.experimental.cake.cake_causal_conv1d_train_kcp`` with ``deterministic=False`` (``cake_causal_conv1d_kcp`` /
 ``cake_causal_conv1d_multi_kcp``); the multi entry runs ``--tensors`` convolutions of one layer (one halo exchange
 per direction).
 One process per rank: ``torchrun --nproc_per_node W`` (W = 2 / 4 / 8), or a plain ``python`` launch for a one-rank
@@ -118,7 +118,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import flashinfer.cake_causal_conv1d_det_train as det_conv  # noqa: E402
 import flashinfer.cake_causal_conv1d_det_train_backend as det_backend  # noqa: E402
 import flashinfer.cake_causal_conv1d_det_train_kcp as det_kcp_api  # noqa: E402
-import flashinfer.cake_causal_conv1d_train_kcp as kcp_api  # noqa: E402
+import flashinfer.experimental.cake.cake_causal_conv1d_train_kcp as kcp_api  # noqa: E402
 import flashinfer.experimental.cake.cake_causal_conv1d_train as conv  # noqa: E402
 import flashinfer.experimental.cake.cake_causal_conv1d_train_backend as nondet_backend  # noqa: E402
 import cake_causal_conv1d_baselines as baselines  # noqa: E402

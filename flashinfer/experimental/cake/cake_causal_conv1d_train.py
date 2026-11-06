@@ -98,7 +98,7 @@ Name map (deterministic -> this module)::
         workspace{,_bytes}                                   workspace{,_bytes}
       CakeCausalConv1dDetFunction                          CakeCausalConv1dFunction
       is_cake_causal_conv1d_det_train_supported            is_cake_causal_conv1d_train_supported
-    flashinfer.cake_causal_conv1d_det_train_kcp.         flashinfer.cake_causal_conv1d_train_kcp.
+    flashinfer.cake_causal_conv1d_det_train_kcp.         flashinfer.experimental.cake.cake_causal_conv1d_train_kcp.
       cake_causal_conv1d_det_kcp                           cake_causal_conv1d_kcp
       cake_causal_conv1d_det_multi_kcp                     cake_causal_conv1d_multi_kcp
       RecomputeHandleDetKcp                                RecomputeHandleKcp
