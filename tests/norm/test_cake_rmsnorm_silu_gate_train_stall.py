@@ -136,9 +136,8 @@ forward = functools.partial(
 backward = functools.partial(
     pkg.cake_rmsnorm_silu_gate_train_backward, deterministic=False
 )
-workspace_for = functools.partial(
-    pkg.cake_rmsnorm_silu_gate_train_backward_workspace, deterministic=False
-)
+# The workspace factory chooses no mode and takes no ``deterministic`` keyword.
+workspace_for = pkg.cake_rmsnorm_silu_gate_train_backward_workspace
 
 D = 128
 H = 48
@@ -159,9 +158,7 @@ SEED = 8067
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
-    or not pkg.is_cake_rmsnorm_silu_gate_train_supported(
-        torch.device("cuda"), deterministic=False
-    ),
+    or not pkg.is_cake_rmsnorm_silu_gate_train_supported(torch.device("cuda")),
     reason="Cake SiLU-gated RMSNorm training needs an SM100 / SM103 / SM107 GPU",
 )
 

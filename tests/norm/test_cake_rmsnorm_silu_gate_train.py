@@ -40,8 +40,14 @@ the graph, no fill kernel in it; two such graphs replayed at the same time on
 two streams; the fill inside the graph past the graph-workspace limit), the
 autograd wrapper (non-reentrant checkpointing included), the state a
 checkpointed step keeps (FlashInfer issue #7039) and the mode policy: every
-compute and workspace entry point refuses any ``deterministic`` but ``False``,
-and the backward alerts under ``torch.use_deterministic_algorithms(True)``.
+compute entry point refuses any ``deterministic`` but ``False`` (the default
+included) with the exact message, the helpers take no mode keyword, the
+backward that computes the weight gradient on more than 256 rows alerts under
+``torch.use_deterministic_algorithms(True)`` immediately before its launch,
+and the fixed-order launches (the forward, the short backward, a call with no
+rows, ``compute_grad_weight=False``) do not; under ``warn_only=True`` a CUDA
+Graph warns when it is captured and not when it is replayed; the deterministic
+package's FP32 workspace is refused naming both modes' workspaces.
 
 This suite exercises the package alone, named once through
 ``tests.test_helpers.cake_package`` (so a vendored copy runs it unchanged), and
@@ -59,6 +65,7 @@ import functools
 import warnings
 from pathlib import Path
 
+import numpy
 import pytest
 import torch
 import torch.utils.checkpoint
@@ -75,15 +82,10 @@ forward = functools.partial(
 backward = functools.partial(
     pkg.cake_rmsnorm_silu_gate_train_backward, deterministic=False
 )
-workspace_for = functools.partial(
-    pkg.cake_rmsnorm_silu_gate_train_backward_workspace, deterministic=False
-)
-workspace_bytes = functools.partial(
-    pkg.cake_rmsnorm_silu_gate_train_backward_workspace_bytes, deterministic=False
-)
-reset_workspace = functools.partial(
-    pkg.cake_rmsnorm_silu_gate_train_reset_workspace, deterministic=False
-)
+# The helpers choose no mode and take no ``deterministic`` keyword.
+workspace_for = pkg.cake_rmsnorm_silu_gate_train_backward_workspace
+workspace_bytes = pkg.cake_rmsnorm_silu_gate_train_backward_workspace_bytes
+reset_workspace = pkg.cake_rmsnorm_silu_gate_train_reset_workspace
 gated_rmsnorm = functools.partial(pkg.cake_rmsnorm_silu_gate, deterministic=False)
 
 D = 128
@@ -94,8 +96,11 @@ BF16_RTOL = 2.0**-7
 # of the terms' magnitudes (the deterministic suite's).
 DW_MAG_TOL = 2.0**-20
 REPEATS = 10
-# The refusal of every entry point for a ``deterministic`` other than ``False``.
-REFUSAL = "computes non-deterministically and takes deterministic=False"
+# The refusal of every compute entry point for a ``deterministic`` other than
+# ``False``: its two fixed parts (the deterministic entry point follows).
+REFUSAL = "runs only the non-deterministic kernels and got deterministic="
+NEEDS_FALSE = "pass deterministic=False for the non-deterministic path"
+DET = "flashinfer.cake_rmsnorm_silu_gate_det_train"
 # PyTorch's alert of the backward under its deterministic algorithms.
 ALERT = "does not have a deterministic implementation"
 
@@ -123,7 +128,7 @@ FP32_SHAPES = [(7, 48), (1031, 48), (32737, 48)]
 
 def _supported() -> bool:
     return torch.cuda.is_available() and pkg.is_cake_rmsnorm_silu_gate_train_supported(
-        torch.device("cuda"), deterministic=False
+        torch.device("cuda")
     )
 
 
@@ -620,9 +625,10 @@ def test_reset_workspace_errors():
     with pytest.raises(ValueError, match="CUDA"):
         reset_workspace(torch.zeros(elements, dtype=torch.float64))
     ws = workspace_for(1, torch.device("cuda"))
-    for mode in ({}, {"deterministic": True}, {"deterministic": None}):
-        with pytest.raises(ValueError, match=REFUSAL):
-            pkg.cake_rmsnorm_silu_gate_train_reset_workspace(ws, **mode)
+    # the reset chooses no mode: a mode keyword is a TypeError
+    for value in (False, True, None):
+        with pytest.raises(TypeError, match="deterministic"):
+            pkg.cake_rmsnorm_silu_gate_train_reset_workspace(ws, deterministic=value)
 
 
 def test_two_streams_with_their_own_workspaces():
@@ -1787,65 +1793,88 @@ MODES = (
     {"deterministic": 0},
     {"deterministic": 1},
     {"deterministic": "False"},
+    {"deterministic": numpy.bool_(False)},
+)
+# The deterministic entry point each compute entry point's refusal names.
+DETERMINISTIC_ENTRIES = {
+    "cake_rmsnorm_silu_gate_train_forward": "cake_rmsnorm_silu_gate_det_train_forward",
+    "cake_rmsnorm_silu_gate_train_backward": "cake_rmsnorm_silu_gate_det_train_backward",
+    "cake_rmsnorm_silu_gate": "cake_rmsnorm_silu_gate_det",
+    "CakeRMSNormSiLUGateFunction": "CakeRMSNormSiLUGateDetFunction",
+}
+# The helpers: no mode, no keyword.
+HELPERS = (
+    "cake_rmsnorm_silu_gate_train_backward_workspace",
+    "cake_rmsnorm_silu_gate_train_backward_workspace_bytes",
+    "cake_rmsnorm_silu_gate_train_reset_workspace",
+    "is_cake_rmsnorm_silu_gate_train_supported",
 )
 
 
 def _mode_calls(**mode) -> dict:
-    """One call per entry point of the package with ``mode`` on valid operands."""
+    """One call per compute entry point of the package with ``mode`` on valid operands."""
     x, z, w, dy = make(5, 48, seed=64)
-    ws = workspace_for(1, x.device)
     flag = tuple(mode.values())
     return {
         "cake_rmsnorm_silu_gate_train_forward": lambda: pkg.cake_rmsnorm_silu_gate_train_forward(x, z, w, EPS, **mode),
         "cake_rmsnorm_silu_gate_train_backward": lambda: pkg.cake_rmsnorm_silu_gate_train_backward(dy, x, z, w, EPS, **mode),
-        "cake_rmsnorm_silu_gate_train_backward_workspace": lambda: pkg.cake_rmsnorm_silu_gate_train_backward_workspace(1, x.device, **mode),
-        "cake_rmsnorm_silu_gate_train_backward_workspace_bytes": lambda: pkg.cake_rmsnorm_silu_gate_train_backward_workspace_bytes(1, x.device, **mode),
-        "cake_rmsnorm_silu_gate_train_reset_workspace": lambda: pkg.cake_rmsnorm_silu_gate_train_reset_workspace(ws, **mode),
         "cake_rmsnorm_silu_gate": lambda: pkg.cake_rmsnorm_silu_gate(x, z, w, EPS, **mode),
         "CakeRMSNormSiLUGateFunction": lambda: pkg.CakeRMSNormSiLUGateFunction.apply(x, z, w, EPS, *flag),
     }  # fmt: skip
 
 
 @pytest.mark.parametrize(
-    "mode", MODES, ids=["default", "true", "none", "zero", "one", "string"]
+    "mode",
+    MODES,
+    ids=["default", "true", "none", "zero", "one", "string", "numpy_false"],
 )
 def test_entry_points_refuse_a_deterministic_mode(mode, launches):
     """Any ``deterministic`` but the bool ``False`` (the default ``True``
-    included) is a ``ValueError`` naming the entry point and the deterministic
-    package, before any launch, also under PyTorch's deterministic algorithms
-    (the refusal precedes the alert).  The support query, a capability probe
-    that launches nothing, answers for every value."""
+    included; ``deterministic is not False``) is a ``ValueError`` from every
+    compute entry point, before any launch, also under PyTorch's deterministic
+    algorithms (the refusal precedes the alert): the message names the entry
+    point, says how to ask for the non-deterministic path and names the
+    deterministic entry point.  The helpers take no mode keyword."""
     calls = _mode_calls(**mode)
-    assert set(calls) == set(pkg.__all__) - {
+    assert set(calls) | set(HELPERS) == set(pkg.__all__) - {
         "ARCHES",
         "SUPPORTED_COMPUTE_CAPABILITIES",
-        "is_cake_rmsnorm_silu_gate_train_supported",
     }
+    got = mode.get("deterministic", True)
+    device = torch.device("cuda")
+    ws = workspace_for(1, device)
+    helper_args = {
+        "cake_rmsnorm_silu_gate_train_backward_workspace": (1, device),
+        "cake_rmsnorm_silu_gate_train_backward_workspace_bytes": (1, device),
+        "cake_rmsnorm_silu_gate_train_reset_workspace": (ws,),
+        "is_cake_rmsnorm_silu_gate_train_supported": (device,),
+    }
+    assert set(helper_args) == set(HELPERS)
     for enabled, warn_only in ((False, False), (True, False), (True, True)):
         torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
-        assert (
-            pkg.is_cake_rmsnorm_silu_gate_train_supported(torch.device("cuda"), **mode)
-            is True
-        )
         for name, call in calls.items():
-            with pytest.raises(ValueError, match=f"^{name} {REFUSAL}") as info:
+            with pytest.raises(ValueError) as info:
                 call()
-            assert (
-                "flashinfer.cake_rmsnorm_silu_gate_det_train is the deterministic package"
-                in str(info.value)
+            assert str(info.value) == (
+                f"{pkg.__name__}.{name} {REFUSAL}{got!r}; {NEEDS_FALSE}, or call "
+                f"{DET}.{DETERMINISTIC_ENTRIES[name]} for the deterministic one"
             ), name
+        for name, args in helper_args.items():
+            with pytest.raises(TypeError, match="deterministic"):
+                getattr(pkg, name)(*args, **(mode or {"deterministic": True}))
     assert launches == []
 
 
 def test_backward_alerts_under_deterministic_algorithms(launches):
     """Under ``torch.use_deterministic_algorithms(True)`` the paths that launch
-    the unordered weight-gradient sum -- the backward with
-    ``compute_grad_weight=True`` and the autograd backward when ``weight`` needs
-    a gradient, also for a node built before the mode was enabled -- raise
-    PyTorch's alert before any launch; under ``warn_only=True`` they warn and
-    run the non-deterministic backward (never a fallback).  The forward, the
-    workspace entry points, the reset, the support query and the backward
-    without the weight gradient run without a warning."""
+    the order-varying weight-gradient sum (257 x 48 rows: past the short
+    backward) -- the backward with ``compute_grad_weight=True`` and the
+    autograd backward when ``weight`` needs a gradient, also for a node built
+    before the mode was enabled -- raise PyTorch's alert immediately before
+    the launch; under ``warn_only=True`` they warn and run the
+    non-deterministic backward (never a fallback).  The forward, the workspace
+    entry points, the reset, the support query and the backward without the
+    weight gradient run without a warning."""
     x, z, w, dy = make(257, 48, seed=65)
     dw64, mag = fp64_reference(dy, x, z, w, EPS)[3], magnitudes(dy, x, z, EPS)
     ws = workspace_for(1, x.device)
@@ -1865,9 +1894,7 @@ def test_backward_alerts_under_deterministic_algorithms(launches):
         forward(x, z, w, EPS)
         assert workspace_bytes(1, x.device) == workspace_for(1, x.device).numel() * 8
         reset_workspace(ws)
-        assert pkg.is_cake_rmsnorm_silu_gate_train_supported(
-            x.device, deterministic=False
-        )
+        assert pkg.is_cake_rmsnorm_silu_gate_train_supported(x.device)
         assert backward(dy, x, z, w, EPS, compute_grad_weight=False)[2] is None
         xa, za, wa = leaves(weight_grad=False)
         gated_rmsnorm(xa, za, wa, EPS).backward(dy)
@@ -1889,3 +1916,244 @@ def test_backward_alerts_under_deterministic_algorithms(launches):
     assert_dw_within(wa.grad, dw64, mag, what="warn_only autograd dw")
     fwd = _forward_module(x.numel() // D)
     assert launches == [routes["bwd_bf16"], fwd, routes["bwd_bf16"]], launches
+
+
+def _alert(entry: str, deterministic_entry: str, *, warn_only: bool) -> str:
+    """The exact text of the alert of ``entry`` of this package."""
+    q = f"{pkg.__name__}.{entry}"
+    d = f"{DET}.{deterministic_entry}"
+    if warn_only:
+        return (
+            f"{q} does not have a deterministic implementation, but you set "
+            "'torch.use_deterministic_algorithms(True, warn_only=True)'; the "
+            f"non-deterministic kernels run. {d} is the deterministic one."
+        )
+    return (
+        f"{q} does not have a deterministic implementation, but you set "
+        f"'torch.use_deterministic_algorithms(True)'. You can call {d} instead, "
+        "or use the 'warn_only=True' option, if that's acceptable for your "
+        "application."
+    )
+
+
+def test_alert_texts_name_the_entry_point_and_the_deterministic_one(launches):
+    """The alert of the functional backward names it and the deterministic
+    backward; the autograd backward's names the autograd backward and the
+    deterministic autograd function (strict: ``RuntimeError`` before the
+    launch; ``warn_only``: one ``UserWarning`` a call, then the launch)."""
+    x, z, w, dy = make(257, 48, seed=66)
+
+    def node():
+        torch.use_deterministic_algorithms(False)
+        return gated_rmsnorm(
+            x.clone().requires_grad_(True),
+            z.clone().requires_grad_(True),
+            w.clone().requires_grad_(True),
+            EPS,
+        )
+
+    functional = (
+        "cake_rmsnorm_silu_gate_train_backward",
+        "cake_rmsnorm_silu_gate_det_train_backward",
+    )
+    autograd = (
+        "CakeRMSNormSiLUGateFunction.backward",
+        "CakeRMSNormSiLUGateDetFunction",
+    )
+    torch.use_deterministic_algorithms(True)
+    launches.clear()
+    with pytest.raises(RuntimeError) as info:
+        backward(dy, x, z, w, EPS)
+    assert str(info.value) == _alert(*functional, warn_only=False)
+    y = node()
+    torch.use_deterministic_algorithms(True)
+    launches.clear()
+    with pytest.raises(RuntimeError) as info:
+        y.backward(dy)
+    assert _alert(*autograd, warn_only=False) in str(info.value), str(info.value)
+    assert launches == []
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    with pytest.warns(UserWarning) as record:
+        backward(dy, x, z, w, EPS)
+    got = [str(r.message) for r in record if ALERT in str(r.message)]
+    assert got == [_alert(*functional, warn_only=True)], got
+    y = node()
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    with pytest.warns(UserWarning) as record:
+        y.backward(dy)
+    got = [str(r.message) for r in record if ALERT in str(r.message)]
+    assert got == [_alert(*autograd, warn_only=True)], got
+    bwd = _routes()["bwd_bf16"]
+    assert launches == [bwd, _forward_module(257 * 48), bwd], launches
+
+
+def _forward_rows() -> dict[str, int]:
+    """One row count of each forward module this device routes:
+    ``{module: rows}``."""
+    sm_count = loader.device_sm_count(torch.cuda.current_device())
+    found: dict[str, int] = {}
+    for rows_per_sm in (1, 12, 59, 100, 900, 1200, 2600, 3200):
+        rows = rows_per_sm * sm_count
+        found.setdefault(_forward_module(rows), rows)
+    return found
+
+
+@pytest.mark.parametrize("warn_only", [False, True], ids=["strict", "warn_only"])
+def test_fixed_order_launches_do_not_alert(warn_only, launches):
+    """Under ``torch.use_deterministic_algorithms(True)`` (strict and
+    ``warn_only``) with every warning an error, the launches whose results do
+    not depend on scheduling run without an alert and return the bits they
+    return with the mode off: the forward on every forward module this device
+    routes, the short backward (one cluster, up to 256 rows: BF16 and FP32
+    weight gradients, accumulation, autograd), a backward with no rows and a
+    backward with ``compute_grad_weight=False``."""
+    forward_rows = _forward_rows()
+    assert len(forward_rows) >= 3, forward_rows
+    x5, z5, w5, dy5 = make(5, 48, seed=69)  # 240 rows: the short backward
+    xl, zl, wl, dyl = make(257, 48, seed=70)
+    empty = torch.empty(0, 48, D, dtype=torch.bfloat16, device="cuda")
+    inputs = {rows: make(rows, 1, seed=71) for rows in forward_rows.values()}
+
+    def run():
+        out = [forward(x, z, w, EPS) for x, z, w, _ in inputs.values()]
+        out += backward(dy5, x5, z5, w5, EPS)
+        out += backward(dy5, x5, z5, w5, EPS, grad_weight=torch.empty(D, device="cuda"))
+        main = torch.full((D,), 0.25, dtype=torch.float32, device="cuda")
+        out += backward(
+            dy5, x5, z5, w5, EPS, grad_weight=main, accumulate_grad_weight=True
+        )
+        leaves = [t.clone().requires_grad_(True) for t in (x5, z5, w5)]
+        y = gated_rmsnorm(*leaves, EPS)
+        y.backward(dy5)
+        out += [y, *(t.grad for t in leaves)]
+        out += backward(empty, empty, empty, w5, EPS)
+        out += backward(dyl, xl, zl, wl, EPS, compute_grad_weight=False)[:2]
+        leaves = [t.clone().requires_grad_(i < 2) for i, t in enumerate((xl, zl, wl))]
+        y = gated_rmsnorm(*leaves, EPS)
+        y.backward(dyl)
+        out += [y, leaves[0].grad, leaves[1].grad]
+        assert leaves[2].grad is None
+        return out
+
+    want = run()
+    launches.clear()
+    torch.use_deterministic_algorithms(True, warn_only=warn_only)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        got = run()
+    torch.cuda.synchronize()
+    assert len(got) == len(want)
+    for i, (a, b) in enumerate(zip(got, want, strict=True)):
+        assert torch.equal(a, b), i
+    short_bf16 = _short_backward(5 * 48, torch.bfloat16)[1]
+    short_f32 = _short_backward(5 * 48, torch.float32)[1]
+    assert short_bf16 is not None and short_f32 is not None
+    routes = _routes()
+    assert launches == [
+        *forward_rows,
+        short_bf16,
+        short_f32,
+        short_f32,
+        _forward_module(5 * 48),
+        short_bf16,
+        routes["bwd_bf16"],
+        _forward_module(257 * 48),
+        routes["bwd_bf16"],
+    ], launches
+
+
+def test_graph_capture_alerts_at_capture_and_replays_without_a_check():
+    """Under ``torch.use_deterministic_algorithms(True, warn_only=True)``
+    capturing a backward that computes the weight gradient past the short
+    backward warns once (the check runs on the host, at capture); the replays
+    run the non-deterministic kernel without a warning, ``dw`` within the
+    budget, the workspace zero after each."""
+    T, H = 300, 48
+    x, z, w, dy = make(T, H, seed=72)
+    ws = workspace_for(T * H, x.device)
+    dx, dz = torch.empty_like(x), torch.empty_like(x)
+    dw = torch.empty(D, dtype=torch.bfloat16, device="cuda")
+
+    def step():
+        backward(dy, x, z, w, EPS, grad_x=dx, grad_z=dz, grad_weight=dw, workspace=ws)
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        step()  # loads the module before the capture
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    graph = torch.cuda.CUDAGraph()
+    with pytest.warns(UserWarning) as record, torch.cuda.graph(graph):
+        step()
+    got = [str(r.message) for r in record if ALERT in str(r.message)]
+    assert got == [
+        _alert(
+            "cake_rmsnorm_silu_gate_train_backward",
+            "cake_rmsnorm_silu_gate_det_train_backward",
+            warn_only=True,
+        )
+    ], got
+    dw64, mag = fp64_reference(dy, x, z, w, EPS)[3], magnitudes(dy, x, z, EPS)
+    _, dx64, dz64, _ = fp64_reference(dy, x, z, w, EPS)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        for k in range(3):
+            dw.fill_(7.0)
+            graph.replay()
+            torch.cuda.synchronize()
+            assert_dw_within(dw, dw64, mag, what=f"replay {k} dw")
+            assert_bf16_close(dx, dx64, what=f"replay {k} dx")
+            assert_bf16_close(dz, dz64, what=f"replay {k} dz")
+            assert not bool(ws.any()), k
+
+
+def test_deterministic_workspace_is_refused_naming_both_modes():
+    """The backward (past the short backward and on it, which checks a caller
+    workspace too) and the reset refuse an FP32 tensor, the deterministic
+    package's workspace, naming both modes' workspaces, and leave it as it is;
+    any other unfit buffer gets the FP64 requirement."""
+    device = torch.device("cuda")
+    elements = workspace_for(1, device).numel()
+    fp32 = torch.zeros(8192, dtype=torch.float32, device="cuda")
+    want = (
+        "workspace is FP32, a workspace of the deterministic mode "
+        f"({DET}.cake_rmsnorm_silu_gate_det_train_backward_workspace); the "
+        "non-deterministic backward needs its own zero-filled FP64 workspace "
+        f"({pkg.__name__}.cake_rmsnorm_silu_gate_train_backward_workspace)"
+    )
+    for T in (65, 5):
+        x, z, w, dy = make(T, 48, seed=73)
+        for dtype in (torch.bfloat16, torch.float32):
+            with pytest.raises(ValueError) as info:
+                backward(
+                    dy,
+                    x,
+                    z,
+                    w,
+                    EPS,
+                    grad_weight=torch.empty(D, dtype=dtype, device="cuda"),
+                    workspace=fp32,
+                )
+            assert str(info.value) == want, (T, dtype)
+    with pytest.raises(ValueError) as info:
+        reset_workspace(fp32)
+    assert str(info.value) == want
+    torch.cuda.synchronize()
+    assert not bool(fp32.any())
+    x, z, w, dy = make(65, 48, seed=74)
+    device = x.device
+    for bad in (
+        torch.zeros(elements - 1, dtype=torch.float64, device="cuda"),
+        torch.zeros(2 * elements, dtype=torch.float64, device="cuda")[::2],
+        torch.zeros(2 * elements, dtype=torch.float16, device="cuda"),
+    ):
+        with pytest.raises(ValueError) as info:
+            backward(dy, x, z, w, EPS, workspace=bad)
+        assert str(info.value) == (
+            f"workspace must be a contiguous FP64 tensor on {device} with at least "
+            f"{elements} elements, zero before its first use "
+            "(cake_rmsnorm_silu_gate_train_backward_workspace(rows, device), "
+            "or cake_rmsnorm_silu_gate_train_reset_workspace(workspace))"
+        )

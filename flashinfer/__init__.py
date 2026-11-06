@@ -323,8 +323,8 @@ from .cake_rmsnorm_silu_gate_det_train import (
     cake_rmsnorm_silu_gate_det_train_forward as cake_rmsnorm_silu_gate_det_train_forward,
 )
 
-# The names before the det rename: the package with the deterministic default and the
-# opt-in non-deterministic weight gradient (``deterministic=False``).
+# The opt-in non-deterministic SiLU-gated RMSNorm: entry points take
+# deterministic=False; the deterministic names are above.
 from .cake_rmsnorm_silu_gate_train import (
     CakeRMSNormSiLUGateFunction as CakeRMSNormSiLUGateFunction,
 )

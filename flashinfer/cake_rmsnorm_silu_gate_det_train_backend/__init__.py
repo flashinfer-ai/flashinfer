@@ -41,6 +41,11 @@ Host design (every control is a keyword; no environment variable):
   return the same bits.
 - No call synchronizes the host or the device; every kernel runs on the
   current torch stream with a plain (non-persistent, non-cooperative) grid.
+- Mode: every entry point is deterministic and takes no ``deterministic``
+  keyword (passing one is a ``TypeError``); every launch sums in a fixed
+  order, so ``torch.use_deterministic_algorithms`` does not affect any call.
+  The backward refuses the non-deterministic package's FP64 workspace with a
+  ``ValueError``.
 """
 
 from __future__ import annotations
@@ -66,6 +71,18 @@ SUPPORTED_COMPUTE_CAPABILITIES: tuple[tuple[int, int], ...] = tuple(
     sorted(ARCH_BY_CAPABILITY)
 )
 _ALIGNMENT_BYTES = ALIGNMENT_ELEMENTS * 2
+
+# The workspace factories the backward's refusal of the other mode's workspace
+# names: this package's FP32 partial buffer and the FP64 workspace of the
+# non-deterministic package (named only; nothing is imported from it).
+_DETERMINISTIC_WORKSPACE = (
+    "flashinfer.cake_rmsnorm_silu_gate_det_train."
+    "cake_rmsnorm_silu_gate_det_train_backward_workspace"
+)
+_NONDETERMINISTIC_WORKSPACE = (
+    "flashinfer.cake_rmsnorm_silu_gate_train_backend."
+    "cake_rmsnorm_silu_gate_train_backward_workspace"
+)
 
 
 def _device_index(device: torch.device) -> int:
@@ -354,7 +371,9 @@ def cake_rmsnorm_silu_gate_det_train_backward(
     workspace : torch.Tensor, optional
         FP32 tensor of at least
         :func:`cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes` bytes,
-        contiguous; allocated on the current stream when omitted.
+        contiguous; allocated on the current stream when omitted.  The FP64
+        workspace of the non-deterministic package is refused
+        (``ValueError``).
 
     Returns
     -------
@@ -404,6 +423,12 @@ def cake_rmsnorm_silu_gate_det_train_backward(
     if workspace is None:
         partial = torch.empty((chunks, HEAD_DIM), dtype=torch.float32, device=device)
     else:
+        if isinstance(workspace, torch.Tensor) and workspace.dtype == torch.float64:
+            raise ValueError(
+                "workspace is FP64, a workspace of the non-deterministic mode "
+                f"({_NONDETERMINISTIC_WORKSPACE}); the deterministic backward needs "
+                f"an FP32 workspace ({_DETERMINISTIC_WORKSPACE})"
+            )
         if (
             not isinstance(workspace, torch.Tensor)
             or workspace.device != device
@@ -494,22 +519,6 @@ def cake_rmsnorm_silu_gate_det(
     (128): :class:`CakeRMSNormSiLUGateDetFunction` applied to the arguments."""
 
     return CakeRMSNormSiLUGateDetFunction.apply(x, z, weight, eps)
-
-
-# The names before the det rename, the same objects as the det names of this backend package (not in __all__).
-CakeRMSNormSiLUGateFunction = CakeRMSNormSiLUGateDetFunction
-cake_rmsnorm_silu_gate = cake_rmsnorm_silu_gate_det
-cake_rmsnorm_silu_gate_train_backward = cake_rmsnorm_silu_gate_det_train_backward
-cake_rmsnorm_silu_gate_train_backward_workspace = (
-    cake_rmsnorm_silu_gate_det_train_backward_workspace
-)
-cake_rmsnorm_silu_gate_train_backward_workspace_bytes = (
-    cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes
-)
-cake_rmsnorm_silu_gate_train_forward = cake_rmsnorm_silu_gate_det_train_forward
-is_cake_rmsnorm_silu_gate_train_supported = (
-    is_cake_rmsnorm_silu_gate_det_train_supported
-)
 
 
 __all__ = [

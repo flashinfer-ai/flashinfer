@@ -145,6 +145,47 @@ inputs, outputs and gradients, a weight shared by every token and head whose
 gradient is summed in a fixed order (repeated calls return the same bits), and
 an autograd wrapper that saves only its inputs.
 
+.. rubric:: Mode and dispatch rules
+
+1. The deterministic package ``flashinfer.cake_rmsnorm_silu_gate_det_train``
+   (and its backend package
+   ``flashinfer.cake_rmsnorm_silu_gate_det_train_backend``) takes no
+   ``deterministic`` keyword: passing one raises ``TypeError``. Every launch
+   sums in a fixed order, so ``torch.use_deterministic_algorithms`` does not
+   affect any call. Its backward refuses the FP64 workspace of the
+   non-deterministic package (``ValueError``).
+2. The non-deterministic module ``flashinfer.cake_rmsnorm_silu_gate_train``,
+   the ``flashinfer`` top-level names without ``det`` and the compute entry
+   points of ``flashinfer.cake_rmsnorm_silu_gate_train_backend`` run only the
+   non-deterministic kernels. Each needs an explicit ``deterministic=False``;
+   any other value, the default included, raises ``ValueError`` and names the
+   deterministic entry point. No call is routed to the deterministic package.
+   The backend package's support, workspace and reset helpers take no mode
+   keyword; their copies in ``flashinfer.cake_rmsnorm_silu_gate_train`` also
+   need ``deterministic=False``.
+3. Under ``torch.use_deterministic_algorithms(True)`` the non-deterministic
+   forward never alerts. A non-deterministic backward that computes the
+   weight gradient raises PyTorch's alert immediately before its
+   order-varying launch (``RuntimeError``; with ``warn_only=True`` a
+   ``UserWarning``, then the non-deterministic kernel runs). The one-cluster
+   backward of up to 256 rows (a fixed order), a call with no rows and a call
+   with ``compute_grad_weight=False`` do not alert. The check runs on the
+   host: a CUDA Graph checks it when it is captured, not when it is replayed.
+4. Autograd: the non-deterministic ``CakeRMSNormSiLUGateFunction`` checks the
+   mode in its forward, and its backward takes no mode. A node of either
+   package saves only ``x``, ``z`` and ``weight`` and runs the backward of its
+   own package. A backward workspace holds the raw partial sums of one
+   package and serves only that package (FP32 for the deterministic package,
+   FP64 for the non-deterministic one).
+5. The names the deterministic package had before it took its ``det`` names
+   (``CakeRMSNormSiLUGateFunction``, ``cake_rmsnorm_silu_gate``,
+   ``cake_rmsnorm_silu_gate_train_forward``,
+   ``cake_rmsnorm_silu_gate_train_backward``,
+   ``cake_rmsnorm_silu_gate_train_backward_workspace``,
+   ``cake_rmsnorm_silu_gate_train_backward_workspace_bytes`` and
+   ``is_cake_rmsnorm_silu_gate_train_supported``) are not attributes of
+   ``flashinfer.cake_rmsnorm_silu_gate_det_train`` or of its backend package.
+
 .. currentmodule:: flashinfer.cake_rmsnorm_silu_gate_det_train
 
 .. autosummary::
@@ -156,26 +197,21 @@ an autograd wrapper that saves only its inputs.
     cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes
     cake_rmsnorm_silu_gate_det_train_backward_workspace
     CakeRMSNormSiLUGateDetFunction
+    is_cake_rmsnorm_silu_gate_det_train_supported
 
 Training SiLU-gated RMSNorm, opt-in non-deterministic weight gradient (Cake)
 ---------------------------------------------------------------------------
 
-The names the training SiLU-gated RMSNorm had before the deterministic package
-took its ``det`` names. Every entry point takes the keyword ``deterministic``
-(default ``True``; a value that is not a ``bool`` raises ``TypeError``), and
-``CakeRMSNormSiLUGateFunction`` takes it as its last forward input:
+The non-deterministic package. Every entry point needs ``deterministic=False``
+(see the mode and dispatch rules above) and runs only the standalone
+non-deterministic kernels (``flashinfer.cake_rmsnorm_silu_gate_train_backend``):
 
-* ``deterministic=True`` runs the deterministic package above and returns its
-  bits.
-* ``deterministic=False`` runs the standalone non-deterministic package
-  (``flashinfer.cake_rmsnorm_silu_gate_train_backend``, whose compute and
-  workspace entry points take ``deterministic=False`` only): the same forward
-  kernel (up to 12 rows per SM on SM100 and SM103 and up to 59 on SM107, a
-  forward with 16 threads to a row, and from 976 rows per SM on SM100 and
-  SM103 and from 800 on SM107,
-  a forward whose CTAs each walk several row blocks: the same bits) and a
-  one-kernel backward: ``dx`` and ``dz`` are the deterministic backward's
-  bits, and the CTAs take row blocks (each CTA its own block when
+* The forward is the deterministic package's forward kernel (up to 12 rows
+  per SM on SM100 and SM103 and up to 59 on SM107, a forward with 16 threads
+  to a row, and from 976 rows per SM on SM100 and SM103 and from 800 on SM107,
+  a forward whose CTAs each walk several row blocks: the same bits).
+* The backward is one kernel: ``dx`` and ``dz`` are the deterministic
+  backward's bits, and the CTAs take row blocks (each CTA its own block when
   the grid has a CTA for every block; past one wave of CTAs they claim the
   blocks in chunks from the workspace's claim counter) and add their FP64
   weight-gradient column sums into FP64 accumulators of the workspace in the
@@ -183,22 +219,15 @@ took its ``det`` names. Every entry point takes the keyword ``deterministic``
   order depend on scheduling: the weight gradient can differ between calls,
   always within the deterministic backward's error bound (for FP32 normal
   gates, terms and sums; with subnormal values both backwards can leave it).
-  Up to 256 rows
-  the backward is one thread-block cluster of 16 CTAs that adds
+  Up to 256 rows the backward is one thread-block cluster of 16 CTAs that adds
   the CTAs' partial sums in a fixed order on chip: the same bits on every
-  call, within the same bound, and no workspace. The workspace
+  call, within the same bound, and no workspace.
+* The workspace
   (``cake_rmsnorm_silu_gate_train_backward_workspace(..., deterministic=False)``,
   a few KiB whatever the token count) is zero after every call: zero it once
   and reuse it, one per concurrently running stream. A buffer that anything
   else wrote into is zeroed with
   ``cake_rmsnorm_silu_gate_train_reset_workspace(..., deterministic=False)``.
-* Under ``torch.use_deterministic_algorithms(True)``, ``deterministic=False``
-  raises ``RuntimeError`` from the compute, workspace and autograd entry
-  points; with ``warn_only=True`` they warn and run the deterministic kernels.
-  The backward of a ``deterministic=False`` autograd node that runs after the
-  mode was enabled raises PyTorch's alert (``warn_only=True``: a warning, then
-  the non-deterministic backward). The support query and the workspace reset
-  do not depend on that setting.
 
 .. currentmodule:: flashinfer.cake_rmsnorm_silu_gate_train
 
