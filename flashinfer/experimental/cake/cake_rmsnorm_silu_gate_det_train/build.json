@@ -337,6 +337,6 @@
       ]
     }
   ],
-  "package": "flashinfer.cake_rmsnorm_silu_gate_det_train_backend",
+  "package": "flashinfer.experimental.cake.cake_rmsnorm_silu_gate_det_train",
   "schema": "cake-build/1"
 }

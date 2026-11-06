@@ -14,9 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Deterministic context-parallel (KCP) packed KDA (Kimi Delta Attention) chunked training
-(SM100 / SM103 / SM107), the Cake backend.  ``flashinfer.kda_train`` keeps the names these
-entry points had before (``chunk_kda_kcp``, ``kcp_partition``, ``KcpRecomputeHandle``, ...)
-as compatibility aliases of the objects defined here.
+(SM100 / SM103 / SM107), the Cake backend.
 
 The packed batch is split over the ranks of a process group (``partition_det_kcp``), every rank
 holds its fragments of the documents, and the per-document state recurrences cross the rank
