@@ -17,8 +17,10 @@ from cutlass import const_expr
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass._mlir.dialects import llvm
 from cutlass.cute import experimental as cute_ext
+import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.nvgpu import warp
 from cutlass.cute.runtime import from_dlpack
+from cutlass.utils.distributed import multimem_st_4xb32
 
 _MMA_SHAPE = (16, 8, 16)
 _COMPUTE_WARPS = 4
@@ -544,8 +546,204 @@ def _make_smem_layout(dtype, rows: int, cols: int, stages: int):
     )
 
 
+@dataclasses.dataclass(frozen=True)
+class LamportPeerStoreConfig:
+    """Destinations of a Lamport peer-store epilogue, compiled into the kernel.
+
+    Lamport protocol: consumers pre-fill the slots with zero, which the producer
+    never stores, and poll until every 32-bit word is nonzero; no flag or barrier.
+    The tile goes into every ``peer_ptrs`` buffer (one per rank, in rank order)
+    or once through ``multicast_ptr``. A buffer holds two halves of
+    ``world_size * slot_bytes`` bytes and the producer writes half
+    ``h = epoch & 1``, reading the int32 at ``epoch_ptr`` after the
+    grid-dependency wait, and releases its dependents only after that wait, so a
+    consumer that reads the epoch at launch sees every earlier advance; the
+    consumer must not advance the epoch before this grid completes (a
+    grid-dependency wait before the advance). Element
+    ``(m, n)`` of this rank's ``[M, N]`` tile lands at byte offset
+
+    * ``"broadcast"`` (all-reduce input, full tile per rank):
+      ``(h * world_size + rank) * slot_bytes + (m * N + n) * 2``
+    * ``"gather"`` (all-gather input, this rank's column slice):
+      ``h * world_size * slot_bytes + ((rank * M + m) * N + n) * 2``
+
+    An all-zero 32-bit word is stored as ``0x00008000`` (its first element as ``-0.0``).
+    """
+
+    layout: str
+    world_size: int
+    rank: int
+    slot_bytes: int
+    epoch_ptr: int
+    peer_ptrs: tuple[int, ...] | None
+    multicast_ptr: int | None
+
+
+def make_lamport_peer_store_config(
+    *, peer_ptrs, multicast_ptr, epoch_ptr, slot_bytes, rank, world_size, layout, m, n
+) -> LamportPeerStoreConfig:
+    if (peer_ptrs is None) == (multicast_ptr is None):
+        raise ValueError("pass exactly one of peer_ptrs and multicast_ptr")
+    if layout not in ("broadcast", "gather"):
+        raise ValueError(f"unsupported layout {layout!r}")
+    if not 0 <= rank < world_size:
+        raise ValueError(f"rank={rank} must be in [0, {world_size})")
+    if peer_ptrs is not None:
+        peer_ptrs = tuple(int(ptr) for ptr in peer_ptrs)
+        if len(peer_ptrs) != world_size:
+            raise ValueError(f"expected {world_size} peer_ptrs, got {len(peer_ptrs)}")
+    else:
+        multicast_ptr = int(multicast_ptr)
+    if any(ptr <= 0 or ptr % 16 for ptr in peer_ptrs or (multicast_ptr,)):
+        raise ValueError("destinations must be non-null and 16-byte aligned")
+    if int(epoch_ptr) <= 0 or int(epoch_ptr) % 4:
+        raise ValueError("epoch_ptr must be non-null and 4-byte aligned")
+    if slot_bytes % 16 or m * n * 2 > slot_bytes:
+        raise ValueError(f"slot_bytes must be 16-aligned and >= {m * n * 2}")
+    return LamportPeerStoreConfig(
+        layout, world_size, rank, slot_bytes, int(epoch_ptr), peer_ptrs, multicast_ptr
+    )
+
+
+def load_peer_epoch_parity(config: LamportPeerStoreConfig):
+    """``epoch & 1``; a plain load, issued after the grid-dependency wait."""
+    epoch = cute.make_tensor(
+        cute.make_ptr(
+            cutlass.Int32,
+            cutlass.Int64(config.epoch_ptr),
+            cute.AddressSpace.gmem,
+            assumed_align=4,
+        ),
+        cute.make_layout(1),
+    )
+    return epoch[0] & 1
+
+
+def replace_zero_sentinel(chunk):
+    """Store an all-zero word of ``chunk`` as ``0x00008000``, the Lamport sentinel rule."""
+    one = cutlass.Uint32(1)
+    for i in range(4):
+        word = chunk[i]
+        # word | -word has its top bit set exactly when word != 0.
+        chunk[i] = word | ((((word | (cutlass.Uint32(0) - word)) >> 31) ^ one) << 15)
+    return chunk
+
+
+def store_peer_chunk(config: LamportPeerStoreConfig, parity, row, feature, m, n, chunk):
+    """Store the 16 B chunk of output (``row``, ``feature``..``feature + 7``) of an
+    ``m`` x ``n`` GEMM to every destination buffer, in half ``parity``."""
+    half = cutlass.Int64(parity) * config.world_size
+    if config.layout == "gather":
+        offset = half * config.slot_bytes + (
+            (cutlass.Int64(config.rank * m + row) * n + feature) * 2
+        )
+    else:
+        offset = (half + config.rank) * config.slot_bytes + (
+            (cutlass.Int64(row) * n + feature) * 2
+        )
+    if config.multicast_ptr is not None:
+        multimem_st_4xb32(
+            cute.make_ptr(
+                cutlass.Uint32,
+                cutlass.Int64(config.multicast_ptr) + offset,
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            ),
+            *(chunk[i].ir_value() for i in range(4)),
+        )
+    else:
+        for ptr in config.peer_ptrs:
+            dst = cute.make_ptr(
+                cutlass.Uint32,
+                cutlass.Int64(ptr) + offset,
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            cute.autovec_copy(chunk, cute.make_tensor(dst, cute.make_layout(4)))
+
+
+@cute.experimental.jit
+def store_tile_to_peers(
+    config: LamportPeerStoreConfig,
+    rD,
+    tiled_copy_t2r,
+    epi_tid,
+    d_layout,
+    acc_dtype,
+    sA,
+    mC,
+    m_idx,
+    n_idx,
+    cta_m: cutlass.Constexpr,
+    cta_n: cutlass.Constexpr,
+):
+    """Peer-store epilogue of the TMEM GEMMs (128 epilogue threads, named barrier 1): the
+    ``cta_m`` x ``cta_n`` tile ``rD`` of the (N, M) output ``mC``, staged in A's first stage ``sA``."""
+    c_dtype = rD.element_type
+    # (1) stmatrix the tile into A's stage 0 (idle after the MMAs), token-major
+    #     with the 16 B chunks of each token XOR-swizzled by token % 8.
+    stage = cute.make_tensor(
+        cute.recast_ptr(sA.iterator, dtype=c_dtype),
+        cute.make_composed_layout(
+            cute.make_swizzle(3, 3, cta_m.bit_length() - 4),
+            0,
+            cute.make_layout((cta_m, cta_n), stride=(1, cta_m)),
+        ),
+    )
+    tiled_copy_r2s = cute.make_tiled_copy_D(
+        sm100_utils.get_smem_store_op(d_layout, c_dtype, acc_dtype, tiled_copy_t2r),
+        tiled_copy_t2r,
+    )
+    cute_ext.partition_and_copy(
+        tiled_copy_r2s.get_slice(epi_tid), tiled_copy_r2s.retile(rD), stage
+    )
+    cute.arch.barrier(barrier_id=1, number_of_threads=128)
+    # Ordered after the B loader's grid-dependency wait by the mainloop barriers.
+    parity = load_peer_epoch_parity(config)
+    n = cute.size(mC, mode=[0])
+    m = cute.size(mC, mode=[1])
+    feat_chunks = cta_m // 8
+    chunks = feat_chunks * cta_n
+    # The stage as 32-bit words: (word, 16 B chunk, token).
+    stage_words = cute.make_tensor(
+        cute.recast_ptr(sA.iterator, dtype=cutlass.Uint32),
+        cute.make_layout((4, feat_chunks, cta_n)),
+    )
+    for c_iter in cutlass.range_constexpr((chunks + 127) // 128):
+        # Consecutive threads take consecutive chunks of one token, so each
+        # warp stores whole rows to the peers.
+        chunk = c_iter * 128 + epi_tid
+        feature_block = chunk % feat_chunks
+        token_in_tile = chunk // feat_chunks
+        token = n_idx * cta_n + token_in_tile
+        feature = m_idx * cta_m + feature_block * 8
+        if chunk < chunks:
+            # A 2-CTA cluster can round the grid up past N: predicate features as well as tokens.
+            if token < m:
+                if feature < n:
+                    # (2) Load the chunk from SMEM.
+                    values = cute.make_rmem_tensor(cute.make_layout(4), cutlass.Uint32)
+                    cute.autovec_copy(
+                        stage_words[
+                            None, feature_block ^ token_in_tile % 8, token_in_tile
+                        ],
+                        values,
+                    )
+                    # (3) Replace zeros with the sentinel.
+                    values = replace_zero_sentinel(values)
+                    # (4) Store to every peer.
+                    store_peer_chunk(config, parity, token, feature, m, n, values)
+
+
 class CpAsyncWarpSplitKKernel:
-    def __init__(self, tactic: WarpSplitKTactic, use_pdl: bool, has_bias: bool) -> None:
+    def __init__(
+        self,
+        tactic: WarpSplitKTactic,
+        use_pdl: bool,
+        has_bias: bool,
+        peer_store: LamportPeerStoreConfig | None = None,
+    ) -> None:
+        self.peer_store = peer_store
         self.output_tile = tactic.output_tile
         self.token_tile = tactic.token_tile
         self.k_tile = tactic.k_tile
@@ -852,10 +1050,12 @@ class CpAsyncWarpSplitKKernel:
             prims.barrier_cta_sync(1, thread_count=_COMPUTE_WARPS * 32)
 
         if warp_idx == self.compute_warp_base:
+            # The peer store reduces and stores its own 16 B chunks below instead.
+            reduced_values = values_per_lane if self.peer_store is None else 0
             final_acc = cute.make_rmem_tensor(
                 cute.make_layout(values_per_lane), cutlass.Float32
             )
-            for value in cutlass.range_constexpr(values_per_lane):
+            for value in cutlass.range_constexpr(reduced_values):
                 linear = value * cute.arch.WARP_SIZE + lane_idx
                 feature = linear % self.output_tile
                 token = linear // self.output_tile
@@ -874,7 +1074,7 @@ class CpAsyncWarpSplitKKernel:
 
             output_base = output_tile_idx * self.output_tile
             token_base = token_tile_idx * self.token_tile
-            for value in cutlass.range_constexpr(values_per_lane):
+            for value in cutlass.range_constexpr(reduced_values):
                 linear = value * cute.arch.WARP_SIZE + lane_idx
                 feature = linear % self.output_tile
                 token = linear // self.output_tile
@@ -882,6 +1082,56 @@ class CpAsyncWarpSplitKKernel:
                     output[token_base + token, output_base + feature] = final_acc[
                         value
                     ].to(output.element_type)
+            if const_expr(self.peer_store is not None):
+                peer_store = self.peer_store
+                # Ordered after the B loader's grid-dependency wait by the mainloop barriers.
+                parity = load_peer_epoch_parity(peer_store)
+                m = cute.size(activation, mode=[0])
+                n = cute.size(weight, mode=[0])
+                feat_chunks = self.output_tile // 8
+                chunks = feat_chunks * self.token_tile
+                for c_iter in cutlass.range_constexpr(
+                    (chunks + cute.arch.WARP_SIZE - 1) // cute.arch.WARP_SIZE
+                ):
+                    # Each lane owns one 16 B chunk (8 features of one token).
+                    chunk = c_iter * cute.arch.WARP_SIZE + lane_idx
+                    feature = chunk % feat_chunks * 8
+                    row = token_base + chunk // feat_chunks
+                    if chunk < chunks:
+                        if row < m:
+                            # (1) Reduce the warps' partials, in the same order as above.
+                            values = cute.make_rmem_tensor(
+                                cute.make_layout(8), cutlass.BFloat16
+                            )
+                            for j in cutlass.range_constexpr(8):
+                                chunk_total = cutlass.Float32(0)
+                                for peer in cutlass.range_constexpr(_COMPUTE_WARPS):
+                                    chunk_total = (
+                                        chunk_total
+                                        + partials[
+                                            peer * partial_stride
+                                            + _partial_offset(
+                                                feature + j,
+                                                chunk // feat_chunks,
+                                                self.token_tile,
+                                            )
+                                        ]
+                                    )
+                                values[j] = chunk_total.to(cutlass.BFloat16)
+                            # (2) Replace zeros with the sentinel.
+                            words = replace_zero_sentinel(
+                                cute.recast_tensor(values, cutlass.Uint32)
+                            )
+                            # (3) Store to every peer.
+                            store_peer_chunk(
+                                peer_store,
+                                parity,
+                                row,
+                                output_base + feature,
+                                m,
+                                n,
+                                words,
+                            )
 
 
 def _from_dlpack(tensor: _torch.Tensor, *, dynamic_m: bool = False):
@@ -903,10 +1153,11 @@ def _compile(
     tactic: WarpSplitKTactic,
     use_pdl: bool,
     has_bias: bool,
+    peer_store: LamportPeerStoreConfig | None = None,
 ):
     with _torch.cuda.device(device_index):
         return cute_ext.compile(
-            CpAsyncWarpSplitKKernel(tactic, use_pdl, has_bias),
+            CpAsyncWarpSplitKKernel(tactic, use_pdl, has_bias, peer_store),
             *(
                 _from_dlpack(
                     _torch.empty(shape, device="cuda", dtype=dtype),
@@ -942,10 +1193,56 @@ def run_warp_splitk_dense(a, b, out, pdl: bool, tactic: WarpSplitKTactic, bias=N
     return out
 
 
+def run_warp_splitk_dense_peer_store(
+    a,
+    b,
+    out,
+    tactic: WarpSplitKTactic,
+    *,
+    peer_ptrs=None,
+    multicast_ptr=None,
+    epoch_ptr: int,
+    slot_bytes: int,
+    rank: int,
+    world_size: int,
+    layout: str = "broadcast",
+    pdl: bool = True,
+) -> None:
+    """``run_warp_splitk_dense`` (no bias) storing into peer buffers (``LamportPeerStoreConfig``); ``out`` is not written."""
+    m, n, k = validate_inputs(a, b, out)
+    validate_tactic(tactic, m, n, k)
+    peer_store = make_lamport_peer_store_config(
+        peer_ptrs=peer_ptrs,
+        multicast_ptr=multicast_ptr,
+        epoch_ptr=epoch_ptr,
+        slot_bytes=slot_bytes,
+        rank=rank,
+        world_size=world_size,
+        layout=layout,
+        m=m,
+        n=n,
+    )
+    device_index = a.device.index
+    assert device_index is not None
+    with _torch.cuda.device(a.device):
+        compiled = _compile(device_index, a.dtype, n, k, tactic, pdl, False, peer_store)
+        compiled(
+            _from_dlpack(b.T),
+            _from_dlpack(a, dynamic_m=True),
+            _from_dlpack(out[0]),
+            _from_dlpack(out, dynamic_m=True),
+            _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream),
+        )
+
+
 __all__ = [
+    "LamportPeerStoreConfig",
     "WarpSplitKTactic",
     "autotune_tactics",
     "default_tactic",
+    "make_lamport_peer_store_config",
     "run_warp_splitk_dense",
+    "run_warp_splitk_dense_peer_store",
+    "store_tile_to_peers",
     "validate_inputs",
 ]

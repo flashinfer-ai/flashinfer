@@ -24,6 +24,12 @@ from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
 
+from flashinfer.gemm.kernels.dense_bf16_gemm_warp_splitk import (
+    LamportPeerStoreConfig,
+    make_lamport_peer_store_config,
+    store_tile_to_peers,
+)
+
 #: Per-CTA SMEM capacity reported by CuTeDSL on SM100/SM103.
 _SMEM_CAPACITY_BYTES = utils.get_smem_capacity_in_bytes("sm_100")
 
@@ -378,6 +384,7 @@ __all__ = [
     "autotune_tactics",
     "default_tactic",
     "run_splitk_dense",
+    "run_splitk_dense_peer_store",
 ]
 
 
@@ -506,7 +513,9 @@ class SplitKDenseGemmKernel:
         use_pdl: bool,
         has_bias: bool,
         arch: str = "sm_100",
+        peer_store: LamportPeerStoreConfig | None = None,
     ) -> None:
+        self.peer_store = peer_store
         self.acc_dtype = cutlass.Float32
         # Dynamic SMEM requested at launch: the capacity of ``arch``.
         self.arch = arch
@@ -663,6 +672,11 @@ class SplitKDenseGemmKernel:
             mailbox = sA
             bar_reduce = bar_mma_epilog
 
+        # None compiles the peer-store epilogue out.
+        peer_store_operands = None
+        if cutlass.const_expr(self.peer_store is not None):
+            peer_store_operands = (sA, mC, bidx, n_idx)
+
         if warp_idx == 0:
             with cute.arch.elect_one():
                 for i in range(stages):
@@ -744,6 +758,7 @@ class SplitKDenseGemmKernel:
                 mailbox,
                 bar_reduce,
                 split_rank,
+                peer_store_operands=peer_store_operands,
             )
 
     @cute.experimental.jit
@@ -762,6 +777,8 @@ class SplitKDenseGemmKernel:
         stages = self.num_ab_stage
         if cutlass.const_expr(not is_a and self.use_pdl):
             cute.arch.griddepcontrol_wait()
+            # Release dependents only after this wait: a pre-pushed consumer reads the epoch at launch.
+            cute.arch.griddepcontrol_launch_dependents()
 
         empty_phase = cutlass.Int32(1)
         for k_tile in cutlass.range(k_tile_count, unroll=1):
@@ -786,8 +803,6 @@ class SplitKDenseGemmKernel:
             if stage == stages - 1:
                 empty_phase = empty_phase ^ 1
 
-        if cutlass.const_expr(is_a and self.use_pdl):
-            cute.arch.griddepcontrol_launch_dependents()
         if cutlass.const_expr(not is_a and self.has_bias):
             cute.arch.mbarrier_arrive(bar_tma_epilog)
         self._drain_producer(bar_empty, empty_phase, k_tile_count)
@@ -878,6 +893,7 @@ class SplitKDenseGemmKernel:
         mailbox,
         bar_reduce,
         split_rank: cutlass.Int32,
+        peer_store_operands=None,
     ):
         # Wait until MMA publishes the TMEM base pointer.
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
@@ -998,8 +1014,26 @@ class SplitKDenseGemmKernel:
                 rAcc.store(rAcc.load() + rBiasAcc.load())
 
             rD.store(rAcc.load().to(c_dtype))
-            # Preserve TMEM coordinates; the copy predicates output tails.
-            cute_ext.partition_and_copy(thr_t2r, rD, gD_epi[None, None, 0, 0])
+            if cutlass.const_expr(self.peer_store is None):
+                # Preserve TMEM coordinates; the copy predicates output tails.
+                cute_ext.partition_and_copy(thr_t2r, rD, gD_epi[None, None, 0, 0])
+            else:
+                sA, mC, bidx, n_idx = peer_store_operands
+                assert self.cta_n <= self.cta_k  # the tile fits in one A stage
+                store_tile_to_peers(
+                    self.peer_store,
+                    rD,
+                    tiled_copy_t2r,
+                    epi_tid,
+                    d_layout,
+                    self.acc_dtype,
+                    sA,
+                    mC,
+                    bidx,
+                    n_idx,
+                    self.cta_m,
+                    self.cta_n,
+                )
 
         # The reduction mbarrier covers remote stores; no cluster barrier needed.
 
@@ -1131,6 +1165,7 @@ def _get_compiled_splitk_kernel(
     use_pdl: bool,
     has_bias: bool,
     leading_dims: tuple[int, int, int],
+    peer_store: LamportPeerStoreConfig | None = None,
 ):
     if dtype not in _SUPPORTED_TORCH_DTYPES:
         raise ValueError(
@@ -1146,6 +1181,7 @@ def _get_compiled_splitk_kernel(
                 use_pdl=use_pdl,
                 has_bias=has_bias,
                 arch=_arch(device_index),
+                peer_store=peer_store,
             ),
             *(compile_tensors if has_bias else compile_tensors[:3]),
             _cuda.CUstream(_torch.cuda.current_stream().cuda_stream),
@@ -1223,3 +1259,55 @@ def run_splitk_dense(
             _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream),
         )
     return out
+
+
+def run_splitk_dense_peer_store(
+    a,
+    b,
+    out,
+    tactic: SplitKTactic,
+    *,
+    peer_ptrs=None,
+    multicast_ptr=None,
+    epoch_ptr: int,
+    slot_bytes: int,
+    rank: int,
+    world_size: int,
+    layout: str = "broadcast",
+    pdl: bool = True,
+) -> None:
+    """``run_splitk_dense`` (BF16, no bias) storing into peer buffers (``LamportPeerStoreConfig``); ``out`` is not written."""
+    m, n, k = _validate_runtime_tensors(a, b, None, out)
+    smem_capacity = _smem_capacity_bytes(a.get_device())
+    validate_tactic(tactic, m, n, k, smem_capacity=smem_capacity)
+    if a.dtype != _torch.bfloat16:
+        raise ValueError("split-K peer store supports bfloat16 only")
+    # The peer-store epilogue stores 16 B chunks (8 features), predicated against N.
+    if n % 8:
+        raise ValueError(f"N={n} must be a multiple of 8")
+    peer_store = make_lamport_peer_store_config(
+        peer_ptrs=peer_ptrs,
+        multicast_ptr=multicast_ptr,
+        epoch_ptr=epoch_ptr,
+        slot_bytes=slot_bytes,
+        rank=rank,
+        world_size=world_size,
+        layout=layout,
+        m=m,
+        n=n,
+    )
+    with _torch.cuda.device(a.device):
+        tensors = _to_cute_swap(a, b, out, None)
+        compiled = _get_compiled_splitk_kernel(
+            device_index=a.get_device(),
+            dtype=a.dtype,
+            tactic=tactic,
+            use_pdl=pdl,
+            has_bias=False,
+            leading_dims=tensors[4],
+            peer_store=peer_store,
+        )
+        compiled(
+            *tensors[:3],
+            _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream),
+        )
