@@ -7807,7 +7807,9 @@ def cake_lm_head_nondet_train_preload(
         valid, pos, idx_full = compaction_index(
             labels, ar=_hidden_count_arange(index, int(labels.numel()))
         )
-        _assert_on_device(pos[-1] == int(pos.numel() - 2), "cake_lm_head_nondet_train_preload")
+        _assert_on_device(
+            pos[-1] == int(pos.numel() - 2), "cake_lm_head_nondet_train_preload"
+        )
         index_rows = valid.nonzero().squeeze(1)
         rows = torch.zeros((8, 8), dtype=torch.bfloat16, device=dev)
         picked = torch.index_select(rows, 0, index_rows)
@@ -7817,7 +7819,10 @@ def cake_lm_head_nondet_train_preload(
         if temperature:
             # the temperature path's operators: the value check, the scalar fill and the gathers
             tau = torch.full((8,), 0.5, dtype=torch.float32, device=dev)
-            _assert_on_device(((tau > 0) & (tau < math.inf)).all(), "cake_lm_head_nondet_train_preload")
+            _assert_on_device(
+                ((tau > 0) & (tau < math.inf)).all(),
+                "cake_lm_head_nondet_train_preload",
+            )
             torch.index_select(tau, 0, index_rows)
             torch.index_select(
                 tau,
