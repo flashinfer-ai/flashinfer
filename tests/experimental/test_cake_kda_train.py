@@ -5991,6 +5991,73 @@ def test_the_node_holds_the_workspace_weakly(device, manifest) -> None:
     check(held)
 
 
+def test_a_set_planned_for_other_sms_is_refused_by_a_backward_without_its_workspace(
+    device, manifest
+) -> None:
+    """The node's saved set is checked against the plan of the backward that reads it.  A forward on a caller's
+    workspace planned for half the device's SMs (fewer segments: a shorter ``seg_table`` and segment states of
+    another ``NSEG``) whose workspace is gone at the backward: the backward plans for the device's SMs and refuses
+    the set with the shape ``ValueError`` before any launch, as for any set of another geometry."""
+    import gc
+    import weakref
+
+    lengths, heads = (32768,), 8
+    S, N = sum(lengths), len(lengths)
+    sm, arch = cake_jit.sm_count(device.index), cake_jit.device_arch(device.index)
+    own = cake_backend.plan(S, N, heads, sm, arch)
+    half = cake_backend.plan(S, N, heads, sm // 2, arch)
+    if own.recur != "seg" or half.recur != "seg" or own.NSEG == half.NSEG:
+        pytest.skip(
+            f"{arch} with {sm} SMs: no segmented plan of another NSEG at half the SMs"
+        )
+    inputs = make_inputs(lengths, heads, device)
+    q, k, v, g, beta = (
+        inputs[n].detach().clone().requires_grad_(True)
+        for n in ("q", "k", "v", "g", "beta")
+    )
+    workspace = KdaWorkspace(half, device, backward=True, deterministic=False)
+    alive = weakref.ref(workspace)
+    out = chunk_kda(q, k, v, g, beta, inputs["cu_seqlens"], workspace=workspace)
+    del workspace
+    gc.collect()
+    assert alive() is None  # the backward plans its own workspace
+    words = (own.NSEG + 2 * N + 1,)
+    with pytest.raises(
+        ValueError,
+        match=re.escape(f"saved.tables.seg_table: expected shape {words}"),
+    ):
+        out.backward(inputs["dout"])
+
+
+def test_a_saved_tensor_hook_after_the_forward_keeps_the_saved_set_checks(
+    device, manifest
+) -> None:
+    """The node's backward checks every saved tensor it reads back, also one a per-tensor saved-tensor hook
+    registered after the forward (``grad_fn._raw_saved_tensors[i]``) hands back: ``Aqk`` with another shape, dtype
+    or layout is refused with the same ``ValueError`` as a caller's saved set of that kind."""
+    lengths, heads = (63, 1, 65), 2
+    S = sum(lengths)
+    inputs = make_inputs(lengths, heads, device)
+    aqk = 6  # the saved tensors: q, k, v, g, beta, cu_seqlens, then the set's Aqk
+    cases = (
+        (lambda t: t[:-1], f"saved.Aqk: expected shape {(S, heads, BT)}"),
+        (lambda t: t.float(), "saved.Aqk: expected torch.bfloat16"),
+        (
+            lambda t: t.transpose(0, 1).contiguous().transpose(0, 1),
+            "saved.Aqk: must be contiguous",
+        ),
+    )
+    for unpack, message in cases:
+        q, k, v, g, beta = (
+            inputs[n].detach().clone().requires_grad_(True)
+            for n in ("q", "k", "v", "g", "beta")
+        )
+        out = chunk_kda(q, k, v, g, beta, inputs["cu_seqlens"])
+        out.grad_fn._raw_saved_tensors[aqk].register_hooks(lambda t: t, unpack)
+        with pytest.raises(ValueError, match=re.escape(message)):
+            out.backward(inputs["dout"])
+
+
 def test_arena_content_never_reaches_a_result(device, manifest) -> None:
     """Write-before-read: every element a launch reads is written earlier in the same call, so an arena filled
     with NaN bytes gives the zero-filled arena's results bit for bit on every path (the forward with and without
