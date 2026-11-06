@@ -6,8 +6,8 @@ are routed to experts via ``m_indptr``.
 
 The public API is backend-agnostic and lives in :mod:`.core`.  Each
 backend has its own subpackage (e.g. :mod:`.cudnn`); future backends
-should follow the same convention.  The experimental Cake training entry
-points of the MoE grouped GEMM are the modules
+should follow the same convention.  The Cake training entry points of the
+MoE grouped GEMM are the modules
 :mod:`flashinfer.cake_moe_grouped_gemm_det_train` and
 :mod:`flashinfer.cake_moe_grouped_gemm_nondet_train`.
 """
