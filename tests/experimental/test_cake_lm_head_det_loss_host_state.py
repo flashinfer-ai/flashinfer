@@ -70,7 +70,7 @@ def _bits(t):
 def _logprob_step(inp, chunk):
     X = inp.X.detach().requires_grad_(True)
     W = inp.W.detach().requires_grad_(True)
-    logp = public.chunked_lm_head_det_logprob(X, W, inp.labels, chunk_size=chunk)
+    logp = public.cake_lm_head_det_train_logprob(X, W, inp.labels, chunk_size=chunk)
     logp.backward(inp.dlogp)
     return dict(logp=logp.detach(), dX=X.grad, dW=W.grad)
 
@@ -203,7 +203,7 @@ def test_hidden_count_arange_records_each_stream_once():
 def _policy_step(inp, chunk):
     X = inp.X.detach().requires_grad_(True)
     W = inp.W.detach().requires_grad_(True)
-    loss, logp = public.chunked_lm_head_det_loss(
+    loss, logp = public.cake_lm_head_det_train_loss(
         X,
         W,
         inp.labels,
@@ -461,7 +461,7 @@ def test_device_first_calls_of_two_threads_keep_the_sync_debug_mode(weight, mode
     def step():
         X = inp.X.detach().requires_grad_(True)
         W = inp.W.detach().requires_grad_(True)
-        loss, logp = cake_backend.chunked_lm_head_det_loss(
+        loss, logp = cake_backend.cake_lm_head_det_train_loss(
             X, W, inp.labels, loss_div=inp.loss_div, chunk_size=4096, return_logp=True
         )
         loss.backward()
@@ -579,7 +579,7 @@ def _require_temperature_forms():
 def _logprob_temperature_step(inp, chunk):
     X = inp.X.detach().requires_grad_(True)
     W = inp.W.detach().requires_grad_(True)
-    logp = public.chunked_lm_head_det_logprob(
+    logp = public.cake_lm_head_det_train_logprob(
         X, W, inp.labels, chunk_size=chunk, temperature=inp.temperature
     )
     logp.backward(inp.dlogp)

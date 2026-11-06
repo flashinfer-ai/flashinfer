@@ -17,14 +17,14 @@ FlashInfer from `build.json` otherwise (see "Layout of this package").
 ## Public entry points (`flashinfer/chunked_lm_head.py`)
 
 ```python
-from flashinfer.chunked_lm_head import chunked_lm_head_det_loss, chunked_lm_head_det_logprob
+from flashinfer.chunked_lm_head import cake_lm_head_det_train_loss, cake_lm_head_det_train_logprob
 
-loss = chunked_lm_head_det_loss(X, W, labels, objective="ce", loss_div=loss_div, chunk_size=4096)
-loss, logp = chunked_lm_head_det_loss(X, W, labels, objective="policy", infer_logp=infer_logp,
+loss = cake_lm_head_det_train_loss(X, W, labels, objective="ce", loss_div=loss_div, chunk_size=4096)
+loss, logp = cake_lm_head_det_train_loss(X, W, labels, objective="policy", infer_logp=infer_logp,
                                       loss_weights=loss_weights, return_logp=True)
-logp = chunked_lm_head_det_logprob(X, W, labels, chunk_size=4096)   # differentiable [T] FP32
-logp = chunked_lm_head_det_logprob(X, W, labels, temperature=0.7)   # scalar temperature
-logp = chunked_lm_head_det_logprob(X, W, labels, temperature=tau)   # per-token: FP32 [T] on X's device
+logp = cake_lm_head_det_train_logprob(X, W, labels, chunk_size=4096)   # differentiable [T] FP32
+logp = cake_lm_head_det_train_logprob(X, W, labels, temperature=0.7)   # scalar temperature
+logp = cake_lm_head_det_train_logprob(X, W, labels, temperature=tau)   # per-token: FP32 [T] on X's device
 ```
 
 `det`: for fixed inputs, hardware, chunk plan and initial accumulation
@@ -73,7 +73,7 @@ these entries otherwise.  These entries take no `deterministic` keyword (see
   below for a `memory_mode="budget"` backward that frees the graph).
 * Gradient placement (`cake_backend.set_gradient_placement(mode)`, returns the
   previous mode; `cake_backend.gradient_placement()` reads it; default
-  `"auto"`; read once per call, it covers `chunked_lm_head_det_loss` in every
+  `"auto"`; read once per call, it covers `cake_lm_head_det_train_loss` in every
   form, the opt-in forms included).  `"auto"`: a call no backward can follow
   (grad mode off -- `torch.no_grad`, `torch.inference_mode`, the first pass of
   a reentrant `torch.utils.checkpoint` -- or neither `X` nor `W` trainable)
@@ -100,9 +100,9 @@ these entries otherwise.  These entries take no `deterministic` keyword (see
   checkpoint.
   `"forward"`: every call with a trainable input forms the gradients in its
   forward (the previous behavior).  The same `loss`, `logp`, `dX` and `dW`
-  bits either way; `chunked_lm_head_det_logprob` forms no gradient in its
+  bits either way; `cake_lm_head_det_train_logprob` forms no gradient in its
   forward and is unchanged.
-* `chunked_lm_head_det_logprob` returns the differentiable `logp [T]` for
+* `cake_lm_head_det_train_logprob` returns the differentiable `logp [T]` for
   arbitrary downstream losses; its forward saves the FP32 row statistic `lse`
   and the valid-row index, and the backward recomputes each chunk's logits
   from the saved inputs (four GEMMs per chunk) without counting the rows again
@@ -110,7 +110,7 @@ these entries otherwise.  These entries take no `deterministic` keyword (see
   `compact_rows=False` and no caller's count counts its valid rows on the host
   in the backward; a caller's count checked with `check_num_valid_rows=True` is
   read back in the forward, never in the backward).
-* Temperature (`temperature`, a keyword of `chunked_lm_head_det_logprob` only,
+* Temperature (`temperature`, a keyword of `cake_lm_head_det_train_logprob` only,
   default `None`, the same as `1.0`; `check_temperature`, default `False`):
   `None` or a positive Python
   number or a float32 `[T]` tensor on `X`'s device (one value per row, any
@@ -141,11 +141,11 @@ these entries otherwise.  These entries take no `deterministic` keyword (see
   them); a recount backward with a temperature (`backward_logprob_temperature`
   without the forward's `row_index`) takes the host count.  The temperature
   path has entry points of its own in both backend modules
-  (`chunked_lm_head_det_logprob_temperature`, `forward_logprob_temperature`,
+  (`cake_lm_head_det_train_logprob_temperature`, `forward_logprob_temperature`,
   `backward_logprob_temperature`, `prepare_lm_head_det_loss_temperature`,
   `memory_report_temperature`); the public entry calls them only for a
   `temperature` other than `None`, so a call without one runs the backend
-  entries without a temperature parameter.  `chunked_lm_head_det_loss` takes
+  entries without a temperature parameter.  `cake_lm_head_det_train_loss` takes
   no temperature, and `memory_mode="keep_logits"` takes none either
   (`ValueError`; its gradient form `row_grad` has no temperature form).
 * Valid-row compaction (`compact_rows`, a keyword of every eager and autograd
@@ -276,7 +276,7 @@ these entries otherwise.  These entries take no `deterministic` keyword (see
   not register an arm keeps the previous stages; the hidden valid-row count's
   chunk 0 keeps its device-count GEMM (`gemm_logits_mcnt` /
   `gemm_logits_nostats_mcnt` + `row_grad`).
-* Kept logits (opt-in, `cake` backend: `chunked_lm_head_det_logprob_keep`,
+* Kept logits (opt-in, `cake` backend: `cake_lm_head_det_train_logprob_keep`,
   the explicit pair `forward_logprob_keep` / `backward_logprob_keep`, the
   public entry's `memory_mode="keep_logits"`): the log-probability forward
   runs `gemm_logits` (the whole `z_c`; the label-column arm is off) and keeps
@@ -293,7 +293,7 @@ these entries otherwise.  These entries take no `deterministic` keyword (see
   (grad mode on and `X` or `W` trainable); elsewhere -- `torch.no_grad`,
   `torch.inference_mode`, the first pass of a reentrant
   `torch.utils.checkpoint`, frozen inputs, the reference backend -- it is
-  `chunked_lm_head_det_logprob` (the label-column forward).  It saves them
+  `cake_lm_head_det_train_logprob` (the label-column forward).  It saves them
   with `save_for_backward`: a non-reentrant checkpoint drops them after the
   checkpointed forward and the recomputation in the backward keeps them
   again, so only the memory held between the forward and the backward drops;
@@ -316,7 +316,7 @@ these entries otherwise.  These entries take no `deterministic` keyword (see
   those entry points only (its runner's `forward` / `backward` raise
   `NotImplementedError`).  Like `"budget"`, `memory_mode="keep_logits"` is a
   `ValueError` on the reference backend (the backend-level
-  `chunked_lm_head_det_logprob_keep` runs the default entry there).
+  `cake_lm_head_det_train_logprob_keep` runs the default entry there).
 * Memory rule (except the opt-in kept logits above): no logits, probability or
   `dlogits` buffer ever spans more than `chunk_size` tokens; a batch smaller than `chunk_size` is one chunk, a tail
   `T % chunk_size` is neither dropped nor padded, and `T == 0` returns loss 0,
@@ -338,7 +338,7 @@ these entries otherwise.  These entries take no `deterministic` keyword (see
   Every output is bitwise the same in both.  The opt-in forms also change
   buffer lifetimes, below.
 * Saved-state release (`memory_mode="budget"` only): a backward of
-  `chunked_lm_head_det_loss` that
+  `cake_lm_head_det_train_loss` that
   frees the graph (no `retain_graph` / `create_graph`) drops the forward's
   FP32 `dX` accumulator as soon as `dX` is written -- before the weight
   gradient's buffers exist -- and the rest of the saved state when it ends,
@@ -353,8 +353,8 @@ these entries otherwise.  These entries take no `deterministic` keyword (see
   every opt-in form `backward_logprob` drops its runner (the chunk workspace)
   before the `dX` output is allocated.  Lifetimes only: every output is
   bitwise the same.
-* Memory budget (`memory_mode`, keyword of `chunked_lm_head_det_loss` /
-  `chunked_lm_head_det_logprob`, default `None`, the `"fast"` form; `"budget"`
+* Memory budget (`memory_mode`, keyword of `cake_lm_head_det_train_loss` /
+  `cake_lm_head_det_train_logprob`, default `None`, the `"fast"` form; `"budget"`
   is opt-in, `cake` backend and BF16 `dW` only; `"keep_logits"`, the
   log-probability entry's kept logits above, takes no `num_valid_rows` and is a
   `ValueError` on the loss entry).  The fast form keeps the FP32 `[V, H]`
@@ -395,7 +395,7 @@ these entries otherwise.  These entries take no `deterministic` keyword (see
   within `B`; the highest reached 0.9794 `B`.  No environment variable
   selects it.
 * Caller's valid-row count (`num_valid_rows`, keyword of
-  `chunked_lm_head_det_loss` / `chunked_lm_head_det_logprob` and of the
+  `cake_lm_head_det_train_loss` / `cake_lm_head_det_train_logprob` and of the
   `cake_backend_opt_in` eager entry points, default `None`): the number of labels
   `>= 0` as a host integer (a Python or NumPy integer or a CPU scalar tensor;
   a CUDA tensor is rejected because reading it would wait for the device).
@@ -419,8 +419,8 @@ these entries otherwise.  These entries take no `deterministic` keyword (see
   it once (the autograd entries in their forward) and raises the same
   `ValueError` on a mismatch, whatever `compact_rows`, `memory_mode` or the
   inputs that need a gradient.  The count is not derived from `loss_div`.
-* First call of a process (`chunked_lm_head_det_preload(device=None, *,
-  temperature=False)`, `cake_backend_opt_in.preload`): loads every library of
+* First call of a process (`cake_lm_head_det_train_preload(device=None, *,
+  temperature=False)`, `cake_backend_opt_in.cake_lm_head_det_train_preload`): loads every library of
   the device's architecture except the temperature forms
   (a JIT build when the package ships no `aot/` library; `temperature=True`
   also loads the temperature forms and launches the temperature path's
@@ -468,13 +468,13 @@ accepts `backend="cake"` only.
 
 ```python
 from flashinfer.chunked_lm_head import (
-    chunked_lm_head_det_support_kl,
-    chunked_lm_head_det_support_logprob,
+    cake_lm_head_det_train_support_kl,
+    cake_lm_head_det_train_support_logprob,
 )
 
-logp = chunked_lm_head_det_support_logprob(X, W, ids, offsets, k_cap=k_cap)          # packed [M] FP32
-sel = chunked_lm_head_det_support_logprob(X, W, ids, offsets, labels, k_cap=k_cap)   # selected [T] FP32
-kl, logp = chunked_lm_head_det_support_kl(X, W, ids, offsets, teacher_logprobs, k_cap=k_cap,
+logp = cake_lm_head_det_train_support_logprob(X, W, ids, offsets, k_cap=k_cap)          # packed [M] FP32
+sel = cake_lm_head_det_train_support_logprob(X, W, ids, offsets, labels, k_cap=k_cap)   # selected [T] FP32
+kl, logp = cake_lm_head_det_train_support_kl(X, W, ids, offsets, teacher_logprobs, k_cap=k_cap,
                                           temperature=tau, return_logprobs=True)
 ```
 
@@ -492,7 +492,7 @@ kl, logp = chunked_lm_head_det_support_kl(X, W, ids, offsets, teacher_logprobs, 
   logp_j)` over the entries with `Q_j = exp(lq_j) > 0` of a detached FP32
   teacher aligned with `ids`.  Gradients flow to `X` and `W` only (BF16 `dz` at
   the support, FP32 accumulation, one cast each); the temperature (a positive
-  number or an FP32 `[T]` tensor, the same rules as `chunked_lm_head_det_logprob`,
+  number or an FP32 `[T]` tensor, the same rules as `cake_lm_head_det_train_logprob`,
   checked on every row) is a constant.
 * Validation: one kernel forms an int64 error word over the offsets, the cap,
   the id range, repeated ids and the labels (`-100` ignored; any other label
@@ -550,7 +550,7 @@ plus blocks of `chunk_size` rows and at most 16384 vocabulary columns.
 ## Switches and environment variables
 
 Every switch above is a keyword argument of each entry point it affects
-(`chunked_lm_head_det_loss`, `chunked_lm_head_det_logprob`, `forward_loss`,
+(`cake_lm_head_det_train_loss`, `cake_lm_head_det_train_logprob`, `forward_loss`,
 `backward_loss`, `forward_logprob`, `backward_logprob`,
 `prepare_lm_head_det_loss`; `prepare_lm_head_det_loss` takes `compact_rows` as a bool or
 the valid-row tensor, default `False`, and no `hidden_count`; `forward_logprob`

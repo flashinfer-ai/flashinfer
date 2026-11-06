@@ -19,7 +19,7 @@ logprob,preload,support_logprob,support_kl}``: experimental dispatchers of the n
 ``deterministic=False`` is accepted: it runs that package with the same argument checks and environment fallbacks,
 also while torch's deterministic algorithms are on (the package's own alert decides; no fallback, no warning from the
 dispatcher).  Any other value, the default ``True`` included, is a ``ValueError`` naming the deterministic entry
-(``chunked_lm_head_det_*``) before any package import or torch query.  The deterministic entries take no
+(``cake_lm_head_det_train_*``) before any package import or torch query.  The deterministic entries take no
 ``deterministic`` keyword (``TypeError``).  The host-layer tests replace the package by recorders; the device tests
 compare the bits of real calls.
 """
@@ -42,11 +42,11 @@ SEED = 20261031
 H_HOST, V_HOST = 256, 512
 # det-free entry -> its deterministic entry
 ENTRIES = {
-    "chunked_lm_head_loss": "chunked_lm_head_det_loss",
-    "chunked_lm_head_logprob": "chunked_lm_head_det_logprob",
-    "chunked_lm_head_preload": "chunked_lm_head_det_preload",
-    "chunked_lm_head_support_logprob": "chunked_lm_head_det_support_logprob",
-    "chunked_lm_head_support_kl": "chunked_lm_head_det_support_kl",
+    "chunked_lm_head_loss": "cake_lm_head_det_train_loss",
+    "chunked_lm_head_logprob": "cake_lm_head_det_train_logprob",
+    "chunked_lm_head_preload": "cake_lm_head_det_train_preload",
+    "chunked_lm_head_support_logprob": "cake_lm_head_det_train_support_logprob",
+    "chunked_lm_head_support_kl": "cake_lm_head_det_train_support_kl",
 }
 # The mode-free helper each dispatcher calls after its mode check (preload loads the opt-in module directly).
 HELPERS = {
@@ -421,16 +421,16 @@ def test_torch_deterministic_mode_passes_a_k_slices_pin_unchanged(
 
 
 def test_deterministic_entries_take_no_mode_keyword():
-    """The ``chunked_lm_head_det_*`` entries have no ``deterministic`` parameter: passing one (``True`` or ``False``)
+    """The ``cake_lm_head_det_train_*`` entries have no ``deterministic`` parameter: passing one (``True`` or ``False``)
     is a ``TypeError`` from argument binding (host tensors suffice: it raises before any work)."""
     X, W, labels = _host_call()
     sup = _support_args()
     calls = {
-        "chunked_lm_head_det_loss": ((X, W, labels), dict(loss_div=1.0)),
-        "chunked_lm_head_det_logprob": ((X, W, labels), {}),
-        "chunked_lm_head_det_preload": ((), {}),
-        "chunked_lm_head_det_support_logprob": (sup, dict(k_cap=3)),
-        "chunked_lm_head_det_support_kl": (sup + (torch.zeros(4),), dict(k_cap=3)),
+        "cake_lm_head_det_train_loss": ((X, W, labels), dict(loss_div=1.0)),
+        "cake_lm_head_det_train_logprob": ((X, W, labels), {}),
+        "cake_lm_head_det_train_preload": ((), {}),
+        "cake_lm_head_det_train_support_logprob": (sup, dict(k_cap=3)),
+        "cake_lm_head_det_train_support_kl": (sup + (torch.zeros(4),), dict(k_cap=3)),
     }
     for det, (args, kwargs) in calls.items():
         fn = getattr(public, det)
@@ -601,11 +601,11 @@ def test_device_public_entry_places_the_gradients(monkeypatch):
 def test_keep_logits_mode_reaches_the_non_deterministic_route(recorders):
     """``memory_mode="keep_logits"`` passes through the log-probability dispatcher unchanged: ``deterministic=False``
     hands it to this package's opt-in module (with ``deterministic=False``), also while torch's deterministic
-    algorithms are on (no fallback); the default is a ``ValueError`` naming ``chunked_lm_head_det_logprob``, which
+    algorithms are on (no fallback); the default is a ``ValueError`` naming ``cake_lm_head_det_train_logprob``, which
     takes the mode itself."""
     fake = recorders
     X, W, labels = _host_call()
-    with pytest.raises(ValueError, match="chunked_lm_head_det_logprob"):
+    with pytest.raises(ValueError, match="cake_lm_head_det_train_logprob"):
         public.chunked_lm_head_logprob(
             X, W, labels, chunk_size=16, memory_mode="keep_logits"
         )
@@ -636,8 +636,8 @@ def test_keep_logits_mode_reaches_the_non_deterministic_route(recorders):
 
 
 def test_device_keep_logits_on_both_routes_is_the_plain_call(monkeypatch):
-    """``chunked_lm_head_det_logprob`` and ``chunked_lm_head_logprob(deterministic=False)`` both accept
-    ``memory_mode="keep_logits"`` and run their package's kept entry (``chunked_lm_head_det_logprob_keep`` /
+    """``cake_lm_head_det_train_logprob`` and ``chunked_lm_head_logprob(deterministic=False)`` both accept
+    ``memory_mode="keep_logits"`` and run their package's kept entry (``cake_lm_head_det_train_logprob_keep`` /
     ``chunked_lm_head_logprob_keep``, counted); each gives its plain call's ``logp`` / ``dW`` bits and the bits of
     the loss ``sum(dlogp * logp)`` -- and ``dX``: the deterministic route's always, the non-deterministic route's
     with one dX slice pinned (its plain store; the default slice rule's reduction adds the same products in an
@@ -657,7 +657,7 @@ def test_device_keep_logits_on_both_routes_is_the_plain_call(monkeypatch):
         pytest.skip("the log-probability programs are not registered for this device")
     counts = {"det": 0, "nd": 0}
     for name, module, attr in (
-        ("det", det_backend, "chunked_lm_head_det_logprob_keep"),
+        ("det", det_backend, "cake_lm_head_det_train_logprob_keep"),
         ("nd", nd_backend, "chunked_lm_head_logprob_keep"),
     ):
         real = getattr(module, attr)
@@ -677,7 +677,7 @@ def test_device_keep_logits_on_both_routes_is_the_plain_call(monkeypatch):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", api_logging.ExperimentalWarning)
         for route, fn, mode, tuning in (
-            ("det", public.chunked_lm_head_det_logprob, {}, None),
+            ("det", public.cake_lm_head_det_train_logprob, {}, None),
             ("nd", public.chunked_lm_head_logprob, dict(deterministic=False), None),
             (
                 "nd",
@@ -853,7 +853,7 @@ def test_device_false_temperature_through_the_public_entry():
         )
         same(
             run(public.chunked_lm_head_logprob, temperature=value, **nd_kw),
-            run(public.chunked_lm_head_det_logprob, temperature=value),
+            run(public.cake_lm_head_det_train_logprob, temperature=value),
             ("vs deterministic", type(value).__name__),
             keys=("logp", "dW"),
         )

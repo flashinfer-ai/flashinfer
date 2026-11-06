@@ -15,8 +15,8 @@ limitations under the License.
 
 flashinfer public-API tests of the Cake chunked LM-head + loss package.
 
-The experimental entry points ``flashinfer.chunked_lm_head.chunked_lm_head_det_loss`` and
-``chunked_lm_head_det_logprob`` are thin wrappers over
+The experimental entry points ``flashinfer.chunked_lm_head.cake_lm_head_det_train_loss`` and
+``cake_lm_head_det_train_logprob`` are thin wrappers over
 ``flashinfer.experimental.cake.cake_lm_head_det_train.cake_backend``: they carry the experimental
 marking, accept ``backend="cake"`` only and own FlashInfer's A/B environment variables
 ``FLASHINFER_CAKE_LM_HEAD_LOSS_*`` -- a switch keyword left at ``None`` falls back to its
@@ -40,8 +40,8 @@ import torch.utils.checkpoint
 import flashinfer.chunked_lm_head as public
 from flashinfer.api_logging import ExperimentalWarning
 from flashinfer.chunked_lm_head import (
-    chunked_lm_head_det_logprob,
-    chunked_lm_head_det_loss,
+    cake_lm_head_det_train_logprob,
+    cake_lm_head_det_train_loss,
 )
 from flashinfer.experimental.cake.cake_lm_head_det_train import cake_backend
 from flashinfer.experimental.cake.cake_lm_head_det_train.cake_backend import (
@@ -89,16 +89,16 @@ def _host_call():
 
 
 def test_public_api_is_marked_experimental():
-    assert chunked_lm_head_det_loss.is_experimental is True
-    assert chunked_lm_head_det_logprob.is_experimental is True
-    assert "SM100" in chunked_lm_head_det_loss.__doc__
-    assert "SM100" in chunked_lm_head_det_logprob.__doc__
+    assert cake_lm_head_det_train_loss.is_experimental is True
+    assert cake_lm_head_det_train_logprob.is_experimental is True
+    assert "SM100" in cake_lm_head_det_train_loss.__doc__
+    assert "SM100" in cake_lm_head_det_train_logprob.__doc__
     X, W, labels = _host_call()
     # the public module serves the cake backend only
     with pytest.raises(ValueError, match="backend"):
-        chunked_lm_head_det_loss(X, W, labels, loss_div=1.0, backend="reference")
+        cake_lm_head_det_train_loss(X, W, labels, loss_div=1.0, backend="reference")
     with pytest.raises(ValueError, match="backend"):
-        chunked_lm_head_det_logprob(X, W, labels, backend="reference")
+        cake_lm_head_det_train_logprob(X, W, labels, backend="reference")
 
 
 # The names before the deterministic (``det``) naming that the deterministic modules no longer define (no
@@ -159,7 +159,7 @@ def test_public_api_switch_keywords():
     """Both public entries take every switch as a keyword-only argument defaulting to ``None``; the loss entry's
     docstring states each default and the variable it falls back to; the backend entries take the same names (the
     wrapper passes them by keyword); the variables the wrapper names are exactly the ones these tests cover."""
-    for fn in (chunked_lm_head_det_loss, chunked_lm_head_det_logprob):
+    for fn in (cake_lm_head_det_train_loss, cake_lm_head_det_train_logprob):
         params = inspect.signature(fn).parameters
         for name in SWITCHES:
             assert params[name].kind is inspect.Parameter.KEYWORD_ONLY, (
@@ -169,10 +169,10 @@ def test_public_api_switch_keywords():
             assert params[name].default is None, (fn.__name__, name)
         assert "FLASHINFER_CAKE_LM_HEAD_LOSS_" in fn.__doc__
     for variable in (*ENV_OF.values(), *CACHE_ENVS):
-        assert variable in chunked_lm_head_det_loss.__doc__, variable
+        assert variable in cake_lm_head_det_train_loss.__doc__, variable
     for fn in (
-        cake_backend.chunked_lm_head_det_loss,
-        cake_backend.chunked_lm_head_det_logprob,
+        cake_backend.cake_lm_head_det_train_loss,
+        cake_backend.cake_lm_head_det_train_logprob,
     ):
         params = inspect.signature(fn).parameters
         assert all(params[name].default is None for name in SWITCHES), fn.__name__
@@ -185,10 +185,10 @@ def test_public_api_memory_and_count_keywords(monkeypatch):
     """Both public entries take ``memory_mode`` (default ``None``, no environment variable), ``num_valid_rows``
     (``None``) and ``check_num_valid_rows`` (``False``) as keyword-only arguments and document them; a call with
     ``memory_mode`` or ``num_valid_rows`` passes all three to the opt-in backend module unchanged, a call with neither
-    calls the default backend entry without them; ``chunked_lm_head_det_preload`` is experimental and needs a CUDA
+    calls the default backend entry without them; ``cake_lm_head_det_train_preload`` is experimental and needs a CUDA
     device."""
     _clear(monkeypatch)
-    for fn in (chunked_lm_head_det_loss, chunked_lm_head_det_logprob):
+    for fn in (cake_lm_head_det_train_loss, cake_lm_head_det_train_logprob):
         params = inspect.signature(fn).parameters
         for name, default in (
             ("memory_mode", None),
@@ -212,14 +212,14 @@ def test_public_api_memory_and_count_keywords(monkeypatch):
 
     backend, opt_in = public._cake_backend(), public._cake_backend_opt_in()
     for module, tag in ((backend, "default"), (opt_in, "opt_in")):
-        monkeypatch.setattr(module, "chunked_lm_head_det_loss", spy(f"{tag}_loss"))
+        monkeypatch.setattr(module, "cake_lm_head_det_train_loss", spy(f"{tag}_loss"))
         monkeypatch.setattr(
-            module, "chunked_lm_head_det_logprob", spy(f"{tag}_logprob")
+            module, "cake_lm_head_det_train_logprob", spy(f"{tag}_logprob")
         )
     X, W, labels = _host_call()
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ExperimentalWarning)
-        chunked_lm_head_det_loss(
+        cake_lm_head_det_train_loss(
             X,
             W,
             labels,
@@ -228,9 +228,9 @@ def test_public_api_memory_and_count_keywords(monkeypatch):
             num_valid_rows=3,
             check_num_valid_rows=True,
         )
-        chunked_lm_head_det_logprob(X, W, labels, num_valid_rows=3)
-        chunked_lm_head_det_loss(X, W, labels, loss_div=1.0)
-        chunked_lm_head_det_logprob(X, W, labels)
+        cake_lm_head_det_train_logprob(X, W, labels, num_valid_rows=3)
+        cake_lm_head_det_train_loss(X, W, labels, loss_div=1.0)
+        cake_lm_head_det_train_logprob(X, W, labels)
     # either keyword: the opt-in module, every keyword passed unchanged
     assert seen["opt_in_loss"]["memory_mode"] == "budget"
     assert seen["opt_in_loss"]["num_valid_rows"] == 3
@@ -249,8 +249,8 @@ def test_public_api_memory_and_count_keywords(monkeypatch):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ExperimentalWarning)
         for fn, kw in (
-            (chunked_lm_head_det_loss, dict(loss_div=1.0)),
-            (chunked_lm_head_det_logprob, {}),
+            (cake_lm_head_det_train_loss, dict(loss_div=1.0)),
+            (cake_lm_head_det_train_logprob, {}),
         ):
             for mode in (None, "fast", "budget"):
                 with pytest.raises(ValueError, match="needs num_valid_rows"):
@@ -263,11 +263,11 @@ def test_public_api_memory_and_count_keywords(monkeypatch):
                         **kw,
                     )
     assert not seen, seen
-    assert public.chunked_lm_head_det_preload.is_experimental is True
+    assert public.cake_lm_head_det_train_preload.is_experimental is True
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ExperimentalWarning)
         with pytest.raises(ValueError, match="CUDA device"):
-            public.chunked_lm_head_det_preload("cpu")
+            public.cake_lm_head_det_train_preload("cpu")
 
 
 def test_public_api_temperature_keywords(monkeypatch):
@@ -275,32 +275,32 @@ def test_public_api_temperature_keywords(monkeypatch):
     ``check_temperature`` (default ``False``) as documented keyword-only arguments, with no environment variable.
     Without a temperature it calls the backend entry (or, with ``memory_mode`` or ``num_valid_rows``, the opt-in
     module's entry) exactly as it does without these keywords; with one it calls that module's
-    ``chunked_lm_head_det_logprob_temperature`` and passes both unchanged (a tensor as the same object).  The backend
-    entries keep their signatures; the loss entry has neither keyword; ``chunked_lm_head_det_preload`` takes
+    ``cake_lm_head_det_train_logprob_temperature`` and passes both unchanged (a tensor as the same object).  The backend
+    entries keep their signatures; the loss entry has neither keyword; ``cake_lm_head_det_train_preload`` takes
     ``temperature`` (default ``False``: the temperature forms are not loaded) and passes it down."""
     _clear(monkeypatch)
-    params = inspect.signature(chunked_lm_head_det_logprob).parameters
+    params = inspect.signature(cake_lm_head_det_train_logprob).parameters
     for name, default in (("temperature", None), ("check_temperature", False)):
         assert params[name].kind is inspect.Parameter.KEYWORD_ONLY, name
         assert params[name].default == default and type(params[name].default) is type(
             default
         ), name
-        assert name in chunked_lm_head_det_logprob.__doc__, name
-    loss_params = inspect.signature(chunked_lm_head_det_loss).parameters
+        assert name in cake_lm_head_det_train_logprob.__doc__, name
+    loss_params = inspect.signature(cake_lm_head_det_train_loss).parameters
     assert "temperature" not in loss_params and "check_temperature" not in loss_params
     for module in (cake_backend, public._cake_backend_opt_in()):
         assert (
             "temperature"
-            not in inspect.signature(module.chunked_lm_head_det_logprob).parameters
+            not in inspect.signature(module.cake_lm_head_det_train_logprob).parameters
         )
         tau_params = inspect.signature(
-            module.chunked_lm_head_det_logprob_temperature
+            module.cake_lm_head_det_train_logprob_temperature
         ).parameters
         assert tau_params["check_temperature"].default is False
-    preload = inspect.signature(public.chunked_lm_head_det_preload).parameters
+    preload = inspect.signature(public.cake_lm_head_det_train_preload).parameters
     assert preload["temperature"].kind is inspect.Parameter.KEYWORD_ONLY
     assert preload["temperature"].default is False
-    assert "temperature" in public.chunked_lm_head_det_preload.__doc__
+    assert "temperature" in public.cake_lm_head_det_train_preload.__doc__
     assert not any("TEMPERATURE" in k for k in vars(public) if k.endswith("_ENV"))
     seen = {}
 
@@ -312,38 +312,38 @@ def test_public_api_temperature_keywords(monkeypatch):
         return call
 
     backend = public._cake_backend()
-    monkeypatch.setattr(backend, "chunked_lm_head_det_logprob", spy("logprob"))
+    monkeypatch.setattr(backend, "cake_lm_head_det_train_logprob", spy("logprob"))
     monkeypatch.setattr(
-        backend, "chunked_lm_head_det_logprob_temperature", spy("logprob_tau")
+        backend, "cake_lm_head_det_train_logprob_temperature", spy("logprob_tau")
     )
     opt_in = public._cake_backend_opt_in()
-    monkeypatch.setattr(opt_in, "chunked_lm_head_det_logprob", spy("opt_in_logprob"))
+    monkeypatch.setattr(opt_in, "cake_lm_head_det_train_logprob", spy("opt_in_logprob"))
     monkeypatch.setattr(
-        opt_in, "chunked_lm_head_det_logprob_temperature", spy("opt_in_logprob_tau")
+        opt_in, "cake_lm_head_det_train_logprob_temperature", spy("opt_in_logprob_tau")
     )
-    monkeypatch.setattr(opt_in, "preload", spy("preload"))
+    monkeypatch.setattr(opt_in, "cake_lm_head_det_train_preload", spy("preload"))
     X, W, labels = _host_call()
     tau = torch.full((4,), 0.7)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ExperimentalWarning)
-        chunked_lm_head_det_logprob(X, W, labels)
+        cake_lm_head_det_train_logprob(X, W, labels)
         assert "temperature" not in seen["logprob"][1]
         assert "check_temperature" not in seen["logprob"][1]
         assert "logprob_tau" not in seen
         plain = seen.pop("logprob")
-        chunked_lm_head_det_logprob(X, W, labels, temperature=None)
+        cake_lm_head_det_train_logprob(X, W, labels, temperature=None)
         assert seen.pop("logprob") == plain
-        chunked_lm_head_det_logprob(X, W, labels, temperature=1.0)
+        cake_lm_head_det_train_logprob(X, W, labels, temperature=1.0)
         assert seen["logprob_tau"][1]["temperature"] == 1.0
         assert {
             k: v for k, v in seen["logprob_tau"][1].items() if "temperature" not in k
         } == plain[1]
-        chunked_lm_head_det_logprob(
+        cake_lm_head_det_train_logprob(
             X, W, labels, temperature=tau, check_temperature=True
         )
         assert seen["logprob_tau"][1]["temperature"] is tau
         assert seen["logprob_tau"][1]["check_temperature"] is True
-        chunked_lm_head_det_logprob(X, W, labels, temperature=0.7)
+        cake_lm_head_det_train_logprob(X, W, labels, temperature=0.7)
         assert seen["logprob_tau"][1]["temperature"] == 0.7
         assert "logprob" not in seen
         for kw in (
@@ -352,24 +352,24 @@ def test_public_api_temperature_keywords(monkeypatch):
             dict(num_valid_rows=3),
         ):
             seen.pop("opt_in_logprob_tau", None)
-            chunked_lm_head_det_logprob(
+            cake_lm_head_det_train_logprob(
                 X, W, labels, temperature=tau, check_temperature=True, **kw
             )
             assert seen["opt_in_logprob_tau"][1]["temperature"] is tau, kw
             assert seen["opt_in_logprob_tau"][1]["check_temperature"] is True, kw
             seen.pop("opt_in_logprob_tau")
-            chunked_lm_head_det_logprob(X, W, labels, temperature=0.7, **kw)
+            cake_lm_head_det_train_logprob(X, W, labels, temperature=0.7, **kw)
             assert seen["opt_in_logprob_tau"][1]["temperature"] == 0.7, kw
             assert seen["opt_in_logprob_tau"][1]["check_temperature"] is False, kw
             seen.pop("opt_in_logprob_tau")
             seen.pop("opt_in_logprob", None)
-            chunked_lm_head_det_logprob(X, W, labels, **kw)
+            cake_lm_head_det_train_logprob(X, W, labels, **kw)
             assert "temperature" not in seen["opt_in_logprob"][1], kw
             assert "opt_in_logprob_tau" not in seen, kw
-        public.chunked_lm_head_det_preload(0, temperature=True)
+        public.cake_lm_head_det_train_preload(0, temperature=True)
         args, kw = seen["preload"]
         assert kw.get("temperature") is True and 0 in (*args, kw.get("device"))
-        public.chunked_lm_head_det_preload(0)
+        public.cake_lm_head_det_train_preload(0)
         assert not seen["preload"][1].get("temperature", False)
 
 
@@ -388,7 +388,7 @@ def test_public_api_temperature_refuses_keep_logits(monkeypatch):
     )
     for temperature in (0.5, inp.temperature):
         with pytest.raises(ValueError, match="takes no temperature"):
-            chunked_lm_head_det_logprob(
+            cake_lm_head_det_train_logprob(
                 inp.X,
                 inp.W,
                 inp.labels,
@@ -510,9 +510,9 @@ def test_gemm_tuning_default_env(monkeypatch):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ExperimentalWarning)
         with pytest.raises(ValueError, match=public.GEMM_TUNING_ENV):
-            chunked_lm_head_det_loss(X, W, labels, loss_div=1.0)
+            cake_lm_head_det_train_loss(X, W, labels, loss_div=1.0)
         with pytest.raises(ValueError, match=public.GEMM_TUNING_ENV):
-            chunked_lm_head_det_logprob(X, W, labels)
+            cake_lm_head_det_train_logprob(X, W, labels)
     monkeypatch.setenv(public.GEMM_TUNING_ENV, '["dx"]')
     with pytest.raises(ValueError, match="JSON object"):
         _knobs()
@@ -654,7 +654,7 @@ def test_device_env_switches_reach_the_backend(monkeypatch):
         bound.clear()
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", ExperimentalWarning)
-            loss, logp = chunked_lm_head_det_loss(
+            loss, logp = cake_lm_head_det_train_loss(
                 X,
                 W,
                 inp.labels,
@@ -699,7 +699,7 @@ def test_device_env_switches_reach_the_backend(monkeypatch):
 def test_device_temperature_through_the_public_entry(monkeypatch):
     """Through the public entry on the generated program: a heterogeneous per-token temperature and a scalar give the
     bits (integer views) of the backend entry with the same argument, ``temperature=1.0`` the bits of the call
-    without the keyword (default ``None``); ``chunked_lm_head_det_preload(temperature=True)`` loads the temperature forms and a call after it
+    without the keyword (default ``None``); ``cake_lm_head_det_train_preload(temperature=True)`` loads the temperature forms and a call after it
     gives the same bits."""
     _require_program()
     _clear(monkeypatch)
@@ -730,23 +730,23 @@ def test_device_temperature_through_the_public_entry(monkeypatch):
 
     for value in (inp.temperature, 0.7):
         same(
-            run(chunked_lm_head_det_logprob, temperature=value),
+            run(cake_lm_head_det_train_logprob, temperature=value),
             run(
-                cake_backend.chunked_lm_head_det_logprob_temperature, temperature=value
+                cake_backend.cake_lm_head_det_train_logprob_temperature, temperature=value
             ),
             type(value).__name__,
         )
-    plain = run(chunked_lm_head_det_logprob)
-    same(plain, run(chunked_lm_head_det_logprob, temperature=1.0), "one")
+    plain = run(cake_lm_head_det_train_logprob)
+    same(plain, run(cake_lm_head_det_train_logprob, temperature=1.0), "one")
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ExperimentalWarning)
-        public.chunked_lm_head_det_preload(temperature=True)
+        public.cake_lm_head_det_train_preload(temperature=True)
     same(
         run(
-            cake_backend.chunked_lm_head_det_logprob_temperature,
+            cake_backend.cake_lm_head_det_train_logprob_temperature,
             temperature=inp.temperature,
         ),
-        run(chunked_lm_head_det_logprob, temperature=inp.temperature),
+        run(cake_lm_head_det_train_logprob, temperature=inp.temperature),
         "after preload",
     )
 
@@ -781,7 +781,7 @@ def test_device_public_entry_places_the_gradients(monkeypatch):
         logps = []
 
         def head(a, b):
-            loss, logp = chunked_lm_head_det_loss(
+            loss, logp = cake_lm_head_det_train_loss(
                 a,
                 b,
                 inp.labels,

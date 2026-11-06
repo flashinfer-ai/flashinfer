@@ -39,7 +39,7 @@ Contract
   ``0`` when ``ratio_t > 2``.  ``dz[t, v] = d_t * (1[v = y_t] - softmax(z_t)_v)``;
   ignored rows: zero loss, zero gradient, ``logp = 0``.  ``dX = dz @ W``,
   ``dW = dz^T @ X`` chunk by chunk.
-* Entry (a) ``chunked_lm_head_det_loss``: the forward produces ``dX_acc`` (FP32
+* Entry (a) ``cake_lm_head_det_train_loss``: the forward produces ``dX_acc`` (FP32
   ``[T, H]``) and ``dW_acc`` (FP32 ``[V, H]``) directly per chunk (three GEMMs,
   no logits recomputation); the backward applies the incoming scalar
   gradient ``g`` and performs the single cast ``dX = bf16(g * dX_acc)``,
@@ -49,7 +49,7 @@ Contract
   backward can follow forms no accumulator, and inside a non-reentrant
   ``torch.utils.checkpoint`` the recomputation forms them instead of the
   checkpointed forward (the same bits).  Entry (b)
-  ``chunked_lm_head_det_logprob``: the forward saves the FP32 row statistic
+  ``cake_lm_head_det_train_logprob``: the forward saves the FP32 row statistic
   ``lse[T]`` and the valid-row index, so the backward plans its chunks without
   counting the rows again (no host synchronization); the backward recomputes
   each chunk's logits (four GEMMs) with the incoming ``dlogp`` as ``d_t``
@@ -3050,7 +3050,7 @@ class _TemperaturePlan(Plan):
 
 
 class _KeptPlan(Plan):
-    """The kept-logits plan of the log-probability entry (:func:`chunked_lm_head_det_logprob_keep`): a :class:`Plan`
+    """The kept-logits plan of the log-probability entry (:func:`cake_lm_head_det_train_logprob_keep`): a :class:`Plan`
     whose forward runs the plain ``gemm_logits`` per chunk (neither logits GEMM arm) and whose backward recomputes
     nothing -- ``row_grad`` forms each chunk's ``dz`` over the chunk's kept logits (:func:`recompute_keys`).  The same
     fields; only :func:`make_plan` with ``logprob_keep=True`` builds it."""
@@ -5319,7 +5319,7 @@ class _KeptLossRunner(LmHeadDetLossRunner):
 
 _KEPT_RUNNER = (
     "a kept-logits plan (logprob_keep) binds its kept views per call: launch it through the eager entry points "
-    "(forward_logprob_keep / backward_logprob_keep / chunked_lm_head_det_logprob_keep)"
+    "(forward_logprob_keep / backward_logprob_keep / cake_lm_head_det_train_logprob_keep)"
 )
 
 
@@ -9374,7 +9374,7 @@ def _loss_backward_split(ctx, grad_loss):
     )
 
 
-class ChunkedLmHeadDetLossFunction(torch.autograd.Function):
+class CakeLMHeadDetLossFunction(torch.autograd.Function):
     """Entry (a): the forward produces the FP32 gradient accumulators; the backward scales and casts them.
 
     Gradient placement ``"auto"`` (:func:`set_gradient_placement`) inside a non-reentrant ``torch.utils.checkpoint``:
@@ -9412,7 +9412,7 @@ class ChunkedLmHeadDetLossFunction(torch.autograd.Function):
         ):
             if _selective_checkpoint_modes():
                 with _modes_off():
-                    return ChunkedLmHeadDetLossFunction.forward(
+                    return CakeLMHeadDetLossFunction.forward(
                         ctx,
                         X,
                         W,
@@ -9551,7 +9551,7 @@ class ChunkedLmHeadDetLossFunction(torch.autograd.Function):
         return (dx, dw) + none[2:]
 
 
-class ChunkedLmHeadDetLogprobFunction(torch.autograd.Function):
+class CakeLMHeadDetLogprobFunction(torch.autograd.Function):
     """Entry (b): the forward saves the row statistic; the backward recomputes the logits."""
 
     @staticmethod
@@ -9573,7 +9573,7 @@ class ChunkedLmHeadDetLogprobFunction(torch.autograd.Function):
     ):
         if _TOP_SAVED_HOOKS(False) is not None and _selective_checkpoint_modes():
             with _modes_off():  # under a selective checkpoint's modes: popped (see _selective_checkpoint_modes)
-                return ChunkedLmHeadDetLogprobFunction.forward(
+                return CakeLMHeadDetLogprobFunction.forward(
                     ctx,
                     X,
                     W,
@@ -9653,8 +9653,8 @@ class ChunkedLmHeadDetLogprobFunction(torch.autograd.Function):
         return (dx, dw) + (None,) * 11
 
 
-class ChunkedLmHeadDetLogprobTemperatureFunction(torch.autograd.Function):
-    """:class:`ChunkedLmHeadDetLogprobFunction` of a call with a temperature (:func:`chunked_lm_head_det_logprob`)."""
+class CakeLMHeadDetLogprobTemperatureFunction(torch.autograd.Function):
+    """:class:`CakeLMHeadDetLogprobFunction` of a call with a temperature (:func:`cake_lm_head_det_train_logprob`)."""
 
     @staticmethod
     def forward(
@@ -9677,7 +9677,7 @@ class ChunkedLmHeadDetLogprobTemperatureFunction(torch.autograd.Function):
     ):
         if _TOP_SAVED_HOOKS(False) is not None and _selective_checkpoint_modes():
             with _modes_off():  # under a selective checkpoint's modes: popped (see _selective_checkpoint_modes)
-                return ChunkedLmHeadDetLogprobTemperatureFunction.forward(
+                return CakeLMHeadDetLogprobTemperatureFunction.forward(
                     ctx,
                     X,
                     W,
@@ -9772,8 +9772,8 @@ class ChunkedLmHeadDetLogprobTemperatureFunction(torch.autograd.Function):
         return (dx, dw) + (None,) * 13
 
 
-class ChunkedLmHeadDetLogprobKeepFunction(torch.autograd.Function):
-    """Entry (b) with the kept logits (:func:`chunked_lm_head_det_logprob_keep`): the forward saves the row statistic
+class CakeLMHeadDetLogprobKeepFunction(torch.autograd.Function):
+    """Entry (b) with the kept logits (:func:`cake_lm_head_det_train_logprob_keep`): the forward saves the row statistic
     and the kept logits; the first backward forms ``dz`` from them, a later one (a retained graph) recomputes."""
 
     @staticmethod
@@ -9793,7 +9793,7 @@ class ChunkedLmHeadDetLogprobKeepFunction(torch.autograd.Function):
     ):
         if _TOP_SAVED_HOOKS(False) is not None and _selective_checkpoint_modes():
             with _modes_off():  # under a selective checkpoint's modes: popped (see _selective_checkpoint_modes)
-                return ChunkedLmHeadDetLogprobKeepFunction.forward(
+                return CakeLMHeadDetLogprobKeepFunction.forward(
                     ctx,
                     X,
                     W,
@@ -9875,7 +9875,7 @@ class ChunkedLmHeadDetLogprobKeepFunction(torch.autograd.Function):
         return (dx, dw) + (None,) * 9
 
 
-def chunked_lm_head_det_loss(
+def cake_lm_head_det_train_loss(
     X: torch.Tensor,
     W: torch.Tensor,
     labels: torch.Tensor,
@@ -9991,7 +9991,7 @@ def chunked_lm_head_det_loss(
             gemm_tuning=gemm_tuning,
         )
         return (result.loss, result.logp) if return_logp else result.loss
-    loss, logp = ChunkedLmHeadDetLossFunction.apply(
+    loss, logp = CakeLMHeadDetLossFunction.apply(
         X,
         W,
         labels,
@@ -10013,7 +10013,7 @@ def chunked_lm_head_det_loss(
     return (loss, logp.detach()) if return_logp else loss
 
 
-def chunked_lm_head_det_logprob(
+def cake_lm_head_det_train_logprob(
     X: torch.Tensor,
     W: torch.Tensor,
     labels: torch.Tensor,
@@ -10031,7 +10031,7 @@ def chunked_lm_head_det_logprob(
 ) -> torch.Tensor:
     """Differentiable FP32 ``logp [T]`` (0 on ignored rows) for arbitrary downstream losses.  The switches
     ``compact_rows`` / ``fuse_dw_cast`` / ``dx_finalize`` / ``dw_stream`` / ``hidden_count`` / ``gemm_tuning`` and
-    their defaults (``None`` = the documented default) as in :func:`chunked_lm_head_det_loss`, plus the logits GEMM arms
+    their defaults (``None`` = the documented default) as in :func:`cake_lm_head_det_train_loss`, plus the logits GEMM arms
     of this entry: ``logprob_lbl`` (default ``True``, :func:`logprob_lbl_default`) -- the forward's logits GEMM
     writes the row statistics and the label column's logit only -- and ``logprob_dz`` (default ``True``,
     :func:`logprob_dz_default`) -- the backward's recompute writes ``dz`` from its epilogue, no ``row_grad`` launch
@@ -10039,7 +10039,7 @@ def chunked_lm_head_det_logprob(
     forward's valid-row index (no count, no host synchronization) and recomputes under the same values."""
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
-    return ChunkedLmHeadDetLogprobFunction.apply(
+    return CakeLMHeadDetLogprobFunction.apply(
         X,
         W,
         labels,
@@ -10056,7 +10056,7 @@ def chunked_lm_head_det_logprob(
     )
 
 
-def chunked_lm_head_det_logprob_temperature(
+def cake_lm_head_det_train_logprob_temperature(
     X: torch.Tensor,
     W: torch.Tensor,
     labels: torch.Tensor,
@@ -10076,7 +10076,7 @@ def chunked_lm_head_det_logprob_temperature(
 ) -> torch.Tensor:
     """Differentiable FP32 ``logp [T]`` (0 on ignored rows) for arbitrary downstream losses.  The switches
     ``compact_rows`` / ``fuse_dw_cast`` / ``dx_finalize`` / ``dw_stream`` / ``hidden_count`` / ``gemm_tuning`` and
-    their defaults (``None`` = the documented default) as in :func:`chunked_lm_head_det_loss`, plus the logits GEMM arms
+    their defaults (``None`` = the documented default) as in :func:`cake_lm_head_det_train_loss`, plus the logits GEMM arms
     of this entry: ``logprob_lbl`` (default ``True``, :func:`logprob_lbl_default`) -- the forward's logits GEMM
     writes the row statistics and the label column's logit only -- and ``logprob_dz`` (default ``True``,
     :func:`logprob_dz_default`) -- the backward's recompute writes ``dz`` from its epilogue, no ``row_grad`` launch
@@ -10100,7 +10100,7 @@ def chunked_lm_head_det_logprob_temperature(
         raise ValueError(f"backend must be one of {BACKENDS}")
     if temperature is None or (type(temperature) is float and temperature == 1.0):
         # the default path: no temperature operation (a scalar 1.0 resolves to none)
-        return ChunkedLmHeadDetLogprobFunction.apply(
+        return CakeLMHeadDetLogprobFunction.apply(
             X,
             W,
             labels,
@@ -10115,7 +10115,7 @@ def chunked_lm_head_det_logprob_temperature(
             logprob_dz,
             logprob_lbl,
         )
-    return ChunkedLmHeadDetLogprobTemperatureFunction.apply(
+    return CakeLMHeadDetLogprobTemperatureFunction.apply(
         X,
         W,
         labels,
@@ -10134,7 +10134,7 @@ def chunked_lm_head_det_logprob_temperature(
     )
 
 
-def chunked_lm_head_det_logprob_keep(
+def cake_lm_head_det_train_logprob_keep(
     X: torch.Tensor,
     W: torch.Tensor,
     labels: torch.Tensor,
@@ -10150,14 +10150,14 @@ def chunked_lm_head_det_logprob_keep(
     logprob_dz: Optional[bool] = None,
     logprob_lbl: Optional[bool] = None,
 ) -> torch.Tensor:
-    """:func:`chunked_lm_head_det_logprob` with the kept logits (opt-in; the opt-in module's
+    """:func:`cake_lm_head_det_train_logprob` with the kept logits (opt-in; the opt-in module's
     ``memory_mode="keep_logits"``).  Where a backward can follow -- grad mode on and ``X`` or ``W`` requiring a
     gradient, ``cake`` backend -- the forward keeps every chunk's BF16 logits as saved tensors (``2 * T_v * V``
     bytes until the backward; :func:`forward_logprob_keep`) and the first backward forms ``dz`` from them with
     ``row_grad`` instead of recomputing the logits (three GEMMs per chunk instead of four); a later backward through
     a retained graph recomputes.  Elsewhere -- grad mode off (``torch.no_grad``, ``torch.inference_mode``, the first
     pass of a reentrant ``torch.utils.checkpoint``), no input requiring a gradient, the reference backend -- the call
-    is :func:`chunked_lm_head_det_logprob` (the label-column forward).  A forward with a trainable input whose
+    is :func:`cake_lm_head_det_train_logprob` (the label-column forward).  A forward with a trainable input whose
     backward never runs pays the full-logits forward and holds the kept logits until the graph is freed.  Bitwise
     the same ``logp`` / ``dX`` / ``dW`` as the default entry."""
     if (
@@ -10165,7 +10165,7 @@ def chunked_lm_head_det_logprob_keep(
         and torch.is_grad_enabled()
         and (X.requires_grad or W.requires_grad)
     ):
-        return ChunkedLmHeadDetLogprobKeepFunction.apply(
+        return CakeLMHeadDetLogprobKeepFunction.apply(
             X,
             W,
             labels,
@@ -10178,7 +10178,7 @@ def chunked_lm_head_det_logprob_keep(
             gemm_tuning,
             logprob_dz,
         )
-    return chunked_lm_head_det_logprob(
+    return cake_lm_head_det_train_logprob(
         X,
         W,
         labels,

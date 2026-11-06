@@ -21,8 +21,8 @@ its host-side checks on its own: under another top-level name, in a
 gate, ``scripts/check_cake_build_manifests.py --vendored-gate``).  The package
 imports only itself, ``torch`` and ``tvm_ffi``; the experimental marking and
 the environment switches belong to the public entry points
-``flashinfer.chunked_lm_head.chunked_lm_head_det_loss`` /
-``chunked_lm_head_det_logprob`` (covered by ``test_cake_lm_head_det_loss_api.py``), so
+``flashinfer.chunked_lm_head.cake_lm_head_det_train_loss`` /
+``cake_lm_head_det_train_logprob`` (covered by ``test_cake_lm_head_det_loss_api.py``), so
 a direct call of the package emits no warning, and the only ``flashinfer``
 import is the JIT fallback of ``cake_build.py``.  Two tests, CPU-only: no GPU,
 no generated program and no JIT build is needed, so both run on every lane.
@@ -127,11 +127,11 @@ assert {
     "backward_loss",
     "forward_logprob",
     "backward_logprob",
-    "chunked_lm_head_det_loss",
-    "chunked_lm_head_det_logprob",
+    "cake_lm_head_det_train_loss",
+    "cake_lm_head_det_train_logprob",
     "forward_logprob_temperature",
     "backward_logprob_temperature",
-    "chunked_lm_head_det_logprob_temperature",
+    "cake_lm_head_det_train_logprob_temperature",
 }.issubset(public), sorted(public)
 assert isinstance(cake_jit.MODULES, dict) and cake_jit.STAGES  # registry loaded
 
@@ -156,7 +156,7 @@ calls = [
     # the prepared runner: the cake backend takes CUDA tensors only
     lambda: cb.prepare_lm_head_det_loss(bf16(T, H), bf16(V, H), labels, loss_div=1.0),
     # the autograd entry: grad_weight_dtype must equal W.dtype
-    lambda: cb.chunked_lm_head_det_loss(
+    lambda: cb.cake_lm_head_det_train_loss(
         bf16(T, H), bf16(V, H), labels, loss_div=1.0, grad_weight_dtype=torch.float32
     ),
     # the loss backward: a compacted accumulator needs num_rows
@@ -164,17 +164,17 @@ calls = [
     # the output cast: the accumulator must be FP32
     lambda: cb.scale_cast(bf16(8), None, torch.float32),
     # the opt-in autograd entry: memory_mode is "fast" or "budget"
-    lambda: opt_in.chunked_lm_head_det_loss(bf16(T, H), bf16(V, H), labels, loss_div=1.0, memory_mode="slow"),
+    lambda: opt_in.cake_lm_head_det_train_loss(bf16(T, H), bf16(V, H), labels, loss_div=1.0, memory_mode="slow"),
     # the opt-in loss forward: the caller's valid-row count lies in [0, T]
     lambda: opt_in.forward_loss(bf16(T, H), bf16(V, H), labels, loss_div=1.0, num_valid_rows=T + 1),
     # the budget rule: rows <= num_rows
     lambda: opt_in.memory_plan("loss", num_rows=T, rows=T + 1, hidden=H, vocab=V, chunk=T),
     # preload needs a CUDA device
-    lambda: opt_in.preload("cpu"),
+    lambda: opt_in.cake_lm_head_det_train_preload("cpu"),
     # the log-probability forward: a temperature must be positive and finite
     lambda: cb.forward_logprob_temperature(bf16(T, H), bf16(V, H), labels, backend="reference", temperature=0.0),
     # the autograd entry: a per-token temperature is an FP32 [T] tensor
-    lambda: cb.chunked_lm_head_det_logprob_temperature(
+    lambda: cb.cake_lm_head_det_train_logprob_temperature(
         bf16(T, H), bf16(V, H), labels, backend="reference", temperature=torch.ones(T + 1)
     ),
 ]

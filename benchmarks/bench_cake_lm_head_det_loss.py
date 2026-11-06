@@ -86,8 +86,8 @@ import flashinfer  # noqa: E402
 from flashinfer import chunked_lm_head as public_lm_head  # noqa: E402
 from flashinfer.api_logging import ExperimentalWarning  # noqa: E402
 from flashinfer.chunked_lm_head import (
-    chunked_lm_head_det_logprob,
-    chunked_lm_head_det_loss,
+    cake_lm_head_det_train_logprob,
+    cake_lm_head_det_train_loss,
 )  # noqa: E402
 from flashinfer.experimental.cake.cake_lm_head_det_train import cake_backend  # noqa: E402
 from flashinfer.testing import bench_gpu_time  # noqa: E402
@@ -525,11 +525,11 @@ class ArmCake(ArmAutograd):
         self.abi = cake_backend.record_abi(record)
 
     def _logprob(self):
-        """``chunked_lm_head_det_logprob`` of the arm's leaves, with the inputs' temperature when they carry one."""
+        """``cake_lm_head_det_train_logprob`` of the arm's leaves, with the inputs' temperature when they carry one."""
         kw = {}
         if self.inp.temperature is not None:
             kw["temperature"] = self.inp.temperature
-        return chunked_lm_head_det_logprob(
+        return cake_lm_head_det_train_logprob(
             self.X, self.W, self.inp.labels, chunk_size=self.chunk, backend="cake", **kw
         )
 
@@ -562,7 +562,7 @@ class ArmCake(ArmAutograd):
         if self.entry == "logprob":
             logp = self._logprob()
             return dict(loss=_downstream_loss(logp, inp), logp=logp)
-        loss, logp = chunked_lm_head_det_loss(
+        loss, logp = cake_lm_head_det_train_loss(
             self.X,
             self.W,
             inp.labels,
@@ -578,7 +578,7 @@ class ArmCake(ArmAutograd):
 
 
 class ArmCakeLogprob(ArmCake):
-    """Loss rows through the log-probability entry: ``chunked_lm_head_det_logprob`` (with the inputs' temperature when
+    """Loss rows through the log-probability entry: ``cake_lm_head_det_train_logprob`` (with the inputs' temperature when
     they carry one) and the row's objective in eager PyTorch on its ``logp`` -- for the policy rows the
     log-probabilities plus an eager policy loss, the matched-input comparison to the fused policy loss of the
     ``cake`` arm."""

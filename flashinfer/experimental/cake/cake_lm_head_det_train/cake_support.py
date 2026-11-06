@@ -805,7 +805,7 @@ def _check_word(word: torch.Tensor, check_inputs: bool) -> None:
 
 @dataclass(frozen=True)
 class SupportOutputs:
-    """Which outputs one call forms (``SupportDetLogprobFunction`` returns them in this order)."""
+    """Which outputs one call forms (``CakeLMHeadDetSupportFunction`` returns them in this order)."""
 
     packed: bool
     selected: bool
@@ -1784,7 +1784,7 @@ def support_memory_report(
     return report
 
 
-class SupportDetLogprobFunction(torch.autograd.Function):
+class CakeLMHeadDetSupportFunction(torch.autograd.Function):
     """One forward serves every requested output; gradients to ``X`` and ``W`` only."""
 
     @staticmethod
@@ -1806,7 +1806,7 @@ class SupportDetLogprobFunction(torch.autograd.Function):
         if _TOP_SAVED_HOOKS(False) is not None and _selective_checkpoint_modes():
             # under selective activation checkpointing: every dispatch mode popped (as in :mod:`.cake_backend`)
             with _modes_off():
-                return SupportDetLogprobFunction.forward(
+                return CakeLMHeadDetSupportFunction.forward(
                     ctx,
                     X,
                     W,
@@ -1984,7 +1984,7 @@ def _support_call(
     if backend == "cake":
         cx = _cake_context(X.device)
         cake = (cx, make_support_plan(problem, cx.arch, cx.geometry, knobs))
-    result = SupportDetLogprobFunction.apply(
+    result = CakeLMHeadDetSupportFunction.apply(
         X,
         W,
         support_ids,
@@ -2014,7 +2014,7 @@ def _check_first_offset(offsets: torch.Tensor, check_inputs: bool) -> None:
         _assert_on_device(first == 0, _ASSERT_MESSAGE)
 
 
-def chunked_lm_head_det_support_logprob(
+def cake_lm_head_det_train_support_logprob(
     X: torch.Tensor,
     W: torch.Tensor,
     support_ids: torch.Tensor,
@@ -2073,7 +2073,7 @@ def chunked_lm_head_det_support_logprob(
     return res["packed"] if labels is None else res["selected"]
 
 
-def chunked_lm_head_det_support_kl(
+def cake_lm_head_det_train_support_kl(
     X: torch.Tensor,
     W: torch.Tensor,
     support_ids: torch.Tensor,
@@ -2096,7 +2096,7 @@ def chunked_lm_head_det_support_kl(
     (``lq``, aligned with ``support_ids``; ``-inf`` allowed: ``Q = 0``).  Student and teacher share the
     support.  Rows with ``K_t <= 1`` give 0.  ``return_logprobs=True`` also returns the differentiable
     packed student ``logp [M]``: ``(kl, logp)``.  Weighting, reduction and any ``tau ** 2`` factor belong to
-    the caller.  Other arguments (and the backend-level knobs) as in :func:`chunked_lm_head_det_support_logprob`.
+    the caller.  Other arguments (and the backend-level knobs) as in :func:`cake_lm_head_det_train_support_logprob`.
     """
     outputs = SupportOutputs(packed=bool(return_logprobs), selected=False, kl=True)
     res = _support_call(
@@ -2120,21 +2120,15 @@ def chunked_lm_head_det_support_kl(
     return (res["kl"], res["packed"]) if return_logprobs else res["kl"]
 
 
+# The entries the facade forwards to, their autograd class and the constants of their contract; the helpers
+# (reference engine, error decoding, memory report, ...) stay importable as module attributes.
 __all__ = [
     "CANONICAL_SEQUENCE",
     "NO_ERROR",
     "SUPPORT_ERRORS",
     "SUPPORT_M_MAX",
     "SUPPORT_V_MAX",
-    "SupportDetLogprobFunction",
-    "SupportReferenceEngine",
-    "SupportRows",
-    "chunked_lm_head_det_support_kl",
-    "chunked_lm_head_det_support_logprob",
-    "decode_support_error",
-    "describe_support_error",
-    "support_error_word",
-    "support_memory_report",
-    "support_program_available",
-    "validate_support_inputs",
+    "CakeLMHeadDetSupportFunction",
+    "cake_lm_head_det_train_support_kl",
+    "cake_lm_head_det_train_support_logprob",
 ]

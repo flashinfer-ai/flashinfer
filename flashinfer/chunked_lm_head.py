@@ -29,14 +29,14 @@ from .api_logging import flashinfer_experimental_api
 # Thin experimental entry points; validation of the backend contract, the
 # chunk plans, the workspace, launch binding, autograd wrappers and JIT
 # registration live in flashinfer.experimental.cake.cake_lm_head_det_train (the
-# deterministic package, entries ``chunked_lm_head_det_*``) and
+# deterministic package, entries ``cake_lm_head_det_train_*``) and
 # flashinfer.experimental.cake.cake_lm_head_loss (the non-deterministic
-# package).  The ``chunked_lm_head_det_*`` entries are the deterministic
+# package).  The ``cake_lm_head_det_train_*`` entries are the deterministic
 # package's and take no ``deterministic`` keyword.  The det-free entries
 # ``chunked_lm_head_{loss,logprob,preload,support_logprob,support_kl}`` run the
 # non-deterministic package only: they need ``deterministic=False``, and any
 # other value, the default included, is a ``ValueError`` naming the
-# ``chunked_lm_head_det_*`` entry (see the section above them at the end of
+# ``cake_lm_head_det_train_*`` entry (see the section above them at the end of
 # this module).
 #
 # The package backend takes every switch as a keyword argument and reads no
@@ -200,7 +200,7 @@ def _cake_backend_opt_in() -> ModuleType:
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
-def chunked_lm_head_det_loss(
+def cake_lm_head_det_train_loss(
     X: torch.Tensor,
     W: torch.Tensor,
     labels: torch.Tensor,
@@ -355,7 +355,7 @@ def chunked_lm_head_det_loss(
         GEMM work.  The bound assumes a backward that frees the graph
         (``retain_graph=True`` keeps the forward's state); its margin is
         measured on GB200, GB300 and B200 (see the package README).
-        ``"keep_logits"`` belongs to ``chunked_lm_head_det_logprob`` (a
+        ``"keep_logits"`` belongs to ``cake_lm_head_det_train_logprob`` (a
         ``ValueError`` here).  No environment variable.
     num_valid_rows : int, optional
         The number of labels ``>= 0`` (not ``-100``), as a host integer (a
@@ -407,7 +407,7 @@ def chunked_lm_head_det_loss(
     saved accumulators as soon as it has used them (a second backward then
     raises).
 
-    ``chunked_lm_head_det_preload`` loads the libraries and creates the
+    ``cake_lm_head_det_train_preload`` loads the libraries and creates the
     per-device state ahead of a process's first call.
 
     Host side: inputs are validated and bound on the first call for an input
@@ -437,7 +437,7 @@ def chunked_lm_head_det_loss(
     if check_num_valid_rows and num_valid_rows is None:
         raise ValueError(_CHECK_WITHOUT_COUNT)
     if memory_mode is not None or num_valid_rows is not None:
-        return _cake_backend_opt_in().chunked_lm_head_det_loss(
+        return _cake_backend_opt_in().cake_lm_head_det_train_loss(
             X,
             W,
             labels,
@@ -461,7 +461,7 @@ def chunked_lm_head_det_loss(
             num_valid_rows=num_valid_rows,
             check_num_valid_rows=check_num_valid_rows,
         )
-    return _cake_backend().chunked_lm_head_det_loss(
+    return _cake_backend().cake_lm_head_det_train_loss(
         X,
         W,
         labels,
@@ -484,7 +484,7 @@ def chunked_lm_head_det_loss(
     )
 
 
-def _chunked_lm_head_det_logprob_temperature(
+def _logprob_temperature(
     X: torch.Tensor,
     W: torch.Tensor,
     labels: torch.Tensor,
@@ -503,8 +503,8 @@ def _chunked_lm_head_det_logprob_temperature(
     temperature: Union[None, float, torch.Tensor] = None,
     check_temperature: bool = False,
 ) -> torch.Tensor:
-    """:func:`chunked_lm_head_det_logprob` with a ``temperature`` (not ``None``): the same routing, through the
-    backends' ``chunked_lm_head_det_logprob_temperature`` entries."""
+    """:func:`cake_lm_head_det_train_logprob` with a ``temperature`` (not ``None``): the same routing, through the
+    backends' ``cake_lm_head_det_train_logprob_temperature`` entries."""
     if backend != "cake":
         raise ValueError(
             "the chunked LM-head + loss kernels currently support backend='cake'"
@@ -512,7 +512,7 @@ def _chunked_lm_head_det_logprob_temperature(
     if check_num_valid_rows and num_valid_rows is None:
         raise ValueError(_CHECK_WITHOUT_COUNT)
     if memory_mode is not None or num_valid_rows is not None:
-        return _cake_backend_opt_in().chunked_lm_head_det_logprob_temperature(
+        return _cake_backend_opt_in().cake_lm_head_det_train_logprob_temperature(
             X,
             W,
             labels,
@@ -532,7 +532,7 @@ def _chunked_lm_head_det_logprob_temperature(
             temperature=temperature,
             check_temperature=check_temperature,
         )
-    return _cake_backend().chunked_lm_head_det_logprob_temperature(
+    return _cake_backend().cake_lm_head_det_train_logprob_temperature(
         X,
         W,
         labels,
@@ -552,7 +552,7 @@ def _chunked_lm_head_det_logprob_temperature(
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
-def chunked_lm_head_det_logprob(
+def cake_lm_head_det_train_logprob(
     X: torch.Tensor,
     W: torch.Tensor,
     labels: torch.Tensor,
@@ -582,7 +582,7 @@ def chunked_lm_head_det_logprob(
     epilogue) and produces BF16
     ``dX`` and ``dW`` through FP32 accumulators with one cast each (with
     ``fuse_dw_cast`` the last chunk's weight-gradient GEMM writes the BF16
-    ``dW`` from its epilogue).  Arguments as in :func:`chunked_lm_head_det_loss`,
+    ``dW`` from its epilogue).  Arguments as in :func:`cake_lm_head_det_train_loss`,
     including the switches ``compact_rows``, ``fuse_dw_cast``, ``dx_finalize``,
     ``dw_stream``, ``hidden_count`` and ``gemm_tuning`` with the same defaults
     (``None`` reads the same ``FLASHINFER_CAKE_LM_HEAD_LOSS_*`` variable; every
@@ -590,7 +590,7 @@ def chunked_lm_head_det_logprob(
     the same values); ``dW`` is returned in BF16.  ``memory_mode``
     (``"budget"``: the backward's weight-gradient form within the same bound),
     ``num_valid_rows`` and ``check_num_valid_rows`` (the forward's count) as in
-    :func:`chunked_lm_head_det_loss`.  ``memory_mode="keep_logits"`` (this
+    :func:`cake_lm_head_det_train_loss`.  ``memory_mode="keep_logits"`` (this
     entry only, without ``num_valid_rows``; opt-in): where a backward can
     follow (grad mode on, ``X`` or ``W`` trainable) the forward keeps the BF16
     logits of the valid rows, ``2 * T_v * V`` bytes from the forward to the
@@ -600,7 +600,7 @@ def chunked_lm_head_det_logprob(
     backward through a retained graph recomputes); where none can follow
     (``torch.no_grad``, ``torch.inference_mode``, frozen inputs) the call is
     the default one.  Bitwise the same ``logp``, ``dX`` and ``dW``.  As for
-    :func:`chunked_lm_head_det_loss`, the det name is the mode: there is no
+    :func:`cake_lm_head_det_train_loss`, the det name is the mode: there is no
     ``deterministic`` keyword (``TypeError``) and torch's deterministic mode
     changes nothing.
 
@@ -628,7 +628,7 @@ def chunked_lm_head_det_logprob(
     takes no temperature (``ValueError``).
     """
     if temperature is not None:
-        return _chunked_lm_head_det_logprob_temperature(
+        return _logprob_temperature(
             X,
             W,
             labels,
@@ -653,7 +653,7 @@ def chunked_lm_head_det_logprob(
     if check_num_valid_rows and num_valid_rows is None:
         raise ValueError(_CHECK_WITHOUT_COUNT)
     if memory_mode is not None or num_valid_rows is not None:
-        return _cake_backend_opt_in().chunked_lm_head_det_logprob(
+        return _cake_backend_opt_in().cake_lm_head_det_train_logprob(
             X,
             W,
             labels,
@@ -671,7 +671,7 @@ def chunked_lm_head_det_logprob(
             num_valid_rows=num_valid_rows,
             check_num_valid_rows=check_num_valid_rows,
         )
-    return _cake_backend().chunked_lm_head_det_logprob(
+    return _cake_backend().cake_lm_head_det_train_logprob(
         X,
         W,
         labels,
@@ -689,7 +689,7 @@ def chunked_lm_head_det_logprob(
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
-def chunked_lm_head_det_preload(
+def cake_lm_head_det_train_preload(
     device: Optional[Union[torch.device, int, str]] = None,
     *,
     temperature: bool = False,
@@ -708,11 +708,13 @@ def chunked_lm_head_det_preload(
     loads at its first launch.  ``device``: a CUDA device, its index or
     ``None`` (the current device).
     ``temperature=True`` also loads the libraries of the
-    :func:`chunked_lm_head_det_logprob` temperature path and launches its PyTorch
+    :func:`cake_lm_head_det_train_logprob` temperature path and launches its PyTorch
     operators once; by default they are not loaded (callers that never pass
     a temperature build no temperature library).
     """
-    _cake_backend_opt_in().preload(device, temperature=temperature)
+    _cake_backend_opt_in().cake_lm_head_det_train_preload(
+        device, temperature=temperature
+    )
 
 
 @functools.cache
@@ -726,7 +728,7 @@ def _cake_support() -> ModuleType:
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
-def chunked_lm_head_det_support_logprob(
+def cake_lm_head_det_train_support_logprob(
     X: torch.Tensor,
     W: torch.Tensor,
     support_ids: torch.Tensor,
@@ -762,7 +764,7 @@ def chunked_lm_head_det_support_logprob(
         raise ValueError(
             "the candidate-support LM-head kernels currently support backend='cake'"
         )
-    return _cake_support().chunked_lm_head_det_support_logprob(
+    return _cake_support().cake_lm_head_det_train_support_logprob(
         X,
         W,
         support_ids,
@@ -777,7 +779,7 @@ def chunked_lm_head_det_support_logprob(
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
-def chunked_lm_head_det_support_kl(
+def cake_lm_head_det_train_support_kl(
     X: torch.Tensor,
     W: torch.Tensor,
     support_ids: torch.Tensor,
@@ -796,16 +798,16 @@ def chunked_lm_head_det_support_kl(
     ``KL_t = sum_j Q_j (lq_j - logp_j)`` over the candidates of row ``t`` with ``Q_j = exp(lq_j) > 0``,
     for the FP32 teacher log-probabilities ``teacher_logprobs [M]`` aligned with ``support_ids``
     (``requires_grad=False``; ``-inf`` entries drop out) and the student ``logp`` of
-    :func:`chunked_lm_head_det_support_logprob` on the same support; ``0`` on a row of one candidate or
+    :func:`cake_lm_head_det_train_support_logprob` on the same support; ``0`` on a row of one candidate or
     none.  Returns the FP32 ``kl [T]``, or ``(kl, logp)`` with the differentiable packed student
     ``logp [M]`` when ``return_logprobs=True``.  Weighting, reduction and any ``tau ** 2`` factor
-    belong to the caller.  Other arguments as in :func:`chunked_lm_head_det_support_logprob`.
+    belong to the caller.  Other arguments as in :func:`cake_lm_head_det_train_support_logprob`.
     """
     if backend != "cake":
         raise ValueError(
             "the candidate-support LM-head kernels currently support backend='cake'"
         )
-    return _cake_support().chunked_lm_head_det_support_kl(
+    return _cake_support().cake_lm_head_det_train_support_kl(
         X,
         W,
         support_ids,
@@ -832,7 +834,7 @@ _BINDING_CACHE_SETTINGS: Dict[str, Any] = _binding_cache_settings()
 # the non-deterministic package, flashinfer.experimental.cake.cake_lm_head_loss,
 # and need ``deterministic=False``.  Any other value, the default ``True``
 # included, raises ``ValueError`` naming the deterministic entry to call
-# instead (``chunked_lm_head_det_<same suffix>``), before any package import or
+# instead (``cake_lm_head_det_train_<same suffix>``), before any package import or
 # torch query.  ``deterministic=False`` runs that package under the same
 # argument checks and the same FLASHINFER_CAKE_LM_HEAD_LOSS_* fallbacks, also
 # while torch's deterministic algorithms are enabled
@@ -1004,7 +1006,7 @@ def chunked_lm_head_loss(*args: Any, deterministic: bool = True, **kwargs: Any):
     non-deterministic package, SM100 / SM103 / SM107 only.
 
     The computation, the arguments and the outputs are those of
-    :func:`chunked_lm_head_det_loss` (each switch keyword left at ``None``
+    :func:`cake_lm_head_det_train_loss` (each switch keyword left at ``None``
     reads the same ``FLASHINFER_CAKE_LM_HEAD_LOSS_*`` variable).
 
     Parameters
@@ -1024,7 +1026,7 @@ def chunked_lm_head_loss(*args: Any, deterministic: bool = True, **kwargs: Any):
         ``flashinfer.experimental.cake.cake_lm_head_loss``, default
         ``"auto"``, the deterministic backend's rule).
         Any other value, the default ``True`` included, raises ``ValueError``
-        naming :func:`chunked_lm_head_det_loss`, the deterministic entry to
+        naming :func:`cake_lm_head_det_train_loss`, the deterministic entry to
         call instead (it takes no ``deterministic`` keyword).  While
         ``torch.use_deterministic_algorithms(True)`` is in effect the call
         still runs the non-deterministic package: PyTorch's alert is raised
@@ -1034,9 +1036,9 @@ def chunked_lm_head_loss(*args: Any, deterministic: bool = True, **kwargs: Any):
         package unchanged.
 
     Every other parameter, the return value and the notes: see
-    :func:`chunked_lm_head_det_loss`.
+    :func:`cake_lm_head_det_train_loss`.
     """
-    _require_nd(deterministic, "chunked_lm_head_loss", "chunked_lm_head_det_loss")
+    _require_nd(deterministic, "chunked_lm_head_loss", "cake_lm_head_det_train_loss")
     try:
         return _nd_loss(*args, **kwargs)
     except TypeError as exc:
@@ -1145,13 +1147,13 @@ def chunked_lm_head_logprob(
     non-deterministic package, SM100 / SM103 / SM107 only.
 
     The computation and the arguments are those of
-    :func:`chunked_lm_head_det_logprob`.  ``deterministic=False`` (the only
+    :func:`cake_lm_head_det_train_logprob`.  ``deterministic=False`` (the only
     accepted value): the non-deterministic package
     (``flashinfer.experimental.cake.cake_lm_head_loss``), whose backward adds
     each K slice of a sliced dX GEMM into the FP32 ``dX`` accumulator by an
     unordered FP32 reduction (``logp`` keeps its fixed order).  Any other
     value, the default ``True`` included, raises ``ValueError`` naming
-    :func:`chunked_lm_head_det_logprob`, the deterministic entry to call
+    :func:`cake_lm_head_det_train_logprob`, the deterministic entry to call
     instead.  Under ``torch.use_deterministic_algorithms(True)`` the call
     still runs the non-deterministic package: PyTorch's alert is raised by
     that package before a K-sliced dX launch; there is no fallback to the
@@ -1163,7 +1165,7 @@ def chunked_lm_head_logprob(
     zero-gradient row skip runs the dX / dW GEMMs of the rows with a nonzero
     ``dlogp`` only, with a temperature too.
     """
-    _require_nd(deterministic, "chunked_lm_head_logprob", "chunked_lm_head_det_logprob")
+    _require_nd(deterministic, "chunked_lm_head_logprob", "cake_lm_head_det_train_logprob")
     try:
         return _nd_logprob(*args, **kwargs)
     except TypeError as exc:
@@ -1186,17 +1188,17 @@ def chunked_lm_head_preload(
     ahead of it, then wait for the device once (SM100 / SM103 / SM107 only).
 
     ``deterministic=False`` (the only accepted value): the work of
-    :func:`chunked_lm_head_det_preload` for the non-deterministic package
+    :func:`cake_lm_head_det_train_preload` for the non-deterministic package
     (``flashinfer.experimental.cake.cake_lm_head_loss``), whose libraries and
     per-device state the other det-free entries use.  Any other value, the
     default ``True`` included, raises ``ValueError`` naming
-    :func:`chunked_lm_head_det_preload`, the deterministic package's preload.
+    :func:`cake_lm_head_det_train_preload`, the deterministic package's preload.
     The per-thread state (side streams, events, count cells) is the calling
     thread's: another thread forms its own at its first call.
     ``temperature=True`` also loads the package's temperature libraries and
     launches its temperature path's PyTorch operators once.
     """
-    _require_nd(deterministic, "chunked_lm_head_preload", "chunked_lm_head_det_preload")
+    _require_nd(deterministic, "chunked_lm_head_preload", "cake_lm_head_det_train_preload")
     if temperature is False:
         _nd_backend_opt_in().preload(device)
         return
@@ -1244,12 +1246,12 @@ def chunked_lm_head_support_logprob(
     token through the non-deterministic package, SM100 / SM103 / SM107 only.
 
     The computation and the other arguments are those of
-    :func:`chunked_lm_head_det_support_logprob`.  ``deterministic=False`` (the
+    :func:`cake_lm_head_det_train_support_logprob`.  ``deterministic=False`` (the
     only accepted value): the non-deterministic package's entry
     (``flashinfer.experimental.cake.cake_lm_head_loss.cake_support``), which
     makes no run-to-run bitwise promise for the gradients.  Any other value,
     the default ``True`` included, raises ``ValueError`` naming
-    :func:`chunked_lm_head_det_support_logprob`, the deterministic entry to
+    :func:`cake_lm_head_det_train_support_logprob`, the deterministic entry to
     call instead.  Under ``torch.use_deterministic_algorithms(True)`` the call
     still runs the non-deterministic package: PyTorch's alert is raised by
     that package before a K-sliced dX launch; there is no fallback to the
@@ -1258,7 +1260,7 @@ def chunked_lm_head_support_logprob(
     _require_nd(
         deterministic,
         "chunked_lm_head_support_logprob",
-        "chunked_lm_head_det_support_logprob",
+        "cake_lm_head_det_train_support_logprob",
     )
     try:
         return _nd_support_logprob(*args, **kwargs)
@@ -1312,13 +1314,13 @@ def chunked_lm_head_support_kl(*args: Any, deterministic: bool = True, **kwargs:
     support through the non-deterministic package, SM100 / SM103 / SM107 only.
 
     The computation and the other arguments are those of
-    :func:`chunked_lm_head_det_support_kl`; ``deterministic`` as in
+    :func:`cake_lm_head_det_train_support_kl`; ``deterministic`` as in
     :func:`chunked_lm_head_support_logprob` (any value but ``False``, the
     default ``True`` included, raises ``ValueError`` naming
-    :func:`chunked_lm_head_det_support_kl`).
+    :func:`cake_lm_head_det_train_support_kl`).
     """
     _require_nd(
-        deterministic, "chunked_lm_head_support_kl", "chunked_lm_head_det_support_kl"
+        deterministic, "chunked_lm_head_support_kl", "cake_lm_head_det_train_support_kl"
     )
     try:
         return _nd_support_kl(*args, **kwargs)
