@@ -3279,7 +3279,10 @@ def _lean_rows():
 
 def test_arena_option_validation() -> None:
     KdaDetArena = cake_backend.KdaDetArena
-    assert KdaDetArena() == KdaDetArena(lean=False, tail_passes=1) and not KdaDetArena().lean
+    assert (
+        KdaDetArena() == KdaDetArena(lean=False, tail_passes=1)
+        and not KdaDetArena().lean
+    )
     assert KdaDetArena(tail_passes=2).lean  # the tail split lives in the lean layouts
     assert KdaDetArena(lean=True).tail_passes == 1
     for bad in (0, -1, 1.5, True, "2"):
@@ -4030,7 +4033,13 @@ def test_autograd_and_checkpoint_give_the_explicit_gradients(device, manifest) -
 
     q, k, v, g, beta = leaves()
     o = checkpoint(
-        lambda *a: cake_backend.chunk_kda_det(*a, cu), q, k, v, g, beta, use_reentrant=False
+        lambda *a: cake_backend.chunk_kda_det(*a, cu),
+        q,
+        k,
+        v,
+        g,
+        beta,
+        use_reentrant=False,
     )
     o.backward(dout)
     for leaf, name in zip(
@@ -4119,7 +4128,9 @@ def test_workspace_reuse_and_byte_counts(device, manifest) -> None:
     with pytest.raises(ValueError, match="allocated for"):
         cake_backend.chunk_kda_det_fwd(q, k, v, g, beta, cu, workspace=other)
     with pytest.raises(ValueError, match="save_mode"):
-        cake_backend.chunk_kda_det_fwd(q, k, v, g, beta, cu, workspace=ws, save_mode="full")
+        cake_backend.chunk_kda_det_fwd(
+            q, k, v, g, beta, cu, workspace=ws, save_mode="full"
+        )
     assert set(ws.paths()) == {"fwd", "fwd_nosave", "light", "tape", "replay"} | (
         {"light_states"} if ws.plan.recur == "seg" else set()
     )
@@ -4204,11 +4215,15 @@ def test_launch_sequences_follow_the_plan(device, manifest) -> None:
         assert not (p.light_saves_wu and "wy_bwd" in launched)
         launched.clear()
         bare = dataclasses.replace(saved, tables=None)
-        cake_backend.chunk_kda_det_bwd(q, k, v, g, beta, cu, dout, saved=bare, workspace=ws)
+        cake_backend.chunk_kda_det_bwd(
+            q, k, v, g, beta, cu, dout, saved=bare, workspace=ws
+        )
         assert launched == _expected_launches(p, "light", saved_tables=False)
         assert len(launched) == p.launch_count("light", tables=False)
         launched.clear()
-        cake_backend.chunk_kda_det_bwd(q, k, v, g, beta, cu, dout, saved=None, workspace=ws)
+        cake_backend.chunk_kda_det_bwd(
+            q, k, v, g, beta, cu, dout, saved=None, workspace=ws
+        )
         assert launched == _expected_launches(p, "replay")
         assert len(launched) == p.launch_count("replay")
         launched.clear()
@@ -4302,7 +4317,9 @@ def test_operand_checks(device, manifest) -> None:
     )
     refused("saved.tables", dataclasses.replace(saved, tables=saved.tables[:2]))
     refused("saved: for", dataclasses.replace(saved, tables=None, S=64))
-    out, _ = cake_backend.chunk_kda_det_fwd(q, k, v, g, beta, cu, save_for_backward=False)
+    out, _ = cake_backend.chunk_kda_det_fwd(
+        q, k, v, g, beta, cu, save_for_backward=False
+    )
     assert out.shape == (65, heads, D)
     assert cake_backend.is_supported(device)
 
@@ -4642,7 +4659,10 @@ def test_the_default_entry_plans_a_repeated_problem_once_and_keeps_no_device_mem
     for arena, doc in (
         (None, None),
         (cake_backend.KdaDetArena(lean=True, tail_passes=4), None),
-        (cake_backend.KdaDetArena(lean=True, tail_passes=2, batch_tokens=1000), lengths),
+        (
+            cake_backend.KdaDetArena(lean=True, tail_passes=2, batch_tokens=1000),
+            lengths,
+        ),
     ):
         ws = KdaDetWorkspace(plan, device, backward=True, arena=arena, doc_lengths=doc)
         ref_out, ref_grads = _autograd_step(inputs, workspace=ws, doc_lengths=doc)
@@ -4730,7 +4750,9 @@ def test_the_arena_options_never_synchronize_the_host(device, manifest) -> None:
         plan = cake_backend.plan(S, N, heads, cake_jit.sm_count(device.index))
         assert plan.light_path == "light_states"
         lean = cake_backend.KdaDetArena(lean=True, tail_passes=4)
-        batched = cake_backend.KdaDetArena(lean=True, tail_passes=4, batch_tokens=budget)
+        batched = cake_backend.KdaDetArena(
+            lean=True, tail_passes=4, batch_tokens=budget
+        )
         assert len(plan.batches(batched, lengths)) == 2
         packing = cake_backend._host_packing(
             plan,
@@ -4744,7 +4766,9 @@ def test_the_arena_options_never_synchronize_the_host(device, manifest) -> None:
             ((lean, None), (batched, lengths)) if runs[0] else ((batched, lengths),)
         )
         for arena, doc in options:
-            ws = KdaDetWorkspace(plan, device, backward=True, arena=arena, doc_lengths=doc)
+            ws = KdaDetWorkspace(
+                plan, device, backward=True, arena=arena, doc_lengths=doc
+            )
             for kwargs in (
                 {"arena": arena},
                 {"arena": arena},
@@ -5048,7 +5072,9 @@ def test_light_saved_set_carries_the_segment_states_above_the_size_rule(
         from_stripped = cake_backend.chunk_kda_det_bwd(
             q, k, v, g, beta, cu, dout, saved=stripped, workspace=ws
         )
-        tape_ws = KdaDetWorkspace.for_problem(S, num_docs, heads, device, save_mode="tape")
+        tape_ws = KdaDetWorkspace.for_problem(
+            S, num_docs, heads, device, save_mode="tape"
+        )
         from_tape_ws = cake_backend.chunk_kda_det_bwd(
             q, k, v, g, beta, cu, dout, saved=saved, workspace=tape_ws
         )
@@ -5342,7 +5368,9 @@ def test_lean_tail_passes_launch_the_tail_once_per_range(device, manifest) -> No
             )
             p = ws.plan
             launched.clear()
-            o, saved_l = cake_backend.chunk_kda_det_fwd(q, k, v, g, beta, cu, workspace=ws)
+            o, saved_l = cake_backend.chunk_kda_det_fwd(
+                q, k, v, g, beta, cu, workspace=ws
+            )
             assert torch.equal(o, reference_out)
             assert [n for n, _ in launched] == _expected_launches(p, "fwd")
             launched.clear()
@@ -5430,7 +5458,9 @@ def test_lean_arena_serves_the_saved_states_and_the_tape_paths(
         )
         assert tape_ws.bytes == p.workspace_bytes("bwd_tape_lean", t) < ws.bytes
         launched.clear()
-        o, saved_t = cake_backend.chunk_kda_det_fwd(q, k, v, g, beta, cu, workspace=tape_ws)
+        o, saved_t = cake_backend.chunk_kda_det_fwd(
+            q, k, v, g, beta, cu, workspace=tape_ws
+        )
         assert (
             torch.equal(o, reference_out)
             and saved_t.version == cake_backend.SAVED_VERSION_TAPE
@@ -5685,7 +5715,9 @@ def test_arena_option_validation_batched() -> None:
     assert KdaDetArena(
         lean=True, tail_passes=4, batch_tokens=10, max_docs_per_batch=1
     ).batched
-    assert not KdaDetArena().batched and not KdaDetArena(lean=True, tail_passes=3).batched
+    assert (
+        not KdaDetArena().batched and not KdaDetArena(lean=True, tail_passes=3).batched
+    )
     for bad in (0, -1, True, 1.5, "3"):
         with pytest.raises(ValueError, match="batch_tokens"):
             KdaDetArena(batch_tokens=bad)
@@ -5830,7 +5862,9 @@ def test_batch_plans_pin_the_whole_problems_records_and_segments() -> None:
             with pytest.raises(ValueError, match="doc_lengths"):
                 p.check_doc_lengths(tuple(lengths[:-1]) + (lengths[-1] + 1,))
             with pytest.raises(ValueError, match="above batch_tokens"):
-                p.batches(cake_backend.KdaDetArena(batch_tokens=max(lengths) - 1), lengths)
+                p.batches(
+                    cake_backend.KdaDetArena(batch_tokens=max(lengths) - 1), lengths
+                )
     # the six-chain row at 2 heads pins the two-level carry's group size (on every architecture)
     assert pinned > 0
 
@@ -5918,7 +5952,9 @@ def test_memory_report_batched_fields() -> None:
                 base["arena_bwd_bound_batched"] is None
                 and base["arena_floor_batched"] is None
             )
-            arena = cake_backend.KdaDetArena(lean=True, tail_passes=4, batch_tokens=120000)
+            arena = cake_backend.KdaDetArena(
+                lean=True, tail_passes=4, batch_tokens=120000
+            )
             p = cake_backend.plan(S, N, heads, sm, arch)
             r = cake_backend.memory_report(
                 S, N, heads, sm_count=sm, arch=arch, arena=arena
@@ -6192,7 +6228,9 @@ def test_batched_arena_gives_the_default_results_bitwise(
     del tape_default
     for label, kw in _partitions(lengths):
         for lean in (False, True):
-            arena = cake_backend.KdaDetArena(lean=lean, tail_passes=3 if lean else 1, **kw)
+            arena = cake_backend.KdaDetArena(
+                lean=lean, tail_passes=3 if lean else 1, **kw
+            )
             tag = (label, lean)
             ws = KdaDetWorkspace.for_problem(
                 S, N, heads, device, arena=arena, doc_lengths=lengths
@@ -6374,7 +6412,9 @@ def test_batched_arena_gives_the_default_results_bitwise(
                 inputs[n].detach().clone().requires_grad_(True)
                 for n in ("q", "k", "v", "g", "beta")
             ]
-            o = cake_backend.chunk_kda_det(*leaves, cu, arena=arena, doc_lengths=lengths)
+            o = cake_backend.chunk_kda_det(
+                *leaves, cu, arena=arena, doc_lengths=lengths
+            )
             assert _bits_equal(o, ref_out), tag
             o.backward(dout)
             _check_bits(
@@ -6650,7 +6690,9 @@ def test_batched_arena_on_a_row_that_saves_the_states(device, manifest) -> None:
             for n in ("q", "k", "v", "g", "beta")
         ]
         o = checkpoint(
-            lambda *a: cake_backend.chunk_kda_det(*a, cu, arena=arena, doc_lengths=lengths),
+            lambda *a: cake_backend.chunk_kda_det(
+                *a, cu, arena=arena, doc_lengths=lengths
+            ),
             *leaves,
             use_reentrant=False,
         )
@@ -6695,7 +6737,9 @@ def test_batched_arena_with_exact_zero_values(device, manifest, monkeypatch) -> 
         ref_out, ref_grads = _clone_all(out, grads)
         del out, grads
         real = _real_chunks(lengths)
-        tape_default = KdaDetWorkspace.for_problem(S, N, heads, device, save_mode="tape")
+        tape_default = KdaDetWorkspace.for_problem(
+            S, N, heads, device, save_mode="tape"
+        )
         _, saved_t = cake_backend.chunk_kda_det_fwd(
             q, k, v, g, beta, cu_t, workspace=tape_default
         )
@@ -6874,7 +6918,9 @@ def test_batched_views_share_the_arena_eye_and_epoch(device, manifest) -> None:
         inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens")
     )
     arena = cake_backend.KdaDetArena(batch_tokens=95)
-    ws = KdaDetWorkspace.for_problem(S, N, heads, device, arena=arena, doc_lengths=lengths)
+    ws = KdaDetWorkspace.for_problem(
+        S, N, heads, device, arena=arena, doc_lengths=lengths
+    )
     p = ws.plan
     batches = p.batches(arena, lengths)
     assert [(b.d0, b.d1) for b in batches] == [(0, 2), (2, 4)]
@@ -7196,7 +7242,9 @@ def test_host_chain_ranks_and_block_runs_follow_the_tables_rule() -> None:
     # the split pack: its first group by index, its second one run from the second chain
     for arch in ARCHES:
         p = cake_backend.plan(sum(SPLIT_LENGTHS), 4, 4, 148, arch)
-        arena = cake_backend.KdaDetArena(batch_tokens=SPLIT_LENGTHS[0] + SPLIT_LENGTHS[1])
+        arena = cake_backend.KdaDetArena(
+            batch_tokens=SPLIT_LENGTHS[0] + SPLIT_LENGTHS[1]
+        )
         packing = cake_backend._host_packing(
             p,
             arena,
@@ -7424,7 +7472,9 @@ def test_batched_block_runs_give_the_default_results_bitwise(
         out, grads, saved = _run_fwd_bwd(inputs)
         ref_out, ref_grads = _clone_all(out, grads)
         del out, grads
-        tape_default = KdaDetWorkspace.for_problem(S, N, heads, device, save_mode="tape")
+        tape_default = KdaDetWorkspace.for_problem(
+            S, N, heads, device, save_mode="tape"
+        )
         _, saved_t = cake_backend.chunk_kda_det_fwd(
             q, k, v, g, beta, cu, workspace=tape_default
         )
@@ -8204,7 +8254,9 @@ def test_raw_gate_operand_checks(device, manifest) -> None:
         with pytest.raises(ValueError, match=name):
             cake_backend.chunk_kda_det_fwd(q, k, v, g32, beta, cu, **{name: value})
         with pytest.raises(ValueError, match=name):
-            cake_backend.chunk_kda_det_bwd(q, k, v, g32, beta, cu, dout, **{name: value})
+            cake_backend.chunk_kda_det_bwd(
+                q, k, v, g32, beta, cu, dout, **{name: value}
+            )
         with pytest.raises(ValueError, match=name):
             cake_backend.chunk_kda_det(q, k, v, g32, beta, cu, **{name: value})
     with pytest.raises(ValueError, match="lower_bound"):
@@ -8441,7 +8493,9 @@ def test_raw_gate_batched_groups_give_the_whole_problem_results_bitwise(
     launched: list = []
     for label, kw in _partitions(lengths):
         for lean in (False, True):
-            arena = cake_backend.KdaDetArena(lean=lean, tail_passes=3 if lean else 1, **kw)
+            arena = cake_backend.KdaDetArena(
+                lean=lean, tail_passes=3 if lean else 1, **kw
+            )
             tag = (label, lean)
             ws = KdaDetWorkspace.for_problem(
                 S,

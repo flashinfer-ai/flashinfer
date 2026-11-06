@@ -82,7 +82,14 @@ REMOVED_MODULES = (
     OLD_PACKAGE,
     *(
         f"{OLD_PACKAGE}.{m}"
-        for m in ("cake_backend", "cake_build", "cake_jit", "cake_kcp", "cake_kcp_jit", "cake_kcp_plan")
+        for m in (
+            "cake_backend",
+            "cake_build",
+            "cake_jit",
+            "cake_kcp",
+            "cake_kcp_jit",
+            "cake_kcp_plan",
+        )
     ),
     "tests.test_helpers.cake_kda_train_reference",
 )
