@@ -47,8 +47,8 @@ PACKAGES: dict[str, str] = {
     "cake_kda_det_train_kcp": "flashinfer.experimental.cake_kda_det_train_kcp",
     # its non-deterministic counterpart (deterministic=False)
     "cake_kda_train_kcp": "flashinfer.experimental.cake_kda_train_kcp",
-    "cake_gdn_det_train_kcp": "flashinfer.experimental.cake_gdn_det_train_kcp",
-    "cake_gdn_train_kcp": "flashinfer.experimental.cake_gdn_train_kcp",
+    "cake_gdn_det_train_kcp": "flashinfer.experimental.cake.cake_gdn_det_train_kcp",
+    "cake_gdn_nondet_train_kcp": "flashinfer.experimental.cake.cake_gdn_nondet_train_kcp",
     "cake_kimi_k3_attn_res": "flashinfer.experimental.cake_kimi_k3_attn_res",
     "cake_stepfun_moe": "flashinfer.experimental.cake_stepfun_moe",
     "cake_nvfp4_svdquant_gemm": "flashinfer.cake_nvfp4_svdquant_gemm_backend",
@@ -60,8 +60,8 @@ PACKAGES: dict[str, str] = {
     "deepgemm_fp8_gemm": "flashinfer.experimental.deepgemm_fp8_gemm",
     "deepgemm_batched_gemm": "flashinfer.experimental.deepgemm_batched_gemm",
     "sm110_xqa": "flashinfer.experimental.sm110_xqa",
-    "cake_gdn_det_train": "flashinfer.experimental.cake_gdn_det_train",
-    "cake.cake_gdn_train": "flashinfer.experimental.cake.cake_gdn_train",
+    "cake_gdn_det_train": "flashinfer.experimental.cake.cake_gdn_det_train",
+    "cake_gdn_nondet_train": "flashinfer.experimental.cake.cake_gdn_nondet_train",
     "cake_gqa_train": "flashinfer.experimental.cake_gqa_train",
     "cake.cake_mhc_train": "flashinfer.experimental.cake.cake_mhc_train_backend",
     # the non-deterministic causal conv1d package (``deterministic=False``); its key carries the namespace
