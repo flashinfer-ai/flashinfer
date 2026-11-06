@@ -24,6 +24,26 @@ libraries are loaded prebuilt from `aot/` when a builder compiled them and
 JIT-built by FlashInfer from the sources and flags `build.json` records
 otherwise.  The package reads no environment variable.
 
+## Mode and dispatch rules
+
+| call | `deterministic=False` | any other value (the default, `True`, `None`, `0`, `1`, `"False"`) | under `torch.use_deterministic_algorithms(True)` (strict or `warn_only=True`) |
+|---|---|---|---|
+| this package (`chunk_gated_delta_rule`, `ChunkGatedDeltaRuleFunction.apply`, `gdn_chunk_forward`, `gdn_chunk_backward`) | runs | `ValueError` naming the deterministic entry, before any work | runs; no alert (every launch is fixed-order) |
+| `flashinfer.experimental.cake_gdn_det_train` (`chunk_gated_delta_rule_det`, ...) | no `deterministic` keyword (`TypeError`) | no `deterministic` keyword | unchanged: every launch is fixed-order |
+
+* This package is the non-deterministic route only.  Nothing routes a call
+  to the deterministic package and nothing falls back to it: a caller who
+  wants the deterministic route calls `flashinfer.experimental.cake_gdn_det_train`.
+* Every call states the mode with `deterministic=False`.
+* PyTorch's deterministic algorithms do not change the route.  A launch whose
+  result can vary run to run raises PyTorch's alert immediately before it runs
+  (`RuntimeError`; a `UserWarning` and then the launch under
+  `warn_only=True`).  Every launch of this version is fixed-order, so no call
+  raises it.
+* The context-parallel packages follow the same rules
+  (`flashinfer.cake_gdn_train_kcp` / `flashinfer.experimental.cake_gdn_train_kcp`
+  and `flashinfer.cake_gdn_det_train_kcp`).
+
 ## Opt-in
 
 Import the entry point explicitly; nothing in `flashinfer` imports this
@@ -79,21 +99,24 @@ package implicitly.  Every entry of this package (`chunk_gated_delta_rule`,
 non-deterministic route fails instead of running it.  The autograd function
 records the forward's mode, and `gdn_chunk_backward` refuses (`ValueError`) a
 forward tape of the other mode, such as one of the deterministic package.
-The KCP facade `flashinfer.cake_gdn_train_kcp` is the entry that dispatches on
-`deterministic` (`True`: the deterministic package; `False`: the
-non-deterministic one).
+The KCP facade `flashinfer.cake_gdn_train_kcp` follows the same rule: it runs
+the non-deterministic KCP package with `deterministic=False` only.
 
 No launch of this package is unordered, so PyTorch's deterministic algorithms
 (`torch.use_deterministic_algorithms(True)`, with or without `warn_only`)
-change nothing: no entry raises PyTorch's alert.  The deterministic packages,
-their names, defaults and aliases are unchanged.
+change nothing: no entry raises PyTorch's alert.
 
-| name | what it is now |
+The deterministic packages are named by their det names only:
+
+| name | what it is |
 |---|---|
-| `flashinfer.experimental.cake_gdn_det_train` and its aliases `chunk_gated_delta_rule`, `ChunkGatedDeltaRuleFunction`, `gdn_chunk_forward`, `gdn_chunk_backward` | unchanged: the deterministic one-rank package |
-| `flashinfer.experimental.cake_gdn_train` (the KCP package of FlashInfer v0.7.3rc1) | unchanged: a legacy alias of the deterministic KCP package `flashinfer.experimental.cake_gdn_det_train_kcp` |
-| `flashinfer.gdn_train`, `flashinfer.cake_gdn_det_train_kcp` | unchanged: deterministic KCP entry points |
-| `flashinfer.experimental.cake.cake_gdn_train` | new: this non-deterministic one-rank package |
+| `flashinfer.experimental.cake_gdn_det_train` (`chunk_gated_delta_rule_det`, `ChunkGatedDeltaRuleDetFunction`, `gdn_chunk_det_forward`, `gdn_chunk_det_backward`) | the deterministic one-rank package |
+| `flashinfer.experimental.cake_gdn_det_train_kcp`, `flashinfer.cake_gdn_det_train_kcp` | the deterministic KCP package and its entry points |
+| `flashinfer.experimental.cake.cake_gdn_train` | this non-deterministic one-rank package |
+
+The no-det spellings `chunk_gated_delta_rule`, `ChunkGatedDeltaRuleFunction`,
+`gdn_chunk_forward` and `gdn_chunk_backward` name this package's
+non-deterministic entries; a deterministic call uses the det names above.
 
 ## Chain
 

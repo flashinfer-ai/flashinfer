@@ -277,6 +277,10 @@ void Run(TensorView a_tmap_q, TensorView a_tmap_swa_kv, TensorView a_tmap_compre
   check_same_device(a_seq_lens, a_tmap_q, "seq_lens", "tmap_q");
   check_contiguous(a_cum_seq_lens_q, "cum_seq_lens_q");
   check_same_device(a_cum_seq_lens_q, a_tmap_q, "cum_seq_lens_q", "tmap_q");
+  TVM_FFI_CHECK((a_sparse_topk >= 128LL), ValueError)
+      << KERNEL_NAME << ": requires (sparse_topk >= 128)";
+  TVM_FFI_CHECK((a_sparse_topk <= 1152LL), ValueError)
+      << KERNEL_NAME << ": requires (sparse_topk <= 1152)";
   TVM_FFI_CHECK(a_enable_pdl == 0LL || a_enable_pdl == 1LL, ValueError)
       << KERNEL_NAME << ": 'enable_pdl' = " << a_enable_pdl << " is not 0 or 1";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)

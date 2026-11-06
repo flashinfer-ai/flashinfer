@@ -2689,6 +2689,7 @@ class KdaDetWorkspace:
                 f"KdaDetWorkspace: layouts takes another route's modes; {LEAN_MODES} take their tail passes from the "
                 f"arena option, got layouts={layouts!r}"
             )
+        _check_det_package(arena=arena)
         self.arena_option = KdaDetArena() if arena is None else arena
         plan.check_arena(self.arena_option, backward=backward)
         self.doc_lengths = (
@@ -3191,6 +3192,37 @@ def _entry_release(ws: KdaDetWorkspace, key: tuple[Any, ...] | None) -> None:
             _entry_pool.popitem(last=False)
 
 
+# What the deterministic entries take, by argument: (the type, what it is, where a caller gets one).
+_DET_KINDS: dict[str, tuple[type, str, str]] = {
+    "workspace": (
+        KdaDetWorkspace,
+        "workspace",
+        "flashinfer.cake_kda_det_train.kda_det_train_workspace",
+    ),
+    "saved": (KdaDetChunkSaved, "saved set", "the saved set of chunk_kda_det_fwd"),
+    "arena": (
+        KdaDetArena,
+        "arena option",
+        "flashinfer.cake_kda_det_train.kda_det_train_arena",
+    ),
+}
+
+
+def _check_det_package(**objects: Any) -> None:
+    """Refuse a ``workspace`` / ``saved`` / ``arena`` argument that is not this package's type with ``ValueError``
+    naming the mode.  The non-deterministic package's ``KdaWorkspace`` / ``KdaChunkSaved`` / ``KdaArena`` carry the
+    attributes the other checks read, so the type alone tells them apart; ``None`` passes."""
+    for name, value in objects.items():
+        cls, kind, source = _DET_KINDS[name]
+        if value is None or isinstance(value, cls):
+            continue
+        raise ValueError(
+            f"{name}: a {type(value).__name__} from {type(value).__module__} is not a deterministic-package "
+            f"{kind}; the deterministic entries take a {cls.__name__} ({source}); the non-deterministic package "
+            "is flashinfer.cake_kda_train / flashinfer.cake_kda_train_kcp (deterministic=False)"
+        )
+
+
 @contextlib.contextmanager
 def _workspace(
     workspace: KdaDetWorkspace | None,
@@ -3209,7 +3241,9 @@ def _workspace(
     """The workspace of one call: the caller's (checked against the problem and the modes) or, without one, the
     call's own, whose device memory lives for the call alone (:func:`_entry_acquire`).  ``l2n`` is the call's
     in-kernel Q/K L2 norm mode: ``"off"`` or ``"fused"`` (``use_qk_l2norm_in_kernel``); a caller's workspace of
-    mode ``"fallback"`` serves a ``"fused"`` call (the explicit test route), every other difference is refused."""
+    mode ``"fallback"`` serves a ``"fused"`` call (the explicit test route), every other difference is refused.
+    A workspace or an arena option of another package (the non-deterministic one) is refused by its type."""
+    _check_det_package(workspace=workspace, arena=arena)
     if workspace is None:
         ws, key = _entry_acquire(
             S,
@@ -4171,8 +4205,10 @@ def chunk_kda_det_fwd(
     reference): the l2n intra record writes ``qn`` / ``kn`` into the arena's ``u`` / ``w`` slots (transient: WY
     overwrites them) and, with ``save_for_backward``, ``qk_rstd`` FP32 ``[2, S, H]`` into the saved set, which
     records the mode; no launch is added and no normalized row is kept.  The workspace must be of an l2n mode
-    (:attr:`KdaDetWorkspace.l2n`).
+    (:attr:`KdaDetWorkspace.l2n`).  A workspace or an arena option of the non-deterministic package is refused
+    with ``ValueError``.
     """
+    _check_det_package(workspace=workspace, arena=arena)
     gate = _gate_mode(use_gate_in_kernel)
     l2n = _l2n_mode(use_qk_l2norm_in_kernel)
     q, k, v, g, beta, S, N, H, batched = _operands(
@@ -4735,7 +4771,10 @@ def chunk_kda_det_bwd(
     that backward allocates nothing for them; else per call.  Every later reader binds them, and the l2n GLM intra
     program applies the pullback ``r * (dq_hat - y * <dq_hat, y>)`` (``y = x * r`` in FP32) before its one BF16
     store.  A saved set of the other mode is refused.
+
+    A saved set, a workspace or an arena option of the non-deterministic package is refused with ``ValueError``.
     """
+    _check_det_package(saved=saved, workspace=workspace, arena=arena)
     gate = _gate_mode(use_gate_in_kernel)
     l2n = _l2n_mode(use_qk_l2norm_in_kernel)
     raw_batched = g.dim() == 4
@@ -5502,16 +5541,6 @@ def is_supported(device: torch.device | str | int | None = None) -> bool:
         is not None
     )
 
-
-# The names before the det rename, bound to the same objects (not in ``__all__``): the KCP modules and existing
-# callers keep working, ``isinstance`` holds across the two spellings.
-ChunkKDAFunction = ChunkKDADetFunction
-KdaArena = KdaDetArena
-KdaChunkSaved = KdaDetChunkSaved
-KdaWorkspace = KdaDetWorkspace
-chunk_kda = chunk_kda_det
-chunk_kda_bwd = chunk_kda_det_bwd
-chunk_kda_fwd = chunk_kda_det_fwd
 
 __all__ = [
     "ALIGN",
