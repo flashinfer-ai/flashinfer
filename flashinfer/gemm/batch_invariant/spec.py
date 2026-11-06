@@ -37,11 +37,50 @@ from ...batch_invariant.fp_interface.term import Term, TermAlgebra, fingerprint
 
 #: The operand formats of the dense classes and their opaque K-step: bf16 on ``kind::f16`` (16 elements per step),
 #: the two fp8 formats on ``kind::f8f6f4`` (32 elements per step).
-IN_FMTS = ("bf16", "e4m3", "e5m2")
+IN_FMTS = ("bf16", "e4m3", "e5m2", "mxfp8", "mxfp8_k64")
 FP8_FMTS = ("e4m3", "e5m2")
-MMA_K_OF = {"bf16": 16, "e4m3": 32, "e5m2": 32}
-MMA_OP_OF = {"bf16": "mma_bf16_k16", "e4m3": "mma_fp8_k32", "e5m2": "mma_fp8_k32"}
-ELEM_BITS_OF = {"bf16": 16, "e4m3": 8, "e5m2": 8}
+#: The MX format: e4m3 elements with one UE8M0 (power-of-two) block scale per 32 elements in the 128x4 swizzled layout, the
+#: scale consumed by the block-scaled instruction itself (no software step touches it). Two classes, one per instruction:
+#: ``mxfp8`` on ``kind::mxf8f6f4`` with 32 elements per step (one scale per row per step; the sm_100 / sm_103 parts) and
+#: ``mxfp8_k64`` on the sm_107 instruction with 64 elements per step (two scales per row per step). A wider step folds more
+#: products per accumulator update: a different per-element fold, hence a different class (``gemm.mxfp8.kfold64``), distinct
+#: from ``gemm.mxfp8.kfold`` at every K. The API runs the class of the device's architecture family (`schedule.mx_class_for`).
+MX_FMTS = ("mxfp8", "mxfp8_k64")
+BLOCK_SCALED = frozenset(
+    MX_FMTS
+)  # formats whose step takes scale-factor operands (the leaf carries them)
+MMA_K_OF = {"bf16": 16, "e4m3": 32, "e5m2": 32, "mxfp8": 32, "mxfp8_k64": 64}
+MMA_OP_OF = {
+    "bf16": "mma_bf16_k16",
+    "e4m3": "mma_fp8_k32",
+    "e5m2": "mma_fp8_k32",
+    "mxfp8": "mma_mxfp8_k32",
+    "mxfp8_k64": "mma_mxfp8_k64",
+}
+ELEM_BITS_OF = {"bf16": 16, "e4m3": 8, "e5m2": 8, "mxfp8": 8, "mxfp8_k64": 8}
+#: Dense MMA throughput relative to bf16 (what the dispatcher's estimate uses): the 8-bit kinds run at twice the bf16 rate,
+#: the block-scaled 8-bit step at the same rate as the dense one.
+MMA_RATE_OF = {"bf16": 1.0, "e4m3": 2.0, "e5m2": 2.0, "mxfp8": 2.0, "mxfp8_k64": 2.0}
+SF_VEC = {"mxfp8": 32, "mxfp8_k64": 32}  # elements per block scale
+SF_FMT = {"mxfp8": "e8m0", "mxfp8_k64": "e8m0"}  # the block scale's format
+#: The 128x4 swizzled scale-factor layout (what ``mxfp8_quantize(..., is_sf_swizzled_layout=True)`` writes): atoms of 128
+#: rows x 4 blocks of ``SF_VEC`` elements (512 bytes), K-tiles consecutive, row-tiles strided by the K-tiles of the whole K.
+SF_ATOM_ROWS, SF_ATOM_KBLOCKS = 128, 4
+
+
+def sf_bytes(rows: int, k: int, in_fmt: str = "mxfp8") -> int:
+    """Bytes of the 128x4 swizzled scale-factor buffer of a ``(rows, k)`` operand of the format: whole atoms."""
+    return (
+        -(-rows // SF_ATOM_ROWS)
+        * SF_ATOM_ROWS
+        * -(-k // (SF_VEC[in_fmt] * SF_ATOM_KBLOCKS))
+        * SF_ATOM_KBLOCKS
+    )
+
+
+CLASS_TAG = {
+    "mxfp8_k64": ("mxfp8.kfold64", "mxfp8.kchunk64")
+}  # class names where the format key is not the class name
 MMA_K = MMA_K_OF["bf16"]  # the bf16 K step (the bf16 class's constant)
 MMA_OP = MMA_OP_OF["bf16"]
 BIAS_OP = "bias_col"  # the bias leaf: the bias of one output column as a binary32 value
@@ -50,14 +89,30 @@ ELEM_BITS = ELEM_BITS_OF["bf16"]
 
 
 def is_scaled(in_fmt: str) -> bool:
-    """The fp8 classes carry the per-tensor scale chain; the bf16 class does not."""
+    """The fp8 classes carry the per-tensor scale chain; the bf16 and the MX classes do not (``mm_mxfp8`` has no alpha; the
+    block scales are the instruction's operands, not a chain step)."""
     return in_fmt in FP8_FMTS
 
 
+def chunk_unit(in_fmt: str) -> int:
+    """The K granule of the fixed-chunk rule (``schedule.chunks_for``): a chunk is a whole number of MMA steps and, for the
+    block-scaled formats, a whole number of scale-factor atom columns (the 128x4 layout stores 4 consecutive K-blocks of
+    ``SF_VEC`` elements together, so a chunk boundary must fall on a ``4 * SF_VEC`` element boundary): the lcm of the two.
+    16 / 32 for bf16 / fp8, 128 for the MX classes (4 x 32 elements: 4 steps of the sm_100 instruction, 2 of the sm_107 one)."""
+    import math
+
+    mk = MMA_K_OF[in_fmt]
+    if in_fmt not in BLOCK_SCALED:
+        return mk
+    atom = 4 * SF_VEC[in_fmt]
+    return mk * atom // math.gcd(mk, atom)
+
+
 def class_name(in_fmt: str, chunked: bool) -> str:
-    """``gemm.<fmt>.kfold`` / ``gemm.<fmt>.kchunk``, with ``.scaled`` for the fp8 formats."""
-    name = f"gemm.{in_fmt}." + ("kchunk" if chunked else "kfold")
-    return name + (".scaled" if is_scaled(in_fmt) else "")
+    """``gemm.<fmt>.kfold`` / ``gemm.<fmt>.kchunk`` (with ``.scaled`` for the fp8 formats), or the declared class name of a
+    format whose key differs from it (``mxfp8_k64``: ``gemm.mxfp8.kfold64`` / ``gemm.mxfp8.kchunk64``)."""
+    tag = CLASS_TAG.get(in_fmt, (f"{in_fmt}.kfold", f"{in_fmt}.kchunk"))
+    return "gemm." + tag[1 if chunked else 0] + (".scaled" if is_scaled(in_fmt) else "")
 
 
 def k_steps(K: int, in_fmt: str = "bf16") -> int:
@@ -66,6 +121,16 @@ def k_steps(K: int, in_fmt: str = "bf16") -> int:
 
 def identity_note(in_fmt: str) -> str:
     mk = MMA_K_OF[in_fmt]
+    if in_fmt in BLOCK_SCALED:
+        # UE8M0 has no zero: the zero-filled scale byte 0x00 is 2^-127, a finite positive power of two; the zero-filled values
+        # are +0, so every padded product is (+0 * 2^-127) * (+0 * 2^-127) = +0 and the step adds nothing
+        return (
+            f"MMA{mk}(D, A=0, SFA=s, B=0, SFB=s) == D for finite s: the K remainder's values are TMA zero fill (+0), its scales "
+            "the scale buffers' padding bytes (the quantizers write zeros: UE8M0 0x00 is the finite 2^-127; the contract "
+            "requires finite bytes), so every padded product is +0 and the step adds nothing; every configuration issues the "
+            "same padded steps (the inner radix is fixed), so this corner cannot separate two configurations (R3); the "
+            "fingerprint hashes the raw K so a padded and an unpadded K are distinct specifications"
+        )
     return (
         f"MMA{mk}(D, 0, 0) == D: the zero-filled K remainder (whole padded steps of the last K-block, TMA zero fill of "
         "both operands) adds products that are all +0; every configuration issues the same padded steps (the inner radix "
@@ -95,8 +160,22 @@ def bias_leaf(fp, n: int):
     return fp.op(BIAS_OP, n)
 
 
-def kslice_leaf(m: int, n: int):
-    """The K-slice leaf of step ``t``: the (A, B) slices of row ``m`` and column ``n``."""
+def kslice_leaf(m: int, n: int, in_fmt: str = "bf16"):
+    """The K-slice leaf of step ``t``: the (A, B) slices of row ``m`` and column ``n``, plus the (SFA, SFB) scale-factor
+    slices for the block-scaled classes (one UE8M0 scale per ``SF_VEC`` elements, consumed by the instruction itself)."""
+    if in_fmt in BLOCK_SCALED:
+
+        def leaf_bs(fp, idx):
+            t = idx["kstep"]
+            return fp.op(
+                "absf_kslice",
+                fp.op("a_rows", m, t),
+                fp.op("sfa_rows", m, t),
+                fp.op("b_cols", t, n),
+                fp.op("sfb_cols", t, n),
+            )
+
+        return leaf_bs
 
     def leaf(fp, idx):
         t = idx["kstep"]
@@ -117,7 +196,9 @@ def reduction(K: int, m: int, n: int, in_fmt: str = "bf16") -> Reduction:
         step=lambda fp, acc, tile: fp.op(op, acc, tile),
         identity_note=identity_note(in_fmt),
     )
-    return Reduction(f"{class_name(in_fmt, False)}[K={K}]", (kstep,), kslice_leaf(m, n))
+    return Reduction(
+        f"{class_name(in_fmt, False)}[K={K}]", (kstep,), kslice_leaf(m, n, in_fmt)
+    )
 
 
 def reduction_chunked(
@@ -144,7 +225,7 @@ def reduction_chunked(
         step=lambda fp, acc, partial: fp.add(acc, partial),
         identity_note="add(+0, P) == P except -0 -> +0, which every config performs alike",
     )
-    slice_leaf = kslice_leaf(m, n)
+    slice_leaf = kslice_leaf(m, n, in_fmt)
 
     def leaf(fp, idx):
         return slice_leaf(fp, {"kstep": idx["chunk"] * (Kc // mk) + idx["kstep"]})
@@ -273,7 +354,9 @@ def spec_fingerprint(
     unbiased class's, unchanged). The biased variant exists for the bf16 class only; ``bias=True`` with another format
     raises."""
     s = GemmSpec(K, out_fmt, chunks=chunks, in_fmt=in_fmt, bias=bias)
-    tag = f"gemm-{in_fmt}-" + ("kfold" if chunks == 1 else f"kchunk{chunks}")
+    tag = f"gemm-{in_fmt.replace('_', '-')}-" + (
+        "kfold" if chunks == 1 else f"kchunk{chunks}"
+    )  # the sm_107 MX class tags as gemm-mxfp8-k64-...
     tag += ("-scaled" if s.scaled else "") + ("-bias" if bias else "") + "-"
     parts = [f"K={K}", f"chunks={chunks}", f"out={out_fmt}"]
     if in_fmt != "bf16":

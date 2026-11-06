@@ -13,7 +13,7 @@ from __future__ import annotations
 from typing import List, Optional
 
 from .generator import CLUSTERS, SWIZZLES, Knobs, enumerate_space  # noqa: F401  (re-exported)
-from .spec import MMA_K_OF
+from .spec import chunk_unit
 
 GemmConfig = Knobs
 
@@ -50,7 +50,9 @@ def chunks_for(N: int, K: int, in_fmt: str = "bf16") -> int:
     a bounded fraction of the operand traffic). An empty weight (N = 0) has no split, as the Lean mirror's natural-number
     division gives. Mirrored by ``BIK.GEMM.chunksFor`` / ``chunksForFp8`` in Lean (checked by the generated conformance
     cases)."""
-    step = MMA_K_OF[in_fmt]
+    step = chunk_unit(
+        in_fmt
+    )  # the format's MMA step; for the block-scaled classes also a whole scale-factor atom column
     if N <= 0 or -(-N // 32) >= SPLIT_MIN_CTAS:
         return 1
     budget = K // (16 * N)
@@ -62,6 +64,13 @@ def chunks_for(N: int, K: int, in_fmt: str = "bf16") -> int:
     ):
         C *= 2
     return C
+
+
+def mx_class_for(base: str, family: Optional[str]) -> str:
+    """The MX class a part runs for an MX format: the sm_107 instruction's class (64 elements per step for mxfp8,
+    ``mxfp8_k64``) on the sm_107 parts, the sm_100 instruction's class (``mxfp8``) elsewhere. A function of the
+    architecture family only (the fingerprint is scoped to the architecture), never of the shape."""
+    return f"{base}_k64" if (base == "mxfp8" and family == "sm_107") else base
 
 
 def rank_topk(

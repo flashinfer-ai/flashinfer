@@ -12,6 +12,12 @@ C[i] = cvt((A[i] @ B[i]) * mul.rn(A_scale, B_scale)) for fp8 A (b, M, K) row-maj
 transpose of a row-major (b, N, K) weight, FlashInfer's documented layout) or row-major, the two per-tensor fp32
 scales multiplied once on the device, bf16 or fp16 output. ``mm_fp8_batch_invariant`` is the same class for one
 product (2-D operands; the tests' entry: it forces configurations and chunk counts and exposes the fp32 output).
+
+``mm_mxfp8_batch_invariant`` is what :func:`flashinfer.mm_mxfp8` runs under ``batch_invariant=True``: C = cvt(A @ B)
+with the UE8M0 block scales (one per 32 elements, the 128x4 swizzled layout of :func:`flashinfer.mxfp8_quantize`)
+applied inside the block-scaled MMA instruction, for e4m3 A (M, K) row-major and B (K, N) the transpose of a row-major
+(N, K) weight (the instruction takes K-major operands only), bf16 or fp16 output; the class is the device
+architecture's (`schedule.mx_class_for`: the sm_107 instruction folds 64 elements per step, the sm_100 / sm_103 one 32).
 Every unsupported input raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls
 back."""
 
@@ -24,25 +30,33 @@ import torch
 
 from ...batch_invariant.support import check_device, unsupported
 from .generator import Knobs
-from .schedule import chunks_for, default_config
-from .spec import MMA_K_OF, is_scaled
+from .schedule import chunks_for, default_config, mx_class_for
+from .spec import MMA_K_OF, MX_FMTS, chunk_unit, is_scaled, sf_bytes
 
 logger = logging.getLogger(__name__)
 
 CLASS = "gemm.bf16"
 #: The class family of :func:`flashinfer.bmm_fp8` (its two formats are the classes ``gemm.e4m3`` and ``gemm.e5m2``).
 CLASS_FP8 = "gemm.fp8"
+#: The class family of :func:`flashinfer.mm_mxfp8`: one class per block-scaled instruction, ``gemm.mxfp8.*`` on SM100 /
+#: SM103 and ``gemm.mxfp8.*64`` on SM107 (`schedule.mx_class_for`).
+CLASS_MXFP8 = "gemm.mxfp8"
 #: The compute capabilities the classes are stated and tested for: SM100 (B200), SM103 (B300), SM107 (Rubin).
 MM_BF16_ARCHS = ((10, 0), (10, 3), (10, 7))
 BMM_FP8_ARCHS = MM_BF16_ARCHS
+MM_MXFP8_ARCHS = MM_BF16_ARCHS
 _ALIGN = 8  # bf16 / fp16 elements per 16 bytes
 _ALIGN_FP8 = 16  # fp8 elements per 16 bytes
+_SF_BLOCK = 32  # elements per UE8M0 block scale of the MXFP8 classes: K is a whole number of blocks
 _ALIGN_BYTES = 16  # the operand base alignment the kernels assume (TMA)
 FP8_FMT_OF_DTYPE = {torch.float8_e4m3fn: "e4m3", torch.float8_e5m2: "e5m2"}
 OUT_FMT_OF_DTYPE = {torch.bfloat16: "bf16", torch.float16: "f16", torch.float32: "f32"}
 #: The fp8 classes' output dtypes: ``bmm_fp8``'s bf16 / fp16; fp32 on the one-product entry exposes the chain's input for tests.
 BMM_FP8_OUT_DTYPES = (torch.bfloat16, torch.float16)
 MM_FP8_OUT_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
+#: The MXFP8 class's output dtypes: ``mm_mxfp8``'s bf16 / fp16; fp32 on the direct entry exposes the chain's input for tests.
+MM_MXFP8_API_OUT_DTYPES = (torch.bfloat16, torch.float16)
+MM_MXFP8_OUT_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
 
 
 def _layout_of_b(b: torch.Tensor, K: int, N: int, cls: str = CLASS) -> str:
@@ -841,4 +855,259 @@ def bmm_fp8_batch_invariant(
             workspace,
             cls,
         )
+    return out
+
+
+# ----------------------------------------------------------------------------- the MXFP8 classes
+
+
+def _flat_sf(
+    sf: torch.Tensor, rows: int, K: int, name: str, device: torch.device, cls: str
+) -> torch.Tensor:
+    """The scale-factor storage of a ``(rows, K)`` operand as a flat uint8 view (no copy): a contiguous buffer, or the
+    transposed view of one, holding at least the bytes of the 128x4 swizzled layout (``spec.sf_bytes``), 16-byte aligned,
+    on the operands' device. Only the layout and the extent are checked; the bytes are inputs."""
+    if not isinstance(sf, torch.Tensor) or sf.dtype != torch.uint8:
+        raise unsupported(
+            cls,
+            f"{name} of type {type(sf).__name__}"
+            + (f" / dtype {sf.dtype}" if isinstance(sf, torch.Tensor) else ""),
+            f"{name} a uint8 tensor of UE8M0 scale factors in the 128x4 swizzled layout "
+            "(mxfp8_quantize(..., is_sf_swizzled_layout=True))",
+        )
+    if sf.device != device:
+        raise unsupported(cls, f"{name} on another device", f"{name} on A's device")
+    if sf.is_contiguous():
+        flat = sf.reshape(-1)
+    elif sf.dim() == 2 and sf.t().is_contiguous():
+        flat = sf.t().reshape(-1)
+    else:
+        raise unsupported(
+            cls,
+            f"{name} with strides {tuple(sf.stride())}",
+            f"{name} a contiguous scale-factor buffer",
+        )
+    need = sf_bytes(rows, K)
+    if flat.numel() < need:
+        raise unsupported(
+            cls,
+            f"{name} of {flat.numel()} bytes for a ({rows}, {K}) operand",
+            f"at least {need} bytes: the 128x4 swizzled layout holds ceil(rows / 128) * 128 rows x ceil(K / 128) * 4 blocks",
+        )
+    _check_base(flat, name, cls)
+    return flat
+
+
+def prepare_mxfp8_operands(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
+    out: Optional[torch.Tensor],
+    out_dtype: torch.dtype,
+    out_dtypes: Tuple[torch.dtype, ...] = MM_MXFP8_OUT_DTYPES,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int, int]:
+    """The MXFP8 class's typed checks for one product, shared by the direct entry and the autotuner entry: device and
+    architecture, e4m3 A and B, 2-D shapes with matching K, K a multiple of 32 (one whole scale block, hence 16-byte TMA
+    rows) and N of 8, A's row placement, B the transpose of a row-major (N, K) weight (the block-scaled instruction takes
+    K-major operands only), the two scale-factor buffers, the output's dtype / shape / layout (allocated when absent).
+    Returns ``(a, sfa, sfb, out, M, N, K)`` with the scale buffers as flat uint8 views. K is a multiple of 32; where it is not a multiple of the class's step (64 on SM107) the last step is partial: its
+    padded values are TMA zero fill, its scales are read from the scale buffers' padding, so those bytes must be finite
+    (the quantizer writes zeros; a NaN or Inf there poisons the row)."""
+    cls = CLASS_MXFP8
+    check_device(a.device, cls, MM_MXFP8_ARCHS)
+    if a.dtype != torch.float8_e4m3fn or b.dtype != torch.float8_e4m3fn:
+        raise unsupported(
+            cls,
+            f"dtypes ({a.dtype}, {b.dtype})",
+            "float8_e4m3fn A and B (the output of mxfp8_quantize)",
+        )
+    if a.dim() != 2 or b.dim() != 2:
+        raise unsupported(
+            cls, f"{a.dim()}-D A and {b.dim()}-D B", "2-D operands (M, K) and (K, N)"
+        )
+    M, K = a.shape
+    K2, N = b.shape
+    if K != K2:
+        raise unsupported(cls, f"A (M, {K}) with B ({K2}, N)", "matching K")
+    if b.device != a.device:
+        raise unsupported(cls, "operands on different devices", "A and B on one device")
+    if K == 0 or N == 0:
+        raise unsupported(
+            cls, f"K = {K}, N = {N}", "K > 0 and N > 0 (only M may be empty)"
+        )
+    if K % _SF_BLOCK or N % _ALIGN:
+        raise unsupported(
+            cls,
+            f"K = {K}, N = {N}",
+            f"K a multiple of {_SF_BLOCK} (one whole block scale) and N of {_ALIGN} (16-byte rows of the output)",
+        )
+    a = _aligned_rows(a, M, K, _ALIGN_FP8)
+    if _layout_of_b(b, K, N, cls) != "k":
+        raise unsupported(
+            cls,
+            "a row-major (K, N) weight",
+            "the transpose of a row-major (N, K) weight (the block-scaled instruction takes K-major operands only)",
+        )
+    _check_base(b, "B", cls)
+    sfa = _flat_sf(a_descale, M, K, "a_descale", a.device, cls)
+    sfb = _flat_sf(b_descale, N, K, "b_descale", a.device, cls)
+    if out_dtype not in out_dtypes:
+        raise unsupported(cls, f"out_dtype={out_dtype}", "bf16 or fp16 output")
+    out = _prepare_out(out, M, N, out_dtype, a.device, cls)
+    return a, sfa, sfb, out, M, N, K
+
+
+def mx_format_for(device: torch.device, in_fmt: Optional[str] = None) -> str:
+    """The MXFP8 class a device runs: the architecture's (`schedule.mx_class_for`), or ``in_fmt`` when given (tests: the
+    sm_100 instruction's class also runs on SM107; the sm_107 instruction exists nowhere else)."""
+    family = part_of(device)[1]
+    if in_fmt is None:
+        return mx_class_for("mxfp8", family)
+    if in_fmt not in MX_FMTS or (in_fmt == "mxfp8_k64" and family != "sm_107"):
+        raise unsupported(
+            CLASS_MXFP8,
+            f"the class of in_fmt={in_fmt!r} on {family}",
+            "mxfp8 on SM100 / SM103 / SM107, mxfp8_k64 on SM107",
+        )
+    return in_fmt
+
+
+def mm_mxfp8_batch_invariant(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    *,
+    out_dtype: torch.dtype = torch.bfloat16,
+    config: Optional[Knobs] = None,
+    chunks: Optional[int] = None,
+    workspace: Optional[torch.Tensor] = None,
+    in_fmt: Optional[str] = None,
+) -> torch.Tensor:
+    """``C = cvt(A @ B)`` with the UE8M0 block scales applied inside the MMA instruction, by the MXFP8 class of the device's
+    architecture (``gemm.mxfp8.kfold64`` on SM107, ``gemm.mxfp8.kfold`` on SM100 / SM103; the fingerprint carries the
+    architecture): ``kfold`` when the weight shape's chunk rule gives 1, else ``kchunk[C]`` with ``C = chunks_for(N, K,
+    fmt)``, a function of the weight shape and the format only (chunks of whole 128-element granules: MMA steps and
+    scale-factor atom columns). ``b`` is the (K, N) weight as the transpose of a row-major (N, K) tensor
+    (:func:`flashinfer.mm_mxfp8`'s column-major layout); the scales are the 1-D swizzled uint8 buffers of
+    :func:`flashinfer.mxfp8_quantize`; ``out_dtype`` bf16 / fp16 (fp32 exposes the fp32 chain input for tests).
+    ``config``, ``chunks`` and ``workspace`` as in :func:`mm_bf16_batch_invariant`; ``in_fmt`` forces the class (tests)."""
+    a, sfa, sfb, out, M, N, K = prepare_mxfp8_operands(
+        a, b, a_descale, b_descale, out, out_dtype
+    )
+    in_fmt = mx_format_for(a.device, in_fmt)
+    cls = f"gemm.{in_fmt}"
+    if M == 0:
+        return out  # no rows: nothing to launch
+    C = chunks if chunks is not None else chunks_for(N, K, in_fmt)
+    if C < 1:
+        raise unsupported(cls, f"chunks = {C}", "a positive chunk count")
+    if C > 1 and K % (chunk_unit(in_fmt) * C):
+        raise unsupported(
+            cls,
+            f"chunks = {C} at K = {K}",
+            f"each K chunk a whole number of {chunk_unit(in_fmt)}-element granules (MMA steps and scale-factor atom columns)",
+        )
+    if config is None:
+        config = default_config(M, N, K, C, "k", *part_of(a.device), in_fmt)
+    return _run_mx(
+        a,
+        b.t(),
+        sfa,
+        sfb,
+        out,
+        M,
+        N,
+        K,
+        C,
+        config,
+        in_fmt,
+        OUT_FMT_OF_DTYPE[out_dtype],
+        workspace,
+        cls,
+    )
+
+
+def _run_mx(
+    a: torch.Tensor,
+    b_nk: torch.Tensor,
+    sfa: torch.Tensor,
+    sfb: torch.Tensor,
+    out: torch.Tensor,
+    M: int,
+    N: int,
+    K: int,
+    C: int,
+    config: Knobs,
+    in_fmt: str,
+    out_fmt: str,
+    workspace: Optional[torch.Tensor],
+    cls: str,
+) -> torch.Tensor:
+    """The launch of the MXFP8 classes for one product: ``b_nk`` the (N, K) row-major view of the weight, the scale buffers
+    flat. Four placements of one class: the direct store (the unsplit class; the in-CTA chunk fold and the in-cluster
+    split of the split class), the swapped decode record (the weights as the kernel's A, the tokens as its B, the output
+    transposed: the block-scaled step is symmetric in its two operands) and the workspace split with the dense module's
+    unscaled fixup (the fp32 partials folded in chunk order from +0, then the chain)."""
+    from .blocks.compile_blockscaled import get_compiled_blockscaled
+    from .blocks.operands import can_implement
+    from .fixup import MAX_GRID_Y, get_fixup
+
+    if not can_implement(config, M, N, K, "k", C, in_fmt):
+        raise unsupported(
+            cls,
+            f"the configuration {config.describe()} at (M, N, K) = ({M}, {N}, {K}) with {C} chunks",
+            "a configuration of the enumerated space for the shape (the dispatcher's, or the tuner's candidates)",
+        )
+    kernel = get_compiled_blockscaled(
+        config,
+        C,
+        persistent_clusters(a.device, config),
+        in_fmt,
+        out_fmt,
+        family=part_of(a.device)[1],
+    )
+    if config.swap_ab:
+        # the decode specialisation: C^T = B^T A^T with the operands exchanged; the kernel's A is the weight (N rows), its B
+        # the tokens (any count, one tile), its C the M-major (N, M) view of the output
+        _require_disjoint(
+            cls,
+            [(out, "the output")],
+            [(a, "A"), (b_nk, "B"), (sfa, "A's scales"), (sfb, "B's scales")],
+        )
+        kernel(
+            b_nk.as_strided((N, K, 1), (b_nk.stride(0), 1, K)),
+            a.as_strided((M, K, 1), (a.stride(0), 1, K)),
+            sfb,
+            sfa,
+            out.as_strided((N, M, 1), (1, out.stride(0), M * N)),
+        )
+        return out
+    # the kernel sees 3-D (m, k, l) / (n, k, l) / (m, n, l) tensors: l = the K chunk of the split views (1 for the unsplit class,
+    # the in-cluster split, which folds whole operands, and the in-CTA fold's output); every stride handed over is a multiple
+    # of the declared 16-byte alignment, the size-1 l stride included
+    L = 1 if config.cluster_k > 1 else C
+    KL = K // L
+    a3 = a.as_strided((M, KL, L), (a.stride(0), 1, KL))
+    b3 = b_nk.as_strided((N, KL, L), (b_nk.stride(0), 1, KL))
+    reads = [(a, "A"), (b_nk, "B"), (sfa, "A's scales"), (sfb, "B's scales")]
+    if C == 1 or config.cta_chunks or config.cluster_k > 1:
+        _require_disjoint(cls, [(out, "the output")], reads)
+        c3 = out.as_strided((M, N, 1), (out.stride(0), 1, N))
+        kernel(a3, b3, sfa, sfb, c3)  # the chain in the epilogue
+        return out
+    # the fixed-chunk split with the partials in an fp32 workspace, folded in chunk order by the fixup kernel (the chain
+    # applied there, once)
+    if workspace is None:
+        ws = torch.empty(C, M, N, dtype=torch.float32, device=a.device)
+        _require_disjoint(cls, [(out, "the output")], reads)
+    else:
+        ws = _check_workspace(workspace, C, M, N, a.device, cls)
+        _require_disjoint(cls, [(ws, "the workspace"), (out, "the output")], reads)
+    ws = ws.permute(1, 2, 0)  # chunk-major storage (C, M, N) viewed as (M, N, C)
+    kernel(a3, b3, sfa, sfb, ws)  # the unscaled body: raw fp32 partials
+    rows = min(M, MAX_GRID_Y)
+    get_fixup(C, out_fmt)(ws, out, M, N, rows)
     return out

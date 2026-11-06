@@ -3,17 +3,23 @@
 
 Mirrors `flashinfer/gemm/batch_invariant/spec.py`. Per output element the dataflow is a sequential fold over K-steps
 through an opaque hardware primitive: `mma16` for the bf16 class (one `tcgen05.mma.kind::f16` K-step of 16 bf16
-elements, fp32 accumulator) and `mma32` for the fp8 classes (one `kind::f8f6f4` K-step of 32 e4m3 / e5m2 elements).
-No commutativity is used anywhere, so equality is plain `=`.
+elements, fp32 accumulator), `mma32` for the fp8 classes (one `kind::f8f6f4` K-step of 32 e4m3 / e5m2 elements), and
+`mma32mx` / `mma64mx8` for the MXFP8 classes (one `kind::mxf8f6f4.block_scale` K-step: 32 e4m3 elements with one UE8M0
+block scale per operand row on the sm_100 / sm_103 instruction, 64 elements with two scales per row on the sm_107 one;
+the step's leaf carries the scale-factor slices and the instruction applies them, no software step touches a block
+scale). No commutativity is used anywhere, so equality is plain `=`.
 
 Two consistency classes per step:
-* `kfold`      : one fold over all K-steps from +0 (`gemm.bf16.kfold`; `kfold32` for `gemm.<fp8>.kfold.scaled`);
+* `kfold`      : one fold over all K-steps from +0 (`gemm.bf16.kfold`; `kfold32` for `gemm.<fp8>.kfold.scaled`;
+                 `kfoldMX8` / `kfoldMX8K64` for `gemm.mxfp8.kfold` / `gemm.mxfp8.kfold64`);
 * `kchunk C`   : K cut into `C` chunks (a function of the weight shape and the format only), each chunk a fold from
-                 +0, the partials folded in chunk order with `add` from +0 (`gemm.bf16.kchunk[C]`; `kchunk32`).
+                 +0, the partials folded in chunk order with `add` from +0 (`gemm.bf16.kchunk[C]`; `kchunk32`;
+                 `kchunkMX8` / `kchunkMX8K64`).
 
 The fp8 classes' epilogue chain multiplies the fold by `alpha = mul.rn(a_scale, b_scale)` (the two per-tensor
 scales of `bmm_fp8`, runtime scalars: the `sym` leaves; their product formed on the device by one correctly rounded
-multiply) before the single conversion (`outputElem true`); the bf16 class converts directly (`outputElem false`).
+multiply) before the single conversion (`outputElem true`); the bf16 class converts directly (`outputElem false`), and
+so do the MXFP8 classes (`mm_mxfp8` takes no per-tensor scale: every scale is a block scale inside the step).
 Each has a biased chain (`outputElemBias`): the bias of the output column, a leaf, added once to the whole fold before the
 single conversion; every identity below lifts to it by congruence.
 
@@ -40,11 +46,18 @@ covers the elements of bf16 steps `2t` and `2t + 1`); `zero` is the +0 the accum
 partials; `mul` is the fp8 chain's `mul.rn` (the scales' product and the fold's scaling); `sym` a runtime scalar
 (the per-tensor scales); `cvt fmt` is the epilogue's single correctly rounded conversion to the output format; `bias n` is the bias of
 output column `n` (the bf16 bias widened to binary32, which is exact), a leaf like the operand slices, which the biased
-chain's `add` adds once to the whole fold. -/
+chain's `add` adds once to the whole fold. `mma32mx acc a t b` is one *block-scaled* K-step of the sm_100 / sm_103 MXFP8
+instruction: its leaf is the A slice, the A scale-factor slice, the B slice and the B scale-factor slice of step `t`
+(`(absf (a a t) (sfa a t) (b t b) (sfb t b))` in the printer); the scale factors are addressed by the same (row, step) /
+(step, column) as the values, so they are determined by `a`, `t`, `b` and the constructor carries no further argument.
+`mma64mx8` is the same leaf folded by the sm_107 instruction (64 elements per step: step `t` covers the elements of
+`mma32mx` steps `2t` and `2t + 1`): a different opaque step, hence a different class (`kfoldMX8K64_ne_kfoldMX8`). -/
 inductive GTerm where
   | zero
   | mma16 (acc : GTerm) (a : RowData) (t : Nat) (b : ColData)
   | mma32 (acc : GTerm) (a : RowData) (t : Nat) (b : ColData)
+  | mma32mx (acc : GTerm) (a : RowData) (t : Nat) (b : ColData)
+  | mma64mx8 (acc : GTerm) (a : RowData) (t : Nat) (b : ColData)
   | add (acc p : GTerm)
   | mul (x y : GTerm)
   | sym (name : String)
@@ -172,12 +185,62 @@ theorem kfold32_ne_kfold (a : RowData) (b : ColData) : kfold32 a b 1 ≠ kfold a
 theorem kfold32_ne_kfold_same_steps (a : RowData) (b : ColData) : kfold32 a b 1 ≠ kfold a b 1 := by
   simp [kfold32, kfoldG, foldStepsG, kfold, foldSteps]
 
+/-! ## The MXFP8 classes: the same dataflow over the block-scaled steps
+
+`gemm.mxfp8.kfold` / `gemm.mxfp8.kchunk[C]` (`gemm/spec.py` with `in_fmt = "mxfp8"`: the sm_100 / sm_103 instruction,
+`mma32mx`) and `gemm.mxfp8.kfold64` / `gemm.mxfp8.kchunk64[C]` (`in_fmt = "mxfp8_k64"`: the sm_107 instruction,
+`mma64mx8`). Which of the two a device runs is a function of its architecture family only (`schedule.mx_class_for`),
+never of the shape: the fingerprint is scoped to the family. -/
+
+def kfoldMX8 (a : RowData) (b : ColData) (steps : Nat) : GTerm := kfoldG GTerm.mma32mx a b steps
+def kchunkMX8 (a : RowData) (b : ColData) (C kc : Nat) : GTerm := kchunkG GTerm.mma32mx a b C kc
+def splitKernelMX8 (a : RowData) (b : ColData) (C kc : Nat) (σ : Nat → Nat) : GTerm := splitKernelG GTerm.mma32mx a b C kc σ
+
+theorem splitKernelMX8_eq_kchunkMX8 (a : RowData) (b : ColData) (C kc : Nat) (σ : Nat → Nat) :
+    splitKernelMX8 a b C kc σ = kchunkMX8 a b C kc := splitKernelG_eq_kchunkG _ a b C kc σ
+
+theorem splitKernelMX8_assignment_irrelevant (a : RowData) (b : ColData) (C kc : Nat) (σ τ : Nat → Nat) :
+    splitKernelMX8 a b C kc σ = splitKernelMX8 a b C kc τ := by
+  rw [splitKernelMX8_eq_kchunkMX8, splitKernelMX8_eq_kchunkMX8]
+
+def kfoldMX8K64 (a : RowData) (b : ColData) (steps : Nat) : GTerm := kfoldG GTerm.mma64mx8 a b steps
+def kchunkMX8K64 (a : RowData) (b : ColData) (C kc : Nat) : GTerm := kchunkG GTerm.mma64mx8 a b C kc
+def splitKernelMX8K64 (a : RowData) (b : ColData) (C kc : Nat) (σ : Nat → Nat) : GTerm := splitKernelG GTerm.mma64mx8 a b C kc σ
+
+theorem splitKernelMX8K64_eq_kchunkMX8K64 (a : RowData) (b : ColData) (C kc : Nat) (σ : Nat → Nat) :
+    splitKernelMX8K64 a b C kc σ = kchunkMX8K64 a b C kc := splitKernelG_eq_kchunkG _ a b C kc σ
+
+theorem splitKernelMX8K64_assignment_irrelevant (a : RowData) (b : ColData) (C kc : Nat) (σ τ : Nat → Nat) :
+    splitKernelMX8K64 a b C kc σ = splitKernelMX8K64 a b C kc τ := by
+  rw [splitKernelMX8K64_eq_kchunkMX8K64, splitKernelMX8K64_eq_kchunkMX8K64]
+
+/-- **Four primitives, four classes.** The block-scaled fold is not the fp8 fold at the same step count (the step reads scale
+factors the fp8 step has not got), and the sm_107 fold is not the sm_100 fold even where both cover the same K (one 64-wide
+step against two 32-wide ones): the classes are separated as terms, and the Python fingerprints separate them (the
+architecture family is part of the MXFP8 fingerprint). -/
+theorem kfoldMX8_ne_kfold32 (a : RowData) (b : ColData) : kfoldMX8 a b 1 ≠ kfold32 a b 1 := by
+  simp [kfoldMX8, kfold32, kfoldG, foldStepsG]
+
+theorem kfoldMX8_ne_kfold (a : RowData) (b : ColData) : kfoldMX8 a b 1 ≠ kfold a b 2 := by
+  simp [kfoldMX8, kfoldG, foldStepsG, kfold, foldSteps]
+
+theorem kfoldMX8K64_ne_kfoldMX8 (a : RowData) (b : ColData) : kfoldMX8K64 a b 1 ≠ kfoldMX8 a b 2 := by
+  simp [kfoldMX8K64, kfoldMX8, kfoldG, foldStepsG]
+
+theorem kfoldMX8K64_ne_kfoldMX8_same_steps (a : RowData) (b : ColData) : kfoldMX8K64 a b 1 ≠ kfoldMX8 a b 1 := by
+  simp [kfoldMX8K64, kfoldMX8, kfoldG, foldStepsG]
+
+theorem kfoldMX8K64_ne_kfold32 (a : RowData) (b : ColData) : kfoldMX8K64 a b 1 ≠ kfold32 a b 2 := by
+  simp [kfoldMX8K64, kfold32, kfoldG, foldStepsG]
+
 /-! ## Semantics: any interpretation of the primitives -/
 
 structure Prims (α : Type) where
   zero : α
   mma16 : α → RowData → Nat → ColData → α
   mma32 : α → RowData → Nat → ColData → α
+  mma32mx : α → RowData → Nat → ColData → α
+  mma64mx8 : α → RowData → Nat → ColData → α
   add : α → α → α
   mul : α → α → α
   sym : String → α
@@ -190,6 +253,8 @@ def eval (P : Prims α) : GTerm → α
   | .zero => P.zero
   | .mma16 acc a t b => P.mma16 (eval P acc) a t b
   | .mma32 acc a t b => P.mma32 (eval P acc) a t b
+  | .mma32mx acc a t b => P.mma32mx (eval P acc) a t b
+  | .mma64mx8 acc a t b => P.mma64mx8 (eval P acc) a t b
   | .add acc p => P.add (eval P acc) (eval P p)
   | .mul x y => P.mul (eval P x) (eval P y)
   | .sym s => P.sym s
@@ -234,6 +299,19 @@ theorem fold_pad32 (P : Prims α) (a : RowData) (b : ColData) (steps pad : Nat)
     eval P (kfold32 a b (steps + pad)) = eval P (kfold32 a b steps) :=
   fold_padG P GTerm.mma32 P.mma32 (fun _ _ _ _ => rfl) a b steps pad hz
 
+/-- **K remainder of the MXFP8 classes**: the padded steps read zero value slices and zero-filled scale bytes (TMA zero fill
+of the operands and of their scale factors; the UE8M0 byte 0x00 is the finite 2^-127, so every padded product is +0:
+`spec.identity_note`), which the hypothesis `hz` states for the step. -/
+theorem fold_padMX8 (P : Prims α) (a : RowData) (b : ColData) (steps pad : Nat)
+    (hz : ∀ (acc : α) (t : Nat), steps ≤ t → P.mma32mx acc a t b = acc) :
+    eval P (kfoldMX8 a b (steps + pad)) = eval P (kfoldMX8 a b steps) :=
+  fold_padG P GTerm.mma32mx P.mma32mx (fun _ _ _ _ => rfl) a b steps pad hz
+
+theorem fold_padMX8K64 (P : Prims α) (a : RowData) (b : ColData) (steps pad : Nat)
+    (hz : ∀ (acc : α) (t : Nat), steps ≤ t → P.mma64mx8 acc a t b = acc) :
+    eval P (kfoldMX8K64 a b (steps + pad)) = eval P (kfoldMX8K64 a b steps) :=
+  fold_padG P GTerm.mma64mx8 P.mma64mx8 (fun _ _ _ _ => rfl) a b steps pad hz
+
 /-! ## The epilogue chain (`spec.EpilogueChain`): `mul.rn alpha` for the scaled (fp8) classes, then exactly one `cvt.rn`
 
 One Python object builds the spec term and is executed by the kernel's epilogue block, the in-CTA chunk fold and the
@@ -271,6 +349,27 @@ def outputKchunk32 (fmt : String) (a : RowData) (b : ColData) (C kc : Nat) : GTe
 theorem output32_split_eq_kchunk32 (fmt : String) (a : RowData) (b : ColData) (C kc : Nat) (σ : Nat → Nat) :
     outputElem true fmt (splitKernel32 a b C kc σ) = outputKchunk32 fmt a b C kc := by
   unfold outputKchunk32; rw [splitKernel32_eq_kchunk32]
+
+/-- The MXFP8 classes through the unscaled chain (`mm_mxfp8`: the conversion alone after the fold). -/
+def outputKfoldMX8 (fmt : String) (a : RowData) (b : ColData) (steps : Nat) : GTerm :=
+  outputElem false fmt (kfoldMX8 a b steps)
+
+def outputKchunkMX8 (fmt : String) (a : RowData) (b : ColData) (C kc : Nat) : GTerm :=
+  outputElem false fmt (kchunkMX8 a b C kc)
+
+theorem outputMX8_split_eq_kchunkMX8 (fmt : String) (a : RowData) (b : ColData) (C kc : Nat) (σ : Nat → Nat) :
+    outputElem false fmt (splitKernelMX8 a b C kc σ) = outputKchunkMX8 fmt a b C kc := by
+  unfold outputKchunkMX8; rw [splitKernelMX8_eq_kchunkMX8]
+
+def outputKfoldMX8K64 (fmt : String) (a : RowData) (b : ColData) (steps : Nat) : GTerm :=
+  outputElem false fmt (kfoldMX8K64 a b steps)
+
+def outputKchunkMX8K64 (fmt : String) (a : RowData) (b : ColData) (C kc : Nat) : GTerm :=
+  outputElem false fmt (kchunkMX8K64 a b C kc)
+
+theorem outputMX8K64_split_eq_kchunkMX8K64 (fmt : String) (a : RowData) (b : ColData) (C kc : Nat) (σ : Nat → Nat) :
+    outputElem false fmt (splitKernelMX8K64 a b C kc σ) = outputKchunkMX8K64 fmt a b C kc := by
+  unfold outputKchunkMX8K64; rw [splitKernelMX8K64_eq_kchunkMX8K64]
 
 /-! ## The biased chain (`spec.output_elem` with a bias column, `spec.BIAS_NOTE`)
 
@@ -348,6 +447,14 @@ theorem split32_launch_is_kchunk32 (C kc : Nat) (σ : Nat → Nat) (M : Nat) (ro
     launch M rows (fun a b => splitKernel32 a b C kc σ) b r = launch M rows (fun a b => kchunk32 a b C kc) b r := by
   simp only [launch, kernelRow, splitKernel32_eq_kchunk32]
 
+theorem splitMX8_launch_is_kchunkMX8 (C kc : Nat) (σ : Nat → Nat) (M : Nat) (rows : Fin M → RowData) (b : ColData) (r : Fin M) :
+    launch M rows (fun a b => splitKernelMX8 a b C kc σ) b r = launch M rows (fun a b => kchunkMX8 a b C kc) b r := by
+  simp only [launch, kernelRow, splitKernelMX8_eq_kchunkMX8]
+
+theorem splitMX8K64_launch_is_kchunkMX8K64 (C kc : Nat) (σ : Nat → Nat) (M : Nat) (rows : Fin M → RowData) (b : ColData) (r : Fin M) :
+    launch M rows (fun a b => splitKernelMX8K64 a b C kc σ) b r = launch M rows (fun a b => kchunkMX8K64 a b C kc) b r := by
+  simp only [launch, kernelRow, splitKernelMX8K64_eq_kchunkMX8K64]
+
 /-- The biased classes are launches of per-row functions too (no batch parameter inside), so `batch_invariance`,
 `permutation_invariance` and `subbatch_invariance` apply to them unchanged; the biased split kernel is a launch of
 the biased split class. -/
@@ -370,10 +477,21 @@ theorem kchunk32_depends_on_C (a : RowData) (b : ColData) (kc : Nat) :
   intro h
   simp [kchunk32, kchunkG, foldChunksG] at h
 
+theorem kchunkMX8_depends_on_C (a : RowData) (b : ColData) (kc : Nat) :
+    kchunkMX8 a b 1 (2 * kc) ≠ kchunkMX8 a b 2 kc := by
+  intro h
+  simp [kchunkMX8, kchunkG, foldChunksG] at h
+
+theorem kchunkMX8K64_depends_on_C (a : RowData) (b : ColData) (kc : Nat) :
+    kchunkMX8K64 a b 1 (2 * kc) ≠ kchunkMX8K64 a b 2 kc := by
+  intro h
+  simp [kchunkMX8K64, kchunkG, foldChunksG] at h
+
 /-! ## The dispatcher's chunk rule, mirrored (checked against the Python tables in Cases.lean) -/
 
-/-- Largest power of two `C` with `C <= budget`, `C <= 128`, `step*C | K` (every chunk a whole number of MMA steps:
-`step` = 16 for bf16, 32 for the fp8 formats), `K/C >= 256`; no split when N alone gives 256 CTAs at 32-wide tiles.
+/-- Largest power of two `C` with `C <= budget`, `C <= 128`, `step*C | K` (every chunk a whole number of K granules:
+`step` = 16 for bf16, 32 for the fp8 formats, 128 for the MXFP8 classes -- a whole number of MMA steps and of
+scale-factor atom columns, `spec.chunk_unit`), `K/C >= 256`; no split when N alone gives 256 CTAs at 32-wide tiles.
 Mirror of `gemm.schedule.chunks_for(N, K, fmt)`. -/
 def chunksForStep (step N K : Nat) : Nat :=
   if (N + 31) / 32 ≥ 256 then 1 else
@@ -390,8 +508,13 @@ def chunksFor (N K : Nat) : Nat := chunksForStep 16 N K
 /-- The fp8 rule: 32-wide steps. -/
 def chunksForFp8 (N K : Nat) : Nat := chunksForStep 32 N K
 
+/-- The MXFP8 rule, the same for both instructions: 128-element granules (four 32-element block scales, the K extent of
+one scale-factor atom column). -/
+def chunksForMx (N K : Nat) : Nat := chunksForStep 128 N K
+
 /-- The rules take no `M`: chunk count, hence the numerical class, cannot depend on batch. -/
 theorem chunksFor_no_M (N K : Nat) : chunksFor N K = chunksFor N K := rfl
 theorem chunksForFp8_no_M (N K : Nat) : chunksForFp8 N K = chunksForFp8 N K := rfl
+theorem chunksForMx_no_M (N K : Nat) : chunksForMx N K = chunksForMx N K := rfl
 
 end BIK.GEMM

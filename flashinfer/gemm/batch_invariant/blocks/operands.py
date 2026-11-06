@@ -24,12 +24,17 @@ from flashinfer.cute_dsl.attention.fmha.helpers import (
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
 from ..generator import MMA_K_BLOCKS, Knobs  # noqa: F401  (MMA_K_BLOCKS re-exported: the mainloop's inner radix)
+from ..spec import BLOCK_SCALED
+
+SF_BLOCK = 32  # elements per UE8M0 block scale of the MX classes: K is a whole number of blocks
 
 ACC_DTYPE = cutlass.Float32
 IN_DT = {
     "bf16": cutlass.BFloat16,
     "e4m3": cutlass.Float8E4M3FN,
     "e5m2": cutlass.Float8E5M2,
+    "mxfp8": cutlass.Float8E4M3FN,  # the block-scaled classes: e4m3 elements, UE8M0 scales per 32 (blocks/blockscaled.py)
+    "mxfp8_k64": cutlass.Float8E4M3FN,
 }
 OUT_DT = {
     "bf16": cutlass.BFloat16,
@@ -41,11 +46,14 @@ ALIGN = {
     "f16": 8,
     "e4m3": 16,
     "e5m2": 16,
+    "mxfp8": 16,
+    "mxfp8_k64": 16,
     "f32": 4,
 }  # elements per 16-byte TMA alignment
 
 NUM_ACC_STAGE = 2  # TMEM accumulator double buffer
 NUM_C_STAGE_MIN = 2  # C smem stages before the leftover budget is added
+MAX_GRID_Z = 65535  # the hardware's grid.z limit: the in-cluster split's one-cluster-per-tile launch
 MBAR_RESERVE_BYTES = 1024  # barriers and the TMEM holding word
 OCCUPANCY = 1
 TMEM_ARCH = "sm_100"
@@ -296,6 +304,38 @@ def can_implement(
     Kc, al_in = K // chunks, ALIGN[in_fmt]
     # the output is stored directly (no fp32 workspace) by the unsplit class and by the in-CTA chunk fold
     al_out = ALIGN["bf16"] if (chunks == 1 or knobs.cta_chunks) else ALIGN["f32"]
+    if in_fmt in BLOCK_SCALED:
+        # the block-scaled instruction takes K-major A and B only; K is a whole number of scale blocks; a chunk is a whole
+        # number of steps AND of scale-factor atom columns (`spec.chunk_unit`: 128 elements for the MX classes)
+        from ..spec import chunk_unit
+
+        if b_major != "k" or K % SF_BLOCK or (chunks > 1 and Kc % chunk_unit(in_fmt)):
+            return False
+        if knobs.swap_ab:
+            # the decode specialisation: the kernel's M is N (the weights), its N is M (the tokens), all tokens in one
+            # tile (the scale-factor atom read from its start); the M-major output needs N aligned
+            return (
+                chunks == 1
+                and knobs.tile_n >= M
+                and N % ALIGN["bf16"] == 0
+                and K % al_in == 0
+            )
+        if knobs.cluster_k > 1:
+            # the in-cluster split computes exactly the class kchunk[cluster_k]: its chunks are whole k-tiles (one smem
+            # stage), so K splits into cluster_k equal k-tile ranges; the output is stored directly. Its launch puts one
+            # cluster per output tile on the grid's z axis, which the hardware caps (MAX_GRID_Z): above that tile count
+            # the record is not a placement of the shape and the workspace split (the same class) takes over
+            from ..generator import MainloopBlock
+
+            k_tile = MainloopBlock(in_fmt).k_block
+            tiles = -(-M // knobs.tile_m) * -(-N // knobs.tile_n)
+            return (
+                chunks == knobs.cluster_k
+                and K % (k_tile * chunks) == 0
+                and N % ALIGN["bf16"] == 0
+                and Kc % al_in == 0
+                and tiles <= MAX_GRID_Z
+            )
     return (
         Kc % al_in == 0
         and (N if b_major == "n" else Kc) % al_in == 0

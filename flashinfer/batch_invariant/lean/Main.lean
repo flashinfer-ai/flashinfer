@@ -28,3 +28,21 @@ def main : IO Unit := do
   for (steps, C) in gemmBiasCases do
     let t := if C == 1 then kfold ⟨0⟩ ⟨0⟩ steps else kchunk ⟨0⟩ ⟨0⟩ C (steps / C)
     IO.println s!"gemmbias {steps} {C} {(outputElemBias "bf16" t ⟨0⟩).sexpr}"
+  -- the MXFP8 classes: the mma32mx step (sm_100 / sm_103) and the mma64mx8 step (sm_107), the unscaled chain, the
+  -- 128-granule chunk rule shared by both
+  for (steps, C) in gemmmx8Cases do
+    let t := if C == 1 then kfoldMX8 ⟨0⟩ ⟨0⟩ steps else kchunkMX8 ⟨0⟩ ⟨0⟩ C (steps / C)
+    IO.println s!"gemmmx8 {steps} {C} {(outputElem false "bf16" t).sexpr}"
+  for nblk in gemmmx8LoopCases do
+    IO.println s!"gemmmx8loop {nblk} {(kblockLoopMX8 ⟨0⟩ ⟨0⟩ gemmMainloopInnerMx8 3 .zero nblk).sexpr}"
+  for (steps, fmt) in gemmmx8OutCases do
+    IO.println s!"gemmmx8out {steps} {fmt} {(outputKfoldMX8 fmt ⟨0⟩ ⟨0⟩ steps).sexpr}"
+  for (N, K, _) in chunkTableMx do
+    IO.println s!"chunksmx {N} {K} {chunksForMx N K}"
+  for (steps, C) in gemmmx8k64Cases do
+    let t := if C == 1 then kfoldMX8K64 ⟨0⟩ ⟨0⟩ steps else kchunkMX8K64 ⟨0⟩ ⟨0⟩ C (steps / C)
+    IO.println s!"gemmmx8k64 {steps} {C} {(outputElem false "bf16" t).sexpr}"
+  for nblk in gemmmx8k64LoopCases do
+    IO.println s!"gemmmx8k64loop {nblk} {(kblockLoopMX8K64 ⟨0⟩ ⟨0⟩ gemmMainloopInnerMx8K64 3 .zero nblk).sexpr}"
+  for (steps, fmt) in gemmmx8k64OutCases do
+    IO.println s!"gemmmx8k64out {steps} {fmt} {(outputKfoldMX8K64 fmt ⟨0⟩ ⟨0⟩ steps).sexpr}"

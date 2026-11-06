@@ -2,24 +2,27 @@
 # SPDX-License-Identifier: Apache-2.0
 """Generate ``lean/BIKernels/Cases.lean`` from the Python side.
 
-For the GEMM classes (bf16 at the ``mma16`` step; e4m3 / e5m2 at the ``mma32`` step with the scaled chain) the file
-carries
+For the GEMM classes (bf16 at the ``mma16`` step; e4m3 / e5m2 at the ``mma32`` step with the scaled chain; mxfp8 at the
+``mma32mx`` step and mxfp8_k64 at the ``mma64mx8`` step, the block-scaled steps with the unscaled chain) the file carries
 
-* the spec terms of both classes at sampled (K, chunks): the *Python spec* (``gemm.spec.GemmSpec``) S-expression,
-  with a Lean theorem that the Lean model (``BIK.GEMM.kfold`` / ``kchunk`` / ``kfold32`` / ``kchunk32`` through
-  ``outputElem``, an independent implementation) prints the same canonical S-expression by kernel ``decide``;
+* the spec terms of both classes of each format at sampled (K, chunks): the *Python spec* (``gemm.spec.GemmSpec``)
+  S-expression, with a Lean theorem that the Lean model (``BIK.GEMM.kfold`` / ``kchunk`` and their ``32`` / ``MX8`` /
+  ``MX8K64`` instances through ``outputElem``, an independent implementation) prints the same canonical S-expression
+  by kernel ``decide``;
 * the mainloop's blocked lowering (``canon.BlockedFold`` as ``MainloopBlock.lowering()`` emits it and
-  ``gemm/blocks/mainloop.py`` executes it): its inner radix per format and the *Python engine's* trace at sampled
-  block counts, reproduced by the Lean loop model ``kblockLoop`` / ``kblockLoop32`` node for node, plus
-  ``kblockLoop_eq_kfold`` / ``kblockLoop32_eq_kfold32`` instantiated on the emitted radix;
-* the epilogue chain per output format, unscaled (bf16) and scaled (fp8: ``mul.rn alpha`` then the conversion),
-  and the biased chain of the bf16 classes;
-* the dispatcher's chunk rules ``chunks_for(N, K, fmt)`` as tables that Lean's ``chunksFor`` / ``chunksForFp8``
-  re-derive;
-* the generator's configuration spaces at the reference shape and the split classes' spaces at a chunked shape, every
-  record checked against ``ConfigOK`` / ``ConfigOKFp8`` (the Lean mirrors of ``Knobs.well_formed``), counted, and
-  ``space_invariant`` / ``space_invariant32`` instantiated on them; and every record the dispatchers return over a
-  shape grid, each shown to be a member.
+  ``gemm/blocks/mainloop.py`` / ``blocks/blockscaled.py`` execute it): its inner radix per format and the *Python
+  engine's* trace at sampled block counts, reproduced by the Lean loop model ``kblockLoop*`` node for node, plus
+  ``kblockLoop*_eq_kfold*`` instantiated on the emitted radix;
+* the epilogue chain per output format, unscaled (bf16, the MXFP8 classes) and scaled (fp8: ``mul.rn alpha`` then the
+  conversion), and the biased chain of the bf16 classes;
+* the dispatcher's chunk rules ``chunks_for(N, K, fmt)`` as tables that Lean's ``chunksFor`` / ``chunksForFp8`` /
+  ``chunksForMx`` re-derive;
+* the generator's configuration spaces at the reference shape and the split classes' spaces at a chunked shape (for the
+  block-scaled classes also a decode shape, whose space holds the swapped token-tile records, and a second chunked
+  shape with the in-cluster split's factor 2), every record checked against ``ConfigOK`` / ``ConfigOKFp8`` /
+  ``ConfigOKMx8`` / ``ConfigOKMx8K64`` (the Lean mirrors of ``Knobs.well_formed``), counted, and
+  ``space_invariant*`` instantiated on them; and every record the dispatchers return over a shape grid, each shown to
+  be a member of one of the emitted spaces.
 
 Consequently a change to a spec, a lowering, a knob constraint or a chunk rule that is not reflected in the
 Lean model makes ``lake build`` fail; and a regenerated file that differs from the committed one fails the
@@ -32,7 +35,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .fp_interface import term
 from ..gemm.batch_invariant.heuristic import PARTS
@@ -109,18 +112,191 @@ FP8_CHUNK_EXTRA = [
     (8, 1040),
     (64, 8208),
 ]  # the 32-alignment of the fp8 chunk rule matters here
+#: The MXFP8 classes: the sm_100 / sm_103 instruction (`mma32mx`, format key ``mxfp8``) and the sm_107 one (`mma64mx8`,
+#: ``mxfp8_k64``); one chunk rule (128-element granules) for both.
+MX_FMT, MX_K64_FMT = "mxfp8", "mxfp8_k64"
+GEMM_MX_CASES = [
+    (128, 1),
+    (256, 1),
+    (512, 2),
+    (512, 4),
+]  # (K, chunks): 4 .. 16 steps at the 32-wide step (the block-scaled leaf is long: 32 steps overflow kernel `decide`)
+GEMM_MX_LOOP_CASES = [1, 2, 3, 5]
+GEMM_MX_OUT_CASES = [(128, "bf16"), (256, "f16"), (128, "f32")]
+MX_CHUNK_EXTRA = [
+    (64, 16640),  # 130 granules: C = 2 where the fp8 rule gives 8
+    (64, 8256),  # 64.5 granules: no split
+    (64, 4224),  # 33 granules: no split
+    (8, 1040),
+]  # the 128-alignment of the MX chunk rule matters here
+#: A decode shape: its block-scaled space holds every swapped token-tile record (M at most the narrowest token tile).
+DECODE_SHAPE = (8, 4096, 4096, 1)
+#: A split-class shape with two chunks: its block-scaled space holds the in-cluster split records of factor 2.
+C2_SHAPE = (16, 128, 4096, 2)
+
+
+@dataclasses.dataclass(frozen=True)
+class LeanFormat:
+    """The Lean side of one input format: the name infix ``p`` of its step's definitions (``kfold{p}``, ``kchunk{p}``,
+    ``kblockLoop{p}``, ``tileResult{p}``, ``space_invariant{p}``, ``outputKfold{p}``), the prefixes of its generated
+    cases (``tag``: also the conformance line tag) and theorems (``th``), its knob-constraint mirror (``ok``), its chunk
+    rule and table (``table`` is None when the rule is rendered under another format), the weight layouts the kernel
+    takes, the parts that run the class (None: every part) and the extra spaces of the block-scaled classes
+    (``(suffix, shape, count theorem, count predicate, what the shape's space holds)``)."""
+
+    in_fmt: str
+    p: str
+    tag: str
+    th: str
+    sp: str
+    dn: str
+    ok: str
+    inner_name: str
+    rule: str
+    table: Optional[str]
+    chunk_tag: str
+    scaled: bool
+    layouts: Tuple[str, ...]
+    families: Optional[Tuple[str, ...]]
+    cases: Tuple[Tuple[int, int], ...]
+    loop_cases: Tuple[int, ...]
+    out_cases: Tuple[Tuple[int, str], ...]
+    chunk_extra: Tuple[Tuple[int, int], ...]
+    extra_spaces: Tuple[Tuple[str, Tuple[int, int, int, int], str, str, str], ...] = ()
+
+    @property
+    def mk(self) -> int:
+        return MMA_K_OF[self.in_fmt]
+
+    def chain_head(self, fmt: str) -> str:
+        """``outputKfold{p} "<fmt>"``: the class's chain (the bf16 definition takes the ``scaled`` flag)."""
+        if self.p == "":
+            return f'outputKfold false "{fmt}"'
+        return f'outputKfold{self.p} "{fmt}"'
+
+    def fold_term(self, steps: int, C: int) -> str:
+        if C == 1:
+            return f"kfold{self.p} ⟨0⟩ ⟨0⟩ {steps}"
+        return f"kchunk{self.p} ⟨0⟩ ⟨0⟩ {C} {steps // C}"
+
+    @property
+    def decided(self) -> Tuple[str, ...]:
+        """The format's theorems closed by ``native_decide``."""
+        names = [
+            f"{self.th}_space_ok",
+            f"{self.th}_space_c4_ok",
+            f"{self.th}_space_c4_cta_twins",
+            f"{self.th}_dispatch_in_space",
+        ]
+        names += [f"{self.th}_space_{sfx.lower()}_ok" for sfx, *_ in self.extra_spaces]
+        return tuple(names)
+
+
+_MX_EXTRA = (
+    (
+        "Decode",
+        DECODE_SHAPE,
+        "swapped",
+        "c.swapAb",
+        "the swapped token-tile records (`swapAb`: the decode specialisation, one token tile for all tokens)",
+    ),
+    (
+        "C2",
+        C2_SHAPE,
+        "cluster",
+        "c.clusterK == 2",
+        "the in-cluster split records of factor 2 (`clusterK`) next to the dense records and the in-CTA chunk-fold twins",
+    ),
+)
+
+FORMATS: Tuple[LeanFormat, ...] = (
+    LeanFormat(
+        "bf16",
+        "",
+        "gemm",
+        "gemm",
+        "gemmSpace",
+        "gemmDispatch",
+        "ConfigOK",
+        "gemmMainloopInner",
+        "chunksFor",
+        "chunkTable",
+        "chunks",
+        False,
+        ("n", "k"),
+        None,
+        tuple(GEMM_CASES),
+        tuple(GEMM_LOOP_CASES),
+        tuple(GEMM_OUT_CASES),
+        (),
+    ),
+    LeanFormat(
+        FP8_FMT,
+        "32",
+        "gemm32",
+        "gemm_fp8",
+        "gemmFp8Space",
+        "gemmFp8Dispatch",
+        "ConfigOKFp8",
+        "gemmMainloopInnerFp8",
+        "chunksForFp8",
+        "chunkTableFp8",
+        "chunks32",
+        True,
+        ("n", "k"),
+        None,
+        tuple(GEMM_FP8_CASES),
+        tuple(GEMM_FP8_LOOP_CASES),
+        tuple(GEMM_FP8_OUT_CASES),
+        tuple(FP8_CHUNK_EXTRA),
+    ),
+    LeanFormat(
+        MX_FMT,
+        "MX8",
+        "gemmmx8",
+        "gemm_mx8",
+        "gemmMx8Space",
+        "gemmMx8Dispatch",
+        "ConfigOKMx8",
+        "gemmMainloopInnerMx8",
+        "chunksForMx",
+        "chunkTableMx",
+        "chunksmx",
+        False,
+        ("k",),
+        ("sm_100", "sm_103"),
+        tuple(GEMM_MX_CASES),
+        tuple(GEMM_MX_LOOP_CASES),
+        tuple(GEMM_MX_OUT_CASES),
+        tuple(MX_CHUNK_EXTRA),
+        _MX_EXTRA,
+    ),
+    LeanFormat(
+        MX_K64_FMT,
+        "MX8K64",
+        "gemmmx8k64",
+        "gemm_mx8k64",
+        "gemmMx8K64Space",
+        "gemmMx8K64Dispatch",
+        "ConfigOKMx8K64",
+        "gemmMainloopInnerMx8K64",
+        "chunksForMx",
+        None,
+        "chunksmx",
+        False,
+        ("k",),
+        ("sm_107",),
+        tuple(GEMM_MX_CASES),
+        tuple(GEMM_MX_LOOP_CASES),
+        tuple(GEMM_MX_OUT_CASES),
+        tuple(MX_CHUNK_EXTRA),
+        _MX_EXTRA,
+    ),
+)
+BY_FMT: Dict[str, LeanFormat] = {F.in_fmt: F for F in FORMATS}
 #: The generated theorems closed by ``native_decide`` (the exhaustive checks over the configuration spaces); every
 #: other case is kernel ``decide``. ``lean/Axioms.lean`` pins exactly these names.
-DECIDED_THEOREMS = (
-    "gemm_space_ok",
-    "gemm_space_c4_ok",
-    "gemm_space_c4_cta_twins",
-    "gemm_dispatch_in_space",
-    "gemm_fp8_space_ok",
-    "gemm_fp8_space_c4_ok",
-    "gemm_fp8_space_c4_cta_twins",
-    "gemm_fp8_dispatch_in_space",
-)
+DECIDED_THEOREMS = tuple(n for F in FORMATS for n in F.decided)
 
 
 def lean_str(s: str) -> str:
@@ -129,10 +305,9 @@ def lean_str(s: str) -> str:
 
 def spec_cases(in_fmt: str = "bf16") -> List[Tuple[int, int, str]]:
     """``(K, chunks, sexpr)``: the Python spec's output element (0, 0) of each class of the format."""
-    cases = GEMM_CASES if in_fmt == "bf16" else GEMM_FP8_CASES
     return [
         (K, C, term.sexpr(GemmSpec(K, chunks=C, in_fmt=in_fmt).out(0, 0)))
-        for K, C in cases
+        for K, C in BY_FMT[in_fmt].cases
     ]
 
 
@@ -140,7 +315,6 @@ def loop_cases(in_fmt: str = "bf16") -> Tuple[int, List[Tuple[int, str]]]:
     """The lowering's inner radix and ``(nblk, sexpr)``: the engine's trace of the blocked fold at ``nblk`` blocks."""
     low = MainloopBlock(in_fmt).lowering()
     alg = term.TermAlgebra()
-    cases = GEMM_LOOP_CASES if in_fmt == "bf16" else GEMM_FP8_LOOP_CASES
     return low.inner, [
         (
             nblk,
@@ -152,15 +326,14 @@ def loop_cases(in_fmt: str = "bf16") -> Tuple[int, List[Tuple[int, str]]]:
                 )
             ),
         )
-        for nblk in cases
+        for nblk in BY_FMT[in_fmt].loop_cases
     ]
 
 
 def out_cases(in_fmt: str = "bf16") -> List[Tuple[int, str, str]]:
-    cases = GEMM_OUT_CASES if in_fmt == "bf16" else GEMM_FP8_OUT_CASES
     return [
         (K, fmt, term.sexpr(GemmSpec(K, fmt, in_fmt=in_fmt).out(0, 0)))
-        for K, fmt in cases
+        for K, fmt in BY_FMT[in_fmt].out_cases
     ]
 
 
@@ -173,14 +346,15 @@ def bias_cases() -> List[Tuple[int, int, str]]:
 
 
 def chunk_table(in_fmt: str = "bf16") -> List[Tuple[int, int, int]]:
-    shapes = CHUNK_TABLE_SHAPES + (FP8_CHUNK_EXTRA if in_fmt != "bf16" else [])
+    shapes = CHUNK_TABLE_SHAPES + list(BY_FMT[in_fmt].chunk_extra)
     return [(N, K, chunks_for(N, K, in_fmt)) for N, K in shapes]
 
 
 def spaces(in_fmt: str = "bf16") -> Tuple[List[Knobs], List[Knobs]]:
     """The generator's space at the reference shape and the split class's space at ``C4_SHAPE``: the bf16 spaces in the
     ``n`` layout (its space is layout-free), the fp8 spaces in the ``k`` layout (the whole knob product: the ``n`` layout
-    drops the 2-CTA 16-wide records, `operands.can_implement`)."""
+    drops the 2-CTA 16-wide records, `operands.can_implement`), the block-scaled spaces in the ``k`` layout (the only one
+    the instruction takes)."""
     M, N, K, C = C4_SHAPE
     lay = "n" if in_fmt == "bf16" else "k"
     return (
@@ -189,10 +363,36 @@ def spaces(in_fmt: str = "bf16") -> Tuple[List[Knobs], List[Knobs]]:
     )
 
 
+def extra_spaces(
+    in_fmt: str,
+) -> List[Tuple[str, Tuple[int, int, int, int], str, str, str, List[Knobs]]]:
+    """The block-scaled classes' further spaces (``LeanFormat.extra_spaces``) with their records."""
+    F = BY_FMT[in_fmt]
+    return [
+        (
+            sfx,
+            shape,
+            cname,
+            pred,
+            doc,
+            enumerate_space(
+                shape[0],
+                shape[1],
+                shape[2],
+                chunks=shape[3],
+                b_major="k",
+                in_fmt=in_fmt,
+            ),
+        )
+        for sfx, shape, cname, pred, doc in F.extra_spaces
+    ]
+
+
 def dispatch_cases(in_fmt: str = "bf16") -> Dict[Knobs, Tuple[int, int, int]]:
-    """Every record the dispatcher returns over the grid (both weight layouts, every part of `PARTS`) at the parts' nominal
-    numbers (``nominal=True``: a device's queried capacity or L2 size never enters the rendering), with the first shape
-    that selects it."""
+    """Every record the dispatcher returns over the grid (the format's weight layouts, every part of `PARTS` that runs the
+    class) at the parts' nominal numbers (``nominal=True``: a device's queried capacity or L2 size never enters the
+    rendering), with the first shape that selects it."""
+    F = BY_FMT[in_fmt]
     disp: Dict[Knobs, Tuple[int, int, int]] = {}
     pairs = [(N, K) for N in DISPATCH_NS for K in DISPATCH_NS]
     pairs += [(N, K) for K in DISPATCH_BIG for N in DISPATCH_NS[::3]]
@@ -200,8 +400,10 @@ def dispatch_cases(in_fmt: str = "bf16") -> Dict[Knobs, Tuple[int, int, int]]:
     for N, K in pairs:
         C = chunks_for(N, K, in_fmt)
         for M in DISPATCH_MS:
-            for b_major in ("n", "k"):
+            for b_major in F.layouts:
                 for family, sm in PARTS:
+                    if F.families is not None and family not in F.families:
+                        continue
                     k = dataclasses.replace(
                         default_config(
                             M, N, K, C, b_major, sm, family, in_fmt, nominal=True
@@ -212,38 +414,36 @@ def dispatch_cases(in_fmt: str = "bf16") -> Dict[Knobs, Tuple[int, int, int]]:
     return disp
 
 
-def _render_format(L: List[str], in_fmt: str) -> None:
-    """The cases of one format: ``p`` is the Lean name infix (`` `` for bf16, ``32`` for the fp8 step)."""
-    fp8 = in_fmt != "bf16"
-    p = "32" if fp8 else ""
-    kfold, kchunk, loop = f"kfold{p}", f"kchunk{p}", f"kblockLoop{p}"
-    scaled = "true" if fp8 else "false"
-    mk = MMA_K_OF[in_fmt]
-    tag = "gemm32" if fp8 else "gemm"
+def _deep(L: List[str], n: int) -> None:
+    """A list longer than the file's default recursion depth needs the deeper one for kernel ``decide`` on it."""
+    if n > 500:
+        L.append("set_option maxRecDepth 16384 in")
+
+
+def _render_format(L: List[str], F: LeanFormat) -> None:
+    """The cases of one format."""
+    in_fmt, p, tag, th, sp, ok = F.in_fmt, F.p, F.tag, F.th, F.sp, F.ok
+    kfold, loop = f"kfold{p}", f"kblockLoop{p}"
+    scaled = "true" if F.scaled else "false"
+    mk = F.mk
+    step = {"": "mma16", "32": "mma32", "MX8": "mma32mx", "MX8K64": "mma64mx8"}[p]
     L.append(
-        f"/-! The spec terms of the two {in_fmt} classes (`gemm/spec.py` vs `GEMM.lean`, the `mma{mk}` step"
-        + (", the scaled chain" if fp8 else "")
+        f"/-! The spec terms of the two {in_fmt} classes (`gemm/spec.py` vs `GEMM.lean`, the `{step}` step"
+        + (", the scaled chain" if F.scaled else "")
         + "): the Python spec's output element, reproduced by the Lean model node for node. -/"
     )
     for i, (K, C, sx) in enumerate(spec_cases(in_fmt)):
-        steps = K // mk
-        t = (
-            f"{kfold} ⟨0⟩ ⟨0⟩ {steps}"
-            if C == 1
-            else f"{kchunk} ⟨0⟩ ⟨0⟩ {C} {steps // C}"
-        )
         L.append(
-            f'theorem {tag}{i}_spec : (outputElem {scaled} "bf16" ({t})).sexpr = {lean_str(sx)} := by decide  -- K={K} C={C}'
+            f'theorem {tag}{i}_spec : (outputElem {scaled} "bf16" ({F.fold_term(K // mk, C)})).sexpr = {lean_str(sx)} := by decide  -- K={K} C={C}'
         )
-    cases = GEMM_FP8_CASES if fp8 else GEMM_CASES
     L.append(
         f"def {tag}Cases : List (Nat × Nat) := ["
-        + ", ".join(f"({K // mk}, {C})" for K, C in cases)
+        + ", ".join(f"({K // mk}, {C})" for K, C in F.cases)
         + "]"
     )
     L.append("")
     inner, loops = loop_cases(in_fmt)
-    inner_name = "gemmMainloopInnerFp8" if fp8 else "gemmMainloopInner"
+    inner_name = F.inner_name
     L.append(
         f'/-! The {in_fmt} mainloop\'s blocked lowering (`canon.BlockedFold`, `MainloopBlock("{in_fmt}").lowering()`, executed by '
         f"`gemm/blocks/mainloop.py`): inner radix {inner}. `{loop}` on it equals `{kfold}` for every block count and "
@@ -259,56 +459,52 @@ def _render_format(L: List[str], in_fmt: str) -> None:
         L.append(
             f"theorem {tag}loop{i} : ({loop} ⟨0⟩ ⟨0⟩ {inner_name} 3 .zero {nblk}).sexpr = {lean_str(sx)} := by decide"
         )
-    loop_cases_ = GEMM_FP8_LOOP_CASES if fp8 else GEMM_LOOP_CASES
     L.append(
         f"def {tag}LoopCases : List Nat := ["
-        + ", ".join(str(n) for n in loop_cases_)
+        + ", ".join(str(n) for n in F.loop_cases)
         + "]"
     )
     L.append("")
     L.append(
         f"/-! The {in_fmt} epilogue chain (`spec.output_elem`"
-        + (", `mul.rn alpha` then the conversion" if fp8 else "")
+        + (", `mul.rn alpha` then the conversion" if F.scaled else "")
         + f"): `outputKfold{p}` against the Python spec's output term per output format. -/"
     )
     for i, (K, fmt, sx) in enumerate(out_cases(in_fmt)):
-        head = f'outputKfold32 "{fmt}"' if fp8 else f'outputKfold false "{fmt}"'
         L.append(
-            f"theorem {tag}out{i} : ({head} ⟨0⟩ ⟨0⟩ {K // mk}).sexpr = {lean_str(sx)} := by decide"
+            f"theorem {tag}out{i} : ({F.chain_head(fmt)} ⟨0⟩ ⟨0⟩ {K // mk}).sexpr = {lean_str(sx)} := by decide"
         )
-    out_cases_ = GEMM_FP8_OUT_CASES if fp8 else GEMM_OUT_CASES
     L.append(
         f"def {tag}OutCases : List (Nat × String) := ["
-        + ", ".join(f'({K // mk}, "{f}")' for K, f in out_cases_)
+        + ", ".join(f'({K // mk}, "{f}")' for K, f in F.out_cases)
         + "]"
     )
     L.append("")
-    rule = "chunksForFp8" if fp8 else "chunksFor"
-    table = "chunkTableFp8" if fp8 else "chunkTable"
-    L.append(
-        f'/-- `chunks_for(N, K, "{in_fmt}")` as the Python dispatcher computes it; Lean re-derives it. -/'
-    )
-    L.append(
-        f"def {table} : List (Nat × Nat × Nat) := ["
-        + ", ".join(f"({N}, {K}, {C})" for N, K, C in chunk_table(in_fmt))
-        + "]"
-    )
-    L.append(
-        f"theorem chunk_rule_matches{'_fp8' if fp8 else ''} : {table}.all (fun ⟨N, K, C⟩ => {rule} N K == C) = true := by decide"
-    )
-    L.append("")
+    if F.table is not None:
+        L.append(
+            f'/-- `chunks_for(N, K, "{in_fmt}")` as the Python dispatcher computes it; Lean re-derives it. -/'
+        )
+        L.append(
+            f"def {F.table} : List (Nat × Nat × Nat) := ["
+            + ", ".join(f"({N}, {K}, {C})" for N, K, C in chunk_table(in_fmt))
+            + "]"
+        )
+        suffix = {"": "", "32": "_fp8", "MX8": "_mx"}[p]
+        L.append(
+            f"theorem chunk_rule_matches{suffix} : {F.table}.all (fun ⟨N, K, C⟩ => {F.rule} N K == C) = true := by decide"
+        )
+        L.append("")
     space, spacec = spaces(in_fmt)
-    sp = "gemmFp8Space" if fp8 else "gemmSpace"
-    ok = "ConfigOKFp8" if fp8 else "ConfigOK"
-    inv = "space_invariant32" if fp8 else "space_invariant"
-    tile = "tileResult32" if fp8 else "tileResult"
-    th = "gemm_fp8" if fp8 else "gemm"
+    inv = f"space_invariant{p}"
+    tile = f"tileResult{p}"
+    lay = "n" if in_fmt == "bf16" else "k"
     L.append(
         f"/-! The generator's {in_fmt} configuration space at the reference shape {REFERENCE_SHAPE} "
-        f"(`gemm.generator.enumerate_space`): every knob record, checked against the kernel's static constraints "
-        f"(`{ok}`), counted, and the `config_invariance` theorem instantiated on it. -/"
+        f"(`gemm.generator.enumerate_space`, the `{lay}` weight layout): every knob record, checked against the kernel's "
+        f"static constraints (`{ok}`), counted, and the `config_invariance` theorem instantiated on it. -/"
     )
     L.append(f"def {sp} : List Config := [" + ", ".join(k.lean() for k in space) + "]")
+    _deep(L, len(space))
     L.append(f"theorem {th}_space_size : {sp}.length = {len(space)} := by decide")
     L.append(f"theorem {th}_space_ok : {sp}.all {ok} = true := by native_decide")
     L.append(
@@ -317,50 +513,102 @@ def _render_format(L: List[str], in_fmt: str) -> None:
     )
     M4, N4, K4, C4 = C4_SHAPE
     n_cta = sum(k.cta_chunks for k in spacec)
-    twins = [dataclasses.replace(k, cta_chunks=True) for k in space]
+    twins = [
+        t
+        for t in (dataclasses.replace(k, cta_chunks=True) for k in space)
+        if t.well_formed(in_fmt)
+    ]
     assert [k for k in spacec if k.cta_chunks] == twins, (
-        "the in-CTA chunk-fold records are not the twins of the dense space"
+        "the in-CTA chunk-fold records are not the well-formed twins of the dense space"
     )
     spc = f"{sp}C4"
     L.append(
         f"/-! The {in_fmt} split class's space at ({M4}, {N4}, {K4}) with {C4} chunks: the dense records the shape admits plus the "
-        f"in-CTA chunk-fold twin (`ctaChunks`) of every record of the reference space. -/"
+        f"in-CTA chunk-fold twin (`ctaChunks`) of every record of the reference space that satisfies `{ok}` with the fold on"
+        + (
+            " (the block-scaled class: the TMEM budget of the running sum, no B-reuse tile), and the in-cluster split records of factor 4 (`clusterK`)"
+            if F.extra_spaces
+            else ""
+        )
+        + ". -/"
     )
     L.append(
         f"def {spc} : List Config := [" + ", ".join(k.lean() for k in spacec) + "]"
     )
-    L.append(
-        "set_option maxRecDepth 16384 in"
-    )  # the 1776-record list exceeds the file's default recursion depth
+    _deep(L, len(spacec))
     L.append(f"theorem {th}_space_c4_size : {spc}.length = {len(spacec)} := by decide")
     L.append(f"theorem {th}_space_c4_ok : {spc}.all {ok} = true := by native_decide")
-    L.append("set_option maxRecDepth 16384 in")
+    _deep(L, len(spacec))
     L.append(
         f"theorem {th}_space_c4_cta : ({spc}.filter (fun c => c.ctaChunks)).length = {n_cta} := by decide"
     )
     L.append(
-        f"theorem {th}_space_c4_cta_twins : {spc}.filter (fun c => c.ctaChunks) = {sp}.map (fun c => {{ c with ctaChunks := true }}) := by native_decide"
+        f"theorem {th}_space_c4_cta_twins : {spc}.filter (fun c => c.ctaChunks) = ({sp}.map (fun c => {{ c with ctaChunks := true }})).filter {ok} := by native_decide"
     )
+    if F.extra_spaces:
+        n_ck = sum(k.cluster_k == C4 for k in spacec)
+        _deep(L, len(spacec))
+        L.append(
+            f"theorem {th}_space_c4_cluster : ({spc}.filter (fun c => c.clusterK == {C4})).length = {n_ck} := by decide"
+        )
     L.append(
         f"theorem {th}_space_c4_invariant : ∀ c₁ ∈ {spc}, ∀ c₂ ∈ {spc}, ∀ (S₁ S₂ : Nat) (p q : GTerm) (a : RowData) (b : ColData) (kb nblk : Nat), "
         f"{tile} c₁ S₁ p a b kb nblk = {tile} c₂ S₂ q a b kb nblk := {inv} {spc}"
     )
     L.append("")
+    members = [sp, spc]
+    for sfx, shape, cname, pred, doc, recs in extra_spaces(in_fmt):
+        name = f"{sp}{sfx}"
+        low = sfx.lower()
+        n_pred = sum(
+            (k.swap_ab if cname == "swapped" else k.cluster_k == shape[3]) for k in recs
+        )
+        L.append(
+            f"/-! The {in_fmt} space at {shape[:3]}"
+            + (f" with {shape[3]} chunks" if shape[3] > 1 else "")
+            + f": {doc}. -/"
+        )
+        L.append(
+            f"def {name} : List Config := [" + ", ".join(k.lean() for k in recs) + "]"
+        )
+        _deep(L, len(recs))
+        L.append(
+            f"theorem {th}_space_{low}_size : {name}.length = {len(recs)} := by decide"
+        )
+        L.append(
+            f"theorem {th}_space_{low}_ok : {name}.all {ok} = true := by native_decide"
+        )
+        _deep(L, len(recs))
+        L.append(
+            f"theorem {th}_space_{low}_{cname} : ({name}.filter (fun c => {pred})).length = {n_pred} := by decide"
+        )
+        L.append(
+            f"theorem {th}_space_{low}_invariant : ∀ c₁ ∈ {name}, ∀ c₂ ∈ {name}, ∀ (S₁ S₂ : Nat) (p q : GTerm) (a : RowData) (b : ColData) (kb nblk : Nat), "
+            f"{tile} c₁ S₁ p a b kb nblk = {tile} c₂ S₂ q a b kb nblk := {inv} {name}"
+        )
+        L.append("")
+        members.append(name)
     disp = dispatch_cases(in_fmt)
-    dn = "gemmFp8Dispatch" if fp8 else "gemmDispatch"
-    L.append(
-        f"/-! Every knob record the {in_fmt} dispatcher returns over the shape grid (both weight layouts; the nominal parts "
-        "Rubin NVL8 / NVL72, B200 / GB200, B300: the table's co-resident capacities and L2 sizes, never a device's queried "
-        "numbers), with the first shape that selects it; each is a member of the enumerated space (R3 membership). -/"
+    parts = (
+        "every part"
+        if F.families is None
+        else "the " + " / ".join(F.families) + " parts"
     )
     L.append(
-        f"def {dn} : List (Nat × Nat × Nat × Config) := ["
+        f"/-! Every knob record the {in_fmt} dispatcher returns over the shape grid ({'both weight layouts' if len(F.layouts) == 2 else 'the K-major weight layout'}; "
+        f"{parts} of the nominal table Rubin NVL8 / NVL72, B200 / GB200, B300: the table's co-resident capacities and L2 sizes, "
+        "never a device's queried numbers), with the first shape that selects it; each is a member of one of the enumerated "
+        "spaces above (R3 membership). -/"
+    )
+    L.append(
+        f"def {F.dn} : List (Nat × Nat × Nat × Config) := ["
         + ", ".join(f"({M}, {N}, {K}, {k.lean()})" for k, (M, N, K) in disp.items())
         + "]"
     )
     L.append(
-        f"theorem {th}_dispatch_in_space : {dn}.all (fun ⟨_, _, _, c⟩ => {sp}.any (fun s => s == c) || "
-        f"(c.ctaChunks && {spc}.any (fun s => s == c))) = true := by native_decide"
+        f"theorem {th}_dispatch_in_space : {F.dn}.all (fun ⟨_, _, _, c⟩ => "
+        + " || ".join(f"{m}.any (fun s => s == c)" for m in members)
+        + ") = true := by native_decide"
     )
     L.append("")
 
@@ -398,20 +646,29 @@ def render() -> str:
         "open GEMM",
         "",
     ]
-    _render_format(L, "bf16")
+    _render_format(L, BY_FMT["bf16"])
     _render_bias(L)
-    _render_format(L, FP8_FMT)
+    for F in FORMATS[1:]:
+        _render_format(L, F)
     L.append("end BIK")
     return "\n".join(L) + "\n"
 
 
 def summary() -> str:
-    space, spacec = spaces()
-    space8, spacec8 = spaces(FP8_FMT)
+    parts = []
+    for F in FORMATS:
+        space, spacec = spaces(F.in_fmt)
+        extra = "+".join(str(len(r[-1])) for r in extra_spaces(F.in_fmt))
+        parts.append(
+            f"{F.in_fmt}: specs={len(F.cases)} loops={len(F.loop_cases)} outs={len(F.out_cases)} "
+            f"chunk-shapes={len(CHUNK_TABLE_SHAPES) + len(F.chunk_extra)} space={len(space)} split={len(spacec)}"
+            + (f" extra={extra}" if extra else "")
+            + f" dispatch={len(dispatch_cases(F.in_fmt))}"
+        )
     return (
-        f"lean_cases coverage: gemm specs={len(GEMM_CASES)}+{len(GEMM_FP8_CASES)} loop cases={len(GEMM_LOOP_CASES)}+{len(GEMM_FP8_LOOP_CASES)} "
-        f"output cases={len(GEMM_OUT_CASES)}+{len(GEMM_FP8_OUT_CASES)} bias cases={len(GEMM_BIAS_CASES)} chunk-table shapes={len(CHUNK_TABLE_SHAPES)}+{len(FP8_CHUNK_EXTRA)} "
-        f"space={len(space)}/{len(space8)} split space={len(spacec)}/{len(spacec8)} dispatch records={len(dispatch_cases())}/{len(dispatch_cases(FP8_FMT))}"
+        "lean_cases coverage: "
+        + "; ".join(parts)
+        + f"; bias cases={len(GEMM_BIAS_CASES)}; native_decide theorems={len(DECIDED_THEOREMS)}"
     )
 
 
