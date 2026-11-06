@@ -17,7 +17,7 @@ limitations under the License.
 """Benchmark the experimental Cake DSA sparse-attention training kernels (SM100 / SM103 / SM107).
 
 Times the forward, the backward and the whole training step (forward +
-backward, wrapper-inclusive) of ``flashinfer.experimental.cake_dsa_train`` on
+backward, wrapper-inclusive) of ``flashinfer.experimental.cake.cake_dsa_sparse_attention_nondet_train`` on
 the GLM-5.2 geometry (64 query heads, 512 latent + 64 rope, 512 value
 dimensions, top-k 2048, BF16) over eighteen representative rows: one causal
 document of 4k .. 128k tokens, context-parallel tails (4k queries over 64k /
@@ -40,7 +40,7 @@ buffer ``[T, 64, 256]`` whose ``192:256`` channels are ``q_rope`` (head stride
 ``0:512``, rope ``512:576``), and the backward accumulates dK/dV into a
 caller-owned fp32 ``dkv_acc [Tkv, 576]``, optionally through a destination-row
 map.  The ``cake`` arm then calls the public varlen entry
-``dsa_sparse_attention_varlen(..., causal=True, dkv_acc=, dkv_dst_map=)`` with
+``cake_dsa_sparse_attention_nondet_varlen(..., causal=True, dkv_acc=, dkv_dst_map=)`` with
 the views as they are (no copies) through autograd; the baseline arms run the
 contiguous copies / cat and the ``index_add_`` / ``+=`` accumulation into
 ``dkv_acc`` their kernels need inside the timed step.  ``dkv_acc`` is
@@ -54,7 +54,7 @@ the chunked FP64 reference (iid 4k x 4k and peaked-attention cases; with a
 destination map the reference dK/dV is mapped the same way).
 
 ``--host-us`` measures the host side of the eager entry points (``forward``,
-``backward``, the public ``dsa_sparse_attention`` forward / autograd backward /
+``backward``, the public ``cake_dsa_sparse_attention_nondet`` forward / autograd backward /
 step) and of a prepared runner as wall-clock microseconds per call with the GPU
 running asynchronously (``--host-rounds`` rounds of ``--host-calls`` calls
 each, the order of the entry points rotated every round and recorded per
@@ -91,12 +91,12 @@ signature drift shows up there, not after the timings).
 
 Usage::
 
-    python benchmarks/bench_cake_dsa_train.py [--rows doc_4096 ...] [--arms cake,flashmla_cudnn,fa4]
+    python benchmarks/bench_cake_dsa_sparse_attention_nondet_train.py [--rows doc_4096 ...] [--arms cake,flashmla_cudnn,fa4]
         [--steps 20] [--accuracy] [--host-us] [--json out.json]
-    python benchmarks/bench_cake_dsa_train.py --preset packed_glm_a --arms cake,flashmla_cudnn,fa4
-    python benchmarks/bench_cake_dsa_train.py --rows doc_4096 --q-layout pre256 --kv-stride 704 \\
+    python benchmarks/bench_cake_dsa_sparse_attention_nondet_train.py --preset packed_glm_a --arms cake,flashmla_cudnn,fa4
+    python benchmarks/bench_cake_dsa_sparse_attention_nondet_train.py --rows doc_4096 --q-layout pre256 --kv-stride 704 \\
         --dkv-acc --dkv-dst-map perm --accuracy
-    python benchmarks/bench_cake_dsa_train.py --preset nope --check-nope-arms \\
+    python benchmarks/bench_cake_dsa_sparse_attention_nondet_train.py --preset nope --check-nope-arms \\
         --arms cake_nope,cake_rope_bridge,fa4_nope,fa4_nope_a2 --json nope.json
 """
 
@@ -108,24 +108,22 @@ import statistics
 import sys
 import time
 import traceback
-import warnings
 from pathlib import Path
 
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from flashinfer.api_logging import ExperimentalWarning  # noqa: E402
-from flashinfer.dsa_sparse_attention import (  # noqa: E402
-    dsa_sparse_attention,
-    dsa_sparse_attention_varlen,
+from flashinfer.cake_dsa_sparse_attention_nondet_train import (  # noqa: E402
+    cake_dsa_sparse_attention_nondet,
+    cake_dsa_sparse_attention_nondet_varlen,
 )
-from flashinfer.experimental.cake_dsa_train import (  # noqa: E402
+from flashinfer.experimental.cake.cake_dsa_sparse_attention_nondet_train import (  # noqa: E402
     cake_backend,
     cake_jit,
 )
 from flashinfer.testing import bench_gpu_time  # noqa: E402
-from tests.test_helpers.cake_dsa_train_reference import (  # noqa: E402
+from tests.test_helpers.cake_dsa_sparse_attention_nondet_train_reference import (  # noqa: E402
     D_LATENT,
     D_QK,
     D_ROPE,
@@ -723,7 +721,7 @@ class ArmCake:
 
     Default layout: the prepared runner (``prepare_dsa_train``, direct launches
     into caller buffers).  Trainer layout: the public varlen entry
-    ``dsa_sparse_attention_varlen(..., causal=True, dkv_acc=, dkv_dst_map=)``
+    ``cake_dsa_sparse_attention_nondet_varlen(..., causal=True, dkv_acc=, dkv_dst_map=)``
     through autograd, fed the layout views as they are (head-stride-256
     ``q_rope`` slice, packed KV rows) and the caller's fp32 ``dkv_acc``
     allocated inside the timed forward (it is passed at forward time and saved
@@ -786,7 +784,7 @@ class ArmCake:
         return dict(
             module=module_name,
             stages=list(cake_jit.registered_stages()),
-            entry="dsa_sparse_attention_varlen",
+            entry="cake_dsa_sparse_attention_nondet_varlen",
             layout=self.layout.describe(),
         )
 
@@ -796,7 +794,7 @@ class ArmCake:
             return dict(out=out, lse=lse)
         inp, layout = self.inp, self.layout
         dkv_acc = layout.new_dkv_acc() if layout.dkv_acc else None
-        out, lse = dsa_sparse_attention_varlen(
+        out, lse = cake_dsa_sparse_attention_nondet_varlen(
             self.q_latent,
             self.q_rope,
             self.kv_latent,
@@ -1161,7 +1159,7 @@ def _planner_key_passes(inp, chunk, program=None):
 
 
 class ArmCakeNope:
-    """The native zero-RoPE entry (``dsa_sparse_attention_nope_varlen``) through autograd.
+    """The native zero-RoPE entry (``cake_dsa_sparse_attention_nondet_nope_varlen``) through autograd.
 
     The caller's fp32 ``dkv_acc [S, 512]`` is allocated in the forward (the entry binds it
     for the backward) and zero-filled inside the timed backward, once per step (where the
@@ -1173,8 +1171,12 @@ class ArmCakeNope:
     name = "cake_nope"
 
     def __init__(self, inp, chunk=NOPE_CHUNK):
-        from flashinfer.dsa_sparse_attention import dsa_sparse_attention_nope_varlen
-        from flashinfer.experimental.cake_dsa_train import cake_jit
+        from flashinfer.cake_dsa_sparse_attention_nondet_train import (
+            cake_dsa_sparse_attention_nondet_nope_varlen,
+        )
+        from flashinfer.experimental.cake.cake_dsa_sparse_attention_nondet_train import (
+            cake_jit,
+        )
 
         program = getattr(cake_jit, "NOPE_PROGRAM", None)
         if program is None or not cake_backend.generated_program_available(
@@ -1182,7 +1184,9 @@ class ArmCakeNope:
         ):
             raise RuntimeError("skipped: nope stems not installed")
         try:  # the record may be registered before the device libraries are built
-            from flashinfer.experimental.cake_dsa_train import cake_build
+            from flashinfer.experimental.cake.cake_dsa_sparse_attention_nondet_train import (
+                cake_build,
+            )
 
             arch = cake_backend.arch_for(inp.q.device)
             installed = cake_build.libraries_by_name()
@@ -1196,13 +1200,15 @@ class ArmCakeNope:
         if missing:
             raise RuntimeError("skipped: nope stems not installed")
         self.program = program
-        self.fn = dsa_sparse_attention_nope_varlen
+        self.fn = cake_dsa_sparse_attention_nondet_nope_varlen
         self.inp, self.chunk = inp, chunk
         self.q = inp.q.detach().requires_grad_()
         self.eager = None
 
     def versions(self):
-        return dict(module=self.program, entry="dsa_sparse_attention_nope_varlen")
+        return dict(
+            module=self.program, entry="cake_dsa_sparse_attention_nondet_nope_varlen"
+        )
 
     def _call(self, q, kv, dkv_acc):
         inp = self.inp
@@ -1346,7 +1352,7 @@ class ArmCakeRopeBridge:
         module_name, _record = cake_backend.record_for(self.inp.q.device)
         return dict(
             module=module_name,
-            entry="dsa_sparse_attention_varlen (zero-RoPE bridge)",
+            entry="cake_dsa_sparse_attention_nondet_varlen (zero-RoPE bridge)",
             dkv_direct=self.direct,
         )
 
@@ -1365,7 +1371,7 @@ class ArmCakeRopeBridge:
         dkv_acc = torch.empty(
             inp.total_k, D_QK, dtype=torch.float32, device=inp.q.device
         )
-        out, lse = dsa_sparse_attention_varlen(
+        out, lse = cake_dsa_sparse_attention_nondet_varlen(
             self.q,
             q_rope0,
             inp.kv,
@@ -2332,9 +2338,7 @@ def measure_host_path(inp, *, calls, rounds, kernel_steps):
     backward_available = cake_backend.generated_program_available(
         inp.q_latent.device, backward=True
     )
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ExperimentalWarning)
-        dsa_sparse_attention(*args)  # the experimental banner fires once per process
+    cake_dsa_sparse_attention_nondet(*args)  # warm-up: binds the eager path once
     leaves = [t.detach().clone().requires_grad_() for t in args[:4]]
     saved = cake_backend.forward(*args)
     runner = cake_backend.prepare_dsa_train(
@@ -2357,7 +2361,7 @@ def measure_host_path(inp, *, calls, rounds, kernel_steps):
         return runner.backward()
 
     def public_forward():
-        return dsa_sparse_attention(*leaves, inp.idx_global)
+        return cake_dsa_sparse_attention_nondet(*leaves, inp.idx_global)
 
     graph_out = public_forward()
 
@@ -2365,7 +2369,7 @@ def measure_host_path(inp, *, calls, rounds, kernel_steps):
         return torch.autograd.grad(graph_out, leaves, inp.dout, retain_graph=True)
 
     def autograd_step():
-        out = dsa_sparse_attention(*leaves, inp.idx_global)
+        out = cake_dsa_sparse_attention_nondet(*leaves, inp.idx_global)
         return torch.autograd.grad(out, leaves, inp.dout)
 
     entry_points = [

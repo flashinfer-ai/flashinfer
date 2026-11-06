@@ -455,8 +455,8 @@ PACKAGES: tuple[Package, ...] = (
         refs_generic,
     ),
     Package(
-        "flashinfer.experimental.cake_dsa_train",
-        "flashinfer/experimental/cake_dsa_train",
+        "flashinfer.experimental.cake.cake_dsa_sparse_attention_nondet_train",
+        "flashinfer/experimental/cake/cake_dsa_sparse_attention_nondet_train",
         "cake_jit.py",
         refs_generic,
     ),

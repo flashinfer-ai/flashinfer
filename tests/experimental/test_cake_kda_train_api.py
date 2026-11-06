@@ -1019,17 +1019,18 @@ def test_package_exports_the_det_free_names_only() -> None:
 
 
 def test_legacy_names_stay_deterministic() -> None:
-    """The det-free spellings of ``flashinfer.kda_train`` are the deterministic facade's objects, never this
-    facade's; the legacy package path ``flashinfer.experimental.cake_kda_train`` stays the deterministic package's
-    compatibility alias, never this package; the test-alias keys follow."""
-    import flashinfer.experimental.cake_kda_train as legacy_pkg
-    import flashinfer.kda_train as legacy
+    """The det names of ``flashinfer.cake_kda_det_train`` are the deterministic facade's objects, never this
+    facade's; the det package ``flashinfer.experimental.cake_kda_det_train`` is never this package; the test-alias
+    keys follow."""
+    import flashinfer.experimental.cake_kda_det_train as legacy_pkg
+    import flashinfer.cake_kda_det_train as legacy
 
     for name, det_name in NAME_MAP.items():
-        assert getattr(legacy, name) is getattr(det_api, det_name), name
-        assert getattr(legacy, name) is not getattr(facade, name), name
+        assert getattr(legacy, det_name) is getattr(det_api, det_name), name
+        assert getattr(legacy, det_name) is not getattr(facade, name), name
         assert (
-            "deterministic" not in inspect.signature(getattr(legacy, name)).parameters
+            "deterministic"
+            not in inspect.signature(getattr(legacy, det_name)).parameters
         )
     assert legacy.DEFAULT_SCALE == facade.DEFAULT_SCALE
     for name, det_name in (
@@ -1040,9 +1041,8 @@ def test_legacy_names_stay_deterministic() -> None:
         ("KdaChunkSaved", "KdaDetChunkSaved"),
         ("KdaWorkspace", "KdaDetWorkspace"),
     ):
-        assert getattr(legacy_pkg, name) is getattr(det_pkg, det_name), name
-        assert getattr(legacy_pkg, name) is not getattr(pkg, name), name
-    assert cake_package("cake_kda_train") is legacy_pkg
+        assert getattr(legacy_pkg, det_name) is getattr(det_pkg, det_name), name
+        assert getattr(legacy_pkg, det_name) is not getattr(pkg, name), name
     assert cake_package("cake_kda_det_train") is det_pkg
     assert cake_package("cake.cake_kda_train") is pkg
     assert legacy_pkg is not pkg and det_pkg is not pkg

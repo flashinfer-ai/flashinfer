@@ -15,9 +15,9 @@ limitations under the License.
 
 Seeded inputs and the chunked FP64 reference of the DSA sparse-attention
 training problem (64 query heads, 512 latent + 64 rope, top-k selection),
-shared by ``tests/experimental/test_cake_dsa_train.py``,
-``tests/experimental/test_cake_dsa_train_api.py`` and
-``benchmarks/bench_cake_dsa_train.py``.  The protocol follows the reference
+shared by ``tests/experimental/test_cake_dsa_sparse_attention_nondet_train.py``,
+``tests/experimental/test_cake_dsa_sparse_attention_nondet_train_api.py`` and
+``benchmarks/bench_cake_dsa_sparse_attention_nondet_train.py``.  The protocol follows the reference
 tests of the FA sparse-MLA backward: per-document causal random top-k with
 ``-1`` padding, BF16 inputs, FP64 reference from the same BF16 values.
 """
