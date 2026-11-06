@@ -917,13 +917,23 @@ the sccache daemon even though they are outside the wrapped process group. The
 CI `docker run --rm` boundary provides final cleanup for those processes.
 
 PR GPU test lanes run their test script through `scripts/run_with_test_sccache.sh`,
-which routes JIT compiles through the same S3 cache and prefix as the AOT lanes
-and uploads `sccache-stats-<kind>-<cuda>-<index>` artifacts. Set the repository
+which routes JIT compiles through the same S3 cache and prefix as the release and
+nightly AOT builds and uploads `sccache-stats-<kind>-<cuda>-<index>` artifacts. Set the repository
 variable `FLASHINFER_GPU_TEST_SCCACHE=0` to turn this off for A/B timing. If the
 sccache install fails, the wrapper runs the lane uncached. Compiles run in the
 sccache server, so a timed-out unit's process-group kill does not reach them, and
 per-unit memory telemetry excludes nvcc. Locally:
 `scripts/run_with_test_sccache.sh scripts/task_run_unit_tests.sh` (read-only without AWS credentials).
+
+The PR AOT lane (`scripts/task_test_jit_cache_package_build_import.sh`) caches
+nvcc with the pinned rapidsai/sccache fork (`FLASHINFER_SCCACHE_NVCC_IMPL=rapids`):
+a second sccache server on port `FLASHINFER_SCCACHE_RAPIDS_PORT` (default 4227)
+with key prefix `<tag>-rapids`, reached through the nvcc launcher. Its
+dependency-list hashing makes an nvcc hit about 0.3 instead of 7.4 host CPU-s.
+Host C++ stays on the upstream server and prefix because the fork fails fatally
+on `g++ -MMD` of files including `<vector>`. Its stats are appended to
+`sccache-stats.txt` and written to `sccache-nvcc-stats.{txt,json}`. Set
+`FLASHINFER_SCCACHE_NVCC_IMPL=upstream` to compare.
 
 ##### Cubin / Artifact Loader
 

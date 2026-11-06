@@ -491,6 +491,84 @@ test "${{FLASHINFER_NVCC_LAUNCHER}}" = sccache
     assert not lane_stats_dir.exists()
 
 
+@pytest.mark.cpu_only
+def test_sccache_setup_rapids_nvcc_impl(tmp_path):
+    """FLASHINFER_SCCACHE_NVCC_IMPL=rapids runs the fork as a second server for
+    nvcc, on its own port and key prefix, and keeps host C++ on upstream."""
+    common_script = (
+        Path(__file__).resolve().parents[3] / "scripts" / "jit_cache_build_common.sh"
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    calls = tmp_path / "calls.log"
+    # Both fakes are named sccache, in separate directories (the fork hangs under
+    # any other name); the tag in the log tells them apart.
+    rapids_bin = tmp_path / "rapids" / "sccache"
+    rapids_bin.parent.mkdir()
+    fakes = {
+        "sccache": (fake_bin / "sccache", "0.18.0"),
+        "sccache-rapids": (rapids_bin, "0.18.0-rapids.8"),
+    }
+    for command, (executable, version) in fakes.items():
+        executable.write_text(
+            "#!/bin/bash\n"
+            f'echo "{command} port=${{SCCACHE_SERVER_PORT:-}} '
+            f'prefix=${{SCCACHE_S3_KEY_PREFIX:-}} $*" >> "{calls}"\n'
+            f'if [ "$1" = --version ]; then echo "sccache {version}"; fi\n'
+        )
+        executable.chmod(0o755)
+    stats_dir = tmp_path / "stats"
+
+    script = f"""
+set -euo pipefail
+source "{common_script}"
+install_sccache() {{ echo unexpected-install >> "{calls}"; }}
+install_rapids_sccache() {{ echo unexpected-install >> "{calls}"; }}
+export PATH="{fake_bin}:$PATH"
+export SCCACHE_BUCKET=test-bucket SCCACHE_STATS_DIR="{stats_dir}"
+export FLASHINFER_SCCACHE_NVCC_IMPL=rapids SCCACHE_RAPIDS_BIN="{rapids_bin}"
+setup_sccache test-prefix "{tmp_path}"
+test "${{SCCACHE_S3_KEY_PREFIX}}" = test-prefix
+test "${{FLASHINFER_CXX_LAUNCHER}}" = sccache
+test "${{FLASHINFER_NVCC_LAUNCHER}}" = "env SCCACHE_SERVER_PORT=4227 {rapids_bin}"
+collect_sccache_stats
+"""
+
+    subprocess.run(["bash", "-c", script], check=True, env=_sccache_free_env())
+
+    lines = calls.read_text().splitlines()
+    assert "unexpected-install" not in lines
+    assert "sccache port= prefix=test-prefix --start-server" in lines
+    assert "sccache-rapids port=4227 prefix=test-prefix-rapids --start-server" in lines
+    assert "sccache port= prefix=test-prefix --stop-server" in lines
+    assert any(
+        line.startswith("sccache-rapids port=4227 ") and line.endswith("--stop-server")
+        for line in lines
+    )
+    assert (stats_dir / "sccache-nvcc-stats.json").exists()
+    assert (
+        "=== nvcc server (sccache 0.18.0-rapids.8) ==="
+        in (stats_dir / "sccache-stats.txt").read_text()
+    )
+
+
+@pytest.mark.cpu_only
+def test_sccache_setup_rejects_unknown_nvcc_impl(tmp_path):
+    common_script = (
+        Path(__file__).resolve().parents[3] / "scripts" / "jit_cache_build_common.sh"
+    )
+    script = f"""
+source "{common_script}"
+export SCCACHE_BUCKET=test-bucket FLASHINFER_SCCACHE_NVCC_IMPL=bogus
+setup_sccache test-prefix "{tmp_path}"
+"""
+    result = subprocess.run(
+        ["bash", "-c", script], env=_sccache_free_env(), capture_output=True, text=True
+    )
+    assert result.returncode != 0
+    assert "Unsupported FLASHINFER_SCCACHE_NVCC_IMPL=bogus" in result.stdout
+
+
 def _write_test_sccache_fakes(
     tmp_path,
     sccache_version,
