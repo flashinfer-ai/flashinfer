@@ -6037,31 +6037,39 @@ def _l2n_key_saved(saved: CakeKDADetKcpSaved | None) -> tuple[Any, ...]:
     return (saved.qk_rstd,) if saved is not None and saved.qk_l2norm else ()
 
 
-# The host module of the non-deterministic package (deterministic=False), this package's sibling: its workspace type
-# is recognized through sys.modules without importing that package (none of its objects exists before it is imported).
-_ND_KCP = f"{__name__.rsplit('.', 2)[0]}.cake_kda_train_kcp.cake_kcp"
+# The host module of the non-deterministic package cake_kda_nondet_train_kcp, this package's sibling: its workspace
+# type is recognized through sys.modules without importing that package (none of its objects exists before it is
+# imported).
+_ND_PARENT = __package__.rpartition(".")[0]
+_ND_KCP = (
+    f"{_ND_PARENT}.cake_kda_nondet_train_kcp.cake_kcp"
+    if _ND_PARENT
+    else "cake_kda_nondet_train_kcp.cake_kcp"
+)
 
 
 def _refuse_nd_workspace(workspace: Any) -> None:
     """A workspace of the non-deterministic package raises ``ValueError`` naming the mode."""
     nd = sys.modules.get(_ND_KCP)
-    if nd is not None and isinstance(workspace, getattr(nd, "WorkspaceKcp", ())):
+    if nd is not None and isinstance(
+        workspace, getattr(nd, "CakeKDANondetKcpWorkspace", ())
+    ):
         raise ValueError(
             f"workspace: a {CakeKDADetKcpWorkspace.__module__}.CakeKDADetKcpWorkspace is required, got "
             f"{type(workspace).__module__}.{type(workspace).__qualname__}; a workspace of the non-deterministic "
-            "package (deterministic=False) serves that package's calls only"
+            "package cake_kda_nondet_train_kcp serves that package's calls only"
         )
 
 
 def _refuse_other_mode(saved: Any, workspace: Any) -> None:
     """The backward's mode check, before any graph key, operand or tensor read: a saved set that is not a
-    :class:`CakeKDADetKcpSaved` (the non-deterministic package's ``SavedKcp`` has the same version and members) and a
-    workspace of the non-deterministic package raise ``ValueError`` naming the mode."""
+    :class:`CakeKDADetKcpSaved` (the non-deterministic package's ``CakeKDANondetKcpSaved`` has the same version and
+    members) and a workspace of the non-deterministic package raise ``ValueError`` naming the mode."""
     if saved is not None and not isinstance(saved, CakeKDADetKcpSaved):
         raise ValueError(
-            f"saved: a {CakeKDADetKcpSaved.__module__}.CakeKDADetKcpSaved (the deterministic KCP forward) is required, got "
-            f"{type(saved).__module__}.{type(saved).__qualname__}; a saved set of the non-deterministic package "
-            "(deterministic=False) is read by that package's backward"
+            f"saved: a {CakeKDADetKcpSaved.__module__}.CakeKDADetKcpSaved (the deterministic KCP forward) is required, "
+            f"got {type(saved).__module__}.{type(saved).__qualname__}; a saved set of the non-deterministic package "
+            "cake_kda_nondet_train_kcp is read by that package's backward"
         )
     _refuse_nd_workspace(workspace)
 
@@ -6501,7 +6509,7 @@ def cake_kda_det_train_kcp_backward(
     a workspace of the other mode is refused with ``ValueError``.
 
     ``saved`` must come from this package's forward and ``workspace`` must not be one of the non-deterministic package
-    (``deterministic=False``): either raises ``ValueError`` naming the mode before anything is read."""
+    ``cake_kda_nondet_train_kcp``: either raises ``ValueError`` naming the mode before anything is read."""
     _refuse_other_mode(saved, workspace)
     opts = _options(options)
     gate_args = _gate_args(use_gate_in_kernel, A_log, dt_bias, lower_bound)
