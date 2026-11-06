@@ -351,7 +351,7 @@ NAMES = {
 }
 
 
-def test_names_are_the_deterministic_names_without_det():
+def test_names_pair_with_the_deterministic_names():
     """Every listed name of the package pairs with the deterministic package's name, is defined by this package (not
     the deterministic object), and no name of the package carries ``_det_`` or ``Det``."""
     for module_name, names in NAMES.items():

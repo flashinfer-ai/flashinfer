@@ -225,7 +225,7 @@ def test_entries_take_no_mode_keyword():
     assert list(forward.parameters)[-1] == "cake"
 
 
-def test_names_are_the_deterministic_names_without_det():
+def test_names_pair_with_the_deterministic_names():
     assert (
         cake_support.CakeLMHeadNondetSupportFunction
         is not det_support.CakeLMHeadDetSupportFunction
