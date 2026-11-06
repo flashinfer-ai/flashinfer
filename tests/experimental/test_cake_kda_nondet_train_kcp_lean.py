@@ -207,7 +207,9 @@ def test_single_rank_layouts_keep_their_bytes() -> None:
     assert "_ROUTE_SLOTS" not in cake_backend.__all__
     assert p.arena_bytes(backward=True) == 4488 * unit
     assert (
-        p.arena_bytes(backward=True, arena=cake_backend.CakeKDANondetArena(tail_passes=4))
+        p.arena_bytes(
+            backward=True, arena=cake_backend.CakeKDANondetArena(tail_passes=4)
+        )
         == 2820 * unit
     )
     for bad in (
@@ -217,9 +219,7 @@ def test_single_rank_layouts_keep_their_bytes() -> None:
         {"fwd_layout": "tiny"},
     ):
         with pytest.raises(ValueError):
-            cake_backend.CakeKDANondetWorkspace(
-                p, "cpu", layouts=((LEAN, 4),), **bad
-            )
+            cake_backend.CakeKDANondetWorkspace(p, "cpu", layouts=((LEAN, 4),), **bad)
     with pytest.raises(ValueError):
         cake_backend.CakeKDANondetWorkspace(p, "cpu", layouts=())
 
@@ -232,9 +232,7 @@ def test_single_rank_workspace_refuses_its_lean_modes_in_layouts() -> None:
         for passes in (1, 2, 4):
             for layouts in (((mode, passes),), ((LEAN, 2), (mode, passes))):
                 with pytest.raises(ValueError, match="take their tail passes"):
-                    cake_backend.CakeKDANondetWorkspace(
-                        p, "cpu", layouts=layouts, deterministic=False
-                    )
+                    cake_backend.CakeKDANondetWorkspace(p, "cpu", layouts=layouts)
 
 
 def test_route_layout_registration_rules() -> None:
@@ -428,7 +426,9 @@ def test_lean_stage_values_cover_the_records(H, arch) -> None:
     grids at the range's chunk count; the gate epilogue only where it launches; the replay layout's launch list
     with one tail range is the earlier one."""
     sm = ARCH_SMS[arch]
-    ctx = kp.cake_kda_nondet_train_kcp_build_context(_part(PROXY_PACK), None, 0, "cpu", 4, sm_count=sm)
+    ctx = kp.cake_kda_nondet_train_kcp_build_context(
+        _part(PROXY_PACK), None, 0, "cpu", 4, sm_count=sm
+    )
     plan = cake_backend.plan(ctx.T_r, ctx.n_frag, H, sm, arch)
     passes = kp.local_lean_passes(plan)
     assert passes > 1
@@ -584,12 +584,19 @@ def test_lean_byte_prediction_on_the_host() -> None:
             parts = [_part(lengths, W, layout) for lengths in (*PACKS, PROXY_PACK)]
             for r in range(W):
                 ctxs = [
-                    kp.cake_kda_nondet_train_kcp_build_context(p, None, r, "cpu", 4, sm_count=152)
+                    kp.cake_kda_nondet_train_kcp_build_context(
+                        p, None, r, "cpu", 4, sm_count=152
+                    )
                     for p in parts
                 ]
                 for H in (4, 12, 64):
-                    replay = kp.cake_kda_nondet_train_kcp_workspace_bytes(ctxs, H=H, local_arena="replay")
-                    assert kp.cake_kda_nondet_train_kcp_workspace_bytes(ctxs, H=H) == replay
+                    replay = kp.cake_kda_nondet_train_kcp_workspace_bytes(
+                        ctxs, H=H, local_arena="replay"
+                    )
+                    assert (
+                        kp.cake_kda_nondet_train_kcp_workspace_bytes(ctxs, H=H)
+                        == replay
+                    )
                     # the pools and the scratch tables: the same under either arena
                     rest = replay - max(
                         cake_backend.workspace_bytes(
@@ -618,18 +625,23 @@ def test_lean_byte_prediction_on_the_host() -> None:
                     assert got == max(local) + rest, (W, layout, r, H)
                     for c, a in zip(ctxs, local, strict=True):
                         single = _lean(ctx=c, H=H)
-                        assert single == a + kp.cake_kda_nondet_train_kcp_workspace_bytes(
-                            c, H=H, local_arena="replay"
-                        ) - (
-                            cake_backend.workspace_bytes(
-                                c.T_r,
-                                c.n_frag,
-                                H,
-                                sm_count=c.sm_count,
-                                fwd_layout=kp.local_fwd_layout(True),
+                        assert (
+                            single
+                            == a
+                            + kp.cake_kda_nondet_train_kcp_workspace_bytes(
+                                c, H=H, local_arena="replay"
                             )
-                            if c.T_r
-                            else 0
+                            - (
+                                cake_backend.workspace_bytes(
+                                    c.T_r,
+                                    c.n_frag,
+                                    H,
+                                    sm_count=c.sm_count,
+                                    fwd_layout=kp.local_fwd_layout(True),
+                                )
+                                if c.T_r
+                                else 0
+                            )
                         )
                         assert _lean(ctx=[c], H=H) == single
                     if H == 12:  # dqkg_int: the replay arena under either option
@@ -648,7 +660,11 @@ def test_lean_byte_prediction_on_the_host() -> None:
         kp.cake_kda_nondet_train_kcp_workspace_bytes(ctxs, H=64, local_arena="tiny")
     with pytest.raises(ValueError):
         cake_kcp.CakeKDANondetKcpWorkspace(local_arena="tiny")
-    assert cake_kcp.CakeKDANondetKcpWorkspace().local_arena == kp.LOCAL_ARENA_DEFAULT == "replay"
+    assert (
+        cake_kcp.CakeKDANondetKcpWorkspace().local_arena
+        == kp.LOCAL_ARENA_DEFAULT
+        == "replay"
+    )
 
 
 # the explicit pass-count variants of the lean arena (``lean_passes``; two is the default): fewer tail launches for
@@ -662,11 +678,15 @@ def test_lean_passes_knob_bytes_on_the_host() -> None:
     smallest arena; a forward-only workspace ignores it; the knob is validated and needs the lean arena (the
     public byte query forwards both arguments)."""
     part = _part(PROXY_PACK)
-    ctx = kp.cake_kda_nondet_train_kcp_build_context(part, None, 0, "cpu", 4, sm_count=152)
+    ctx = kp.cake_kda_nondet_train_kcp_build_context(
+        part, None, 0, "cpu", 4, sm_count=152
+    )
     fi_kcp = pytest.importorskip("flashinfer.cake_kda_nondet_train_kcp")
     for H in (4, 64):
         p = cake_backend.plan(ctx.T_r, ctx.n_frag, H, ctx.sm_count)
-        replay = kp.cake_kda_nondet_train_kcp_workspace_bytes(ctx, H=H, local_arena="replay")
+        replay = kp.cake_kda_nondet_train_kcp_workspace_bytes(
+            ctx, H=H, local_arena="replay"
+        )
         default = _lean(ctx=ctx, H=H)
         assert default == _lean(ctx=ctx, H=H, lean_passes=2) < replay
         sizes = [kp.local_lean_bytes(p, b) for b in range(1, kp.LEAN_MAX_PASSES + 1)]
@@ -689,7 +709,7 @@ def test_lean_passes_knob_bytes_on_the_host() -> None:
             assert prev is None or got <= prev, (H, b, prev, got)
             assert (
                 fi_kcp.cake_kda_nondet_train_kcp_workspace_bytes(
-                    ctx, H=H, local_arena="lean", lean_passes=b, deterministic=False
+                    ctx, H=H, local_arena="lean", lean_passes=b
                 )
                 == got
             )
@@ -708,7 +728,12 @@ def test_lean_passes_knob_bytes_on_the_host() -> None:
     for arena in ("replay", None):
         with pytest.raises(ValueError):
             cake_kcp.CakeKDANondetKcpWorkspace(local_arena=arena, lean_passes=2)
-    assert cake_kcp.CakeKDANondetKcpWorkspace(local_arena="lean", lean_passes=3).lean_passes == 3
+    assert (
+        cake_kcp.CakeKDANondetKcpWorkspace(
+            local_arena="lean", lean_passes=3
+        ).lean_passes
+        == 3
+    )
     assert cake_kcp.CakeKDANondetKcpWorkspace(local_arena="lean").lean_passes is None
 
 
@@ -755,7 +780,7 @@ def test_gpu_single_rank_workspace_views_and_route_layouts(device) -> None:
                 check(ws, "bwd", option.tail_passes)  # mapped to bwd_lean
             del ws
         fwd = cake_backend.CakeKDANondetWorkspace(
-            p, device, backward=False, fwd_layout="fwd_kcp", deterministic=False
+            p, device, backward=False, fwd_layout="fwd_kcp"
         )
         assert fwd.layout_passes == {} and fwd.bytes == p.workspace_bytes("fwd_kcp")
         check(fwd, "fwd_kcp", 1)
@@ -783,7 +808,10 @@ def test_gpu_single_rank_workspace_views_and_route_layouts(device) -> None:
 
 
 def _packs_on(device, H: int, packs) -> tuple[list, list]:
-    ctxs = [kp.cake_kda_nondet_train_kcp_build_context(_part(lengths), None, 0, device) for lengths in packs]
+    ctxs = [
+        kp.cake_kda_nondet_train_kcp_build_context(_part(lengths), None, 0, device)
+        for lengths in packs
+    ]
     ops = [_operands(device, int(c.T_r), H, 0x7815 + i) for i, c in enumerate(ctxs)]
     return ctxs, ops
 
@@ -1124,7 +1152,9 @@ def _run_lean_rank(
         if _pointers(ws) != ptrs:
             report["fail"].append(f"pointers moved r{rnd}")
     if report["lean_bytes"] != report["pred_bytes"]:
-        report["fail"].append("bytes != cake_kda_nondet_train_kcp_workspace_bytes(ctxs)")
+        report["fail"].append(
+            "bytes != cake_kda_nondet_train_kcp_workspace_bytes(ctxs)"
+        )
     if ws.local is not None and not report["lean_bytes"] < max(report["replay_bytes"]):
         report["fail"].append("lean bytes not below the replay workspace")
     if any(b is None for b in report["passes"]):

@@ -13,16 +13,15 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Host synchronization of the non-deterministic KCP route (``cake_kda_nondet_train_kcp.cake_kcp`` / ``cake_kcp_plan``,
-``deterministic=False``): pack preparation and the
-KDA / conv halo calls never copy a table from pageable memory and never wait for queued device work, with or without
-a caller-owned workspace.  The signals of a window are those of ``tests/test_helpers/cake_host_sync.py``: an upload
-counter that needs no device tracing (equal to the profiler's host-to-device copies by kind where the profiler
-traces the device), the caching allocator's device allocations, the synchronizing operations
-``torch.cuda.set_sync_debug_mode("warn")`` reports, and a queue probe (``torch.cuda._sleep`` enqueued before the
-window must still run after it, and the host must return well before it ends).  The negative control is the previous
-path (context test knobs ``upload="blocking"`` + ``table_cache="workspace"``): the same signals must report the copies
-and the waits there.  Results of the new path are bitwise those of the previous one.
+Host synchronization of the non-deterministic KCP route (``cake_kda_nondet_train_kcp.cake_kcp`` / ``cake_kcp_plan``):
+pack preparation and the KDA / conv halo calls never copy a table from pageable memory and never wait for queued device
+work, with or without a caller-owned workspace.  The signals of a window are those of
+``tests/test_helpers/cake_host_sync.py``: an upload counter that needs no device tracing (equal to the profiler's
+host-to-device copies by kind where the profiler traces the device), the caching allocator's device allocations, the
+synchronizing operations ``torch.cuda.set_sync_debug_mode("warn")`` reports, and a queue probe (``torch.cuda._sleep``
+enqueued before the window must still run after it, and the host must return well before it ends).  The negative control
+is the previous path (context test knobs ``upload="blocking"`` + ``table_cache="workspace"``): the same signals must
+report the copies and the waits there.  Results of the new path are bitwise those of the previous one.
 """
 
 import gc
@@ -178,9 +177,7 @@ def _passes(ctx, o: dict, ws, **opts) -> tuple:
         res += [out, *grads]
     leaves = [x.detach().clone().requires_grad_(True) for x in (q, k, v, g, beta)]
     out = torch.utils.checkpoint.checkpoint(
-        lambda *a: cake_kcp.cake_kda_nondet_kcp(
-            *a, ctx, None, "light", "saved", ws, deterministic=False
-        ),
+        lambda *a: cake_kcp.cake_kda_nondet_kcp(*a, ctx, None, "light", "saved", ws),
         *leaves,
         use_reentrant=False,
     )
@@ -241,12 +238,18 @@ def test_upload_knobs_are_gated_context_knobs(monkeypatch) -> None:
     part = kp.cake_kda_nondet_train_kcp_partition(list(CU), 1)
     monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", False)
     with pytest.raises(ValueError, match="enable_test_knobs"):
-        kp.cake_kda_nondet_train_kcp_build_context(part, None, 0, "cpu", _kcp_test_knobs=dict(OLD))
+        kp.cake_kda_nondet_train_kcp_build_context(
+            part, None, 0, "cpu", _kcp_test_knobs=dict(OLD)
+        )
     monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
     with pytest.raises(ValueError, match="upload must be one of"):
-        kp.cake_kda_nondet_train_kcp_build_context(part, None, 0, "cpu", _kcp_test_knobs={"upload": "x"})
+        kp.cake_kda_nondet_train_kcp_build_context(
+            part, None, 0, "cpu", _kcp_test_knobs={"upload": "x"}
+        )
     with pytest.raises(ValueError, match="table_cache must be one of"):
-        kp.cake_kda_nondet_train_kcp_build_context(part, None, 0, "cpu", _kcp_test_knobs={"table_cache": "x"})
+        kp.cake_kda_nondet_train_kcp_build_context(
+            part, None, 0, "cpu", _kcp_test_knobs={"table_cache": "x"}
+        )
     with pytest.raises(ValueError, match="needs upload='blocking'"):
         kp.cake_kda_nondet_train_kcp_build_context(
             part, None, 0, "cpu", _kcp_test_knobs={"table_cache": "workspace"}
@@ -255,12 +258,18 @@ def test_upload_knobs_are_gated_context_knobs(monkeypatch) -> None:
         part, None, 0, "cpu", _kcp_test_knobs={"upload": "blocking"}
     )
     assert (blocking.upload, blocking.table_cache) == ("blocking", "context")
-    scalar = kp.cake_kda_nondet_train_kcp_build_context(part, None, 0, "cpu", heads=torch.tensor(64))
+    scalar = kp.cake_kda_nondet_train_kcp_build_context(
+        part, None, 0, "cpu", heads=torch.tensor(64)
+    )
     assert set(scalar._head_plans) == {64}
     with pytest.raises(ValueError, match="unknown knob"):
         cake_kcp._options({"_kcp_test_knobs": {"upload": "blocking"}})
-    old = kp.cake_kda_nondet_train_kcp_build_context(part, None, 0, "cpu", _kcp_test_knobs=dict(OLD))
-    new = kp.cake_kda_nondet_train_kcp_build_context(part, None, 0, "cpu", heads=(4, 64))
+    old = kp.cake_kda_nondet_train_kcp_build_context(
+        part, None, 0, "cpu", _kcp_test_knobs=dict(OLD)
+    )
+    new = kp.cake_kda_nondet_train_kcp_build_context(
+        part, None, 0, "cpu", heads=(4, 64)
+    )
     assert (old.upload, old.table_cache) == ("blocking", "workspace")
     assert (new.upload, new.table_cache) == (
         kp.UPLOAD_DEFAULT,
@@ -300,22 +309,30 @@ def test_gpu_prepare_does_not_wait_for_queued_work(device, knobs) -> None:
     operations are counted and the queue has drained when it returns.  Rows: every rank of C / Z / D at W = 4, H = 64.
     Copy counts: the upload counter (and the profiler where it traces the device, equal to the counter)."""
     H = 64
-    warm = kp.cake_kda_nondet_train_kcp_build_context(kp.cake_kda_nondet_train_kcp_partition(list(CU), 1), None, 0, device, heads=H)
+    warm = kp.cake_kda_nondet_train_kcp_build_context(
+        kp.cake_kda_nondet_train_kcp_partition(list(CU), 1), None, 0, device, heads=H
+    )
     del warm  # the pinned staging size class and the allocator blocks are warm
     seen = 0
     for layout in kp.LAYOUTS:
-        part = kp.cake_kda_nondet_train_kcp_partition([0, 700, 701, 2001, 3000], 4, layout=layout)
+        part = kp.cake_kda_nondet_train_kcp_partition(
+            [0, 700, 701, 2001, 3000], 4, layout=layout
+        )
         for r in range(4):
 
             def prepare():
-                ctx = kp.cake_kda_nondet_train_kcp_build_context(part, None, r, device, heads=H)
+                ctx = kp.cake_kda_nondet_train_kcp_build_context(
+                    part, None, r, device, heads=H
+                )
                 return ctx, not ctx.ready.query()
 
             c = census(prepare, device)
             ctx, pending = c["out"]
             _assert_nonblocking(c, (layout, r))
             assert c["pinned"] == 1 and pending, (layout, r, summary(c))
-            ref = kp.cake_kda_nondet_train_kcp_build_context(part, None, r, "cpu", sm_count=ctx.sm_count)
+            ref = kp.cake_kda_nondet_train_kcp_build_context(
+                part, None, r, "cpu", sm_count=ctx.sm_count
+            )
             for name in ref.tables:
                 assert torch.equal(ctx.tables[name].cpu(), ref.tables[name]), name
             for name in ref.halo_tables:
@@ -353,8 +370,12 @@ def test_gpu_prepare_inside_a_capture_is_refused(device) -> None:
 def test_gpu_byte_queries_and_head_plans_are_host_only(device) -> None:
     """The byte queries and ``heads=`` touch no device: no upload is recorded on the context and the head plan's
     device tables stay unread."""
-    part = kp.cake_kda_nondet_train_kcp_partition([0, 700, 701, 2001, 3000], 4, layout="zigzag_per_document")
-    ctx = kp.cake_kda_nondet_train_kcp_build_context(part, None, 1, device, heads=(4, 64))
+    part = kp.cake_kda_nondet_train_kcp_partition(
+        [0, 700, 701, 2001, 3000], 4, layout="zigzag_per_document"
+    )
+    ctx = kp.cake_kda_nondet_train_kcp_build_context(
+        part, None, 1, device, heads=(4, 64)
+    )
     n = len(ctx._uploads)
     assert n == 1
     for H in (4, 64):
@@ -370,7 +391,9 @@ def _row_of(device: torch.device, p_class: str) -> tuple[tuple, int, int]:
     and its P."""
     sms = None
     for cu in ROW_CUS:
-        probe = kp.cake_kda_nondet_train_kcp_build_context(kp.cake_kda_nondet_train_kcp_partition(list(cu), 1), None, 0, device)
+        probe = kp.cake_kda_nondet_train_kcp_build_context(
+            kp.cake_kda_nondet_train_kcp_partition(list(cu), 1), None, 0, device
+        )
         sms = probe.sm_count
         for H in P_CLASSES[p_class]:
             P = cake_kcp.CakeKDANondetKcpWorkspace(local=False).tables(probe, H).P
@@ -396,7 +419,9 @@ def _other_of_class(cu: tuple, H: int, P: int, device: torch.device) -> tuple[in
         other = [0]
         for n in cand:
             other.append(other[-1] + n)
-        probe = kp.cake_kda_nondet_train_kcp_build_context(kp.cake_kda_nondet_train_kcp_partition(other, 1), None, 0, device)
+        probe = kp.cake_kda_nondet_train_kcp_build_context(
+            kp.cake_kda_nondet_train_kcp_partition(other, 1), None, 0, device
+        )
         if cake_kcp.CakeKDANondetKcpWorkspace(local=False).tables(probe, H).P == P:
             return tuple(other)
     raise AssertionError(f"no partition of the class of {cu} (H {H}, P {P}) found")
@@ -421,7 +446,9 @@ def test_gpu_calls_issue_no_blocking_upload(device, knobs, p_class, ws_mode) -> 
     def run(ctx, o, ws):
         return _passes(ctx, o, ws if ws_mode == "reused" else None)
 
-    warm = kp.cake_kda_nondet_train_kcp_build_context(kp.cake_kda_nondet_train_kcp_partition(list(other), 1), None, 0, device)
+    warm = kp.cake_kda_nondet_train_kcp_build_context(
+        kp.cake_kda_nondet_train_kcp_partition(list(other), 1), None, 0, device
+    )
     # the class: modules loaded, allocator blocks cached
     run(warm, _ops(warm, H, device), _new_ws())
     del warm
@@ -444,7 +471,9 @@ def test_gpu_calls_issue_no_blocking_upload(device, knobs, p_class, ws_mode) -> 
     for a, b in zip(first["out"], steady["out"], strict=True):
         assert torch.equal(a, b)
     if ws_mode == "none":
-        old = kp.cake_kda_nondet_train_kcp_build_context(part, None, 0, device, _kcp_test_knobs=dict(OLD))
+        old = kp.cake_kda_nondet_train_kcp_build_context(
+            part, None, 0, device, _kcp_test_knobs=dict(OLD)
+        )
         for _ in range(2):
             run(old, o, None)
         neg = census(lambda: run(old, o, None), device)
@@ -466,7 +495,9 @@ def test_gpu_new_path_is_bitwise_the_previous_path(device, knobs, p_class) -> No
     print(f"ROW {p_class}: documents {cu} H {H} P {P}")
     part = kp.cake_kda_nondet_train_kcp_partition(list(cu), 1)
     new = kp.cake_kda_nondet_train_kcp_build_context(part, None, 0, device)
-    old = kp.cake_kda_nondet_train_kcp_build_context(part, None, 0, device, _kcp_test_knobs=dict(OLD))
+    old = kp.cake_kda_nondet_train_kcp_build_context(
+        part, None, 0, device, _kcp_test_knobs=dict(OLD)
+    )
     o = _ops(new, H, device)
     for ws_new, ws_old in ((None, None), (_new_ws(), _new_ws())):
         a, b = _passes(new, o, ws_new), _passes(old, o, ws_old)
@@ -504,7 +535,7 @@ def test_gpu_graph_replay_issues_no_copy(device) -> None:
 
     def call(clone: bool = True):
         out, saved = cake_kcp.cake_kda_nondet_train_kcp_forward(
-            q, k, v, g, beta, ctx, workspace=ws, graph="replay", deterministic=False
+            q, k, v, g, beta, ctx, workspace=ws, graph="replay"
         )
         grads = cake_kcp.cake_kda_nondet_train_kcp_backward(
             q,
@@ -593,7 +624,9 @@ def test_gpu_side_stream_preparation_is_ordered(device, form, hook) -> None:
     holder = {}
 
     def prepare():
-        holder["ctx"] = kp.cake_kda_nondet_train_kcp_build_context(part, None, 0, device, stream=side)
+        holder["ctx"] = kp.cake_kda_nondet_train_kcp_build_context(
+            part, None, 0, device, stream=side
+        )
 
     with torch.cuda.stream(side):
         torch.cuda._sleep(sleep_cycles(device, SLEEP_MS))
@@ -681,7 +714,9 @@ def test_gpu_fresh_context_with_conv_halo_releases_everything(device) -> None:
 
     H = 2
     part = kp.cake_kda_nondet_train_kcp_partition(list(CU), 1)
-    o = _ops(kp.cake_kda_nondet_train_kcp_build_context(part, None, 0, device), H, device)
+    o = _ops(
+        kp.cake_kda_nondet_train_kcp_build_context(part, None, 0, device), H, device
+    )
     q, k, v, g, beta, dout = (o[n] for n in ("q", "k", "v", "g", "beta", "dout"))
     gen = torch.Generator(device=device).manual_seed(11)
     T = int(CU[-1])

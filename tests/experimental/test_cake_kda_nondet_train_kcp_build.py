@@ -818,7 +818,9 @@ def test_the_units_are_the_deterministic_units_under_this_packages_names(
         ):
             text = (PACKAGE_DIR / source).read_text()
             det_text = (det_dir / det_source).read_text()
-            assert text == det_text.replace("cake_kda_det_train", "cake_kda_nondet_train"), (
+            assert text == det_text.replace(
+                "cake_kda_det_train", "cake_kda_nondet_train"
+            ), (
                 name,
                 source,
             )

@@ -10,13 +10,14 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Multi-GPU rows of the non-deterministic context-parallel (KCP) KDA training route (``cake_kda_nondet_train_kcp.cake_kcp``,
-``deterministic=False``): ``W`` ranks over NCCL, each holding the fragments of one partition of a packed batch, compared with the exact FP64 per-document
-recurrence of the same operands (``tests/test_helpers/cake_kda_det_train_reference``) and with one another (saved ==
-replay, repeat, autograd == explicit, checkpoint == direct, document-alone == slice, graph replay == eager with
-every rank capturing the same calls) and with the deterministic package ``cake_kda_det_train_kcp`` on the same operands
-and context (``out``, ``dq``, ``dk``, ``dv``, ``dbeta`` bitwise; ``dg`` within the same budget and at most 1.1 times
-the deterministic error against the FP64 reference).
+Multi-GPU rows of the non-deterministic context-parallel (KCP) KDA training route
+(``cake_kda_nondet_train_kcp.cake_kcp``): ``W`` ranks over NCCL, each holding the fragments of one partition of a packed
+batch, compared with the exact FP64 per-document recurrence of the same operands
+(``tests/test_helpers/cake_kda_det_train_reference``) and with one another (saved == replay, repeat, autograd ==
+explicit, checkpoint == direct, document-alone == slice, graph replay == eager with every rank capturing the same calls)
+and with the deterministic package ``cake_kda_det_train_kcp`` on the same operands and context (``out``, ``dq``, ``dk``,
+``dv``, ``dbeta`` bitwise; ``dg`` within the same budget and at most 1.1 times the deterministic error against the FP64
+reference).
 
 Two launch forms: ``torch.multiprocessing.spawn`` (``pytest``: the ranks meet through a ``file://`` store under the
 test's temporary directory; skipped when fewer than ``W`` CUDA devices are visible or the KCP programs are not
@@ -138,7 +139,9 @@ def _partition(lengths, W: int, layout: str):
                 p = e
                 d += 1
             pos = end
-        return cake_kcp_plan.cake_kda_nondet_train_kcp_partition(cu, W, fragments=nested), cu
+        return cake_kcp_plan.cake_kda_nondet_train_kcp_partition(
+            cu, W, fragments=nested
+        ), cu
     return cake_kcp_plan.cake_kda_nondet_train_kcp_partition(cu, W, layout=layout), cu
 
 
@@ -181,7 +184,9 @@ def _run_rank(rank: int, W: int, row, rdzv: str | None, result_dir: str | None) 
         _init_group(rank, W, device, rdzv)
     group = dist.group.WORLD if W > 1 else None
     part, cu = _partition(lengths, W, layout)
-    ctx = cake_kcp_plan.cake_kda_nondet_train_kcp_build_context(part, group, rank, device)
+    ctx = cake_kcp_plan.cake_kda_nondet_train_kcp_build_context(
+        part, group, rank, device
+    )
     total = cu[-1]
     glob = make_inputs(
         lengths, H, device
@@ -192,7 +197,7 @@ def _run_rank(rank: int, W: int, row, rdzv: str | None, result_dir: str | None) 
 
     def saved_pass(**opts):
         out, saved = cake_kcp.cake_kda_nondet_train_kcp_forward(
-            q, k, v, g, beta, ctx, workspace=ws, **opts, deterministic=False
+            q, k, v, g, beta, ctx, workspace=ws, **opts
         )
         # ``boundary_mode`` is a forward keyword: the backward replays the forward whenever ``saved`` is None
         bwd_opts = {key: val for key, val in opts.items() if key != "boundary_mode"}
@@ -214,9 +219,7 @@ def _run_rank(rank: int, W: int, row, rdzv: str | None, result_dir: str | None) 
         leaves = [x.detach().clone().requires_grad_(True) for x in (q, k, v, g, beta)]
 
         def fn(*a):
-            return cake_kcp.cake_kda_nondet_kcp(
-                *a, ctx, None, "light", "saved", ws, deterministic=False
-            )
+            return cake_kcp.cake_kda_nondet_kcp(*a, ctx, None, "light", "saved", ws)
 
         if ckpt:
             from torch.utils.checkpoint import checkpoint
@@ -273,11 +276,14 @@ def _run_rank(rank: int, W: int, row, rdzv: str | None, result_dir: str | None) 
     # bitwise, and the backward that upgrades the forward-only workspace gives the same gradients; workspace=None (a
     # forward-only arena per call) through autograd too
     out_b, saved_b = cake_kcp.cake_kda_nondet_train_kcp_forward(
-        q, k, v, g, beta, ctx, workspace=ws, deterministic=False
+        q, k, v, g, beta, ctx, workspace=ws
     )
-    ws_f, ws_n = cake_kcp.CakeKDANondetKcpWorkspace(), cake_kcp.CakeKDANondetKcpWorkspace()
+    ws_f, ws_n = (
+        cake_kcp.CakeKDANondetKcpWorkspace(),
+        cake_kcp.CakeKDANondetKcpWorkspace(),
+    )
     out_f, saved_f = cake_kcp.cake_kda_nondet_train_kcp_forward(
-        q, k, v, g, beta, ctx, workspace=ws_f, deterministic=False
+        q, k, v, g, beta, ctx, workspace=ws_f
     )
     out_n, _ = cake_kcp.cake_kda_nondet_train_kcp_forward(
         q,
@@ -289,7 +295,9 @@ def _run_rank(rank: int, W: int, row, rdzv: str | None, result_dir: str | None) 
         workspace=ws_n,
         save_for_backward=False,
     )
-    pred_f = cake_kcp_plan.cake_kda_nondet_train_kcp_workspace_bytes(ctx, H=H, backward=False)
+    pred_f = cake_kcp_plan.cake_kda_nondet_train_kcp_workspace_bytes(
+        ctx, H=H, backward=False
+    )
     lazy_f = cake_kcp_plan.kcp_arena_layout(ctx, H=H, backward=False)["lazy"]
     fwd_only_bytes = (
         ws_f.bytes == pred_f
@@ -302,7 +310,7 @@ def _run_rank(rank: int, W: int, row, rdzv: str | None, result_dir: str | None) 
     # never allocates the c1 receive pool
     ws_t = cake_kcp.CakeKDANondetKcpWorkspace()
     out_t, _ = cake_kcp.cake_kda_nondet_train_kcp_forward(
-        q, k, v, g, beta, ctx, workspace=ws_t, save_transfer=False, deterministic=False
+        q, k, v, g, beta, ctx, workspace=ws_t, save_transfer=False
     )
     pred_t = cake_kcp_plan.cake_kda_nondet_train_kcp_workspace_bytes(
         ctx, H=H, backward=False, save_transfer=False
@@ -335,7 +343,7 @@ def _run_rank(rank: int, W: int, row, rdzv: str | None, result_dir: str | None) 
     except AssertionError as exc:
         carry_poisoned = f"carry_slots: {exc!r}"
     dq, dk, dv, dbeta, dg = cake_kcp.cake_kda_nondet_train_kcp_backward(
-        q, k, v, g, beta, ctx, dout, saved=saved_f, workspace=ws_f, deterministic=False
+        q, k, v, g, beta, ctx, dout, saved=saved_f, workspace=ws_f
     )
     res_fwd_only = {
         "out": out_f,
@@ -377,7 +385,7 @@ def _run_rank(rank: int, W: int, row, rdzv: str | None, result_dir: str | None) 
         # a forward-only ring workspace: no c1 receive pool, the hop pools on first use
         ws_r = cake_kcp.CakeKDANondetKcpWorkspace()
         out_r, _ = cake_kcp.cake_kda_nondet_train_kcp_forward(
-            q, k, v, g, beta, ctx, workspace=ws_r, exchange="ring", deterministic=False
+            q, k, v, g, beta, ctx, workspace=ws_r, exchange="ring"
         )
         ring_ok = ring_ok and torch.equal(out_r, res["out"])
         fwd_only_bytes = (
@@ -686,7 +694,7 @@ def _run_upload_rank(
 
     def run(c, ws, **opts) -> list:
         out, saved = cake_kcp.cake_kda_nondet_train_kcp_forward(
-            q, k, v, g, beta, c, workspace=ws, **opts, deterministic=False
+            q, k, v, g, beta, c, workspace=ws, **opts
         )
         # ``boundary_mode`` is a forward keyword
         bwd_opts = {key: val for key, val in opts.items() if key != "boundary_mode"}
@@ -709,9 +717,7 @@ def _run_upload_rank(
 
         leaves = [t.detach().clone().requires_grad_(True) for t in (q, k, v, g, beta)]
         out = checkpoint(
-            lambda *a: cake_kcp.cake_kda_nondet_kcp(
-                *a, c, None, "light", "saved", ws, deterministic=False
-            ),
+            lambda *a: cake_kcp.cake_kda_nondet_kcp(*a, c, None, "light", "saved", ws),
             *leaves,
             use_reentrant=False,
         )
@@ -728,7 +734,9 @@ def _run_upload_rank(
         )
 
     def build(**kw):
-        return cake_kcp_plan.cake_kda_nondet_train_kcp_build_context(part, group, rank, device, **kw)
+        return cake_kcp_plan.cake_kda_nondet_train_kcp_build_context(
+            part, group, rank, device, **kw
+        )
 
     def window(fn, **kw) -> dict:
         return census(fn, device, sleep_ms=DIST_SLEEP_MS, **kw)
@@ -749,7 +757,10 @@ def _run_upload_rank(
         sleep_cycles(device, DIST_SLEEP_MS)  # calibrated before any window
         old = build(_kcp_test_knobs=dict(OLD_PATH))
         ctx = build(heads=H)
-        ws, ws_old = cake_kcp.CakeKDANondetKcpWorkspace(), cake_kcp.CakeKDANondetKcpWorkspace()
+        ws, ws_old = (
+            cake_kcp.CakeKDANondetKcpWorkspace(),
+            cake_kcp.CakeKDANondetKcpWorkspace(),
+        )
         P = cake_kcp.CakeKDANondetKcpWorkspace(local=False).tables(ctx, H).P
         ref = (
             run(old, None)
@@ -1015,11 +1026,13 @@ def test_module_imports_only_torch_and_its_package() -> None:
     path's begin_call template cache, owned by the local arena and weakly keyed by the table set -- stdlib, no new
     module; ``torch.utils`` for the checkpoint hand-off, which reads the pack-hook classes of
     ``torch.utils.checkpoint`` once (``cake_kcp._handoff_frames_readable``) -- torch, no new package;
-    ``operator.itemgetter`` for the trimmed local launch plan's argument fetch -- stdlib, no new module)."""
+    ``operator.itemgetter`` for the trimmed local launch plan's argument fetch -- stdlib, no new module;
+    ``sys.modules`` for the backward's mode check, which recognizes the deterministic package's workspace type
+    without importing that package -- stdlib, no new module); ``importlib`` in ``_single_rank``, through which it
+    imports its single-rank sibling by name (README "Vendoring")."""
     import ast
 
-    src = Path(cake_kcp.__file__).read_text()
-    tree = ast.parse(src)
+    package = Path(cake_kcp.__file__).parent
     allowed = {
         "__future__",
         "dataclasses",
@@ -1036,15 +1049,19 @@ def test_module_imports_only_torch_and_its_package() -> None:
         "ctypes",
         "warnings",
         "functools",
+        "inspect",  # inspect.signature: the entry points' signatures state their keyword options (stdlib)
         "weakref",
         "operator",
-    }  # operator: itemgetter of the trimmed local launch plan's arguments; weakref: the arena-owned template cache of the trimmed host path; functools: cached_property of the trimmed host path; ctypes: the cache-config bracket of the walk-launch geometry and the capture-graph entry points of the replay cap; warnings: the one RuntimeWarning without a loadable CUDA runtime or for a degraded node cap; torch.utils: the checkpoint hand-off reads the pack-hook classes of torch.utils.checkpoint once; no other use
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for a in node.names:
-                assert a.name in allowed, a.name
-        elif isinstance(node, ast.ImportFrom) and node.level == 0:
-            assert node.module in allowed, node.module
+        "sys",  # sys.modules: the deterministic package's types are found without importing that package
+        "importlib",
+    }  # importlib: _single_rank resolves the single-rank sibling package by name (README "Vendoring"); operator: itemgetter of the trimmed local launch plan's arguments; weakref: the arena-owned template cache of the trimmed host path; functools: cached_property of the trimmed host path; ctypes: the cache-config bracket of the walk-launch geometry and the capture-graph entry points of the replay cap; warnings: the one RuntimeWarning without a loadable CUDA runtime or for a degraded node cap; torch.utils: the checkpoint hand-off reads the pack-hook classes of torch.utils.checkpoint once; no other use
+    for name in ("cake_kcp.py", "_single_rank.py"):
+        for node in ast.walk(ast.parse((package / name).read_text())):
+            if isinstance(node, ast.Import):
+                for a in node.names:
+                    assert a.name in allowed, (name, a.name)
+            elif isinstance(node, ast.ImportFrom) and node.level == 0:
+                assert node.module in allowed, (name, node.module)
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -1248,7 +1265,9 @@ def _run_rank_ckpt(
         _init_group(rank, W, device, rdzv)
     group = dist.group.WORLD
     part, cu = _partition(lengths, W, layout)
-    ctx = cake_kcp_plan.cake_kda_nondet_train_kcp_build_context(part, group, rank, device)
+    ctx = cake_kcp_plan.cake_kda_nondet_train_kcp_build_context(
+        part, group, rank, device
+    )
     glob = make_inputs(lengths, H, device)
     ops = _local_slices(part, rank, cu, glob)
     q, k, v, g, beta, dout = (ops[n] for n in ("q", "k", "v", "g", "beta", "dout"))
@@ -1285,9 +1304,7 @@ def _run_rank_ckpt(
     for form, wsp in (("per_call", None), ("caller_ws", ws)):
 
         def fn0(*a, _w=wsp):
-            return cake_kcp.cake_kda_nondet_kcp(
-                *a, ctx, None, "light", "saved", _w, deterministic=False
-            )
+            return cake_kcp.cake_kda_nondet_kcp(*a, ctx, None, "light", "saved", _w)
 
         for step in ("warm", "measure"):
             lv = leaves()
@@ -1367,7 +1384,11 @@ def _run_rank_ckpt(
 
                 def outer(q_, k_, v_, g_, b_, h_, w_):
                     # the product saves the outer region's yi (the outer recompute runs and its yi is read)
-                    hh = cake_kcp.CakeKDANondetKcpRecomputeHandle() if mode == "nested_in" else h_
+                    hh = (
+                        cake_kcp.CakeKDANondetKcpRecomputeHandle()
+                        if mode == "nested_in"
+                        else h_
+                    )
                     yi = checkpoint(fn, q_, k_, v_, g_, b_, hh, use_reentrant=False)
                     return yi * w_
 
@@ -1469,7 +1490,9 @@ def _run_rank_ckpt(
             flags[f"{tag}_modes"] = rec["modes"] == ["capture", "replay"]
             # bytes the collectives moved == the byte query of the tier (KDA alone: c1 + c2, b1 + b2; none in the
             # recompute)
-            cb = cake_kcp_plan.cake_kda_nondet_train_kcp_comm_bytes(ctx, H=H, checkpoint_keep=keep)
+            cb = cake_kcp_plan.cake_kda_nondet_train_kcp_comm_bytes(
+                ctx, H=H, checkpoint_keep=keep
+            )
             want_b = {
                 "send": {
                     "orig": cb["c1"]["send"] + cb["c2"]["send"],
@@ -1503,7 +1526,9 @@ def _run_rank_ckpt(
         e = h.entries["kda"]
         e["S_in"] = e["S_in"] + 1.0
 
-    pert, _, pert_aux = run("ckpt", cake_kcp.CakeKDANondetKcpRecomputeHandle(), tamper=perturb)
+    pert, _, pert_aux = run(
+        "ckpt", cake_kcp.CakeKDANondetKcpRecomputeHandle(), tamper=perturb
+    )
     flags["binding_control"] = n_in == 0 or (
         not pert_aux["outs_ok"] and not same(pert["dw"], plain["dw"])
     )
@@ -1542,7 +1567,11 @@ def _run_rank_ckpt(
         for keep in ("states", "transfer"):
             tag = f"handle_overlap_{keep}"
             res, rec, aux = run(
-                "ckpt", cake_kcp.CakeKDANondetKcpRecomputeHandle(), keep=keep, poison=True, **ov
+                "ckpt",
+                cake_kcp.CakeKDANondetKcpRecomputeHandle(),
+                keep=keep,
+                poison=True,
+                **ov,
             )
             counts[tag] = rec
             flags[f"{tag}_bitwise"] = eq(res, plain_ov) and eq(res, direct)
@@ -1673,9 +1702,7 @@ def _run_rank_ckpt(
     hd = cake_kcp.CakeKDANondetKcpRecomputeHandle()
     lv = leaves()
     out = checkpoint(
-        lambda *a: cake_kcp.cake_kda_nondet_kcp(
-            *a[:5], ctx, recompute_handle=a[5], deterministic=False
-        ),
+        lambda *a: cake_kcp.cake_kda_nondet_kcp(*a[:5], ctx, recompute_handle=a[5]),
         *lv,
         hd,
         use_reentrant=False,
@@ -1791,7 +1818,9 @@ def _run_rank_ckpt(
     )
     # the shared handle holds "conv" + "kda"; the three handles together = KDA states + three hist pools
     flags["layer_nbytes"] = sorted(l_hs[0].entries) == ["conv", "kda"] and l_nbytes == (
-        cake_kcp_plan.cake_kda_nondet_train_kcp_saved_bytes(ctx, H=H, checkpoint_keep="states", C=C)
+        cake_kcp_plan.cake_kda_nondet_train_kcp_saved_bytes(
+            ctx, H=H, checkpoint_keep="states", C=C
+        )
         + 2 * int(ctx.halo.n_hist_rows) * C * 2
     )
 

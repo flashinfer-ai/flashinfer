@@ -25,10 +25,10 @@ Arms (``--arms``), every one the same packed batch split by the same partition
 (``fla_cp``: by FLA's own, which gives every rank the tokens of its shard):
 
 * ``det``: the deterministic package, the objects of
-  ``flashinfer.cake_kda_det_train_kcp`` (what ``deterministic=True`` of
-  ``flashinfer.cake_kda_nondet_train_kcp`` runs), with its own partition and context;
-* ``nd``: ``flashinfer.cake_kda_nondet_train_kcp`` with ``deterministic=False`` (the
-  package ``flashinfer.experimental.cake.cake_kda_nondet_train_kcp``), with its own
+  ``flashinfer.cake_kda_det_train_kcp`` (the package
+  ``flashinfer.experimental.cake.cake_kda_det_train_kcp``), with its own partition and context;
+* ``nd``: ``flashinfer.cake_kda_nondet_train_kcp`` (the package
+  ``flashinfer.experimental.cake.cake_kda_nondet_train_kcp``), with its own
   partition and context;
 * ``control``: the ``nd`` path again (the same programs; its ratio to ``nd``
   measures the protocol's own noise and must stay within the control band);
@@ -39,7 +39,7 @@ Arms (``--arms``), every one the same packed batch split by the same partition
   ``nd_off / nd`` is the hand-off's gain on ``ckpt`` (and ~1 on the other
   boundaries, where it never engages);
 * ``local``: the single-rank non-deterministic Cake kernels
-  (``flashinfer.cake_kda_nondet_train.cake_kda_nondet`` with ``deterministic=False``, after
+  (``flashinfer.cake_kda_nondet_train.cake_kda_nondet``, after
   the single-rank convolution) on the rank's shard as if it were a batch of its
   own (no exchange; the per-rank work without the boundaries);
 * ``fla``: flash-linear-attention's ``chunk_kda`` on the rank's shard (after the
@@ -338,9 +338,11 @@ def make_problem(args, rank: int, world: int, device: torch.device) -> dict[str,
             "the two packages' partitions of the batch differ; the arms would not time the same shards"
         )
     build = {
-        "det": lambda: cake_kda_det_train_kcp_build_context(part_det, group, rank, device),
+        "det": lambda: cake_kda_det_train_kcp_build_context(
+            part_det, group, rank, device
+        ),
         "nd": lambda: cake_kda_nondet_train_kcp_build_context(
-            part_nd, group, rank, device, deterministic=False
+            part_nd, group, rank, device
         ),
     }
     ctx = {arm: build[arm]() for arm in CAKE_ARMS[args.build_order]}
@@ -615,7 +617,7 @@ def _forward(arm: str, problem: dict[str, Any], conv: bool, fla_chunk_kda=None):
             fwd,
             problem,
             lambda da, db: cake_kda_nondet_train_kcp_reduce_gate_param_grads(
-                ctx, da, db, deterministic=False
+                ctx, da, db
             ),
         )
 
@@ -1133,7 +1135,9 @@ def run(args, rank: int, world: int, device: torch.device) -> dict[str, Any]:
     ctx_det, ctx_nd = problem["ctx"]["det"], problem["ctx"]["nd"]
     nbytes = {
         "det": {
-            "workspace": cake_kda_det_train_kcp_workspace_bytes(ctx_det, H=H, C=C, **modes),
+            "workspace": cake_kda_det_train_kcp_workspace_bytes(
+                ctx_det, H=H, C=C, **modes
+            ),
             "saved": cake_kda_det_train_kcp_saved_bytes(ctx_det, H=H, C=C, **modes),
             "comm": cake_kda_det_train_kcp_comm_bytes(ctx_det, H=H, C=C),
         },
@@ -1141,12 +1145,10 @@ def run(args, rank: int, world: int, device: torch.device) -> dict[str, Any]:
             "workspace": cake_kda_nondet_train_kcp_workspace_bytes(
                 ctx_nd, H=H, C=C, **modes
             ),
-            "saved": cake_kda_nondet_train_kcp_saved_bytes(
-                ctx_nd, H=H, C=C, **modes
-            ),
+            "saved": cake_kda_nondet_train_kcp_saved_bytes(ctx_nd, H=H, C=C, **modes),
             "saved_handoff": (
                 cake_kda_nondet_train_kcp_saved_bytes(
-                    ctx_nd, H=H, C=C, checkpoint_handoff=True, deterministic=False
+                    ctx_nd, H=H, C=C, checkpoint_handoff=True
                 )
                 if handoff_mode
                 else None
@@ -1346,10 +1348,6 @@ def main() -> int:
     if args.ckpt_handoff not in ("auto", "on", "off"):
         parser.error(
             f"${HANDOFF_ENV}={args.ckpt_handoff!r}: expected auto, on or off (or unset)"
-        )
-    if torch.are_deterministic_algorithms_enabled():
-        parser.error(
-            "torch's deterministic algorithms are enabled: deterministic=False would run the deterministic package"
         )
     rank, world, device = _init()
     report = run(args, rank, world, device)

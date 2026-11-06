@@ -66,7 +66,9 @@ def _context(lengths: list[int], cp: int, fragments: int):
     cu = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int64)
     part = kcp_plan.cake_kda_nondet_train_kcp_partition(cu, cp, "zigzag_per_document")
     assert sum(len(f) for f in part.fragments) == fragments
-    return cu, kcp_plan.cake_kda_nondet_train_kcp_build_context(part, None, 0, "cpu", heads=HEADS)
+    return cu, kcp_plan.cake_kda_nondet_train_kcp_build_context(
+        part, None, 0, "cpu", heads=HEADS
+    )
 
 
 @pytest.fixture(scope="module")
@@ -192,7 +194,9 @@ class _Layer(nn.Module):
         self.proj = nn.Linear(width, width)
 
     def forward(self, x: torch.Tensor, meta: BatchMeta) -> torch.Tensor:
-        assert meta.kcp is None or isinstance(meta.kcp, kcp_plan.CakeKDANondetKcpContext)
+        assert meta.kcp is None or isinstance(
+            meta.kcp, kcp_plan.CakeKDANondetKcpContext
+        )
         return self.proj(x)
 
 

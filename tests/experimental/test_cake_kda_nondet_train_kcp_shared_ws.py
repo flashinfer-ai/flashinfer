@@ -38,7 +38,10 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from tests.experimental.test_cake_kda_nondet_train_kcp_dist import _init_group, _rendezvous
+from tests.experimental.test_cake_kda_nondet_train_kcp_dist import (
+    _init_group,
+    _rendezvous,
+)
 from tests.test_helpers.cake_host_sync import (
     allocator_counts,
     census,
@@ -120,14 +123,24 @@ def test_byte_query_of_a_list_is_the_per_pool_max() -> None:
             parts = [_part(lengths, W, layout) for lengths in PACKS]
             for r in range(W):
                 ctxs = [
-                    kp.cake_kda_nondet_train_kcp_build_context(p, None, r, "cpu", 4, sm_count=SM_COUNT)
+                    kp.cake_kda_nondet_train_kcp_build_context(
+                        p, None, r, "cpu", 4, sm_count=SM_COUNT
+                    )
                     for p in parts
                 ]
                 for H in HEADS:
                     for backward in (True, False):
                         kw = {"H": H, "backward": backward}
-                        single = [kp.cake_kda_nondet_train_kcp_workspace_bytes(c, **kw) for c in ctxs]
-                        assert kp.cake_kda_nondet_train_kcp_workspace_bytes([ctxs[0]], **kw) == single[0]
+                        single = [
+                            kp.cake_kda_nondet_train_kcp_workspace_bytes(c, **kw)
+                            for c in ctxs
+                        ]
+                        assert (
+                            kp.cake_kda_nondet_train_kcp_workspace_bytes(
+                                [ctxs[0]], **kw
+                            )
+                            == single[0]
+                        )
                         lays = [kp.kcp_arena_layout(c, **kw) for c in ctxs]
                         need = {
                             key[5:]: max(lay[key] for lay in lays)
@@ -198,11 +211,15 @@ def test_reserve_floor_and_allocate_false_size_forwards_for_the_backward() -> No
     sizes the backward pools too (no forward-only state to upgrade); ``allocate=False`` allocates nothing until the
     first ensure; a workspace without a context keeps today's forward-only first state."""
     part = _part((1000, 577), 4, "zigzag_per_document")
-    ctx = kp.cake_kda_nondet_train_kcp_build_context(part, None, 1, "cpu", 4, sm_count=SM_COUNT)
+    ctx = kp.cake_kda_nondet_train_kcp_build_context(
+        part, None, 1, "cpu", 4, sm_count=SM_COUNT
+    )
     full = kp.kcp_arena_layout(ctx, H=4)["arena"]
     fwd = kp.kcp_arena_layout(ctx, H=4, backward=False)["arena"]
     assert fwd < full
-    ws = cake_kcp.CakeKDANondetKcpWorkspace(ctx, 4, device="cpu", local=False, allocate=False)
+    ws = cake_kcp.CakeKDANondetKcpWorkspace(
+        ctx, 4, device="cpu", local=False, allocate=False
+    )
     assert ws.bytes == 0 and not ws._pools and ws.local is None
     ws.ensure(ctx, 4, device="cpu", backward=False)
     assert ws.bytes == full and ws.has("b1_send")
@@ -226,7 +243,9 @@ def test_shared_workspace_holds_no_context_and_bounds_its_caches() -> None:
     ws = cake_kcp.CakeKDANondetKcpWorkspace(local=False)
     refs = []
     for _ in range(3):
-        ctx = kp.cake_kda_nondet_train_kcp_build_context(part, None, 0, "cpu", 4, sm_count=SM_COUNT)
+        ctx = kp.cake_kda_nondet_train_kcp_build_context(
+            part, None, 0, "cpu", 4, sm_count=SM_COUNT
+        )
         tb = ws.ensure(ctx, 64, device="cpu", backward=True, host_trim=True)
         assert ws.ensure(ctx, 64, device="cpu", backward=True, host_trim=True) is tb
         refs.append((weakref.ref(ctx), weakref.ref(tb)))
@@ -235,7 +254,9 @@ def test_shared_workspace_holds_no_context_and_bounds_its_caches() -> None:
     assert all(a() is None and b() is None for a, b in refs)
     assert ws._fast and all(rec[0]() is None for rec in ws._fast.values())
     # a dead ensure record misses: the next ensure takes the full path
-    ctx = kp.cake_kda_nondet_train_kcp_build_context(part, None, 0, "cpu", 4, sm_count=SM_COUNT)
+    ctx = kp.cake_kda_nondet_train_kcp_build_context(
+        part, None, 0, "cpu", 4, sm_count=SM_COUNT
+    )
     assert ws.ensure(ctx, 64, device="cpu", backward=True, host_trim=True) is not None
     n = ws._pools["c1_send"].numel()
     for i in range(1, cake_kcp.SLICE_CACHE_MAX + 50):
@@ -260,7 +281,9 @@ def test_shared_workspace_holds_no_context_and_bounds_its_caches() -> None:
     ws.tables = real
     part = _part((50, 640, 77))
     for _ in range(cake_kcp.ENSURE_CACHE_MAX + 10):
-        c = kp.cake_kda_nondet_train_kcp_build_context(part, None, 0, "cpu", 4, sm_count=SM_COUNT)
+        c = kp.cake_kda_nondet_train_kcp_build_context(
+            part, None, 0, "cpu", 4, sm_count=SM_COUNT
+        )
         ws.ensure(c, 64, device="cpu", backward=True, host_trim=True)
         assert len(ws._fast) <= cake_kcp.ENSURE_CACHE_MAX
 
@@ -310,7 +333,9 @@ def _operands(device, T: int, H: int, seed: int) -> dict:
 
 def _packs(device, H: int, packs=PACKS, W: int = 1, rank: int = 0, layout="contiguous"):
     ctxs = [
-        kp.cake_kda_nondet_train_kcp_build_context(_part(lengths, W, layout), None, rank, device)
+        kp.cake_kda_nondet_train_kcp_build_context(
+            _part(lengths, W, layout), None, rank, device
+        )
         for lengths in packs
     ]
     ops = [_operands(device, int(c.T_r), H, 0x7815 + i) for i, c in enumerate(ctxs)]
@@ -389,7 +414,7 @@ def _schedule(ctxs, ops, wss, *, poison=None, **kw) -> list[dict]:
         ]
         out = torch.utils.checkpoint.checkpoint(
             lambda *a, i=i: cake_kcp.cake_kda_nondet_kcp(
-                *a, ctxs[i], None, "light", "saved", wss[i], **kw, deterministic=False
+                *a, ctxs[i], None, "light", "saved", wss[i], **kw
             ),
             *lf,
             use_reentrant=False,
@@ -425,14 +450,18 @@ def test_gpu_reserved_shared_workspace_is_bitwise_per_pack(device) -> None:
     seen_p1 = seen_pn = 0
     for H in HEADS:
         ctxs, ops = _packs(device, H)
-        Ps = [cake_kcp.CakeKDANondetKcpWorkspace(local=False).tables(c, H).P for c in ctxs]
+        Ps = [
+            cake_kcp.CakeKDANondetKcpWorkspace(local=False).tables(c, H).P for c in ctxs
+        ]
         seen_p1 += sum(P == 1 for P in Ps)
         seen_pn += sum(P > 1 for P in Ps)
         per = [_new_ws() for _ in ctxs]
         for c, w in zip(ctxs, per, strict=True):
             w.ensure(c, H, device=device, backward=True)
         per_bytes = [w.bytes for w in per]
-        assert per_bytes == [kp.cake_kda_nondet_train_kcp_workspace_bytes(c, H=H) for c in ctxs]
+        assert per_bytes == [
+            kp.cake_kda_nondet_train_kcp_workspace_bytes(c, H=H) for c in ctxs
+        ]
         per_arena = max(w.local.bytes for w in per)
         ref = _schedule(ctxs, ops, per)
         del per
@@ -529,14 +558,17 @@ def test_gpu_allocate_false_sizes_the_first_forward_for_the_backward(device) -> 
         torch.cuda.synchronize(device)
         assert torch.cuda.memory_allocated(device) == base and ws.bytes == 0
         out, saved = _fwd(ctx, o, ws)
-        assert ws.local.backward and ws.bytes == kp.cake_kda_nondet_train_kcp_workspace_bytes(ctx, H=H)
+        assert (
+            ws.local.backward
+            and ws.bytes == kp.cake_kda_nondet_train_kcp_workspace_bytes(ctx, H=H)
+        )
         ptrs = _pointers(ws)
         torch.cuda.synchronize(device)
         before = torch.cuda.memory_allocated(device)
         grads = _bwd(ctx, o, ws, saved)
-        assert _pointers(ws) == ptrs and ws.bytes == kp.cake_kda_nondet_train_kcp_workspace_bytes(
-            ctx, H=H
-        )
+        assert _pointers(
+            ws
+        ) == ptrs and ws.bytes == kp.cake_kda_nondet_train_kcp_workspace_bytes(ctx, H=H)
         assert torch.equal(out, out_r) and _same(grads, grads_r), H
         assert _same(written_tensors(saved), written_tensors(saved_r)), H
         del grads
@@ -566,7 +598,7 @@ def test_gpu_four_pack_step_peak_drops_by_sum_minus_max(device) -> None:
             outs.append(
                 torch.utils.checkpoint.checkpoint(
                     lambda *a, c=c, i=i: cake_kcp.cake_kda_nondet_kcp(
-                        *a, c, None, "light", "saved", wss[i], deterministic=False
+                        *a, c, None, "light", "saved", wss[i]
                     ),
                     *lf,
                     use_reentrant=False,
@@ -993,7 +1025,8 @@ def test_gpu_graph_replay_on_a_reserved_shared_workspace(device) -> None:
         assert ws.local is not old
         for e in cake_kcp._GRAPHS.values():
             assert not any(
-                isinstance(p, cake_backend.CakeKDANondetWorkspace) and p.arena is old.arena
+                isinstance(p, cake_backend.CakeKDANondetWorkspace)
+                and p.arena is old.arena
                 for p in e.pins
             )
     finally:
@@ -1335,7 +1368,9 @@ def _rank_packs(rank: int, W: int, row, rdzv: str | None):
         _init_group(rank, W, device, rdzv)
     group = dist.group.WORLD if W > 1 else None
     ctxs = [
-        kp.cake_kda_nondet_train_kcp_build_context(_part(lengths, W, layout), group, rank, device)
+        kp.cake_kda_nondet_train_kcp_build_context(
+            _part(lengths, W, layout), group, rank, device
+        )
         for lengths in packs
     ]
     ops = [
@@ -1364,7 +1399,9 @@ def _run_dist_rank(
     per = [_new_ws() for _ in ctxs]
     ref = _schedule(ctxs, ops, per, **kw)
     report["per_pack_bytes"] = [w.bytes for w in per]
-    report["P"] = [cake_kcp.CakeKDANondetKcpWorkspace(local=False).tables(c, H).P for c in ctxs]
+    report["P"] = [
+        cake_kcp.CakeKDANondetKcpWorkspace(local=False).tables(c, H).P for c in ctxs
+    ]
     del per
     gc.collect()
     torch.cuda.synchronize(device)
@@ -1398,7 +1435,9 @@ def _run_dist_rank(
         if _pointers(ws) != ptrs:
             report["fail"].append(f"pointers moved r{rnd}")
     if report["shared_bytes"] != report["pred_bytes"]:
-        report["fail"].append("bytes != cake_kda_nondet_train_kcp_workspace_bytes(ctxs)")
+        report["fail"].append(
+            "bytes != cake_kda_nondet_train_kcp_workspace_bytes(ctxs)"
+        )
     # the caching allocator may hand out a cached block up to 1 MiB larger than a request without splitting it
     if not (
         report["rounded"]
