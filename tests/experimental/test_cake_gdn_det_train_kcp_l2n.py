@@ -43,7 +43,7 @@ from fractions import Fraction
 import pytest
 import torch
 
-PACKAGE = "flashinfer.experimental.cake_gdn_det_train_kcp"
+PACKAGE = "flashinfer.experimental.cake.cake_gdn_det_train_kcp"
 
 
 def _mod(sub: str | None = None):

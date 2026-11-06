@@ -172,13 +172,12 @@ SELECT_RULES = ("always", "columns", "ctas_per_head")
 
 
 def _registry():
-    """The registry module, or a skip while the seed registry is not in the tree yet."""
-    return pytest.importorskip(f"{PACKAGE_IMPORT}.cake_jit")
+    """The registry module."""
+    return importlib.import_module(f"{PACKAGE_IMPORT}.cake_jit")
 
 
 def _backend():
-    """The backend module; it imports the registry, so it skips with it while the seed registry is not in the tree."""
-    _registry()
+    """The backend module."""
     return importlib.import_module(f"{PACKAGE_IMPORT}.cake_backend")
 
 

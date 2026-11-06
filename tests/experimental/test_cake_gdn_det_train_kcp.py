@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-CPU tests of the GDN KCP metadata layer of ``flashinfer.experimental.cake_gdn_det_train_kcp``: the package-local plan
+CPU tests of the GDN KCP metadata layer of ``flashinfer.experimental.cake.cake_gdn_det_train_kcp``: the package-local plan
 module against ``cake_kda_det_train_kcp.cake_kcp_plan`` (field-identical partitions and contexts on the step-0 rows with
 ``H := HV``, except the b1 buffer with maps, ``B1_DM_FIELDS``, which has this package's own dense layout; the KDA
 package is imported HERE only, never by the package), the per-rank crossing counts and
@@ -55,7 +55,7 @@ def _package(submodule: str):
         return cake_package("cake_gdn_det_train_kcp", submodule)
     except KeyError:  # the registry entry is added by the package scaffolding lane
         return importlib.import_module(
-            f"flashinfer.experimental.cake_gdn_det_train_kcp.{submodule}"
+            f"flashinfer.experimental.cake.cake_gdn_det_train_kcp.{submodule}"
         )
 
 
@@ -1836,7 +1836,7 @@ def test_registry_seed() -> None:
     }
     # the rendered manifests: one library per shipped record and exported arch; the test-only walks likewise
     manifest = json.loads((PACKAGE_DIR / "build.json").read_text())
-    assert manifest["package"] == "flashinfer.experimental.cake_gdn_det_train_kcp"
+    assert manifest["package"] == "flashinfer.experimental.cake.cake_gdn_det_train_kcp"
     n_libs = len(manifest["libraries"])
     assert n_libs == len(gj.MODULES) * len(gj.ARCHES)
     assert {lib["arch"] for lib in manifest["libraries"]} == set(gj.ARCHES)

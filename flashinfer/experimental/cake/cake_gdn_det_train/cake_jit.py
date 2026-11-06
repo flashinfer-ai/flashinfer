@@ -90,7 +90,7 @@ ARCHES = ("sm_100a", "sm_103a", "sm_107a")
 ARCH_BY_CAPABILITY = {(10, 0): "sm_100a", (10, 3): "sm_103a", (10, 7): "sm_107a"}
 CHUNK = 64
 HEAD_DIM = 128
-PACKAGE = "flashinfer.experimental.cake_gdn_det_train"
+PACKAGE = "flashinfer.experimental.cake.cake_gdn_det_train"
 LIBRARY_PREFIX = "cake_gdn_det_train"
 MANIFEST = "build.json"
 

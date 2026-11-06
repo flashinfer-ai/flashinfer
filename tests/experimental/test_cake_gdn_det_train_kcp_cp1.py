@@ -34,6 +34,8 @@ table and byte-query tests in ``test_cake_gdn_det_train_kcp.py``.
 
 from __future__ import annotations
 
+import importlib
+
 import pytest
 import torch
 
@@ -50,10 +52,7 @@ from tests.test_helpers.cake_gdn_det_train_kcp_reference import (
     reference_pack,
 )
 
-gdn_api = pytest.importorskip(
-    "flashinfer.cake_gdn_det_train_kcp",
-    reason="the flashinfer.cake_gdn_det_train_kcp facade is not part of this tree",
-)
+gdn_api = importlib.import_module("flashinfer.cake_gdn_det_train_kcp")
 
 # Accuracy gate, declared before the first run: every output elementwise within
 # ``|cand - ref| <= ATOL + RTOL * |ref|`` of the exact FP64 reference of the same BF16 / FP32 inputs with ZERO
@@ -334,7 +333,9 @@ def test_plain_split_views_keep_hooks_and_bitwise_gradients(
     (``dq | dk | dv``), ``dg`` and ``dbeta``, with the in-kernel norm off and on, direct and checkpointed.  Plain views
     keep torch's autograd path: their tensor hooks and ``retain_grad`` (and those on the split outputs) fire once
     with the gradient, and only the packed views' split hands the packed dQKV row on without a concatenation."""
-    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_det_train_kcp.cake_kcp")
+    kcp = importlib.import_module(
+        "flashinfer.experimental.cake.cake_gdn_det_train_kcp.cake_kcp"
+    )
     H, HV = heads
     cu = _cu(lengths)
     T = cu[-1]
@@ -408,7 +409,9 @@ def test_backward_refuses_the_non_deterministic_forwards_saved_set_and_workspace
     """A saved set and a caller-held workspace of the non-deterministic package's forward (kernels, same tokens) are
     refused by the deterministic package backward with ``ValueError`` naming the deterministic mode and the expected
     type; the deterministic forward's own saved set and workspace still run."""
-    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_det_train_kcp.cake_kcp")
+    kcp = importlib.import_module(
+        "flashinfer.experimental.cake.cake_gdn_det_train_kcp.cake_kcp"
+    )
     nd = pytest.importorskip(
         "flashinfer.experimental.cake_gdn_train_kcp",
         reason="the non-deterministic package is not part of this tree",
@@ -452,8 +455,8 @@ def test_every_launch_binds_the_caller_stream_once(device, monkeypatch, ckpt) ->
     call on the default stream."""
     from torch.utils.checkpoint import checkpoint
 
-    be = pytest.importorskip(
-        "flashinfer.experimental.cake_gdn_det_train_kcp.cake_backend"
+    be = importlib.import_module(
+        "flashinfer.experimental.cake.cake_gdn_det_train_kcp.cake_backend"
     )
     cu = _cu((100, 640, 77, 1000, 129))
     inputs = make_inputs(cu, 2, 6)
@@ -516,8 +519,8 @@ ISSUE_CU = [
 def test_context_preparation_does_not_synchronize(device) -> None:
     """``partition_det_kcp`` + ``build_context_det_kcp`` + ``prepare`` of a new layout make no synchronizing CUDA call (the
     tables travel in pinned, asynchronous copies), and every device table is bitwise the table built on the CPU."""
-    plan = pytest.importorskip(
-        "flashinfer.experimental.cake_gdn_det_train_kcp.cake_kcp_plan"
+    plan = importlib.import_module(
+        "flashinfer.experimental.cake.cake_gdn_det_train_kcp.cake_kcp_plan"
     )
     torch.cuda.synchronize(device)
     torch.cuda.set_sync_debug_mode("error")
@@ -611,9 +614,11 @@ def test_workspace_bytes_match_what_the_backward_binds(device, cu, heads) -> Non
 
     from torch.utils.checkpoint import checkpoint
 
-    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_det_train_kcp.cake_kcp")
-    gb = pytest.importorskip(
-        "flashinfer.experimental.cake_gdn_det_train_kcp.cake_bytes"
+    kcp = importlib.import_module(
+        "flashinfer.experimental.cake.cake_gdn_det_train_kcp.cake_kcp"
+    )
+    gb = importlib.import_module(
+        "flashinfer.experimental.cake.cake_gdn_det_train_kcp.cake_bytes"
     )
     H, HV = heads
     inputs = make_inputs(cu, H, HV)
@@ -695,7 +700,9 @@ def test_reuse_recompute_tapes_auto_follows_the_region_shape(
     (``holders_remain``); ``True`` always hands off (``always``), ``False`` never (``off``).  Every form is bitwise the
     direct autograd result, the registry is empty afterwards, and the ``"auto"`` backward -- the recompute forward,
     the frame proof over the autograd graph, the take -- makes no synchronizing CUDA call."""
-    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_det_train_kcp.cake_kcp")
+    kcp = importlib.import_module(
+        "flashinfer.experimental.cake.cake_gdn_det_train_kcp.cake_kcp"
+    )
     H, HV = 2, 6
     cu = [0, 1500, 4200, 6144]
     inputs = make_inputs(cu, H, HV)
@@ -888,9 +895,11 @@ def test_fused_output_walk_is_bitwise_the_split_forward(
     saver, the replay form, three layers with a later saver, a recompute handle), two segments, both value widths,
     the in-kernel L2 norm and the graph replay, each with test knob ``fused_o`` 1 and 0 (split twice): every tensor
     bitwise equal."""
-    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_det_train_kcp.cake_kcp")
-    backend = pytest.importorskip(
-        "flashinfer.experimental.cake_gdn_det_train_kcp.cake_backend"
+    kcp = importlib.import_module(
+        "flashinfer.experimental.cake.cake_gdn_det_train_kcp.cake_kcp"
+    )
+    backend = importlib.import_module(
+        "flashinfer.experimental.cake.cake_gdn_det_train_kcp.cake_backend"
     )
     if not kcp.fused_o_shipped(backend.device_arch(device.index)):
         pytest.skip("the registry ships no output walk for this architecture")
@@ -943,7 +952,9 @@ def test_full_backward_without_save_transfer_matches_light_on_poisoned_memory(
     ``M_seg^T`` staging plane the backward's merges read) shows up as a non-finite gradient.  The saved set carries
     ``M_seg``; the full form gives the light form's bits (out and the five gradients) on a per-call, a fresh and a
     shared workspace (twice on the shared one) and under a non-reentrant checkpoint."""
-    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_det_train_kcp.cake_kcp")
+    kcp = importlib.import_module(
+        "flashinfer.experimental.cake.cake_gdn_det_train_kcp.cake_kcp"
+    )
     real_alloc = kcp._alloc
 
     def nan_alloc(shape, dtype, dev):

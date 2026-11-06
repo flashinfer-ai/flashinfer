@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Backend suite of the Cake deterministic GDN chunked-training package
-(``flashinfer.experimental.cake_gdn_det_train``).
+(``flashinfer.experimental.cake.cake_gdn_det_train``).
 
 Without a device: the registry (one record per stage and architecture, the argument plans of the call sites, the
 scan constants, the ``dhu_tc2`` selection constants and the ``prep_tma`` window), the build manifest (every record's

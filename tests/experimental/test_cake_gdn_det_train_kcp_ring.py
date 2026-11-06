@@ -35,7 +35,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-PACKAGE = "flashinfer.experimental.cake_gdn_det_train_kcp"
+PACKAGE = "flashinfer.experimental.cake.cake_gdn_det_train_kcp"
 W = 4
 H_QK, HV = 2, 4
 # contiguous layout: 256 tokens per rank

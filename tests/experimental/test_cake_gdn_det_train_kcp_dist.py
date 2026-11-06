@@ -68,7 +68,7 @@ import torch.multiprocessing as mp
 
 from tests.test_helpers.kcp_collective_shims import CollectiveCounter, RecomputePhase
 
-PACKAGE = "flashinfer.experimental.cake_gdn_det_train_kcp"
+PACKAGE = "flashinfer.experimental.cake.cake_gdn_det_train_kcp"
 
 
 def _mod(sub: str | None = None):
@@ -2087,7 +2087,7 @@ def test_public_api_cannot_select_test_programs() -> None:
     """The precision policy: the shipped record is ``precision_mode=0`` / ``transfer_walk="tf32_hilo"``;
     the test-only records (1 ``_three_mma``, 2 ``_plain_tf32``, ``"bf16x3"``) are refused unless ``test_knobs`` names
     the same value; nothing in the environment changes that (there is no environment hook)."""
-    from flashinfer.experimental.cake_gdn_det_train_kcp import cake_options
+    from flashinfer.experimental.cake.cake_gdn_det_train_kcp import cake_options
 
     for mode in (1, 2):
         with pytest.raises(ValueError):

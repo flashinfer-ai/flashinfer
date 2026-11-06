@@ -25,7 +25,7 @@ Import the entry point explicitly; nothing in `flashinfer` imports this
 package.
 
 ```python
-from flashinfer.experimental.cake_gdn_det_train import chunk_gated_delta_rule_det
+from flashinfer.experimental.cake.cake_gdn_det_train import chunk_gated_delta_rule_det
 
 o, final_state = chunk_gated_delta_rule_det(
     q, k, v, g, beta,                    # [B, T, H, 128] / [B, T, HV, 128] bf16; g, beta [B, T, HV]

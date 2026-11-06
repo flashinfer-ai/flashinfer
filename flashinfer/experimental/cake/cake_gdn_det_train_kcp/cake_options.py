@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Options of the context-parallel (KCP) packed GDN training route
-(``flashinfer.experimental.cake_gdn_det_train_kcp``): every behaviour switch of the
+(``flashinfer.experimental.cake.cake_gdn_det_train_kcp``): every behaviour switch of the
 entry points is a keyword-only field of :class:`OptionsDetKcp`, validated once
 per call by :meth:`OptionsDetKcp.check`.  No field is read from the environment;
 the package reads ``os.environ`` nowhere.
