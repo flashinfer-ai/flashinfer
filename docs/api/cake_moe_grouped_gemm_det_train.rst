@@ -154,9 +154,13 @@ Prepared launches
 
 Each one validates the arguments, binds one generated program and returns a
 ``CakeMoEGroupedGemmDetLaunch`` (also importable from the module) whose ``launch()``
-performs no allocation and no host synchronisation and is CUDA-graph capturable; the
-same prepared launch stays valid when new offsets or values are written into the bound
-tensors.  The backend package holds plain functions of the same names; a build that
+performs no host synchronisation and is CUDA-graph capturable; the same prepared launch
+stays valid when new offsets or values are written into the bound tensors.  A launch
+allocates only the stream workspaces of its programs (the scheduler and wave buffers,
+described in the ``cake_backend`` module docstring): the first launch on a CUDA stream
+allocates that stream's buffers, later launches on the same stream reuse them and
+allocate nothing, and a launch during a CUDA-graph capture, or for a device other than
+the current one, allocates a set of its own (from the graph's pool under capture).  The backend package holds plain functions of the same names; a build that
 vendors the package calls them directly.
 
 Support query

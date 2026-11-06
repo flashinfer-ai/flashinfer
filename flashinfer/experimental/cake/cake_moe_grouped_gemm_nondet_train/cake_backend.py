@@ -1407,8 +1407,12 @@ class CakeMoEGroupedGemmNondetLaunch:
     """One prepared ragged grouped GEMM of the non-deterministic package.
 
     ``launch()`` runs the bound program on the current torch stream into the
-    caller-owned ``out`` with no CUDA allocation and no host synchronisation
-    and returns ``out``.  Each launch passes the operands' TMA descriptors by
+    caller-owned ``out`` with no host synchronisation and returns ``out``.  It
+    allocates only the stream workspaces (module docstring): a launch allocates
+    the current stream's buffer of a kind when the stream has none yet or a
+    smaller one than the launch needs (the split-tail sums and tickets), later
+    launches on that stream allocate nothing, and a launch under capture or for
+    another device allocates a set of its own.  Each launch passes the operands' TMA descriptors by
     value (encoded by the binding from the bound tensors' metadata), and the
     kernels read ``offs`` on device at every launch, so the same prepared
     launch (or a CUDA Graph capturing it) stays valid when the caller writes
