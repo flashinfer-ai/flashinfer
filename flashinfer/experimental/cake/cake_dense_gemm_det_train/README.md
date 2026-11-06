@@ -1,48 +1,64 @@
-# Cake dense projection GEMM backend (SM100 / SM107)
+# Cake dense GEMM training backend, deterministic (SM100 / SM103 / SM107)
 
-Experimental backend for the GLM-5.2 training GEMMs: the BF16 dense projection
-GEMM (K1 -- BF16 operands, FP32 accumulation, BF16 or FP32 output, strided
-views, ragged token counts, batched head projections) and the FP32 router-gate
-GEMM through split-BF16x3 tensor-core emulation with chunked FP32 promotion
-(K2).  Tracking issue: flashinfer-ai/flashinfer#5677.
+Backend of `flashinfer.cake_dense_gemm_det_train`: the GLM-5.2 training GEMMs, the BF16 dense projection
+GEMM (K1 -- BF16 operands, FP32 accumulation, BF16 or FP32 output, strided views, ragged token counts,
+batched head projections) and the FP32 router-gate GEMM through split-BF16x3 tensor-core emulation with
+chunked FP32 promotion (K2).  Tracking issue: flashinfer-ai/flashinfer#5677.
 
-Both the API and the backend are experimental: no compatibility guarantee.
 SM107 (Rubin R200) is the primary architecture; SM100 (B200 / GB200) is built
 from the same sources and, for five input-gradient rows, ships the knob-free
 eight-warp CTA form of the GEMM (one program, measured on GB200); SM103 (B300 /
 GB300) ships its own builds of the same programs and, for six input-gradient
 rows, the eight-warp CTA form in two programs (`cake_jit.KERNELS` lists the registered architectures).  A device whose architecture the registry does not
-list raises `NotImplementedError` naming the missing instance.  The feature has
-no core entry point yet (importing this package is
-the explicit opt-in) and does not participate in automatic backend selection,
-autotuning or trace-apply.  Its libraries are loaded prebuilt from `aot/` when
-the package ships them and JIT-built by FlashInfer from `build.json` otherwise
-(see "Layout of this package").
+list raises `NotImplementedError` naming the missing instance;
+`is_cake_dense_gemm_det_train_supported(device)` reports whether a device is a supported architecture.  The
+backend does not participate in automatic backend selection, autotuning or trace-apply.  Its libraries are
+loaded prebuilt from `aot/` when the package ships them and JIT-built by FlashInfer from `build.json`
+otherwise (see "Layout of this package").
 
+## Names and mode
 
-The package was formerly `flashinfer.experimental.dense_projection_gemm`; that import path and the former
-entry-point names (`dense_projection_gemm`, `prepare_dense_projection_gemm`, `projection_forward`,
-`router_fp32_gemm`, ...) remain as aliases of the canonical objects above.
-## Entry points (`cake_backend.py`)
+The public module is `flashinfer.cake_dense_gemm_det_train`.  It imports this package on the first
+attribute access and returns the objects of `cake_backend.py` (and `ARCHES` of `cake_jit.py`) unchanged, so
+`flashinfer.cake_dense_gemm_det_train.X is cake_backend.X`.  Every public name carries the mode word `det`:
+
+| kind | names |
+|---|---|
+| K1 entry points | `cake_dense_gemm_det_train_projection`, `cake_dense_gemm_det_train_projection_{forward,dgrad,wgrad}` |
+| K1 plan / prepare | `cake_dense_gemm_det_train_projection_{plan,prepare,wgrad_prepare}` |
+| K1 types | `CakeDenseGemmDetProjectionPlan`, `CakeDenseGemmDetProjectionLaunch` |
+| K2 entry points | `cake_dense_gemm_det_train_router`, `cake_dense_gemm_det_train_router_{forward,dgrad,wgrad}` |
+| K2 plan / prepare | `cake_dense_gemm_det_train_router_{plan,prepare}` |
+| K2 types | `CakeDenseGemmDetRouterPlan`, `CakeDenseGemmDetRouterLaunch` |
+| cache, support, constants | `cake_dense_gemm_det_train_convenience_cache_clear`, `is_cake_dense_gemm_det_train_supported`, `ARCHES`, `SUPPORTED_COMPUTE_CAPABILITIES` |
+
+The module selects the mode: no entry point takes a mode argument.  Every program of this package runs in a
+fixed order, so the same inputs, hardware and plan give bitwise the same outputs on every run.  The entry
+points do not read `torch.use_deterministic_algorithms`: they never raise or warn under it (strict or
+`warn_only`) and run the same programs with or without it.  The non-deterministic split-K programs are a
+separate module, `flashinfer.cake_dense_gemm_nondet_train`.  `CONVENIENCE_CACHE_SIZE` is a setting of
+`cake_backend` (assign it there, not on the public module).  The backend's other helpers keep their names.
+
+## Entry points (`flashinfer.cake_dense_gemm_det_train`, defined in `cake_backend.py`)
 
 ```python
-from flashinfer.experimental.dense_projection_det_gemm import cake_backend as gemm
+import flashinfer.cake_dense_gemm_det_train as gemm
 
 # K1: strided-view GEMM  out[l, m, n] = sum_k A[l, m, k] B[l, k, n]
-gemm.dense_projection_det_gemm(A, B, out, transposed_out=False)   # convenience path (cached plan)
-gemm.projection_det_forward(X, W, out=None)               # out[T, N] = X[T, K] @ W[N, K].T
-gemm.projection_det_dgrad(G, W, out=None, out_dtype=None)  # out[T, K] = G[T, N] @ W[N, K]
-gemm.projection_det_wgrad(G, X, out=None, out_dtype=None)  # out[N, K] = G[T, N].T @ X[T, K]
-prepared = gemm.prepare_dense_projection_det_gemm(A, B, out, transposed_out=False)
-prepared = gemm.prepare_projection_det_wgrad(G, X, out)
+gemm.cake_dense_gemm_det_train_projection(A, B, out, transposed_out=False)   # convenience path (cached plan)
+gemm.cake_dense_gemm_det_train_projection_forward(X, W, out=None)               # out[T, N] = X[T, K] @ W[N, K].T
+gemm.cake_dense_gemm_det_train_projection_dgrad(G, W, out=None, out_dtype=None)  # out[T, K] = G[T, N] @ W[N, K]
+gemm.cake_dense_gemm_det_train_projection_wgrad(G, X, out=None, out_dtype=None)  # out[N, K] = G[T, N].T @ X[T, K]
+prepared = gemm.cake_dense_gemm_det_train_projection_prepare(A, B, out, transposed_out=False)
+prepared = gemm.cake_dense_gemm_det_train_projection_wgrad_prepare(G, X, out)
 prepared.launch()   # allocation-free; prepared.template / .grid / .module_name / .plan
 
 # K2: FP32 router GEMM through split-BF16x3 emulation
-gemm.router_fp32_det_gemm(A, B, out, splits=None)                  # convenience path (cached plan)
-gemm.router_det_forward(X, W, out=None, splits=4)          # out[T, N] = X[T, K] @ W[N, K].T
-gemm.router_det_dgrad(G, W, out=None)                      # out[T, K] = G[T, N] @ W[N, K]
-gemm.router_det_wgrad(G, X, out=None, splits=6)            # out[N, K] = G[T, N].T @ X[T, K]
-prepared = gemm.prepare_router_fp32_det_gemm(A, B, out, splits=None)
+gemm.cake_dense_gemm_det_train_router(A, B, out, splits=None)                  # convenience path (cached plan)
+gemm.cake_dense_gemm_det_train_router_forward(X, W, out=None, splits=4)          # out[T, N] = X[T, K] @ W[N, K].T
+gemm.cake_dense_gemm_det_train_router_dgrad(G, W, out=None)                      # out[T, K] = G[T, N] @ W[N, K]
+gemm.cake_dense_gemm_det_train_router_wgrad(G, X, out=None, splits=6)            # out[N, K] = G[T, N].T @ X[T, K]
+prepared = gemm.cake_dense_gemm_det_train_router_prepare(A, B, out, splits=None)
 prepared.launch()   # re-splits B, launches, reduces the split-K partials; .splits
 ```
 
@@ -51,17 +67,17 @@ prepared.launch()   # re-splits B, launches, reduces the split-K partials; .spli
 Both paths run the same planner once per binding and bind the same generated
 module; they differ in who owns the plan and the workspace.
 
-| | prepared path (`prepare_*` + `launch()`) | convenience path (`dense_projection_det_gemm`, `projection_*`, `router_*`) |
+| | prepared path (`prepare_*` + `launch()`) | convenience path (`cake_dense_gemm_det_train_projection`, `projection_*`, `router_*`) |
 |---|---|---|
 | planning | once, in `prepare_*` | once per cache key, on the first call |
 | workspace (K1: stream-K slabs + slice counters; K2: BF16x3 stack, the torch-chain split's fp32 scratch, split-K partials) | owned by the prepared object | carved out of the workspace arena of the (device, stream): one growable buffer per kind shared by every cached entry of that device and stream, grown to the largest requirement seen, never per entry |
 | per call | bind nothing: launch the bound views | rebind the caller's views (view objects only), resolve the workspace views of the arena (memoised until the arena grows), launch; `out` is allocated only when the caller passes none |
 | device queries | none after `prepare_*` | none after the first call |
-| cache | none | per process, per kind (K1 / K2), `CONVENIENCE_CACHE_SIZE` = 64 entries, least recently used first out; the arena of a (device, stream) is released with its last entry and by `clear_convenience_caches()` |
+| cache | none | per process, per kind (K1 / K2), `CONVENIENCE_CACHE_SIZE` = 64 entries, least recently used first out; the arena of a (device, stream) is released with its last entry and by `cake_dense_gemm_det_train_convenience_cache_clear()` |
 | memory held | the prepared object's workspace | bounded by the largest geometry seen per workspace kind, however many token counts the cache has planned (a ragged T adds entries, not workspace) |
 | CUDA Graphs | capture `launch()` | do not capture (a later growth replaces, an eviction frees, the workspace a graph replays) |
 
-The orientation of `projection_det_wgrad` / `prepare_projection_det_wgrad` follows the
+The orientation of `cake_dense_gemm_det_train_projection_wgrad` / `cake_dense_gemm_det_train_projection_wgrad_prepare` follows the
 row's measured rule when the rule table keys the row in exactly one orientation
 (the swapped `X.T @ G` form with the transposed store, or the direct `G.T @
 X`), else the launcher's padded-tile-work rule (N < 256 and N = 576 swap);
@@ -86,7 +102,7 @@ the kernel resets every counter it uses (the last arriver of a tail tile's slice
 writes zero after the fixup), so the shared counter buffer is zero again when
 each launch completes -- the same contract the Cake launcher's per-device
 counters rely on.  Threads: planning and the arena bookkeeping (creation,
-growth, reference counts, insertion, eviction, `clear_convenience_caches()`)
+growth, reference counts, insertion, eviction, `cake_dense_gemm_det_train_convenience_cache_clear()`)
 are serialised by a module lock (a miss re-checks the cache under it, so a key
 is planned once; a growth keeps the larger buffer); the K2 hit path holds its
 arena's lock from the carve of the workspace views through the split-K
@@ -126,7 +142,7 @@ device index (`device_facts`).
   (`A` K-major, `B = W.T` K-major), input gradient `G @ W` (`B` MN-major),
   weight gradient `G.T @ X` (both MN-major, `K = T` ragged).  A weight
   gradient with fewer than 256 output rows runs the swapped `X.T @ G` with
-  the transposed store (`projection_det_wgrad` / `prepare_projection_det_wgrad`).
+  the transposed store (`cake_dense_gemm_det_train_projection_wgrad` / `cake_dense_gemm_det_train_projection_wgrad_prepare`).
 * Numerics: BF16 x BF16 products exact in FP32, tensor-core FP32
   accumulation, one rounding at the store.  BF16 outputs match an FP64
   reference to `atol = rtol = 1e-2` elementwise; FP32 outputs carry the
@@ -143,7 +159,7 @@ stream-K split, raster group, wave working set) and the L2 size (hint gate);
 `prepare_*` and the convenience path read both once per device index
 (`device_facts`: `device_sm_count`, `device_l2_bytes` =
 `torch.cuda.get_device_properties(...).L2_cache_size`, falling back to
-`cuDeviceGetAttribute`), `plan_dense_projection_det_gemm` takes them as inputs:
+`cuDeviceGetAttribute`), `cake_dense_gemm_det_train_projection_plan` takes them as inputs:
 
 | choice | rule |
 |---|---|
@@ -164,8 +180,8 @@ stream-K split, raster group, wave working set) and the L2 size (hint gate);
 | grid | `(num_full + sk_units) * 2` CTAs: one cluster of two CTAs per `2 * CTA_ROWS` x `BLOCK_N` output tile plus the stream-K units; under `cta1` (round 19) `num_full` CTAs, one per `CTA_ROWS` x `BLOCK_N` tile, launched with the module's recorded cluster dims (1, 1, 1) |
 | stream-K | `stream_k_plan(pair_tiles, k_blocks, sm_count // 2, sk="auto")`: only when the whole problem is one partial wave of CTA pairs whose halves fit the pairs (`pair_tiles <= pairs`, `2 * tail <= pairs`) and `k_blocks >= 16`, the tiles' linearised K steps are cut into units of `iters_per_unit = ceil(k_blocks / 2)` (two K-aligned halves per tile on an even `k_blocks`), `sk_units = ceil(pair_tiles * k_blocks / iters_per_unit)` so that every unit holds a K step, with an in-kernel deterministic fixup; otherwise every work item is a whole tile (multi-wave tails stay data-parallel).  `sk=True` is the linearised-units policy (up to `pairs` units of >= 8 K steps), `sk="tiles"` the whole-tile diagnostic, `sk=False` off.  A measured `sk_parts = p` rule, or the caller knob `sk_parts`, instead splits every tail tile `p` ways when `p * tail` units fit the pairs and each keeps >= 8 K steps (`sk_parts_plan`).  The host asserts `tail_tiles * 16 <= 4096` slice counters, and `check_stream_k_plan` refuses a plan outside the kernel's launch contract: a unit without a K step on the `pd` 2 / `sk_slab` 2 / `stt` programs (they hand off the work in an item's last segment, so such a unit never finishes), synchronised collectors outside `[1, tail_tiles]` (`[1, ...)` on the other `sk_sync` programs), or a linearised plan with `2 * iters_per_unit < k_blocks` (more than `WS_PARTS` units on a tail tile) on a program that keys its workspace by tile (`tile_keyed_workspace`; its binding refuses the same plan) |
 
-`plan_dense_projection_det_gemm(A, B, out, sm_count=..., l2_bytes=...)` exposes
-the plan (`DetGemmPlan`, including `wave_working_set_bytes`) without a device;
+`cake_dense_gemm_det_train_projection_plan(A, B, out, sm_count=..., l2_bytes=...)` exposes
+the plan (`CakeDenseGemmDetProjectionPlan`, including `wave_working_set_bytes`) without a device;
 the prepared launch resolves the template
 through `cake_jit.KERNELS[arch][template]`, owns its stream-K partial slabs
 (`max(sk_units + tail_tiles, WS_PARTS * tail_tiles) * 2 * CTA_ROWS * BLOCK_N`
@@ -181,7 +197,7 @@ launcher's.
 
 ### The swapped small-token forward
 
-The convenience path (`dense_projection_det_gemm`) runs a batched forward row
+The convenience path (`cake_dense_gemm_det_train_projection`) runs a batched forward row
 that the planner would swap (`swap_small_m`: `L > 1`, `M <= 256`, `N >= 2 M`)
 on a program that puts the weight rows in the MMA's M and the tokens in its N
 (the `swap_ab_<tile>` templates), when `A` and `B` are K-major, the output is
@@ -281,15 +297,16 @@ registry does not list.
 
 CUDA Graphs: prepare outside capture and replay the prepared launch
 (`prepare_*` once, `launch` many times).  The convenience entry points
-(`dense_projection_det_gemm`, `projection_*`, `router_*`) reuse a cached planned
+(`cake_dense_gemm_det_train_projection`, `projection_*`, `router_*`) reuse a cached planned
 launch per (device, stream, geometry) key and the shared workspace arena of its
 (device, stream); capture a prepared launch object rather than the convenience
 entry points (see "Host paths").
 
-Tests: `tests/experimental/test_cake_dense_projection_det_gemm.py` (host-side
+Tests: `tests/experimental/test_cake_dense_gemm_det_train.py` and
+`tests/experimental/test_cake_dense_gemm_det_train_names.py` (host-side
 planning tests run everywhere; the GPU tests skip without a registered
 generated instance -- a device of an architecture `cake_jit.KERNELS` lists).  Benchmark:
-`benchmarks/bench_cake_dense_projection_det_gemm.py` (the 11 GLM-5.2 projection
+`benchmarks/bench_cake_dense_gemm_det_train.py` (the 11 GLM-5.2 projection
 rows x fwd / dgrad / wgrad x T in {16231, 16172}, the router rows and the two
 batched MLA rows, paired against `torch.matmul`; `--host-overhead` adds the
 host time per call of the prepared launch and of the convenience entry point).

@@ -39,7 +39,7 @@ forward ``X[T, K] @ W[N, K].T`` (``A = X`` K-major, ``B = W.T`` K-major),
 input gradient ``G[T, N] @ W[N, K]`` (``B = W`` MN-major), weight gradient
 ``G[T, N].T @ X[T, K]`` (both MN-major, ``K = T`` ragged); a weight gradient
 with fewer than 256 output rows runs the swapped ``X.T @ G`` with the
-transposed store (:func:`projection_det_wgrad`).
+transposed store (:func:`cake_dense_gemm_det_train_projection_wgrad`).
 
 The host selects one traced kernel instance per (A layout, B layout, tile
 width, tile height, output kind, epilogue path, raster group, TMA L2 eviction
@@ -56,7 +56,7 @@ is bitwise identical to the Cake launcher's on the same device.
 The convenience path runs a batched forward of at most 256 tokens on the
 swapped program instead (the weight rows in the MMA's M, at most two waves of
 single-CTA tiles over the caller's strided views; :func:`swap_ab_template`),
-which takes ``enable_pdl`` per call (:func:`dense_projection_det_gemm`).
+which takes ``enable_pdl`` per call (:func:`cake_dense_gemm_det_train_projection`).
 
 K2 -- FP32 router GEMM through split-BF16x3 emulation
 ----------------------------------------------------
@@ -76,17 +76,17 @@ transposed-store ``nn_t`` weight gradient 6).
 
 Two host paths share one planner and one binding:
 
-* the prepared path -- :func:`prepare_dense_projection_det_gemm` /
-  :func:`prepare_router_fp32_det_gemm` plan once and own their workspace; the
+* the prepared path -- :func:`cake_dense_gemm_det_train_projection_prepare` /
+  :func:`cake_dense_gemm_det_train_router_prepare` plan once and own their workspace; the
   returned launch replays with no CUDA allocation and no host synchronization
   for new values written into the bound tensors.  Every ``launch()`` is
   launch-only: the generated binding encodes the operand tensor maps by value
   from the bound views on each call (no descriptor workspace), so a prepared
   launch can be captured into a CUDA Graph from its first call;
-* the convenience path -- :func:`dense_projection_det_gemm`,
-  :func:`projection_det_forward` / :func:`projection_det_dgrad` / :func:`projection_det_wgrad`,
-  :func:`router_fp32_det_gemm`, :func:`router_det_forward` / :func:`router_det_dgrad` /
-  :func:`router_det_wgrad` -- keeps a bounded per-process cache of planned launches
+* the convenience path -- :func:`cake_dense_gemm_det_train_projection`,
+  :func:`cake_dense_gemm_det_train_projection_forward` / :func:`cake_dense_gemm_det_train_projection_dgrad` / :func:`cake_dense_gemm_det_train_projection_wgrad`,
+  :func:`cake_dense_gemm_det_train_router`, :func:`cake_dense_gemm_det_train_router_forward` / :func:`cake_dense_gemm_det_train_router_dgrad` /
+  :func:`cake_dense_gemm_det_train_router_wgrad` -- keeps a bounded per-process cache of planned launches
   keyed by the device, the stream and the geometry of the views (shapes,
   strides, dtypes, storage offsets, alignment, flags); a call that hits the
   cache rebinds the caller's views and launches without planning, device
@@ -96,7 +96,7 @@ Two host paths share one planner and one binding:
   owning a workspace each, so the memory the convenience path holds is bounded
   by the largest geometry seen, not by the number of geometries (a ragged
   token count).  See ``CONVENIENCE_CACHE_SIZE`` and
-  :func:`clear_convenience_caches`.
+  :func:`cake_dense_gemm_det_train_convenience_cache_clear`.
 
 The device facts a plan depends on (architecture, SM count, L2 size) are read
 once per device index (:func:`device_facts`).
@@ -131,7 +131,7 @@ SUPPORTED_COMPUTE_CAPABILITIES = {
 
 # ---------------------------------------------------------------------------
 # K1 tile configuration (mirror of the Cake kernel module's constants; the
-# Cake kernel host is ``dense_projection_det_gemm.py`` of the Cake kernel library,
+# Cake kernel host is the K1 kernel module of the Cake kernel library,
 # cited by line below)
 # ---------------------------------------------------------------------------
 
@@ -217,7 +217,7 @@ CTA_ROWS_CHOICES = (64, 128, 256)
 ROUTER_BLOCK_M = 128
 ROUTER_BLOCK_K = 32  # fp32 elements split per stage
 ROUTER_BLOCK_N = 128  # output columns per CTA pair
-# Production split-K counts per instance layout (router_det_forward / router_det_dgrad / router_det_wgrad).
+# Production split-K counts per instance layout (cake_dense_gemm_det_train_router_forward / cake_dense_gemm_det_train_router_dgrad / cake_dense_gemm_det_train_router_wgrad).
 ROUTER_SPLITS = {"kk": 4, "kn": 1, "nn_t": 6}
 
 
@@ -264,7 +264,7 @@ def _driver_l2_bytes(index: int) -> int:
     )
     if err != cuda.CUresult.CUDA_SUCCESS or not l2:
         raise RuntimeError(
-            f"dense_projection_det_gemm: cannot resolve the L2 size of cuda:{index} ({err})"
+            f"cake_dense_gemm_det_train_projection: cannot resolve the L2 size of cuda:{index} ({err})"
         )
     return int(l2)
 
@@ -306,6 +306,13 @@ def require_arch(device: torch.device) -> str:
             "the Cake dense projection GEMMs require compute capability 10.0, 10.3 or 10.7"
         )
     return arch
+
+
+def is_cake_dense_gemm_det_train_supported(device: torch.device) -> bool:
+    """Whether ``device`` is a CUDA device of compute capability 10.0, 10.3 or 10.7 (``sm_100a`` / ``sm_103a`` /
+    ``sm_107a``).  Shape-level support is checked per call: an unsupported view, layout or size raises
+    ``ValueError``, and a geometry without a registered program raises ``NotImplementedError``."""
+    return arch_for(device) is not None
 
 
 def generated_program_available(
@@ -354,7 +361,7 @@ def exact_waves(pair_tiles: int, units: int) -> bool:
     ``cta1``) in whole waves - ``((m_tiles // 2) * n_tiles * L) % sm_pairs == 0`` in the pair form.  The BLOCK_N 224
     weight-gradient rules were chosen for this fit on the 76-pair measuring devices (152 SMs: the 4096 x 4096 row's
     152 tall tiles are two waves, the 4096 x 1024 row's 76 tiles one); the exact-wave gate of
-    :func:`plan_dense_projection_det_gemm` reads it for the running device."""
+    :func:`cake_dense_gemm_det_train_projection_plan` reads it for the running device."""
     return pair_tiles > 0 and pair_tiles % units == 0
 
 
@@ -1689,7 +1696,7 @@ def _measured_row_rule(
     ragged-M (N, K, None) rule, else the ragged-K (N, None, M) rule, else the parent architecture's entry
     (``RULE_PARENT``: sm_103a reads the sm_100a table for the rows its lanes did not measure), else empty (the lookup
     of Cake ``row_rule``; FlashInfer-only split so the registry fallback can drop the MEASURED rule alone, see
-    ``plan_dense_projection_det_gemm``)."""
+    ``cake_dense_gemm_det_train_projection_plan``)."""
     ident = (arch, bool(a_mn), bool(b_mn), bool(out_f32), bool(out_t), bool(batched))
     for tail in (
         (int(N), int(K), int(M)),
@@ -1936,7 +1943,7 @@ def stream_k_plan(
     return pair_tiles - tail, tail, units, iters_per_unit
 
 
-def check_stream_k_plan(plan: "DetGemmPlan", arch: Optional[str] = None) -> None:
+def check_stream_k_plan(plan: "CakeDenseGemmDetProjectionPlan", arch: Optional[str] = None) -> None:
     """Refuse a stream-K plan outside the program's launch contract (the Cake kernel's ``requires``) before it
     launches.  The programs that hand off the work inside an item's last segment (``pd`` 2, ``sk_slab`` 2,
     ``stt``) never finish an item that holds no K step: the linearised plan needs ``iters_per_unit >= 1`` and
@@ -1952,7 +1959,7 @@ def check_stream_k_plan(plan: "DetGemmPlan", arch: Optional[str] = None) -> None
         collectors = plan.sk_collectors
         if collectors < 1 or (handoff and collectors > plan.tail_tiles):
             raise ValueError(
-                f"dense_projection_det_gemm: {plan.template} needs 1 <= collectors"
+                f"cake_dense_gemm_det_train_projection: {plan.template} needs 1 <= collectors"
                 f"{' <= tail_tiles' if handoff else ''} (got {collectors} collectors, {plan.tail_tiles} tail tiles)"
             )
     elif handoff and not plan.sk_exact:
@@ -1961,7 +1968,7 @@ def check_stream_k_plan(plan: "DetGemmPlan", arch: Optional[str] = None) -> None
             or (plan.sk_units - 1) * plan.iters_per_unit >= plan.sk_iters
         ):
             raise ValueError(
-                f"dense_projection_det_gemm: {plan.template} needs every stream-K unit to hold a K step (got "
+                f"cake_dense_gemm_det_train_projection: {plan.template} needs every stream-K unit to hold a K step (got "
                 f"{plan.sk_units} units of {plan.iters_per_unit} over {plan.sk_iters} K steps)"
             )
     if (
@@ -1971,7 +1978,7 @@ def check_stream_k_plan(plan: "DetGemmPlan", arch: Optional[str] = None) -> None
         and tile_keyed_workspace(arch, plan.template)
     ):
         raise ValueError(
-            f"dense_projection_det_gemm: {plan.template} keys its stream-K workspace by tail tile and needs "
+            f"cake_dense_gemm_det_train_projection: {plan.template} keys its stream-K workspace by tail tile and needs "
             f"2 * iters_per_unit >= k_blocks, at most {WS_PARTS} units on a tile (got {plan.sk_units} units of "
             f"{plan.iters_per_unit} K steps over {plan.tail_tiles} tail tiles of {plan.k_blocks} K steps)"
         )
@@ -2053,7 +2060,7 @@ def operand_view(
 
 
 @dataclass(frozen=True)
-class DetGemmPlan:
+class CakeDenseGemmDetProjectionPlan:
     """The host plan of one dense projection GEMM launch (device-independent except ``sm_pairs``: the concurrent
     work items of the device - CTA pairs, or SMs under the single-CTA form ``cta1``)."""
 
@@ -2085,7 +2092,7 @@ class DetGemmPlan:
     sk_units: int
     iters_per_unit: int
     template: str
-    # FlashInfer-only (see ``plan_dense_projection_det_gemm``): the batched small-M swap was undone / the row's
+    # FlashInfer-only (see ``cake_dense_gemm_det_train_projection_plan``): the batched small-M swap was undone / the row's
     # measured rule was dropped because the planned instance is not a generated program of this architecture
     # (the Cake host JIT-compiles it)
     swap_fallback: bool = False
@@ -2240,7 +2247,7 @@ class DetGemmPlan:
         return self.epi == "tma" or self.stt
 
 
-def plan_dense_projection_det_gemm(
+def cake_dense_gemm_det_train_projection_plan(
     A: torch.Tensor,
     B: torch.Tensor,
     out: torch.Tensor,
@@ -2289,7 +2296,7 @@ def plan_dense_projection_det_gemm(
     _fallback: bool = True,
     _allow_swap: bool = True,
     _use_rules: bool = True,
-) -> tuple[DetGemmPlan, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[CakeDenseGemmDetProjectionPlan, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Validate the views exactly as the Cake launcher does and plan the launch for a device
     with ``sm_count`` SMs and an L2 of ``l2_bytes`` (the two device facts the plan depends on:
     stream-K split and raster group through the CTA-pair count, the hint working-set gate
@@ -2346,7 +2353,7 @@ def plan_dense_projection_det_gemm(
     A caller-forced ``form`` is admitted or refused by ``instance_key`` and refused on a plan with stream-K units.  It
     changes no plan arithmetic; the launch adds the raster's four fast divisors (``fd_tiles_l`` / ``fd_tiles_g`` /
     ``fd_group`` / ``fd_last``), which the ten-warp programs' argument plans do not name.
-    [Cake ``dense_projection_det_gemm`` L1234-L1358]
+    [Cake K1 kernel host L1234-L1358]
 
     One FlashInfer-only deviation: the Cake host applies ``swap_small_m`` unconditionally because it compiles
     the swapped instance on demand, while this package can only launch the generated programs registered for
@@ -2411,24 +2418,24 @@ def plan_dense_projection_det_gemm(
         arch=arch,
     )
     if A.dtype != torch.bfloat16 or B.dtype != torch.bfloat16:
-        raise ValueError("dense_projection_det_gemm: A and B must be bf16")
+        raise ValueError("cake_dense_gemm_det_train_projection: A and B must be bf16")
     if out.dtype not in (torch.bfloat16, torch.float32):
-        raise ValueError("dense_projection_det_gemm: out must be bf16 or fp32")
+        raise ValueError("cake_dense_gemm_det_train_projection: out must be bf16 or fp32")
     A3, B3, O3 = as_batched(A, "A"), as_batched(B, "B"), as_batched(out, "out")
     L, M, K = (int(s) for s in A3.shape)
     if tuple(B3.shape) != (L, K, int(B3.shape[2])):
         raise ValueError(
-            f"dense_projection_det_gemm: B must be [L={L}, K={K}, N], got {tuple(B3.shape)}"
+            f"cake_dense_gemm_det_train_projection: B must be [L={L}, K={K}, N], got {tuple(B3.shape)}"
         )
     N = int(B3.shape[2])
     expect = (L, N, M) if transposed_out else (L, M, N)
     if tuple(O3.shape) != expect:
         raise ValueError(
-            f"dense_projection_det_gemm: out must be {expect}, got {tuple(O3.shape)}"
+            f"cake_dense_gemm_det_train_projection: out must be {expect}, got {tuple(O3.shape)}"
         )
     if N % 8 != 0 or M < 1 or K < 1 or N < 8:
         raise ValueError(
-            f"dense_projection_det_gemm: N must be a positive multiple of 8 and M, K >= 1 (M={M}, N={N}, K={K})"
+            f"cake_dense_gemm_det_train_projection: N must be a positive multiple of 8 and M, K >= 1 (M={M}, N={N}, K={K})"
         )
     if (
         O3.stride(2) != 1
@@ -2437,7 +2444,7 @@ def plan_dense_projection_det_gemm(
         or out.data_ptr() % 16 != 0
     ):
         raise ValueError(
-            "dense_projection_det_gemm: out needs unit inner stride, 16-byte aligned rows / batches "
+            "cake_dense_gemm_det_train_projection: out needs unit inner stride, 16-byte aligned rows / batches "
             f"and base; strides {tuple(O3.stride())}"
         )
     swap_eligible = swap_small_m(L, M, N, transposed_out)
@@ -2521,7 +2528,7 @@ def plan_dense_projection_det_gemm(
         # the single-CTA form carries no tail policy (its one-K-step rows never split) and no pair-only knob; a caller
         # forcing one with cta1 asked for two incompatible forms  [Cake launcher]
         raise ValueError(
-            f"dense_projection_det_gemm: cta1 excludes sk / sk_exact / sk_sync / htail / sk_parts / sk_max_units / batch_group "
+            f"cake_dense_gemm_det_train_projection: cta1 excludes sk / sk_exact / sk_sync / htail / sk_parts / sk_max_units / batch_group "
             f"(got sk={sk}, sk_exact={sk_exact}, sk_sync={sk_sync}, htail={htail}, sk_parts={sk_parts}, "
             f"sk_max_units={sk_max_units}, batch_group={batch_group})"
         )
@@ -2636,7 +2643,7 @@ def plan_dense_projection_det_gemm(
     form = str(form or "")
     if form not in ("", *W8_FORMS):
         raise ValueError(
-            f"dense_projection_det_gemm: form must be one of {W8_FORMS} (the eight-warp CTA form) or '', got {form!r}"
+            f"cake_dense_gemm_det_train_projection: form must be one of {W8_FORMS} (the eight-warp CTA form) or '', got {form!r}"
         )
     if htail is None:
         htail = rule.get("htail", False)
@@ -2671,7 +2678,7 @@ def plan_dense_projection_det_gemm(
     batch_group = int(batch_group) if L > 1 else 0
     if batch_group < 0 or (batch_group > 1 and L % batch_group):
         raise ValueError(
-            f"dense_projection_det_gemm: batch_group must be 0, 1 or a divisor of the batch size {L}, got {batch_group}"
+            f"cake_dense_gemm_det_train_projection: batch_group must be 0, 1 or a divisor of the batch size {L}, got {batch_group}"
         )
     if store_ef is None:
         store_ef = rule.get("store_ef", False)
@@ -2783,7 +2790,7 @@ def plan_dense_projection_det_gemm(
         )
     if tail_tiles * 16 > SK_DUMMY_BASE:
         raise ValueError(
-            f"dense_projection_det_gemm: {tail_tiles} stream-K tail tiles exceed the {SK_DUMMY_BASE // 16} slice-counter budget"
+            f"cake_dense_gemm_det_train_projection: {tail_tiles} stream-K tail tiles exceed the {SK_DUMMY_BASE // 16} slice-counter budget"
         )
     out_f32 = out.dtype == torch.float32
     mode = epi_mode(out_f32, transposed_out, K, epi, block_n, cta_rows)
@@ -2855,7 +2862,7 @@ def plan_dense_projection_det_gemm(
     promo = str(promo)
     if promo not in L2_PROMOS:
         raise ValueError(
-            f"dense_projection_det_gemm: promo must be one of {L2_PROMOS}, got {promo!r}"
+            f"cake_dense_gemm_det_train_projection: promo must be one of {L2_PROMOS}, got {promo!r}"
         )
     if group_m is None:
         group_m = rule.get(
@@ -2864,7 +2871,7 @@ def plan_dense_projection_det_gemm(
     group_m = int(group_m)
     if group_m < 1 or (cg == 2 and not cgrp and (group_m < 2 or group_m % 2)):
         raise ValueError(
-            f"dense_projection_det_gemm: group_m must be an even number >= 2 (CTA pairs are adjacent row tiles; any count >= 1 under cta1, or under cgrp where it counts column tiles), got {group_m}"
+            f"cake_dense_gemm_det_train_projection: group_m must be an even number >= 2 (CTA pairs are adjacent row tiles; any count >= 1 under cta1, or under cgrp where it counts column tiles), got {group_m}"
         )
     if hints is None:
         # round 21 (Cake W3): the hint gate over the column raster's wave working set under cgrp  [Cake launcher]
@@ -2895,7 +2902,7 @@ def plan_dense_projection_det_gemm(
             mg = False
     elif mg and not whole_tiles:
         raise ValueError(
-            f"dense_projection_det_gemm: mg (whole-tile tile resolve) needs a whole-tile plan under 2**21 cluster tiles "
+            f"cake_dense_gemm_det_train_projection: mg (whole-tile tile resolve) needs a whole-tile plan under 2**21 cluster tiles "
             f"(got {sk_units} stream-K units over {num_full + sk_units} cluster tiles)"
         )
     # The drain guard of ``sw``: the ``_sw<n>`` programs pace the bf16 TMA-store pd-2 drain and the kernel refuses the
@@ -2939,7 +2946,7 @@ def plan_dense_projection_det_gemm(
             store_hint, store_ef, quad_store, f32_v8 = "none", False, False, False
     elif form and not whole_tiles:
         raise ValueError(
-            f"dense_projection_det_gemm: form (the eight-warp CTA form) needs a whole-tile kn bf16 plan on 128 x 256 pair "
+            f"cake_dense_gemm_det_train_projection: form (the eight-warp CTA form) needs a whole-tile kn bf16 plan on 128 x 256 pair "
             f"tiles under 2**21 cluster tiles (got {sk_units} stream-K units over {num_full + sk_units} cluster tiles)"
         )
     key = instance_key(
@@ -2982,7 +2989,7 @@ def plan_dense_projection_det_gemm(
         sw=sw,
         form=form,
     )
-    plan = DetGemmPlan(
+    plan = CakeDenseGemmDetProjectionPlan(
         L=L,
         M=M,
         N=N,
@@ -3046,7 +3053,7 @@ def plan_dense_projection_det_gemm(
                 continue  # the plan just made
             if (not allow_swap and not swapped) or (not use_rules and not rule):
                 continue  # dropping a swap not taken / an empty rule changes nothing
-            candidate = plan_dense_projection_det_gemm(
+            candidate = cake_dense_gemm_det_train_projection_plan(
                 A,
                 B,
                 out,
@@ -3066,7 +3073,7 @@ def plan_dense_projection_det_gemm(
         tried: set[tuple] = set()
         for allow_swap in (True, False) if swapped else (False,):
             try:
-                base = plan_dense_projection_det_gemm(
+                base = cake_dense_gemm_det_train_projection_plan(
                     A,
                     B,
                     out,
@@ -3092,7 +3099,7 @@ def plan_dense_projection_det_gemm(
                     continue
                 tried.add(frozen)
                 try:
-                    candidate = plan_dense_projection_det_gemm(
+                    candidate = cake_dense_gemm_det_train_projection_plan(
                         A,
                         B,
                         out,
@@ -3113,7 +3120,7 @@ def plan_dense_projection_det_gemm(
     return plan, a_desc, b_desc, O3
 
 
-# Knob variants the registry fallback tries, nearest first (see ``plan_dense_projection_det_gemm``): the plain TMA L2
+# Knob variants the registry fallback tries, nearest first (see ``cake_dense_gemm_det_train_projection_plan``): the plain TMA L2
 # policy (the same tiles and plan; only the eviction hints of the loads differ), the single-CTA 128-row form, the
 # 64-row pair family, the tall tile, the register epilogue (the canonical-T templates), then BLOCK_N = 128 with the same
 # forms.  The TMA L2 promotion and the raster group width are launch parameters since round 11: they select no program
@@ -3167,7 +3174,7 @@ _CTA1_CLEARED = (
     "sk_first",
     "lw",
 )
-# The caller knobs the eight-warp CTA form yields to (``plan_dense_projection_det_gemm``): a value a caller forces for any
+# The caller knobs the eight-warp CTA form yields to (``cake_dense_gemm_det_train_projection_plan``): a value a caller forces for any
 # of them shapes the pipeline, tile, epilogue, tail or raster the form cannot carry, so the row's ten-warp program runs
 # the plan asked for.  Every name is a planner keyword whose default is None (a default call never yields).
 _W8_FIXED = (
@@ -3576,10 +3583,10 @@ def flat_alias(t: torch.Tensor) -> torch.Tensor:
 # (device index, raw stream) -- one growable buffer per kind shared by every entry of that device and stream
 # (:class:`_Arena`) -- so the memory held is bounded by the largest requirement seen per kind, however many
 # geometries (token counts) the cache has planned; an arena is released when its last entry is evicted and by
-# :func:`clear_convenience_caches`.  The key holds the raw stream, so launches on different streams never share
+# :func:`cake_dense_gemm_det_train_convenience_cache_clear`.  The key holds the raw stream, so launches on different streams never share
 # a workspace, and launches of one device and stream -- the only users of its arena -- are ordered by that
 # stream.  Threads: planning and the arena bookkeeping (creation, growth, reference counts, insertion, eviction,
-# ``clear_convenience_caches``) are serialised by the module lock ``_PLAN_LOCK`` (a miss re-checks the cache
+# ``cake_dense_gemm_det_train_convenience_cache_clear``) are serialised by the module lock ``_PLAN_LOCK`` (a miss re-checks the cache
 # under it, so a key is planned once); the K2 hit path holds its arena's lock from the carve of the workspace
 # views through the split-K reduction, so two threads issuing router launches of different geometries on one
 # stream cannot interleave their split / kernel / reduction on the shared BF16x3 stack and partials; the K1 hit
@@ -3690,11 +3697,11 @@ _ARENA_KINDS: dict[str, tuple[torch.dtype, bool]] = {
     "k1_ws": (
         torch.float32,
         False,
-    ),  # stream-K partial slabs (``DetGemmPlan.ws_f32_elems``)
+    ),  # stream-K partial slabs (``CakeDenseGemmDetProjectionPlan.ws_f32_elems``)
     "k1_counters": (
         torch.uint32,
         True,
-    ),  # stream-K slice counters (``DetGemmPlan.counters_alloc_u32``)
+    ),  # stream-K slice counters (``CakeDenseGemmDetProjectionPlan.counters_alloc_u32``)
     "k2_parts": (
         torch.bfloat16,
         False,
@@ -3804,7 +3811,7 @@ class _CachedLaunch(Protocol):
 
 
 _ARENAS: dict[tuple[int, int], _Arena] = {}
-# Serialises planning and every mutation of the arenas and the caches (``_plan_entry``, ``clear_convenience_caches``);
+# Serialises planning and every mutation of the arenas and the caches (``_plan_entry``, ``cake_dense_gemm_det_train_convenience_cache_clear``);
 # the hit paths (``_cache_get``, ``_entry_views``) do not take it.
 _PLAN_LOCK = threading.Lock()
 
@@ -3910,7 +3917,7 @@ def _entry_views(entry: _CachedLaunch) -> dict[str, torch.Tensor]:
 
 
 @dataclass
-class PreparedDetGemm:
+class CakeDenseGemmDetProjectionLaunch:
     """One prepared dense projection GEMM launch.
 
     ``launch()`` writes ``out`` and returns it; it allocates nothing and never synchronizes.
@@ -3920,7 +3927,7 @@ class PreparedDetGemm:
 
     module_name: str
     arch: str
-    plan: DetGemmPlan
+    plan: CakeDenseGemmDetProjectionPlan
     out: torch.Tensor
     tensors: dict[str, torch.Tensor] = field(repr=False)
     device_index: int = 0
@@ -3950,13 +3957,13 @@ def _k1_plan(
     *,
     transposed_out: bool,
     knobs: dict[str, Any],
-) -> tuple[DetGemmPlan, torch.Tensor, torch.Tensor, torch.Tensor, str, str]:
+) -> tuple[CakeDenseGemmDetProjectionPlan, torch.Tensor, torch.Tensor, torch.Tensor, str, str]:
     """Plan one K1 binding for its device: ``(plan, a_desc, b_desc, out3, arch, module_name)`` (the device facts
-    come from the per-device cache, the module from the registry; see :func:`plan_dense_projection_det_gemm`)."""
+    come from the per-device cache, the module from the registry; see :func:`cake_dense_gemm_det_train_projection_plan`)."""
     device = _same_cuda_device(A, B, out)
     facts = device_facts(device)
     arch = require_arch(device)
-    plan, a_desc, b_desc, O3 = plan_dense_projection_det_gemm(
+    plan, a_desc, b_desc, O3 = cake_dense_gemm_det_train_projection_plan(
         A,
         B,
         out,
@@ -3970,7 +3977,7 @@ def _k1_plan(
 
 
 def _k1_workspace(
-    plan: DetGemmPlan, device: torch.device
+    plan: CakeDenseGemmDetProjectionPlan, device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """The stream-K partial slabs and the slice counters of a plan (the only allocations of the K1 backend).
     The counters are zero-initialised once: the kernel resets every counter it uses (the last arriver of a tail
@@ -4000,7 +4007,7 @@ def _out_strides(out3: torch.Tensor) -> tuple[int, int]:
 
 
 def _k1_values(
-    plan: DetGemmPlan,
+    plan: CakeDenseGemmDetProjectionPlan,
     device: torch.device,
     *,
     A: Any,
@@ -4051,7 +4058,7 @@ def _k1_values(
     )
 
 
-def prepare_dense_projection_det_gemm(
+def cake_dense_gemm_det_train_projection_prepare(
     A: torch.Tensor,
     B: torch.Tensor,
     out: torch.Tensor,
@@ -4090,7 +4097,7 @@ def prepare_dense_projection_det_gemm(
     stt: Optional[bool] = None,
     pro: Optional[int] = None,
     form: Optional[str] = None,
-) -> PreparedDetGemm:
+) -> CakeDenseGemmDetProjectionLaunch:
     """Validate one binding, plan it for the device and prepare its launch (the only
     allocations of the K1 backend: the stream-K partial slabs and the slice counters).  See the module docstring for the view contract; the keyword
     knobs default to the Cake launcher's choices."""
@@ -4152,7 +4159,7 @@ def prepare_dense_projection_det_gemm(
         out_l=out_l,
     )
     launch = bind_launch(module_name, values, plan.grid, arch)
-    return PreparedDetGemm(
+    return CakeDenseGemmDetProjectionLaunch(
         module_name=module_name,
         arch=arch,
         plan=plan,
@@ -4169,7 +4176,7 @@ def prepare_dense_projection_det_gemm(
 
 
 def _k1_swapped(
-    plan: DetGemmPlan, A: torch.Tensor, B: torch.Tensor, *, transposed_out: bool
+    plan: CakeDenseGemmDetProjectionPlan, A: torch.Tensor, B: torch.Tensor, *, transposed_out: bool
 ) -> bool:
     """Did the planner run the swapped GEMM (``B.T @ A.T`` with the transposed store) for these views?  The
     launcher's small-M swap rule on the caller's dimensions, unless the registry fallback undid the swap
@@ -4183,7 +4190,7 @@ def _k1_views(
     A: torch.Tensor, B: torch.Tensor, out: torch.Tensor, *, swapped: bool
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """The operand views of a K1 launch for the caller's tensors -- ``(a_desc, b_desc, out3)`` exactly as
-    :func:`plan_dense_projection_det_gemm` derives them (batched, the operands exchanged and transposed when the plan
+    :func:`cake_dense_gemm_det_train_projection_plan` derives them (batched, the operands exchanged and transposed when the plan
     swapped, the ``[L, outer, inner]`` TMA spans of :func:`operand_view`) -- without planning.  ``operand_view``
     re-checks the stride and alignment contract of the views."""
     A3, B3, O3 = as_batched(A, "A"), as_batched(B, "B"), as_batched(out, "out")
@@ -4212,7 +4219,7 @@ class _CachedGemm:
 
     module_name: str
     arch: str
-    plan: DetGemmPlan
+    plan: CakeDenseGemmDetProjectionPlan
     swapped: bool
     entry: Callable[..., Any] = field(repr=False)
     template: tuple = field(repr=False)
@@ -4251,8 +4258,8 @@ def _prepare_cached_gemm(
         for got, want in zip(rebuilt, (a_desc, b_desc, O3), strict=True)
     ):
         raise RuntimeError(
-            "dense_projection_det_gemm: the per-call operand views differ from the planner's; "
-            "the convenience path cannot cache this binding (use prepare_dense_projection_det_gemm)"
+            "cake_dense_gemm_det_train_projection: the per-call operand views differ from the planner's; "
+            "the convenience path cannot cache this binding (use cake_dense_gemm_det_train_projection_prepare)"
         )
     ldo, out_l = _out_strides(O3)
     values = _k1_values(
@@ -4487,7 +4494,7 @@ def _run_swap_ab(
     return out
 
 
-def dense_projection_det_gemm(
+def cake_dense_gemm_det_train_projection(
     A: torch.Tensor,
     B: torch.Tensor,
     out: torch.Tensor,
@@ -4512,16 +4519,16 @@ def dense_projection_det_gemm(
 # --- the training operations as thin wrappers (the Cake entry points) ---------------------
 
 
-def projection_det_forward(
+def cake_dense_gemm_det_train_projection_forward(
     X: torch.Tensor, W: torch.Tensor, out: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
     """``out[T, N] = X[T, K] @ W[N, K].T`` (bf16 out by default)."""
     if out is None:
         out = torch.empty(X.shape[0], W.shape[0], device=X.device, dtype=torch.bfloat16)
-    return dense_projection_det_gemm(X, W.t(), out)
+    return cake_dense_gemm_det_train_projection(X, W.t(), out)
 
 
-def projection_det_dgrad(
+def cake_dense_gemm_det_train_projection_dgrad(
     G: torch.Tensor,
     W: torch.Tensor,
     out: Optional[torch.Tensor] = None,
@@ -4533,7 +4540,7 @@ def projection_det_dgrad(
         out = torch.empty(
             G.shape[0], W.shape[1], device=G.device, dtype=out_dtype or torch.bfloat16
         )
-    return dense_projection_det_gemm(G, W, out)
+    return cake_dense_gemm_det_train_projection(G, W, out)
 
 
 def wgrad_views(
@@ -4547,7 +4554,7 @@ def wgrad_views(
     when ``wgrad_swapped`` the swapped GEMM ``X.T @ G`` runs with the transposed store (the
     result lands directly in ``[N, K]``), otherwise ``G.T @ X``.  ``arch`` / ``out_f32`` let a
     measured rule of that architecture and output dtype decide the orientation (see ``wgrad_swapped``).
-    [Cake ``projection_det_wgrad`` L1507-L1518 / ``wgrad_swapped`` L1496-L1504]"""
+    [Cake ``cake_dense_gemm_det_train_projection_wgrad`` L1507-L1518 / ``wgrad_swapped`` L1496-L1504]"""
     N, K = int(G.shape[1]), int(X.shape[1])
     if wgrad_swapped(N, K, arch=arch, out_f32=out_f32):
         return X.t(), G, True
@@ -4591,25 +4598,25 @@ def wgrad_swapped(
     return swapped < direct
 
 
-def prepare_projection_det_wgrad(
+def cake_dense_gemm_det_train_projection_wgrad_prepare(
     G: torch.Tensor,
     X: torch.Tensor,
     out: torch.Tensor,
     *,
     sk: bool | str = "auto",
     cta_rows: Optional[int] = None,
-) -> PreparedDetGemm:
+) -> CakeDenseGemmDetProjectionLaunch:
     """Prepared ``out[N, K] = G[T, N].T @ X[T, K]``; the orientation follows the row's measured rule, else the
     small-``N`` swap rule of the Cake launcher (``wgrad_swapped``)."""
     A, B, transposed = wgrad_views(
         G, X, arch=arch_for(out.device), out_f32=out.dtype == torch.float32
     )
-    return prepare_dense_projection_det_gemm(
+    return cake_dense_gemm_det_train_projection_prepare(
         A, B, out, transposed_out=transposed, sk=sk, cta_rows=cta_rows
     )
 
 
-def projection_det_wgrad(
+def cake_dense_gemm_det_train_projection_wgrad(
     G: torch.Tensor,
     X: torch.Tensor,
     out: Optional[torch.Tensor] = None,
@@ -4655,13 +4662,13 @@ def router_layout_class(a_mn: bool, b_mn: bool) -> str:
     if a_mn and b_mn:
         return "nn_t"
     raise NotImplementedError(
-        "router_fp32_det_gemm: an MN-major A with a K-major B has no registered instance "
+        "cake_dense_gemm_det_train_router: an MN-major A with a K-major B has no registered instance "
         f"(see {TRACKING_ISSUE})"
     )
 
 
 @dataclass(frozen=True)
-class RouterDetPlan:
+class CakeDenseGemmDetRouterPlan:
     M: int
     N: int
     K: int
@@ -4691,7 +4698,7 @@ def _router_a_layout(A: torch.Tensor) -> bool:
         return False
     if A.stride(0) == 1:
         return True
-    raise ValueError("router_fp32_det_gemm: A needs a unit stride on m or k")
+    raise ValueError("cake_dense_gemm_det_train_router: A needs a unit stride on m or k")
 
 
 def _router_b_layout(B: torch.Tensor) -> bool:
@@ -4699,16 +4706,16 @@ def _router_b_layout(B: torch.Tensor) -> bool:
         return False
     if B.stride(1) == 1:  # n contiguous -> MN-major parts [3, K, N]
         return True
-    raise ValueError("router_fp32_det_gemm: B needs a unit stride on k or n")
+    raise ValueError("cake_dense_gemm_det_train_router: B needs a unit stride on k or n")
 
 
-def plan_router_fp32_det_gemm(
+def cake_dense_gemm_det_train_router_plan(
     A: torch.Tensor,
     B: torch.Tensor,
     out: torch.Tensor,
     *,
     splits: Optional[int] = None,
-) -> tuple[RouterDetPlan, torch.Tensor, torch.Tensor]:
+) -> tuple[CakeDenseGemmDetRouterPlan, torch.Tensor, torch.Tensor]:
     """Classify the fp32 views, apply the swap rule of the weight gradient and plan the launch.
 
     Returns ``(plan, A_eff, B_eff)``: the operands of the launched (possibly swapped) GEMM;
@@ -4719,25 +4726,25 @@ def plan_router_fp32_det_gemm(
         or B.dtype != torch.float32
         or out.dtype != torch.float32
     ):
-        raise ValueError("router_fp32_det_gemm: A, B and out must be fp32")
+        raise ValueError("cake_dense_gemm_det_train_router: A, B and out must be fp32")
     if A.dim() != 2 or B.dim() != 2 or out.dim() != 2:
-        raise ValueError("router_fp32_det_gemm: A, B and out must be 2-D views")
+        raise ValueError("cake_dense_gemm_det_train_router: A, B and out must be 2-D views")
     M, K = (int(s) for s in A.shape)
     Kb, N = (int(s) for s in B.shape)
     if Kb != K:
         raise ValueError(
-            f"router_fp32_det_gemm: A is [M={M}, K={K}] but B is [{Kb}, {N}]; K must agree"
+            f"cake_dense_gemm_det_train_router: A is [M={M}, K={K}] but B is [{Kb}, {N}]; K must agree"
         )
     if tuple(out.shape) != (M, N):
         raise ValueError(
-            f"router_fp32_det_gemm: out must be [{M}, {N}], got {tuple(out.shape)}"
+            f"cake_dense_gemm_det_train_router: out must be [{M}, {N}], got {tuple(out.shape)}"
         )
     if M < 1 or K < 1 or N < 1:
         # An empty problem (a ragged batch with T = 0 reaches here as M = 0 for the
         # forward / input gradient or K = 0 for the weight gradient) would otherwise
         # produce a zero-sized grid or a TMA descriptor with a zero extent.
         raise ValueError(
-            f"router_fp32_det_gemm: M, K and N must be >= 1 (M={M}, N={N}, K={K})"
+            f"cake_dense_gemm_det_train_router: M, K and N must be >= 1 (M={M}, N={N}, K={K})"
         )
     a_mn, b_mn = _router_a_layout(A), _router_b_layout(B)
     layout = router_layout_class(a_mn, b_mn)
@@ -4752,33 +4759,33 @@ def plan_router_fp32_det_gemm(
     a_eff_mn, b_eff_mn = _router_a_layout(A_eff), _router_b_layout(B_eff)
     lda = int(A_eff.stride(1)) if a_eff_mn else int(A_eff.stride(0))
     if lda % 4 != 0 or A_eff.data_ptr() % 16 != 0:
-        raise ValueError("router_fp32_det_gemm: A rows must be 16-byte aligned")
+        raise ValueError("cake_dense_gemm_det_train_router: A rows must be 16-byte aligned")
     if B_eff.data_ptr() % 16 != 0:
         raise ValueError(
-            "router_fp32_det_gemm: B must start at a 16-byte aligned address"
+            "cake_dense_gemm_det_train_router: B must start at a 16-byte aligned address"
         )
     # the kernel's output view: [M_eff, N_eff] row-major, or [N_eff, M_eff] with the transposed store = out
     if out.stride(1) != 1 or out.stride(0) % 4 != 0 or N_eff % 8 != 0:
         raise ValueError(
-            "router_fp32_det_gemm: out must have unit inner stride and 16-byte rows; N a multiple of 8"
+            "cake_dense_gemm_det_train_router: out must have unit inner stride and 16-byte rows; N a multiple of 8"
         )
     if splits is None:
         splits = ROUTER_SPLITS[layout]
     splits = int(splits)
     if splits < 1:
-        raise ValueError("router_fp32_det_gemm: splits must be >= 1")
+        raise ValueError("cake_dense_gemm_det_train_router: splits must be >= 1")
     # one split stores straight into ``out``: the row-major store (kk / kn) writes 16-byte vectors, the
     # transposed store (nn_t) one fp32 element at a time; more splits store into the workspace and reduce into ``out``
     if splits == 1 and not transposed and out.data_ptr() % 16 != 0:
         raise ValueError(
-            "router_fp32_det_gemm: out must start at a 16-byte aligned address "
+            "cake_dense_gemm_det_train_router: out must start at a 16-byte aligned address "
             f"(the single-split {layout} launch stores 16-byte vectors into it)"
         )
     m_tiles = _ceil_div(M_eff, ROUTER_BLOCK_M)
     m_tiles += m_tiles % CTA_GROUP
     n_tiles = _ceil_div(N_eff, ROUTER_BLOCK_N)
     k_blocks = _ceil_div(K, ROUTER_BLOCK_K)
-    plan = RouterDetPlan(
+    plan = CakeDenseGemmDetRouterPlan(
         M=M_eff,
         N=N_eff,
         K=K,
@@ -4853,7 +4860,7 @@ def _split_grid(n: int) -> tuple[int, int, int]:
 
 
 @dataclass
-class PreparedRouterDetGemm:
+class CakeDenseGemmDetRouterLaunch:
     """One prepared FP32 router GEMM: the retained BF16x3 stack of the second operand (re-split
     from the bound fp32 view on every ``launch()`` -- one launch of the fused split program when
     this checkout registers it for the device, else the torch chain through the fp32 scratch
@@ -4862,7 +4869,7 @@ class PreparedRouterDetGemm:
 
     module_name: str
     arch: str
-    plan: RouterDetPlan
+    plan: CakeDenseGemmDetRouterPlan
     out: torch.Tensor
     tensors: dict[str, torch.Tensor] = field(repr=False)
     device_index: int = 0
@@ -4906,16 +4913,16 @@ class PreparedRouterDetGemm:
 
 def _k2_plan(
     A: torch.Tensor, B: torch.Tensor, out: torch.Tensor, *, splits: Optional[int]
-) -> tuple[RouterDetPlan, torch.Tensor, torch.Tensor, str, str]:
+) -> tuple[CakeDenseGemmDetRouterPlan, torch.Tensor, torch.Tensor, str, str]:
     """Plan one K2 binding for its device: ``(plan, A_eff, B_eff, arch, module_name)``."""
     device = _same_cuda_device(A, B, out)
     arch = require_arch(device)
-    plan, A_eff, B_eff = plan_router_fp32_det_gemm(A, B, out, splits=splits)
+    plan, A_eff, B_eff = cake_dense_gemm_det_train_router_plan(A, B, out, splits=splits)
     return plan, A_eff, B_eff, arch, select_module(arch, plan.template)
 
 
 def _k2_views(
-    A: torch.Tensor, B: torch.Tensor, plan: RouterDetPlan
+    A: torch.Tensor, B: torch.Tensor, plan: CakeDenseGemmDetRouterPlan
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``(a_view, split_src)`` of a router launch for the caller's operands: the streamed operand as the
     ``[1, M, K]`` / ``[1, K, M]`` TMA span and the second operand in its own layout -- the source of the BF16x3
@@ -4932,10 +4939,10 @@ def _k2_checked_views(
     B: torch.Tensor,
     A_eff: torch.Tensor,
     B_eff: torch.Tensor,
-    plan: RouterDetPlan,
+    plan: CakeDenseGemmDetRouterPlan,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """:func:`_k2_views` of the caller's operands, checked against the planner's operands ``(A_eff, B_eff)``
-    of :func:`plan_router_fp32_det_gemm` in the launch form (the streamed ``[1, M, K]`` / ``[1, K, M]`` span under
+    of :func:`cake_dense_gemm_det_train_router_plan` in the launch form (the streamed ``[1, M, K]`` / ``[1, K, M]`` span under
     ``plan.a_mn``, the split source under ``plan.b_mn``).  The convenience path rebuilds the views from the
     caller's tensors on every call, so a rebuild that is not the planner's view fails closed here (the K1 check
     of :func:`_prepare_cached_gemm`) instead of launching on a view the plan never validated."""
@@ -4944,14 +4951,14 @@ def _k2_checked_views(
     want_split = B_eff if plan.b_mn else B_eff.t()
     if not (_same_view(a_view, want_a) and _same_view(split_src, want_split)):
         raise RuntimeError(
-            "router_fp32_det_gemm: the per-call operand views differ from the planner's; "
-            "the convenience path cannot cache this binding (use prepare_router_fp32_det_gemm)"
+            "cake_dense_gemm_det_train_router: the per-call operand views differ from the planner's; "
+            "the convenience path cannot cache this binding (use cake_dense_gemm_det_train_router_prepare)"
         )
     return a_view, split_src
 
 
 def _k2_workspace(
-    plan: RouterDetPlan,
+    plan: CakeDenseGemmDetRouterPlan,
     split_src: torch.Tensor,
     device: torch.device,
     *,
@@ -4984,7 +4991,7 @@ def _k2_out32(out: torch.Tensor) -> torch.Tensor:
 
 
 def _k2_values(
-    plan: RouterDetPlan,
+    plan: CakeDenseGemmDetRouterPlan,
     *,
     A: Any,
     parts: Any,
@@ -5009,13 +5016,13 @@ def _k2_values(
     )
 
 
-def prepare_router_fp32_det_gemm(
+def cake_dense_gemm_det_train_router_prepare(
     A: torch.Tensor,
     B: torch.Tensor,
     out: torch.Tensor,
     *,
     splits: Optional[int] = None,
-) -> PreparedRouterDetGemm:
+) -> CakeDenseGemmDetRouterLaunch:
     """Validate one fp32 binding, plan it and prepare its launch (the only allocations of the
     K2 backend: the BF16x3 stack, the fp32 residual scratch of the torch-chain split and the
     split-K workspace)."""
@@ -5042,7 +5049,7 @@ def prepare_router_fp32_det_gemm(
         split_launch = bind_launch(
             split_module, _split_values(split_src, parts, n), _split_grid(n), arch
         )
-    return PreparedRouterDetGemm(
+    return CakeDenseGemmDetRouterLaunch(
         module_name=module_name,
         arch=arch,
         plan=plan,
@@ -5064,7 +5071,7 @@ class _CachedRouter:
 
     module_name: str
     arch: str
-    plan: RouterDetPlan
+    plan: CakeDenseGemmDetRouterPlan
     entry: Callable[..., Any] = field(repr=False)
     template: tuple = field(repr=False)
     arena: _Arena = field(repr=False)
@@ -5089,7 +5096,7 @@ class _CachedRouter:
 _K2_CACHE: "OrderedDict[tuple, _CachedRouter]" = OrderedDict()
 
 
-def clear_convenience_caches() -> None:
+def cake_dense_gemm_det_train_convenience_cache_clear() -> None:
     """Drop every cached convenience-path launch (K1 and K2) and release every workspace arena; a launch in
     flight keeps a reference to the buffers it was bound with until its FFI call has enqueued it, and the
     freed blocks are reused stream-ordered (see :class:`_Arena`)."""
@@ -5212,7 +5219,7 @@ def _launch_cached_router(
     return out
 
 
-def router_fp32_det_gemm(
+def cake_dense_gemm_det_train_router(
     A: torch.Tensor, B: torch.Tensor, out: torch.Tensor, *, splits: Optional[int] = None
 ) -> torch.Tensor:
     """``out[m, n] = sum_k A[m, k] B[k, n]`` for fp32 views through the emulation (the cached convenience
@@ -5220,7 +5227,7 @@ def router_fp32_det_gemm(
     return _launch_cached_router(A, B, out, splits=splits)
 
 
-def router_det_forward(
+def cake_dense_gemm_det_train_router_forward(
     X: torch.Tensor,
     W: torch.Tensor,
     out: Optional[torch.Tensor] = None,
@@ -5230,19 +5237,19 @@ def router_det_forward(
     """``out[T, N] = X[T, K] @ W[N, K].T`` in FP32 through the emulation."""
     if out is None:
         out = torch.empty(X.shape[0], W.shape[0], device=X.device, dtype=torch.float32)
-    return router_fp32_det_gemm(X, W.t(), out, splits=splits)
+    return cake_dense_gemm_det_train_router(X, W.t(), out, splits=splits)
 
 
-def router_det_dgrad(
+def cake_dense_gemm_det_train_router_dgrad(
     G: torch.Tensor, W: torch.Tensor, out: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
     """``out[T, K] = G[T, N] @ W[N, K]`` in FP32 through the emulation."""
     if out is None:
         out = torch.empty(G.shape[0], W.shape[1], device=G.device, dtype=torch.float32)
-    return router_fp32_det_gemm(G, W, out, splits=1)
+    return cake_dense_gemm_det_train_router(G, W, out, splits=1)
 
 
-def router_det_wgrad(
+def cake_dense_gemm_det_train_router_wgrad(
     G: torch.Tensor,
     X: torch.Tensor,
     out: Optional[torch.Tensor] = None,
@@ -5252,25 +5259,5 @@ def router_det_wgrad(
     """``out[N, K] = G[T, N].T @ X[T, K]`` in FP32: the swapped GEMM ``X.T @ G`` with a transposed store."""
     if out is None:
         out = torch.empty(G.shape[1], X.shape[1], device=G.device, dtype=torch.float32)
-    return router_fp32_det_gemm(G.t(), X, out, splits=splits)
+    return cake_dense_gemm_det_train_router(G.t(), X, out, splits=splits)
 
-
-# --- the former public names (before the det rename), aliases of the canonical objects -----------------------
-GemmPlan = DetGemmPlan
-PreparedGemm = PreparedDetGemm
-PreparedRouterGemm = PreparedRouterDetGemm
-RouterPlan = RouterDetPlan
-dense_projection_gemm = dense_projection_det_gemm
-plan_dense_projection_gemm = plan_dense_projection_det_gemm
-plan_router_fp32_gemm = plan_router_fp32_det_gemm
-prepare_dense_projection_gemm = prepare_dense_projection_det_gemm
-prepare_projection_wgrad = prepare_projection_det_wgrad
-prepare_router_fp32_gemm = prepare_router_fp32_det_gemm
-projection_dgrad = projection_det_dgrad
-projection_forward = projection_det_forward
-projection_wgrad = projection_det_wgrad
-router_dgrad = router_det_dgrad
-router_forward = router_det_forward
-router_fp32_gemm = router_fp32_det_gemm
-router_wgrad = router_det_wgrad
-split_fp32_to_bf16x3_ = split_fp32_to_bf16x3_det_
