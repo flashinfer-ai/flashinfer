@@ -75,6 +75,7 @@ FI_API = "flashinfer.norm.rmsnorm"
 @pytest.fixture(autouse=True)
 def clean_install(monkeypatch):
     # apply.py asks CUDA about capture on the uncached path; keep it CPU-only.
+    """Keep capture checks CPU-only, then release packages and disable Apply."""
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     yield
     pk.release_packages()
@@ -84,6 +85,7 @@ def clean_install(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def private_imports(monkeypatch):
+    """Restore ``sys.meta_path`` and drop sealed modules imported during a test."""
     before = set(sys.modules)
     monkeypatch.setattr(sys, "meta_path", list(sys.meta_path))
     yield
@@ -127,6 +129,7 @@ class _Lifecycle:
         self.teardowns: list = []
 
     def setup(self, context):
+        """Record the context and return a serial state or ``result(context)``."""
         self.setups += 1
         self.contexts.append(context)
         return {"serial": self.setups} if self.result is None else self.result(context)
@@ -140,6 +143,7 @@ class _Lifecycle:
 
 
 def bind(life, *, run=None, setup_inputs=("x",), state_param="state", definition=None):
+    """Wrap ``life`` in a SetupBoundCallable with the test defaults."""
     return SetupBoundCallable(
         run or life.run,
         life.setup,
@@ -162,6 +166,7 @@ def rmsnorm_reference(x, w):
 
 
 def test_setup_fields_round_trip_and_hash_neutrality():
+    """Setup fields round-trip and leave a setup-less Solution's hash unchanged."""
     solution = Solution.from_dict(SETUP_SOLUTION)
     assert solution.spec.setup_inputs == ("x",)
     assert (solution.setup_file(), solution.setup_symbol()) == ("kernel.py", "setup")
@@ -267,6 +272,7 @@ def test_setup_fields_round_trip_and_hash_neutrality():
 def test_bad_setup_declarations_are_refused(
     tmp_path, spec, definition, spec_message, verify_message
 ):
+    """Bad setup declarations refuse in BuildSpec and at verification alike."""
     merged = {k: v for k, v in {**SETUP_SPEC, **spec}.items() if v is not None}
     if spec_message is not None:
         with pytest.raises(ValueError, match=spec_message):
@@ -279,6 +285,7 @@ def test_bad_setup_declarations_are_refused(
 def test_setup_files_must_be_listed_in_sources(tmp_path):
     # Solution.__post_init__ refuses a setup file absent from sources; verify
     # refuses it first, with the standard library, instead of load_packages.
+    """A setup file absent from ``sources`` refuses at verification."""
     solution = {
         **SETUP_SOLUTION,
         "spec": {**SETUP_SPEC, "setup_entry_point": "prepare.py::setup"},
@@ -297,6 +304,7 @@ def test_setup_files_must_be_listed_in_sources(tmp_path):
 def test_destination_passing_style_must_be_a_boolean_with_a_setup(tmp_path):
     # A null would read as False and leave a destination-passing kernel without
     # its output buffer; both layers refuse it.
+    """A null destination_passing_style with a setup refuses at both layers."""
     spec = {**SETUP_SPEC, "destination_passing_style": None}
     with pytest.raises(ValueError, match="as a boolean"):
         Solution.from_dict({**SETUP_SOLUTION, "spec": spec})
@@ -313,6 +321,8 @@ def test_destination_passing_style_must_be_a_boolean_with_a_setup(tmp_path):
 
 
 def test_setup_fields_are_framed_in_the_hash():
+    """The hash frames the setup fields so adjacent values cannot run together."""
+
     def hashed(state_param, inputs):
         spec = {**SETUP_SPEC, "setup_state_param": state_param, "setup_inputs": inputs}
         return Solution.from_dict({**SETUP_SOLUTION, "spec": spec}).hash()
@@ -326,6 +336,7 @@ def test_setup_fields_are_framed_in_the_hash():
 
 
 def test_golden_setup_package_verifies_binds_and_serves(sm_gate_off):
+    """The golden setup package verifies, binds, serves rmsnorm and releases cleanly."""
     directory = GOLDEN_ROOT / GOLDEN_SETUP_DIGEST
     manifest = json.loads((directory / "manifest.json").read_text())
     assert manifest["schema_version"] == 1
@@ -387,6 +398,7 @@ def test_golden_setup_package_verifies_binds_and_serves(sm_gate_off):
 def test_release_packages_leaves_curated_and_captured_solutions_enabled(
     tmp_path, sm_gate_off, monkeypatch
 ):
+    """Release removes sealed identities only; curated and captured bindings stay."""
     import flashinfer.trace_apply.apply as apply_module
 
     def curated(hidden_states, weight):
@@ -445,6 +457,7 @@ def test_release_packages_leaves_curated_and_captured_solutions_enabled(
 
 
 def test_state_is_keyed_on_setup_input_identity():
+    """States key on tensor storage identity, and release tears them all down."""
     life = _Lifecycle()
     wrapper = bind(life)
     a, b, out = torch.ones(2, 4), torch.ones(2, 4), torch.empty(2, 4)
@@ -486,6 +499,7 @@ def test_state_is_keyed_on_setup_input_identity():
 
 
 def test_state_bounds_and_failed_setups(monkeypatch):
+    """A failed setup leaves nothing; MAX_WEIGHT_SETS bounds the retained states."""
     life = _Lifecycle()
     wrapper = bind(life, setup_inputs=())  # no setup inputs: one state per process
     for _ in range(3):
@@ -520,6 +534,7 @@ def test_state_bounds_and_failed_setups(monkeypatch):
 
 def test_capture_refuses_first_use_freezes_and_never_releases(tmp_path, monkeypatch):
     # A weight set first seen under capture is refused and counted.
+    """Capture refuses a first use, freezes the key set and pins the states for good."""
     life = _Lifecycle()
     wrapper = bind(life)
     a, out = torch.ones(2), torch.empty(2)
@@ -553,6 +568,7 @@ def test_capture_refuses_first_use_freezes_and_never_releases(tmp_path, monkeypa
 
 
 def test_a_wrapper_kept_across_release_routes_nowhere(sm_gate_off, monkeypatch):
+    """A wrapped API kept across release routes to stock, never to the loader."""
     import flashinfer.trace_apply.apply as apply_module
 
     def stock(
@@ -587,11 +603,13 @@ def test_a_wrapper_kept_across_release_routes_nowhere(sm_gate_off, monkeypatch):
 
 
 def test_capture_is_seen_on_the_calls_device_and_on_the_current_one(monkeypatch):
+    """_is_capturing checks the call's device and the current one, restoring it."""
     capturing = {0: False, 1: False}
     current = [0]
 
     class Device:  # torch.cuda.device: the current device, for the block
         def __init__(self, device):
+            """Resolve the device index, defaulting to the current one."""
             self.index = current[0] if device.index is None else device.index
 
         def __enter__(self):
@@ -616,10 +634,12 @@ def test_capture_is_seen_on_the_calls_device_and_on_the_current_one(monkeypatch)
 
 
 def test_a_released_binding_refuses_calls_even_from_its_own_teardown():
+    """A released binding refuses every call, including one from its teardown."""
     life = _Lifecycle()
     reentered = []
 
     def teardown(state):
+        """Record the state and re-enter the released wrapper."""
         life.teardowns.append(state)
         try:
             wrapper(x=a, out=out)  # a teardown re-entering its own Definition
@@ -647,6 +667,7 @@ def test_a_released_binding_refuses_calls_even_from_its_own_teardown():
 
 
 def test_a_state_does_not_survive_fork(monkeypatch):
+    """A binding called from another process id refuses."""
     wrapper = bind(_Lifecycle())
     pid = os.getpid()
     monkeypatch.setattr(os, "getpid", lambda: pid + 1)
@@ -655,6 +676,8 @@ def test_a_state_does_not_survive_fork(monkeypatch):
 
 
 def test_context_has_the_documented_keys():
+    """The setup context holds exactly the documented keys, Definition or not."""
+
     def run(x, out, state, scale):
         out.copy_(x * scale)
 
@@ -704,6 +727,7 @@ def test_context_has_the_documented_keys():
 
 
 def test_result_envelope_and_malformed_calls():
+    """The setup result envelope is unpacked and malformed calls refuse by keyword."""
     envelope = _Lifecycle(
         result=lambda context: {"state": "prepared", "input_buffers": {}}
     )
@@ -767,12 +791,14 @@ def test_result_envelope_and_malformed_calls():
     ],
 )
 def test_import_entry_refuses_an_unbindable_setup(tmp_path, files, spec, message):
+    """A setup that is not callable, unbindable or unloadable refuses at import."""
     with pytest.raises(pk.SealedPackageError, match=message):
         pk.import_entry(setup_package(tmp_path, files, spec=spec))
     assert pk.setup_stats() == {}
 
 
 def test_curated_loader_binds_the_same_class(tmp_path, monkeypatch):
+    """The curated loader binds a setup-bearing Solution as a SetupBoundCallable."""
     monkeypatch.setenv("HOME", str(tmp_path / "home"))  # hermetic loader cache
     split = Solution.from_dict(
         {
@@ -802,6 +828,7 @@ def test_load_packages_refuses_a_schema_error_as_a_sealed_error(tmp_path, sm_gat
     # Verification reads the Solution with the standard library; a key the
     # schema requires and the verifier does not is a refusal, not an escape
     # out of ``_load_packages_from_env``.
+    """A Solution missing a schema key is a sealed-package refusal, not an escape."""
     authorless = {key: value for key, value in SOLUTION.items() if key != "author"}
     digest = seal_flashinfer_fixture(tmp_path, solution=authorless)
     result = pk.load_packages(tmp_path, [digest], strict=False, enable=False)
@@ -812,6 +839,7 @@ def test_load_packages_refuses_a_schema_error_as_a_sealed_error(tmp_path, sm_gat
 
 
 def test_exports():
+    """The package re-exports the setup API and API_VERSION is 2."""
     assert ta.SetupBoundCallable is SetupBoundCallable
     assert ta.SetupStateError is SetupStateError
     assert ta.release_packages is pk.release_packages

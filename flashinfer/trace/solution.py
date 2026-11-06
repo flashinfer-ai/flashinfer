@@ -115,6 +115,7 @@ class BuildSpec:
     keeps whatever parameter name it already uses and records it here."""
 
     def __post_init__(self) -> None:
+        """Validate language, entry point, hardware, binding and the setup fields."""
         try:
             language = SupportedLanguages(self.language)
         except ValueError as exc:
@@ -203,6 +204,7 @@ class BuildSpec:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "BuildSpec":
+        """Build a BuildSpec from JSON, refusing an implicit DPS with a setup."""
         if data.get("setup_entry_point") is not None and not isinstance(
             data.get("destination_passing_style"), bool
         ):
@@ -227,6 +229,7 @@ class BuildSpec:
         )
 
     def to_dict(self) -> dict[str, Any]:
+        """Serialize to JSON, emitting setup fields only when a setup is declared."""
         out: dict[str, Any] = {
             "language": self.language.value,
             "target_hardware": list(self.target_hardware),
@@ -264,6 +267,7 @@ class Solution:
     _hash_cache: str = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        """Check the spec type, source uniqueness and that entry files are sources."""
         if not isinstance(self.spec, BuildSpec):
             raise TypeError("Solution.spec must be a BuildSpec")
         if not self.sources:
@@ -349,6 +353,7 @@ class Solution:
         return out
 
     def _compute_hash(self) -> str:
+        """Hash the definition, build-affecting spec fields and sorted sources."""
         h = hashlib.sha256()
         # Sort sources by path so the hash is independent of source ordering.
         sorted_sources = sorted(self.sources, key=lambda s: s.path)

@@ -187,6 +187,7 @@ class LoadResult:
 
 
 def _required_text(value: Mapping[str, Any], key: str, path: Path) -> str:
+    """Return ``value[key]`` as a non-empty string, else refuse the document."""
     item = value.get(key)
     if not isinstance(item, str) or not item.strip():
         raise SealedPackageError(f"{path}: {key} must be a non-empty string")
@@ -194,11 +195,13 @@ def _required_text(value: Mapping[str, Any], key: str, path: Path) -> str:
 
 
 def _sm_number(value: str) -> str | None:
+    """Return the SM number in a target such as ``sm100``, or None if it is not one."""
     match = _SM.fullmatch(value.strip().lower())
     return match.group(1) if match else None
 
 
 def _sha256_file(path: Path) -> str:
+    """Hex SHA-256 of a file, read in 1 MiB chunks."""
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1 << 20), b""):
@@ -207,6 +210,7 @@ def _sha256_file(path: Path) -> str:
 
 
 def _read_json(path: Path) -> object:
+    """Parse a JSON file, refusing an unreadable one as a sealed-package error."""
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -227,6 +231,7 @@ def _refuse_link(path: Path) -> None:
 
 
 def _canonical_relative(name: str, where: Path) -> None:
+    """Refuse a listed path that is not a plain, canonical, bundle-relative name."""
     relative = Path(name)
     if (
         relative.is_absolute()
@@ -686,6 +691,7 @@ class _SourceLoader(importlib.machinery.SourceFileLoader):
 
     def get_code(self, fullname: str) -> Any:
         # Deferred imports must authenticate the bytes they compile, too.
+        """Re-hash the sealed source against its manifest digest before compiling."""
         path = Path(self.path)
         _refuse_link(path)
         if not path.is_file():
@@ -707,6 +713,7 @@ class _BundleFinder(importlib.abc.MetaPathFinder):
         self.namespace, self.bundle, self.files = namespace, bundle, dict(files)
 
     def find_spec(self, fullname: str, path: Any = None, target: Any = None) -> Any:
+        """Resolve a sealed-namespace name to its manifest-listed file, or refuse."""
         if fullname != self.namespace and not fullname.startswith(self.namespace + "."):
             return None
         relative = fullname[len(self.namespace) :].lstrip(".").replace(".", "/")
@@ -1097,6 +1104,7 @@ def load_packages(
 
 
 def _env_digests(environ: Mapping[str, str]) -> list[str]:
+    """Split the comma-separated digest list in the packages environment variable."""
     raw = environ.get(PACKAGES_ENV, "").strip()
     return [item.strip() for item in raw.split(",") if item.strip()] if raw else []
 

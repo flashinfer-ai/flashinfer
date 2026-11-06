@@ -232,6 +232,7 @@ def preloaded_entry(definition: str, name: str) -> Callable | None:
 
 
 def _preloaded_for(entry: tuple[Callable, str | None], solution: Solution) -> Callable:
+    """Return the preloaded callable, refusing one bound to another Solution hash."""
     fn, bound = entry
     if bound is not None and bound != solution.hash():
         raise RuntimeError(
@@ -243,6 +244,7 @@ def _preloaded_for(entry: tuple[Callable, str | None], solution: Solution) -> Ca
 
 
 def _get_loaded_solution(solution: Solution) -> Callable:
+    """Resolve a Solution's callable: a preloaded entry wins, else build it once."""
     key = (solution.definition, solution.name)
     with _loaded_lock:
         preloaded = _preloaded.get(key)
@@ -808,6 +810,7 @@ def disable_apply() -> None:
 
 
 def _disable_locked() -> None:
+    """Revert each patch, warn about unfired Solutions, empty the mapping in place."""
     global _solutions, _unfired
     while _patches:
         p = _patches.pop()

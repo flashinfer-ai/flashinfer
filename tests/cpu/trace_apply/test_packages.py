@@ -54,6 +54,7 @@ from tests.cpu.trace_apply.seal_helpers import (
 
 @pytest.fixture(autouse=True)
 def clean_install():
+    """Release sealed packages and disable Trace Apply after every test."""
     yield
     pk.release_packages()
     if ta.is_enabled():
@@ -62,6 +63,7 @@ def clean_install():
 
 @pytest.fixture(autouse=True)
 def private_imports(monkeypatch):
+    """Restore ``sys.meta_path`` and drop sealed modules imported during a test."""
     before = set(sys.modules)
     monkeypatch.setattr(sys, "meta_path", list(sys.meta_path))
     yield
@@ -74,6 +76,7 @@ def package(root, files, entry="kernel.py::run"):
     # Embedded sources mirror the sealed bytes exactly, so the packages these
     # tests build are loadable end to end (Solution.from_dict requires a
     # sources list; the importer requires the embedded copy to equal the bytes).
+    """Seal ``files`` with a solution.json embedding them as sources, and verify it."""
     solution = {
         **SOLUTION,
         "spec": {**SOLUTION["spec"], "entry_point": entry},
@@ -102,6 +105,7 @@ def sm_gate_off(monkeypatch):
 
 
 def test_omitted_identity_resolves_from_sealed_metadata(tmp_path):
+    """An unconstrained verify reads the identity from the sealed metadata."""
     digest = seal_flashinfer_fixture(tmp_path)
     pkg = pk.verify_package(tmp_path, digest)
     assert pkg.operation == OPERATION
@@ -111,6 +115,7 @@ def test_omitted_identity_resolves_from_sealed_metadata(tmp_path):
 
 
 def test_expected_constraints_cannot_relabel_a_package(tmp_path):
+    """``expected`` constraints check the sealed identity and never relabel it."""
     digest = seal_flashinfer_fixture(tmp_path)
     for field, value in (("operation", "another_operation"), ("family", "activation")):
         with pytest.raises(pk.SealedPackageError, match=f"not the {field}"):
@@ -127,6 +132,7 @@ def test_expected_constraints_cannot_relabel_a_package(tmp_path):
     ],
 )
 def test_sealed_metadata_must_agree(tmp_path, field, value, message):
+    """A manifest identity field that contradicts solution.json refuses."""
     solution = {**SOLUTION, "family": "rope"} if field == "family" else SOLUTION
     digest = seal_package(
         tmp_path,
@@ -139,7 +145,10 @@ def test_sealed_metadata_must_agree(tmp_path, field, value, message):
 
 
 def test_qualification_alias_and_sealed_files_spellings_agree(tmp_path):
+    """Both sidecar spellings seal alike; conflicting spellings refuse."""
+
     def seal(sidecar_key: str) -> str:
+        """Seal SOURCE and SOLUTION with the sidecar under ``sidecar_key``."""
         digests = {
             "kernel.py": hashlib.sha256(SOURCE).hexdigest(),
             "solution.json": hashlib.sha256(json_bytes(SOLUTION)).hexdigest(),
@@ -181,6 +190,7 @@ def test_qualification_alias_and_sealed_files_spellings_agree(tmp_path):
 
 
 def test_unknown_schema_version_refuses(tmp_path):
+    """A manifest with a schema_version this reader does not know refuses."""
     digest = seal_package(
         tmp_path,
         {"solution.json": json_bytes(SOLUTION), "kernel.py": SOURCE},
@@ -193,6 +203,7 @@ def test_unknown_schema_version_refuses(tmp_path):
 
 @pytest.mark.parametrize("name", ["definition.json", "solution.json", "metadata.json"])
 def test_regular_unsealed_sidecars_cannot_change_identity(tmp_path, name):
+    """Unsealed sidecars beside the manifest never change what verify returns."""
     digest = seal_flashinfer_fixture(tmp_path)
     original = pk.verify_package(tmp_path, digest)
     sidecar = tmp_path / digest / name
@@ -216,6 +227,7 @@ def test_regular_unsealed_sidecars_cannot_change_identity(tmp_path, name):
 def test_every_sealed_byte_and_the_exact_bundle_file_set_are_checked(
     tmp_path, change, message
 ):
+    """Any changed, missing or extra byte under the digest chain refuses the package."""
     digest = seal_flashinfer_fixture(tmp_path)
     directory = tmp_path / digest
     if change == "manifest":
@@ -238,6 +250,7 @@ def test_every_sealed_byte_and_the_exact_bundle_file_set_are_checked(
 def test_bundle_traversal_errors_cannot_hide_unsealed_files(
     tmp_path, monkeypatch, scan_error
 ):
+    """A bundle directory that cannot be listed refuses; unseen files never pass."""
     digest = seal_flashinfer_fixture(tmp_path)
     hidden = tmp_path / digest / "bundle" / "unreadable"
     hidden.mkdir()
@@ -245,6 +258,7 @@ def test_bundle_traversal_errors_cannot_hide_unsealed_files(
     scandir = os.scandir
 
     def cannot_scan(path):
+        """Fail the scan of the hidden directory only."""
         if Path(path) == hidden:
             raise scan_error("cannot list bundle directory")
         return scandir(path)
@@ -257,6 +271,7 @@ def test_bundle_traversal_errors_cannot_hide_unsealed_files(
 def test_manifest_listing_digest_is_checked_independently_of_the_manifest_digest(
     tmp_path,
 ):
+    """The listing digest is checked even when the manifest digest matches."""
     digest = seal_package(
         tmp_path,
         {"solution.json": json_bytes(SOLUTION), "kernel.py": SOURCE},
@@ -273,6 +288,7 @@ def test_manifest_listing_digest_is_checked_independently_of_the_manifest_digest
     "name", ["../escape", "/absolute", "./kernel.py", "a//kernel.py", "bad\0name"]
 )
 def test_manifest_paths_must_be_canonical_bundle_relative_names(tmp_path, name):
+    """A manifest path that escapes, is absolute or is not normalized refuses."""
     files = {name: hashlib.sha256(SOURCE).hexdigest()}
     digest = seal_package(
         tmp_path,
@@ -287,6 +303,7 @@ def test_manifest_paths_must_be_canonical_bundle_relative_names(tmp_path, name):
     "name", ["", "manifest.json", "qualification.json", "bundle", "bundle/kernel.py"]
 )
 def test_sealed_files_and_directories_must_not_be_symbolic_links(tmp_path, name):
+    """A symbolic link anywhere in the sealed tree refuses the package."""
     digest = seal_flashinfer_fixture(tmp_path)
     path = tmp_path / digest / name if name else tmp_path / digest
     moved = tmp_path / "moved"
@@ -298,6 +315,7 @@ def test_sealed_files_and_directories_must_not_be_symbolic_links(tmp_path, name)
 
 @pytest.mark.parametrize("name", ["unsealed-sidecar", "bundle/unsealed-file"])
 def test_root_and_bundle_special_file_safety_checks_remain(tmp_path, name):
+    """A special file (a FIFO) in the package root or bundle refuses."""
     digest = seal_flashinfer_fixture(tmp_path)
     os.mkfifo(tmp_path / digest / name)
     with pytest.raises(pk.SealedPackageError, match="not a regular file"):
@@ -308,6 +326,7 @@ def test_root_and_bundle_special_file_safety_checks_remain(tmp_path, name):
     "language", ["python", "triton", "cutedsl", "cutile", "cpp", "cuda", "cute", None]
 )
 def test_only_python_family_solutions_load(tmp_path, language):
+    """Verification accepts Python-family languages and refuses every other."""
     solution = {**SOLUTION, "spec": {**SOLUTION["spec"], "language": language}}
     digest = seal_flashinfer_fixture(tmp_path, solution=solution)
     if language in {"python", "triton", "cutedsl", "cutile"}:
@@ -318,6 +337,7 @@ def test_only_python_family_solutions_load(tmp_path, language):
 
 
 def test_kernel_factory_schema_is_not_silently_translated(tmp_path):
+    """A SOLBench/Kernel Factory ``languages`` spec is refused, not translated."""
     spec = {key: value for key, value in SOLUTION["spec"].items() if key != "language"}
     solution = {**SOLUTION, "spec": {**spec, "languages": ["cute"]}}
     digest = seal_flashinfer_fixture(tmp_path, solution=solution)
@@ -326,6 +346,7 @@ def test_kernel_factory_schema_is_not_silently_translated(tmp_path):
 
 
 def test_verification_does_not_import_a_sealed_executable(tmp_path):
+    """verify_package never executes a sealed source file."""
     digest = seal_package(
         tmp_path,
         {
@@ -338,6 +359,7 @@ def test_verification_does_not_import_a_sealed_executable(tmp_path):
 
 
 def test_golden_package_verifies_unchanged():
+    """The checked-in golden package verifies; its sources match the embedded copy."""
     pkg = pk.verify_package(GOLDEN_ROOT, GOLDEN_DIGEST)
     manifest_bytes = (pkg.directory / "manifest.json").read_bytes()
     assert hashlib.sha256(manifest_bytes).hexdigest() == GOLDEN_DIGEST
@@ -354,6 +376,7 @@ def test_golden_package_verifies_unchanged():
 
 
 def test_relative_imports_are_private_and_leave_exact_file_set(tmp_path):
+    """Relative imports resolve inside a per-digest namespace and write no bytecode."""
     for source in (
         b"from .helpers.value import VALUE\ndef run(): return VALUE\n",
         b"def run():\n    from .helpers.value import VALUE\n    return VALUE\n",
@@ -381,6 +404,7 @@ def test_relative_imports_are_private_and_leave_exact_file_set(tmp_path):
 
 @pytest.mark.parametrize("mutate_manifest", [False, True])
 def test_deferred_import_uses_the_original_sealed_digest(tmp_path, mutate_manifest):
+    """A lazy import is checked against the digest sealed at verification time."""
     sealed = package(
         tmp_path,
         {
@@ -401,6 +425,7 @@ def test_deferred_import_uses_the_original_sealed_digest(tmp_path, mutate_manife
 
 
 def test_deferred_missing_module_refuses_as_sealed_error(tmp_path):
+    """A lazy import of an unsealed name raises SealedPackageError, not ImportError."""
     sealed = package(
         tmp_path,
         {
@@ -413,6 +438,7 @@ def test_deferred_missing_module_refuses_as_sealed_error(tmp_path):
 
 
 def test_manifest_changed_on_disk_after_import_refuses_the_next_import(tmp_path):
+    """import_entry re-verifies the manifest; an edited one refuses the next import."""
     sealed = package(tmp_path, {"kernel.py": b"def run(): return 1\n"})
     assert pk.import_entry(sealed)() == 1
     manifest = sealed.directory / "manifest.json"
@@ -434,6 +460,7 @@ def test_manifest_changed_on_disk_after_import_refuses_the_next_import(tmp_path)
     ],
 )
 def test_deferred_import_refuses_replaced_paths(tmp_path, replacement):
+    """A sealed source replaced by a link, directory, FIFO or nothing refuses lazily."""
     sealed = package(
         tmp_path,
         {
@@ -470,6 +497,7 @@ def test_module_colon_symbol_entry_points_are_refused_at_verification(tmp_path, 
     # BuildSpec takes only '<file>.py::<symbol>'; verification refuses the
     # module:symbol spelling before any sealed code runs, instead of letting
     # load_packages discover it after the import already executed.
+    """A ``module:symbol`` entry point refuses at verification, before any import."""
     with pytest.raises(pk.SealedPackageError, match="must be '<file>.py::<symbol>'"):
         package(
             tmp_path,
@@ -489,6 +517,7 @@ def test_module_colon_symbol_entry_points_are_refused_at_verification(tmp_path, 
     ],
 )
 def test_explicit_module_or_package_entry_point(tmp_path, entry, filename, helper):
+    """An ``__init__.py`` entry file imports as a package, at the root or nested."""
     sealed = package(
         tmp_path,
         {
@@ -545,11 +574,13 @@ def test_no_entry_point_guessing_or_optional_dependency_fallback(
 ):
     # The entry point is parsed and validated at verification, so invalid spellings
     # refuse before any import; sealed-but-unloadable entries refuse at import.
+    """Invalid entry points refuse at verification; unloadable ones refuse at import."""
     with pytest.raises(pk.SealedPackageError, match=message):
         pk.import_entry(package(tmp_path, files, entry))
 
 
 def test_reauthenticate_after_executable_import(tmp_path):
+    """A module that rewrites its own file on import fails the post-import re-hash."""
     sealed = package(
         tmp_path,
         {
@@ -564,6 +595,7 @@ def test_reauthenticate_after_executable_import(tmp_path):
 
 
 def test_embedded_sources_must_equal_sealed_bytes(tmp_path):
+    """An embedded source that differs from the sealed file refuses before import."""
     digest = seal_package(
         tmp_path,
         {
@@ -578,6 +610,7 @@ def test_embedded_sources_must_equal_sealed_bytes(tmp_path):
 
 
 def test_same_digest_from_another_directory_is_not_a_module_cache_hit(tmp_path):
+    """One digest binds to one directory per process; a copy elsewhere is refused."""
     files = {"kernel.py": b"def run(): return __file__\n"}
     first = package(tmp_path / "first", files)
     second = package(tmp_path / "second", files)
@@ -593,6 +626,7 @@ def test_same_digest_from_another_directory_is_not_a_module_cache_hit(tmp_path):
 
 
 def test_register_preloaded_short_circuits_the_build_path(tmp_path):
+    """A preloaded callable is served instead of a build, until it is cleared."""
     sealed = package(tmp_path, {"kernel.py": b"def run(x): return x + 1\n"})
     sentinel = lambda x: x  # noqa: E731
     register_preloaded(sealed.operation, "test_solution", sentinel)
@@ -605,6 +639,7 @@ def test_register_preloaded_short_circuits_the_build_path(tmp_path):
 
 
 def test_load_packages_strict_refuses_and_loose_collects(tmp_path, sm_gate_off):
+    """Strict loading raises on a bad digest; best effort records it in ``errors``."""
     good = package(tmp_path, {"kernel.py": b"def run(x): return x + 1\n"})
     with pytest.raises(pk.SealedPackageError):
         pk.load_packages(tmp_path, [good.digest, "0" * 64], enable=False)
@@ -616,6 +651,7 @@ def test_load_packages_strict_refuses_and_loose_collects(tmp_path, sm_gate_off):
 
 
 def test_duplicate_definitions_refuse(tmp_path, sm_gate_off):
+    """Two packages for one Definition refuse before the second's module runs."""
     first = package(tmp_path, {"kernel.py": b"def run(x): return x + 1\n"})
     # Refused before its module runs: a duplicate never executes sealed code.
     second = package(
@@ -630,6 +666,7 @@ def test_duplicate_definitions_refuse(tmp_path, sm_gate_off):
 
 
 def test_loose_loading_isolates_a_package_whose_module_raises(tmp_path, sm_gate_off):
+    """A module that raises on import fails strict loading and is isolated in loose."""
     good = package(tmp_path, {"kernel.py": b"def run(x): return x + 1\n"})
     broken = package(
         tmp_path / "broken", {"kernel.py": b"raise RuntimeError('boom')\n"}
@@ -648,6 +685,7 @@ def test_loose_loading_isolates_a_package_whose_module_raises(tmp_path, sm_gate_
 
 
 def test_preloaded_callable_is_bound_to_its_solution(tmp_path, monkeypatch):
+    """A hash-bound preloaded callable serves only its Solution and beats a build."""
     import flashinfer.trace_apply.apply as apply_module
     from flashinfer.trace.solution import Solution
 
@@ -685,6 +723,7 @@ def test_preloaded_callable_is_bound_to_its_solution(tmp_path, monkeypatch):
 def test_release_drops_every_sealed_identity_a_definition_accumulated(
     tmp_path, monkeypatch, sm_gate_off
 ):
+    """release_packages drops routes before every sealed identity's preloaded entry."""
     import flashinfer.trace_apply.apply as apply_module
 
     def plain(root, name):
@@ -726,6 +765,7 @@ def test_release_drops_every_sealed_identity_a_definition_accumulated(
 def test_a_registration_during_another_callers_build_is_seen_under_the_build_lock(
     tmp_path, monkeypatch
 ):
+    """A registration made during another caller's build wins under the build lock."""
     import threading
 
     import flashinfer.trace_apply.apply as apply_module
@@ -780,6 +820,7 @@ def test_a_registration_during_another_callers_build_is_seen_under_the_build_loc
 
 
 def test_target_hardware_gate(tmp_path, monkeypatch):
+    """The SM gate compares numbers: sm120 refuses an sm100 package; no GPU skips it."""
     import flashinfer.trace_apply.apply as apply_mod
 
     sealed = package(tmp_path, {"kernel.py": b"def run(x): return x + 1\n"})
@@ -796,6 +837,7 @@ def test_target_hardware_gate(tmp_path, monkeypatch):
 
 
 def test_env_loading_is_warning_only(tmp_path, monkeypatch, sm_gate_off):
+    """The env hook warns about a refused digest and still loads the good ones."""
     good = package(tmp_path, {"kernel.py": b"def run(x): return x + 1\n"})
     monkeypatch.setenv(pk.PACKAGES_ENV, f"{good.digest},{'0' * 64}")
     monkeypatch.setenv(pk.ROOT_ENV, str(tmp_path))
@@ -811,6 +853,7 @@ def test_env_loading_is_warning_only(tmp_path, monkeypatch, sm_gate_off):
 
 
 def test_env_kill_switch(tmp_path, monkeypatch):
+    """FLASHINFER_KERNEL_PLUGINS_DISABLE=1 warns and loads nothing."""
     good = package(tmp_path, {"kernel.py": b"def run(x): return x + 1\n"})
     monkeypatch.setenv(pk.PACKAGES_ENV, good.digest)
     monkeypatch.setenv(pk.ROOT_ENV, str(tmp_path))
@@ -822,6 +865,7 @@ def test_env_kill_switch(tmp_path, monkeypatch):
 
 def test_env_gate_asymmetry_regression(tmp_path, monkeypatch):
     # Only exactly "1" reaches the env hook; "true" warns and never enables.
+    """FLASHINFER_TRACE_APPLY=true warns and never enables Trace Apply."""
     monkeypatch.setenv("FLASHINFER_TRACE_APPLY", "true")
     with pytest.warns(UserWarning, match="must be '0' or '1'"):
         _enable_apply_from_env()

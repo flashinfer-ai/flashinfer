@@ -89,6 +89,7 @@ def materialize(solution: Solution) -> Path:
 
 
 def _import_file(module_name: str, path: Path) -> ModuleType:
+    """Import ``path`` as ``module_name``, dropping it from sys.modules on failure."""
     spec = importlib.util.spec_from_file_location(module_name, path)
     if spec is None or spec.loader is None:
         raise ImportError(f"Could not build import spec for {path}")
@@ -116,6 +117,7 @@ def load(solution: Solution) -> Callable:
     modules: dict[str, ModuleType] = {}
 
     def symbol(file_part: str, func_part: str, role: str) -> Callable:
+        """Import ``file_part`` once per role; return its ``func_part`` attribute."""
         module = modules.get(file_part)
         if module is None:
             path = _safe_relpath(sol_dir, file_part)

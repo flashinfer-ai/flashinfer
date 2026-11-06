@@ -123,6 +123,7 @@ def _call_device(tensors: tuple[Any, ...], kwargs: Mapping[str, Any]) -> Any:
 
 
 def _section(document: Mapping[str, Any], key: str) -> Mapping[str, Any]:
+    """Return ``document[key]`` when it is a mapping, else an empty one."""
     value = document.get(key)
     return value if isinstance(value, Mapping) else {}
 
@@ -200,6 +201,7 @@ class SetupBoundCallable:
         state_param: str,
         definition: Mapping[str, Any] | None = None,
     ) -> None:
+        """Bind ``run`` to its setup; it must take the keyword ``state_param``."""
         try:
             signature = inspect.signature(run)
         except (TypeError, ValueError) as error:
@@ -248,6 +250,7 @@ class SetupBoundCallable:
         }
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        """Run the entry point with the state prepared for the call's setup inputs."""
         if args:
             raise SetupStateError(
                 f"{self.name}: a setup-bearing Solution is called by keyword only, "
@@ -295,6 +298,7 @@ class SetupBoundCallable:
         return self._run(**kwargs)
 
     def _setup_tensors(self, kwargs: Mapping[str, Any]) -> tuple[Any, ...]:
+        """Collect the call's setup-input tensors; a missing or non-tensor refuses."""
         import torch
 
         tensors = []
@@ -316,6 +320,7 @@ class SetupBoundCallable:
         kwargs: Mapping[str, Any],
         device: Any,
     ) -> tuple[Any, tuple[Any, ...]]:
+        """Return the state for ``key``, running setup once under the capture rules."""
         import torch
 
         with self._lock:
@@ -378,6 +383,7 @@ class SetupBoundCallable:
     def _context(
         self, tensors: tuple[Any, ...], kwargs: Mapping[str, Any], device: Any
     ) -> dict[str, Any]:
+        """Build the context setup receives: axes, device, rank, inputs, outputs."""
         import torch
         import torch.distributed as dist
 

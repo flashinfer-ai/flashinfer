@@ -110,6 +110,7 @@ def json_bytes(value: object) -> bytes:
 
 
 def listing_sha256(files: Mapping[str, str]) -> str:
+    """Digest of the sorted name/digest listing that ``bundle_sha256`` seals."""
     listing = "".join(f"{name}\0{digest}\n" for name, digest in sorted(files.items()))
     return hashlib.sha256(listing.encode()).hexdigest()
 
