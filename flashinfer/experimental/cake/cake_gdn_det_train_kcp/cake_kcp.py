@@ -116,13 +116,14 @@ queries) is :mod:`.cake_kcp_plan` / :mod:`.cake_bytes`.
 from __future__ import annotations
 
 import dataclasses
+import inspect
 from collections.abc import Callable, Sequence
 from typing import Any
 
 import torch
 import torch.distributed as dist
 
-from . import cake_kcp_plan, cake_l2n
+from . import cake_bytes, cake_kcp_plan, cake_l2n
 from . import cake_options as _opt
 from .cake_bytes import TICKET_SITES, TICKET_SLOT_BYTES
 from .cake_options import (
@@ -5088,6 +5089,32 @@ def _prepare(
     return call, batched
 
 
+def _option_keywords(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """``fn`` with the signature of its call: ``fn``'s parameters without ``**knobs``, then one keyword-only
+    parameter per :class:`CakeGDNDetKcpOptions` field that ``fn`` does not name itself (the field's default).  The
+    body still takes those fields through ``**knobs`` and refuses any other name (``TypeError``), so a keyword that
+    is no option, ``deterministic`` included, fails ``inspect.signature(fn).bind_partial`` as it fails the call."""
+    sig = inspect.signature(fn)
+    params = [
+        p
+        for p in sig.parameters.values()
+        if p.kind is not inspect.Parameter.VAR_KEYWORD
+    ]
+    named = {p.name for p in params}
+    params += [
+        inspect.Parameter(
+            f.name,
+            inspect.Parameter.KEYWORD_ONLY,
+            default=f.default,
+            annotation=f.type,
+        )
+        for f in dataclasses.fields(CakeGDNDetKcpOptions)
+        if f.name not in named
+    ]
+    fn.__signature__ = sig.replace(parameters=params)  # type: ignore[attr-defined]
+    return fn
+
+
 def _literal_overrides(options: Any, *pairs: tuple[str, Any, Any]) -> dict[str, Any]:
     """The literal keywords of an entry point as option fields: each ``(name, value, default)`` overrides an
     ``options`` instance / dict only when it differs from its documented default (without ``options`` every value
@@ -5099,6 +5126,7 @@ def _literal_overrides(options: Any, *pairs: tuple[str, Any, Any]) -> dict[str, 
     }
 
 
+@_option_keywords
 def cake_gdn_det_train_kcp_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -5602,6 +5630,7 @@ def _check_mode_objects(saved: Any, workspace: Any) -> None:
             )
 
 
+@_option_keywords
 def cake_gdn_det_train_kcp_backward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -5941,6 +5970,7 @@ def cake_gdn_det_train_kcp_packed_qkv_views(
     return CakeGDNDetKcpPackedQKVSplitFunction.apply(qkv, H_qk, HV)
 
 
+@_option_keywords
 def cake_gdn_det_kcp(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -6019,25 +6049,12 @@ def cake_gdn_det_kcp(
 # Byte queries (literal public forms; the pure-CPU formulas live in the package's byte module)
 
 
-def cake_gdn_det_train_kcp_comm_bytes(ctx: Any, **kw: Any) -> dict:
-    """``cake_gdn_det_train_kcp_comm_bytes(ctx, *, H_qk, HV, C, ...)``: bytes this rank moves per collective and per boundary."""
-    from . import cake_bytes  # noqa: PLC0415
-
-    return cake_bytes.cake_gdn_det_train_kcp_comm_bytes(ctx, **kw)
-
-
-def cake_gdn_det_train_kcp_saved_bytes(ctx: Any, **kw: Any) -> int:
-    """``cake_gdn_det_train_kcp_saved_bytes(ctx, *, H_qk, HV, save_mode, save_transfer, ...)``: saved-set bytes of one layer."""
-    from . import cake_bytes  # noqa: PLC0415
-
-    return cake_bytes.cake_gdn_det_train_kcp_saved_bytes(ctx, **kw)
-
-
-def cake_gdn_det_train_kcp_workspace_bytes(ctx: Any, **kw: Any) -> int:
-    """``cake_gdn_det_train_kcp_workspace_bytes(ctx, *, H_qk, HV, ...)``: caller-held workspace bytes of one rank."""
-    from . import cake_bytes  # noqa: PLC0415
-
-    return cake_bytes.cake_gdn_det_train_kcp_workspace_bytes(ctx, **kw)
+# The public byte queries are the byte module's functions themselves: their keyword-only parameters are the call's.
+cake_gdn_det_train_kcp_comm_bytes = cake_bytes.cake_gdn_det_train_kcp_comm_bytes
+cake_gdn_det_train_kcp_saved_bytes = cake_bytes.cake_gdn_det_train_kcp_saved_bytes
+cake_gdn_det_train_kcp_workspace_bytes = (
+    cake_bytes.cake_gdn_det_train_kcp_workspace_bytes
+)
 
 
 __all__ = [

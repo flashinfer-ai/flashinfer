@@ -88,6 +88,8 @@ with this module's ``ctx``.
 
 from __future__ import annotations
 
+import inspect
+from collections.abc import Callable
 from typing import Any, Optional
 
 import torch
@@ -102,6 +104,39 @@ def _pkg():
     from .experimental.cake import cake_gdn_det_train_kcp  # noqa: PLC0415 - the backend package, imported on first use
 
     return cake_gdn_det_train_kcp
+
+
+class _Forwarded:
+    """``__wrapped__`` of a facade function that hands its ``**`` keywords to the package function of its name.
+    ``inspect.signature`` of the facade function follows it and gives the call's signature: the facade function's
+    own parameters without ``**``, then each keyword-only parameter of the package function that the facade
+    function does not name (every option field, keyword-only).  The package is imported on the first inspection or
+    call, so importing this module still imports nothing."""
+
+    def __init__(self, fn: Callable[..., Any]) -> None:
+        self._fn = fn
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return self._fn(*args, **kwargs)
+
+    @property
+    def __signature__(self) -> inspect.Signature:
+        own = inspect.signature(self._fn, follow_wrapped=False)
+        params = [p for p in own.parameters.values() if p.kind is not p.VAR_KEYWORD]
+        named = {p.name for p in params}
+        theirs = inspect.signature(getattr(_pkg(), self._fn.__name__)).parameters
+        params += [
+            p
+            for p in theirs.values()
+            if p.kind is p.KEYWORD_ONLY and p.name not in named
+        ]
+        return own.replace(parameters=params)
+
+
+def _forwards_keywords(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Mark ``fn`` as handing its ``**`` keywords to the package function of its name (:class:`_Forwarded`)."""
+    fn.__wrapped__ = _Forwarded(fn)  # type: ignore[attr-defined]
+    return fn
 
 
 @flashinfer_api
@@ -164,6 +199,7 @@ def cake_gdn_det_train_kcp_build_context(
 
 
 @flashinfer_api
+@_forwards_keywords
 def cake_gdn_det_train_kcp_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -232,6 +268,7 @@ def cake_gdn_det_train_kcp_forward(
 
 
 @flashinfer_api
+@_forwards_keywords
 def cake_gdn_det_train_kcp_backward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -287,6 +324,7 @@ def cake_gdn_det_train_kcp_backward(
 
 
 @flashinfer_api
+@_forwards_keywords
 def cake_gdn_det_kcp(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -414,6 +452,7 @@ def cake_gdn_det_train_kcp_packed_qkv_views(
 
 
 @flashinfer_api
+@_forwards_keywords
 def cake_gdn_det_train_kcp_workspace_bytes(
     ctx: Any, *, H_qk: int, HV: int, **kw: Any
 ) -> int:
@@ -426,6 +465,7 @@ def cake_gdn_det_train_kcp_workspace_bytes(
 
 
 @flashinfer_api
+@_forwards_keywords
 def cake_gdn_det_train_kcp_saved_bytes(
     ctx: Any, *, H_qk: int, HV: int, **kw: Any
 ) -> int:
@@ -436,6 +476,7 @@ def cake_gdn_det_train_kcp_saved_bytes(
 
 
 @flashinfer_api
+@_forwards_keywords
 def cake_gdn_det_train_kcp_comm_bytes(
     ctx: Any, *, H_qk: int, HV: int, C: int = 10240, **kw: Any
 ) -> dict:

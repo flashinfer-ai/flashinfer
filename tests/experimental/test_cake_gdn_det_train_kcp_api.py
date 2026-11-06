@@ -542,7 +542,7 @@ def test_entry_points_take_every_knob_keyword_only() -> None:
     ):
         sig = inspect.signature(fn)
         for p in _after(sig, anchor):
-            assert p.kind in (p.KEYWORD_ONLY, p.VAR_KEYWORD), (fn.__name__, p.name)
+            assert p.kind is p.KEYWORD_ONLY, (fn.__name__, p.name)
     sig = inspect.signature(kcp.cake_gdn_det_kcp)
     assert sig.parameters["save_mode"].default == "light"
     assert sig.parameters["boundary_mode"].default == "saved"
@@ -587,14 +587,14 @@ def test_facade_exposes_the_contract_names_keyword_only() -> None:
         (facade.cake_gdn_det_train_kcp_backward, "dout"),
     ):
         for p in _after(inspect.signature(fn), anchor):
-            assert p.kind in (p.KEYWORD_ONLY, p.VAR_KEYWORD), (fn.__name__, p.name)
+            assert p.kind is p.KEYWORD_ONLY, (fn.__name__, p.name)
     for fn in (
         facade.cake_gdn_det_train_kcp_workspace_bytes,
         facade.cake_gdn_det_train_kcp_saved_bytes,
         facade.cake_gdn_det_train_kcp_comm_bytes,
     ):
         for p in _after(inspect.signature(fn), "ctx"):
-            assert p.kind in (p.KEYWORD_ONLY, p.VAR_KEYWORD), (fn.__name__, p.name)
+            assert p.kind is p.KEYWORD_ONLY, (fn.__name__, p.name)
     # every public function of the facade module is a real def decorated with ``@flashinfer_api`` (the support query
     # too); the decorator returns the function unchanged while logging is off, so the check reads the source
     tree = ast.parse(pathlib.Path(facade.__file__).read_text())
@@ -604,7 +604,13 @@ def test_facade_exposes_the_contract_names_keyword_only() -> None:
         if isinstance(node, ast.FunctionDef) and not node.name.startswith("_")
     }
     assert sorted(decorators) == sorted(names)
-    assert all(d == ["flashinfer_api"] for d in decorators.values()), decorators
+    # under it the entries of OPTION_KEYWORD_ENTRIES carry the facade's ``_forwards_keywords``, which declares the
+    # keywords they hand to the package (``test_option_keyword_entries_declare_every_option_field``)
+    for name, found in decorators.items():
+        want = ["flashinfer_api"]
+        if name in OPTION_KEYWORD_ENTRIES:
+            want.append("_forwards_keywords")
+        assert found == want, (name, found)
     # a stable API: no entry is marked experimental
     for n in names:
         assert getattr(getattr(facade, n), "is_experimental", False) is False, n
@@ -725,6 +731,93 @@ DET_FREE_NAMES = (
     "validate_heads",
     "validate_ring",
 )
+
+
+# The entries that take the option keywords as ``**knobs`` / ``**kw``.  Their signatures declare the call's keywords,
+# with no ``**`` parameter (``test_option_keyword_entries_declare_every_option_field``), so a stray ``deterministic=``
+# fails ``inspect.signature(...).bind_partial`` as it fails the call, which refuses it with ``TypeError``.
+OPTION_KEYWORD_ENTRIES = frozenset(
+    {
+        "cake_gdn_det_kcp",
+        "cake_gdn_det_train_kcp_forward",
+        "cake_gdn_det_train_kcp_backward",
+        "cake_gdn_det_train_kcp_workspace_bytes",
+        "cake_gdn_det_train_kcp_saved_bytes",
+        "cake_gdn_det_train_kcp_comm_bytes",
+    }
+)
+
+
+def _own_keyword_only(fn, name: str) -> set[str]:
+    """The keyword-only parameters that the def of ``fn`` names itself, read from its code object (through a
+    ``functools.wraps`` wrapper of ``@flashinfer_api`` at a raised log level), not from its declared signature."""
+    raw = inspect.unwrap(
+        fn,
+        stop=lambda f: getattr(getattr(f, "__code__", None), "co_name", None) == name,
+    )
+    code = raw.__code__
+    assert code.co_name == name, (name, code.co_name)
+    first = code.co_argcount
+    return set(code.co_varnames[first : first + code.co_kwonlyargcount])
+
+
+def test_option_keyword_entries_declare_every_option_field() -> None:
+    """The entries of :data:`OPTION_KEYWORD_ENTRIES` take their option keywords through ``**knobs`` / ``**kw``, and
+    their signatures (facade, package root, ``cake_kcp``) declare the call's keywords, with no ``**`` parameter and
+    no ``deterministic``.  A compute entry declares the keywords its def names plus one keyword-only parameter per
+    :class:`CakeGDNDetKcpOptions` field (the field's default where the def does not name it); the facade declares
+    the package's keywords.  A byte query of the package is the byte module's function of its name, and the facade
+    declares the keyword-only parameters of that function (its own ``C`` default: 10240 channels)."""
+    facade = importlib.import_module("flashinfer.cake_gdn_det_train_kcp")
+    pkg, kcp, nbytes = _mod(), _mod("cake_kcp"), _mod("cake_bytes")
+    fields = {f.name: f.default for f in dataclasses.fields(CakeGDNDetKcpOptions)}
+    assert all(d is not dataclasses.MISSING for d in fields.values()), fields
+    for name in sorted(OPTION_KEYWORD_ENTRIES):
+        byte_query = name.endswith("_bytes")
+        if byte_query:
+            reference = getattr(nbytes, name)
+            assert (
+                getattr(kcp, name) is reference and getattr(pkg, name) is reference
+            ), name
+        else:
+            reference = getattr(kcp, name)
+            assert getattr(pkg, name) is reference, name
+        ref_params = inspect.signature(reference).parameters
+        ref_kw = {n for n, p in ref_params.items() if p.kind is p.KEYWORD_ONLY}
+        for module in (facade, pkg, kcp):
+            fn = getattr(module, name)
+            params = inspect.signature(fn).parameters
+            where = (module.__name__, name)
+            assert all(p.kind is not p.VAR_KEYWORD for p in params.values()), where
+            assert "deterministic" not in params, where
+            kw_only = {n for n, p in params.items() if p.kind is p.KEYWORD_ONLY}
+            assert kw_only == ref_kw, (*where, kw_only ^ ref_kw)
+            own = _own_keyword_only(fn, name)
+            if byte_query:
+                assert own <= kw_only, (*where, own - kw_only)
+                for n in kw_only - own:
+                    assert params[n].default == ref_params[n].default, (*where, n)
+            else:
+                assert kw_only == own | set(fields), (
+                    *where,
+                    kw_only ^ (own | set(fields)),
+                )
+                for n in set(fields) - own:
+                    assert params[n].default == fields[n], (
+                        *where,
+                        n,
+                        params[n].default,
+                    )
+            try:
+                inspect.signature(fn).bind_partial(deterministic=False)
+            except TypeError as exc:
+                assert "deterministic" in str(exc), (*where, exc)
+            else:
+                pytest.fail(f"{module.__name__}.{name} binds deterministic=")
+    comm = inspect.signature(facade.cake_gdn_det_train_kcp_comm_bytes).parameters
+    assert (
+        comm["C"].kind is inspect.Parameter.KEYWORD_ONLY and comm["C"].default == 10240
+    )
 
 
 def test_legacy_names_are_removed() -> None:
@@ -905,11 +998,13 @@ def test_package_reads_no_environment_variable() -> None:
 
 
 def test_host_modules_import_only_torch_and_their_package() -> None:
-    """The host module and the options module import the standard library's typing helpers, torch, torch.distributed
-    and their own package only (relative imports); the registry / emulation are imported lazily inside functions."""
+    """The host module and the options module import the standard library's typing and introspection helpers
+    (``inspect``: the declared signatures of the option-keyword entries), torch, torch.distributed and their own
+    package only (relative imports); the registry / emulation are imported lazily inside functions."""
     allowed = {
         "__future__",
         "dataclasses",
+        "inspect",
         "math",
         "types",
         "typing",
