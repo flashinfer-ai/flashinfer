@@ -13,9 +13,9 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-One KCP workspace shared by several prepared packs (``cake_kda_det_train_kcp.cake_kcp.WorkspaceDetKcp``): ``reserve`` sizes it
+One KCP workspace shared by several prepared packs (``cake_kda_det_train_kcp.cake_kcp.CakeKDADetKcpWorkspace``): ``reserve`` sizes it
 for a list of contexts (each pool at its largest need, the local arena at the largest layout, a plan view of it per
-other pack), ``kda_det_workspace_bytes_kcp([ctx, ...], H=)`` predicts its bytes, and the calls of the reserved packs, in any
+other pack), ``cake_kda_det_train_kcp_workspace_bytes([ctx, ...], H=)`` predicts its bytes, and the calls of the reserved packs, in any
 interleaving, allocate nothing, keep every pointer and give bitwise the results of one workspace per pack.  The
 workspace holds no context, its host caches are bounded, a call on another stream is ordered after the last one on
 the device and a storage it releases is reused only after that stream's queued work (``record_stream`` on a switch
@@ -76,7 +76,7 @@ def _part(lengths, W: int = 1, layout: str = "contiguous"):
 
 def _new_ws(**kw):
     backend = cake_kcp.get_backend()
-    return cake_kcp.WorkspaceDetKcp(
+    return cake_kcp.CakeKDADetKcpWorkspace(
         state_dtype=backend.dtypes["state"], local=backend.local_stages, **kw
     )
 
@@ -108,7 +108,7 @@ def _pointers(ws) -> dict:
 
 
 def test_byte_query_of_a_list_is_the_per_pool_max() -> None:
-    """``kda_det_workspace_bytes_kcp([ctx, ...])`` (host only): a list of one context is that context's bytes; a list gives
+    """``cake_kda_det_train_kcp_workspace_bytes([ctx, ...])`` (host only): a list of one context is that context's bytes; a list gives
     each pool at its largest need over the contexts (a :data:`SHARED_POOLS` pair one storage of the larger), the
     largest local arena and each distinct pack's scratch table set -- computed here independently from the
     single-context queries; a ``reserve`` of the same list on a pools-only workspace allocates exactly that pool
@@ -126,9 +126,13 @@ def test_byte_query_of_a_list_is_the_per_pool_max() -> None:
                 for H in HEADS:
                     for backward in (True, False):
                         kw = {"H": H, "backward": backward}
-                        single = [kp.kda_det_workspace_bytes_kcp(c, **kw) for c in ctxs]
+                        single = [
+                            kp.cake_kda_det_train_kcp_workspace_bytes(c, **kw)
+                            for c in ctxs
+                        ]
                         assert (
-                            kp.kda_det_workspace_bytes_kcp([ctxs[0]], **kw) == single[0]
+                            kp.cake_kda_det_train_kcp_workspace_bytes([ctxs[0]], **kw)
+                            == single[0]
                         )
                         lays = [kp.kcp_arena_layout(c, **kw) for c in ctxs]
                         need = {
@@ -167,7 +171,7 @@ def test_byte_query_of_a_list_is_the_per_pool_max() -> None:
                             (c.T_r, c.n_frag): loc - a
                             for c, loc, a in zip(ctxs, local, arena, strict=True)
                         }
-                        got = kp.kda_det_workspace_bytes_kcp(ctxs, **kw)
+                        got = kp.cake_kda_det_train_kcp_workspace_bytes(ctxs, **kw)
                         assert got == max(arena) + sum(scratch.values()) + pools, (
                             W,
                             layout,
@@ -178,14 +182,14 @@ def test_byte_query_of_a_list_is_the_per_pool_max() -> None:
                         assert max(single) <= got < sum(single)
                         if backward:
                             for order in (ctxs, ctxs[::-1]):
-                                ws = cake_kcp.WorkspaceDetKcp(local=False)
+                                ws = cake_kcp.CakeKDADetKcpWorkspace(local=False)
                                 ws.reserve(order, H)
                                 assert ws.bytes == pools, (W, layout, r, H)
                                 ptrs = _pointers(ws)
                                 for c in order:
                                     ws.ensure(c, H, device="cpu", backward=False)
                                 assert _pointers(ws) == ptrs and ws.bytes == pools
-                            ws_r = cake_kcp.WorkspaceDetKcp(local=False)
+                            ws_r = cake_kcp.CakeKDADetKcpWorkspace(local=False)
                             ws_r.reserve(ctxs, H, ring=True)  # the hop pools too
                             assert ws_r.bytes == pools + sum(
                                 max(lay[f"pool.{n}"] for lay in lays)
@@ -196,7 +200,7 @@ def test_byte_query_of_a_list_is_the_per_pool_max() -> None:
 
 
 def test_reserve_floor_and_allocate_false_size_forwards_for_the_backward() -> None:
-    """``reserve`` and ``WorkspaceDetKcp(ctx, H, allocate=False)`` keep a backward sizing floor: a later forward ensure
+    """``reserve`` and ``CakeKDADetKcpWorkspace(ctx, H, allocate=False)`` keep a backward sizing floor: a later forward ensure
     sizes the backward pools too (no forward-only state to upgrade); ``allocate=False`` allocates nothing until the
     first ensure; a workspace without a context keeps today's forward-only first state."""
     part = _part((1000, 577), 4, "zigzag_per_document")
@@ -204,14 +208,16 @@ def test_reserve_floor_and_allocate_false_size_forwards_for_the_backward() -> No
     full = kp.kcp_arena_layout(ctx, H=4)["arena"]
     fwd = kp.kcp_arena_layout(ctx, H=4, backward=False)["arena"]
     assert fwd < full
-    ws = cake_kcp.WorkspaceDetKcp(ctx, 4, device="cpu", local=False, allocate=False)
+    ws = cake_kcp.CakeKDADetKcpWorkspace(
+        ctx, 4, device="cpu", local=False, allocate=False
+    )
     assert ws.bytes == 0 and not ws._pools and ws.local is None
     ws.ensure(ctx, 4, device="cpu", backward=False)
     assert ws.bytes == full and ws.has("b1_send")
-    plain = cake_kcp.WorkspaceDetKcp(local=False)
+    plain = cake_kcp.CakeKDADetKcpWorkspace(local=False)
     plain.ensure(ctx, 4, device="cpu", backward=False)
     assert plain.bytes == fwd and not plain.has("b1_send")
-    reserved = cake_kcp.WorkspaceDetKcp(local=False)
+    reserved = cake_kcp.CakeKDADetKcpWorkspace(local=False)
     reserved.reserve([ctx], 4)
     ptrs = _pointers(reserved)
     reserved.ensure(ctx, 4, device="cpu", backward=False)
@@ -225,7 +231,7 @@ def test_shared_workspace_holds_no_context_and_bounds_its_caches() -> None:
     table set weakly; the table set lives on the context); its pool-view and ensure-record caches stay bounded,
     and a record per context lets interleaved packs keep the fast path."""
     part = _part((1000, 577))
-    ws = cake_kcp.WorkspaceDetKcp(local=False)
+    ws = cake_kcp.CakeKDADetKcpWorkspace(local=False)
     refs = []
     for _ in range(3):
         ctx = kp.build_context_det_kcp(part, None, 0, "cpu", 4, sm_count=SM_COUNT)
@@ -320,13 +326,13 @@ def _packs(device, H: int, packs=PACKS, W: int = 1, rank: int = 0, layout="conti
 
 
 def _fwd(ctx, o, ws, **kw):
-    return cake_kcp.chunk_kda_det_fwd_kcp(
+    return cake_kcp.cake_kda_det_train_kcp_forward(
         o["q"], o["k"], o["v"], o["g"], o["beta"], ctx, workspace=ws, **kw
     )
 
 
 def _bwd(ctx, o, ws, saved, **kw):
-    return cake_kcp.chunk_kda_det_bwd_kcp(
+    return cake_kcp.cake_kda_det_train_kcp_backward(
         o["q"],
         o["k"],
         o["v"],
@@ -383,7 +389,7 @@ def _schedule(ctxs, ops, wss, *, poison=None, **kw) -> list[dict]:
             for name in ("q", "k", "v", "g", "beta")
         ]
         out = torch.utils.checkpoint.checkpoint(
-            lambda *a, i=i: cake_kcp.chunk_kda_det_kcp(
+            lambda *a, i=i: cake_kcp.cake_kda_det_kcp(
                 *a, ctxs[i], None, "light", "saved", wss[i], **kw
             ),
             *lf,
@@ -415,19 +421,21 @@ def test_gpu_reserved_shared_workspace_is_bitwise_per_pack(device) -> None:
     without a saved set, checkpointed autograd through all packs; the arena NaN-filled before every forward): out,
     the written saved sets and every gradient are bitwise those of one workspace per pack.  ``reserve`` allocates
     exactly the workspace's storages (``memory_allocated`` delta = their allocator-rounded bytes) and its ``bytes``
-    equal ``kda_det_workspace_bytes_kcp(ctxs, H=H)``, below the sum of the per-pack workspaces; the local arena is the
+    equal ``cake_kda_det_train_kcp_workspace_bytes(ctxs, H=H)``, below the sum of the per-pack workspaces; the local arena is the
     largest per-pack arena; after two schedules no pointer, arena, view or byte count has changed."""
     seen_p1 = seen_pn = 0
     for H in HEADS:
         ctxs, ops = _packs(device, H)
-        Ps = [cake_kcp.WorkspaceDetKcp(local=False).tables(c, H).P for c in ctxs]
+        Ps = [cake_kcp.CakeKDADetKcpWorkspace(local=False).tables(c, H).P for c in ctxs]
         seen_p1 += sum(P == 1 for P in Ps)
         seen_pn += sum(P > 1 for P in Ps)
         per = [_new_ws() for _ in ctxs]
         for c, w in zip(ctxs, per, strict=True):
             w.ensure(c, H, device=device, backward=True)
         per_bytes = [w.bytes for w in per]
-        assert per_bytes == [kp.kda_det_workspace_bytes_kcp(c, H=H) for c in ctxs]
+        assert per_bytes == [
+            kp.cake_kda_det_train_kcp_workspace_bytes(c, H=H) for c in ctxs
+        ]
         per_arena = max(w.local.bytes for w in per)
         ref = _schedule(ctxs, ops, per)
         del per
@@ -441,7 +449,7 @@ def test_gpu_reserved_shared_workspace_is_bitwise_per_pack(device) -> None:
         rounded = sum(
             -(-t.untyped_storage().nbytes() // 512) * 512 for t in _storages(ws)
         )
-        pred = kp.kda_det_workspace_bytes_kcp(ctxs, H=H)
+        pred = kp.cake_kda_det_train_kcp_workspace_bytes(ctxs, H=H)
         print(
             f"SHARED_WS H={H} P={Ps} per_pack={per_bytes} sum={sum(per_bytes)} max={max(per_bytes)} "
             f"shared={ws.bytes} pred={pred} delta={delta} rounded={rounded}"
@@ -501,15 +509,15 @@ def test_gpu_unreserved_shared_workspace_grows_to_the_max_only(device) -> None:
     for i in range(len(ctxs)):
         for key, val in ref[i].items():
             assert _same(res[i][key], val), (i, key)
-    assert ws.bytes == kp.kda_det_workspace_bytes_kcp(ctxs, H=H)
+    assert ws.bytes == kp.cake_kda_det_train_kcp_workspace_bytes(ctxs, H=H)
     print(f"UNRESERVED replaced={replaced} bytes={ws.bytes}")
 
 
 def test_gpu_allocate_false_sizes_the_first_forward_for_the_backward(device) -> None:
-    """B T3 with the sizing floor (compared after the first backward): ``WorkspaceDetKcp(ctx, H, allocate=False)``
-    allocates nothing; its first forward allocates the backward workspace (``kda_det_workspace_bytes_kcp(ctx, H=H)``, the
+    """B T3 with the sizing floor (compared after the first backward): ``CakeKDADetKcpWorkspace(ctx, H, allocate=False)``
+    allocates nothing; its first forward allocates the backward workspace (``cake_kda_det_train_kcp_workspace_bytes(ctx, H=H)``, the
     backward arena) and the first backward allocates nothing more and moves no pointer; the results are bitwise
-    those of ``WorkspaceDetKcp(ctx, H)``."""
+    those of ``CakeKDADetKcpWorkspace(ctx, H)``."""
     for H in HEADS:
         ctxs, ops = _packs(device, H, packs=PACKS[:2])
         ctx, o = ctxs[0], ops[0]
@@ -524,16 +532,17 @@ def test_gpu_allocate_false_sizes_the_first_forward_for_the_backward(device) -> 
         torch.cuda.synchronize(device)
         assert torch.cuda.memory_allocated(device) == base and ws.bytes == 0
         out, saved = _fwd(ctx, o, ws)
-        assert ws.local.backward and ws.bytes == kp.kda_det_workspace_bytes_kcp(
-            ctx, H=H
+        assert (
+            ws.local.backward
+            and ws.bytes == kp.cake_kda_det_train_kcp_workspace_bytes(ctx, H=H)
         )
         ptrs = _pointers(ws)
         torch.cuda.synchronize(device)
         before = torch.cuda.memory_allocated(device)
         grads = _bwd(ctx, o, ws, saved)
-        assert _pointers(ws) == ptrs and ws.bytes == kp.kda_det_workspace_bytes_kcp(
-            ctx, H=H
-        )
+        assert _pointers(
+            ws
+        ) == ptrs and ws.bytes == kp.cake_kda_det_train_kcp_workspace_bytes(ctx, H=H)
         assert torch.equal(out, out_r) and _same(grads, grads_r), H
         assert _same(written_tensors(saved), written_tensors(saved_r)), H
         del grads
@@ -567,7 +576,7 @@ def test_gpu_four_pack_step_peak_drops_by_sum_minus_max(device) -> None:
             ]
             outs.append(
                 torch.utils.checkpoint.checkpoint(
-                    lambda *a, c=c, i=i: cake_kcp.chunk_kda_det_kcp(
+                    lambda *a, c=c, i=i: cake_kcp.cake_kda_det_kcp(
                         *a, c, None, "light", "saved", wss[i]
                     ),
                     *lf,
@@ -1099,7 +1108,7 @@ def _handle_pass(ctxs, ops, wss, *, keep=None, order="interleaved", poison=None,
     """Per pack :data:`HANDLE_LAYERS` KDA layers on its context (layer ``l + 1`` reads layer ``l``'s ``out`` as
     ``v``; leaves ``q, k, v, g, beta``; ``backward(dout)`` from the last layer).  ``keep=None``: direct autograd, no
     checkpoint, no handle (the reference).  Otherwise every layer runs under ``torch.utils.checkpoint`` (non-reentrant)
-    with its own :class:`RecomputeHandleDetKcp` and ``checkpoint_keep=keep``.  ``wss[i]``: pack ``i``'s workspace (one
+    with its own :class:`CakeKDADetKcpRecomputeHandle` and ``checkpoint_keep=keep``.  ``wss[i]``: pack ``i``'s workspace (one
     object: shared).  ``poison(ws)`` before every forward and backward.  Right after each checkpointed forward the
     handle's stored tensors are copied; before every backward and at the end every stored tensor is compared bitwise
     with its copy (a stored tensor in the shared workspace would be overwritten by the other packs' calls and
@@ -1141,13 +1150,13 @@ def _handle_pass(ctxs, ops, wss, *, keep=None, order="interleaved", poison=None,
             if poison is not None:
                 poison(ws)
             if keep is None:
-                y = cake_kcp.chunk_kda_det_kcp(
+                y = cake_kcp.cake_kda_det_kcp(
                     q, k, y, g, b, ctx, None, "light", "saved", ws, **kw
                 )
                 continue
 
             def fn(q_, k_, v_, g_, b_, h_, w_, _i=i, _layer=layer):
-                out = cake_kcp.chunk_kda_det_kcp(
+                out = cake_kcp.cake_kda_det_kcp(
                     q_,
                     k_,
                     v_,
@@ -1165,7 +1174,7 @@ def _handle_pass(ctxs, ops, wss, *, keep=None, order="interleaved", poison=None,
                 seen[_i][_layer].append(out.detach().clone())
                 return out * w_
 
-            h = cake_kcp.RecomputeHandleDetKcp()
+            h = cake_kcp.CakeKDADetKcpRecomputeHandle()
             # ``out * w`` with ``w`` a leaf of ones changes no bit of ``out`` or of its gradient, but the product's
             # backward reads the recompute's ``out``: the recompute runs past the record above (torch stops a
             # recompute once the tensors it needs are back)
@@ -1346,7 +1355,7 @@ def _run_dist_rank(
 ) -> dict:
     """One rank: the four packs on one workspace per pack (reference) and on one reserved shared workspace (the
     interleaved schedule, the arena NaN-filled before every forward), bitwise compared on this rank; the shared
-    workspace's bytes against ``kda_det_workspace_bytes_kcp(ctxs)`` and the per-pack sum, pointer stability over two rounds.
+    workspace's bytes against ``cake_kda_det_train_kcp_workspace_bytes(ctxs)`` and the per-pack sum, pointer stability over two rounds.
     The verdicts are gathered to every rank."""
     packs, H, _w, layout, exchange = row
     device, ctxs, ops = _rank_packs(rank, W, row, rdzv)
@@ -1356,7 +1365,9 @@ def _run_dist_rank(
     per = [_new_ws() for _ in ctxs]
     ref = _schedule(ctxs, ops, per, **kw)
     report["per_pack_bytes"] = [w.bytes for w in per]
-    report["P"] = [cake_kcp.WorkspaceDetKcp(local=False).tables(c, H).P for c in ctxs]
+    report["P"] = [
+        cake_kcp.CakeKDADetKcpWorkspace(local=False).tables(c, H).P for c in ctxs
+    ]
     del per
     gc.collect()
     torch.cuda.synchronize(device)
@@ -1370,7 +1381,7 @@ def _run_dist_rank(
     )
     report["shared_bytes"] = ws.bytes
     # the ring rows reserve the hop pools too: each at its largest need over the packs
-    report["pred_bytes"] = kp.kda_det_workspace_bytes_kcp(ctxs, H=H) + (
+    report["pred_bytes"] = kp.cake_kda_det_train_kcp_workspace_bytes(ctxs, H=H) + (
         sum(
             max(kp.kcp_arena_layout(c, H=H)[f"pool.{name}"] for c in ctxs)
             for name in kp.LAZY_POOLS
@@ -1390,7 +1401,7 @@ def _run_dist_rank(
         if _pointers(ws) != ptrs:
             report["fail"].append(f"pointers moved r{rnd}")
     if report["shared_bytes"] != report["pred_bytes"]:
-        report["fail"].append("bytes != kda_det_workspace_bytes_kcp(ctxs)")
+        report["fail"].append("bytes != cake_kda_det_train_kcp_workspace_bytes(ctxs)")
     # the caching allocator may hand out a cached block up to 1 MiB larger than a request without splitting it
     if not (
         report["rounded"]

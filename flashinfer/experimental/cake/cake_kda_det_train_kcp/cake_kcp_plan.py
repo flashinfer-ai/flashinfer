@@ -139,8 +139,8 @@ P_RULES = (
 P_RULE_DEFAULT = "wave_fill1_p1tie"  # shipped; "wave_fill1" = the previous default, via _kcp_test_knobs only
 # The shipped default of ``save_transfer`` (the design note §6.2) -- the merge owner
 # keeps its c1 receive tensor (and the home rank its M_seg at P > 1) for the backward instead of re-sending M_f^T in b1.
-# Default of the byte queries below and of ``cake_kcp.OptionsDetKcp``; ``False`` (the earlier recompute form) stays
-# selectable through the ``save_transfer`` argument; ``kda_det_saved_bytes_kcp`` reports the delta.
+# Default of the byte queries below and of ``cake_kcp.CakeKDADetKcpOptions``; ``False`` (the earlier recompute form) stays
+# selectable through the ``save_transfer`` argument; ``cake_kda_det_train_kcp_saved_bytes`` reports the delta.
 SAVE_TRANSFER_DEFAULT = True
 # Wave-aware P rule: per-CTA-step constants at one CTA per SM on GB300, H = 64, in 10 ns units (exact integer arithmetic
 # keeps the argmin and its ties identical on every rank), measured on the CP4 / CP8 profiles and the walk / merge
@@ -2444,7 +2444,7 @@ def _check_save_mode(save_mode: str) -> None:
         raise ValueError(f"save_mode must be 'light' or 'tape', got {save_mode!r}")
 
 
-# What a checkpoint recompute handle keeps of one KDA call (``cake_kcp.chunk_kda_det_kcp(..., recompute_handle=,
+# What a checkpoint recompute handle keeps of one KDA call (``cake_kcp.cake_kda_det_kcp(..., recompute_handle=,
 # checkpoint_keep=)``): ``"states"`` (the default) the incoming states ``S_in`` -- the call runs with
 # ``save_transfer=False`` --, ``"transfer"`` also the owner's c1 receive tensor (``save_transfer=True``).
 CHECKPOINT_KEEPS = ("states", "transfer")
@@ -2471,7 +2471,7 @@ def _check_checkpoint_keep(
     return transfer
 
 
-def kda_det_saved_bytes_kcp(
+def cake_kda_det_train_kcp_saved_bytes(
     ctx: ContextDetKcp,
     *,
     H: int = 64,
@@ -2484,7 +2484,7 @@ def kda_det_saved_bytes_kcp(
     use_qk_l2norm_in_kernel: bool = False,
     use_gate_in_kernel: bool = False,
 ) -> int:
-    """Saved-set bytes of one layer on this rank (the KCP contract §3.2 ``kda_det_saved_bytes_kcp(ctx, ...)``)::
+    """Saved-set bytes of one layer on this rank (the KCP contract §3.2 ``cake_kda_det_train_kcp_saved_bytes(ctx, ...)``)::
 
     tables_bytes(NC_pad, n_frag, NSEG)                         # the int32 tables
     + n_in * s                                                 # S_in, s = H * 128 * 128 * 4
@@ -2506,7 +2506,7 @@ def kda_det_saved_bytes_kcp(
 
     The retained ``S_in`` and c1 tensors are the padded receive buffers (``s`` -> ``n_owners Hg`` tiles,
     ``Hg_r`` -> ``Hg_pad_r``); identical to the formula for ``H = 64``, and the padding is reported by
-    ``kda_det_comm_bytes_kcp(...)["padding"]``.  ``M_seg`` stays the dense copy of §9 (``NSEG s``).
+    ``cake_kda_det_train_kcp_comm_bytes(...)["padding"]``.  ``M_seg`` stays the dense copy of §9 (``NSEG s``).
 
     ``checkpoint_keep`` (``None`` = the saved set above): the bytes a checkpoint recompute handle retains for this
     layer while its backward is pending -- the tensors the handle's ``"kda"`` entry holds (exactly
@@ -2523,7 +2523,7 @@ def kda_det_saved_bytes_kcp(
     (#7039).
 
     ``use_qk_l2norm_in_kernel`` (issue #7817): the saved set of the in-kernel Q / K L2 norm adds the per-token FP32
-    rstd of q and k (``SavedDetKcp.qk_rstd``, empty on a rank without tokens; the raw q / k are the caller's tensors,
+    rstd of q and k (``CakeKDADetKcpSaved.qk_rstd``, empty on a rank without tokens; the raw q / k are the caller's tensors,
     not counted here).  A recompute handle's entry does not change: the recompute writes its rstd afresh.  While the
     single-rank programs of the mode are absent it raises ``NotImplementedError`` as the workspace does
     (:func:`require_qk_l2norm`), for the gate mode ``use_gate_in_kernel`` (the call's; the bytes do not depend on
@@ -2568,7 +2568,7 @@ def kda_det_saved_bytes_kcp(
     return total
 
 
-def kda_det_comm_bytes_kcp(
+def cake_kda_det_train_kcp_comm_bytes(
     ctx: ContextDetKcp,
     *,
     H: int = 64,
@@ -2577,7 +2577,7 @@ def kda_det_comm_bytes_kcp(
     boundary_mode: str = "saved",
     checkpoint_keep: str | None = None,
 ) -> dict:
-    """Bytes this rank moves per collective and per boundary (the KCP contract §3.2 ``kda_det_comm_bytes_kcp(ctx)``; ``send`` / ``recv``
+    """Bytes this rank moves per collective and per boundary (the KCP contract §3.2 ``cake_kda_det_train_kcp_comm_bytes(ctx)``; ``send`` / ``recv``
     per collective, totals ``B1`` = forward (c1, c2, halo_fwd), ``B2`` = backward from the saved context (b1 with
     the re-sent maps unless ``save_transfer``, b2, halo_bwd), ``B3`` = the replayed forward + the backward with b1
     in its replay form (offsets only); plus the crossing-fragment counts and the per-fragment state bytes.
@@ -2677,7 +2677,7 @@ def kda_det_comm_bytes_kcp(
     return table
 
 
-# The pools of a rank's KCP workspace (``cake_kcp.WorkspaceDetKcp``) that share one storage: each backward send pool
+# The pools of a rank's KCP workspace (``cake_kcp.CakeKDADetKcpWorkspace``) that share one storage: each backward send pool
 # reuses the bytes of the forward send pool beside it.  A forward call waits its c1 / c2 sends before it returns and
 # a replay-mode backward runs its forward (waiting those sends) before the first write of b1_send / b2_send, so the
 # lifetimes never overlap; c1_recv keeps its own storage (the replay-mode backward's adjoint merge reads it).
@@ -2749,7 +2749,7 @@ def kcp_arena_layout(
     save_transfer: bool = SAVE_TRANSFER_DEFAULT,
     C: int = 8192,
 ) -> dict[str, int]:
-    """The KCP pools of a rank's workspace (``cake_kcp.WorkspaceDetKcp``) in bytes, as the workspace allocates them.
+    """The KCP pools of a rank's workspace (``cake_kcp.CakeKDADetKcpWorkspace``) in bytes, as the workspace allocates them.
 
     ``pool.<name>``: the bytes each pool of a forward (``backward=False``) or a backward workspace needs
     (:func:`kcp_pool_numel`, 4 B per element); ``arena``: the bytes the workspace allocates -- every pool once, each
@@ -2761,8 +2761,8 @@ def kcp_arena_layout(
     workspace, which counts every pool in ``arena``).  The ring exchange receives no c1 tensor: its forward workspace
     holds ``pool.c1_recv`` bytes fewer than the ``save_transfer=False`` ``arena`` (the option resolves to ``False``
     there) and ``ring`` more.  The saved set (``S_in``, the c1 receive tensor kept with ``save_transfer``, ``M_seg``, the forward's saved
-    copy of the carry plane; :func:`kda_det_saved_bytes_kcp`; the ``carry`` pool the backward's adjoint carries use is a
-    workspace pool) and the convolution route's halo rows (per-call tensors; their traffic: :func:`kda_det_comm_bytes_kcp`
+    copy of the carry plane; :func:`cake_kda_det_train_kcp_saved_bytes`; the ``carry`` pool the backward's adjoint carries use is a
+    workspace pool) and the convolution route's halo rows (per-call tensors; their traffic: :func:`cake_kda_det_train_kcp_comm_bytes`
     ``halo_fwd`` / ``halo_bwd``) are never workspace pools, so ``C`` leaves the workspace unchanged, and so does
     ``save_transfer`` a backward workspace."""
     _check_save_mode(save_mode)
@@ -2839,7 +2839,7 @@ def local_scratch_table_bytes(plan) -> int:
     return int(plan.table_words()) * 4 if intra_writes_tables(plan) else 0
 
 
-# The local arena of a backward workspace (``cake_kcp.WorkspaceDetKcp`` ``local_arena``): ``"replay"`` (the default)
+# The local arena of a backward workspace (``cake_kcp.CakeKDADetKcpWorkspace`` ``local_arena``): ``"replay"`` (the default)
 # is the existing backend's replay layout (4488 B per internal token-head) with its forward layout; ``"lean"`` (opt-in)
 # runs the backward on this route's lean layout (:data:`LOCAL_LAYOUT_BWD_LEAN`, registered on the existing backend:
 # 3460 B per internal token-head plus the per-pass set where it does not fit; the fused gradient, GLM intra and the
@@ -3417,7 +3417,7 @@ def qk_l2norm_intra_first(plan, path: str = LOCAL_PATH_BWD) -> bool:
     return qk_l2norm_twin(str(plan.record("fwd_intra", path)))
 
 
-def kda_det_workspace_bytes_kcp(
+def cake_kda_det_train_kcp_workspace_bytes(
     ctx: ContextDetKcp | Sequence[ContextDetKcp],
     *,
     H: int = 64,
@@ -3438,23 +3438,23 @@ def kda_det_workspace_bytes_kcp(
     workspace, ``backward=False``, takes the KCP forward layout :data:`LOCAL_LAYOUT_FWD_ONLY`, 2432 B per internal
     token-head) with the intra record's scratch table set where it writes one (:func:`local_scratch_table_bytes`), plus the KCP
     arena of transient buffers (:func:`kcp_arena_layout`; CONSISTENCY-6, SPEC-4: saved-set tensors are counted by
-    :func:`kda_det_saved_bytes_kcp`).  A forward-only workspace has two states: these bytes after its forwards with a saved
+    :func:`cake_kda_det_train_kcp_saved_bytes`).  A forward-only workspace has two states: these bytes after its forwards with a saved
     set (the training forward) under ``save_transfer`` -- pass the forward's value: without it such a forward also
     allocates the :data:`FWD_TRANSFER_POOLS` -- and ``kcp_arena_layout(..., save_transfer=save_transfer)["lazy"]``
     more once a forward without one has read the rest of the :data:`FWD_LAZY_POOLS`.  The ring exchange's hop pools
     (``["ring"]``) are not counted; its forward-only workspace holds no c1 receive pool (``["pool.c1_recv"]``).
 
-    A sequence of contexts gives the bytes of one workspace that serves all of them (``WorkspaceDetKcp.reserve``):
+    A sequence of contexts gives the bytes of one workspace that serves all of them (``CakeKDADetKcpWorkspace.reserve``):
     each pool at its largest need over the contexts (each :data:`SHARED_POOLS` pair one storage of the larger), the
     largest local arena (the first of the largest in list order, with its tail-count table where it is a lean one, as
     ``reserve`` binds it), and the scratch table set of every distinct ``(T_r, n_frag)`` that has one (zero at
     ``H = 64``; KiB scale where present).  The bytes of a list of one context are those of the context.
-    ``lean_passes``: the tail passes a lean arena is sized for (``WorkspaceDetKcp(lean_passes=...)``; ``None``:
+    ``lean_passes``: the tail passes a lean arena is sized for (``CakeKDADetKcpWorkspace(lean_passes=...)``; ``None``:
     :data:`LEAN_PASSES_DEFAULT`).  ``use_gate_in_kernel``: the workspace's gate mode
-    (``WorkspaceDetKcp(use_gate_in_kernel=)``): the raw mode's local arena is planned in the raw mode (its backward
+    (``CakeKDADetKcpWorkspace(use_gate_in_kernel=)``): the raw mode's local arena is planned in the raw mode (its backward
     layout carries no gate epilogue buffers on any architecture) and is the replay arena (``local_arena="lean"`` is
     refused in this mode, as by the workspace); the pools do not depend on it.  ``use_qk_l2norm_in_kernel``: the
-    workspace's in-kernel Q / K L2 norm mode (``WorkspaceDetKcp(use_qk_l2norm_in_kernel=True)``, issue #7817): the
+    workspace's in-kernel Q / K L2 norm mode (``CakeKDADetKcpWorkspace(use_qk_l2norm_in_kernel=True)``, issue #7817): the
     local arena is planned in the form of the flag (``l2n="fused"``, :func:`qk_l2norm_plan_kwargs`: on sm_100a a backward
     layout without the gate epilogue's buffers) and is the replay arena (``local_arena="lean"`` is refused in this
     mode, as by the workspace); the pools do not depend on it.  The mode's per-call tensors (the backward's normalized
@@ -3470,13 +3470,13 @@ def kda_det_workspace_bytes_kcp(
     gate = "raw" if use_gate_in_kernel else "g"
     if gate == "raw" and check_local_arena(local_arena) == "lean":
         raise NotImplementedError(
-            'kda_det_workspace_bytes_kcp: use_gate_in_kernel=True runs on the replay local arena; local_arena="lean" '
+            'cake_kda_det_train_kcp_workspace_bytes: use_gate_in_kernel=True runs on the replay local arena; local_arena="lean" '
             "is not supported in the raw gate mode"
         )
     if l2n and check_local_arena(local_arena) == "lean":
-        # as WorkspaceDetKcp: the lean layout's support of the mode follows the single-rank layout of its programs
+        # as CakeKDADetKcpWorkspace: the lean layout's support of the mode follows the single-rank layout of its programs
         raise NotImplementedError(
-            'kda_det_workspace_bytes_kcp: use_qk_l2norm_in_kernel=True runs on the replay local arena; local_arena="lean" '
+            'cake_kda_det_train_kcp_workspace_bytes: use_qk_l2norm_in_kernel=True runs on the replay local arena; local_arena="lean" '
             "is not supported with the in-kernel Q/K L2 norm yet"
         )
     mode = qk_l2norm_mode(l2n)
@@ -3486,7 +3486,7 @@ def kda_det_workspace_bytes_kcp(
     )
     ctxs = list(ctx) if isinstance(ctx, (list, tuple)) else [ctx]
     if not ctxs:
-        raise ValueError("kda_det_workspace_bytes_kcp: no context given")
+        raise ValueError("cake_kda_det_train_kcp_workspace_bytes: no context given")
     if l2n:
         # before any plan: the refusal of every rank alike (rank-independent inputs only: the device model of the
         # contexts, never the current CUDA device); the flag-off query makes no CUDA call here
@@ -3652,12 +3652,12 @@ __all__ = [
     "chunk_tables",
     "head_groups",
     "kcp_arena_layout",
-    "kda_det_comm_bytes_kcp",
+    "cake_kda_det_train_kcp_comm_bytes",
     "kcp_pool_numel",
     "partition_det_kcp",
     "kcp_plan",
-    "kda_det_saved_bytes_kcp",
-    "kda_det_workspace_bytes_kcp",
+    "cake_kda_det_train_kcp_saved_bytes",
+    "cake_kda_det_train_kcp_workspace_bytes",
     "near_equal",
     "owner_of_head",
     "seg_chunk_start",

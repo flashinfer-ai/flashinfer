@@ -140,7 +140,7 @@ def _ops(ctx, H: int, device: torch.device, seed: int = 0x7815) -> dict:
 
 def _new_ws():
     backend = cake_kcp.get_backend()
-    return cake_kcp.WorkspaceDetKcp(
+    return cake_kcp.CakeKDADetKcpWorkspace(
         state_dtype=backend.dtypes["state"], local=backend.local_stages
     )
 
@@ -151,16 +151,16 @@ def _passes(ctx, o: dict, ws, **opts) -> tuple:
     q, k, v, g, beta, dout = (o[n] for n in ("q", "k", "v", "g", "beta", "dout"))
     res = []
     for mode in ("saved", "replay"):
-        out, saved = cake_kcp.chunk_kda_det_fwd_kcp(
+        out, saved = cake_kcp.cake_kda_det_train_kcp_forward(
             q, k, v, g, beta, ctx, boundary_mode=mode, workspace=ws, **opts
         )
-        grads = cake_kcp.chunk_kda_det_bwd_kcp(
+        grads = cake_kcp.cake_kda_det_train_kcp_backward(
             q, k, v, g, beta, ctx, dout, saved=saved, workspace=ws, **opts
         )
         res += [out, *grads]
     leaves = [x.detach().clone().requires_grad_(True) for x in (q, k, v, g, beta)]
     out = torch.utils.checkpoint.checkpoint(
-        lambda *a: cake_kcp.chunk_kda_det_kcp(*a, ctx, None, "light", "saved", ws),
+        lambda *a: cake_kcp.cake_kda_det_kcp(*a, ctx, None, "light", "saved", ws),
         *leaves,
         use_reentrant=False,
     )
@@ -264,8 +264,8 @@ def test_upload_knobs_are_gated_context_knobs(monkeypatch) -> None:
     )
     # the table set lives on the context (shared by workspaces); the knob keeps it per workspace
     ws1, ws2 = (
-        cake_kcp.WorkspaceDetKcp(local=False),
-        cake_kcp.WorkspaceDetKcp(local=False),
+        cake_kcp.CakeKDADetKcpWorkspace(local=False),
+        cake_kcp.CakeKDADetKcpWorkspace(local=False),
     )
     assert ws1.tables(new, 4) is ws2.tables(new, 4) and not ws1._tables
     assert ws1.tables(old, 4) is not ws2.tables(old, 4) and ws1._tables
@@ -344,9 +344,9 @@ def test_gpu_byte_queries_and_head_plans_are_host_only(device) -> None:
     n = len(ctx._uploads)
     assert n == 1
     for H in (4, 64):
-        kp.kda_det_workspace_bytes_kcp(ctx, H=H)
-        kp.kda_det_saved_bytes_kcp(ctx, H=H)
-        kp.kda_det_comm_bytes_kcp(ctx, H=H, C=1024)
+        kp.cake_kda_det_train_kcp_workspace_bytes(ctx, H=H)
+        kp.cake_kda_det_train_kcp_saved_bytes(ctx, H=H)
+        kp.cake_kda_det_train_kcp_comm_bytes(ctx, H=H, C=1024)
         assert not ctx.heads(H).device_tables.uploaded
     assert len(ctx._uploads) == n
 
@@ -361,7 +361,7 @@ def _row_of(device: torch.device, p_class: str) -> tuple[tuple, int, int]:
         )
         sms = probe.sm_count
         for H in P_CLASSES[p_class]:
-            P = cake_kcp.WorkspaceDetKcp(local=False).tables(probe, H).P
+            P = cake_kcp.CakeKDADetKcpWorkspace(local=False).tables(probe, H).P
             if (P > 1) == (p_class == "P>1"):
                 return cu, H, P
     pytest.skip(
@@ -387,7 +387,7 @@ def _other_of_class(cu: tuple, H: int, P: int, device: torch.device) -> tuple[in
         probe = kp.build_context_det_kcp(
             kp.partition_det_kcp(other, 1), None, 0, device
         )
-        if cake_kcp.WorkspaceDetKcp(local=False).tables(probe, H).P == P:
+        if cake_kcp.CakeKDADetKcpWorkspace(local=False).tables(probe, H).P == P:
             return tuple(other)
     raise AssertionError(f"no partition of the class of {cu} (H {H}, P {P}) found")
 
@@ -495,10 +495,10 @@ def test_gpu_graph_replay_issues_no_copy(device) -> None:
     q, k, v, g, beta, dout = (o[n] for n in ("q", "k", "v", "g", "beta", "dout"))
 
     def call(clone: bool = True):
-        out, saved = cake_kcp.chunk_kda_det_fwd_kcp(
+        out, saved = cake_kcp.cake_kda_det_train_kcp_forward(
             q, k, v, g, beta, ctx, workspace=ws, graph="replay"
         )
-        grads = cake_kcp.chunk_kda_det_bwd_kcp(
+        grads = cake_kcp.cake_kda_det_train_kcp_backward(
             q, k, v, g, beta, ctx, dout, saved=saved, workspace=ws, graph="replay"
         )
         events = (
@@ -679,10 +679,10 @@ def test_gpu_fresh_context_with_conv_halo_releases_everything(device) -> None:
         else:
             res = [y.detach().clone()]
             for mode in ("saved", "replay"):
-                out, saved = cake_kcp.chunk_kda_det_fwd_kcp(
+                out, saved = cake_kcp.cake_kda_det_train_kcp_forward(
                     q, k, v, g, beta, ctx, boundary_mode=mode, workspace=None
                 )
-                grads = cake_kcp.chunk_kda_det_bwd_kcp(
+                grads = cake_kcp.cake_kda_det_train_kcp_backward(
                     q, k, v, g, beta, ctx, dout, saved=saved, workspace=None
                 )
                 res += [out, *grads]

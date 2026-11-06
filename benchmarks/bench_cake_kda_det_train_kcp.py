@@ -17,7 +17,7 @@ Benchmark of the context-parallel (KCP) Cake packed KDA training step: one
 process per rank (``torchrun --nproc_per_node N``), every rank timing the
 module boundary of its fragments -- the KCP causal convolution
 (``flashinfer.cake_causal_conv1d_det_train_kcp.cake_causal_conv1d_det_kcp``) followed by
-the KCP KDA step (``flashinfer.cake_kda_det_train_kcp.chunk_kda_det_kcp``), forward and
+the KCP KDA step (``flashinfer.cake_kda_det_train_kcp.cake_kda_det_kcp``), forward and
 backward -- with CUDA events, and the slowest rank's time counting for the
 iteration.
 
@@ -51,17 +51,17 @@ forms on the same raw operands (BF16 raw gate, FP32 ``A_log`` / ``dt_bias``, low
 shard of the same packed batch, with the same groups and visits (in every group the order ``R, control, E_T,
 E_F``, then the reverse):
 
-* ``R``: the raw gate mode, ``chunk_kda_det_kcp(raw, ..., use_gate_in_kernel=True, A_log=, dt_bias=, lower_bound=)``;
+* ``R``: the raw gate mode, ``cake_kda_det_kcp(raw, ..., use_gate_in_kernel=True, A_log=, dt_bias=, lower_bound=)``;
 * ``control``: the ``R`` step again (its ratio to ``R`` must stay within the control band);
-* ``E_T``: a torch FP32 gate with autograd on the rank's raw shard, then ``chunk_kda_det_kcp(g)``;
-* ``E_F``: flash-linear-attention's gate with autograd, then ``chunk_kda_det_kcp(g)`` (where it imports and gives
+* ``E_T``: a torch FP32 gate with autograd on the rank's raw shard, then ``cake_kda_det_kcp(g)``;
+* ``E_F``: flash-linear-attention's gate with autograd, then ``cake_kda_det_kcp(g)`` (where it imports and gives
   the torch gate's values on every rank).
 
 A step is the forward and the backward from fresh gradients, then the cross-rank sum of the parameter gradients'
-partial sums (``reduce_gate_param_grads_det_kcp``: the raw mode's partials in ``R``, the gate's autograd partials
-in ``E_T`` / ``E_F``); every arm runs on a persistent ``WorkspaceDetKcp`` of its gate mode.  ``--ckpt`` times it
+partial sums (``cake_kda_det_train_kcp_reduce_gate_param_grads``: the raw mode's partials in ``R``, the gate's autograd partials
+in ``E_T`` / ``E_F``); every arm runs on a persistent ``CakeKDADetKcpWorkspace`` of its gate mode.  ``--ckpt`` times it
 plain (``off``), under ``torch.utils.checkpoint(use_reentrant=False)`` (``on``: forward, recompute with the state
-exchange, backward) and with a ``RecomputeHandleDetKcp`` per step (``handle``: the recompute exchanges nothing).
+exchange, backward) and with a ``CakeKDADetKcpRecomputeHandle`` per step (``handle``: the recompute exchanges nothing).
 Per row and arm: the median of the slowest rank's step time, its interquartile range and group medians, the ratio
 of each explicit arm to ``R`` (above 1: ``R`` is faster), the control ratio and the drift of ``R``; per rank the
 peak memory of one step above the inputs (``max_memory_allocated`` after ``reset_peak_memory_stats``) and the
@@ -76,10 +76,10 @@ frames, from the caching allocator's memory history)::
 The Q/K L2 norm arms (``--l2n-arms``) time the KCP KDA step alone the same way (FP32 gate ``g``), on the same raw
 BF16 ``q`` / ``k`` rows (in every group the order ``N, control, S_T, S_F``, then the reverse):
 
-* ``N``: the in-kernel norm, ``chunk_kda_det_kcp(q_raw, k_raw, ..., use_qk_l2norm_in_kernel=True)``;
+* ``N``: the in-kernel norm, ``cake_kda_det_kcp(q_raw, k_raw, ..., use_qk_l2norm_in_kernel=True)``;
 * ``control``: the ``N`` step again;
 * ``S_T``: a torch FP32 norm with autograd (``x / sqrt(sum x^2 + 1e-6)``, stored in BF16), then
-  ``chunk_kda_det_kcp`` with the flag off;
+  ``cake_kda_det_kcp`` with the flag off;
 * ``S_F``: flash-linear-attention's norm with autograd (``fla.modules.l2norm.l2norm``, where it imports and gives
   the torch norm's values on every rank), then the flag-off step.
 
@@ -117,15 +117,15 @@ from flashinfer.cake_causal_conv1d_det_train_kcp import (  # noqa: E402
     cake_causal_conv1d_det_kcp,
 )
 from flashinfer.cake_kda_det_train_kcp import (  # noqa: E402
-    RecomputeHandleDetKcp,
-    WorkspaceDetKcp,
+    CakeKDADetKcpRecomputeHandle,
+    CakeKDADetKcpWorkspace,
     build_context_det_kcp,
-    chunk_kda_det_kcp,
-    kda_det_comm_bytes_kcp,
-    kda_det_saved_bytes_kcp,
-    kda_det_workspace_bytes_kcp,
+    cake_kda_det_kcp,
+    cake_kda_det_train_kcp_comm_bytes,
+    cake_kda_det_train_kcp_saved_bytes,
+    cake_kda_det_train_kcp_workspace_bytes,
     partition_det_kcp,
-    reduce_gate_param_grads_det_kcp,
+    cake_kda_det_train_kcp_reduce_gate_param_grads,
 )
 from flashinfer.cake_kda_det_train import chunk_kda_det  # noqa: E402
 from tests.test_helpers.cake_kda_det_train_reference import (  # noqa: E402
@@ -236,7 +236,7 @@ def _step_kcp(problem: dict[str, Any]) -> None:
         local[n].detach().requires_grad_(True) for n in ("q", "k", "v", "g", "beta")
     )
     y = cake_causal_conv1d_det_kcp(x, w, ctx)
-    out = chunk_kda_det_kcp(q, k, v, g, beta, ctx)
+    out = cake_kda_det_kcp(q, k, v, g, beta, ctx)
     torch.autograd.backward([y, out], [local["dy"], local["dout"]])
 
 
@@ -357,11 +357,15 @@ def run(args, rank: int, world: int, device: torch.device) -> dict[str, Any]:
             "seed": args.seed,
         },
         "bytes": {
-            "workspace": kda_det_workspace_bytes_kcp(
+            "workspace": cake_kda_det_train_kcp_workspace_bytes(
                 ctx, H=args.heads, C=args.channels
             ),
-            "saved": kda_det_saved_bytes_kcp(ctx, H=args.heads, C=args.channels),
-            "comm": kda_det_comm_bytes_kcp(ctx, H=args.heads, C=args.channels),
+            "saved": cake_kda_det_train_kcp_saved_bytes(
+                ctx, H=args.heads, C=args.channels
+            ),
+            "comm": cake_kda_det_train_kcp_comm_bytes(
+                ctx, H=args.heads, C=args.channels
+            ),
         },
         "arms": rows,
         "control_ratio": control,
@@ -436,8 +440,8 @@ def gate_steps(
     dout = local["dout"]
     names = ("q", "k", "v", "g", "beta", "A_log", "dt_bias")
     workspaces = {
-        "raw": WorkspaceDetKcp(use_gate_in_kernel=True),
-        "g": WorkspaceDetKcp(),
+        "raw": CakeKDADetKcpWorkspace(use_gate_in_kernel=True),
+        "g": CakeKDADetKcpWorkspace(),
     }
     gates: dict[str, Any] = {"E_T": _torch_gate}
     skipped: dict[str, str] = {}
@@ -466,7 +470,7 @@ def gate_steps(
         def fn(q, k, v, raw, beta, a_log, dt_bias, *handle):
             kw = {"workspace": ws, "recompute_handle": handle[0] if handle else None}
             if arm == "R":
-                return chunk_kda_det_kcp(
+                return cake_kda_det_kcp(
                     q,
                     k,
                     v,
@@ -480,13 +484,13 @@ def gate_steps(
                     **kw,
                 )
             g = gate_fn(raw, a_log, dt_bias).contiguous()
-            return chunk_kda_det_kcp(q, k, v, g, beta, ctx, **kw)
+            return cake_kda_det_kcp(q, k, v, g, beta, ctx, **kw)
 
         def forward():
             if ckpt == "off":
                 return fn(*leaves)
             # one handle per step, an argument of the checkpointed function (the recompute binds it)
-            handle = (RecomputeHandleDetKcp(),) if ckpt == "handle" else ()
+            handle = (CakeKDADetKcpRecomputeHandle(),) if ckpt == "handle" else ()
             return checkpoint(fn, *leaves, *handle, use_reentrant=False)
 
         def clear():
@@ -497,7 +501,9 @@ def gate_steps(
             clear()
             forward().backward(dout)
             # the same deterministic cross-rank sum of the parameter partials in every arm
-            return reduce_gate_param_grads_det_kcp(ctx, a_log.grad, dt_bias.grad)
+            return cake_kda_det_train_kcp_reduce_gate_param_grads(
+                ctx, a_log.grad, dt_bias.grad
+            )
 
         step.clear = clear  # the memory pass drops the last step's gradients first
         return step, forward
@@ -572,8 +578,8 @@ def l2n_steps(
     local, ctx = problem["local"], problem["ctx"]
     T, H = local["q"].shape[0], local["q"].shape[1]
     workspaces = {
-        "in-kernel": WorkspaceDetKcp(use_qk_l2norm_in_kernel=True),
-        "separate": WorkspaceDetKcp(),
+        "in-kernel": CakeKDADetKcpWorkspace(use_qk_l2norm_in_kernel=True),
+        "separate": CakeKDADetKcpWorkspace(),
     }
     norms: dict[str, Any] = {"S_T": _torch_l2norm}
     skipped: dict[str, str] = {}
@@ -617,18 +623,18 @@ def l2n_steps(
                 q, k, v, g, beta = xs[: len(leaves)]
             kw = {"workspace": ws, "recompute_handle": handle[0] if handle else None}
             if arm == "N":
-                return chunk_kda_det_kcp(
+                return cake_kda_det_kcp(
                     q, k, v, g, beta, ctx, use_qk_l2norm_in_kernel=True, **kw
                 )
             # flash-linear-attention's norm reads contiguous rows (a no-op unless packed)
             if arm == "S_F":
                 q, k = q.contiguous(), k.contiguous()
-            return chunk_kda_det_kcp(norm(q), norm(k), v, g, beta, ctx, **kw)
+            return cake_kda_det_kcp(norm(q), norm(k), v, g, beta, ctx, **kw)
 
         def forward():
             if ckpt == "off":
                 return fn(*leaves)
-            handle = (RecomputeHandleDetKcp(),) if ckpt == "handle" else ()
+            handle = (CakeKDADetKcpRecomputeHandle(),) if ckpt == "handle" else ()
             return checkpoint(fn, *leaves, *handle, use_reentrant=False)
 
         def clear():

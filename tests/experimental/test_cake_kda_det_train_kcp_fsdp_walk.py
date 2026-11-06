@@ -61,7 +61,7 @@ class BatchMeta:
 
 def _context(lengths: list[int], cp: int, fragments: int):
     """Rank 0's context of ``lengths`` cut per document into ``2 * cp`` pieces, without a process group, in its
-    state after the first ``chunk_kda_det_kcp`` call of ``HEADS`` heads; ``fragments`` = the group's fragment count."""
+    state after the first ``cake_kda_det_kcp`` call of ``HEADS`` heads; ``fragments`` = the group's fragment count."""
     cu = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int64)
     part = kcp_plan.partition_det_kcp(cu, cp, "zigzag_per_document")
     assert sum(len(f) for f in part.fragments) == fragments

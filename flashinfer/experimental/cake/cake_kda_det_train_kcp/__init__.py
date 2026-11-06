@@ -16,7 +16,7 @@ limitations under the License.
 
 # Experimental Cake backend: deterministic context-parallel (KCP) packed KDA (Kimi Delta Attention) chunked
 # training on SM100 / SM103 / SM107.  The public entry points are in ``flashinfer.cake_kda_det_train_kcp``
-# (``chunk_kda_det_kcp``, ``chunk_kda_det_fwd_kcp``, ``chunk_kda_det_bwd_kcp``, ``partition_det_kcp``,
+# (``cake_kda_det_kcp``, ``cake_kda_det_train_kcp_forward``, ``cake_kda_det_train_kcp_backward``, ``partition_det_kcp``,
 # ``build_context_det_kcp``, the byte queries); the per-rank launch sequences and the autograd Function
 # (``cake_kcp``), the partition and context plan (``cake_kcp_plan``), the registry of the KCP programs
 # (``cake_kcp_jit``) and their generated sources live here.  The chunk stages a rank runs at its own shape are
@@ -28,23 +28,23 @@ from typing import Any
 
 # public name -> the submodule that defines it
 _SUBMODULE_OF = {
-    "ChunkKDADetFunctionKcp": "cake_kcp",
-    "CallDetKcp": "cake_kcp",
-    "OptionsDetKcp": "cake_kcp",
-    "RecomputeHandleDetKcp": "cake_kcp",
-    "SavedDetKcp": "cake_kcp",
-    "WorkspaceDetKcp": "cake_kcp",
-    "chunk_kda_det_bwd_kcp": "cake_kcp",
-    "chunk_kda_det_fwd_kcp": "cake_kcp",
-    "chunk_kda_det_kcp": "cake_kcp",
-    "reduce_gate_param_grads_det_kcp": "cake_kcp",
+    "CakeKDADetKcpCall": "cake_kcp",
+    "CakeKDADetKcpFunction": "cake_kcp",
+    "CakeKDADetKcpOptions": "cake_kcp",
+    "CakeKDADetKcpRecomputeHandle": "cake_kcp",
+    "CakeKDADetKcpSaved": "cake_kcp",
+    "CakeKDADetKcpWorkspace": "cake_kcp",
     "ContextDetKcp": "cake_kcp_plan",
     "FragmentDetKcp": "cake_kcp_plan",
     "PartitionDetKcp": "cake_kcp_plan",
     "build_context_det_kcp": "cake_kcp_plan",
-    "kda_det_comm_bytes_kcp": "cake_kcp_plan",
-    "kda_det_saved_bytes_kcp": "cake_kcp_plan",
-    "kda_det_workspace_bytes_kcp": "cake_kcp_plan",
+    "cake_kda_det_kcp": "cake_kcp",
+    "cake_kda_det_train_kcp_backward": "cake_kcp",
+    "cake_kda_det_train_kcp_comm_bytes": "cake_kcp_plan",
+    "cake_kda_det_train_kcp_forward": "cake_kcp",
+    "cake_kda_det_train_kcp_reduce_gate_param_grads": "cake_kcp",
+    "cake_kda_det_train_kcp_saved_bytes": "cake_kcp_plan",
+    "cake_kda_det_train_kcp_workspace_bytes": "cake_kcp_plan",
     "partition_det_kcp": "cake_kcp_plan",
 }
 
@@ -61,22 +61,22 @@ def __dir__() -> list[str]:
 
 
 __all__ = [
-    "CallDetKcp",  # noqa: F822 - resolved by __getattr__
-    "ChunkKDADetFunctionKcp",  # noqa: F822 - resolved by __getattr__
+    "CakeKDADetKcpCall",  # noqa: F822 - resolved by __getattr__
+    "CakeKDADetKcpFunction",  # noqa: F822 - resolved by __getattr__
+    "CakeKDADetKcpOptions",  # noqa: F822 - resolved by __getattr__
+    "CakeKDADetKcpRecomputeHandle",  # noqa: F822 - resolved by __getattr__
+    "CakeKDADetKcpSaved",  # noqa: F822 - resolved by __getattr__
+    "CakeKDADetKcpWorkspace",  # noqa: F822 - resolved by __getattr__
     "ContextDetKcp",  # noqa: F822 - resolved by __getattr__
     "FragmentDetKcp",  # noqa: F822 - resolved by __getattr__
-    "OptionsDetKcp",  # noqa: F822 - resolved by __getattr__
     "PartitionDetKcp",  # noqa: F822 - resolved by __getattr__
-    "RecomputeHandleDetKcp",  # noqa: F822 - resolved by __getattr__
-    "SavedDetKcp",  # noqa: F822 - resolved by __getattr__
-    "WorkspaceDetKcp",  # noqa: F822 - resolved by __getattr__
     "build_context_det_kcp",  # noqa: F822 - resolved by __getattr__
-    "chunk_kda_det_bwd_kcp",  # noqa: F822 - resolved by __getattr__
-    "chunk_kda_det_fwd_kcp",  # noqa: F822 - resolved by __getattr__
-    "chunk_kda_det_kcp",  # noqa: F822 - resolved by __getattr__
-    "kda_det_comm_bytes_kcp",  # noqa: F822 - resolved by __getattr__
-    "kda_det_saved_bytes_kcp",  # noqa: F822 - resolved by __getattr__
-    "kda_det_workspace_bytes_kcp",  # noqa: F822 - resolved by __getattr__
+    "cake_kda_det_kcp",  # noqa: F822 - resolved by __getattr__
+    "cake_kda_det_train_kcp_backward",  # noqa: F822 - resolved by __getattr__
+    "cake_kda_det_train_kcp_comm_bytes",  # noqa: F822 - resolved by __getattr__
+    "cake_kda_det_train_kcp_forward",  # noqa: F822 - resolved by __getattr__
+    "cake_kda_det_train_kcp_reduce_gate_param_grads",  # noqa: F822 - resolved by __getattr__
+    "cake_kda_det_train_kcp_saved_bytes",  # noqa: F822 - resolved by __getattr__
+    "cake_kda_det_train_kcp_workspace_bytes",  # noqa: F822 - resolved by __getattr__
     "partition_det_kcp",  # noqa: F822 - resolved by __getattr__
-    "reduce_gate_param_grads_det_kcp",  # noqa: F822 - resolved by __getattr__
 ]
