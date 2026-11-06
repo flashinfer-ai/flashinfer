@@ -124,9 +124,8 @@ from typing import Any, Optional
 
 import torch
 
-from .api_logging import flashinfer_experimental_api
+from .api_logging import flashinfer_api
 
-_FEATURE = "Cake four-stream mHC training, non-deterministic (SM100/SM103/SM107)"
 # The default hidden size of the workspace helpers: the backend's ``cake_jit.HIDDEN``,
 # spelled here so that defining the entry points imports no backend (a test checks
 # that the two agree).
@@ -146,17 +145,31 @@ def _pkg():
 # signatures of this module; the bodies live in the non-deterministic package)
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def is_cake_mhc_nondet_train_supported(
     device: torch.device,
     hidden: Optional[int] = None,
 ) -> bool:
-    """Whether ``device`` (and optionally ``hidden``) has every exported route of the non-deterministic package."""
+    """Whether ``device`` (and optionally ``hidden``) has every exported route of the non-deterministic package.
+
+    Parameters
+    ----------
+    device : torch.device
+        Device to query; a device that is not CUDA, or whose architecture is not
+        SM100 / SM103 / SM107, gives ``False``.
+    hidden : int, optional
+        Hidden size to query: 4096, 5120 or 7168 on SM100 / SM103, 4096 on
+        SM107.  ``None`` (default) queries the architecture only.
+
+    Returns
+    -------
+    ``True`` when the device (at ``hidden``, when given) has the routes.
+    """
 
     return _pkg().is_cake_mhc_nondet_train_supported(device, hidden)
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_mhc_nondet_train_forward_workspace_bytes(
     T: int,
     device: torch.device,
@@ -167,8 +180,22 @@ def cake_mhc_nondet_train_forward_workspace_bytes(
 
     The forward workspace has one layout in both packages (see
     :func:`~flashinfer.cake_mhc_det_train.cake_mhc_det_train_forward_workspace_bytes`).
-    ``hidden`` is the hidden size of the calls the buffer serves: 4096, 5120 or
-    7168 on SM100 / SM103, 4096 on SM107 (any other value raises ``ValueError``).
+
+    Parameters
+    ----------
+    T : int
+        Largest token count the buffer serves (the size is the maximum over
+        every token count up to ``T``); ``T == 0`` needs no workspace.
+    device : torch.device
+        CUDA device of the calls.
+    hidden : int
+        Hidden size ``H`` of the calls the buffer serves (``X.shape[2]``;
+        default ``4096``): 4096, 5120 or 7168 on SM100 / SM103, 4096 on SM107
+        (any other value raises ``ValueError``).
+
+    Returns
+    -------
+    The size of the forward workspace in bytes.
     """
 
     return _pkg().cake_mhc_nondet_train_forward_workspace_bytes(
@@ -176,7 +203,7 @@ def cake_mhc_nondet_train_forward_workspace_bytes(
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_mhc_nondet_train_backward_workspace_bytes(
     T: int,
     device: torch.device,
@@ -190,9 +217,22 @@ def cake_mhc_nondet_train_backward_workspace_bytes(
     (``P x 24 x 4H x 4`` bytes at hidden size ``H``, ``P <= 32``).  A
     deterministic backward workspace of the same hidden size
     (:func:`~flashinfer.cake_mhc_det_train.cake_mhc_det_train_backward_workspace`)
-    also serves the non-deterministic backward.  The size is the maximum over
-    every token count up to ``T``; ``T == 0`` needs no workspace.  ``hidden``
-    as in :func:`cake_mhc_nondet_train_forward_workspace_bytes`.
+    also serves the non-deterministic backward.
+
+    Parameters
+    ----------
+    T : int
+        Largest token count the buffer serves (the size is the maximum over
+        every token count up to ``T``); ``T == 0`` needs no workspace.
+    device : torch.device
+        CUDA device of the calls.
+    hidden : int
+        Hidden size of the calls the buffer serves (default ``4096``), as in
+        :func:`cake_mhc_nondet_train_forward_workspace_bytes`.
+
+    Returns
+    -------
+    The size of the backward workspace in bytes.
     """
 
     return _pkg().cake_mhc_nondet_train_backward_workspace_bytes(
@@ -200,7 +240,7 @@ def cake_mhc_nondet_train_backward_workspace_bytes(
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_mhc_nondet_train_forward_workspace(
     T: int,
     device: torch.device,
@@ -208,12 +248,22 @@ def cake_mhc_nondet_train_forward_workspace(
     hidden: int = _HIDDEN,
 ) -> torch.Tensor:
     """Allocate a zero-initialized forward workspace (one layout in both packages; see
-    :func:`cake_mhc_nondet_train_forward_workspace_bytes`)."""
+    :func:`cake_mhc_nondet_train_forward_workspace_bytes`).
+
+    Parameters
+    ----------
+    T, device, hidden : int, torch.device, int
+        As in :func:`cake_mhc_nondet_train_forward_workspace_bytes`.
+
+    Returns
+    -------
+    A zero-filled ``uint8`` tensor of that many bytes on ``device``.
+    """
 
     return _pkg().cake_mhc_nondet_train_forward_workspace(T, device, hidden=hidden)
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_mhc_nondet_train_backward_workspace(
     T: int,
     device: torch.device,
@@ -221,12 +271,22 @@ def cake_mhc_nondet_train_backward_workspace(
     hidden: int = _HIDDEN,
 ) -> torch.Tensor:
     """Allocate a zero-initialized backward workspace of the non-deterministic layout (see
-    :func:`cake_mhc_nondet_train_backward_workspace_bytes`)."""
+    :func:`cake_mhc_nondet_train_backward_workspace_bytes`).
+
+    Parameters
+    ----------
+    T, device, hidden : int, torch.device, int
+        As in :func:`cake_mhc_nondet_train_backward_workspace_bytes`.
+
+    Returns
+    -------
+    A zero-filled ``uint8`` tensor of that many bytes on ``device``.
+    """
 
     return _pkg().cake_mhc_nondet_train_backward_workspace(T, device, hidden=hidden)
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_mhc_nondet_train_forward_prepare(
     X: torch.Tensor,
     fn: torch.Tensor,
@@ -247,6 +307,30 @@ def cake_mhc_nondet_train_forward_prepare(
     The call runs the non-deterministic package, whose forward runs copies of
     the deterministic programs, so ``U`` and ``stats`` are the deterministic
     package's bits.
+
+    Parameters
+    ----------
+    X : torch.Tensor
+        BF16 ``[T, 4, H]`` contiguous residual streams; ``H = X.shape[2]`` is
+        4096, 5120 or 7168 on SM100 / SM103 and 4096 on SM107.
+    fn, scale, base : torch.Tensor
+        FP32 ``[24, 4H]`` mapping matrix, ``[3]`` group scales and ``[24]``
+        logit offsets.
+    rms_eps, hc_eps, sinkhorn_iters : float, float, int
+        Normalization epsilon (default ``1e-5``), coefficient epsilon (default
+        ``1e-6``) and Sinkhorn iteration count (1 to 64, default ``20``).
+    out : torch.Tensor, optional
+        Preallocated BF16 ``[T, H]`` contiguous ``U``.
+    stats_out : torch.Tensor, optional
+        Preallocated FP32 ``[T, 64]`` contiguous statistics record.
+    workspace : torch.Tensor, optional
+        Caller-owned buffer from :func:`cake_mhc_nondet_train_forward_workspace`
+        (``hidden=X.shape[2]``); a per-device default when omitted.
+
+    Returns
+    -------
+    ``(U, stats)``: BF16 ``U`` of shape ``[T, H]`` and the FP32 ``[T, 64]``
+    per-token record.
     """
 
     return _pkg().cake_mhc_nondet_train_forward_prepare(
@@ -263,7 +347,7 @@ def cake_mhc_nondet_train_forward_prepare(
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_mhc_nondet_train_forward_stats(
     X: torch.Tensor,
     fn: torch.Tensor,
@@ -282,6 +366,23 @@ def cake_mhc_nondet_train_forward_stats(
     :func:`~flashinfer.cake_mhc_det_train.cake_mhc_det_train_forward_stats`;
     the call runs the non-deterministic package (the deterministic package's
     bits).
+
+    Parameters
+    ----------
+    X, fn, scale, base : torch.Tensor
+        As in :func:`cake_mhc_nondet_train_forward_prepare`.
+    rms_eps, hc_eps, sinkhorn_iters : float, float, int
+        As in :func:`cake_mhc_nondet_train_forward_prepare`.
+    stats_out : torch.Tensor, optional
+        Preallocated FP32 ``[T, 64]`` contiguous statistics record.
+    workspace : torch.Tensor, optional
+        Caller-owned forward workspace (``hidden=X.shape[2]``); a per-device
+        default when omitted.
+
+    Returns
+    -------
+    FP32 ``[T, 64]`` ``stats``, bitwise the record of
+    :func:`cake_mhc_nondet_train_forward_prepare` for the same inputs.
     """
 
     return _pkg().cake_mhc_nondet_train_forward_stats(
@@ -297,7 +398,7 @@ def cake_mhc_nondet_train_forward_stats(
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_mhc_nondet_train_forward_finish(
     X: torch.Tensor,
     B: torch.Tensor,
@@ -311,12 +412,28 @@ def cake_mhc_nondet_train_forward_finish(
     :func:`~flashinfer.cake_mhc_det_train.cake_mhc_det_train_forward_finish`;
     the call runs the non-deterministic package (the deterministic package's
     bits).
+
+    Parameters
+    ----------
+    X : torch.Tensor
+        BF16 ``[T, 4, H]`` contiguous residual streams (the ``forward_prepare`` input).
+    B : torch.Tensor
+        BF16 ``[T, H]`` contiguous output of the external branch applied to ``U``.
+    stats : torch.Tensor
+        FP32 ``[T, 64]`` record of :func:`cake_mhc_nondet_train_forward_prepare`
+        (or :func:`cake_mhc_nondet_train_forward_stats`).
+    out : torch.Tensor, optional
+        Preallocated BF16 ``[T, 4, H]`` contiguous ``Y``.
+
+    Returns
+    -------
+    BF16 ``Y`` of shape ``[T, 4, H]``.
     """
 
     return _pkg().cake_mhc_nondet_train_forward_finish(X, B, stats, out=out)
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_mhc_nondet_train_backward_prepare(
     dY: torch.Tensor,
     B: torch.Tensor,
@@ -332,6 +449,26 @@ def cake_mhc_nondet_train_backward_prepare(
     :func:`~flashinfer.cake_mhc_det_train.cake_mhc_det_train_backward_prepare`;
     the call runs the non-deterministic package (the deterministic package's
     bits: this pass has no cross-token reduction).
+
+    Parameters
+    ----------
+    dY : torch.Tensor
+        BF16 ``[T, 4, H]`` contiguous gradient of ``Y``.
+    B : torch.Tensor
+        BF16 ``[T, H]`` contiguous branch output of the forward.
+    X : torch.Tensor
+        BF16 ``[T, 4, H]`` contiguous residual streams of the forward.
+    stats : torch.Tensor
+        FP32 ``[T, 64]`` record of the forward.
+    dB : torch.Tensor, optional
+        Preallocated BF16 ``[T, H]`` contiguous output.
+    grad_stats_out : torch.Tensor, optional
+        Preallocated FP32 ``[T, 32]`` contiguous output.
+
+    Returns
+    -------
+    ``(dB, grad_stats)``: BF16 ``dB`` of shape ``[T, H]`` and the FP32
+    ``[T, 32]`` record that :func:`cake_mhc_nondet_train_backward_finish` consumes.
     """
 
     return _pkg().cake_mhc_nondet_train_backward_prepare(
@@ -339,7 +476,7 @@ def cake_mhc_nondet_train_backward_prepare(
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_mhc_nondet_train_backward_finish(
     X: torch.Tensor,
     dY: torch.Tensor,
@@ -381,11 +518,43 @@ def cake_mhc_nondet_train_backward_finish(
 
     Parameters
     ----------
+    X : torch.Tensor
+        BF16 ``[T, 4, H]`` contiguous residual streams of the forward
+        (``H = X.shape[2]``).
+    dY : torch.Tensor
+        BF16 ``[T, 4, H]`` contiguous gradient of ``Y``.
+    dU : torch.Tensor
+        BF16 ``[T, H]`` contiguous gradient of ``U`` from the branch backward.
+    B : torch.Tensor, optional
+        BF16 ``[T, H]`` branch output of the forward; validated when given, not read.
+    fn, scale, base : torch.Tensor
+        The parameters of the forward (FP32 ``[24, 4H]``, ``[3]``, ``[24]``).
+    stats : torch.Tensor
+        FP32 ``[T, 64]`` record of the forward (saved, or recomputed with
+        :func:`cake_mhc_nondet_train_forward_stats`).
+    grad_stats : torch.Tensor
+        FP32 ``[T, 32]`` record of :func:`cake_mhc_nondet_train_backward_prepare`.
+    rms_eps, hc_eps, sinkhorn_iters : float, float, int
+        As in :func:`cake_mhc_nondet_train_forward_prepare`.
+    accumulate : bool
+        ``False`` (default): ``dfn``, ``dscale`` and ``dbase`` are written.
+        ``True``: the caller passes all three and the sums are added to their
+        current values.
     workspace : torch.Tensor, optional
         Caller-owned ``uint8`` buffer from :func:`cake_mhc_nondet_train_backward_workspace`,
         or a deterministic backward workspace of the same hidden size
         (:func:`~flashinfer.cake_mhc_det_train.cake_mhc_det_train_backward_workspace`);
         a per-device default when omitted.
+    dX : torch.Tensor, optional
+        Preallocated BF16 ``[T, 4, H]`` contiguous output.
+    dfn, dscale, dbase : torch.Tensor, optional
+        Preallocated FP32 ``[24, 4H]``, ``[3]``, ``[24]`` contiguous outputs
+        (required with ``accumulate=True``).
+
+    Returns
+    -------
+    ``(dX, dfn, dscale, dbase)``: the BF16 input gradient and the FP32
+    parameter gradients.
     """
 
     return _pkg().cake_mhc_nondet_train_backward_finish(
@@ -410,7 +579,7 @@ def cake_mhc_nondet_train_backward_finish(
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_mhc_nondet_train_prepare(
     X: torch.Tensor,
     fn: torch.Tensor,
@@ -438,10 +607,27 @@ def cake_mhc_nondet_train_prepare(
 
     Parameters
     ----------
+    X, fn, scale, base : torch.Tensor
+        As in :func:`cake_mhc_nondet_train_forward_prepare` (``X`` and the
+        parameters may require gradients).
+    rms_eps, hc_eps, sinkhorn_iters : float, float, int
+        As in :func:`cake_mhc_nondet_train_forward_prepare`.
+    save_stats : bool
+        ``True`` (default): the per-token statistics are kept for the backward.
+        ``False``: they are recomputed from ``X`` in the backward (checkpoint
+        replay), bit for bit the saved record.
+    workspace : torch.Tensor, optional
+        Caller-owned forward workspace (``hidden=X.shape[2]``); a per-device
+        default when omitted.
     backward_workspace : torch.Tensor, optional
         Caller-owned backward workspace of :func:`cake_mhc_nondet_train_backward_workspace`,
         or a deterministic backward workspace of the same hidden size; a
         per-device default when omitted.
+
+    Returns
+    -------
+    ``(U, handle)``: BF16 ``U`` of shape ``[T, H]`` and the handle of this
+    prepare node for one :func:`cake_mhc_nondet_train_finish`.
     """
 
     return _pkg().cake_mhc_nondet_train_prepare(
@@ -458,7 +644,7 @@ def cake_mhc_nondet_train_prepare(
     )
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
+@flashinfer_api
 def cake_mhc_nondet_train_finish(
     X: torch.Tensor,
     B: torch.Tensor,
@@ -470,6 +656,20 @@ def cake_mhc_nondet_train_finish(
     :func:`~flashinfer.cake_mhc_det_train.cake_mhc_det_train_finish`; ``handle``
     is the handle :func:`cake_mhc_nondet_train_prepare` returned (any other
     handle, such as a ``cake_mhc_det_train_prepare`` one, raises ``TypeError``).
+
+    Parameters
+    ----------
+    X : torch.Tensor
+        The BF16 ``[T, 4, H]`` tensor passed to :func:`cake_mhc_nondet_train_prepare`.
+    B : torch.Tensor
+        BF16 ``[T, H]`` output of the external branch applied to ``U`` (may
+        require gradients).
+    handle : object
+        The handle returned by :func:`cake_mhc_nondet_train_prepare`, for one finish.
+
+    Returns
+    -------
+    BF16 ``Y`` of shape ``[T, 4, H]``.
     """
 
     return _pkg().cake_mhc_nondet_train_finish(X, B, handle)

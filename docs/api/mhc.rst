@@ -46,24 +46,31 @@ Training mHC (Cake)
           (0.7.3),
           ``flashinfer.cake_mhc_det_train.CakeMHCDetTrain{Prepare,Finish}Function``
         - ``flashinfer.cake_mhc_det_train.CakeMHCDet{Prepare,Finish}Function``
-      * - ``flashinfer.cake_mhc_det_train.route_key``
+      * - ``flashinfer.cake_mhc_train.is_cake_mhc_train_supported`` (0.7.3)
+        - ``flashinfer.cake_mhc_det_train.is_cake_mhc_det_train_supported``
+      * - ``flashinfer.cake_mhc_train.route_key`` (0.7.3),
+          ``flashinfer.cake_mhc_det_train.route_key``
         - ``flashinfer.cake_mhc_det_train.cake_mhc_det_train_route_key``
       * - ``flashinfer.cake_mhc_train_backend`` (0.7.3),
           ``flashinfer.cake_mhc_det_train_backend``
         - ``flashinfer.experimental.cake.cake_mhc_det_train``
-      * - ``flashinfer.cake_mhc_det_train.cake_mhc_det_train_head_<verb>`` and
-          the top-level ``flashinfer.cake_mhc_train_head_<verb>`` (0.7.3), for
+      * - ``flashinfer.cake_mhc_det_train.cake_mhc_det_train_head_<verb>``,
+          ``flashinfer.cake_mhc_train.cake_mhc_train_head_<verb>`` and the
+          top-level ``flashinfer.cake_mhc_train_head_<verb>`` (0.7.3), for
           ``<verb>`` ``forward`` and ``backward``
         - ``flashinfer.cake_mhc_head_det_train.cake_mhc_head_det_train_<verb>``
           (also at the top level)
-      * - ``flashinfer.cake_mhc_det_train.cake_mhc_det_train_head`` and the
-          top-level ``flashinfer.cake_mhc_train_head`` (0.7.3)
+      * - ``flashinfer.cake_mhc_det_train.cake_mhc_det_train_head``,
+          ``flashinfer.cake_mhc_train.cake_mhc_train_head`` and the top-level
+          ``flashinfer.cake_mhc_train_head`` (0.7.3)
         - ``flashinfer.cake_mhc_head_det_train.cake_mhc_head_det`` (also at the
           top level)
-      * - ``flashinfer.cake_mhc_det_train.CakeMHCDetTrainHeadFunction`` and the
+      * - ``flashinfer.cake_mhc_det_train.CakeMHCDetTrainHeadFunction``,
+          ``flashinfer.cake_mhc_train.CakeMHCTrainHeadFunction`` and the
           top-level ``flashinfer.CakeMHCTrainHeadFunction`` (0.7.3)
         - ``flashinfer.cake_mhc_head_det_train.CakeMHCHeadDetFunction``
-      * - ``flashinfer.cake_mhc_det_train.is_cake_mhc_det_train_head_supported``
+      * - ``flashinfer.cake_mhc_det_train.is_cake_mhc_det_train_head_supported``,
+          ``flashinfer.cake_mhc_train.is_cake_mhc_train_head_supported`` (0.7.3)
         - ``flashinfer.cake_mhc_head_det_train.is_cake_mhc_head_det_train_supported``
       * - ``flashinfer.cake_mhc_train_head_backend`` (0.7.3),
           ``flashinfer.cake_mhc_det_train_head_backend``
@@ -171,8 +178,8 @@ a reserved name for a planned version; it does not exist yet.
     CakeMHCHeadDetFunction
     is_cake_mhc_head_det_train_supported
 
-Training mHC, non-deterministic (Cake, experimental)
-----------------------------------------------------
+Training mHC, non-deterministic (Cake)
+--------------------------------------
 
 ``flashinfer.cake_mhc_nondet_train`` is the same training function, computed
 by the non-deterministic package
@@ -247,3 +254,23 @@ of its workspace at zero, so a replay needs no reset;
 
 The head has no cross-token reduction and no counterpart in this module; use
 the deterministic head module ``flashinfer.cake_mhc_head_det_train`` above.
+
+.. currentmodule:: flashinfer.cake_mhc_nondet_train
+
+.. autosummary::
+    :toctree: ../generated
+
+    cake_mhc_nondet_train_forward_prepare
+    cake_mhc_nondet_train_forward_stats
+    cake_mhc_nondet_train_forward_finish
+    cake_mhc_nondet_train_backward_prepare
+    cake_mhc_nondet_train_backward_finish
+    cake_mhc_nondet_train_prepare
+    cake_mhc_nondet_train_finish
+    cake_mhc_nondet_train_forward_workspace_bytes
+    cake_mhc_nondet_train_backward_workspace_bytes
+    cake_mhc_nondet_train_forward_workspace
+    cake_mhc_nondet_train_backward_workspace
+    is_cake_mhc_nondet_train_supported
+    CakeMHCNondetPrepareFunction
+    CakeMHCNondetFinishFunction

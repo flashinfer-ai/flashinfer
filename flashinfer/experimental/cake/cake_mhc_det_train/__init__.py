@@ -2306,7 +2306,8 @@ def cake_mhc_det_train_finish(
 
     if not isinstance(handle, _MHCTrainHandle):
         raise TypeError(
-            "handle must be the handle returned by cake_mhc_det_train_prepare"
+            "handle must be the handle returned by cake_mhc_det_train_prepare (a cake_mhc_nondet_train_prepare "
+            "handle goes to flashinfer.cake_mhc_nondet_train.cake_mhc_nondet_train_finish)"
         )
     # The forward takes the edges off the handle: the handle then holds nothing of
     # the prepare node, and a checkpoint rerun of this call runs without them.

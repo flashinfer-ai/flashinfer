@@ -13,9 +13,10 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Tests of ``flashinfer.cake_mhc_nondet_train``, the experimental top-level module
-of the Cake four-stream mHC training kernels' non-deterministic package (SM100 /
-SM103 / SM107; FlashInfer issue #8068).
+Tests of ``flashinfer.cake_mhc_nondet_train``, the stable top-level module of
+the Cake four-stream mHC training kernels' non-deterministic package (SM100 /
+SM103 / SM107; FlashInfer issue #8068): its entry points emit no
+``ExperimentalWarning``.
 
 The mode is part of the names: every entry point runs the non-deterministic
 package ``flashinfer.experimental.cake.cake_mhc_nondet_train`` (imported on the
@@ -350,7 +351,6 @@ def test_deterministic_keyword_is_a_type_error(value, monkeypatch) -> None:
             warnings.catch_warnings(),
         ):
             warnings.simplefilter("error")
-            warnings.simplefilter("ignore", ExperimentalWarning)
             for name, (_det_name, args) in _ENTRIES.items():
                 for module in (facade, backend):
                     with pytest.raises(TypeError, match=_NO_MODE_KEYWORD):
@@ -534,7 +534,6 @@ def test_forwards_to_the_backend(name: str, monkeypatch) -> None:
             warnings.catch_warnings(),
         ):
             warnings.simplefilter("error")
-            warnings.simplefilter("ignore", ExperimentalWarning)
             assert function(*args, **keywords) == "nd"
         assert len(calls) == 1, (torch_mode, warn_only)
         calls[0].apply_defaults()
@@ -547,7 +546,7 @@ def test_finish_refuses_other_handles() -> None:
     included -- with one ``TypeError`` naming the deterministic finish."""
     det_handle = det_backend._MHCTrainHandle(None, ())
     with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ExperimentalWarning)
+        warnings.simplefilter("error", ExperimentalWarning)
         for handle in (det_handle, object(), None, (None, ())):
             with pytest.raises(TypeError, match=_exactly(_HANDLE_ERROR)):
                 facade.cake_mhc_nondet_train_finish("X", "B", handle)
@@ -834,7 +833,6 @@ def test_strict_mode_alerts_the_backward_only(
         deterministic_algorithms(True)
         with warnings.catch_warnings():
             warnings.simplefilter("error")
-            warnings.simplefilter("ignore", ExperimentalWarning)
             supported = facade.is_cake_mhc_nondet_train_supported(dev, hidden)
             sizes = _workspace_sizes(T, hidden)
             buffers = {
@@ -893,7 +891,7 @@ def test_warn_only_alerts_once_and_runs_the_backend(
         deterministic_algorithms(True, warn_only=True)
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            warnings.simplefilter("ignore", ExperimentalWarning)
+            warnings.simplefilter("error", ExperimentalWarning)
             got = [
                 t.clone()
                 for t in facade.cake_mhc_nondet_train_backward_finish(*_args(i))
@@ -977,7 +975,7 @@ def test_nondeterministic_workspace_helpers_reject_other_hidden_sizes() -> None:
     and in the backend (the sizes of the device's architecture are ``test_hidden_sizes_follow_the_device``'s)."""
     assert tuple(loader.HIDDEN_SIZES) == HIDDEN_SIZES
     with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ExperimentalWarning)
+        warnings.simplefilter("error", ExperimentalWarning)
         for name in _WORKSPACE_HELPERS:
             for module in (facade, backend):
                 for hidden in (6144, 2048, 4097, 0, -4096, True, 4096.0, "4096"):
@@ -999,7 +997,7 @@ def test_hidden_sizes_follow_the_device(hidden: int) -> None:
     assert backend.is_cake_mhc_nondet_train_supported(dev, hidden) == exported
     i = _inputs(7, hidden=hidden) if exported else None
     with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ExperimentalWarning)
+        warnings.simplefilter("error", ExperimentalWarning)
         if not exported:
             for name in _WORKSPACE_HELPERS:
                 for module in (facade, backend):

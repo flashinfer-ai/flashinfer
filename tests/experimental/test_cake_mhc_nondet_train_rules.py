@@ -3371,8 +3371,14 @@ def test_facade_forwards_every_entry_point_to_the_package() -> None:
         if isinstance(node, ast.ImportFrom) and node.module:
             names.append(node.module)
         assert not [n for n in names if "cake_mhc_det_train" in n], (node.lineno, names)
-        if [n for n in names if "experimental" in n]:
-            assert in_function, (node.lineno, names)
+        # The dotted path of each imported object: ``experimental`` as a path component, not as a substring of a
+        # name (``from .api_logging import flashinfer_experimental_api`` imports nothing of the package).
+        if isinstance(node, ast.ImportFrom):
+            paths = [f"{node.module or ''}.{alias.name}" for alias in node.names]
+        else:
+            paths = [alias.name for alias in node.names]
+        if [p for p in paths if "experimental" in p.split(".")]:
+            assert in_function, (node.lineno, paths)
     tree = ast.parse(path.read_text(), filename=str(path))
     constants = {
         target.id: ast.literal_eval(node.value)

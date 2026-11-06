@@ -129,5 +129,13 @@ def test_former_names_are_gone() -> None:
             if n.startswith(REMOVED_PREFIXES) or n in REMOVED_NAMES
         ]
         assert not leftovers, (owner.__name__, leftovers)
-    # the mode has no top-level name: its module is imported by its full name
-    assert not [n for n in dir(flashinfer) if "mhc" in n.lower() and MODE in n.lower()]
+    # the mode has no top-level name: its module is imported by its full name (importing it binds the submodule
+    # attribute ``flashinfer.cake_mhc_nondet_train``, which is the module, not a re-exported name)
+    leftovers = [
+        n
+        for n in dir(flashinfer)
+        if "mhc" in n.lower()
+        and MODE in n.lower()
+        and not inspect.ismodule(getattr(flashinfer, n))
+    ]
+    assert not leftovers, leftovers
