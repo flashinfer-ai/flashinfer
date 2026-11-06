@@ -666,6 +666,23 @@ class LazyExportTableTest(unittest.TestCase):
             },
         )
 
+    def test_relative_and_absolute_spellings_agree(self) -> None:
+        relative = (
+            '_LAZY_EXPORTS = {"a": (".impl", "api"), "m": (".pkg.mod", None),'
+            ' "up": ("..x", None)}'
+        )
+        absolute = (
+            '_LAZY_EXPORTS = {"a": ("flashinfer.impl", "api"),'
+            ' "m": ("flashinfer.pkg.mod", None)}'
+        )
+        self.assertEqual(
+            api_diff.exported_names(relative), api_diff.exported_names(absolute)
+        )
+        self.assertEqual(
+            api_diff.exported_names('_LAZY_EXPORTS = {"m": (".", None)}'),
+            api_diff.exported_names('_LAZY_EXPORTS = {"m": ("flashinfer", None)}'),
+        )
+
     def test_moving_names_into_rows_is_not_a_removal(self) -> None:
         impl = "@flashinfer_api\ndef api(value: int) -> None:\n    pass\n"
         base = {

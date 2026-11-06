@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import importlib.util
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -700,11 +701,14 @@ def lazy_exported_names(tree: ast.Module) -> dict[str, str]:
             ):
                 continue
             if module.startswith("."):
-                module = "flashinfer" + module
+                try:
+                    module = importlib.util.resolve_name(module, "flashinfer")
+                except ImportError:  # "..x" climbs above flashinfer
+                    continue
             if module != "flashinfer" and not module.startswith("flashinfer."):
                 continue
             if attribute is None:
-                module = module.rpartition(".")[0]
+                module = module.rpartition(".")[0] or module
             exports[key.value] = module
     return exports
 
