@@ -1004,8 +1004,8 @@ def _det_tripwires(monkeypatch):
     def tripwire(*args, **kwargs):
         raise AssertionError("the facade routed to the deterministic package")
 
-    monkeypatch.setattr(det_pkg, "grouped_det_gemm_wgrad", tripwire)
-    monkeypatch.setattr(det_autograd, "cake_grouped_det_mm", tripwire)
+    monkeypatch.setattr(det_pkg, "cake_moe_grouped_gemm_det_train_wgrad", tripwire)
+    monkeypatch.setattr(det_autograd, "cake_moe_grouped_gemm_det", tripwire)
 
 
 def _facade_recorders(monkeypatch):
@@ -1081,23 +1081,23 @@ def test_facade_accumulate_rows_refuse_the_default_mode(monkeypatch):
     calls = (
         (
             lambda: facade.grouped_gemm_wgrad(g, x, offs, out=out, accumulate=True),
-            "grouped_det_gemm_wgrad",
+            "cake_moe_grouped_gemm_det_train_wgrad",
         ),
         (
             lambda: facade.grouped_gemm_wgrad(g, x, offs, accumulate=True),
-            "grouped_det_gemm_wgrad",
+            "cake_moe_grouped_gemm_det_train_wgrad",
         ),
         (
             lambda: facade.cake_grouped_mm(
                 x, weight, offs, fuse_wgrad_accumulation=True
             ),
-            "cake_grouped_det_mm",
+            "cake_moe_grouped_gemm_det",
         ),
         (
             lambda: facade.cake_grouped_mm(
                 x, weight, offs, deterministic=True, fuse_wgrad_accumulation=True
             ),
-            "cake_grouped_det_mm",
+            "cake_moe_grouped_gemm_det",
         ),
     )
     for mode in (contextlib.nullcontext(), base._torch_deterministic()):

@@ -108,8 +108,8 @@ allocates the buffers from the graph's pool) and the even split.  The static
 sm_107a forward and data-gradient programs take ``sched``, ``c0`` and ``c1`` and
 ignore them.
 
-Accumulate mode.  ``prepare_grouped_det_gemm_wgrad(..., out=out, accumulate=True)``
-(also ``grouped_det_gemm_wgrad`` and the autograd wrapper's
+Accumulate mode.  ``cake_moe_grouped_gemm_det_train_prepare_wgrad(..., out=out, accumulate=True)``
+(also ``cake_moe_grouped_gemm_det_train_wgrad`` and the autograd wrapper's
 ``fuse_wgrad_accumulation``) adds the weight gradient into ``out``:
 ``out[e] <- out[e] + G_e^T X_e``, Megatron's gradient-accumulation fusion into an
 fp32 or bf16 ``main_grad``.  The host plans the launch exactly as the overwrite of
@@ -936,7 +936,7 @@ class _Launch:
 
 
 @dataclass(frozen=True)
-class GroupedDetGemmLaunch:
+class CakeMoEGroupedGemmDetLaunch:
     """One prepared ragged grouped GEMM.
 
     ``launch()`` runs the bound program on the current torch stream into the
@@ -1082,7 +1082,7 @@ def _bind(
 ) -> _Launch:
     """Order ``kwargs`` by the generated argument plan of ``stage`` of route ``name`` on ``arch`` and load
     its entry (the binding encodes the operands' TMA descriptors by value at every launch).  A buffer the
-    plan names after a stream workspace kind is left to ``GroupedDetGemmLaunch.launch``; with ``split`` so
+    plan names after a stream workspace kind is left to ``CakeMoEGroupedGemmDetLaunch.launch``; with ``split`` so
     are ``c0`` / ``c1``, which a launch replaces by the probed split of its ``sched`` once known, and the
     queue probe is built here."""
     binding = stage_binding(name, stage, arch)
@@ -1128,8 +1128,8 @@ def _finish(
     *,
     zero_fill: bool = False,
     add_from: Optional[torch.Tensor] = None,
-) -> GroupedDetGemmLaunch:
-    return GroupedDetGemmLaunch(
+) -> CakeMoEGroupedGemmDetLaunch:
+    return CakeMoEGroupedGemmDetLaunch(
         op=op,
         record_name=name,
         stages=stages,
@@ -1149,7 +1149,7 @@ def _prepare_row_op(
     w: torch.Tensor,
     offs: torch.Tensor,
     out: Optional[torch.Tensor],
-) -> GroupedDetGemmLaunch:
+) -> CakeMoEGroupedGemmDetLaunch:
     c = host_plan_constants()
     block_n, block_k = int(c["block_n"]), int(c["block_k"])
     a_name = "x" if op == "fwd" else "g"
@@ -1240,12 +1240,12 @@ def _prepare_row_op(
     return _finish(op, name, plan, out, (stage,), [launch], [])
 
 
-def prepare_grouped_det_gemm_fwd(
+def cake_moe_grouped_gemm_det_train_prepare_forward(
     x: torch.Tensor,
     w: torch.Tensor,
     offs: torch.Tensor,
     out: Optional[torch.Tensor] = None,
-) -> GroupedDetGemmLaunch:
+) -> CakeMoEGroupedGemmDetLaunch:
     """Prepare ``Y[sum_m, N] = grouped X @ W[e].T`` (bf16 in, bf16 out).
 
     ``x``: ``[sum_m, K]`` bf16; ``w``: ``[E, N, K]`` bf16; ``offs``: int32
@@ -1258,12 +1258,12 @@ def prepare_grouped_det_gemm_fwd(
     return _prepare_row_op("fwd", x, w, offs, out)
 
 
-def prepare_grouped_det_gemm_dgrad(
+def cake_moe_grouped_gemm_det_train_prepare_dgrad(
     g: torch.Tensor,
     w: torch.Tensor,
     offs: torch.Tensor,
     out: Optional[torch.Tensor] = None,
-) -> GroupedDetGemmLaunch:
+) -> CakeMoEGroupedGemmDetLaunch:
     """Prepare ``dX[sum_m, K] = grouped G @ W[e]`` (W read in place; bf16 in, bf16 out).
 
     ``g``: ``[sum_m, N]`` bf16; ``w``: ``[E, N, K]`` bf16; ``offs``: int32
@@ -1347,7 +1347,7 @@ def _check_accumulate_out(
             )
 
 
-def prepare_grouped_det_gemm_wgrad(
+def cake_moe_grouped_gemm_det_train_prepare_wgrad(
     g: torch.Tensor,
     x: torch.Tensor,
     offs: torch.Tensor,
@@ -1356,7 +1356,7 @@ def prepare_grouped_det_gemm_wgrad(
     num_groups: Optional[int] = None,
     *,
     accumulate: bool = False,
-) -> GroupedDetGemmLaunch:
+) -> CakeMoEGroupedGemmDetLaunch:
     """Prepare ``dW[E, N, K] = grouped G[e].T @ X[e]`` (bf16 in; bf16 or fp32 out), deterministic.
 
     ``g``: ``[sum_m, N]`` bf16; ``x``: ``[sum_m, K]`` bf16; ``offs``: int32
@@ -1383,13 +1383,15 @@ def prepare_grouped_det_gemm_wgrad(
     ``launch()`` and each replay of a graph that captured it adds again; keep
     the launch alive while such a graph may replay.
     """
-    _require_flag(accumulate, "accumulate", "prepare_grouped_det_gemm_wgrad")
+    _require_flag(
+        accumulate, "accumulate", "cake_moe_grouped_gemm_det_train_prepare_wgrad"
+    )
     if accumulate:
         _check_accumulate_out(
             out,
             out_dtype,
             {"g": g, "x": x, "offs": offs},
-            "prepare_grouped_det_gemm_wgrad",
+            "cake_moe_grouped_gemm_det_train_prepare_wgrad",
         )
     c = host_plan_constants()
     block_n = int(c["block_n"])
@@ -1586,4 +1588,6 @@ def grouped_det_mm_bf16_cake(
             "the cake backend of grouped_mm_bf16 has a single generated program "
             f"per architecture; tactic must be -1 (got {tactic})"
         )
-    return prepare_grouped_det_gemm_fwd(a, b, m_indptr, out=out).launch()
+    return cake_moe_grouped_gemm_det_train_prepare_forward(
+        a, b, m_indptr, out=out
+    ).launch()

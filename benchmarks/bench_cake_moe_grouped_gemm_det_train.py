@@ -26,7 +26,7 @@ with a cold L2 between iterations: the median time (the JSON adds the 10th /
 Plus one checkpointed training step per (projection, distribution), the
 ``step`` rows: ``y = mm(x, w, offs)`` under ``torch.utils.checkpoint``
 (non-reentrant) and its backward with both gradients, through
-``cake_grouped_det_mm`` and through ``torch._grouped_mm``'s autograd, with
+``cake_moe_grouped_gemm_det`` and through ``torch._grouped_mm``'s autograd, with
 checkpoint early stop off so that every arm recomputes its forward GEMM
 (``2 x forward + backward``, the same work in every arm).  Opt-in autograd rows
 over the same distributions: ``step_es``, that step with early stop on (the
@@ -38,7 +38,7 @@ gate_up, ``silu(a) * b`` on its two halves, down, with the gradients of ``x``,
 skipped.  The rate of the ``step`` rows counts the four GEMMs every arm runs;
 that of the other autograd rows the useful work only (forward, data and
 weight gradient of each GEMM).  Opt-in arm ``cake_det_inforward``: ``cake_det``
-through a direct ``CakeGroupedDetMm.apply(x, w, offs)``, whose forward
+through a direct ``CakeMoEGroupedGemmDetFunction.apply(x, w, offs)``, whose forward
 GEMM launches inside ``forward`` so that a checkpoint always recomputes it
 (autograd rows only; when it runs with ``cake_det``, the JSON records the elements
 in which their outputs and gradients differ -- none).  ``--census`` adds the
@@ -62,13 +62,13 @@ from flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train import (
     cake_backend as cb,
 )
 from flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train.cake_autograd import (
-    CakeGroupedDetMm,
-    cake_grouped_det_mm,
+    CakeMoEGroupedGemmDetFunction,
+    cake_moe_grouped_gemm_det,
 )
 from flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train.cake_backend import (
-    prepare_grouped_det_gemm_dgrad,
-    prepare_grouped_det_gemm_fwd,
-    prepare_grouped_det_gemm_wgrad,
+    cake_moe_grouped_gemm_det_train_prepare_dgrad,
+    cake_moe_grouped_gemm_det_train_prepare_forward,
+    cake_moe_grouped_gemm_det_train_prepare_wgrad,
 )
 from flashinfer.testing import bench_gpu_time
 
@@ -239,7 +239,7 @@ def _step(mm, t, early_stop=False):
     Early stop off (the ``step`` rows): every arm recomputes its forward GEMM,
     ``2 x forward + backward``.  On (the torch default, the ``step_es`` rows): the
     recompute stops once the region saved its last tensor, so an arm whose inputs are
-    saved before its GEMM launches (``torch._grouped_mm``, ``cake_grouped_det_mm``) does
+    saved before its GEMM launches (``torch._grouped_mm``, ``cake_moe_grouped_gemm_det``) does
     one GEMM less, and one that launches inside ``Function.forward``
     (``cake_det_inforward``) still recomputes it."""
     return _checkpointed(mm, t, ("x", "w"), early_stop)
@@ -269,26 +269,34 @@ def _autograd(mm, row, t):
 def cake_det_arm(row, t):
     op = row["op"]
     if op in AUTOGRAD_OPS:
-        fn = _autograd(lambda x, w, offs: cake_grouped_det_mm(x, w, offs), row, t)
-        return fn, f"{AUTOGRAD_NOTES[op]} (cake_grouped_det_mm)"
+        fn = _autograd(lambda x, w, offs: cake_moe_grouped_gemm_det(x, w, offs), row, t)
+        return fn, f"{AUTOGRAD_NOTES[op]} (cake_moe_grouped_gemm_det)"
     if op == "fwd":
-        launch = prepare_grouped_det_gemm_fwd(t["x"], t["w"], t["offs"], out=t["out"])
+        launch = cake_moe_grouped_gemm_det_train_prepare_forward(
+            t["x"], t["w"], t["offs"], out=t["out"]
+        )
     elif op == "dgrad":
-        launch = prepare_grouped_det_gemm_dgrad(t["g"], t["w"], t["offs"], out=t["out"])
+        launch = cake_moe_grouped_gemm_det_train_prepare_dgrad(
+            t["g"], t["w"], t["offs"], out=t["out"]
+        )
     else:
-        launch = prepare_grouped_det_gemm_wgrad(t["g"], t["x"], t["offs"], out=t["out"])
+        launch = cake_moe_grouped_gemm_det_train_prepare_wgrad(
+            t["g"], t["x"], t["offs"], out=t["out"]
+        )
     return launch.launch, f"{launch.record_name} plan={launch.plan}"
 
 
 def cake_det_inforward_arm(row, t):
-    """``cake_det`` through a direct ``CakeGroupedDetMm.apply``: the forward GEMM launches
+    """``cake_det`` through a direct ``CakeMoEGroupedGemmDetFunction.apply``: the forward GEMM launches
     inside ``forward``, before autograd saves the inputs (the internal control of the
     autograd rows)."""
     op = row["op"]
     if op not in AUTOGRAD_OPS:
         raise NotImplementedError("the in-forward control has autograd rows only")
-    fn = _autograd(lambda x, w, offs: CakeGroupedDetMm.apply(x, w, offs), row, t)
-    return fn, f"{AUTOGRAD_NOTES[op]} (direct CakeGroupedDetMm.apply)"
+    fn = _autograd(
+        lambda x, w, offs: CakeMoEGroupedGemmDetFunction.apply(x, w, offs), row, t
+    )
+    return fn, f"{AUTOGRAD_NOTES[op]} (direct CakeMoEGroupedGemmDetFunction.apply)"
 
 
 def torch_grouped_mm_arm(row, t):

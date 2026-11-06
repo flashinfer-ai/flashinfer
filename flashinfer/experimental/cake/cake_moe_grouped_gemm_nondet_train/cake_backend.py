@@ -32,7 +32,7 @@ and runs nothing else: every entry point (``prepare_grouped_gemm_*`` here,
 the bool ``False`` (the default included), naming the deterministic entry of
 the deterministic package ``flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train``
 (``grouped_det_gemm_*``, ``prepare_grouped_det_gemm_*``,
-``cake_grouped_det_mm``).  Nothing here routes to that package.
+``cake_moe_grouped_gemm_det``).  Nothing here routes to that package.
 ``fwd``, ``dgrad`` and the weight gradient with the 256-wide k tile run this
 package's copies of the deterministic programs and give their bits (the
 256-wide k tile's ``main_wave`` program is the same kernel rendered from a newer
@@ -305,17 +305,17 @@ def sm_count(device: torch.device) -> int:
     return _device_facts(_device_index(device))[1]
 
 
-# The deterministic entry of the package ``flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train`` that
-# corresponds to each entry point of this package (and of the facade): named by the mode refusal.
+# The deterministic entry of the module ``flashinfer.cake_moe_grouped_gemm_det_train`` that corresponds
+# to each entry point of this package (and of the facade): named by the mode refusal.
 _DET_ENTRIES: dict[str, str] = {
-    "CakeGroupedMm": "CakeGroupedDetMm",
-    "cake_grouped_mm": "cake_grouped_det_mm",
-    "grouped_gemm_dgrad": "grouped_det_gemm_dgrad",
-    "grouped_gemm_fwd": "grouped_det_gemm_fwd",
-    "grouped_gemm_wgrad": "grouped_det_gemm_wgrad",
-    "prepare_grouped_gemm_dgrad": "prepare_grouped_det_gemm_dgrad",
-    "prepare_grouped_gemm_fwd": "prepare_grouped_det_gemm_fwd",
-    "prepare_grouped_gemm_wgrad": "prepare_grouped_det_gemm_wgrad",
+    "CakeGroupedMm": "CakeMoEGroupedGemmDetFunction",
+    "cake_grouped_mm": "cake_moe_grouped_gemm_det",
+    "grouped_gemm_dgrad": "cake_moe_grouped_gemm_det_train_dgrad",
+    "grouped_gemm_fwd": "cake_moe_grouped_gemm_det_train_forward",
+    "grouped_gemm_wgrad": "cake_moe_grouped_gemm_det_train_wgrad",
+    "prepare_grouped_gemm_dgrad": "cake_moe_grouped_gemm_det_train_prepare_dgrad",
+    "prepare_grouped_gemm_fwd": "cake_moe_grouped_gemm_det_train_prepare_forward",
+    "prepare_grouped_gemm_wgrad": "cake_moe_grouped_gemm_det_train_prepare_wgrad",
 }
 
 
@@ -329,7 +329,7 @@ def _require_deterministic_false(deterministic: object, entry: str) -> None:
             f"{entry} is the non-deterministic ragged grouped GEMM (the 512-wide k tile's weight gradient adds "
             "its split tail with unordered fp32 reductions) and runs only with deterministic=False, got "
             f"deterministic={deterministic!r}; the deterministic entry is "
-            f"flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train.{det} (it takes no deterministic argument); "
+            f"flashinfer.cake_moe_grouped_gemm_det_train.{det} (it takes no deterministic argument); "
             "pass deterministic=False for the non-deterministic path"
         )
 
@@ -363,9 +363,9 @@ def _caller_stacklevel() -> int:
 # The deterministic counterpart of each entry that can launch an order-varying weight gradient (the
 # ``entry`` of ``GroupedGemmLaunch._run``): named by the alert.
 _ALERT_DET_ENTRIES: dict[str, str] = {
-    "CakeGroupedMm.backward": "CakeGroupedDetMm",
-    "GroupedGemmLaunch.launch": "GroupedDetGemmLaunch.launch",
-    "grouped_gemm_wgrad": "grouped_det_gemm_wgrad",
+    "CakeGroupedMm.backward": "CakeMoEGroupedGemmDetFunction",
+    "GroupedGemmLaunch.launch": "CakeMoEGroupedGemmDetLaunch.launch",
+    "grouped_gemm_wgrad": "cake_moe_grouped_gemm_det_train_wgrad",
 }
 
 
@@ -380,7 +380,7 @@ def _alert_not_deterministic(entry: str) -> None:
     exposes no public Python entry for it."""
     if not torch.are_deterministic_algorithms_enabled():
         return
-    det = "flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train"
+    det = "flashinfer.cake_moe_grouped_gemm_det_train"
     if entry in _ALERT_DET_ENTRIES:
         det = f"{det}.{_ALERT_DET_ENTRIES[entry]}"
     if torch.is_deterministic_algorithms_warn_only_enabled():
@@ -2193,7 +2193,7 @@ def prepare_grouped_gemm_wgrad(
     defaults to the dtype of ``out`` (bf16 when neither is given).
 
     ``deterministic`` must be ``False`` (``ValueError`` naming
-    ``prepare_grouped_det_gemm_wgrad`` otherwise).  With the 512-wide k tile a
+    ``cake_moe_grouped_gemm_det_train_prepare_wgrad`` otherwise).  With the 512-wide k tile a
     split tail is added in place with unordered fp32 reductions
     (``plan["unordered_tail"]`` and ``plan["tail_splits"] > 1``, the launch's
     ``order_varying``), so ``dW`` is not bitwise reproducible run to run; with

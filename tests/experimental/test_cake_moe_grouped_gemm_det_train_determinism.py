@@ -261,10 +261,14 @@ def _inputs(case, device):
 
 def _prepare(case, a, b, offs, out):
     if case.op == "fwd":
-        return cb.prepare_grouped_det_gemm_fwd(x=a, w=b, offs=offs, out=out)
+        return cb.cake_moe_grouped_gemm_det_train_prepare_forward(
+            x=a, w=b, offs=offs, out=out
+        )
     if case.op == "dgrad":
-        return cb.prepare_grouped_det_gemm_dgrad(g=a, w=b, offs=offs, out=out)
-    return cb.prepare_grouped_det_gemm_wgrad(
+        return cb.cake_moe_grouped_gemm_det_train_prepare_dgrad(
+            g=a, w=b, offs=offs, out=out
+        )
+    return cb.cake_moe_grouped_gemm_det_train_prepare_wgrad(
         g=a, x=b, offs=offs, out=out, out_dtype=case.out_dtype, num_groups=None
     )
 

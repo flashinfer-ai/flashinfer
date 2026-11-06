@@ -99,10 +99,10 @@ for name in pkg.__all__:  # the lazy re-exports load cake_backend and cake_autog
     getattr(pkg, name)
 cb = importlib.import_module(PKG_NAME + ".cake_backend")
 for name in (
-    "grouped_det_gemm_fwd",
-    "grouped_det_gemm_dgrad",
-    "grouped_det_gemm_wgrad",
-    "cake_grouped_det_mm",
+    "cake_moe_grouped_gemm_det_train_forward",
+    "cake_moe_grouped_gemm_det_train_dgrad",
+    "cake_moe_grouped_gemm_det_train_wgrad",
+    "cake_moe_grouped_gemm_det",
 ):
     # plain functions: the experimental marking belongs to the core entry points
     assert not hasattr(getattr(pkg, name), "is_experimental"), name
@@ -118,10 +118,10 @@ m_indptr = torch.tensor([0, 2, 4], dtype=torch.int32)
 # two grouped_det_mm_bf16_cake calls fail their out_dtype / tactic checks first.
 # Every call raises ValueError before any device access.
 calls = [
-    lambda: pkg.grouped_det_gemm_fwd(f32(4, 64), f32(2, 256, 64), offs),
-    lambda: pkg.grouped_det_gemm_dgrad(f32(4, 64), f32(2, 64, 256), offs),
-    lambda: pkg.grouped_det_gemm_wgrad(f32(4, 256), f32(4, 64), offs),
-    lambda: pkg.cake_grouped_det_mm(f32(4, 64), f32(2, 256, 64), offs),
+    lambda: pkg.cake_moe_grouped_gemm_det_train_forward(f32(4, 64), f32(2, 256, 64), offs),
+    lambda: pkg.cake_moe_grouped_gemm_det_train_dgrad(f32(4, 64), f32(2, 64, 256), offs),
+    lambda: pkg.cake_moe_grouped_gemm_det_train_wgrad(f32(4, 256), f32(4, 64), offs),
+    lambda: pkg.cake_moe_grouped_gemm_det(f32(4, 64), f32(2, 256, 64), offs),
     lambda: cb.grouped_det_mm_bf16_cake(
         f32(4, 64), f32(2, 256, 64), m_indptr, out_dtype=torch.float32
     ),

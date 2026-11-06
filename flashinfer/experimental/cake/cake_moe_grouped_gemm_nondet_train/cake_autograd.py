@@ -288,7 +288,7 @@ def cake_grouped_mm(
         the default included): this is the non-deterministic package, whose
         weight gradient may add its split tail with unordered fp32 reductions.
         The deterministic wrapper is
-        ``flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train.cake_grouped_det_mm``
+        ``flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train.cake_moe_grouped_gemm_det``
         (no ``deterministic`` argument); nothing here routes to it.
     fuse_wgrad_accumulation : bool
         ``False`` (default): the backward returns ``w``'s gradient as below.

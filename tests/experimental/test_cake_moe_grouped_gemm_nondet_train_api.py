@@ -74,17 +74,17 @@ ENTRY_POINTS = (
 )
 # facade entry -> the deterministic entry its mode refusal names
 DET_ENTRY = {
-    "grouped_gemm_fwd": "grouped_det_gemm_fwd",
-    "grouped_gemm_dgrad": "grouped_det_gemm_dgrad",
-    "grouped_gemm_wgrad": "grouped_det_gemm_wgrad",
-    "cake_grouped_mm": "cake_grouped_det_mm",
+    "grouped_gemm_fwd": "cake_moe_grouped_gemm_det_train_forward",
+    "grouped_gemm_dgrad": "cake_moe_grouped_gemm_det_train_dgrad",
+    "grouped_gemm_wgrad": "cake_moe_grouped_gemm_det_train_wgrad",
+    "cake_grouped_mm": "cake_moe_grouped_gemm_det",
 }
 # The deterministic objects nothing here may call (module, attribute).
 DET_TARGETS = (
-    (det_pkg, "grouped_det_gemm_fwd"),
-    (det_pkg, "grouped_det_gemm_dgrad"),
-    (det_pkg, "grouped_det_gemm_wgrad"),
-    (det_autograd, "cake_grouped_det_mm"),
+    (det_pkg, "cake_moe_grouped_gemm_det_train_forward"),
+    (det_pkg, "cake_moe_grouped_gemm_det_train_dgrad"),
+    (det_pkg, "cake_moe_grouped_gemm_det_train_wgrad"),
+    (det_autograd, "cake_moe_grouped_gemm_det"),
 )
 NEW_TARGETS = {
     "grouped_gemm_fwd": (pkg, "grouped_gemm_fwd"),
@@ -383,7 +383,7 @@ PACKAGE_CALLS = {
 def test_package_refuses_every_mode_but_false(name):
     """Every entry point of the package raises ``ValueError`` naming its deterministic
     entry (``grouped_det_gemm_*``, ``prepare_grouped_det_gemm_*``,
-    ``cake_grouped_det_mm``, ``CakeGroupedDetMm``) and saying to pass
+    ``cake_moe_grouped_gemm_det``, ``CakeMoEGroupedGemmDetFunction``) and saying to pass
     ``deterministic=False`` unless ``deterministic`` is the bool ``False``; with
     ``False`` it reaches its host checks (CPU operands: the device check)."""
     call = PACKAGE_CALLS[name]
@@ -427,9 +427,9 @@ def test_package_mode_keyword_only():
 @pytest.mark.parametrize(
     "entry,det",
     [
-        ("CakeGroupedMm.backward", "CakeGroupedDetMm"),
-        ("GroupedGemmLaunch.launch", "GroupedDetGemmLaunch.launch"),
-        ("grouped_gemm_wgrad", "grouped_det_gemm_wgrad"),
+        ("CakeGroupedMm.backward", "CakeMoEGroupedGemmDetFunction"),
+        ("GroupedGemmLaunch.launch", "CakeMoEGroupedGemmDetLaunch.launch"),
+        ("grouped_gemm_wgrad", "cake_moe_grouped_gemm_det_train_wgrad"),
     ],
 )
 def test_alert_names_the_deterministic_entry(entry, det):
@@ -556,7 +556,7 @@ def test_order_varying_launch_alerts_immediately_before_it_runs(monkeypatch):
     """An order-varying launch (the weight gradient with an unordered split tail) checks
     torch's deterministic mode at every ``launch()``: strict, a ``RuntimeError`` naming
     ``GroupedGemmLaunch.launch`` and the deterministic entry
-    (``GroupedDetGemmLaunch.launch``), and nothing launches; ``warn_only``, one
+    (``CakeMoEGroupedGemmDetLaunch.launch``), and nothing launches; ``warn_only``, one
     ``UserWarning`` naming both and the caller's line, then it launches; mode off, it
     launches silently."""
     launch, log = _recorded_launch(monkeypatch, plan=SPLIT_TAIL)
@@ -566,7 +566,7 @@ def test_order_varying_launch_alerts_immediately_before_it_runs(monkeypatch):
         pytest.raises(RuntimeError, match="GroupedGemmLaunch.launch") as info,
     ):
         launch.launch()
-    assert "cake_moe_grouped_gemm_det_train.GroupedDetGemmLaunch.launch" in str(
+    assert "cake_moe_grouped_gemm_det_train.CakeMoEGroupedGemmDetLaunch.launch" in str(
         info.value
     )
     assert log == []
@@ -579,7 +579,7 @@ def test_order_varying_launch_alerts_immediately_before_it_runs(monkeypatch):
     alerts = _user_warnings(rec)
     assert len(alerts) == 1, [str(w.message) for w in rec]
     assert "GroupedGemmLaunch.launch" in str(alerts[0].message)
-    assert "cake_moe_grouped_gemm_det_train.GroupedDetGemmLaunch.launch" in str(
+    assert "cake_moe_grouped_gemm_det_train.CakeMoEGroupedGemmDetLaunch.launch" in str(
         alerts[0].message
     )
     assert os.path.samefile(alerts[0].filename, __file__), alerts[0].filename
@@ -683,7 +683,10 @@ def test_det_free_names_are_only_the_non_deterministic_objects():
     for name in ("grouped_gemm_fwd", "grouped_gemm_dgrad", "grouped_gemm_wgrad"):
         assert not hasattr(grouped_mm, name), name
         assert not hasattr(det_pkg, name), name
-        assert getattr(facade, name) is not getattr(det_pkg, f"grouped_det_{name[8:]}")
+        det_name = "cake_moe_grouped_gemm_det_train_" + name[13:].replace(
+            "fwd", "forward"
+        )
+        assert getattr(facade, name) is not getattr(det_pkg, det_name)
     assert not hasattr(grouped_mm, "cake_grouped_mm")
     for name in (
         "CakeGroupedMm",

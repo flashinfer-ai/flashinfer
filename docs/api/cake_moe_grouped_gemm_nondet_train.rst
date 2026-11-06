@@ -25,8 +25,8 @@ The facade functions and the package are non-deterministic only; every ND exampl
   refuses anything but ``None`` in its fifth, internal slot with ``TypeError``) and must
   be the bool ``False``: the call runs the non-deterministic package.
 - Every other value -- the default ``True``, ``None``, ``0``, ``1``, ``"False"`` --
-  raises ``ValueError`` naming the deterministic entry (``grouped_det_gemm_fwd`` /
-  ``_dgrad`` / ``_wgrad``, ``prepare_grouped_det_gemm_*``, ``cake_grouped_det_mm``) and
+  raises ``ValueError`` naming the deterministic entry (``cake_moe_grouped_gemm_det_train_forward`` /
+  ``_dgrad`` / ``_wgrad``, ``prepare_grouped_det_gemm_*``, ``cake_moe_grouped_gemm_det``) and
   saying "pass deterministic=False for the non-deterministic path"; nothing runs.
   Nothing here routes to the deterministic package, also not as a fallback.
 - Under ``torch.use_deterministic_algorithms(True)`` PyTorch's non-determinism alert is
@@ -166,13 +166,13 @@ The deterministic names carry ``det``; the non-deterministic names omit it:
 ======================================================== ==============================================================
 deterministic (no ``deterministic`` argument)            non-deterministic (``deterministic=False`` only)
 ======================================================== ==============================================================
-``flashinfer.cake_moe_grouped_gemm_det_train.grouped_det_gemm_fwd``           ``flashinfer.cake_moe_grouped_gemm_nondet_train.grouped_gemm_fwd``
-``flashinfer.cake_moe_grouped_gemm_det_train.grouped_det_gemm_dgrad``         ``flashinfer.cake_moe_grouped_gemm_nondet_train.grouped_gemm_dgrad``
-``flashinfer.cake_moe_grouped_gemm_det_train.grouped_det_gemm_wgrad``         ``flashinfer.cake_moe_grouped_gemm_nondet_train.grouped_gemm_wgrad``
-``flashinfer.cake_moe_grouped_gemm_det_train.cake_grouped_det_mm``            ``flashinfer.cake_moe_grouped_gemm_nondet_train.cake_grouped_mm``
+``flashinfer.cake_moe_grouped_gemm_det_train.cake_moe_grouped_gemm_det_train_forward``           ``flashinfer.cake_moe_grouped_gemm_nondet_train.grouped_gemm_fwd``
+``flashinfer.cake_moe_grouped_gemm_det_train.cake_moe_grouped_gemm_det_train_dgrad``         ``flashinfer.cake_moe_grouped_gemm_nondet_train.grouped_gemm_dgrad``
+``flashinfer.cake_moe_grouped_gemm_det_train.cake_moe_grouped_gemm_det_train_wgrad``         ``flashinfer.cake_moe_grouped_gemm_nondet_train.grouped_gemm_wgrad``
+``flashinfer.cake_moe_grouped_gemm_det_train.cake_moe_grouped_gemm_det``            ``flashinfer.cake_moe_grouped_gemm_nondet_train.cake_grouped_mm``
 ``cake_moe_grouped_det_gemm.prepare_grouped_det_gemm_*`` ``cake.cake_moe_grouped_gemm.prepare_grouped_gemm_*``
-``cake_moe_grouped_det_gemm.GroupedDetGemmLaunch``       ``cake.cake_moe_grouped_gemm.GroupedGemmLaunch``
-``cake_moe_grouped_det_gemm.CakeGroupedDetMm``           ``cake.cake_moe_grouped_gemm.CakeGroupedMm``
+``cake_moe_grouped_det_gemm.CakeMoEGroupedGemmDetLaunch``       ``cake.cake_moe_grouped_gemm.GroupedGemmLaunch``
+``cake_moe_grouped_det_gemm.CakeMoEGroupedGemmDetFunction``           ``cake.cake_moe_grouped_gemm.CakeGroupedMm``
 ======================================================== ==============================================================
 
 The former det-free aliases of the deterministic objects (the package path

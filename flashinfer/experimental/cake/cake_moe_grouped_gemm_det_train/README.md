@@ -2,8 +2,8 @@
 
 Both this API and its Cake backend are experimental and may change or be
 removed without compatibility guarantees. The entry points are the core
-functions `flashinfer.cake_moe_grouped_gemm_det_train.grouped_det_gemm_fwd`, `grouped_det_gemm_dgrad`,
-`grouped_det_gemm_wgrad` and `cake_grouped_det_mm`, and the stable API
+functions `flashinfer.cake_moe_grouped_gemm_det_train.cake_moe_grouped_gemm_det_train_forward`, `cake_moe_grouped_gemm_det_train_dgrad`,
+`cake_moe_grouped_gemm_det_train_wgrad` and `cake_moe_grouped_gemm_det`, and the stable API
 `flashinfer.grouped_mm.grouped_mm_bf16(..., backend="cake")`; calling one of
 them is the explicit opt-in and emits FlashInfer's `ExperimentalWarning` once.
 There is no automatic backend selection. Tracking: FlashInfer issue #5678.
@@ -12,15 +12,15 @@ Three operations over `E` groups of rows, described by an int32 **device**
 tensor `offs[E]` of cumulative end offsets (`offs[-1] == sum_m`; groups may be
 imbalanced, empty, one row long, or any size that is not a tile multiple) or,
 equivalently, an `m_indptr[E + 1]` with a leading 0 (`torch._grouped_mm` /
-`grouped_mm_bf16` form; `grouped_det_gemm_wgrad` needs `num_groups=E` to tell the
+`grouped_mm_bf16` form; `cake_moe_grouped_gemm_det_train_wgrad` needs `num_groups=E` to tell the
 two forms apart). The kernels read the offsets on the device; the host never
 synchronises on them.
 
 | helper | computation | inputs | output |
 | --- | --- | --- | --- |
-| `grouped_det_gemm_fwd(x, w, offs, out=None)` | `Y[offs[e-1]:offs[e]] = X[offs[e-1]:offs[e]] @ W[e].T` | `x [sum_m, K]`, `w [E, N, K]` bf16 | `Y [sum_m, N]` bf16 |
-| `grouped_det_gemm_dgrad(g, w, offs, out=None)` | `dX[offs[e-1]:offs[e]] = G[offs[e-1]:offs[e]] @ W[e]` (W read in place) | `g [sum_m, N]`, `w [E, N, K]` bf16 | `dX [sum_m, K]` bf16 |
-| `grouped_det_gemm_wgrad(g, x, offs, out=None, out_dtype=None, num_groups=None, *, accumulate=False)` | `dW[e] = G[offs[e-1]:offs[e]].T @ X[offs[e-1]:offs[e]]` (with `accumulate=True`: `out[e] += dW[e]`) | `g [sum_m, N]`, `x [sum_m, K]` bf16 | `dW [E, N, K]` bf16 or fp32 |
+| `cake_moe_grouped_gemm_det_train_forward(x, w, offs, out=None)` | `Y[offs[e-1]:offs[e]] = X[offs[e-1]:offs[e]] @ W[e].T` | `x [sum_m, K]`, `w [E, N, K]` bf16 | `Y [sum_m, N]` bf16 |
+| `cake_moe_grouped_gemm_det_train_dgrad(g, w, offs, out=None)` | `dX[offs[e-1]:offs[e]] = G[offs[e-1]:offs[e]] @ W[e]` (W read in place) | `g [sum_m, N]`, `w [E, N, K]` bf16 | `dX [sum_m, K]` bf16 |
+| `cake_moe_grouped_gemm_det_train_wgrad(g, x, offs, out=None, out_dtype=None, num_groups=None, *, accumulate=False)` | `dW[e] = G[offs[e-1]:offs[e]].T @ X[offs[e-1]:offs[e]]` (with `accumulate=True`: `out[e] += dW[e]`) | `g [sum_m, N]`, `x [sum_m, K]` bf16 | `dW [E, N, K]` bf16 or fp32 |
 
 Alignment: `fwd` needs `N % 256 == 0` and `K % 64 == 0`; `dgrad` needs
 `K % 256 == 0` and `N % 64 == 0`; `wgrad` needs `N % 256 == 0` and `K` a
@@ -39,9 +39,9 @@ This package is deterministic only; every public name carries `det`.
 
 | call | result |
 | --- | --- |
-| any entry point of this package or `flashinfer.grouped_mm.{grouped_det_gemm_*, cake_grouped_det_mm}` | the deterministic programs: fixed reduction order, bitwise reproducible run to run |
-| a `deterministic` argument (`True` or `False`), e.g. `cake_grouped_det_mm(x, w, offs, deterministic=False)` | `TypeError`: no deterministic entry takes one |
-| a fourth argument of `CakeGroupedDetMm.apply(x, w, offs)` other than `None` (e.g. a stale `True` / `False` mode; the fifth is `fuse_wgrad_accumulation`) | `TypeError` |
+| any entry point of this package or `flashinfer.grouped_mm.{grouped_det_gemm_*, cake_moe_grouped_gemm_det}` | the deterministic programs: fixed reduction order, bitwise reproducible run to run |
+| a `deterministic` argument (`True` or `False`), e.g. `cake_moe_grouped_gemm_det(x, w, offs, deterministic=False)` | `TypeError`: no deterministic entry takes one |
+| a fourth argument of `CakeMoEGroupedGemmDetFunction.apply(x, w, offs)` other than `None` (e.g. a stale `True` / `False` mode; the fifth is `fuse_wgrad_accumulation`) | `TypeError` |
 | `accumulate=True` / `fuse_wgrad_accumulation=True` | the deterministic weight gradient added into `out` / `w.main_grad`, bitwise reproducible run to run (Weight-gradient accumulation, below) |
 | `torch.use_deterministic_algorithms(True)` (also `warn_only=True`) | no change: no alert, no warning |
 | `flashinfer.grouped_mm.grouped_mm_bf16(..., backend="cake")` | the deterministic forward (the forward programs of both Cake packages give the same bits) |
@@ -65,12 +65,12 @@ an empty namespace package; remove it with
 ```python
 import torch
 from flashinfer.grouped_mm import (
-    cake_grouped_det_mm,
-    grouped_det_gemm_dgrad,
-    grouped_det_gemm_fwd,
-    grouped_det_gemm_wgrad,
+    cake_moe_grouped_gemm_det,
+    cake_moe_grouped_gemm_det_train_dgrad,
+    cake_moe_grouped_gemm_det_train_forward,
+    cake_moe_grouped_gemm_det_train_wgrad,
 )
-from flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train import prepare_grouped_det_gemm_wgrad
+from flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train import cake_moe_grouped_gemm_det_train_prepare_wgrad
 
 E, N, K = 4, 4096, 6144
 sizes = [28128, 28128, 28128, 28192]
@@ -80,30 +80,30 @@ x = torch.randn(sum_m, K, dtype=torch.bfloat16, device="cuda")
 w = torch.randn(E, N, K, dtype=torch.bfloat16, device="cuda")
 g = torch.randn(sum_m, N, dtype=torch.bfloat16, device="cuda")
 
-y = grouped_det_gemm_fwd(x, w, offs)  # one-shot: prepares and launches
-dx = grouped_det_gemm_dgrad(g, w, offs)
-dw = grouped_det_gemm_wgrad(g, x, offs, out_dtype=torch.float32)
-y = cake_grouped_det_mm(x, w, offs)  # autograd wrapper: dX and dW in backward
+y = cake_moe_grouped_gemm_det_train_forward(x, w, offs)  # one-shot: prepares and launches
+dx = cake_moe_grouped_gemm_det_train_dgrad(g, w, offs)
+dw = cake_moe_grouped_gemm_det_train_wgrad(g, x, offs, out_dtype=torch.float32)
+y = cake_moe_grouped_gemm_det(x, w, offs)  # autograd wrapper: dX and dW in backward
 
 # Prepare once, launch many (CUDA-graph capturable; new offs / values may be
 # written into the bound tensors between launches):
-dw_launch = prepare_grouped_det_gemm_wgrad(g, x, offs, out_dtype=torch.float32)
+dw_launch = cake_moe_grouped_gemm_det_train_prepare_wgrad(g, x, offs, out_dtype=torch.float32)
 dw = dw_launch.launch()
 print(dw_launch.record_name, dw_launch.plan)
 ```
 
-The one-shot functions and `cake_grouped_det_mm` are imported from
+The one-shot functions and `cake_moe_grouped_gemm_det` are imported from
 `flashinfer.grouped_mm`: those core entry points carry the experimental-API
 marking and the once-only `ExperimentalWarning` and hand off to the plain
-functions of the same names in this package (`grouped_det_gemm_fwd`,
-`grouped_det_gemm_dgrad` and `grouped_det_gemm_wgrad` in the package root,
-`cake_grouped_det_mm` in `cake_autograd`). A build that vendors the package calls
+functions of the same names in this package (`cake_moe_grouped_gemm_det_train_forward`,
+`cake_moe_grouped_gemm_det_train_dgrad` and `cake_moe_grouped_gemm_det_train_wgrad` in the package root,
+`cake_moe_grouped_gemm_det` in `cake_autograd`). A build that vendors the package calls
 those plain functions directly; they emit no warning. The prepared-launch
 surface below is reached from the package itself.
 
 `prepare_grouped_det_gemm_*` validates, allocates the output (when not given) and
 the weight-gradient workspaces, resolves the route and binds the generated
-programs, and returns a `GroupedDetGemmLaunch`. `launch()` passes the operands'
+programs, and returns a `CakeMoEGroupedGemmDetLaunch`. `launch()` passes the operands'
 TMA descriptors by value (the binding encodes them on the host from the bound
 tensors' metadata at every launch), performs no allocation and no host
 synchronisation. Prepare a new launch when a shape, dtype or tensor binding
@@ -119,33 +119,33 @@ opt-in and emits FlashInfer's `ExperimentalWarning` once, from the core API;
 it then hands off to `cake_backend.grouped_det_mm_bf16_cake`, which rejects the
 options the backend does not take and emits no warning itself.
 
-`cake_grouped_det_mm(x, w, offs)` is a `torch.autograd.Function`
-wrapper (`CakeGroupedDetMm`): `backward` produces `x.grad` with the `dgrad`
+`cake_moe_grouped_gemm_det(x, w, offs)` is a `torch.autograd.Function`
+wrapper (`CakeMoEGroupedGemmDetFunction`): `backward` produces `x.grad` with the `dgrad`
 program and `w.grad` with the `wgrad` program in the dtype of `w`. The
 programs always reduce in a fixed order and there is no `deterministic`
-argument; `grouped_det_gemm_wgrad(..., out_dtype=torch.float32)`
+argument; `cake_moe_grouped_gemm_det_train_wgrad(..., out_dtype=torch.float32)`
 gives an fp32 weight gradient, and `fuse_wgrad_accumulation=True` adds it
-into an fp32 `w.main_grad` (next section). `CakeGroupedDetMm` calls the three programs as
+into an fp32 `w.main_grad` (next section). `CakeMoEGroupedGemmDetFunction` calls the three programs as
 plain functions; no torch custom op is registered.
-The wrapper launches the forward GEMM after `CakeGroupedDetMm.apply` returns,
+The wrapper launches the forward GEMM after `CakeMoEGroupedGemmDetFunction.apply` returns,
 that is after autograd saved `x`, `w` and `offs`, as for a built-in op. Under
 `torch.utils.checkpoint(..., use_reentrant=False)` with early stop on (the
 default), the recomputation therefore stops before this GEMM when these are
 the last saves of the innermost checkpointed region; a later save in that
 region (of its output or of any other tensor) makes it run, with the same
-bits. A direct `CakeGroupedDetMm.apply(x, w, offs)` launches inside
+bits. A direct `CakeMoEGroupedGemmDetFunction.apply(x, w, offs)` launches inside
 `forward` and is always recomputed, as is the wrapper under `torch.jit.trace`
 and `torch.compile`.
 
 ## Weight-gradient accumulation
 
-`grouped_det_gemm_wgrad(..., out=out, accumulate=True)` (also
-`prepare_grouped_det_gemm_wgrad(..., accumulate=True)` and
-`flashinfer.cake_moe_grouped_gemm_det_train.grouped_det_gemm_wgrad`) adds the deterministic weight
+`cake_moe_grouped_gemm_det_train_wgrad(..., out=out, accumulate=True)` (also
+`cake_moe_grouped_gemm_det_train_prepare_wgrad(..., accumulate=True)` and
+`flashinfer.cake_moe_grouped_gemm_det_train.cake_moe_grouped_gemm_det_train_wgrad`) adds the deterministic weight
 gradient into the caller's `out` instead of overwriting it:
 `out[e] += G[e].T @ X[e]`, Megatron's `gradient_accumulation_fusion` into an
 fp32 or bf16 `main_grad` (FlashInfer issue #5678).
-`cake_grouped_det_mm(..., fuse_wgrad_accumulation=True)` does the same in its
+`cake_moe_grouped_gemm_det(..., fuse_wgrad_accumulation=True)` does the same in its
 backward into `w.main_grad` (below). Both switches are keyword-only and off by
 default; with the defaults the routes, programs, plans and bits are unchanged,
 and `plan["accumulate"]` is `"off"`.
@@ -193,7 +193,7 @@ returns it to, the graph's pool within that backward. As for any in-place
 operation, two launches into the same `out` on different streams must be
 ordered by the caller.
 
-`cake_grouped_det_mm(x, w, offs, fuse_wgrad_accumulation=True)` follows
+`cake_moe_grouped_gemm_det(x, w, offs, fuse_wgrad_accumulation=True)` follows
 Megatron and Transformer Engine, as the non-deterministic wrapper does:
 `w.main_grad` must be an fp32 or bf16 tensor of `w`'s shape on its device with
 unit stride along the last dimension and rows and experts that do not overlap
@@ -214,7 +214,7 @@ not require grad is never added to. The flag raises `NotImplementedError` under
 `torch.jit.trace`, `torch.compile` and in a `create_graph` backward; under a
 reentrant checkpoint `w` arrives detached without `main_grad` (`ValueError`;
 use `use_reentrant=False`). A non-reentrant checkpoint's early stop still skips
-the recomputed forward GEMM. A direct `CakeGroupedDetMm.apply(x, w, offs, None,
+the recomputed forward GEMM. A direct `CakeMoEGroupedGemmDetFunction.apply(x, w, offs, None,
 True)` takes the flag as its fifth argument (the fourth is an internal slot)
 and checks `main_grad` at the backward only.
 
@@ -241,8 +241,8 @@ Cost (`S = E * N * K` elements):
   allocates them, one more write of each.
 
 ```python
-from flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train import prepare_grouped_det_gemm_wgrad
-from flashinfer.cake_moe_grouped_gemm_det_train import cake_grouped_det_mm, grouped_det_gemm_wgrad
+from flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train import cake_moe_grouped_gemm_det_train_prepare_wgrad
+from flashinfer.cake_moe_grouped_gemm_det_train import cake_moe_grouped_gemm_det, cake_moe_grouped_gemm_det_train_wgrad
 
 # Megatron-style accumulation into an fp32 main_grad, deterministic
 w = torch.nn.Parameter(torch.randn(E, N, K, dtype=torch.bfloat16, device="cuda"))
@@ -250,12 +250,12 @@ w.main_grad = torch.zeros(E, N, K, dtype=torch.float32, device="cuda")
 # (Megatron's DDP also sets w.grad_added_to_main_grad; the backward then returns a
 # placeholder gradient for its hooks.  Without the attribute w.grad stays None.)
 for x, g in micro_batches:
-    y = cake_grouped_det_mm(x, w, offs, fuse_wgrad_accumulation=True)
+    y = cake_moe_grouped_gemm_det(x, w, offs, fuse_wgrad_accumulation=True)
     y.backward(g)  # w.main_grad[e] += G[e].T @ X[e]; x.grad as usual
 
 # Low level: add into any fp32 / bf16 buffer
-grouped_det_gemm_wgrad(g, x, offs, out=main_grad, accumulate=True)
-launch = prepare_grouped_det_gemm_wgrad(g, x, offs, out=main_grad, accumulate=True)
+cake_moe_grouped_gemm_det_train_wgrad(g, x, offs, out=main_grad, accumulate=True)
+launch = cake_moe_grouped_gemm_det_train_prepare_wgrad(g, x, offs, out=main_grad, accumulate=True)
 launch.launch()  # main_grad += dW; launch.plan["accumulate"] == "composed"
 ```
 
@@ -403,11 +403,11 @@ constants delivered with the generated programs (`HOST_PLAN_CONSTANTS`):
   returns the buffer kept for a stream, or `None` before a launch on it needed
   one.
 
-`GroupedDetGemmLaunch.plan` exposes `grid`, `tile_k`, `tail_splits`,
+`CakeMoEGroupedGemmDetLaunch.plan` exposes `grid`, `tile_k`, `tail_splits`,
 `raster_rows`, `launches` and, for `fwd` / `dgrad`, `tile_n`, `clusters`, `c0`,
 `c1` (the even split) and `queue_split`, for `wgrad` `tail_tile_k` (the k width of the split tail tiles),
-`wave_mode` and `accumulate` (`"off"` or `"composed"`), for inspection and tests; `GroupedDetGemmLaunch.stages`
-names the bound stages in launch order, and `GroupedDetGemmLaunch.add_from` is the
+`wave_mode` and `accumulate` (`"off"` or `"composed"`), for inspection and tests; `CakeMoEGroupedGemmDetLaunch.stages`
+names the bound stages in launch order, and `CakeMoEGroupedGemmDetLaunch.add_from` is the
 scratch of an accumulate launch (else `None`).
 
 ## Build targets and layout

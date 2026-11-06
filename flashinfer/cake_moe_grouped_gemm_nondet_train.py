@@ -23,7 +23,7 @@ tail (the tiles of its last partial wave, cut into k-step units over the
 clusters) in place with unordered fp32 reductions, in one launch.  The
 deterministic counterpart is a separate package with ``det`` in every name,
 ``flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train`` (also
-``flashinfer.grouped_mm.grouped_det_gemm_*`` / ``cake_grouped_det_mm``), to
+``flashinfer.grouped_mm.grouped_det_gemm_*`` / ``cake_moe_grouped_gemm_det``), to
 which nothing here routes.
 
 Mode and dispatch rules (one row per call)::
@@ -39,10 +39,10 @@ Mode and dispatch rules (one row per call)::
                                                             runs); never a deterministic fallback
 
     entry                 deterministic entry (no deterministic argument)
-    grouped_gemm_fwd      flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train.grouped_det_gemm_fwd
-    grouped_gemm_dgrad    ...grouped_det_gemm_dgrad
-    grouped_gemm_wgrad    ...grouped_det_gemm_wgrad
-    cake_grouped_mm       ...cake_grouped_det_mm
+    grouped_gemm_fwd      flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train.cake_moe_grouped_gemm_det_train_forward
+    grouped_gemm_dgrad    ...cake_moe_grouped_gemm_det_train_dgrad
+    grouped_gemm_wgrad    ...cake_moe_grouped_gemm_det_train_wgrad
+    cake_grouped_mm       ...cake_moe_grouped_gemm_det
 
 An order-varying launch is the weight gradient whose 512-wide k tile splits
 its tail (``plan["unordered_tail"]`` and ``plan["tail_splits"] > 1``), in
@@ -89,9 +89,9 @@ Usage::
     dw = grouped_gemm_wgrad(g, x, offs, out_dtype=torch.float32, deterministic=False)
 
     # The deterministic entries take no deterministic argument:
-    from flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train import cake_grouped_det_mm
+    from flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train import cake_moe_grouped_gemm_det
 
-    y = cake_grouped_det_mm(x, w, offs)
+    y = cake_moe_grouped_gemm_det(x, w, offs)
 
 The kernels, the host planning, the autograd wrapper and the JIT registration
 live in the package, which every function imports inside its body (a
@@ -141,7 +141,7 @@ def grouped_gemm_fwd(
         Must be ``False``: the non-deterministic package's copy of the
         deterministic forward programs (bitwise the same ``Y``).  Every other
         value, the default ``True`` included, raises ``ValueError`` naming
-        ``grouped_det_gemm_fwd``.  Never alerts under torch's deterministic
+        ``cake_moe_grouped_gemm_det_train_forward``.  Never alerts under torch's deterministic
         mode (fixed order).
 
     Returns
@@ -172,7 +172,7 @@ def grouped_gemm_dgrad(
     offsets (or ``m_indptr`` ``[E + 1]``) and ``out`` is ``[sum_m, K]`` bfloat16.
     ``K % 256 == 0`` and ``N % 64 == 0`` are required.  ``deterministic`` must
     be ``False`` (every other value, the default ``True`` included, raises
-    ``ValueError`` naming ``grouped_det_gemm_dgrad``): the non-deterministic
+    ``ValueError`` naming ``cake_moe_grouped_gemm_det_train_dgrad``): the non-deterministic
     package's copy of the deterministic programs (on sm_100a, where the
     evict-first rule holds, its own build of the deterministic wide program
     with L2 evict-first loads and stores; bitwise the same ``dX``).  Never
@@ -209,7 +209,7 @@ def grouped_gemm_wgrad(
 
     ``deterministic`` must be ``False`` (every other value, the default
     ``True`` included, raises ``ValueError`` naming
-    ``grouped_det_gemm_wgrad``): with the 512-wide k tile a split tail is
+    ``cake_moe_grouped_gemm_det_train_wgrad``): with the 512-wide k tile a split tail is
     added in place with unordered fp32 reductions (one launch instead of two),
     within the same error budgets but not bitwise reproducible run to run;
     with the 256-wide k tile the deterministic programs run.  Under torch's
@@ -263,7 +263,7 @@ def cake_grouped_mm(
         ``[E + 1]``.  Read by the kernels, never on the host.
     deterministic : bool
         Keyword-only; must be ``False`` (every other value, the default ``True``
-        included, raises ``ValueError`` naming ``cake_grouped_det_mm``):
+        included, raises ``ValueError`` naming ``cake_moe_grouped_gemm_det``):
         ``CakeGroupedMm`` of the non-deterministic package, whose backward runs
         the deterministic data-gradient programs and the weight gradient with
         the unordered split tail.  Under torch's deterministic mode the

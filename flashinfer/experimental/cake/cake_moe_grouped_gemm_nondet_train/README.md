@@ -34,7 +34,7 @@ deterministic package:
 | call | result |
 | --- | --- |
 | `deterministic=False` | this package |
-| `deterministic` omitted or `True`, or any value that is not the bool `False` (`None`, `0`, `1`, `"False"`) | `ValueError` naming the deterministic entry (`grouped_det_gemm_*`, `prepare_grouped_det_gemm_*`, `cake_grouped_det_mm`, `CakeGroupedDetMm`) and saying "pass deterministic=False for the non-deterministic path"; nothing runs |
+| `deterministic` omitted or `True`, or any value that is not the bool `False` (`None`, `0`, `1`, `"False"`) | `ValueError` naming the deterministic entry (`grouped_det_gemm_*`, `prepare_grouped_det_gemm_*`, `cake_moe_grouped_gemm_det`, `CakeMoEGroupedGemmDetFunction`) and saying "pass deterministic=False for the non-deterministic path"; nothing runs |
 | `deterministic=False` under `torch.use_deterministic_algorithms(True)` | PyTorch's non-determinism alert, naming the deterministic entry, immediately before an order-varying launch (`RuntimeError`, nothing launches; `warn_only=True`: a `UserWarning`, then the launch runs; it names the caller's line for a direct call of `grouped_gemm_wgrad` or `launch()`, a frame of PyTorch's autograd for the backward); never a deterministic fallback |
 
 An order-varying launch (`GroupedGemmLaunch.order_varying`) is the weight

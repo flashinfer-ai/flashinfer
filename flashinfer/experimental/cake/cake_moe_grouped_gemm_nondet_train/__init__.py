@@ -112,7 +112,7 @@ def grouped_gemm_fwd(
     out : Optional[torch.Tensor]
         ``[sum_m, N]`` bfloat16 output (allocated when omitted); may be row-padded.
     deterministic : bool
-        Must be ``False`` (``ValueError`` naming ``grouped_det_gemm_fwd``
+        Must be ``False`` (``ValueError`` naming ``cake_moe_grouped_gemm_det_train_forward``
         otherwise, the default included).  The forward programs are copies of
         the deterministic package's and give its bits; they never alert under
         torch's deterministic mode.
@@ -148,7 +148,7 @@ def grouped_gemm_dgrad(
     read in place (no transpose copy), ``offs`` is ``[E]`` int32 device end
     offsets (or ``m_indptr`` ``[E + 1]``) and ``out`` is ``[sum_m, K]`` bfloat16.  ``K % 256 == 0`` and
     ``N % 64 == 0`` are required.  ``deterministic`` must be ``False``
-    (``ValueError`` naming ``grouped_det_gemm_dgrad`` otherwise); the programs
+    (``ValueError`` naming ``cake_moe_grouped_gemm_det_train_dgrad`` otherwise); the programs
     are copies of the deterministic package's, but for the sm_100a evict-first
     twin, this package's own build of the deterministic wide tile, and all give
     its bits (no alert under torch's deterministic mode).  See
@@ -179,7 +179,7 @@ def grouped_gemm_wgrad(
     is ``[E, N, K]`` in ``out_dtype`` (bfloat16 or float32; defaults to the
     dtype of ``out``, else bfloat16).  fp32 accumulation, one rounding at the
     store, exact zeros for empty groups.  ``deterministic`` must be ``False``
-    (``ValueError`` naming ``grouped_det_gemm_wgrad`` otherwise): with the
+    (``ValueError`` naming ``cake_moe_grouped_gemm_det_train_wgrad`` otherwise): with the
     512-wide k tile a split tail is added with unordered fp32 reductions, so
     ``dW`` is not bitwise reproducible run to run, and under
     ``torch.use_deterministic_algorithms(True)`` such a launch raises the

@@ -78,9 +78,9 @@ forward, data gradient and weight gradient), ``det_mgB`` (the
 deterministic autograd wrapper's bf16 ``w.grad``, then the fp32
 ``main_grad.add_``; the deterministic bf16 ``dW`` and the add in
 ``wgrad_acc``) and ``det_mgX`` (the deterministic package's own accumulate:
-``cake_grouped_det_mm(..., fuse_wgrad_accumulation=True)`` into the fp32
+``cake_moe_grouped_gemm_det(..., fuse_wgrad_accumulation=True)`` into the fp32
 ``main_grad`` with the ``grad_added_to_main_grad`` placeholder;
-``prepare_grouped_det_gemm_wgrad(..., accumulate=True)`` in ``wgrad_acc``).
+``cake_moe_grouped_gemm_det_train_prepare_wgrad(..., accumulate=True)`` in ``wgrad_acc``).
 The peak memory includes the placeholder gradient and every temporary.  A
 fused arm records ``plan["accumulate"]`` and, where the device serves an
 accumulate build of its dtype, fails unless the row is fused
@@ -115,7 +115,7 @@ from flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train import (
     cake_backend as det_cb,
 )
 from flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train.cake_autograd import (
-    cake_grouped_det_mm,
+    cake_moe_grouped_gemm_det,
 )
 from flashinfer.testing import bench_gpu_time
 
@@ -388,7 +388,7 @@ def _step(autograd_fn, t, early_stop=False):
     Early stop off (the ``step`` rows): every arm recomputes its forward GEMM,
     ``2 x forward + backward``.  On (the torch default, the ``step_es`` rows): the
     recompute stops once the region saved its last tensor, so an arm whose inputs are
-    saved before its GEMM launches (``torch._grouped_mm``, ``cake_grouped_det_mm``,
+    saved before its GEMM launches (``torch._grouped_mm``, ``cake_moe_grouped_gemm_det``,
     ``cake_grouped_mm``) does one GEMM less, and one that launches inside
     ``Function.forward`` (``cake_inforward``) still recomputes it."""
     return _checkpointed(autograd_fn, t, ("x", "w"), early_stop)
@@ -426,7 +426,9 @@ def _cake_arm(backend, row, t):
     deterministic = backend is det_cb
     if op in AUTOGRAD_OPS:
         if deterministic:
-            fn = _autograd(lambda x, w, offs: cake_grouped_det_mm(x, w, offs), row, t)
+            fn = _autograd(
+                lambda x, w, offs: cake_moe_grouped_gemm_det(x, w, offs), row, t
+            )
         else:
             fn = _autograd(
                 lambda x, w, offs: pkg.cake_grouped_mm(x, w, offs, deterministic=False),
@@ -439,9 +441,9 @@ def _cake_arm(backend, row, t):
         args = (t["g"], t["x"])
     if deterministic:
         prepare = {
-            "fwd": det_cb.prepare_grouped_det_gemm_fwd,
-            "dgrad": det_cb.prepare_grouped_det_gemm_dgrad,
-            "wgrad": det_cb.prepare_grouped_det_gemm_wgrad,
+            "fwd": det_cb.cake_moe_grouped_gemm_det_train_prepare_forward,
+            "dgrad": det_cb.cake_moe_grouped_gemm_det_train_prepare_dgrad,
+            "wgrad": det_cb.cake_moe_grouped_gemm_det_train_prepare_wgrad,
         }[op]
         launch = prepare(*args, t["offs"], out=t["out"])
     else:
@@ -585,7 +587,7 @@ class _MainGradMm(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, w, offs, mode):
         if mode == "det_acc":
-            y = det_pkg.grouped_det_gemm_fwd(x, w, offs)
+            y = det_pkg.cake_moe_grouped_gemm_det_train_forward(x, w, offs)
         else:
             y = pkg.grouped_gemm_fwd(x, w, offs, deterministic=False)
         ctx.save_for_backward(x, w, offs)
@@ -602,13 +604,15 @@ class _MainGradMm(torch.autograd.Function):
         dx = None
         if ctx.needs_input_grad[0]:
             if det:
-                dx = det_pkg.grouped_det_gemm_dgrad(g, w, offs)
+                dx = det_pkg.cake_moe_grouped_gemm_det_train_dgrad(g, w, offs)
             else:
                 dx = pkg.grouped_gemm_dgrad(g, w, offs, deterministic=False)
         main_grad = ctx.w.main_grad
         if det:
             main_grad.add_(
-                det_pkg.grouped_det_gemm_wgrad(g, x, offs, out_dtype=torch.float32)
+                det_pkg.cake_moe_grouped_gemm_det_train_wgrad(
+                    g, x, offs, out_dtype=torch.float32
+                )
             )
         elif ctx.mode == "mgF":
             main_grad.add_(
@@ -679,12 +683,12 @@ def _acc_autograd(arm, t, op):
     elif arm == "det_mgB":
 
         def mm(a, b, o):
-            return cake_grouped_det_mm(a, b, o)
+            return cake_moe_grouped_gemm_det(a, b, o)
 
     elif arm == "det_mgX":
 
         def mm(a, b, o):
-            return cake_grouped_det_mm(a, b, o, fuse_wgrad_accumulation=True)
+            return cake_moe_grouped_gemm_det(a, b, o, fuse_wgrad_accumulation=True)
 
     elif arm in ("mgF", "mgO", "det_acc"):
 
@@ -740,7 +744,7 @@ def _acc_wgrad(arm, t):
     if arm == "det_mgX":
         # The deterministic package's accumulate: its fp32 dW into the launch's scratch,
         # then the add.
-        return det_cb.prepare_grouped_det_gemm_wgrad(
+        return det_cb.cake_moe_grouped_gemm_det_train_prepare_wgrad(
             g, x, offs, out=mg32, accumulate=True
         ).launch
     if arm in DET_ACC_ARMS:
@@ -748,7 +752,9 @@ def _acc_wgrad(arm, t):
         # Megatron's unfused path) into a temporary, then the fp32 add into main_grad.
         dtype = torch.float32 if arm == "det_acc" else torch.bfloat16
         tmp = torch.empty(mg32.shape, dtype=dtype, device=mg32.device)
-        det_launch = det_cb.prepare_grouped_det_gemm_wgrad(g, x, offs, out=tmp)
+        det_launch = det_cb.cake_moe_grouped_gemm_det_train_prepare_wgrad(
+            g, x, offs, out=tmp
+        )
 
         def run_det():
             det_launch.launch()

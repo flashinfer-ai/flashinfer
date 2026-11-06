@@ -293,10 +293,14 @@ def _prepare(backend, case, a, b, offs, out):
     non-deterministic (``cb``) package."""
     if backend is det_cb:
         if case.op == "fwd":
-            return det_cb.prepare_grouped_det_gemm_fwd(a, b, offs, out=out)
+            return det_cb.cake_moe_grouped_gemm_det_train_prepare_forward(
+                a, b, offs, out=out
+            )
         if case.op == "dgrad":
-            return det_cb.prepare_grouped_det_gemm_dgrad(a, b, offs, out=out)
-        return det_cb.prepare_grouped_det_gemm_wgrad(
+            return det_cb.cake_moe_grouped_gemm_det_train_prepare_dgrad(
+                a, b, offs, out=out
+            )
+        return det_cb.cake_moe_grouped_gemm_det_train_prepare_wgrad(
             a, b, offs, out=out, out_dtype=case.out_dtype
         )
     if case.op == "fwd":
