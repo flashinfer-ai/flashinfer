@@ -54,44 +54,56 @@ fusion and an autograd wrapper.
 
    **Mode and dispatch rules.**
 
-   * ``flashinfer.cake_rmsnorm_det_train`` (this section) is the deterministic
-     package: its weight gradient ``dw`` is bitwise reproducible and every
-     forward, backward, workspace, support-query and autograd entry point name
-     carries ``det``. Its entry points take no ``deterministic`` keyword
-     (passing one raises ``TypeError``), and
-     ``torch.use_deterministic_algorithms`` changes nothing for them.
-   * ``flashinfer.cake_rmsnorm_train`` (next section) is the non-deterministic
-     package (names without ``det``). Every entry point requires
-     ``deterministic=False``: any other value, the default ``True`` included,
-     raises ``ValueError`` naming the matching ``det`` entry point. A ``False``
-     default would silently switch callers of the former deterministic default
-     to the non-deterministic kernels; the explicit ``False`` keeps the mode
-     visible at every call, for example
-     ``cake_rmsnorm(x, w, eps, deterministic=False)``.
+   * The mode is part of the name, and only of the name. Every public name of
+     ``flashinfer.cake_rmsnorm_det_train`` (this section, the deterministic
+     package) carries ``det``; every public name of
+     ``flashinfer.cake_rmsnorm_nondet_train`` (next section, the
+     non-deterministic package) carries ``nondet``. The constants ``ARCHES``
+     and ``SUPPORTED_COMPUTE_CAPABILITIES`` keep their names. Each package
+     runs its own kernels only; neither runs the other.
+   * No entry point of either package takes a ``deterministic`` keyword:
+     passing one raises Python's ``TypeError``. The deterministic package's
+     weight gradient ``dw`` is bitwise reproducible; the non-deterministic
+     package's is not guaranteed to be.
    * Under ``torch.use_deterministic_algorithms(True)`` the non-deterministic
      package alerts only before work whose result can vary from run to run:
-     every backward call (and the backward of the autograd ``cake_rmsnorm`` /
-     ``CakeRMSNormFunction``, when it runs) raises ``RuntimeError`` naming the
-     ``det`` entry point, or, with ``warn_only=True``, warns once and runs the
-     non-deterministic backward. The forward (no cross-row reduction, bitwise
-     reproducible), the workspace helpers and
-     ``is_cake_rmsnorm_train_supported`` never alert.
-   * The ``flashinfer`` top level binds only the ``det`` names
+     every backward call (and the backward of the autograd
+     ``cake_rmsnorm_nondet`` / ``CakeRMSNormNondetFunction``, when it runs)
+     raises ``RuntimeError`` naming the ``det`` entry point, or, with
+     ``warn_only=True``, warns once and runs the non-deterministic backward
+     (never the deterministic one). The forward (no cross-row reduction,
+     bitwise reproducible), the workspace helpers,
+     ``cake_rmsnorm_nondet_train_route_key`` and
+     ``is_cake_rmsnorm_nondet_train_supported`` never alert. The deterministic
+     package never alerts.
+   * The ``flashinfer`` top level binds the ``det`` entry points
      (``cake_rmsnorm_det``, ``CakeRMSNormDetFunction``,
      ``cake_rmsnorm_det_train_forward``, ``cake_rmsnorm_det_train_backward``,
-     ``cake_rmsnorm_det_train_backward_workspace_bytes``). The non-deterministic
-     package is reached only as the module ``flashinfer.cake_rmsnorm_train``.
-     The top-level ``flashinfer.cake_rmsnorm``, ``flashinfer.CakeRMSNormFunction``,
-     ``flashinfer.cake_rmsnorm_train_forward``,
-     ``flashinfer.cake_rmsnorm_train_backward`` and
-     ``flashinfer.cake_rmsnorm_train_backward_workspace_bytes`` are removed, so
-     code that imports them fails at import. Callers that want the
-     deterministic behavior of those names use the ``det`` names (for example
-     ``flashinfer.cake_rmsnorm_det``); callers of the non-deterministic package
-     call ``flashinfer.cake_rmsnorm_train.cake_rmsnorm`` with
-     ``deterministic=False``.
-   * There are no aliases: a name without ``det`` never runs the deterministic
-     package, and neither package runs the other.
+     ``cake_rmsnorm_det_train_backward_workspace_bytes``) and the module
+     ``flashinfer.cake_rmsnorm_nondet_train``, through which the
+     non-deterministic package is reached; it binds none of that package's
+     names.
+   * The names from before the rename are removed, with no aliases; code that
+     uses them fails at import:
+
+     ===================================================  ===========================================================
+     Removed                                              Use
+     ===================================================  ===========================================================
+     module ``flashinfer.cake_rmsnorm_train``             module ``flashinfer.cake_rmsnorm_nondet_train``
+     ``cake_rmsnorm(..., deterministic=False)``           ``cake_rmsnorm_nondet(...)``
+     ``CakeRMSNormFunction``                              ``CakeRMSNormNondetFunction``
+     ``cake_rmsnorm_train_forward``                       ``cake_rmsnorm_nondet_train_forward``
+     ``cake_rmsnorm_train_backward``                      ``cake_rmsnorm_nondet_train_backward``
+     ``cake_rmsnorm_train_backward_workspace``            ``cake_rmsnorm_nondet_train_backward_workspace``
+     ``cake_rmsnorm_train_backward_workspace_bytes``      ``cake_rmsnorm_nondet_train_backward_workspace_bytes``
+     ``is_cake_rmsnorm_train_supported``                  ``is_cake_rmsnorm_nondet_train_supported``
+     ``route_key`` (non-deterministic package)            ``cake_rmsnorm_nondet_train_route_key``
+     ``route_key`` (deterministic package)                ``cake_rmsnorm_det_train_route_key``
+     ``program_windows``                                  ``cake_rmsnorm_det_train_program_windows``
+     ``weight_dtypes``                                    ``cake_rmsnorm_det_train_weight_dtypes``
+     ``flashinfer.cake_rmsnorm_det_train_backend``        ``flashinfer.experimental.cake.cake_rmsnorm_det_train``
+     ``flashinfer.cake_rmsnorm_train_backend``            ``flashinfer.experimental.cake.cake_rmsnorm_nondet_train``
+     ===================================================  ===========================================================
 
 .. currentmodule:: flashinfer.cake_rmsnorm_det_train
 
@@ -104,8 +116,8 @@ fusion and an autograd wrapper.
     cake_rmsnorm_det_train_backward_workspace_bytes
     cake_rmsnorm_det_train_backward_workspace
     is_cake_rmsnorm_det_train_supported
-    program_windows
-    weight_dtypes
+    cake_rmsnorm_det_train_program_windows
+    cake_rmsnorm_det_train_weight_dtypes
     CakeRMSNormDetFunction
 
 Training RMSNorm, non-deterministic weight gradient (Cake)
@@ -113,7 +125,7 @@ Training RMSNorm, non-deterministic weight gradient (Cake)
 
 The deterministic package's forward programs, rendered into this package, and a
 backward with the non-deterministic weight gradient (the note above gives the
-mode and dispatch rules: every call passes ``deterministic=False``):
+mode and dispatch rules):
 
 * The backward runs the form its registry lists for each token-count window
   (the backward's docstring lists the windows). In the windows that ship the
@@ -127,7 +139,7 @@ mode and dispatch rules: every call passes ``deterministic=False``):
   FP64 additions, so its ``dw`` error does not grow with the token count. The
   other windows run the deterministic package's backward pair (main kernel and
   fixed-order reduce), rendered into this package.
-* The backward workspace (``cake_rmsnorm_train_backward_workspace_bytes``) has
+* The backward workspace (``cake_rmsnorm_nondet_train_backward_workspace_bytes``) has
   one layout with fixed offsets: the pair's counters, the single kernel's
   counters and FP64 column sums and, for the pair windows, the partial rows.
   Zeroed once, it serves any sequence of backward calls it is large enough for
@@ -136,18 +148,18 @@ mode and dispatch rules: every call passes ``deterministic=False``):
 * It also accepts ``[..., H]`` inputs whose leading dimensions collapse into
   rows and an FP32 weight on the routes that ship the FP32-weight programs.
 
-.. currentmodule:: flashinfer.cake_rmsnorm_train
+.. currentmodule:: flashinfer.cake_rmsnorm_nondet_train
 
 .. autosummary::
     :toctree: ../generated
 
-    cake_rmsnorm
-    cake_rmsnorm_train_forward
-    cake_rmsnorm_train_backward
-    cake_rmsnorm_train_backward_workspace_bytes
-    cake_rmsnorm_train_backward_workspace
-    CakeRMSNormFunction
-    is_cake_rmsnorm_train_supported
+    cake_rmsnorm_nondet
+    cake_rmsnorm_nondet_train_forward
+    cake_rmsnorm_nondet_train_backward
+    cake_rmsnorm_nondet_train_backward_workspace_bytes
+    cake_rmsnorm_nondet_train_backward_workspace
+    CakeRMSNormNondetFunction
+    is_cake_rmsnorm_nondet_train_supported
 
 Training SiLU-gated RMSNorm (Cake)
 ----------------------------------
