@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 // SM120 (RTX PRO 6000 / 6000D class) MXFP4 MegaMoE for decode-size batches over PCIe P2P, one
-// persistent kernel per rank: routing exchange -> dispatch (MXFP8 requantisation + 16 B P2P stores
+// persistent kernel per rank: routing exchange -> dispatch (the staged MXFP8 rows, 16 B P2P stores
 // into the destination expert pool) -> FC1 + clamped SwiGLU (swap-AB W4A8 mma.sync) -> FC2 -> P2P
 // push of each (token, k) partial back to its source rank -> top-k combine. No cross-rank barrier:
 // every source writes an epoch-tagged flag into the consumer's memory (st.release.sys) after its
@@ -22,9 +22,9 @@
 //
 // Compute core: mma.sync.aligned.m16n8k32.kind::mxf8f6f4.block_scale (E2M1 weights as A, E4M3
 // activations as B, UE8M0 scales per 32 on both): 16 weight rows x 8 tokens per MMA, weights loaded
-// global -> registers in a lane-fragment layout (flashinfer/megamoe/weights.py, SM120 branch). FC1
-// rows are interleaved per 16-row block (gate rows 8b..8b+7, then up rows 8b..8b+7), so each SwiGLU
-// pair lands in one thread.
+// global -> registers in a lane-fragment layout (flashinfer.moe_ep SM120 mxfp4_mxfp8_bf16_decode
+// backend, weights.py). FC1 rows are interleaved per 16-row block (gate rows 8b..8b+7, then up rows
+// 8b..8b+7), so each SwiGLU pair lands in one thread.
 //
 // Every spin wait times out and records an error code in the counter block instead of hanging the
 // GPU; the last CTA to exit resets the per-call counters and advances the epoch (CUDA-graph replay
@@ -132,7 +132,7 @@ struct Gin {
 
 struct Args {
   const uint8_t* x;         // [T][H] e4m3, staged by the caller
-  const float* x_sf;        // [T][H/128] fp32 scale per 128 channels
+  const uint8_t* x_sf;      // [T][H/32] UE8M0 scale per 32 channels
   const int64_t* topk_ids;  // [T][TOPK] global expert ids, -1 = masked route
   const float* topk_w;      // [T][TOPK]
   __nv_bfloat16* out;       // [T][H]
@@ -448,7 +448,7 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
     }
   }
 
-  // ---------------- dispatch: one CTA per token: quantize once to MXFP8 in smem, push TOPK copies
+  // ---------------- dispatch: one CTA per token: the staged MXFP8 row into smem, push TOPK copies
   // with every thread
   const int nitems = a.T * TOPK;
   {
@@ -457,26 +457,12 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
     uint8_t* s_sc = s_q + H;
     __shared__ int s_rowk[8], s_dstk[8];
     for (int t = blockIdx.x; t < a.T; t += gridDim.x) {
-      if (threadIdx.x <
-          H / 32) {  // one thread per K32 group: dequantise the staged row, requantise to MXFP8
+      if (threadIdx.x < H / 32) {  // one thread per K32 group: the staged codes and their scale
         const uint4* s4 = reinterpret_cast<const uint4*>(a.x + size_t(t) * H + threadIdx.x * 32);
-        const float sf = a.x_sf[size_t(t) * (H / 128) + threadIdx.x / 4];
-        float v[32];
-#pragma unroll
-        for (int q = 0; q < 2; ++q) {
-          const uint4 u = s4[q];
-          const __nv_fp8_storage_t* f8 = reinterpret_cast<const __nv_fp8_storage_t*>(&u);
-#pragma unroll
-          for (int r = 0; r < 16; ++r) {
-            const __half_raw hr = __nv_cvt_fp8_to_halfraw(f8[r], __NV_E4M3);
-            v[q * 16 + r] = __half2float(__half(hr)) * sf;
-          }
-        }
-        uint32_t q8[8];
-        s_sc[threadIdx.x] = quant32(v, q8);
         uint4* d4 = reinterpret_cast<uint4*>(s_q + threadIdx.x * 32);
-        d4[0] = make_uint4(q8[0], q8[1], q8[2], q8[3]);
-        d4[1] = make_uint4(q8[4], q8[5], q8[6], q8[7]);
+        d4[0] = s4[0];
+        d4[1] = s4[1];
+        s_sc[threadIdx.x] = a.x_sf[size_t(t) * (H / 32) + threadIdx.x];
       }
       if (warp < TOPK) {  // warp k: destination row of copy k (slot = tokens t' < t routed to the
                           // same expert)

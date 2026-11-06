@@ -94,7 +94,7 @@ void megamoe_sm120_mxfp4_fused(
   s::Args a{};
   char* local = static_cast<char*>(symm_buffer.data_ptr());
   a.x = reinterpret_cast<const uint8_t*>(local + offsets[kOffX]);
-  a.x_sf = reinterpret_cast<const float*>(local + offsets[kOffXSf]);
+  a.x_sf = reinterpret_cast<const uint8_t*>(local + offsets[kOffXSf]);
   a.topk_ids = reinterpret_cast<const int64_t*>(local + offsets[kOffTopkIdx]);
   a.topk_w = reinterpret_cast<const float*>(local + offsets[kOffTopkWeights]);
   a.out = static_cast<__nv_bfloat16*>(y.data_ptr());
