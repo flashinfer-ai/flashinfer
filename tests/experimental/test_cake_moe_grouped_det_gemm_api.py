@@ -27,17 +27,24 @@ out of ``import flashinfer.grouped_mm`` -- and checks the stable route on a GPU
 against the per-group fp64 reference (including the rows past ``m_indptr[-1]``,
 which belong to no group) and against the options the Cake backend does not take,
 and that a non-reentrant checkpoint of the core ``cake_grouped_det_mm`` with early stop
-on skips the recomputed forward GEMM.
+on skips the recomputed forward GEMM.  On CPU it also checks the deterministic-only
+contract: the det-free names and paths of the package before the deterministic-family
+rename are gone (``ModuleNotFoundError`` / ``AttributeError`` / ``KeyError``, no alias),
+no deterministic entry takes a ``deterministic`` argument (``TypeError``, also a stale
+positional mode of ``CakeGroupedDetMm.apply``), and torch's deterministic mode changes
+nothing for them (no alert, no warning).
 The backend tests of the package live in ``test_cake_moe_grouped_det_gemm.py``, which
 imports the package only through ``tests.test_helpers.cake_package``.
 """
 
+import importlib
 import inspect
 import json
 import math
 import os
 import subprocess
 import sys
+import warnings
 from pathlib import Path
 
 import pytest
@@ -186,6 +193,232 @@ def test_importing_grouped_mm_does_not_import_the_package():
         " or m.startswith('flashinfer.experimental.cake_moe_grouped_det_gemm'))))\n"
     )
     assert json.loads(_run_cpu_subprocess(code)) == ["flashinfer.grouped_mm.cake_det"]
+
+
+# ---------------------------------------------------------------------------
+# Removed det-free names and the deterministic-only contract (CPU)
+# ---------------------------------------------------------------------------
+
+# The package path and module of the deterministic objects before the
+# deterministic-family rename: removed, with no alias module.
+REMOVED_MODULES = (
+    "flashinfer.experimental.cake_moe_grouped_gemm",
+    "flashinfer.experimental.cake_moe_grouped_gemm.cake_autograd",
+    "flashinfer.experimental.cake_moe_grouped_gemm.cake_backend",
+    "flashinfer.experimental.cake_moe_grouped_gemm.cake_build",
+    "flashinfer.experimental.cake_moe_grouped_gemm.cake_jit",
+    "flashinfer.grouped_mm.cake",
+)
+# module -> the det-free names it no longer has (formerly aliases of the det objects).
+REMOVED_NAMES = {
+    "flashinfer.experimental.cake_moe_grouped_det_gemm": (
+        "CakeGroupedMm",
+        "GroupedGemmLaunch",
+        "cake_grouped_mm",
+        "grouped_gemm_dgrad",
+        "grouped_gemm_fwd",
+        "grouped_gemm_wgrad",
+        "prepare_grouped_gemm_dgrad",
+        "prepare_grouped_gemm_fwd",
+        "prepare_grouped_gemm_wgrad",
+    ),
+    "flashinfer.experimental.cake_moe_grouped_det_gemm.cake_autograd": (
+        "CakeGroupedMm",
+        "cake_grouped_mm",
+    ),
+    "flashinfer.experimental.cake_moe_grouped_det_gemm.cake_backend": (
+        "GroupedGemmLaunch",
+        "grouped_mm_bf16_cake",
+        "prepare_grouped_gemm_dgrad",
+        "prepare_grouped_gemm_fwd",
+        "prepare_grouped_gemm_wgrad",
+    ),
+    "flashinfer.grouped_mm.cake_det": (
+        "cake_grouped_mm",
+        "grouped_gemm_dgrad",
+        "grouped_gemm_fwd",
+        "grouped_gemm_wgrad",
+    ),
+    "flashinfer.grouped_mm": (
+        "cake_grouped_mm",
+        "grouped_gemm_dgrad",
+        "grouped_gemm_fwd",
+        "grouped_gemm_wgrad",
+    ),
+}
+
+
+@pytest.mark.parametrize("path", REMOVED_MODULES)
+def test_removed_module_paths_do_not_import(path):
+    """The package ``flashinfer.experimental.cake_moe_grouped_gemm`` (and its
+    submodules) and the core module ``flashinfer.grouped_mm.cake`` are gone: importing
+    them raises ``ModuleNotFoundError`` (no alias module redirects them)."""
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module(path)
+
+
+@pytest.mark.parametrize("module_name", list(REMOVED_NAMES))
+def test_removed_det_free_names_raise_attribute_error(module_name):
+    """Every det-free name that used to resolve to a deterministic object raises
+    ``AttributeError`` (no ``_RENAMED`` map and no ``__getattr__`` alias branch is
+    left), and ``from ... import`` of it raises ``ImportError``."""
+    module = importlib.import_module(module_name)
+    assert not hasattr(module, "_RENAMED"), module_name
+    for name in REMOVED_NAMES[module_name]:
+        with pytest.raises(AttributeError):
+            getattr(module, name)
+        assert name not in getattr(module, "__all__", ()), (module_name, name)
+        with pytest.raises(ImportError):
+            exec(f"from {module_name} import {name}", {})
+
+
+def test_removed_test_helper_key():
+    """The test-helper key ``cake_moe_grouped_gemm`` (formerly the det package's
+    compatibility key) is gone; the det and non-deterministic keys stay."""
+    from tests.test_helpers.cake_package import PACKAGES, cake_package
+
+    assert "cake_moe_grouped_gemm" not in PACKAGES
+    with pytest.raises(KeyError):
+        cake_package("cake_moe_grouped_gemm")
+    assert cake_package("cake_moe_grouped_det_gemm") is pkg
+    assert (
+        PACKAGES["cake.cake_moe_grouped_gemm"]
+        == "flashinfer.experimental.cake.cake_moe_grouped_gemm"
+    )
+
+
+def _det_callables():
+    """name -> callable of every deterministic entry point: the package functions,
+    the prepared-launch builders, the autograd wrapper and the core entry points."""
+    from flashinfer.experimental.cake_moe_grouped_det_gemm import cake_autograd
+
+    found = {f"pkg.{name}": getattr(pkg, name) for name in pkg.__all__}
+    found.update({f"core.{name}": getattr(grouped_mm, name) for name in ENTRY_POINTS})
+    found["CakeGroupedDetMm.forward"] = cake_autograd.CakeGroupedDetMm.forward
+    found["cb.grouped_det_mm_bf16_cake"] = cb.grouped_det_mm_bf16_cake
+    return found
+
+
+def test_det_entries_have_no_mode_parameter():
+    """No deterministic entry point has a ``deterministic`` parameter; the autograd
+    function's ``forward`` takes ``x``, ``w``, ``offs`` and the internal deferred-launch
+    slot only."""
+    for name, fn in _det_callables().items():
+        if inspect.isclass(fn):
+            continue
+        assert "deterministic" not in inspect.signature(fn).parameters, name
+    from flashinfer.experimental.cake_moe_grouped_det_gemm import cake_autograd
+
+    forward = inspect.signature(cake_autograd.CakeGroupedDetMm.forward)
+    assert list(forward.parameters) == ["ctx", "x", "w", "offs", "_launch"]
+
+
+def _cpu_operands():
+    x = torch.zeros(4, 64, dtype=torch.bfloat16)
+    w = torch.zeros(2, 256, 64, dtype=torch.bfloat16)
+    offs = torch.tensor([2, 4], dtype=torch.int32)
+    return x, w, offs
+
+
+@pytest.mark.parametrize("value", [True, False])
+@pytest.mark.parametrize("entry", ["package", "core"])
+def test_det_wrapper_refuses_a_mode_argument(entry, value):
+    """``cake_grouped_det_mm(..., deterministic=...)`` raises ``TypeError`` for either
+    value (no silent acceptance of ``False``), as does a fourth positional argument, in
+    the package and in ``flashinfer.grouped_mm``."""
+    fn = (
+        pkg.cake_grouped_det_mm
+        if entry == "package"
+        else grouped_mm.cake_grouped_det_mm
+    )
+    x, w, offs = _cpu_operands()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # the core entry's ExperimentalWarning
+        with pytest.raises(TypeError, match="deterministic"):
+            fn(x, w, offs, deterministic=value)
+        with pytest.raises(TypeError):
+            fn(x, w, offs, value)
+
+
+@pytest.mark.parametrize("name", ["grouped_det_gemm_fwd", "grouped_det_gemm_dgrad"])
+def test_det_functions_refuse_a_mode_keyword(name):
+    """The one-shot functions and the prepared-launch builders of the package take no
+    ``deterministic`` keyword either (``TypeError``)."""
+    x, w, offs = _cpu_operands()
+    for fn in (getattr(pkg, name), getattr(cb, "prepare_" + name)):
+        with pytest.raises(TypeError, match="deterministic"):
+            fn(x, w, offs, deterministic=True)
+    with pytest.raises(TypeError, match="deterministic"):
+        pkg.grouped_det_gemm_wgrad(x, x, offs, deterministic=False)
+    with pytest.raises(TypeError, match="deterministic"):
+        cb.prepare_grouped_det_gemm_wgrad(x, x, offs, deterministic=False)
+
+
+@pytest.mark.parametrize("stale", [True, False, 0, "deterministic"])
+def test_direct_apply_refuses_a_stale_mode_argument(stale):
+    """``CakeGroupedDetMm.apply(x, w, offs, True)`` / ``(..., False)`` (the former
+    numerical-mode argument) raises ``TypeError`` in ``forward`` before anything runs,
+    instead of binding the value to the internal deferred-launch slot; five arguments
+    exceed the arity."""
+    from flashinfer.experimental.cake_moe_grouped_det_gemm import cake_autograd
+
+    x, w, offs = _cpu_operands()
+    x.requires_grad_(True)
+    with pytest.raises(TypeError, match="takes no fourth argument"):
+        cake_autograd.CakeGroupedDetMm.apply(x, w, offs, stale)
+    with pytest.raises(TypeError):
+        cake_autograd.CakeGroupedDetMm.apply(
+            x, w, offs, stale, cake_autograd._DEFER_FWD
+        )
+
+
+_DET_MODE_CALLS = {
+    "grouped_det_gemm_fwd": lambda x, w, offs: pkg.grouped_det_gemm_fwd(x, w, offs),
+    "grouped_det_gemm_dgrad": lambda x, w, offs: pkg.grouped_det_gemm_dgrad(
+        torch.zeros(4, 256, dtype=torch.bfloat16), w, offs
+    ),
+    "grouped_det_gemm_wgrad": lambda x, w, offs: pkg.grouped_det_gemm_wgrad(
+        torch.zeros(4, 256, dtype=torch.bfloat16), x, offs, out_dtype=torch.float32
+    ),
+    "prepare_grouped_det_gemm_wgrad": lambda x, w, offs: (
+        cb.prepare_grouped_det_gemm_wgrad(
+            torch.zeros(4, 256, dtype=torch.bfloat16), x, offs
+        )
+    ),
+    "cake_grouped_det_mm": lambda x, w, offs: pkg.cake_grouped_det_mm(
+        x, w.requires_grad_(True), offs
+    ),
+}
+
+
+@pytest.mark.parametrize("name", list(_DET_MODE_CALLS))
+def test_torch_deterministic_mode_changes_nothing_for_det_entries(name):
+    """Under ``torch.use_deterministic_algorithms(True)`` (strict and ``warn_only``) a
+    deterministic entry raises no alert and no ``UserWarning``: CPU operands reach the
+    same host-side ``ValueError`` (the device check) as with the mode off."""
+
+    def outcome():
+        x, w, offs = _cpu_operands()
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            with pytest.raises(ValueError) as info:
+                _DET_MODE_CALLS[name](x, w, offs)
+        return str(info.value), [w for w in rec if w.category is UserWarning]
+
+    want, warned = outcome()
+    assert warned == []
+    saved = (
+        torch.are_deterministic_algorithms_enabled(),
+        torch.is_deterministic_algorithms_warn_only_enabled(),
+    )
+    try:
+        for warn_only in (False, True):
+            torch.use_deterministic_algorithms(True, warn_only=warn_only)
+            got, warned = outcome()
+            assert got == want, (warn_only, got)
+            assert warned == [], (warn_only, [str(w.message) for w in warned])
+    finally:
+        torch.use_deterministic_algorithms(saved[0], warn_only=saved[1])
 
 
 # ---------------------------------------------------------------------------

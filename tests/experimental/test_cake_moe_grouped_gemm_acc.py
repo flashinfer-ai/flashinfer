@@ -24,12 +24,14 @@ rst feature matrices state too) and against the stages they are builds of (their
 the ``build.json`` entries, the accumulate plans against the overwrite plans over the
 owner rows at every SM count, the fused / composed route choice (the 256-wide k tile, an
 ordered tail, a stage without an accumulate build, a build that cannot load by the
-loader's static rule, the alignment), the checks of ``out``, the alerts, the signatures,
-the facade's dispatch rows and the autograd flag's refusals.  On a GPU: the fused route
+loader's static rule, the alignment), the checks of ``out``, the alerts (only before an
+order-varying launch, whatever the route), the signatures, the facade's handoff (no
+deterministic route) and the autograd flag's refusals.  On a GPU: the fused route
 against its bitwise oracles and the fp64 reference, on forced forms and on the benchmark
 rows as planned, the composed route against ``out.add_``, empty groups, padding,
 ``sum_m == 0``, short groups, concurrent streams, graph replay, allocations, the version
-counter and the autograd flag.  A fused case the shipped set promises fails unless the
+counter, the autograd flag and the alert of an order-varying accumulate under torch's
+deterministic mode.  A fused case the shipped set promises fails unless the
 call is fused; it skips (``"cannot load"`` in the reason) only where the build's library
 cannot load in this environment (neither prebuilt nor a JIT toolkit at its ``min_cuda``),
 where the call composes instead.
@@ -40,12 +42,14 @@ an unsplit and a split tail, for ``compute-sanitizer --tool memcheck | racecheck
 synccheck``.
 """
 
+import contextlib
 import importlib.util
 import inspect
 import os
 import re
 import shutil
 import sys
+import types
 import warnings
 
 import pytest
@@ -727,29 +731,94 @@ def test_sum_m_zero_accumulates_nothing(monkeypatch):
     assert not acc.zero_fill and acc.add_from is None and not acc.bump_version
 
 
-def test_weight_gradient_alerts_before_the_accumulate_checks():
-    """Under torch's deterministic mode the accumulate entry points raise the
-    non-determinism alert first (before the check of ``out``), and a prepared accumulate
-    launch alerts at ``launch()`` before it runs anything."""
+@pytest.mark.parametrize("arch,sm_count", base.ARCH_SM_COUNTS)
+def test_order_varying_follows_the_plan(arch, sm_count, monkeypatch):
+    """A prepared weight gradient is ``order_varying`` (it alerts under torch's
+    deterministic mode) exactly when its plan adds an unordered split tail
+    (``unordered_tail`` and ``tail_splits > 1``) and it has a program to launch, in
+    overwrite and accumulate mode alike (fused or composed): the ``CHANGED_SHAPES`` on
+    ``K512_E3`` split their tail at every SM count; the 256-wide k tile (ordered tail
+    reduce) and no rows never vary."""
+    _fake_device(monkeypatch, arch, sm_count, checks=False)
+    for n, k in base.CHANGED_SHAPES:
+        for out_dtype in (torch.bfloat16, torch.float32):
+            g, x, offs, out = _meta_operands(base.K512_E3, n, k, out_dtype)
+            for launch in _prepare_pair(g, x, offs, out):
+                assert launch.plan["unordered_tail"] and launch.plan["tail_splits"] > 1
+                assert launch.order_varying, (n, k, out_dtype, launch.plan)
+    for sizes, (n, k) in (
+        (base.K256_WAVE_SIZES, base.K256_WAVE_SHAPE),
+        ([0, 0], base.CHANGED_SHAPES[0]),
+    ):
+        g, x, offs, out = _meta_operands(sizes, n, k, torch.float32)
+        for launch in _prepare_pair(g, x, offs, out):
+            assert not launch.order_varying, (sizes, launch.plan)
+
+
+def _recorded_acc_launch(monkeypatch, plan):
+    """A composed accumulate ``GroupedGemmLaunch`` whose program is a recorder and whose
+    scratch holds ones: each launch adds one into ``out``; returns ``(launch, log)``."""
+    monkeypatch.setattr(
+        cb, "tvm_ffi", types.SimpleNamespace(use_torch_stream=contextlib.nullcontext)
+    )
+    log = []
+    launch = cb.GroupedGemmLaunch(
+        op="wgrad",
+        record_name="cake_moe_grouped_gemm_wgrad_f32_k512",
+        stages=("main_halves",),
+        plan={"accumulate": "composed", **plan},
+        out=torch.zeros(4),
+        launches=(cb._Launch(entry=lambda *args: log.append("launch"), arguments=()),),
+        add_from=torch.ones(4),
+    )
+    return launch, log
+
+
+def test_accumulate_alerts_only_before_an_order_varying_launch(monkeypatch):
+    """Under torch's deterministic mode the accumulate entry points check ``out`` first
+    and never alert while preparing (CPU operands: the ``out`` and device checks); an
+    accumulate launch with an unordered split tail alerts at ``launch()`` before it runs
+    anything (strict: ``RuntimeError``, ``out`` untouched; ``warn_only``: a
+    ``UserWarning``, then it adds); one with a fixed order adds without an alert."""
     g, x, offs, _ = _cpu_operands([2, 2], 256, 64, torch.float32)
     with base._torch_deterministic():
-        with pytest.raises(RuntimeError, match="prepare_grouped_gemm_wgrad"):
+        with pytest.raises(ValueError, match="pass the"):
             cb.prepare_grouped_gemm_wgrad(
                 g, x, offs, deterministic=False, accumulate=True
             )
-        with pytest.raises(RuntimeError, match="grouped_gemm_wgrad"):
+        with pytest.raises(ValueError, match="pass the"):
             pkg.grouped_gemm_wgrad(g, x, offs, deterministic=False, accumulate=True)
-        launch = cb.GroupedGemmLaunch(
-            op="wgrad",
-            record_name="cake_moe_grouped_gemm_wgrad_f32_k512",
-            stages=(),
-            plan={"accumulate": "composed"},
-            out=torch.zeros(1),
-            launches=(),
-            add_from=torch.ones(1),
-        )
-        with pytest.raises(RuntimeError, match="GroupedGemmLaunch.launch"):
-            launch.launch()
+    split, log = _recorded_acc_launch(
+        monkeypatch, {"unordered_tail": True, "tail_splits": 2}
+    )
+    assert split.order_varying
+    strict = pytest.raises(RuntimeError, match="GroupedGemmLaunch.launch")
+    with base._torch_deterministic(), strict:
+        split.launch()
+    assert log == [] and torch.equal(split.out, torch.zeros(4))
+    saved = (
+        torch.are_deterministic_algorithms_enabled(),
+        torch.is_deterministic_algorithms_warn_only_enabled(),
+    )
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    try:
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            split.launch()
+    finally:
+        torch.use_deterministic_algorithms(saved[0], warn_only=saved[1])
+    alerts = [w for w in rec if w.category is UserWarning]
+    assert len(alerts) == 1 and "GroupedGemmLaunch.launch" in str(alerts[0].message)
+    assert log == ["launch"] and torch.equal(split.out, torch.ones(4))
+    unsplit, log = _recorded_acc_launch(
+        monkeypatch, {"unordered_tail": True, "tail_splits": 1}
+    )
+    assert not unsplit.order_varying
+    with base._torch_deterministic(), warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        unsplit.launch()
+    assert [w for w in rec if w.category is UserWarning] == []
+    assert log == ["launch"] and torch.equal(unsplit.out, torch.ones(4))
 
 
 def test_accumulate_keywords_and_signatures():
@@ -767,6 +836,8 @@ def test_accumulate_keywords_and_signatures():
         assert parameter.default is False, fn
     forward = inspect.signature(cake_autograd.CakeGroupedMm.forward).parameters
     assert forward["fuse_wgrad_accumulation"].default is False
+    mode = inspect.signature(pkg.cake_grouped_mm).parameters["deterministic"]
+    assert mode.kind is inspect.Parameter.KEYWORD_ONLY and mode.default is True
     facade = pytest.importorskip("flashinfer.experimental.cake.grouped_mm")
     for name in ("grouped_gemm_wgrad", "cake_grouped_mm"):
         impl = (
@@ -922,136 +993,122 @@ def test_fuse_flag_is_refused_under_trace_and_compile(mode, monkeypatch):
         )
 
 
-def _facade_recorders(monkeypatch, facade):
-    """Replace the package functions the facade hands the weight gradient and the autograd
-    wrapper to by recorders: the deterministic weight gradient returns ones of the
-    requested dtype and shape; return the call log."""
-    import flashinfer.experimental.cake_moe_grouped_det_gemm as legacy_pkg
+def _det_tripwires(monkeypatch):
+    """Replace the deterministic package's weight gradient and autograd wrapper by
+    functions that fail the test when called: nothing may route there."""
+    import flashinfer.experimental.cake_moe_grouped_det_gemm as det_pkg
     from flashinfer.experimental.cake_moe_grouped_det_gemm import (
-        cake_autograd as legacy_autograd,
+        cake_autograd as det_autograd,
     )
 
-    log = []
+    def tripwire(*args, **kwargs):
+        raise AssertionError("the facade routed to the deterministic package")
 
-    def legacy_wgrad(g, x, offs, **kwargs):
-        log.append(("legacy_wgrad", kwargs))
-        e = kwargs.get("num_groups") or offs.numel()
-        dtype = kwargs.get("out_dtype") or torch.bfloat16
-        return torch.ones(e, g.shape[1], x.shape[1], dtype=dtype)
+    monkeypatch.setattr(det_pkg, "grouped_det_gemm_wgrad", tripwire)
+    monkeypatch.setattr(det_autograd, "cake_grouped_det_mm", tripwire)
+
+
+def _facade_recorders(monkeypatch):
+    """Replace the package functions the facade hands the weight gradient and the autograd
+    wrapper to by recorders (and the deterministic ones by tripwires); return the log."""
+    _det_tripwires(monkeypatch)
+    log = []
 
     def new_wgrad(*args, **kwargs):
         log.append(("new_wgrad", kwargs))
         return "new"
 
-    def legacy_mm(*args, **kwargs):
-        log.append(("legacy_mm", kwargs))
-        return "legacy"
-
     def new_mm(*args, **kwargs):
         log.append(("new_mm", kwargs))
         return "new"
 
-    monkeypatch.setattr(legacy_pkg, "grouped_det_gemm_wgrad", legacy_wgrad)
     monkeypatch.setattr(pkg, "grouped_gemm_wgrad", new_wgrad)
-    monkeypatch.setattr(legacy_autograd, "cake_grouped_det_mm", legacy_mm)
     monkeypatch.setattr(cake_autograd, "cake_grouped_mm", new_mm)
-    monkeypatch.setattr(facade, "_FALLBACK_WARNED", set())
     return log
 
 
-def test_facade_accumulate_dispatch_rows(monkeypatch):
-    """The facade's accumulate rows: ``deterministic=False`` hands ``accumulate`` to the
-    package; the deterministic route (explicit, or torch's deterministic mode with its
-    one-time warning) checks ``out`` like the package, computes the deterministic weight
-    gradient in ``out``'s dtype and adds it into ``out``; ``accumulate=False`` reaches the
-    deterministic package without a new keyword.  ``fuse_wgrad_accumulation=True`` reaches
-    the package's wrapper with ``deterministic=False`` and raises ``NotImplementedError`` on
-    the deterministic route (after the fallback warning under torch's deterministic mode)."""
+def test_facade_accumulate_rows(monkeypatch):
+    """The facade hands ``accumulate`` and ``fuse_wgrad_accumulation`` to the package with
+    ``deterministic=False``, also under torch's deterministic mode: no reroute to the
+    deterministic package, no warning, no ``NotImplementedError``."""
     facade = pytest.importorskip("flashinfer.experimental.cake.grouped_mm")
-    log = _facade_recorders(monkeypatch, facade)
+    log = _facade_recorders(monkeypatch)
     sizes, n, k = [2, 2], 256, 64
     g, x, offs, out = _cpu_operands(sizes, n, k, torch.float32)
-    with warnings.catch_warnings(record=True) as rec:
-        warnings.simplefilter("always")
-        assert (
-            facade.grouped_gemm_wgrad(
-                g, x, offs, out=out, deterministic=False, accumulate=True
+    weight = torch.zeros(2, n, k, dtype=torch.bfloat16)
+    for mode in (contextlib.nullcontext(), base._torch_deterministic()):
+        with mode, warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            assert (
+                facade.grouped_gemm_wgrad(
+                    g, x, offs, out=out, deterministic=False, accumulate=True
+                )
+                == "new"
             )
-            == "new"
-        )
-        assert log.pop() == (
-            "new_wgrad",
-            dict(
-                out=out,
-                out_dtype=None,
-                num_groups=None,
-                deterministic=False,
-                accumulate=True,
+            assert log.pop() == (
+                "new_wgrad",
+                dict(
+                    out=out,
+                    out_dtype=None,
+                    num_groups=None,
+                    deterministic=False,
+                    accumulate=True,
+                ),
+            )
+            assert (
+                facade.cake_grouped_mm(
+                    x, weight, offs, deterministic=False, fuse_wgrad_accumulation=True
+                )
+                == "new"
+            )
+            assert log.pop() == (
+                "new_mm",
+                dict(deterministic=False, fuse_wgrad_accumulation=True),
+            )
+            assert log == []
+        assert [r for r in rec if r.category is UserWarning] == []
+
+
+def test_facade_accumulate_rows_refuse_the_default_mode(monkeypatch):
+    """Without ``deterministic=False`` (omitted or ``True``) the facade's accumulate rows
+    raise ``ValueError`` naming the deterministic entry and saying to pass
+    ``deterministic=False``, before the checks of ``out`` and before anything runs; the
+    deterministic package is never called and ``out`` is untouched."""
+    facade = pytest.importorskip("flashinfer.experimental.cake.grouped_mm")
+    _det_tripwires(monkeypatch)
+    g, x, offs, out = _cpu_operands([2, 2], 256, 64, torch.float32)
+    weight = torch.zeros(2, 256, 64, dtype=torch.bfloat16)
+    calls = (
+        (
+            lambda: facade.grouped_gemm_wgrad(g, x, offs, out=out, accumulate=True),
+            "grouped_det_gemm_wgrad",
+        ),
+        (
+            lambda: facade.grouped_gemm_wgrad(g, x, offs, accumulate=True),
+            "grouped_det_gemm_wgrad",
+        ),
+        (
+            lambda: facade.cake_grouped_mm(
+                x, weight, offs, fuse_wgrad_accumulation=True
             ),
-        )
-        assert facade.grouped_gemm_wgrad(g, x, offs, out=out, accumulate=True) is out
-        assert log.pop() == (
-            "legacy_wgrad",
-            dict(out_dtype=torch.float32, num_groups=None),
-        )
-        assert torch.equal(out, torch.ones_like(out))
-        facade.grouped_gemm_wgrad(g, x, offs, out=out)
-        assert log.pop() == (
-            "legacy_wgrad",
-            dict(out=out, out_dtype=None, num_groups=None),
-        )
-        for value in (1, None):
-            with pytest.raises(ValueError, match="accumulate must be a bool"):
-                facade.grouped_gemm_wgrad(g, x, offs, out=out, accumulate=value)
-        with pytest.raises(ValueError, match="pass the"):
-            facade.grouped_gemm_wgrad(g, x, offs, accumulate=True)
-        expanded = torch.zeros(1, n, k).expand(len(sizes), n, k)
-        with pytest.raises(ValueError, match="expert stride"):
-            facade.grouped_gemm_wgrad(g, x, offs, out=expanded, accumulate=True)
-        with pytest.raises(ValueError, match=r"\[2, 256, 64\]"):
-            facade.grouped_gemm_wgrad(
-                g, x, offs, out=torch.zeros(2, 256, 128), accumulate=True
-            )
-        assert log == []
-        w = torch.zeros(2, n, k, dtype=torch.bfloat16)
-        assert (
-            facade.cake_grouped_mm(x, w, offs, False, fuse_wgrad_accumulation=True)
-            == "new"
-        )
-        assert log.pop() == (
-            "new_mm",
-            dict(deterministic=False, fuse_wgrad_accumulation=True),
-        )
-        with pytest.raises(NotImplementedError, match="deterministic package"):
-            facade.cake_grouped_mm(x, w, offs, fuse_wgrad_accumulation=True)
-        with pytest.raises(ValueError, match="must be a bool"):
-            facade.cake_grouped_mm(x, w, offs, fuse_wgrad_accumulation=1)
-        assert facade.cake_grouped_mm(x, w, offs) == "legacy"
-        assert log.pop() == ("legacy_mm", dict(deterministic=True))
-        assert log == []
-    assert [w for w in rec if w.category is UserWarning] == []
-    with base._torch_deterministic(), warnings.catch_warnings(record=True) as rec:
-        warnings.simplefilter("always")
-        out.zero_()
-        assert (
-            facade.grouped_gemm_wgrad(
-                g, x, offs, out=out, deterministic=False, accumulate=True
-            )
-            is out
-        )
-        assert log.pop() == (
-            "legacy_wgrad",
-            dict(out_dtype=torch.float32, num_groups=None),
-        )
-        assert torch.equal(out, torch.ones_like(out))
-        for _ in range(2):
-            with pytest.raises(NotImplementedError, match="deterministic package"):
-                facade.cake_grouped_mm(x, w, offs, False, fuse_wgrad_accumulation=True)
-        assert log == []
-    user = [str(w.message) for w in rec if w.category is UserWarning]
-    assert len(user) == 2, user
-    assert any("grouped_gemm_wgrad(deterministic=False)" in m for m in user)
-    assert any("cake_grouped_mm(deterministic=False)" in m for m in user)
+            "cake_grouped_det_mm",
+        ),
+        (
+            lambda: facade.cake_grouped_mm(
+                x, weight, offs, deterministic=True, fuse_wgrad_accumulation=True
+            ),
+            "cake_grouped_det_mm",
+        ),
+    )
+    for mode in (contextlib.nullcontext(), base._torch_deterministic()):
+        with mode:
+            for call, det in calls:
+                with pytest.raises(ValueError, match=det) as info:
+                    call()
+                assert "pass deterministic=False for the non-deterministic path" in (
+                    str(info.value)
+                )
+    assert torch.equal(out, torch.zeros_like(out))
 
 
 # ---------------------------------------------------------------------------
@@ -2004,7 +2061,8 @@ def test_autograd_flag_errors_and_side_effects(monkeypatch):
     (``ValueError``); ``retain_graph`` twice adds twice; a frozen ``w`` leaves
     ``main_grad``; ``create_graph`` raises ``NotImplementedError``; a
     ``torch.autograd.grad`` whose ``inputs`` exclude ``w`` still adds into ``main_grad``;
-    under torch's deterministic mode the backward raises the non-determinism alert."""
+    under torch's deterministic mode this unsplit (fixed-order) shape runs without an
+    alert and adds the same bits."""
     device, sizes, x0, w0, g1, _g2, offs = _autograd_case(torch.float32, monkeypatch)
     gemm = _fused_gemm(offs)
     mg0 = torch.zeros(w0.shape, device=device)
@@ -2048,37 +2106,72 @@ def test_autograd_flag_errors_and_side_effects(monkeypatch):
     _assert_bitwise(w.main_grad, mg0.clone().add_(dw1), "autograd.grad(inputs=(x,))")
     x, w = leaves()
     y = gemm(x, w)
+    with base._torch_deterministic(), warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        y.backward(g1)
+    torch.cuda.synchronize()
+    assert [w for w in rec if w.category is UserWarning] == []
+    _assert_bitwise(w.main_grad, mg0.clone().add_(dw1), "torch deterministic mode")
+
+
+@pytest.mark.parametrize("form", TWIN_FORMS)
+def test_autograd_fuse_alerts_before_an_order_varying_accumulate(form, monkeypatch):
+    """With ``fuse_wgrad_accumulation=True`` on a shape whose ``form`` splits its tail,
+    the backward under torch's strict deterministic mode raises the non-determinism
+    alert immediately before the accumulate launch: ``main_grad`` is untouched and no
+    placeholder flag is set; with ``warn_only`` it warns and then adds, within the budget
+    of the fp64 sum."""
+    base._require_program("fwd")
+    base._require_program("dgrad")
+    device = base._require_program("wgrad", torch.float32)
+    base._fresh_stream_workspaces(monkeypatch)
+    _acc_route(device, form, torch.float32, monkeypatch)
+    case = _split_case(device, form)
+    if case is None:
+        pytest.skip(f"no candidate shape splits the {form} tail on this device")
+    sizes, n, k = case
+    x0, w0, g, offs = base._inputs(sizes, n, k, device, seed=58)
+    mg0 = torch.randn(w0.shape, device=device)
+    gemm = _fused_gemm(offs)
+
+    def leaves():
+        x = x0.clone().requires_grad_(True)
+        w = w0.clone().requires_grad_(True)
+        w.main_grad = mg0.clone()
+        w.grad_added_to_main_grad = False
+        return x, w
+
+    x, w = leaves()
+    y = gemm(x, w)
     with (
         base._torch_deterministic(),
         pytest.raises(RuntimeError, match="CakeGroupedMm.backward"),
     ):
-        y.backward(g1)
-
-
-def test_facade_deterministic_route_composes_the_deterministic_gradient():
-    """The facade's deterministic route with ``accumulate=True`` gives bitwise
-    ``out0.add_(dW)`` with the deterministic package's ``dW`` in ``out``'s dtype."""
-    facade = pytest.importorskip("flashinfer.experimental.cake.grouped_mm")
-    legacy_pkg = pytest.importorskip(
-        "flashinfer.experimental.cake_moe_grouped_det_gemm"
+        y.backward(g)
+    torch.cuda.synchronize()
+    assert torch.equal(w.main_grad, mg0) and w.grad_added_to_main_grad is False
+    x, w = leaves()
+    y = gemm(x, w)
+    saved = (
+        torch.are_deterministic_algorithms_enabled(),
+        torch.is_deterministic_algorithms_warn_only_enabled(),
     )
-    for out_dtype in (torch.float32, torch.bfloat16):
-        device = base._require_program("wgrad", out_dtype)
-        sizes, n, k = base.K512_E3, 512, 1024
-        x, _w, g, offs = base._inputs(sizes, n, k, device, seed=55)
-        gen = torch.Generator(device=device).manual_seed(56)
-        out0 = torch.randn(len(sizes), n, k, generator=gen, device=device).to(out_dtype)
-        out = out0.clone()
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            assert (
-                facade.grouped_gemm_wgrad(g, x, offs, out=out, accumulate=True) is out
-            )
-        dw = legacy_pkg.grouped_det_gemm_wgrad(g, x, offs, out_dtype=out_dtype)
-        torch.cuda.synchronize()
-        _assert_bitwise(
-            out, out0.clone().add_(dw), f"deterministic compose {out_dtype}"
-        )
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    try:
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            y.backward(g)
+    finally:
+        torch.use_deterministic_algorithms(saved[0], warn_only=saved[1])
+    torch.cuda.synchronize()
+    assert any("CakeGroupedMm.backward" in str(r.message) for r in rec)
+    assert w.grad_added_to_main_grad is True
+    dw = base._reference("wgrad", g, x0, sizes).double()
+    expected = (
+        (mg0.double() + dw).float(),
+        (mg0.double().abs() + dw.abs()).float(),
+    )
+    _assert_within_budget(w.main_grad, expected)
 
 
 # ---------------------------------------------------------------------------
