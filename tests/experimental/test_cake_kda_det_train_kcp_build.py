@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -661,6 +662,32 @@ def test_shipped_manifest_lists_the_kcp_programs_and_no_test_only_one() -> None:
         for arch in ARCHES
     }
     assert not names & test_only
+
+
+# The PTX ISA 8.8 instructions (CUDA 12.9; CUDA 12.8's ptxas refuses them): a 256-bit ld / st, a three-input
+# min / max.
+_PTX_ISA_8_8 = re.compile(
+    rb"\b(?:min|max)(?:\.\w+)*\s+%[^;,\"]+(?:,[^;,\"]+){3};"
+    rb"|\b(?:ld|st)(?:\.[\w:]+)*\.v8\.[bfsu]32\b"
+)
+
+
+@pytest.mark.parametrize("manifest", ["build.json", "build.test.json"])
+def test_an_entry_whose_units_use_ptx_isa_8_8_needs_cuda_12_9(manifest: str) -> None:
+    """An entry whose units use a PTX ISA 8.8 instruction (the 256-bit stores of the fused forward walk, the output
+    stages and the full-width tape walks) states ``min_cuda`` 12.9 or newer: CUDA 12.8 cannot build it."""
+    path = PACKAGE_DIR / manifest
+    if not path.is_file():
+        pytest.skip(f"{manifest} is not shipped here")
+    wide = []
+    for entry in json.loads(path.read_text())["libraries"]:
+        if any(
+            _PTX_ISA_8_8.search((PACKAGE_DIR / source).read_bytes())
+            for source in entry["sources"]
+        ):
+            wide.append(entry["name"])
+            assert tuple(map(int, entry["min_cuda"].split("."))) >= (12, 9), entry
+    assert any(name.endswith("_sm_100a") for name in wide), wide
 
 
 def test_test_manifest_is_the_test_only_programs_under_the_opt_in(

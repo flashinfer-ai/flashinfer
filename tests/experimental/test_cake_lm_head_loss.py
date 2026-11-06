@@ -390,7 +390,8 @@ def test_each_supported_architecture_has_its_record_and_libraries():
     """The supported compute capabilities name exactly the architectures of the registry's records (``(10, 7)``
     only with an ``sm_107a`` record), ``build.json`` builds exactly those architectures, and every registered stage
     of each record has its ``<library>_<arch>`` entry.  The ``sm_107a`` record registers the ``sm_103a`` record's
-    stages and programs, the zero-gradient row skip's (the ``_dcnt`` forms and the partition kernel) included."""
+    stages and programs, the zero-gradient row skip's (the ``_dcnt`` forms and the partition kernel) included, but for
+    the cast at the last live chunk (the ``_lc`` forms, registered on ``sm_100a`` and ``sm_103a`` only)."""
     assert cake_backend.SUPPORTED_COMPUTE_CAPABILITIES == {
         (10, 0): "sm_100a",
         (10, 3): "sm_103a",
@@ -423,7 +424,12 @@ def test_each_supported_architecture_has_its_record_and_libraries():
         assert cake_backend.ZERO_DLOGP_PARTITION_STAGE in cake_jit.registered_stages(
             name
         )
-    assert cake_jit.registered_stages(sm107) == cake_jit.registered_stages(sm103)
+    # the cast at the last live chunk (the ``_lc`` forms) is registered on sm_100a and sm_103a only
+    assert cake_jit.registered_stages(sm107) == tuple(
+        stage
+        for stage in cake_jit.registered_stages(sm103)
+        if not stage.endswith("_lc_dcnt")
+    )
     for stage in cake_jit.registered_stages(sm107):
         assert (
             cake_jit.MODULES[sm107][stage]["library"]
@@ -437,9 +443,9 @@ def test_sm107_takes_the_sm103_rule_tables_except_the_long_chunk_ring():
     table except ``DX_LONG_CHUNK_STAGES``: its chunks of ``>= DW_LONG_CHUNK_MIN_ROWS`` rows keep the 512-wide dX tile's
     table ring.  At the same SM count (B300 148, R200 212 and 216) its plans are the ``sm_103a`` plans but for that
     ring depth (the C 4096 plans are the same), and its record registers every form they launch.  The zero-gradient
-    row skip is not a GEMM tile rule: ``ZERO_DLOGP_MIN_ROWS_BY_ARCH`` has no ``sm_107a`` entry, so ``sm_107a`` keeps
-    the generic 4097-row floor, and ``DX_COUNTED_MIN_SLICES_BY_ARCH`` has none, so its counted plans keep the slice
-    rule's dX counts."""
+    row skip is not a GEMM tile rule: ``ZERO_DLOGP_MIN_ROWS_BY_ARCH`` gives ``sm_107a`` its own floor (1946 valid
+    rows; ``sm_103a``: 3891), and ``DX_COUNTED_MIN_SLICES_BY_ARCH`` the ``sm_103a`` two-slice counted dX, so its
+    counted plans take the ``sm_103a`` dX slices and its record registers every counted form they launch."""
     b = cake_backend
     for table in (
         b.RASTER_WIDE_GROUPS,
@@ -459,8 +465,12 @@ def test_sm107_takes_the_sm103_rule_tables_except_the_long_chunk_ring():
     for table in (b.DX_SPLIT_WHOLE_FEW_CHUNKS_ARCHES, b.DX_WIDE_MIN_EFF):
         assert "sm_103a" not in table and "sm_107a" not in table, table
     assert b.DX_LONG_CHUNK_STAGES == {"sm_100a": 3, "sm_103a": 3}
-    assert "sm_107a" not in b.ZERO_DLOGP_MIN_ROWS_BY_ARCH
-    assert "sm_107a" not in b.DX_COUNTED_MIN_SLICES_BY_ARCH
+    assert b.ZERO_DLOGP_MIN_ROWS_BY_ARCH["sm_107a"] == 1946
+    assert (
+        b.DX_COUNTED_MIN_SLICES_BY_ARCH["sm_107a"]
+        == b.DX_COUNTED_MIN_SLICES_BY_ARCH["sm_103a"]
+        == 2
+    )
     assert b.ZERO_DLOGP_MIN_ROWS_DEFAULT == 4097
     sm107 = next(n for n, r in cake_jit.MODULES.items() if r["arch"] == "sm_107a")
     registered = set(cake_jit.registered_stages(sm107))
@@ -510,6 +520,15 @@ def test_sm107_takes_the_sm103_rule_tables_except_the_long_chunk_ring():
                 case,
                 sorted(set(p107.stages) - registered),
             )
+            if entry == "logprob":
+                c103 = b.make_plan(problem, arch="sm_103a", dcnt=True, **kw)
+                c107 = b.make_plan(problem, arch="sm_107a", dcnt=True, **kw)
+                assert c107.dcnt == c103.dcnt, case
+                assert c107.dx_slices == c103.dx_slices, case
+                assert set(c107.stages) <= registered, (
+                    case,
+                    sorted(set(c107.stages) - registered),
+                )
     assert long_ring, "no C 8192 chunk took the sm_103a long-chunk ring"
 
 
@@ -7066,15 +7085,16 @@ def test_zero_dlogp_floor_switch():
 def test_zero_dlogp_floor_per_architecture(monkeypatch):
     """The skip's default floor is per architecture: ``zero_dlogp_min_rows(index)`` reads the device's architecture
     once per device index and returns its floor in ``ZERO_DLOGP_MIN_ROWS_BY_ARCH`` (sm_100a: 1946 valid rows,
-    sm_103a: 3891), the generic ``ZERO_DLOGP_MIN_ROWS_DEFAULT`` (4097) for any other architecture and without a
-    device.  An override of ``set_zero_dlogp_min_rows`` (an integer or ``None``) applies to every device; the setter
-    returns ``ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT`` when no override was set and takes it back, so every returned value
-    passed back restores the previous state exactly."""
+    sm_103a: 3891, sm_107a: 1946), the generic ``ZERO_DLOGP_MIN_ROWS_DEFAULT`` (4097) for any other architecture and
+    without a device.  An override of ``set_zero_dlogp_min_rows`` (an integer or ``None``) applies to every device;
+    the setter returns ``ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT`` when no override was set and takes it back, so every
+    returned value passed back restores the previous state exactly."""
     sentinel = cake_backend.ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT
     assert cake_backend.ZERO_DLOGP_MIN_ROWS_DEFAULT == 4097
     assert cake_backend.ZERO_DLOGP_MIN_ROWS_BY_ARCH == {
         "sm_100a": 1946,
         "sm_103a": 3891,
+        "sm_107a": 1946,
     }
     assert repr(sentinel) == "ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT"
     archs = {0: "sm_100a", 1: "sm_103a", 2: "sm_107a", 3: None}
@@ -7087,7 +7107,7 @@ def test_zero_dlogp_floor_per_architecture(monkeypatch):
     monkeypatch.setattr(cake_backend, "arch_for", arch_for)
     monkeypatch.setattr(cake_backend, "_ZERO_DLOGP_ARCH", {})
     monkeypatch.setattr(cake_backend, "_ZERO_DLOGP_MIN_ROWS", {"rows": sentinel})
-    defaults = {0: 1946, 1: 3891, 2: 4097, 3: 4097}
+    defaults = {0: 1946, 1: 3891, 2: 1946, 3: 4097}
 
     def floors():
         return {index: cake_backend.zero_dlogp_min_rows(index) for index in archs}
@@ -7190,13 +7210,13 @@ def test_dcnt_stage_names_round_trip():
     assert cake_backend.dx_stage(1, dcnt=True) == "gemm_dx"
     assert cake_backend.dx_stage(3, dcnt=True) == "gemm_dx_red_dcnt"
     counted = [stage for stage in cake_jit.STAGES if stage.endswith("_dcnt")]
-    assert len(counted) == 10
+    assert len(counted) == 10 + len(_LC_STAGES)
     for stage in counted:
         base, knobs = cake_backend.parse_stage(stage)
         assert base in cake_backend.DCNT_BASES and knobs["dcnt"]
         assert not knobs["temperature"]
         assert cake_backend.stage_form(base, **knobs) == stage
-        assert stage.removesuffix("_dcnt") in cake_jit.STAGES
+        assert stage.removesuffix("_dcnt").removesuffix("_lc") in cake_jit.STAGES
 
 
 def _not_dx(stages):
@@ -7241,15 +7261,15 @@ def _assert_counted_twin(plan, plain, arch, case=None):
 
 def test_counted_plan_runs_no_one_slice_dx_chunk():
     """Under the zero-gradient row skip (``make_plan(dcnt=True)``) a plan on an architecture of
-    ``DX_COUNTED_MIN_SLICES_BY_ARCH`` (sm_100a and sm_103a: two slices) runs no one-slice dX chunk: each chunk the slice
-    rule gives one slice (naturally, or below ``dx_red_min_rows``) runs the counted two-slice K-sliced reduction, every
-    other chunk, slice count and knob as the slice rule plans it, and the architecture's record registers every form
-    of the plan.  sm_107a keeps the slice rule's counts.  The plan without the skip keeps the slice rule's counts
+    ``DX_COUNTED_MIN_SLICES_BY_ARCH`` (sm_100a, sm_103a and sm_107a: two slices) runs no one-slice dX chunk: each chunk
+    the slice rule gives one slice (naturally, or below ``dx_red_min_rows``) runs the counted two-slice K-sliced
+    reduction, every other chunk, slice count and knob as the slice rule plans it, and the architecture's record
+    registers every form of the plan.  The plan without the skip keeps the slice rule's counts
     (:func:`plan_dx_slices`) on every architecture.  The counts stay the slice rule's under an explicit dX ``k_slices``
     (a count, or ``None`` = one slice), on a record that serves one slice and at a vocabulary of one K step; the
     backward binding key tells the skip and a dX slice pin apart."""
     b = cake_backend
-    assert b.DX_COUNTED_MIN_SLICES_BY_ARCH == {"sm_100a": 2, "sm_103a": 2}
+    assert b.DX_COUNTED_MIN_SLICES_BY_ARCH == {"sm_100a": 2, "sm_103a": 2, "sm_107a": 2}
     g = b.Geometry.from_record({"geometry": {"hidden": GLM_H, "vocab": GLM_V}})
     common = dict(
         need_dx=True,
@@ -7307,7 +7327,7 @@ def test_counted_plan_runs_no_one_slice_dx_chunk():
             raised[arch] += sum(
                 x != y for x, y in zip(plan.dx_slices, plain.dx_slices, strict=True)
             )
-    assert raised["sm_100a"] and raised["sm_103a"] and not raised["sm_107a"], raised
+    assert raised["sm_100a"] and raised["sm_103a"] and raised["sm_107a"], raised
     problem = _keep_problem(8117, GLM_H, GLM_V, 4096, entry="logprob")
     tiny_g = b.Geometry.from_record({"geometry": {"hidden": GLM_H, "vocab": g.k_block}})
     tiny = _keep_problem(8117, GLM_H, g.k_block, 4096, entry="logprob")
@@ -7400,6 +7420,159 @@ def test_plan_runs_the_counted_forms():
         need_dw=True,
     )
     assert key(zero_dlogp=True) != key() == key(zero_dlogp=False)
+
+
+def test_live_cast_stage_names():
+    """The cast at the last live chunk (``_lc`` before ``_dcnt``): the counted weight-gradient accumulate on its 1-D and
+    2-D raster and the counted bf16 fused cast in both stores; each name round-trips through ``parse_stage``; the
+    accumulate's form also reads the next chunk's count cell (``CNT_NEXT``), the casts' forms the counted casts'
+    operands; the sm_100a and sm_103a records register all four (the grids of their counted twins), sm_107a none."""
+    sv = cake_backend.stage_variant
+    assert sv("gemm_dw_acc", live_cast=True, dcnt=True) == "gemm_dw_acc_lc_dcnt"
+    assert (
+        sv("gemm_dw_acc", blocked=True, live_cast=True, dcnt=True)
+        == "gemm_dw_acc_gn_lc_dcnt"
+    )
+    assert (
+        sv("gemm_dw_cast_bf16", live_cast=True, dcnt=True)
+        == "gemm_dw_cast_bf16_lc_dcnt"
+    )
+    assert (
+        sv("gemm_dw_cast_bf16", epi_store="tma", live_cast=True, dcnt=True)
+        == "gemm_dw_cast_bf16_tma_lc_dcnt"
+    )
+    for base, kw in (
+        ("gemm_dw_acc", dict(dcnt=False)),
+        ("gemm_dw_acc", dict(epi_store="tma", dcnt=True)),
+        ("gemm_dw_cast_bf16", dict(dcnt=False)),
+        ("gemm_dw_cast_f32", dict(dcnt=True)),
+        ("gemm_dx_red", dict(dcnt=True)),
+        ("gemm_logits_dz", dict(dcnt=True)),
+    ):
+        with pytest.raises(ValueError):
+            sv(base, live_cast=True, **kw)
+    assert sorted(_LC_STAGES) == sorted(
+        [
+            "gemm_dw_acc_lc_dcnt",
+            "gemm_dw_acc_gn_lc_dcnt",
+            "gemm_dw_cast_bf16_lc_dcnt",
+            "gemm_dw_cast_bf16_tma_lc_dcnt",
+        ]
+    )
+    for stage in _LC_STAGES:
+        base, knobs = cake_backend.parse_stage(stage)
+        assert knobs["live_cast"] and knobs["dcnt"] and not knobs["temperature"]
+        assert cake_backend.stage_form(base, **knobs) == stage
+        twin = stage.replace("_lc_dcnt", "_dcnt")
+        assert twin in cake_jit.STAGES
+        assert cake_jit.STAGES.index(stage) > cake_jit.STAGES.index(twin)
+        assert cake_backend.STAGE_TENSORS[stage] == cake_backend.STAGE_TENSORS[twin] + (
+            ("CNT_NEXT",) if base == "gemm_dw_acc" else ()
+        )
+    for bad in (
+        "gemm_dw_acc_lc",
+        "gemm_dw_cast_bf16_lc",
+        "gemm_dw_acc_tma_lc_dcnt",
+        "gemm_dw_acc_dcnt_lc",
+        "gemm_dw_cast_f32_lc_dcnt",
+        "gemm_dx_red_lc_dcnt",
+        "gemm_logits_dz_lc_dcnt",
+    ):
+        with pytest.raises(ValueError):
+            cake_backend.parse_stage(bad)
+    for name, record in cake_jit.MODULES.items():
+        present = {stage for stage in _LC_STAGES if stage in record}
+        registered = record["arch"] in ("sm_100a", "sm_103a")
+        assert present == (set(_LC_STAGES) if registered else set()), name
+        for stage in present:
+            twin = record[stage.replace("_lc_dcnt", "_dcnt")]
+            assert record[stage]["grid"] == twin["grid"], (name, stage)
+            assert record[stage]["launch"] == twin["launch"], (name, stage)
+            plan = [slot for _kind, slot in record[stage]["arg_plan"]]
+            want = [slot for _kind, slot in twin["arg_plan"]]
+            if stage.startswith("gemm_dw_acc"):
+                # the accumulate's form takes the deferred cast's operands plus the next chunk's count
+                cast = record["gemm_dw_cast_bf16_dcnt"]["arg_plan"]
+                want = [slot for _kind, slot in cast]
+                want.insert(want.index("CNT") + 1, "CNT_NEXT")
+            assert plan == want, (name, stage)
+
+
+def test_plan_runs_the_live_cast():
+    """``make_plan(dcnt=True, live_cast=True)``: a counted plan of two chunks or more with the fused bf16 cast runs the
+    accumulate of every chunk but the last and the deferred cast in their ``_lc`` forms, the rest of the plan as the
+    counted plan; one chunk, no counted forms or an unfused cast keep it off; the temperature plans carry it and the
+    twin of the mixed plan (dcnt off) drops it."""
+    g = cake_backend.Geometry.from_record(
+        {"geometry": {"hidden": 6144, "vocab": 154880}}
+    )
+    common = dict(
+        need_dx=True,
+        need_dw=True,
+        geometry=g,
+        dx_max_slices=4,
+        num_sms=148,
+        dx_resident=74,
+        fuse_dw_cast=True,
+        dx_finalize=True,
+        logprob_dz=True,
+        logprob_lbl=True,
+    )
+    checked = 0
+    # three chunks (the last of 3808 rows), two (the last of 650: the TMA cast) and the T = 65031 timing row
+    for T, rows in ((12000, 12000), (4746, 4746), (65031, 15 * 4096 + 339)):
+        problem = _keep_problem(T, 6144, 154880, 4096, entry="logprob")
+        for arch in ("sm_100a", "sm_103a", "sm_107a"):
+            kw = dict(common, arch=arch, valid_rows=rows)
+            counted = cake_backend.make_plan(problem, dcnt=True, **kw)
+            lc = cake_backend.make_plan(problem, dcnt=True, live_cast=True, **kw)
+            if not counted.dcnt:
+                assert not lc.dcnt and not lc.live_cast
+                continue
+            checked += 1
+            assert lc.live_cast and not counted.live_cast, (T, arch)
+            assert dataclasses.replace(lc, live_cast=False) == counted
+            for i in range(lc.num_chunks):
+                assert lc.dw_acc_stage(i) == _lc_form(counted.dw_acc_stage(i), lc)
+                assert lc.dx_stage_of(i) == counted.dx_stage_of(i)
+                assert lc.recompute_stage(i) == counted.recompute_stage(i)
+            assert lc.dw_cast_stage == _lc_form(counted.dw_cast_stage, lc)
+            assert {s.replace("_lc_dcnt", "_dcnt") for s in lc.stages} == set(
+                counted.stages
+            )
+            assert list(lc.stages) == [s for s in cake_jit.STAGES if s in lc.stages]
+            assert [
+                (s.replace("_lc_dcnt", "_dcnt"), i)
+                for s, i in cake_backend.recompute_keys(lc)
+            ] == list(cake_backend.recompute_keys(counted))
+            # the accumulate of the last chunk is not a stage of a plan with the deferred cast
+            last = lc.dw_acc_stage(lc.num_chunks - 1)
+            assert all(
+                key != (last, lc.num_chunks - 1)
+                for key in cake_backend.recompute_keys(lc)
+            )
+            tau_problem = cake_backend._with_temperature(problem)
+            for counted_dz in (True, False):
+                tau = cake_backend.make_plan_temperature(
+                    tau_problem, dcnt=True, live_cast=True, counted_dz=counted_dz, **kw
+                )
+                assert tau.live_cast and tau.dw_cast_stage == lc.dw_cast_stage
+                twin = tau.without_temperature()
+                assert twin.live_cast == counted_dz and twin.dcnt == counted_dz
+    assert checked, "no architecture ran the counted forms"
+    for T, kw in (
+        (3000, dict(common, arch="sm_100a", valid_rows=3000)),  # one chunk
+        (12000, dict(common, arch="sm_100a", valid_rows=12000, fuse_dw_cast=False)),
+        (12000, dict(common, arch=None, valid_rows=12000)),  # the reference path
+    ):
+        problem = _keep_problem(T, 6144, 154880, 4096, entry="logprob")
+        assert not cake_backend.make_plan(
+            problem, dcnt=True, live_cast=True, **kw
+        ).live_cast
+    problem = _keep_problem(12000, 6144, 154880, 4096, entry="logprob")
+    assert not cake_backend.make_plan(
+        problem, live_cast=True, **dict(common, arch="sm_100a", valid_rows=12000)
+    ).live_cast  # no counted forms
 
 
 def test_plan_counts_the_short_last_chunk_of_a_long_call():
@@ -7812,8 +7985,8 @@ def test_device_binding_scratch_slots_cover_every_launch(glm_weight, T, case):
     the loss entry's forward all four.  Every launch and host step of a binding's forward / backward sequence finds
     every value it binds when only that sequence's scratch slots are present, and the remembered calls give the first
     call's bits.  The log-probability cases set the zero-gradient row skip's floor: ``logprob_skip`` runs it (``0``),
-    ``logprob`` and ``logprob_tau`` run the shipped backward (``None``) on every architecture -- on sm_100a the
-    default floor (1946 valid rows) would put both sizes on the skip."""
+    ``logprob`` and ``logprob_tau`` run the shipped backward (``None``) on every architecture -- on sm_100a and
+    sm_107a the default floor (1946 valid rows) would put both sizes on the skip."""
     _require_program(entry="loss" if case.startswith("loss") else "logprob")
     objective = "policy" if case == "loss_policy" else "ce"
     inp = _device_inputs(T, objective, W=glm_weight)
@@ -7876,8 +8049,8 @@ def test_device_binding_scratch_slots_cover_every_launch(glm_weight, T, case):
 
 def test_device_zero_dlogp_default_floor_per_architecture(glm_weight, monkeypatch):
     """Without an override a one-chunk log-probability backward runs the skip from this device's default floor on
-    (``zero_dlogp_min_rows(index)``: 1946 valid rows on sm_100a, 3891 on sm_103a, else 4097): a backward of one row
-    fewer runs without it (the zero rows' ``dX`` zeros either way)."""
+    (``zero_dlogp_min_rows(index)``: 1946 valid rows on sm_100a and sm_107a, 3891 on sm_103a, else 4097): a backward
+    of one row fewer runs without it (the zero rows' ``dX`` zeros either way)."""
     _require_zero_dlogp_skip()
     index = torch.cuda.current_device()
     _module_name, record = cake_backend.record_for(CUDA)
@@ -7949,6 +8122,43 @@ def _logprob_bwd_plans():
         for k, b in cake_backend.BINDING_CACHE._bindings.items()
         if k[:2] == ("bwd", "logprob")
     ]
+
+
+# The cast at the last live chunk (``_lc`` before ``_dcnt``, :attr:`cake_backend.Plan.live_cast`)
+_LC_STAGES = tuple(stage for stage in cake_jit.STAGES if stage.endswith("_lc_dcnt"))
+
+
+def _lc_form(stage, plan):
+    """``stage`` (a counted weight-gradient form) as ``plan`` runs it: its ``_lc`` form when the plan casts at the
+    last live chunk."""
+    return stage.replace("_dcnt", "_lc_dcnt") if plan.live_cast else stage
+
+
+def _lc_registered(module_name):
+    """Whether record ``module_name`` registers the cast at the last live chunk (all four ``_lc`` forms, or none)."""
+    stages = cake_jit.registered_stages(module_name)
+    present = [stage in stages for stage in _LC_STAGES]
+    assert all(present) or not any(present), present
+    return all(present)
+
+
+@contextlib.contextmanager
+def _without_live_cast(monkeypatch):
+    """Run with the records' ``_lc`` forms hidden from the plan builders (the skip then runs the counted forms)."""
+    plain = cake_backend.registered_stages
+    with_tau = cake_backend.registered_stages_with_temperature
+    with monkeypatch.context() as m:
+        m.setattr(
+            cake_backend,
+            "registered_stages",
+            lambda name: tuple(s for s in plain(name) if s not in _LC_STAGES),
+        )
+        m.setattr(
+            cake_backend,
+            "registered_stages_with_temperature",
+            lambda name: tuple(s for s in with_tau(name) if s not in _LC_STAGES),
+        )
+        yield
 
 
 def test_device_zero_dlogp_plan_without_counted_forms_runs_the_shipped_backward(
@@ -8082,10 +8292,12 @@ def test_device_zero_dlogp_short_last_chunk_keeps_the_counted_cast(
         "gemm_dw_cast_bf16_tma" if tma else "gemm_dw_cast_bf16"
     )
     stages = cake_jit.registered_stages(_module_name)
-    assert skip_plan.dw_cast_stage == (
+    assert skip_plan.live_cast == _lc_registered(_module_name)
+    assert skip_plan.dw_cast_stage == _lc_form(
         cake_backend.DW_CAST_TMA_DCNT_STAGE
         if tma and cake_backend.DW_CAST_TMA_DCNT_STAGE in stages
-        else "gemm_dw_cast_bf16_dcnt"
+        else "gemm_dw_cast_bf16_dcnt",
+        skip_plan,
     )
     live = valid & ~zero
     assert _same_bits(nd["logp"], plain["logp"])
@@ -8148,12 +8360,15 @@ def test_device_zero_dlogp_short_last_chunk_cast_bits_without_zero_rows(
     assert shipped.dw_cast_stage == (
         "gemm_dw_cast_bf16_tma" if tma else "gemm_dw_cast_bf16"
     )
+    assert skip_plan.live_cast == _lc_registered(module_name)
     if tma:
         stages = cake_jit.registered_stages(module_name)
         assert cake_backend.DW_CAST_TMA_DCNT_STAGE in stages
-        assert skip_plan.dw_cast_stage == cake_backend.DW_CAST_TMA_DCNT_STAGE
+        assert skip_plan.dw_cast_stage == _lc_form(
+            cake_backend.DW_CAST_TMA_DCNT_STAGE, skip_plan
+        )
     else:
-        assert skip_plan.dw_cast_stage == "gemm_dw_cast_bf16_dcnt"
+        assert skip_plan.dw_cast_stage == _lc_form("gemm_dw_cast_bf16_dcnt", skip_plan)
     for key in ("logp", "dW"):
         assert _same_bits(nd[key], plain[key]), key
     assert not bool(_bits(nd["dX"][~valid]).any())
@@ -8185,8 +8400,8 @@ ZERO_DLOGP_RAISED_CASES = [
 @pytest.mark.parametrize("mode, T, kind", ZERO_DLOGP_RAISED_CASES, ids=str)
 def test_device_zero_dlogp_raised_dx_slices(glm_weight, mode, T, kind):
     """Under the skip the backward's plan runs each dX chunk at the architecture's counted slice count at least
-    (``DX_COUNTED_MIN_SLICES_BY_ARCH``: two on sm_100a and sm_103a; sm_107a keeps the slice rule's counts) and the
-    backward without the skip the slice rule's counts; every chunk of more than one slice launches its counted form.
+    (``DX_COUNTED_MIN_SLICES_BY_ARCH``: two on sm_100a, sm_103a and sm_107a) and the backward without the skip the
+    slice rule's counts; every chunk of more than one slice launches its counted form.
     The results pass the skip suite's checks on the binding and the remembered binding: ``logp`` the bits of the
     backward without the skip; the zero and ignored rows' ``dX`` exact ``+0``; the live rows' ``dX`` within one BF16
     rounding of the backward without the skip; ``dW`` bitwise without zero rows (the forward's row order); the
@@ -8256,6 +8471,135 @@ def test_device_zero_dlogp_raised_dx_slices(glm_weight, mode, T, kind):
         f"{shipped.dx_slices}), zero {int(zero.sum())}/{int(valid.sum())}: dW rel-L2 vs no skip {dw_rel:.2e}, "
         f"dX max|skip - no skip| {dx_diff:.2e}"
     )
+
+
+def _require_live_cast():
+    """Skip unless this device's record registers the skip and the cast at the last live chunk (sm_100a, sm_103a)."""
+    _require_zero_dlogp_skip()
+    module_name, _record = cake_backend.record_for(CUDA)
+    if not _lc_registered(module_name):
+        pytest.skip(
+            "this device's record does not register the cast at the last live chunk (_lc forms)"
+        )
+    return module_name
+
+
+@pytest.mark.parametrize(
+    "kind, dw_stream",
+    [
+        (("random", 0.5), "0"),  # trailing chunks without a live row
+        (("random", 0.5), "1"),  # the same on the dW side stream
+        ("last", "auto"),  # only the first chunk after the partition holds live rows
+        ("single", "1"),  # one live row
+        (
+            "none",
+            "0",
+        ),  # every chunk live: the accumulates add, the deferred cast writes
+        (
+            "all",
+            "auto",
+        ),  # no live row (the partition keeps one row live in the first chunk)
+        (("group", 0.166), "1"),
+    ],
+)
+def test_device_zero_dlogp_live_cast(glm_weight, monkeypatch, kind, dw_stream):
+    """The cast at the last live chunk on the eager skip path: on a record with the ``_lc`` forms a backward of two
+    chunks or more runs every accumulate but the last chunk's and the deferred cast in their ``_lc`` forms, and its
+    ``dW`` is bitwise that of the counted forms (the same FP32 operations: the tile added into the sum with the
+    accumulate's flush to zero, then the scale and the bf16 cast) -- with trailing chunks of no live row (no cast-only
+    pass), with only the first chunk live, with every chunk live, on the dW side stream and without it; ``dX`` within
+    the unordered K-slice reduction of the counted run and exact zeros on the zero rows; the public runner keeps the
+    counted forms."""
+    module_name = _require_live_cast()
+    base = _device_inputs(13500, "ce", W=glm_weight)
+    zero = _zero_dlogp_set(base, kind)
+    inp = _with_zero_dlogp(base, zero)
+    kw = dict(chunk_size=4096, dw_stream=dw_stream, **ND)
+    fr = cake_backend.forward_logprob(inp.X, inp.W, inp.labels, chunk_size=4096, **ND)
+    torch.cuda.synchronize()
+    assert fr.row_index is not None
+
+    def backward():
+        cake_backend.BINDING_CACHE.clear()
+        dx, dw = cake_backend.backward_logprob(
+            inp.X,
+            inp.W,
+            inp.labels,
+            fr.lse,
+            inp.dlogp.clone(),
+            row_index=fr.row_index,
+            **kw,
+        )
+        torch.cuda.synchronize()
+        ((plan, keys),) = _logprob_bwd_plans()
+        return dx, dw, plan, [k[0] for k in keys]
+
+    with _zero_dlogp_floor(0):
+        dx_lc, dw_lc, plan_lc, run_lc = backward()
+        with _without_live_cast(monkeypatch):
+            dx_c, dw_c, plan_c, run_c = backward()
+    assert plan_lc.dcnt and plan_c.dcnt and plan_lc.num_chunks >= 2
+    assert plan_lc.live_cast and not plan_c.live_cast
+    assert _lc_registered(module_name)
+    # the same launches, the weight-gradient GEMMs in their ``_lc`` forms
+    assert [s.replace("_lc_dcnt", "_dcnt") for s in run_lc] == run_c
+    assert sum(s.endswith("_lc_dcnt") for s in run_lc) == plan_lc.num_chunks
+    assert not any(s.endswith("_lc_dcnt") for s in run_c)
+    assert _same_bits(dw_lc, dw_c)
+    assert bool(torch.isfinite(dw_lc.float()).all())
+    valid = inp.labels >= 0
+    live = valid & ~zero
+    assert not bool(_bits(dx_lc[~live]).any())
+    if bool(live.any()):
+        scale = float(dx_c[live].float().abs().max())
+        diff = float((dx_lc[live].float() - dx_c[live].float()).abs().max())
+        assert diff <= scale * 2**-7, (diff, scale)
+    else:
+        assert not bool(dw_lc.float().any())
+    # the public runner of the same call keeps the counted forms (its ``dw_acc`` holds the sum before the last chunk)
+    rows = int(fr.row_index.numel())
+    with _torch_deterministic(False):
+        runner = cake_backend.prepare_lm_head_loss(
+            inp.X,
+            inp.W,
+            inp.labels,
+            chunk_size=4096,
+            entry="logprob",
+            lse=fr.lse,
+            compact_rows=fr.row_index,
+            logprob_dz=True,
+            dcnt=torch.empty((-(-rows // 4096),), dtype=torch.int32, device=CUDA),
+            **ND,
+        )
+    assert runner.plan.dcnt and not runner.plan.live_cast
+    assert not any(s.endswith("_lc_dcnt") for s in runner.plan.stages)
+
+
+def test_device_zero_dlogp_live_cast_temperature(glm_weight, monkeypatch):
+    """The temperature backward under the skip takes the cast at the last live chunk too (its own plan search: the
+    ``_lc`` forms first, then the counted forms), with ``dW`` bitwise that of its counted forms."""
+    module_name = _require_live_cast()
+    _require_tau_program()
+    base = _tau_inputs(13500, W=glm_weight)
+    zero = _zero_dlogp_set(base, ("random", 0.5))
+    inp = dataclasses.replace(_with_zero_dlogp(base, zero), temperature=0.7)
+    stages = cake_jit.registered_stages_with_temperature(module_name)
+    assert all(s in stages for s in _LC_STAGES)
+    calls = {}
+    with _zero_dlogp_floor(0):
+        cake_backend.BINDING_CACHE.clear()
+        calls["lc"] = _run(inp, 4096, entry="logprob", backend="cake", **_TAU_ONE)
+        lc_plans = [p for p, _k in _logprob_bwd_plans()]
+        with _without_live_cast(monkeypatch):
+            cake_backend.BINDING_CACHE.clear()
+            calls["counted"] = _run(
+                inp, 4096, entry="logprob", backend="cake", **_TAU_ONE
+            )
+            counted_plans = [p for p, _k in _logprob_bwd_plans()]
+    assert lc_plans and all(p.temperature and p.dcnt and p.live_cast for p in lc_plans)
+    assert counted_plans and all(p.dcnt and not p.live_cast for p in counted_plans)
+    assert _same_bits(calls["lc"]["dW"], calls["counted"]["dW"])
+    assert _same_bits(calls["lc"]["logp"], calls["counted"]["logp"])
 
 
 def test_device_zero_dlogp_generic_floor_is_one_row_above_a_chunk(
@@ -11277,10 +11621,12 @@ def test_device_temperature_zero_dlogp_rows_skip(
         )
         for plan, _keys in skip_plans:
             assert plan.num_chunks == 2 and plan.chunks[-1][1] == rows - 4096
-            assert plan.dw_cast_stage == (
+            assert plan.live_cast == _lc_registered(module_name), case
+            assert plan.dw_cast_stage == _lc_form(
                 cake_backend.DW_CAST_TMA_DCNT_STAGE
                 if tma and counted_tma
-                else "gemm_dw_cast_bf16_dcnt"
+                else "gemm_dw_cast_bf16_dcnt",
+                plan,
             ), case
     calls.clear()
     bound.clear()
@@ -11662,6 +12008,7 @@ def test_temperature_stage_names_round_trip():
             swab=False,
             blocked=False,
             epi_store=None,
+            live_cast=False,
             dcnt=False,
             temperature=True,
         ),
