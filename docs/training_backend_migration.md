@@ -2,7 +2,7 @@
 
 Issue #8928 gives every CAKE training family one naming scheme. The facade module is `flashinfer.cake_<op>_<mode>_train[_kcp]`, and its backend package is `flashinfer/experimental/cake/<module>/`. `<mode>` is `det` (run-to-run bitwise deterministic) or `nondet` (no run-to-run bitwise promise). Each family moves in its own PR. This page maps the modules, names and backend directories of FlashInfer 0.7.3 and 0.7.4rc1 to their new names.
 
-The mode is part of the name. No new entry takes `deterministic=`. The old names are removed without aliases, by the family PR or by an earlier PR that a row or a table note names. In 0.7.4rc1 several modules selected the mode with `deterministic: bool = True`. A call that kept the default ran deterministic programs, also in the modules that later became the `nondet` ones. Callers that kept the default move to the `det` module; only `deterministic=False` callers move to the `nondet` module.
+The mode is part of the name. No new entry takes `deterministic=`. The old names are removed without aliases, by the family PR or by an earlier PR that a row or a table note names. In 0.7.4rc1 several modules selected the mode with `deterministic: bool = True`. A call that kept the default ran deterministic programs, also in the modules that later became the `nondet` ones. Callers that kept the default move to the `det` module. `deterministic=False` callers move to the `nondet` module, except for the MoE entries that ignored the argument (see "Calls that took `deterministic=`").
 
 ## Status and mode labels
 
@@ -53,8 +53,8 @@ Every shipped training module after the renames. Each module has a backend packa
 |  | `flashinfer.cake_kda_det_train_kcp` | det | KCP | planned |
 |  | `flashinfer.cake_kda_nondet_train` | nondet | single rank | planned |
 |  | `flashinfer.cake_kda_nondet_train_kcp` | nondet | KCP | planned |
-| MoE grouped GEMM | `flashinfer.cake_moe_grouped_gemm_det_train` | det | single rank | planned |
-|  | `flashinfer.cake_moe_grouped_gemm_nondet_train` | nondet | single rank | planned |
+| MoE grouped GEMM | `flashinfer.cake_moe_grouped_gemm_det_train` | det | single rank | #8963 |
+|  | `flashinfer.cake_moe_grouped_gemm_nondet_train` | nondet | single rank | #8963 |
 | dense projection GEMM | `flashinfer.cake_dense_gemm_det_train` | det | single rank | #8926 |
 |  | `flashinfer.cake_dense_gemm_nondet_train` | nondet | single rank | #8926 |
 | LM head + loss | `flashinfer.cake_lm_head_det_train` | det | single rank | #8925 |
@@ -69,6 +69,7 @@ Every shipped training module after the renames. Each module has a backend packa
 | --- | --- |
 | an old entry called with the default, or with `deterministic=True` | the same entry of the family's `det` module |
 | an old entry called with `deterministic=False` | the same entry of the family's `nondet` module |
+| MoE: `cake_grouped_mm` or `cake_grouped_det_mm` of `flashinfer.grouped_mm`, `flashinfer.grouped_mm.cake`, `flashinfer.experimental.cake_moe_grouped_gemm` or `flashinfer.experimental.cake_moe_grouped_det_gemm`, or `CakeGroupedMm.apply` / `CakeGroupedDetMm.apply` of these packages, with any `deterministic` value | `flashinfer.cake_moe_grouped_gemm_det_train.cake_moe_grouped_gemm_det` or `flashinfer.cake_moe_grouped_gemm_det_train.CakeMoEGroupedGemmDetFunction`: these old entries ran the det programs for every value |
 | any new entry called with `deterministic=` | `TypeError`: no new entry has the parameter |
 | an old module, old name or old backend path in the tables below | fails at import; there are no aliases |
 
@@ -86,7 +87,7 @@ Every shipped training module after the renames. Each module has a backend packa
 | `flashinfer.cake_gdn_train_kcp` | - | nondet, det by default | Default calls: `flashinfer.cake_gdn_det_train_kcp`, #8920. `deterministic=False`: `flashinfer.cake_gdn_nondet_train_kcp`, #8959. |
 | `flashinfer.cake_kda_train` | - | nondet, det by default | Default calls: `flashinfer.cake_kda_det_train`, planned. `deterministic=False`: `flashinfer.cake_kda_nondet_train`, planned. |
 | `flashinfer.cake_kda_train_kcp` | - | nondet, det by default | Default calls: `flashinfer.cake_kda_det_train_kcp`, planned. `deterministic=False`: `flashinfer.cake_kda_nondet_train_kcp`, planned. |
-| `flashinfer.experimental.cake.grouped_mm` | - | nondet, det by default | Default calls: `flashinfer.cake_moe_grouped_gemm_det_train`, planned. `deterministic=False`: `flashinfer.cake_moe_grouped_gemm_nondet_train`, planned. |
+| `flashinfer.experimental.cake.grouped_mm` | - | nondet, det by default | Default calls: `flashinfer.cake_moe_grouped_gemm_det_train`, #8963. `deterministic=False`: `flashinfer.cake_moe_grouped_gemm_nondet_train`, #8963. |
 | `flashinfer/experimental/dense_projection_gemm/` | det | nondet, det by default | 0.7.3, and 0.7.4rc1 default calls: `flashinfer.cake_dense_gemm_det_train`, #8926. 0.7.4rc1 `deterministic=False`: `flashinfer.cake_dense_gemm_nondet_train`, #8926. |
 | `flashinfer.chunked_lm_head` (the `chunked_lm_head_*` entries without `det`) | det | nondet, det by default | 0.7.3, and 0.7.4rc1 default calls: `flashinfer.cake_lm_head_det_train`, #8925. 0.7.4rc1 `deterministic=False`: `flashinfer.cake_lm_head_nondet_train`, #8952. |
 
@@ -120,9 +121,9 @@ For vendoring builds that copy a backend directory.
 | `flashinfer/experimental/cake_kda_det_train_kcp/` | - | det | `flashinfer/experimental/cake/cake_kda_det_train_kcp/` | planned | KCP. Needs its single-rank sibling `flashinfer/experimental/cake/cake_kda_det_train/` (in 0.7.4rc1: `flashinfer/experimental/cake_kda_det_train/`). |
 | `flashinfer/experimental/cake/cake_kda_train/` | - | nondet, det by default | `flashinfer/experimental/cake/cake_kda_nondet_train/` | planned | Single rank. The facade `flashinfer.cake_kda_train` routed the default to det; the directory accepted only `deterministic=False`. Not the same directory as `flashinfer/experimental/cake_kda_train/`. |
 | `flashinfer/experimental/cake_kda_train_kcp/` | - | nondet, det by default | `flashinfer/experimental/cake/cake_kda_nondet_train_kcp/` | planned | KCP. The facade `flashinfer.cake_kda_train_kcp` routed the default to det. Needs its single-rank sibling `flashinfer/experimental/cake/cake_kda_nondet_train/` (in 0.7.4rc1: `flashinfer/experimental/cake/cake_kda_train/`). |
-| `flashinfer/experimental/cake_moe_grouped_gemm/` | det | det alias of `flashinfer/experimental/cake_moe_grouped_det_gemm/` | `flashinfer/experimental/cake/cake_moe_grouped_gemm_det_train/` | planned | In 0.7.3, `deterministic=False` also ran the det programs. Not the same directory as `flashinfer/experimental/cake/cake_moe_grouped_gemm/`. Removed from main by #8924. |
-| `flashinfer/experimental/cake_moe_grouped_det_gemm/` | - | det | `flashinfer/experimental/cake/cake_moe_grouped_gemm_det_train/` | planned | |
-| `flashinfer/experimental/cake/cake_moe_grouped_gemm/` | - | nondet, det by default | `flashinfer/experimental/cake/cake_moe_grouped_gemm_nondet_train/` | planned | The facade `flashinfer.experimental.cake.grouped_mm` routed the default to det; the directory accepted only `deterministic=False`. |
+| `flashinfer/experimental/cake_moe_grouped_gemm/` | det | det alias of `flashinfer/experimental/cake_moe_grouped_det_gemm/` | `flashinfer/experimental/cake/cake_moe_grouped_gemm_det_train/` | #8963 | In 0.7.3, `deterministic=False` also ran the det programs. Not the same directory as `flashinfer/experimental/cake/cake_moe_grouped_gemm/`. Removed from main by #8924. |
+| `flashinfer/experimental/cake_moe_grouped_det_gemm/` | - | det | `flashinfer/experimental/cake/cake_moe_grouped_gemm_det_train/` | #8963 | |
+| `flashinfer/experimental/cake/cake_moe_grouped_gemm/` | - | nondet, det by default | `flashinfer/experimental/cake/cake_moe_grouped_gemm_nondet_train/` | #8963 | The facade `flashinfer.experimental.cake.grouped_mm` routed the default to det; the directory accepted only `deterministic=False`. |
 | `flashinfer/experimental/dense_projection_gemm/` (as in 0.7.3) | det | - | `flashinfer/experimental/cake/cake_dense_gemm_det_train/` | #8926 | |
 | `flashinfer/experimental/dense_projection_gemm/` (as in 0.7.4rc1) | - | nondet, det by default | `flashinfer/experimental/cake/cake_dense_gemm_nondet_train/` | #8926 | In 0.7.4rc1 the default call loaded the sibling `flashinfer/experimental/dense_projection_det_gemm/`. The new directory has no det route but imports its sibling `flashinfer/experimental/cake/cake_dense_gemm_det_train/`; copy both. |
 | `flashinfer/experimental/dense_projection_det_gemm/` | - | det | `flashinfer/experimental/cake/cake_dense_gemm_det_train/` | #8926 | |
@@ -375,24 +376,39 @@ Planned: the other public names of these modules (for example `flashinfer.cake_k
 
 | Old name | In | New name | PR |
 |---|---|---|---|
-| `flashinfer.grouped_mm.cake` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_det_train` | planned |
-| `flashinfer.grouped_mm.cake_grouped_mm`, `flashinfer.grouped_mm.cake.cake_grouped_mm` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_det_train.cake_moe_grouped_gemm_det` | planned |
-| `flashinfer.grouped_mm.cake_grouped_det_mm`, `flashinfer.grouped_mm.cake.cake_grouped_det_mm` | 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_det_train.cake_moe_grouped_gemm_det` | planned |
-| `flashinfer.experimental.cake_moe_grouped_gemm.cake_grouped_mm` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_det_train.cake_moe_grouped_gemm_det` | planned |
-| `flashinfer.experimental.cake_moe_grouped_det_gemm.{cake_grouped_det_mm, cake_grouped_mm}` | 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_det_train.cake_moe_grouped_gemm_det` | planned |
-| `flashinfer.experimental.cake_moe_grouped_gemm.CakeGroupedMm` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_det_train.CakeMoEGroupedGemmDetFunction` | planned |
-| `flashinfer.experimental.cake_moe_grouped_det_gemm.{CakeGroupedDetMm, CakeGroupedMm}` | 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_det_train.CakeMoEGroupedGemmDetFunction` | planned |
-| package `flashinfer.experimental.cake_moe_grouped_gemm` | 0.7.3, 0.7.4rc1 | package `flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train` | planned |
-| package `flashinfer.experimental.cake_moe_grouped_det_gemm` | 0.7.4rc1 | package `flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train` | planned |
-| `flashinfer.experimental.cake.grouped_mm` (default) | 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_det_train` | planned |
-| `flashinfer.experimental.cake.grouped_mm` (deterministic=False calls) | 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_nondet_train` | planned |
-| `flashinfer.experimental.cake.grouped_mm.cake_grouped_mm` (default) | 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_det_train.cake_moe_grouped_gemm_det` | planned |
-| `flashinfer.experimental.cake.grouped_mm.cake_grouped_mm(..., deterministic=False)` | 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_nondet_train.cake_moe_grouped_gemm_nondet` | planned |
-| `flashinfer.experimental.cake.cake_moe_grouped_gemm.cake_grouped_mm` | 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_nondet_train.cake_moe_grouped_gemm_nondet` | planned |
-| `flashinfer.experimental.cake.cake_moe_grouped_gemm.CakeGroupedMm` | 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_nondet_train.CakeMoEGroupedGemmNondetFunction` | planned |
-| package `flashinfer.experimental.cake.cake_moe_grouped_gemm` | 0.7.4rc1 | package `flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train` | planned |
+| `flashinfer.grouped_mm.cake` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_det_train` | #8963 |
+| `flashinfer.grouped_mm.{grouped_gemm_fwd, grouped_gemm_dgrad, grouped_gemm_wgrad}`, `flashinfer.grouped_mm.cake.{grouped_gemm_fwd, grouped_gemm_dgrad, grouped_gemm_wgrad}` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_det_train.{cake_moe_grouped_gemm_det_train_forward, cake_moe_grouped_gemm_det_train_dgrad, cake_moe_grouped_gemm_det_train_wgrad}` | #8963 |
+| `flashinfer.grouped_mm.{grouped_det_gemm_fwd, grouped_det_gemm_dgrad, grouped_det_gemm_wgrad}`, `flashinfer.grouped_mm.cake.{grouped_det_gemm_fwd, grouped_det_gemm_dgrad, grouped_det_gemm_wgrad}` | 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_det_train.{cake_moe_grouped_gemm_det_train_forward, cake_moe_grouped_gemm_det_train_dgrad, cake_moe_grouped_gemm_det_train_wgrad}` | #8963 |
+| `flashinfer.grouped_mm.cake_grouped_mm`, `flashinfer.grouped_mm.cake.cake_grouped_mm` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_det_train.cake_moe_grouped_gemm_det` | #8963 |
+| `flashinfer.grouped_mm.cake_grouped_det_mm`, `flashinfer.grouped_mm.cake.cake_grouped_det_mm` | 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_det_train.cake_moe_grouped_gemm_det` | #8963 |
+| `flashinfer.experimental.cake_moe_grouped_gemm.{grouped_gemm_fwd, grouped_gemm_dgrad, grouped_gemm_wgrad}` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_det_train.{cake_moe_grouped_gemm_det_train_forward, cake_moe_grouped_gemm_det_train_dgrad, cake_moe_grouped_gemm_det_train_wgrad}` | #8963 |
+| `flashinfer.experimental.cake_moe_grouped_gemm.{prepare_grouped_gemm_fwd, prepare_grouped_gemm_dgrad, prepare_grouped_gemm_wgrad}` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_det_train.{cake_moe_grouped_gemm_det_train_prepare_forward, cake_moe_grouped_gemm_det_train_prepare_dgrad, cake_moe_grouped_gemm_det_train_prepare_wgrad}` | #8963 |
+| `flashinfer.experimental.cake_moe_grouped_gemm.GroupedGemmLaunch` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_det_train.CakeMoEGroupedGemmDetLaunch` | #8963 |
+| `flashinfer.experimental.cake_moe_grouped_gemm.cake_grouped_mm` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_det_train.cake_moe_grouped_gemm_det` | #8963 |
+| `flashinfer.experimental.cake_moe_grouped_gemm.CakeGroupedMm` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_det_train.CakeMoEGroupedGemmDetFunction` | #8963 |
+| `flashinfer.experimental.cake_moe_grouped_gemm.cake_backend.grouped_mm_bf16_cake` | 0.7.3, 0.7.4rc1 | `flashinfer.grouped_mm.grouped_mm_bf16(..., backend="cake")` | #8963 |
+| package `flashinfer.experimental.cake_moe_grouped_gemm` | 0.7.3, 0.7.4rc1 | package `flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train` | #8963 |
+| `flashinfer.experimental.cake_moe_grouped_det_gemm.{grouped_det_gemm_fwd, grouped_det_gemm_dgrad, grouped_det_gemm_wgrad, grouped_gemm_fwd, grouped_gemm_dgrad, grouped_gemm_wgrad}` | 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_det_train.{cake_moe_grouped_gemm_det_train_forward, cake_moe_grouped_gemm_det_train_dgrad, cake_moe_grouped_gemm_det_train_wgrad}` | #8963 |
+| `flashinfer.experimental.cake_moe_grouped_det_gemm.{prepare_grouped_det_gemm_fwd, prepare_grouped_det_gemm_dgrad, prepare_grouped_det_gemm_wgrad, prepare_grouped_gemm_fwd, prepare_grouped_gemm_dgrad, prepare_grouped_gemm_wgrad}` | 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_det_train.{cake_moe_grouped_gemm_det_train_prepare_forward, cake_moe_grouped_gemm_det_train_prepare_dgrad, cake_moe_grouped_gemm_det_train_prepare_wgrad}` | #8963 |
+| `flashinfer.experimental.cake_moe_grouped_det_gemm.{GroupedDetGemmLaunch, GroupedGemmLaunch}` | 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_det_train.CakeMoEGroupedGemmDetLaunch` | #8963 |
+| `flashinfer.experimental.cake_moe_grouped_det_gemm.{cake_grouped_det_mm, cake_grouped_mm}` | 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_det_train.cake_moe_grouped_gemm_det` | #8963 |
+| `flashinfer.experimental.cake_moe_grouped_det_gemm.{CakeGroupedDetMm, CakeGroupedMm}` | 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_det_train.CakeMoEGroupedGemmDetFunction` | #8963 |
+| `flashinfer.experimental.cake_moe_grouped_det_gemm.cake_backend.grouped_mm_bf16_cake` | 0.7.4rc1 | `flashinfer.grouped_mm.grouped_mm_bf16(..., backend="cake")` | #8963 |
+| package `flashinfer.experimental.cake_moe_grouped_det_gemm` | 0.7.4rc1 | package `flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train` | #8963 |
+| `flashinfer.experimental.cake.grouped_mm` (default) | 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_det_train` | #8963 |
+| `flashinfer.experimental.cake.grouped_mm` (deterministic=False calls) | 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_nondet_train` | #8963 |
+| `flashinfer.experimental.cake.grouped_mm.{grouped_gemm_fwd, grouped_gemm_dgrad, grouped_gemm_wgrad}` (default) | 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_det_train.{cake_moe_grouped_gemm_det_train_forward, cake_moe_grouped_gemm_det_train_dgrad, cake_moe_grouped_gemm_det_train_wgrad}` | #8963 |
+| `flashinfer.experimental.cake.grouped_mm.{grouped_gemm_fwd, grouped_gemm_dgrad, grouped_gemm_wgrad}(..., deterministic=False)` | 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_nondet_train.{cake_moe_grouped_gemm_nondet_train_forward, cake_moe_grouped_gemm_nondet_train_dgrad, cake_moe_grouped_gemm_nondet_train_wgrad}` | #8963 |
+| `flashinfer.experimental.cake.grouped_mm.cake_grouped_mm` (default) | 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_det_train.cake_moe_grouped_gemm_det` | #8963 |
+| `flashinfer.experimental.cake.grouped_mm.cake_grouped_mm(..., deterministic=False)` | 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_nondet_train.cake_moe_grouped_gemm_nondet` | #8963 |
+| `flashinfer.experimental.cake.cake_moe_grouped_gemm.{grouped_gemm_fwd, grouped_gemm_dgrad, grouped_gemm_wgrad}` | 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_nondet_train.{cake_moe_grouped_gemm_nondet_train_forward, cake_moe_grouped_gemm_nondet_train_dgrad, cake_moe_grouped_gemm_nondet_train_wgrad}` | #8963 |
+| `flashinfer.experimental.cake.cake_moe_grouped_gemm.{prepare_grouped_gemm_fwd, prepare_grouped_gemm_dgrad, prepare_grouped_gemm_wgrad}` | 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_nondet_train.{cake_moe_grouped_gemm_nondet_train_prepare_forward, cake_moe_grouped_gemm_nondet_train_prepare_dgrad, cake_moe_grouped_gemm_nondet_train_prepare_wgrad}` | #8963 |
+| `flashinfer.experimental.cake.cake_moe_grouped_gemm.GroupedGemmLaunch` | 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_nondet_train.CakeMoEGroupedGemmNondetLaunch` | #8963 |
+| `flashinfer.experimental.cake.cake_moe_grouped_gemm.cake_grouped_mm` | 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_nondet_train.cake_moe_grouped_gemm_nondet` | #8963 |
+| `flashinfer.experimental.cake.cake_moe_grouped_gemm.CakeGroupedMm` | 0.7.4rc1 | `flashinfer.cake_moe_grouped_gemm_nondet_train.CakeMoEGroupedGemmNondetFunction` | #8963 |
+| package `flashinfer.experimental.cake.cake_moe_grouped_gemm` | 0.7.4rc1 | package `flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train` | #8963 |
 
-On main, #8924 already removed the module `flashinfer.grouped_mm.cake`, the names without `det` in `flashinfer.grouped_mm` and in `flashinfer.experimental.cake_moe_grouped_det_gemm`, and the package `flashinfer.experimental.cake_moe_grouped_gemm`. Since #8924, a call of `flashinfer.experimental.cake.grouped_mm` that does not pass `deterministic=False` raises `ValueError`. Planned: the other public names of these modules (`grouped_gemm_*`, `grouped_det_gemm_*`, `prepare_grouped_*`, `GroupedGemmLaunch`, `GroupedDetGemmLaunch`) get their final names in the MoE family PR.
+On main, #8924 already removed the module `flashinfer.grouped_mm.cake`, the names without `det` in `flashinfer.grouped_mm` and in `flashinfer.experimental.cake_moe_grouped_det_gemm`, and the package `flashinfer.experimental.cake_moe_grouped_gemm`. Since #8924, a call of `flashinfer.experimental.cake.grouped_mm` that does not pass `deterministic=False` raises `ValueError`. #8963 also adds `flashinfer.cake_moe_grouped_gemm_det_train.is_cake_moe_grouped_gemm_det_train_supported` and `flashinfer.cake_moe_grouped_gemm_nondet_train.is_cake_moe_grouped_gemm_nondet_train_supported`. `flashinfer.grouped_mm.grouped_mm_bf16(..., backend="cake")` keeps its name and runs the det programs.
 
 ### dense projection GEMM
 
