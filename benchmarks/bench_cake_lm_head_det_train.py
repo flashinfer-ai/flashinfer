@@ -17,7 +17,7 @@ limitations under the License.
 """Benchmark the experimental Cake chunked LM-head + loss training kernels (SM100 / SM103).
 
 Times the forward, the backward and the whole training step (forward +
-backward, wrapper-inclusive) of ``flashinfer.chunked_lm_head`` on the
+backward, wrapper-inclusive) of ``flashinfer.cake_lm_head_det_train`` on the
 GLM-class geometry (``H = 6144``, ``V = 154880``, BF16 ``X`` / ``W``, int64
 labels with five percent ignored rows) over irregular token counts: the loss
 entry with the cross-entropy and the policy objective at chunks of 2048 /
@@ -61,7 +61,7 @@ and compute capability).
 
 Usage::
 
-    python benchmarks/bench_cake_lm_head_det_loss.py [--rows t16231_c4096_ce ...]
+    python benchmarks/bench_cake_lm_head_det_train.py [--rows t16231_c4096_ce ...]
         [--arms torch_unchunked,torch_chunked,liger,cce,cake,cake_logprob] [--steps 20] [--accuracy]
         [--temperature hetero] [--json out.json]
 """
@@ -83,13 +83,13 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import flashinfer  # noqa: E402
-from flashinfer import chunked_lm_head as public_lm_head  # noqa: E402
+from flashinfer import _cake_lm_head_train_knobs as _knobs  # noqa: E402
 from flashinfer.api_logging import ExperimentalWarning  # noqa: E402
-from flashinfer.chunked_lm_head import (
-    chunked_lm_head_det_logprob,
-    chunked_lm_head_det_loss,
+from flashinfer.cake_lm_head_det_train import (
+    cake_lm_head_det_train_logprob,
+    cake_lm_head_det_train_loss,
 )  # noqa: E402
-from flashinfer.experimental.cake_lm_head_det_loss import cake_backend  # noqa: E402
+from flashinfer.experimental.cake.cake_lm_head_det_train import cake_backend  # noqa: E402
 from flashinfer.testing import bench_gpu_time  # noqa: E402
 from tests.test_helpers.cake_lm_head_loss_reference import (  # noqa: E402
     DEFAULT_H,
@@ -502,7 +502,7 @@ class ArmCCEDefault(ArmCCE):
 
 
 class ArmCake(ArmAutograd):
-    """The public experimental entry points (``flashinfer.chunked_lm_head``, ``backend="cake"``); a
+    """The public entry points (``flashinfer.cake_lm_head_det_train``, ``backend="cake"``); a
     log-probability row with a temperature passes the inputs' temperature argument as is (a Python number for the
     scalar form, the ``[T]`` tensor otherwise)."""
 
@@ -525,18 +525,18 @@ class ArmCake(ArmAutograd):
         self.abi = cake_backend.record_abi(record)
 
     def _logprob(self):
-        """``chunked_lm_head_det_logprob`` of the arm's leaves, with the inputs' temperature when they carry one."""
+        """``cake_lm_head_det_train_logprob`` of the arm's leaves, with the inputs' temperature when they carry one."""
         kw = {}
         if self.inp.temperature is not None:
             kw["temperature"] = self.inp.temperature
-        return chunked_lm_head_det_logprob(
+        return cake_lm_head_det_train_logprob(
             self.X, self.W, self.inp.labels, chunk_size=self.chunk, backend="cake", **kw
         )
 
     def versions(self):
         # the switches this arm runs with: the public module's resolution of its FLASHINFER_CAKE_LM_HEAD_LOSS_*
         # variables (every keyword left at None), which it passes down to the backend
-        switches = public_lm_head._resolve_knobs(
+        switches = _knobs.resolve_knobs(
             compact_rows=None,
             fuse_dw_cast=None,
             dx_finalize=None,
@@ -562,7 +562,7 @@ class ArmCake(ArmAutograd):
         if self.entry == "logprob":
             logp = self._logprob()
             return dict(loss=_downstream_loss(logp, inp), logp=logp)
-        loss, logp = chunked_lm_head_det_loss(
+        loss, logp = cake_lm_head_det_train_loss(
             self.X,
             self.W,
             inp.labels,
@@ -578,7 +578,7 @@ class ArmCake(ArmAutograd):
 
 
 class ArmCakeLogprob(ArmCake):
-    """Loss rows through the log-probability entry: ``chunked_lm_head_det_logprob`` (with the inputs' temperature when
+    """Loss rows through the log-probability entry: ``cake_lm_head_det_train_logprob`` (with the inputs' temperature when
     they carry one) and the row's objective in eager PyTorch on its ``logp`` -- for the policy rows the
     log-probabilities plus an eager policy loss, the matched-input comparison to the fused policy loss of the
     ``cake`` arm."""

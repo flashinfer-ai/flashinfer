@@ -18,8 +18,8 @@ limitations under the License.
 # log-sum-exp / cross-entropy / policy-gradient loss with a memory-bounded
 # backward (every vocabulary-sized intermediate spans at most one token chunk)
 # for training on SM100 / SM103 (flashinfer-ai/flashinfer#5680, tracker #4642).
-# The public entry points are ``flashinfer.chunked_lm_head.chunked_lm_head_det_loss``,
-# ``chunked_lm_head_det_logprob`` and the candidate-support entries
-# ``chunked_lm_head_det_support_logprob`` / ``chunked_lm_head_det_support_kl``; the
+# The public entry points are ``flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_loss``,
+# ``cake_lm_head_det_train_logprob`` and the candidate-support entries
+# ``cake_lm_head_det_train_support_logprob`` / ``cake_lm_head_det_train_support_kl``; the
 # autograd wrappers, host planning, JIT registration and the generated sources
 # live in this package.

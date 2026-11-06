@@ -113,7 +113,7 @@ repos:
       - id: ruff-format
         types_or: [ python, pyi ]
         # The chunked LM-head module table is checksum-attested exporter output (byte-exact).
-        exclude: ^flashinfer/experimental/(?:cake_lm_head_loss|cake/cake_lm_head_loss)/cake_jit\.py$
+        exclude: ^flashinfer/experimental/cake/(?:cake_lm_head_det_train|cake_lm_head_loss)/cake_jit\.py$
 
   - repo: local
     hooks:

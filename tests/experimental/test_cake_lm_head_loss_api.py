@@ -14,21 +14,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Public-API tests of the det-free chunked LM-head entries ``flashinfer.chunked_lm_head.chunked_lm_head_{loss,
-logprob,preload,support_logprob,support_kl}``: experimental dispatchers with a keyword-only
-``deterministic: bool = True``.  ``True`` runs the deterministic entry (``chunked_lm_head_det_*``) with the same
-arguments -- the same bits, no added allocation or synchronization, one identity test of host work --;
-``False`` runs ``flashinfer.experimental.cake.cake_lm_head_loss`` with the same argument checks and environment
-fallbacks, or the deterministic entry with one warning per entry point while torch's deterministic algorithms are
-on; any other value is a ``TypeError``.  The deterministic entries are unchanged and still refuse
-``deterministic=False``.  The host-layer tests replace the packages by recorders; the device tests compare the
-bits of real calls.
+logprob,preload,support_logprob,support_kl}``: experimental dispatchers of the non-deterministic package
+``flashinfer.experimental.cake.cake_lm_head_loss`` with a keyword-only ``deterministic: bool = True``.  Only
+``deterministic=False`` is accepted: it runs that package with the same argument checks and environment fallbacks,
+also while torch's deterministic algorithms are on (the package's own alert decides; no fallback, no warning from the
+dispatcher).  Any other value, the default ``True`` included, is a ``ValueError`` naming the deterministic entry
+(``flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_*``) before any package import or torch query.  That the deterministic entries take no
+``deterministic`` keyword is checked by ``test_cake_lm_head_det_train_names.py``.  The host-layer tests replace the package by recorders; the device tests
+compare the bits of real calls.
 """
 
 import importlib
 import inspect
 import json
-import os
-import sys
+import re
 import warnings
 
 import pytest
@@ -36,6 +35,7 @@ import torch
 import torch.utils.checkpoint
 
 import flashinfer.api_logging as api_logging
+import flashinfer.cake_lm_head_det_train as det_public
 import flashinfer.chunked_lm_head as public
 from tests.test_helpers.cake_lm_head_loss_reference import make_inputs
 
@@ -43,21 +43,22 @@ SEED = 20261031
 H_HOST, V_HOST = 256, 512
 # det-free entry -> its deterministic entry
 ENTRIES = {
-    "chunked_lm_head_loss": "chunked_lm_head_det_loss",
-    "chunked_lm_head_logprob": "chunked_lm_head_det_logprob",
-    "chunked_lm_head_preload": "chunked_lm_head_det_preload",
-    "chunked_lm_head_support_logprob": "chunked_lm_head_det_support_logprob",
-    "chunked_lm_head_support_kl": "chunked_lm_head_det_support_kl",
+    "chunked_lm_head_loss": "cake_lm_head_det_train_loss",
+    "chunked_lm_head_logprob": "cake_lm_head_det_train_logprob",
+    "chunked_lm_head_preload": "cake_lm_head_det_train_preload",
+    "chunked_lm_head_support_logprob": "cake_lm_head_det_train_support_logprob",
+    "chunked_lm_head_support_kl": "cake_lm_head_det_train_support_kl",
 }
-# The deterministic entry's body each dispatcher calls (below the experimental wrapper).
-BODIES = {
-    "chunked_lm_head_loss": "_det_loss",
-    "chunked_lm_head_logprob": "_det_logprob",
-    "chunked_lm_head_preload": "_det_preload",
-    "chunked_lm_head_support_logprob": "_det_support_logprob",
-    "chunked_lm_head_support_kl": "_det_support_kl",
+# The mode-free helper each dispatcher calls after its mode check (preload loads the opt-in module directly).
+HELPERS = {
+    "chunked_lm_head_loss": "_nd_loss",
+    "chunked_lm_head_logprob": "_nd_logprob",
+    "chunked_lm_head_support_logprob": "_nd_support_logprob",
+    "chunked_lm_head_support_kl": "_nd_support_kl",
 }
 SUPPORT = ("chunked_lm_head_support_logprob", "chunked_lm_head_support_kl")
+# A call that leaves ``deterministic`` at its default.
+DEFAULT = object()
 
 
 def _host_call():
@@ -153,15 +154,12 @@ class _FakePackage:
 
 
 def _fail(*_args, **_kwargs):
-    raise AssertionError("the deterministic=True path must not reach this")
+    raise AssertionError("a call refused by the mode check must not reach this")
 
 
 @pytest.fixture
 def recorders(monkeypatch):
-    """The deterministic bodies and the non-deterministic package replaced by recorders."""
-    bodies = {entry: _Recorder(body) for entry, body in BODIES.items()}
-    for entry, body in BODIES.items():
-        monkeypatch.setattr(public, body, bodies[entry])
+    """The non-deterministic package replaced by recorders."""
     fake = {
         "backend": _FakePackage(),
         "opt_in": _FakePackage(),
@@ -170,8 +168,6 @@ def recorders(monkeypatch):
     monkeypatch.setattr(public, "_nd_backend", lambda: fake["backend"])
     monkeypatch.setattr(public, "_nd_backend_opt_in", lambda: fake["opt_in"])
     monkeypatch.setattr(public, "_nd_support", lambda: fake["support"])
-    monkeypatch.setattr(public, "_DET_FALLBACK_WARNED", set())
-    monkeypatch.setattr(public, "_DET_FALLBACK_PIN_WARNED", set())
     for name in (
         "FLASHINFER_CAKE_LM_HEAD_LOSS_COMPACT_ROWS",
         "FLASHINFER_CAKE_LM_HEAD_LOSS_FUSE_DW_CAST",
@@ -181,7 +177,27 @@ def recorders(monkeypatch):
         "FLASHINFER_CAKE_LM_HEAD_LOSS_GEMM_TUNING",
     ):
         monkeypatch.delenv(name, raising=False)
-    return bodies, fake
+    return fake
+
+
+def _torch_deterministic(warn_only):
+    """Turn torch's deterministic algorithms on; returns the previous ``(mode, warn_only)``."""
+    was = (
+        torch.are_deterministic_algorithms_enabled(),
+        torch.is_deterministic_algorithms_warn_only_enabled(),
+    )
+    torch.use_deterministic_algorithms(True, warn_only=warn_only)
+    return was
+
+
+def _nd_calls(fake, entry):
+    """The recorded calls of the package entry that ``_call_args(entry)`` reaches with ``deterministic=False``."""
+    if entry == "chunked_lm_head_preload":
+        return fake["opt_in"].recorders["preload"].calls
+    if entry in SUPPORT:
+        return fake["support"].recorders[entry].calls
+    # ``_call_args`` gives the loss call ``memory_mode="budget"`` and the log-probability call ``memory_mode="fast"``
+    return fake["opt_in"].recorders[entry].calls
 
 
 # ---------------------------------------------------------------------------
@@ -190,128 +206,104 @@ def recorders(monkeypatch):
 
 
 def test_entries_are_experimental_dispatchers():
-    """Each det-free entry is its own experimental function (no longer the deterministic object) with the
-    deterministic entry's feature, and every deterministic entry keeps its marking."""
+    """Each det-free entry is its own experimental function (not the deterministic object) with its module's
+    feature; every deterministic entry is a stable API (no experimental marking)."""
     for entry, det in ENTRIES.items():
-        fn, det_fn = getattr(public, entry), getattr(public, det)
+        fn, det_fn = getattr(public, entry), getattr(det_public, det)
         assert fn is not det_fn, entry
-        assert fn.is_experimental is True and det_fn.is_experimental is True, entry
-        assert fn.experimental_feature == det_fn.experimental_feature, entry
+        assert fn.is_experimental is True, entry
+        assert getattr(det_fn, "is_experimental", False) is False, det
+        assert fn.experimental_feature == public._FEATURE, entry
         assert fn.__name__ == entry and "SM100" in fn.__doc__, entry
-        assert getattr(public, BODIES[entry]) is det_fn.__wrapped__, entry
+    for name in (
+        "_det_loss",
+        "_det_logprob",
+        "_det_preload",
+        "_det_support_logprob",
+        "_det_support_kl",
+        "_runs_det",
+        "_det_fallback_kwargs",
+        "_DET_FALLBACK_WARNED",
+        "_DET_FALLBACK_PIN_WARNED",
+        "_DET_DX_K_SLICES_MAX",
+        "_caller_stacklevel",
+    ):
+        assert not hasattr(public, name), name
 
 
 def test_signatures_mirror_the_deterministic_entries():
-    """The loss / log-probability entries have the deterministic signature (``deterministic`` keyword-only,
-    default ``True``); preload and the support entries add that keyword (the deterministic ones have none)."""
+    """Each dispatcher's signature is its deterministic entry's plus the keyword-only ``deterministic: bool = True``
+    (displayed as before; only ``False`` is accepted); no deterministic entry has that keyword."""
     for entry, det in ENTRIES.items():
         params = dict(inspect.signature(getattr(public, entry)).parameters)
-        det_params = dict(inspect.signature(getattr(public, det)).parameters)
-        mode = params["deterministic"]
+        det_params = dict(inspect.signature(getattr(det_public, det)).parameters)
+        mode = params.pop("deterministic")
         assert mode.kind is inspect.Parameter.KEYWORD_ONLY and mode.default is True
         assert mode.annotation in (bool, "bool"), entry
-        if "deterministic" in det_params:
-            assert list(params.items()) == list(det_params.items()), entry
-        else:
-            del params["deterministic"]
-            assert list(params.items()) == list(det_params.items()), entry
+        assert "deterministic" not in det_params, det
+        assert list(params.items()) == list(det_params.items()), entry
 
 
 @pytest.mark.parametrize("entry", list(ENTRIES))
-@pytest.mark.parametrize("explicit", [False, True])
-def test_default_runs_the_deterministic_body_with_the_same_arguments(
-    recorders, monkeypatch, entry, explicit
+@pytest.mark.parametrize(
+    "value",
+    [DEFAULT, True, None, 0, 1, "False", "True", 1.0],
+    ids=["default", "True", "None", "0", "1", "str-False", "str-True", "1.0"],
+)
+def test_any_mode_but_false_is_a_value_error_before_any_work(
+    recorders, monkeypatch, entry, value
 ):
-    """``deterministic=True`` (default or explicit) calls the deterministic body once with exactly the call's
-    arguments -- the same objects, positional and keyword as given, ``deterministic`` not passed on (the body's
-    default is ``True``) -- and does nothing else: no knob resolution, no torch-mode query, no package import."""
-    bodies, fake = recorders
+    """The default ``deterministic=True`` and every other value but ``False`` raise ``ValueError`` naming the
+    deterministic entry and ``deterministic=False`` -- before any knob resolution, torch-mode query or package
+    import (each patched to fail), and before the non-deterministic helper binds the call's other arguments."""
+    fake = recorders
     monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", _fail)
-    monkeypatch.setattr(public, "_resolve_knobs", _fail)
-    monkeypatch.setattr(public, "_runs_det", _fail)
-    monkeypatch.setattr(public, "_det_fallback_kwargs", _fail)
+    monkeypatch.setattr(public._knobs, "resolve_knobs", _fail)
+    for loader in ("_nd_backend", "_nd_backend_opt_in", "_nd_support"):
+        monkeypatch.setattr(public, loader, _fail)
+    for helper in HELPERS.values():
+        monkeypatch.setattr(public, helper, _fail)
     args, kwargs = _call_args(entry)
-    given = dict(kwargs, deterministic=True) if explicit else kwargs
-    assert getattr(public, entry)(*args, **given) == ("result-of", BODIES[entry])
-    assert len(bodies[entry].calls) == 1
-    got_args, got_kwargs = bodies[entry].calls[0]
-    assert len(got_args) == len(args) and all(
-        a is b for a, b in zip(got_args, args, strict=True)
+    given = kwargs if value is DEFAULT else dict(kwargs, deterministic=value)
+    det = ENTRIES[entry]
+    got = re.escape(repr(True if value is DEFAULT else value))
+    pattern = (
+        rf"^{entry}\(\) runs the non-deterministic package "
+        r"flashinfer\.experimental\.cake\.cake_lm_head_loss only; "
+        r"pass deterministic=False for the non-deterministic path "
+        rf"\(got deterministic={got}\); "
+        rf"the deterministic entry is flashinfer\.cake_lm_head_det_train\.{det}$"
     )
-    assert list(got_kwargs) == list(kwargs)
-    assert all(got_kwargs[name] is value for name, value in kwargs.items())
-    # positional arguments the caller gives by keyword stay keywords
-    if entry in ("chunked_lm_head_loss", "chunked_lm_head_logprob"):
-        X, W, labels = args
-        getattr(public, entry)(X, W=W, labels=labels, **given)
-        assert bodies[entry].calls[-1] == ((X,), dict(W=W, labels=labels, **kwargs))
+    with pytest.raises(ValueError, match=pattern):
+        getattr(public, entry)(*args, **given)
+    if entry != "chunked_lm_head_preload":  # preload binds its own signature first
+        # the mode check comes before the helper binds the call: an unknown keyword is not reported
+        with pytest.raises(ValueError, match=re.escape(det)):
+            getattr(public, entry)(*args, bogus=1, **given)
     assert not any(f.recorders for f in fake.values())
 
 
-@pytest.mark.parametrize("entry", list(ENTRIES))
-def test_default_path_runs_one_python_frame_beyond_the_deterministic_entry(
-    recorders, entry
-):
-    """Structurally, a ``deterministic=True`` call runs the experimental wrapper, the dispatcher and the
-    deterministic body and no other Python function (a profile of the call's Python frames), so the default adds one
-    frame and its ``is True`` test to the deterministic entry's call.  At API log level 0 only (a higher level adds
-    the logging layer to both)."""
-    if api_logging._API_LOG_LEVEL != 0:
-        pytest.skip("API logging adds its own frames")
-    bodies, _ = recorders
-    fn = getattr(public, entry)
-    args, kwargs = _call_args(entry)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        fn(*args, **kwargs)  # the experimental warning of the first call
-    frames: list = []
-
-    def profile(frame, event, _arg):
-        if event == "call":
-            frames.append(frame.f_code)
-
-    sys.setprofile(profile)
-    try:
-        fn(*args, **kwargs)
-    finally:
-        sys.setprofile(None)
-    want = [fn.__code__, fn.__wrapped__.__code__, _Recorder.__call__.__code__]
-    assert frames == want, [f"{c.co_filename}:{c.co_name}" for c in frames]
-    assert len(bodies[entry].calls) == 2
-
-
-@pytest.mark.parametrize("entry", list(ENTRIES))
-@pytest.mark.parametrize("value", [1, 0, None, "True", "False", 1.0])
-def test_a_mode_that_is_not_a_bool_is_a_type_error(recorders, entry, value):
-    bodies, fake = recorders
-    args, kwargs = _call_args(entry)
-    with pytest.raises(TypeError, match="deterministic must be a bool"):
-        getattr(public, entry)(*args, **kwargs, deterministic=value)
-    assert not bodies[entry].calls and not any(f.recorders for f in fake.values())
-
-
-@pytest.mark.parametrize("deterministic", [True, False])
 @pytest.mark.parametrize(
     "entry", [e for e in ENTRIES if e != "chunked_lm_head_preload"]
 )
-def test_argument_errors_name_the_public_entry(entry, deterministic):
-    """An unknown keyword or a missing argument names the public entry, not the deterministic body it forwards to or
-    the private non-deterministic helper (both raise before any work: no device is needed)."""
+def test_argument_errors_name_the_public_entry(entry):
+    """With ``deterministic=False``, an unknown keyword or a missing argument names the public entry, not the private
+    non-deterministic helper (both raise before any work: no device is needed)."""
     fn = getattr(public, entry)
     args = _support_args() if entry in SUPPORT else _host_call()
     with pytest.raises(
         TypeError, match=rf"^{entry}\(\) got an unexpected keyword argument 'bogus'$"
     ):
-        fn(*args, bogus=1, deterministic=deterministic)
+        fn(*args, bogus=1, deterministic=False)
     with pytest.raises(TypeError, match=rf"^{entry}\(\) missing "):
-        fn(deterministic=deterministic)
+        fn(deterministic=False)
 
 
 def test_false_reaches_the_non_deterministic_package(recorders, monkeypatch):
     """``deterministic=False`` calls the package's entry of the same name with ``deterministic=False``, the
     switches resolved from the environment like the deterministic entries do, and the opt-in module for
-    ``memory_mode`` / ``num_valid_rows``; the deterministic bodies are not called."""
-    bodies, fake = recorders
+    ``memory_mode`` / ``num_valid_rows``."""
+    fake = recorders
     monkeypatch.setenv("FLASHINFER_CAKE_LM_HEAD_LOSS_COMPACT_ROWS", "0")
     monkeypatch.setenv("FLASHINFER_CAKE_LM_HEAD_LOSS_DW_STREAM", "on")
     X, W, labels = _host_call()
@@ -340,11 +332,10 @@ def test_false_reaches_the_non_deterministic_package(recorders, monkeypatch):
         ((got_args, got_kw),) = fake["support"].recorders[entry].calls
         assert all(a is b for a, b in zip(got_args, args, strict=True))
         assert got_kw == dict(kwargs, deterministic=False)
-    assert not any(b.calls for b in bodies.values())
 
 
 def test_false_checks_the_arguments_like_the_deterministic_entries(recorders):
-    bodies, fake = recorders
+    fake = recorders
     X, W, labels = _host_call()
     with pytest.raises(ValueError, match="backend"):
         public.chunked_lm_head_loss(
@@ -368,17 +359,14 @@ def test_false_checks_the_arguments_like_the_deterministic_entries(recorders):
 
 
 @pytest.mark.parametrize("warn_only", [False, True])
-def test_torch_deterministic_mode_runs_the_deterministic_entry_and_warns_once(
+def test_torch_deterministic_mode_still_runs_the_non_deterministic_package(
     recorders, warn_only
 ):
-    """With torch's deterministic algorithms on (also ``warn_only``), ``deterministic=False`` runs the deterministic
-    body with the call's arguments and warns once per entry point, naming the caller's line."""
-    bodies, fake = recorders
-    was, was_warn = (
-        torch.are_deterministic_algorithms_enabled(),
-        torch.is_deterministic_algorithms_warn_only_enabled(),
-    )
-    torch.use_deterministic_algorithms(True, warn_only=warn_only)
+    """With torch's deterministic algorithms on (strict or ``warn_only``), ``deterministic=False`` still reaches the
+    non-deterministic package with the call's arguments on every call, and the dispatcher itself warns nothing (the
+    package's own alert decides; here the package is a recorder, so no warning at all but the experimental one)."""
+    fake = recorders
+    was = _torch_deterministic(warn_only)
     try:
         for entry in ENTRIES:
             args, kwargs = _call_args(entry)
@@ -386,143 +374,52 @@ def test_torch_deterministic_mode_runs_the_deterministic_entry_and_warns_once(
                 warnings.simplefilter("always")
                 for _ in range(3):
                     getattr(public, entry)(*args, **kwargs, deterministic=False)
-            mine = [
-                w
+            other = [
+                str(w.message)
                 for w in rec
-                if "runs the deterministic implementation" in str(w.message)
+                if not issubclass(w.category, api_logging.ExperimentalWarning)
             ]
-            assert len(mine) == 1, (entry, [str(w.message) for w in rec])
-            assert mine[0].category is UserWarning and entry in str(mine[0].message)
-            assert os.path.abspath(mine[0].filename) == os.path.abspath(__file__), mine[
-                0
-            ].filename
-            assert len(bodies[entry].calls) == 3, entry
+            assert not other, (entry, other)
+            calls = _nd_calls(fake, entry)
+            assert len(calls) == 3, entry
+            for got_args, _ in calls:
+                assert all(a is b for a, b in zip(got_args, args, strict=True)), entry
     finally:
-        torch.use_deterministic_algorithms(was, warn_only=was_warn)
-    assert not any(f.recorders for f in fake.values())
+        torch.use_deterministic_algorithms(was[0], warn_only=was[1])
 
 
 @pytest.mark.parametrize("entry", ["chunked_lm_head_loss", "chunked_lm_head_logprob"])
 @pytest.mark.parametrize("source", ["keyword", "environment"])
-def test_det_fallback_drops_a_k_slices_pin_it_does_not_serve(
+def test_torch_deterministic_mode_passes_a_k_slices_pin_unchanged(
     recorders, monkeypatch, entry, source
 ):
-    """Under torch's deterministic algorithms ``deterministic=False`` runs the deterministic body; a dX ``k_slices``
-    pin above its four slices (``gemm_tuning`` or ``FLASHINFER_CAKE_LM_HEAD_LOSS_GEMM_TUNING``) is dropped with one
-    warning per entry point -- the other knobs pass on --, and a pin it serves passes on unchanged without a
+    """Under torch's deterministic algorithms a dX ``k_slices`` pin of any size (``gemm_tuning`` or
+    ``FLASHINFER_CAKE_LM_HEAD_LOSS_GEMM_TUNING``) reaches the non-deterministic package unchanged, without a
     warning."""
-    bodies, fake = recorders
+    fake = recorders
     X, W, labels = _host_call()
     extra = dict(loss_div=1.0) if entry == "chunked_lm_head_loss" else {}
     pinned = {"dx": {"k_slices": 8, "tile_n": 256}, "logits": {"group_m": 8}}
-    served = {"dx": {"k_slices": 4}}
-    was, was_warn = (
-        torch.are_deterministic_algorithms_enabled(),
-        torch.is_deterministic_algorithms_warn_only_enabled(),
-    )
-    torch.use_deterministic_algorithms(True)
+    if source == "environment":
+        monkeypatch.setenv(
+            "FLASHINFER_CAKE_LM_HEAD_LOSS_GEMM_TUNING", json.dumps(pinned)
+        )
+    else:
+        extra = dict(extra, gemm_tuning=pinned)
+    was = _torch_deterministic(False)
     try:
         with warnings.catch_warnings(record=True) as rec:
             warnings.simplefilter("always")
-            for _ in range(3):
-                if source == "keyword":
-                    getattr(public, entry)(
-                        X, W, labels, gemm_tuning=pinned, deterministic=False, **extra
-                    )
-                else:
-                    monkeypatch.setenv(
-                        "FLASHINFER_CAKE_LM_HEAD_LOSS_GEMM_TUNING", json.dumps(pinned)
-                    )
-                    getattr(public, entry)(X, W, labels, deterministic=False, **extra)
-            monkeypatch.delenv(
-                "FLASHINFER_CAKE_LM_HEAD_LOSS_GEMM_TUNING", raising=False
-            )
-            getattr(public, entry)(
-                X, W, labels, gemm_tuning=served, deterministic=False, **extra
-            )
+            getattr(public, entry)(X, W, labels, deterministic=False, **extra)
     finally:
-        torch.use_deterministic_algorithms(was, warn_only=was_warn)
-    dropped = [w for w in rec if "k_slices=8 is dropped" in str(w.message)]
-    assert len(dropped) == 1 and entry in str(dropped[0].message), [
-        str(w.message) for w in rec
+        torch.use_deterministic_algorithms(was[0], warn_only=was[1])
+    assert not [
+        w for w in rec if not issubclass(w.category, api_logging.ExperimentalWarning)
     ]
-    assert os.path.abspath(dropped[0].filename) == os.path.abspath(__file__)
-    calls = bodies[entry].calls
-    assert len(calls) == 4
-    for _, kw in calls[:3]:
-        assert kw["gemm_tuning"] == {"dx": {"tile_n": 256}, "logits": {"group_m": 8}}
-    assert calls[3][1]["gemm_tuning"] is served
-    assert not any(f.recorders for f in fake.values())
-
-
-def test_det_fallback_drops_a_lone_k_slices_pin_to_no_dx_knobs(recorders):
-    """A pin of ``k_slices`` alone leaves no dX knob: the deterministic body gets no ``dx`` entry (its own rule), and
-    the other GEMMs' knobs pass on."""
-    bodies, _ = recorders
-    X, W, labels = _host_call()
-    was, was_warn = (
-        torch.are_deterministic_algorithms_enabled(),
-        torch.is_deterministic_algorithms_warn_only_enabled(),
-    )
-    torch.use_deterministic_algorithms(True)
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            public.chunked_lm_head_logprob(
-                X, W, labels, gemm_tuning={"dx": {"k_slices": 6}}, deterministic=False
-            )
-    finally:
-        torch.use_deterministic_algorithms(was, warn_only=was_warn)
-    ((_, kw),) = bodies["chunked_lm_head_logprob"].calls
-    assert kw["gemm_tuning"] == {}
-
-
-def test_deterministic_entries_still_refuse_false():
-    """``chunked_lm_head_det_loss`` / ``_logprob`` keep their contract: ``deterministic=False`` is refused by the
-    deterministic backend's validation (host tensors suffice: it runs before any device query)."""
-    X, W, labels = _host_call()
-    with pytest.raises(NotImplementedError, match="only deterministic=True"):
-        public.chunked_lm_head_det_loss(X, W, labels, loss_div=1.0, deterministic=False)
-    with pytest.raises(NotImplementedError, match="only deterministic=True"):
-        public.chunked_lm_head_det_logprob(X, W, labels, deterministic=False)
-    for det in (
-        "chunked_lm_head_det_support_logprob",
-        "chunked_lm_head_det_support_kl",
-    ):
-        assert "deterministic" not in inspect.signature(getattr(public, det)).parameters
-
-
-def test_remaining_aliases_are_the_canonical_objects():
-    """Every alias that remains after the dispatchers is an identity: the legacy package path
-    ``flashinfer.experimental.cake_lm_head_loss`` is the deterministic package (module for module), never the
-    non-deterministic one, and the deterministic modules' former names are their canonical objects."""
-    nd_root = "flashinfer.experimental.cake.cake_lm_head_loss"
-    for name in (
-        "cake_backend",
-        "cake_backend_opt_in",
-        "cake_build",
-        "cake_jit",
-        "cake_support",
-    ):
-        legacy = importlib.import_module(
-            f"flashinfer.experimental.cake_lm_head_loss.{name}"
-        )
-        det = importlib.import_module(
-            f"flashinfer.experimental.cake_lm_head_det_loss.{name}"
-        )
-        nd = importlib.import_module(f"{nd_root}.{name}")
-        assert legacy is det and legacy is not nd, name
-    det_backend = importlib.import_module(
-        "flashinfer.experimental.cake_lm_head_det_loss.cake_backend"
-    )
-    for old, new in (
-        ("chunked_lm_head_loss", "chunked_lm_head_det_loss"),
-        ("chunked_lm_head_logprob", "chunked_lm_head_det_logprob"),
-        ("prepare_lm_head_loss", "prepare_lm_head_det_loss"),
-        ("LmHeadLossRunner", "LmHeadDetLossRunner"),
-        ("load_cake_lm_head_loss_module", "load_cake_lm_head_det_loss_module"),
-    ):
-        assert getattr(det_backend, old) is getattr(det_backend, new), old
+    ((_, kw),) = fake["backend"].recorders[entry].calls
+    assert kw["gemm_tuning"] == pinned
+    if source == "keyword":
+        assert kw["gemm_tuning"] is pinned
 
 
 def test_non_deterministic_binding_caches_take_the_import_settings():
@@ -545,13 +442,13 @@ def test_non_deterministic_binding_caches_take_the_import_settings():
 
 
 # ---------------------------------------------------------------------------
-# Device: the bits and the host cost of the default path
+# Device
 # ---------------------------------------------------------------------------
 
 
 def _require_device():
     det_backend = importlib.import_module(
-        "flashinfer.experimental.cake_lm_head_det_loss.cake_backend"
+        "flashinfer.experimental.cake.cake_lm_head_det_train.cake_backend"
     )
     if not torch.cuda.is_available() or torch.cuda.get_device_capability(0) not in (
         det_backend.SUPPORTED_COMPUTE_CAPABILITIES
@@ -568,209 +465,12 @@ def _bits(t):
     return t.view({torch.bfloat16: torch.int16, torch.float32: torch.int32}[t.dtype])
 
 
-def _loss_step(fn, inp, **kw):
-    X = inp.X.detach().requires_grad_(True)
-    W = inp.W.detach().requires_grad_(True)
-    loss, logp = fn(
-        X,
-        W,
-        inp.labels,
-        objective=inp.objective,
-        loss_div=inp.loss_div if inp.objective == "ce" else None,
-        infer_logp=inp.infer_logp,
-        loss_weights=inp.loss_weights,
-        return_logp=True,
-        **kw,
-    )
-    loss.backward()
-    return dict(loss=loss.detach(), logp=logp, dX=X.grad, dW=W.grad)
-
-
 def _logprob_step(fn, inp, **kw):
     X = inp.X.detach().requires_grad_(True)
     W = inp.W.detach().requires_grad_(True)
     logp = fn(X, W, inp.labels, **kw)
     logp.backward(inp.dlogp)
     return dict(logp=logp.detach(), dX=X.grad, dW=W.grad)
-
-
-def _support_step(fn, inp, **kw):
-    X = inp.X.detach().requires_grad_(True)
-    W = inp.W.detach().requires_grad_(True)
-    out = fn(
-        X, W, inp.support_ids, inp.support_offsets, inp.labels, **inp.kwargs(), **kw
-    )
-    out.backward(inp.d)
-    return dict(out=out.detach(), dX=X.grad, dW=W.grad)
-
-
-# Measured default calls per path.
-_MEASURED_CALLS = 4
-
-
-def _allocations() -> int:
-    return int(torch.cuda.memory_stats()["allocation.all.allocated"])
-
-
-def _syncs(records) -> int:
-    return sum("synchroniz" in str(w.message) for w in records)
-
-
-def _measure_dispatch(monkeypatch, entry, step, inp, kw):
-    """The outputs of ``_MEASURED_CALLS`` default calls of ``entry`` and, per call, ``(allocations, synchronizations)``
-    the call made OUTSIDE the deterministic body it reached: the caching allocator's allocation count and PyTorch's
-    synchronization debug warnings, each taken around the whole call and around the body (a recorder in place of the
-    body), so the difference is the dispatcher's own -- whatever the body's binding-cache state (a miss in one call
-    and a hit in another changes the body's count, not the difference)."""
-    body_name = BODIES[entry]
-    body = getattr(public, body_name)
-    records: list = []
-    inside: list = []
-
-    def probed_body(*args, **kwargs):
-        a0, s0 = _allocations(), len(records)
-        out = body(*args, **kwargs)
-        inside.append((_allocations() - a0, _syncs(records[s0:])))
-        return out
-
-    entry_fn = getattr(public, entry)
-    outside: list = []
-
-    def measured_entry(*args, **kwargs):
-        a0, s0 = _allocations(), len(records)
-        out = entry_fn(*args, **kwargs)
-        total = (_allocations() - a0, _syncs(records[s0:]))
-        body_cost = inside[-1]
-        outside.append((total[0] - body_cost[0], total[1] - body_cost[1]))
-        return out
-
-    monkeypatch.setattr(public, body_name, probed_body)
-    outs = []
-    torch.cuda.set_sync_debug_mode("warn")
-    try:
-        with warnings.catch_warnings(record=True) as rec:
-            warnings.simplefilter("always")
-            records = rec
-            for _ in range(_MEASURED_CALLS):
-                outs.append(step(measured_entry, inp, **kw))
-    finally:
-        torch.cuda.set_sync_debug_mode("default")
-        monkeypatch.setattr(public, body_name, body)
-    torch.cuda.synchronize()
-    assert len(inside) == len(outside) == _MEASURED_CALLS
-    return outs, outside
-
-
-def _cases():
-    from tests.test_helpers.cake_lm_head_support_reference import make_support_inputs
-
-    cuda = torch.device("cuda")
-    W = make_inputs(1, seed=SEED, device=cuda, ignore_frac=0.0).W
-    ce = make_inputs(4097, seed=SEED + 1, device=cuda, W=W)
-    policy = make_inputs(4097, objective="policy", seed=SEED + 2, device=cuda, W=W)
-    sup = make_support_inputs(
-        257, seed=SEED + 3, H=256, V=512, k_cap=8, device=cuda, labels=True
-    )
-    return [
-        ("loss-ce", _loss_step, ce, {}),
-        ("loss-policy", _loss_step, policy, {}),
-        ("loss-budget", _loss_step, ce, dict(memory_mode="budget")),
-        ("loss-count", _loss_step, ce, dict(num_valid_rows=int(ce.valid.sum()))),
-        ("logprob", _logprob_step, ce, {}),
-        ("support-logprob", _support_step, sup, {}),
-    ]
-
-
-_DET_OF = {
-    _loss_step: "chunked_lm_head_det_loss",
-    _logprob_step: "chunked_lm_head_det_logprob",
-    _support_step: "chunked_lm_head_det_support_logprob",
-}
-_NEW_OF = {
-    _loss_step: "chunked_lm_head_loss",
-    _logprob_step: "chunked_lm_head_logprob",
-    _support_step: "chunked_lm_head_support_logprob",
-}
-
-
-def test_device_default_is_the_deterministic_call_bit_for_bit_with_no_extra_allocation_or_sync(
-    monkeypatch,
-):
-    """For each entry and form, every default call gives the deterministic entry's bits, and the dispatcher itself --
-    the call measured around the deterministic body it runs -- allocates nothing and synchronizes nothing (the
-    caching allocator's count and PyTorch's synchronization debug mode), in every one of the measured calls."""
-    _require_device()
-    for name, step, inp, kw in _cases():
-        det_out = step(getattr(public, _DET_OF[step]), inp, **kw)
-        outs, outside = _measure_dispatch(monkeypatch, _NEW_OF[step], step, inp, kw)
-        for out in outs:
-            for key, value in det_out.items():
-                assert torch.equal(_bits(value), _bits(out[key])), (name, key)
-        print(f"\n{name}: dispatcher (allocations, syncs) per call {outside}")
-        assert all(cost == (0, 0) for cost in outside), (name, outside)
-
-
-@pytest.mark.parametrize("step", [_loss_step, _logprob_step], ids=["loss", "logprob"])
-def test_device_det_fallback_runs_a_k_slices_pin_above_four_without_it(
-    monkeypatch, step
-):
-    """On the device: under ``torch.use_deterministic_algorithms(True)`` a ``deterministic=False`` call pinning
-    ``{"dx": {"k_slices": 8, "tile_n": 256}}`` runs the real deterministic entry without the pin -- one warning names
-    it -- instead of raising: the deterministic call with ``{"dx": {"tile_n": 256}}``, bit for bit."""
-    _require_device()
-    monkeypatch.setattr(public, "_DET_FALLBACK_WARNED", set())
-    monkeypatch.setattr(public, "_DET_FALLBACK_PIN_WARNED", set())
-    inp = make_inputs(4097, seed=SEED + 9, device=torch.device("cuda"))
-    want = step(
-        getattr(public, _DET_OF[step]), inp, gemm_tuning={"dx": {"tile_n": 256}}
-    )
-    was, was_warn = (
-        torch.are_deterministic_algorithms_enabled(),
-        torch.is_deterministic_algorithms_warn_only_enabled(),
-    )
-    torch.use_deterministic_algorithms(True)
-    try:
-        with warnings.catch_warnings(record=True) as rec:
-            warnings.simplefilter("always")
-            got = step(
-                getattr(public, _NEW_OF[step]),
-                inp,
-                gemm_tuning={"dx": {"k_slices": 8, "tile_n": 256}},
-                deterministic=False,
-            )
-    finally:
-        torch.use_deterministic_algorithms(was, warn_only=was_warn)
-    dropped = [w for w in rec if "k_slices=8 is dropped" in str(w.message)]
-    assert len(dropped) == 1, [str(w.message) for w in rec]
-    for key, value in want.items():
-        assert torch.equal(_bits(value), _bits(got[key])), key
-
-
-def test_device_support_kl_default_is_the_deterministic_call():
-    _require_device()
-    from tests.test_helpers.cake_lm_head_support_reference import make_support_inputs
-
-    inp = make_support_inputs(
-        257,
-        seed=SEED + 5,
-        H=256,
-        V=512,
-        k_cap=8,
-        device=torch.device("cuda"),
-        teacher=True,
-    )
-    outs = []
-    for fn in (
-        public.chunked_lm_head_det_support_kl,
-        public.chunked_lm_head_support_kl,
-    ):
-        X = inp.X.detach().requires_grad_(True)
-        W = inp.W.detach().requires_grad_(True)
-        kl = fn(X, W, inp.support_ids, inp.support_offsets, inp.teacher, **inp.kwargs())
-        kl.backward(inp.e)
-        outs.append((kl.detach(), X.grad, W.grad))
-    for a, b in zip(*outs, strict=True):
-        assert torch.equal(_bits(a), _bits(b))
 
 
 def test_device_public_entry_places_the_gradients(monkeypatch):
@@ -857,19 +557,17 @@ def test_device_public_entry_places_the_gradients(monkeypatch):
         assert torch.equal(_bits(ckpt[key]), _bits(plain[key])), key
 
 
-def test_keep_logits_mode_reaches_both_routes(recorders):
-    """``memory_mode="keep_logits"`` passes through the log-probability dispatcher unchanged on both routes:
-    ``deterministic=True`` hands it to the deterministic entry with the call's other arguments, ``deterministic=False``
-    to this package's opt-in module (with ``deterministic=False``), and while torch's deterministic algorithms are on
-    the ``False`` route's fallback hands it to the deterministic entry."""
-    bodies, fake = recorders
+def test_keep_logits_mode_reaches_the_non_deterministic_route(recorders):
+    """``memory_mode="keep_logits"`` passes through the log-probability dispatcher unchanged: ``deterministic=False``
+    hands it to this package's opt-in module (with ``deterministic=False``), also while torch's deterministic
+    algorithms are on (no fallback); the default is a ``ValueError`` naming ``cake_lm_head_det_train_logprob``, which
+    takes the mode itself."""
+    fake = recorders
     X, W, labels = _host_call()
-    public.chunked_lm_head_logprob(
-        X, W, labels, chunk_size=16, memory_mode="keep_logits"
-    )
-    ((args, kw),) = bodies["chunked_lm_head_logprob"].calls
-    assert args == (X, W, labels)
-    assert kw == dict(chunk_size=16, memory_mode="keep_logits")
+    with pytest.raises(ValueError, match="cake_lm_head_det_train_logprob"):
+        public.chunked_lm_head_logprob(
+            X, W, labels, chunk_size=16, memory_mode="keep_logits"
+        )
     public.chunked_lm_head_logprob(
         X, W, labels, chunk_size=16, memory_mode="keep_logits", deterministic=False
     )
@@ -878,11 +576,7 @@ def test_keep_logits_mode_reaches_both_routes(recorders):
     assert kw["memory_mode"] == "keep_logits" and kw["deterministic"] is False
     assert kw["chunk_size"] == 16 and kw["num_valid_rows"] is None
     assert "chunked_lm_head_logprob" not in fake["backend"].recorders
-    was, was_warn = (
-        torch.are_deterministic_algorithms_enabled(),
-        torch.is_deterministic_algorithms_warn_only_enabled(),
-    )
-    torch.use_deterministic_algorithms(True, warn_only=True)
+    was = _torch_deterministic(True)
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -895,15 +589,14 @@ def test_keep_logits_mode_reaches_both_routes(recorders):
                 deterministic=False,
             )
     finally:
-        torch.use_deterministic_algorithms(was, warn_only=was_warn)
-    assert len(bodies["chunked_lm_head_logprob"].calls) == 2
-    assert bodies["chunked_lm_head_logprob"].calls[1][1]["memory_mode"] == "keep_logits"
-    assert len(fake["opt_in"].recorders["chunked_lm_head_logprob"].calls) == 1
+        torch.use_deterministic_algorithms(was[0], warn_only=was[1])
+    calls = fake["opt_in"].recorders["chunked_lm_head_logprob"].calls
+    assert len(calls) == 2 and calls[1][1]["memory_mode"] == "keep_logits"
 
 
 def test_device_keep_logits_on_both_routes_is_the_plain_call(monkeypatch):
-    """``deterministic=True`` and ``deterministic=False`` both accept ``memory_mode="keep_logits"`` through the public
-    log-probability entry and run their package's kept entry (``chunked_lm_head_det_logprob_keep`` /
+    """``cake_lm_head_det_train_logprob`` and ``chunked_lm_head_logprob(deterministic=False)`` both accept
+    ``memory_mode="keep_logits"`` and run their package's kept entry (``cake_lm_head_det_train_logprob_keep`` /
     ``chunked_lm_head_logprob_keep``, counted); each gives its plain call's ``logp`` / ``dW`` bits and the bits of
     the loss ``sum(dlogp * logp)`` -- and ``dX``: the deterministic route's always, the non-deterministic route's
     with one dX slice pinned (its plain store; the default slice rule's reduction adds the same products in an
@@ -913,7 +606,7 @@ def test_device_keep_logits_on_both_routes_is_the_plain_call(monkeypatch):
         "flashinfer.experimental.cake.cake_lm_head_loss.cake_backend"
     )
     det_backend = importlib.import_module(
-        "flashinfer.experimental.cake_lm_head_det_loss.cake_backend"
+        "flashinfer.experimental.cake.cake_lm_head_det_train.cake_backend"
     )
     if not nd_backend.generated_program_available(
         torch.device("cuda"), entry="logprob"
@@ -923,7 +616,7 @@ def test_device_keep_logits_on_both_routes_is_the_plain_call(monkeypatch):
         pytest.skip("the log-probability programs are not registered for this device")
     counts = {"det": 0, "nd": 0}
     for name, module, attr in (
-        ("det", det_backend, "chunked_lm_head_det_logprob_keep"),
+        ("det", det_backend, "cake_lm_head_det_train_logprob_keep"),
         ("nd", nd_backend, "chunked_lm_head_logprob_keep"),
     ):
         real = getattr(module, attr)
@@ -942,33 +635,33 @@ def test_device_keep_logits_on_both_routes_is_the_plain_call(monkeypatch):
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", api_logging.ExperimentalWarning)
-        for deterministic, tuning in (
-            (True, None),
-            (False, None),
-            (False, {"dx": {"k_slices": 1}}),
+        for route, fn, mode, tuning in (
+            ("det", det_public.cake_lm_head_det_train_logprob, {}, None),
+            ("nd", public.chunked_lm_head_logprob, dict(deterministic=False), None),
+            (
+                "nd",
+                public.chunked_lm_head_logprob,
+                dict(deterministic=False),
+                {"dx": {"k_slices": 1}},
+            ),
         ):
-            kw = dict(chunk_size=4096, deterministic=deterministic, gemm_tuning=tuning)
-            plain = _logprob_step(public.chunked_lm_head_logprob, inp, **kw)
+            kw = dict(chunk_size=4096, gemm_tuning=tuning, **mode)
+            plain = _logprob_step(fn, inp, **kw)
             before = dict(counts)
-            kept = _logprob_step(
-                public.chunked_lm_head_logprob, inp, memory_mode="keep_logits", **kw
-            )
-            route = "det" if deterministic else "nd"
-            assert counts[route] == before[route] + 1, (deterministic, counts)
-            assert (
-                counts["det" if route == "nd" else "nd"]
-                == before["det" if route == "nd" else "nd"]
-            ), (deterministic, counts)
-            keys = ["logp", "dW"] + (["dX"] if deterministic or tuning else [])
+            kept = _logprob_step(fn, inp, memory_mode="keep_logits", **kw)
+            other = "det" if route == "nd" else "nd"
+            assert counts[route] == before[route] + 1, (route, counts)
+            assert counts[other] == before[other], (route, counts)
+            keys = ["logp", "dW"] + (["dX"] if route == "det" or tuning else [])
             for key in keys:
                 assert torch.equal(_bits(kept[key]), _bits(plain[key])), (
-                    deterministic,
+                    route,
                     tuning,
                     key,
                 )
             assert torch.equal(
                 _bits(loss_of(kept).float()), _bits(loss_of(plain).float())
-            ), (deterministic, tuning)
+            ), (route, tuning)
             assert bool(torch.isfinite(kept["dX"].float()).all())
             assert torch.all(kept["dX"][~inp.valid] == 0)
 
@@ -984,8 +677,8 @@ def test_false_temperature_reaches_the_non_deterministic_temperature_entry(recor
     ``temperature`` / ``check_temperature`` unchanged (a tensor as the same object) and every other keyword of the
     call without one; ``None`` and the scalars whose FP32 value is 1.0 call the entry without a temperature, with
     neither keyword; a bool is a ``ValueError``; ``chunked_lm_head_preload(temperature=True)`` passes it to the
-    opt-in module's ``preload``.  The deterministic bodies are not called."""
-    bodies, fake = recorders
+    opt-in module's ``preload``."""
+    fake = recorders
     X, W, labels = _host_call()
     tau = torch.full((4,), 0.7)
     public.chunked_lm_head_logprob(X, W, labels, deterministic=False)
@@ -1045,7 +738,6 @@ def test_false_temperature_reaches_the_non_deterministic_temperature_entry(recor
         (("cuda:0",), {"temperature": True}),
         (("cuda:0",), {}),
     ]
-    assert not any(b.calls for b in bodies.values())
 
 
 def test_false_temperature_refuses_keep_logits():
@@ -1120,7 +812,7 @@ def test_device_false_temperature_through_the_public_entry():
         )
         same(
             run(public.chunked_lm_head_logprob, temperature=value, **nd_kw),
-            run(public.chunked_lm_head_logprob, temperature=value),
+            run(det_public.cake_lm_head_det_train_logprob, temperature=value),
             ("vs deterministic", type(value).__name__),
             keys=("logp", "dW"),
         )

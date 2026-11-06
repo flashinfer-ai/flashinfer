@@ -178,6 +178,7 @@ _PRIMS_TS_LAZY_EXPORTS = frozenset(
 # import the experimental tree.
 _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     **{name: (".fused_moe", name) for name in sorted(_PRIMS_TS_LAZY_EXPORTS)},
+    "cake_lm_head_det_train": (".cake_lm_head_det_train", None),
     # SiLU-gated RMSNorm training (Cake), both modes: each facade imports its
     # backend package (under flashinfer.experimental.cake) on first use.
     "cake_rmsnorm_silu_gate_det_train": (".cake_rmsnorm_silu_gate_det_train", None),

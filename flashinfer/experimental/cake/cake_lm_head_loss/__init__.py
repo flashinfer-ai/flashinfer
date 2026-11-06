@@ -23,6 +23,6 @@ limitations under the License.
 # ``chunked_lm_head_preload`` and the candidate-support entries
 # ``chunked_lm_head_support_logprob`` / ``chunked_lm_head_support_kl`` with
 # ``deterministic=False`` (their default ``deterministic=True`` runs the
-# deterministic package ``flashinfer.experimental.cake_lm_head_det_loss``); the
+# deterministic package ``flashinfer.experimental.cake.cake_lm_head_det_train``); the
 # autograd wrappers, host planning, JIT registration and the generated sources
 # live in this package.
