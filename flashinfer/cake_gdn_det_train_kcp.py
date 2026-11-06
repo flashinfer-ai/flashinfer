@@ -106,36 +106,60 @@ def _pkg():
     return cake_gdn_det_train_kcp
 
 
-class _Forwarded:
-    """``__wrapped__`` of a facade function that hands its ``**`` keywords to the package function of its name.
-    ``inspect.signature`` of the facade function follows it and gives the call's signature: the facade function's
-    own parameters without ``**``, then each keyword-only parameter of the package function that the facade
-    function does not name (every option field, keyword-only).  The package is imported on the first inspection or
-    call, so importing this module still imports nothing."""
+class _PackageKeywordsSignature(inspect.Signature):
+    """``__signature__`` of a facade function that hands its ``**`` keywords to the package function of its name: the
+    facade function's own parameters without ``**``, then each keyword-only parameter of the package function that the
+    facade function does not name (every option field, keyword-only).  The package parameters are read on first use of
+    the signature, which imports the package, so importing this module still imports nothing; the facade function
+    stays a plain function (its source and type hints are its own)."""
 
-    def __init__(self, fn: Callable[..., Any]) -> None:
-        self._fn = fn
+    __slots__ = ("_own", "_name", "_full")
 
-    def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        return self._fn(*args, **kwargs)
+    def __init__(
+        self, fn: Callable[..., Any]
+    ) -> None:  # no Signature.__init__: the parameters are read on first use
+        self._own = inspect.signature(fn)
+        self._name = fn.__name__
+        self._full: Optional[inspect.Signature] = None
 
-    @property
-    def __signature__(self) -> inspect.Signature:
-        own = inspect.signature(self._fn, follow_wrapped=False)
-        params = [p for p in own.parameters.values() if p.kind is not p.VAR_KEYWORD]
-        named = {p.name for p in params}
-        theirs = inspect.signature(getattr(_pkg(), self._fn.__name__)).parameters
-        params += [
-            p
-            for p in theirs.values()
-            if p.kind is p.KEYWORD_ONLY and p.name not in named
-        ]
-        return own.replace(parameters=params)
+    def _resolved(self) -> inspect.Signature:
+        if self._full is None:
+            params = [
+                p for p in self._own.parameters.values() if p.kind is not p.VAR_KEYWORD
+            ]
+            named = {p.name for p in params}
+            theirs = inspect.signature(getattr(_pkg(), self._name)).parameters
+            params += [
+                p
+                for p in theirs.values()
+                if p.kind is p.KEYWORD_ONLY and p.name not in named
+            ]
+            self._full = self._own.replace(parameters=params)
+        return self._full
+
+    # every Signature method (parameters, bind, str, ==, hash) reads these two slots of the base class
+    @property  # type: ignore[override]
+    def _parameters(self) -> Any:
+        return self._resolved().parameters
+
+    @property  # type: ignore[override]
+    def _return_annotation(self) -> Any:
+        return self._own.return_annotation
+
+    def replace(self, **changes: Any) -> inspect.Signature:  # type: ignore[override]
+        return self._resolved().replace(**changes)
+
+    def __reduce__(self) -> Any:
+        return self._resolved().__reduce__()
+
+    def __repr__(self) -> str:
+        return repr(self._resolved())
 
 
 def _forwards_keywords(fn: Callable[..., Any]) -> Callable[..., Any]:
-    """Mark ``fn`` as handing its ``**`` keywords to the package function of its name (:class:`_Forwarded`)."""
-    fn.__wrapped__ = _Forwarded(fn)  # type: ignore[attr-defined]
+    """Mark ``fn`` as handing its ``**`` keywords to the package function of its name: its ``__signature__`` is a
+    :class:`_PackageKeywordsSignature`."""
+    fn.__signature__ = _PackageKeywordsSignature(fn)  # type: ignore[attr-defined]
     return fn
 
 

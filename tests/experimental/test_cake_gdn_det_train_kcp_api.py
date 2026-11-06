@@ -24,7 +24,10 @@ import importlib
 import importlib.util
 import inspect
 import pathlib
+import subprocess
+import sys
 import types
+import typing
 
 import pytest
 import torch
@@ -818,6 +821,43 @@ def test_option_keyword_entries_declare_every_option_field() -> None:
     assert (
         comm["C"].kind is inspect.Parameter.KEYWORD_ONLY and comm["C"].default == 10240
     )
+    # the facade entries stay plain functions: the declared signature is their ``__signature__`` (no ``__wrapped__``
+    # stand-in), so their source and type hints are their own
+    for name in sorted(OPTION_KEYWORD_ENTRIES):
+        fn = getattr(facade, name)
+        sig = inspect.signature(fn)
+        assert isinstance(sig, inspect.Signature), name
+        assert str(sig).startswith("("), name
+        assert sig.replace(return_annotation="int").return_annotation == "int", name
+        raw = inspect.unwrap(fn)
+        assert raw.__name__ == name and raw.__module__ == facade.__name__, name
+        assert f"def {name}(" in inspect.getsource(fn), name
+        assert "return" in typing.get_type_hints(fn), name
+
+
+def test_importing_the_facade_does_not_import_the_package() -> None:
+    """A fresh interpreter imports the facade without importing the backend package; the package is imported on the
+    first read of the parameters of an entry that hands its option keywords to the package (``inspect.signature``
+    alone imports nothing)."""
+    code = (
+        "import inspect\n"
+        "import sys\n"
+        "import flashinfer.cake_gdn_det_train_kcp as facade\n"
+        f"assert {PACKAGE!r} not in sys.modules, 'imported at facade import'\n"
+        "sig = inspect.signature(facade.cake_gdn_det_kcp)\n"
+        f"assert {PACKAGE!r} not in sys.modules, 'imported by inspect.signature'\n"
+        "assert 'save_transfer' in sig.parameters\n"
+        f"assert {PACKAGE!r} in sys.modules, 'not imported on the first read of the parameters'\n"
+    )
+    root = pathlib.Path(__file__).resolve().parents[2]
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert proc.returncode == 0, proc.stderr[-4000:]
 
 
 def test_legacy_names_are_removed() -> None:
