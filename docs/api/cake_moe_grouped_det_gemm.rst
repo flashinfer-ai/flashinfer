@@ -31,6 +31,32 @@ operation    computation                                                        
 ``wgrad``    ``dW[e] = G[offs[e-1]:offs[e]].T @ X[offs[e-1]:offs[e]]``             ``[E, N, K]`` bfloat16 or float32
 ============ ==================================================================== ============================
 
+Mode and dispatch rules
+-----------------------
+
+This package and its entry points are deterministic only; every public name carries
+``det``.
+
+- Every entry below runs the deterministic programs: a fixed reduction order, bitwise
+  reproducible run to run.
+- No deterministic entry takes a ``deterministic`` argument: passing one (``True`` or
+  ``False``, e.g. ``cake_grouped_det_mm(x, w, offs, deterministic=False)``) raises
+  ``TypeError``, and so does a fourth argument of ``CakeGroupedDetMm.apply(x, w, offs)``
+  (a stale ``True`` / ``False`` numerical mode included).
+- ``torch.use_deterministic_algorithms(True)`` (also with ``warn_only=True``) changes
+  nothing: no alert, no warning.
+- ``flashinfer.grouped_mm.grouped_mm_bf16(..., backend="cake")`` runs the deterministic
+  forward (the forward programs of both Cake packages give the same bits).
+
+The non-deterministic counterpart is a separate package,
+``flashinfer.experimental.cake.cake_moe_grouped_gemm``, and its facade
+``flashinfer.experimental.cake.grouped_mm`` (see :ref:`apicake_moe_grouped_gemm`),
+which take only ``deterministic=False``.  The names of this package before the
+deterministic-family rename (``flashinfer.experimental.cake_moe_grouped_gemm``,
+``flashinfer.grouped_mm.cake``, ``grouped_gemm_*``, ``cake_grouped_mm`` and the other
+names without ``det``) were removed with no alias: importing them raises
+``ModuleNotFoundError`` / ``AttributeError``.
+
 Stable API opt-in
 -----------------
 
@@ -61,12 +87,12 @@ Autograd
 
     cake_grouped_det_mm
 
-``cake_grouped_det_mm(x, w, offs, deterministic=True)`` wraps the ``torch.autograd.Function``
+``cake_grouped_det_mm(x, w, offs)`` wraps the ``torch.autograd.Function``
 ``CakeGroupedDetMm`` of the backend package: its ``backward`` produces ``x.grad`` with the
 ``dgrad`` program and ``w.grad`` with the ``wgrad`` program in the dtype of ``w``.  The
-Cake programs always reduce in a fixed order, so ``deterministic=False`` currently runs
-the same programs.  Use :func:`grouped_det_gemm_wgrad` with ``out_dtype=torch.float32``
-for an fp32 weight gradient.
+Cake programs always reduce in a fixed order; there is no ``deterministic`` argument.
+Use :func:`grouped_det_gemm_wgrad` with ``out_dtype=torch.float32`` for an fp32 weight
+gradient.
 
 Prepared launches
 -----------------
@@ -80,13 +106,3 @@ capturable; the same prepared launch stays valid when new offsets or values are
 written into the bound tensors.  The package also carries plain functions of the same
 names as the entry points above; a build that vendors the package calls them
 directly, without the experimental marking and warning.
-
-Names before the deterministic-family rename
---------------------------------------------
-
-The package was ``flashinfer.experimental.cake_moe_grouped_gemm`` and its functions
-were ``grouped_gemm_fwd``, ``grouped_gemm_dgrad``, ``grouped_gemm_wgrad``,
-``cake_grouped_mm`` / ``CakeGroupedMm``, ``prepare_grouped_gemm_fwd`` /
-``prepare_grouped_gemm_dgrad`` / ``prepare_grouped_gemm_wgrad`` / ``GroupedGemmLaunch``
-and ``grouped_mm_bf16_cake``.  Those names remain as deprecated aliases that resolve
-to the very same objects; new code should use the ``*_det_*`` names above.

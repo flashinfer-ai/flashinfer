@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Benchmark the selectable-mode ragged BF16 MoE grouped GEMM on SM100/SM103/SM107.
+"""Benchmark the non-deterministic ragged BF16 MoE grouped GEMM on SM100/SM103/SM107.
 
 The 58 MoE projection rows of the deterministic package's benchmark: gate/up
 (N=4096, K=6144) and down (N=6144, K=2048) projections, E=4 with balanced /
@@ -72,7 +72,7 @@ fp32 ``main_grad``, with Megatron's ``grad_added_to_main_grad`` placeholder),
 (``mgX`` with ``zero_out_wgrad``), ``accX`` (the same into a bf16
 ``main_grad``: the composed route, a bf16 ``dW`` and the same-dtype add),
 ``det_acc`` (the deterministic package: its fp32 ``dW`` into a temporary, then
-``main_grad.add_``, the facade's deterministic ``accumulate=True`` route; in
+``main_grad.add_``, the deterministic weight gradient composed with the add; in
 the step and the backward, through a Function running the deterministic
 forward, data gradient and weight gradient) and ``det_mgB`` (the
 deterministic autograd wrapper's bf16 ``w.grad``, then the fp32
@@ -720,7 +720,7 @@ def _acc_wgrad(arm, t):
             "the placeholder-gradient arms have autograd rows only"
         )
     if arm in DET_ACC_ARMS:
-        # The deterministic package's dW (fp32: the facade's deterministic accumulate route; bf16:
+        # The deterministic package's dW (fp32: the composed deterministic accumulate; bf16:
         # Megatron's unfused path) into a temporary, then the fp32 add into main_grad.
         dtype = torch.float32 if arm == "det_acc" else torch.bfloat16
         tmp = torch.empty(mg32.shape, dtype=dtype, device=mg32.device)

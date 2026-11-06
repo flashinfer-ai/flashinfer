@@ -33,6 +33,29 @@ Numerics: fp32 tensor-core accumulation with one bf16 rounding at the store
 deterministic (no atomics; the split-K tail sums fp32 partials in a fixed
 order); `dW[e] == 0` exactly for empty groups.
 
+## Mode and dispatch rules
+
+This package is deterministic only; every public name carries `det`.
+
+| call | result |
+| --- | --- |
+| any entry point of this package or `flashinfer.grouped_mm.{grouped_det_gemm_*, cake_grouped_det_mm}` | the deterministic programs: fixed reduction order, bitwise reproducible run to run |
+| a `deterministic` argument (`True` or `False`), e.g. `cake_grouped_det_mm(x, w, offs, deterministic=False)` | `TypeError`: no deterministic entry takes one |
+| a fourth argument of `CakeGroupedDetMm.apply(x, w, offs)` (e.g. a stale `True` / `False` mode) | `TypeError` |
+| `torch.use_deterministic_algorithms(True)` (also `warn_only=True`) | no change: no alert, no warning |
+| `flashinfer.grouped_mm.grouped_mm_bf16(..., backend="cake")` | the deterministic forward (the forward programs of both Cake packages give the same bits) |
+
+The non-deterministic counterpart is the separate package
+`flashinfer.experimental.cake.cake_moe_grouped_gemm` and its facade
+`flashinfer.experimental.cake.grouped_mm`, which take only `deterministic=False`
+(`ValueError` otherwise, naming the deterministic entry of this package) and never
+route here. The names of this package before the deterministic-family rename
+(`flashinfer.experimental.cake_moe_grouped_gemm` with its submodules,
+`flashinfer.grouped_mm.cake`, and `grouped_gemm_*`, `prepare_grouped_gemm_*`,
+`GroupedGemmLaunch`, `CakeGroupedMm`, `cake_grouped_mm`, `grouped_mm_bf16_cake`
+here and in `flashinfer.grouped_mm`) were removed with no alias:
+`ModuleNotFoundError` / `AttributeError`.
+
 ## Usage
 
 ```python
@@ -92,11 +115,11 @@ opt-in and emits FlashInfer's `ExperimentalWarning` once, from the core API;
 it then hands off to `cake_backend.grouped_det_mm_bf16_cake`, which rejects the
 options the backend does not take and emits no warning itself.
 
-`cake_grouped_det_mm(x, w, offs, deterministic=True)` is a `torch.autograd.Function`
+`cake_grouped_det_mm(x, w, offs)` is a `torch.autograd.Function`
 wrapper (`CakeGroupedDetMm`): `backward` produces `x.grad` with the `dgrad`
 program and `w.grad` with the `wgrad` program in the dtype of `w`. The
-programs always reduce in a fixed order, so `deterministic=False` currently
-runs the same deterministic programs; `grouped_det_gemm_wgrad(..., out_dtype=torch.float32)`
+programs always reduce in a fixed order and there is no `deterministic`
+argument; `grouped_det_gemm_wgrad(..., out_dtype=torch.float32)`
 gives an fp32 weight gradient. `CakeGroupedDetMm` calls the three programs as
 plain functions; no torch custom op is registered.
 The wrapper launches the forward GEMM after `CakeGroupedDetMm.apply` returns,
@@ -105,7 +128,7 @@ that is after autograd saved `x`, `w` and `offs`, as for a built-in op. Under
 default), the recomputation therefore stops before this GEMM when these are
 the last saves of the innermost checkpointed region; a later save in that
 region (of its output or of any other tensor) makes it run, with the same
-bits. A direct `CakeGroupedDetMm.apply(x, w, offs, True)` launches inside
+bits. A direct `CakeGroupedDetMm.apply(x, w, offs)` launches inside
 `forward` and is always recomputed, as is the wrapper under `torch.jit.trace`
 and `torch.compile`.
 
@@ -349,7 +372,7 @@ call of the package's functions emits none of them.
 ## Tests and benchmark
 
 ```bash
-pytest tests/experimental/test_cake_moe_grouped_det_gemm.py tests/experimental/test_cake_moe_grouped_det_gemm_api.py tests/experimental/test_cake_moe_grouped_det_gemm_standalone.py tests/experimental/test_cake_moe_grouped_det_gemm_determinism.py tests/experimental/test_cake_moe_grouped_det_gemm_alias.py
+pytest tests/experimental/test_cake_moe_grouped_det_gemm.py tests/experimental/test_cake_moe_grouped_det_gemm_api.py tests/experimental/test_cake_moe_grouped_det_gemm_standalone.py tests/experimental/test_cake_moe_grouped_det_gemm_determinism.py
 python benchmarks/bench_cake_moe_grouped_det_gemm.py --help
 ```
 
@@ -359,7 +382,9 @@ reference (including an empty group, a one-row group, padded outputs,
 determinism and the fp32 output) and skips when no supported device or no
 registered program is present. `test_cake_moe_grouped_det_gemm_api.py` covers the
 core entry points of `flashinfer.grouped_mm` (the experimental marking, the
-once-only warnings and the `backend="cake"` route of `grouped_mm_bf16`).
+once-only warnings and the `backend="cake"` route of `grouped_mm_bf16`) and the
+mode rules above (the removed det-free names and paths, the `TypeError` of a
+`deterministic` argument, no change under torch's deterministic mode).
 `test_cake_moe_grouped_det_gemm_standalone.py` copies the package under another
 name into a CPU subprocess with `flashinfer` blocked and checks that it
 imports, raises its host-side errors without any warning and has its only
@@ -368,24 +393,11 @@ imports, raises its host-side errors without any warning and has its only
 data gradient, weight gradient in bf16 and fp32 at both k tiles with the tail
 reduce, the probed split of the data gradient) on fixed inputs and zeroed
 accumulators and requires bitwise-identical outputs, also across fresh
-processes. `test_cake_moe_grouped_det_gemm_alias.py` checks that the names
-before the rename resolve lazily to the same objects. The benchmark times the prepared
+processes. The benchmark times the prepared
 launches against `torch._grouped_mm`, a per-group cuBLAS loop and
 `flashinfer.grouped_mm.grouped_mm_bf16` on the MoE projection rows of the
 design (E = 4 ragged distributions, E = 8 / 16 / 32 balanced, fp32 weight
 gradients).
-
-## Names before the deterministic-family rename
-
-The package was `flashinfer.experimental.cake_moe_grouped_gemm`; its functions
-were `grouped_gemm_fwd`, `grouped_gemm_dgrad`, `grouped_gemm_wgrad`,
-`cake_grouped_mm` / `CakeGroupedMm`, `prepare_grouped_gemm_fwd` /
-`prepare_grouped_gemm_dgrad` / `prepare_grouped_gemm_wgrad` / `GroupedGemmLaunch`
-and `grouped_mm_bf16_cake`, and those of `flashinfer.grouped_mm` were
-`grouped_gemm_fwd`, `grouped_gemm_dgrad`, `grouped_gemm_wgrad` and
-`cake_grouped_mm`. The old package path (with its submodules) and the old names
-remain as deprecated aliases that resolve, on first use, to the very same
-objects; new code should use the `*_det_*` names.
 
 ## Limitations
 
