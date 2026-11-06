@@ -72,8 +72,8 @@ cake_build = cake_package("cake.cake_kda_train", "cake_build")
 cake_jit = cake_package("cake.cake_kda_train", "cake_jit")
 # The deterministic package: the same-input comparison point of the S1 cells (never a source of budgets) and the
 # source of the records this package copies.
-det_backend = cake_package("cake_kda_det_train", "cake_backend")
-det_jit = cake_package("cake_kda_det_train", "cake_jit")
+det_backend = cake_package("cake.cake_kda_det_train", "cake_backend")
+det_jit = cake_package("cake.cake_kda_det_train", "cake_jit")
 PACKAGE_DIR = Path(cake_jit.__file__).resolve().parent
 
 
@@ -3266,7 +3266,7 @@ def test_saved_set_version_4_fields_and_the_autograd_extras() -> None:
     # sets have the same format, and the backward reads either)
     assert KdaChunkSaved.__dataclass_fields__["deterministic"].default is False
     assert [f.name for f in dataclasses.fields(KdaChunkSaved)][:-1] == [
-        f.name for f in dataclasses.fields(det_backend.KdaDetChunkSaved)
+        f.name for f in dataclasses.fields(det_backend.CakeKDADetChunkSaved)
     ]
     # the in-kernel Q/K L2 norm's reciprocal norms ride last in both versions (the deterministic package's order)
     assert cake_backend._EXTRA_FIELDS == {
@@ -8541,10 +8541,10 @@ def _det_fwd_bwd(inputs, *, save_mode=None, replay=False):
     q, k, v, g, beta, cu, dout = (
         inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens", "dout")
     )
-    out, saved = det_backend.chunk_kda_det_fwd(
+    out, saved = det_backend.cake_kda_det_train_forward(
         q, k, v, g, beta, cu, scale=SCALE, save_for_backward=True, save_mode=save_mode
     )
-    grads = det_backend.chunk_kda_det_bwd(
+    grads = det_backend.cake_kda_det_train_backward(
         q, k, v, g, beta, cu, dout, saved=None if replay else saved, scale=SCALE
     )
     return out.clone(), {n: t.clone() for n, t in zip(GRAD_ORDER, grads, strict=True)}
@@ -9393,7 +9393,7 @@ def _rg_fwd(inputs, *, det=False, g=None, **kwargs):
     """The raw-mode forward of this package (``det``: of the deterministic package) on ``inputs`` (``g``: another
     view of the same raw gate)."""
     q, k, v, raw, beta, cu, _dout = _rg_ops(inputs)
-    fwd = det_backend.chunk_kda_det_fwd if det else chunk_kda_fwd
+    fwd = det_backend.cake_kda_det_train_forward if det else chunk_kda_fwd
     return fwd(
         q,
         k,
@@ -9411,7 +9411,7 @@ def _rg_bwd(inputs, saved, *, det=False, g=None, **kwargs):
     """The raw-mode backward of this package (``det``: of the deterministic package) from ``saved`` (``None``: the
     replay)."""
     q, k, v, raw, beta, cu, dout = _rg_ops(inputs)
-    bwd = det_backend.chunk_kda_det_bwd if det else chunk_kda_bwd
+    bwd = det_backend.cake_kda_det_train_backward if det else chunk_kda_bwd
     return bwd(
         q,
         k,
@@ -9428,9 +9428,9 @@ def _rg_bwd(inputs, saved, *, det=False, g=None, **kwargs):
 
 
 def _det_set(saved):
-    """This package's saved set as the deterministic package's ``KdaDetChunkSaved`` with the same fields and tensors,
+    """This package's saved set as the deterministic package's ``CakeKDADetChunkSaved`` with the same fields and tensors,
     as the facade's deterministic route hands it over (the deterministic entries take their own type only)."""
-    det_type = det_backend.KdaDetChunkSaved
+    det_type = det_backend.CakeKDADetChunkSaved
     return det_type(
         **{f.name: getattr(saved, f.name) for f in dataclasses.fields(det_type)}
     )
@@ -9470,7 +9470,7 @@ def _rg_leaves(inputs) -> list[torch.Tensor]:
 
 def _rg_autograd(leaves, cu, *, det=False, **kwargs) -> torch.Tensor:
     q, k, v, raw, beta, a_log, dt_bias = leaves
-    fn = det_backend.chunk_kda_det if det else chunk_kda
+    fn = det_backend.cake_kda_det if det else chunk_kda
     return fn(
         q,
         k,
@@ -9963,7 +9963,7 @@ def test_raw_gate_launch_sequences_are_the_deterministic_raw_mode(
                     launcher=_rg_recorder(nd_log),
                     deterministic=False,
                 ),
-                det_backend.KdaDetWorkspace.for_problem(
+                det_backend.CakeKDADetWorkspace.for_problem(
                     S,
                     N,
                     heads,

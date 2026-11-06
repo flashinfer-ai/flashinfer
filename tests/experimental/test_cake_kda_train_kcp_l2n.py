@@ -108,8 +108,8 @@ cake_jit = cake_package("cake.cake_kda_train", "cake_jit")
 det_kcp = cake_package("cake_kda_det_train_kcp", "cake_kcp")
 det_kcp_plan = cake_package("cake_kda_det_train_kcp", "cake_kcp_plan")
 det_kcp_jit = cake_package("cake_kda_det_train_kcp", "cake_kcp_jit")
-det_backend = cake_package("cake_kda_det_train", "cake_backend")
-det_jit = cake_package("cake_kda_det_train", "cake_jit")
+det_backend = cake_package("cake.cake_kda_det_train", "cake_backend")
+det_jit = cake_package("cake.cake_kda_det_train", "cake_jit")
 
 D = cake_kcp.D
 SCALE = cake_kcp.SCALE

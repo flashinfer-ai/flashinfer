@@ -1086,7 +1086,7 @@ def _forbidden(module: str) -> bool:
 
 
 def test_the_package_never_imports_a_deterministic_package() -> None:
-    """Statically: no module of the package imports ``flashinfer.experimental.cake_kda_det_train`` /
+    """Statically: no module of the package imports ``flashinfer.experimental.cake.cake_kda_det_train`` /
     ``cake_kda_det_train_kcp`` (or a module of them) or the compatibility package
     ``flashinfer.experimental.cake_kda_train`` -- a relative ``..cake_kda_train`` would bind the latter and launch
     the deterministic records; the single-rank package it imports is ``flashinfer.experimental.cake.cake_kda_train``.

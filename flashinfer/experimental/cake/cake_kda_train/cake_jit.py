@@ -15,7 +15,7 @@ limitations under the License.
 
 Registry and loader glue of the Cake packed KDA chunked training kernels
 (SM100 / SM103 / SM107), the ``deterministic=False`` package: the registry of
-``flashinfer.experimental.cake_kda_det_train`` with the records of its fused
+``flashinfer.experimental.cake.cake_kda_det_train`` with the records of its fused
 gradient and GLM intra stages re-routed to the ``S1`` pairs on the rows below
 in g mode with the in-kernel Q/K L2 norm off (the other records, their
 programs and their rules, and those of raw mode and of the l2n modes, are the

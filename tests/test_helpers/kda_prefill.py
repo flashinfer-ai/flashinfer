@@ -140,6 +140,38 @@ def _make_inputs(
     }
 
 
+def _strided_qkv(inputs, *, independent):
+    shape = inputs["q"].shape
+    batch, tokens, heads, dim = shape
+    width = heads * dim
+    if independent:
+        return {
+            name: torch.empty_strided(
+                shape,
+                (tokens * pitch, pitch, dim, 1),
+                dtype=inputs[name].dtype,
+                device=inputs[name].device,
+            ).copy_(inputs[name])
+            for name, pitch in zip(
+                ("q", "k", "v"),
+                (width + 8, 2 * width + 16, 3 * width + 24),
+                strict=True,
+            )
+        }
+    carrier = torch.full(
+        (batch, tokens, 3 * width + 8),
+        float("nan"),
+        dtype=inputs["q"].dtype,
+        device=inputs["q"].device,
+    )
+    return {
+        name: carrier[..., index * width : (index + 1) * width]
+        .view(shape)
+        .copy_(inputs[name])
+        for index, name in enumerate(("q", "k", "v"))
+    }
+
+
 def _reference(inputs, *, lower_bound=-5.0, scale=None, checkpoint_every_n_tokens=0):
     q = inputs["q"]
     batch_size, seq_len, num_heads, head_dim = q.shape

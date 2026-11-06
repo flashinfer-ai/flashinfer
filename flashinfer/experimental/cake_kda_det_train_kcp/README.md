@@ -5,7 +5,7 @@ Attention (KDA) chunked training forward and backward: the packed batch is
 split over the ranks of a `torch.distributed` process group and the
 per-document state recurrences cross the rank boundaries exactly.  The public
 entry points are in `flashinfer/cake_kda_det_train_kcp.py`; each rank runs the
-chunk stages of `flashinfer.experimental.cake_kda_det_train` at its own shape.
+chunk stages of `flashinfer.experimental.cake.cake_kda_det_train` at its own shape.
 Both the API and the backend are experimental: no compatibility guarantee.
 
 The path is deterministic: the same inputs, hardware, plan and process group
@@ -276,7 +276,7 @@ others.  The phase comes from `torch._C._current_graph_task_id()`; a torch
 without it refuses the handle.
 
 One halo exchange for a layer's q / k / v convolutions:
-`cake_causal_conv1d_det_multi_kcp((xq, xk, xv), (wq, wk, wv), ctx)` returns the
+`cake_causal_conv1d_det_kcp_multi((xq, xk, xv), (wq, wk, wv), ctx)` returns the
 three outputs bitwise equal to three `cake_causal_conv1d_det_kcp` calls (outputs,
 `dx` and `dweight`), but its forward and its backward each issue one halo
 collective instead of three: the history rows of the three tensors travel side
@@ -287,7 +287,7 @@ the layer's `"kda"` entry, so the checkpointed layer above needs one handle:
 
 ```python
 def layer(xq, xk, xv, g, beta, h):
-    q, k, v = cake_causal_conv1d_det_multi_kcp((xq, xk, xv), (wq, wk, wv), ctx, recompute_handle=h)
+    q, k, v = cake_causal_conv1d_det_kcp_multi((xq, xk, xv), (wq, wk, wv), ctx, recompute_handle=h)
     ...
     return chunk_kda_det_kcp(q, k, v, g, beta, ctx, recompute_handle=h)
 
@@ -303,7 +303,7 @@ Raw gate mode on the KCP route (issue #7816): the three KDA entry points take
 the single-rank keywords `use_gate_in_kernel=True, A_log=, dt_bias=,
 lower_bound=` with the same operand rules (`g` is the rank's raw BF16 gate,
 any view under the stride rule of "Raw gate mode" in the single-rank README,
-`flashinfer/experimental/cake_kda_det_train/README.md`, never copied;
+`flashinfer/experimental/cake/cake_kda_det_train/README.md`, never copied;
 `A_log` / `dt_bias` are the full parameters, the same tensors on every rank).
 
 ```python
