@@ -622,7 +622,8 @@ result = scale(x, 2.0, skip_check=True)
 For a call mode that replaces the backends altogether and validates its own inputs, pass `bypass=`: a cheap
 predicate over the call's arguments. When it returns True the wrapper runs no requirement check, heuristic or
 capability lookup and calls the function directly (even under `backend="auto"`, where `skip_check` would still run
-the heuristic). `mm_bf16` uses it for `batch_invariant=True`:
+the heuristic). The GEMM APIs with a batch-invariant mode (`mm_bf16`, `bmm_fp8`, `mm_mxfp8`, `mm_fp4`) use it for
+`batch_invariant=True`:
 
 ```python
 @backend_requirement(
