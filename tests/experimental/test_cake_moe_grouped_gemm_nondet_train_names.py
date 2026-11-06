@@ -267,3 +267,38 @@ def test_flashinfer_binds_the_module_on_first_access():
     assert getattr(flashinfer, MODULE) is _module(FACADE)
     for name in _module(FACADE).__all__:
         assert name not in flashinfer._LAZY_EXPORTS, name
+
+
+def test_the_shared_mode_name_checks():
+    """The shared Cake mode-name checks (``tests/test_helpers/cake_mode_names.py``):
+    the mode word in every public name and in order, no ``deterministic``
+    argument, one name per object across ``flashinfer``, the module and its
+    backend, and the former paths and names failing at import in a fresh
+    interpreter."""
+    from tests.test_helpers.cake_mode_names import assert_cake_mode_module
+
+    import flashinfer
+
+    forwards = [
+        (name, getattr(_module(f"{PACKAGE}.{sub}" if sub else PACKAGE), name))
+        for name, sub in PUBLIC.items()
+    ]
+    former = [
+        (host, name)
+        for host in NAME_HOSTS
+        for name in FORMER_NAMES + EXTRA_FORMER_NAMES.get(host, ())
+    ]
+    assert_cake_mode_module(
+        _module(FACADE),
+        MODE,
+        namespaces=(
+            flashinfer,
+            _module(PACKAGE),
+            _module(f"{PACKAGE}.cake_autograd"),
+            _module(f"{PACKAGE}.cake_backend"),
+        ),
+        forwards=forwards,
+        old_modules=REMOVED_MODULES,
+        old_names=former,
+        cwd=Path(flashinfer.__file__).resolve().parent.parent,
+    )
