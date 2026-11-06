@@ -53,10 +53,10 @@ module checks:
   deterministic backward workspace serves the backward; a deterministic prepare
   handle is refused by ``cake_mhc_nondet_train_finish``; a hidden size runs
   exactly where the deterministic package runs it;
-* non-deterministic training composed with the model's head of the
-  deterministic package (``flashinfer.cake_mhc_det_train.cake_mhc_det_train_head``,
-  the stream mean of the last layer): the gradients reach every leaf through
-  the head and equal the deterministic training and head's.
+* non-deterministic training composed with the model's deterministic head
+  (``flashinfer.cake_mhc_head_det_train.cake_mhc_head_det``, the stream mean
+  of the last layer): the gradients reach every leaf through the head and
+  equal the deterministic training and head's.
 
 The numerical contract of the non-deterministic backward is
 ``test_cake_mhc_nondet_train.py``'s.
@@ -77,10 +77,11 @@ from pathlib import Path
 import pytest
 import torch
 
-import flashinfer.experimental.cake.cake_mhc_det_train as det_backend
 import flashinfer.cake_mhc_nondet_train as facade
+import flashinfer.experimental.cake.cake_mhc_det_train as det_backend
 import flashinfer.experimental.cake.cake_mhc_nondet_train as backend
 from flashinfer import cake_mhc_det_train as det_facade
+from flashinfer import cake_mhc_head_det_train as head_facade
 from flashinfer.api_logging import ExperimentalWarning
 from flashinfer.experimental.cake.cake_mhc_det_train import cake_jit as det_loader
 from flashinfer.experimental.cake.cake_mhc_nondet_train import cake_jit as loader
@@ -1035,7 +1036,7 @@ def test_hidden_sizes_follow_the_device(hidden: int) -> None:
 
 def _head_connections(prepare, finish, i: dict, layers: list, **kwargs) -> tuple:
     """Two connections of ``prepare`` / ``finish`` (``layers``: their ``(fn, scale, base)``; the branch ``B = U +
-    B_0``), then the model's head ``cake_mhc_det_train_head`` (the stream mean of the last connection's ``Y``) under
+    B_0``), then the model's head ``cake_mhc_head_det`` (the stream mean of the last connection's ``Y``) under
     the loss ``sum(head * dU)``: ``(head output, [X.grad, *(fn, scale, base).grad per connection])``."""
     X = i["X"].clone().requires_grad_(True)
     params = [[p.clone().requires_grad_(True) for p in layer] for layer in layers]
@@ -1043,7 +1044,7 @@ def _head_connections(prepare, finish, i: dict, layers: list, **kwargs) -> tuple
     for fn, scale, base in params:
         U, handle = prepare(x, fn, scale, base, **kwargs)
         x = finish(x, (U.float() + i["B"].float()).to(BF16), handle)
-    head = det_facade.cake_mhc_det_train_head(x)
+    head = head_facade.cake_mhc_head_det(x)
     (head.float() * i["dU"].float()).sum().backward()
     return head.detach(), [X.grad, *[p.grad for layer in params for p in layer]]
 
@@ -1054,14 +1055,14 @@ def _head_connections(prepare, finish, i: dict, layers: list, **kwargs) -> tuple
 def test_nd_training_composes_with_the_stream_mean_head(
     T: int, save_stats: bool, hidden: int
 ) -> None:
-    """Non-deterministic training feeding the deterministic package's model head
-    (``flashinfer.cake_mhc_det_train.cake_mhc_det_train_head``, ``mean_i X[:, i, :]`` of the last connection's
+    """Non-deterministic training feeding the model's deterministic head
+    (``flashinfer.cake_mhc_head_det_train.cake_mhc_head_det``, ``mean_i X[:, i, :]`` of the last connection's
     four streams), at every hidden size the device routes: two connections, the head and a loss on its output.  The
     gradients reach every leaf through the head (finite, non-zero), the connections' handles are the backend's, and
     the head output and the ``X`` / ``scale`` / ``base`` gradients are bitwise those of the deterministic training
     and the same head; each ``fn`` gradient is within FP32 rounding of the deterministic one (rel-L2 <=
     ``DFN_REL_L2_MAX``)."""
-    if not det_facade.is_cake_mhc_det_train_head_supported(_device(), hidden):
+    if not head_facade.is_cake_mhc_head_det_train_supported(_device(), hidden):
         pytest.skip(f"the head has no program of hidden {hidden} on {_arch()}")
     i = _inputs(T, seed=SEED + 40, hidden=hidden)
     second = _inputs(1, seed=SEED + 41, hidden=hidden)

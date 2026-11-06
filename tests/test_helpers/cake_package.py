@@ -24,6 +24,7 @@ PACKAGES: dict[str, str] = {
     "cake_fused_qk_rope_append": "flashinfer.cake_fused_qk_rope_append_backend",
     "cake_sage_block_sparse_attention": "flashinfer.cake_sage_block_sparse_attention_backend",
     "cake.cake_mhc_det_train": "flashinfer.experimental.cake.cake_mhc_det_train",
+    "cake.cake_mhc_head_det_train": "flashinfer.experimental.cake.cake_mhc_head_det_train",
     "cake_dsa_train": "flashinfer.experimental.cake_dsa_train",
     "cake_dsa_indexer_det": "flashinfer.experimental.cake_dsa_indexer_det",
     "cake_dsa_indexer": "flashinfer.experimental.cake_dsa_indexer",

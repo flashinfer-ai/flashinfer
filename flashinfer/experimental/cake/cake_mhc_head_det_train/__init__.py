@@ -13,13 +13,13 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Backend of the Cake mHC training head of :mod:`flashinfer.cake_mhc_det_train`: the
-stream mean ``Y = mean_i X[:, i, :]`` of the four residual streams and its
-gradient (hidden 4096, 5120 and 7168; SM100 / SM103 / SM107) as one
+Backend of :mod:`flashinfer.cake_mhc_head_det_train`, the Cake mHC training
+head: the stream mean ``Y = mean_i X[:, i, :]`` of the four residual streams
+and its gradient (hidden 4096, 5120 and 7168; SM100 / SM103 / SM107) as one
 self-contained package (host API bodies, the ``cake_jit`` loader and the
 generated CUDA sources under ``csrc/``).  The stable,
 ``@flashinfer_api``-decorated entry points and the user-facing documentation
-live in :mod:`flashinfer.cake_mhc_det_train`; import that module.
+live in :mod:`flashinfer.cake_mhc_head_det_train`; import that module.
 """
 
 from __future__ import annotations
@@ -75,7 +75,7 @@ def _device_arch(device: torch.device) -> str:
     return arch
 
 
-def is_cake_mhc_det_train_head_supported(
+def is_cake_mhc_head_det_train_supported(
     device: torch.device, hidden: Optional[int] = None
 ) -> bool:
     """Whether ``device`` (and optionally the hidden size ``hidden``) has the exported head programs."""
@@ -207,11 +207,11 @@ def _run(
         run(*args)
 
 
-def cake_mhc_det_train_head_forward(
+def cake_mhc_head_det_train_forward(
     X: torch.Tensor, *, out: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
     """``Y = BF16(((X0 + X1) + X2 + X3) * 0.25)``, bit-identical to ``X.mean(dim=1)``; see
-    :func:`flashinfer.cake_mhc_det_train.cake_mhc_det_train_head_forward`."""
+    :func:`flashinfer.cake_mhc_head_det_train.cake_mhc_head_det_train_forward`."""
 
     rows, hidden, device, arch = _rows_hidden(X, "X", 3)
     X = _validate(X, "X", shape=(rows, STREAMS, hidden), device=device)
@@ -226,14 +226,14 @@ def cake_mhc_det_train_head_forward(
     return Y
 
 
-def cake_mhc_det_train_head_backward(
+def cake_mhc_head_det_train_backward(
     dY: torch.Tensor,
     *,
     dX: Optional[torch.Tensor] = None,
     accumulate: bool = False,
 ) -> torch.Tensor:
     """``dX[:, i, :] = BF16(dY * 0.25)`` for each stream, or ``dX += BF16(dY * 0.25)``; see
-    :func:`flashinfer.cake_mhc_det_train.cake_mhc_det_train_head_backward`."""
+    :func:`flashinfer.cake_mhc_head_det_train.cake_mhc_head_det_train_backward`."""
 
     rows, hidden, device, arch = _rows_hidden(dY, "dY", 2)
     dY = _validate(dY, "dY", shape=(rows, hidden), device=device)
@@ -251,16 +251,16 @@ def cake_mhc_det_train_head_backward(
     return dX
 
 
-class CakeMHCDetTrainHeadFunction(torch.autograd.Function):
-    """Autograd node of the head: forward :func:`cake_mhc_det_train_head_forward`,
-    backward :func:`cake_mhc_det_train_head_backward`.  The backward needs only the
+class CakeMHCHeadDetFunction(torch.autograd.Function):
+    """Autograd node of the head: forward :func:`cake_mhc_head_det_train_forward`,
+    backward :func:`cake_mhc_head_det_train_backward`.  The backward needs only the
     incoming gradient, so the node saves no tensor: an activation checkpoint
     around it recomputes nothing for its backward and keeps nothing alive."""
 
     @staticmethod
     def forward(ctx: Any, X: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
         ctx.set_materialize_grads(False)
-        return cake_mhc_det_train_head_forward(X)
+        return cake_mhc_head_det_train_forward(X)
 
     @staticmethod
     def backward(ctx: Any, dY: Optional[torch.Tensor]) -> Optional[torch.Tensor]:  # type: ignore[override]
@@ -271,22 +271,22 @@ class CakeMHCDetTrainHeadFunction(torch.autograd.Function):
         dY = dY.contiguous()
         if dY.data_ptr() % TENSOR_ALIGNMENT_BYTES:
             dY = dY.clone()
-        return cake_mhc_det_train_head_backward(dY)
+        return cake_mhc_head_det_train_backward(dY)
 
 
-def cake_mhc_det_train_head(X: torch.Tensor) -> torch.Tensor:
-    """Autograd-enabled :func:`cake_mhc_det_train_head_forward`; see
-    :func:`flashinfer.cake_mhc_det_train.cake_mhc_det_train_head`."""
+def cake_mhc_head_det(X: torch.Tensor) -> torch.Tensor:
+    """Autograd-enabled :func:`cake_mhc_head_det_train_forward`; see
+    :func:`flashinfer.cake_mhc_head_det_train.cake_mhc_head_det`."""
 
-    return CakeMHCDetTrainHeadFunction.apply(X)
+    return CakeMHCHeadDetFunction.apply(X)
 
 
 __all__ = [
     "ARCHES",
     "SUPPORTED_COMPUTE_CAPABILITIES",
-    "CakeMHCDetTrainHeadFunction",
-    "cake_mhc_det_train_head",
-    "cake_mhc_det_train_head_backward",
-    "cake_mhc_det_train_head_forward",
-    "is_cake_mhc_det_train_head_supported",
+    "CakeMHCHeadDetFunction",
+    "cake_mhc_head_det",
+    "cake_mhc_head_det_train_backward",
+    "cake_mhc_head_det_train_forward",
+    "is_cake_mhc_head_det_train_supported",
 ]

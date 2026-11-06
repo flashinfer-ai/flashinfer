@@ -17,7 +17,7 @@ Names of the non-deterministic mHC training module ``flashinfer.cake_mhc_nondet_
 (FlashInfer issue #8928): every exported name but the ALL_CAPS constants carries
 the mode token ``nondet`` (``Nondet`` in a class name), no public callable takes
 a ``deterministic`` keyword (the ``forward`` / ``backward`` of the autograd
-``Function`` classes included), and the former modules and names of the mode
+``Function`` classes included), and the former mHC training modules and names
 are gone (no module, no alias, no top-level name).
 """
 
@@ -33,15 +33,27 @@ import flashinfer
 import flashinfer.cake_mhc_nondet_train as module
 
 MODE = "nondet"
-# The former modules of the mode and FlashInfer 0.7.3's package names: importing them fails.
+# The former modules of the mHC training modes (FlashInfer 0.7.3's package names, the backend paths before
+# #8928, the former non-deterministic module): importing them fails.
 REMOVED_MODULES = (
-    "flashinfer.experimental.cake.cake_mhc_train",
-    "flashinfer.experimental.cake.cake_mhc_train_backend",
     "flashinfer.cake_mhc_train",
     "flashinfer.cake_mhc_train_backend",
+    "flashinfer.cake_mhc_train_head_backend",
+    "flashinfer.cake_mhc_det_train_backend",
+    "flashinfer.cake_mhc_det_train_head_backend",
+    "flashinfer.experimental.cake.cake_mhc_train",
+    "flashinfer.experimental.cake.cake_mhc_train_backend",
 )
-# The former names of the mode: their prefixes, and the generic route helper.
-REMOVED_PREFIXES = ("cake_mhc_train_", "is_cake_mhc_train_", "CakeMHCTrain")
+# The former names: their prefixes (0.7.3's names without the mode word, the classes and head names before
+# #8928) and the generic route helpers.
+REMOVED_PREFIXES = (
+    "cake_mhc_train_",
+    "is_cake_mhc_train_",
+    "CakeMHCTrain",
+    "CakeMHCDetTrain",
+    "cake_mhc_det_train_head",
+    "is_cake_mhc_det_train_head",
+)
 REMOVED_NAMES = ("route_key", "route_modules")
 
 _CHILD = r"""

@@ -42,21 +42,26 @@ MODULE = "flashinfer.cake_mhc_det_train"
 BACKEND = "flashinfer.experimental.cake.cake_mhc_det_train"
 KEY = "cake.cake_mhc_det_train"
 REPO = Path(__file__).resolve().parents[3]
-# FlashInfer 0.7.3's package names of this mode and the former backend path: importing them fails.
+# The former modules of the mHC training modes (FlashInfer 0.7.3's package names, the backend paths before
+# #8928, the former non-deterministic module): importing them fails.
 REMOVED_MODULES = (
     "flashinfer.cake_mhc_train",
     "flashinfer.cake_mhc_train_backend",
     "flashinfer.cake_mhc_train_head_backend",
     "flashinfer.cake_mhc_det_train_backend",
+    "flashinfer.cake_mhc_det_train_head_backend",
+    "flashinfer.experimental.cake.cake_mhc_train",
+    "flashinfer.experimental.cake.cake_mhc_train_backend",
 )
-# The former names: their prefixes (0.7.3's names without the mode word, the classes before #8928) and the
-# generic route helpers.
+# The former names: their prefixes (0.7.3's names without the mode word, the classes and head names before
+# #8928) and the generic route helpers.
 REMOVED_PREFIXES = (
     "cake_mhc_train_",
     "is_cake_mhc_train_",
     "CakeMHCTrain",
-    "CakeMHCDetTrainPrepare",
-    "CakeMHCDetTrainFinish",
+    "CakeMHCDetTrain",
+    "cake_mhc_det_train_head",
+    "is_cake_mhc_det_train_head",
 )
 REMOVED_NAMES = ("route_key", "route_modules")
 

@@ -268,6 +268,6 @@
       ]
     }
   ],
-  "package": "flashinfer.cake_mhc_det_train_head_backend",
+  "package": "flashinfer.experimental.cake.cake_mhc_head_det_train",
   "schema": "cake-build/1"
 }
