@@ -379,9 +379,11 @@ def mxfp8_quantize(
     is_sf_swizzled_layout: bool = True,
     alignment: int = 32,
     enable_pdl: Optional[bool] = None,
-    backend: Literal["cuda", "cute-dsl"] = "cuda",
+    backend: Literal["auto", "cuda", "cute-dsl"] = "auto",
     sf_swizzle_layout: Optional[SfLayout] = None,
     rank_preserving: bool = False,
+    *,
+    batch_invariant: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Quantize input tensor to MxFP8 format.
 
@@ -404,10 +406,12 @@ def mxfp8_quantize(
     enable_pdl : bool, optional
         Whether to enable Programmatic Dependent Launch.  Auto-detected
         from device capability (SM >= 9.0) when ``None``.
-    backend : {"cuda", "cute-dsl"}
+    backend : {"auto", "cuda", "cute-dsl"}
         Backend to use:
 
-        - ``"cuda"``: stable JIT-compiled CUDA kernel (default).
+        - ``"auto"`` (default): ``"cuda"``, or the batch-invariant kernel
+          under ``batch_invariant=True`` (which requires ``"auto"``).
+        - ``"cuda"``: stable JIT-compiled CUDA kernel.
         - ``"cute-dsl"``: CuTe-DSL kernel (SM100+, **experimental**).
     sf_swizzle_layout : SfLayout, optional
         Swizzle layout for scale factors; when supplied this overrides
@@ -426,6 +430,16 @@ def mxfp8_quantize(
           ``input[i]``.  The per-batch form is the layout batched consumers
           such as :func:`flashinfer.gemm.bmm_mxfp8` read.  Only
           ``backend="cuda"`` supports it.
+    batch_invariant : bool
+        ``True`` runs the batch-invariant MXFP8 quantization class in place
+        of the backends (requires ``backend="auto"``): a row's bits depend on
+        its values alone, not on the batch it is quantized in, its position,
+        the configuration chosen or the SM count, and the result is
+        deterministic. The dataflow is TransformerEngine's MXFP8 chain,
+        fingerprinted as ``flashinfer.batch_invariant.fingerprint("mxfp8_quantize")``.
+        Unsupported inputs raise
+        :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`
+        instead of falling back. See ``flashinfer/batch_invariant/README.md``.
 
     Returns
     -------
@@ -474,15 +488,34 @@ def mxfp8_quantize(
     """
     sf_vec_size = 32
 
-    assert input.shape[-1] % sf_vec_size == 0
-    assert backend in ("cuda", "cute-dsl"), (
-        f"backend must be 'cuda' or 'cute-dsl', got '{backend}'"
-    )
-
     if sf_swizzle_layout is None:
         sf_swizzle_layout = (
             SfLayout.layout_128x4 if is_sf_swizzled_layout else SfLayout.layout_linear
         )
+    if batch_invariant:
+        if rank_preserving:
+            raise NotImplementedError(
+                "mxfp8_quantize: rank_preserving=True is not supported with batch_invariant=True."
+            )
+        if backend != "auto":
+            raise ValueError(
+                "mxfp8_quantize: batch_invariant=True requires backend='auto' "
+                f"(got backend={backend!r})"
+            )
+        from ..batch_invariant.quantization.mx_api import (
+            mxfp8_quantize_batch_invariant,
+        )
+
+        return mxfp8_quantize_batch_invariant(
+            input, sf_swizzle_layout, alignment, enable_pdl
+        )
+
+    assert input.shape[-1] % sf_vec_size == 0
+    assert backend in ("auto", "cuda", "cute-dsl"), (
+        f"backend must be 'auto', 'cuda' or 'cute-dsl', got '{backend}'"
+    )
+    if backend == "auto":
+        backend = "cuda"
 
     if rank_preserving and backend != "cuda":
         raise NotImplementedError(

@@ -33,7 +33,8 @@ The delivered architectures, world sizes and carriers are the loader's tables
 (``flashinfer.jit.cake_fp8_rowwise_gemm_allreduce``: ``ROUTES``, ``COMM_MODES``,
 ``GEOMETRY``). Operands are contiguous CUDA tensors: ``a`` ``[M, K_l]`` and ``w``
 ``[N, K_l]`` in ``torch.float8_e4m3fn``, ``a_scale`` ``[M]`` and ``w_scale``
-``[N]`` in fp32, ``N`` a positive multiple of the architecture's column tile,
+``[N]`` in fp32 (``a``, ``w``, ``w_scale`` and ``out`` start at a 16-byte
+aligned address), ``N`` a positive multiple of 256 and at most ``134184960``,
 ``K_l`` a positive multiple of 128, any positive ``M`` with ``M * N <= 2**30``.
 Every rank passes the same ``M``, ``N`` and ``K_l`` (a mismatch is undefined
 behaviour of the collective and surfaces as a bounded-wait trap). The
@@ -221,6 +222,20 @@ def _check_tensor(value: Any, name: str, dtype: torch.dtype, ndim: int) -> None:
         raise ValueError(f"{name} must be a CUDA tensor, got {value.device}")
 
 
+# The kernels read w_scale and write out with 8/16-byte vector accesses, and
+# reach a, w and out through TMA tensor maps; both need a 16-byte aligned base.
+_ALIGN_BYTES = 16
+
+
+def _check_aligned(value: Any, name: str) -> None:
+    offset = int(value.data_ptr()) % _ALIGN_BYTES
+    if offset:
+        raise ValueError(
+            f"{name} must start at a {_ALIGN_BYTES}-byte aligned address, "
+            f"got data_ptr % {_ALIGN_BYTES} == {offset}"
+        )
+
+
 def _delivered_arch(device_index: int) -> str:
     """The delivered architecture of ``device_index``; raises naming the capability otherwise."""
 
@@ -256,6 +271,8 @@ def _validate(
     _check_tensor(w_scale, "w_scale", torch.float32, 1)
     if len({a.device, w.device, a_scale.device, w_scale.device}) != 1:
         raise ValueError("a, a_scale, w and w_scale must share one CUDA device")
+    for value, name in ((a, "a"), (w, "w"), (w_scale, "w_scale")):
+        _check_aligned(value, name)
     m, k_l = (int(dim) for dim in a.shape)
     n = int(w.shape[0])
     if int(w.shape[1]) != k_l:
@@ -304,6 +321,7 @@ def _output(
         raise ValueError("out must be a bfloat16 tensor on the operands' CUDA device")
     if tuple(out.shape) != (call.m, call.n) or not out.is_contiguous():
         raise ValueError(f"out must be a contiguous [{call.m}, {call.n}] tensor")
+    _check_aligned(out, "out")
     return out
 
 
@@ -757,10 +775,10 @@ def fp8_rowwise_gemm_allreduce_cake(
     ``w`` its ``[N, K_l]`` FP8 weight shard, ``a_scale`` / ``w_scale`` the fp32
     row / column scales, and the result is the reduced ``[M, N]`` bfloat16
     product on every rank: a new tensor, or ``out`` when the caller provides a
-    contiguous tensor of that shape, dtype and device. The first call of a
-    group for a given ``N`` (and the first call with more rows than any earlier
-    call) is a collective that sizes the workspace; later calls are
-    asynchronous.
+    contiguous, 16-byte aligned tensor of that shape, dtype and device. The
+    first call of a group for a given ``N`` (and the first call with more rows
+    than any earlier call) is a collective that sizes the workspace; later
+    calls are asynchronous.
     """
 
     if backend != "cake":

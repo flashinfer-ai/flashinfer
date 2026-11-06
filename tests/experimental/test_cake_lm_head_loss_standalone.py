@@ -299,7 +299,7 @@ def test_package_names_flashinfer_only_in_the_jit_fallback():
 def test_the_loader_and_header_are_the_deterministic_packages_bytes():
     """``cake_build.py`` (and, once rendered, ``csrc/cake_ffi_checks.h``) are the shared ``cake-build/1`` files, byte
     for byte the deterministic package's (read from the repository, not imported)."""
-    det = PACKAGE_DIR.parents[1] / "cake_lm_head_det_loss"
+    det = PACKAGE_DIR.parent / "cake_lm_head_det_train"
     assert (PACKAGE_DIR / "cake_build.py").read_bytes() == (
         det / "cake_build.py"
     ).read_bytes()

@@ -324,7 +324,8 @@ class BatchedGemmConfig:
 
     Matches TRTLLM-gen's ``tmemLdstMaxNumRegs`` control. Both the transposed
     ``16x256b`` and non-transposed ``32x32b`` epilogues split a logical
-    fragment into the largest legal loads that do not exceed this cap.
+    fragment into the largest legal loads that do not exceed this cap. The
+    DeepSeek FP8 epilogues are exempt and always issue one full-width load.
     """
 
     mma_k: int = 64
@@ -1681,6 +1682,12 @@ class BatchedGemmConfig:
         than one instruction under the configured register cap.
         """
         total_regs_per_slice = max(1, self.epi_tile_n // 2)
+        # The DeepSeek epilogue re-reads the accumulator every K block, so one
+        # wide load per slice (as before the cap) keeps the epilogue warps from
+        # falling behind the MMA at epi_tile_n=128; two half loads cost ~25%.
+        if self.use_deepseek_fp8:
+            return max(4, total_regs_per_slice)
+
         width_limit = min(total_regs_per_slice, self.tmem_ldst_max_num_regs)
         num_regs = 1 << (width_limit.bit_length() - 1)
         while total_regs_per_slice % num_regs != 0:
@@ -1859,6 +1866,30 @@ class BatchedGemmConfig:
         if self.uses_16bit_gated_tma_c_scratch:
             return False
         return not self.is_persistent and not self.has_cast_a
+
+    @property
+    def tmem_alloc_blocks_second_cta(self) -> bool:
+        """True when the TMEM allocation leaves no room for a second CTA on the SM.
+
+        ``tcgen05.alloc`` blocks until the requested columns are free, so a
+        second resident CTA could only wait for the first one to finish.
+        """
+        return 2 * self.tmem_alloc_cols > self.tmem_capacity_columns
+
+    @property
+    def smem_single_cta_floor_bytes(self) -> int:
+        """Dynamic-SMEM floor that limits residency to one CTA per SM (0 = none).
+
+        Applied only when :attr:`tmem_alloc_blocks_second_cta` holds.  Requesting
+        more than half of the SM's shared memory makes the hardware block
+        scheduler see the one-CTA limit that TMEM already imposes, instead of
+        placing a second CTA that spins in ``tcgen05.alloc`` next to the running
+        one.  Smaller footprints (16-bit gated FC1 epilogue scratch, narrow
+        tiles) otherwise drop below that threshold on SM100.
+        """
+        if not self.tmem_alloc_blocks_second_cta:
+            return 0
+        return self.smem_capacity_bytes // 2 + 1
 
     @property
     def tmem_alloc_cols(self) -> int:

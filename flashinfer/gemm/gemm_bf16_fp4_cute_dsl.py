@@ -19,7 +19,7 @@ from ..fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
     map_to_hybrid_bucket_uncapped,
 )
-from ..utils import _get_cache_buf, get_compute_capability, get_device_sm_count
+from ..utils import _get_stream_cache_buf, get_compute_capability, get_device_sm_count
 from .gemm_base import _check_cute_dsl_availability
 from .gemm_bf16_fp4 import _cute_dsl_uses_sm100_layout, _unswizzle_sf_128x4
 
@@ -1012,6 +1012,35 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
             # index must not replay on a different SM count.
             return (out_dtype, n, k, get_device_sm_count(a.device))
 
+        def validate_tactic(self, inputs: List[torch.Tensor], tactic: int) -> bool:
+            """Reject a cached GEMV tactic outside its single-row domain."""
+            return self._validate_tactic_for_m(inputs, tactic, int(inputs[0].shape[0]))
+
+        def validate_tactic_for_profile(
+            self, inputs: List[torch.Tensor], tactic: int, profile: OptimizationProfile
+        ) -> bool:
+            """Validate a warm bucket against its profiled row count."""
+            return self._validate_tactic_for_m(
+                inputs, tactic, int(profile.get_opt_shapes()[0][0])
+            )
+
+        def _validate_tactic_for_m(
+            self, inputs: List[torch.Tensor], tactic: int, m: int
+        ) -> bool:
+            if tactic == -1:
+                return True
+            a, b, _, _, _, _, block_size = inputs
+            n = int(b.shape[1]) // 2
+            k = int(b.shape[0]) * int(block_size)
+            configs = _bf16_fp4_cute_dsl_tactic_configs(
+                n, k, get_device_sm_count(a.device)
+            )
+            if not 0 <= tactic < len(configs):
+                return False
+            return configs[tactic][7] != "gemv" or (
+                m == 1 and get_compute_capability(a.device)[0] == 12
+            )
+
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
@@ -1096,13 +1125,13 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
                     splits, a.dtype, out_dtype, enable_pdl=enable_pdl
                 )
                 if splits > 1:
-                    partial = _get_cache_buf(
+                    partial = _get_stream_cache_buf(
                         "mm_bf16_fp4_split_k_partial",
                         splits * m * n * 4,
                         a.device,
                     ).view(torch.float32)
                 else:
-                    partial = _get_cache_buf(
+                    partial = _get_stream_cache_buf(
                         "mm_bf16_fp4_split_k_partial_dummy", 16, a.device
                     ).view(torch.float32)
                 compiled(a, b, b_sf_u8, out, partial, alpha_for_launch)
@@ -1144,13 +1173,13 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
                     )
                 # The compiled call launches the reduce kernel as well, so
                 # ``out`` is final on return.
-                partial = _get_cache_buf(
+                partial = _get_stream_cache_buf(
                     "mm_bf16_fp4_split_k_partial",
                     k_splits * m * n * 4,
                     a.device,
                 ).view(torch.float32)
             else:
-                partial = _get_cache_buf(
+                partial = _get_stream_cache_buf(
                     "mm_bf16_fp4_split_k_partial_dummy", 16, a.device
                 ).view(torch.float32)
             compiled(a, b, b_sf_u8, out, partial, alpha_for_launch)

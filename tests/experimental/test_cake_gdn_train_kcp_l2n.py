@@ -86,6 +86,22 @@ def _no_flush_denormal():
     yield
 
 
+@pytest.fixture(autouse=True, scope="module")
+def _few_cpu_threads():
+    """The CPU emulation runs many small matmuls and elementwise ops.  On a host with hundreds of CPUs, torch's default
+    intra-op pool and the oneDNN matmul path (its own pool, which torch.set_num_threads does not resize) spend far more
+    time synchronizing threads than computing (see ``test_cake_gdn_train_kcp.py``), so this module runs with at most 8
+    threads and oneDNN off, as that suite does."""
+    threads, onednn = torch.get_num_threads(), torch.backends.mkldnn.enabled
+    torch.set_num_threads(min(threads, 8))
+    torch.backends.mkldnn.enabled = False
+    try:
+        yield
+    finally:
+        torch.backends.mkldnn.enabled = onednn
+        torch.set_num_threads(threads)
+
+
 # ----------------------------------------------------------------------------------------------------------------
 # exact rational oracle of FP32 / BF16 round-to-nearest-even (subnormals, overflow, signed zeros)
 
@@ -994,6 +1010,51 @@ def test_forward_drops_kn_before_the_output_and_qn_after_fwd_o(fused_o: int) -> 
     assert not {"qn", "kn"} & set(ws._tapes)
 
 
+@pytest.mark.parametrize("fused_o_tape", (0, 1))
+def test_full_forward_reads_both_rows_in_the_tape_and_output_walk(
+    fused_o_tape: int,
+) -> None:
+    """``save_mode="full"``: the shipped forward (``fused_o_tape`` = 1) reads ``qn`` and ``kn`` in its tape-and-output
+    walks and drops both after them; the split form (0) reads both in the tape walk and ``qn`` in #5.  Either form
+    leaves neither row in the arena (the saved ``r`` is a fresh tensor)."""
+    ctx, ops = _setup()
+    seen = {}
+    ws = kcp.WorkspaceKcp()
+
+    class Recording(kcp.FakeBackend):
+        def run(self, name, args):
+            call = args["_call"]
+            if not call.backward:
+                seen[name] = sorted(set(call.ws._tapes) & {"qn", "kn", kcp.QK_RSTD})
+            super().run(name, args)
+
+    previous = kcp.set_backend("fake", Recording())
+    try:
+        kcp.chunk_gdn_fwd_kcp(
+            *_ops(ops),
+            ctx,
+            backend="fake",
+            workspace=ws,
+            save_mode="full",
+            use_qk_l2norm_in_kernel=True,
+            test_knobs={"fused_o_tape": fused_o_tape},
+            deterministic=False,
+        )
+    finally:
+        kcp.set_backend("fake", previous)
+    assert seen["fwd_prep_l2n"] == ["kn", "qn"]
+    if fused_o_tape and kcp.fused_o_tape_shipped():
+        assert kcp.LAST_CALL["fwd"]["fwd_o"] == "fused_tape"
+        assert seen["kcp_fwdh_out_tape"] == ["kn", "qn"]
+        assert not {"kcp_fwdh_tape", "kcp_fwdh_out", "fwd_o"} & set(seen)
+    else:
+        assert kcp.LAST_CALL["fwd"]["fwd_o"] == "launched"
+        assert seen["kcp_fwdh_tape"] == ["kn", "qn"]
+        assert seen["fwd_o"] == ["qn"]
+        assert not {"kcp_fwdh_out", "kcp_fwdh_out_tape"} & set(seen)
+    assert not {"qn", "kn"} & set(ws._tapes)
+
+
 def test_saved_count_and_the_recompute_output_skip() -> None:
     """``_saved_count`` counts ``qk_rstd`` (``5 + len(saved.tensors())``), so the checkpoint frame proof still holds:
     the recompute of a region the node closes skips #5 with the norm on."""
@@ -1155,7 +1216,7 @@ def test_option_keyword_and_override_rule() -> None:
         p = params["use_qk_l2norm_in_kernel"]
         assert p.kind == p.KEYWORD_ONLY and p.default is False, fn
         assert not any("rstd" in n for n in params), fn
-    # the mode-dispatching facade forwards the option through its keyword arguments to the routed package
+    # the facade forwards the option through its keyword arguments to the package
     for fn in (
         facade.chunk_gdn_kcp,
         facade.chunk_gdn_fwd_kcp,
@@ -1493,8 +1554,8 @@ def test_no_fla_import() -> None:
 
 def test_facade_nondeterministic_route_runs_the_norm() -> None:
     """The ``flashinfer.cake_gdn_train_kcp`` facade with ``deterministic=False`` hands ``use_qk_l2norm_in_kernel``
-    (keyword, mapping or either route's options instance) to this package, which runs the norm: bitwise the package's
-    own call; ``False`` is the norm-off route."""
+    (keyword, mapping, this package's or the deterministic package's options instance) to this package, which runs the
+    norm: bitwise the package's own call; ``False`` is the norm-off route."""
     facade = importlib.import_module("flashinfer.cake_gdn_train_kcp")
     det_options = importlib.import_module(
         "flashinfer.experimental.cake_gdn_det_train_kcp.cake_options"
@@ -1532,20 +1593,22 @@ def test_facade_nondeterministic_route_runs_the_norm() -> None:
     assert kcp.LAST_CALL["fwd"]["qk_l2norm"] is False
 
 
-def test_facade_byte_queries_take_the_option_on_both_routes() -> None:
-    """The facade's byte queries forward ``use_qk_l2norm_in_kernel`` on both routes; the non-deterministic package's
-    norm terms equal the deterministic package's (same plan inputs, same formulas)."""
+def test_facade_byte_queries_take_the_option() -> None:
+    """The facade's byte queries forward ``use_qk_l2norm_in_kernel`` to this package; its norm terms equal those of the
+    deterministic package's own queries (``flashinfer.cake_gdn_det_train_kcp``; same plan inputs, same formulas)."""
     facade = importlib.import_module("flashinfer.cake_gdn_train_kcp")
+    det_facade = importlib.import_module("flashinfer.cake_gdn_det_train_kcp")
     ctx, _ops_ = _setup()
     H_qk, HV = 2, 6
     for query in ("gdn_saved_bytes_kcp", "gdn_workspace_bytes_kcp"):
         q = getattr(facade, query)
+        det_q = getattr(det_facade, query.replace("gdn_", "gdn_det_", 1))
         on = q(ctx, H_qk=H_qk, HV=HV, deterministic=False, use_qk_l2norm_in_kernel=True)
         off = q(
             ctx, H_qk=H_qk, HV=HV, deterministic=False, use_qk_l2norm_in_kernel=False
         )
-        det_on = q(ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=True)
-        det_off = q(ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=False)
+        det_on = det_q(ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=True)
+        det_off = det_q(ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=False)
         assert on > off and det_on > det_off, query
         assert on - off == det_on - det_off, query
     assert (

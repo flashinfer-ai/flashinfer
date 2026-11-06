@@ -21,9 +21,15 @@ with FLA's ``chunk_gated_delta_rule`` signature (no context parallelism).
 
 The forward runs the prep (``prep_tma``, the q / k tiles staged by TMA and one
 CTA per (chunk, key head), unless its dispatch rule :func:`use_prep_tma` keeps
-the plain prep; both give the same bits), the tcgen05 WY stage and the fused
-tcgen05 scan and output (``fwd_ho``; a split plan first runs the pre-scan and
-the stitch for the segment start states).  The backward runs ``dv_local`` and
+the plain prep; both give the same bits), the tcgen05 WY stage
+(:func:`wy_stage`: ``wy_tc2``, five CTAs per SM, on the architectures of
+``WY_TC2_ARCHS``, else ``wy_tc``; the same bits) and the fused tcgen05 scan
+and output (``fwd_ho``; a split plan first runs the pre-scan and the stitch
+for the segment start states; on the architectures of ``FWD_HO_VH2_ARCHS`` a
+scan of one launch whose CTAs fill at most half of the SMs runs as
+``fwd_ho_vh2``, two CTAs per segment and value head, one value half each,
+:func:`fwd_ho_vh2_engaged`, where the record is the split program,
+:func:`fwd_ho_vh2_splits`; the same bits).  The backward runs ``dv_local`` and
 the register scan of the adjoint state (with the pre-scan and the stitch on a
 split plan), or on a serial plan the tcgen05 adjoint scan with ``dv_local``
 fused (``dhu_tc2``) when its selection rule (:func:`dhu_tc_pricing`) prices it
@@ -32,7 +38,12 @@ on a host-built table runs its pass 2 on ``dhu_tc2`` from the stitched segment
 states when its rule (:func:`sdt_pricing`) prices that pass 2 below the
 register one, and then launches no ``dv_local``: its pre-scan
 (``dhu_pre_dvl_r64k1``) computes the ``dv_local`` tiles of the chunks it scans
-(the same bits); then, for a value-head group of two or of three, the fused
+(the same bits).  On ``sm_107a``, on a host-built table of a value-head group
+of two, a split adjoint plan the serial-scan rule (:func:`serial_scan_pricing`)
+prices slower than ``dhu_tc2`` over whole sequences becomes that serial plan
+(other bits of ``dk`` / ``dv`` / ``dg`` / ``dbeta``, within the same
+accuracy); then, for a
+value-head group of two or of three, the fused
 tcgen05 tail (``tail_g2`` / ``tail_g3``), else ``dqkwg``, the WY pullback and
 the finalize.  A host-built table lists the sequences longest first
 (:func:`lpt_sequence_order`; every chunk keeps its token offset, the state rows
@@ -58,7 +69,8 @@ the chunks one pre-scan CTA covers) are the records' ``scan`` constants; the
 records' ``select`` tables.
 
 Where the ``dhu_tc2`` adjoint scan feeds ``tail_g2_bf16`` on one stream and
-takes at most half the SMs, or on ``sm_100a`` and ``sm_103a`` is the pass 2 of
+takes at most half the SMs (on ``sm_107a`` with the scan's release in batches
+of eight chunks), or on ``sm_100a`` and ``sm_103a`` is the pass 2 of
 a split plan with more CTAs than SMs on a call of enough tokens x value heads,
 the backward runs them as the wavefront pair
 ``dhu_tc2_wavefront`` / ``tail_g2_bf16_wavefront`` (the split pass 2 on
@@ -111,6 +123,8 @@ __all__ = [
     "chunk_gated_delta_rule_det",
     "dhu_tc_pricing",
     "finalize_stage",
+    "fwd_ho_vh2_engaged",
+    "fwd_ho_vh2_splits",
     "gdn_chunk_backward",
     "gdn_chunk_det_backward",
     "gdn_chunk_det_forward",
@@ -120,6 +134,7 @@ __all__ = [
     "make_options",
     "scan_plans",
     "sdt_pricing",
+    "serial_scan_pricing",
     "sequence_groups",
     "stage_set",
     "two_stream_split",
@@ -127,6 +142,7 @@ __all__ = [
     "wavefront_engaged",
     "wavefront_order",
     "wavefront_split_engaged",
+    "wy_stage",
 ]
 
 CHUNK: int = int(cake_jit.CHUNK)
@@ -192,7 +208,9 @@ LAUNCH_ARGS: dict[str, tuple[str, ...]] = {
     "prep_tma": _PREP_TMA_ARGS,
     "prep_tma_bf16beta": _PREP_TMA_ARGS,
     "wy_tc": _WY_ARGS,
+    "wy_tc2": _WY_ARGS,
     "fwd_ho": _FWD_HO_ARGS,
+    "fwd_ho_vh2": _FWD_HO_ARGS,
     "stitch": _STITCH_ARGS,
     "dv_local": _DV_LOCAL_ARGS,
     "dhu_tc2": _DHU_TC2_ARGS,
@@ -1288,6 +1306,104 @@ def _sdt_selected(meta: ChunkMeta, segs: SegmentTable, num_v_heads: int, device_
 
 
 # --------------------------------------------------------------------------- #
+# the serial adjoint plan of a split layout: dhu_tc2 over whole sequences instead of the pre-scan, the stitch and pass 2
+# --------------------------------------------------------------------------- #
+# The segment planner prices the register scans only; with dhu_tc2 the serial scan can beat a split plan as it runs
+# (the pre-scan, the stitch and pass 2, on dhu_tc2 where :func:`sdt_pricing` selects it).  The rule, on a host-built
+# table of a value-head group of two (``HV = 2 H``: both plans feed ``tail_g2`` beside the scan) without plan pins,
+# replaces a split adjoint plan by the serial one when T_ser <= T_cur and the serial plan's own rule
+# (:func:`dhu_tc_pricing`) runs it on dhu_tc2.  T_ser = :func:`dhu_tc_pricing`'s ``T_tc``; T_cur = the
+# split plan's pre-scan and stitch in planner units (:func:`_best_split`'s terms) x t_unit plus the dhu_tc2 pass 2's
+# ``T_tc2`` where :func:`sdt_pricing` selects it, else the plan's planner units x t_unit + tiles x c_dvl / SMs.
+# The rule is on for SERIAL_SCAN_ARCHS: on sm_100a and sm_103a the split pass 2 can run as the wavefront pair beside
+# tail_g2, an overlap these prices do not see.  The forward plan is unchanged; the adjoint scan's dk / dv / dg / dbeta take other bits than the split plan's (bitwise run to run
+# for the layout).  The decision is made with the chunk tables (:func:`_chunk_meta`) and cached with them.
+SERIAL_SCAN_ARCHS = ("sm_107a",)
+
+
+def serial_scan_pricing(
+    chunks, plan: ScanPlan, num_v_heads: int, device_index: int
+) -> dict:
+    """The serial-scan rule's two sides for the split adjoint ``plan`` of a host layout of ``chunks`` (chunks per
+    sequence); ``select`` is the answer."""
+    arch = cake_backend.device_arch(int(device_index))
+    sm_count, _smem, _major = _device_props(device_index)
+    cfg = cast("tuple[int, int]", tuple(plan.config))
+    seg_len = int(plan.segment_len)
+    rec: dict[str, Any] = {
+        "arch": arch,
+        "config": list(cfg),
+        "segment_len": seg_len,
+        "select": False,
+    }
+    found = _dhu_tc_constants(arch)
+    if found is None or arch not in SERIAL_SCAN_ARCHS or seg_len <= 0:
+        rec["missing_constants"] = True
+        return rec
+    const = dict(found)
+    vb, ks = cfg
+    splits = tuple(max(1, -(-int(c) // seg_len)) for c in chunks)
+    per_segment = int(num_v_heads) * (HEAD_DIM // vb)
+    residency = _scan_residency("dhu", vb, ks, device_index)
+    scan = SCAN_STEP_FACTOR[cfg] * _scan_makespan(
+        chunks, splits, per_segment, sm_count, residency
+    )
+    pre = (
+        PRESCAN_WARMUP_CHUNKS
+        * PRESCAN_STEP_FACTOR
+        * SCAN_STEP_FACTOR[cfg]
+        * _wave_factor(sum(k - 1 for k in splits) * per_segment, sm_count, residency)
+    )
+    stitch = STITCH_FIXED_CHUNKS + STITCH_COPY_CHUNKS * (max(splits) - 1)
+    pass2 = (
+        sdt_pricing(chunks, seg_len, num_v_heads, device_index)
+        if cfg == SDT_CONFIG
+        and _available("dhu_tc2", arch)
+        and _available(SDT_PRESCAN, arch)
+        else {"select": False}
+    )
+    sdt = bool(pass2["select"])
+    if sdt:
+        t_cur = (pre + stitch) * const["t_unit"] + pass2["T_tc2"]
+    else:
+        t_dvl = sum(chunks) * int(num_v_heads) * const["c_dvl"] / sm_count
+        t_cur = (scan + pre + stitch) * const["t_unit"] + t_dvl
+    serial = dhu_tc_pricing(chunks, num_v_heads, device_index)
+    rec.update(segments=sum(splits), pass2_tc=sdt, T_cur=t_cur, T_ser=serial["T_tc"],
+               serial_tc=bool(serial["select"]))  # fmt: skip
+    rec["select"] = rec["serial_tc"] and serial["T_tc"] <= t_cur
+    return rec
+
+
+def _serial_adjoint_plan(
+    seq_lens: tuple[int, ...],
+    plans: tuple[ScanPlan, ScanPlan],
+    num_heads: int | None,
+    num_v_heads: int,
+    device_index: int,
+    options: ChainOptions,
+) -> tuple[ScanPlan, ScanPlan]:
+    """``plans`` with the adjoint plan made serial where the serial-scan rule selects it (see above): a value-head
+    group of two, no ``scan_config`` / ``segment_chunks`` / ``dhu_scan`` pin, a split adjoint plan."""
+    bwd = plans[1]
+    if (
+        num_heads is None
+        or int(num_v_heads) != 2 * int(num_heads)
+        or options.scan_config is not None
+        or options.segment_chunks is not None
+        or options.dhu_scan is not None
+        or bwd.segment_len <= 0
+    ):
+        return plans
+    chunks = tuple(-(-int(x) // CHUNK) for x in seq_lens)
+    if sum(max(1, -(-c // bwd.segment_len)) for c in chunks) <= len(chunks):
+        return plans
+    if not serial_scan_pricing(chunks, bwd, int(num_v_heads), device_index)["select"]:
+        return plans
+    return plans[0], ScanPlan(bwd.config, 0)
+
+
+# --------------------------------------------------------------------------- #
 # prep selection: prep_tma (TMA-staged q / k, one CTA per (chunk, key head)) or the plain prep
 # --------------------------------------------------------------------------- #
 # The rule: CTAs = chunks x H and slots = ctas_per_sm x SMs; the plain prep (grid (chunks, HV)) runs where prep_tma's
@@ -1467,8 +1583,10 @@ def _side_stream(device_index: int, main: torch.cuda.Stream) -> torch.cuda.Strea
 # fork, and the entry count reaches ``segments x HV`` only once the last CTA of the second round has started, after
 # the first round has given back the SMs it needs, so again the waiting tail never holds an SM a scan CTA still needs.
 # That pass 2 runs the scan ``dhu_tc2_wavefront_split`` (the elected release: with one release per store thread
-# the slower scan ate most of the overlap on sm_103a); the scan of at most half the SMs runs ``dhu_tc2_wavefront``.
-WAVEFRONT_ARCHS = ("sm_100a", "sm_103a")
+# the slower scan ate most of the overlap on sm_103a); the scan of at most half the SMs runs ``dhu_tc2_wavefront``,
+# whose sm_107a program releases in the elected form once per eight chunks (there the release per store thread
+# slowed the scan by about a fifth); the split side stays off sm_107a (``WAVEFRONT_SPLIT_ARCHS``).
+WAVEFRONT_ARCHS = ("sm_100a", "sm_103a", "sm_107a")
 # sm_100a: the host path of a call with fewer value heads outlasts its GPU work, so the pair's host cost is not hidden
 WAVEFRONT_MIN_V_HEADS = {"sm_100a": 32}
 # the split pass 2 of more CTAs than SMs: the pair (scan ``dhu_tc2_wavefront_split``) at any value-head count, on a
@@ -1597,6 +1715,18 @@ def _wait_entry(device_index: int):
 # --------------------------------------------------------------------------- #
 # forward
 # --------------------------------------------------------------------------- #
+# The forward WY stage: on an architecture of ``WY_TC2_ARCHS`` every ``wy_tc`` launch (the forward, both sequence
+# groups of the P form and the backward's recompute) runs ``wy_tc2`` instead, the same per-element chains, grid and
+# outputs (so the same bits) with a 64-column TMEM accumulator and packed shared-memory operands, so five CTAs fit
+# on an SM where ``wy_tc`` fits four.
+WY_TC2_ARCHS = ("sm_100a", "sm_103a", "sm_107a")
+
+
+def wy_stage(arch: str) -> str:
+    """The stage of the forward WY launches on ``arch``: ``wy_tc2`` on ``WY_TC2_ARCHS``, else ``wy_tc``."""
+    return "wy_tc2" if arch in WY_TC2_ARCHS else "wy_tc"
+
+
 def _wy_outputs(kn, v, total_tokens, num_v_heads):
     w = torch.empty(
         (total_tokens, num_v_heads, HEAD_DIM), dtype=kn.dtype, device=kn.device
@@ -1620,8 +1750,8 @@ def _launch_wy(
     recompute,
 ):
     w, u = _wy_outputs(kn, v, total_tokens, num_v_heads)
-    _launch("wy_tc", meta.num_chunks, num_v_heads, 1, kn, v, g_cs, beta32, A, w, u, meta.chunk_start, meta.chunk_len,
-            num_heads, num_v_heads, 1 if recompute else 0)  # fmt: skip
+    _launch(wy_stage(arch), meta.num_chunks, num_v_heads, 1, kn, v, g_cs, beta32, A, w, u, meta.chunk_start,
+            meta.chunk_len, num_heads, num_v_heads, 1 if recompute else 0)  # fmt: skip
     return w, u
 
 
@@ -1678,6 +1808,28 @@ def _launch_fwd_h(arch, kn, w, u, g_cs, initial_state, meta, num_heads, num_v_he
             final_state, meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq, meta.seq_chunk_start,
             num_heads, num_v_heads, use_init, 1 if store_final_state else 0)  # fmt: skip
     return h, v_new, final_state
+
+
+# The value-half split of the fused forward scan and output: on an architecture of ``FWD_HO_VH2_ARCHS`` a forward
+# scan of one launch (no two-stream groups) whose CTAs fill at most half of the SMs runs ``fwd_ho_vh2``, two CTAs per
+# (segment, value head) on twice the grid, each the scan and output of one value half.  Its per-element math is
+# fwd_ho's, so the bits are the same; the split shortens each CTA's per-chunk chain where the SMs would sit idle.
+FWD_HO_VH2_ARCHS = ("sm_107a",)
+
+
+@cache
+def fwd_ho_vh2_splits(arch: str) -> bool:
+    """Whether the ``fwd_ho_vh2`` record of ``arch`` is the split program (two CTAs per segment and value head).  On
+    ``sm_100a`` and ``sm_103a`` the record is the ``fwd_ho`` program itself, which runs on ``fwd_ho``'s grid."""
+    split = cake_backend.record(cake_backend.stage_record("fwd_ho_vh2", arch))
+    plain = cake_backend.record(cake_backend.stage_record("fwd_ho", arch))
+    return split["library"] != plain["library"]
+
+
+def fwd_ho_vh2_engaged(num_segments: int, num_v_heads: int, sm_count: int) -> bool:
+    """Whether a one-launch forward scan of ``num_segments`` segments runs as ``fwd_ho_vh2``: its ``2 x num_segments
+    x num_v_heads`` CTAs fit one round of ``sm_count`` SMs (one CTA per SM)."""
+    return 2 * int(num_segments) * int(num_v_heads) <= int(sm_count)
 
 
 _WALKS: dict = {}
@@ -1768,10 +1920,16 @@ def _launch_fwd_ho(arch, qn, kn, w, u, g_cs, initial_state, meta, num_heads, num
         use_seg = 1
     walk = _walk(device, segs, options)
     if wy is None:
-        _launch("fwd_ho", segs.num_segments * num_v_heads, 1, 1, qn, kn, w, u, g_cs, h0, seg_start, h, v_new, v_new, o,
-                o, final_state, meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq,
-                meta.seq_chunk_start, walk, num_heads, num_v_heads, use_init, 1 if store_final_state else 0, use_seg,
-                float(scale))  # fmt: skip
+        stage, ctas = "fwd_ho", segs.num_segments * num_v_heads
+        if arch in FWD_HO_VH2_ARCHS and fwd_ho_vh2_engaged(
+            segs.num_segments, num_v_heads, _device_props(_tensor_index(kn))[0]
+        ):
+            stage = "fwd_ho_vh2"
+            if fwd_ho_vh2_splits(arch):
+                ctas = 2 * ctas
+        _launch(stage, ctas, 1, 1, qn, kn, w, u, g_cs, h0, seg_start, h, v_new, v_new, o, o, final_state,
+                meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq, meta.seq_chunk_start, walk,
+                num_heads, num_v_heads, use_init, 1 if store_final_state else 0, use_seg, float(scale))  # fmt: skip
         return h, v_new, final_state, o
     # P form: the side stream runs wy_tc and fwd_ho of group A (the partial round); the caller's stream runs those of
     # group B (the full rounds) once wy_tc(A) is done, then joins the side stream.  fwd_ho(A) can read w / u rows past
@@ -1782,8 +1940,10 @@ def _launch_fwd_ho(arch, qn, kn, w, u, g_cs, initial_state, meta, num_heads, num
     groups = cast("StreamGroups", meta.fwd_groups)
     n, na, ca = segs.num_segments, groups.split, groups.split_chunk
 
+    wy_name = wy_stage(arch)
+
     def wy_tc(c0, c1):
-        _launch("wy_tc", c1 - c0, num_v_heads, 1, kn, v, g_cs, beta32, A, w, u, meta.chunk_start[c0:c1],
+        _launch(wy_name, c1 - c0, num_v_heads, 1, kn, v, g_cs, beta32, A, w, u, meta.chunk_start[c0:c1],
                 meta.chunk_len[c0:c1], num_heads, num_v_heads, 0)  # fmt: skip
 
     def fwd_ho(s0, s1):
@@ -2273,9 +2433,12 @@ def _chunk_meta(
     index: int,
     num_v_heads,
     options: ChainOptions,
+    *,
+    num_heads: int | None = None,
 ) -> ChunkMeta:
     """The chunk and segment tables of one call on device ``index``: a ``host_cache`` hit on the layout's key, else
-    planned (the layout's sequence lengths are derived only then)."""
+    planned (the layout's sequence lengths are derived only then).  ``num_heads`` (the key heads) lets a host-built
+    table take the serial-scan rule's adjoint plan (:func:`_serial_adjoint_plan`; ``None``: the planner's plans)."""
     total_tokens = int(batch) * int(seq_len)
     if cu_seqlens is None:
         layout: tuple[Any, ...] = ("equal", int(batch), int(seq_len))
@@ -2291,14 +2454,18 @@ def _chunk_meta(
         )  # fmt: skip
     else:
         layout = _host_offsets(cu_seqlens_cpu)
+    # the key carries everything the tables depend on: the dhu_scan pin too, which keeps the planner's adjoint plan
+    # where the serial-scan rule would make it serial (:func:`_serial_adjoint_plan`)
     key = (
         layout,
         int(num_v_heads),
         int(index),
         total_tokens,
         options.pins,
+        options.dhu_scan,
         options.lpt,
         options.streams,
+        num_heads,
     )
     if options.host_cache:
         meta = _META_FRONT.get(key)
@@ -2312,6 +2479,9 @@ def _chunk_meta(
         seq_lens = tuple(b - a for a, b in zip(layout[:-1], layout[1:], strict=True))
     plans = scan_plans(total_tokens, len(seq_lens), int(num_v_heads), int(index), seq_lens,
                        scan_config=options.scan_config, segment_chunks=options.segment_chunks)  # fmt: skip
+    plans = _serial_adjoint_plan(
+        seq_lens, plans, num_heads, int(num_v_heads), int(index), options
+    )
     meta = _host_chunk_meta(seq_lens, plans, int(index), options.lpt)
     if options.streams == 2:
         fwd_groups, bwd_groups = sequence_groups(
@@ -2338,7 +2508,14 @@ class ChunkGatedDeltaRuleDetFunction(torch.autograd.Function):
         index = _tensor_index(q)
         arch = cake_backend.device_arch(index)
         meta = _chunk_meta(
-            cu_seqlens, cu_seqlens_cpu, batch, seq_len, index, num_v_heads, options
+            cu_seqlens,
+            cu_seqlens_cpu,
+            batch,
+            seq_len,
+            index,
+            num_v_heads,
+            options,
+            num_heads=num_heads,
         )
         fwd = gdn_chunk_det_forward(q, k, v, g, beta, meta=meta, arch=arch, scale=scale, initial_state=initial_state,
                                 output_final_state=output_final_state, normalize_qk=use_qk_l2norm_in_kernel,

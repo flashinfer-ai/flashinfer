@@ -22,7 +22,9 @@ recurrence of the same operands and with one another.  Per row and rank the test
   for every tensor;
 * bitwise (G3): repeat; saved == replay (``boundary_mode``); ``save_mode`` light == full; autograd == explicit;
   ``torch.utils.checkpoint(use_reentrant=False)`` == direct; ``save_transfer`` True == False; ring == a2a where the
-  partition allows the ring; strided packed-QKV views == contiguous operands (``layout`` tma and copy; under tma the
+  partition allows the ring; ``save_mode="full"`` with ``save_transfer=False`` (a2a and, where allowed, ring) == the
+  light form with every package allocation filled with NaN bytes, at the plan's ``P`` and at the forced ``P = 2``
+  (``segments=2``, where every rank's fragments take it; the full saved set holds ``M_seg`` there); strided packed-QKV views == contiguous operands (``layout`` tma and copy; under tma the
   backward writes one packed dQKV row, and ``packed_qkv_views_det_kcp`` hands it to a packed leaf without a concatenation;
   plain ``split`` views of the leaf, direct and checkpointed, keep torch's split backward and their hooks, issue #8367);
   ``.backward()`` twice accumulates exactly twice the gradient;
@@ -356,6 +358,16 @@ def _programs_exported() -> bool:
         return bool(libraries)
 
 
+def _forward_arena_tapes(backend: str, device, T_r: int) -> tuple[str, ...]:
+    """The forward tapes an eager light, saved-boundary forward leaves in a caller's arena: the output walk's two
+    (``FWD_TAPES_ARENA_AFTER_FUSED``) where the forward folds #5 into its tape walks (``cake_kcp._fuse_o``: tokens and
+    the registry's output-walk records for this backend's architecture), else the four #5 reads."""
+    arch = None if backend == "fake" else _mod("cake_backend").device_arch(device.index)
+    if T_r > 0 and kcp.fused_o_shipped(arch):
+        return kcp.FWD_TAPES_ARENA_AFTER_FUSED
+    return kcp.FWD_TAPES_ARENA_AFTER_FWD
+
+
 def _backend_name() -> str:
     name = os.environ.get("KCP_TEST_BACKEND")
     if name:
@@ -457,6 +469,79 @@ def _packed_views(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
 
 def _eq(a: dict, b: dict, names=TENSORS) -> bool:
     return all(torch.equal(a[n], b[n]) for n in names)
+
+
+@contextlib.contextmanager
+def _nan_allocations():
+    """Every tensor the package allocates (its ``_alloc``: outputs, saved set, pools, tapes) is filled with NaN
+    bytes while the block runs: a program that reads a plane no program of the call wrote gives non-finite results
+    instead of the bytes a previous call left in the caching allocator."""
+    real = kcp._alloc
+
+    def nan_alloc(shape, dtype, device):
+        t = real(shape, dtype, device)
+        if t.numel():
+            t.view(-1).view(torch.uint8).fill_(0xFF)
+        return t
+
+    kcp._alloc = nan_alloc
+    try:
+        yield
+    finally:
+        kcp._alloc = real
+
+
+def _m_seg_rule(saved) -> dict:
+    """The ``M_seg`` record of a ``save_mode="full"`` saved set: present exactly at ``P > 1`` (the full backward runs no
+    transfer walk, so its merges read the saved ``M_seg^T`` plane)."""
+    if saved is None:
+        return {"ok": False, "P": None, "m_seg_bytes": None}
+    m = saved.M_seg
+    ok = (m is not None) == (int(saved.P) > 1) and saved.save_mode == "full"
+    return {
+        "ok": bool(ok),
+        "P": int(saved.P),
+        "m_seg_bytes": None if m is None else int(m.numel() * m.element_size()),
+    }
+
+
+def _p2_group_ok(ctx, HV: int, group, W: int, device: torch.device) -> bool:
+    """Every rank's fragments take the segments override ``P = 2`` (the longest fragment of each rank has at least
+    two chunks).  Many rows plan ``P = 1``; the forced ``P = 2`` forms put the full backward's read of the saved
+    ``M_seg^T`` plane on them.  A group decision (MIN over the ranks): every rank runs the same calls."""
+    try:
+        ok = int(ctx.heads(HV, P=2).P) == 2
+    except ValueError:
+        ok = False
+    flag = torch.tensor([1 if ok else 0], dtype=torch.int32, device=device)
+    if W > 1:
+        dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=group)
+    return bool(flag.item())
+
+
+def _p2_full_flags(
+    saved_pass, info, flags, *, ring: bool, prefix: str = "", **extra
+) -> None:
+    """The forced ``P = 2`` forms without ``save_transfer`` under NaN-filled allocations: ``save_mode="full"`` against
+    the light form at ``P = 2`` (bitwise, ``M_seg`` held at ``P = 2``), over a2a and, where the partition allows it,
+    over the ring (and the ring's light form bitwise the a2a's)."""
+    o = {"segments": 2, "save_transfer": False, **extra}
+    light = {}
+    for name, ex in (("p2_full_no_transfer_eq", "a2a"), ("p2_full_ring_eq", "ring")):
+        if ex == "ring" and not ring:
+            continue
+        with _nan_allocations():
+            res_full = saved_pass(save_mode="full", exchange=ex, **o)
+            light[ex] = saved_pass(exchange=ex, **o)
+        rule = _m_seg_rule(res_full["saved"])
+        info[prefix + name] = rule
+        flags[prefix + name] = (
+            _eq(res_full, light[ex]) and rule["ok"] and rule["P"] == 2
+        )
+        del res_full
+    if ring:
+        flags[prefix + "p2_ring_eq_a2a"] = _eq(light["ring"], light["a2a"])
+    del light
 
 
 def _plain_split_pass(buf, g, beta, dout, call, H_qk: int, HV: int, *, ckpt: bool):
@@ -852,7 +937,13 @@ def _kept_record(T_r: int) -> dict:
     replay); a rank without tokens has no tapes and runs the replay form as before."""
     bwd = kcp.LAST_CALL["bwd"]
     seq = list(bwd["sequence"])
-    forward_programs = {"fwd_prep", "kcp_fwdh_offset", "kcp_fwdh_tape", "fwd_o"}
+    forward_programs = {
+        "fwd_prep",
+        "kcp_fwdh_offset",
+        "kcp_fwdh_tape",
+        "kcp_fwdh_out",
+        "fwd_o",
+    }
     first_local = next(
         (s_ for s_ in seq if s_ in kcp.LOCAL_PROGRAMS or s_ in forward_programs), None
     )
@@ -1190,6 +1281,21 @@ def _run_rank(
     flags["ring_eq_a2a"] = (not ring_eligible) or _eq(
         res_recompute, saved_pass(exchange="ring", save_transfer=False)
     )
+    # save_mode="full" without save_transfer (the keyword, or the ring exchange, which needs it): the full backward
+    # runs no transfer walk, so at P > 1 its merges read the saved M_seg^T plane; on NaN-filled allocations a read of
+    # an unwritten plane cannot pass on the bytes the forward left in the caching allocator
+    with _nan_allocations():
+        flags["full_no_transfer_eq"] = _eq(
+            res, saved_pass(save_mode="full", save_transfer=False)
+        )
+        flags["full_ring_eq_a2a"] = (not ring_eligible) or _eq(
+            res, saved_pass(save_mode="full", exchange="ring", save_transfer=False)
+        )
+    # many rows plan P = 1: the same full / ring + full forms again at the forced P = 2 (segments override, where every
+    # rank's fragments take it), against the light form at P = 2
+    info["p2_eligible"] = _p2_group_ok(ctx, HV, group, W, device)
+    if info["p2_eligible"]:
+        _p2_full_flags(saved_pass, info, flags, ring=ring_eligible)
     res_host = saved_pass(group_reduce="host")
     info["host_reduce_eq_fused"] = _eq(
         res, res_host
@@ -1296,11 +1402,14 @@ def _run_rank(
             leaf.grad = None
         torch.cuda.synchronize(device)
         gc.collect()
+        arena_after = _forward_arena_tapes(backend, device, int(q.shape[0]))
         if wsp is not None:
             # the warm-up backward's replay re-bound the arena tapes an eager forward drops before its output
-            # (FWD_DEAD_BEFORE_O); start from the state a forward leaves so the delta is the output alone
-            for name in kcp.FWD_DEAD_BEFORE_O + kcp.FWD_DEAD_AFTER_PREP:
-                wsp.release_tape(name)
+            # (FWD_DEAD_BEFORE_O; a fused forward binds no h / v_new either); start from the state a forward
+            # leaves so the delta is the output alone
+            for name in kcp.FWD_TAPES:
+                if name not in arena_after:
+                    wsp.release_tape(name)
             for name in kcp.FWD_DEAD_POOLS:
                 wsp.release_pool(name)
             torch.cuda.synchronize(device)
@@ -1348,12 +1457,13 @@ def _run_rank(
             )
         out.backward(dout)
         if wsp is not None and form == "caller_ws_kept":
-            # a kept backward leaves the caller's arena as a forward leaves it: of the forward tapes only the four
-            # #5 reads are bound (no dead tape, no kept tape beyond them), no entry survives the backward
+            # a kept backward leaves the caller's arena as a forward leaves it: of the forward tapes only the ones
+            # the forward leaves are bound (the four #5 reads; a fused forward's two), no dead tape, no kept tape
+            # beyond them, no entry survives the backward
             dbg["arena_tapes_after_backward"] = sorted(wsp._tapes)
             flags["kept_ws_as_forward_leaves"] = (
                 set(wsp._tapes) & set(kcp.FWD_TAPES)
-            ) <= set(kcp.FWD_TAPES_ARENA_AFTER_FWD) and kcp.kept_registry_size() == 0
+            ) <= set(arena_after) and kcp.kept_registry_size() == 0
         del out, leaves
     info["retained_bytes"] = retained
     info["retained_block_bytes"] = retained_block
@@ -1993,7 +2103,7 @@ def test_public_api_cannot_select_test_programs() -> None:
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# C7: the convolution halo row.  The user calls FlashInfer's ``cake_causal_conv1d_kcp(x_local, weight, ctx)`` with
+# C7: the convolution halo row.  The user calls FlashInfer's ``cake_causal_conv1d_det_kcp(x_local, weight, ctx)`` with
 # THIS package's context: the conv package reads the halo plan (``ctx.halo``, ``ctx.halo_tables``), the local
 # ``cu_seqlens`` and the process group by duck typing.  The row's partition: document 0 = [1, 2, 300] on ranks 0,
 # 1 and 3 (the three history rows of rank 3's first outputs come from TWO predecessor ranks), rank 2 holds no token
@@ -2088,7 +2198,8 @@ def _run_rank_conv(
     """C7 on one rank: ``y`` / ``dx`` / ``dweight`` of the rank's tokens against the FP64 oracle of the whole pack,
     ``y`` bitwise equal to the single-rank conv of the whole pack on the rank's tokens, repeat bitwise, and the
     halo-row gradients delivered to the predecessor ranks (rank 0 / 1: 1 / 2 tokens of document 0)."""
-    from flashinfer import cake_causal_conv1d_train as conv
+    from flashinfer import cake_causal_conv1d_det_train as conv
+    from flashinfer import cake_causal_conv1d_det_train_kcp as conv_kcp
 
     part, cu = _partition(row)
     ctx = plan.build_context_det_kcp(part, group, rank, device)
@@ -2107,10 +2218,10 @@ def _run_rank_conv(
     w_dev = w.to(device).requires_grad_(True)
     dy_local = dy_all[l2g].to(device)
     t0 = time.time()
-    y = conv.cake_causal_conv1d_kcp(x_local, w_dev, ctx)
+    y = conv_kcp.cake_causal_conv1d_det_kcp(x_local, w_dev, ctx)
     y.backward(dy_local)
     dx, dw = x_local.grad, w_dev.grad
-    y2 = conv.cake_causal_conv1d_kcp(x_local.detach(), w_dev.detach(), ctx)
+    y2 = conv_kcp.cake_causal_conv1d_det_kcp(x_local.detach(), w_dev.detach(), ctx)
     torch.cuda.synchronize(device)
     # the oracle (FP64 on this rank's device, the whole pack) and the single-rank conv of the whole pack
     y_ref, dx_ref, dpre, taps = _conv_reference(
@@ -2121,7 +2232,7 @@ def _run_rank_conv(
         [(dpre[sel] * tap[sel]).sum(0) for tap in taps], dim=1
     )  # this rank's partial of dweight (the framework reduces the ranks)
     cu_dev = torch.tensor(cu, dtype=torch.int32, device=device)
-    y_single = conv.cake_causal_conv1d(x_all.to(device), w.to(device), cu_dev)
+    y_single = conv.cake_causal_conv1d_det(x_all.to(device), w.to(device), cu_dev)
     flags: dict[str, bool] = {}
     metrics: dict[str, dict] = {}
     metrics["y"] = _outside(y, y_ref[sel], atol=CONV_Y_ATOL, rtol=CONV_Y_RTOL)
@@ -2177,13 +2288,13 @@ def _run_rank_conv(
 
 
 def test_conv_halo_row(slurm) -> None:
-    """C7: FlashInfer's ``cake_causal_conv1d_kcp`` through this package's context (duck typing): ``y`` / ``dx`` /
+    """C7: FlashInfer's ``cake_causal_conv1d_det_kcp`` through this package's context (duck typing): ``y`` / ``dx`` /
     ``dweight`` vs FP64 on every rank, ``y`` bitwise the single-rank conv, history rows from two predecessor ranks,
     an empty predecessor and a document start.  Runs under Slurm with >= 4 ranks."""
     if slurm is None:
         pytest.skip("the conv halo row runs under Slurm (4 ranks)")
-    conv = pytest.importorskip("flashinfer.cake_causal_conv1d_train")
-    if not conv.is_cake_causal_conv1d_train_supported(slurm.device):
+    conv = pytest.importorskip("flashinfer.cake_causal_conv1d_det_train")
+    if not conv.is_cake_causal_conv1d_det_train_supported(slurm.device):
         pytest.skip("the conv package does not support this device")
     _slurm_row(C7_ROW, slurm, "conv", _run_rank_conv)
 
@@ -2239,7 +2350,7 @@ def _run_rank_layer(
     caller's norm)."""
     import inspect
 
-    from flashinfer import cake_causal_conv1d_train as conv
+    from flashinfer import cake_causal_conv1d_det_train_kcp as conv_kcp
 
     H_qk, HV = row.heads
     C = (2 * H_qk + HV) * 128
@@ -2259,12 +2370,13 @@ def _run_rank_layer(
     ops = _local_inputs(row, part, cu, rank, device)
     g, beta, dout = ops["g"], ops["beta"], ops["dout"]
     conv_takes_handle = (
-        "recompute_handle" in inspect.signature(conv.cake_causal_conv1d_kcp).parameters
+        "recompute_handle"
+        in inspect.signature(conv_kcp.cake_causal_conv1d_det_kcp).parameters
     )
 
     def layer(x, w, g_, b_, h):
         ckw = {"recompute_handle": h} if (h is not None and conv_takes_handle) else {}
-        y = conv.cake_causal_conv1d_kcp(x, w, ctx, **ckw)
+        y = conv_kcp.cake_causal_conv1d_det_kcp(x, w, ctx, **ckw)
         qkv = y.view(y.shape[0], 2 * H_qk + HV, 128)
         if l2n:  # #7817: the raw views; the recurrence normalizes q / k itself
             q, k = qkv[:, :H_qk], qkv[:, H_qk : 2 * H_qk]
@@ -2319,7 +2431,7 @@ def _run_rank_layer(
 
     # the convolution's own forward collectives (its halo exchange), for the pending whole-layer count
     with CollectiveCounter() as cc_conv:
-        conv.cake_causal_conv1d_kcp(x_local, w_all.to(device), ctx)
+        conv_kcp.cake_causal_conv1d_det_kcp(x_local, w_all.to(device), ctx)
     conv_fwd = cc_conv.record()
     t0 = time.time()
     res_d, rec_d = run("direct")
@@ -2396,8 +2508,8 @@ def test_layer_checkpoint_rows(row: Row, slurm) -> None:
     recompute handle (see the block comment above).  Runs under Slurm with >= the row's ranks."""
     if slurm is None:
         pytest.skip("the layer rows run under Slurm")
-    conv = pytest.importorskip("flashinfer.cake_causal_conv1d_train")
-    if not conv.is_cake_causal_conv1d_train_supported(slurm.device):
+    conv = pytest.importorskip("flashinfer.cake_causal_conv1d_det_train")
+    if not conv.is_cake_causal_conv1d_det_train_supported(slurm.device):
         pytest.skip("the conv package does not support this device")
     _slurm_row(row, slurm, _backend_name(), _run_rank_layer)
 
@@ -2447,8 +2559,11 @@ V1_LIBRARIES = {
     "kcp_transfer_walk_plain_tf32": "cake_gdn_det_train_efbba796414578cbd8b5_kcp",
 }
 # sha256 over the sorted lines "<file> <sha256>\n" of the 36 csrc files (<library>_kernel.cu / _binding.cu) of the
-# 18 records above at FlashInfer 615a65850 (the package before the norm)
-V1_CSRC_DIGEST = "8ba3ceacd195fcc2794ed799da319fb9648abef343ca4502af1282e043a0cf97"
+# 18 records above as regenerated with the output walk: kernel text only changed from the package before the norm
+# (FlashInfer 615a65850), with the same bindings and the same SASS on sm_100a / sm_103a / sm_107a
+V1_CSRC_DIGEST = "a3b9ca82cf1ce9953813e288b5310a715080eeeb203d9a14af8910cf504a618a"
+# The output walk (#2 with #5 folded in): no v1 record, launched by the norm-off and the norm-on forward alike.
+NORM_OFF_EXTRA_RECORDS = ("kcp_fwdh_out", "kcp_fwdh_out_vh64")
 L2N_SKIP = (
     "the in-kernel Q/K L2 norm records (fwd_prep_l2n, bwd_dqkg_l2n, qk_apply) are not in the shipped registry "
     "yet: use_qk_l2norm_in_kernel cannot run on the kernel backend"
@@ -2603,7 +2718,8 @@ def _run_rank_l2n(
             **{n: lf.grad for n, lf in zip(GRADS, leaves, strict=True)},
         }
 
-    # norm off unchanged: pinned v1 identities and bytes; the norm-off route launches only v1 records
+    # norm off unchanged: pinned v1 identities and bytes; the norm-off route launches only v1 records and the output
+    # walk (a program of both routes, new beside the v1 records; NORM_OFF_EXTRA_RECORDS)
     jit = _mod("cake_jit")
     flags["norm_off_libraries_pinned"] = all(
         ({**jit.MODULES, **jit.TEST_MODULES}.get(n) or {}).get("library") == lib
@@ -2622,7 +2738,7 @@ def _run_rank_l2n(
     flags["norm_off_bitwise_unchanged"] = (
         flags["norm_off_libraries_pinned"]
         and flags["norm_off_csrc_bytes_pinned"]
-        and used <= set(V1_LIBRARIES)
+        and used <= set(V1_LIBRARIES) | set(NORM_OFF_EXTRA_RECORDS)
         and not res_off["fwd"]["qk_l2norm"]
     )
 
@@ -2675,6 +2791,30 @@ def _run_rank_l2n(
     if W > 1 and int(ctx.n_d_max) - 1 <= kcp.RING_MAX_HOPS:
         flags["l2n_ring_eq_a2a"] = _eq(
             res, saved_pass(exchange="ring", save_transfer=False, **L2N)
+        )
+    # save_mode="full" without save_transfer (the keyword, or the ring exchange) on NaN-filled allocations, as in the
+    # norm-off row: at P > 1 the full backward's merges read the saved M_seg^T plane
+    with _nan_allocations():
+        flags["l2n_full_no_transfer_eq"] = _eq(
+            res, saved_pass(save_mode="full", save_transfer=False, **L2N)
+        )
+        if W > 1 and int(ctx.n_d_max) - 1 <= kcp.RING_MAX_HOPS:
+            flags["l2n_full_ring_eq_a2a"] = _eq(
+                res,
+                saved_pass(
+                    save_mode="full", exchange="ring", save_transfer=False, **L2N
+                ),
+            )
+    # the forced P = 2 forms (see _run_rank)
+    info["p2_eligible"] = _p2_group_ok(ctx, HV, group, W, device)
+    if info["p2_eligible"]:
+        _p2_full_flags(
+            saved_pass,
+            info,
+            flags,
+            ring=W > 1 and int(ctx.n_d_max) - 1 <= kcp.RING_MAX_HOPS,
+            prefix="l2n_",
+            **L2N,
         )
     res_host = saved_pass(group_reduce="host", **L2N)
     info["l2n_host_eq_fused"] = _eq(
@@ -3025,8 +3165,8 @@ def test_l2n_layer_checkpoint_rows(row: Row, slurm) -> None:
     out / dx / dw / dg / dbeta bitwise the direct pass; L8 is the ``C = 10240`` (16, 48) row."""
     if slurm is None:
         pytest.skip("the layer rows run under Slurm")
-    conv = pytest.importorskip("flashinfer.cake_causal_conv1d_train")
-    if not conv.is_cake_causal_conv1d_train_supported(slurm.device):
+    conv = pytest.importorskip("flashinfer.cake_causal_conv1d_det_train")
+    if not conv.is_cake_causal_conv1d_det_train_supported(slurm.device):
         pytest.skip("the conv package does not support this device")
     backend = _backend_name()
     _skip_unless_l2n(backend)

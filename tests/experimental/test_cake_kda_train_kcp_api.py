@@ -25,9 +25,10 @@ deterministic package's previous names in ``flashinfer.kda_train`` and the compa
 public name carries a mode), the import isolation
 (the package imports the non-deterministic single-rank package ``flashinfer.experimental.cake.cake_kda_train``, never
 a deterministic package or the compatibility package) and the dispatch of the local stages over architecture x head
-count (the ``S1`` pair of the replay path, the KCP backward), and the deterministic package's raw gate and in-kernel
-q / k L2 norm (the package refuses them, their off values pass; the facade forwards them with ``deterministic=True``
-and routes ``reduce_gate_param_grads_kcp`` there).
+count (the ``S1`` pair of the replay path, the KCP backward), the raw gate mode (the package's entries take its
+keywords and its byte query its mode; the facade forwards them on both routes and routes
+``reduce_gate_param_grads_kcp`` by mode) and the deterministic package's in-kernel q / k L2 norm (the package refuses
+it, its off value passes).
 """
 
 import ast
@@ -44,7 +45,6 @@ import torch
 
 import flashinfer.cake_kda_det_train_kcp as det_api
 import flashinfer.cake_kda_train_kcp as kcp_api
-import flashinfer.kda_train as kda_train
 from flashinfer.api_logging import ExperimentalWarning
 
 pytestmark = pytest.mark.cpu_only
@@ -90,6 +90,7 @@ LEGACY_FACADE_NAMES = {
     "kcp_workspace_bytes": "kda_det_workspace_bytes_kcp",
     "kcp_saved_bytes": "kda_det_saved_bytes_kcp",
     "kcp_comm_bytes": "kda_det_comm_bytes_kcp",
+    "kcp_reduce_gate_param_grads": "reduce_gate_param_grads_det_kcp",
 }
 LEGACY_TYPE_NAMES = {
     "KcpContext": "ContextDetKcp",
@@ -235,7 +236,8 @@ def test_autograd_function_records_the_forward_mode() -> None:
 
     class StandIn:
         saved_tensors = tuple(torch.zeros(1) for _ in range(5))
-        kcp = (object(), None, "light", None, {}, None)
+        # ctx, scale, save_mode, workspace, options, saved-set meta, (raw gate mode, lower_bound)
+        kcp = (object(), None, "light", None, {}, None, (False, None))
 
     fctx = StandIn()
     fctx.deterministic = True
@@ -494,7 +496,7 @@ def test_facade_byte_queries_resolve_save_transfer_like_the_deterministic_facade
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# the deterministic package's modes: the raw gate (#7816) and the in-kernel q / k L2 norm (#7817)
+# the raw gate mode (#7816) and the deterministic package's in-kernel q / k L2 norm (#7817)
 
 # each keyword at its off value
 MODE_OFF = {
@@ -504,16 +506,15 @@ MODE_OFF = {
     "lower_bound": None,
     "use_qk_l2norm_in_kernel": False,
 }
-RAW_GATE_ON = [
-    {"use_gate_in_kernel": True},
-    {"use_gate_in_kernel": 1},
-    {"A_log": torch.zeros(4)},
-    {"dt_bias": torch.zeros(4, 128)},
-    {"lower_bound": -5.0},
-    {"use_gate_in_kernel": True, "use_qk_l2norm_in_kernel": True},
-]
-RAW_GATE = "runs on the deterministic package only; pass deterministic=True"
+RAW_KEYWORDS = ("use_gate_in_kernel", "A_log", "dt_bias", "lower_bound")
+# the package's refusal of the raw gate before it ran the mode (no message may carry it now)
+RAW_GATE_REFUSAL = "runs on the deterministic package only"
 QK_NORM = "in-kernel q / k L2 norm runs on the deterministic package only"
+DET_COMPUTE_NAMES = {
+    "chunk_kda_kcp": "chunk_kda_det_kcp",
+    "chunk_kda_fwd_kcp": "chunk_kda_det_fwd_kcp",
+    "chunk_kda_bwd_kcp": "chunk_kda_det_bwd_kcp",
+}
 
 
 def _raw_gate_keywords() -> dict:
@@ -526,44 +527,75 @@ def _raw_gate_keywords() -> dict:
 
 
 @pytest.mark.parametrize("entry", COMPUTE_ENTRIES)
-@pytest.mark.parametrize(
-    "kw",
-    RAW_GATE_ON,
-    ids=["gate_true", "gate_1", "A_log", "dt_bias", "lower_bound", "gate_and_qk_norm"],
-)
-def test_package_entries_refuse_the_raw_gate(entry, kw) -> None:
-    """The raw gate runs on the deterministic package only: ``use_gate_in_kernel`` other than ``False`` or any of
-    ``A_log`` / ``dt_bias`` / ``lower_bound`` other than ``None`` is a ``ValueError`` naming ``deterministic=True``,
-    raised before any work (also with the in-kernel norm requested)."""
-    with pytest.raises(ValueError, match=RAW_GATE):
-        _package_call(entry, deterministic=False, **kw)
+def test_package_entries_take_the_raw_gate_keywords(entry) -> None:
+    """The raw gate mode runs on this package: every compute entry takes ``use_gate_in_kernel`` / ``A_log`` /
+    ``dt_bias`` / ``lower_bound`` as keyword-only parameters with the deterministic entry's defaults (``False``,
+    ``None``), so they never reach the options (whose validator does not know them).  A raw call with stand-in
+    operands fails on the operand checks, never with a refusal of the mode or an unknown keyword; a non-bool mode is
+    the single-rank rule's ``ValueError``, raised before any work."""
+    kcp, det_kcp = _mod("cake_kcp"), _det("cake_kcp")
+    params = inspect.signature(getattr(kcp, entry)).parameters
+    det_params = inspect.signature(
+        getattr(det_kcp, DET_COMPUTE_NAMES[entry])
+    ).parameters
+    for key in RAW_KEYWORDS:
+        assert params[key].kind is inspect.Parameter.KEYWORD_ONLY, (entry, key)
+        assert params[key].default is det_params[key].default is MODE_OFF[key], (
+            entry,
+            key,
+        )
+    with pytest.raises(TypeError, match="unexpected keyword"):
+        kcp._options({"use_gate_in_kernel": True})
+    with pytest.raises(Exception) as info:  # noqa: B017 - the stand-in operands' error, never the mode's
+        _package_call(entry, deterministic=False, **_raw_gate_keywords())
+    message = str(info.value)
+    for refusal in ("unexpected keyword", RAW_GATE_REFUSAL, QK_NORM):
+        assert refusal not in message, message
+    with pytest.raises(ValueError, match="use_gate_in_kernel must be a bool"):
+        _package_call(entry, deterministic=False, use_gate_in_kernel=1)
 
 
 @pytest.mark.parametrize("entry", COMPUTE_ENTRIES)
 def test_package_entries_refuse_the_in_kernel_qk_norm(entry) -> None:
-    """``use_qk_l2norm_in_kernel=True`` is a ``ValueError`` before any work: the package has no in-kernel norm."""
+    """``use_qk_l2norm_in_kernel=True`` is a ``ValueError`` before any work: the package has no in-kernel norm (also
+    with the raw gate requested)."""
     with pytest.raises(ValueError, match=QK_NORM):
         _package_call(entry, deterministic=False, use_qk_l2norm_in_kernel=True)
+    with pytest.raises(ValueError, match=QK_NORM):
+        _package_call(
+            entry,
+            deterministic=False,
+            use_qk_l2norm_in_kernel=True,
+            **_raw_gate_keywords(),
+        )
 
 
 @pytest.mark.parametrize("entry", COMPUTE_ENTRIES)
 def test_package_entries_accept_the_modes_off(entry) -> None:
-    """The off values are this package's mode: the options validate as if they were omitted, and an entry that
-    spells them out fails on the stand-in operands, not on a keyword."""
+    """The off values are this package's explicit mode: the option ``use_qk_l2norm_in_kernel=False`` validates as if
+    it were omitted, and an entry that spells out every off value fails on the stand-in operands, not on a
+    keyword."""
     kcp = _mod("cake_kcp")
-    assert kcp._options(dict(MODE_OFF)) == kcp._options({})
+    assert kcp._options({"use_qk_l2norm_in_kernel": False}) == kcp._options({})
     with pytest.raises(Exception) as info:  # noqa: B017 - the stand-in operands' error, never a keyword's
         _package_call(entry, deterministic=False, **MODE_OFF)
     message = str(info.value)
-    for refusal in ("unexpected keyword", RAW_GATE, QK_NORM):
+    for refusal in ("unexpected keyword", RAW_GATE_REFUSAL, QK_NORM):
         assert refusal not in message, message
 
 
-def test_package_byte_query_refuses_the_raw_gate() -> None:
-    """The package's workspace and saved-set byte queries take the deterministic queries' ``use_gate_in_kernel``:
-    ``False`` gives the bytes of the omitted keyword, any other value is a ``ValueError`` naming
-    ``deterministic=True``, before the context is read; the facade's ``deterministic=False`` route raises the same."""
-    plan = _mod("cake_kcp_plan")
+def test_package_byte_queries_take_the_raw_gate() -> None:
+    """The package's workspace and saved-set byte queries take ``use_gate_in_kernel`` as the deterministic queries
+    do: ``False`` gives the bytes of the omitted keyword; ``True`` gives the raw plan's workspace bytes (the
+    deterministic query's answer for the same partition plus, on a backward workspace of an R1c plan, the local
+    arena's FP64 parameter-gradient accumulators; its arena never more than the explicit mode's; the facade's
+    answer on each route is its package's) and the saved-set bytes of the explicit gate (the saved set does not
+    depend on the gate mode, on either route); a non-bool is a ``ValueError`` and ``True`` with the lean local arena
+    a ``NotImplementedError``."""
+    plan, det_plan = _mod("cake_kcp_plan"), _det("cake_kcp_plan")
+    backend = importlib.import_module(
+        "flashinfer.experimental.cake.cake_kda_train.cake_backend"
+    )
     ctx = kcp_api.build_context_kcp(
         kcp_api.partition_kcp(MODE_CU, 2, deterministic=False),
         None,
@@ -572,22 +604,56 @@ def test_package_byte_query_refuses_the_raw_gate() -> None:
         sm_count=148,
         deterministic=False,
     )
+    det_ctx = kcp_api.build_context_kcp(
+        kcp_api.partition_kcp(MODE_CU, 2), None, 0, "cpu", sm_count=148
+    )
+    assert plan.kda_workspace_bytes_kcp(
+        ctx, H=4, use_gate_in_kernel=False
+    ) == plan.kda_workspace_bytes_kcp(ctx, H=4)
+    for backward in (True, False):
+        raw = plan.kda_workspace_bytes_kcp(
+            ctx, H=4, backward=backward, use_gate_in_kernel=True
+        )
+        det_raw = det_plan.kda_det_workspace_bytes_kcp(
+            det_ctx, H=4, backward=backward, use_gate_in_kernel=True
+        )
+        # the R1c accumulators (one replica at 4 heads; none on sm_107a, none for a forward-only workspace)
+        local_plan = backend.plan(ctx.T_r, ctx.n_frag, 4, ctx.sm_count, gate="raw")
+        acc = (
+            8 * 4 * 2 * 128
+            if backward and local_plan.arch in ("sm_100a", "sm_103a")
+            else 0
+        )
+        assert acc == (backend._param_acc_bytes(local_plan) if backward else 0)
+        assert raw == det_raw + acc, backward
+        assert raw - acc <= plan.kda_workspace_bytes_kcp(ctx, H=4, backward=backward)
+        for det, c, want in ((False, ctx, raw), (True, det_ctx, det_raw)):
+            assert (
+                kcp_api.kda_workspace_bytes_kcp(
+                    c,
+                    H=4,
+                    backward=backward,
+                    use_gate_in_kernel=True,
+                    deterministic=det,
+                )
+                == want
+            ), (backward, det)
+    saved = plan.kda_saved_bytes_kcp(ctx, H=4)
+    assert plan.kda_saved_bytes_kcp(ctx, H=4, use_gate_in_kernel=True) == saved
+    assert plan.kda_saved_bytes_kcp(ctx, H=4, use_gate_in_kernel=False) == saved
+    for det, c in ((False, ctx), (True, det_ctx)):
+        for gate in (False, True):
+            assert kcp_api.kda_saved_bytes_kcp(
+                c, H=4, use_gate_in_kernel=gate, deterministic=det
+            ) == kcp_api.kda_saved_bytes_kcp(c, H=4, deterministic=det), (det, gate)
     for query in ("kda_workspace_bytes_kcp", "kda_saved_bytes_kcp"):
-        fn = getattr(plan, query)
-        assert fn(ctx, H=4, use_gate_in_kernel=False) == fn(ctx, H=4), query
-        for value in (True, 1, None):
-            with pytest.raises(
-                ValueError, match="raw gate mode runs on the deterministic"
-            ) as info:
-                fn(object(), use_gate_in_kernel=value)
-            assert "deterministic=True" in str(info.value), query
-        with pytest.raises(
-            ValueError, match="raw gate mode runs on the deterministic"
-        ) as info:
-            getattr(kcp_api, query)(
-                object(), use_gate_in_kernel=True, deterministic=False
-            )
-        assert "deterministic=True" in str(info.value), query
+        for value in (1, None, "raw"):
+            with pytest.raises(ValueError, match="use_gate_in_kernel must be a bool"):
+                getattr(plan, query)(ctx, H=4, use_gate_in_kernel=value)
+    with pytest.raises(NotImplementedError, match='local_arena="lean"'):
+        plan.kda_workspace_bytes_kcp(
+            ctx, H=4, use_gate_in_kernel=True, local_arena="lean"
+        )
 
 
 def test_package_byte_queries_refuse_the_in_kernel_qk_norm() -> None:
@@ -660,12 +726,13 @@ def test_facade_byte_queries_forward_the_in_kernel_qk_norm(
         assert seen[-1][1]["use_qk_l2norm_in_kernel"] is True, query
 
 
-def test_facade_forwards_the_raw_gate_to_the_deterministic_package(
+def test_facade_forwards_the_raw_gate_on_both_routes(
     monkeypatch, torch_deterministic
 ) -> None:
-    """``deterministic=True`` forwards the raw gate keywords (the same objects) to the deterministic entries and
-    ``use_gate_in_kernel`` to its workspace byte query; ``deterministic=False`` refuses them, unless torch's
-    deterministic algorithms route the call to the deterministic package, which then receives them."""
+    """Both routes forward the raw gate keywords (the same objects) to their package's entries (``deterministic=False``
+    with the mode) and ``use_gate_in_kernel`` to their byte queries; the non-deterministic route refuses
+    ``use_qk_l2norm_in_kernel=True`` in the package's own entries; under torch's deterministic algorithms a
+    ``deterministic=False`` call reaches the deterministic package with the keywords."""
     seen = _route_recorders(monkeypatch)
     calls = _facade_calls()
     gate = _raw_gate_keywords()
@@ -673,12 +740,18 @@ def test_facade_forwards_the_raw_gate_to_the_deterministic_package(
         assert calls[entry](**gate) == f"det:{FACADE_DET_NAMES[entry]}", entry
         for key, value in gate.items():
             assert seen[-1][1][key] is value, (entry, key)
-    kcp_api.kda_workspace_bytes_kcp(object(), use_gate_in_kernel=True)
-    assert seen[-1][1]["use_gate_in_kernel"] is True
+        assert calls[entry](deterministic=False, **gate) == f"nd:{entry}", entry
+        for key, value in gate.items():
+            assert seen[-1][1][key] is value, (entry, key)
+        assert seen[-1][1]["deterministic"] is False, entry
+    for query in ("kda_workspace_bytes_kcp", "kda_saved_bytes_kcp"):
+        for det in (True, False):
+            getattr(kcp_api, query)(
+                object(), use_gate_in_kernel=True, deterministic=det
+            )
+            assert seen[-1][1]["use_gate_in_kernel"] is True, (query, det)
     monkeypatch.undo()  # the package's own entries: the refusal is theirs
     t = torch.zeros(1)
-    with pytest.raises(ValueError, match=RAW_GATE):
-        kcp_api.chunk_kda_fwd_kcp(t, t, t, t, t, object(), deterministic=False, **gate)
     with pytest.raises(ValueError, match=QK_NORM):
         kcp_api.chunk_kda_kcp(
             t, t, t, t, t, object(), deterministic=False, use_qk_l2norm_in_kernel=True
@@ -694,34 +767,51 @@ def test_facade_forwards_the_raw_gate_to_the_deterministic_package(
         assert seen[-1][1]["use_gate_in_kernel"] is True, entry
 
 
-def test_facade_reduces_the_gate_parameter_grads_on_the_deterministic_package(
+def test_facade_reduces_the_gate_parameter_grads_by_mode(
     monkeypatch, torch_deterministic
 ) -> None:
-    """``reduce_gate_param_grads_kcp`` is the deterministic package's ``reduce_gate_param_grads_det_kcp`` behind the
-    mode keyword (keyword-only, default ``True``): ``deterministic=False`` is a ``ValueError`` (the raw gate runs on
-    the deterministic package only) unless torch's deterministic algorithms route it there; a non-bool is a
-    ``TypeError``."""
+    """``reduce_gate_param_grads_kcp`` takes the mode keyword (keyword-only, default ``True``): ``True`` runs the
+    deterministic package's ``reduce_gate_param_grads_det_kcp``, ``False`` this package's
+    ``reduce_gate_param_grads_kcp`` (the same arguments, no mode), and torch's deterministic algorithms route
+    ``False`` to the deterministic package; a non-bool is a ``TypeError``.  Unpatched, the two helpers return the
+    same bits on one rank."""
     p = inspect.signature(kcp_api.reduce_gate_param_grads_kcp).parameters[
         "deterministic"
     ]
     assert p.kind is inspect.Parameter.KEYWORD_ONLY and p.default is True
+    one = type("OneRank", (), {"world_size": 1, "group": None})()
+    dA_log = torch.arange(4, dtype=torch.float32)
+    ddt_bias = torch.linspace(-1.0, 1.0, 4 * 128).view(4, 128)
+    nd_res = kcp_api.reduce_gate_param_grads_kcp(
+        one, dA_log, ddt_bias, deterministic=False
+    )
+    det_res = kcp_api.reduce_gate_param_grads_kcp(one, dA_log, ddt_bias)
+    for a, b in zip(nd_res, det_res, strict=True):
+        assert a.shape == b.shape and a.dtype == b.dtype and torch.equal(a, b)
     seen = []
 
-    def recorder(*args, **kwargs):
-        seen.append((args, kwargs))
-        return "det:reduce_gate_param_grads_det_kcp"
+    def recorder(tag):
+        def fn(*args, **kwargs):
+            seen.append((tag, args, kwargs))
+            return tag
 
-    monkeypatch.setattr(_det("cake_kcp"), "reduce_gate_param_grads_det_kcp", recorder)
+        return fn
+
+    monkeypatch.setattr(
+        _det("cake_kcp"), "reduce_gate_param_grads_det_kcp", recorder("det")
+    )
+    monkeypatch.setattr(_mod("cake_kcp"), "reduce_gate_param_grads_kcp", recorder("nd"))
     ctx, dA_log, ddt_bias = object(), torch.zeros(4), torch.zeros(4, 128)
     for kw in ({}, {"deterministic": True}):
         seen.clear()
-        assert (
-            kcp_api.reduce_gate_param_grads_kcp(ctx, dA_log, ddt_bias, **kw)
-            == "det:reduce_gate_param_grads_det_kcp"
-        )
-        assert seen == [((ctx, dA_log, ddt_bias), {})]
-    with pytest.raises(ValueError, match="pass deterministic=True"):
+        assert kcp_api.reduce_gate_param_grads_kcp(ctx, dA_log, ddt_bias, **kw) == "det"
+        assert seen == [("det", (ctx, dA_log, ddt_bias), {})]
+    seen.clear()
+    assert (
         kcp_api.reduce_gate_param_grads_kcp(ctx, dA_log, ddt_bias, deterministic=False)
+        == "nd"
+    )
+    assert seen == [("nd", (ctx, dA_log, ddt_bias), {})]
     for bad in (1, 0, None, "False"):
         with pytest.raises(TypeError, match="deterministic must be a bool"):
             kcp_api.reduce_gate_param_grads_kcp(
@@ -732,7 +822,7 @@ def test_facade_reduces_the_gate_parameter_grads_on_the_deterministic_package(
     torch.use_deterministic_algorithms(True)
     assert (
         kcp_api.reduce_gate_param_grads_kcp(ctx, dA_log, ddt_bias, deterministic=False)
-        == "det:reduce_gate_param_grads_det_kcp"
+        == "det"
     )
 
 
@@ -811,9 +901,9 @@ def _nd_objects() -> list:
 
 
 def test_legacy_names_stay_the_deterministic_objects() -> None:
-    """``flashinfer.kda_train`` and the compatibility package ``flashinfer.experimental.cake_kda_train`` stay the
-    deterministic package's paths: every previous name IS its deterministic object and none is an object of this
-    package or of the facade (``chunk_kda_kcp``, spelled by both, included)."""
+    """The det name of every previous name (``flashinfer.cake_kda_det_train_kcp`` and the det package
+    ``flashinfer.experimental.cake_kda_det_train_kcp``) is a deterministic object and none is an object of this
+    package or of the facade (``chunk_kda_kcp`` included)."""
     nd = _nd_objects()
     assert len(nd) > 50
 
@@ -821,17 +911,17 @@ def test_legacy_names_stay_the_deterministic_objects() -> None:
         return any(obj is o for o in nd)
 
     for old, new in LEGACY_FACADE_NAMES.items():
-        obj = getattr(kda_train, old)
+        obj = getattr(det_api, new)
         assert obj is getattr(det_api, new), old
         assert not is_nd(obj), old
     for old, new in LEGACY_TYPE_NAMES.items():
-        obj = getattr(kda_train, old)
+        obj = getattr(det_api, new)
         assert obj is getattr(det_api, new), old
         assert not is_nd(obj), old
-    assert kda_train.chunk_kda_kcp is not kcp_api.chunk_kda_kcp
-    assert kda_train.chunk_kda_kcp is not _mod("cake_kcp").chunk_kda_kcp
+    assert det_api.chunk_kda_det_kcp is not kcp_api.chunk_kda_kcp
+    assert det_api.chunk_kda_det_kcp is not _mod("cake_kcp").chunk_kda_kcp
     for sub in ("cake_kcp", "cake_kcp_plan", "cake_kcp_jit"):
-        compat = importlib.import_module(f"{COMPAT_PACKAGE}.{sub}")
+        compat = importlib.import_module(f"{DET_PACKAGE}.{sub}")
         assert compat is _det(sub), sub
         assert compat is not _mod(sub), sub
     for name in (

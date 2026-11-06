@@ -1040,6 +1040,102 @@ def test_moe_unfused_finalize(
     )
 
 
+@_CUTLASS_MOE_ARCH_SKIP
+def test_moe_deterministic_mode_selects_unfused_finalize():
+    """Under ``torch.use_deterministic_algorithms(True)`` the default finalize is unfused.
+
+    Two autotuned runs of the same routed BF16 batch, with ``use_fused_finalize``
+    left at its default, must be bit-identical, and no fused-finalize runner may be
+    built for the call.
+    """
+    batch_size, hidden_size, intermediate_size, num_experts, top_k = (
+        256,
+        1024,
+        1024,
+        8,
+        4,
+    )
+    dtype = torch.bfloat16
+    torch.manual_seed(42)
+    x = torch.randn(batch_size, hidden_size, dtype=dtype).cuda() / 5
+    router_logits = torch.randn(batch_size, num_experts, dtype=torch.float32).cuda()
+    w31_weight = (
+        torch.randn(num_experts, 2 * intermediate_size, hidden_size, dtype=dtype).cuda()
+        / 10
+    )
+    w2_weight = (
+        torch.randn(num_experts, hidden_size, intermediate_size, dtype=dtype).cuda()
+        / 10
+    )
+    routing_weights, selected_experts = compute_routing(router_logits, top_k)
+    selected_experts = selected_experts.to(torch.int)
+    ref_output = compute_with_experts(
+        num_experts,
+        x.float(),
+        w31_weight.float(),
+        w2_weight.float(),
+        selected_experts,
+        routing_weights,
+    )
+
+    major, minor = get_compute_capability(torch.device("cuda"))
+    runner_dict = get_cutlass_fused_moe_module(
+        f"{major * 10 + minor}"
+    ).MoERunner.runner_dict
+    runners_before = set(runner_dict)
+
+    def run_default():
+        out = torch.empty(batch_size, hidden_size, dtype=dtype, device="cuda")
+        return fused_moe.cutlass_fused_moe(
+            x,
+            selected_experts,
+            routing_weights,
+            w31_weight,
+            w2_weight,
+            dtype,
+            output=out,
+            quant_scales=None,
+        )[0]
+
+    was_deterministic = torch.are_deterministic_algorithms_enabled()
+    was_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    torch.use_deterministic_algorithms(True)
+    try:
+        with autotune(True):
+            out1 = run_default()
+            out2 = run_default()
+        ws_default = fused_moe.cutlass_fused_moe_workspace_size(
+            batch_size,
+            hidden_size,
+            intermediate_size,
+            num_experts,
+            top_k,
+            x_dtype=dtype,
+            weight_dtype=dtype,
+            output_dtype=dtype,
+        )
+    finally:
+        torch.use_deterministic_algorithms(was_deterministic, warn_only=was_warn_only)
+
+    ws_unfused = fused_moe.cutlass_fused_moe_workspace_size(
+        batch_size,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        top_k,
+        x_dtype=dtype,
+        weight_dtype=dtype,
+        output_dtype=dtype,
+        use_fused_finalize=False,
+    )
+
+    torch.testing.assert_close(ref_output, out1.float(), rtol=2e-2, atol=2e-2)
+    assert torch.equal(out1, out2), "deterministic mode must give bit-identical outputs"
+    assert ws_default == ws_unfused
+    new_runners = set(runner_dict) - runners_before
+    assert all(key[7] is False for key in new_runners), new_runners
+
+
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
 @pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
 @pytest.mark.parametrize("num_experts", NUM_EXPERTS)

@@ -59,8 +59,8 @@ checks:
   ratio printed, also with the unit order forced to each of ``"chunk"`` and
   ``"slab"`` where the device's route holds that order's records (the board
   cells of ``BWD_SLAB_ORDER_OVERRIDES`` / ``BWD_SLAB_LPT_OVERRIDES`` emptied,
-  so the forced order holds on every board, the 212-SM sm_107a one too); run
-  to run, ``dX`` / ``dscale`` / ``dbase`` identical
+  so the forced order holds on every board, the 212-SM sm_107a and 152-SM
+  sm_103a ones too); run to run, ``dX`` / ``dscale`` / ``dbase`` identical
   and the ``dfn`` bits that differ counted and printed (never asserted);
 * the two-size schedule at forced geometries (``cake_jit.lpt_chunks`` replaced
   for one token count: one size, one small chunk, several, small chunks past
@@ -1274,9 +1274,10 @@ def test_matches_the_deterministic_backward(hidden: int, T: int) -> None:
 def forced_order():
     """``force(hidden, order)``: the board cells of ``cake_jit.BWD_SLAB_ORDER_OVERRIDES`` and
     ``cake_jit.BWD_SLAB_LPT_OVERRIDES`` emptied (a board cell would replace the forced order, as on sm_107a with 212
-    SMs, and its calibration the architecture's) and ``cake_jit.BWD_SLAB_ORDER`` of the device's architecture at
-    ``hidden`` set to ``order`` (``"chunk"`` or ``"slab"``) at every token count, with the package's route-plan caches
-    cleared on entry, after each edit and after the restore (a plan binds the selection of its token count)."""
+    SMs at hidden 4096 and on sm_103a with 152 SMs at 7168, and its calibration the architecture's) and
+    ``cake_jit.BWD_SLAB_ORDER`` of the device's architecture at ``hidden`` set to ``order`` (``"chunk"`` or
+    ``"slab"``) at every token count, with the package's route-plan caches cleared on entry, after each edit and after
+    the restore (a plan binds the selection of its token count)."""
     with pytest.MonkeyPatch.context() as patch:
 
         def force(hidden: int, order: str) -> None:

@@ -30,8 +30,7 @@ the history rows, the backward's head rows and the tail fold all run through the
     the direct forward / backward calls, and the fold of the received ``dpre`` rows reproduces the unpartitioned
     launch's ``dx`` through the same host flow.
 
-A ``KcpContext`` is built with ``build_kcp_context`` when the KCP plan module is importable, else from the same
-tables hand-built here (the plan's halo layout for one rank).
+A ``ContextDetKcp`` is built with ``build_context_det_kcp`` of the KDA KCP plan module.
 """
 
 from __future__ import annotations
@@ -46,10 +45,10 @@ from flashinfer.cake_causal_conv1d_det_train import (
     cake_causal_conv1d_det_train_forward,
     is_cake_causal_conv1d_det_train_supported,
 )
-from flashinfer.cake_causal_conv1d_det_train_backend.kcp import (
+from flashinfer.experimental.cake.cake_causal_conv1d_det_train.kcp import (
     cake_causal_conv1d_det_kcp,
-    cake_causal_conv1d_det_backward_kcp,
-    cake_causal_conv1d_det_forward_kcp,
+    cake_causal_conv1d_det_train_kcp_backward,
+    cake_causal_conv1d_det_train_kcp_forward,
 )
 
 WIDTH = 4
@@ -110,127 +109,19 @@ def _fragments(lens, cuts):
     return S, tuple(cu), frags
 
 
-def _halo_tables(lens, frags):
-    """One rank's halo plan over ``frags`` (local order = the given order): the kernels' tables and the row pools'
-    sizes, laid out as the plan does for a single rank (receive pool rows in consumer order)."""
-    n_frag = len(frags)
-    local_cu = [0]
-    for _, _, ln in frags:
-        local_cu.append(local_cu[-1] + ln)
-    by_doc = {}
-    for slot, (d, off, ln) in enumerate(frags):
-        if ln > 0:
-            by_doc.setdefault(d, []).append((off, ln, slot))
-    owner = {}  # (doc, token) -> (slot, pos)
-    for d, chain in by_doc.items():
-        for off, ln, slot in chain:
-            for t in range(off, off + ln):
-                owner[(d, t)] = (slot, t - off)
-    hist_row_off = [[-1] * HALO for _ in range(n_frag)]
-    hist_index = []
-    n = 0
-    for slot, (d, off, ln) in enumerate(frags):
-        if ln == 0 or off == 0:
-            continue
-        for k in range(HALO):
-            tok = off - HALO + k
-            if tok < 0:
-                continue
-            src_slot, pos = owner[(d, tok)]
-            hist_row_off[slot][k] = n
-            hist_index.append(local_cu[src_slot] + pos)
-            n += 1
-    n_hist = n
-    tail_row_off = [[-1] * HALO for _ in range(n_frag)]
-    head_row_off = [[[-1] * HALO for _ in range(HALO)] for _ in range(n_frag)]
-    n = 0
-    for slot, (d, off, ln) in enumerate(frags):
-        if ln == 0:
-            continue
-        end = off + ln
-        for m in range(HALO):
-            tok = end + m
-            if (d, tok) not in owner:
-                continue
-            succ_slot, pos = owner[(d, tok)]
-            if pos >= HALO:
-                continue  # the successor's token beyond its first three rows is never a head row
-            tail_row_off[slot][m] = n
-            slots = head_row_off[succ_slot][pos]
-            free = [c for c in range(HALO) if slots[c] == -1]
-            assert free, "a head token has at most three consuming fragments"
-            slots[free[0]] = n
-            n += 1
-    n_tail = n
-    return types.SimpleNamespace(
-        n_frag=n_frag,
-        local_cu=tuple(local_cu),
-        hist_row_off=hist_row_off,
-        tail_row_off=tail_row_off,
-        head_row_off=head_row_off,
-        hist_index=hist_index,
-        n_hist_rows=n_hist,
-        n_head_rows=n_tail,
-        n_tail_rows=n_tail,
-    )
-
-
 def _context(lens, cuts, device):
-    """A one-rank ``KcpContext`` for ``cuts`` over documents ``lens``: ``build_kcp_context`` when the plan module
-    is importable, else a stand-in with the same fields the conv host module reads."""
-    S, cu_global, frags = _fragments(lens, cuts)
-    try:
-        from flashinfer.experimental.cake_kda_train.cake_kcp_plan import (
-            build_kcp_context,
-            kcp_partition,
-        )
+    """A one-rank ``ContextDetKcp`` for ``cuts`` over documents ``lens``, built by the KDA KCP plan module (imported
+    unconditionally: a renamed or moved plan fails here instead of silently testing a stand-in context)."""
+    from flashinfer.experimental.cake_kda_det_train_kcp.cake_kcp_plan import (
+        build_context_det_kcp,
+        partition_det_kcp,
+    )
 
-        part = kcp_partition(
-            torch.tensor(cu_global, dtype=torch.int64), 1, fragments=[frags]
-        )
-        ctx = build_kcp_context(part, None, 0, device, conv_kernel_size=WIDTH)
-        return ctx, S, cu_global, frags
-    except ImportError:
-        pass
-    t = _halo_tables(lens, frags)
-    i32 = torch.int32
-    halo = types.SimpleNamespace(
-        halo=HALO,
-        hist_row_off=tuple(tuple(r) for r in t.hist_row_off),
-        tail_row_off=tuple(tuple(r) for r in t.tail_row_off),
-        head_row_off=tuple(tuple(tuple(c) for c in r) for r in t.head_row_off),
-        hist_index=tuple(t.hist_index),
-        fwd_send_rows=(t.n_hist_rows,),
-        fwd_recv_rows=(t.n_hist_rows,),
-        bwd_send_rows=(t.n_head_rows,),
-        bwd_recv_rows=(t.n_tail_rows,),
-        n_hist_rows=t.n_hist_rows,
-        n_head_rows=t.n_head_rows,
-        n_tail_rows=t.n_tail_rows,
+    S, cu_global, frags = _fragments(lens, cuts)
+    part = partition_det_kcp(
+        torch.tensor(cu_global, dtype=torch.int64), 1, fragments=[frags]
     )
-    ctx = types.SimpleNamespace(
-        rank=0,
-        world_size=1,
-        group=None,
-        device=device,
-        conv_kernel_size=WIDTH,
-        T_r=S,
-        n_frag=t.n_frag,
-        cu_seqlens_local=torch.tensor(t.local_cu, dtype=i32, device=device),
-        halo=halo,
-        halo_tables={
-            "hist_row_off": torch.tensor(
-                t.hist_row_off, dtype=i32, device=device
-            ).reshape(t.n_frag, HALO),
-            "tail_row_off": torch.tensor(
-                t.tail_row_off, dtype=i32, device=device
-            ).reshape(t.n_frag, HALO),
-            "head_row_off": torch.tensor(
-                t.head_row_off, dtype=i32, device=device
-            ).reshape(t.n_frag, HALO, HALO),
-            "hist_index": torch.tensor(t.hist_index, dtype=torch.int64, device=device),
-        },
-    )
+    ctx = build_context_det_kcp(part, None, 0, device, conv_kernel_size=WIDTH)
     return ctx, S, cu_global, frags
 
 
@@ -344,7 +235,7 @@ def _bits(t):
 def test_forward_matches_unpartitioned_bitwise(name, lens, cuts, C):
     device = torch.device("cuda")
     p = _problem(lens, cuts, C, device)
-    y_local, hist = cake_causal_conv1d_det_forward_kcp(p.x_local, p.w, p.ctx)
+    y_local, hist = cake_causal_conv1d_det_train_kcp_forward(p.x_local, p.w, p.ctx)
     y_global = cake_causal_conv1d_det_train_forward(p.x, p.w, p.cu)
     torch.cuda.synchronize()
     assert hist.shape[0] == max(1, p.ctx.halo.n_hist_rows)
@@ -366,8 +257,8 @@ def test_backward_matches_reference_and_folds_tails_bitwise(
 ):
     device = torch.device("cuda")
     p = _problem(lens, cuts, C, device)
-    _, hist = cake_causal_conv1d_det_forward_kcp(p.x_local, p.w, p.ctx)
-    dx_local, dw_local = cake_causal_conv1d_det_backward_kcp(
+    _, hist = cake_causal_conv1d_det_train_kcp_forward(p.x_local, p.w, p.ctx)
+    dx_local, dw_local = cake_causal_conv1d_det_train_kcp_backward(
         p.x_local, p.w, p.ctx, p.dy_local, hist
     )
     torch.cuda.synchronize()
@@ -395,8 +286,10 @@ def test_backward_matches_reference_and_folds_tails_bitwise(
     # (c) The unpartitioned problem through the same host flow (one fragment per document, no halo rows): the fold
     # of the received dpre rows reproduces its dx bit for bit.
     whole = _problem(lens, tuple(lens), C, device)
-    _, hist_w = cake_causal_conv1d_det_forward_kcp(whole.x_local, whole.w, whole.ctx)
-    dx_whole, _ = cake_causal_conv1d_det_backward_kcp(
+    _, hist_w = cake_causal_conv1d_det_train_kcp_forward(
+        whole.x_local, whole.w, whole.ctx
+    )
+    dx_whole, _ = cake_causal_conv1d_det_train_kcp_backward(
         whole.x_local, whole.w, whole.ctx, whole.dy_local, hist_w
     )
     torch.cuda.synchronize()
@@ -417,8 +310,8 @@ def test_autograd_function_and_repeat_are_bitwise(name, lens, cuts, C, record_pr
         y = cake_causal_conv1d_det_kcp(x, w, p.ctx)
         y.backward(p.dy_local)
         runs.append((y.detach(), x.grad, w.grad))
-    y_direct, hist = cake_causal_conv1d_det_forward_kcp(p.x_local, p.w, p.ctx)
-    dx_direct, dw_direct = cake_causal_conv1d_det_backward_kcp(
+    y_direct, hist = cake_causal_conv1d_det_train_kcp_forward(p.x_local, p.w, p.ctx)
+    dx_direct, dw_direct = cake_causal_conv1d_det_train_kcp_backward(
         p.x_local, p.w, p.ctx, p.dy_local, hist
     )
     torch.cuda.synchronize()
@@ -455,8 +348,10 @@ def test_empty_rank_returns_empty_outputs():
     ctx, S, _, _ = _context((0,), (0,), device)
     x = torch.empty(0, C, dtype=torch.bfloat16, device=device)
     w = torch.randn(C, WIDTH, device=device)
-    y, hist = cake_causal_conv1d_det_forward_kcp(x, w, ctx)
-    dx, dw = cake_causal_conv1d_det_backward_kcp(x, w, ctx, torch.empty_like(x), hist)
+    y, hist = cake_causal_conv1d_det_train_kcp_forward(x, w, ctx)
+    dx, dw = cake_causal_conv1d_det_train_kcp_backward(
+        x, w, ctx, torch.empty_like(x), hist
+    )
     assert y.shape == (0, C) and dx.shape == (0, C)
     assert torch.equal(dw, torch.zeros_like(dw))
 
@@ -465,7 +360,9 @@ def test_rejects_mismatched_context():
     device = torch.device("cuda")
     p = _problem((5000, 1003), (1, 2, 4997, 1003), 512, device)
     with pytest.raises(ValueError):
-        cake_causal_conv1d_det_forward_kcp(p.x_local[:-1].contiguous(), p.w, p.ctx)
+        cake_causal_conv1d_det_train_kcp_forward(
+            p.x_local[:-1].contiguous(), p.w, p.ctx
+        )
 
 
 def test_kcp_keeps_fp32_taps_and_no_bias():
@@ -475,9 +372,11 @@ def test_kcp_keeps_fp32_taps_and_no_bias():
     device = torch.device("cuda")
     p = _problem((5000, 1003), (1, 2, 4997, 1003), 512, device)
     with pytest.raises(ValueError, match="weight must be torch.float32"):
-        cake_causal_conv1d_det_forward_kcp(p.x_local, p.w.to(torch.bfloat16), p.ctx)
+        cake_causal_conv1d_det_train_kcp_forward(
+            p.x_local, p.w.to(torch.bfloat16), p.ctx
+        )
     with pytest.raises(ValueError, match="weight must be torch.float32"):
-        cake_causal_conv1d_det_backward_kcp(
+        cake_causal_conv1d_det_train_kcp_backward(
             p.x_local,
             p.w.to(torch.bfloat16),
             p.ctx,
@@ -486,7 +385,7 @@ def test_kcp_keeps_fp32_taps_and_no_bias():
         )
     bias = torch.zeros(p.C, device=device)
     with pytest.raises(TypeError):
-        cake_causal_conv1d_det_forward_kcp(p.x_local, p.w, p.ctx, bias=bias)
+        cake_causal_conv1d_det_train_kcp_forward(p.x_local, p.w, p.ctx, bias=bias)
     with pytest.raises(TypeError):
         cake_causal_conv1d_det_kcp(p.x_local, p.w, p.ctx, bias)
 
@@ -496,8 +395,10 @@ def test_kcp_plans_with_the_legacy_tile_rule(monkeypatch):
     n_ch_tiles) = (128, 1, 2)`` (the training routes tile it as (32, 4, 5)), and the forward's ``y`` stays
     bitwise the unpartitioned forward's."""
 
-    from flashinfer.cake_causal_conv1d_det_train_backend import cake_jit
-    from flashinfer.cake_causal_conv1d_det_train_backend import kcp as conv_kcp
+    from flashinfer.experimental.cake.cake_causal_conv1d_det_train import cake_jit
+    from flashinfer.experimental.cake.cake_causal_conv1d_det_train import (
+        kcp as conv_kcp,
+    )
 
     geometry = {"threads": 128, "vec": 8}
     legacy = cake_jit.plan(5000, 1280, 2, geometry=geometry, legacy=True)
@@ -514,8 +415,8 @@ def test_kcp_plans_with_the_legacy_tile_rule(monkeypatch):
     monkeypatch.setattr(conv_kcp, "plan", recording_plan)
     device = torch.device("cuda")
     p = _problem((5000, 1003), (1, 2, 4997, 1003), 1280, device)
-    y, hist = cake_causal_conv1d_det_forward_kcp(p.x_local, p.w, p.ctx)
-    dx, dw = cake_causal_conv1d_det_backward_kcp(
+    y, hist = cake_causal_conv1d_det_train_kcp_forward(p.x_local, p.w, p.ctx)
+    dx, dw = cake_causal_conv1d_det_train_kcp_backward(
         p.x_local, p.w, p.ctx, p.dy_local, hist
     )
     assert len(calls) == 2 and all(call.get("legacy") is True for call in calls), calls
@@ -531,14 +432,16 @@ def test_graph_replay_knob_is_bitwise(monkeypatch, form) -> None:
     the second is captured and replayed once, later calls replay the graph; ``y`` / ``hist`` / ``dx`` / ``dweight``
     are bitwise the knob-off results on every call.  The backward's key holds the forward's ``hist`` pointer, so
     its capture follows the forward's by one call.  Another input pointer is another key (eager, still bitwise)."""
-    from flashinfer.cake_causal_conv1d_det_train_backend import kcp as conv_kcp
+    from flashinfer.experimental.cake.cake_causal_conv1d_det_train import (
+        kcp as conv_kcp,
+    )
 
     device = torch.device("cuda")
     p = _problem((5000, 1003), (1, 2, 4997, 1003), 512, device)
     x, w, ctx = p.x_local, p.w, p.ctx
     dy = torch.randn(x.shape, device=device).to(torch.bfloat16)
-    y0, hist0 = cake_causal_conv1d_det_forward_kcp(x, w, ctx)
-    dx0, dw0 = cake_causal_conv1d_det_backward_kcp(x, w, ctx, dy, hist0)
+    y0, hist0 = cake_causal_conv1d_det_train_kcp_forward(x, w, ctx)
+    dx0, dw0 = cake_causal_conv1d_det_train_kcp_backward(x, w, ctx, dy, hist0)
     kw = {}
     if form == "knob":
         monkeypatch.setenv(conv_kcp.TEST_KNOBS_ENV, "1")
@@ -548,10 +451,12 @@ def test_graph_replay_knob_is_bitwise(monkeypatch, form) -> None:
     try:
         events = []
         for _ in range(4):
-            y, hist = cake_causal_conv1d_det_forward_kcp(x, w, ctx, **kw)
+            y, hist = cake_causal_conv1d_det_train_kcp_forward(x, w, ctx, **kw)
             events.append(conv_kcp.LAST_CALL["fwd"]["graph_event"])
             assert torch.equal(y, y0) and torch.equal(hist, hist0)
-            dx, dw = cake_causal_conv1d_det_backward_kcp(x, w, ctx, dy, hist, **kw)
+            dx, dw = cake_causal_conv1d_det_train_kcp_backward(
+                x, w, ctx, dy, hist, **kw
+            )
             events.append(conv_kcp.LAST_CALL["bwd"]["graph_event"])
             assert torch.equal(dx, dx0) and torch.equal(dw, dw0)
         assert events == [
@@ -565,7 +470,7 @@ def test_graph_replay_knob_is_bitwise(monkeypatch, form) -> None:
             "replay",
         ], events
         assert conv_kcp.GRAPH_STATS["fallback"] == 0
-        y, hist = cake_causal_conv1d_det_forward_kcp(x.clone(), w, ctx, **kw)
+        y, hist = cake_causal_conv1d_det_train_kcp_forward(x.clone(), w, ctx, **kw)
         assert conv_kcp.LAST_CALL["fwd"]["graph_event"] == "eager"
         assert torch.equal(y, y0) and torch.equal(hist, hist0)
         if (
@@ -581,7 +486,7 @@ def test_graph_replay_knob_is_bitwise(monkeypatch, form) -> None:
     finally:
         conv_kcp._set_test_knobs(None)
         conv_kcp._GRAPHS.clear()
-    y, hist = cake_causal_conv1d_det_forward_kcp(x, w, ctx)
+    y, hist = cake_causal_conv1d_det_train_kcp_forward(x, w, ctx)
     assert torch.equal(y, y0) and torch.equal(hist, hist0)
 
 
@@ -677,12 +582,14 @@ def test_recompute_handle_is_bitwise_and_exchange_free(
     ``y`` / ``dx`` / ``dweight`` are bitwise the plain checkpoint's, the direct pass's and the explicit
     forward / backward calls' (``recompute_handle=None`` is the unchanged path); the handle holds exactly the
     history pool, the saved set's own tensor."""
-    from flashinfer.cake_causal_conv1d_det_train_backend import kcp as conv_kcp
+    from flashinfer.experimental.cake.cake_causal_conv1d_det_train import (
+        kcp as conv_kcp,
+    )
 
     device = torch.device("cuda")
     p = _problem(lens, cuts, C, device)
-    y_e, hist_e = cake_causal_conv1d_det_forward_kcp(p.x_local, p.w, p.ctx)
-    dx_e, dw_e = cake_causal_conv1d_det_backward_kcp(
+    y_e, hist_e = cake_causal_conv1d_det_train_kcp_forward(p.x_local, p.w, p.ctx)
+    dx_e, dw_e = cake_causal_conv1d_det_train_kcp_backward(
         p.x_local, p.w, p.ctx, p.dy_local, hist_e
     )
     explicit = {"y": y_e, "dx": dx_e, "dw": dw_e}
@@ -690,7 +597,7 @@ def test_recompute_handle_is_bitwise_and_exchange_free(
     plain_cc = _ExchangeCounter(monkeypatch, conv_kcp)
     plain = _ckpt_run(p, reentrant=reentrant, counter=plain_cc)
     monkeypatch.undo()
-    handle = conv_kcp.RecomputeHandleDetKcp()
+    handle = conv_kcp.CakeCausalConv1dDetKcpRecomputeHandle()
     cc = _ExchangeCounter(monkeypatch, conv_kcp)
     conv_kcp.LAST_CALL.pop("recompute_handle", None)
     got = _ckpt_run(p, handle=handle, reentrant=reentrant, counter=cc)
@@ -729,14 +636,19 @@ def test_recompute_handle_retain_graph_and_nested_checkpoints(monkeypatch) -> No
     from torch.utils.checkpoint import checkpoint
 
     from flashinfer import cake_causal_conv1d_det_train_kcp as facade
-    from flashinfer.cake_causal_conv1d_det_train_backend import kcp as conv_kcp
+    from flashinfer.experimental.cake.cake_causal_conv1d_det_train import (
+        kcp as conv_kcp,
+    )
 
     device = torch.device("cuda")
     p = _problem((5000, 1003), (1, 2, 4997, 1003), 512, device)
     direct = _ckpt_run(p, ckpt=False)
     cc = _ExchangeCounter(monkeypatch, conv_kcp)
     twice = _ckpt_run(
-        p, handle=conv_kcp.RecomputeHandleDetKcp(), counter=cc, twice=True
+        p,
+        handle=conv_kcp.CakeCausalConv1dDetKcpRecomputeHandle(),
+        counter=cc,
+        twice=True,
     )
     assert cc.table() == {"orig": 1, "recompute": 0, "bwd": 2}
     assert torch.equal(_bits(twice["dx"]), _bits(direct["dx"] + direct["dx"]))
@@ -752,7 +664,7 @@ def test_recompute_handle_retain_graph_and_nested_checkpoints(monkeypatch) -> No
             return facade.cake_causal_conv1d_det_kcp(x_, w_, p.ctx, recompute_handle=h_)
 
         def outer(x_, w_, h_):
-            hh = conv_kcp.RecomputeHandleDetKcp() if inside else h_
+            hh = conv_kcp.CakeCausalConv1dDetKcpRecomputeHandle() if inside else h_
             yi = checkpoint(inner, x_, w_, hh, use_reentrant=False)
             return yi * torch.ones_like(
                 yi
@@ -762,7 +674,7 @@ def test_recompute_handle_retain_graph_and_nested_checkpoints(monkeypatch) -> No
             outer,
             x,
             w,
-            conv_kcp.RecomputeHandleDetKcp(),
+            conv_kcp.CakeCausalConv1dDetKcpRecomputeHandle(),
             use_reentrant=False,
             context_fn=lambda: (contextlib.nullcontext(), counter.recompute_cm()),
         )
@@ -787,11 +699,13 @@ def test_recompute_handle_misuse_raises() -> None:
     from torch.utils.checkpoint import checkpoint
 
     from flashinfer import cake_causal_conv1d_det_train_kcp as facade
-    from flashinfer.cake_causal_conv1d_det_train_backend import kcp as conv_kcp
+    from flashinfer.experimental.cake.cake_causal_conv1d_det_train import (
+        kcp as conv_kcp,
+    )
 
     device = torch.device("cuda")
     p = _problem((5000, 1003), (1, 2, 4997, 1003), 512, device)
-    handle = conv_kcp.RecomputeHandleDetKcp()
+    handle = conv_kcp.CakeCausalConv1dDetKcpRecomputeHandle()
     facade.cake_causal_conv1d_det_kcp(p.x_local, p.w, p.ctx, recompute_handle=handle)
     assert conv_kcp.LAST_CALL["recompute_handle"] == {"fwd": "capture"}
     with pytest.raises(RuntimeError, match="per call and micro-step"):
@@ -804,7 +718,7 @@ def test_recompute_handle_misuse_raises() -> None:
             p.w,
             p.ctx,
             graph="replay",
-            recompute_handle=conv_kcp.RecomputeHandleDetKcp(),
+            recompute_handle=conv_kcp.CakeCausalConv1dDetKcpRecomputeHandle(),
         )
     with pytest.raises(TypeError, match="entries"):
         facade.cake_causal_conv1d_det_kcp(
@@ -813,22 +727,25 @@ def test_recompute_handle_misuse_raises() -> None:
     graph = torch.cuda.CUDAGraph()
     with pytest.raises(ValueError, match="capture"), torch.cuda.graph(graph):
         conv_kcp.cake_causal_conv1d_det_kcp(
-            p.x_local, p.w, p.ctx, recompute_handle=conv_kcp.RecomputeHandleDetKcp()
+            p.x_local,
+            p.w,
+            p.ctx,
+            recompute_handle=conv_kcp.CakeCausalConv1dDetKcpRecomputeHandle(),
         )
     del graph
     # the public autograd Function refuses like the wrapper (graph keyword, capture, no entries dict)
-    fresh = conv_kcp.RecomputeHandleDetKcp()
+    fresh = conv_kcp.CakeCausalConv1dDetKcpRecomputeHandle()
     with pytest.raises(ValueError, match="graph='off'"):
-        conv_kcp.CakeCausalConv1dDetFunctionKcp.apply(
+        conv_kcp.CakeCausalConv1dDetKcpFunction.apply(
             p.x_local, p.w, p.ctx, "replay", fresh
         )
     with pytest.raises(TypeError, match="entries"):
-        conv_kcp.CakeCausalConv1dDetFunctionKcp.apply(
+        conv_kcp.CakeCausalConv1dDetKcpFunction.apply(
             p.x_local, p.w, p.ctx, None, object()
         )
     graph = torch.cuda.CUDAGraph()
     with pytest.raises(ValueError, match="capture"), torch.cuda.graph(graph):
-        conv_kcp.CakeCausalConv1dDetFunctionKcp.apply(
+        conv_kcp.CakeCausalConv1dDetKcpFunction.apply(
             p.x_local, p.w, p.ctx, None, fresh
         )
     del graph
@@ -836,7 +753,7 @@ def test_recompute_handle_misuse_raises() -> None:
     # a recompute whose entry belongs to another context / problem raises inside the backward
     other = _problem((5000, 1003), (1, 2, 4997, 1003), 512, device)
     for tamper in ("ctx", "key"):
-        h = conv_kcp.RecomputeHandleDetKcp()
+        h = conv_kcp.CakeCausalConv1dDetKcpRecomputeHandle()
         x = p.x_local.clone().requires_grad_(True)
 
         def fn(x_, h_):
@@ -853,7 +770,7 @@ def test_recompute_handle_misuse_raises() -> None:
             y.backward(p.dy_local)
     # the entry dropped before the recompute: the recompute is an original forward (exchanges and stores)
     direct = _ckpt_run(p, ckpt=False)
-    h = conv_kcp.RecomputeHandleDetKcp()
+    h = conv_kcp.CakeCausalConv1dDetKcpRecomputeHandle()
     x = p.x_local.clone().requires_grad_(True)
     w = p.w.clone().requires_grad_(True)
     y = checkpoint(
@@ -873,13 +790,15 @@ def test_recompute_handle_misuse_raises() -> None:
 
 
 def test_recompute_handle_knob_graph_is_refused(monkeypatch) -> None:
-    from flashinfer.cake_causal_conv1d_det_train_backend import kcp as conv_kcp
+    from flashinfer.experimental.cake.cake_causal_conv1d_det_train import (
+        kcp as conv_kcp,
+    )
 
     device = torch.device("cuda")
     p = _problem((65,), (64, 1), 256, device)
     monkeypatch.setenv(conv_kcp.TEST_KNOBS_ENV, "1")
     conv_kcp._set_test_knobs({"graph": "replay"})
-    handle = conv_kcp.RecomputeHandleDetKcp()
+    handle = conv_kcp.CakeCausalConv1dDetKcpRecomputeHandle()
     try:
         with pytest.raises(ValueError, match="graph='off'"):
             conv_kcp.cake_causal_conv1d_det_kcp(
@@ -887,7 +806,7 @@ def test_recompute_handle_knob_graph_is_refused(monkeypatch) -> None:
             )
         # the public autograd Function refuses the knob too
         with pytest.raises(ValueError, match="graph='off'"):
-            conv_kcp.CakeCausalConv1dDetFunctionKcp.apply(
+            conv_kcp.CakeCausalConv1dDetKcpFunction.apply(
                 p.x_local, p.w, p.ctx, None, handle
             )
     finally:
@@ -900,7 +819,9 @@ def test_recompute_handle_knob_graph_is_refused(monkeypatch) -> None:
 def test_recompute_handle_both_host_paths(monkeypatch, host_trim) -> None:
     """The replay binds the stored pool on the trimmed and on the previous host path alike: bitwise, and no exchange
     in the recompute (the plain checkpoint, the positive control, exchanges once there)."""
-    from flashinfer.cake_causal_conv1d_det_train_backend import kcp as conv_kcp
+    from flashinfer.experimental.cake.cake_causal_conv1d_det_train import (
+        kcp as conv_kcp,
+    )
 
     device = torch.device("cuda")
     p = _problem((1, 2, 3, 57), (3, 30, 30), 384, device)
@@ -914,7 +835,9 @@ def test_recompute_handle_both_host_paths(monkeypatch, host_trim) -> None:
         # the next counter wraps the module's own exchange, not the first counter
         monkeypatch.setattr(conv_kcp, "_exchange", exchange)
         cc = _ExchangeCounter(monkeypatch, conv_kcp)
-        got = _ckpt_run(p, handle=conv_kcp.RecomputeHandleDetKcp(), counter=cc)
+        got = _ckpt_run(
+            p, handle=conv_kcp.CakeCausalConv1dDetKcpRecomputeHandle(), counter=cc
+        )
         assert conv_kcp.LAST_CALL["recompute_handle"] == {"fwd": "replay"}
     finally:
         conv_kcp._set_test_knobs(None)
@@ -950,26 +873,28 @@ class _RouteRecorder:
 )
 @pytest.mark.parametrize("host_trim", [0, 1])
 def test_backward_launch_forms(monkeypatch, name, lens, cuts, C, host_trim) -> None:
-    from flashinfer.cake_causal_conv1d_det_train_backend import kcp as conv_kcp
+    from flashinfer.experimental.cake.cake_causal_conv1d_det_train import (
+        kcp as conv_kcp,
+    )
 
     device = torch.device("cuda")
     p = _problem(lens, cuts, C, device)
     monkeypatch.setenv(conv_kcp.TEST_KNOBS_ENV, "1")
     conv_kcp._set_test_knobs({"host_trim": host_trim})
-    conv_kcp.host_cache_clear()
+    conv_kcp.cake_causal_conv1d_det_train_kcp_host_cache_clear()
     routes = _RouteRecorder(monkeypatch, conv_kcp)
     try:
-        _, hist = cake_causal_conv1d_det_forward_kcp(p.x_local, p.w, p.ctx)
+        _, hist = cake_causal_conv1d_det_train_kcp_forward(p.x_local, p.w, p.ctx)
         out = {}
         for coop in (True, False):
             runs = [
-                cake_causal_conv1d_det_backward_kcp(
+                cake_causal_conv1d_det_train_kcp_backward(
                     p.x_local, p.w, p.ctx, p.dy_local, hist, cooperative=coop
                 )
                 for _ in range(3)
             ]
             out[coop] = runs
-        default = cake_causal_conv1d_det_backward_kcp(
+        default = cake_causal_conv1d_det_train_kcp_backward(
             p.x_local, p.w, p.ctx, p.dy_local, hist
         )
         torch.cuda.synchronize()
@@ -1015,15 +940,19 @@ def test_backward_launch_form_autograd_graph_and_refusal(monkeypatch) -> None:
     """The autograd entry carries ``cooperative`` to its backward (bitwise the direct backward of that form), a graph
     replay of either form is bitwise its eager result (the form is part of the graph key), and a non-bool is
     refused."""
-    from flashinfer.cake_causal_conv1d_det_train_backend import kcp as conv_kcp
+    from flashinfer.experimental.cake.cake_causal_conv1d_det_train import (
+        kcp as conv_kcp,
+    )
 
     device = torch.device("cuda")
     p = _problem((5000, 1003), (1, 2, 4997, 1003), 512, device)
     x, w, ctx = p.x_local, p.w, p.ctx
     dy = p.dy_local
-    _, hist = cake_causal_conv1d_det_forward_kcp(x, w, ctx)
+    _, hist = cake_causal_conv1d_det_train_kcp_forward(x, w, ctx)
     direct = {
-        coop: cake_causal_conv1d_det_backward_kcp(x, w, ctx, dy, hist, cooperative=coop)
+        coop: cake_causal_conv1d_det_train_kcp_backward(
+            x, w, ctx, dy, hist, cooperative=coop
+        )
         for coop in (True, False)
     }
     for coop in (True, False):
@@ -1037,7 +966,7 @@ def test_backward_launch_form_autograd_graph_and_refusal(monkeypatch) -> None:
         )
     try:
         for coop in (True, False, True, False, True, False):
-            dx, dw = cake_causal_conv1d_det_backward_kcp(
+            dx, dw = cake_causal_conv1d_det_train_kcp_backward(
                 x, w, ctx, dy, hist, graph="replay", cooperative=coop
             )
             assert torch.equal(dx, direct[coop][0]) and torch.equal(
@@ -1049,6 +978,8 @@ def test_backward_launch_form_autograd_graph_and_refusal(monkeypatch) -> None:
         conv_kcp._GRAPHS.clear()
     for bad in (1, "split"):
         with pytest.raises(TypeError, match="cooperative"):
-            cake_causal_conv1d_det_backward_kcp(x, w, ctx, dy, hist, cooperative=bad)
+            cake_causal_conv1d_det_train_kcp_backward(
+                x, w, ctx, dy, hist, cooperative=bad
+            )
         with pytest.raises(TypeError, match="cooperative"):
             cake_causal_conv1d_det_kcp(x, w, ctx, cooperative=bad)

@@ -7,9 +7,22 @@ the NVFP4 decode family (`run_cake_dsv4_nvfp4`; see the host module docstring).
 Select the backend explicitly; `backend="auto"` keeps the architecture-based
 selection. `enable_pdl` launches the FP8 persistent and M64 programs as
 programmatic dependents (they wait for the previous grid before their first
-global read and trigger their own dependents right after); the other BF16 / FP8
-programs launch without it, and the NVFP4 family rejects it. The TRTLLM-GEN
-RopeQuant epilogue is not supported.
+global read and trigger their own dependents right after); without it, the
+H128 persistent program's `_no_pdl` twin, the same kernel without the two
+`griddepcontrol` instructions, runs on SM103 launches of at least 384 query rows
+and on SM100 calls whose longest request has at least 257 query tokens. On SM107
+the FP8 H128 uniform-gather persistent route's `_k64` sibling, the same work
+with every MMA a one-CTA M128 tile at K=64, runs on launches of at least 48
+query rows; SM107 decode launches of at least 160 query rows also take that
+route instead of the lane-gather one when each request holds one query row (at
+most 2 from 256 rows) or, on calls that read a 64-row-page compressed cache
+(compress ratio 4), at most 4 query rows (at most 8 from 256 rows).
+The other BF16 / FP8 programs launch without it, and the NVFP4 family rejects
+it. On SM107 the FP8 low-head prefill route's `_overlap` sibling, the same work
+with the P x V MMAs started on the low half of P and the output drained per V
+block, runs on launches of at most 64 query rows (scaled down with the SM count
+below 216 SMs); routing its `VARIANTS` key to the route's program retires it.
+The TRTLLM-GEN RopeQuant epilogue is not supported.
 
 ```python
 from flashinfer.mla import (

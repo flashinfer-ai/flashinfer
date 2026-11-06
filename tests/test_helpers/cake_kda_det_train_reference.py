@@ -18,8 +18,7 @@ training problem (GLM-5.3-Flash geometry: head dimension 128, natural-log
 decay gate, sigmoid beta), shared by ``tests/experimental/test_cake_kda_det_train.py``,
 ``tests/experimental/test_cake_kda_det_train_api.py``,
 ``tests/experimental/test_cake_kda_det_train_raw_gate_accuracy.py`` and
-``benchmarks/bench_cake_kda_det_train.py`` (and, through the previous module path
-``tests/test_helpers/cake_kda_train_reference.py``, by the KCP suites).
+``benchmarks/bench_cake_kda_det_train.py`` and the KCP suites.
 
 The reference is the token recurrence of one document, in FP64 with autograd,
 state ``S`` in ``R^{K x V}`` starting from zero::

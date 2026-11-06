@@ -46,6 +46,8 @@ from .core import (
     JitSpec,
     gen_jit_spec,
     sm100a_nvcc_flags,
+    sm103a_nvcc_flags,
+    sm90a_nvcc_flags,
 )
 
 # Filled mechanically from the program bundle.
@@ -56,7 +58,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "csrc/cake_fp8_rowwise_gemm_allreduce/cake_fp8_rowwise_gemm_allreduce_14343fabdff465e3e64a_kernel.cu",
             "csrc/cake_fp8_rowwise_gemm_allreduce/cake_fp8_rowwise_gemm_allreduce_14343fabdff465e3e64a_binding.cu",
         ],
-        "arches": ["sm_100a"],
+        "arches": ["sm_100a", "sm_103a"],
         "block": [384, 1, 1],
         "cluster": [2, 1, 1],
         "dynamic_smem_bytes": 197632,
@@ -75,6 +77,90 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "grid_n",
             "pair_tiles",
             "K_tiles",
+            "C",
+            "C_cap",
+            "S_bytes",
+            "flag_words",
+            "pg_world",
+            "pg_rank",
+            "pg_flags",
+            "S",
+            "S_peers",
+            "flags",
+            "flags_peers",
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        ],
+    },
+    "cake_fp8_rowwise_gemm_allreduce_32edd0405014d238b067": {
+        "family": "hopper",
+        "sources": [
+            "csrc/cake_fp8_rowwise_gemm_allreduce/hopper/cake_fp8_rowwise_gemm_allreduce_32edd0405014d238b067_kernel.cu",
+            "csrc/cake_fp8_rowwise_gemm_allreduce/hopper/cake_fp8_rowwise_gemm_allreduce_32edd0405014d238b067_binding.cu",
+        ],
+        "arches": ["sm_90a"],
+        "block": [512, 1, 1],
+        "cluster": [1, 1, 1],
+        "dynamic_smem_bytes": 213088,
+        "args": [
+            "A",
+            "W",
+            "OUT",
+            "out_ptr",
+            "sa",
+            "sw",
+            "ctl",
+            "S_mc",
+            "M",
+            "N",
+            "K",
+            "grid_n",
+            "tiles",
+            "K_tiles",
+            "group_m",
+            "C",
+            "C_cap",
+            "S_bytes",
+            "flag_words",
+            "pg_world",
+            "pg_rank",
+            "pg_flags",
+            "S",
+            "S_peers",
+            "flags",
+            "flags_peers",
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        ],
+    },
+    "cake_fp8_rowwise_gemm_allreduce_39c6c11b20cb6d7d4baa": {
+        "family": "hopper",
+        "sources": [
+            "csrc/cake_fp8_rowwise_gemm_allreduce/hopper/cake_fp8_rowwise_gemm_allreduce_39c6c11b20cb6d7d4baa_kernel.cu",
+            "csrc/cake_fp8_rowwise_gemm_allreduce/hopper/cake_fp8_rowwise_gemm_allreduce_39c6c11b20cb6d7d4baa_binding.cu",
+        ],
+        "arches": ["sm_90a"],
+        "block": [512, 1, 1],
+        "cluster": [1, 1, 1],
+        "dynamic_smem_bytes": 213088,
+        "args": [
+            "A",
+            "W",
+            "OUT",
+            "out_ptr",
+            "sa",
+            "sw",
+            "ctl",
+            "S_mc",
+            "M",
+            "N",
+            "K",
+            "grid_n",
+            "tiles",
+            "K_tiles",
+            "group_m",
             "C",
             "C_cap",
             "S_bytes",
@@ -132,19 +218,87 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "grid_z",
         ],
     },
+    "cake_fp8_rowwise_gemm_allreduce_4e73c78f58b60636f408": {
+        "family": "blackwell",
+        "sources": [
+            "csrc/cake_fp8_rowwise_gemm_allreduce/cake_fp8_rowwise_gemm_allreduce_4e73c78f58b60636f408_kernel.cu",
+            "csrc/cake_fp8_rowwise_gemm_allreduce/cake_fp8_rowwise_gemm_allreduce_4e73c78f58b60636f408_binding.cu",
+        ],
+        "arches": ["sm_103a"],
+        "block": [384, 1, 1],
+        "cluster": [2, 1, 1],
+        "dynamic_smem_bytes": 222208,
+        "args": [
+            "A",
+            "W",
+            "OUT",
+            "out_ptr",
+            "sa",
+            "sw",
+            "ctl",
+            "S_mc",
+            "M",
+            "N",
+            "K",
+            "grid_n",
+            "pair_tiles",
+            "K_tiles",
+            "C",
+            "C_cap",
+            "S_bytes",
+            "flag_words",
+            "pg_world",
+            "pg_rank",
+            "pg_flags",
+            "S",
+            "S_peers",
+            "flags",
+            "flags_peers",
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        ],
+    },
 }
 ROUTES: dict[str, dict[str, str]] = {
+    "sm_90a": {
+        "main_ws2_p2p": "cake_fp8_rowwise_gemm_allreduce_32edd0405014d238b067",
+        "main_ws4_p2p": "cake_fp8_rowwise_gemm_allreduce_32edd0405014d238b067",
+        "main_ws8_p2p": "cake_fp8_rowwise_gemm_allreduce_32edd0405014d238b067",
+        "main_ws8_p2p_g4": "cake_fp8_rowwise_gemm_allreduce_39c6c11b20cb6d7d4baa",
+    },
     "sm_100a": {
         "main_ws2_p2p": "cake_fp8_rowwise_gemm_allreduce_43c80d0e40bf111ee438",
         "main_ws4_p2p": "cake_fp8_rowwise_gemm_allreduce_43c80d0e40bf111ee438",
         "main_ws8_nvls": "cake_fp8_rowwise_gemm_allreduce_14343fabdff465e3e64a",
     },
+    "sm_103a": {
+        "main_ws2_p2p": "cake_fp8_rowwise_gemm_allreduce_4e73c78f58b60636f408",
+        "main_ws4_p2p": "cake_fp8_rowwise_gemm_allreduce_4e73c78f58b60636f408",
+        "main_ws8_nvls": "cake_fp8_rowwise_gemm_allreduce_14343fabdff465e3e64a",
+    },
 }
 COMPILE_FLAGS: list[str] = []
 # Per architecture: the exchange carrier of each delivered world size.
-COMM_MODES: dict[str, dict[int, str]] = {"sm_100a": {2: "p2p", 4: "p2p", 8: "nvls"}}
+COMM_MODES: dict[str, dict[int, str]] = {
+    "sm_90a": {2: "p2p", 4: "p2p", 8: "p2p"},
+    "sm_100a": {2: "p2p", 4: "p2p", 8: "nvls"},
+    "sm_103a": {2: "p2p", 4: "p2p", 8: "nvls"},
+}
 # Frozen trace-time choices per architecture and carrier (documentation, never knobs).
 FROZEN: dict[str, dict[str, dict[str, Any]]] = {
+    "sm_90a": {
+        "p2p": {
+            "bc_release": "release",
+            "chunk_groups": 8,
+            "layout": "wg4",
+            "num_stages": 5,
+            "promote_k32_steps": 4,
+            "timeout_cycles_log2": 34,
+            "transport": "pull",
+            "wgmma_inflight_groups": 2,
+        },
+    },
     "sm_100a": {
         "nvls": {"g1_sched": "static", "num_stages": 4, "timeout_cycles_log2": 34},
         "p2p": {
@@ -155,10 +309,65 @@ FROZEN: dict[str, dict[str, dict[str, Any]]] = {
             "transport": "pull",
         },
     },
+    "sm_103a": {
+        "nvls": {"g1_sched": "static", "num_stages": 4, "timeout_cycles_log2": 34},
+        "p2p": {
+            "chunk_groups": 8,
+            "num_stages": 4,
+            "p2p_reduce_wave": 4,
+            "timeout_cycles_log2": 34,
+            "transport": "pull",
+        },
+    },
 }
 # Tile geometry, control-word layout and grid rule per architecture (mirrors the Cake export adapter).
 GEOMETRY: dict[str, dict[str, Any]] = {
+    "sm_90a": {
+        "BLOCK_M": 128,
+        "BLOCK_N": 128,
+        "BLOCK_K": 128,
+        "CHUNK_ROWS": 128,
+        "CLUSTER_DIMS": [1, 1, 1],
+        "OUT_BYTES": 2,
+        "TILE_BYTES": 32768,
+        "FLAG_WORD_BYTES_PER_CHUNK": 8,
+        "MAX_CTAS": 1024,
+        "CTL_EXTRA_WORDS": 2,
+        "CTL_STEAL_WORDS": False,
+        "CTL_SCHED_WORDS": False,
+        "S_ROWS_OWNED_ONLY_UNDER_PULL": True,
+        "GRID_RULE": "persistent_sm_count",
+        "TILE_ARG": "tiles",
+        "MAX_DYNAMIC_SMEM_BYTES": 232448,
+        "THREADS": {"p2p": 512, "nvls": 384},
+        "RASTER_SM_COUNT": 132,
+        "RASTER_L2_BYTES": 52428800,
+        "RASTER_GROUP_CHOICES": [1, 2, 4, 8, 16, 32],
+        "RASTER_MIN_GRID_N": 16,
+        "RASTER_MIN_K": 4096,
+        "RASTER_MIN_CHUNKS": 4,
+    },
     "sm_100a": {
+        "BLOCK_M": 128,
+        "BLOCK_N": 256,
+        "BLOCK_K": 128,
+        "CHUNK_ROWS": 128,
+        "CLUSTER_DIMS": [2, 1, 1],
+        "OUT_BYTES": 2,
+        "TILE_BYTES": 65536,
+        "FLAG_WORD_BYTES_PER_CHUNK": 8,
+        "MAX_CTAS": 1024,
+        "CTL_EXTRA_WORDS": 2,
+        "CTL_STEAL_WORDS": True,
+        "CTL_SCHED_WORDS": True,
+        "S_ROWS_OWNED_ONLY_UNDER_PULL": False,
+        "GRID_RULE": "persistent_cluster_pairs",
+        "TILE_ARG": "pair_tiles",
+        "MAX_DYNAMIC_SMEM_BYTES": 232448,
+        "THREADS": {"p2p": 384, "nvls": 384},
+        "PAIR_TILE_M": 256,
+    },
+    "sm_103a": {
         "BLOCK_M": 128,
         "BLOCK_N": 256,
         "BLOCK_K": 128,
@@ -181,23 +390,39 @@ GEOMETRY: dict[str, dict[str, Any]] = {
 }
 # Per architecture: ``[world_size, rows_capacity, suffix]`` rows naming the program variant a
 # prepared capacity of exactly ``rows_capacity`` rows selects (empty when every capacity shares one program).
-CAPACITY_VARIANTS: dict[str, list[list[Any]]] = {"sm_100a": []}
+CAPACITY_VARIANTS: dict[str, list[list[Any]]] = {
+    "sm_90a": [[8, 4096, "_g4"]],
+    "sm_100a": [],
+    "sm_103a": [],
+}
 # Exact-architecture compile flags (``flashinfer.jit.core``) and the capability -> architecture table.
 ARCH_FLAGS: dict[str, list[str]] = {
+    "sm_90a": sm90a_nvcc_flags,
     "sm_100a": sm100a_nvcc_flags,
+    "sm_103a": sm103a_nvcc_flags,
 }
 CAPABILITY_ARCH: dict[tuple[int, int], str] = {
+    (9, 0): "sm_90a",
     (10, 0): "sm_100a",
+    (10, 3): "sm_103a",
 }
 SUPPORTED_WORLD_SIZES: tuple[int, ...] = (2, 4, 8)
 
 SOURCE_PACKAGE = "cake_fp8_rowwise_gemm_allreduce"
+# Family directories of the package: their programs and the headers they include.
+SOURCE_DIRECTORIES: tuple[str, ...] = ("hopper",)
 EXCHANGE_MODE = "X16"
 # One chunk is 128 rows on every architecture; the column tile is per architecture (``GEOMETRY[arch]["BLOCK_N"]``).
 BLOCK_M = 128
 BLOCK_K = 128
 OUT_BYTES = 2
 MAX_ROWS_TIMES_COLS = 1 << 30
+# The column multiple of the operand contract on every architecture (the
+# sm_90a tile is 128 wide, but only multiples of 256 are delivered).
+N_MULTIPLE = 256
+# Reducer/drainer vector indices are 32-bit: 16 * N plus the drainer's
+# 8 * 64 * MAX_CTAS stride overshoot must stay below 2**31.
+MAX_COLS = (1 << 27) - (1 << 15)
 GRID_RULE_CLUSTER_PAIRS = "persistent_cluster_pairs"
 GRID_RULE_SM_COUNT = "persistent_sm_count"
 
@@ -383,12 +608,18 @@ def ctl_words(c_cap: int, arch: str) -> int:
 
 
 def validate_shape(m: int, n: int, k_l: int, arch: str) -> tuple[int, int, int]:
-    """``M >= 1``, ``N % BLOCK_N == 0``, ``K_l % 128 == 0``, ``M * N <= 2**30``."""
+    """``M >= 1``, ``N % 256 == 0``, ``N <= MAX_COLS``, ``K_l % 128 == 0``, ``M * N <= 2**30``."""
 
     m, n, k_l = int(m), int(n), int(k_l)
     if m <= 0:
         raise ValueError(f"M must be positive, got {m}")
     grid_n(n, arch)
+    if n % N_MULTIPLE:
+        raise ValueError(f"N must be a positive multiple of {N_MULTIPLE}, got {n}")
+    if n > MAX_COLS:
+        raise ValueError(
+            f"N = {n} exceeds {MAX_COLS} (32-bit reducer/drainer vector index)"
+        )
     if k_l <= 0 or k_l % BLOCK_K:
         raise ValueError(f"K_l must be a positive multiple of {BLOCK_K}, got {k_l}")
     if m * n > MAX_ROWS_TIMES_COLS:
@@ -494,11 +725,12 @@ def _source_dir() -> Path:
 
 def _source_path(relative: str) -> Path:
     parts = Path(relative).parts
-    if parts[:2] != ("csrc", SOURCE_PACKAGE) or len(parts) != 3:
+    nested = len(parts) == 4 and parts[2] in SOURCE_DIRECTORIES
+    if parts[:2] != ("csrc", SOURCE_PACKAGE) or not (len(parts) == 3 or nested):
         raise ValueError(
             f"exported source path is outside the fused FP8 GEMM + all-reduce package: {relative!r}"
         )
-    return _source_dir() / parts[2]
+    return _source_dir().joinpath(*parts[2:])
 
 
 @functools.cache
@@ -637,7 +869,9 @@ __all__ = [
     "GEOMETRY",
     "GRID_RULE_CLUSTER_PAIRS",
     "GRID_RULE_SM_COUNT",
+    "MAX_COLS",
     "MAX_ROWS_TIMES_COLS",
+    "N_MULTIPLE",
     "OUT_BYTES",
     "PROGRAMS",
     "ROUTES",

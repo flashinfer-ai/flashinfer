@@ -31,15 +31,18 @@ package's checkpoint hand-off counters) takes none:
   (``flashinfer.cake_kda_train`` with ``deterministic=False``), whose backward
   moves the ``q * dq`` term of the gate gradient ``dg`` from the fused
   dq / dk / dg program into the GLM intra program on the rows its registry
-  lists.  The schedule has a fixed order: at the same topology repeated calls
-  give bitwise the same results, ``out``, ``dq``, ``dk``, ``dv`` and ``dbeta``
+  lists.  In the g mode (the default; the raw gate mode is below) the schedule
+  has a fixed order: at the same topology repeated calls give bitwise the same
+  results, ``out``, ``dq``, ``dk``, ``dv`` and ``dbeta``
   are bitwise the deterministic package's, and ``dg`` differs from it by FP32
   rounding only (the same accuracy budget).
 * With ``torch.use_deterministic_algorithms(True)``, ``deterministic=False``
   runs the deterministic package and warns once per process.
 
 The mode is never stored in the context: a partition, a context and the byte
-queries of either package describe the same plan, a partition of either
+queries of either package describe the same plan (the workspace query of
+``deterministic=False`` adds the FP64 parameter-gradient accumulators of a raw
+gate mode backward on SM100 / SM103, below), a partition of either
 package builds the context of both (``build_context_kcp`` converts it to the
 type of the package it routes to), and a context of either package serves the
 calls of both (``partition_kcp`` / ``build_context_kcp`` build it with the
@@ -91,17 +94,36 @@ Usage::
                               deterministic=False)
 
 Raw gate mode (``use_gate_in_kernel=True`` with ``A_log``, ``dt_bias`` and
-``lower_bound``; FlashInfer #7816) runs on the deterministic package only: the
-compute entries forward the keywords, ``chunk_kda_bwd_kcp`` then returns seven
-tensors (``dA_log`` / ``ddt_bias`` this rank's partial sums, summed over the
-group with :func:`reduce_gate_param_grads_kcp`), and ``kda_workspace_bytes_kcp`` /
-``kda_saved_bytes_kcp`` take ``use_gate_in_kernel``.  The in-kernel q / k L2 norm
-(``use_qk_l2norm_in_kernel=True``, #7817) runs on the deterministic package too:
-the compute entries forward it, and ``kda_workspace_bytes_kcp`` /
-``kda_saved_bytes_kcp`` take it.  ``deterministic=False`` raises ``ValueError``
-naming ``deterministic=True`` for either mode; the off values (``use_gate_in_kernel=False``,
-``A_log`` / ``dt_bias`` / ``lower_bound`` ``None``,
-``use_qk_l2norm_in_kernel=False``) are accepted on both routes.
+``lower_bound``; FlashInfer #7816) runs on both packages: the compute entries
+forward the keywords, ``chunk_kda_bwd_kcp`` then returns seven tensors
+(``dA_log`` / ``ddt_bias`` this rank's partial sums, summed over the group with
+:func:`reduce_gate_param_grads_kcp`), and ``kda_workspace_bytes_kcp`` /
+``kda_saved_bytes_kcp`` take ``use_gate_in_kernel``.  With ``deterministic=False``
+the rank-local stages run the non-deterministic single-rank package's raw
+records, copies of the deterministic raw programs on every row but for the
+parameter-gradient reduce, so every output and the raw gate's gradient are
+bitwise those of ``deterministic=True``.  On SM107 the parameter partial sums
+are bitwise too.  On SM100 / SM103 each rank adds its per-chunk parameter
+partials in FP64 in no fixed order and rounds the sums to FP32 once, so its
+partial sums can differ from run to run and from ``deterministic=True``: from
+run to run by one FP32 ulp at most while the FP64 sum's order error stays below
+half an FP32 ulp of the result (only per-chunk terms that nearly cancel exceed
+it), and their error against an FP64 reference stays within the deterministic
+package's plus the FP64 sum's own error; its local arena then
+also holds the FP64 accumulators (2 KiB per head; 16 KiB per head on SM100 from
+32 heads), which ``kda_workspace_bytes_kcp`` counts.
+:func:`reduce_gate_param_grads_kcp` keeps the fixed rank order, so every rank
+gets the same sums from the same partials; as the partials can change from run
+to run, so can those sums, by a few FP32 ulps that grow with the world size
+(each partial by about one ulp, each of the additions rounding either way).  Under torch's
+deterministic algorithms such a call runs the deterministic package, as above.
+The checkpoint hand-off does not engage in the raw mode.
+The in-kernel q / k L2 norm (``use_qk_l2norm_in_kernel=True``, #7817) runs on
+the deterministic package only: the compute entries forward it, and
+``kda_workspace_bytes_kcp`` / ``kda_saved_bytes_kcp`` take it.
+``deterministic=False`` raises ``ValueError`` naming ``deterministic=True`` for
+it; its off value (``use_qk_l2norm_in_kernel=False``) is accepted on both
+routes.
 
 The width-4 causal convolution with halo of the same partition takes this module's ``ctx``.
 """
@@ -365,9 +387,9 @@ def chunk_kda_fwd_kcp(
         The forward programs of the two are the same: bitwise the same ``out``.
     **options
         Further KCP options (``save_transfer``, ``exchange``, ``head_groups``, ``offset_class``, ``graph``),
-        forwarded; with ``deterministic=True`` also the raw gate keywords of
+        forwarded; also the raw gate keywords of
         :func:`flashinfer.cake_kda_det_train_kcp.chunk_kda_det_fwd_kcp` (``use_gate_in_kernel``, ``A_log``,
-        ``dt_bias``, ``lower_bound``).  ``deterministic=False`` refuses the raw gate and
+        ``dt_bias``, ``lower_bound``), on both packages.  ``deterministic=False`` refuses
         ``use_qk_l2norm_in_kernel=True`` (``ValueError``; see the module docstring).
 
     Returns
@@ -444,9 +466,12 @@ def chunk_kda_bwd_kcp(
     Returns
     -------
     ``(dq, dk, dv, dbeta, dg)`` of this rank's tokens: BF16 ``dq, dk, dv, dbeta``, FP32 ``dg``.  Bitwise
-    reproducible at the same topology in both modes.  In raw gate mode (``deterministic=True`` only) seven tensors,
+    reproducible at the same topology in both modes.  In raw gate mode seven tensors,
     ``(dq, dk, dv, dbeta, dg, dA_log, ddt_bias)``, as :func:`flashinfer.cake_kda_det_train_kcp.chunk_kda_det_bwd_kcp`
-    returns them.
+    returns them; both packages give the same bits, bitwise reproducible at the same topology, but for this rank's
+    ``dA_log`` / ``ddt_bias`` on SM100 / SM103 with ``deterministic=False``: an unordered FP64 sum rounded once to
+    FP32, they can differ by about one FP32 ulp from run to run and from ``deterministic=True`` (see the module
+    docstring).
     """
     if _deterministic(deterministic, "chunk_kda_bwd_kcp"):
         return _det_kcp().chunk_kda_det_bwd_kcp(
@@ -510,7 +535,8 @@ def chunk_kda_kcp(
     verified device, ``H`` in ``KCP_HANDOFF_HEADS``, ``H * (total tokens // world size) >= 393216``).  An engaged
     call raises the checkpoint peak of this rank by at most :func:`kda_handoff_bytes_kcp` (its saved set is
     ``kda_saved_bytes_kcp(..., checkpoint_handoff=True)``: no carry plane); ``"off"`` opts out.  The deterministic
-    package has no hand-off: ``deterministic=True`` ignores the value and never engages.
+    package has no hand-off: ``deterministic=True`` ignores the value and never engages.  In raw gate mode
+    (``use_gate_in_kernel=True``, forwarded through ``**options``) the hand-off does not engage either.
 
     ``recompute_handle`` / ``checkpoint_keep``: the checkpoint recompute without the forward state exchange, as for
     :func:`flashinfer.cake_kda_det_train_kcp.chunk_kda_det_kcp` (a ``RecomputeHandleKcp`` or any object with an
@@ -578,14 +604,17 @@ def kda_workspace_bytes_kcp(
     deterministic: bool = True,
 ) -> int:
     """Bytes of this rank's KCP workspace for ``H`` heads on the package ``deterministic`` selects (the same for both
-    values); see :func:`flashinfer.cake_kda_det_train_kcp.kda_det_workspace_bytes_kcp`.  ``ctx`` may be a list of
+    values but in the raw gate mode on SM100 / SM103, below); see
+    :func:`flashinfer.cake_kda_det_train_kcp.kda_det_workspace_bytes_kcp`.  ``ctx`` may be a list of
     contexts (one workspace that serves all of them).  ``local_arena`` / ``lean_passes`` are those of the workspace
     (``WorkspaceKcp`` / ``WorkspaceDetKcp`` ``(local_arena="lean", lean_passes=...)``, opt-in: the backward's lean
     local arena, its tail in ``lean_passes`` passes, two by default); ``None`` keeps the replay arena.
-    ``use_gate_in_kernel``: the workspace's gate mode (``WorkspaceDetKcp(use_gate_in_kernel=True)``, the raw gate
-    mode); ``use_qk_l2norm_in_kernel``: its in-kernel q / k L2 norm mode
-    (``WorkspaceDetKcp(use_qk_l2norm_in_kernel=True)``).  Either ``True`` with ``deterministic=False`` raises
-    ``ValueError``."""
+    ``use_gate_in_kernel``: the workspace's gate mode (``WorkspaceKcp`` / ``WorkspaceDetKcp``
+    ``(use_gate_in_kernel=True)``, the raw gate mode; with ``backward`` on SM100 / SM103, ``deterministic=False``
+    adds the local arena's FP64 parameter-gradient accumulators: 2 KiB per head, 16 KiB per head on SM100 from 32
+    heads);
+    ``use_qk_l2norm_in_kernel``: its in-kernel q / k L2 norm mode (``WorkspaceDetKcp(use_qk_l2norm_in_kernel=True)``),
+    ``True`` with ``deterministic=False`` raises ``ValueError``."""
     det = _deterministic(deterministic, "kda_workspace_bytes_kcp")
     plan = _det_plan() if det else _nd_plan()
     if save_transfer is None:
@@ -614,16 +643,15 @@ def reduce_gate_param_grads_kcp(
     deterministic: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """The raw gate mode's full ``(dA_log, ddt_bias)`` from every rank's partial sums (the last two tensors of
-    :func:`chunk_kda_bwd_kcp`), bitwise reproducible; see
+    :func:`chunk_kda_bwd_kcp`), in a fixed rank order on the package ``deterministic`` selects (the same algorithm
+    for both values): bitwise reproducible from the same partial sums, and the same bits on every rank and for both
+    values.  The partial sums of ``deterministic=False`` on SM100 / SM103 can differ by about one FP32 ulp from run to
+    run, so its sums can too, by a few FP32 ulps that grow with the world size; see
     :func:`flashinfer.cake_kda_det_train_kcp.reduce_gate_param_grads_det_kcp`.  A collective: every rank of
-    ``ctx.group`` calls it.  The raw gate mode runs on the deterministic package only, so ``deterministic=False``
-    raises ``ValueError`` (unless torch's deterministic algorithms route it to the deterministic package)."""
-    if not _deterministic(deterministic, "reduce_gate_param_grads_kcp"):
-        raise ValueError(
-            "reduce_gate_param_grads_kcp: the raw gate mode (use_gate_in_kernel=True) runs on the deterministic "
-            "package only; pass deterministic=True"
-        )
-    return _det_kcp().reduce_gate_param_grads_det_kcp(ctx, dA_log, ddt_bias)
+    ``ctx.group`` calls it."""
+    if _deterministic(deterministic, "reduce_gate_param_grads_kcp"):
+        return _det_kcp().reduce_gate_param_grads_det_kcp(ctx, dA_log, ddt_bias)
+    return _nd_kcp().reduce_gate_param_grads_kcp(ctx, dA_log, ddt_bias)
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
@@ -644,8 +672,9 @@ def kda_saved_bytes_kcp(
     """Bytes of this rank's KCP saved set for ``H`` heads on the package ``deterministic`` selects (the same for both
     values, except ``checkpoint_handoff=True``); see :func:`flashinfer.cake_kda_det_train_kcp.kda_det_saved_bytes_kcp`
     for ``save_transfer``, ``with_conv``, ``C``, ``checkpoint_keep``, ``use_gate_in_kernel`` (the saved set's gate
-    mode, the raw gate mode of ``WorkspaceDetKcp(use_gate_in_kernel=True)``) and ``use_qk_l2norm_in_kernel`` (the
-    saved set of the in-kernel q / k L2 norm).  Either ``True`` with ``deterministic=False`` raises ``ValueError``.
+    mode, the raw gate mode of ``WorkspaceKcp`` / ``WorkspaceDetKcp`` ``(use_gate_in_kernel=True)``; the same bytes
+    in both gate modes and for both values of ``deterministic``) and ``use_qk_l2norm_in_kernel`` (the saved set of
+    the in-kernel q / k L2 norm; ``True`` with ``deterministic=False`` raises ``ValueError``).
     ``checkpoint_handoff`` (a ``bool``, the hand-off decision, not :func:`chunk_kda_kcp`'s mode; another value raises
     ``TypeError``; ``False`` by default: the light set): ``True`` is the saved set, at the same ``save_transfer``, of
     a ``deterministic=False`` forward that the checkpoint hand-off engages on (plus :func:`kda_handoff_bytes_kcp`,

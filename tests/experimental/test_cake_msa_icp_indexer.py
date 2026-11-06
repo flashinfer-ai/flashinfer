@@ -659,6 +659,51 @@ def plan_buffers(total_q: int, batch: int, *, poison: bool = True) -> dict:
     }
 
 
+# The fused prefill path's list pool is poisoned with 0xFF bytes: a key read
+# before the list scorer wrote it would be the largest (forced) key and win
+# its row.  Guard bytes past the pool catch writes beyond the sized pieces.
+POOL_POISON = 0xFF
+POOL_GUARD_BYTES = 4096
+
+
+def prefill_pool(total_q: int, batch: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(pool, guard)``: a poisoned list pool of exactly
+    ``msa_icp_prefill_pool_bytes`` bytes and the poisoned guard bytes that
+    follow it in the same allocation."""
+    n = msa_ops.msa_icp_prefill_pool_bytes(total_q=total_q, batch=batch, device=DEV)
+    full = torch.full(
+        (n + POOL_GUARD_BYTES,), POOL_POISON, dtype=torch.uint8, device=DEV
+    )
+    return full[:n], full[n:]
+
+
+def assert_guard(guard: torch.Tensor, what: str) -> None:
+    bad = int((guard != POOL_POISON).sum())
+    assert bad == 0, f"{what}: {bad} guard bytes past the list pool were written"
+
+
+def plan_pieces(plan: Any) -> int:
+    """Pieces the plan's (CTA, item) cells use: ``max(s + j) + 1`` over the
+    non-empty cells of every CTA's slice (host read of the device plan)."""
+    used = 0
+    for s, wr in enumerate(plan.packed_work_range.cpu().tolist()):
+        wr &= (1 << 64) - 1
+        j0, j1, c1 = wr & 0xFFFF, (wr >> 16) & 0xFFFF, (wr >> 48) & 0xFFFF
+        j_end = j1 + 1 if c1 > 0 else j1
+        if j_end > j0:
+            used = max(used, s + j_end)
+    return used
+
+
+def check_pool_bound(plan: Any, total_q: int, batch: int, what: str) -> None:
+    """The plan's pieces fit the pool sizing bound."""
+    bound = cake_backend.prefill_pool_pieces(
+        total_q=total_q, batch=batch, num_ctas=plan.packed_work_range.numel()
+    )
+    used = plan_pieces(plan)
+    assert used <= bound, f"{what}: the plan uses {used} pieces, the pool holds {bound}"
+
+
 def prefill_case_inputs(case: ref.PrefillCase, lay: ref.IcpLayout) -> dict:
     return {
         "q": _fp8(case.q),
@@ -679,10 +724,15 @@ def run_prefill(
     carriers: list[torch.Tensor] | None = None,
     outputs: list[torch.Tensor] | None = None,
     check_scores: bool = True,
-) -> None:
+    pool: torch.Tensor | None = None,
+) -> list[torch.Tensor]:
     """Per rank and window: device plan, scorer, carrier select; then the
     emulated exchange and every owner's merge.  Score scratch / carriers /
-    outputs may be passed in (reuse) and are poisoned otherwise."""
+    outputs may be passed in (reuse) and are poisoned otherwise.  With
+    ``pool`` each (rank, window) runs the fused prefill path instead (list
+    scorer -> list-to-carrier merge into the same carrier rows; no score
+    rows), every window in that one pool, after checking that the plan's
+    pieces fit the pool bound.  Returns the per-rank carriers."""
     inp = prefill_case_inputs(case, lay)
     windows = case.windows()
     t_max = max(w.total_q for w in windows)
@@ -705,6 +755,23 @@ def run_prefill(
     for r in range(lay.tp):
         for wi, w in enumerate(windows):
             plan = plan_window(w, storage)
+            if pool is not None:
+                check_pool_bound(plan, w.total_q, w.batch, f"{what}: window {wi}")
+                msa_ops.msa_icp_prefill_score_select(
+                    inp["q"][w.start : w.end],
+                    inp["shards"][r],
+                    inp["block_table"],
+                    plan,
+                    inp["nvalid"][w.start : w.end],
+                    pool,
+                    carriers[r][:, w.start : w.end],
+                    rank=r,
+                    tp=lay.tp,
+                    compact=lay.page_size == 256,
+                    force_begin_blocks=case.init_blocks,
+                    force_end_blocks=case.local_blocks,
+                )
+                continue
             rows = scratch[r][: w.total_q]
             before = _bits(rows) if (check_scores and not initialize) else None
             msa_ops.msa_icp_index_score_sharded(
@@ -765,6 +832,7 @@ def run_prefill(
             f"{what}: unsharded oracle",
         )
     assert int(errors.item()) == 0
+    return carriers
 
 
 # =========================================================================== golden vectors
@@ -1554,10 +1622,90 @@ def _prefill_scenarios(page: int) -> list[tuple[str, dict, bool]]:
             ),
             True,
         ),
+        # Prefix caching: requests 1 and 2 alias request 0's physical index-K
+        # pages for their shared prefix, at different query offsets, over
+        # several query chunks.
+        (
+            "shared_prefix_pages",
+            dict(
+                q_lens=[70, 45, 30],
+                prefixes=[2900, 3100, 2700],
+                padding_tokens=3,
+                chunk=64,
+                share_prefix=True,
+            ),
+            False,
+        ),
+        # Rows whose every visible product is NaN (a NaN query byte) score
+        # -inf in every column; NaN key rows are ignored where other rows of
+        # the block are visible.
+        (
+            "nan_rows",
+            dict(
+                q_lens=[50, 20],
+                prefixes=[1500, 260],
+                padding_tokens=2,
+                chunk=64,
+                init_blocks=2,
+                local_blocks=3,
+                nan_every=5,
+            ),
+            False,
+        ),
+        # Fractional E4M3 queries and keys (every FP32 summation still exact).
+        (
+            "fractional_fp8",
+            dict(
+                q_lens=[60, 33],
+                prefixes=[2000, 129],
+                chunk=64,
+                q_kind="narrow",
+                k_kind="narrow",
+            ),
+            False,
+        ),
+        # Equal maxima everywhere (one key row repeated): every block ties
+        # within and across ranks; the lower ids win.
+        (
+            "all_equal_ties",
+            dict(
+                q_lens=[40, 9],
+                prefixes=[2500, 300],
+                chunk=32,
+                k_kind="all_equal",
+                init_blocks=1,
+                local_blocks=1,
+            ),
+            False,
+        ),
     ]
 
 
 PREFILL_SCENARIOS = [name for name, _, _ in _prefill_scenarios(128)]
+
+
+def _share_prefix(case: ref.PrefillCase) -> ref.PrefillCase:
+    """Requests ``b > 0`` read request 0's physical pages for the full pages
+    every request's prefix covers (a prefix-cache hit)."""
+    shared = min(case.prefixes) // case.page_size
+    assert shared >= 2, "the scenario needs at least two shared prefix pages"
+    table = [list(row) for row in case.block_table]
+    for row in table[1:]:
+        row[:shared] = table[0][:shared]
+    return dataclasses.replace(case, block_table=table)
+
+
+def _nan_rows(case: ref.PrefillCase, every: int) -> ref.PrefillCase:
+    """Every ``every``-th (token, head) query row gets one NaN byte (all its
+    products are NaN), and every ``every``-th key row of every physical page
+    gets one NaN byte."""
+    q = case.q.clone()
+    rows = q.view(-1, q.shape[-1])
+    rows[::every, 7] = ref.E4M3_NAN
+    cache = case.cache.clone()
+    keys = cache.view(-1, cache.shape[-1])
+    keys[3::every, 11] = ref.E4M3_NAN
+    return dataclasses.replace(case, q=q, cache=cache)
 
 
 def _make_prefill(
@@ -1565,9 +1713,17 @@ def _make_prefill(
 ) -> tuple[ref.PrefillCase, bool]:
     for name, kw, fast in _prefill_scenarios(page):
         if name == scenario:
-            return ref.make_prefill_case(
+            kw = dict(kw)
+            share = kw.pop("share_prefix", False)
+            nan_every = kw.pop("nan_every", 0)
+            case = ref.make_prefill_case(
                 f"{scenario}_p{page}", page_size=page, seed=seed, **kw
-            ), fast
+            )
+            if share:
+                case = _share_prefix(case)
+            if nan_every:
+                case = _nan_rows(case, nan_every)
+            return case, fast
     raise KeyError(scenario)
 
 
@@ -1631,6 +1787,133 @@ def test_prefill_reuses_stale_buffers(lay: ref.IcpLayout) -> None:
         )
 
 
+def _poisoned_carriers(lay: ref.IcpLayout, total_q: int) -> list[torch.Tensor]:
+    return [
+        torch.full(
+            (H, total_q, ref.ROW_WORDS), POISON_I32, dtype=torch.int32, device=DEV
+        )
+        for _ in range(lay.tp)
+    ]
+
+
+@pytest.mark.parametrize("scenario", PREFILL_SCENARIOS)
+@pytest.mark.parametrize("lay", LAYOUTS, ids=LAYOUT_IDS)
+def test_fused_prefill_is_byte_identical_to_the_materialized_chain(
+    lay: ref.IcpLayout, scenario: str
+) -> None:
+    """The fused prefill path (list scorer -> list-to-carrier merge, one
+    0xFF-poisoned pool reused by every window and rank) writes every word of
+    every carrier row of the materialized path (scorer -> select), padding
+    rows included, and both equal the oracle; the merged ids follow.  No
+    byte past the sized pool is written."""
+    case, fast = _make_prefill(lay.page_size, scenario)
+    exp = prefill_expect(case, lay, fast=fast, with_global=not fast)
+    what = f"{case.label} {lay.name}"
+    mat = run_prefill(
+        case,
+        lay,
+        exp,
+        initialize=False,
+        what=f"{what} materialized",
+        check_scores=False,
+    )
+    t_max = max(w.total_q for w in case.windows())
+    pool, guard = prefill_pool(t_max, case.batch)
+    fused = run_prefill(
+        case,
+        lay,
+        exp,
+        initialize=False,
+        what=f"{what} fused",
+        carriers=_poisoned_carriers(lay, case.total_q),
+        pool=pool,
+    )
+    for r in range(lay.tp):
+        assert_words(fused[r], mat[r], f"{what}: rank {r} fused vs materialized")
+    assert_guard(guard, what)
+
+
+@pytest.mark.parametrize("scenario", PREFILL_SCENARIOS)
+def test_fused_prefill_n256_lists_are_byte_identical(
+    monkeypatch, scenario: str
+) -> None:
+    """TP2 P256: the list build with two pages per MMA (``score_topk16_n256``,
+    taken here for every window) writes the carrier rows of the materialized
+    path, padding rows included."""
+    lay = ref.IcpLayout(256, 2)
+    if not cake_jit.has_role("score_topk16_n256", cake_jit.device_arch(DEV.index)):
+        pytest.skip("no score_topk16_n256 program on this architecture")
+    monkeypatch.setattr(cake_backend, "N256_MIN_TOKENS", 1)
+    case, fast = _make_prefill(lay.page_size, scenario)
+    exp = prefill_expect(case, lay, fast=fast, with_global=not fast)
+    what = f"{case.label} {lay.name} n256"
+    mat = run_prefill(
+        case,
+        lay,
+        exp,
+        initialize=False,
+        what=f"{what} materialized",
+        check_scores=False,
+    )
+    t_max = max(w.total_q for w in case.windows())
+    pool, guard = prefill_pool(t_max, case.batch)
+    fused = run_prefill(
+        case,
+        lay,
+        exp,
+        initialize=False,
+        what=f"{what} fused",
+        carriers=_poisoned_carriers(lay, case.total_q),
+        pool=pool,
+    )
+    for r in range(lay.tp):
+        assert_words(fused[r], mat[r], f"{what}: rank {r} n256 vs materialized")
+    assert_guard(guard, what)
+
+
+@pytest.mark.parametrize("lay", LAYOUTS, ids=LAYOUT_IDS)
+def test_fused_prefill_reuses_stale_buffers(lay: ref.IcpLayout) -> None:
+    """One pool / carrier / output set reused by a step, the step with the
+    request lengths reversed, and the first step again: lists left in the
+    pool by a longer window and carriers of a longer step must not leak."""
+    a = ref.make_prefill_case(
+        "fwd",
+        page_size=lay.page_size,
+        q_lens=[200, 7, 0, 33],
+        prefixes=[0, 900, 5, 2000],
+        padding_tokens=4,
+        chunk=64,
+        seed=21,
+    )
+    b = ref.make_prefill_case(
+        "rev",
+        page_size=lay.page_size,
+        q_lens=[33, 0, 7, 200],
+        prefixes=[2000, 5, 900, 0],
+        padding_tokens=4,
+        chunk=64,
+        seed=22,
+        columns=a.columns,
+    )
+    t_max = max(w.total_q for w in a.windows())
+    pool, guard = prefill_pool(t_max, a.batch)
+    carriers = _poisoned_carriers(lay, a.total_q)
+    outputs = new_outputs(lay.tp, a.total_q)
+    for case in (a, b, a):
+        exp = prefill_expect(case, lay, fast=False, with_global=True)
+        run_prefill(
+            case,
+            lay,
+            exp,
+            initialize=False,
+            what=f"{case.label} {lay.name} fused reuse",
+            carriers=carriers,
+            outputs=outputs,
+            pool=pool,
+        )
+    assert_guard(guard, f"{lay.name} fused reuse")
+
+
 def _window_meta(w: ref.PrefillWindow) -> tuple[torch.Tensor, ...]:
     qo_indptr, kv_indptr = [0], [0]
     for q, kv in zip(w.q_lens, w.kv_lens, strict=True):
@@ -1645,11 +1928,17 @@ def _window_meta(w: ref.PrefillWindow) -> tuple[torch.Tensor, ...]:
     )
 
 
+@pytest.mark.parametrize("fused", (False, True), ids=("materialized", "fused"))
 @pytest.mark.parametrize("lay", LAYOUTS, ids=LAYOUT_IDS)
-def test_facade_prefill_matches_the_oracle(lay: ref.IcpLayout) -> None:
+def test_facade_prefill_matches_the_oracle(
+    lay: ref.IcpLayout, fused: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """``prepare_msa_icp_indexer`` per rank: one plan per query window,
-    per-chunk local scoring into the carrier (reused score scratch), the
-    emulated exchange and the merge."""
+    per-chunk local scoring into the carrier (reused score scratch, or with
+    ``fused`` a caller pool of ``prefill_pool_shape()`` and no score scratch,
+    every window on the fused path), the emulated exchange and the merge."""
+    if fused:  # no short windows: every window runs the fused path
+        monkeypatch.setattr(cake_backend, "SHORT_PREFILL_MAX_TOKENS", {})
     case = ref.make_prefill_case(
         "facade",
         page_size=lay.page_size,
@@ -1690,6 +1979,17 @@ def test_facade_prefill_matches_the_oracle(lay: ref.IcpLayout) -> None:
     rows, heads, pitch = plans[0].prefill_scratch_shape(max(case.seq_lens))
     assert heads == H and pitch >= case.columns and rows >= case.chunk
     scratch = [_poisoned_f32((rows, H, pitch)) for _ in range(lay.tp)]
+    pools = [None] * lay.tp
+    if fused:
+        assert plans[0].fused_prefill is False  # the rule starts empty
+        assert all(w.total_q <= plans[0].prefill_window_tokens() for w in windows)
+        scratch = [None] * lay.tp
+        pools = [
+            torch.full(
+                p.prefill_pool_shape(), POOL_POISON, dtype=torch.uint8, device=DEV
+            )
+            for p in plans
+        ]
     for r in range(lay.tp):
         wplans = [
             plans[r].prefill_window_plan(
@@ -1710,6 +2010,7 @@ def test_facade_prefill_matches_the_oracle(lay: ref.IcpLayout) -> None:
                 scratch[r],
                 inp["nvalid"][w.start : w.end],
                 send[r][:, w.start : w.end],
+                pool=pools[r],
             )
     torch.cuda.synchronize()
     for r in range(lay.tp):
@@ -1725,6 +2026,97 @@ def test_facade_prefill_matches_the_oracle(lay: ref.IcpLayout) -> None:
         plans[o].prefill_merge(received, inp["nvalid"], out)
         torch.cuda.synchronize()
         assert_words(out, exp.outputs[o], f"facade {lay.name} owner {o}")
+
+
+@pytest.mark.parametrize("lay", LAYOUTS, ids=LAYOUT_IDS)
+def test_facade_prefill_short_windows_run_the_score_rows(
+    lay: ref.IcpLayout, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With a pool, a window of at most ``prefill_short_tokens`` query tokens
+    runs the score rows and the Top16 select in the facade's own scratch and
+    a longer window the fused path (no caller score scratch); the carriers
+    equal the oracle's either way."""
+    arch = cake_jit.device_arch(DEV.index)
+    case = ref.make_prefill_case(
+        "short",
+        page_size=lay.page_size,
+        q_lens=[300, 1, 45],
+        prefixes=[0, 4000, 700],
+        padding_tokens=3,
+        chunk=128,
+        seed=37,
+    )
+    windows = case.windows()
+    sizes = [w.total_q for w in windows]
+    short = min(sizes)
+    assert short < max(sizes)
+    monkeypatch.setattr(
+        cake_backend,
+        "SHORT_PREFILL_MAX_TOKENS",
+        {(arch, lay.page_size, lay.tp): short},
+    )
+    exp = prefill_expect(case, lay, fast=False, with_global=True)
+    inp = prefill_case_inputs(case, lay)
+    plans = [
+        msa_ops.prepare_msa_icp_indexer(
+            world_size=lay.tp,
+            rank=r,
+            num_index_heads=H,
+            page_size=lay.page_size,
+            init_blocks=case.init_blocks,
+            local_blocks=case.local_blocks,
+            max_decode_tokens=16,
+            max_decode_query_len=4,
+            max_num_batched_tokens=8192 * len(windows),
+            max_num_seqs=case.batch,
+            max_model_len=8192,
+            num_sparse_layers=3,
+            device=DEV,
+        )
+        for r in range(lay.tp)
+    ]
+    assert plans[0].prefill_short_tokens == short
+    select = cake_jit.route("select_prefill", None, arch)
+    carrier = cake_jit.route("prefill_list_carrier", None, arch)
+    send = [
+        torch.full(
+            (H, case.total_q, ref.ROW_WORDS), POISON_I32, dtype=torch.int32, device=DEV
+        )
+        for _ in range(lay.tp)
+    ]
+    pools = [
+        torch.full(p.prefill_pool_shape(), POOL_POISON, dtype=torch.uint8, device=DEV)
+        for p in plans
+    ]
+    for r in range(lay.tp):
+        for wi, w in enumerate(windows):
+            wplan = plans[r].prefill_window_plan(
+                wi,
+                *_window_meta(w),
+                total_q=w.total_q,
+                max_query_len=max(max(w.q_lens), 1),
+                max_seq_len=max(max(w.kv_lens), 1),
+            )
+            args = (
+                inp["q"][w.start : w.end],
+                inp["shards"][r],
+                inp["block_table"],
+                wplan,
+                None,
+                inp["nvalid"][w.start : w.end],
+                send[r][:, w.start : w.end],
+            )
+            with cake_jit.record_launches() as calls:
+                plans[r].prefill_local(*args, pool=pools[r])
+            names = [c.name for c in calls]
+            if w.total_q <= short:
+                assert select in names and carrier not in names, names
+            else:
+                assert carrier in names and select not in names, names
+            plans[r].prefill_local(*args, pool=pools[r])
+    torch.cuda.synchronize()
+    for r in range(lay.tp):
+        assert_words(send[r], exp.carriers[r], f"short {lay.name} rank {r} carrier")
 
 
 # =========================================================================== CUDA Graph replay
@@ -1995,11 +2387,15 @@ def test_decode_steps_replay(
     comm.check_against_emulator(f"{lay.name} {mode} L{layers} after {steps} steps")
 
 
+@pytest.mark.parametrize("fused", (False, True), ids=("materialized", "fused"))
 @pytest.mark.parametrize("lay", LAYOUTS, ids=LAYOUT_IDS)
-def test_prefill_graph_replays(lay: ref.IcpLayout) -> None:
-    """Captured device plan + scorer + carrier select + exchange copy + merge,
-    replayed for 4 steps with new Q / K / lengths of one token geometry."""
-    steps, chunk = 4, 64
+def test_prefill_graph_replays(lay: ref.IcpLayout, fused: bool) -> None:
+    """Captured device plan + scorer + carrier select (or with ``fused`` the
+    list scorer + list-to-carrier merge in one pool) + exchange copy + merge,
+    replayed for 4 steps with new Q / K / lengths of one token geometry (the
+    last step's Q is the negation of step 2's), with no allocation and no
+    synchronization."""
+    steps, chunk = 5, 64
     cases = []
     for s in range(steps):
         rng = ref.SplitMix64(900 + s)
@@ -2018,6 +2414,8 @@ def test_prefill_graph_replays(lay: ref.IcpLayout) -> None:
                 columns=48,
             )
         )
+    # E4M3 negation flips the sign bit: every score of the step changes sign.
+    cases[4] = dataclasses.replace(cases[4], q=cases[2].q ^ 0x80)
     total = cases[0].total_q
     windows = [c.windows() for c in cases]
     nwin = len(windows[0])
@@ -2044,6 +2442,7 @@ def test_prefill_graph_replays(lay: ref.IcpLayout) -> None:
     ]
     storage = [plan_buffers(chunk, batch) for _ in range(nwin)]
     scratch = [_poisoned_f32((chunk, H, 48)) for _ in range(lay.tp)]
+    pool, guard = prefill_pool(chunk, batch)
     carriers = [
         torch.full((H, total, ref.ROW_WORDS), POISON_I32, dtype=torch.int32, device=DEV)
         for _ in range(lay.tp)
@@ -2118,6 +2517,22 @@ def test_prefill_graph_replays(lay: ref.IcpLayout) -> None:
                     packed_work_info=storage[wi]["work_info"],
                     workspace=storage[wi]["workspace"],
                 )
+                if fused:
+                    msa_ops.msa_icp_prefill_score_select(
+                        q[w.start : w.end].view(FP8),
+                        k[r].view(FP8),
+                        bt,
+                        plan,
+                        nvalid[w.start : w.end],
+                        pool,
+                        carriers[r][:, w.start : w.end],
+                        rank=r,
+                        tp=lay.tp,
+                        compact=lay.page_size == 256,
+                        force_begin_blocks=0,
+                        force_end_blocks=1,
+                    )
+                    continue
                 rows = scratch[r][: w.total_q]
                 msa_ops.msa_icp_index_score_sharded(
                     q[w.start : w.end].view(FP8),
@@ -2164,7 +2579,7 @@ def test_prefill_graph_replays(lay: ref.IcpLayout) -> None:
     torch.cuda.synchronize()
     with torch.cuda.graph(g):
         run()
-    with no_alloc_no_sync(f"{lay.name} prefill replays"):
+    with no_alloc_no_sync(f"{lay.name} prefill replays (fused={fused})"):
         for s in range(1, steps):
             load(s)
             g.replay()
@@ -2184,6 +2599,7 @@ def test_prefill_graph_replays(lay: ref.IcpLayout) -> None:
             f"{lay.name} prefill step {s} unsharded",
         )
     assert int(errors.item()) == 0
+    assert_guard(guard, f"{lay.name} prefill replays (fused={fused})")
 
 
 # =========================================================================== facade decode protocol rules
@@ -3185,6 +3601,7 @@ def _dist_main(argv: Sequence[str]) -> int:
         assert_words(send, exp.carriers[rank], f"rank {rank} prefill carrier")
         assert_words(out, exp.outputs[rank], f"rank {rank} prefill merged ids")
         report["checks"] += 2
+        _dist_fused_prefill(rank, world, lay, args.page, cap, max_dql, dist, report)
         report["ok"] = True
     except BaseException as e:  # noqa: BLE001 - reported to the launching test
         report["ok"] = False
@@ -3194,6 +3611,208 @@ def _dist_main(argv: Sequence[str]) -> int:
         Path(args.out, f"rank{rank}.json").write_text(json.dumps(report))
         dist.destroy_process_group()
     return 0
+
+
+# Fused prefill cases of the multi-GPU test (two query windows each):
+# (label, make_prefill_case kwargs, alias the prefix pages).
+DIST_FUSED_CASES = (
+    (
+        "two_windows",
+        dict(
+            q_lens=[700, 1, 0, 90],
+            prefixes=[0, 5000, 3, 260],
+            padding_tokens=6,
+            chunk=512,
+        ),
+        False,
+    ),
+    (
+        "shared_prefix",
+        dict(
+            q_lens=[300, 200, 100],
+            prefixes=[2600, 2800, 3000],
+            padding_tokens=5,
+            chunk=320,
+        ),
+        True,
+    ),
+    (
+        "palette_ties",
+        dict(
+            q_lens=[400, 150],
+            prefixes=[3000, 700],
+            chunk=300,
+            k_kind="palette",
+            page_order="repeat",
+            distinct_pages=3,
+            init_blocks=2,
+            local_blocks=2,
+        ),
+        False,
+    ),
+    (
+        "all_equal",
+        dict(q_lens=[200, 120], prefixes=[1000, 4000], chunk=160, k_kind="all_equal"),
+        False,
+    ),
+)
+
+
+def _dup_stats(carriers: Sequence[torch.Tensor]) -> dict[str, int]:
+    """Candidates of one (head, token) row across the ranks' carriers: global
+    blocks in exactly one rank's Top16 (``single``), in several ranks' with
+    equal partial maxima (``tie``) and with different ones (``win``: the
+    merge keeps the larger)."""
+    rows = torch.stack([c.cpu() for c in carriers])  # [W, H, T, 33]
+    ids, scores = rows[..., 16:32].tolist(), rows[..., :16].tolist()
+    stats = {"single": 0, "tie": 0, "win": 0}
+    for h in range(rows.shape[1]):
+        for t in range(rows.shape[2]):
+            seen: dict[int, list[int]] = {}
+            for r in range(rows.shape[0]):
+                for i, sc in zip(ids[r][h][t], scores[r][h][t], strict=True):
+                    if i >= 0:
+                        seen.setdefault(i, []).append(sc)
+            for v in seen.values():
+                key = "single" if len(v) == 1 else "tie" if len(set(v)) == 1 else "win"
+                stats[key] += 1
+    return stats
+
+
+def _dist_fused_prefill(
+    rank: int,
+    world: int,
+    lay: ref.IcpLayout,
+    page: int,
+    cap: int,
+    max_dql: int,
+    dist: Any,
+    report: dict,
+) -> None:
+    """The fused prefill path through the facade with a caller pool, per
+    case over two query windows and two layers: every rank's carrier equals
+    the materialized path's and the oracle, each layer makes exactly one
+    ``all_to_all_single`` (the facade makes none), and the merged ids equal
+    the oracle.  The cases cover prefix-cache pages shared by requests and
+    blocks whose partial maxima tie or differ across ranks (and blocks in
+    only one rank's Top16), on every layout whose blocks span ranks."""
+    hpr = H // world
+    a2a = dist.all_to_all_single
+    exchanges: list[int] = []
+
+    def counted(*a: Any, **k: Any) -> Any:
+        exchanges.append(1)
+        return a2a(*a, **k)
+
+    dist.all_to_all_single = counted
+    stats = {"single": 0, "tie": 0, "win": 0}
+    try:
+        for label, kw, share in DIST_FUSED_CASES:
+            case = ref.make_prefill_case(
+                f"dist_{label}", page_size=page, seed=4242, **kw
+            )
+            if share:
+                case = _share_prefix(case)
+            windows = case.windows()
+            assert len(windows) == 2, (label, len(windows))
+            exp = prefill_expect(case, lay, fast=False, with_global=False)
+            for key, n in _dup_stats(exp.carriers).items():
+                stats[key] += n
+            plan = msa_ops.prepare_msa_icp_indexer(
+                world_size=world,
+                rank=rank,
+                num_index_heads=H,
+                page_size=page,
+                init_blocks=case.init_blocks,
+                local_blocks=case.local_blocks,
+                max_decode_tokens=cap,
+                max_decode_query_len=max_dql,
+                max_num_batched_tokens=8192 * len(windows),
+                max_num_seqs=case.batch,
+                max_model_len=16384,
+                num_sparse_layers=2,
+                device=DEV,
+            )
+            assert plan.fused_prefill is False
+            assert all(w.total_q <= plan.prefill_window_tokens() for w in windows)
+            inp = prefill_case_inputs(case, lay)
+            wplans = [
+                plan.prefill_window_plan(
+                    wi,
+                    *_window_meta(w),
+                    total_q=w.total_q,
+                    max_query_len=max(max(w.q_lens), 1),
+                    max_seq_len=max(max(w.kv_lens), 1),
+                )
+                for wi, w in enumerate(windows)
+            ]
+            rows_, _, pitch = plan.prefill_scratch_shape(max(case.seq_lens))
+            scratch = _poisoned_f32((rows_, H, pitch))
+            pool = torch.full(
+                plan.prefill_pool_shape(), POOL_POISON, dtype=torch.uint8, device=DEV
+            )
+            mat = torch.full(
+                (H, case.total_q, ref.ROW_WORDS),
+                POISON_I32,
+                dtype=torch.int32,
+                device=DEV,
+            )
+            for wi, w in enumerate(windows):
+                plan.prefill_local(
+                    inp["q"][w.start : w.end],
+                    inp["shards"][rank],
+                    inp["block_table"],
+                    wplans[wi],
+                    scratch,
+                    inp["nvalid"][w.start : w.end],
+                    mat[:, w.start : w.end],
+                )
+            send = torch.full_like(mat, POISON_I32)
+            recv = torch.empty_like(send)
+            for layer in range(2):
+                send.fill_(POISON_I32)
+                before = len(exchanges)
+                for wi, w in enumerate(windows):
+                    plan.prefill_local(
+                        inp["q"][w.start : w.end],
+                        inp["shards"][rank],
+                        inp["block_table"],
+                        wplans[wi],
+                        None,
+                        inp["nvalid"][w.start : w.end],
+                        send[:, w.start : w.end],
+                        pool=pool,
+                    )
+                assert len(exchanges) == before, "the facade made an exchange"
+                dist.all_to_all_single(recv, send)
+                assert len(exchanges) == before + 1
+                out = torch.full(
+                    (case.total_q, hpr, TOPK), POISON_I32, dtype=torch.int32, device=DEV
+                )
+                plan.prefill_merge(
+                    recv.view(world, hpr, case.total_q, ref.ROW_WORDS),
+                    inp["nvalid"],
+                    out,
+                )
+                torch.cuda.synchronize()
+                what = f"rank {rank} fused prefill {label} layer {layer}"
+                assert_words(send, mat, f"{what}: fused vs materialized carrier")
+                assert_words(send, exp.carriers[rank], f"{what}: carrier")
+                assert_words(out, exp.outputs[rank], f"{what}: merged ids")
+                report["checks"] += 3
+        assert len(exchanges) == 2 * len(DIST_FUSED_CASES), exchanges
+    finally:
+        dist.all_to_all_single = a2a
+    shared = page == 128 or world == 4
+    report["fused_prefill_dup_stats"] = stats
+    assert stats["single"] > 0, stats
+    if shared:
+        # blocks span ranks: ties and strict winners across ranks both occur
+        assert stats["tie"] > 0 and stats["win"] > 0, stats
+    else:
+        # P256 TP2: every block lives on one rank
+        assert stats["tie"] == stats["win"] == 0, stats
+    dist.barrier()
 
 
 def _dist_first_exchange(
@@ -3288,7 +3907,10 @@ def test_distributed_decode_and_prefill(world: int, page: int) -> None:
     memory (legacy and tagged, 1 / 2 / 3 / 5 layers, eager then CUDA Graph
     replays with no inter-step host sync; the fused chain with a caller pool
     and, at 8 requests, by the facade's chain rule), a 64-round legacy ready-flag litmus
-    and a prefill exchange, every rank checked against the oracle."""
+    and a prefill exchange (the materialized path, then the fused path with a
+    caller pool over two windows and two layers with one exchange per layer,
+    including shared prefix pages and partial maxima that tie or differ across
+    ranks), every rank checked against the oracle."""
     if torch.cuda.device_count() < world:
         pytest.skip(f"needs {world} GPUs")
     _torchrun(world, ["--page", str(page)])

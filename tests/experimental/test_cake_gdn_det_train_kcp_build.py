@@ -45,12 +45,13 @@ PREFIX = "cake_gdn_det_train"
 KCP_SUFFIX = "_kcp"  # the context-parallel-only programs (``kcp_*``)
 _W = "sm100_sm103_sm107"
 
-# The nine programs of a step (the shipped records by program name: sixteen libraries), the three programs of the
-# in-kernel Q / K L2 norm (one library each) and the two test-only records.
+# The nine programs of a step and the output walk (the shipped records by program name: eighteen libraries), the three
+# programs of the in-kernel Q / K L2 norm (one library each) and the two test-only records.
 SHIPPED_PROGRAMS = (
     "fwd_prep",
     "kcp_fwdh_offset",
     "kcp_fwdh_tape",
+    "kcp_fwdh_out",
     "kcp_transfer_walk",
     "kcp_affine_merge",
     "fwd_o",
@@ -89,6 +90,11 @@ IDENTITIES = {
     "kcp_fwdh_tape_vh64": (
         f"tart.gdn_chunk_kcp_fwd_h.{_W}.gdn_chunk_det_fwdh_v1_kcp",
         {"program": "tape", "vh": 64},
+    ),
+    "kcp_fwdh_out": (f"tart.gdn_chunk_kcp_fwd_h.{_W}.gdn_chunk_fwdh_out_v1_kcp", {}),
+    "kcp_fwdh_out_vh64": (
+        f"tart.gdn_chunk_kcp_fwd_h.{_W}.gdn_chunk_fwdh_out_v1_kcp",
+        {"vh": 64},
     ),
     "kcp_transfer_walk": (
         f"tart.gdn_chunk_kcp_transfer_walk.{_W}.gdn_chunk_det_transfer_walk_v1_kcp",
@@ -203,7 +209,7 @@ def test_the_package_imports_nothing_from_the_kda_training_package() -> None:
                 names = [node.module or ""] + [alias.name for alias in node.names]
             else:
                 continue
-            if any("cake_kda_train" in name for name in names):
+            if any("cake_kda" in name for name in names):
                 offenders.append(f"{path.name}:{node.lineno}")
     assert not offenders, offenders
 
@@ -247,7 +253,7 @@ def test_the_loader_and_header_are_the_pinned_bytes_of_every_cake_package() -> N
     header too."""
     kda_dir = Path(
         importlib.import_module(
-            "flashinfer.experimental.cake_kda_train.cake_build"
+            "flashinfer.experimental.cake_kda_det_train.cake_build"
         ).__file__
     ).parent
     for relative in ("cake_build.py", "csrc/cake_ffi_checks.h"):

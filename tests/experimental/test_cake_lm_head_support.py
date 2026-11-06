@@ -43,7 +43,7 @@ from tests.test_helpers.cake_package import cake_package
 
 cake_support = cake_package("cake.cake_lm_head_loss", "cake_support")
 cake_backend = cake_package("cake.cake_lm_head_loss", "cake_backend")
-det_support = cake_package("cake_lm_head_det_loss", "cake_support")
+det_support = cake_package("cake.cake_lm_head_det_train", "cake_support")
 support_logprob = cake_support.chunked_lm_head_support_logprob
 support_kl = cake_support.chunked_lm_head_support_kl
 
@@ -69,8 +69,8 @@ def run_support(
         logprob_fn, kl_fn = support_logprob, support_kl
         kwargs.update(ND)
     else:
-        logprob_fn = det_support.chunked_lm_head_det_support_logprob
-        kl_fn = det_support.chunked_lm_head_det_support_kl
+        logprob_fn = det_support.cake_lm_head_det_train_support_logprob
+        kl_fn = det_support.cake_lm_head_det_train_support_kl
     res = dict(packed=None, selected=None, kl=None)
     if "kl" in outputs:
         out = kl_fn(
@@ -205,7 +205,7 @@ def test_entries_refuse_any_mode_but_false(value):
             backend=REF,
             deterministic=value,
         )
-    with pytest.raises(ValueError, match="cake_lm_head_det_loss"):
+    with pytest.raises(ValueError, match="cake_lm_head_det_train"):
         support_kl(
             inp.X,
             inp.W,
@@ -231,9 +231,10 @@ def test_entries_refuse_any_mode_but_false(value):
 
 def test_names_are_the_deterministic_names_without_det():
     assert (
-        cake_support.SupportLogprobFunction is not det_support.SupportDetLogprobFunction
+        cake_support.SupportLogprobFunction
+        is not det_support.CakeLMHeadDetSupportFunction
     )
-    assert support_logprob is not det_support.chunked_lm_head_det_support_logprob
+    assert support_logprob is not det_support.cake_lm_head_det_train_support_logprob
     assert set(cake_support.__all__) >= {
         "SupportLogprobFunction",
         "chunked_lm_head_support_logprob",
@@ -478,12 +479,19 @@ DX_RULE_EXPECTED = {
     (4096, 8192, 244, 148, "sm_100a"): (1, 34),
     (1808, 6144, 242, 148, "sm_100a"): (1, 22),
     (257, 512, 8, 148, "sm_100a"): (1, 2),
-    # no cell on sm_103a (split forms); sm_107a: no cell, no split forms
+    # no cell on sm_103a / sm_107a (split forms on both)
     (4096, 5120, 240, 148, "sm_103a"): (1, 12),
     (1024, 6144, 242, 148, "sm_103a"): (1, 0),
     (512, 4096, 242, 148, "sm_103a"): (1, 16),
-    (4096, 5120, 240, 148, "sm_107a"): (1, 0),
-    (1808, 6144, 242, 148, "sm_107a"): (1, 0),
+    (4096, 5120, 240, 148, "sm_107a"): (1, 12),
+    (1808, 6144, 242, 148, "sm_107a"): (1, 22),
+    (1024, 6144, 242, 148, "sm_107a"): (1, 0),
+    # the shipped R200 split tail (212 SMs: 106 pairs, 216 SMs: 108): 12 row pairs x 4 = 48 items -> F 48 on both;
+    # 16 row pairs x 8 = 128 items -> F 22 / F 20
+    (3072, 2048, 244, 212, "sm_107a"): (1, 48),
+    (3072, 2048, 244, 216, "sm_107a"): (1, 48),
+    (4096, 4096, 242, 212, "sm_107a"): (1, 22),
+    (4096, 4096, 242, 216, "sm_107a"): (1, 20),
 }
 
 
@@ -537,10 +545,13 @@ def test_dense_stages_follow_the_rule():
     stages = cake_support.support_dense_stages
     split = set(cake_support.SUPPORT_DENSE_SPLIT_STAGES)
     assert split == {"gemm_dx_split", "gemm_dx_red_split"}
+    assert set(cake_backend.DX_SPLIT_ARCHES) == {"sm_100a", "sm_103a", "sm_107a"}
     for arch in cake_backend.DX_SPLIT_ARCHES:
         assert split <= set(stages(arch))
-    assert not split & set(stages("sm_107a"))
-    assert set(cake_support.SUPPORT_DENSE_STAGES) <= set(stages("sm_107a"))
+        assert set(cake_support.SUPPORT_DENSE_STAGES) <= set(stages(arch))
+    # an architecture outside DX_SPLIT_ARCHES requires no split-tail program
+    assert not split & set(stages("sm_90a"))
+    assert set(cake_support.SUPPORT_DENSE_STAGES) <= set(stages("sm_90a"))
     # the later blocks of a chunk add through the reduction form at one slice too
     assert "gemm_dx_red" in cake_support.SUPPORT_DENSE_STAGES
     for name, record in cake_support.MODULES.items():
