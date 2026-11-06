@@ -87,11 +87,11 @@ the eight-rank Blackwell carrier), so no separate all-reduce kernel or
 collective runs. The delivered architectures and world sizes are recorded in
 the loader's route tables (``flashinfer.jit.cake_fp8_rowwise_gemm_allreduce``);
 a device or group outside them raises instead of falling back.
-Operands are contiguous CUDA tensors with ``N`` a positive multiple of the
-delivered route's column tile (256 on SM100 / SM103, 128 on SM90), ``K_l`` a
-positive multiple of 128, any positive ``M`` with ``M * N <= 2**30``, and the
-process's torch symmetric-memory backend being the default ``CUDA`` backend or
-``NVSHMEM`` (the Cake backend never selects one itself). The symmetric
+Operands are contiguous CUDA tensors starting at a 16-byte aligned address
+(``a``, ``w``, ``w_scale`` and a caller-provided ``out``), with ``N`` a positive
+multiple of 256 and at most ``134184960``, ``K_l`` a positive multiple of 128,
+any positive ``M`` with ``M * N <= 2**30``, and the process's torch
+symmetric-memory backend being the default ``CUDA`` backend or ``NVSHMEM`` (the Cake backend never selects one itself). The symmetric
 workspace of a group grows to the largest ``M`` seen; that growth is the only
 collective after the first call.
 

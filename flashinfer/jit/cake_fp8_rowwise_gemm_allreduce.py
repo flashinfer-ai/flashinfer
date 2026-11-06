@@ -417,6 +417,12 @@ BLOCK_M = 128
 BLOCK_K = 128
 OUT_BYTES = 2
 MAX_ROWS_TIMES_COLS = 1 << 30
+# The column multiple of the operand contract on every architecture (the
+# sm_90a tile is 128 wide, but only multiples of 256 are delivered).
+N_MULTIPLE = 256
+# Reducer/drainer vector indices are 32-bit: 16 * N plus the drainer's
+# 8 * 64 * MAX_CTAS stride overshoot must stay below 2**31.
+MAX_COLS = (1 << 27) - (1 << 15)
 GRID_RULE_CLUSTER_PAIRS = "persistent_cluster_pairs"
 GRID_RULE_SM_COUNT = "persistent_sm_count"
 
@@ -602,12 +608,18 @@ def ctl_words(c_cap: int, arch: str) -> int:
 
 
 def validate_shape(m: int, n: int, k_l: int, arch: str) -> tuple[int, int, int]:
-    """``M >= 1``, ``N % BLOCK_N == 0``, ``K_l % 128 == 0``, ``M * N <= 2**30``."""
+    """``M >= 1``, ``N % 256 == 0``, ``N <= MAX_COLS``, ``K_l % 128 == 0``, ``M * N <= 2**30``."""
 
     m, n, k_l = int(m), int(n), int(k_l)
     if m <= 0:
         raise ValueError(f"M must be positive, got {m}")
     grid_n(n, arch)
+    if n % N_MULTIPLE:
+        raise ValueError(f"N must be a positive multiple of {N_MULTIPLE}, got {n}")
+    if n > MAX_COLS:
+        raise ValueError(
+            f"N = {n} exceeds {MAX_COLS} (32-bit reducer/drainer vector index)"
+        )
     if k_l <= 0 or k_l % BLOCK_K:
         raise ValueError(f"K_l must be a positive multiple of {BLOCK_K}, got {k_l}")
     if m * n > MAX_ROWS_TIMES_COLS:
@@ -857,7 +869,9 @@ __all__ = [
     "GEOMETRY",
     "GRID_RULE_CLUSTER_PAIRS",
     "GRID_RULE_SM_COUNT",
+    "MAX_COLS",
     "MAX_ROWS_TIMES_COLS",
+    "N_MULTIPLE",
     "OUT_BYTES",
     "PROGRAMS",
     "ROUTES",
