@@ -65,8 +65,11 @@ class SwapsKernel:
     """``SwapsKernel(D, g, page, n_pad)`` compiled once per static tuple; shapes, strides, the page table, the work units and the scale are
     runtime arguments. Every unit must have at most ``n_pad`` live rows (the API selects ``n_pad`` per launch)."""
 
-    def __init__(self, D: int, g: int, page: int, n_pad: int, ragged: bool = False):
+    def __init__(
+        self, D: int, g: int, page: int, n_pad: int, ragged: bool = False, cap: int = 0
+    ):
         self.D, self.g, self.page, self.n_pad, self.ragged = D, g, page, n_pad, ragged
+        self.cap = cap  # the shared-memory capacity the ring is sized for (0: the current device's)
 
     @cute.jit
     def __call__(
@@ -88,7 +91,7 @@ class SwapsKernel:
         grid: Int32,
         stream: cuda.CUstream,
     ):
-        st = SwapsPlan(self.D, self.g, self.page, self.n_pad, self.ragged)
+        st = SwapsPlan(self.D, self.g, self.page, self.n_pad, self.ragged, self.cap)
         self.st = st
         tma = SwapsTma(st, mQ, mK, mV)
 

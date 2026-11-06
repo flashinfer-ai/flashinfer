@@ -1556,8 +1556,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
         _check_workspace_buffer_alignment(
             float_workspace_buffer, "float_workspace_buffer"
         )
-        _check_kv_layout(kv_layout)
-
         self._batch_invariant = None
         if batch_invariant:
             from .attention.batch_invariant.wrappers import BatchInvariantAttention
@@ -1570,6 +1568,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 jit_args,
                 use_cuda_graph=use_cuda_graph,
             )
+
+        _check_kv_layout(kv_layout)
 
         if backend in ("cute-dsl", "cudnn") and jit_args is not None:
             raise NotImplementedError(
@@ -3369,6 +3369,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             enable_pdl = device_support_pdl(q.device)
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
         if self._batch_invariant is not None:
+            self._batch_invariant.refuse(positional_arguments=args or None)
             if q_len_per_req is not None:
                 warnings.warn(
                     "Passing `q_len_per_req` to BatchDecodeWithPagedKVCacheWrapper.run() "
@@ -3395,7 +3396,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 kv_cache_sf=kv_cache_sf,
                 skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
                 enable_pdl=enable_pdl,
-                sm_scale=self._sm_scale,
+                sm_scale=self._sm_scale
+                if self._sm_scale is not None
+                else 1.0 / math.sqrt(q.shape[-1]),
                 pos_encoding_mode=self._pos_encoding_mode,
                 logits_soft_cap=self._logits_soft_cap,
                 rope_scale=self._rope_scale,

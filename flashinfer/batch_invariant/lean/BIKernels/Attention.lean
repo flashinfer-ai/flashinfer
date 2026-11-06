@@ -6,7 +6,10 @@ import BIKernels.Export
 /-!
 # Paged-KV attention: the class `attention.bf16` (per head dim) and the batch-invariance guarantees
 
-Mirrors `flashinfer/attention/batch_invariant/spec.py`. Per logical row `(p, h)` and output column `d` the dataflow is
+Mirrors `flashinfer/attention/batch_invariant/spec.py`. The model is per logical row: the row's identity (its query token and
+head, hence its own K / V) is the leaf index of every score and value term, so rows of different KV heads or requests are
+different terms even when their values coincide, and the theorems quantify over every row. Per logical row `(p, h)` and output
+column `d` the dataflow is
 
 * the score of key `k`: the GEMM's `kfold` over `D` (opaque `mma16` steps, `GEMM.kfold`);
 * a **tile step** on the state `(m, l, O)`: row maximum (pairwise `fmax` tree over the tile's visible

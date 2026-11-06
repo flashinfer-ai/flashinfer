@@ -9,6 +9,10 @@ its KV position, its head and the window alone, so the three wrappers compute th
 CUDA graphs: capture ``run()`` after ``plan()``; a replay reproduces the planned batch (the descriptor table and the launch grid are
 the plan's), and a new ``plan()`` needs a new capture. The wrappers' ``use_cuda_graph=True`` contract (``plan()`` refreshes the
 metadata a captured graph reads) is not offered: there is no device-side planner, so it raises.
+
+A plan's execution state (the split-KV partials in the workspace, the arrival counters) is single-use per launch: two ``run()``
+calls of one plan must be stream-ordered, as with every FlashInfer wrapper's workspace; the counters reset themselves at every
+launch, so sequential reuse on one stream needs nothing more.
 """
 
 from __future__ import annotations
@@ -119,6 +123,7 @@ class BatchInvariantAttention:
         "o_indptr": "the offsets of qo_indptr for the output",
         "rope_scale": "no fused RoPE (apply RoPE to q / k beforehand)",
         "rope_theta": "no fused RoPE (apply RoPE to q / k beforehand)",
+        "positional_arguments": "keyword arguments after the KV cache",
     }
 
     def refuse(self, **args) -> None:
@@ -511,6 +516,8 @@ class BatchInvariantAttention:
         logits_soft_cap: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
+        causal: Optional[bool] = None,
+        use_fp16_qk_reduction: bool = False,
     ) -> torch.Tensor:
         """The wrappers' ``run`` arguments; ``sm_scale`` .. ``rope_theta`` are the per-call options the deprecated ``forward()`` sets on the
         wrapper: they must agree with the plan (``sm_scale``) or be the class's defaults."""
@@ -533,6 +540,16 @@ class BatchInvariantAttention:
                 'pos_encoding_mode "NONE" (apply RoPE to q / k beforehand)',
             )
         self.refuse(rope_scale=rope_scale, rope_theta=rope_theta)
+        if causal is not None and not causal and self.kind != "decode":
+            raise unsupported(
+                CLASS, "non-causal attention", "causal attention (bottom-right aligned)"
+            )
+        if use_fp16_qk_reduction:
+            raise unsupported(
+                CLASS,
+                "use_fp16_qk_reduction",
+                "the fp32 score accumulation of the class",
+            )
         if use_fp16_softmax or uses_spcompress:
             raise unsupported(
                 CLASS,
@@ -616,6 +633,9 @@ class BatchInvariantAttention:
             if ok and t.stride(-1) != 1:
                 ok = False
                 want += " with a unit stride along the head dim (the kernels are compiled for it)"
+            if ok and (t.data_ptr() % 16 or any(s % 8 for s in t.stride()[:-1])):
+                ok = False
+                want += " 16-byte aligned (base address and outer strides: the TMA descriptors)"
             if not ok:
                 raise unsupported(
                     CLASS,
@@ -636,6 +656,15 @@ class BatchInvariantAttention:
                 CLASS,
                 f"out {tuple(out.shape)} {out.dtype} on {out.device}",
                 f"a contiguous bf16 ({q.shape[0]}, {Hq}, {D}) output on {self.device}",
+            )
+        if out.untyped_storage().data_ptr() in (
+            k.untyped_storage().data_ptr(),
+            v.untyped_storage().data_ptr(),
+        ):
+            raise unsupported(
+                CLASS,
+                "an output that aliases the KV cache",
+                "an output buffer of its own (CTAs store rows while others still read pages)",
             )
         engine.run_attention(
             self._planned,

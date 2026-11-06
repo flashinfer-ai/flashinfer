@@ -213,7 +213,9 @@ class Roles:
 class SwapsPlan:
     """Tiled MMAs, tilers, smem / TMEM layouts, stage counts and the producer views of the swapped body."""
 
-    def __init__(self, D: int, g: int, page: int, n_pad: int, ragged: bool = False):
+    def __init__(
+        self, D: int, g: int, page: int, n_pad: int, ragged: bool = False, cap: int = 0
+    ):
         assert D in (64, 128, 256) and n_pad in N_PADS and 1 <= g <= 32, (D, n_pad, g)
         assert page >= 1 and (
             page <= TILE_KEYS and TILE_KEYS % page == 0 or page % TILE_KEYS == 0
@@ -232,7 +234,7 @@ class SwapsPlan:
         self.halves = self.slot_dims // HALF  # 64-wide d halves per slot: 1, 2, 2
         self.halves_tile = D // HALF
         self.slot_keys = self.T
-        self.n_slots = ring_slots(D, n_pad, arch_smem_cap())
+        self.n_slots = ring_slots(D, n_pad, cap or arch_smem_cap())
         self.kv_slots = self.n_slots // self.slots_per_tile  # tiles in flight
         self.box_rows = min(page, self.T)  # keys per TMA box
         self.boxes_per_slot = self.T // self.box_rows

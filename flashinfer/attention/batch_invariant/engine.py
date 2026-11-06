@@ -286,6 +286,7 @@ class _Planned:
         self.total_q: Optional[int] = None
         self.window_left: Optional[int] = None
         self.config: Optional[AttnConfig] = None
+        self.page: Optional[int] = None
         self.fixup_groups = (
             fixup_groups if fixup_groups is not None else groups
         )  # the groups the fixup kernel folds (the FMHA body folds the others in-kernel)
@@ -400,6 +401,7 @@ def plan_attention(
     planned.total_q = int(qo_indptr[-1]) if qo_indptr.numel() else 0
     planned.window_left = int(window_left)
     planned.config = config
+    planned.page = int(page)
     return planned
 
 
@@ -491,6 +493,10 @@ def run_attention(
         )
     else:
         page = k_cache.shape[1] if kv_layout == "NHD" else k_cache.shape[2]
+        if planned.page is not None and int(page) != planned.page:
+            raise ValueError(
+                f"a KV cache of page size {page} at run_attention over a plan built for page size {planned.page}"
+            )
         Hkv = k_cache.shape[2] if kv_layout == "NHD" else k_cache.shape[1]
         kv_k, kv_v = (
             _kv_view(k_cache, kv_layout, Hkv, page, D),
@@ -512,11 +518,17 @@ def run_attention(
         and v_cache.dtype == torch.bfloat16
     )
     assert q.is_contiguous(), "Q must be a packed (total_q, Hq, D) tensor"
+    if k_cache.stride(-1) != 1 or v_cache.stride(-1) != 1:
+        raise ValueError(
+            "the K / V caches must have a unit stride along the head dim (the kernels are compiled for it)"
+        )
     if out is None:
         out = torch.empty_like(q)
     assert out.shape == q.shape and out.dtype == torch.bfloat16 and out.is_contiguous()
     c = check_sm_scale(sm_scale)
     plan = planned.plan
+    if total_q == 0 or plan.num_units == 0:
+        return out  # nothing to compute: no TMA descriptor over an empty query extent
     assert plan.g == g
     q_view = q.permute(2, 1, 0)  # (D, Hq, total_q)
     o_view = out.view(total_q * Hq, D)

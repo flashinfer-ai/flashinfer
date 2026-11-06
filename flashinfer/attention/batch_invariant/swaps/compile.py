@@ -19,15 +19,22 @@ from .kernel import SwapsKernel
 MODULE = "batch_invariant_attention"
 
 
-def kernel_name(D: int, g: int, page: int, n_pad: int, ragged: bool = False) -> str:
+def kernel_name(
+    D: int, g: int, page: int, n_pad: int, ragged: bool = False, cap: int = 0
+) -> str:
     return jit.sanitize_symbol_name(
-        f"attn_swaps_d{D}_g{g}_p{page}_n{n_pad}" + ("_rg" if ragged else "")
+        f"attn_swaps_d{D}_g{g}_p{page}_n{n_pad}"
+        + ("_rg" if ragged else "")
+        + (f"_c{cap >> 10}" if cap else "")
     )
 
 
 @functools.cache
 def get_compiled_swaps(D: int, g: int, page: int, n_pad: int, ragged: bool = False):
-    name = kernel_name(D, g, page, n_pad, ragged)
+    from .operands import arch_smem_cap
+
+    cap = arch_smem_cap()  # the ring depth follows the compile target's capacity: part of the kernel's identity
+    name = kernel_name(D, g, page, n_pad, ragged, cap)
 
     def compile_fn():
         bf16, f32, i32 = cutlass.BFloat16, cutlass.Float32, cutlass.Int32
@@ -88,7 +95,7 @@ def get_compiled_swaps(D: int, g: int, page: int, n_pad: int, ragged: bool = Fal
             i32, (s_nidx,), (1,), assumed_align=4
         )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-        k = SwapsKernel(D, g, page, n_pad, ragged)
+        k = SwapsKernel(D, g, page, n_pad, ragged, cap)
         return cute.compile(
             k,
             q_fake,

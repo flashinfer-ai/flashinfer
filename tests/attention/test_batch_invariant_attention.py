@@ -966,6 +966,46 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
             window_left=None,
             sm_scale=0.5,
         )
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError
+    ):  # the deprecated forward()'s causal=False
+        w._batch_invariant.run(
+            pr.q,
+            k,
+            v,
+            out=None,
+            return_lse=False,
+            lse=None,
+            window_left=None,
+            causal=False,
+        )
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError
+    ):  # a positional argument after the cache
+        w.run(pr.q, (k, v), 0.5)
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError
+    ):  # an output aliasing the cache
+        w.run(pr.q, (k, v), out=k.flatten()[: pr.q.numel()].view(pr.q.shape))
+    off = torch.empty(k.numel() + 1, dtype=k.dtype, device=k.device)[1:].view(k.shape)
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError
+    ):  # a K view that is not 16-byte aligned
+        w.run(pr.q, (off, v))
+    # a plan with no query rows: nothing is launched, the (empty) output comes back
+    w.plan(
+        torch.tensor([0, 0], dtype=torch.int32, device=pr.device),
+        pr.kv_indptr,
+        pr.kv_indices,
+        pr.kv_last,
+        32,
+        8,
+        128,
+        16,
+        causal=True,
+        **kw,
+    )
+    assert w.run(pr.q[:0], (k, v)).shape == (0, 32, 128)
     with pytest.raises(bi.BatchInvariantUnsupportedError):  # a negative kv_indptr entry
         w.plan(
             pr.qo_indptr,

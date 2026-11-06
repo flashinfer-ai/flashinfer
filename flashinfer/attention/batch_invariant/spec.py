@@ -2,6 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Canonical dataflow of paged-KV attention: the class ``attn.bf16.d<D>``.
 
+The class is stated for finite bf16 operands: a non-finite Q / K / V value, or scaled scores outside the binary32 range, give
+the NaN that fp32 softmax arithmetic gives (bit for bit, like every other value) and are not guarded against.
+
 Everything numeric lives here once, parameterised by an ``fp`` backend (``TermAlgebra`` for the
 symbolic spec and the Lean coupling, ``CuteF32`` inside the kernel). Per logical row ``(p, h)`` with visible keys ``[lo, L)``:
 
