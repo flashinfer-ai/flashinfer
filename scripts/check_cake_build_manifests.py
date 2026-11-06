@@ -449,8 +449,8 @@ PACKAGES: tuple[Package, ...] = (
         refs_generic,
     ),
     Package(
-        "flashinfer.experimental.cake.cake_mhc_train_backend",
-        "flashinfer/experimental/cake/cake_mhc_train_backend",
+        "flashinfer.experimental.cake.cake_mhc_nondet_train",
+        "flashinfer/experimental/cake/cake_mhc_nondet_train",
         "cake_jit.py",
         refs_generic,
     ),

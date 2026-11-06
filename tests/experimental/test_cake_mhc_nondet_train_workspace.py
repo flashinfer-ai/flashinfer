@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Workspace reuse across token counts of the Cake four-stream mHC training
-package with the opt-in non-deterministic backward
-(``flashinfer.experimental.cake.cake_mhc_train_backend``, every entry point with
-``deterministic=False``; hidden 4096, 5120 and 7168, 4 streams; SM100 /
-SM103 at the three hidden sizes, SM107 at 4096; FlashInfer issue #8068), in the
+package with the non-deterministic backward
+(``flashinfer.experimental.cake.cake_mhc_nondet_train``; hidden 4096, 5120 and
+7168, 4 streams; SM100 / SM103 at the three hidden sizes, SM107 at 4096;
+FlashInfer issue #8068), in the
 form of ``test_cake_mhc_det_train_workspace.py``.  Every case runs at each
 hidden size the device's architecture routes, its buffers sized with
 ``hidden=``; a size it does not route is skipped.
@@ -29,7 +29,7 @@ its per-chunk ``dfn`` partials; its first region is the ticket word the
 column-slab pass draws its work units from with a self-resetting ``atom.inc``
 (a word that is not zero at launch makes the launch skip units or end away
 from zero), at offset 0 for every token count.  A caller-owned buffer sized by
-``cake_mhc_train_backward_workspace_bytes(T_max, deterministic=False)`` serves
+``cake_mhc_nondet_train_backward_workspace_bytes(T_max)`` serves
 every token count up to ``T_max`` (at its ``hidden``) and CUDA Graph replays
 at a smaller ``T``.
 Before every call the bytes of the backward buffer past the ticket region are
@@ -73,7 +73,6 @@ import contextlib
 import gc
 import json
 import math
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -83,13 +82,13 @@ import torch
 
 from tests.test_helpers.cake_package import PACKAGES, cake_package
 
-KEY = "cake.cake_mhc_train"
+KEY = "cake.cake_mhc_nondet_train"
 pkg = cake_package(KEY)
 loader = cake_package(KEY, "cake_jit")
 # The deterministic package: the same-input comparison point.
 det = cake_package("cake_mhc_det_train")
 det_loader = cake_package("cake_mhc_det_train", "cake_jit")
-backward_finish = pkg.cake_mhc_train_backward_finish
+backward_finish = pkg.cake_mhc_nondet_train_backward_finish
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 STREAMS, HIDDEN, MAPPING_ROWS = 4, 4096, 24
@@ -136,7 +135,7 @@ def _supported() -> bool:
     return (
         torch.cuda.is_available()
         and _capability() in SUPPORTED_CAPABILITIES
-        and pkg.is_cake_mhc_train_supported(_device())
+        and pkg.is_cake_mhc_nondet_train_supported(_device())
         and loader.route_applies(
             device_capability=_capability(), hidden=HIDDEN, kind="bwd_finish"
         )
@@ -145,7 +144,7 @@ def _supported() -> bool:
 
 pytestmark = pytest.mark.skipif(
     not _supported(),
-    reason="cake_mhc_train needs an SM100 / SM103 / SM107 device with exported routes",
+    reason="cake_mhc_nondet_train needs an SM100 / SM103 / SM107 device with exported routes",
 )
 
 
@@ -219,7 +218,7 @@ def _slab_parts(T: int, hidden: int = HIDDEN) -> int:
 
 
 def _dfn_factor(T: int, hidden: int = HIDDEN) -> float:
-    """F of the dfn bound F u (|carried| + ABS_SLACK sum_t |dz'_t| |x_t|) at T (``test_cake_mhc_train.py``'s
+    """F of the dfn bound F u (|carried| + ABS_SLACK sum_t |dz'_t| |x_t|) at T (``test_cake_mhc_nondet_train.py``'s
     ``_dfn_factor``, which derives it): 2 P where the column slab runs dynr or dynr_os (both sides sum the same
     per-chunk partials), 2 max(P, P_k7) + 10 where it runs lpt or lpt_os (the partials are another partition's)."""
     if not _lpt_runs(T, hidden):
@@ -232,7 +231,7 @@ def _round256(n: int) -> int:
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# The dfn bound (test_cake_mhc_train.py's)
+# The dfn bound (test_cake_mhc_nondet_train.py's)
 
 
 def _sinkhorn(logits: torch.Tensor, hc_eps: float, iters: int) -> torch.Tensor:
@@ -286,7 +285,7 @@ def _dzp(i: dict) -> torch.Tensor:
 
 def _dfn_bound(i: dict) -> torch.Tensor:
     """Per-element bound of ``|dfn_a - dfn_b|`` for two sums of per-chunk partials in two orders:
-    ``F u * 1.02 sum_t |dz'_t| |x_t|`` with ``F`` = :func:`_dfn_factor` (``test_cake_mhc_train.py``'s
+    ``F u * 1.02 sum_t |dz'_t| |x_t|`` with ``F`` = :func:`_dfn_factor` (``test_cake_mhc_nondet_train.py``'s
     ``_dfn_bound``)."""
     T, hidden = i["X"].shape[0], i["X"].shape[2]
     dzp = _dzp(i).abs()
@@ -334,33 +333,29 @@ def _bound(i: dict) -> torch.Tensor:
     return i["bound"]
 
 
-def _step(i: dict, fwd_ws, bwd_ws, *, deterministic: bool = False) -> dict:
-    """One forward + backward of this package (``deterministic=False``) or of the deterministic package."""
-    if deterministic:
+def _step(i: dict, fwd_ws, bwd_ws, *, det_package: bool = False) -> dict:
+    """One forward + backward of this package or of the deterministic package."""
+    if det_package:
         entries = (
             det.cake_mhc_det_train_forward_prepare,
             det.cake_mhc_det_train_forward_finish,
             det.cake_mhc_det_train_backward_prepare,
             det.cake_mhc_det_train_backward_finish,
         )
-        mode = {}
     else:
         entries = (
-            pkg.cake_mhc_train_forward_prepare,
-            pkg.cake_mhc_train_forward_finish,
-            pkg.cake_mhc_train_backward_prepare,
+            pkg.cake_mhc_nondet_train_forward_prepare,
+            pkg.cake_mhc_nondet_train_forward_finish,
+            pkg.cake_mhc_nondet_train_backward_prepare,
             backward_finish,
         )
-        mode = {"deterministic": False}
     fwd_prepare, fwd_finish, bwd_prepare, bwd_finish = entries
-    U, stats = fwd_prepare(
-        i["X"], i["fn"], i["scale"], i["base"], workspace=fwd_ws, **mode
-    )
-    Y = fwd_finish(i["X"], i["B"], stats, **mode)
-    dB, gstats = bwd_prepare(i["dY"], i["B"], i["X"], stats, **mode)
+    U, stats = fwd_prepare(i["X"], i["fn"], i["scale"], i["base"], workspace=fwd_ws)
+    Y = fwd_finish(i["X"], i["B"], stats)
+    dB, gstats = bwd_prepare(i["dY"], i["B"], i["X"], stats)
     dX, dfn, dscale, dbase = bwd_finish(
         i["X"], i["dY"], i["dU"], i["B"], i["fn"], i["scale"], i["base"], stats, gstats,
-        workspace=bwd_ws, **mode,
+        workspace=bwd_ws,
     )  # fmt: skip
     return dict(
         zip(OUTPUTS, (U, stats, Y, dB, gstats, dX, dfn, dscale, dbase), strict=True)
@@ -379,12 +374,8 @@ def _workspaces(t_max: int, hidden: int) -> tuple[torch.Tensor, torch.Tensor]:
     """Caller-owned forward and backward workspaces of the non-deterministic sizing for up to ``t_max`` tokens of
     hidden size ``hidden``."""
     return (
-        pkg.cake_mhc_train_forward_workspace(
-            t_max, _device(), hidden=hidden, deterministic=False
-        ),
-        pkg.cake_mhc_train_backward_workspace(
-            t_max, _device(), hidden=hidden, deterministic=False
-        ),
+        pkg.cake_mhc_nondet_train_forward_workspace(t_max, _device(), hidden=hidden),
+        pkg.cake_mhc_nondet_train_backward_workspace(t_max, _device(), hidden=hidden),
     )
 
 
@@ -398,7 +389,7 @@ def _nd_workspace_exact(T: int, hidden: int = HIDDEN) -> torch.Tensor:
 
 
 def _fresh(T: int, hidden: int = HIDDEN) -> dict:
-    """The outputs of one ``deterministic=False`` call on fresh zeroed exact-size workspaces."""
+    """The outputs of one non-deterministic call on fresh zeroed exact-size workspaces."""
     fwd_ws = torch.zeros(
         _layout("fwd", T, hidden)["total_bytes"], dtype=torch.uint8, device=_device()
     )
@@ -411,7 +402,7 @@ def _deterministic(T: int, hidden: int = HIDDEN) -> dict:
     """The outputs of the deterministic package on its default workspaces (``dscale`` / ``dbase`` of its per-CTA
     reduction where it runs its group-row forms: :func:`_det_reduction`)."""
     i = _inputs(T, hidden)
-    out = _snapshot(_step(i, None, None, deterministic=True))
+    out = _snapshot(_step(i, None, None, det_package=True))
     out.update(_det_reduction(i, {"stats": out["stats"], "gstats": out["gstats"]}))
     torch.cuda.synchronize()
     return out
@@ -612,7 +603,7 @@ def test_default_workspace_bucket_across_token_counts(Ts: tuple, hidden: int) ->
 
 
 # One process per sequence: the inputs of the issue's reproduction (one CPU generator seeded 0, drawn in call order)
-# at the hidden size of the case, each ``backward_finish(..., deterministic=False)`` on the default workspace (keyed by
+# at the hidden size of the case, each ``backward_finish(...)`` on the default workspace (keyed by
 # device, kind, hidden size and power-of-two token bucket), then the same call on a fresh zeroed exact-size workspace
 # and the deterministic call.  The inputs are not the records of a forward (``stats`` and
 # ``grad_stats`` are random), so no FP64 reference applies: ``dfn`` is compared by its rel-L2.
@@ -646,11 +637,11 @@ for T in (int(t) for t in sys.argv[3].split(",")):
         return 0 if ws is None else int(torch.count_nonzero(ws[ticket["offset"] : ticket["offset"] + ticket["bytes"]]))
     call = {"T": T, "ticket_before": nonzero()}
     print(json.dumps(call), flush=True)
-    got = [t.clone() for t in pkg.cake_mhc_train_backward_finish(*args, deterministic=False)]
+    got = [t.clone() for t in pkg.cake_mhc_nondet_train_backward_finish(*args)]
     call["ticket_after"] = nonzero()
     call["default_found"] = key in pkg._DEFAULT_WORKSPACES
     fresh = torch.zeros(layout["total_bytes"], dtype=torch.uint8, device=dev)
-    ref = [t.clone() for t in pkg.cake_mhc_train_backward_finish(*args, workspace=fresh, deterministic=False)]
+    ref = [t.clone() for t in pkg.cake_mhc_nondet_train_backward_finish(*args, workspace=fresh)]
     want = det.cake_mhc_det_train_backward_finish(*args)
     torch.cuda.synchronize()
     call["finite"] = all(bool(torch.isfinite(t).all()) for t in got)
@@ -686,12 +677,12 @@ def test_default_workspace_reported_sequence(Ts: tuple, hidden: int) -> None:
     ]
     tail = "\n".join((run.stdout + run.stderr).strip().splitlines()[-6:])
     assert run.returncode == 0, (
-        f"backward_finish(deterministic=False) over {Ts} on the default workspace: exit {run.returncode}\n{tail}"
+        f"backward_finish() over {Ts} on the default workspace: exit {run.returncode}\n{tail}"
     )
     done = [c for c in calls if "differs" in c]
     assert [c["T"] for c in done] == list(Ts), tail
     for c in done:
-        what = f"default workspace, backward_finish(deterministic=False) at T={c['T']} H={hidden} of {Ts}"
+        what = f"default workspace, backward_finish() at T={c['T']} H={hidden} of {Ts}"
         # The ticket checks read the call's default buffer, not a missing one (a vacuous zero).
         assert c["default_found"], (
             f"{what}: no default workspace under the probed key (device, kind, hidden, bucket)"
@@ -718,7 +709,7 @@ def test_default_workspace_reported_sequence(Ts: tuple, hidden: int) -> None:
             )
 
 
-# A fresh process at the hidden size of the case: ``backward_finish(..., deterministic=False)`` on a caller-owned
+# A fresh process at the hidden size of the case: ``backward_finish(...)`` on a caller-owned
 # workspace (every module loaded), then the same call with ``workspace=None`` inside a CUDA graph capture, before any
 # default buffer of its bucket exists, then the same call eagerly.
 _CAPTURE_CHILD = r"""
@@ -734,20 +725,20 @@ args = [r(T, 4, H, dtype=torch.bfloat16), r(T, 4, H, dtype=torch.bfloat16, scale
         r(T, H, dtype=torch.bfloat16, scale=1e-3), None, r(24, 4 * H, scale=0.05), r(3, scale=0.1),
         r(24), r(T, 64), r(T, 32, scale=1e-3)]
 key = (0, "bwd", H, 1 << (T - 1).bit_length())
-ws = pkg.cake_mhc_train_backward_workspace(T, dev, hidden=H, deterministic=False)
-ref = [t.clone() for t in pkg.cake_mhc_train_backward_finish(*args, workspace=ws, deterministic=False)]
+ws = pkg.cake_mhc_nondet_train_backward_workspace(T, dev, hidden=H)
+ref = [t.clone() for t in pkg.cake_mhc_nondet_train_backward_finish(*args, workspace=ws)]
 torch.cuda.synchronize()
 out = {"cached_before": key in pkg._DEFAULT_WORKSPACES, "raised": None}
 graph = torch.cuda.CUDAGraph()
 try:
     with torch.cuda.graph(graph):
-        pkg.cake_mhc_train_backward_finish(*args, deterministic=False)
+        pkg.cake_mhc_nondet_train_backward_finish(*args)
 except ValueError as e:
     out["raised"] = str(e)
 del graph
 torch.cuda.synchronize()
 out["cached_after_capture"] = key in pkg._DEFAULT_WORKSPACES
-got = [t.clone() for t in pkg.cake_mhc_train_backward_finish(*args, deterministic=False)]
+got = [t.clone() for t in pkg.cake_mhc_nondet_train_backward_finish(*args)]
 torch.cuda.synchronize()
 out["cached_after_eager"] = key in pkg._DEFAULT_WORKSPACES
 out["differs"] = [n for n, a, b in zip(("dX", "dfn", "dscale", "dbase"), got, ref) if n != "dfn" and not torch.equal(a, b)]
@@ -772,7 +763,7 @@ def test_default_workspace_is_not_created_during_capture(hidden: int) -> None:
     ]
     assert len(lines) == 1, tail
     out = lines[0]
-    what = f"backward_finish(deterministic=False) at T={T} H={hidden} on the default workspace"
+    what = f"backward_finish() at T={T} H={hidden} on the default workspace"
     assert not out["cached_before"], (
         f"{what}: a default buffer existed before the capture"
     )
@@ -789,7 +780,7 @@ def test_default_workspace_is_not_created_during_capture(hidden: int) -> None:
     )
 
 
-# A fresh process with two devices at the hidden size of the case: ``backward_finish(..., deterministic=False)`` on a
+# A fresh process with two devices at the hidden size of the case: ``backward_finish(...)`` on a
 # caller-owned workspace of each device (every module loaded), then the call with ``workspace=None`` on cuda:1
 # tensors, before any default buffer of its bucket exists, (a) inside a capture on cuda:1 while cuda:0 is the current
 # device and (b) inside a relaxed-mode capture on cuda:0 (the call's stream, cuda:1's current stream, is not capturing).
@@ -810,11 +801,11 @@ def on(dev):
 names = ("dX", "dfn", "dscale", "dbase")
 bucket = 1 << (T - 1).bit_length()
 for dev in (dev0, dev1):
-    ws = pkg.cake_mhc_train_backward_workspace(T, dev, hidden=H, deterministic=False)
-    pkg.cake_mhc_train_backward_finish(*on(dev), workspace=ws, deterministic=False)
+    ws = pkg.cake_mhc_nondet_train_backward_workspace(T, dev, hidden=H)
+    pkg.cake_mhc_nondet_train_backward_finish(*on(dev), workspace=ws)
 args1 = on(dev1)
-ws1 = pkg.cake_mhc_train_backward_workspace(T, dev1, hidden=H, deterministic=False)
-ref = [t.clone() for t in pkg.cake_mhc_train_backward_finish(*args1, workspace=ws1, deterministic=False)]
+ws1 = pkg.cake_mhc_nondet_train_backward_workspace(T, dev1, hidden=H)
+ref = [t.clone() for t in pkg.cake_mhc_nondet_train_backward_finish(*args1, workspace=ws1)]
 torch.cuda.synchronize(dev0)
 torch.cuda.synchronize(dev1)
 out = {"cached_before": [(i, "bwd", H, bucket) in pkg._DEFAULT_WORKSPACES for i in (0, 1)], "raised_a": None, "raised_b": None}
@@ -827,7 +818,7 @@ with torch.cuda.device(dev1):
         with torch.cuda.graph(graph, stream=capture1):
             with torch.cuda.device(dev0):
                 out["stream_a"] = [torch.cuda.current_device(), torch.cuda.current_stream(dev1).cuda_stream == capture1.cuda_stream]
-                pkg.cake_mhc_train_backward_finish(*args1, deterministic=False)
+                pkg.cake_mhc_nondet_train_backward_finish(*args1)
     except ValueError as e:
         out["raised_a"] = str(e)
     del graph
@@ -844,7 +835,7 @@ with torch.cuda.device(dev0):
             with torch.cuda.device(dev1):
                 capturing1 = torch.cuda.is_current_stream_capturing()
             out["stream_b"] = [torch.cuda.current_device(), torch.cuda.current_stream(dev0).cuda_stream == capture0.cuda_stream, capturing1]
-            got = [t.clone() for t in pkg.cake_mhc_train_backward_finish(*args1, deterministic=False)]
+            got = [t.clone() for t in pkg.cake_mhc_nondet_train_backward_finish(*args1)]
     except ValueError as e:
         out["raised_b"] = str(e)
     del graph
@@ -885,7 +876,7 @@ def test_default_workspace_capture_check_uses_workspace_device(hidden: int) -> N
     ]
     assert len(lines) == 1, tail
     out = lines[0]
-    what = f"backward_finish(deterministic=False) at T={T} H={hidden} on cuda:1's default workspace"
+    what = f"backward_finish() at T={T} H={hidden} on cuda:1's default workspace"
     assert out["cached_before"] == [False, False], (
         f"{what}: a default buffer existed before the captures"
     )
@@ -919,11 +910,11 @@ def test_default_workspace_capture_check_uses_workspace_device(hidden: int) -> N
 
 def _forward(i: dict) -> dict:
     """The forward prepare and the backward prepare of a case: the records ``backward_finish`` takes."""
-    _U, stats = pkg.cake_mhc_train_forward_prepare(
-        i["X"], i["fn"], i["scale"], i["base"], deterministic=False
+    _U, stats = pkg.cake_mhc_nondet_train_forward_prepare(
+        i["X"], i["fn"], i["scale"], i["base"]
     )
-    _dB, gstats = pkg.cake_mhc_train_backward_prepare(
-        i["dY"], i["B"], i["X"], stats, deterministic=False
+    _dB, gstats = pkg.cake_mhc_nondet_train_backward_prepare(
+        i["dY"], i["B"], i["X"], stats
     )
     return {"stats": stats, "gstats": gstats}
 
@@ -936,7 +927,7 @@ def _backward(entry, i: dict, prep: dict, **kwargs) -> dict:
 
 
 def _nd_backward(i: dict, prep: dict, **kwargs) -> dict:
-    return _backward(backward_finish, i, prep, deterministic=False, **kwargs)
+    return _backward(backward_finish, i, prep, **kwargs)
 
 
 def _det_backward(i: dict, prep: dict) -> dict:
@@ -1004,10 +995,9 @@ def test_workspace_sizes_and_which_sizing_serves_which_backward(hidden: int) -> 
     layout (:func:`_det_per_cta`: the parameter region ``[chunks, 32]`` at every token count) without its last region,
     the per-chunk ``dfn`` partials (``P x 24 x 4H`` FP32): the same regions at the same offsets; its public size is
     the envelope over every token count up to ``T``, below the deterministic package's; the forward workspace is the
-    deterministic one.  The size helper called without ``deterministic=False`` (the default or ``True``) raises the
-    ``ValueError`` that names ``cake_mhc_det_train_backward_workspace_bytes``.  A workspace of the deterministic
-    sizing (``cake_mhc_det_train_backward_workspace``) serves the non-deterministic backward; one of the
-    non-deterministic sizing is refused by the deterministic backward (and by a larger token count)."""
+    deterministic one.  The size helper takes no ``deterministic`` keyword (``TypeError``).  A workspace of the
+    deterministic sizing (``cake_mhc_det_train_backward_workspace``) serves the non-deterministic backward; one of
+    the non-deterministic sizing is refused by the deterministic backward (and by a larger token count)."""
     dev, sm, arch = _device(), _sm_count(), _arch()
     for T in (1, 7, 63, 64, 65, 129, 257, 1000, 2049, 4096, 8192, 16263, 32768, 65536):
         ndl = loader.workspace_regions("bwd", T, sm, arch, hidden)
@@ -1028,44 +1018,31 @@ def test_workspace_sizes_and_which_sizing_serves_which_backward(hidden: int) -> 
         ), T
         assert part["bytes"] == _parts(T, hidden) * MAPPING_ROWS * STREAMS * hidden * 4
         assert ndl["total_bytes"] == dtl["total_bytes"] - _round256(part["bytes"]), T
-        nd_bytes = pkg.cake_mhc_train_backward_workspace_bytes(
-            T, dev, hidden=hidden, deterministic=False
+        nd_bytes = pkg.cake_mhc_nondet_train_backward_workspace_bytes(
+            T, dev, hidden=hidden
         )
         det_bytes = det.cake_mhc_det_train_backward_workspace_bytes(
             T, dev, hidden=hidden
         )
         assert nd_bytes == loader.workspace_bytes_upto("bwd", T, sm, arch, hidden), T
         assert ndl["total_bytes"] <= nd_bytes < det_bytes and nd_bytes % 256 == 0, T
-        assert pkg.cake_mhc_train_forward_workspace_bytes(
-            T, dev, hidden=hidden, deterministic=False
+        assert pkg.cake_mhc_nondet_train_forward_workspace_bytes(
+            T, dev, hidden=hidden
         ) == det.cake_mhc_det_train_forward_workspace_bytes(T, dev, hidden=hidden), T
     assert (
-        pkg.cake_mhc_train_backward_workspace_bytes(
-            0, dev, hidden=hidden, deterministic=False
-        )
-        == 0
+        pkg.cake_mhc_nondet_train_backward_workspace_bytes(0, dev, hidden=hidden) == 0
     )
     with pytest.raises(ValueError):
-        pkg.cake_mhc_train_backward_workspace_bytes(
-            -1, dev, hidden=hidden, deterministic=False
-        )
-    refusal = re.escape(
-        "cake_mhc_train_backward_workspace_bytes computes non-deterministically (got deterministic=True): pass "
-        "deterministic=False for the non-deterministic path, or call "
-        "flashinfer.cake_mhc_det_train.cake_mhc_det_train_backward_workspace_bytes for the deterministic one "
-        "(no fallback)"
-    )
-    for kwargs in ({}, {"deterministic": True}):
-        with pytest.raises(ValueError, match=refusal):
-            pkg.cake_mhc_train_backward_workspace_bytes(
-                2049, dev, hidden=hidden, **kwargs
+        pkg.cake_mhc_nondet_train_backward_workspace_bytes(-1, dev, hidden=hidden)
+    for value in (False, True):
+        with pytest.raises(TypeError, match="deterministic"):
+            pkg.cake_mhc_nondet_train_backward_workspace_bytes(
+                2049, dev, hidden=hidden, deterministic=value
             )
-    allocated = pkg.cake_mhc_train_backward_workspace(
-        2049, dev, hidden=hidden, deterministic=False
-    )
+    allocated = pkg.cake_mhc_nondet_train_backward_workspace(2049, dev, hidden=hidden)
     assert allocated.dtype == torch.uint8 and allocated.device == dev
-    assert allocated.numel() == pkg.cake_mhc_train_backward_workspace_bytes(
-        2049, dev, hidden=hidden, deterministic=False
+    assert allocated.numel() == pkg.cake_mhc_nondet_train_backward_workspace_bytes(
+        2049, dev, hidden=hidden
     )
     assert int(torch.count_nonzero(allocated)) == 0
 
@@ -1075,9 +1052,7 @@ def test_workspace_sizes_and_which_sizing_serves_which_backward(hidden: int) -> 
     want = _snapshot(_det_backward(i, prep))
     bound = _bound(i)
     det_sized = det.cake_mhc_det_train_backward_workspace(T, dev, hidden=hidden)
-    nd_sized = pkg.cake_mhc_train_backward_workspace(
-        T, dev, hidden=hidden, deterministic=False
-    )
+    nd_sized = pkg.cake_mhc_nondet_train_backward_workspace(T, dev, hidden=hidden)
     for name, ws in (("deterministic-sized", det_sized), ("nd-sized", nd_sized)):
         got = _snapshot(_nd_backward(i, prep, workspace=ws))
         _assert_exact_outputs(got, want, f"workspace {name} H={hidden}")
@@ -1087,9 +1062,7 @@ def test_workspace_sizes_and_which_sizing_serves_which_backward(hidden: int) -> 
         _assert_ticket_zero(ws, f"workspace {name} H={hidden}")
     with pytest.raises(ValueError, match="workspace holds"):
         _backward(det.cake_mhc_det_train_backward_finish, i, prep, workspace=nd_sized)
-    small = pkg.cake_mhc_train_backward_workspace(
-        64, dev, hidden=hidden, deterministic=False
-    )
+    small = pkg.cake_mhc_nondet_train_backward_workspace(64, dev, hidden=hidden)
     with pytest.raises(ValueError, match="workspace holds"):
         _nd_backward(i, prep, workspace=small)
 
@@ -1104,13 +1077,13 @@ def test_workspace_bytes_per_hidden_size() -> None:
     sizes = _hidden_sizes()
     unrouted = tuple(H for H in HIDDEN_SIZES if H not in sizes)
     for kind, layout in (("forward", "fwd"), ("backward", "bwd")):
-        nbytes = getattr(pkg, f"cake_mhc_train_{kind}_workspace_bytes")
-        allocate = getattr(pkg, f"cake_mhc_train_{kind}_workspace")
+        nbytes = getattr(pkg, f"cake_mhc_nondet_train_{kind}_workspace_bytes")
+        allocate = getattr(pkg, f"cake_mhc_nondet_train_{kind}_workspace")
         reference_nbytes = getattr(det, f"cake_mhc_det_train_{kind}_workspace_bytes")
         for H in sizes:
             previous = 0
             for T in (1, 7, 128, 129, 1000, 2049, 8192, 16263, 65536):
-                current = nbytes(T, dev, hidden=H, deterministic=False)
+                current = nbytes(T, dev, hidden=H)
                 exact = _layout(layout, T, H)["total_bytes"]
                 assert current % 256 == 0 and current >= max(previous, exact), (
                     kind,
@@ -1126,20 +1099,16 @@ def test_workspace_bytes_per_hidden_size() -> None:
                 else:
                     assert current < want, (kind, H, T, current, want)
                 previous = current
-        assert nbytes(129, dev, deterministic=False) == nbytes(
-            129, dev, hidden=4096, deterministic=False
-        ), kind
+        assert nbytes(129, dev) == nbytes(129, dev, hidden=4096), kind
         for bad in (6144, 0, -4096, 4097, 2 * 7168, True) + unrouted:
             with pytest.raises(ValueError, match="hidden"):
-                nbytes(129, dev, hidden=bad, deterministic=False)
+                nbytes(129, dev, hidden=bad)
         for bad in (6144,) + unrouted:
             with pytest.raises(ValueError, match="hidden"):
-                allocate(129, dev, hidden=bad, deterministic=False)
+                allocate(129, dev, hidden=bad)
     for T in (1, 129, 2049, 8192):
         backward = {
-            H: pkg.cake_mhc_train_backward_workspace_bytes(
-                T, dev, hidden=H, deterministic=False
-            )
+            H: pkg.cake_mhc_nondet_train_backward_workspace_bytes(T, dev, hidden=H)
             for H in sizes
         }
         print(f"non-deterministic backward workspace bytes T={T}: {backward}")
@@ -1147,7 +1116,7 @@ def test_workspace_bytes_per_hidden_size() -> None:
 
 @pytest.mark.parametrize("T", (129, 2049))
 def test_workspace_sized_for_another_hidden_size(T: int) -> None:
-    """A caller workspace serves a ``deterministic=False`` call when it holds the call's ``(T, H)`` layout and is
+    """A caller workspace serves a non-deterministic call when it holds the call's ``(T, H)`` layout and is
     refused (``ValueError``) when it is too small (``test_cake_mhc_det_train.py``'s test of the same name): buffers
     sized for ``(T, 4096)`` used by an H 7168 call at the same ``T`` are refused where smaller than its layout and
     otherwise give the default-workspace outputs; buffers one 256-byte block short of the H 7168 layout are refused
@@ -1183,14 +1152,14 @@ def test_workspace_sized_for_another_hidden_size(T: int) -> None:
         what = f"T={T} H=7168 on a {label} buffer"
         if fwd_ws.numel() < need["fwd"]:
             for entry in (
-                pkg.cake_mhc_train_forward_prepare,
-                pkg.cake_mhc_train_forward_stats,
+                pkg.cake_mhc_nondet_train_forward_prepare,
+                pkg.cake_mhc_nondet_train_forward_stats,
             ):
                 with pytest.raises(ValueError, match="workspace holds"):
-                    entry(*args, workspace=fwd_ws, deterministic=False)
+                    entry(*args, workspace=fwd_ws)
         else:
-            _U, stats = pkg.cake_mhc_train_forward_prepare(
-                *args, workspace=fwd_ws, deterministic=False
+            _U, stats = pkg.cake_mhc_nondet_train_forward_prepare(
+                *args, workspace=fwd_ws
             )
             assert _same_bits(stats, ref["stats"]), f"{what}: forward stats"
         if bwd_ws.numel() < need["bwd"]:

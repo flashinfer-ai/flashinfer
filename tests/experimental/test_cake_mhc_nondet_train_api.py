@@ -13,49 +13,53 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Tests of ``flashinfer.experimental.cake.cake_mhc_train``, the experimental module
+Tests of ``flashinfer.cake_mhc_nondet_train``, the experimental top-level module
 of the Cake four-stream mHC training kernels' non-deterministic package (SM100 /
 SM103 / SM107; FlashInfer issue #8068).
 
-Every entry point but ``cake_mhc_train_reset_workspace`` and ``route_key`` takes
-a keyword-only ``deterministic: bool = True`` and runs the non-deterministic
-package ``flashinfer.experimental.cake.cake_mhc_train_backend`` only for an
-explicit ``deterministic=False``: any other value, the default included, raises
-``ValueError`` naming the deterministic package's entry point
-(``flashinfer.cake_mhc_det_train.cake_mhc_det_train_*``), and nothing falls back
-to that package.  With PyTorch's deterministic algorithms on, the backward
-raises PyTorch's alert and the other entry points run unchanged.  This module
-checks:
+The mode is part of the names: every entry point runs the non-deterministic
+package ``flashinfer.experimental.cake.cake_mhc_nondet_train`` (imported on the
+first call or attribute access), no entry point takes a ``deterministic``
+keyword (passing one is a ``TypeError``), and nothing falls back to the
+deterministic package.  With PyTorch's deterministic algorithms on, the
+backward raises PyTorch's alert and the other entry points run unchanged.  This
+module checks:
 
-* the surface without a device: the exports (no head, no deterministic names),
-  the signatures (the deterministic package's plus the keyword-only
-  ``deterministic=True``), no import of this module by ``flashinfer``'s top
-  level, no import of the deterministic package by this module and none of the
-  former fallback's state, the ``ValueError`` of the default and of every value
-  but ``False`` before anything else in every torch mode, each entry point's
-  forwarding to the backend's (replaced by a recorder) with every argument
-  unchanged, and the ``TypeError`` of ``cake_mhc_train_finish`` for any other
-  handle (naming the deterministic finish);
+* the surface without a device: the exports (no head name; every name but the
+  ALL_CAPS constants carries the ``nondet`` mode token and no other), the
+  backend objects resolved on first access, the signatures (the deterministic
+  package's; no ``deterministic`` parameter on any public callable of the
+  module or of the backend, the autograd ``Function.forward`` included), the
+  ``TypeError`` of a ``deterministic`` keyword on every entry point, the
+  workspace helpers' ``hidden`` default equal to the backend's
+  ``cake_jit.HIDDEN``, the lazy import (in a fresh interpreter ``import
+  flashinfer`` and ``import flashinfer.cake_mhc_nondet_train`` load no backend,
+  and the top level exposes no ``nondet`` name), the former module paths
+  failing at import, no import of the deterministic package by this module and
+  none of the former fallback's state, each entry point's forwarding to the
+  backend's (replaced by a recorder) with every argument unchanged, and the
+  ``TypeError`` of ``cake_mhc_nondet_train_finish`` for any other handle
+  (naming the deterministic finish);
 * on a device, at every hidden size the device's architecture routes (4096,
-  5120 and 7168 on SM100 / SM103, 4096 on SM107): ``deterministic=False``, the
+  5120 and 7168 on SM100 / SM103, 4096 on SM107): the module, the
   deterministic package's launches refused, gives the backend's workspace sizes
   and results (the forward entry points and the backward's ``dX`` / ``dscale`` /
   ``dbase`` bitwise the deterministic package's, ``dfn`` within FP32 rounding);
   under ``torch.use_deterministic_algorithms(True)``
-  ``is_cake_mhc_train_supported``, the workspace helpers, the forward entry
-  points and ``backward_prepare`` run as with the mode off, while
+  ``is_cake_mhc_nondet_train_supported``, the workspace helpers, the forward
+  entry points and ``backward_prepare`` run as with the mode off, while
   ``backward_finish`` and the prepare node's backward raise PyTorch's alert
   before any launch (``warn_only``: one alert, then the backend's backward); a
   deterministic backward workspace serves the backward; a deterministic prepare
-  handle is refused by ``cake_mhc_train_finish``; a hidden size runs exactly
-  where the deterministic package runs it;
-* training with ``deterministic=False`` composed with the model's head of the
+  handle is refused by ``cake_mhc_nondet_train_finish``; a hidden size runs
+  exactly where the deterministic package runs it;
+* non-deterministic training composed with the model's head of the
   deterministic package (``flashinfer.cake_mhc_det_train.cake_mhc_det_train_head``,
   the stream mean of the last layer): the gradients reach every leaf through
   the head and equal the deterministic training and head's.
 
 The numerical contract of the non-deterministic backward is
-``test_cake_mhc_train.py``'s.
+``test_cake_mhc_nondet_train.py``'s.
 """
 
 from __future__ import annotations
@@ -63,7 +67,10 @@ from __future__ import annotations
 import ast
 import contextlib
 import inspect
+import json
 import re
+import subprocess
+import sys
 import warnings
 from pathlib import Path
 
@@ -71,12 +78,12 @@ import pytest
 import torch
 
 import flashinfer.cake_mhc_det_train_backend as det_backend
-import flashinfer.experimental.cake.cake_mhc_train as facade
-import flashinfer.experimental.cake.cake_mhc_train_backend as backend
+import flashinfer.cake_mhc_nondet_train as facade
+import flashinfer.experimental.cake.cake_mhc_nondet_train as backend
 from flashinfer import cake_mhc_det_train as det_facade
 from flashinfer.api_logging import ExperimentalWarning
 from flashinfer.cake_mhc_det_train_backend import cake_jit as det_loader
-from flashinfer.experimental.cake.cake_mhc_train_backend import cake_jit as loader
+from flashinfer.experimental.cake.cake_mhc_nondet_train import cake_jit as loader
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 # The hidden sizes of both packages; a device case of a size runs where the device's architecture routes it.
@@ -90,57 +97,51 @@ _OUTPUTS = ("dX", "dfn", "dscale", "dbase")
 _EXACT = ("dX", "dscale", "dbase")
 _LEAVES = ("X", "fn", "scale", "base")
 # The ``dfn`` of the non-deterministic backward against the deterministic one: per-chunk partials, the same or another
-# partition's, summed in another order (the per-element bound is test_cake_mhc_train.py's).
+# partition's, summed in another order (the per-element bound is test_cake_mhc_nondet_train.py's).
 DFN_REL_L2_MAX = 1e-6
 _ALERT = "does not have a deterministic implementation"
-# facade entry point -> (the deterministic package's entry point its ValueError names, positional stand-ins: the mode
-# check comes first, so no stand-in is read before it)
+# The interpreter's refusal of a ``deterministic`` keyword: no entry point has that parameter.
+_NO_MODE_KEYWORD = "unexpected keyword argument 'deterministic'"
+# facade entry point -> (the deterministic package's entry point of the same verb, positional stand-ins: a keyword the
+# function does not take is refused before its body runs, so no stand-in is read)
 _ENTRIES = {
-    "is_cake_mhc_train_supported": ("is_cake_mhc_det_train_supported", ("device", 5120)),
-    "cake_mhc_train_forward_workspace_bytes": ("cake_mhc_det_train_forward_workspace_bytes", (8, "device")),
-    "cake_mhc_train_backward_workspace_bytes": ("cake_mhc_det_train_backward_workspace_bytes", (8, "device")),
-    "cake_mhc_train_forward_workspace": ("cake_mhc_det_train_forward_workspace", (8, "device")),
-    "cake_mhc_train_backward_workspace": ("cake_mhc_det_train_backward_workspace", (8, "device")),
-    "cake_mhc_train_forward_prepare": ("cake_mhc_det_train_forward_prepare", ("X", "fn", "scale", "base")),
-    "cake_mhc_train_forward_stats": ("cake_mhc_det_train_forward_stats", ("X", "fn", "scale", "base")),
-    "cake_mhc_train_forward_finish": ("cake_mhc_det_train_forward_finish", ("X", "B", "stats")),
-    "cake_mhc_train_backward_prepare": ("cake_mhc_det_train_backward_prepare", ("dY", "B", "X", "stats")),
-    "cake_mhc_train_backward_finish": (
+    "is_cake_mhc_nondet_train_supported": ("is_cake_mhc_det_train_supported", ("device", 5120)),
+    "cake_mhc_nondet_train_forward_workspace_bytes": ("cake_mhc_det_train_forward_workspace_bytes", (8, "device")),
+    "cake_mhc_nondet_train_backward_workspace_bytes": ("cake_mhc_det_train_backward_workspace_bytes", (8, "device")),
+    "cake_mhc_nondet_train_forward_workspace": ("cake_mhc_det_train_forward_workspace", (8, "device")),
+    "cake_mhc_nondet_train_backward_workspace": ("cake_mhc_det_train_backward_workspace", (8, "device")),
+    "cake_mhc_nondet_train_forward_prepare": ("cake_mhc_det_train_forward_prepare", ("X", "fn", "scale", "base")),
+    "cake_mhc_nondet_train_forward_stats": ("cake_mhc_det_train_forward_stats", ("X", "fn", "scale", "base")),
+    "cake_mhc_nondet_train_forward_finish": ("cake_mhc_det_train_forward_finish", ("X", "B", "stats")),
+    "cake_mhc_nondet_train_backward_prepare": ("cake_mhc_det_train_backward_prepare", ("dY", "B", "X", "stats")),
+    "cake_mhc_nondet_train_backward_finish": (
         "cake_mhc_det_train_backward_finish",
         ("X", "dY", "dU", "B", "fn", "scale", "base", "stats", "grad_stats"),
     ),
-    "cake_mhc_train_prepare": ("cake_mhc_det_train_prepare", ("X", "fn", "scale", "base")),
-    "cake_mhc_train_finish": ("cake_mhc_det_train_finish", ("X", "B", "handle")),
+    "cake_mhc_nondet_train_prepare": ("cake_mhc_det_train_prepare", ("X", "fn", "scale", "base")),
+    "cake_mhc_nondet_train_finish": ("cake_mhc_det_train_finish", ("X", "B", "handle")),
 }  # fmt: skip
-# The names the facade re-exports from the backend unchanged.
+# The backend objects the facade resolves on first access (the backend's own objects).
 _REEXPORTS = (
     "ARCHES",
     "SUPPORTED_COMPUTE_CAPABILITIES",
-    "CakeMHCTrainFinishFunction",
-    "CakeMHCTrainPrepareFunction",
-    "cake_mhc_train_reset_workspace",
-    "route_key",
+    "CakeMHCNondetFinishFunction",
+    "CakeMHCNondetPrepareFunction",
+    "cake_mhc_nondet_train_reset_workspace",
+    "cake_mhc_nondet_train_route_key",
 )
 _WORKSPACE_HELPERS = (
-    "cake_mhc_train_forward_workspace_bytes",
-    "cake_mhc_train_backward_workspace_bytes",
-    "cake_mhc_train_forward_workspace",
-    "cake_mhc_train_backward_workspace",
-)
-# The ``deterministic`` keywords every entry point refuses: the default, ``True`` and values that are not bools.
-_REFUSED_MODES = (
-    {},
-    {"deterministic": True},
-    {"deterministic": None},
-    {"deterministic": 0},
-    {"deterministic": 1},
-    {"deterministic": "False"},
+    "cake_mhc_nondet_train_forward_workspace_bytes",
+    "cake_mhc_nondet_train_backward_workspace_bytes",
+    "cake_mhc_nondet_train_forward_workspace",
+    "cake_mhc_nondet_train_backward_workspace",
 )
 # PyTorch's deterministic algorithms as ``(mode, warn_only)``: off, strict, warn_only.
 _TORCH_MODES = ((False, False), (True, False), (True, True))
-# The state of the former fallback to the deterministic package: the once-per-process warning, the mode switch and
-# the companion backward workspaces.
+# The state of the former mode keyword and of the former fallback to the deterministic package: the mode check, the
+# once-per-process warning, the mode switch and the companion backward workspaces.
 _REMOVED = (
+    "_require_nondeterministic",
     "_DET_FALLBACK_WARNED",
     "_deterministic",
     "_COMPANIONS",
@@ -148,8 +149,16 @@ _REMOVED = (
     "_fallback_backward_workspace",
 )
 _HANDLE_ERROR = (
-    "handle must be the handle returned by cake_mhc_train_prepare (a cake_mhc_det_train_prepare handle goes to "
-    "flashinfer.cake_mhc_det_train.cake_mhc_det_train_finish)"
+    "handle must be the handle returned by cake_mhc_nondet_train_prepare (a cake_mhc_det_train_prepare "
+    "handle goes to flashinfer.cake_mhc_det_train.cake_mhc_det_train_finish)"
+)
+_BACKEND = "flashinfer.experimental.cake.cake_mhc_nondet_train"
+# The former module paths of the non-deterministic mode (and of the 0.7.3 names): removed, with no alias.
+_FORMER_MODULES = (
+    "flashinfer.experimental.cake.cake_mhc_train",
+    "flashinfer.experimental.cake.cake_mhc_train_backend",
+    "flashinfer.cake_mhc_train",
+    "flashinfer.cake_mhc_train_backend",
 )
 
 
@@ -166,13 +175,13 @@ def _supported() -> bool:
         torch.cuda.is_available()
         and _capability() in SUPPORTED_CAPABILITIES
         and det_facade.is_cake_mhc_det_train_supported(_device())
-        and facade.is_cake_mhc_train_supported(_device(), deterministic=False)
+        and facade.is_cake_mhc_nondet_train_supported(_device())
     )
 
 
 requires_device = pytest.mark.skipif(
     not _supported(),
-    reason="cake_mhc_train needs an SM100 / SM103 / SM107 device with exported routes",
+    reason="cake_mhc_nondet_train needs an SM100 / SM103 / SM107 device with exported routes",
 )
 
 
@@ -221,13 +230,26 @@ def _exactly(message: str) -> str:
     return f"^{re.escape(message)}$"
 
 
-def _mode_error(name: str, value) -> str:
-    """The ``ValueError`` message of the entry point ``name`` for ``deterministic=value`` (any value but ``False``)."""
-    return (
-        f"{name} computes non-deterministically (got deterministic={value!r}): pass deterministic=False for the "
-        f"non-deterministic path, or call flashinfer.cake_mhc_det_train.{_ENTRIES[name][0]} for the deterministic "
-        "one (no fallback)"
-    )
+def _mode_tokens(name: str) -> set[str]:
+    """The mode words of ``name``: ``det`` / ``nondet`` as ``_``-separated tokens of a snake_case name, ``Det`` /
+    ``Nondet`` as words of a CamelCase one (a substring test would read ``nondet`` as ``det`` too)."""
+    if name[:1].isupper():
+        return {word.lower() for word in re.findall(r"(Nondet|Det)(?=[A-Z]|$)", name)}
+    return set(re.findall(r"(?:^|_)(det|nondet)(?=_|$)", name))
+
+
+def _public_callables(module) -> dict:
+    """``name -> callable`` of every public callable of ``module.__all__``: its functions, and the ``forward`` /
+    ``backward`` of its autograd ``Function`` classes."""
+    found = {}
+    for name in module.__all__:
+        obj = getattr(module, name)
+        if inspect.isclass(obj):
+            for method in ("forward", "backward"):
+                found[f"{name}.{method}"] = getattr(obj, method)
+        elif callable(obj):
+            found[name] = obj
+    return found
 
 
 def _refuse_deterministic_package(m) -> None:
@@ -241,60 +263,112 @@ def _refuse_deterministic_package(m) -> None:
             m.setattr(module, det_name, refuse)
 
 
+def _run_child(code: str, *args: str) -> dict:
+    """``code`` in a fresh interpreter (whatever this session imported does not count); its last line of output as
+    JSON."""
+    proc = subprocess.run(
+        [sys.executable, "-c", code, *args],
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert proc.returncode == 0, proc.stderr[-4000:]
+    return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
 # ----------------------------------------------------------------------------------------------------------------
 # The surface (no device)
 
 
 @pytest.mark.cpu_only
 def test_exports() -> None:
-    """``__all__``: the re-exported backend objects and the facade's own entry points (``def``s of this module, not
-    the backend's objects); no public head name and no deterministic name."""
+    """``__all__``: the backend objects resolved on first access (the backend's own objects, listed by ``dir``) and
+    the module's own entry points (``def``s of this module, not the backend's objects); no public head name; every
+    name but the ALL_CAPS constants carries the mode token ``nondet`` (``Nondet`` in a class name) and no ``det``
+    token."""
     expected = set(_ENTRIES) | set(_REEXPORTS)
     assert set(facade.__all__) == expected, sorted(set(facade.__all__) ^ expected)
     for name in _REEXPORTS:
         assert getattr(facade, name) is getattr(backend, name), name
+        assert name in dir(facade), name
     for name in _ENTRIES:
         function = getattr(facade, name)
         assert inspect.unwrap(function).__module__ == facade.__name__, name
         assert function is not getattr(backend, name), name
-    for name in (n for n in dir(facade) if not n.startswith("_")):
+    for name in facade.__all__:
         assert "head" not in name.lower(), name
-        assert "det_train" not in name and "DetTrain" not in name, name
+        if not name.isupper():
+            assert _mode_tokens(name) == {"nondet"}, name
+    for name in (n for n in dir(facade) if not n.startswith("_")):
+        assert "det" not in _mode_tokens(name), name
+    with pytest.raises(AttributeError):
+        facade.route_key  # noqa: B018 - the former name is gone
     assert facade.SUPPORTED_COMPUTE_CAPABILITIES == SUPPORTED_CAPABILITIES
 
 
 @pytest.mark.cpu_only
 def test_signatures_mirror_the_deterministic_facade() -> None:
-    """Every entry point, ``cake_mhc_train_finish`` included, has the parameters of the deterministic entry point its
-    ``ValueError`` names (names, kinds and defaults, in order; an exported name of
-    ``flashinfer.cake_mhc_det_train``) plus a keyword-only ``deterministic=True`` it documents.  The backend's entry
-    points have the facade's parameters, but for ``is_cake_mhc_train_supported`` (no mode: the facade checks it).
-    ``cake_mhc_train_reset_workspace`` and ``route_key`` take no ``deterministic``."""
+    """Every entry point, ``cake_mhc_nondet_train_finish`` included, has the parameters of the deterministic entry
+    point of the same verb (names, kinds and defaults, in order; an exported name of
+    ``flashinfer.cake_mhc_det_train``), and the backend's entry point of its name has them too.  No public callable
+    of the module or of the backend has a ``deterministic`` parameter, the autograd ``Function.forward`` /
+    ``backward`` of the backend's nodes included."""
     for name, (det_name, _stand_ins) in _ENTRIES.items():
         assert det_name in det_facade.__all__, det_name
-        function = getattr(facade, name)
-        parameters = _shape(inspect.signature(function).parameters.values())
+        parameters = _shape(
+            inspect.signature(getattr(facade, name)).parameters.values()
+        )
         det_parameters = _shape(
             inspect.signature(getattr(det_facade, det_name)).parameters.values()
         )
         backend_parameters = _shape(
             inspect.signature(getattr(backend, name)).parameters.values()
         )
-        assert parameters[:-1] == det_parameters, name
-        assert parameters[-1] == (
-            "deterministic",
-            inspect.Parameter.KEYWORD_ONLY,
-            True,
-        ), name
-        assert "deterministic" in (inspect.getdoc(function) or ""), name
-        if name == "is_cake_mhc_train_supported":
-            assert backend_parameters == parameters[:-1], name
-        else:
-            assert backend_parameters == parameters, name
-    for name in ("cake_mhc_train_reset_workspace", "route_key"):
-        assert (
-            "deterministic" not in inspect.signature(getattr(facade, name)).parameters
-        ), name
+        assert parameters == det_parameters, name
+        assert backend_parameters == parameters, name
+    for module in (facade, backend):
+        callables = _public_callables(module)
+        assert "CakeMHCNondetPrepareFunction.forward" in callables, module.__name__
+        for name, function in callables.items():
+            parameters = inspect.signature(function).parameters
+            assert "deterministic" not in parameters, (module.__name__, name)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("value", (False, True, None), ids=repr)
+def test_deterministic_keyword_is_a_type_error(value, monkeypatch) -> None:
+    """A ``deterministic`` keyword, whatever its value, is the interpreter's ``TypeError`` (an unexpected keyword
+    argument) on every entry point of the module and of the backend, ``cake_mhc_nondet_train_reset_workspace``
+    included, before anything else (no stand-in argument is read, the deterministic package is not called), with
+    PyTorch's deterministic algorithms off, strict and ``warn_only`` alike (no warning, no alert)."""
+    _refuse_deterministic_package(monkeypatch)
+    for torch_mode, warn_only in _TORCH_MODES:
+        with (
+            _torch_deterministic(torch_mode, warn_only=warn_only),
+            warnings.catch_warnings(),
+        ):
+            warnings.simplefilter("error")
+            warnings.simplefilter("ignore", ExperimentalWarning)
+            for name, (_det_name, args) in _ENTRIES.items():
+                for module in (facade, backend):
+                    with pytest.raises(TypeError, match=_NO_MODE_KEYWORD):
+                        getattr(module, name)(*args, deterministic=value)
+            with pytest.raises(TypeError, match=_NO_MODE_KEYWORD):
+                facade.cake_mhc_nondet_train_reset_workspace(
+                    "workspace", deterministic=value
+                )
+
+
+@pytest.mark.cpu_only
+def test_hidden_default_is_the_backend_hidden() -> None:
+    """The workspace helpers' ``hidden`` default, the module's ``_HIDDEN`` (spelled there so that defining the entry
+    points imports no backend), is the backend's ``cake_jit.HIDDEN``."""
+    assert facade._HIDDEN == loader.HIDDEN == 4096
+    for name in _WORKSPACE_HELPERS:
+        for module in (facade, backend):
+            default = inspect.signature(getattr(module, name)).parameters["hidden"]
+            assert default.default == loader.HIDDEN, (module.__name__, name)
 
 
 def _imports(path: Path) -> list[str]:
@@ -315,25 +389,104 @@ def _imports(path: Path) -> list[str]:
 
 
 @pytest.mark.cpu_only
-def test_top_level_does_not_import_the_facade() -> None:
-    """``flashinfer/__init__.py`` does not import the experimental facade."""
+def test_top_level_does_not_import_the_module() -> None:
+    """``flashinfer/__init__.py`` imports neither this module nor the experimental package."""
     imported = _imports(REPO / "flashinfer" / "__init__.py")
     leaks = [
-        m for m in imported if m.startswith("experimental") or "experimental.cake" in m
+        m
+        for m in imported
+        if m.startswith("experimental")
+        or "experimental.cake" in m
+        or "cake_mhc_nondet_train" in m
     ]
     assert not leaks, leaks
 
 
+_LAZY_CHILD = r"""
+import json, sys
+
+backend = sys.argv[1]
+
+
+def loaded():
+    return sorted(m for m in sys.modules if m == "flashinfer.experimental.cake" or m.startswith("flashinfer.experimental.cake."))
+
+
+import flashinfer
+
+out = {
+    "flashinfer": loaded(),
+    "facade_loaded": "flashinfer.cake_mhc_nondet_train" in sys.modules,
+    "nondet_names": sorted(n for n in dir(flashinfer) if "nondet" in n.lower()),
+}
+import flashinfer.cake_mhc_nondet_train as facade
+
+out["facade"] = loaded()
+facade.cake_mhc_nondet_train_backward_finish
+out["entry_point"] = loaded()
+facade.ARCHES
+out["lazy_attribute"] = loaded()
+out["backend"] = backend in sys.modules
+print(json.dumps(out))
+"""
+
+
 @pytest.mark.cpu_only
-def test_facade_does_not_import_the_deterministic_package() -> None:
-    """The facade's source imports nothing of the deterministic package (no imported module or name contains
-    ``cake_mhc_det_train``) and defines and reads none of the former fallback's names (the once-per-process
-    warning flag, the mode switch, the companion workspaces)."""
+def test_the_backend_is_imported_on_first_use() -> None:
+    """In a fresh interpreter, ``import flashinfer`` loads nothing of ``flashinfer.experimental.cake`` and not this
+    module, and the top level exposes no ``nondet`` name; ``import flashinfer.cake_mhc_nondet_train`` and reading an
+    entry point load no backend either; the first lazily resolved attribute (``ARCHES``) imports the backend."""
+    out = _run_child(_LAZY_CHILD, _BACKEND)
+    assert out["flashinfer"] == [], out
+    assert out["facade_loaded"] is False, out
+    assert out["nondet_names"] == [], out
+    assert out["facade"] == [] and out["entry_point"] == [], out
+    assert _BACKEND in out["lazy_attribute"] and out["backend"] is True, out
+
+
+_FORMER_CHILD = r"""
+import importlib, json, sys
+
+out = {}
+for name in sys.argv[1:]:
+    try:
+        module = importlib.import_module(name)
+    except ImportError:
+        out[name] = None
+    else:
+        # a namespace package left by a stale __pycache__ directory has no origin: it holds no code
+        spec = getattr(module, "__spec__", None)
+        out[name] = getattr(spec, "origin", None)
+print(json.dumps(out))
+"""
+
+
+@pytest.mark.cpu_only
+def test_former_module_paths_fail_at_import() -> None:
+    """The former module paths of the non-deterministic mode (``flashinfer.experimental.cake.cake_mhc_train`` and its
+    ``_backend``) and of the 0.7.3 names are gone, with no alias: importing each in a fresh interpreter raises
+    ``ImportError`` (a namespace package without code, left by a stale ``__pycache__``, counts as gone)."""
+    out = _run_child(_FORMER_CHILD, *_FORMER_MODULES)
+    assert out == dict.fromkeys(_FORMER_MODULES), out
+
+
+@pytest.mark.cpu_only
+def test_module_imports_only_the_backend_on_first_use() -> None:
+    """The module's source imports nothing of the deterministic package (no imported module or name contains
+    ``cake_mhc_det_train``), imports the backend only inside a function (no module-level import of
+    ``flashinfer.experimental``), and defines and reads none of the former mode keyword's or fallback's names (the
+    mode check, the once-per-process warning flag, the mode switch, the companion workspaces)."""
     path = Path(facade.__file__)
     det_imports = [m for m in _imports(path) if "cake_mhc_det_train" in m]
     assert not det_imports, det_imports
+    tree = ast.parse(path.read_text())
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom):
+            assert "experimental" not in (node.module or ""), node.lineno
+        elif isinstance(node, ast.Import):
+            assert not [a for a in node.names if "experimental" in a.name], node.lineno
     names = set()
-    for node in ast.walk(ast.parse(path.read_text())):
+    for node in ast.walk(tree):
         if isinstance(node, ast.Name):
             names.add(node.id)
         elif isinstance(node, ast.Attribute):
@@ -344,53 +497,26 @@ def test_facade_does_not_import_the_deterministic_package() -> None:
             names.update(node.names)
     left = sorted(names & set(_REMOVED))
     assert not left, left
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    "mode",
-    _REFUSED_MODES,
-    ids=lambda mode: repr(mode["deterministic"]) if mode else "default",
-)
-def test_every_mode_but_false_is_a_value_error(mode: dict, monkeypatch) -> None:
-    """The default and every ``deterministic`` but ``False`` (``True``, ``None``, ``0``, ``1``, ``"False"``) make every
-    entry point raise one ``ValueError`` that names the deterministic package's entry point, before anything else (no
-    stand-in argument is read) and without calling the deterministic package, with PyTorch's deterministic algorithms
-    off, strict and ``warn_only`` alike (no warning, no alert)."""
-    value = mode.get("deterministic", True)
-    _refuse_deterministic_package(monkeypatch)
-    for torch_mode, warn_only in _TORCH_MODES:
-        with (
-            _torch_deterministic(torch_mode, warn_only=warn_only),
-            warnings.catch_warnings(),
-        ):
-            warnings.simplefilter("error")
-            warnings.simplefilter("ignore", ExperimentalWarning)
-            for name, (_det_name, args) in _ENTRIES.items():
-                with pytest.raises(
-                    ValueError, match=_exactly(_mode_error(name, value))
-                ):
-                    getattr(facade, name)(*args, **mode)
+    for name in _REMOVED:
+        assert not hasattr(backend, name), name
 
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("name", sorted(_ENTRIES))
 def test_forwards_to_the_backend(name: str, monkeypatch) -> None:
-    """With the backend's entry point replaced by a recorder and the deterministic package's refused, a
-    ``deterministic=False`` call (stand-ins for every positional and keyword-only argument) calls the backend's entry
-    point of the same name once with every argument unchanged (``deterministic=False`` included, but for
-    ``is_cake_mhc_train_supported``: the backend's has no mode), with PyTorch's deterministic algorithms off, strict
-    and ``warn_only`` alike (no warning, no alert)."""
+    """With the backend's entry point replaced by a recorder and the deterministic package's refused, a call
+    (stand-ins for every positional and keyword-only argument) calls the backend's entry point of the same name once
+    with every argument unchanged, with PyTorch's deterministic algorithms off, strict and ``warn_only`` alike (no
+    warning, no alert)."""
     function = getattr(facade, name)
     target = inspect.signature(getattr(backend, name))
     _det_name, args = _ENTRIES[name]
     keywords = {
         p.name: f"<{p.name}>"
         for p in inspect.signature(function).parameters.values()
-        if p.kind is inspect.Parameter.KEYWORD_ONLY and p.name != "deterministic"
+        if p.kind is inspect.Parameter.KEYWORD_ONLY
     }
-    mode = {} if name == "is_cake_mhc_train_supported" else {"deterministic": False}
-    want = target.bind(*args, **keywords, **mode)
+    want = target.bind(*args, **keywords)
     want.apply_defaults()
     calls: list = []
 
@@ -408,7 +534,7 @@ def test_forwards_to_the_backend(name: str, monkeypatch) -> None:
         ):
             warnings.simplefilter("error")
             warnings.simplefilter("ignore", ExperimentalWarning)
-            assert function(*args, **keywords, deterministic=False) == "nd"
+            assert function(*args, **keywords) == "nd"
         assert len(calls) == 1, (torch_mode, warn_only)
         calls[0].apply_defaults()
         assert calls[0].arguments == want.arguments, (torch_mode, warn_only)
@@ -416,20 +542,14 @@ def test_forwards_to_the_backend(name: str, monkeypatch) -> None:
 
 @pytest.mark.cpu_only
 def test_finish_refuses_other_handles() -> None:
-    """``cake_mhc_train_finish(..., deterministic=False)`` refuses every handle but its prepare's -- the deterministic
-    package's handle included -- with one ``TypeError`` naming the deterministic finish; the mode is checked first
-    (the default is the mode's ``ValueError`` whatever the handle)."""
+    """``cake_mhc_nondet_train_finish`` refuses every handle but its prepare's -- the deterministic package's handle
+    included -- with one ``TypeError`` naming the deterministic finish."""
     det_handle = det_backend._MHCTrainHandle(None, ())
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ExperimentalWarning)
         for handle in (det_handle, object(), None, (None, ())):
             with pytest.raises(TypeError, match=_exactly(_HANDLE_ERROR)):
-                facade.cake_mhc_train_finish("X", "B", handle, deterministic=False)
-            with pytest.raises(
-                ValueError,
-                match=_exactly(_mode_error("cake_mhc_train_finish", True)),
-            ):
-                facade.cake_mhc_train_finish("X", "B", handle)
+                facade.cake_mhc_nondet_train_finish("X", "B", handle)
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -540,31 +660,31 @@ _FORWARD_ENTRIES = (
 )
 
 
-def _entries(module, prefix: str = "cake_mhc_train") -> dict:
+def _entries(module, prefix: str = "cake_mhc_nondet_train") -> dict:
     """The forward entry points and ``backward_prepare`` of ``module`` by short name."""
     return {k: getattr(module, f"{prefix}_{k}") for k in _FORWARD_ENTRIES}
 
 
-def _forward_outputs(entries: dict, i: dict, **mode) -> dict:
+def _forward_outputs(entries: dict, i: dict) -> dict:
     X, fn, scale, base = (i[k] for k in _LEAVES)
-    U, stats = entries["forward_prepare"](X, fn, scale, base, **mode)
-    dB, gstats = entries["backward_prepare"](i["dY"], i["B"], X, stats, **mode)
+    U, stats = entries["forward_prepare"](X, fn, scale, base)
+    dB, gstats = entries["backward_prepare"](i["dY"], i["B"], X, stats)
     return {
         "U": U.clone(),
         "stats": stats.clone(),
-        "replay": entries["forward_stats"](X, fn, scale, base, **mode).clone(),
-        "Y": entries["forward_finish"](X, i["B"], stats, **mode).clone(),
+        "replay": entries["forward_stats"](X, fn, scale, base).clone(),
+        "Y": entries["forward_finish"](X, i["B"], stats).clone(),
         "dB": dB.clone(),
         "gstats": gstats.clone(),
     }
 
 
 def _nd_prepare(*args, **kwargs):
-    return facade.cake_mhc_train_prepare(*args, deterministic=False, **kwargs)
+    return facade.cake_mhc_nondet_train_prepare(*args, **kwargs)
 
 
 def _nd_finish(*args, **kwargs):
-    return facade.cake_mhc_train_finish(*args, deterministic=False, **kwargs)
+    return facade.cake_mhc_nondet_train_finish(*args, **kwargs)
 
 
 def _graph(prepare, finish, i: dict, **kwargs) -> tuple:
@@ -614,8 +734,8 @@ def _references(i: dict) -> dict:
 def _workspace_sizes(T: int, hidden: int) -> dict[str, int]:
     """The facade's forward and backward workspace bytes for ``T`` tokens at ``hidden``."""
     return {
-        kind: getattr(facade, f"cake_mhc_train_{kind}_workspace_bytes")(
-            T, _device(), hidden=hidden, deterministic=False
+        kind: getattr(facade, f"cake_mhc_nondet_train_{kind}_workspace_bytes")(
+            T, _device(), hidden=hidden
         )
         for kind in ("forward", "backward")
     }
@@ -623,10 +743,10 @@ def _workspace_sizes(T: int, hidden: int) -> dict[str, int]:
 
 @requires_device
 @pytest.mark.parametrize("T", (7, 2049))
-def test_false_is_the_nondeterministic_backend(
+def test_module_runs_the_nondeterministic_backend(
     T: int, hidden: int, monkeypatch
 ) -> None:
-    """``deterministic=False``, with the deterministic package's launches refused: the backend's workspace sizes (the
+    """The module, with the deterministic package's launches refused: the backend's workspace sizes (the
     forward one the deterministic package's, the backward one smaller: the deterministic layout adds the per-chunk
     ``dfn`` partials) and zeroed buffers; the forward entry points bitwise the backend's and the deterministic
     package's; ``backward_finish`` (default and caller workspaces) with the backend's and the deterministic ``dX`` /
@@ -635,10 +755,9 @@ def test_false_is_the_nondeterministic_backend(
     FP32 rounding)."""
     i = _inputs(T, hidden=hidden)
     ref = _references(i)
-    direct_forward = _forward_outputs(_entries(backend), i, deterministic=False)
+    direct_forward = _forward_outputs(_entries(backend), i)
     direct = [
-        t.clone()
-        for t in backend.cake_mhc_train_backward_finish(*_args(i), deterministic=False)
+        t.clone() for t in backend.cake_mhc_nondet_train_backward_finish(*_args(i))
     ]
     dev = _device()
     nd_bytes = loader.workspace_bytes_upto("bwd", T, _sm_count(), _arch(), hidden)
@@ -649,8 +768,8 @@ def test_false_is_the_nondeterministic_backend(
         assert (
             sizes["backward"]
             == nd_bytes
-            == backend.cake_mhc_train_backward_workspace_bytes(
-                T, dev, hidden=hidden, deterministic=False
+            == backend.cake_mhc_nondet_train_backward_workspace_bytes(
+                T, dev, hidden=hidden
             )
         ), what
         assert nd_bytes < det_facade.cake_mhc_det_train_backward_workspace_bytes(
@@ -663,18 +782,16 @@ def test_false_is_the_nondeterministic_backend(
                 T, dev, hidden=hidden
             )
         ), what
-        ws = facade.cake_mhc_train_backward_workspace(
-            T, dev, hidden=hidden, deterministic=False
-        )
+        ws = facade.cake_mhc_nondet_train_backward_workspace(T, dev, hidden=hidden)
         assert ws.dtype == torch.uint8 and ws.numel() == nd_bytes, what
         assert int(torch.count_nonzero(ws)) == 0, what
-        got = _forward_outputs(_entries(facade), i, deterministic=False)
+        got = _forward_outputs(_entries(facade), i)
         for k, v in ref["forward"].items():
             assert _same_bits(got[k], v), f"{k} {what} vs deterministic"
             assert _same_bits(got[k], direct_forward[k]), f"{k} {what} vs the backend"
         for workspace in (None, ws):
-            got = facade.cake_mhc_train_backward_finish(
-                *_args(i), workspace=workspace, deterministic=False
+            got = facade.cake_mhc_nondet_train_backward_finish(
+                *_args(i), workspace=workspace
             )
             label = f"{what} workspace={workspace is not None}"
             _assert_backward(got, ref["backward"], f"{label} vs deterministic")
@@ -690,7 +807,7 @@ def test_strict_mode_alerts_the_backward_only(
     hidden: int, deterministic_algorithms, monkeypatch
 ) -> None:
     """Under ``torch.use_deterministic_algorithms(True)``, with the deterministic package's launches refused (nothing
-    falls back to it): ``is_cake_mhc_train_supported``, the workspace helpers, the forward entry points,
+    falls back to it): ``is_cake_mhc_nondet_train_supported``, the workspace helpers, the forward entry points,
     ``backward_prepare`` and the prepare / finish forwards run without an alert or a warning (warnings are errors)
     and give what they give with the mode off; ``backward_finish`` raises PyTorch's alert (``RuntimeError``) before
     any launch (the backend's launches refused for that call), the caller's outputs and workspace keeping their
@@ -698,15 +815,11 @@ def test_strict_mode_alerts_the_backward_only(
     T = 129
     dev = _device()
     i = _inputs(T, hidden=hidden)
-    want_supported = facade.is_cake_mhc_train_supported(
-        dev, hidden, deterministic=False
-    )
+    want_supported = facade.is_cake_mhc_nondet_train_supported(dev, hidden)
     want_sizes = _workspace_sizes(T, hidden)
-    want = _forward_outputs(_entries(facade), i, deterministic=False)
+    want = _forward_outputs(_entries(facade), i)
     _leaves_off, _handle_off, want_Y, recorded_off = _graph(_nd_prepare, _nd_finish, i)
-    ws = facade.cake_mhc_train_backward_workspace(
-        T, dev, hidden=hidden, deterministic=False
-    )
+    ws = facade.cake_mhc_nondet_train_backward_workspace(T, dev, hidden=hidden)
     ws[TICKET_BYTES:].fill_(0xAB)
     before = ws.clone()
     outputs = {
@@ -721,33 +834,32 @@ def test_strict_mode_alerts_the_backward_only(
         with warnings.catch_warnings():
             warnings.simplefilter("error")
             warnings.simplefilter("ignore", ExperimentalWarning)
-            supported = facade.is_cake_mhc_train_supported(
-                dev, hidden, deterministic=False
-            )
+            supported = facade.is_cake_mhc_nondet_train_supported(dev, hidden)
             sizes = _workspace_sizes(T, hidden)
             buffers = {
-                kind: getattr(facade, f"cake_mhc_train_{kind}_workspace")(
-                    T, dev, hidden=hidden, deterministic=False
+                kind: getattr(facade, f"cake_mhc_nondet_train_{kind}_workspace")(
+                    T, dev, hidden=hidden
                 )
                 for kind in ("forward", "backward")
             }
-            got = _forward_outputs(_entries(facade), i, deterministic=False)
+            got = _forward_outputs(_entries(facade), i)
             _leaves_on, _handle_on, Y, recorded_on = _graph(_nd_prepare, _nd_finish, i)
         with (
             monkeypatch.context() as n,
             pytest.raises(
                 RuntimeError,
-                match="^" + re.escape(f"cake_mhc_train_backward_finish {_ALERT}"),
+                match="^"
+                + re.escape(f"cake_mhc_nondet_train_backward_finish {_ALERT}"),
             ),
         ):
             _refuse_launches(n, backend)
-            facade.cake_mhc_train_backward_finish(
-                *_args(i), workspace=ws, deterministic=False, **outputs
+            facade.cake_mhc_nondet_train_backward_finish(
+                *_args(i), workspace=ws, **outputs
             )
         for loss in (recorded_on, recorded_off):
             with pytest.raises(
                 RuntimeError,
-                match=re.escape(f"CakeMHCTrainPrepareFunction.backward {_ALERT}"),
+                match=re.escape(f"CakeMHCNondetPrepareFunction.backward {_ALERT}"),
             ):
                 loss.backward()
         deterministic_algorithms(False)
@@ -783,16 +895,14 @@ def test_warn_only_alerts_once_and_runs_the_backend(
             warnings.simplefilter("ignore", ExperimentalWarning)
             got = [
                 t.clone()
-                for t in facade.cake_mhc_train_backward_finish(
-                    *_args(i), deterministic=False
-                )
+                for t in facade.cake_mhc_nondet_train_backward_finish(*_args(i))
             ]
         deterministic_algorithms(False)
     alerts = [w for w in caught if _ALERT in str(w.message)]
     assert len(alerts) == 1, [str(w.message) for w in caught]
     assert alerts[0].category is UserWarning
     assert str(alerts[0].message).startswith(
-        f"cake_mhc_train_backward_finish {_ALERT}"
+        f"cake_mhc_nondet_train_backward_finish {_ALERT}"
     ), str(alerts[0].message)
     _assert_backward(got, want, f"warn_only H={hidden}")
 
@@ -817,8 +927,8 @@ def test_deterministic_backward_workspace_serves_the_backward(
         _refuse_launches(m, det_backend)
         got = [
             t.clone()
-            for t in facade.cake_mhc_train_backward_finish(
-                *_args(i), workspace=ws, deterministic=False
+            for t in facade.cake_mhc_nondet_train_backward_finish(
+                *_args(i), workspace=ws
             )
         ]
         _assert_ticket_zero(ws, f"backward_finish {what}")
@@ -832,19 +942,17 @@ def test_deterministic_backward_workspace_serves_the_backward(
 
 @requires_device
 def test_finish_refuses_a_deterministic_handle() -> None:
-    """``cake_mhc_train_finish`` given the handle of the deterministic package's prepare raises the mode's
-    ``ValueError`` by default and the handle's ``TypeError`` (naming the deterministic finish) with
-    ``deterministic=False``; neither call touches the handle, whose deterministic finish then gives the deterministic
-    ``Y`` and gradients bit for bit."""
+    """``cake_mhc_nondet_train_finish`` given the handle of the deterministic package's prepare raises the handle's
+    ``TypeError`` (naming the deterministic finish), and with a ``deterministic`` keyword the interpreter's
+    ``TypeError``; neither call touches the handle, whose deterministic finish then gives the deterministic ``Y`` and
+    gradients bit for bit."""
     i = _inputs(7, seed=SEED + 10)
 
     def finish(X, B, handle):
-        with pytest.raises(
-            ValueError, match=_exactly(_mode_error("cake_mhc_train_finish", True))
-        ):
-            facade.cake_mhc_train_finish(X, B, handle)
+        with pytest.raises(TypeError, match=_NO_MODE_KEYWORD):
+            facade.cake_mhc_nondet_train_finish(X, B, handle, deterministic=False)
         with pytest.raises(TypeError, match=_exactly(_HANDLE_ERROR)):
-            facade.cake_mhc_train_finish(X, B, handle, deterministic=False)
+            facade.cake_mhc_nondet_train_finish(X, B, handle)
         return det_facade.cake_mhc_det_train_finish(X, B, handle)
 
     handle, Y, grads = _autograd(det_facade.cake_mhc_det_train_prepare, finish, i)
@@ -863,7 +971,7 @@ def test_finish_refuses_a_deterministic_handle() -> None:
 
 @pytest.mark.cpu_only
 def test_nondeterministic_workspace_helpers_reject_other_hidden_sizes() -> None:
-    """``deterministic=False`` lists the hidden sizes 4096, 5120 and 7168 (``cake_jit.HIDDEN_SIZES``): its workspace
+    """The non-deterministic package lists the hidden sizes 4096, 5120 and 7168 (``cake_jit.HIDDEN_SIZES``): its workspace
     helpers raise ``ValueError`` for another hidden size or a non-``int`` one before any device query, in the facade
     and in the backend (the sizes of the device's architecture are ``test_hidden_sizes_follow_the_device``'s)."""
     assert tuple(loader.HIDDEN_SIZES) == HIDDEN_SIZES
@@ -873,25 +981,21 @@ def test_nondeterministic_workspace_helpers_reject_other_hidden_sizes() -> None:
             for module in (facade, backend):
                 for hidden in (6144, 2048, 4097, 0, -4096, True, 4096.0, "4096"):
                     with pytest.raises(ValueError, match="hidden"):
-                        getattr(module, name)(
-                            1, torch.device("cuda"), hidden=hidden, deterministic=False
-                        )
+                        getattr(module, name)(1, torch.device("cuda"), hidden=hidden)
 
 
 @requires_device
 @pytest.mark.parametrize("hidden", HIDDEN_SIZES[1:], ids=lambda h: f"H{h}")
 def test_hidden_sizes_follow_the_device(hidden: int) -> None:
-    """``deterministic=False`` takes a hidden size exactly where the deterministic package does: on sm_100a / sm_103a
+    """The non-deterministic package takes a hidden size exactly where the deterministic package does: on sm_100a / sm_103a
     5120 and 7168 size their workspaces (the forward one the deterministic package's, the backward one smaller than
     its, both other than the H 4096 sizes) and the entry points run on them; on sm_107a (hidden 4096 only) the
     workspace helpers and the entry points refuse them with ``ValueError``."""
     dev = _device()
     exported = det_facade.is_cake_mhc_det_train_supported(dev, hidden)
     assert exported == (hidden in _hidden_sizes()) == (_arch() != "sm_107a")
-    assert (
-        facade.is_cake_mhc_train_supported(dev, hidden, deterministic=False) == exported
-    )
-    assert backend.is_cake_mhc_train_supported(dev, hidden) == exported
+    assert facade.is_cake_mhc_nondet_train_supported(dev, hidden) == exported
+    assert backend.is_cake_mhc_nondet_train_supported(dev, hidden) == exported
     i = _inputs(7, hidden=hidden) if exported else None
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ExperimentalWarning)
@@ -899,33 +1003,29 @@ def test_hidden_sizes_follow_the_device(hidden: int) -> None:
             for name in _WORKSPACE_HELPERS:
                 for module in (facade, backend):
                     with pytest.raises(ValueError):
-                        getattr(module, name)(
-                            300, dev, hidden=hidden, deterministic=False
-                        )
+                        getattr(module, name)(300, dev, hidden=hidden)
             X = torch.zeros(7, 4, hidden, dtype=BF16, device=dev)
             fn = torch.zeros(24, 4 * hidden, device=dev)
             scale = torch.ones(3, device=dev)
             base = torch.zeros(24, device=dev)
             for module in (facade, backend):
                 with pytest.raises(ValueError):
-                    module.cake_mhc_train_forward_prepare(
-                        X, fn, scale, base, deterministic=False
-                    )
+                    module.cake_mhc_nondet_train_forward_prepare(X, fn, scale, base)
             return
         for kind in ("forward", "backward"):
-            nbytes = getattr(facade, f"cake_mhc_train_{kind}_workspace_bytes")
+            nbytes = getattr(facade, f"cake_mhc_nondet_train_{kind}_workspace_bytes")
             reference_nbytes = getattr(
                 det_facade, f"cake_mhc_det_train_{kind}_workspace_bytes"
             )
-            got = nbytes(300, dev, hidden=hidden, deterministic=False)
+            got = nbytes(300, dev, hidden=hidden)
             want = reference_nbytes(300, dev, hidden=hidden)
-            assert got != nbytes(300, dev, deterministic=False), kind
+            assert got != nbytes(300, dev), kind
             assert got == want if kind == "forward" else got < want, (kind, got, want)
-            ws = getattr(facade, f"cake_mhc_train_{kind}_workspace")(
-                300, dev, hidden=hidden, deterministic=False
+            ws = getattr(facade, f"cake_mhc_nondet_train_{kind}_workspace")(
+                300, dev, hidden=hidden
             )
             assert ws.numel() == got and int(torch.count_nonzero(ws)) == 0, kind
-        got = facade.cake_mhc_train_backward_finish(*_args(i), deterministic=False)
+        got = facade.cake_mhc_nondet_train_backward_finish(*_args(i))
         _assert_backward(got, _det_backward(i), f"H={hidden}")
 
 
@@ -954,7 +1054,7 @@ def _head_connections(prepare, finish, i: dict, layers: list, **kwargs) -> tuple
 def test_nd_training_composes_with_the_stream_mean_head(
     T: int, save_stats: bool, hidden: int
 ) -> None:
-    """Training with ``deterministic=False`` feeding the deterministic package's model head
+    """Non-deterministic training feeding the deterministic package's model head
     (``flashinfer.cake_mhc_det_train.cake_mhc_det_train_head``, ``mean_i X[:, i, :]`` of the last connection's
     four streams), at every hidden size the device routes: two connections, the head and a loss on its output.  The
     gradients reach every leaf through the head (finite, non-zero), the connections' handles are the backend's, and

@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Tests of the run-time Sinkhorn iteration count and the epsilons of the Cake
-four-stream mHC training package with the opt-in non-deterministic backward
-(``flashinfer.experimental.cake.cake_mhc_train_backend``, every entry point
-with ``deterministic=False``; SM100 / SM103 / SM107; FlashInfer issue #8068), in
+four-stream mHC training package with the non-deterministic backward
+(``flashinfer.experimental.cake.cake_mhc_nondet_train``; SM100 / SM103 /
+SM107; FlashInfer issue #8068), in
 the form of ``test_cake_mhc_det_train_iters.py``.
 
 ``sinkhorn_iters`` is an integer from 1 to ``SINKHORN_ITERS_MAX`` (64).  The
@@ -56,7 +56,6 @@ architecture routes them (SM100 / SM103; SM107 routes 4096 only).
 
 from __future__ import annotations
 
-import functools
 import math
 import statistics
 
@@ -65,24 +64,18 @@ import torch
 
 from tests.test_helpers.cake_package import cake_package
 
-KEY = "cake.cake_mhc_train"
+KEY = "cake.cake_mhc_nondet_train"
 pkg = cake_package(KEY)
 loader = cake_package(KEY, "cake_jit")
 # The deterministic package: the same-input comparison point.
 det = cake_package("cake_mhc_det_train")
 det_loader = cake_package("cake_mhc_det_train", "cake_jit")
-# The package's entry points with the mode they require.
-forward_prepare = functools.partial(
-    pkg.cake_mhc_train_forward_prepare, deterministic=False
-)
-forward_stats = functools.partial(pkg.cake_mhc_train_forward_stats, deterministic=False)
-forward_finish = functools.partial(
-    pkg.cake_mhc_train_forward_finish, deterministic=False
-)
-backward_prepare = functools.partial(
-    pkg.cake_mhc_train_backward_prepare, deterministic=False
-)
-backward_finish = pkg.cake_mhc_train_backward_finish
+# The package's entry points.
+forward_prepare = pkg.cake_mhc_nondet_train_forward_prepare
+forward_stats = pkg.cake_mhc_nondet_train_forward_stats
+forward_finish = pkg.cake_mhc_nondet_train_forward_finish
+backward_prepare = pkg.cake_mhc_nondet_train_backward_prepare
+backward_finish = pkg.cake_mhc_nondet_train_backward_finish
 det_backward_finish = det.cake_mhc_det_train_backward_finish
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
@@ -121,7 +114,7 @@ def _supported() -> bool:
     return (
         torch.cuda.is_available()
         and _capability() in SUPPORTED_CAPABILITIES
-        and pkg.is_cake_mhc_train_supported(_device())
+        and pkg.is_cake_mhc_nondet_train_supported(_device())
         and loader.route_applies(
             device_capability=_capability(), hidden=HIDDEN, kind="bwd_finish"
         )
@@ -130,7 +123,7 @@ def _supported() -> bool:
 
 pytestmark = pytest.mark.skipif(
     not _supported(),
-    reason="cake_mhc_train needs an SM100 / SM103 / SM107 device with exported routes",
+    reason="cake_mhc_nondet_train needs an SM100 / SM103 / SM107 device with exported routes",
 )
 
 
@@ -189,7 +182,7 @@ def _slab_parts(T: int, hidden: int = HIDDEN) -> int:
 
 
 def _dfn_factor(T: int, hidden: int = HIDDEN) -> float:
-    """F of the dfn bound F u (|carried| + ABS_SLACK sum_t |dz'_t| |x_t|) at T (``test_cake_mhc_train.py``'s
+    """F of the dfn bound F u (|carried| + ABS_SLACK sum_t |dz'_t| |x_t|) at T (``test_cake_mhc_nondet_train.py``'s
     ``_dfn_factor``, which derives it): 2 P where the column slab runs dynr or dynr_os (both sides sum the same
     per-chunk partials), 2 max(P, P_k7) + 10 where it runs lpt or lpt_os (the partials are another partition's)."""
     if not _lpt_runs(T, hidden):
@@ -198,7 +191,7 @@ def _dfn_factor(T: int, hidden: int = HIDDEN) -> float:
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# Reference (test_cake_mhc_train.py's arithmetic: the epsilons and the Sinkhorn count a case carries)
+# Reference (test_cake_mhc_nondet_train.py's arithmetic: the epsilons and the Sinkhorn count a case carries)
 
 
 def _set_ieee_fp32() -> None:
@@ -319,7 +312,7 @@ def _dzp(i: dict) -> torch.Tensor:
 
 def _dfn_bound(i: dict) -> torch.Tensor:
     """Per-element bound of ``|dfn_a - dfn_b|`` for two sums of per-chunk partials in two orders:
-    ``F u * 1.02 sum_t |dz'_t| |x_t|`` with ``F`` = :func:`_dfn_factor` (``test_cake_mhc_train.py``'s
+    ``F u * 1.02 sum_t |dz'_t| |x_t|`` with ``F`` = :func:`_dfn_factor` (``test_cake_mhc_nondet_train.py``'s
     ``_dfn_bound``)."""
     T, hidden = i["X"].shape[0], i["X"].shape[2]
     dzp = _dzp(i).abs()
@@ -363,7 +356,7 @@ def _backward(entry, i: dict, prep: dict, **kwargs) -> dict:
 
 
 def _nd_backward(i: dict, prep: dict, **kwargs) -> dict:
-    return _backward(backward_finish, i, prep, deterministic=False, **kwargs)
+    return _backward(backward_finish, i, prep, **kwargs)
 
 
 def _det_backward(i: dict, prep: dict, **kwargs) -> dict:
@@ -543,7 +536,7 @@ def test_parameter_gradients_within_2x_comparator_over_draws(
     for k, pairs in rows.items():
         kernel, comparator = [p[0] for p in pairs], [p[1] for p in pairs]
         print(
-            f"{k} T={T} sinkhorn_iters={iters} deterministic=False: worst-launch rel-L2 median "
+            f"{k} T={T} sinkhorn_iters={iters} nondet: worst-launch rel-L2 median "
             f"{statistics.median(kernel):.3e} max {max(kernel):.3e}; comparator median "
             f"{statistics.median(comparator):.3e} max {max(comparator):.3e}",
             flush=True,
@@ -604,7 +597,7 @@ def _check_paths(T: int, iters: int, hidden: int) -> None:
             f"{name} T={T} sinkhorn_iters={iters} H={hidden}: differs from the deterministic package"
         )
     operands = (i["X"], i["dY"], dB, B, i["fn"], i["scale"], i["base"], stats, gstats)
-    direct = backward_finish(*operands, sinkhorn_iters=iters, deterministic=False)
+    direct = backward_finish(*operands, sinkhorn_iters=iters)
     direct_det = det_backward_finish(*operands, sinkhorn_iters=iters)
     bound = _dfn_bound({**i, "B": B, "dU": dB, "sinkhorn_iters": iters})
     label = f"T={T} sinkhorn_iters={iters} H={hidden}"
@@ -618,13 +611,12 @@ def _check_paths(T: int, iters: int, hidden: int) -> None:
         fn = i["fn"].clone().requires_grad_(True)
         scale = i["scale"].clone().requires_grad_(True)
         base = i["base"].clone().requires_grad_(True)
-        Ua, handle = pkg.cake_mhc_train_prepare(
+        Ua, handle = pkg.cake_mhc_nondet_train_prepare(
             X, fn, scale, base, sinkhorn_iters=iters, save_stats=save_stats,
-            deterministic=False,
         )  # fmt: skip
         Ua.retain_grad()
         Ba = (Ua.float() + i["B"].float()).to(BF16)
-        Ya = pkg.cake_mhc_train_finish(X, Ba, handle, deterministic=False)
+        Ya = pkg.cake_mhc_nondet_train_finish(X, Ba, handle)
         (Ya.float() * i["dY"].float()).sum().backward()
         what = f"{label} save_stats={save_stats}"
         assert torch.equal(Ua.detach(), U) and torch.equal(Ya.detach(), Y), what
@@ -666,7 +658,7 @@ def test_changing_count_does_not_rebuild() -> None:
 def test_count_validation() -> None:
     """The package checks the count like the deterministic package: a non-integer, non-positive or bool count is a
     ``ValueError``, one above ``SINKHORN_ITERS_MAX`` a ``NotImplementedError``, on ``backward_finish``,
-    ``forward_prepare`` and ``cake_mhc_train_prepare``; the counts 1, 20.0 and ``SINKHORN_ITERS_MAX`` run and give the deterministic
+    ``forward_prepare`` and ``cake_mhc_nondet_train_prepare``; the counts 1, 20.0 and ``SINKHORN_ITERS_MAX`` run and give the deterministic
     backward's ``dX`` / ``dscale`` / ``dbase`` bits at the same count."""
     assert det.SHIPPED_SINKHORN_ITERS == pkg.SHIPPED_SINKHORN_ITERS == (SINKHORN_ITERS,)
     assert det.SINKHORN_ITERS_MAX == loader.SINKHORN_ITERS_MAX == SINKHORN_ITERS_MAX
@@ -679,18 +671,14 @@ def test_count_validation() -> None:
         with pytest.raises(ValueError):
             forward_prepare(X, fn, scale, base, sinkhorn_iters=iters)
         with pytest.raises(ValueError):
-            pkg.cake_mhc_train_prepare(
-                X, fn, scale, base, sinkhorn_iters=iters, deterministic=False
-            )
+            pkg.cake_mhc_nondet_train_prepare(X, fn, scale, base, sinkhorn_iters=iters)
     for iters in (SINKHORN_ITERS_MAX + 1, 1000):
         with pytest.raises(NotImplementedError):
             _nd_backward(i, prep, sinkhorn_iters=iters)
         with pytest.raises(NotImplementedError):
             forward_prepare(X, fn, scale, base, sinkhorn_iters=iters)
         with pytest.raises(NotImplementedError):
-            pkg.cake_mhc_train_prepare(
-                X, fn, scale, base, sinkhorn_iters=iters, deterministic=False
-            )
+            pkg.cake_mhc_nondet_train_prepare(X, fn, scale, base, sinkhorn_iters=iters)
     for iters in (1, 20.0, SINKHORN_ITERS_MAX):
         case = {**i, "sinkhorn_iters": iters}
         cprep = _forward(case)
@@ -717,7 +705,7 @@ def test_run_time_count_and_epsilons(
     T: int, iters: int, rms_eps: float, hc_eps: float
 ) -> None:
     """A run-time Sinkhorn count (the deterministic token-owner pass's run-time-count record) and non-default
-    epsilons with ``deterministic=False``: ``dX``, ``dscale``, ``dbase`` bitwise the deterministic backward's at the
+    epsilons of the non-deterministic backward: ``dX``, ``dscale``, ``dbase`` bitwise the deterministic backward's at the
     same constants on every launch, ``dfn`` within the bound; against the FP64 reference at the same constants the
     BF16 ``dX`` gate and rel-L2 <= 1e-5 (``dscale`` / ``dbase`` per element <= 1e-4) on the worst launch."""
     i = _make_inputs(T, seed=SEED + 41)

@@ -15,12 +15,12 @@ limitations under the License.
 
 Backend suite of the Cake four-stream mHC training package with the opt-in
 non-deterministic backward
-(``flashinfer.experimental.cake.cake_mhc_train_backend``; hidden 4096, 5120
+(``flashinfer.experimental.cake.cake_mhc_nondet_train``; hidden 4096, 5120
 and 7168 on SM100 / SM103, 4096 on SM107; 4 streams; FlashInfer issue #8068).
 
 The package is standalone: its forward, statistics replay, residual mixing and
 backward prepare run its own copies of the deterministic programs, and
-``cake_mhc_train_backward_finish(..., deterministic=False)`` launches its copy
+``cake_mhc_nondet_train_backward_finish(...)`` launches its copy
 of the deterministic token-owner pass, its atomic fn split (beside the
 token-owner pass as its programmatic dependent; it also clears ``dfn`` without
 ``accumulate``) and its atomic column-slab pass, which adds
@@ -33,13 +33,11 @@ which this package does not copy: the reference there is its backward with
 those forms off, :func:`_det_backward`); each ``dfn`` element sums ``P``
 per-chunk FP32 partials (``P`` the column slab's chunk count:
 ``cake_jit.k7_chunks``, or the two-size geometry where ``cake_jit.lpt_chunks``
-fires; at most 32) in an order that may change from run to run.  Every compute
-and workspace entry point, the autograd prepare and finish included, takes
-``deterministic=False`` passed explicitly (``is_cake_mhc_train_supported`` and
-``cake_mhc_train_reset_workspace`` take no ``deterministic``): any other
-value, the default ``True`` included, is a ``ValueError`` naming the
-deterministic package's entry, never a fallback (checked without a device by
-``test_cake_mhc_train_rules.py``).  The deterministic package
+fires; at most 32) in an order that may change from run to run.  The mode is
+part of the names: no entry point takes a ``deterministic`` keyword (passing one
+is a ``TypeError``) and nothing falls back to the deterministic package (checked
+without a device by ``test_cake_mhc_nondet_train_rules.py``).  The deterministic
+package
 (``flashinfer.cake_mhc_det_train_backend``) is the same-input reference
 throughout, never a source of tolerances.  This module checks:
 
@@ -86,14 +84,14 @@ throughout, never a source of tolerances.  This module checks:
 * PyTorch's deterministic algorithms: ``backward_finish`` raises PyTorch's
   alert (``RuntimeError`` before any launch; under ``warn_only`` one
   ``UserWarning`` per call, then the non-deterministic backward runs, never a
-  fallback), and so does the backward of the ``cake_mhc_train_prepare`` node,
+  fallback), and so does the backward of the ``cake_mhc_nondet_train_prepare`` node,
   also when the mode is enabled between the forward and the backward; the
   forward entry points, the workspaces and the prepare node's forward never
   alert;
 * four ``accumulate=True`` passes; the autograd functions plain and under a
   non-reentrant checkpoint, against the deterministic gradients;
-* ``test_cake_mhc_det_train.py``'s checkpoint and lifetime cases with
-  ``deterministic=False`` (the saved-tensor and autograd-edge contract of
+* ``test_cake_mhc_det_train.py``'s checkpoint and lifetime cases with this
+  package's autograd functions (the saved-tensor and autograd-edge contract of
   FlashInfer issues #7039 / #7547): the checkpoint replay of the statistics, a
   checkpoint around the connection or after the prepare keeping nothing alive,
   nothing alive once a backward has run, repeated backward passes with
@@ -110,14 +108,14 @@ throughout, never a source of tolerances.  This module checks:
   the hidden size) give each size's bits.
 
 The siblings hold the rest of the deterministic suite's organization:
-``test_cake_mhc_train_graphs.py`` (CUDA Graph capture and replay),
-``test_cake_mhc_train_iters.py`` (the run-time Sinkhorn count and the
-epsilons), ``test_cake_mhc_train_workspace.py`` (caller and default
+``test_cake_mhc_nondet_train_graphs.py`` (CUDA Graph capture and replay),
+``test_cake_mhc_nondet_train_iters.py`` (the run-time Sinkhorn count and the
+epsilons), ``test_cake_mhc_nondet_train_workspace.py`` (caller and default
 workspaces across token-count sequences, their sizes and which sizing serves
-which backward), ``test_cake_mhc_train_rules.py`` (the registry against the
+which backward), ``test_cake_mhc_nondet_train_rules.py`` (the registry against the
 deterministic one, the standalone package and the mode policy without a
-device) and ``test_cake_mhc_train_api.py`` (the
-``flashinfer.experimental.cake.cake_mhc_train`` facade).
+device) and ``test_cake_mhc_nondet_train_api.py`` (the
+``flashinfer.cake_mhc_nondet_train`` facade).
 
 The largest cases hold the FP64 reference in row blocks of 8192 tokens.  Like
 ``test_cake_mhc_det_train.py`` this suite exercises the backend packages alone
@@ -128,7 +126,6 @@ else from flashinfer.
 from __future__ import annotations
 
 import contextlib
-import functools
 import math
 import re
 import statistics
@@ -141,24 +138,18 @@ from torch.utils.checkpoint import checkpoint
 
 from tests.test_helpers.cake_package import cake_package
 
-KEY = "cake.cake_mhc_train"
+KEY = "cake.cake_mhc_nondet_train"
 pkg = cake_package(KEY)
 loader = cake_package(KEY, "cake_jit")
 # The deterministic package: the same-input comparison point (never a source of tolerances).
 det = cake_package("cake_mhc_det_train")
 det_loader = cake_package("cake_mhc_det_train", "cake_jit")
-# The package's entry points with the mode they require.
-backward_finish = pkg.cake_mhc_train_backward_finish
-forward_prepare = functools.partial(
-    pkg.cake_mhc_train_forward_prepare, deterministic=False
-)
-forward_stats = functools.partial(pkg.cake_mhc_train_forward_stats, deterministic=False)
-forward_finish = functools.partial(
-    pkg.cake_mhc_train_forward_finish, deterministic=False
-)
-backward_prepare = functools.partial(
-    pkg.cake_mhc_train_backward_prepare, deterministic=False
-)
+# The package's entry points.
+backward_finish = pkg.cake_mhc_nondet_train_backward_finish
+forward_prepare = pkg.cake_mhc_nondet_train_forward_prepare
+forward_stats = pkg.cake_mhc_nondet_train_forward_stats
+forward_finish = pkg.cake_mhc_nondet_train_forward_finish
+backward_prepare = pkg.cake_mhc_nondet_train_backward_prepare
 det_backward_finish = det.cake_mhc_det_train_backward_finish
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
@@ -246,7 +237,7 @@ def _supported() -> bool:
     return (
         torch.cuda.is_available()
         and _capability() in SUPPORTED_CAPABILITIES
-        and pkg.is_cake_mhc_train_supported(_device())
+        and pkg.is_cake_mhc_nondet_train_supported(_device())
         and loader.route_applies(
             device_capability=_capability(), hidden=HIDDEN, kind="bwd_finish"
         )
@@ -255,7 +246,7 @@ def _supported() -> bool:
 
 pytestmark = pytest.mark.skipif(
     not _supported(),
-    reason="cake_mhc_train needs an SM100 / SM103 / SM107 device with exported routes",
+    reason="cake_mhc_nondet_train needs an SM100 / SM103 / SM107 device with exported routes",
 )
 
 
@@ -712,7 +703,7 @@ def _backward(entry, i: dict, prep: dict, **kwargs) -> dict:
 
 
 def _nd_backward(i: dict, prep: dict, **kwargs) -> dict:
-    return _backward(backward_finish, i, prep, deterministic=False, **kwargs)
+    return _backward(backward_finish, i, prep, **kwargs)
 
 
 def _clear_det_caches() -> None:
@@ -1114,7 +1105,7 @@ def _cancellation_band_report(
 
 @pytest.mark.parametrize(("hidden", "T"), _hidden_cases(T_ACCURACY, T_ACCURACY_NEW))
 def test_nondeterministic_backward_matches_fp64(hidden: int, T: int) -> None:
-    """``deterministic=False`` against the FP64 reference on the worst of REPEATS launches: BF16 ``dX`` with no
+    """The non-deterministic backward against the FP64 reference on the worst of REPEATS launches: BF16 ``dX`` with no
     mismatch at atol = rtol = 1e-2 (the launches' ``dX`` bitwise equal); ``dfn`` / ``dscale`` / ``dbase`` rel-L2
     <= 1e-5, ``dscale`` / ``dbase`` per element <= 1e-4."""
     _require_hidden(hidden)
@@ -1123,7 +1114,7 @@ def test_nondeterministic_backward_matches_fp64(hidden: int, T: int) -> None:
     outs = _nd_repeats(i, prep)
     ref = _oracle(i)
     comp = _oracle(i, dtype=F32, block_tokens=None)
-    label = f"T={T} H={hidden} P={_slab_parts(T, hidden)} deterministic=False"
+    label = f"T={T} H={hidden} P={_slab_parts(T, hidden)} nondet"
     _assert_bf16(outs[0]["dX"], ref["dX32"], f"dX {label}")
     for repeat, out in enumerate(outs[1:], start=1):
         _assert_same_bits(out["dX"], outs[0]["dX"], f"dX {label} launch {repeat}")
@@ -1138,9 +1129,7 @@ def test_parameter_gradients_within_2x_comparator_over_draws(T: int) -> None:
     launch: rel-L2 <= 1e-5 (``dscale`` / ``dbase`` per element <= 1e-4) on every draw; the median and the maximum of
     the rel-L2 <= 2x the IEEE-FP32 comparator's median and maximum."""
     rows = _parameter_rows(T, seeds=range(SEED, SEED + PARAM_CLAUSE_DRAWS))
-    _assert_parameter_distribution(
-        rows, f"T={T} mode=unit deterministic=False", regime="unit"
-    )
+    _assert_parameter_distribution(rows, f"T={T} mode=unit nondet", regime="unit")
 
 
 @pytest.mark.parametrize("T", (257, 2049))
@@ -1153,7 +1142,7 @@ def test_saturated_sigmoid_tails(T: int) -> None:
     outs = _nd_repeats(i, prep)
     ref = _oracle(i)
     comp = _oracle(i, dtype=F32, block_tokens=None)
-    label = f"T={T} mode=tail deterministic=False"
+    label = f"T={T} mode=tail nondet"
     _assert_bf16(outs[0]["dX"], ref["dX32"], f"dX {label}")
     _assert_draw(
         {k: _worst_row(outs, ref, comp, k) for k in _PARAMETER}, label, regime="tail"
@@ -1162,9 +1151,7 @@ def test_saturated_sigmoid_tails(T: int) -> None:
         _assert_tail_gradients(out, ref, f"{label} launch {repeat}")
     del i, prep, outs, ref, comp
     rows = _parameter_rows(T, mode="tail", seeds=range(SEED, SEED + PARAM_CLAUSE_DRAWS))
-    _assert_parameter_distribution(
-        rows, f"T={T} mode=tail deterministic=False", regime="tail"
-    )
+    _assert_parameter_distribution(rows, f"T={T} mode=tail nondet", regime="tail")
 
 
 @pytest.mark.parametrize("T", (257, 2049))
@@ -1180,7 +1167,7 @@ def test_single_cast_cancellation(T: int) -> None:
         prep = _forward(i)
         want = _snapshot(_det_backward(i, prep))
         outs = _nd_repeats(i, prep)
-        label = f"T={T} mode=cancel seed={seed} deterministic=False"
+        label = f"T={T} mode=cancel seed={seed} nondet"
         for repeat, out in enumerate(outs):
             _assert_same_bits(out["dX"], want["dX"], f"dX {label} launch {repeat}")
         ref = _oracle(i, want_contrib=True)
@@ -1202,7 +1189,7 @@ def test_single_cast_cancellation(T: int) -> None:
     strict_every_draw = max_k <= CANCEL_ULP_MAX
     pooled = total_k <= 2 * total_c and max_k <= 2 * max_c
     print(
-        f"dX cancellation T={T} deterministic=False: {len(reports)} draws; kernel total n(> 2 ulp) {total_k}, max ulp "
+        f"dX cancellation T={T} nondet: {len(reports)} draws; kernel total n(> 2 ulp) {total_k}, max ulp "
         f"{max_k}; IEEE-FP32 comparator {total_c} / {max_c}; aggregate verdict "
         f"{'PASS' if strict_every_draw or pooled else 'FAIL'}",
         flush=True,
@@ -1211,9 +1198,7 @@ def test_single_cast_cancellation(T: int) -> None:
         f"dX cancellation T={T}: over {len(reports)} draws the resolvable band has {total_k} elements > 2 ulp (max "
         f"{max_k}) against the IEEE-FP32 comparator's {total_c} (max {max_c}): beyond 2x"
     )
-    _assert_parameter_distribution(
-        rows, f"T={T} mode=cancel deterministic=False", regime="unit"
-    )
+    _assert_parameter_distribution(rows, f"T={T} mode=cancel nondet", regime="unit")
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -1228,9 +1213,7 @@ def _matches_the_deterministic_backward(hidden: int, T: int) -> None:
     want = _snapshot(_det_backward(i, prep))
     parts, lpt = _slab_parts(T, hidden), _lpt_runs(T, hidden)
     bound = _dfn_bound(i, _dfn_factor(T, hidden))
-    ws = pkg.cake_mhc_train_backward_workspace(
-        T, _device(), hidden=hidden, deterministic=False
-    )
+    ws = pkg.cake_mhc_nondet_train_backward_workspace(T, _device(), hidden=hidden)
     figures = []
     for repeat in range(REPEATS):
         label = f"T={T} H={hidden} {program} P={parts} launch {repeat}"
@@ -1469,9 +1452,7 @@ def test_two_size_schedule_at_forced_geometries(
     want = _snapshot(_det_backward(i, prep, accumulate=accumulate, **outputs(False)))
     factor = _dfn_factor(T, hidden)
     bound = _dfn_bound(i, factor, carried=None if carried is None else carried["dfn"])
-    ws = pkg.cake_mhc_train_backward_workspace(
-        T, _device(), hidden=hidden, deterministic=False
-    )
+    ws = pkg.cake_mhc_nondet_train_backward_workspace(T, _device(), hidden=hidden)
     loaded: list[str] = []
     load = loader.load
 
@@ -1563,15 +1544,13 @@ def test_forward_entry_points_are_the_deterministic_programs(
     _require_hidden(hidden)
     i = _make_inputs(T, hidden=hidden, seed=SEED + 12)
     want = _snapshot(_reference_forward_outputs(i))
-    nbytes = pkg.cake_mhc_train_forward_workspace_bytes(
-        T, _device(), hidden=hidden, deterministic=False
+    nbytes = pkg.cake_mhc_nondet_train_forward_workspace_bytes(
+        T, _device(), hidden=hidden
     )
     assert nbytes == det.cake_mhc_det_train_forward_workspace_bytes(
         T, _device(), hidden=hidden
     )
-    ws = pkg.cake_mhc_train_forward_workspace(
-        T, _device(), hidden=hidden, deterministic=False
-    )
+    ws = pkg.cake_mhc_nondet_train_forward_workspace(T, _device(), hidden=hidden)
     assert ws.numel() == nbytes and int(torch.count_nonzero(ws)) == 0
     for workspace in (None, ws):
         got = _forward_outputs(i, workspace=workspace)
@@ -1605,9 +1584,7 @@ def test_benchmark_token_counts_at_the_new_hidden_sizes(hidden: int, T: int) -> 
         _assert_same_bits(got[k], v, f"{k} {label}")
     prep = {"stats": got["stats"], "gstats": got["gstats"]}
     want = _snapshot(_det_backward(i, prep))
-    ws = pkg.cake_mhc_train_backward_workspace(
-        T, _device(), hidden=hidden, deterministic=False
-    )
+    ws = pkg.cake_mhc_nondet_train_backward_workspace(T, _device(), hidden=hidden)
     got = _snapshot(_nd_backward(i, prep, workspace=ws))
     _assert_ticket_zero(ws, label)
     _assert_exact_outputs(got, want, f"{label} vs deterministic")
@@ -1690,7 +1667,7 @@ def test_launches_are_this_packages_records(monkeypatch, hidden: int) -> None:
 
 # ----------------------------------------------------------------------------------------------------------------
 # PyTorch's deterministic algorithms (the alert of the unordered reduction; the facade, which forwards to this
-# package, is test_cake_mhc_train_api.py's)
+# package, is test_cake_mhc_nondet_train_api.py's)
 
 
 def _our_alerts(caught) -> list[str]:
@@ -1701,7 +1678,7 @@ def _our_alerts(caught) -> list[str]:
         if _ALERT not in message:
             continue
         name = message.split(f" {_ALERT}")[0]
-        if name.startswith(("cake_mhc_train", "CakeMHCTrain")):
+        if name.startswith(("cake_mhc_nondet_train", "CakeMHCNondet")):
             assert w.category is UserWarning, (name, w.category)
             names.append(name)
     return names
@@ -1720,17 +1697,17 @@ def test_policy_strict_alerts_the_direct_backward_only(
     want_replay = forward_stats(i["X"], i["fn"], i["scale"], i["base"]).clone()
     want = _snapshot(_det_backward(i, want_prep))
     bound = _dfn_bound(i, _dfn_factor(T))
-    ws = pkg.cake_mhc_train_backward_workspace(T, _device(), deterministic=False)
+    ws = pkg.cake_mhc_nondet_train_backward_workspace(T, _device())
     deterministic_algorithms(True)
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         prep = _snapshot(_forward(i))
         replay = forward_stats(i["X"], i["fn"], i["scale"], i["base"]).clone()
         forward_finish(i["X"], i["B"], prep["stats"])
-        assert pkg.cake_mhc_train_backward_workspace_bytes(
-            T, _device(), deterministic=False
+        assert pkg.cake_mhc_nondet_train_backward_workspace_bytes(
+            T, _device()
         ) == loader.workspace_bytes_upto("bwd", T, _sm_count(), _arch())
-        pkg.cake_mhc_train_forward_workspace(T, _device(), deterministic=False)
+        pkg.cake_mhc_nondet_train_forward_workspace(T, _device())
     for k in ("stats", "gstats"):
         _assert_same_bits(prep[k], want_prep[k], f"{k} under the strict mode")
     _assert_same_bits(replay, want_replay, "statistics replay under the strict mode")
@@ -1740,7 +1717,7 @@ def test_policy_strict_alerts_the_direct_backward_only(
     with pytest.raises(RuntimeError) as info:
         _nd_backward(i, prep, workspace=ws, **outputs)
     assert str(info.value).startswith(
-        f"cake_mhc_train_backward_finish {_ALERT}, but you set "
+        f"cake_mhc_nondet_train_backward_finish {_ALERT}, but you set "
         "'torch.use_deterministic_algorithms(True)'"
     ), str(info.value)
     torch.cuda.synchronize()
@@ -1782,7 +1759,7 @@ def test_policy_warn_only_warns_once_and_runs_the_nondeterministic_backward(
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             got = _snapshot(_nd_backward(i, prep, workspace=workspace))
-        assert _our_alerts(caught) == ["cake_mhc_train_backward_finish"], (
+        assert _our_alerts(caught) == ["cake_mhc_nondet_train_backward_finish"], (
             name,
             [str(w.message) for w in caught],
         )
@@ -1799,7 +1776,7 @@ def test_policy_prepare_node_alerts_its_backward(
     deterministic_algorithms, save_stats: bool
 ) -> None:
     """The prepare node's forward, the finish node and (``save_stats=False``) the statistics replay never alert; the
-    prepare node's backward raises PyTorch's alert named ``CakeMHCTrainPrepareFunction.backward`` whenever the
+    prepare node's backward raises PyTorch's alert named ``CakeMHCNondetPrepareFunction.backward`` whenever the
     deterministic algorithms are on when it runs -- recorded under the strict mode, or recorded with the mode off and
     the mode enabled before ``backward()``.  Under ``warn_only`` that backward warns once (``backward_finish`` adds
     no second alert) and runs the non-deterministic backward: ``Y`` and the ``X`` / ``scale`` / ``base`` gradients
@@ -1818,7 +1795,7 @@ def test_policy_prepare_node_alerts_its_backward(
 
     leaves_det, Y_det, loss = graph(DET_API)
     loss.backward()
-    refusal = f"CakeMHCTrainPrepareFunction.backward {_ALERT}"
+    refusal = f"CakeMHCNondetPrepareFunction.backward {_ALERT}"
     # recorded under the strict mode: the forward runs without an alert, the backward refuses
     deterministic_algorithms(True)
     with warnings.catch_warnings():
@@ -1842,7 +1819,7 @@ def test_policy_prepare_node_alerts_its_backward(
             loss.backward()
         deterministic_algorithms(False)
         what = f"warn_only at backward, save_stats={save_stats}, workspace={workspace is not None}"
-        assert _our_alerts(caught) == ["CakeMHCTrainPrepareFunction.backward"], (
+        assert _our_alerts(caught) == ["CakeMHCNondetPrepareFunction.backward"], (
             what,
             [str(w.message) for w in caught],
         )
@@ -1945,7 +1922,7 @@ def _connection(prepare, finish, branch, *, save_stats: bool, record=None, **kwa
 def test_autograd_matches_the_deterministic_gradients(
     T: int, save_stats: bool, checkpointed: bool, branch: str
 ) -> None:
-    """``cake_mhc_train_prepare(deterministic=False)`` / ``cake_mhc_train_finish`` around an external branch, plain or
+    """``cake_mhc_nondet_train_prepare()`` / ``cake_mhc_nondet_train_finish`` around an external branch, plain or
     inside a non-reentrant ``torch.utils.checkpoint``, against the plain deterministic autograd on the same inputs:
     ``Y`` and the gradients of ``X``, ``scale`` and ``base`` bitwise; the ``fn`` gradient within the ``dfn`` bound
     (evaluated on the branch output and the branch's ``dU`` of the deterministic graph)."""
@@ -1999,17 +1976,17 @@ def test_autograd_matches_the_deterministic_gradients(
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# The autograd connection with deterministic=False: test_cake_mhc_det_train.py's checkpoint and lifetime cases (the
+# The autograd connection of this package: test_cake_mhc_det_train.py's checkpoint and lifetime cases (the
 # saved-tensor and autograd-edge contract of FlashInfer issues #7039 / #7547: nothing of a connection stays alive
 # once its backward has run, nothing beyond the outputs under a checkpoint)
 
 
 def _nd_prepare(*args, **kwargs):
-    return pkg.cake_mhc_train_prepare(*args, deterministic=False, **kwargs)
+    return pkg.cake_mhc_nondet_train_prepare(*args, **kwargs)
 
 
 def _nd_finish(*args, **kwargs):
-    return pkg.cake_mhc_train_finish(*args, deterministic=False, **kwargs)
+    return pkg.cake_mhc_nondet_train_finish(*args, **kwargs)
 
 
 # (prepare, finish) of each package: a handle goes to the finish of the package that made it.
@@ -2074,7 +2051,7 @@ def _assert_kept(
 
 @pytest.mark.parametrize(("hidden", "T"), _hidden_cases((129, 2049), (129, 2049)))
 def test_checkpoint_replay(hidden: int, T: int) -> None:
-    """``forward_stats`` is bitwise the ``forward_prepare`` record, and the ``deterministic=False`` gradients with the
+    """``forward_stats`` is bitwise the ``forward_prepare`` record, and the non-deterministic gradients with the
     statistics saved (``save_stats=True``) and replayed in the backward (``False``, the checkpoint path) agree with
     each other and with the deterministic gradients: ``X`` / ``scale`` / ``base`` bitwise, ``fn`` within the bound."""
     _require_hidden(hidden)
@@ -2108,7 +2085,7 @@ def test_checkpoint_replay(hidden: int, T: int) -> None:
 @pytest.mark.parametrize("T", (129, 2049))
 @pytest.mark.parametrize("save_stats", (True, False))
 def test_checkpoint_keeps_nothing_alive(T: int, save_stats: bool) -> None:
-    """A non-reentrant ``torch.utils.checkpoint`` around a ``deterministic=False`` prepare / finish keeps no tensor of
+    """A non-reentrant ``torch.utils.checkpoint`` around a non-deterministic prepare / finish keeps no tensor of
     the layer alive after the forward, and the checkpointed backward equals the plain one and the deterministic one
     (``X`` / ``scale`` / ``base`` bitwise, ``fn`` within the bound)."""
     i = _make_inputs(T, seed=SEED + 41)
@@ -2136,7 +2113,7 @@ def test_checkpoint_keeps_nothing_alive(T: int, save_stats: bool) -> None:
 @pytest.mark.parametrize("T", (129, 2049))
 @pytest.mark.parametrize("save_stats", (True, False))
 def test_checkpoint_after_prepare_replays_statistics(T: int, save_stats: bool) -> None:
-    """A non-reentrant checkpoint region that starts after a ``deterministic=False`` prepare (the branch and the finish
+    """A non-reentrant checkpoint region that starts after a non-deterministic prepare (the branch and the finish
     inside it) keeps nothing beyond its output after the forward, the finish forward takes the edges off the handle
     and its rerun replays the released statistics; the gradients equal the plain run's (``X`` / ``scale`` / ``base``
     bitwise, ``fn`` within the bound)."""
@@ -2242,7 +2219,7 @@ def _assert_chain_grads(got, want, bounds: list, label: str) -> None:
 def test_backward_keeps_nothing_alive(
     T: int, save_stats: bool, checkpointed: bool
 ) -> None:
-    """Once a ``deterministic=False`` connection's backward has run, nothing of it stays alive: after
+    """Once a non-deterministic connection's backward has run, nothing of it stays alive: after
     ``torch.autograd.grad`` over two layers of two connections the only live tensor of the step is its output ``Y``.
     A second step equals the first and the deterministic step (``X`` / ``scale`` / ``base`` bitwise, each ``fn``
     within its connection's bound)."""
@@ -2275,7 +2252,7 @@ def test_backward_keeps_nothing_alive(
 @pytest.mark.parametrize("T", (129, 2049))
 @pytest.mark.parametrize("save_stats", (True, False))
 def test_repeated_backward_with_retain_graph(T: int, save_stats: bool) -> None:
-    """Backward passes over one retained ``deterministic=False`` graph are independent: two full passes equal a fresh
+    """Backward passes over one retained non-deterministic graph are independent: two full passes equal a fresh
     graph's, and a pass in between that reaches the prepare node but not the finish node (the loss is ``U``) takes
     no ``dY`` of the earlier pass: it equals the same pass on a fresh graph (``X`` / ``scale`` / ``base`` bitwise,
     ``fn`` within the bound of its pass)."""
@@ -2309,7 +2286,7 @@ def test_repeated_backward_with_retain_graph(T: int, save_stats: bool) -> None:
 @pytest.mark.parametrize("save_stats", (True, False))
 @pytest.mark.parametrize("region", ("connection", "after_prepare"))
 def test_reentrant_checkpoint(T: int, save_stats: bool, region: str) -> None:
-    """A reentrant ``torch.utils.checkpoint`` around a ``deterministic=False`` connection, or around the branch and the
+    """A reentrant ``torch.utils.checkpoint`` around a non-deterministic connection, or around the branch and the
     finish with the prepare outside, equals the plain gradients (``X`` / ``scale`` / ``base`` bitwise, ``fn`` within
     the bound) and keeps nothing alive after the backward beyond ``Y`` and the leaves' gradients."""
     i = _make_inputs(T, seed=SEED + 57)
@@ -2351,7 +2328,7 @@ def test_reentrant_checkpoint(T: int, save_stats: bool, region: str) -> None:
 @pytest.mark.parametrize("T", (129, 2049))
 @pytest.mark.parametrize("prepare", ("skipped", "not_recorded"))
 def test_backward_without_the_prepare_node(T: int, prepare: str) -> None:
-    """A backward that runs the finish node but not the ``deterministic=False`` prepare node leaves the finish node's
+    """A backward that runs the finish node but not the non-deterministic prepare node leaves the finish node's
     ``dY`` and gradient statistics on no handle; what stays alive is the prepare node's own saved statistics while
     its backward has not run."""
     i = _make_inputs(T, seed=SEED + 58)
@@ -2383,7 +2360,7 @@ def test_backward_without_the_prepare_node(T: int, prepare: str) -> None:
 
 @pytest.mark.parametrize("save_stats", (True, False))
 def test_interleaved_connections(save_stats: bool) -> None:
-    """Two ``deterministic=False`` connections of one shape whose prepares both run before either finish equal the two
+    """Two non-deterministic connections of one shape whose prepares both run before either finish equal the two
     connections run one after the other (``X`` / ``scale`` / ``base`` bitwise, each ``fn`` within its bound)."""
     T = 129
     a, b = _make_inputs(T, seed=SEED + 61), _make_inputs(T, seed=SEED + 62)
@@ -2450,7 +2427,7 @@ def test_large_logits(T: int) -> None:
     prep = _forward(i)
     outs = _nd_repeats(i, prep)
     want = _snapshot(_det_backward(i, prep))
-    label = f"T={T} fn_scale=1000 deterministic=False"
+    label = f"T={T} fn_scale=1000 nondet"
     for repeat, out in enumerate(outs):
         _assert_exact_outputs(out, want, f"{label} launch {repeat}")
     ref = _oracle(i)
@@ -2493,7 +2470,7 @@ def test_changing_rows_in_one_process_does_not_rebuild() -> None:
 
 
 def test_argument_validation() -> None:
-    """``deterministic=False`` validates like the deterministic backward (``test_cake_mhc_det_train.py``'s checks,
+    """The non-deterministic backward validates like the deterministic backward (``test_cake_mhc_det_train.py``'s checks,
     on ``backward_finish`` and the autograd prepare / finish): a wrong shape, dtype, device or layout of an operand or
     an output is a ``ValueError``, as are out-of-range epsilons and Sinkhorn counts (a count above
     ``SINKHORN_ITERS_MAX`` a ``NotImplementedError``) and ``accumulate=True`` without its buffers; the workspace must
@@ -2502,8 +2479,7 @@ def test_argument_validation() -> None:
     (6144) or the architecture does not route (5120 and 7168 on sm_107a), is a ``ValueError``.  ``B`` is optional:
     ``None`` gives the same ``dX`` / ``dscale`` / ``dbase`` bits and a ``dfn`` within the bound.  ``finish`` takes
     only this package's handles (any other object, a deterministic package's handle included, is a ``TypeError``
-    naming the deterministic finish), and checks the mode first: the default ``deterministic`` with such a handle is
-    the mode's ``ValueError`` naming the deterministic finish."""
+    naming the deterministic finish); a ``deterministic`` keyword is a ``TypeError`` too."""
     T = 8
     i = _make_inputs(T, seed=SEED + 9)
     X, fn, scale, base = i["X"], i["fn"], i["scale"], i["base"]
@@ -2524,11 +2500,11 @@ def test_argument_validation() -> None:
     def call(**changes):
         operands = {**args, **{k: v for k, v in changes.items() if k in args}}
         keywords = {k: v for k, v in changes.items() if k not in args}
-        return backward_finish(*operands.values(), deterministic=False, **keywords)
+        return backward_finish(*operands.values(), **keywords)
 
     # Padded rows (a [T, 4, 4096] view of a wider buffer) are not materialized silently: the caller decides.
     padded = torch.zeros(T, STREAMS, HIDDEN + 64, dtype=BF16, device=dev)[:, :, :HIDDEN]
-    nbytes = pkg.cake_mhc_train_backward_workspace_bytes(T, dev, deterministic=False)
+    nbytes = pkg.cake_mhc_nondet_train_backward_workspace_bytes(T, dev)
     shifted = torch.zeros(nbytes + 512, dtype=torch.uint8, device=dev)[1 : 1 + nbytes]
     for change in (
         {"X": X.float()},
@@ -2570,7 +2546,6 @@ def test_argument_validation() -> None:
         with pytest.raises(ValueError):
             backward_finish(
                 j["X"], j["dY"], j["dU"], j["B"], j["fn"], j["scale"], j["base"], prep["stats"], prep["gstats"],
-                deterministic=False,
             )  # fmt: skip
         with pytest.raises(ValueError):
             forward_prepare(j["X"], j["fn"], j["scale"], j["base"])
@@ -2581,7 +2556,7 @@ def test_argument_validation() -> None:
     with pytest.raises(TypeError):
         call(workspace=[0] * 256)
     with pytest.raises(ValueError):
-        backward_finish(*(t.cpu() for t in args.values()), deterministic=False)
+        backward_finish(*(t.cpu() for t in args.values()))
     # B is optional in the backward finish (its contribution is in grad_stats).
     with_b = _snapshot(dict(zip(_OUTPUTS, call(), strict=True)))
     without_b = _snapshot(dict(zip(_OUTPUTS, call(B=None), strict=True)))
@@ -2594,20 +2569,16 @@ def test_argument_validation() -> None:
     with pytest.raises(ValueError):
         _nd_prepare(padded, fn, scale, base)
     foreign = (
-        "handle must be the handle returned by cake_mhc_train_prepare (a cake_mhc_det_train_prepare handle goes to "
-        "flashinfer.cake_mhc_det_train.cake_mhc_det_train_finish)"
+        "handle must be the handle returned by cake_mhc_nondet_train_prepare (a cake_mhc_det_train_prepare "
+        "handle goes to flashinfer.cake_mhc_det_train.cake_mhc_det_train_finish)"
     )
     det_handle = det.cake_mhc_det_train_prepare(X, fn, scale, base)[1]
     for handle in (object(), det_handle):
         with pytest.raises(TypeError, match=re.escape(foreign)):
             _nd_finish(X, i["B"], handle)
-    default_mode = (
-        "cake_mhc_train_finish computes non-deterministically (got deterministic=True): pass deterministic=False for "
-        "the non-deterministic path, or call flashinfer.cake_mhc_det_train.cake_mhc_det_train_finish for the "
-        "deterministic one (no fallback)"
-    )
-    with pytest.raises(ValueError, match=re.escape(default_mode)):
-        pkg.cake_mhc_train_finish(X, i["B"], det_handle)
+    for value in (False, True):
+        with pytest.raises(TypeError, match="deterministic"):
+            pkg.cake_mhc_nondet_train_finish(X, i["B"], det_handle, deterministic=value)
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -2623,7 +2594,7 @@ def test_concurrent_streams(Ts: tuple) -> None:
     for n, T in enumerate(Ts):
         i = _make_inputs(T, seed=SEED + 500 + n)
         prep = _forward(i)
-        ws = pkg.cake_mhc_train_backward_workspace(T, _device(), deterministic=False)
+        ws = pkg.cake_mhc_nondet_train_backward_workspace(T, _device())
         serial = _snapshot(_nd_backward(i, prep, workspace=ws))
         want = _snapshot(_det_backward(i, prep))
         _assert_exact_outputs(serial, want, f"serial T={T}")
@@ -2700,14 +2671,14 @@ def _mixed_workspaces(sizes: tuple[int, ...], T: int, mode: str) -> dict:
     if mode == "default":
         return {H: (None, None) for H in sizes}
     nbytes = {
-        "fwd": pkg.cake_mhc_train_forward_workspace_bytes,
-        "bwd": pkg.cake_mhc_train_backward_workspace_bytes,
+        "fwd": pkg.cake_mhc_nondet_train_forward_workspace_bytes,
+        "bwd": pkg.cake_mhc_nondet_train_backward_workspace_bytes,
     }
     if mode == "per_hidden":
         return {
             H: tuple(
                 torch.zeros(
-                    size(T, dev, hidden=H, deterministic=False),
+                    size(T, dev, hidden=H),
                     dtype=torch.uint8,
                     device=dev,
                 )
@@ -2718,7 +2689,7 @@ def _mixed_workspaces(sizes: tuple[int, ...], T: int, mode: str) -> dict:
     assert mode == "shared", mode
     shared = tuple(
         torch.zeros(
-            max(size(T, dev, hidden=H, deterministic=False) for H in sizes),
+            max(size(T, dev, hidden=H) for H in sizes),
             dtype=torch.uint8,
             device=dev,
         )
@@ -2753,7 +2724,7 @@ def _staged_run(cases: dict, order: tuple[int, ...], ws: dict) -> dict:
         i, o = cases[H], out[H]
         o["dX"], o["dfn"], o["dscale"], o["dbase"] = backward_finish(
             i["X"], i["dY"], i["dU"], i["B"], i["fn"], i["scale"], i["base"], o["stats"], o["gstats"],
-            workspace=ws[H][1], deterministic=False,
+            workspace=ws[H][1],
         )  # fmt: skip
     return {H: _snapshot(o) for H, o in out.items()}
 
@@ -2810,7 +2781,7 @@ def test_mixed_hidden_sizes_same_token_count(T: int, workspaces: str) -> None:
 @pytest.mark.parametrize("save_stats", (True, False))
 @pytest.mark.parametrize("workspaces", _WORKSPACE_MODES)
 def test_mixed_hidden_sizes_autograd(T: int, save_stats: bool, workspaces: str) -> None:
-    """The ``deterministic=False`` autograd connections with every routed hidden size at the same token count: the
+    """The non-deterministic autograd connections with every routed hidden size at the same token count: the
     prepares of every size, then the finishes in the reverse order, then one backward over the sum of the losses.
     Each size's ``U`` and ``Y`` are bitwise those of the sizes run one after the other, its gradients equal theirs
     and the deterministic connection's (``X`` / ``scale`` / ``base`` bitwise, ``fn`` within the bound)."""
@@ -2878,9 +2849,7 @@ def test_zero_tokens_launch_nothing(hidden: int) -> None:
     i = _make_inputs(0, hidden=hidden)
     prep = _forward(i)
     want = _det_backward(i, prep)
-    empty_ws = pkg.cake_mhc_train_backward_workspace(
-        0, _device(), hidden=hidden, deterministic=False
-    )
+    empty_ws = pkg.cake_mhc_nondet_train_backward_workspace(0, _device(), hidden=hidden)
     assert empty_ws.numel() == 0
     for workspace in (None, empty_ws):
         got = _nd_backward(i, prep, workspace=workspace)

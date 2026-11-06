@@ -4179,6 +4179,6 @@
       ]
     }
   ],
-  "package": "flashinfer.experimental.cake.cake_mhc_train_backend",
+  "package": "flashinfer.experimental.cake.cake_mhc_nondet_train",
   "schema": "cake-build/1"
 }

@@ -63,7 +63,7 @@ PACKAGES: dict[str, str] = {
     "cake_gdn_det_train": "flashinfer.experimental.cake_gdn_det_train",
     "cake.cake_gdn_train": "flashinfer.experimental.cake.cake_gdn_train",
     "cake_gqa_train": "flashinfer.experimental.cake_gqa_train",
-    "cake.cake_mhc_train": "flashinfer.experimental.cake.cake_mhc_train_backend",
+    "cake.cake_mhc_nondet_train": "flashinfer.experimental.cake.cake_mhc_nondet_train",
     # the non-deterministic causal conv1d package (``deterministic=False``); its key carries the namespace
     "cake.cake_causal_conv1d_train": "flashinfer.experimental.cake.cake_causal_conv1d_train_backend",
 }
