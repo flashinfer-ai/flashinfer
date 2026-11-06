@@ -218,9 +218,13 @@ def test_top_level_exports_are_the_facade() -> None:
         is cake_rmsnorm_silu_gate_nondet_train_backward_workspace_bytes
     )
     # one non-deterministic autograd function: the backend's class, reached
-    # through the facade
+    # through the facade and the top level
     assert (
         CakeRMSNormSiLUGateNondetFunction is backend.CakeRMSNormSiLUGateNondetFunction
+    )
+    assert (
+        flashinfer.CakeRMSNormSiLUGateNondetFunction
+        is CakeRMSNormSiLUGateNondetFunction
     )
     # the det names stay the det package's objects
     assert (

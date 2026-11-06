@@ -34,9 +34,11 @@ a mode word) fail at import: no alias, no compat module, and no module
 ``__getattr__`` but the facades' own, which resolves exactly the three
 backend-owned names (the autograd class and the architecture constants).  Each
 facade imports its backend package on first use, so ``import flashinfer``
-loads no module of either backend package.  The ``flashinfer`` top level binds
-only names of the family with a mode word (checked in this process and in
-fresh interpreters).  The JIT
+loads no module of either backend package.  The family's ``flashinfer``
+top-level names are rows of the lazy-export table ``flashinfer._LAZY_EXPORTS``
+(bound on first access): each mode's facade module, its functional, forward,
+backward, workspace size and autograd class, all with a mode word (checked in
+this process and in fresh interpreters).  The JIT
 library names of the backends (``cake_rmsnorm_silu_gate_train_<hash>`` and
 ``cake_rmsnorm_silu_gate_det_train_<hash>``) are build identities, not Python
 names, and are unchanged.
@@ -102,16 +104,26 @@ def _public_names(mode: str) -> set:
 
 
 PUBLIC = {mode: _public_names(mode) for mode in MODES}
-# The names of the family the ``flashinfer`` top level binds (the autograd
-# classes are backend objects: attributes of the facade modules only).
+# The names of the family the ``flashinfer`` top level exports (rows of its
+# lazy-export table, besides the facade modules).
 TOP_LEVEL = {
     mode: {
         f"{OP}_{mode}",
         f"{OP}_{mode}_train_forward",
         f"{OP}_{mode}_train_backward",
         f"{OP}_{mode}_train_backward_workspace_bytes",
+        CLASS[mode],
     }
     for mode in MODES
+}
+# The family's rows of ``flashinfer._LAZY_EXPORTS``: name -> (module, attribute).
+ROWS = {
+    **{f"{OP}_{mode}_train": (f".{OP}_{mode}_train", None) for mode in MODES},
+    **{
+        name: (f".{OP}_{mode}_train", name)
+        for mode in MODES
+        for name in TOP_LEVEL[mode]
+    },
 }
 # The modules and packages the family had before the mode-in-name rule.
 OLD_MODULES = (
@@ -368,26 +380,42 @@ def test_old_name_fails_at_import(name: str) -> None:
 
 
 def test_top_level_binds_only_mode_names() -> None:
-    family = {name for name in vars(flashinfer) if FAMILY.search(name)}
-    modules = {f"{OP}_{mode}_train" for mode in MODES}
-    assert family == TOP_LEVEL["det"] | TOP_LEVEL["nondet"] | modules, sorted(family)
+    """The family's top-level names are exactly its lazy-export rows, and each
+    resolves to its facade's object (both autograd classes included)."""
+    rows = {
+        name: tuple(row)
+        for name, row in flashinfer._LAZY_EXPORTS.items()
+        if FAMILY.search(name)
+    }
+    assert rows == ROWS, sorted(rows)
+    family = {name for name in dir(flashinfer) if FAMILY.search(name)}
+    assert family == set(ROWS), sorted(family)
+    assert {name for name in vars(flashinfer) if FAMILY.search(name)} <= set(ROWS)
     for mode in MODES:
         facade = importlib.import_module(FACADE[mode])
         for name in TOP_LEVEL[mode]:
             assert getattr(flashinfer, name) is getattr(facade, name), name
+        assert getattr(flashinfer, CLASS[mode]) is getattr(
+            importlib.import_module(BACKEND[mode]), CLASS[mode]
+        )
         assert getattr(flashinfer, f"{OP}_{mode}_train") is facade
 
 
-# Each import form in a fresh interpreter: a plain ``import flashinfer`` (the
-# family's names at the top level), the old modules and names (each fails), and
-# the backend submodules first.
+# Each import form in a fresh interpreter: a plain ``import flashinfer`` (it
+# binds none of the family's names; each binds on first access), the old modules
+# and names (each fails), and the backend submodules first.
 FRESH = {
     "top_level": (
         "import re, flashinfer\n"
-        "family = sorted(n for n in vars(flashinfer) if re.search("
+        "def family(names):\n"
+        "    return sorted(n for n in names if re.search("
         "r'rmsnorm_silu_gate|RMSNormSiLUGate', n))\n"
-        f"want = sorted({sorted(TOP_LEVEL['det'] | TOP_LEVEL['nondet'] | {f'{OP}_{m}_train' for m in MODES})!r})\n"
-        "assert family == want, family\n"
+        f"want = {sorted(ROWS)!r}\n"
+        "assert family(vars(flashinfer)) == [], family(vars(flashinfer))\n"
+        "assert family(dir(flashinfer)) == want, family(dir(flashinfer))\n"
+        "for n in want:\n"
+        "    getattr(flashinfer, n)\n"
+        "assert family(vars(flashinfer)) == want, family(vars(flashinfer))\n"
     ),
     "old_modules": (
         "import importlib\n"
