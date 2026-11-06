@@ -13,11 +13,11 @@ plans or parallel partitions. `kcp` is the suffix for a context-parallel route.
 
 | Canonical name | Name before the `det` naming |
 | --- | --- |
-| `flashinfer.chunked_lm_head.chunked_lm_head_det_loss` | `chunked_lm_head_loss` (now a dispatcher, see below) |
-| `flashinfer.chunked_lm_head.chunked_lm_head_det_logprob` | `chunked_lm_head_logprob` (now a dispatcher) |
-| `flashinfer.chunked_lm_head.chunked_lm_head_det_preload` | `chunked_lm_head_preload` (now a dispatcher) |
-| `flashinfer.chunked_lm_head.chunked_lm_head_det_support_logprob` | `chunked_lm_head_support_logprob` (now a dispatcher) |
-| `flashinfer.chunked_lm_head.chunked_lm_head_det_support_kl` | `chunked_lm_head_support_kl` (now a dispatcher) |
+| `flashinfer.chunked_lm_head.chunked_lm_head_det_loss` | `chunked_lm_head_loss` (now a dispatcher of the non-deterministic package only, which needs `deterministic=False`; see below) |
+| `flashinfer.chunked_lm_head.chunked_lm_head_det_logprob` | `chunked_lm_head_logprob` (now a non-deterministic dispatcher) |
+| `flashinfer.chunked_lm_head.chunked_lm_head_det_preload` | `chunked_lm_head_preload` (now a non-deterministic dispatcher) |
+| `flashinfer.chunked_lm_head.chunked_lm_head_det_support_logprob` | `chunked_lm_head_support_logprob` (now a non-deterministic dispatcher) |
+| `flashinfer.chunked_lm_head.chunked_lm_head_det_support_kl` | `chunked_lm_head_support_kl` (now a non-deterministic dispatcher) |
 | package `flashinfer.experimental.cake_lm_head_det_loss` | `flashinfer.experimental.cake_lm_head_loss`: removed, no alias |
 | `cake_backend.chunked_lm_head_det_loss` | `chunked_lm_head_loss` (in `cake_backend` and `cake_backend_opt_in`): removed, no alias |
 | `cake_backend.chunked_lm_head_det_logprob` | `chunked_lm_head_logprob` (in `cake_backend` and `cake_backend_opt_in`): removed, no alias |
@@ -55,11 +55,11 @@ their fixed order. Its names are the deterministic names without `det`:
 | Deterministic name | Non-deterministic name | The same name in the deterministic package |
 | --- | --- | --- |
 | package `flashinfer.experimental.cake_lm_head_det_loss` | package `flashinfer.experimental.cake.cake_lm_head_loss` | none |
-| `flashinfer.chunked_lm_head.chunked_lm_head_det_loss` | `flashinfer.chunked_lm_head.chunked_lm_head_loss(..., deterministic=False)` | `chunked_lm_head_loss` is a dispatcher, default `deterministic=True` |
-| `flashinfer.chunked_lm_head.chunked_lm_head_det_logprob` | `chunked_lm_head_logprob(..., deterministic=False)` | dispatcher |
-| `flashinfer.chunked_lm_head.chunked_lm_head_det_preload` | `chunked_lm_head_preload(..., deterministic=False)` | dispatcher |
-| `flashinfer.chunked_lm_head.chunked_lm_head_det_support_logprob` | `chunked_lm_head_support_logprob(..., deterministic=False)` | dispatcher (the keyword is new) |
-| `flashinfer.chunked_lm_head.chunked_lm_head_det_support_kl` | `chunked_lm_head_support_kl(..., deterministic=False)` | dispatcher (the keyword is new) |
+| `flashinfer.chunked_lm_head.chunked_lm_head_det_loss` | `flashinfer.chunked_lm_head.chunked_lm_head_loss(..., deterministic=False)` | `chunked_lm_head_loss` is this package's dispatcher; it needs `deterministic=False` |
+| `flashinfer.chunked_lm_head.chunked_lm_head_det_logprob` | `chunked_lm_head_logprob(..., deterministic=False)` | dispatcher; `deterministic=False` required |
+| `flashinfer.chunked_lm_head.chunked_lm_head_det_preload` | `chunked_lm_head_preload(..., deterministic=False)` | dispatcher; `deterministic=False` required |
+| `flashinfer.chunked_lm_head.chunked_lm_head_det_support_logprob` | `chunked_lm_head_support_logprob(..., deterministic=False)` | dispatcher; `deterministic=False` required |
+| `flashinfer.chunked_lm_head.chunked_lm_head_det_support_kl` | `chunked_lm_head_support_kl(..., deterministic=False)` | dispatcher; `deterministic=False` required |
 | `cake_backend.prepare_lm_head_det_loss` | `cake_backend.prepare_lm_head_loss` | removed, no alias |
 | `cake_backend.validate_lm_head_det_inputs` | `cake_backend.validate_lm_head_inputs` | removed, no alias |
 | `cake_backend.lm_head_det_loss_workspace_size` | `cake_backend.lm_head_loss_workspace_size` | removed, no alias |
@@ -74,22 +74,20 @@ deterministic modules define only the `det` names.
 
 Mode and dispatch rules:
 
-| Call | Runs |
+| Call | Result |
 | --- | --- |
-| `chunked_lm_head_*(...)` or `deterministic=True` | the `chunked_lm_head_det_*` entry with the same arguments: the same bits, no added allocation or synchronization |
-| `deterministic=False` | the non-deterministic package, after the same argument checks and with the same `FLASHINFER_CAKE_LM_HEAD_LOSS_*` fallbacks |
-| `deterministic=False` while `torch.use_deterministic_algorithms(True)` is in effect (also `warn_only=True`) | the `chunked_lm_head_det_*` entry, with one `UserWarning` per entry point; a dX `k_slices` pin above 4 (in `gemm_tuning` or `FLASHINFER_CAKE_LM_HEAD_LOSS_GEMM_TUNING`) is dropped, with one more `UserWarning` per entry point |
-| `deterministic` not a `bool` | `TypeError` |
-| `chunked_lm_head_det_loss` / `chunked_lm_head_det_logprob` with `deterministic=False` | `NotImplementedError` (unchanged) |
-| `chunked_lm_head_det_preload` / `chunked_lm_head_det_support_*` with a `deterministic` keyword | `TypeError` (they have no `deterministic` parameter) |
-| a non-deterministic package entry with `deterministic` other than `False` (its default `True` included) | `ValueError` naming the deterministic package |
-| a non-deterministic package entry that launches gradient GEMMs while `torch.use_deterministic_algorithms(True)` is in effect | PyTorch's alert: `RuntimeError`, or a `UserWarning` with `warn_only=True` |
+| `chunked_lm_head_{loss,logprob,preload,support_logprob,support_kl}(...)` with the default or any `deterministic` other than `False` (`True`, `None`, `0`, `1`, `"False"`) | `ValueError`, raised before any package import or torch query; it names `flashinfer.chunked_lm_head.chunked_lm_head_det_<same suffix>` and says "pass deterministic=False for the non-deterministic path" |
+| the same with `deterministic=False` | the non-deterministic package, after the same argument checks and with the same `FLASHINFER_CAKE_LM_HEAD_LOSS_*` fallbacks |
+| the same with `deterministic=False` while `torch.use_deterministic_algorithms(True)` is in effect (also `warn_only=True`) | the non-deterministic package; its alert decides (the row below); no fallback to the deterministic entry; a `k_slices` pin reaches it unchanged, and the dispatcher itself warns nothing |
+| `chunked_lm_head_det_{loss,logprob,preload,support_logprob,support_kl}(..., deterministic=<any>)`; likewise every function and autograd `Function` of the deterministic package | `TypeError` (none has a `deterministic` parameter); torch's deterministic mode changes nothing |
+| a non-deterministic package entry (`flashinfer.experimental.cake.cake_lm_head_loss`) with `deterministic` other than `False` (its default `True` included) | `ValueError` before any launch, naming the deterministic entry `flashinfer.chunked_lm_head.chunked_lm_head_det_<suffix>` and saying "pass deterministic=False for the non-deterministic path"; `backward_loss` and `ForwardResult.backward` take no `deterministic` (they continue a `forward_loss` call) |
+| a non-deterministic package entry while `torch.use_deterministic_algorithms(True)` is in effect | PyTorch's alert (`RuntimeError`, or a `UserWarning` with `warn_only=True`, after which the call runs) only right before a K-sliced dX launch: a `gemm_dx_red` chunk of more than one dX slice (the counted two-slice chunks of the zero-gradient row skip included) or the candidate-support backward's dense dX at more than one slice (`sm_100a` cells only); fixed-order launches do not alert (one-slice dX, the weight-gradient GEMMs in chunk order, the deferred last-chunk weight gradient, the budget recompute, the casts, the support sparse passes, forward-only calls) |
 
 Zero-weight policy rows (`objective="policy"`, a valid label and
 `loss_weights == 0`): the non-deterministic loss entry leaves them out of the
 gradient path, as it does ignored rows.
 
-| | `deterministic=True` | `deterministic=False` |
+| | `chunked_lm_head_det_loss` | `chunked_lm_head_loss(..., deterministic=False)` |
 | --- | --- | --- |
 | gradient rows of the chunk loop | every valid row | `(labels >= 0) & (loss_weights != 0)` (a NaN weight stays in) |
 | `logp` of a zero-weight row (`return_logp=True`) | the loss path | a logp-only pass of the log-probability forward kernels |
@@ -101,7 +99,7 @@ gradient path, as it does ignored rows.
 Candidate-support entries (`chunked_lm_head_support_logprob` /
 `chunked_lm_head_support_kl`):
 
-| | `deterministic=True` | `deterministic=False` |
+| | `chunked_lm_head_det_support_*` | `chunked_lm_head_support_*(..., deterministic=False)` |
 | --- | --- | --- |
 | outputs, sparse `dX`, `dW` | the deterministic programs | the same programs: the same bits |
 | dense `dX` | per vocabulary block an FP32 product block, added into the chunk sum in block order | each block's GEMM adds into the chunk sum from its epilogue: one K slice (the same bits) at every shape outside the measured cells of `support_dx_form`; two or three K slices inside them (B200 only: five classes of H, token chunk and vocabulary block, at H 2048 to 6144): an unordered FP32 sum within the accuracy budgets |
@@ -109,5 +107,5 @@ Candidate-support entries (`chunked_lm_head_support_logprob` /
 | sparse `dW` long segments | parts summed in part order | the same |
 
 The non-deterministic package adds no environment variable; the
-`FLASHINFER_CAKE_LM_HEAD_LOSS_*` variables apply to both modes through the
-dispatchers, and its binding caches take the same two binding-cache settings.
+`FLASHINFER_CAKE_LM_HEAD_LOSS_*` variables apply to the `det` entries and to
+the dispatchers, and its binding caches take the same two binding-cache settings.

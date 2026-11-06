@@ -143,9 +143,11 @@ Contract
   (no new operation, no new kernel).  Every value must be positive and finite,
   ignored rows included (a device-side assertion on CUDA; ``check_temperature``
   reads it back).  ``|z / tau_t| < 3e38`` keeps every output defined.
-* ``deterministic=True`` (the only mode this backend serves): fixed sequential
-  chunk order, no atomics -- bitwise reproducible ``loss``, ``logp``, ``dX``
-  and ``dW`` across runs.
+* The mode: fixed sequential chunk order, no atomics -- bitwise reproducible
+  ``loss``, ``logp``, ``dX`` and ``dW`` across runs.  The det name is the
+  mode, so no function or autograd ``Function`` of this package takes a
+  ``deterministic`` argument (passing one is a ``TypeError``), and torch's
+  deterministic mode (``torch.use_deterministic_algorithms``) changes nothing.
 
 Every allocation happens in :func:`prepare_lm_head_det_loss`; the returned runner
 launches with no CUDA allocation and no host synchronization, so a runner (or
@@ -2639,7 +2641,6 @@ def validate_lm_head_det_inputs(
     loss_weights: Optional[torch.Tensor] = None,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     grad_weight_dtype: torch.dtype = torch.bfloat16,
-    deterministic: bool = True,
     entry: str = "loss",
     geometry: Geometry = DEFAULT_GEOMETRY,
 ) -> Problem:
@@ -2651,10 +2652,6 @@ def validate_lm_head_det_inputs(
     """
     if entry not in ENTRIES:
         raise ValueError(f"entry must be one of {ENTRIES}")
-    if deterministic is not True:
-        raise NotImplementedError(
-            "only deterministic=True is available: fixed chunk order, no atomics"
-        )
     if X.ndim != 2 or X.dtype != torch.bfloat16:
         raise ValueError("X must be a BF16 [T, H] tensor")
     if W.ndim != 2 or W.dtype != torch.bfloat16:
@@ -5438,7 +5435,6 @@ def prepare_lm_head_det_loss(
     need_dx: bool = True,
     need_dw: bool = True,
     grad_weight_dtype: torch.dtype = torch.bfloat16,
-    deterministic: bool = True,
     entry: str = "loss",
     dlogp: Optional[torch.Tensor] = None,
     workspace_buffer: Optional[torch.Tensor] = None,
@@ -5547,7 +5543,6 @@ def prepare_lm_head_det_loss(
         loss_weights=loss_weights,
         chunk_size=chunk_size,
         grad_weight_dtype=grad_weight_dtype,
-        deterministic=deterministic,
         entry=entry,
         geometry=geometry,
     )
@@ -5821,7 +5816,6 @@ def prepare_lm_head_det_loss_temperature(
     need_dx: bool = True,
     need_dw: bool = True,
     grad_weight_dtype: torch.dtype = torch.bfloat16,
-    deterministic: bool = True,
     entry: str = "loss",
     dlogp: Optional[torch.Tensor] = None,
     workspace_buffer: Optional[torch.Tensor] = None,
@@ -5931,7 +5925,6 @@ def prepare_lm_head_det_loss_temperature(
         loss_weights=loss_weights,
         chunk_size=chunk_size,
         grad_weight_dtype=grad_weight_dtype,
-        deterministic=deterministic,
         entry=entry,
         geometry=geometry,
     )
@@ -7454,7 +7447,6 @@ def forward_loss(
     need_dx: bool = True,
     need_dw: bool = True,
     grad_weight_dtype: torch.dtype = torch.bfloat16,
-    deterministic: bool = True,
     backend: str = "cake",
     compact_rows: Optional[bool] = None,
     fuse_dw_cast: Optional[bool] = None,
@@ -7503,7 +7495,6 @@ def forward_loss(
         loss_weights=loss_weights,
         chunk_size=chunk_size,
         grad_weight_dtype=grad_weight_dtype,
-        deterministic=deterministic,
         entry="loss",
     )
     stream_mode = dw_stream_mode(dw_stream)
@@ -7604,7 +7595,6 @@ def forward_loss(
         X,
         W,
         labels,
-        deterministic=deterministic,
         entry="loss",
         backend=backend,
         compact_rows=False if row_index is None else row_index,
@@ -7996,7 +7986,9 @@ def backward_loss(
     scale-cast-scatter of the compact rows (:func:`finalize_dx`); without it the compact rows are cast,
     then scattered into a zero BF16 ``[T, H]``.  Both give the same bits.  ``gemm_tuning`` (default
     :func:`gemm_tuning_default`; ``ForwardResult.gemm_tuning``): the forward's explicit GEMM knobs, which pin the
-    deferred weight-gradient GEMM's form (:func:`dw_cast`)."""
+    deferred weight-gradient GEMM's form (:func:`dw_cast`).  Pass only the accumulators of this package's
+    :func:`forward_loss`: raw FP32 accumulators carry no mode tag, so this function cannot refuse those of another
+    package (the non-deterministic package's included)."""
     dx = None
     if dx_acc is not None:
         if row_index is not None and num_rows is None:
@@ -8041,7 +8033,6 @@ def forward_logprob(
     labels: torch.Tensor,
     *,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
-    deterministic: bool = True,
     backend: str = "cake",
     compact_rows: Optional[bool] = None,
     hidden_count: Optional[bool] = None,
@@ -8062,7 +8053,6 @@ def forward_logprob(
         W,
         labels,
         chunk_size=chunk_size,
-        deterministic=deterministic,
         entry="logprob",
     )
     tuning = _resolve_gemm_tuning(gemm_tuning)
@@ -8130,7 +8120,6 @@ def forward_logprob(
         chunk_size=chunk_size,
         need_dx=False,
         need_dw=False,
-        deterministic=deterministic,
         entry="logprob",
         backend=backend,
         compact_rows=False if row_index is None else row_index,
@@ -8172,7 +8161,6 @@ def backward_logprob(
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     need_dx: bool = True,
     need_dw: bool = True,
-    deterministic: bool = True,
     backend: str = "cake",
     compact_rows: Optional[bool] = None,
     fuse_dw_cast: Optional[bool] = None,
@@ -8206,7 +8194,6 @@ def backward_logprob(
         W,
         labels,
         chunk_size=chunk_size,
-        deterministic=deterministic,
         entry="logprob",
     )
     stream_mode = dw_stream_mode(dw_stream)
@@ -8302,7 +8289,6 @@ def backward_logprob(
         chunk_size=chunk_size,
         need_dx=need_dx,
         need_dw=need_dw,
-        deterministic=deterministic,
         entry="logprob",
         dlogp=dlogp,
         lse=lse,
@@ -8336,7 +8322,6 @@ def forward_logprob_temperature(
     labels: torch.Tensor,
     *,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
-    deterministic: bool = True,
     backend: str = "cake",
     compact_rows: Optional[bool] = None,
     hidden_count: Optional[bool] = None,
@@ -8366,7 +8351,6 @@ def forward_logprob_temperature(
         W,
         labels,
         chunk_size=chunk_size,
-        deterministic=deterministic,
         entry="logprob",
     )
     tau = _resolve_temperature(
@@ -8472,7 +8456,6 @@ def forward_logprob_temperature(
         chunk_size=chunk_size,
         need_dx=False,
         need_dw=False,
-        deterministic=deterministic,
         entry="logprob",
         backend=backend,
         compact_rows=False if row_index is None else row_index,
@@ -8523,7 +8506,6 @@ def backward_logprob_temperature(
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     need_dx: bool = True,
     need_dw: bool = True,
-    deterministic: bool = True,
     backend: str = "cake",
     compact_rows: Optional[bool] = None,
     fuse_dw_cast: Optional[bool] = None,
@@ -8567,7 +8549,6 @@ def backward_logprob_temperature(
         W,
         labels,
         chunk_size=chunk_size,
-        deterministic=deterministic,
         entry="logprob",
     )
     if temperature_rows is not None and temperature is not None:
@@ -8709,7 +8690,6 @@ def backward_logprob_temperature(
         chunk_size=chunk_size,
         need_dx=need_dx,
         need_dw=need_dw,
-        deterministic=deterministic,
         entry="logprob",
         dlogp=dlogp,
         lse=lse,
@@ -8744,7 +8724,6 @@ def forward_logprob_keep(
     labels: torch.Tensor,
     *,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
-    deterministic: bool = True,
     backend: str = "cake",
     compact_rows: Optional[bool] = None,
     hidden_count: Optional[bool] = None,
@@ -8762,7 +8741,6 @@ def forward_logprob_keep(
         W,
         labels,
         chunk_size=chunk_size,
-        deterministic=deterministic,
         entry="logprob",
     )
     tuning = _resolve_gemm_tuning(gemm_tuning)
@@ -8826,7 +8804,6 @@ def forward_logprob_keep(
             chunk_size=chunk_size,
             need_dx=False,
             need_dw=False,
-            deterministic=deterministic,
             entry="logprob",
             backend=backend,
             compact_rows=False if row_index is None else row_index,
@@ -8863,7 +8840,6 @@ def backward_logprob_keep(
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     need_dx: bool = True,
     need_dw: bool = True,
-    deterministic: bool = True,
     backend: str = "cake",
     compact_rows: Optional[bool] = None,
     fuse_dw_cast: Optional[bool] = None,
@@ -8885,7 +8861,6 @@ def backward_logprob_keep(
         W,
         labels,
         chunk_size=chunk_size,
-        deterministic=deterministic,
         entry="logprob",
     )
     stream_mode = dw_stream_mode(dw_stream)
@@ -8948,7 +8923,6 @@ def backward_logprob_keep(
             chunk_size=chunk_size,
             need_dx=need_dx,
             need_dw=need_dw,
-            deterministic=deterministic,
             entry="logprob",
             dlogp=dlogp,
             lse=lse,
@@ -9421,7 +9395,6 @@ class ChunkedLmHeadDetLossFunction(torch.autograd.Function):
         chunk_size,
         return_logp,
         grad_weight_dtype,
-        deterministic,
         backend,
         compact_rows,
         fuse_dw_cast,
@@ -9451,7 +9424,6 @@ class ChunkedLmHeadDetLossFunction(torch.autograd.Function):
                         chunk_size,
                         return_logp,
                         grad_weight_dtype,
-                        deterministic,
                         backend,
                         compact_rows,
                         fuse_dw_cast,
@@ -9474,7 +9446,6 @@ class ChunkedLmHeadDetLossFunction(torch.autograd.Function):
                     loss_div=loss_div,
                     chunk_size=chunk_size,
                     grad_weight_dtype=grad_weight_dtype,
-                    deterministic=deterministic,
                     backend=backend,
                     compact_rows=compact_rows,
                     fuse_dw_cast=fuse_dw_cast,
@@ -9498,7 +9469,6 @@ class ChunkedLmHeadDetLossFunction(torch.autograd.Function):
             need_dx=need_dx,
             need_dw=need_dw,
             grad_weight_dtype=grad_weight_dtype,
-            deterministic=deterministic,
             backend=backend,
             compact_rows=compact_rows,
             fuse_dw_cast=fuse_dw_cast,
@@ -9537,7 +9507,7 @@ class ChunkedLmHeadDetLossFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_loss, grad_logp=None):
-        none = (None,) * 18
+        none = (None,) * 17
         if grad_loss is None:
             return none
         if ctx.split is not None:
@@ -9591,7 +9561,6 @@ class ChunkedLmHeadDetLogprobFunction(torch.autograd.Function):
         W,
         labels,
         chunk_size,
-        deterministic,
         backend,
         compact_rows,
         fuse_dw_cast,
@@ -9610,7 +9579,6 @@ class ChunkedLmHeadDetLogprobFunction(torch.autograd.Function):
                     W,
                     labels,
                     chunk_size,
-                    deterministic,
                     backend,
                     compact_rows,
                     fuse_dw_cast,
@@ -9635,7 +9603,6 @@ class ChunkedLmHeadDetLogprobFunction(torch.autograd.Function):
             W,
             labels,
             chunk_size=chunk_size,
-            deterministic=deterministic,
             backend=backend,
             compact_rows=compact,
             hidden_count=hidden,
@@ -9645,9 +9612,8 @@ class ChunkedLmHeadDetLogprobFunction(torch.autograd.Function):
         ctx.set_materialize_grads(False)
         # the valid-row index rides along: the backward plans its chunks without counting the rows again
         ctx.save_for_backward(X, W, labels, result.lse, result.row_index)
-        ctx.chunk_size, ctx.deterministic, ctx.backend, ctx.compact = (
+        ctx.chunk_size, ctx.backend, ctx.compact = (
             chunk_size,
-            deterministic,
             backend,
             compact,
         )
@@ -9662,7 +9628,7 @@ class ChunkedLmHeadDetLogprobFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dlogp):
         if dlogp is None:
-            return (None,) * 14
+            return (None,) * 13
         X, W, labels, lse, row_index = ctx.saved_tensors
         need_dx, need_dw = bool(ctx.needs_input_grad[0]), bool(ctx.needs_input_grad[1])
         dx, dw = backward_logprob(
@@ -9674,7 +9640,6 @@ class ChunkedLmHeadDetLogprobFunction(torch.autograd.Function):
             chunk_size=ctx.chunk_size,
             need_dx=need_dx,
             need_dw=need_dw,
-            deterministic=ctx.deterministic,
             backend=ctx.backend,
             compact_rows=ctx.compact,
             fuse_dw_cast=ctx.fuse_dw_cast,
@@ -9685,7 +9650,7 @@ class ChunkedLmHeadDetLogprobFunction(torch.autograd.Function):
             logprob_dz=ctx.logprob_dz,
             row_index=row_index,
         )
-        return (dx, dw) + (None,) * 12
+        return (dx, dw) + (None,) * 11
 
 
 class ChunkedLmHeadDetLogprobTemperatureFunction(torch.autograd.Function):
@@ -9698,7 +9663,6 @@ class ChunkedLmHeadDetLogprobTemperatureFunction(torch.autograd.Function):
         W,
         labels,
         chunk_size,
-        deterministic,
         backend,
         compact_rows,
         fuse_dw_cast,
@@ -9719,7 +9683,6 @@ class ChunkedLmHeadDetLogprobTemperatureFunction(torch.autograd.Function):
                     W,
                     labels,
                     chunk_size,
-                    deterministic,
                     backend,
                     compact_rows,
                     fuse_dw_cast,
@@ -9754,7 +9717,6 @@ class ChunkedLmHeadDetLogprobTemperatureFunction(torch.autograd.Function):
             W,
             labels,
             chunk_size=chunk_size,
-            deterministic=deterministic,
             backend=backend,
             compact_rows=compact,
             hidden_count=hidden,
@@ -9768,9 +9730,8 @@ class ChunkedLmHeadDetLogprobTemperatureFunction(torch.autograd.Function):
         ctx.save_for_backward(
             X, W, labels, result.lse, result.row_index, result.temperature_rows
         )
-        ctx.chunk_size, ctx.deterministic, ctx.backend, ctx.compact = (
+        ctx.chunk_size, ctx.backend, ctx.compact = (
             chunk_size,
-            deterministic,
             backend,
             compact,
         )
@@ -9785,7 +9746,7 @@ class ChunkedLmHeadDetLogprobTemperatureFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dlogp):
         if dlogp is None:
-            return (None,) * 16
+            return (None,) * 15
         X, W, labels, lse, row_index, tau_rows = ctx.saved_tensors
         need_dx, need_dw = bool(ctx.needs_input_grad[0]), bool(ctx.needs_input_grad[1])
         dx, dw = backward_logprob_temperature(
@@ -9797,7 +9758,6 @@ class ChunkedLmHeadDetLogprobTemperatureFunction(torch.autograd.Function):
             chunk_size=ctx.chunk_size,
             need_dx=need_dx,
             need_dw=need_dw,
-            deterministic=ctx.deterministic,
             backend=ctx.backend,
             compact_rows=ctx.compact,
             fuse_dw_cast=ctx.fuse_dw_cast,
@@ -9809,7 +9769,7 @@ class ChunkedLmHeadDetLogprobTemperatureFunction(torch.autograd.Function):
             row_index=row_index,
             temperature_rows=tau_rows,
         )
-        return (dx, dw) + (None,) * 14
+        return (dx, dw) + (None,) * 13
 
 
 class ChunkedLmHeadDetLogprobKeepFunction(torch.autograd.Function):
@@ -9823,7 +9783,6 @@ class ChunkedLmHeadDetLogprobKeepFunction(torch.autograd.Function):
         W,
         labels,
         chunk_size,
-        deterministic,
         compact_rows,
         fuse_dw_cast,
         dx_finalize,
@@ -9840,7 +9799,6 @@ class ChunkedLmHeadDetLogprobKeepFunction(torch.autograd.Function):
                     W,
                     labels,
                     chunk_size,
-                    deterministic,
                     compact_rows,
                     fuse_dw_cast,
                     dx_finalize,
@@ -9857,7 +9815,6 @@ class ChunkedLmHeadDetLogprobKeepFunction(torch.autograd.Function):
             W,
             labels,
             chunk_size=chunk_size,
-            deterministic=deterministic,
             compact_rows=compact,
             hidden_count=hidden,
             gemm_tuning=tuning,
@@ -9870,9 +9827,8 @@ class ChunkedLmHeadDetLogprobKeepFunction(torch.autograd.Function):
             X, W, labels, result.lse, result.row_index, *(result.logits or ())
         )
         ctx.kept = result.logits is not None
-        ctx.chunk_size, ctx.deterministic, ctx.compact = (
+        ctx.chunk_size, ctx.compact = (
             chunk_size,
-            deterministic,
             compact,
         )
         ctx.fuse_dw_cast = _resolve_fuse(fuse_dw_cast)
@@ -9886,14 +9842,13 @@ class ChunkedLmHeadDetLogprobKeepFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dlogp):
         if dlogp is None:
-            return (None,) * 12
+            return (None,) * 11
         need_dx, need_dw = bool(ctx.needs_input_grad[0]), bool(ctx.needs_input_grad[1])
         X, W, labels, lse, row_index, *kept = ctx.saved_tensors
         common = dict(
             chunk_size=ctx.chunk_size,
             need_dx=need_dx,
             need_dw=need_dw,
-            deterministic=ctx.deterministic,
             compact_rows=ctx.compact,
             fuse_dw_cast=ctx.fuse_dw_cast,
             dx_finalize=ctx.dx_finalize,
@@ -9917,7 +9872,7 @@ class ChunkedLmHeadDetLogprobKeepFunction(torch.autograd.Function):
                 logprob_dz=ctx.logprob_dz,
                 **common,
             )
-        return (dx, dw) + (None,) * 10
+        return (dx, dw) + (None,) * 9
 
 
 def chunked_lm_head_det_loss(
@@ -9932,7 +9887,6 @@ def chunked_lm_head_det_loss(
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     return_logp: bool = False,
     grad_weight_dtype: torch.dtype = torch.bfloat16,
-    deterministic: bool = True,
     backend: str = "cake",
     compact_rows: Optional[bool] = None,
     fuse_dw_cast: Optional[bool] = None,
@@ -10028,7 +9982,6 @@ def chunked_lm_head_det_loss(
             need_dx=False,
             need_dw=False,
             grad_weight_dtype=grad_weight_dtype,
-            deterministic=deterministic,
             backend=backend,
             compact_rows=compact_rows,
             fuse_dw_cast=fuse_dw_cast,
@@ -10049,7 +10002,6 @@ def chunked_lm_head_det_loss(
         int(chunk_size),
         bool(return_logp),
         grad_weight_dtype,
-        deterministic,
         backend,
         compact_rows,
         fuse_dw_cast,
@@ -10067,7 +10019,6 @@ def chunked_lm_head_det_logprob(
     labels: torch.Tensor,
     *,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
-    deterministic: bool = True,
     backend: str = "cake",
     compact_rows: Optional[bool] = None,
     fuse_dw_cast: Optional[bool] = None,
@@ -10093,7 +10044,6 @@ def chunked_lm_head_det_logprob(
         W,
         labels,
         int(chunk_size),
-        deterministic,
         backend,
         compact_rows,
         fuse_dw_cast,
@@ -10112,7 +10062,6 @@ def chunked_lm_head_det_logprob_temperature(
     labels: torch.Tensor,
     *,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
-    deterministic: bool = True,
     backend: str = "cake",
     compact_rows: Optional[bool] = None,
     fuse_dw_cast: Optional[bool] = None,
@@ -10156,7 +10105,6 @@ def chunked_lm_head_det_logprob_temperature(
             W,
             labels,
             int(chunk_size),
-            deterministic,
             backend,
             compact_rows,
             fuse_dw_cast,
@@ -10172,7 +10120,6 @@ def chunked_lm_head_det_logprob_temperature(
         W,
         labels,
         int(chunk_size),
-        deterministic,
         backend,
         compact_rows,
         fuse_dw_cast,
@@ -10193,7 +10140,6 @@ def chunked_lm_head_det_logprob_keep(
     labels: torch.Tensor,
     *,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
-    deterministic: bool = True,
     backend: str = "cake",
     compact_rows: Optional[bool] = None,
     fuse_dw_cast: Optional[bool] = None,
@@ -10224,7 +10170,6 @@ def chunked_lm_head_det_logprob_keep(
             W,
             labels,
             int(chunk_size),
-            deterministic,
             compact_rows,
             fuse_dw_cast,
             dx_finalize,
@@ -10238,7 +10183,6 @@ def chunked_lm_head_det_logprob_keep(
         W,
         labels,
         chunk_size=chunk_size,
-        deterministic=deterministic,
         backend=backend,
         compact_rows=compact_rows,
         fuse_dw_cast=fuse_dw_cast,

@@ -32,8 +32,9 @@ buffers, repeated forward and backward calls give bitwise-identical outputs and
 gradients (not promised across architectures, shapes or chunk plans).  The
 five names without `det` (`chunked_lm_head_loss`, `chunked_lm_head_logprob`,
 `chunked_lm_head_preload`, `chunked_lm_head_support_logprob` and
-`chunked_lm_head_support_kl`) are dispatchers, not aliases: their default
-`deterministic=True` runs these entries with the same arguments (see
+`chunked_lm_head_support_kl`) are the non-deterministic package's dispatchers,
+not aliases: they need `deterministic=False` and raise `ValueError` naming
+these entries otherwise.  These entries take no `deterministic` keyword (see
 `docs/training_backend_names.md`).
 
 * `X [T, H]` BF16 hidden states, row-major with any leading stride (`H` a
@@ -430,8 +431,11 @@ five names without `det` (`chunked_lm_head_loss`, `chunked_lm_head_logprob`,
   paths once and synchronizes.  It does not launch the package's kernels:
   under the driver's lazy module loading (`CUDA_MODULE_LOADING=LAZY`, the
   default) each kernel form still loads at its first launch.
-* `deterministic=True` only: fixed sequential chunk order, bitwise
-  reproducible `loss`, `logp`, `dX` and `dW` run to run.
+* The det name is the mode: fixed sequential chunk order, bitwise
+  reproducible `loss`, `logp`, `dX` and `dW` run to run.  No entry, function
+  or autograd `Function` of this package takes a `deterministic` keyword
+  (passing one is a `TypeError`), and torch's deterministic mode
+  (`torch.use_deterministic_algorithms`) changes nothing.
 
 Explicit forward / backward entry points without autograd (`forward_loss`,
 `backward_loss`, `forward_logprob`, `backward_logprob`), a prepared

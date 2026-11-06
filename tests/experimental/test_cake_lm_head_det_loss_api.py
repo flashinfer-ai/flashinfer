@@ -102,8 +102,8 @@ def test_public_api_is_marked_experimental():
 
 
 # The names before the deterministic (``det``) naming that the deterministic modules no longer define (no
-# aliases), by module.  The det-free public names are the dispatchers of ``flashinfer.chunked_lm_head``
-# (tests/experimental/test_cake_lm_head_loss_api.py checks the dispatch).
+# aliases), by module.  The det-free public names are the non-deterministic package's dispatchers in
+# ``flashinfer.chunked_lm_head`` (tests/experimental/test_cake_lm_head_loss_api.py checks the dispatch).
 REMOVED_NAMES = {
     "cake_backend": (
         "chunked_lm_head_loss",
@@ -396,126 +396,6 @@ def test_public_api_temperature_refuses_keep_logits(monkeypatch):
                 memory_mode="keep_logits",
                 temperature=temperature,
             )
-
-
-def test_public_api_temperature_with_deterministic_false(monkeypatch):
-    """The det-free entries with ``deterministic=False``: ``chunked_lm_head_logprob`` passes a temperature other than
-    ``None`` or a scalar whose FP32 value is 1.0 to the non-deterministic package's temperature entry (the opt-in
-    module's with ``memory_mode`` or ``num_valid_rows``) unchanged, and refuses a ``bool`` with ``ValueError`` before
-    either package is reached; ``None`` and those scalars run the package's call without a temperature.  Under
-    torch's deterministic algorithms the call runs the deterministic entry, which gets the temperature.
-    ``chunked_lm_head_preload(temperature=True)`` passes the flag to the non-deterministic package's preload.
-    ``deterministic=True`` (the default) with a temperature still calls the deterministic entry, with the same
-    temperature object, and never the non-deterministic package."""
-    _clear(monkeypatch)
-    nd_calls, det_calls = [], []
-
-    class _Package:
-        def __getattr__(self, name):
-            if name.startswith("__"):
-                raise AttributeError(name)
-            return lambda *a, **k: nd_calls.append((name, a, k)) or name
-
-    def _det(name):
-        return lambda *a, **k: det_calls.append((name, a, k)) or "det"
-
-    monkeypatch.setattr(public, "_nd_backend", lambda: _Package())
-    monkeypatch.setattr(public, "_nd_backend_opt_in", lambda: _Package())
-    monkeypatch.setattr(public, "_det_logprob", _det("logprob"))
-    monkeypatch.setattr(public, "_det_preload", _det("preload"))
-    monkeypatch.setattr(public, "_DET_FALLBACK_WARNED", set())
-    X, W, labels = _host_call()
-    tau = torch.full((X.shape[0],), 0.7)
-    for temperature in (0.7, 2, 1.0 + 1e-6, tau, torch.tensor(1.0)):
-        for opt_in in ({}, {"memory_mode": "budget"}):
-            got = public.chunked_lm_head_logprob(
-                X,
-                W,
-                labels,
-                deterministic=False,
-                temperature=temperature,
-                check_temperature=True,
-                **opt_in,
-            )
-            assert got == "chunked_lm_head_logprob_temperature"
-            ((_, args, kw),) = nd_calls
-            nd_calls.clear()
-            assert args == (X, W, labels) and kw["deterministic"] is False
-            assert kw["temperature"] is temperature and kw["check_temperature"] is True
-            assert kw.get("memory_mode") == opt_in.get("memory_mode")
-    with pytest.raises(ValueError, match="not a bool"):
-        public.chunked_lm_head_logprob(
-            X, W, labels, deterministic=False, temperature=True
-        )
-    public.chunked_lm_head_preload("cuda:0", deterministic=False, temperature=True)
-    assert nd_calls == [("preload", ("cuda:0",), {"temperature": True})]
-    nd_calls.clear()
-    assert not det_calls
-    # deterministic=True (default) with a temperature: the deterministic entry, the same temperature object
-    got = public.chunked_lm_head_logprob(
-        X, W, labels, temperature=tau, check_temperature=True
-    )
-    assert got == "det"
-    ((name, args, kw),) = det_calls
-    det_calls.clear()
-    assert name == "logprob" and args == (X, W, labels)
-    assert kw["temperature"] is tau and kw["check_temperature"] is True
-    assert sorted(kw) == ["check_temperature", "temperature"]
-    assert not nd_calls
-    # None and the scalars whose FP32 value is 1.0 are the call without a temperature
-    for temperature in (None, 1.0, 1, 1.0 + 1e-9):
-        got = public.chunked_lm_head_logprob(
-            X,
-            W,
-            labels,
-            deterministic=False,
-            temperature=temperature,
-            check_temperature=True,
-        )
-        assert got == "chunked_lm_head_logprob"
-        ((_, args, kw),) = nd_calls
-        nd_calls.clear()
-        assert args == (X, W, labels) and kw["deterministic"] is False
-        assert "temperature" not in kw and "check_temperature" not in kw
-    public.chunked_lm_head_preload("cuda:0", deterministic=False)
-    assert nd_calls == [("preload", ("cuda:0",), {})]
-    nd_calls.clear()
-    assert not det_calls
-    # deterministic=True: the deterministic preload, with the temperature libraries only when asked
-    public.chunked_lm_head_preload("cuda:0")
-    public.chunked_lm_head_preload("cuda:0", temperature=True)
-    assert det_calls == [
-        ("preload", ("cuda:0",), {}),
-        ("preload", ("cuda:0",), {"temperature": True}),
-    ]
-    det_calls.clear()
-    # torch's deterministic algorithms: the deterministic entry serves the temperature
-    was, was_warn = (
-        torch.are_deterministic_algorithms_enabled(),
-        torch.is_deterministic_algorithms_warn_only_enabled(),
-    )
-    torch.use_deterministic_algorithms(True)
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            public.chunked_lm_head_logprob(
-                X,
-                W,
-                labels,
-                deterministic=False,
-                temperature=tau,
-                check_temperature=True,
-            )
-            public.chunked_lm_head_preload(
-                "cuda:0", deterministic=False, temperature=True
-            )
-    finally:
-        torch.use_deterministic_algorithms(was, warn_only=was_warn)
-    (logprob, preload) = det_calls
-    assert logprob[0] == "logprob" and logprob[1] == (X, W, labels)
-    assert logprob[2]["temperature"] is tau and logprob[2]["check_temperature"] is True
-    assert preload == ("preload", ("cuda:0",), {"temperature": True})
-    assert not nd_calls
 
 
 def test_compact_rows_default_env(monkeypatch):

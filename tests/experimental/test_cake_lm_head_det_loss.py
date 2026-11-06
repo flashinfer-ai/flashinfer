@@ -867,11 +867,6 @@ def _cuda_scalar():
         ),
         (lambda kw: dict(kw, objective="other"), ValueError, "objective"),
         (lambda kw: dict(kw, entry="logprob"), ValueError, "objective arguments"),
-        (
-            lambda kw: dict(kw, deterministic=False),
-            NotImplementedError,
-            "deterministic",
-        ),
     ],
     ids=[
         "x_fp32",
@@ -896,7 +891,6 @@ def _cuda_scalar():
         "policy_with_loss_div",
         "unknown_objective",
         "logprob_with_objective_args",
-        "nondeterministic",
     ],
 )
 def test_validate_rejects(mutate, exc, match):

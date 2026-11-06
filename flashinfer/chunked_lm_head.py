@@ -19,7 +19,6 @@ import inspect
 import json
 import os
 import struct
-import warnings
 from types import ModuleType
 from typing import Any, Dict, NoReturn, Optional, Union
 
@@ -32,9 +31,13 @@ from .api_logging import flashinfer_experimental_api
 # registration live in flashinfer.experimental.cake_lm_head_det_loss (the
 # deterministic package, entries ``chunked_lm_head_det_*``) and
 # flashinfer.experimental.cake.cake_lm_head_loss (the non-deterministic
-# package).  The det-free entries ``chunked_lm_head_{loss,logprob,preload,
-# support_logprob,support_kl}`` take ``deterministic: bool = True`` and
-# dispatch (see the section above them at the end of this module).
+# package).  The ``chunked_lm_head_det_*`` entries are the deterministic
+# package's and take no ``deterministic`` keyword.  The det-free entries
+# ``chunked_lm_head_{loss,logprob,preload,support_logprob,support_kl}`` run the
+# non-deterministic package only: they need ``deterministic=False``, and any
+# other value, the default included, is a ``ValueError`` naming the
+# ``chunked_lm_head_det_*`` entry (see the section above them at the end of
+# this module).
 #
 # The package backend takes every switch as a keyword argument and reads no
 # environment variable.  The FLASHINFER_CAKE_LM_HEAD_LOSS_* variables below
@@ -209,7 +212,6 @@ def chunked_lm_head_det_loss(
     chunk_size: int = 4096,
     return_logp: bool = False,
     grad_weight_dtype: torch.dtype = torch.bfloat16,
-    deterministic: bool = True,
     backend: str = "cake",
     compact_rows: Optional[bool] = None,
     fuse_dw_cast: Optional[bool] = None,
@@ -272,9 +274,6 @@ def chunked_lm_head_det_loss(
         value must equal ``W.dtype`` (the autograd engine casts every gradient
         to its leaf's dtype); an FP32 ``dW`` for a BF16 ``W`` is available from
         the explicit ``cake_backend.forward_loss`` / ``backward_loss`` pair.
-    deterministic : bool
-        Only ``True`` is available: fixed sequential chunk order, no atomics,
-        bitwise reproducible ``loss``, ``logp``, ``dX`` and ``dW``.
     backend : str
         Only ``"cake"``.
     compact_rows : bool, optional
@@ -377,6 +376,12 @@ def chunked_lm_head_det_loss(
 
     Notes
     -----
+    Fixed sequential chunk order, no atomics: ``loss``, ``logp``, ``dX`` and
+    ``dW`` are bitwise reproducible run to run.  The det name is the mode, so
+    there is no ``deterministic`` keyword (passing one is a ``TypeError``);
+    torch's deterministic mode (``torch.use_deterministic_algorithms``)
+    changes nothing.
+
     Precision boundary: BF16 GEMM output promoted to FP32 for the max /
     log-sum-exp / loss arithmetic, BF16 ``dlogits``, FP32 ``dW`` accumulation
     with one cast at the output, BF16 ``dX`` (FP32 accumulation, one cast).
@@ -443,7 +448,6 @@ def chunked_lm_head_det_loss(
             chunk_size=chunk_size,
             return_logp=return_logp,
             grad_weight_dtype=grad_weight_dtype,
-            deterministic=deterministic,
             backend="cake",
             **_resolve_knobs(
                 compact_rows=compact_rows,
@@ -468,7 +472,6 @@ def chunked_lm_head_det_loss(
         chunk_size=chunk_size,
         return_logp=return_logp,
         grad_weight_dtype=grad_weight_dtype,
-        deterministic=deterministic,
         backend="cake",
         **_resolve_knobs(
             compact_rows=compact_rows,
@@ -487,7 +490,6 @@ def _chunked_lm_head_det_logprob_temperature(
     labels: torch.Tensor,
     *,
     chunk_size: int = 4096,
-    deterministic: bool = True,
     backend: str = "cake",
     compact_rows: Optional[bool] = None,
     fuse_dw_cast: Optional[bool] = None,
@@ -515,7 +517,6 @@ def _chunked_lm_head_det_logprob_temperature(
             W,
             labels,
             chunk_size=chunk_size,
-            deterministic=deterministic,
             backend="cake",
             **_resolve_knobs(
                 compact_rows=compact_rows,
@@ -536,7 +537,6 @@ def _chunked_lm_head_det_logprob_temperature(
         W,
         labels,
         chunk_size=chunk_size,
-        deterministic=deterministic,
         backend="cake",
         **_resolve_knobs(
             compact_rows=compact_rows,
@@ -558,7 +558,6 @@ def chunked_lm_head_det_logprob(
     labels: torch.Tensor,
     *,
     chunk_size: int = 4096,
-    deterministic: bool = True,
     backend: str = "cake",
     compact_rows: Optional[bool] = None,
     fuse_dw_cast: Optional[bool] = None,
@@ -600,7 +599,10 @@ def chunked_lm_head_det_logprob(
     recomputing the logits (three GEMMs per chunk instead of four; a second
     backward through a retained graph recomputes); where none can follow
     (``torch.no_grad``, ``torch.inference_mode``, frozen inputs) the call is
-    the default one.  Bitwise the same ``logp``, ``dX`` and ``dW``.
+    the default one.  Bitwise the same ``logp``, ``dX`` and ``dW``.  As for
+    :func:`chunked_lm_head_det_loss`, the det name is the mode: there is no
+    ``deterministic`` keyword (``TypeError``) and torch's deterministic mode
+    changes nothing.
 
     ``temperature`` (default ``None``, the same as ``1.0``: no temperature)
     is a positive Python number or a float32 ``[T]`` tensor on ``X``'s device
@@ -631,7 +633,6 @@ def chunked_lm_head_det_logprob(
             W,
             labels,
             chunk_size=chunk_size,
-            deterministic=deterministic,
             backend=backend,
             compact_rows=compact_rows,
             fuse_dw_cast=fuse_dw_cast,
@@ -657,7 +658,6 @@ def chunked_lm_head_det_logprob(
             W,
             labels,
             chunk_size=chunk_size,
-            deterministic=deterministic,
             backend="cake",
             **_resolve_knobs(
                 compact_rows=compact_rows,
@@ -676,7 +676,6 @@ def chunked_lm_head_det_logprob(
         W,
         labels,
         chunk_size=chunk_size,
-        deterministic=deterministic,
         backend="cake",
         **_resolve_knobs(
             compact_rows=compact_rows,
@@ -827,84 +826,37 @@ _BINDING_CACHE_SETTINGS: Dict[str, Any] = _binding_cache_settings()
 
 
 # ---------------------------------------------------------------------------
-# The det-free entries: ``deterministic`` selects the package.
+# The det-free entries: the non-deterministic package only.
 #
-# ``deterministic=True`` (the default) calls the deterministic entry's body
-# directly with the caller's own positional and keyword arguments (the body is
-# the function below the deterministic entry's experimental wrapper, whose
-# once-only warning this entry's own wrapper gives): no keyword is re-bound or
-# re-packed, no allocation, no synchronization -- one identity test of host
-# work.  Each entry's signature (``__signature__``) is the deterministic
-# entry's, plus ``deterministic`` where that one has none.  ``deterministic=
-# False`` runs the non-deterministic package,
-# flashinfer.experimental.cake.cake_lm_head_loss, under the same argument
-# checks and the same FLASHINFER_CAKE_LM_HEAD_LOSS_* fallbacks; while torch's
-# deterministic algorithms are enabled (``torch.use_deterministic_algorithms(
-# True)``, also with ``warn_only``) it runs the deterministic entry instead and
-# warns once per entry point (an explicit dX ``k_slices`` pin above the
-# deterministic entry's four slices is then dropped, with one more warning).
-# Any other value is a ``TypeError``.
+# ``chunked_lm_head_{loss,logprob,preload,support_logprob,support_kl}`` run
+# the non-deterministic package, flashinfer.experimental.cake.cake_lm_head_loss,
+# and need ``deterministic=False``.  Any other value, the default ``True``
+# included, raises ``ValueError`` naming the deterministic entry to call
+# instead (``chunked_lm_head_det_<same suffix>``), before any package import or
+# torch query.  ``deterministic=False`` runs that package under the same
+# argument checks and the same FLASHINFER_CAKE_LM_HEAD_LOSS_* fallbacks, also
+# while torch's deterministic algorithms are enabled
+# (``torch.use_deterministic_algorithms(True)``, also with ``warn_only``): the
+# only alert is PyTorch's, raised by that package before a K-sliced dX launch
+# (docs/training_backend_names.md); there is no fallback to the deterministic
+# entry, every knob (a dX ``k_slices`` pin included) reaches the package
+# unchanged and these entries warn nothing themselves.  Each entry's
+# signature (``__signature__``) is its mode-free helper's below plus the
+# keyword-only ``deterministic: bool = True``.
 # ---------------------------------------------------------------------------
 
-_det_loss = chunked_lm_head_det_loss.__wrapped__
-_det_logprob = chunked_lm_head_det_logprob.__wrapped__
-_det_preload = chunked_lm_head_det_preload.__wrapped__
-_det_support_logprob = chunked_lm_head_det_support_logprob.__wrapped__
-_det_support_kl = chunked_lm_head_det_support_kl.__wrapped__
 
-# The entry points that already warned that torch's deterministic mode ran the
-# deterministic implementation for ``deterministic=False``.
-_DET_FALLBACK_WARNED: set = set()
-# The entry points that already warned that the deterministic fallback dropped
-# a dX ``k_slices`` pin it does not serve.
-_DET_FALLBACK_PIN_WARNED: set = set()
-# The dX slice counts the deterministic entries serve (the non-deterministic
-# package's reduction serves more).
-_DET_DX_K_SLICES_MAX = 4
-
-# The flashinfer package directory: frames below it are the entries, their
-# decorators and the packages.
-_PACKAGE_ROOT = os.path.dirname(os.path.abspath(__file__))
-
-
-def _caller_stacklevel() -> int:
-    """The ``stacklevel`` of the nearest frame outside the flashinfer package,
-    for a warning issued by the function that calls this one (the decorators
-    between the caller and the entry vary with the API logging level, so a
-    fixed ``stacklevel`` could name a frame of flashinfer)."""
-    frame = inspect.currentframe()
-    level = 0
-    while frame is not None:
-        parent = frame.f_back
-        level += 1
-        if parent is not None and not os.path.abspath(
-            parent.f_code.co_filename
-        ).startswith(_PACKAGE_ROOT + os.sep):
-            return level
-        frame = parent
-    return 3
-
-
-def _runs_det(deterministic: object, entry: str) -> bool:
-    """Whether a call whose ``deterministic`` is not ``True`` runs the
-    deterministic entry: ``False`` -> ``torch.are_deterministic_algorithms_enabled()``
-    (warning once per entry point when it is); any non-bool is a ``TypeError``."""
+def _require_nd(deterministic: object, entry: str, det_entry: str) -> None:
+    """Refuse every ``deterministic`` but ``False`` for the det-free ``entry``,
+    naming ``det_entry``, the deterministic entry to call instead."""
     if deterministic is not False:
-        raise TypeError(
-            f"{entry}: deterministic must be a bool, got {type(deterministic).__name__}"
+        raise ValueError(
+            f"{entry}() runs the non-deterministic package "
+            "flashinfer.experimental.cake.cake_lm_head_loss only; pass "
+            "deterministic=False for the non-deterministic path (got "
+            f"deterministic={deterministic!r}); the deterministic entry is "
+            f"flashinfer.chunked_lm_head.{det_entry}"
         )
-    if not torch.are_deterministic_algorithms_enabled():
-        return False
-    if entry not in _DET_FALLBACK_WARNED:
-        _DET_FALLBACK_WARNED.add(entry)
-        warnings.warn(
-            f"{entry}(deterministic=False) runs the deterministic implementation "
-            f"(chunked_lm_head_det_*) because torch.use_deterministic_algorithms(True) "
-            "is in effect",
-            UserWarning,
-            stacklevel=_caller_stacklevel(),
-        )
-    return True
 
 
 def _raise_named(exc: TypeError, inner: Any, entry: str) -> NoReturn:
@@ -918,40 +870,6 @@ def _raise_named(exc: TypeError, inner: Any, entry: str) -> NoReturn:
     if tb is None or tb.tb_next is not None or not message.startswith(prefix):
         raise exc
     raise TypeError(f"{entry}() {message[len(prefix) :]}") from None
-
-
-def _det_fallback_kwargs(entry: str, kwargs: Dict[str, Any]) -> Dict[str, Any]:
-    """The keyword arguments of a ``deterministic=False`` call that runs the
-    deterministic entry (:func:`_runs_det`): an explicit dX ``k_slices`` pin
-    above :data:`_DET_DX_K_SLICES_MAX` (the non-deterministic package serves
-    more; given as ``gemm_tuning`` or through ``FLASHINFER_CAKE_LM_HEAD_LOSS_
-    GEMM_TUNING``) is dropped -- that GEMM then takes the deterministic
-    entry's own slice rule -- with one warning per entry point; any other
-    knob, and any other value of the pin, is passed on unchanged."""
-    tuning = _env_gemm_tuning(kwargs.get("gemm_tuning"))
-    dx = (tuning or {}).get("dx")
-    k = dx.get("k_slices") if isinstance(dx, dict) else None
-    if (
-        not isinstance(k, int)
-        or isinstance(k, bool)
-        or k <= _DET_DX_K_SLICES_MAX
-        or tuning is None
-    ):
-        return kwargs
-    rest = {op: knobs for op, knobs in tuning.items() if op != "dx"}
-    kept = {name: value for name, value in dx.items() if name != "k_slices"}
-    if kept:
-        rest["dx"] = kept
-    if entry not in _DET_FALLBACK_PIN_WARNED:
-        _DET_FALLBACK_PIN_WARNED.add(entry)
-        warnings.warn(
-            f"{entry}(deterministic=False) under torch.use_deterministic_algorithms(True): "
-            f"the deterministic implementation serves 1 .. {_DET_DX_K_SLICES_MAX} dX K slices, "
-            f"so gemm_tuning dx k_slices={k} is dropped (its own slice rule applies)",
-            UserWarning,
-            stacklevel=_caller_stacklevel(),
-        )
-    return dict(kwargs, gemm_tuning=rest)
 
 
 @functools.cache
@@ -994,18 +912,16 @@ def _no_temperature(temperature: object) -> bool:
         return False
 
 
-def _with_mode(det_fn, *, before: str) -> inspect.Signature:
-    """``det_fn``'s signature with the keyword-only ``deterministic: bool = True``
-    inserted before the parameter ``before`` (the entries whose deterministic
-    form has no mode keyword)."""
-    params = list(inspect.signature(det_fn).parameters.values())
+def _with_mode(fn, *, before: str) -> inspect.Signature:
+    """``fn``'s signature with the keyword-only ``deterministic: bool = True``
+    inserted before the parameter ``before``: the displayed signature of a
+    det-free entry, formed from its mode-free helper ``fn``."""
+    params = list(inspect.signature(fn).parameters.values())
     at = [p.name for p in params].index(before)
     mode = inspect.Parameter(
         "deterministic", inspect.Parameter.KEYWORD_ONLY, default=True, annotation=bool
     )
-    return inspect.signature(det_fn).replace(
-        parameters=params[:at] + [mode] + params[at:]
-    )
+    return inspect.signature(fn).replace(parameters=params[:at] + [mode] + params[at:])
 
 
 def _nd_loss(
@@ -1013,7 +929,6 @@ def _nd_loss(
     W: torch.Tensor,
     labels: torch.Tensor,
     *,
-    deterministic: object,
     objective: str = "ce",
     loss_div: Optional[float] = None,
     infer_logp: Optional[torch.Tensor] = None,
@@ -1032,30 +947,7 @@ def _nd_loss(
     num_valid_rows: Optional[int] = None,
     check_num_valid_rows: bool = False,
 ):
-    """:func:`chunked_lm_head_loss` for ``deterministic`` other than ``True``."""
-    if _runs_det(deterministic, "chunked_lm_head_loss"):
-        kwargs = dict(
-            objective=objective,
-            loss_div=loss_div,
-            infer_logp=infer_logp,
-            loss_weights=loss_weights,
-            chunk_size=chunk_size,
-            return_logp=return_logp,
-            grad_weight_dtype=grad_weight_dtype,
-            backend=backend,
-            compact_rows=compact_rows,
-            fuse_dw_cast=fuse_dw_cast,
-            dx_finalize=dx_finalize,
-            dw_stream=dw_stream,
-            hidden_count=hidden_count,
-            gemm_tuning=gemm_tuning,
-            memory_mode=memory_mode,
-            num_valid_rows=num_valid_rows,
-            check_num_valid_rows=check_num_valid_rows,
-        )
-        return _det_loss(
-            X, W, labels, **_det_fallback_kwargs("chunked_lm_head_loss", kwargs)
-        )
+    """The body of :func:`chunked_lm_head_loss` after its mode check."""
     if backend != "cake":
         raise ValueError(
             "the chunked LM-head + loss kernels currently support backend='cake'"
@@ -1108,20 +1000,18 @@ def _nd_loss(
 
 @flashinfer_experimental_api(feature=_FEATURE)
 def chunked_lm_head_loss(*args: Any, deterministic: bool = True, **kwargs: Any):
-    r"""Differentiable chunked LM-head projection + loss with a selectable
-    numerical mode, SM100 / SM103 / SM107 only.
+    r"""Differentiable chunked LM-head projection + loss through the
+    non-deterministic package, SM100 / SM103 / SM107 only.
 
     The computation, the arguments and the outputs are those of
     :func:`chunked_lm_head_det_loss` (each switch keyword left at ``None``
-    reads the same ``FLASHINFER_CAKE_LM_HEAD_LOSS_*`` variable in both modes).
+    reads the same ``FLASHINFER_CAKE_LM_HEAD_LOSS_*`` variable).
 
     Parameters
     ----------
     deterministic : bool
-        ``True`` (default): :func:`chunked_lm_head_det_loss` with the same
-        arguments, passed on as given -- the same outputs bit for bit, with no
-        added allocation or synchronization.  ``False``: the non-deterministic
-        package (``flashinfer.experimental.cake.cake_lm_head_loss``): the same
+        Only ``False`` is accepted: the non-deterministic package
+        (``flashinfer.experimental.cake.cake_lm_head_loss``): the same
         precision boundaries (BF16 logits and ``dlogits``, FP32 loss
         arithmetic, FP32 ``dX`` / ``dW`` accumulation, one final cast each),
         with each K slice of a sliced dX GEMM added straight into the FP32
@@ -1133,26 +1023,27 @@ def chunked_lm_head_loss(*args: Any, deterministic: bool = True, **kwargs: Any):
         (``cake_backend.set_gradient_placement`` of
         ``flashinfer.experimental.cake.cake_lm_head_loss``, default
         ``"auto"``, the deterministic backend's rule).
-        While ``torch.use_deterministic_algorithms(True)`` is in effect,
-        ``deterministic=False`` runs the deterministic entry and warns once
-        (a dX ``k_slices`` pin above its four slices is dropped, with one
-        warning).  A value that is not a ``bool`` is a ``TypeError``.
+        Any other value, the default ``True`` included, raises ``ValueError``
+        naming :func:`chunked_lm_head_det_loss`, the deterministic entry to
+        call instead (it takes no ``deterministic`` keyword).  While
+        ``torch.use_deterministic_algorithms(True)`` is in effect the call
+        still runs the non-deterministic package: PyTorch's alert is raised
+        by that package before a K-sliced dX launch (``RuntimeError``; with
+        ``warn_only=True`` a ``UserWarning``, then the call runs); there is
+        no fallback to the deterministic entry, and every knob reaches the
+        package unchanged.
 
     Every other parameter, the return value and the notes: see
     :func:`chunked_lm_head_det_loss`.
     """
-    if deterministic is True:
-        try:
-            return _det_loss(*args, **kwargs)
-        except TypeError as exc:
-            _raise_named(exc, _det_loss, "chunked_lm_head_loss")
+    _require_nd(deterministic, "chunked_lm_head_loss", "chunked_lm_head_det_loss")
     try:
-        return _nd_loss(*args, deterministic=deterministic, **kwargs)
+        return _nd_loss(*args, **kwargs)
     except TypeError as exc:
         _raise_named(exc, _nd_loss, "chunked_lm_head_loss")
 
 
-chunked_lm_head_loss.__wrapped__.__signature__ = inspect.signature(_det_loss)
+chunked_lm_head_loss.__wrapped__.__signature__ = _with_mode(_nd_loss, before="backend")
 
 
 def _nd_logprob(
@@ -1160,7 +1051,6 @@ def _nd_logprob(
     W: torch.Tensor,
     labels: torch.Tensor,
     *,
-    deterministic: object,
     chunk_size: int = 4096,
     backend: str = "cake",
     compact_rows: Optional[bool] = None,
@@ -1175,26 +1065,7 @@ def _nd_logprob(
     temperature: Union[None, float, torch.Tensor] = None,
     check_temperature: bool = False,
 ) -> torch.Tensor:
-    """:func:`chunked_lm_head_logprob` for ``deterministic`` other than ``True``."""
-    if _runs_det(deterministic, "chunked_lm_head_logprob"):
-        kwargs = dict(
-            chunk_size=chunk_size,
-            backend=backend,
-            compact_rows=compact_rows,
-            fuse_dw_cast=fuse_dw_cast,
-            dx_finalize=dx_finalize,
-            dw_stream=dw_stream,
-            hidden_count=hidden_count,
-            gemm_tuning=gemm_tuning,
-            memory_mode=memory_mode,
-            num_valid_rows=num_valid_rows,
-            check_num_valid_rows=check_num_valid_rows,
-            temperature=temperature,
-            check_temperature=check_temperature,
-        )
-        return _det_logprob(
-            X, W, labels, **_det_fallback_kwargs("chunked_lm_head_logprob", kwargs)
-        )
+    """The body of :func:`chunked_lm_head_logprob` after its mode check."""
     if backend != "cake":
         raise ValueError(
             "the chunked LM-head + loss kernels currently support backend='cake'"
@@ -1270,38 +1141,38 @@ def _nd_logprob(
 def chunked_lm_head_logprob(
     *args: Any, deterministic: bool = True, **kwargs: Any
 ) -> torch.Tensor:
-    r"""Differentiable chunked selected-token log-probability with a selectable
-    numerical mode, SM100 / SM103 / SM107 only.
+    r"""Differentiable chunked selected-token log-probability through the
+    non-deterministic package, SM100 / SM103 / SM107 only.
 
     The computation and the arguments are those of
-    :func:`chunked_lm_head_det_logprob`.  ``deterministic=True`` (default):
-    that entry with the same arguments, passed on as given (the same bits, no
-    added allocation or synchronization); ``deterministic=False``: the
-    non-deterministic package (``flashinfer.experimental.cake.cake_lm_head_loss``),
-    whose backward adds each K slice of a sliced dX GEMM into the FP32 ``dX``
-    accumulator by an unordered FP32 reduction (``logp`` keeps its fixed
-    order); under ``torch.use_deterministic_algorithms(True)`` it runs the
-    deterministic entry and warns once (a dX ``k_slices`` pin above its four
-    slices is dropped, with one warning).  A value that is not a ``bool`` is a
-    ``TypeError``.  ``temperature`` / ``check_temperature`` reach either
-    package: the non-deterministic one runs the same temperature forms
-    (``logp`` the deterministic entry's bits, ``dW`` too when no valid row has
-    a zero ``dlogp``; ``dX`` the same products, a sliced chunk's in the
-    unordered reduction) and its zero-gradient row skip runs the dX / dW
-    GEMMs of the rows with a nonzero ``dlogp`` only, with a temperature too.
+    :func:`chunked_lm_head_det_logprob`.  ``deterministic=False`` (the only
+    accepted value): the non-deterministic package
+    (``flashinfer.experimental.cake.cake_lm_head_loss``), whose backward adds
+    each K slice of a sliced dX GEMM into the FP32 ``dX`` accumulator by an
+    unordered FP32 reduction (``logp`` keeps its fixed order).  Any other
+    value, the default ``True`` included, raises ``ValueError`` naming
+    :func:`chunked_lm_head_det_logprob`, the deterministic entry to call
+    instead.  Under ``torch.use_deterministic_algorithms(True)`` the call
+    still runs the non-deterministic package: PyTorch's alert is raised by
+    that package before a K-sliced dX launch; there is no fallback to the
+    deterministic entry.
+    ``temperature`` / ``check_temperature``: the non-deterministic package
+    runs the same temperature forms (``logp`` the deterministic entry's bits,
+    ``dW`` too when no valid row has a zero ``dlogp``; ``dX`` the same
+    products, a sliced chunk's in the unordered reduction) and its
+    zero-gradient row skip runs the dX / dW GEMMs of the rows with a nonzero
+    ``dlogp`` only, with a temperature too.
     """
-    if deterministic is True:
-        try:
-            return _det_logprob(*args, **kwargs)
-        except TypeError as exc:
-            _raise_named(exc, _det_logprob, "chunked_lm_head_logprob")
+    _require_nd(deterministic, "chunked_lm_head_logprob", "chunked_lm_head_det_logprob")
     try:
-        return _nd_logprob(*args, deterministic=deterministic, **kwargs)
+        return _nd_logprob(*args, **kwargs)
     except TypeError as exc:
         _raise_named(exc, _nd_logprob, "chunked_lm_head_logprob")
 
 
-chunked_lm_head_logprob.__wrapped__.__signature__ = inspect.signature(_det_logprob)
+chunked_lm_head_logprob.__wrapped__.__signature__ = _with_mode(
+    _nd_logprob, before="backend"
+)
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
@@ -1314,23 +1185,18 @@ def chunked_lm_head_preload(
     r"""Do part of the one-time work of a process's first chunked LM-head call
     ahead of it, then wait for the device once (SM100 / SM103 / SM107 only).
 
-    ``deterministic=True`` (default): :func:`chunked_lm_head_det_preload`
-    (the deterministic package's libraries and per-device state);
-    ``deterministic=False``: the same for the non-deterministic package
-    (``flashinfer.experimental.cake.cake_lm_head_loss``), or the deterministic
-    package's while ``torch.use_deterministic_algorithms(True)`` is in effect
-    (the package a ``deterministic=False`` call then runs; one warning).  The
-    per-thread state (side streams, events, count cells) is the calling
-    thread's: another thread forms its own at its first call.  A value that is
-    not a ``bool`` is a ``TypeError``.  ``temperature=True`` also loads the
-    package's temperature libraries and launches its temperature path's
-    PyTorch operators once (:func:`chunked_lm_head_det_preload`; the same for
-    the non-deterministic package).
+    ``deterministic=False`` (the only accepted value): the work of
+    :func:`chunked_lm_head_det_preload` for the non-deterministic package
+    (``flashinfer.experimental.cake.cake_lm_head_loss``), whose libraries and
+    per-device state the other det-free entries use.  Any other value, the
+    default ``True`` included, raises ``ValueError`` naming
+    :func:`chunked_lm_head_det_preload`, the deterministic package's preload.
+    The per-thread state (side streams, events, count cells) is the calling
+    thread's: another thread forms its own at its first call.
+    ``temperature=True`` also loads the package's temperature libraries and
+    launches its temperature path's PyTorch operators once.
     """
-    if deterministic is True or _runs_det(deterministic, "chunked_lm_head_preload"):
-        if temperature is False:
-            return _det_preload(device)
-        return _det_preload(device, temperature=temperature)
+    _require_nd(deterministic, "chunked_lm_head_preload", "chunked_lm_head_det_preload")
     if temperature is False:
         _nd_backend_opt_in().preload(device)
         return
@@ -1348,23 +1214,9 @@ def _nd_support_logprob(
     temperature: Union[None, float, torch.Tensor] = 1.0,
     chunk_size: Optional[int] = None,
     check_inputs: bool = False,
-    deterministic: object = False,
     backend: str = "cake",
 ) -> torch.Tensor:
-    """:func:`chunked_lm_head_support_logprob` for ``deterministic`` other than ``True``."""
-    if _runs_det(deterministic, "chunked_lm_head_support_logprob"):
-        return _det_support_logprob(
-            X,
-            W,
-            support_ids,
-            support_offsets,
-            labels,
-            k_cap=k_cap,
-            temperature=temperature,
-            chunk_size=chunk_size,
-            check_inputs=check_inputs,
-            backend=backend,
-        )
+    """The body of :func:`chunked_lm_head_support_logprob` after its mode check."""
     if backend != "cake":
         raise ValueError(
             "the candidate-support LM-head kernels currently support backend='cake'"
@@ -1389,31 +1241,33 @@ def chunked_lm_head_support_logprob(
     *args: Any, deterministic: bool = True, **kwargs: Any
 ) -> torch.Tensor:
     r"""Differentiable log-probabilities over a ragged candidate support per
-    token with a selectable numerical mode, SM100 / SM103 / SM107 only.
+    token through the non-deterministic package, SM100 / SM103 / SM107 only.
 
     The computation and the other arguments are those of
-    :func:`chunked_lm_head_det_support_logprob`.  ``deterministic=True``
-    (default): that entry with the same arguments, passed on as given (the
-    same bits, no added allocation or synchronization); ``deterministic=False``:
-    the non-deterministic package's entry
+    :func:`chunked_lm_head_det_support_logprob`.  ``deterministic=False`` (the
+    only accepted value): the non-deterministic package's entry
     (``flashinfer.experimental.cake.cake_lm_head_loss.cake_support``), which
-    makes no run-to-run bitwise promise for the gradients; under
-    ``torch.use_deterministic_algorithms(True)`` it runs the deterministic
-    entry and warns once.  A value that is not a ``bool`` is a ``TypeError``.
+    makes no run-to-run bitwise promise for the gradients.  Any other value,
+    the default ``True`` included, raises ``ValueError`` naming
+    :func:`chunked_lm_head_det_support_logprob`, the deterministic entry to
+    call instead.  Under ``torch.use_deterministic_algorithms(True)`` the call
+    still runs the non-deterministic package: PyTorch's alert is raised by
+    that package before a K-sliced dX launch; there is no fallback to the
+    deterministic entry.
     """
-    if deterministic is True:
-        try:
-            return _det_support_logprob(*args, **kwargs)
-        except TypeError as exc:
-            _raise_named(exc, _det_support_logprob, "chunked_lm_head_support_logprob")
+    _require_nd(
+        deterministic,
+        "chunked_lm_head_support_logprob",
+        "chunked_lm_head_det_support_logprob",
+    )
     try:
-        return _nd_support_logprob(*args, deterministic=deterministic, **kwargs)
+        return _nd_support_logprob(*args, **kwargs)
     except TypeError as exc:
         _raise_named(exc, _nd_support_logprob, "chunked_lm_head_support_logprob")
 
 
 chunked_lm_head_support_logprob.__wrapped__.__signature__ = _with_mode(
-    _det_support_logprob, before="backend"
+    _nd_support_logprob, before="backend"
 )
 
 
@@ -1429,24 +1283,9 @@ def _nd_support_kl(
     return_logprobs: bool = False,
     chunk_size: Optional[int] = None,
     check_inputs: bool = False,
-    deterministic: object = False,
     backend: str = "cake",
 ):
-    """:func:`chunked_lm_head_support_kl` for ``deterministic`` other than ``True``."""
-    if _runs_det(deterministic, "chunked_lm_head_support_kl"):
-        return _det_support_kl(
-            X,
-            W,
-            support_ids,
-            support_offsets,
-            teacher_logprobs,
-            k_cap=k_cap,
-            temperature=temperature,
-            return_logprobs=return_logprobs,
-            chunk_size=chunk_size,
-            check_inputs=check_inputs,
-            backend=backend,
-        )
+    """The body of :func:`chunked_lm_head_support_kl` after its mode check."""
     if backend != "cake":
         raise ValueError(
             "the candidate-support LM-head kernels currently support backend='cake'"
@@ -1470,23 +1309,23 @@ def _nd_support_kl(
 @flashinfer_experimental_api(feature=_FEATURE)
 def chunked_lm_head_support_kl(*args: Any, deterministic: bool = True, **kwargs: Any):
     r"""Unreduced forward KL from a detached teacher over a ragged candidate
-    support with a selectable numerical mode, SM100 / SM103 / SM107 only.
+    support through the non-deterministic package, SM100 / SM103 / SM107 only.
 
     The computation and the other arguments are those of
     :func:`chunked_lm_head_det_support_kl`; ``deterministic`` as in
-    :func:`chunked_lm_head_support_logprob`.
+    :func:`chunked_lm_head_support_logprob` (any value but ``False``, the
+    default ``True`` included, raises ``ValueError`` naming
+    :func:`chunked_lm_head_det_support_kl`).
     """
-    if deterministic is True:
-        try:
-            return _det_support_kl(*args, **kwargs)
-        except TypeError as exc:
-            _raise_named(exc, _det_support_kl, "chunked_lm_head_support_kl")
+    _require_nd(
+        deterministic, "chunked_lm_head_support_kl", "chunked_lm_head_det_support_kl"
+    )
     try:
-        return _nd_support_kl(*args, deterministic=deterministic, **kwargs)
+        return _nd_support_kl(*args, **kwargs)
     except TypeError as exc:
         _raise_named(exc, _nd_support_kl, "chunked_lm_head_support_kl")
 
 
 chunked_lm_head_support_kl.__wrapped__.__signature__ = _with_mode(
-    _det_support_kl, before="backend"
+    _nd_support_kl, before="backend"
 )
