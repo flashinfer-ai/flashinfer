@@ -788,8 +788,9 @@ __global__ void FusedAddRMSNormFP8BlockQuantKernel(
     // DeepGEMM's ceil_to_ue8m0(amax / 448). The quotient must be correctly rounded: under
     // -use_fast_math an exact power of two can come out 1 ulp high and round up one exponent.
     const uint32_t bits = __float_as_uint(__fdiv_rn(amax, max_val));
+    // Clamped to 254: an inf amax would give 255, the E8M0 NaN code, and wrap the inverse below.
     const uint32_t exponent =
-        ((bits >> 23) & 0xffu) + static_cast<uint32_t>((bits & 0x7fffffu) != 0);
+        min(((bits >> 23) & 0xffu) + static_cast<uint32_t>((bits & 0x7fffffu) != 0), 254u);
     inv = __uint_as_float((254u - exponent) << 23);  // exact 1 / 2^(exponent - 127)
     if (block_leader) {
       // Little-endian byte (block_idx % 4) of int32 [block_idx / 4][bx]. The row's last block
