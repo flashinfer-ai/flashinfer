@@ -16,10 +16,10 @@ between it and the deterministic twin: the options validator (``cake_gdn_train_k
 signatures, the facade's contract names, the numerical mode (``deterministic`` on every entry: the package refuses
 everything but ``False`` and, every path being fixed-order, raises no alert under ``torch.use_deterministic_algorithms``; the
 facade routes ``True`` and torch's deterministic mode to the twin, warns once, refuses a non-bool and a saved set of
-the other route; no context, partition or options field holds the mode), the names (the twin's legacy aliases stay
-the twin's objects; this package copies none of them and no public name carries a mode), the package hygiene rules
-(no environment variable, no ``cake_kda_train`` import, standalone: no import of another FlashInfer package, its twin
-included, and no library name of the twin) and the host tables built on the CPU for the correctness rows'
+the other route; no context, partition or options field holds the mode), the names (this package and the facade copy
+none of the twin's pre-rename names and share no entry or type with it; no public name carries a mode), the package
+hygiene rules (no environment variable, no KDA package import, standalone: no import of another FlashInfer package,
+its twin included, and no library name of the twin) and the host tables built on the CPU for the correctness rows'
 partitions.  No kernel runs here: the compute entries run on the fake backend (the CPU emulation), directly or
 through ``KernelBackend`` with a stub launch glue (the architecture the kernel backend passes to the #7 walks).
 """
@@ -663,141 +663,72 @@ def test_package_init_re_exports_the_route() -> None:
         assert n in pkg.__all__
 
 
-# The deterministic twin's pre-rename names: legacy facade name -> det canonical facade name, legacy package-only
-# name -> det canonical name, and the module-level aliases at the ends of the det package's modules.  None of them is
-# copied into this package; ``chunk_gdn_kcp`` is the one spelling both carry (a det legacy alias there, this package's
-# canonical entry here).
-LEGACY_FACADE_NAMES = {
-    "kcp_partition": "partition_det_kcp",
-    "build_kcp_context": "build_context_det_kcp",
-    "chunk_gdn_kcp": "chunk_gdn_det_kcp",
-    "chunk_gdn_kcp_fwd": "chunk_gdn_det_fwd_kcp",
-    "chunk_gdn_kcp_bwd": "chunk_gdn_det_bwd_kcp",
-    "gdn_kcp_workspace_bytes": "gdn_det_workspace_bytes_kcp",
-    "gdn_kcp_saved_bytes": "gdn_det_saved_bytes_kcp",
-    "gdn_kcp_comm_bytes": "gdn_det_comm_bytes_kcp",
-    "is_gdn_train_supported": "is_gdn_det_train_kcp_supported",
-    "KcpOptions": "OptionsDetKcp",
-    "KcpContext": "ContextDetKcp",
-    "KcpPartition": "PartitionDetKcp",
-    "KcpRecomputeHandle": "RecomputeHandleDetKcp",
-    "KcpSaved": "SavedDetKcp",
-    "KcpWorkspace": "WorkspaceDetKcp",
-}
-LEGACY_PACKAGE_NAMES = {
-    **{
-        k: v
-        for k, v in LEGACY_FACADE_NAMES.items()
-        if k not in ("is_gdn_train_supported",)
-    },
-    "ChunkGDNKcpFunction": "ChunkGDNDetFunctionKcp",
-    "KcpCall": "CallDetKcp",
-    "KcpFragment": "FragmentDetKcp",
-}
-LEGACY_MODULE_ALIASES = {
-    "cake_kcp": {
-        "ChunkGDNKcpFunction": "ChunkGDNDetFunctionKcp",
-        "KcpCall": "CallDetKcp",
-        "KcpOptions": "OptionsDetKcp",
-        "KcpRecomputeHandle": "RecomputeHandleDetKcp",
-        "KcpSaved": "SavedDetKcp",
-        "KcpWorkspace": "WorkspaceDetKcp",
-        "chunk_gdn_kcp": "chunk_gdn_det_kcp",
-        "chunk_gdn_kcp_bwd": "chunk_gdn_det_bwd_kcp",
-        "chunk_gdn_kcp_fwd": "chunk_gdn_det_fwd_kcp",
-        "gdn_kcp_comm_bytes": "gdn_det_comm_bytes_kcp",
-        "gdn_kcp_saved_bytes": "gdn_det_saved_bytes_kcp",
-        "gdn_kcp_workspace_bytes": "gdn_det_workspace_bytes_kcp",
-    },
-    "cake_kcp_plan": {
-        "KcpContext": "ContextDetKcp",
-        "KcpFragment": "FragmentDetKcp",
-        "KcpPartition": "PartitionDetKcp",
-        "build_kcp_context": "build_context_det_kcp",
-        "kcp_partition": "partition_det_kcp",
-    },
-    "cake_bytes": {
-        "gdn_kcp_comm_bytes": "gdn_det_comm_bytes_kcp",
-        "gdn_kcp_saved_bytes": "gdn_det_saved_bytes_kcp",
-        "gdn_kcp_workspace_bytes": "gdn_det_workspace_bytes_kcp",
-        "gdn_kcp_saved_layout": "gdn_det_saved_layout_kcp",
-        "gdn_kcp_workspace_layout": "gdn_det_workspace_layout_kcp",
-    },
-    "cake_options": {"KcpOptions": "OptionsDetKcp"},
-}
-SHARED_SPELLINGS = {
-    "chunk_gdn_kcp"
-}  # a det legacy alias and this package's canonical entry
+# The deterministic twin's pre-rename spellings (its former facade, package and module-level names).  This package
+# and the facade copy none of them.  ``chunk_gdn_kcp`` is not listed: it is this package's canonical entry.
+LEGACY_DET_SPELLINGS = frozenset(
+    {
+        "kcp_partition",
+        "build_kcp_context",
+        "chunk_gdn_kcp_fwd",
+        "chunk_gdn_kcp_bwd",
+        "gdn_kcp_workspace_bytes",
+        "gdn_kcp_saved_bytes",
+        "gdn_kcp_comm_bytes",
+        "gdn_kcp_saved_layout",
+        "gdn_kcp_workspace_layout",
+        "is_gdn_train_supported",
+        "ChunkGDNKcpFunction",
+        "KcpCall",
+        "KcpContext",
+        "KcpFragment",
+        "KcpOptions",
+        "KcpPartition",
+        "KcpRecomputeHandle",
+        "KcpSaved",
+        "KcpWorkspace",
+    }
+)
 SUBMODULES = (
+    "cake_backend",
+    "cake_build",
     "cake_bytes",
     "cake_fake_backend",
     "cake_jit",
     "cake_kcp",
     "cake_kcp_plan",
+    "cake_l2n",
     "cake_options",
     "cake_tables",
 )
 
 
-def _nondet_objects() -> list:
-    """Every public object of this package (its ``__all__``, every function / class its modules define) and of the
-    facade (its ``__all__`` and its entries)."""
-    pkg, facade = _mod(), importlib.import_module(FACADE)
-    objs = [getattr(pkg, n) for n in pkg.__all__]
-    objs += [getattr(facade, n) for n in facade.__all__]
-    for sub in SUBMODULES:
-        mod = _mod(sub)
-        objs += [
-            v
-            for v in vars(mod).values()
-            if callable(v) and str(getattr(v, "__module__", "")).startswith(PACKAGE)
-        ]
-    return objs
-
-
-def test_legacy_names_are_the_deterministic_objects_never_the_non_deterministic_ones() -> (
-    None
-):
-    """``flashinfer.gdn_train``, ``flashinfer.experimental.cake_gdn_train`` and the det package's module-level aliases
-    stay the deterministic twin's compatibility paths: every legacy name IS its det object and is NOT any object of
-    this package or of the ``flashinfer.cake_gdn_train_kcp`` facade (in particular ``chunk_gdn_kcp``, spelled by both)."""
-    det_facade = importlib.import_module(DET_FACADE)
-    det_pkg = importlib.import_module(DET_PACKAGE)
-    nondet = _nondet_objects()
-    assert len(nondet) > 50
-
-    def is_nondet(obj) -> bool:
-        return any(obj is o for o in nondet)
-
-    legacy = importlib.import_module("flashinfer.gdn_train")
-    for old, new in LEGACY_FACADE_NAMES.items():
-        obj = getattr(legacy, old)
-        assert obj is getattr(det_facade, new), old
-        assert not is_nondet(obj), old
-    legacy_pkg = importlib.import_module("flashinfer.experimental.cake_gdn_train")
-    for old, new in LEGACY_PACKAGE_NAMES.items():
-        obj = getattr(legacy_pkg, old)
-        assert obj is getattr(det_pkg, new), old
-        assert not is_nondet(obj), old
-    for sub, aliases in LEGACY_MODULE_ALIASES.items():
-        det_mod = importlib.import_module(f"{DET_PACKAGE}.{sub}")
-        for old, new in aliases.items():
-            obj = getattr(det_mod, old)
-            assert obj is getattr(det_mod, new), (sub, old)
-            assert not is_nondet(obj), (sub, old)
-    # the shared spelling: the det alias, never this package's entry or the facade's dispatcher
+def test_no_module_of_the_package_or_the_facade_binds_a_legacy_det_spelling() -> None:
+    """No pre-rename spelling of the twin was copied: the package, each of its modules and the facade neither bind
+    nor export any of them.  ``chunk_gdn_kcp`` is this package's own entry, defined in ``cake_kcp`` under that name."""
     facade = importlib.import_module(FACADE)
-    assert legacy.chunk_gdn_kcp is det_facade.chunk_gdn_det_kcp
-    assert legacy_pkg.chunk_gdn_kcp is det_pkg.chunk_gdn_det_kcp
+    pkg = _mod()
+    for module in [pkg, facade] + [_mod(sub) for sub in SUBMODULES]:
+        exported = set(getattr(module, "__all__", ()))
+        for name in sorted(LEGACY_DET_SPELLINGS):
+            assert not hasattr(module, name), (module.__name__, name)
+            assert name not in exported, (module.__name__, name)
+    entry = _mod("cake_kcp").chunk_gdn_kcp
+    assert pkg.chunk_gdn_kcp is entry
+    assert (
+        entry.__module__ == f"{PACKAGE}.cake_kcp" and entry.__name__ == "chunk_gdn_kcp"
+    )
+
+
+def test_the_package_shares_no_entry_or_type_with_the_twin() -> None:
+    """This package's entries (also through the facade) and types are never the twin's objects (the twin's det names)."""
+    det_pkg = importlib.import_module(DET_PACKAGE)
+    facade = importlib.import_module(FACADE)
     for nondet_entry in (
         _mod().chunk_gdn_kcp,
         _mod("cake_kcp").chunk_gdn_kcp,
         facade.chunk_gdn_kcp,
     ):
-        assert nondet_entry is not legacy.chunk_gdn_kcp
-        assert nondet_entry is not legacy_pkg.chunk_gdn_kcp
         assert nondet_entry is not det_pkg.chunk_gdn_det_kcp
-    # and this package's types are not the twin's
     for name in (
         "OptionsKcp",
         "ContextKcp",
@@ -807,32 +738,7 @@ def test_legacy_names_are_the_deterministic_objects_never_the_non_deterministic_
     ):
         assert getattr(_mod(), name) is not getattr(
             det_pkg, name.replace("Kcp", "DetKcp")
-        )
-
-
-def test_the_package_exports_no_legacy_alias_name() -> None:
-    """No pre-rename name of the twin was copied: the package, its modules and the facade bind none of them (except
-    ``chunk_gdn_kcp``, this package's canonical entry, defined in ``cake_kcp`` under its own name)."""
-    legacy_names = (
-        set(LEGACY_FACADE_NAMES)
-        | set(LEGACY_PACKAGE_NAMES)
-        | {n for aliases in LEGACY_MODULE_ALIASES.values() for n in aliases}
-    )
-    facade = importlib.import_module(FACADE)
-    pkg = _mod()
-    for name in sorted(legacy_names - SHARED_SPELLINGS):
-        assert not hasattr(pkg, name), name
-        assert name not in pkg.__all__, name
-        assert not hasattr(facade, name), name
-        for sub in SUBMODULES:
-            assert not hasattr(_mod(sub), name), (sub, name)
-    entry = _mod("cake_kcp").chunk_gdn_kcp
-    assert pkg.chunk_gdn_kcp is entry
-    assert (
-        entry.__module__ == f"{PACKAGE}.cake_kcp" and entry.__name__ == "chunk_gdn_kcp"
-    )
-    for module in [pkg] + [_mod(sub) for sub in SUBMODULES]:
-        assert not hasattr(module, "KcpContext"), module.__name__
+        ), name
 
 
 def test_no_public_name_of_the_package_or_the_facade_names_a_mode() -> None:
@@ -1732,7 +1638,7 @@ def test_the_registry_names_no_library_of_the_deterministic_twin() -> None:
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# package hygiene (no cake_kda_train import; no os.environ; the host module's import allow-list)
+# package hygiene (no KDA package import; no os.environ; the host module's import allow-list)
 
 
 def _package_sources() -> list[pathlib.Path]:
@@ -1746,25 +1652,22 @@ def _facade_source() -> pathlib.Path:
     return pathlib.Path(importlib.import_module(FACADE).__file__).resolve()
 
 
-def test_package_never_imports_cake_kda_train() -> None:
+def test_package_never_imports_a_kda_package() -> None:
+    """Neither the package nor the facade imports a KDA package: no imported module path or name contains ``cake_kda``
+    (the deterministic and the non-deterministic KDA packages)."""
     for path in _package_sources() + [_facade_source()]:
         tree = ast.parse(path.read_text())
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for a in node.names:
-                    assert "cake_kda_train" not in a.name, (path.name, a.name)
+                    assert "cake_kda" not in a.name, (path.name, a.name)
             elif isinstance(node, ast.ImportFrom):
-                assert "cake_kda_train" not in (node.module or ""), (
+                assert "cake_kda" not in (node.module or ""), (
                     path.name,
                     node.module,
                 )
                 for a in node.names:
-                    assert a.name != "cake_kda_train", (path.name, a.name)
-        assert (
-            "cake_kda_train"
-            not in path.read_text().replace("Provenance", "").split("import os")[0]
-            or True
-        )
+                    assert "cake_kda" not in a.name, (path.name, a.name)
 
 
 def test_package_reads_no_environment_variable() -> None:

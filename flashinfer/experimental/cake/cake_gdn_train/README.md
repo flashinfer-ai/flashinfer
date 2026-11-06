@@ -85,15 +85,19 @@ non-deterministic one).
 
 No launch of this package is unordered, so PyTorch's deterministic algorithms
 (`torch.use_deterministic_algorithms(True)`, with or without `warn_only`)
-change nothing: no entry raises PyTorch's alert.  The deterministic packages,
-their names, defaults and aliases are unchanged.
+change nothing: no entry raises PyTorch's alert.
 
-| name | what it is now |
+The deterministic packages are named by their det names only:
+
+| name | what it is |
 |---|---|
-| `flashinfer.experimental.cake_gdn_det_train` and its aliases `chunk_gated_delta_rule`, `ChunkGatedDeltaRuleFunction`, `gdn_chunk_forward`, `gdn_chunk_backward` | unchanged: the deterministic one-rank package |
-| `flashinfer.experimental.cake_gdn_train` (the KCP package of FlashInfer v0.7.3rc1) | unchanged: a legacy alias of the deterministic KCP package `flashinfer.experimental.cake_gdn_det_train_kcp` |
-| `flashinfer.gdn_train`, `flashinfer.cake_gdn_det_train_kcp` | unchanged: deterministic KCP entry points |
-| `flashinfer.experimental.cake.cake_gdn_train` | new: this non-deterministic one-rank package |
+| `flashinfer.experimental.cake_gdn_det_train` (`chunk_gated_delta_rule_det`, `ChunkGatedDeltaRuleDetFunction`, `gdn_chunk_det_forward`, `gdn_chunk_det_backward`) | the deterministic one-rank package |
+| `flashinfer.experimental.cake_gdn_det_train_kcp`, `flashinfer.cake_gdn_det_train_kcp` | the deterministic KCP package and its entry points |
+| `flashinfer.experimental.cake.cake_gdn_train` | this non-deterministic one-rank package |
+
+The no-det spellings `chunk_gated_delta_rule`, `ChunkGatedDeltaRuleFunction`,
+`gdn_chunk_forward` and `gdn_chunk_backward` name this package's
+non-deterministic entries; a deterministic call uses the det names above.
 
 ## Chain
 
