@@ -716,9 +716,10 @@ class TestPrimsTsUnifiedGpu:
             activation=SwiGLU(),
             execution=ExecutionConfig(tune_max_num_tokens=num_tokens),
         )
-        prims_out = MoELayer(
+        prims_layer = MoELayer(
             dataclasses.replace(config, backend=BackendOptions((PrimsTsConfig(),)))
-        )(act, prims_weights)
+        )
+        prims_out = prims_layer(act, prims_weights)
         trtllm_out = MoELayer(
             dataclasses.replace(config, backend=BackendOptions((TrtllmFp4Config(),)))
         )(act, trtllm_weights)
@@ -728,6 +729,13 @@ class TestPrimsTsUnifiedGpu:
         is_local = (topk_ids >= offset) & (topk_ids < offset + local)
         no_local = ~is_local.any(dim=1)
         assert torch.equal(prims_out[no_local], torch.zeros_like(prims_out[no_local]))
+
+        # The same routing weights in FP32, through the same layer and tactics.
+        fp32_out = prims_layer(
+            dataclasses.replace(act, topk_weights=routing_weights.float()),
+            prims_weights,
+        )
+        assert torch.equal(fp32_out, prims_out)
 
     @pytest.mark.parametrize(
         "quant",

@@ -1019,7 +1019,7 @@ constexpr int FINALIZE_WARP_THREADS = 256;
 constexpr int FINALIZE_WARP_VECS = 4;
 // Row slices are added until the launch has at least this many warps.
 constexpr int FINALIZE_WARP_MIN_WARPS = 2048;
-// A prime, so coprime to every token count it does not divide (checked at launch).
+// A prime, so coprime to every token count it does not divide.
 constexpr int64_t FINALIZE_TOKEN_SPREAD_STRIDE = 1000003;
 
 // With SingleExpertTokensDone, the GEMM producing the input already wrote every token that has
@@ -1043,7 +1043,9 @@ __device__ __forceinline__ void finalizeWarpPerToken(KernelParams const& params)
   if constexpr (SingleExpertTokensDone) {
     // The tokens left are typically consecutive (rows without a local expert are packed at the
     // end of each source rank's block); a stride coprime to numTokens spreads them over the CTAs.
-    tokenIdx = tokenIdx * FINALIZE_TOKEN_SPREAD_STRIDE % params.numTokens;
+    if (params.numTokens % FINALIZE_TOKEN_SPREAD_STRIDE != 0) {
+      tokenIdx = tokenIdx * FINALIZE_TOKEN_SPREAD_STRIDE % params.numTokens;
+    }
   }
   int64_t const numVecs = params.hiddenDim / ElemPerVec;
   int64_t const numVecsPadded = params.hiddenDimPadded / ElemPerVec;
@@ -1342,8 +1344,6 @@ void run(Data const& data, void* stream) {
                          data.hiddenDimPadded % elemPerVec == 0 && data.topK <= 32,
                      "Finalize of multi-expert tokens needs one input, 128-bit aligned rows "
                      "and topK <= 32");
-    FLASHINFER_CHECK(data.numTokens % FINALIZE_TOKEN_SPREAD_STRIDE != 0,
-                     "Finalize of multi-expert tokens does not support %d tokens", data.numTokens);
     LAUNCH_EXPW(LAUNCH_FINALIZE_SINGLE_INPUT_PDL, data, finalizeKernelMultiExpertTokens, 1,
                 warpPerTokenGrid(data, elemPerVec),
                 /*numThreads=*/FINALIZE_WARP_THREADS, 0, stream);
