@@ -4039,7 +4039,7 @@ def _check(
     dtype: torch.dtype,
     device: torch.device,
 ) -> None:
-    if tuple(x.shape) != shape:
+    if x.shape != shape:  # torch.Size equals the tuple of its extents
         raise ValueError(f"{name}: expected shape {shape}, got {tuple(x.shape)}")
     if x.dtype != dtype:
         raise ValueError(f"{name}: expected {dtype}, got {x.dtype}")
