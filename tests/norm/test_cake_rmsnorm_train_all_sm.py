@@ -37,9 +37,9 @@ Beside the all-SM kernel a call starts when it costs at most
 is reported as "not measured (det-inherited)" -- a pytest skip -- only when its
 window is in the package's whole-SM list (``cake_windows.WHOLE_SM``, the list
 the facade documents) and the call runs the deterministic package's program (a
-forward or a deterministic-pair backward window whose program id equals the one
-the deterministic package selects at the same token count; an FP32-weight twin
-through its BF16 owner route, same form, or -- in a deterministic-pair twin
+forward or a deterministic-pair backward window whose program id is one of the
+deterministic package's programs for the same shape, at any token count; an
+FP32-weight twin through its BF16 owner route, same form, or -- in a deterministic-pair twin
 window where the owner runs a single kernel -- through the owner's pair program
 that the twin's program twins); the deterministic package's own call
 beside the same side kernel is measured and printed for reference.  Every other
@@ -531,10 +531,12 @@ def _owner_pair_program(hidden: int, residual: bool, w: str, twin_main: str):
 
 
 def _runs_det_program(kind: str, hidden: int, residual: bool, w: str, rows: int):
-    """``(True / False, note)``: the call runs the program the deterministic
-    package selects for the same shape and token count (program id equality of
-    the main kernels); an FP32-weight twin through its BF16 owner route (the
-    det package serves BF16 weights only), whose form it must share -- or, in a
+    """``(True / False, note)``: the call runs a program the deterministic
+    package ships for the same shape (program id of the main kernel among the
+    det route's main programs, at any token count: the det package may move a
+    window to a newer program while this package keeps the older one); an
+    FP32-weight twin through its BF16 owner route (the det package serves BF16
+    weights only), whose form it must share -- or, in a
     pair twin window where the owner runs a single kernel, through the owner's
     pair program that the twin's program twins (:func:`_owner_pair_program`)."""
     if det is None:
@@ -550,7 +552,12 @@ def _runs_det_program(kind: str, hidden: int, residual: bool, w: str, rows: int)
     )
     owner = ref.window_records(loader, _arch(), hidden, kind, residual, "bf16", rows)
     main = _main_module(owner, loader.MODULES)
-    same = _program_id(main) == _program_id(det_main)
+    det_programs = {
+        _program_id(n)
+        for n in det.cake_jit.route_modules(arch, hidden, kind, residual)
+        if det.cake_jit.MODULES[n]["role"] != "bwd_reduce"
+    }
+    same = _program_id(main) in det_programs
     note = f"program={_program_id(main)[:8]} det_program={_program_id(det_main)[:8]}"
     if w != "bf16" and kind == "bwd":
         twin = ref.window_records(loader, _arch(), hidden, kind, residual, w, rows)
@@ -559,7 +566,7 @@ def _runs_det_program(kind: str, hidden: int, residual: bool, w: str, rows: int)
             program = _owner_pair_program(
                 hidden, residual, w, _main_module(twin, loader.MODULES)
             )
-            same = program is not None and program == _program_id(det_main)
+            same = program is not None and program in det_programs
             note += (
                 f" (the twin's program twins the owner's pair program "
                 f"{(program or 'none')[:8]}; owner form single)"
