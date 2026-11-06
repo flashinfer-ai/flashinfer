@@ -150,33 +150,13 @@ def grouped_det_gemm_wgrad(
     ).launch()
 
 
-# The names of the package before the deterministic-family rename (when it was
-# ``flashinfer.experimental.cake_moe_grouped_gemm``), kept as deprecated
-# compatibility aliases of the names above.  They resolve on first access to
-# the very same objects and are left out of ``__all__``.
-_RENAMED: dict[str, str] = {
-    "CakeGroupedMm": "CakeGroupedDetMm",
-    "GroupedGemmLaunch": "GroupedDetGemmLaunch",
-    "cake_grouped_mm": "cake_grouped_det_mm",
-    "grouped_gemm_dgrad": "grouped_det_gemm_dgrad",
-    "grouped_gemm_fwd": "grouped_det_gemm_fwd",
-    "grouped_gemm_wgrad": "grouped_det_gemm_wgrad",
-    "prepare_grouped_gemm_dgrad": "prepare_grouped_det_gemm_dgrad",
-    "prepare_grouped_gemm_fwd": "prepare_grouped_det_gemm_fwd",
-    "prepare_grouped_gemm_wgrad": "prepare_grouped_det_gemm_wgrad",
-}
-
-
 def __getattr__(name: str) -> Any:
-    target = _RENAMED.get(name, name)
-    if target in _BACKEND_EXPORTS:
+    if name in _BACKEND_EXPORTS:
         from . import cake_backend
 
-        return getattr(cake_backend, target)
-    if target in _AUTOGRAD_EXPORTS:
+        return getattr(cake_backend, name)
+    if name in _AUTOGRAD_EXPORTS:
         from . import cake_autograd
 
-        return getattr(cake_autograd, target)
-    if target != name:
-        return globals()[target]
+        return getattr(cake_autograd, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

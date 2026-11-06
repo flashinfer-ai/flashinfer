@@ -14,7 +14,7 @@ body (a deferred import, never at module level), so importing
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Optional
 
 import torch
 
@@ -149,20 +149,3 @@ def cake_grouped_det_mm(
     )
 
     return _impl(x, w, offs, deterministic=deterministic)
-
-
-# The entry-point names before the deterministic-family rename, kept as
-# deprecated compatibility aliases of the functions above (resolved on access to
-# the very same objects; not in ``__all__``).
-_RENAMED: dict[str, str] = {
-    "cake_grouped_mm": "cake_grouped_det_mm",
-    "grouped_gemm_dgrad": "grouped_det_gemm_dgrad",
-    "grouped_gemm_fwd": "grouped_det_gemm_fwd",
-    "grouped_gemm_wgrad": "grouped_det_gemm_wgrad",
-}
-
-
-def __getattr__(name: str) -> Any:
-    if name in _RENAMED:
-        return globals()[_RENAMED[name]]
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

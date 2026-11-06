@@ -26,8 +26,6 @@ limitations under the License.
 
 from __future__ import annotations
 
-from typing import Any
-
 import torch
 
 from .cake_backend import (
@@ -178,19 +176,3 @@ def cake_grouped_det_mm(
     y = CakeGroupedDetMm.apply(x, w, offs, bool(deterministic), _DEFER_FWD)
     _fill_fwd(x, w, offs, y)
     return y
-
-
-# The names of the package before the deterministic-family rename (when it was
-# ``flashinfer.experimental.cake_moe_grouped_gemm``), kept as deprecated
-# compatibility aliases of the names above (resolved on access to the very same
-# objects).
-_RENAMED: dict[str, str] = {
-    "CakeGroupedMm": "CakeGroupedDetMm",
-    "cake_grouped_mm": "cake_grouped_det_mm",
-}
-
-
-def __getattr__(name: str) -> Any:
-    if name in _RENAMED:
-        return globals()[_RENAMED[name]]
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

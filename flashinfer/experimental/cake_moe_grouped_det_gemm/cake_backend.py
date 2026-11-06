@@ -1423,22 +1423,3 @@ def grouped_det_mm_bf16_cake(
             f"per architecture; tactic must be -1 (got {tactic})"
         )
     return prepare_grouped_det_gemm_fwd(a, b, m_indptr, out=out).launch()
-
-
-# The names of the package before the deterministic-family rename (when it was
-# ``flashinfer.experimental.cake_moe_grouped_gemm``), kept as deprecated
-# compatibility aliases of the names above (resolved on access to the very same
-# objects).
-_RENAMED: dict[str, str] = {
-    "GroupedGemmLaunch": "GroupedDetGemmLaunch",
-    "grouped_mm_bf16_cake": "grouped_det_mm_bf16_cake",
-    "prepare_grouped_gemm_dgrad": "prepare_grouped_det_gemm_dgrad",
-    "prepare_grouped_gemm_fwd": "prepare_grouped_det_gemm_fwd",
-    "prepare_grouped_gemm_wgrad": "prepare_grouped_det_gemm_wgrad",
-}
-
-
-def __getattr__(name: str) -> Any:
-    if name in _RENAMED:
-        return globals()[_RENAMED[name]]
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
