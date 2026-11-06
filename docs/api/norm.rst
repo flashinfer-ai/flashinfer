@@ -154,6 +154,9 @@ an autograd wrapper that saves only its inputs.
    ``flashinfer.cake_rmsnorm_silu_gate_nondet_train`` (backend package
    ``flashinfer.experimental.cake.cake_rmsnorm_silu_gate_nondet_train``)
    carries ``nondet``.  The ``flashinfer`` top level exports only such names.
+   Each module imports its backend package on first use (``import
+   flashinfer`` loads neither backend package); its autograd class and
+   its architecture constants are the backend package's objects.
 2. No entry point takes a ``deterministic`` keyword: passing one is a
    ``TypeError``.  A call of one package never runs the other package.
 3. Under ``torch.use_deterministic_algorithms(True)`` no deterministic call

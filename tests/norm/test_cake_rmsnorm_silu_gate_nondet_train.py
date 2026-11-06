@@ -118,8 +118,9 @@ FP32_SHAPES = [(7, 48), (1031, 48), (32737, 48)]
 
 
 def _supported() -> bool:
-    return torch.cuda.is_available() and pkg.is_cake_rmsnorm_silu_gate_nondet_train_supported(
-        torch.device("cuda")
+    return (
+        torch.cuda.is_available()
+        and pkg.is_cake_rmsnorm_silu_gate_nondet_train_supported(torch.device("cuda"))
     )
 
 
@@ -619,7 +620,9 @@ def test_reset_workspace_errors():
     # the mode is in the name: a mode keyword is a TypeError
     for value in (False, True, None):
         with pytest.raises(TypeError, match="deterministic"):
-            pkg.cake_rmsnorm_silu_gate_nondet_train_reset_workspace(ws, deterministic=value)
+            pkg.cake_rmsnorm_silu_gate_nondet_train_reset_workspace(
+                ws, deterministic=value
+            )
 
 
 def test_two_streams_with_their_own_workspaces():
@@ -1010,7 +1013,10 @@ def test_registry_records_reference_the_build_manifest():
     one cluster and take no workspace."""
     manifest = cake_build.manifest()
     assert manifest["schema"] == "cake-build/1"
-    assert manifest["package"] == "flashinfer.experimental.cake.cake_rmsnorm_silu_gate_nondet_train"
+    assert (
+        manifest["package"]
+        == "flashinfer.experimental.cake.cake_rmsnorm_silu_gate_nondet_train"
+    )
     libraries = cake_build.libraries_by_name()
     package = Path(cake_build.__file__).parent
     for arch in loader.ARCHES:

@@ -548,7 +548,9 @@ def cake_rmsnorm_silu_gate_nondet_train_backward_workspace(
     )
 
 
-def cake_rmsnorm_silu_gate_nondet_train_reset_workspace(workspace: torch.Tensor) -> None:
+def cake_rmsnorm_silu_gate_nondet_train_reset_workspace(
+    workspace: torch.Tensor,
+) -> None:
     """Return a caller-owned backward workspace to its first-use state: zero its
     FP64 accumulators and the two 32-bit words of its last element (the arrival
     ticket and the claim counter).

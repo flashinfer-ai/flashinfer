@@ -307,9 +307,10 @@ from .cake_rmsnorm_train import (
 )
 from . import cake_rmsnorm_train as cake_rmsnorm_train
 from . import cake_rmsnorm_train_backend as cake_rmsnorm_train_backend
-from .cake_rmsnorm_silu_gate_det_train import (
-    CakeRMSNormSiLUGateDetFunction as CakeRMSNormSiLUGateDetFunction,
-)
+# The SiLU-gated RMSNorm facades import their backend packages (under
+# flashinfer.experimental.cake) on first use; their autograd classes
+# CakeRMSNormSiLUGateDetFunction and CakeRMSNormSiLUGateNondetFunction are
+# backend objects, reached as attributes of the facade modules.
 from .cake_rmsnorm_silu_gate_det_train import (
     cake_rmsnorm_silu_gate_det as cake_rmsnorm_silu_gate_det,
 )
@@ -325,9 +326,6 @@ from .cake_rmsnorm_silu_gate_det_train import (
 
 # The non-deterministic SiLU-gated RMSNorm (``nondet`` names); the
 # deterministic names are above.
-from .cake_rmsnorm_silu_gate_nondet_train import (
-    CakeRMSNormSiLUGateNondetFunction as CakeRMSNormSiLUGateNondetFunction,
-)
 from .cake_rmsnorm_silu_gate_nondet_train import (
     cake_rmsnorm_silu_gate_nondet as cake_rmsnorm_silu_gate_nondet,
 )

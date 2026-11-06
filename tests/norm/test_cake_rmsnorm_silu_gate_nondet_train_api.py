@@ -97,7 +97,9 @@ from flashinfer.cake_rmsnorm_silu_gate_nondet_train import (
     cake_rmsnorm_silu_gate_nondet_train_reset_workspace,
     is_cake_rmsnorm_silu_gate_nondet_train_supported,
 )
-from flashinfer.experimental.cake.cake_rmsnorm_silu_gate_nondet_train import cake_jit as loader
+from flashinfer.experimental.cake.cake_rmsnorm_silu_gate_nondet_train import (
+    cake_jit as loader,
+)
 from tests.norm import test_cake_rmsnorm_silu_gate_nondet_train as suite
 
 D = 128
@@ -131,8 +133,9 @@ det_backward = deterministic_facade.cake_rmsnorm_silu_gate_det_train_backward
 
 
 def _supported() -> bool:
-    return torch.cuda.is_available() and is_cake_rmsnorm_silu_gate_nondet_train_supported(
-        torch.device("cuda")
+    return (
+        torch.cuda.is_available()
+        and is_cake_rmsnorm_silu_gate_nondet_train_supported(torch.device("cuda"))
     )
 
 
@@ -214,11 +217,8 @@ def test_top_level_exports_are_the_facade() -> None:
         flashinfer.cake_rmsnorm_silu_gate_nondet_train_backward_workspace_bytes
         is cake_rmsnorm_silu_gate_nondet_train_backward_workspace_bytes
     )
-    assert (
-        flashinfer.CakeRMSNormSiLUGateNondetFunction
-        is CakeRMSNormSiLUGateNondetFunction
-    )
-    # one non-deterministic autograd function: the backend's class
+    # one non-deterministic autograd function: the backend's class, reached
+    # through the facade
     assert (
         CakeRMSNormSiLUGateNondetFunction is backend.CakeRMSNormSiLUGateNondetFunction
     )
@@ -230,10 +230,6 @@ def test_top_level_exports_are_the_facade() -> None:
     assert (
         flashinfer.cake_rmsnorm_silu_gate_det_train_forward
         is deterministic_facade.cake_rmsnorm_silu_gate_det_train_forward
-    )
-    assert (
-        flashinfer.CakeRMSNormSiLUGateDetFunction
-        is deterministic_facade.CakeRMSNormSiLUGateDetFunction
     )
 
 
@@ -285,7 +281,7 @@ def test_a_mode_keyword_is_a_type_error(
     for enabled, warn_only in ((False, False), (True, False), (True, True)):
         torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
         for module in (facade, backend):
-            for entry, call in _mode_calls(module, ws).items():
+            for call in _mode_calls(module, ws).values():
                 with pytest.raises(TypeError, match="deterministic"):
                     call(deterministic=value)
         with pytest.raises(TypeError):
@@ -341,9 +337,9 @@ def test_facade_runs_the_backend_with_the_same_arguments(
 def test_autograd_function_runs_the_backend_in_both_directions(
     monkeypatch: pytest.MonkeyPatch, determinism_setting
 ) -> None:
-    """:class:`CakeRMSNormSiLUGateNondetFunction` (also
-    ``flashinfer.CakeRMSNormSiLUGateNondetFunction``) runs the backend's
-    forward and backward bodies; its backward names the autograd backward for
+    """:class:`CakeRMSNormSiLUGateNondetFunction` (the backend's class, also an
+    attribute of the facade) runs the backend's forward and backward bodies;
+    its backward names the autograd backward for
     the alert.  The forward does not alert under
     ``torch.use_deterministic_algorithms(True)`` (bodies stubbed: no device
     needed)."""
@@ -646,7 +642,7 @@ def test_a_mode_keyword_is_a_type_error_on_the_device(
         ),
     }
     assert set(runs) == set(ENTRY_NAMES)
-    for name, run in runs.items():
+    for run in runs.values():
         for value in (True, False):
             with pytest.raises(TypeError, match="deterministic"):
                 run(deterministic=value)

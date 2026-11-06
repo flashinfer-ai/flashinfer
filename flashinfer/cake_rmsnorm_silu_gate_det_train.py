@@ -42,6 +42,9 @@ Mode and dispatch rules (the same in
    :mod:`flashinfer.cake_rmsnorm_silu_gate_nondet_train` (backend package
    ``flashinfer.experimental.cake.cake_rmsnorm_silu_gate_nondet_train``)
    carries ``nondet``.  The ``flashinfer`` top level exports only such names.
+   Each module imports its backend package on first use (``import
+   flashinfer`` loads neither backend package); its autograd class and
+   its architecture constants are the backend package's objects.
 2. No entry point takes a ``deterministic`` keyword: passing one is a
    ``TypeError``.  A call of one package never runs the other package.
 3. Under ``torch.use_deterministic_algorithms(True)`` no deterministic call
@@ -89,24 +92,41 @@ Usage::
 
 from __future__ import annotations
 
-from typing import Optional
+import functools
+from typing import Any, Optional
 
 import torch
 
 from .api_logging import flashinfer_api
-from .experimental.cake import cake_rmsnorm_silu_gate_det_train as _backend
-from .experimental.cake.cake_rmsnorm_silu_gate_det_train import (  # noqa: F401
-    ARCHES,
-    SUPPORTED_COMPUTE_CAPABILITIES,
-    CakeRMSNormSiLUGateDetFunction,
-    cake_rmsnorm_silu_gate_det_train_backward_workspace,
-    cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes,
-    is_cake_rmsnorm_silu_gate_det_train_supported,
+
+# The entry points are real ``def``s here (public-API tooling reads the
+# decorated signatures of this module); their bodies live in the self-contained
+# backend package next to the generated CUDA sources.  The backend package is
+# imported on first use (flashinfer/experimental/README.md, "Containment
+# rules"), so ``import flashinfer`` loads no experimental module.
+
+
+@functools.cache
+def _backend() -> Any:
+    from .experimental.cake import cake_rmsnorm_silu_gate_det_train  # noqa: PLC0415 - the backend package, imported on first use
+
+    return cake_rmsnorm_silu_gate_det_train
+
+
+# The backend package's own objects (the autograd class and the architecture
+# constants), resolved on first access by the module ``__getattr__`` below.
+_BACKEND_OBJECTS = (
+    "ARCHES",
+    "SUPPORTED_COMPUTE_CAPABILITIES",
+    "CakeRMSNormSiLUGateDetFunction",
 )
 
-# The stable entry points are real ``def``s here (public-API tooling reads the
-# decorated signatures of this module); their bodies live in the self-contained
-# backend package next to the generated CUDA sources.
+
+@flashinfer_api
+def is_cake_rmsnorm_silu_gate_det_train_supported(device: torch.device) -> bool:
+    """Whether ``device`` is a CUDA device of an exported architecture."""
+
+    return _backend().is_cake_rmsnorm_silu_gate_det_train_supported(device)
 
 
 @flashinfer_api
@@ -118,9 +138,56 @@ def cake_rmsnorm_silu_gate_det_train_forward(
     *,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """See :func:`flashinfer.experimental.cake.cake_rmsnorm_silu_gate_det_train.cake_rmsnorm_silu_gate_det_train_forward`."""
+    r"""SiLU-gated RMSNorm forward: ``y = BF16(((x * rstd) * weight) * silu(z))``.
 
-    return _backend.cake_rmsnorm_silu_gate_det_train_forward(x, z, weight, eps, out=out)
+    ``rstd = 1 / sqrt(mean(x^2) + eps)`` over the last dimension (128), in FP32;
+    ``silu(z) = z / (1 + exp(-z))`` in FP32; one rounding to BF16 at the end.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        BF16 ``[..., 128]`` input (``[T, H, 128]`` or ``[T * H, 128]``).
+    z : torch.Tensor
+        BF16 gate input of the same shape as ``x`` (its own strides).
+    weight : torch.Tensor
+        BF16 ``[128]`` weight shared by every token and head.
+    eps : float
+        Variance epsilon (FP32 inside the kernel).
+    out : torch.Tensor, optional
+        Preallocated BF16 output of ``x``'s shape.
+
+    Returns
+    -------
+    torch.Tensor
+        BF16 ``y`` of ``x``'s shape (``out`` when given).
+    """
+
+    return _backend().cake_rmsnorm_silu_gate_det_train_forward(
+        x, z, weight, eps, out=out
+    )
+
+
+@flashinfer_api
+def cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes(
+    rows: int, device: torch.device
+) -> int:
+    """Bytes of the backward's FP32 weight-gradient partial buffer for ``rows``
+    rows (``T * H``) on ``device``: ``chunks * 128 * 4``."""
+
+    return _backend().cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes(
+        rows, device
+    )
+
+
+@flashinfer_api
+def cake_rmsnorm_silu_gate_det_train_backward_workspace(
+    rows: int, device: torch.device
+) -> torch.Tensor:
+    """A caller-owned backward workspace for ``rows`` rows: an uninitialized
+    FP32 tensor of :func:`cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes`
+    bytes (the backward writes every element it reads)."""
+
+    return _backend().cake_rmsnorm_silu_gate_det_train_backward_workspace(rows, device)
 
 
 @flashinfer_api
@@ -138,9 +205,49 @@ def cake_rmsnorm_silu_gate_det_train_backward(
     compute_grad_weight: bool = True,
     workspace: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """See :func:`flashinfer.experimental.cake.cake_rmsnorm_silu_gate_det_train.cake_rmsnorm_silu_gate_det_train_backward`."""
+    r"""SiLU-gated RMSNorm backward: ``dx``, ``dz`` and the weight gradient.
 
-    return _backend.cake_rmsnorm_silu_gate_det_train_backward(
+    With ``n = x * rstd``, ``s = sigmoid(z)`` and ``a = dy * silu(z)``::
+
+        dz = BF16(dy * (n * weight) * s * (1 + z * (1 - s)))
+        dx = BF16(rstd * a * weight - x * rstd^3 * mean(a * weight * x))
+        dw = sum over every token and head of a * n
+
+    in FP32, the statistics and the gate recomputed from ``x`` and ``z``.  ``dw``
+    is accumulated in FP32 per CTA chunk and in FP64 over the chunks, in an
+    order fixed by the row count, and rounded once.
+
+    Parameters
+    ----------
+    grad_out, x, z : torch.Tensor
+        BF16 tensors of one ``[..., 128]`` shape (any strides, see the module).
+    weight : torch.Tensor
+        BF16 ``[128]``.
+    eps : float
+        The forward's epsilon.
+    grad_x, grad_z : torch.Tensor, optional
+        Preallocated BF16 outputs of ``x``'s shape.
+    grad_weight : torch.Tensor, optional
+        A BF16 or FP32 ``[128]`` tensor that receives the weight gradient
+        (rounded once into its dtype).  Without it a new BF16 tensor is returned.
+    accumulate_grad_weight : bool
+        Add the gradient to ``grad_weight``'s current value before the one
+        rounding (needs ``grad_weight``).
+    compute_grad_weight : bool
+        ``False`` skips the weight-gradient reduction and returns ``None`` for it.
+    workspace : torch.Tensor, optional
+        FP32 tensor of at least
+        :func:`cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes` bytes,
+        contiguous; allocated on the current stream when omitted.  The FP64
+        workspace of the non-deterministic package is refused
+        (``ValueError``).
+
+    Returns
+    -------
+    ``(grad_x, grad_z, grad_weight)``.
+    """
+
+    return _backend().cake_rmsnorm_silu_gate_det_train_backward(
         grad_out,
         x,
         z,
@@ -159,25 +266,28 @@ def cake_rmsnorm_silu_gate_det_train_backward(
 def cake_rmsnorm_silu_gate_det(
     x: torch.Tensor, z: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6
 ) -> torch.Tensor:
-    """See :func:`flashinfer.experimental.cake.cake_rmsnorm_silu_gate_det_train.cake_rmsnorm_silu_gate_det`."""
+    """Differentiable ``RMSNorm(x) * weight * SiLU(z)`` over the last dimension
+    (128): :class:`CakeRMSNormSiLUGateDetFunction` applied to the arguments."""
 
-    return _backend.cake_rmsnorm_silu_gate_det(x, z, weight, eps)
+    return _backend().cake_rmsnorm_silu_gate_det(x, z, weight, eps)
 
 
-# Sphinx renders the backend docstrings; the one-line delegations satisfy the checker.
-cake_rmsnorm_silu_gate_det_train_forward.__doc__ = (
-    _backend.cake_rmsnorm_silu_gate_det_train_forward.__doc__
-)
-cake_rmsnorm_silu_gate_det_train_backward.__doc__ = (
-    _backend.cake_rmsnorm_silu_gate_det_train_backward.__doc__
-)
-cake_rmsnorm_silu_gate_det.__doc__ = _backend.cake_rmsnorm_silu_gate_det.__doc__
+def __getattr__(name: str) -> Any:
+    if name in _BACKEND_OBJECTS:
+        value = getattr(_backend(), name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(_BACKEND_OBJECTS))
 
 
 __all__ = [
-    "ARCHES",
-    "SUPPORTED_COMPUTE_CAPABILITIES",
-    "CakeRMSNormSiLUGateDetFunction",
+    "ARCHES",  # noqa: F822 - resolved by __getattr__
+    "SUPPORTED_COMPUTE_CAPABILITIES",  # noqa: F822 - resolved by __getattr__
+    "CakeRMSNormSiLUGateDetFunction",  # noqa: F822 - resolved by __getattr__
     "cake_rmsnorm_silu_gate_det",
     "cake_rmsnorm_silu_gate_det_train_backward",
     "cake_rmsnorm_silu_gate_det_train_backward_workspace",

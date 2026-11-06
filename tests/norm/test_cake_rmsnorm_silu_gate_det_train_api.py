@@ -153,7 +153,8 @@ def test_top_level_exports_are_the_facade():
         flashinfer.cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes
         is cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes
     )
-    assert flashinfer.CakeRMSNormSiLUGateDetFunction is CakeRMSNormSiLUGateDetFunction
+    # the autograd class is the backend package's, reached through the facade
+    assert facade.CakeRMSNormSiLUGateDetFunction is CakeRMSNormSiLUGateDetFunction
     assert CakeRMSNormSiLUGateDetFunction is backend.CakeRMSNormSiLUGateDetFunction
 
 

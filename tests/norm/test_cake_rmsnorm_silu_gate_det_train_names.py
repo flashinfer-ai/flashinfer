@@ -28,9 +28,13 @@ No entry point has a ``deterministic`` parameter.  The modules and names the
 family had before (``flashinfer.cake_rmsnorm_silu_gate_train``, the packages
 ``flashinfer.cake_rmsnorm_silu_gate_train_backend`` and
 ``flashinfer.cake_rmsnorm_silu_gate_det_train_backend``, and the names without
-a mode word) fail at import: no alias, no module ``__getattr__``, no compat
-module.  The ``flashinfer`` top level binds only names of the family with a
-mode word (checked in this process and in fresh interpreters).  The JIT
+a mode word) fail at import: no alias, no compat module, and no module
+``__getattr__`` but the facades' own, which resolves exactly the three
+backend-owned names (the autograd class and the architecture constants).  Each
+facade imports its backend package on first use, so ``import flashinfer``
+loads no module of either backend package.  The ``flashinfer`` top level binds
+only names of the family with a mode word (checked in this process and in
+fresh interpreters).  The JIT
 library names of the backends (``cake_rmsnorm_silu_gate_train_<hash>`` and
 ``cake_rmsnorm_silu_gate_det_train_<hash>``) are build identities, not Python
 names, and are unchanged.
@@ -94,10 +98,10 @@ def _public_names(mode: str) -> set:
 
 
 PUBLIC = {mode: _public_names(mode) for mode in MODES}
-# The names of the family the ``flashinfer`` top level binds.
+# The names of the family the ``flashinfer`` top level binds (the autograd
+# classes are backend objects: attributes of the facade modules only).
 TOP_LEVEL = {
     mode: {
-        CLASS[mode],
         f"{OP}_{mode}",
         f"{OP}_{mode}_train_forward",
         f"{OP}_{mode}_train_backward",
@@ -211,10 +215,30 @@ def test_old_names_are_not_attributes(key) -> None:
         assert not hasattr(module, name), (key, name)
 
 
+# The backend package's objects a facade resolves on first access.
+BACKEND_OBJECTS = {
+    mode: ("ARCHES", "SUPPORTED_COMPUTE_CAPABILITIES", CLASS[mode]) for mode in MODES
+}
+
+
 @pytest.mark.parametrize("key", list(NAMESPACES), ids=NAMESPACE_IDS)
 def test_no_name_shim(key) -> None:
-    # No module ``__getattr__`` (PEP 562) that could resolve a removed name.
-    assert "__getattr__" not in vars(NAMESPACES[key]), key
+    """No module ``__getattr__`` (PEP 562) that could resolve a removed name: a
+    backend package has none; a facade's resolves exactly its three
+    backend-owned names and raises ``AttributeError`` for anything else."""
+    mode, kind = key
+    module = NAMESPACES[key]
+    if kind == "backend":
+        assert "__getattr__" not in vars(module), key
+        return
+    assert module._BACKEND_OBJECTS == BACKEND_OBJECTS[mode], key
+    backend = importlib.import_module(BACKEND[mode])
+    for name in BACKEND_OBJECTS[mode]:
+        assert module.__getattr__(name) is getattr(backend, name), (key, name)
+    other = "nondet" if mode == "det" else "det"
+    for name in (*OLD_NAMES, CLASS[other], "deterministic", "_forward"):
+        with pytest.raises(AttributeError):
+            module.__getattr__(name)
 
 
 @pytest.mark.parametrize("key", list(NAMESPACES), ids=NAMESPACE_IDS)
@@ -275,18 +299,14 @@ def test_the_two_modes_are_separate_modules() -> None:
 
 
 def test_facade_objects() -> None:
-    """Each facade's ``flashinfer_api`` entry points are its own defs; its other
-    names, the autograd class included, are its backend's objects."""
-    det_defs = {
-        f"{OP}_det",
-        f"{OP}_det_train_forward",
-        f"{OP}_det_train_backward",
-    }
-    nd_defs = PUBLIC["nondet"] - {CLASS["nondet"]}
-    for facade, backend, defs in (
-        (det_facade, det_backend, det_defs),
-        (nd_facade, nd_backend, nd_defs),
+    """Each facade's functions are its own ``flashinfer_api`` defs; its other
+    names (the autograd class and the architecture constants) are its
+    backend's objects."""
+    for facade, backend, mode in (
+        (det_facade, det_backend, "det"),
+        (nd_facade, nd_backend, "nondet"),
     ):
+        defs = PUBLIC[mode] - {CLASS[mode]}
         for name in facade.__all__:
             own = getattr(facade, name) is not getattr(backend, name)
             assert own == (name in defs), (facade.__name__, name)
@@ -354,6 +374,17 @@ FRESH = {
         "        except ImportError:\n"
         "            continue\n"
         "        raise AssertionError((m, n))\n"
+    ),
+    "backends_load_on_first_use": (
+        "import sys, flashinfer\n"
+        "def loaded():\n"
+        "    return sorted(m for m in sys.modules if m.startswith("
+        f"('{BACKEND['det']}', '{BACKEND['nondet']}')))\n"
+        "assert loaded() == [], loaded()\n"
+        f"import {FACADE['nondet']} as nd\n"
+        "assert loaded() == [], loaded()\n"
+        f"nd.{CLASS['nondet']}\n"
+        f"assert '{BACKEND['nondet']}' in loaded() and not any(m.startswith('{BACKEND['det']}') for m in loaded()), loaded()\n"
     ),
     "backend_submodule_first": (
         "import importlib, sys\n"

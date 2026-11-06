@@ -97,6 +97,9 @@ Mode and dispatch rules (the same in
    :mod:`flashinfer.cake_rmsnorm_silu_gate_nondet_train` (backend package
    ``flashinfer.experimental.cake.cake_rmsnorm_silu_gate_nondet_train``)
    carries ``nondet``.  The ``flashinfer`` top level exports only such names.
+   Each module imports its backend package on first use (``import
+   flashinfer`` loads neither backend package); its autograd class and
+   its architecture constants are the backend package's objects.
 2. No entry point takes a ``deterministic`` keyword: passing one is a
    ``TypeError``.  A call of one package never runs the other package.
 3. Under ``torch.use_deterministic_algorithms(True)`` no deterministic call
@@ -200,16 +203,29 @@ Usage::
 
 from __future__ import annotations
 
-from typing import Optional
+import functools
+from typing import Any, Optional
 
 import torch
 
 from .api_logging import flashinfer_api
-from .experimental.cake import cake_rmsnorm_silu_gate_nondet_train as _backend
-from .experimental.cake.cake_rmsnorm_silu_gate_nondet_train import (  # noqa: F401
-    ARCHES,
-    SUPPORTED_COMPUTE_CAPABILITIES,
-    CakeRMSNormSiLUGateNondetFunction,
+
+
+# The backend package is imported on first use (flashinfer/experimental/README.md,
+# "Containment rules"), so ``import flashinfer`` loads no experimental module.
+@functools.cache
+def _backend() -> Any:
+    from .experimental.cake import cake_rmsnorm_silu_gate_nondet_train  # noqa: PLC0415 - the backend package, imported on first use
+
+    return cake_rmsnorm_silu_gate_nondet_train
+
+
+# The backend package's own objects (the autograd class and the architecture
+# constants), resolved on first access by the module ``__getattr__`` below.
+_BACKEND_OBJECTS = (
+    "ARCHES",
+    "SUPPORTED_COMPUTE_CAPABILITIES",
+    "CakeRMSNormSiLUGateNondetFunction",
 )
 
 # The stable entry points are real ``def``s here (public-API tooling reads the
@@ -238,7 +254,7 @@ def is_cake_rmsnorm_silu_gate_nondet_train_supported(device: torch.device) -> bo
         ``True`` when the non-deterministic package has kernels for ``device``.
     """
 
-    return _backend.is_cake_rmsnorm_silu_gate_nondet_train_supported(device)
+    return _backend().is_cake_rmsnorm_silu_gate_nondet_train_supported(device)
 
 
 @flashinfer_api
@@ -283,7 +299,7 @@ def cake_rmsnorm_silu_gate_nondet_train_forward(
         BF16 ``y`` of ``x``'s shape (``out`` when given).
     """
 
-    return _backend.cake_rmsnorm_silu_gate_nondet_train_forward(
+    return _backend().cake_rmsnorm_silu_gate_nondet_train_forward(
         x, z, weight, eps, out=out
     )
 
@@ -314,7 +330,9 @@ def cake_rmsnorm_silu_gate_nondet_train_backward_workspace_bytes(
         The workspace size in bytes.
     """
 
-    return _backend.cake_rmsnorm_silu_gate_nondet_train_backward_workspace_bytes(rows, device)
+    return _backend().cake_rmsnorm_silu_gate_nondet_train_backward_workspace_bytes(
+        rows, device
+    )
 
 
 @flashinfer_api
@@ -346,11 +364,15 @@ def cake_rmsnorm_silu_gate_nondet_train_backward_workspace(
         The zero-filled FP64 workspace on ``device``.
     """
 
-    return _backend.cake_rmsnorm_silu_gate_nondet_train_backward_workspace(rows, device)
+    return _backend().cake_rmsnorm_silu_gate_nondet_train_backward_workspace(
+        rows, device
+    )
 
 
 @flashinfer_api
-def cake_rmsnorm_silu_gate_nondet_train_reset_workspace(workspace: torch.Tensor) -> None:
+def cake_rmsnorm_silu_gate_nondet_train_reset_workspace(
+    workspace: torch.Tensor,
+) -> None:
     """Return a caller-owned workspace of the non-deterministic backward to its
     first-use state.
 
@@ -375,7 +397,7 @@ def cake_rmsnorm_silu_gate_nondet_train_reset_workspace(workspace: torch.Tensor)
         The caller-owned FP64 workspace of the non-deterministic backward.
     """
 
-    _backend.cake_rmsnorm_silu_gate_nondet_train_reset_workspace(workspace)
+    _backend().cake_rmsnorm_silu_gate_nondet_train_reset_workspace(workspace)
 
 
 @flashinfer_api
@@ -477,7 +499,7 @@ def cake_rmsnorm_silu_gate_nondet_train_backward(
     ``(grad_x, grad_z, grad_weight)``.
     """
 
-    return _backend.cake_rmsnorm_silu_gate_nondet_train_backward(
+    return _backend().cake_rmsnorm_silu_gate_nondet_train_backward(
         grad_out,
         x,
         z,
@@ -528,13 +550,25 @@ def cake_rmsnorm_silu_gate_nondet(
         BF16 ``y`` of ``x``'s shape.
     """
 
-    return _backend.cake_rmsnorm_silu_gate_nondet(x, z, weight, eps)
+    return _backend().cake_rmsnorm_silu_gate_nondet(x, z, weight, eps)
+
+
+def __getattr__(name: str) -> Any:
+    if name in _BACKEND_OBJECTS:
+        value = getattr(_backend(), name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(_BACKEND_OBJECTS))
 
 
 __all__ = [
-    "ARCHES",
-    "SUPPORTED_COMPUTE_CAPABILITIES",
-    "CakeRMSNormSiLUGateNondetFunction",
+    "ARCHES",  # noqa: F822 - resolved by __getattr__
+    "SUPPORTED_COMPUTE_CAPABILITIES",  # noqa: F822 - resolved by __getattr__
+    "CakeRMSNormSiLUGateNondetFunction",  # noqa: F822 - resolved by __getattr__
     "cake_rmsnorm_silu_gate_nondet",
     "cake_rmsnorm_silu_gate_nondet_train_backward",
     "cake_rmsnorm_silu_gate_nondet_train_backward_workspace",
