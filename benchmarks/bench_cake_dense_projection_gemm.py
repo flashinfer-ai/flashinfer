@@ -315,18 +315,28 @@ def prepare_atomic(spec, inp, out, **knobs):
     )
 
 
-def convenience(spec, inp, out, *, deterministic):
-    """The convenience entry point of the row in one mode (cached plan, arena workspace)."""
+def convenience_det(spec, inp, out):
+    """The deterministic package's convenience entry point of the row (cached plan, arena workspace)."""
+    if spec["family"] == "router":
+        return lambda: det_backend.router_fp32_det_gemm(inp["A"], inp["B"], out)
+    if spec["family"] == "proj" and spec["op"] == "wgrad":
+        return lambda: det_backend.projection_det_wgrad(inp["G"], inp["X"], out)
+    return lambda: det_backend.dense_projection_det_gemm(inp["A"], inp["B"], out)
+
+
+def convenience_atomic(spec, inp, out):
+    """``deterministic=False`` through this package's convenience entry point of the row (cached plan, arena
+    workspace)."""
     if spec["family"] == "router":
         return lambda: cake_backend.router_fp32_gemm(
-            inp["A"], inp["B"], out, deterministic=deterministic
+            inp["A"], inp["B"], out, deterministic=False
         )
     if spec["family"] == "proj" and spec["op"] == "wgrad":
         return lambda: cake_backend.projection_wgrad(
-            inp["G"], inp["X"], out, deterministic=deterministic
+            inp["G"], inp["X"], out, deterministic=False
         )
     return lambda: cake_backend.dense_projection_gemm(
-        inp["A"], inp["B"], out, deterministic=deterministic
+        inp["A"], inp["B"], out, deterministic=False
     )
 
 
@@ -1346,9 +1356,12 @@ def _measure_row(entry, spec, args, libs, resident, uuid):
         mem["atomic_prepared_retained"], mem["atomic_prepared_peak_temp"] = memory_of(
             lambda: prepare_atomic(spec, inp, outs["atomic"]).launch
         )
-        for mode, deterministic in (("det", True), ("atomic", False)):
+        for mode, convenience in (
+            ("det", convenience_det),
+            ("atomic", convenience_atomic),
+        ):
             cake_backend.clear_convenience_caches()
-            fn = convenience(spec, inp, outs[mode], deterministic=deterministic)
+            fn = convenience(spec, inp, outs[mode])
             retained, peak = memory_of(lambda fn=fn: first_call(fn))
             mem[f"{mode}_convenience_retained"] = retained
             mem[f"{mode}_convenience_peak_temp"] = peak

@@ -81,7 +81,7 @@ ENTRY_POINTS = (
     "router_wgrad",
     "split_fp32_to_bf16x3_",
 )
-# former name -> the deterministic package's canonical name (its alias block, kept by #8046)
+# former name -> the deterministic package's canonical name
 FORMER_TO_DET = {
     "GemmPlan": "DetGemmPlan",
     "PreparedGemm": "PreparedDetGemm",
@@ -215,16 +215,6 @@ def test_entry_points_take_keyword_only_deterministic_true(name):
     ]
     assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
     assert parameter.default is True
-
-
-def test_the_deterministic_names_map():
-    assert {
-        k: v for k, v in cake_backend.DETERMINISTIC_NAMES.items() if k in FORMER_TO_DET
-    } == FORMER_TO_DET
-    for former, canonical in FORMER_TO_DET.items():
-        assert getattr(det_backend, former) is getattr(det_backend, canonical)
-    for name in ENTRY_POINTS:
-        assert getattr(cake_backend, name).__module__ == cake_backend.__name__
 
 
 @pytest.mark.parametrize("name", FORMER_MODULE_NAMES)
@@ -7690,7 +7680,7 @@ def test_gpu_k1_budgets_over_reruns(row, out_dtype, splits, k1_rule):
     device, arch = _atomic_device_or_skip()
     G, X, out = _k1_wgrad_inputs(row, 16231, out_dtype, device, SEED)
     ref = G.double().t() @ X.double()
-    det_out = cake_backend.projection_wgrad(G, X, torch.empty_like(out))
+    det_out = det_backend.projection_det_wgrad(G, X, torch.empty_like(out))
     prepared = _k1_prepare(G, X, out, arch, splits)
     _assert_ran(prepared.launch, prepared.module_name)
     k1_rule(G, X, out, splits)
@@ -7937,7 +7927,7 @@ def test_gpu_k1_ragged_token_counts_reuse_poisoned_scratch(k1_rule):
         _k1_check(out, G.double().t() @ X.double(), f"T={T}")
         assert _arena_tickets_zero(), T
         if not cake_backend.k1_splits_fit(3, T):
-            assert torch.equal(out, cake_backend.projection_wgrad(G, X))
+            assert torch.equal(out, det_backend.projection_det_wgrad(G, X))
     assert len(cake_backend._ATOMIC_ARENAS) == 1
     (arena,) = cake_backend._ATOMIC_ARENAS.values()
     assert arena.version >= 2  # created, then grown or reused; never shrunk
@@ -7958,7 +7948,7 @@ def test_gpu_torch_deterministic_mode_rule(torch_determinism):
     launch; with ``warn_only=True`` it warns and returns the deterministic bits."""
     device = _det_device_or_skip()
     G, X, out = _k1_wgrad_inputs("indexer_hw", 4097, torch.bfloat16, device, SEED + 40)
-    expected = cake_backend.projection_wgrad(G, X, torch.empty_like(out))
+    expected = det_backend.projection_det_wgrad(G, X, torch.empty_like(out))
     torch.use_deterministic_algorithms(True)
     with pytest.raises(RuntimeError, match="deterministic=True"):
         cake_backend.projection_wgrad(G, X, out, deterministic=False)
@@ -7976,7 +7966,7 @@ def test_gpu_det_then_atomic_share_a_stream_not_a_workspace(k1_rule):
     k1_rule(G, X, out, 2)
     ref = G.double().t() @ X.double()
     for _ in range(3):
-        det = cake_backend.projection_wgrad(G, X, torch.empty_like(out))
+        det = det_backend.projection_det_wgrad(G, X, torch.empty_like(out))
         atomic = cake_backend.projection_wgrad(G, X, out, deterministic=False)
         torch.cuda.synchronize()
         _k1_check(det, ref)
@@ -8011,19 +8001,26 @@ def test_gpu_k1_deterministic_program_through_the_binding():
                 _bf16((N, K), device, g, K**-0.5),
                 _bf16((T, N), device, g),
             )
+            # op -> (out shape, out dtype, the deterministic package's call, this package's deterministic=False call)
             # fmt: off
             calls = {
-                "fwd": ((T, N), torch.bfloat16, lambda o, d: cake_backend.projection_forward(X, W, o, deterministic=d)),
-                "dgrad": ((T, K), torch.bfloat16, lambda o, d: cake_backend.projection_dgrad(G, W, o, deterministic=d)),
-                "dgrad_f32": ((T, K), torch.float32, lambda o, d: cake_backend.projection_dgrad(G, W, o, deterministic=d)),
-                "wgrad": ((N, K), torch.bfloat16, lambda o, d: cake_backend.projection_wgrad(G, X, o, deterministic=d)),
-                "wgrad_f32": ((N, K), torch.float32, lambda o, d: cake_backend.projection_wgrad(G, X, o, deterministic=d)),
-                "wgrad_sk": ((N, K), torch.float32, lambda o, d: cake_backend.projection_wgrad(G, X, o, sk=False, deterministic=d)),
+                "fwd": ((T, N), torch.bfloat16, lambda o: det_backend.projection_det_forward(X, W, o),
+                        lambda o: cake_backend.projection_forward(X, W, o, deterministic=False)),
+                "dgrad": ((T, K), torch.bfloat16, lambda o: det_backend.projection_det_dgrad(G, W, o),
+                          lambda o: cake_backend.projection_dgrad(G, W, o, deterministic=False)),
+                "dgrad_f32": ((T, K), torch.float32, lambda o: det_backend.projection_det_dgrad(G, W, o),
+                              lambda o: cake_backend.projection_dgrad(G, W, o, deterministic=False)),
+                "wgrad": ((N, K), torch.bfloat16, lambda o: det_backend.projection_det_wgrad(G, X, o),
+                          lambda o: cake_backend.projection_wgrad(G, X, o, deterministic=False)),
+                "wgrad_f32": ((N, K), torch.float32, lambda o: det_backend.projection_det_wgrad(G, X, o),
+                              lambda o: cake_backend.projection_wgrad(G, X, o, deterministic=False)),
+                "wgrad_sk": ((N, K), torch.float32, lambda o: det_backend.projection_det_wgrad(G, X, o, sk=False),
+                             lambda o: cake_backend.projection_wgrad(G, X, o, sk=False, deterministic=False)),
             }
             # fmt: on
             arch = det_backend.arch_for(device)
             sm_count = det_backend.device_facts(device).sm_count
-            for op, ((rows_, cols), dtype, call) in calls.items():
+            for op, ((rows_, cols), dtype, det_call, call) in calls.items():
                 f32 = dtype == torch.float32
                 if op.startswith("wgrad") and cake_backend.k1_plan(
                     arch=arch, L=1, M=K, N=N, K=T, out_f32=f32, sm_count=sm_count
@@ -8036,10 +8033,10 @@ def test_gpu_k1_deterministic_program_through_the_binding():
                     out = storage[:, :cols]
                 else:
                     out = torch.empty(rows_, cols, device=device, dtype=dtype)
-                want = call(out, True).clone()
+                want = det_call(out).clone()
                 for _ in range(2):
                     out.fill_(float("nan"))
-                    assert call(out, False) is out
+                    assert call(out) is out
                     assert torch.equal(out, want), (name, op, T, pad_out)
                 if pad_out:
                     assert bool((storage[:, cols:] == 7.0).all()), (name, op)
@@ -8058,7 +8055,7 @@ def test_gpu_k1_deterministic_program_through_the_binding():
             )
             if det_backend._swap_ab_launch(A, B, out, False) is not None:
                 swapped.add((T, shape))
-            want = cake_backend.dense_projection_gemm(A, B, out).clone()
+            want = det_backend.dense_projection_det_gemm(A, B, out).clone()
             out.fill_(float("nan"))
             assert (
                 cake_backend.dense_projection_gemm(A, B, out, deterministic=False)
@@ -8103,7 +8100,7 @@ def test_gpu_k1_deterministic_program_through_the_binding():
     Xm = storage[1 : 1 + 1001 * 4096].view(1001, 4096)
     Xm.copy_(X)
     with pytest.raises(ValueError, match="16-byte aligned") as refused:
-        cake_backend.projection_forward(Xm, W)
+        det_backend.projection_det_forward(Xm, W)
     with pytest.raises(ValueError, match=re.escape(str(refused.value))):
         cake_backend.projection_forward(Xm, W, deterministic=False)
 
@@ -8163,7 +8160,7 @@ def test_gpu_k1_pdl_waits_for_an_early_producer(splits, k1_rule):
     for _ in range(3):
         G.fill_(float("nan"))
         out.fill_(float("nan"))
-        cake_backend.projection_forward(H, Wg, G, enable_pdl=True)
+        det_backend.projection_det_forward(H, Wg, G, enable_pdl=True)
         cake_backend.projection_wgrad(G, X, out, deterministic=False, enable_pdl=True)
         torch.cuda.synchronize()
         _k1_check(out, G.double().t() @ X.double())
@@ -8184,12 +8181,12 @@ def test_gpu_k1_bound_deterministic_program_waits_for_an_early_producer():
     W = _bf16((N, K), device, g, K**-0.5)
     G = torch.empty(T, N, device=device, dtype=torch.bfloat16)
     dX = torch.empty(T, K, device=device, dtype=torch.bfloat16)
-    cake_backend.projection_forward(H, Wg, G, enable_pdl=False)
-    want = cake_backend.projection_dgrad(G, W, enable_pdl=False).clone()
+    det_backend.projection_det_forward(H, Wg, G, enable_pdl=False)
+    want = det_backend.projection_det_dgrad(G, W, enable_pdl=False).clone()
     for _ in range(3):
         G.fill_(float("nan"))
         dX.fill_(float("nan"))
-        cake_backend.projection_forward(H, Wg, G, enable_pdl=True)
+        det_backend.projection_det_forward(H, Wg, G, enable_pdl=True)
         assert (
             cake_backend.projection_dgrad(
                 G, W, dX, deterministic=False, enable_pdl=True
@@ -8405,7 +8402,7 @@ def _router_gate(op, splits, spec, router_rule, T, hidden, seed):
     assert worst <= ROUTER_REL_FRO_MAX, worst
     if splits == 1:
         det_out = torch.empty_like(out)
-        cake_backend.router_fp32_gemm(A, B, det_out, splits=1)
+        det_backend.router_fp32_det_gemm(A, B, det_out, splits=1)
         assert torch.equal(out, det_out)
     return plan
 
@@ -8522,7 +8519,7 @@ def test_gpu_router_tmem_head_tail_program_in_its_windows(hidden, T):
         launch.launch()
         torch.cuda.synchronize()
     det_out = torch.empty_like(out)
-    cake_backend.router_fp32_gemm(A, B, det_out, splits=1)
+    det_backend.router_fp32_det_gemm(A, B, det_out, splits=1)
     assert torch.equal(stores[ts], stores[c3]) and torch.equal(stores[ts], det_out)
 
 
@@ -8887,7 +8884,7 @@ def test_gpu_router_input_gradient_windows_run_at_their_edges():
             prepared = cake_backend.prepare_router_fp32_gemm(
                 G, W, torch.empty(T, hidden, device=device), deterministic=False
             )
-            det_out = cake_backend.router_dgrad(G, W)
+            det_out = det_backend.router_det_dgrad(G, W)
             first = None
             for _ in range(2):
                 out = torch.full((T, hidden), float("nan"), device=device)
@@ -9014,7 +9011,7 @@ def test_gpu_router_forward_simt_windows_keep_the_fp64_rule(monkeypatch):
                     assert torch.equal(out, got), (hidden, T)
                     del graph
                 ref = X.double() @ W.double().t()
-                base = cake_backend.router_forward(X, W)
+                base = det_backend.router_det_forward(X, W)
                 err, base_err = _rel_fro(got, ref), _rel_fro(base, ref)
                 assert err <= ROUTER_REL_FRO_MAX, (hidden, T, seed, err)
                 gamma = hidden * 2.0**-24 / (1 - hidden * 2.0**-24)
@@ -9139,7 +9136,7 @@ def test_gpu_router_entry_points_reach_the_stream_k_program(router_rule):
     router_rule("fwd", X, W.t(), "forward")
     router_rule("wgrad", G.t(), X, "pairs")
     first = cake_backend.router_forward(X, W, deterministic=False)
-    det_fwd = cake_backend.router_forward(X, W)
+    det_fwd = det_backend.router_det_forward(X, W)
     ref_fwd, ref_wgrad = X.double() @ W.double().t(), G.double().t() @ X.double()
     for name, out in (("atomic", first), ("det", det_fwd)):
         differ, ties = _top8_rows_differ(out, ref_fwd)
@@ -9320,7 +9317,7 @@ def test_gpu_k1_forward_rows_run_their_plan():
         torch.cuda.synchronize()
         assert torch.equal(out, again), (K, N, T)
         det_out = torch.full_like(out, float("nan"))
-        cake_backend.projection_forward(X, W, det_out)
+        det_backend.projection_det_forward(X, W, det_out)
         torch.cuda.synchronize()
         _k1_check(det_out, ref, f"deterministic forward {K} {N} {T}")
         ran += 1
@@ -9767,8 +9764,8 @@ def test_gpu_router_rows_without_a_verdict_run_the_deterministic_program_unplann
         wgrad = cake_backend.router_wgrad(G, X, deterministic=False)
         assert not cake_backend._K2_ATOMIC_CACHE
         assert len(cake_backend._K2_SPLITK_CACHE) == 2
-        assert torch.equal(fwd, cake_backend.router_forward(X, W))
-        assert torch.equal(wgrad, cake_backend.router_wgrad(G, X))
+        assert torch.equal(fwd, det_backend.router_det_forward(X, W))
+        assert torch.equal(wgrad, det_backend.router_det_wgrad(G, X))
         A, B, out = _router_case("fwd", X, W, G)
         assert cake_backend.router_fp32_gemm(A, B, out, deterministic=False) is out
         assert torch.equal(out, fwd) and not cake_backend._K2_ATOMIC_CACHE
@@ -9901,24 +9898,28 @@ def test_gpu_router_deterministic_program_through_the_binding():
         if pad_g:
             G = torch.cat([G, torch.zeros(T, 16, device=device)], 1)[:, :256]
         shapes = {"fwd": (T, 256), "dgrad": (T, hidden), "wgrad": (256, hidden)}
+        # op -> (the deterministic package's call, this package's deterministic=False call)
         # fmt: off
         calls = {
-            "fwd": lambda out, d: cake_backend.router_forward(X, W, out, deterministic=d),
-            "dgrad": lambda out, d: cake_backend.router_dgrad(G, W, out, deterministic=d),
-            "wgrad": lambda out, d: cake_backend.router_wgrad(G, X, out, deterministic=d),
+            "fwd": (lambda out: det_backend.router_det_forward(X, W, out),
+                    lambda out: cake_backend.router_forward(X, W, out, deterministic=False)),
+            "dgrad": (lambda out: det_backend.router_det_dgrad(G, W, out),
+                      lambda out: cake_backend.router_dgrad(G, W, out, deterministic=False)),
+            "wgrad": (lambda out: det_backend.router_det_wgrad(G, X, out),
+                      lambda out: cake_backend.router_wgrad(G, X, out, deterministic=False)),
         }
         # fmt: on
-        for op, call in calls.items():
+        for op, (det_call, call) in calls.items():
             rows, cols = shapes[op]
             if pad_out:
                 storage = torch.full((rows, cols + 64), 7.0, device=device)
                 out = storage[:, :cols]
             else:
                 out = torch.empty(rows, cols, device=device)
-            want = call(out, True).clone()
+            want = det_call(out).clone()
             for _ in range(2):
                 out.fill_(float("nan"))
-                assert call(out, False) is out
+                assert call(out) is out
                 assert torch.equal(out, want), (op, T, pad_out, pad_g)
             if pad_out:
                 assert bool((storage[:, cols:] == 7.0).all()), op
@@ -9955,7 +9956,7 @@ def test_gpu_router_deterministic_program_through_the_binding():
     storage = torch.empty(1001 * hidden + 4, device=device)
     out = storage[1 : 1 + 1001 * hidden].view(1001, hidden)
     with pytest.raises(ValueError, match="16-byte aligned") as refused:
-        cake_backend.router_dgrad(G, W, out)
+        det_backend.router_det_dgrad(G, W, out)
     with pytest.raises(ValueError, match=re.escape(str(refused.value))):
         cake_backend.router_dgrad(G, W, out, deterministic=False)
 
@@ -10333,6 +10334,11 @@ def test_gpu_router_entry_points_give_their_paths_results(monkeypatch, hidden, T
         "dgrad": cake_backend.router_dgrad,
         "wgrad": cake_backend.router_wgrad,
     }
+    det_calls = {
+        "fwd": det_backend.router_det_forward,
+        "dgrad": det_backend.router_det_dgrad,
+        "wgrad": det_backend.router_det_wgrad,
+    }
     shapes = {"fwd": (T, 256), "dgrad": (T, hidden), "wgrad": (256, hidden)}
     side = torch.cuda.Stream(device)
     ran = {"bits": 0, "gate": 0}
@@ -10372,7 +10378,7 @@ def test_gpu_router_entry_points_give_their_paths_results(monkeypatch, hidden, T
                     assert torch.equal(out, want), (op, splits, pad)
             if not entry.atomic:
                 det_kw = {} if op == "dgrad" or splits is None else {"splits": splits}
-                det_out = calls[op](P, Q, torch.empty_like(out), **det_kw)
+                det_out = det_calls[op](P, Q, torch.empty_like(out), **det_kw)
                 stream.synchronize()
                 assert torch.equal(out, det_out), (op, splits, pad)
         ran["bits" if _router_entry_bits(entry) else "gate"] += 1
