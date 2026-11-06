@@ -14,9 +14,9 @@ dense ``[E * H + 1, w2_dense_k / 2]`` copy of the caller's bytes (zero codes
 past ``w2_logical_k`` and one zero row at the end, which the last row's final
 K step reads into) with ``K2 = w2_dense_k``, and every other call on that route
 binds the padded ``W2`` as before. The scales are padded alike either way.
-The dense image's tensor map (a rank-3 16U4 map with 32-byte chunk strides)
-has been validated on driver 580.159.03; a driver that refuses it fails the
-bind with an error, never with a wrong result.
+The dense image's tensor map is a rank-3 16U4 map with 32-byte chunk strides;
+a driver that refuses it fails the bind with an error, never with a wrong
+result.
 
 Expert-parallel calls describe the rank's window of the global expert space:
 ``num_experts`` is the number of experts this rank holds (the leading dimension
