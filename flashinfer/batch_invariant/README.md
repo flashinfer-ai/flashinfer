@@ -114,17 +114,24 @@ orders and the chains; `lake exe quantconformance` prints its terms for the gene
 
 ## Sampling
 
-`flashinfer.sampling.softmax(logits, temperature, batch_invariant=True)` and the new entry
-`flashinfer.sampling.log_probs(logits, token_ids, temperature, return_lse=)` run one class, `lse.row`: the row maximum
-`m` and the sum `s` of the exponentials as the engine's canonical trees over the vocabulary (an 8-element fold per slot,
-pairwise over the blocks of 256 elements, pairwise over the 32 lanes: a function of the vocabulary alone, never of the
-batch, the configuration or the device), and fixed chains over them. The operator's own softmax selects its reduction
-path by batch size, so a row's bits there depend on the batch; the class is what the mode promises instead.
+`flashinfer.sampling.softmax(logits, temperature, batch_invariant=True[, out_dtype=])` and the new entries
+`flashinfer.sampling.log_softmax(logits, temperature)` and `flashinfer.sampling.log_probs(logits, token_ids,
+temperature, return_lse=)` run one class, `lse.row`: the row maximum `m` and the sum `s` of the exponentials as the
+engine's canonical trees over the vocabulary (an 8-element fold per slot, pairwise over the blocks of 256 elements,
+pairwise over the 32 lanes: a function of the vocabulary alone, never of the batch, the configuration or the device),
+and fixed chains over them. The operator's own softmax selects its reduction path by batch size, so a row's bits there
+depend on the batch; the class is what the mode promises instead.
 
 | API | Class and fingerprint | Numerics | Supported inputs |
 |---|---|---|---|
-| `softmax(..., batch_invariant=True)` | `lse.row`; `fingerprint("softmax", N=, dtype=, temperature=)` (the vocabulary, the input dtype and whether a temperature enters the scale are the specification's dimensions) | `c = log2(e)` or `div.rn(log2(e), T)`; `z_j = mul.rn(add.rn(x_j, neg(m)), c)`; `e_j = ex2.approx.ftz(z_j)`; `s` the `add.rn` tree over the `e_j`; `p_j = cvt.rn(mul.rn(e_j, div.rn(1, s)))` in the input dtype. `m` is the `max.f32` tree (a NaN operand yields the other; a NaN logit then propagates through the sum), a `-inf` logit weighs `+0` | bf16 / f16 / fp32 logits `(..., N)`, any `N`; temperature `None`, a positive scalar, or one per row (f16 / bf16 / f32 / f64, the last rounded to f32); same-dtype output; `enable_pdl`; SM100 / SM103 / SM107 |
-| `log_probs(logits, token_ids, temperature, return_lse=)` | the same class and fingerprint (`fingerprint("log_probs", ...)`) | from the same `m`, `s` and `z`: `logp_t = mul.rn(add.rn(z_t, neg(lg2.approx.ftz(s))), ln 2)` for the row's token id (NaN for an id outside `[0, N)`), and with `return_lse` the row's `lse = mul.rn(add.rn(mul.rn(m, c), lg2.approx.ftz(s)), ln 2)`; fp32 outputs of shape `logits.shape[:-1]` | as above; `token_ids` int32 / int64 of shape `logits.shape[:-1]`; this entry has no non-invariant implementation (`batch_invariant=False` raises) |
+| `softmax(..., batch_invariant=True, out_dtype=)` | `lse.row`; `fingerprint("softmax", N=, dtype=, temperature=[, out_dtype=])` (the vocabulary, the input dtype and whether a temperature enters the scale are the specification's dimensions; `out_dtype=torch.float32` names the fp32 input's specification: the leaves of a 16-bit input are its exact widenings, so only the output conversion differs) | `c = log2(e)` or `div.rn(log2(e), T)`; `z_j = mul.rn(add.rn(x_j, neg(m)), c)`; `e_j = ex2.approx.ftz(z_j)`; `s` the `add.rn` tree over the `e_j`; `p_j = cvt.rn(mul.rn(e_j, div.rn(1, s)))` in the input dtype, or `mul.rn(e_j, div.rn(1, s))` itself with `out_dtype=torch.float32`. `m` is the `max.f32` tree (a NaN operand yields the other; a NaN logit then propagates through the sum), a `-inf` logit weighs `+0` | bf16 / f16 / fp32 logits `(..., N)`, any `N`; temperature `None`, a positive scalar, or one per row (f16 / bf16 / f32 / f64, the last rounded to f32); same-dtype or fp32 output; `enable_pdl`; SM100 / SM103 / SM107 |
+| `log_softmax(logits, temperature)` | the same class and fingerprint (`fingerprint("log_softmax", ...)`) | the row `logp_j = mul.rn(add.rn(z_j, neg(lg2.approx.ftz(s))), ln 2)` in fp32, shape `logits.shape` | as above; this entry has no non-invariant implementation (`batch_invariant=False` raises) |
+| `log_probs(logits, token_ids, temperature, return_lse=)` | the same class and fingerprint (`fingerprint("log_probs", ...)`) | the log-softmax row above gathered at the row's token ids (NaN for an id outside `[0, N)`), and with `return_lse` the row's `lse = mul.rn(add.rn(mul.rn(m, c), lg2.approx.ftz(s)), ln 2)`; fp32 outputs of the ids' shape / `logits.shape[:-1]` | as above; `token_ids` int32 / int64 of shape `logits.shape[:-1]` (one id per row) or `logits.shape[:-1] + (K,)` (`K` ids per row in one launch); `batch_invariant=False` raises |
+
+A row view into a wider tensor (the `[..., :vocab]` slice of a padded lm_head) whose row stride is a multiple of 16 bytes
+is read in place; other views are copied first (a placement). For a sampler and a trainer to agree bit for bit they must
+call with the same arguments: raw logits and the temperature (the class scales inside its chain), or identically
+pre-scaled logits and `temperature=None`; a greedy row's temperature of 0 is `None`.
 
 `ex2.approx.ftz.f32` and `lg2.approx.ftz.f32` are the class's two opaque primitives: deterministic per architecture,
 pinned as inline PTX in the kernel, and tabulated on the device for the exact CPU model (`sampling/mufu_device.py`).

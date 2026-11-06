@@ -402,6 +402,40 @@ def test_shared_dataflow_of_the_entries():
     assert torch.isnan(lpb[:2]).all()
     assert same(lpb[2:], lp_row[torch.arange(2, 16, device="cuda"), bad[2:]])
     assert same(flashinfer.sampling.log_probs(x, ids.to(torch.int32), temps), lp)
+    # the log-softmax entry is the class's row; K ids per row are the row gathered K times (one launch), NaN per id
+    assert same(flashinfer.sampling.log_softmax(x, temps), lp_row)
+    with pytest.raises(ValueError):
+        flashinfer.sampling.log_softmax(x, temps, batch_invariant=False)
+    ar = torch.arange(16, device="cuda")
+    ids3 = torch.stack([ids, bad, ids.flip(0)], dim=1)
+    lp3, lse3 = flashinfer.sampling.log_probs(x, ids3, temps, return_lse=True)
+    assert lp3.shape == (16, 3) and lp3.dtype == torch.float32 and same(lse3, lse)
+    assert same(lp3[:, 0], lp) and same(lp3[:, 2], lp_row[ar, ids.flip(0)])
+    assert torch.isnan(lp3[:2, 1]).all() and same(lp3[2:, 1], lpb[2:])
+    ids40 = torch.randint(0, 8192, (16, 40), device="cuda")  # two lane rounds of ids
+    lp40 = flashinfer.sampling.log_probs(x, ids40, temps)
+    assert lp40.shape == (16, 40) and same(lp40, lp_row[ar[:, None], ids40])
+    assert same(flashinfer.sampling.log_probs(x, ids40.to(torch.int32), temps), lp40)
+    assert same(flashinfer.sampling.log_probs(x, ids[:, None], temps), lp[:, None])
+    # softmax in fp32 is the fp32 input's class: the probabilities before the output conversion
+    p32 = flashinfer.sampling.softmax(
+        x, temps, batch_invariant=True, out_dtype=torch.float32
+    )
+    assert p32.dtype == torch.float32 and same(
+        p32, flashinfer.sampling.softmax(x.float(), temps, batch_invariant=True)
+    )
+    assert same(
+        flashinfer.sampling.softmax(
+            x, temps, batch_invariant=True, out_dtype=torch.bfloat16
+        ),
+        flashinfer.sampling.softmax(x, temps, batch_invariant=True),
+    )
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        flashinfer.sampling.softmax(
+            x, temps, batch_invariant=True, out_dtype=torch.float16
+        )
+    with pytest.raises(ValueError):
+        flashinfer.sampling.softmax(x, temps, out_dtype=torch.float32)
 
 
 @needs_device
@@ -460,10 +494,20 @@ def test_determinism_graph_replay_and_pdl():
 
 @needs_device
 def test_shapes_views_and_empty_batches():
-    """3-D logits, a view into a wider tensor (copied: a placement), the output shapes and dtypes, M = 0."""
+    """3-D logits, a view into a wider tensor (read in place when its row stride is 16-byte aligned, copied otherwise:
+    a placement), the output shapes and dtypes, K ids per row in 3-D, M = 0."""
     N = 4096
     x = logits(8, 2 * N, torch.bfloat16)[:, :N]
     assert same(softmax_batch_invariant(x), softmax_batch_invariant(x.contiguous()))
+    ids8 = ids_for(x)
+    assert same(
+        log_probs_batch_invariant(x, ids8),
+        log_probs_batch_invariant(x.contiguous(), ids8),
+    )
+    xo = logits(8, N + 8, torch.bfloat16)[
+        :, :N
+    ]  # an odd pad: a 16-byte-aligned stride still, in place
+    assert same(softmax_batch_invariant(xo), softmax_batch_invariant(xo.contiguous()))
     x3 = logits(6, N, torch.bfloat16).view(2, 3, N)
     ids3 = torch.zeros(2, 3, dtype=torch.long, device="cuda")
     p3 = softmax_batch_invariant(x3)
@@ -472,8 +516,19 @@ def test_shapes_views_and_empty_batches():
     lp3, lse3 = log_probs_batch_invariant(x3, ids3, return_lse=True)
     assert lp3.shape == (2, 3) and lse3.shape == (2, 3) and lp3.dtype == torch.float32
     assert same(lp3.view(6), log_probs_batch_invariant(x3.view(6, N), ids3.view(6)))
+    ids3k = torch.randint(0, N, (2, 3, 5), device="cuda")
+    lp3k = log_probs_batch_invariant(x3, ids3k)
+    assert lp3k.shape == (2, 3, 5)
+    assert same(
+        lp3k.view(6, 5), log_probs_batch_invariant(x3.view(6, N), ids3k.view(6, 5))
+    )
+    assert flashinfer.sampling.log_softmax(x3).shape == (2, 3, N)
     with pytest.raises(ValueError):
         log_probs_batch_invariant(x3, ids3.view(6))
+    with pytest.raises(ValueError):
+        log_probs_batch_invariant(
+            x3, torch.zeros(2, 3, 0, dtype=torch.long, device="cuda")
+        )
     x0 = torch.empty(0, N, device="cuda", dtype=torch.bfloat16)
     assert softmax_batch_invariant(x0).shape == (0, N)
     lp0, lse0 = log_probs_batch_invariant(

@@ -152,19 +152,24 @@ def logp(fp, z, nlg2s):
 # ---------------------------------------------------------------------------------------------------- the symbolic spec
 @dataclass(frozen=True)
 class Mode:
-    """Which outputs a kernel writes: the probabilities (softmax, input dtype), the full log-softmax row (f32), the
-    per-row ``lse`` (f32), the log-probability of a given token id per row (f32)."""
+    """Which outputs a kernel writes: the probabilities (softmax, in the input dtype, or in fp32 with ``probs_f32``: the
+    chain before its output conversion, which for a 16-bit input is the fp32 input's class since the leaves are the exact
+    widenings), the full log-softmax row (f32), the per-row ``lse`` (f32), the log-probabilities of the given token ids per
+    row (f32; one id or ``K`` ids per row)."""
 
     probs: bool = False
     logprobs: bool = False
     lse: bool = False
     logp: bool = False
+    probs_f32: bool = False
 
     def __post_init__(self):
         if not (self.probs or self.logprobs or self.lse or self.logp):
             raise ValueError("a mode writes at least one output")
         if self.probs and self.logprobs:
             raise ValueError("one row output per launch (probs or logprobs)")
+        if self.probs_f32 and not self.probs:
+            raise ValueError("probs_f32 qualifies the probabilities output")
 
     @property
     def name(self) -> str:
@@ -172,6 +177,7 @@ class Mode:
             t
             for t, on in (
                 ("p", self.probs),
+                ("f", self.probs_f32),
                 ("l", self.logprobs),
                 ("s", self.lse),
                 ("t", self.logp),
@@ -185,6 +191,7 @@ class Mode:
 
 
 SOFTMAX = Mode(probs=True)
+SOFTMAX_F32 = Mode(probs=True, probs_f32=True)
 LOG_SOFTMAX = Mode(logprobs=True)
 LSE = Mode(lse=True)
 LOGP = Mode(logp=True)

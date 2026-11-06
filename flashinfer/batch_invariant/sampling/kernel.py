@@ -340,6 +340,7 @@ class LSERowKernel:
         cfg: LSEConfig,
         mode: Mode,
         temp_rows: bool,
+        k_slots: int = 1,
     ):
         N = (
             Kp * BLOCK
@@ -353,7 +354,11 @@ class LSERowKernel:
             mode,
             temp_rows,
         )
-        self.out_dtype = dtype if mode.probs else Float32
+        # token ids per row the log-probability output is specialised for: 1 (one id, every thread forms it) or a
+        # multiple of 32 (the lanes of warp 0 take the ids in turn; `K` at run time predicates the tail)
+        assert k_slots == 1 or (k_slots > 0 and k_slots % LANES == 0), k_slots
+        self.k_slots = k_slots
+        self.out_dtype = dtype if (mode.probs and not mode.probs_f32) else Float32
         pl = cfg.placement(N)
         self.plan_max = canon.plan(max_reduction(N, None), pl)
         self.plan_sum = canon.plan(sum_reduction(N, None), pl)
@@ -407,6 +412,7 @@ class LSERowKernel:
         c_const: Float32,
         M: Int64,
         N: Int32,
+        K: Int32,
         enable_pdl: cutlass.Constexpr[bool],
         stream,
     ):
@@ -420,6 +426,7 @@ class LSERowKernel:
             c_const,
             M,
             N,
+            K,
             enable_pdl,
             self._tv_layout(self.vec),
             self._tv_layout(self.vec_out),
@@ -455,6 +462,7 @@ class LSERowKernel:
         c_const: Float32,
         M: Int64,
         N: Int32,
+        K: Int32,
         enable_pdl: cutlass.Constexpr[bool],
         tv_layout: cute.Layout,
         tv_layout_out: cute.Layout,
@@ -571,17 +579,38 @@ class LSERowKernel:
                         if row_ok:
                             mLse[row] = lse_v
         if cutlass.const_expr(self.mode.logp):
-            tok = mTok[row_c]
-            tok_ok = (tok >= 0) & (tok < N.to(Int64))
-            tok_c = _select(tok_ok, tok, Int64(0))
-            xt = mX[row_c, tok_c].to(Float32)
-            lp = logp(fp, shifted(fp, xt, nm, c), fp.neg(lg2s))
-            lp = _select(tok_ok, lp, Float32(NAN))
-            if t == 0:
-                if w == 0:
-                    if c_rank == 0:
-                        if row_ok:
-                            mLogp[row] = lp
+            nlg2s = fp.neg(lg2s)
+            if cutlass.const_expr(self.k_slots == 1):
+                # one id per row: every thread forms it, thread 0 of the row's first CTA stores it
+                tok = mTok[row_c, 0]
+                tok_ok = (tok >= 0) & (tok < N.to(Int64))
+                tok_c = _select(tok_ok, tok, Int64(0))
+                xt = mX[row_c, tok_c].to(Float32)
+                lp = logp(fp, shifted(fp, xt, nm, c), nlg2s)
+                lp = _select(tok_ok, lp, Float32(NAN))
+                if t == 0:
+                    if w == 0:
+                        if c_rank == 0:
+                            if row_ok:
+                                mLogp[row, 0] = lp
+            else:
+                # K ids per row: lane `t` of every warp forms ids t, t + 32, ... (the same chain per id; the gathers of
+                # a warp's lanes are independent loads), warp 0 of the row's first CTA stores the ids below `K`
+                for it in cutlass.range_constexpr(self.k_slots // LANES):
+                    kk = Int32(it * LANES) + t
+                    k_ok = kk < K
+                    kc = _select(k_ok, kk, Int32(0))
+                    tok = mTok[row_c, kc]
+                    tok_ok = (tok >= 0) & (tok < N.to(Int64))
+                    tok_c = _select(tok_ok, tok, Int64(0))
+                    xt = mX[row_c, tok_c].to(Float32)
+                    lp = logp(fp, shifted(fp, xt, nm, c), nlg2s)
+                    lp = _select(tok_ok, lp, Float32(NAN))
+                    if w == 0:
+                        if c_rank == 0:
+                            if row_ok:
+                                if k_ok:
+                                    mLogp[row, kc] = lp
 
         # ===== pass 3: the row outputs ======================================================================================
         if cutlass.const_expr(self.mode.row_output):
@@ -624,10 +653,17 @@ def kernel_name(
     cfg: LSEConfig,
     temp_rows: bool,
     enable_pdl: bool,
+    k_slots: int = 1,
 ) -> str:
     return jit.sanitize_symbol_name(
         f"lse_{mode.name}_{dtype_str}_Kp{Kp}_{cfg.describe()}_{'trow' if temp_rows else 'tconst'}_pdl{int(enable_pdl)}"
+        + (f"_k{k_slots}" if k_slots != 1 else "")
     )
+
+
+def k_slots_for(K: int) -> int:
+    """The compile-time id slots per row serving ``K`` ids: 1, else the multiple of 32 at or above ``K``."""
+    return 1 if K <= 1 else LANES * (-(-int(K) // LANES))
 
 
 def get_compiled_kernel(
@@ -637,13 +673,14 @@ def get_compiled_kernel(
     mode: Mode,
     temp_rows: bool,
     enable_pdl: bool,
+    k_slots: int = 1,
 ):
-    """The compiled kernel serving vocabulary ``N``: one per (dtype, Kp bucket, config, mode, temperature form, pdl);
-    ``N``, ``M`` and the row stride are runtime arguments."""
+    """The compiled kernel serving vocabulary ``N``: one per (dtype, Kp bucket, config, mode, temperature form, pdl,
+    id slots); ``N``, ``M``, ``K`` and the row stride are runtime arguments."""
     from .schedule import padded_blocks
 
     return _compile_bucket(
-        dtype_str, padded_blocks(N), cfg, mode, temp_rows, enable_pdl
+        dtype_str, padded_blocks(N), cfg, mode, temp_rows, enable_pdl, k_slots
     )
 
 
@@ -655,14 +692,15 @@ def _compile_bucket(
     mode: Mode,
     temp_rows: bool,
     enable_pdl: bool,
+    k_slots: int = 1,
 ):
     from ..fp_interface.cute import get_cutlass_dtype
 
     dtype = get_cutlass_dtype(dtype_str)
-    name = kernel_name(mode, dtype_str, Kp, cfg, temp_rows, enable_pdl)
+    name = kernel_name(mode, dtype_str, Kp, cfg, temp_rows, enable_pdl, k_slots)
 
     def compile_fn():
-        obj = LSERowKernel(dtype, Kp, cfg, mode, temp_rows)
+        obj = LSERowKernel(dtype, Kp, cfg, mode, temp_rows, k_slots)
         sym_m, sym_n = cute.sym_int(64), cute.sym_int(32)
 
         def rows(dt, vec, shape):
@@ -684,12 +722,22 @@ def _compile_bucket(
         y_shape = (
             (sym_m, sym_n) if mode.row_output else (cute.sym_int(64), cute.sym_int(32))
         )
+
+        def ids(dt, align):
+            # the token ids and their log-probabilities: (rows, K) with their own size symbols (dummies when unused)
+            return cute.runtime.make_fake_tensor(
+                dt,
+                (cute.sym_int(64), cute.sym_int(32)),
+                (cute.sym_int64(divisibility=1), 1),
+                assumed_align=align,
+            )
+
         args = (
             rows(dtype, cfg.vec_elems, (sym_m, sym_n)),
             rows(obj.out_dtype, obj.vec_out, y_shape),
             vector(Float32, 4),
-            vector(Int64, 8),
-            vector(Float32, 4),
+            ids(Int64, 8),
+            ids(Float32, 4),
             vector(Float32, 4),
         )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
@@ -698,6 +746,7 @@ def _compile_bucket(
             *args,
             Float32(1.0),
             Int64(1),
+            Int32(1),
             Int32(1),
             enable_pdl,
             stream_fake,

@@ -254,6 +254,12 @@ TP_BYTES_PER_THREAD = (
     512  # throughput regime: about this many input bytes per thread of a CTA's share.
 )
 TP_MAX_CLUSTER = 8  # throughput regime: at most this many CTAs per row.
+TP_PAD_MAX = 0.25  # throughput regime: no cluster while the tree's padding (Kp - blocks) / Kp exceeds this (a cluster's idle
+#   CTAs wait at its barriers holding SMs); the three-pass members then take the single-CTA pick below, the two-pass members
+TP_PAD_THREADS = (
+    512  # ... a single CTA of this many threads re-reading the row from L2 ...
+)
+TP_PAD_VEC = 4  # ... with vector loads of at most this many elements (the wider vectors lose at that share).
 
 
 def _clamp_T(T: int, Kp: int) -> int:
@@ -321,6 +327,12 @@ def _rule(
     else:
         share = ROW_OUT_SHARE if row_output else ROW_SCALAR_SHARE
         C = min(TP_MAX_CLUSTER, max(1, pow2ceil(-(-row_bytes // share))))
+        if (Kp - num_blocks(N)) > TP_PAD_MAX * Kp:
+            if not row_output:
+                cand = LSEConfig(TP_PAD_THREADS, 1, min(vec, TP_PAD_VEC), "reread", 1)
+                if cand in space:
+                    return cand
+            C = 1
         while C >= 1:
             T = _clamp_T(-(-(row_bytes // C) // TP_BYTES_PER_THREAD), Kp // C)
             T = max(T, 128) if Kp // C >= 4 else T
