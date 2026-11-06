@@ -416,25 +416,25 @@ def test_backward_refuses_the_non_deterministic_forwards_saved_set_and_workspace
     kcp = importlib.import_module(
         "flashinfer.experimental.cake.cake_gdn_det_train_kcp.cake_kcp"
     )
+    # the non-deterministic package under its FlashInfer #8928 path and names (absent from a tree without it)
     nd = pytest.importorskip(
-        "flashinfer.experimental.cake_gdn_train_kcp",
+        "flashinfer.experimental.cake.cake_gdn_nondet_train_kcp",
         reason="the non-deterministic package is not part of this tree",
     )
     cu = _cu((100, 640, 77))
     inputs = make_inputs(cu, 2, 6)
     ops = [inputs[n].to(device) for n in OPERANDS]
     dout = inputs["dout"].to(device)
-    nd_part = nd.partition_kcp(
+    nd_part = nd.cake_gdn_nondet_train_kcp_partition(
         torch.tensor(cu, dtype=torch.int64), 1, layout="contiguous"
     )
-    nd_ws = nd.WorkspaceKcp()
-    _, nd_saved = nd.chunk_gdn_fwd_kcp(
+    nd_ws = nd.CakeGDNNondetKcpWorkspace()
+    _, nd_saved = nd.cake_gdn_nondet_train_kcp_forward(
         *ops,
-        nd.build_context_kcp(nd_part, None, 0, device),
+        nd.cake_gdn_nondet_train_kcp_build_context(nd_part, None, 0, device),
         workspace=nd_ws,
-        deterministic=False,
     )
-    assert type(nd_saved) is nd.SavedKcp
+    assert type(nd_saved) is nd.CakeGDNNondetKcpSaved
     ctx = _local_context(cu, device)
     ws = kcp.CakeGDNDetKcpWorkspace()
     _, saved = kcp.cake_gdn_det_train_kcp_forward(*ops, ctx, workspace=ws)

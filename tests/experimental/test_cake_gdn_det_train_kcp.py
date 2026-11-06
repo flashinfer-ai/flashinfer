@@ -1906,21 +1906,71 @@ def test_registry_seed() -> None:
     )
 
 
+_DYNAMIC_IMPORTS = ("import_module", "__import__")
+
+
+def _imported_names(node: ast.AST) -> list[str]:
+    """The module names one AST node imports: an ``import`` / ``from ... import`` statement, or a call of
+    ``importlib.import_module`` / ``import_module`` / ``__import__`` with a literal string module name."""
+    if isinstance(node, ast.Import):
+        return [a.name for a in node.names]
+    if isinstance(node, ast.ImportFrom):
+        return [a.name for a in node.names] + ([node.module] if node.module else [])
+    if isinstance(node, ast.Call):
+        func = node.func
+        name = (
+            func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+        )
+        if name in _DYNAMIC_IMPORTS:
+            args = list(node.args[:1]) + [
+                k.value for k in node.keywords if k.arg == "name"
+            ]
+            return [
+                a.value
+                for a in args
+                if isinstance(a, ast.Constant) and isinstance(a.value, str)
+            ]
+    return []
+
+
+def _kda_imports(source: str) -> list[int]:
+    """The lines of ``source`` that import a KDA package (any ``cake_kda*`` module), statically or dynamically."""
+    return [
+        node.lineno
+        for node in ast.walk(ast.parse(source))
+        if any("cake_kda" in n for n in _imported_names(node))
+    ]
+
+
+def test_the_kda_import_scan_sees_dynamic_imports() -> None:
+    """The scan of :func:`test_package_imports_no_kda_and_no_environ` rejects a literal dynamic import of a KDA package
+    (``importlib.import_module``, ``import_module``, ``__import__``) as well as an import statement."""
+    kda = "flashinfer.experimental.cake_kda_det_train_kcp.cake_kcp_plan"
+    for line in (
+        f"import importlib\nm = importlib.import_module({kda!r})\n",
+        f"from importlib import import_module\nm = import_module(name={kda!r})\n",
+        f"m = __import__({kda!r})\n",
+        f"import {kda}\n",
+        "from flashinfer.experimental import cake_kda_det_train\n",
+    ):
+        assert _kda_imports(line), line
+    for line in (
+        "import importlib\nm = importlib.import_module('flashinfer.cake_gdn_det_train_kcp')\n",
+        "m = __import__(name)\n",
+    ):
+        assert not _kda_imports(line), line
+
+
 def test_package_imports_no_kda_and_no_environ() -> None:
-    """The package never imports a KDA package (any ``cake_kda*`` module) and reads no environment variable; the plan
-    module imports torch, torch.distributed and dataclasses only."""
+    """The package never imports a KDA package (any ``cake_kda*`` module, by statement or by a literal
+    ``importlib.import_module`` / ``__import__`` call) and reads no environment variable; the plan module imports
+    torch, torch.distributed and dataclasses only."""
     for path in sorted(PACKAGE_DIR.glob("*.py")):
-        tree = ast.parse(path.read_text())
+        source = path.read_text()
+        assert not _kda_imports(source), f"{path.name} imports a KDA package"
+        tree = ast.parse(source)
         for node in ast.walk(tree):
             if isinstance(node, (ast.Import, ast.ImportFrom)):
-                names = [a.name for a in node.names] + (
-                    [node.module]
-                    if isinstance(node, ast.ImportFrom) and node.module
-                    else []
-                )
-                assert not any("cake_kda" in n for n in names), (
-                    f"{path.name} imports a KDA package"
-                )
                 assert "os" not in [
                     a.name for a in node.names if isinstance(node, ast.Import)
                 ], f"{path.name} imports os"
@@ -2632,8 +2682,8 @@ def test_dead_pools_are_not_sized_for_the_call() -> None:
 
 def _other_mode_twin(cls, name: str):
     """A stand-in for the other mode's class of the same shape: every attribute and method of ``cls`` (dataclass
-    fields included) on a class that is not ``cls`` -- what the non-deterministic package's ``SavedKcp`` /
-    ``WorkspaceKcp`` look like to this package (same fields and version), built without importing that package."""
+    fields included) on a class that is not ``cls`` -- what the non-deterministic package's ``CakeGDNNondetKcpSaved`` /
+    ``CakeGDNNondetKcpWorkspace`` look like to this package (same fields and version), built without importing that package."""
     body = {k: v for k, v in vars(cls).items() if k not in ("__dict__", "__weakref__")}
     body.update(__module__="other_mode_stand_in", __qualname__=name)
     return type(name, (), body)
@@ -2659,13 +2709,13 @@ def test_backward_refuses_a_saved_set_or_workspace_of_the_other_mode() -> None:
         *args, ctx, backend="fake", segments=2, workspace=ws
     )
     assert type(saved) is kcp.CakeGDNDetKcpSaved
-    saved_twin = _other_mode_twin(kcp.CakeGDNDetKcpSaved, "SavedKcp")(
+    saved_twin = _other_mode_twin(kcp.CakeGDNDetKcpSaved, "CakeGDNNondetKcpSaved")(
         **{f.name: getattr(saved, f.name) for f in dataclasses.fields(saved) if f.init}
     )
     assert dataclasses.fields(saved_twin) == dataclasses.fields(saved)
     assert saved_twin.version == saved.version and saved_twin.ctx is ctx
     ws_twin = object.__new__(
-        _other_mode_twin(kcp.CakeGDNDetKcpWorkspace, "WorkspaceKcp")
+        _other_mode_twin(kcp.CakeGDNDetKcpWorkspace, "CakeGDNNondetKcpWorkspace")
     )
     vars(ws_twin).update(vars(kcp.CakeGDNDetKcpWorkspace()))
     for name, kw, expected in (

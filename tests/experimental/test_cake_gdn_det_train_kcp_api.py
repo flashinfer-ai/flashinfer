@@ -167,6 +167,15 @@ def test_enumerated_fields(field, values) -> None:
             make_options(**{field: bad})
 
 
+def test_save_mode_refuses_the_non_deterministic_light_akk() -> None:
+    # ``light_akk`` is a save mode of the non-deterministic package only; the deterministic options refuse it
+    assert "light_akk" not in _mod("cake_options").SAVE_MODES
+    with pytest.raises(ValueError, match="save_mode must be one of"):
+        make_options(save_mode="light_akk")
+    with pytest.raises(ValueError, match="save_mode must be one of"):
+        make_options({"save_mode": "light_akk"})
+
+
 def test_reuse_recompute_tapes_defaults_to_auto_never_captured() -> None:
     """The checkpoint-aware light backward is a keyword-only switch -- ``"auto"`` (the shipped default: the tapes are
     kept only when the node closes the checkpointed region), ``True`` (always) or ``False`` (the replay form); under
@@ -805,19 +814,25 @@ def _facade_source() -> pathlib.Path:
 
 
 def test_package_never_imports_a_kda_package() -> None:
-    for path in _package_sources() + [_facade_source()]:
+    sources = _package_sources() + [_facade_source()]
+    assert len(sources) > 10, sources  # the package modules and the facade (not vacuous)
+    seen = 0
+    for path in sources:
         tree = ast.parse(path.read_text())
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
+                seen += 1
                 for a in node.names:
                     assert "cake_kda" not in a.name, (path.name, a.name)
             elif isinstance(node, ast.ImportFrom):
+                seen += 1
                 assert "cake_kda" not in (node.module or ""), (
                     path.name,
                     node.module,
                 )
                 for a in node.names:
                     assert "cake_kda" not in a.name, (path.name, a.name)
+    assert seen > 50, seen  # the scan sees the modules' import statements
 
 
 def test_package_reads_no_environment_variable() -> None:

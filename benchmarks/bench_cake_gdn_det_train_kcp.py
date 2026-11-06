@@ -36,7 +36,7 @@ input storage:
 * ``local``: the single-rank Cake kernels on the rank's shard as a batch of
   its own (no exchange; the per-rank work without the boundaries): the
   deterministic causal convolution and
-  ``flashinfer.experimental.cake.cake_gdn_det_train.cake_gdn_det``;
+  ``flashinfer.cake_gdn_det_train.cake_gdn_det``;
 * ``control``: the KCP path again -- the identical-program control.
 
 Protocol: ``--groups`` groups (at least 3); in every group the arms run in the
@@ -91,9 +91,7 @@ from flashinfer.cake_gdn_det_train_kcp import (  # noqa: E402
     cake_gdn_det_train_kcp_saved_bytes,
     cake_gdn_det_train_kcp_workspace_bytes,
 )
-from flashinfer.experimental.cake.cake_gdn_det_train import (  # noqa: E402
-    cake_gdn_det,
-)
+from flashinfer.cake_gdn_det_train import cake_gdn_det  # noqa: E402
 
 ARMS = ("cake", "fla", "local", "control")
 BOUNDARIES = ("B1", "B2", "B3")
