@@ -17,7 +17,7 @@ flashinfer public-API tests of the Cake chunked LM-head + loss package.
 
 The experimental entry points ``flashinfer.chunked_lm_head.chunked_lm_head_det_loss`` and
 ``chunked_lm_head_det_logprob`` are thin wrappers over
-``flashinfer.experimental.cake_lm_head_det_loss.cake_backend``: they carry the experimental
+``flashinfer.experimental.cake.cake_lm_head_det_train.cake_backend``: they carry the experimental
 marking, accept ``backend="cake"`` only and own FlashInfer's A/B environment variables
 ``FLASHINFER_CAKE_LM_HEAD_LOSS_*`` -- a switch keyword left at ``None`` falls back to its
 variable and the resolved value is passed down; the two binding-cache variables are
@@ -43,8 +43,8 @@ from flashinfer.chunked_lm_head import (
     chunked_lm_head_det_logprob,
     chunked_lm_head_det_loss,
 )
-from flashinfer.experimental.cake_lm_head_det_loss import cake_backend
-from flashinfer.experimental.cake_lm_head_det_loss.cake_backend import (
+from flashinfer.experimental.cake.cake_lm_head_det_train import cake_backend
+from flashinfer.experimental.cake.cake_lm_head_det_train.cake_backend import (
     SUPPORTED_COMPUTE_CAPABILITIES,
     BindingCache,
     forward_binding_key,
@@ -148,7 +148,7 @@ def test_names_before_the_det_naming_are_gone():
     assert len({name for names in REMOVED_NAMES.values() for name in names}) == 12
     for module_name, names in REMOVED_NAMES.items():
         module = importlib.import_module(
-            f"flashinfer.experimental.cake_lm_head_det_loss.{module_name}"
+            f"flashinfer.experimental.cake.cake_lm_head_det_train.{module_name}"
         )
         for name in names:
             assert not hasattr(module, name), (module_name, name)

@@ -31,9 +31,9 @@ import flashinfer.chunked_lm_head as public
 from tests.test_helpers.cake_lm_head_loss_reference import make_inputs
 from tests.test_helpers.cake_package import cake_package
 
-cake_backend = cake_package("cake_lm_head_det_loss", "cake_backend")
-opt_in = cake_package("cake_lm_head_det_loss", "cake_backend_opt_in")
-cake_jit = cake_package("cake_lm_head_det_loss", "cake_jit")
+cake_backend = cake_package("cake.cake_lm_head_det_train", "cake_backend")
+opt_in = cake_package("cake.cake_lm_head_det_train", "cake_backend_opt_in")
+cake_jit = cake_package("cake.cake_lm_head_det_train", "cake_jit")
 
 SEED = 20261031
 CUDA = torch.device("cuda")

@@ -52,12 +52,12 @@ from tests.test_helpers.cake_package import cake_package
 # build that vendors the package under another import path runs this file unchanged after pointing the ``PACKAGES``
 # entry at it).  The tests of the public entry points ``flashinfer.chunked_lm_head`` -- their experimental marking and
 # the FLASHINFER_CAKE_LM_HEAD_LOSS_* environment variables they read -- live in ``test_cake_lm_head_det_loss_api.py``.
-pkg = cake_package("cake_lm_head_det_loss")
-cake_backend = cake_package("cake_lm_head_det_loss", "cake_backend")
+pkg = cake_package("cake.cake_lm_head_det_train")
+cake_backend = cake_package("cake.cake_lm_head_det_train", "cake_backend")
 # The opt-in forms (``memory_mode`` / ``num_valid_rows``); a call with neither keyword is ``cake_backend``'s.
-opt_in = cake_package("cake_lm_head_det_loss", "cake_backend_opt_in")
-cake_build = cake_package("cake_lm_head_det_loss", "cake_build")
-cake_jit = cake_package("cake_lm_head_det_loss", "cake_jit")
+opt_in = cake_package("cake.cake_lm_head_det_train", "cake_backend_opt_in")
+cake_build = cake_package("cake.cake_lm_head_det_train", "cake_build")
+cake_jit = cake_package("cake.cake_lm_head_det_train", "cake_jit")
 ABI_CONTRACT = cake_backend.ABI_CONTRACT
 COMMON_SCALARS = cake_backend.COMMON_SCALARS
 COMMON_TENSORS = cake_backend.COMMON_TENSORS
@@ -7563,7 +7563,7 @@ import sys, torch
 sys.path.insert(0, {root!r})
 from tests.test_helpers.cake_lm_head_loss_reference import make_inputs
 from tests.test_helpers.cake_package import cake_package
-cake_backend = cake_package("cake_lm_head_det_loss", "cake_backend")
+cake_backend = cake_package("cake.cake_lm_head_det_train", "cake_backend")
 W = make_inputs(1, seed={seed_w}, device="cuda", ignore_frac=0.0).W  # the module fixture's weight
 inp = make_inputs({T}, seed={seed}, device="cuda", W=W, ignore_frac=0.05)
 X = inp.X.detach().requires_grad_(True)
@@ -9672,7 +9672,7 @@ _WRONG_COUNT_SCRIPT = """
 import sys, torch
 sys.path.insert(0, {root!r})
 from tests.test_helpers.cake_package import cake_package
-opt_in = cake_package("cake_lm_head_det_loss", "cake_backend_opt_in")
+opt_in = cake_package("cake.cake_lm_head_det_train", "cake_backend_opt_in")
 labels = torch.tensor([0, -100, 3, 1, -100, 2], device="cuda")
 index, _ = opt_in.given_valid_rows(labels, 4)
 torch.cuda.synchronize()
@@ -10542,7 +10542,7 @@ def test_registry_declares_only_known_stages():
     ``STAGES_WITH_TEMPERATURE`` only, so a row under another name (``gemm_logits_tau`` for ``gemm_logits_mcnt_tau``)
     would drop out silently -- the hidden valid-row count would never find its temperature form and the device
     temperature tests would skip."""
-    cake_support = cake_package("cake_lm_head_det_loss", "cake_support")
+    cake_support = cake_package("cake.cake_lm_head_det_train", "cake_support")
     known = set(cake_jit.STAGES_WITH_TEMPERATURE) | set(cake_support.SUPPORT_STAGES)
     for name, record in cake_jit.MODULES.items():
         unknown = set(record.get("stages", ())) - known
@@ -11281,7 +11281,7 @@ import sys, torch
 sys.path.insert(0, {root!r})
 from tests.test_helpers.cake_lm_head_loss_reference import make_inputs
 from tests.test_helpers.cake_package import cake_package
-cake_backend = cake_package("cake_lm_head_det_loss", "cake_backend")
+cake_backend = cake_package("cake.cake_lm_head_det_train", "cake_backend")
 W = make_inputs(1, seed={seed_w}, device="cuda", ignore_frac=0.0).W  # the module fixture's weight
 inp = make_inputs({T}, seed={seed}, device="cuda", W=W, ignore_frac=0.05, temperature="hetero")
 X = inp.X.detach().requires_grad_(True)
@@ -11467,7 +11467,7 @@ import sys, torch
 sys.path.insert(0, {root!r})
 from tests.test_helpers.cake_lm_head_loss_reference import make_weight
 from tests.test_helpers.cake_package import cake_package
-cake_backend = cake_package("cake_lm_head_det_loss", "cake_backend")
+cake_backend = cake_package("cake.cake_lm_head_det_train", "cake_backend")
 H, V = {H}, {V}
 labels = torch.tensor([0, -100, 3, 1, -100, 2], device="cuda")
 T = int(labels.numel())
@@ -12341,7 +12341,7 @@ import torch.utils.checkpoint as tuc
 sys.path.insert(0, {root!r})
 from tests.test_helpers.cake_lm_head_loss_reference import make_inputs
 from tests.test_helpers.cake_package import cake_package
-backend = cake_package("cake_lm_head_det_loss", {module!r})
+backend = cake_package("cake.cake_lm_head_det_train", {module!r})
 W = make_inputs(1, seed={seed_w}, device="cuda", ignore_frac=0.0).W
 inp = make_inputs({T}, seed={seed}, device="cuda", W=W, ignore_frac=0.05)
 kw = dict(chunk_size={C}, backend="cake", **{switches!r})
@@ -12508,7 +12508,7 @@ def _region_entry(entry, inp, X, W):
         base = inp.labels.clamp_min(0)[:, None]
         ids = (base + 997 * torch.arange(K, device=X.device)[None, :]) % V
         offsets = torch.arange(0, T * K + 1, K, device=X.device)
-        support = cake_package("cake_lm_head_det_loss", "cake_support")
+        support = cake_package("cake.cake_lm_head_det_train", "cake_support")
         logp = support.chunked_lm_head_det_support_logprob(
             X, W, ids.reshape(-1), offsets, inp.labels, k_cap=K
         )

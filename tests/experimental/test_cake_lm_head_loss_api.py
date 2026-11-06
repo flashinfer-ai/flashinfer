@@ -447,7 +447,7 @@ def test_deterministic_package_has_no_mode_parameter_and_reads_no_torch_mode():
     ``deterministic`` parameter, and none of them reads torch's deterministic mode."""
     for name in ("cake_backend", "cake_backend_opt_in", "cake_support"):
         module = importlib.import_module(
-            f"flashinfer.experimental.cake_lm_head_det_loss.{name}"
+            f"flashinfer.experimental.cake.cake_lm_head_det_train.{name}"
         )
         assert "are_deterministic_algorithms_enabled" not in inspect.getsource(module)
         for attr, value in vars(module).items():
@@ -489,7 +489,7 @@ def test_non_deterministic_binding_caches_take_the_import_settings():
 
 def _require_device():
     det_backend = importlib.import_module(
-        "flashinfer.experimental.cake_lm_head_det_loss.cake_backend"
+        "flashinfer.experimental.cake.cake_lm_head_det_train.cake_backend"
     )
     if not torch.cuda.is_available() or torch.cuda.get_device_capability(0) not in (
         det_backend.SUPPORTED_COMPUTE_CAPABILITIES
@@ -647,7 +647,7 @@ def test_device_keep_logits_on_both_routes_is_the_plain_call(monkeypatch):
         "flashinfer.experimental.cake.cake_lm_head_loss.cake_backend"
     )
     det_backend = importlib.import_module(
-        "flashinfer.experimental.cake_lm_head_det_loss.cake_backend"
+        "flashinfer.experimental.cake.cake_lm_head_det_train.cake_backend"
     )
     if not nd_backend.generated_program_available(
         torch.device("cuda"), entry="logprob"

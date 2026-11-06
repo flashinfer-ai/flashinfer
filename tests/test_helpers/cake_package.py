@@ -27,7 +27,7 @@ PACKAGES: dict[str, str] = {
     "cake_dsa_train": "flashinfer.experimental.cake_dsa_train",
     "cake_dsa_indexer_det": "flashinfer.experimental.cake_dsa_indexer_det",
     "cake_dsa_indexer": "flashinfer.experimental.cake_dsa_indexer",
-    "cake_lm_head_det_loss": "flashinfer.experimental.cake_lm_head_det_loss",
+    "cake.cake_lm_head_det_train": "flashinfer.experimental.cake.cake_lm_head_det_train",
     # the non-deterministic package (deterministic=False); its key carries the namespace
     "cake.cake_lm_head_loss": "flashinfer.experimental.cake.cake_lm_head_loss",
     "dense_projection_det_gemm": "flashinfer.experimental.dense_projection_det_gemm",
@@ -72,7 +72,7 @@ PACKAGES: dict[str, str] = {
 def cake_package(name: str, submodule: str | None = None) -> ModuleType:
     """The package module of ``name`` (a key of :data:`PACKAGES`), or its ``submodule`` (``"cake_backend"``, ...).
 
-    ``cake_package("cake_lm_head_det_loss")`` is the package itself; ``cake_package("cake_lm_head_det_loss", "cake_backend")``
+    ``cake_package("cake.cake_lm_head_det_train")`` is the package itself; ``cake_package("cake.cake_lm_head_det_train", "cake_backend")``
     is ``<package>.cake_backend``.  Raises ``KeyError`` for a name the table does not list.
     """
     path = PACKAGES[name]

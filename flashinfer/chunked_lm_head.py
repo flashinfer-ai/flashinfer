@@ -28,7 +28,7 @@ from .api_logging import flashinfer_experimental_api
 
 # Thin experimental entry points; validation of the backend contract, the
 # chunk plans, the workspace, launch binding, autograd wrappers and JIT
-# registration live in flashinfer.experimental.cake_lm_head_det_loss (the
+# registration live in flashinfer.experimental.cake.cake_lm_head_det_train (the
 # deterministic package, entries ``chunked_lm_head_det_*``) and
 # flashinfer.experimental.cake.cake_lm_head_loss (the non-deterministic
 # package).  The ``chunked_lm_head_det_*`` entries are the deterministic
@@ -181,7 +181,7 @@ def _cake_backend() -> ModuleType:
     # The backend is imported on first use (experimental containment: core
     # reaches kernels and their dependencies through a deferred import) and
     # the binding-cache settings read at import are applied to it once.
-    from .experimental.cake_lm_head_det_loss import cake_backend
+    from .experimental.cake.cake_lm_head_det_train import cake_backend
 
     _configure_binding_cache(cake_backend, _BINDING_CACHE_SETTINGS)
     return cake_backend
@@ -193,7 +193,7 @@ def _cake_backend_opt_in() -> ModuleType:
     # their first use; a call with neither never imports them.  Their own
     # binding cache takes the same settings.
     _cake_backend()
-    from .experimental.cake_lm_head_det_loss import cake_backend_opt_in
+    from .experimental.cake.cake_lm_head_det_train import cake_backend_opt_in
 
     _configure_binding_cache(cake_backend_opt_in, _BINDING_CACHE_SETTINGS)
     return cake_backend_opt_in
@@ -414,7 +414,7 @@ def chunked_lm_head_det_loss(
     binding (``data_ptr``, shape, stride and dtype of every input plus the
     options); later calls with the same binding launch from the remembered
     argument plans
-    (``flashinfer.experimental.cake_lm_head_det_loss.cake_backend.BINDING_CACHE``).
+    (``flashinfer.experimental.cake.cake_lm_head_det_train.cake_backend.BINDING_CACHE``).
     ``FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE=0`` disables that cache and
     ``FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE_CAPACITY`` (a positive
     integer; default 64) sets its capacity: both are read when this module is
@@ -720,7 +720,7 @@ def _cake_support() -> ModuleType:
     # The candidate-support entries live in their own module of the package; it
     # binds its kernels through the backend's cache, configured on first use.
     _cake_backend()
-    from .experimental.cake_lm_head_det_loss import cake_support
+    from .experimental.cake.cake_lm_head_det_train import cake_support
 
     return cake_support
 
