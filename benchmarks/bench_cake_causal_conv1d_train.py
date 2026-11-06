@@ -755,7 +755,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             )
     if torch.are_deterministic_algorithms_enabled():
         raise SystemExit(
-            "torch.use_deterministic_algorithms(True) would run both modes deterministically"
+            "torch.use_deterministic_algorithms(True) is in effect: the non-deterministic backward raises "
+            "PyTorch's RuntimeError there (with warn_only=True it warns and runs); run the benchmark with it off"
         )
     arch = loader.arch_for_capability(torch.cuda.get_device_capability(device))
     if route.backward_route() not in loader.ROUTES[arch]:

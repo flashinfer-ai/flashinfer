@@ -209,11 +209,16 @@ deterministic package.
   deterministic entry points' plus ``deterministic``.
 * ``flashinfer.cake_causal_conv1d_train_kcp``: ``cake_causal_conv1d_kcp``,
   ``cake_causal_conv1d_multi_kcp`` and ``RecomputeHandleKcp``, with the
-  keyword-only ``bwd_reserve_sms`` (SMs the main backward leaves free; refused
-  on SM107).  ``cooperative=True`` is refused: the backward is one ordinary
+  keyword-only ``bwd_reserve_sms`` (SMs the main backward leaves free;
+  ``bwd_reserve_sms >= 1`` raises ``ValueError`` on SM107).
+  ``cooperative=True`` raises ``ValueError``: the backward is one ordinary
   launch.
-* ``flashinfer.experimental.cake.cake_causal_conv1d_train_backend`` (and its
-  ``kcp`` module): the package behind both, with the same rule.
+
+The package behind both,
+``flashinfer.experimental.cake.cake_causal_conv1d_train_backend`` (and its
+``kcp`` module), follows the same mode rule for its entry points and
+workspace helpers; it is not marked experimental, and its support query
+``is_cake_causal_conv1d_train_supported(device)`` takes no ``deterministic``.
 
 Each name maps to a deterministic name: ``cake_causal_conv1d`` ->
 ``cake_causal_conv1d_det``, ``cake_causal_conv1d_train_{forward,backward}``

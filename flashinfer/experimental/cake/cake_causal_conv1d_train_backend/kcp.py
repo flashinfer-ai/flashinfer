@@ -131,6 +131,7 @@ import torch.distributed as dist
 import tvm_ffi
 
 from . import (
+    _DET_ENTRIES,
     _accumulator_layout,
     _alert_nondeterministic,
     _backward_accumulators,
@@ -313,7 +314,9 @@ class RecomputeHandleKcp:
     argument of the checkpointed function, so the recompute sees the same object::
 
         def layer(x, weight, handle):
-            return cake_causal_conv1d_kcp(x, weight, ctx, recompute_handle=handle)
+            return cake_causal_conv1d_kcp(
+                x, weight, ctx, recompute_handle=handle, deterministic=False
+            )
 
         y = torch.utils.checkpoint.checkpoint(layer, x, w, RecomputeHandleKcp(), use_reentrant=False)
 
@@ -616,8 +619,8 @@ def _ordinary_launch(cooperative: Any, entry: str) -> None:
         )
     if cooperative:
         raise ValueError(
-            f"{entry}: cooperative=True applies to deterministic=True only; the non-deterministic main backward "
-            "is one ordinary launch (pass cooperative=None or False)"
+            f"{entry}: cooperative=True applies to the deterministic entry point {_DET_ENTRIES[entry]} only; the "
+            "non-deterministic main backward is one ordinary launch (pass cooperative=None or False)"
         )
 
 

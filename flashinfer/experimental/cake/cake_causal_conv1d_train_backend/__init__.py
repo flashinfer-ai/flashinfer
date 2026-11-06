@@ -232,15 +232,75 @@ def _device_arch(device: torch.device) -> str:
     return arch
 
 
+# The deterministic entry point of each entry point here (and of the ``kcp`` module), named by its refusal.
+_DET_ENTRIES = {
+    **{
+        name: f"flashinfer.cake_causal_conv1d_det_train.{det}"
+        for name, det in (
+            ("cake_causal_conv1d", "cake_causal_conv1d_det"),
+            ("CakeCausalConv1dFunction", "CakeCausalConv1dDetFunction"),
+            (
+                "cake_causal_conv1d_train_forward",
+                "cake_causal_conv1d_det_train_forward",
+            ),
+            (
+                "cake_causal_conv1d_train_backward",
+                "cake_causal_conv1d_det_train_backward",
+            ),
+            (
+                "cake_causal_conv1d_train_forward_workspace",
+                "cake_causal_conv1d_det_train_forward_workspace",
+            ),
+            (
+                "cake_causal_conv1d_train_forward_workspace_bytes",
+                "cake_causal_conv1d_det_train_forward_workspace_bytes",
+            ),
+            (
+                "cake_causal_conv1d_train_backward_workspace",
+                "cake_causal_conv1d_det_train_backward_workspace",
+            ),
+            (
+                "cake_causal_conv1d_train_backward_workspace_bytes",
+                "cake_causal_conv1d_det_train_backward_workspace_bytes",
+            ),
+        )
+    },
+    **{
+        name: f"flashinfer.cake_causal_conv1d_det_train_kcp.{det}"
+        for name, det in (
+            ("cake_causal_conv1d_kcp", "cake_causal_conv1d_det_kcp"),
+            ("cake_causal_conv1d_multi_kcp", "cake_causal_conv1d_det_multi_kcp"),
+        )
+    },
+    **{
+        name: f"flashinfer.cake_causal_conv1d_det_train_backend.kcp.{det}"
+        for name, det in (
+            ("cake_causal_conv1d_forward_kcp", "cake_causal_conv1d_det_forward_kcp"),
+            ("cake_causal_conv1d_backward_kcp", "cake_causal_conv1d_det_backward_kcp"),
+            ("CakeCausalConv1dFunctionKcp", "CakeCausalConv1dDetFunctionKcp"),
+            (
+                "cake_causal_conv1d_multi_forward_kcp",
+                "cake_causal_conv1d_det_multi_forward_kcp",
+            ),
+            (
+                "cake_causal_conv1d_multi_backward_kcp",
+                "cake_causal_conv1d_det_multi_backward_kcp",
+            ),
+            ("CakeCausalConv1dMultiFunctionKcp", "CakeCausalConv1dDetMultiFunctionKcp"),
+        )
+    },
+}
+
+
 def _require_nondeterministic(deterministic: object, entry: str) -> None:
-    """Refuse every numerical mode but ``deterministic=False``: this package has no deterministic programs."""
+    """Refuse every numerical mode but ``deterministic=False`` with a ``ValueError`` that names the deterministic
+    entry point of ``entry`` (:data:`_DET_ENTRIES`): this package has no deterministic programs."""
 
     if not isinstance(deterministic, bool) or deterministic:
         raise ValueError(
             f"{entry} is the non-deterministic implementation (unordered dweight / dbias reductions) and needs "
-            f"deterministic=False, got deterministic={deterministic!r}; the deterministic programs are "
-            "flashinfer.cake_causal_conv1d_det_train and flashinfer.cake_causal_conv1d_det_train_kcp (pass "
-            "deterministic=False here for the non-deterministic path)"
+            f"deterministic=False, got deterministic={deterministic!r}; the deterministic entry point is "
+            f"{_DET_ENTRIES[entry]} (pass deterministic=False here for the non-deterministic path)"
         )
 
 

@@ -313,9 +313,15 @@ def test_torch_deterministic_mode_changes_nothing_here(
     and without a warning from these modules (the package's backward raises PyTorch's alert itself); every other
     value is still refused; nothing runs the deterministic package."""
 
-    x, w, cu, dy, ctx = (object() for _ in range(5))
+    x, w, cu, dy, b, ctx = (object() for _ in range(6))
+    # The autograd entry takes the bias positionally (and passes it on so); give it one.
+    entry_args = {
+        "cake_causal_conv1d_train_forward": (x, w, cu),
+        "cake_causal_conv1d_train_backward": (x, w, cu, dy),
+        "cake_causal_conv1d": (x, w, cu, b),
+    }
     for entry in ENTRIES:
-        args = (x, w, cu, dy) if entry.endswith("backward") else (x, w, cu)
+        args = entry_args[entry]
         recorded.clear()
         result, caught = _quiet(
             lambda: getattr(facade, entry)(*args, deterministic=False)
@@ -392,13 +398,60 @@ def test_kcp_package_refuses_a_cooperative_backward() -> None:
     for entry in KCP_ENTRIES:
         for fn in (getattr(kcp_backend, entry), getattr(kcp_facade, entry)):
             with pytest.raises(
-                ValueError, match=f"{entry}: cooperative=True applies to"
+                ValueError,
+                match=rf"^{entry}: cooperative=True applies to the deterministic entry point "
+                rf"flashinfer\.cake_causal_conv1d_det_train_kcp\.{KCP_ENTRIES[entry]} only; ",
             ):
                 _quiet(lambda: fn(x, w, ctx, cooperative=True, deterministic=False))
             with pytest.raises(
                 TypeError, match=f"{entry}: cooperative must be None or a bool"
             ):
                 _quiet(lambda: fn(x, w, ctx, cooperative=1, deterministic=False))
+
+
+@pytest.mark.cpu_only
+def test_package_refusals_name_the_deterministic_entry() -> None:
+    """Every entry point of the package (single-rank and ``kcp``) refuses a mode but ``False`` naming its own
+    deterministic entry point, which exists; the map covers exactly the entry points that check the mode."""
+
+    import importlib
+    import re
+    from pathlib import Path
+
+    sources = [
+        Path(backend.__file__),
+        Path(backend.__file__).with_name("kcp.py"),
+    ]
+    checked = {
+        name
+        for path in sources
+        for name in re.findall(
+            r'_require_nondeterministic\(\s*deterministic,\s*"(\w+)"', path.read_text()
+        )
+    }
+    assert checked == set(backend._DET_ENTRIES), checked ^ set(backend._DET_ENTRIES)
+    for entry, det_path in backend._DET_ENTRIES.items():
+        module, _, name = det_path.rpartition(".")
+        assert "det" in name and hasattr(importlib.import_module(module), name), (
+            det_path
+        )
+        for bad in REFUSED_MODES:
+            with pytest.raises(
+                ValueError,
+                match=rf"^{entry} is the non-deterministic implementation .* needs deterministic=False, got "
+                rf".*; the deterministic entry point is {re.escape(det_path)} \(pass deterministic=False here",
+            ):
+                backend._require_nondeterministic(bad, entry)
+        backend._require_nondeterministic(False, entry)
+    cpu = torch.device("cpu")
+    calls = {
+        "cake_causal_conv1d_train_forward": lambda: backend.cake_causal_conv1d_train_forward(None, None, None),
+        "cake_causal_conv1d_train_backward": lambda: backend.cake_causal_conv1d_train_backward(None, None, None, None),
+        "cake_causal_conv1d_train_backward_workspace_bytes": lambda: backend.cake_causal_conv1d_train_backward_workspace_bytes(64, 256, cpu),
+    }  # fmt: skip
+    for entry, call in calls.items():
+        with pytest.raises(ValueError, match=re.escape(backend._DET_ENTRIES[entry])):
+            call()
 
 
 # ----------------------------------------------------------------------------------------------------------------
