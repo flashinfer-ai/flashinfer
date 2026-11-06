@@ -995,7 +995,7 @@ def test_gpu_graph_replay_on_a_reserved_shared_workspace(device) -> None:
         assert ws.local is not old
         for e in cake_kcp._GRAPHS.values():
             assert not any(
-                isinstance(p, cake_backend.KdaWorkspace) and p.arena is old.arena
+                isinstance(p, cake_backend.KdaDetWorkspace) and p.arena is old.arena
                 for p in e.pins
             )
     finally:
