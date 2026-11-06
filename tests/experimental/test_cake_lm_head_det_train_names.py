@@ -25,6 +25,7 @@ library stems ``cake_lm_head_det_loss_<hex>``) keep their names.
 import importlib
 import inspect
 import json
+import re
 import subprocess
 import sys
 import warnings
@@ -141,6 +142,26 @@ REMOVED_NAMES = {
 H_HOST, V_HOST = 256, 512
 
 
+def _tokens(name: str) -> list:
+    """The lowercase words of ``name``: split on ``_``, then on CamelCase (``CakeLMHeadDetSupportFunction`` ->
+    cake, lm, head, det, support, function)."""
+    words = []
+    for part in name.split("_"):
+        words += re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z0-9]+", part)
+    return [w.lower() for w in words]
+
+
+def _autograd_functions(module) -> list:
+    """The ``torch.autograd.Function`` classes defined in ``module``."""
+    return [
+        (name, value)
+        for name, value in vars(module).items()
+        if inspect.isclass(value)
+        and issubclass(value, torch.autograd.Function)
+        and value.__module__ == module.__name__
+    ]
+
+
 def _backend(module_name):
     return importlib.import_module(f"{BACKEND}.{module_name}")
 
@@ -204,8 +225,8 @@ def test_former_entries_fail_at_import():
 
 def test_former_names_are_gone_from_the_backend():
     """No backend module defines or exports a former name (no aliases)."""
-    assert sum(len(names) for names in REMOVED_NAMES.values()) == 41
-    assert len({name for names in REMOVED_NAMES.values() for name in names}) == 25
+    assert sum(len(names) for names in REMOVED_NAMES.values()) == 39
+    assert len({name for names in REMOVED_NAMES.values() for name in names}) == 24
     for module_name, names in REMOVED_NAMES.items():
         module = _backend(module_name)
         for name in names:
@@ -224,40 +245,75 @@ def test_facade_all_is_the_five_entries():
         assert fn.__name__ == name, name
 
 
+def test_mode_word_is_a_token():
+    """The token split finds the mode word only as a whole word."""
+    assert _tokens("CakeLMHeadDetSupportFunction") == [
+        "cake",
+        "lm",
+        "head",
+        "det",
+        "support",
+        "function",
+    ]
+    assert _tokens("cake_lm_head_det_train_loss") == [
+        "cake",
+        "lm",
+        "head",
+        "det",
+        "train",
+        "loss",
+    ]
+    assert "det" not in _tokens("cake_lm_head_detail_loss")
+    assert "det" not in _tokens("DetailFunction")
+
+
 def test_public_names_carry_the_mode():
     """Every name of the facade's ``__all__`` and every backend object the facade forwards to carries the mode
-    (``_det_`` / ``Det``); ``cake_support.__all__`` lists only those objects and constants."""
+    word ``det`` as a token (split on ``_`` and CamelCase); ``cake_support.__all__`` lists only those objects and
+    ALL_CAPS constants."""
     count = 0
     for name in public.__all__:
-        assert "_det_" in name, name
+        assert "det" in _tokens(name), name
         count += 1
     for module_name, names in FORWARDED.items():
         module = _backend(module_name)
         for name in names:
             obj = getattr(module, name)
             assert obj.__module__ == module.__name__, (module_name, name)
-            assert "_det_" in name or "Det" in name, (module_name, name)
+            assert "det" in _tokens(name), (module_name, name)
             count += 1
     assert count == 23
     support = _backend("cake_support")
     for name in support.__all__:
-        assert name.isupper() or "_det_" in name or "Det" in name, name
+        assert name.isupper() or "det" in _tokens(name), name
     assert set(FORWARDED["cake_support"]) <= set(support.__all__)
 
 
 def test_no_entry_takes_a_mode_keyword():
-    """No facade entry, forwarded backend entry or autograd ``forward`` has a ``deterministic`` parameter or
-    ``**kwargs``; passing ``deterministic`` (``True`` or ``False``) to a facade entry is a ``TypeError`` from
-    argument binding (host tensors suffice: it raises before any work)."""
-    fns = [(name, getattr(public, name)) for name in ENTRIES]
+    """No facade entry, forwarded backend entry or autograd ``Function.forward`` of the backend accepts a
+    ``deterministic`` keyword: ``inspect.signature(fn).bind_partial(deterministic=False)`` is a ``TypeError``
+    (no such parameter, no ``**kwargs``); passing ``deterministic`` (``True`` or ``False``) to a facade entry is a
+    ``TypeError`` from argument binding (host tensors suffice: it raises before any work)."""
+    fns = {name: getattr(public, name) for name in ENTRIES}
     for module_name, names in FORWARDED.items():
         module = _backend(module_name)
         for name in names:
             obj = getattr(module, name)
-            fn = obj.forward if inspect.isclass(obj) else obj
-            fns.append((f"{module_name}.{name}", fn))
+            fns[f"{module_name}.{name}"] = obj.forward if inspect.isclass(obj) else obj
     assert len(fns) == 23
-    for label, fn in fns:
+    classes = 0
+    for module_name in ("cake_backend", "cake_backend_opt_in", "cake_support"):
+        for name, cls in _autograd_functions(_backend(module_name)):
+            fns[f"{module_name}.{name}.forward"] = cls.forward
+            classes += 1
+    assert classes == 8
+    for label, fn in fns.items():
+        try:
+            inspect.signature(fn).bind_partial(deterministic=False)
+        except TypeError:
+            pass
+        else:
+            pytest.fail(f"{label} accepts a deterministic keyword")
         params = inspect.signature(fn).parameters
         assert "deterministic" not in params, label
         assert all(p.kind is not p.VAR_KEYWORD for p in params.values()), label
