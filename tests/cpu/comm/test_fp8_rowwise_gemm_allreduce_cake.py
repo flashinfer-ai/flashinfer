@@ -120,11 +120,17 @@ def test_route_tables_cover_every_delivered_world_size_once():
 @pytest.mark.parametrize("program", PROGRAMS)
 def test_program_records_carry_the_fused_launcher_contract(program):
     record = loader.PROGRAMS[program]
-    # The device unit and its thin tvm-ffi launcher, both directly under the package.
+    # The device unit and its thin tvm-ffi launcher, both directly under the package
+    # or both in one family directory of it, next to the shared headers they include.
     assert len(record["sources"]) == 2
+    directories = set()
     for relative in record["sources"]:
         assert relative.startswith("csrc/cake_fp8_rowwise_gemm_allreduce/")
-        assert relative.count("/") == 2
+        directory = relative.split("/", 2)[2].rpartition("/")[0]
+        assert directory in ("", *loader.SOURCE_DIRECTORIES)
+        assert loader._source_path(relative).is_file()
+        directories.add(directory)
+    assert len(directories) == 1
     assert record["arches"] and set(record["arches"]) <= set(ARCHES)
     args = loader.launcher_args(program)
     assert args[-3:] == ("grid_x", "grid_y", "grid_z")
@@ -454,19 +460,38 @@ def test_cluster_pair_programs_carry_no_raster_group(arch):
 @pytest.mark.parametrize("arch", ARCHES)
 def test_validate_shape_enforces_the_operand_contract(arch):
     width = loader.block_n(arch)
-    assert loader.validate_shape(1, width, 128, arch) == (1, width, 128)
+    assert loader.validate_shape(1, 256, 128, arch) == (1, 256, 128)
     assert loader.validate_shape(4133, 3072, 768, arch) == (4133, 3072, 768)
     assert loader.validate_shape(1 << 20, 1024, 128, arch) == (1 << 20, 1024, 128)
     with pytest.raises(ValueError, match="M must be positive"):
-        loader.validate_shape(0, width, 128, arch)
+        loader.validate_shape(0, 256, 128, arch)
     for n in (64, 1000, 1281, 3073):
         with pytest.raises(ValueError, match=f"multiple of {width}"):
             loader.validate_shape(1, n, 128, arch)
+    # Tile multiples outside the 256 contract (they pass grid_n on sm_90a).
+    for n in (128, 384, 640):
+        with pytest.raises(ValueError, match="multiple of 256"):
+            loader.validate_shape(1, n, 128, arch)
+    if width == 128:
+        assert loader.grid_n(384, arch) == 3
     for k_l in (0, 64, 769):
         with pytest.raises(ValueError, match="multiple of 128"):
-            loader.validate_shape(1, width, k_l, arch)
+            loader.validate_shape(1, 256, k_l, arch)
     with pytest.raises(ValueError, match=r"2\*\*30"):
         loader.validate_shape((1 << 20) + 1, 1024, 128, arch)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ARCHES)
+def test_validate_shape_bounds_n_so_vector_indices_fit_int32(arch):
+    limit = loader.MAX_COLS
+    assert limit == (1 << 27) - (1 << 15) and limit % loader.N_MULTIPLE == 0
+    assert 16 * limit + 512 * int(loader.GEOMETRY[arch]["MAX_CTAS"]) <= 2**31
+    assert loader.validate_shape(1, limit, 128, arch) == (1, limit, 128)
+    for n in (limit + 256, 1 << 27, (1 << 27) + 256):
+        assert n <= loader.MAX_ROWS_TIMES_COLS
+        with pytest.raises(ValueError, match=str(limit)):
+            loader.validate_shape(1, n, 128, arch)
 
 
 @pytest.mark.cpu_only
@@ -524,11 +549,15 @@ def _patch_distributed(
 class _CudaLike:
     """Tensor metadata stand-in: shape, dtype, contiguity and a CUDA device without a GPU."""
 
-    def __init__(self, shape, dtype, *, contiguous=True, index=0):
+    def __init__(self, shape, dtype, *, contiguous=True, index=0, ptr=0x10000):
         self._shape = tuple(shape)
         self.dtype = dtype
         self.device = torch.device("cuda", index)
         self._contiguous = contiguous
+        self._ptr = ptr
+
+    def data_ptr(self):
+        return self._ptr
 
     @property
     def shape(self):
@@ -629,6 +658,31 @@ def test_validation_rejects_strided_and_foreign_device_operands(
     )
     with pytest.raises(ValueError, match="CUDA tensor"):
         backend._validate(cpu, sa, w, sw, group)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch, world_size", DELIVERED)
+def test_validation_rejects_misaligned_vector_and_tma_operands(
+    monkeypatch, arch, world_size
+):
+    _patch_distributed(monkeypatch, capability=CAPABILITY[arch])
+    group = _fake_group(world_size, 0)
+    n = _n(arch)
+    a, sa, w, sw = _operands(256, n)
+    # A 4-byte offset (storage[1:1 + N]) breaks every vector load; an 8-byte
+    # offset still breaks the 16-byte loads.
+    for ptr in (0x10004, 0x10008):
+        with pytest.raises(ValueError, match="w_scale must start at a 16-byte aligned"):
+            backend._validate(a, sa, w, _CudaLike((n,), torch.float32, ptr=ptr), group)
+    with pytest.raises(ValueError, match="a must start at a 16-byte aligned"):
+        backend._validate(_CudaLike((256, K_L), FP8, ptr=0x10001), sa, w, sw, group)
+    with pytest.raises(ValueError, match="w must start at a 16-byte aligned"):
+        backend._validate(a, sa, _CudaLike((n, K_L), FP8, ptr=0x10001), sw, group)
+    # a_scale is read with scalar loads only: a 4-byte offset stays admitted.
+    backend._validate(a, _CudaLike((256,), torch.float32, ptr=0x10004), w, sw, group)
+    call = _call(256, arch=arch, world_size=world_size)
+    with pytest.raises(ValueError, match="out must start at a 16-byte aligned"):
+        backend._output(_CudaLike((256, n), torch.bfloat16, ptr=0x10002), call, a)
 
 
 @pytest.mark.cpu_only

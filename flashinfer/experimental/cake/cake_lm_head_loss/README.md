@@ -13,8 +13,8 @@ Both the API and the backend are experimental: no compatibility guarantee,
 SM100 (B200 / GB200) is the acceptance architecture; SM103 (B300 / GB300) and
 SM107 (R200) are compiled from the same sources (SM107 runs SM103's programs,
 built for `sm_107a`, with SM103's GEMM tile rule tables except the long chunks'
-3-deep dX operand ring; its zero-gradient row skip keeps the generic 4097-row
-floor).  The feature does not participate in automatic
+3-deep dX operand ring; its zero-gradient row skip has a 1946-row floor and
+SM103's two-slice counted dX).  The feature does not participate in automatic
 backend selection, autotuning or trace-apply.  Its libraries are loaded
 prebuilt from `aot/` when the package ships them and JIT-built by FlashInfer
 from `build.json` otherwise (see "Layout of this package").
@@ -57,7 +57,9 @@ The det-free entries `chunked_lm_head_loss`, `chunked_lm_head_logprob`,
   `FLASHINFER_CAKE_LM_HEAD_LOSS_*` fallbacks of the switches.  While torch's
   deterministic algorithms are enabled (also with `warn_only=True`), the
   deterministic entry runs instead and a `UserWarning` names the entry once
-  per process.
+  per process.  An explicit dX `k_slices` pin above the deterministic entry's
+  four slices is then dropped (that GEMM takes the deterministic entry's
+  slice rule), with one more `UserWarning`.
 * Anything else: `TypeError`.
 
 The arguments, outputs, memory rule, switches, ignored-row semantics,
@@ -269,7 +271,7 @@ the previous value; an entry call reads them once):
 | `cake_backend.set_dx_slice_policy` | `"det"` | the dX slice rule (see "Kernel structure of one token chunk"); part of every binding key |
 | `cake_backend.set_dx_red_min_rows` | `0` | a chunk of fewer rows keeps one K slice (the plain store); part of every binding key |
 | `cake_backend.set_zero_weight_min_rows` | `4096` | a call of fewer rows `T` keeps its zero-weight rows in the chunk loop (see "Zero-weight policy rows") |
-| `cake_backend.set_zero_dlogp_min_rows` | per architecture: `1946` on sm_100a, `3891` on sm_103a, `4097` elsewhere (sm_107a included) | a log-probability backward of fewer valid rows runs without the zero-gradient row skip; an integer or `None` (the skip off) applies to every architecture; with no override set the setter returns `ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT`, which passed back restores the per-architecture default (see "Zero-gradient rows of the log-probability backward"); part of the backward binding key |
+| `cake_backend.set_zero_dlogp_min_rows` | per architecture: `1946` on sm_100a and sm_107a, `3891` on sm_103a, `4097` elsewhere | a log-probability backward of fewer valid rows runs without the zero-gradient row skip; an integer or `None` (the skip off) applies to every architecture; with no override set the setter returns `ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT`, which passed back restores the per-architecture default (see "Zero-gradient rows of the log-probability backward"); part of the backward binding key |
 | `cake_backend.set_zero_dlogp_temperature_dz_counted` | `True` | under the zero-gradient row skip a call with a temperature runs the counted temperature form of the dz arm (`gemm_logits_dz_dcnt_tau`); `False` runs the uncounted one over every row (the same outputs); part of the backward binding key |
 | `cake_backend.set_gradient_placement` | `"auto"` | where the loss entries (`chunked_lm_head_loss` of both modules, every form) run the dX / dW GEMMs. `"auto"`: a call no backward can follow (grad mode off, or neither `X` nor `W` trainable) computes the loss (and `logp`) only; inside a non-reentrant `torch.utils.checkpoint` (its own saved-tensor hooks innermost) the checkpointed forward computes the loss only and saves its inputs, and the recomputation in the backward runs the fused forward and hands the gradient accumulators to the checkpointed call's backward, so a checkpointed step forms them once and keeps no FP32 accumulator from the forward to the backward (paired per checkpoint frame and graph by call order and checked against the inputs' metadata and the call's options; without a handed result the backward runs the fused forward itself, with a `RuntimeWarning`); other hooks innermost (CPU offload), torch's deterministic algorithms, or a torch whose checkpoint lacks those hooks keep the fused forward. Under selective activation checkpointing (`context_fn` of `create_selective_checkpoint_contexts`, whose recomputation replays the checkpointed forward's operators by position) every entry of this package -- the loss, log-probability (default, budget, kept logits, with a temperature) and candidate-support entries -- runs its forward with all active torch dispatch modes popped, the checkpoint's and any user mode on the stack (a `FlopCounterMode` does not see the entry's operators; a tracing mode such as `FakeTensorMode` or a `torch.compile` trace gets real launches on fake inputs and fails loudly), and behaves as in a plain non-reentrant checkpoint; the per-device constant cells and the calling thread's count cells and `arange` constant are formed outside active dispatch modes. `"forward"`: every call with a trainable input forms the gradients in its forward (the previous behavior). The same kernels on the same operands either way: the same loss, `logp` and dW bits, and dX up to the order of its unordered K-slice reduction (the same bits with one dX slice) |
 | `cake_backend.set_dx_fill_side_stream` | `False` | `True`: a remembered binding issues the `-0.0` fill of `dX_acc` on the calling thread's fill stream (its own allocator pool, joined before the first dX GEMM), so it runs beside the queued chunk-0 logits GEMM; not under CUDA graph capture, not in the prepared runner; `True` keeps up to `T * H * 4` bytes more reserved in the fill stream's pool |
@@ -363,6 +365,16 @@ it handles these rows on the device, without a host synchronization:
   same set of launches for every `dlogp` and a CUDA graph capture of the
   backward replays for other `dlogp` values.  A chunk with no live row runs
   its launches without their GEMM work.
+* The one-slice dX plain store has no counted form, so on the architectures
+  of `DX_COUNTED_MIN_SLICES_BY_ARCH` (sm_100a, sm_103a and sm_107a: two slices) the
+  call's plan runs every dX chunk the slice rule gives one slice as a
+  two-slice K-sliced reduction in its counted form
+  (`cake_backend.counted_dx_slices`): the chunk computes no row past its
+  count.  The chunks, the other chunks' slices and the other GEMMs' forms do
+  not change.  Not raised: an
+  explicit dX `k_slices` in `gemm_tuning`, a record that serves one slice, a
+  vocabulary of one K step, and a plan whose two-slice forms would have no
+  counted form (it keeps the slice rule's counts).
 * The fused dX finalize writes exact `+0` rows for the zero-gradient rows (as
   for an ignored row); `dX` of a live row is the same mathematics as without
   the skip.  `dW` sums the same nonzero products over the live rows in the new
@@ -376,7 +388,7 @@ it handles these rows on the device, without a host synchronization:
   one is set (an integer, or `None` = never, on every architecture), else the
   architecture's default floor -- `ZERO_DLOGP_MIN_ROWS_BY_ARCH` (the table
   below), and `ZERO_DLOGP_MIN_ROWS_DEFAULT` = 4097 (one row above a default
-  4096-row chunk) elsewhere, sm_107a included.  With no override set the setter
+  4096-row chunk) elsewhere.  With no override set the setter
   returns `ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT`; passing it back (or a copy or
   an unpickled copy of it) restores the per-architecture default, and
   `zero_dlogp_min_rows()` without a device returns 4097.  The
@@ -388,6 +400,21 @@ it handles these rows on the device, without a host synchronization:
   either way -- and a plan with a form that has no counted one (an explicitly
   pinned swapped dX tile or weight-gradient TMA epilogue) runs the backward
   without the skip: no partition launch, rows in the forward's order.
+* The bf16 `dW` cast moves to the last chunk with a live row (`_lc` forms,
+  sm_100a and sm_103a records; a backward of two chunks or more): the live
+  rows of a call are a prefix of its chunks, so every chunk's weight-gradient
+  accumulate but the last reads the next chunk's count too
+  (`gemm_dw_acc_lc_dcnt`, `gemm_dw_acc_gn_lc_dcnt`).  With a live next chunk it
+  adds its tile into the FP32 sum as before; else it writes
+  `bf16(g * (sum + tile))` (`bf16(g * tile)` on the first chunk) into `dW` and
+  leaves the sum, and the deferred cast of the last chunk
+  (`gemm_dw_cast_bf16_lc_dcnt`, `gemm_dw_cast_bf16_tma_lc_dcnt`) writes nothing
+  when that chunk has no live row.  One program writes `dW`, and a backward
+  whose trailing chunks hold no live row runs no cast-only pass.  The plan
+  takes the forms whole or not at all (a record without one of them: the
+  counted forms above).  Only the eager skip path runs them: a runner of
+  `prepare_lm_head_loss(dcnt=...)` keeps the counted forms above, so its
+  `dw_acc` keeps holding the sum of the chunks before the last.
 
 Non-finite values: a NaN `dlogp` keeps its row live (NaN in its `dX` row and
 in `dW`, as without the skip).  A non-finite `X` row of a zero-gradient row
@@ -402,10 +429,11 @@ Default floors (`ZERO_DLOGP_MIN_ROWS_BY_ARCH`, valid rows of one call):
 | --- | --- | --- |
 | sm_100a (B200) | 1946 (T = 2048 with 5 % ignored rows) | timing on B200 at 1946 and 3891 valid rows |
 | sm_103a (GB300) | 3891 (T = 4096 with 5 % ignored rows) | timing on GB300 at 1946 and 3891 valid rows |
-| any other (sm_107a included) | 4097 (`ZERO_DLOGP_MIN_ROWS_DEFAULT`) | not timed below one default chunk |
+| sm_107a (R200) | 1946 (T = 2048 with 5 % ignored rows) | timing on the 212-SM and 216-SM R200 boards at 1100, 1946 and 3891 valid rows, with the two-slice counted dX |
+| any other | 4097 (`ZERO_DLOGP_MIN_ROWS_DEFAULT`) | not timed below one default chunk |
 
 The per-architecture floors put one-chunk backwards from the floor (1946 valid
-rows on sm_100a, 3891 on sm_103a) to 4096 valid rows on the skip, which the
+rows on sm_100a and sm_107a, 3891 on sm_103a) to 4096 valid rows on the skip, which the
 generic 4097 floor keeps off it.  On those calls: the `dW` bits can differ
 from the call without the skip (the new row order; within the accuracy
 budgets, the same bits run to run); a
@@ -420,8 +448,8 @@ Not applied: `compact_rows=False`, a backward that recounts its valid rows,
 the kept-logits entry, `memory_mode="budget"`, the prepared runner and the
 reference backend.  A call with a temperature takes the skip with its own
 plan (above): the counted temperature form of the dz arm and the counted dX /
-dW GEMMs.  The one-slice dX chunks (the plain store) compute every row of the
-chunk.
+dW GEMMs.  A one-slice dX chunk (the plain store: pinned with `gemm_tuning`,
+or one of the cases not raised above) computes every row of the chunk.
 
 ## Kernel structure of one token chunk
 
@@ -473,11 +501,10 @@ shared by `cake_backend_opt_in.py`.
 | --- | --- |
 | `flashinfer.chunked_lm_head.chunked_lm_head_{loss,logprob,preload,support_logprob,support_kl}` | dispatchers: `deterministic=True` -> `chunked_lm_head_det_*`, `False` -> this package |
 | `flashinfer.chunked_lm_head.chunked_lm_head_det_*` | the deterministic entries, unchanged (`deterministic=False` raises) |
-| `flashinfer.experimental.cake_lm_head_loss` | the deterministic package under its former path (each module is the deterministic module) |
 | `flashinfer.experimental.cake.cake_lm_head_loss` | this package |
-| `cake_backend.{prepare_lm_head_loss, validate_lm_head_inputs, lm_head_loss_workspace_size, LmHeadLossRunner, ChunkedLmHeadLossFunction, ChunkedLmHeadLogprobFunction, chunked_lm_head_loss, chunked_lm_head_logprob}` | this package's objects (the deterministic modules keep these names as aliases of their `det` objects) |
+| `cake_backend.{prepare_lm_head_loss, validate_lm_head_inputs, lm_head_loss_workspace_size, LmHeadLossRunner, ChunkedLmHeadLossFunction, ChunkedLmHeadLogprobFunction, chunked_lm_head_loss, chunked_lm_head_logprob}` | this package's objects |
 | `cake_backend.{chunked_lm_head_logprob_keep, ChunkedLmHeadLogprobKeepFunction, forward_logprob_keep, backward_logprob_keep, KeptForwardResult, kept_memory_report}` | this package's kept-logits objects (the deterministic package's `chunked_lm_head_det_logprob_keep`, `ChunkedLmHeadDetLogprobKeepFunction` and the same eager names) |
-| `cake_backend.{chunked_lm_head_logprob_temperature, ChunkedLmHeadLogprobTemperatureFunction, forward_logprob_temperature, backward_logprob_temperature, prepare_lm_head_loss_temperature, memory_report_temperature}` | this package's temperature objects (the deterministic package's same names) |
+| `cake_backend.{chunked_lm_head_logprob_temperature, ChunkedLmHeadLogprobTemperatureFunction, forward_logprob_temperature, backward_logprob_temperature, prepare_lm_head_loss_temperature, memory_report_temperature}` | this package's temperature objects (the deterministic package's `chunked_lm_head_det_logprob_temperature`, `ChunkedLmHeadDetLogprobTemperatureFunction`, `prepare_lm_head_det_loss_temperature` and the same eager names) |
 | `cake_support.{SupportLogprobFunction, chunked_lm_head_support_logprob, chunked_lm_head_support_kl}` | this package's objects |
 | `cake_jit.load_cake_lm_head_loss_module` | this package's loader |
 | libraries `cake_lm_head_loss_<20 hex>_<arch>`, symbols `kernel_cake_lm_head_loss_<20 hex>` | this package's programs (named from their current kernel modules; no name of the libraries the deterministic package shipped under this prefix before its `det` naming is reused) |
@@ -524,12 +551,14 @@ import is the JIT fallback of `cake_build.py`.
   entries (the logits and weight-gradient raster heights, the weight-gradient
   blocked raster, the split-tail and swapped dX tiles), except the 3-deep dX
   operand ring of the long chunks (`DX_LONG_CHUNK_STAGES`): on `sm_107a` those
-  chunks keep the table ring depth.  The zero-gradient row skip is not one of
-  them: `ZERO_DLOGP_MIN_ROWS_BY_ARCH` has no `sm_107a` entry, so `sm_107a`
-  keeps the generic 4097-row floor (`ZERO_DLOGP_MIN_ROWS_DEFAULT`; `sm_103a`:
-  3891). `dw_cast_tma_rule`
+  chunks keep the table ring depth.  The zero-gradient row skip has its own
+  `sm_107a` entries, from R200 timing: the 1946-row floor of
+  `ZERO_DLOGP_MIN_ROWS_BY_ARCH` (`sm_103a`: 3891) and the two-slice counted dX
+  of `DX_COUNTED_MIN_SLICES_BY_ARCH`. `dw_cast_tma_rule`
   bounds `sm_107a` as `sm_103a` (1792 rows): a short last chunk takes the
-  TMA-epilogue bf16 cast, counted under the zero-gradient row skip.
+  TMA-epilogue bf16 cast, counted under the zero-gradient row skip.  The
+  `sm_107a` record does not register the `_lc` forms (the cast at the last
+  live chunk): its skip runs the counted forms.
 * Temperature of the log-probability entry
   (https://github.com/flashinfer-ai/flashinfer/issues/7637): the
   deterministic package's four temperature forms per architecture (the row

@@ -118,6 +118,10 @@ BS_N256_RUN32_ROUTE = "bs_ue8m0_n256_run32"
 # The store16 programs of the single-run routes (:func:`bs_store16`).
 BS_N128_S16_ROUTE = "bs_ue8m0_n128_s16"
 BS_N256_S16_ROUTE = "bs_ue8m0_n256_s16"
+# The SM107a lead-prefetch program of the BLOCK_N 256 single-run route
+# (:func:`bs_lead_prefetch`; its short-K layouts never take BLOCK_N 128 there).
+BS_N256_LPF_ROUTE = "bs_ue8m0_n256_lpf"
+BS_LPF_ROUTES = {BS_N256_ROUTE: BS_N256_LPF_ROUTE}
 BS_ROUTES = frozenset(
     {
         BS_N128_ROUTE,
@@ -126,6 +130,7 @@ BS_ROUTES = frozenset(
         BS_N256_RUN32_ROUTE,
         BS_N128_S16_ROUTE,
         BS_N256_S16_ROUTE,
+        BS_N256_LPF_ROUTE,
     }
 )
 BS_BLOCK_M = 128
@@ -324,6 +329,10 @@ def _unaligned_cg2_route(
     return single if load_single < load_cg2 else shape_route
 
 
+# The architecture whose single-run BLOCK_N rule is its own (:func:`bs_block_n`).
+BS_SM107A_ARCH = "sm_107a"
+
+
 def bs_block_n(
     m: int,
     n: int,
@@ -332,6 +341,7 @@ def bs_block_n(
     *,
     alignment: int = BS_BLOCK_M,
     num_groups: int | None = None,
+    arch: str | None = None,
 ) -> int:
     """``BLOCK_N`` of the block-scaled family.
 
@@ -349,8 +359,12 @@ def bs_block_n(
       rows plus each group's alignment padding and the 128-row round-up), would
       at one row per run fill more 128-column tiles than the device has SMs.
 
-    The choice never changes the output bits: every route accumulates each
-    output in the same K order.
+    On SM107a (``arch="sm_107a"``) a single-run problem (``alignment`` a
+    multiple of 128) runs 256 columns below 32 K blocks whatever the number of M
+    blocks.
+
+    The choice never changes the output bits of a single-run problem: both of
+    its routes accumulate each output in the same K order.
     """
     if n % B_SCALE_BLOCK_N:
         raise ValueError(f"N must be a multiple of {B_SCALE_BLOCK_N}, got {n}")
@@ -363,6 +377,8 @@ def bs_block_n(
     if k_blocks < 16 or m_blocks >= 3 * sm_count:
         return 256
     if alignment % BS_BLOCK_M == 0:
+        if arch == BS_SM107A_ARCH:
+            return 256 if k_blocks < 32 else 128
         return 256 if k_blocks < 32 and m_blocks < 2 * sm_count else 128
     if num_groups is not None:
         routed = m - num_groups * (alignment - 1) - (BS_BLOCK_M - 1)
@@ -380,8 +396,9 @@ def bs_route_for_shape(
     alignment: int,
     sm_count: int,
     num_groups: int | None = None,
+    arch: str | None = None,
 ) -> str:
-    """Select the block-scaled route for packed UE8M0 scales."""
+    """Select the block-scaled route for packed UE8M0 scales (``arch``: see :func:`bs_block_n`)."""
     if alignment <= 0 or alignment % BS_SUB_ROWS:
         raise ValueError(
             f"alignment must be a positive multiple of {BS_SUB_ROWS}, got {alignment}"
@@ -390,7 +407,9 @@ def bs_route_for_shape(
         raise ValueError(
             f"block-scaled grouped FP8 GEMM requires positive K divisible by {BS_BLOCK_K}; got K={k}"
         )
-    block_n = bs_block_n(m, n, k, sm_count, alignment=alignment, num_groups=num_groups)
+    block_n = bs_block_n(
+        m, n, k, sm_count, alignment=alignment, num_groups=num_groups, arch=arch
+    )
     single_run = alignment % BS_BLOCK_M == 0
     return {
         (128, True): BS_N128_ROUTE,
@@ -765,6 +784,35 @@ BS_STORE16_ARCHS = frozenset({"sm_100a", "sm_103a"})
 FP32_SCALE_ARCHS = frozenset({"sm_100a", "sm_103a"})
 
 
+def bs_lead_prefetch(
+    m: int, k: int, *, alignment: int, num_groups: int | None, arch: str | None
+) -> bool:
+    """Whether a single-run block-scaled problem takes the SM107a lead-prefetch program.
+
+    Each CTA writes the leading ``m_indices`` entry of each of its first 224
+    tiles to a shared table before its prologue barrier, and each role reads
+    its tile's entry from there (a later tile reads ``m_indices``), so a
+    padding tile costs no dependent global load; on a layout of mostly routed
+    blocks, or past two K blocks where the K loop outweighs the walk, the
+    table costs as much as it saves.  The rule reads host-known values only: at
+    most two K blocks, the valid blocks bounded as in :func:`bs_block_n`
+    (``min(routed, num_groups + routed // 128)`` with
+    ``routed = m - num_groups * (alignment - 1)``) at most four fifths of the
+    M blocks.  The program computes every output as the single-run program
+    does, so the routed rows keep their bits.
+    """
+    if arch != BS_SM107A_ARCH or not num_groups or alignment % BS_BLOCK_M:
+        return False
+    if k // K_BLOCK > 2:
+        return False
+    routed = m - num_groups * (alignment - 1)
+    if routed <= 0:
+        return False
+    valid_blocks = min(routed, num_groups + routed // BS_BLOCK_M)
+    m_blocks = (m + BS_BLOCK_M - 1) // BS_BLOCK_M
+    return 5 * valid_blocks <= 4 * m_blocks
+
+
 def bs_store16(m: int, *, alignment: int, num_groups: int | None) -> bool:
     """Whether a single-run block-scaled problem takes the store16 programs.
 
@@ -863,9 +911,11 @@ def _launch_plan(
     arch: str | None,
     aligned: Optional[bool],
     tile_starts: Optional[Mapping[int, Sequence[int]]] = None,
+    device_arch: str | None = None,
 ) -> tuple[str, tuple[int, int, int]]:
     """:func:`launch_plan` with the layout a validated launch read (``aligned``
-    and ``tile_starts``, see :func:`_route`)."""
+    and ``tile_starts``, see :func:`_route`) and the device's architecture
+    (``device_arch``, which selects its BLOCK_N rule, :func:`bs_block_n`)."""
     if sm_count <= 0:
         raise ValueError("sm_count must be positive")
     if block_scaled:
@@ -874,8 +924,18 @@ def _launch_plan(
                 "block-scaled grouped FP8 GEMM requires a 16-byte-aligned output"
             )
         route = bs_route_for_shape(
-            m, n, k, alignment=alignment, sm_count=sm_count, num_groups=num_groups
+            m,
+            n,
+            k,
+            alignment=alignment,
+            sm_count=sm_count,
+            num_groups=num_groups,
+            arch=device_arch or arch,
         )
+        if route in BS_LPF_ROUTES and bs_lead_prefetch(
+            m, k, alignment=alignment, num_groups=num_groups, arch=device_arch or arch
+        ):
+            route = BS_LPF_ROUTES[route]
         if arch is not None:
             route = (
                 bs_swap_route_for_shape(
@@ -1793,6 +1853,7 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous(
         arch=arch if swap_surfaces is not None else None,
         aligned=aligned,
         tile_starts=tile_starts,
+        device_arch=arch,
     )
     if (
         layout is not None
@@ -1881,6 +1942,7 @@ __all__ = [
     "argument_slots",
     "bind_arguments",
     "bs_block_n",
+    "bs_lead_prefetch",
     "bs_route_for_shape",
     "device_sm_count",
     "is_group_gemm_fp8_nt_groupwise_contiguous_prepared_available",

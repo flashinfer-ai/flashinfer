@@ -676,6 +676,7 @@ def autotune_v2_reload() -> None:
         tuner._protocol_record_partitions.clear()
         tuner._protocol_cache_generation += 1
         tuner._profiling_cache_policies.clear()
+        tuner._profiling_cache_selections.clear()
         tuner._managed_decoded.clear()
         # Drop the hydration markers so every store re-hydrates on its next
         # attach instead of silently degrading to lazy per-key disk reads.

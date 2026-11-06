@@ -123,12 +123,12 @@ the partition's order) and return that shard's outputs and gradients:
 from flashinfer.cake_kda_train_kcp import (partition_kcp, build_context_kcp, chunk_kda_kcp,
                                            chunk_kda_fwd_kcp, chunk_kda_bwd_kcp,
                                            kda_workspace_bytes_kcp, kda_saved_bytes_kcp, kda_comm_bytes_kcp)
-from flashinfer.cake_causal_conv1d_train import cake_causal_conv1d_kcp
+from flashinfer.cake_causal_conv1d_det_train_kcp import cake_causal_conv1d_det_kcp
 
 nd = dict(deterministic=False)                                     # the default True is the deterministic package
 part = partition_kcp(cu_seqlens_global_cpu, world_size, **nd)      # the same object on every rank
 ctx = build_context_kcp(part, group, rank, device, **nd)           # this rank's tables and collectives
-y_local = cake_causal_conv1d_kcp(x_local, conv_weight, ctx)        # the convolution before the KDA step
+y_local = cake_causal_conv1d_det_kcp(x_local, conv_weight, ctx)    # the convolution before the KDA step
 out_local = chunk_kda_kcp(q_local, k_local, v_local, g_local, beta_local, ctx, **nd)   # autograd
 out_local, saved = chunk_kda_fwd_kcp(q_local, k_local, v_local, g_local, beta_local, ctx,
                                      save_mode="light", boundary_mode="saved", **nd)
@@ -144,7 +144,7 @@ carries it costs no walk time per fragment.
 CUDA-graph replay: the three KDA entry points -- `chunk_kda_kcp`,
 `chunk_kda_fwd_kcp` and `chunk_kda_bwd_kcp` -- take `graph="replay"`
 (default `"off"`, the eager path); the convolution halo takes `graph=` only
-through the backend module's function, the `cake_causal_conv1d_kcp` facade
+through the backend module's function, the `cake_causal_conv1d_det_kcp` facade
 has no such parameter. The first call of a
 validity key runs eagerly, the second is captured into a CUDA graph and every
 later call of the key replays it: the same launches and collectives, bitwise
@@ -331,12 +331,12 @@ A recompute handle keeps what the original forward received instead:
 
 ```python
 from flashinfer.cake_kda_train_kcp import RecomputeHandleKcp, chunk_kda_kcp
-from flashinfer.cake_causal_conv1d_train import cake_causal_conv1d_kcp
+from flashinfer.cake_causal_conv1d_det_train_kcp import cake_causal_conv1d_det_kcp
 
 def layer(xq, xk, xv, g, beta, hq, hk, hv):
-    q = cake_causal_conv1d_kcp(xq, wq, ctx, recompute_handle=hq)   # "conv" entry of hq
-    k = cake_causal_conv1d_kcp(xk, wk, ctx, recompute_handle=hk)
-    v = cake_causal_conv1d_kcp(xv, wv, ctx, recompute_handle=hv)
+    q = cake_causal_conv1d_det_kcp(xq, wq, ctx, recompute_handle=hq)   # "conv" entry of hq
+    k = cake_causal_conv1d_det_kcp(xk, wk, ctx, recompute_handle=hk)
+    v = cake_causal_conv1d_det_kcp(xv, wv, ctx, recompute_handle=hv)
     ...                                                          # split heads, normalize q / k
     return chunk_kda_kcp(q, k, v, g, beta, ctx, recompute_handle=hq, deterministic=False)   # "kda" entry of hq
 
@@ -461,8 +461,8 @@ even when a capture, `torch.compile` or a dispatch mode is active in one
 pass only.  It combines with a recompute handle.
 
 One halo exchange for a layer's q / k / v convolutions:
-`cake_causal_conv1d_kcp_multi((xq, xk, xv), (wq, wk, wv), ctx)` returns the
-three outputs bitwise equal to three `cake_causal_conv1d_kcp` calls (outputs,
+`cake_causal_conv1d_det_multi_kcp((xq, xk, xv), (wq, wk, wv), ctx)` returns the
+three outputs bitwise equal to three `cake_causal_conv1d_det_kcp` calls (outputs,
 `dx` and `dweight`), but its forward and its backward each issue one halo
 collective instead of three: the history rows of the three tensors travel side
 by side in one `all_to_all_single` and are copied out after the wait, and each
@@ -472,7 +472,7 @@ the layer's `"kda"` entry, so the checkpointed layer above needs one handle:
 
 ```python
 def layer(xq, xk, xv, g, beta, h):
-    q, k, v = cake_causal_conv1d_kcp_multi((xq, xk, xv), (wq, wk, wv), ctx, recompute_handle=h)
+    q, k, v = cake_causal_conv1d_det_multi_kcp((xq, xk, xv), (wq, wk, wv), ctx, recompute_handle=h)
     ...
     return chunk_kda_kcp(q, k, v, g, beta, ctx, recompute_handle=h, deterministic=False)
 

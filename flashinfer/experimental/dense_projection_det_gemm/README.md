@@ -39,9 +39,9 @@ prepared.launch()   # allocation-free; prepared.template / .grid / .module_name 
 
 # K2: FP32 router GEMM through split-BF16x3 emulation
 gemm.router_fp32_det_gemm(A, B, out, splits=None)                  # convenience path (cached plan)
-gemm.router_det_forward(X, W, out=None, splits=4)          # out[T, N] = X[T, K] @ W[N, K].T
+gemm.router_det_forward(X, W, out=None, splits=None)       # out[T, N] = X[T, K] @ W[N, K].T
 gemm.router_det_dgrad(G, W, out=None)                      # out[T, K] = G[T, N] @ W[N, K]
-gemm.router_det_wgrad(G, X, out=None, splits=6)            # out[N, K] = G[T, N].T @ X[T, K]
+gemm.router_det_wgrad(G, X, out=None, splits=None)         # out[N, K] = G[T, N].T @ X[T, K]
 prepared = gemm.prepare_router_fp32_det_gemm(A, B, out, splits=None)
 prepared.launch()   # re-splits B, launches, reduces the split-K partials; .splits
 ```
@@ -55,9 +55,9 @@ module; they differ in who owns the plan and the workspace.
 |---|---|---|
 | planning | once, in `prepare_*` | once per cache key, on the first call |
 | workspace (K1: stream-K slabs + slice counters; K2: BF16x3 stack, the torch-chain split's fp32 scratch, split-K partials) | owned by the prepared object | carved out of the workspace arena of the (device, stream): one growable buffer per kind shared by every cached entry of that device and stream, grown to the largest requirement seen, never per entry |
-| per call | bind nothing: launch the bound views | rebind the caller's views (view objects only), resolve the workspace views of the arena (memoised until the arena grows), launch; `out` is allocated only when the caller passes none |
+| per call | bind nothing: launch the bound views | rebind the caller's views (view objects only), resolve the workspace views of the arena (memoised until the arena grows), launch; a K1 entry point launches the binding of its key (the argument list bound once, the caller's views rebuilt from its tensors, the workspace converted once per arena growth); `out` is allocated only when the caller passes none |
 | device queries | none after `prepare_*` | none after the first call |
-| cache | none | per process, per kind (K1 / K2), `CONVENIENCE_CACHE_SIZE` = 64 entries, least recently used first out; the arena of a (device, stream) is released with its last entry and by `clear_convenience_caches()` |
+| cache | none | per process, per kind (K1 / K2) and for the K1 entry points' bindings, `CONVENIENCE_CACHE_SIZE` = 64 entries each, least recently used first out; the arena of a (device, stream) is released with its last entry or binding and by `clear_convenience_caches()` |
 | memory held | the prepared object's workspace | bounded by the largest geometry seen per workspace kind, however many token counts the cache has planned (a ragged T adds entries, not workspace) |
 | CUDA Graphs | capture `launch()` | do not capture (a later growth replaces, an eviction frees, the workspace a graph replays) |
 
@@ -223,17 +223,25 @@ split take `enable_pdl` too and wait before their first global access.
   `out [M, N]` with unit inner stride and 16-byte rows; `N` a multiple of 8.
   A single-split `kk` / `kn` launch stores 16-byte vectors straight into `out`,
   so `out` must then start at a 16-byte aligned address.
-* The operand layouts select the instance and the production split-K count:
+* The operand layouts select the instance and the default split-K count:
   `kk` (forward, 4 splits), `kn` (input gradient, 1), both MN-major -> the
   swapped transposed-store weight gradient `nn_t` (6 splits; `out.T = B.T
   A.T`).  An MN-major `A` with a K-major `B` has no instance.
+  `ROUTER_SPLIT_RULES` replaces the default count (`router_splits`, used when
+  `splits` is `None`) for N = 256 rows measured faster with another count on a
+  device: by architecture, SM count, layout, hidden size H and token-count
+  window T 16129-16384:
+  `sm_100a` at 148 / 152 SMs, weight gradient H 5120: 9 splits;
+  `sm_103a` at 148 / 152 SMs, weight gradient H 5120: 9 splits.
 * Every `launch()` re-splits the second operand into the retained
   `[3, outer, inner]` BF16 stack in the operand's own layout (exact three-way
   split, no allocation: one launch of the fused split program
   `split_fp32_det_bf16x3` when this checkout registers it for the device, else a
   five-op torch chain through an fp32 scratch -- the same bits either way),
   launches, and sums the split-K partials on the host in a fixed order.  Splits, chunk boundaries and the reduction order are
-  fixed: bit-exact run to run.  Error against an FP64 reference: FP32-class
+  fixed: bit-exact run to run.  The bits are a function of the split count:
+  another count (a caller's `splits`, or a `ROUTER_SPLIT_RULES` count that a
+  later version adds or changes) gives other bits within the same accuracy.  Error against an FP64 reference: FP32-class
   (`rel_fro` about 2e-7 to 4e-7 on the GLM-5.2 router shapes).
 
 ## Layout of this package
