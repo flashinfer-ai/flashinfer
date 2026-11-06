@@ -231,10 +231,24 @@ def test_fp8_record_replaces_only_its_fields_and_leaves_the_bf16_record():
         "sm_103a": [],
         "sm_107a": ["l6", "narrow", "split_narrow", "wide"],
     }
-    # the FP8 records' own rules: sm_107a keeps no split-fit rule (no FP8 split program is measured under one), and no
-    # FP8 call walks its key tiles in descending order (the descending-walk programs are BF16 programs)
+    # the FP8 records' own rules: every split field pinned (no split-resident rule); sm_107a keeps no split-fit
+    # rule (no FP8 split program is measured under one), and no FP8 call walks its key tiles in descending order
+    # (the descending-walk programs are BF16 programs)
+    split_fields = (
+        "split_max",
+        "split_min_range_tiles",
+        "split_wave_rule",
+        "split_wave_scope",
+        "split_fit_rule",
+        "split_resident_rule",
+        "split_units",
+    )
     assert {
-        arch: {f: v for f, v in fields.items() if f != "static_scan_kinds"}
+        arch: {
+            f: v
+            for f, v in fields.items()
+            if f != "static_scan_kinds" and f not in split_fields
+        }
         for arch, fields in cake_jit.POLICY_FP8.items()
     } == {
         "sm_100a": {
@@ -267,12 +281,43 @@ def test_fp8_record_replaces_only_its_fields_and_leaves_the_bf16_record():
             "snake_l6_fallback_waves": None,
         },
         "sm_107a": {
-            "split_fit_rule": None,
             "snake_cap_rule": [1, 40],
             "desc_walk_kinds": None,
             "snake_packed_rule": None,
             "snake_l6_fallback_waves": None,
         },
+    }
+    assert {
+        arch: {f: fields[f] for f in split_fields}
+        for arch, fields in cake_jit.POLICY_FP8.items()
+    } == {
+        "sm_100a": dict(
+            split_max=16,
+            split_min_range_tiles=32,
+            split_wave_rule=None,
+            split_wave_scope=None,
+            split_fit_rule=[4096],
+            split_resident_rule=None,
+            split_units=["l6", "narrow"],
+        ),
+        "sm_103a": dict(
+            split_max=16,
+            split_min_range_tiles=32,
+            split_wave_rule=None,
+            split_wave_scope=None,
+            split_fit_rule=[4096],
+            split_resident_rule=None,
+            split_units=["l6", "narrow"],
+        ),
+        "sm_107a": dict(
+            split_max=16,
+            split_min_range_tiles=32,
+            split_wave_rule=[1000, 0.12],
+            split_wave_scope=[["narrow"], 1, True],
+            split_fit_rule=None,
+            split_resident_rule=None,
+            split_units=["narrow", "wide"],
+        ),
     }
     # the FP8 record never inherits the BF16 programs' static kinds, and takes only record fields
     with pytest.raises(ValueError, match="static_scan_kinds"):
