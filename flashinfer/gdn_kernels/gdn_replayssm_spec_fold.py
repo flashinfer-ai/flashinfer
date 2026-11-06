@@ -538,9 +538,7 @@ def commit_gdn_replayssm_fold_all_layers(
     if backend == "tcgen05" and target.major != 10:
         raise ValueError("tcgen05 commit requires SM100/SM103")
     supports_tcgen = (
-        target.major == 10
-        and 4 <= max_cache_len <= 8
-        and use_qk_l2norm_in_kernel
+        target.major == 10 and 4 <= max_cache_len <= 8 and use_qk_l2norm_in_kernel
     )
     if backend == "tcgen05" and not supports_tcgen:
         raise ValueError("tcgen05 commit requires normalized T=4..8")
