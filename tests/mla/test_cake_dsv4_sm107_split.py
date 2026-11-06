@@ -59,7 +59,18 @@ COMPRESSED_WIDTH = 1024
 WIDTH = hardening.SWA_WINDOW + COMPRESSED_WIDTH
 TILE = 128
 # Routed row counts and the pieces per row the SM107 rule plans for them.
-ROUTED = [(1, 9), (2, 9), (4, 9), (8, 5), (12, 3), (13, 3), (16, 2), (17, 2)]
+ROUTED = [
+    (1, 9),
+    (2, 9),
+    (4, 9),
+    (8, 5),
+    (12, 3),
+    (13, 3),
+    (14, 3),
+    (15, 3),
+    (16, 2),
+    (17, 2),
+]
 REPEATS = 20
 
 
@@ -236,7 +247,7 @@ def test_split_launch_matches_reference(monkeypatch, rows, splits, layout, lengt
     assert torch.equal(clean, poisoned), "masked columns leak into the split output"
 
 
-@pytest.mark.parametrize("rows,splits", [(1, 9), (4, 9), (8, 5), (13, 3), (17, 2)])
+@pytest.mark.parametrize("rows,splits", [(1, 9), (4, 9), (8, 5), (15, 3), (17, 2)])
 @pytest.mark.parametrize("sink", ["none", "large", "empty_piece_zero"])
 def test_split_launch_sinks(monkeypatch, rows, splits, sink):
     """No sink, a sink far above the scores, and rows whose first piece has no
@@ -258,7 +269,7 @@ def test_split_launch_sinks(monkeypatch, rows, splits, sink):
     hardening._assert_valid(out, case)
 
 
-@pytest.mark.parametrize("rows,splits", [(2, 9), (8, 5), (13, 3), (17, 2)])
+@pytest.mark.parametrize("rows,splits", [(2, 9), (8, 5), (15, 3), (17, 2)])
 def test_split_launch_zero_length_rows(monkeypatch, rows, splits):
     """Rows without an attendable column (zero active length, or every index
     ``-1``) write zeros; the other rows of the launch match the reference."""
@@ -346,7 +357,7 @@ def test_split_launch_metadata_forms(monkeypatch, rows, splits, form):
     )
 
 
-@pytest.mark.parametrize("rows,splits", [(1, 9), (8, 5), (13, 3), (17, 2)])
+@pytest.mark.parametrize("rows,splits", [(1, 9), (8, 5), (15, 3), (17, 2)])
 def test_split_launch_is_deterministic(monkeypatch, rows, splits):
     """Eager calls and CUDA graph replays of one split launch, with the piece
     buffers and the output poisoned before each, are bitwise identical; inside
