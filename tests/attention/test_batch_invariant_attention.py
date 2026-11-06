@@ -992,6 +992,13 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         bi.BatchInvariantUnsupportedError
     ):  # a K view that is not 16-byte aligned
         w.run(pr.q, (off, v))
+    qoff = torch.empty(pr.q.numel() + 1, dtype=pr.q.dtype, device=pr.q.device)[1:].view(
+        pr.q.shape
+    )
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError
+    ):  # a q whose base is not 16-byte aligned
+        w.run(qoff, (k, v))
     # a plan with no query rows: nothing is launched, the (empty) output comes back
     w.plan(
         torch.tensor([0, 0], dtype=torch.int32, device=pr.device),
