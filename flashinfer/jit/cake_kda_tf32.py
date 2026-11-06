@@ -2173,7 +2173,7 @@ _RENDERED_MODULES = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "arches": ["sm_103a"],
+        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_kda_prefill_4864c64f7e75b9376fe3": {
         "sources": [
@@ -2648,7 +2648,7 @@ _RENDERED_MODULES = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "arches": ["sm_103a"],
+        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_kda_prefill_5704df93aca2fdd4c4d6": {
         "sources": [
@@ -4920,7 +4920,7 @@ _RENDERED_MODULES = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "arches": ["sm_103a"],
+        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_kda_prefill_e37381d75cc3b9e271d7": {
         "sources": [
@@ -5777,7 +5777,11 @@ _RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES: dict[str, dict[str, str]] = {
 # take no bin-mix, helper-pool or short-task build; every other launch keeps
 # the turnover build.
 _RENDERED_WORK_BIN_TURN_E128_ROUTES: dict[str, dict[str, str]] = {
-    "sm_100a": {},
+    "sm_100a": {
+        "cake_kda_bf16_02c6dae5d13691ae05c3": "cake_kda_prefill_5349d111191031dfe29c",
+        "cake_kda_bf16_2064d4aca94aef841cf8": "cake_kda_prefill_3f31fb3a1fbcfacf3257",
+        "cake_kda_bf16_5be344cbddc29563f1ee": "cake_kda_prefill_e2d4e945f49b1e31af24",
+    },
     "sm_103a": {
         "cake_kda_bf16_02c6dae5d13691ae05c3": "cake_kda_prefill_5349d111191031dfe29c",
         "cake_kda_bf16_2064d4aca94aef841cf8": "cake_kda_prefill_3f31fb3a1fbcfacf3257",

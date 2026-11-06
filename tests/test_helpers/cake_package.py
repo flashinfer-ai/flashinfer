@@ -27,11 +27,11 @@ PACKAGES: dict[str, str] = {
     "cake.cake_mhc_head_det_train": "flashinfer.experimental.cake.cake_mhc_head_det_train",
     "cake.cake_dsa_sparse_attention_nondet_train": "flashinfer.experimental.cake.cake_dsa_sparse_attention_nondet_train",
     "cake.cake_dsa_indexer_det_train": "flashinfer.experimental.cake.cake_dsa_indexer_det_train",
-    "cake_lm_head_det_loss": "flashinfer.experimental.cake_lm_head_det_loss",
+    "cake.cake_lm_head_det_train": "flashinfer.experimental.cake.cake_lm_head_det_train",
     # the non-deterministic package (deterministic=False); its key carries the namespace
     "cake.cake_lm_head_loss": "flashinfer.experimental.cake.cake_lm_head_loss",
-    "dense_projection_det_gemm": "flashinfer.experimental.dense_projection_det_gemm",
-    "dense_projection_gemm": "flashinfer.experimental.dense_projection_gemm",
+    "cake_dense_gemm_det_train": "flashinfer.experimental.cake.cake_dense_gemm_det_train",
+    "cake_dense_gemm_nondet_train": "flashinfer.experimental.cake.cake_dense_gemm_nondet_train",
     "cake_moe_grouped_det_gemm": "flashinfer.experimental.cake_moe_grouped_det_gemm",
     # the non-deterministic package (deterministic=False); its key carries the namespace
     "cake.cake_moe_grouped_gemm": "flashinfer.experimental.cake.cake_moe_grouped_gemm",

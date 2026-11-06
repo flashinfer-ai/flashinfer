@@ -181,6 +181,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "CakeMHCDetFinishFunction": (".cake_mhc_det_train", "CakeMHCDetFinishFunction"),
     "CakeMHCDetPrepareFunction": (".cake_mhc_det_train", "CakeMHCDetPrepareFunction"),
     "CakeMHCHeadDetFunction": (".cake_mhc_head_det_train", "CakeMHCHeadDetFunction"),
+    "cake_lm_head_det_train": (".cake_lm_head_det_train", None),
     # SiLU-gated RMSNorm training (Cake), both modes: each facade imports its
     # backend package (under flashinfer.experimental.cake) on first use.
     "cake_rmsnorm_silu_gate_det_train": (".cake_rmsnorm_silu_gate_det_train", None),
@@ -535,14 +536,14 @@ from .fi_trace import fi_trace as fi_trace
 
 # ---------------------------------------------------------------------------
 # Trace Apply (opt-in): zero-code kernel substitution from the FlashInfer Trace.
-# Activated only when FLASHINFER_TRACE_APPLY=1. This is the single edit to
-# existing flashinfer code required by the Trace Apply design — the package
-# itself lives in flashinfer/trace_apply/. Failures here must never break a
-# normal import, so the install is best-effort.
+# Activated only when FLASHINFER_TRACE_APPLY=1 (exactly "1": anything else is
+# refused by _enable_apply_from_env, so the gate here must match it exactly).
+# The package itself lives in flashinfer/trace_apply/. Failures here must
+# never break a normal import, so the install is best-effort.
 # ---------------------------------------------------------------------------
 import os as _os
 
-if _os.environ.get("FLASHINFER_TRACE_APPLY", "0") not in ("0", "", "false", "False"):
+if _os.environ.get("FLASHINFER_TRACE_APPLY", "0") == "1":
     try:
         from . import trace_apply as trace_apply
 
@@ -554,6 +555,32 @@ if _os.environ.get("FLASHINFER_TRACE_APPLY", "0") not in ("0", "", "false", "Fal
             "FLASHINFER_TRACE_APPLY is set but enabling Trace Apply failed: %s "
             "(continuing without Trace Apply).",
             _trace_apply_err,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Sealed kernel packages (opt-in): digest-named package directories whose
+# every byte is pinned by a sha256 chain (manifest digest == directory name,
+# exact bundle file set, per-file digests, sealed sidecars) before anything
+# is imported. Named by FLASHINFER_KERNEL_PACKAGES (comma-separated digests)
+# under FLASHINFER_KERNEL_PACKAGE_ROOT. The same best-effort rule as above: a
+# bad package warns and never breaks import flashinfer. See
+# flashinfer/trace_apply/packages.py.
+# ---------------------------------------------------------------------------
+if _os.environ.get("FLASHINFER_KERNEL_PACKAGES", "") or _os.environ.get(
+    "FLASHINFER_KERNEL_PACKAGE_ROOT", ""
+):
+    try:
+        from . import trace_apply as _trace_apply_sealed
+
+        _trace_apply_sealed._load_packages_from_env()
+    except Exception as _sealed_err:  # noqa: BLE001
+        import logging as _sealed_logging
+
+        _sealed_logging.getLogger("flashinfer.trace_apply").warning(
+            "FLASHINFER_KERNEL_PACKAGES is set but sealed package loading failed: %s "
+            "(continuing with stock kernels).",
+            _sealed_err,
         )
 
 

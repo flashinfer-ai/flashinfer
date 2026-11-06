@@ -174,7 +174,7 @@ def test_package_wiring() -> None:
     assert "aot/" in (directory / ".gitignore").read_text().split()
     pre_commit = (REPO / ".pre-commit-config.yaml").read_text()
     # pre-commit skips every generated source of the package (a per-package entry or the generic #8928 rule), still
-    # checks its Python modules and names no former tree
+    # checks its Python modules; the former tree holds no sources (the shared exclude may still list its path)
     exclude = re.compile(
         next(ln for ln in pre_commit.splitlines() if ln.startswith("exclude:"))
         .split(":", 1)[1]
@@ -192,7 +192,7 @@ def test_package_wiring() -> None:
     assert not exclude.search(
         (package_dir / "cake_jit.py").relative_to(root).as_posix()
     )
-    assert "|cake_mhc_det_train_backend/csrc/" not in pre_commit
+    assert not list((REPO / "flashinfer/cake_mhc_det_train_backend/csrc").glob("*"))
     spec = importlib.util.spec_from_file_location(
         "check_cake_build_manifests", REPO / "scripts" / "check_cake_build_manifests.py"
     )
