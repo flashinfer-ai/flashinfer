@@ -195,3 +195,27 @@ Candidate-support entries (`chunked_lm_head_support_logprob` /
 The non-deterministic package adds no environment variable; the
 `FLASHINFER_CAKE_LM_HEAD_LOSS_*` variables apply to both modes through the
 dispatchers, and its binding caches take the same two binding-cache settings.
+
+## Family migration tables
+
+Each table below takes effect when that family's rename PR merges; until then
+the family's current names stay in effect.
+
+### GQA HD256: non-deterministic package
+
+| Old | New |
+| --- | --- |
+| module `flashinfer.gqa_train` | `flashinfer.cake_gqa_nondet_train` (stable API, `@flashinfer_api`; backend imported on first use) |
+| package `flashinfer.experimental.cake_gqa_train` | `flashinfer.experimental.cake.cake_gqa_nondet_train` |
+| `varlen_gqa_attention` | `cake_gqa_nondet` |
+| `varlen_gqa_attention_fwd` (backend `gqa_attention_fwd`) | `cake_gqa_nondet_train_forward` |
+| `varlen_gqa_attention_bwd` (backend `gqa_attention_bwd`) | `cake_gqa_nondet_train_backward` |
+| `gqa_train_workspace` | `cake_gqa_nondet_train_workspace` |
+| `gqa_train_workspace_bytes` (backend `workspace_bytes`) | `cake_gqa_nondet_train_workspace_bytes` |
+| backend `VarlenGQAAttentionFunction` | `CakeGQANondetFunction` |
+| backend `Workspace` | `CakeGQANondetWorkspace` |
+| backend `DkvAccSource` | `CakeGQANondetDkvAccSource` |
+
+No aliases: the old names fail at import. No entry takes `deterministic=`. Under `torch.use_deterministic_algorithms(True)` the forward (fixed order) runs and the backward raises PyTorch's alert before it launches, because it adds the dQ partials (and row-map dK / dV adds) with atomic FP32 reductions; with `warn_only=True` it warns once per backward call and runs the non-deterministic backward. Nothing falls back to a deterministic implementation; `flashinfer.cake_gqa_det_train` is reserved (planned).
+
+Build identities keep their names: program / library stems `cake_gqa_train_<20 hex>[_<arch>]`, kernel symbols `kernel_cake_gqa_train_<20 hex>`, csrc file names and `cake_jit.LIBRARY_PREFIX`; `build.json` changes only `"package"`. Internal backend helpers (`default_workspace`, `load`, `record`, `stage_record`, `library_name`, ...) keep their names.
