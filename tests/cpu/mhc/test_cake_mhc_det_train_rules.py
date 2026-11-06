@@ -524,7 +524,7 @@ TABLES = {
     },
     "BWD_DPL_SLABS": ("dynl", "dynr"),
     "BWD_DPL_PATHS": {
-        "sm_100a": {"backward": ((8192, 15590), (16131, 16263))},
+        "sm_100a": {"backward": ((8192, 15590), (16132, 16263))},
         "sm_103a": {},
         "sm_107a": {},
     },
@@ -2002,8 +2002,8 @@ def test_path_bands_of_record() -> None:
         "bwd_slab_program",
         "bwd_reduce_program",
     )
-    inside = (8193, 12288, 14928, 15590, 16132, 16263)  # bands are (above, at_most]
-    outside = (15591, 16114, 16130, 16131, 16264)
+    inside = (8193, 12288, 14928, 15590, 16133, 16263)  # bands are (above, at_most]
+    outside = (15591, 16114, 16130, 16131, 16132, 16264)
     for sm in SM_COUNTS:
         for T in inside + outside:
             slab = loader.bwd_slab_program(T, sm, "sm_100a", path="backward")
