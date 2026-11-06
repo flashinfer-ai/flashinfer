@@ -24,6 +24,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
+#include "tensorrt_llm/kernels/nvfp4Recipe.h"
 #ifdef ENABLE_FP4
 #include "tensorrt_llm/kernels/cutlass_kernels/fp4_compat.h"
 #endif
@@ -312,6 +313,10 @@ struct QuantParams {
 
     GemmInputs fc1;
     GemmInputs fc2;
+    // 4over6 recipe for both NVFP4 activation quantizations (GEMM1 input when
+    // the activations arrive unquantized, GEMM2 input), as the code decoded by
+    // resolveNVFP4Recipe(). The default reads FLASHINFER_NVFP4_4OVER6*.
+    int64_t nvfp4_4over6_code = kNVFP44Over6FromEnv;
   } fp4;
 
   // GPTQ/AWQ quantization params
@@ -403,14 +408,14 @@ struct QuantParams {
       float const* fc2_act_global_scale,
       TmaWarpSpecializedGroupedGemmInput::NVFP4ElementSF const* fc2_weight_block_scale,
       float const* fc2_global_scale,  //
-      bool fc1_use_per_expert_act_scale = false, bool fc2_use_per_expert_act_scale = false)
-
-  {
+      bool fc1_use_per_expert_act_scale = false, bool fc2_use_per_expert_act_scale = false,
+      int64_t nvfp4_4over6_code = kNVFP44Over6FromEnv) {
     QuantParams qp;
     qp.fp4.fc1 = {fc1_use_per_expert_act_scale, fc1_act_global_scale, fc1_weight_block_scale,
                   fc1_global_scale};
     qp.fp4.fc2 = {fc2_use_per_expert_act_scale, fc2_act_global_scale, fc2_weight_block_scale,
                   fc2_global_scale};
+    qp.fp4.nvfp4_4over6_code = nvfp4_4over6_code;
     return qp;
   }
 

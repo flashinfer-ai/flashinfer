@@ -535,6 +535,128 @@ def test_fused_add_rmsnorm_fi_trace():
     assert "residual" in defn["outputs"]
 
 
+def test_gated_residual_rmsnorm_fi_trace():
+    import flashinfer.norm
+
+    branch = torch.empty(2, 8192, dtype=torch.bfloat16)
+    residual = torch.empty(2, 8192, dtype=torch.float32)
+    weight = torch.empty(8192, dtype=torch.bfloat16)
+    gate = torch.empty(8192, dtype=torch.float32)
+    defn = flashinfer.norm.gated_residual_rmsnorm.fi_trace(
+        branch=branch,
+        residual=residual,
+        weight=weight,
+        alpha=gate,
+        beta=gate,
+        eps=1e-6,
+        gain_center=1.0,
+    )
+    _check_defn(
+        defn, "gated_residual_rmsnorm", "flashinfer.norm.gated_residual_rmsnorm"
+    )
+    assert defn["axes"]["hidden_size"]["value"] == 8192
+    assert defn["outputs"]["output"]["dtype"] == "float32"
+
+
+@pytest.mark.parametrize("post_input_scale", [False, True])
+@pytest.mark.parametrize("alpha", [None, 1.0, 0.5])
+def test_gated_residual_next_rmsnorm_fi_trace(post_input_scale, alpha):
+    import flashinfer.norm
+
+    branch = torch.empty(2, 8192, dtype=torch.bfloat16)
+    residual = torch.empty(2, 8192, dtype=torch.float32)
+    next_weight = torch.empty(8192, dtype=torch.bfloat16)
+    gate = torch.empty(8192, dtype=torch.float32)
+    kwargs = {}
+    if post_input_scale:
+        kwargs = {"post_weight": next_weight, "post_gain_center": 1.0}
+    defn = flashinfer.norm.gated_residual_next_rmsnorm.fi_trace(
+        branch=branch,
+        residual=residual,
+        next_weight=next_weight,
+        alpha=gate if alpha is None else alpha,
+        beta=gate,
+        post_eps=1e-8,
+        next_eps=1e-5,
+        next_gain_center=1.0,
+        **kwargs,
+    )
+    _check_defn(
+        defn,
+        "gated_residual_next_rmsnorm",
+        "flashinfer.norm.gated_residual_next_rmsnorm",
+    )
+    assert defn["axes"]["hidden_size"]["value"] == 8192
+    assert defn["outputs"]["residual_out"]["dtype"] == "float32"
+    assert defn["outputs"]["ffn_input"]["dtype"] == "bfloat16"
+    if alpha is not None:
+        assert defn["inputs"]["alpha"] == {"shape": None, "dtype": "float32"}
+        assert defn["name"] == "gated_residual_next_rmsnorm_scalar_alpha_h8192"
+    if post_input_scale:
+        assert defn["inputs"]["post_weight"]["dtype"] == "bfloat16"
+
+
+@pytest.mark.parametrize("alpha", [1.0, 0.5])
+def test_gated_residual_next_rmsnorm_scalar_init_standalone(alpha):
+    from flashinfer.norm import gated_residual_next_rmsnorm
+
+    inputs = gated_residual_next_rmsnorm.fi_init(num_rows=2, alpha=alpha, device="cpu")
+    assert inputs["alpha"] == alpha
+    defn = gated_residual_next_rmsnorm.fi_trace(**inputs)
+    namespace = {}
+    exec(defn["init"], namespace)
+    restored = namespace["_gated_residual_next_rmsnorm_scalar_init"](
+        num_rows=2, alpha=alpha, device="cpu"
+    )
+    assert restored["alpha"] == alpha
+    assert gated_residual_next_rmsnorm.fi_trace(**restored) == defn
+
+
+def test_rmsnorm_sigmoid_gate_fi_trace():
+    import flashinfer.norm
+
+    x = torch.empty(2, 32, 64, dtype=torch.bfloat16)
+    gate = torch.empty_like(x)
+    defn = flashinfer.norm.rmsnorm_sigmoid_gate.fi_trace(input=x, gate=gate, eps=1e-5)
+    _check_defn(defn, "rmsnorm_sigmoid_gate", "flashinfer.norm.rmsnorm_sigmoid_gate")
+    assert defn["axes"]["head_dim"]["value"] == 64
+    assert defn["outputs"]["output"]["dtype"] == "bfloat16"
+
+
+@pytest.mark.parametrize("expert_weights_dtype", [torch.bfloat16, torch.float32])
+def test_tp_moe_finalize_rmsnorm_fi_trace(expert_weights_dtype):
+    import flashinfer.comm
+
+    if not hasattr(flashinfer.comm, "tp_moe_finalize_rmsnorm"):
+        pytest.skip("TP MoE finalize dependencies are unavailable")
+    gemm2_permuted = torch.empty(19, 4128, dtype=torch.bfloat16)
+    expert_weights = torch.empty(2, 8, dtype=expert_weights_dtype)
+    expanded_idx_to_permuted_idx = torch.empty(2, 8, dtype=torch.int32)
+    norm_weight = torch.empty(4096, dtype=torch.bfloat16)
+    output = torch.empty(2, 4096, dtype=torch.bfloat16)
+    defn = flashinfer.comm.tp_moe_finalize_rmsnorm.fi_trace(
+        gemm2_permuted=gemm2_permuted,
+        expert_weights=expert_weights,
+        expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+        norm_weight=norm_weight,
+        output=output,
+        eps=1e-8,
+        gain_center=1.0,
+        weight_before_norm=True,
+    )
+    _check_defn(
+        defn,
+        "tp_moe_finalize_rmsnorm",
+        "flashinfer.comm.tp_moe_finalize_rmsnorm",
+    )
+    assert defn["axes"]["num_experts"]["value"] == 8
+    assert defn["axes"]["hidden_size"]["value"] == 4096
+    assert defn["axes"]["hidden_size_padded"]["value"] == 4128
+    assert defn["inputs"]["expert_weights"]["dtype"] == str(
+        expert_weights_dtype
+    ).removeprefix("torch.")
+
+
 # ---------------------------------------------------------------------------
 # sampling
 # ---------------------------------------------------------------------------
@@ -1512,6 +1634,70 @@ def test_fi_trace_creates_nested_save_dir(tmp_path):
     assert json.loads(files[0].read_text())["name"] == defn["name"]
 
 
+def test_const_extract_axis_appears_only_when_derived():
+    """``Const(extract=)`` leaves the definition untouched when it yields None."""
+    from flashinfer.trace.template import Const, TraceTemplate, Tensor, Var
+
+    tmpl = TraceTemplate(
+        op_type="probe",
+        axes={
+            "rows": Var(),
+            "cols": Const(abbrev="c"),
+            "flag": Const(
+                abbrev="f",
+                extract=lambda kw: None if kw.get("flag") is None else int(kw["flag"]),
+            ),
+        },
+        inputs={"x": Tensor(["rows", "cols"])},
+        outputs={"y": Tensor(["rows", "cols"], dtype="bfloat16")},
+    )
+    trace = tmpl.build_fi_trace_fn("probe.api")
+    x = torch.empty(4, 8, device="meta")
+
+    absent = trace(x=x)
+    assert absent["name"] == "probe_c8"
+    assert "flag" not in absent["axes"]
+
+    present = trace(x=x, flag=0)
+    assert present["name"] == "probe_c8_f0"
+    assert present["axes"]["flag"]["value"] == 0
+
+
+def test_cutlass_fused_moe_fi_trace_nvfp4_4over6_axis():
+    """The recipe axis records the wire code: unset omits it, ``None`` is 0."""
+    from flashinfer.quantization.nvfp4_quantization_utils import (
+        NVFP44Over6Config,
+        nvfp4_4over6_code,
+    )
+
+    e, h, i, k, s = 4, 256, 512, 2, 16
+    kwargs = dict(
+        input=torch.empty(s, h, dtype=torch.bfloat16, device="meta"),
+        token_selected_experts=torch.empty(s, k, dtype=torch.int32, device="meta"),
+        token_final_scales=torch.empty(s, k, dtype=torch.float32, device="meta"),
+        fc1_expert_weights=torch.empty(
+            e, 2 * i, h, dtype=torch.bfloat16, device="meta"
+        ),
+        fc2_expert_weights=torch.empty(e, h, i, dtype=torch.bfloat16, device="meta"),
+        output_dtype=torch.bfloat16,
+        quant_scales=[],
+    )
+    trace = flashinfer.fused_moe.cutlass_fused_moe.fi_trace
+
+    unset = trace(**kwargs)
+    assert "nvfp4_4over6" not in unset["axes"]
+    assert unset["name"] == "cutlass_fused_moe_e4_h256_i512_topk2"
+
+    off = trace(**kwargs, nvfp4_4over6=None)
+    assert off["axes"]["nvfp4_4over6"]["value"] == 0
+    assert off["name"] == "cutlass_fused_moe_e4_h256_i512_topk2_r4o60"
+
+    recipe = NVFP44Over6Config(e4m3_max=256)
+    pinned = trace(**kwargs, nvfp4_4over6=recipe)
+    assert pinned["axes"]["nvfp4_4over6"]["value"] == nvfp4_4over6_code(recipe)
+    assert pinned["name"].endswith(f"_r4o6{nvfp4_4over6_code(recipe)}")
+
+
 def test_fi_trace_filename_matches_definition_name(tmp_path):
     """The written filename is exactly '<definition_name>.json'."""
     from flashinfer.decode import BatchDecodeWithPagedKVCacheWrapper
@@ -1557,6 +1743,128 @@ def test_nvfp4_append_trace_json_init_is_self_contained():
                 pytest.skip(f"{filename} init unsupported on CPU: {exc}")
             raise
         assert isinstance(result, dict)
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("op", ["k_sum_v_amax", "q_grouped_amax", "k_grouped_amax"])
+def test_ulysses_lowp_trace_json_init_is_self_contained(head_dim, op):
+    suffix = "" if op == "k_sum_v_amax" else "_p8"
+    path = (
+        Path(__file__).parent
+        / "fi_trace_out"
+        / (f"ulysses_lowp_{op}_h8_d{head_dim}{suffix}.json")
+    )
+    definition = json.loads(path.read_text())
+    namespace = {}
+    exec(definition["init"], namespace)
+    inputs = namespace[f"_ulysses_lowp_{op}_init"](
+        batch=1, local_sequence=65, device="cpu"
+    )
+    tensor = inputs["q" if op == "q_grouped_amax" else "k"]
+    assert tensor.shape == (1, 65, 8, head_dim)
+    assert tensor.dtype == torch.bfloat16
+    from flashinfer.comm import _ulysses_lowp as lowp
+
+    regenerated = getattr(lowp, op).fi_trace(**inputs)
+    assert regenerated["init"] == definition["init"]
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("num_heads,world_size", [(8, 2), (16, 4)])
+@pytest.mark.parametrize("op", ["k_sum_v_amax", "q_grouped_amax", "k_grouped_amax"])
+def test_ulysses_lowp_trace_init_binds_const_axes(op, head_dim, num_heads, world_size):
+    from flashinfer.comm import _ulysses_lowp as lowp
+    from flashinfer.trace.templates import comm
+
+    init = getattr(comm, f"_ulysses_lowp_{op}_init")
+    original_defaults = dict(init.__kwdefaults__)
+    template = getattr(comm, f"ulysses_lowp_{op}_trace")
+    api = getattr(lowp, op)
+    source_inputs = init(
+        batch=1,
+        local_sequence=65,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        device="cpu",
+    )
+    if op != "k_sum_v_amax":
+        source_inputs["world_size"] = world_size
+    definition = api.fi_trace(**source_inputs)
+    namespace = {}
+    exec(definition["init"], namespace)
+    # Change the Var axes; the definition's Const axes must remain bound.
+    replay_inputs = namespace[init.__name__](batch=2, local_sequence=97, device="cpu")
+    tensor = replay_inputs["q" if op == "q_grouped_amax" else "k"]
+    assert tensor.shape == (2, 97, num_heads, head_dim)
+    if op != "k_sum_v_amax":
+        assert replay_inputs["world_size"] == world_size
+    if op == "k_grouped_amax":
+        assert replay_inputs["k_mean_global"].shape == (2, num_heads, head_dim)
+    regenerated = api.fi_trace(**replay_inputs)
+    assert regenerated["axes"] == definition["axes"]
+    assert regenerated["init"] == definition["init"]
+    assert init.__kwdefaults__ == original_defaults
+    assert template.init is init
+
+
+def test_trace_init_const_binding_is_opt_in():
+    import inspect
+
+    from flashinfer.trace.template import _render_init_source
+    from flashinfer.trace.templates.comm import _pcie_ipc_all_reduce_init
+
+    init = _pcie_ipc_all_reduce_init
+    original_source = _render_init_source(init)
+    assert original_source.endswith(inspect.getsource(init))
+    assert _render_init_source(init, {"hidden_dim": 64}) == original_source
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_ulysses_lowp_trace_head_dim(head_dim):
+    from flashinfer.comm import _ulysses_lowp as lowp
+
+    q = torch.empty(1, 65, 8, head_dim, dtype=torch.bfloat16)
+    mean = torch.empty(1, 8, head_dim, dtype=q.dtype)
+    spec = lowp.payload_spec(
+        batch_size=1, local_sequence=65, num_heads=8, head_dim=head_dim, world_size=8
+    )
+    calls = (
+        (lowp.k_sum_v_amax, dict(k=q, v=q)),
+        (lowp.q_grouped_amax, dict(q=q, rank=0, world_size=8)),
+        (lowp.k_grouped_amax, dict(k=q, k_mean_global=mean, rank=0, world_size=8)),
+        (
+            lowp.quant_qkv_pack,
+            dict(
+                q=q,
+                k=q,
+                v=q,
+                k_mean_global=mean,
+                q_amax_final=torch.empty(1, 8, 3),
+                k_amax_final=torch.empty(1, 8, 2),
+                v_scale_global=mean.float(),
+                rank=0,
+                world_size=8,
+            ),
+        ),
+        (
+            lowp.unpack_for_sage,
+            dict(
+                recv_u8=torch.empty(8, spec["chunk_bytes"], dtype=torch.uint8),
+                batch_size=1,
+                local_sequence=65,
+                local_heads=1,
+                head_dim=head_dim,
+                world_size=8,
+            ),
+        ),
+    )
+    for fn, kwargs in calls:
+        definition = fn.fi_trace(**kwargs)
+        _check_defn(definition, "comm", f"flashinfer.comm._ulysses_lowp.{fn.__name__}")
+        assert definition["axes"]["head_dim"]["value"] == head_dim
+        assert f"_d{head_dim}" in definition["name"]
+        path = Path(__file__).parent / "fi_trace_out" / f"{definition['name']}.json"
+        assert json.loads(path.read_text()) == definition
 
 
 def test_gdn_replayssm_commit_fi_trace():

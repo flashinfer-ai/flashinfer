@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import argparse
+import json
 import ast
 import importlib.util
 import hashlib
 import inspect
-import json
 import os
 import re
 from pathlib import Path
 from typing import Any
 
 from .activations import ACTIVATIONS, is_gated
+from .manifest import MANIFEST_FILENAME, read_manifest, write_manifest
+from .catalog import generic_contract, kernel_id
 
 
 def _slug(value: str) -> str:
@@ -42,6 +44,9 @@ def _build_graph(
     dtype: str = "bf16",
     *,
     quantize_output: bool = False,
+    combine_output: bool = False,
+    top_k: int = 1,
+    gather_input: bool = False,
 ):
     import cudnn
 
@@ -49,7 +54,18 @@ def _build_graph(
         raise ValueError(f"unsupported export dtype {dtype!r}")
     if quantize_output and (dtype == "bf16" or op == "grouped_gemm2"):
         raise ValueError("output quantization requires a block-scaled FC1")
-    if dtype != "bf16" and (n % 128 or k % 128):
+    if gather_input and (op == "grouped_gemm2" or combine_output):
+        raise ValueError("GATHER requires FC1 without COMBINE")
+    if combine_output and (
+        dtype != "nvfp4"
+        or op != "grouped_gemm2"
+        or not 0 < top_k <= experts
+        or s % top_k
+    ):
+        raise ValueError(
+            "COMBINE requires NVFP4 FC2 and routed rows divisible by top_k"
+        )
+    if n < 128 or k < 128 or n % 128 or k % 128:
         raise ValueError(f"{dtype.upper()} export requires N and K divisible by 128")
     token_type, weight_type = {
         "bf16": (cudnn.data_type.BFLOAT16, cudnn.data_type.BFLOAT16),
@@ -85,13 +101,23 @@ def _build_graph(
         scales = graph.tensor(
             name=name,
             dim=[1, s, sf_k] if token else [experts, sf_k, n],
-            stride=[s * sf_k, sf_k, 1] if token else [sf_k * n, 1, sf_k],
+            stride=(
+                [s * ((sf_k + 15) // 16 * 16), (sf_k + 15) // 16 * 16, 1]
+                if token and gather_input
+                else [s * sf_k, sf_k, 1]
+                if token
+                else [sf_k * n, 1, sf_k]
+            ),
             data_type=(
                 cudnn.data_type.FP8_E4M3
                 if dtype == "nvfp4"
                 else cudnn.data_type.FP8_E8M0
             ),
-            reordering_type=cudnn.tensor_reordering.F8_128x4,
+            reordering_type=(
+                cudnn.tensor_reordering.NONE
+                if token and gather_input
+                else cudnn.tensor_reordering.F8_128x4
+            ),
         )
         return graph.block_scale_dequantize(
             input=tensor,
@@ -120,15 +146,41 @@ def _build_graph(
             stride=[1, 1, 1],
             data_type=cudnn.data_type.INT32,
         )
+        routing = {}
+        if combine_output:
+            routing = {
+                name: graph.tensor(
+                    name=name,
+                    dim=[1, s, 1],
+                    stride=[s, 1, 1],
+                    data_type=cudnn.data_type.INT32,
+                )
+                for name in ("token_index", "token_ks")
+            }
+            routing.update(
+                top_k_scores=graph.tensor(
+                    name="top_k_scores",
+                    dim=[1, s // top_k, top_k],
+                    stride=[s, top_k, 1],
+                    data_type=cudnn.data_type.FLOAT,
+                ),
+                top_k=top_k,
+            )
         output = graph.moe_grouped_matmul(
             token,
             gate,
             offsets,
-            mode=cudnn.moe_grouped_matmul_mode.NONE,
+            mode=(
+                cudnn.moe_grouped_matmul_mode.COMBINE
+                if combine_output
+                else cudnn.moe_grouped_matmul_mode.NONE
+            ),
             compute_data_type=cudnn.data_type.FLOAT,
             name="fc2",
+            **routing,
         )
-        output = apply_gemm_scale(output, "alpha")
+        if not combine_output:
+            output = apply_gemm_scale(output, "alpha")
         output.set_data_type(cudnn.data_type.BFLOAT16).set_output(True)
         return graph
     activation = op.removeprefix("grouped_gemm1_")
@@ -153,13 +205,27 @@ def _build_graph(
         stride=[1, 1, 1],
         data_type=cudnn.data_type.FLOAT,
     )
+    routing = {}
+    if gather_input:
+        routing["token_index"] = graph.tensor(
+            name="token_index",
+            dim=[1, s, 1],
+            stride=[s, 1, 1],
+            data_type=cudnn.data_type.INT32,
+        )
+    fc1_mode = (
+        cudnn.moe_grouped_matmul_mode.GATHER
+        if gather_input
+        else cudnn.moe_grouped_matmul_mode.NONE
+    )
     gate_out = graph.moe_grouped_matmul(
         token,
         gate,
         offsets,
-        mode=cudnn.moe_grouped_matmul_mode.NONE,
+        mode=fc1_mode,
         compute_data_type=cudnn.data_type.FLOAT,
         name="gate_gemm",
+        **routing,
     )
     gate_out = apply_gemm_scale(gate_out, "gate_alpha")
     up_out = None
@@ -168,9 +234,10 @@ def _build_graph(
             token,
             up,
             offsets,
-            mode=cudnn.moe_grouped_matmul_mode.NONE,
+            mode=fc1_mode,
             compute_data_type=cudnn.data_type.FLOAT,
             name="up_gemm",
+            **routing,
         )
         up_out = apply_gemm_scale(up_out, "up_alpha")
     unary = {
@@ -194,7 +261,8 @@ def _build_graph(
         )
         up_out = graph.relu(
             input=up_out,
-            negative_slope=1.0,
+            # lower_clip is the leaky-ReLU hinge. Its default zero slope
+            # implements the lower clamp; slope one would leave it unbounded.
             lower_clip=-7.0,
             upper_clip=7.0,
             name="up_clamp",
@@ -362,6 +430,28 @@ def _standalone_source(path: Path) -> str:
     keep = _reachable_definitions(freeze(text), helpers - own)
     inlined.clear()
     source = freeze(text)
+    # The graph fixes top-k, while a packaged recipe binds it at preparation.
+    # Rewrite only the ordinary Python compile() fake, preserving device code.
+    lines = source.splitlines(keepends=True)
+    for definition in ast.parse(source).body:
+        if not isinstance(definition, ast.FunctionDef) or definition.name != "compile":
+            continue
+        for statement in ast.walk(definition):
+            if isinstance(statement, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "fake_top_k_scores"
+                for t in statement.targets
+            ):
+                call = statement.value
+                if not isinstance(call, ast.Call) or len(call.args) < 2:
+                    raise RuntimeError("unexpected COMBINE score fake declaration")
+                shape = call.args[1]
+                if not isinstance(shape, ast.Tuple) or len(shape.elts) != 2:
+                    raise RuntimeError("unexpected COMBINE score fake shape")
+                shape.elts[1] = ast.Name(id="moe_top_k", ctx=ast.Load())
+                lines[statement.lineno - 1 : statement.end_lineno] = [
+                    " " * statement.col_offset + ast.unparse(statement) + "\n"
+                ]
+    source = "".join(lines)
     for node in ast.walk(ast.parse(source)):
         modules = []
         if isinstance(node, ast.ImportFrom):
@@ -370,7 +460,9 @@ def _standalone_source(path: Path) -> str:
             modules = [alias.name for alias in node.names]
         if any(m == "cudnn" or m.startswith("cudnn.") for m in modules):
             raise RuntimeError("Exported source still imports the cuDNN frontend")
-    return source
+    # Marker removal in the producer can leave indentation on an empty line.
+    # Keep statements intact while producing whitespace-clean source artifacts.
+    return re.sub(r"(?m)^[ \t]+(?=\n)", "", source)
 
 
 def _export_source(
@@ -394,10 +486,10 @@ def _export_source(
             constants.get("epi_store_dtype")
             in ("cutlass.Float4E2M1FNx2", "cutlass.Float8E4M3FN")
             and constants.get("n_tma_outputs") == "1"
-            and constants.get("epi_chunk_elems") != "32"
+            and constants.get("epi_chunk_elems") not in ("32", "64")
         ):
             raise ValueError(
-                "quantized TMA source templates require a 32-element epilogue"
+                "quantized TMA source templates require a 32/64-element epilogue"
             )
     digest = hashlib.sha256(source.encode()).hexdigest()
     # One maintained implementation per architecture and family. A producer
@@ -498,8 +590,11 @@ def export_one(args: argparse.Namespace) -> dict[str, Any]:
     op = getattr(args, "op", "grouped_gemm1_swiglu")
     dtype = getattr(args, "dtype", "bf16")
     quantize_output = getattr(args, "quantize_output", False)
+    combine_output = getattr(args, "combine_output", False)
     if quantize_output and (dtype == "bf16" or config.swap_ab):
         raise ValueError("fused output quantization requires normal block-scaled FC1")
+    if getattr(args, "gather_input", False) and arch != "sm_107a":
+        raise ValueError("GATHER export requires an SM107a GPU")
     graph = _build_graph(
         args.s,
         args.n,
@@ -509,9 +604,27 @@ def export_one(args: argparse.Namespace) -> dict[str, Any]:
         op,
         dtype,
         quantize_output=quantize_output,
+        combine_output=combine_output,
+        top_k=getattr(args, "top_k", 1),
+        gather_input=getattr(args, "gather_input", False),
     )
-    with force_stg_epi(args.store_mode == "stg"):
+    # COMBINE's bulk reduction reports an STG output but needs its own SMEM
+    # staging. Forcing the scalar STG epilogue would disable that fast path.
+    with force_stg_epi(args.store_mode == "stg" and not combine_output):
         compiled = _compile_graph(graph, config, args.cta_group, args.scheduler)
+    if combine_output:
+        from cudnn.gemm.frost.sm100.compiler import (
+            _use_fixed_combine_descriptors,
+            _use_swap_bulk_combine,
+        )
+
+        if arch != "sm_107a" or not (
+            _use_fixed_combine_descriptors(compiled.chain, config)
+            or _use_swap_bulk_combine(compiled.chain, config)
+        ):
+            raise ValueError(
+                "COMBINE export requires a qualified SM107 NVFP4 bulk reduction path"
+            )
     return _export_compiled(args, compiled, config, arch)
 
 
@@ -522,6 +635,8 @@ def _export_compiled(args, compiled, config, arch):
     op = getattr(args, "op", "grouped_gemm1_swiglu")
     dtype = getattr(args, "dtype", "bf16")
     quantize_output = getattr(args, "quantize_output", False)
+    combine_output = getattr(args, "combine_output", False)
+    gather_input = getattr(args, "gather_input", False)
     swap_ab = getattr(config, "swap_ab", False)
     activation = (
         op.removeprefix("grouped_gemm1_") if op != "grouped_gemm2" else "identity"
@@ -533,6 +648,8 @@ def _export_compiled(args, compiled, config, arch):
         )
     if compiled.chain.has_block_scale != (dtype != "bf16"):
         raise RuntimeError("cuDNN Frost compiled the wrong quantization pipeline")
+    if (compiled.chain.moe.mode == "gather") != gather_input:
+        raise RuntimeError("cuDNN Frost compiled the wrong input routing mode")
     store_modes = tuple(compiled.store_modes)
     if quantize_output:
         valid_store = (
@@ -567,7 +684,7 @@ def _export_compiled(args, compiled, config, arch):
         artifact_id,
         arch=arch,
         replace=args.replace,
-        template_family=f"{op}{'_quantized' if quantize_output else ''}_{dtype}_{'swap_ab' if swap_ab else 'normal'}_{actual_store_mode}",
+        template_family=f"{op}{'_combine' if combine_output else ''}{'_gather' if gather_input else ''}{'_quantized' if quantize_output else ''}_{dtype}_{'swap_ab' if swap_ab else 'normal'}_{actual_store_mode}",
         swap_ab=swap_ab,
     )
     tma_slots: frozenset[int] = getattr(compiled, "tma_slots", frozenset())
@@ -591,7 +708,9 @@ def _export_compiled(args, compiled, config, arch):
     if op != "grouped_gemm2" and set(aux_names) != expected_aux:
         raise RuntimeError(f"Unexpected FC1 auxiliary tensors: {aux_names}")
     if op == "grouped_gemm2":
-        if set(aux_names) != ({"alpha"} if dtype != "bf16" else set()):
+        if set(aux_names) != (
+            {"alpha"} if dtype != "bf16" and not combine_output else set()
+        ):
             raise RuntimeError(f"Unexpected FC2 auxiliary tensors: {aux_names}")
     token_dtype, weight_dtype = {
         "bf16": ("bfloat16", "bfloat16"),
@@ -599,11 +718,11 @@ def _export_compiled(args, compiled, config, arch):
         "nvfp4": ("float4_e2m1fn_x2", "float4_e2m1fn_x2"),
         "mxfp8_mxfp4": ("float8_e4m3fn", "float4_e2m1fn_x2"),
     }[dtype]
-    return {
+    record = {
         "id": artifact_id,
         "op": prefix,
         "arch": arch,
-        "abi": f"cudnn_frost_{prefix}{'_quantized' if quantize_output else ''}{'_swap_ab' if swap_ab else ''}",
+        "abi": f"cudnn_frost_{prefix}{'_combine' if combine_output else ''}{'_gather' if gather_input else ''}{'_quantized' if quantize_output else ''}{'_swap_ab' if swap_ab else ''}",
         "source": source,
         "workspace_bytes": int(compiled.workspace_bytes),
         "launch": {"tail": launch_tail},
@@ -664,19 +783,37 @@ def _export_compiled(args, compiled, config, arch):
         },
         "producer_revision": args.cudnn_frost_revision,
     }
+    if combine_output:
+        record["contract"].update(
+            moe_mode="combine", global_scale_position="top_k_score"
+        )
+        record["launch"]["prefix"] = ["top_k_scores", "token_ks", "token_index"]
+    if gather_input:
+        record["contract"]["moe_mode"] = "gather"
+        record["launch"]["prefix"] = ["token_index"]
+        if dtype != "bf16":
+            record["contract"]["token_scale_layout"] = "linear"
+    record["contract"] = generic_contract(record)
+    if not args.id:
+        record["id"] = kernel_id(record, dtype)
+    return record
 
 
 def _write_manifest(output_dir: Path, kernel: dict[str, Any], replace: bool) -> None:
-    path = output_dir / "cudnn_frost_selected_kernels.json"
+    path = output_dir / MANIFEST_FILENAME
     payload: dict[str, Any] = {
         "schema_version": 2,
         "producer": {"name": "cudnn_frost"},
         "kernels": [],
     }
     if path.exists():
-        payload = json.loads(path.read_text())
-        if payload.get("schema_version") != 2:
-            raise RuntimeError(f"refusing to update unsupported manifest {path}")
+        catalog = json.loads(path.read_text())
+        payload = read_manifest(path)
+        if catalog.get("schema_version") == 4:
+            from .catalog import generic_contract, kernel_id
+
+            kernel = {**kernel, "contract": generic_contract(kernel)}
+            kernel["id"] = kernel_id(kernel, catalog["dtype"])
     kernels = list(payload.get("kernels", []))
     old = next(
         (i for i, item in enumerate(kernels) if item.get("id") == kernel["id"]),
@@ -694,9 +831,7 @@ def _write_manifest(output_dir: Path, kernel: dict[str, Any], replace: bool) -> 
         kernels,
         key=lambda item: (item["contract"]["output_dtype"] != "bfloat16", item["id"]),
     )
-    temporary = path.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-    temporary.replace(path)
+    write_manifest(path, payload)
 
 
 def main() -> None:
@@ -729,6 +864,22 @@ def main() -> None:
     parser.add_argument("--experts", type=int, required=True)
     parser.add_argument("--groups", type=int, help="defaults to --experts")
     parser.add_argument("--replace", action="store_true")
+    parser.add_argument(
+        "--gather-input",
+        action="store_true",
+        help="gather original token rows inside FC1",
+    )
+    parser.add_argument(
+        "--combine-output",
+        action="store_true",
+        help="fuse NVFP4 FC2 with routed output reduction",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=1,
+        help="prototype top-k; bound per MoE plan in packaged recipes",
+    )
     parser.add_argument(
         "--quantize-output",
         action="store_true",

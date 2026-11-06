@@ -346,6 +346,7 @@ def select_gemm1(
     *,
     pdl_trigger_after_wait: bool | None = None,
     weight_l2_hint: bool | None = None,
+    cluster_split: bool = False,
 ) -> Kernel:
     """The swap-AB GEMM1 SiTU form the plan selected.
 
@@ -353,13 +354,16 @@ def select_gemm1(
     is the module's griddepcontrol placement (the plan's ``pdl and dep_prefetch``) --
     the split chain's narrow forms exist under both placements; ``weight_l2_hint`` is
     the module's weight-stream L2 policy (the plan's ``swap_weight_l2_hint``) -- the
-    n16 / n32 forms exist under both.
+    n16 / n32 forms exist under both; ``cluster_split`` selects the 2-CTA cluster
+    split-K ``_cs`` twin of a narrow plain form (the plan's cluster-split decision) --
+    the n8 / n16 / n32 forms exist as the single-CTA raster and as the twin.
     """
     form: dict[str, Any] = dict(
         kind="gemm1_swapab",
         n_tile=int(n_tile),
         kbps=int(kbps),
         row_group_list=bool(row_group_list),
+        cluster_split=bool(cluster_split),
     )
     if pdl_trigger_after_wait is not None:
         form["pdl_trigger_after_wait"] = bool(pdl_trigger_after_wait)

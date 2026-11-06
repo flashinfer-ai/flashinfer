@@ -14,14 +14,14 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-#include "tvm_ffi_utils.h"
+#include "cake_ffi_checks.h"
 
 #include <cstdint>
 
 extern "C" __global__ void kernel_cake_mok_gather(int* __restrict__ local_routes, unsigned long long multicast_address, int rank, int numel);
 
 
-namespace cake_host_shim_75cb8dfe08b73028 {
+namespace cake_host_shim_2a2447d307dccff3 {
 
 using tvm::ffi::TensorView;
 
@@ -55,13 +55,19 @@ void Run(TensorView arg_local_routes, int64_t arg_multicast_address, int64_t arg
   dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
   dim3 block(1u, 1u, 1u);
 
-  cudaError_t launch_status = cudaLaunchKernel(
-      reinterpret_cast<const void*>(kernel_cake_mok_gather), grid, block, kargs, 3072u, stream);
+  cudaLaunchConfig_t config{};
+  config.gridDim = grid;
+  config.blockDim = block;
+  config.dynamicSmemBytes = 3072u;
+  config.stream = stream;
+  cudaError_t launch_status = cudaLaunchKernelExC(
+      &config, reinterpret_cast<const void*>(kernel_cake_mok_gather), kargs);
   TVM_FFI_CHECK(launch_status == cudaSuccess, RuntimeError)
-      << "cudaLaunchKernel for kernel_cake_mok_gather failed: "
+      << "cudaLaunchKernelExC for kernel_cake_mok_gather failed: "
       << cudaGetErrorString(launch_status);
 }
 
-}  // namespace cake_host_shim_75cb8dfe08b73028
+}  // namespace cake_host_shim_2a2447d307dccff3
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_75cb8dfe08b73028::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_2a2447d307dccff3::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(build_cuda_version, cake_ffi_build_cuda_version);

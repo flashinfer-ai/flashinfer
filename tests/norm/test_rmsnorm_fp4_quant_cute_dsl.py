@@ -27,7 +27,12 @@ pytestmark = pytest.mark.skipif(
 )
 
 from flashinfer.cute_dsl.utils import is_cute_dsl_available
-from tests.test_helpers.utils_fp4 import cast_from_fp4
+from tests.test_helpers.utils_fp4 import (
+    E2M1_TO_FLOAT32,
+    cast_from_fp4,
+    pack_fp4_values,
+    ref_fp4_quant,
+)
 
 
 def get_cc():
@@ -197,6 +202,73 @@ blackwell_required = pytest.mark.skipif(
 @blackwell_required
 class TestRMSNormFP4QuantCuteDSL:
     """Tests for CuTe-DSL RMSNorm + FP4 Quantization."""
+
+    def test_nvfp4_bf16_packed_values_avoid_product_rounding(self):
+        """Check signed FP4 bytes across value boundaries with unchanged E4M3 scales."""
+        from flashinfer.cute_dsl.rmsnorm_fp4quant import rmsnorm_fp4quant
+
+        x = torch.full((1, 64), 129 / 128, device="cuda", dtype=torch.bfloat16)
+        weight = torch.full((64,), 0.75, device="cuda", dtype=torch.bfloat16)
+        weight[1::2] = -0.75
+        weight[::16] = 6.0
+        weight[16::32] = -6.0
+        eps = 1e-4
+        global_scale = torch.ones(1, device=x.device, dtype=torch.float32)
+        rstd = torch.rsqrt(x.float().square().mean(dim=-1, keepdim=True) + eps)
+        reference = x.float() * rstd * weight.float()
+        rounded_product = (x * weight).float() * rstd
+        assert reference[0, 2] < 0.75 < rounded_product[0, 2]
+        assert rounded_product[0, 1] < -0.75 < reference[0, 1]
+
+        reference_values, reference_scales = ref_fp4_quant(reference, global_scale, 16)
+        _, rounded_scales = ref_fp4_quant(rounded_product, global_scale, 16)
+        assert torch.all(reference_scales == 1.0)
+        torch.testing.assert_close(rounded_scales, reference_scales, rtol=0, atol=0)
+        levels = torch.tensor(E2M1_TO_FLOAT32[:8], device=x.device)
+        codes = torch.searchsorted(levels, reference_values.abs()).to(torch.uint8)
+        codes |= torch.signbit(reference_values).to(torch.uint8) << 3
+        expected_bytes = codes[:, 0::2] | (codes[:, 1::2] << 4)
+
+        actual_fp4, actual_scales = rmsnorm_fp4quant(
+            x, weight, global_scale=global_scale, eps=eps, block_size=16
+        )
+        assert actual_scales.dtype == torch.float8_e4m3fn
+        torch.testing.assert_close(
+            actual_scales.float(), reference_scales, rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            actual_fp4.view(torch.uint8), expected_bytes, rtol=0, atol=0
+        )
+
+    def test_nvfp4_bf16_scale_reduction_avoids_product_rounding(self):
+        """Keep a BF16 product-rounding error from crossing an E4M3 midpoint."""
+        from flashinfer.cute_dsl.rmsnorm_fp4quant import rmsnorm_fp4quant
+
+        x = torch.full((1, 64), 65 / 64, device="cuda", dtype=torch.bfloat16)
+        weight = torch.full((64,), 65 / 64, device="cuda", dtype=torch.bfloat16)
+        eps = 1e-6
+        rstd = torch.rsqrt(x.float().square().mean(dim=-1, keepdim=True) + eps)
+        reference = x.float() * rstd * weight.float()
+        rounded_product = (x * weight).float() * rstd
+        # Place the E4M3 midpoint (1.0625) between the two scale reductions.
+        global_scale = (
+            6.0 * 1.0625 / ((reference.amax() + rounded_product.amax()) / 2)
+        ).reshape(1)
+        expected_scale = (
+            global_scale * reference.view(1, 4, 16).abs().amax(dim=-1) / 6.0
+        ).to(torch.float8_e4m3fn)
+        rounded_scale = (
+            global_scale * rounded_product.view(1, 4, 16).abs().amax(dim=-1) / 6.0
+        ).to(torch.float8_e4m3fn)
+        assert torch.all(expected_scale.float() == 1.125)
+        assert torch.all(rounded_scale.float() == 1.0)
+
+        _, actual_scale = rmsnorm_fp4quant(
+            x, weight, global_scale=global_scale, eps=eps, block_size=16
+        )
+        torch.testing.assert_close(
+            actual_scale.float(), expected_scale.float(), rtol=0, atol=0
+        )
 
     @pytest.mark.parametrize(
         "batch_size", [1, 4, 16, 32, 7, 13, 33, 100, 128, 8192, 16384]
@@ -398,6 +470,64 @@ class TestRMSNormFP4QuantCuteDSL:
 class TestRMSNormFP4QuantMXFP4:
     """Tests for MXFP4 format (block_size=32, UE8M0 scales)."""
 
+    def test_mxfp4_bf16_packed_values_avoid_product_rounding(self):
+        """Check exact FP4 bytes across a value boundary with unchanged scales."""
+        from flashinfer.cute_dsl.rmsnorm_fp4quant import rmsnorm_fp4quant
+
+        x = torch.full((1, 64), 129 / 128, device="cuda", dtype=torch.bfloat16)
+        weight = torch.full((64,), 0.75, device="cuda", dtype=torch.bfloat16)
+        weight[::32] = 4.0
+        eps = 1e-4
+        rstd = torch.rsqrt(x.float().square().mean(dim=-1, keepdim=True) + eps)
+        reference = x.float() * rstd * weight.float()
+        rounded_product = (x * weight).float() * rstd
+        assert reference[0, 1] < 0.75 < rounded_product[0, 1]
+
+        # Both versions have block maxima in (3, 6), so UE8M0 scale is 1.
+        # Preserve the FP32 oracle: rounding it to BF16 would erase the
+        # value-boundary distinction this regression is intended to detect.
+        for values in (reference, rounded_product):
+            block_max = values.view(1, 2, 32).abs().amax(dim=-1)
+            assert torch.all((block_max > 3.0) & (block_max < 6.0))
+        assert torch.all((reference[:, ::32] > 3.5) & (reference[:, ::32] < 5.0))
+        assert torch.all((reference[:, 1:32] > 0.25) & (reference[:, 1:32] < 0.75))
+        # Positive E2M1 codes: 4 -> 0x6 at each block's anchor, 0.5 -> 0x1
+        # elsewhere. The first element occupies the low nibble of each byte.
+        expected_bytes = torch.full((1, 32), 0x11, device=x.device, dtype=torch.uint8)
+        expected_bytes[:, ::16] = 0x16
+        expected_scales = torch.full((1, 2), 127, device=x.device, dtype=torch.uint8)
+
+        actual_fp4, actual_scales = rmsnorm_fp4quant(
+            x, weight, eps=eps, block_size=32, scale_format="ue8m0"
+        )
+        torch.testing.assert_close(actual_scales, expected_scales, rtol=0, atol=0)
+        torch.testing.assert_close(
+            actual_fp4.view(torch.uint8), expected_bytes, rtol=0, atol=0
+        )
+
+    def test_mxfp4_bf16_scale_reduction_avoids_product_rounding(self):
+        """Keep BF16 product rounding from crossing the UE8M0 scale boundary."""
+        from flashinfer.cute_dsl.rmsnorm_fp4quant import rmsnorm_fp4quant
+
+        x = torch.full((1, 64), 99 / 128, device="cuda", dtype=torch.bfloat16)
+        x[0, 0] = 0.75
+        weight = torch.full((64,), 6.0, device="cuda", dtype=torch.bfloat16)
+        eps = 1e-6
+        rstd = torch.rsqrt(x.float().square().mean(dim=-1, keepdim=True) + eps)
+        reference = x.float() * rstd * weight.float()
+        rounded_product = (x * weight).float() * rstd
+        reference_max = reference.view(1, 2, 32).abs().amax(dim=-1)
+        rounded_max = rounded_product.view(1, 2, 32).abs().amax(dim=-1)
+        # A maximum above 6 needs scale 2 (encoded 128), rather than scale 1.
+        assert torch.all(reference_max > 6.0)
+        assert torch.all(rounded_max < 6.0)
+        expected_scale = torch.full((1, 2), 128, device="cuda", dtype=torch.uint8)
+
+        _, actual_scale = rmsnorm_fp4quant(
+            x, weight, eps=eps, block_size=32, scale_format="ue8m0"
+        )
+        torch.testing.assert_close(actual_scale, expected_scale, rtol=0, atol=0)
+
     @pytest.mark.parametrize("batch_size", [1, 4, 16, 7, 25, 128, 8192])
     @pytest.mark.parametrize("hidden_size", [128, 256, 512, 1536, 2048, 4096])
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -530,7 +660,8 @@ class TestFusedVsSeparateFP4Quantize:
     Tests comparing fused RMSNorm+FP4Quant against separate RMSNorm + fp4_quantize.
 
     This validates that the fused kernel applies global_scale identically to the
-    standalone fp4_quantize function.
+    standalone fp4_quantize function. BF16 uses an FP32 quantization reference
+    because the fused kernel does not round the normalized values back to BF16.
     """
 
     @pytest.mark.parametrize("batch_size", [1, 4, 16, 128])
@@ -579,21 +710,30 @@ class TestFusedVsSeparateFP4Quantize:
             is_sf_swizzled_layout=False,  # Use unswizzled for easier comparison
         )
 
-        # === Separate path: RMSNorm + fp4_quantize ===
-        y_rmsnorm = llama_rms_norm(x, weight, eps=eps)
-        y_fp4_separate, block_scale_separate = fp4_quantize(
-            y_rmsnorm,
-            global_scale,
-            sf_vec_size=block_size,
-            sf_use_ue8m0=False,  # E4M3 for NVFP4
-            is_sf_swizzled_layout=False,
-        )
+        if dtype == torch.bfloat16:
+            # Match the fused FP32 intermediate for bytes, scales and dequantization.
+            y_rmsnorm_f32 = llama_rms_norm(x.float(), weight, eps=eps)
+            reference_values, block_scale_reference = ref_fp4_quant(
+                y_rmsnorm_f32, global_scale, block_size
+            )
+            y_fp4_reference = pack_fp4_values(reference_values)
+        else:
+            y_rmsnorm = llama_rms_norm(x, weight, eps=eps)
+            y_fp4_reference, block_scale_reference = fp4_quantize(
+                y_rmsnorm,
+                global_scale,
+                sf_vec_size=block_size,
+                sf_use_ue8m0=False,  # E4M3 for NVFP4
+                is_sf_swizzled_layout=False,
+            )
+            block_scale_reference = block_scale_reference.view(
+                torch.float8_e4m3fn
+            ).view(batch_size, -1)
 
         # === Compare FP4 packed outputs ===
-        # They should match exactly since the quantization logic is the same
         # View as uint8 for comparison (float4_e2m1fn_x2 doesn't support == operator)
         fp4_match = (
-            (y_fp4_fused.view(torch.uint8) == y_fp4_separate.view(torch.uint8))
+            (y_fp4_fused.view(torch.uint8) == y_fp4_reference.view(torch.uint8))
             .float()
             .mean()
             .item()
@@ -605,24 +745,19 @@ class TestFusedVsSeparateFP4Quantize:
         # === Compare block scales ===
         # Cast to float for comparison
         scale_fused = block_scale_fused.to(torch.float32)
-        scale_separate = (
-            block_scale_separate.view(torch.float8_e4m3fn)
-            .view(batch_size, -1)
-            .to(torch.float32)
-        )
-
-        scale_match = (scale_fused == scale_separate).float().mean().item()
+        scale_reference = block_scale_reference.float()
+        scale_match = (scale_fused == scale_reference).float().mean().item()
         assert scale_match > 0.90, (
-            f"Block scale mismatch: only {scale_match * 100:.1f}% of scales match"
+            f"Block scale mismatch: only {scale_match * 100:.1f}% match the reference"
         )
 
         # === Also verify dequantized values are close ===
         y_fused_dequant = dequantize_fp4_output(
             y_fp4_fused, block_scale_fused, block_size, global_scale
         )
-        y_separate_dequant = dequantize_fp4_output(
-            y_fp4_separate,
-            block_scale_separate.view(torch.float8_e4m3fn).view(batch_size, -1),
+        y_reference_dequant = dequantize_fp4_output(
+            y_fp4_reference,
+            block_scale_reference,
             block_size,
             global_scale,
         )
@@ -630,13 +765,13 @@ class TestFusedVsSeparateFP4Quantize:
         # Two-tiered tolerance: 99% within tight tolerance, 100% within loose tolerance
         assert_close_with_tiered_tolerance(
             y_fused_dequant,
-            y_separate_dequant,
+            y_reference_dequant,
             tight_rtol=0.3,
             tight_atol=0.5,
             loose_rtol=0.5,
             loose_atol=2.0,
             tight_pct=0.99,
-            msg="Dequantized outputs from fused and separate paths should match closely",
+            msg="Dequantized fused output should match the quantization reference",
         )
 
     @pytest.mark.parametrize("batch_size", [1, 4, 16, 128])
@@ -679,20 +814,32 @@ class TestFusedVsSeparateFP4Quantize:
             is_sf_swizzled_layout=False,
         )
 
-        # === Separate path: RMSNorm + fp4_quantize ===
-        y_rmsnorm = llama_rms_norm(x, weight, eps=eps)
-        y_fp4_separate, block_scale_separate = fp4_quantize(
-            y_rmsnorm,
-            global_scale_val,
-            sf_vec_size=block_size,
-            sf_use_ue8m0=True,  # UE8M0 for MXFP4
-            is_sf_swizzled_layout=False,
-        )
+        if dtype == torch.bfloat16:
+            # Match the fused FP32 intermediate for bytes, scales and dequantization.
+            y_rmsnorm_f32 = llama_rms_norm(x.float(), weight, eps=eps)
+            reference_values, reference_scales = ref_fp4_quant(
+                y_rmsnorm_f32, global_scale_val, block_size, sf_use_ue8m0=True
+            )
+            y_fp4_reference = pack_fp4_values(reference_values)
+            # The reference returns power-of-two FP32 scales; encode their exponents.
+            block_scale_reference = (reference_scales.view(torch.int32) >> 23).to(
+                torch.uint8
+            )
+        else:
+            y_rmsnorm = llama_rms_norm(x, weight, eps=eps)
+            y_fp4_reference, block_scale_reference = fp4_quantize(
+                y_rmsnorm,
+                global_scale_val,
+                sf_vec_size=block_size,
+                sf_use_ue8m0=True,  # UE8M0 for MXFP4
+                is_sf_swizzled_layout=False,
+            )
+            block_scale_reference = block_scale_reference.view(batch_size, -1)
 
         # === Compare FP4 packed outputs ===
         # View as uint8 for comparison (float4_e2m1fn_x2 doesn't support == operator)
         fp4_match = (
-            (y_fp4_fused.view(torch.uint8) == y_fp4_separate.view(torch.uint8))
+            (y_fp4_fused.view(torch.uint8) == y_fp4_reference.view(torch.uint8))
             .float()
             .mean()
             .item()
@@ -703,9 +850,7 @@ class TestFusedVsSeparateFP4Quantize:
 
         # === Compare block scales ===
         scale_fused = block_scale_fused
-        scale_separate = block_scale_separate.view(batch_size, -1)
-
-        scale_match = (scale_fused == scale_separate).float().mean().item()
+        scale_match = (scale_fused == block_scale_reference).float().mean().item()
         assert scale_match > 0.90, (
             f"Block scale mismatch: only {scale_match * 100:.1f}% of scales match"
         )
@@ -716,20 +861,20 @@ class TestFusedVsSeparateFP4Quantize:
         y_fused_dequant = dequantize_fp4_output(
             y_fp4_fused, block_scale_fused, block_size
         )
-        y_separate_dequant = dequantize_fp4_output(
-            y_fp4_separate, scale_separate, block_size
+        y_reference_dequant = dequantize_fp4_output(
+            y_fp4_reference, block_scale_reference, block_size
         )
 
         # Two-tiered tolerance: 99% within tight tolerance, 100% within loose tolerance
         assert_close_with_tiered_tolerance(
             y_fused_dequant,
-            y_separate_dequant,
+            y_reference_dequant,
             tight_rtol=0.3,
             tight_atol=0.5,
             loose_rtol=0.5,
             loose_atol=2.0,
             tight_pct=0.99,
-            msg="Dequantized outputs from fused and separate paths should match closely",
+            msg="Dequantized fused output should match the quantization reference",
         )
 
     @pytest.mark.parametrize("batch_size", [1, 16, 64])

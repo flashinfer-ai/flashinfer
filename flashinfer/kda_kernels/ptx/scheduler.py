@@ -13,7 +13,6 @@ not supported by this integration.
 from __future__ import annotations
 
 import heapq
-import math
 from collections import defaultdict, deque
 from itertools import pairwise
 
@@ -22,11 +21,9 @@ import torch
 from ...utils import get_device_properties
 from .fallback import prepare_fwd
 from .static_runtime import (
-    compiled_stream_m64_fixed,
     compiled_stream_m64_fixed_final,
     compiled_stream_m128,
     compiled_stream_m128_cluster2,
-    compiled_stream_m128_cluster8,
     compiled_stream_m128_fixed_h96_final,
 )
 
@@ -49,11 +46,6 @@ INLINE_SPLIT_MARGIN = 0.98
 # and larger splits; measured on uniform/mixed screens in session 18.
 HANDOFF_PIECE_TAX = 0.0
 HANDOFF_SPLIT_SLOPE = 0.04
-# A B300 sweep of dense random FP32 state remained finite through scale 2^12
-# (observed max above 1.6e4) and became nonfinite at scale 2^16.  Keeping the
-# absolute-value limit at 2^12 is conservative for dense inputs while retaining
-# the required sparse striped-state split case whose maximum is exactly 2^12.
-MAX_STREAM_INITIAL_STATE_ABS = float(2**12)
 
 # Exact 173-slot packing for the canonical mixed-H96 final-state job multiset.
 # Vector positions are head-5, tail-93, whole-A-97, B-65, C-42, D-32,
@@ -595,19 +587,6 @@ class KDAPiecesLaunch:
             cu_seqlens=cu_seqlens,
         )
         base_args = self._fallback.args
-        if initial_state is not None:
-            initial_state_abs_max = float(initial_state.detach().abs().max())
-            if (
-                not math.isfinite(initial_state_abs_max)
-                or initial_state_abs_max > MAX_STREAM_INITIAL_STATE_ABS
-            ):
-                self._module = None
-                self._detector = None
-                self.expected_norm_enabled = False
-                self.normalization_mode = "exact_norm_fallback"
-                self.schedule = f"state_guard_{self._fallback.schedule}"
-                self.state_input_mode = "timed_fp32_bf16_boundary_conversions"
-                return
         if offsets is None:
             offsets = base_args["cu_seqlens"].tolist()
         offsets = [int(x) for x in offsets]
@@ -623,7 +602,7 @@ class KDAPiecesLaunch:
             return
         num_sms = get_device_properties(q.device).multi_processor_count
         warm_tables = [None] * (len(offsets) - 1)
-        rows, has_split, self._windows = plan_pieces(
+        rows, _, _ = plan_pieces(
             offsets,
             num_heads,
             num_sms,
@@ -632,21 +611,6 @@ class KDAPiecesLaunch:
             int(final_state is not None),
         )
         full_chunks = all((row[1] - row[0]) % K2_CHUNK == 0 for row in rows)
-
-        if (
-            allow_approximate_split
-            and not has_split
-            and "m64" in self._fallback.schedule
-        ):
-            self._module = None
-            self._detector = None
-            self.expected_norm_enabled = False
-            self.normalization_mode = "exact_norm_fallback"
-            self.schedule = self._fallback.schedule
-            self.state_input_mode = "timed_fp32_bf16_boundary_conversions"
-            return
-
-        n_split = sum(1 for r in rows if r[0] != r[2])
         dummy = torch.empty(1, dtype=torch.float32, device=q.device)
         args_template = dict(base_args)
         for name in (
@@ -686,18 +650,14 @@ class KDAPiecesLaunch:
             phase_full = all((row[1] - row[0]) % K2_CHUNK == 0 for row in ordered_rows)
             return args, (len(cta_vals) // 3, 1, 1), ordered_rows, phase_full
 
-        inline_plan = None
-        if not has_split:
-            inline_plan = plan_exact_inline_split(rows, num_sms)
-        tail_plan = None
-        if not has_split:
-            tail_plan = plan_exact_tail_split(
-                rows,
-                offsets,
-                num_heads,
-                num_sms,
-                int(final_state is not None),
-            )
+        inline_plan = plan_exact_inline_split(rows, num_sms)
+        tail_plan = plan_exact_tail_split(
+            rows,
+            offsets,
+            num_heads,
+            num_sms,
+            int(final_state is not None),
+        )
         if inline_plan is not None and tail_plan is not None:
             # Both exact rebalancing schedules qualified; keep the one
             # with the smaller modeled span (two-launch pays the phase
@@ -714,31 +674,15 @@ class KDAPiecesLaunch:
         use_fixed_h64_m64 = (
             inline_plan is None
             and tail_plan is None
-            and not allow_approximate_split
-            and not use_expected_norm
             and initial_state is not None
             and lower_bound == -5.0
             and num_heads == 64
             and offsets == [0, 8192]
             and full_chunks
         )
-        use_fixed_h96_cluster8 = (
-            inline_plan is None
-            and tail_plan is None
-            and not allow_approximate_split
-            and not use_expected_norm
-            and initial_state is not None
-            and final_state is None
-            and lower_bound == -5.0
-            and num_heads == 96
-            and offsets == [0, 8192]
-            and full_chunks
-        )
         use_fixed_h96_static_final = (
             inline_plan is None
             and tail_plan is None
-            and not allow_approximate_split
-            and not use_expected_norm
             and initial_state is not None
             and final_state is not None
             and lower_bound == -5.0
@@ -772,8 +716,6 @@ class KDAPiecesLaunch:
             )
             use_mixed_h96_gpc_swap = (
                 num_sms == 148
-                and not allow_approximate_split
-                and not use_expected_norm
                 and initial_state is not None
                 and final_state is not None
                 and lower_bound == -5.0
@@ -807,20 +749,7 @@ class KDAPiecesLaunch:
             rows = ordered_rows
             full_chunks = all((row[1] - row[0]) % K2_CHUNK == 0 for row in ordered_rows)
             use_mixed_cluster2 = (
-                not allow_approximate_split
-                and not use_expected_norm
-                and initial_state is not None
-                and lower_bound == -5.0
-                and num_heads in (64, 96)
-                and offsets == [0, 1300, 1847, 3895, 4858, 5129, 8192]
-                and self._grid == (148, 1, 1)
-                and not full_chunks
-            )
-            use_mixed_static_final = (
-                not allow_approximate_split
-                and not use_expected_norm
-                and initial_state is not None
-                and final_state is not None
+                initial_state is not None
                 and lower_bound == -5.0
                 and num_heads in (64, 96)
                 and offsets == [0, 1300, 1847, 3895, 4858, 5129, 8192]
@@ -830,52 +759,13 @@ class KDAPiecesLaunch:
             inline_compiler = compiled_stream_m128
             if use_mixed_cluster2:
                 inline_compiler = compiled_stream_m128_cluster2
-            uniform_regs = (
-                {"regs_epilogue": 64, "regs_service": 40}
-                if inline_compiler is compiled_stream_m128 and full_chunks
-                else {}
-            )
-            use_named_mma_signals = (
-                not allow_approximate_split
-                and not use_expected_norm
-                and initial_state is not None
-                and final_state is not None
-                and lower_bound == -5.0
-                and num_heads in (64, 96)
-                and self._grid == (148, 1, 1)
-                and offsets
-                in (
-                    [0, 1300, 1847, 3895, 4858, 5129, 8192],
-                    [0, 1024, 2048, 3072, 4096, 5120, 6144, 7168, 8192],
-                )
-            )
-            use_named_out_empty = (
-                use_named_mma_signals
-                and inline_compiler is compiled_stream_m128
-                and full_chunks
-            )
             self._module = inline_compiler(
                 full_chunks=full_chunks,
                 store_final_state=True,
-                lower_bound_m5=lower_bound == -5.0 and full_chunks,
-                expected_norm=use_expected_norm,
                 handoff=True,
-                idle_state_prefetch=not use_expected_norm,
-                first_state_prefetch=not use_expected_norm,
-                static_final_export=use_mixed_static_final,
-                named_mma_signals=use_named_mma_signals,
-                named_out_empty=use_named_out_empty,
-                **uniform_regs,
             )
             full_suffix = "_full" if full_chunks else ""
-            nofs_suffix = "_nofs" if final_state is None else ""
-            inline_tile = (
-                "m128c2"
-                if use_mixed_cluster2
-                else "m128sf"
-                if use_mixed_static_final
-                else "m128"
-            )
+            inline_tile = "m128c2" if use_mixed_cluster2 else "m128"
             self.schedule = (
                 f"exact_inline_handoff_{inline_tile}_n{n_split_chains}"
                 f"_c{inline_prefix}"
@@ -883,7 +773,6 @@ class KDAPiecesLaunch:
                 f"_span{inline_base_span}-{inline_span}"
                 + ("_gpc57" if use_mixed_h96_gpc_swap else "")
                 + full_suffix
-                + nofs_suffix
             )
             self.state_input_mode = "exact_single_launch_native_fp32_handoff"
         elif tail_plan is None:
@@ -891,7 +780,7 @@ class KDAPiecesLaunch:
                 rows,
                 initial_state.contiguous() if initial_state is not None else None,
                 final_state.contiguous() if final_state is not None else None,
-                0 if has_split else 1,
+                1,
             )
             if use_fixed_h64_m64:
                 # The retained fixed_h64 program is laid out for a 138-CTA
@@ -902,10 +791,8 @@ class KDAPiecesLaunch:
                     and num_sms >= 138
                     and self._grid == (64, 1, 1)
                 )
-                self._module = (
-                    compiled_stream_m64_fixed()
-                    if final_state is None
-                    else compiled_stream_m64_fixed_final(split_major=use_split_major)
+                self._module = compiled_stream_m64_fixed_final(
+                    split_major=use_split_major
                 )
                 if use_split_major:
                     # Keep the 64 heads in order in each value half while
@@ -919,36 +806,13 @@ class KDAPiecesLaunch:
                     self._grid = (2 * half_rows.shape[0], 1, 1)
                 else:
                     self._grid = (self._grid[0] * 2, 1, 1)
+            elif use_fixed_h96_static_final:
+                self._module = compiled_stream_m128_fixed_h96_final()
             else:
-                stream_compiler = compiled_stream_m128
-                if use_fixed_h96_static_final:
-                    self._module = compiled_stream_m128_fixed_h96_final()
-                    stream_compiler = None
-                elif use_fixed_h96_cluster8:
-                    stream_compiler = compiled_stream_m128_cluster8
-                if stream_compiler is not None:
-                    self._module = stream_compiler(
-                        full_chunks=full_chunks,
-                        store_final_state=final_state is not None,
-                        lower_bound_m5=lower_bound == -5.0 and full_chunks,
-                        expected_norm=use_expected_norm,
-                        idle_state_prefetch=(
-                            not has_split
-                            and not full_chunks
-                            and initial_state is not None
-                            and final_state is None
-                            and not use_expected_norm
-                        ),
-                        first_state_prefetch=(
-                            not has_split
-                            and full_chunks
-                            and initial_state is not None
-                            and final_state is None
-                            and not use_expected_norm
-                            and num_heads == 96
-                            and offsets == [0, 8192]
-                        ),
-                    )
+                self._module = compiled_stream_m128(
+                    full_chunks=full_chunks,
+                    store_final_state=final_state is not None,
+                )
         else:
             (
                 phase_a,
@@ -991,14 +855,10 @@ class KDAPiecesLaunch:
             self._module = compiled_stream_m128(
                 full_chunks=full_chunks,
                 store_final_state=True,
-                lower_bound_m5=lower_bound == -5.0 and full_chunks,
-                expected_norm=use_expected_norm,
             )
             self._tail_module = compiled_stream_m128(
                 full_chunks=tail_full_chunks,
                 store_final_state=final_state is not None,
-                lower_bound_m5=lower_bound == -5.0 and tail_full_chunks,
-                expected_norm=use_expected_norm,
             )
             self.schedule = (
                 f"exact_tail_stream_m128_q{tail_seqs[0]}x{len(tail_seqs)}"
@@ -1006,42 +866,28 @@ class KDAPiecesLaunch:
                 f"_j{len(rows)}+{len(tail_rows)}"
                 f"_b{self._grid[0]}+{self._tail_grid[0]}"
                 f"_span{base_span}-{span_a}-{total_span - span_a}"
-                f"{'_nofs' if final_state is None else ''}"
             )
             self.state_input_mode = "exact_two_launch_native_fp32_handoff"
         if inline_plan is None and tail_plan is None:
-            stream_mode = "dynamic" if has_split else "exact"
             stream_tile = "m128"
             if use_fixed_h64_m64:
                 stream_tile = "m64"
             elif use_fixed_h96_static_final:
                 stream_tile = "m128sf"
-            elif use_fixed_h96_cluster8:
-                stream_tile = "m128c8"
             self.schedule = (
-                f"{stream_mode}_stream_{stream_tile}_j{len(rows)}"
-                f"_b{self._grid[0]}_s{n_split}"
+                f"exact_stream_{stream_tile}_j{len(rows)}_b{self._grid[0]}"
                 f"{'_full' if full_chunks else ''}"
-                f"{'_nofs' if final_state is None else ''}"
             )
-            self.state_input_mode = (
-                "dynamic_g_inkernel_checked_native_fp32"
-                if has_split
-                else "exact_unsplit_native_fp32"
-            )
+            self.state_input_mode = "exact_unsplit_native_fp32"
             if self._module is None:
                 # No retained static program covers this route; launch()
                 # runs the exact fallback, so report that instead of the
                 # stream schedule that was not bound.
                 self.schedule = f"no_static_program_{self._fallback.schedule}"
                 self.state_input_mode = "timed_fp32_bf16_boundary_conversions"
-        if self._windows and any(
-            start - walk != K2_CHUNK for walk, start in self._windows
-        ):
-            raise RuntimeError("dynamic-g plan requires one-chunk warmups")
         self._generation = 0
+        # Retained kernel ABI field; the exact schedules never write to it.
         self._failure_host = torch.zeros(1, dtype=torch.int32, pin_memory=True)
-        self._done_event = torch.cuda.Event()
         for stream_args in (self._args, self._tail_args):
             if stream_args is None:
                 continue
@@ -1092,11 +938,11 @@ class KDAPiecesLaunch:
         if self.final_state is not None:
             self.final_state.copy_(self._staging_out)
 
-    def _stream_passes(self):
-        """Launch the checked stream and read the in-kernel proof verdict.
+    def _launch_stream(self):
+        """Launch the bound stream program and its tail phase, if any.
 
-        :return: True when no warmup window published a failure.
-        :rtype: bool
+        :return: None.
+        :rtype: NoneType
         """
         if self._handoff_flags is not None:
             self._handoff_flags.zero_()
@@ -1106,27 +952,9 @@ class KDAPiecesLaunch:
         if self._tail_module is not None:
             self._tail_args["generation"] = self._generation
             self._tail_module.launch(grid=self._tail_grid, **self._tail_args)
-        if not self._windows:
-            return True
-        self._done_event.record()
-        self._done_event.synchronize()
-        return int(self._failure_host[0]) != self._generation
-
-    def revalidate(self):
-        """Recheck every proof window against the current gate tensor.
-
-        The proof lives inside the stream kernel, so this replays one full
-        checked launch (overwriting the bound output tensor).
-
-        :return: True when all windows still satisfy the decay threshold.
-        :rtype: bool
-        """
-        if self._module is None:
-            return True
-        return self._stream_passes()
 
     def launch(self, g=None):
-        """Launch the exact stream or checked split; rerun on proof failure.
+        """Launch the exact stream, or the exact fallback when none is bound.
 
         :return: None.
         :rtype: NoneType
@@ -1136,8 +964,7 @@ class KDAPiecesLaunch:
         if self._module is None:
             self._launch_fallback()
             return
-        if not self._stream_passes():
-            self._launch_fallback()
+        self._launch_stream()
 
     def close(self):
         """Release nothing; FFI modules are process-resident.

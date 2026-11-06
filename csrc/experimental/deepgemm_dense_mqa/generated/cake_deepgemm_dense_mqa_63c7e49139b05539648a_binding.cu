@@ -28,7 +28,7 @@
 
 #include <cstdint>
 
-#include "cake_deepgemm_dense_mqa_host_common.cuh"
+#include "experimental/cake_host_common.cuh"
 
 extern "C" __global__ void kernel_cake_deepgemm_dense_mqa_63c7e49139b05539648a(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap KV, const __grid_constant__ CUtensorMap Weights, const __grid_constant__ CUtensorMap SF_Q, const __grid_constant__ CUtensorMap SF_KV, float* __restrict__ Logits, int* __restrict__ cu_seq_len_k_start, int* __restrict__ cu_seq_len_k_end, int seq_len, int seq_len_kv, int stride_logits, int num_q_blocks, unsigned int* __restrict__ ScheduleMeta);
 

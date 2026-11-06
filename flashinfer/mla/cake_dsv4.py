@@ -1,4 +1,5 @@
-"""Source-level CAKE backend for DeepSeek V4 sparse MLA on SM100 and SM103.
+"""Source-level CAKE backend for DeepSeek V4 sparse MLA on SM100 and SM103, and
+for the FP8 decode route on SM107.
 
 Host contract (flashinfer#4671 hardening)
 -----------------------------------------
@@ -60,7 +61,7 @@ Host contract (flashinfer#4671 hardening)
 * **Workspace.** One caller-owned ``workspace_buffer`` is carved
   deterministically (:func:`cake_dsv4_workspace_layout`)::
 
-      [0,      1024)          reserved (formerly the TMA descriptor slab; see below)
+      [0,      1024)          reserved (formerly the TMA descriptor slab)
       [1024,   1024 + 256 KiB) split-merge counters, uint32[65536]
       [P,      P + O_bytes)    partial_O  bf16 [T * H * S * 512]  (P = 1024 + 256 KiB;
                                O_bytes = 0 when the route runs one split)
@@ -99,34 +100,6 @@ Host contract (flashinfer#4671 hardening)
   (replays stay self-contained, nothing is registered). The kernels do not
   depend on any other host state. :func:`cake_dsv4_workspace_reset` zeroes
   and registers explicitly.
-* **Descriptor storage.** The SM103 bindings that read their TMA descriptors
-  from device memory (``tma_workspace_bytes`` in their registration; the SM100
-  twins pass descriptors by value and use none of this) take a private,
-  host-retained 1 KiB tensor per launch and write the descriptors of the call
-  into it when they differ from what it holds, in stream order and never
-  inside CUDA Graph capture. The host keeps a pool of such tensors per
-  (variant, device) (:func:`_descriptor_storage`) keyed by the *descriptor
-  set* = the TMA source geometry (pointer, shape, strides, dtype of ``Q`` and
-  the KV caches). Rules:
-
-  1. A set launched eagerly becomes a *live* entry; at most
-     :data:`_DESCRIPTOR_POOL_CAPACITY` live entries exist per pool, and a new
-     set beyond that takes the least recently used live entry's storage (the
-     binding rewrites it before the launch). A live hit does no device write.
-  2. A set launched under graph capture must be live at that moment (prepare
-     it with one eager call on the same tensors); it then becomes a *captured*
-     entry, which is never evicted or reassigned for the process lifetime
-     because its graph may replay at any time. Eviction applies to live
-     entries only.
-  3. A set that is not live when a capture reaches it raises before any
-     allocation or binding call.
-  4. One lock covers the pool bookkeeping, the bindings' descriptor checks
-     and the launch enqueues of a call; a launch on another stream than the
-     storage's last reader waits for that stream first.
-
-  Successive calls through one workspace (the layers of a model) therefore do
-  not collide, and a stream of fresh query tensors does not grow memory
-  without bound. Nothing else allocates device memory.
 
 NVFP4 cache route (``kv_cache_format="nvfp4"``)
 ---------------------------------------------------------
@@ -152,14 +125,15 @@ and the tile64 member (``t64``, 64 heads per CTA); a one-tile row with
 ``H <= 64`` whose grid gives 2 or 4 CTAs per work item runs the H64 tile member
 (``tile_h64``: 64-row Q boxes, same grid and output as ``tile``). The one-tile
 members run ``o_chunks`` CTAs per work item; the split merge runs on
-``merge_heads_per_cta`` heads per CTA. Each (member, retrace knobs) pair is one
-registered variant (``_nvfp4_variant_name``: ``nvfp4_decode_persistent``,
-``nvfp4_decode_cluster``, ``nvfp4_decode_t64_n64_oc1``,
-``nvfp4_decode_pv_n{16,32}_oc1``, ``nvfp4_decode_swap_n{16,32}_oc{1,2,4}``,
-``nvfp4_decode_tile_oc{1,2,4}``, ``nvfp4_decode_tile_h64_oc{2,4}``) plus
-``nvfp4_merge``, bound through the same
+``merge_heads_per_cta`` heads per CTA. Each member is one registered variant
+(``_nvfp4_variant_name``: ``nvfp4_decode_persistent``, ``nvfp4_decode_cluster``,
+``nvfp4_decode_t64_n64_oc1``, ``nvfp4_decode_pv``, ``nvfp4_decode_swap``,
+``nvfp4_decode_tile``, ``nvfp4_decode_tile_h64``) plus ``nvfp4_merge``; the
+templated members take their retrace knobs (``tile_n``: heads on the MMA N side,
+``o_chunks``: CTAs per work item) as launch arguments and their launcher switches
+over the explicit instantiations of the kernel unit. All are bound through the same
 registration machinery as the BF16/FP8 routes from the generated sources under
-``csrc/cake_dsv4/sm_100a`` and ``csrc/cake_dsv4/sm_103a``; a plan that selects
+``csrc/cake_dsv4/{sm_100a,sm_103a,common}``; a plan that selects
 an unexported variant raises ``NotImplementedError``. Splits write
 ``partial_O [T, H, S, 512]`` BF16 and ``partial_lse [T, H, S]`` FP32 into the
 workspace; the final base-2 LSE lives in an extra ``lse`` region appended
@@ -168,12 +142,13 @@ after ``partial_lse`` (:func:`cake_dsv4_workspace_layout` ``with_lse=True``).
 
 from __future__ import annotations
 
-import collections
+import ctypes
 import functools
+import os
 import threading
 import weakref
 from dataclasses import dataclass, field
-from typing import Any, Literal, Mapping, Optional, Sequence, Union
+from typing import Any, Literal, Mapping, Optional, Union
 
 import torch
 
@@ -214,6 +189,14 @@ _BF16_TOPK128X_MAX_WIDTH = 388
 # One FP8 low-head producer partition owns up to three sparse tiles; mirrors
 # the producer's FP8_ONE_PARTITION_MAX_TILES = 3.
 _FP8_ONE_PARTITION_MAX_WIDTH = 384
+# The M64 bindings take items of at most 1152 sparse slots (SWA 128 + 1024);
+# mirrors their ``sparse_topk <= 1152`` check.
+_FP8_M64_MAX_WIDTH = 1152
+# The FP8 low-head prefill producer stages an item's sparse indices in a
+# shared-memory buffer of 1152 slots (nine tiles of 128).  A wider item
+# writes past that buffer and past the dynamic shared memory, and its
+# binding does not check the width.
+_FP8_LOWHEAD_PREFILL_MAX_WIDTH = 1152
 _BF16_H64_COMPRESSED_PREFILL_TOKENS = 24
 _BF16_H64_PREFILL_MAX_SPARSE_WIDTH = 640
 # Workspaces whose split-merge counter region is known to be zero:
@@ -292,6 +275,11 @@ def _bf16_h128_prefill_uses_snake_feed(
     if (int(sparse_topk) + _TILE_KV - 1) // _TILE_KV < 2:
         return False
     return 2 * (tokens % clusters) > clusters
+
+
+@functools.lru_cache(maxsize=None)
+def _device_sm_count(device: torch.device) -> int:
+    return int(torch.cuda.get_device_properties(device).multi_processor_count)
 
 
 @functools.lru_cache(maxsize=None)
@@ -382,18 +370,6 @@ class SparseMetadata:
     @property
     def compressed_width(self) -> int:
         return self.sparse_topk - _SWA_WIDTH
-
-    @property
-    def legacy_combined_table(self) -> Optional[torch.Tensor]:
-        """Combined ``[T, sparse_topk]`` table for bindings that predate the split ABI.
-
-        Only a combined table without an explicit length offset can be handed
-        to a binding that still declares the pre-hardening ``sparse_indices``
-        argument; separate tables and offsets need regenerated bindings.
-        """
-        if self.separate_tables or self.sparse_topk_lens_offset != 0:
-            return None
-        return self.swa_indices
 
 
 def _flat_index_span(table: torch.Tensor) -> torch.Tensor:
@@ -774,113 +750,6 @@ def _counters(raw: torch.Tensor, merge_groups: int) -> torch.Tensor:
     return raw[_COUNTER_OFFSET : _COUNTER_OFFSET + merge_groups * 4].view(torch.uint32)
 
 
-# Descriptor storage pools (see the module docstring, "Descriptor storage").
-# Bound on the storages a pool hands to eager launches; descriptor sets that
-# were launched under CUDA Graph capture are retained separately for the
-# process lifetime because their graphs keep reading them.
-_DESCRIPTOR_POOL_CAPACITY = 4096
-_descriptor_lock = threading.Lock()
-_descriptor_pools: dict[tuple[str, str, torch.device], "_DescriptorPool"] = {}
-
-
-@dataclass
-class _DescriptorStorage:
-    tensor: torch.Tensor
-    # Stream of the last launch that read this storage; a launch on another
-    # stream waits for it before the binding may rewrite the descriptors.
-    stream: Optional[torch.cuda.Stream]
-
-
-@dataclass
-class _DescriptorPool:
-    """Descriptor storages of one variant module on one device."""
-
-    # descriptor set -> storage, least recently used first; reassignable
-    live: "collections.OrderedDict[tuple, _DescriptorStorage]"
-    # descriptor sets launched under graph capture: never reassigned
-    captured: dict[tuple, _DescriptorStorage]
-    # storages released by a capacity change, reused before allocating
-    spare: list[_DescriptorStorage]
-
-
-def _new_descriptor_storage(device: torch.device) -> _DescriptorStorage:
-    backing = torch.empty(
-        _DESCRIPTOR_SLAB_BYTES + _ALIGN, dtype=torch.uint8, device=device
-    )
-    offset = (-backing.data_ptr()) % _ALIGN
-    return _DescriptorStorage(backing[offset : offset + _DESCRIPTOR_SLAB_BYTES], None)
-
-
-def _descriptor_storage(
-    variant: str,
-    arch: str,
-    num_bytes: int,
-    sources: Sequence[tuple[str, torch.Tensor]],
-    *,
-    capturing: bool,
-) -> torch.Tensor:
-    """Private descriptor storage for ``variant`` over these TMA source tensors.
-
-    A descriptor set is a pure function of each source tensor's pointer, shape,
-    strides and dtype, so that geometry is the key. The pool of one variant on
-    one device hands out at most :data:`_DESCRIPTOR_POOL_CAPACITY` storages to
-    eager launches: a hit reuses the storage whose bytes the binding already
-    holds, a miss takes a fresh storage until the pool is full and the least
-    recently used one afterwards (the binding rewrites its descriptors in
-    stream order before the launch). A set launched under CUDA Graph capture
-    moves to the pool's retained part and is never reassigned, so replays keep
-    reading the descriptors they captured; a set that is not resident when a
-    capture reaches it is an error, because the binding cannot initialize
-    descriptors inside a capture. The caller holds :data:`_descriptor_lock`
-    from this lookup through the launch, so a storage is never reassigned
-    between the binding's descriptor check and the launch that reads it.
-    """
-    if num_bytes > _DESCRIPTOR_SLAB_BYTES:
-        raise ValueError(
-            f"CAKE DSv4 variant needs {num_bytes} TMA descriptor bytes; the "
-            f"descriptor storage holds {_DESCRIPTOR_SLAB_BYTES}"
-        )
-    device = sources[0][1].device if sources else torch.device("cpu")
-    key = tuple(
-        (name, t.data_ptr(), tuple(t.shape), tuple(t.stride()), t.dtype)
-        for name, t in sources
-    )
-    stream = torch.cuda.current_stream(device) if device.type == "cuda" else None
-    pool = _descriptor_pools.get((variant, arch, device))
-    if pool is None:
-        pool = _DescriptorPool(collections.OrderedDict(), {}, [])
-        _descriptor_pools[variant, arch, device] = pool
-    storage = pool.captured.get(key)
-    if storage is not None:
-        return storage.tensor
-    storage = pool.live.get(key)
-    if capturing:
-        if storage is None:
-            raise RuntimeError(
-                f"CAKE DSv4 {variant}: the TMA descriptors for these query / "
-                "KV-cache tensors have not been initialised and the current "
-                "stream is capturing a CUDA graph; run one eager call with the "
-                "same tensors (pointers, shapes and strides) before capture"
-            )
-        del pool.live[key]
-        pool.captured[key] = storage
-        return storage.tensor
-    if storage is not None:
-        pool.live.move_to_end(key)
-    else:
-        capacity = max(1, int(_DESCRIPTOR_POOL_CAPACITY))
-        while len(pool.live) >= capacity:
-            pool.spare.append(pool.live.popitem(last=False)[1])
-        storage = pool.spare.pop() if pool.spare else _new_descriptor_storage(device)
-        pool.live[key] = storage
-    if stream is not None and storage.stream is not None and storage.stream != stream:
-        # Order this launch (and a descriptor rewrite the binding may issue
-        # on this stream) after the last launch that read the storage.
-        stream.wait_stream(storage.stream)
-    storage.stream = stream
-    return storage.tensor
-
-
 def _workspace_owner(workspace: torch.Tensor) -> torch.Tensor:
     """The tensor whose lifetime owns ``workspace``'s storage (its ``_base`` or itself)."""
     base = workspace._base
@@ -992,8 +861,6 @@ _TENSOR_VALUE_NAMES = frozenset(
         "swa_indices",
         "compressed_indices",
         "sparse_topk_lens",
-        # Pre-hardening combined table; bound only for combined metadata.
-        "sparse_indices",
         # NVFP4 cache route (two independent tables over two uint8 pools).
         "q_rows",
         "main_cache",
@@ -1043,17 +910,16 @@ _SCALAR_VALUE_NAMES = frozenset(
         "main_page_stride",
         "extra_page_stride",
         "heads_per_cta",
+        # Retrace knobs of the templated NVFP4 members (runtime instantiation switch).
+        "tile_n",
+        "o_chunks",
         *_FLOAT_SCALAR_VALUE_NAMES,
     }
 )
 _GRID_NAMES = ("grid_x", "grid_y", "grid_z")
-_DESCRIPTOR_WORKSPACE_NAME = "tma_descriptor_workspace"
-_RETIRED_ARG_REASONS: Mapping[str, str] = {
-    "completion_base": (
-        "host-side split-merge generation state was removed; the kernel resets "
-        "partition_arrivals itself"
-    ),
-}
+# The per-call launch argument of the programs that leave programmatic dependent
+# launch to each call (``["launch", "enable_pdl"]`` in their plan, 0 or 1).
+_LAUNCH_NAMES = ("enable_pdl",)
 # Producers whose generated ABI reads request boundaries from cum_seq_lens_q
 # only; run_cake_dsv4 synthesizes the dense offsets for them.
 _RAGGED_ONLY_ROUTES = frozenset(
@@ -1069,25 +935,128 @@ _RAGGED_ONLY_ROUTES = frozenset(
 # from 128 tokens on, the lane-issued gathers (several waves per cluster) win.
 _FP8_PERSISTENT_LANE_GATHER_MIN_TOKENS = 128
 
+# Per architecture, (fewest query rows, longest request, topk4x items only)
+# entries: launches that reach an entry's row count and whose requests hold at
+# most its query rows keep the uniform-gather route past the lane-gather floor.
+# On SM107 that route runs its K=64 sibling, which led the lane-issued program
+# on these short-query decode launches (VR200, one process, eight calls per
+# CUDA graph).  It trailed it at almost every measured row count on topk4x and
+# topk128x prefill, with 16 or more query rows per request on topk4x items (8
+# at 160 rows), with 8 or more on topk128x items, and with 4 on topk128x items
+# 1152 wide (2 at 160 rows); it was mixed with 4 query rows on narrower
+# topk128x and on SWA-only items.
+_FP8_PERSISTENT_SHORT_QUERY_UNIFORM = {
+    "sm_107a": ((160, 1, False), (256, 2, False), (160, 4, True), (256, 8, True)),
+}
 
-def _fp8_persistent_program(num_query_tokens: int) -> str:
+
+def _fp8_persistent_program(
+    num_query_tokens: int,
+    *,
+    max_q_len: Optional[int] = None,
+    topk4x: bool = False,
+    arch: Optional[str] = None,
+) -> str:
     if num_query_tokens < _FP8_PERSISTENT_LANE_GATHER_MIN_TOKENS:
+        return "fp8_h128_prefill_source_persistent_uniform"
+    entries = _FP8_PERSISTENT_SHORT_QUERY_UNIFORM.get(arch, ()) if arch else ()
+    if max_q_len is not None and any(
+        num_query_tokens >= rows and max_q_len <= longest and (topk4x or not only4x)
+        for rows, longest, only4x in entries
+    ):
         return "fp8_h128_prefill_source_persistent_uniform"
     return "fp8_h128_prefill_source_persistent"
 
 
-# Mirrors the Cake seed's H64_M64_MIN_TOKENS
-# (portfolio_v34.persistent_program): FP8/H64 rows admitted to the persistent
-# body with at least this many tokens run the H64-specific single-CTA M64 body.
-_FP8_H64_M64_MIN_TOKENS = 128
+# SM107: the FP8/H64 rows of one complete sparse tile and at least half of a
+# second (widths 192-252) also run the persistent body past 12 tokens, and from
+# 48 keys of a second (widths 176-191) up to 16 tokens.  Per architecture:
+# (minimum width, minimum width up to 16 tokens).
+_FP8_H64_PERSISTENT_ONE_TILE_MIN_WIDTH = {"sm_107a": (192, 176)}
 
 
-def _fp8_h64_uses_persistent_body(sparse_topk: int, num_query_tokens: int) -> bool:
-    """FP8/H64 persistent-body rule (Cake seed ``portfolio_v34.uses_persistent_body``)."""
+def _fp8_h64_uses_persistent_body(
+    sparse_topk: int, num_query_tokens: int, arch: Optional[str] = None
+) -> bool:
+    """FP8/H64 rows that run the FP8/H128 persistent body while it fits one wave
+    (Cake seed ``portfolio_v34.uses_persistent_body``).
+
+    On SM107 the rows of one complete tile and at least half of a second join
+    them past 12 tokens, and from 48 keys of a second up to 16 tokens
+    (``_FP8_H64_PERSISTENT_ONE_TILE_MIN_WIDTH``).  VR200 (208 SMs, two
+    boards), q_len 1 and 4: widths 192-252 at 13-31 tokens, M64 body
+    5.93-6.19 -> persistent body 5.65-6.17 us (0.99-1.05x; 1.00-1.05x up to
+    24 tokens); width 176 at 13-16 tokens 5.93-6.03 -> 5.78-5.90 us
+    (1.02-1.03x), 0.97-1.01x past 16 tokens.  Narrower widths stay on the M64
+    body (1.00-1.02x up to 16 tokens, 0.97-1.00x past them, one board).
+    """
     full_tiles = sparse_topk // 128
     if num_query_tokens <= 12:
         return full_tiles >= 3
-    return full_tiles >= 2 or num_query_tokens >= 128
+    if full_tiles == 1:
+        min_width, short_min_width = _FP8_H64_PERSISTENT_ONE_TILE_MIN_WIDTH.get(
+            arch, (2 * _TILE_KV, 2 * _TILE_KV)
+        )
+        if num_query_tokens <= 16:
+            min_width = short_min_width
+        return sparse_topk >= min_width
+    return full_tiles >= 2
+
+
+# SM107: the M64 body (K=64 QK) takes the FP8/H64 decode rows of two to four
+# sparse tiles before the half wave.  Per ``(ceil(sparse_topk / 128),
+# sparse_topk // 128)`` (all tiles, complete tiles), ``(num, den)``: the M64
+# body from ``den * tokens > num * sm_count`` on.
+_FP8_H64_M64_EARLY_WAVE = {
+    "sm_107a": {
+        (2, 1): (3, 20),
+        (2, 2): (1, 8),
+        (3, 2): (51, 200),
+        (3, 3): (1, 4),
+        (4, 3): (3, 10),
+        (4, 4): (13, 50),
+    },
+}
+
+
+def _fp8_h64_uses_m64_body(
+    num_query_tokens: int,
+    sm_count: int,
+    *,
+    sparse_topk: Optional[int] = None,
+    arch: Optional[str] = None,
+) -> bool:
+    """FP8/H64 decode rows (``max_q_len < 257``) whose two-CTA-per-token bodies
+    no longer fit one wave.
+
+    The FP8/H128 persistent body, the SWA producer and the H64 cluster body
+    launch two CTAs per token; once ``2 * tokens`` exceeds the SM count their
+    second wave costs more than the single-CTA M64 body (one CTA per token)
+    saves by running each token on one SM.  GB300 (152 SMs), q_len 4,
+    DSv4-Flash widths: 84-120 tokens SWA-only 11.2-11.9 -> 7.0-7.5 us, topk4x
+    640 14.2-15.9 -> 14.3-14.8 us; 128-512 tokens the M64 body led already.
+
+    On SM107 the M64 body wins earlier on the rows of two to four sparse tiles
+    (``_FP8_H64_M64_EARLY_WAVE``).  VR200 (208 and 216 SMs), q_len 1, 2 and 4,
+    persistent body -> M64 body over the rows each tile count adds: two tiles
+    5.79-7.79 -> 5.54-6.24 us, three tiles 7.33-8.76 -> 7.06-7.92 us, four
+    tiles 8.76-9.54 -> 8.23-9.09 us (0.99-1.25x).  Five tiles and up stay on
+    the persistent body below the half wave (M64 0.83-1.02x there).  The
+    complete-tile count refines the edges (VR200, 208 SMs, two boards): two
+    tiles with one complete take the M64 body from 32 tokens, where the two
+    bodies meet (6.03-6.10 vs 6.05-6.10 us); three tiles with two complete
+    (widths 260-380, measured at 260 and 320) keep the persistent body at 53
+    tokens (M64 7.22-7.34 vs 7.08-7.20 us); and four complete tiles (width
+    512) take the M64 body from 55 tokens (8.28-8.65 -> 8.11-8.25 us at 55-62
+    tokens).
+    """
+    if 2 * num_query_tokens > sm_count:
+        return True
+    if sparse_topk is None:
+        return False
+    tiles = (_ceil_div(sparse_topk, _TILE_KV), sparse_topk // _TILE_KV)
+    early = _FP8_H64_M64_EARLY_WAVE.get(arch, {}).get(tiles)
+    return early is not None and early[1] * num_query_tokens > early[0] * sm_count
 
 
 # Mirrors the Cake M64 seed's box_k_gather_for_width (TILE_KV = 128).  The M64
@@ -1096,20 +1065,62 @@ def _fp8_h64_uses_persistent_body(sparse_topk: int, num_query_tokens: int) -> bo
 # one box TMA (-0.35..-0.42 us on the 128/256-token SWA rows); every wider item
 # runs the program without that block, which measured at +0.03..+0.11 us of
 # load-warp code layout on the multi-tile rows even when the in-kernel gate
-# kept it off.  Same bits from both programs.
+# kept it off.  Same bits from both programs.  SM107 runs the multi-tile
+# program's launches on its four-stage sibling where this process can launch
+# it (:func:`_kv4_variant`).
 def _fp8_h64_m64_program(sparse_topk: int) -> str:
     if sparse_topk == _TILE_KV:
         return "fp8_h64_prefill_source_persistent_m64"
     return "fp8_h64_prefill_source_persistent_m64_multi_tile"
 
 
-_UNAVAILABLE_HINTS: Mapping[str, str] = {
-    "sparse_indices": (
-        "this binding predates the split-table metadata ABI and only accepts a "
-        "combined sparse_indices table with sparse_topk_lens_offset == 0; "
-        "regenerate the bindings for separate tables or length offsets"
-    ),
-}
+# Architectures that build the H64 cluster body (``fp8_lowhead_h64``); SM107
+# registers no program for it.
+_FP8_LOWHEAD_H64_ARCHES = frozenset({"sm_100a", "sm_103a"})
+
+
+def _fp8_h64_uses_cluster_body(
+    sparse_topk: int, num_query_tokens: int, arch: Optional[str]
+) -> bool:
+    """FP8/H64 decode rows of at most 12 tokens with two complete sparse tiles
+    and a partial third (widths 260-380), which the persistent body leaves (it
+    needs three complete tiles at <= 12 tokens): the H64 cluster body (two CTAs
+    per token, one wave) beats the M64 body there (1-12 tokens, widths
+    260-380, both cache layouts: B200 9.5-10.3 us vs 10.0-11.1 us, GB300
+    9.1-10.0 us vs 9.4-10.7 us).  Width 256 (no partial tile: B200 8.8-9.4 us
+    vs 7.6-8.9 us, GB300 8.5-9.2 us vs 7.2-8.3 us) and rows with one complete
+    tile keep the M64 body; so does ``arch=None`` (unknown device)."""
+    return (
+        arch in _FP8_LOWHEAD_H64_ARCHES
+        and num_query_tokens <= 12
+        and 2 * _TILE_KV < sparse_topk < 3 * _TILE_KV
+    )
+
+
+# Architectures where two more kinds of FP8 rows leave the low-head prefill
+# producer for the single-CTA M64 body: the 8-head prefill rows (``_route``)
+# and the 8/16/32-head SWA-only decode rows past one wave
+# (``_fp8_lowhead_swa_uses_m64_body``).  Measured on SM107 only; SM100, SM103
+# and ``arch=None`` keep the producer on those rows.
+_FP8_LOWHEAD_M64_ARCHES = frozenset({"sm_107a"})
+
+
+def _fp8_lowhead_swa_uses_m64_body(
+    num_query_tokens: int, sm_count: int, arch: Optional[str]
+) -> bool:
+    """FP8 SWA-only decode rows (``max_q_len < 257``) of 8, 16 or 32 heads
+    whose low-head prefill producer no longer fits one wave.
+
+    The producer launches two CTAs per token (one per work item); once
+    ``2 * tokens`` exceeds the SM count its second wave costs more than the
+    single-CTA M64 body (one CTA per token) saves.  R200 (sm_107a, 216 SMs),
+    q_len 4, CUDA graph + PDL, per call: 112-256 tokens 6.71-10.45 us ->
+    4.06-5.69 us (1.56-1.85x) at 8, 16 and 32 heads; 96 and 108 tokens (one
+    wave) 0.98-1.01x, which keep the producer.  A rule of its own, kept apart
+    from the 64-head one (``_fp8_h64_uses_m64_body``), and on the
+    architectures of ``_FP8_LOWHEAD_M64_ARCHES`` only.
+    """
+    return arch in _FP8_LOWHEAD_M64_ARCHES and 2 * num_query_tokens > sm_count
 
 
 def canonical_arg_name(kind: str, name: str) -> str:
@@ -1128,10 +1139,10 @@ def is_bindable_arg(kind: str, name: str) -> bool:
         return canonical in _TENSOR_VALUE_NAMES
     if kind == "parameter":
         return canonical in _SCALAR_VALUE_NAMES
-    if kind == "workspace":
-        return name == _DESCRIPTOR_WORKSPACE_NAME
     if kind == "grid":
         return name in _GRID_NAMES
+    if kind == "launch":
+        return name in _LAUNCH_NAMES
     return False
 
 
@@ -1142,7 +1153,6 @@ def _bind_argument(
     *,
     variant: str,
     grid: Mapping[str, int],
-    descriptor_slab: Optional[torch.Tensor],
 ) -> Any:
     if kind == "grid":
         if name not in grid:
@@ -1150,22 +1160,17 @@ def _bind_argument(
                 f"CAKE DSv4 {variant} has an unknown grid argument: {name}"
             )
         return grid[name]
-    if kind == "workspace":
-        if name != _DESCRIPTOR_WORKSPACE_NAME or descriptor_slab is None:
+    if kind == "launch":
+        if name not in _LAUNCH_NAMES:
             raise ValueError(
-                f"CAKE DSv4 {variant} has an unresolved workspace argument: {name}"
+                f"CAKE DSv4 {variant} has an unknown launch argument: {name}"
             )
-        return descriptor_slab
+        return int(bool(values.get(name, False)))
     if kind not in ("buffer", "tma_buffer", "parameter"):
         raise ValueError(
             f"CAKE DSv4 {variant} has an unknown argument kind {kind!r} for {name}"
         )
     canonical = canonical_arg_name(kind, name)
-    if canonical in _RETIRED_ARG_REASONS:
-        raise ValueError(
-            f"CAKE DSv4 {variant} binds the retired argument {name!r}: "
-            f"{_RETIRED_ARG_REASONS[canonical]}; regenerate the bindings"
-        )
     if canonical not in values:
         raise ValueError(
             f"CAKE DSv4 {variant} argument {name!r} ({kind}) has no host value; "
@@ -1173,8 +1178,9 @@ def _bind_argument(
         )
     value = values[canonical]
     if value is None:
-        hint = _UNAVAILABLE_HINTS.get(canonical, "it is not available for this call")
-        raise ValueError(f"CAKE DSv4 {variant} argument {name!r}: {hint}")
+        raise ValueError(
+            f"CAKE DSv4 {variant} argument {name!r}: it is not available for this call"
+        )
     if kind == "parameter":
         if canonical in _FLOAT_SCALAR_VALUE_NAMES:
             if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -1232,37 +1238,16 @@ def _prepare_variant(
     """Bind the generated ABI by name through the registration ``arg_plan``.
 
     Two-stage routes prepare the producer and the reducer before launching
-    either, so no Python-side binding sits between the two kernels. The caller
-    holds :data:`_descriptor_lock` from the first preparation through the last
-    launch of the call.
+    either, so no Python-side binding sits between the two kernels.
     """
     from ..jit.cake_dsv4 import get_cake_dsv4_spec
 
     contract = get_cake_dsv4_spec(variant, arch=arch)
-    plan = contract["arg_plan"]
     grid_values = _grid_values(grid)
-
-    def bind(kind, name, storage=None):
-        return _bind_argument(
-            values,
-            kind,
-            name,
-            variant=variant,
-            grid=grid_values,
-            descriptor_slab=storage,
-        )
-
-    tma_bytes = int(contract.get("tma_workspace_bytes", 0) or 0)
-    storage = None
-    if tma_bytes:
-        sources = [
-            (name, bind(kind, name)) for kind, name in plan if kind == "tma_buffer"
-        ]
-        device = sources[0][1].device if sources else torch.device("cpu")
-        storage = _descriptor_storage(
-            variant, arch, tma_bytes, sources, capturing=_is_capturing(device)
-        )
-    bound = [bind(kind, name, storage) for kind, name in plan]
+    bound = [
+        _bind_argument(values, kind, name, variant=variant, grid=grid_values)
+        for kind, name in contract["arg_plan"]
+    ]
     return _PreparedLaunch(_variant_module(variant, arch=arch), bound)
 
 
@@ -1274,8 +1259,7 @@ def _launch_variant(
     values: Mapping[str, Any],
 ):
     """Prepare and launch one variant (single-launch convenience)."""
-    with _descriptor_lock:
-        return _prepare_variant(variant, arch=arch, grid=grid, values=values)()
+    return _prepare_variant(variant, arch=arch, grid=grid, values=values)()
 
 
 # --------------------------------------------------------------------------- #
@@ -1293,7 +1277,14 @@ def _route(
     batch_size: int,
     compressed_page_size: int,
     num_query_tokens: int,
+    sm_count: int,
+    arch: Optional[str] = None,
 ) -> str:
+    """The variant one call runs; ``sm_count`` is the device's SM count (the
+    FP8/H64 decode rows, and on SM107 the FP8 8/16/32-head SWA-only decode
+    rows, pick their body by the waves of its grid) and ``arch`` its
+    ``sm_XYa`` target (``None``: the architecture-independent choice, which
+    SM107 may not build: it has no BF16 programs)."""
     if max_q_len <= 0:
         raise ValueError("max_q_len must be positive")
     is_swa = sparse_topk == 128
@@ -1305,7 +1296,9 @@ def _route(
             # work feed over T x 2 CTAs, runtime q_lens) matched or beat the
             # former per-(token, split) cluster producer on the 12-token
             # decode rows and beat trtllm-gen 1.12-1.75x on the MTP rows.
-            return _fp8_persistent_program(num_query_tokens)
+            return _fp8_persistent_program(
+                num_query_tokens, max_q_len=max_q_len, topk4x=is_topk4x, arch=arch
+            )
         if num_heads not in (8, 16, 32, 64):
             raise ValueError(f"unsupported CAKE FP8 DSv4 head count: {num_heads}")
         if (
@@ -1318,6 +1311,30 @@ def _route(
         ):
             return "fp8_h64_source_exact"
         if max_q_len >= 257:
+            if num_heads in (16, 32, 64):
+                # The single-CTA M64 persistent body (num_heads runtime, heads
+                # past num_heads predicated) beats the low-head prefill
+                # producer on every 16/32/64-head prefill row of the DSv4
+                # contract on GB300: 2.1-5.2x on the 512-8192-token rows
+                # (widths 128-1024, single and dual caches), with the same
+                # oracle.  Two programs, selected by the item width.
+                return _fp8_h64_m64_program(sparse_topk)
+            if arch in _FP8_LOWHEAD_M64_ARCHES and sparse_topk <= _FP8_M64_MAX_WIDTH:
+                # 8-head prefill rows take the same M64 body on SM107: R200
+                # (sm_107a, 216 SMs), CUDA graph + PDL, per call, measured at
+                # (tokens x width) 257 x 128, 386 x 640, 1024 x 128 / 640 /
+                # 1152 and 2048 x 128 / 640 / 1152: 1.87-4.66x (one
+                # 257-token request at width 128: 10.50 -> 5.61 us; two
+                # 1024-token requests at width 1152: 318.4 -> 68.4 us), with
+                # the same oracle.  Other architectures (unmeasured there)
+                # keep the low-head prefill producer for 8-head prefill rows.
+                return _fp8_h64_m64_program(sparse_topk)
+            if sparse_topk > _FP8_LOWHEAD_PREFILL_MAX_WIDTH:
+                raise ValueError(
+                    f"backend='cake' has no FP8 kernel for {num_heads} heads "
+                    f"with sparse_topk {sparse_topk} > "
+                    f"{_FP8_LOWHEAD_PREFILL_MAX_WIDTH} at max_q_len >= 257"
+                )
             return "fp8_lowhead_prefill"
         if (
             num_heads in (8, 16)
@@ -1336,29 +1353,36 @@ def _route(
             # 1.24-1.25x, width-260 rows 56/59/68/71 GB300 1.38-1.49x /
             # B200 1.33-1.43x (one-partition producer 0.99-1.27x).
             return "fp8_h8_h16_source_exact"
-        if num_heads == 64 and _fp8_h64_uses_persistent_body(
-            sparse_topk, num_query_tokens
-        ):
-            # Mirrors the Cake seed's H64_PERSISTENT_* rule:
-            # 12-token rows with >= 3 complete sparse tiles; every many-token
-            # compressed row (>= 2 complete tiles); SWA-only rows from 128
-            # tokens.  Same persistent FP8 body as FP8/H128 (heads >= num_heads
-            # predicated): GB300 1.23-1.26x / B200 1.15x on the 12-token rows,
-            # 1.02-1.92x on the 16-128-token hardening rows where the
-            # per-token cluster body and the SWA producer sat at 0.6-0.87x.
-            # Evaluated before the SWA-only test on purpose.
-            if num_query_tokens >= _FP8_H64_M64_MIN_TOKENS:
-                # H64-specific single-CTA M64 persistent body (one
-                # CTA per token, unified 128-row KV stage, no V gathers): GB300
-                # 1.25-1.55x / B200 1.22-1.44x on the 128-512 token rows where
-                # the FP8/H128 body sat at 0.81-1.13x.  Two exported programs,
-                # selected by the item width.
-                return _fp8_h64_m64_program(sparse_topk)
-            return _fp8_persistent_program(num_query_tokens)
-        if is_swa:
-            return "fp8_lowhead_prefill"
         if num_heads == 64:
-            return "fp8_lowhead_h64"
+            if _fp8_h64_uses_m64_body(
+                num_query_tokens, sm_count, sparse_topk=sparse_topk, arch=arch
+            ):
+                # H64-specific single-CTA M64 persistent body (one CTA per
+                # token, unified 128-row KV stage, no V gathers).  Two exported
+                # programs, selected by the item width.
+                return _fp8_h64_m64_program(sparse_topk)
+            if _fp8_h64_uses_persistent_body(sparse_topk, num_query_tokens, arch):
+                # Same persistent FP8 body as FP8/H128 (heads >= num_heads
+                # predicated) for the multi-tile rows of one wave: GB300 10.5-12.0
+                # us vs 13.4-14.1 us for the M64 body on the 1-72-token topk4x
+                # 640 rows.
+                return _fp8_persistent_program(num_query_tokens)
+            if is_swa:
+                return "fp8_lowhead_prefill"
+            if _fp8_h64_uses_cluster_body(sparse_topk, num_query_tokens, arch):
+                return "fp8_lowhead_h64"
+            # Rows with one complete tile (and width 256): the M64 body beats
+            # the H64 cluster body at every token count (GB300, topk128x widths
+            # 204-252, 1-72 tokens: 7.9-8.5 us vs 8.8-10.4 us).  On SM107 the
+            # rows of _FP8_H64_PERSISTENT_ONE_TILE_MIN_WIDTH took the persistent
+            # body above.
+            return _fp8_h64_m64_program(sparse_topk)
+        if is_swa:
+            if _fp8_lowhead_swa_uses_m64_body(num_query_tokens, sm_count, arch):
+                # 8/16/32-head SWA-only rows past one wave of the low-head
+                # prefill producer: the single-tile M64 program (width 128).
+                return _fp8_h64_m64_program(sparse_topk)
+            return "fp8_lowhead_prefill"
         # One producer partition owns up to three sparse tiles (widths up to
         # 384) and writes final O directly (one partition measured 1.18-1.26x
         # on the width-260 rows).  No two-partition producer is exported for
@@ -1636,17 +1660,29 @@ def cake_dsv4_workspace_requirement(
     max_q_len: int,
     batch_size: int,
     ragged: bool,
+    sm_count: Optional[int] = None,
+    arch: Optional[str] = None,
 ) -> WorkspaceRequirement:
-    """Route and exact workspace requirement of one call, without device access.
+    """Route and exact workspace requirement of one call.
 
     The arguments are the route inputs of :func:`run_cake_dsv4`:
     ``num_query_tokens`` = metadata rows, ``sparse_topk`` = combined table
     width, ``compressed_page_size`` = ``compressed_kv_cache.shape[-2]``
     (irrelevant for SWA-only calls), ``max_q_len`` = dense per-request query
     length or the ragged maximum, ``batch_size`` = ``seq_lens.numel()``,
-    ``ragged`` = ``cum_seq_lens_q is not None``. Raises ``ValueError`` for a
-    shape ``backend="cake"`` has no kernel for.
+    ``ragged`` = ``cum_seq_lens_q is not None``, ``sm_count`` = the SM count
+    of the device the call runs on (``None``: the current CUDA device's; the
+    workspace numbers do not depend on it, the route name may), ``arch`` = its
+    ``sm_XYa`` target (``None``: the current CUDA device's whenever CUDA is
+    available, else the architecture-independent route, which SM107 may not
+    build: it has no BF16 programs; the workspace numbers do not depend on it
+    either). Raises ``ValueError`` for a shape
+    ``backend="cake"`` has no kernel for.
     """
+    if sm_count is None:
+        sm_count = _device_sm_count(torch.device("cuda", torch.cuda.current_device()))
+    if arch is None and torch.cuda.is_available():
+        arch = _target_arch(torch.device("cuda", torch.cuda.current_device()))
     tokens = _positive_int(num_query_tokens, "num_query_tokens")
     heads = _positive_int(num_heads, "num_heads")
     batch = _positive_int(batch_size, "batch_size")
@@ -1660,6 +1696,8 @@ def cake_dsv4_workspace_requirement(
         batch_size=batch,
         compressed_page_size=int(compressed_page_size),
         num_query_tokens=tokens,
+        sm_count=_positive_int(sm_count, "sm_count"),
+        arch=arch,
     )
     plan = _route_plan(
         route, num_query_tokens=tokens, num_heads=heads, sparse_topk=topk
@@ -1717,6 +1755,44 @@ _OUT_PHASE_BY_ROUTE: dict[str, int] = {
     #   bf16_h128_topk128x: hardening-000025 / -000031 -0.74 / -0.70 us GB300, the
     #   other rows of the route flat (|d| <= 0.03 us).
     "bf16_h128_topk128x": 0x800,
+}
+
+
+# Alignment of O that each route's program needs beyond the 2 bytes a
+# contiguous bf16 view guarantees, the widest O store of its kernels over every
+# architecture that runs the route: 32 = ``st.global.v8.b32`` at 16-element
+# offsets, 16 = ``int4`` stores at 8-element offsets or an O tensor map (TMA
+# store; its binding rejects an address off 16 bytes).  bf16_h128_topk4x_v52
+# writes O from its split-5 reducer (``int4`` on sm_103a, ``int2`` on sm_100a);
+# bf16_h128_topk128x from the split reducer (``int2``) or, above 16 tokens, the
+# row-first owners (``st.global.v8.b32``); bf16_h64_compressed_q8_v38 from the
+# H64 reducer (``int2``) or, with one split, the producer
+# (``st.global.v8.b32``).  A caller ``out`` off that alignment (a contiguous
+# view at +2 or +16 bytes) runs into an aligned staging buffer that is then
+# copied into ``out``: the same program, the same bits.  An aligned ``out``
+# (every allocation, every phase of ``_OUT_PHASE_BY_ROUTE``) takes no staging.
+_OUT_ALIGN_BY_ROUTE: dict[str, int] = {
+    "bf16_h128_prefill_v42": 32,
+    "bf16_h128_swa128": 16,
+    "bf16_h128_topk128x": 32,
+    "bf16_h128_topk4x_v52": 16,
+    "bf16_h16_h32_swa128_v44": 16,
+    "bf16_h32_topk128x_early_v47": 16,
+    "bf16_h64_compressed_q8_v38": 32,
+    "bf16_h64_guard_q_tma_batch_r25": 16,
+    "bf16_h64_prefill": 32,
+    "bf16_h8_h16_source_exact": 16,
+    "bf16_h8_swa128_v43": 16,
+    "bf16_swa128_single_cta": 16,
+    "fp8_h128_prefill_source_persistent": 16,
+    "fp8_h128_prefill_source_persistent_uniform": 16,
+    "fp8_h64_prefill_source_persistent_m64": 32,
+    "fp8_h64_prefill_source_persistent_m64_multi_tile": 32,
+    "fp8_h64_source_exact": 32,
+    "fp8_h8_h16_source_exact": 16,
+    "fp8_lowhead_h64": 32,
+    "fp8_lowhead_one_partition": 32,
+    "fp8_lowhead_prefill": 32,
 }
 
 
@@ -1844,6 +1920,233 @@ def _int32_vector(
     return flat
 
 
+# The routes whose programs leave PDL to each call and may route a PDL-free
+# twin ``<route>_no_pdl``: the same kernel without its two griddepcontrol
+# instructions, which a call that does not ask for PDL launches instead
+# (without the attribute the grid starts after its predecessor completes, so
+# it reads what the PDL program reads after its wait).  SM100 and SM103 route
+# the twin to programs of their own.
+_NO_PDL_TWIN_ROUTES = frozenset({"fp8_h128_prefill_source_persistent"})
+
+# The fewest query rows a launch needs to take the twin, per architecture.
+# GB300 without PDL: the twin beat the PDL program by 64-192 ns from 386 rows
+# on (2 x 257-token prefill, 64 x 8 MTP) but trailed it by up to 64 ns at 256
+# rows (64 x 4 MTP).
+_NO_PDL_TWIN_MIN_TOKENS = {"sm_103a": 384}
+
+# The fewest query tokens the call's longest request needs for its launches to
+# take the twin, per architecture.  B200 without PDL: the twin led the PDL
+# program by 32-128 ns (median 64 ns) on 2 x 257-token prefill launches but
+# tied or trailed it by up to 32 ns on 2- to 8-token MTP launches.
+_NO_PDL_TWIN_MIN_QUERY_LEN = {"sm_100a": 257}
+
+
+# The routes with a K=64 sibling ``<route>_k64`` on an architecture whose FP8
+# MMA runs at K=64 only as a one-CTA M128 tile (SM107): a program whose every
+# MMA is that tile, where the route's pair-M128 MMAs run at K=32, with the
+# route's arguments, grid and launch.
+_K64_SIBLING_ROUTES = frozenset({"fp8_h128_prefill_source_persistent_uniform"})
+
+# The fewest query rows a launch needs to take the K=64 sibling, per
+# architecture.  VR200, eight back-to-back calls per CUDA graph: the sibling
+# led the K=32 program from 48 rows on (FP8/H128 and FP8/H64, widths 128-1152)
+# and trailed it by up to 4 % below.
+_K64_SIBLING_MIN_TOKENS = {"sm_107a": 48}
+
+# The dynamic shared memory of the K=64 sibling programs whose bindings launch
+# them in CUDA 13.4's oversized shared-memory mode (above the 232448 B standard
+# opt-in ceiling of SM107), per architecture.  The binding sets that mode
+# through the CUDA runtime its JIT module links (``libcudart`` by soname, so
+# the copy already in the process, e.g. torch's runtime wheel); a runtime
+# older than 13.4 rejects it ("cudaFuncSetAttribute failed: invalid argument")
+# even on a driver that supports it, so those launches run the program they
+# would run without the sibling instead (:func:`_k64_sibling_launchable`,
+# :func:`_k64_variant`).
+_K64_SIBLING_OVERSIZED_SMEM_BYTES = {"sm_107a": 272512}
+
+# The routes with a four-stage sibling ``<route>_kv4`` on an architecture whose
+# oversized shared-memory mode holds two more 64 KiB K/V stages (SM107): the
+# multi-tile M64 program with a four-stage K/V ring in that mode, where the
+# route's program has two stages, with the route's arguments, grid and launch
+# and the same output bits.  R200 (208 SMs), eight back-to-back calls per CUDA
+# graph and single cold calls: the four-stage program led the two-stage one by
+# 0.4-28.8 % on every multi-tile row but one and tied or trailed it by up to
+# 2.3 % on that one, 64-head 2 x 257-token prefill on topk128x items 256 wide.
+_KV4_SIBLING_ROUTES = frozenset({"fp8_h64_prefill_source_persistent_m64_multi_tile"})
+
+# The dynamic shared memory of the four-stage sibling programs, per
+# architecture (the route's two-stage program takes 191616 B).  Their bindings
+# launch them in the oversized mode, as the K=64 siblings' bindings do, so a
+# process that cannot launch them runs the route's program instead
+# (:func:`_kv4_sibling_launchable`, :func:`_kv4_variant`).
+_KV4_SIBLING_OVERSIZED_SMEM_BYTES = {"sm_107a": 322688}
+
+# The CUDA toolkit and runtime (``cudaRuntimeGetVersion``) version that added
+# the oversized shared-memory mode, and the driver's device attribute for its
+# ceiling (CU_DEVICE_ATTRIBUTE_MAX_OVERSIZED_SHARED_MEMORY_PER_BLOCK).
+_OVERSIZED_SMEM_CUDA_VERSION = "13.4"
+_OVERSIZED_SMEM_CUDART_VERSION = 13040
+_CU_DEVICE_ATTRIBUTE_MAX_OVERSIZED_SHARED_MEMORY_PER_BLOCK = 150
+
+
+def _shared_library(soname: str) -> Optional[ctypes.CDLL]:
+    """The process's copy of shared library ``soname``: the one already mapped
+    (the copy a JIT module linking ``soname`` binds to), else the one the
+    dynamic linker finds (JIT modules loaded later bind to it), else ``None``."""
+    for mode in (os.RTLD_NOLOAD | os.RTLD_NOW, ctypes.DEFAULT_MODE):
+        try:
+            return ctypes.CDLL(soname, mode=mode)
+        except OSError:
+            continue
+    return None
+
+
+def _cuda_runtime_version(major: int) -> Optional[int]:
+    """``cudaRuntimeGetVersion`` of ``libcudart.so.<major>``, the runtime the
+    JIT modules link (``-lcudart``, no rpath), or ``None`` when that library
+    does not load or the call fails."""
+    cudart = _shared_library(f"libcudart.so.{major}")
+    if cudart is None:
+        return None
+    version = ctypes.c_int(0)
+    if cudart.cudaRuntimeGetVersion(ctypes.pointer(version)) != 0:
+        return None
+    return version.value
+
+
+def _device_oversized_smem_per_block(device: torch.device) -> Optional[int]:
+    """The oversized shared-memory ceiling per block of ``device``, read from
+    the driver (a runtime older than 13.4 does not know the attribute), or
+    ``None`` when the driver does not report it (one older than 13.4 has no
+    oversized mode)."""
+    cuda = _shared_library("libcuda.so.1")
+    if cuda is None:
+        return None
+    ordinal = torch.cuda.current_device() if device.index is None else device.index
+    handle = ctypes.c_int(0)
+    value = ctypes.c_int(0)
+    if cuda.cuInit(0) != 0 or cuda.cuDeviceGet(ctypes.pointer(handle), ordinal) != 0:
+        return None
+    attribute = _CU_DEVICE_ATTRIBUTE_MAX_OVERSIZED_SHARED_MEMORY_PER_BLOCK
+    if cuda.cuDeviceGetAttribute(ctypes.pointer(value), attribute, handle) != 0:
+        return None
+    return value.value
+
+
+@functools.lru_cache(maxsize=None)
+def _oversized_smem_launchable(smem_bytes: int, device: torch.device) -> bool:
+    """Whether this process can launch a program of ``smem_bytes`` dynamic
+    shared memory in the oversized mode on ``device``: it needs a CUDA toolkit
+    of at least 13.4 (the program's binding does not build below it), a CUDA
+    runtime of at least 13.4 in the process (an older one rejects the mode) and
+    a driver that reports an oversized ceiling holding ``smem_bytes`` (one that
+    reports none has no mode)."""
+    from ..jit.cpp_ext import get_cuda_version, is_cuda_version_at_least
+
+    if not is_cuda_version_at_least(_OVERSIZED_SMEM_CUDA_VERSION):
+        return False
+    runtime = _cuda_runtime_version(get_cuda_version().major)
+    if runtime is None or runtime < _OVERSIZED_SMEM_CUDART_VERSION:
+        return False
+    ceiling = _device_oversized_smem_per_block(device)
+    return ceiling is not None and ceiling >= smem_bytes
+
+
+def _k64_sibling_launchable(arch: str, device: torch.device) -> bool:
+    """Whether this process can launch ``arch``'s K=64 sibling on ``device``.
+
+    A sibling within the standard opt-in ceiling always can; one in the
+    oversized mode can when :func:`_oversized_smem_launchable` passes for its
+    shared memory."""
+    smem_bytes = _K64_SIBLING_OVERSIZED_SMEM_BYTES.get(arch)
+    return smem_bytes is None or _oversized_smem_launchable(smem_bytes, device)
+
+
+def _kv4_sibling_launchable(arch: str, device: torch.device) -> bool:
+    """Whether this process can launch ``arch``'s four-stage sibling on
+    ``device``, as :func:`_k64_sibling_launchable` for the K=64 sibling."""
+    smem_bytes = _KV4_SIBLING_OVERSIZED_SMEM_BYTES.get(arch)
+    return smem_bytes is None or _oversized_smem_launchable(smem_bytes, device)
+
+
+def _k64_variant(
+    route: str, *, arch: str, num_query_tokens: int, device: torch.device
+) -> str:
+    """The variant a launch of ``route`` over ``num_query_tokens`` rows on
+    ``device`` runs: its K=64 sibling when ``arch`` has a floor in
+    ``_K64_SIBLING_MIN_TOKENS``, the launch meets it, ``arch`` routes the
+    sibling to a program other than the route's and this process can launch
+    that program on ``device`` (:func:`_k64_sibling_launchable`), else
+    ``route``.  When only that launch check fails, launches of at least
+    ``_FP8_PERSISTENT_LANE_GATHER_MIN_TOKENS`` rows (the short-query launches
+    SM107 keeps on the uniform route only for the sibling) run the lane-issued
+    route ``fp8_h128_prefill_source_persistent`` instead."""
+    if route not in _K64_SIBLING_ROUTES:
+        return route
+    min_tokens = _K64_SIBLING_MIN_TOKENS.get(arch)
+    if min_tokens is None or num_query_tokens < min_tokens:
+        return route
+    from ..jit.cake_dsv4 import VARIANTS
+
+    programs = VARIANTS.get(arch, {})
+    sibling = f"{route}_k64"
+    if programs.get(sibling, programs.get(route)) == programs.get(route):
+        return route
+    if not _k64_sibling_launchable(arch, device):
+        if num_query_tokens >= _FP8_PERSISTENT_LANE_GATHER_MIN_TOKENS:
+            return "fp8_h128_prefill_source_persistent"
+        return route
+    return sibling
+
+
+def _kv4_variant(route: str, *, arch: str, device: torch.device) -> str:
+    """The variant a launch of ``route`` on ``device`` runs: its four-stage
+    sibling when ``route`` is in ``_KV4_SIBLING_ROUTES``, ``arch`` routes the
+    sibling to a program other than the route's and this process can launch
+    that program on ``device`` (:func:`_kv4_sibling_launchable`), else
+    ``route``."""
+    if route not in _KV4_SIBLING_ROUTES:
+        return route
+    from ..jit.cake_dsv4 import VARIANTS
+
+    programs = VARIANTS.get(arch, {})
+    sibling = f"{route}_kv4"
+    if programs.get(sibling, programs.get(route)) == programs.get(route):
+        return route
+    return sibling if _kv4_sibling_launchable(arch, device) else route
+
+
+def _pdl_variant(
+    route: str,
+    *,
+    arch: str,
+    enable_pdl: bool,
+    num_query_tokens: int,
+    max_q_len: int,
+) -> str:
+    """The variant a launch of ``route`` over ``num_query_tokens`` rows of a
+    call whose longest request has ``max_q_len`` tokens runs: its PDL-free twin
+    when the call does not ask for PDL, ``arch`` has a floor in
+    ``_NO_PDL_TWIN_MIN_TOKENS`` or ``_NO_PDL_TWIN_MIN_QUERY_LEN``, the launch
+    meets each floor ``arch`` has and ``arch`` routes the twin to a program
+    other than the route's, else ``route``."""
+    if enable_pdl or route not in _NO_PDL_TWIN_ROUTES:
+        return route
+    min_tokens = _NO_PDL_TWIN_MIN_TOKENS.get(arch)
+    min_q_len = _NO_PDL_TWIN_MIN_QUERY_LEN.get(arch)
+    if min_tokens is None and min_q_len is None:
+        return route
+    if num_query_tokens < (min_tokens or 0) or max_q_len < (min_q_len or 0):
+        return route
+    from ..jit.cake_dsv4 import VARIANTS
+
+    programs = VARIANTS.get(arch, {})
+    twin = f"{route}_no_pdl"
+    if programs.get(twin, programs.get(route)) == programs.get(route):
+        return route
+    return twin
+
+
 class _Launcher:
     """Per-call launch context: shared values plus per-variant overrides."""
 
@@ -1934,8 +2237,17 @@ def run_cake_dsv4(
     extra_sparse_topk_lens: Optional[torch.Tensor] = None,
     sparse_topk_lens_offset: int = 0,
     out_shape: Optional[tuple[int, ...]] = None,
+    enable_pdl: bool = False,
 ) -> torch.Tensor:
     """Launch the CAKE DSv4 route for flattened ``query [rows, num_heads, 512]``.
+
+    ``enable_pdl`` launches the programs that support it (the FP8 persistent,
+    M64, low-head prefill and H64 cluster bodies) as programmatic dependents of the previous kernel on the
+    stream; they wait for it before their first global read.  The other
+    programs launch without the attribute.  Without ``enable_pdl`` the FP8
+    H128 persistent route launches its PDL-free twin on SM103 from 384 query
+    rows per launch and on SM100 when the longest request has at least 257
+    query tokens (``_pdl_variant``).
 
     ``out=None`` allocates the output here, after the route is known, so the
     routes in ``_OUT_PHASE_BY_ROUTE`` get their measured-fast base phase;
@@ -1946,7 +2258,9 @@ def run_cake_dsv4(
     the dense per-request query length (``query.shape[1]`` of the caller's
     ``[B, Q, H, 512]``) or the ragged maximum; ``seq_lens`` has one entry per
     request and ``cum_seq_lens_q`` (ragged only) ``batch_size + 1`` offsets.
-    Apart from the ``out=None`` output no device memory is allocated here
+    Apart from the ``out=None`` output and the staging buffer of a caller
+    ``out`` off its route's store alignment (``_OUT_ALIGN_BY_ROUTE``; an
+    aligned ``out`` takes none) no device memory is allocated here
     (the dense request offsets of the ragged-only producers and of row-tiled
     dense launches are process-lifetime constants, created on first use:
     warm such shapes up eagerly before a capture); see the module docstring
@@ -2036,6 +2350,8 @@ def run_cake_dsv4(
         batch_size=batch_size,
         compressed_page_size=compressed_kv_cache.shape[-2],
         num_query_tokens=meta.num_query_tokens,
+        sm_count=_device_sm_count(device),
+        arch=arch,
     )
 
     if out is None:
@@ -2053,6 +2369,11 @@ def run_cake_dsv4(
                 f"out_shape {tuple(out.shape)} holds fewer than {num_query_tokens} rows"
             )
     out_rows = out.view(-1, num_heads, _HEAD_DIM)[:num_query_tokens]
+    staged_out: Optional[torch.Tensor] = None
+    out_align = _OUT_ALIGN_BY_ROUTE.get(route)
+    if out_align is not None and out_rows.data_ptr() % out_align:
+        staged_out = out_rows
+        out_rows = torch.empty_like(out_rows)
 
     if not ragged and batch_size * max_q_len < num_query_tokens:
         raise ValueError(
@@ -2087,7 +2408,6 @@ def run_cake_dsv4(
         "bmm1_scale": scale1,
         "bmm2_scale": scale2,
         **meta.kernel_kwargs(),
-        "sparse_indices": meta.legacy_combined_table,
         "num_heads": num_heads,
         "num_head_tiles": _ceil_div(num_heads, 64),
         "has_sinks": has_sinks,
@@ -2096,6 +2416,7 @@ def run_cake_dsv4(
         "ragged_query": int(ragged),
         "num_splits": 1,
         "total_work_items": num_query_tokens,
+        "enable_pdl": bool(enable_pdl),
     }
     plan = _route_plan(
         route,
@@ -2118,33 +2439,27 @@ def run_cake_dsv4(
             f"({num_heads} heads, {plan.num_splits} splits); size it with "
             "get_cake_dsv4_workspace_bytes() or cake_dsv4_workspace_requirement()"
         )
-    # One host-side critical section per call: descriptor-pool bookkeeping,
-    # the bindings' descriptor checks and the launch enqueues (see
-    # _descriptor_storage).
-    with _descriptor_lock:
-        if rows_per_launch >= num_query_tokens:
-            _dispatch_route(
-                route,
-                _Launcher(
-                    arch=arch, workspace=workspace_buffer, raw=raw, values=values
-                ),
-            )
-        else:
-            if request_offsets is None:
-                request_offsets = _dense_query_offsets(
-                    batch_size, max_q_len, device=device
-                )
-            _dispatch_row_tiles(
-                route,
-                arch=arch,
-                workspace=workspace_buffer,
-                raw=raw,
-                values=values,
-                meta=meta,
-                plan=plan,
-                rows_per_launch=rows_per_launch,
-                request_offsets=request_offsets,
-            )
+    if rows_per_launch >= num_query_tokens:
+        _dispatch_route(
+            route,
+            _Launcher(arch=arch, workspace=workspace_buffer, raw=raw, values=values),
+        )
+    else:
+        if request_offsets is None:
+            request_offsets = _dense_query_offsets(batch_size, max_q_len, device=device)
+        _dispatch_row_tiles(
+            route,
+            arch=arch,
+            workspace=workspace_buffer,
+            raw=raw,
+            values=values,
+            meta=meta,
+            plan=plan,
+            rows_per_launch=rows_per_launch,
+            request_offsets=request_offsets,
+        )
+    if staged_out is not None:
+        staged_out.copy_(out_rows)
     return out
 
 
@@ -2174,7 +2489,6 @@ def _dispatch_row_tiles(
     total = values["num_query_tokens"]
     num_heads = values["num_heads"]
     num_offsets = int(request_offsets.numel())
-    legacy = values["sparse_indices"]
     for first in range(0, total, rows_per_launch):
         rows = min(rows_per_launch, total - first)
         stop = first + rows
@@ -2185,7 +2499,6 @@ def _dispatch_row_tiles(
             swa_indices=_flat_index_span(meta.swa_indices[first:stop]),
             compressed_indices=_flat_index_span(meta.compressed_indices[first:stop]),
             sparse_topk_lens=meta.sparse_topk_lens[first:stop],
-            sparse_indices=None if legacy is None else legacy[first:stop],
             num_query_tokens=rows,
             total_work_items=rows,
         )
@@ -2353,7 +2666,14 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
         "fp8_h128_prefill_source_persistent_uniform",
     ):
         parts = L.partials(1)
-        L.run(L.variant(route, grid=(T * 2, 1, 1), total_work_items=T, **parts))
+        program = _pdl_variant(
+            _k64_variant(route, arch=L.arch, num_query_tokens=T, device=v["Q"].device),
+            arch=L.arch,
+            enable_pdl=v["enable_pdl"],
+            num_query_tokens=T,
+            max_q_len=v["max_q_len"],
+        )
+        L.run(L.variant(program, grid=(T * 2, 1, 1), total_work_items=T, **parts))
         return
 
     if route in (
@@ -2363,9 +2683,18 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
         # One CTA per token (cta_group::1, M = 64); same kernel kwargs as the
         # FP8/H128 persistent body (num_heads runtime, -1 masking, padded rows,
         # caller-owned workspace), grid = tokens.  Both M64 programs share the
-        # kernel ABI; _fp8_h64_m64_program picks one by the item width.
+        # kernel ABI; _fp8_h64_m64_program picks one by the item width.  SM107
+        # runs the multi-tile program's launches on its four-stage sibling
+        # where this process can launch it (_kv4_variant).
         parts = L.partials(1)
-        L.run(L.variant(route, grid=(T, 1, 1), total_work_items=T, **parts))
+        program = _pdl_variant(
+            _kv4_variant(route, arch=L.arch, device=v["Q"].device),
+            arch=L.arch,
+            enable_pdl=v["enable_pdl"],
+            num_query_tokens=T,
+            max_q_len=v["max_q_len"],
+        )
+        L.run(L.variant(program, grid=(T, 1, 1), total_work_items=T, **parts))
         return
 
     if route in (
@@ -2445,62 +2774,35 @@ class NVFP4Plan:
 
     @property
     def variant(self) -> str:
-        return _nvfp4_variant_name(
-            self.member, tile_n=self.tile_n, o_chunks=self.o_chunks
-        )
+        return _nvfp4_variant_name(self.member)
 
 
-# Retrace knobs each member's generated program is specialised on, in variant-name order (Cake
-# flashinfer_blackwell_sparse_mla_dsv4_nvfp4_program.MEMBER_VARIANT_KNOBS).
-_NVFP4_VARIANT_KNOBS: Mapping[str, tuple[str, ...]] = {
-    "persistent": (),
-    "cluster": (),
-    "t64": ("tile_n", "o_chunks"),
-    "pv": ("tile_n", "o_chunks"),
-    "swap": ("tile_n", "o_chunks"),
-    "tile": ("o_chunks",),
-    "tile_h64": ("o_chunks",),
+# Registered program of each family member (Cake flashinfer_blackwell_sparse_mla_dsv4_nvfp4_program).  The
+# templated members (pv, swap, tile, tile_h64) take their retrace knobs -- ``tile_n`` (heads on the MMA N side)
+# and ``o_chunks`` (CTAs per work item) -- as launch arguments of one program each; its launcher switches over
+# the explicit instantiations of the kernel unit (swap: n{16,32} x oc{1,2,4}, tile: oc{1,2,4}, tile_h64:
+# oc{2,4}, pv: n{16,32}).  The standalone tile64 program keeps its exported knob suffix.
+_NVFP4_MEMBER_VARIANTS: Mapping[str, str] = {
+    "persistent": _NVFP4_VARIANT_PERSISTENT,
+    "cluster": _NVFP4_VARIANT_CLUSTER,
+    "t64": "nvfp4_decode_t64_n64_oc1",
+    "pv": "nvfp4_decode_pv",
+    "swap": "nvfp4_decode_swap",
+    "tile": "nvfp4_decode_tile",
+    "tile_h64": "nvfp4_decode_tile_h64",
 }
-_NVFP4_KNOB_TAGS = {"tile_n": "n", "o_chunks": "oc"}
 
 
-def _nvfp4_variant_name(
-    member: str, *, tile_n: Optional[int] = None, o_chunks: int = 1
-) -> str:
-    """Registered variant name of a member's physical program:
-    ``nvfp4_decode_<member>[_n<tile_n>][_oc<o_chunks>]`` (the merge is ``nvfp4_merge``)."""
-    if member not in _NVFP4_VARIANT_KNOBS:
+def _nvfp4_variant_name(member: str) -> str:
+    """Registered variant name of a member's program (the merge is ``nvfp4_merge``)."""
+    if member not in _NVFP4_MEMBER_VARIANTS:
         raise ValueError(f"unknown NVFP4 family member {member!r}")
-    values = {"tile_n": tile_n, "o_chunks": o_chunks}
-    tags = []
-    for knob in _NVFP4_VARIANT_KNOBS[member]:
-        if values[knob] is None:
-            raise ValueError(f"{member}: variant knob {knob} is required")
-        tags.append(f"_{_NVFP4_KNOB_TAGS[knob]}{int(values[knob])}")
-    return "nvfp4_decode_" + member + "".join(tags)
+    return _NVFP4_MEMBER_VARIANTS[member]
 
 
 # Every decode variant a plan can select (the host names them statically so the export can check that each
-# generated program is bindable): persistent, cluster, t64 n64, pv n16 / n32, swap n{16,32} x oc{1,2,4},
-# tile oc{1,2,4}, tile_h64 oc{2,4} (the H64 tile member has no 1-CTA form).
-_NVFP4_DECODE_VARIANTS = (
-    _NVFP4_VARIANT_PERSISTENT,
-    _NVFP4_VARIANT_CLUSTER,
-    "nvfp4_decode_t64_n64_oc1",
-    "nvfp4_decode_pv_n16_oc1",
-    "nvfp4_decode_pv_n32_oc1",
-    "nvfp4_decode_swap_n16_oc1",
-    "nvfp4_decode_swap_n16_oc2",
-    "nvfp4_decode_swap_n16_oc4",
-    "nvfp4_decode_swap_n32_oc1",
-    "nvfp4_decode_swap_n32_oc2",
-    "nvfp4_decode_swap_n32_oc4",
-    "nvfp4_decode_tile_oc1",
-    "nvfp4_decode_tile_oc2",
-    "nvfp4_decode_tile_oc4",
-    "nvfp4_decode_tile_h64_oc2",
-    "nvfp4_decode_tile_h64_oc4",
-)
+# generated program is bindable).
+_NVFP4_DECODE_VARIANTS = tuple(_NVFP4_MEMBER_VARIANTS.values())
 _NVFP4_VARIANTS = (*_NVFP4_DECODE_VARIANTS, _NVFP4_VARIANT_MERGE)
 
 
@@ -2707,7 +3009,7 @@ def _nvfp4_plan(
         merge_heads_per_cta=_nvfp4_merge_heads_per_cta(tokens, heads, sms),
     )
     # the persistent member's own split rule: enough CTAs to cover the SMs
-    p_splits, p_tiles = _nvfp4_split_shape(
+    _, p_tiles = _nvfp4_split_shape(
         total_tiles, max(1, min(total_tiles, _ceil_div(sms, tokens * num_head_tiles)))
     )
     if heads > _NVFP4_PV_MAX_HEADS:
@@ -2770,12 +3072,12 @@ def _nvfp4_plan(
             o_chunks=_nvfp4_swap_o_chunks(tokens * total_tiles * num_head_tiles, sms),
             **common,
         )
-    return NVFP4Plan(
-        num_head_tiles=num_head_tiles,
-        num_splits=p_splits,
-        tiles_per_split=p_tiles,
-        member="persistent",
-        **common,
+    # Unreachable: a one-tile pv split (pv_tiles == 1) implies p_tiles == 1
+    # (sweep over sm_count 1..264 x total_tiles 1..12 x T 1..4096: 0 hits).
+    raise RuntimeError(
+        f"CAKE DSv4 NVFP4 plan has no member for H={heads}, T={tokens}, "
+        f"{total_tiles} tiles on {sms} SMs (pv tiles {pv_tiles}, persistent "
+        f"tiles {p_tiles})"
     )
 
 
@@ -3139,6 +3441,8 @@ def run_cake_dsv4_nvfp4(
         "extra_page_stride": int(extra_page_stride),
         "has_sinks": int(sinks is not None),
         "heads_per_cta": plan.merge_heads_per_cta,
+        "tile_n": plan.tile_n,
+        "o_chunks": plan.o_chunks,
         "lse_partial_scale": float(lse_partial_scale),
         "lse_scale": lse_scale,
     }
@@ -3152,10 +3456,7 @@ def run_cake_dsv4_nvfp4(
     if num_splits > 1:
         # Split merge: one CTA per (token, heads_per_cta heads) over partial_O / partial_lse.
         launches.append(launcher.variant(_NVFP4_VARIANT_MERGE, grid=plan.merge_grid))
-    # One host-side critical section per call, as for the BF16 / FP8 routes
-    # (descriptor-pool bookkeeping, descriptor checks, launch enqueues).
-    with _descriptor_lock:
-        launcher.run(*launches)
+    launcher.run(*launches)
     return out
 
 

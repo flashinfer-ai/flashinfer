@@ -2,848 +2,41 @@
 # Licensed under the Apache License, Version 2.0.
 # https://www.apache.org/licenses/LICENSE-2.0
 
-"""Prepared fused BF16 routing GEMM and normalized top-k weights on SM100a/SM103a.
+"""Prepared fused BF16 routing GEMM and normalized top-k weights on SM100a/SM103a/SM107a.
 
 One compiled program per physical schedule template (block tokens, MMA CTA
 pair, split-K, expert groups, pipeline stages, gate warpgroups, K-block
 merge, the single-token cluster-reduction route, the 2..4-token cluster-reduction
 route of SM100a, the small-M idle L2 touch).
-The token count, the SM-count-derived worker stride and the physical-map /
-logical-output flags are kernel arguments, so any token count is served: the
-DeepGEMM configuration for ``M`` is snapped onto the exported template set.
+The token count, the SM-count-derived worker stride and the route flags
+(physical map, logical output, token mask, image bias) are kernel arguments,
+so any token count is served: the DeepGEMM configuration for ``M`` is snapped
+onto the exported template set. Deterministic requests of at most
+``DETERMINISTIC_CG2_MAX_TOKENS`` tokens take the paired-CTA split-1 template
+(one 32-token block, two MMA CTAs per expert group; a template outside
+DeepGEMM's own selector). The programs and their architectures are the
+records of :mod:`.cake_jit`.
 """
 
 from __future__ import annotations
 
 import functools
 
+from . import cake_jit
+
 EXPORTED = dict(K=5120, E=384, num_topk=6, scoring_func="sqrtsoftplus")
 """The problem constants the exported programs were generated for."""
 
 ROUTE_FLAG_PHYSICAL_MAP = 1
 ROUTE_FLAG_UNMAPPED_OUTPUT = 2
+ROUTE_FLAG_TOKEN_MASK = 4
+ROUTE_FLAG_IMAGE_BIAS = 8
 
-_ARCHES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
-
-PROGRAMS = {
-    "cake_deepgemm_mega_gate_094f5a3c7afdfc448778": {
-        "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_094f5a3c7afdfc448778_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_094f5a3c7afdfc448778_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["tma_buffer", "X"],
-            ["tma_buffer", "W"],
-            ["buffer", "bias"],
-            ["buffer", "image_bias"],
-            ["buffer", "image_mask"],
-            ["buffer", "mask"],
-            ["buffer", "physical_map"],
-            ["buffer", "logical_count"],
-            ["buffer", "topk_idx"],
-            ["buffer", "unmapped_idx"],
-            ["buffer", "topk_weights"],
-            ["buffer", "scratch"],
-            ["buffer", "score_barriers"],
-            ["buffer", "fixed_mask"],
-            ["buffer", "random_mask"],
-            ["parameter", "num_tokens"],
-            ["parameter", "num_shared"],
-            ["parameter", "map_width"],
-            ["parameter", "ep_rank"],
-            ["parameter", "routed_scale"],
-            ["parameter", "unmapped_stride"],
-            ["parameter", "num_workers"],
-            ["parameter", "route_flags"],
-            ["parameter", "num_split_k"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-    },
-    "cake_deepgemm_mega_gate_3561d17eaa3f4b261151": {
-        "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_3561d17eaa3f4b261151_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_3561d17eaa3f4b261151_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["tma_buffer", "X"],
-            ["tma_buffer", "W"],
-            ["buffer", "bias"],
-            ["buffer", "image_bias"],
-            ["buffer", "image_mask"],
-            ["buffer", "mask"],
-            ["buffer", "physical_map"],
-            ["buffer", "logical_count"],
-            ["buffer", "topk_idx"],
-            ["buffer", "unmapped_idx"],
-            ["buffer", "topk_weights"],
-            ["buffer", "scratch"],
-            ["buffer", "score_barriers"],
-            ["buffer", "fixed_mask"],
-            ["buffer", "random_mask"],
-            ["parameter", "num_tokens"],
-            ["parameter", "num_shared"],
-            ["parameter", "map_width"],
-            ["parameter", "ep_rank"],
-            ["parameter", "routed_scale"],
-            ["parameter", "unmapped_stride"],
-            ["parameter", "num_workers"],
-            ["parameter", "route_flags"],
-            ["parameter", "num_split_k"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-    },
-    "cake_deepgemm_mega_gate_3ca2bfdfda45f81dad49": {
-        "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_3ca2bfdfda45f81dad49_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_3ca2bfdfda45f81dad49_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["tma_buffer", "X"],
-            ["tma_buffer", "W"],
-            ["buffer", "bias"],
-            ["buffer", "image_bias"],
-            ["buffer", "image_mask"],
-            ["buffer", "mask"],
-            ["buffer", "physical_map"],
-            ["buffer", "logical_count"],
-            ["buffer", "topk_idx"],
-            ["buffer", "unmapped_idx"],
-            ["buffer", "topk_weights"],
-            ["buffer", "scratch"],
-            ["buffer", "score_barriers"],
-            ["buffer", "fixed_mask"],
-            ["buffer", "random_mask"],
-            ["parameter", "num_tokens"],
-            ["parameter", "num_shared"],
-            ["parameter", "map_width"],
-            ["parameter", "ep_rank"],
-            ["parameter", "routed_scale"],
-            ["parameter", "unmapped_stride"],
-            ["parameter", "num_workers"],
-            ["parameter", "route_flags"],
-            ["parameter", "num_split_k"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-    },
-    "cake_deepgemm_mega_gate_443ee7219ad7504a35a0": {
-        "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_443ee7219ad7504a35a0_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_443ee7219ad7504a35a0_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["tma_buffer", "X"],
-            ["tma_buffer", "W"],
-            ["buffer", "bias"],
-            ["buffer", "image_bias"],
-            ["buffer", "image_mask"],
-            ["buffer", "mask"],
-            ["buffer", "physical_map"],
-            ["buffer", "logical_count"],
-            ["buffer", "topk_idx"],
-            ["buffer", "unmapped_idx"],
-            ["buffer", "topk_weights"],
-            ["buffer", "scratch"],
-            ["buffer", "score_barriers"],
-            ["buffer", "fixed_mask"],
-            ["buffer", "random_mask"],
-            ["parameter", "num_tokens"],
-            ["parameter", "num_shared"],
-            ["parameter", "map_width"],
-            ["parameter", "ep_rank"],
-            ["parameter", "routed_scale"],
-            ["parameter", "unmapped_stride"],
-            ["parameter", "num_workers"],
-            ["parameter", "route_flags"],
-            ["parameter", "num_split_k"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-    },
-    "cake_deepgemm_mega_gate_882c44206a6ea3c085b4": {
-        "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_882c44206a6ea3c085b4_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_882c44206a6ea3c085b4_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["tma_buffer", "X"],
-            ["tma_buffer", "W"],
-            ["buffer", "bias"],
-            ["buffer", "image_bias"],
-            ["buffer", "image_mask"],
-            ["buffer", "mask"],
-            ["buffer", "physical_map"],
-            ["buffer", "logical_count"],
-            ["buffer", "topk_idx"],
-            ["buffer", "unmapped_idx"],
-            ["buffer", "topk_weights"],
-            ["buffer", "scratch"],
-            ["buffer", "score_barriers"],
-            ["buffer", "fixed_mask"],
-            ["buffer", "random_mask"],
-            ["parameter", "num_tokens"],
-            ["parameter", "num_shared"],
-            ["parameter", "map_width"],
-            ["parameter", "ep_rank"],
-            ["parameter", "routed_scale"],
-            ["parameter", "unmapped_stride"],
-            ["parameter", "num_workers"],
-            ["parameter", "route_flags"],
-            ["parameter", "num_split_k"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-    },
-    "cake_deepgemm_mega_gate_8b22b176f3db4b110d56": {
-        "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_8b22b176f3db4b110d56_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_8b22b176f3db4b110d56_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["tma_buffer", "X"],
-            ["tma_buffer", "W"],
-            ["buffer", "bias"],
-            ["buffer", "image_bias"],
-            ["buffer", "image_mask"],
-            ["buffer", "mask"],
-            ["buffer", "physical_map"],
-            ["buffer", "logical_count"],
-            ["buffer", "topk_idx"],
-            ["buffer", "unmapped_idx"],
-            ["buffer", "topk_weights"],
-            ["buffer", "scratch"],
-            ["buffer", "score_barriers"],
-            ["buffer", "fixed_mask"],
-            ["buffer", "random_mask"],
-            ["parameter", "num_tokens"],
-            ["parameter", "num_shared"],
-            ["parameter", "map_width"],
-            ["parameter", "ep_rank"],
-            ["parameter", "routed_scale"],
-            ["parameter", "unmapped_stride"],
-            ["parameter", "num_workers"],
-            ["parameter", "route_flags"],
-            ["parameter", "num_split_k"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-    },
-    "cake_deepgemm_mega_gate_8be2bbbc2c42bd4ebb76": {
-        "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_8be2bbbc2c42bd4ebb76_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_8be2bbbc2c42bd4ebb76_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["tma_buffer", "X"],
-            ["tma_buffer", "W"],
-            ["buffer", "bias"],
-            ["buffer", "image_bias"],
-            ["buffer", "image_mask"],
-            ["buffer", "mask"],
-            ["buffer", "physical_map"],
-            ["buffer", "logical_count"],
-            ["buffer", "topk_idx"],
-            ["buffer", "unmapped_idx"],
-            ["buffer", "topk_weights"],
-            ["buffer", "scratch"],
-            ["buffer", "score_barriers"],
-            ["buffer", "fixed_mask"],
-            ["buffer", "random_mask"],
-            ["parameter", "num_tokens"],
-            ["parameter", "num_shared"],
-            ["parameter", "map_width"],
-            ["parameter", "ep_rank"],
-            ["parameter", "routed_scale"],
-            ["parameter", "unmapped_stride"],
-            ["parameter", "num_workers"],
-            ["parameter", "route_flags"],
-            ["parameter", "num_split_k"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-    },
-    "cake_deepgemm_mega_gate_99c1c61a19e3d15ee143": {
-        "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_99c1c61a19e3d15ee143_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_99c1c61a19e3d15ee143_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["tma_buffer", "X"],
-            ["tma_buffer", "W"],
-            ["buffer", "bias"],
-            ["buffer", "image_bias"],
-            ["buffer", "image_mask"],
-            ["buffer", "mask"],
-            ["buffer", "physical_map"],
-            ["buffer", "logical_count"],
-            ["buffer", "topk_idx"],
-            ["buffer", "unmapped_idx"],
-            ["buffer", "topk_weights"],
-            ["buffer", "scratch"],
-            ["buffer", "score_barriers"],
-            ["buffer", "fixed_mask"],
-            ["buffer", "random_mask"],
-            ["parameter", "num_tokens"],
-            ["parameter", "num_shared"],
-            ["parameter", "map_width"],
-            ["parameter", "ep_rank"],
-            ["parameter", "routed_scale"],
-            ["parameter", "unmapped_stride"],
-            ["parameter", "num_workers"],
-            ["parameter", "route_flags"],
-            ["parameter", "num_split_k"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-    },
-    "cake_deepgemm_mega_gate_a8833c334d5a93ad889b": {
-        "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_a8833c334d5a93ad889b_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_a8833c334d5a93ad889b_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["tma_buffer", "X"],
-            ["tma_buffer", "W"],
-            ["buffer", "bias"],
-            ["buffer", "image_bias"],
-            ["buffer", "image_mask"],
-            ["buffer", "mask"],
-            ["buffer", "physical_map"],
-            ["buffer", "logical_count"],
-            ["buffer", "topk_idx"],
-            ["buffer", "unmapped_idx"],
-            ["buffer", "topk_weights"],
-            ["buffer", "scratch"],
-            ["buffer", "score_barriers"],
-            ["buffer", "fixed_mask"],
-            ["buffer", "random_mask"],
-            ["parameter", "num_tokens"],
-            ["parameter", "num_shared"],
-            ["parameter", "map_width"],
-            ["parameter", "ep_rank"],
-            ["parameter", "routed_scale"],
-            ["parameter", "unmapped_stride"],
-            ["parameter", "num_workers"],
-            ["parameter", "route_flags"],
-            ["parameter", "num_split_k"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-    },
-    "cake_deepgemm_mega_gate_ab8ab2e282f523349bbc": {
-        "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_ab8ab2e282f523349bbc_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_ab8ab2e282f523349bbc_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["tma_buffer", "X"],
-            ["tma_buffer", "W"],
-            ["buffer", "bias"],
-            ["buffer", "image_bias"],
-            ["buffer", "image_mask"],
-            ["buffer", "mask"],
-            ["buffer", "physical_map"],
-            ["buffer", "logical_count"],
-            ["buffer", "topk_idx"],
-            ["buffer", "unmapped_idx"],
-            ["buffer", "topk_weights"],
-            ["buffer", "scratch"],
-            ["buffer", "score_barriers"],
-            ["buffer", "fixed_mask"],
-            ["buffer", "random_mask"],
-            ["parameter", "num_tokens"],
-            ["parameter", "num_shared"],
-            ["parameter", "map_width"],
-            ["parameter", "ep_rank"],
-            ["parameter", "routed_scale"],
-            ["parameter", "unmapped_stride"],
-            ["parameter", "num_workers"],
-            ["parameter", "route_flags"],
-            ["parameter", "num_split_k"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-    },
-    "cake_deepgemm_mega_gate_aeda81f093c3fa7be274": {
-        "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_aeda81f093c3fa7be274_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_aeda81f093c3fa7be274_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["tma_buffer", "X"],
-            ["tma_buffer", "W"],
-            ["buffer", "bias"],
-            ["buffer", "image_bias"],
-            ["buffer", "image_mask"],
-            ["buffer", "mask"],
-            ["buffer", "physical_map"],
-            ["buffer", "logical_count"],
-            ["buffer", "topk_idx"],
-            ["buffer", "unmapped_idx"],
-            ["buffer", "topk_weights"],
-            ["buffer", "scratch"],
-            ["buffer", "score_barriers"],
-            ["buffer", "fixed_mask"],
-            ["buffer", "random_mask"],
-            ["parameter", "num_tokens"],
-            ["parameter", "num_shared"],
-            ["parameter", "map_width"],
-            ["parameter", "ep_rank"],
-            ["parameter", "routed_scale"],
-            ["parameter", "unmapped_stride"],
-            ["parameter", "num_workers"],
-            ["parameter", "route_flags"],
-            ["parameter", "num_split_k"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-    },
-    "cake_deepgemm_mega_gate_c01e013d8fdd8e74134c": {
-        "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_c01e013d8fdd8e74134c_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_c01e013d8fdd8e74134c_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["tma_buffer", "X"],
-            ["tma_buffer", "W"],
-            ["buffer", "bias"],
-            ["buffer", "image_bias"],
-            ["buffer", "image_mask"],
-            ["buffer", "mask"],
-            ["buffer", "physical_map"],
-            ["buffer", "logical_count"],
-            ["buffer", "topk_idx"],
-            ["buffer", "unmapped_idx"],
-            ["buffer", "topk_weights"],
-            ["buffer", "scratch"],
-            ["buffer", "score_barriers"],
-            ["buffer", "fixed_mask"],
-            ["buffer", "random_mask"],
-            ["parameter", "num_tokens"],
-            ["parameter", "num_shared"],
-            ["parameter", "map_width"],
-            ["parameter", "ep_rank"],
-            ["parameter", "routed_scale"],
-            ["parameter", "unmapped_stride"],
-            ["parameter", "num_workers"],
-            ["parameter", "route_flags"],
-            ["parameter", "num_split_k"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-    },
-    "cake_deepgemm_mega_gate_c58a40265fa9d7d03481": {
-        "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_c58a40265fa9d7d03481_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_c58a40265fa9d7d03481_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["tma_buffer", "X"],
-            ["tma_buffer", "W"],
-            ["buffer", "bias"],
-            ["buffer", "image_bias"],
-            ["buffer", "image_mask"],
-            ["buffer", "mask"],
-            ["buffer", "physical_map"],
-            ["buffer", "logical_count"],
-            ["buffer", "topk_idx"],
-            ["buffer", "unmapped_idx"],
-            ["buffer", "topk_weights"],
-            ["buffer", "scratch"],
-            ["buffer", "score_barriers"],
-            ["buffer", "fixed_mask"],
-            ["buffer", "random_mask"],
-            ["parameter", "num_tokens"],
-            ["parameter", "num_shared"],
-            ["parameter", "map_width"],
-            ["parameter", "ep_rank"],
-            ["parameter", "routed_scale"],
-            ["parameter", "unmapped_stride"],
-            ["parameter", "num_workers"],
-            ["parameter", "route_flags"],
-            ["parameter", "num_split_k"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-    },
-    "cake_deepgemm_mega_gate_f3a19a16a7987e71c969": {
-        "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_f3a19a16a7987e71c969_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_f3a19a16a7987e71c969_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["tma_buffer", "X"],
-            ["tma_buffer", "W"],
-            ["buffer", "bias"],
-            ["buffer", "image_bias"],
-            ["buffer", "image_mask"],
-            ["buffer", "mask"],
-            ["buffer", "physical_map"],
-            ["buffer", "logical_count"],
-            ["buffer", "topk_idx"],
-            ["buffer", "unmapped_idx"],
-            ["buffer", "topk_weights"],
-            ["buffer", "scratch"],
-            ["buffer", "score_barriers"],
-            ["buffer", "fixed_mask"],
-            ["buffer", "random_mask"],
-            ["parameter", "num_tokens"],
-            ["parameter", "num_shared"],
-            ["parameter", "map_width"],
-            ["parameter", "ep_rank"],
-            ["parameter", "routed_scale"],
-            ["parameter", "unmapped_stride"],
-            ["parameter", "num_workers"],
-            ["parameter", "route_flags"],
-            ["parameter", "num_split_k"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-    },
-    "cake_deepgemm_mega_gate_f78ed5c2f5ea2b8989aa": {
-        "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_f78ed5c2f5ea2b8989aa_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_f78ed5c2f5ea2b8989aa_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["tma_buffer", "X"],
-            ["tma_buffer", "W"],
-            ["buffer", "bias"],
-            ["buffer", "image_bias"],
-            ["buffer", "image_mask"],
-            ["buffer", "mask"],
-            ["buffer", "physical_map"],
-            ["buffer", "logical_count"],
-            ["buffer", "topk_idx"],
-            ["buffer", "unmapped_idx"],
-            ["buffer", "topk_weights"],
-            ["buffer", "scratch"],
-            ["buffer", "score_barriers"],
-            ["buffer", "fixed_mask"],
-            ["buffer", "random_mask"],
-            ["parameter", "num_tokens"],
-            ["parameter", "num_shared"],
-            ["parameter", "map_width"],
-            ["parameter", "ep_rank"],
-            ["parameter", "routed_scale"],
-            ["parameter", "unmapped_stride"],
-            ["parameter", "num_workers"],
-            ["parameter", "route_flags"],
-            ["parameter", "num_split_k"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-    },
-}
-"""program name -> sources (csrc-relative), compile flags, FFI entry and argument plan."""
-
-TEMPLATES = (
-    {
-        "block_tokens": 16,
-        "num_mma_ctas": 1,
-        "num_split_k": 16,
-        "num_expert_groups": 3,
-        "num_stages": 12,
-        "num_gate_warpgroups": 2,
-        "k_block_merge": 1,
-        "single_token": True,
-        "idle_touch": True,
-        "static_tokens": 0,
-        "static_route": -1,
-        "static_workers": 0,
-        "cluster_tokens": 0,
-        "program": "cake_deepgemm_mega_gate_8be2bbbc2c42bd4ebb76",
-    },
-    {
-        "block_tokens": 16,
-        "num_mma_ctas": 1,
-        "num_split_k": 16,
-        "num_expert_groups": 3,
-        "num_stages": 12,
-        "num_gate_warpgroups": 2,
-        "k_block_merge": 1,
-        "single_token": False,
-        "idle_touch": True,
-        "static_tokens": 0,
-        "static_route": -1,
-        "static_workers": 0,
-        "cluster_tokens": 4,
-        "program": "cake_deepgemm_mega_gate_99c1c61a19e3d15ee143",
-    },
-    {
-        "block_tokens": 16,
-        "num_mma_ctas": 1,
-        "num_split_k": 8,
-        "num_expert_groups": 3,
-        "num_stages": 12,
-        "num_gate_warpgroups": 2,
-        "k_block_merge": 1,
-        "single_token": False,
-        "idle_touch": True,
-        "static_tokens": 0,
-        "static_route": -1,
-        "static_workers": 0,
-        "cluster_tokens": 0,
-        "program": "cake_deepgemm_mega_gate_aeda81f093c3fa7be274",
-    },
-    {
-        "block_tokens": 16,
-        "num_mma_ctas": 1,
-        "num_split_k": 1,
-        "num_expert_groups": 3,
-        "num_stages": 12,
-        "num_gate_warpgroups": 2,
-        "k_block_merge": 1,
-        "single_token": False,
-        "idle_touch": True,
-        "static_tokens": 0,
-        "static_route": -1,
-        "static_workers": 0,
-        "cluster_tokens": 0,
-        "program": "cake_deepgemm_mega_gate_f3a19a16a7987e71c969",
-    },
-    {
-        "block_tokens": 32,
-        "num_mma_ctas": 1,
-        "num_split_k": 8,
-        "num_expert_groups": 3,
-        "num_stages": 11,
-        "num_gate_warpgroups": 4,
-        "k_block_merge": 1,
-        "single_token": False,
-        "idle_touch": False,
-        "static_tokens": 0,
-        "static_route": -1,
-        "static_workers": 0,
-        "cluster_tokens": 0,
-        "program": "cake_deepgemm_mega_gate_3561d17eaa3f4b261151",
-    },
-    {
-        "block_tokens": 96,
-        "num_mma_ctas": 1,
-        "num_split_k": 8,
-        "num_expert_groups": 3,
-        "num_stages": 7,
-        "num_gate_warpgroups": 6,
-        "k_block_merge": 1,
-        "single_token": False,
-        "idle_touch": False,
-        "static_tokens": 0,
-        "static_route": -1,
-        "static_workers": 0,
-        "cluster_tokens": 0,
-        "program": "cake_deepgemm_mega_gate_882c44206a6ea3c085b4",
-    },
-    {
-        "block_tokens": 176,
-        "num_mma_ctas": 2,
-        "num_split_k": 4,
-        "num_expert_groups": 3,
-        "num_stages": 11,
-        "num_gate_warpgroups": 6,
-        "k_block_merge": 1,
-        "single_token": False,
-        "idle_touch": False,
-        "static_tokens": 0,
-        "static_route": -1,
-        "static_workers": 0,
-        "cluster_tokens": 0,
-        "program": "cake_deepgemm_mega_gate_443ee7219ad7504a35a0",
-    },
-    {
-        "block_tokens": 176,
-        "num_mma_ctas": 2,
-        "num_split_k": 2,
-        "num_expert_groups": 3,
-        "num_stages": 11,
-        "num_gate_warpgroups": 6,
-        "k_block_merge": 1,
-        "single_token": False,
-        "idle_touch": False,
-        "static_tokens": 0,
-        "static_route": -1,
-        "static_workers": 0,
-        "cluster_tokens": 0,
-        "program": "cake_deepgemm_mega_gate_443ee7219ad7504a35a0",
-    },
-    {
-        "block_tokens": 176,
-        "num_mma_ctas": 2,
-        "num_split_k": 2,
-        "num_expert_groups": 3,
-        "num_stages": 11,
-        "num_gate_warpgroups": 7,
-        "k_block_merge": 2,
-        "single_token": False,
-        "idle_touch": False,
-        "static_tokens": 0,
-        "static_route": -1,
-        "static_workers": 0,
-        "cluster_tokens": 0,
-        "program": "cake_deepgemm_mega_gate_c58a40265fa9d7d03481",
-    },
-    {
-        "block_tokens": 176,
-        "num_mma_ctas": 2,
-        "num_split_k": 1,
-        "num_expert_groups": 3,
-        "num_stages": 11,
-        "num_gate_warpgroups": 7,
-        "k_block_merge": 1,
-        "single_token": False,
-        "idle_touch": False,
-        "static_tokens": 0,
-        "static_route": -1,
-        "static_workers": 0,
-        "cluster_tokens": 0,
-        "program": "cake_deepgemm_mega_gate_094f5a3c7afdfc448778",
-    },
-    {
-        "block_tokens": 16,
-        "num_mma_ctas": 1,
-        "num_split_k": 16,
-        "num_expert_groups": 3,
-        "num_stages": 12,
-        "num_gate_warpgroups": 2,
-        "k_block_merge": 1,
-        "single_token": True,
-        "idle_touch": True,
-        "static_tokens": 1,
-        "static_route": 1,
-        "static_workers": 3,
-        "cluster_tokens": 0,
-        "program": "cake_deepgemm_mega_gate_f78ed5c2f5ea2b8989aa",
-    },
-    {
-        "block_tokens": 16,
-        "num_mma_ctas": 1,
-        "num_split_k": 16,
-        "num_expert_groups": 3,
-        "num_stages": 12,
-        "num_gate_warpgroups": 2,
-        "k_block_merge": 1,
-        "single_token": False,
-        "idle_touch": True,
-        "static_tokens": 4,
-        "static_route": 1,
-        "static_workers": 3,
-        "cluster_tokens": 4,
-        "program": "cake_deepgemm_mega_gate_8b22b176f3db4b110d56",
-    },
-    {
-        "block_tokens": 16,
-        "num_mma_ctas": 1,
-        "num_split_k": 8,
-        "num_expert_groups": 3,
-        "num_stages": 12,
-        "num_gate_warpgroups": 2,
-        "k_block_merge": 1,
-        "single_token": False,
-        "idle_touch": True,
-        "static_tokens": 16,
-        "static_route": 1,
-        "static_workers": 6,
-        "cluster_tokens": 0,
-        "program": "cake_deepgemm_mega_gate_c01e013d8fdd8e74134c",
-    },
-    {
-        "block_tokens": 16,
-        "num_mma_ctas": 1,
-        "num_split_k": 8,
-        "num_expert_groups": 3,
-        "num_stages": 12,
-        "num_gate_warpgroups": 2,
-        "k_block_merge": 1,
-        "single_token": False,
-        "idle_touch": True,
-        "static_tokens": 16,
-        "static_route": 2,
-        "static_workers": 6,
-        "cluster_tokens": 0,
-        "program": "cake_deepgemm_mega_gate_a8833c334d5a93ad889b",
-    },
-    {
-        "block_tokens": 32,
-        "num_mma_ctas": 1,
-        "num_split_k": 8,
-        "num_expert_groups": 3,
-        "num_stages": 11,
-        "num_gate_warpgroups": 4,
-        "k_block_merge": 1,
-        "single_token": False,
-        "idle_touch": False,
-        "static_tokens": 128,
-        "static_route": 1,
-        "static_workers": 6,
-        "cluster_tokens": 0,
-        "program": "cake_deepgemm_mega_gate_ab8ab2e282f523349bbc",
-    },
-    {
-        "block_tokens": 96,
-        "num_mma_ctas": 1,
-        "num_split_k": 8,
-        "num_expert_groups": 3,
-        "num_stages": 7,
-        "num_gate_warpgroups": 6,
-        "k_block_merge": 1,
-        "single_token": False,
-        "idle_touch": False,
-        "static_tokens": 512,
-        "static_route": 1,
-        "static_workers": 6,
-        "cluster_tokens": 0,
-        "program": "cake_deepgemm_mega_gate_3ca2bfdfda45f81dad49",
-    },
-)
+TEMPLATES = tuple(cake_jit.template(name) for name in cake_jit.MODULES)
 """Exported schedule templates (``block_tokens``, ``num_mma_ctas``, ``num_split_k``, ``num_expert_groups``,
-``num_stages``, ``num_gate_warpgroups``, ``k_block_merge``, ``single_token``, ``idle_touch``, ``cluster_tokens``) and their program."""
+``num_stages``, ``num_gate_warpgroups``, ``k_block_merge``, ``single_token``, ``idle_touch``, the exact-shape
+``static_tokens`` / ``static_route`` / ``static_workers`` and ``cluster_tokens``), their program and the
+architectures it is delivered for, in registry order."""
 
 
 def _ceildiv(a, b):
@@ -866,6 +59,19 @@ def _small_m_cluster_split16(M, arch):
     )
 
 
+DETERMINISTIC_CG2_MAX_TOKENS = 16
+
+
+def _deterministic_cg2_route(M, aligned_e, groups, deterministic):
+    """The paired-CTA split-1 route of deterministic requests of at most DETERMINISTIC_CG2_MAX_TOKENS tokens on a
+    128-expert group partition (the exported 32-token cta_group::2 template; outside DeepGEMM's own selector)."""
+    return (
+        bool(deterministic)
+        and 0 < M <= DETERMINISTIC_CG2_MAX_TOKENS
+        and aligned_e // groups == 128
+    )
+
+
 def deepgemm_config(
     M,
     K,
@@ -878,8 +84,9 @@ def deepgemm_config(
     deterministic=False,
     arch=None,
 ):
-    """DeepGEMM's wave/tile/split-K selection and SMEM budget, plus the single-tile 16-split routes (``arch`` = the
-    device architecture; only the 2..4-token route depends on it).
+    """DeepGEMM's wave/tile/split-K selection and SMEM budget, plus the single-tile 16-split routes and the paired-CTA
+    split-1 route of deterministic requests of at most DETERMINISTIC_CG2_MAX_TOKENS tokens (``arch`` = the device
+    architecture; only the 2..4-token route depends on it).
 
     Returns ``(block, ctas, split, groups, stages, warpgroups, launch_ctas, workers)``.
     """
@@ -966,6 +173,15 @@ def deepgemm_config(
         launch_ctas = min(workers, _ceildiv(M, block)) * groups * 16
     if deterministic:
         split = 1
+        workers = launch_ctas // (groups * ctas)
+    if _deterministic_cg2_route(M, aligned_e, groups, deterministic):
+        # The paired-CTA split-1 route on one 32-token block (padded; a cta_group::2 MMA needs 16 token rows per CTA):
+        # the launch grid is that tile's groups x 2 task CTAs with worker stride 1, not DeepGEMM's preserved grid; the
+        # warpgroup and stage budget below follow DeepGEMM's rules at this geometry.
+        ctas, block = 2, 32
+        launch_ctas = (
+            min(num_sms // (groups * ctas), _ceildiv(M, block)) * groups * ctas
+        )
         workers = launch_ctas // (groups * ctas)
     token_cols = block // ctas if aligned_e // groups == 128 else block
     transpose_units = _ceildiv(token_cols, 8)
@@ -1090,6 +306,7 @@ def select_template(
         == (ctas, split, groups)
         and t["single_token"] == single_token
         and t["cluster_tokens"] == cluster_tokens
+        and (arch is None or arch in t["arches"])
     ]
     if not family:
         raise NotImplementedError(
@@ -1102,9 +319,12 @@ def select_template(
         if TEMPLATES[i]["block_tokens"] >= block
     ]
     BM = min(larger) if larger else max(TEMPLATES[i]["block_tokens"] for i in family)
+    # DeepGEMM's grid and worker stride at the snapped block (its pre-deterministic split sizes the launched grid; the
+    # paired-CTA deterministic route sizes its own grid).
     pre = (
         cfg
         if not deterministic
+        or _deterministic_cg2_route(M, _align(E, 128), groups, deterministic)
         else deepgemm_config(
             M, K, E, num_sms, has_physical_map=has_physical_map, arch=arch
         )
@@ -1133,6 +353,7 @@ def select_template(
     for i, t in enumerate(TEMPLATES):
         if (
             t["static_tokens"]
+            and (arch is None or arch in t["arches"])
             and _tile_geometry(t, t["static_tokens"]) == _tile_geometry(t, M)
             and t["static_route"] == route
             and t["static_workers"] in (0, workers)
@@ -1148,44 +369,28 @@ def device_facts(device_index):
     import torch
 
     properties = torch.cuda.get_device_properties(device_index)
-    arch = _ARCHES.get((properties.major, properties.minor))
+    arch = cake_jit.arch_for_capability((properties.major, properties.minor))
     if arch is None:
         raise RuntimeError(
             f"Mega Gate has no exported programs for compute capability {(properties.major, properties.minor)}; "
-            f"exported architectures: {sorted(_ARCHES.values())}"
+            f"exported architectures: {sorted(cake_jit.ARCH_BY_CAPABILITY.values())}"
         )
     return arch, int(properties.multi_processor_count)
 
 
-def _nvcc_flags(arch):
-    from flashinfer.jit.core import sm100a_nvcc_flags, sm103a_nvcc_flags
+def _token_mask(tensor, name, M, device):
+    import torch
 
-    return {"sm_100a": sm100a_nvcc_flags, "sm_103a": sm103a_nvcc_flags}[arch]
-
-
-@functools.cache
-def load_program(arch, name):
-    """Build (once per process) and load the exported program ``name`` for ``arch``."""
-    from flashinfer.jit import env
-    from flashinfer.jit.core import gen_jit_spec
-
-    record = PROGRAMS[name]
-    spec = gen_jit_spec(
-        name=f"{name}_{arch}",
-        sources=[
-            env.FLASHINFER_CSRC_DIR / p.removeprefix("csrc/") for p in record["sources"]
-        ],
-        extra_cuda_cflags=[*_nvcc_flags(arch), *record["compile_flags"]],
-        extra_ldflags=["-lcuda"],
-        extra_include_paths=[
-            env.FLASHINFER_CSRC_DIR,
-            env.FLASHINFER_INCLUDE_DIR,
-            env.FLASHINFER_CSRC_DIR
-            / record["sources"][0].removeprefix("csrc/").rsplit("/", 1)[0],
-        ],
-        use_fast_math=False,
-    )
-    return spec.build_and_load(), spec
+    if (
+        tensor.dtype != torch.bool
+        or tuple(tensor.shape) != (M,)
+        or not tensor.is_contiguous()
+        or tensor.device != device
+    ):
+        raise ValueError(
+            f"{name} must be a contiguous bool[{M}] tensor on the input device"
+        )
+    return tensor.view(torch.uint8)
 
 
 class MegaGatePlan:
@@ -1195,7 +400,18 @@ class MegaGatePlan:
     uses int32[E+shared,width] and logical_count int32[E+shared]. The optional
     logical top-k output is int64[M,topk] with unit column stride. The selected
     rows emit int64 indices and FP32 normalized unbiased scores scaled by
-    routed_scale. Deterministic mode selects the split-K-free template.
+    routed_scale. Deterministic mode selects the split-K-free templates (up
+    to 16 tokens: the paired-CTA 32-token block).
+
+    The optional token ``mask`` is bool[M]: a token whose entry is False takes
+    expert -1 with weight 0 in every slot (and -1 in the logical output).
+    ``image_bias`` (FP32[E]) and ``image_token_mask`` (bool[M]) come together:
+    an image token ranks experts by its score plus ``image_bias`` in place of
+    ``bias``; the weights stay the unbiased scores.
+
+    ``enable_pdl`` launches with programmatic dependent launch (default: when
+    the device supports it): the kernel waits on the preceding kernel before
+    its first global read and lets the following kernel start right after.
 
     Optional scratch and score_barriers are caller-owned; fresh barriers must
     be zeroed once before first use. A plan retains all buffers and submits on
@@ -1229,8 +445,11 @@ class MegaGatePlan:
         scratch=None,
         score_barriers=None,
         descriptor_workspace=None,
+        enable_pdl=None,
     ):
         import torch
+
+        from flashinfer.utils import device_support_pdl
 
         if x.device.type != "cuda":
             raise RuntimeError("Mega Gate requires a CUDA device")
@@ -1260,21 +479,13 @@ class MegaGatePlan:
                 EXPORTED["scoring_func"],
             )
             or bias is None
-            or any(
-                t is not None
-                for t in (
-                    image_bias,
-                    image_token_mask,
-                    mask,
-                    fix_routing_mask,
-                    force_random,
-                )
-            )
+            or fix_routing_mask is not None
+            or force_random is not None
         ):
             raise NotImplementedError(
                 f"the exported Mega Gate programs cover K={EXPORTED['K']}, E={EXPORTED['E']}, "
                 f"top-k {EXPORTED['num_topk']}, {EXPORTED['scoring_func']} scoring with an expert bias and "
-                "no image bias, token mask, fixed or random routing"
+                "no fixed or random routing"
             )
         if descriptor_workspace is not None:
             raise ValueError(
@@ -1283,6 +494,10 @@ class MegaGatePlan:
         if (to_physical_map is None) != (logical_count is None):
             raise ValueError(
                 "to_physical_map and logical_count must be supplied together"
+            )
+        if (image_bias is None) != (image_token_mask is None):
+            raise ValueError(
+                "image_bias and image_token_mask must be supplied together"
             )
         if not 0 <= ep_rank <= 0x7FFFFFFF:
             raise ValueError("ep_rank must fit nonnegative int32")
@@ -1332,8 +547,11 @@ class MegaGatePlan:
             or score_barriers.dtype != torch.uint64
         ):
             raise ValueError("score_barriers must be uint64[ceil(M/block_tokens),16]")
-        if bias.dtype != torch.float32 or tuple(bias.shape) != (E,):
-            raise ValueError(f"bias must be FP32[{E}]")
+        for name, tensor in (("bias", bias), ("image_bias", image_bias)):
+            if tensor is not None and (
+                tensor.dtype != torch.float32 or tuple(tensor.shape) != (E,)
+            ):
+                raise ValueError(f"{name} must be FP32[{E}]")
         if logical_count is not None and (
             logical_count.dtype != torch.int32
             or tuple(logical_count.shape) != (E + shared,)
@@ -1357,6 +575,7 @@ class MegaGatePlan:
             x,
             weight,
             bias,
+            image_bias,
             to_physical_map,
             logical_count,
             *out,
@@ -1373,20 +592,29 @@ class MegaGatePlan:
             )
         if unmapped_topk_idx is not None and unmapped_topk_idx.device != x.device:
             raise ValueError("unmapped_topk_idx must be on the input device")
+        token_mask = None if mask is None else _token_mask(mask, "mask", M, x.device)
+        image_mask = (
+            None
+            if image_token_mask is None
+            else _token_mask(image_token_mask, "image_token_mask", M, x.device)
+        )
         dummy_f32 = torch.empty(1, dtype=torch.float32, device=x.device)
         dummy_i32 = torch.empty(1, dtype=torch.int32, device=x.device)
         dummy_i64 = torch.empty(1, dtype=torch.int64, device=x.device)
         dummy_u8 = torch.empty(1, dtype=torch.uint8, device=x.device)
-        route_flags = route_flags_for(
-            to_physical_map is not None, unmapped_topk_idx is not None
+        route_flags = (
+            route_flags_for(to_physical_map is not None, unmapped_topk_idx is not None)
+            | (ROUTE_FLAG_TOKEN_MASK if token_mask is not None else 0)
+            | (ROUTE_FLAG_IMAGE_BIAS if image_mask is not None else 0)
         )
+        pdl = device_support_pdl(x.device) if enable_pdl is None else bool(enable_pdl)
         bindings = dict(
             X=x,
             W=weight,
             bias=bias,
-            image_bias=dummy_f32,
-            image_mask=dummy_u8,
-            mask=dummy_u8,
+            image_bias=image_bias if image_bias is not None else dummy_f32,
+            image_mask=image_mask if image_mask is not None else dummy_u8,
+            mask=token_mask if token_mask is not None else dummy_u8,
             physical_map=to_physical_map if to_physical_map is not None else dummy_i32,
             logical_count=logical_count if logical_count is not None else dummy_i32,
             topk_idx=out[0],
@@ -1409,29 +637,34 @@ class MegaGatePlan:
             num_workers=num_workers,
             route_flags=route_flags,
             num_split_k=num_split_k,
+            enable_pdl=int(pdl),
             grid_x=launch_ctas,
             grid_y=1,
             grid_z=1,
         )
-        module, _spec = load_program(arch, template["program"])
-        record = PROGRAMS[template["program"]]
+        program = template["program"]
+        module = cake_jit.load(program, arch)
+        record = cake_jit.MODULES[program]
         args = tuple(bindings[name] for _kind, name in record["arg_plan"])
         self.route = dict(
             arch=arch,
             template=index,
-            program=template["program"],
+            program=program,
             launch_ctas=launch_ctas,
             num_workers=num_workers,
             block_tokens=block_tokens,
             num_split_k=num_split_k,
             num_sms=sms,
             route_flags=route_flags,
+            enable_pdl=pdl,
         )
-        self._submission = (module[record["ffi_entry"]], args)
+        self._submission = (getattr(module, record["ffi_entry"]), args)
         self._retained = (
             module,
             tensors,
             unmapped_topk_idx,
+            token_mask,
+            image_mask,
             dummy_f32,
             dummy_i32,
             dummy_i64,

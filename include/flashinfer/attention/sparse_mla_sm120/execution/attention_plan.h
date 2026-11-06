@@ -14,7 +14,7 @@ namespace flashinfer::sparse_mla_sm120::execution {
 constexpr int DecodeMaxHeads = 128;
 constexpr int FixedPageSize = 64;
 constexpr bool runtime_page(ModelType model) {
-  return model == ModelType::DSV4 || model == ModelType::DSV4_1 || model == ModelType::DSV3_2 ||
+  return model == ModelType::DSV4 || is_dsv41(model) || model == ModelType::DSV3_2 ||
          model == ModelType::GLM_NSA || model == ModelType::GLM53_NOPE ||
          model == ModelType::DOTS3_SWA;
 }
@@ -32,11 +32,11 @@ PrefillLaunchResult visit_prefill_heads(int heads, F&& call) {
   constexpr bool swap = Variant == 4;
 #define HEAD(H) \
   if (heads == H) return call(std::integral_constant<int, H>{});
-  if constexpr ((sg && (inline_scale || MT == ModelType::DSV4_1 || MT == ModelType::DOTS3_SWA)) ||
+  if constexpr ((sg && (inline_scale || is_dsv41(MT) || MT == ModelType::DOTS3_SWA)) ||
                 (mg && MT == ModelType::DSV4)) {
     HEAD(8) HEAD(16)
   }
-  if constexpr ((sg && (MT == ModelType::DSV4_1 || MT == ModelType::DOTS3_SWA)) ||
+  if constexpr ((sg && (is_dsv41(MT) || MT == ModelType::DOTS3_SWA)) ||
                 (mg && (inline_scale || MT == ModelType::DSV4))) {
     HEAD(32) HEAD(64)
   }
@@ -64,6 +64,7 @@ inline bool has_prefill_heads(ModelType model, int variant, int heads) {
     MODEL(GLM53_NOPE);
     MODEL(DOTS3_SWA);
     MODEL(DSV4_1);
+    MODEL(DSV4_1_INLINE);
   }
 #undef MODEL
   return false;
@@ -131,6 +132,9 @@ struct AttentionMetadata {
   bool has_sink;
   bool extra_fp4;
   int variant;
+  // Extra-cache row advance: the record width for footer caches, the
+  // validated row pitch for inline-scale records; zero without an extra cache.
+  size_t extra_row_stride_bytes = 0;
 };
 
 struct DeviceCaps {

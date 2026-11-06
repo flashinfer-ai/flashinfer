@@ -17,10 +17,19 @@ Independent reference for the DSA indexer top-k contract
 (flashinfer-ai/flashinfer#5676): input generators, an FP64 / FP32 scorer, the
 exact global selection with the issue's tie rule, the accumulation-error
 bound and the judgement of a result against the reference.  Shared by
-``tests/experimental/test_cake_dsa_indexer.py`` and
+``tests/experimental/test_cake_dsa_indexer.py``,
+``tests/experimental/test_cake_dsa_indexer_fp8.py``,
+``tests/experimental/test_cake_dsa_indexer_api.py`` and
 ``benchmarks/bench_cake_dsa_indexer.py``.
 
 Nothing here knows how the kernels partition queries or keys.
+
+Input generators.  ``make_random_inputs`` draws iid Gaussian ``q`` / ``k``
+(optionally ``peaked``); ``make_sink_inputs`` draws the attention-sink +
+local-band statistics of flashinfer-ai/flashinfer#7042 (key 0 boosted along a
+shared direction, log-spaced sinusoid position features shared by every query
+and its nearby keys, positive ``w``), the distribution on which the sampled
+first threshold of the generated program is stress-tested.
 
 Scoring.  For every visible (query, key) pair the FP64 score is treated as
 exact and an independent FP32 scorer that follows the generated program's
@@ -54,6 +63,17 @@ sum, plus one spare: ``D + 2H + 2``; two evaluations give ``2D + 4H + 4``.
 A tensor-core accumulation that truncates instead of rounding has unit
 roundoff ``2u``, and ``gamma_m(2u) <= gamma_2m(u)``, so the same ``n`` covers
 the kernel-versus-FP64 comparison).
+
+FP8 form.  Inputs with ``k_scale`` (``make_fp8_inputs``) hold float8_e4m3fn
+``q`` / ``k`` and score ``s = k_scale[j] * sum_h w_h relu(x_h)`` (``softmax_scale
+= 1``).  The product of two e4m3 values is exact and every partial sum of
+128 of them is a multiple of ``2**-18`` below ``2**25``, so the FP64 logits
+are exact in any order (``order="auto"`` picks ``matmul``); the head sum is
+FP64 and ``k_scale[j]`` multiplies it once.  The FP32 scorer rounds that head
+sum to FP32 and multiplies by ``k_scale[j]`` (one rounding each); it is not a
+model of a program's reduction, so FP8 judgements are bound-based only.  The
+bound keeps ``n = 2D + 4H + 4`` with ``A = |k_scale[j]| * sum_h |w_h| sum_d
+|q_hd k_jd|``.
 
 Judgement.  Structure (shapes, dtypes, padding, uniqueness, ascending order,
 visibility and segment membership) is always exact.  Returned score bits must
@@ -156,6 +176,12 @@ class IndexerInputs:
     q_causal_offsets: Optional[torch.Tensor] = None
     ratio: int = 1
     label: str = ""
+    # the FP8 form's per-key FP32 scales [Tkv] (float8_e4m3fn q / k); None for BF16 inputs
+    k_scale: Optional[torch.Tensor] = None
+
+    @property
+    def fp8(self) -> bool:
+        return self.k_scale is not None
 
     @property
     def num_queries(self) -> int:
@@ -180,6 +206,15 @@ class IndexerInputs:
         return effective_offsets(self.seg_q_len, self.seg_k_len, explicit, self.ratio)
 
     def kwargs(self) -> dict[str, Any]:
+        if self.fp8:
+            # the FP8 form takes softmax_scale=None (every scale but k_scale lives in w)
+            return dict(
+                top_k=self.top_k,
+                softmax_scale=None,
+                q_causal_offsets=self.q_causal_offsets,
+                ratio=self.ratio,
+                k_scale=self.k_scale,
+            )
         return dict(
             top_k=self.top_k,
             softmax_scale=self.softmax_scale,
@@ -234,6 +269,7 @@ def build_inputs(
     q_causal_offsets=None,
     ratio: int = 1,
     label: str = "",
+    k_scale: Optional[torch.Tensor] = None,
 ) -> IndexerInputs:
     seg_q_len = [int(x) for x in seg_q_len]
     seg_k_len = [int(x) for x in seg_k_len]
@@ -241,6 +277,11 @@ def build_inputs(
         raise ValueError("query and key segment lists must have the same length")
     if sum(seg_q_len) != q.shape[0] or sum(seg_k_len) != k.shape[0]:
         raise ValueError("segment lengths must sum to the tensor row counts")
+    if k_scale is not None and float(softmax_scale) != 1.0:
+        # the FP8 form takes softmax_scale=None and the references would still apply it
+        raise ValueError(
+            "the FP8 form folds softmax_scale into w: pass softmax_scale=1.0 with k_scale"
+        )
     device = q.device
     offsets = None
     if q_causal_offsets is not None:
@@ -264,6 +305,7 @@ def build_inputs(
         q_causal_offsets=offsets,
         ratio=int(ratio),
         label=label,
+        k_scale=k_scale,
     )
 
 
@@ -340,6 +382,200 @@ def make_random_inputs(
         softmax_scale=DEFAULT_SCALE if softmax_scale is None else softmax_scale,
         q_causal_offsets=q_causal_offsets,
         ratio=ratio,
+        label=label,
+    )
+
+
+E4M3_MAX = 448.0
+
+
+def _quantize_e4m3(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-row (last dimension) amax scaling of FP32 ``x`` to float8_e4m3fn: ``(x8, scale)`` with ``x ~ x8 * scale``."""
+    scale = (x.abs().amax(dim=-1) / E4M3_MAX).clamp_min(2.0**-60)
+    x8 = (x / scale.unsqueeze(-1)).clamp_(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn)
+    return x8, scale
+
+
+def make_fp8_inputs(
+    seg_q_len,
+    seg_k_len,
+    *,
+    top_k: int = DEFAULT_TOP_K,
+    seed: int = 0,
+    device="cuda",
+    ratio: int = 1,
+    q_causal_offsets=None,
+    softmax_scale: float = DEFAULT_SCALE,
+    k_row_stride: Optional[int] = None,
+    label: str = "",
+) -> IndexerInputs:
+    """Seeded FP8 inputs: iid Gaussian ``q`` / ``k`` quantized to float8_e4m3fn with one amax scale per (query, head)
+    and one per key row (``k_scale``), and signed ``w ~ N(0, 1) * H**-0.5`` carrying the query scale and
+    ``softmax_scale`` (the deployed FP8 indexer's folding; the stored ``softmax_scale`` is 1.0).  ``k_row_stride``
+    returns ``k`` as the leading ``[:, :128]`` view of a wider ``[Tkv, k_row_stride]`` e4m3 tensor."""
+    device = torch.device(device)
+    gen = torch.Generator(device=device).manual_seed(int(seed))
+    seg_q_len = [int(x) for x in seg_q_len]
+    seg_k_len = [int(x) for x in seg_k_len]
+    T, Tkv = sum(seg_q_len), sum(seg_k_len)
+    q = torch.empty((T, NUM_HEADS, HEAD_DIM), dtype=torch.float8_e4m3fn, device=device)
+    q_scale = torch.empty((T, NUM_HEADS), dtype=torch.float32, device=device)
+    for r0 in range(0, T, _GEN_ROWS):
+        r1 = min(T, r0 + _GEN_ROWS)
+        q[r0:r1], q_scale[r0:r1] = _quantize_e4m3(
+            torch.randn(
+                (r1 - r0, NUM_HEADS, HEAD_DIM),
+                generator=gen,
+                device=device,
+                dtype=torch.float32,
+            )
+        )
+    w = (
+        torch.randn((T, NUM_HEADS), generator=gen, device=device, dtype=torch.float32)
+        * (NUM_HEADS**-0.5)
+        * q_scale
+        * float(softmax_scale)
+    )
+    width = HEAD_DIM if k_row_stride is None else int(k_row_stride)
+    if width < HEAD_DIM:
+        raise ValueError("k_row_stride must be >= 128")
+    packed = torch.zeros((Tkv, width), dtype=torch.uint8, device=device).view(
+        torch.float8_e4m3fn
+    )
+    k_scale = torch.empty(Tkv, dtype=torch.float32, device=device)
+    for r0 in range(0, Tkv, _GEN_ROWS):
+        r1 = min(Tkv, r0 + _GEN_ROWS)
+        packed[r0:r1, :HEAD_DIM], k_scale[r0:r1] = _quantize_e4m3(
+            torch.randn(
+                (r1 - r0, HEAD_DIM), generator=gen, device=device, dtype=torch.float32
+            )
+        )
+    k = packed if k_row_stride is None else packed[:, :HEAD_DIM]
+    return build_inputs(
+        q,
+        k,
+        w,
+        seg_q_len,
+        seg_k_len,
+        top_k=top_k,
+        softmax_scale=1.0,
+        q_causal_offsets=q_causal_offsets,
+        ratio=ratio,
+        label=label,
+        k_scale=k_scale,
+    )
+
+
+def dequantized_bf16(inputs: IndexerInputs) -> IndexerInputs:
+    """BF16 inputs of the same data as the FP8 ``inputs``: ``q`` exactly (every e4m3 value is a BF16 value), ``k``
+    as ``bf16(k * k_scale)``, the same ``w`` and ``softmax_scale = 1``; for timing the BF16 form on the FP8 form's
+    data (its scores are close to, not equal to, the FP8 form's)."""
+    if not inputs.fp8:
+        raise ValueError("dequantized_bf16 takes FP8 inputs")
+    k = (inputs.k.to(torch.float32) * inputs.k_scale.unsqueeze(1)).to(torch.bfloat16)
+    return IndexerInputs(
+        q=inputs.q.to(torch.float32).to(torch.bfloat16),
+        k=k,
+        w=inputs.w,
+        cu_seqlens_q=inputs.cu_seqlens_q,
+        cu_seqlens_k=inputs.cu_seqlens_k,
+        top_k=inputs.top_k,
+        softmax_scale=1.0,
+        seg_q_len=list(inputs.seg_q_len),
+        seg_k_len=list(inputs.seg_k_len),
+        q_causal_offsets=inputs.q_causal_offsets,
+        ratio=inputs.ratio,
+        label=f"{inputs.label}_bf16" if inputs.label else "bf16",
+    )
+
+
+SINK_NUM_FREQUENCIES = 32
+SINK_SEED = 7
+
+
+def make_sink_inputs(
+    seg_q_len,
+    seg_k_len,
+    *,
+    top_k: int = DEFAULT_TOP_K,
+    seed: int = SINK_SEED,
+    device="cuda",
+    q_causal_offsets=None,
+    noise: float = 0.5,
+    local: float = 4.0,
+    sink: float = 2.0,
+    key0_boost: float = 8.0,
+    n_freq: int = SINK_NUM_FREQUENCIES,
+    label: str = "",
+) -> IndexerInputs:
+    """Attention-sink + local-band inputs (flashinfer-ai/flashinfer#7042, the GLM-5.2 layer-6 indexer statistics).
+
+    The issue's generator, byte for byte, generalised to several segments: position features ``z(pos)`` are 32
+    random-phase ``(cos, sin)`` pairs at the log-spaced frequencies ``2**-3 .. 2**-17`` over ``sqrt(32)``,
+    zero-padded to 128; a unit direction ``s`` is shared by every query (``+ sink * s``) and boosted on key 0 of
+    every segment (``+ key0_boost * s``); ``q = noise * N + local * z(q_pos) + sink * s``,
+    ``k = noise * N + local * z(k_pos)``, ``w = |N| * H**-0.5`` (positive weights, unlike
+    :func:`make_random_inputs`).  Query ``u`` of segment ``s`` sits at document position ``offset_s + u``
+    (``offset_s = Lk - Lq`` by default, the context-parallel tail rule), key ``j`` at position ``j``, so the
+    nearest keys of every query form a log-decaying band and key 0 is an attention sink.  ``ratio`` is 1.
+
+    The draws follow one seeded generator in a fixed order (``phi``, ``s``, ``q`` noise, ``k`` noise, ``w``), so two
+    calls with the same arguments on the same device give the same bits; CUDA Gaussian draws of large tensors
+    depend on the device's SM count, so bitwise identity of the inputs holds within one GPU model only.
+    """
+    device = torch.device(device)
+    seg_q_len = [int(x) for x in seg_q_len]
+    seg_k_len = [int(x) for x in seg_k_len]
+    if len(seg_q_len) != len(seg_k_len):
+        raise ValueError("query and key segment lists must have the same length")
+    offsets = effective_offsets(seg_q_len, seg_k_len, q_causal_offsets, 1)
+    q_pos = torch.cat(
+        [
+            torch.arange(off, off + lq, dtype=torch.int64)
+            for off, lq in zip(offsets, seg_q_len, strict=True)
+        ]
+    ).to(device)
+    k_pos = torch.cat([torch.arange(0, lk, dtype=torch.int64) for lk in seg_k_len]).to(
+        device
+    )
+    T = int(q_pos.numel())
+    gen = torch.Generator(device=device).manual_seed(int(seed))
+    omega = torch.logspace(
+        -3, -17, n_freq, base=2.0, device=device, dtype=torch.float64
+    )
+    phi = (
+        torch.rand(n_freq, generator=gen, device=device, dtype=torch.float64)
+        * 2
+        * torch.pi
+    )
+
+    def z(pos):
+        ang = pos.double()[:, None] * omega + phi
+        feat = torch.cat((ang.cos(), ang.sin()), 1).float() / n_freq**0.5
+        return torch.nn.functional.pad(feat, (0, HEAD_DIM - 2 * n_freq))
+
+    s = torch.randn(HEAD_DIM, generator=gen, device=device)
+    s = s / s.norm()
+    q = (
+        noise * torch.randn(T, NUM_HEADS, HEAD_DIM, generator=gen, device=device)
+        + local * z(q_pos)[:, None, :]
+        + sink * s
+    )
+    k = noise * torch.randn(
+        k_pos.numel(), HEAD_DIM, generator=gen, device=device
+    ) + local * z(k_pos)
+    k = k + (k_pos == 0).float()[:, None] * key0_boost * s
+    w = torch.randn(T, NUM_HEADS, generator=gen, device=device).abs() * NUM_HEADS**-0.5
+    return build_inputs(
+        q.bfloat16(),
+        k.bfloat16(),
+        w,
+        seg_q_len,
+        seg_k_len,
+        top_k=top_k,
+        softmax_scale=DEFAULT_SCALE,
+        q_causal_offsets=q_causal_offsets,
+        ratio=1,
         label=label,
     )
 
@@ -929,6 +1165,28 @@ def _finish_scores(logits64, logits32, w_rows, scale: float):
     return s64, s32
 
 
+def _fp64_values(x: torch.Tensor) -> torch.Tensor:
+    """FP64 values of BF16 / e4m3 / FP32 elements (exact)."""
+    return x.to(torch.float32).to(torch.float64)
+
+
+def _rows_of(x: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+    """``x.index_select(0, index)``; e4m3 rows are gathered through their uint8 bytes."""
+    if x.dtype == torch.float8_e4m3fn:
+        return x.view(torch.uint8).index_select(0, index).view(torch.float8_e4m3fn)
+    return x.index_select(0, index)
+
+
+def _fp8_scores(logits64, w_rows, k_scale_rows):
+    """FP8 form (module docstring): ``logits64 [c, H, n]`` exact, ``w_rows [c, H]`` fp32, ``k_scale_rows`` fp32
+    broadcasting to ``[c, n]``; returns ``(s64, s32)``."""
+    w64 = w_rows.to(torch.float64).unsqueeze(-1)
+    head64 = _heads_sequential(w64 * _relu_plus_zero(logits64))
+    s64 = head64 * k_scale_rows.to(torch.float64)
+    s32 = head64.to(torch.float32) * k_scale_rows
+    return s64, s32
+
+
 def score_block(
     q_rows,
     w_rows,
@@ -937,11 +1195,29 @@ def score_block(
     *,
     order: str = "sequential",
     with_bound: bool = False,
+    k_scale_rows: Optional[torch.Tensor] = None,
 ):
     """Scores of every (query, key) pair: ``q_rows [c, H, D]`` bf16, ``w_rows [c, H]`` fp32, ``k_rows [n, D]`` bf16.
 
     Returns ``(s64 [c, n], s32 [c, n], A64 [c, n] or None)`` where ``A`` is the bound base of the module docstring.
+    ``k_scale_rows [n]`` (fp32): the FP8 form, with e4m3 ``q_rows`` / ``k_rows``.
     """
+    if k_scale_rows is not None:
+        q64, k64 = _fp64_values(q_rows), _fp64_values(k_rows)
+        s64, s32 = _fp8_scores(
+            _logits(q64, k64, order, batched=False), w_rows, k_scale_rows
+        )
+        bound_base = None
+        if with_bound:
+            abs_logits = torch.matmul(q64.abs(), k64.abs().t())
+            bound_base = (
+                torch.bmm(
+                    w_rows.to(torch.float64).abs().unsqueeze(1), abs_logits
+                ).squeeze(1)
+                * k_scale_rows.to(torch.float64).abs()
+                * scale
+            )
+        return s64, s32, bound_base
     q64, k64 = q_rows.to(torch.float64), k_rows.to(torch.float64)
     q32, k32 = q_rows.to(torch.float32), k_rows.to(torch.float32)
     s64, s32 = _finish_scores(
@@ -989,9 +1265,35 @@ def score_selected(
         rr = rows[r0:r1]
         local = ids[r0:r1].to(torch.int64)
         valid = local >= 0
-        global_ids = k_starts[seg[rr]].unsqueeze(1) + local.clamp_min(0)
-        qb = inputs.q.index_select(0, rr)
+        # a padding id in a trailing empty key segment would point one past the last key: clamp it (``valid``
+        # discards its score)
+        global_ids = (k_starts[seg[rr]].unsqueeze(1) + local.clamp_min(0)).clamp_max(
+            inputs.num_keys - 1
+        )
         wb = inputs.w.index_select(0, rr)
+        if inputs.fp8:
+            qb = _rows_of(inputs.q, rr)
+            kb = _rows_of(inputs.k, global_ids.reshape(-1)).reshape(
+                r1 - r0, K, HEAD_DIM
+            )
+            ksb = inputs.k_scale.index_select(0, global_ids.reshape(-1)).reshape(
+                r1 - r0, K
+            )
+            q64, k64 = _fp64_values(qb), _fp64_values(kb)
+            b64, b32 = _fp8_scores(_logits(q64, k64, order, batched=True), wb, ksb)
+            abs_logits = torch.matmul(q64.abs(), k64.abs().transpose(1, 2))
+            base = (
+                torch.bmm(wb.to(torch.float64).abs().unsqueeze(1), abs_logits).squeeze(
+                    1
+                )
+                * ksb.to(torch.float64).abs()
+                * inputs.softmax_scale
+            )
+            s64[r0:r1] = torch.where(valid, b64, s64[r0:r1])
+            s32[r0:r1] = torch.where(valid, b32, s32[r0:r1])
+            a64[r0:r1] = torch.where(valid, base, a64[r0:r1])
+            continue
+        qb = inputs.q.index_select(0, rr)
         kb = inputs.k.index_select(0, global_ids.reshape(-1)).reshape(
             r1 - r0, K, HEAD_DIM
         )
@@ -1040,6 +1342,9 @@ def resolve_order(inputs: IndexerInputs, order: str) -> str:
         raise ValueError(
             f"order must be 'auto', 'sequential' or 'matmul', got {order!r}"
         )
+    if inputs.fp8:
+        # e4m3 logits are exact in FP64 under any order
+        return "matmul"
     return (
         "sequential"
         if count_visible_pairs(inputs) <= SEQUENTIAL_PAIR_LIMIT
@@ -1154,6 +1459,9 @@ def select_reference(
                     inputs.k[k0 + j0 : k0 + j1],
                     inputs.softmax_scale,
                     order=order,
+                    k_scale_rows=None
+                    if inputs.k_scale is None
+                    else inputs.k_scale[k0 + j0 : k0 + j1],
                 )
                 ids = (
                     torch.arange(j0, j1, dtype=torch.int64, device=device)
@@ -1204,9 +1512,10 @@ def select_reference(
 
 def bruteforce_rows(inputs: IndexerInputs) -> tuple[list[list[int]], list[list[float]]]:
     """Pure-Python per-row selection (FP64 scores from torch, ranking in Python) for tiny problems."""
-    q = inputs.q.to(torch.float64).cpu()
-    k = inputs.k.to(torch.float64).cpu()
+    q = _fp64_values(inputs.q).cpu()
+    k = _fp64_values(inputs.k).cpu()
     w = inputs.w.to(torch.float64).cpu()
+    k_scale = None if inputs.k_scale is None else inputs.k_scale.to(torch.float64).cpu()
     q_starts, k_starts = inputs.query_starts(), inputs.key_starts()
     offsets = inputs.offsets()
     ids_out: list[list[int]] = []
@@ -1220,6 +1529,8 @@ def bruteforce_rows(inputs: IndexerInputs) -> tuple[list[list[int]], list[list[f
                 logit = (q[t] * k[k_starts[s] + j]).sum(dim=1) * inputs.softmax_scale
                 terms = w[t] * torch.clamp(logit, min=0.0)
                 score = float(terms.sum())
+                if k_scale is not None:
+                    score *= float(k_scale[k_starts[s] + j])
                 scored.append((score + 0.0, j, score))
             scored.sort(key=lambda e: (e[0], e[1]), reverse=True)
             chosen = sorted(scored[: inputs.top_k], key=lambda e: e[1])
@@ -1350,6 +1661,10 @@ def judge(
             f"the reference models the positive-accumulator reduction; no model for {zero_sign_policy!r}"
         )
     inputs, order = reference.inputs, reference.order
+    if exact_bits and inputs.fp8:
+        raise ValueError(
+            "the FP8 form has no FP32 program model: judge it against the bound"
+        )
     indices, scores = result
     failures = structure_failures(inputs, indices, scores, rows=rows)
     if failures:
@@ -1511,6 +1826,7 @@ __all__ = [
     "CHUNK_BYTES",
     "DEFAULT_SCALE",
     "DEFAULT_TOP_K",
+    "E4M3_MAX",
     "EXACT_CASES",
     "EXACT_SCALE",
     "FP32_UNIT_ROUNDOFF",
@@ -1520,6 +1836,8 @@ __all__ = [
     "PAD_ID",
     "PAD_SCORE",
     "SEQUENTIAL_PAIR_LIMIT",
+    "SINK_NUM_FREQUENCIES",
+    "SINK_SEED",
     "TRAINER_KEY_ROW_STRIDE",
     "ZERO_SIGN_POLICIES",
     "IndexerInputs",
@@ -1531,6 +1849,7 @@ __all__ = [
     "clean_rows",
     "count_visible_pairs",
     "cumulative",
+    "dequantized_bf16",
     "dirty_rows",
     "effective_offsets",
     "exact_closed_form",
@@ -1540,9 +1859,11 @@ __all__ = [
     "make_boundary_inputs",
     "make_exact_case",
     "make_exact_inputs",
+    "make_fp8_inputs",
     "make_nonfinite_inputs",
     "make_packed_inputs",
     "make_random_inputs",
+    "make_sink_inputs",
     "mixed_weights",
     "negative_weights",
     "pair_bound",

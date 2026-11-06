@@ -92,6 +92,14 @@ from ._execution import (
 from ._execution import (
     resolve_model_type as _resolve_model_type,
 )
+from ._execution import (
+    split_inline_scale_format as _split_inline_scale_format,
+)
+from ._execution import (
+    DSV41_INLINE_FP4_ROW_BYTES as _DSV41_INLINE_FP4_ROW_BYTES,
+    DSV41_INLINE_ROW_BYTES as _DSV41_INLINE_ROW_BYTES,
+    check_inline_scale_cache as _check_inline_scale_cache,
+)
 
 # Package-root compatibility exports also expose the decode capability probes.
 from ._policy import (
@@ -113,6 +121,7 @@ from ._policy import (
     _MODEL_TYPE_DSV3_2,
     _MODEL_TYPE_DSV4,
     _MODEL_TYPE_DSV4_1,
+    _DSV4_1_MODEL_TYPES,
     _MODEL_TYPE_GLM53_NOPE,  # noqa: F401 (compatibility export)
     _MODEL_TYPE_GLM_NSA,  # noqa: F401 (compatibility export)
     _MODEL_TYPE_TO_FAMILY,
@@ -328,6 +337,7 @@ def supported_sparse_mla_sm120_configs(
         _DECODE_DSV3_2_TOPKS,
         frozenset({_DECODE_GLM53_NOPE_TOPK}),
         frozenset({_DECODE_DOTS3_SWA_TOPK}),
+        frozenset({_DECODE_DSV4_1_TOPK}),
         frozenset({_DECODE_DSV4_1_TOPK}),
     )
     result = {}
@@ -715,7 +725,19 @@ def _sparse_mla_sm120_paged_attention(
         GLM-style arbitrary FP32 inline scales (GLM_NSA at ``d_qk=576``,
         GLM53_NOPE at ``d_qk=512``); ``"auto"`` at ``d_qk=512`` selects
         DSV4; ``"ue8m0_g32"`` at ``d_qk=512`` selects DSV4_1 (DeepSeek-V4.1:
-        32-wide UE8M0 groups over the all-FP8 512-wide K).
+        32-wide UE8M0 groups over the all-FP8 512-wide K) with footer-scale
+        pages (``page_size * 512`` data bytes, then ``page_size * 16`` scale
+        bytes). ``"ue8m0_g32_inline"`` selects DSV4_1_INLINE, the same
+        geometry and scales on inline-scale records, FlashMLA's V4.1 ABI as of
+        its 2026.09.30 release: each token's 512 data bytes are followed by its
+        own 16 scale bytes (a V41_FP4 extra cache likewise holds 256 data bytes
+        then 32 scale bytes per token). Inline records are rows of the whole
+        cache: each cache's rows sit at a uniform row pitch (the token-axis
+        stride, or the page stride of one-row pages such as ``[num_rows,
+        528]``), a 16-byte multiple of at least the record size, the page
+        stride is a whole number of rows, and the main and extra indices
+        address row ``page * (page_stride // row_pitch) + slot`` (the paged
+        slot ID when pages carry no padding).
     topk_length : Optional[torch.Tensor]
         Effective top-k length per query token, shape ``[num_tokens]``, dtype
         int32. Required for sliding-window MLA near sequence start; ``None``
@@ -773,13 +795,16 @@ def _sparse_mla_sm120_paged_attention(
         raise ValueError("extra_kv_cache and extra_indices must be provided together")
     if extra_kv_cache is None and extra_topk_length is not None:
         raise ValueError("extra_topk_length requires extra_kv_cache and extra_indices")
+    from ._execution import check_inline_scale_caches
+
+    check_inline_scale_caches(kv_scale_format, kv_cache, extra_kv_cache, extra_fp4)
     model_type = _resolve_model_type(q.shape[-1], kv_scale_format)
     _require_d_v(d_v, model_type)
     _check_last_dim(output, "output", model_type)
-    if extra_fp4 and model_type != _MODEL_TYPE_DSV4_1:
+    if extra_fp4 and model_type not in _DSV4_1_MODEL_TYPES:
         raise ValueError(
             "extra_fp4 (V41_FP4 extra cache) requires a DSV4_1 main cache "
-            '(kv_scale_format="ue8m0_g32")'
+            '(kv_scale_format="ue8m0_g32" or "ue8m0_g32_inline")'
         )
 
     impl = get_sparse_mla_sm120_module()
@@ -841,7 +866,19 @@ class _SparseMLAPagedAttentionRunner:
         GLM-style arbitrary FP32 inline scales (GLM_NSA at ``d_qk=576``,
         GLM53_NOPE at ``d_qk=512``); ``"auto"`` at ``d_qk=512`` selects
         DSV4; ``"ue8m0_g32"`` at ``d_qk=512`` selects DSV4_1 (DeepSeek-V4.1:
-        32-wide UE8M0 groups over the all-FP8 512-wide K).
+        32-wide UE8M0 groups over the all-FP8 512-wide K) with footer-scale
+        pages (``page_size * 512`` data bytes, then ``page_size * 16`` scale
+        bytes). ``"ue8m0_g32_inline"`` selects DSV4_1_INLINE, the same
+        geometry and scales on inline-scale records, FlashMLA's V4.1 ABI as of
+        its 2026.09.30 release: each token's 512 data bytes are followed by its
+        own 16 scale bytes (a V41_FP4 extra cache likewise holds 256 data bytes
+        then 32 scale bytes per token). Inline records are rows of the whole
+        cache: each cache's rows sit at a uniform row pitch (the token-axis
+        stride, or the page stride of one-row pages such as ``[num_rows,
+        528]``), a 16-byte multiple of at least the record size, the page
+        stride is a whole number of rows, and the main and extra indices
+        address row ``page * (page_stride // row_pitch) + slot`` (the paged
+        slot ID when pages carry no padding).
     kv_cache_format : {"fp8", "nvfp4"}
         Packed cache format. Both formats reuse this wrapper and its ``run``
         signature; each format keeps its own planner and internal kernels.
@@ -938,12 +975,14 @@ class _SparseMLAPagedAttentionRunner:
         # d_v is validated against the compiled format table on the first
         # plan/run; construction stays free of JIT module loading.
         self._kv_scale_format = _normalize_kv_scale_format(kv_scale_format)
+        dsv41_scale_format, inline_scale = _split_inline_scale_format(
+            self._kv_scale_format
+        )
+        dsv41 = dsv41_scale_format == "ue8m0_g32"
         if compute_precision not in ("default", "fp8", "bf16", "nvfp4"):
             raise ValueError("compute_precision must be default, fp8, bf16, or nvfp4")
         if compute_precision in ("fp8", "bf16") and (
-            kv_cache_format != "fp8"
-            or self._kv_scale_format != "ue8m0_g32"
-            or d_v != 512
+            kv_cache_format != "fp8" or not dsv41 or d_v != 512
         ):
             raise ValueError(
                 "explicit FP8/BF16 compute_precision requires DSV4.1 FP8 storage (ue8m0_g32, d_v=512)"
@@ -967,20 +1006,25 @@ class _SparseMLAPagedAttentionRunner:
                     "when kv_cache_format='nvfp4'"
                 )
         self._kv_cache_format = kv_cache_format
-        if extra_kv_fp4 and (
-            kv_cache_format != "fp8" or self._kv_scale_format != "ue8m0_g32"
-        ):
+        if extra_kv_fp4 and (kv_cache_format != "fp8" or not dsv41):
             raise ValueError(
                 "extra_kv_fp4 (V41_FP4 extra cache) requires kv_cache_format='fp8' "
-                "and kv_scale_format='ue8m0_g32' (a DSV4_1 main cache)"
+                "and kv_scale_format='ue8m0_g32' or 'ue8m0_g32_inline' (a DSV4_1 "
+                "main cache)"
             )
         self._extra_kv_fp4 = extra_kv_fp4
         # backend="cake": the DSv4 NVFP4 route (kv_cache_format="nvfp4") or the DeepSeek-V4.1
         # mixed-cache route (kv_cache_format="fp8" + ue8m0_g32 + extra_kv_fp4), whose numerics
         # route is fixed here: "default" and "bf16" select the BF16 route (the only one exported).
         self._cake_compute_precision: Optional[str] = None
+        if backend == "cake" and inline_scale:
+            raise ValueError(
+                "backend='cake' reads the footer-scale DeepSeek-V4.1 caches only; "
+                "kv_scale_format='ue8m0_g32_inline' (inline-scale records) requires "
+                "backend='auto' or 'sparse'"
+            )
         if backend == "cake" and kv_cache_format == "fp8":
-            if self._kv_scale_format != "ue8m0_g32" or not extra_kv_fp4 or d_v != 512:
+            if not dsv41 or not extra_kv_fp4 or d_v != 512:
                 raise ValueError(
                     "backend='cake' with kv_cache_format='fp8' serves the DeepSeek-V4.1 "
                     "mixed cache only (528-byte FP8 main cache + 288-byte V41_FP4 extra "
@@ -1424,6 +1468,7 @@ def dsv41_fp4_quantize_pack_sparse_mla_cache(
     latent_kv: torch.Tensor,
     *,
     kv_layout: str = "HND",
+    inline_scale: bool = False,
 ) -> torch.Tensor:
     r"""Quantize complete DeepSeek-V4.1 latent-KV pages to the V41_FP4 ABI.
 
@@ -1437,6 +1482,12 @@ def dsv41_fp4_quantize_pack_sparse_mla_cache(
         scales (scale = amax/6), mirroring the FlashMLA V41_FP4 trajectory.
     kv_layout : str
         Output layout, either ``"HND"`` or ``"NHD"``.
+    inline_scale : bool
+        Write inline-scale records (FlashMLA's V4.1 ABI as of its 2026.09.30
+        release; ``kv_cache_format="fp8_dsv41_inline_fp4_ca"`` /
+        ``SparseMLASm120Wrapper(kv_scale_format="ue8m0_g32_inline")``) instead
+        of footer-scale pages: each token's 256 data bytes followed by its
+        own 32 scale bytes.
 
     Returns
     -------
@@ -1446,7 +1497,8 @@ def dsv41_fp4_quantize_pack_sparse_mla_cache(
         ``[num_pages, page_size, 1, 288]`` for NHD. Within each physical page
         it stores ``page_size * 256`` data bytes followed by
         ``page_size * 32`` scale bytes. Consumers must not interpret the last
-        dimension as a contiguous per-token record.
+        dimension as a contiguous per-token record. With ``inline_scale=True``
+        the last dimension is each token's contiguous 288-byte record instead.
     """
     if kv_layout not in ("HND", "NHD"):
         raise ValueError(f"kv_layout must be 'HND' or 'NHD', got {kv_layout!r}")
@@ -1478,7 +1530,7 @@ def dsv41_fp4_quantize_pack_sparse_mla_cache(
     if int(num_pages) == 0 or int(page_size) == 0:
         return cache
     get_sparse_mla_sm120_module().sparse_mla_sm120_dsv41_fp4_quantize_pack(
-        latent_kv, cache
+        latent_kv, cache, inline_scale
     )
     return cache
 
@@ -1489,6 +1541,8 @@ def dsv41_fp4_quantize_append_sparse_mla_cache(
     latent_kv: torch.Tensor,
     slot_mapping: torch.Tensor,
     cache: torch.Tensor,
+    *,
+    inline_scale: bool = False,
 ) -> None:
     r"""Quantize and append DeepSeek-V4.1 latent KV by physical cache slot.
 
@@ -1508,6 +1562,15 @@ def dsv41_fp4_quantize_append_sparse_mla_cache(
         Page-strided views may place the cache inside vLLM's packed physical
         block allocation. Only addressed data rows and scale slots are
         written, so prefill history is reused directly by decode.
+    inline_scale : bool
+        Write inline-scale records (FlashMLA's V4.1 ABI as of its 2026.09.30
+        release; ``kv_cache_format="fp8_dsv41_inline_fp4_ca"`` /
+        ``SparseMLASm120Wrapper(kv_scale_format="ue8m0_g32_inline")``) instead
+        of footer-scale pages: each token's 256 data bytes followed by its
+        own 32 scale bytes.
+        ``slot_mapping`` then addresses row ``page_id * (page_stride //
+        row_pitch) + entry_id`` of the cache's records, at the cache's row
+        pitch (a 16-byte multiple of at least 288 bytes).
     """
     if not slot_mapping.is_cuda:
         raise ValueError(
@@ -1524,8 +1587,10 @@ def dsv41_fp4_quantize_append_sparse_mla_cache(
         raise ValueError(
             "latent_kv, slot_mapping, and cache must be on the same device"
         )
+    if inline_scale:
+        _check_inline_scale_cache(cache, _DSV41_INLINE_FP4_ROW_BYTES, "cache")
     get_sparse_mla_sm120_module().sparse_mla_sm120_dsv41_fp4_quantize_append(
-        latent_kv, slot_mapping, cache
+        latent_kv, slot_mapping, cache, inline_scale
     )
 
 
@@ -1585,6 +1650,7 @@ def dsv41_fp8_quantize_pack_sparse_mla_cache(
     latent_kv: torch.Tensor,
     *,
     kv_layout: str = "HND",
+    inline_scale: bool = False,
 ) -> torch.Tensor:
     r"""Quantize complete DeepSeek-V4.1 latent-KV pages to the 528-byte DSV4_1 FP8 ABI.
 
@@ -1611,6 +1677,12 @@ def dsv41_fp8_quantize_pack_sparse_mla_cache(
         codes for the finite ones.
     kv_layout : str
         Output layout, either ``"HND"`` or ``"NHD"``.
+    inline_scale : bool
+        Write inline-scale records (FlashMLA's V4.1 ABI as of its 2026.09.30
+        release; ``kv_cache_format="fp8_dsv41_inline"`` /
+        ``SparseMLASm120Wrapper(kv_scale_format="ue8m0_g32_inline")``) instead
+        of footer-scale pages: each token's 512 data bytes followed by its
+        own 16 scale bytes.
 
     Returns
     -------
@@ -1620,7 +1692,9 @@ def dsv41_fp8_quantize_pack_sparse_mla_cache(
         ``[num_pages, page_size, 1, 528]`` for NHD. Within each physical page
         it stores ``page_size * 512`` E4M3 data bytes followed by
         ``page_size * 16`` UE8M0 scale bytes. Consumers must not interpret the
-        last dimension as a contiguous per-token record.
+        last dimension as a contiguous per-token record. With
+        ``inline_scale=True`` the last dimension is each token's contiguous
+        528-byte record instead.
     """
     from ._execution import format_info
 
@@ -1632,7 +1706,7 @@ def dsv41_fp8_quantize_pack_sparse_mla_cache(
     if num_pages == 0 or page_size == 0:
         return cache
     get_sparse_mla_sm120_module().sparse_mla_sm120_dsv41_fp8_quantize_pack(
-        latent_kv, cache
+        latent_kv, cache, inline_scale
     )
     return cache
 
@@ -1643,6 +1717,8 @@ def dsv41_fp8_quantize_append_sparse_mla_cache(
     latent_kv: torch.Tensor,
     slot_mapping: torch.Tensor,
     cache: torch.Tensor,
+    *,
+    inline_scale: bool = False,
 ) -> None:
     r"""Quantize and append DeepSeek-V4.1 latent KV by physical slot into a 528-byte FP8 cache.
 
@@ -1665,8 +1741,19 @@ def dsv41_fp8_quantize_append_sparse_mla_cache(
         and scale slots are written, so prefill history is reused directly by
         decode. The conversion is the one documented for
         :func:`dsv41_fp8_quantize_pack_sparse_mla_cache`.
+    inline_scale : bool
+        Write inline-scale records (FlashMLA's V4.1 ABI as of its 2026.09.30
+        release; ``kv_cache_format="fp8_dsv41_inline"`` /
+        ``SparseMLASm120Wrapper(kv_scale_format="ue8m0_g32_inline")``) instead
+        of footer-scale pages: each token's 512 data bytes followed by its
+        own 16 scale bytes.
+        ``slot_mapping`` then addresses row ``page_id * (page_stride //
+        row_pitch) + entry_id`` of the cache's records, at the cache's row
+        pitch (a 16-byte multiple of at least 528 bytes).
     """
     _check_dsv41_append_arguments(latent_kv, slot_mapping, cache)
+    if inline_scale:
+        _check_inline_scale_cache(cache, _DSV41_INLINE_ROW_BYTES, "cache")
     get_sparse_mla_sm120_module().sparse_mla_sm120_dsv41_fp8_quantize_append(
-        latent_kv, slot_mapping, cache
+        latent_kv, slot_mapping, cache, inline_scale
     )

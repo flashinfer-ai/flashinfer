@@ -1,17 +1,33 @@
 """JIT loader for the Cake-generated DeepSeek V4 sparse MLA kernels.
 
 Every variant is one device kernel plus its TVM-FFI launcher under
-``csrc/cake_dsv4/<arch>/`` (``common/`` when both architectures compile the same
-source). ``_ARCH_REGISTRATIONS`` is the per-architecture build and argument
+``csrc/cake_dsv4/<arch>/`` (``common/`` when both SM100 and SM103 compile the
+same source). SM107 (``sm_107a``) routes only the FP8 decode variants whose Cake
+programs build for it, each from its own ``sm_107a/`` sources, and has no NVFP4
+records. ``_ARCH_REGISTRATIONS`` is the per-architecture build and argument
 contract: the host (``flashinfer.mla.cake_dsv4``) binds every ``arg_plan`` entry
 by name and passes the launch grid, so a regenerated registration only needs
 names from the host vocabulary.
+
+The BF16 / FP8 programs are spelled as three literal tables, so a regenerated
+delivery rewrites the tables without touching the code that reads them:
+
+* ``ARG_PLANS``: plan name -> ``[kind, name]`` pairs in binding order, the launch
+  grid last.
+* ``MODULES``: program -> its ``sources`` (relative to ``csrc/cake_dsv4``), its
+  ``compile_flags``, the optional ``host_linkage_flags``, its ``arg_plan`` (an
+  ``ARG_PLANS`` name), the ``arches`` that compile it and its ``identity`` per
+  architecture (the digest that names the JIT module).
+* ``VARIANTS``: architecture -> variant key -> program.
+
+``_ARCH_REGISTRATIONS`` is built from those tables and the NVFP4 records.
 """
 
 from __future__ import annotations
 
 import functools
 from pathlib import Path
+from typing import Any
 
 from . import env as jit_env
 from .core import (
@@ -20,374 +36,19 @@ from .core import (
     logger,
     sm100a_nvcc_flags,
     sm103a_nvcc_flags,
+    sm107a_nvcc_flags,
 )
 from .cpp_ext import get_cuda_version, is_cuda_version_at_least
 
 
-_ARCH_NVCC_FLAGS = {"sm_100a": sm100a_nvcc_flags, "sm_103a": sm103a_nvcc_flags}
+_ARCH_NVCC_FLAGS = {
+    "sm_100a": sm100a_nvcc_flags,
+    "sm_103a": sm103a_nvcc_flags,
+    "sm_107a": sm107a_nvcc_flags,
+}
 
-# Argument plans shared by the generated launchers: (kind, name) in binding order,
-# followed by the launch grid. ``_SLAB`` marks the SM103 bindings that read their
-# TMA descriptors from the caller-owned workspace slab.
+# The launch grid that ends every argument plan.
 _GRID = (("grid", "grid_x"), ("grid", "grid_y"), ("grid", "grid_z"))
-_SLAB = (("workspace", "tma_descriptor_workspace"),)
-
-_PLAN_BF16_H128_PERSISTENT_QLAYOUT = (
-    ("tma_buffer", "tmap_q"),
-    ("tma_buffer", "tmap_swa_k"),
-    ("tma_buffer", "tmap_compressed_k"),
-    ("tma_buffer", "tmap_swa_v"),
-    ("tma_buffer", "tmap_compressed_v"),
-    ("buffer", "O"),
-    ("buffer", "partial_lse"),
-    ("buffer", "swa_indices"),
-    ("buffer", "compressed_indices"),
-    ("buffer", "sparse_topk_lens"),
-    ("buffer", "seq_lens"),
-    ("buffer", "cum_seq_lens_q"),
-    ("buffer", "sinks"),
-    ("buffer", "bmm1_scale"),
-    ("buffer", "bmm2_scale"),
-    ("parameter", "num_heads"),
-    ("parameter", "num_query_tokens"),
-    ("parameter", "swa_index_stride"),
-    ("parameter", "compressed_index_stride"),
-    ("parameter", "sparse_topk_lens_offset"),
-    ("parameter", "sparse_topk"),
-    ("parameter", "has_sinks"),
-    ("parameter", "total_work_items"),
-    ("parameter", "ragged_query"),
-    ("parameter", "max_q_len"),
-    ("parameter", "batch_size"),
-)
-
-_PLAN_BF16_H128_PERSISTENT_TMA_O_QLAYOUT = (
-    ("tma_buffer", "tmap_q"),
-    ("tma_buffer", "tmap_swa_k"),
-    ("tma_buffer", "tmap_compressed_k"),
-    ("tma_buffer", "tmap_swa_v"),
-    ("tma_buffer", "tmap_compressed_v"),
-    ("tma_buffer", "O"),
-    ("buffer", "partial_lse"),
-    ("buffer", "swa_indices"),
-    ("buffer", "compressed_indices"),
-    ("buffer", "sparse_topk_lens"),
-    ("buffer", "seq_lens"),
-    ("buffer", "cum_seq_lens_q"),
-    ("buffer", "sinks"),
-    ("buffer", "bmm1_scale"),
-    ("buffer", "bmm2_scale"),
-    ("parameter", "num_heads"),
-    ("parameter", "num_query_tokens"),
-    ("parameter", "swa_index_stride"),
-    ("parameter", "compressed_index_stride"),
-    ("parameter", "sparse_topk_lens_offset"),
-    ("parameter", "sparse_topk"),
-    ("parameter", "has_sinks"),
-    ("parameter", "total_work_items"),
-    ("parameter", "ragged_query"),
-    ("parameter", "max_q_len"),
-    ("parameter", "batch_size"),
-)
-
-_PLAN_BF16_H128_SWA_QLAYOUT = (
-    ("tma_buffer", "tmap_q"),
-    ("tma_buffer", "tmap_swa_kv"),
-    ("buffer", "O"),
-    ("buffer", "swa_indices"),
-    ("buffer", "compressed_indices"),
-    ("buffer", "sparse_topk_lens"),
-    ("buffer", "seq_lens"),
-    ("buffer", "cum_seq_lens_q"),
-    ("buffer", "sinks"),
-    ("buffer", "bmm1_scale"),
-    ("buffer", "bmm2_scale"),
-    ("parameter", "num_heads"),
-    ("parameter", "swa_index_stride"),
-    ("parameter", "compressed_index_stride"),
-    ("parameter", "sparse_topk_lens_offset"),
-    ("parameter", "sparse_topk"),
-    ("parameter", "num_head_tiles"),
-    ("parameter", "has_sinks"),
-    ("parameter", "ragged_query"),
-    ("parameter", "max_q_len"),
-    ("parameter", "batch_size"),
-)
-
-_PLAN_BF16_H32_MERGE_QLAYOUT = (
-    ("tma_buffer", "tmap_q"),
-    ("tma_buffer", "tmap_swa_kv"),
-    ("tma_buffer", "tmap_compressed_kv"),
-    ("buffer", "partial_O"),
-    ("buffer", "partial_lse"),
-    ("buffer", "O"),
-    ("buffer", "partition_arrivals"),
-    ("buffer", "swa_indices"),
-    ("buffer", "compressed_indices"),
-    ("buffer", "sparse_topk_lens"),
-    ("buffer", "seq_lens"),
-    ("buffer", "cum_seq_lens_q"),
-    ("buffer", "sinks"),
-    ("buffer", "bmm1_scale"),
-    ("buffer", "bmm2_scale"),
-    ("parameter", "num_heads"),
-    ("parameter", "swa_index_stride"),
-    ("parameter", "compressed_index_stride"),
-    ("parameter", "sparse_topk_lens_offset"),
-    ("parameter", "sparse_topk"),
-    ("parameter", "num_splits"),
-    ("parameter", "num_head_tiles"),
-    ("parameter", "has_sinks"),
-    ("parameter", "ragged_query"),
-    ("parameter", "max_q_len"),
-    ("parameter", "batch_size"),
-)
-
-_PLAN_BF16_H64_GUARD_TMA_O = (
-    ("tma_buffer", "tmap_q"),
-    ("tma_buffer", "tmap_swa_kv"),
-    ("tma_buffer", "tmap_compressed_kv"),
-    ("tma_buffer", "O"),
-    ("buffer", "swa_indices"),
-    ("buffer", "compressed_indices"),
-    ("buffer", "sparse_topk_lens"),
-    ("buffer", "seq_lens"),
-    ("buffer", "cum_seq_lens_q"),
-    ("buffer", "sinks"),
-    ("buffer", "bmm1_scale"),
-    ("buffer", "bmm2_scale"),
-    ("parameter", "num_heads"),
-    ("parameter", "swa_index_stride"),
-    ("parameter", "compressed_index_stride"),
-    ("parameter", "sparse_topk_lens_offset"),
-    ("parameter", "sparse_topk"),
-    ("parameter", "batch_size"),
-    ("parameter", "max_q_len"),
-    ("parameter", "ragged_query"),
-    ("parameter", "has_sinks"),
-)
-
-_PLAN_BF16_H64_PREFILL_QLAYOUT = (
-    ("tma_buffer", "tmap_q"),
-    ("tma_buffer", "tmap_swa_kv"),
-    ("tma_buffer", "tmap_compressed_kv"),
-    ("buffer", "O"),
-    ("buffer", "swa_indices"),
-    ("buffer", "compressed_indices"),
-    ("buffer", "sparse_topk_lens"),
-    ("buffer", "seq_lens"),
-    ("buffer", "cum_seq_lens_q"),
-    ("buffer", "sinks"),
-    ("buffer", "bmm1_scale"),
-    ("buffer", "bmm2_scale"),
-    ("parameter", "num_heads"),
-    ("parameter", "swa_index_stride"),
-    ("parameter", "compressed_index_stride"),
-    ("parameter", "sparse_topk_lens_offset"),
-    ("parameter", "sparse_topk"),
-    ("parameter", "num_query_tokens"),
-    ("parameter", "has_sinks"),
-    ("parameter", "ragged_query"),
-    ("parameter", "max_q_len"),
-    ("parameter", "batch_size"),
-)
-
-_PLAN_BF16_H64_SPLIT_QLAYOUT = (
-    ("tma_buffer", "tmap_q"),
-    ("tma_buffer", "tmap_swa_kv"),
-    ("tma_buffer", "tmap_compressed_kv"),
-    ("buffer", "partial_O"),
-    ("buffer", "partial_lse"),
-    ("buffer", "swa_indices"),
-    ("buffer", "compressed_indices"),
-    ("buffer", "sparse_topk_lens"),
-    ("buffer", "seq_lens"),
-    ("buffer", "cum_seq_lens_q"),
-    ("buffer", "sinks"),
-    ("buffer", "bmm1_scale"),
-    ("buffer", "bmm2_scale"),
-    ("parameter", "num_heads"),
-    ("parameter", "swa_index_stride"),
-    ("parameter", "compressed_index_stride"),
-    ("parameter", "sparse_topk_lens_offset"),
-    ("parameter", "sparse_topk"),
-    ("parameter", "num_splits"),
-    ("parameter", "has_sinks"),
-    ("parameter", "ragged_query"),
-    ("parameter", "max_q_len"),
-    ("parameter", "batch_size"),
-)
-
-_PLAN_BF16_SWA_DECODE_QLAYOUT = (
-    ("tma_buffer", "tmap_q"),
-    ("tma_buffer", "tmap_swa_kv"),
-    ("buffer", "O"),
-    ("buffer", "swa_indices"),
-    ("buffer", "compressed_indices"),
-    ("buffer", "sparse_topk_lens"),
-    ("buffer", "seq_lens"),
-    ("buffer", "cum_seq_lens_q"),
-    ("buffer", "sinks"),
-    ("buffer", "bmm1_scale"),
-    ("buffer", "bmm2_scale"),
-    ("parameter", "num_heads"),
-    ("parameter", "swa_index_stride"),
-    ("parameter", "compressed_index_stride"),
-    ("parameter", "sparse_topk_lens_offset"),
-    ("parameter", "sparse_topk"),
-    ("parameter", "has_sinks"),
-    ("parameter", "ragged_query"),
-    ("parameter", "max_q_len"),
-    ("parameter", "batch_size"),
-)
-
-_PLAN_FP8_H64_M64_SWA_K_QLAYOUT = (
-    ("tma_buffer", "tmap_q"),
-    ("tma_buffer", "tmap_swa_kv"),
-    ("tma_buffer", "tmap_compressed_kv"),
-    ("tma_buffer", "tmap_swa_k"),
-    ("buffer", "O"),
-    ("buffer", "partial_lse"),
-    ("buffer", "swa_indices"),
-    ("buffer", "compressed_indices"),
-    ("buffer", "sparse_topk_lens"),
-    ("buffer", "seq_lens"),
-    ("buffer", "cum_seq_lens_q"),
-    ("buffer", "sinks"),
-    ("buffer", "bmm1_scale"),
-    ("buffer", "bmm2_scale"),
-    ("parameter", "num_heads"),
-    ("parameter", "swa_index_stride"),
-    ("parameter", "compressed_index_stride"),
-    ("parameter", "sparse_topk_lens_offset"),
-    ("parameter", "num_query_tokens"),
-    ("parameter", "sparse_topk"),
-    ("parameter", "has_sinks"),
-    ("parameter", "total_work_items"),
-    ("parameter", "ragged_query"),
-    ("parameter", "max_q_len"),
-    ("parameter", "batch_size"),
-)
-
-_PLAN_FP8_H64_SOURCE_EXACT_QLAYOUT = (
-    ("tma_buffer", "tmap_q"),
-    ("tma_buffer", "tmap_swa_kv"),
-    ("tma_buffer", "tmap_compressed_kv"),
-    ("buffer", "O"),
-    ("buffer", "cum_seq_lens_q"),
-    ("buffer", "seq_lens"),
-    ("buffer", "swa_indices"),
-    ("buffer", "compressed_indices"),
-    ("buffer", "sparse_topk_lens"),
-    ("buffer", "sinks"),
-    ("buffer", "bmm1_scale"),
-    ("buffer", "bmm2_scale"),
-    ("parameter", "num_heads"),
-    ("parameter", "swa_index_stride"),
-    ("parameter", "compressed_index_stride"),
-    ("parameter", "sparse_topk_lens_offset"),
-    ("parameter", "sparse_topk"),
-    ("parameter", "ragged_query"),
-    ("parameter", "max_q_len"),
-    ("parameter", "batch_size"),
-    ("parameter", "has_sinks"),
-    ("parameter", "total_work_items"),
-)
-
-_PLAN_FP8_LOWHEAD_QLAYOUT = (
-    ("tma_buffer", "tmap_q"),
-    ("tma_buffer", "tmap_swa_kv"),
-    ("tma_buffer", "tmap_compressed_kv"),
-    ("buffer", "O"),
-    ("buffer", "partial_lse"),
-    ("buffer", "swa_indices"),
-    ("buffer", "compressed_indices"),
-    ("buffer", "sparse_topk_lens"),
-    ("buffer", "sinks"),
-    ("buffer", "bmm1_scale"),
-    ("buffer", "bmm2_scale"),
-    ("parameter", "num_heads"),
-    ("parameter", "swa_index_stride"),
-    ("parameter", "compressed_index_stride"),
-    ("parameter", "sparse_topk_lens_offset"),
-    ("parameter", "num_query_tokens"),
-    ("parameter", "sparse_topk"),
-    ("parameter", "has_sinks"),
-    ("parameter", "total_work_items"),
-    ("buffer", "seq_lens"),
-    ("buffer", "cum_seq_lens_q"),
-    ("parameter", "ragged_query"),
-    ("parameter", "max_q_len"),
-    ("parameter", "batch_size"),
-)
-
-_PLAN_FP8_PERSISTENT_QLAYOUT = (
-    ("tma_buffer", "tmap_q"),
-    ("tma_buffer", "tmap_swa_kv"),
-    ("tma_buffer", "tmap_compressed_kv"),
-    ("tma_buffer", "tmap_o"),
-    ("buffer", "O"),
-    ("buffer", "partial_lse"),
-    ("buffer", "swa_indices"),
-    ("buffer", "compressed_indices"),
-    ("buffer", "sparse_topk_lens"),
-    ("buffer", "seq_lens"),
-    ("buffer", "cum_seq_lens_q"),
-    ("buffer", "sinks"),
-    ("buffer", "bmm1_scale"),
-    ("buffer", "bmm2_scale"),
-    ("parameter", "num_heads"),
-    ("parameter", "swa_index_stride"),
-    ("parameter", "compressed_index_stride"),
-    ("parameter", "sparse_topk_lens_offset"),
-    ("parameter", "num_query_tokens"),
-    ("parameter", "sparse_topk"),
-    ("parameter", "has_sinks"),
-    ("parameter", "total_work_items"),
-    ("parameter", "ragged_query"),
-    ("parameter", "max_q_len"),
-    ("parameter", "batch_size"),
-)
-
-_PLAN_H64_REDUCE = (
-    ("buffer", "partial_O"),
-    ("buffer", "partial_lse"),
-    ("buffer", "O"),
-    ("parameter", "num_heads"),
-    ("parameter", "num_splits"),
-)
-
-_PLAN_H8_H16_SOURCE_EXACT_TOKENS_QLAYOUT = (
-    ("tma_buffer", "tmap_q"),
-    ("tma_buffer", "tmap_swa_kv"),
-    ("tma_buffer", "tmap_compressed_kv"),
-    ("buffer", "O"),
-    ("buffer", "swa_indices"),
-    ("buffer", "compressed_indices"),
-    ("buffer", "sparse_topk_lens"),
-    ("buffer", "seq_lens"),
-    ("buffer", "cum_seq_lens_q"),
-    ("buffer", "sinks"),
-    ("buffer", "bmm1_scale"),
-    ("buffer", "bmm2_scale"),
-    ("parameter", "swa_index_stride"),
-    ("parameter", "compressed_index_stride"),
-    ("parameter", "sparse_topk_lens_offset"),
-    ("parameter", "sparse_topk"),
-    ("parameter", "ragged_query"),
-    ("parameter", "max_q_len"),
-    ("parameter", "batch_size"),
-    ("parameter", "has_sinks"),
-    ("parameter", "num_query_tokens"),
-)
-
-_PLAN_SPLIT_REDUCE = (
-    ("buffer", "partial_O"),
-    ("buffer", "partial_lse"),
-    ("buffer", "O"),
-    ("parameter", "num_q_heads"),
-    ("parameter", "num_split"),
-)
 
 # Populated by the generated-program integration from the resolved bundle; one
 # record per variant and architecture.
@@ -517,971 +178,1309 @@ _PLAN_NVFP4_TILE = (
     ("parameter", "lse_scale"),
 )
 
-_ARCH_REGISTRATIONS = {
+# The templated members take their retrace knobs as launch arguments after the
+# kernel parameters: the launcher switches over the explicit instantiations of its
+# kernel unit by (tile_n, o_chunks).
+_PLAN_NVFP4_SWAP = _PLAN_NVFP4_TILE + (
+    ("parameter", "tile_n"),
+    ("parameter", "o_chunks"),
+)
+_PLAN_NVFP4_TILE_OC = _PLAN_NVFP4_TILE + (("parameter", "o_chunks"),)
+_PLAN_NVFP4_PV = _PLAN_NVFP4_G4 + (("parameter", "tile_n"),)
+
+# NVFP4 decode family: one record per member, shared by both architectures (their
+# registrations differ only in the identity that names the JIT module). The templated
+# members (pv, swap, tile, tile_h64) compile their kernel unit once with every explicit
+# instantiation and take the retrace knobs (tile_n, o_chunks) as launch arguments.
+_NVFP4_RECORDS = {
+    "nvfp4_decode_cluster": {
+        "arg_plan": _PLAN_NVFP4_DECODE + _GRID,
+        "sources": [
+            "common/cake_dsv4_nvfp4_decode_cluster_kernel.cu",
+            "common/cake_dsv4_nvfp4_decode_cluster_binding.cu",
+        ],
+    },
+    "nvfp4_decode_persistent": {
+        "arg_plan": _PLAN_NVFP4_DECODE + _GRID,
+        "sources": [
+            "common/cake_dsv4_nvfp4_decode_persistent_kernel.cu",
+            "common/cake_dsv4_nvfp4_decode_persistent_binding.cu",
+        ],
+    },
+    "nvfp4_decode_pv": {
+        "arg_plan": _PLAN_NVFP4_PV + _GRID,
+        "sources": [
+            "common/cake_dsv4_nvfp4_decode_pv_kernel.cu",
+            "common/cake_dsv4_nvfp4_decode_pv_binding.cu",
+        ],
+    },
+    "nvfp4_decode_swap": {
+        "arg_plan": _PLAN_NVFP4_SWAP + _GRID,
+        "sources": [
+            "common/cake_dsv4_nvfp4_decode_swap_kernel.cu",
+            "common/cake_dsv4_nvfp4_decode_swap_binding.cu",
+        ],
+    },
+    "nvfp4_decode_t64_n64_oc1": {
+        "arg_plan": _PLAN_NVFP4_G4 + _GRID,
+        "sources": [
+            "common/cake_dsv4_nvfp4_decode_t64_n64_oc1_kernel.cu",
+            "common/cake_dsv4_nvfp4_decode_t64_n64_oc1_binding.cu",
+        ],
+    },
+    "nvfp4_decode_tile": {
+        "arg_plan": _PLAN_NVFP4_TILE_OC + _GRID,
+        "sources": [
+            "common/cake_dsv4_nvfp4_decode_tile_kernel.cu",
+            "common/cake_dsv4_nvfp4_decode_tile_binding.cu",
+        ],
+    },
+    "nvfp4_decode_tile_h64": {
+        "arg_plan": _PLAN_NVFP4_TILE_OC + _GRID,
+        "sources": [
+            "common/cake_dsv4_nvfp4_decode_tile_h64_kernel.cu",
+            "common/cake_dsv4_nvfp4_decode_tile_h64_binding.cu",
+        ],
+    },
+    "nvfp4_merge": {
+        "arg_plan": _PLAN_NVFP4_MERGE + _GRID,
+        "sources": [
+            "common/cake_dsv4_nvfp4_merge_kernel.cu",
+            "common/cake_dsv4_nvfp4_merge_binding.cu",
+        ],
+    },
+}
+_NVFP4_IDENTITIES = {
     "sm_100a": {
-        "variants": {
-            "bf16_h128_prefill_v42": {
-                "arg_plan": _PLAN_BF16_H128_PERSISTENT_QLAYOUT + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "host_linkage_flags": ["--device-entity-has-hidden-visibility=false"],
-                "identity": "5a316b6230275e2de9bdd1fb6942fa1e2df455095204959abc055473b5ec5f82",
-                "sources": [
-                    "sm_100a/cake_dsv4_860a0ac41a77c1305873_kernel.cu",
-                    "sm_100a/cake_dsv4_860a0ac41a77c1305873_binding.cu",
-                ],
-            },
-            "bf16_h128_prefill_v42_snake": {
-                "arg_plan": _PLAN_BF16_H128_PERSISTENT_QLAYOUT + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "host_linkage_flags": ["--device-entity-has-hidden-visibility=false"],
-                "identity": "6a99296cd5d6c0de80d3820b2d31776d197b9beb4b7cb0b592b848f5fd66494d",
-                "sources": [
-                    "sm_100a/cake_dsv4_8a33d6688c16c25820e9_kernel.cu",
-                    "sm_100a/cake_dsv4_8a33d6688c16c25820e9_binding.cu",
-                ],
-            },
-            "bf16_h128_split5_reduce": {
-                "arg_plan": _PLAN_SPLIT_REDUCE + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "host_linkage_flags": ["--device-entity-has-hidden-visibility=false"],
-                "identity": "8b3a94fe8503fea96ba4cd20291bbb468c2de50e49015baf0ce68fa076730ba1",
-                "sources": [
-                    "sm_100a/cake_dsv4_e1c7ffd7ad7de34b2096_kernel.cu",
-                    "sm_100a/cake_dsv4_e1c7ffd7ad7de34b2096_binding.cu",
-                ],
-            },
-            "bf16_h128_swa128": {
-                "arg_plan": _PLAN_BF16_H128_SWA_QLAYOUT + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "identity": "aeda09841fac016a4b05a94e6fedd25e37223cb96c786996bc82cc02ded2cb99",
-                "sources": [
-                    "sm_100a/cake_dsv4_7abc1b8f5f3d1d936f1a_kernel.cu",
-                    "sm_100a/cake_dsv4_7abc1b8f5f3d1d936f1a_binding.cu",
-                ],
-            },
-            "bf16_h128_topk128x_row_first": {
-                "arg_plan": _PLAN_BF16_H128_PERSISTENT_QLAYOUT + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "host_linkage_flags": ["--device-entity-has-hidden-visibility=false"],
-                "identity": "01fed2d55eeb0a186ef47e63614c15ea4234feb50b7a810a114f9e29106efb29",
-                "sources": [
-                    "sm_100a/cake_dsv4_71e0baa44c61b948d82c_kernel.cu",
-                    "sm_100a/cake_dsv4_71e0baa44c61b948d82c_binding.cu",
-                ],
-            },
-            "bf16_h128_topk128x_row_first_vsplit": {
-                "arg_plan": _PLAN_BF16_H128_PERSISTENT_QLAYOUT + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "host_linkage_flags": ["--device-entity-has-hidden-visibility=false"],
-                "identity": "fc2edc102a92ac9b47d1ff994dc58a799067deff591ff1ebac8fb77e986db2c4",
-                "sources": [
-                    "sm_100a/cake_dsv4_3af1afa1871d27324303_kernel.cu",
-                    "sm_100a/cake_dsv4_3af1afa1871d27324303_binding.cu",
-                ],
-            },
-            "bf16_h128_topk128x_split4_sm100": {
-                "arg_plan": _PLAN_BF16_H128_PERSISTENT_TMA_O_QLAYOUT + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "host_linkage_flags": ["--device-entity-has-hidden-visibility=false"],
-                "identity": "3ab6b7f0731df770732005f8d1bb4d5db16dacf7f01f8151dc9ace2a2f8d1c04",
-                "sources": [
-                    "sm_100a/cake_dsv4_fc73aade5a5f4f85a9e8_kernel.cu",
-                    "sm_100a/cake_dsv4_fc73aade5a5f4f85a9e8_binding.cu",
-                ],
-            },
-            "bf16_h128_topk4x_v52": {
-                "arg_plan": _PLAN_BF16_H128_PERSISTENT_TMA_O_QLAYOUT + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "host_linkage_flags": ["--device-entity-has-hidden-visibility=false"],
-                "identity": "2ccbcccc20cb009f822bf93b5353a81212116bc4aceb0cd4276975a351b319cf",
-                "sources": [
-                    "sm_100a/cake_dsv4_1b4dfa2ab26fc784f640_kernel.cu",
-                    "sm_100a/cake_dsv4_1b4dfa2ab26fc784f640_binding.cu",
-                ],
-            },
-            "bf16_h16_h32_swa128_v44": {
-                "arg_plan": _PLAN_BF16_SWA_DECODE_QLAYOUT + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "identity": "dc9b763a2a0f2197c6f1b00665d178bb6fa4a8a9c2309ec79eacff6b54861d93",
-                "sources": [
-                    "sm_100a/cake_dsv4_61008e64c0c3bd2e1a83_kernel.cu",
-                    "sm_100a/cake_dsv4_61008e64c0c3bd2e1a83_binding.cu",
-                ],
-            },
-            "bf16_h32_topk128x_early_v47": {
-                "arg_plan": _PLAN_BF16_H32_MERGE_QLAYOUT + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "identity": "bbabb2d7088e38e96def36ccea32d82c3f7f907f310caaae66086f6dc38fefd3",
-                "sources": [
-                    "sm_100a/cake_dsv4_c9156a2e9f65117a0900_kernel.cu",
-                    "sm_100a/cake_dsv4_c9156a2e9f65117a0900_binding.cu",
-                ],
-            },
-            "bf16_h64_compressed_q8_v38": {
-                "arg_plan": _PLAN_BF16_H64_SPLIT_QLAYOUT + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "identity": "079202d3f54068e646d22c7a96309644fa48e69b02c993c82648881db4d99ddc",
-                "sources": [
-                    "sm_100a/cake_dsv4_58df983ae8026a009dab_kernel.cu",
-                    "sm_100a/cake_dsv4_58df983ae8026a009dab_binding.cu",
-                ],
-            },
-            "bf16_h64_compressed_reduce": {
-                "arg_plan": _PLAN_H64_REDUCE + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "identity": "bf037e2abd291d1fec2e2744bbcc6abf5913813885457ef971a1ed28827e1fd0",
-                "sources": [
-                    "sm_100a/cake_dsv4_efb864796f11291dc52c_kernel.cu",
-                    "sm_100a/cake_dsv4_efb864796f11291dc52c_binding.cu",
-                ],
-            },
-            "bf16_h64_guard_q_tma_batch_r25": {
-                "arg_plan": _PLAN_BF16_H64_GUARD_TMA_O + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "identity": "2835651b803b1e48bdea97a81e39851193af6679690b708e216c4708fa46d225",
-                "sources": [
-                    "sm_100a/cake_dsv4_cfa285ef8a408579ac99_kernel.cu",
-                    "sm_100a/cake_dsv4_cfa285ef8a408579ac99_binding.cu",
-                ],
-            },
-            "bf16_h64_prefill": {
-                "arg_plan": _PLAN_BF16_H64_PREFILL_QLAYOUT + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "identity": "6f79d07e8e964e23950fcd200a2338df83751a9faed8cebc0bffca61bb59d1be",
-                "sources": [
-                    "sm_100a/cake_dsv4_c85537d4ca6a34893cd1_kernel.cu",
-                    "sm_100a/cake_dsv4_c85537d4ca6a34893cd1_binding.cu",
-                ],
-            },
-            "bf16_h8_h16_source_exact": {
-                "arg_plan": _PLAN_H8_H16_SOURCE_EXACT_TOKENS_QLAYOUT + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "identity": "5890455023681306e8550ab87996577bab400dc0d8c05cf84239a5da9bbe04c1",
-                "sources": [
-                    "sm_100a/cake_dsv4_cc8f5e8152e47e5e566a_kernel.cu",
-                    "sm_100a/cake_dsv4_cc8f5e8152e47e5e566a_binding.cu",
-                ],
-            },
-            "bf16_h8_swa128_v43": {
-                "arg_plan": _PLAN_BF16_SWA_DECODE_QLAYOUT + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "identity": "5a5fdc876904c6efc1cc40a9675f7aa1eb2e7b3c422d3409405c2d385077ffaa",
-                "sources": [
-                    "sm_100a/cake_dsv4_e3b65d62b4db145adce7_kernel.cu",
-                    "sm_100a/cake_dsv4_e3b65d62b4db145adce7_binding.cu",
-                ],
-            },
-            "bf16_swa128_single_cta": {
-                "arg_plan": _PLAN_BF16_SWA_DECODE_QLAYOUT + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "identity": "99c036a5663cc25e85dfa86b1b3f7997f1901203bde0429c3a375c7a19864100",
-                "sources": [
-                    "sm_100a/cake_dsv4_2cebeb2f2243d69b2827_kernel.cu",
-                    "sm_100a/cake_dsv4_2cebeb2f2243d69b2827_binding.cu",
-                ],
-            },
-            "fp8_h128_prefill_source_persistent": {
-                "arg_plan": _PLAN_FP8_PERSISTENT_QLAYOUT + _GRID,
-                "compile_flags": [
-                    "--use_fast_math",
-                    "-Xptxas=--register-usage-level=10",
-                ],
-                "identity": "db6008ee35a7637151ec89c92e0ccab143ceb667dc09e48e459140887dd96395",
-                "sources": [
-                    "sm_100a/cake_dsv4_155cefce7e1900a952c3_kernel.cu",
-                    "sm_100a/cake_dsv4_155cefce7e1900a952c3_binding.cu",
-                ],
-            },
-            "fp8_h128_prefill_source_persistent_uniform": {
-                "arg_plan": _PLAN_FP8_PERSISTENT_QLAYOUT + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "identity": "a98964240d626054db869dee6297d460b53d0131777e9c3f1b8ce86690da8d35",
-                "sources": [
-                    "sm_100a/cake_dsv4_ca071620f07188f5ea22_kernel.cu",
-                    "sm_100a/cake_dsv4_ca071620f07188f5ea22_binding.cu",
-                ],
-            },
-            "fp8_h64_prefill_source_persistent_m64": {
-                "arg_plan": _PLAN_FP8_H64_M64_SWA_K_QLAYOUT + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "identity": "1f14b1c06f518922763964296e537e25904b5d359feb763936585b456539e5bf",
-                "sources": [
-                    "sm_100a/cake_dsv4_ee710a07143d70b73dc2_kernel.cu",
-                    "sm_100a/cake_dsv4_ee710a07143d70b73dc2_binding.cu",
-                ],
-            },
-            "fp8_h64_prefill_source_persistent_m64_multi_tile": {
-                "arg_plan": _PLAN_FP8_H64_M64_SWA_K_QLAYOUT + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "identity": "177daf891c826b472d4dfe1ea629e2707bb5c9c2842cc0598f196f4e257c96cc",
-                "sources": [
-                    "sm_100a/cake_dsv4_aa5800406f680b6ad9fc_kernel.cu",
-                    "sm_100a/cake_dsv4_aa5800406f680b6ad9fc_binding.cu",
-                ],
-            },
-            "fp8_h64_source_exact": {
-                "arg_plan": _PLAN_FP8_H64_SOURCE_EXACT_QLAYOUT + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "identity": "edc54d7de032e113d6777f120904e6cb5cc719ccdfa33bbc4a9d782b84c7309e",
-                "sources": [
-                    "sm_100a/cake_dsv4_d7c58d0212deccbcaf48_kernel.cu",
-                    "sm_100a/cake_dsv4_d7c58d0212deccbcaf48_binding.cu",
-                ],
-            },
-            "fp8_h8_h16_source_exact": {
-                "arg_plan": _PLAN_H8_H16_SOURCE_EXACT_TOKENS_QLAYOUT + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "identity": "c7244948bb13cfcf30f60287826cfe947d1842209d84c7f45dbd0da1539fa79d",
-                "sources": [
-                    "sm_100a/cake_dsv4_f98ac384c6e4f7fb86e4_kernel.cu",
-                    "sm_100a/cake_dsv4_f98ac384c6e4f7fb86e4_binding.cu",
-                ],
-            },
-            "fp8_lowhead_h64": {
-                "arg_plan": _PLAN_FP8_LOWHEAD_QLAYOUT + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "identity": "95cc9fb8932cc64983cd9473ea365daf3085b1a49519521b08fb76c7d3fadec6",
-                "sources": [
-                    "sm_100a/cake_dsv4_5d0c8e053e04ac001929_kernel.cu",
-                    "sm_100a/cake_dsv4_5d0c8e053e04ac001929_binding.cu",
-                ],
-            },
-            "fp8_lowhead_one_partition": {
-                "arg_plan": _PLAN_FP8_LOWHEAD_QLAYOUT + _GRID,
-                "compile_flags": [
-                    "--use_fast_math",
-                    "-Xptxas=--register-usage-level=10",
-                ],
-                "identity": "0d18f1c06d7edfd3da572053e9104be81d1f1a4f6a1ad40f39984ad450806410",
-                "sources": [
-                    "sm_100a/cake_dsv4_9c5822db6c2739c63dc1_kernel.cu",
-                    "sm_100a/cake_dsv4_9c5822db6c2739c63dc1_binding.cu",
-                ],
-            },
-            "fp8_lowhead_prefill": {
-                "arg_plan": _PLAN_FP8_LOWHEAD_QLAYOUT + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "identity": "c094cf8490fece7bca46372f12131e8a5013c98612849c9a5828a4c23321b7c1",
-                "sources": [
-                    "sm_100a/cake_dsv4_820670a92a2bf9dfb2b0_kernel.cu",
-                    "sm_100a/cake_dsv4_820670a92a2bf9dfb2b0_binding.cu",
-                ],
-            },
-            "nvfp4_decode_cluster": {
-                "arg_plan": _PLAN_NVFP4_DECODE + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "identity": "90fcb1d4fef96bd6530118ff3e4bff8557896974d8c9eef734b517858f74ed6b",
-                "min_cuda_version": "13.4",
-                "sources": [
-                    "common/cake_dsv4_nvfp4_decode_cluster_kernel.cu",
-                    "common/cake_dsv4_nvfp4_decode_cluster_binding.cu",
-                ],
-            },
-            "nvfp4_decode_persistent": {
-                "arg_plan": _PLAN_NVFP4_DECODE + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "identity": "56cff27e58b865c36ec815127729fed389174b2e82bc422054ae4372788afb71",
-                "min_cuda_version": "13.4",
-                "sources": [
-                    "common/cake_dsv4_nvfp4_decode_persistent_kernel.cu",
-                    "common/cake_dsv4_nvfp4_decode_persistent_binding.cu",
-                ],
-            },
-            "nvfp4_decode_pv_n16_oc1": {
-                "arg_plan": _PLAN_NVFP4_G4 + _GRID,
-                "compile_flags": [
-                    "--use_fast_math",
-                    "-DCAKE_DSV4_NVFP4_DECODE_PV_SELECT=1",
-                    "-DCAKE_DSV4_NVFP4_DECODE_PV_N16_OC1=1",
-                ],
-                "identity": "1ab6f68908e0ec65d3ecafc7a858be3ebd4edc29c783aa86310314afcb322ec8",
-                "min_cuda_version": "13.4",
-                "sources": [
-                    "common/cake_dsv4_nvfp4_decode_pv_kernel.cu",
-                    "common/cake_dsv4_nvfp4_decode_pv_n16_oc1_binding.cu",
-                ],
-            },
-            "nvfp4_decode_pv_n32_oc1": {
-                "arg_plan": _PLAN_NVFP4_G4 + _GRID,
-                "compile_flags": [
-                    "--use_fast_math",
-                    "-DCAKE_DSV4_NVFP4_DECODE_PV_SELECT=1",
-                    "-DCAKE_DSV4_NVFP4_DECODE_PV_N32_OC1=1",
-                ],
-                "identity": "05aac533eaa644eaef18abe2a70d2b6ba6786cea0f951c6387daaaf0b3c9d164",
-                "min_cuda_version": "13.4",
-                "sources": [
-                    "common/cake_dsv4_nvfp4_decode_pv_kernel.cu",
-                    "common/cake_dsv4_nvfp4_decode_pv_n32_oc1_binding.cu",
-                ],
-            },
-            "nvfp4_decode_swap_n16_oc1": {
-                "arg_plan": _PLAN_NVFP4_TILE + _GRID,
-                "compile_flags": [
-                    "--use_fast_math",
-                    "-DCAKE_DSV4_NVFP4_DECODE_SWAP_SELECT=1",
-                    "-DCAKE_DSV4_NVFP4_DECODE_SWAP_N16_OC1=1",
-                ],
-                "identity": "a826ee5e7616476f82726473f6c8aa62ae16a8df9aa336c138b23bde307185f6",
-                "min_cuda_version": "13.4",
-                "sources": [
-                    "common/cake_dsv4_nvfp4_decode_swap_kernel.cu",
-                    "common/cake_dsv4_nvfp4_decode_swap_n16_oc1_binding.cu",
-                ],
-            },
-            "nvfp4_decode_swap_n16_oc2": {
-                "arg_plan": _PLAN_NVFP4_TILE + _GRID,
-                "compile_flags": [
-                    "--use_fast_math",
-                    "-DCAKE_DSV4_NVFP4_DECODE_SWAP_SELECT=1",
-                    "-DCAKE_DSV4_NVFP4_DECODE_SWAP_N16_OC2=1",
-                ],
-                "identity": "320e783ebde4dccff0c692c4873a2a72eef43851034bbad4cd9d954968813865",
-                "min_cuda_version": "13.4",
-                "sources": [
-                    "common/cake_dsv4_nvfp4_decode_swap_kernel.cu",
-                    "common/cake_dsv4_nvfp4_decode_swap_n16_oc2_binding.cu",
-                ],
-            },
-            "nvfp4_decode_swap_n16_oc4": {
-                "arg_plan": _PLAN_NVFP4_TILE + _GRID,
-                "compile_flags": [
-                    "--use_fast_math",
-                    "-DCAKE_DSV4_NVFP4_DECODE_SWAP_SELECT=1",
-                    "-DCAKE_DSV4_NVFP4_DECODE_SWAP_N16_OC4=1",
-                ],
-                "identity": "65146b0ffd8417de0daea1c1eadb1cb656a9d51df57e7cf916e3ad6282814099",
-                "min_cuda_version": "13.4",
-                "sources": [
-                    "common/cake_dsv4_nvfp4_decode_swap_kernel.cu",
-                    "common/cake_dsv4_nvfp4_decode_swap_n16_oc4_binding.cu",
-                ],
-            },
-            "nvfp4_decode_swap_n32_oc1": {
-                "arg_plan": _PLAN_NVFP4_TILE + _GRID,
-                "compile_flags": [
-                    "--use_fast_math",
-                    "-DCAKE_DSV4_NVFP4_DECODE_SWAP_SELECT=1",
-                    "-DCAKE_DSV4_NVFP4_DECODE_SWAP_N32_OC1=1",
-                ],
-                "identity": "52d8d488ae988c41540b647555017665bc6a41755710104bbcb793371cabaa4c",
-                "min_cuda_version": "13.4",
-                "sources": [
-                    "common/cake_dsv4_nvfp4_decode_swap_kernel.cu",
-                    "common/cake_dsv4_nvfp4_decode_swap_n32_oc1_binding.cu",
-                ],
-            },
-            "nvfp4_decode_swap_n32_oc2": {
-                "arg_plan": _PLAN_NVFP4_TILE + _GRID,
-                "compile_flags": [
-                    "--use_fast_math",
-                    "-DCAKE_DSV4_NVFP4_DECODE_SWAP_SELECT=1",
-                    "-DCAKE_DSV4_NVFP4_DECODE_SWAP_N32_OC2=1",
-                ],
-                "identity": "743970168898bd8715fafbec926ca85851638f36fe98e06c3207159d33ddb965",
-                "min_cuda_version": "13.4",
-                "sources": [
-                    "common/cake_dsv4_nvfp4_decode_swap_kernel.cu",
-                    "common/cake_dsv4_nvfp4_decode_swap_n32_oc2_binding.cu",
-                ],
-            },
-            "nvfp4_decode_swap_n32_oc4": {
-                "arg_plan": _PLAN_NVFP4_TILE + _GRID,
-                "compile_flags": [
-                    "--use_fast_math",
-                    "-DCAKE_DSV4_NVFP4_DECODE_SWAP_SELECT=1",
-                    "-DCAKE_DSV4_NVFP4_DECODE_SWAP_N32_OC4=1",
-                ],
-                "identity": "f473d4c6e6558b9dd496a5434b2b0b379084e4aec88e848e94a7768cbe0877d4",
-                "min_cuda_version": "13.4",
-                "sources": [
-                    "common/cake_dsv4_nvfp4_decode_swap_kernel.cu",
-                    "common/cake_dsv4_nvfp4_decode_swap_n32_oc4_binding.cu",
-                ],
-            },
-            "nvfp4_decode_t64_n64_oc1": {
-                "arg_plan": _PLAN_NVFP4_G4 + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "identity": "112afaf2bf36df2d908dc52d8b5d4a0725b2d2269a271428569bd2f20ee9cc68",
-                "min_cuda_version": "13.4",
-                "sources": [
-                    "common/cake_dsv4_nvfp4_decode_t64_n64_oc1_kernel.cu",
-                    "common/cake_dsv4_nvfp4_decode_t64_n64_oc1_binding.cu",
-                ],
-            },
-            "nvfp4_decode_tile_h64_oc2": {
-                "arg_plan": _PLAN_NVFP4_TILE + _GRID,
-                "compile_flags": [
-                    "--use_fast_math",
-                    "-DCAKE_DSV4_NVFP4_DECODE_TILE_H64_SELECT=1",
-                    "-DCAKE_DSV4_NVFP4_DECODE_TILE_H64_OC2=1",
-                ],
-                "identity": "71f55cc5b1359e1779563bf6ae77c6a2394fbee75a0e64141530ea5555348fc7",
-                "min_cuda_version": "13.4",
-                "sources": [
-                    "common/cake_dsv4_nvfp4_decode_tile_h64_kernel.cu",
-                    "common/cake_dsv4_nvfp4_decode_tile_h64_oc2_binding.cu",
-                ],
-            },
-            "nvfp4_decode_tile_h64_oc4": {
-                "arg_plan": _PLAN_NVFP4_TILE + _GRID,
-                "compile_flags": [
-                    "--use_fast_math",
-                    "-DCAKE_DSV4_NVFP4_DECODE_TILE_H64_SELECT=1",
-                    "-DCAKE_DSV4_NVFP4_DECODE_TILE_H64_OC4=1",
-                ],
-                "identity": "4013e7af9db870f5258440007a656d4c1b48299ec9cf9f10902ef674cbfa7c51",
-                "min_cuda_version": "13.4",
-                "sources": [
-                    "common/cake_dsv4_nvfp4_decode_tile_h64_kernel.cu",
-                    "common/cake_dsv4_nvfp4_decode_tile_h64_oc4_binding.cu",
-                ],
-            },
-            "nvfp4_decode_tile_oc1": {
-                "arg_plan": _PLAN_NVFP4_TILE + _GRID,
-                "compile_flags": [
-                    "--use_fast_math",
-                    "-DCAKE_DSV4_NVFP4_DECODE_TILE_SELECT=1",
-                    "-DCAKE_DSV4_NVFP4_DECODE_TILE_OC1=1",
-                ],
-                "identity": "8977d2fc4c310f99eb1f8f12d8d5216c65dd6ed8e46892e7f8a9a2084d5f7f69",
-                "min_cuda_version": "13.4",
-                "sources": [
-                    "common/cake_dsv4_nvfp4_decode_tile_kernel.cu",
-                    "common/cake_dsv4_nvfp4_decode_tile_oc1_binding.cu",
-                ],
-            },
-            "nvfp4_decode_tile_oc2": {
-                "arg_plan": _PLAN_NVFP4_TILE + _GRID,
-                "compile_flags": [
-                    "--use_fast_math",
-                    "-DCAKE_DSV4_NVFP4_DECODE_TILE_SELECT=1",
-                    "-DCAKE_DSV4_NVFP4_DECODE_TILE_OC2=1",
-                ],
-                "identity": "4117d74c17266464cf1ad3caefde5a46bbe09629c788efbb0580765ce764bd22",
-                "min_cuda_version": "13.4",
-                "sources": [
-                    "common/cake_dsv4_nvfp4_decode_tile_kernel.cu",
-                    "common/cake_dsv4_nvfp4_decode_tile_oc2_binding.cu",
-                ],
-            },
-            "nvfp4_decode_tile_oc4": {
-                "arg_plan": _PLAN_NVFP4_TILE + _GRID,
-                "compile_flags": [
-                    "--use_fast_math",
-                    "-DCAKE_DSV4_NVFP4_DECODE_TILE_SELECT=1",
-                    "-DCAKE_DSV4_NVFP4_DECODE_TILE_OC4=1",
-                ],
-                "identity": "770269d570d69bc70b2a1235850ae4b9b31c8a1407ba58a62afeb100494f355f",
-                "min_cuda_version": "13.4",
-                "sources": [
-                    "common/cake_dsv4_nvfp4_decode_tile_kernel.cu",
-                    "common/cake_dsv4_nvfp4_decode_tile_oc4_binding.cu",
-                ],
-            },
-            "nvfp4_merge": {
-                "arg_plan": _PLAN_NVFP4_MERGE + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "identity": "3868c9d64707b2cd86ce99cb43ba8b68a6032a493b99e10f0fbd7d5d3063c5a8",
-                "min_cuda_version": "13.4",
-                "sources": [
-                    "common/cake_dsv4_nvfp4_merge_kernel.cu",
-                    "common/cake_dsv4_nvfp4_merge_binding.cu",
-                ],
-            },
-            "split_reduce": {
-                "arg_plan": _PLAN_SPLIT_REDUCE + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "host_linkage_flags": ["--device-entity-has-hidden-visibility=false"],
-                "identity": "7cea46afc483f21f79017268008dda3281422fde211450ab973bb3b59a32696e",
-                "sources": [
-                    "sm_100a/cake_dsv4_2b24cab15b398c9b420a_kernel.cu",
-                    "sm_100a/cake_dsv4_2b24cab15b398c9b420a_binding.cu",
-                ],
-            },
-        },
+        "nvfp4_decode_cluster": "2971d71708fd20d7a5abc26da66a0763e94d0ca5075207d2acb4d2448c433be7",
+        "nvfp4_decode_persistent": "3a9d813a27e4dc4836dedb132610f59e4a52b1699b7772714522fd97afc36b1b",
+        "nvfp4_decode_pv": "e9d03a609e9a79e8647463bea12b930419bf01c0254734a9cc98a9ae985df2ff",
+        "nvfp4_decode_swap": "fe90a8150f671f46ca1d26df290fe3e394252f123aab729f7a4a726b9548ef66",
+        "nvfp4_decode_t64_n64_oc1": "18e16a5c2120d5e03b025dc48ea8b9eed10c99e6243a932c50019a5f41be0b8b",
+        "nvfp4_decode_tile": "fd63f71fbe4f07219ae65174f962117f5bfa3a51eda8f21e0f1959ce18b07e01",
+        "nvfp4_decode_tile_h64": "86d495adf8b3bcbd4af9b3f855d95e3b05b3804590fa42b322474d5f034e01a3",
+        "nvfp4_merge": "0c4146f78e275850deedeaa5eecd9c6cfa790b7b62329e995d261b5b937881b7",
     },
     "sm_103a": {
-        "variants": {
-            "bf16_h128_prefill_v42": {
-                "arg_plan": _PLAN_BF16_H128_PERSISTENT_QLAYOUT + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "host_linkage_flags": ["--device-entity-has-hidden-visibility=false"],
-                "identity": "80d7ac59aa962080cc2d62000ab5f8561a9e04ac36949a24fb0ca177af2102fb",
-                "sources": [
-                    "sm_103a/cake_dsv4_06cdf778054cc6c67dc5_kernel.cu",
-                    "sm_103a/cake_dsv4_06cdf778054cc6c67dc5_binding.cu",
-                ],
-            },
-            "bf16_h128_prefill_v42_snake": {
-                "arg_plan": _PLAN_BF16_H128_PERSISTENT_QLAYOUT + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "host_linkage_flags": ["--device-entity-has-hidden-visibility=false"],
-                "identity": "9b3bb0f42ab31389b7ef02255ddad92416b75cce0b1cb4b7976d26991a8a3709",
-                "sources": [
-                    "sm_103a/cake_dsv4_a8b112bf2abd1a8ed848_kernel.cu",
-                    "sm_103a/cake_dsv4_a8b112bf2abd1a8ed848_binding.cu",
-                ],
-            },
-            "bf16_h128_split5_reduce": {
-                "arg_plan": _PLAN_SPLIT_REDUCE + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "host_linkage_flags": ["--device-entity-has-hidden-visibility=false"],
-                "identity": "95ca59e0021b622eb3b961f7200f8eb76d479275e646013e672f9e2a7441d8bb",
-                "sources": [
-                    "sm_103a/cake_dsv4_8b60cfd54a78d36864f4_kernel.cu",
-                    "sm_103a/cake_dsv4_8b60cfd54a78d36864f4_binding.cu",
-                ],
-            },
-            "bf16_h128_swa128": {
-                "arg_plan": _PLAN_BF16_H128_SWA_QLAYOUT + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "identity": "6a3ef5704ad10c1ad5135f5d6d6a6622775ca013b3bb656d3bfcafc5e0689adc",
-                "sources": [
-                    "sm_103a/cake_dsv4_f918e4ac3c5b77c4514b_kernel.cu",
-                    "sm_103a/cake_dsv4_f918e4ac3c5b77c4514b_binding.cu",
-                ],
-            },
-            "bf16_h128_topk128x_row_first": {
-                "arg_plan": _PLAN_BF16_H128_PERSISTENT_QLAYOUT + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "host_linkage_flags": ["--device-entity-has-hidden-visibility=false"],
-                "identity": "04b97ac830d37ba297280a69668914de33b552314ca2c99d4b9d634c6dfe03d5",
-                "sources": [
-                    "sm_103a/cake_dsv4_8c2cf89e71be1ebbd233_kernel.cu",
-                    "sm_103a/cake_dsv4_8c2cf89e71be1ebbd233_binding.cu",
-                ],
-            },
-            "bf16_h128_topk128x_row_first_vsplit": {
-                "arg_plan": _PLAN_BF16_H128_PERSISTENT_QLAYOUT + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "host_linkage_flags": ["--device-entity-has-hidden-visibility=false"],
-                "identity": "8f000d053f792f4e4537d7370c6ca6e52579ab1b4cca8d8b4fcfb3070f4fba19",
-                "sources": [
-                    "sm_103a/cake_dsv4_9c1ead828285aaa7f400_kernel.cu",
-                    "sm_103a/cake_dsv4_9c1ead828285aaa7f400_binding.cu",
-                ],
-            },
-            "bf16_h128_topk128x_split4_sm100": {
-                "arg_plan": _PLAN_BF16_H128_PERSISTENT_TMA_O_QLAYOUT + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "host_linkage_flags": ["--device-entity-has-hidden-visibility=false"],
-                "identity": "bb0a0f01dbb6e1fe6a736e9f99cfe996ada9e0759cf32bfb40beee8fb23e116d",
-                "sources": [
-                    "sm_103a/cake_dsv4_6a34a835c2b39424c20c_kernel.cu",
-                    "sm_103a/cake_dsv4_6a34a835c2b39424c20c_binding.cu",
-                ],
-            },
-            "bf16_h128_topk4x_v52": {
-                "arg_plan": _PLAN_BF16_H128_PERSISTENT_TMA_O_QLAYOUT + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "host_linkage_flags": ["--device-entity-has-hidden-visibility=false"],
-                "identity": "ddc7f4ed360e21ab8d8d1d2591a3028daeca234fae9c95f9fe848f4e96d0344c",
-                "sources": [
-                    "sm_103a/cake_dsv4_3b4ec80fd59f1a59eb0d_kernel.cu",
-                    "sm_103a/cake_dsv4_3b4ec80fd59f1a59eb0d_binding.cu",
-                ],
-            },
-            "bf16_h16_h32_swa128_v44": {
-                "arg_plan": _PLAN_BF16_SWA_DECODE_QLAYOUT + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "identity": "de1914156f95e7c127f50257df70d17b0f7b9f0b3cb8697771327e2f7a5dc7c9",
-                "sources": [
-                    "sm_103a/cake_dsv4_a164ee5cbd7fc5b4d14d_kernel.cu",
-                    "sm_103a/cake_dsv4_a164ee5cbd7fc5b4d14d_binding.cu",
-                ],
-            },
-            "bf16_h32_topk128x_early_v47": {
-                "arg_plan": _PLAN_BF16_H32_MERGE_QLAYOUT + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "identity": "7d5fe7a24d8596b5bfd3e87ad74ee7d29ae02c3e8ed95ddd512c81537425a5ea",
-                "sources": [
-                    "sm_103a/cake_dsv4_ebf2dfc077eb990f64fa_kernel.cu",
-                    "sm_103a/cake_dsv4_ebf2dfc077eb990f64fa_binding.cu",
-                ],
-            },
-            "bf16_h64_compressed_q8_v38": {
-                "arg_plan": _PLAN_BF16_H64_SPLIT_QLAYOUT + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "identity": "62fa5a24bc71a7176e077b935144961fb1c9743a2b40030fa4e215430099505a",
-                "sources": [
-                    "sm_103a/cake_dsv4_584c7f1bfa07e4783b08_kernel.cu",
-                    "sm_103a/cake_dsv4_584c7f1bfa07e4783b08_binding.cu",
-                ],
-            },
-            "bf16_h64_compressed_reduce": {
-                "arg_plan": _PLAN_H64_REDUCE + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "identity": "534205e2faf86f4ae23f9d02f68774c915960013f4de6eb0b013332956122be7",
-                "sources": [
-                    "sm_103a/cake_dsv4_e900f8c37ff1f0974a39_kernel.cu",
-                    "sm_103a/cake_dsv4_e900f8c37ff1f0974a39_binding.cu",
-                ],
-            },
-            "bf16_h64_guard_q_tma_batch_r25": {
-                "arg_plan": _PLAN_BF16_H64_GUARD_TMA_O + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "identity": "108a253711ffef47bd770d12b1085673aa9bd1b699899138ed57159bb51f25de",
-                "sources": [
-                    "sm_103a/cake_dsv4_a293c552f4c6f588106c_kernel.cu",
-                    "sm_103a/cake_dsv4_a293c552f4c6f588106c_binding.cu",
-                ],
-            },
-            "bf16_h64_prefill": {
-                "arg_plan": _PLAN_BF16_H64_PREFILL_QLAYOUT + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "identity": "72671cb08b37e1db7844c856831d79c0a86e17f37a1cee8843fb60f241fe3083",
-                "sources": [
-                    "sm_103a/cake_dsv4_2ada791761e6057628f6_kernel.cu",
-                    "sm_103a/cake_dsv4_2ada791761e6057628f6_binding.cu",
-                ],
-            },
-            "bf16_h8_h16_source_exact": {
-                "arg_plan": _PLAN_H8_H16_SOURCE_EXACT_TOKENS_QLAYOUT + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "identity": "c94422867e63d478cf9cb82d64661a43d499162321b78290f65b65d1ce4b25aa",
-                "sources": [
-                    "sm_103a/cake_dsv4_34c0d39b1248c1010a15_kernel.cu",
-                    "sm_103a/cake_dsv4_34c0d39b1248c1010a15_binding.cu",
-                ],
-            },
-            "bf16_h8_swa128_v43": {
-                "arg_plan": _PLAN_BF16_SWA_DECODE_QLAYOUT + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "identity": "17be1dde22562a78d48fb6120aca8e73e7f4b98f73a38d9d0ea588c0ec3f4ba1",
-                "sources": [
-                    "sm_103a/cake_dsv4_7383588b37366a763e1e_kernel.cu",
-                    "sm_103a/cake_dsv4_7383588b37366a763e1e_binding.cu",
-                ],
-            },
-            "bf16_swa128_single_cta": {
-                "arg_plan": _PLAN_BF16_SWA_DECODE_QLAYOUT + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "identity": "4b25b98298ef653eae8fc4cce699685abfcc48f8e0e7babd95a3630796225a64",
-                "sources": [
-                    "sm_103a/cake_dsv4_ee00a096a4346bd6ad78_kernel.cu",
-                    "sm_103a/cake_dsv4_ee00a096a4346bd6ad78_binding.cu",
-                ],
-            },
-            "fp8_h128_prefill_source_persistent": {
-                "arg_plan": _PLAN_FP8_PERSISTENT_QLAYOUT + _GRID,
-                "compile_flags": [
-                    "--use_fast_math",
-                    "-Xptxas=--register-usage-level=10",
-                ],
-                "identity": "a2040d948500253d55ecac75238b4f82e9cd7165ea6d26925e19cabc807208bb",
-                "sources": [
-                    "sm_103a/cake_dsv4_1dd9f772bf09c995842d_kernel.cu",
-                    "sm_103a/cake_dsv4_1dd9f772bf09c995842d_binding.cu",
-                ],
-            },
-            "fp8_h128_prefill_source_persistent_uniform": {
-                "arg_plan": _PLAN_FP8_PERSISTENT_QLAYOUT + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "identity": "0a4d0fabb8d4c56d064752142761aed7f900e6466adc6ef906cb14cb21e0d1a8",
-                "sources": [
-                    "sm_103a/cake_dsv4_25214a8d235e87a9cc33_kernel.cu",
-                    "sm_103a/cake_dsv4_25214a8d235e87a9cc33_binding.cu",
-                ],
-            },
-            "fp8_h64_prefill_source_persistent_m64": {
-                "arg_plan": _PLAN_FP8_H64_M64_SWA_K_QLAYOUT + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "identity": "62abfe11a85b45ca89b9e8d3627def5def3e283bca9ea712c44ddf9e439b5b44",
-                "sources": [
-                    "sm_103a/cake_dsv4_c09af191b368fc936d16_kernel.cu",
-                    "sm_103a/cake_dsv4_c09af191b368fc936d16_binding.cu",
-                ],
-            },
-            "fp8_h64_prefill_source_persistent_m64_multi_tile": {
-                "arg_plan": _PLAN_FP8_H64_M64_SWA_K_QLAYOUT + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "identity": "706de01351b7cd8ceb6888a9427943a99c1fa4cd63a19898ef6faf3f2c750b27",
-                "sources": [
-                    "sm_103a/cake_dsv4_14df2e7f409bd2c5c501_kernel.cu",
-                    "sm_103a/cake_dsv4_14df2e7f409bd2c5c501_binding.cu",
-                ],
-            },
-            "fp8_h64_source_exact": {
-                "arg_plan": _PLAN_FP8_H64_SOURCE_EXACT_QLAYOUT + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "identity": "72dfe6f3cc94735c0e04120b256bd9d1ec0620228039bbecd994c6c1406237f1",
-                "sources": [
-                    "sm_103a/cake_dsv4_8543cb10ca15edd3a26b_kernel.cu",
-                    "sm_103a/cake_dsv4_8543cb10ca15edd3a26b_binding.cu",
-                ],
-            },
-            "fp8_h8_h16_source_exact": {
-                "arg_plan": _PLAN_H8_H16_SOURCE_EXACT_TOKENS_QLAYOUT + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "identity": "4e6224033672232f0d29e1427473fb2d48e8ca8b1ef5c41c9d34c4dc79c59ecd",
-                "sources": [
-                    "sm_103a/cake_dsv4_e875bc1d8a3b3ff27030_kernel.cu",
-                    "sm_103a/cake_dsv4_e875bc1d8a3b3ff27030_binding.cu",
-                ],
-            },
-            "fp8_lowhead_h64": {
-                "arg_plan": _PLAN_FP8_LOWHEAD_QLAYOUT + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "identity": "bd0ea36f2b7b1335e2aad245666d9a9d5c264d721724f6b66d4b8b3cc3bb0ca1",
-                "sources": [
-                    "sm_103a/cake_dsv4_914897d09f87971636b3_kernel.cu",
-                    "sm_103a/cake_dsv4_914897d09f87971636b3_binding.cu",
-                ],
-            },
-            "fp8_lowhead_one_partition": {
-                "arg_plan": _PLAN_FP8_LOWHEAD_QLAYOUT + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "identity": "4a71a2732a5d5913f09e1bd418d37cc4c0b0b96371c93ccc45d15bb7f4df956a",
-                "sources": [
-                    "sm_103a/cake_dsv4_9c1c6548071b6184d8e3_kernel.cu",
-                    "sm_103a/cake_dsv4_9c1c6548071b6184d8e3_binding.cu",
-                ],
-            },
-            "fp8_lowhead_prefill": {
-                "arg_plan": _PLAN_FP8_LOWHEAD_QLAYOUT + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "identity": "9f430a079ba1928ab48b460d2c9d74bc427f24211bf39d4241e6522b7f31f99e",
-                "sources": [
-                    "sm_103a/cake_dsv4_3b2807f9cb6acd058bdf_kernel.cu",
-                    "sm_103a/cake_dsv4_3b2807f9cb6acd058bdf_binding.cu",
-                ],
-            },
-            "nvfp4_decode_cluster": {
-                "arg_plan": _PLAN_NVFP4_DECODE + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "identity": "d23558ffc6ff0728296296fc6be7a246bae07e07d111ea06a938c126f1504cf8",
-                "min_cuda_version": "13.4",
-                "sources": [
-                    "common/cake_dsv4_nvfp4_decode_cluster_kernel.cu",
-                    "common/cake_dsv4_nvfp4_decode_cluster_binding.cu",
-                ],
-            },
-            "nvfp4_decode_persistent": {
-                "arg_plan": _PLAN_NVFP4_DECODE + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "identity": "97f66ada72365e7e4d20acc96ce2eb0d81f8fd3fd9cd736d3fd5db167a68f86c",
-                "min_cuda_version": "13.4",
-                "sources": [
-                    "common/cake_dsv4_nvfp4_decode_persistent_kernel.cu",
-                    "common/cake_dsv4_nvfp4_decode_persistent_binding.cu",
-                ],
-            },
-            "nvfp4_decode_pv_n16_oc1": {
-                "arg_plan": _PLAN_NVFP4_G4 + _GRID,
-                "compile_flags": [
-                    "--use_fast_math",
-                    "-DCAKE_DSV4_NVFP4_DECODE_PV_SELECT=1",
-                    "-DCAKE_DSV4_NVFP4_DECODE_PV_N16_OC1=1",
-                ],
-                "identity": "9275dbe72169a9a2881877df4e1dbea4a8f593f6b23cb197faca4bd73bbb0b13",
-                "min_cuda_version": "13.4",
-                "sources": [
-                    "common/cake_dsv4_nvfp4_decode_pv_kernel.cu",
-                    "common/cake_dsv4_nvfp4_decode_pv_n16_oc1_binding.cu",
-                ],
-            },
-            "nvfp4_decode_pv_n32_oc1": {
-                "arg_plan": _PLAN_NVFP4_G4 + _GRID,
-                "compile_flags": [
-                    "--use_fast_math",
-                    "-DCAKE_DSV4_NVFP4_DECODE_PV_SELECT=1",
-                    "-DCAKE_DSV4_NVFP4_DECODE_PV_N32_OC1=1",
-                ],
-                "identity": "b8b27c41d767d82c5502fd2d3249eaaf0e1ce5e98d336a60fabf0fe25e8cb256",
-                "min_cuda_version": "13.4",
-                "sources": [
-                    "common/cake_dsv4_nvfp4_decode_pv_kernel.cu",
-                    "common/cake_dsv4_nvfp4_decode_pv_n32_oc1_binding.cu",
-                ],
-            },
-            "nvfp4_decode_swap_n16_oc1": {
-                "arg_plan": _PLAN_NVFP4_TILE + _GRID,
-                "compile_flags": [
-                    "--use_fast_math",
-                    "-DCAKE_DSV4_NVFP4_DECODE_SWAP_SELECT=1",
-                    "-DCAKE_DSV4_NVFP4_DECODE_SWAP_N16_OC1=1",
-                ],
-                "identity": "5ea7107ed25486f1a914df6075bd19f17c6670f0f9a134f99d9d26e06d961a97",
-                "min_cuda_version": "13.4",
-                "sources": [
-                    "common/cake_dsv4_nvfp4_decode_swap_kernel.cu",
-                    "common/cake_dsv4_nvfp4_decode_swap_n16_oc1_binding.cu",
-                ],
-            },
-            "nvfp4_decode_swap_n16_oc2": {
-                "arg_plan": _PLAN_NVFP4_TILE + _GRID,
-                "compile_flags": [
-                    "--use_fast_math",
-                    "-DCAKE_DSV4_NVFP4_DECODE_SWAP_SELECT=1",
-                    "-DCAKE_DSV4_NVFP4_DECODE_SWAP_N16_OC2=1",
-                ],
-                "identity": "3806003bd3a30bb085317ea3d03e1a729e930f5a529e3c6c6adbd05c93e47429",
-                "min_cuda_version": "13.4",
-                "sources": [
-                    "common/cake_dsv4_nvfp4_decode_swap_kernel.cu",
-                    "common/cake_dsv4_nvfp4_decode_swap_n16_oc2_binding.cu",
-                ],
-            },
-            "nvfp4_decode_swap_n16_oc4": {
-                "arg_plan": _PLAN_NVFP4_TILE + _GRID,
-                "compile_flags": [
-                    "--use_fast_math",
-                    "-DCAKE_DSV4_NVFP4_DECODE_SWAP_SELECT=1",
-                    "-DCAKE_DSV4_NVFP4_DECODE_SWAP_N16_OC4=1",
-                ],
-                "identity": "0385745419d8c9a36e543060694c1a53d752acf15e28fae311b877f8238c1a27",
-                "min_cuda_version": "13.4",
-                "sources": [
-                    "common/cake_dsv4_nvfp4_decode_swap_kernel.cu",
-                    "common/cake_dsv4_nvfp4_decode_swap_n16_oc4_binding.cu",
-                ],
-            },
-            "nvfp4_decode_swap_n32_oc1": {
-                "arg_plan": _PLAN_NVFP4_TILE + _GRID,
-                "compile_flags": [
-                    "--use_fast_math",
-                    "-DCAKE_DSV4_NVFP4_DECODE_SWAP_SELECT=1",
-                    "-DCAKE_DSV4_NVFP4_DECODE_SWAP_N32_OC1=1",
-                ],
-                "identity": "2686a9baf5d8d8791bdb866989f087fcd8619048738ee9f12d3a43941cb6a569",
-                "min_cuda_version": "13.4",
-                "sources": [
-                    "common/cake_dsv4_nvfp4_decode_swap_kernel.cu",
-                    "common/cake_dsv4_nvfp4_decode_swap_n32_oc1_binding.cu",
-                ],
-            },
-            "nvfp4_decode_swap_n32_oc2": {
-                "arg_plan": _PLAN_NVFP4_TILE + _GRID,
-                "compile_flags": [
-                    "--use_fast_math",
-                    "-DCAKE_DSV4_NVFP4_DECODE_SWAP_SELECT=1",
-                    "-DCAKE_DSV4_NVFP4_DECODE_SWAP_N32_OC2=1",
-                ],
-                "identity": "5eb42d803c7e710fd698cb52bcdc8ffcbfc8f51efe62e334397b3df840df14a2",
-                "min_cuda_version": "13.4",
-                "sources": [
-                    "common/cake_dsv4_nvfp4_decode_swap_kernel.cu",
-                    "common/cake_dsv4_nvfp4_decode_swap_n32_oc2_binding.cu",
-                ],
-            },
-            "nvfp4_decode_swap_n32_oc4": {
-                "arg_plan": _PLAN_NVFP4_TILE + _GRID,
-                "compile_flags": [
-                    "--use_fast_math",
-                    "-DCAKE_DSV4_NVFP4_DECODE_SWAP_SELECT=1",
-                    "-DCAKE_DSV4_NVFP4_DECODE_SWAP_N32_OC4=1",
-                ],
-                "identity": "948363dfaeed4cfe1b23c76ae1b2d21d65f8a2d6e10fa5c18522deceaf4fa32f",
-                "min_cuda_version": "13.4",
-                "sources": [
-                    "common/cake_dsv4_nvfp4_decode_swap_kernel.cu",
-                    "common/cake_dsv4_nvfp4_decode_swap_n32_oc4_binding.cu",
-                ],
-            },
-            "nvfp4_decode_t64_n64_oc1": {
-                "arg_plan": _PLAN_NVFP4_G4 + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "identity": "9be19d7c73a37b35a0c0e174c575785087ae89dea9ed082419d849a8a0f9b160",
-                "min_cuda_version": "13.4",
-                "sources": [
-                    "common/cake_dsv4_nvfp4_decode_t64_n64_oc1_kernel.cu",
-                    "common/cake_dsv4_nvfp4_decode_t64_n64_oc1_binding.cu",
-                ],
-            },
-            "nvfp4_decode_tile_h64_oc2": {
-                "arg_plan": _PLAN_NVFP4_TILE + _GRID,
-                "compile_flags": [
-                    "--use_fast_math",
-                    "-DCAKE_DSV4_NVFP4_DECODE_TILE_H64_SELECT=1",
-                    "-DCAKE_DSV4_NVFP4_DECODE_TILE_H64_OC2=1",
-                ],
-                "identity": "40b2368796b39f6eeb2cff3fdf3a0b6561ccc8079dbb67b83be8fc00c8dc1602",
-                "min_cuda_version": "13.4",
-                "sources": [
-                    "common/cake_dsv4_nvfp4_decode_tile_h64_kernel.cu",
-                    "common/cake_dsv4_nvfp4_decode_tile_h64_oc2_binding.cu",
-                ],
-            },
-            "nvfp4_decode_tile_h64_oc4": {
-                "arg_plan": _PLAN_NVFP4_TILE + _GRID,
-                "compile_flags": [
-                    "--use_fast_math",
-                    "-DCAKE_DSV4_NVFP4_DECODE_TILE_H64_SELECT=1",
-                    "-DCAKE_DSV4_NVFP4_DECODE_TILE_H64_OC4=1",
-                ],
-                "identity": "bce172d7ad6ce6fae32984c60f65c165e43b5d85b81a645d5985e8dba6ea3262",
-                "min_cuda_version": "13.4",
-                "sources": [
-                    "common/cake_dsv4_nvfp4_decode_tile_h64_kernel.cu",
-                    "common/cake_dsv4_nvfp4_decode_tile_h64_oc4_binding.cu",
-                ],
-            },
-            "nvfp4_decode_tile_oc1": {
-                "arg_plan": _PLAN_NVFP4_TILE + _GRID,
-                "compile_flags": [
-                    "--use_fast_math",
-                    "-DCAKE_DSV4_NVFP4_DECODE_TILE_SELECT=1",
-                    "-DCAKE_DSV4_NVFP4_DECODE_TILE_OC1=1",
-                ],
-                "identity": "64a4fb5ab31dc90a6ac00e6c81552c56c0966c9e32fceea013dca7b6169160c4",
-                "min_cuda_version": "13.4",
-                "sources": [
-                    "common/cake_dsv4_nvfp4_decode_tile_kernel.cu",
-                    "common/cake_dsv4_nvfp4_decode_tile_oc1_binding.cu",
-                ],
-            },
-            "nvfp4_decode_tile_oc2": {
-                "arg_plan": _PLAN_NVFP4_TILE + _GRID,
-                "compile_flags": [
-                    "--use_fast_math",
-                    "-DCAKE_DSV4_NVFP4_DECODE_TILE_SELECT=1",
-                    "-DCAKE_DSV4_NVFP4_DECODE_TILE_OC2=1",
-                ],
-                "identity": "92f16b7b832c8b9504985d144c84888ca32fd45da5eecd4cc93fb154906eb216",
-                "min_cuda_version": "13.4",
-                "sources": [
-                    "common/cake_dsv4_nvfp4_decode_tile_kernel.cu",
-                    "common/cake_dsv4_nvfp4_decode_tile_oc2_binding.cu",
-                ],
-            },
-            "nvfp4_decode_tile_oc4": {
-                "arg_plan": _PLAN_NVFP4_TILE + _GRID,
-                "compile_flags": [
-                    "--use_fast_math",
-                    "-DCAKE_DSV4_NVFP4_DECODE_TILE_SELECT=1",
-                    "-DCAKE_DSV4_NVFP4_DECODE_TILE_OC4=1",
-                ],
-                "identity": "f5a24fd8fcbf4ec5ddc74fc494db3f6037fb118b9c9067b80fafd873eec9bd36",
-                "min_cuda_version": "13.4",
-                "sources": [
-                    "common/cake_dsv4_nvfp4_decode_tile_kernel.cu",
-                    "common/cake_dsv4_nvfp4_decode_tile_oc4_binding.cu",
-                ],
-            },
-            "nvfp4_merge": {
-                "arg_plan": _PLAN_NVFP4_MERGE + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "identity": "7185d93fad5a359ea5d0a6dde1ba857d6f14b337d2e1e774339eedc198e9f263",
-                "min_cuda_version": "13.4",
-                "sources": [
-                    "common/cake_dsv4_nvfp4_merge_kernel.cu",
-                    "common/cake_dsv4_nvfp4_merge_binding.cu",
-                ],
-            },
-            "split_reduce": {
-                "arg_plan": _PLAN_SPLIT_REDUCE + _GRID,
-                "compile_flags": ["--use_fast_math"],
-                "host_linkage_flags": ["--device-entity-has-hidden-visibility=false"],
-                "identity": "a17f7b729fe17d899e263d1615cbc2f73fa9b5dcec4d8ac465cd343cbcf9c263",
-                "sources": [
-                    "sm_103a/cake_dsv4_aa6dd9bfdbb2d261b462_kernel.cu",
-                    "sm_103a/cake_dsv4_aa6dd9bfdbb2d261b462_binding.cu",
-                ],
-            },
+        "nvfp4_decode_cluster": "3e173e5eefc84548e3acf1e120cf11b2c2e4a7f4f86b501b435cb68489789396",
+        "nvfp4_decode_persistent": "48d99563a290f30f2630bb88a4d435862bf698d33a31265be9af3623cf803970",
+        "nvfp4_decode_pv": "c02c5b7def113df4aa306b88fbcd1d1b7d5ec1135be392164b566424501a1121",
+        "nvfp4_decode_swap": "a2ac56c674df1f3bcfcfcc4156f93559d44333f3d929240149a16509cefc611e",
+        "nvfp4_decode_t64_n64_oc1": "4d23efd4fd0e5cd8c3a1d96ccaa081be6252db1b057dab909223bde061b25e45",
+        "nvfp4_decode_tile": "5063120aaf31dd1d6866c3b1172e3f66a37f050519c9f801bd136c0dc40225b1",
+        "nvfp4_decode_tile_h64": "5dd82fc89ef96a01498cb2c3ea6c7044ee038b85ebbcdab2c64f95e24e9b0725",
+        "nvfp4_merge": "2c3aa9fe35accdfdf40b7985fbe76e42aab2974cf575a1aacea0b92d6f0d9d4a",
+    },
+}
+
+
+def _nvfp4_variants(arch: str) -> dict[str, dict[str, object]]:
+    """The NVFP4 records of one architecture (CUDA 13.4: PTX ISA 9.4 QMUL4)."""
+    return {
+        variant: {
+            **record,
+            "compile_flags": ["--use_fast_math"],
+            "identity": _NVFP4_IDENTITIES[arch][variant],
+            "min_cuda_version": "13.4",
+        }
+        for variant, record in _NVFP4_RECORDS.items()
+    }
+
+
+# The BF16 / FP8 argument plans, programs and variant routes (see the module
+# docstring). Keep each table a plain literal (no name, call or operator inside)
+# so that it can be read and rewritten as data.
+ARG_PLANS: dict[str, list[list[str]]] = {
+    "bf16_h128_persistent_qlayout": [
+        ["tma_buffer", "tmap_q"],
+        ["tma_buffer", "tmap_swa_k"],
+        ["tma_buffer", "tmap_compressed_k"],
+        ["tma_buffer", "tmap_swa_v"],
+        ["tma_buffer", "tmap_compressed_v"],
+        ["buffer", "O"],
+        ["buffer", "partial_lse"],
+        ["buffer", "swa_indices"],
+        ["buffer", "compressed_indices"],
+        ["buffer", "sparse_topk_lens"],
+        ["buffer", "seq_lens"],
+        ["buffer", "cum_seq_lens_q"],
+        ["buffer", "sinks"],
+        ["buffer", "bmm1_scale"],
+        ["buffer", "bmm2_scale"],
+        ["parameter", "num_heads"],
+        ["parameter", "num_query_tokens"],
+        ["parameter", "swa_index_stride"],
+        ["parameter", "compressed_index_stride"],
+        ["parameter", "sparse_topk_lens_offset"],
+        ["parameter", "sparse_topk"],
+        ["parameter", "has_sinks"],
+        ["parameter", "total_work_items"],
+        ["parameter", "ragged_query"],
+        ["parameter", "max_q_len"],
+        ["parameter", "batch_size"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "bf16_h128_persistent_tma_o_qlayout": [
+        ["tma_buffer", "tmap_q"],
+        ["tma_buffer", "tmap_swa_k"],
+        ["tma_buffer", "tmap_compressed_k"],
+        ["tma_buffer", "tmap_swa_v"],
+        ["tma_buffer", "tmap_compressed_v"],
+        ["tma_buffer", "O"],
+        ["buffer", "partial_lse"],
+        ["buffer", "swa_indices"],
+        ["buffer", "compressed_indices"],
+        ["buffer", "sparse_topk_lens"],
+        ["buffer", "seq_lens"],
+        ["buffer", "cum_seq_lens_q"],
+        ["buffer", "sinks"],
+        ["buffer", "bmm1_scale"],
+        ["buffer", "bmm2_scale"],
+        ["parameter", "num_heads"],
+        ["parameter", "num_query_tokens"],
+        ["parameter", "swa_index_stride"],
+        ["parameter", "compressed_index_stride"],
+        ["parameter", "sparse_topk_lens_offset"],
+        ["parameter", "sparse_topk"],
+        ["parameter", "has_sinks"],
+        ["parameter", "total_work_items"],
+        ["parameter", "ragged_query"],
+        ["parameter", "max_q_len"],
+        ["parameter", "batch_size"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "bf16_h128_swa_qlayout": [
+        ["tma_buffer", "tmap_q"],
+        ["tma_buffer", "tmap_swa_kv"],
+        ["buffer", "O"],
+        ["buffer", "swa_indices"],
+        ["buffer", "compressed_indices"],
+        ["buffer", "sparse_topk_lens"],
+        ["buffer", "seq_lens"],
+        ["buffer", "cum_seq_lens_q"],
+        ["buffer", "sinks"],
+        ["buffer", "bmm1_scale"],
+        ["buffer", "bmm2_scale"],
+        ["parameter", "num_heads"],
+        ["parameter", "swa_index_stride"],
+        ["parameter", "compressed_index_stride"],
+        ["parameter", "sparse_topk_lens_offset"],
+        ["parameter", "sparse_topk"],
+        ["parameter", "num_head_tiles"],
+        ["parameter", "has_sinks"],
+        ["parameter", "ragged_query"],
+        ["parameter", "max_q_len"],
+        ["parameter", "batch_size"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "bf16_h32_merge_qlayout": [
+        ["tma_buffer", "tmap_q"],
+        ["tma_buffer", "tmap_swa_kv"],
+        ["tma_buffer", "tmap_compressed_kv"],
+        ["buffer", "partial_O"],
+        ["buffer", "partial_lse"],
+        ["buffer", "O"],
+        ["buffer", "partition_arrivals"],
+        ["buffer", "swa_indices"],
+        ["buffer", "compressed_indices"],
+        ["buffer", "sparse_topk_lens"],
+        ["buffer", "seq_lens"],
+        ["buffer", "cum_seq_lens_q"],
+        ["buffer", "sinks"],
+        ["buffer", "bmm1_scale"],
+        ["buffer", "bmm2_scale"],
+        ["parameter", "num_heads"],
+        ["parameter", "swa_index_stride"],
+        ["parameter", "compressed_index_stride"],
+        ["parameter", "sparse_topk_lens_offset"],
+        ["parameter", "sparse_topk"],
+        ["parameter", "num_splits"],
+        ["parameter", "num_head_tiles"],
+        ["parameter", "has_sinks"],
+        ["parameter", "ragged_query"],
+        ["parameter", "max_q_len"],
+        ["parameter", "batch_size"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "bf16_h64_guard_tma_o": [
+        ["tma_buffer", "tmap_q"],
+        ["tma_buffer", "tmap_swa_kv"],
+        ["tma_buffer", "tmap_compressed_kv"],
+        ["tma_buffer", "O"],
+        ["buffer", "swa_indices"],
+        ["buffer", "compressed_indices"],
+        ["buffer", "sparse_topk_lens"],
+        ["buffer", "seq_lens"],
+        ["buffer", "cum_seq_lens_q"],
+        ["buffer", "sinks"],
+        ["buffer", "bmm1_scale"],
+        ["buffer", "bmm2_scale"],
+        ["parameter", "num_heads"],
+        ["parameter", "swa_index_stride"],
+        ["parameter", "compressed_index_stride"],
+        ["parameter", "sparse_topk_lens_offset"],
+        ["parameter", "sparse_topk"],
+        ["parameter", "batch_size"],
+        ["parameter", "max_q_len"],
+        ["parameter", "ragged_query"],
+        ["parameter", "has_sinks"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "bf16_h64_prefill_qlayout": [
+        ["tma_buffer", "tmap_q"],
+        ["tma_buffer", "tmap_swa_kv"],
+        ["tma_buffer", "tmap_compressed_kv"],
+        ["buffer", "O"],
+        ["buffer", "swa_indices"],
+        ["buffer", "compressed_indices"],
+        ["buffer", "sparse_topk_lens"],
+        ["buffer", "seq_lens"],
+        ["buffer", "cum_seq_lens_q"],
+        ["buffer", "sinks"],
+        ["buffer", "bmm1_scale"],
+        ["buffer", "bmm2_scale"],
+        ["parameter", "num_heads"],
+        ["parameter", "swa_index_stride"],
+        ["parameter", "compressed_index_stride"],
+        ["parameter", "sparse_topk_lens_offset"],
+        ["parameter", "sparse_topk"],
+        ["parameter", "num_query_tokens"],
+        ["parameter", "has_sinks"],
+        ["parameter", "ragged_query"],
+        ["parameter", "max_q_len"],
+        ["parameter", "batch_size"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "bf16_h64_split_qlayout": [
+        ["tma_buffer", "tmap_q"],
+        ["tma_buffer", "tmap_swa_kv"],
+        ["tma_buffer", "tmap_compressed_kv"],
+        ["buffer", "partial_O"],
+        ["buffer", "partial_lse"],
+        ["buffer", "swa_indices"],
+        ["buffer", "compressed_indices"],
+        ["buffer", "sparse_topk_lens"],
+        ["buffer", "seq_lens"],
+        ["buffer", "cum_seq_lens_q"],
+        ["buffer", "sinks"],
+        ["buffer", "bmm1_scale"],
+        ["buffer", "bmm2_scale"],
+        ["parameter", "num_heads"],
+        ["parameter", "swa_index_stride"],
+        ["parameter", "compressed_index_stride"],
+        ["parameter", "sparse_topk_lens_offset"],
+        ["parameter", "sparse_topk"],
+        ["parameter", "num_splits"],
+        ["parameter", "has_sinks"],
+        ["parameter", "ragged_query"],
+        ["parameter", "max_q_len"],
+        ["parameter", "batch_size"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "bf16_swa_decode_qlayout": [
+        ["tma_buffer", "tmap_q"],
+        ["tma_buffer", "tmap_swa_kv"],
+        ["buffer", "O"],
+        ["buffer", "swa_indices"],
+        ["buffer", "compressed_indices"],
+        ["buffer", "sparse_topk_lens"],
+        ["buffer", "seq_lens"],
+        ["buffer", "cum_seq_lens_q"],
+        ["buffer", "sinks"],
+        ["buffer", "bmm1_scale"],
+        ["buffer", "bmm2_scale"],
+        ["parameter", "num_heads"],
+        ["parameter", "swa_index_stride"],
+        ["parameter", "compressed_index_stride"],
+        ["parameter", "sparse_topk_lens_offset"],
+        ["parameter", "sparse_topk"],
+        ["parameter", "has_sinks"],
+        ["parameter", "ragged_query"],
+        ["parameter", "max_q_len"],
+        ["parameter", "batch_size"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "fp8_h128_prefill_source_persistent_no_pdl": [
+        ["tma_buffer", "tmap_q"],
+        ["tma_buffer", "tmap_swa_kv"],
+        ["tma_buffer", "tmap_compressed_kv"],
+        ["tma_buffer", "tmap_o"],
+        ["buffer", "O"],
+        ["buffer", "partial_lse"],
+        ["buffer", "swa_indices"],
+        ["buffer", "compressed_indices"],
+        ["buffer", "sparse_topk_lens"],
+        ["buffer", "seq_lens"],
+        ["buffer", "cum_seq_lens_q"],
+        ["buffer", "sinks"],
+        ["buffer", "bmm1_scale"],
+        ["buffer", "bmm2_scale"],
+        ["parameter", "num_heads"],
+        ["parameter", "swa_index_stride"],
+        ["parameter", "compressed_index_stride"],
+        ["parameter", "sparse_topk_lens_offset"],
+        ["parameter", "num_query_tokens"],
+        ["parameter", "sparse_topk"],
+        ["parameter", "has_sinks"],
+        ["parameter", "total_work_items"],
+        ["parameter", "ragged_query"],
+        ["parameter", "max_q_len"],
+        ["parameter", "batch_size"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "fp8_h128_prefill_source_persistent_uniform": [
+        ["tma_buffer", "tmap_q"],
+        ["tma_buffer", "tmap_swa_kv"],
+        ["tma_buffer", "tmap_compressed_kv"],
+        ["tma_buffer", "tmap_o"],
+        ["buffer", "O"],
+        ["buffer", "partial_lse"],
+        ["buffer", "swa_indices"],
+        ["buffer", "compressed_indices"],
+        ["buffer", "sparse_topk_lens"],
+        ["buffer", "seq_lens"],
+        ["buffer", "cum_seq_lens_q"],
+        ["buffer", "sinks"],
+        ["buffer", "bmm1_scale"],
+        ["buffer", "bmm2_scale"],
+        ["parameter", "num_heads"],
+        ["parameter", "swa_index_stride"],
+        ["parameter", "compressed_index_stride"],
+        ["parameter", "sparse_topk_lens_offset"],
+        ["parameter", "num_query_tokens"],
+        ["parameter", "sparse_topk"],
+        ["parameter", "has_sinks"],
+        ["parameter", "total_work_items"],
+        ["parameter", "ragged_query"],
+        ["parameter", "max_q_len"],
+        ["parameter", "batch_size"],
+        ["launch", "enable_pdl"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "fp8_h64_prefill_source_persistent_m64_multi_tile": [
+        ["tma_buffer", "tmap_q"],
+        ["tma_buffer", "tmap_swa_kv"],
+        ["tma_buffer", "tmap_compressed_kv"],
+        ["tma_buffer", "tmap_swa_k"],
+        ["buffer", "O"],
+        ["buffer", "partial_lse"],
+        ["buffer", "swa_indices"],
+        ["buffer", "compressed_indices"],
+        ["buffer", "sparse_topk_lens"],
+        ["buffer", "seq_lens"],
+        ["buffer", "cum_seq_lens_q"],
+        ["buffer", "sinks"],
+        ["buffer", "bmm1_scale"],
+        ["buffer", "bmm2_scale"],
+        ["parameter", "num_heads"],
+        ["parameter", "swa_index_stride"],
+        ["parameter", "compressed_index_stride"],
+        ["parameter", "sparse_topk_lens_offset"],
+        ["parameter", "num_query_tokens"],
+        ["parameter", "sparse_topk"],
+        ["parameter", "has_sinks"],
+        ["parameter", "total_work_items"],
+        ["parameter", "ragged_query"],
+        ["parameter", "max_q_len"],
+        ["parameter", "batch_size"],
+        ["launch", "enable_pdl"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "fp8_h64_source_exact_qlayout": [
+        ["tma_buffer", "tmap_q"],
+        ["tma_buffer", "tmap_swa_kv"],
+        ["tma_buffer", "tmap_compressed_kv"],
+        ["buffer", "O"],
+        ["buffer", "cum_seq_lens_q"],
+        ["buffer", "seq_lens"],
+        ["buffer", "swa_indices"],
+        ["buffer", "compressed_indices"],
+        ["buffer", "sparse_topk_lens"],
+        ["buffer", "sinks"],
+        ["buffer", "bmm1_scale"],
+        ["buffer", "bmm2_scale"],
+        ["parameter", "num_heads"],
+        ["parameter", "swa_index_stride"],
+        ["parameter", "compressed_index_stride"],
+        ["parameter", "sparse_topk_lens_offset"],
+        ["parameter", "sparse_topk"],
+        ["parameter", "ragged_query"],
+        ["parameter", "max_q_len"],
+        ["parameter", "batch_size"],
+        ["parameter", "has_sinks"],
+        ["parameter", "total_work_items"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "fp8_lowhead_prefill": [
+        ["tma_buffer", "tmap_q"],
+        ["tma_buffer", "tmap_swa_kv"],
+        ["tma_buffer", "tmap_compressed_kv"],
+        ["buffer", "O"],
+        ["buffer", "partial_lse"],
+        ["buffer", "swa_indices"],
+        ["buffer", "compressed_indices"],
+        ["buffer", "sparse_topk_lens"],
+        ["buffer", "sinks"],
+        ["buffer", "bmm1_scale"],
+        ["buffer", "bmm2_scale"],
+        ["parameter", "num_heads"],
+        ["parameter", "swa_index_stride"],
+        ["parameter", "compressed_index_stride"],
+        ["parameter", "sparse_topk_lens_offset"],
+        ["parameter", "num_query_tokens"],
+        ["parameter", "sparse_topk"],
+        ["parameter", "has_sinks"],
+        ["parameter", "total_work_items"],
+        ["buffer", "seq_lens"],
+        ["buffer", "cum_seq_lens_q"],
+        ["parameter", "ragged_query"],
+        ["parameter", "max_q_len"],
+        ["parameter", "batch_size"],
+        ["launch", "enable_pdl"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "fp8_lowhead_qlayout": [
+        ["tma_buffer", "tmap_q"],
+        ["tma_buffer", "tmap_swa_kv"],
+        ["tma_buffer", "tmap_compressed_kv"],
+        ["buffer", "O"],
+        ["buffer", "partial_lse"],
+        ["buffer", "swa_indices"],
+        ["buffer", "compressed_indices"],
+        ["buffer", "sparse_topk_lens"],
+        ["buffer", "sinks"],
+        ["buffer", "bmm1_scale"],
+        ["buffer", "bmm2_scale"],
+        ["parameter", "num_heads"],
+        ["parameter", "swa_index_stride"],
+        ["parameter", "compressed_index_stride"],
+        ["parameter", "sparse_topk_lens_offset"],
+        ["parameter", "num_query_tokens"],
+        ["parameter", "sparse_topk"],
+        ["parameter", "has_sinks"],
+        ["parameter", "total_work_items"],
+        ["buffer", "seq_lens"],
+        ["buffer", "cum_seq_lens_q"],
+        ["parameter", "ragged_query"],
+        ["parameter", "max_q_len"],
+        ["parameter", "batch_size"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "h64_reduce": [
+        ["buffer", "partial_O"],
+        ["buffer", "partial_lse"],
+        ["buffer", "O"],
+        ["parameter", "num_heads"],
+        ["parameter", "num_splits"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "h8_h16_source_exact_tokens_qlayout": [
+        ["tma_buffer", "tmap_q"],
+        ["tma_buffer", "tmap_swa_kv"],
+        ["tma_buffer", "tmap_compressed_kv"],
+        ["buffer", "O"],
+        ["buffer", "swa_indices"],
+        ["buffer", "compressed_indices"],
+        ["buffer", "sparse_topk_lens"],
+        ["buffer", "seq_lens"],
+        ["buffer", "cum_seq_lens_q"],
+        ["buffer", "sinks"],
+        ["buffer", "bmm1_scale"],
+        ["buffer", "bmm2_scale"],
+        ["parameter", "swa_index_stride"],
+        ["parameter", "compressed_index_stride"],
+        ["parameter", "sparse_topk_lens_offset"],
+        ["parameter", "sparse_topk"],
+        ["parameter", "ragged_query"],
+        ["parameter", "max_q_len"],
+        ["parameter", "batch_size"],
+        ["parameter", "has_sinks"],
+        ["parameter", "num_query_tokens"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "split_reduce": [
+        ["buffer", "partial_O"],
+        ["buffer", "partial_lse"],
+        ["buffer", "O"],
+        ["parameter", "num_q_heads"],
+        ["parameter", "num_split"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+}
+
+MODULES: dict[str, dict[str, Any]] = {
+    "cake_dsv4_009fa784c7206613d7b7": {
+        "sources": [
+            "sm_100a/cake_dsv4_009fa784c7206613d7b7_kernel.cu",
+            "sm_100a/cake_dsv4_009fa784c7206613d7b7_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "arg_plan": "fp8_h128_prefill_source_persistent_uniform",
+        "arches": ["sm_100a"],
+        "identity": {
+            "sm_100a": "8287bd3483e9062481662126c66084f46bc4d7e05eebf9b9405e95fd3147c59d",
         },
     },
-}  # type: dict[str, dict[str, dict[str, dict[str, object]]]]
+    "cake_dsv4_089147c4b5a5062fab1b": {
+        "sources": [
+            "sm_103a/cake_dsv4_089147c4b5a5062fab1b_kernel.cu",
+            "sm_103a/cake_dsv4_089147c4b5a5062fab1b_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "arg_plan": "h8_h16_source_exact_tokens_qlayout",
+        "arches": ["sm_103a"],
+        "identity": {
+            "sm_103a": "32c057dbbe84e98a6b6f5619eed73ff7561d671e13f1d3774f41ea330934817f",
+        },
+    },
+    "cake_dsv4_13091b5bf0612783f02d": {
+        "sources": [
+            "sm_103a/cake_dsv4_13091b5bf0612783f02d_kernel.cu",
+            "sm_103a/cake_dsv4_13091b5bf0612783f02d_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "host_linkage_flags": ["--device-entity-has-hidden-visibility=false"],
+        "arg_plan": "bf16_h128_persistent_qlayout",
+        "arches": ["sm_103a"],
+        "identity": {
+            "sm_103a": "360a43167438aa6a30d1bf22a05714251a71a66dba5b5384927ffdaa0e16dbfc",
+        },
+    },
+    "cake_dsv4_132f453f8df4a8300d5c": {
+        "sources": [
+            "sm_103a/cake_dsv4_132f453f8df4a8300d5c_kernel.cu",
+            "sm_103a/cake_dsv4_132f453f8df4a8300d5c_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math", "-Xptxas=--register-usage-level=10"],
+        "arg_plan": "fp8_h128_prefill_source_persistent_no_pdl",
+        "arches": ["sm_103a"],
+        "identity": {
+            "sm_103a": "37774c143b12b6115f2d994229deeae6ecc1af06d63a49bcd15b53da12aa3d69",
+        },
+    },
+    "cake_dsv4_13f0ca13f90a32070cfe": {
+        "sources": [
+            "sm_103a/cake_dsv4_13f0ca13f90a32070cfe_kernel.cu",
+            "sm_103a/cake_dsv4_13f0ca13f90a32070cfe_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "arg_plan": "bf16_swa_decode_qlayout",
+        "arches": ["sm_103a"],
+        "identity": {
+            "sm_103a": "091b8f6bfe8cf234842a92a89c28682895fb7d827a1d6baf9ae769b196d83a5e",
+        },
+    },
+    "cake_dsv4_16749fca629bdea1d909": {
+        "sources": [
+            "common/cake_dsv4_16749fca629bdea1d909_kernel.cu",
+            "common/cake_dsv4_16749fca629bdea1d909_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "arg_plan": "bf16_h128_swa_qlayout",
+        "arches": ["sm_100a", "sm_103a"],
+        "identity": {
+            "sm_100a": "714a2d5448946e564c05763ab2e3e544c54aad5debc776816a56164e4a83bc2c",
+            "sm_103a": "cc76fb79e0c274e4268ad05b2da855b22cfab8cc2475ef6c7b2226c0debac50f",
+        },
+    },
+    "cake_dsv4_1aefb39e2f65a24b1628": {
+        "sources": [
+            "sm_103a/cake_dsv4_1aefb39e2f65a24b1628_kernel.cu",
+            "sm_103a/cake_dsv4_1aefb39e2f65a24b1628_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "host_linkage_flags": ["--device-entity-has-hidden-visibility=false"],
+        "arg_plan": "bf16_h128_persistent_tma_o_qlayout",
+        "arches": ["sm_103a"],
+        "identity": {
+            "sm_103a": "9ae633cce8741795babfaf5912348720c7f0e8c9309fbef76d4bdce174b67e0b",
+        },
+    },
+    "cake_dsv4_1cd047de4a9a94e4f214": {
+        "sources": [
+            "common/cake_dsv4_1cd047de4a9a94e4f214_kernel.cu",
+            "common/cake_dsv4_1cd047de4a9a94e4f214_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "arg_plan": "bf16_h64_guard_tma_o",
+        "arches": ["sm_100a", "sm_103a"],
+        "identity": {
+            "sm_100a": "0532d16cc54ca4386865fd4d774849cf79948647db5edcf8a207cc1234bccda0",
+            "sm_103a": "e5fecce40a647b75e935879b7f15fbe69116019cac20b5551c10501c5a2e8c7e",
+        },
+    },
+    "cake_dsv4_289be7e9a77a8bb87264": {
+        "sources": [
+            "sm_100a/cake_dsv4_289be7e9a77a8bb87264_kernel.cu",
+            "sm_100a/cake_dsv4_289be7e9a77a8bb87264_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "host_linkage_flags": ["--device-entity-has-hidden-visibility=false"],
+        "arg_plan": "split_reduce",
+        "arches": ["sm_100a"],
+        "identity": {
+            "sm_100a": "793778812017819a450fc6bb83c6fa86bbdcfb731fcba674313f230845f96f5f",
+        },
+    },
+    "cake_dsv4_30ff1ef182cbae9bfba3": {
+        "sources": [
+            "sm_100a/cake_dsv4_30ff1ef182cbae9bfba3_kernel.cu",
+            "sm_100a/cake_dsv4_30ff1ef182cbae9bfba3_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "host_linkage_flags": ["--device-entity-has-hidden-visibility=false"],
+        "arg_plan": "bf16_h128_persistent_qlayout",
+        "arches": ["sm_100a"],
+        "identity": {
+            "sm_100a": "9c5c537b7f73afb40a1f698063646e3d595733991bd82bd986dc314b1a0e1812",
+        },
+    },
+    "cake_dsv4_36c80272414ea39a56d2": {
+        "sources": [
+            "common/cake_dsv4_36c80272414ea39a56d2_kernel.cu",
+            "common/cake_dsv4_36c80272414ea39a56d2_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "host_linkage_flags": ["--device-entity-has-hidden-visibility=false"],
+        "arg_plan": "bf16_h128_persistent_qlayout",
+        "arches": ["sm_100a", "sm_103a"],
+        "identity": {
+            "sm_100a": "8933a25c10455d1c266216d5fe0069367b3f3578d45c4c2bc2877311961b7267",
+            "sm_103a": "25e23b357ee5a9141c42b933e73f0f639af8ed1bd695505068e7a82fe77da22a",
+        },
+    },
+    "cake_dsv4_3eaffaa117944ce5e14e": {
+        "sources": [
+            "common/cake_dsv4_3eaffaa117944ce5e14e_kernel.cu",
+            "common/cake_dsv4_3eaffaa117944ce5e14e_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "host_linkage_flags": ["--device-entity-has-hidden-visibility=false"],
+        "arg_plan": "bf16_h128_persistent_tma_o_qlayout",
+        "arches": ["sm_100a", "sm_103a"],
+        "identity": {
+            "sm_100a": "02d6144a16ca4404bced3edf9b68d7cb427c3bce22c658f1f497c89eb30cb049",
+            "sm_103a": "ac53ab1e19758d2c0156cec8c965169f58ca0a12020bdb3a331866dba7f913f2",
+        },
+    },
+    "cake_dsv4_3fce080f96f6dc5e9f8c": {
+        "sources": [
+            "sm_103a/cake_dsv4_3fce080f96f6dc5e9f8c_kernel.cu",
+            "sm_103a/cake_dsv4_3fce080f96f6dc5e9f8c_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "arg_plan": "fp8_h64_prefill_source_persistent_m64_multi_tile",
+        "arches": ["sm_103a"],
+        "identity": {
+            "sm_103a": "147e82a37af4791b7565ff78a576b41ffbbf525226f841b3d67002c4a118750e",
+        },
+    },
+    "cake_dsv4_40932cb442b76026206f": {
+        "sources": [
+            "sm_103a/cake_dsv4_40932cb442b76026206f_kernel.cu",
+            "sm_103a/cake_dsv4_40932cb442b76026206f_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "arg_plan": "fp8_h64_prefill_source_persistent_m64_multi_tile",
+        "arches": ["sm_103a"],
+        "identity": {
+            "sm_103a": "bcf8fc2f3320ca8a1f2a6fa0991e0cd402ee461bf286e8fcd92b4ae3df24a689",
+        },
+    },
+    "cake_dsv4_4869e52499bb527f3e84": {
+        "sources": [
+            "sm_100a/cake_dsv4_4869e52499bb527f3e84_kernel.cu",
+            "sm_100a/cake_dsv4_4869e52499bb527f3e84_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "arg_plan": "bf16_swa_decode_qlayout",
+        "arches": ["sm_100a"],
+        "identity": {
+            "sm_100a": "56e39a54a6c54528942d4755a15a8e1e8e4e00d1cfbb3656da64042c9cb255ca",
+        },
+    },
+    "cake_dsv4_4a6718b7a2ca825d8800": {
+        "sources": [
+            "sm_107a/cake_dsv4_4a6718b7a2ca825d8800_kernel.cu",
+            "sm_107a/cake_dsv4_4a6718b7a2ca825d8800_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "arg_plan": "fp8_h128_prefill_source_persistent_uniform",
+        "arches": ["sm_107a"],
+        "identity": {
+            "sm_107a": "954684e567b70122d1e315f5b6ed7a98f1ee4b272f7586676147da5cfbdfa388",
+        },
+    },
+    "cake_dsv4_506e02d3d583a84bacdd": {
+        "sources": [
+            "sm_100a/cake_dsv4_506e02d3d583a84bacdd_kernel.cu",
+            "sm_100a/cake_dsv4_506e02d3d583a84bacdd_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math", "-Xptxas=--register-usage-level=10"],
+        "arg_plan": "fp8_h128_prefill_source_persistent_no_pdl",
+        "arches": ["sm_100a"],
+        "identity": {
+            "sm_100a": "e89081fea2e8534c42cfee9b5eceb944bc861b6a9ef4b8dd692016a829ff5a91",
+        },
+    },
+    "cake_dsv4_50a2c6ca93259d30db6b": {
+        "sources": [
+            "common/cake_dsv4_50a2c6ca93259d30db6b_kernel.cu",
+            "common/cake_dsv4_50a2c6ca93259d30db6b_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "arg_plan": "h64_reduce",
+        "arches": ["sm_100a", "sm_103a"],
+        "identity": {
+            "sm_100a": "254641199b600346536f0178bd47d30e956c6a3bddcf968102de840ec92c3f6f",
+            "sm_103a": "7c66d36bbb6e1e4e7aa1ffc910352b2a20936732a9766ad55e47dd14e35ee73e",
+        },
+    },
+    "cake_dsv4_51eee53d2d4f8b5344e9": {
+        "sources": [
+            "common/cake_dsv4_51eee53d2d4f8b5344e9_kernel.cu",
+            "common/cake_dsv4_51eee53d2d4f8b5344e9_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "host_linkage_flags": ["--device-entity-has-hidden-visibility=false"],
+        "arg_plan": "bf16_h128_persistent_qlayout",
+        "arches": ["sm_100a", "sm_103a"],
+        "identity": {
+            "sm_100a": "996d876b90eb9a70eb3d0a749b6bb365cc7ca986890d74de1bd9be534405544e",
+            "sm_103a": "97c93ae7199cc266045d634d4ac0019f43a413b75dd4aec2e016ab1b7a9c0bfc",
+        },
+    },
+    "cake_dsv4_5a02e8137c1b1bc7c58a": {
+        "sources": [
+            "sm_100a/cake_dsv4_5a02e8137c1b1bc7c58a_kernel.cu",
+            "sm_100a/cake_dsv4_5a02e8137c1b1bc7c58a_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "arg_plan": "fp8_h64_prefill_source_persistent_m64_multi_tile",
+        "arches": ["sm_100a"],
+        "identity": {
+            "sm_100a": "cb4870c193fc1110579dc4b36247f42d7fcffbdb0f18b674ed3cd5033a4d406d",
+        },
+    },
+    "cake_dsv4_5f640d72462f26d33803": {
+        "sources": [
+            "common/cake_dsv4_5f640d72462f26d33803_kernel.cu",
+            "common/cake_dsv4_5f640d72462f26d33803_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "host_linkage_flags": ["--device-entity-has-hidden-visibility=false"],
+        "arg_plan": "split_reduce",
+        "arches": ["sm_100a", "sm_103a"],
+        "identity": {
+            "sm_100a": "00c1f03b2b547713d533e73462ebe845b856a21adc732d2ca3c02b0e7b9527c0",
+            "sm_103a": "56980013bb3fe4bba3c55e9c737cc2c2ef6a172363e374108b2b77d67013c23a",
+        },
+    },
+    "cake_dsv4_7074d4c5b808db91fcba": {
+        "sources": [
+            "sm_107a/cake_dsv4_7074d4c5b808db91fcba_kernel.cu",
+            "sm_107a/cake_dsv4_7074d4c5b808db91fcba_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "arg_plan": "fp8_h128_prefill_source_persistent_uniform",
+        "arches": ["sm_107a"],
+        "identity": {
+            "sm_107a": "a0e4753bb2aa54fad60d5a502c50dd47e36154fa6478fe9b44e5ba277b7cf816",
+        },
+    },
+    "cake_dsv4_750835d54fe97cfc7ad4": {
+        "sources": [
+            "common/cake_dsv4_750835d54fe97cfc7ad4_kernel.cu",
+            "common/cake_dsv4_750835d54fe97cfc7ad4_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "arg_plan": "bf16_swa_decode_qlayout",
+        "arches": ["sm_100a", "sm_103a"],
+        "identity": {
+            "sm_100a": "25c1f4c3f2c15aa0deead6e08dfd9695d2d41dae60459d3e5f9d48bda66aeaf9",
+            "sm_103a": "e6e5b87fd8a983b27441821bef344529d5ee4590768197309b782583f469a393",
+        },
+    },
+    "cake_dsv4_77fc7066e2ba5bebb062": {
+        "sources": [
+            "sm_107a/cake_dsv4_77fc7066e2ba5bebb062_kernel.cu",
+            "sm_107a/cake_dsv4_77fc7066e2ba5bebb062_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math", "-Xptxas=--register-usage-level=10"],
+        "arg_plan": "fp8_h128_prefill_source_persistent_uniform",
+        "arches": ["sm_107a"],
+        "identity": {
+            "sm_107a": "e1e02c8bf09123ce9837336807bb88ecd36a0509d1ba018a72ffc2c179065474",
+        },
+    },
+    "cake_dsv4_7850190a53cc07aba85a": {
+        "sources": [
+            "sm_103a/cake_dsv4_7850190a53cc07aba85a_kernel.cu",
+            "sm_103a/cake_dsv4_7850190a53cc07aba85a_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "arg_plan": "bf16_swa_decode_qlayout",
+        "arches": ["sm_103a"],
+        "identity": {
+            "sm_103a": "f628532d65dd1875e01123a77a8871a269168fdc6d63dfa6ffaf76b1d841a58e",
+        },
+    },
+    "cake_dsv4_7c51b4b6d5b345d4fe03": {
+        "sources": [
+            "sm_103a/cake_dsv4_7c51b4b6d5b345d4fe03_kernel.cu",
+            "sm_103a/cake_dsv4_7c51b4b6d5b345d4fe03_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math", "-Xptxas=--register-usage-level=10"],
+        "arg_plan": "fp8_h128_prefill_source_persistent_uniform",
+        "arches": ["sm_103a"],
+        "identity": {
+            "sm_103a": "ac44c636adbd64873e4ca15fa914f27e95c8c90c6ec571f663ee5c3446c58e8d",
+        },
+    },
+    "cake_dsv4_7d6d09e037a1a9e99d87": {
+        "sources": [
+            "common/cake_dsv4_7d6d09e037a1a9e99d87_kernel.cu",
+            "common/cake_dsv4_7d6d09e037a1a9e99d87_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "arg_plan": "bf16_h64_prefill_qlayout",
+        "arches": ["sm_100a", "sm_103a"],
+        "identity": {
+            "sm_100a": "8261fffc7484344ede9441c1c7e6326e43234bb51f0f527e4cfacf82b60d7703",
+            "sm_103a": "4370ff7b8f887d3169f5c53b17aa4349343535acfe96d748bdd7fb5727f01e1d",
+        },
+    },
+    "cake_dsv4_82ca6fee14338e07ece4": {
+        "sources": [
+            "common/cake_dsv4_82ca6fee14338e07ece4_kernel.cu",
+            "common/cake_dsv4_82ca6fee14338e07ece4_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "arg_plan": "bf16_h64_split_qlayout",
+        "arches": ["sm_100a", "sm_103a"],
+        "identity": {
+            "sm_100a": "fac9b6db2449cb8fa4785c8aeca7d00afe97b124b658e270722501c329897125",
+            "sm_103a": "6b8c4d478b03aeef864d7ddf8afcc8d33aa8e5261a64bac2cd0a66e58ffb6be2",
+        },
+    },
+    "cake_dsv4_8625d6529808d0d51fc2": {
+        "sources": [
+            "sm_107a/cake_dsv4_8625d6529808d0d51fc2_kernel.cu",
+            "sm_107a/cake_dsv4_8625d6529808d0d51fc2_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "arg_plan": "fp8_lowhead_prefill",
+        "arches": ["sm_107a"],
+        "identity": {
+            "sm_107a": "2e58ed8124bfd29a752aa92a4c14c016f557a81fcfb7caf1f63b0e23ccccbae5",
+        },
+    },
+    "cake_dsv4_88757d413062636b5640": {
+        "sources": [
+            "sm_100a/cake_dsv4_88757d413062636b5640_kernel.cu",
+            "sm_100a/cake_dsv4_88757d413062636b5640_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "host_linkage_flags": ["--device-entity-has-hidden-visibility=false"],
+        "arg_plan": "bf16_h128_persistent_tma_o_qlayout",
+        "arches": ["sm_100a"],
+        "identity": {
+            "sm_100a": "4290339dd401a14f7bed380842fadadbc7b670f9542f1d4af4088f929422ccc3",
+        },
+    },
+    "cake_dsv4_8afa079cbcc688b8b5b9": {
+        "sources": [
+            "sm_107a/cake_dsv4_8afa079cbcc688b8b5b9_kernel.cu",
+            "sm_107a/cake_dsv4_8afa079cbcc688b8b5b9_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "arg_plan": "fp8_h64_prefill_source_persistent_m64_multi_tile",
+        "arches": ["sm_107a"],
+        "identity": {
+            "sm_107a": "56a081bf317abfb7ff19f1270b24eb569d5bee93181c46f8131f5462a4badede",
+        },
+    },
+    "cake_dsv4_8bcdc9f41a3d74231d15": {
+        "sources": [
+            "sm_103a/cake_dsv4_8bcdc9f41a3d74231d15_kernel.cu",
+            "sm_103a/cake_dsv4_8bcdc9f41a3d74231d15_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "arg_plan": "fp8_h128_prefill_source_persistent_uniform",
+        "arches": ["sm_103a"],
+        "identity": {
+            "sm_103a": "0409e5938c08aec662525ad558b0c68bbb2509892019bc75f69bf2cfcbe43c1a",
+        },
+    },
+    "cake_dsv4_8e21f3bf00b9778e08c2": {
+        "sources": [
+            "sm_100a/cake_dsv4_8e21f3bf00b9778e08c2_kernel.cu",
+            "sm_100a/cake_dsv4_8e21f3bf00b9778e08c2_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "arg_plan": "h8_h16_source_exact_tokens_qlayout",
+        "arches": ["sm_100a"],
+        "identity": {
+            "sm_100a": "51dcf4f44217bf164c05ec0bfda6d81387be2283f2bb73ffb16568367ece16cc",
+        },
+    },
+    "cake_dsv4_9daa9c5ff43490ad80ac": {
+        "sources": [
+            "sm_100a/cake_dsv4_9daa9c5ff43490ad80ac_kernel.cu",
+            "sm_100a/cake_dsv4_9daa9c5ff43490ad80ac_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "host_linkage_flags": ["--device-entity-has-hidden-visibility=false"],
+        "arg_plan": "bf16_h128_persistent_qlayout",
+        "arches": ["sm_100a"],
+        "identity": {
+            "sm_100a": "1d5ffeeaa9987a7064927cfc2f184984605d45ff8521c27ad86d325b7a8bbbeb",
+        },
+    },
+    "cake_dsv4_9f75cb272ce8994420ff": {
+        "sources": [
+            "sm_100a/cake_dsv4_9f75cb272ce8994420ff_kernel.cu",
+            "sm_100a/cake_dsv4_9f75cb272ce8994420ff_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math", "-Xptxas=--register-usage-level=10"],
+        "arg_plan": "fp8_h128_prefill_source_persistent_uniform",
+        "arches": ["sm_100a"],
+        "identity": {
+            "sm_100a": "eed23e81f47b3907beab754067a37f0f5b40d6902187e8f2a5dd5a0210d61ec5",
+        },
+    },
+    "cake_dsv4_b78d35b605cb10daf20f": {
+        "sources": [
+            "sm_103a/cake_dsv4_b78d35b605cb10daf20f_kernel.cu",
+            "sm_103a/cake_dsv4_b78d35b605cb10daf20f_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "arg_plan": "fp8_lowhead_qlayout",
+        "arches": ["sm_103a"],
+        "identity": {
+            "sm_103a": "31977e5437b6c3f2792cc92d967c421a8307d8e139f222dd522846103e5c22c1",
+        },
+    },
+    "cake_dsv4_b7c345c94f3a216b24e5": {
+        "sources": [
+            "sm_100a/cake_dsv4_b7c345c94f3a216b24e5_kernel.cu",
+            "sm_100a/cake_dsv4_b7c345c94f3a216b24e5_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math", "-Xptxas=--register-usage-level=10"],
+        "arg_plan": "fp8_lowhead_qlayout",
+        "arches": ["sm_100a"],
+        "identity": {
+            "sm_100a": "fe482c106d746eb25e14b0e92414600c7894c848f56e6e2397c560edf962beec",
+        },
+    },
+    "cake_dsv4_cbf3168c696847fd3f69": {
+        "sources": [
+            "common/cake_dsv4_cbf3168c696847fd3f69_kernel.cu",
+            "common/cake_dsv4_cbf3168c696847fd3f69_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "arg_plan": "fp8_lowhead_prefill",
+        "arches": ["sm_100a", "sm_103a"],
+        "identity": {
+            "sm_100a": "1805f23a2001fe8a9e6bfa4efdc9104c9df345bbc6a59d051483372e126a5534",
+            "sm_103a": "1408f1cf42e4f32c795d4f4bcaefcba78e6ddc86d6037717ffdc4df8b49e0a04",
+        },
+    },
+    "cake_dsv4_cf7e7f261a5e1c42f98f": {
+        "sources": [
+            "sm_103a/cake_dsv4_cf7e7f261a5e1c42f98f_kernel.cu",
+            "sm_103a/cake_dsv4_cf7e7f261a5e1c42f98f_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "host_linkage_flags": ["--device-entity-has-hidden-visibility=false"],
+        "arg_plan": "bf16_h128_persistent_qlayout",
+        "arches": ["sm_103a"],
+        "identity": {
+            "sm_103a": "f2d06b61a833bf2e255a7d37066f4f676ffd1afc6b55920f6312bc6e72b529ec",
+        },
+    },
+    "cake_dsv4_d0233d0d9fe44a645212": {
+        "sources": [
+            "sm_100a/cake_dsv4_d0233d0d9fe44a645212_kernel.cu",
+            "sm_100a/cake_dsv4_d0233d0d9fe44a645212_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "arg_plan": "bf16_swa_decode_qlayout",
+        "arches": ["sm_100a"],
+        "identity": {
+            "sm_100a": "717635d85e956dc8f0332111940fa97d38f58e7f5ef22506b91e148cfb9e6a8c",
+        },
+    },
+    "cake_dsv4_d9d623599c9697a9ccf3": {
+        "sources": [
+            "sm_100a/cake_dsv4_d9d623599c9697a9ccf3_kernel.cu",
+            "sm_100a/cake_dsv4_d9d623599c9697a9ccf3_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "arg_plan": "fp8_lowhead_prefill",
+        "arches": ["sm_100a"],
+        "identity": {
+            "sm_100a": "b1b2c3108dcfb7ea8b54a57f7dde80f561fff8fd5010c93fa4b1ee3a738bdb18",
+        },
+    },
+    "cake_dsv4_df5d069562864950e48b": {
+        "sources": [
+            "sm_107a/cake_dsv4_df5d069562864950e48b_kernel.cu",
+            "sm_107a/cake_dsv4_df5d069562864950e48b_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "arg_plan": "fp8_h64_prefill_source_persistent_m64_multi_tile",
+        "arches": ["sm_107a"],
+        "identity": {
+            "sm_107a": "e8e84bca5329e94abf29f10e4e48b2748eb9fb4900579c27dfae0ccbce55464e",
+        },
+    },
+    "cake_dsv4_e21760e2024d7c1e85c9": {
+        "sources": [
+            "sm_103a/cake_dsv4_e21760e2024d7c1e85c9_kernel.cu",
+            "sm_103a/cake_dsv4_e21760e2024d7c1e85c9_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "arg_plan": "fp8_lowhead_prefill",
+        "arches": ["sm_103a"],
+        "identity": {
+            "sm_103a": "bbaa5da7cb0f8fc63684d3daf1d5d2156b9c441e87068d2c666b6361df61b840",
+        },
+    },
+    "cake_dsv4_e5e9d7f2a2798aec29ff": {
+        "sources": [
+            "common/cake_dsv4_e5e9d7f2a2798aec29ff_kernel.cu",
+            "common/cake_dsv4_e5e9d7f2a2798aec29ff_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "arg_plan": "fp8_h64_source_exact_qlayout",
+        "arches": ["sm_100a", "sm_103a"],
+        "identity": {
+            "sm_100a": "34284d78f03b0284b881b9720674d1a4813c6b087a742acca08cc5f123e12364",
+            "sm_103a": "d993119b34840042a04139a493421b6bb1fad516a895b869c08da8710fe4053a",
+        },
+    },
+    "cake_dsv4_e880e7c12a67fe035a37": {
+        "sources": [
+            "sm_103a/cake_dsv4_e880e7c12a67fe035a37_kernel.cu",
+            "sm_103a/cake_dsv4_e880e7c12a67fe035a37_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "host_linkage_flags": ["--device-entity-has-hidden-visibility=false"],
+        "arg_plan": "split_reduce",
+        "arches": ["sm_103a"],
+        "identity": {
+            "sm_103a": "1712237fc719cb0c2f32d750eacd1dda44c264a5fd3a2f330c46883c30f4eaee",
+        },
+    },
+    "cake_dsv4_f647b239789ffbbdbd90": {
+        "sources": [
+            "sm_100a/cake_dsv4_f647b239789ffbbdbd90_kernel.cu",
+            "sm_100a/cake_dsv4_f647b239789ffbbdbd90_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "arg_plan": "fp8_h64_prefill_source_persistent_m64_multi_tile",
+        "arches": ["sm_100a"],
+        "identity": {
+            "sm_100a": "fec7317ee77f3bdab4feb97b72525afa540dd36c2d5855511e3e7d99d2b1be72",
+        },
+    },
+    "cake_dsv4_f81486848bf3b4e05349": {
+        "sources": [
+            "common/cake_dsv4_f81486848bf3b4e05349_kernel.cu",
+            "common/cake_dsv4_f81486848bf3b4e05349_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "arg_plan": "bf16_h32_merge_qlayout",
+        "arches": ["sm_100a", "sm_103a"],
+        "identity": {
+            "sm_100a": "e8b2b84eb0152f83cf97526d156d5619b819e67c79827eeb1a83d5b564d07020",
+            "sm_103a": "b4a3936030565653e447cc2706a138b67cf8158707b131f4abf53ecfc32a1a1c",
+        },
+    },
+    "cake_dsv4_fee38be0a1a558bc4cf4": {
+        "sources": [
+            "sm_100a/cake_dsv4_fee38be0a1a558bc4cf4_kernel.cu",
+            "sm_100a/cake_dsv4_fee38be0a1a558bc4cf4_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "arg_plan": "h8_h16_source_exact_tokens_qlayout",
+        "arches": ["sm_100a"],
+        "identity": {
+            "sm_100a": "fd4a13f32b30471c675e21d7ac69955b43369f67e74f2be3a4736350b5d8fcb2",
+        },
+    },
+    "cake_dsv4_ff4aa022aa97fded6032": {
+        "sources": [
+            "sm_103a/cake_dsv4_ff4aa022aa97fded6032_kernel.cu",
+            "sm_103a/cake_dsv4_ff4aa022aa97fded6032_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "arg_plan": "h8_h16_source_exact_tokens_qlayout",
+        "arches": ["sm_103a"],
+        "identity": {
+            "sm_103a": "85f6e251ee2272c1f34b4ec404e3e76aaa5e13fc25ba50cd303d5007808ac69d",
+        },
+    },
+    "cake_dsv4_ffa4216b35dae8d46543": {
+        "sources": [
+            "sm_107a/cake_dsv4_ffa4216b35dae8d46543_kernel.cu",
+            "sm_107a/cake_dsv4_ffa4216b35dae8d46543_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "arg_plan": "fp8_h64_prefill_source_persistent_m64_multi_tile",
+        "arches": ["sm_107a"],
+        "identity": {
+            "sm_107a": "0f5ba42603e09cc45e0da9e7cd30c76c47d630c64d0bd6018cdb2c8b5a09caea",
+        },
+    },
+}
+
+VARIANTS: dict[str, dict[str, str]] = {
+    "sm_100a": {
+        "bf16_h128_prefill_v42": "cake_dsv4_30ff1ef182cbae9bfba3",
+        "bf16_h128_prefill_v42_snake": "cake_dsv4_9daa9c5ff43490ad80ac",
+        "bf16_h128_split5_reduce": "cake_dsv4_289be7e9a77a8bb87264",
+        "bf16_h128_swa128": "cake_dsv4_16749fca629bdea1d909",
+        "bf16_h128_topk128x_row_first": "cake_dsv4_36c80272414ea39a56d2",
+        "bf16_h128_topk128x_row_first_vsplit": "cake_dsv4_51eee53d2d4f8b5344e9",
+        "bf16_h128_topk128x_split4_sm100": "cake_dsv4_3eaffaa117944ce5e14e",
+        "bf16_h128_topk4x_v52": "cake_dsv4_88757d413062636b5640",
+        "bf16_h16_h32_swa128_v44": "cake_dsv4_750835d54fe97cfc7ad4",
+        "bf16_h32_topk128x_early_v47": "cake_dsv4_f81486848bf3b4e05349",
+        "bf16_h64_compressed_q8_v38": "cake_dsv4_82ca6fee14338e07ece4",
+        "bf16_h64_compressed_reduce": "cake_dsv4_50a2c6ca93259d30db6b",
+        "bf16_h64_guard_q_tma_batch_r25": "cake_dsv4_1cd047de4a9a94e4f214",
+        "bf16_h64_prefill": "cake_dsv4_7d6d09e037a1a9e99d87",
+        "bf16_h8_h16_source_exact": "cake_dsv4_8e21f3bf00b9778e08c2",
+        "bf16_h8_swa128_v43": "cake_dsv4_4869e52499bb527f3e84",
+        "bf16_swa128_single_cta": "cake_dsv4_d0233d0d9fe44a645212",
+        "fp8_h128_prefill_source_persistent": "cake_dsv4_9f75cb272ce8994420ff",
+        "fp8_h128_prefill_source_persistent_no_pdl": "cake_dsv4_506e02d3d583a84bacdd",
+        "fp8_h128_prefill_source_persistent_uniform": "cake_dsv4_009fa784c7206613d7b7",
+        "fp8_h128_prefill_source_persistent_uniform_k64": "cake_dsv4_009fa784c7206613d7b7",
+        "fp8_h64_prefill_source_persistent_m64": "cake_dsv4_5a02e8137c1b1bc7c58a",
+        "fp8_h64_prefill_source_persistent_m64_multi_tile": "cake_dsv4_f647b239789ffbbdbd90",
+        "fp8_h64_prefill_source_persistent_m64_multi_tile_kv4": "cake_dsv4_f647b239789ffbbdbd90",
+        "fp8_h64_source_exact": "cake_dsv4_e5e9d7f2a2798aec29ff",
+        "fp8_h8_h16_source_exact": "cake_dsv4_fee38be0a1a558bc4cf4",
+        "fp8_lowhead_h64": "cake_dsv4_cbf3168c696847fd3f69",
+        "fp8_lowhead_one_partition": "cake_dsv4_b7c345c94f3a216b24e5",
+        "fp8_lowhead_prefill": "cake_dsv4_d9d623599c9697a9ccf3",
+        "split_reduce": "cake_dsv4_5f640d72462f26d33803",
+    },
+    "sm_103a": {
+        "bf16_h128_prefill_v42": "cake_dsv4_13091b5bf0612783f02d",
+        "bf16_h128_prefill_v42_snake": "cake_dsv4_cf7e7f261a5e1c42f98f",
+        "bf16_h128_split5_reduce": "cake_dsv4_e880e7c12a67fe035a37",
+        "bf16_h128_swa128": "cake_dsv4_16749fca629bdea1d909",
+        "bf16_h128_topk128x_row_first": "cake_dsv4_36c80272414ea39a56d2",
+        "bf16_h128_topk128x_row_first_vsplit": "cake_dsv4_51eee53d2d4f8b5344e9",
+        "bf16_h128_topk128x_split4_sm100": "cake_dsv4_3eaffaa117944ce5e14e",
+        "bf16_h128_topk4x_v52": "cake_dsv4_1aefb39e2f65a24b1628",
+        "bf16_h16_h32_swa128_v44": "cake_dsv4_750835d54fe97cfc7ad4",
+        "bf16_h32_topk128x_early_v47": "cake_dsv4_f81486848bf3b4e05349",
+        "bf16_h64_compressed_q8_v38": "cake_dsv4_82ca6fee14338e07ece4",
+        "bf16_h64_compressed_reduce": "cake_dsv4_50a2c6ca93259d30db6b",
+        "bf16_h64_guard_q_tma_batch_r25": "cake_dsv4_1cd047de4a9a94e4f214",
+        "bf16_h64_prefill": "cake_dsv4_7d6d09e037a1a9e99d87",
+        "bf16_h8_h16_source_exact": "cake_dsv4_089147c4b5a5062fab1b",
+        "bf16_h8_swa128_v43": "cake_dsv4_7850190a53cc07aba85a",
+        "bf16_swa128_single_cta": "cake_dsv4_13f0ca13f90a32070cfe",
+        "fp8_h128_prefill_source_persistent": "cake_dsv4_7c51b4b6d5b345d4fe03",
+        "fp8_h128_prefill_source_persistent_no_pdl": "cake_dsv4_132f453f8df4a8300d5c",
+        "fp8_h128_prefill_source_persistent_uniform": "cake_dsv4_8bcdc9f41a3d74231d15",
+        "fp8_h128_prefill_source_persistent_uniform_k64": "cake_dsv4_8bcdc9f41a3d74231d15",
+        "fp8_h64_prefill_source_persistent_m64": "cake_dsv4_40932cb442b76026206f",
+        "fp8_h64_prefill_source_persistent_m64_multi_tile": "cake_dsv4_3fce080f96f6dc5e9f8c",
+        "fp8_h64_prefill_source_persistent_m64_multi_tile_kv4": "cake_dsv4_3fce080f96f6dc5e9f8c",
+        "fp8_h64_source_exact": "cake_dsv4_e5e9d7f2a2798aec29ff",
+        "fp8_h8_h16_source_exact": "cake_dsv4_ff4aa022aa97fded6032",
+        "fp8_lowhead_h64": "cake_dsv4_cbf3168c696847fd3f69",
+        "fp8_lowhead_one_partition": "cake_dsv4_b78d35b605cb10daf20f",
+        "fp8_lowhead_prefill": "cake_dsv4_e21760e2024d7c1e85c9",
+        "split_reduce": "cake_dsv4_5f640d72462f26d33803",
+    },
+    "sm_107a": {
+        "fp8_h128_prefill_source_persistent": "cake_dsv4_77fc7066e2ba5bebb062",
+        "fp8_h128_prefill_source_persistent_uniform": "cake_dsv4_4a6718b7a2ca825d8800",
+        "fp8_h128_prefill_source_persistent_uniform_k64": "cake_dsv4_7074d4c5b808db91fcba",
+        "fp8_h64_prefill_source_persistent_m64": "cake_dsv4_df5d069562864950e48b",
+        "fp8_h64_prefill_source_persistent_m64_multi_tile": "cake_dsv4_ffa4216b35dae8d46543",
+        "fp8_h64_prefill_source_persistent_m64_multi_tile_kv4": "cake_dsv4_8afa079cbcc688b8b5b9",
+        "fp8_lowhead_prefill": "cake_dsv4_8625d6529808d0d51fc2",
+    },
+}
+
+
+def _registration(arch: str, variant: str) -> dict[str, object]:
+    """The registration of one BF16 / FP8 variant on ``arch``, read from the tables."""
+    program = VARIANTS[arch][variant]
+    record = MODULES[program]
+    if arch not in record["arches"]:
+        raise ValueError(
+            f"CAKE DSv4 variant {variant} ({arch}) names {program}, "
+            f"which is built for {record['arches']} only"
+        )
+    registration: dict[str, object] = {
+        "arg_plan": tuple(tuple(pair) for pair in ARG_PLANS[record["arg_plan"]]),
+        "compile_flags": list(record["compile_flags"]),
+    }
+    if "host_linkage_flags" in record:
+        registration["host_linkage_flags"] = list(record["host_linkage_flags"])
+    registration["identity"] = record["identity"][arch]
+    registration["sources"] = list(record["sources"])
+    return registration
+
+
+def _arch_registration(arch: str) -> dict[str, dict[str, dict[str, object]]]:
+    """Every variant of ``arch`` (BF16 / FP8 and, where it has them, NVFP4), in key order."""
+    variants = {
+        variant: _registration(arch, variant) for variant in VARIANTS.get(arch, {})
+    }
+    nvfp4 = _nvfp4_variants(arch) if arch in _NVFP4_IDENTITIES else {}
+    shared = sorted(set(variants) & set(nvfp4))
+    if shared:
+        raise ValueError(f"CAKE DSv4 variant keys registered twice on {arch}: {shared}")
+    variants.update(nvfp4)
+    return {"variants": dict(sorted(variants.items()))}
+
+
+_ARCH_REGISTRATIONS = {arch: _arch_registration(arch) for arch in _ARCH_NVCC_FLAGS}
 
 
 def _get_csrc_dir() -> Path:
@@ -1519,7 +1518,13 @@ def get_cake_dsv4_spec(variant: str, *, arch: str) -> dict:
         return _ARCH_REGISTRATIONS[arch]["variants"][variant]
     except KeyError as exc:
         raise ValueError(
-            f"CAKE DSv4 variant has no generated source contract: {variant}"
+            f"CAKE DSv4 variant has no generated source contract: {variant} ({arch})"
+            + (
+                " (SM107 runs the FP8 decode route's persistent, M64 and low-head "
+                "prefill programs only)"
+                if arch == "sm_107a"
+                else ""
+            )
         ) from exc
 
 

@@ -45,10 +45,9 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define THREADS 256
 
 #include <math_constants.h>
-
 extern "C" {
 
-__global__ __launch_bounds__(256) void
+__global__ __launch_bounds__(THREADS) void
 kernel_cake_mok_zero(uint16_t* __restrict__ gate, uint16_t* __restrict__ up, uint16_t* __restrict__ down, int* __restrict__ counts, long long elements)
 {
     const int tid = threadIdx.x;
@@ -65,7 +64,7 @@ kernel_cake_mok_zero(uint16_t* __restrict__ gate, uint16_t* __restrict__ up, uin
     int expert = blockIdx.y;
     if (counts[expert] != 0) return;
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     long long offset = (long long)expert * elements;
     #pragma unroll 1
     for (long long index = (long long)(bid * 256 + tid); index < elements; index += gridDim.x * 256) {

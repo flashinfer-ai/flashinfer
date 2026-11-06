@@ -28,12 +28,16 @@ def _top_k_varlen_reference(
     pre_idx=None,
     row_starts=None,
     absolute_indices=False,
+    page_table=None,
+    page_size=None,
+    next_n=1,
     **_unused,
 ):
     """Per-row top-K with seq_lens masking (window ``[row_starts[r],
     row_starts[r] + seq_lens[r])`` with window-local indices when
     ``row_starts`` is given, absolute columns with ``absolute_indices``).
     Reference uses torch.topk on each row."""
+    page_size = 1 if page_size is None else page_size
     num_rows, N = logits.shape
     indices = torch.empty(num_rows, top_k, dtype=torch.int32, device=logits.device)
     logits_f32 = logits.to(torch.float32)
@@ -44,7 +48,12 @@ def _top_k_varlen_reference(
         n = max(min(s + int(seq_lens[r].item()), N) - s, 0)
         row = logits_f32[r, s : s + n]
         _, idx = torch.topk(row, min(top_k, n), largest=True, sorted=False)
-        indices[r, : len(idx)] = idx.to(torch.int32) + (s if absolute_indices else 0)
+        idx = idx.to(torch.int32) + (s if absolute_indices else 0)
+        if page_table is not None:
+            pt = page_table[r // next_n].to(torch.int64)
+            i64 = idx.to(torch.int64)
+            idx = ((pt[i64 // page_size] * page_size) + i64 % page_size).to(torch.int32)
+        indices[r, : len(idx)] = idx
         if len(idx) < top_k:
             indices[r, len(idx) :] = -1
     return indices
@@ -58,6 +67,9 @@ def _top_k_varlen_check(
     top_k=None,
     row_starts=None,
     absolute_indices=False,
+    page_table=None,
+    page_size=None,
+    next_n=1,
     **_unused,
 ):
     """Tie-safe value check: every selected value must be >= the row's K-th largest.
@@ -90,10 +102,46 @@ def _top_k_varlen_check(
 
     logits_f32 = logits.to(torch.float32)
     N = logits_f32.shape[1]
+    if page_table is not None:
+        ps = 1 if page_size is None else int(page_size)
+        pt64 = page_table.to(torch.int64)
     for r in range(act.shape[0]):
         s = min(max(int(row_starts[r].item()), 0), N) if row_starts is not None else 0
         n = max(min(s + int(seq_lens[r].item()), N) - s, 0)
         sel = act[r].long()  # window-local indices (absolute: shift back by s)
+        if page_table is not None:
+            # paged output holds physical KV slots: map every valid slot back to
+            # its logits column through the request's page map (one physical
+            # page per logical page, so the map inverts), then validate the
+            # columns exactly like the other frames -- ties at the K-th value
+            # may be broken differently from the reference and still be correct.
+            # Only the pages the row's length spans take part: later table
+            # entries are padding (and may repeat a live page id). A slot
+            # outside the spanned pages is a failure.
+            row_pt = pt64[r // next_n][: (n + ps - 1) // ps]
+            valid = sel >= 0
+            slots = sel[valid]
+            # an all-pad row (an empty request, or a full row wrongly padded)
+            # has nothing to map; the pad checks below decide it. A slot in a
+            # row that spans no pages is a failure, not an empty reduction.
+            if slots.numel():
+                if row_pt.numel() == 0:
+                    return False
+                phys = slots // ps
+                if bool((phys > row_pt.max()).any()):
+                    return False
+                inv = torch.full(
+                    (int(row_pt.max().item()) + 1,),
+                    -1,
+                    dtype=torch.int64,
+                    device=sel.device,
+                )
+                inv[row_pt] = torch.arange(row_pt.numel(), device=sel.device)
+                logical = inv[phys]
+                if bool((logical < 0).any()):
+                    return False
+                sel = sel.clone()
+                sel[valid] = logical * ps + slots % ps
         if absolute_indices:
             sel = torch.where(sel >= 0, sel - s, sel)  # -1 pads stay -1
         if n < top_k:
@@ -123,6 +171,7 @@ def _top_k_varlen_init(
     batch_size: int,
     max_seq_len: int = 8192,
     top_k: int = 1024,
+    max_pages: int = 0,  # paged-output axis; the example never builds a page table
     device: str = "cuda",
     seed: int = 0,
 ):
@@ -169,6 +218,9 @@ top_k_varlen_trace = TraceTemplate(
         # init()'s max_seq_len, which sizes the example buffer
         "num_cols": Const(abbrev="n", description="Logits row width (padded)."),
         "top_k": Const(abbrev="k", description="Number of top elements per row."),
+        "max_pages": Var(
+            description="Page-table entries per request (paged output only)."
+        ),
     },
     inputs={
         "logits": Tensor(
@@ -221,6 +273,17 @@ top_k_varlen_trace = TraceTemplate(
                 "so it must hold at every replay. Refused with ValueError without "
                 "row_starts."
             ),
+        ),
+        "page_table": Tensor(
+            ["batch_size", "max_pages"],
+            dtype="int32",
+            optional=True,
+            description="Paged decode output: indices leave as page_table[req, c // page_size] * page_size + c % page_size (gvr_2 only).",
+        ),
+        "page_size": Scalar(
+            "int32",
+            optional=True,
+            description="Columns per page_table entry (power of two).",
         ),
     },
     outputs={

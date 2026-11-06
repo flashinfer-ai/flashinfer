@@ -20,7 +20,7 @@ import functools
 from collections.abc import Mapping
 from pathlib import Path
 import json
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 from . import env as jit_env
 from .cake_fmha import CAKE_FMHA_JIT_TAG, get_cake_fmha_csrc_dir
@@ -122,6 +122,10 @@ def _get_dcp_sources(
 # world and (split-KV families) the split count are defined on the compile line
 # (``-DNAME=value``), so one module per program, target and constant set.  The
 # program name is the delivered-text identity the exporter assigned.
+# The programs of a family compile one folded kernel source
+# (``cuda/dcp_spec/<family>_kernel.cu``; fp8_d256 one per architecture) and one
+# folded binding source; the ``-DCAKE_FMHA_DCP_*`` values in a program's
+# ``compile_flags`` select its text (its kernel symbol stays its own).
 
 DcpStaticFamily = Literal["bf16_v1", "bf16_v4", "fp8_d128", "fp8_d256"]
 DCP_STATIC_FAMILIES: tuple[str, ...] = ("bf16_v1", "bf16_v4", "fp8_d128", "fp8_d256")
@@ -245,12 +249,35 @@ def _load_dcp_spec_static_module(
 # On-device load-balanced DCP families (CAKE-685 round 3)
 # ---------------------------------------------------------------------------
 #
-# Each family ships one shape-independent program for both architectures
-# (``cuda/dcp_spec/<family>/kernel.cu``; the shared-base prologue is switched
-# by ``__CUDA_ARCH__``).  Its 32- and 64-row packed instances are the
-# manifest members' ``defines`` (``-DN_ROWS=32`` / ``64``), selected by the
-# packed-row tile the request's speculative rows need; batch, heads, lengths,
-# rank and world are runtime kernel arguments.
+# Each family ships shape-independent programs for both architectures (the
+# shared-base prologue is switched by ``__CUDA_ARCH__``).  A manifest member's
+# ``sources`` names the program body it compiles: either the family's folded
+# ``cuda/dcp_spec/<family>/kernel.cu`` (a family with ``program_variants``
+# folds those programs into that one source and
+# ``-DCAKE_FMHA_DCP_<KEY>=<value>`` selects the program's text), or a
+# per-instance unit
+# ``cuda/dcp_spec/<family>/cake_fmha_<family>_program<P>_n<N>.cu`` that
+# holds one program for one packed-row tile (the E4M3 head_dim-128
+# family's program 0, the head_dim-256 family's programs 1 and 2).  A family
+# can mix both forms; the loader passes the same defines to either.  The 32-
+# and 64-row packed instances are the members' ``defines`` (``-DN_ROWS=32`` /
+# ``64``), selected by the packed-row tile the request's speculative rows
+# need; every member also defines ``Q_BOX_TOKENS``, the tokens per Q TMA box
+# of its program, from which the adapter encodes the Q tensor map (the
+# swapped-QK whole-tile programs load 32-row boxes, every other program the
+# 64-row tile).  Batch, heads, lengths, rank and world are runtime kernel
+# arguments.
+#
+# Dynamic shared memory: the launch binding sets and launches with it.  The
+# BF16 and E4M3 head_dim-256 bindings hold a constant equal to the family's
+# ``dynamic_shared_memory_bytes``.  The E4M3 head_dim-128 programs differ
+# (program 0: 177152 bytes, programs 1 and 2: 160768), so that family has no
+# family-level value: each member defines ``DYNAMIC_SMEM_BYTES`` (passed with
+# the other member defines) and its binding reads that define.  The balanced
+# route's ``launch.shared_mem_bytes`` records the same sizes for readers of
+# the registry: one integer when every program of the family uses the same
+# size, else an object mapping each program value (as a string) to its bytes.
+# No loader code reads that route field.
 
 DcpBalancedFamily = Literal[
     "dcp_spec_bf16_balanced",
@@ -267,8 +294,21 @@ DCP_BALANCED_N_ROWS: tuple[int, ...] = (32, 64)
 _DCP_BALANCED_SELECTOR_KEY = "n_rows"
 
 
+def dcp_balanced_program_variants(family: str) -> Optional[Mapping[str, Any]]:
+    """The ``program_variants`` block of a balanced family, or ``None`` when the family ships one program.
+
+    A family with program variants ships one traced program per value of its
+    selector ``key`` (folded into one source, ``-DCAKE_FMHA_DCP_<KEY>`` selects
+    the program's text) and the host selects the program from launch metadata
+    (:func:`flashinfer.cake_dcp.dcp_balanced_program`).
+    """
+
+    route = get_dcp_spec_registry()["balanced_routes"].get(family)
+    return None if route is None else route.get("program_variants")
+
+
 def _validate_balanced_specialization(
-    family: str, target: DcpSpecTarget, n_rows: int
+    family: str, target: DcpSpecTarget, n_rows: int, program: Optional[int] = None
 ) -> None:
     if family not in DCP_BALANCED_FAMILIES:
         raise ValueError(f"unsupported balanced DCP family: {family}")
@@ -278,26 +318,77 @@ def _validate_balanced_specialization(
         raise ValueError(
             f"balanced DCP n_rows must be one of {DCP_BALANCED_N_ROWS}, got {n_rows}"
         )
+    variants = dcp_balanced_program_variants(family)
+    if variants is None:
+        if program is not None:
+            raise ValueError(
+                f"balanced DCP family {family} ships one program; got program={program!r}"
+            )
+    elif program not in [int(value) for value in variants["values"]]:
+        raise ValueError(
+            f"balanced DCP family {family} program ({variants['key']}) must be one of "
+            f"{list(variants['values'])}, got {program!r}"
+        )
+
+
+def _balanced_selector(
+    family: str, n_rows: int, program: Optional[int]
+) -> dict[str, int]:
+    selector = {_DCP_BALANCED_SELECTOR_KEY: n_rows}
+    variants = dcp_balanced_program_variants(family)
+    if variants is not None:
+        selector[str(variants["key"])] = int(program)  # type: ignore[arg-type]
+    return selector
+
+
+def _balanced_program_defines(family: str, program: Optional[int]) -> list[str]:
+    """``-DCAKE_FMHA_DCP_<KEY>=<program>`` for a family with ``program_variants``.
+
+    Its programs share one folded source; the define selects the program's text.
+    """
+
+    variants = dcp_balanced_program_variants(family)
+    if variants is None or program is None:
+        return []
+    return [f"-DCAKE_FMHA_DCP_{str(variants['key']).upper()}={int(program)}"]
 
 
 def get_dcp_spec_balanced_uri(
-    family: DcpBalancedFamily, target: DcpSpecTarget, n_rows: int
+    family: DcpBalancedFamily,
+    target: DcpSpecTarget,
+    n_rows: int,
+    program: Optional[int] = None,
 ) -> str:
-    _validate_balanced_specialization(family, target, n_rows)
-    return f"cake_fmha_{family}_n{n_rows}_{target}_{CAKE_FMHA_JIT_TAG}"
+    _validate_balanced_specialization(family, target, n_rows, program)
+    variants = dcp_balanced_program_variants(family)
+    program_tag = "" if variants is None else f"_{variants['key']}{int(program)}"  # type: ignore[arg-type]
+    return f"cake_fmha_{family}_n{n_rows}{program_tag}_{target}_{CAKE_FMHA_JIT_TAG}"
 
 
 def _get_dcp_balanced_sources(
-    family: DcpBalancedFamily, target: DcpSpecTarget, n_rows: int
+    family: DcpBalancedFamily,
+    target: DcpSpecTarget,
+    n_rows: int,
+    program: Optional[int] = None,
 ) -> tuple[Path, Path, Path, Mapping[str, int]]:
     """``(program body, exported launch binding, FlashInfer adapter, instance defines)`` of one instance."""
 
-    selector = {_DCP_BALANCED_SELECTOR_KEY: n_rows}
+    selector = _balanced_selector(family, n_rows, program)
     body, api_binding = _get_dcp_sources(family, target, selector)
     defines = dict(_get_dcp_member(family, selector).get("defines", {}))
     if defines.get("N_ROWS") != n_rows:
         raise RuntimeError(
             f"Cake FMHA DCP member {family} {selector!r} does not define N_ROWS={n_rows}"
+        )
+    q_box_tokens = defines.get("Q_BOX_TOKENS")
+    if (
+        not isinstance(q_box_tokens, int)
+        or isinstance(q_box_tokens, bool)
+        or q_box_tokens <= 0
+    ):
+        raise RuntimeError(
+            f"Cake FMHA DCP member {family} {selector!r} does not define Q_BOX_TOKENS "
+            "(the tokens per Q TMA box of its program)"
         )
     launch_binding = (
         get_cake_fmha_csrc_dir() / _get_dcp_family(family)["binding_source"]
@@ -309,20 +400,28 @@ def _get_dcp_balanced_sources(
 
 @functools.cache
 def gen_dcp_spec_balanced_module(
-    family: DcpBalancedFamily, target: DcpSpecTarget, n_rows: int
+    family: DcpBalancedFamily,
+    target: DcpSpecTarget,
+    n_rows: int,
+    program: Optional[int] = None,
 ) -> JitSpec:
-    """Generate one shape-independent balanced DCP module (one per packed tile).
+    """Generate one shape-independent balanced DCP module (one per packed tile and program).
 
-    The family's single program is instantiated with the manifest member's
-    defines (``-DN_ROWS``).  The exported launch binding owns the kernel's
-    thread count and dynamic shared memory; the FlashInfer adapter encodes the
-    tensor maps, carves the caller-owned scratch and calls it as
-    ``CAKE_FMHA_DCP_BALANCED_LAUNCH``.
+    The family's program (``program`` selects it for families with
+    ``program_variants``; see :func:`dcp_balanced_program_variants`) is
+    instantiated with the manifest member's defines (``-DN_ROWS``, and
+    ``-DDYNAMIC_SMEM_BYTES`` for a family whose programs differ in dynamic
+    shared memory).  The exported launch binding owns the kernel's thread
+    count and sets the dynamic shared memory: a constant equal to the
+    family's ``dynamic_shared_memory_bytes``, or the member's
+    ``DYNAMIC_SMEM_BYTES`` define when the family has no family-level value.
+    The FlashInfer adapter encodes the tensor maps, carves the caller-owned
+    scratch and calls the binding as ``CAKE_FMHA_DCP_BALANCED_LAUNCH``.
     """
 
-    uri = get_dcp_spec_balanced_uri(family, target, n_rows)
+    uri = get_dcp_spec_balanced_uri(family, target, n_rows, program)
     body, launch_binding, api_binding, defines = _get_dcp_balanced_sources(
-        family, target, n_rows
+        family, target, n_rows, program
     )
     manifest_family = _get_dcp_family(family)
     csrc_dir = get_cake_fmha_csrc_dir()
@@ -333,6 +432,7 @@ def gen_dcp_spec_balanced_module(
         extra_cuda_cflags=[
             *_DCP_SPEC_NVCC_FLAGS[target],
             *(f"-D{name}={value}" for name, value in sorted(defines.items())),
+            *_balanced_program_defines(family, program),
             f"-DCAKE_FMHA_DCP_BALANCED_LAUNCH={manifest_family['launch_binding']}",
         ],
         extra_include_paths=[csrc_dir, jit_env.FLASHINFER_CSRC_DIR],
@@ -344,9 +444,14 @@ def gen_dcp_spec_balanced_module(
 
 @functools.cache
 def load_dcp_spec_balanced_module(
-    family: DcpBalancedFamily, target: DcpSpecTarget, n_rows: int
+    family: DcpBalancedFamily,
+    target: DcpSpecTarget,
+    n_rows: int,
+    program: Optional[int] = None,
 ):
-    module = gen_dcp_spec_balanced_module(family, target, n_rows).build_and_load()
+    module = gen_dcp_spec_balanced_module(
+        family, target, n_rows, program
+    ).build_and_load()
     logger.info(f"Loaded balanced DCP speculative FMHA module: {module}")
     return module
 
@@ -358,6 +463,7 @@ __all__ = [
     "DcpBalancedFamily",
     "DcpSpecTarget",
     "DcpStaticFamily",
+    "dcp_balanced_program_variants",
     "gen_dcp_spec_balanced_module",
     "gen_dcp_spec_static_module",
     "get_dcp_spec_balanced_uri",

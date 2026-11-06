@@ -1,0 +1,2355 @@
+{
+  "hardware": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition (SM120)",
+  "driver": "615.71.09",
+  "torch": "2.14.1+cu130",
+  "cuda": "13.0",
+  "cutlass_dsl": "4.8.0",
+  "tvm_ffi": "0.1.14.post1",
+  "cupti_python": "13.0.1",
+  "base_revision": "333217ef3",
+  "shape": {
+    "hidden": 2048,
+    "intermediate": 512,
+    "experts": 512,
+    "top_k": 10,
+    "activation": "SwiGLU",
+    "input_weights_output_dtype": "FP16"
+  },
+  "scope": "Complete routed-expert GPU pipeline with precomputed routing; no routing selection, shared experts, communication, host enqueue or serving. Synthetic tensors at common model geometry; no checkpoint conversion or serving claim.",
+  "timer": "CUPTI first-to-last GPU activity span from a single-call CUDA Graph replay; cold flush is outside the span. Warm means repeated identical operands, not guaranteed L2 residency.",
+  "baseline": "Flat cutlass_fused_moe FP16; on SM120 this uses the SM80-family native implementation. All 8 x 8 advertised GEMM1/GEMM2 pairs plus default were attempted; 16 pairs require unsupported shared memory. Not a claim over every library.",
+  "selection": "All 16 Frost tactics and native Cartesian product; freeze winners then four independent ABBA validation blocks (50 samples per call).",
+  "reference": "FP64 dot products with FP32 activation, FP16 intermediate and expert outputs, ordered FP32 combine, BF16-rounded route scores for both paths. Relative L2 < 0.003 and normalized max < 0.01 for every timed candidate.",
+  "reproduction": "python benchmarks/bench_frost_low_latency_fp16.py --tokens T --hidden 2048 --intermediate 512 --experts 512 --top-k 10 --cache-mode CACHE --expert-reuse REUSE --output result.json",
+  "harness_note": "Measured with the pre-integration CUPTI-only form of the checked-in benchmark; the checked-in script adds an explicit globaltimer option and expanded provenance. Device source hashes are below.",
+  "device_source_sha256": {
+    "flashinfer/fused_moe/backends/frost_low_latency/__init__.py": "19cca05a476f8244eec58829041dec176a248e5f16d0aeb9e3ef969f94ad320d",
+    "flashinfer/fused_moe/backends/frost_low_latency/activation.py": "69b1247b0c56b785171703208a9292dcd31d3d1e340720eb072b61315c0de07a",
+    "flashinfer/fused_moe/backends/frost_low_latency/fma/__init__.py": "de6683449a20e3dad045d702e254ad5f62c17399513af286de9074a8c746ecc3",
+    "flashinfer/fused_moe/backends/frost_low_latency/fma/activation_config.py": "1b51203e8fbb681395798ba8711592e00c37f48c48667a2c76ef12d3c069193a",
+    "flashinfer/fused_moe/backends/frost_low_latency/fma/activations.py": "99f2ef68515e9d6c8bbf8626f4c1ad32acac9b7426b75292c6966769c61dcbfa",
+    "flashinfer/fused_moe/backends/frost_low_latency/fma/bf16/__init__.py": "b4d3306414a9948b6870f55f19903bf36e21053329f8ccb8052bd6d22b076d35",
+    "flashinfer/fused_moe/backends/frost_low_latency/fma/bf16/fma_fc1.py": "ae185c3718575ceb4cb36655b383adf6dd1e4f464b9da0283110606626f22ae6",
+    "flashinfer/fused_moe/backends/frost_low_latency/fma/bf16/fma_fc2.py": "0d02ae469a12bee58e1426c04b923dd8a9b90f7e13673e0a81677294ee400a1b",
+    "flashinfer/fused_moe/backends/frost_low_latency/fma/bf16/runtime.py": "55bf2d2e5066e45e9986d6e2167f7498383017b00a68b0f8e81845f89b95925d",
+    "flashinfer/fused_moe/backends/frost_low_latency/fma/mxfp8/__init__.py": "b4d3306414a9948b6870f55f19903bf36e21053329f8ccb8052bd6d22b076d35",
+    "flashinfer/fused_moe/backends/frost_low_latency/fma/mxfp8/fma_common.py": "3c5cc0878a17b82f21e09500dc3ea2bc34428facc04955bfaf5e95211f517ade",
+    "flashinfer/fused_moe/backends/frost_low_latency/fma/mxfp8/fma_fc1.py": "a407fb74eba2cef85131f547d35f4e3206a1c729421addccd02d7541b20739b1",
+    "flashinfer/fused_moe/backends/frost_low_latency/fma/mxfp8/fma_fc2.py": "fb2bed49c325e4c0b9ed9b003932f0416cdffac9babd6fa4a6bff1ce45b83397",
+    "flashinfer/fused_moe/backends/frost_low_latency/fma/nvfp4/__init__.py": "b4d3306414a9948b6870f55f19903bf36e21053329f8ccb8052bd6d22b076d35",
+    "flashinfer/fused_moe/backends/frost_low_latency/fma/nvfp4/fma_fc1_o2.py": "6086984981a456144f89d0c93b3566875fef39f2a98540ede3814dade0df42ae",
+    "flashinfer/fused_moe/backends/frost_low_latency/fma/nvfp4/fma_fc1_o4.py": "cbb7ba0d68c7a0e5719f2fd82ccea55434cacfcaad6e2d35fdb8a8e5a55e22db",
+    "flashinfer/fused_moe/backends/frost_low_latency/fma/nvfp4/fma_fc2.py": "d53520da9bee139699d159d8070ca20dda12e1fba69a14e9f2b943fec888fe7f",
+    "flashinfer/fused_moe/backends/frost_low_latency/fma/nvfp4/runtime.py": "fd0f25d9c746dbe1da0a3829cec25d78d4a8d9394c801bc13839d7d1629cd651",
+    "flashinfer/fused_moe/backends/frost_low_latency/fma/runtime.py": "4d1ad53bb03efa42a2b8224e4ba8b0e0cf343e6743498ec3243f3713f842a132",
+    "flashinfer/fused_moe/backends/frost_low_latency/gemm.py": "5d53868fb2190bc0499eb3b28fc46607c1d2c9b753c610780a8beb428c13cd83",
+    "flashinfer/fused_moe/backends/frost_low_latency/io.py": "bce77e22086f81bf78f65f62ab31d465d721094d4160e4ace568fea914e268db",
+    "flashinfer/fused_moe/backends/frost_low_latency/nvfp4.py": "04e7a0aa7dfbb04fa205380dfea4d27213ab2ceb7b55988267a0279899ce508c",
+    "flashinfer/fused_moe/backends/frost_low_latency/pipeline.py": "18e469ce116d4e8b01921c321e50125c76eb8c9a419a16392a5dba31ad8f1469",
+    "flashinfer/fused_moe/backends/frost_low_latency/prepare.py": "cc6849098b7d720ab1aa90dba7936d83b58564e180ab56243934f23e78f5a038",
+    "flashinfer/fused_moe/backends/frost_low_latency/quantization.py": "de0c5a7d2b63f0e5381560e75f6f97d9b7401d6134d8ac2dbfe30e0a6efec446",
+    "flashinfer/fused_moe/backends/frost_low_latency/runner.py": "259204276dfd49a5ef722f0e28b72b976b710249d463c22c981642ea3f81aca7",
+    "flashinfer/fused_moe/backends/frost_low_latency/runtime.py": "6574858a564a6cd9950e20ba830b51087a520d8b3c79a9000950a34066c9a757"
+  },
+  "rows": [
+    {
+      "tokens": 1,
+      "cache_mode": "cold",
+      "expert_reuse": "disjoint",
+      "median_us": {
+        "frost": 45.327749999999995,
+        "cutlass": 63.19925
+      },
+      "speedup": 1.3942728240426672,
+      "selected_tactics": {
+        "frost": [
+          "ffma",
+          1,
+          2
+        ],
+        "cutlass": [
+          2,
+          9
+        ]
+      },
+      "native_tactic_counts": [
+        8,
+        8
+      ],
+      "native_search": "exhaustive advertised GEMM1 x GEMM2 Cartesian product plus default",
+      "rejected_native_pairs": 16,
+      "aa_ratio": {
+        "frost": 0.9982531355390482,
+        "cutlass": 0.9981036437694822
+      },
+      "max_relative_l2": 0.00024962539285432444,
+      "max_normalized_error": 0.000514668039114771,
+      "validation_blocks": [
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-0-A1",
+          "median_us": 63.150999999999996
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-0-B1",
+          "median_us": 45.1995
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-0-B2",
+          "median_us": 45.39149999999999
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-0-A2",
+          "median_us": 63.1515
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-1-A1",
+          "median_us": 63.135
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-1-B1",
+          "median_us": 45.295500000000004
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-1-B2",
+          "median_us": 45.359
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-1-A2",
+          "median_us": 63.32749999999999
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-2-A1",
+          "median_us": 63.167500000000004
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-2-B1",
+          "median_us": 45.311499999999995
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-2-B2",
+          "median_us": 45.344
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-2-A2",
+          "median_us": 63.230999999999995
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-3-A1",
+          "median_us": 63.232
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-3-B1",
+          "median_us": 45.28
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-3-B2",
+          "median_us": 45.375
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-3-A2",
+          "median_us": 63.359
+        }
+      ],
+      "warm_event_chain_us": null,
+      "measurement_harness_sha256": "27a3b1cf4cccdffe8f861d6bef749cdb5e9d6e8ec9741367ff88934594b79316"
+    },
+    {
+      "tokens": 1,
+      "cache_mode": "cold",
+      "expert_reuse": "shared",
+      "median_us": {
+        "frost": 45.2795,
+        "cutlass": 63.263
+      },
+      "speedup": 1.3971664881458496,
+      "selected_tactics": {
+        "frost": [
+          "ffma",
+          2,
+          4
+        ],
+        "cutlass": [
+          2,
+          9
+        ]
+      },
+      "native_tactic_counts": [
+        8,
+        8
+      ],
+      "native_search": "exhaustive advertised GEMM1 x GEMM2 Cartesian product plus default",
+      "rejected_native_pairs": 16,
+      "aa_ratio": {
+        "frost": 0.9991115476729171,
+        "cutlass": 0.9992416462595782
+      },
+      "max_relative_l2": 0.00024962539285432444,
+      "max_normalized_error": 0.000514668039114771,
+      "validation_blocks": [
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-0-A1",
+          "median_us": 63.199000000000005
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-0-B1",
+          "median_us": 45.2315
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-0-B2",
+          "median_us": 45.3275
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-0-A2",
+          "median_us": 63.10300000000001
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-1-A1",
+          "median_us": 63.230999999999995
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-1-B1",
+          "median_us": 45.2795
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-1-B2",
+          "median_us": 45.2795
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-1-A2",
+          "median_us": 63.263
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-2-A1",
+          "median_us": 63.295500000000004
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-2-B1",
+          "median_us": 45.247
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-2-B2",
+          "median_us": 45.1995
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-2-A2",
+          "median_us": 63.32699999999999
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-3-A1",
+          "median_us": 63.263
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-3-B1",
+          "median_us": 45.376
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-3-B2",
+          "median_us": 45.407999999999994
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-3-A2",
+          "median_us": 63.327
+        }
+      ],
+      "warm_event_chain_us": null,
+      "measurement_harness_sha256": "27a3b1cf4cccdffe8f861d6bef749cdb5e9d6e8ec9741367ff88934594b79316"
+    },
+    {
+      "tokens": 1,
+      "cache_mode": "warm",
+      "expert_reuse": "disjoint",
+      "median_us": {
+        "frost": 11.136,
+        "cutlass": 33.696
+      },
+      "speedup": 3.0258620689655173,
+      "selected_tactics": {
+        "frost": [
+          "ffma",
+          1,
+          1
+        ],
+        "cutlass": [
+          2,
+          9
+        ]
+      },
+      "native_tactic_counts": [
+        8,
+        8
+      ],
+      "native_search": "exhaustive advertised GEMM1 x GEMM2 Cartesian product plus default",
+      "rejected_native_pairs": 16,
+      "aa_ratio": {
+        "frost": 1.0,
+        "cutlass": 0.9995177469135803
+      },
+      "max_relative_l2": 0.00024962539285432444,
+      "max_normalized_error": 0.000514668039114771,
+      "validation_blocks": [
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-0-A1",
+          "median_us": 33.5995
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-0-B1",
+          "median_us": 11.136
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-0-B2",
+          "median_us": 11.136
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-0-A2",
+          "median_us": 33.568
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-1-A1",
+          "median_us": 33.551500000000004
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-1-B1",
+          "median_us": 11.1675
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-1-B2",
+          "median_us": 11.136
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-1-A2",
+          "median_us": 33.711
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-2-A1",
+          "median_us": 33.807500000000005
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-2-B1",
+          "median_us": 11.136
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-2-B2",
+          "median_us": 11.136
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-2-A2",
+          "median_us": 33.696
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-3-A1",
+          "median_us": 33.76
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-3-B1",
+          "median_us": 11.1355
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-3-B2",
+          "median_us": 11.104
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-3-A2",
+          "median_us": 33.696
+        }
+      ],
+      "warm_event_chain_us": {
+        "frost": {
+          "samples": [
+            10.724499821662903,
+            10.681499727070332,
+            10.645000264048576,
+            10.63849963247776,
+            10.641749948263168,
+            10.628250427544117,
+            10.638750158250332
+          ],
+          "median": 10.641749948263168
+        },
+        "cutlass": {
+          "samples": [
+            32.69825130701065,
+            32.636500895023346,
+            32.63299912214279,
+            32.61825069785118,
+            32.60074928402901,
+            32.615501433610916,
+            32.59475156664848
+          ],
+          "median": 32.61825069785118
+        }
+      },
+      "measurement_harness_sha256": "27a3b1cf4cccdffe8f861d6bef749cdb5e9d6e8ec9741367ff88934594b79316"
+    },
+    {
+      "tokens": 1,
+      "cache_mode": "warm",
+      "expert_reuse": "shared",
+      "median_us": {
+        "frost": 11.1355,
+        "cutlass": 33.679249999999996
+      },
+      "speedup": 3.024493736248933,
+      "selected_tactics": {
+        "frost": [
+          "ffma",
+          1,
+          1
+        ],
+        "cutlass": [
+          2,
+          9
+        ]
+      },
+      "native_tactic_counts": [
+        8,
+        8
+      ],
+      "native_search": "exhaustive advertised GEMM1 x GEMM2 Cartesian product plus default",
+      "rejected_native_pairs": 16,
+      "aa_ratio": {
+        "frost": 0.9992142600574714,
+        "cutlass": 0.9973896148198685
+      },
+      "max_relative_l2": 0.00024962539285432444,
+      "max_normalized_error": 0.000514668039114771,
+      "validation_blocks": [
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-0-A1",
+          "median_us": 33.551500000000004
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-0-B1",
+          "median_us": 11.136
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-0-B2",
+          "median_us": 11.136
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-0-A2",
+          "median_us": 33.568
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-1-A1",
+          "median_us": 33.5835
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-1-B1",
+          "median_us": 11.135000000000002
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-1-B2",
+          "median_us": 11.104
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-1-A2",
+          "median_us": 33.695
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-2-A1",
+          "median_us": 33.6635
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-2-B1",
+          "median_us": 11.1195
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-2-B2",
+          "median_us": 11.167
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-2-A2",
+          "median_us": 33.728
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-3-A1",
+          "median_us": 33.712
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-3-B1",
+          "median_us": 11.104
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-3-B2",
+          "median_us": 11.136
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-3-A2",
+          "median_us": 33.728
+        }
+      ],
+      "warm_event_chain_us": {
+        "frost": {
+          "samples": [
+            10.748250409960747,
+            10.64824964851141,
+            10.639999993145466,
+            10.641749948263168,
+            10.63624955713749,
+            10.63149981200695,
+            10.625000111758709
+          ],
+          "median": 10.639999993145466
+        },
+        "cutlass": {
+          "samples": [
+            32.818250358104706,
+            32.744500786066055,
+            32.760750502347946,
+            32.74049982428551,
+            32.7257513999939,
+            32.735999673604965,
+            32.7490009367466
+          ],
+          "median": 32.744500786066055
+        }
+      },
+      "measurement_harness_sha256": "27a3b1cf4cccdffe8f861d6bef749cdb5e9d6e8ec9741367ff88934594b79316"
+    },
+    {
+      "tokens": 2,
+      "cache_mode": "cold",
+      "expert_reuse": "disjoint",
+      "median_us": {
+        "frost": 85.015,
+        "cutlass": 103.31875
+      },
+      "speedup": 1.2153002411339175,
+      "selected_tactics": {
+        "frost": [
+          "ffma",
+          4,
+          8
+        ],
+        "cutlass": [
+          3,
+          9
+        ]
+      },
+      "native_tactic_counts": [
+        8,
+        8
+      ],
+      "native_search": "exhaustive advertised GEMM1 x GEMM2 Cartesian product plus default",
+      "rejected_native_pairs": 16,
+      "aa_ratio": {
+        "frost": 1.0006560116258205,
+        "cutlass": 1.0007744227525404
+      },
+      "max_relative_l2": 0.0001926062815177552,
+      "max_normalized_error": 0.00046125461254612545,
+      "validation_blocks": [
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-0-A1",
+          "median_us": 103.4385
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-0-B1",
+          "median_us": 84.975
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-0-B2",
+          "median_us": 85.007
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-0-A2",
+          "median_us": 103.167
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-1-A1",
+          "median_us": 103.26299999999999
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-1-B1",
+          "median_us": 85.055
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-1-B2",
+          "median_us": 84.86349999999999
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-1-A2",
+          "median_us": 103.423
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-2-A1",
+          "median_us": 103.519
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-2-B1",
+          "median_us": 85.023
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-2-B2",
+          "median_us": 85.18299999999999
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-2-A2",
+          "median_us": 103.3105
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-3-A1",
+          "median_us": 103.327
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-3-B1",
+          "median_us": 85.071
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-3-B2",
+          "median_us": 84.95949999999999
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-3-A2",
+          "median_us": 103.295
+        }
+      ],
+      "warm_event_chain_us": null,
+      "measurement_harness_sha256": "27a3b1cf4cccdffe8f861d6bef749cdb5e9d6e8ec9741367ff88934594b79316"
+    },
+    {
+      "tokens": 2,
+      "cache_mode": "cold",
+      "expert_reuse": "shared",
+      "median_us": {
+        "frost": 45.62325,
+        "cutlass": 63.103
+      },
+      "speedup": 1.3831325037124713,
+      "selected_tactics": {
+        "frost": [
+          "ffma",
+          4,
+          8
+        ],
+        "cutlass": [
+          2,
+          9
+        ]
+      },
+      "native_tactic_counts": [
+        8,
+        8
+      ],
+      "native_search": "exhaustive advertised GEMM1 x GEMM2 Cartesian product plus default",
+      "rejected_native_pairs": 16,
+      "aa_ratio": {
+        "frost": 0.9987791057360131,
+        "cutlass": 0.9994930231268591
+      },
+      "max_relative_l2": 0.00023659935254066307,
+      "max_normalized_error": 0.000514668039114771,
+      "validation_blocks": [
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-0-A1",
+          "median_us": 63.0555
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-0-B1",
+          "median_us": 45.536
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-0-B2",
+          "median_us": 45.6155
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-0-A2",
+          "median_us": 63.087
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-1-A1",
+          "median_us": 63.119
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-1-B1",
+          "median_us": 45.6155
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-1-B2",
+          "median_us": 45.631
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-1-A2",
+          "median_us": 63.087
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-2-A1",
+          "median_us": 63.167
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-2-B1",
+          "median_us": 45.599500000000006
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-2-B2",
+          "median_us": 45.8715
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-2-A2",
+          "median_us": 63.230999999999995
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-3-A1",
+          "median_us": 63.0555
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-3-B1",
+          "median_us": 45.935500000000005
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-3-B2",
+          "median_us": 45.695499999999996
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-3-A2",
+          "median_us": 63.1515
+        }
+      ],
+      "warm_event_chain_us": null,
+      "measurement_harness_sha256": "27a3b1cf4cccdffe8f861d6bef749cdb5e9d6e8ec9741367ff88934594b79316"
+    },
+    {
+      "tokens": 2,
+      "cache_mode": "warm",
+      "expert_reuse": "disjoint",
+      "median_us": {
+        "frost": 19.584,
+        "cutlass": 39.271
+      },
+      "speedup": 2.0052593954248366,
+      "selected_tactics": {
+        "frost": [
+          "ffma",
+          4,
+          2
+        ],
+        "cutlass": [
+          2,
+          9
+        ]
+      },
+      "native_tactic_counts": [
+        8,
+        8
+      ],
+      "native_search": "exhaustive advertised GEMM1 x GEMM2 Cartesian product plus default",
+      "rejected_native_pairs": 16,
+      "aa_ratio": {
+        "frost": 1.0,
+        "cutlass": 1.000611387084448
+      },
+      "max_relative_l2": 0.0001926062815177552,
+      "max_normalized_error": 0.00046125461254612545,
+      "validation_blocks": [
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-0-A1",
+          "median_us": 39.2155
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-0-B1",
+          "median_us": 19.616000000000003
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-0-B2",
+          "median_us": 19.584
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-0-A2",
+          "median_us": 39.278999999999996
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-1-A1",
+          "median_us": 39.294999999999995
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-1-B1",
+          "median_us": 19.552
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-1-B2",
+          "median_us": 19.584
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-1-A2",
+          "median_us": 39.231
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-2-A1",
+          "median_us": 39.327
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-2-B1",
+          "median_us": 19.584
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-2-B2",
+          "median_us": 19.584
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-2-A2",
+          "median_us": 39.294999999999995
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-3-A1",
+          "median_us": 39.263
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-3-B1",
+          "median_us": 19.584
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-3-B2",
+          "median_us": 19.8235
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-3-A2",
+          "median_us": 39.2155
+        }
+      ],
+      "warm_event_chain_us": {
+        "frost": {
+          "samples": [
+            19.067250192165375,
+            19.010750576853752,
+            18.998250365257263,
+            18.96825060248375,
+            18.952250480651855,
+            18.977750092744827,
+            18.953999504446983
+          ],
+          "median": 18.977750092744827
+        },
+        "cutlass": {
+          "samples": [
+            38.25699910521507,
+            38.117751479148865,
+            38.14224898815155,
+            38.12500089406967,
+            38.136500865221024,
+            38.11874985694885,
+            38.12675178050995
+          ],
+          "median": 38.12675178050995
+        }
+      },
+      "measurement_harness_sha256": "27a3b1cf4cccdffe8f861d6bef749cdb5e9d6e8ec9741367ff88934594b79316"
+    },
+    {
+      "tokens": 2,
+      "cache_mode": "warm",
+      "expert_reuse": "shared",
+      "median_us": {
+        "frost": 19.456,
+        "cutlass": 34.03925
+      },
+      "speedup": 1.749550267269737,
+      "selected_tactics": {
+        "frost": [
+          "ffma",
+          4,
+          2
+        ],
+        "cutlass": [
+          2,
+          9
+        ]
+      },
+      "native_tactic_counts": [
+        8,
+        8
+      ],
+      "native_search": "exhaustive advertised GEMM1 x GEMM2 Cartesian product plus default",
+      "rejected_native_pairs": 16,
+      "aa_ratio": {
+        "frost": 1.0,
+        "cutlass": 1.0000146889252846
+      },
+      "max_relative_l2": 0.00023659935254066307,
+      "max_normalized_error": 0.000514668039114771,
+      "validation_blocks": [
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-0-A1",
+          "median_us": 34.063500000000005
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-0-B1",
+          "median_us": 19.456
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-0-B2",
+          "median_us": 19.456
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-0-A2",
+          "median_us": 34.08
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-1-A1",
+          "median_us": 34.08
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-1-B1",
+          "median_us": 19.424
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-1-B2",
+          "median_us": 19.455
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-1-A2",
+          "median_us": 34.0315
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-2-A1",
+          "median_us": 34.016
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-2-B1",
+          "median_us": 19.488
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-2-B2",
+          "median_us": 19.456
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-2-A2",
+          "median_us": 34.0315
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-3-A1",
+          "median_us": 34.015499999999996
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-3-B1",
+          "median_us": 19.456
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-3-B2",
+          "median_us": 19.488
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-3-A2",
+          "median_us": 34.047000000000004
+        }
+      ],
+      "warm_event_chain_us": {
+        "frost": {
+          "samples": [
+            19.05274949967861,
+            18.99225078523159,
+            18.969500437378883,
+            18.967999145388603,
+            18.991749733686447,
+            18.995750695466995,
+            19.17625032365322
+          ],
+          "median": 18.99225078523159
+        },
+        "cutlass": {
+          "samples": [
+            32.99900144338608,
+            32.93975070118904,
+            32.937999814748764,
+            32.91274979710579,
+            32.930001616477966,
+            32.92924910783768,
+            32.91900083422661
+          ],
+          "median": 32.930001616477966
+        }
+      },
+      "measurement_harness_sha256": "27a3b1cf4cccdffe8f861d6bef749cdb5e9d6e8ec9741367ff88934594b79316"
+    },
+    {
+      "tokens": 4,
+      "cache_mode": "cold",
+      "expert_reuse": "disjoint",
+      "median_us": {
+        "frost": 167.87025,
+        "cutlass": 183.96599999999998
+      },
+      "speedup": 1.0958820875050819,
+      "selected_tactics": {
+        "frost": [
+          "ffma",
+          4,
+          4
+        ],
+        "cutlass": [
+          2,
+          9
+        ]
+      },
+      "native_tactic_counts": [
+        8,
+        8
+      ],
+      "native_search": "exhaustive advertised GEMM1 x GEMM2 Cartesian product plus default",
+      "rejected_native_pairs": 16,
+      "aa_ratio": {
+        "frost": 0.9998109015973604,
+        "cutlass": 0.9988262783241864
+      },
+      "max_relative_l2": 0.00017650611392328698,
+      "max_normalized_error": 0.0007220216606498195,
+      "validation_blocks": [
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-0-A1",
+          "median_us": 183.6775
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-0-B1",
+          "median_us": 167.774
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-0-B2",
+          "median_us": 168.19
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-0-A2",
+          "median_us": 183.71
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-1-A1",
+          "median_us": 183.678
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-1-B1",
+          "median_us": 167.88649999999998
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-1-B2",
+          "median_us": 167.838
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-1-A2",
+          "median_us": 184.12599999999998
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-2-A1",
+          "median_us": 183.95
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-2-B1",
+          "median_us": 167.85399999999998
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-2-B2",
+          "median_us": 167.966
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-2-A2",
+          "median_us": 183.98199999999997
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-3-A1",
+          "median_us": 184.03
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-3-B1",
+          "median_us": 167.966
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-3-B2",
+          "median_us": 167.80650000000003
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-3-A2",
+          "median_us": 184.078
+        }
+      ],
+      "warm_event_chain_us": null,
+      "measurement_harness_sha256": "27a3b1cf4cccdffe8f861d6bef749cdb5e9d6e8ec9741367ff88934594b79316"
+    },
+    {
+      "tokens": 4,
+      "cache_mode": "cold",
+      "expert_reuse": "shared",
+      "median_us": {
+        "frost": 53.36750000000001,
+        "cutlass": 63.432
+      },
+      "speedup": 1.1885885604534594,
+      "selected_tactics": {
+        "frost": [
+          "ffma",
+          4,
+          2
+        ],
+        "cutlass": [
+          2,
+          9
+        ]
+      },
+      "native_tactic_counts": [
+        8,
+        8
+      ],
+      "native_search": "exhaustive advertised GEMM1 x GEMM2 Cartesian product plus default",
+      "rejected_native_pairs": 16,
+      "aa_ratio": {
+        "frost": 1.0019452334748902,
+        "cutlass": 0.9986139058322275
+      },
+      "max_relative_l2": 0.0001783496870891781,
+      "max_normalized_error": 0.0005995203836930455,
+      "validation_blocks": [
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-0-A1",
+          "median_us": 63.39150000000001
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-0-B1",
+          "median_us": 53.423
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-0-B2",
+          "median_us": 53.327
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-0-A2",
+          "median_us": 63.32749999999999
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-1-A1",
+          "median_us": 63.3595
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-1-B1",
+          "median_us": 53.4555
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-1-B2",
+          "median_us": 53.215500000000006
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-1-A2",
+          "median_us": 63.5195
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-2-A1",
+          "median_us": 63.408
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-2-B1",
+          "median_us": 53.248
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-2-B2",
+          "median_us": 53.344
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-2-A2",
+          "median_us": 63.550999999999995
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-3-A1",
+          "median_us": 63.552
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-3-B1",
+          "median_us": 53.5035
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-3-B2",
+          "median_us": 53.391000000000005
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-3-A2",
+          "median_us": 63.455999999999996
+        }
+      ],
+      "warm_event_chain_us": null,
+      "measurement_harness_sha256": "27a3b1cf4cccdffe8f861d6bef749cdb5e9d6e8ec9741367ff88934594b79316"
+    },
+    {
+      "tokens": 4,
+      "cache_mode": "warm",
+      "expert_reuse": "disjoint",
+      "median_us": {
+        "frost": 156.086,
+        "cutlass": 176.70975
+      },
+      "speedup": 1.1321306843663108,
+      "selected_tactics": {
+        "frost": [
+          "ffma",
+          1,
+          2
+        ],
+        "cutlass": [
+          2,
+          9
+        ]
+      },
+      "native_tactic_counts": [
+        8,
+        8
+      ],
+      "native_search": "exhaustive advertised GEMM1 x GEMM2 Cartesian product plus default",
+      "rejected_native_pairs": 16,
+      "aa_ratio": {
+        "frost": 1.0002562952521301,
+        "cutlass": 0.9989561512816849
+      },
+      "max_relative_l2": 0.00017650611392328698,
+      "max_normalized_error": 0.0007220216606498195,
+      "validation_blocks": [
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-0-A1",
+          "median_us": 176.42899999999997
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-0-B1",
+          "median_us": 156.12599999999998
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-0-B2",
+          "median_us": 156.07800000000003
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-0-A2",
+          "median_us": 176.398
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-1-A1",
+          "median_us": 176.36599999999999
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-1-B1",
+          "median_us": 156.094
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-1-B2",
+          "median_us": 156.046
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-1-A2",
+          "median_us": 176.797
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-2-A1",
+          "median_us": 176.7015
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-2-B1",
+          "median_us": 156.1735
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-2-B2",
+          "median_us": 156.12599999999998
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-2-A2",
+          "median_us": 176.7815
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-3-A1",
+          "median_us": 176.71800000000002
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-3-B1",
+          "median_us": 156.0135
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-3-B2",
+          "median_us": 156.062
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-3-A2",
+          "median_us": 176.71800000000002
+        }
+      ],
+      "warm_event_chain_us": {
+        "frost": {
+          "samples": [
+            155.68700432777405,
+            155.67074716091156,
+            155.70449829101562,
+            155.69375455379486,
+            155.61574697494507,
+            155.6602567434311,
+            155.6524932384491
+          ],
+          "median": 155.67074716091156
+        },
+        "cutlass": {
+          "samples": [
+            175.9124994277954,
+            175.86250603199005,
+            175.8897453546524,
+            175.91699957847595,
+            175.90224742889404,
+            175.82224309444427,
+            175.8124977350235
+          ],
+          "median": 175.8897453546524
+        }
+      },
+      "measurement_harness_sha256": "27a3b1cf4cccdffe8f861d6bef749cdb5e9d6e8ec9741367ff88934594b79316"
+    },
+    {
+      "tokens": 4,
+      "cache_mode": "warm",
+      "expert_reuse": "shared",
+      "median_us": {
+        "frost": 34.08,
+        "cutlass": 34.61525
+      },
+      "speedup": 1.015705692488263,
+      "selected_tactics": {
+        "frost": [
+          "ffma",
+          4,
+          2
+        ],
+        "cutlass": [
+          2,
+          9
+        ]
+      },
+      "native_tactic_counts": [
+        8,
+        8
+      ],
+      "native_search": "exhaustive advertised GEMM1 x GEMM2 Cartesian product plus default",
+      "rejected_native_pairs": 16,
+      "aa_ratio": {
+        "frost": 0.9997799779977997,
+        "cutlass": 0.9974535433979688
+      },
+      "max_relative_l2": 0.0001783496870891781,
+      "max_normalized_error": 0.0005995203836930455,
+      "validation_blocks": [
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-0-A1",
+          "median_us": 34.464
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-0-B1",
+          "median_us": 34.08
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-0-B2",
+          "median_us": 34.0475
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-0-A2",
+          "median_us": 34.559
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-1-A1",
+          "median_us": 34.528000000000006
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-1-B1",
+          "median_us": 34.08
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-1-B2",
+          "median_us": 34.0955
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-1-A2",
+          "median_us": 34.656
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-2-A1",
+          "median_us": 34.6075
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-2-B1",
+          "median_us": 34.048
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-2-B2",
+          "median_us": 34.175999999999995
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-2-A2",
+          "median_us": 34.656
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-3-A1",
+          "median_us": 34.623
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-3-B1",
+          "median_us": 34.159499999999994
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-3-B2",
+          "median_us": 34.079499999999996
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-3-A2",
+          "median_us": 34.656
+        }
+      ],
+      "warm_event_chain_us": {
+        "frost": {
+          "samples": [
+            33.58900174498558,
+            33.445749431848526,
+            33.4554985165596,
+            33.472999930381775,
+            33.456750214099884,
+            33.41025114059448,
+            33.44324976205826
+          ],
+          "median": 33.4554985165596
+        },
+        "cutlass": {
+          "samples": [
+            33.5329994559288,
+            33.47975015640259,
+            33.45724940299988,
+            33.45024958252907,
+            33.48350152373314,
+            33.4709994494915,
+            33.46100077033043
+          ],
+          "median": 33.4709994494915
+        }
+      },
+      "measurement_harness_sha256": "27a3b1cf4cccdffe8f861d6bef749cdb5e9d6e8ec9741367ff88934594b79316"
+    },
+    {
+      "tokens": 8,
+      "cache_mode": "cold",
+      "expert_reuse": "disjoint",
+      "median_us": {
+        "frost": 331.821,
+        "cutlass": 344.22025
+      },
+      "speedup": 1.0373672853737406,
+      "selected_tactics": {
+        "frost": [
+          "ffma",
+          2,
+          4
+        ],
+        "cutlass": [
+          2,
+          9
+        ]
+      },
+      "native_tactic_counts": [
+        8,
+        8
+      ],
+      "native_search": "exhaustive advertised GEMM1 x GEMM2 Cartesian product plus default",
+      "rejected_native_pairs": 16,
+      "aa_ratio": {
+        "frost": 1.0000723299511547,
+        "cutlass": 1.0001394650498405
+      },
+      "max_relative_l2": 0.00018421191818468555,
+      "max_normalized_error": 0.0007220216606498195,
+      "validation_blocks": [
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-0-A1",
+          "median_us": 344.31600000000003
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-0-B1",
+          "median_us": 331.6125
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-0-B2",
+          "median_us": 331.933
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-0-A2",
+          "median_us": 344.269
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-1-A1",
+          "median_us": 344.125
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-1-B1",
+          "median_us": 331.85249999999996
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-1-B2",
+          "median_us": 331.821
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-1-A2",
+          "median_us": 344.0285
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-2-A1",
+          "median_us": 344.2205
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-2-B1",
+          "median_us": 331.9
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-2-B2",
+          "median_us": 331.80449999999996
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-2-A2",
+          "median_us": 344.10800000000006
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-3-A1",
+          "median_us": 344.22
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-3-B1",
+          "median_us": 331.821
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-3-B2",
+          "median_us": 331.804
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-3-A2",
+          "median_us": 344.2365
+        }
+      ],
+      "warm_event_chain_us": null,
+      "measurement_harness_sha256": "27a3b1cf4cccdffe8f861d6bef749cdb5e9d6e8ec9741367ff88934594b79316"
+    },
+    {
+      "tokens": 8,
+      "cache_mode": "cold",
+      "expert_reuse": "shared",
+      "median_us": {
+        "frost": 82.63900000000001,
+        "cutlass": 64.25550000000001
+      },
+      "speedup": 0.7775445007805032,
+      "selected_tactics": {
+        "frost": [
+          "ffma",
+          4,
+          2
+        ],
+        "cutlass": [
+          2,
+          9
+        ]
+      },
+      "native_tactic_counts": [
+        8,
+        8
+      ],
+      "native_search": "exhaustive advertised GEMM1 x GEMM2 Cartesian product plus default",
+      "rejected_native_pairs": 16,
+      "aa_ratio": {
+        "frost": 1.0002904197775866,
+        "cutlass": 1.0000000000000002
+      },
+      "max_relative_l2": 0.00016243685497989628,
+      "max_normalized_error": 0.0005995203836930455,
+      "validation_blocks": [
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-0-A1",
+          "median_us": 64.2555
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-0-B1",
+          "median_us": 82.57499999999999
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-0-B2",
+          "median_us": 82.687
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-0-A2",
+          "median_us": 64.191
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-1-A1",
+          "median_us": 64.25550000000001
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-1-B1",
+          "median_us": 82.767
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-1-B2",
+          "median_us": 82.63900000000001
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-1-A2",
+          "median_us": 64.2875
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-2-A1",
+          "median_us": 64.25500000000001
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-2-B1",
+          "median_us": 82.5435
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-2-B2",
+          "median_us": 82.63900000000001
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-2-A2",
+          "median_us": 64.3355
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-3-A1",
+          "median_us": 64.319
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-3-B1",
+          "median_us": 82.751
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-3-B2",
+          "median_us": 82.591
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-3-A2",
+          "median_us": 64.2235
+        }
+      ],
+      "warm_event_chain_us": null,
+      "measurement_harness_sha256": "27a3b1cf4cccdffe8f861d6bef749cdb5e9d6e8ec9741367ff88934594b79316"
+    },
+    {
+      "tokens": 8,
+      "cache_mode": "warm",
+      "expert_reuse": "disjoint",
+      "median_us": {
+        "frost": 308.6445,
+        "cutlass": 329.51599999999996
+      },
+      "speedup": 1.067623106842986,
+      "selected_tactics": {
+        "frost": [
+          "ffma",
+          1,
+          4
+        ],
+        "cutlass": [
+          2,
+          9
+        ]
+      },
+      "native_tactic_counts": [
+        8,
+        8
+      ],
+      "native_search": "exhaustive advertised GEMM1 x GEMM2 Cartesian product plus default",
+      "rejected_native_pairs": 16,
+      "aa_ratio": {
+        "frost": 1.0002073962694598,
+        "cutlass": 1.0000713167190667
+      },
+      "max_relative_l2": 0.00018421191818468555,
+      "max_normalized_error": 0.0007220216606498195,
+      "validation_blocks": [
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-0-A1",
+          "median_us": 329.627
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-0-B1",
+          "median_us": 308.65200000000004
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-0-B2",
+          "median_us": 308.6685
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-0-A2",
+          "median_us": 329.404
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-1-A1",
+          "median_us": 329.452
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-1-B1",
+          "median_us": 308.637
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-1-B2",
+          "median_us": 308.6035
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-1-A2",
+          "median_us": 329.5
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-2-A1",
+          "median_us": 329.41949999999997
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-2-B1",
+          "median_us": 308.6835
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-2-B2",
+          "median_us": 308.508
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-2-A2",
+          "median_us": 329.532
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-3-A1",
+          "median_us": 329.756
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-3-B1",
+          "median_us": 308.65200000000004
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-3-B2",
+          "median_us": 308.5725
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-3-A2",
+          "median_us": 329.533
+        }
+      ],
+      "warm_event_chain_us": {
+        "frost": {
+          "samples": [
+            308.22598934173584,
+            308.17925930023193,
+            308.1445097923279,
+            308.1572353839874,
+            308.1355094909668,
+            308.16149711608887,
+            308.1292510032654
+          ],
+          "median": 308.1572353839874
+        },
+        "cutlass": {
+          "samples": [
+            328.55725288391113,
+            328.52450013160706,
+            328.57924699783325,
+            328.47049832344055,
+            328.5817503929138,
+            328.49374413490295,
+            328.6362588405609
+          ],
+          "median": 328.55725288391113
+        }
+      },
+      "measurement_harness_sha256": "27a3b1cf4cccdffe8f861d6bef749cdb5e9d6e8ec9741367ff88934594b79316"
+    },
+    {
+      "tokens": 8,
+      "cache_mode": "warm",
+      "expert_reuse": "shared",
+      "median_us": {
+        "frost": 63.727000000000004,
+        "cutlass": 35.84775
+      },
+      "speedup": 0.5625205956658872,
+      "selected_tactics": {
+        "frost": [
+          "ffma",
+          1,
+          2
+        ],
+        "cutlass": [
+          2,
+          9
+        ]
+      },
+      "native_tactic_counts": [
+        8,
+        8
+      ],
+      "native_search": "exhaustive advertised GEMM1 x GEMM2 Cartesian product plus default",
+      "rejected_native_pairs": 16,
+      "aa_ratio": {
+        "frost": 0.9988665466539596,
+        "cutlass": 1.0006764720240462
+      },
+      "max_relative_l2": 0.00016243685497989628,
+      "max_normalized_error": 0.0005995203836930455,
+      "validation_blocks": [
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-0-A1",
+          "median_us": 35.903999999999996
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-0-B1",
+          "median_us": 63.631
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-0-B2",
+          "median_us": 63.742999999999995
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-0-A2",
+          "median_us": 36.0155
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-1-A1",
+          "median_us": 35.9995
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-1-B1",
+          "median_us": 63.599000000000004
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-1-B2",
+          "median_us": 63.7435
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-1-A2",
+          "median_us": 35.808
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-2-A1",
+          "median_us": 35.839999999999996
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-2-B1",
+          "median_us": 63.711000000000006
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-2-B2",
+          "median_us": 63.663
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-2-A2",
+          "median_us": 35.8555
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-3-A1",
+          "median_us": 35.806999999999995
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-3-B1",
+          "median_us": 63.7435
+        },
+        {
+          "backend": "frost",
+          "phase": "ABBA-3-B2",
+          "median_us": 63.839000000000006
+        },
+        {
+          "backend": "cutlass",
+          "phase": "ABBA-3-A2",
+          "median_us": 35.839999999999996
+        }
+      ],
+      "warm_event_chain_us": {
+        "frost": {
+          "samples": [
+            63.582248985767365,
+            63.52149695158005,
+            63.59274685382843,
+            63.60950320959091,
+            63.657499849796295,
+            63.69049847126007,
+            63.69300186634064
+          ],
+          "median": 63.60950320959091
+        },
+        "cutlass": {
+          "samples": [
+            34.63875129818916,
+            34.6280001103878,
+            34.623999148607254,
+            34.630998969078064,
+            34.60099920630455,
+            34.5662496984005,
+            34.593500196933746
+          ],
+          "median": 34.623999148607254
+        }
+      },
+      "measurement_harness_sha256": "27a3b1cf4cccdffe8f861d6bef749cdb5e9d6e8ec9741367ff88934594b79316"
+    }
+  ],
+  "large_expert_control": {
+    "shape": {
+      "hidden": 7168,
+      "intermediate": 2048,
+      "experts": 256,
+      "top_k": 8
+    },
+    "rows": [
+      {
+        "tokens": 1,
+        "cache_mode": "cold",
+        "expert_reuse": "disjoint",
+        "median_us": {
+          "frost": 458.2605,
+          "cutlass": 479.29249999999996
+        },
+        "speedup": 1.0458952931793162,
+        "selected_tactics": {
+          "frost": [
+            "ffma",
+            2,
+            1
+          ],
+          "cutlass": [
+            2,
+            11
+          ]
+        },
+        "aa_ratio": {
+          "frost": 0.9998958124799192,
+          "cutlass": 0.9989671188193975
+        },
+        "max_relative_l2": 0.00028171933472821833,
+        "max_normalized_error": 0.00043706293706293706
+      },
+      {
+        "tokens": 1,
+        "cache_mode": "warm",
+        "expert_reuse": "disjoint",
+        "median_us": {
+          "frost": 431.12325,
+          "cutlass": 460.77875
+        },
+        "speedup": 1.0687865940888135,
+        "selected_tactics": {
+          "frost": [
+            "ffma",
+            1,
+            1
+          ],
+          "cutlass": [
+            2,
+            11
+          ]
+        },
+        "aa_ratio": {
+          "frost": 1.0000162366562229,
+          "cutlass": 0.9988537503736294
+        },
+        "max_relative_l2": 0.00028171933472821833,
+        "max_normalized_error": 0.00043706293706293706
+      },
+      {
+        "tokens": 2,
+        "cache_mode": "cold",
+        "expert_reuse": "disjoint",
+        "median_us": {
+          "frost": 903.7205,
+          "cutlass": 920.425
+        },
+        "speedup": 1.0184841441574026,
+        "selected_tactics": {
+          "frost": [
+            "ffma",
+            1,
+            2
+          ],
+          "cutlass": [
+            2,
+            11
+          ]
+        },
+        "aa_ratio": {
+          "frost": 1.00005283897447,
+          "cutlass": 1.001068799739251
+        },
+        "max_relative_l2": 0.00027106447176259796,
+        "max_normalized_error": 0.0004329004329004329
+      },
+      {
+        "tokens": 2,
+        "cache_mode": "warm",
+        "expert_reuse": "disjoint",
+        "median_us": {
+          "frost": 857.5342499999999,
+          "cutlass": 895.366
+        },
+        "speedup": 1.0441168967886707,
+        "selected_tactics": {
+          "frost": [
+            "ffma",
+            1,
+            1
+          ],
+          "cutlass": [
+            2,
+            9
+          ]
+        },
+        "aa_ratio": {
+          "frost": 0.9999259525519112,
+          "cutlass": 1.0
+        },
+        "max_relative_l2": 0.00027106447176259796,
+        "max_normalized_error": 0.0004329004329004329
+      },
+      {
+        "tokens": 4,
+        "cache_mode": "cold",
+        "expert_reuse": "disjoint",
+        "median_us": {
+          "frost": 1776.146,
+          "cutlass": 1815.2417500000001
+        },
+        "speedup": 1.0220115632386078,
+        "selected_tactics": {
+          "frost": [
+            "ffma",
+            1,
+            1
+          ],
+          "cutlass": [
+            4,
+            11
+          ]
+        },
+        "aa_ratio": {
+          "frost": 0.9999818430385576,
+          "cutlass": 1.0001501316406565
+        },
+        "max_relative_l2": 0.00027615661720640806,
+        "max_normalized_error": 0.0006447453255963894
+      },
+      {
+        "tokens": 4,
+        "cache_mode": "warm",
+        "expert_reuse": "disjoint",
+        "median_us": {
+          "frost": 1712.255,
+          "cutlass": 1761.991
+        },
+        "speedup": 1.0290470753480059,
+        "selected_tactics": {
+          "frost": [
+            "ffma",
+            1,
+            2
+          ],
+          "cutlass": [
+            2,
+            11
+          ]
+        },
+        "aa_ratio": {
+          "frost": 0.999990947610023,
+          "cutlass": 1.0000181616030792
+        },
+        "max_relative_l2": 0.00027615661720640806,
+        "max_normalized_error": 0.0006447453255963894
+      },
+      {
+        "tokens": 8,
+        "cache_mode": "cold",
+        "expert_reuse": "disjoint",
+        "median_us": {
+          "frost": 3484.3505,
+          "cutlass": 3542.102
+        },
+        "speedup": 1.016574538066707,
+        "selected_tactics": {
+          "frost": [
+            "ffma",
+            1,
+            2
+          ],
+          "cutlass": [
+            4,
+            11
+          ]
+        },
+        "aa_ratio": {
+          "frost": 0.9999954797888444,
+          "cutlass": 1.0002349720913293
+        },
+        "max_relative_l2": 0.0002800259273147403,
+        "max_normalized_error": 0.0006447453255963894
+      },
+      {
+        "tokens": 8,
+        "cache_mode": "warm",
+        "expert_reuse": "disjoint",
+        "median_us": {
+          "frost": 3417.6765,
+          "cutlass": 3490.19575
+        },
+        "speedup": 1.0212188748701054,
+        "selected_tactics": {
+          "frost": [
+            "ffma",
+            1,
+            1
+          ],
+          "cutlass": [
+            2,
+            11
+          ]
+        },
+        "aa_ratio": {
+          "frost": 1.0000375998810849,
+          "cutlass": 0.999965689603513
+        },
+        "max_relative_l2": 0.0002800259273147403,
+        "max_normalized_error": 0.0006447453255963894
+      }
+    ],
+    "scope": "Same dtype, activation, timer and selection/validation protocol; disjoint routes only."
+  }
+}

@@ -226,6 +226,7 @@ def test_capability_probes_stay_jit_free(monkeypatch) -> None:
         "glm53_nope",
         "dots3_swa",
         "dsv4_1",
+        "dsv4_1_inline",
     }
     assert configs["dsv4"].supports_decode(num_heads=64, topk=256)
     assert configs["dsv4_1"].bytes_per_token == 528
@@ -299,6 +300,7 @@ def test_supported_configs_families(sm120_module, ordinary_format_facts) -> None
         "glm53_nope",
         "dots3_swa",
         "dsv4_1",
+        "dsv4_1_inline",
     }
     assert all(
         isinstance(config, SparseMLASm120DecodeConfig) for config in configs.values()
@@ -351,6 +353,7 @@ def test_supported_configs_families(sm120_module, ordinary_format_facts) -> None
     assert dsv4_1.topks == frozenset({512})  # the V4.1 indexer topk
     assert dsv4_1.min_topk == 1
     assert dsv4_1.bytes_per_token == 528
+    assert configs["dsv4_1_inline"] == dsv4_1  # same envelope, inline records
     assert (64, 512) in _DECODE_DSV4_1_DISPATCH
     assert (48, 384) in _DECODE_DSV4_1_DISPATCH  # off the calibrated grid
     assert (256, 512) not in _DECODE_DSV4_1_DISPATCH

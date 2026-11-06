@@ -22,7 +22,7 @@ audited; the DCP component keeps its own registry under
 ``csrc/cake_fmha/cuda/dcp_spec/``.  :func:`cake_fmha_manifest` returns a
 defensive copy of the core registry.
 
-All 1,798 optimized cells have registered high-level adapters for their
+All 1,906 optimized cells have registered high-level adapters for their
 complete component chains.  The selector accepts the pinned matrix's normalized
 NHD context views and device scalar FP8/NVFP4 scales.  Its numerically inert
 ``1e-30`` skip-softmax probe is canonicalized to ordinary softmax only after an
@@ -49,7 +49,7 @@ checked-in allocation-free replay therefore enumerates the independent pinned
 capability corpus (80,768 raw cells, 57,280 valid cells), calls the actual
 high-level selectors, and authenticates every case/route pair with canonical
 SHA-256 ``d47bf01c2d27409c6a39759d02e30bb9df65e98c353f53d7335081dd26b3f3a8``.
-It requires exactly 1,798 optimized cells and 55,482 ``compat_v1`` cells, with
+It requires exactly 1,906 optimized cells and 55,374 ``compat_v1`` cells, with
 the same per-route accounting as the manifest.  Both a fresh source checkout
 and the installed wheel must execute this replay and then exercise selected
 routes on SM100a and SM103a; representative family tests and manifest-count

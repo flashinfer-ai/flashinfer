@@ -539,7 +539,9 @@ class _RecurrentKDAPrefillWorkspaceBase:
 
 
 class RecurrentKDAPrefillWorkspace(_RecurrentKDAPrefillWorkspaceBase):
-    """Caller-owned storage required for recurrent-KDA CUDA graph capture.
+    """Caller-owned storage for native recurrent-KDA CUDA graph capture.
+
+    Auto-selected cuDNN leaves this workspace unused and manages its own scratch.
 
     Construct one workspace per captured
     :func:`flashinfer.kda.recurrent_kda` invocation on the graph's CUDA
@@ -554,14 +556,12 @@ class RecurrentKDAPrefillWorkspace(_RecurrentKDAPrefillWorkspaceBase):
     On SM100-family devices this includes beta padding, M64/M128-N32/M128-N16
     and BT64 descriptor storage, small-BH packet-ring storage, and BT16
     prepare/chain metadata, factors, and independent descriptor storage.
-    Persistent M128 is an eager-only B200/GB200 route; explicit workspaces use
-    non-persistent direct, M64, small-BH, or eligible BT16 schedules so graph
-    capture never synchronizes sequence lengths to construct host task bins.
+    Cake's persistent M128 route is eager-only; its explicit workspaces use
+    non-persistent schedules to avoid reading sequence lengths on the host.
 
-    A workspace binds to its first stream. Once it participates in capture it
-    cannot be passed to Python again, either eagerly or in another capture.
-    Graph replay does not invoke Python and remains valid for the lifetime of
-    the workspace.
+    Native use binds the workspace to its first stream. After native capture,
+    another native Python call cannot reuse it. Graph replay remains valid
+    for the lifetime of the workspace.
     """
 
 

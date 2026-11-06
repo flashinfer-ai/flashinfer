@@ -17,8 +17,10 @@ limitations under the License.
 import contextlib
 import math
 import re
+import subprocess
 import sys
 import types
+from pathlib import Path
 
 import pytest
 import torch
@@ -130,16 +132,67 @@ def test_every_profile_has_one_exact_arch_jit_spec(monkeypatch, arch):
     cake_vsa_jit.gen_cake_vsa_module.cache_clear()
 
 
+# Profiles whose device source is shared with another profile and selected by a
+# define; every other profile has its own ``cake_vsa_<profile>.cu``.
+_SHARED_DEVICE_SOURCES = {"blk128_fp16_compact": "cake_vsa_blk128_compact.cu"}
+
+
 def test_profile_launch_records_match_their_device_sources():
     for profile, record in cake_vsa_jit.PROFILES.items():
         path = cake_vsa_jit.device_source(profile)
-        assert path.name == record.source == f"cake_vsa_{profile}.cu"
+        expected = _SHARED_DEVICE_SOURCES.get(profile, f"cake_vsa_{profile}.cu")
+        assert path.name == record.source == expected
         source = path.read_text(encoding="utf-8")
 
         assert re.search(rf"\b{re.escape(record.kernel)}\s*\(", source), profile
         smem = re.search(r"^#define SMEM_TOTAL (\d+)$", source, re.MULTILINE)
         assert smem is not None and int(smem.group(1)) == record.smem_bytes, profile
         assert f"__launch_bounds__({record.threads}" in source, profile
+
+
+def test_blk128_fp16_profile_shares_the_blk128_compact_source():
+    bf16 = cake_vsa_jit.PROFILES["blk128_compact"]
+    fp16 = cake_vsa_jit.PROFILES["blk128_fp16_compact"]
+
+    assert bf16.source == fp16.source == "cake_vsa_blk128_compact.cu"
+    assert not any(define.startswith("CAKE_VSA_FP16") for define in bf16.defines)
+    assert fp16.defines == (*bf16.defines, "CAKE_VSA_FP16=1")
+    assert bf16.kernel != fp16.kernel
+    assert (bf16.threads, bf16.smem_bytes) == (fp16.threads, fp16.smem_bytes)
+    source = cake_vsa_jit.device_source("blk128_compact").read_text(encoding="utf-8")
+    assert "\n#if CAKE_VSA_FP16\n" in source
+
+
+def test_profile_cubin_compile_carries_the_profile_defines(monkeypatch, tmp_path):
+    commands = []
+
+    def fake_nvcc(command, **kwargs):
+        commands.append(command)
+        Path(command[-1]).write_bytes(b"")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(cake_vsa_jit, "_nvcc", lambda: Path("nvcc"))
+    monkeypatch.setattr(subprocess, "run", fake_nvcc)
+    profiles = ("blk128_compact", "blk128_fp16_compact")
+    for profile in profiles:
+        cubins = cake_vsa_jit.prepare_cake_vsa_cubin(
+            tmp_path, profile=profile, arch="sm_100a"
+        )
+        assert cubins == {
+            "cake_vsa_kernel": tmp_path / f"cake_vsa_{profile}_sm_100a.cubin"
+        }
+
+    source = str(cake_vsa_jit.device_source("blk128_compact"))
+    assert [command[-3] for command in commands] == [source, source]
+    defines = [
+        [flag for flag in command if flag.startswith("-D")] for command in commands
+    ]
+    assert defines == [
+        [f"-D{define}" for define in cake_vsa_jit.PROFILES[profile].defines]
+        for profile in profiles
+    ]
+    assert "-DCAKE_VSA_FP16=1" not in defines[0]
+    assert "-DCAKE_VSA_FP16=1" in defines[1]
 
 
 def test_arch_and_sm_count_are_resolved_once_per_device(monkeypatch):
@@ -153,8 +206,10 @@ def test_arch_and_sm_count_are_resolved_once_per_device(monkeypatch):
     monkeypatch.setattr(
         torch.cuda,
         "get_device_properties",
-        lambda index: property_calls.append(index)
-        or types.SimpleNamespace(multi_processor_count=148),
+        lambda index: (
+            property_calls.append(index)
+            or types.SimpleNamespace(multi_processor_count=148)
+        ),
     )
     cake_vsa._arch_for_device_index.cache_clear()
     cake_vsa._sm_count.cache_clear()

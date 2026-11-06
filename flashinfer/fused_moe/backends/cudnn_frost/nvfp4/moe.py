@@ -18,7 +18,7 @@ from .....fused_moe.runners import MoERunner, _validate_prerouted_inputs
 from .....utils import get_compute_capability
 from .. import runtime as common
 from ..activations import ACTIVATIONS, activation_name
-from ..support import weight_view
+from ..support import SUPPORTED_ARCHS, weight_view
 from .support import is_eligible
 from ..compiler import require_moe_assembler
 from ..cache import (
@@ -36,8 +36,9 @@ from ..engine import (
     seal_kernels,
 )
 from ..capabilities import require_compiler
-from ..shortlist import _read, select, capture_profiles
-from ..heuristics import POLICY_VERSION, select_stages
+from ..shortlist import _read, capture_profiles
+from ..heuristics import POLICY_VERSION
+from ..catalog import can_implement, select_kernels as select_catalog
 from ..tuning import prepared_state, ranked_tactics
 from . import runtime, fma
 
@@ -52,6 +53,7 @@ _WEIGHT_KEYS = (
     "fc2_dequant_scale",
 )
 _TAG = "cudnn_frost-nvfp4-moe-v3"
+_UNSUPPORTED = "cuDNN Frost NVFP4 MoE kernels require SM107a or SM120a"
 
 
 def _tensor_version(tensor):
@@ -63,7 +65,7 @@ def _tensor_version(tensor):
         return None
 
 
-@functools.lru_cache(maxsize=1)
+@functools.lru_cache(maxsize=None)
 def _module(arch):
     from .....jit.cudnn_frost import gen_cudnn_frost_moe_module
 
@@ -95,17 +97,28 @@ def _kernels(
 
 
 def _matching_kernels(
-    roots, arch, rows, hidden, intermediate, experts, name, *, quantized_output=False
+    roots,
+    arch,
+    rows,
+    hidden,
+    intermediate,
+    experts,
+    name,
+    *,
+    quantized_output=False,
+    include_combine=False,
 ):
     first, second = [], []
     for root in roots:
-        for kernel in runtime.discover(root, quantized_output=quantized_output):
+        for kernel in runtime.discover(
+            root,
+            quantized_output=quantized_output,
+            include_combine=include_combine,
+            include_gather=True,
+        ):
             n, k = (intermediate, hidden) if kernel.fc1 else (hidden, intermediate)
             dims = dict(s=rows, n=n, k=k, experts=experts, groups=experts)
-            if kernel.arch != arch or not all(
-                common._dimension_matches(v, kernel.contract.get(d))
-                for d, v in dims.items()
-            ):
+            if kernel.arch != arch or not can_implement(kernel, dims):
                 continue
             if kernel.fc1:
                 if kernel.activation == name:
@@ -130,6 +143,7 @@ def _selected_kernels(tokens, hidden, intermediate, experts, topk, device, activ
         experts,
         topk,
         activation_name(activation),
+        common.cluster_capacities(device),
     )
 
 
@@ -146,45 +160,22 @@ def _selected_kernels_cached(
     experts,
     topk,
     name,
+    cluster_capacities=(),
 ):
     # Admission and packing share metadata only; per-call validation stays outside.
     profiles = _read(roots).get((arch, name, experts, hidden, intermediate, topk), {})
-    if not profiles or tokens > max(profiles):
-        first, second = _matching_kernels(
-            roots, arch, tokens * topk, hidden, intermediate, experts, name
-        )
-        if not first or not second:
-            return (), ()
-        fused, _ = _matching_kernels(
-            roots,
-            arch,
-            tokens * topk,
-            hidden,
-            intermediate,
-            experts,
-            name,
-            quantized_output=True,
-        )
-        return select_stages(
-            first,
-            second,
-            fused,
-            tokens=tokens,
-            hidden=hidden,
-            intermediate=intermediate,
-            experts=experts,
-            topk=topk,
-            sm_count=sm_count,
-        )
-    bucket = min((n for n in profiles if n >= tokens), default=max(profiles))
-    if any(len(ids) != 2 for ids in profiles[bucket]):
-        return (), ()
     first, second = _matching_kernels(
-        roots, arch, tokens * topk, hidden, intermediate, experts, name
+        roots,
+        arch,
+        tokens * topk,
+        hidden,
+        intermediate,
+        experts,
+        name,
+        include_combine=True,
     )
-    first, second = select(
-        roots, arch, name, tokens, hidden, intermediate, experts, topk, first, second
-    )
+    if not first or not second:
+        return (), ()
     fused, _ = _matching_kernels(
         roots,
         arch,
@@ -195,14 +186,19 @@ def _selected_kernels_cached(
         name,
         quantized_output=True,
     )
-    tiles = {kernel.tactic_metadata["tile"] for kernel in first}
-    # Retain the measured unfused choices: fusion can trade mainloop overlap
-    # for fewer launches. Include available data-store modes in full-pipeline tuning;
-    # the fused scale output uses STG in both variants.
-    variants = tuple(
-        kernel for kernel in fused if kernel.tactic_metadata["tile"] in tiles
+    return select_catalog(
+        first,
+        second,
+        fused,
+        profiles,
+        tokens=tokens,
+        hidden=hidden,
+        intermediate=intermediate,
+        experts=experts,
+        topk=topk,
+        sm_count=sm_count,
+        cluster_capacities=cluster_capacities,
     )
-    return first + variants, second
 
 
 def _fma_tactic(tokens, hidden, intermediate, experts, topk, activation):
@@ -218,13 +214,17 @@ def _fma_tactic(tokens, hidden, intermediate, experts, topk, activation):
     return fma.tactic(activation_name(activation))
 
 
-def _capture_selection(roots, arch, sm_count, activation):
+def _capture_selection(roots, arch, sm_count, activation, cluster_capacities=()):
     name = activation_name(activation)
-    normal = seal_kernels(kernel for root in roots for kernel in runtime.discover(root))
+    normal = seal_kernels(
+        kernel
+        for root in roots
+        for kernel in runtime.discover(root, include_combine=True, include_gather=True)
+    )
     fused = seal_kernels(
         kernel
         for root in roots
-        for kernel in runtime.discover(root, quantized_output=True)
+        for kernel in runtime.discover(root, quantized_output=True, include_gather=True)
     )
     select_fma, validate_fma_sources = capture_fma_selection(fma, name, arch)
     return SelectionSnapshot(
@@ -236,7 +236,7 @@ def _capture_selection(roots, arch, sm_count, activation):
             arch,
             name,
             sm_count,
-            quantized=True,
+            cluster_capacities=cluster_capacities,
         ),
         select_fma,
         validate_fma_sources,
@@ -261,6 +261,8 @@ class _Plans:
         validate_fma_sources=None,
     ):
         self.plans, self.launches = {}, {}
+        first = tuple(common.bind_kernel(k, device) for k in first)
+        second = tuple(common.bind_kernel(k, device, top_k=topk) for k in second)
         self.first, self.second = first, second
         required = 0
         module = _module(common._arch_for(device))
@@ -269,7 +271,10 @@ class _Plans:
             executor_key = (hidden, intermediate, experts, topk, swizzled, key)
             plan = executor_cache.get(executor_key)
             if plan is None:
-                plan = module.make_runner(
+                factory = (
+                    module.make_gather_runner if a.gathers_input else module.make_runner
+                )
+                plan = factory(
                     [common._load_kernel(a, device)],
                     [common._load_kernel(b, device)],
                     hidden,
@@ -342,7 +347,7 @@ class _Plans:
 
 
 def prepared_stage_inputs(inputs, *, tactic=None):
-    """Expose grouped inputs from a prepared call for offline stage measurements.
+    """Expose FC1/FC2 inputs from a prepared call for offline stage measurements.
 
     FMA plans reject this helper because they never group tokens by expert.
     Executes routing, FC1, and intermediate quantization. Fused FC1 plans do
@@ -365,13 +370,35 @@ def prepared_stage_inputs(inputs, *, tactic=None):
         size = torch.empty((), dtype=dtype).element_size()
         return raw[start : start + count * size].view(dtype).view(shape)
 
+    index_offset, pitch = plan["gather_layout"](t)
     result = {
-        "fc1_tokens": view(xp, s * h // 2, torch.uint8, (s, h // 2)),
-        "fc1_token_scales": view(sp1, sf_rows * h // 16, torch.uint8, (-1,)),
+        "fc1_tokens": (
+            inputs[1]
+            if index_offset >= 0
+            else view(xp, s * h // 2, torch.uint8, (s, h // 2))
+        ),
+        "fc1_token_scales": (
+            None
+            if index_offset >= 0
+            else view(sp1, sf_rows * h // 16, torch.uint8, (-1,))
+        ),
         "fc2_tokens": view(qp, s * i // 2, torch.uint8, (s, i // 2)),
         "fc2_token_scales": view(sp2, sf_rows * i // 16, torch.uint8, (-1,)),
         "offsets": view(op, e + 1, torch.int32, (e + 1,)),
     }
+    if index_offset >= 0:
+        result["fc1_tokens"] = inputs[1]
+        # GATHER accepts row-major scales with a 16-byte-aligned row pitch.
+        # A linear input with that pitch is borrowed without a GPU copy.
+        input_sf = inputs[8]
+        if input_sf.ndim == 2 and pitch == h // 16:
+            result["fc1_token_scales"] = input_sf
+        else:
+            result["fc1_token_scales"] = view(sp1, t * pitch, torch.uint8, (t, pitch))[
+                :, : h // 16
+            ]
+        result["token_index"] = view(index_offset, s, torch.int32, (s,))
+
     if mp >= 0:
         result["fc1_output"] = view(mp, s * i, torch.bfloat16, (s, i))
     return result
@@ -412,8 +439,12 @@ class CudnnFrostNvfp4MoeRunner(FrostRunnerMixin, MoERunner):
 
     def _check_support(self):
         super()._check_support()
-        if self.device.type != "cuda" or get_compute_capability(self.device) != (10, 7):
-            raise NotImplementedError("cuDNN Frost NVFP4 MoE kernels require SM107a")
+        if self.device.type != "cuda":
+            raise NotImplementedError(_UNSUPPORTED)
+        major, minor = get_compute_capability(self.device)
+        arch = f"sm_{major}{minor}a"
+        if arch not in SUPPORTED_ARCHS:
+            raise NotImplementedError(_UNSUPPORTED)
         name = activation_name(self.config.activation)
         if not self.config.finalize.do_finalize or self.config.quant.per_token_scale:
             raise NotImplementedError(
@@ -425,15 +456,22 @@ class CudnnFrostNvfp4MoeRunner(FrostRunnerMixin, MoERunner):
                     (kernel.source_path, kernel.source_sha256)
                     for root in _artifact_roots()
                     for quantized in (False, True)
-                    for kernel in runtime.discover(root, quantized_output=quantized)
-                    if kernel.arch == "sm_107a"
+                    for kernel in runtime.discover(
+                        root,
+                        quantized_output=quantized,
+                        include_combine=True,
+                        include_gather=True,
+                    )
+                    if kernel.arch == arch
                     and (not kernel.fc1 or kernel.activation == name)
                 }
             )
         )
         require_graph_resource_retention()
-        require_moe_assembler()
-        require_compiler("sm_107a", sources)
+        # Only the SM107 sources patch tensor maps and need the assembler floor.
+        if arch == "sm_107a":
+            require_moe_assembler()
+        require_compiler(arch, sources)
 
     def _build(self):
         device, activation = self.device, self.config.activation
@@ -445,10 +483,14 @@ class CudnnFrostNvfp4MoeRunner(FrostRunnerMixin, MoERunner):
             artifact_version=lambda: runtime._artifact_cache_version,
             policy_version=POLICY_VERSION,
             tactic_tag=_TAG,
-            require_assembler=True,
+            require_assembler=get_compute_capability(device) == (10, 7),
             refresh_artifacts=runtime.clear_artifact_cache,
             capture_selection=lambda roots, arch, sm_count: _capture_selection(
-                roots, arch, sm_count, activation
+                roots,
+                arch,
+                sm_count,
+                activation,
+                common.cluster_capacities(device),
             ),
             build_plan=lambda shape, metadata, workspace_pool, executor_cache: _Plans(
                 *shape,

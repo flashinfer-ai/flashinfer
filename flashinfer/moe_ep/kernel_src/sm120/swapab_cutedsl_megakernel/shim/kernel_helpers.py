@@ -54,7 +54,7 @@ _LAZY = {
         "_make_e8m0_scale_tensor",
     ),
     # torch reference: the SM120 wrapper pins gate_up_interleave=8 (swap-AB
-    # register interleave) and apply_topk_in_fc1=True over the generic
+    # register interleave) and routing weights before FC2 over the generic
     # moe_mxfp8_glu reference
     "compute_megamoe_reference_mxfp8": (
         "moe_sm120_mxfp8_swapab.mega_reference",

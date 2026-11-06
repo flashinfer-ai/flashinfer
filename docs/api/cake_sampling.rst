@@ -34,7 +34,8 @@ the launch share it).
   the ``(8, 48)`` resident, a large-k pick, is built without it.
 * **Whole-CTA tail** (``64 < top_k_max <= 1024``, ``fused_block_tail_kcap``; launch flag bit 3):
   stage 2/3 runs on the whole first CTA (512 threads, two slab entries each) in a separate build
-  of the variant (manifest ``fused_block_tail``, symbol suffix ``_bt``).  Taken for a cluster-8
+  of the cluster-8 streaming variants (manifest ``fused_block_tail``, symbol suffix ``_bt``; the
+  variants the dispatcher never fuses ship no such build).  Taken for a cluster-8
   streaming variant with ``top_k_max > 768`` on a one-wave grid on compute capability 9.0, 10.0
   and 10.3 (10.3 up to ``vocab = 196608``); every other large-k launch takes the chain.  Rows of
   such a launch whose k is at most 64 take the two-warp tail.

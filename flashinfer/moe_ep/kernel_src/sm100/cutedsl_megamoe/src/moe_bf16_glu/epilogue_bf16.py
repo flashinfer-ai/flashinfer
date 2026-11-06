@@ -34,13 +34,13 @@ def swiglu_act(
         ug = cute.arch.mul_packed_f32x2(
             (t_up[i], t_up[i + 1]),
             (t_gate[i], t_gate[i + 1]),
-            rnd="rn",
+            rnd='rn',
             ftz=False,
         )
         neg_g_log2e = cute.arch.mul_packed_f32x2(
             (t_gate[i], t_gate[i + 1]),
             (-Log2E, -Log2E),
-            rnd="rn",
+            rnd='rn',
             ftz=False,
         )
         one_plus_exp = cute.arch.add_packed_f32x2(
@@ -57,7 +57,7 @@ def swiglu_act(
         (
             t_swiglu[i],
             t_swiglu[i + 1],
-        ) = cute.arch.mul_packed_f32x2(ug, sigmoid_pair, rnd="rn", ftz=False)
+        ) = cute.arch.mul_packed_f32x2(ug, sigmoid_pair, rnd='rn', ftz=False)
         if cutlass.const_expr(prob is not None):
             (
                 t_swiglu[i],
@@ -65,10 +65,9 @@ def swiglu_act(
             ) = cute.arch.mul_packed_f32x2(
                 (t_swiglu[i], t_swiglu[i + 1]),
                 (prob, prob),
-                rnd="rn",
+                rnd='rn',
                 ftz=False,
             )
-
 
 # Gate/up interleave granularity on the fc1 feature axis: each subtile folds
 # one 32-col gate block with its adjacent 32-col up block into 32 downproj
@@ -80,7 +79,6 @@ Fc1CTMAStages = 1
 # =============================================================================
 # GluBf16Epilogue
 # =============================================================================
-
 
 class GluBf16Epilogue(GluMxfp8Epilogue):
     """BF16 specialisation of the fused fc1+fc2 GLU epilogue.

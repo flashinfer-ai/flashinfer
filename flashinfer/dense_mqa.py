@@ -60,8 +60,11 @@ def fp8_mqa_logits(
     ``q`` E4M3 ``[Q, H, 128]`` (``H`` in the catalog's head counts), ``kv`` the
     pair ``(E4M3 [K, 128], FP32 scales [K])``, FP32 ``weights [Q, H]``, int32
     ``ks`` / ``ke [Q]`` with ``0 <= ks <= ke <= K``. Returns the FP32 ``[Q, K]``
-    view of a row-padded buffer whose every cell is written (``-inf`` outside
-    each row's window), so ``clean_logits`` does not change the result;
+    view of a row-padded buffer. The cells inside each row's window are the
+    same for both ``clean_logits`` values. With ``clean_logits=True`` every
+    other cell is ``-inf`` (a route whose own programs store raw tiles rejects
+    it); with ``clean_logits=False`` (DeepGEMM semantics) a route that
+    catalogues a ``"raw"`` variant leaves them unwritten.
     ``max_seqlen_k`` must be 0. ``sm_count`` overrides the CTA budget (default:
     the device's SM count). Which ``(H, Q, K)`` points are served is a catalog
     property: ``dense_route_available(H, Q, K)`` in
@@ -89,8 +92,9 @@ def dense_route_available(num_heads, queries, keys, precision="fp8", *, arch=Non
     carries its route, ``K`` satisfies the route record's K rule for ``arch`` (``kv_min``, ``kv_alignment[arch]``)
     and the route is admitted there.  This is the table the engine consults before taking
     the Cake route; a 64-head tier the producer withheld on an architecture (``dense_admission(arch)``) is not
-    served there, so the engine keeps its stock kernel (the 64-head ``:short`` one-split routes are the exception: a
-    withheld ``:short`` call is served by its tier route, so this stays True).  ``arch`` (:func:`device_arch` of the device, e.g.
+    served there, so the engine keeps its stock kernel (the 64-head ``:short`` one-split routes and the ``:ts``
+    tile-schedule-words routes are the exception: a withheld ``:short`` / ``:ts`` call is served by its tier route, so this
+    stays True).  ``arch`` (:func:`device_arch` of the device, e.g.
     ``"sm_100a"``) may be omitted only where the architectures agree on the route; otherwise ``ValueError``."""
     from .experimental.deepgemm_dense_mqa.dense_mqa import (
         dense_route_available as _available,

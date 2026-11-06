@@ -3194,7 +3194,7 @@
                                 tb_pub[tb_e * MOE_X_3f9b7f9a5d + MOE_X_d77e871d9d + tb_s] = _max_aa07ac;
                                 tb_pub[tb_e * MOE_X_3f9b7f9a5d + MOE_X_ac7a5b84c0 + tb_s] = tb_q;
                             }
-#elif MOE_INSTANCE == 0 // moe-select
+#elif (MOE_INSTANCE == 0 && MOE_SW_WIDE_RANKS == 0) // moe-select
                 {
                     if (active_rows_0be5d1 >= 1024) {
                         int tb_secs[MOE_RANKS];
@@ -3217,7 +3217,7 @@
                                 tb_pf = _min_14e680;
                                 tb_need[tb_s] = (tb_pf + tb_q - 1) / tb_q;
                             }
-#elif MOE_INSTANCE == 2 // moe-select
+#elif (MOE_INSTANCE == 2 && MOE_SW_WIDE_RANKS == 0) // moe-select
                 {
                     if (active_rows_0be5d1 >= 1024) {
                         int tb_secs[MOE_RANKS];
@@ -3239,6 +3239,42 @@
                                 int _min_14e680 = ((_max_35358b) < (tb_rc) ? (_max_35358b) : (tb_rc));
                                 tb_pf = _min_14e680;
                                 tb_need[tb_s] = (tb_pf + tb_q - 1) / tb_q;
+                            }
+#elif MOE_INSTANCE == 0 // moe-select
+                {
+                    if (active_rows_0be5d1 >= 1024) {
+                        #pragma unroll 1
+                        for (int tb_s = 0; tb_s < MOE_RANKS; tb_s++) {
+                            tb_pub[tb_e * MOE_X_efe70cec4a + tb_s] = 0;
+                            if (tb_s < world_size) {
+                                int _max_5d9eff = ((source_record_counts[tb_s]) > (0) ? (source_record_counts[tb_s]) : (0));
+                                int _min_a8b516_4 = ((_max_5d9eff) < (MOE_MAX_ROWS) ? (_max_5d9eff) : (MOE_MAX_ROWS));
+                                int tb_rc = _min_a8b516_4;
+                                int _max_6c5620 = (((tb_rc + 8 - 1) / 8) > (dispatch_chunk_min_records) ? ((tb_rc + 8 - 1) / 8) : (dispatch_chunk_min_records));
+                                int tb_q = _max_6c5620;
+                                int tb_pf = reinterpret_cast<int*>(reinterpret_cast<int*>(dispatch_header_inbox) + ((tb_s * 2 + slot) * MOE_X_c005674f28 + 8 + MOE_X_fa76c90be3 + tb_e))[0];
+                                int _max_35358b = ((tb_pf) > (0) ? (tb_pf) : (0));
+                                int _min_14e680 = ((_max_35358b) < (tb_rc) ? (_max_35358b) : (tb_rc));
+                                tb_pf = _min_14e680;
+                                tb_pub[tb_e * MOE_X_efe70cec4a + tb_s] = (tb_pf + tb_q - 1) / tb_q;
+                            }
+#elif MOE_INSTANCE == 2 // moe-select
+                {
+                    if (active_rows_0be5d1 >= 1024) {
+                        #pragma unroll 1
+                        for (int tb_s = 0; tb_s < MOE_RANKS; tb_s++) {
+                            tb_pub[tb_e * MOE_X_efe70cec4a + tb_s] = 0;
+                            if (tb_s < world_size) {
+                                int _max_5d9eff = ((source_record_counts[tb_s]) > (0) ? (source_record_counts[tb_s]) : (0));
+                                int _min_a8b516_3 = ((_max_5d9eff) < (MOE_MAX_ROWS) ? (_max_5d9eff) : (MOE_MAX_ROWS));
+                                int tb_rc = _min_a8b516_3;
+                                int _max_6c5620 = (((tb_rc + 8 - 1) / 8) > (dispatch_chunk_min_records) ? ((tb_rc + 8 - 1) / 8) : (dispatch_chunk_min_records));
+                                int tb_q = _max_6c5620;
+                                int tb_pf = reinterpret_cast<int*>(reinterpret_cast<int*>(dispatch_header_inbox) + ((tb_s * 2 + slot) * MOE_X_c005674f28 + 8 + MOE_X_fa76c90be3 + tb_e))[0];
+                                int _max_35358b = ((tb_pf) > (0) ? (tb_pf) : (0));
+                                int _min_14e680 = ((_max_35358b) < (tb_rc) ? (_max_35358b) : (tb_rc));
+                                tb_pf = _min_14e680;
+                                tb_pub[tb_e * MOE_X_efe70cec4a + tb_s] = (tb_pf + tb_q - 1) / tb_q;
                             }
 #else // moe-select
                 {
@@ -3317,6 +3353,10 @@
                             int _min_3e6ce7 = ((m_local + 128) < (tb_count) ? (m_local + 128) : (tb_count));
                             int task_last_row = _min_3e6ce7;
                             int task_ms = -1;
+                            #pragma unroll
+                            for (int ms_source = 0; ms_source < MOE_RANKS; ms_source++) {
+                                if (ft_cnt[ms_source] > 0 && task_last_row > ft_base[ms_source] && m_local < ft_base[ms_source] + ft_cnt[ms_source]) {
+                                    task_ms = ms_source;
 #elif (MOE_SW_POLICY_EP == 8 && ((MOE_INSTANCE == 0 && MOE_SW_TB_SCR_GLOBAL == 1) || (MOE_INSTANCE == 2 && MOE_SW_TB_SCR_GLOBAL == 1))) // moe-select
                         int _shfl_up_02290a = __shfl_up_sync(0xFFFFFFFF, tb_sec_incl, 2, 32);
                         int tb_up_s_f16102 = _shfl_up_02290a;
@@ -3377,6 +3417,10 @@
                             int _min_3e6ce7 = ((m_local + 128) < (tb_count) ? (m_local + 128) : (tb_count));
                             int task_last_row = _min_3e6ce7;
                             int task_ms = -1;
+                            #pragma unroll
+                            for (int ms_source = 0; ms_source < MOE_RANKS; ms_source++) {
+                                if (ft_cnt[ms_source] > 0 && task_last_row > ft_base[ms_source] && m_local < ft_base[ms_source] + ft_cnt[ms_source]) {
+                                    task_ms = ms_source;
 #elif (MOE_SW_POLICY_EP == 16 && ((MOE_INSTANCE == 1 && (MOE_SW_WIDE_RANKS == 1 && MOE_SHARED_EXPERT == 1)) || (MOE_INSTANCE == 3 && (MOE_SW_WIDE_RANKS == 1 && MOE_SHARED_EXPERT == 1)))) // moe-select
                         int _shfl_up_02290a = __shfl_up_sync(0xFFFFFFFF, tb_sec_incl, 2, 32);
                         int tb_up_s_f16102 = _shfl_up_02290a;
@@ -3437,6 +3481,10 @@
                             int _min_9b55c6 = ((m_local + 64) < (tb_count) ? (m_local + 64) : (tb_count));
                             int task_last_row = _min_9b55c6;
                             int task_ms = -1;
+                            #pragma unroll
+                            for (int ms_source = 0; ms_source < MOE_RANKS; ms_source++) {
+                                if (ft_cnt[ms_source] > 0 && task_last_row > ft_base[ms_source] && m_local < ft_base[ms_source] + ft_cnt[ms_source]) {
+                                    task_ms = ms_source;
 #elif ((MOE_INSTANCE == 0 && (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_WATCH_WIDE == 0 && (MOE_SW_TB_SCR_GLOBAL == 0 && (MOE_SW_TASK_GATE_U64 == 0 && MOE_SHARED_EXPERT == 1))))) || (MOE_INSTANCE == 2 && (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_WATCH_WIDE == 0 && (MOE_SW_TB_SCR_GLOBAL == 0 && (MOE_SW_TASK_GATE_U64 == 0 && MOE_SHARED_EXPERT == 1)))))) // moe-select
                         int _shfl_up_02290a = __shfl_up_sync(0xFFFFFFFF, tb_sec_incl, 2, 32);
                         int tb_up_s_f16102 = _shfl_up_02290a;
@@ -3497,6 +3545,10 @@
                             int _min_3e6ce7 = ((m_local + 128) < (tb_count) ? (m_local + 128) : (tb_count));
                             int task_last_row = _min_3e6ce7;
                             int task_ms = -1;
+                            #pragma unroll
+                            for (int ms_source = 0; ms_source < MOE_RANKS; ms_source++) {
+                                if (ft_cnt[ms_source] > 0 && task_last_row > ft_base[ms_source] && m_local < ft_base[ms_source] + ft_cnt[ms_source]) {
+                                    task_ms = ms_source;
 #elif ((MOE_INSTANCE == 0 && (MOE_SW_POLICY_EP == 4 || MOE_SW_POLICY_EP == 8)) || (MOE_INSTANCE == 2 && (MOE_SW_POLICY_EP == 4 || MOE_SW_POLICY_EP == 8))) // moe-select
                         int _shfl_up_02290a = __shfl_up_sync(0xFFFFFFFF, tb_sec_incl, 2, 32);
                         int tb_up_s_f16102 = _shfl_up_02290a;
@@ -3557,6 +3609,10 @@
                             int _min_3e6ce7 = ((m_local + 128) < (tb_count) ? (m_local + 128) : (tb_count));
                             int task_last_row = _min_3e6ce7;
                             int task_ms = -1;
+                            #pragma unroll
+                            for (int ms_source = 0; ms_source < MOE_RANKS; ms_source++) {
+                                if (ft_cnt[ms_source] > 0 && task_last_row > ft_base[ms_source] && m_local < ft_base[ms_source] + ft_cnt[ms_source]) {
+                                    task_ms = ms_source;
 #elif ((MOE_INSTANCE == 1 && (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_TB_SCR_GLOBAL == 0 && MOE_SHARED_EXPERT == 1))) || (MOE_INSTANCE == 3 && (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_TB_SCR_GLOBAL == 0 && MOE_SHARED_EXPERT == 1)))) // moe-select
                         int _shfl_up_02290a = __shfl_up_sync(0xFFFFFFFF, tb_sec_incl, 2, 32);
                         int tb_up_s_f16102 = _shfl_up_02290a;
@@ -3617,6 +3673,10 @@
                             int _min_9b55c6 = ((m_local + 64) < (tb_count) ? (m_local + 64) : (tb_count));
                             int task_last_row = _min_9b55c6;
                             int task_ms = -1;
+                            #pragma unroll
+                            for (int ms_source = 0; ms_source < MOE_RANKS; ms_source++) {
+                                if (ft_cnt[ms_source] > 0 && task_last_row > ft_base[ms_source] && m_local < ft_base[ms_source] + ft_cnt[ms_source]) {
+                                    task_ms = ms_source;
 #elif ((MOE_INSTANCE == 1 && MOE_SW_TB_SCR_GLOBAL == 0) || (MOE_INSTANCE == 3 && MOE_SW_TB_SCR_GLOBAL == 0)) // moe-select
                         int _shfl_up_02290a = __shfl_up_sync(0xFFFFFFFF, tb_sec_incl, 2, 32);
                         int tb_up_s_f16102 = _shfl_up_02290a;
@@ -3677,6 +3737,10 @@
                             int _min_9b55c6 = ((m_local + 64) < (tb_count) ? (m_local + 64) : (tb_count));
                             int task_last_row = _min_9b55c6;
                             int task_ms = -1;
+                            #pragma unroll
+                            for (int ms_source = 0; ms_source < MOE_RANKS; ms_source++) {
+                                if (ft_cnt[ms_source] > 0 && task_last_row > ft_base[ms_source] && m_local < ft_base[ms_source] + ft_cnt[ms_source]) {
+                                    task_ms = ms_source;
 #elif ((MOE_INSTANCE == 1 && MOE_SHARED_EXPERT == 1) || (MOE_INSTANCE == 3 && MOE_SHARED_EXPERT == 1)) // moe-select
                         int _shfl_up_02290a = __shfl_up_sync(0xFFFFFFFF, tb_sec_incl, 2, 32);
                         int tb_up_s_f16102 = _shfl_up_02290a;
@@ -3737,6 +3801,10 @@
                             int _min_9b55c6 = ((m_local + 64) < (tb_count) ? (m_local + 64) : (tb_count));
                             int task_last_row = _min_9b55c6;
                             int task_ms = -1;
+                            #pragma unroll
+                            for (int ms_source = 0; ms_source < MOE_RANKS; ms_source++) {
+                                if (ft_cnt[ms_source] > 0 && task_last_row > ft_base[ms_source] && m_local < ft_base[ms_source] + ft_cnt[ms_source]) {
+                                    task_ms = ms_source;
 #elif (MOE_INSTANCE == 1 || MOE_INSTANCE == 3) // moe-select
                         int _shfl_up_02290a = __shfl_up_sync(0xFFFFFFFF, tb_sec_incl, 2, 32);
                         int tb_up_s_f16102 = _shfl_up_02290a;
@@ -3797,21 +3865,28 @@
                             int _min_9b55c6 = ((m_local + 64) < (tb_count) ? (m_local + 64) : (tb_count));
                             int task_last_row = _min_9b55c6;
                             int task_ms = -1;
+                            #pragma unroll
+                            for (int ms_source = 0; ms_source < MOE_RANKS; ms_source++) {
+                                if (ft_cnt[ms_source] > 0 && task_last_row > ft_base[ms_source] && m_local < ft_base[ms_source] + ft_cnt[ms_source]) {
+                                    task_ms = ms_source;
+#elif MOE_SW_WIDE_RANKS == 1 // moe-select
+                        int es_run = 0;
+                        #pragma unroll 1
+                        for (int tb_s_11f2db = 0; tb_s_11f2db < MOE_RANKS; tb_s_11f2db++) {
+                            int tb_b = 0;
+                            #pragma unroll 1
+                            for (int tb_s2 = 0; tb_s2 < MOE_RANKS; tb_s2++) {
+                                if (tb_pub[tb_e * MOE_X_efe70cec4a + tb_s2] < tb_pub[tb_e * MOE_X_efe70cec4a + tb_s_11f2db] || tb_pub[tb_e * MOE_X_efe70cec4a + tb_s2] == tb_pub[tb_e * MOE_X_efe70cec4a + tb_s_11f2db] && tb_s2 < tb_s_11f2db) {
+                                    tb_b = tb_b + source_expert_counts[tb_s2 * MOE_X_fa76c90be3 + tb_e];
 #else // moe-select
                         int es_run = 0;
                         #pragma unroll
                         for (int tb_s_11f2db = 0; tb_s_11f2db < MOE_RANKS; tb_s_11f2db++) {
                             int tb_b = 0;
-#endif // moe-select
                             #pragma unroll
-#if (MOE_SW_POLICY_EP == 16 && (MOE_INSTANCE == 0 || MOE_INSTANCE == 2)) // moe-select
                             for (int tb_s2 = 0; tb_s2 < MOE_RANKS; tb_s2++) {
                                 if (tb_need[tb_s2] < tb_need[tb_s_11f2db] || tb_need[tb_s2] == tb_need[tb_s_11f2db] && tb_s2 < tb_s_11f2db) {
                                     tb_b = tb_b + tb_secs[tb_s2];
-#else // moe-select
-                            for (int ms_source = 0; ms_source < MOE_RANKS; ms_source++) {
-                                if (ft_cnt[ms_source] > 0 && task_last_row > ft_base[ms_source] && m_local < ft_base[ms_source] + ft_cnt[ms_source]) {
-                                    task_ms = ms_source;
 #endif // moe-select
                                 }
                             }
@@ -3846,6 +3921,31 @@
                                     int _min_d40b00 = ((tb_need[tb_s_11f2db_1]) < (rs1_pos / tb_pub[tb_e * MOE_X_3f9b7f9a5d + MOE_X_ac7a5b84c0 + tb_s_11f2db_1] + 1) ? (tb_need[tb_s_11f2db_1]) : (rs1_pos / tb_pub[tb_e * MOE_X_3f9b7f9a5d + MOE_X_ac7a5b84c0 + tb_s_11f2db_1] + 1));
                                     int _max_e54b71 = ((tb_key) > (_min_d40b00) ? (tb_key) : (_min_d40b00));
                                     tb_key = _max_e54b71;
+#elif (MOE_SW_POLICY_EP == 16 && ((MOE_INSTANCE == 0 && (MOE_SW_WIDE_RANKS == 0 && MOE_SW_TB_SCR_GLOBAL == 0)) || (MOE_INSTANCE == 2 && (MOE_SW_WIDE_RANKS == 0 && MOE_SW_TB_SCR_GLOBAL == 0)))) // moe-select
+                            tb_base[tb_s_11f2db] = tb_b;
+                            expert_source_base[tb_e * MOE_RANKS + tb_s_11f2db] = tb_b;
+                            es_run = es_run + tb_secs[tb_s_11f2db];
+                        }
+                        if (es_run != tb_count) {
+                            atomicMax(&protocol_error[0], 1);
+                        }
+                        #pragma unroll 1
+                        for (int tb_z = 0; tb_z < MOE_X_4846b72315; tb_z++) {
+                            tb_scr[tb_e * MOE_X_4846b72315 + tb_z] = 0;
+                        }
+                        int tb_cnt[9];
+                        #pragma unroll
+                        for (int tb_k = 0; tb_k < 9; tb_k++) {
+                            tb_cnt[tb_k] = 0;
+                        }
+                        #pragma unroll 1
+                        for (int tb_m = 0; tb_m < tb_padded; tb_m += 128) {
+                            int tb_key = 0;
+                            #pragma unroll
+                            for (int tb_s_11f2db_1 = 0; tb_s_11f2db_1 < MOE_RANKS; tb_s_11f2db_1++) {
+                                if (tb_secs[tb_s_11f2db_1] > 0 && tb_base[tb_s_11f2db_1] < tb_m + 128 && tb_m < tb_base[tb_s_11f2db_1] + tb_secs[tb_s_11f2db_1]) {
+                                    int _max_1e3302 = ((tb_key) > (tb_need[tb_s_11f2db_1]) ? (tb_key) : (tb_need[tb_s_11f2db_1]));
+                                    tb_key = _max_1e3302;
 #elif (MOE_SW_POLICY_EP == 16 && ((MOE_INSTANCE == 0 && (MOE_SW_WIDE_RANKS == 0 && MOE_SHARED_EXPERT == 1)) || (MOE_INSTANCE == 2 && (MOE_SW_WIDE_RANKS == 0 && MOE_SHARED_EXPERT == 1)))) // moe-select
                             tb_base[tb_s_11f2db] = tb_b;
                             expert_source_base[tb_e * MOE_RANKS + tb_s_11f2db] = tb_b;
@@ -3877,7 +3977,82 @@
                                     int _min_d40b00 = ((tb_need[tb_s_11f2db_1]) < (rs1_pos / tb_pub[tb_e * MOE_X_3f9b7f9a5d + MOE_X_ac7a5b84c0 + tb_s_11f2db_1] + 1) ? (tb_need[tb_s_11f2db_1]) : (rs1_pos / tb_pub[tb_e * MOE_X_3f9b7f9a5d + MOE_X_ac7a5b84c0 + tb_s_11f2db_1] + 1));
                                     int _max_e54b71 = ((tb_key) > (_min_d40b00) ? (tb_key) : (_min_d40b00));
                                     tb_key = _max_e54b71;
-#elif (MOE_SW_POLICY_EP == 16 && ((MOE_INSTANCE == 1 && MOE_SW_WIDE_RANKS == 1) || (MOE_INSTANCE == 3 && MOE_SW_WIDE_RANKS == 1))) // moe-select
+#elif (MOE_SW_POLICY_EP == 16 && ((MOE_INSTANCE == 0 && MOE_SW_WIDE_RANKS == 0) || (MOE_INSTANCE == 2 && MOE_SW_WIDE_RANKS == 0))) // moe-select
+                            tb_base[tb_s_11f2db] = tb_b;
+                            expert_source_base[tb_e * MOE_RANKS + tb_s_11f2db] = tb_b;
+                            es_run = es_run + tb_secs[tb_s_11f2db];
+                        }
+                        if (es_run != tb_count) {
+                            atomicMax(&protocol_error[0], 1);
+                        }
+                        #pragma unroll 1
+                        for (int tb_z = 0; tb_z < MOE_X_4846b72315; tb_z++) {
+                            tb_pub[MOE_X_8923c9d28f + tb_e * MOE_X_4846b72315 + tb_z] = 0;
+                        }
+                        int tb_cnt[9];
+                        #pragma unroll
+                        for (int tb_k = 0; tb_k < 9; tb_k++) {
+                            tb_cnt[tb_k] = 0;
+                        }
+                        #pragma unroll 1
+                        for (int tb_m = 0; tb_m < tb_padded; tb_m += 128) {
+                            int tb_key = 0;
+                            #pragma unroll
+                            for (int tb_s_11f2db_1 = 0; tb_s_11f2db_1 < MOE_RANKS; tb_s_11f2db_1++) {
+                                if (tb_secs[tb_s_11f2db_1] > 0 && tb_base[tb_s_11f2db_1] < tb_m + 128 && tb_m < tb_base[tb_s_11f2db_1] + tb_secs[tb_s_11f2db_1]) {
+                                    int _max_1e3302 = ((tb_key) > (tb_need[tb_s_11f2db_1]) ? (tb_key) : (tb_need[tb_s_11f2db_1]));
+                                    tb_key = _max_1e3302;
+#elif (MOE_SW_POLICY_EP == 16 && ((MOE_INSTANCE == 0 && MOE_SW_TB_SCR_GLOBAL == 0) || (MOE_INSTANCE == 2 && MOE_SW_TB_SCR_GLOBAL == 0))) // moe-select
+                            tb_pub[tb_e * MOE_X_efe70cec4a + MOE_X_96e08f30e3 + tb_s_11f2db] = tb_b;
+                            expert_source_base[tb_e * MOE_RANKS + tb_s_11f2db] = tb_b;
+                            es_run = es_run + source_expert_counts[tb_s_11f2db * MOE_X_fa76c90be3 + tb_e];
+                        }
+                        if (es_run != tb_count) {
+                            atomicMax(&protocol_error[0], 1);
+                        }
+                        #pragma unroll 1
+                        for (int tb_z = 0; tb_z < MOE_X_4846b72315; tb_z++) {
+                            tb_scr[tb_e * MOE_X_4846b72315 + tb_z] = 0;
+                        }
+                        int tb_cnt[9];
+                        #pragma unroll
+                        for (int tb_k = 0; tb_k < 9; tb_k++) {
+                            tb_cnt[tb_k] = 0;
+                        }
+                        #pragma unroll 1
+                        for (int tb_m = 0; tb_m < tb_padded; tb_m += 128) {
+                            int tb_key = 0;
+                            #pragma unroll 1
+                            for (int tb_s_11f2db_1 = 0; tb_s_11f2db_1 < MOE_RANKS; tb_s_11f2db_1++) {
+                                if (source_expert_counts[tb_s_11f2db_1 * MOE_X_fa76c90be3 + tb_e] > 0 && tb_pub[tb_e * MOE_X_efe70cec4a + MOE_X_96e08f30e3 + tb_s_11f2db_1] < tb_m + 128 && tb_m < tb_pub[tb_e * MOE_X_efe70cec4a + MOE_X_96e08f30e3 + tb_s_11f2db_1] + source_expert_counts[tb_s_11f2db_1 * MOE_X_fa76c90be3 + tb_e]) {
+                                    int _max_961fc8 = ((tb_key) > (tb_pub[tb_e * MOE_X_efe70cec4a + tb_s_11f2db_1]) ? (tb_key) : (tb_pub[tb_e * MOE_X_efe70cec4a + tb_s_11f2db_1]));
+                                    tb_key = _max_961fc8;
+#elif (MOE_SW_POLICY_EP == 16 && (MOE_INSTANCE == 0 || MOE_INSTANCE == 2)) // moe-select
+                            tb_pub[tb_e * MOE_X_efe70cec4a + MOE_X_96e08f30e3 + tb_s_11f2db] = tb_b;
+                            expert_source_base[tb_e * MOE_RANKS + tb_s_11f2db] = tb_b;
+                            es_run = es_run + source_expert_counts[tb_s_11f2db * MOE_X_fa76c90be3 + tb_e];
+                        }
+                        if (es_run != tb_count) {
+                            atomicMax(&protocol_error[0], 1);
+                        }
+                        #pragma unroll 1
+                        for (int tb_z = 0; tb_z < MOE_X_4846b72315; tb_z++) {
+                            tb_pub[MOE_X_8923c9d28f + tb_e * MOE_X_4846b72315 + tb_z] = 0;
+                        }
+                        int tb_cnt[9];
+                        #pragma unroll
+                        for (int tb_k = 0; tb_k < 9; tb_k++) {
+                            tb_cnt[tb_k] = 0;
+                        }
+                        #pragma unroll 1
+                        for (int tb_m = 0; tb_m < tb_padded; tb_m += 128) {
+                            int tb_key = 0;
+                            #pragma unroll 1
+                            for (int tb_s_11f2db_1 = 0; tb_s_11f2db_1 < MOE_RANKS; tb_s_11f2db_1++) {
+                                if (source_expert_counts[tb_s_11f2db_1 * MOE_X_fa76c90be3 + tb_e] > 0 && tb_pub[tb_e * MOE_X_efe70cec4a + MOE_X_96e08f30e3 + tb_s_11f2db_1] < tb_m + 128 && tb_m < tb_pub[tb_e * MOE_X_efe70cec4a + MOE_X_96e08f30e3 + tb_s_11f2db_1] + source_expert_counts[tb_s_11f2db_1 * MOE_X_fa76c90be3 + tb_e]) {
+                                    int _max_961fc8 = ((tb_key) > (tb_pub[tb_e * MOE_X_efe70cec4a + tb_s_11f2db_1]) ? (tb_key) : (tb_pub[tb_e * MOE_X_efe70cec4a + tb_s_11f2db_1]));
+                                    tb_key = _max_961fc8;
+#elif MOE_SW_WIDE_RANKS == 1 // moe-select
                             task_max_source[tb_task_idx] = task_ms;
                             task_expert[tb_task_idx] = rank * MOE_X_daba0ce864 + tb_e;
                             task_source_rank[tb_task_idx] = 0;
@@ -3904,56 +4079,6 @@
                                         int wide_gate_chunks = (wide_gate_prefix + wide_gate_q - 1) / wide_gate_q;
                                         wide_task_gate = wide_task_gate | (unsigned long long)wide_gate_chunks << (unsigned long long)(gate_lane * 4);
                                     }
-#elif (MOE_SW_POLICY_EP == 16 && ((MOE_INSTANCE == 0 && MOE_SW_TB_SCR_GLOBAL == 0) || (MOE_INSTANCE == 2 && MOE_SW_TB_SCR_GLOBAL == 0))) // moe-select
-                            tb_base[tb_s_11f2db] = tb_b;
-                            expert_source_base[tb_e * MOE_RANKS + tb_s_11f2db] = tb_b;
-                            es_run = es_run + tb_secs[tb_s_11f2db];
-                        }
-                        if (es_run != tb_count) {
-                            atomicMax(&protocol_error[0], 1);
-                        }
-                        #pragma unroll 1
-                        for (int tb_z = 0; tb_z < MOE_X_4846b72315; tb_z++) {
-                            tb_scr[tb_e * MOE_X_4846b72315 + tb_z] = 0;
-                        }
-                        int tb_cnt[9];
-                        #pragma unroll
-                        for (int tb_k = 0; tb_k < 9; tb_k++) {
-                            tb_cnt[tb_k] = 0;
-                        }
-                        #pragma unroll 1
-                        for (int tb_m = 0; tb_m < tb_padded; tb_m += 128) {
-                            int tb_key = 0;
-                            #pragma unroll
-                            for (int tb_s_11f2db_1 = 0; tb_s_11f2db_1 < MOE_RANKS; tb_s_11f2db_1++) {
-                                if (tb_secs[tb_s_11f2db_1] > 0 && tb_base[tb_s_11f2db_1] < tb_m + 128 && tb_m < tb_base[tb_s_11f2db_1] + tb_secs[tb_s_11f2db_1]) {
-                                    int _max_1e3302 = ((tb_key) > (tb_need[tb_s_11f2db_1]) ? (tb_key) : (tb_need[tb_s_11f2db_1]));
-                                    tb_key = _max_1e3302;
-#elif (MOE_SW_POLICY_EP == 16 && (MOE_INSTANCE == 0 || MOE_INSTANCE == 2)) // moe-select
-                            tb_base[tb_s_11f2db] = tb_b;
-                            expert_source_base[tb_e * MOE_RANKS + tb_s_11f2db] = tb_b;
-                            es_run = es_run + tb_secs[tb_s_11f2db];
-                        }
-                        if (es_run != tb_count) {
-                            atomicMax(&protocol_error[0], 1);
-                        }
-                        #pragma unroll 1
-                        for (int tb_z = 0; tb_z < MOE_X_4846b72315; tb_z++) {
-                            tb_pub[MOE_X_8923c9d28f + tb_e * MOE_X_4846b72315 + tb_z] = 0;
-                        }
-                        int tb_cnt[9];
-                        #pragma unroll
-                        for (int tb_k = 0; tb_k < 9; tb_k++) {
-                            tb_cnt[tb_k] = 0;
-                        }
-                        #pragma unroll 1
-                        for (int tb_m = 0; tb_m < tb_padded; tb_m += 128) {
-                            int tb_key = 0;
-                            #pragma unroll
-                            for (int tb_s_11f2db_1 = 0; tb_s_11f2db_1 < MOE_RANKS; tb_s_11f2db_1++) {
-                                if (tb_secs[tb_s_11f2db_1] > 0 && tb_base[tb_s_11f2db_1] < tb_m + 128 && tb_m < tb_base[tb_s_11f2db_1] + tb_secs[tb_s_11f2db_1]) {
-                                    int _max_1e3302 = ((tb_key) > (tb_need[tb_s_11f2db_1]) ? (tb_key) : (tb_need[tb_s_11f2db_1]));
-                                    tb_key = _max_1e3302;
 #elif (MOE_INSTANCE == 0 || MOE_INSTANCE == 2) // moe-select
                             task_max_source[tb_task_idx] = task_ms;
                             task_expert[tb_task_idx] = rank * MOE_X_daba0ce864 + tb_e;
@@ -4013,19 +4138,41 @@
                             expert_block_task[tb_e * MOE_X_eada4540ba + m_local / 64] = tb_task_idx;
 #elif (MOE_SW_POLICY_EP == 16 && ((MOE_INSTANCE == 1 && MOE_SW_WIDE_RANKS == 1) || (MOE_INSTANCE == 3 && MOE_SW_WIDE_RANKS == 1))) // moe-select
                             expert_block_task[tb_e * MOE_X_0e8fba56d4 + m_local / 64] = tb_task_idx;
+#elif (MOE_SW_POLICY_EP == 16 && ((MOE_INSTANCE == 0 && (MOE_SW_WIDE_RANKS == 1 && MOE_SW_TB_SCR_GLOBAL == 0)) || (MOE_INSTANCE == 2 && (MOE_SW_WIDE_RANKS == 1 && MOE_SW_TB_SCR_GLOBAL == 0)))) // moe-select
+                            #pragma unroll 1
+                            for (int tb_s_11f2db_2 = 0; tb_s_11f2db_2 < MOE_RANKS; tb_s_11f2db_2++) {
+                                int _max_82013a = ((tb_pub[tb_e * MOE_X_efe70cec4a + MOE_X_96e08f30e3 + tb_s_11f2db_2]) > (tb_m) ? (tb_pub[tb_e * MOE_X_efe70cec4a + MOE_X_96e08f30e3 + tb_s_11f2db_2]) : (tb_m));
+                                int tb_lo = _max_82013a;
+                                int _min_d3577c = ((tb_pub[tb_e * MOE_X_efe70cec4a + MOE_X_96e08f30e3 + tb_s_11f2db_2] + source_expert_counts[tb_s_11f2db_2 * MOE_X_fa76c90be3 + tb_e]) < (tb_m + 128) ? (tb_pub[tb_e * MOE_X_efe70cec4a + MOE_X_96e08f30e3 + tb_s_11f2db_2] + source_expert_counts[tb_s_11f2db_2 * MOE_X_fa76c90be3 + tb_e]) : (tb_m + 128));
+                                int tb_hi = _min_d3577c;
+                                if (tb_hi > tb_lo) {
+                                    tb_scr[tb_e * MOE_X_4846b72315 + tb_key * MOE_RANKS + tb_s_11f2db_2] = tb_scr[tb_e * MOE_X_4846b72315 + tb_key * MOE_RANKS + tb_s_11f2db_2] + (tb_hi - tb_lo);
+                                }
+                            }
 #elif ((MOE_INSTANCE == 0 && (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_WATCH_WIDE == 0 && (MOE_SW_TASK_GATE_U64 == 0 && MOE_SHARED_EXPERT == 1)))) || (MOE_INSTANCE == 2 && (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_WATCH_WIDE == 0 && (MOE_SW_TASK_GATE_U64 == 0 && MOE_SHARED_EXPERT == 1))))) // moe-select
                             task_gate_packed[tb_task_idx] = task_gate;
                             expert_block_task[tb_e * MOE_X_2bf3a44db8 + m_local / 128] = tb_task_idx;
 #elif ((MOE_INSTANCE == 0 && (MOE_SW_POLICY_EP == 4 || MOE_SW_POLICY_EP == 8)) || (MOE_INSTANCE == 2 && (MOE_SW_POLICY_EP == 4 || MOE_SW_POLICY_EP == 8))) // moe-select
                             task_gate_packed[tb_task_idx] = task_gate;
                             expert_block_task[tb_e * MOE_X_1d92be5ff8 + m_local / 128] = tb_task_idx;
-#elif ((MOE_INSTANCE == 1 && MOE_SHARED_EXPERT == 1) || (MOE_INSTANCE == 3 && MOE_SHARED_EXPERT == 1)) // moe-select
+#elif MOE_SW_WIDE_RANKS == 1 // moe-select
+                            #pragma unroll 1
+                            for (int tb_s_11f2db_2 = 0; tb_s_11f2db_2 < MOE_RANKS; tb_s_11f2db_2++) {
+                                int _max_82013a = ((tb_pub[tb_e * MOE_X_efe70cec4a + MOE_X_96e08f30e3 + tb_s_11f2db_2]) > (tb_m) ? (tb_pub[tb_e * MOE_X_efe70cec4a + MOE_X_96e08f30e3 + tb_s_11f2db_2]) : (tb_m));
+                                int tb_lo = _max_82013a;
+                                int _min_d3577c = ((tb_pub[tb_e * MOE_X_efe70cec4a + MOE_X_96e08f30e3 + tb_s_11f2db_2] + source_expert_counts[tb_s_11f2db_2 * MOE_X_fa76c90be3 + tb_e]) < (tb_m + 128) ? (tb_pub[tb_e * MOE_X_efe70cec4a + MOE_X_96e08f30e3 + tb_s_11f2db_2] + source_expert_counts[tb_s_11f2db_2 * MOE_X_fa76c90be3 + tb_e]) : (tb_m + 128));
+                                int tb_hi = _min_d3577c;
+                                if (tb_hi > tb_lo) {
+                                    tb_pub[MOE_X_8923c9d28f + tb_e * MOE_X_4846b72315 + tb_key * MOE_RANKS + tb_s_11f2db_2] = tb_pub[MOE_X_8923c9d28f + tb_e * MOE_X_4846b72315 + tb_key * MOE_RANKS + tb_s_11f2db_2] + (tb_hi - tb_lo);
+                                }
+                            }
+#elif (MOE_INSTANCE == 0 || MOE_INSTANCE == 2) // moe-select
+#elif MOE_SHARED_EXPERT == 1 // moe-select
                             task_gate_packed[tb_task_idx] = task_gate;
                             expert_block_task[tb_e * MOE_X_eada4540ba + m_local / 64] = tb_task_idx;
-#elif (MOE_INSTANCE == 1 || MOE_INSTANCE == 3) // moe-select
+#else // moe-select
                             task_gate_packed[tb_task_idx] = task_gate;
                             expert_block_task[tb_e * MOE_X_0e8fba56d4 + m_local / 64] = tb_task_idx;
-#else // moe-select
 #endif // moe-select
                             #pragma unroll
 #if (MOE_SW_POLICY_EP == 16 && ((MOE_INSTANCE == 0 && (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_TB_SCR_GLOBAL == 1 && MOE_SHARED_EXPERT == 1))) || (MOE_INSTANCE == 2 && (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_TB_SCR_GLOBAL == 1 && MOE_SHARED_EXPERT == 1))))) // moe-select
@@ -4037,7 +4184,7 @@
                                 if (tb_hi > tb_lo) {
                                     tb_pub[MOE_X_9844159897 + tb_e * MOE_X_4846b72315 + tb_key * MOE_RANKS + tb_s_11f2db_2] = tb_pub[MOE_X_9844159897 + tb_e * MOE_X_4846b72315 + tb_key * MOE_RANKS + tb_s_11f2db_2] + (tb_hi - tb_lo);
                                 }
-#elif (MOE_SW_POLICY_EP == 16 && ((MOE_INSTANCE == 0 && MOE_SW_TB_SCR_GLOBAL == 1) || (MOE_INSTANCE == 2 && MOE_SW_TB_SCR_GLOBAL == 1))) // moe-select
+#elif (MOE_SW_POLICY_EP == 16 && ((MOE_INSTANCE == 0 && (MOE_SW_WIDE_RANKS == 0 && MOE_SW_TB_SCR_GLOBAL == 1)) || (MOE_INSTANCE == 2 && (MOE_SW_WIDE_RANKS == 0 && MOE_SW_TB_SCR_GLOBAL == 1)))) // moe-select
                             for (int tb_s_11f2db_2 = 0; tb_s_11f2db_2 < MOE_RANKS; tb_s_11f2db_2++) {
                                 int _max_a655a3 = ((tb_base[tb_s_11f2db_2]) > (tb_m) ? (tb_base[tb_s_11f2db_2]) : (tb_m));
                                 int tb_lo = _max_a655a3;
@@ -4046,7 +4193,7 @@
                                 if (tb_hi > tb_lo) {
                                     tb_pub[MOE_X_8923c9d28f + tb_e * MOE_X_4846b72315 + tb_key * MOE_RANKS + tb_s_11f2db_2] = tb_pub[MOE_X_8923c9d28f + tb_e * MOE_X_4846b72315 + tb_key * MOE_RANKS + tb_s_11f2db_2] + (tb_hi - tb_lo);
                                 }
-#elif (MOE_SW_POLICY_EP == 16 && (MOE_INSTANCE == 0 || MOE_INSTANCE == 2)) // moe-select
+#elif (MOE_SW_POLICY_EP == 16 && ((MOE_INSTANCE == 0 && MOE_SW_WIDE_RANKS == 0) || (MOE_INSTANCE == 2 && MOE_SW_WIDE_RANKS == 0))) // moe-select
                             for (int tb_s_11f2db_2 = 0; tb_s_11f2db_2 < MOE_RANKS; tb_s_11f2db_2++) {
                                 int _max_a655a3 = ((tb_base[tb_s_11f2db_2]) > (tb_m) ? (tb_base[tb_s_11f2db_2]) : (tb_m));
                                 int tb_lo = _max_a655a3;
@@ -4055,6 +4202,9 @@
                                 if (tb_hi > tb_lo) {
                                     tb_scr[tb_e * MOE_X_4846b72315 + tb_key * MOE_RANKS + tb_s_11f2db_2] = tb_scr[tb_e * MOE_X_4846b72315 + tb_key * MOE_RANKS + tb_s_11f2db_2] + (tb_hi - tb_lo);
                                 }
+#elif (MOE_SW_POLICY_EP == 16 && (MOE_INSTANCE == 0 || MOE_INSTANCE == 2)) // moe-select
+                            for (int tb_k_5a2bf2 = 0; tb_k_5a2bf2 < 9; tb_k_5a2bf2++) {
+                                tb_cnt[tb_k_5a2bf2] = tb_cnt[tb_k_5a2bf2] + (int)(tb_key == tb_k_5a2bf2);
 #else // moe-select
                             for (int sb_source = 0; sb_source < MOE_RANKS; sb_source++) {
                                 int _max_b8a74b = ((m_local - ft_base[sb_source]) > (0) ? (m_local - ft_base[sb_source]) : (0));
@@ -4163,6 +4313,173 @@
                         #pragma unroll 1
                         for (int tb_z2 = 0; tb_z2 < MOE_X_4846b72315; tb_z2++) {
                             tb_pub[tb_e * MOE_X_3f9b7f9a5d + MOE_X_576908eaec + tb_z2] = tb_scr[MOE_X_5f1332287b + tb_e * MOE_X_4846b72315 + tb_z2];
+                        }
+                    } else {
+                        int ft_base[MOE_RANKS];
+                        int ft_cnt[MOE_RANKS];
+                        int ft_pre[MOE_RANKS];
+                        int ft_gch[MOE_RANKS];
+                        int so_run = 0;
+                        #pragma unroll
+                        for (int es_source = 0; es_source < MOE_RANKS; es_source++) {
+                            int tb_sec = source_expert_counts[es_source * MOE_X_fa76c90be3 + tb_e];
+                            int tb_sec_incl = tb_sec;
+                            int _shfl_up_9fa3b8 = __shfl_up_sync(0xFFFFFFFF, tb_sec_incl, 1, 32);
+                            int tb_up_s = _shfl_up_9fa3b8;
+                            if (tb_lane >= 1) {
+                                tb_sec_incl = tb_sec_incl + tb_up_s;
+                            }
+                            int _shfl_up_02290a = __shfl_up_sync(0xFFFFFFFF, tb_sec_incl, 2, 32);
+                            int tb_up_s_f16102 = _shfl_up_02290a;
+                            if (tb_lane >= 2) {
+                                tb_sec_incl = tb_sec_incl + tb_up_s_f16102;
+                            }
+                            int _shfl_up_1cfd9b = __shfl_up_sync(0xFFFFFFFF, tb_sec_incl, 4, 32);
+                            int tb_up_s_f16102_1 = _shfl_up_1cfd9b;
+                            if (tb_lane >= 4) {
+                                tb_sec_incl = tb_sec_incl + tb_up_s_f16102_1;
+                            }
+                            int _shfl_up_448be0 = __shfl_up_sync(0xFFFFFFFF, tb_sec_incl, 8, 32);
+                            int tb_up_s_f16102_2 = _shfl_up_448be0;
+                            if (tb_lane >= 8) {
+                                tb_sec_incl = tb_sec_incl + tb_up_s_f16102_2;
+                            }
+                            int _shfl_up_a1ebf1 = __shfl_up_sync(0xFFFFFFFF, tb_sec_incl, 16, 32);
+                            int tb_up_s_f16102_3 = _shfl_up_a1ebf1;
+                            if (tb_lane >= 16) {
+                                tb_sec_incl = tb_sec_incl + tb_up_s_f16102_3;
+                            }
+                            int tb_so_c = tb_scr[MOE_X_2b14d080ee + es_source];
+                            source_expert_prefix[tb_e * MOE_RANKS + es_source] = tb_so_c + tb_sec_incl - tb_sec;
+                            int _shfl_01c494 = __shfl_sync(0xFFFFFFFF, tb_sec_incl, 31);
+                            int tb_so_t = _shfl_01c494;
+                            __syncwarp();
+                            if (tb_lane == 0) {
+                                tb_scr[MOE_X_2b14d080ee + es_source] = tb_so_c + tb_so_t;
+                            }
+                            __syncwarp();
+                            expert_source_base[tb_e * MOE_RANKS + es_source] = so_run;
+                            ft_pre[es_source] = tb_so_c + tb_sec_incl - tb_sec;
+                            ft_base[es_source] = so_run;
+                            ft_cnt[es_source] = 0;
+                            ft_gch[es_source] = 0;
+                            if (es_source < world_size) {
+                                ft_cnt[es_source] = tb_sec;
+                                int ft_gc = source_record_counts[es_source];
+                                int _max_42b838 = (((ft_gc + 8 - 1) / 8) > (dispatch_chunk_min_records) ? ((ft_gc + 8 - 1) / 8) : (dispatch_chunk_min_records));
+                                int ft_gq = _max_42b838;
+                                int ft_pf = reinterpret_cast<int*>(reinterpret_cast<int*>(dispatch_header_inbox) + ((es_source * 2 + slot) * MOE_X_c005674f28 + 8 + MOE_X_fa76c90be3 + tb_e))[0];
+                                int _max_b028a0 = ((ft_pf) > (0) ? (ft_pf) : (0));
+                                int _min_0258ac = ((_max_b028a0) < (ft_gc) ? (_max_b028a0) : (ft_gc));
+                                ft_pf = _min_0258ac;
+                                ft_gch[es_source] = (ft_pf + ft_gq - 1) / ft_gq;
+                            }
+                            if (es_source < world_size) {
+                                so_run = so_run + tb_sec;
+                            }
+                        }
+                        if (so_run != tb_count) {
+#elif (MOE_SW_POLICY_EP == 16 && ((MOE_INSTANCE == 0 && (MOE_SW_WIDE_RANKS == 0 && MOE_SW_TB_SCR_GLOBAL == 0)) || (MOE_INSTANCE == 2 && (MOE_SW_WIDE_RANKS == 0 && MOE_SW_TB_SCR_GLOBAL == 0)))) // moe-select
+                            #pragma unroll
+                            for (int tb_k_5a2bf2 = 0; tb_k_5a2bf2 < 9; tb_k_5a2bf2++) {
+                                tb_cnt[tb_k_5a2bf2] = tb_cnt[tb_k_5a2bf2] + (int)(tb_key == tb_k_5a2bf2);
+                            }
+                        }
+                        int tb_pre[9];
+                        int tb_below[9];
+                        #pragma unroll
+                        for (int tb_k_5a2bf2_1 = 0; tb_k_5a2bf2_1 < 9; tb_k_5a2bf2_1++) {
+                            int tb_inc = tb_cnt[tb_k_5a2bf2_1];
+                            int _shfl_up_c4bd22 = __shfl_up_sync(0xFFFFFFFF, tb_inc, 1, 32);
+                            int tb_up3 = _shfl_up_c4bd22;
+                            if (tb_lane >= 1) {
+                                tb_inc = tb_inc + tb_up3;
+                            }
+                            int _shfl_up_a32050 = __shfl_up_sync(0xFFFFFFFF, tb_inc, 2, 32);
+                            int tb_up3_c36c54 = _shfl_up_a32050;
+                            if (tb_lane >= 2) {
+                                tb_inc = tb_inc + tb_up3_c36c54;
+                            }
+                            int _shfl_up_bcaaa0 = __shfl_up_sync(0xFFFFFFFF, tb_inc, 4, 32);
+                            int tb_up3_c36c54_1 = _shfl_up_bcaaa0;
+                            if (tb_lane >= 4) {
+                                tb_inc = tb_inc + tb_up3_c36c54_1;
+                            }
+                            int _shfl_up_73d470 = __shfl_up_sync(0xFFFFFFFF, tb_inc, 8, 32);
+                            int tb_up3_c36c54_2 = _shfl_up_73d470;
+                            if (tb_lane >= 8) {
+                                tb_inc = tb_inc + tb_up3_c36c54_2;
+                            }
+                            int _shfl_up_f08845 = __shfl_up_sync(0xFFFFFFFF, tb_inc, 16, 32);
+                            int tb_up3_c36c54_3 = _shfl_up_f08845;
+                            if (tb_lane >= 16) {
+                                tb_inc = tb_inc + tb_up3_c36c54_3;
+                            }
+                            tb_pre[tb_k_5a2bf2_1] = tb_tot[tb_k_5a2bf2_1] + tb_inc - tb_cnt[tb_k_5a2bf2_1];
+                            int _shfl_4dad8f = __shfl_sync(0xFFFFFFFF, tb_inc, 31);
+                            tb_tot[tb_k_5a2bf2_1] = tb_tot[tb_k_5a2bf2_1] + _shfl_4dad8f;
+                        }
+                        int tb_acc2 = 0;
+                        #pragma unroll
+                        for (int tb_k_5a2bf2_2 = 0; tb_k_5a2bf2_2 < 9; tb_k_5a2bf2_2++) {
+                            tb_below[tb_k_5a2bf2_2] = tb_acc2;
+                            tb_acc2 = tb_acc2 + tb_cnt[tb_k_5a2bf2_2];
+                        }
+                        #pragma unroll
+                        for (int tb_k_5a2bf2_3 = 0; tb_k_5a2bf2_3 < 9; tb_k_5a2bf2_3++) {
+                            #pragma unroll
+                            for (int tb_s_11f2db_3 = 0; tb_s_11f2db_3 < MOE_RANKS; tb_s_11f2db_3++) {
+                                __syncwarp();
+                                int tb_vc = tb_scr[MOE_X_2b14d080ee + tb_k_5a2bf2_3 * MOE_RANKS + tb_s_11f2db_3];
+                                int tb_v = tb_scr[tb_e * MOE_X_4846b72315 + tb_k_5a2bf2_3 * MOE_RANKS + tb_s_11f2db_3];
+                                int tb_vi = tb_v;
+                                int _shfl_up_d3afbd = __shfl_up_sync(0xFFFFFFFF, tb_vi, 1, 32);
+                                int tb_up4 = _shfl_up_d3afbd;
+                                if (tb_lane >= 1) {
+                                    tb_vi = tb_vi + tb_up4;
+                                }
+                                int _shfl_up_df8eb1 = __shfl_up_sync(0xFFFFFFFF, tb_vi, 2, 32);
+                                int tb_up4_a40c7c = _shfl_up_df8eb1;
+                                if (tb_lane >= 2) {
+                                    tb_vi = tb_vi + tb_up4_a40c7c;
+                                }
+                                int _shfl_up_a577d1 = __shfl_up_sync(0xFFFFFFFF, tb_vi, 4, 32);
+                                int tb_up4_a40c7c_1 = _shfl_up_a577d1;
+                                if (tb_lane >= 4) {
+                                    tb_vi = tb_vi + tb_up4_a40c7c_1;
+                                }
+                                int _shfl_up_263c4e = __shfl_up_sync(0xFFFFFFFF, tb_vi, 8, 32);
+                                int tb_up4_a40c7c_2 = _shfl_up_263c4e;
+                                if (tb_lane >= 8) {
+                                    tb_vi = tb_vi + tb_up4_a40c7c_2;
+                                }
+                                int _shfl_up_aff9aa = __shfl_up_sync(0xFFFFFFFF, tb_vi, 16, 32);
+                                int tb_up4_a40c7c_3 = _shfl_up_aff9aa;
+                                if (tb_lane >= 16) {
+                                    tb_vi = tb_vi + tb_up4_a40c7c_3;
+                                }
+                                tb_scr[MOE_X_5f1332287b + tb_e * MOE_X_4846b72315 + tb_k_5a2bf2_3 * MOE_RANKS + tb_s_11f2db_3] = tb_vc + tb_vi - tb_v;
+                                int _shfl_8c2991 = __shfl_sync(0xFFFFFFFF, tb_vi, 31);
+                                int tb_vt = _shfl_8c2991;
+                                __syncwarp();
+                                if (tb_lane == 0) {
+                                    tb_scr[MOE_X_2b14d080ee + tb_k_5a2bf2_3 * MOE_RANKS + tb_s_11f2db_3] = tb_vc + tb_vt;
+                                }
+                            }
+                        }
+                        #pragma unroll
+                        for (int tb_s_11f2db_4 = 0; tb_s_11f2db_4 < MOE_RANKS; tb_s_11f2db_4++) {
+                            tb_pub[tb_e * MOE_X_efe70cec4a + tb_s_11f2db_4] = tb_need[tb_s_11f2db_4];
+                            tb_pub[tb_e * MOE_X_efe70cec4a + MOE_X_96e08f30e3 + tb_s_11f2db_4] = tb_base[tb_s_11f2db_4];
+                        }
+                        #pragma unroll
+                        for (int tb_k_5a2bf2_4 = 0; tb_k_5a2bf2_4 < 9; tb_k_5a2bf2_4++) {
+                            tb_pub[tb_e * MOE_X_efe70cec4a + MOE_X_a41ee4a7d8 + tb_k_5a2bf2_4] = tb_pre[tb_k_5a2bf2_4];
+                            tb_pub[tb_e * MOE_X_efe70cec4a + MOE_X_493edec11b + tb_k_5a2bf2_4] = tb_below[tb_k_5a2bf2_4];
+                        }
+                        #pragma unroll 1
+                        for (int tb_z2 = 0; tb_z2 < MOE_X_4846b72315; tb_z2++) {
+                            tb_pub[tb_e * MOE_X_efe70cec4a + MOE_X_576908eaec + tb_z2] = tb_scr[MOE_X_5f1332287b + tb_e * MOE_X_4846b72315 + tb_z2];
                         }
                     } else {
                         int ft_base[MOE_RANKS];
@@ -4396,174 +4713,7 @@
                             }
                         }
                         if (so_run != tb_count) {
-#elif (MOE_SW_POLICY_EP == 16 && ((MOE_INSTANCE == 0 && MOE_SW_TB_SCR_GLOBAL == 0) || (MOE_INSTANCE == 2 && MOE_SW_TB_SCR_GLOBAL == 0))) // moe-select
-                            #pragma unroll
-                            for (int tb_k_5a2bf2 = 0; tb_k_5a2bf2 < 9; tb_k_5a2bf2++) {
-                                tb_cnt[tb_k_5a2bf2] = tb_cnt[tb_k_5a2bf2] + (int)(tb_key == tb_k_5a2bf2);
-                            }
-                        }
-                        int tb_pre[9];
-                        int tb_below[9];
-                        #pragma unroll
-                        for (int tb_k_5a2bf2_1 = 0; tb_k_5a2bf2_1 < 9; tb_k_5a2bf2_1++) {
-                            int tb_inc = tb_cnt[tb_k_5a2bf2_1];
-                            int _shfl_up_c4bd22 = __shfl_up_sync(0xFFFFFFFF, tb_inc, 1, 32);
-                            int tb_up3 = _shfl_up_c4bd22;
-                            if (tb_lane >= 1) {
-                                tb_inc = tb_inc + tb_up3;
-                            }
-                            int _shfl_up_a32050 = __shfl_up_sync(0xFFFFFFFF, tb_inc, 2, 32);
-                            int tb_up3_c36c54 = _shfl_up_a32050;
-                            if (tb_lane >= 2) {
-                                tb_inc = tb_inc + tb_up3_c36c54;
-                            }
-                            int _shfl_up_bcaaa0 = __shfl_up_sync(0xFFFFFFFF, tb_inc, 4, 32);
-                            int tb_up3_c36c54_1 = _shfl_up_bcaaa0;
-                            if (tb_lane >= 4) {
-                                tb_inc = tb_inc + tb_up3_c36c54_1;
-                            }
-                            int _shfl_up_73d470 = __shfl_up_sync(0xFFFFFFFF, tb_inc, 8, 32);
-                            int tb_up3_c36c54_2 = _shfl_up_73d470;
-                            if (tb_lane >= 8) {
-                                tb_inc = tb_inc + tb_up3_c36c54_2;
-                            }
-                            int _shfl_up_f08845 = __shfl_up_sync(0xFFFFFFFF, tb_inc, 16, 32);
-                            int tb_up3_c36c54_3 = _shfl_up_f08845;
-                            if (tb_lane >= 16) {
-                                tb_inc = tb_inc + tb_up3_c36c54_3;
-                            }
-                            tb_pre[tb_k_5a2bf2_1] = tb_tot[tb_k_5a2bf2_1] + tb_inc - tb_cnt[tb_k_5a2bf2_1];
-                            int _shfl_4dad8f = __shfl_sync(0xFFFFFFFF, tb_inc, 31);
-                            tb_tot[tb_k_5a2bf2_1] = tb_tot[tb_k_5a2bf2_1] + _shfl_4dad8f;
-                        }
-                        int tb_acc2 = 0;
-                        #pragma unroll
-                        for (int tb_k_5a2bf2_2 = 0; tb_k_5a2bf2_2 < 9; tb_k_5a2bf2_2++) {
-                            tb_below[tb_k_5a2bf2_2] = tb_acc2;
-                            tb_acc2 = tb_acc2 + tb_cnt[tb_k_5a2bf2_2];
-                        }
-                        #pragma unroll
-                        for (int tb_k_5a2bf2_3 = 0; tb_k_5a2bf2_3 < 9; tb_k_5a2bf2_3++) {
-                            #pragma unroll
-                            for (int tb_s_11f2db_3 = 0; tb_s_11f2db_3 < MOE_RANKS; tb_s_11f2db_3++) {
-                                __syncwarp();
-                                int tb_vc = tb_scr[MOE_X_2b14d080ee + tb_k_5a2bf2_3 * MOE_RANKS + tb_s_11f2db_3];
-                                int tb_v = tb_scr[tb_e * MOE_X_4846b72315 + tb_k_5a2bf2_3 * MOE_RANKS + tb_s_11f2db_3];
-                                int tb_vi = tb_v;
-                                int _shfl_up_d3afbd = __shfl_up_sync(0xFFFFFFFF, tb_vi, 1, 32);
-                                int tb_up4 = _shfl_up_d3afbd;
-                                if (tb_lane >= 1) {
-                                    tb_vi = tb_vi + tb_up4;
-                                }
-                                int _shfl_up_df8eb1 = __shfl_up_sync(0xFFFFFFFF, tb_vi, 2, 32);
-                                int tb_up4_a40c7c = _shfl_up_df8eb1;
-                                if (tb_lane >= 2) {
-                                    tb_vi = tb_vi + tb_up4_a40c7c;
-                                }
-                                int _shfl_up_a577d1 = __shfl_up_sync(0xFFFFFFFF, tb_vi, 4, 32);
-                                int tb_up4_a40c7c_1 = _shfl_up_a577d1;
-                                if (tb_lane >= 4) {
-                                    tb_vi = tb_vi + tb_up4_a40c7c_1;
-                                }
-                                int _shfl_up_263c4e = __shfl_up_sync(0xFFFFFFFF, tb_vi, 8, 32);
-                                int tb_up4_a40c7c_2 = _shfl_up_263c4e;
-                                if (tb_lane >= 8) {
-                                    tb_vi = tb_vi + tb_up4_a40c7c_2;
-                                }
-                                int _shfl_up_aff9aa = __shfl_up_sync(0xFFFFFFFF, tb_vi, 16, 32);
-                                int tb_up4_a40c7c_3 = _shfl_up_aff9aa;
-                                if (tb_lane >= 16) {
-                                    tb_vi = tb_vi + tb_up4_a40c7c_3;
-                                }
-                                tb_scr[MOE_X_5f1332287b + tb_e * MOE_X_4846b72315 + tb_k_5a2bf2_3 * MOE_RANKS + tb_s_11f2db_3] = tb_vc + tb_vi - tb_v;
-                                int _shfl_8c2991 = __shfl_sync(0xFFFFFFFF, tb_vi, 31);
-                                int tb_vt = _shfl_8c2991;
-                                __syncwarp();
-                                if (tb_lane == 0) {
-                                    tb_scr[MOE_X_2b14d080ee + tb_k_5a2bf2_3 * MOE_RANKS + tb_s_11f2db_3] = tb_vc + tb_vt;
-                                }
-                            }
-                        }
-                        #pragma unroll
-                        for (int tb_s_11f2db_4 = 0; tb_s_11f2db_4 < MOE_RANKS; tb_s_11f2db_4++) {
-                            tb_pub[tb_e * MOE_X_efe70cec4a + tb_s_11f2db_4] = tb_need[tb_s_11f2db_4];
-                            tb_pub[tb_e * MOE_X_efe70cec4a + MOE_X_96e08f30e3 + tb_s_11f2db_4] = tb_base[tb_s_11f2db_4];
-                        }
-                        #pragma unroll
-                        for (int tb_k_5a2bf2_4 = 0; tb_k_5a2bf2_4 < 9; tb_k_5a2bf2_4++) {
-                            tb_pub[tb_e * MOE_X_efe70cec4a + MOE_X_a41ee4a7d8 + tb_k_5a2bf2_4] = tb_pre[tb_k_5a2bf2_4];
-                            tb_pub[tb_e * MOE_X_efe70cec4a + MOE_X_493edec11b + tb_k_5a2bf2_4] = tb_below[tb_k_5a2bf2_4];
-                        }
-                        #pragma unroll 1
-                        for (int tb_z2 = 0; tb_z2 < MOE_X_4846b72315; tb_z2++) {
-                            tb_pub[tb_e * MOE_X_efe70cec4a + MOE_X_576908eaec + tb_z2] = tb_scr[MOE_X_5f1332287b + tb_e * MOE_X_4846b72315 + tb_z2];
-                        }
-                    } else {
-                        int ft_base[MOE_RANKS];
-                        int ft_cnt[MOE_RANKS];
-                        int ft_pre[MOE_RANKS];
-                        int ft_gch[MOE_RANKS];
-                        int so_run = 0;
-                        #pragma unroll
-                        for (int es_source = 0; es_source < MOE_RANKS; es_source++) {
-                            int tb_sec = source_expert_counts[es_source * MOE_X_fa76c90be3 + tb_e];
-                            int tb_sec_incl = tb_sec;
-                            int _shfl_up_9fa3b8 = __shfl_up_sync(0xFFFFFFFF, tb_sec_incl, 1, 32);
-                            int tb_up_s = _shfl_up_9fa3b8;
-                            if (tb_lane >= 1) {
-                                tb_sec_incl = tb_sec_incl + tb_up_s;
-                            }
-                            int _shfl_up_02290a = __shfl_up_sync(0xFFFFFFFF, tb_sec_incl, 2, 32);
-                            int tb_up_s_f16102 = _shfl_up_02290a;
-                            if (tb_lane >= 2) {
-                                tb_sec_incl = tb_sec_incl + tb_up_s_f16102;
-                            }
-                            int _shfl_up_1cfd9b = __shfl_up_sync(0xFFFFFFFF, tb_sec_incl, 4, 32);
-                            int tb_up_s_f16102_1 = _shfl_up_1cfd9b;
-                            if (tb_lane >= 4) {
-                                tb_sec_incl = tb_sec_incl + tb_up_s_f16102_1;
-                            }
-                            int _shfl_up_448be0 = __shfl_up_sync(0xFFFFFFFF, tb_sec_incl, 8, 32);
-                            int tb_up_s_f16102_2 = _shfl_up_448be0;
-                            if (tb_lane >= 8) {
-                                tb_sec_incl = tb_sec_incl + tb_up_s_f16102_2;
-                            }
-                            int _shfl_up_a1ebf1 = __shfl_up_sync(0xFFFFFFFF, tb_sec_incl, 16, 32);
-                            int tb_up_s_f16102_3 = _shfl_up_a1ebf1;
-                            if (tb_lane >= 16) {
-                                tb_sec_incl = tb_sec_incl + tb_up_s_f16102_3;
-                            }
-                            int tb_so_c = tb_scr[MOE_X_2b14d080ee + es_source];
-                            source_expert_prefix[tb_e * MOE_RANKS + es_source] = tb_so_c + tb_sec_incl - tb_sec;
-                            int _shfl_01c494 = __shfl_sync(0xFFFFFFFF, tb_sec_incl, 31);
-                            int tb_so_t = _shfl_01c494;
-                            __syncwarp();
-                            if (tb_lane == 0) {
-                                tb_scr[MOE_X_2b14d080ee + es_source] = tb_so_c + tb_so_t;
-                            }
-                            __syncwarp();
-                            expert_source_base[tb_e * MOE_RANKS + es_source] = so_run;
-                            ft_pre[es_source] = tb_so_c + tb_sec_incl - tb_sec;
-                            ft_base[es_source] = so_run;
-                            ft_cnt[es_source] = 0;
-                            ft_gch[es_source] = 0;
-                            if (es_source < world_size) {
-                                ft_cnt[es_source] = tb_sec;
-                                int ft_gc = source_record_counts[es_source];
-                                int _max_42b838 = (((ft_gc + 8 - 1) / 8) > (dispatch_chunk_min_records) ? ((ft_gc + 8 - 1) / 8) : (dispatch_chunk_min_records));
-                                int ft_gq = _max_42b838;
-                                int ft_pf = reinterpret_cast<int*>(reinterpret_cast<int*>(dispatch_header_inbox) + ((es_source * 2 + slot) * MOE_X_c005674f28 + 8 + MOE_X_fa76c90be3 + tb_e))[0];
-                                int _max_b028a0 = ((ft_pf) > (0) ? (ft_pf) : (0));
-                                int _min_0258ac = ((_max_b028a0) < (ft_gc) ? (_max_b028a0) : (ft_gc));
-                                ft_pf = _min_0258ac;
-                                ft_gch[es_source] = (ft_pf + ft_gq - 1) / ft_gq;
-                            }
-                            if (es_source < world_size) {
-                                so_run = so_run + tb_sec;
-                            }
-                        }
-                        if (so_run != tb_count) {
-#elif (MOE_SW_POLICY_EP == 16 && (MOE_INSTANCE == 0 || MOE_INSTANCE == 2)) // moe-select
+#elif (MOE_SW_POLICY_EP == 16 && ((MOE_INSTANCE == 0 && MOE_SW_WIDE_RANKS == 0) || (MOE_INSTANCE == 2 && MOE_SW_WIDE_RANKS == 0))) // moe-select
                             #pragma unroll
                             for (int tb_k_5a2bf2 = 0; tb_k_5a2bf2 < 9; tb_k_5a2bf2++) {
                                 tb_cnt[tb_k_5a2bf2] = tb_cnt[tb_k_5a2bf2] + (int)(tb_key == tb_k_5a2bf2);
@@ -4655,6 +4805,332 @@
                         for (int tb_s_11f2db_4 = 0; tb_s_11f2db_4 < MOE_RANKS; tb_s_11f2db_4++) {
                             tb_pub[tb_e * MOE_X_efe70cec4a + tb_s_11f2db_4] = tb_need[tb_s_11f2db_4];
                             tb_pub[tb_e * MOE_X_efe70cec4a + MOE_X_96e08f30e3 + tb_s_11f2db_4] = tb_base[tb_s_11f2db_4];
+                        }
+                        #pragma unroll
+                        for (int tb_k_5a2bf2_4 = 0; tb_k_5a2bf2_4 < 9; tb_k_5a2bf2_4++) {
+                            tb_pub[tb_e * MOE_X_efe70cec4a + MOE_X_a41ee4a7d8 + tb_k_5a2bf2_4] = tb_pre[tb_k_5a2bf2_4];
+                            tb_pub[tb_e * MOE_X_efe70cec4a + MOE_X_493edec11b + tb_k_5a2bf2_4] = tb_below[tb_k_5a2bf2_4];
+                        }
+                        #pragma unroll 1
+                        for (int tb_z2 = 0; tb_z2 < MOE_X_4846b72315; tb_z2++) {
+                            tb_pub[tb_e * MOE_X_efe70cec4a + MOE_X_576908eaec + tb_z2] = tb_pub[MOE_X_331b8b06eb + tb_e * MOE_X_4846b72315 + tb_z2];
+                        }
+                    } else {
+                        int ft_base[MOE_RANKS];
+                        int ft_cnt[MOE_RANKS];
+                        int ft_pre[MOE_RANKS];
+                        int ft_gch[MOE_RANKS];
+                        int so_run = 0;
+                        #pragma unroll
+                        for (int es_source = 0; es_source < MOE_RANKS; es_source++) {
+                            int tb_sec = source_expert_counts[es_source * MOE_X_fa76c90be3 + tb_e];
+                            int tb_sec_incl = tb_sec;
+                            int _shfl_up_9fa3b8 = __shfl_up_sync(0xFFFFFFFF, tb_sec_incl, 1, 32);
+                            int tb_up_s = _shfl_up_9fa3b8;
+                            if (tb_lane >= 1) {
+                                tb_sec_incl = tb_sec_incl + tb_up_s;
+                            }
+                            int _shfl_up_02290a = __shfl_up_sync(0xFFFFFFFF, tb_sec_incl, 2, 32);
+                            int tb_up_s_f16102 = _shfl_up_02290a;
+                            if (tb_lane >= 2) {
+                                tb_sec_incl = tb_sec_incl + tb_up_s_f16102;
+                            }
+                            int _shfl_up_1cfd9b = __shfl_up_sync(0xFFFFFFFF, tb_sec_incl, 4, 32);
+                            int tb_up_s_f16102_1 = _shfl_up_1cfd9b;
+                            if (tb_lane >= 4) {
+                                tb_sec_incl = tb_sec_incl + tb_up_s_f16102_1;
+                            }
+                            int _shfl_up_448be0 = __shfl_up_sync(0xFFFFFFFF, tb_sec_incl, 8, 32);
+                            int tb_up_s_f16102_2 = _shfl_up_448be0;
+                            if (tb_lane >= 8) {
+                                tb_sec_incl = tb_sec_incl + tb_up_s_f16102_2;
+                            }
+                            int _shfl_up_a1ebf1 = __shfl_up_sync(0xFFFFFFFF, tb_sec_incl, 16, 32);
+                            int tb_up_s_f16102_3 = _shfl_up_a1ebf1;
+                            if (tb_lane >= 16) {
+                                tb_sec_incl = tb_sec_incl + tb_up_s_f16102_3;
+                            }
+                            int tb_so_c = tb_pub[MOE_X_0ed328979b + es_source];
+                            source_expert_prefix[tb_e * MOE_RANKS + es_source] = tb_so_c + tb_sec_incl - tb_sec;
+                            int _shfl_01c494 = __shfl_sync(0xFFFFFFFF, tb_sec_incl, 31);
+                            int tb_so_t = _shfl_01c494;
+                            __syncwarp();
+                            if (tb_lane == 0) {
+                                tb_pub[MOE_X_0ed328979b + es_source] = tb_so_c + tb_so_t;
+                            }
+                            __syncwarp();
+                            expert_source_base[tb_e * MOE_RANKS + es_source] = so_run;
+                            ft_pre[es_source] = tb_so_c + tb_sec_incl - tb_sec;
+                            ft_base[es_source] = so_run;
+                            ft_cnt[es_source] = 0;
+                            ft_gch[es_source] = 0;
+                            if (es_source < world_size) {
+                                ft_cnt[es_source] = tb_sec;
+                                int ft_gc = source_record_counts[es_source];
+                                int _max_42b838 = (((ft_gc + 8 - 1) / 8) > (dispatch_chunk_min_records) ? ((ft_gc + 8 - 1) / 8) : (dispatch_chunk_min_records));
+                                int ft_gq = _max_42b838;
+                                int ft_pf = reinterpret_cast<int*>(reinterpret_cast<int*>(dispatch_header_inbox) + ((es_source * 2 + slot) * MOE_X_c005674f28 + 8 + MOE_X_fa76c90be3 + tb_e))[0];
+                                int _max_b028a0 = ((ft_pf) > (0) ? (ft_pf) : (0));
+                                int _min_0258ac = ((_max_b028a0) < (ft_gc) ? (_max_b028a0) : (ft_gc));
+                                ft_pf = _min_0258ac;
+                                ft_gch[es_source] = (ft_pf + ft_gq - 1) / ft_gq;
+                            }
+                            if (es_source < world_size) {
+                                so_run = so_run + tb_sec;
+                            }
+                        }
+                        if (so_run != tb_count) {
+#elif (MOE_SW_POLICY_EP == 16 && ((MOE_INSTANCE == 0 && MOE_SW_TB_SCR_GLOBAL == 0) || (MOE_INSTANCE == 2 && MOE_SW_TB_SCR_GLOBAL == 0))) // moe-select
+                        }
+                        int tb_pre[9];
+                        int tb_below[9];
+                        #pragma unroll
+                        for (int tb_k_5a2bf2_1 = 0; tb_k_5a2bf2_1 < 9; tb_k_5a2bf2_1++) {
+                            int tb_inc = tb_cnt[tb_k_5a2bf2_1];
+                            int _shfl_up_c4bd22 = __shfl_up_sync(0xFFFFFFFF, tb_inc, 1, 32);
+                            int tb_up3 = _shfl_up_c4bd22;
+                            if (tb_lane >= 1) {
+                                tb_inc = tb_inc + tb_up3;
+                            }
+                            int _shfl_up_a32050 = __shfl_up_sync(0xFFFFFFFF, tb_inc, 2, 32);
+                            int tb_up3_c36c54 = _shfl_up_a32050;
+                            if (tb_lane >= 2) {
+                                tb_inc = tb_inc + tb_up3_c36c54;
+                            }
+                            int _shfl_up_bcaaa0 = __shfl_up_sync(0xFFFFFFFF, tb_inc, 4, 32);
+                            int tb_up3_c36c54_1 = _shfl_up_bcaaa0;
+                            if (tb_lane >= 4) {
+                                tb_inc = tb_inc + tb_up3_c36c54_1;
+                            }
+                            int _shfl_up_73d470 = __shfl_up_sync(0xFFFFFFFF, tb_inc, 8, 32);
+                            int tb_up3_c36c54_2 = _shfl_up_73d470;
+                            if (tb_lane >= 8) {
+                                tb_inc = tb_inc + tb_up3_c36c54_2;
+                            }
+                            int _shfl_up_f08845 = __shfl_up_sync(0xFFFFFFFF, tb_inc, 16, 32);
+                            int tb_up3_c36c54_3 = _shfl_up_f08845;
+                            if (tb_lane >= 16) {
+                                tb_inc = tb_inc + tb_up3_c36c54_3;
+                            }
+                            tb_pre[tb_k_5a2bf2_1] = tb_tot[tb_k_5a2bf2_1] + tb_inc - tb_cnt[tb_k_5a2bf2_1];
+                            int _shfl_4dad8f = __shfl_sync(0xFFFFFFFF, tb_inc, 31);
+                            tb_tot[tb_k_5a2bf2_1] = tb_tot[tb_k_5a2bf2_1] + _shfl_4dad8f;
+                        }
+                        int tb_acc2 = 0;
+                        #pragma unroll
+                        for (int tb_k_5a2bf2_2 = 0; tb_k_5a2bf2_2 < 9; tb_k_5a2bf2_2++) {
+                            tb_below[tb_k_5a2bf2_2] = tb_acc2;
+                            tb_acc2 = tb_acc2 + tb_cnt[tb_k_5a2bf2_2];
+                        }
+                        #pragma unroll
+                        for (int tb_k_5a2bf2_3 = 0; tb_k_5a2bf2_3 < 9; tb_k_5a2bf2_3++) {
+                            #pragma unroll 1
+                            for (int tb_s_11f2db_3 = 0; tb_s_11f2db_3 < MOE_RANKS; tb_s_11f2db_3++) {
+                                __syncwarp();
+                                int tb_vc = tb_scr[MOE_X_2b14d080ee + tb_k_5a2bf2_3 * MOE_RANKS + tb_s_11f2db_3];
+                                int tb_v = tb_scr[tb_e * MOE_X_4846b72315 + tb_k_5a2bf2_3 * MOE_RANKS + tb_s_11f2db_3];
+                                int tb_vi = tb_v;
+                                int _shfl_up_d3afbd = __shfl_up_sync(0xFFFFFFFF, tb_vi, 1, 32);
+                                int tb_up4 = _shfl_up_d3afbd;
+                                if (tb_lane >= 1) {
+                                    tb_vi = tb_vi + tb_up4;
+                                }
+                                int _shfl_up_df8eb1 = __shfl_up_sync(0xFFFFFFFF, tb_vi, 2, 32);
+                                int tb_up4_a40c7c = _shfl_up_df8eb1;
+                                if (tb_lane >= 2) {
+                                    tb_vi = tb_vi + tb_up4_a40c7c;
+                                }
+                                int _shfl_up_a577d1 = __shfl_up_sync(0xFFFFFFFF, tb_vi, 4, 32);
+                                int tb_up4_a40c7c_1 = _shfl_up_a577d1;
+                                if (tb_lane >= 4) {
+                                    tb_vi = tb_vi + tb_up4_a40c7c_1;
+                                }
+                                int _shfl_up_263c4e = __shfl_up_sync(0xFFFFFFFF, tb_vi, 8, 32);
+                                int tb_up4_a40c7c_2 = _shfl_up_263c4e;
+                                if (tb_lane >= 8) {
+                                    tb_vi = tb_vi + tb_up4_a40c7c_2;
+                                }
+                                int _shfl_up_aff9aa = __shfl_up_sync(0xFFFFFFFF, tb_vi, 16, 32);
+                                int tb_up4_a40c7c_3 = _shfl_up_aff9aa;
+                                if (tb_lane >= 16) {
+                                    tb_vi = tb_vi + tb_up4_a40c7c_3;
+                                }
+                                tb_scr[MOE_X_5f1332287b + tb_e * MOE_X_4846b72315 + tb_k_5a2bf2_3 * MOE_RANKS + tb_s_11f2db_3] = tb_vc + tb_vi - tb_v;
+                                int _shfl_8c2991 = __shfl_sync(0xFFFFFFFF, tb_vi, 31);
+                                int tb_vt = _shfl_8c2991;
+                                __syncwarp();
+                                if (tb_lane == 0) {
+                                    tb_scr[MOE_X_2b14d080ee + tb_k_5a2bf2_3 * MOE_RANKS + tb_s_11f2db_3] = tb_vc + tb_vt;
+                                }
+                            }
+                        }
+                        #pragma unroll 1
+                        for (int tb_s_11f2db_4 = 0; tb_s_11f2db_4 < MOE_RANKS; tb_s_11f2db_4++) {
+                            tb_pub[tb_e * MOE_X_efe70cec4a + tb_s_11f2db_4] = tb_pub[tb_e * MOE_X_efe70cec4a + tb_s_11f2db_4];
+                            tb_pub[tb_e * MOE_X_efe70cec4a + MOE_X_96e08f30e3 + tb_s_11f2db_4] = tb_pub[tb_e * MOE_X_efe70cec4a + MOE_X_96e08f30e3 + tb_s_11f2db_4];
+                        }
+                        #pragma unroll
+                        for (int tb_k_5a2bf2_4 = 0; tb_k_5a2bf2_4 < 9; tb_k_5a2bf2_4++) {
+                            tb_pub[tb_e * MOE_X_efe70cec4a + MOE_X_a41ee4a7d8 + tb_k_5a2bf2_4] = tb_pre[tb_k_5a2bf2_4];
+                            tb_pub[tb_e * MOE_X_efe70cec4a + MOE_X_493edec11b + tb_k_5a2bf2_4] = tb_below[tb_k_5a2bf2_4];
+                        }
+                        #pragma unroll 1
+                        for (int tb_z2 = 0; tb_z2 < MOE_X_4846b72315; tb_z2++) {
+                            tb_pub[tb_e * MOE_X_efe70cec4a + MOE_X_576908eaec + tb_z2] = tb_scr[MOE_X_5f1332287b + tb_e * MOE_X_4846b72315 + tb_z2];
+                        }
+                    } else {
+                        int ft_base[MOE_RANKS];
+                        int ft_cnt[MOE_RANKS];
+                        int ft_pre[MOE_RANKS];
+                        int ft_gch[MOE_RANKS];
+                        int so_run = 0;
+                        #pragma unroll
+                        for (int es_source = 0; es_source < MOE_RANKS; es_source++) {
+                            int tb_sec = source_expert_counts[es_source * MOE_X_fa76c90be3 + tb_e];
+                            int tb_sec_incl = tb_sec;
+                            int _shfl_up_9fa3b8 = __shfl_up_sync(0xFFFFFFFF, tb_sec_incl, 1, 32);
+                            int tb_up_s = _shfl_up_9fa3b8;
+                            if (tb_lane >= 1) {
+                                tb_sec_incl = tb_sec_incl + tb_up_s;
+                            }
+                            int _shfl_up_02290a = __shfl_up_sync(0xFFFFFFFF, tb_sec_incl, 2, 32);
+                            int tb_up_s_f16102 = _shfl_up_02290a;
+                            if (tb_lane >= 2) {
+                                tb_sec_incl = tb_sec_incl + tb_up_s_f16102;
+                            }
+                            int _shfl_up_1cfd9b = __shfl_up_sync(0xFFFFFFFF, tb_sec_incl, 4, 32);
+                            int tb_up_s_f16102_1 = _shfl_up_1cfd9b;
+                            if (tb_lane >= 4) {
+                                tb_sec_incl = tb_sec_incl + tb_up_s_f16102_1;
+                            }
+                            int _shfl_up_448be0 = __shfl_up_sync(0xFFFFFFFF, tb_sec_incl, 8, 32);
+                            int tb_up_s_f16102_2 = _shfl_up_448be0;
+                            if (tb_lane >= 8) {
+                                tb_sec_incl = tb_sec_incl + tb_up_s_f16102_2;
+                            }
+                            int _shfl_up_a1ebf1 = __shfl_up_sync(0xFFFFFFFF, tb_sec_incl, 16, 32);
+                            int tb_up_s_f16102_3 = _shfl_up_a1ebf1;
+                            if (tb_lane >= 16) {
+                                tb_sec_incl = tb_sec_incl + tb_up_s_f16102_3;
+                            }
+                            int tb_so_c = tb_scr[MOE_X_2b14d080ee + es_source];
+                            source_expert_prefix[tb_e * MOE_RANKS + es_source] = tb_so_c + tb_sec_incl - tb_sec;
+                            int _shfl_01c494 = __shfl_sync(0xFFFFFFFF, tb_sec_incl, 31);
+                            int tb_so_t = _shfl_01c494;
+                            __syncwarp();
+                            if (tb_lane == 0) {
+                                tb_scr[MOE_X_2b14d080ee + es_source] = tb_so_c + tb_so_t;
+                            }
+                            __syncwarp();
+                            expert_source_base[tb_e * MOE_RANKS + es_source] = so_run;
+                            ft_pre[es_source] = tb_so_c + tb_sec_incl - tb_sec;
+                            ft_base[es_source] = so_run;
+                            ft_cnt[es_source] = 0;
+                            ft_gch[es_source] = 0;
+                            if (es_source < world_size) {
+                                ft_cnt[es_source] = tb_sec;
+                                int ft_gc = source_record_counts[es_source];
+                                int _max_42b838 = (((ft_gc + 8 - 1) / 8) > (dispatch_chunk_min_records) ? ((ft_gc + 8 - 1) / 8) : (dispatch_chunk_min_records));
+                                int ft_gq = _max_42b838;
+                                int ft_pf = reinterpret_cast<int*>(reinterpret_cast<int*>(dispatch_header_inbox) + ((es_source * 2 + slot) * MOE_X_c005674f28 + 8 + MOE_X_fa76c90be3 + tb_e))[0];
+                                int _max_b028a0 = ((ft_pf) > (0) ? (ft_pf) : (0));
+                                int _min_0258ac = ((_max_b028a0) < (ft_gc) ? (_max_b028a0) : (ft_gc));
+                                ft_pf = _min_0258ac;
+                                ft_gch[es_source] = (ft_pf + ft_gq - 1) / ft_gq;
+                            }
+                            if (es_source < world_size) {
+                                so_run = so_run + tb_sec;
+                            }
+                        }
+                        if (so_run != tb_count) {
+#elif (MOE_SW_POLICY_EP == 16 && (MOE_INSTANCE == 0 || MOE_INSTANCE == 2)) // moe-select
+                        }
+                        int tb_pre[9];
+                        int tb_below[9];
+                        #pragma unroll
+                        for (int tb_k_5a2bf2_1 = 0; tb_k_5a2bf2_1 < 9; tb_k_5a2bf2_1++) {
+                            int tb_inc = tb_cnt[tb_k_5a2bf2_1];
+                            int _shfl_up_c4bd22 = __shfl_up_sync(0xFFFFFFFF, tb_inc, 1, 32);
+                            int tb_up3 = _shfl_up_c4bd22;
+                            if (tb_lane >= 1) {
+                                tb_inc = tb_inc + tb_up3;
+                            }
+                            int _shfl_up_a32050 = __shfl_up_sync(0xFFFFFFFF, tb_inc, 2, 32);
+                            int tb_up3_c36c54 = _shfl_up_a32050;
+                            if (tb_lane >= 2) {
+                                tb_inc = tb_inc + tb_up3_c36c54;
+                            }
+                            int _shfl_up_bcaaa0 = __shfl_up_sync(0xFFFFFFFF, tb_inc, 4, 32);
+                            int tb_up3_c36c54_1 = _shfl_up_bcaaa0;
+                            if (tb_lane >= 4) {
+                                tb_inc = tb_inc + tb_up3_c36c54_1;
+                            }
+                            int _shfl_up_73d470 = __shfl_up_sync(0xFFFFFFFF, tb_inc, 8, 32);
+                            int tb_up3_c36c54_2 = _shfl_up_73d470;
+                            if (tb_lane >= 8) {
+                                tb_inc = tb_inc + tb_up3_c36c54_2;
+                            }
+                            int _shfl_up_f08845 = __shfl_up_sync(0xFFFFFFFF, tb_inc, 16, 32);
+                            int tb_up3_c36c54_3 = _shfl_up_f08845;
+                            if (tb_lane >= 16) {
+                                tb_inc = tb_inc + tb_up3_c36c54_3;
+                            }
+                            tb_pre[tb_k_5a2bf2_1] = tb_tot[tb_k_5a2bf2_1] + tb_inc - tb_cnt[tb_k_5a2bf2_1];
+                            int _shfl_4dad8f = __shfl_sync(0xFFFFFFFF, tb_inc, 31);
+                            tb_tot[tb_k_5a2bf2_1] = tb_tot[tb_k_5a2bf2_1] + _shfl_4dad8f;
+                        }
+                        int tb_acc2 = 0;
+                        #pragma unroll
+                        for (int tb_k_5a2bf2_2 = 0; tb_k_5a2bf2_2 < 9; tb_k_5a2bf2_2++) {
+                            tb_below[tb_k_5a2bf2_2] = tb_acc2;
+                            tb_acc2 = tb_acc2 + tb_cnt[tb_k_5a2bf2_2];
+                        }
+                        #pragma unroll
+                        for (int tb_k_5a2bf2_3 = 0; tb_k_5a2bf2_3 < 9; tb_k_5a2bf2_3++) {
+                            #pragma unroll 1
+                            for (int tb_s_11f2db_3 = 0; tb_s_11f2db_3 < MOE_RANKS; tb_s_11f2db_3++) {
+                                __syncwarp();
+                                int tb_vc = tb_pub[MOE_X_0ed328979b + tb_k_5a2bf2_3 * MOE_RANKS + tb_s_11f2db_3];
+                                int tb_v = tb_pub[MOE_X_8923c9d28f + tb_e * MOE_X_4846b72315 + tb_k_5a2bf2_3 * MOE_RANKS + tb_s_11f2db_3];
+                                int tb_vi = tb_v;
+                                int _shfl_up_d3afbd = __shfl_up_sync(0xFFFFFFFF, tb_vi, 1, 32);
+                                int tb_up4 = _shfl_up_d3afbd;
+                                if (tb_lane >= 1) {
+                                    tb_vi = tb_vi + tb_up4;
+                                }
+                                int _shfl_up_df8eb1 = __shfl_up_sync(0xFFFFFFFF, tb_vi, 2, 32);
+                                int tb_up4_a40c7c = _shfl_up_df8eb1;
+                                if (tb_lane >= 2) {
+                                    tb_vi = tb_vi + tb_up4_a40c7c;
+                                }
+                                int _shfl_up_a577d1 = __shfl_up_sync(0xFFFFFFFF, tb_vi, 4, 32);
+                                int tb_up4_a40c7c_1 = _shfl_up_a577d1;
+                                if (tb_lane >= 4) {
+                                    tb_vi = tb_vi + tb_up4_a40c7c_1;
+                                }
+                                int _shfl_up_263c4e = __shfl_up_sync(0xFFFFFFFF, tb_vi, 8, 32);
+                                int tb_up4_a40c7c_2 = _shfl_up_263c4e;
+                                if (tb_lane >= 8) {
+                                    tb_vi = tb_vi + tb_up4_a40c7c_2;
+                                }
+                                int _shfl_up_aff9aa = __shfl_up_sync(0xFFFFFFFF, tb_vi, 16, 32);
+                                int tb_up4_a40c7c_3 = _shfl_up_aff9aa;
+                                if (tb_lane >= 16) {
+                                    tb_vi = tb_vi + tb_up4_a40c7c_3;
+                                }
+                                tb_pub[MOE_X_331b8b06eb + tb_e * MOE_X_4846b72315 + tb_k_5a2bf2_3 * MOE_RANKS + tb_s_11f2db_3] = tb_vc + tb_vi - tb_v;
+                                int _shfl_8c2991 = __shfl_sync(0xFFFFFFFF, tb_vi, 31);
+                                int tb_vt = _shfl_8c2991;
+                                __syncwarp();
+                                if (tb_lane == 0) {
+                                    tb_pub[MOE_X_0ed328979b + tb_k_5a2bf2_3 * MOE_RANKS + tb_s_11f2db_3] = tb_vc + tb_vt;
+                                }
+                            }
+                        }
+                        #pragma unroll 1
+                        for (int tb_s_11f2db_4 = 0; tb_s_11f2db_4 < MOE_RANKS; tb_s_11f2db_4++) {
+                            tb_pub[tb_e * MOE_X_efe70cec4a + tb_s_11f2db_4] = tb_pub[tb_e * MOE_X_efe70cec4a + tb_s_11f2db_4];
+                            tb_pub[tb_e * MOE_X_efe70cec4a + MOE_X_96e08f30e3 + tb_s_11f2db_4] = tb_pub[tb_e * MOE_X_efe70cec4a + MOE_X_96e08f30e3 + tb_s_11f2db_4];
                         }
                         #pragma unroll
                         for (int tb_k_5a2bf2_4 = 0; tb_k_5a2bf2_4 < 9; tb_k_5a2bf2_4++) {

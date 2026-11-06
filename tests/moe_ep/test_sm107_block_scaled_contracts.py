@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import sys
 from types import SimpleNamespace
 from unittest import mock
 
@@ -46,6 +47,25 @@ def _config(**kw):
     )
 
 
+@pytest.mark.parametrize("rubin", [False, True])
+def test_route_staging_fallback_preserves_architecture_score_policy(rubin):
+    from flashinfer.moe_ep.backends.mega.kernel import routing_staging as shared
+    from flashinfer.moe_ep.backends.mega.kernel.sm107 import routing_staging
+
+    ids = torch.tensor([[0, -1, -1, -1]])
+    scores = torch.tensor([[0.25, float("nan"), float("inf"), -float("inf")]])
+    ids_out = torch.full((2, 4), -7, dtype=torch.int32)
+    scores_out = torch.full((2, 4), 123.0)
+    stage = routing_staging.stage_routes if rubin else shared.stage_routes
+    stage(ids, scores, ids_out, scores_out, workspace=SimpleNamespace())
+    expected = scores if rubin else scores.masked_fill(ids == -1, 0)
+    torch.testing.assert_close(scores_out[:1], expected, rtol=0, atol=0, equal_nan=True)
+    assert torch.equal(ids_out[:1], ids.to(torch.int32))
+    assert (ids_out[1:] == -7).all() and (scores_out[1:] == 123).all()
+    assert torch.isnan(scores[:, 1]).all()
+    assert torch.isposinf(scores[:, 2]).all() and torch.isneginf(scores[:, 3]).all()
+
+
 def test_mxfp4_weights_have_independent_dtype_and_packing():
     cfg = _config(quant_kind="mxfp4_mxfp8", intermediate=128)
     assert cfg.torch_act_data_dtype == torch.float8_e4m3fn
@@ -59,6 +79,141 @@ def test_mxfp4_weights_have_independent_dtype_and_packing():
     assert shapes[:2] == ((8, 64, 256), (8, 64, 128))
     with pytest.raises(ValueError, match="multiple of 128"):
         _config(quant_kind="mxfp4_mxfp8", intermediate=192)
+
+
+@pytest.mark.parametrize("variant", ["inference", "genphase"])
+def test_mxfp4_w4a4_config_and_candidates(variant):
+    from flashinfer.moe_ep import Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import sm107_candidates
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim.knob_cache import (
+        default_knobs,
+    )
+
+    public = Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig(128, 2)
+    assert public.kind == "mxfp4"
+    assert create_mega_kernel(public).kernel_name() == public.kernel_name
+    knobs = default_knobs(3, quant_kind="mxfp4", kernel_variant=variant)
+    cfg = _config(quant_kind="mxfp4", intermediate=128, kernel_variant=variant, **knobs)
+    assert cfg.torch_act_data_dtype == getattr(torch, "float4_e2m1fn_x2", torch.uint8)
+    assert cfg.torch_weight_data_dtype == cfg.torch_act_data_dtype
+    assert cfg.torch_act_sf_dtype == torch.float8_e8m0fnu
+    assert cfg.sf_vec_size == 32
+    assert cfg.instruction_k == 128
+    assert cfg.resolved_mma_tiler_mnk == (256, 128, 256)
+    candidates = sm107_candidates(quant_kind="mxfp4", kernel_variant=variant)
+    assert candidates
+    assert all(c["mma_tiler_mnk"][2] in (256, 512) for c in candidates)
+
+
+@pytest.mark.parametrize("variant", ["inference", "genphase"])
+@pytest.mark.parametrize("early", [False, True])
+@pytest.mark.parametrize("finalize", [False, True])
+def test_mxfp4_w4a4_cli_dispatch(monkeypatch, variant, early, finalize):
+    from flashinfer.moe_ep import tune
+    from flashinfer.moe_ep.backends.mega.kernel.sm107.mxfp4_mxfp4_bf16_cutedsl import (
+        tuner,
+    )
+
+    calls = []
+
+    def run(args, kind):
+        calls.append((kind, args.kernel_variant, args.apply_routing_weights_before_fc2))
+        return 0
+
+    monkeypatch.setattr(tuner, "_run_tuning", run)
+    argv = [
+        "--dtype",
+        "mxfp4",
+        "--arch",
+        "sm107",
+        "--hidden",
+        "512",
+        "--intermediate",
+        "256",
+        "--num-experts",
+        "8",
+        "--topk",
+        "4",
+        "--max-tokens",
+        "128",
+        "--apply-routing-weights-before-fc2"
+        if early
+        else "--no-apply-routing-weights-before-fc2",
+        "--do-finalize" if finalize else "--no-do-finalize",
+    ]
+    assert tune.main([*argv, "--kernel-variant", variant]) == (0 if finalize else 2)
+    assert calls == ([("mxfp4", variant, early)] if finalize else [])
+
+
+@pytest.mark.parametrize("variant", ["inference", "genphase"])
+@pytest.mark.parametrize("early", [False, True])
+def test_mxfp4_w4a4_cli_preserves_forward_contract(monkeypatch, variant, early):
+    from flashinfer.moe_ep import tune, Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig
+    from flashinfer.moe_ep.backends.mega.kernel.sm107 import forward_tuning, tuning
+    from flashinfer.moe_ep.core.kernel import registry
+    from flashinfer.moe_ep.kernel_src.sm107 import next_cutedsl_megamoe as package
+
+    args = tune._parse_args(
+        [
+            "--dtype",
+            "mxfp4",
+            "--arch",
+            "sm107",
+            "--hidden",
+            "512",
+            "--intermediate",
+            "256",
+            "--num-experts",
+            "8",
+            "--topk",
+            "4",
+            "--max-tokens",
+            "128",
+            "--kernel-variant",
+            variant,
+            "--sweep",
+            "schedule",
+            "--apply-routing-weights-before-fc2"
+            if early
+            else "--no-apply-routing-weights-before-fc2",
+        ]
+    )
+    backend = mock.Mock()
+    create = mock.Mock(return_value=backend)
+    resolve = mock.Mock(return_value=({}, "default"))
+    execution = mock.Mock()
+
+    def gather(results, result, *, group):
+        assert group is backend.ep_comm_group
+        results[:] = [result] * len(results)
+
+    exchange = mock.Mock(side_effect=gather)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", exchange)
+    monkeypatch.setattr(registry, "create_mega_kernel", create)
+    monkeypatch.setattr(tuning, "_dummy_transformed_weights", lambda *a: (None, None))
+    monkeypatch.setattr(
+        tuning, "_dummy_inputs", lambda *a: mock.Mock(spec=MoEEpTensors)
+    )
+    monkeypatch.setattr(torch, "empty", mock.Mock())
+    monkeypatch.setattr(forward_tuning, "ForwardExecution", execution)
+    monkeypatch.setattr(package, "resolve_knobs", resolve)
+    monkeypatch.setattr(package, "sm107_schedule_candidates", lambda *a, **k: [{}])
+    finish = mock.Mock(return_value={"fc2_use_bulk": True})
+    monkeypatch.setattr(tuning, "finish_sweep", finish)
+
+    assert tuning.tune_one(args, 0, 2, 128, "mxfp4") == {"fc2_use_bulk": True}
+    exchange.assert_called_once()
+    assert finish.call_args.args[8] == [{}]
+    config = create.call_args.args[0]
+    assert isinstance(config, Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig)
+    assert config.kernel_variant == variant
+    assert config.apply_routing_weights_before_fc2 is early
+    assert resolve.call_args.kwargs["dtype"] == "mxfp4"
+    assert resolve.call_args.kwargs["kernel_variant"] == variant
+    assert resolve.call_args.kwargs["apply_routing_weights_before_fc2"] is early
+    assert execution.call_args.kwargs["quantize_input"] is True
+    backend.destroy.assert_called_once_with(backend._allocate_workspace.return_value)
 
 
 def test_mxfp4_weight_ingestion_rejects_nvfp4_scales():
@@ -160,9 +315,14 @@ def _workspace():
     ws.config = _config()
     ws.device = torch.device("cpu")
     ws._destroyed = False
+    ws._tuning_state = block_scaled.AutoTuningState()
     ws._compiled = mock.Mock()
+    # Model a kernel that requires launch-side clearing. Native masked BF16
+    # reducers opt out via this capability; quantized combine still clears.
+    ws.kernel = SimpleNamespace(masks_invalid_combine_slots=False)
     ws._launch_key = None
     ws._launch_kwargs = None
+    ws._routing_checks = {}
     ws._runtime_kwargs = mock.Mock(side_effect=lambda a, b: {"weights": (a, b)})
     ws.topk_idx = torch.tensor([[0, 1], [2, -1], [-1, -1], [-1, -1]])
     ws._pre_reduced_activation = torch.full((4, 2, 128), 7.0)
@@ -267,7 +427,11 @@ def test_cache_keeps_reduction_and_weighting_policy_separate(tmp_path, monkeypat
     assert lookup_knobs(**key) is None
     assert lookup_knobs(**key, allow_nondeterministic=True) == knobs
     assert (
-        lookup_knobs(**key, allow_nondeterministic=True, apply_topk_at_fc1=False)
+        lookup_knobs(
+            **key,
+            allow_nondeterministic=True,
+            apply_routing_weights_before_fc2=False,
+        )
         is None
     )
     data = json.loads(path.read_text())
@@ -304,17 +468,53 @@ def test_sm100_and_sm107_cache_entries_cannot_collide(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("ids", [[[0, 0]], [[-2, 0]], [[0, 8]], [[0, 2**32]]])
-def test_invalid_routes_rejected_before_int32_conversion(ids):
+def test_invalid_routes_rejected_before_int32_conversion(ids, monkeypatch):
+    monkeypatch.setenv("FLASHINFER_SM107_MEGA_CHECK_ROUTES", "1")
     with pytest.raises(RuntimeError, match="unique expert"):
         validate_routing_values(torch.tensor(ids), torch.ones(1, 2), 8)
 
 
-def test_masked_routes_and_finite_score_contract():
+@pytest.mark.parametrize("score", [float("nan"), float("inf"), -float("inf")])
+def test_masked_routes_and_finite_score_contract(score, monkeypatch):
+    monkeypatch.setenv("FLASHINFER_SM107_MEGA_CHECK_ROUTES", "1")
     validate_routing_values(torch.tensor([[-1, -1], [0, 7]]), torch.ones(2, 2), 8)
+    validate_routing_values(
+        torch.tensor([[-1, -1], [0, -1]]),
+        torch.tensor([[score, score], [1.0, score]]),
+        8,
+    )
     with pytest.raises(RuntimeError, match="finite scores"):
-        validate_routing_values(
-            torch.tensor([[0, 1]]), torch.tensor([[1.0, float("nan")]]), 8
-        )
+        validate_routing_values(torch.tensor([[0, 1]]), torch.tensor([[1.0, score]]), 8)
+
+
+@pytest.mark.parametrize("check_routes", [None, "1", "0"])
+@pytest.mark.parametrize("fused", [False, True])
+def test_routing_validation_opt_in(monkeypatch, check_routes, fused):
+    if check_routes is None:
+        monkeypatch.delenv("FLASHINFER_SM107_MEGA_CHECK_ROUTES", raising=False)
+    else:
+        monkeypatch.setenv("FLASHINFER_SM107_MEGA_CHECK_ROUTES", check_routes)
+    monkeypatch.setenv("FLASHINFER_SM107_FUSED_ROUTE_CHECK", "1")
+    ids = torch.tensor([[0, 0]])
+    scores = torch.ones(1, 2)
+    checker = mock.Mock(side_effect=RuntimeError("unique expert IDs"))
+    monkeypatch.setitem(
+        sys.modules,
+        "flashinfer.moe_ep.backends.mega.kernel.sm107.routing_validation",
+        SimpleNamespace(check_routing=checker),
+    )
+    if fused:
+        ids = mock.Mock(is_cuda=True, shape=(1, 2))
+        ids.is_contiguous.return_value = True
+
+    if check_routes in (None, "0"):
+        validate_routing_values(ids, scores, 8)
+        checker.assert_not_called()
+    else:
+        with pytest.raises(RuntimeError, match="unique expert"):
+            validate_routing_values(ids, scores, 8)
+        if fused:
+            checker.assert_called_once_with(ids, scores, 8, None)
 
 
 @pytest.mark.parametrize("name", ["fc1_alpha", "fc2_alpha", "fc1_norm_const"])
@@ -498,7 +698,9 @@ def test_no_dist_rejects_multirank(monkeypatch):
 
 
 def test_ikr_requires_early_weighting():
-    with pytest.raises(ValueError, match="apply_topk_at_fc1"):
+    with pytest.raises(ValueError, match="apply_routing_weights_before_fc2"):
         dataclasses.replace(
-            _config(), reduce_topk_in_kernel=True, apply_topk_at_fc1=False
+            _config(),
+            reduce_topk_in_kernel=True,
+            apply_routing_weights_before_fc2=False,
         )

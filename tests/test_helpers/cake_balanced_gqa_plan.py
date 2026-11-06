@@ -44,6 +44,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, Sequence
 
+import torch
+
+from flashinfer.experimental.balanced_gqa_decode.cake_backend import (
+    BalancedGQADecodeRunner,
+    _device_arch,
+    _device_index,
+    program_kind,
+)
 from flashinfer.experimental.balanced_gqa_decode.cake_bounds import (
     BLOCK_N,
     DEFAULT_PAIRS_MIN,
@@ -53,6 +61,22 @@ from flashinfer.experimental.balanced_gqa_decode.cake_bounds import (
     PAIR_TOKENS,
     TARGET_CHUNK_PAIRS,
 )
+from flashinfer.experimental.balanced_gqa_decode.cake_jit import KINDS, PROGRAMS
+
+
+def device_plan(runner: BalancedGQADecodeRunner) -> tuple[int, int]:
+    """``(chunk_pairs, num_items)`` published by the last launch (syncs)."""
+    counters = runner.main_kwargs["queue_counters"].tolist()
+    return int(counters[2]), int(counters[3])
+
+
+def generated_program_available(device: torch.device, q_len_per_req: int = 1) -> bool:
+    """True when this checkout registers the program serving ``q_len_per_req`` on ``device``."""
+    arch = _device_arch(_device_index(device))
+    program = KINDS.get(program_kind(q_len_per_req))
+    return (
+        arch is not None and program is not None and arch in PROGRAMS[program]["arches"]
+    )
 
 
 # Multi-wave uniform-batch launch-time model (mirror of the cake planner's
@@ -464,6 +488,40 @@ MTP_MERGE_WAVE_PAIRS = 1
 MTP_MERGE_ROWCHUNKS_PER_QUARTER_PAIR = 6
 MTP_INLINE_MERGE_ROWCHUNKS = 18  # in-place fold of a two-chunk tile ~ 3/4 pair
 MTP_COARSE_CANDIDATES = 3  # the planner also evaluates 2, 3, 4 x ceil(total / CTAs)
+# Merge tickets per split tile: T in {1, 2, q_len, 2 * q_len} row slices, the
+# smallest T with (2 * q_len / T) * n_chunks <= MTP_MERGE_ROWCHUNKS_PER_WARP
+# (rows folded per correction warp times chunks per row).
+MTP_MERGE_ROWCHUNKS_PER_WARP = 8
+# Two-chunk split tiles are folded in place by the last arriving chunk item
+# and take no merge tickets.
+MTP_INLINE_MERGE_CHUNKS = 2
+
+
+def mtp_merge_slices_for(n_chunks: int, q_len_per_req: int) -> int:
+    """Merge tickets of a split tile with ``n_chunks`` partials.
+
+    Two-chunk tiles take none (folded in place by the last arriving chunk).
+    Otherwise ``T in (1, 2, q_len, 2 * q_len)``: the smallest keeping
+    ``(2 * q_len // T) * n_chunks <= MTP_MERGE_ROWCHUNKS_PER_WARP``.
+    """
+    if n_chunks <= MTP_INLINE_MERGE_CHUNKS:
+        return 0
+    for t in (1, 2, q_len_per_req, 2 * q_len_per_req):
+        if (2 * q_len_per_req // t) * n_chunks <= MTP_MERGE_ROWCHUNKS_PER_WARP:
+            return t
+    return 2 * q_len_per_req
+
+
+def mtp_merge_items(
+    seq_lens: Sequence[int], *, q_len_per_req: int, num_kv_heads: int, chunk_pairs: int
+) -> int:
+    """Merge tickets the device scheduler appends for chunk length ``chunk_pairs``."""
+    total = 0
+    for s in seq_lens:
+        n = -(-((int(s) + 255) // 256) // chunk_pairs)
+        if n > 1:
+            total += mtp_merge_slices_for(n, q_len_per_req)
+    return total * num_kv_heads
 
 
 def mtp_chunk_pairs(
@@ -481,11 +539,6 @@ def mtp_chunk_pairs(
     merge ticket's rows per warp x chunks, or 18 for a two-chunk tile folded
     in place by its last chunk item.
     """
-    from flashinfer.experimental.balanced_gqa_decode.cake_bounds import (
-        MTP_INLINE_MERGE_CHUNKS,
-        mtp_merge_slices_for,
-    )
-
     pairs = [_ceil_div(int(s), PAIR_TOKENS) for s in seq_lens]
     total_work = sum(pairs) * num_kv_heads
     base, _ = chunk_pairs_for(
@@ -544,10 +597,6 @@ def mtp_device_plan(
     seq_lens: Sequence[int], *, q_len: int, num_kv_heads: int, num_ctas: int
 ) -> tuple[int, int]:
     """``(chunk_pairs, tickets)`` the packed-row kernel publishes in its queue counters."""
-    from flashinfer.experimental.balanced_gqa_decode.cake_bounds import (
-        mtp_merge_items,
-    )
-
     chunk = mtp_chunk_pairs(
         seq_lens, q_len=q_len, num_kv_heads=num_kv_heads, num_ctas=num_ctas
     )

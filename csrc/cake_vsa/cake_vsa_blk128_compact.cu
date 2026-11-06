@@ -490,7 +490,11 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, 1) void
+#if CAKE_VSA_FP16
+kernel_flashinfer_blackwell_vsa_blk128_fp16_compact_sm100(const __grid_constant__ CUtensorMap q, const __grid_constant__ CUtensorMap k, const __grid_constant__ CUtensorMap v, __half* __restrict__ out, float* __restrict__ lse, float* __restrict__ temperature_lse, uint8_t* __restrict__ block_mask, int mb, int nb, int num_q_heads, int num_kv_heads, float softmax_scale_log2, float lse_temperature_scale, int return_softmax_lse, int return_temperature_lse)
+#else
 kernel_flashinfer_blackwell_vsa_blk128_seed_sm100(const __grid_constant__ CUtensorMap q, const __grid_constant__ CUtensorMap k, const __grid_constant__ CUtensorMap v, __nv_bfloat16* __restrict__ out, float* __restrict__ lse, float* __restrict__ temperature_lse, uint8_t* __restrict__ block_mask, int mb, int nb, int num_q_heads, int num_kv_heads, float softmax_scale_log2, float lse_temperature_scale, int return_softmax_lse, int return_temperature_lse)
+#endif  // CAKE_VSA_FP16
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -504,13 +508,29 @@ kernel_flashinfer_blackwell_vsa_blk128_seed_sm100(const __grid_constant__ CUtens
     const int num_bids = gridDim.x;
 
     // Kernel setup ops
+#if CAKE_VSA_FP16
+    __half* q0_smem = reinterpret_cast<__half*>(smem_raw + 1024);
+#else
     __nv_bfloat16* q0_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
+#endif  // CAKE_VSA_FP16
     const int q0_smem_addr = smem + 1024;
+#if CAKE_VSA_FP16
+    __half* q1_smem = reinterpret_cast<__half*>(smem_raw + 17408);
+#else
     __nv_bfloat16* q1_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
+#endif  // CAKE_VSA_FP16
     const int q1_smem_addr = smem + 17408;
+#if CAKE_VSA_FP16
+    __half* kv_smem = reinterpret_cast<__half*>(smem_raw + 33792);
+#else
     __nv_bfloat16* kv_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + 33792);
+#endif  // CAKE_VSA_FP16
     const int kv_smem_addr = smem + 33792;
+#if CAKE_VSA_FP16
+    __half* v_smem = reinterpret_cast<__half*>(smem_raw + 33792);
+#else
     __nv_bfloat16* v_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + 33792);
+#endif  // CAKE_VSA_FP16
     const int v_smem_addr = smem + 33792;
     float* scale_smem = reinterpret_cast<float*>(smem_raw + 132096);
     const int scale_smem_addr = smem + 132096;
@@ -851,8 +871,13 @@ kernel_flashinfer_blackwell_vsa_blk128_seed_sm100(const __grid_constant__ CUtens
                     unsigned int packed_p[32];
                     #pragma unroll
                     for (int _lp = 0; _lp < 32; _lp++) {
+#if CAKE_VSA_FP16
+                        __half2 _h2 = __float22half2_rn(make_float2(_tmem_load_1[_lp*2 + 0], _tmem_load_1[_lp*2+1 + 0]));
+                        packed_p[_lp] = *(uint32_t*)&_h2;
+#else
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_1[_lp*2 + 0], _tmem_load_1[_lp*2+1 + 0]));
                         packed_p[_lp] = *(uint32_t*)&_bf2;
+#endif  // CAKE_VSA_FP16
                     }
                     asm volatile(
                         "tcgen05.st.sync.aligned.16x32bx2.x16.b32"
@@ -882,8 +907,13 @@ kernel_flashinfer_blackwell_vsa_blk128_seed_sm100(const __grid_constant__ CUtens
                     unsigned int packed_p_1[32];
                     #pragma unroll
                     for (int _lp = 0; _lp < 32; _lp++) {
+#if CAKE_VSA_FP16
+                        __half2 _h2 = __float22half2_rn(make_float2(_tmem_load_0[_lp*2 + 0], _tmem_load_0[_lp*2+1 + 0]));
+                        packed_p_1[_lp] = *(uint32_t*)&_h2;
+#else
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_0[_lp*2 + 0], _tmem_load_0[_lp*2+1 + 0]));
                         packed_p_1[_lp] = *(uint32_t*)&_bf2;
+#endif  // CAKE_VSA_FP16
                     }
                     asm volatile(
                         "tcgen05.st.sync.aligned.16x32bx2.x16.b32"
@@ -1088,12 +1118,21 @@ kernel_flashinfer_blackwell_vsa_blk128_seed_sm100(const __grid_constant__ CUtens
                             for (int _ps = 0; _ps < 8; _ps++)
                                 _tmem_load_4[offset + _ps] *= inv_sum;
                             #endif
+#if CAKE_VSA_FP16
+                            __half2 _pk[4];
+                            _pk[0] = __floats2half2_rn(_tmem_load_4[offset + 0], _tmem_load_4[offset + 1]);
+                            _pk[1] = __floats2half2_rn(_tmem_load_4[offset + 2], _tmem_load_4[offset + 3]);
+                            _pk[2] = __floats2half2_rn(_tmem_load_4[offset + 4], _tmem_load_4[offset + 5]);
+                            _pk[3] = __floats2half2_rn(_tmem_load_4[offset + 6], _tmem_load_4[offset + 7]);
+                            *reinterpret_cast<uint4*>(&((__half*)(out + (output_row + col_base + offset)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+#else
                             __nv_bfloat162 _pk[4];
                             _pk[0] = __floats2bfloat162_rn(_tmem_load_4[offset + 0], _tmem_load_4[offset + 1]);
                             _pk[1] = __floats2bfloat162_rn(_tmem_load_4[offset + 2], _tmem_load_4[offset + 3]);
                             _pk[2] = __floats2bfloat162_rn(_tmem_load_4[offset + 4], _tmem_load_4[offset + 5]);
                             _pk[3] = __floats2bfloat162_rn(_tmem_load_4[offset + 6], _tmem_load_4[offset + 7]);
                             *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(out + (output_row + col_base + offset)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+#endif  // CAKE_VSA_FP16
                         }
                     }
                     if (col_half_1 == 0) {
@@ -1158,7 +1197,11 @@ kernel_flashinfer_blackwell_vsa_blk128_seed_sm100(const __grid_constant__ CUtens
                     ""
                     "mov.b32 adhi, 0x40004040;\n\t"
                     "mov.b32 bdhi, 0x40004040;\n\t"
+#if CAKE_VSA_FP16
+                    "mov.b32 id, 69206032;\n\t"
+#else
                     "mov.b32 id, 69207184;\n\t"
+#endif  // CAKE_VSA_FP16
                     "mov.b32 alo, %0;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
@@ -1224,7 +1267,11 @@ kernel_flashinfer_blackwell_vsa_blk128_seed_sm100(const __grid_constant__ CUtens
                     ""
                     "mov.b32 adhi, 0x40004040;\n\t"
                     "mov.b32 bdhi, 0x40004040;\n\t"
+#if CAKE_VSA_FP16
+                    "mov.b32 id, 69206032;\n\t"
+#else
                     "mov.b32 id, 69207184;\n\t"
+#endif  // CAKE_VSA_FP16
                     "mov.b32 alo, %0;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
@@ -1289,7 +1336,11 @@ kernel_flashinfer_blackwell_vsa_blk128_seed_sm100(const __grid_constant__ CUtens
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
                     "mov.b32 dhi, 0x40004040;\n\t"
+#if CAKE_VSA_FP16
+                    "mov.b32 id, 69271568;\n\t"
+#else
                     "mov.b32 id, 69272720;\n\t"
+#endif  // CAKE_VSA_FP16
                     "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
@@ -1349,7 +1400,11 @@ kernel_flashinfer_blackwell_vsa_blk128_seed_sm100(const __grid_constant__ CUtens
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
                     "mov.b32 dhi, 0x40004040;\n\t"
+#if CAKE_VSA_FP16
+                    "mov.b32 id, 69271568;\n\t"
+#else
                     "mov.b32 id, 69272720;\n\t"
+#endif  // CAKE_VSA_FP16
                     "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"

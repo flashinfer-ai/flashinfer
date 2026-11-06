@@ -99,20 +99,6 @@ UNION_Q_VALUES = (2, 4)
 UNION_SPLIT_FACTORS = (1, 2, 4, 8)
 USE_CACHE_HIT_VALUES = (False, True, "auto")
 
-# Argument-plan names the persistent program's ABI still lists but never
-# reads (the global-partial merge path they belonged to is not built).  They
-# are bound to tensors the launch already holds; the names disappear from
-# ``ARG_PLANS`` together with the kernel ABI.
-_PERSISTENT_ABI_CARRIERS = {
-    "partial_O": "msa_lse",
-    "partial_M": "msa_lse",
-    "partial_D": "msa_lse",
-    "split_completion": "task_kind",
-    "kv_indptr": "task_kv_head",
-    "task_request": "task_kv_head",
-}
-_SHORT_ABI_CARRIERS = {"kv_indptr": "task_kv_head", "task_request": "task_kv_head"}
-
 
 # ---------------------------------------------------------------------------
 # Device geometry and the split-KV rule
@@ -420,7 +406,6 @@ def _bind(
     route: str,
     values: dict[str, Any],
     grid: tuple[int, int, int],
-    carriers: dict[str, str],
 ) -> tuple[Callable[..., Any], tuple]:
     """Order ``values`` by the route's generated argument plan and load the program."""
     grid_values = dict(zip(("grid_x", "grid_y", "grid_z"), grid, strict=True))
@@ -430,8 +415,6 @@ def _bind(
             arguments.append(grid_values[name])
         elif name in values:
             arguments.append(values[name])
-        elif name in carriers:
-            arguments.append(values[carriers[name]])
         else:
             raise ValueError(
                 f"the {route} program's argument plan names {name!r}, which this backend does not bind"
@@ -719,7 +702,7 @@ def prepare_msa_nvfp4_sparse_decode(
             q2k_token_stride=int(q2k_indices.stride(1)),
             q2k_head_stride=int(q2k_indices.stride(0)),
         )
-        entry, arguments = _bind(name, arch, "union", values, grid, {})
+        entry, arguments = _bind(name, arch, "union", values, grid)
         return MSANvfp4DecodeRunner(
             name,
             arch,
@@ -762,7 +745,7 @@ def prepare_msa_nvfp4_sparse_decode(
             vs_head_stride=vs_hs,
         )
         grid = short_grid(total_work_items, get_device_sm_count(device), record)
-        entry, arguments = _bind(name, arch, "short", values, grid, _SHORT_ABI_CARRIERS)
+        entry, arguments = _bind(name, arch, "short", values, grid)
         return MSANvfp4DecodeRunner(
             name, arch, "short", 1, False, grid, arguments, out, lse, entry
         )
@@ -792,9 +775,7 @@ def prepare_msa_nvfp4_sparse_decode(
         **metadata,
         **scalars,
     )
-    entry, arguments = _bind(
-        name, arch, "persistent", values, grid, _PERSISTENT_ABI_CARRIERS
-    )
+    entry, arguments = _bind(name, arch, "persistent", values, grid)
     return MSANvfp4DecodeRunner(
         name,
         arch,

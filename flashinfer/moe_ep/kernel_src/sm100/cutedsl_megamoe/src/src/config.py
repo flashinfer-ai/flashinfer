@@ -18,24 +18,15 @@ def _align_up(x: int, m: int) -> int:
     return ((x + m - 1) // m) * m
 
 
-def _num_max_pool_tokens(
-    num_ranks: int,
-    num_tokens_per_rank: int,
-    num_topk: int,
-    num_experts_per_rank: int,
-    block_m: int,
-) -> int:
+def _num_max_pool_tokens(num_ranks: int, num_tokens_per_rank: int, num_topk: int,
+                         num_experts_per_rank: int, block_m: int) -> int:
     num_max_recv = num_ranks * num_tokens_per_rank
     num_max_experts_per_token = min(num_topk, num_experts_per_rank)
-    raw = num_max_recv * num_max_experts_per_token + num_experts_per_rank * (
-        block_m - 1
-    )
+    raw = num_max_recv * num_max_experts_per_token + num_experts_per_rank * (block_m - 1)
     return _align_up(raw, block_m)
 
 
-def _num_padded_sf_pool_tokens(
-    num_max_pool_tokens: int, block_m: int, sf_block_m: int
-) -> int:
+def _num_padded_sf_pool_tokens(num_max_pool_tokens: int, block_m: int, sf_block_m: int) -> int:
     return (num_max_pool_tokens // block_m) * sf_block_m
 
 
@@ -82,19 +73,12 @@ class DSV4Config:
 
     @property
     def num_max_pool_tokens(self) -> int:
-        return _num_max_pool_tokens(
-            self.num_ranks,
-            self.num_tokens_per_rank,
-            self.num_topk,
-            self.num_experts_per_rank,
-            self.block_m,
-        )
+        return _num_max_pool_tokens(self.num_ranks, self.num_tokens_per_rank,
+                                    self.num_topk, self.num_experts_per_rank, self.block_m)
 
     @property
     def num_padded_sf_pool_tokens(self) -> int:
-        return _num_padded_sf_pool_tokens(
-            self.num_max_pool_tokens, self.block_m, self.sf_block_m
-        )
+        return _num_padded_sf_pool_tokens(self.num_max_pool_tokens, self.block_m, self.sf_block_m)
 
     @property
     def num_max_pool_blocks(self) -> int:

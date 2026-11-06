@@ -30,6 +30,7 @@ output_column_dict = {
         "random_actual_seq_len",
         "is_var_seq",
         "cute_dsl_impl",
+        "softmax_rescale_threshold_log2",
         "timing_metric",
         "row_activity_mode",
         "calls_per_sample",
@@ -84,13 +85,6 @@ output_column_dict = {
         "ep_size",
         "ep_rank",
     ],
-    "moe_comm": [
-        "num_tokens",
-        "num_experts",
-        "top_k",
-        "ep_size",
-        "max_num_tokens",
-    ],
     "allreduce_comm": [
         "num_tokens",
         "ar_backend",
@@ -131,6 +125,8 @@ output_column_dict = {
         "temperature",
         "num_speculate_tokens",
         "filter_apply_order",
+        "per_row_top_k",
+        "top_k_max",
         "max_len",
         "num_rows",
     ],
@@ -159,6 +155,17 @@ output_column_dict = {
         "weight_dtype",
         "has_z",
         "dt_softplus",
+        "conv_tokens_per_sequence",
+        "conv_seq_lens",
+        "conv_bias",
+        "conv_speculative",
+        "conv_initial_state",
+        "conv_layout",
+        "conv_input_row_stride",
+        "conv_graph_refcheck_passed",
+        "conv_workspace_bytes",
+        "conv_host_submit_us",
+        "conv_cuda_ops",
     ],
     "gdn": [
         "num_q_heads",
@@ -217,7 +224,6 @@ full_output_columns = (
     + output_column_dict["dsv4_sparse_mla"]
     + output_column_dict["gemm"]
     + output_column_dict["moe"]
-    + output_column_dict["moe_comm"]
     + output_column_dict["allreduce_comm"]
     + output_column_dict["mixed_comm"]
     + output_column_dict["norm"]
@@ -269,9 +275,6 @@ benchmark_apis = {
     # real runner construction/probe, like mm_fp4's runtime backend filtering.
     "unified_moe": [
         "unified_moe",
-    ],
-    "moe_comm": [
-        "moe_a2a_dispatch_combine",
     ],
     "allreduce_comm": [
         "allreduce_fusion",
@@ -333,6 +336,8 @@ benchmark_apis = {
     ],
     "mamba": [
         "selective_state_update",
+        "causal_conv1d_fn",
+        "causal_conv1d_update",
     ],
     "gdn": [
         "gated_delta_rule_decode",
@@ -464,6 +469,7 @@ routine_cc_to_supported_backends = {
             "cudnn-native",
             "trtllm-gen",
             "trtllm-native",
+            "prims-ts",
         ],
         "12.0": ["fa2", "fa2_tc", "auto", "cudnn", "cudnn-native", "trtllm-native"],
         "12.1": ["fa2", "fa2_tc", "auto", "cudnn", "cudnn-native", "trtllm-native"],
@@ -495,7 +501,15 @@ routine_cc_to_supported_backends = {
             "trtllm-native",
             "prims-ts",
         ],
-        "10.7": ["fa2", "auto", "cudnn", "cudnn-native", "trtllm-gen", "trtllm-native"],
+        "10.7": [
+            "fa2",
+            "auto",
+            "cudnn",
+            "cudnn-native",
+            "trtllm-gen",
+            "trtllm-native",
+            "prims-ts",
+        ],
         "12.0": [
             "fa2",
             "auto",
@@ -563,7 +577,7 @@ routine_cc_to_supported_backends = {
         "9.0": ["fa2", "fa3"],
         "10.0": ["fa2", "cutlass", "trtllm-native", "cute-dsl", "auto", "prims-ts"],
         "10.3": ["fa2", "cutlass", "trtllm-native", "cute-dsl", "auto", "prims-ts"],
-        "10.7": ["fa2", "cutlass", "trtllm-native"],
+        "10.7": ["fa2", "cutlass", "trtllm-native", "cute-dsl", "prims-ts"],
         "12.0": ["fa2"],
         "12.1": ["fa2"],
     },
@@ -586,9 +600,9 @@ routine_cc_to_supported_backends = {
         "8.6": [],
         "8.9": [],
         "9.0": [],
-        "10.0": ["cutlass"],
-        "10.3": ["cutlass"],
-        "10.7": ["cutlass"],
+        "10.0": ["cutlass", "auto"],
+        "10.3": ["cutlass", "auto"],
+        "10.7": ["cutlass", "cute-dsl", "auto"],
         "12.0": [],
         "12.1": [],
     },
@@ -810,16 +824,16 @@ routine_cc_to_supported_backends = {
         "12.1": ["cute-dsl"],
     },
     "layernorm_quant": {
-        "7.5": ["cuda"],
-        "8.0": ["cuda"],
-        "8.6": ["cuda"],
-        "8.9": ["cuda"],
-        "9.0": ["cuda"],
-        "10.0": ["cuda"],
-        "10.3": ["cuda"],
-        "10.7": ["cuda"],
-        "12.0": ["cuda"],
-        "12.1": ["cuda"],
+        "7.5": ["cuda", "cute-dsl"],
+        "8.0": ["cuda", "cute-dsl"],
+        "8.6": ["cuda", "cute-dsl"],
+        "8.9": ["cuda", "cute-dsl"],
+        "9.0": ["cuda", "cute-dsl"],
+        "10.0": ["cuda", "cute-dsl"],
+        "10.3": ["cuda", "cute-dsl"],
+        "10.7": ["cuda", "cute-dsl"],
+        "12.0": ["cuda", "cute-dsl"],
+        "12.1": ["cuda", "cute-dsl"],
     },
     # NORM - FP4 Quantization (Blackwell SM100+ only, CuTe-DSL kernels)
     "rmsnorm_fp4quant": {
@@ -1178,6 +1192,14 @@ routine_cc_to_supported_backends = {
         "12.1": ["cuda"],
     },
     # MAMBA
+    "causal_conv1d_fn": {
+        "10.0": ["flashinfer", "triton"],
+        "10.3": ["flashinfer", "triton"],
+    },
+    "causal_conv1d_update": {
+        "10.0": ["flashinfer", "triton"],
+        "10.3": ["flashinfer", "triton"],
+    },
     "selective_state_update": {
         "7.5": ["flashinfer", "triton"],
         "8.0": ["flashinfer", "triton"],
@@ -1197,10 +1219,10 @@ routine_cc_to_supported_backends = {
         "8.0": [],
         "8.6": [],
         "8.9": [],
-        "9.0": ["flashinfer", "triton"],
-        "10.0": ["flashinfer", "triton"],
-        "10.3": ["flashinfer", "triton"],
-        "10.7": ["flashinfer", "triton"],
+        "9.0": ["flashinfer", "cute", "triton"],
+        "10.0": ["flashinfer", "cute", "cake_gdn", "triton"],
+        "10.3": ["flashinfer", "cute", "cake_gdn", "triton"],
+        "10.7": ["flashinfer", "cute", "cake_gdn", "triton", "rubin", "rubin_ugpu"],
         "11.0": ["triton"],
         "12.0": ["triton"],
         "12.1": ["triton"],

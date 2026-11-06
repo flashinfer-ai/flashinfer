@@ -18,22 +18,14 @@ import functools
 from typing import Any
 
 PROGRAMS: dict[str, dict[str, Any]] = {
-    "cake_deepgemm_fp4_gemm_40f53c88e86797021dc8": {
+    "cake_deepgemm_fp4_gemm_0181597a4d65f627f485": {
         "sources": [
-            "experimental/deepgemm_fp4_gemm/cake_deepgemm_fp4_gemm_40f53c88e86797021dc8_kernel.cu",
-            "experimental/deepgemm_fp4_gemm/cake_deepgemm_fp4_gemm_40f53c88e86797021dc8_binding.cu",
+            "experimental/deepgemm_fp4_gemm/cake_deepgemm_fp4_gemm_0181597a4d65f627f485_kernel.cu",
+            "experimental/deepgemm_fp4_gemm/cake_deepgemm_fp4_gemm_0181597a4d65f627f485_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
         "arg_plan": [
-            [
-                "tma_buffer",
-                "SFA",
-            ],
-            [
-                "tma_buffer",
-                "SFB",
-            ],
             [
                 "tma_buffer",
                 "A",
@@ -41,6 +33,14 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             [
                 "tma_buffer",
                 "B",
+            ],
+            [
+                "tma_buffer",
+                "SFA",
+            ],
+            [
+                "tma_buffer",
+                "SFB",
             ],
             [
                 "tma_buffer",
@@ -92,10 +92,10 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "sm_103a",
         ],
     },
-    "cake_deepgemm_fp4_gemm_7f6481216fbfb264acf6": {
+    "cake_deepgemm_fp4_gemm_01f1ab6e4dc995e5dcf7": {
         "sources": [
-            "experimental/deepgemm_fp4_gemm/cake_deepgemm_fp4_gemm_7f6481216fbfb264acf6_kernel.cu",
-            "experimental/deepgemm_fp4_gemm/cake_deepgemm_fp4_gemm_7f6481216fbfb264acf6_binding.cu",
+            "experimental/deepgemm_fp4_gemm/cake_deepgemm_fp4_gemm_01f1ab6e4dc995e5dcf7_kernel.cu",
+            "experimental/deepgemm_fp4_gemm/cake_deepgemm_fp4_gemm_01f1ab6e4dc995e5dcf7_binding.cu",
         ],
         "compile_flags": [
             "--ptxas-options=--register-usage-level=10",
@@ -168,10 +168,10 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "sm_103a",
         ],
     },
-    "cake_deepgemm_fp4_gemm_a51b18d814bd13cb5875": {
+    "cake_deepgemm_fp4_gemm_41c47a05088d6702defc": {
         "sources": [
-            "experimental/deepgemm_fp4_gemm/cake_deepgemm_fp4_gemm_a51b18d814bd13cb5875_kernel.cu",
-            "experimental/deepgemm_fp4_gemm/cake_deepgemm_fp4_gemm_a51b18d814bd13cb5875_binding.cu",
+            "experimental/deepgemm_fp4_gemm/cake_deepgemm_fp4_gemm_41c47a05088d6702defc_kernel.cu",
+            "experimental/deepgemm_fp4_gemm/cake_deepgemm_fp4_gemm_41c47a05088d6702defc_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -242,10 +242,10 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "sm_103a",
         ],
     },
-    "cake_deepgemm_fp4_gemm_b8f21c5cd2f70ffc6f24": {
+    "cake_deepgemm_fp4_gemm_68e25fdc9902355084dc": {
         "sources": [
-            "experimental/deepgemm_fp4_gemm/cake_deepgemm_fp4_gemm_b8f21c5cd2f70ffc6f24_kernel.cu",
-            "experimental/deepgemm_fp4_gemm/cake_deepgemm_fp4_gemm_b8f21c5cd2f70ffc6f24_binding.cu",
+            "experimental/deepgemm_fp4_gemm/cake_deepgemm_fp4_gemm_68e25fdc9902355084dc_kernel.cu",
+            "experimental/deepgemm_fp4_gemm/cake_deepgemm_fp4_gemm_68e25fdc9902355084dc_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -316,10 +316,10 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "sm_103a",
         ],
     },
-    "cake_deepgemm_fp4_gemm_bc83e664ecb731739d12": {
+    "cake_deepgemm_fp4_gemm_a79c6847ccacabf02b35": {
         "sources": [
-            "experimental/deepgemm_fp4_gemm/cake_deepgemm_fp4_gemm_bc83e664ecb731739d12_kernel.cu",
-            "experimental/deepgemm_fp4_gemm/cake_deepgemm_fp4_gemm_bc83e664ecb731739d12_binding.cu",
+            "experimental/deepgemm_fp4_gemm/cake_deepgemm_fp4_gemm_a79c6847ccacabf02b35_kernel.cu",
+            "experimental/deepgemm_fp4_gemm/cake_deepgemm_fp4_gemm_a79c6847ccacabf02b35_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -390,10 +390,10 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "sm_103a",
         ],
     },
-    "cake_deepgemm_fp4_gemm_e6bafe7ceb6a5cfd40fc": {
+    "cake_deepgemm_fp4_gemm_b2fa42d3c2801bd3f387": {
         "sources": [
-            "experimental/deepgemm_fp4_gemm/cake_deepgemm_fp4_gemm_e6bafe7ceb6a5cfd40fc_kernel.cu",
-            "experimental/deepgemm_fp4_gemm/cake_deepgemm_fp4_gemm_e6bafe7ceb6a5cfd40fc_binding.cu",
+            "experimental/deepgemm_fp4_gemm/cake_deepgemm_fp4_gemm_b2fa42d3c2801bd3f387_kernel.cu",
+            "experimental/deepgemm_fp4_gemm/cake_deepgemm_fp4_gemm_b2fa42d3c2801bd3f387_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -464,22 +464,14 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "sm_103a",
         ],
     },
-    "cake_deepgemm_fp4_gemm_e6c9fb59c73ea5fce24c": {
+    "cake_deepgemm_fp4_gemm_d94790a04f86df826d7d": {
         "sources": [
-            "experimental/deepgemm_fp4_gemm/cake_deepgemm_fp4_gemm_e6c9fb59c73ea5fce24c_kernel.cu",
-            "experimental/deepgemm_fp4_gemm/cake_deepgemm_fp4_gemm_e6c9fb59c73ea5fce24c_binding.cu",
+            "experimental/deepgemm_fp4_gemm/cake_deepgemm_fp4_gemm_d94790a04f86df826d7d_kernel.cu",
+            "experimental/deepgemm_fp4_gemm/cake_deepgemm_fp4_gemm_d94790a04f86df826d7d_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
         "arg_plan": [
-            [
-                "tma_buffer",
-                "A",
-            ],
-            [
-                "tma_buffer",
-                "B",
-            ],
             [
                 "tma_buffer",
                 "SFA",
@@ -487,6 +479,14 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             [
                 "tma_buffer",
                 "SFB",
+            ],
+            [
+                "tma_buffer",
+                "A",
+            ],
+            [
+                "tma_buffer",
+                "B",
             ],
             [
                 "tma_buffer",
@@ -538,10 +538,10 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "sm_103a",
         ],
     },
-    "cake_deepgemm_fp4_gemm_f6e26f62fc441e353075": {
+    "cake_deepgemm_fp4_gemm_f7b05e48d8f5fddcbbaf": {
         "sources": [
-            "experimental/deepgemm_fp4_gemm/cake_deepgemm_fp4_gemm_f6e26f62fc441e353075_kernel.cu",
-            "experimental/deepgemm_fp4_gemm/cake_deepgemm_fp4_gemm_f6e26f62fc441e353075_binding.cu",
+            "experimental/deepgemm_fp4_gemm/cake_deepgemm_fp4_gemm_f7b05e48d8f5fddcbbaf_kernel.cu",
+            "experimental/deepgemm_fp4_gemm/cake_deepgemm_fp4_gemm_f7b05e48d8f5fddcbbaf_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -615,14 +615,14 @@ PROGRAMS: dict[str, dict[str, Any]] = {
 }
 
 ROUTES = {
-    "normal_bm128_bn128_s7": "cake_deepgemm_fp4_gemm_bc83e664ecb731739d12",
-    "normal_bm128_bn160_s7": "cake_deepgemm_fp4_gemm_b8f21c5cd2f70ffc6f24",
-    "normal_bm128_bn16_s7": "cake_deepgemm_fp4_gemm_e6c9fb59c73ea5fce24c",
-    "normal_bm128_bn224_s6": "cake_deepgemm_fp4_gemm_7f6481216fbfb264acf6",
-    "normal_bm128_bn256_s6": "cake_deepgemm_fp4_gemm_40f53c88e86797021dc8",
-    "swap_ab_bm16_bn128_s11": "cake_deepgemm_fp4_gemm_f6e26f62fc441e353075",
-    "swap_ab_bm32_bn128_s10": "cake_deepgemm_fp4_gemm_e6bafe7ceb6a5cfd40fc",
-    "swap_ab_bm48_bn128_s10": "cake_deepgemm_fp4_gemm_a51b18d814bd13cb5875",
+    "normal_bm128_bn128_s7": "cake_deepgemm_fp4_gemm_a79c6847ccacabf02b35",
+    "normal_bm128_bn160_s7": "cake_deepgemm_fp4_gemm_b2fa42d3c2801bd3f387",
+    "normal_bm128_bn16_s7": "cake_deepgemm_fp4_gemm_41c47a05088d6702defc",
+    "normal_bm128_bn224_s6": "cake_deepgemm_fp4_gemm_01f1ab6e4dc995e5dcf7",
+    "normal_bm128_bn256_s6": "cake_deepgemm_fp4_gemm_d94790a04f86df826d7d",
+    "swap_ab_bm16_bn128_s11": "cake_deepgemm_fp4_gemm_0181597a4d65f627f485",
+    "swap_ab_bm32_bn128_s10": "cake_deepgemm_fp4_gemm_68e25fdc9902355084dc",
+    "swap_ab_bm48_bn128_s10": "cake_deepgemm_fp4_gemm_f7b05e48d8f5fddcbbaf",
 }
 
 _ARCHES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}

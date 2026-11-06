@@ -279,10 +279,14 @@ _ONLY_SEEDS = os.environ.get("FLASHINFER_UMOE_FUZZ_ONLY_SEED", "")
 # sequence enabled is its regression coverage.
 # Set FLASHINFER_UMOE_FUZZ=0 to disable in an emergency; FLASHINFER_UMOE_FUZZ=1 (the old opt-in
 # value) still enables and is now a no-op.
-pytestmark = pytest.mark.skipif(
-    os.environ.get("FLASHINFER_UMOE_FUZZ", "1") == "0",
-    reason="unified MoE fuzzer disabled via FLASHINFER_UMOE_FUZZ=0",
-)
+# H100 CI peak host RSS: 313.6 GiB, including cold JIT compilation.
+pytestmark = [
+    pytest.mark.host_memory_heavy,
+    pytest.mark.skipif(
+        os.environ.get("FLASHINFER_UMOE_FUZZ", "1") == "0",
+        reason="unified MoE fuzzer disabled via FLASHINFER_UMOE_FUZZ=0",
+    ),
+]
 
 # Per-backend determinism contract, established empirically (CRC across reruns) + confirmed against
 # code. A "True" backend MUST reproduce bitwise; flip to False only with evidence (and ideally an
@@ -1954,9 +1958,10 @@ _CURATED = [
         topk_group=2,
         routed_scaling=1.0,
     ),  # BF16 FromLogits bias/group routing
-    # Deterministic typed-activation coverage. Keep CUTLASS-only activations
-    # pre-routed so they have an executable candidate.
+    # Deterministic typed-activation coverage. Keep activations not shared by
+    # every BF16 routing backend pre-routed so they have an executable candidate.
     Cfg(8, 256, 256, 8, 2, "bf16", "uniform", 900_014, activation="relu2"),
+    Cfg(8, 256, 256, 8, 2, "bf16", "uniform", 900_025, activation="silu"),
     Cfg(
         8,
         256,

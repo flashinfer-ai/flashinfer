@@ -1,0 +1,9 @@
+RTX6000D local validation of code commit3cd6473fd4
+pytest -q tests/experimental/gdn_sm120_cute: 69 passed
+compute-sanitizer --tool memcheck --report-api-errors no --error-exitcode 99 python -m pytest -q tests/experimental/gdn_sm120_cute/test_public.py: 35 passed, ERROR SUMMARY:0
+compute-sanitizer --tool racecheck --report-api-errors no --error-exitcode 99 python -m pytest -q tests/experimental/gdn_sm120_cute/test_public.py -k test_public_forward:12 passed,0 hazards
+API error reporting disabled only for known machine CUDA-hook initialization/symbol-probe noise; kernel checks remain enabled.
+Ruff check/format and project-default mypy: passed.
+Configured changed-file pre-commit could not bootstrap Lucas-C/pre-commit-hooks because remote github.com:443 timed out; not claimed passed.
+Public performance:46 cases x2 paths x3 rounds x100 samples=27600; all experimental calls traced to CuTe (no fallback in matrix); maximum output/final-state relative L2=0.005388526940327897.
+Full project tests and upstream CI not run locally; maintainer-scoped CI and review required.

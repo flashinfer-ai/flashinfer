@@ -141,7 +141,7 @@ inline CUtensorMap EncodeTma_W(const TensorView& t) {
   return tm;
 }
 
-void Run(int64_t arg_num_experts, int64_t arg_shape_n, int64_t arg_shape_k, double arg_clamp_limit, TensorView arg_A, TensorView arg_W, TensorView arg_offsets, TensorView arg_D, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+void Launch(int64_t arg_num_experts, int64_t arg_shape_n, int64_t arg_shape_k, double arg_clamp_limit, TensorView arg_A, TensorView arg_W, TensorView arg_offsets, TensorView arg_D, int64_t grid_x, int64_t grid_y, int64_t grid_z, bool use_pdl) {
   DLDevice dev = arg_A.device();
   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
   {
@@ -199,7 +199,7 @@ void Run(int64_t arg_num_experts, int64_t arg_shape_n, int64_t arg_shape_k, doub
   dim3 block(384u, 1u, 1u);
 
   // Extended direct-source launch for a linked CUDA kernel symbol.
-  cudaLaunchAttribute attrs[2]{};
+  cudaLaunchAttribute attrs[3]{};
   int n = 0;
   attrs[n].id = cudaLaunchAttributeClusterDimension;
   attrs[n].val.clusterDim.x = 2u;
@@ -209,6 +209,11 @@ void Run(int64_t arg_num_experts, int64_t arg_shape_n, int64_t arg_shape_k, doub
   attrs[n].id = cudaLaunchAttributeClusterSchedulingPolicyPreference;
   attrs[n].val.clusterSchedulingPolicyPreference = cudaClusterSchedulingPolicySpread;
   ++n;
+  if (use_pdl) {  // programmatic dependent launch behind the previous kernel of the round
+    attrs[n].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[n].val.programmaticStreamSerializationAllowed = 1;
+    ++n;
+  }
   cudaLaunchConfig_t config{};
   config.gridDim = grid;
   config.blockDim = block;
@@ -223,6 +228,15 @@ void Run(int64_t arg_num_experts, int64_t arg_shape_n, int64_t arg_shape_k, doub
       << cudaGetErrorString(launch_status);
 }
 
+void Run(int64_t arg_num_experts, int64_t arg_shape_n, int64_t arg_shape_k, double arg_clamp_limit, TensorView arg_A, TensorView arg_W, TensorView arg_offsets, TensorView arg_D, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+  Launch(arg_num_experts, arg_shape_n, arg_shape_k, arg_clamp_limit, arg_A, arg_W, arg_offsets, arg_D, grid_x, grid_y, grid_z, false);
+}
+
+void RunPdl(int64_t arg_num_experts, int64_t arg_shape_n, int64_t arg_shape_k, double arg_clamp_limit, TensorView arg_A, TensorView arg_W, TensorView arg_offsets, TensorView arg_D, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+  Launch(arg_num_experts, arg_shape_n, arg_shape_k, arg_clamp_limit, arg_A, arg_W, arg_offsets, arg_D, grid_x, grid_y, grid_z, true);
+}
+
 }  // namespace cake_host_shim_d643ac1d77957c20
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_d643ac1d77957c20::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_pdl, cake_host_shim_d643ac1d77957c20::RunPdl);

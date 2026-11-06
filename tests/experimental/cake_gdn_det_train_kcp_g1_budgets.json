@@ -1,0 +1,1923 @@
+{
+ "title": "G1 accuracy budgets of the multi-rank KCP rows (final table, declared 2026-10-23T17:11:14Z)",
+ "rule": "budget = 1.10 x max(single-rank local-path error of this package, qualified FLA tf32x3 error at the FLA layout of record), rel-RMS and max-abs each; errors vs the FP64 reference of the global unpadded pack (out / dq / dk / dv as stored BF16, dg / dbeta as FP32)",
+ "max_abs_slack": "max-abs may exceed budget_max_abs by one storage ulp of |ref| at the candidate's worst element (judge_tensor pass_u1); rel-RMS has no slack",
+ "factor": 1.1,
+ "declared_utc": "2026-10-23T17:11:14Z",
+ "status": "FINAL",
+ "cells": 216,
+ "source_table_sha256": "537a66baa68887035e23d21c3895a90a079c29c329954d9eef4c02fef98949d0",
+ "notes": [
+  "rows of layout D / R are anchored at the FLA contiguous arm of the same CP (those layouts have no FLA equivalent)",
+  "C9b (0 tokens) has no FLA item and no elements: budget = empty-output shape / finiteness only",
+  "a multi-rank row whose CP has no cell here is judged at the row's nearest CP of record (A1 at CP16 -> the CP8 cell)"
+ ],
+ "rows": {
+  "C1": {
+   "2": {
+    "cp": 2,
+    "heads": [
+     2,
+     6
+    ],
+    "fla_layout_of_record": "C",
+    "tensors": {
+     "out": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0033629506645200366,
+      "budget_max_abs": 0.00051008585555863,
+      "source": "b_fla / cake_cp1",
+      "status": "final"
+     },
+     "dq": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0038390880661029994,
+      "budget_max_abs": 0.008261140838360603,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dk": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.004094236952551012,
+      "budget_max_abs": 0.005553448936457529,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dv": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0031653594446672613,
+      "budget_max_abs": 0.00047216872611516444,
+      "source": "b_fla / cake_cp1",
+      "status": "final"
+     },
+     "dg": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.003434188192902054,
+      "budget_max_abs": 0.0008505182996617207,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dbeta": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.002618317861174888,
+      "budget_max_abs": 0.0023703253362531655,
+      "source": "cake_cp1 / b_fla",
+      "status": "final"
+     }
+    }
+   },
+   "4": {
+    "cp": 4,
+    "heads": [
+     2,
+     6
+    ],
+    "fla_layout_of_record": "C",
+    "tensors": {
+     "out": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0033625185998098083,
+      "budget_max_abs": 0.00051008585555863,
+      "source": "b_fla / cake_cp1",
+      "status": "final"
+     },
+     "dq": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0038383487321908484,
+      "budget_max_abs": 0.008261140838360603,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dk": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.004092835605399281,
+      "budget_max_abs": 0.005553448936457529,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dv": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0031640999896434363,
+      "budget_max_abs": 0.00047216872611516444,
+      "source": "b_fla / cake_cp1",
+      "status": "final"
+     },
+     "dg": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.003434188192902054,
+      "budget_max_abs": 0.0008505182996617207,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dbeta": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.002618317861174888,
+      "budget_max_abs": 0.0023703253362531655,
+      "source": "cake_cp1 / b_fla",
+      "status": "final"
+     }
+    }
+   }
+  },
+  "C2": {
+   "2": {
+    "cp": 2,
+    "heads": [
+     4,
+     12
+    ],
+    "fla_layout_of_record": "C",
+    "tensors": {
+     "out": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0035008740372431315,
+      "budget_max_abs": 0.0005464622383758139,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dq": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.003948264167552953,
+      "budget_max_abs": 0.006931748404038963,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dk": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.00432763684073256,
+      "budget_max_abs": 0.007024511765752495,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dv": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.003198745356425411,
+      "budget_max_abs": 0.0005417062029419384,
+      "source": "b_fla / cake_cp1",
+      "status": "final"
+     },
+     "dg": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.003141300583196803,
+      "budget_max_abs": 0.001091101710013423,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dbeta": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.0026297808623857322,
+      "budget_max_abs": 0.0034678383816165283,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     }
+    }
+   },
+   "4": {
+    "cp": 4,
+    "heads": [
+     4,
+     12
+    ],
+    "fla_layout_of_record": "C",
+    "tensors": {
+     "out": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0035008740372431315,
+      "budget_max_abs": 0.0005464622383758139,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dq": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.00394598665677951,
+      "budget_max_abs": 0.006931748404038963,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dk": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.004328049043528046,
+      "budget_max_abs": 0.007024511765752495,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dv": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.003198600251620375,
+      "budget_max_abs": 0.0005417062029419384,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dg": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.003141300583196803,
+      "budget_max_abs": 0.001091101710013423,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dbeta": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.002625378139604084,
+      "budget_max_abs": 0.0034678383816165283,
+      "source": "cake_cp1 / b_fla",
+      "status": "final"
+     }
+    }
+   }
+  },
+  "C3": {
+   "2": {
+    "cp": 2,
+    "heads": [
+     1,
+     3
+    ],
+    "fla_layout_of_record": "C",
+    "tensors": {
+     "out": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0033924712130264907,
+      "budget_max_abs": 0.00047243863931999006,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dq": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.003837068328675363,
+      "budget_max_abs": 0.005170844501641425,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dk": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.004107841581483088,
+      "budget_max_abs": 0.005719741948308255,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dv": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0031719975502565168,
+      "budget_max_abs": 0.0004219966859684274,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dg": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.0027675977664149134,
+      "budget_max_abs": 0.0005577626894911592,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dbeta": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.002556945718178426,
+      "budget_max_abs": 0.002227621918430156,
+      "source": "cake_cp1 / b_fla",
+      "status": "final"
+     }
+    }
+   },
+   "4": {
+    "cp": 4,
+    "heads": [
+     1,
+     3
+    ],
+    "fla_layout_of_record": "C",
+    "tensors": {
+     "out": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.003392092945319933,
+      "budget_max_abs": 0.00047243863931999006,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dq": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0038379965194251,
+      "budget_max_abs": 0.005170844501641425,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dk": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.004107752359907603,
+      "budget_max_abs": 0.005719741948308255,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dv": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0031719975502565168,
+      "budget_max_abs": 0.0004219966859684274,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dg": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.0027675977664149134,
+      "budget_max_abs": 0.0005577626894911592,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dbeta": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.002556945718178426,
+      "budget_max_abs": 0.002227621918430156,
+      "source": "cake_cp1 / b_fla",
+      "status": "final"
+     }
+    }
+   }
+  },
+  "C4a": {
+   "2": {
+    "cp": 2,
+    "heads": [
+     8,
+     24
+    ],
+    "fla_layout_of_record": "C",
+    "tensors": {
+     "out": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.003496451202184374,
+      "budget_max_abs": 0.0006250963808334232,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dq": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.003961968115197785,
+      "budget_max_abs": 0.00640879524311685,
+      "source": "b_fla / cake_cp1",
+      "status": "final"
+     },
+     "dk": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0043306051436864034,
+      "budget_max_abs": 0.01026481198684781,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dv": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0031956229071208875,
+      "budget_max_abs": 0.00043823749341911634,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dg": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.00322130609242149,
+      "budget_max_abs": 0.0013281926471224337,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dbeta": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.002622972524519056,
+      "budget_max_abs": 0.0028537326054137503,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     }
+    }
+   },
+   "4": {
+    "cp": 4,
+    "heads": [
+     8,
+     24
+    ],
+    "fla_layout_of_record": "C",
+    "tensors": {
+     "out": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.003496451202184374,
+      "budget_max_abs": 0.0006250963808334232,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dq": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.003960792334256878,
+      "budget_max_abs": 0.00640879524311685,
+      "source": "b_fla / cake_cp1",
+      "status": "final"
+     },
+     "dk": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.004329599211663433,
+      "budget_max_abs": 0.01026481198684781,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dv": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0031956229071208875,
+      "budget_max_abs": 0.00043823749341911634,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dg": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.00322130609242149,
+      "budget_max_abs": 0.0013281926471224337,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dbeta": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.002622972524519056,
+      "budget_max_abs": 0.0028537326054137503,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     }
+    }
+   }
+  },
+  "C4b": {
+   "2": {
+    "cp": 2,
+    "heads": [
+     8,
+     24
+    ],
+    "fla_layout_of_record": "C",
+    "tensors": {
+     "out": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.003493432179838017,
+      "budget_max_abs": 0.0006250963808334232,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dq": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.003963494368015084,
+      "budget_max_abs": 0.00640879524311685,
+      "source": "b_fla / cake_cp1",
+      "status": "final"
+     },
+     "dk": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.004331786873314485,
+      "budget_max_abs": 0.01026481198684781,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dv": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0031930066160166556,
+      "budget_max_abs": 0.000363750369849257,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dg": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.003208213696761931,
+      "budget_max_abs": 0.0013281926471224337,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dbeta": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.002614184985343684,
+      "budget_max_abs": 0.0028537326054137503,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     }
+    }
+   },
+   "4": {
+    "cp": 4,
+    "heads": [
+     8,
+     24
+    ],
+    "fla_layout_of_record": "C",
+    "tensors": {
+     "out": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.003493432179838017,
+      "budget_max_abs": 0.0006250963808334232,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dq": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.003959841237696621,
+      "budget_max_abs": 0.00640879524311685,
+      "source": "b_fla / cake_cp1",
+      "status": "final"
+     },
+     "dk": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.004329482035805126,
+      "budget_max_abs": 0.01026481198684781,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dv": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0031930066160166556,
+      "budget_max_abs": 0.000363750369849257,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dg": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.003208213696761931,
+      "budget_max_abs": 0.0013281926471224337,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dbeta": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.002614396704953779,
+      "budget_max_abs": 0.0028537326054137503,
+      "source": "b_fla / cake_cp1",
+      "status": "final"
+     }
+    }
+   }
+  },
+  "C5a": {
+   "2": {
+    "cp": 2,
+    "heads": [
+     4,
+     4
+    ],
+    "fla_layout_of_record": "C",
+    "tensors": {
+     "out": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.00346512232416723,
+      "budget_max_abs": 0.00038172699196757783,
+      "source": "cake_cp1 / b_fla",
+      "status": "final"
+     },
+     "dq": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.003518037111867042,
+      "budget_max_abs": 0.003535543572209654,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dk": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0038108715155787984,
+      "budget_max_abs": 0.00412475194012455,
+      "source": "b_fla / cake_cp1",
+      "status": "final"
+     },
+     "dv": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0031612889097900085,
+      "budget_max_abs": 0.0002951544409513802,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dg": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.0031568330621652373,
+      "budget_max_abs": 0.0007018492008916828,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dbeta": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.0025336420929918907,
+      "budget_max_abs": 0.0017089503822790954,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     }
+    }
+   },
+   "4": {
+    "cp": 4,
+    "heads": [
+     4,
+     4
+    ],
+    "fla_layout_of_record": "C",
+    "tensors": {
+     "out": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.00346512232416723,
+      "budget_max_abs": 0.00038172699196757783,
+      "source": "cake_cp1 / b_fla",
+      "status": "final"
+     },
+     "dq": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.003518037111867042,
+      "budget_max_abs": 0.003535543572209654,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dk": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.00379673715291737,
+      "budget_max_abs": 0.00412475194012455,
+      "source": "b_fla / cake_cp1",
+      "status": "final"
+     },
+     "dv": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.003162446312519833,
+      "budget_max_abs": 0.0002951544409513802,
+      "source": "b_fla / cake_cp1",
+      "status": "final"
+     },
+     "dg": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.0031568330621652373,
+      "budget_max_abs": 0.0007018492008916828,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dbeta": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.0025741738343349513,
+      "budget_max_abs": 0.0017089503822790954,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     }
+    }
+   }
+  },
+  "C5b": {
+   "2": {
+    "cp": 2,
+    "heads": [
+     4,
+     4
+    ],
+    "fla_layout_of_record": "C",
+    "tensors": {
+     "out": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.00346512232416723,
+      "budget_max_abs": 0.00038172699196757783,
+      "source": "cake_cp1 / b_fla",
+      "status": "final"
+     },
+     "dq": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.003518037111867042,
+      "budget_max_abs": 0.003535543572209654,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dk": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0038108715155787984,
+      "budget_max_abs": 0.00412475194012455,
+      "source": "b_fla / cake_cp1",
+      "status": "final"
+     },
+     "dv": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0031612889097900085,
+      "budget_max_abs": 0.0002951544409513802,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dg": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.0031568330621652373,
+      "budget_max_abs": 0.0007018492008916828,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dbeta": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.0025336420929918907,
+      "budget_max_abs": 0.0017089503822790954,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     }
+    }
+   },
+   "4": {
+    "cp": 4,
+    "heads": [
+     4,
+     4
+    ],
+    "fla_layout_of_record": "C",
+    "tensors": {
+     "out": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.00346512232416723,
+      "budget_max_abs": 0.00038172699196757783,
+      "source": "cake_cp1 / b_fla",
+      "status": "final"
+     },
+     "dq": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.003518037111867042,
+      "budget_max_abs": 0.003535543572209654,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dk": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.00379673715291737,
+      "budget_max_abs": 0.00412475194012455,
+      "source": "b_fla / cake_cp1",
+      "status": "final"
+     },
+     "dv": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.003162446312519833,
+      "budget_max_abs": 0.0002951544409513802,
+      "source": "b_fla / cake_cp1",
+      "status": "final"
+     },
+     "dg": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.0031568330621652373,
+      "budget_max_abs": 0.0007018492008916828,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dbeta": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.0025741738343349513,
+      "budget_max_abs": 0.0017089503822790954,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     }
+    }
+   }
+  },
+  "C6": {
+   "2": {
+    "cp": 2,
+    "heads": [
+     16,
+     48
+    ],
+    "fla_layout_of_record": "Z",
+    "tensors": {
+     "out": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0034251031559073913,
+      "budget_max_abs": 0.0007748368726679029,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dq": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.003896927479000078,
+      "budget_max_abs": 0.009469490356057486,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dk": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0042275502698722435,
+      "budget_max_abs": 0.010414206333901645,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dv": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0031812623137797095,
+      "budget_max_abs": 0.0006217108644950329,
+      "source": "cake_cp1 / b_fla",
+      "status": "final"
+     },
+     "dg": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.003141969092474575,
+      "budget_max_abs": 0.0015849281259215598,
+      "source": "cake_cp1 / b_fla",
+      "status": "final"
+     },
+     "dbeta": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.0026067084657569266,
+      "budget_max_abs": 0.003741168622015989,
+      "source": "cake_cp1 / b_fla",
+      "status": "final"
+     }
+    }
+   },
+   "8": {
+    "cp": 8,
+    "heads": [
+     16,
+     48
+    ],
+    "fla_layout_of_record": "Z",
+    "tensors": {
+     "out": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0034251031559073913,
+      "budget_max_abs": 0.0007748368726679029,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dq": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0038971999745618714,
+      "budget_max_abs": 0.009268547044503063,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dk": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0042275305443374754,
+      "budget_max_abs": 0.010414206333901645,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dv": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0031812623137797095,
+      "budget_max_abs": 0.0006181838918797658,
+      "source": "cake_cp1 / b_fla",
+      "status": "final"
+     },
+     "dg": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.003141969092474575,
+      "budget_max_abs": 0.001570273546619111,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dbeta": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.0026067084657569266,
+      "budget_max_abs": 0.003741168622015989,
+      "source": "cake_cp1 / b_fla",
+      "status": "final"
+     }
+    }
+   }
+  },
+  "C7": {
+   "2": {
+    "cp": 2,
+    "heads": [
+     1,
+     3
+    ],
+    "fla_layout_of_record": "C",
+    "tensors": {
+     "out": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0033776385807446417,
+      "budget_max_abs": 0.0005099697727326089,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dq": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.003800419221810731,
+      "budget_max_abs": 0.005259127459514734,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dk": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.004086687969803423,
+      "budget_max_abs": 0.0072352483566093815,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dv": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0031695952652522506,
+      "budget_max_abs": 0.000586896511124839,
+      "source": "b_fla / cake_cp1",
+      "status": "final"
+     },
+     "dg": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.0028338630383078485,
+      "budget_max_abs": 0.0006528571905800057,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dbeta": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.0025511650444346797,
+      "budget_max_abs": 0.0020779535801930707,
+      "source": "cake_cp1 / b_fla",
+      "status": "final"
+     }
+    }
+   },
+   "4": {
+    "cp": 4,
+    "heads": [
+     1,
+     3
+    ],
+    "fla_layout_of_record": "C",
+    "tensors": {
+     "out": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0033769992791489274,
+      "budget_max_abs": 0.0005099697727326089,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dq": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.003798003882710287,
+      "budget_max_abs": 0.005259127459514734,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dk": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.004083463151224028,
+      "budget_max_abs": 0.0072352483566093815,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dv": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0031694243022314444,
+      "budget_max_abs": 0.000586896511124839,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dg": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.0028338630383078485,
+      "budget_max_abs": 0.0006528571905800057,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dbeta": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.0025511650444346797,
+      "budget_max_abs": 0.002028731715963345,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     }
+    }
+   }
+  },
+  "C7b": {
+   "2": {
+    "cp": 2,
+    "heads": [
+     1,
+     3
+    ],
+    "fla_layout_of_record": "C",
+    "tensors": {
+     "out": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0033776385807446417,
+      "budget_max_abs": 0.0005099697727326089,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dq": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.003800419221810731,
+      "budget_max_abs": 0.005259127459514734,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dk": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.004086687969803423,
+      "budget_max_abs": 0.0072352483566093815,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dv": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0031695952652522506,
+      "budget_max_abs": 0.000586896511124839,
+      "source": "b_fla / cake_cp1",
+      "status": "final"
+     },
+     "dg": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.0028338630383078485,
+      "budget_max_abs": 0.0006528571905800057,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dbeta": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.0025511650444346797,
+      "budget_max_abs": 0.0020779535801930707,
+      "source": "cake_cp1 / b_fla",
+      "status": "final"
+     }
+    }
+   },
+   "4": {
+    "cp": 4,
+    "heads": [
+     1,
+     3
+    ],
+    "fla_layout_of_record": "C",
+    "tensors": {
+     "out": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0033769992791489274,
+      "budget_max_abs": 0.0005099697727326089,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dq": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.003798003882710287,
+      "budget_max_abs": 0.005259127459514734,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dk": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.004083463151224028,
+      "budget_max_abs": 0.0072352483566093815,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dv": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0031694243022314444,
+      "budget_max_abs": 0.000586896511124839,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dg": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.0028338630383078485,
+      "budget_max_abs": 0.0006528571905800057,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dbeta": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.0025511650444346797,
+      "budget_max_abs": 0.002028731715963345,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     }
+    }
+   }
+  },
+  "C8": {
+   "2": {
+    "cp": 2,
+    "heads": [
+     16,
+     48
+    ],
+    "fla_layout_of_record": "C",
+    "tensors": {
+     "out": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.003424441703788424,
+      "budget_max_abs": 0.0007100311668722326,
+      "source": "cake_cp1 / b_fla",
+      "status": "final"
+     },
+     "dq": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.003893996259023706,
+      "budget_max_abs": 0.008299957112110201,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dk": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.004225609594587525,
+      "budget_max_abs": 0.009534579382991449,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dv": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.003181486722767988,
+      "budget_max_abs": 0.0006633047030903339,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dg": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.0031492091338612767,
+      "budget_max_abs": 0.001409237758390164,
+      "source": "cake_cp1 / b_fla",
+      "status": "final"
+     },
+     "dbeta": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.00260628000948707,
+      "budget_max_abs": 0.0035507824378000043,
+      "source": "cake_cp1 / b_fla",
+      "status": "final"
+     }
+    }
+   },
+   "8": {
+    "cp": 8,
+    "heads": [
+     16,
+     48
+    ],
+    "fla_layout_of_record": "C",
+    "tensors": {
+     "out": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.003424441703788424,
+      "budget_max_abs": 0.0007100311668722326,
+      "source": "cake_cp1 / b_fla",
+      "status": "final"
+     },
+     "dq": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0038942832310771354,
+      "budget_max_abs": 0.008299957112110201,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dk": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.004225926214212442,
+      "budget_max_abs": 0.009534579382991449,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dv": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.003181486722767988,
+      "budget_max_abs": 0.0006633047030903339,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dg": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.0031492091338612767,
+      "budget_max_abs": 0.001409237758390164,
+      "source": "cake_cp1 / b_fla",
+      "status": "final"
+     },
+     "dbeta": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.00260628000948707,
+      "budget_max_abs": 0.0035507168726907515,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     }
+    }
+   }
+  },
+  "C9a": {
+   "2": {
+    "cp": 2,
+    "heads": [
+     2,
+     6
+    ],
+    "fla_layout_of_record": "C",
+    "tensors": {
+     "out": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.003217008952930547,
+      "budget_max_abs": 0.00010655864244379817,
+      "source": "b_fla / cake_cp1",
+      "status": "final"
+     },
+     "dq": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.002662956688828373,
+      "budget_max_abs": 0.0007603655198870824,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dk": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.002643722393571874,
+      "budget_max_abs": 0.0008060162944426353,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dv": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.003101877321058999,
+      "budget_max_abs": 7.677602971894876e-05,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dg": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.0,
+      "budget_max_abs": 0.0,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dbeta": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.006120969030108466,
+      "budget_max_abs": 0.0003153727633321668,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     }
+    }
+   }
+  },
+  "C9b": {
+   "2": {
+    "cp": 2,
+    "heads": [
+     2,
+     6
+    ],
+    "fla_layout_of_record": "C",
+    "tensors": {
+     "out": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0,
+      "budget_max_abs": 0.0,
+      "source": "cake_cp1 only (0 tokens: empty-output shape / finiteness only; no B_fla KCP item)",
+      "status": "final"
+     },
+     "dq": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0,
+      "budget_max_abs": 0.0,
+      "source": "cake_cp1 only (0 tokens: empty-output shape / finiteness only; no B_fla KCP item)",
+      "status": "final"
+     },
+     "dk": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0,
+      "budget_max_abs": 0.0,
+      "source": "cake_cp1 only (0 tokens: empty-output shape / finiteness only; no B_fla KCP item)",
+      "status": "final"
+     },
+     "dv": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0,
+      "budget_max_abs": 0.0,
+      "source": "cake_cp1 only (0 tokens: empty-output shape / finiteness only; no B_fla KCP item)",
+      "status": "final"
+     },
+     "dg": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.0,
+      "budget_max_abs": 0.0,
+      "source": "cake_cp1 only (0 tokens: empty-output shape / finiteness only; no B_fla KCP item)",
+      "status": "final"
+     },
+     "dbeta": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.0,
+      "budget_max_abs": 0.0,
+      "source": "cake_cp1 only (0 tokens: empty-output shape / finiteness only; no B_fla KCP item)",
+      "status": "final"
+     }
+    }
+   }
+  },
+  "A1": {
+   "2": {
+    "cp": 2,
+    "heads": [
+     2,
+     6
+    ],
+    "fla_layout_of_record": "C",
+    "tensors": {
+     "out": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.004083483500523302,
+      "budget_max_abs": 0.00023580966952766182,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dq": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.00449131006336917,
+      "budget_max_abs": 0.005329457914818526,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dk": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.004927069975207833,
+      "budget_max_abs": 0.007210957625494574,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dv": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.00367354625040883,
+      "budget_max_abs": 0.00036816535687972667,
+      "source": "cake_cp1 / b_fla",
+      "status": "final"
+     },
+     "dg": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.009091180309660944,
+      "budget_max_abs": 0.2164819911416305,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dbeta": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.0032222365609216553,
+      "budget_max_abs": 0.0718351142172363,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     }
+    }
+   },
+   "4": {
+    "cp": 4,
+    "heads": [
+     2,
+     6
+    ],
+    "fla_layout_of_record": "C",
+    "tensors": {
+     "out": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.004083441276362235,
+      "budget_max_abs": 0.0002378543105727188,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dq": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.004493165553650865,
+      "budget_max_abs": 0.005747833408096226,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dk": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.004926142058090375,
+      "budget_max_abs": 0.008166812168612193,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dv": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.00367354625040883,
+      "budget_max_abs": 0.00036816535687972667,
+      "source": "cake_cp1 / b_fla",
+      "status": "final"
+     },
+     "dg": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.009224047901754106,
+      "budget_max_abs": 0.20910351344870529,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dbeta": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.0032222365609216553,
+      "budget_max_abs": 0.0718351142172363,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     }
+    }
+   },
+   "8": {
+    "cp": 8,
+    "heads": [
+     2,
+     6
+    ],
+    "fla_layout_of_record": "C",
+    "tensors": {
+     "out": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.004077090551276757,
+      "budget_max_abs": 0.00023662690511186069,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dq": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.00448759601229341,
+      "budget_max_abs": 0.0063043019768063155,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dk": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.004925457795955723,
+      "budget_max_abs": 0.007852568892612412,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dv": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.00367354625040883,
+      "budget_max_abs": 0.00036816535687972667,
+      "source": "cake_cp1 / b_fla",
+      "status": "final"
+     },
+     "dg": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.009006718535553146,
+      "budget_max_abs": 0.16628064024847244,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dbeta": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.0032222365609216553,
+      "budget_max_abs": 0.0718351142172363,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     }
+    }
+   }
+  },
+  "A2": {
+   "2": {
+    "cp": 2,
+    "heads": [
+     2,
+     6
+    ],
+    "fla_layout_of_record": "C",
+    "tensors": {
+     "out": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.004149084471992931,
+      "budget_max_abs": 0.00012952742063073662,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dq": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.004553333422033594,
+      "budget_max_abs": 0.005760222578740316,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dk": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.004839483319575557,
+      "budget_max_abs": 0.01967393825347843,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dv": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.003746537954081845,
+      "budget_max_abs": 0.0006964172931192753,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dg": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.008533649001147796,
+      "budget_max_abs": 0.1358217653590284,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dbeta": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.003318488602132974,
+      "budget_max_abs": 0.0948419897937157,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     }
+    }
+   },
+   "4": {
+    "cp": 4,
+    "heads": [
+     2,
+     6
+    ],
+    "fla_layout_of_record": "C",
+    "tensors": {
+     "out": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.004148693133679777,
+      "budget_max_abs": 0.00012004751729903595,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dq": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.00455337930049349,
+      "budget_max_abs": 0.005760222578740316,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dk": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.004840373835088242,
+      "budget_max_abs": 0.01967393825347843,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dv": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.003746537954081845,
+      "budget_max_abs": 0.0006964172931192753,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dg": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.008232194720144578,
+      "budget_max_abs": 0.14181416708930863,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dbeta": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.003318488602132974,
+      "budget_max_abs": 0.0948419897937157,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     }
+    }
+   },
+   "8": {
+    "cp": 8,
+    "heads": [
+     2,
+     6
+    ],
+    "fla_layout_of_record": "C",
+    "tensors": {
+     "out": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0041441402219731934,
+      "budget_max_abs": 0.00011517193881305754,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dq": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.00454516617363051,
+      "budget_max_abs": 0.00484520821268597,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dk": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.004839122325006152,
+      "budget_max_abs": 0.020555155718448327,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dv": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.003746537954081845,
+      "budget_max_abs": 0.0006964172931192753,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dg": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.008759981469066582,
+      "budget_max_abs": 0.15475015593357916,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dbeta": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.003318488602132974,
+      "budget_max_abs": 0.0948419897937157,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     }
+    }
+   }
+  },
+  "A3": {
+   "2": {
+    "cp": 2,
+    "heads": [
+     2,
+     6
+    ],
+    "fla_layout_of_record": "C",
+    "tensors": {
+     "out": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.003942635181961832,
+      "budget_max_abs": 0.0005905586671401107,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dq": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0043653344055869835,
+      "budget_max_abs": 0.007784873915549806,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dk": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.004769822259785505,
+      "budget_max_abs": 0.010272905770622544,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dv": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0035772905575811105,
+      "budget_max_abs": 0.0007943645460449512,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dg": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.00900601327426805,
+      "budget_max_abs": 0.1694904571606326,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dbeta": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.0032212058717845707,
+      "budget_max_abs": 0.07879464072572971,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     }
+    }
+   },
+   "4": {
+    "cp": 4,
+    "heads": [
+     2,
+     6
+    ],
+    "fla_layout_of_record": "C",
+    "tensors": {
+     "out": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.003946124166636537,
+      "budget_max_abs": 0.0005905586671401107,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dq": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.004368668158833917,
+      "budget_max_abs": 0.007784873915549806,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dk": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.00476857923949218,
+      "budget_max_abs": 0.007855087032897057,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dv": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0035772905575811105,
+      "budget_max_abs": 0.0007943645460449512,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dg": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.009268933572094566,
+      "budget_max_abs": 0.17515250731711376,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dbeta": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.0032212058717845707,
+      "budget_max_abs": 0.07879464072572971,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     }
+    }
+   }
+  },
+  "A4": {
+   "2": {
+    "cp": 2,
+    "heads": [
+     2,
+     6
+    ],
+    "fla_layout_of_record": "C",
+    "tensors": {
+     "out": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.004006467911480168,
+      "budget_max_abs": 0.00016721718088851152,
+      "source": "b_fla / cake_cp1",
+      "status": "final"
+     },
+     "dq": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.0044276173977687945,
+      "budget_max_abs": 0.0033388391235839258,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dk": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.00484960741610868,
+      "budget_max_abs": 0.005426180001502224,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dv": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.003659335370131832,
+      "budget_max_abs": 0.0002777297925431195,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dg": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.008627702012547823,
+      "budget_max_abs": 0.2081453703725099,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dbeta": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.0031824390553785355,
+      "budget_max_abs": 0.12396601241666085,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     }
+    }
+   },
+   "4": {
+    "cp": 4,
+    "heads": [
+     2,
+     6
+    ],
+    "fla_layout_of_record": "C",
+    "tensors": {
+     "out": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.004005807656126261,
+      "budget_max_abs": 0.00016721718088851152,
+      "source": "b_fla / cake_cp1",
+      "status": "final"
+     },
+     "dq": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.004426960921950352,
+      "budget_max_abs": 0.0034169399459037745,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dk": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.004849242088022995,
+      "budget_max_abs": 0.005426180001502224,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dv": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.003659335370131832,
+      "budget_max_abs": 0.0002777297925431195,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dg": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.00859305899763848,
+      "budget_max_abs": 0.22533805631358278,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dbeta": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.0031824390553785355,
+      "budget_max_abs": 0.12396601241666085,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     }
+    }
+   },
+   "8": {
+    "cp": 8,
+    "heads": [
+     2,
+     6
+    ],
+    "fla_layout_of_record": "C",
+    "tensors": {
+     "out": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.004006355668978249,
+      "budget_max_abs": 0.00016721718088851152,
+      "source": "b_fla / cake_cp1",
+      "status": "final"
+     },
+     "dq": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.004428023863710681,
+      "budget_max_abs": 0.0032811374952242513,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dk": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.004851430116520421,
+      "budget_max_abs": 0.0061243604547854165,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dv": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.003659335370131832,
+      "budget_max_abs": 0.0002777297925431195,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dg": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.008616984598647666,
+      "budget_max_abs": 0.16544725269505778,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dbeta": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.0031824390553785355,
+      "budget_max_abs": 0.12396601241666085,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     }
+    }
+   },
+   "16": {
+    "cp": 16,
+    "heads": [
+     2,
+     6
+    ],
+    "fla_layout_of_record": "C",
+    "tensors": {
+     "out": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.004006291217715585,
+      "budget_max_abs": 0.00016721718088851152,
+      "source": "b_fla / cake_cp1",
+      "status": "final"
+     },
+     "dq": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.004428431268654343,
+      "budget_max_abs": 0.0034857081363224743,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dk": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.004853966354189376,
+      "budget_max_abs": 0.005513967229595307,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dv": {
+      "storage": "bf16",
+      "budget_rel_rms": 0.003659335370131832,
+      "budget_max_abs": 0.0002777297925431195,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     },
+     "dg": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.00855206955511973,
+      "budget_max_abs": 0.18953834160286231,
+      "source": "b_fla / b_fla",
+      "status": "final"
+     },
+     "dbeta": {
+      "storage": "fp32",
+      "budget_rel_rms": 0.0031824390553785355,
+      "budget_max_abs": 0.12396601241666085,
+      "source": "cake_cp1 / cake_cp1",
+      "status": "final"
+     }
+    }
+   }
+  }
+ }
+}

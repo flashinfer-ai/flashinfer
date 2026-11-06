@@ -1896,7 +1896,7 @@ def test_public_profile_reuse_force_and_failure(
     assert cpb_mod.default_cache_path().read_bytes() == before
 
 
-def test_public_preflight_and_default_six_families(
+def test_public_preflight_and_default_families(
     store, monkeypatch, ordinary_format_facts
 ):
     from flashinfer.mla._sparse_mla_sm120 import _execution as execution
@@ -1915,7 +1915,7 @@ def test_public_preflight_and_default_six_families(
     def profile(request, device):
         requested.add(request.family)
         assert request.effective["compute_precision"] == (
-            "fp8" if request.family == "dsv4_1" else "default"
+            "fp8" if request.family in ("dsv4_1", "dsv4_1_inline") else "default"
         )
         assert request.extra_topk == 0
         return {
@@ -1940,6 +1940,7 @@ def test_public_preflight_and_default_six_families(
         "glm53_nope",
         "dots3_swa",
         "dsv4_1",
+        "dsv4_1_inline",
     }
 
 

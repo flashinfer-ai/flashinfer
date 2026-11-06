@@ -46,9 +46,11 @@ forward(t: MoEEpTensors)                                   # flashinfer/moe_ep/l
 └─ handle.complete()  →  return c.x                                  # [num_tokens, hidden] bf16
 ```
 
-With `enable_timing=True`, `forward` brackets dispatch/compute/combine with CUDA events and
-records `last_timings_ms` (all stages run on the `HandleAlgoKnobUserStream`, so on-stream
-events capture their GPU time; `dispatch` host-syncs internally, which doesn't perturb them).
+With `enable_timing=True`, `forward` brackets each stage (`quantize`, the payload packing;
+then dispatch/compute/combine) with CUDA events and records `last_timings_ms` (all stages run
+on the `HandleAlgoKnobUserStream`, so on-stream events capture their GPU time; `dispatch`
+host-syncs internally, which doesn't perturb them). `stage_hook` brackets the same stages
+without synchronizing, so it also works under CUDA graph capture.
 
 The handle backend (`flashinfer/moe_ep/nccl_ep/handle.py`) is where the three I/O contracts
 live, and where the host-call fast path (`NV_FI_EP_FAST_PATH`) and burn-down probes (`EP_PROFILE_HOST`)

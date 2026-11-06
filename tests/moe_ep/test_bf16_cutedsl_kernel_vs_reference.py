@@ -102,7 +102,7 @@ def test_bf16_kernel_matches_mega_reference(monkeypatch):
             fc1_weight=transformed_l1[0].unsqueeze(0),
             fc2_weight=transformed_l2[0].unsqueeze(0),
             ref_compute_graph="deepgemm",
-            apply_topk_in_fc1=True,
+            apply_routing_weights_before_fc2=True,
         )
         y_ref = combine_ref[0].to(torch.float32).sum(dim=1)
         y_kernel = torch.empty(num_tokens, hidden, dtype=torch.bfloat16, device="cuda")

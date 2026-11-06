@@ -136,12 +136,12 @@ struct AbsMaxOp<__nv_bfloat16> {
   __device__ static float to_float(Accum value) { return __bfloat162float(value); }
 };
 
-// TODO(aleozlx, #5141): unlike the TRT-LLM quantization kernels, this CUTLASS-backend
-// dispatcher still reads FLASHINFER_NVFP4_4OVER6* directly instead of taking a
-// caller-supplied NVFP4RecipeSpec. Threading the recipe down to here is a follow-up.
+// Selects the compile-time NVFP4 quantizer variant from the recipe code
+// (resolveNVFP4Recipe(); the default code reads FLASHINFER_NVFP4_4OVER6*).
+// FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH stays a separate environment knob.
 template <typename Fn>
-auto dispatchNVFP44Over6Config(Fn&& fn) {
-  bool const use4Over6 = tensorrt_llm::common::getEnvNVFP4Use4Over6();
+auto dispatchNVFP44Over6Config(int64_t nvfp4_4over6_code, Fn&& fn) {
+  auto const recipe = tensorrt_llm::kernels::resolveNVFP4Recipe(nvfp4_4over6_code);
   bool const disableFP4QuantFastMath = tensorrt_llm::common::getEnvDisableFP4QuantFastMath();
 
   auto dispatchDisableFastMath = [&](auto e4m3MaxTag, auto errModeTag, auto errUseFastMathTag) {
@@ -155,13 +155,10 @@ auto dispatchNVFP44Over6Config(Fn&& fn) {
                                 decltype(errUseFastMathTag)::value>{});
   };
 
-  if (use4Over6) {
-    NVFP44Over6ErrMode const errMode = tensorrt_llm::common::getEnvNVFP44Over6ErrMode();
-    bool const errUseFastMath = tensorrt_llm::common::getEnvNVFP44Over6ErrUseFastMath();
-    int e4m3Max = 448;
-    if (tensorrt_llm::common::getEnvNVFP44Over6E4M3Use256()) {
-      e4m3Max = 256;
-    }
+  if (recipe.use4Over6) {
+    NVFP44Over6ErrMode const errMode = recipe.errMode;
+    bool const errUseFastMath = recipe.errUseFastMath;
+    int const e4m3Max = recipe.e4m3Max;
 
     auto dispatchErrUseFastMath = [&](auto e4m3MaxTag, auto errModeTag) {
       if (errUseFastMath) {
@@ -1894,6 +1891,7 @@ void expandInputRowsKernelLauncher(
                            "NVFP4 block scaling is expected for FP4xFP4");
       TLLM_CHECK_WITH_INFO(!prequant_scales, "NVFP4 is not supported for AWQ");
       return dispatchNVFP44Over6Config(
+          quant_params.fp4.nvfp4_4over6_code,
           [&](auto disableFP4QuantFastMathTag, auto nvfp4_4over6_config_tag) {
             return &expandInputRowsKernel<
                 InputActivationsType, ExpandedActivationsType,
@@ -2301,6 +2299,51 @@ struct SituAdaptor {
   }
 };
 
+// PowLU-GLU. The gate branch replaces
+// SiLU's linear factor by a self-adapting power, and the negative half is plain SiLU:
+//   PowLU(g) = g > 0 ? g^(m / (sqrt(g) + 1)) * sigmoid(g)
+//                    : g * sigmoid(g)
+//   out      = min(PowLU(gate), limit) * clamp(up, -limit, limit)
+// The two branches agree at g == 0 (both 0) and at g == 1, so PowLU is continuous.
+//
+// `alpha` carries the exponent numerator m. PowLU needs exactly one scalar besides `limit`, so it
+// reuses the generic per-expert swiglu_alpha/swiglu_limit slots instead of widening the
+// ActivationParams ABI -- the same trade SwigluStepAdaptor makes for `limit`. Per-expert
+// `swiglu_limit` covers split limits (routed experts vs. a fused shared expert).
+//
+// PowLU is bounded: for m == 2.5 it peaks at 4.02 (g ~= 12.9) and decays back toward 1 as g grows,
+// so a `limit` above that peak never clips the gate branch and only clamps `up`.
+struct PowLUAdaptor {
+  constexpr static bool IS_GLU = true;
+  float alpha = 2.5f;  // m
+  // Unused by the math; present so the generic setPerExpertActivationParams branch compiles.
+  float beta = 0.0f;
+  float limit = std::numeric_limits<float>::infinity();
+
+  template <class T>
+  __device__ T operator()(T const& gate, T const& linear) const {
+    // Element-wise rather than whole-Array: the gate needs a sign-dependent branch, which the
+    // cutlass::Array functors cannot express. T is always cutlass::Array<float, N> here (both
+    // dispatch sites call the adaptor with ComputeElem).
+    T out;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < T::kElements; ++i) {
+      float const g = gate[i];
+      // __expf overflows to +inf for very negative g, giving sigmoid == 0 exactly (not NaN).
+      float const sigmoid = 1.0f / (1.0f + __expf(-g));
+      // __powf(g, e) is exp2f(e * __log2f(g)). The Triton reference computes exp(e * log(g));
+      // the two agree to <= 6e-6 relative, far below bf16 resolution. Shared edge with that
+      // reference: an overflowed gate (g == inf) gives e == 0 and 0 * log(inf) == NaN, which the
+      // non-propagating fminf below turns into `limit` -- torch.pow(inf, 0) == 1 instead.
+      float act = g > 0.0f ? __powf(g, alpha / (sqrtf(g) + 1.0f)) * sigmoid : g * sigmoid;
+      act = fminf(act, limit);
+      float const u = fmaxf(fminf(linear[i], limit), -limit);
+      out[i] = act * u;
+    }
+    return out;
+  }
+};
+
 __device__ inline bool hasPerExpertActivationParams(ActivationParams const& params) {
   // clamped_relu2_limit applies model-wide and is consumed only by the fused GEMM1 epilogue.
   return params.swiglu_alpha || params.swiglu_beta || params.swiglu_limit || params.situ_beta ||
@@ -2393,6 +2436,8 @@ void doGatedActivation(ActivationOutputType* output, GemmOutputType const* gemm_
                  ? &doGatedActivationKernel<ActivationOutputType, GemmOutputType, SwigluStepAdaptor>
              : activation_type == ActivationType::Situ
                  ? &doGatedActivationKernel<ActivationOutputType, GemmOutputType, SituAdaptor>
+             : activation_type == ActivationType::PowLU
+                 ? &doGatedActivationKernel<ActivationOutputType, GemmOutputType, PowLUAdaptor>
                  : nullptr;
   TLLM_CHECK_WITH_INFO(fn != nullptr, "Invalid activation type");
   fn<<<blocks, threads, 0, stream>>>(output, gemm_result, expert_first_token_offset, inter_size,
@@ -2726,6 +2771,13 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
                               decltype(disableFP4QuantFastMathTag)::value,
                               decltype(nvfp4_4over6_config_tag)>  // Situ
       };
+      // PowLU is CUTLASS-only and numbered after InvalidType (like ClampedRelu2), so it is
+      // outside the dense enum-indexed range of fn_list and dispatched here instead.
+      if (activation_type.activation_type == ActivationType::PowLU) {
+        return &doActivationKernel<
+            T, GemmOutputType, ScaleBiasType, PowLUAdaptor, decltype(block_scaling_type)::value,
+            decltype(disableFP4QuantFastMathTag)::value, decltype(nvfp4_4over6_config_tag)>;
+      }
       auto const activation_index = static_cast<size_t>(activation_type.activation_type);
       TLLM_CHECK_WITH_INFO(activation_index < fn_list.size(),
                            "Unsupported activation type in doActivation");
@@ -2747,6 +2799,7 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
       TLLM_CHECK_WITH_INFO(quant_params.fp4.fc2.weight_block_scale,
                            "NVFP4 block scaling is expected for FP4xFP4");
       return dispatchNVFP44Over6Config(
+          quant_params.fp4.nvfp4_4over6_code,
           [&](auto disableFP4QuantFastMathTag, auto nvfp4_4over6_config_tag) {
             return fn(NVFP4, disableFP4QuantFastMathTag, nvfp4_4over6_config_tag);
           });
