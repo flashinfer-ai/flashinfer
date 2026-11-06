@@ -14,11 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Benchmark of the Cake chunked LM-head + loss training kernels in their two numerical modes (SM100 / SM103):
-``deterministic=True`` (the deterministic package ``flashinfer.experimental.cake_lm_head_det_loss``) against
+``deterministic=True`` (the deterministic package ``flashinfer.experimental.cake.cake_lm_head_det_train``) against
 ``deterministic=False`` (``flashinfer.experimental.cake.cake_lm_head_loss``: the dX GEMM's K-slice partials added
 in an unordered FP32 reduction), both through the dispatching entries of ``flashinfer.chunked_lm_head``.
 
-The rows are the deterministic benchmark's (``bench_cake_lm_head_det_loss.py``): the GLM-class geometry
+The rows are the deterministic benchmark's (``bench_cake_lm_head_det_train.py``): the GLM-class geometry
 (``H = 6144``, ``V = 154880``, BF16 ``X`` / ``W``, int64 labels with five percent ignored rows), the loss entry with
 the cross-entropy and the policy objective and the log-probability entry at ``T`` = 16231, 16172, 4096, 32463 and
 chunks of 2048 / 4096 / 8192 rows, plus the tail rows ``T`` = 1, 4095, 4097.  Per row and mode:
@@ -43,8 +43,8 @@ rounds.  ``speedup`` is ``det / nondet`` of the medians (above 1: the non-determ
 ``det`` (the package default, the deterministic package's slice counts) or ``measured`` (the form-aware B200 rule).
 
 ``--facade`` adds the host cost of the dispatcher's default path on tiny log-probability rows (``T`` = 1, 128): the
-median enqueue time of ``chunked_lm_head_logprob`` (default ``deterministic=True``) against calling
-``chunked_lm_head_det_logprob`` directly, interleaved over rounds.
+median enqueue time of ``chunked_lm_head_logprob`` (``deterministic=False``) against calling
+``cake_lm_head_det_train_logprob`` directly, interleaved over rounds.
 
 Example::
 
@@ -69,6 +69,7 @@ import torch.utils.checkpoint
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from flashinfer import cake_lm_head_det_train as det_public  # noqa: E402
 from flashinfer import chunked_lm_head as public  # noqa: E402
 from flashinfer.api_logging import ExperimentalWarning  # noqa: E402
 from flashinfer.testing import bench_gpu_time  # noqa: E402
@@ -117,7 +118,7 @@ def _gpu_us(fn: Callable[[], object], steps: int) -> float:
 def _backends(deterministic: bool):
     """The package backend of a mode (the explicit forward / backward pair)."""
     if deterministic:
-        from flashinfer.experimental.cake_lm_head_det_loss import cake_backend
+        from flashinfer.experimental.cake.cake_lm_head_det_train import cake_backend
 
         return cake_backend, {}
     from flashinfer.experimental.cake.cake_lm_head_loss import cake_backend
@@ -315,8 +316,10 @@ def bench_facade(W: torch.Tensor, args) -> list[dict]:
         inp = make_inputs(T, seed=SEED_BASE + T, device="cuda", W=W, ignore_frac=0.0)
         X = inp.X.detach().requires_grad_(True)
         calls = {
-            "det": lambda: public.chunked_lm_head_det_logprob(X, W, inp.labels),
-            "dispatch": lambda: public.chunked_lm_head_logprob(X, W, inp.labels),
+            "det": lambda: det_public.cake_lm_head_det_train_logprob(X, W, inp.labels),
+            "dispatch": lambda: public.chunked_lm_head_logprob(
+                X, W, inp.labels, deterministic=False
+            ),
         }
         per_round = {name: [] for name in calls}
         for fn in calls.values():

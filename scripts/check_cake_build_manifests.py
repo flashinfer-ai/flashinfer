@@ -42,8 +42,8 @@ In-tree checks (``--in-tree``, the default):
 * the ``cake_build.py`` files of all checked packages are byte-identical;
 * ``common.requires.tvm_ffi.python`` equals line 1 of ``requirements.txt``;
 * every package a package requires (``Package.requires``: a package it imports
-  as its sibling, as the numerical-mode ``dense_projection_gemm`` imports the
-  deterministic ``dense_projection_det_gemm``) is a row of this table with the
+  as its sibling, as the non-deterministic ``cake_dense_gemm_nondet_train`` imports
+  the deterministic ``cake_dense_gemm_det_train``) is a row of this table with the
   same parent package;
 * ``common.requires.packages`` of ``build.json`` lists the directory names of
   the packages it requires (``Package.requires``), sorted and without
@@ -405,14 +405,14 @@ PACKAGES: tuple[Package, ...] = (
         refs_generic,
     ),
     Package(
-        "flashinfer.cake_rmsnorm_silu_gate_det_train_backend",
-        "flashinfer/cake_rmsnorm_silu_gate_det_train_backend",
+        "flashinfer.experimental.cake.cake_rmsnorm_silu_gate_det_train",
+        "flashinfer/experimental/cake/cake_rmsnorm_silu_gate_det_train",
         "cake_jit.py",
         refs_generic,
     ),
     Package(
-        "flashinfer.cake_rmsnorm_silu_gate_train_backend",
-        "flashinfer/cake_rmsnorm_silu_gate_train_backend",
+        "flashinfer.experimental.cake.cake_rmsnorm_silu_gate_nondet_train",
+        "flashinfer/experimental/cake/cake_rmsnorm_silu_gate_nondet_train",
         "cake_jit.py",
         refs_generic,
     ),
@@ -459,14 +459,14 @@ PACKAGES: tuple[Package, ...] = (
         refs_generic,
     ),
     Package(
-        "flashinfer.experimental.cake_dsa_train",
-        "flashinfer/experimental/cake_dsa_train",
+        "flashinfer.experimental.cake.cake_dsa_sparse_attention_nondet_train",
+        "flashinfer/experimental/cake/cake_dsa_sparse_attention_nondet_train",
         "cake_jit.py",
         refs_generic,
     ),
     Package(
-        "flashinfer.experimental.cake_dsa_indexer_det",
-        "flashinfer/experimental/cake_dsa_indexer_det",
+        "flashinfer.experimental.cake.cake_dsa_indexer_det_train",
+        "flashinfer/experimental/cake/cake_dsa_indexer_det_train",
         "cake_jit.py",
         refs_generic,
     ),
@@ -527,8 +527,8 @@ PACKAGES: tuple[Package, ...] = (
         refs_moe_grouped_gemm,
     ),
     Package(
-        "flashinfer.experimental.cake_lm_head_det_loss",
-        "flashinfer/experimental/cake_lm_head_det_loss",
+        "flashinfer.experimental.cake.cake_lm_head_det_train",
+        "flashinfer/experimental/cake/cake_lm_head_det_train",
         "cake_jit.py",
         refs_lm_head_det_loss,
     ),
@@ -545,18 +545,18 @@ PACKAGES: tuple[Package, ...] = (
         refs_mok_bf16,
     ),
     Package(
-        "flashinfer.experimental.dense_projection_det_gemm",
-        "flashinfer/experimental/dense_projection_det_gemm",
+        "flashinfer.experimental.cake.cake_dense_gemm_det_train",
+        "flashinfer/experimental/cake/cake_dense_gemm_det_train",
         "cake_jit.py",
         refs_generic,
     ),
     Package(
-        "flashinfer.experimental.dense_projection_gemm",
-        "flashinfer/experimental/dense_projection_gemm",
+        "flashinfer.experimental.cake.cake_dense_gemm_nondet_train",
+        "flashinfer/experimental/cake/cake_dense_gemm_nondet_train",
         "cake_jit.py",
         refs_generic,
-        # its deterministic path calls the deterministic package's programs
-        requires=("flashinfer.experimental.dense_projection_det_gemm",),
+        # its fixed-order rows run the deterministic package's programs
+        requires=("flashinfer.experimental.cake.cake_dense_gemm_det_train",),
     ),
     Package(
         "flashinfer.experimental.cake_stepfun_moe",
@@ -637,8 +637,8 @@ PACKAGES: tuple[Package, ...] = (
         refs_generic,
     ),
     Package(
-        "flashinfer.experimental.cake_gqa_train",
-        "flashinfer/experimental/cake_gqa_train",
+        "flashinfer.experimental.cake.cake_gqa_nondet_train",
+        "flashinfer/experimental/cake/cake_gqa_nondet_train",
         "cake_jit.py",
         refs_generic,
     ),
