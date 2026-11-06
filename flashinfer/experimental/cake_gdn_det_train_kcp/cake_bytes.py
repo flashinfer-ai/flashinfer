@@ -935,10 +935,3 @@ __all__ = [
     "gdn_det_workspace_layout_kcp",
     "state_bytes",
 ]
-
-# Compatibility aliases: the pre-rename names bound to the same objects (not in ``__all__``).
-gdn_kcp_comm_bytes = gdn_det_comm_bytes_kcp
-gdn_kcp_saved_bytes = gdn_det_saved_bytes_kcp
-gdn_kcp_workspace_bytes = gdn_det_workspace_bytes_kcp
-gdn_kcp_saved_layout = gdn_det_saved_layout_kcp
-gdn_kcp_workspace_layout = gdn_det_workspace_layout_kcp

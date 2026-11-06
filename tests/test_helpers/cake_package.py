@@ -25,8 +25,7 @@ PACKAGES: dict[str, str] = {
     "cake_sage_block_sparse_attention": "flashinfer.cake_sage_block_sparse_attention_backend",
     "cake_mhc_det_train": "flashinfer.cake_mhc_det_train_backend",
     "cake_dsa_train": "flashinfer.experimental.cake_dsa_train",
-    "cake_dsa_indexer_det": "flashinfer.experimental.cake_dsa_indexer_det",
-    "cake_dsa_indexer": "flashinfer.experimental.cake_dsa_indexer",
+    "cake.cake_dsa_indexer_det_train": "flashinfer.experimental.cake.cake_dsa_indexer_det_train",
     "cake.cake_lm_head_det_train": "flashinfer.experimental.cake.cake_lm_head_det_train",
     # the non-deterministic LM-head package; its key carries the namespace
     "cake.cake_lm_head_nondet_train": "flashinfer.experimental.cake.cake_lm_head_nondet_train",
