@@ -41,8 +41,10 @@ class MoKConfig:
     all_gather_top_experts_chunk_bytes: int = 2048
     # Diagnostics of the imbalance-aware path: ``True`` prints each change of
     # the (forward, backward) communication-SM split to stderr, one line per
-    # rank, from the launch that applies it (``MoKFunctional._comm_split``).
-    # Off by default; no effect while ``imbalance_comm_sms`` is ``None``. The
+    # rank, from the launch that applies it (``MoKFunctional._comm_split``),
+    # and each change of the sm_107a MXFP8 forward program choice
+    # (``MoKFunctional._multimacro``). Off by default; the split lines need
+    # ``imbalance_comm_sms``. The
     # value is compared across ranks at workspace creation like every field; a
     # later ``dataclasses.replace`` on one rank only changes that rank's log.
     comm_split_log: bool = False

@@ -120,6 +120,7 @@ _COMMON = dict(
     l6_solo_unsampled_max_queries=None,
     wide_pair_snake_only=False,
     snake_default=False,
+    snake_cap_rule=None,
     tile_unroll_default=1,
     tile_unroll_factor=2,
     sample_fit_max_mean_tiles=512,
@@ -348,15 +349,19 @@ def test_registry_records_are_well_formed():
         assert set(keys) == set(scan_keys) | set(finalize_keys) | set(rank_keys) | {
             MERGE_KEY
         }, arch
-        # every scan key follows the key grammar; an FP8 key (``:fp8`` before ``:lsf``) runs in the plain unit order
-        # and the sampled-fit form, and the BF16 record's rules below are the BF16 programs' (the FP8 form has a
-        # record of its own, ``policy_for(arch, "fp8")``)
+        # every scan key follows the key grammar; an FP8 key (``:fp8`` before ``:lsf``) runs the sampled-fit form, in
+        # the plain unit order or as the snake copy of a registered plain FP8 program, and the BF16 record's rules
+        # below are the BF16 programs' (the FP8 form has a record of its own, ``policy_for(arch, "fp8")``)
         for key in scan_keys:
             fields = scan_key_fields(key)
             assert fields is not None, (arch, key)
             assert (key.split(":")[-1] == "lsf") == fields.lsf, (arch, key)
             if fields.form == cake_policy.FP8:
-                assert not fields.snake and fields.sample_fit, (arch, key)
+                assert fields.sample_fit, (arch, key)
+                assert not fields.snake or key.replace(":s1:", ":s0:", 1) in keys, (
+                    arch,
+                    key,
+                )
         scan_keys = [k for k in scan_keys if scan_key_form(k) == cake_policy.BF16]
         # the rank finalize programs are registered exactly where the architecture's rule admits a call
         assert bool(rank_keys) == (
@@ -766,6 +771,15 @@ def test_policy_record_round_trip_and_validation():
         dict(l6_solo_unsampled_max_queries=16384.0),
         dict(l6_solo_unsampled_max_queries=True),
         dict(l6_solo_unsampled_max_queries=[16384]),
+        # the FP8 snake cap: [max segments >= 1, max waves >= 1] or None
+        dict(snake_cap_rule=40),
+        dict(snake_cap_rule=[]),
+        dict(snake_cap_rule=[1]),
+        dict(snake_cap_rule=[1, 40, 1]),
+        dict(snake_cap_rule=[0, 40]),
+        dict(snake_cap_rule=[1, 0]),
+        dict(snake_cap_rule=[1.0, 40]),
+        dict(snake_cap_rule=[True, 40]),
         # the scope of the two-way wave split: [ascending unit geometries, max segments >= 1, sampled only] or None
         dict(split_wave_scope="narrow"),
         dict(split_wave_scope=[]),
@@ -840,6 +854,14 @@ def test_policy_record_round_trip_and_validation():
     assert waved.wide_wave_rule == [1.6, 1.3, 80.0]
     assert waved.record()["wide_wave_rule"] == [1.6, 1.3, 80.0]
     assert DispatchPolicy.from_record(waved.record()) == waved
+    capped = DispatchPolicy.from_record(dict(record, snake_cap_rule=(1, 40)))
+    assert capped.record()["snake_cap_rule"] == [1, 40]
+    assert DispatchPolicy.from_record(capped.record()) == capped
+    # waves of 6-query units on 212 CTAs: 32768 queries take 26, 65536 take 52
+    assert capped.snake_copy_fits(32768, 1, 6, 212)
+    assert not capped.snake_copy_fits(65536, 1, 6, 212)
+    assert not capped.snake_copy_fits(32768, 2, 6, 212)
+    assert DispatchPolicy.from_record(record).snake_copy_fits(1 << 20, 64, 6, 212)
     scoped = DispatchPolicy.from_record(
         dict(record, split_wave_scope=(("narrow", "wide"), 2, False))
     )

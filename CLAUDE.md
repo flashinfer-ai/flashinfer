@@ -965,6 +965,9 @@ Used by `flashinfer.trace` / `fi_trace`.
 | `FLASHINFER_TRACE_DUMP_DIR` | cwd | `flashinfer/fi_trace.py` | Directory where the trace JSON files are written. |
 | `FLASHINFER_TRACE_APPLY` | `0` | `flashinfer/__init__.py`, `flashinfer/trace_apply/config.py` | Set to `1` to enable Trace Apply (runtime kernel substitution) when FlashInfer is imported. |
 | `FLASHINFER_TRACE_APPLY_PATH` | unset | `flashinfer/trace_apply/config.py` | Directory from which deployment-configured solutions are loaded for Trace Apply. |
+| `FLASHINFER_KERNEL_PACKAGES` | unset | `flashinfer/__init__.py`, `flashinfer/trace_apply/packages.py` | Comma-separated sha256 digests of sealed kernel packages to verify, import and enable when FlashInfer is imported (best effort: a bad package warns). |
+| `FLASHINFER_KERNEL_PACKAGE_ROOT` | `/opt/flashinfer/kernel_packages` | `flashinfer/__init__.py`, `flashinfer/trace_apply/packages.py` | Directory holding the digest-named sealed package directories. |
+| `FLASHINFER_KERNEL_PLUGINS_DISABLE` | unset | `flashinfer/trace_apply/packages.py` | Kill switch for the environment-triggered loading above: when truthy, the import-time hook refuses with a warning even if the two variables are set. A program that calls `load_packages()` itself is not affected. |
 
 ##### Validation / Autotuning / Routing / Kernel Selection
 

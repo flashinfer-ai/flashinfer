@@ -250,6 +250,17 @@ and does not change the launch sequence.
   comm_split_log=True)` on the returned config) prints each split change per
   rank to stderr; the `CAKE_MOK_COMM_SPLIT_LOG` environment variable that used
   to select this no longer exists.
+- Two-macro-batch forward program (sm_107a MXFP8 only): the
+  `forward_mxfp8[_clamped]_multimacro` build streams macro batch 0's
+  unaliased rows to the experts while macro batch 1 combines, instead of
+  after it. Each rank chooses it from the same lagged observation as the
+  split, when its padded schedule rows (`num_tokens`) filled exactly two
+  macro batches; otherwise, before the first observation and at a schedule
+  capacity of at most one macro batch the default build runs (and no
+  observation is queued for this alone). Both builds give bitwise the same
+  outputs, context and gradients for any schedule, so ranks may run different
+  builds in one step and a stale choice costs time only. `comm_split_log`
+  also prints each change of the choice.
 - Fixed split per device and group size (`fwd_num_comm_sms="auto"` /
   `bwd_num_comm_sms="auto"`; the factory default stays 40 / 40): `"auto"` takes
   the measured row of `COMM_SMS` (compute capability, SM count, precision, EP
