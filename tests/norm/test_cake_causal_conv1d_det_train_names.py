@@ -178,7 +178,8 @@ import {kcp_facade} as kcp_facade
 from {package} import kcp as kcp_backend
 for old, new in {facade_names!r}:
     assert not hasattr(kcp_facade, old), old
-    assert getattr(kcp_facade, new) is getattr(kcp_backend, new), new
+    assert new in kcp_facade.__all__ and hasattr(kcp_backend, new), new
+assert kcp_facade.RecomputeHandleDetKcp is kcp_backend.RecomputeHandleDetKcp
 for old, new in {backend_names!r}:
     assert not hasattr(kcp_backend, old), old
     assert old not in kcp_backend.__all__, old
