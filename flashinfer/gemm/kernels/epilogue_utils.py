@@ -720,6 +720,7 @@ def epilogue_tma_store_mxfp8(
     tCgSFC_base: cute.Tensor,
     epi_tile: cute.Tile,
     num_tiles_executed: Int32,
+    epilogue_op: Constexpr,
     alpha_value: cutlass.Float32,
     mma_tile_coord_mnl: Tuple[Int32, Int32, Int32],
     acc_consumer_state: pipeline.PipelineState,
@@ -729,7 +730,8 @@ def epilogue_tma_store_mxfp8(
     """
     Per-tile epilogue that writes MXFP8: Float8E4M3FN values plus one UE8M0 scale per 32 output columns.
 
-    Each value is scaled by alpha in Float32 and rounded to bf16 first, then quantized exactly as
+    Each value is scaled by alpha in Float32, rounded to bf16 and passed through ``epilogue_op``
+    (as the bf16 epilogue applies it), then quantized exactly as
     ``mxfp8_quantize`` would quantize that bf16 tensor (round-up UE8M0 of absmax / 448, then
     a round-to-nearest saturating e4m3 conversion), so the bytes match a bf16 GEMM followed by
     ``mxfp8_quantize(..., is_sf_swizzled_layout=True)``. ``tCgSFC_base`` is the scale tensor
@@ -786,7 +788,9 @@ def epilogue_tma_store_mxfp8(
         tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
         cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
         tTR_rAcc.store(
-            (tTR_rAcc.load() * alpha_value).to(cutlass.BFloat16).to(cutlass.Float32)
+            epilogue_op((tTR_rAcc.load() * alpha_value).to(cutlass.BFloat16)).to(
+                cutlass.Float32
+            )
         )
 
         acc_frg = cute.logical_divide(tTR_rAcc, cute.make_layout(32))

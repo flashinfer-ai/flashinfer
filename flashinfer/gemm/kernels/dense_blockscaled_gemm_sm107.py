@@ -1977,6 +1977,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                         tCgSFC,
                         epi_tile,
                         tile_sched.num_tiles_executed,
+                        epilogue_op,
                         alpha_value,
                         mma_tile_coord_mnl,
                         acc_consumer_state,

@@ -236,8 +236,15 @@ def test_bmm_mxfp8_cute_dsl_mxfp8_output(layout, auto_tuning):
     else:
         storage = out = torch.empty([b, m, n], device="cuda", dtype=torch.float8_e4m3fn)
         ref_q, ref_s = mxfp8_quantize(ref.reshape(b * m, n), True)
+    # Independent oracle: the strided A must reach the GEMM as the same values.
+    expected = torch.bmm(x.float(), weight.float().transpose(-2, -1))
+    cos_sim = F.cosine_similarity(expected.reshape(-1), ref.float().reshape(-1), dim=0)
+    assert cos_sim > 0.99, f"cosine similarity {cos_sim:.4f}"
     out_scale = torch.zeros_like(ref_s)
-    with autotune(auto_tuning):
+    if auto_tuning:
+        gemm_base.AutoTuner.get().clear_cache()  # tune afresh, not from an earlier test's entry
+    with warnings.catch_warnings(record=True) as caught, autotune(auto_tuning):
+        warnings.simplefilter("always")
         bmm_mxfp8(
             a,
             w.transpose(-2, -1),
@@ -248,6 +255,9 @@ def test_bmm_mxfp8_cute_dsl_mxfp8_output(layout, auto_tuning):
             backend="cute-dsl",
             out_scale=out_scale,
         )
+    assert not [
+        w for w in caught if "falling back to default tactic=-1" in str(w.message)
+    ]
     assert torch.equal(
         storage.view(torch.uint8).reshape(-1), ref_q.view(torch.uint8).reshape(-1)
     )
@@ -265,3 +275,25 @@ def test_bmm_mxfp8_fp8_output_needs_out_scale():
             torch.empty(512, dtype=torch.uint8),
             torch.float8_e4m3fn,
         )
+
+
+def test_bmm_mxfp8_sm107_out_scale_geometry():
+    geometry = gemm_base._bmm_mxfp8_sm107_out_scale_geometry  # pyright: ignore[reportPrivateUsage]
+    b, m, n = 8, 512, 1024
+    # contiguous [b, m, n]: batches stacked along rows
+    assert geometry((b, m, n), (m * n, n, 1)) == (
+        n,
+        (m // 128) * n * 4,
+        b * m * n // 32,
+    )
+    # [m, b, n] storage: batches side by side in one [m, b * n] row
+    assert geometry((b, m, n), (n, b * n, 1)) == (
+        b * n,
+        (n // 128) * 512,
+        m * b * n // 32,
+    )
+    # a batch offset that carries into the next row cannot use one constant offset
+    assert geometry((4, 128, 128), (49280, 384, 1)) is None
+    # unaligned batch start / row pitch
+    assert geometry((2, 128, 128), (128 * 128 + 64, 128, 1)) is None
+    assert geometry((1, 128, 96), (96 * 128, 96, 1)) is None
