@@ -1042,25 +1042,68 @@ _FP8_H64_M64_EARLY_WAVE = {
 
 # The same form, read in place of ``_FP8_H64_M64_EARLY_WAVE`` on the launches
 # whose multi-tile M64 route runs its four-stage sibling
-# (:func:`_fp8_h64_kv4_edges`).  R200 (208 and 216 SMs, three boards), eight
+# (:func:`_fp8_h64_kv4_edges`); the edges scale with the SM count, measured at
+# 208, 212 and 216 SMs (each entry at the SM counts named below; the comments
+# give the token count each edge starts at on 208 / 212 / 216 SMs).  Eight
 # distinct-input calls per CUDA graph / single cold calls, persistent body ->
-# four-stage M64 body on the rows each entry moves: width 256 (13-27 tokens,
-# q_len 1 and 4) 1.018-1.073x / 1.039-1.099x, width 384 (1-16 tokens, q_len 1,
-# 2 and 4) 1.011-1.039x / 1.035-1.091x, widths 260-380 (52-55 tokens, q_len 1
-# and 4) 1.002-1.023x / 1.011-1.044x, width 512 (52-56 tokens, q_len 1 and 4)
+# four-stage M64 body on the rows each entry moves.
+# R200 (208 and 216 SMs, three boards): width 256 (13-27 tokens, q_len 1 and
+# 4) 1.018-1.073x / 1.039-1.099x, width 384 (1-16 tokens, q_len 1, 2 and 4)
+# 1.011-1.039x / 1.035-1.091x, widths 260-380 (52-55 tokens, q_len 1 and 4)
+# 1.002-1.023x / 1.011-1.044x, width 512 (52-56 tokens, q_len 1 and 4)
 # 1.023-1.050x / 1.037-1.069x, widths 896-1152 (80-104 tokens, q_len 4 only)
-# 1.026-1.087x / 1.015-1.097x.
+# 1.026-1.087x / 1.015-1.097x.  R200 (208 SMs): width 512 (50 tokens, q_len 1
+# and 2) 1.021-1.024x / 1.049-1.059x, width 896 (64-77 tokens, q_len 1, 2 and
+# 4) 1.031-1.054x / 1.002-1.035x, width 1024 (84-92 tokens, q_len 1, 2 and 4)
+# 1.022-1.035x / 1.024-1.070x, width 1152 (77 tokens, q_len 1) 1.022x /
+# 1.012x.  R200 (216 SMs) and VR200 (212 SMs), q_len 1, 2 and 4: widths
+# 400-508 (61-64 tokens) 1.016-1.074x / 1.000-1.077x, width 512 (40-51 tokens)
+# 1.014-1.090x / 1.003-1.123x, widths 516-636 (65-106 tokens) 1.032-1.116x /
+# 1.017-1.139x, width 640 (57-106 tokens) 1.035-1.135x / 1.016-1.141x, widths
+# 644-764 (60-106 tokens) 1.016-1.104x / 1.002-1.108x, width 768 (56-106
+# tokens) 1.015-1.112x / 1.009-1.117x, widths 772-892 (78-106 tokens)
+# 1.021-1.080x / 1.009-1.093x, width 896 (64-79 tokens) 1.024-1.070x /
+# 1.000-1.066x, widths 900-1020 (79-106 tokens) 1.014-1.062x / 1.013-1.087x,
+# width 1024 (83-94 tokens) 1.033-1.060x / 1.017-1.080x, widths 1028-1148
+# (92-106 tokens) 1.004-1.054x / 1.022-1.082x, width 1152 (78-79 tokens,
+# q_len 1 and 2) 1.025-1.034x / 1.027-1.051x.
 _FP8_H64_M64_EARLY_WAVE_KV4 = {
     "sm_107a": {
         (2, 1): (3, 20),
         (2, 2): (0, 1),  # width 256: every token count
-        (3, 2): (14, 57),  # widths 257-383: 52 / 54 tokens (208 / 216 SMs)
+        (3, 2): (14, 57),  # widths 257-383: 52 / 53 / 54 tokens
         (3, 3): (0, 1),  # width 384: every token count
-        (4, 3): (3, 10),
-        (4, 4): (19, 79),  # width 512: 51 / 52 tokens
-        (7, 7): (77, 208),  # width 896: 78 / 80 tokens
-        (8, 8): (23, 52),  # width 1024: 93 / 96 tokens
-        (9, 9): (77, 208),  # width 1152: 78 / 80 tokens
+        (4, 3): (21, 73),  # widths 385-511: 60 / 61 / 63 tokens
+        (4, 4): (3, 16),  # width 512: 40 / 40 / 41 tokens
+        (5, 4): (11, 36),  # widths 513-639: 64 / 65 / 67 tokens
+        (5, 5): (4, 15),  # width 640: 56 / 57 / 58 tokens, 32-47 below
+        (6, 5): (13, 46),  # widths 641-767: 59 / 60 / 62 tokens
+        (6, 6): (19, 72),  # width 768: 55 / 56 / 58 tokens
+        (7, 6): (11, 30),  # widths 769-895: 77 / 78 / 80 tokens
+        (7, 7): (19, 63),  # width 896: 63 / 64 / 66 tokens
+        (8, 7): (10, 27),  # widths 897-1023: 78 / 79 / 81 tokens
+        (8, 8): (12, 31),  # width 1024: 81 / 83 / 84 tokens
+        (9, 8): (13, 30),  # widths 1025-1151: 91 / 92 / 94 tokens
+        (9, 9): (19, 52),  # width 1152: 77 / 78 / 79 tokens
+    },
+}
+
+# Token windows of the same launches below the uniform route's K=64 floor
+# (``_K64_SIBLING_MIN_TOKENS``), where the persistent body still runs its K=32
+# program: per ``(ceil(sparse_topk / 128), sparse_topk // 128)``, ``(minimum
+# width, maximum width, first tokens)``, the M64 body from ``first tokens`` up
+# to that floor.  R200 (216 SMs) and VR200 (212 SMs), q_len 1, 2 and 4, eight
+# distinct-input calls per CUDA graph / single cold calls, persistent body ->
+# four-stage M64 body: widths 260-344 at 24-47 tokens 1.007-1.130x /
+# 1.024-1.149x, widths 368 and 380 at 44-47 tokens 1.056-1.110x /
+# 1.047-1.133x, width 640 at 32-47 tokens 1.007-1.083x / 1.029-1.111x.  From
+# 48 tokens, where the persistent body runs its K=64 sibling, the M64 body
+# trailed it down to 0.979x (VR200 and R200); at width 640, 48-51 tokens,
+# q_len 1 and 2, the distinct-input calls gave 0.993-1.000x (R200).
+_FP8_H64_M64_BELOW_K64_KV4 = {
+    "sm_107a": {
+        (3, 2): ((257, 352, 24), (353, 383, 44)),
+        (5, 5): ((640, 640, 32),),
     },
 }
 
@@ -1096,7 +1139,9 @@ def _fp8_h64_uses_m64_body(
     tokens (M64 7.22-7.34 vs 7.08-7.20 us); and four complete tiles (width
     512) take the M64 body from 55 tokens (8.28-8.65 -> 8.11-8.25 us at 55-62
     tokens).  Launches whose multi-tile M64 route runs its four-stage sibling
-    (``kv4``) take the edges of ``_FP8_H64_M64_EARLY_WAVE_KV4`` instead.
+    (``kv4``) take the edges of ``_FP8_H64_M64_EARLY_WAVE_KV4`` instead, and
+    also the M64 body in the token windows of ``_FP8_H64_M64_BELOW_K64_KV4``
+    below the uniform route's K=64 floor (``_K64_SIBLING_MIN_TOKENS``).
     """
     if 2 * num_query_tokens > sm_count:
         return True
@@ -1107,7 +1152,19 @@ def _fp8_h64_uses_m64_body(
     if kv4 and arch in _FP8_H64_M64_EARLY_WAVE_KV4:
         table = _FP8_H64_M64_EARLY_WAVE_KV4
     early = table.get(arch, {}).get(tiles)
-    return early is not None and early[1] * num_query_tokens > early[0] * sm_count
+    if early is not None and early[1] * num_query_tokens > early[0] * sm_count:
+        return True
+    if not kv4:
+        return False
+    # The uniform route's K=64 floor, read at call time (defined further down).
+    k64_rows = _K64_SIBLING_MIN_TOKENS.get(arch)
+    if k64_rows is None or num_query_tokens >= k64_rows:
+        return False
+    windows = _FP8_H64_M64_BELOW_K64_KV4.get(arch, {}).get(tiles, ())
+    return any(
+        min_width <= sparse_topk <= max_width and num_query_tokens >= first
+        for min_width, max_width, first in windows
+    )
 
 
 # Mirrors the Cake M64 seed's box_k_gather_for_width (TILE_KV = 128).  The M64
@@ -1433,7 +1490,8 @@ def _route(
             # 204-252, 1-72 tokens: 7.9-8.5 us vs 8.8-10.4 us).  On SM107 the
             # rows of _FP8_H64_PERSISTENT_ONE_TILE_MIN_WIDTH took the persistent
             # body above; with kv4, width 176 and widths 257-352 at 13-16 tokens
-            # land here (_FP8_H64_PERSISTENT_SHORT_MIN_WIDTH_KV4).
+            # land here (_FP8_H64_PERSISTENT_SHORT_MIN_WIDTH_KV4), while the
+            # windows of _FP8_H64_M64_BELOW_K64_KV4 took the M64 body above.
             return _fp8_h64_m64_program(sparse_topk)
         if is_swa:
             if _fp8_lowhead_swa_uses_m64_body(num_query_tokens, sm_count, arch):
@@ -2051,7 +2109,8 @@ _K64_SIBLING_OVERSIZED_SMEM_BYTES = {"sm_107a": 272512}
 # 0.4-28.8 % on every multi-tile row but one and tied or trailed it by up to
 # 2.3 % on that one, 64-head 2 x 257-token prefill on topk128x items 256 wide.
 # Where the sibling launches, SM107 routes the FP8/H64 decode rows by its
-# edges (:func:`_fp8_h64_kv4_edges`, ``_FP8_H64_M64_EARLY_WAVE_KV4``).
+# edges (:func:`_fp8_h64_kv4_edges`, ``_FP8_H64_M64_EARLY_WAVE_KV4``,
+# ``_FP8_H64_M64_BELOW_K64_KV4``).
 _KV4_SIBLING_ROUTES = frozenset({"fp8_h64_prefill_source_persistent_m64_multi_tile"})
 
 # The dynamic shared memory of the four-stage sibling programs, per
