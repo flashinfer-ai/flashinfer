@@ -24,12 +24,15 @@ described by an int32 **device** tensor ``offs[E]`` of cumulative end offsets
 * ``dgrad``: ``dX[offs[e-1]:offs[e]] = G[offs[e-1]:offs[e]] @ W[e]``
 * ``wgrad``: ``dW[e] = G[offs[e-1]:offs[e]].T @ X[offs[e-1]:offs[e]]`` (bf16 or fp32 output)
 
-Numerical mode.  This package is the ``deterministic=False`` implementation:
-every entry point (``prepare_grouped_gemm_*`` here, ``grouped_gemm_*`` and
-``cake_grouped_mm`` of the package) takes ``deterministic: bool = True`` and
-raises ``ValueError`` unless it is ``False``; the deterministic programs are the
-deterministic package's (or those of the facade
-``flashinfer.experimental.cake.grouped_mm`` with ``deterministic=True``).
+Numerical mode.  This package is the ``deterministic=False`` implementation
+and runs nothing else: every entry point (``prepare_grouped_gemm_*`` here,
+``grouped_gemm_*`` and ``cake_grouped_mm`` of the package, and the facade
+``flashinfer.experimental.cake.grouped_mm``) takes the keyword-only
+``deterministic: bool = True`` and raises ``ValueError`` for every value but
+the bool ``False`` (the default included), naming the deterministic entry of
+the deterministic package ``flashinfer.experimental.cake_moe_grouped_det_gemm``
+(``grouped_det_gemm_*``, ``prepare_grouped_det_gemm_*``,
+``cake_grouped_det_mm``).  Nothing here routes to that package.
 ``fwd``, ``dgrad`` and the weight gradient with the 256-wide k tile run this
 package's copies of the deterministic programs and give their bits (the
 256-wide k tile's ``main_wave`` program is the same kernel rendered from a newer
@@ -51,11 +54,18 @@ units are added varies, so only the run-to-run bitwise reproducibility of such
 a ``dW`` is relaxed.  The operands (bf16), the accumulation (fp32), the one
 round-to-nearest rounding to bf16 (or the fp32 store), the layouts, the
 ``offs`` contract and the exact zeros of empty groups are the deterministic
-package's.  With ``torch.use_deterministic_algorithms(True)``,
-``prepare_grouped_gemm_wgrad`` (hence ``grouped_gemm_wgrad`` and the backward of
-``CakeGroupedMm``) raises PyTorch's non-determinism alert (``_alert_not_deterministic``:
-a ``RuntimeError``, or a ``UserWarning`` under ``warn_only=True``) and never falls back;
-``fwd`` and ``dgrad`` give the deterministic bits and do not alert.  The stable
+package's.  With ``torch.use_deterministic_algorithms(True)``, a launch whose
+result can vary run to run (``GroupedGemmLaunch.order_varying``: the 512-wide k
+tile's weight gradient with a split tail, ``plan["unordered_tail"]`` and
+``plan["tail_splits"] > 1``, in overwrite or accumulate mode) raises PyTorch's
+non-determinism alert immediately before it launches (``_alert_not_deterministic``:
+a ``RuntimeError``, and nothing launches; or under ``warn_only=True`` a
+``UserWarning``, and the launch runs), at every ``launch()`` and in
+``grouped_gemm_wgrad`` and the backward of ``CakeGroupedMm``; it never falls back
+to the deterministic package.  Every other launch has a fixed order and never
+alerts: ``fwd``, ``dgrad``, the 256-wide k tile's weight gradient (ordered tail
+reduce) and a 512-wide k tile whose tail is not split.  Preparation never
+alerts.  The stable
 ``flashinfer.grouped_mm.grouped_mm_bf16(..., backend="cake")`` stays on the
 deterministic package: this package has no handoff for it.
 
@@ -295,16 +305,32 @@ def sm_count(device: torch.device) -> int:
     return _device_facts(_device_index(device))[1]
 
 
+# The deterministic entry of the package ``flashinfer.experimental.cake_moe_grouped_det_gemm`` that
+# corresponds to each entry point of this package (and of the facade): named by the mode refusal.
+_DET_ENTRIES: dict[str, str] = {
+    "CakeGroupedMm": "CakeGroupedDetMm",
+    "cake_grouped_mm": "cake_grouped_det_mm",
+    "grouped_gemm_dgrad": "grouped_det_gemm_dgrad",
+    "grouped_gemm_fwd": "grouped_det_gemm_fwd",
+    "grouped_gemm_wgrad": "grouped_det_gemm_wgrad",
+    "prepare_grouped_gemm_dgrad": "prepare_grouped_det_gemm_dgrad",
+    "prepare_grouped_gemm_fwd": "prepare_grouped_det_gemm_fwd",
+    "prepare_grouped_gemm_wgrad": "prepare_grouped_det_gemm_wgrad",
+}
+
+
 def _require_deterministic_false(deterministic: object, entry: str) -> None:
-    """Refuse every numerical mode but ``deterministic=False``: this package's weight gradient adds its split
-    tail with unordered reductions, and its deterministic counterpart is another package."""
-    if not isinstance(deterministic, bool) or deterministic:
+    """Refuse every value of ``deterministic`` but the bool ``False`` (``ValueError`` naming the deterministic
+    entry): this package's weight gradient adds its split tail with unordered reductions, and its
+    deterministic counterpart is another package, to which nothing here routes."""
+    if deterministic is not False:
+        det = _DET_ENTRIES[entry]
         raise ValueError(
             f"{entry} is the non-deterministic ragged grouped GEMM (the 512-wide k tile's weight gradient adds "
-            "its split tail with unordered fp32 reductions) and needs deterministic=False, got "
-            f"deterministic={deterministic!r}; the deterministic programs are "
-            "flashinfer.experimental.cake_moe_grouped_det_gemm (or the facade "
-            "flashinfer.experimental.cake.grouped_mm with deterministic=True)"
+            "its split tail with unordered fp32 reductions) and runs only with deterministic=False, got "
+            f"deterministic={deterministic!r}; the deterministic entry is "
+            f"flashinfer.experimental.cake_moe_grouped_det_gemm.{det} (it takes no deterministic argument); "
+            "pass deterministic=False for the non-deterministic path"
         )
 
 
@@ -334,28 +360,42 @@ def _caller_stacklevel() -> int:
     return 2
 
 
+# The deterministic counterpart of each entry that can launch an order-varying weight gradient (the
+# ``entry`` of ``GroupedGemmLaunch._run``): named by the alert.
+_ALERT_DET_ENTRIES: dict[str, str] = {
+    "CakeGroupedMm.backward": "CakeGroupedDetMm",
+    "GroupedGemmLaunch.launch": "GroupedDetGemmLaunch.launch",
+    "grouped_gemm_wgrad": "grouped_det_gemm_wgrad",
+}
+
+
 def _alert_not_deterministic(entry: str) -> None:
     """PyTorch's alert for an operation without a deterministic implementation, when torch's deterministic
-    algorithms are enabled: a ``RuntimeError``, or a ``UserWarning`` (naming the caller's frame) under
-    ``torch.use_deterministic_algorithms(True, warn_only=True)``; nothing otherwise.  Called by the entry points
-    that can launch the unordered weight gradient, before they prepare it; there is no fallback.  The alert is
-    raised here because PyTorch exposes no public Python entry for it."""
+    algorithms are enabled: a ``RuntimeError``, or a ``UserWarning`` under
+    ``torch.use_deterministic_algorithms(True, warn_only=True)``; nothing otherwise.  Both name the
+    deterministic entry (``_ALERT_DET_ENTRIES``).  The warning names the nearest frame outside flashinfer:
+    the caller's line for a direct call (``grouped_gemm_wgrad``, ``launch()``), a frame of PyTorch's autograd
+    for a backward (the engine calls it).  Called by :meth:`GroupedGemmLaunch._run` immediately before an
+    order-varying launch (``order_varying``); there is no fallback.  The alert is raised here because PyTorch
+    exposes no public Python entry for it."""
     if not torch.are_deterministic_algorithms_enabled():
         return
+    det = "flashinfer.experimental.cake_moe_grouped_det_gemm"
+    if entry in _ALERT_DET_ENTRIES:
+        det = f"{det}.{_ALERT_DET_ENTRIES[entry]}"
     if torch.is_deterministic_algorithms_warn_only_enabled():
         warnings.warn(
             f"{entry} does not have a deterministic implementation, but you set "
             "'torch.use_deterministic_algorithms(True, warn_only=True)'; "
-            "flashinfer.experimental.cake_moe_grouped_det_gemm is the deterministic package",
+            f"the deterministic entry is {det}",
             UserWarning,
             stacklevel=_caller_stacklevel(),
         )
         return
     raise RuntimeError(
         f"{entry} does not have a deterministic implementation, but you set "
-        "'torch.use_deterministic_algorithms(True)'; flashinfer.experimental.cake_moe_grouped_det_gemm is "
-        "the deterministic package, or use the 'warn_only=True' option if that is acceptable for your "
-        "application"
+        f"'torch.use_deterministic_algorithms(True)'; the deterministic entry is {det}, or use the "
+        "'warn_only=True' option if that is acceptable for your application"
     )
 
 
@@ -1413,11 +1453,16 @@ class GroupedGemmLaunch:
     launch, as is the probed queue split where ``plan["queue_split"]`` is
     ``"probed"``.
 
-    A weight-gradient launch checks torch's deterministic mode at every
-    ``launch()`` (a host flag read, no synchronisation) and raises the
-    non-determinism alert when it is on, also when it was switched on after
-    the preparation.  Under CUDA graph capture the check runs when the launch
-    is captured; a replay of the graph does not check again.
+    An order-varying launch (``order_varying``: a weight gradient whose
+    512-wide k tile adds a split tail with unordered fp32 reductions) checks
+    torch's deterministic mode at every ``launch()`` (a host flag read, no
+    synchronisation) and raises the non-determinism alert immediately before
+    it launches when the mode is on, also when it was switched on after the
+    preparation: a ``RuntimeError`` (nothing launches), or under
+    ``warn_only=True`` a ``UserWarning``, after which it launches.  Every other
+    launch has a fixed order and never alerts.  Under CUDA graph capture the
+    check runs when the launch is captured; a replay of the graph does not
+    check again.
 
     A weight gradient prepared with ``accumulate=True`` adds into ``out`` at
     every ``launch()`` and every replay of a graph that captured it (it is not
@@ -1455,13 +1500,27 @@ class GroupedGemmLaunch:
     # Fused accumulate: the kernel wrote ``out`` in place; bump its version counter after the launch.
     bump_version: bool = False
 
-    def launch(self) -> torch.Tensor:
-        if self.op == "wgrad":
-            _alert_not_deterministic("GroupedGemmLaunch.launch")
-        return self._run()
+    @property
+    def order_varying(self) -> bool:
+        """Whether the launch adds a split tail with unordered fp32 reductions, so its result can vary run
+        to run: a weight gradient with a program to launch whose plan has ``unordered_tail`` and
+        ``tail_splits > 1`` (overwrite or accumulate).  Only such a launch alerts under torch's
+        deterministic mode."""
+        return (
+            self.op == "wgrad"
+            and bool(self.launches)
+            and bool(self.plan.get("unordered_tail"))
+            and int(self.plan.get("tail_splits", 1)) > 1
+        )
 
-    def _run(self) -> torch.Tensor:
-        """``launch()`` without the deterministic-mode check, for entry points that raised the alert."""
+    def launch(self) -> torch.Tensor:
+        return self._run("GroupedGemmLaunch.launch")
+
+    def _run(self, entry: str = "GroupedGemmLaunch.launch") -> torch.Tensor:
+        """``launch()``, with the deterministic-mode alert of an order-varying launch naming ``entry`` (the
+        entry point the caller called)."""
+        if self.order_varying:
+            _alert_not_deterministic(entry)
         if self.zero_fill:
             self.out.zero_()
         with tvm_ffi.use_torch_stream():
@@ -1872,37 +1931,6 @@ def _accumulate_aligned(out: torch.Tensor) -> bool:
     return out.shape[0] <= 1 or int(out.stride(0)) * size % ACC_ALIGN == 0
 
 
-def _check_accumulate_call(
-    g: torch.Tensor,
-    x: torch.Tensor,
-    offs: torch.Tensor,
-    out: Optional[torch.Tensor],
-    out_dtype: Optional[torch.dtype],
-    num_groups: Optional[int],
-    accumulate: object,
-    entry: str,
-) -> bool:
-    """The accumulate checks of a weight-gradient call before it runs anything, for a caller that composes
-    the add itself (the facade's deterministic route): ``accumulate`` a bool and, when True, the checks of
-    :func:`_check_accumulate_out` and an ``out`` of shape ``[E, N, K]`` (``E`` = ``num_groups``, else
-    ``offs.numel()``; ``N`` = the columns of ``g``, ``K`` those of ``x``).  Returns ``accumulate``."""
-    _require_flag(accumulate, "accumulate", entry)
-    if not accumulate:
-        return False
-    if g.dim() != 2 or x.dim() != 2:
-        raise ValueError(
-            f"{entry}: g must be a [sum_m, N] tensor and x a [sum_m, K] tensor"
-        )
-    _check_accumulate_out(out, out_dtype, {"g": g, "x": x, "offs": offs}, entry)
-    groups = int(offs.numel()) if num_groups is None else int(num_groups)
-    shape = (groups, int(g.shape[1]), int(x.shape[1]))
-    if tuple(out.shape) != shape:
-        raise ValueError(
-            f"{entry}: out must be a {out.dtype} {list(shape)} tensor, got {list(out.shape)}"
-        )
-    return True
-
-
 def _warn_once(key: str, message: str) -> None:
     """A ``UserWarning`` naming the caller's frame, the first time ``key`` warns in this process."""
     if key in _WARNED:
@@ -1921,7 +1949,7 @@ def _prepare_wgrad(
     *,
     accumulate: bool = False,
 ) -> GroupedGemmLaunch:
-    """The weight-gradient preparation of :func:`prepare_grouped_gemm_wgrad`, after its mode check and alert."""
+    """The weight-gradient preparation of :func:`prepare_grouped_gemm_wgrad`, after its mode check."""
     _require_flag(accumulate, "accumulate", "prepare_grouped_gemm_wgrad")
     if accumulate:
         _check_accumulate_out(
@@ -2164,12 +2192,15 @@ def prepare_grouped_gemm_wgrad(
     when it is chosen).  Empty groups produce exact zeros.  ``out_dtype``
     defaults to the dtype of ``out`` (bf16 when neither is given).
 
-    ``deterministic`` must be ``False``.  With the 512-wide k tile a split tail
-    is added in place with unordered fp32 reductions (``plan["unordered_tail"]``
-    and ``plan["tail_splits"] > 1``), so ``dW`` is not bitwise reproducible run
-    to run; with the 256-wide k tile the deterministic program and its ordered
-    tail reduce run.  Under ``torch.use_deterministic_algorithms(True)`` this
-    function raises the non-determinism alert (module docstring).
+    ``deterministic`` must be ``False`` (``ValueError`` naming
+    ``prepare_grouped_det_gemm_wgrad`` otherwise).  With the 512-wide k tile a
+    split tail is added in place with unordered fp32 reductions
+    (``plan["unordered_tail"]`` and ``plan["tail_splits"] > 1``, the launch's
+    ``order_varying``), so ``dW`` is not bitwise reproducible run to run; with
+    the 256-wide k tile the deterministic program and its ordered tail reduce
+    run.  The preparation never alerts; under
+    ``torch.use_deterministic_algorithms(True)`` an order-varying launch raises
+    the non-determinism alert at each ``launch()`` (module docstring).
 
     ``accumulate=True`` adds instead: every launch computes
     ``out[e] <- out[e] + G[e].T @ X[e]`` into the caller's ``out`` (required, bf16
@@ -2186,5 +2217,4 @@ def prepare_grouped_gemm_wgrad(
     graph that captured it adds again.
     """
     _require_deterministic_false(deterministic, "prepare_grouped_gemm_wgrad")
-    _alert_not_deterministic("prepare_grouped_gemm_wgrad")
     return _prepare_wgrad(g, x, offs, out, out_dtype, num_groups, accumulate=accumulate)
