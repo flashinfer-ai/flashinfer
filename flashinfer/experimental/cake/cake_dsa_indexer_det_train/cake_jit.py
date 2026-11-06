@@ -358,11 +358,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "library": "cake_dsa_indexer_det_topk_629db978ba455dd1e92b",
         "arches": ["sm_103a"],
     },
-    "cake_dsa_indexer_det_topk_653b884c1cc0239fc248": {
-        "role": "scan",
-        "library": "cake_dsa_indexer_det_topk_653b884c1cc0239fc248",
-        "arches": ["sm_100a"],
-    },
     "cake_dsa_indexer_det_topk_69d2d7c68ccceb095540": {
         "role": "finalize_rank",
         "library": "cake_dsa_indexer_det_topk_69d2d7c68ccceb095540",
@@ -425,11 +420,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "library": "cake_dsa_indexer_det_topk_808a62a6315ae38034c6",
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_dsa_indexer_det_topk_81234f610e68daf19b8f": {
-        "role": "scan",
-        "library": "cake_dsa_indexer_det_topk_81234f610e68daf19b8f",
-        "arches": ["sm_100a"],
-    },
     "cake_dsa_indexer_det_topk_81ccb257c7338a468c3b": {
         "role": "scan",
         "library": "cake_dsa_indexer_det_topk_81ccb257c7338a468c3b",
@@ -460,6 +450,11 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "role": "scan",
         "library": "cake_dsa_indexer_det_topk_90c88df0fd82d4908fca",
         "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_dsa_indexer_det_topk_925f0237326fb52b0f94": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_det_topk_925f0237326fb52b0f94",
+        "arches": ["sm_100a"],
     },
     "cake_dsa_indexer_det_topk_93373e506f0537a0ed67": {
         "role": "scan",
@@ -582,6 +577,11 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "role": "finalize_rank",
         "library": "cake_dsa_indexer_det_topk_c02bcf153cf2ddae3b58",
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
+    },
+    "cake_dsa_indexer_det_topk_c2a7046ddd07c57f04fe": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_det_topk_c2a7046ddd07c57f04fe",
+        "arches": ["sm_100a"],
     },
     "cake_dsa_indexer_det_topk_c401fe6c01bd4f9f95c8": {
         "role": "scan",
@@ -724,8 +724,8 @@ PROGRAM_KEYS: dict[str, dict[str, str]] = {
         "scan:l6:u1:s0:f0": "cake_dsa_indexer_det_topk_401fb46fc3a69d791fdd",
         "scan:l6:u1:s0:f0:lsf": "cake_dsa_indexer_det_topk_f59c7d519b4a998a5cf9",
         "scan:l6:u1:s0:f1": "cake_dsa_indexer_det_topk_d121d20b4ff827b4b6d2",
-        "scan:l6:u1:s0:f1:fp8": "cake_dsa_indexer_det_topk_81234f610e68daf19b8f",
-        "scan:l6:u1:s0:f1:fp8:lsf": "cake_dsa_indexer_det_topk_653b884c1cc0239fc248",
+        "scan:l6:u1:s0:f1:fp8": "cake_dsa_indexer_det_topk_925f0237326fb52b0f94",
+        "scan:l6:u1:s0:f1:fp8:lsf": "cake_dsa_indexer_det_topk_c2a7046ddd07c57f04fe",
         "scan:l6:u1:s0:f1:lsf": "cake_dsa_indexer_det_topk_ec8a5e9e791c7fee7261",
         "scan:narrow:u1:s0:f0": "cake_dsa_indexer_det_topk_93373e506f0537a0ed67",
         "scan:narrow:u1:s0:f0:lsf": "cake_dsa_indexer_det_topk_59068059bffe0b4c085d",
