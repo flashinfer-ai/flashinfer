@@ -299,7 +299,12 @@ that writes the registry verifies the record against them before it is frozen.
   package needed 114 / 228 MiB (119537664 / 239075328 B); a reused buffer
   sized under the previous package for such a call must be re-sized (the
   runner rejects it with `workspace_buffer needs N bytes`), and
-  `cake_dsa_indexer_det_train_topk_workspace_size` follows the new plan automatically.  It is
+  `cake_dsa_indexer_det_train_topk_workspace_size` follows the new plan automatically.  On
+  `sm_100a`, BF16 calls of 5.5 to 6 wide rounds per CTA (`wide_rule[0]`; the
+  FP8 form decides by its `wide_wave_rule`) now take eight queries per unit as
+  well: 148 MiB (155197568 B) at the 16384-slot floor at `top_k = 2048` on 148
+  SMs, where the previous package needed 74 MiB (77602944 B), with identical
+  ids and score bits; re-size a buffer reused across such calls the same way.  It is
   the larger of the sampled default's plan and the plan with the sampled first
   threshold off (`sample_tiles_max=0`): on sm_107a the unpaired
   three-warpgroup preference can give an unsampled call six queries per unit

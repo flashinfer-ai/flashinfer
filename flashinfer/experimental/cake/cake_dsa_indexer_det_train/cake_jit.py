@@ -898,7 +898,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "cand_cap_ceiling": None,
         "cand_cap_ceiling_unsampled": None,
         "l6_rule": [256.0, 512],
-        "wide_rule": [6.0, 300.0],
+        "wide_rule": [5.5, 300.0],
         "wide_first_rule": None,
         "wide_wave_rule": None,
         "split_max": 16,
