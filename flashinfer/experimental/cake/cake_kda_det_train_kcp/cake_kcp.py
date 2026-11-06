@@ -205,7 +205,7 @@ from metadata only, allocates the outputs and the saved set fresh per call and
 keeps only transient buffers in the workspace.  The kernels are launched
 through a dispatch table (:class:`Backend`): the shipped backend runs the
 exported programs of :mod:`.cake_kcp_jit` and the local chunk stages through
-:mod:`..cake.cake_kda_det_train.cake_backend`; a test may install another backend (an FP64 emulation of
+:mod:`..cake_kda_det_train.cake_backend`; a test may install another backend (an FP64 emulation of
 the same ABI) for the orchestration tests.
 
 Semantics and contracts follow the KCP design note (its sections 3.5, 3.6, 6.4,
