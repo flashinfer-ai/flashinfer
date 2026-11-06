@@ -362,3 +362,63 @@ def gen_megamoe_sm120_mxfp4_module(fast_math: bool) -> JitSpec:
         extra_include_paths=[csrc, jit_env.FLASHINFER_CSRC_DIR],
         use_fast_math=fast_math,
     )
+
+
+def _sm120_nccl():
+    # NCCL 2.30.7 headers + library (the Device API GIN), located as for the moe_ep cake backend
+    from ..moe_ep.kernel_src.sm120.cake_mxfp4_megamoe.shim.cake_jit import (
+        GIN_BACKENDS,
+        nccl_installation,
+    )
+
+    include, library = nccl_installation()
+    return include, library, GIN_BACKENDS
+
+
+def gen_megamoe_sm120_gin_session_module() -> JitSpec:
+    """SM120 MegaMoE NIC transport session: NCCL window, LSA peer pointers, device communicator."""
+    include, library, _ = _sm120_nccl()
+    uri = "megamoe_sm120_gin_session"
+    directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
+    directory.mkdir(parents=True, exist_ok=True)
+    source = directory / "megamoe_sm120_gin_session.cu"
+    write_if_different(
+        source, (_csrc_dir() / "megamoe_sm120_gin_session.cu").read_text()
+    )
+    return gen_jit_spec(
+        uri,
+        [source],
+        extra_cuda_cflags=["-std=c++17", *sm120a_nvcc_flags],
+        extra_ldflags=[str(library), f"-Wl,-rpath,{library.parent}"],
+        extra_include_paths=[include, jit_env.FLASHINFER_CSRC_DIR],
+    )
+
+
+def gen_megamoe_sm120_mxfp4_gin_module(fast_math: bool, gin_type: int) -> JitSpec:
+    """SM120 MXFP4 fused MegaMoE with NIC (GIN) pairs, built for one NCCL GIN backend so that the
+    kernel inlines only that backend's put / signal code."""
+    include, library, backends = _sm120_nccl()
+    names = {t: (name, flags) for name, (t, flags) in backends.items()}
+    if gin_type not in names:
+        raise ValueError(f"unsupported NCCL GIN type {gin_type}")
+    backend, backend_flags = names[gin_type]
+    uri = f"megamoe_sm120_mxfp4_gin_{backend}" + ("_fm" if fast_math else "")
+    csrc = _csrc_dir()
+    directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
+    directory.mkdir(parents=True, exist_ok=True)
+    source = directory / "megamoe_sm120_mxfp4.cu"
+    write_if_different(source, (csrc / "megamoe_sm120_mxfp4.cu").read_text())
+    return gen_jit_spec(
+        uri,
+        [source],
+        extra_cuda_cflags=[
+            "-std=c++17",
+            "-DFLASHINFER_MEGAMOE_SM120_GIN=1",
+            "-D_CCCL_ATOMIC_UNSAFE_AUTOMATIC_STORAGE",
+            *backend_flags,
+            *sm120a_nvcc_flags,
+        ],
+        extra_ldflags=[str(library), f"-Wl,-rpath,{library.parent}"],
+        extra_include_paths=[csrc, jit_env.FLASHINFER_CSRC_DIR, include],
+        use_fast_math=fast_math,
+    )

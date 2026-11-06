@@ -70,7 +70,15 @@ def _megamoe(args, h, ih, experts, topk, generator, raw):
         transform_mxfp4_weights_for_mega_moe,
     )
 
-    buffer = MegaMoESymmBuffer(dist.group.WORLD, experts, args.capacity, topk, h, ih)
+    buffer = MegaMoESymmBuffer(
+        dist.group.WORLD,
+        experts,
+        args.capacity,
+        topk,
+        h,
+        ih,
+        transport=args.mm_transport,
+    )
     buffer.prewarm()
     w1, w2 = transform_mxfp4_weights_for_mega_moe(raw(2 * ih, h), raw(h, ih))
 
@@ -79,7 +87,9 @@ def _megamoe(args, h, ih, experts, topk, generator, raw):
         x = (x_bf16.float() / sf).to(torch.float8_e4m3fn)
         buffer.stage(x, sf.expand(m, h // 128).contiguous(), idx, weights)
         y = torch.empty(m, x_bf16.shape[1], device="cuda", dtype=torch.bfloat16)
-        return lambda: mxfp4_mega_moe(y, w1, w2, buffer)
+        return lambda: mxfp4_mega_moe(
+            y, w1, w2, buffer, sm120_tokens_per_item=args.tokens_per_item
+        )
 
     return setup, buffer.destroy
 
@@ -271,6 +281,19 @@ if __name__ == "__main__":
     parser.add_argument("--knobs", type=str, default="", help="cutedsl: JSON knobs")
     parser.add_argument(
         "--transport", type=str, default="all_lsa", help="cake: transport table"
+    )
+    parser.add_argument(
+        "--tokens-per-item",
+        type=int,
+        choices=[8, 16, 24, 32],
+        default=None,
+        help="megamoe: force the work-item width (default: by routed rows per local expert)",
+    )
+    parser.add_argument(
+        "--mm-transport",
+        choices=["p2p", "nic", "auto"],
+        default="p2p",
+        help="megamoe: MegaMoESymmBuffer transport",
     )
     args = parser.parse_args()
     if args.cold_l2 and args.repeats != 1:
