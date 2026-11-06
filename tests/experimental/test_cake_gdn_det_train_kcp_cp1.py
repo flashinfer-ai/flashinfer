@@ -402,6 +402,108 @@ def test_explicit_entries_match_autograd_and_keep_the_output_order(device) -> No
         )
 
 
+def test_backward_refuses_the_non_deterministic_forwards_saved_set_and_workspace(
+    device,
+) -> None:
+    """A saved set and a caller-held workspace of the non-deterministic package's forward (kernels, same tokens) are
+    refused by the deterministic package backward with ``ValueError`` naming the deterministic mode and the expected
+    type; the deterministic forward's own saved set and workspace still run."""
+    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_det_train_kcp.cake_kcp")
+    nd = pytest.importorskip(
+        "flashinfer.experimental.cake_gdn_train_kcp",
+        reason="the non-deterministic package is not part of this tree",
+    )
+    cu = _cu((100, 640, 77))
+    inputs = make_inputs(cu, 2, 6)
+    ops = [inputs[n].to(device) for n in OPERANDS]
+    dout = inputs["dout"].to(device)
+    nd_part = nd.partition_kcp(
+        torch.tensor(cu, dtype=torch.int64), 1, layout="contiguous"
+    )
+    nd_ws = nd.WorkspaceKcp()
+    _, nd_saved = nd.chunk_gdn_fwd_kcp(
+        *ops,
+        nd.build_context_kcp(nd_part, None, 0, device),
+        workspace=nd_ws,
+        deterministic=False,
+    )
+    assert type(nd_saved) is nd.SavedKcp
+    ctx = _local_context(cu, device)
+    ws = kcp.WorkspaceDetKcp()
+    _, saved = kcp.chunk_gdn_det_fwd_kcp(*ops, ctx, workspace=ws)
+    with pytest.raises(
+        ValueError, match="saved must be a SavedDetKcp of the deterministic mode"
+    ):
+        kcp.chunk_gdn_det_bwd_kcp(*ops, ctx, dout, saved=nd_saved, workspace=ws)
+    with pytest.raises(
+        ValueError,
+        match="workspace must be a WorkspaceDetKcp of the deterministic mode",
+    ):
+        kcp.chunk_gdn_det_bwd_kcp(*ops, ctx, dout, saved=saved, workspace=nd_ws)
+    grads = kcp.chunk_gdn_det_bwd_kcp(*ops, ctx, dout, saved=saved, workspace=ws)
+    assert all(bool(torch.isfinite(t).all()) for t in grads)
+
+
+@pytest.mark.parametrize("ckpt", [False, True], ids=["direct", "checkpoint"])
+def test_every_launch_binds_the_caller_stream_once(device, monkeypatch, ckpt) -> None:
+    """The kernels backend's launch path on a caller (side) stream: an autograd forward + backward, direct and under a
+    non-reentrant checkpoint, binds the caller's stream for tvm-ffi (``tvm_ffi.use_raw_stream`` on the stream's device
+    and raw handle) exactly once per launch, every binding is the caller stream, and the results are bitwise the same
+    call on the default stream."""
+    from torch.utils.checkpoint import checkpoint
+
+    be = pytest.importorskip(
+        "flashinfer.experimental.cake_gdn_det_train_kcp.cake_backend"
+    )
+    cu = _cu((100, 640, 77, 1000, 129))
+    inputs = make_inputs(cu, 2, 6)
+    ctx = _local_context(cu, device)
+    dout = inputs["dout"].to(device)
+
+    def run() -> dict:
+        leaves = [inputs[n].to(device).detach().requires_grad_(True) for n in OPERANDS]
+
+        def fn(*xs):
+            return gdn_api.chunk_gdn_det_kcp(*xs, ctx)
+
+        out = checkpoint(fn, *leaves, use_reentrant=False) if ckpt else fn(*leaves)
+        grads = torch.autograd.grad(out, leaves, dout)
+        res = {"out": out.detach()[0]}
+        res.update({n: gr.detach()[0] for n, gr in zip(GRAD_NAMES, grads, strict=True)})
+        return res
+
+    want = run()  # the default stream, the glue as shipped
+    torch.cuda.synchronize(device)
+    real_ffi, real_run = be.tvm_ffi, be.run_module
+    bound, launches = [], [0]
+
+    class _Counting:
+        def __getattr__(self, name):
+            return getattr(real_ffi, name)
+
+        @staticmethod
+        def use_raw_stream(dev, raw):
+            bound.append((dev.index, int(raw)))
+            return real_ffi.use_raw_stream(dev, raw)
+
+    def counting_run(*a, **kw):
+        launches[0] += 1
+        return real_run(*a, **kw)
+
+    monkeypatch.setattr(be, "tvm_ffi", _Counting())
+    monkeypatch.setattr(be, "run_module", counting_run)
+    side = torch.cuda.Stream(device)
+    side.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(side):
+        got = run()
+    torch.cuda.current_stream(device).wait_stream(side)
+    torch.cuda.synchronize(device)
+    assert launches[0] > 0 and len(bound) == launches[0], (len(bound), launches[0])
+    assert set(bound) == {(device.index, side.cuda_stream)}, set(bound)
+    for n in TENSORS:
+        assert torch.equal(got[n], want[n]), n
+
+
 # --------------------------------------------------------------------------- issue #7074 (1): sync-free context preparation (one GPU)
 ISSUE_CU = [
     0,

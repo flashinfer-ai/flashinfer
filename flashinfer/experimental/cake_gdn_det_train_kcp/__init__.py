@@ -23,21 +23,15 @@ limitations under the License.
 # ``chunk_gdn_det_kcp``, ``chunk_gdn_det_fwd_kcp``, ``chunk_gdn_det_bwd_kcp``,
 # ``packed_qkv_views_det_kcp`` and the byte queries; the partition / context plan, the host orchestration, the
 # options, the registry and the generated sources live here.  This package
-# imports itself, torch and torch.distributed only (never ``cake_kda_train``) and
-# reads no environment variable.  The pre-rename names (``chunk_gdn_kcp``,
-# ``KcpContext``, ...) remain importable as compatibility aliases of the same
-# objects; ``flashinfer.experimental.cake_gdn_train`` is the legacy import path.
+# imports itself, torch and torch.distributed only (never a KDA package) and
+# reads no environment variable.  It exports the names that carry ``det`` only:
+# the constants and backend controls without ``det`` (``SCALE``, ``LAST_CALL``,
+# ``set_backend``, ``make_options``, ...) stay in their modules (``cake_kcp``,
+# ``cake_options``).
 
 from .cake_kcp import (
-    KCP_SAVED_VERSION,
-    LAST_CALL,
-    PROGRAMS,
-    SCALE,
-    Backend,
     CallDetKcp,
     ChunkGDNDetFunctionKcp,
-    FakeBackend,
-    KernelBackend,
     PackedQKVSplitDetKcp,
     RecomputeHandleDetKcp,
     SavedDetKcp,
@@ -48,10 +42,7 @@ from .cake_kcp import (
     gdn_det_comm_bytes_kcp,
     gdn_det_saved_bytes_kcp,
     gdn_det_workspace_bytes_kcp,
-    get_backend,
-    graph_cache_clear,
     packed_qkv_views_det_kcp,
-    set_backend,
 )
 from .cake_kcp_plan import (
     ContextDetKcp,
@@ -60,20 +51,13 @@ from .cake_kcp_plan import (
     build_context_det_kcp,
     partition_det_kcp,
 )
-from .cake_options import OptionsDetKcp, make_options, validate_heads, validate_ring
+from .cake_options import OptionsDetKcp
 
 __all__ = [
-    "KCP_SAVED_VERSION",
-    "LAST_CALL",
-    "PROGRAMS",
-    "SCALE",
-    "Backend",
     "CallDetKcp",
     "ChunkGDNDetFunctionKcp",
     "ContextDetKcp",
-    "FakeBackend",
     "FragmentDetKcp",
-    "KernelBackend",
     "OptionsDetKcp",
     "PackedQKVSplitDetKcp",
     "PartitionDetKcp",
@@ -87,31 +71,6 @@ __all__ = [
     "gdn_det_comm_bytes_kcp",
     "gdn_det_saved_bytes_kcp",
     "gdn_det_workspace_bytes_kcp",
-    "get_backend",
-    "graph_cache_clear",
-    "make_options",
     "packed_qkv_views_det_kcp",
     "partition_det_kcp",
-    "set_backend",
-    "validate_heads",
-    "validate_ring",
 ]
-
-# Compatibility aliases: the pre-rename names bound to the same objects (not in ``__all__``).
-ChunkGDNKcpFunction = ChunkGDNDetFunctionKcp
-KcpCall = CallDetKcp
-KcpContext = ContextDetKcp
-KcpFragment = FragmentDetKcp
-KcpOptions = OptionsDetKcp
-KcpPartition = PartitionDetKcp
-KcpRecomputeHandle = RecomputeHandleDetKcp
-KcpSaved = SavedDetKcp
-KcpWorkspace = WorkspaceDetKcp
-build_kcp_context = build_context_det_kcp
-chunk_gdn_kcp = chunk_gdn_det_kcp
-chunk_gdn_kcp_bwd = chunk_gdn_det_bwd_kcp
-chunk_gdn_kcp_fwd = chunk_gdn_det_fwd_kcp
-gdn_kcp_comm_bytes = gdn_det_comm_bytes_kcp
-gdn_kcp_saved_bytes = gdn_det_saved_bytes_kcp
-gdn_kcp_workspace_bytes = gdn_det_workspace_bytes_kcp
-kcp_partition = partition_det_kcp

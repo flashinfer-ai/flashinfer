@@ -15,6 +15,7 @@ from flashinfer.gemm import (
 from flashinfer.gemm.cake_grouped_fp8_gemm import (
     BS_N128_ROUTE,
     BS_N128_RUN32_ROUTE,
+    BS_N256_LPF_ROUTE,
     BS_N256_ROUTE,
     BS_N128_S16_ROUTE,
     BS_N256_RUN32_ROUTE,
@@ -95,7 +96,9 @@ BLOCK_SCALED_ONLY_TESTS = frozenset(
         "test_block_scaled_launch_rebinds_token_operands_and_captures",
         "test_block_scaled_rejects_invalid_inputs",
         "test_block_scaled_route_rule_sm107a",
+        "test_block_scaled_lead_prefetch_rule",
         "test_block_scaled_block_n_routes_write_the_same_bits",
+        "test_block_scaled_lead_prefetch_writes_the_same_bits",
         "test_block_scaled_only_arch_routes_name_registered_programs",
         "test_block_scaled_only_arch_rejects_float32_scales",
     }
@@ -1224,6 +1227,39 @@ def test_block_scaled_route_rule_sm107a():
             assert sm107a == bs_route_for_shape(m, 512, 4096, **kwargs)
 
 
+def test_block_scaled_lead_prefetch_rule():
+    """SM107a single-run layouts of at most two K blocks whose bounded valid blocks are at most four fifths of
+    the M blocks take the lead-prefetch program; longer K, other architectures, run32 layouts and unknown group
+    counts do not."""
+    from flashinfer.gemm.cake_grouped_fp8_gemm import bs_lead_prefetch
+
+    # Qwen3.5-397B down (K 256), 1 / 32 tokens (512 experts): 128 / 384 routed rows bound, 509 / 511 M blocks.
+    for m in (65152, 65408):
+        assert bs_lead_prefetch(m, 256, alignment=128, num_groups=512, arch="sm_107a")
+        assert not bs_lead_prefetch(
+            m, 256, alignment=128, num_groups=512, arch="sm_103a"
+        )
+        assert not bs_lead_prefetch(
+            m, 256, alignment=128, num_groups=None, arch="sm_107a"
+        )
+        # K 512 (4 K blocks) and longer: never.
+        for k in (512, 2048, 4096):
+            assert not bs_lead_prefetch(
+                m, k, alignment=128, num_groups=512, arch="sm_107a"
+            )
+    # Qwen3.5-35B down (K 512 = 4 K blocks), 1 token (256 experts): 128 valid blocks bound over 255, never.
+    assert not bs_lead_prefetch(
+        32640, 512, alignment=128, num_groups=256, arch="sm_107a"
+    )
+    # 2048 tokens: 672 valid blocks bound over 668 M blocks; a32 layouts never.
+    assert not bs_lead_prefetch(
+        85504, 256, alignment=128, num_groups=512, arch="sm_107a"
+    )
+    assert not bs_lead_prefetch(
+        16000, 256, alignment=32, num_groups=512, arch="sm_107a"
+    )
+
+
 def test_block_scaled_route_rule():
     """BLOCK_N 256 unless a 256-column grid underfills the device or K is long with under three waves of M blocks (except single-run below 32 K blocks and two waves, and multi-run rows that fill a wave of 128-column tiles); run32 below 128-row alignment."""
     assert (
@@ -2347,6 +2383,59 @@ BLOCK_SCALED_BLOCK_N_CASES = [
 ]
 
 
+# (group_counts, N, K, sm_count): padding-heavy short-K layouts of 512 experts the
+# lead-prefetch rule routes (8 / 48 routed experts); sm_count 0 keeps the device's,
+# 4 makes each CTA walk over 224 tiles, past the program's lead table.
+BLOCK_SCALED_LEAD_PREFETCH_CASES = [
+    pytest.param([1] * 8 + [0] * 504, 512, 256, 0, id="g8_k256"),
+    pytest.param([0] * 464 + [5] * 48, 1024, 256, 0, id="g48_k256"),
+    pytest.param([1] * 8 + [0] * 504, 512, 256, 4, id="g8_k256_long_walk"),
+]
+
+
+@pytest.mark.parametrize("group_counts,n,k,sm_count", BLOCK_SCALED_LEAD_PREFETCH_CASES)
+def test_block_scaled_lead_prefetch_writes_the_same_bits(
+    group_counts, n, k, sm_count, monkeypatch
+):
+    """On SM107a the lead-prefetch program writes the BLOCK_N 256 single-run program's bits.
+
+    It reads each tile's leading ``m_indices`` entry from a shared table (the
+    first 224 tiles of a CTA) or from ``m_indices`` (later tiles) and computes
+    every output as the single-run program does, on the same grid.
+    """
+    device = torch.device("cuda")
+    if device_arch(torch.cuda.current_device()) != "sm_107a":
+        pytest.skip("checks the SM107a programs")
+    from flashinfer.gemm import cake_grouped_fp8_gemm as host
+
+    a, b, a_scale, b_scale, a_packed, b_packed, m_indices = _make_block_scaled_inputs(
+        group_counts, n, k, alignment=128, seed=4810 + k, device=device
+    )
+    m = int(m_indices.numel())
+    if sm_count:
+        monkeypatch.setattr(host, "device_sm_count", lambda *args: sm_count)
+    outs = {}
+    for route in (BS_N256_LPF_ROUTE, BS_N256_ROUTE):
+        if route == BS_N256_ROUTE:
+            monkeypatch.setattr(host, "bs_lead_prefetch", lambda *args, **kw: False)
+        out = torch.full((m, n), float("nan"), dtype=torch.bfloat16, device=device)
+        prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous(
+            a, b, a_packed, b_packed, m_indices, out=out, alignment=128
+        )
+        assert prepared.route == route
+        prepared.launch()
+        outs[route] = out
+    monkeypatch.undo()
+    torch.cuda.synchronize()
+    expected = _reference(a, b, a_scale, b_scale, m_indices)
+    _assert_block_scaled(outs[BS_N256_LPF_ROUTE], expected, m_indices)
+    routed = m_indices >= 0
+    assert torch.equal(
+        outs[BS_N256_LPF_ROUTE][routed].view(torch.int16),
+        outs[BS_N256_ROUTE][routed].view(torch.int16),
+    )
+
+
 @pytest.mark.parametrize("group_counts,n,k,alignment", BLOCK_SCALED_BLOCK_N_CASES)
 def test_block_scaled_block_n_routes_write_the_same_bits(
     group_counts, n, k, alignment, monkeypatch
@@ -2387,10 +2476,11 @@ def test_block_scaled_block_n_routes_write_the_same_bits(
 
 
 def test_block_scaled_only_arch_routes_name_registered_programs():
-    """On SM107a every block-scaled launch plan names one of its four registered programs."""
+    """On SM107a every block-scaled launch plan names one of its registered programs."""
     for route in (
         BS_N128_ROUTE,
         BS_N256_ROUTE,
+        BS_N256_LPF_ROUTE,
         BS_N128_RUN32_ROUTE,
         BS_N256_RUN32_ROUTE,
     ):
@@ -2417,6 +2507,20 @@ def test_block_scaled_only_arch_routes_name_registered_programs():
                             arch="sm_107a",
                         )
                         planned.add(route)
+    # Padding-heavy short-K single-run layouts (512 experts, 1 / 32 tokens) take the lead-prefetch program.
+    for m, n, k in ((65152, 4096, 256), (65408, 4096, 256)):
+        route, _ = launch_plan(
+            m,
+            n,
+            k,
+            sm_count=216,
+            scalar_output=False,
+            block_scaled=True,
+            alignment=128,
+            num_groups=512,
+            arch="sm_107a",
+        )
+        planned.add(route)
     assert planned == set(SM107A_ROUTES)
 
 

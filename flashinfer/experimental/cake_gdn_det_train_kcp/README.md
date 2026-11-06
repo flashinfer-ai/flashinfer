@@ -21,6 +21,28 @@ variable.
 > Status: scaffolding.  The numbers of this file (shapes, bytes, limits) are
 > the contract; measured figures are added with the kernels.
 
+## Mode and dispatch rules
+
+- This package and its facade `flashinfer.cake_gdn_det_train_kcp` are the
+  deterministic mode only.  Every public name carries `det`.  No entry takes a
+  `deterministic` keyword: passing one (any value) is a `TypeError`, like every
+  unknown keyword.
+- `torch.use_deterministic_algorithms(True)` changes nothing here: every launch
+  has a fixed order, so outputs and gradients are bitwise reproducible run to
+  run at the same topology.  No entry routes to another mode.
+- `chunk_gdn_det_bwd_kcp` (and the autograd backward) reads the deterministic
+  forward's `SavedDetKcp` and a caller-held `WorkspaceDetKcp` only.  It refuses
+  a saved set or a workspace of the non-deterministic mode with `ValueError`
+  before any launch.
+- The non-deterministic mode is the separate package
+  `flashinfer.experimental.cake_gdn_train_kcp`.  Its entries take
+  `deterministic=False` explicitly and refuse every other value.
+- This package's `__init__.py` exports the names that carry `det` only.  The
+  constants and backend controls (`SCALE`, `LAST_CALL`, `PROGRAMS`,
+  `KCP_SAVED_VERSION`, `set_backend`, `get_backend`, `graph_cache_clear`,
+  `make_options`, ...) are read from their modules (`cake_kcp`,
+  `cake_options`).
+
 ## Public entry points (`flashinfer/cake_gdn_det_train_kcp.py`)
 
 ```python
@@ -43,43 +65,15 @@ ws = gdn_det_workspace_bytes_kcp(ctx, H_qk=16, HV=48)                           
 ```
 
 These fourteen names are the whole public surface (the `__all__` of
-`flashinfer/cake_gdn_det_train_kcp.py`; this package's `__init__.py` exports
-them beside its backend controls).  The pre-rename names (see "Names") are
-compatibility aliases of the same objects, not additional surface.  Every
-switch is a keyword argument of the public call (`OptionsDetKcp` fields); no
-module-level global and no environment variable selects anything.
+`flashinfer/cake_gdn_det_train_kcp.py`).  Every switch is a keyword argument
+of the public call (`OptionsDetKcp` fields); no module-level global and no
+environment variable selects anything.
 
 ### Names
 
-The package was renamed to the deterministic KCP family name.  The old names
-remain importable as compatibility aliases of the same objects (`old is new`):
-`flashinfer.gdn_train` binds every legacy facade name, this package and its
-modules bind the legacy class and function names, and
-`flashinfer.experimental.cake_gdn_train` is the legacy package path (each of
-its modules is the module of this package).  New code uses the new names.
-
-| old name | new name |
-|---|---|
-| `flashinfer.gdn_train` | `flashinfer.cake_gdn_det_train_kcp` |
-| `flashinfer.experimental.cake_gdn_train` | `flashinfer.experimental.cake_gdn_det_train_kcp` |
-| `kcp_partition` | `partition_det_kcp` |
-| `build_kcp_context` | `build_context_det_kcp` |
-| `chunk_gdn_kcp` | `chunk_gdn_det_kcp` |
-| `chunk_gdn_kcp_fwd` | `chunk_gdn_det_fwd_kcp` |
-| `chunk_gdn_kcp_bwd` | `chunk_gdn_det_bwd_kcp` |
-| `gdn_kcp_workspace_bytes` | `gdn_det_workspace_bytes_kcp` |
-| `gdn_kcp_saved_bytes` | `gdn_det_saved_bytes_kcp` |
-| `gdn_kcp_comm_bytes` | `gdn_det_comm_bytes_kcp` |
-| `is_gdn_train_supported` | `is_gdn_det_train_kcp_supported` |
-| `KcpOptions` | `OptionsDetKcp` |
-| `KcpContext` | `ContextDetKcp` |
-| `KcpPartition` | `PartitionDetKcp` |
-| `KcpRecomputeHandle` | `RecomputeHandleDetKcp` |
-| `KcpSaved` | `SavedDetKcp` |
-| `KcpWorkspace` | `WorkspaceDetKcp` |
-| `KcpCall` | `CallDetKcp` |
-| `KcpFragment` | `FragmentDetKcp` |
-| `ChunkGDNKcpFunction` | `ChunkGDNDetFunctionKcp` |
+The pre-rename names were removed without aliases: `flashinfer.gdn_train`,
+`flashinfer.experimental.cake_gdn_train` and the old class and function names
+(`chunk_gdn_kcp`, `KcpContext`, `kcp_partition`, ...).  Use the names above.
 
 The generated libraries are named `cake_gdn_det_train_<20 hex>` for the
 per-chunk programs and `cake_gdn_det_train_<20 hex>_kcp` for the
@@ -124,6 +118,12 @@ context-parallel-only programs (`kcp_*`); the kernel symbol of a library is
   bitwise.  Gradient accumulation (`.backward()` twice) accumulates.
 * No cooperative launch anywhere in the package; every program is a plain
   stream-ordered launch.
+* Host launch path: each launch binds torch's current stream for tvm-ffi
+  through `tvm_ffi.use_raw_stream` with that stream's device and raw handle
+  (the stream `tvm_ffi.use_torch_stream()` binds, without building a
+  `torch.cuda.Stream` per launch).  The registry's answers (in-kernel L2 norm
+  and fused-output records) and the chunk table's token count are derived once
+  and reused.
 * On `sm_100a` and `sm_103a`, with a zigzag or zigzag-per-document partition
   of at most 8 ranks, the summaries' offset walk runs on a side stream beside
   the transfer walk (fork / join with CUDA events; the same launches,

@@ -711,25 +711,25 @@ def _program_id(name: str) -> str:
 # claims.  The claim holds where the det package selects that module; elsewhere
 # the single is compared only.
 DX_BITWISE_WITH = {
-    # sm_100a H512 row (0, 26] and (1280, inf); det module at T 16385
+    # sm_100a H512 row (1280, inf); det module at T 16385
     "cake_rmsnorm_train_d0bde38aa443d42a5f04": "cake_rmsnorm_det_train_ad1a5a3c5f88e3d10036",
-    # sm_100a H1536 row (0, 14] and (36864, inf); det module at T 65536
+    # sm_100a H1536 row (36864, 78784]; det module at T 65536
     "cake_rmsnorm_train_ae610afdf77ff6714a5b": "cake_rmsnorm_det_train_b457c4d134e44476dc6f",
-    # sm_100a H2048 column (0, 336]; det module at T 257
+    # sm_100a H2048 column (64, 336]; det module at T 257
     "cake_rmsnorm_train_64e6aa82bb2c6d4ea978": "cake_rmsnorm_det_train_caf6978ed0a17fbf65b9",
-    # sm_100a H2048 help row (7168, 11264], (13608, 45056] and (58880, inf); det
-    # module at T 16385 and 65536
+    # sm_100a H2048 help row (7168, 11264] and (13608, 65536]; det module at T 16385 and
+    # 65536
     "cake_rmsnorm_train_0fa4f255caf709d09f66": "cake_rmsnorm_det_train_ceeef043ac64f37fc529",
-    # sm_100a H4096 column (0, 1152]; det module at T 257
+    # sm_100a H4096 column (64, 1152]; det module at T 257
     "cake_rmsnorm_train_4822793ea0c954c11af6": "cake_rmsnorm_det_train_59270fb249dcba1ff679",
-    # sm_100a H4096 help row (4608, 36864] and (44032, inf); det module at T 16385
-    # and 65536
+    # sm_100a H4096 help row (4608, 36864] and (44032, 65536]; det module at T 16385 and
+    # 65536
     "cake_rmsnorm_train_15e157d2ee9080d206a9": "cake_rmsnorm_det_train_35a0b0ca6b2060313255",
-    # sm_100a H6144 column (0, 1152]; det module at T 257 (the help row differs)
+    # sm_100a H6144 column (64, 1152]; det module at T 257 (the help row differs)
     "cake_rmsnorm_train_44508df7dab2ab688f85": "cake_rmsnorm_det_train_5c804aed7ad14b99e1d0",
-    # sm_100a H6144 residual column (0, 1408]; the det residual program (every T)
+    # sm_100a H6144 residual column (64, 1408]; the det residual program (every T)
     "cake_rmsnorm_train_864e84f3d874f850c091": "cake_rmsnorm_det_train_0dcdc563be377247044e",
-    # sm_100a H6144 residual help row (1408, inf); the det residual program (every T)
+    # sm_100a H6144 residual help row (1408, 65536]; the det residual program (every T)
     "cake_rmsnorm_train_3fbfdd750cbeb47032b5": "cake_rmsnorm_det_train_0dcdc563be377247044e",
 }
 
@@ -868,7 +868,9 @@ def test_repeated_launches_against_fp64_and_det(
 # H5120: the backward runs the plain det pair up to H5120_PLAIN_EDGE, the
 # deterministic package's compensated det pair (compensated per-chunk dw sums)
 # from there up to H5120_ACCURACY_EDGE, and the FP64-accumulating single kernel
-# (on sm_103a and sm_107a its kblock form) above it; a single kernel also runs
+# (on sm_103a its kblock form up to T 393216 (BF16 weight) or T 196608 (FP32
+# weight) and a TwoSum single kernel above that, on sm_107a its kblock form)
+# above it; a single kernel also runs
 # from T 1 up to T 22 with FP32 weight on sm_100a and with both weight dtypes on
 # sm_103a, up to T 18 (BF16 weight) and 13 (FP32 weight) on sm_107a, and with BF16
 # weight up to T 896 on sm_100a.  The plain
@@ -899,8 +901,12 @@ def test_repeated_launches_against_fp64_and_det(
 # above T 49152 <= 0.807 (BF16 weight) and <= 0.719 (FP32 weight) at the sampled
 # T from 49153 to 131072 (212 SMs).
 H5120_PLAIN_EDGE = {"sm_100a": 6144, "sm_103a": 5120, "sm_107a": 19968}
+# FP32 weight: the plain det pair's top where a single kernel runs between it and
+# the compensated pair for dw accuracy (None: no plain det pair runs below the
+# compensated pair)
+H5120_PLAIN_TOP_F32 = {"sm_100a": None, "sm_107a": 4096}
 H5120_ACCURACY_EDGE = {
-    "sm_100a": {"bf16": 65536, "f32": 65536},
+    "sm_100a": {"bf16": 56256, "f32": 56256},
     "sm_103a": {"bf16": 61952, "f32": 61952},
     "sm_107a": {"bf16": 49152, "f32": 49152},
 }
@@ -940,8 +946,13 @@ def test_h5120_dw_accuracy_edge(side: str, w: str, family: str) -> None:
     FP64 ``rstd`` every form's stays within the budget."""
     _skip_unless_route(5120, w_dtype=w)
     plain_edge, edge = H5120_PLAIN_EDGE[_arch()], H5120_ACCURACY_EDGE[_arch()][w]
+    plain_top = (
+        H5120_PLAIN_TOP_F32.get(_arch(), plain_edge) if w == "f32" else plain_edge
+    )
+    if side == "plain" and plain_top is None:
+        pytest.skip(f"no plain det pair runs below the compensated pair ({w} weight)")
     rows = {
-        "plain": plain_edge,
+        "plain": plain_top,
         "compensated": plain_edge + 1,
         "edge": edge,
         "above": edge + 1,
@@ -953,12 +964,13 @@ def test_h5120_dw_accuracy_edge(side: str, w: str, family: str) -> None:
     )
     # the plain and the compensated det pair are different programs; the
     # compensated pair runs from one above the plain edge to the accuracy edge
-    plain = _window_records(5120, "bwd", False, w, plain_edge)
     compensated = _window_records(5120, "bwd", False, w, plain_edge + 1)
-    library = loader.MODULES[plain[0]]["library"]
-    assert library != loader.MODULES[compensated[0]]["library"], (
-        f"T={plain_edge} and T={plain_edge + 1} run the same program {library}"
-    )
+    if plain_top is not None:
+        plain = _window_records(5120, "bwd", False, w, plain_top)
+        library = loader.MODULES[plain[0]]["library"]
+        assert library != loader.MODULES[compensated[0]]["library"], (
+            f"T={plain_top} and T={plain_edge + 1} run the same program {library}"
+        )
     assert compensated == _window_records(5120, "bwd", False, w, edge)
     eps = EPS[5120]
     worst, worst_fp64_rstd = 0.0, 0.0

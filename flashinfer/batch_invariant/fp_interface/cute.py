@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """The only floating-point primitives a batch-invariant CuTe-DSL kernel may use.
 
-Each one lowers to an NVVM intrinsic with an explicit ``.rn`` rounding mode (``add.rn.f32``). Unlike
+Each one lowers to an NVVM intrinsic with an explicit ``.rn`` rounding mode (``add.rn.f32``, ``mul.rn.f32``). Unlike
 ``a + b`` on ``Float32`` (which lowers to ``arith`` ops that the NVPTX backend is free to contract into
 FMAs), these are opaque to the compiler: no contraction, no reassociation, no flush-to-zero. The GEMM's
 tensor-core step is not here: it is the kernel's opaque ``cute.gemm`` on the accumulator, below which
@@ -34,9 +34,20 @@ class CuteF32:
         return cute.math.add(a, b, rounding=RN)
 
     @staticmethod
+    def mul(a, b):
+        """``mul.rn.f32``."""
+        return cute.math.mul(a, b, rounding=RN)
+
+    @staticmethod
     def cvt_out(a, fmt_name: str):
         """``cvt.rn.<fmt>.f32`` (``arith.truncf``, RNE); the identity for ``f32``."""
         return a if fmt_name == "f32" else a.to(get_cutlass_dtype(fmt_name))
+
+    @staticmethod
+    def widen(a):
+        """A bf16 / f16 value as binary32 (``arith.extf``): exact, a bit movement rather than a rounding step; how a
+        narrower input (the bias) enters the fp32 chain."""
+        return a.to(Float32)
 
 
 # Name <-> CuTe dtype table shared by the kernels (kept out of the API modules so that compiled-kernel cache keys do not depend
@@ -44,6 +55,10 @@ class CuteF32:
 def get_cutlass_dtype(name: str):
     import cutlass
 
-    return {"bf16": cutlass.BFloat16, "f16": cutlass.Float16, "f32": cutlass.Float32}[
-        name
-    ]
+    return {
+        "bf16": cutlass.BFloat16,
+        "f16": cutlass.Float16,
+        "f32": cutlass.Float32,
+        "e4m3": cutlass.Float8E4M3FN,
+        "e5m2": cutlass.Float8E5M2,
+    }[name]

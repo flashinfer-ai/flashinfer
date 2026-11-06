@@ -23,6 +23,7 @@ limitations under the License.
 import pytest
 import torch
 
+from flashinfer import mxfp8_dequantize_host, mxfp8_quantize
 from flashinfer.utils import get_compute_capability, is_sm100a_supported
 from flashinfer.quantization.nvfp4_quantization_utils import NVFP44Over6Config
 from flashinfer.fused_moe import (
@@ -3780,8 +3781,8 @@ def test_fp4_block_scale_moe_fused_shared_experts_reject_routed_only_tensors():
             trtllm_fp4_block_scale_moe(**kwargs)
 
 
-def test_mxfp8_block_scale_moe_swiglu_oa_activation_params(cache_permute_indices):
-    """TRT-LLM Gen MxFp8 MoE applies raw fused FC1 SwiGLU OA params."""
+def _mxfp8_sparse_swiglu_case(cache_permute_indices):
+    """Sparse MxFp8 MoE whose output column 0 is the SwiGLU of input columns 0, 1."""
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability not in ((10, 0), (10, 3), (10, 7)):
         pytest.skip("These tests require TRTLLM FP8 MoE on SM100, SM103, or SM107.")
@@ -3917,6 +3918,13 @@ def test_mxfp8_block_scale_moe_swiglu_oa_activation_params(cache_permute_indices
         )
         return output_ref, output_actual
 
+    return hidden_states, per_expert, run_case
+
+
+def test_mxfp8_block_scale_moe_swiglu_oa_activation_params(cache_permute_indices):
+    """TRT-LLM Gen MxFp8 MoE applies raw fused FC1 SwiGLU OA params."""
+    _, per_expert, run_case = _mxfp8_sparse_swiglu_case(cache_permute_indices)
+
     output_default_ref, output_default = run_case()
     output_noop_ref, output_noop = run_case(
         gemm1_alpha=per_expert(1.0), gemm1_clamp_limit=per_expert(1.0e9)
@@ -3943,6 +3951,50 @@ def test_mxfp8_block_scale_moe_swiglu_oa_activation_params(cache_permute_indices
     torch.testing.assert_close(output_beta_oa, output_beta_oa_ref, atol=1e-1, rtol=1e-1)
     assert not torch.allclose(output_default, output_oa, atol=1e-2, rtol=1e-2)
     assert not torch.allclose(output_oa, output_beta_oa, atol=1e-2, rtol=1e-2)
+
+
+def megatron_glu_reference(gate, linear, clamp_value, linear_offset):
+    """Megatron-Core ``glu_inputs`` (``activation_func_clamp_value``, ``glu_linear_offset``) followed by SwiGLU."""
+    gate = torch.minimum(gate, torch.full_like(gate, clamp_value))
+    linear = torch.clamp(linear, min=-clamp_value, max=clamp_value) + linear_offset
+    return torch.nn.functional.silu(gate) * linear
+
+
+@pytest.mark.parametrize(
+    ("clamp_value", "linear_offset"),
+    [(2.0, 1.0), (7.0, 0.5)],
+    ids=["clamp2-offset1", "clamp7-offset0.5"],
+)
+def test_mxfp8_block_scale_moe_matches_megatron_glu_clamp_offset(
+    clamp_value, linear_offset, cache_permute_indices
+):
+    """``gemm1_clamp_limit=v, gemm1_beta=o, gemm1_alpha=1`` is Megatron's ``glu_inputs(v, o)``."""
+    hidden_states, per_expert, run_case = _mxfp8_sparse_swiglu_case(
+        cache_permute_indices
+    )
+    _, output = run_case(
+        gemm1_alpha=per_expert(1.0),
+        gemm1_beta=per_expert(linear_offset),
+        gemm1_clamp_limit=per_expert(clamp_value),
+    )
+
+    linear = hidden_states[:, 0].float()
+    gate = hidden_states[:, 1].float()
+    activation = megatron_glu_reference(gate, linear, clamp_value, linear_offset)
+    assert not torch.allclose(activation, torch.nn.functional.silu(gate) * linear)
+    expected = torch.zeros_like(output, dtype=torch.bfloat16)
+    expected[:, 0] = activation
+    # GEMM2 consumes the activation as MXFP8, so round the reference the same way.
+    expected_q, expected_sf = mxfp8_quantize(expected, False)
+    expected = mxfp8_dequantize_host(
+        expected_q.cpu().view(torch.uint8),
+        expected_sf.cpu().view(torch.uint8).reshape(-1),
+        False,
+    )
+
+    torch.testing.assert_close(
+        output.float().cpu(), expected.float(), atol=1e-2, rtol=1e-2
+    )
 
 
 def test_dsfp8_block_scale_moe_swiglu_oa_activation_params(cache_permute_indices):

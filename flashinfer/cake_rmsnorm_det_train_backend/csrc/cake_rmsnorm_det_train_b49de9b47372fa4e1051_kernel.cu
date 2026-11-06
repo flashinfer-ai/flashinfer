@@ -85,7 +85,7 @@ kernel_cake_rmsnorm_det_train_b49de9b47372fa4e1051(__nv_bfloat16* __restrict__ x
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* partials = reinterpret_cast<float*>(smem_raw + 0);
     const int partials_addr = smem + 0;
     float* w_sm = reinterpret_cast<float*>(smem_raw + 128);
