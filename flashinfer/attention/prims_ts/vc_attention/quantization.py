@@ -46,7 +46,7 @@ from __future__ import annotations
 import functools
 import math
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
 
 import torch
 
@@ -236,6 +236,7 @@ def vc_quantize(
     kmeans_iters: int = VC_KMEANS_ITERS,
     generator: torch.Generator | None = None,
     demean: bool = True,
+    enable_pdl: Optional[bool] = None,
 ) -> VCAttentionOperands:
     """Turn ``[B, S, H, D]`` bf16/fp16 K/V into VC-Attention-QK16 kernel
     operands with two CuTe DSL kernels (``prepare``).
@@ -248,6 +249,11 @@ def vc_quantize(
     permuted K rows, the V tile mean and residual amax; pass 2 writes the E4M3
     residuals and the packed bf16 mean operand. Requires CUDA bf16/fp16 inputs
     with head_dim 128.
+
+    ``enable_pdl`` launches the preparation kernels with programmatic
+    dependent launch (PDL); each kernel waits in-kernel for the preceding
+    grid before it reads its inputs. ``None`` (default) enables it on
+    devices that support PDL.
     """
     if k.dim() != 4 or k.shape != v.shape or k.dtype != v.dtype:
         raise ValueError("k and v must be [B, S, H, D] with matching shapes and dtype")
@@ -261,6 +267,7 @@ def vc_quantize(
         v.contiguous(),
         perm,
         demean=demean,
+        enable_pdl=enable_pdl,
     )
     return VCAttentionOperands(
         k=k_p,
@@ -283,9 +290,10 @@ def vc_quantize_fp8(
     kmeans_iters: int = VC_KMEANS_ITERS,
     generator: torch.Generator | None = None,
     demean: bool = True,
+    enable_pdl: Optional[bool] = None,
 ) -> VCAttentionOperands:
     """Turn ``[B, S, H, D]`` bf16/fp16 Q/K/V into VC-Attention-QK8 kernel
-    operands with four CuTe DSL kernels (``prepare``).
+    operands with three CuTe DSL kernels (``prepare``).
 
     Keys are centred by their per-(batch, head) channel mean over tokens
     (softmax-invariant), permuted with the values, rotated with Q by the
@@ -293,6 +301,11 @@ def vc_quantize_fp8(
     128-token tile; queries take one E4M3 scale per 128-token block. Values
     are prepared as in ``vc_quantize``. Requires CUDA bf16/fp16 inputs with
     head_dim 128.
+
+    ``enable_pdl`` launches the preparation kernels with programmatic
+    dependent launch (PDL); each kernel waits in-kernel for the preceding
+    grid before it reads its inputs. ``None`` (default) enables it on
+    devices that support PDL.
     """
     if (
         q.dim() != 4
@@ -311,7 +324,12 @@ def vc_quantize_fp8(
     if perm is None:
         perm = vc_token_permutation(v, iters=kmeans_iters, generator=generator)[0]
     q8, k8, v8, q_scale, k_scale, v_scale, mean, mu = vc_prepare_fp8(
-        q.contiguous(), k.contiguous(), v.contiguous(), perm, demean=demean
+        q.contiguous(),
+        k.contiguous(),
+        v.contiguous(),
+        perm,
+        demean=demean,
+        enable_pdl=enable_pdl,
     )
     return VCAttentionOperands(
         k=k8,
@@ -334,6 +352,7 @@ def vc_quantize_repair(
     *,
     budget: float,
     q: torch.Tensor | None = None,
+    enable_pdl: Optional[bool] = None,
 ) -> VCAttentionOperands:
     """Turn ``[B, S, H, D]`` K/V into V repair operands, of VC-Attention-QK8
     with ``q``.
@@ -343,6 +362,11 @@ def vc_quantize_repair(
     residual energy per batch and head gets a repair row, a copy of the key
     (under QK8 re-centred, rotated and quantized with the repair tile's own
     scale) with the E4M3 residual of the value.
+
+    ``enable_pdl`` launches the preparation kernels with programmatic
+    dependent launch (PDL); each kernel waits in-kernel for the preceding
+    grid before it reads its inputs. ``None`` (default) enables it on
+    devices that support PDL.
     """
     if k.dim() != 4 or k.shape != v.shape or k.dtype != v.dtype:
         raise ValueError("k and v must be [B, S, H, D] with matching shapes and dtype")
@@ -367,6 +391,7 @@ def vc_quantize_repair(
         v.contiguous(),
         repair_tiles=repair_tiles,
         repair_tokens=repair_tokens,
+        enable_pdl=enable_pdl,
     )
     return VCAttentionOperands(
         k=k_all,
@@ -429,6 +454,7 @@ class VCAttentionPreprocessor:
         *,
         q: torch.Tensor | None = None,
         denoise_step: tuple[int, int] | None = None,
+        enable_pdl: Optional[bool] = None,
     ) -> VCAttentionOperands:
         """Return the operands of one run for ``[B, S, H, D]`` bf16 K/V, and Q
         under VC-Attention-QK8.
@@ -436,6 +462,11 @@ class VCAttentionPreprocessor:
         ``denoise_step`` is the sampler's ``(step_index, num_steps)``. Kept
         out of torch.compile so the step index and the k-means refresh do not
         recompile the caller per step.
+
+        ``enable_pdl`` launches the preparation kernels with programmatic
+        dependent launch (PDL); each kernel waits in-kernel for the preceding
+        grid before it reads its inputs. ``None`` (default) enables it on
+        devices that support PDL.
         """
         key = (k.shape[0], k.shape[1], k.shape[2])
         entry = self._groupings.get(key)
@@ -484,8 +515,10 @@ class VCAttentionPreprocessor:
             perm = torch.arange(k.shape[1], device=k.device, dtype=torch.int32)
             perm = perm.view(1, 1, -1).expand(k.shape[0], k.shape[2], -1).contiguous()
         if q is not None:
-            return vc_quantize_fp8(q, k, v, perm=perm, demean=smooth)
-        return vc_quantize(k, v, perm=perm, demean=smooth)
+            return vc_quantize_fp8(
+                q, k, v, perm=perm, demean=smooth, enable_pdl=enable_pdl
+            )
+        return vc_quantize(k, v, perm=perm, demean=smooth, enable_pdl=enable_pdl)
 
 
 __all__ = [
