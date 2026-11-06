@@ -152,7 +152,7 @@ s[t, j] = k_scale[j] * sum_h w[t, h] * relu(sum_d q[t, h, d] * k[j, d])
 * **Dispatch**: the architecture's FP8 record is its BF16 `POLICY` record with
   the fields of `cake_jit.POLICY_FP8[arch]` replaced
   (`cake_policy.fp8_policy_record`); `POLICY_FP8` names every architecture's
-  FP8 `static_scan_kinds` itself.  On `sm_100a` it also sets
+  FP8 `static_scan_kinds` itself.  On `sm_100a` and `sm_103a` it also sets
   `wide_wave_rule`, so the FP8 form chooses its wide unit by waves of the
   grid (the unit geometry rule below).
   `cake_policy.select_fp8_program` runs the BF16 decision procedure under it
@@ -194,11 +194,11 @@ s[t, j] = k_scale[j] * sum_h w[t, h] * relu(sum_d q[t, h, d] * k[j, d])
   the narrow fallback.  An FP8 buffer sized for such a call under an
   earlier, smaller fallback (`narrow`, and for a `wide` decision also `l6`)
   is rejected (`workspace_buffer needs N bytes`) and must be sized again
-  with this function.  On `sm_100a` the FP8 wave rule (`wide_wave_rule`)
-  gives more calls the 8-query `wide` unit than the BF16 rule does; their FP8
-  bound grows with the queries per unit (8 rather than the `narrow` unit's 4
-  or the `l6` unit's 6), and a buffer sized for such a call under the
-  previous package is rejected the same way.
+  with this function.  On `sm_100a` and `sm_103a` the FP8 wave rule
+  (`wide_wave_rule`) gives more calls the 8-query `wide` unit than the BF16
+  rule does; their FP8 bound grows with the queries per unit (8 rather than
+  the `narrow` unit's 4 or the `l6` unit's 6), and a buffer sized for such a
+  call under the previous package is rejected the same way.
 * **Prepared runners** bind `k_scale` with `q` / `k`: new values written into
   it are read by the next run.
 
@@ -271,7 +271,7 @@ mean key tiles per work unit, `(Tkv - T / (2 ratio)) / S / 128`.
 
 | decision | rule (record fields) |
 |---|---|
-| unit geometry | where the record sets `wide_wave_rule` (the FP8 record of `sm_100a`), it replaces `wide_rule` and `wide_first_rule`: `block_q_wide` queries per unit when the unit the `l6_rule` leaves (`block_q_l6`, else `block_q_narrow`) needs at least `wide_wave_rule[1]` times the wide unit's waves of the grid (`ceil(ceil(T / block_q) / grid)`) against `block_q_l6`, from `wide_wave_rule[2]` mean unit tiles on, or `wide_wave_rule[0]` times against `block_q_narrow`; else that unit.  Without it: `block_q_wide` queries per unit first where the record sets `wide_first_rule`, the call is wide-eligible (at least `wide_rule[0]` wide rounds per CTA and `rounds x mean tiles >= wide_rule[1]`) and the mean unit tiles reach `wide_first_rule[0]`; else `block_q_l6` (three math warpgroups) when the mean unit tiles are at most `l6_rule[0]` and `top_k >= l6_rule[1]`; else `block_q_wide` when wide-eligible; else `block_q_narrow` |
+| unit geometry | where the record sets `wide_wave_rule` (the FP8 records of `sm_100a` and `sm_103a`), it replaces `wide_rule` and `wide_first_rule`: `block_q_wide` queries per unit when the unit the `l6_rule` leaves (`block_q_l6`, else `block_q_narrow`) needs at least `wide_wave_rule[1]` times the wide unit's waves of the grid (`ceil(ceil(T / block_q) / grid)`) against `block_q_l6`, from `wide_wave_rule[2]` mean unit tiles on (an eleven-element rule, `[1.7, 1.15, 64.0, 2048, 1.1, 112.0, 3.5, 14, 1.26, 40.0, 9.0]` on `sm_103a`, raises that count by `wide_wave_rule[6]` per wide wave below `wide_wave_rule[7]` wide waves, to at least `wide_wave_rule[5]` on a packed call and to at least `wide_wave_rule[9] / (W - 1)` while the ratio `W` of the `block_q_l6` waves to the wide unit's stays below `wide_wave_rule[8]` (on a packed call then also to at least `wide_wave_rule[10] / (W - 1) ** 2`), and multiplies it by `(top_k / wide_wave_rule[3]) ** wide_wave_rule[4]` above `top_k = wide_wave_rule[3]`), or `wide_wave_rule[0]` times against `block_q_narrow`; else that unit.  Without it: `block_q_wide` queries per unit first where the record sets `wide_first_rule`, the call is wide-eligible (at least `wide_rule[0]` wide rounds per CTA and `rounds x mean tiles >= wide_rule[1]`) and the mean unit tiles reach `wide_first_rule[0]`; else `block_q_l6` (three math warpgroups) when the mean unit tiles are at most `l6_rule[0]` and `top_k >= l6_rule[1]`; else `block_q_wide` when wide-eligible; else `block_q_narrow` |
 | key-range split | `n_split = clamp(grid // units, 1, min(mean tiles // split_min_range_tiles, split_max))`; on architectures with `split_wave_rule` a two-way split when the units are long and the unsplit call would idle `split_wave_rule[1]` of the CTAs in its ragged last round (where the record sets `split_wave_scope` (sm_107a), only for its unit geometries on calls of at most its segment count, and with its third item on sampled calls only); only for a unit geometry of `split_units` (the units whose split program the architecture registers): any other unit runs unsplit |
 | CTA pair | the two-CTA multicast program when the mean unit tiles lie in `pair_rule[0..1]`, `top_k >= pair_rule[2]`, the call is not split (grid made even) and the unit geometry is one of `pair_units` (the units whose pair program the architecture registers) |
 | unpaired wide unit | where the record sets `wide_pair_snake_only` (sm_107a), a sampled call keeps the CTA pair of the wide unit only where the pair program walks the snake order; elsewhere it runs the unpaired wide program when that program is registered |
