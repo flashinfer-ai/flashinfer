@@ -110,6 +110,7 @@ _COMMON = dict(
     cand_cap_ceiling=None,
     cand_cap_ceiling_unsampled=None,
     wide_first_rule=None,
+    wide_wave_rule=None,
     split_max=32,
     split_min_range_tiles=64,
     split_units=["l6", "narrow", "wide"],
@@ -739,6 +740,13 @@ def test_policy_record_round_trip_and_validation():
         dict(wide_first_rule=[512.0, 1]),
         dict(wide_first_rule=[-1.0]),
         dict(wide_first_rule=[True]),
+        # the wave rule: [min narrow / wide wave ratio, min l6 / wide wave ratio, min mean unit tiles], each >= 0, or None
+        dict(wide_wave_rule=1.6),
+        dict(wide_wave_rule=[]),
+        dict(wide_wave_rule=[1.6, 1.3]),
+        dict(wide_wave_rule=[1.6, 1.3, 80.0, 1]),
+        dict(wide_wave_rule=[-1.0, 1.3, 80.0]),
+        dict(wide_wave_rule=[1.6, 1.3, True]),
         # the units that split: an ascending list of unit geometries (may be empty)
         dict(split_units="l6"),
         dict(split_units=["split_l6"]),
@@ -828,6 +836,10 @@ def test_policy_record_round_trip_and_validation():
     assert first.wide_first_rule == [192.0]
     assert first.record()["wide_first_rule"] == [192.0]
     assert DispatchPolicy.from_record(first.record()) == first
+    waved = DispatchPolicy.from_record(dict(record, wide_wave_rule=[1.6, 1.3, 80.0]))
+    assert waved.wide_wave_rule == [1.6, 1.3, 80.0]
+    assert waved.record()["wide_wave_rule"] == [1.6, 1.3, 80.0]
+    assert DispatchPolicy.from_record(waved.record()) == waved
     scoped = DispatchPolicy.from_record(
         dict(record, split_wave_scope=(("narrow", "wide"), 2, False))
     )
@@ -1476,6 +1488,34 @@ def test_wide_first_precedence_and_pair_units_guard():
         dict(hostile.record(), pair_units=["l6", "wide"])
     )
     assert _select(hostile_open, 131072, 131072).kind == "pair_wide"
+
+
+def test_wide_wave_rule_compares_waves_of_the_persistent_grid():
+    """``wide_wave_rule`` replaces ``wide_rule`` and ``wide_first_rule``: the wide unit takes a call when the unit the
+    other rules leave needs at least the record's ratio of the wide unit's waves of the grid (``ceil(units / grid)``),
+    against the three-warpgroup unit also from a mean unit tile count on.  The fixture takes ``NARROW_PAIR_POLICY``
+    (``l6_rule`` to 256 tiles at top_k >= 512) with the rule [1.7, 1.3, 84] on a 148-CTA grid."""
+    waved = DispatchPolicy.from_record(
+        dict(NARROW_PAIR_POLICY.record(), wide_wave_rule=[1.7, 1.3, 84.0])
+    )
+
+    def unit(T, Tkv, K=2048):
+        return waved.unit_block_q_for(T, Tkv, 1, 1, 148, K)
+
+    # 4096 queries over 65536 keys (496 mean tiles): narrow 1024 units = 7 waves, wide 512 = 4 waves, 7 >= 6.8 -> wide
+    assert unit(4096, 65536) == 8
+    # 2560 queries over 49152 keys: narrow 640 units = 5 waves, wide 320 = 3 waves, 5 < 5.1 -> narrow
+    assert unit(2560, 49152) == 4
+    # 16384 queries over 20480 keys (96 mean tiles, three-warpgroup): l6 2731 units = 19 waves, wide 2048 = 14
+    # waves, 19 >= 18.2 from the 84-tile floor on -> wide; at 18432 keys (80 mean tiles) below the floor -> l6
+    assert unit(16384, 20480) == 8
+    assert unit(16384, 18432) == 6
+    # 8k causal document (32 mean tiles): l6 10 waves against wide 7, 10 >= 9.1 but below the floor -> l6
+    assert unit(8192, 8192) == 6
+    # top_k 256 has no three-warpgroup unit: 712 queries over 4096 keys compare narrow 2 waves with wide 1 -> wide
+    assert unit(712, 4096, K=256) == 8
+    # the record without the field keeps the rounds-and-work rule: 512 / 148 = 3.5 rounds < 6 -> narrow
+    assert NARROW_PAIR_POLICY.unit_block_q_for(4096, 65536, 1, 1, 148, 2048) == 4
 
 
 def test_sample_shift_rule_precedence():
