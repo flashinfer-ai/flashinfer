@@ -151,6 +151,9 @@ the same bits.  Beside a kernel on another stream that holds ``k`` of the ``N``
 SMs, a persistent forward takes at most ``N / (N - k)`` times its time alone,
 plus one CTA's share of the row blocks, plus 0.02, and the short forward ends
 no later than the plain forward (within 2 % or 1.5 microseconds).
+On SM107 with fewer than 205 SMs, as on a small MIG instance, the short
+forward's grid at 59 rows per SM is more than one wave, and this bound of the
+short forward is not shown there.
 
 .. rubric:: Mode and dispatch rules
 

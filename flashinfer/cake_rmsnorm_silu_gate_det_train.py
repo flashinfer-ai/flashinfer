@@ -42,7 +42,10 @@ another stream that holds ``k`` of the ``N`` SMs, a persistent forward takes
 at most ``N / (N - k)`` times its time alone, plus the share of one CTA's row
 blocks in the call, plus 0.02 (a CTA whose slot that kernel holds walks all of
 its blocks once it starts); the short forward ends no later than the plain
-forward beside the same kernel, within 2 % or 1.5 microseconds.
+forward beside the same kernel, within 2 % or 1.5 microseconds.  On SM107 with
+fewer than 205 SMs, as on a small MIG instance, the short forward's grid at
+59 rows per SM is more than one wave, and this bound of the short forward is
+not shown there.
 
 Mode and dispatch rules (the same in
 :mod:`flashinfer.cake_rmsnorm_silu_gate_det_train` and
