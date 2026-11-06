@@ -7,6 +7,7 @@ import csv
 import hashlib
 import importlib.util
 import io
+import re
 import sys
 import zipfile
 from pathlib import Path
@@ -193,6 +194,7 @@ def test_entry_rules(build_backend):
     assert not dropped("flashinfer/data/csrc/norm/k.cu", True)
     assert not dropped("flashinfer/cake_gdp_backend/csrc/k.cu", True)
     # the Cake training backends behind stable facades (#8928) keep their sources
+    # unless they are rows of _RELEASE_WHEEL_DROPPED_CAKE_BACKENDS
     assert not dropped(
         "flashinfer/experimental/cake/cake_causal_conv1d_det_train/csrc/k.cu", True
     )
@@ -202,3 +204,33 @@ def test_entry_rules(build_backend):
     assert not dropped(
         "flashinfer/experimental/cake/cake_kda_nondet_train/csrc/k.cu", True
     )
+
+
+def test_dropped_cake_backends(build_backend, monkeypatch):
+    dropped = build_backend._wheel_entry_dropped
+    monkeypatch.setattr(
+        build_backend,
+        "_RELEASE_WHEEL_DROPPED_CAKE_BACKENDS",
+        frozenset({"cake_probe_det_train"}),
+    )
+    root = "flashinfer/experimental/cake/cake_probe_det_train"
+    assert dropped(f"{root}/csrc/k.cu", True)
+    assert dropped(f"{root}/csrc/a/k.cuh", True)
+    assert not dropped(f"{root}/csrc/k.cu", False)
+    for kept in ("build.json", "cake_jit.py", "__init__.py", "kcp/csrc.py"):
+        assert not dropped(f"{root}/{kept}", True)
+    # rows match whole module names, not prefixes
+    assert not dropped(
+        "flashinfer/experimental/cake/cake_probe_det_train_kcp/csrc/k.cu", True
+    )
+    assert not dropped(
+        "flashinfer/experimental/cake/cake_causal_conv1d_det_train/csrc/k.cu", True
+    )
+
+
+def test_dropped_cake_backend_rows_are_module_names(build_backend):
+    # Rule 1 of #8928: the backend of flashinfer.<module> sits at
+    # flashinfer/experimental/cake/<module>/.
+    pattern = re.compile(r"^cake_[a-z0-9_]+_(det|nondet)_train(_kcp)?$")
+    for row in build_backend._RELEASE_WHEEL_DROPPED_CAKE_BACKENDS:
+        assert pattern.fullmatch(row), row
