@@ -4,7 +4,7 @@ handling of a mismatched flashinfer-cubin package — issue #5886.
 env.py imports CompilationContext (CUDA deps), so we load it in isolation
 with lightweight stubs to keep tests runnable without a GPU.
 
-    python -m pytest tests/cpu/test_env.py -v --noconftest
+    python -m pytest tests/infra/cpu/test_env.py -v --noconftest
 """
 
 import pytest
@@ -14,7 +14,7 @@ import pathlib
 import sys
 import types
 
-_REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 
 
 def _load_env_module():

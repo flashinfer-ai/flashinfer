@@ -6,7 +6,7 @@ import tarfile
 from pathlib import Path
 
 
-sys.path.insert(0, str(Path(__file__).parents[2]))
+sys.path.insert(0, str(Path(__file__).parents[3]))
 
 from scripts.collect_ninja_diagnostics import (
     collect,

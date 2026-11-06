@@ -143,9 +143,7 @@ docker/                                          @righthandabacus @dierksen @bkr
 build_backend.py                                 @righthandabacus @dierksen @bkryu @yongwww @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @Anerudhan
 pytest.ini                                       @righthandabacus @dierksen @bkryu @yongwww @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @Anerudhan
 tests/infra/                                     @righthandabacus @dierksen @bkryu @yongwww @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @Anerudhan
-tests/test_helpers/                              @righthandabacus @dierksen @bkryu @yongwww @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @Anerudhan
 flashinfer-jit-cache-provider/                   @righthandabacus @dierksen @bkryu @yongwww @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @Anerudhan
 flashinfer-cubin/                                @righthandabacus @dierksen @bkryu @yongwww @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @Anerudhan
-tests/cpu/                                       @righthandabacus @dierksen @bkryu @yongwww @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @Anerudhan
 tests/test_artifacts.py                          @righthandabacus @dierksen @bkryu @yongwww @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @Anerudhan
 docs/installation.rst                            @righthandabacus @dierksen @bkryu @yongwww @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @Anerudhan

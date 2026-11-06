@@ -8,7 +8,7 @@ import pytest
 
 
 VALIDATOR_PATH = (
-    Path(__file__).resolve().parents[2] / "scripts" / "validate_nightly_packages.py"
+    Path(__file__).resolve().parents[3] / "scripts" / "validate_nightly_packages.py"
 )
 
 

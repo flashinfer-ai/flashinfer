@@ -7,7 +7,7 @@ import subprocess
 from pathlib import Path
 
 
-REPO_ROOT = Path(__file__).parents[2]
+REPO_ROOT = Path(__file__).parents[3]
 ARTIFACT_SCRIPT = REPO_ROOT / "scripts" / "build_flashinfer_jit_cache_artifact.sh"
 
 

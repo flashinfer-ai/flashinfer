@@ -26,7 +26,7 @@ import pytest
 import torch
 from torch.utils.checkpoint import checkpoint
 
-from tests.test_helpers import (
+from tests.experimental.test_helpers import (
     cake_dsa_sparse_attention_nondet_train_reference as nope_ref,
 )
 from tests.experimental.test_helpers.cake_dsa_sparse_attention_nondet_train_reference import (

@@ -10,7 +10,7 @@ import pytest
 
 @pytest.fixture
 def wheel_builder(monkeypatch):
-    path = Path(__file__).parents[2] / "scripts" / "build_jit_cache_wheel.py"
+    path = Path(__file__).parents[3] / "scripts" / "build_jit_cache_wheel.py"
     spec = importlib.util.spec_from_file_location("build_jit_cache_wheel", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

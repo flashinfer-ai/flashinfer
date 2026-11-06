@@ -10,7 +10,7 @@ import build_utils
 import pytest
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
 CUDA_TILE_COMPILE_REQUIREMENTS = [
     "nvidia-cuda-nvcc<13.4,>=13.2",

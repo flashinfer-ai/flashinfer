@@ -64,7 +64,7 @@ from flashinfer.tllm_enums import (
     DEFAULT_SWIGLU_BETA,
     DEFAULT_SWIGLU_LIMIT,
 )
-from tests.test_helpers.utils_fp4 import (
+from tests.quantization.test_helpers.utils_fp4 import (
     ref_fp4_quant,
     ref_fp4_quant_te,
     pack_fp4_values,

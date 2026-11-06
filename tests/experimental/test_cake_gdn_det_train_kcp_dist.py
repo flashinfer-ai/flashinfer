@@ -66,7 +66,10 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from tests.test_helpers.kcp_collective_shims import CollectiveCounter, RecomputePhase
+from tests.experimental.test_helpers.kcp_collective_shims import (
+    CollectiveCounter,
+    RecomputePhase,
+)
 
 PACKAGE = "flashinfer.experimental.cake_gdn_det_train_kcp"
 

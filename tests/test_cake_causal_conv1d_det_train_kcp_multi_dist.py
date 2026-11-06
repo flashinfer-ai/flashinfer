@@ -53,7 +53,10 @@ from tests.test_cake_causal_conv1d_det_train_kcp_dist import (
     _requested,
     _supported,
 )
-from tests.test_helpers.kcp_collective_shims import CollectiveCounter, RecomputePhase
+from tests.experimental.test_helpers.kcp_collective_shims import (
+    CollectiveCounter,
+    RecomputePhase,
+)
 
 WIDTH = 4
 

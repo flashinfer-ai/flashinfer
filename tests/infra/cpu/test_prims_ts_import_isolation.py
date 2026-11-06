@@ -22,7 +22,7 @@ import sys
 import pytest
 
 
-_REPO_ROOT = Path(__file__).parents[2]
+_REPO_ROOT = Path(__file__).parents[3]
 
 
 def _run_isolated(code: str) -> None:

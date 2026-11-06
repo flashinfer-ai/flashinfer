@@ -62,7 +62,7 @@ from tests.moe.test_helpers import cute_dsl_moe_swap_ab_reference as swap_ab_ref
 from tests.moe.test_helpers.cute_dsl_moe_swap_ab_reference import (
     assert_cute_dsl_moe_bits,
 )
-from tests.test_helpers.w4a16_reference import (
+from tests.moe_ep.test_helpers.w4a16_reference import (
     assert_w4a16_bits,
     split_w4a16_reference_from_tensors,
 )

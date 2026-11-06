@@ -18,7 +18,7 @@ import math
 
 import pytest
 import torch
-from tests.test_helpers.test_helpers import clear_cuda_cache
+from tests.attention.test_helpers.test_helpers import clear_cuda_cache
 from tests.infra.test_helpers.parametrize import (
     parametrize_product,
     pairwise_product_cases,

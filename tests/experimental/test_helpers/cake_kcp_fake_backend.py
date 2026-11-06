@@ -32,7 +32,7 @@ crossing-out fragment and no cancellation; ``_transfer_matches_basis_transfer`` 
 basis-vector ``transfer`` helper on a short interval.
 
 Inputs come from the reference harness (``cake_kda_kcp_shapes`` rows, ``cake_kda_kcp_inputs`` operands) and the
-FP64 reference ``cake_kda_kcp_reference``, all in ``tests/test_helpers``.
+FP64 reference ``cake_kda_kcp_reference``, all in ``tests/experimental/test_helpers``.
 """
 
 from __future__ import annotations

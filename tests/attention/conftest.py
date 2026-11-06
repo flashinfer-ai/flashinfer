@@ -275,7 +275,7 @@ def _batch_prefill_specs(items):
             sp("fa3", H, H, H, 64, 64, 0, False, False, False)
         # Fixture grid, included here so it gets AOT-staged.
         try:
-            from tests.test_helpers.jit_utils import gen_prefill_attention_modules
+            from tests.jit.test_helpers.jit_utils import gen_prefill_attention_modules
 
             for spec in gen_prefill_attention_modules(
                 [torch.float16],

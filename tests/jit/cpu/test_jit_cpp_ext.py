@@ -12,7 +12,7 @@ from flashinfer.utils import (
     determine_attention_backend,
     is_fa3_prefill_head_dim_supported,
 )
-from tests.test_helpers import jit_utils
+from tests.jit.test_helpers import jit_utils
 
 
 @pytest.mark.cpu_only
