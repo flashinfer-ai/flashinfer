@@ -17,6 +17,7 @@
 import inspect
 from dataclasses import dataclass
 from types import SimpleNamespace
+from typing import Optional
 
 import cutlass
 import cutlass.pipeline as pipeline
@@ -122,6 +123,7 @@ class _DummyResource(MemoryResource):
     desc_a_s2t_base: TaskLocalVariable = TaskLocalVariable.uninitialized()
     smem_sfa_stage_ptr: TaskLocalVariable = TaskLocalVariable.uninitialized()
     desc_b_s2t_base: TaskLocalVariable = TaskLocalVariable.uninitialized()
+    smem_sfb_stage_ptr: TaskLocalVariable = TaskLocalVariable.uninitialized()
     sfa_stage_col_offset: TaskLocalVariable = TaskLocalVariable.uninitialized()
     sfb_stage_col_offset: TaskLocalVariable = TaskLocalVariable.uninitialized()
     tmem_cast_a_addr: TaskLocalVariable = TaskLocalVariable.uninitialized()
@@ -165,6 +167,7 @@ class _DummyResource(MemoryResource):
             "desc_a_s2t_base",
             "smem_sfa_stage_ptr",
             "desc_b_s2t_base",
+            "smem_sfb_stage_ptr",
         ):
             setattr(
                 self,
@@ -224,6 +227,10 @@ class _DummyResource(MemoryResource):
 
     @producer_work(work_attrs=WorkAttr.AUXILIARY)
     def drain_tail(self, stage_info, *, prefetch_idx: cutlass.Constexpr[int]):
+        pass
+
+    @producer_work(work_attrs=WorkAttr.AUXILIARY)
+    def drain_store_tail(self, stage_info):
         pass
 
     @producer_work(work_attrs=WorkAttr.AUXILIARY)
@@ -330,7 +337,7 @@ class _DummyResource(MemoryResource):
     def build_sfa_s2t_desc(self, stage_info):
         pass
 
-    @consumer_work_decorator(returns=("desc_b_s2t_base",))
+    @consumer_work_decorator(returns=("desc_b_s2t_base", "smem_sfb_stage_ptr"))
     def build_sfb_s2t_desc(self, stage_info):
         pass
 
@@ -357,12 +364,18 @@ class _DummyResource(MemoryResource):
         pass
 
     @producer_work()
-    def copy_sfb(self, stage_info, *, desc_b_s2t_base):
+    def copy_sfb(self, stage_info, *, desc_b_s2t_base, smem_sfb_stage_ptr):
         pass
 
     @producer_work()
     def copy_sfab(
-        self, stage_info, *, desc_a_s2t_base, smem_sfa_stage_ptr, desc_b_s2t_base
+        self,
+        stage_info,
+        *,
+        desc_a_s2t_base,
+        smem_sfa_stage_ptr,
+        desc_b_s2t_base,
+        smem_sfb_stage_ptr,
     ):
         pass
 
@@ -398,6 +411,13 @@ class _DummyResource(MemoryResource):
         returns=("t2r_rmem", "t2r_rmem_1", "t2r_output_call_idx"),
         work_attrs=WorkAttr.AUXILIARY,
     )
+    def preload_non_swap_overlap(self, stage_info):
+        pass
+
+    @consumer_work_decorator(
+        returns=("t2r_rmem", "t2r_rmem_1", "t2r_output_call_idx"),
+        work_attrs=WorkAttr.AUXILIARY,
+    )
     def load_overlap_subtile(self, stage_info, *, subtile_idx: cutlass.Constexpr[int]):
         pass
 
@@ -411,6 +431,19 @@ class _DummyResource(MemoryResource):
         smem_a_stage_ptr,
         desc_b_mma_base,
         smem_b_stage_ptr,
+        first_k_tile: cutlass.Constexpr[Optional[bool]] = None,
+    ):
+        pass
+
+    @producer_work(work_attrs=WorkAttr.AUXILIARY)
+    def copy_fused_sf(
+        self,
+        stage_info,
+        *,
+        desc_a_s2t_base,
+        smem_sfa_stage_ptr,
+        desc_b_s2t_base,
+        smem_sfb_stage_ptr,
     ):
         pass
 
@@ -423,9 +456,7 @@ class _DummyResource(MemoryResource):
         smem_a_stage_ptr,
         desc_b_mma_base,
         smem_b_stage_ptr,
-        desc_a_s2t_base,
-        smem_sfa_stage_ptr,
-        desc_b_s2t_base,
+        first_k_tile: cutlass.Constexpr[Optional[bool]] = None,
     ):
         pass
 
@@ -440,12 +471,19 @@ class _DummyResource(MemoryResource):
         smem_b_stage_ptr,
         sfa_stage_col_offset,
         sfb_stage_col_offset,
+        first_k_tile: cutlass.Constexpr[Optional[bool]] = None,
     ):
         pass
 
     @producer_work()
     def mma_cast_a(
-        self, stage_info, *, desc_b_mma_base, smem_b_stage_ptr, tmem_cast_a_addr
+        self,
+        stage_info,
+        *,
+        desc_b_mma_base,
+        smem_b_stage_ptr,
+        tmem_cast_a_addr,
+        first_k_tile: cutlass.Constexpr[Optional[bool]] = None,
     ):
         pass
 
@@ -459,6 +497,17 @@ class _DummyResource(MemoryResource):
         t2r_rmem_1,
         t2r_output_call_idx,
         subtile_idx: cutlass.Constexpr[int],
+    ):
+        pass
+
+    @producer_work()
+    def store_non_swap_overlap(
+        self,
+        stage_info,
+        *,
+        t2r_rmem,
+        t2r_rmem_1,
+        t2r_output_call_idx,
     ):
         pass
 
@@ -510,8 +559,7 @@ def test_fast_drain_work_queue_reserves_response_and_barrier_smem():
             is_persistent=True,
             use_early_exit=True,
             use_clc_fast_drain=True,
-            is_swap_ab=True,
-            rasterizes_features_first=False,
+            is_swap_ab=False,
         ),
         name="WorkQueue",
     )
@@ -549,7 +597,6 @@ def test_fast_drain_work_queue_omits_smem_when_disabled(
             use_early_exit=use_early_exit,
             use_clc_fast_drain=use_clc_fast_drain,
             is_swap_ab=False,
-            rasterizes_features_first=is_persistent,
         ),
         name="WorkQueue",
     )
@@ -576,6 +623,11 @@ def _all_producer_aux_labels(task) -> list[str | None]:
 
 def _cfg(**overrides) -> SimpleNamespace:
     values = {
+        # These schedule-shape stubs model the legacy logical 2x1 CGA unless a
+        # test explicitly overrides the complete physical shape.
+        "umma_cta_count": 2,
+        "preferred_cluster_shape": (2, 1, 1),
+        "fallback_cluster_shape": None,
         "tile_scheduler": int(TileScheduler.PERSISTENT),
         "is_persistent": True,
         "load_a_warp_idx": 0,
@@ -584,15 +636,14 @@ def _cfg(**overrides) -> SimpleNamespace:
         "load_b_warp_idx": 1,
         "num_load_b_warps": 1,
         "load_b_task_regs": 24,
-        "gather_warp_idx": 2,
-        "num_gather_warps": 1,
-        "gather_regs": 24,
+        "load_b_regs": 24,
         "sync_regs": 24,
         "has_routed_sfs": True,
         "uses_ldgsts_routed_sfs": True,
         "uses_tma_routed_sfs": False,
-        "has_deepseek_fp8": False,
-        "has_cluster": True,
+        "use_deepseek_fp8": False,
+        "uses_two_cta_mma": True,
+        "sfa_smem_to_tmem_copy": int(SfSmemToTmemCopy.UTCCP),
         "sfb_smem_to_tmem_copy": int(SfSmemToTmemCopy.UTCCP),
         "smem_sfb_layout": int(SfLayout.R128c4),
         "load_sfa_warp_idx": 3,
@@ -602,7 +653,6 @@ def _cfg(**overrides) -> SimpleNamespace:
         "num_load_sfb_warps": 1,
         "load_sfb_task_regs": 24,
         "load_sfab_warp_idx": 12,
-        "num_load_sfab_warps": 0,
         "load_sfab_regs": 48,
         "copy_sfa_warp_idx": 5,
         "num_copy_sfa_warps": 1,
@@ -617,11 +667,20 @@ def _cfg(**overrides) -> SimpleNamespace:
         "num_mma_warps": 1,
         "mma_regs": 24,
         "use_tile256_tmem_overlap": True,
+        # Mirror BatchedGemmConfig.uses_tmem_overlap_window for this default
+        # four-warp epilogue fixture. Schedule factories intentionally consume
+        # the derived property instead of duplicating its config expression.
+        "uses_tmem_overlap_window": True,
         "num_epilogue_warps": 4,
         "batch_mode": int(BatchMode.BATCH_M),
         "transpose_mma_output": 0,
         "is_swap_ab": False,
+        "has_gated_epilogue": False,
         "epi_tile_n": 32,
+        "non_swap_tmem_load_num_regs": 32,
+        "non_swap_tmem_overlap_loads": 1,
+        # tile_n=64 with 32 columns consumed by each non-gated call.
+        "non_swap_epilogue_subtile_cnt": 2,
         "tile_n": 64,
         "epilogue_warp_idx": 9,
         "epilogue_regs": 24,
@@ -632,11 +691,9 @@ def _cfg(**overrides) -> SimpleNamespace:
         "num_padding_warps": 1,
         "padding_regs": 24,
         "use_early_exit": False,
-        "uses_non_swap_tma_store": False,
-        "use_tma_store": False,
     }
     values.update(overrides)
-    return SimpleNamespace(**values)
+    return SimpleNamespace(**values, warp_layout=SimpleNamespace(**values))
 
 
 @pytest.mark.cpu_only
@@ -928,7 +985,7 @@ def test_load_a_try_acquire_is_per_k_tile():
 
 @pytest.mark.cpu_only
 def test_non_cluster_routed_sf_ldgsts_schedules_pre_commit_hook():
-    cfg = _cfg(use_early_exit=False, has_cluster=False)
+    cfg = _cfg(use_early_exit=False, uses_two_cta_mma=False)
     work_queue = _work_queue()
     smem_sfa = _res("SmemSfA")
     load_sfa = create_load_sfa_task(
@@ -953,9 +1010,9 @@ def test_non_cluster_routed_sf_ldgsts_schedules_pre_commit_hook():
 
 
 @pytest.mark.cpu_only
-def test_ldgsts_sf_pipeline_configs_use_async_load_producers():
+def test_ldgsts_sf_pipeline_configs_join_clustered_routed_producers():
     cfg = make_config(
-        cluster_m=2,
+        umma_cta_count=2,
         route_sfs_act=int(RouteImpl.LDGSTS),
         batch_mode=int(BatchMode.BATCH_M),
         transpose_mma_output=0,
@@ -963,11 +1020,28 @@ def test_ldgsts_sf_pipeline_configs_use_async_load_producers():
     )
     smem_sfa_cfg = _make_pipeline_configs(cfg)["smem_sfa"]
     assert smem_sfa_cfg.pipeline_type == PipelineType.AsyncUmma
-    assert smem_sfa_cfg.umma_consumer_producer_op == pipeline.PipelineOp.AsyncLoad
-    assert smem_sfa_cfg.producer_group.size == cfg.num_load_sfa_warps * 32
+    assert smem_sfa_cfg.umma_consumer_producer_op == pipeline.PipelineOp.AsyncThread
+    assert (
+        smem_sfa_cfg.producer_group.size
+        == cfg.warp_layout.num_load_sfa_warps * 32 * cfg.umma_cta_count
+    )
+
+    single_cta_cfg = make_config(
+        umma_cta_count=1,
+        route_sfs_act=int(RouteImpl.LDGSTS),
+        batch_mode=int(BatchMode.BATCH_M),
+        transpose_mma_output=0,
+        tile_n=128,
+    )
+    single_cta_sfa_cfg = _make_pipeline_configs(single_cta_cfg)["smem_sfa"]
+    assert single_cta_sfa_cfg.umma_consumer_producer_op == pipeline.PipelineOp.AsyncLoad
+    assert (
+        single_cta_sfa_cfg.producer_group.size
+        == single_cta_cfg.warp_layout.num_load_sfa_warps * 32
+    )
 
     r128c4_sfb_cfg = make_config(
-        cluster_m=2,
+        umma_cta_count=2,
         route_sfs_act=int(RouteImpl.LDGSTS),
         tile_scheduler=int(TileScheduler.PERSISTENT),
         tile_n=128,
@@ -982,14 +1056,16 @@ def test_ldgsts_sf_pipeline_configs_use_async_load_producers():
     assert smem_sfb_cfg.umma_consumer_producer_op == pipeline.PipelineOp.AsyncThread
     assert (
         smem_sfb_cfg.producer_group.size
-        == r128c4_sfb_cfg.num_load_sfb_warps * 32 * r128c4_sfb_cfg.cluster_m
+        == r128c4_sfb_cfg.warp_layout.num_load_sfb_warps
+        * 32
+        * r128c4_sfb_cfg.umma_cta_count
     )
     assert smem_sfb_cfg.advance_on_acquire
     assert smem_sfb_cfg.advance_on_wait
     assert _ldgsts_sfb_producer_commit_prefetch_depth(r128c4_sfb_cfg) == 3
 
     compact_cfg = make_config(
-        cluster_m=2,
+        umma_cta_count=2,
         route_sfs_act=int(RouteImpl.LDGSTS),
         tile_n=64,
     )
@@ -998,7 +1074,10 @@ def test_ldgsts_sf_pipeline_configs_use_async_load_producers():
     assert compact_cfg.smem_sfb_layout == int(SfLayout.R8c4)
     assert smem_sfb_cfg.pipeline_type == PipelineType.AsyncAsync
     assert smem_sfb_cfg.async_producer_op == pipeline.PipelineOp.AsyncLoad
-    assert smem_sfb_cfg.producer_group.size == compact_cfg.num_load_sfb_warps * 32
+    assert (
+        smem_sfb_cfg.producer_group.size
+        == compact_cfg.warp_layout.num_load_sfb_warps * 32
+    )
     assert not smem_sfb_cfg.advance_on_acquire
 
 
@@ -1006,7 +1085,7 @@ def test_ldgsts_sf_pipeline_configs_use_async_load_producers():
 def test_fused_operand_sf_schedule_matches_high_throughput_warp_layout():
     cfg = make_config(
         batch_mode=int(BatchMode.BATCH_N),
-        cluster_m=2,
+        umma_cta_count=2,
         dtype_a=int(DType.E2M1),
         dtype_b=int(DType.E2M1),
         dtype_c=int(DType.E2M1),
@@ -1014,8 +1093,7 @@ def test_fused_operand_sf_schedule_matches_high_throughput_warp_layout():
         act_kind=int(ActKind.SWIGLU),
         fuse_operand_sf_loads=1,
         fuse_sf_copy_to_mma=1,
-        gather_regs=128,
-        load_b_regs=96,
+        load_b_regs=128,
         load_sfb_regs=128,
         mma_k=64,
         mma_m=256,
@@ -1037,24 +1115,43 @@ def test_fused_operand_sf_schedule_matches_high_throughput_warp_layout():
     compute_warp_layout(cfg)
     validate_config(cfg)
 
-    assert cfg.threads_per_cta == 384
-    assert cfg.epilogue_warp_idx == 0
-    assert cfg.gather_warp_idx == 4
-    assert cfg.load_b_warp_idx == cfg.gather_warp_idx
-    assert cfg.load_sfb_warp_idx == cfg.gather_warp_idx
-    assert cfg.load_a_warp_idx == 8
-    assert cfg.load_sfa_warp_idx == cfg.load_a_warp_idx
-    assert cfg.mma_warp_idx == 9
-    assert cfg.workid_warp_idx == 10
-    assert cfg.padding_warp_idx == 11
-    assert cfg.num_sync_warps == 0
+    assert cfg.warp_layout.threads_per_cta == 384
+    assert cfg.warp_layout.epilogue_warp_idx == 0
+    assert (
+        cfg.warp_layout.load_b_warp_idx
+        if cfg.is_swap_ab
+        else cfg.warp_layout.load_a_warp_idx
+    ) == 4
+    assert cfg.warp_layout.load_b_warp_idx == (
+        cfg.warp_layout.load_b_warp_idx
+        if cfg.is_swap_ab
+        else cfg.warp_layout.load_a_warp_idx
+    )
+    assert cfg.warp_layout.load_sfb_warp_idx == (
+        cfg.warp_layout.load_b_warp_idx
+        if cfg.is_swap_ab
+        else cfg.warp_layout.load_a_warp_idx
+    )
+    assert cfg.warp_layout.load_a_warp_idx == 8
+    assert cfg.warp_layout.load_sfa_warp_idx == cfg.warp_layout.load_a_warp_idx
+    assert cfg.warp_layout.mma_warp_idx == 9
+    assert cfg.warp_layout.workid_warp_idx == 10
+    assert cfg.warp_layout.padding_warp_idx == 11
+    assert cfg.warp_layout.num_sync_warps == 0
 
     pipeline_cfgs = _make_pipeline_configs(cfg)
     gather_pipeline = pipeline_cfgs["smem_gather"]
     assert gather_pipeline.umma_consumer_producer_op == pipeline.PipelineOp.AsyncThread
     assert gather_pipeline.advance_on_acquire
     assert (
-        gather_pipeline.producer_group.size == cfg.num_gather_warps * 32 * cfg.cluster_m
+        gather_pipeline.producer_group.size
+        == (
+            cfg.warp_layout.num_load_b_warps
+            if cfg.is_swap_ab
+            else cfg.warp_layout.num_load_a_warps
+        )
+        * 32
+        * cfg.umma_cta_count
     )
 
     work_queue = _work_queue()
@@ -1082,10 +1179,14 @@ def test_fused_operand_sf_schedule_matches_high_throughput_warp_layout():
     )
 
     assert fused_a.name == "FusedLoadASfATask"
-    assert fused_a.warp_idx == cfg.load_a_warp_idx
+    assert fused_a.warp_idx == cfg.warp_layout.load_a_warp_idx
     assert fused_a.num_warps == 1
     assert fused_b.name == "FusedGatherSfBTask"
-    assert fused_b.warp_idx == cfg.gather_warp_idx
+    assert fused_b.warp_idx == (
+        cfg.warp_layout.load_b_warp_idx
+        if cfg.is_swap_ab
+        else cfg.warp_layout.load_a_warp_idx
+    )
     assert fused_b.num_warps == 4
 
 
@@ -1125,7 +1226,7 @@ def test_ts_async_umma_commit_uses_2sm_cluster_arrive():
 @pytest.mark.cpu_only
 def test_ldgsts_sf_wait_group_depth_matches_generated_throttle():
     cfg = make_config(
-        cluster_m=2,
+        umma_cta_count=2,
         num_stages_smem_sfb=6,
         route_act=int(RouteImpl.TMA),
         route_sfs_act=int(RouteImpl.LDGSTS),
@@ -1143,7 +1244,7 @@ def test_ldgsts_sf_wait_group_depth_matches_generated_throttle():
     assert res.cp_async_wait_group_depth == 2
 
     two_stage_cfg = make_config(
-        cluster_m=2,
+        umma_cta_count=2,
         num_stages_smem_sfb=2,
         route_sfs_act=int(RouteImpl.LDGSTS),
         tile_scheduler=int(TileScheduler.PERSISTENT),
@@ -1165,7 +1266,7 @@ def test_ldgsts_sf_wait_group_depth_matches_generated_throttle():
 @pytest.mark.cpu_only
 def test_ldgsts_sfb_advance_on_acquire_prefetches_head_and_drains_tail():
     cfg = make_config(
-        cluster_m=2,
+        umma_cta_count=2,
         num_stages_smem_sfb=6,
         route_act=int(RouteImpl.TMA),
         route_sfs_act=int(RouteImpl.LDGSTS),
@@ -1256,7 +1357,8 @@ def test_ldgsts_sfa_prefetch_drains_tail_with_prefetch_ordinals():
 @pytest.mark.cpu_only
 def test_ldgsts_sfb_prefetch_depth_is_derived_from_host_k_tiles():
     cfg = make_config(
-        cluster_m=2,
+        umma_cta_count=2,
+        mma_m=256,
         num_stages_smem_sfb=6,
         route_act=int(RouteImpl.TMA),
         route_sfs_act=int(RouteImpl.LDGSTS),
@@ -1272,13 +1374,15 @@ def test_ldgsts_sfb_prefetch_depth_is_derived_from_host_k_tiles():
 
     validate_config(cfg, problem_mnk=(128, 128, 256))
 
-    assert _ldgsts_sfb_producer_commit_prefetch_depth(cfg) == 1
+    assert _ldgsts_sfb_producer_commit_prefetch_depth(cfg) == 3
+    specialized = _runtime_config(cfg, 256)
+    assert _ldgsts_sfb_producer_commit_prefetch_depth(specialized) == 1
 
 
 @pytest.mark.cpu_only
 def test_combined_tmem_sfab_uses_umma_producer_commit_pipeline():
     cfg = make_config(
-        cluster_m=2,
+        umma_cta_count=2,
         route_sfs_act=int(RouteImpl.LDGSTS),
         tile_scheduler=int(TileScheduler.PERSISTENT),
         tile_n=128,
@@ -1366,7 +1470,7 @@ def test_combined_tmem_sfab_delays_commit_and_smem_release():
 def test_runtime_config_preserves_plain_bf16_stages():
     cfg = make_config(
         bias_type=int(BiasType.M),
-        cluster_m=2,
+        umma_cta_count=2,
         dtype_a=int(DType.BF16),
         dtype_b=int(DType.BF16),
         dtype_c=int(DType.BF16),
@@ -1416,7 +1520,7 @@ def test_runtime_config_enables_mma_unroll_only_for_even_k_tiles(
 def test_runtime_config_preserves_scaled_fp4_stages():
     cfg = make_config(
         bias_type=int(BiasType.M),
-        cluster_m=2,
+        umma_cta_count=2,
         dtype_a=int(DType.E2M1),
         dtype_b=int(DType.E2M1),
         dtype_c=int(DType.BF16),
@@ -1431,7 +1535,7 @@ def test_runtime_config_preserves_scaled_fp4_stages():
         num_stages_tmem_sfa=6,
         num_stages_tmem_sfb=6,
         route_act=int(RouteImpl.NONE),
-        route_sfs_act=int(RouteImpl.NONE),
+        route_sfs_act=int(RouteImpl.AUTO),
         sf_layout_a=int(SfLayout.R128c4),
         sf_layout_b=int(SfLayout.R128c4),
         tile_k=256,
@@ -1451,7 +1555,7 @@ def test_runtime_config_preserves_scaled_fp4_stages():
 @pytest.mark.cpu_only
 def test_tmem_sf_utccp_pipeline_configs_use_umma_producer_umma_consumer():
     cfg = make_config(
-        cluster_m=2,
+        umma_cta_count=2,
         tile_n=128,
         mma_n=128,
         epi_tile_n=64,
@@ -1468,7 +1572,7 @@ def test_tmem_sf_utccp_pipeline_configs_use_umma_producer_umma_consumer():
     assert pcfgs["tmem_sfb"].consumer_group.size == 1
 
     compact_cfg = make_config(
-        cluster_m=2,
+        umma_cta_count=2,
         tile_n=64,
     )
     assert compact_cfg.sfb_smem_to_tmem_copy == int(SfSmemToTmemCopy.LDS_STTM)
@@ -1480,7 +1584,9 @@ def test_tmem_sf_utccp_pipeline_configs_use_umma_producer_umma_consumer():
 
 
 @pytest.mark.cpu_only
-def test_proxy_cluster_barrier_uses_ts_async_umma_pipeline():
+def test_proxy_cluster_barrier_uses_atom_routing_only_for_multi_atom_cga(
+    monkeypatch,
+):
     proxy_cfg = PipelineConfig.create_async_umma_pipeline_cfg(
         num_stages=2,
         producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, size=64),
@@ -1491,7 +1597,37 @@ def test_proxy_cluster_barrier_uses_ts_async_umma_pipeline():
     )
 
     assert proxy_cfg.pipeline_type == PipelineType.AsyncUmma
-    assert "create_pipeline" not in ProxyClusterBarrierResource.__dict__
+
+    # Legacy 2x1 retains the stock TS pipeline; a wider physical CGA wraps it
+    # so the proxy release addresses the current rank-relative UMMA atom.
+    from flashinfer.prims_ts.batched_gemm import mixed_cga_ts
+
+    base = object()
+    wrapped = object()
+    calls = []
+    monkeypatch.setattr(
+        MemoryResource,
+        "create_pipeline",
+        lambda _self, _pipeline_config: base,
+    )
+    monkeypatch.setattr(
+        mixed_cga_ts,
+        "override_umma_atom_pipeline",
+        lambda actual_base: (calls.append(actual_base), wrapped)[1],
+    )
+
+    resource = object.__new__(ProxyClusterBarrierResource)
+    object.__setattr__(resource, "cfg", _cfg())
+    assert resource.create_pipeline(proxy_cfg) is base
+    assert calls == []
+
+    object.__setattr__(
+        resource,
+        "cfg",
+        _cfg(preferred_cluster_shape=(4, 1, 1)),
+    )
+    assert resource.create_pipeline(proxy_cfg) is wrapped
+    assert calls == [base]
 
 
 @pytest.mark.cpu_only
@@ -1526,7 +1662,6 @@ def test_bs1_nvfp4_persistent_pdl_wait_completes_before_task_graph():
         use_tma_store=1,
         use_pdl=1,
         use_early_exit=1,
-        do_pdl_wait_for_num_non_exiting_ctas=1,
         **uniform_pipeline_stage_overrides(5),
     )
     all_task_resources = [

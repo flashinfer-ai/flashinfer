@@ -25,7 +25,7 @@ from .tuning import (
     sm100_standard_candidates,
 )
 
-_REVISION = "sm100-genphase-e6256732-auto-v5"
+_REVISION = "sm100-genphase-block-scaled-auto-v6"
 
 
 def knob_cache_path() -> str | None:

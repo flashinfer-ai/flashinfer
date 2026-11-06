@@ -72,6 +72,76 @@ statement of the fact that the gated attention block's declaration-time decline 
 metadata above every role wait (the pre-dispatch dead-CTA exit, the claim-counter scheduler), so a dependent launch of it would read
 what the setup launch has not written yet; the switch's scope is the dense BSHD and paged decode chain.
 
+THE FUSED GATED e4m3 STORE (appended 2026-10-29; an OP ATTRIBUTE of the declaration, never a knob -- it changes the numerics): ``o``
+declared ``float8_e4m3fn`` + ``out_scale`` (a 1-element fp32 CUDA tensor or descriptor: the consumer's static per-tensor DEQUANT scale,
+the o_proj input scale) + ``epilogue_gate``, on a SPLIT plan (the lean tile always splits; the tcgen05 core needs ``split_kv >= 2``):
+the split combine's fused entry (``sm100/split_combine.compile_ptr(gate=True, gate_e4m3=True, dtype_o="e4m3")``) stores
+``e4m3(rn, satfinite)(O32 * sigmoid(G) * div.rn(1, scale))`` -- ONE rounding of the fp32 gated value, the inverse computed on device
+-- in place of the half O and the consumer's gate + quant launch; a dead row stores 0, the LSE is untouched.  Against the unfused
+chain (the half O, then ``e4m3(half(O) * inv)``) it differs by at most one e4m3 ulp at the larger magnitude, never bitwise, WHEREVER the
+half twin does not underflow before the scale: below the half dtype's smallest normal the twin loses digits and then flushes to zero (f16
+from 2^-25 down) while the fused path keeps the fp32 magnitude -- the single rounding is the contract, the twin is not a general bound
+(the gate suite's boundary cell records 48 on every form against the f16 twin's 0 and the bf16 twin's 52: a merged value of 1e-8, a zero
+gate, the scale 1e-10).  ``out_scale``
+is a POSITIVE NORMAL fp32 by contract: its VALUE is never read on the host (a device word; the shape / dtype / contiguity are), and a zero /
+subnormal scale makes the on-device inverse +inf -- a dead row's ``0 * inf`` is then the e4m3 NaN byte and every live element +-448 (or NaN
+where it is exactly 0), so no kernel-side select makes a zero scale meaningful.  Declines by name: ``NotImplementedError`` (the typed decline
+that advances a build walk) for an UNWIRED form -- an e4m3 ``o`` without the gate / unsplit / under THD, any other output dtype than Q's or
+e4m3 --, ``ValueError`` for a MALFORMED declaration, like the adapter's other operand-shape errors -- an e4m3 ``o`` without ``out_scale``,
+``out_scale`` with a half ``o``, a scale that is not ONE contiguous fp32 element.  :attr:`SparseGqaFwdDslSm107.fused_e4m3` reads the
+resolved arm back after ``check_support``.  On the Blackwell explicit-lean parts the lean route's combine FORM follows the cc 10.7
+split-aware rule's shape (``sparse_tile_rules.SPARSE_LEAN_COMBINE_RULE_CCS`` = cc 10.0, measured on the GB200 class 2026-10-28; cc 10.3 keeps the
+module's own forms) -- :func:`_sparse_combine_decode_grid`.
+
+THE FUSED STORE's ROUNDING CONVENTION (``out_rounding``, appended last; an OP ATTRIBUTE of the declaration, never a knob -- it changes the bytes;
+the vocabulary is ``heuristics.COMBINE_OUT_ROUNDINGS``, validated by name at construction): ``"single"`` (the default) is the convention above, ONE
+rounding of the fp32 gated value (FROST's own); ``"staged"`` reproduces a serving stack's gate-and-quantize launch byte for byte,
+``e4m3(rn, satfinite)(bf16(bf16(O32) / (1 + exp(-G))) * div.rn(1, scale))`` -- the merged O rounded to bf16 as that stack's attention kernel
+stores it, the exact sigmoid as a division, the gated value rounded to bf16, the fp32 multiply by the same inverse, the saturating cvt -- spelled
+with the DSL ops that stack's kernel spells (``split_combine.compile_ptr(out_rounding="staged")``), so a provider whose speculative verify is
+tuned on the stack's bytes can take the fused launch without moving the acceptance length (the two conventions differ by one e4m3 code on a
+few percent of the elements, enough to flip a near-tie greedy token).  The LSE, the dead rows (0), the PDL arm and the combine FORM are the single
+mode's; the attribute is compiled into the combine entry (no new runtime slot).  Declines by name: ``"staged"`` with a half ``o`` (no fused store
+to apply it to) is a ``ValueError`` (a malformed declaration, like ``out_scale`` with a half ``o``); ``"staged"`` with f16 operands is a
+``NotImplementedError`` (the typed decline: the convention is a bf16 chain's -- refused by name rather than defined for f16, which has no
+consumer, no ground truth and a narrower range below which the two conventions part); a value outside the vocabulary is a ``ValueError`` at
+construction.  :attr:`SparseGqaFwdDslSm107.out_rounding` reads the attribute back.
+The per-form COST of ``"staged"`` is a PERFORMANCE fact of the attribute, not a numerics change, recorded in the tracker's "Measured cost
+of the staged convention" note (``python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md``; 2026-10-30, the Rubin 212-SM class): a tie inside
+the noise on the served decode-grid combine at one token per sequence, 0.13-0.30 us per layer at four, 1.2-1.5 us per layer (-6.7..-8.5 %)
+where the combine resolves to the module's own forms -- prefer ``"single"`` on such a declaration until the staged arithmetic is rescheduled.
+
+TWO BODIES, ONE FUNCTION (``tile_form``, appended; a PERFORMANCE knob): the tcgen05 core (``kernels/sm107/sparse_d256_f16.py``, the
+module above, ``kernel_template`` ``"sparse_d256_f16"``) and the LEAN decode tile (``kernels/sm107/sparse_lean_d256_f16.py``: ``mma.sync``
+m16n8k16 + ``cp.async``, one 128-thread CTA per (sequence, KV head, chunk of ``sub_tiles_per_cta`` 32-key sub-tiles), no TMEM / TMA / CLC,
+``kernel_template`` ``"sparse_lean_d256_f16"``) compute the same O / LSE -- within the fixed-order-sum budget (a 4 x 64-d split-K sum vs
+one 256-d MMA chain, 32- vs 128-key tiles: never bitwise ACROSS the bodies, bitwise WITHIN each), so a caller may pin either.  The lean
+body serves the DECODE form only (``bottom_right`` + the shared list at ``S_q <= config_sm107.LEAN_SPARSE_SERVED_MAX_S_Q`` = 4 -- every
+row of the step in ONE CTA: ``n_mt = ceil(S_q x G / 16)`` m16 tiles of 128 threads over one gathered sub-tile, where the tcgen05 core runs
+every row as its own item; the adapter builds the lean tile's own record ``config_sm107.TemplateParamsLean(decode_seqlen_q=S_q, sub_tiles_per_cta=k)``, the
+compile-time S_q axis -- or the per-row list at ``S_q == 1``, which IS the shared list; per-row lists past one row are the core's --,
+``seq_kv_lens`` present, dense BSHD or paged pools, bf16 / f16, G <= 16,
+``top_k`` in [8, 512]) and ALWAYS splits: its ``split_kv`` is a LEAN split ``ceil(n_sub / k)`` (``heuristics.sparse_lean_splits``: 65 / 33 /
+22 / 17 / ... at ``top_k`` 512) that SELECTS ``k``, the sub-tiles per CTA (a pinned ``split_kv`` must be one of them; ``split_kv`` unset =
+the default ``k`` of ``heuristics.sparse_lean_sub_tiles_per_cta``, 1 today; ``sub_tiles_per_cta`` pins ``k`` directly; an explicit ``split_kv=1`` reads as UNSET on the adapter -- 1 is the constructor's default, so the two
+cannot be told apart -- and under ``tile_form="auto"`` on a listed part takes the lean split: an unsplit launch there is pinned with
+``tile_form="tcgen05"``, where the block's ``decode_split_kv`` has a None default and keeps the core for an explicit 1), writing the SAME fp32
+split-major partial slab the tcgen05 core's split store writes, so the combine, its pinned form and the gate riding it are untouched.
+``tile_form="auto"`` (the default) resolves through ``heuristics.sparse_tile_form_auto``: on the measured part
+(``heuristics.SPARSE_LEAN_TILE_DEFAULT_CCS`` = cc 10.7 since the gate's table) the placement rule
+``heuristics.sparse_decode_lean_tile_selected`` (``B x H_kv <= LEAN_SPARSE_MAX_UNITS`` = 4 CTAs per chunk -- the lean grid's own unit: the
+step's S_q rows ride inside the CTA, so B 1 and B 2 on two KV heads take the lean body at every served S_q 1..4), the tcgen05 core on every
+other part; an explicit ``"lean"`` is honoured where the body serves the declaration -- on the core's parts and, FOR MEASUREMENT, on the
+Blackwell parts of ``heuristics.SPARSE_LEAN_TILE_EXPLICIT_CCS`` (cc 10.0 / 10.3, outside the record's ``sm_lo .. sm_hi`` and stated by its
+``lean_explicit_ccs`` field: the lean body is
+SM100-legal and its config pins no Rubin-only size; UNMEASURED there, the AUTO reading unchanged, ``"auto"`` / ``"tcgen05"`` declined by name
+through ``heuristics.sparse_tile_part_decline``) -- and a typed decline naming the arm where it does not (``heuristics.sparse_lean_tile_decline``:
+THD, a prefill / top-left form, no ``seq_kv_lens``, ``S_q`` past the served rows, per-row lists past one row, a group past 16, ``top_k`` below
+8, a non-default ``softmax_groups``), never a silent fallback; ``sub_tiles_per_cta`` is the lean body's pin and is refused by name where the
+resolved body is the tcgen05 core.  :attr:`SparseGqaFwdDslSm107.tile_form` / :attr:`kernel_template` read the resolved body back after
+``check_support`` (a route is pinned by the kernel that compiled, never transcribed); the claims record gains NO field (the function is
+the same).
+
 The device does the work (Rule 3): lengths, counts, dead items and the tail block(s) are derived on device from the position
 and the per-row ``block_lens``; nothing below reads device memory.  ``execute`` validates and launches (Rule 1): no
 conversion, no allocation, the caller's stream.  The kernel needs NO GMEM scratch unless split or THD
@@ -113,8 +183,14 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import flashinfer.experimental.qwen_3_5_block._cudnn_frost as cudnn
+from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.sparse_tile_rules import (  # DSL-free (no cutlass / torch / tile_dsl import): importable before the DSL gate, as a declaration's construction must be
+    COMBINE_OUT_ROUNDING_SINGLE,
+    COMBINE_OUT_ROUNDINGS,
+    SPARSE_LEAN_TILE_EXPLICIT_CCS,
+)
 
 KERNEL_FILE = "sm107/sparse_d256_f16.py"
+KERNEL_FILE_LEAN = "sm107/sparse_lean_d256_f16.py"  # the second body (tile_form="lean"); the vocabulary and the kernel_template names are the heuristics'
 _TOPK_MIN, _TOPK_MAX = 4, 512
 _BLOCK_SIZE = 4
 _D = 256
@@ -127,7 +203,7 @@ class SparseCapabilities:
     """What the sparse core serves -- the adapter-owned claims record (no engine row: see the module docstring).  Field names
     follow ``engines.Capabilities`` where the meaning matches; the index-list fields are this record's own."""
 
-    sm_lo: int = 107
+    sm_lo: int = 107  # the CORE's parts (both bodies); the EXPLICIT lean tile is admitted on `lean_explicit_ccs` (below) too: cc 10.0 / 10.3, unmeasured
     sm_hi: int = 119
     phase: str = "forward"
     d_shapes: frozenset = frozenset({(_D, _D)})
@@ -167,6 +243,15 @@ class SparseCapabilities:
     )
     index_shared_list_max_tokens: int = 4  # S_q cap under list_per_sequence: the shared list's tail covers at most two blocks for S_q <= 4 (the MTP cap)
     cutedsl_min_version: Tuple[int, int, int] = (4, 8, 0)
+    lean_explicit_ccs: Tuple[Tuple[int, int], ...] = (
+        SPARSE_LEAN_TILE_EXPLICIT_CCS  # appended 2026-10-28: the parts OUTSIDE sm_lo .. sm_hi (cc 10.0 / 10.3: B200 / GB200, B300) on which the EXPLICIT tile_form="lean" is admitted for measurement (unmeasured there; "auto" / "tcgen05" resolve the core and are declined by name) -- the copy sparse_tile_part_decline reads, pinned equal to sparse_tile_rules.SPARSE_LEAN_TILE_EXPLICIT_CCS by the suite
+    )
+    gated_e4m3_out: bool = (
+        True  # appended 2026-10-29: O stored as float8_e4m3fn at a static per-tensor DEQUANT scale (out_scale, a positive normal fp32 by contract) through the GATED split combine's fused entry -- a split plan with the gate, dense or paged, never THD
+    )
+    gated_e4m3_out_roundings: Tuple[str, ...] = (
+        COMBINE_OUT_ROUNDINGS  # appended 2026-10-29: the fused store's rounding conventions (the `out_rounding` attribute: "single" = one rounding of the fp32 gated value, the default; "staged" = a serving stack's gate-and-quantize order, bf16 operands only) -- pinned equal to heuristics.COMBINE_OUT_ROUNDINGS by the suite
+    )
 
 
 SPARSE_CAPABILITIES = SparseCapabilities()
@@ -297,7 +382,7 @@ def _paged_pool_geometry(name: str, pool, KH: int, page_size: int) -> Tuple[int,
     return s_page, s_tok, col_head, rows_per_page, rows_per_head
 
 
-def _sparse_combine_decode_grid(b: int, h_q: int, s_q: int, split: int, device_cc) -> int:
+def _sparse_combine_decode_grid(b: int, h_q: int, s_q: int, split: int, device_cc, *, lean: bool = False) -> int:
     """The split combine entry's kernel FORM for a sparse plan (``split_combine.DECODE_GRID_AUTO`` / ``DECODE_GRID_OFF`` /
     ``DECODE_GRID_LEAN_WALK``): a plan-time specialization on the sparse grid ``(B, H_q, S_q)`` -- the REAL query-head count, the
     rows the combine reduces --, the split and the plan's DEVICE, never a runtime value.  The dense adapter's rule
@@ -308,14 +393,21 @@ def _sparse_combine_decode_grid(b: int, h_q: int, s_q: int, split: int, device_c
     split-aware rule pins the module's own forms where the two disagree (``decode_combine_force_lean``: a split below 8, or a mid-sized
     grid below 32 -- B 4 x S_q 4 at split 7), a deeper split past the bound keeps the AUTO entry (= the module's own forms there by
     construction).  Off cc 10.7 (the Blackwell line keeps the module's own three-way rule, measured on B200 / B300; a line the rules
-    were never measured on likewise) a plan never names the walk and never compiles the AUTO entry inside the bound."""
+    were never measured on likewise) a plan never names the walk and never compiles the AUTO entry inside the bound -- EXCEPT a LEAN plan
+    (``lean``, appended 2026-10-29: the body is the lean tile) on a part of ``sparse_tile_rules.SPARSE_LEAN_COMBINE_RULE_CCS`` (cc 10.0),
+    whose combine follows the cc 10.7 split-aware rule's SHAPE (``sparse_lean_combine_rule_cc``): the lean grids' two combine forms were
+    MEASURED there (the GB200 152-SM class, the table in the rules module: the decode-grid kernel 3.0-3.8 us against the module's
+    own 6.8-16.3 on the 24-96-row grids at the lean splits 17-65, the own forms ahead only on the 384-row grid below split 32), never the
+    walk (a cc 10.7 form; the lean splits are >= 9 anyway).  The tcgen05 body and every other part read as before; a caller of the former
+    five-argument form (``lean`` unset) reads as before."""
     from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.heuristics import decode_combine_force_lean, decode_combine_lean_walk_selected
     from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.kernels.sm100 import split_combine
+    from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.sparse_tile_rules import sparse_lean_combine_rule_cc
 
     cc = (int(device_cc[0]), int(device_cc[1]))
-    if decode_combine_lean_walk_selected(b, h_q, s_q, split, device_cc=cc):
+    if decode_combine_lean_walk_selected(b, h_q, s_q, split, device_cc=cc):  # the walk: the plan's own line only (cc 10.7)
         return split_combine.DECODE_GRID_LEAN_WALK
-    if decode_combine_force_lean(b, h_q, s_q, split, device_cc=cc):
+    if decode_combine_force_lean(b, h_q, s_q, split, device_cc=sparse_lean_combine_rule_cc(cc, lean=lean)):
         return split_combine.DECODE_GRID_OFF
     return split_combine.DECODE_GRID_AUTO
 
@@ -388,8 +480,32 @@ class SparseGqaFwdDslSm107:
         workspace=None,
         softmax_groups: int = 0,
         use_pdl: bool = False,
+        tile_form: str = "auto",
+        sub_tiles_per_cta: Optional[int] = None,
+        out_scale=None,
+        out_rounding: str = COMBINE_OUT_ROUNDING_SINGLE,
     ):
         self.q, self.k, self.v, self.o, self.lse = q, k, v, o, lse
+        # The TILE FORM (appended; a PERFORMANCE knob of the two bodies, the module docstring): "auto" / "lean" / "tcgen05" -- the
+        # vocabulary is the heuristics' (one spelling for the adapter and the gated attention block); resolved by check_support (the
+        # placement rule on the measured parts, the explicit body honoured or declined by name) into `tile_form` / `kernel_template`.
+        # `sub_tiles_per_cta` pins the lean body's k (1 .. min(8, n_sub - 1)); it is refused by name where the resolved body is tcgen05.
+        from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.sparse_tile_rules import SPARSE_TILE_FORMS
+
+        if not isinstance(tile_form, str) or tile_form not in SPARSE_TILE_FORMS:
+            raise ValueError(
+                f"sparse d256 forward (sm107): tile_form must be one of {SPARSE_TILE_FORMS} ('auto' = the placement rule on the measured parts, "
+                f"the tcgen05 core elsewhere; 'lean' / 'tcgen05' explicit); got {tile_form!r}"
+            )
+        if sub_tiles_per_cta is not None and (isinstance(sub_tiles_per_cta, bool) or not isinstance(sub_tiles_per_cta, int) or sub_tiles_per_cta < 1):
+            raise ValueError(
+                f"sparse d256 forward (sm107): sub_tiles_per_cta must be None (the default k) or an int >= 1 (the lean tile's sub-tiles per CTA); got {sub_tiles_per_cta!r}"
+            )
+        self.tile_form_requested = tile_form
+        self.tile_form: Optional[str] = None  # the RESOLVED body ("lean" / "tcgen05"), set by check_support
+        self.sub_tiles_per_cta_requested = sub_tiles_per_cta
+        self.sub_tiles_per_cta: Optional[int] = None  # the lean body's k after check_support; None on the tcgen05 body
+        self.split_kv_requested = int(split_kv)  # as declared: on the lean body `split_kv` becomes the lean split check_support resolves
         # Programmatic dependent launch (appended 2026-10-21; a PERFORMANCE knob of the chain's two launches -- the same function, bitwise):
         # the launch attribute plus the griddepcontrol sites in both kernels it reaches -- the sparse core (compile(use_pdl=): every role's
         # wait before its first dependent global read; no explicit release, the CTA exit triggers the dependent at the core's completion)
@@ -404,6 +520,24 @@ class SparseGqaFwdDslSm107:
         # The fused epilogue gate's OPERAND (a tensor or a SparseOperandDesc; None = the ungated specialization): O's shape in
         # Q's dtype at its own (batch, seq, head) strides -- validated in check_support, compiled in as TemplateParams.epilogue_gate.
         self.gate = epilogue_gate
+        # The FUSED gated e4m3 STORE (appended 2026-10-29; an OP ATTRIBUTE of the declaration, never a knob -- it changes the numerics): `o`
+        # declared float8_e4m3fn + `out_scale` = the 1-element fp32 per-tensor DEQUANT scale (a POSITIVE NORMAL value by contract, never read
+        # on the host; the o_proj input scale: the stored byte is e4m3(rn, satfinite)(O32 * sigmoid(G) * div.rn(1, scale)), ONE rounding of the
+        # fp32 gated value) + the epilogue gate, on a split plan (the store rides the split combine's fused entry, compile_ptr(gate_e4m3=True));
+        # resolved by check_support into `fused_e4m3`.
+        self.out_scale = out_scale
+        self.fused_e4m3 = False
+        # The fused store's ROUNDING CONVENTION (appended 2026-10-29; an OP ATTRIBUTE, never a knob -- it changes the bytes): "single" (the
+        # default) = the one rounding above, "staged" = a serving stack's gate-and-quantize order (bf16 of the merged O, the exact sigmoid as a
+        # division, bf16 of the gated value, then the same inverse and saturating cvt; compile_ptr(out_rounding="staged")).  The vocabulary is
+        # validated here by name (heuristics.COMBINE_OUT_ROUNDINGS, like tile_form's); its composition (the fused store, bf16 operands) in
+        # check_support once the dtypes are known.  Compiled into the combine entry: no runtime slot.
+        if not isinstance(out_rounding, str) or out_rounding not in COMBINE_OUT_ROUNDINGS:
+            raise ValueError(
+                f"sparse d256 forward (sm107): out_rounding must be one of {COMBINE_OUT_ROUNDINGS} ('single' = one rounding of the fp32 gated value, "
+                f"'staged' = a serving stack's gate-and-quantize order on the fused e4m3 store); got {out_rounding!r}"
+            )
+        self.out_rounding = out_rounding
         self.top_k, self.block_size = int(top_k), int(block_size)
         # The softmax scale is handed to the kernel SIGNED (as scale x log2 e): the body multiplies every raw score by it BEFORE the
         # column max, so a negative attn_scale is served as is -- the dense line's TemplateParams.negate_scores (BMM1 negates Q and
@@ -473,12 +607,25 @@ class SparseGqaFwdDslSm107:
         from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.requirements import tma_gather4_requirement_error  # the host entry: importable below the DSL floor
 
         cc = self._device_cc()
+        self.split_kv = self.split_kv_requested  # re-resolved below (check_support may run more than once; the pin, never the resolved value, is the input)
         msg = tma_gather4_requirement_error(cc)
         if msg is not None:
             raise NotImplementedError(f"sparse d256 forward (sm107): {msg}")
-        cc_code = cc[0] * 10 + cc[1]
-        if not (SPARSE_CAPABILITIES.sm_lo <= cc_code <= SPARSE_CAPABILITIES.sm_hi):
-            raise NotImplementedError(f"sparse d256 forward (sm107): needs a Rubin-line GPU (cc 10.7 .. 11.9); got cc {cc[0]}.{cc[1]}")
+        # the PART: the core's record (cc 10.7 .. 11.9: both bodies); the Blackwell parts of the record's lean_explicit_ccs
+        # (= sparse_tile_rules.SPARSE_LEAN_TILE_EXPLICIT_CCS: cc 10.0 / 10.3) serve the EXPLICIT lean tile only, for measurement -- "auto" /
+        # "tcgen05" there resolve the core and are declined by name (the ONE statement, sparse_tile_part_decline; its text ends with the former
+        # Rubin-line spelling)
+        from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.sparse_tile_rules import sparse_tile_part_decline
+
+        part = sparse_tile_part_decline(
+            device_cc=cc,
+            tile_form_requested=self.tile_form_requested,
+            sm_lo=SPARSE_CAPABILITIES.sm_lo,
+            sm_hi=SPARSE_CAPABILITIES.sm_hi,
+            explicit_lean_ccs=SPARSE_CAPABILITIES.lean_explicit_ccs,
+        )
+        if part is not None:
+            raise NotImplementedError(f"sparse d256 forward (sm107): {part}")
         device = self._device_index
         for name, t in (
             ("q", self.q),
@@ -492,6 +639,7 @@ class SparseGqaFwdDslSm107:
             ("block_table", self.block_table),
             ("seq_q_lens", self.seq_q_lens),
             ("gate", self.gate),
+            ("out_scale", self.out_scale),
             ("workspace", self.workspace),
         ):
             device = _require_cuda_device(name, t, device, allow_unbound=True)
@@ -531,7 +679,9 @@ class SparseGqaFwdDslSm107:
                 "sparse d256 forward (sm107): list_per_sequence=True needs bottom_right=True -- the shared list is anchored at the step-0 position "
                 "kv_len - S_q (the decode / MTP form); a top-left per-sequence list has no serving meaning"
             )
-        max_tiles = -(-(self.top_k + 1) // 32) if _TOPK_MIN <= self.top_k <= _TOPK_MAX else 0
+        from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.sparse_tile_rules import sparse_tcgen05_max_split  # one copy of the core's split bound (the envelope reads the same)
+
+        max_tiles = sparse_tcgen05_max_split(self.top_k) if _TOPK_MIN <= self.top_k <= _TOPK_MAX else 0
 
         # the index list's FORM (the kernel's staging is sized by it)
         if self.block_size != _BLOCK_SIZE:
@@ -540,19 +690,32 @@ class SparseGqaFwdDslSm107:
             )
         if not (_TOPK_MIN <= self.top_k <= _TOPK_MAX) or self.top_k % 4 != 0:
             raise NotImplementedError(f"sparse d256 forward (sm107): top_k must be a multiple of 4 in [{_TOPK_MIN}, {_TOPK_MAX}]; got {self.top_k}")
-        if self.split_kv > max_tiles:
-            raise NotImplementedError(
-                f"sparse d256 forward (sm107): split_kv={self.split_kv} exceeds the item's maximum tile count ceil((top_k + 1) / 32) = {max_tiles} at "
-                f"top_k={self.top_k} -- a larger split has an empty chunk (a dead work item) on every item"
-            )
+        # the split bound is PER BODY (`_resolve_tile_form`, after the shapes: 17 = ceil((top_k + 1) / 32) on the tcgen05 core, the lean splits on the lean tile)
 
         # dtypes: one half dtype for Q / K / V / O, fp32 LSE
         dt = str(self.q.dtype)
         if dt not in _DTYPE_CODE:
             raise NotImplementedError(f"sparse d256 forward (sm107): Q must be bf16 or f16; got {dt}")
-        for name, t in (("K", self.k), ("V", self.v), ("O", self.o)):
+        for name, t in (("K", self.k), ("V", self.v)):
             if str(t.dtype) != dt:
                 raise ValueError(f"sparse d256 forward (sm107): {name} dtype {t.dtype} must equal Q's {dt}")
+        # O: Q's dtype (the half store), or float8_e4m3fn with out_scale + the gate (the FUSED store; its split requirement is checked
+        # once the body and the split are resolved below)
+        self.fused_e4m3 = self._resolve_fused_store(dt)
+        if self.out_rounding != COMBINE_OUT_ROUNDING_SINGLE:
+            # the staged convention is a property of the FUSED store (no half store takes a convention: it rounds once at its own cast) and of a
+            # bf16 chain (the f16 analogue is refused by name, not defined: no consumer, no ground truth, a narrower underflow range)
+            if not self.fused_e4m3:
+                raise ValueError(
+                    f"sparse d256 forward (sm107): out_rounding={self.out_rounding!r} belongs to the fused e4m3 store -- declare O as float8_e4m3fn with "
+                    "out_scale and the epilogue gate; a half O rounds once at its own store and takes no rounding convention"
+                )
+            if dt != "torch.bfloat16":
+                raise NotImplementedError(
+                    f"sparse d256 forward (sm107): out_rounding={self.out_rounding!r} is served with bf16 operands only (the convention is a bf16 serving "
+                    f"chain's: the merged O and the gated value are rounded to bf16); the f16 analogue is not wired -- got Q {dt}; declare bf16 operands or "
+                    "out_rounding='single'"
+                )
         if self.lse is not None and str(self.lse.dtype) != "torch.float32":
             raise ValueError(f"sparse d256 forward (sm107): LSE must be float32; got {self.lse.dtype}")
         if self.gate is not None:
@@ -658,6 +821,14 @@ class SparseGqaFwdDslSm107:
             raise NotImplementedError(
                 f"sparse d256 forward (sm107): the query-head group H_q / H_kv = {G} must be in [1, {_GQA_GROUP_MAX}] (one 16-row tile per token)"
             )
+        # THE TILE FORM and the split, per body (the module docstring): resolved here, once the geometry is known
+        self._resolve_tile_form(B, SQ, KH, G, cc, max_tiles)
+        if self.fused_e4m3 and self.split_kv <= 1:
+            raise NotImplementedError(
+                "sparse d256 forward (sm107): the e4m3 store rides the SPLIT combine (the fused gated entry, compile_ptr(gate_e4m3=True)); this plan is "
+                f"unsplit (split_kv {self.split_kv} on the {self.tile_form} body) -- declare a split (the lean tile always splits; split_kv >= 2 on the tcgen05 "
+                "core) or a half O"
+            )
         if self.lse is not None and _shape(self.lse) != (B, H, SQ):
             raise ValueError(f"sparse d256 forward (sm107): LSE must be (B, H_q, S_q) = {(B, H, SQ)}; got {_shape(self.lse)}")
         if B * SKV > _INT32_MAX or B * SQ * self.top_k > _INT32_MAX:
@@ -719,6 +890,163 @@ class SparseGqaFwdDslSm107:
         self._NSEQ = n_seq
         self._dtype_code = _DTYPE_CODE[dt]
         return True
+
+    def _resolve_fused_store(self, dt: str) -> bool:
+        """Whether this declaration takes the FUSED gated static-scale e4m3 store (the module docstring): ``o`` float8_e4m3fn with ``out_scale``
+        and the epilogue gate -- True --, or Q's dtype without ``out_scale`` -- False; every other combination is a decline naming the arm:
+        ``NotImplementedError`` (the typed decline) for an unwired form -- an e4m3 ``o`` without the gate or under THD, any other output dtype
+        --, ``ValueError`` for a malformed declaration, like the other operand-shape errors of ``check_support`` -- an e4m3 ``o`` without
+        ``out_scale``, ``out_scale`` with a half ``o``, a scale that is not ONE contiguous fp32 element (the split requirement is checked by
+        ``check_support`` once the body is resolved).  The scale's VALUE is not read (a device word): it is a positive normal fp32 by contract --
+        a zero / subnormal scale makes the on-device inverse +inf, a dead row's ``0 * inf`` the e4m3 NaN byte.  ``dt`` is Q's dtype string."""
+        o_dt = str(self.o.dtype)
+        if o_dt == dt:
+            if self.out_scale is not None:
+                raise ValueError(
+                    f"sparse d256 forward (sm107): out_scale given but O is {o_dt}, not torch.float8_e4m3fn -- the static per-tensor scale belongs to the "
+                    "fused e4m3 store (declare O as float8_e4m3fn with the epilogue gate), a half O takes no scale"
+                )
+            return False
+        if o_dt != "torch.float8_e4m3fn":
+            raise NotImplementedError(
+                f"sparse d256 forward (sm107): O dtype {o_dt} must equal Q's {dt} or be torch.float8_e4m3fn with out_scale (the fused gated static-scale "
+                "store); no other output dtype is wired"
+            )
+        if self.out_scale is None:
+            raise ValueError(
+                "sparse d256 forward (sm107): an e4m3 O needs out_scale (the 1-element fp32 per-tensor DEQUANT scale: the stored byte is "
+                "e4m3(O * sigmoid(G) * div.rn(1, out_scale)))"
+            )
+        if self.gate is None:
+            raise NotImplementedError(
+                "sparse d256 forward (sm107): an e4m3 O is served with the epilogue_gate only (the fused store is the GATED split combine's: "
+                "O32 * sigmoid(G) * div.rn(1, out_scale) rounded once); an ungated e4m3 store is not wired -- declare epilogue_gate or a half O"
+            )
+        if self.thd:
+            raise NotImplementedError(
+                "sparse d256 forward (sm107): thd=True has no split combine (the packed form stores O in its epilogue): the e4m3 store needs the dense "
+                "BSHD or paged decode chain -- declare a half O under THD"
+            )
+        sc = self.out_scale
+        if str(sc.dtype) != "torch.float32" or _shape(sc) != (1,) or not sc.is_contiguous():
+            raise ValueError(
+                f"sparse d256 forward (sm107): out_scale must be a contiguous float32 tensor of ONE element (the per-tensor dequant scale); got {sc.dtype} "
+                f"{_shape(sc)}"
+            )
+        return True
+
+    def _sm_count_for_rule(self) -> int:
+        """The SM count the lean k rule's fill model reads (information: the default k is capped at 1), 0 for a storage-free / non-CUDA Q."""
+        dev = getattr(self.q, "device", None)
+        if dev is None:
+            return 0
+        import torch
+
+        try:
+            d = torch.device(dev)
+        except (TypeError, ValueError, RuntimeError):
+            return 0
+        if d.type != "cuda" or not torch.cuda.is_available():
+            return 0
+        return _device_sm_count(d)
+
+    def _resolve_tile_form(self, B: int, SQ: int, KH: int, G: int, cc, max_tiles: int) -> None:
+        """Which BODY serves this declaration and at which split (the module docstring's TWO BODIES paragraph).  ``tile_form="auto"`` ->
+        :func:`heuristics.sparse_tile_form_auto` (the tcgen05 core unless the part is in ``SPARSE_LEAN_TILE_DEFAULT_CCS``, the lean body
+        admissible, the placement rule for it and the pinned split, if any, a lean split); an explicit body as given.  The LEAN body:
+        the admissibility declines by name (:func:`heuristics.sparse_lean_tile_decline`), then ``split_kv`` as a lean split that SELECTS k
+        (``ceil(n_sub / k)``; unset = the default k of :func:`heuristics.sparse_lean_sub_tiles_per_cta` or the pinned ``sub_tiles_per_cta``),
+        k in ``1 .. min(8, n_sub - 1)``; ``self.split_kv`` becomes the lean split and ``self.sub_tiles_per_cta`` the k.  The TCGEN05 core:
+        ``split_kv`` up to ``ceil((top_k + 1) / 32)`` as before; a ``sub_tiles_per_cta`` pin is refused by name (never silently ignored)."""
+        from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd import sparse_tile_rules as H
+        from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.sparse_tile_rules import lean_sparse_n_sub, lean_sparse_split
+
+        split_req = self.split_kv_requested
+        reason = H.sparse_lean_tile_decline(
+            s_q=SQ,
+            group=G,
+            top_k=self.top_k,
+            thd=self.thd,
+            bottom_right=self.bottom_right,
+            list_per_sequence=self.list_per_sequence,
+            seq_kv_lens_present=self.seq_kv_lens is not None,
+            half_dtype=True,  # the dtypes were validated above
+            softmax_groups=self.softmax_groups,
+        )
+        if self.tile_form_requested == H.SPARSE_TILE_FORM_AUTO:
+            form = H.sparse_tile_form_auto(
+                batch=B, h_kv=KH, s_q=SQ, top_k=self.top_k, device_cc=cc, admissible=reason is None, split_pinned=split_req if split_req > 1 else None
+            )
+        else:
+            form = self.tile_form_requested
+        if form == H.SPARSE_TILE_FORM_LEAN:
+            if reason is not None:
+                raise NotImplementedError(f"sparse d256 forward (sm107): tile_form='lean' -- {reason}")
+            n_sub = lean_sparse_n_sub(self.top_k)
+            splits = H.sparse_lean_splits(self.top_k)
+            k_max = H.sparse_lean_max_sub_tiles_per_cta(self.top_k)
+            k_pin = self.sub_tiles_per_cta_requested
+            if split_req > 1:
+                if split_req not in splits:
+                    raise NotImplementedError(
+                        f"sparse d256 forward (sm107): split_kv={split_req} is not a lean split of top_k {self.top_k}: the lean tile's splits are {splits} "
+                        f"(ceil(n_sub / k) at n_sub = {n_sub}; the split SELECTS k, the sub-tiles per CTA) -- pin one of them, or leave split_kv unset for the "
+                        f"default k; the tcgen05 core (tile_form='tcgen05') takes any split in [1, {max_tiles}]"
+                    )
+                # the explicit k is THE k when given (ceil(n_sub / split) is not its inverse: at top_k 32 the splits of k 3 and k 4 are both 2);
+                # the split must then be ITS lean split
+                k = int(k_pin) if k_pin is not None else -(-n_sub // split_req)
+                if k_pin is not None and lean_sparse_split(self.top_k, k) != split_req:
+                    raise ValueError(
+                        f"sparse d256 forward (sm107): sub_tiles_per_cta={k} and split_kv={split_req} disagree: the lean split of k {k} at top_k "
+                        f"{self.top_k} is ceil({n_sub} / {k}) = {lean_sparse_split(self.top_k, k)} -- pin one of the two"
+                    )
+            else:
+                k = (
+                    int(k_pin)
+                    if k_pin is not None
+                    else H.sparse_lean_sub_tiles_per_cta(batch=B, h_kv=KH, s_q=SQ, group=G, top_k=self.top_k, sm_count=self._sm_count_for_rule())
+                )
+            if not 1 <= k <= k_max:
+                raise NotImplementedError(
+                    f"sparse d256 forward (sm107): sub_tiles_per_cta={k} must be in [1, {k_max}] at top_k {self.top_k} (n_sub {n_sub}: the sub-tile loop is "
+                    f"unrolled at trace time, and k = n_sub would be ONE chunk = split 1 -- the lean tile always splits; a one-chunk list is the tcgen05 core's)"
+                )
+            self.split_kv = lean_sparse_split(self.top_k, k)
+            self.sub_tiles_per_cta = k
+        else:
+            if self.sub_tiles_per_cta_requested is not None:
+                raise NotImplementedError(
+                    f"sparse d256 forward (sm107): sub_tiles_per_cta={self.sub_tiles_per_cta_requested} is the lean tile's pin (its 32-key sub-tiles per CTA), but the "
+                    f"resolved tile_form is 'tcgen05' (requested {self.tile_form_requested!r}"
+                    + (f": {reason}" if reason is not None else ": the placement rule / the measured-default set keep the tcgen05 core here")
+                    + ") -- declare tile_form='lean' to force the lean body, or drop the pin"
+                )
+            if split_req > max_tiles:
+                raise NotImplementedError(
+                    f"sparse d256 forward (sm107): split_kv={split_req} exceeds the item's maximum tile count ceil((top_k + 1) / 32) = {max_tiles} at "
+                    f"top_k={self.top_k} on the tcgen05 core -- a larger split has an empty chunk (a dead work item) on every item"
+                )
+            self.split_kv = split_req
+            self.sub_tiles_per_cta = None
+        self.tile_form = form
+
+    @property
+    def kernel_template(self) -> Optional[str]:
+        """The body ``compile`` loads, by its module stem (``heuristics.SPARSE_TILE_LEAN`` / ``SPARSE_TILE_TCGEN05``): the readback a caller
+        pins its route against; None before ``check_support`` resolved the form."""
+        from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.sparse_tile_rules import SPARSE_TILE_FORM_LEAN, SPARSE_TILE_LEAN, SPARSE_TILE_TCGEN05
+
+        if self.tile_form is None:
+            return None
+        return SPARSE_TILE_LEAN if self.tile_form == SPARSE_TILE_FORM_LEAN else SPARSE_TILE_TCGEN05
+
+    @property
+    def lean(self) -> bool:
+        """Whether the resolved body is the lean tile (after ``check_support``)."""
+        from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.sparse_tile_rules import SPARSE_TILE_FORM_LEAN
+
+        return self.tile_form == SPARSE_TILE_FORM_LEAN
 
     @staticmethod
     def _check_block_lens_form(bl, B: int, SQ: int, per_sequence: bool = False) -> None:
@@ -799,11 +1127,13 @@ class SparseGqaFwdDslSm107:
         folds a 0 here.  ``split_kv > 1``: the fp32 O / LSE PARTIAL slabs the kernel writes and the combine reads (split-major,
         ``(B x S, S_q, H, D)`` + ``(B x S, H, S_q)``, 16-byte aligned; plus a final-LSE scratch when no LSE output is declared).
         THD: the int32 metadata buffer the setup launch fills (``THD_META_WORDS(B) = 4 B + 4`` words, 16-byte rounded: the
-        per-sequence KV lengths, both prefix sums, the live unit total and the claim counter)."""
-        if not self.thd and self.split_kv <= 1:
-            return 0
+        per-sequence KV lengths, both prefix sums, the live unit total and the claim counter).  The plan is RESOLVED first
+        (``check_support``): on the lean body ``split_kv`` becomes the lean split there, so a caller asking for the scratch size
+        before ``check_support()`` gets the slab, never the requested split's 0."""
         if not self._G:
             self.check_support()
+        if not self.thd and self.split_kv <= 1:
+            return 0
         if self.thd:
             return self._thd_meta_bytes(self._NSEQ)
         return self._split_workspace_bytes()
@@ -815,7 +1145,7 @@ class SparseGqaFwdDslSm107:
 
         if not self._G:
             self.check_support()
-        return TemplateParams(
+        kw = dict(
             dtype_qkv=self._dtype_code,
             cta_mma=1,
             pack_gqa=True,
@@ -831,21 +1161,37 @@ class SparseGqaFwdDslSm107:
             epilogue_gate=self.gate is not None and self.split_kv <= 1,
             split_kv=self.split_kv,
             bottom_right=self.bottom_right,
-            qsa_list_per_sequence=self.list_per_sequence,
+            # the lean body is ONE rendering per list form: the shared list (its config requires it); the per-row list at ONE row per sequence
+            # (admitted by _resolve_tile_form at S_q 1) IS that list -- block_ids [B, 1, top_k] / block_lens [B, 1] are the shared [B, top_k] /
+            # [B] bytes, the step-0 anchor is the row's own position -- so the template is loaded in its shared form and the bound tensors need
+            # no view; the tcgen05 core keeps the declared form (its per-token arm is its own rendering)
+            qsa_list_per_sequence=self.list_per_sequence or self.lean,
             qsa_softmax_groups=self.softmax_groups,
         )
+        if self.lean:
+            # the lean tile's OWN record (config_sm107.TemplateParamsLean: the shared record plus the appended compile-time S_q axis): the
+            # rendering holds every row of the step -- N_MT = ceil(S_q x G / 16) m16 tiles over ONE gathered sub-tile --, so the host entry's
+            # problem_size SQ equals CFG.S_Q (its contract); the tcgen05 core keeps the shared record (no appended field: its digest and
+            # compiled-plan keys are what they were)
+            from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.config_sm107 import TemplateParamsLean
+
+            # the resolved k rides the record too: an explicit pin survives template lowering (ceil(n_sub / split) is not invertible) and
+            # two pins are two cache identities
+            return TemplateParamsLean(**kw, decode_seqlen_q=self._SQ, sub_tiles_per_cta=int(self.sub_tiles_per_cta or 0))
+        return TemplateParams(**kw)
 
     def combine_form(self) -> int:
         """The split combine entry's kernel FORM this plan compiles (``split_combine.DECODE_GRID_AUTO`` / ``DECODE_GRID_OFF`` /
         ``DECODE_GRID_LEAN_WALK``): :func:`_sparse_combine_decode_grid` on the declared ``(B, H_q, S_q)``, the split and the device --
-        a plan-time fact, read after ``check_support`` (which it runs when needed); ``DECODE_GRID_OFF`` unsplit (no combine launch)."""
+        a plan-time fact, read after ``check_support`` (which it runs when needed); ``DECODE_GRID_OFF`` unsplit (no combine launch).  A LEAN
+        plan on cc 10.0 follows the cc 10.7 rule's shape (``sparse_tile_rules.SPARSE_LEAN_COMBINE_RULE_CCS``, measured there)."""
         from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.kernels.sm100 import split_combine
 
         if not self._G:
             self.check_support()
         if self.split_kv <= 1:
             return split_combine.DECODE_GRID_OFF
-        return _sparse_combine_decode_grid(self._B, self._H, self._SQ, self.split_kv, self._device_cc())
+        return _sparse_combine_decode_grid(self._B, self._H, self._SQ, self.split_kv, self._device_cc(), lean=self.lean)
 
     def compile(self, has_block_lens: Optional[bool] = None):
         """Load the template for this specialization and compile its pointer ABI (one artifact per (dtype, group, top_k,
@@ -875,8 +1221,11 @@ class SparseGqaFwdDslSm107:
             from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.template_loader import load_template
 
             params = self.template_params()
-            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", KERNEL_FILE)
-            self._module = load_template(path, params, tag="sdpa_fwd_sm107_sparse_d256")
+            # the BODY (tile_form, resolved by check_support): the lean tile's template takes the same TemplateParams (its split_kv = the lean
+            # split selects k) under its own tag -- two module caches, never a shared compiled artifact
+            lean = self.lean
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", KERNEL_FILE_LEAN if lean else KERNEL_FILE)
+            self._module = load_template(path, params, tag="sdpa_fwd_sm107_sparse_lean" if lean else "sdpa_fwd_sm107_sparse_d256")
         # Under a split the kernel's LSE is the fp32 PARTIAL (always written: it drives the combine); the caller's LSE presence
         # selects the combine's final-LSE target (the output, or the workspace scratch).
         # Their outer functools.lru_cache keys only on arguments. Bypass it so compiled_cache's device/context-aware memo
@@ -899,8 +1248,11 @@ class SparseGqaFwdDslSm107:
             tag = "bf16" if self._dtype_code == 2 else "f16"
             form = self.combine_form()
             compile_combine = getattr(split_combine.compile_ptr, "__wrapped__", split_combine.compile_ptr)
+            # the FUSED gated e4m3 store (fused_e4m3): the gated entry's frame plus the static DEQUANT scale, the e4m3 output rounded once --
+            # or, under out_rounding="staged" (check_support admits it with the fused store and bf16 operands only), a serving stack's
+            # gate-and-quantize order; the convention is compiled into the entry (in its cache key), never a runtime slot
             owner = compile_combine(
-                dtype_o=tag,
+                dtype_o="e4m3" if self.fused_e4m3 else tag,
                 dtype_partial="f32",
                 has_lse=True,
                 stats_log2=False,
@@ -908,6 +1260,8 @@ class SparseGqaFwdDslSm107:
                 dtype_gate=tag if self.gate is not None else None,
                 decode_grid=form,
                 use_pdl=self.use_pdl,
+                gate_e4m3=self.fused_e4m3,
+                out_rounding=self.out_rounding,
             )
             entry = positional_entry(owner)
             if entry is None:
@@ -952,6 +1306,7 @@ class SparseGqaFwdDslSm107:
         seq_q_lens=None,
         workspace=None,
         gate=None,
+        out_scale=None,
     ):
         """Launch on ``stream`` (default: the framework's current stream).  Validation only -- no conversion, no allocation.
 
@@ -963,7 +1318,7 @@ class SparseGqaFwdDslSm107:
         variant, ``None`` -> the kernel's derived default count -- the variant must have been compiled (:meth:`compile`), never
         compiled here.  THD: ``seq_q_lens`` binds like the others and ``workspace`` (the metadata buffer,
         :meth:`scratch_workspace_bytes`, 16-byte aligned) is the one operand that need not match a declaration -- any buffer of
-        at least the size serves."""
+        at least the size serves.  ``out_scale`` (appended) binds like the others on a fused e4m3 declaration (its presence is compiled in)."""
         if not self._G:
             self.check_support()
         q = self._bind("q", q, self.q, required=True)
@@ -982,6 +1337,7 @@ class SparseGqaFwdDslSm107:
                 raise ValueError("sparse d256 forward (sm107): thd=True needs the metadata workspace at execute(workspace=) (scratch_workspace_bytes() bytes)")
             self._check_workspace(ws, self._NSEQ)
         gate = self._bind("gate", gate, self.gate, required=self.gate is not None)
+        out_scale = self._bind("out_scale", out_scale, self.out_scale, required=self.fused_e4m3)
         # every pointer handed to the kernel with assumed_align=16 starts on a 16-byte boundary (a storage-offset view is refused by name)
         for name, t in (("Q", q), ("K", k), ("V", v), ("O", o), ("block_ids", ids), ("the epilogue gate", gate)):
             _require_16b_base(name, t)
@@ -1014,6 +1370,7 @@ class SparseGqaFwdDslSm107:
             ("block_table", table),
             ("seq_q_lens", seq_q_lens),
             ("gate", gate),
+            ("out_scale", out_scale),
             ("workspace", ws),
         ):
             _require_cuda_device(name, t, device)
@@ -1026,9 +1383,9 @@ class SparseGqaFwdDslSm107:
         import torch
 
         with torch.cuda.device(device):
-            return self._execute_on_device(q, k, v, o, ids, lse, lens, seq_kv_lens, table, seq_q_lens, ws, gate, fn, stream)
+            return self._execute_on_device(q, k, v, o, ids, lse, lens, seq_kv_lens, table, seq_q_lens, ws, gate, fn, stream, out_scale)
 
-    def _execute_on_device(self, q, k, v, o, ids, lse, lens, seq_kv_lens, table, seq_q_lens, ws, gate, fn, stream):
+    def _execute_on_device(self, q, k, v, o, ids, lse, lens, seq_kv_lens, table, seq_q_lens, ws, gate, fn, stream, out_scale=None):
         import torch
         import cutlass
         import cuda.bindings.driver as cuda_driver
@@ -1086,7 +1443,7 @@ class SparseGqaFwdDslSm107:
             o_ptr, o_strides = P(o, half), _strides(o)[:3]
             lse_ptr, lse_strides = P(lse, cutlass.Float32, 4), (_strides(lse)[:3] if lse is not None else (0, 0, 0))
             kernel_gate = gate
-        fn(
+        common = dict(
             q_ptr=P(q, half),
             k_ptr=P(k, half),
             v_ptr=P(v, half),
@@ -1104,11 +1461,19 @@ class SparseGqaFwdDslSm107:
             scale_softmax_log2=cutlass.Float32(self.scale * math.log2(math.e)),
             block_table_ptr=P(table, cutlass.Int32, 4),
             paged_geom=paged_geom,
-            gate_ptr=P(kernel_gate, half),
-            gate_strides=_strides(kernel_gate)[:3] if kernel_gate is not None else (0, 0, 0),
             stream=stream,
-            **thd_kw,
         )
+        if self.lean:
+            # the lean body's ABI: the tcgen05 core's minus the arms it does not carry (the epilogue gate rides the combine, no THD slots);
+            # the slab pointers above are the split partials (the lean tile always splits)
+            fn(**common)
+        else:
+            fn(
+                gate_ptr=P(kernel_gate, half),
+                gate_strides=_strides(kernel_gate)[:3] if kernel_gate is not None else (0, 0, 0),
+                **common,
+                **thd_kw,
+            )
         if self.split_kv > 1:
             # The second launch on the same stream: the positional combine entry (partials, O, final LSE, (B, H, S_q, D), the
             # split count, O's four BSHD strides, the LSE's three, [the gate's pointer + four BSHD strides,] the stream).
@@ -1117,4 +1482,6 @@ class SparseGqaFwdDslSm107:
             args = [base + o_off, base + lse_off, int(o.data_ptr()), lse_final, (B, H, SQ, _D), S, tuple(_strides(o)[:4]), lse_final_strides]
             if gate is not None:
                 args += [int(gate.data_ptr()), tuple(_strides(gate)[:4])]
+            if self.fused_e4m3:
+                args.append(int(out_scale.data_ptr()))  # the fused entry's static DEQUANT scale, right after the gate strides
             self._combine(*args, int(stream))

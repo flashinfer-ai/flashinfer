@@ -390,6 +390,8 @@ class MoELayer:
         Only runners that support this pack's ``routing_input_mode`` compete —
         not every backend has an in-kernel router — and the winner is cached
         per ``(token-count bucket, mode)`` so repeated calls skip reselection.
+        Candidate pools containing Frost low-latency use exact token counts
+        because their bounded tactics need not cover every row in a bucket.
 
         Parameters
         ----------
@@ -445,6 +447,14 @@ class MoELayer:
             )
 
         bucket = map_to_hybrid_bucket(act_pack.num_tokens, ceiling)
+        # Frost's bounded decode tactics can require exactly T=4 or T=8.
+        # Sharing their winner with T=3 or T=5..7 is not a valid specialization.
+        # Other candidate pools retain hybrid bucketing; Frost admits at most
+        # eight token counts, so exact keys remain bounded.
+        if any(
+            isinstance(self.runners[index], FrostLowLatencyRunner) for index in eligible
+        ):
+            bucket = act_pack.num_tokens
         # Candidate positions distinguish different options for the same backend
         # and prevent changing weight views or shape eligibility from reusing a winner.
         winner_key = (bucket, mode, eligible)

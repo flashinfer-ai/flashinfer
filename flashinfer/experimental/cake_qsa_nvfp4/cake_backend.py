@@ -39,7 +39,12 @@ ties every measured alternative there.  On an RTX PRO 6000 (188 SMs, two CTAs
 per SM) the formula gives 33, 33, 33, 23, 11, 5, 2, 1 and the table replaces
 rows 4, 8, 16 and 32 with 16, 11, 5 and 3 (measured whole call in both forms,
 both layouts, both L2 flushes: +15 to +39 % at rows 4 and 8, +2 to +8 % at rows
-16 and 32; rows 1 and 2 keep 33, where 16 splits lose 7 % after a read flush).
+16 and 32; rows 1 and 2 keep 33, where 16 splits lose 7 % after a read flush)
+and rows 64 with 1: one whole-tile CTA of 33 tiles per (row, KV head) and no
+merge, +5 to +13 % whole call over the formula's two splits on three units
+(both layouts, both L2 flushes, calls back to back, behind an L2 flush in the
+stream and lone synchronous calls), whose 256 CTAs run two per SM on 68 SMs
+and add the merge; rows 128 keep the formula's 1.
 That is the *plain* split count (:func:`plain_splits`).  Where the persistent
 walk serves the call (:func:`select_walk`, below) ``num_splits`` is instead the
 walk's partial slots per (row, KV head), :func:`cake_jit.walk_splits` -- 2 for
@@ -226,7 +231,10 @@ _SQRT_HEAD_DIM = math.sqrt(HEAD_DIM)
 # RTX PRO 6000 (188 SMs, the mma.sync decode's two CTAs per SM): rows 4 take 16 splits, rows 8 take 11, rows 16 take 5
 # and rows 32 take 3 (about half the formula's 33 / 23 / 11 / 5: fewer CTAs of two to seven tiles beat the formula's
 # one-tile CTAs whole call in both forms, both layouts, both flushes); rows 1 and 2 keep 33 (16 splits win after a memset
-# flush yet lose 7 % after a read flush) and rows 64 and 128 keep the formula (4 and 2 splits lose 3 to 7 %).
+# flush yet lose 7 % after a read flush); rows 64 take 1 (one whole-tile CTA of 33 tiles per (row, KV head), no merge:
+# +5 to +13 % whole call over the formula's 2 splits on three units, both layouts, both flushes, back-to-back / flushed-
+# stream / lone-call regimes -- the two-split cut's 256 CTAs run two per SM on 68 SMs and add the merge; 4 splits lose
+# 3 to 7 %) and rows 128 keep the formula (2 splits lose 3 to 7 %).
 SPLIT_OVERRIDES: dict[tuple[int, int], int] = {
     (132, 4): 16,
     (132, 8): 8,
@@ -236,6 +244,7 @@ SPLIT_OVERRIDES: dict[tuple[int, int], int] = {
     (188, 8): 11,
     (188, 16): 5,
     (188, 32): 3,
+    (188, 64): 1,
 }
 
 

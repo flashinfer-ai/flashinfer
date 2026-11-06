@@ -1220,9 +1220,9 @@ def _resolve_dsv4_sparse_mla_backend(
 ) -> Literal["trtllm-gen", "cute-dsl", "sparse", "cake"]:
     cc = get_compute_capability(device)
     is_sm100_family = cc in ((10, 0), (10, 3), (10, 7))
-    # CuTe DSL HCA and the SM100 CAKE kernels require SM100/SM103;
-    # only the prebuilt cubin backend additionally covers SM107.
-    is_sm100_or_sm103 = cc in ((10, 0), (10, 3))
+    # The SM100 CAKE kernels build for SM100/SM103 and, for the FP8 decode
+    # route, SM107 (run_cake_dsv4 refuses a route SM107 has no program for).
+    is_cake_sm100_family = is_sm100_family
     is_sm120_family = cc in ((12, 0), (12, 1))
     if requested_backend == "auto":
         if is_sm120_family:
@@ -1242,15 +1242,16 @@ def _resolve_dsv4_sparse_mla_backend(
         raise ValueError(
             f"backend={requested_backend!r} requires SM100/SM103/SM107, got SM{cc[0]}{cc[1]}"
         )
-    if requested_backend == "cute-dsl" and not is_sm100_or_sm103:
+    if requested_backend == "cute-dsl" and not is_sm100_family:
         raise ValueError(
-            f"backend='cute-dsl' requires SM100/SM103, got SM{cc[0]}{cc[1]}"
+            f"backend='cute-dsl' requires SM100/SM103/SM107, got SM{cc[0]}{cc[1]}"
         )
     if requested_backend == "sparse" and not is_sm120_family:
         raise ValueError(f"backend='sparse' requires SM120/SM121, got SM{cc[0]}{cc[1]}")
-    if requested_backend == "cake" and not (is_sm100_or_sm103 or is_sm120_family):
+    if requested_backend == "cake" and not (is_cake_sm100_family or is_sm120_family):
         raise ValueError(
-            f"backend='cake' requires SM100/SM103 or SM120/SM121, got SM{cc[0]}{cc[1]}"
+            "backend='cake' requires SM100/SM103/SM107 or SM120/SM121, "
+            f"got SM{cc[0]}{cc[1]}"
         )
     return cast(Literal["trtllm-gen", "cute-dsl", "sparse", "cake"], requested_backend)
 
@@ -1888,7 +1889,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     the packed backend's final base-2 LSE and finite-sink semantics are
     documented in :meth:`SparseMLASm120Wrapper.run`.
 
-    With ``backend="cute-dsl"`` on SM100/SM103, this calls the DeepSeek V4
+    With ``backend="cute-dsl"`` on SM100/SM103/SM107, this calls the DeepSeek V4
     HCA kernel. Its SWA stream consumes arbitrary physical token-row indices,
     matching the TRTLLM-GEN dynamic-token-sparse ABI, while its compressed
     stream consumes physical page IDs. HCA currently accepts dense FP8 E4M3
@@ -1933,7 +1934,9 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     :func:`flashinfer.mla.dsv41_fp4_quantize_pack_sparse_mla_cache`.
 
     With ``backend="cake"`` on SM100/SM103, this calls the source-level CAKE
-    kernels (``flashinfer.mla.cake_dsv4``). The metadata may describe fewer
+    kernels (``flashinfer.mla.cake_dsv4``); on SM107 the FP8 cache's decode
+    route runs them (the FP8 persistent, M64 and low-head prefill programs),
+    and any other route raises. The metadata may describe fewer
     tokens than ``query`` provides: with dense ``[B, Q, H, D]`` input the
     table rows cover the first ``T <= B * Q`` flattened tokens (padded batch),
     with ragged ``[sum_q, H, D]`` input the first ``T <= sum_q`` rows. Query
@@ -2054,10 +2057,13 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         ``cum_seq_lens_q``.
     enable_pdl : Optional[bool]
         Whether to enable Programmatic Dependent Launch. Used by the
-        TRTLLM-GEN path and, on SM120/SM121, by ``backend="cake"`` with
+        TRTLLM-GEN path; on SM100/SM103/SM107 by ``backend="cake"`` for its
+        FP8 persistent, M64 and low-head prefill programs and, on SM100/SM103,
+        its FP8 H64 cluster program (the other BF16 / FP8 programs launch
+        without it); and on SM120/SM121 by ``backend="cake"`` with
         ``kv_cache_format="fp8_dsv41_fp4_ca"`` (its split merge is launched as a
-        programmatic dependent of the decode grid; ``None`` follows the device
-        default). The NVFP4 Cake family rejects ``True``.
+        programmatic dependent of the decode grid). ``None`` follows the device
+        default. The NVFP4 Cake family rejects ``True``.
     swa_topk_lens : Optional[torch.Tensor]
         Active SWA segment lengths, shape ``[sum_q]`` INT32. On SM120/SM121
         these are sparse-segment lengths. HCA requires them as its per-row
@@ -2383,14 +2389,17 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     # On SM120/SM121, backend="cake" selects the Cake NVFP4 sparse-MLA decode,
     # which shares the SM120 "sparse" call surface (swa_topk_lens, dual cache).
     cake_sm120 = backend == "cake" and _is_sm120_family(query.device)
-    if backend == "cake":
-        # The DeepSeek-V4.1 mixed-cache Cake family launches its split merge as a
-        # programmatic dependent of the decode grid (None = device default); the
-        # NVFP4 Cake family has no PDL launch option.
-        if not (cake_sm120 and kv_cache_format == "fp8_dsv41_fp4_ca"):
-            if enable_pdl:
-                raise ValueError("backend='cake' does not support enable_pdl")
-            enable_pdl = False
+    if backend == "cake" and kv_cache_format == "nvfp4":
+        # The NVFP4 Cake family has no PDL launch option.  The DeepSeek-V4.1
+        # mixed-cache family launches its split merge as a programmatic
+        # dependent of the decode grid, and the SM100/SM103 BF16 / FP8 programs
+        # that support it launch as programmatic dependents (None = device
+        # default for both).
+        if enable_pdl:
+            raise ValueError(
+                "backend='cake' with kv_cache_format='nvfp4' does not support enable_pdl"
+            )
+        enable_pdl = False
     elif enable_pdl is None:
         enable_pdl = device_support_pdl(query.device)
     if isinstance(bmm1_scale, torch.Tensor):
@@ -2641,6 +2650,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
             seq_lens=seq_lens,
             backend="cake",
             out_shape=tuple(expected_out_shape),
+            enable_pdl=bool(enable_pdl),
         )
 
     primary_kv_cache = compressed_kv_cache

@@ -13,25 +13,30 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-The KCP registry (``cake_kcp_jit``) and manifests of the Cake packed KDA training package: the records against the
-frozen kernel ABIs, the program names against the identity rule, ``build.json`` (the shipped programs, never a
-test-only one) and ``build.test.json`` (the test-only programs, loadable only under ``CAKE_KCP_TEST_KNOBS=1``).
-No device is needed; nothing is built or launched.
+The KCP registry (``cake_kcp_jit``) and manifests of the non-deterministic Cake packed KDA training package
+``flashinfer.experimental.cake_kda_train_kcp``: the records against the frozen kernel ABIs, the program names against
+the identity rule (under this package's ``cake_kda_train_`` prefix), ``build.json`` (the shipped programs, never a
+test-only one) and ``build.test.json`` (the test-only programs, loadable only after ``cake_kcp_plan.enable_test_knobs()``),
+and the carried programs: every record and unit is the deterministic package's under this package's names (the KCP
+programs have no non-deterministic form).  No device is needed; nothing is built or launched.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 
 import pytest
 
 from tests.test_helpers.cake_package import cake_package
 
-cake_build = cake_package("cake_kda_train", "cake_build")
-cake_jit = cake_package("cake_kda_train", "cake_jit")
-kcp_jit = cake_package("cake_kda_train", "cake_kcp_jit")
+cake_build = cake_package("cake_kda_train_kcp", "cake_build")
+det_kcp_jit = cake_package("cake_kda_det_train_kcp", "cake_kcp_jit")
+cake_jit = cake_package("cake.cake_kda_train", "cake_jit")
+kcp_jit = cake_package("cake_kda_train_kcp", "cake_kcp_jit")
+kcp_plan = cake_package("cake_kda_train_kcp", "cake_kcp_plan")
 
 PACKAGE_DIR = Path(cake_build.__file__).parent
 ARCHES = ("sm_100a", "sm_103a", "sm_107a")
@@ -92,7 +97,10 @@ PLANS = {
     "kcp_fwdh_tape_full": FWDH_PLAN,
     "kcp_dhu_tape_full": DHU_PLAN,
 }
-# The identity rule: ``cake_kda_train_<20 hex of sha256("<tart module>\\n<sorted JSON of the build keywords>")>``.
+# The identity rule: ``cake_kda_train_<20 hex of sha256("<source module>\\n<sorted JSON of the build keywords>")>``,
+# then ``_kcp`` for a program only the context-parallel route runs (every one but the single-rank ``dav`` stage).
+# The digest hashes the source module path the program shipped under, so the digests are those of the previous names
+# (``kcp_fwd_o``'s KCP module is new: its path is its own).
 _W = "sm100_sm103_sm107"
 IDENTITIES = {
     "kcp_fwdh_offset": (
@@ -131,7 +139,7 @@ IDENTITIES = {
         f"tart.kda_chunk_kcp_affine_merge.{_W}.kda_chunk_kcp_affine_merge_fp32_v1",
         {"cols_per_cta": 16},
     ),
-    "kcp_fwd_o": (f"tart.kda_chunk_fwd_o.{_W}.kda_chunk_train_fwd_o_v1", {}),
+    "kcp_fwd_o": (f"tart.kda_chunk_kcp_fwd_o.{_W}.kda_chunk_det_fwd_o_v1_kcp", {}),
     "kcp_dav": (f"tart.kda_chunk_bwd_dav.{_W}.kda_chunk_train_bwd_dav_v1", {}),
     "kcp_transfer_walk_three_mma": (
         f"tart.kda_chunk_kcp_transfer_walk.{_W}.kda_chunk_kcp_transfer_walk_v1",
@@ -158,6 +166,11 @@ IDENTITIES = {
         {"program": "tape"},
     ),
 }
+
+
+# The chunk stage the route runs at the rank's shape with the single-rank kernel: a program without the ``_kcp``
+# suffix (``kcp_fwd_o`` runs the KCP output program).
+CHUNK_STAGES = ("kcp_dav",)
 
 
 def _records() -> dict[str, dict]:
@@ -227,10 +240,13 @@ def test_program_names_follow_the_identity_rule() -> None:
         digest = hashlib.sha256(
             f"{module}\n{json.dumps(kwargs, sort_keys=True)}".encode()
         ).hexdigest()
-        assert _records()[name]["library"] == f"cake_kda_train_{digest[:20]}", name
+        suffix = "" if name in CHUNK_STAGES else "_kcp"
+        assert _records()[name]["library"] == f"cake_kda_train_{digest[:20]}{suffix}", (
+            name
+        )
     libraries = [record["library"] for record in _records().values()]
     assert len(set(libraries)) == len(libraries), "every record is its own program"
-    assert not set(libraries) & set(cake_jit.MODULES), (
+    assert not set(libraries) & {r["library"] for r in cake_jit.MODULES.values()}, (
         "no KCP program shares a name with a single-rank one"
     )
 
@@ -282,13 +298,20 @@ def test_selection_and_grids() -> None:
     )
     with pytest.raises(ValueError):
         kcp_jit.launch_grid("kcp_fwdh_offset", n_walk=0, num_heads=4)
-    # the chunk stages: persistent CTAs bounded by the SMs, one CTA per chunk pair and head
+    # the chunk stages: one CTA per (chunk, head) tile whatever the SM count, one CTA per chunk pair and head
     assert kcp_jit.launch_grid(
         "kcp_fwd_o", num_chunks_pad=10, num_heads=3, sm_count=152
     ) == (30, 1, 1)
     assert kcp_jit.launch_grid(
         "kcp_fwd_o", num_chunks_pad=400, num_heads=4, sm_count=152
-    ) == (152, 1, 1)
+    ) == (1600, 1, 1)
+    assert kcp_jit.launch_grid("kcp_fwd_o", num_chunks_pad=268, num_heads=64) == (
+        17152,
+        1,
+        1,
+    )
+    with pytest.raises(ValueError):
+        kcp_jit.launch_grid("kcp_fwd_o", num_chunks_pad=0, num_heads=4, sm_count=152)
     assert kcp_jit.launch_grid("kcp_dav", num_chunks_pad=10, num_heads=3) == (5, 3, 1)
     with pytest.raises(ValueError):
         kcp_jit.launch_grid("kcp_dav", num_chunks_pad=9, num_heads=3)
@@ -370,10 +393,10 @@ def test_walk_form_rules_and_records() -> None:
 def test_the_shipped_transfer_walk_is_the_half_width_bf16x3_program() -> None:
     record = kcp_jit.MODULES["kcp_transfer_walk"]
     assert record["grid_rule"] == {"ctas_per_head": 2, "kind": "kcp_segments_heads"}
-    assert record["library"] == "cake_kda_train_9a3f306bacf8c8a1547d"
+    assert record["library"] == "cake_kda_train_9a3f306bacf8c8a1547d_kcp"
     previous = kcp_jit.TEST_MODULES["kcp_transfer_walk_tf32_hilo"]
     assert previous["grid_rule"] == {"kind": "kcp_segments_heads"}
-    assert previous["library"] == "cake_kda_train_1ac972f0cb7cc7b13cf7"
+    assert previous["library"] == "cake_kda_train_1ac972f0cb7cc7b13cf7_kcp"
     assert previous["test_knobs"] == {"transfer_walk": "tf32_hilo"}
     assert kcp_jit.TRANSFER_WALKS[0] == "bf16x3_hw64"
 
@@ -408,19 +431,45 @@ def test_shipped_manifest_lists_the_kcp_programs_and_no_test_only_one() -> None:
     assert not names & test_only
 
 
+# The PTX ISA 8.8 instructions (CUDA 12.9; CUDA 12.8's ptxas refuses them): a 256-bit ld / st, a three-input
+# min / max.
+_PTX_ISA_8_8 = re.compile(
+    rb"\b(?:min|max)(?:\.\w+)*\s+%[^;,\"]+(?:,[^;,\"]+){3};"
+    rb"|\b(?:ld|st)(?:\.[\w:]+)*\.v8\.[bfsu]32\b"
+)
+
+
+@pytest.mark.parametrize("manifest", ["build.json", "build.test.json"])
+def test_an_entry_whose_units_use_ptx_isa_8_8_needs_cuda_12_9(manifest: str) -> None:
+    """An entry whose units use a PTX ISA 8.8 instruction (the 256-bit stores of the output stages and the
+    full-width tape walks) states ``min_cuda`` 12.9 or newer: CUDA 12.8 cannot build it."""
+    path = PACKAGE_DIR / manifest
+    if not path.is_file():
+        pytest.skip(f"{manifest} is not shipped here")
+    wide = []
+    for entry in json.loads(path.read_text())["libraries"]:
+        if any(
+            _PTX_ISA_8_8.search((PACKAGE_DIR / source).read_bytes())
+            for source in entry["sources"]
+        ):
+            wide.append(entry["name"])
+            assert tuple(map(int, entry["min_cuda"].split("."))) >= (12, 9), entry
+    assert any(name.endswith("_sm_100a") for name in wide), wide
+
+
 def test_test_manifest_is_the_test_only_programs_under_the_opt_in(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     path = PACKAGE_DIR / kcp_jit.TEST_MANIFEST
     if not path.is_file():
         pytest.skip(f"{kcp_jit.TEST_MANIFEST} is not shipped here")
-    kcp_jit.test_manifest.cache_clear()
-    monkeypatch.delenv(kcp_jit.TEST_KNOBS_ENV, raising=False)
+    kcp_jit._test_manifest.cache_clear()
+    monkeypatch.setattr(kcp_plan, "_TEST_KNOBS_ENABLED", False)
     assert kcp_jit.test_knobs_enabled() is False
-    with pytest.raises(RuntimeError, match=kcp_jit.TEST_KNOBS_ENV):
+    with pytest.raises(RuntimeError, match="enable_test_knobs"):
         kcp_jit.test_manifest()
-    monkeypatch.setenv(kcp_jit.TEST_KNOBS_ENV, "1")
-    kcp_jit.test_manifest.cache_clear()
+    monkeypatch.setattr(kcp_plan, "_TEST_KNOBS_ENABLED", True)
+    kcp_jit._test_manifest.cache_clear()
     assert kcp_jit.test_knobs_enabled() is True
     document = kcp_jit.test_manifest()
     shipped = cake_build.manifest()
@@ -428,7 +477,7 @@ def test_test_manifest_is_the_test_only_programs_under_the_opt_in(
     assert (
         document["package"]
         == shipped["package"]
-        == "flashinfer.experimental.cake_kda_train"
+        == "flashinfer.experimental.cake_kda_train_kcp"
     )
     # the shipped manifest is re-rendered by every kernel update of the package, the test-only manifest only when its
     # programs change: the two generator records share their form, not their stamp
@@ -455,6 +504,127 @@ def test_test_manifest_is_the_test_only_programs_under_the_opt_in(
     for name in kcp_jit.TEST_MODULES:
         for arch in ARCHES:
             assert kcp_jit.test_library_name(name, arch) in names
+    # an opt-out after the parse is cached closes the test-only programs again (the gate is outside the caches)
+    monkeypatch.setattr(kcp_plan, "_TEST_KNOBS_ENABLED", False)
+    with pytest.raises(RuntimeError, match="enable_test_knobs"):
+        kcp_jit.test_manifest()
+    with pytest.raises(RuntimeError, match="enable_test_knobs"):
+        kcp_jit.load_test(next(iter(kcp_jit.TEST_MODULES)), ARCHES[0])
+    monkeypatch.setattr(kcp_plan, "_TEST_KNOBS_ENABLED", True)
     with pytest.raises(RuntimeError):
         kcp_jit.test_library_name("kcp_transfer_walk_three_mma", "sm_90a")
-    kcp_jit.test_manifest.cache_clear()
+    kcp_jit._test_manifest.cache_clear()
+
+
+DET_PREFIX, PREFIX = "cake_kda_det_train_", "cake_kda_train_"
+# The deterministic package's programs this package has no form of: the fused forward walk (the forward state walk
+# with the chunk output inside it), whose records only the deterministic package ships.
+DET_ONLY_PROGRAMS = ("kcp_fwdh_o",)
+# The records whose builds differ between the two packages: the deterministic package ships newer builds of the
+# affine merge (selected by its MERGE_RULE), of the full-width offset walks (the adjoint one beside the plain build,
+# selected by its WALK_HEADS_RULE) and of the shipped transfer walk; this package keeps its own builds of these
+# records.  The deterministic package's
+# extra records belong to those programs.  Every other record and unit is the deterministic package's under this
+# package's names.
+OWN = {
+    "kcp_fwdh_offset": PREFIX + "7658fcc297c6fd906d53_kcp",
+    "kcp_dhu_offset": PREFIX + "1c66573e87150245374b_kcp",
+    "kcp_transfer_walk": PREFIX + "9a3f306bacf8c8a1547d_kcp",
+    "kcp_affine_merge_c8": PREFIX + "c6958a0a4ed5cb55a9a1_kcp",
+    "kcp_affine_merge_c16": PREFIX + "89f5ff59f03eb170e3bf_kcp",
+}
+
+
+def _library_stem(name: str) -> str:
+    return name.rsplit("_sm_", 1)[0]
+
+
+def _renamed(value):
+    """A deterministic record's value under this package's names (library stems and kernel symbols)."""
+    if isinstance(value, str):
+        return value.replace(DET_PREFIX, PREFIX)
+    if isinstance(value, dict):
+        return {k: _renamed(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_renamed(v) for v in value]
+    return value
+
+
+def test_the_records_are_the_deterministic_records_under_this_packages_names() -> None:
+    """The KCP programs have no non-deterministic form: both tables hold the deterministic package's records, every
+    field equal but the library stem and the kernel symbol, which carry the same twenty hex digits under this
+    package's prefix; no library or kernel symbol of this package is one of the deterministic package's.  The records
+    of ``OWN`` are this package's own builds; the programs of ``DET_ONLY_PROGRAMS`` are the deterministic package's
+    alone."""
+    own_programs = {kcp_jit.MODULES[name]["program"] for name in OWN}
+    for table in ("MODULES", "TEST_MODULES"):
+        ours, theirs = getattr(kcp_jit, table), getattr(det_kcp_jit, table)
+        assert set(ours) <= set(theirs), table
+        assert {
+            theirs[n]["program"] for n in set(theirs) - set(ours)
+        } <= own_programs | set(DET_ONLY_PROGRAMS)
+        for name, record in ours.items():
+            assert record["library"].startswith(PREFIX), name
+            if name in OWN:
+                assert record["library"] == OWN[name], name
+            else:
+                assert record == _renamed(theirs[name]), (table, name)
+    assert set(OWN) <= set(kcp_jit.MODULES)
+    ours = {r["library"] for r in _records().values()}
+    theirs = {
+        r["library"]
+        for r in {**det_kcp_jit.MODULES, **det_kcp_jit.TEST_MODULES}.values()
+    }
+    assert not ours & theirs
+    assert set(DET_ONLY_PROGRAMS) <= set(det_kcp_jit.PROGRAMS)
+    assert not set(DET_ONLY_PROGRAMS) & set(kcp_jit.PROGRAMS)
+    assert (
+        tuple(p for p in det_kcp_jit.PROGRAMS if p not in DET_ONLY_PROGRAMS)
+        == kcp_jit.PROGRAMS
+    )
+    assert kcp_jit.LOGICAL_TENSORS == det_kcp_jit.LOGICAL_TENSORS
+    assert kcp_jit.LOGICAL_SCALARS == det_kcp_jit.LOGICAL_SCALARS
+
+
+@pytest.mark.parametrize("manifest", ["build.json", "build.test.json"])
+def test_the_units_are_the_deterministic_units_under_this_packages_names(
+    manifest: str,
+) -> None:
+    """Every library of this package's manifest is the deterministic package's library of the same digits: the same
+    architecture, flags and entry, and sources whose text is the deterministic unit's with the deterministic prefix
+    renamed (file names, kernel symbols, binding namespaces); nothing else differs.  The libraries of the records whose
+    builds differ between the two packages (``OWN``, and the deterministic package's extra records) are left out on
+    both sides."""
+    det_dir = Path(det_kcp_jit.__file__).resolve().parent
+    path, det_path = PACKAGE_DIR / manifest, det_dir / manifest
+    if not path.is_file() or not det_path.is_file():
+        pytest.skip(f"{manifest} is not rendered in both packages here")
+    own = set(OWN.values())
+    det_records = {**det_kcp_jit.MODULES, **det_kcp_jit.TEST_MODULES}
+    left_out = set(OWN) | (set(det_records) - set(_records()))
+    det_own = {det_records[n]["library"] for n in left_out if n in det_records}
+    ours = {
+        e["name"]: e
+        for e in json.loads(path.read_text())["libraries"]
+        if _library_stem(e["name"]) not in own
+    }
+    theirs = {
+        _renamed(e["name"]): e
+        for e in json.loads(det_path.read_text())["libraries"]
+        if _library_stem(e["name"]) not in det_own
+    }
+    assert set(ours) == set(theirs), manifest
+    for name, entry in ours.items():
+        det_entry = theirs[name]
+        for key in ("arch", "entry", "nvcc_flags"):
+            assert entry.get(key) == det_entry.get(key), (name, key)
+        assert entry["sources"] == _renamed(det_entry["sources"]), name
+        for source, det_source in zip(
+            entry["sources"], det_entry["sources"], strict=True
+        ):
+            text = (PACKAGE_DIR / source).read_text()
+            det_text = (det_dir / det_source).read_text()
+            assert text == det_text.replace("cake_kda_det_train", "cake_kda_train"), (
+                name,
+                source,
+            )

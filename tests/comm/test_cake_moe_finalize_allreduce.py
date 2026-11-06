@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import multiprocessing as mp
-import socket
 import time
+from pathlib import Path
 
 import pytest
 import torch
@@ -23,23 +23,40 @@ FP4_RTOL = 0.1
 PROCESS_JOIN_TIMEOUT_S = 600.0
 PROCESS_CLEANUP_TIMEOUT_S = 30.0
 
-# Program choice of the Cake binding above SMALL_TOKEN_MAX tokens: the small-token program
-# still runs up to SMALL_TOKEN_EXTENDED_MAX tokens at world sizes 2 and 4 except for top_k 4
-# without a shared expert (while the device holds that many small-token clusters); the
-# two-shot program runs at world size 8 and at world size 4 from TWO_SHOT_MIN_TOKENS_WS4
-# tokens; the large-token program runs at world size 2 for top_k 4 above
-# LARGE_TOKEN_MIN_TOKENS tokens (LARGE_TOKEN_MIN_TOKENS_SHARED with a shared expert); the
-# persistent program runs otherwise.
+# Program choice of the Cake binding: the two-shot program runs first, at world size 4
+# from TWO_SHOT_MIN_TOKENS[4] tokens and at world size 8 from TWO_SHOT_MIN_TOKENS[8]
+# tokens, in its deferred form from TWO_SHOT_DEFER_MIN_TOKENS tokens except at world
+# size 8 for top_k 4 without a shared expert and without the NVFP4 epilogue (output
+# profile 110), and otherwise in its early form up to TWO_SHOT_EARLY_MAX_TOKENS
+# tokens. A rank with a shared expert runs the deferred form that also prefetches the
+# shared-expert row to L2 at world size 4, and at world size 8 for top_k 8 except in
+# float16 with output profile 110. Other batches of up to SMALL_TOKEN_MAX
+# tokens run the small-token program, which still runs up to SMALL_TOKEN_EXTENDED_MAX
+# tokens at world size 4, and at world size 2 except for top_k 4 without a shared
+# expert (while the device holds that many small-token clusters). Above that, the
+# two-shot program runs at world size 8, the large-token program at world size 2 for
+# top_k 4 above LARGE_TOKEN_MIN_TOKENS tokens (LARGE_TOKEN_MIN_TOKENS_SHARED with a
+# shared expert, then in its form that also prefetches the shared-expert row), the quad
+# program at world size 2 up to W2_QUAD_MAX_TOKENS tokens and the persistent program
+# otherwise.
 SMALL_TOKEN_EXTENDED_MAX = 71
-TWO_SHOT_MIN_TOKENS_WS4 = 96
+TWO_SHOT_MIN_TOKENS = {4: 72, 8: 56}
+TWO_SHOT_DEFER_MIN_TOKENS = {4: 1536, 8: 768}
+TWO_SHOT_EARLY_MAX_TOKENS = {4: 128, 8: 128}
 LARGE_TOKEN_MIN_TOKENS = 512
 LARGE_TOKEN_MIN_TOKENS_SHARED = 1280
+W2_QUAD_MAX_TOKENS = 142
 # SM count at which the small-token program holds SMALL_TOKEN_EXTENDED_MAX clusters (B200, B300).
 SMALL_TOKEN_EXTENDED_MIN_SMS = 148
 _PROGRAM_SUFFIX = {
     "small": "_small",
     "two_shot": "_ts",
+    "two_shot_defer": "_tsd",
+    "two_shot_defer_shared": "_tsds",
+    "two_shot_early": "_tse",
     "large_token": "_lt",
+    "large_token_shared": "_lts",
+    "quad": "_quad",
     "persistent": "",
 }
 
@@ -102,12 +119,6 @@ def _decode_fp4_output(
     return (values.reshape(rows, scale_columns, 16) * scales.unsqueeze(-1)).reshape(
         rows, columns
     )
-
-
-def _open_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
 
 
 def _bounded_rand(
@@ -174,14 +185,23 @@ def _token_counts(world_size: int) -> tuple[int, ...]:
         SMALL_TOKEN_EXTENDED_MAX + 1,
         128,
     }
-    if world_size == 4:
-        tokens |= {TWO_SHOT_MIN_TOKENS_WS4 - 1, TWO_SHOT_MIN_TOKENS_WS4}
+    if world_size in TWO_SHOT_MIN_TOKENS:
+        tokens |= {
+            TWO_SHOT_MIN_TOKENS[world_size] - 1,
+            TWO_SHOT_MIN_TOKENS[world_size],
+            TWO_SHOT_DEFER_MIN_TOKENS[world_size] - 1,
+            TWO_SHOT_DEFER_MIN_TOKENS[world_size],
+            TWO_SHOT_EARLY_MAX_TOKENS[world_size],
+            TWO_SHOT_EARLY_MAX_TOKENS[world_size] + 1,
+        }
     if world_size == 2:
         tokens |= {
             LARGE_TOKEN_MIN_TOKENS,
             LARGE_TOKEN_MIN_TOKENS + 1,
             LARGE_TOKEN_MIN_TOKENS_SHARED,
             LARGE_TOKEN_MIN_TOKENS_SHARED + 1,
+            W2_QUAD_MAX_TOKENS,
+            W2_QUAD_MAX_TOKENS + 1,
         }
     return tuple(sorted(tokens))
 
@@ -200,23 +220,60 @@ def _cases(world_size: int) -> list[tuple[int, int, bool, str, float]]:
 
 
 def _expected_program(
-    world_size: int, tokens: int, top_k: int, use_shared: bool
+    world_size: int,
+    tokens: int,
+    top_k: int,
+    use_shared: bool,
+    output_profile: str,
+    dtype_name: str,
 ) -> str:
+    # The deferred form of a rank with a shared expert is _tsds at world size 4, and at
+    # world size 8 for top_k 8 but in float16 o110.
+    deferred = (
+        "two_shot_defer_shared"
+        if use_shared
+        and (
+            world_size == 4
+            or (
+                world_size == 8
+                and top_k == 8
+                and (dtype_name == "bfloat16" or output_profile == "111")
+            )
+        )
+        else "two_shot_defer"
+    )
+    two_shot = (
+        deferred
+        if world_size in TWO_SHOT_DEFER_MIN_TOKENS
+        and tokens >= TWO_SHOT_DEFER_MIN_TOKENS[world_size]
+        and not (
+            world_size == 8
+            and top_k == 4
+            and not use_shared
+            and output_profile == "110"
+        )
+        else "two_shot_early"
+        if world_size in TWO_SHOT_EARLY_MAX_TOKENS
+        and tokens <= TWO_SHOT_EARLY_MAX_TOKENS[world_size]
+        else "two_shot"
+    )
+    if world_size in TWO_SHOT_MIN_TOKENS and tokens >= TWO_SHOT_MIN_TOKENS[world_size]:
+        return two_shot
     if tokens <= SMALL_TOKEN_MAX:
         return "small"
     if (
-        world_size != 8
-        and (top_k != 4 or use_shared)
-        and tokens <= SMALL_TOKEN_EXTENDED_MAX
-    ):
+        world_size == 4 or (world_size == 2 and (top_k != 4 or use_shared))
+    ) and tokens <= SMALL_TOKEN_EXTENDED_MAX:
         return "small"
-    if world_size == 8 or (world_size == 4 and tokens >= TWO_SHOT_MIN_TOKENS_WS4):
-        return "two_shot"
+    if world_size == 8:
+        return two_shot
     large_token_min = (
         LARGE_TOKEN_MIN_TOKENS_SHARED if use_shared else LARGE_TOKEN_MIN_TOKENS
     )
     if world_size == 2 and top_k == 4 and tokens > large_token_min:
-        return "large_token"
+        return "large_token_shared" if use_shared else "large_token"
+    if world_size == 2 and tokens <= W2_QUAD_MAX_TOKENS:
+        return "quad"
     return "persistent"
 
 
@@ -229,7 +286,9 @@ def _expected_kernel(
     output_profile: str,
 ) -> str:
     dtype_name = "float16" if dtype == torch.float16 else "bfloat16"
-    program = _expected_program(world_size, tokens, top_k, use_shared)
+    program = _expected_program(
+        world_size, tokens, top_k, use_shared, output_profile, dtype_name
+    )
     return (
         f"kernel_cake_trtllm_moe_finalize_{dtype_name}_ws{world_size}"
         f"_o{output_profile}{_PROGRAM_SUFFIX[program]}"
@@ -324,12 +383,12 @@ def _run_backend(
     return residual_out, norm_out, quant_out, scale_out
 
 
-def _worker(world_size: int, rank: int, dtype: torch.dtype, port: int) -> None:
+def _worker(world_size: int, rank: int, dtype: torch.dtype, init_method: str) -> None:
     device = torch.device("cuda", rank)
     torch.cuda.set_device(device)
     dist.init_process_group(
         backend="nccl",
-        init_method=f"tcp://127.0.0.1:{port}",
+        init_method=init_method,
         rank=rank,
         world_size=world_size,
     )
@@ -505,7 +564,9 @@ def _worker(world_size: int, rank: int, dtype: torch.dtype, port: int) -> None:
 
 @pytest.mark.parametrize("world_size", [2, 4, 8])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_cake_moe_finalize_allreduce(world_size: int, dtype: torch.dtype) -> None:
+def test_cake_moe_finalize_allreduce(
+    world_size: int, dtype: torch.dtype, tmp_path: Path
+) -> None:
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"test requires {world_size} CUDA devices")
     capabilities = {
@@ -514,10 +575,11 @@ def test_cake_moe_finalize_allreduce(world_size: int, dtype: torch.dtype) -> Non
     if len(capabilities) != 1 or not capabilities.issubset({(10, 0), (10, 3)}):
         pytest.skip("test requires one homogeneous SM100 or SM103 node")
 
-    port = _open_port()
+    # File rendezvous: a probed free TCP port can be taken before rank 0 binds it.
+    init_method = f"file://{tmp_path / 'rendezvous'}"
     context = mp.get_context("spawn")
     processes = [
-        context.Process(target=_worker, args=(world_size, rank, dtype, port))
+        context.Process(target=_worker, args=(world_size, rank, dtype, init_method))
         for rank in range(world_size)
     ]
     for process in processes:

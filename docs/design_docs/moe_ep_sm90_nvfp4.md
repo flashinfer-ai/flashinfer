@@ -107,7 +107,13 @@ experts, top-6, K64, `block_permutation_v1` routing** at these capacities:
 ```
 
 For the reference model the heuristic rounds capacity up to the next bucket,
-and uses the largest bucket above 32768. Clamp and SM90 product name do not
+and uses the largest bucket above 32768. As for MXFP4, a default without the
+scale ring then takes the token-tile width of 64, 72 or 80 that needs the
+fewest tiles for the balanced rows per expert,
+`max_tokens * top_k * EP / experts`; ties keep N64. For the reference model
+this changes 1025-1280, 2049-2560 and 3073-3840 tokens and every capacity
+above 4096; on H200 it measured 0.61-0.98x the N64 default at nine of these
+capacities, from 1152 to 32768 tokens. Clamp and SM90 product name do not
 gate it. Other model shapes, routing or K layouts use a shape-compatible
 fallback. These are legal starting configurations, not measured performance
 guarantees for other capacities or hardware.
@@ -138,9 +144,10 @@ K32/K0 and unmatched shapes use the corresponding legal fallback policy.
 ## Benchmark
 
 After installing FlashInfer with its SM90 CuTeDSL/MoE dependencies, use four
-H200 GPUs and at least two physical CPU cores per rank. Configure supported
-GPU clocks externally if comparing with locked-clock measurements. The script
-records device UUIDs and CPU affinity; it does not change clock settings.
+H200 GPUs (two for an EP2 shape) and at least two physical CPU cores per rank.
+Configure supported GPU clocks externally if comparing with locked-clock
+measurements. The script records device UUIDs and CPU affinity; it does not
+change clock settings.
 
 ```bash
 # Short public-API sanity check; not a performance measurement.
@@ -153,13 +160,22 @@ torchrun --standalone --nproc-per-node=4 \
   benchmarks/bench_moe_ep_sm90_nvfp4.py \
   --tokens 8 16 32 64 128 256 512 1024 2048 4096 8192 16384 32768 \
   --rounds 3 --warmup 10 --iters 50 --padding-us 300 \
-  --cooldown-seconds 5 --mx-compact --output results.json
+  --cooldown-seconds 5 --output results.json
+
+# EP2 shape, and a partly filled layer (buffer capacity 8192, 1024 live tokens).
+torchrun --standalone --nproc-per-node=2 \
+  benchmarks/bench_moe_ep_sm90_nvfp4.py \
+  --hidden 2560 --intermediate 640 --experts 512 --top-k 10 --tokens 1024 2048
+torchrun --standalone --nproc-per-node=4 \
+  benchmarks/bench_moe_ep_sm90_nvfp4.py --capacity 8192 --tokens 1024
 ```
 
 The benchmark quantizes the same BF16 weights for both formats and shares
 inputs and routing assignments. Weight preparation is outside timing. NV and
-MX use their respective configuration defaults; `--mx-compact` is an explicit
-MX configuration choice, not a new MX autotuning axis.
+MX use their configuration defaults, or the tactics cached in
+`FLASHINFER_MOE_EP_KNOB_CACHE` after tuning. `--mx-compact` forces the MX
+compact pull buffer over the selected tactic's choice (the buffer is a tactic
+field), which also drops a tactic's pull batch to one row.
 
 Use `--nv-knobs-json` or `--mx-knobs-json` for a complete tactic. For a paired
 before/after NV comparison, also pass `--nv-reference-knobs-json`: the three
@@ -171,10 +187,35 @@ The config object for MX can contain `compact_pull_buffer`.
 
 CUDA events include MegaMoE and top-k reduction only. The calibrated GPU
 padding, rank barrier, allocation, input staging, warmup, and cooldown are
-outside the event interval. Each block's score is the maximum of four rank
+outside the event interval. Each block's score is the maximum of the ranks'
 sample medians. The JSON preserves attempts, raw samples, submission timing,
 and same-round ratios; ratio summaries are medians of paired ratios. Up to
 five attempts retain the first block passing the rank-skew rule. Three rounds
 in one process are not three independent fresh-process runs. Use separate
 `torchrun` processes to measure process-to-process variation, and account for
 actual GPU clock and power states when interpreting results.
+
+## Two-slot scale ring
+
+`nvfp4_sf_stages=0` follows the AB pipeline's scale-buffer stage count.
+Eligible non-pingpong M256N64K256 tactics can instead use
+`nvfp4_sf_stages=2`, `compact_pull_buffer=True`, lane LUT mapping, and one
+or two LUT replicas. Two scale slots reduce shared-memory use; the supplied
+profiles use four AB stages. The AB and scale-ring barriers use their own
+slot counts. This changes buffering, not the numerical operation: same-core
+sf0/sf2 output remains byte-identical.
+
+The candidate table includes five measured SF2 profiles: R1/R2 variants
+of the T512 and T1024 seeds, and one R1 variant of the T4096/T16384 seed. Their
+admission uses geometry, protocol and shared-memory legality, without GPU
+product-name or live-token restrictions. T512/T1024 reference capacity
+buckets use R1 SF2 defaults; the other eleven reference defaults use SF0.
+Autotuning can select any legal profile by measurement, including with
+FC1 overlap explicitly disabled. Explicit token-back selection without
+`knobs` uses manual configuration rather than inheriting an SF2 default.
+
+A complete manual tactic can set `"nvfp4_sf_stages": 2`. The AB stage count
+must be a multiple of twice the scale-ring depth, and rounding must not
+reduce it below the corresponding SF0 stage count. Illegal resource
+combinations are rejected before launch. SF1 remains available for legal
+manual configurations that meet this rule.

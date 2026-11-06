@@ -394,8 +394,15 @@ def test_launch_metadata_is_passed_as_given_only_for_metadata_i64_records() -> N
     assert cast.dtype == torch.int32
     assert torch.equal(cast, i32)
     # The route carries the contract and defaults to the int32-only ABI.
-    assert cake_gdn.CakeGDNRoute._fields == ("route_id", "variant_name", "metadata_i64")
+    assert cake_gdn.CakeGDNRoute._fields == (
+        "route_id",
+        "variant_name",
+        "metadata_i64",
+        "one_cta_per_tile",
+    )
     assert cake_gdn.CakeGDNRoute("prefill.dvsplit", "variant").metadata_i64 is False
+    # The launch grid comes from the grid rule unless the route says one CTA per tile.
+    assert cake_gdn.CakeGDNRoute("prefill.dvsplit", "variant").one_cta_per_tile is False
 
 
 def _public_dispatch_inputs() -> tuple[torch.Tensor, ...]:
@@ -528,3 +535,367 @@ def test_resolver_gate_stream_twin_follows_the_routed_grid() -> None:
     assert "_gatestream_full" in base.variant_name
     assert "_gatestream_full" in unrouted.variant_name
     assert "_gatestream_full" not in routed.variant_name
+
+
+_MIXED16 = (8192, 4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1, 1, 1)
+_UNEQ8 = (4096, 2048, 1024, 512, 256, 128, 64, 32)
+_ONE_LONG8 = (8192,) + (1024,) * 7
+# The head geometries (Hq, Hv) whose BF16-I/O FP32-state stateful key ships both a full-DV
+# and a DV-split record on sm_107a.
+_RAGGED_DVSPLIT_GEOMETRIES = (
+    (2, 4),
+    (2, 8),
+    (4, 8),
+    (4, 16),
+    (8, 16),
+    (8, 32),
+    (16, 32),
+    (16, 64),
+)
+
+
+def _ragged_dvsplit_load_fits(num_o_heads, lens):
+    """The rule of the ragged DV-split route, spelled out on the lengths."""
+
+    limit = (
+        cake_gdn.RAGGED_DVSPLIT_LOAD_LONGEST_FIRST
+        if lens[0] == max(lens)
+        else cake_gdn.RAGGED_DVSPLIT_LOAD
+    )
+    load = num_o_heads * (sum(lens) + cake_gdn.RAGGED_DVSPLIT_SEQ_TOKENS * len(lens))
+    return load <= limit * max(lens)
+
+
+def _sm107a_fp32_state_kwargs(heads, lens, *, host=True, **overrides):
+    num_q_heads, num_v_heads = heads
+    kwargs = dict(
+        arch="sm_107a",
+        io_dtype="bfloat16",
+        state_dtype="float32",
+        num_seqs=len(lens),
+        total_seq_len=sum(lens),
+        max_seq_len=max(lens),
+        num_q_heads=num_q_heads,
+        num_k_heads=min(num_q_heads, num_v_heads),
+        num_v_heads=num_v_heads,
+        use_initial_state=True,
+        store_final_state=True,
+        checkpoint_every_n_tokens=0,
+        use_state_indices=False,
+        gates_present=True,
+        host_seq_lens=tuple(lens) if host else None,
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+def _sm107a_fp32_state_route(heads, lens, *, host=True, **overrides):
+    return cake_gdn.select_cake_gdn_prefill_variant(
+        **_sm107a_fp32_state_kwargs(heads, lens, host=host, **overrides)
+    )
+
+
+@pytest.mark.cpu_only
+def test_ragged_dvsplit_route_takes_a_ragged_full_dv_batch() -> None:
+    """With the host lengths, a ragged sm_107a BF16/FP32-state batch over the DV-split
+    tile budget runs the DV-split body, one CTA per half tile; the same batch without the
+    lengths keeps full-DV."""
+
+    routed = _sm107a_fp32_state_route((8, 16), _MIXED16)
+    assert routed.route_id == "flashinfer.gdn_prefill.noncp.dvsplit"
+    assert routed.one_cta_per_tile is True
+    assert "_dvsplit_initial_sm107a_l7_vec2_" in routed.variant_name
+    assert routed.metadata_i64
+    without_lengths = _sm107a_fp32_state_route((8, 16), _MIXED16, host=False)
+    assert without_lengths.route_id == "flashinfer.gdn_prefill.noncp.full_dv"
+    assert without_lengths.one_cta_per_tile is False
+    assert routed == cake_gdn._ragged_dvsplit_routes()[without_lengths.variant_name]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("heads", "lens", "overrides"),
+    (
+        # equal lengths
+        ((8, 16), (512,) * 32, {}),
+        ((8, 32), (2048,) * 4, {}),
+        ((8, 32), (256,) * 64, {}),
+        # already DV-split under the tile budget (2 * 16 * 4 <= 212)
+        ((2, 4), _MIXED16, {}),
+        # other dtypes, stateless and indexed calls keep their rule
+        ((8, 16), _MIXED16, {"state_dtype": "bfloat16"}),
+        ((16, 32), _MIXED16, {"io_dtype": "float16"}),
+        ((16, 32), _MIXED16, {"use_initial_state": False}),
+        ((16, 32), _MIXED16, {"store_final_state": False}),
+        # other architectures
+        ((8, 16), _MIXED16, {"arch": "sm_100a"}),
+        ((8, 16), _MIXED16, {"arch": "sm_103a"}),
+        # head geometries without both records
+        ((16, 16), _MIXED16, {}),
+        ((32, 16), _MIXED16, {}),
+        # ragged but balanced: the doubled tile count costs more than the long sequence
+        ((8, 16), (512,) * 31 + (520,), {}),
+        ((4, 8), tuple(range(1024, 1024 + 64 * 40, 64)), {}),
+        # the longest sequence last behind a full first wave of half tiles
+        ((2, 8), (2048,) * 19 + (4096,), {}),
+    ),
+)
+def test_ragged_dvsplit_route_keeps_every_other_batch_on_its_rule(
+    heads, lens, overrides
+) -> None:
+    """The route (or the fail-closed error) is the one the batch resolves without the host
+    lengths."""
+
+    def outcome(host):
+        try:
+            return _sm107a_fp32_state_route(heads, lens, host=host, **overrides)
+        except cake_gdn.CakeGDNUnsupportedError as error:
+            return str(error)
+
+    route = outcome(True)
+    assert getattr(route, "one_cta_per_tile", False) is False
+    assert route == outcome(False)
+
+
+@pytest.mark.cpu_only
+def test_ragged_dvsplit_routes_pair_the_two_records_of_each_key() -> None:
+    """Each key of the map is an sm_107a-only full-DV record (base, gate-stream twin or its
+    prefetch twin) of the BF16-I/O FP32-state stateful contract, and its value is the
+    DV-split record with the same specializations; the map covers exactly the head
+    geometries that ship both."""
+
+    routes = cake_gdn._ragged_dvsplit_routes()
+    records = {r["name"]: r for r in cake_gdn._manifest()["variants"]}
+    stem = "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_"
+    geometries = set()
+    for name, route in routes.items():
+        full_dv, split = records[name], records[route.variant_name]
+        assert full_dv["architectures"] == ["sm_107a"]
+        assert full_dv["source_schedule"] in (
+            stem + "initial_sm107a_i64meta",
+            stem + "initial_gatestream_full_sm107a_i64meta",
+            stem + "initial_gatestream_full_pf_sm107a_i64meta",
+        )
+        assert split["source_schedule"] == stem + "dvsplit_initial_sm107a_l7_vec2"
+        assert split["specializations"] == full_dv["specializations"]
+        assert route == cake_gdn.CakeGDNRoute(
+            "flashinfer.gdn_prefill.noncp.dvsplit",
+            split["name"],
+            bool(split.get("metadata_i64", False)),
+            True,
+        )
+        specs = full_dv["specializations"]
+        assert (specs["USE_INITIAL_STATE"], specs["STORE_FINAL_STATE"]) == (1, 1)
+        assert (specs["ENABLE_CHECKPOINTS"], specs["USE_STATE_INDICES"]) == (0, 0)
+        assert specs["IS_GQA"] == 0
+        num_v_heads = 1 << specs["NUM_O_HEADS_LOG2"]
+        geometries.add((num_v_heads >> specs["HEAD_GROUP_LOG2"], num_v_heads))
+    assert sorted(geometries) == sorted(_RAGGED_DVSPLIT_GEOMETRIES)
+    # 8 base records, 7 gate-stream twins (none for Hq16/Hv64) and their 7 prefetch twins
+    assert len(routes) == 22
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("heads", "lens"),
+    (
+        # The nine routed rows of the shipped tables: the Qwen3.5 mixed16 rows and the four
+        # chunked-engine rows.
+        ((8, 16), _MIXED16),
+        ((4, 8), _MIXED16),
+        ((8, 32), _MIXED16),
+        ((4, 16), _MIXED16),
+        ((2, 8), _MIXED16),
+        ((16, 32), _UNEQ8),
+        ((16, 32), _ONE_LONG8),
+        ((8, 16), _UNEQ8),
+        ((8, 16), _ONE_LONG8),
+    ),
+)
+def test_ragged_dvsplit_route_takes_the_routed_rows(heads, lens) -> None:
+    assert _ragged_dvsplit_load_fits(max(heads), lens)
+    route = _sm107a_fp32_state_route(heads, lens)
+    assert route.one_cta_per_tile is True
+    assert route.route_id == "flashinfer.gdn_prefill.noncp.dvsplit"
+    assert "_dvsplit_initial_sm107a_l7_vec2_" in route.variant_name
+
+
+@pytest.mark.cpu_only
+def test_ragged_dvsplit_route_is_the_twin_of_the_resolved_record(monkeypatch) -> None:
+    """On random keys (head geometries, I/O dtypes, gates, architectures, with and without
+    the host lengths) the resolver returns the route it returns without the ragged DV-split
+    map, except on the contract: an sm_107a BF16-I/O FP32-state stateful ragged batch with
+    the host lengths whose resolved full-DV record has a DV-split twin and whose load fits
+    the rule, which runs that twin.
+    This covers the unshipped-DV-split fallback (#8225) too: the batches it serves never
+    reach the map."""
+
+    rng = random.Random(20261102)
+    resolve = cake_gdn.select_cake_gdn_prefill_variant.__wrapped__
+    routes = cake_gdn._ragged_dvsplit_routes()
+    heads_pairs = _RAGGED_DVSPLIT_GEOMETRIES + (
+        (2, 6),
+        (1, 3),
+        (3, 9),
+        (8, 24),
+        (16, 48),
+        (6, 2),
+        (12, 4),
+        (32, 16),
+        (16, 16),
+    )
+    keys = []
+    for _ in range(1_500):
+        heads = rng.choice(heads_pairs)
+        lens = _random_batch(rng)
+        overrides = dict(
+            io_dtype=rng.choice(("bfloat16", "bfloat16", "float16")),
+            gates_present=rng.random() < 0.8,
+            arch=rng.choice(("sm_107a",) * 6 + ("sm_100a", "sm_103a")),
+        )
+        if rng.random() < 0.1:
+            overrides["state_dtype"] = "bfloat16"
+        keys.append((heads, lens, overrides, rng.random() < 0.8))
+
+    def resolve_all():
+        out = []
+        for heads, lens, overrides, host in keys:
+            try:
+                out.append(
+                    resolve(
+                        **_sm107a_fp32_state_kwargs(heads, lens, host=host, **overrides)
+                    )
+                )
+            except cake_gdn.CakeGDNUnsupportedError:
+                out.append(None)
+        return out
+
+    with_map = resolve_all()
+    monkeypatch.setattr(cake_gdn, "_ragged_dvsplit_routes", lambda: {})
+    without_map = resolve_all()
+    routed = 0
+    for (heads, lens, overrides, host), got, base in zip(
+        keys, with_map, without_map, strict=True
+    ):
+        contract = (
+            host
+            and len(set(lens)) > 1
+            and overrides["arch"] == "sm_107a"
+            and overrides["io_dtype"] == "bfloat16"
+            and "state_dtype" not in overrides
+            and heads in _RAGGED_DVSPLIT_GEOMETRIES
+            and 2 * len(lens) * max(heads) > 212
+            and _ragged_dvsplit_load_fits(max(heads), lens)
+        )
+        if base is None:
+            assert got is None
+        elif contract:
+            assert base.route_id == "flashinfer.gdn_prefill.noncp.full_dv"
+            assert got == routes[base.variant_name]
+            routed += 1
+        else:
+            assert got == base
+            assert got.one_cta_per_tile is False
+    assert routed > 0
+
+
+@pytest.mark.cpu_only
+def test_ragged_dvsplit_route_needs_the_dvsplit_record_of_the_key(monkeypatch) -> None:
+    """With the key's DV-split record removed from the catalog, the batch the route would
+    move stays on its full-DV record (it never resolves to the missing record)."""
+
+    import functools
+
+    manifest = cake_gdn._manifest()
+    routed = _sm107a_fp32_state_route((8, 16), _MIXED16)
+    assert routed.one_cta_per_tile is True
+    full_dv = _sm107a_fp32_state_route((8, 16), _MIXED16, host=False)
+    stripped = dict(
+        manifest,
+        variants=[r for r in manifest["variants"] if r["name"] != routed.variant_name],
+    )
+    monkeypatch.setattr(cake_gdn, "_manifest", lambda: stripped)
+    monkeypatch.setattr(
+        cake_gdn,
+        "_ragged_dvsplit_routes",
+        functools.cache(cake_gdn._ragged_dvsplit_routes.__wrapped__),
+    )
+    assert full_dv.variant_name not in cake_gdn._ragged_dvsplit_routes()
+    resolve = cake_gdn.select_cake_gdn_prefill_variant.__wrapped__
+    route = resolve(**_sm107a_fp32_state_kwargs((8, 16), _MIXED16))
+    assert route.one_cta_per_tile is False
+    assert route == full_dv
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("heads", ((6, 2), (12, 4)))
+def test_ragged_dvsplit_route_needs_the_full_dv_record_of_the_key(heads) -> None:
+    """The route chooses between two served records.  The Hq >= Hv key whose head ratio and
+    output head count are not powers of two ships a DV-split record but no full-DV record, so
+    over the DV-split tile budget it fails closed without the host lengths; with them it
+    fails closed as well, whatever the lengths, instead of serving some length
+    distributions on the DV-split record."""
+
+    lens = (8192,) + (64,) * 20  # 2 * 21 * Hq half tiles > 212: full-DV
+    kwargs = _sm107a_fp32_state_kwargs(heads, lens)
+    specs = {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": -1,
+        "IS_GQA": 1,
+        "NUM_O_HEADS_LOG2": -1,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0,
+    }
+    stem = "flashinfer_blackwell_gdn_prefill"
+    for attr, ships in (
+        (f"{stem}_dvsplit_initial_sm107a_l7_vec2", True),
+        (f"{stem}_initial_sm107a_i64meta", False),
+    ):
+        assert (
+            cake_gdn._has_variant(
+                arch="sm_107a",
+                domain="prefill",
+                schedule_attr=attr,
+                specializations=specs,
+            )
+            is ships
+        ), attr
+    records = {r["name"]: r for r in cake_gdn._manifest()["variants"]}
+    assert all(
+        records[name]["specializations"] != specs
+        for name in cake_gdn._ragged_dvsplit_routes()
+    )
+    resolve = cake_gdn.select_cake_gdn_prefill_variant.__wrapped__
+    for host in (True, False):
+        with pytest.raises(cake_gdn.CakeGDNUnsupportedError):
+            resolve(**dict(kwargs, host_seq_lens=lens if host else None))
+    # Under the tile budget the key runs its DV-split record, with or without the lengths.
+    short = lens[:8]
+    routed = resolve(**_sm107a_fp32_state_kwargs(heads, short))
+    assert routed.route_id == "flashinfer.gdn_prefill.noncp.dvsplit"
+    assert routed.variant_name.endswith("805fd7f7b98d")
+    assert routed.one_cta_per_tile is False
+
+
+@pytest.mark.cpu_only
+def test_ragged_dvsplit_rule_limits_follow_the_position_of_the_longest_sequence() -> (
+    None
+):
+    """The same lengths route with the longest sequence first (its half tiles start at once)
+    and keep full-DV with it last, where the load must fit the smaller limit."""
+
+    lens = (8192,) + (1024,) * 15  # Hq4/Hv16: load 16 * (23552 + 384 * 16) = 475136
+    assert _ragged_dvsplit_load_fits(16, lens)
+    assert not _ragged_dvsplit_load_fits(16, lens[1:] + lens[:1])
+    first = _sm107a_fp32_state_route((4, 16), lens)
+    last = _sm107a_fp32_state_route((4, 16), lens[1:] + lens[:1])
+    assert first.one_cta_per_tile is True
+    assert last.one_cta_per_tile is False
+    assert last == _sm107a_fp32_state_route((4, 16), lens[1:] + lens[:1], host=False)
+    # A long sequence anywhere routes once its load fits the smaller limit.
+    lens = (64,) * 30 + (32768,) + (64,) * 30  # Hq2/Hv4
+    assert _ragged_dvsplit_load_fits(4, lens) and lens[0] != max(lens)
+    assert _sm107a_fp32_state_route((2, 4), lens).one_cta_per_tile is True

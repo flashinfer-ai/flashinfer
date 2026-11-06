@@ -3,6 +3,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+// The registry member defines the dynamic shared memory of its program's body:
+// program 0 holds a four-stage K ring, programs 1 and 2 a three-stage one.
+#ifndef DYNAMIC_SMEM_BYTES
+#error "DYNAMIC_SMEM_BYTES (dynamic shared memory of the selected program) must be defined"
+#endif
+
 #include "../include/cake_fmha.h"
 
 extern "C" __global__ void kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* O_ptr, float* LSE_ptr, int* page_table, int* causal_seqlens_kv_global, float* partial_o, float* partial_stats, uint32_t* tile_counters, uint32_t* queue_counters, int max_pages_per_seq, float softmax_scale_log2, float output_scale, int num_q_heads, int num_kv_heads, int batch_size, int q_len, int cp_rank, int cp_world_log2, uint32_t max_items);
@@ -36,7 +42,7 @@ extern "C" cudaError_t cake_fmha_launch_dcp_spec_bf16_fp8_balanced(
     cudaError_t status = cudaFuncSetAttribute(
         reinterpret_cast<const void*>(kernel_cake_fmha_dcp_spec_bf16_fp8_balanced),
         cudaFuncAttributeMaxDynamicSharedMemorySize,
-        160768);
+        DYNAMIC_SMEM_BYTES);
     if (status != cudaSuccess) {
         return status;
     }
@@ -68,6 +74,6 @@ extern "C" cudaError_t cake_fmha_launch_dcp_spec_bf16_fp8_balanced(
         dim3(grid_x, grid_y, grid_z),
         dim3(384, 1, 1),
         kernel_args,
-        160768,
+        DYNAMIC_SMEM_BYTES,
         stream);
 }

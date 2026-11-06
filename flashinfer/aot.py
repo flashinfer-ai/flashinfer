@@ -202,6 +202,9 @@ from .jit.cake_grouped_mxfp8_quantize import (
 from .jit.cake_bf16_bmm_swap_ab import (
     aot_specs as gen_cake_bf16_bmm_swap_ab_aot_modules,
 )
+from .jit.cake_vsa_sm120 import (
+    aot_specs as gen_cake_vsa_sm120_aot_modules,
+)
 from .jit.mla_kv_pack import gen_mla_kv_pack_fp8_module
 from .jit.api_log_stats import gen_api_log_stats_module
 from .jit.norm import gen_norm_module
@@ -320,6 +323,7 @@ def gen_attention(
     has_sm90: bool,
     has_sm100: bool,
     has_sm103: bool,
+    has_sm110: bool,
     add_gemma: bool,
     add_oai_oss: bool,
 ) -> Iterator[JitSpec]:
@@ -495,7 +499,7 @@ def gen_attention(
 
     # fmha_cutlass_sm100a
     # NOTE: currently there's only one uri.
-    if has_sm100 or has_sm103:
+    if has_sm100 or has_sm103 or has_sm110:
         yield gen_fmha_cutlass_sm100a_module(
             dtype_q=torch.bfloat16,
             dtype_kv=torch.bfloat16,
@@ -508,7 +512,8 @@ def gen_attention(
             use_logits_soft_cap=False,
         )
 
-        # trtllm_gen_fmha
+    if has_sm100 or has_sm103:
+        # trtllm_gen_fmha loads prebuilt SM10x cubins, so SM110 cannot share it.
         yield gen_trtllm_gen_fmha_module()
 
     # MLA
@@ -527,8 +532,8 @@ def gen_attention(
                 use_profiler=False,
             )
 
-    # MLA SM100
-    if has_sm100 or has_sm103:
+    # MLA SM100 (also builds for SM110)
+    if has_sm100 or has_sm103 or has_sm110:
         yield gen_mla_module()
 
 
@@ -657,6 +662,7 @@ def gen_all_modules(
     jit_specs.append(gen_spdlog_module())
     has_bgmv_moe = sm_capabilities.get("bgmv_moe", False)
     has_sm80 = sm_capabilities.get("sm80", False)
+    has_sm89 = sm_capabilities.get("sm89", False)
     has_sm90 = sm_capabilities.get("sm90", False)
     has_sm100 = sm_capabilities.get("sm100", False)
     has_blackwell_msa_sm100a = sm_capabilities.get("blackwell_msa_sm100a", False)
@@ -696,6 +702,9 @@ def gen_all_modules(
     has_cake_megamoe_topk_reduce_sm103a = sm_capabilities.get(
         "cake_megamoe_topk_reduce_sm103a", False
     )
+    has_cake_megamoe_topk_reduce_sm107a = sm_capabilities.get(
+        "cake_megamoe_topk_reduce_sm107a", False
+    )
     has_cake_selective_state_update_sm100a = sm_capabilities.get(
         "cake_selective_state_update_sm100a", False
     )
@@ -723,6 +732,7 @@ def gen_all_modules(
             has_sm90,
             has_sm100,
             has_sm103,
+            has_sm110,
             add_gemma,
             add_oai_oss,
         )
@@ -749,6 +759,13 @@ def gen_all_modules(
         jit_specs.append(gen_mla_kv_pack_fp8_module())
     if has_sm120 or has_sm121:
         jit_specs.append(gen_nvfp4_attention_sm120_module())
+    # Cake SM120 block-64 block-sparse attention (backend="vsa_sm120_blk64" of
+    # BlockSparseAttentionWrapper): the bfloat16 and float16 programs, one
+    # library each per exact target.
+    if has_sm120:
+        jit_specs.extend(gen_cake_vsa_sm120_aot_modules("sm_120a"))
+    if has_sm121:
+        jit_specs.extend(gen_cake_vsa_sm120_aot_modules("sm_121a"))
     blackwell_msa_targets: tuple[tuple[BlackwellMSATarget, bool], ...] = (
         ("sm100a", has_blackwell_msa_sm100a),
         ("sm103a", has_blackwell_msa_sm103a),
@@ -943,6 +960,8 @@ def gen_all_modules(
             jit_specs.append(gen_cake_megamoe_topk_reduce_module("sm_100a"))
         if has_cake_megamoe_topk_reduce_sm103a:
             jit_specs.append(gen_cake_megamoe_topk_reduce_module("sm_103a"))
+        if has_cake_megamoe_topk_reduce_sm107a:
+            jit_specs.append(gen_cake_megamoe_topk_reduce_module("sm_107a"))
         # Cake selective state update: every program instantiation a route of the architecture selects
         # (the four-CTA residency schedule of the paired row-major program has an sm_100a band only).
         if has_cake_selective_state_update_sm100a:
@@ -963,8 +982,10 @@ def gen_all_modules(
             # SM103 registers its own FP4 quantization, CUTLASS fused MoE and FP4 GEMM
             # below, and takes the SM100f TGV GEMMs instead of these sm_100a ones.
             jit_specs.append(gen_fp4_quantization_sm100_module())
-            jit_specs.append(gen_cutlass_fused_moe_sm100_module())
             jit_specs.append(gen_gemm_sm100_module_cutlass_fp4())
+        if has_sm100 or has_sm107 or has_sm110:
+            # The SM100-named MoE also serves SM107 (via SM100f) and SM110.
+            jit_specs.append(gen_cutlass_fused_moe_sm100_module())
         # Both TGV variants share a module name, so a build that also targets SM103
         # must keep only the SM100f one, which runs on both.
         if has_sm100 and not has_sm103:
@@ -981,11 +1002,15 @@ def gen_all_modules(
             jit_specs.append(gen_trtllm_low_latency_gemm_module())
             jit_specs.append(gen_gemm_sm100_module())
             jit_specs.append(gen_gemm_sm100_module_cutlass_nvfp4_svdquant())
-            jit_specs.append(gen_gemm_sm100_module_cutlass_fp8())
-            jit_specs.append(gen_gemm_sm100_module_cutlass_mxfp8())
-            jit_specs.append(gen_mxfp8_quantization_sm100_module())
             jit_specs.append(gen_trtllm_gen_fused_moe_sm100_module())
             jit_specs.append(gen_trtllm_gen_routing_module())
+        if has_sm100 or has_sm103 or has_sm107 or has_sm110:
+            # SM107 (via SM100f) and SM110 load this SM100-named FP8 GEMM too.
+            jit_specs.append(gen_gemm_sm100_module_cutlass_fp8())
+        if has_sm100 or has_sm103 or has_sm110:
+            # These SM100-named modules also build for SM110, which loads them at runtime.
+            jit_specs.append(gen_gemm_sm100_module_cutlass_mxfp8())
+            jit_specs.append(gen_mxfp8_quantization_sm100_module())
         if has_sm100f or has_sm103:
             # Add TGV GEMM modules compiled with SM100f flags for both bf16 and fp16
             jit_specs.append(
@@ -1020,9 +1045,10 @@ def gen_all_modules(
             jit_specs.append(gen_trtllm_gen_routing_module())
         if has_sm110:
             jit_specs.append(gen_fp4_quantization_sm110_module())
-            # fused_moe_100 also targets SM110 and must ship in its provider.
+            # fp4_gemm_cutlass also targets SM110 and must ship in its provider
+            # (fused_moe_100 is registered with SM100/SM107 above).
             if not has_sm100:
-                jit_specs.append(gen_cutlass_fused_moe_sm100_module())
+                jit_specs.append(gen_gemm_sm100_module_cutlass_fp4())
         if has_sm120:
             jit_specs.extend(
                 gen_cudnn_frost_moe_module(dtype, "sm_120a") for dtype in FROST_DTYPES
@@ -1069,10 +1095,20 @@ def gen_all_modules(
             gen_pcie_ipc_comm_module,
             gen_trtllm_comm_module,
             gen_trtllm_mnnvl_comm_module,
+            gen_ulysses_lowp_module,
+            gen_ulysses_lowp_sm90_module,
             gen_vllm_comm_module,
         )
 
         jit_specs.append(gen_nvlink_two_sided_alltoall_module())
+        if has_sm89 or has_sm120:
+            # One module emits the requested SM89/SM120 targets; register it once.
+            jit_specs.append(gen_ulysses_lowp_module())
+        if has_sm90:
+            # The SM90 grid (16/128) lives in its own translation unit pinned to
+            # -gencode sm_90a, so it needs its own prebuild; without this every
+            # Hopper caller JIT-compiles ulysses_lowp_sm90.cu on first use.
+            jit_specs.append(gen_ulysses_lowp_sm90_module())
         if (
             has_sm90
             or has_sm100
@@ -1085,9 +1121,11 @@ def gen_all_modules(
             jit_specs.append(gen_trtllm_comm_module())
         if has_sm100 or has_sm103:
             jit_specs.append(gen_trtllm_mnnvl_comm_module())
+        if has_sm100 or has_sm103 or has_sm110:
             # dcp_alltoall: kernel itself supports SM90+, but ptxas 12.6.0 has
             # a known state-space inference bug on cp.async.bulk that aborts
-            # compilation. has_sm100/has_sm103 imply CUDA >= 12.8, which avoids the bug.
+            # compilation. has_sm100/has_sm103 imply CUDA >= 12.8 and has_sm110
+            # implies CUDA >= 13.0, which avoids the bug.
             # SM90/SM12x users still get this via JIT.
             jit_specs.append(gen_dcp_alltoall_module())
         if (
@@ -1142,7 +1180,7 @@ def gen_all_modules(
             gen_sampling_module(),
             gen_topk_module(),
         ]
-        if has_sm100 or has_sm103:
+        if has_sm100 or has_sm103 or has_sm107:
             jit_specs.append(gen_blackwell_softmax_module())
         # Cake radix sampling: one fatbin over every 9.x-12.x target (clusters + DSM only).
         if any(
@@ -1252,7 +1290,7 @@ def gen_all_modules(
                         *dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype
                     )
                 )
-        if has_sm90 or has_sm100 or has_sm103:
+        if has_sm90 or has_sm100 or has_sm103 or has_sm107:
             jit_specs.append(gen_trtllm_utils_module())
         # FP4 KV cache quantization/dequantization
         jit_specs.append(gen_fp4_kv_dequantization_module())
@@ -1502,6 +1540,8 @@ def detect_sm_capabilities():
             for major, _ in compilation_context.TARGET_CUDA_ARCHS
         ),
         "sm80": has_any_sm8x and cuda_version >= Version("11.0"),
+        # Keep the existing CUDA >= 12.8 floor for Lowp AOT builds.
+        "sm89": has_sm("compute_89", "12.8"),
         "sm90": has_sm("compute_90", "12.3"),
         "sm100": has_sm("compute_100", "12.8"),
         "sm100a_exact": (10, "0a") in compilation_context.TARGET_CUDA_ARCHS
@@ -1570,6 +1610,10 @@ def detect_sm_capabilities():
         "cake_megamoe_topk_reduce_sm103a": (
             (10, "3a") in compilation_context.TARGET_CUDA_ARCHS
             and cuda_version >= Version("12.9")
+        ),
+        "cake_megamoe_topk_reduce_sm107a": (
+            (10, "7a") in compilation_context.TARGET_CUDA_ARCHS
+            and cuda_version >= Version("13.0")
         ),
         "cake_selective_state_update_sm100a": (
             (10, "0a") in compilation_context.TARGET_CUDA_ARCHS

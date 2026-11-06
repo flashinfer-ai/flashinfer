@@ -188,6 +188,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         # True the M tile is laid out as [F sub_q_tok][num_heads heads]; the
         # full q_tok for row r is blk_coord[1] * F + (r // num_heads).
         self.num_heads = num_heads
+        self.packed_rows = 0
         self.seq_len_q = seq_len_q
         # fold_sq (caller-controlled): whether the folding code path is enabled.
         # fold_sq_ratio (derived): fold factor F ≥ 1; the largest divisor of
@@ -1834,12 +1835,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             tSgKR,
         )
 
-        tQLgQL = tQLgQL_mkl[
-            None, None, None, common_params.blk_coord[1], common_params.blk_coord[2]
-        ]
-        tQRgQR = tQRgQR_mkl[
-            None, None, None, common_params.blk_coord[1], common_params.blk_coord[2]
-        ]
+        q_sequence = 0 if self.packed_rows else common_params.blk_coord[1]
+        tQLgQL = tQLgQL_mkl[None, None, None, q_sequence, common_params.blk_coord[2]]
+        tQRgQR = tQRgQR_mkl[None, None, None, q_sequence, common_params.blk_coord[2]]
 
         # set extra params
         common_params.mPT = mPT
@@ -1998,7 +1996,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 # load q latent
                 cute.copy(
                     qk_params.tma_atom_q_latent,
-                    qk_params.tQLgQL[None, 0, i],
+                    qk_params.tQLgQL[
+                        None, common_params.blk_coord[1] if self.packed_rows else 0, i
+                    ],
                     qk_params.tQsQ[None, (i, 0)],
                     tma_bar_ptr=tma_bar_ptr,
                 )
@@ -2006,7 +2006,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 # load q rope
                 cute.copy(
                     qk_params.tma_atom_q_rope,
-                    qk_params.tQRgQR[None, 0, i],
+                    qk_params.tQRgQR[
+                        None, common_params.blk_coord[1] if self.packed_rows else 0, i
+                    ],
                     qk_params.tQsQ_rope[None, i],
                     tma_bar_ptr=tma_bar_ptr,
                 )

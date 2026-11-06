@@ -1,17 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Family heuristics for ``frost_gemm``: the facts callable and the proposal
-callable the engine manifest names (``engines/manifest.py``).
-
-Same shape as the SDPA family (``cudnn.sdpa.fwd.heuristics``): the analyzer
-turns the graph into facts once, ``recommend`` proposes complete
-``PlanConfig(engine_id, GemmKnobs)`` entries from those facts alone, and every
-listed plan carries the exact tile config the engine will build -- so a recorded
-``(engine_id, knobs)`` replays the same kernel after the automatic pick changes.
-
-The shared planner proposes up to eight entries in calibrated paths, including
-geometry, split-K and swapAB choices, with the single-plan recommendation first.
-"""
+"""Family heuristics for ``frost_gemm``: the facts callable and the proposal callable the engine manifest names (``engines/manifest.py``)."""
 
 from __future__ import annotations
 
@@ -34,12 +23,13 @@ class GemmFacts:
 
     chain: Any  # fusion_ir.FusionChain
     dynamic_shapes: bool  # the graph declared dynamic shapes (split-K is skipped)
+    shapes_fixed: bool = False  # neither dynamic nor override-shape enabled
 
 
 def analyze_facts(graph) -> Optional[GemmFacts]:
     """The manifest's ``analyzer`` hook: facts for a GEMM graph, or None when
     the FROST analyzer cannot express it (the backend then serves it alone)."""
-    from .compiler import _graph_dynamic_shapes
+    from .compiler import _graph_dynamic_shapes, _graph_shapes_fixed
     from .graph_analyzer import _graph_has_gemm, analyze
 
     if not _graph_has_gemm(graph):
@@ -49,7 +39,7 @@ def analyze_facts(graph) -> Optional[GemmFacts]:
     except (NotImplementedError, ValueError, KeyError) as exc:
         _LOG.debug("frost_gemm analyzer declined the graph: %s", exc)
         return None
-    return GemmFacts(chain=chain, dynamic_shapes=_graph_dynamic_shapes(graph))
+    return GemmFacts(chain=chain, dynamic_shapes=_graph_dynamic_shapes(graph), shapes_fixed=_graph_shapes_fixed(graph))
 
 
 def recommend(kind: str, facts: GemmFacts, offered: Dict[str, int]) -> List[PlanConfig]:
@@ -62,7 +52,7 @@ def recommend(kind: str, facts: GemmFacts, offered: Dict[str, int]) -> List[Plan
 
     try:
         probe_cutedsl()
-        configs = plan_configs(facts.chain, dynamic_shapes=facts.dynamic_shapes)
+        configs = plan_configs(facts.chain, dynamic_shapes=facts.dynamic_shapes, shapes_fixed=facts.shapes_fixed)
     except (NotImplementedError, ValueError, KeyError) as exc:
         _LOG.debug("frost_gemm proposes nothing (%s): %s", kind, exc)
         return []

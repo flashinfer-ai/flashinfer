@@ -13,12 +13,14 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-The registry (``cake_jit``), the loader glue (``cake_backend``) and the manifests of the Cake packed GDN KCP training
-package: the package contract that needs no device -- ``build.json`` (schema ``cake-build/1``, the shipped programs,
-never a test-only one, digests over the listed sources), ``build.test.json`` (the test-only programs), the program
-names against the identity rule, the records against the frozen kernel ABIs, the loader's independence from
-``flashinfer.jit`` (the prebuilt route) and the package's independence from the KDA training package.  Nothing is
-built or launched.
+The registry (``cake_jit``), the loader glue (``cake_backend``) and the manifests of the non-deterministic Cake packed
+GDN KCP training package ``flashinfer.experimental.cake_gdn_train_kcp``: the package contract that needs no device --
+``build.json`` (schema ``cake-build/1``, the shipped programs, never a test-only one, digests over the listed sources),
+``build.test.json`` (the test-only programs), the program names against the identity rule (prefix ``cake_gdn_train``,
+never a library name of the deterministic twin), the records against the frozen kernel ABIs, the loader's independence
+from ``flashinfer.jit`` (the prebuilt route) and the package's independence from the KDA training package.  Nothing is
+built or launched.  The generated files (``cake_build.py``, ``build.json``, ``build.test.json``, ``csrc/*.cu``) come
+from the export render: every test that needs one of them skips while it is absent.
 """
 
 from __future__ import annotations
@@ -32,23 +34,66 @@ import sys
 from pathlib import Path
 
 import pytest
+import torch
 
-from tests.test_helpers.cake_package import PACKAGES, cake_package
+PACKAGE = "cake_gdn_train_kcp"
 
-PACKAGE = "cake_gdn_train"
-cake_build = cake_package(PACKAGE, "cake_build")
-PACKAGE_DIR = Path(cake_build.__file__).parent
-PACKAGE_IMPORT = PACKAGES[PACKAGE]
+
+@pytest.fixture(autouse=True, scope="module")
+def _few_cpu_threads():
+    """The CPU emulation runs many small matmuls and elementwise ops.  On a host with hundreds of CPUs, torch's default
+    intra-op pool and the oneDNN matmul path (its own pool, which torch.set_num_threads does not resize) spend far more
+    time synchronizing threads than computing (see ``test_cake_gdn_train_kcp.py``), so this module runs with at most 8
+    threads and oneDNN off, as that suite does."""
+    threads, onednn = torch.get_num_threads(), torch.backends.mkldnn.enabled
+    torch.set_num_threads(min(threads, 8))
+    torch.backends.mkldnn.enabled = False
+    try:
+        yield
+    finally:
+        torch.backends.mkldnn.enabled = onednn
+        torch.set_num_threads(threads)
+
+
+def _package_import() -> str:
+    """The import path of the package: the test-helper registry's entry when it lists the package, else the in-tree
+    path (the registry has no entry for this package yet)."""
+    try:
+        from tests.test_helpers.cake_package import PACKAGES
+
+        return PACKAGES[PACKAGE]
+    except (ImportError, KeyError):
+        return f"flashinfer.experimental.{PACKAGE}"
+
+
+def _package(sub: str | None = None):
+    """The package (or one of its modules) through the test-helper registry when it lists the package, else directly."""
+    try:
+        from tests.test_helpers.cake_package import cake_package
+
+        return cake_package(PACKAGE, sub)
+    except (ImportError, KeyError):
+        path = _package_import()
+        return importlib.import_module(path if sub is None else f"{path}.{sub}")
+
+
+PACKAGE_IMPORT = _package_import()
+PACKAGE_DIR = Path(_package().__file__).resolve().parent
 ARCHES = ("sm_100a", "sm_103a", "sm_107a")
 GRID = [["grid", "grid_x"], ["grid", "grid_y"], ["grid", "grid_z"]]
 PREFIX = "cake_gdn_train"
+KCP_SUFFIX = "_kcp"  # the context-parallel-only programs (``kcp_*``)
 _W = "sm100_sm103_sm107"
 
-# The nine programs of a step (the shipped records by program name: sixteen libraries) and the two test-only records.
+# The nine programs of a step and the two output walks (the shipped records by program name: twenty libraries), the
+# three programs of the in-kernel Q / K L2 norm and the light replay of #1_l2n (one library each: 24 shipped records)
+# and the two test-only records.
 SHIPPED_PROGRAMS = (
     "fwd_prep",
     "kcp_fwdh_offset",
     "kcp_fwdh_tape",
+    "kcp_fwdh_out",
+    "kcp_fwdh_out_tape",
     "kcp_transfer_walk",
     "kcp_affine_merge",
     "fwd_o",
@@ -57,39 +102,58 @@ SHIPPED_PROGRAMS = (
     "kcp_dhu_tape",
     "bwd_dqkg",
     "gate_epilogue",
+    "fwd_prep_l2n",
+    "fwd_prep_replay_l2n",
+    "bwd_dqkg_l2n",
+    "qk_apply",
 )
 TEST_RECORDS = ("kcp_transfer_walk_three_mma", "kcp_transfer_walk_plain_tf32")
-# The identity rule: ``cake_gdn_train_<20 hex of sha256("<kernel module>\\n<sorted JSON of the build keywords>")>``.
+# The identity rule: ``cake_gdn_train_<20 hex of sha256("<kernel module>\\n<sorted JSON of the build keywords>")>``,
+# followed by ``_kcp`` for the context-parallel-only programs (``kcp_*``: the state walks, the transfer walk and the
+# affine merge).  The merge keeps the digest of its current shared module path (the KDA package's merge records).
 # The build keywords are the contract of each record; a keyword spelled at its default names the same program as an
-# omitted one, so these pairs are frozen together with the kernels' build signatures.
+# omitted one, so these pairs are frozen together with the kernels' build signatures.  The kernel modules are, so
+# far, the deterministic family's (``gdn_chunk_det_*``): the digests equal the twin's, the prefix differs, so no library
+# of this package is named like a library of ``cake_gdn_det_train_kcp`` (a lever that replaces a program updates
+# its row here).  The output walks' modules are det-neutral (``gdn_chunk_fwdh_out_v1_kcp``,
+# ``gdn_chunk_fwdh_out_tape_v1_kcp``) and no det twin ships them; the light replay's module
+# (``gdn_chunk_train_fwd_prep_replay_l2n_v1``) is this package's own, with no det twin.
 IDENTITIES = {
-    "fwd_prep": (f"tart.gdn_chunk_train_fwd_prep.{_W}.gdn_chunk_train_fwd_prep_v1", {}),
+    "fwd_prep": (
+        f"tart.gdn_chunk_train_fwd_prep.{_W}.gdn_chunk_det_train_fwd_prep_v1",
+        {},
+    ),
     "kcp_fwdh_offset": (
-        f"tart.gdn_chunk_kcp_fwd_h.{_W}.gdn_chunk_kcp_fwdh_v1",
+        f"tart.gdn_chunk_kcp_fwd_h.{_W}.gdn_chunk_det_fwdh_v1_kcp",
         {"program": "offset"},
     ),
     "kcp_fwdh_tape": (
-        f"tart.gdn_chunk_kcp_fwd_h.{_W}.gdn_chunk_kcp_fwdh_v1",
+        f"tart.gdn_chunk_kcp_fwd_h.{_W}.gdn_chunk_det_fwdh_v1_kcp",
         {"program": "tape"},
     ),
     "kcp_fwdh_offset_vh64": (
-        f"tart.gdn_chunk_kcp_fwd_h.{_W}.gdn_chunk_kcp_fwdh_v1",
+        f"tart.gdn_chunk_kcp_fwd_h.{_W}.gdn_chunk_det_fwdh_v1_kcp",
         {"program": "offset", "vh": 64},
     ),
     "kcp_fwdh_tape_vh64": (
-        f"tart.gdn_chunk_kcp_fwd_h.{_W}.gdn_chunk_kcp_fwdh_v1",
+        f"tart.gdn_chunk_kcp_fwd_h.{_W}.gdn_chunk_det_fwdh_v1_kcp",
         {"program": "tape", "vh": 64},
     ),
+    "kcp_fwdh_out": (f"tart.gdn_chunk_kcp_fwd_h.{_W}.gdn_chunk_fwdh_out_v1_kcp", {}),
+    "kcp_fwdh_out_vh64": (
+        f"tart.gdn_chunk_kcp_fwd_h.{_W}.gdn_chunk_fwdh_out_v1_kcp",
+        {"vh": 64},
+    ),
     "kcp_transfer_walk": (
-        f"tart.gdn_chunk_kcp_transfer_walk.{_W}.gdn_chunk_kcp_transfer_walk_v1",
+        f"tart.gdn_chunk_kcp_transfer_walk.{_W}.gdn_chunk_det_transfer_walk_v1_kcp",
         {"precision_mode": 0, "compute_warps": 8},
     ),
     "kcp_transfer_walk_three_mma": (
-        f"tart.gdn_chunk_kcp_transfer_walk.{_W}.gdn_chunk_kcp_transfer_walk_v1",
+        f"tart.gdn_chunk_kcp_transfer_walk.{_W}.gdn_chunk_det_transfer_walk_v1_kcp",
         {"precision_mode": 1},
     ),
     "kcp_transfer_walk_plain_tf32": (
-        f"tart.gdn_chunk_kcp_transfer_walk.{_W}.gdn_chunk_kcp_transfer_walk_v1",
+        f"tart.gdn_chunk_kcp_transfer_walk.{_W}.gdn_chunk_det_transfer_walk_v1_kcp",
         {"precision_mode": 2},
     ),
     "kcp_affine_merge_c8": (
@@ -100,33 +164,58 @@ IDENTITIES = {
         f"tart.kda_chunk_kcp_affine_merge.{_W}.kda_chunk_kcp_affine_merge_fp32_v1",
         {"cols_per_cta": 16},
     ),
-    "fwd_o": (f"tart.gdn_chunk_train_fwd_o.{_W}.gdn_chunk_train_fwd_o_v1", {}),
-    "bwd_prep": (f"tart.gdn_chunk_train_bwd_prep.{_W}.gdn_chunk_train_bwd_prep_v1", {}),
+    "fwd_o": (f"tart.gdn_chunk_train_fwd_o.{_W}.gdn_chunk_det_train_fwd_o_v1", {}),
+    "bwd_prep": (
+        f"tart.gdn_chunk_train_bwd_prep.{_W}.gdn_chunk_det_train_bwd_prep_v1",
+        {},
+    ),
     "kcp_dhu_offset": (
-        f"tart.gdn_chunk_kcp_dhu.{_W}.gdn_chunk_kcp_dhu_v1",
+        f"tart.gdn_chunk_kcp_dhu.{_W}.gdn_chunk_det_dhu_v1_kcp",
         {"program": "offset"},
     ),
     "kcp_dhu_tape": (
-        f"tart.gdn_chunk_kcp_dhu.{_W}.gdn_chunk_kcp_dhu_v1",
+        f"tart.gdn_chunk_kcp_dhu.{_W}.gdn_chunk_det_dhu_v1_kcp",
         {"program": "tape"},
     ),
     "kcp_dhu_offset_vh64": (
-        f"tart.gdn_chunk_kcp_dhu.{_W}.gdn_chunk_kcp_dhu_v1",
+        f"tart.gdn_chunk_kcp_dhu.{_W}.gdn_chunk_det_dhu_v1_kcp",
         {"program": "offset", "vh": 64},
     ),
     "kcp_dhu_tape_vh64": (
-        f"tart.gdn_chunk_kcp_dhu.{_W}.gdn_chunk_kcp_dhu_v1",
+        f"tart.gdn_chunk_kcp_dhu.{_W}.gdn_chunk_det_dhu_v1_kcp",
         {"program": "tape", "vh": 64},
     ),
     "bwd_dqkg": (
-        f"tart.gdn_chunk_train_bwd_dqkg_fused.{_W}.gdn_chunk_train_bwd_dqkg_v1",
+        f"tart.gdn_chunk_train_bwd_dqkg_fused.{_W}.gdn_chunk_det_train_bwd_dqkg_v1",
         {},
     ),
     "gate_epilogue": (
-        f"tart.gdn_chunk_train_gate_epilogue.{_W}.gdn_chunk_train_gate_epilogue_v1",
+        f"tart.gdn_chunk_train_gate_epilogue.{_W}.gdn_chunk_det_train_gate_epilogue_v1",
+        {},
+    ),
+    "fwd_prep_l2n": (
+        f"tart.gdn_chunk_train_fwd_prep.{_W}.gdn_chunk_det_train_fwd_prep_l2n_v1",
+        {},
+    ),
+    "fwd_prep_replay_l2n": (
+        f"tart.gdn_chunk_train_fwd_prep.{_W}.gdn_chunk_train_fwd_prep_replay_l2n_v1",
+        {},
+    ),
+    "bwd_dqkg_l2n": (
+        f"tart.gdn_chunk_train_bwd_dqkg_fused.{_W}.gdn_chunk_det_train_bwd_dqkg_l2n_v1",
+        {},
+    ),
+    "qk_apply": (
+        f"tart.gdn_chunk_train_qk_apply.{_W}.gdn_chunk_det_train_qk_apply_v1",
         {},
     ),
 }
+# The tape-and-output walk: the output walk's kernel family under its own module (records named as the output walk's).
+_FWDH_OUT_TAPE_MODULE = IDENTITIES["kcp_fwdh_out"][0].replace(
+    ".gdn_chunk_fwdh_out_v1_kcp", ".gdn_chunk_fwdh_out_tape_v1_kcp"
+)
+IDENTITIES["kcp_fwdh_out_tape"] = (_FWDH_OUT_TAPE_MODULE, {})
+IDENTITIES["kcp_fwdh_out_tape_vh64"] = (_FWDH_OUT_TAPE_MODULE, {"vh": 64})
 # The grid rules the host evaluates: the walks launch one CTA per listed segment and value head, the affine merge one
 # CTA per chain and column block, the chunk-shaped programs one CTA per chunk and (Q/K or value) head.
 GRID_RULES = (
@@ -145,9 +234,18 @@ def _registry():
     return pytest.importorskip(f"{PACKAGE_IMPORT}.cake_jit")
 
 
+def _cake_build():
+    """The pinned loader ``cake_build.py`` (a generated file), or a skip while the render has not delivered it."""
+    if not (PACKAGE_DIR / "cake_build.py").is_file():
+        pytest.skip("cake_build.py is not rendered into the package yet")
+    return importlib.import_module(f"{PACKAGE_IMPORT}.cake_build")
+
+
 def _backend():
-    """The backend module; it imports the registry, so it skips with it while the seed registry is not in the tree."""
+    """The backend module; it imports the registry and the pinned loader, so it skips with them while either is not
+    in the tree."""
     _registry()
+    _cake_build()
     return importlib.import_module(f"{PACKAGE_IMPORT}.cake_backend")
 
 
@@ -156,7 +254,9 @@ def _records(cake_jit) -> dict[str, dict]:
 
 
 def _manifest_rendered() -> bool:
-    return bool(cake_build.manifest()["libraries"])
+    if not (PACKAGE_DIR / "build.json").is_file():
+        return False
+    return bool(_cake_build().manifest()["libraries"])
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -178,7 +278,7 @@ def test_the_package_imports_nothing_from_the_kda_training_package() -> None:
                 names = [node.module or ""] + [alias.name for alias in node.names]
             else:
                 continue
-            if any("cake_kda_train" in name for name in names):
+            if any("cake_kda" in name for name in names):
                 offenders.append(f"{path.name}:{node.lineno}")
     assert not offenders, offenders
 
@@ -201,6 +301,9 @@ def test_the_package_reads_no_environment_variable() -> None:
 def test_the_loader_imports_standalone_without_flashinfer() -> None:
     """The vendorable form: ``cake_build.py`` loaded by file path from the package directory, in a process where
     ``flashinfer`` cannot be imported, reads the manifest (the prebuilt route imports nothing from FlashInfer)."""
+    _cake_build()
+    if not (PACKAGE_DIR / "build.json").is_file():
+        pytest.skip("build.json is not rendered into the package yet")
     code = (
         "import importlib.util, sys\n"
         "sys.modules['flashinfer'] = None\n"
@@ -220,9 +323,12 @@ def test_the_loader_imports_standalone_without_flashinfer() -> None:
 def test_the_loader_and_header_are_the_pinned_bytes_of_every_cake_package() -> None:
     """``cake_build.py`` is byte-identical across the Cake packages (the manifest checker's rule); the binding checks
     header too."""
+    _cake_build()
+    if not (PACKAGE_DIR / "csrc" / "cake_ffi_checks.h").is_file():
+        pytest.skip("csrc/cake_ffi_checks.h is not rendered into the package yet")
     kda_dir = Path(
         importlib.import_module(
-            "flashinfer.experimental.cake_kda_train.cake_build"
+            "flashinfer.experimental.cake_kda_det_train.cake_build"
         ).__file__
     ).parent
     for relative in ("cake_build.py", "csrc/cake_ffi_checks.h"):
@@ -288,7 +394,8 @@ def test_program_names_follow_the_identity_rule() -> None:
         digest = hashlib.sha256(
             f"{module}\n{json.dumps(kwargs, sort_keys=True)}".encode()
         ).hexdigest()
-        assert records[name]["library"] == f"{PREFIX}_{digest[:20]}", name
+        suffix = KCP_SUFFIX if records[name]["program"].startswith("kcp_") else ""
+        assert records[name]["library"] == f"{PREFIX}_{digest[:20]}{suffix}", name
     libraries = [record["library"] for record in records.values()]
     assert len(set(libraries)) == len(libraries), "every record is its own program"
     assert all(library.startswith(f"{PREFIX}_") for library in libraries)
@@ -408,6 +515,9 @@ def test_selection_and_grids() -> None:
 
 
 def test_manifest_skeleton_is_well_formed() -> None:
+    cake_build = _cake_build()
+    if not (PACKAGE_DIR / "build.json").is_file():
+        pytest.skip("build.json is not rendered into the package yet")
     manifest = cake_build.manifest()
     assert manifest["schema"] == "cake-build/1"
     assert manifest["package"] == PACKAGE_IMPORT
@@ -429,6 +539,7 @@ def test_shipped_manifest_lists_the_programs_and_no_test_only_one() -> None:
         pytest.skip("build.json carries no libraries yet (the package is not rendered)")
     cake_jit = _registry()
     backend = _backend()
+    cake_build = _cake_build()
     manifest = cake_build.manifest()
     libraries = cake_build.libraries_by_name()
     for name, record in cake_jit.MODULES.items():
@@ -470,7 +581,7 @@ def test_test_manifest_is_the_test_only_programs() -> None:
         pytest.skip(f"{backend.TEST_MANIFEST} is not shipped here")
     backend.test_manifest.cache_clear()
     document = backend.test_manifest()
-    shipped = cake_build.manifest()
+    shipped = _cake_build().manifest()
     assert document["schema"] == shipped["schema"] == "cake-build/1"
     assert document["package"] == shipped["package"] == PACKAGE_IMPORT
     assert document["generator"] == shipped["generator"]
@@ -503,6 +614,7 @@ def test_aot_load_prefers_the_prebuilt_library() -> None:
         pytest.skip("build.json carries no libraries yet (the package is not rendered)")
     backend = _backend()
     cake_jit = _registry()
+    cake_build = _cake_build()
     name = next(iter(cake_jit.MODULES))
     for arch in ARCHES:
         library = backend.library_name(name, arch)

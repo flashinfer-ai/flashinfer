@@ -326,7 +326,10 @@ def _factory_conversion_knobs():
     }
 
 
-@pytest.mark.parametrize("conversion_layout", ["fallback", "factory"])
+@pytest.mark.parametrize(
+    "conversion_layout",
+    ["fallback", "factory", "sf2-r1", "sf0-n72", "sf0-n80", "sf0-k128-n80"],
+)
 def test_sm90_nvfp4_public_ep4_matches_raw_weight_oracles(conversion_layout):
     import torch
 
@@ -348,13 +351,57 @@ def test_sm90_nvfp4_public_ep4_matches_raw_weight_oracles(conversion_layout):
     local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
     bootstrap = BootstrapConfig(world_size=WORLD_SIZE, rank=rank, device=local_rank)
     ensure_moe_ep_cuda_device(bootstrap)
-    tokens, hidden_size, intermediate_size = TOKENS, HIDDEN, INTERMEDIATE
+    scale_ring = conversion_layout == "sf2-r1"
+    wide_tile = conversion_layout in ("sf0-n72", "sf0-n80", "sf0-k128-n80")
+    tile_n = 72 if conversion_layout == "sf0-n72" else 80
+    tile_k = 128 if conversion_layout == "sf0-k128-n80" else 256
+    large = scale_ring or wide_tile
+    tokens = 1024 if large else TOKENS
+    hidden_size = 1280 if large else HIDDEN
+    intermediate_size = 1280 if large else INTERMEDIATE
     knobs = _factory_conversion_knobs() if conversion_layout == "factory" else None
+    if large:
+        # Five K256 tiles exercise steady-state scale production and ring
+        # wrap. FC2's M=1280 also pads the final two-CTA cluster. Production
+        # references remain independent of the production converter.
+        knobs = {
+            "mma_tiler_mnk": (256, 64, 256),
+            "cluster_shape_mnk": (2, 1, 1),
+            "group_hint": 528,
+            "num_sched_stages": 1,
+            "pingpong": False,
+            "swap_ab": True,
+            "fp8_accum_mode": "1xacc",
+            "load_balance_mode": "atomic_counter",
+            "token_back_mode": "epi_warps",
+            "dedup_dispatch": False,
+            "active_dispatch_warps": 1,
+            "fc1_store_offload": False,
+            "fc1_early_done_publish": True,
+            "fold_producer_warps": True,
+            "grouped_token_back": False,
+            "combine_format": "bf16",
+            "in_kernel_fc2_reduce": False,
+            "fc2_tail_n8": False,
+            "fc1_ready_mode": "tile",
+            "tail_split_pairs": False,
+            "compact_pull_buffer": True,
+            "nvfp4_lut_replicas": 1,
+            "nvfp4_lut_map": "lane",
+            "nvfp4_sf_stages": 2,
+        }
+        if wide_tile:
+            # 1024 rows per expert: 14 full N72 tiles and a 16-row tail, or 12
+            # full N80 tiles and a 64-row tail; K128 also runs the next-stage
+            # prefetch. The token tile does not change the math, so the N64
+            # baseline below must match byte for byte.
+            knobs = dict(knobs, mma_tiler_mnk=(256, tile_n, tile_k), nvfp4_sf_stages=0)
     config = Sm90_Fp8_Nvfp4_Bf16_PullCutedsl_MegaMoeConfig(
         intermediate_size=intermediate_size,
         top_k=WORLD_SIZE,
         gate_up_clamp=CLAMP,
         knobs=knobs,
+        nvfp4_fc1_k256_overlap=True if large and tile_k == 256 else None,
     )
     assert config.nvfp4_kperm == 64
     weights = _raw_weights(
@@ -387,7 +434,32 @@ def test_sm90_nvfp4_public_ep4_matches_raw_weight_oracles(conversion_layout):
             transformed_weights=prepared,
         ),
     )
+    baseline_layer = None
     try:
+        if large:
+            # Use a second public layer so constructing the fixed baseline
+            # cannot replace the tested layer's default workspace. Only the ring
+            # depth (sf2-r1) or the token tile (sf0-*) differs; K64 weights,
+            # the remaining geometry and overlap stay identical.
+            baseline_knobs = (
+                dict(knobs, mma_tiler_mnk=(256, 64, tile_k))
+                if wide_tile
+                else dict(knobs, nvfp4_sf_stages=0)
+            )
+            baseline_layer = MoEEpLayer(
+                bootstrap=bootstrap,
+                fleet_params=FleetParams(
+                    num_experts=WORLD_SIZE * LOCAL_EXPERTS,
+                    max_tokens_per_rank=tokens,
+                    token_hidden_size=hidden_size,
+                ),
+                weights=None,
+                backend=MegaConfig(
+                    megakernel=replace(config, knobs=baseline_knobs),
+                    preprocess_weights=False,
+                    transformed_weights=prepared,
+                ),
+            )
         raw = tuple(
             _gather(getattr(weights, name))
             for name in (
@@ -418,11 +490,19 @@ def test_sm90_nvfp4_public_ep4_matches_raw_weight_oracles(conversion_layout):
             tensors = MoEEpTensors(
                 hidden_states=hidden, topk_ids=ids, topk_weights=route_weights
             )
+            baseline = None
+            if baseline_layer is not None:
+                baseline = baseline_layer.forward(tensors).clone()
             actual = layer.forward(tensors).clone()
             repeated = None
             if launch == 1:
                 repeated = layer.forward(tensors).clone()
             actual = _gather(actual)
+            if baseline is not None:
+                baseline = _gather(baseline)
+                torch.testing.assert_close(
+                    actual.view(torch.uint8), baseline.view(torch.uint8), atol=0, rtol=0
+                )
             if repeated is not None:
                 repeated = _gather(repeated)
                 torch.testing.assert_close(
@@ -459,6 +539,8 @@ def test_sm90_nvfp4_public_ep4_matches_raw_weight_oracles(conversion_layout):
                 rel_l2 = (actual[source].float() - expected[source]).norm() / norm
                 assert rel_l2 < 0.025, (source, launch, rel_l2.item())
     finally:
+        if baseline_layer is not None:
+            baseline_layer.destroy()
         layer.destroy()
 
 

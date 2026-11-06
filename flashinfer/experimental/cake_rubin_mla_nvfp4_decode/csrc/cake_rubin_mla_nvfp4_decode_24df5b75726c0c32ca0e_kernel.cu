@@ -128,10 +128,10 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
       l1 = partial_lse[stat_base_7 + lane_7 + 32];
     }
     float vec[128];
-    int _mn_0_0 = ((0) < (last_7) ? (0) : (last_7));
+    int _mn_0 = ((0) < (last_7) ? (0) : (last_7));
     {
       const uint4* _vptr_0 =
-          reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_0_0) * 512 + d0_7);
+          reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_0) * 512 + d0_7);
       uint4 _vld_0[1];
 #pragma unroll
       for (int _blk = 0; _blk < 1; _blk++) {
@@ -146,10 +146,10 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
         }
       }
     }
-    int _mn_0_1 = ((1) < (last_7) ? (1) : (last_7));
+    int _mn_1 = ((1) < (last_7) ? (1) : (last_7));
     {
       const uint4* _vptr_1 =
-          reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_0_1) * 512 + d0_7);
+          reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_1) * 512 + d0_7);
       uint4 _vld_1[1];
 #pragma unroll
       for (int _blk = 0; _blk < 1; _blk++) {
@@ -164,10 +164,10 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
         }
       }
     }
-    int _mn_0_2 = ((2) < (last_7) ? (2) : (last_7));
+    int _mn_2 = ((2) < (last_7) ? (2) : (last_7));
     {
       const uint4* _vptr_2 =
-          reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_0_2) * 512 + d0_7);
+          reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_2) * 512 + d0_7);
       uint4 _vld_2[1];
 #pragma unroll
       for (int _blk = 0; _blk < 1; _blk++) {
@@ -182,10 +182,10 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
         }
       }
     }
-    int _mn_0_3 = ((3) < (last_7) ? (3) : (last_7));
+    int _mn_3 = ((3) < (last_7) ? (3) : (last_7));
     {
       const uint4* _vptr_3 =
-          reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_0_3) * 512 + d0_7);
+          reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_3) * 512 + d0_7);
       uint4 _vld_3[1];
 #pragma unroll
       for (int _blk = 0; _blk < 1; _blk++) {
@@ -200,10 +200,10 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
         }
       }
     }
-    int _mn_0_4 = ((4) < (last_7) ? (4) : (last_7));
+    int _mn_4 = ((4) < (last_7) ? (4) : (last_7));
     {
       const uint4* _vptr_4 =
-          reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_0_4) * 512 + d0_7);
+          reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_4) * 512 + d0_7);
       uint4 _vld_4[1];
 #pragma unroll
       for (int _blk = 0; _blk < 1; _blk++) {
@@ -218,10 +218,10 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
         }
       }
     }
-    int _mn_0_5 = ((5) < (last_7) ? (5) : (last_7));
+    int _mn_5 = ((5) < (last_7) ? (5) : (last_7));
     {
       const uint4* _vptr_5 =
-          reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_0_5) * 512 + d0_7);
+          reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_5) * 512 + d0_7);
       uint4 _vld_5[1];
 #pragma unroll
       for (int _blk = 0; _blk < 1; _blk++) {
@@ -236,10 +236,10 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
         }
       }
     }
-    int _mn_0_6 = ((6) < (last_7) ? (6) : (last_7));
+    int _mn_6 = ((6) < (last_7) ? (6) : (last_7));
     {
       const uint4* _vptr_6 =
-          reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_0_6) * 512 + d0_7);
+          reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_6) * 512 + d0_7);
       uint4 _vld_6[1];
 #pragma unroll
       for (int _blk = 0; _blk < 1; _blk++) {
@@ -254,10 +254,10 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
         }
       }
     }
-    int _mn_0_7 = ((7) < (last_7) ? (7) : (last_7));
+    int _mn_7 = ((7) < (last_7) ? (7) : (last_7));
     {
       const uint4* _vptr_7 =
-          reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_0_7) * 512 + d0_7);
+          reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_7) * 512 + d0_7);
       uint4 _vld_7[1];
 #pragma unroll
       for (int _blk = 0; _blk < 1; _blk++) {
@@ -272,10 +272,10 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
         }
       }
     }
-    int _mn_0_8 = ((8) < (last_7) ? (8) : (last_7));
+    int _mn_8 = ((8) < (last_7) ? (8) : (last_7));
     {
       const uint4* _vptr_8 =
-          reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_0_8) * 512 + d0_7);
+          reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_8) * 512 + d0_7);
       uint4 _vld_8[1];
 #pragma unroll
       for (int _blk = 0; _blk < 1; _blk++) {
@@ -290,10 +290,10 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
         }
       }
     }
-    int _mn_0_9 = ((9) < (last_7) ? (9) : (last_7));
+    int _mn_9 = ((9) < (last_7) ? (9) : (last_7));
     {
       const uint4* _vptr_9 =
-          reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_0_9) * 512 + d0_7);
+          reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_9) * 512 + d0_7);
       uint4 _vld_9[1];
 #pragma unroll
       for (int _blk = 0; _blk < 1; _blk++) {
@@ -308,10 +308,10 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
         }
       }
     }
-    int _mn_0_10 = ((10) < (last_7) ? (10) : (last_7));
+    int _mn_10 = ((10) < (last_7) ? (10) : (last_7));
     {
       const uint4* _vptr_10 =
-          reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_0_10) * 512 + d0_7);
+          reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_10) * 512 + d0_7);
       uint4 _vld_10[1];
 #pragma unroll
       for (int _blk = 0; _blk < 1; _blk++) {
@@ -326,10 +326,10 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
         }
       }
     }
-    int _mn_0_11 = ((11) < (last_7) ? (11) : (last_7));
+    int _mn_11 = ((11) < (last_7) ? (11) : (last_7));
     {
       const uint4* _vptr_11 =
-          reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_0_11) * 512 + d0_7);
+          reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_11) * 512 + d0_7);
       uint4 _vld_11[1];
 #pragma unroll
       for (int _blk = 0; _blk < 1; _blk++) {
@@ -344,10 +344,10 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
         }
       }
     }
-    int _mn_0_12 = ((12) < (last_7) ? (12) : (last_7));
+    int _mn_12 = ((12) < (last_7) ? (12) : (last_7));
     {
       const uint4* _vptr_12 =
-          reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_0_12) * 512 + d0_7);
+          reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_12) * 512 + d0_7);
       uint4 _vld_12[1];
 #pragma unroll
       for (int _blk = 0; _blk < 1; _blk++) {
@@ -362,10 +362,10 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
         }
       }
     }
-    int _mn_0_13 = ((13) < (last_7) ? (13) : (last_7));
+    int _mn_13 = ((13) < (last_7) ? (13) : (last_7));
     {
       const uint4* _vptr_13 =
-          reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_0_13) * 512 + d0_7);
+          reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_13) * 512 + d0_7);
       uint4 _vld_13[1];
 #pragma unroll
       for (int _blk = 0; _blk < 1; _blk++) {
@@ -380,10 +380,10 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
         }
       }
     }
-    int _mn_0_14 = ((14) < (last_7) ? (14) : (last_7));
+    int _mn_14 = ((14) < (last_7) ? (14) : (last_7));
     {
       const uint4* _vptr_14 =
-          reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_0_14) * 512 + d0_7);
+          reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_14) * 512 + d0_7);
       uint4 _vld_14[1];
 #pragma unroll
       for (int _blk = 0; _blk < 1; _blk++) {
@@ -398,10 +398,10 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
         }
       }
     }
-    int _mn_0_15 = ((15) < (last_7) ? (15) : (last_7));
+    int _mn_15 = ((15) < (last_7) ? (15) : (last_7));
     {
       const uint4* _vptr_15 =
-          reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_0_15) * 512 + d0_7);
+          reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_15) * 512 + d0_7);
       uint4 _vld_15[1];
 #pragma unroll
       for (int _blk = 0; _blk < 1; _blk++) {
@@ -598,10 +598,10 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
 #pragma unroll 1
     for (int bt = 1; bt < n_batches; bt++) {
       int k0 = bt * 16;
-      int _mn_1_0 = ((k0 + 0) < (last_7) ? (k0 + 0) : (last_7));
+      int _mn_16 = ((k0 + 0) < (last_7) ? (k0 + 0) : (last_7));
       {
         const uint4* _vptr_20 =
-            reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_1_0) * 512 + d0_7);
+            reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_16) * 512 + d0_7);
         uint4 _vld_20[1];
 #pragma unroll
         for (int _blk = 0; _blk < 1; _blk++) {
@@ -616,10 +616,10 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
           }
         }
       }
-      int _mn_1_1 = ((k0 + 1) < (last_7) ? (k0 + 1) : (last_7));
+      int _mn_17 = ((k0 + 1) < (last_7) ? (k0 + 1) : (last_7));
       {
         const uint4* _vptr_21 =
-            reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_1_1) * 512 + d0_7);
+            reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_17) * 512 + d0_7);
         uint4 _vld_21[1];
 #pragma unroll
         for (int _blk = 0; _blk < 1; _blk++) {
@@ -634,10 +634,10 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
           }
         }
       }
-      int _mn_1_2 = ((k0 + 2) < (last_7) ? (k0 + 2) : (last_7));
+      int _mn_18 = ((k0 + 2) < (last_7) ? (k0 + 2) : (last_7));
       {
         const uint4* _vptr_22 =
-            reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_1_2) * 512 + d0_7);
+            reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_18) * 512 + d0_7);
         uint4 _vld_22[1];
 #pragma unroll
         for (int _blk = 0; _blk < 1; _blk++) {
@@ -652,10 +652,10 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
           }
         }
       }
-      int _mn_1_3 = ((k0 + 3) < (last_7) ? (k0 + 3) : (last_7));
+      int _mn_19 = ((k0 + 3) < (last_7) ? (k0 + 3) : (last_7));
       {
         const uint4* _vptr_23 =
-            reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_1_3) * 512 + d0_7);
+            reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_19) * 512 + d0_7);
         uint4 _vld_23[1];
 #pragma unroll
         for (int _blk = 0; _blk < 1; _blk++) {
@@ -670,10 +670,10 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
           }
         }
       }
-      int _mn_1_4 = ((k0 + 4) < (last_7) ? (k0 + 4) : (last_7));
+      int _mn_20 = ((k0 + 4) < (last_7) ? (k0 + 4) : (last_7));
       {
         const uint4* _vptr_24 =
-            reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_1_4) * 512 + d0_7);
+            reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_20) * 512 + d0_7);
         uint4 _vld_24[1];
 #pragma unroll
         for (int _blk = 0; _blk < 1; _blk++) {
@@ -688,10 +688,10 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
           }
         }
       }
-      int _mn_1_5 = ((k0 + 5) < (last_7) ? (k0 + 5) : (last_7));
+      int _mn_21 = ((k0 + 5) < (last_7) ? (k0 + 5) : (last_7));
       {
         const uint4* _vptr_25 =
-            reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_1_5) * 512 + d0_7);
+            reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_21) * 512 + d0_7);
         uint4 _vld_25[1];
 #pragma unroll
         for (int _blk = 0; _blk < 1; _blk++) {
@@ -706,10 +706,10 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
           }
         }
       }
-      int _mn_1_6 = ((k0 + 6) < (last_7) ? (k0 + 6) : (last_7));
+      int _mn_22 = ((k0 + 6) < (last_7) ? (k0 + 6) : (last_7));
       {
         const uint4* _vptr_26 =
-            reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_1_6) * 512 + d0_7);
+            reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_22) * 512 + d0_7);
         uint4 _vld_26[1];
 #pragma unroll
         for (int _blk = 0; _blk < 1; _blk++) {
@@ -724,10 +724,10 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
           }
         }
       }
-      int _mn_1_7 = ((k0 + 7) < (last_7) ? (k0 + 7) : (last_7));
+      int _mn_23 = ((k0 + 7) < (last_7) ? (k0 + 7) : (last_7));
       {
         const uint4* _vptr_27 =
-            reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_1_7) * 512 + d0_7);
+            reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_23) * 512 + d0_7);
         uint4 _vld_27[1];
 #pragma unroll
         for (int _blk = 0; _blk < 1; _blk++) {
@@ -742,10 +742,10 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
           }
         }
       }
-      int _mn_1_8 = ((k0 + 8) < (last_7) ? (k0 + 8) : (last_7));
+      int _mn_24 = ((k0 + 8) < (last_7) ? (k0 + 8) : (last_7));
       {
         const uint4* _vptr_28 =
-            reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_1_8) * 512 + d0_7);
+            reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_24) * 512 + d0_7);
         uint4 _vld_28[1];
 #pragma unroll
         for (int _blk = 0; _blk < 1; _blk++) {
@@ -760,10 +760,10 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
           }
         }
       }
-      int _mn_1_9 = ((k0 + 9) < (last_7) ? (k0 + 9) : (last_7));
+      int _mn_25 = ((k0 + 9) < (last_7) ? (k0 + 9) : (last_7));
       {
         const uint4* _vptr_29 =
-            reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_1_9) * 512 + d0_7);
+            reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_25) * 512 + d0_7);
         uint4 _vld_29[1];
 #pragma unroll
         for (int _blk = 0; _blk < 1; _blk++) {
@@ -778,10 +778,10 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
           }
         }
       }
-      int _mn_1_10 = ((k0 + 10) < (last_7) ? (k0 + 10) : (last_7));
+      int _mn_26 = ((k0 + 10) < (last_7) ? (k0 + 10) : (last_7));
       {
         const uint4* _vptr_30 =
-            reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_1_10) * 512 + d0_7);
+            reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_26) * 512 + d0_7);
         uint4 _vld_30[1];
 #pragma unroll
         for (int _blk = 0; _blk < 1; _blk++) {
@@ -796,10 +796,10 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
           }
         }
       }
-      int _mn_1_11 = ((k0 + 11) < (last_7) ? (k0 + 11) : (last_7));
+      int _mn_27 = ((k0 + 11) < (last_7) ? (k0 + 11) : (last_7));
       {
         const uint4* _vptr_31 =
-            reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_1_11) * 512 + d0_7);
+            reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_27) * 512 + d0_7);
         uint4 _vld_31[1];
 #pragma unroll
         for (int _blk = 0; _blk < 1; _blk++) {
@@ -814,10 +814,10 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
           }
         }
       }
-      int _mn_1_12 = ((k0 + 12) < (last_7) ? (k0 + 12) : (last_7));
+      int _mn_28 = ((k0 + 12) < (last_7) ? (k0 + 12) : (last_7));
       {
         const uint4* _vptr_32 =
-            reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_1_12) * 512 + d0_7);
+            reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_28) * 512 + d0_7);
         uint4 _vld_32[1];
 #pragma unroll
         for (int _blk = 0; _blk < 1; _blk++) {
@@ -832,10 +832,10 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
           }
         }
       }
-      int _mn_1_13 = ((k0 + 13) < (last_7) ? (k0 + 13) : (last_7));
+      int _mn_29 = ((k0 + 13) < (last_7) ? (k0 + 13) : (last_7));
       {
         const uint4* _vptr_33 =
-            reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_1_13) * 512 + d0_7);
+            reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_29) * 512 + d0_7);
         uint4 _vld_33[1];
 #pragma unroll
         for (int _blk = 0; _blk < 1; _blk++) {
@@ -850,10 +850,10 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
           }
         }
       }
-      int _mn_1_14 = ((k0 + 14) < (last_7) ? (k0 + 14) : (last_7));
+      int _mn_30 = ((k0 + 14) < (last_7) ? (k0 + 14) : (last_7));
       {
         const uint4* _vptr_34 =
-            reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_1_14) * 512 + d0_7);
+            reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_30) * 512 + d0_7);
         uint4 _vld_34[1];
 #pragma unroll
         for (int _blk = 0; _blk < 1; _blk++) {
@@ -868,10 +868,10 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
           }
         }
       }
-      int _mn_1_15 = ((k0 + 15) < (last_7) ? (k0 + 15) : (last_7));
+      int _mn_31 = ((k0 + 15) < (last_7) ? (k0 + 15) : (last_7));
       {
         const uint4* _vptr_35 =
-            reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_1_15) * 512 + d0_7);
+            reinterpret_cast<const uint4*>(partial_o + (stat_base_7 + _mn_31) * 512 + d0_7);
         uint4 _vld_35[1];
 #pragma unroll
         for (int _blk = 0; _blk < 1; _blk++) {

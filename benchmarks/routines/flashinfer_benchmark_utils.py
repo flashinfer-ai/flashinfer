@@ -155,6 +155,17 @@ output_column_dict = {
         "weight_dtype",
         "has_z",
         "dt_softplus",
+        "conv_tokens_per_sequence",
+        "conv_seq_lens",
+        "conv_bias",
+        "conv_speculative",
+        "conv_initial_state",
+        "conv_layout",
+        "conv_input_row_stride",
+        "conv_graph_refcheck_passed",
+        "conv_workspace_bytes",
+        "conv_host_submit_us",
+        "conv_cuda_ops",
     ],
     "gdn": [
         "num_q_heads",
@@ -325,6 +336,8 @@ benchmark_apis = {
     ],
     "mamba": [
         "selective_state_update",
+        "causal_conv1d_fn",
+        "causal_conv1d_update",
     ],
     "gdn": [
         "gated_delta_rule_decode",
@@ -456,6 +469,7 @@ routine_cc_to_supported_backends = {
             "cudnn-native",
             "trtllm-gen",
             "trtllm-native",
+            "prims-ts",
         ],
         "12.0": ["fa2", "fa2_tc", "auto", "cudnn", "cudnn-native", "trtllm-native"],
         "12.1": ["fa2", "fa2_tc", "auto", "cudnn", "cudnn-native", "trtllm-native"],
@@ -487,7 +501,15 @@ routine_cc_to_supported_backends = {
             "trtllm-native",
             "prims-ts",
         ],
-        "10.7": ["fa2", "auto", "cudnn", "cudnn-native", "trtllm-gen", "trtllm-native"],
+        "10.7": [
+            "fa2",
+            "auto",
+            "cudnn",
+            "cudnn-native",
+            "trtllm-gen",
+            "trtllm-native",
+            "prims-ts",
+        ],
         "12.0": [
             "fa2",
             "auto",
@@ -555,7 +577,7 @@ routine_cc_to_supported_backends = {
         "9.0": ["fa2", "fa3"],
         "10.0": ["fa2", "cutlass", "trtllm-native", "cute-dsl", "auto", "prims-ts"],
         "10.3": ["fa2", "cutlass", "trtllm-native", "cute-dsl", "auto", "prims-ts"],
-        "10.7": ["fa2", "cutlass", "trtllm-native", "cute-dsl"],
+        "10.7": ["fa2", "cutlass", "trtllm-native", "cute-dsl", "prims-ts"],
         "12.0": ["fa2"],
         "12.1": ["fa2"],
     },
@@ -1170,6 +1192,14 @@ routine_cc_to_supported_backends = {
         "12.1": ["cuda"],
     },
     # MAMBA
+    "causal_conv1d_fn": {
+        "10.0": ["flashinfer", "triton"],
+        "10.3": ["flashinfer", "triton"],
+    },
+    "causal_conv1d_update": {
+        "10.0": ["flashinfer", "triton"],
+        "10.3": ["flashinfer", "triton"],
+    },
     "selective_state_update": {
         "7.5": ["flashinfer", "triton"],
         "8.0": ["flashinfer", "triton"],

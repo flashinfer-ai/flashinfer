@@ -305,7 +305,14 @@ kernel_cake_blackwell_bf16_fp4_7468dc6cc46a70c1decc(const __grid_constant__ CUte
     }
     float alpha_reg = 1.0f;
     {
-        alpha_reg = alpha[0];
+        float _alpha_v[1];
+        {
+            uint32_t _scalar_bits_0;
+            asm volatile("ld.global.b32 %0, [%1];"
+                : "=r"(_scalar_bits_0) : "l"((const void*)(alpha + (0))) : "memory");
+            _alpha_v[0] = __uint_as_float(_scalar_bits_0);
+        }
+        alpha_reg = _alpha_v[0];
     }
     if (warp == 0) {
         if (elect_sync()) {
@@ -413,9 +420,9 @@ kernel_cake_blackwell_bf16_fp4_7468dc6cc46a70c1decc(const __grid_constant__ CUte
         : "=r"(*reinterpret_cast<uint32_t*>(&brawh[0])), "=r"(*reinterpret_cast<uint32_t*>(&brawh[(0) + 1]))
         : "r"(smk_b_addr + 11264 + (unsigned int)b_lane));
     asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&sfwh[0])) : "r"(smk_sf_addr + 11264 + (unsigned int)sf_lane));
-    uint32_t _prmt_0;
-    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_0) : "r"(sfw[0]), "r"(sfw[0]), "r"(sf_sel));
-    uint32_t car = cvt_bf16x2_e4m3x2((uint16_t)_prmt_0);
+    uint32_t _prmt_1;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_1) : "r"(sfw[0]), "r"(sfw[0]), "r"(sf_sel));
+    uint32_t car = cvt_bf16x2_e4m3x2((uint16_t)_prmt_1);
     uint32_t _fp4_bf16x8_0[4];
     {
     #if defined(__CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 2)) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
@@ -490,9 +497,9 @@ kernel_cake_blackwell_bf16_fp4_7468dc6cc46a70c1decc(const __grid_constant__ CUte
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
         : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
         : "r"(a_frag[0]), "r"(a_frag[1]), "r"(a_frag[2]), "r"(a_frag[3]), "r"(b_frag[0]), "r"(b_frag[1]));
-    uint32_t _prmt_1;
-    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_1) : "r"(sfw[0]), "r"(sfw[0]), "r"(sf_sel));
-    uint32_t car_1 = cvt_bf16x2_e4m3x2((uint16_t)_prmt_1);
+    uint32_t _prmt_2;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_2) : "r"(sfw[0]), "r"(sfw[0]), "r"(sf_sel));
+    uint32_t car_1 = cvt_bf16x2_e4m3x2((uint16_t)_prmt_2);
     uint32_t _fp4_bf16x8_1[4];
     {
     #if defined(__CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 2)) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
@@ -585,9 +592,9 @@ kernel_cake_blackwell_bf16_fp4_7468dc6cc46a70c1decc(const __grid_constant__ CUte
         : "=r"(*reinterpret_cast<uint32_t*>(&braw[0])), "=r"(*reinterpret_cast<uint32_t*>(&braw[(0) + 1]))
         : "r"(smk_b_addr + 22528 + (unsigned int)b_lane));
     asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&sfw[0])) : "r"(smk_sf_addr + 22528 + (unsigned int)sf_lane));
-    uint32_t _prmt_2;
-    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_2) : "r"(sfwh[0]), "r"(sfwh[0]), "r"(sf_sel));
-    uint32_t car_2 = cvt_bf16x2_e4m3x2((uint16_t)_prmt_2);
+    uint32_t _prmt_3;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_3) : "r"(sfwh[0]), "r"(sfwh[0]), "r"(sf_sel));
+    uint32_t car_2 = cvt_bf16x2_e4m3x2((uint16_t)_prmt_3);
     uint32_t _fp4_bf16x8_2[4];
     {
     #if defined(__CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 2)) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
@@ -662,9 +669,9 @@ kernel_cake_blackwell_bf16_fp4_7468dc6cc46a70c1decc(const __grid_constant__ CUte
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
         : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
         : "r"(a_frag[0]), "r"(a_frag[1]), "r"(a_frag[2]), "r"(a_frag[3]), "r"(b_frag[0]), "r"(b_frag[1]));
-    uint32_t _prmt_3;
-    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_3) : "r"(sfwh[0]), "r"(sfwh[0]), "r"(sf_sel));
-    uint32_t car_3 = cvt_bf16x2_e4m3x2((uint16_t)_prmt_3);
+    uint32_t _prmt_4;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_4) : "r"(sfwh[0]), "r"(sfwh[0]), "r"(sf_sel));
+    uint32_t car_3 = cvt_bf16x2_e4m3x2((uint16_t)_prmt_4);
     uint32_t _fp4_bf16x8_3[4];
     {
     #if defined(__CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 2)) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
@@ -757,9 +764,9 @@ kernel_cake_blackwell_bf16_fp4_7468dc6cc46a70c1decc(const __grid_constant__ CUte
         : "=r"(*reinterpret_cast<uint32_t*>(&brawh[0])), "=r"(*reinterpret_cast<uint32_t*>(&brawh[(0) + 1]))
         : "r"(smk_b_addr + 33792 + (unsigned int)b_lane));
     asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&sfwh[0])) : "r"(smk_sf_addr + 33792 + (unsigned int)sf_lane));
-    uint32_t _prmt_4;
-    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_4) : "r"(sfw[0]), "r"(sfw[0]), "r"(sf_sel));
-    uint32_t car_4 = cvt_bf16x2_e4m3x2((uint16_t)_prmt_4);
+    uint32_t _prmt_5;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_5) : "r"(sfw[0]), "r"(sfw[0]), "r"(sf_sel));
+    uint32_t car_4 = cvt_bf16x2_e4m3x2((uint16_t)_prmt_5);
     uint32_t _fp4_bf16x8_4[4];
     {
     #if defined(__CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 2)) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
@@ -834,9 +841,9 @@ kernel_cake_blackwell_bf16_fp4_7468dc6cc46a70c1decc(const __grid_constant__ CUte
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
         : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
         : "r"(a_frag[0]), "r"(a_frag[1]), "r"(a_frag[2]), "r"(a_frag[3]), "r"(b_frag[0]), "r"(b_frag[1]));
-    uint32_t _prmt_5;
-    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_5) : "r"(sfw[0]), "r"(sfw[0]), "r"(sf_sel));
-    uint32_t car_5 = cvt_bf16x2_e4m3x2((uint16_t)_prmt_5);
+    uint32_t _prmt_6;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_6) : "r"(sfw[0]), "r"(sfw[0]), "r"(sf_sel));
+    uint32_t car_5 = cvt_bf16x2_e4m3x2((uint16_t)_prmt_6);
     uint32_t _fp4_bf16x8_5[4];
     {
     #if defined(__CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 2)) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
@@ -911,9 +918,9 @@ kernel_cake_blackwell_bf16_fp4_7468dc6cc46a70c1decc(const __grid_constant__ CUte
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
         : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
         : "r"(a_frag[0]), "r"(a_frag[1]), "r"(a_frag[2]), "r"(a_frag[3]), "r"(b_frag[0]), "r"(b_frag[1]));
-    uint32_t _prmt_6;
-    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_6) : "r"(sfwh[0]), "r"(sfwh[0]), "r"(sf_sel));
-    uint32_t car_6 = cvt_bf16x2_e4m3x2((uint16_t)_prmt_6);
+    uint32_t _prmt_7;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_7) : "r"(sfwh[0]), "r"(sfwh[0]), "r"(sf_sel));
+    uint32_t car_6 = cvt_bf16x2_e4m3x2((uint16_t)_prmt_7);
     uint32_t _fp4_bf16x8_6[4];
     {
     #if defined(__CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 2)) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
@@ -988,9 +995,9 @@ kernel_cake_blackwell_bf16_fp4_7468dc6cc46a70c1decc(const __grid_constant__ CUte
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
         : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
         : "r"(a_frag[0]), "r"(a_frag[1]), "r"(a_frag[2]), "r"(a_frag[3]), "r"(b_frag[0]), "r"(b_frag[1]));
-    uint32_t _prmt_7;
-    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_7) : "r"(sfwh[0]), "r"(sfwh[0]), "r"(sf_sel));
-    uint32_t car_7 = cvt_bf16x2_e4m3x2((uint16_t)_prmt_7);
+    uint32_t _prmt_8;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_8) : "r"(sfwh[0]), "r"(sfwh[0]), "r"(sf_sel));
+    uint32_t car_7 = cvt_bf16x2_e4m3x2((uint16_t)_prmt_8);
     uint32_t _fp4_bf16x8_7[4];
     {
     #if defined(__CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 2)) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)

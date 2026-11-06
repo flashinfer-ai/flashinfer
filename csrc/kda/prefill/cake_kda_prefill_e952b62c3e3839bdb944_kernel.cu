@@ -47,16 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAP_RING_STAGES 2
-#define SMEM_SMEM_M_OFF 1024
-#define SMEM_SMEM_M_STAGE_BYTES 32768
-#define SMEM_SMEM_M_STRIDE 32768
-#define SMEM_SMEM_CARRY_OFF 66560
-#define SMEM_SMEM_CARRY_STAGE_BYTES 8192
-#define SMEM_SMEM_CARRY_STRIDE 8192
-#define SMEM_TOTAL 74752
-#define THREADS 128
 #define LAUNCH_MIN_BLOCKS 2
 
 #include <math_constants.h>
@@ -158,15 +148,16 @@ kernel_cake_kda_prefill_e952b62c3e3839bdb944(float* __restrict__ split_state, __
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* smem_m = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int smem_m_addr = smem + 1024;
     float* smem_carry = reinterpret_cast<float*>(smem_raw + 66560);
     const int smem_carry_addr = smem + 66560;
+
+    // Kernel setup ops
     asm volatile("griddepcontrol.wait;" ::: "memory");
 
-    // Mbarrier init (1 pipeline groups, 0 ordered-sequence groups, 2 barriers)
-    // Mbarriers at smem_raw[0..16)
+    // Mbarrier init (2 barriers at smem_raw[0..16))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -230,62 +221,62 @@ kernel_cake_kda_prefill_e952b62c3e3839bdb944(float* __restrict__ split_state, __
         if (place % 2 == 1) {
             wanted = seq_count - 1 - place / 2;
         }
-        int rank = 0;
+        int rank_0 = 0;
         if (windows[1] > windows[0]) {
-            rank = rank + 1;
+            rank_0 = rank_0 + 1;
         }
         if (windows[2] > windows[0]) {
-            rank = rank + 1;
+            rank_0 = rank_0 + 1;
         }
         if (windows[3] > windows[0]) {
-            rank = rank + 1;
+            rank_0 = rank_0 + 1;
         }
-        if (rank == wanted) {
+        if (rank_0 == wanted) {
             sequence = 0;
             part_begin = bounds[0];
             part_stop = bounds[1];
         }
-        int rank_0 = 0;
+        int rank_1 = 0;
         if (windows[0] >= windows[1]) {
-            rank_0 = rank_0 + 1;
+            rank_1 = rank_1 + 1;
         }
         if (windows[2] > windows[1]) {
-            rank_0 = rank_0 + 1;
+            rank_1 = rank_1 + 1;
         }
         if (windows[3] > windows[1]) {
-            rank_0 = rank_0 + 1;
+            rank_1 = rank_1 + 1;
         }
-        if (rank_0 == wanted) {
+        if (rank_1 == wanted) {
             sequence = 1;
             part_begin = bounds[1];
             part_stop = bounds[2];
         }
-        int rank_1 = 0;
+        int rank_2 = 0;
         if (windows[0] >= windows[2]) {
-            rank_1 = rank_1 + 1;
+            rank_2 = rank_2 + 1;
         }
         if (windows[1] >= windows[2]) {
-            rank_1 = rank_1 + 1;
+            rank_2 = rank_2 + 1;
         }
         if (windows[3] > windows[2]) {
-            rank_1 = rank_1 + 1;
+            rank_2 = rank_2 + 1;
         }
-        if (rank_1 == wanted) {
+        if (rank_2 == wanted) {
             sequence = 2;
             part_begin = bounds[2];
             part_stop = bounds[3];
         }
-        int rank_2 = 0;
+        int rank_3 = 0;
         if (windows[0] >= windows[3]) {
-            rank_2 = rank_2 + 1;
+            rank_3 = rank_3 + 1;
         }
         if (windows[1] >= windows[3]) {
-            rank_2 = rank_2 + 1;
+            rank_3 = rank_3 + 1;
         }
         if (windows[2] >= windows[3]) {
-            rank_2 = rank_2 + 1;
+            rank_3 = rank_3 + 1;
         }
-        if (rank_2 == wanted) {
+        if (rank_3 == wanted) {
             sequence = 3;
             part_begin = bounds[3];
             part_stop = bounds[4];
@@ -370,7 +361,7 @@ kernel_cake_kda_prefill_e952b62c3e3839bdb944(float* __restrict__ split_state, __
             if (warp == 0) {
                 if (elect_sync()) {
                     mbarrier_arrive_expect_tx(map_full_addr + (map_slot) * 8, 32768);
-                    cp_async_bulk_gmem2smem(smem_m_addr + map_slot * 32768, reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(map_state_bf16) + ((unsigned long long)((part_begin * num_heads + task) * 16384) * (unsigned long long)2)), 32768, map_full_addr + (map_slot) * 8);
+                    cp_async_bulk_gmem2smem(smem_m_addr + map_slot * 32768, reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(map_state_bf16) + (unsigned long long)((part_begin * num_heads + task) * 16384) * (unsigned long long)2), 32768, map_full_addr + (map_slot) * 8);
                 }
             }
         }
@@ -563,9 +554,8 @@ kernel_cake_kda_prefill_e952b62c3e3839bdb944(float* __restrict__ split_state, __
                 }
                 if (warp == 0) {
                     if (elect_sync()) {
-                        unsigned int fill_slot = ((map_slot + 1 < 2) ? map_slot + 1 : (unsigned int)0);
-                        mbarrier_arrive_expect_tx(map_full_addr + (fill_slot) * 8, 32768);
-                        cp_async_bulk_gmem2smem(smem_m_addr + fill_slot * 32768, reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(map_state_bf16) + ((unsigned long long)((part * num_heads + task) * 16384) * (unsigned long long)2)), 32768, map_full_addr + (fill_slot) * 8);
+                        mbarrier_arrive_expect_tx(map_full_addr + (((map_slot + 1 < 2) ? map_slot + 1 : (unsigned int)0)) * 8, 32768);
+                        cp_async_bulk_gmem2smem(smem_m_addr + ((map_slot + 1 < 2) ? map_slot + 1 : (unsigned int)0) * 32768, reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(map_state_bf16) + (unsigned long long)((part * num_heads + task) * 16384) * (unsigned long long)2), 32768, map_full_addr + (((map_slot + 1 < 2) ? map_slot + 1 : (unsigned int)0)) * 8);
                     }
                 }
             }
@@ -631,13 +621,13 @@ kernel_cake_kda_prefill_e952b62c3e3839bdb944(float* __restrict__ split_state, __
                     float rounded[2];
                     rounded[0] = (float)(__nv_bfloat16)carry_reg[0];
                     rounded[1] = (float)(__nv_bfloat16)carry_reg[1];
-                    unsigned int _packed_0[1];
+                    unsigned int packed[1];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(rounded[_lp*2 + 0], rounded[_lp*2+1 + 0]));
-                        _packed_0[_lp] = *(uint32_t*)&_bf2;
+                        packed[_lp] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<unsigned*>(final_state_bf16 + (final_index))[0] = reinterpret_cast<unsigned*>(_packed_0)[0];
+                    reinterpret_cast<unsigned*>(final_state_bf16 + (final_index))[0] = reinterpret_cast<unsigned*>(packed)[0];
                 }
             }
             if (row0 + 1 < 128) {
@@ -651,13 +641,13 @@ kernel_cake_kda_prefill_e952b62c3e3839bdb944(float* __restrict__ split_state, __
                     float rounded_1[2];
                     rounded_1[0] = (float)(__nv_bfloat16)carry_reg[2];
                     rounded_1[1] = (float)(__nv_bfloat16)carry_reg[3];
-                    unsigned int _packed_1[1];
+                    unsigned int packed_1[1];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(rounded_1[_lp*2 + 0], rounded_1[_lp*2+1 + 0]));
-                        _packed_1[_lp] = *(uint32_t*)&_bf2;
+                        packed_1[_lp] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_1))[0] = reinterpret_cast<unsigned*>(_packed_1)[0];
+                    reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_1))[0] = reinterpret_cast<unsigned*>(packed_1)[0];
                 }
             }
             if (row0 + 2 < 128) {
@@ -671,13 +661,13 @@ kernel_cake_kda_prefill_e952b62c3e3839bdb944(float* __restrict__ split_state, __
                     float rounded_2[2];
                     rounded_2[0] = (float)(__nv_bfloat16)carry_reg[4];
                     rounded_2[1] = (float)(__nv_bfloat16)carry_reg[5];
-                    unsigned int _packed_2[1];
+                    unsigned int packed_2[1];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(rounded_2[_lp*2 + 0], rounded_2[_lp*2+1 + 0]));
-                        _packed_2[_lp] = *(uint32_t*)&_bf2;
+                        packed_2[_lp] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_2))[0] = reinterpret_cast<unsigned*>(_packed_2)[0];
+                    reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_2))[0] = reinterpret_cast<unsigned*>(packed_2)[0];
                 }
             }
             if (row0 + 3 < 128) {
@@ -691,13 +681,13 @@ kernel_cake_kda_prefill_e952b62c3e3839bdb944(float* __restrict__ split_state, __
                     float rounded_3[2];
                     rounded_3[0] = (float)(__nv_bfloat16)carry_reg[6];
                     rounded_3[1] = (float)(__nv_bfloat16)carry_reg[7];
-                    unsigned int _packed_3[1];
+                    unsigned int packed_3[1];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(rounded_3[_lp*2 + 0], rounded_3[_lp*2+1 + 0]));
-                        _packed_3[_lp] = *(uint32_t*)&_bf2;
+                        packed_3[_lp] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_3))[0] = reinterpret_cast<unsigned*>(_packed_3)[0];
+                    reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_3))[0] = reinterpret_cast<unsigned*>(packed_3)[0];
                 }
             }
             if (row0 + 4 < 128) {
@@ -711,13 +701,13 @@ kernel_cake_kda_prefill_e952b62c3e3839bdb944(float* __restrict__ split_state, __
                     float rounded_4[2];
                     rounded_4[0] = (float)(__nv_bfloat16)carry_reg[8];
                     rounded_4[1] = (float)(__nv_bfloat16)carry_reg[9];
-                    unsigned int _packed_4[1];
+                    unsigned int packed_4[1];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(rounded_4[_lp*2 + 0], rounded_4[_lp*2+1 + 0]));
-                        _packed_4[_lp] = *(uint32_t*)&_bf2;
+                        packed_4[_lp] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_4))[0] = reinterpret_cast<unsigned*>(_packed_4)[0];
+                    reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_4))[0] = reinterpret_cast<unsigned*>(packed_4)[0];
                 }
             }
             if (row0 + 5 < 128) {
@@ -731,13 +721,13 @@ kernel_cake_kda_prefill_e952b62c3e3839bdb944(float* __restrict__ split_state, __
                     float rounded_5[2];
                     rounded_5[0] = (float)(__nv_bfloat16)carry_reg[10];
                     rounded_5[1] = (float)(__nv_bfloat16)carry_reg[11];
-                    unsigned int _packed_5[1];
+                    unsigned int packed_5[1];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(rounded_5[_lp*2 + 0], rounded_5[_lp*2+1 + 0]));
-                        _packed_5[_lp] = *(uint32_t*)&_bf2;
+                        packed_5[_lp] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_5))[0] = reinterpret_cast<unsigned*>(_packed_5)[0];
+                    reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_5))[0] = reinterpret_cast<unsigned*>(packed_5)[0];
                 }
             }
         }
@@ -868,13 +858,13 @@ kernel_cake_kda_prefill_e952b62c3e3839bdb944(float* __restrict__ split_state, __
                 float rounded_6[2];
                 rounded_6[0] = (float)(__nv_bfloat16)single_state[0];
                 rounded_6[1] = (float)(__nv_bfloat16)single_state[1];
-                unsigned int _packed_6[1];
+                unsigned int packed_6[1];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(rounded_6[_lp*2 + 0], rounded_6[_lp*2+1 + 0]));
-                    _packed_6[_lp] = *(uint32_t*)&_bf2;
+                    packed_6[_lp] = *(uint32_t*)&_bf2;
                 }
-                reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_6))[0] = reinterpret_cast<unsigned*>(_packed_6)[0];
+                reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_6))[0] = reinterpret_cast<unsigned*>(packed_6)[0];
             }
         }
         if (row0 + 1 < 128) {
@@ -888,13 +878,13 @@ kernel_cake_kda_prefill_e952b62c3e3839bdb944(float* __restrict__ split_state, __
                 float rounded_7[2];
                 rounded_7[0] = (float)(__nv_bfloat16)single_state[2];
                 rounded_7[1] = (float)(__nv_bfloat16)single_state[3];
-                unsigned int _packed_7[1];
+                unsigned int packed_7[1];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(rounded_7[_lp*2 + 0], rounded_7[_lp*2+1 + 0]));
-                    _packed_7[_lp] = *(uint32_t*)&_bf2;
+                    packed_7[_lp] = *(uint32_t*)&_bf2;
                 }
-                reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_7))[0] = reinterpret_cast<unsigned*>(_packed_7)[0];
+                reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_7))[0] = reinterpret_cast<unsigned*>(packed_7)[0];
             }
         }
         if (row0 + 2 < 128) {
@@ -908,13 +898,13 @@ kernel_cake_kda_prefill_e952b62c3e3839bdb944(float* __restrict__ split_state, __
                 float rounded_8[2];
                 rounded_8[0] = (float)(__nv_bfloat16)single_state[4];
                 rounded_8[1] = (float)(__nv_bfloat16)single_state[5];
-                unsigned int _packed_8[1];
+                unsigned int packed_8[1];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(rounded_8[_lp*2 + 0], rounded_8[_lp*2+1 + 0]));
-                    _packed_8[_lp] = *(uint32_t*)&_bf2;
+                    packed_8[_lp] = *(uint32_t*)&_bf2;
                 }
-                reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_8))[0] = reinterpret_cast<unsigned*>(_packed_8)[0];
+                reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_8))[0] = reinterpret_cast<unsigned*>(packed_8)[0];
             }
         }
         if (row0 + 3 < 128) {
@@ -928,13 +918,13 @@ kernel_cake_kda_prefill_e952b62c3e3839bdb944(float* __restrict__ split_state, __
                 float rounded_9[2];
                 rounded_9[0] = (float)(__nv_bfloat16)single_state[6];
                 rounded_9[1] = (float)(__nv_bfloat16)single_state[7];
-                unsigned int _packed_9[1];
+                unsigned int packed_9[1];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(rounded_9[_lp*2 + 0], rounded_9[_lp*2+1 + 0]));
-                    _packed_9[_lp] = *(uint32_t*)&_bf2;
+                    packed_9[_lp] = *(uint32_t*)&_bf2;
                 }
-                reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_9))[0] = reinterpret_cast<unsigned*>(_packed_9)[0];
+                reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_9))[0] = reinterpret_cast<unsigned*>(packed_9)[0];
             }
         }
         if (row0 + 4 < 128) {
@@ -948,13 +938,13 @@ kernel_cake_kda_prefill_e952b62c3e3839bdb944(float* __restrict__ split_state, __
                 float rounded_10[2];
                 rounded_10[0] = (float)(__nv_bfloat16)single_state[8];
                 rounded_10[1] = (float)(__nv_bfloat16)single_state[9];
-                unsigned int _packed_10[1];
+                unsigned int packed_10[1];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(rounded_10[_lp*2 + 0], rounded_10[_lp*2+1 + 0]));
-                    _packed_10[_lp] = *(uint32_t*)&_bf2;
+                    packed_10[_lp] = *(uint32_t*)&_bf2;
                 }
-                reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_10))[0] = reinterpret_cast<unsigned*>(_packed_10)[0];
+                reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_10))[0] = reinterpret_cast<unsigned*>(packed_10)[0];
             }
         }
         if (row0 + 5 < 128) {
@@ -968,13 +958,13 @@ kernel_cake_kda_prefill_e952b62c3e3839bdb944(float* __restrict__ split_state, __
                 float rounded_11[2];
                 rounded_11[0] = (float)(__nv_bfloat16)single_state[10];
                 rounded_11[1] = (float)(__nv_bfloat16)single_state[11];
-                unsigned int _packed_11[1];
+                unsigned int packed_11[1];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(rounded_11[_lp*2 + 0], rounded_11[_lp*2+1 + 0]));
-                    _packed_11[_lp] = *(uint32_t*)&_bf2;
+                    packed_11[_lp] = *(uint32_t*)&_bf2;
                 }
-                reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_11))[0] = reinterpret_cast<unsigned*>(_packed_11)[0];
+                reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_11))[0] = reinterpret_cast<unsigned*>(packed_11)[0];
             }
         }
     }

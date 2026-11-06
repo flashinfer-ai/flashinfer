@@ -189,13 +189,14 @@ def _get_compiled_mla_kernel(
     is_var_seq: bool = True,
     is_var_q: bool = False,
     is_var_split_kv: bool = False,
-    reducer_d_tiles: int = 1,
+    reducer_d_tiles: int = 0,
     reducer_max_splits: int = MAX_SPLITS,
     skip_correction_threshold: float = 0.0,
     is_workspace_size_zero: bool = False,
     enable_pdl: bool = False,
     enable_dcp: bool = False,
     cp_world: int = 1,
+    reducer_prefetch_splits: Optional[int] = 8,
 ):
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("Rubin MTP must be prepared before CUDA graph capture")
@@ -242,7 +243,23 @@ def _get_compiled_mla_kernel(
         False,
         use_fp16_softmax=False,
         force_branch="auto",
+        reducer_max_splits=reducer_max_splits,
     )
+    if reducer_d_tiles:
+        from ..monolithic.mla_reducer import MLAReducer
+
+        # The producer folds two H128 tokens into each M256 workspace tile.
+        kernel.reducer = MLAReducer(
+            acc_dtype=cutlass.Float32,
+            lse_dtype=cutlass.Float32,
+            qk_tile_shape=(256, 128),
+            num_heads=256,
+            seq_len_q=seq_len_q // 2,
+            max_splits=reducer_max_splits,
+            d_tiles=reducer_d_tiles,
+            empty_lse_negative_inf=True,
+            max_prefetch_splits=reducer_prefetch_splits,
+        )
     kernel.causal_num_heads = 128
     kernel.causal_seq_len_q = seq_len_q
     kernel.causal_fold_ratio = 2
@@ -381,7 +398,7 @@ def prepare_cute_dsl_mla_decode(
     num_kv_splits=None,
 ):
     """Compile before capture; return a monolithic-compatible prepared launch."""
-    splits, size = _get_split_kv_and_workspace_size(
+    _, size = _get_split_kv_and_workspace_size(
         batch_size,
         seq_len_q,
         num_heads,
@@ -399,6 +416,9 @@ def prepare_cute_dsl_mla_decode(
         qk_rope_head_dim=qk_rope_head_dim,
         num_heads=num_heads,
         seq_len_q=seq_len_q,
+        # The scalar reducer rounds every supported budget to one warp.
+        # Keep a single cache key when only the runtime split count changes.
+        reducer_max_splits=MAX_SPLITS,
         is_workspace_size_zero=size == 0,
     )
 

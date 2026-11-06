@@ -378,14 +378,28 @@ the BF16 table or the earlier unclamped-SwiGLU cohort.
 | FP16 / per-tensor FP8 / DeepSeek block FP8 activation | Same eleven activations and scalar restrictions as BF16 |
 | BF16 parameters | SwiGLU alpha/beta/limit, SwiGLUStep limit, and PowLU m/optional limit; other activations require their default parameters |
 | MX parameters | Same typed scalar restrictions as BF16; activation remains FP32 before MXFP8 quantization |
+| MX prepared storage | MXFP4 weight bases must be 32-byte aligned; MXFP8 weights and MX scale tensors must be 16-byte aligned. `prepare_weights` supplies suitable storage; manually sliced views must preserve alignment |
+| MX repeated routes | If top-k exceeds E, default and autotuned execution use FMA with top-k <= 32. MX Tensor Core tactics require top-k <= E |
 | NVFP4 | NVFP4 weights and inputs, BF16 output; shared FMA, the same eleven activations, H divisible by 512, I by 128, top-k <= 32; no 4over6 intermediate quantization |
 | BF16/FP16/per-tensor FP8/DeepSeek block FP8 FMA | top-k <= 32; FC1 and FC2 output columns 1/2/4/8 (16 combinations), default 1 and 4; GELU/GeGLU require compiler `erf` support |
 | MX/BF16/FP16/per-tensor FP8 geometry | H divisible by 128; logical I divisible by 32, padded to 128 |
 | DeepSeek block FP8 | E4M3 weights, arbitrary FP32 128×128 scales; BF16 input or prequantized E4M3 with FP32 1×128 scales; H and I divisible by 128; FP32 preactivation, BF16 output |
 | Token rows | 1–2 by default; explicitly configurable up to 8 |
-| Routing | Packed or unpacked precomputed IDs; valid IDs in `[0, E)` |
+| Routing | Packed or unpacked precomputed IDs in `[0, E)`; MXFP8/NVFP4 activation paths also accept the unrouted slots described below |
 | Parallelism | Local expert computation, including TP weight slices; no EP shards or communication |
 | Compiler | `nvidia-cutlass-dsl >= 4.8` |
+
+For MXFP8 activations with MXFP8/MXFP4 weights, and NVFP4 activations with NVFP4
+weights, IDs outside `[0, E)` mark unrouted slots. For these format pairs,
+unrouted slots contribute nothing to finalized output, including when their
+routing score is NaN or Inf. With `do_finalize=False`, their raw expert rows
+are written as zero on every invocation, and the identity route mapping is
+preserved. Raw routing scores retain the supplied values (with BF16 rounding
+in packed mode); downstream reducers must exclude unrouted slots before
+multiplying their scores, since `0 * NaN` and `0 * Inf` produce NaN. These rules
+apply to changed IDs during CUDA Graph replay as well as eager calls. Other
+Frost format pairs require IDs in `[0, E)`. Other backends in a cross-backend
+configuration may also require every ID to be in range.
 
 This candidate is omitted from the default backend list. Include a prepared
 native backend for larger inputs and for shapes where it wins. Correctness

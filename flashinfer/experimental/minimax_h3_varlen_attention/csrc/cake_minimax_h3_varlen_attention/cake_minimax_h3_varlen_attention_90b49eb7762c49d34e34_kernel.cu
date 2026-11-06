@@ -204,138 +204,138 @@ kernel_cake_minimax_h3_varlen_attention_90b49eb7762c49d34e34(__nv_bfloat16* __re
         int row_1 = vector_1 / 8;
         int group_1 = vector_1 - row_1 * 8;
         int row128 = sub * 32 + row_1;
-        float _unpack_bf16_0[16];
+        float values[16];
         #pragma unroll
         for (int _pair = 0; _pair < 1; _pair++) {
-            (&_unpack_bf16_0[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((q_words + iteration_1 * 8)[_pair]) << 16);
-            (&_unpack_bf16_0[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((q_words + iteration_1 * 8)[_pair]) & 0xffff0000u);
+            (&values[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((q_words + iteration_1 * 8)[_pair]) << 16);
+            (&values[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((q_words + iteration_1 * 8)[_pair]) & 0xffff0000u);
         }
         #pragma unroll
         for (int _pair = 0; _pair < 1; _pair++) {
-            (&_unpack_bf16_0[2 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((q_words + iteration_1 * 8)[1 + _pair]) << 16);
-            (&_unpack_bf16_0[2 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((q_words + iteration_1 * 8)[1 + _pair]) & 0xffff0000u);
+            (&values[2 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((q_words + iteration_1 * 8)[1 + _pair]) << 16);
+            (&values[2 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((q_words + iteration_1 * 8)[1 + _pair]) & 0xffff0000u);
         }
         #pragma unroll
         for (int _pair = 0; _pair < 1; _pair++) {
-            (&_unpack_bf16_0[4 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((q_words + iteration_1 * 8)[2 + _pair]) << 16);
-            (&_unpack_bf16_0[4 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((q_words + iteration_1 * 8)[2 + _pair]) & 0xffff0000u);
+            (&values[4 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((q_words + iteration_1 * 8)[2 + _pair]) << 16);
+            (&values[4 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((q_words + iteration_1 * 8)[2 + _pair]) & 0xffff0000u);
         }
         #pragma unroll
         for (int _pair = 0; _pair < 1; _pair++) {
-            (&_unpack_bf16_0[6 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((q_words + iteration_1 * 8)[3 + _pair]) << 16);
-            (&_unpack_bf16_0[6 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((q_words + iteration_1 * 8)[3 + _pair]) & 0xffff0000u);
+            (&values[6 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((q_words + iteration_1 * 8)[3 + _pair]) << 16);
+            (&values[6 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((q_words + iteration_1 * 8)[3 + _pair]) & 0xffff0000u);
         }
         #pragma unroll
         for (int _pair = 0; _pair < 1; _pair++) {
-            (&_unpack_bf16_0[8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((q_words + iteration_1 * 8)[4 + _pair]) << 16);
-            (&_unpack_bf16_0[8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((q_words + iteration_1 * 8)[4 + _pair]) & 0xffff0000u);
+            (&values[8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((q_words + iteration_1 * 8)[4 + _pair]) << 16);
+            (&values[8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((q_words + iteration_1 * 8)[4 + _pair]) & 0xffff0000u);
         }
         #pragma unroll
         for (int _pair = 0; _pair < 1; _pair++) {
-            (&_unpack_bf16_0[10 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((q_words + iteration_1 * 8)[5 + _pair]) << 16);
-            (&_unpack_bf16_0[10 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((q_words + iteration_1 * 8)[5 + _pair]) & 0xffff0000u);
+            (&values[10 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((q_words + iteration_1 * 8)[5 + _pair]) << 16);
+            (&values[10 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((q_words + iteration_1 * 8)[5 + _pair]) & 0xffff0000u);
         }
         #pragma unroll
         for (int _pair = 0; _pair < 1; _pair++) {
-            (&_unpack_bf16_0[12 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((q_words + iteration_1 * 8)[6 + _pair]) << 16);
-            (&_unpack_bf16_0[12 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((q_words + iteration_1 * 8)[6 + _pair]) & 0xffff0000u);
+            (&values[12 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((q_words + iteration_1 * 8)[6 + _pair]) << 16);
+            (&values[12 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((q_words + iteration_1 * 8)[6 + _pair]) & 0xffff0000u);
         }
         #pragma unroll
         for (int _pair = 0; _pair < 1; _pair++) {
-            (&_unpack_bf16_0[14 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((q_words + iteration_1 * 8)[7 + _pair]) << 16);
-            (&_unpack_bf16_0[14 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((q_words + iteration_1 * 8)[7 + _pair]) & 0xffff0000u);
+            (&values[14 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((q_words + iteration_1 * 8)[7 + _pair]) << 16);
+            (&values[14 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((q_words + iteration_1 * 8)[7 + _pair]) & 0xffff0000u);
         }
-        float _unpack_bf16_1[16];
+        float values_0[16];
         #pragma unroll
         for (int _pair = 0; _pair < 1; _pair++) {
-            (&_unpack_bf16_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((k_words + iteration_1 * 8)[_pair]) << 16);
-            (&_unpack_bf16_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((k_words + iteration_1 * 8)[_pair]) & 0xffff0000u);
-        }
-        #pragma unroll
-        for (int _pair = 0; _pair < 1; _pair++) {
-            (&_unpack_bf16_1[2 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((k_words + iteration_1 * 8)[1 + _pair]) << 16);
-            (&_unpack_bf16_1[2 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((k_words + iteration_1 * 8)[1 + _pair]) & 0xffff0000u);
+            (&values_0[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((k_words + iteration_1 * 8)[_pair]) << 16);
+            (&values_0[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((k_words + iteration_1 * 8)[_pair]) & 0xffff0000u);
         }
         #pragma unroll
         for (int _pair = 0; _pair < 1; _pair++) {
-            (&_unpack_bf16_1[4 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((k_words + iteration_1 * 8)[2 + _pair]) << 16);
-            (&_unpack_bf16_1[4 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((k_words + iteration_1 * 8)[2 + _pair]) & 0xffff0000u);
+            (&values_0[2 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((k_words + iteration_1 * 8)[1 + _pair]) << 16);
+            (&values_0[2 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((k_words + iteration_1 * 8)[1 + _pair]) & 0xffff0000u);
         }
         #pragma unroll
         for (int _pair = 0; _pair < 1; _pair++) {
-            (&_unpack_bf16_1[6 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((k_words + iteration_1 * 8)[3 + _pair]) << 16);
-            (&_unpack_bf16_1[6 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((k_words + iteration_1 * 8)[3 + _pair]) & 0xffff0000u);
+            (&values_0[4 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((k_words + iteration_1 * 8)[2 + _pair]) << 16);
+            (&values_0[4 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((k_words + iteration_1 * 8)[2 + _pair]) & 0xffff0000u);
         }
         #pragma unroll
         for (int _pair = 0; _pair < 1; _pair++) {
-            (&_unpack_bf16_1[8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((k_words + iteration_1 * 8)[4 + _pair]) << 16);
-            (&_unpack_bf16_1[8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((k_words + iteration_1 * 8)[4 + _pair]) & 0xffff0000u);
+            (&values_0[6 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((k_words + iteration_1 * 8)[3 + _pair]) << 16);
+            (&values_0[6 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((k_words + iteration_1 * 8)[3 + _pair]) & 0xffff0000u);
         }
         #pragma unroll
         for (int _pair = 0; _pair < 1; _pair++) {
-            (&_unpack_bf16_1[10 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((k_words + iteration_1 * 8)[5 + _pair]) << 16);
-            (&_unpack_bf16_1[10 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((k_words + iteration_1 * 8)[5 + _pair]) & 0xffff0000u);
+            (&values_0[8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((k_words + iteration_1 * 8)[4 + _pair]) << 16);
+            (&values_0[8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((k_words + iteration_1 * 8)[4 + _pair]) & 0xffff0000u);
         }
         #pragma unroll
         for (int _pair = 0; _pair < 1; _pair++) {
-            (&_unpack_bf16_1[12 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((k_words + iteration_1 * 8)[6 + _pair]) << 16);
-            (&_unpack_bf16_1[12 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((k_words + iteration_1 * 8)[6 + _pair]) & 0xffff0000u);
+            (&values_0[10 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((k_words + iteration_1 * 8)[5 + _pair]) << 16);
+            (&values_0[10 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((k_words + iteration_1 * 8)[5 + _pair]) & 0xffff0000u);
         }
         #pragma unroll
         for (int _pair = 0; _pair < 1; _pair++) {
-            (&_unpack_bf16_1[14 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((k_words + iteration_1 * 8)[7 + _pair]) << 16);
-            (&_unpack_bf16_1[14 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((k_words + iteration_1 * 8)[7 + _pair]) & 0xffff0000u);
-        }
-        float _unpack_bf16_2[16];
-        #pragma unroll
-        for (int _pair = 0; _pair < 1; _pair++) {
-            (&_unpack_bf16_2[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((v_words + iteration_1 * 8)[_pair]) << 16);
-            (&_unpack_bf16_2[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((v_words + iteration_1 * 8)[_pair]) & 0xffff0000u);
+            (&values_0[12 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((k_words + iteration_1 * 8)[6 + _pair]) << 16);
+            (&values_0[12 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((k_words + iteration_1 * 8)[6 + _pair]) & 0xffff0000u);
         }
         #pragma unroll
         for (int _pair = 0; _pair < 1; _pair++) {
-            (&_unpack_bf16_2[2 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((v_words + iteration_1 * 8)[1 + _pair]) << 16);
-            (&_unpack_bf16_2[2 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((v_words + iteration_1 * 8)[1 + _pair]) & 0xffff0000u);
+            (&values_0[14 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((k_words + iteration_1 * 8)[7 + _pair]) << 16);
+            (&values_0[14 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((k_words + iteration_1 * 8)[7 + _pair]) & 0xffff0000u);
+        }
+        float values_1[16];
+        #pragma unroll
+        for (int _pair = 0; _pair < 1; _pair++) {
+            (&values_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((v_words + iteration_1 * 8)[_pair]) << 16);
+            (&values_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((v_words + iteration_1 * 8)[_pair]) & 0xffff0000u);
         }
         #pragma unroll
         for (int _pair = 0; _pair < 1; _pair++) {
-            (&_unpack_bf16_2[4 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((v_words + iteration_1 * 8)[2 + _pair]) << 16);
-            (&_unpack_bf16_2[4 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((v_words + iteration_1 * 8)[2 + _pair]) & 0xffff0000u);
+            (&values_1[2 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((v_words + iteration_1 * 8)[1 + _pair]) << 16);
+            (&values_1[2 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((v_words + iteration_1 * 8)[1 + _pair]) & 0xffff0000u);
         }
         #pragma unroll
         for (int _pair = 0; _pair < 1; _pair++) {
-            (&_unpack_bf16_2[6 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((v_words + iteration_1 * 8)[3 + _pair]) << 16);
-            (&_unpack_bf16_2[6 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((v_words + iteration_1 * 8)[3 + _pair]) & 0xffff0000u);
+            (&values_1[4 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((v_words + iteration_1 * 8)[2 + _pair]) << 16);
+            (&values_1[4 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((v_words + iteration_1 * 8)[2 + _pair]) & 0xffff0000u);
         }
         #pragma unroll
         for (int _pair = 0; _pair < 1; _pair++) {
-            (&_unpack_bf16_2[8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((v_words + iteration_1 * 8)[4 + _pair]) << 16);
-            (&_unpack_bf16_2[8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((v_words + iteration_1 * 8)[4 + _pair]) & 0xffff0000u);
+            (&values_1[6 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((v_words + iteration_1 * 8)[3 + _pair]) << 16);
+            (&values_1[6 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((v_words + iteration_1 * 8)[3 + _pair]) & 0xffff0000u);
         }
         #pragma unroll
         for (int _pair = 0; _pair < 1; _pair++) {
-            (&_unpack_bf16_2[10 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((v_words + iteration_1 * 8)[5 + _pair]) << 16);
-            (&_unpack_bf16_2[10 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((v_words + iteration_1 * 8)[5 + _pair]) & 0xffff0000u);
+            (&values_1[8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((v_words + iteration_1 * 8)[4 + _pair]) << 16);
+            (&values_1[8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((v_words + iteration_1 * 8)[4 + _pair]) & 0xffff0000u);
         }
         #pragma unroll
         for (int _pair = 0; _pair < 1; _pair++) {
-            (&_unpack_bf16_2[12 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((v_words + iteration_1 * 8)[6 + _pair]) << 16);
-            (&_unpack_bf16_2[12 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((v_words + iteration_1 * 8)[6 + _pair]) & 0xffff0000u);
+            (&values_1[10 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((v_words + iteration_1 * 8)[5 + _pair]) << 16);
+            (&values_1[10 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((v_words + iteration_1 * 8)[5 + _pair]) & 0xffff0000u);
         }
         #pragma unroll
         for (int _pair = 0; _pair < 1; _pair++) {
-            (&_unpack_bf16_2[14 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((v_words + iteration_1 * 8)[7 + _pair]) << 16);
-            (&_unpack_bf16_2[14 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((v_words + iteration_1 * 8)[7 + _pair]) & 0xffff0000u);
+            (&values_1[12 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((v_words + iteration_1 * 8)[6 + _pair]) << 16);
+            (&values_1[12 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((v_words + iteration_1 * 8)[6 + _pair]) & 0xffff0000u);
         }
-        float value_max = _unpack_bf16_0[0];
+        #pragma unroll
+        for (int _pair = 0; _pair < 1; _pair++) {
+            (&values_1[14 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((v_words + iteration_1 * 8)[7 + _pair]) << 16);
+            (&values_1[14 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((v_words + iteration_1 * 8)[7 + _pair]) & 0xffff0000u);
+        }
+        float value_max = values[0];
         #pragma unroll
         for (int _lr = 1; _lr < 16; _lr++) {
-            value_max = max_noftz(value_max, _unpack_bf16_0[_lr]);
+            value_max = max_noftz(value_max, values[_lr]);
         }
-        float value_min = _unpack_bf16_0[0];
+        float value_min = values[0];
         #pragma unroll
         for (int _lr = 1; _lr < 16; _lr++) {
-            value_min = fminf(value_min, _unpack_bf16_0[_lr]);
+            value_min = fminf(value_min, values[_lr]);
         }
         float amax_0 = fmaxf(value_max, -value_min);
         float raw_scale = fmaxf(amax_0 * 0.16666667f, 0.001953125f);
@@ -351,47 +351,47 @@ kernel_cake_minimax_h3_varlen_attention_90b49eb7762c49d34e34(__nv_bfloat16* __re
         float normalized[16];
         #pragma unroll
         for (int element = 0; element < 16; element++) {
-            normalized[element] = _unpack_bf16_0[element] * inverse_scale;
+            normalized[element] = values[element] * inverse_scale;
         }
         unsigned int packed[2];
         asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(packed[0]) : "f"(normalized[0]), "f"(normalized[1]), "f"(normalized[2]), "f"(normalized[3]), "f"(normalized[4]), "f"(normalized[5]), "f"(normalized[6]), "f"(normalized[7]));
         asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(packed[1]) : "f"(normalized[8]), "f"(normalized[9]), "f"(normalized[10]), "f"(normalized[11]), "f"(normalized[12]), "f"(normalized[13]), "f"(normalized[14]), "f"(normalized[15]));
-        float value_max_1 = _unpack_bf16_1[0];
+        float value_max_0 = values_0[0];
         #pragma unroll
         for (int _lr = 1; _lr < 16; _lr++) {
-            value_max_1 = max_noftz(value_max_1, _unpack_bf16_1[_lr]);
+            value_max_0 = max_noftz(value_max_0, values_0[_lr]);
         }
-        float value_min_2 = _unpack_bf16_1[0];
+        float value_min_0 = values_0[0];
         #pragma unroll
         for (int _lr = 1; _lr < 16; _lr++) {
-            value_min_2 = fminf(value_min_2, _unpack_bf16_1[_lr]);
+            value_min_0 = fminf(value_min_0, values_0[_lr]);
         }
-        float amax_3 = fmaxf(value_max_1, -value_min_2);
-        float raw_scale_4 = fmaxf(amax_3 * 0.16666667f, 0.001953125f);
+        float amax_1 = fmaxf(value_max_0, -value_min_0);
+        float raw_scale_0 = fmaxf(amax_1 * 0.16666667f, 0.001953125f);
         uint16_t _e4m3x2_11;
-        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_11) : "f"(0.0f), "f"(raw_scale_4));
+        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_11) : "f"(0.0f), "f"(raw_scale_0));
         uint8_t _cvt_satfinite_e4m3_f32_10 = (uint8_t)_e4m3x2_11;
         uint32_t _f16x2_decode_12;
-        float rounded_scale_5;
+        float rounded_scale_0;
         asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_decode_12) : "h"(_e4m3x2_11));
         uint16_t _f16_decode_12 = (uint16_t)_f16x2_decode_12;
-        asm("cvt.f32.f16 %0, %1;" : "=f"(rounded_scale_5) : "h"(_f16_decode_12));
-        float inverse_scale_6 = approx_rcp(rounded_scale_5);
-        float normalized_7[16];
+        asm("cvt.f32.f16 %0, %1;" : "=f"(rounded_scale_0) : "h"(_f16_decode_12));
+        float inverse_scale_0 = approx_rcp(rounded_scale_0);
+        float normalized_0[16];
         #pragma unroll
         for (int element_1 = 0; element_1 < 16; element_1++) {
-            normalized_7[element_1] = _unpack_bf16_1[element_1] * inverse_scale_6;
+            normalized_0[element_1] = values_0[element_1] * inverse_scale_0;
         }
-        unsigned int packed_8[2];
-        asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(packed_8[0]) : "f"(normalized_7[0]), "f"(normalized_7[1]), "f"(normalized_7[2]), "f"(normalized_7[3]), "f"(normalized_7[4]), "f"(normalized_7[5]), "f"(normalized_7[6]), "f"(normalized_7[7]));
-        asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(packed_8[1]) : "f"(normalized_7[8]), "f"(normalized_7[9]), "f"(normalized_7[10]), "f"(normalized_7[11]), "f"(normalized_7[12]), "f"(normalized_7[13]), "f"(normalized_7[14]), "f"(normalized_7[15]));
+        unsigned int packed_0[2];
+        asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(packed_0[0]) : "f"(normalized_0[0]), "f"(normalized_0[1]), "f"(normalized_0[2]), "f"(normalized_0[3]), "f"(normalized_0[4]), "f"(normalized_0[5]), "f"(normalized_0[6]), "f"(normalized_0[7]));
+        asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(packed_0[1]) : "f"(normalized_0[8]), "f"(normalized_0[9]), "f"(normalized_0[10]), "f"(normalized_0[11]), "f"(normalized_0[12]), "f"(normalized_0[13]), "f"(normalized_0[14]), "f"(normalized_0[15]));
         long long output_offset = ((long long)tile * 128 + (long long)row128) * 64 + (long long)(group_1 * 8);
         {
             int2 _iv2 = make_int2(packed[0 + 0], packed[0 + 1]);
             *reinterpret_cast<int2*>(q_fp4 + output_offset + 0) = _iv2;
         }
         {
-            int2 _iv2 = make_int2(packed_8[0 + 0], packed_8[0 + 1]);
+            int2 _iv2 = make_int2(packed_0[0 + 0], packed_0[0 + 1]);
             *reinterpret_cast<int2*>(k_fp4 + output_offset + 0) = _iv2;
         }
         int row_outer = row128 / 32;
@@ -408,7 +408,7 @@ kernel_cake_minimax_h3_varlen_attention_90b49eb7762c49d34e34(__nv_bfloat16* __re
         for (int j = 0; j < 4; j++) {
             float _shfl_sync_13 = __shfl_sync(4294967295, raw_scale, j, 4);
             q_sf4[j] = _shfl_sync_13;
-            float _shfl_sync_14 = __shfl_sync(4294967295, raw_scale_4, j, 4);
+            float _shfl_sync_14 = __shfl_sync(4294967295, raw_scale_0, j, 4);
             k_sf4[j] = _shfl_sync_14;
         }
         unsigned int q_sf_word[1];
@@ -448,7 +448,7 @@ kernel_cake_minimax_h3_varlen_attention_90b49eb7762c49d34e34(__nv_bfloat16* __re
         const float2 _scale2_15 = {v_inverse_scale, v_inverse_scale};
         #pragma unroll
         for (int _ls = 0; _ls < 8; _ls++)
-            reinterpret_cast<float2*>(_scaled_0)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>(_unpack_bf16_2)[_ls], _scale2_15);
+            reinterpret_cast<float2*>(_scaled_0)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>(values_1)[_ls], _scale2_15);
         unsigned int _packed_0[4];
         {
             uint32_t _packed;

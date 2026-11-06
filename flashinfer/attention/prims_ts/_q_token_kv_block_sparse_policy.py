@@ -80,6 +80,7 @@ def select_sparse_launch(
         heads_q_per_kv=heads_q_per_kv, seq_len_q=group_size
     )
 
+    # Choose the first Q tile covering the route group and minimum MMA rows.
     def recipe(minimum: int):
         return next(
             c
@@ -87,6 +88,7 @@ def select_sparse_launch(
             if c.tile_size_q >= minimum and c.q_tokens_per_cta >= group_size
         )
 
+    # Choose split fanout using KV instances per loop and a useful-work floor.
     def fanout(instances: int) -> int:
         maximum = MAX_SPLITS_KV
         minimum_iterations = MIN_LOOP_ITERS_PER_SPLIT
@@ -149,17 +151,25 @@ def select_sparse_launch(
             else 0
         ),
         o_stages=1 if head_dim > 128 and candidate.variant == "keeps_mma_ab" else 2,
+        # A caller that disables split-KV (packed prefill) plans each step's own
+        # route count. Taking the persistent scheduler for every count keeps one
+        # program per group size instead of a static/persistent pair keyed by
+        # whether a step happens to exceed one SM wave. Within one wave the two
+        # schedulers measure within about 1 us of each other.
         use_persistent_scheduler=(
             splits == 1
-            and _select_auto_launch_mode(
-                batch_size=num_routes,
-                num_heads_kv=num_kv_heads,
-                seq_len_kv=work_tokens,
-                tile_size_kv=TILE_SIZE_KV,
-                split_kv=False,
-                service_capacity=multi_processor_count,
+            and (
+                not split_kv
+                or _select_auto_launch_mode(
+                    batch_size=num_routes,
+                    num_heads_kv=num_kv_heads,
+                    seq_len_kv=work_tokens,
+                    tile_size_kv=TILE_SIZE_KV,
+                    split_kv=False,
+                    service_capacity=multi_processor_count,
+                )
+                == "persistent"
             )
-            == "persistent"
         ),
     )
 

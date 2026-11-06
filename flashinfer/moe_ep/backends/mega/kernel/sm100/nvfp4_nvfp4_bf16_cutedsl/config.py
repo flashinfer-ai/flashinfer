@@ -31,6 +31,9 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     provider export. It accepts default or fixed ``knobs``, activation controls
     and the finalization modes below. With ``knobs="auto"``, warm up inside
     ``autotune_v2()`` before capture to select and prepare a configuration.
+    ``kernel_variant="genphase"`` selects decoding with separate BF16
+    finalization and a K256/N128/CGA4 Gather4 tile. It supports standard SwiGLU
+    and early or late routing weights, without per-token FC1 scales.
     """
 
     intermediate_size: int
@@ -80,6 +83,13 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     # (one cute.compile per candidate, paid once per session).
     # The standard _cutedsl_next selector defers searches to autotune_v2().
     knobs: dict | str | None = None
+    # GenPhase is available through the _cutedsl_next selector.
+    kernel_variant: Literal["inference", "genphase"] = field(
+        default="inference", kw_only=True
+    )
+    mma_tiler_mnk: tuple[int, int, int] | None = field(default=None, kw_only=True)
+    cluster_shape_mn: tuple[int, int] | None = field(default=None, kw_only=True)
+    schedule_policy: tuple[str, int | None] | None = field(default=None, kw_only=True)
     # Uniform per-layer SwiGLU constants; None/None keeps standard SwiGLU.
     swiglu_alpha: float | None = None
     swiglu_beta: float | None = None

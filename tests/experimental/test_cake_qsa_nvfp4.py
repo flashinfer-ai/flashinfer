@@ -1149,7 +1149,7 @@ def test_split_formula_fills_the_device_capacity():
         2,
     ]
     # sm_120a (the RTX PRO 6000 Blackwell, 188 SMs): the mma.sync decode's two CTAs per SM; the table's rows 4, 8,
-    # 16 and 32 (16, 11, 5, 3) replace the formula's 33, 23, 11, 5.
+    # 16, 32 and 64 (16, 11, 5, 3, 1) replace the formula's 33, 23, 11, 5, 2.
     assert [num_splits(r, 2, WIDTH, 188, "sm_120a") for r in ROWS] == [
         33,
         33,
@@ -1157,7 +1157,7 @@ def test_split_formula_fills_the_device_capacity():
         11,
         5,
         3,
-        2,
+        1,
         1,
     ]
     assert [_formula(r, 2, WIDTH, 188, "sm_120a") for r in ROWS] == [
@@ -1222,6 +1222,7 @@ def test_host_rule_applies_the_measured_table_within_the_caps():
         (188, 8): 11,
         (188, 16): 5,
         (188, 32): 3,
+        (188, 64): 1,
     }
     assert all(
         isinstance(sm, int) and isinstance(rows, int) and 1 <= s <= MAX_SPLITS
@@ -1229,7 +1230,7 @@ def test_host_rule_applies_the_measured_table_within_the_caps():
     )
     table_132 = [33, 33, 16, 8, 8, 4, 2, 1]
     table_108 = [33, 33, 27, 13, 6, 3, 4, 2]
-    table_188 = [33, 33, 16, 11, 5, 3, 2, 1]
+    table_188 = [33, 33, 16, 11, 5, 3, 1, 1]
     assert [num_splits(r, 2, WIDTH, 132, "sm_90a") for r in ROWS] == table_132
     assert [num_splits(r, 2, WIDTH, 108, "sm_80") for r in ROWS] == table_108
     assert [num_splits(r, 2, WIDTH, 188, "sm_120a") for r in ROWS] == table_188

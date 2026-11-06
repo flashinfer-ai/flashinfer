@@ -148,6 +148,8 @@ void Run(TensorView a_qkv, TensorView a_cos_sin, TensorView a_seq_lens, TensorVi
   check_same_device(a_q_scale, a_qkv, "q_scale", "qkv");
   check_contiguous(a_split_k_flag, "split_k_flag");
   check_same_device(a_split_k_flag, a_qkv, "split_k_flag", "qkv");
+  TVM_FFI_CHECK((a_num_requests >= 1LL), ValueError)
+      << KERNEL_NAME << ": requires (num_requests >= 1)";
   TVM_FFI_CHECK((CheckedAdd(a_num_rows, a_num_requests) <= 65535LL), ValueError)
       << KERNEL_NAME << ": requires ((num_rows + num_requests) <= 65535)";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)

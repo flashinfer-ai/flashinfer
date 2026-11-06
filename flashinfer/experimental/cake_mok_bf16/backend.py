@@ -423,9 +423,10 @@ class MoKFunctional:
         host memory behind a CUDA event: no host synchronization.
         ``_comm_split`` reads the latest completed observation, so a split
         change takes effect from the first later launch whose event has
-        completed. The gathered IDs, and so the counts, are identical on
-        every rank, but each rank decides from its own latest completed
-        observation: with back-to-back steps a launch may run with different
+        completed; a completed observation is also adopted here, before the
+        next one replaces it. The gathered IDs, and so the counts, are
+        identical on every rank, but each rank decides from its own latest
+        completed observation: with back-to-back steps a launch may run with different
         splits on different ranks for a step. The split is a per-rank launch
         parameter (how many of that rank's SMs run its communication program);
         the protocol does not require the ranks to agree on it. Skipped during
@@ -438,11 +439,23 @@ class MoKFunctional:
         ):
             return
         entry = self._load_entry(workspace, create=True)
+        # Keep a completed observation before its slot stops being pending:
+        # when the host runs ahead of the device, no launch of the previous
+        # step may have found it complete.
+        self._collect_load(entry)
         loads = self.scheduler.owner_loads()
         slot = entry["slot"] ^ 1
         entry["host"][slot].copy_(loads, non_blocking=True)
         entry["events"][slot].record()
         entry["slot"] = entry["pending"] = slot
+
+    @staticmethod
+    def _collect_load(entry):
+        """Adopt the pending observation once its event has completed."""
+        pending = entry["pending"]
+        if pending is not None and entry["events"][pending].query():
+            entry["loads"] = entry["host"][pending].tolist()
+            entry["pending"] = None
 
     def _comm_split(self, config, workspace):
         """(forward, backward) communication-SM counts for the next launch.
@@ -456,10 +469,8 @@ class MoKFunctional:
         entry = self._load_entry(workspace, create=not capturing)
         if entry is None:
             return base
-        pending = entry["pending"]
-        if pending is not None and not capturing and entry["events"][pending].query():
-            entry["loads"] = entry["host"][pending].tolist()
-            entry["pending"] = None
+        if not capturing:
+            self._collect_load(entry)
         split = select_comm_split(
             entry["loads"], base, config.imbalance_comm_sms, config.imbalance_threshold
         )

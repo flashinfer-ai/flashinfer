@@ -358,36 +358,36 @@ kernel_cake_kimi_k3_fused_router_aea2ff5129b7b6374e5a(float* __restrict__ logits
         }
     }
     unsigned int published = 0;
-    unsigned int warp_top0;
-    asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top0) : "r"(lane_bound));
+    unsigned int warp_top0_1_0;
+    asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top0_1_0) : "r"(lane_bound));
     if (lane == 0) {
-        published = warp_top0;
+        published = warp_top0_1_0;
     }
-    if (lane_bound == warp_top0) {
+    if (lane_bound == warp_top0_1_0) {
         lane_bound = (unsigned int)0;
     }
-    unsigned int warp_top1;
-    asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top1) : "r"(lane_bound));
+    unsigned int warp_top0_1_1;
+    asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top0_1_1) : "r"(lane_bound));
     if (lane == 1) {
-        published = warp_top1;
+        published = warp_top0_1_1;
     }
-    if (lane_bound == warp_top1) {
+    if (lane_bound == warp_top0_1_1) {
         lane_bound = (unsigned int)0;
     }
-    unsigned int warp_top2;
-    asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top2) : "r"(lane_bound));
+    unsigned int warp_top0_1_2;
+    asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top0_1_2) : "r"(lane_bound));
     if (lane == 2) {
-        published = warp_top2;
+        published = warp_top0_1_2;
     }
-    if (lane_bound == warp_top2) {
+    if (lane_bound == warp_top0_1_2) {
         lane_bound = (unsigned int)0;
     }
-    unsigned int warp_top3;
-    asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top3) : "r"(lane_bound));
+    unsigned int warp_top0_1_3;
+    asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top0_1_3) : "r"(lane_bound));
     if (lane == 3) {
-        published = warp_top3;
+        published = warp_top0_1_3;
     }
-    if (lane_bound == warp_top3) {
+    if (lane_bound == warp_top0_1_3) {
         lane_bound = (unsigned int)0;
     }
     if (lane < 4) {
@@ -425,24 +425,24 @@ kernel_cake_kimi_k3_fused_router_aea2ff5129b7b6374e5a(float* __restrict__ logits
     }
     cand_slot += ((keys[0] >= cand_floor) ? 1 : 0);
     if (keys[1] >= cand_floor && cand_slot < 32) {
-        int cand_index1 = warp * 32 + cand_slot;
-        cand_keys[cand_index1] = keys[1];
-        cand_ids[cand_index1] = expert_base + 1;
-        cand_scores[cand_index1] = unbiased[1];
+        int cand_index_0 = warp * 32 + cand_slot;
+        cand_keys[cand_index_0] = keys[1];
+        cand_ids[cand_index_0] = expert_base + 1;
+        cand_scores[cand_index_0] = unbiased[1];
     }
     cand_slot += ((keys[1] >= cand_floor) ? 1 : 0);
     if (keys[2] >= cand_floor && cand_slot < 32) {
-        int cand_index2 = warp * 32 + cand_slot;
-        cand_keys[cand_index2] = keys[2];
-        cand_ids[cand_index2] = expert_base + 2;
-        cand_scores[cand_index2] = unbiased[2];
+        int cand_index_1 = warp * 32 + cand_slot;
+        cand_keys[cand_index_1] = keys[2];
+        cand_ids[cand_index_1] = expert_base + 2;
+        cand_scores[cand_index_1] = unbiased[2];
     }
     cand_slot += ((keys[2] >= cand_floor) ? 1 : 0);
     if (keys[3] >= cand_floor && cand_slot < 32) {
-        int cand_index3 = warp * 32 + cand_slot;
-        cand_keys[cand_index3] = keys[3];
-        cand_ids[cand_index3] = expert_base + 3;
-        cand_scores[cand_index3] = unbiased[3];
+        int cand_index_2 = warp * 32 + cand_slot;
+        cand_keys[cand_index_2] = keys[3];
+        cand_ids[cand_index_2] = expert_base + 3;
+        cand_scores[cand_index_2] = unbiased[3];
     }
     if (lane == 0) {
         cand_counts[warp] = cand_warp;
@@ -1006,25 +1006,25 @@ kernel_cake_kimi_k3_fused_router_aea2ff5129b7b6374e5a(float* __restrict__ logits
     }
     int mask_lane_blocks = (int)(unsigned int)__popc(mask_lane_word);
     int mask_inclusive = mask_lane_blocks;
-    int mask_peer = __shfl_up_sync(0xFFFFFFFF, mask_inclusive, 1, 32);
+    int mask_peer_4_0 = __shfl_up_sync(0xFFFFFFFF, mask_inclusive, 1, 32);
     if (lane >= 1) {
-        mask_inclusive += mask_peer;
+        mask_inclusive += mask_peer_4_0;
     }
-    int mask_peer_0 = __shfl_up_sync(0xFFFFFFFF, mask_inclusive, 2, 32);
+    int mask_peer_4_1 = __shfl_up_sync(0xFFFFFFFF, mask_inclusive, 2, 32);
     if (lane >= 2) {
-        mask_inclusive += mask_peer_0;
+        mask_inclusive += mask_peer_4_1;
     }
-    int mask_peer_1 = __shfl_up_sync(0xFFFFFFFF, mask_inclusive, 4, 32);
+    int mask_peer_4_2 = __shfl_up_sync(0xFFFFFFFF, mask_inclusive, 4, 32);
     if (lane >= 4) {
-        mask_inclusive += mask_peer_1;
+        mask_inclusive += mask_peer_4_2;
     }
-    int mask_peer_2 = __shfl_up_sync(0xFFFFFFFF, mask_inclusive, 8, 32);
+    int mask_peer_4_3 = __shfl_up_sync(0xFFFFFFFF, mask_inclusive, 8, 32);
     if (lane >= 8) {
-        mask_inclusive += mask_peer_2;
+        mask_inclusive += mask_peer_4_3;
     }
-    int mask_peer_3 = __shfl_up_sync(0xFFFFFFFF, mask_inclusive, 16, 32);
+    int mask_peer_4_4 = __shfl_up_sync(0xFFFFFFFF, mask_inclusive, 16, 32);
     if (lane >= 16) {
-        mask_inclusive += mask_peer_3;
+        mask_inclusive += mask_peer_4_4;
     }
     int mask_exclusive = mask_inclusive - mask_lane_blocks;
     int mask_total = __shfl_sync(0xFFFFFFFF, mask_inclusive, 31);
@@ -1048,35 +1048,35 @@ kernel_cake_kimi_k3_fused_router_aea2ff5129b7b6374e5a(float* __restrict__ logits
             sorted_token_ids[emit_start_mp + emit_pad_mp] = M * TOP_K;
         }
     }
-    int slice_expert_mp = cta_rank * SLICE_EXPERTS;
+    int slice_expert_mp_1_0 = cta_rank * SLICE_EXPERTS;
     if (tid < SLICE_EXPERTS) {
-        slice_expert_mp += tid;
+        slice_expert_mp_1_0 += tid;
     }
-    int slice_word_mp = slice_expert_mp >> 5;
-    unsigned int slice_low_mp = ((unsigned int)1 << (unsigned int)(slice_expert_mp & 31)) - (unsigned int)1;
-    int _shfl_sync_11 = __shfl_sync(0xFFFFFFFF, mask_exclusive, slice_word_mp);
-    unsigned int _shfl_sync_12 = __shfl_sync(0xFFFFFFFF, mask_lane_word, slice_word_mp);
-    int slice_blocks_mp = _shfl_sync_11 + (int)(unsigned int)__popc(_shfl_sync_12 & slice_low_mp);
+    int slice_word_mp_1_0 = slice_expert_mp_1_0 >> 5;
+    unsigned int slice_low_mp_1_0 = ((unsigned int)1 << (unsigned int)(slice_expert_mp_1_0 & 31)) - (unsigned int)1;
+    int _shfl_sync_11 = __shfl_sync(0xFFFFFFFF, mask_exclusive, slice_word_mp_1_0);
+    unsigned int _shfl_sync_12 = __shfl_sync(0xFFFFFFFF, mask_lane_word, slice_word_mp_1_0);
+    int slice_blocks_mp_1_0 = _shfl_sync_11 + (int)(unsigned int)__popc(_shfl_sync_12 & slice_low_mp_1_0);
     if (tid < SLICE_EXPERTS) {
-        int slice_count_mp = (int)(unsigned int)__popc(row_bits[slice_expert_mp]);
-        expert_counts[slice_expert_mp] = slice_count_mp;
-        expert_scatter_offsets[slice_expert_mp] = slice_count_mp;
-        expert_offsets[slice_expert_mp] = slice_blocks_mp << BLOCK_SHIFT;
+        int slice_count_mp_1_0 = (int)(unsigned int)__popc(row_bits[slice_expert_mp_1_0]);
+        expert_counts[slice_expert_mp_1_0] = slice_count_mp_1_0;
+        expert_scatter_offsets[slice_expert_mp_1_0] = slice_count_mp_1_0;
+        expert_offsets[slice_expert_mp_1_0] = slice_blocks_mp_1_0 << BLOCK_SHIFT;
     }
-    int slice_expert_mp_4 = cta_rank * SLICE_EXPERTS;
+    int slice_expert_mp_1_1 = cta_rank * SLICE_EXPERTS;
     if (tid + THREADS < SLICE_EXPERTS) {
-        slice_expert_mp_4 += tid + THREADS;
+        slice_expert_mp_1_1 += tid + THREADS;
     }
-    int slice_word_mp_5 = slice_expert_mp_4 >> 5;
-    unsigned int slice_low_mp_6 = ((unsigned int)1 << (unsigned int)(slice_expert_mp_4 & 31)) - (unsigned int)1;
-    int _shfl_sync_13 = __shfl_sync(0xFFFFFFFF, mask_exclusive, slice_word_mp_5);
-    unsigned int _shfl_sync_14 = __shfl_sync(0xFFFFFFFF, mask_lane_word, slice_word_mp_5);
-    int slice_blocks_mp_7 = _shfl_sync_13 + (int)(unsigned int)__popc(_shfl_sync_14 & slice_low_mp_6);
+    int slice_word_mp_1_1 = slice_expert_mp_1_1 >> 5;
+    unsigned int slice_low_mp_1_1 = ((unsigned int)1 << (unsigned int)(slice_expert_mp_1_1 & 31)) - (unsigned int)1;
+    int _shfl_sync_13 = __shfl_sync(0xFFFFFFFF, mask_exclusive, slice_word_mp_1_1);
+    unsigned int _shfl_sync_14 = __shfl_sync(0xFFFFFFFF, mask_lane_word, slice_word_mp_1_1);
+    int slice_blocks_mp_1_1 = _shfl_sync_13 + (int)(unsigned int)__popc(_shfl_sync_14 & slice_low_mp_1_1);
     if (tid + THREADS < SLICE_EXPERTS) {
-        int slice_count_mp_1 = (int)(unsigned int)__popc(row_bits[slice_expert_mp_4]);
-        expert_counts[slice_expert_mp_4] = slice_count_mp_1;
-        expert_scatter_offsets[slice_expert_mp_4] = slice_count_mp_1;
-        expert_offsets[slice_expert_mp_4] = slice_blocks_mp_7 << BLOCK_SHIFT;
+        int slice_count_mp_1_1 = (int)(unsigned int)__popc(row_bits[slice_expert_mp_1_1]);
+        expert_counts[slice_expert_mp_1_1] = slice_count_mp_1_1;
+        expert_scatter_offsets[slice_expert_mp_1_1] = slice_count_mp_1_1;
+        expert_offsets[slice_expert_mp_1_1] = slice_blocks_mp_1_1 << BLOCK_SHIFT;
     }
     if (cta_rank == 0) {
         if (tid == THREADS - 1) {

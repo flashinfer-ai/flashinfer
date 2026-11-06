@@ -114,8 +114,8 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define RADIX_BINS_PER_LANE 8
 #define MAX_BLOCK_M 16
 #define OWNER_CTAS 128
-#define GATHER_LOADS 16
-#define GATHER_PASS_PAIRS 3584
+#define GATHER_LOADS 10
+#define GATHER_PASS_PAIRS 2240
 #define EMIT_SUBCHUNKS 4
 #define EMIT_CHUNK_PAIRS 128
 #define BLOCK_MASK (BLOCK_M - 1)
@@ -288,36 +288,36 @@ kernel_cake_kimi_k3_fused_router_ed9f4ad5513af55af382(float* __restrict__ logits
             }
         }
         unsigned int published = 0;
-        unsigned int warp_top0;
-        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top0) : "r"(lane_bound));
+        unsigned int warp_top0_1_0;
+        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top0_1_0) : "r"(lane_bound));
         if (lane == 0) {
-            published = warp_top0;
+            published = warp_top0_1_0;
         }
-        if (lane_bound == warp_top0) {
+        if (lane_bound == warp_top0_1_0) {
             lane_bound = (unsigned int)0;
         }
-        unsigned int warp_top1;
-        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top1) : "r"(lane_bound));
+        unsigned int warp_top0_1_1;
+        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top0_1_1) : "r"(lane_bound));
         if (lane == 1) {
-            published = warp_top1;
+            published = warp_top0_1_1;
         }
-        if (lane_bound == warp_top1) {
+        if (lane_bound == warp_top0_1_1) {
             lane_bound = (unsigned int)0;
         }
-        unsigned int warp_top2;
-        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top2) : "r"(lane_bound));
+        unsigned int warp_top0_1_2;
+        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top0_1_2) : "r"(lane_bound));
         if (lane == 2) {
-            published = warp_top2;
+            published = warp_top0_1_2;
         }
-        if (lane_bound == warp_top2) {
+        if (lane_bound == warp_top0_1_2) {
             lane_bound = (unsigned int)0;
         }
-        unsigned int warp_top3;
-        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top3) : "r"(lane_bound));
+        unsigned int warp_top0_1_3;
+        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top0_1_3) : "r"(lane_bound));
         if (lane == 3) {
-            published = warp_top3;
+            published = warp_top0_1_3;
         }
-        if (lane_bound == warp_top3) {
+        if (lane_bound == warp_top0_1_3) {
             lane_bound = (unsigned int)0;
         }
         if (lane < 4) {
@@ -884,13 +884,33 @@ kernel_cake_kimi_k3_fused_router_ed9f4ad5513af55af382(float* __restrict__ logits
                 }
             }
             #pragma unroll
-            for (int store_slot = 0; store_slot < GATHER_LOADS; store_slot++) {
+            for (int store_slot = 0; store_slot < 5; store_slot++) {
                 int store_id = gathered[store_slot];
+                int store_pair = gather_base + store_slot * THREADS + tid;
+                int store_token = store_pair >> 4;
+                unsigned int store_bit = (unsigned int)0;
+                int store_index = lane;
                 if (store_id >= 0) {
-                    int store_pair = gather_base + store_slot * THREADS + tid;
-                    int store_token = store_pair >> 4;
                     plan_ids[store_pair] = store_id;
-                    atomicAdd(&plan_bitmap[(store_token >> 5) * NUM_EXPERTS + store_id], (unsigned int)1 << (unsigned int)(store_token & 31));
+                    store_bit = (unsigned int)1 << (unsigned int)(store_token & 31);
+                    store_index = (store_token >> 5) * NUM_EXPERTS + store_id;
+                }
+                atomicAdd(&plan_bitmap[store_index], store_bit);
+            }
+            if (gather_base + 5 * THREADS < total_pairs) {
+                #pragma unroll
+                for (int late_slot = 5; late_slot < GATHER_LOADS; late_slot++) {
+                    int late_id = gathered[late_slot];
+                    int late_pair = gather_base + late_slot * THREADS + tid;
+                    int late_token = late_pair >> 4;
+                    unsigned int late_bit = (unsigned int)0;
+                    int late_index = lane;
+                    if (late_id >= 0) {
+                        plan_ids[late_pair] = late_id;
+                        late_bit = (unsigned int)1 << (unsigned int)(late_token & 31);
+                        late_index = (late_token >> 5) * NUM_EXPERTS + late_id;
+                    }
+                    atomicAdd(&plan_bitmap[late_index], late_bit);
                 }
             }
         }
@@ -927,25 +947,25 @@ kernel_cake_kimi_k3_fused_router_ed9f4ad5513af55af382(float* __restrict__ logits
             lane_total += padded_count_scan;
         }
         int warp_inclusive = lane_total;
-        int phase2_scan_peer = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 1, 32);
+        int phase2_scan_peer_4_0 = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 1, 32);
         if (lane >= 1) {
-            warp_inclusive += phase2_scan_peer;
+            warp_inclusive += phase2_scan_peer_4_0;
         }
-        int phase2_scan_peer_0 = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 2, 32);
+        int phase2_scan_peer_4_1 = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 2, 32);
         if (lane >= 2) {
-            warp_inclusive += phase2_scan_peer_0;
+            warp_inclusive += phase2_scan_peer_4_1;
         }
-        int phase2_scan_peer_1 = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 4, 32);
+        int phase2_scan_peer_4_2 = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 4, 32);
         if (lane >= 4) {
-            warp_inclusive += phase2_scan_peer_1;
+            warp_inclusive += phase2_scan_peer_4_2;
         }
-        int phase2_scan_peer_2 = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 8, 32);
+        int phase2_scan_peer_4_3 = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 8, 32);
         if (lane >= 8) {
-            warp_inclusive += phase2_scan_peer_2;
+            warp_inclusive += phase2_scan_peer_4_3;
         }
-        int phase2_scan_peer_3 = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 16, 32);
+        int phase2_scan_peer_4_4 = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 16, 32);
         if (lane >= 16) {
-            warp_inclusive += phase2_scan_peer_3;
+            warp_inclusive += phase2_scan_peer_4_4;
         }
         if (lane == 31) {
             phase2_warp_sums[warp] = warp_inclusive;

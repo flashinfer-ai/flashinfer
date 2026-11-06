@@ -17,12 +17,18 @@ from flashinfer.gemm.cake_grouped_fp8_fused_silu_quant import (
     ACT_ROUTES,
     ACT_WIDE_MIN_ITEMS,
     ACT_WIDE_ROUTE,
+    CTA_CAP,
     FUSED_MIXED_ROUTE,
     FUSED_ROUTE,
     FUSED_ROUTES,
     GEMM_BACKEND_CAKE,
     GEMM_BACKEND_CUTE,
+    MIXED_CTA_CAPS,
+    ROUTE_MODEL_GEOMETRY,
+    ROUTE_MODELS_CAP,
     SMALL_M_MAX,
+    TINY_MIXED_MAX_K,
+    TINY_MIXED_MAX_UNITS,
     act_items,
     fused_tile_counts,
     is_group_gemm_fp8_nt_groupwise_contiguous_silu_quant_prepared_available,
@@ -30,11 +36,13 @@ from flashinfer.gemm.cake_grouped_fp8_fused_silu_quant import (
     mixed_clusters,
     routing_blocks,
     select_route,
+    select_route_and_cap,
     small_m_gemm_backend,
     tail_launch_grid,
 )
 from flashinfer.jit.gemm.cake_grouped_fp8_fused_silu_quant import (
     SUPPORTED_COMPUTE_CAPABILITIES,
+    device_arch,
 )
 from flashinfer.quantization import per_token_group_quant_8bit
 
@@ -42,6 +50,19 @@ GROUP_SIZE = 128
 EPS = 1e-10
 # FP8 outputs: dequantized 0.1/0.1 per element against the chain; scales exact.
 ATOL = RTOL = 0.1
+
+
+def _small_m_route(n2, k, group_blocks):
+    """Route of a known small-M routing: the mixed schedule for a tiny routing (no
+    pair tile, at most TINY_MIXED_MAX_UNITS odd-tail units, K <= TINY_MIXED_MAX_K),
+    else the GEMM + act route."""
+    pair_tiles, odd_units = fused_tile_counts(n2, group_blocks)
+    tiny = (
+        pair_tiles == 0
+        and 0 < odd_units <= TINY_MIXED_MAX_UNITS
+        and k <= TINY_MIXED_MAX_K
+    )
+    return FUSED_MIXED_ROUTE if tiny else ACT_ROUTE
 
 
 @pytest.fixture(autouse=True)
@@ -347,7 +368,7 @@ def test_prepared_matches_torch_reference_chain(group_counts, n2, k, arbitrary_s
     # GEMM + act kernel, or pair kernel + PDL tail kernel; the mixed-schedule route is one kernel
     assert prepared.num_kernels == (1 if prepared.route == FUSED_MIXED_ROUTE else 2)
     if m < SMALL_M_MAX:
-        assert prepared.route == ACT_ROUTE
+        assert prepared.route == _small_m_route(n2, k, routing_blocks(group_counts))
     if prepared.route in ACT_ROUTES:
         assert prepared.gemm_backend == small_m_gemm_backend(m, n2, k)
         assert prepared.gemm_backend == (
@@ -452,17 +473,29 @@ def test_launch_plan_matches_prepared(group_counts, n2, k, expected_route):
         group_counts, n2, k, seed=664, device=device
     )
     sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    arch = device_arch(torch.cuda.current_device())
     m = sum(group_counts)
     blocks = routing_blocks(group_counts)
-    # without the routing the plan is shape-only; with it (and K) the routing-aware rule applies
-    shape_route, _ = launch_plan(m, n2, sm_count=sm_count, k=k)
+    # without the routing the plan is shape-only; with it (and K) the routing-aware rule applies,
+    # and with the device's architecture the CTA-cap rule of the mixed-schedule route
+    shape_route, _ = launch_plan(m, n2, sm_count=sm_count, k=k, arch=arch)
     assert shape_route == select_route(m, n2, sm_count=sm_count, k=k)
     if expected_route is not None:
         assert shape_route == expected_route
-    route, grid = launch_plan(m, n2, sm_count=sm_count, group_blocks=blocks, k=k)
-    assert route == select_route(m, n2, sm_count=sm_count, group_blocks=blocks, k=k)
+    route, grid = launch_plan(
+        m, n2, sm_count=sm_count, group_blocks=blocks, k=k, arch=arch
+    )
+    rule_route, cta_cap = select_route_and_cap(
+        m, n2, sm_count=sm_count, group_blocks=blocks, k=k, arch=arch
+    )
+    assert route == rule_route
+    if cta_cap == CTA_CAP:
+        assert route == select_route(m, n2, sm_count=sm_count, group_blocks=blocks, k=k)
+    else:
+        assert route == FUSED_MIXED_ROUTE
+        assert cta_cap in MIXED_CTA_CAPS and cta_cap <= sm_count
     if m < SMALL_M_MAX:
-        assert route == ACT_ROUTE
+        assert route == _small_m_route(n2, k, blocks)
     prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
         a, b, a_scale, b_scale, m_indices, validate_indices=True
     )
@@ -475,14 +508,22 @@ def test_launch_plan_matches_prepared(group_counts, n2, k, expected_route):
     )
     if route == FUSED_ROUTE:
         assert grid[0] % 2 == 0 and grid[0] <= 128
-        tail = tail_launch_grid(m, n2, sm_count=sm_count)
-        assert prepared.tail_grid == tail and 1 <= tail[0] <= sm_count
+        # with the routing known the tail grid covers the odd-tail units (at least
+        # one CTA); without it, every block
+        odd_units = fused_tile_counts(n2, blocks)[1]
+        tail = tail_launch_grid(m, n2, sm_count=sm_count, odd_units=odd_units)
+        assert prepared.tail_grid == tail
+        assert tail[0] == max(1, min(odd_units, sm_count))
         assert set(prepared.stage_grids) == {"pair", "tail"}
+        if unvalidated.route == FUSED_ROUTE:
+            assert unvalidated.tail_grid == tail_launch_grid(m, n2, sm_count=sm_count)
     elif route == FUSED_MIXED_ROUTE:
         pair_tiles, odd_units = fused_tile_counts(n2, blocks)
-        clusters = mixed_clusters(pair_tiles, odd_units, sm_count=sm_count)
+        clusters = mixed_clusters(
+            pair_tiles, odd_units, sm_count=sm_count, cta_cap=cta_cap
+        )
         assert clusters >= 1  # one cluster per pair tile or solo unit up to the cap
-        assert grid == (2 * clusters, 1, 1) and grid[0] <= 128
+        assert grid == (2 * clusters, 1, 1) and grid[0] <= cta_cap
         assert prepared.tail_grid is None
         assert set(prepared.stage_grids) == {"main"}
         assert prepared.num_kernels == 1
@@ -607,6 +648,97 @@ def test_routing_blocks_and_fused_tile_counts():
     assert small_grid == (2048, 1, 1)  # 8192 items, one warp each, four per CTA
 
 
+# Picks of the CTA-cap rule on the measured MoE rows at [2H = 2048, K = 4096] per device model; rows not listed
+# keep select_route's route at CTA_CAP.
+CTA_CAP_RULE_PICKS: dict[tuple[str, int], dict[str, tuple[str, int]]] = {
+    ("sm_100a", 148): {
+        "m8192_sixteen_odd": (FUSED_MIXED_ROUTE, 148),
+    },
+    ("sm_103a", 152): {
+        "m8192_sixteen_odd": (FUSED_MIXED_ROUTE, 148),
+    },
+}
+CTA_CAP_RULE_ROWS = {
+    "wide_ep32_gate_up_uniform": [256] * 16,
+    "wide_ep32_gate_up_random_aligned": [256, 0, 512, 0, 384, 640, 128, 384]
+    + [256, 0, 128, 128, 384, 384, 512, 0],
+    "wide_ep32_gate_up_all_odd": [384] * 8 + [128] * 8,
+    "wide_ep32_gate_up_all_one_block": [128] * 16,
+    "wide_ep32_gate_up_mixed_tail": [640, 128, 384, 0, 896, 128, 384, 256]
+    + [128, 0, 384, 128, 256, 128, 128, 128],
+    "wide_ep32_gate_up_two_odd": [128, 384] + [256] * 14,
+    "m8192_max": [512] * 16,
+    "m8192_sixteen_odd": [640] * 8 + [384] * 8,
+}
+
+
+def test_select_route_and_cap_rule():
+    """The CTA-cap rule moves a routing only to the mixed-schedule route above 128 CTAs, only on a
+    device with a model, at the model's geometry with the routing known; every other call keeps
+    select_route's route at 128 CTAs."""
+    rng = random.Random(1356)
+    routings = []
+    for _ in range(400):
+        blocks = [0] * 16
+        for _ in range(rng.randint(8, 64)):
+            blocks[rng.randrange(16)] += 1
+        n2, k = rng.choice([(2048, 4096)] * 6 + [(2048, 2048), (1024, 4096)])
+        routings.append(([128 * b for b in blocks], n2, k))
+    routings += [(counts, 2048, 4096) for counts in CTA_CAP_RULE_ROWS.values()]
+    devices = dict.fromkeys([*ROUTE_MODELS_CAP, ("sm_100a", 148), ("sm_103a", 152)])
+    for arch, sm_count in devices:
+        changed = 0
+        for counts, n2, k in routings:
+            m = sum(counts)
+            blocks = routing_blocks(counts)
+            route, cap = select_route_and_cap(
+                m, n2, sm_count=sm_count, group_blocks=blocks, k=k, arch=arch
+            )
+            base = select_route(m, n2, sm_count=sm_count, group_blocks=blocks, k=k)
+            if cap == CTA_CAP:
+                assert route == base
+            else:
+                changed += 1
+                assert (arch, sm_count) in ROUTE_MODELS_CAP
+                assert route == FUSED_MIXED_ROUTE
+                assert cap in MIXED_CTA_CAPS and cap <= sm_count
+                assert m >= SMALL_M_MAX and (n2, k) == ROUTE_MODEL_GEOMETRY
+                pair_tiles, odd_units = fused_tile_counts(n2, blocks)
+                clusters = mixed_clusters(
+                    pair_tiles, odd_units, sm_count=sm_count, cta_cap=cap
+                )
+                assert launch_plan(
+                    m, n2, sm_count=sm_count, group_blocks=blocks, k=k, arch=arch
+                ) == (FUSED_MIXED_ROUTE, (2 * clusters, 1, 1))
+            # no architecture, no routing, no K or another SM count: no CTA-cap rule
+            assert select_route_and_cap(
+                m, n2, sm_count=sm_count, group_blocks=blocks, k=k
+            ) == (base, CTA_CAP)
+            assert select_route_and_cap(
+                m, n2, sm_count=sm_count, group_blocks=blocks, arch=arch
+            ) == (select_route(m, n2, sm_count=sm_count, group_blocks=blocks), CTA_CAP)
+            assert select_route_and_cap(m, n2, sm_count=sm_count, k=k, arch=arch) == (
+                select_route(m, n2, sm_count=sm_count, k=k),
+                CTA_CAP,
+            )
+            assert select_route_and_cap(
+                m, n2, sm_count=sm_count - 16, group_blocks=blocks, k=k, arch=arch
+            ) == (
+                select_route(m, n2, sm_count=sm_count - 16, group_blocks=blocks, k=k),
+                CTA_CAP,
+            )
+        if (arch, sm_count) not in ROUTE_MODELS_CAP:
+            assert changed == 0
+    for (arch, sm_count), picks in CTA_CAP_RULE_PICKS.items():
+        for name, counts in CTA_CAP_RULE_ROWS.items():
+            m = sum(counts)
+            blocks = routing_blocks(counts)
+            base = select_route(m, 2048, sm_count=sm_count, group_blocks=blocks, k=4096)
+            assert select_route_and_cap(
+                m, 2048, sm_count=sm_count, group_blocks=blocks, k=4096, arch=arch
+            ) == picks.get(name, (base, CTA_CAP))
+
+
 @pytest.mark.parametrize(
     "group_counts,n2,k",
     [
@@ -643,6 +775,85 @@ def test_cuda_graph_replay_after_first_launch(group_counts, n2, k):
     # ... and matches the chain where the chain can run
     ref_q, ref_s = _chain_or_skip(a, b, a_scale, b_scale, m_indices)
     _assert_matches(prepared.out_q, prepared.out_s, ref_q, ref_s)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < 2,
+    reason="requires two CUDA devices",
+)
+@pytest.mark.parametrize(
+    "group_counts,n2,k,expected_route",
+    [
+        pytest.param([256, 256], 256, 512, ACT_ROUTE, id="act_cute_gemm"),
+        pytest.param([128, 128, 100], 256, 1024, ACT_ROUTE, id="act_cake_gemm"),
+        pytest.param([128], 256, 512, FUSED_MIXED_ROUTE, id="tiny_mixed"),
+        pytest.param([256] * 8 + [128], 256, 512, FUSED_ROUTE, id="pair_tail"),
+    ],
+)
+def test_launch_on_non_current_device(group_counts, n2, k, expected_route):
+    """launch() enters no device or stream context: with cuda:0 current, a launch of
+    a cuda:1 problem runs on cuda:1's current stream (eager, on a side stream and
+    under a graph capture) and writes the same bits as a launch under
+    ``torch.cuda.device(1)``."""
+    dev1 = torch.device("cuda", 1)
+    if torch.cuda.get_device_capability(dev1) not in SUPPORTED_COMPUTE_CAPABILITIES:
+        pytest.skip("cuda:1 is not an SM100a / SM103a device")
+    with torch.cuda.device(0):
+        a, b, a_scale, b_scale, m_indices = _make_inputs(
+            group_counts, n2, k, seed=669, device=dev1
+        )
+        prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
+            a, b, a_scale, b_scale, m_indices, group_counts=group_counts
+        )
+        assert prepared.route == expected_route
+        out_q, out_s = prepared.out_q, prepared.out_s
+
+        def poison():
+            out_q.view(torch.uint8).fill_(0xFF)
+            out_s.fill_(float("nan"))
+            torch.cuda.synchronize(dev1)
+
+        def assert_same_bits(ref_q, ref_s):
+            assert torch.equal(out_q.view(torch.uint8), ref_q.view(torch.uint8))
+            assert torch.equal(out_s.view(torch.int32), ref_s.view(torch.int32))
+
+        with torch.cuda.device(1):
+            prepared.launch()
+            torch.cuda.synchronize()
+            g, u = _reference_halves(_reference_gemm(a, b, a_scale, b_scale, m_indices))
+            _assert_quantizes_reference(out_q, out_s, g, u)
+        ref_q, ref_s = out_q.clone(), out_s.clone()
+
+        # eager, cuda:0 current
+        poison()
+        prepared.launch()
+        assert torch.cuda.current_device() == 0
+        torch.cuda.synchronize(dev1)
+        assert_same_bits(ref_q, ref_s)
+
+        # side stream of cuda:1 made current there, cuda:0 current again
+        poison()
+        side = torch.cuda.Stream(device=dev1)
+        side.wait_stream(torch.cuda.current_stream(dev1))
+        with torch.cuda.stream(side):
+            torch.cuda.set_device(0)
+            prepared.launch()
+            torch.cuda.set_device(1)
+        side.synchronize()
+        assert_same_bits(ref_q, ref_s)
+
+        # graph capture on cuda:1 with cuda:0 current during the launch
+        graph = torch.cuda.CUDAGraph()
+        capture = torch.cuda.Stream(device=dev1)
+        with torch.cuda.graph(graph, stream=capture):
+            torch.cuda.set_device(0)
+            prepared.launch()
+            torch.cuda.set_device(1)
+        poison()
+        graph.replay()
+        torch.cuda.synchronize(dev1)
+        assert_same_bits(ref_q, ref_s)
+        del graph
 
 
 def _random_aligned_counts(rng, groups, max_blocks):

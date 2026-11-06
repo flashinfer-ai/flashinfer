@@ -529,7 +529,7 @@ class SmemQResource(DecodeGenResourceBase):
                 logical_b_idx,
             )
 
-        if cutlass.const_expr(cfg.max_seq_len_q == 1):
+        if cutlass.const_expr(cfg.fixed_seqlen and cfg.max_seq_len_q == 1):
             return (
                 head_dim_offset,
                 logical_q_group_idx * Int32(cfg.tile_size_q),
@@ -923,7 +923,9 @@ class SmemKvTileResource(DecodeGenResourceBase):
                 + tile_idx
             )
         if cutlass.const_expr(
-            self.seqlens_kv is None and not self.cfg.uses_runtime_q_kv_union
+            self.seqlens_kv is None
+            and self.cfg.fixed_seqlen
+            and not self.cfg.uses_runtime_q_kv_union
         ):
             if cutlass.const_expr(self.cfg.use_split_kv):
                 tile_idx = _static_split_kv_global_tile_idx(
@@ -1747,6 +1749,10 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
             offset = self.consumer_work_stage * Int32(
                 self.page_ids_per_stage
             ) + local_tile_idx * Int32(pages_per_tile)
+        elif cutlass.const_expr(cfg.runtime_page_window):
+            offset = self.consumer_work_stage * Int32(32) + local_tile_idx * Int32(
+                pages_per_tile
+            )
         elif cutlass.const_expr(
             self.stage_page_ids_per_tile or self.stages_encoded_locators_per_tile
         ):
@@ -1787,6 +1793,10 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
             offset = self.consumer_work_stage * Int32(
                 self.page_ids_per_stage
             ) + local_tile_idx * Int32(pages_per_tile)
+        elif cutlass.const_expr(cfg.runtime_page_window):
+            offset = self.consumer_work_stage * Int32(32) + local_tile_idx * Int32(
+                pages_per_tile
+            )
         elif cutlass.const_expr(
             self.stage_page_ids_per_tile or self.stages_encoded_locators_per_tile
         ):
@@ -1893,7 +1903,7 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
         """Read a private, tail-padded query bit-plane without transposing it."""
         cfg = self.cfg
         assert cfg.query_major_memberships and cfg.num_tokens_per_page == 4
-        assert cfg.tile_size_kv == 128 and 2 <= cfg.max_seq_len_q <= 8
+        assert cfg.tile_size_kv == 128
         query = q_token_idx & Int32(7)
         word = Uint32(0)
         if cutlass.const_expr(self.cache_memberships_in_smem):
@@ -2196,6 +2206,9 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
                     Int32(task_cache[_TASK_CACHE_SEQ_LEN_KV]),
                     self.seq_len_q,
                     _q_group_token_base(cfg, runtime_q_group),
+                    requested_splits=_decode_gen_task_cache(stage_info)[10]
+                    if cfg.runtime_split_kv
+                    else None,
                 )
                 local_page_end = (
                     Int32(task_cache[_TASK_CACHE_KV_RAW_TILE_BASE]) + local_tiles
@@ -2425,6 +2438,10 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
             grouped_base_page_idx = ((tile_idx * pages_per_tile) >> Int32(5)) << Int32(
                 5
             )
+            if cutlass.const_expr(cfg.runtime_page_window):
+                grouped_base_page_idx = (
+                    Int32(task_cache[_TASK_CACHE_KV_RAW_TILE_BASE]) * pages_per_tile
+                )
             if page_warp_rank == Int32(0):
                 grouped_logical_page_idx = cute.math.min(
                     grouped_base_page_idx + lane_idx, page_idx_ub
@@ -2779,7 +2796,9 @@ class SmemKvResource(DecodeGenResourceBase):
         # Apply runtime sequence-length, split-KV, and sliding-window
         # transforms to a local prefetch tile.
         if cutlass.const_expr(
-            self.seqlens_kv is None and not self.cfg.uses_runtime_q_kv_union
+            self.seqlens_kv is None
+            and self.cfg.fixed_seqlen
+            and not self.cfg.uses_runtime_q_kv_union
         ):
             if cutlass.const_expr(self.cfg.use_split_kv):
                 tile_idx = _static_split_kv_global_tile_idx(

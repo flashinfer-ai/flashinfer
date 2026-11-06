@@ -21,7 +21,8 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Float32
 from cutlass._mlir import ir as _ir
-from cutlass._mlir.dialects import nvvm as _nvvm_dialect
+from cutlass._mlir.dialects import llvm, nvvm as _nvvm_dialect
+from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.experimental.primitives import nvvm_wrapper as _nvvm_wrapper
 
 from cutlass.experimental.task_scheduling.memory import SmemAllocation
@@ -37,11 +38,24 @@ from .batched_gemm_config import (
     ActKind,
     DType,
     SfLayout,
+    SHUFFLED_MATRIX_ROW_GROUP,
+    TMA_SWIZZLE_ATOM_BYTES,
+    WARPS_PER_WARPGROUP,
+    WARP_SIZE,
 )
 from .gmem_ab_resources import nonnegative_div, nonnegative_mod
 from cutlass.experimental import primitives as prims
+from flashinfer.cute_dsl.fp4_common import cvt_e2m1x8_f32
 
 Constexpr = cutlass.Constexpr
+
+# Named-barrier slots are part of the kernel-wide schedule.  Slots 7/8 belong
+# to independent epilogue warpgroups; slot 9 synchronizes the complete
+# epilogue task.  Naming them here prevents store paths from silently drifting.
+_TMA_STORE_BARRIER_BASE = 7
+_EPILOGUE_BARRIER_ID = 9
+_FP4_VALUES_PER_PACKED_WORD = 8
+_PACKED_WORD_BYTES = 4
 
 
 def _convert_f32x2_to_e2m1x2(a, b):
@@ -74,9 +88,118 @@ def _convert_f32x2_to_e4m3x2(a, b):
     )
 
 
+@dsl_user_op
+def _convert_f32x2_to_e4m3x2_and_back(a, b, *, loc=None, ip=None):
+    """Pack two E4M3 scales and decode both with one native x2 conversion."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i16(), T.f32(), T.f32()]),
+        [
+            Float32(a).ir_value(loc=loc, ip=ip),
+            Float32(b).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        {
+            .reg .b16 packed;
+            .reg .b32 h2;
+            .reg .b16 h0, h1;
+            cvt.rn.satfinite.e4m3x2.f32 packed, $4, $3;
+            cvt.rn.f16x2.e4m3x2 h2, packed;
+            mov.b32 {h0, h1}, h2;
+            mov.b16 $0, packed;
+            cvt.f32.f16 $1, h0;
+            cvt.f32.f16 $2, h1;
+        }
+        """,
+        "=h,=f,=f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        cutlass.Int16(llvm.extractvalue(T.i16(), result, [0], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(T.f32(), result, [1], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(T.f32(), result, [2], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
+def _clamp_f32_trt(val, lower, upper, *, loc=None, ip=None):
+    """TRTLLM-gen clamp: ``x < lo ? lo : (x > hi ? hi : x)``."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                Float32(val).ir_value(loc=loc, ip=ip),
+                Float32(lower).ir_value(loc=loc, ip=ip),
+                Float32(upper).ir_value(loc=loc, ip=ip),
+            ],
+            """
+            {
+                .reg .pred p;
+                .reg .f32 tmp;
+                setp.lt.f32 p, $1, $2;
+                selp.f32 tmp, $2, $1, p;
+                setp.gt.f32 p, tmp, $3;
+                selp.f32 $0, $3, tmp, p;
+            }
+            """,
+            "=f,f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _clamp_upper_f32_trt(val, upper, *, loc=None, ip=None):
+    """TRTLLM-gen upper clamp with ternary NaN behavior."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                Float32(val).ir_value(loc=loc, ip=ip),
+                Float32(upper).ir_value(loc=loc, ip=ip),
+            ],
+            """
+            {
+                .reg .pred p;
+                setp.gt.f32 p, $1, $2;
+                selp.f32 $0, $2, $1, p;
+            }
+            """,
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
 @dataclass(kw_only=True)
 class GmemCResource(MemoryResource):
-    """GMEM output resource for BF16/FP16, plain-FP8, or quantized stores."""
+    """GMEM output resource for BF16/FP16, plain-FP8, or quantized stores.
+
+    TMA output paths obey one shared-memory ownership protocol:
+
+    * Before staging, the issuing lane waits until the selected scratch stage
+      is reusable; a barrier then holds every warp that can write that stage.
+    * After staging, an SMEM fence plus the same writer barrier publishes a
+      complete tile before the elected lane issues and commits the TMA store.
+    * Stores normally remain asynchronous until the next scratch reuse.  An
+      aliased A/B allocation is drained at ownership handoff because its next
+      writer may be a different task, and the final group is drained once at
+      epilogue-task tail.
+
+    Bulk wait-group state is per issuing thread.  Consequently a wait without
+    its following writer barrier is insufficient to protect SMEM reuse.
+    """
 
     cfg: Constexpr[BatchedGemmConfig]
     c_tensor: Any = None  # cute.Tensor for C output
@@ -96,11 +219,15 @@ class GmemCResource(MemoryResource):
     total_num_padded_tokens_tensor: Any = None
     problem_m: Any = None
     problem_n: Any = None
+    c_row_stride: Any = None
+    sf_c_m_offset: Any = None
     gC: Any = None  # make_array_view of c_tensor
     gCBytes: Any = None
     gCInt16: Any = None
+    gCInt32: Any = None
     gSfC: Any = None
     gSfCBytes: Any = None
+    gSfCInt16: Any = None
     gBias: Any = None
     gScaleC: Any = None
     gScaleGate: Any = None
@@ -112,6 +239,7 @@ class GmemCResource(MemoryResource):
     gTotalNumPaddedTokens: Any = None
     sC: Any = None
     sCInt16: Any = None
+    sCInt32: Any = None
     sCFloat: Any = None
     sDsFp8Absmax: Any = None
     sBias: Any = None
@@ -125,9 +253,6 @@ class GmemCResource(MemoryResource):
     tile_expert_idx: Any = None
     tile_token_limit: Any = None
     dsfp8_c_scale_stride: Any = None
-    tma_smem_base_even: Any = None
-    tma_smem_base_odd: Any = None
-    _cache_tma_smem_offsets: Constexpr[bool] = False
     _alloc_sc: Constexpr[Optional[SmemAllocation]] = None
     _alloc_dsfp8_absmax: Constexpr[Optional[SmemAllocation]] = None
     _alloc_bias: Constexpr[Optional[SmemAllocation]] = None
@@ -135,13 +260,6 @@ class GmemCResource(MemoryResource):
     _alloc_per_token_sf_b: Constexpr[Optional[SmemAllocation]] = None
 
     def __post_init__(self):
-        self._cache_tma_smem_offsets = (
-            self.cfg.is_swap_ab
-            and self.cfg.use_tma_store
-            and self.cfg.dtype_c_kind in (int(DType.BF16), int(DType.FP16))
-            and not self.cfg.has_activation_epilogue
-            and not self.cfg.has_deepseek_fp8
-        )
         if self._alloc_sc is None:
             self._alloc_sc = SmemAllocation(
                 f"{self.name}_sc",
@@ -151,7 +269,7 @@ class GmemCResource(MemoryResource):
         if (
             self._alloc_dsfp8_absmax is None
             and self.cfg.has_deepseek_fp8_c_scale
-            and self.cfg.epi_tile_n == 64
+            and self.cfg.uses_deepseek_fp8_atomic_absmax
         ):
             self._alloc_dsfp8_absmax = SmemAllocation(
                 f"{self.name}_dsfp8_absmax",
@@ -184,12 +302,17 @@ class GmemCResource(MemoryResource):
                 or self.cfg.uses_fp8_output
             ):
                 self.gCBytes = cutlass.Array(self.gC.data_ptr(), dtype=cutlass.Int8)
-            if self.cfg.uses_fp8_output:
+            if self.cfg.uses_fp4_output_quant:
+                self.gCInt32 = cutlass.Array(self.gC.data_ptr(), dtype=cutlass.Int32)
+            if self.cfg.uses_fp8_output or self.cfg.uses_mxfp8_output_quant:
                 self.gCInt16 = cutlass.Array(self.gC.data_ptr(), dtype=cutlass.Int16)
         if self.sf_c_tensor is not None:
             self.gSfC = cutlass.make_array_view(self.sf_c_tensor)
-            if self.cfg.has_epilogue_quant:
+            if self.cfg.has_output_block_scaling:
                 self.gSfCBytes = cutlass.Array(self.gSfC.data_ptr(), dtype=cutlass.Int8)
+                self.gSfCInt16 = cutlass.Array(
+                    self.gSfC.data_ptr(), dtype=cutlass.Int16
+                )
         if self.bias_tensor is not None:
             self.gBias = cutlass.make_array_view(self.bias_tensor)
         if self.scale_c_tensor is not None:
@@ -236,16 +359,14 @@ class GmemCResource(MemoryResource):
         ):
             sc_dtype = cutlass.Int8
             sc_elem_bytes = 1
-        elif cutlass.const_expr(self.cfg.dtype_c_kind == int(DType.BF16)):
+        elif cutlass.const_expr(self.cfg.dtype_c == int(DType.BF16)):
             sc_dtype = cutlass.BFloat16
             sc_elem_bytes = 2
-        elif cutlass.const_expr(self.cfg.dtype_c_kind == int(DType.FP16)):
+        elif cutlass.const_expr(self.cfg.dtype_c == int(DType.FP16)):
             sc_dtype = cutlass.Float16
             sc_elem_bytes = 2
         else:
-            raise ValueError(
-                f"Unsupported dtype_c output store: {self.cfg.dtype_c_kind}"
-            )
+            raise ValueError(f"Unsupported dtype_c output store: {self.cfg.dtype_c}")
         self.sC = cutlass.Array(
             context.smem_base.data_ptr() + self._alloc_sc.offset,
             dtype=sc_dtype,
@@ -262,6 +383,12 @@ class GmemCResource(MemoryResource):
             context.smem_base.data_ptr() + self._alloc_sc.offset,
             dtype=cutlass.Int16,
             shape=(self._alloc_sc.size_bytes // 2,),
+            addrspace=3,
+        )
+        self.sCInt32 = cutlass.Array(
+            context.smem_base.data_ptr() + self._alloc_sc.offset,
+            dtype=cutlass.Int32,
+            shape=(self._alloc_sc.size_bytes // 4,),
             addrspace=3,
         )
         if cutlass.const_expr(self._alloc_dsfp8_absmax is not None):
@@ -292,26 +419,6 @@ class GmemCResource(MemoryResource):
                 shape=(self.cfg.tile_n,),
                 addrspace=3,
             )
-        if cutlass.const_expr(self._cache_tma_smem_offsets):
-            # The epilogue task initializes this state before its persistent
-            # work loop. Row ownership and the 128-byte swizzle depend only on
-            # warp/lane identity, not on the current expert or output tile.
-            tidx, _, _ = cute.arch.thread_idx()
-            warp_idx = cute.arch.warp_idx()
-            lane_id = tidx & Int32(31)
-            local_row = (warp_idx & Int32(3)) * Int32(32) + (
-                lane_id >> Int32(2)
-            ) * Int32(4)
-            local_col = (lane_id & Int32(3)) * Int32(2)
-            group_offset = (warp_idx >> Int32(2)) * Int32(
-                self.cfg.num_bytes_c_tma_store_per_group // 2
-            )
-            self.tma_smem_base_even = group_offset + self._bf16_tma_smem_element_offset(
-                local_row, local_col
-            )
-            self.tma_smem_base_odd = group_offset + self._bf16_tma_smem_element_offset(
-                local_row, local_col + Int32(1)
-            )
         self.tile_scale_c = Float32(1.0)
         self.tile_scale_gate = Float32(1.0)
         self.tile_gemm1_alpha = Float32(1.0)
@@ -321,6 +428,11 @@ class GmemCResource(MemoryResource):
         self.tile_gemm1_clamp_limit = Float32(0.0)
         self.tile_expert_idx = Int32(0)
         self.tile_token_limit = Int32(0)
+        if cutlass.const_expr(self.cfg.uses_non_swap_c_tma_ring):
+            # This counter survives persistent work-tile iterations.  Deriving
+            # the stage from tile-local column indices can otherwise select a
+            # stage that is still being read by a prior tile's TMA store.
+            self._c_tma_call_idx = Int32(0)
         self.dsfp8_c_scale_stride = self.problem_n
         if cutlass.const_expr(
             self.cfg.has_deepseek_fp8_c_scale and self.gTotalNumPaddedTokens is not None
@@ -338,13 +450,43 @@ class GmemCResource(MemoryResource):
             if tidx < Int32(self.cfg.epi_tile_n):
                 self.sDsFp8Absmax.subview(tidx).store(Float32(0.0))
             prims.barrier_cta_sync(
-                barrier_id=9,
-                thread_count=self.cfg.num_epilogue_warps * 32,
+                barrier_id=_EPILOGUE_BARRIER_ID,
+                thread_count=self.cfg.warp_layout.num_epilogue_warps * WARP_SIZE,
             )
+
+    def _c_pitch(self, output_m):
+        """Row pitch of C in elements; defaults to this launch's output width."""
+        if self.c_row_stride is not None:
+            return self.c_row_stride
+        return output_m
+
+    def _sf_group_axis(self, output_m):
+        """Extent used to compute the SF-C stride between outer-axis tiles."""
+        if cutlass.const_expr(self.cfg.is_swap_ab):
+            return self._c_pitch(output_m)
+        return output_m
 
     def _use_swap_ab_quant_tma_store(self) -> bool:
         """Whether the swapAB quantized epilogue should stage C through TMA."""
         return self.cfg.use_tma_store
+
+    @producer_work(work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def drain_store_tail(self, stage_info: StageInfo) -> None:
+        """Retire the final C TMA group before the epilogue task exits.
+
+        Bulk wait-group state belongs to each issuing thread.  Every epilogue
+        thread executes the wait (a no-op for non-issuers), then the full
+        epilogue group rendezvous so no thread can finish the kernel while a C
+        store issued by another warpgroup is still reading shared memory.
+        """
+        del stage_info
+        if cutlass.const_expr(self.cfg.use_tma_store):
+            prims.cp_async_bulk_wait_group(0, read=True)
+            prims.barrier_cta_sync(
+                barrier_id=_EPILOGUE_BARRIER_ID,
+                thread_count=self.cfg.warp_layout.num_epilogue_warps * WARP_SIZE,
+            )
 
     @cute.jit
     def _quick_gelu(self, x, scale_gate):
@@ -601,17 +743,14 @@ class GmemCResource(MemoryResource):
 
     @cute.jit
     def _bias_storage_row(self, m_row):
-        if cutlass.const_expr(self.cfg.epi_tile_m % 128 == 0):
-            block_size = Int32(32)
-            row_group = Int32(4)
-        else:
-            block_size = Int32(16)
-            row_group = Int32(2)
+        # Bias uses the same physical row permutation as shuffleMatrix.
+        block_size = Int32(self.cfg.shuffled_matrix_block_size)
+        num_row_groups = block_size // Int32(SHUFFLED_MATRIX_ROW_GROUP)
         row_in_block = m_row % block_size
         return (
             (m_row // block_size) * block_size
-            + (row_in_block // row_group)
-            + (row_in_block % row_group) * Int32(8)
+            + (row_in_block % num_row_groups) * Int32(SHUFFLED_MATRIX_ROW_GROUP)
+            + row_in_block // num_row_groups
         )
 
     @cute.jit
@@ -679,6 +818,48 @@ class GmemCResource(MemoryResource):
         return val0, val1
 
     @cute.jit
+    def _apply_eltwise_act(self, val, scale_gate):
+        """Apply a non-gated activation after the optional activation scale."""
+        if cutlass.const_expr(self.cfg.uses_global_scales):
+            val = val * scale_gate
+        if cutlass.const_expr(self.cfg.act_kind == int(ActKind.RELU2)):
+            val = cute.math.max(val, Float32(0.0))
+            return val * val
+        neg_val_log2e = Float32(-1.4426950408889634) * val
+        sigmoid = cute.math.rcp(
+            Float32(1.0) + cute.math.exp2(neg_val_log2e, fastmath=True),
+            approx=True,
+            ftz=True,
+        )
+        return val * sigmoid
+
+    @cute.jit
+    def _apply_eltwise_act_pair(self, val0, val1, scale_gate):
+        if cutlass.const_expr(self.cfg.uses_global_scales):
+            val0, val1 = self._fmul2(val0, val1, scale_gate, scale_gate)
+        if cutlass.const_expr(self.cfg.act_kind == int(ActKind.RELU2)):
+            val0 = cute.math.max(val0, Float32(0.0))
+            val1 = cute.math.max(val1, Float32(0.0))
+            return val0 * val0, val1 * val1
+        neg_val0_log2e, neg_val1_log2e = self._fmul2(
+            val0,
+            val1,
+            Float32(-1.4426950408889634),
+            Float32(-1.4426950408889634),
+        )
+        exp0 = cute.math.exp2(neg_val0_log2e, fastmath=True)
+        exp1 = cute.math.exp2(neg_val1_log2e, fastmath=True)
+        denom0, denom1 = self._fadd2(
+            exp0,
+            exp1,
+            Float32(1.0),
+            Float32(1.0),
+        )
+        sigmoid0 = cute.math.rcp(denom0, approx=True, ftz=True)
+        sigmoid1 = cute.math.rcp(denom1, approx=True, ftz=True)
+        return self._fmul2(val0, val1, sigmoid0, sigmoid1)
+
+    @cute.jit
     def _load_per_token_sf_a(self, local_m_row):
         if cutlass.const_expr(
             self.cfg.has_per_token_sf_a and self.sPerTokenSfA is not None
@@ -712,50 +893,31 @@ class GmemCResource(MemoryResource):
             return val.to(cutlass.Float8E4M3FN)
         if cutlass.const_expr(self.cfg.uses_mxfp8_output_quant):
             return val.to(cutlass.Float8E4M3FN)
-        if cutlass.const_expr(self.cfg.dtype_c_kind == int(DType.BF16)):
+        if cutlass.const_expr(self.cfg.dtype_c == int(DType.BF16)):
             return val.to(cutlass.BFloat16)
-        if cutlass.const_expr(self.cfg.dtype_c_kind == int(DType.FP16)):
+        if cutlass.const_expr(self.cfg.dtype_c == int(DType.FP16)):
             return val.to(cutlass.Float16)
-        raise ValueError(
-            f"Unsupported dtype_c output conversion: {self.cfg.dtype_c_kind}"
-        )
+        raise ValueError(f"Unsupported dtype_c output conversion: {self.cfg.dtype_c}")
+
+    @cute.jit
+    def _scale_and_convert_output_vec(self, vec_f32, scale_c):
+        """Apply the optional global scale and cast one contiguous C vector."""
+        if cutlass.const_expr(self.cfg.uses_global_scales):
+            vec_f32 = vec_f32 * cutlass.vector.full_like(vec_f32, scale_c)
+        return self._to_output_value(vec_f32)
 
     @cute.jit
     def _clamp_swiglu_oai_linear(self, val):
         if cutlass.const_expr(self.cfg.has_gemm1_clamp_limit):
             limit = self.tile_gemm1_clamp_limit
-            # Match TRT-LLM Gen's ordered-comparison clamp.  cute.math.min/max
-            # preserve NaNs through explicit isnan/select sequences, whereas
-            # Gen's ternaries naturally retain NaN when both comparisons are
-            # false.  Emit that sequence directly to avoid the extra checks in
-            # the SwiGLU epilogue hot path.
-            val = prims.inline_ptx_hl(
-                "{\n"
-                ".reg .pred below, above;\n"
-                ".reg .f32 tmp;\n"
-                "setp.lt.f32 below, {$r0}, {$r1};\n"
-                "selp.f32 tmp, {$r1}, {$r0}, below;\n"
-                "setp.gt.f32 above, tmp, {$r2};\n"
-                "selp.f32 {$w0}, {$r2}, tmp, above;\n"
-                "}",
-                write_only_types=[Float32],
-                read_only_args=[Float32(val), Float32(-limit), Float32(limit)],
-            )
+            val = _clamp_f32_trt(val, -limit, limit)
         return val
 
     @cute.jit
     def _clamp_swiglu_oai_gate(self, val):
         if cutlass.const_expr(self.cfg.has_gemm1_clamp_limit):
             limit = self.tile_gemm1_clamp_limit
-            val = prims.inline_ptx_hl(
-                "{\n"
-                ".reg .pred above;\n"
-                "setp.gt.f32 above, {$r0}, {$r1};\n"
-                "selp.f32 {$w0}, {$r1}, {$r0}, above;\n"
-                "}",
-                write_only_types=[Float32],
-                read_only_args=[Float32(val), Float32(limit)],
-            )
+            val = _clamp_upper_f32_trt(val, limit)
         return val
 
     @producer_work(work_attrs=WorkAttr.AUXILIARY)
@@ -769,9 +931,8 @@ class GmemCResource(MemoryResource):
                 token_tile = tile_coord_n
             else:
                 token_tile = tile_coord_m
-            expert_idx = self.tile_idx_view.load(
-                idx=token_tile // Int32(self.cfg.token_metadata_stride), vector_size=1
-            )[0]
+            token_cga = token_tile // Int32(self.cfg.token_cluster_dim)
+            expert_idx = self.tile_idx_view.load(idx=token_cga, vector_size=1)[0]
         self.tile_expert_idx = expert_idx
         if cutlass.const_expr(self.cfg.is_swap_ab):
             token_limit = Int32(self.cfg.tile_n)
@@ -784,11 +945,9 @@ class GmemCResource(MemoryResource):
                 token_tile = tile_coord_n
             else:
                 token_tile = tile_coord_m
+            token_cga = token_tile // Int32(self.cfg.token_cluster_dim)
             token_limit = self._local_tile_limit(
-                self.mn_limit_view.load(
-                    idx=token_tile // Int32(self.cfg.token_metadata_stride),
-                    vector_size=1,
-                )[0],
+                self.mn_limit_view.load(idx=token_cga, vector_size=1)[0],
                 token_tile,
                 token_rows,
             )
@@ -812,10 +971,13 @@ class GmemCResource(MemoryResource):
                 sf_idx = m_row
                 sf_val = Float32(1.0)
                 if m_row < self.problem_m:
-                    if cutlass.const_expr(self.cfg.is_swap_ab):
-                        sf_idx = self._bias_storage_row(m_row)
-                    elif cutlass.const_expr(
-                        self.cfg.has_routed_act and self.route_map_view is not None
+                    # Unlike BiasType.M, the public per-token/per-channel scale
+                    # tensor is kept in logical row order even when swapAB
+                    # weights use the shuffled epilogue layout.
+                    if cutlass.const_expr(
+                        not self.cfg.is_swap_ab
+                        and self.cfg.has_routed_act
+                        and self.route_map_view is not None
                     ):
                         sf_idx = self.route_map_view.load(idx=m_row, vector_size=1)[0]
                     if cutlass.const_expr(self.gPerTokenSfA is not None):
@@ -825,7 +987,7 @@ class GmemCResource(MemoryResource):
                 self.sPerTokenSfA.subview(local_m_row).store(sf_val)
             prims.barrier_cta_sync(
                 barrier_id=6,
-                thread_count=self.cfg.num_epilogue_warps * 32,
+                thread_count=self.cfg.warp_layout.num_epilogue_warps * WARP_SIZE,
             )
 
         if cutlass.const_expr(
@@ -861,7 +1023,7 @@ class GmemCResource(MemoryResource):
                 self.sPerTokenSfB.subview(local_col).store(sf_val)
             prims.barrier_cta_sync(
                 barrier_id=6,
-                thread_count=self.cfg.num_epilogue_warps * 32,
+                thread_count=self.cfg.warp_layout.num_epilogue_warps * WARP_SIZE,
             )
 
         if cutlass.const_expr(self.cfg.has_bias_m and self.sBias is not None):
@@ -879,8 +1041,8 @@ class GmemCResource(MemoryResource):
                         )[0]
                 self.sBias.subview(local_m_row).store(bias_val)
             prims.barrier_cta_sync(
-                barrier_id=9,
-                thread_count=self.cfg.num_epilogue_warps * 32,
+                barrier_id=_EPILOGUE_BARRIER_ID,
+                thread_count=self.cfg.warp_layout.num_epilogue_warps * WARP_SIZE,
             )
 
     @producer_work
@@ -901,16 +1063,8 @@ class GmemCResource(MemoryResource):
             warp_idx = cute.arch.warp_idx()
             if cutlass.const_expr(self.cfg.is_swap_ab):
                 if cutlass.const_expr(
-                    self.cfg.use_tma_store and self.cfg.has_deepseek_fp8
-                ):
-                    # Dequantization and C stores share this work-tile scratch.
-                    prims.cp_async_bulk_wait_group(0, read=True)
-                    prims.barrier_cta_sync(
-                        barrier_id=7, thread_count=self.cfg.num_epilogue_warps * 32
-                    )
-                if cutlass.const_expr(
                     self.cfg.use_tile256_tmem_overlap
-                    and self.cfg.num_epilogue_warps == 4
+                    and self.cfg.warp_layout.num_epilogue_warps == 4
                 ):
                     self._store_swap_ab_16x256b(
                         t2r_rmem,
@@ -930,47 +1084,100 @@ class GmemCResource(MemoryResource):
                         warp_idx,
                     )
             else:
-                if cutlass.const_expr(
-                    self.cfg.use_tile256_tmem_overlap
-                    and self.cfg.num_epilogue_warps == 4
-                ):
-                    self._store_non_swap_32x32b(
-                        t2r_rmem,
-                        tile_coord_m,
-                        tile_coord_n,
-                        t2r_output_call_idx,
-                        warp_idx,
-                        subtile_idx,
+                if cutlass.const_expr(self.cfg.has_gated_epilogue):
+                    # TmemC returns a group-major step index; convert it to
+                    # this step's first output-fragment index.
+                    fragment_call_idx = t2r_output_call_idx * Int32(
+                        self.cfg.non_swap_epilogue_fragments_per_group
                     )
+                elif cutlass.const_expr(self.cfg.uses_tmem_overlap_window):
+                    fragment_call_idx = t2r_output_call_idx
                 else:
-                    self._store_non_swap_32x32b(
-                        t2r_rmem,
-                        tile_coord_m,
-                        tile_coord_n,
-                        subtile_idx,
-                        warp_idx,
-                        subtile_idx,
-                    )
+                    fragment_call_idx = Int32(subtile_idx)
+                self._store_non_swap_32x32b(
+                    t2r_rmem,
+                    t2r_rmem_1,
+                    tile_coord_m,
+                    tile_coord_n,
+                    fragment_call_idx,
+                    warp_idx,
+                )
+                if cutlass.const_expr(self.cfg.uses_non_swap_c_tma_ring):
+                    self._c_tma_call_idx = self._c_tma_call_idx + Int32(1)
+
+    @producer_work
+    @cute.jit
+    def store_non_swap_overlap(
+        self,
+        stage_info: StageInfo,
+        *,
+        t2r_rmem: cutlass.Float32,
+        t2r_rmem_1: cutlass.Float32,
+        t2r_output_call_idx: Int32,
+    ) -> None:
+        """Store the one or two fragments preloaded from shared TMEM columns."""
+        if self.gC is not None:
+            tile_coord_m, tile_coord_n, _ = stage_info.work_tile.tile_idx
+            warp_idx = cute.arch.warp_idx()
+            if cutlass.const_expr(self.cfg.has_gated_epilogue):
+                # TmemC returns a group-major step index; convert it to
+                # this step's first output-fragment index.
+                fragment_call_idx = t2r_output_call_idx * Int32(
+                    self.cfg.non_swap_epilogue_fragments_per_group
+                )
+            else:
+                fragment_call_idx = t2r_output_call_idx
+            self._store_non_swap_32x32b(
+                t2r_rmem,
+                t2r_rmem_1,
+                tile_coord_m,
+                tile_coord_n,
+                fragment_call_idx,
+                warp_idx,
+            )
+            if cutlass.const_expr(self.cfg.uses_non_swap_c_tma_ring):
+                self._c_tma_call_idx = self._c_tma_call_idx + Int32(1)
+            if cutlass.const_expr(
+                not self.cfg.has_gated_epilogue
+                and self.cfg.non_swap_tmem_overlap_loads == 2
+            ):
+                self._store_non_swap_32x32b(
+                    t2r_rmem_1,
+                    t2r_rmem_1,
+                    tile_coord_m,
+                    tile_coord_n,
+                    fragment_call_idx + Int32(1),
+                    warp_idx,
+                )
+                if cutlass.const_expr(self.cfg.uses_non_swap_c_tma_ring):
+                    self._c_tma_call_idx = self._c_tma_call_idx + Int32(1)
 
     @cute.jit
     def _store_non_swap_32x32b(
-        self, t2r_rmem, tile_coord_m, tile_coord_n, call_idx, warp_idx, sequence_idx
+        self,
+        t2r_rmem,
+        t2r_rmem_1,
+        tile_coord_m,
+        tile_coord_n,
+        call_idx,
+        warp_idx,
     ):
         """Non-swapAB: 32x32b T2R, row-major output."""
-        epi_t2r_repx = self.cfg.epi_tile_n // 4
-        # Each T2R contains a complete 32-column shuffle block. Reorder
-        # registers before pairing gate/up or staging the FC2 output.
-        values = [Float32(0.0)] * epi_t2r_repx
-        for i in cutlass.range_constexpr(epi_t2r_repx):
-            source = (i // 32) * 32 + (i % 4) * 8 + (i % 32) // 4
-            values[i] = t2r_rmem[source]
-        t2r_rmem = cutlass.Vector.from_elements(tuple(values), dtype=Float32)
-        warp_in_epi = warp_idx - Int32(self.cfg.epilogue_warp_idx)
+        epi_t2r_repx = self.cfg.non_swap_tmem_load_num_regs
+        warp_in_epi = warp_idx - Int32(self.cfg.warp_layout.epilogue_warp_idx)
         warp_in_epi = cute.arch.make_warp_uniform(warp_in_epi)
         lane_id = cute.arch.lane_idx()
 
-        row = tile_coord_m * Int32(self.cfg.tile_m) + warp_in_epi * Int32(32) + lane_id
-        row_in_tile = warp_in_epi * Int32(32) + lane_id
+        warp_in_epi4 = warp_in_epi % Int32(WARPS_PER_WARPGROUP)
+        warp_in_epi4 = cute.arch.make_warp_uniform(warp_in_epi4)
+        warpgroup_idx = warp_in_epi // Int32(WARPS_PER_WARPGROUP)
+        warpgroup_idx = cute.arch.make_warp_uniform(warpgroup_idx)
+        row = (
+            tile_coord_m * Int32(self.cfg.tile_m)
+            + warp_in_epi4 * Int32(WARP_SIZE)
+            + lane_id
+        )
+        row_in_tile = warp_in_epi4 * Int32(WARP_SIZE) + lane_id
         n = self.problem_n
         expert_idx = self._expert_idx_for_tile(tile_coord_m, tile_coord_n)
         scale_c = self.tile_scale_c
@@ -979,14 +1186,19 @@ class GmemCResource(MemoryResource):
         if cutlass.const_expr(self.cfg.use_tma_oob_opt):
             token_limit = self._token_limit_for_tile(tile_coord_m, tile_coord_n)
         token_in_bounds = row_in_tile < token_limit
+        # A physical CGA may be wider than the logical N grid. Every CTA must
+        # still participate in the atom-local pipelines, but padded Y CTAs
+        # must not store their out-of-range N tile. Without this predicate a
+        # row-major vector store at col == problem_n aliases the next row and
+        # races the valid Y=0 epilogue.
+        output_tile_in_bounds = (tile_coord_n * Int32(self.cfg.tile_n)) < self.problem_n
 
         is_gated_act = cutlass.const_expr(
             (self.cfg.act_kind == int(ActKind.SWIGLU))
             or (self.cfg.act_kind == int(ActKind.GEGLU))
-            or (self.cfg.act_kind == int(ActKind.SILU))
             or (self.cfg.act_kind == int(ActKind.SITU))
         )
-        is_eltwise_relu = cutlass.const_expr(self.cfg.act_kind == int(ActKind.RELU2))
+        is_eltwise_act = cutlass.const_expr(self.cfg.has_eltwise_act)
         if cutlass.const_expr(is_gated_act):
             # Gated epilogue: adjacent columns are (gate, up) pairs.
             # Output has half the columns.
@@ -994,65 +1206,266 @@ class GmemCResource(MemoryResource):
             col_base = tile_coord_n * Int32(self.cfg.tile_n // 2) + call_idx * Int32(
                 epi_t2r_repx // 2
             )
-            gated_values = [Float32(0.0)] * (epi_t2r_repx // 2)
-            for pi in cutlass.range_constexpr(epi_t2r_repx // 2):
-                gate = t2r_rmem[pi * 2]
-                up = t2r_rmem[pi * 2 + 1]
-                gate = self._maybe_apply_per_token_sf_a(gate, row_in_tile)
-                up = self._maybe_apply_per_token_sf_a(up, row_in_tile)
-                sf_b_col = call_idx * Int32(epi_t2r_repx) + Int32(pi * 2)
-                gate = self._maybe_apply_per_token_sf_b(gate, sf_b_col)
-                up = self._maybe_apply_per_token_sf_b(up, sf_b_col + Int32(1))
-                gate = self._maybe_add_bias_m(gate, expert_idx, row, row_in_tile)
-                up = self._maybe_add_bias_m(up, expert_idx, row, row_in_tile)
-                result = self._apply_gated_activation(gate, up, scale_gate)
-                result = self._maybe_apply_scale_c(result, scale_c)
-                if cutlass.const_expr(
-                    self.cfg.uses_non_swap_tma_store or self.cfg.has_epilogue_quant
-                ):
-                    gated_values[pi] = result
-                else:
-                    result_out = self._to_output_value(result)
-                    linear_idx = row * output_n + col_base + Int32(pi)
-                    if cutlass.const_expr(self.cfg.use_tma_oob_opt):
-                        if token_in_bounds:
-                            self.gC.store(
-                                result_out,
-                                idx=linear_idx,
-                                vector_size=1,
-                                alignment=(1 if self.cfg.uses_fp8_output else 2),
-                            )
-                    else:
-                        self.gC.store(
-                            result_out,
-                            idx=linear_idx,
-                            vector_size=1,
-                            alignment=(1 if self.cfg.uses_fp8_output else 2),
+            results_per_call = self.cfg.non_swap_gated_output_cols_per_call
+            result_vals = []
+            for pair_idx in cutlass.range_constexpr(results_per_call // 2):
+                pi0 = pair_idx * 2
+                pi1 = pi0 + 1
+                # The host first interleaves (linear, gate) rows and then,
+                # when requested, applies TRTLLM-gen's row shuffle.  Select
+                # physical accumulator columns through that same source->dst
+                # map so activation and stores remain in logical output order.
+                linear0 = self._load_non_swap_accumulator(
+                    t2r_rmem, t2r_rmem_1, pi0 * 2, epi_t2r_repx
+                )
+                gate0 = self._load_non_swap_accumulator(
+                    t2r_rmem, t2r_rmem_1, pi0 * 2 + 1, epi_t2r_repx
+                )
+                linear1 = self._load_non_swap_accumulator(
+                    t2r_rmem, t2r_rmem_1, pi1 * 2, epi_t2r_repx
+                )
+                gate1 = self._load_non_swap_accumulator(
+                    t2r_rmem, t2r_rmem_1, pi1 * 2 + 1, epi_t2r_repx
+                )
+                linear0 = self._maybe_apply_per_token_sf_a(linear0, row_in_tile)
+                gate0 = self._maybe_apply_per_token_sf_a(gate0, row_in_tile)
+                linear1 = self._maybe_apply_per_token_sf_a(linear1, row_in_tile)
+                gate1 = self._maybe_apply_per_token_sf_a(gate1, row_in_tile)
+                sf_b_col0 = call_idx * Int32(epi_t2r_repx) + Int32(pi0 * 2)
+                sf_b_col1 = call_idx * Int32(epi_t2r_repx) + Int32(pi1 * 2)
+                linear0 = self._maybe_apply_per_token_sf_b(linear0, sf_b_col0)
+                gate0 = self._maybe_apply_per_token_sf_b(gate0, sf_b_col0 + Int32(1))
+                linear1 = self._maybe_apply_per_token_sf_b(linear1, sf_b_col1)
+                gate1 = self._maybe_apply_per_token_sf_b(gate1, sf_b_col1 + Int32(1))
+                linear0 = self._maybe_add_bias_m(linear0, expert_idx, row, row_in_tile)
+                gate0 = self._maybe_add_bias_m(gate0, expert_idx, row, row_in_tile)
+                linear1 = self._maybe_add_bias_m(linear1, expert_idx, row, row_in_tile)
+                gate1 = self._maybe_add_bias_m(gate1, expert_idx, row, row_in_tile)
+                result0, result1 = self._apply_gated_activation_pair(
+                    linear0,
+                    linear1,
+                    gate0,
+                    gate1,
+                    scale_gate,
+                )
+                result_vals.append(result0)
+                result_vals.append(result1)
+
+            if cutlass.const_expr(self.cfg.has_output_block_scaling):
+                sf_block = self.cfg.output_sf_block_size_c
+                all_scaled_vals = []
+                num_sf_blocks = self.cfg.non_swap_output_sf_blocks_per_call
+                num_sf_pairs = num_sf_blocks // 2
+                for sf_pair_idx in cutlass.range_constexpr(num_sf_pairs):
+                    result_base0 = sf_pair_idx * 2 * sf_block
+                    result_base1 = result_base0 + sf_block
+                    block_absmax0 = cute.math.abs(result_vals[result_base0])
+                    block_absmax1 = cute.math.abs(result_vals[result_base1])
+                    for value_idx in cutlass.range_constexpr(1, sf_block):
+                        block_absmax0 = cute.arch.fmax(
+                            block_absmax0,
+                            cute.math.abs(result_vals[result_base0 + value_idx]),
                         )
-            if cutlass.const_expr(self.cfg.has_epilogue_quant):
-                self._store_non_swap_nvfp4(
-                    gated_values, row, col_base, output_n, token_in_bounds
-                )
-            elif cutlass.const_expr(self.cfg.uses_non_swap_tma_store):
-                vec_out = self._to_output_value(
-                    cutlass.Vector.from_elements(tuple(gated_values), dtype=Float32)
-                )
-                self._store_non_swap_tma_32x32b(
-                    vec_out,
-                    row_in_tile,
-                    col_base,
-                    tile_coord_m,
-                    call_idx,
-                    token_in_bounds,
-                    warp_idx,
-                    sequence_idx,
-                )
+                        block_absmax1 = cute.arch.fmax(
+                            block_absmax1,
+                            cute.math.abs(result_vals[result_base1 + value_idx]),
+                        )
+                    # fmax filters NaNs unless every value is NaN; clamp so an
+                    # all-NaN block yields SF=0 like the swap-AB reductions.
+                    block_absmax0 = cute.math.max(block_absmax0, Float32(0.0))
+                    block_absmax1 = cute.math.max(block_absmax1, Float32(0.0))
+                    if cutlass.const_expr(self.cfg.uses_global_scales):
+                        block_absmax0, block_absmax1 = self._fmul2(
+                            block_absmax0,
+                            block_absmax1,
+                            scale_c,
+                            scale_c,
+                        )
+                    sf_pre0, sf_pre1 = self._fmul2(
+                        block_absmax0,
+                        block_absmax1,
+                        Float32(1.0 / 6.0),
+                        Float32(1.0 / 6.0),
+                    )
+                    sf_packed, sf_rounded0, sf_rounded1 = (
+                        _convert_f32x2_to_e4m3x2_and_back(sf_pre0, sf_pre1)
+                    )
+                    output_scale0 = cute.arch.fmin(
+                        scale_c * cute.arch.rcp_approx(sf_rounded0),
+                        Float32(3.402823466e38),
+                    )
+                    output_scale1 = cute.arch.fmin(
+                        scale_c * cute.arch.rcp_approx(sf_rounded1),
+                        Float32(3.402823466e38),
+                    )
+                    output_scale0 = output_scale0 * cute.arch.fmin(
+                        sf_rounded0 * Float32(1.0e30), Float32(1.0)
+                    )
+                    output_scale1 = output_scale1 * cute.arch.fmin(
+                        sf_rounded1 * Float32(1.0e30), Float32(1.0)
+                    )
+                    for value_idx in cutlass.range_constexpr(sf_block):
+                        all_scaled_vals.append(
+                            result_vals[result_base0 + value_idx] * output_scale0
+                        )
+                    for value_idx in cutlass.range_constexpr(sf_block):
+                        all_scaled_vals.append(
+                            result_vals[result_base1 + value_idx] * output_scale1
+                        )
+
+                    self._store_non_swap_output_sf_pair(
+                        sf_packed,
+                        row,
+                        output_n,
+                        col_base + Int32(result_base0),
+                        token_in_bounds,
+                        output_tile_in_bounds,
+                    )
+
+                if cutlass.const_expr(num_sf_blocks % 2 != 0):
+                    result_base = num_sf_pairs * 2 * sf_block
+                    block_absmax = cute.math.abs(result_vals[result_base])
+                    for value_idx in cutlass.range_constexpr(1, sf_block):
+                        block_absmax = cute.arch.fmax(
+                            block_absmax,
+                            cute.math.abs(result_vals[result_base + value_idx]),
+                        )
+                    block_absmax = cute.math.max(block_absmax, Float32(0.0))
+                    if cutlass.const_expr(self.cfg.uses_global_scales):
+                        block_absmax = block_absmax * scale_c
+
+                    sf_e4m3 = (block_absmax * Float32(1.0 / 6.0)).to(
+                        cutlass.Float8E4M3FN
+                    )
+                    sf_rounded = Float32(sf_e4m3)
+                    output_scale = cute.arch.fmin(
+                        scale_c * cute.arch.rcp_approx(sf_rounded),
+                        Float32(3.402823466e38),
+                    )
+                    output_scale = output_scale * cute.arch.fmin(
+                        sf_rounded * Float32(1.0e30), Float32(1.0)
+                    )
+                    for value_idx in cutlass.range_constexpr(sf_block):
+                        all_scaled_vals.append(
+                            result_vals[result_base + value_idx] * output_scale
+                        )
+                    self._store_non_swap_output_sf(
+                        sf_e4m3.bitcast(cutlass.Int8),
+                        row,
+                        output_n,
+                        col_base + Int32(result_base),
+                        token_in_bounds,
+                        output_tile_in_bounds,
+                    )
+
+                # Pack eight FP4 outputs per register. Both direct GMEM and
+                # TMA-staged paths then emit the widest naturally aligned
+                # vector available instead of scalar packed-byte stores.
+                packed_i32_list = []
+                num_packed_words = results_per_call // _FP4_VALUES_PER_PACKED_WORD
+                for pack_idx in cutlass.range_constexpr(num_packed_words):
+                    value_idx = pack_idx * _FP4_VALUES_PER_PACKED_WORD
+                    packed_i32_list.append(
+                        cvt_e2m1x8_f32(
+                            all_scaled_vals[value_idx],
+                            all_scaled_vals[value_idx + 1],
+                            all_scaled_vals[value_idx + 2],
+                            all_scaled_vals[value_idx + 3],
+                            all_scaled_vals[value_idx + 4],
+                            all_scaled_vals[value_idx + 5],
+                            all_scaled_vals[value_idx + 6],
+                            all_scaled_vals[value_idx + 7],
+                        ).bitcast(cutlass.Int32)
+                    )
+                packed_i32 = tuple(packed_i32_list)
+                if cutlass.const_expr(self.cfg.use_tma_store):
+                    staged_vals_i32 = packed_i32
+                    if not token_in_bounds:
+                        staged_vals_i32 = tuple(
+                            cutlass.Int32(0) for _ in range(num_packed_words)
+                        )
+                    store_barrier_id = self._tma_store_barrier_id(warpgroup_idx)
+                    self._wait_for_tma_scratch_reuse(store_barrier_id)
+                    self._stage_non_swap_fp4_tma(
+                        staged_vals_i32,
+                        row_in_tile,
+                        warpgroup_idx,
+                        num_packed_words,
+                    )
+                    self._publish_tma_scratch(store_barrier_id)
+                    self._commit_non_swap_fp4_tma(
+                        tile_coord_m,
+                        tile_coord_n,
+                        call_idx,
+                        output_n,
+                        output_tile_in_bounds,
+                        warp_idx,
+                        warpgroup_idx,
+                    )
+                else:
+                    self._store_non_swap_fp4_gmem(
+                        packed_i32,
+                        row,
+                        output_n,
+                        col_base,
+                        token_in_bounds,
+                        output_tile_in_bounds,
+                        num_packed_words,
+                    )
+            else:
+                result_out_vals = []
+                for result_idx in cutlass.range_constexpr(results_per_call):
+                    result = self._maybe_apply_scale_c(result_vals[result_idx], scale_c)
+                    result_out_vals.append(self._to_output_value(result))
+                if cutlass.const_expr(
+                    self.cfg.use_tma_store
+                    and self.cfg.dtype_c in (int(DType.BF16), int(DType.FP16))
+                ):
+                    if cutlass.const_expr(self.cfg.dtype_c == int(DType.BF16)):
+                        result_out_vec = cutlass.Vector.from_elements(
+                            tuple(result_out_vals), dtype=cutlass.BFloat16
+                        )
+                    else:
+                        result_out_vec = cutlass.Vector.from_elements(
+                            tuple(result_out_vals), dtype=cutlass.Float16
+                        )
+                    self._store_non_swap_gated_16bit_tma(
+                        result_out_vec,
+                        row_in_tile,
+                        col_base,
+                        tile_coord_m,
+                        tile_coord_n,
+                        token_in_bounds,
+                        output_tile_in_bounds,
+                        warp_idx,
+                        warpgroup_idx,
+                    )
+                else:
+                    self._store_non_swap_gmem_vec(
+                        tuple(result_out_vals),
+                        row,
+                        output_n,
+                        col_base,
+                        token_in_bounds,
+                        output_tile_in_bounds,
+                        results_per_call,
+                    )
         else:
             col_base = tile_coord_n * Int32(self.cfg.tile_n) + call_idx * Int32(
                 epi_t2r_repx
             )
-            linear_idx = row * n + col_base
             vec_f32 = t2r_rmem
+            if cutlass.const_expr(self.cfg.use_shuffled_matrix):
+                # A 32x32b load owns complete shuffle blocks (validated in
+                # validate_config), so unshuffling is a register permutation;
+                # output addresses and vectorized stores stay contiguous.
+                vec_f32 = cutlass.Vector.from_elements(
+                    tuple(
+                        t2r_rmem[self._non_swap_shuffled_col_idx(vi)]
+                        for vi in range(epi_t2r_repx)
+                    ),
+                    dtype=cutlass.Float32,
+                )
             if cutlass.const_expr(self.cfg.has_per_token_sf_a):
                 sf_a_vec = cutlass.vector.full_like(
                     vec_f32,
@@ -1074,18 +1487,36 @@ class GmemCResource(MemoryResource):
                     self._load_bias_m(expert_idx, row, row_in_tile),
                 )
                 vec_f32 = vec_f32 + bias_vec
-            if cutlass.const_expr(is_eltwise_relu):
-                relu_vec = cute.math.max(
-                    vec_f32, cutlass.vector.full_like(vec_f32, 0.0)
-                )
-                vec_f32 = relu_vec * relu_vec
-            if cutlass.const_expr(self.cfg.uses_global_scales):
-                vec_f32 = vec_f32 * cutlass.vector.full_like(vec_f32, scale_c)
-            vec_out = self._to_output_value(vec_f32)
+            if cutlass.const_expr(is_eltwise_act):
+                if cutlass.const_expr(self.cfg.uses_global_scales):
+                    scale_gate_vec = cutlass.vector.full_like(vec_f32, scale_gate)
+                    vec_f32 = vec_f32 * scale_gate_vec
+                if cutlass.const_expr(self.cfg.act_kind == int(ActKind.RELU2)):
+                    relu_vec = cute.math.max(
+                        vec_f32, cutlass.vector.full_like(vec_f32, 0.0)
+                    )
+                    vec_f32 = relu_vec * relu_vec
+                else:
+                    if cutlass.const_expr(epi_t2r_repx % 2 != 0):
+                        raise ValueError(
+                            "Non-swap SiLU requires an even TMEM load width"
+                        )
+                    silu_vals = [Float32(0.0)] * epi_t2r_repx
+                    for vi in cutlass.range_constexpr(epi_t2r_repx // 2):
+                        pair_idx = vi * 2
+                        silu_vals[pair_idx], silu_vals[pair_idx + 1] = (
+                            self._apply_eltwise_act_pair(
+                                vec_f32[pair_idx],
+                                vec_f32[pair_idx + 1],
+                                Float32(1.0),
+                            )
+                        )
+                    vec_f32 = cutlass.Vector.from_elements(
+                        tuple(silu_vals), dtype=cutlass.Float32
+                    )
+            vec_out = self._scale_and_convert_output_vec(vec_f32, scale_c)
             if cutlass.const_expr(
-                self.cfg.uses_non_swap_tma_store
-                and self.tma_c_desc is not None
-                and not self.cfg.is_swap_ab
+                self.cfg.use_tma_store and self.tma_c_desc is not None
             ):
                 self._store_non_swap_tma_32x32b(
                     vec_out,
@@ -1094,26 +1525,389 @@ class GmemCResource(MemoryResource):
                     tile_coord_m,
                     call_idx,
                     token_in_bounds,
+                    output_tile_in_bounds,
                     warp_idx,
-                    sequence_idx,
                 )
-            elif cutlass.const_expr(self.cfg.use_tma_oob_opt):
-                if token_in_bounds:
-                    self.gC.store(
-                        vec_out,
-                        idx=linear_idx,
-                        vector_size=epi_t2r_repx,
-                        alignment=(
-                            (1 if self.cfg.uses_fp8_output else 2) * epi_t2r_repx
-                        ),
+            else:
+                self._store_non_swap_gmem_vec(
+                    vec_out,
+                    row,
+                    n,
+                    col_base,
+                    token_in_bounds,
+                    output_tile_in_bounds,
+                    epi_t2r_repx,
+                )
+
+    def _tma_store_barrier_id(self, warpgroup_idx):
+        return Int32(_TMA_STORE_BARRIER_BASE) + warpgroup_idx
+
+    @cute.jit
+    def _wait_for_tma_scratch_reuse(self, barrier_id):
+        """Hold a warpgroup until its prior TMA read has released SMEM."""
+        prims.cp_async_bulk_wait_group(0, read=True)
+        prims.barrier_cta_sync(
+            barrier_id=barrier_id,
+            thread_count=self.cfg.epilogue_threads_per_warpgroup,
+        )
+
+    @cute.jit
+    def _publish_tma_scratch(self, barrier_id):
+        """Publish all warpgroup STS writes before its elected TMA issuer."""
+        cute.arch.fence_view_async_shared()
+        prims.barrier_cta_sync(
+            barrier_id=barrier_id,
+            thread_count=self.cfg.epilogue_threads_per_warpgroup,
+        )
+
+    @cute.jit
+    def _store_non_swap_gmem_vec(
+        self,
+        vec_out,
+        row,
+        output_n,
+        col_base,
+        token_in_bounds,
+        output_tile_in_bounds,
+        vector_elems: cutlass.Constexpr[int],
+    ):
+        """Store the widest legal contiguous vector, with a scalar N-tail."""
+        row_in_bounds = output_tile_in_bounds
+        if cutlass.const_expr(self.cfg.use_tma_oob_opt):
+            row_in_bounds = row_in_bounds & token_in_bounds
+        if row_in_bounds:
+            linear_idx = row * output_n + col_base
+            element_bytes = self.cfg.dtype_c_bits // 8
+            vector_bytes = element_bytes * vector_elems
+            if col_base + Int32(vector_elems) <= output_n:
+                packed_vec = tuple(
+                    vec_out[elem_idx] for elem_idx in range(vector_elems)
+                )
+                self.gC.store(
+                    packed_vec,
+                    idx=linear_idx,
+                    vector_size=vector_elems,
+                    alignment=vector_bytes,
+                )
+            else:
+                for elem_idx in cutlass.range_constexpr(vector_elems):
+                    if col_base + Int32(elem_idx) < output_n:
+                        self.gC.store(
+                            vec_out[elem_idx],
+                            idx=linear_idx + Int32(elem_idx),
+                            vector_size=1,
+                            alignment=element_bytes,
+                        )
+
+    @cute.jit
+    def _store_non_swap_output_sf(
+        self,
+        sf_value,
+        row,
+        output_n,
+        output_col,
+        token_in_bounds,
+        output_tile_in_bounds,
+    ):
+        """Store one non-swap output scale with the common OOB predicates."""
+        row_in_bounds = output_tile_in_bounds
+        if cutlass.const_expr(self.cfg.use_tma_oob_opt):
+            row_in_bounds = row_in_bounds & token_in_bounds
+        if row_in_bounds & (output_col < output_n):
+            sf_idx = self._sf_c_index(output_col, row, output_n)
+            self.gSfCBytes.subview(sf_idx).store(sf_value)
+
+    @cute.jit
+    def _store_non_swap_output_sf_pair(
+        self,
+        sf_packed,
+        row,
+        output_n,
+        output_col,
+        token_in_bounds,
+        output_tile_in_bounds,
+    ):
+        """Store two adjacent output scales together, with a one-block tail."""
+        row_in_bounds = output_tile_in_bounds
+        if cutlass.const_expr(self.cfg.use_tma_oob_opt):
+            row_in_bounds = row_in_bounds & token_in_bounds
+        if row_in_bounds:
+            sf_idx = self._sf_c_index(output_col, row, output_n)
+            second_col = output_col + Int32(self.cfg.output_sf_block_size_c)
+            if second_col < output_n:
+                self.gSfCInt16.subview(sf_idx // Int32(2)).store(sf_packed)
+            elif output_col < output_n:
+                sf_first = cutlass.Int8(Int32(sf_packed) & Int32(0xFF))
+                self.gSfCBytes.subview(sf_idx).store(sf_first)
+
+    @cute.jit
+    def _store_non_swap_fp4_gmem(
+        self,
+        packed_i32,
+        row,
+        output_n,
+        col_base,
+        token_in_bounds,
+        output_tile_in_bounds,
+        num_packed_words: cutlass.Constexpr[int],
+    ):
+        """Store FP4 output in maximally packed, 16-byte GMEM atoms."""
+        row_in_bounds = output_tile_in_bounds
+        if cutlass.const_expr(self.cfg.use_tma_oob_opt):
+            row_in_bounds = row_in_bounds & token_in_bounds
+        if row_in_bounds:
+            packed_row_base = (row * output_n + col_base) // Int32(
+                _FP4_VALUES_PER_PACKED_WORD
+            )
+            if (
+                col_base + Int32(num_packed_words * _FP4_VALUES_PER_PACKED_WORD)
+                <= output_n
+            ):
+                words_per_vector = TMA_SWIZZLE_ATOM_BYTES // _PACKED_WORD_BYTES
+                full_vectors = num_packed_words // words_per_vector
+                for vector_idx in cutlass.range_constexpr(full_vectors):
+                    word_base = vector_idx * words_per_vector
+                    packed_vec = tuple(
+                        packed_i32[word_base + word_idx]
+                        for word_idx in range(words_per_vector)
+                    )
+                    self.gCInt32.store(
+                        packed_vec,
+                        idx=packed_row_base + Int32(word_base),
+                        vector_size=words_per_vector,
+                        alignment=TMA_SWIZZLE_ATOM_BYTES,
+                    )
+                tail_words = num_packed_words % words_per_vector
+                if cutlass.const_expr(tail_words != 0):
+                    word_base = full_vectors * words_per_vector
+                    packed_tail = tuple(
+                        packed_i32[word_base + word_idx]
+                        for word_idx in range(tail_words)
+                    )
+                    self.gCInt32.store(
+                        packed_tail,
+                        idx=packed_row_base + Int32(word_base),
+                        vector_size=tail_words,
+                        alignment=tail_words * _PACKED_WORD_BYTES,
                     )
             else:
-                self.gC.store(
-                    vec_out,
-                    idx=linear_idx,
-                    vector_size=epi_t2r_repx,
-                    alignment=((1 if self.cfg.uses_fp8_output else 2) * epi_t2r_repx),
-                )
+                for word_idx in cutlass.range_constexpr(num_packed_words):
+                    output_col = col_base + Int32(
+                        word_idx * _FP4_VALUES_PER_PACKED_WORD
+                    )
+                    if output_col + Int32(_FP4_VALUES_PER_PACKED_WORD) <= output_n:
+                        self.gCInt32.store(
+                            packed_i32[word_idx],
+                            idx=packed_row_base + Int32(word_idx),
+                            vector_size=1,
+                            alignment=_PACKED_WORD_BYTES,
+                        )
+
+    @cute.jit
+    def _non_swap_fp4_tma_smem_word_offset(self, m_local_row, n_local_col):
+        """Map one packed FP4 word into the TMA-swizzled scratch tile."""
+        row_bytes = Int32(self.cfg.tma_store_cols // 2)
+        byte_offset = m_local_row * row_bytes + n_local_col // Int32(2)
+        swizzle_mask = self._c_tma_smem_swizzle_mask(byte_offset // Int32(128))
+        return (byte_offset ^ swizzle_mask) // Int32(_PACKED_WORD_BYTES)
+
+    @cute.jit
+    def _stage_non_swap_fp4_tma(
+        self,
+        packed_i32,
+        row_in_tile,
+        warpgroup_idx,
+        num_packed_words: cutlass.Constexpr[int],
+    ):
+        """Stage FP4 as independently swizzled 16-byte SMEM atoms."""
+        words_per_atom = TMA_SWIZZLE_ATOM_BYTES // _PACKED_WORD_BYTES
+        group_word_offset = (
+            warpgroup_idx
+            * Int32(self.cfg.num_bytes_c_tma_store_per_group)
+            // Int32(_PACKED_WORD_BYTES)
+        )
+        full_atoms = num_packed_words // words_per_atom
+        for atom_idx in cutlass.range_constexpr(full_atoms):
+            word_base = atom_idx * words_per_atom
+            atom = tuple(
+                packed_i32[word_base + word_idx] for word_idx in range(words_per_atom)
+            )
+            word_offset = self._non_swap_fp4_tma_smem_word_offset(
+                row_in_tile,
+                Int32(word_base * _FP4_VALUES_PER_PACKED_WORD),
+            )
+            self.sCInt32.store(
+                atom,
+                idx=group_word_offset + word_offset,
+                vector_size=words_per_atom,
+                alignment=TMA_SWIZZLE_ATOM_BYTES,
+            )
+        tail_words = num_packed_words % words_per_atom
+        if cutlass.const_expr(tail_words != 0):
+            word_base = full_atoms * words_per_atom
+            tail = tuple(
+                packed_i32[word_base + word_idx] for word_idx in range(tail_words)
+            )
+            word_offset = self._non_swap_fp4_tma_smem_word_offset(
+                row_in_tile,
+                Int32(word_base * _FP4_VALUES_PER_PACKED_WORD),
+            )
+            self.sCInt32.store(
+                tail,
+                idx=group_word_offset + word_offset,
+                vector_size=tail_words,
+                alignment=tail_words * _PACKED_WORD_BYTES,
+            )
+
+    def _non_swap_shuffled_col_idx(self, logical_col: int) -> int:
+        """Map a logical batch-M column to its physical shuffled column."""
+        if not self.cfg.use_shuffled_matrix:
+            return logical_col
+        block_size = self.cfg.shuffled_matrix_block_size
+        indices = self.cfg.shuffled_matrix_row_indices
+        return (logical_col // block_size) * block_size + indices[
+            logical_col % block_size
+        ]
+
+    @cute.jit
+    def _load_non_swap_accumulator(
+        self, t2r_rmem, t2r_rmem_1, logical_col: int, fragment_regs: int
+    ):
+        """Load one logical column from one or two batch-M T2R fragments."""
+        physical_col = self._non_swap_shuffled_col_idx(logical_col)
+        if cutlass.const_expr(physical_col >= fragment_regs):
+            return t2r_rmem_1[physical_col - fragment_regs]
+        return t2r_rmem[physical_col]
+
+    @cute.jit
+    def _commit_non_swap_fp4_tma(
+        self,
+        tile_coord_m,
+        tile_coord_n,
+        call_idx,
+        output_n,
+        output_tile_in_bounds,
+        warp_idx,
+        warpgroup_idx,
+    ):
+        """Publish one 128-row by output-N FP4 warpgroup tile through B4X16."""
+        store_barrier_id = self._tma_store_barrier_id(warpgroup_idx)
+        group_leader = Int32(
+            self.cfg.warp_layout.epilogue_warp_idx
+        ) + warpgroup_idx * Int32(WARPS_PER_WARPGROUP)
+        output_col_base = tile_coord_n * Int32(self.cfg.tile_n // 2) + call_idx * Int32(
+            self.cfg.non_swap_tmem_load_num_regs // 2
+        )
+        smem_base = self.sC.subview(
+            warpgroup_idx * Int32(self.cfg.num_bytes_c_tma_store_per_group)
+        )
+        should_store = (
+            (warp_idx == group_leader)
+            & prims.elect_sync()
+            & output_tile_in_bounds
+            & (output_col_base < output_n)
+        )
+        if should_store:
+            prims.cp_async_bulk_tensor_global_shared_cta(
+                self.tma_c_desc,
+                smem_base,
+                (output_col_base, tile_coord_m * Int32(self.cfg.tile_m)),
+            )
+            prims.cp_async_bulk_commit_group()
+            if cutlass.const_expr(self.cfg.aliases_c_scratch_with_ab):
+                # The next writer can be an A/B producer running on different
+                # threads.  Drain on the issuing lane before handing ownership
+                # of the aliased allocation back to that task.
+                prims.cp_async_bulk_wait_group(0, read=True)
+        prims.barrier_cta_sync(
+            barrier_id=store_barrier_id,
+            thread_count=self.cfg.epilogue_threads_per_warpgroup,
+        )
+
+    @cute.jit
+    def _store_non_swap_gated_16bit_tma(
+        self,
+        result_out_vec,
+        row_in_tile,
+        output_col_base,
+        tile_coord_m,
+        tile_coord_n,
+        token_in_bounds,
+        output_tile_in_bounds,
+        warp_idx,
+        warpgroup_idx,
+    ):
+        """Accumulate one gated BF16/FP16 step and TMA-store a complete box.
+
+        Each epilogue warpgroup owns a configuration-derived output tile.
+        Keeping a separate scratch tile and named barrier per group also works
+        for the rotated output order used by max TMEM overlap.
+        """
+        store_barrier_id = self._tma_store_barrier_id(warpgroup_idx)
+        group_leader = Int32(
+            self.cfg.warp_layout.epilogue_warp_idx
+        ) + warpgroup_idx * Int32(WARPS_PER_WARPGROUP)
+        step_output_cols = self.cfg.non_swap_gated_output_cols_per_call
+        tma_store_cols = self.cfg.tma_store_cols
+        calls_per_box = tma_store_cols // step_output_cols
+        tile_output_col_base = tile_coord_n * Int32(self.cfg.tile_n // 2)
+        local_output_col = output_col_base - tile_output_col_base
+        step_in_box = (local_output_col % Int32(tma_store_cols)) // Int32(
+            step_output_cols
+        )
+        box_elems = self.cfg.epi_tile_m * tma_store_cols
+        smem_group_elem_offset = warpgroup_idx * Int32(
+            box_elems * self.cfg.num_stages_c_smem
+        )
+        smem_stage_idx = Int32(0)
+        if cutlass.const_expr(self.cfg.uses_non_swap_c_tma_ring):
+            smem_stage_idx = (self._c_tma_call_idx // Int32(calls_per_box)) % Int32(
+                self.cfg.num_stages_c_smem
+            )
+        smem_base = self.sC.subview(
+            smem_group_elem_offset + smem_stage_idx * Int32(box_elems)
+        )
+
+        staged_vec = result_out_vec
+        if token_in_bounds:
+            pass
+        else:
+            staged_vec = cutlass.vector.full_like(result_out_vec, 0.0)
+
+        # The first writer into a box waits until its selected stage is no
+        # longer read by TMA. Later calls fill disjoint column slices.
+        if step_in_box == Int32(0):
+            prims.cp_async_bulk_wait_group(self.cfg.num_stages_c_smem - 1, read=True)
+            prims.barrier_cta_sync(
+                barrier_id=store_barrier_id,
+                thread_count=self.cfg.epilogue_threads_per_warpgroup,
+            )
+        self._stage_non_swap_tma_vec(
+            staged_vec,
+            row_in_tile,
+            step_in_box * Int32(step_output_cols),
+            smem_base,
+            step_output_cols,
+        )
+
+        if step_in_box == Int32(calls_per_box - 1):
+            self._publish_tma_scratch(store_barrier_id)
+            tma_output_col_base = output_col_base - step_in_box * Int32(
+                step_output_cols
+            )
+            is_issuer = (warp_idx == group_leader) & prims.elect_sync()
+            if is_issuer:
+                if output_tile_in_bounds & (
+                    tma_output_col_base < self.problem_n // Int32(2)
+                ):
+                    prims.cp_async_bulk_tensor_global_shared_cta(
+                        self.tma_c_desc,
+                        smem_base,
+                        (tma_output_col_base, tile_coord_m * Int32(self.cfg.tile_m)),
+                    )
+                # Empty groups are intentional for padded output tiles.  They
+                # keep wait_group(S - 1) aligned with the running stage ring.
+                prims.cp_async_bulk_commit_group()
 
     @cute.jit
     def _store_non_swap_tma_32x32b(
@@ -1124,149 +1918,167 @@ class GmemCResource(MemoryResource):
         tile_coord_m,
         call_idx,
         token_in_bounds,
+        output_tile_in_bounds,
         warp_idx,
-        sequence_idx,
     ):
         """Stage one non-swap epilogue subtile to SMEM and TMA-store it."""
-        epi_t2r_repx = self.cfg.epi_tile_n // (8 if self.cfg.has_gated_epilogue else 4)
-        tma_store_cols = self.cfg.non_swap_tma_store_cols
-        element_bytes = self.cfg.dtype_c_bits // 8
-        if cutlass.const_expr(self.cfg.uses_fp8_output):
-            vec_stored = vec_out.bitcast(cutlass.Int8)
-        else:
-            vec_stored = vec_out
+        epi_t2r_repx = self.cfg.non_swap_tmem_load_num_regs
+        tma_store_cols = self.cfg.tma_store_cols
         calls_per_tma = max(1, tma_store_cols // epi_t2r_repx)
         call_in_tma = call_idx % calls_per_tma
-        # Let the next T2R and activation overlap the previous TMA read. Only
-        # wait when about to overwrite its scratch box; all writers must wait
-        # for the issuing thread before reusing SMEM.
-        smem_box_base = self.sC
-        wait_before_store = call_in_tma == Int32(0)
-        if cutlass.const_expr(self.cfg.use_swizzled_non_swap_tma):
-            smem_box_base = self.sC.subview(
-                (call_idx // calls_per_tma) * Int32(self.cfg.tile_m * tma_store_cols)
+        smem_stage_offset = Int32(0)
+        if cutlass.const_expr(self.cfg.num_stages_c_smem > 1):
+            if cutlass.const_expr(self.cfg.uses_non_swap_c_tma_ring):
+                tma_group_idx = self._c_tma_call_idx // Int32(calls_per_tma)
+            else:
+                tma_group_idx = call_idx // Int32(calls_per_tma)
+            tma_smem_stage = tma_group_idx % Int32(self.cfg.num_stages_c_smem)
+            smem_stage_stride = Int32(
+                self.cfg.num_bytes_c_per_stage * 8 // self.cfg.dtype_c_bits
             )
-            wait_before_store = Int32(sequence_idx) == Int32(0)
-        if wait_before_store:
-            prims.cp_async_bulk_wait_group(0, read=True)
-            prims.barrier_cta_sync(
-                barrier_id=9,
-                thread_count=self.cfg.num_epilogue_warps * 32,
-            )
-        smem_row = smem_box_base.subview(
-            row_in_tile * Int32(tma_store_cols) + Int32(call_in_tma * epi_t2r_repx)
+            smem_stage_offset = tma_smem_stage * smem_stage_stride
+        smem_box_base = self.sC.subview(smem_stage_offset)
+        smem_col = Int32(call_in_tma * epi_t2r_repx)
+        staged_vec = vec_out
+        if token_in_bounds:
+            pass
+        else:
+            staged_vec = cutlass.vector.full_like(vec_out, 0.0)
+        # Keep the reuse guard immediately adjacent to every SMEM staging
+        # call.  It is redundant for later disjoint slices of one TMA box, but
+        # avoids making synchronization depend on a staged call index.  A
+        # wait-group is local to the issuer, so the all-writer barrier must
+        # follow it before any warp can overwrite the selected stage.
+        prims.cp_async_bulk_wait_group(self.cfg.num_stages_c_smem - 1, read=True)
+        prims.barrier_cta_sync(
+            barrier_id=_EPILOGUE_BARRIER_ID,
+            thread_count=self.cfg.warp_layout.num_epilogue_warps * WARP_SIZE,
         )
-        if cutlass.const_expr(self.cfg.use_swizzled_non_swap_tma):
-            # The tensor-map swizzle permutes 16-byte chunks within each
-            # swizzled row. Split the register fragment into matching stores;
-            # a single wider store would cross a swizzle discontinuity.
-            row_bytes = tma_store_cols * element_bytes
-            chunk_elements = 16 // element_bytes
-            for chunk in cutlass.range_constexpr(epi_t2r_repx // chunk_elements):
-                col = call_in_tma * Int32(epi_t2r_repx) + Int32(chunk * chunk_elements)
-                offset_bytes = row_in_tile * Int32(row_bytes) + col * Int32(
-                    element_bytes
-                )
-                offset_bytes = offset_bytes ^ (
-                    (offset_bytes >> Int32(3)) & Int32(row_bytes - 16)
-                )
-                values = [
-                    vec_stored[chunk * chunk_elements + i]
-                    for i in range(chunk_elements)
-                ]
-                packed = cutlass.Vector.from_elements(
-                    tuple(values),
-                    dtype=(
-                        cutlass.Int8
-                        if self.cfg.uses_fp8_output
-                        else cutlass.BFloat16
-                        if self.cfg.dtype_c_kind == int(DType.BF16)
-                        else cutlass.Float16
-                    ),
-                )
-                if not token_in_bounds:
-                    packed = cutlass.vector.full_like(packed, 0.0)
-                smem_box_base.subview(offset_bytes // Int32(element_bytes)).store(
-                    packed, vector_size=chunk_elements, alignment=16
-                )
-        elif token_in_bounds:
-            smem_row.store(
-                vec_stored,
-                vector_size=epi_t2r_repx,
-                alignment=((1 if self.cfg.uses_fp8_output else 2) * epi_t2r_repx),
+        if cutlass.const_expr(self.cfg.c_tma_swizzle_bytes >= 32):
+            # Match the TMA descriptor's 32/64/128-byte swizzle for every C
+            # format. Split the fragment into 16-byte atoms because TMA
+            # swizzling permutes those atoms within each row; a wider vector
+            # store could cross a swizzle boundary.
+            self._stage_non_swap_tma_vec(
+                staged_vec,
+                row_in_tile,
+                smem_col,
+                smem_box_base,
+                epi_t2r_repx,
             )
         else:
-            zero_vec = cutlass.vector.full_like(vec_stored, 0.0)
+            smem_row = smem_box_base.subview(
+                row_in_tile * Int32(tma_store_cols) + smem_col
+            )
             smem_row.store(
-                zero_vec,
+                staged_vec,
                 vector_size=epi_t2r_repx,
                 alignment=((1 if self.cfg.uses_fp8_output else 2) * epi_t2r_repx),
             )
 
-        issue_store = call_in_tma == Int32(calls_per_tma - 1)
-        if cutlass.const_expr(self.cfg.use_swizzled_non_swap_tma):
-            # The first maximum-overlap window is rotated by one fragment.
-            # Its last box becomes complete at the final call, not the first.
-            num_calls = self.cfg.tile_n // (self.cfg.epi_tile_n // 4)
-            if cutlass.const_expr(
-                self.cfg.use_tile256_tmem_overlap and calls_per_tma > 1
-            ):
-                issue_store = (issue_store & (Int32(sequence_idx) != Int32(0))) | (
-                    Int32(sequence_idx) == Int32(num_calls - 1)
-                )
-        if issue_store:
+        if call_in_tma == Int32(calls_per_tma - 1):
+            # Calls write disjoint column slices of one SMEM box. Publish and
+            # issue TMA only after its final slice, independent of scheduling.
             cute.arch.fence_view_async_shared()
             prims.barrier_cta_sync(
-                barrier_id=9,
-                thread_count=self.cfg.num_epilogue_warps * 32,
+                barrier_id=_EPILOGUE_BARRIER_ID,
+                thread_count=self.cfg.warp_layout.num_epilogue_warps * WARP_SIZE,
             )
             tma_col_base = col_base - Int32(call_in_tma * epi_t2r_repx)
-            if (warp_idx == Int32(self.cfg.epilogue_warp_idx)) & prims.elect_sync():
-                prims.cp_async_bulk_tensor_global_shared_cta(
-                    self.tma_c_desc,
-                    smem_box_base,
-                    (tma_col_base, tile_coord_m * Int32(self.cfg.tile_m)),
-                )
+            is_issuer = (
+                warp_idx == Int32(self.cfg.warp_layout.epilogue_warp_idx)
+            ) & prims.elect_sync()
+            if is_issuer:
+                if output_tile_in_bounds:
+                    prims.cp_async_bulk_tensor_global_shared_cta(
+                        self.tma_c_desc,
+                        smem_box_base,
+                        (tma_col_base, tile_coord_m * Int32(self.cfg.tile_m)),
+                    )
                 prims.cp_async_bulk_commit_group()
+                if cutlass.const_expr(self.cfg.aliases_c_scratch_with_ab):
+                    prims.cp_async_bulk_wait_group(0, read=True)
+            if cutlass.const_expr(self.cfg.aliases_c_scratch_with_ab):
+                prims.barrier_cta_sync(
+                    barrier_id=_EPILOGUE_BARRIER_ID,
+                    thread_count=self.cfg.warp_layout.num_epilogue_warps * WARP_SIZE,
+                )
 
-    @producer_work(work_attrs=WorkAttr.AUXILIARY)
     @cute.jit
-    def drain_non_swap_tma_stores(self, stage_info: StageInfo) -> None:
-        """Finish outstanding output writes before the epilogue task exits."""
-        del stage_info
-        prims.cp_async_bulk_wait_group(0, read=False)
-        prims.barrier_cta_sync(
-            barrier_id=9,
-            thread_count=self.cfg.num_epilogue_warps * 32,
-        )
+    def _c_tma_smem_swizzle_mask(self, swizzle_row_128b):
+        """XOR mask for the 128-byte SMEM band containing a C element."""
+        if cutlass.const_expr(self.cfg.c_tma_swizzle_bytes % 128 == 0):
+            return (swizzle_row_128b % Int32(8)) * Int32(16)
+        if cutlass.const_expr(self.cfg.c_tma_swizzle_bytes % 64 == 0):
+            return (swizzle_row_128b % Int32(4)) * Int32(16)
+        if cutlass.const_expr(self.cfg.c_tma_swizzle_bytes % 32 == 0):
+            return (swizzle_row_128b % Int32(2)) * Int32(16)
+        return Int32(0)
 
-    @producer_work(work_attrs=WorkAttr.AUXILIARY)
     @cute.jit
-    def drain_swap_ab_tma_stores(self, stage_info: StageInfo) -> None:
-        """Drain deferred output writes before the epilogue task can exit."""
-        del stage_info
-        prims.cp_async_bulk_wait_group(0, read=False)
-        warpgroup_idx = cute.arch.warp_idx() % self.cfg.num_epilogue_warps // 4
-        prims.barrier_cta_sync(barrier_id=Int32(7) + warpgroup_idx, thread_count=128)
+    def _non_swap_tma_smem_element_offset(self, m_local_row, n_local_col):
+        """Map a row-major C element into the TMA-swizzled scratch."""
+        tma_store_cols = Int32(self.cfg.tma_store_cols)
+        element_bytes = Int32(self.cfg.dtype_c_bits // 8)
+        smem_offset_bytes = (m_local_row * tma_store_cols + n_local_col) * element_bytes
+        # TMA derives the XOR row from 128-byte SMEM bands.  A logical row is
+        # narrower than that for s32b/s64b, so using m_local_row directly
+        # advances the swizzle pattern too quickly.
+        swizzle_mask = self._c_tma_smem_swizzle_mask(smem_offset_bytes // Int32(128))
+        return (smem_offset_bytes ^ swizzle_mask) // element_bytes
+
+    @cute.jit
+    def _stage_non_swap_tma_vec(
+        self,
+        vec_out,
+        m_local_row,
+        n_local_col,
+        smem_box_base,
+        vector_elems: cutlass.Constexpr[int],
+    ):
+        """Stage a C fragment as independently swizzled 16-byte atoms."""
+        atom_elems = self.cfg.c_tma_smem_atom_elements
+        full_atoms = vector_elems // atom_elems
+        for atom_idx in cutlass.range_constexpr(full_atoms):
+            atom_col = atom_idx * atom_elems
+            atom = tuple(vec_out[atom_col + elem_idx] for elem_idx in range(atom_elems))
+            smem_offset = self._non_swap_tma_smem_element_offset(
+                m_local_row, n_local_col + Int32(atom_col)
+            )
+            smem_box_base.store(
+                atom,
+                idx=smem_offset,
+                vector_size=atom_elems,
+                alignment=TMA_SWIZZLE_ATOM_BYTES,
+            )
+        tail_elems = vector_elems % atom_elems
+        if cutlass.const_expr(tail_elems != 0):
+            atom_col = full_atoms * atom_elems
+            tail = tuple(vec_out[atom_col + elem_idx] for elem_idx in range(tail_elems))
+            smem_offset = self._non_swap_tma_smem_element_offset(
+                m_local_row, n_local_col + Int32(atom_col)
+            )
+            smem_box_base.store(
+                tail,
+                idx=smem_offset,
+                vector_size=tail_elems,
+                alignment=(self.cfg.dtype_c_bits // 8) * tail_elems,
+            )
 
     @cute.jit
     def _bf16_tma_smem_element_offset(self, m_local_row, n_local_col):
-        tma_store_cols = Int32(self.cfg.epi_tile_n)
-        row_block = m_local_row // Int32(64)
-        row_in_block = m_local_row % Int32(64)
-        smem_row_idx = row_block * tma_store_cols + n_local_col
-        smem_offset_bytes = smem_row_idx * Int32(128) + row_in_block * Int32(2)
-        swizzle_mask = (smem_row_idx % Int32(8)) * Int32(16)
+        box_rows = Int32(self.cfg.swap_tma_store_rows)
+        row_block = m_local_row // box_rows
+        row_in_block = m_local_row % box_rows
+        box_stride = Int32(self.cfg.epi_tile_n) * box_rows
+        linear = row_block * box_stride + n_local_col * box_rows + row_in_block
+        smem_offset_bytes = linear * Int32(2)
+        swizzle_mask = self._c_tma_smem_swizzle_mask(smem_offset_bytes // Int32(128))
         return (smem_offset_bytes ^ swizzle_mask) // Int32(2)
 
     @cute.jit
     def _bf16_gated_tma_smem_element_offset(self, m_local_row, n_local_col):
-        output_tile_m = Int32(self.cfg.tile_m // 2)
-        linear = n_local_col * output_tile_m + m_local_row
-        smem_row_idx = linear // Int32(64)
-        smem_offset_bytes = linear * Int32(2)
-        swizzle_mask = (smem_row_idx % Int32(8)) * Int32(16)
-        return (smem_offset_bytes ^ swizzle_mask) // Int32(2)
+        return self._bf16_tma_smem_element_offset(m_local_row, n_local_col)
 
     @cute.jit
     def _tma_oob_c_coords_bf16(
@@ -1298,9 +2110,10 @@ class GmemCResource(MemoryResource):
         tile_coord_m,
         tile_coord_n,
         n_subtile_offset,
+        row_offset,
         token_limit,
     ):
-        m_base = tile_coord_m * Int32(self.cfg.tile_m // 2)
+        m_base = tile_coord_m * Int32(self.cfg.tile_m // 2) + row_offset
         n_base = tile_coord_n * Int32(self.cfg.tile_n)
         if cutlass.const_expr(self.cfg.use_tma_oob_opt):
             large_n = Int32(0x40000000)
@@ -1398,11 +2211,7 @@ class GmemCResource(MemoryResource):
             )
 
     @cute.jit
-    def _sync_swap_ab_tma_threads(self, warpgroup_idx):
-        prims.barrier_cta_sync(barrier_id=Int32(7) + warpgroup_idx, thread_count=128)
-
-    @cute.jit
-    def _commit_swap_ab_bf16_tma(
+    def _commit_swap_ab_plain_tma(
         self,
         tile_coord_m,
         tile_coord_n,
@@ -1413,42 +2222,64 @@ class GmemCResource(MemoryResource):
     ):
         cute.arch.fence_view_async_shared()
         cute.arch.fence_view_async_tmem_load()
-        self._sync_swap_ab_tma_threads(warpgroup_idx)
-        warp_in_epi4 = warp_idx % Int32(4)
+        store_barrier_id = Int32(_TMA_STORE_BARRIER_BASE) + warpgroup_idx
+        prims.barrier_cta_sync(
+            barrier_id=store_barrier_id,
+            thread_count=self.cfg.epilogue_threads_per_warpgroup,
+        )
+        warp_in_epi4 = warp_idx % Int32(WARPS_PER_WARPGROUP)
         warp_in_epi4 = cute.arch.make_warp_uniform(warp_in_epi4)
         should_store = (warp_in_epi4 == Int32(0)) & prims.elect_sync()
+        c_element_bytes = self.cfg.dtype_c_bits // 8
+        group_stride_elems = Int32(
+            self.cfg.num_bytes_c_tma_store_per_group // c_element_bytes
+        )
+        smem_group_base = self.sC.subview(warpgroup_idx * group_stride_elems)
+        # SwapAB's descriptor-fastest dimension is M. The complete N stripe is
+        # stored at once; the row loop below emits the full M tile through the
+        # warpgroup's 128-byte-or-smaller contiguous boxes.
+        for pass_idx in cutlass.range_constexpr(self.cfg.tma_store_passes):
+            n_slice_offset = Int32(pass_idx * self.cfg.tma_store_cols)
+            slice_should_store = should_store
+            if cutlass.const_expr(self.cfg.use_tma_oob_opt):
+                slice_should_store = slice_should_store & (
+                    n_subtile_offset + n_slice_offset < token_limit
+                )
+            if slice_should_store:
+                for row_pass_idx in cutlass.range_constexpr(
+                    self.cfg.swap_tma_store_row_passes
+                ):
+                    row_offset = Int32(row_pass_idx * self.cfg.swap_tma_store_rows)
+                    if cutlass.const_expr(self.cfg.uses_fp8_output):
+                        smem_offset = self._fp8_nongated_tma_smem_byte_offset(
+                            row_offset, n_slice_offset
+                        )
+                    else:
+                        smem_offset = self._bf16_tma_smem_element_offset(
+                            row_offset, n_slice_offset
+                        )
+                    prims.cp_async_bulk_tensor_global_shared_cta(
+                        self.tma_c_desc,
+                        smem_group_base.subview(smem_offset),
+                        self._tma_oob_c_coords_bf16(
+                            tile_coord_m,
+                            tile_coord_n,
+                            n_subtile_offset + n_slice_offset,
+                            row_offset,
+                            token_limit,
+                        ),
+                    )
+        commit_store = should_store
         if cutlass.const_expr(self.cfg.use_tma_oob_opt):
-            should_store = should_store & (n_subtile_offset < token_limit)
-        if should_store:
-            group_stride_elems = Int32(self.cfg.num_bytes_c_tma_store_per_group // 2)
-            smem_base = self.sC.subview(warpgroup_idx * group_stride_elems)
-            row_offset0 = Int32(0)
-            prims.cp_async_bulk_tensor_global_shared_cta(
-                self.tma_c_desc,
-                smem_base,
-                self._tma_oob_c_coords_bf16(
-                    tile_coord_m,
-                    tile_coord_n,
-                    n_subtile_offset,
-                    row_offset0,
-                    token_limit,
-                ),
-            )
-            row_offset1 = Int32(64)
-            prims.cp_async_bulk_tensor_global_shared_cta(
-                self.tma_c_desc,
-                smem_base.subview(
-                    self._bf16_tma_smem_element_offset(row_offset1, Int32(0))
-                ),
-                self._tma_oob_c_coords_bf16(
-                    tile_coord_m,
-                    tile_coord_n,
-                    n_subtile_offset,
-                    row_offset1,
-                    token_limit,
-                ),
-            )
+            commit_store = commit_store & (n_subtile_offset < token_limit)
+        if commit_store:
             prims.cp_async_bulk_commit_group()
+            if cutlass.const_expr(self.cfg.aliases_c_scratch_with_ab):
+                prims.cp_async_bulk_wait_group(0, read=True)
+        prims.barrier_cta_sync(
+            barrier_id=store_barrier_id,
+            thread_count=self.cfg.epilogue_threads_per_warpgroup,
+        )
 
     @cute.jit
     def _tma_oob_c_coords_bf16_dsfp8(
@@ -1457,9 +2288,10 @@ class GmemCResource(MemoryResource):
         tile_coord_n,
         n_subtile_offset,
         warpgroup_idx,
+        row_offset,
         token_limit,
     ):
-        m_base = (tile_coord_m * Int32(2) + warpgroup_idx) * Int32(64)
+        m_base = (tile_coord_m * Int32(2) + warpgroup_idx) * Int32(64) + row_offset
         n_base = tile_coord_n * Int32(self.cfg.tile_n)
         if cutlass.const_expr(self.cfg.use_tma_oob_opt):
             large_n = Int32(0x40000000)
@@ -1486,29 +2318,54 @@ class GmemCResource(MemoryResource):
     ):
         cute.arch.fence_view_async_shared()
         cute.arch.fence_view_async_tmem_load()
+        store_barrier_id = Int32(_TMA_STORE_BARRIER_BASE) + warpgroup_idx
         prims.barrier_cta_sync(
-            barrier_id=7,
-            thread_count=self.cfg.num_epilogue_warps * 32,
+            barrier_id=store_barrier_id,
+            thread_count=self.cfg.epilogue_threads_per_warpgroup,
         )
-        warp_in_epi4 = warp_idx % Int32(4)
+        warp_in_epi4 = warp_idx % Int32(WARPS_PER_WARPGROUP)
         warp_in_epi4 = cute.arch.make_warp_uniform(warp_in_epi4)
         should_store = (warp_in_epi4 == Int32(0)) & prims.elect_sync()
+        group_stride_elems = Int32(64 * self.cfg.epi_tile_n)
+        smem_group_base = self.sC.subview(warpgroup_idx * group_stride_elems)
+        for pass_idx in cutlass.range_constexpr(self.cfg.tma_store_passes):
+            n_slice_offset = Int32(pass_idx * self.cfg.tma_store_cols)
+            slice_should_store = should_store
+            if cutlass.const_expr(self.cfg.use_tma_oob_opt):
+                slice_should_store = slice_should_store & (
+                    n_subtile_offset + n_slice_offset < token_limit
+                )
+            if slice_should_store:
+                for row_pass_idx in cutlass.range_constexpr(
+                    self.cfg.swap_tma_store_row_passes
+                ):
+                    row_offset = Int32(row_pass_idx * self.cfg.swap_tma_store_rows)
+                    smem_offset = self._bf16_tma_smem_element_offset(
+                        row_offset, n_slice_offset
+                    )
+                    prims.cp_async_bulk_tensor_global_shared_cta(
+                        self.tma_c_desc,
+                        smem_group_base.subview(smem_offset),
+                        self._tma_oob_c_coords_bf16_dsfp8(
+                            tile_coord_m,
+                            tile_coord_n,
+                            n_subtile_offset + n_slice_offset,
+                            warpgroup_idx,
+                            row_offset,
+                            token_limit,
+                        ),
+                    )
+        commit_store = should_store
         if cutlass.const_expr(self.cfg.use_tma_oob_opt):
-            should_store = should_store & (n_subtile_offset < token_limit)
-        if should_store:
-            group_stride_elems = Int32(64 * self.cfg.epi_tile_n)
-            prims.cp_async_bulk_tensor_global_shared_cta(
-                self.tma_c_desc,
-                self.sC.subview(warpgroup_idx * group_stride_elems),
-                self._tma_oob_c_coords_bf16_dsfp8(
-                    tile_coord_m,
-                    tile_coord_n,
-                    n_subtile_offset,
-                    warpgroup_idx,
-                    token_limit,
-                ),
-            )
+            commit_store = commit_store & (n_subtile_offset < token_limit)
+        if commit_store:
             prims.cp_async_bulk_commit_group()
+            if cutlass.const_expr(self.cfg.aliases_c_scratch_with_ab):
+                prims.cp_async_bulk_wait_group(0, read=True)
+        prims.barrier_cta_sync(
+            barrier_id=store_barrier_id,
+            thread_count=self.cfg.epilogue_threads_per_warpgroup,
+        )
 
     @cute.jit
     def _commit_swap_ab_bf16_gated_tma(
@@ -1522,43 +2379,81 @@ class GmemCResource(MemoryResource):
         cute.arch.fence_view_async_shared()
         cute.arch.fence_view_async_tmem_load()
         prims.barrier_cta_sync(
-            barrier_id=7,
-            thread_count=self.cfg.num_epilogue_warps * 32,
+            barrier_id=_TMA_STORE_BARRIER_BASE,
+            thread_count=self.cfg.warp_layout.num_epilogue_warps * WARP_SIZE,
         )
-        warp_in_epi4 = warp_idx % Int32(4)
+        warp_in_epi4 = warp_idx % Int32(WARPS_PER_WARPGROUP)
         warp_in_epi4 = cute.arch.make_warp_uniform(warp_in_epi4)
         should_store = (warp_in_epi4 == Int32(0)) & prims.elect_sync()
+        for pass_idx in cutlass.range_constexpr(self.cfg.tma_store_passes):
+            n_slice_offset = Int32(pass_idx * self.cfg.tma_store_cols)
+            slice_should_store = should_store
+            if cutlass.const_expr(not self.cfg.use_tma_oob_opt):
+                slice_should_store = slice_should_store & (
+                    n_subtile_offset + n_slice_offset < token_limit
+                )
+            if slice_should_store:
+                for row_pass_idx in cutlass.range_constexpr(
+                    self.cfg.swap_tma_store_row_passes
+                ):
+                    row_offset = Int32(row_pass_idx * self.cfg.swap_tma_store_rows)
+                    smem_offset = self._bf16_gated_tma_smem_element_offset(
+                        row_offset, n_slice_offset
+                    )
+                    prims.cp_async_bulk_tensor_global_shared_cta(
+                        self.tma_c_desc,
+                        self.sC.subview(smem_offset),
+                        self._tma_oob_c_coords_bf16_gated(
+                            tile_coord_m,
+                            tile_coord_n,
+                            n_subtile_offset + n_slice_offset,
+                            row_offset,
+                            token_limit,
+                        ),
+                    )
+        commit_store = should_store
         if cutlass.const_expr(not self.cfg.use_tma_oob_opt):
-            should_store = should_store & (n_subtile_offset < token_limit)
-        if should_store:
-            prims.cp_async_bulk_tensor_global_shared_cta(
-                self.tma_c_desc,
-                self.sC,
-                self._tma_oob_c_coords_bf16_gated(
-                    tile_coord_m,
-                    tile_coord_n,
-                    n_subtile_offset,
-                    token_limit,
-                ),
-            )
+            commit_store = commit_store & (n_subtile_offset < token_limit)
+        if commit_store:
             prims.cp_async_bulk_commit_group()
+            if cutlass.const_expr(self.cfg.aliases_c_scratch_with_ab):
+                prims.cp_async_bulk_wait_group(0, read=True)
+        prims.barrier_cta_sync(
+            barrier_id=_TMA_STORE_BARRIER_BASE,
+            thread_count=self.cfg.warp_layout.num_epilogue_warps * WARP_SIZE,
+        )
 
     @cute.jit
     def _reduce_fp4_absmax_m16(self, val):
         """Reduce a positive max value across the 8 lanes owning one M16 block.
 
-        Output-SF reduction uses fmax so NaNs are filtered (fmax(NaN, x) = x):
-        and all-NaN local contributions reduce as zero.
+        NaNs are filtered by the NaN-quiet max against 0.0 below
+        (max(NaN, 0.0) = 0.0), so all-NaN local contributions reduce as zero.
         """
         if cutlass.const_expr(self.cfg.has_deepseek_fp8_c_scale):
             val = cute.arch.fmax(cute.arch.fmax(val, -val), Float32(0.0))
         else:
             val = cute.math.max(cute.math.abs(val), Float32(0.0))
-        for lane_mask in (4, 8, 16):
+        return self._reduce_positive_max_lanes(val, True)
+
+    @cute.jit
+    def _reduce_positive_max_lanes(self, val, include_xor16: cutlass.Constexpr[bool]):
+        """Butterfly-reduce a non-negative maximum across 4 or 8 lane groups."""
+        for lane_mask in (4, 8):
             other = prims.shfl_sync(
                 thread_mask=0xFFFFFFFF,
                 val=val.bitcast(cutlass.Int32),
                 offset=lane_mask,
+                mask_and_clamp=0x1F,
+                kind=prims.Shfl.BFLY,
+                return_value_and_is_valid=False,
+            ).bitcast(cutlass.Float32)
+            val = self._fmax_ftz(val, other)
+        if cutlass.const_expr(include_xor16):
+            other = prims.shfl_sync(
+                thread_mask=0xFFFFFFFF,
+                val=val.bitcast(cutlass.Int32),
+                offset=16,
                 mask_and_clamp=0x1F,
                 kind=prims.Shfl.BFLY,
                 return_value_and_is_valid=False,
@@ -1584,7 +2479,7 @@ class GmemCResource(MemoryResource):
         ):
             scratch_base = Int32(
                 self.cfg.num_bytes_c_tma_store_per_group
-                * max(1, self.cfg.num_epilogue_warps // 4)
+                * self.cfg.num_epilogue_warpgroups
                 // 4
             )
         scratch_group_stride = Int32(max(1, self.cfg.epi_tile_n // 8) * 32)
@@ -1753,7 +2648,7 @@ class GmemCResource(MemoryResource):
 
     @cute.jit
     def _dsfp8_c_scale_pair_two_epilogues(self, lane_id, scale_pair):
-        if cutlass.const_expr(self.cfg.epi_tile_n == 64):
+        if cutlass.const_expr(self.cfg.uses_deepseek_fp8_atomic_absmax):
             lane_col = (lane_id % Int32(4)) * Int32(2)
             scratch_idx = scale_pair * Int32(8) + lane_col
             block_abs0, block_abs1 = self.sDsFp8Absmax.load(
@@ -1834,52 +2729,25 @@ class GmemCResource(MemoryResource):
             val, warpgroup_idx, warp_in_epi4, lane_id, scale_slot
         )
         prims.barrier_cta_sync(
-            barrier_id=9,
-            thread_count=self.cfg.num_epilogue_warps * 32,
+            barrier_id=_EPILOGUE_BARRIER_ID,
+            thread_count=self.cfg.warp_layout.num_epilogue_warps * WARP_SIZE,
         )
         block_absmax = self._read_absmax_scratch(
             warpgroup_idx, warp_in_epi4, lane_id, scale_slot
         )
         prims.barrier_cta_sync(
-            barrier_id=9,
-            thread_count=self.cfg.num_epilogue_warps * 32,
+            barrier_id=_EPILOGUE_BARRIER_ID,
+            thread_count=self.cfg.warp_layout.num_epilogue_warps * WARP_SIZE,
         )
         return block_absmax
 
     @cute.jit
-    def _store_non_swap_nvfp4(self, values, row, col_base, output_n, token_in_bounds):
-        """Each lane owns contiguous feature blocks and their NVFP4 scales.
-
-        Packed values use direct stores: a 16-value block is only eight bytes,
-        below the minimum TMA box. SF-C uses the same token/feature layout as
-        BatchN, with logical coordinates reversed for BatchM.
-        """
-        num_values = self.cfg.epi_tile_n // 8
-        for block in cutlass.range_constexpr(num_values // 16):
-            absmax = Float32(0.0)
-            for i in cutlass.range_constexpr(16):
-                absmax = cute.math.max(absmax, cute.math.abs(values[block * 16 + i]))
-            sf = absmax * Float32(1.0 / 6.0)
-            inv_sf = cute.math.rcp(
-                cute.math.max(sf, Float32(1.0e-12)), approx=True, ftz=True
-            )
-            feature = col_base + Int32(block * 16)
-            if token_in_bounds & (feature < output_n):
-                sf_idx = self._sf_c_index(feature, row, output_n)
-                self.gSfCBytes.subview(sf_idx).store(
-                    sf.to(cutlass.Float8E4M3FN).bitcast(cutlass.Int8)
-                )
-                for pair in cutlass.range_constexpr(8):
-                    lo = values[block * 16 + pair * 2] * inv_sf
-                    hi = values[block * 16 + pair * 2 + 1] * inv_sf
-                    packed = _convert_f32x2_to_e2m1x2(hi, lo)
-                    byte_idx = (row * output_n + feature) // Int32(2) + Int32(pair)
-                    self.gCBytes.subview(byte_idx).store(packed)
-
-    @cute.jit
     def _sf_c_index(self, m_row, n_col, output_m):
+        if cutlass.const_expr(self.cfg.is_swap_ab):
+            m_row = m_row + cute.assume(self.sf_c_m_offset, divby=32)
         block_m = Int32(self.cfg.output_sf_block_size_c)
         group_m = block_m * Int32(4)
+        sf_group_axis = self._sf_group_axis(output_m)
         if cutlass.const_expr(self.cfg.output_sf_block_size_c in (16, 32)):
             # These coordinates are non-negative.  Spell out the power-of-two
             # arithmetic so the DSL does not lower Python's signed // and %
@@ -1887,7 +2755,7 @@ class GmemCResource(MemoryResource):
             block_shift = 4 if self.cfg.output_sf_block_size_c == 16 else 5
             group_shift = block_shift + 2
             m_block = m_row >> Int32(block_shift)
-            m_groups = (output_m + group_m - Int32(1)) >> Int32(group_shift)
+            m_groups = (sf_group_axis + group_m - Int32(1)) >> Int32(group_shift)
             if cutlass.const_expr(self.cfg.sf_layout_c == int(SfLayout.R8c4)):
                 return (
                     (n_col >> Int32(3)) * (m_groups * Int32(32))
@@ -1903,7 +2771,7 @@ class GmemCResource(MemoryResource):
                 + (m_block & Int32(3))
             )
         m_block = m_row // block_m
-        m_groups = (output_m + group_m - Int32(1)) // group_m
+        m_groups = (sf_group_axis + group_m - Int32(1)) // group_m
         if cutlass.const_expr(self.cfg.sf_layout_c == int(SfLayout.R8c4)):
             return (
                 (n_col // Int32(8)) * (m_groups * Int32(32))
@@ -1921,17 +2789,23 @@ class GmemCResource(MemoryResource):
 
     @cute.jit
     def _fp4_tma_smem_byte_offset(self, m_local_row, n_local_col):
-        output_tile_m = Int32(self.cfg.tile_m // 2)
-        linear = n_local_col * output_tile_m + m_local_row
-        byte_offset = linear >> Int32(1)
-        swizzle_mask = ((linear >> Int32(8)) & Int32(1)) << Int32(4)
+        box_rows = Int32(self.cfg.swap_tma_store_rows)
+        row_block = m_local_row // box_rows
+        row_in_block = m_local_row % box_rows
+        box_stride = Int32(self.cfg.epi_tile_n) * box_rows
+        linear = row_block * box_stride + n_local_col * box_rows + row_in_block
+        byte_offset = linear // Int32(2)
+        swizzle_mask = self._c_tma_smem_swizzle_mask(byte_offset // Int32(128))
         return byte_offset ^ swizzle_mask
 
     @cute.jit
     def _mxfp8_tma_smem_byte_offset(self, m_local_row, n_local_col):
-        output_tile_m = Int32(self.cfg.tile_m // 2)
-        linear = n_local_col * output_tile_m + m_local_row
-        swizzle_mask = ((linear >> Int32(7)) & Int32(3)) << Int32(4)
+        box_rows = Int32(self.cfg.swap_tma_store_rows)
+        row_block = m_local_row // box_rows
+        row_in_block = m_local_row % box_rows
+        box_stride = Int32(self.cfg.epi_tile_n) * box_rows
+        linear = row_block * box_stride + n_local_col * box_rows + row_in_block
+        swizzle_mask = self._c_tma_smem_swizzle_mask(linear // Int32(128))
         return linear ^ swizzle_mask
 
     @cute.jit
@@ -1942,12 +2816,13 @@ class GmemCResource(MemoryResource):
 
     @cute.jit
     def _fp8_nongated_tma_smem_byte_offset(self, m_local_row, n_local_col):
-        row_block = m_local_row // Int32(64)
-        row_in_block = m_local_row % Int32(64)
-        linear = n_local_col * Int32(64) + row_in_block
-        swizzle_mask = ((linear // Int32(128)) % Int32(4)) * Int32(16)
-        box_bytes = Int32(64 * self.cfg.epi_tile_n)
-        return row_block * box_bytes + (linear ^ swizzle_mask)
+        box_rows = Int32(self.cfg.swap_tma_store_rows)
+        row_block = m_local_row // box_rows
+        row_in_block = m_local_row % box_rows
+        box_stride = Int32(self.cfg.epi_tile_n) * box_rows
+        linear = row_block * box_stride + n_local_col * box_rows + row_in_block
+        swizzle_mask = self._c_tma_smem_swizzle_mask(linear // Int32(128))
+        return linear ^ swizzle_mask
 
     @cute.jit
     def _stage_swap_ab_fp8_tma_vec4(
@@ -1978,8 +2853,7 @@ class GmemCResource(MemoryResource):
         tma_smem_stage,
     ):
         smem_stage_stride = Int32(
-            self.cfg.num_bytes_c_tma_store_per_group
-            * max(1, self.cfg.num_epilogue_warps // 4)
+            self.cfg.num_bytes_c_tma_store_per_group * self.cfg.num_epilogue_warpgroups
         )
         smem_offset = (
             self._mxfp8_tma_smem_byte_offset(m_local_row, n_local_col)
@@ -2122,14 +2996,24 @@ class GmemCResource(MemoryResource):
 
     @cute.jit
     def _tma_oob_c_coords(
-        self, tile_coord_m, tile_coord_n, call_idx, token_limit, warpgroup_idx
+        self,
+        tile_coord_m,
+        tile_coord_n,
+        call_idx,
+        token_limit,
+        warpgroup_idx,
+        n_slice_offset,
+        m_slice_offset,
     ):
-        m_base = tile_coord_m * Int32(self.cfg.tile_m // 2)
+        output_tile_m = self.cfg.tile_m
+        if cutlass.const_expr(self.cfg.has_gated_epilogue):
+            output_tile_m //= 2
+        m_base = tile_coord_m * Int32(output_tile_m) + m_slice_offset
         n_base = tile_coord_n * Int32(self.cfg.tile_n)
         n_subtile_offset = call_idx * Int32(self.cfg.epi_tile_n)
-        if cutlass.const_expr(self.cfg.num_epilogue_warps > 4):
+        if cutlass.const_expr(self.cfg.warp_layout.num_epilogue_warps > 4):
             n_subtile_offset = call_idx * Int32(
-                self.cfg.epi_tile_n * max(1, self.cfg.num_epilogue_warps // 4)
+                self.cfg.epi_tile_n * self.cfg.num_epilogue_warpgroups
             ) + warpgroup_idx * Int32(self.cfg.epi_tile_n)
         if cutlass.const_expr(self.cfg.use_tma_oob_opt):
             large_n = Int32(0x40000000)
@@ -2138,14 +3022,14 @@ class GmemCResource(MemoryResource):
             dist = (tile_n_i32 - limit_mod) % tile_n_i32
             return (
                 m_base,
-                n_subtile_offset + dist,
+                n_subtile_offset + n_slice_offset + dist,
                 large_n,
                 n_base - dist + large_n,
             )
-        return (m_base, n_base + n_subtile_offset)
+        return (m_base, n_base + n_subtile_offset + n_slice_offset)
 
     @cute.jit
-    def _commit_swap_ab_fp4_tma(
+    def _commit_swap_ab_packed_tma(
         self,
         tile_coord_m,
         tile_coord_n,
@@ -2159,128 +3043,421 @@ class GmemCResource(MemoryResource):
         # Uses named barrier 7 for epilogue TMA-store staging.
         # Barrier 4 is used by compact SFB STTM copy; sharing it lets the
         # epilogue and CopySfB warp-groups corrupt each other's rendezvous.
-        store_barrier_id = Int32(7) + warpgroup_idx
+        store_barrier_id = Int32(_TMA_STORE_BARRIER_BASE) + warpgroup_idx
         prims.barrier_cta_sync(
             barrier_id=store_barrier_id,
-            thread_count=128,
+            thread_count=self.cfg.epilogue_threads_per_warpgroup,
         )
         smem_stage_stride = Int32(
-            self.cfg.num_bytes_c_tma_store_per_group
-            * max(1, self.cfg.num_epilogue_warps // 4)
+            self.cfg.num_bytes_c_tma_store_per_group * self.cfg.num_epilogue_warpgroups
         )
         smem_base = self.sC.subview(
             tma_smem_stage * smem_stage_stride
             + warpgroup_idx * Int32(self.cfg.num_bytes_c_tma_store_per_group)
         )
-        group_leader = Int32(self.cfg.epilogue_warp_idx) + warpgroup_idx * Int32(4)
+        group_leader = Int32(
+            self.cfg.warp_layout.epilogue_warp_idx
+        ) + warpgroup_idx * Int32(WARPS_PER_WARPGROUP)
         should_store = (warp_idx == group_leader) & prims.elect_sync()
-        if cutlass.const_expr(self.cfg.use_tma_oob_opt):
-            n_subtile_offset = call_idx * Int32(self.cfg.epi_tile_n)
-            if cutlass.const_expr(self.cfg.num_epilogue_warps > 4):
-                n_subtile_offset = call_idx * Int32(
-                    self.cfg.epi_tile_n * max(1, self.cfg.num_epilogue_warps // 4)
-                ) + warpgroup_idx * Int32(self.cfg.epi_tile_n)
-            should_store = should_store & (n_subtile_offset < token_limit)
+        n_subtile_offset = call_idx * Int32(self.cfg.epi_tile_n)
+        if cutlass.const_expr(self.cfg.warp_layout.num_epilogue_warps > 4):
+            n_subtile_offset = call_idx * Int32(
+                self.cfg.epi_tile_n * self.cfg.num_epilogue_warpgroups
+            ) + warpgroup_idx * Int32(self.cfg.epi_tile_n)
+        for pass_idx in cutlass.range_constexpr(self.cfg.tma_store_passes):
+            n_slice_offset = Int32(pass_idx * self.cfg.tma_store_cols)
+            slice_should_store = should_store
+            if cutlass.const_expr(self.cfg.use_tma_oob_opt):
+                slice_should_store = slice_should_store & (
+                    n_subtile_offset + n_slice_offset < token_limit
+                )
+            if slice_should_store:
+                for row_pass_idx in cutlass.range_constexpr(
+                    self.cfg.swap_tma_store_row_passes
+                ):
+                    m_slice_offset = Int32(row_pass_idx * self.cfg.swap_tma_store_rows)
+                    if cutlass.const_expr(self.cfg.uses_fp4_output_quant):
+                        smem_slice_offset = self._fp4_tma_smem_byte_offset(
+                            m_slice_offset, n_slice_offset
+                        )
+                    else:
+                        smem_slice_offset = self._mxfp8_tma_smem_byte_offset(
+                            m_slice_offset, n_slice_offset
+                        )
+                    prims.cp_async_bulk_tensor_global_shared_cta(
+                        self.tma_c_desc,
+                        smem_base.subview(smem_slice_offset),
+                        self._tma_oob_c_coords(
+                            tile_coord_m,
+                            tile_coord_n,
+                            call_idx,
+                            token_limit,
+                            warpgroup_idx,
+                            n_slice_offset,
+                            m_slice_offset,
+                        ),
+                    )
         if should_store:
-            prims.cp_async_bulk_tensor_global_shared_cta(
-                self.tma_c_desc,
-                smem_base,
-                self._tma_oob_c_coords(
-                    tile_coord_m,
-                    tile_coord_n,
-                    call_idx,
-                    token_limit,
-                    warpgroup_idx,
-                ),
-            )
+            # Commit on every call, even when the token limit skipped every TMA
+            # above: multi-stage callers reuse a scratch stage after
+            # wait_group(stages - 1), which assumes one bulk group per call.
+            # A skipped commit would leave the previous same-stage store in
+            # flight while this stage is overwritten.
             prims.cp_async_bulk_commit_group()
+            # An aliased A/B producer cannot wait on this lane's TMA group.
+            # Drain only at that ownership handoff; disjoint C scratch instead
+            # remains asynchronous until its next epilogue-stage reuse.
+            if cutlass.const_expr(self.cfg.aliases_c_scratch_with_ab):
+                prims.cp_async_bulk_wait_group(0, read=True)
         prims.barrier_cta_sync(
             barrier_id=store_barrier_id,
-            thread_count=128,
+            thread_count=self.cfg.epilogue_threads_per_warpgroup,
         )
 
     @cute.jit
-    def _store_swap_ab_fp4_pair(
+    def _nvfp4_output_scale_pair(
+        self,
+        local_absmax0,
+        local_absmax1,
+        scale_c,
+        include_xor16: cutlass.Constexpr[bool],
+    ):
+        """Compute two E4M3 block scales and their matching E2M1 multipliers."""
+        local_absmax0 = cute.math.max(local_absmax0, Float32(0.0))
+        local_absmax1 = cute.math.max(local_absmax1, Float32(0.0))
+        if cutlass.const_expr(self.cfg.uses_global_scales):
+            local_absmax0, local_absmax1 = self._fmul2(
+                local_absmax0,
+                local_absmax1,
+                scale_c,
+                scale_c,
+            )
+        block_absmax0 = self._reduce_positive_max_lanes(local_absmax0, include_xor16)
+        block_absmax1 = self._reduce_positive_max_lanes(local_absmax1, include_xor16)
+        sf0, sf1 = self._fmul2(
+            block_absmax0,
+            block_absmax1,
+            Float32(1.0 / 6.0),
+            Float32(1.0 / 6.0),
+        )
+        sf_packed2, sf_rounded0, sf_rounded1 = _convert_f32x2_to_e4m3x2_and_back(
+            sf0, sf1
+        )
+        sf_for_rcp0 = cute.math.max(sf_rounded0, Float32(1.0e-12))
+        sf_for_rcp1 = cute.math.max(sf_rounded1, Float32(1.0e-12))
+        output_scale0 = cute.math.rcp(sf_for_rcp0, approx=True, ftz=True)
+        output_scale1 = cute.math.rcp(sf_for_rcp1, approx=True, ftz=True)
+        if sf_rounded0 == Float32(0.0):
+            output_scale0 = Float32(0.0)
+        if sf_rounded1 == Float32(0.0):
+            output_scale1 = Float32(0.0)
+        if cutlass.const_expr(self.cfg.uses_global_scales):
+            output_scale0, output_scale1 = self._fmul2(
+                output_scale0,
+                output_scale1,
+                scale_c,
+                scale_c,
+            )
+
+        # The packed conversion helper places sf0 in the low byte.  Return
+        # scalar bytes in column order for the SF-C stores.
+        sf_bits = Int32(sf_packed2)
+        sf_packed0 = cutlass.Int8(sf_bits & Int32(0xFF))
+        sf_packed1 = cutlass.Int8((sf_bits >> Int32(8)) & Int32(0xFF))
+        return output_scale0, sf_packed0, output_scale1, sf_packed1
+
+    @cute.jit
+    def _mx_output_scale_pair_from_absmax(self, block_absmax0, block_absmax1, scale_c):
+        """Compute two UE8M0 scales and matching MX output multipliers."""
+        max_pow2_rcp = Float32(1.0 / 256.0)
+        if cutlass.const_expr(self.cfg.uses_mxfp4_output_quant):
+            max_pow2_rcp = Float32(1.0 / 4.0)
+        sf0, sf1 = self._fmul2(
+            self._trunc_abs_float_to_pow2(block_absmax0),
+            self._trunc_abs_float_to_pow2(block_absmax1),
+            max_pow2_rcp,
+            max_pow2_rcp,
+        )
+        sf_rcp0 = self._scale_rcp_exp_only(sf0)
+        sf_rcp1 = self._scale_rcp_exp_only(sf1)
+        if sf0 == Float32(0.0):
+            sf_rcp0 = Float32(0.0)
+        if sf1 == Float32(0.0):
+            sf_rcp1 = Float32(0.0)
+
+        output_scale0 = sf_rcp0
+        output_scale1 = sf_rcp1
+        if cutlass.const_expr(self.cfg.uses_global_scales):
+            output_scale0, output_scale1 = self._fmul2(
+                output_scale0,
+                output_scale1,
+                scale_c,
+                scale_c,
+            )
+        sf_packed0 = sf0.to(cutlass.Float8E8M0FNU).bitcast(cutlass.Int8)
+        sf_packed1 = sf1.to(cutlass.Float8E8M0FNU).bitcast(cutlass.Int8)
+        return output_scale0, sf_packed0, output_scale1, sf_packed1
+
+    @cute.jit
+    def _mx_output_scale_pair(self, local_absmax0, local_absmax1, scale_c):
+        """Reduce two local M32 maxima and compute their MX output scales."""
+        local_absmax0 = cute.math.max(local_absmax0, Float32(0.0))
+        local_absmax1 = cute.math.max(local_absmax1, Float32(0.0))
+        if cutlass.const_expr(self.cfg.uses_global_scales):
+            local_absmax0, local_absmax1 = self._fmul2(
+                local_absmax0,
+                local_absmax1,
+                scale_c,
+                scale_c,
+            )
+        block_absmax0 = self._reduce_positive_max_lanes(local_absmax0, True)
+        block_absmax1 = self._reduce_positive_max_lanes(local_absmax1, True)
+        return self._mx_output_scale_pair_from_absmax(
+            block_absmax0, block_absmax1, scale_c
+        )
+
+    @cute.jit
+    def _store_swap_ab_fp4_vec4(
         self,
         result0,
         result1,
-        scale_c,
+        result2,
+        result3,
+        output_scale,
         m_row0,
         n_col,
         output_m,
         token_in_bounds,
-        output_in_bounds,
-        lane_id,
+        warpgroup_idx,
+        tma_smem_stage,
         m_local_row0,
         n_local_col,
-        store_sf_c,
     ):
-        local_absmax = self._fmax_ftz(
-            cute.math.abs(result0),
-            cute.math.abs(result1),
-        )
-        if cutlass.const_expr(self.cfg.uses_global_scales):
-            local_absmax = local_absmax * scale_c
-        block_absmax = self._reduce_fp4_absmax_m16(local_absmax)
-        sf = block_absmax * Float32(1.0 / 6.0)
-        sf_for_rcp = cute.math.max(sf, Float32(1.0e-12))
-        sf_rcp = cute.math.rcp(sf_for_rcp, approx=True, ftz=True)
+        """Scale and pack four consecutive non-gated rows as two NVFP4 bytes."""
+        scaled0, scaled1 = self._fmul2(result0, result1, output_scale, output_scale)
+        scaled2, scaled3 = self._fmul2(result2, result3, output_scale, output_scale)
+        packed01 = _convert_f32x2_to_e2m1x2(scaled1, scaled0)
+        packed23 = _convert_f32x2_to_e2m1x2(scaled3, scaled2)
+        if cutlass.const_expr(self._use_swap_ab_quant_tma_store()):
+            smem_offset = (
+                self._fp4_tma_smem_byte_offset(m_local_row0, n_local_col)
+                + tma_smem_stage
+                * Int32(
+                    self.cfg.num_bytes_c_tma_store_per_group
+                    * self.cfg.num_epilogue_warpgroups
+                )
+                + warpgroup_idx * Int32(self.cfg.num_bytes_c_tma_store_per_group)
+            )
+            self.sC.store(
+                (packed01, packed23),
+                idx=smem_offset,
+                vector_size=2,
+                alignment=2,
+            )
+        elif n_col < self.problem_n:
+            flat_idx0 = n_col * self._c_pitch(output_m) + m_row0
+            if cutlass.const_expr(self.cfg.use_tma_oob_opt):
+                if token_in_bounds:
+                    if m_row0 < output_m:
+                        self.gCBytes.store(
+                            (packed01, packed23),
+                            idx=flat_idx0 >> Int32(1),
+                            vector_size=2,
+                            alignment=2,
+                        )
+            else:
+                if m_row0 < output_m:
+                    self.gCBytes.store(
+                        (packed01, packed23),
+                        idx=flat_idx0 >> Int32(1),
+                        vector_size=2,
+                        alignment=2,
+                    )
 
-        output_scale = sf_rcp
-        if cutlass.const_expr(self.cfg.uses_global_scales):
-            output_scale = output_scale * scale_c
-        scaled0, scaled1 = self._fmul2(
-            result0,
-            result1,
-            output_scale,
-            output_scale,
+    @cute.jit
+    def _store_swap_ab_mx_vec4(
+        self,
+        result0,
+        result1,
+        result2,
+        result3,
+        output_scale,
+        m_row0,
+        n_col,
+        output_m,
+        token_in_bounds,
+        warpgroup_idx,
+        tma_smem_stage,
+        m_local_row0,
+        n_local_col,
+    ):
+        """Scale and pack four consecutive non-gated rows as MXE4M3 bytes."""
+        scaled0, scaled1 = self._fmul2(result0, result1, output_scale, output_scale)
+        scaled2, scaled3 = self._fmul2(result2, result3, output_scale, output_scale)
+        packed01 = self._pack_swap_ab_fp8_gated_tma_pair(scaled0, scaled1)
+        packed23 = self._pack_swap_ab_fp8_gated_tma_pair(scaled2, scaled3)
+        if cutlass.const_expr(self._use_swap_ab_quant_tma_store()):
+            smem_offset = (
+                self._mxfp8_tma_smem_byte_offset(m_local_row0, n_local_col)
+                + tma_smem_stage
+                * Int32(
+                    self.cfg.num_bytes_c_tma_store_per_group
+                    * self.cfg.num_epilogue_warpgroups
+                )
+                + warpgroup_idx * Int32(self.cfg.num_bytes_c_tma_store_per_group)
+            )
+            self.sCInt16.store(
+                (packed01, packed23),
+                idx=smem_offset >> Int32(1),
+                vector_size=2,
+                alignment=4,
+            )
+        elif n_col < self.problem_n:
+            flat_idx0 = n_col * self._c_pitch(output_m) + m_row0
+            if cutlass.const_expr(self.cfg.use_tma_oob_opt):
+                if token_in_bounds:
+                    if m_row0 < output_m:
+                        self.gCInt16.store(
+                            (packed01, packed23),
+                            idx=flat_idx0 >> Int32(1),
+                            vector_size=2,
+                            alignment=4,
+                        )
+            else:
+                if m_row0 < output_m:
+                    self.gCInt16.store(
+                        (packed01, packed23),
+                        idx=flat_idx0 >> Int32(1),
+                        vector_size=2,
+                        alignment=4,
+                    )
+
+    @cute.jit
+    def _store_swap_ab_fp4_pair2(
+        self,
+        result00,
+        result01,
+        result10,
+        result11,
+        scale_c,
+        m_row0,
+        n_col0,
+        output_m,
+        token_in_bounds0,
+        token_in_bounds1,
+        output_in_bounds0,
+        output_in_bounds1,
+        warpgroup_idx,
+        m_local_row0,
+        n_local_col0,
+    ):
+        """Quantize and stage two adjacent NVFP4 output-column pairs.
+
+        The two columns have independent M16 scales, but computing them
+        together exposes packed multiply and E4M3x2 conversion instructions.
+        C remains byte-stored because adjacent columns are not adjacent in the
+        swapAB TMA scratch layout.
+        """
+        local_absmax0 = self._fmax_ftz(
+            cute.math.abs(result00),
+            cute.math.abs(result01),
+        )
+        local_absmax1 = self._fmax_ftz(
+            cute.math.abs(result10),
+            cute.math.abs(result11),
+        )
+        (
+            output_scale0,
+            sf_packed0,
+            output_scale1,
+            sf_packed1,
+        ) = self._nvfp4_output_scale_pair(
+            local_absmax0,
+            local_absmax1,
+            scale_c,
+            True,
+        )
+        scaled00, scaled01 = self._fmul2(
+            result00,
+            result01,
+            output_scale0,
+            output_scale0,
+        )
+        scaled10, scaled11 = self._fmul2(
+            result10,
+            result11,
+            output_scale1,
+            output_scale1,
         )
         # NVVM's e2m1x2 conversion operand order maps the second source to the
         # low nibble.  Store row0 in the low nibble to match trtllm-gen packing.
-        packed = _convert_f32x2_to_e2m1x2(scaled1, scaled0)
+        packed0 = _convert_f32x2_to_e2m1x2(scaled01, scaled00)
+        packed1 = _convert_f32x2_to_e2m1x2(scaled11, scaled10)
 
         if cutlass.const_expr(self.cfg.use_tma_store):
-            smem_offset = self._fp4_tma_smem_byte_offset(m_local_row0, n_local_col)
-            self.sC.subview(smem_offset).store(packed)
-        elif output_in_bounds:
+            # Wide FC1 tiles use two epilogue warpgroups, each with a distinct
+            # TMA-store scratch segment.  Keep their staged FP4 bytes disjoint.
+            smem_group_offset = warpgroup_idx * Int32(
+                self.cfg.num_bytes_c_tma_store_per_group
+            )
+            smem_offset0 = (
+                self._fp4_tma_smem_byte_offset(m_local_row0, n_local_col0)
+                + smem_group_offset
+            )
+            smem_offset1 = (
+                self._fp4_tma_smem_byte_offset(m_local_row0, n_local_col0 + Int32(1))
+                + smem_group_offset
+            )
+            self.sC.subview(smem_offset0).store(packed0)
+            self.sC.subview(smem_offset1).store(packed1)
+        else:
             if cutlass.const_expr(self.cfg.use_tma_oob_opt):
-                if token_in_bounds:
-                    flat_idx0 = n_col * output_m + m_row0
-                    self.gCBytes.subview(flat_idx0 >> Int32(1)).store(packed)
+                if output_in_bounds0 & token_in_bounds0:
+                    flat_idx0 = n_col0 * self._c_pitch(output_m) + m_row0
+                    self.gCBytes.subview(flat_idx0 // Int32(2)).store(packed0)
+                if output_in_bounds1 & token_in_bounds1:
+                    flat_idx1 = (n_col0 + Int32(1)) * self._c_pitch(output_m) + m_row0
+                    self.gCBytes.subview(flat_idx1 // Int32(2)).store(packed1)
             else:
-                flat_idx0 = n_col * output_m + m_row0
-                self.gCBytes.subview(flat_idx0 >> Int32(1)).store(packed)
+                if output_in_bounds0:
+                    flat_idx0 = n_col0 * self._c_pitch(output_m) + m_row0
+                    self.gCBytes.subview(flat_idx0 // Int32(2)).store(packed0)
+                if output_in_bounds1:
+                    flat_idx1 = (n_col0 + Int32(1)) * self._c_pitch(output_m) + m_row0
+                    self.gCBytes.subview(flat_idx1 // Int32(2)).store(packed1)
 
-        sf_packed = sf.to(cutlass.Float8E4M3FN).bitcast(cutlass.Int8)
-        if cutlass.const_expr(store_sf_c):
-            if (lane_id >> Int32(2)) == Int32(0):
-                sf_idx = self._sf_c_index(m_row0, n_col, output_m)
-                if (n_col < self.problem_n) & (m_row0 < output_m):
-                    if cutlass.const_expr(self.cfg.use_tma_oob_opt):
-                        if token_in_bounds:
-                            self.gSfCBytes.subview(sf_idx).store(sf_packed)
-                    else:
-                        self.gSfCBytes.subview(sf_idx).store(sf_packed)
-        return sf_packed
+        return sf_packed0, sf_packed1
 
     @cute.jit
-    def _select_int8_from_8(self, values, selector):
-        """Select one of eight packed bytes without staged control-flow."""
+    def _select_int8(self, values, selector):
+        """Select one of one, two, four, or eight packed bytes with ``selp``."""
+
+        if cutlass.const_expr(len(values) == 1):
+            return values[0]
 
         select_bit0 = (selector & Int32(1)) != Int32(0)
-        select_bit1 = (selector & Int32(2)) != Int32(0)
-        select_bit2 = (selector & Int32(4)) != Int32(0)
-
         pair0 = prims.inline_ptx_hl(
             "selp.b32 {$w0}, {$r0}, {$r1}, {$r2};",
             write_only_types=[Int32],
             read_only_args=[Int32(values[1]), Int32(values[0]), select_bit0],
         )
+        if cutlass.const_expr(len(values) == 2):
+            return pair0.to(cutlass.Int8)
+
+        select_bit1 = (selector & Int32(2)) != Int32(0)
         pair1 = prims.inline_ptx_hl(
             "selp.b32 {$w0}, {$r0}, {$r1}, {$r2};",
             write_only_types=[Int32],
             read_only_args=[Int32(values[3]), Int32(values[2]), select_bit0],
         )
+        quad0 = prims.inline_ptx_hl(
+            "selp.b32 {$w0}, {$r0}, {$r1}, {$r2};",
+            write_only_types=[Int32],
+            read_only_args=[pair1, pair0, select_bit1],
+        )
+        if cutlass.const_expr(len(values) == 4):
+            return quad0.to(cutlass.Int8)
+
         pair2 = prims.inline_ptx_hl(
             "selp.b32 {$w0}, {$r0}, {$r1}, {$r2};",
             write_only_types=[Int32],
@@ -2291,11 +3468,7 @@ class GmemCResource(MemoryResource):
             write_only_types=[Int32],
             read_only_args=[Int32(values[7]), Int32(values[6]), select_bit0],
         )
-        quad0 = prims.inline_ptx_hl(
-            "selp.b32 {$w0}, {$r0}, {$r1}, {$r2};",
-            write_only_types=[Int32],
-            read_only_args=[pair1, pair0, select_bit1],
-        )
+        select_bit2 = (selector & Int32(4)) != Int32(0)
         quad1 = prims.inline_ptx_hl(
             "selp.b32 {$w0}, {$r0}, {$r1}, {$r2};",
             write_only_types=[Int32],
@@ -2312,13 +3485,12 @@ class GmemCResource(MemoryResource):
     def _store_swap_ab_quant_sf_epi32(
         self,
         sf_values,
-        m_tile_base,
+        m_row,
         n_tile_base,
         n_subtile_offset,
         token_limit,
         output_m,
         lane_id,
-        warp_in_epi4,
     ):
         """Store an epi-N32 quantization SF-C fragment with one warp store.
 
@@ -2328,13 +3500,12 @@ class GmemCResource(MemoryResource):
         """
 
         selector = lane_id >> Int32(2)
-        sf_packed = self._select_int8_from_8(sf_values, selector)
+        sf_packed = self._select_int8(sf_values, selector)
         n_local_col = (
             (selector >> Int32(1)) * Int32(8)
             + (lane_id & Int32(3)) * Int32(2)
             + (selector & Int32(1))
         )
-        m_row = (m_tile_base >> Int32(1)) + warp_in_epi4 * Int32(16)
         n_col = n_tile_base + n_local_col
         sf_idx = self._sf_c_index(m_row, n_col, output_m)
         output_in_bounds = (n_col < self.problem_n) & (m_row < output_m)
@@ -2350,13 +3521,12 @@ class GmemCResource(MemoryResource):
     def _store_swap_ab_quant_sf_epi64(
         self,
         sf_values,
-        m_tile_base,
+        m_row,
         n_tile_base,
         n_subtile_offset,
         token_limit,
         output_m,
         lane_id,
-        warp_in_epi4,
     ):
         """Store an epi-N64 SF-C fragment as two coalesced warp stores."""
 
@@ -2366,10 +3536,9 @@ class GmemCResource(MemoryResource):
             + (lane_id & Int32(3)) * Int32(2)
             + (selector & Int32(1))
         )
-        m_row = (m_tile_base >> Int32(1)) + warp_in_epi4 * Int32(16)
         for half in cutlass.range_constexpr(2):
             value_base = half * 8
-            sf_packed = self._select_int8_from_8(
+            sf_packed = self._select_int8(
                 sf_values[value_base : value_base + 8], selector
             )
             n_local_col = lane_col + Int32(half * 32)
@@ -2377,6 +3546,52 @@ class GmemCResource(MemoryResource):
             sf_idx = self._sf_c_index(m_row, n_col, output_m)
             output_in_bounds = (n_col < self.problem_n) & (m_row < output_m)
             if output_in_bounds:
+                if cutlass.const_expr(self.cfg.use_tma_oob_opt):
+                    token_in_bounds = (n_subtile_offset + n_local_col) < token_limit
+                    if token_in_bounds:
+                        self.gSfCBytes.subview(sf_idx).store(sf_packed)
+                else:
+                    self.gSfCBytes.subview(sf_idx).store(sf_packed)
+
+    @cute.jit
+    def _store_swap_ab_nongated_nvfp4_sf(
+        self,
+        sf_values,
+        m_tile_base,
+        n_tile_base,
+        n_subtile_offset,
+        token_limit,
+        output_m,
+        lane_id,
+        warp_in_epi4,
+    ):
+        """Store both M16 scale rows owned by one non-gated output warp."""
+
+        lane_group = lane_id >> Int32(2)
+        selector = lane_group & Int32(3)
+        m_row = (
+            m_tile_base
+            + warp_in_epi4 * Int32(32)
+            + (lane_group >> Int32(2)) * Int32(16)
+        )
+        num_sf_values = self.cfg.epi_tile_n // 4
+        num_store_groups = (num_sf_values + 3) // 4
+        for store_group in cutlass.range_constexpr(num_store_groups):
+            sf_base = store_group * 4
+            sf_values_in_group = min(4, num_sf_values - sf_base)
+            sf_packed = self._select_int8(
+                sf_values[sf_base : sf_base + sf_values_in_group], selector
+            )
+            sf_slot = Int32(sf_base) + selector
+            sf_col_offset = (sf_slot // Int32(2)) * Int32(8) + sf_slot % Int32(2)
+            n_local_col = (lane_id & Int32(3)) * Int32(2) + sf_col_offset
+            n_col = n_tile_base + n_local_col
+            if (
+                (selector < Int32(sf_values_in_group))
+                & (m_row < output_m)
+                & (n_col < self.problem_n)
+            ):
+                sf_idx = self._sf_c_index(m_row, n_col, output_m)
                 if cutlass.const_expr(self.cfg.use_tma_oob_opt):
                     token_in_bounds = (n_subtile_offset + n_local_col) < token_limit
                     if token_in_bounds:
@@ -2491,34 +3706,9 @@ class GmemCResource(MemoryResource):
             lane_id,
             scale_pair,
         )
-        max_pow2_rcp = Float32(1.0 / 256.0)
-        if cutlass.const_expr(self.cfg.uses_mxfp4_output_quant):
-            max_pow2_rcp = Float32(1.0 / 4.0)
-        sf0, sf1 = self._fmul2(
-            self._trunc_abs_float_to_pow2(block_absmax0),
-            self._trunc_abs_float_to_pow2(block_absmax1),
-            max_pow2_rcp,
-            max_pow2_rcp,
+        return self._mx_output_scale_pair_from_absmax(
+            block_absmax0, block_absmax1, scale_c
         )
-        sf_rcp0 = self._scale_rcp_exp_only(sf0)
-        sf_rcp1 = self._scale_rcp_exp_only(sf1)
-        if sf0 == Float32(0.0):
-            sf_rcp0 = Float32(0.0)
-        if sf1 == Float32(0.0):
-            sf_rcp1 = Float32(0.0)
-
-        output_scale0 = sf_rcp0
-        output_scale1 = sf_rcp1
-        if cutlass.const_expr(self.cfg.uses_global_scales):
-            output_scale0, output_scale1 = self._fmul2(
-                output_scale0,
-                output_scale1,
-                scale_c,
-                scale_c,
-            )
-        sf_packed0 = sf0.to(cutlass.Float8E8M0FNU).bitcast(cutlass.Int8)
-        sf_packed1 = sf1.to(cutlass.Float8E8M0FNU).bitcast(cutlass.Int8)
-        return output_scale0, sf_packed0, output_scale1, sf_packed1
 
     @cute.jit
     def _mx_output_store_phase(
@@ -2559,7 +3749,7 @@ class GmemCResource(MemoryResource):
                 ) + warpgroup_idx * Int32(self.cfg.num_bytes_c_tma_store_per_group)
                 self.sCInt16.subview(smem_offset0 >> Int32(1)).store(packed)
         elif output_in_bounds:
-            flat_idx0 = n_col * output_m + m_row0
+            flat_idx0 = n_col * self._c_pitch(output_m) + m_row0
             if cutlass.const_expr(self.cfg.uses_mxfp4_output_quant):
                 packed = _convert_f32x2_to_e2m1x2(scaled1, scaled0)
                 if cutlass.const_expr(self.cfg.use_tma_oob_opt):
@@ -2592,6 +3782,239 @@ class GmemCResource(MemoryResource):
         return sf_packed
 
     @cute.jit
+    def _store_swap_ab_nongated_quant(
+        self,
+        t2r_rmem,
+        t2r_slice1,
+        tile_coord_m,
+        tile_coord_n,
+        call_idx,
+        warp_idx,
+        warpgroup_idx,
+        warp_in_epi4,
+        lane_id,
+        m_tile_base,
+        n_tile_base,
+        n_subtile_offset,
+        base_tmem_col,
+        base_row_idx,
+        expert_idx,
+        output_m,
+        token_limit,
+        scale_c,
+        scale_gate,
+        is_eltwise_act: cutlass.Constexpr[bool],
+    ):
+        """Quantize a non-gated swapAB fragment to NVFP4 or MXE4M3."""
+        tma_stage_count = self.cfg.num_swap_ab_nongated_quant_tma_stages
+        tma_smem_stage = call_idx % Int32(tma_stage_count)
+        if cutlass.const_expr(self._use_swap_ab_quant_tma_store()):
+            prims.cp_async_bulk_wait_group(tma_stage_count - 1, read=True)
+            prims.barrier_cta_sync(
+                barrier_id=Int32(_TMA_STORE_BARRIER_BASE) + warpgroup_idx,
+                thread_count=self.cfg.epilogue_threads_per_warpgroup,
+            )
+
+        sf_values = []
+        for group in cutlass.range_constexpr(self.cfg.epi_tile_n // 8):
+            col_off = Int32(group * 8)
+            result0_vals = []
+            result1_vals = []
+            result2_vals = []
+            result3_vals = []
+            local_abs_vals = []
+            for col_sub in cutlass.range_constexpr(2):
+                tmem_col = base_tmem_col + col_off + Int32(col_sub)
+                reg0 = group * 4 + col_sub
+                reg1 = group * 4 + 2 + col_sub
+                result0 = self._maybe_apply_per_token_sf_a(t2r_rmem[reg0], base_row_idx)
+                result1 = self._maybe_apply_per_token_sf_a(
+                    t2r_rmem[reg1], base_row_idx + Int32(1)
+                )
+                result2 = self._maybe_apply_per_token_sf_a(
+                    t2r_slice1[reg0], base_row_idx + Int32(2)
+                )
+                result3 = self._maybe_apply_per_token_sf_a(
+                    t2r_slice1[reg1], base_row_idx + Int32(3)
+                )
+                if cutlass.const_expr(self.cfg.has_per_token_sf_b):
+                    local_token_col = n_subtile_offset + tmem_col
+                    token_sf = self._load_per_token_sf_b(local_token_col)
+                    result0, result1 = self._fmul2(result0, result1, token_sf, token_sf)
+                    result2, result3 = self._fmul2(result2, result3, token_sf, token_sf)
+                result0 = self._maybe_add_bias_m(
+                    result0,
+                    expert_idx,
+                    m_tile_base + base_row_idx,
+                    base_row_idx,
+                )
+                result1 = self._maybe_add_bias_m(
+                    result1,
+                    expert_idx,
+                    m_tile_base + base_row_idx + Int32(1),
+                    base_row_idx + Int32(1),
+                )
+                result2 = self._maybe_add_bias_m(
+                    result2,
+                    expert_idx,
+                    m_tile_base + base_row_idx + Int32(2),
+                    base_row_idx + Int32(2),
+                )
+                result3 = self._maybe_add_bias_m(
+                    result3,
+                    expert_idx,
+                    m_tile_base + base_row_idx + Int32(3),
+                    base_row_idx + Int32(3),
+                )
+                if cutlass.const_expr(is_eltwise_act):
+                    result0, result1 = self._apply_eltwise_act_pair(
+                        result0, result1, scale_gate
+                    )
+                    result2, result3 = self._apply_eltwise_act_pair(
+                        result2, result3, scale_gate
+                    )
+                local_abs01 = self._fmax_ftz(
+                    cute.math.abs(result0), cute.math.abs(result1)
+                )
+                local_abs23 = self._fmax_ftz(
+                    cute.math.abs(result2), cute.math.abs(result3)
+                )
+                local_abs_vals.append(self._fmax_ftz(local_abs01, local_abs23))
+                result0_vals.append(result0)
+                result1_vals.append(result1)
+                result2_vals.append(result2)
+                result3_vals.append(result3)
+
+            if cutlass.const_expr(self.cfg.dtype_c == int(DType.E2M1)):
+                (
+                    output_scale0,
+                    sf_packed0,
+                    output_scale1,
+                    sf_packed1,
+                ) = self._nvfp4_output_scale_pair(
+                    local_abs_vals[0],
+                    local_abs_vals[1],
+                    scale_c,
+                    False,
+                )
+            else:
+                (
+                    output_scale0,
+                    sf_packed0,
+                    output_scale1,
+                    sf_packed1,
+                ) = self._mx_output_scale_pair(
+                    local_abs_vals[0], local_abs_vals[1], scale_c
+                )
+            sf_values.append(sf_packed0)
+            sf_values.append(sf_packed1)
+
+            for col_sub in cutlass.range_constexpr(2):
+                tmem_col = base_tmem_col + col_off + Int32(col_sub)
+                n_col = n_tile_base + tmem_col
+                token_in_bounds = (n_subtile_offset + tmem_col) < token_limit
+                output_scale = output_scale0
+                sf_packed = sf_packed0
+                if col_sub == 1:
+                    output_scale = output_scale1
+                    sf_packed = sf_packed1
+                m_row0 = m_tile_base + base_row_idx
+                if cutlass.const_expr(self.cfg.dtype_c == int(DType.E2M1)):
+                    self._store_swap_ab_fp4_vec4(
+                        result0_vals[col_sub],
+                        result1_vals[col_sub],
+                        result2_vals[col_sub],
+                        result3_vals[col_sub],
+                        output_scale,
+                        m_row0,
+                        n_col,
+                        output_m,
+                        token_in_bounds,
+                        warpgroup_idx,
+                        tma_smem_stage,
+                        base_row_idx,
+                        tmem_col,
+                    )
+                else:
+                    self._store_swap_ab_mx_vec4(
+                        result0_vals[col_sub],
+                        result1_vals[col_sub],
+                        result2_vals[col_sub],
+                        result3_vals[col_sub],
+                        output_scale,
+                        m_row0,
+                        n_col,
+                        output_m,
+                        token_in_bounds,
+                        warpgroup_idx,
+                        tma_smem_stage,
+                        base_row_idx,
+                        tmem_col,
+                    )
+                if cutlass.const_expr(
+                    self.cfg.dtype_c != int(DType.E2M1)
+                    and self.cfg.epi_tile_n not in (32, 64)
+                ):
+                    lane_group = lane_id >> Int32(2)
+                    sf_m_row = m_tile_base + warp_in_epi4 * Int32(32)
+                    if (
+                        (lane_group == Int32(0))
+                        & (sf_m_row < output_m)
+                        & (n_col < self.problem_n)
+                    ):
+                        sf_idx = self._sf_c_index(sf_m_row, n_col, output_m)
+                        if cutlass.const_expr(self.cfg.use_tma_oob_opt):
+                            if token_in_bounds:
+                                self.gSfCBytes.subview(sf_idx).store(sf_packed)
+                        else:
+                            self.gSfCBytes.subview(sf_idx).store(sf_packed)
+
+        if cutlass.const_expr(self.cfg.dtype_c == int(DType.E2M1)):
+            self._store_swap_ab_nongated_nvfp4_sf(
+                sf_values,
+                m_tile_base,
+                n_tile_base,
+                n_subtile_offset,
+                token_limit,
+                output_m,
+                lane_id,
+                warp_in_epi4,
+            )
+        elif cutlass.const_expr(self.cfg.epi_tile_n in (32, 64)):
+            sf_m_row = m_tile_base + warp_in_epi4 * Int32(32)
+            if cutlass.const_expr(self.cfg.epi_tile_n == 32):
+                self._store_swap_ab_quant_sf_epi32(
+                    sf_values,
+                    sf_m_row,
+                    n_tile_base,
+                    n_subtile_offset,
+                    token_limit,
+                    output_m,
+                    lane_id,
+                )
+            else:
+                self._store_swap_ab_quant_sf_epi64(
+                    sf_values,
+                    sf_m_row,
+                    n_tile_base,
+                    n_subtile_offset,
+                    token_limit,
+                    output_m,
+                    lane_id,
+                )
+
+        if cutlass.const_expr(self._use_swap_ab_quant_tma_store()):
+            self._commit_swap_ab_packed_tma(
+                tile_coord_m,
+                tile_coord_n,
+                call_idx,
+                token_limit,
+                warp_idx,
+                warpgroup_idx,
+                tma_smem_stage,
+            )
+
+    @cute.jit
     def _store_swap_ab_16x256b(
         self, t2r_rmem, t2r_rmem_1, tile_coord_m, tile_coord_n, call_idx, warp_idx
     ):
@@ -2617,7 +4040,7 @@ class GmemCResource(MemoryResource):
         lane_id = tidx & Int32(31)
 
         m_tile_base = tile_coord_m * Int32(self.cfg.tile_m)
-        warpgroup_count = max(1, self.cfg.num_epilogue_warps // 4)
+        warpgroup_count = self.cfg.num_epilogue_warpgroups
         n_warpgroup_count = warpgroup_count
         n_warpgroup_idx = warpgroup_idx
         if cutlass.const_expr(self.cfg.has_deepseek_fp8_two_epilogue):
@@ -2638,10 +4061,9 @@ class GmemCResource(MemoryResource):
         is_gated_act = cutlass.const_expr(
             (self.cfg.act_kind == int(ActKind.SWIGLU))
             or (self.cfg.act_kind == int(ActKind.GEGLU))
-            or (self.cfg.act_kind == int(ActKind.SILU))
             or (self.cfg.act_kind == int(ActKind.SITU))
         )
-        is_eltwise_relu = cutlass.const_expr(self.cfg.act_kind == int(ActKind.RELU2))
+        is_eltwise_act = cutlass.const_expr(self.cfg.has_eltwise_act)
         output_m = self.problem_m
         if cutlass.const_expr(is_gated_act):
             output_m = self.problem_m >> Int32(1)
@@ -2659,12 +4081,20 @@ class GmemCResource(MemoryResource):
         if cutlass.const_expr(
             self.cfg.has_deepseek_fp8_two_epilogue
             and (
-                self.cfg.dtype_c_kind == int(DType.BF16)
-                or self.cfg.dtype_c_kind == int(DType.FP16)
+                self.cfg.dtype_c == int(DType.BF16)
+                or self.cfg.dtype_c == int(DType.FP16)
             )
             and self.cfg.use_tma_store
             and not is_gated_act
         ):
+            # Each split-M warpgroup owns a disjoint scratch tile.  The lane
+            # that issued its previous TMA waits, then all four writer warps
+            # rendezvous before any of them starts overwriting that tile.
+            prims.cp_async_bulk_wait_group(0, read=True)
+            prims.barrier_cta_sync(
+                barrier_id=Int32(_TMA_STORE_BARRIER_BASE) + warpgroup_idx,
+                thread_count=self.cfg.epilogue_threads_per_warpgroup,
+            )
             for group in cutlass.range_constexpr(self.cfg.epi_tile_n // 8):
                 col_off = Int32(group * 8)
                 for col_sub in cutlass.range_constexpr(2):
@@ -2683,11 +4113,10 @@ class GmemCResource(MemoryResource):
                         m_tile_base + base_row_idx + Int32(1),
                         base_row_idx + Int32(1),
                     )
-                    if cutlass.const_expr(is_eltwise_relu):
-                        val0_f32 = cute.math.max(val0_f32, Float32(0.0))
-                        val1_f32 = cute.math.max(val1_f32, Float32(0.0))
-                        val0_f32 = val0_f32 * val0_f32
-                        val1_f32 = val1_f32 * val1_f32
+                    if cutlass.const_expr(is_eltwise_act):
+                        val0_f32, val1_f32 = self._apply_eltwise_act_pair(
+                            val0_f32, val1_f32, scale_gate
+                        )
                     val0_f32 = self._maybe_apply_scale_c(val0_f32, scale_c)
                     val1_f32 = self._maybe_apply_scale_c(val1_f32, scale_c)
                     self._stage_swap_ab_bf16_dsfp8_tma_pair(
@@ -2710,11 +4139,13 @@ class GmemCResource(MemoryResource):
         # Process both slices
         if cutlass.const_expr(is_gated_act):
             if cutlass.const_expr(self._use_swap_ab_quant_tma_store()):
-                # The same epilogue scratch tile is reused for
-                # the next TMA store, so wait for the prior bulk store before any
-                # warp overwrites SMEM for this tile.
+                # Protect the scratch stage before its first writer below.
+                # Plain FP8 FC1 tileN=128/256 writes multiple epilogue
+                # subtiles per C tile.  Use the existing two C scratch
+                # stages so one TMA store can remain in flight while the
+                # next subtile is staged into the other buffer.
                 num_subtiles = self.cfg.tile_n // (
-                    self.cfg.epi_tile_n * max(1, self.cfg.num_epilogue_warps // 4)
+                    self.cfg.epi_tile_n * self.cfg.num_epilogue_warpgroups
                 )
                 can_overlap_stores = (
                     self.cfg.uses_fp8_output
@@ -2732,29 +4163,35 @@ class GmemCResource(MemoryResource):
                         prims.cp_async_bulk_wait_group(pending_groups, read=True)
                 else:
                     prims.cp_async_bulk_wait_group(pending_groups, read=True)
-                # Only the warp-group leader owns the TMA store group, so the
-                # other epilogue threads return from wait_group immediately.
-                # Rendezvous before reusing the shared-memory scratch tile;
-                # otherwise they can overwrite data still being consumed by
-                # the previous subtile's TMA store.
-                store_barrier_id = Int32(7) + warpgroup_idx
-                prims.barrier_cta_sync(
-                    barrier_id=store_barrier_id,
-                    thread_count=128,
-                )
-            if cutlass.const_expr(self.cfg.has_epilogue_quant):
-                # MX output paths collect scale bytes in a local Python list so
-                # scale computation is batched, then stores SF-C through the
-                # same per-scale predicate path as C.  Keeping the C/SF-C
-                # predicates together avoids stale scale stores on large
-                # swapAB hidden-M grids.
+                if cutlass.const_expr(
+                    self.cfg.has_output_block_scaling or self.cfg.uses_fp8_output
+                ):
+                    # Packed output scratch is partitioned per warpgroup.
+                    prims.barrier_cta_sync(
+                        barrier_id=Int32(_TMA_STORE_BARRIER_BASE) + warpgroup_idx,
+                        thread_count=self.cfg.epilogue_threads_per_warpgroup,
+                    )
+                else:
+                    # The gated 16-bit path uses one tile shared by every
+                    # epilogue writer warp.
+                    prims.barrier_cta_sync(
+                        barrier_id=_TMA_STORE_BARRIER_BASE,
+                        thread_count=self.cfg.warp_layout.num_epilogue_warps
+                        * WARP_SIZE,
+                    )
+            if cutlass.const_expr(self.cfg.has_output_block_scaling):
+                # Quantized output paths collect values or scale bytes in
+                # register lists before their batched reduction/conversion or
+                # lane-redistributed SF-C store below.
                 mx_result0_vals = []
                 mx_result1_vals = []
                 mx_output_scale_vals = []
                 mx_sf_c_vals = []
-                fp4_sf_c_vals = []
+                nvfp4_sf_c_vals = []
                 for group in cutlass.range_constexpr(self.cfg.epi_tile_n // 8):
                     col_off = Int32(group * 8)
+                    nvfp4_result0_vals = []
+                    nvfp4_result1_vals = []
                     for col_sub in cutlass.range_constexpr(2):
                         gate_idx = group * 4 + col_sub
                         up_idx = group * 4 + 2 + col_sub
@@ -2828,48 +4265,44 @@ class GmemCResource(MemoryResource):
                             mx_result0_vals.append(result0)
                             mx_result1_vals.append(result1)
                         else:
-                            sf_packed = self._store_swap_ab_fp4_pair(
-                                result0,
-                                result1,
-                                scale_c,
-                                m_row0,
-                                n_col,
-                                output_m,
-                                token_in_bounds,
-                                output_in_bounds,
-                                lane_id,
-                                m_local_row0,
-                                tmem_col_even,
-                                self.cfg.epi_tile_n not in (32, 64),
-                            )
-                            if cutlass.const_expr(self.cfg.epi_tile_n in (32, 64)):
-                                fp4_sf_c_vals.append(sf_packed)
-                if cutlass.const_expr(
-                    not self.cfg.uses_mx_output_quant
-                    and self.cfg.epi_tile_n in (32, 64)
-                ):
-                    if cutlass.const_expr(self.cfg.epi_tile_n == 32):
-                        self._store_swap_ab_quant_sf_epi32(
-                            fp4_sf_c_vals,
-                            m_tile_base,
-                            n_tile_base,
-                            n_subtile_offset,
-                            token_limit,
-                            output_m,
-                            lane_id,
-                            warp_in_epi4,
+                            nvfp4_result0_vals.append(result0)
+                            nvfp4_result1_vals.append(result1)
+                    if cutlass.const_expr(not self.cfg.uses_mx_output_quant):
+                        n_local_col0 = base_tmem_col + col_off
+                        n_col0 = n_tile_base + n_local_col0
+                        token_in_bounds0 = (
+                            n_subtile_offset + n_local_col0
+                        ) < token_limit
+                        token_in_bounds1 = (
+                            n_subtile_offset + n_local_col0 + Int32(1)
+                        ) < token_limit
+                        m_row0 = m_tile_base // Int32(2) + base_row_idx
+                        m_row1 = m_row0 + Int32(1)
+                        output_in_bounds0 = (m_row1 < output_m) & (
+                            n_col0 < self.problem_n
                         )
-                    else:
-                        self._store_swap_ab_quant_sf_epi64(
-                            fp4_sf_c_vals,
-                            m_tile_base,
-                            n_tile_base,
-                            n_subtile_offset,
-                            token_limit,
-                            output_m,
-                            lane_id,
-                            warp_in_epi4,
+                        output_in_bounds1 = (m_row1 < output_m) & (
+                            n_col0 + Int32(1) < self.problem_n
                         )
+                        sf_packed0, sf_packed1 = self._store_swap_ab_fp4_pair2(
+                            nvfp4_result0_vals[0],
+                            nvfp4_result1_vals[0],
+                            nvfp4_result0_vals[1],
+                            nvfp4_result1_vals[1],
+                            scale_c,
+                            m_row0,
+                            n_col0,
+                            output_m,
+                            token_in_bounds0,
+                            token_in_bounds1,
+                            output_in_bounds0,
+                            output_in_bounds1,
+                            warpgroup_idx,
+                            base_row_idx,
+                            n_local_col0,
+                        )
+                        nvfp4_sf_c_vals.append(sf_packed0)
+                        nvfp4_sf_c_vals.append(sf_packed1)
                 if cutlass.const_expr(self.cfg.uses_mx_output_quant):
                     # Phase 1: after all activation outputs are available,
                     # reduce/store adjacent MX scale slots as paired f32
@@ -2893,8 +4326,9 @@ class GmemCResource(MemoryResource):
                     # once instead of per-(group, col_sub). This replaces 2×N
                     # bar.sync calls with just 2.
                     prims.barrier_cta_sync(
-                        barrier_id=9,
-                        thread_count=self.cfg.num_epilogue_warps * 32,
+                        barrier_id=_EPILOGUE_BARRIER_ID,
+                        thread_count=self.cfg.warp_layout.num_epilogue_warps
+                        * WARP_SIZE,
                     )
                     # Phase 2a: compute all SF/output scales first so the
                     # dependent multiply/convert/store block is packed.
@@ -2955,32 +4389,71 @@ class GmemCResource(MemoryResource):
                         if (warp_in_epi4 & Int32(1)) == Int32(0):
                             self._store_swap_ab_quant_sf_epi32(
                                 mx_sf_c_vals,
-                                m_tile_base,
+                                (m_tile_base >> Int32(1)) + warp_in_epi4 * Int32(16),
                                 n_tile_base,
                                 n_subtile_offset,
                                 token_limit,
                                 output_m,
                                 lane_id,
-                                warp_in_epi4,
                             )
                     elif cutlass.const_expr(self.cfg.epi_tile_n == 64):
                         if (warp_in_epi4 & Int32(1)) == Int32(0):
                             self._store_swap_ab_quant_sf_epi64(
                                 mx_sf_c_vals,
-                                m_tile_base,
+                                (m_tile_base >> Int32(1)) + warp_in_epi4 * Int32(16),
                                 n_tile_base,
                                 n_subtile_offset,
                                 token_limit,
                                 output_m,
                                 lane_id,
-                                warp_in_epi4,
                             )
                     prims.barrier_cta_sync(
-                        barrier_id=9,
-                        thread_count=self.cfg.num_epilogue_warps * 32,
+                        barrier_id=_EPILOGUE_BARRIER_ID,
+                        thread_count=self.cfg.warp_layout.num_epilogue_warps
+                        * WARP_SIZE,
                     )
+                else:
+                    # Each lane owns epi_tile_n/4 M16 scales at column offsets
+                    # [0, 1, 8, 9, ...] relative to its lane%4 base.  Move
+                    # groups of eight register values across the lane/4 groups
+                    # so all 32 lanes issue one static SF-C store per group.
+                    # For the target epi_tile_n=64 kernel this is the same two-
+                    # store mapping as TRTLLM-gen and replaces 16 separately
+                    # predicated address/store sites.  The final predicate
+                    # also supports smaller 8- and 32-column epilogues.
+                    thread_group = lane_id // Int32(4)
+                    num_sf_vals = self.cfg.epi_tile_n // 4
+                    num_sf_store_groups = (num_sf_vals + 7) // 8
+                    for store_half in cutlass.range_constexpr(num_sf_store_groups):
+                        sf_base = store_half * 8
+                        sf_packed = nvfp4_sf_c_vals[sf_base]
+                        sf_vals_in_group = min(8, num_sf_vals - sf_base)
+                        for sf_select in cutlass.range_constexpr(1, sf_vals_in_group):
+                            if thread_group == Int32(sf_select):
+                                sf_packed = nvfp4_sf_c_vals[sf_base + sf_select]
+
+                        sf_slot = Int32(sf_base) + thread_group
+                        sf_col_offset = (sf_slot // Int32(2)) * Int32(
+                            8
+                        ) + sf_slot % Int32(2)
+                        sf_n_col = n_tile_base + base_tmem_col + sf_col_offset
+                        sf_m_row = m_tile_base // Int32(2) + base_row_idx
+                        sf_token_in_bounds = (
+                            n_subtile_offset + base_tmem_col + sf_col_offset
+                        ) < token_limit
+                        sf_idx = self._sf_c_index(sf_m_row, sf_n_col, output_m)
+                        if (
+                            (thread_group < Int32(sf_vals_in_group))
+                            & (sf_n_col < self.problem_n)
+                            & (sf_m_row < output_m)
+                        ):
+                            if cutlass.const_expr(self.cfg.use_tma_oob_opt):
+                                if sf_token_in_bounds:
+                                    self.gSfCBytes.subview(sf_idx).store(sf_packed)
+                            else:
+                                self.gSfCBytes.subview(sf_idx).store(sf_packed)
                 if cutlass.const_expr(self._use_swap_ab_quant_tma_store()):
-                    self._commit_swap_ab_fp4_tma(
+                    self._commit_swap_ab_packed_tma(
                         tile_coord_m,
                         tile_coord_n,
                         call_idx,
@@ -2991,8 +4464,8 @@ class GmemCResource(MemoryResource):
                     )
             else:
                 if cutlass.const_expr(
-                    self.cfg.dtype_c_kind == int(DType.BF16)
-                    or self.cfg.dtype_c_kind == int(DType.FP16)
+                    self.cfg.dtype_c == int(DType.BF16)
+                    or self.cfg.dtype_c == int(DType.FP16)
                 ):
                     for group in cutlass.range_constexpr(self.cfg.epi_tile_n // 8):
                         col_off = Int32(group * 8)
@@ -3088,7 +4561,7 @@ class GmemCResource(MemoryResource):
                                     output_in_bounds,
                                 )
                             else:
-                                flat_idx0 = n_col * output_m + m_row0
+                                flat_idx0 = n_col * self._c_pitch(output_m) + m_row0
                                 flat_idx1 = flat_idx0 + Int32(1)
                                 if cutlass.const_expr(self.cfg.use_tma_oob_opt):
                                     if token_in_bounds & output_in_bounds:
@@ -3133,7 +4606,7 @@ class GmemCResource(MemoryResource):
                     if cutlass.const_expr(
                         self.cfg.num_stages_c_smem > 1
                         and self.cfg.tile_n
-                        > self.cfg.epi_tile_n * max(1, self.cfg.num_epilogue_warps // 4)
+                        > self.cfg.epi_tile_n * self.cfg.num_epilogue_warpgroups
                     ):
                         tma_smem_stage = call_idx % Int32(self.cfg.num_stages_c_smem)
                     pair_count = (self.cfg.epi_tile_n // 8) * 2
@@ -3299,7 +4772,7 @@ class GmemCResource(MemoryResource):
                                 store_dep,
                                 output_in_bounds,
                             )
-                    self._commit_swap_ab_fp4_tma(
+                    self._commit_swap_ab_packed_tma(
                         tile_coord_m,
                         tile_coord_n,
                         call_idx,
@@ -3359,7 +4832,7 @@ class GmemCResource(MemoryResource):
 
                                 m_row = m_tile_base // Int32(2) + m_local_row
                                 n_col = n_tile_base + tmem_col_even
-                                flat_idx = n_col * output_m + m_row
+                                flat_idx = n_col * self._c_pitch(output_m) + m_row
                                 token_in_bounds = (
                                     n_subtile_offset + tmem_col_even
                                 ) < token_limit
@@ -3422,7 +4895,7 @@ class GmemCResource(MemoryResource):
                             local_abs0 = local_abs
                         else:
                             local_abs1 = local_abs
-                    if cutlass.const_expr(self.cfg.epi_tile_n == 64):
+                    if cutlass.const_expr(self.cfg.uses_deepseek_fp8_atomic_absmax):
                         self._atomic_dsfp8_absmax_scratch_pair(
                             local_abs0,
                             local_abs1,
@@ -3439,7 +4912,10 @@ class GmemCResource(MemoryResource):
                             Int32(group),
                         )
 
-                prims.barrier_cta_sync(barrier_id=9, thread_count=256)
+                prims.barrier_cta_sync(
+                    barrier_id=_EPILOGUE_BARRIER_ID,
+                    thread_count=self.cfg.warp_layout.num_epilogue_warps * WARP_SIZE,
+                )
                 for group in cutlass.range_constexpr(self.cfg.epi_tile_n // 8):
                     q0, dq0, q1, dq1 = self._dsfp8_c_scale_pair_two_epilogues(
                         lane_id,
@@ -3470,7 +4946,7 @@ class GmemCResource(MemoryResource):
                             warpgroup_idx,
                         )
                         m_row1 = m_row0 + Int32(1)
-                        flat_idx0 = n_col * output_m + m_row0
+                        flat_idx0 = n_col * self._c_pitch(output_m) + m_row0
                         output_pair_in_bounds = (m_row1 < output_m) & (
                             n_col < self.problem_n
                         )
@@ -3488,7 +4964,10 @@ class GmemCResource(MemoryResource):
                                 self.gCInt16.subview(flat_idx0 // Int32(2)).store(
                                     packed
                                 )
-                prims.barrier_cta_sync(barrier_id=9, thread_count=256)
+                prims.barrier_cta_sync(
+                    barrier_id=_EPILOGUE_BARRIER_ID,
+                    thread_count=self.cfg.warp_layout.num_epilogue_warps * WARP_SIZE,
+                )
             else:
                 val0_vals = []
                 val1_vals = []
@@ -3547,15 +5026,13 @@ class GmemCResource(MemoryResource):
                             m_tile_base + base_row_idx + Int32(3),
                             base_row_idx + Int32(3),
                         )
-                        if cutlass.const_expr(is_eltwise_relu):
-                            val0_f32 = cute.math.max(val0_f32, Float32(0.0))
-                            val1_f32 = cute.math.max(val1_f32, Float32(0.0))
-                            val2_f32 = cute.math.max(val2_f32, Float32(0.0))
-                            val3_f32 = cute.math.max(val3_f32, Float32(0.0))
-                            val0_f32 = val0_f32 * val0_f32
-                            val1_f32 = val1_f32 * val1_f32
-                            val2_f32 = val2_f32 * val2_f32
-                            val3_f32 = val3_f32 * val3_f32
+                        if cutlass.const_expr(is_eltwise_act):
+                            val0_f32, val1_f32 = self._apply_eltwise_act_pair(
+                                val0_f32, val1_f32, scale_gate
+                            )
+                            val2_f32, val3_f32 = self._apply_eltwise_act_pair(
+                                val2_f32, val3_f32, scale_gate
+                            )
                         val0_f32 = self._maybe_apply_scale_c(val0_f32, scale_c)
                         val1_f32 = self._maybe_apply_scale_c(val1_f32, scale_c)
                         val2_f32 = self._maybe_apply_scale_c(val2_f32, scale_c)
@@ -3590,8 +5067,8 @@ class GmemCResource(MemoryResource):
                     )
 
                 prims.barrier_cta_sync(
-                    barrier_id=9,
-                    thread_count=self.cfg.num_epilogue_warps * 32,
+                    barrier_id=_EPILOGUE_BARRIER_ID,
+                    thread_count=self.cfg.warp_layout.num_epilogue_warps * WARP_SIZE,
                 )
                 for group in cutlass.range_constexpr(self.cfg.epi_tile_n // 8):
                     q0, dq0, q1, dq1 = self._dsfp8_c_scale_pair(
@@ -3636,7 +5113,7 @@ class GmemCResource(MemoryResource):
                             elif row_sub == 3:
                                 val_f32 = val3_vals[pair_idx]
                             val_out = self._to_output_value(val_f32 * q_scale)
-                            flat_idx = n_col * output_m + m_row
+                            flat_idx = n_col * self._c_pitch(output_m) + m_row
                             output_in_bounds = (m_row < output_m) & (
                                 n_col < self.problem_n
                             )
@@ -3657,10 +5134,53 @@ class GmemCResource(MemoryResource):
                                         alignment=1,
                                     )
                 prims.barrier_cta_sync(
-                    barrier_id=9,
-                    thread_count=self.cfg.num_epilogue_warps * 32,
+                    barrier_id=_EPILOGUE_BARRIER_ID,
+                    thread_count=self.cfg.warp_layout.num_epilogue_warps * WARP_SIZE,
                 )
         else:
+            if cutlass.const_expr(self.cfg.has_output_block_scaling):
+                self._store_swap_ab_nongated_quant(
+                    t2r_rmem,
+                    t2r_slice1,
+                    tile_coord_m,
+                    tile_coord_n,
+                    call_idx,
+                    warp_idx,
+                    warpgroup_idx,
+                    warp_in_epi4,
+                    lane_id,
+                    m_tile_base,
+                    n_tile_base,
+                    n_subtile_offset,
+                    base_tmem_col,
+                    base_row_idx,
+                    expert_idx,
+                    output_m,
+                    token_limit,
+                    scale_c,
+                    scale_gate,
+                    is_eltwise_act,
+                )
+                return
+            if cutlass.const_expr(
+                self.cfg.use_tma_store
+                and not self.cfg.uses_fp8_output
+                and self.cfg.swap_tma_store_offsets_are_col_linear
+            ):
+                group_stride_elems = Int32(
+                    self.cfg.num_bytes_c_tma_store_per_group // 2
+                )
+                smem_group_offset = warpgroup_idx * group_stride_elems
+                tma_smem_base_even = (
+                    smem_group_offset
+                    + self._bf16_tma_smem_element_offset(base_row_idx, base_tmem_col)
+                )
+                tma_smem_base_odd = (
+                    smem_group_offset
+                    + self._bf16_tma_smem_element_offset(
+                        base_row_idx, base_tmem_col + Int32(1)
+                    )
+                )
             for group in cutlass.range_constexpr(self.cfg.epi_tile_n // 8):
                 col_off = Int32(group * 8)
                 for col_sub in cutlass.range_constexpr(2):
@@ -3718,24 +5238,26 @@ class GmemCResource(MemoryResource):
                             m_tile_base + base_row_idx + Int32(3),
                             base_row_idx + Int32(3),
                         )
-                        if cutlass.const_expr(is_eltwise_relu):
-                            val0_f32 = cute.math.max(val0_f32, Float32(0.0))
-                            val1_f32 = cute.math.max(val1_f32, Float32(0.0))
-                            val2_f32 = cute.math.max(val2_f32, Float32(0.0))
-                            val3_f32 = cute.math.max(val3_f32, Float32(0.0))
-                            val0_f32 = val0_f32 * val0_f32
-                            val1_f32 = val1_f32 * val1_f32
-                            val2_f32 = val2_f32 * val2_f32
-                            val3_f32 = val3_f32 * val3_f32
+                        if cutlass.const_expr(is_eltwise_act):
+                            val0_f32, val1_f32 = self._apply_eltwise_act_pair(
+                                val0_f32, val1_f32, scale_gate
+                            )
+                            val2_f32, val3_f32 = self._apply_eltwise_act_pair(
+                                val2_f32, val3_f32, scale_gate
+                            )
                         val0_f32 = self._maybe_apply_scale_c(val0_f32, scale_c)
                         val1_f32 = self._maybe_apply_scale_c(val1_f32, scale_c)
                         val2_f32 = self._maybe_apply_scale_c(val2_f32, scale_c)
                         val3_f32 = self._maybe_apply_scale_c(val3_f32, scale_c)
                         if cutlass.const_expr(group == 0 and col_sub == 0):
-                            # T2R and register arithmetic overlap the prior TMA read.
-                            # Wait now, just before staging overwrites its SMEM source.
+                            # Overlap T2R and register arithmetic with the
+                            # previous TMA read, then protect the first writer.
                             prims.cp_async_bulk_wait_group(0, read=True)
-                            self._sync_swap_ab_tma_threads(warpgroup_idx)
+                            prims.barrier_cta_sync(
+                                barrier_id=Int32(_TMA_STORE_BARRIER_BASE)
+                                + warpgroup_idx,
+                                thread_count=self.cfg.epilogue_threads_per_warpgroup,
+                            )
                         if cutlass.const_expr(self.cfg.uses_fp8_output):
                             self._stage_swap_ab_fp8_tma_vec4(
                                 val0_f32,
@@ -3746,18 +5268,25 @@ class GmemCResource(MemoryResource):
                                 tmem_col,
                             )
                         else:
-                            if cutlass.const_expr(self._cache_tma_smem_offsets):
-                                # Eight columns preserve the 128-byte swizzle.
+                            if cutlass.const_expr(
+                                self.cfg.swap_tma_store_offsets_are_col_linear
+                            ):
                                 if cutlass.const_expr(col_sub == 0):
-                                    smem_offset = self.tma_smem_base_even
+                                    smem_offset = tma_smem_base_even
                                 else:
-                                    smem_offset = self.tma_smem_base_odd
-                                smem_offset += Int32(group * 512)
+                                    smem_offset = tma_smem_base_odd
+                                smem_offset += Int32(
+                                    group * self.cfg.swap_tma_store_col_group_step_elems
+                                )
                             else:
-                                smem_offset = warpgroup_idx * Int32(
+                                group_stride_elems = Int32(
                                     self.cfg.num_bytes_c_tma_store_per_group // 2
-                                ) + self._bf16_tma_smem_element_offset(
-                                    base_row_idx, tmem_col
+                                )
+                                smem_offset = (
+                                    warpgroup_idx * group_stride_elems
+                                    + self._bf16_tma_smem_element_offset(
+                                        base_row_idx, tmem_col
+                                    )
                                 )
                             self._stage_swap_ab_bf16_tma_vec4(
                                 self._to_output_value(val0_f32),
@@ -3789,12 +5318,11 @@ class GmemCResource(MemoryResource):
                             val_f32 = self._maybe_add_bias_m(
                                 val_f32, expert_idx, m_row, m_local_row
                             )
-                            if cutlass.const_expr(is_eltwise_relu):
-                                val_f32 = cute.math.max(val_f32, Float32(0.0))
-                                val_f32 = val_f32 * val_f32
+                            if cutlass.const_expr(is_eltwise_act):
+                                val_f32 = self._apply_eltwise_act(val_f32, scale_gate)
                             val_f32 = self._maybe_apply_scale_c(val_f32, scale_c)
                             val_out = self._to_output_value(val_f32)
-                            flat_idx = n_col * output_m + m_row
+                            flat_idx = n_col * self._c_pitch(output_m) + m_row
                             token_in_bounds = (
                                 n_subtile_offset + tmem_col
                             ) < token_limit
@@ -3822,7 +5350,7 @@ class GmemCResource(MemoryResource):
                                         ),
                                     )
             if cutlass.const_expr(self.cfg.use_tma_store):
-                self._commit_swap_ab_bf16_tma(
+                self._commit_swap_ab_plain_tma(
                     tile_coord_m,
                     tile_coord_n,
                     n_subtile_offset,

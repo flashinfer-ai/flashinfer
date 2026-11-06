@@ -263,6 +263,11 @@ def _make_wrapper(
     def wrapper(*args, **kwargs):
         try:
             namespace = build_namespace(args, kwargs)
+            if namespace.get("batch_invariant"):
+                # The batch-invariant mode fixes the call's dataflow to its class; a registered solution is another
+                # kernel, so the original call stands.
+                bump_stat(fi_api, "fallback_batch_invariant")
+                return original(*args, **kwargs)
             template = (
                 templates[0]
                 if template_dispatch is None

@@ -26,9 +26,14 @@ import tvm_ffi
 from ..api_logging import flashinfer_api
 from ..jit.cake_minimax_h3_sm120_quant_varlen_attention import (
     ATTENTION,
+    ATTENTION_LEAD,
+    ATTENTION_TAIL,
     KV_STATS,
+    PREPROCESS_HEAD_MAJOR,
+    PREPROCESS_HEAD_MAJOR_BURST,
     QUANTIZE,
 )
+from ..jit.cake_program import CakeProgram
 from ..utils import register_custom_op, register_fake_op
 
 MINIMAX_H3_HEAD_DIM = 128
@@ -50,7 +55,66 @@ _LOG2E = 1.4426950408889634
 # Grid rule (``minimax_h3_sm120_quant_varlen_attention_launch_grids``): grid-stride statistics and
 # quantizer launches of at most 4 CTAs per SM, one persistent attention CTA per SM.
 _PREP_CTAS_PER_SM = 4
-_PROGRAMS = (KV_STATS, QUANTIZE, ATTENTION)
+# The overlapped form of a plan inside the overlap band (``_overlap_selected``) on a part whose SM
+# count has an overlap width P (``minimax_h3_sm120_quant_varlen_attention_overlap_grids``), in launch
+# order: the head-major pre-processing producers (a plain launch; one CTA of two workers on each SM it
+# takes), the lead attention launch over the SMs the producers leave (a programmatic dependent of the
+# producers) and the tail attention launch over P CTAs (a programmatic dependent of the lead).  The
+# three share the head-control words ``hctr`` (4 words per head, then 8): each head's operands are
+# published by a ready flag the attention CTAs wait on before their loads, the tail CTAs end after
+# every lead CTA and the producers' completion, and the words restart within every complete call.  A
+# CTA waits only on CTAs of the launches before it in its call, which have all been resident by then,
+# so a call completes whatever else runs on the device.  Each producer item and attention unit
+# computes what the sequential launches compute for it, so the output is bitwise the sequential
+# form's.
+_OVERLAP_WIDTH = {170: 32, 188: 32}
+# The overlap width P of a plan also follows its attention-weighted mean segment length (the sum of
+# the squared segment lengths over the token count: the attention work per pre-processed token).  A
+# plan whose mean is at most ``_OVERLAP_LIGHT_MAX_SEGMENT`` tokens (per SM count) is bound by its
+# producers and takes the width ``_OVERLAP_WIDTH_LIGHT``; a plan of more than
+# ``_OVERLAP_LONG_MIN_PADDED`` padded tokens whose mean is at least ``_OVERLAP_LONG_MIN_SEGMENT``
+# tokens takes ``_OVERLAP_WIDTH_LONG``; the rest keep ``_OVERLAP_WIDTH``.
+_OVERLAP_WIDTH_LIGHT = {170: 64, 188: 64}
+_OVERLAP_LIGHT_MAX_SEGMENT = {170: 1792, 188: 2304}
+_OVERLAP_WIDTH_LONG = {170: 64, 188: 48}
+_OVERLAP_LONG_MIN_PADDED = 16384
+_OVERLAP_LONG_MIN_SEGMENT = 4096
+_OVERLAP_PRODUCER_WORKERS = 2
+# On a part of 188 SMs a plan that keeps the default width (neither light nor long) launches the
+# producers' burst build (``PREPROCESS_HEAD_MAJOR_BURST``, built for P = ``_OVERLAP_BURST_P``) on
+# every SM instead: the lead attention takes the same SMs, the producer CTAs beyond the first P stop
+# taking work items once they hold one past the first heads' items and leave their SMs to the lead,
+# and the first P CTAs take the rest of the work order.  Only which producer CTA runs an item
+# changes, so the output is bitwise the default producers'.  The parts of 170 SMs keep the default
+# producers at every width.
+_OVERLAP_BURST_WIDTH = {188: 32}
+_OVERLAP_BURST_P = 32
+_HCTR_WORDS_PER_HEAD = 4
+_HCTR_TAIL_WORDS = 8
+# The overlap band: 56 heads and an attention work W = sum(len^2) over the segments of 2^23 to
+# 24576^2 (below it the pre-processing is too short to hide, above it the attention dwarfs it).
+_OVERLAP_HEADS = MINIMAX_H3_NUM_HEADS
+_OVERLAP_MIN_WORK = 1 << 23
+_OVERLAP_MAX_WORK = 24576 * 24576
+# Above the overlap band a plan of 56 heads and at most ``_HEAD_MAJOR_MAX_TOKENS`` tokens (per SM
+# count; ``_head_major_selected``) keeps the sequential attention launch but takes its
+# pre-processing from the head-major producers (``PREPROCESS_HEAD_MAJOR``, a plain launch over every
+# SM) in place of the statistics and quantizer launches: each producer item computes what those
+# launches compute for it, so the operands are bitwise theirs, and a head's quantizer items follow
+# its statistics items while the head's K / V rows are still in L2.  Past the token bound a head's
+# K / V rows no longer stay in L2 and the two launches are faster.  The producers add to the
+# head-control words that only the overlapped form's tail restarts, so the call zeroes the plan's
+# words after them (every complete call leaves them zero).
+_HEAD_MAJOR_MAX_TOKENS = {170: 65536, 188: 98304}
+_PROGRAMS = (
+    KV_STATS,
+    QUANTIZE,
+    ATTENTION,
+    PREPROCESS_HEAD_MAJOR,
+    PREPROCESS_HEAD_MAJOR_BURST,
+    ATTENTION_LEAD,
+    ATTENTION_TAIL,
+)
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -110,8 +174,34 @@ def assign_unit_slots(unit_costs: List[int], num_ctas: int) -> List[int]:
     return slots
 
 
+def _overlap_selected(num_heads: int, work: int, num_sms: int) -> bool:
+    """Whether a plan of ``num_heads`` heads and attention work ``work`` (the sum of the squared
+    segment lengths) runs the overlapped form on a device of ``num_sms`` SMs."""
+    return (
+        int(num_sms) in _OVERLAP_WIDTH
+        and num_heads == _OVERLAP_HEADS
+        and _OVERLAP_MIN_WORK <= work <= _OVERLAP_MAX_WORK
+    )
+
+
+def _head_major_selected(
+    num_heads: int, work: int, total_tokens: int, num_sms: int
+) -> bool:
+    """Whether a plan of ``num_heads`` heads, attention work ``work`` (the sum of the squared
+    segment lengths) and ``total_tokens`` tokens takes its pre-processing from the head-major
+    producers on a device of ``num_sms`` SMs: 56 heads above the overlap band, at most
+    ``_HEAD_MAJOR_MAX_TOKENS[num_sms]`` tokens."""
+    return (
+        int(num_sms) in _OVERLAP_WIDTH
+        and num_heads == _OVERLAP_HEADS
+        and work > _OVERLAP_MAX_WORK
+        and total_tokens <= _HEAD_MAJOR_MAX_TOKENS.get(int(num_sms), 0)
+    )
+
+
 class MiniMaxH3VarlenPlan:
-    """Segment tables and persistent-grid unit table for one ``(cu_seqlens, heads, device)``."""
+    """Segment tables and persistent-grid unit table for one ``(cu_seqlens, heads, device)``; a plan
+    of the overlap band also holds the overlapped form's head-major unit table."""
 
     def __init__(
         self,
@@ -175,6 +265,27 @@ class MiniMaxH3VarlenPlan:
         for unit in assign_unit_slots(costs, self.grid):
             seg, head, t = units[unit]
             unit_table.extend((seg, (head << 16) | t))
+        self.work = sum(length * length for length in lens)
+        self.overlap = _overlap_selected(num_heads, self.work, int(num_ctas))
+        self.head_major = _head_major_selected(
+            num_heads, self.work, self.total_tokens, int(num_ctas)
+        )
+        # The overlapped form's units come from one counter in this order: head by head (the order the
+        # producers publish the heads), each head's units longest first (equal costs keep segment and
+        # tile order).
+        unit_table_head_major: List[int] = []
+        if self.overlap:
+            per_head = sorted(
+                (
+                    (cost, seg, t)
+                    for (seg, head, t), cost in zip(units, costs, strict=True)
+                    if head == 0
+                ),
+                key=lambda unit: -unit[0],
+            )
+            for head in range(num_heads):
+                for _, seg, t in per_head:
+                    unit_table_head_major.extend((seg, (head << 16) | t))
         self.num_kblocks = max(1, _ceil_div(self.total_tokens, _BLOCK_N))
         self.padded_tokens = self.num_kblocks * _BLOCK_N
         i32 = lambda values: torch.tensor(values, dtype=torch.int32, device=device)  # noqa: E731
@@ -184,6 +295,7 @@ class MiniMaxH3VarlenPlan:
         self.seg_tile_begin = i32(seg_tile_begin)
         self.tile_table = i32(tile_table or [0, 0])
         self.unit_table = i32(unit_table or [0, 0])
+        self.unit_table_head_major = i32(unit_table_head_major or [0, 0])
 
 
 # Most recently used segment plans (device tables) and workspace sets, one set per workspace owner
@@ -231,9 +343,10 @@ def _plan_at(
 
 class _Launch:
     """One plan's workspace slices and launch facts, built once per workspace set (``_owner``): ``args``
-    are the custom op's arguments from ``cu_seqlens`` through ``attention_grid``, the tensors among them
+    are the custom op's arguments from ``cu_seqlens`` through ``tail_grid``, the tensors among them
     already converted to tvm-ffi tensors, so a call hands the bindings no DLPack exchange but Q, K, V
-    and the output's."""
+    and the output's.  The overlapped form's grids are zero for a plan outside the overlap band, but for
+    a head-major sequential plan (``_head_major_selected``), whose producer grid is the SM count."""
 
     __slots__ = ("args",)
     args: Tuple[Any, ...]
@@ -252,6 +365,7 @@ class _Launch:
         n_stats = plan.num_segments * heads * hd
         n_partials = plan.num_tiles * heads * _PARTIAL_FLOATS
         n_pairs = plan.num_segments * heads
+        n_hctr = _HCTR_WORDS_PER_HEAD * heads + _HCTR_TAIL_WORDS
         buffer = workspace.buffer
         q8 = buffer("q8", n_rows8, torch.uint8)[:n_rows8]
         k8 = buffer("k8", n_rows8, torch.uint8)[:n_rows8]
@@ -262,6 +376,8 @@ class _Launch:
         mean_k = buffer("mean_k", n_stats, torch.float32)[:n_stats]
         partials = buffer("partials", n_partials, torch.float32)[:n_partials]
         counters = buffer("counters", n_pairs, torch.uint32, zero=True)[:n_pairs]
+        # the head-control words start zeroed and every complete overlapped call leaves them zero
+        hctr = buffer("hctr", n_hctr, torch.uint32, zero=True)[:n_hctr]
         stats_grid, quantize_grid, attention_grid = (
             minimax_h3_sm120_quant_varlen_attention_launch_grids(
                 _sm_count(index),
@@ -271,6 +387,20 @@ class _Launch:
                 num_units=plan.num_units,
             )
         )
+        overlap_grids = (0, 0, 0)
+        if plan.overlap:
+            grids = minimax_h3_sm120_quant_varlen_attention_overlap_grids(
+                _sm_count(index),
+                num_units=plan.num_units,
+                total_tokens=plan.total_tokens,
+                work=plan.work,
+                padded_tokens=plan.padded_tokens,
+            )
+            assert grids is not None, "an overlap plan has an overlap width"
+            overlap_grids = grids
+        elif plan.head_major:
+            # the head-major producers over every SM, then the attention (its grid in the tail position)
+            overlap_grids = (0, _sm_count(index), attention_grid)
         tensors = (
             plan.cu_seqlens,
             plan.seg_begin,
@@ -290,6 +420,8 @@ class _Launch:
             mean_k,
             partials,
             counters,
+            hctr,
+            plan.unit_table_head_major,
         )
         self.args = (
             *(tvm_ffi.from_dlpack(t) for t in tensors),
@@ -301,6 +433,7 @@ class _Launch:
             stats_grid,
             quantize_grid,
             attention_grid,
+            *overlap_grids,
         )
 
 
@@ -418,6 +551,18 @@ def _capture_id(stream: int) -> int:
     return int(info[2])
 
 
+def _capturing(index: int, stream: int) -> bool:
+    """Whether the raw stream ``stream`` of device ``index`` takes part in a CUDA-graph capture.
+
+    ``torch.cuda.is_current_stream_capturing`` reads the current stream of the current device, which is
+    ``stream`` only when ``index`` is the current device; a call whose tensors live on another device asks
+    CUDA about ``stream`` itself.
+    """
+    if index == torch.cuda.current_device():
+        return torch.cuda.is_current_stream_capturing()
+    return _capture_id(stream) != 0
+
+
 def _owner(index: int, stream: int) -> Tuple[int, ...]:
     """The workspace owner of a call on device ``index`` and raw stream ``stream``: ``(index, stream)`` for
     an eager call, ``(index, stream, capture id)`` for a call captured into a CUDA graph.
@@ -434,7 +579,7 @@ def _owner(index: int, stream: int) -> Tuple[int, ...]:
     # Concurrency: safe on any number of streams, host threads, CUDA graphs and MPS clients. Exec graphs
     # instantiated more than once from one captured graph (or cloned as child graphs) share this op's
     # workspace and must not run concurrently.
-    if torch.cuda.is_current_stream_capturing():
+    if _capturing(index, stream):
         capture = _capture_id(stream)
         if capture:
             return (index, stream, capture)
@@ -463,7 +608,7 @@ def _ffi_device(index: int):
 
 
 def workspace_bytes(tokens: int, num_heads: int, num_segments: int) -> int:
-    """Bytes of one (device, stream) workspace set the operator needs for ``tokens`` packed rows."""
+    """Bytes of one workspace set (``_owner``) the operator needs for ``tokens`` packed rows."""
 
     padded = max(1, _ceil_div(tokens, _BLOCK_N)) * _BLOCK_N
     q8 = k8 = tokens * num_heads * MINIMAX_H3_HEAD_DIM
@@ -475,7 +620,8 @@ def workspace_bytes(tokens: int, num_heads: int, num_segments: int) -> int:
     )
     partials = _ceil_div(tokens, _BLOCK_M) * num_heads * _PARTIAL_FLOATS
     counters = num_segments * num_heads
-    return q8 + k8 + vt8 + 4 * (scales + partials + counters)
+    hctr = _HCTR_WORDS_PER_HEAD * num_heads + _HCTR_TAIL_WORDS
+    return q8 + k8 + vt8 + 4 * (scales + partials + counters + hctr)
 
 
 def _softmax_scale_log2(softmax_scale: float) -> float:
@@ -523,6 +669,97 @@ def minimax_h3_sm120_quant_varlen_attention_launch_grids(
     return prep(num_tiles), prep(num_kblocks), attention
 
 
+def minimax_h3_sm120_quant_varlen_attention_overlap_grids(
+    num_sms: int,
+    *,
+    num_units: int,
+    total_tokens: Optional[int] = None,
+    work: Optional[int] = None,
+    padded_tokens: Optional[int] = None,
+) -> Optional[Tuple[int, int, int]]:
+    """The overlapped form's ``(lead, producers, tail)`` grids on a device of ``num_sms`` SMs, or
+    ``None`` when that SM count has no overlap width ``P``: the lead attention over
+    ``max(1, min(num_sms - P, num_units))`` CTAs (one per SM), the producers over
+    ``min(2 * P, num_sms - lead)`` CTAs (one CTA of two workers on each SM the lead leaves), or over
+    ``num_sms`` CTAs on 188 SMs when ``P`` is 32 (the burst producers,
+    ``PREPROCESS_HEAD_MAJOR_BURST``), and the tail attention over ``P`` CTAs.  The tuple is in grid
+    order; the launch order is the producers, the lead, the tail.  ``P`` is 32 on 170 and 188 SMs;
+    with the plan's ``total_tokens`` and ``work`` (the sum of the squared segment lengths) it is 64
+    when ``work`` is at most 1792 (170 SMs) or 2304 (188 SMs) times ``total_tokens``, else, with
+    ``padded_tokens`` above 16384 and ``work`` at least 4096 times ``total_tokens``, 64 on 170 SMs
+    and 48 on 188 SMs."""
+    sms = int(num_sms)
+    if sms <= 0:
+        raise ValueError(f"num_sms must be positive, got {num_sms}")
+    width = _OVERLAP_WIDTH.get(sms)
+    if width is None:
+        return None
+    if (
+        total_tokens is not None
+        and work is not None
+        and int(total_tokens) > 0
+        and int(work) <= _OVERLAP_LIGHT_MAX_SEGMENT.get(sms, 0) * int(total_tokens)
+    ):
+        width = _OVERLAP_WIDTH_LIGHT.get(sms, width)
+    elif (
+        total_tokens is not None
+        and work is not None
+        and padded_tokens is not None
+        and int(padded_tokens) > _OVERLAP_LONG_MIN_PADDED
+        and int(work) >= _OVERLAP_LONG_MIN_SEGMENT * int(total_tokens)
+    ):
+        width = _OVERLAP_WIDTH_LONG.get(sms, width)
+    lead = max(1, min(sms - width, int(num_units)))
+    if width == _OVERLAP_BURST_WIDTH.get(sms):
+        return lead, sms, width
+    return lead, min(_OVERLAP_PRODUCER_WORKERS * width, sms - lead), width
+
+
+def minimax_h3_sm120_quant_varlen_attention_programs(
+    plan: MiniMaxH3VarlenPlan,
+) -> Tuple[CakeProgram, ...]:
+    """The programs a call of ``plan`` launches, in launch order: ``(PREPROCESS_HEAD_MAJOR,
+    ATTENTION_LEAD, ATTENTION_TAIL)`` for a plan of the overlap band (56 heads, an attention work
+    ``sum(len^2)`` of 2^23 to 24576^2, a part of 170 or 188 SMs), with ``PREPROCESS_HEAD_MAJOR_BURST``
+    in place of ``PREPROCESS_HEAD_MAJOR`` when the overlap grids launch the burst producers (188 SMs,
+    width 32); ``(PREPROCESS_HEAD_MAJOR, ATTENTION)`` for a plan of 56 heads above the band of at most
+    65536 (170 SMs) or 98304 (188 SMs) tokens (``_head_major_selected``); else ``(KV_STATS, QUANTIZE,
+    ATTENTION)``."""
+    if plan.overlap:
+        grids = minimax_h3_sm120_quant_varlen_attention_overlap_grids(
+            plan.key[3],
+            num_units=plan.num_units,
+            total_tokens=plan.total_tokens,
+            work=plan.work,
+            padded_tokens=plan.padded_tokens,
+        )
+        assert grids is not None, "an overlap plan has an overlap width"
+        return _overlap_programs(_overlap_burst(grids))
+    if plan.head_major:
+        return PREPROCESS_HEAD_MAJOR, ATTENTION
+    return KV_STATS, QUANTIZE, ATTENTION
+
+
+def _overlap_burst(grids: Tuple[int, int, int]) -> bool:
+    """Whether the overlap grids ``(lead, producers, tail)`` launch the burst producers: a producer
+    grid above two workers' CTAs per tail CTA, which ``overlap_grids`` gives only for a tail of the
+    burst build's P (checked here)."""
+    _lead, producers, tail = grids
+    burst = producers > _OVERLAP_PRODUCER_WORKERS * tail
+    if burst and tail != _OVERLAP_BURST_P:
+        raise AssertionError(
+            f"the burst producers are built for a tail of {_OVERLAP_BURST_P} CTAs, got {tail}"
+        )
+    return burst
+
+
+def _overlap_programs(burst: bool) -> Tuple[CakeProgram, CakeProgram, CakeProgram]:
+    """The overlapped form's producers (the burst build when ``burst``), lead and tail attention
+    programs."""
+    producers = PREPROCESS_HEAD_MAJOR_BURST if burst else PREPROCESS_HEAD_MAJOR
+    return producers, ATTENTION_LEAD, ATTENTION_TAIL
+
+
 @register_custom_op(
     "flashinfer::minimax_h3_sm120_varlen_attention_fp8",
     mutates_args=(
@@ -536,6 +773,7 @@ def minimax_h3_sm120_quant_varlen_attention_launch_grids(
         "mean_k",
         "partials",
         "counters",
+        "hctr",
     ),
 )
 def _minimax_h3_sm120_varlen_attention_fp8_impl(
@@ -561,6 +799,8 @@ def _minimax_h3_sm120_varlen_attention_fp8_impl(
     mean_k: Any,
     partials: Any,
     counters: Any,
+    hctr: Any,
+    unit_table_head_major: Any,
     num_segments: int,
     num_tiles: int,
     num_units: int,
@@ -569,18 +809,123 @@ def _minimax_h3_sm120_varlen_attention_fp8_impl(
     stats_grid: int,
     quantize_grid: int,
     attention_grid: int,
+    lead_grid: int,
+    producer_grid: int,
+    tail_grid: int,
     softmax_scale_log2: float,
     stream: int,
     target: str,
 ) -> None:
     # Three launches on ``stream`` (the current torch stream): the K / V statistics (per-tile partials,
     # the last tile of each (segment, head) folding them into its K means and V scales) -> E4M3 Q8 /
-    # centred K8 / transposed V8 -> attention.  The bindings take the host arguments in the kernels'
-    # signature order followed by the grid triple; the attention binding encodes its three tensor maps
-    # from the byte tensors handed in its descriptor positions (``*_rows``, views of ``*_words``).
+    # centred K8 / transposed V8 -> attention; or, for a plan of the overlap band (``tail_grid`` > 0),
+    # the overlapped form's three launches (``_launch_overlapped``); or, for a head-major sequential plan
+    # (``producer_grid`` > 0, ``tail_grid`` 0), the head-major producers over ``producer_grid`` CTAs, the
+    # head-control words zeroed, and the attention.  The bindings take the host
+    # arguments in the kernels' signature order followed by the grid triple; the attention bindings
+    # encode their three tensor maps from the byte tensors handed in their descriptor positions
+    # (``*_rows``, views of ``*_words``).
     tokens, heads = int(q.shape[0]), int(q.shape[1])
-    stats, quantize, attention = _entries(target)
     with tvm_ffi.use_raw_stream(_ffi_device(q.device.index), stream):
+        if tail_grid > 0:
+            if lead_grid == 0:
+                # the head-major sequential form
+                producers, attention = _head_major_entries(target)
+                producers(
+                    q,
+                    k,
+                    v,
+                    tile_table,
+                    seg_begin,
+                    seg_len,
+                    seg_tile_begin,
+                    cu_seqlens,
+                    partials,
+                    counters,
+                    mean_k,
+                    v_scale,
+                    q8_words,
+                    k8_words,
+                    vt8_words,
+                    q_scale,
+                    k_scale,
+                    hctr,
+                    num_tiles,
+                    tokens,
+                    padded_tokens,
+                    num_segments,
+                    heads,
+                    num_kblocks,
+                    producer_grid,
+                    1,
+                    1,
+                )
+                # the producers leave their ready and done words set; the call restarts them (stream order)
+                (
+                    hctr if isinstance(hctr, torch.Tensor) else torch.from_dlpack(hctr)
+                ).zero_()
+                attention(
+                    q8_rows,
+                    k8_rows,
+                    vt8_rows,
+                    out,
+                    q_scale,
+                    k_scale,
+                    v_scale,
+                    seg_begin,
+                    seg_len,
+                    unit_table,
+                    num_units,
+                    heads,
+                    num_kblocks,
+                    softmax_scale_log2,
+                    tail_grid,
+                    1,
+                    1,
+                )
+                return
+            _launch_overlapped(
+                target,
+                q.device.index,
+                stream,
+                (
+                    q,
+                    k,
+                    v,
+                    tile_table,
+                    seg_begin,
+                    seg_len,
+                    seg_tile_begin,
+                    cu_seqlens,
+                    partials,
+                    counters,
+                    mean_k,
+                    v_scale,
+                    q8_words,
+                    k8_words,
+                    vt8_words,
+                    q_scale,
+                    k_scale,
+                    hctr,
+                ),
+                (num_tiles, tokens, padded_tokens, num_segments, heads, num_kblocks),
+                (
+                    q8_rows,
+                    k8_rows,
+                    vt8_rows,
+                    out,
+                    q_scale,
+                    k_scale,
+                    v_scale,
+                    seg_begin,
+                    seg_len,
+                    unit_table_head_major,
+                ),
+                (num_units, heads, num_kblocks, softmax_scale_log2, hctr),
+                (lead_grid, producer_grid, tail_grid),
+            )
+            return
+        stats, quantize, attention = _entries(target)
         stats(
             k,
             v,
@@ -664,6 +1009,8 @@ def _minimax_h3_sm120_varlen_attention_fp8_fake(
     mean_k: Any,
     partials: Any,
     counters: Any,
+    hctr: Any,
+    unit_table_head_major: Any,
     num_segments: int,
     num_tiles: int,
     num_units: int,
@@ -672,6 +1019,9 @@ def _minimax_h3_sm120_varlen_attention_fp8_fake(
     stats_grid: int,
     quantize_grid: int,
     attention_grid: int,
+    lead_grid: int,
+    producer_grid: int,
+    tail_grid: int,
     softmax_scale_log2: float,
     stream: int,
     target: str,
@@ -683,6 +1033,69 @@ def _minimax_h3_sm120_varlen_attention_fp8_fake(
 def _entries(target: str) -> Tuple[Any, Any, Any]:
     """The ``run`` entries of the statistics, quantizer and attention programs on ``target``."""
     return KV_STATS.entry(target), QUANTIZE.entry(target), ATTENTION.entry(target)
+
+
+@functools.cache
+def _head_major_entries(target: str) -> Tuple[Any, Any]:
+    """The ``run`` entries of the head-major sequential form on ``target``: the head-major producers
+    (``PREPROCESS_HEAD_MAJOR``), its pre-processing, and the attention."""
+    return PREPROCESS_HEAD_MAJOR.entry(target), ATTENTION.entry(target)
+
+
+@functools.cache
+def _overlap_entries(target: str, burst: bool) -> Tuple[Any, Any, Any]:
+    """The ``run`` entries of the overlapped form's producers (the burst build when ``burst``), lead
+    and tail attention on ``target``."""
+    return tuple(program.entry(target) for program in _overlap_programs(burst))
+
+
+# (device, target, burst) triples whose overlapped programs ran once (``_launch_overlapped``).
+_OVERLAP_LOADED: set = set()
+
+
+def _launch_overlapped(
+    target: str,
+    index: int,
+    stream: int,
+    producer_tensors: Tuple[Any, ...],
+    producer_facts: Tuple[int, ...],
+    attention_tensors: Tuple[Any, ...],
+    attention_facts: Tuple[Any, ...],
+    grids: Tuple[int, int, int],
+) -> None:
+    """The overlapped form's launches on the current tvm-ffi stream, in order: the producers (a plain
+    launch: it starts after every earlier launch of the stream has completed), the lead attention (a
+    programmatic dependent of the producers) and the tail attention (a programmatic dependent of the
+    lead).  ``producer_tensors`` / ``producer_facts`` are the producers' arguments through ``hctr`` /
+    after it, ``attention_tensors`` / ``attention_facts`` the attention's through ``unit_table`` / from
+    ``total_units`` through ``hctr``; ``grids`` is ``(lead, producers, tail)``.  Grids that launch
+    the burst producers (``_overlap_burst``: every SM of the device beside a tail of their P) select
+    ``PREPROCESS_HEAD_MAJOR_BURST``, any other grids ``PREPROCESS_HEAD_MAJOR``.  The caller holds the
+    stream's host lock (``_stream_lock``), so the three launches are contiguous on the stream.
+
+    The first overlapped call on a device whose raw stream ``stream`` takes part in no graph capture
+    (``_capturing``) first runs the three programs once with no work, in the same order on the call's
+    own head-control words (read as one head's, left zero), so their modules load before the call's
+    own launches.  This only keeps a module load out of the first call's overlap: a CTA of the overlap
+    waits only on CTAs of the earlier launches of its call, so a lazy module load delays a call and
+    never blocks it.
+    """
+    lead_grid, producer_grid, tail_grid = grids
+    burst = _overlap_burst(grids)
+    producers, lead, tail = _overlap_entries(target, burst)
+    if (index, target, burst) not in _OVERLAP_LOADED and not _capturing(index, stream):
+        # one head, no statistics tile, no 128-key block, one segment, no unit
+        tokens, padded_tokens = producer_facts[1], producer_facts[2]
+        producers(*producer_tensors, 0, tokens, padded_tokens, 1, 1, 0, 1, 1, 1)
+        softmax_scale_log2, hctr = attention_facts[3], attention_facts[4]
+        for attention in (lead, tail):
+            attention(
+                *attention_tensors, 0, 1, 1, softmax_scale_log2, hctr, 1, 1, 1, 1, 1
+            )
+        _OVERLAP_LOADED.add((index, target, burst))
+    producers(*producer_tensors, *producer_facts, producer_grid, 1, 1)
+    lead(*attention_tensors, *attention_facts, lead_grid, tail_grid, lead_grid, 1, 1)
+    tail(*attention_tensors, *attention_facts, lead_grid, tail_grid, tail_grid, 1, 1)
 
 
 def _check_thd(name: str, tensor: torch.Tensor, tokens: int, heads: int) -> None:
@@ -722,7 +1135,14 @@ def minimax_h3_sm120_varlen_attention_fp8(
     Three runtime-variable generated programs, launched in order on the current stream (the K / V
     statistics with their per-segment fold, the quantizer, the attention), serve any ``tokens``
     and any segment lengths (including empty segments and lengths below one tile); the grids are
-    ``minimax_h3_sm120_quant_varlen_attention_launch_grids``.  The quantized operands
+    ``minimax_h3_sm120_quant_varlen_attention_launch_grids``.  A plan of 56 heads whose attention
+    work (the sum of the squared segment lengths) lies in [2^23, 24576^2] runs, on a part of 170 or
+    188 SMs, the overlapped form instead (``minimax_h3_sm120_quant_varlen_attention_programs``,
+    ``minimax_h3_sm120_quant_varlen_attention_overlap_grids``): the head-major pre-processing
+    producers start first and the attention starts each head as soon as its operands are written,
+    with the same output bit for bit; above the band such a plan of at most 65536 (170 SMs) or 98304
+    (188 SMs) tokens takes its pre-processing from the head-major producers over every SM in place
+    of the first two launches, with the same operands bit for bit.  The quantized operands
     live in a grow-only workspace per (device, stream), and per capture for a call captured into a
     CUDA graph (``workspace_bytes``); the most recent 8 workspace sets and 256 segment plans are
     kept.  The programs ship for ``sm_120a`` alone: a call with a non-empty segment on a device of
@@ -803,6 +1223,8 @@ __all__ = [
     "MiniMaxH3VarlenPlan",
     "assign_unit_slots",
     "minimax_h3_sm120_quant_varlen_attention_launch_grids",
+    "minimax_h3_sm120_quant_varlen_attention_overlap_grids",
+    "minimax_h3_sm120_quant_varlen_attention_programs",
     "minimax_h3_sm120_varlen_attention_fp8",
     "normalize_cu_seqlens",
     "workspace_bytes",

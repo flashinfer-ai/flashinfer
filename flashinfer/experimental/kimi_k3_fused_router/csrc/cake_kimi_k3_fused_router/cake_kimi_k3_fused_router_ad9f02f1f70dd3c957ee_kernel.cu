@@ -358,36 +358,36 @@ kernel_cake_kimi_k3_fused_router_ad9f02f1f70dd3c957ee(float* __restrict__ logits
         }
     }
     unsigned int published = 0;
-    unsigned int warp_top0;
-    asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top0) : "r"(lane_bound));
+    unsigned int warp_top0_1_0;
+    asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top0_1_0) : "r"(lane_bound));
     if (lane == 0) {
-        published = warp_top0;
+        published = warp_top0_1_0;
     }
-    if (lane_bound == warp_top0) {
+    if (lane_bound == warp_top0_1_0) {
         lane_bound = (unsigned int)0;
     }
-    unsigned int warp_top1;
-    asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top1) : "r"(lane_bound));
+    unsigned int warp_top0_1_1;
+    asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top0_1_1) : "r"(lane_bound));
     if (lane == 1) {
-        published = warp_top1;
+        published = warp_top0_1_1;
     }
-    if (lane_bound == warp_top1) {
+    if (lane_bound == warp_top0_1_1) {
         lane_bound = (unsigned int)0;
     }
-    unsigned int warp_top2;
-    asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top2) : "r"(lane_bound));
+    unsigned int warp_top0_1_2;
+    asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top0_1_2) : "r"(lane_bound));
     if (lane == 2) {
-        published = warp_top2;
+        published = warp_top0_1_2;
     }
-    if (lane_bound == warp_top2) {
+    if (lane_bound == warp_top0_1_2) {
         lane_bound = (unsigned int)0;
     }
-    unsigned int warp_top3;
-    asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top3) : "r"(lane_bound));
+    unsigned int warp_top0_1_3;
+    asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top0_1_3) : "r"(lane_bound));
     if (lane == 3) {
-        published = warp_top3;
+        published = warp_top0_1_3;
     }
-    if (lane_bound == warp_top3) {
+    if (lane_bound == warp_top0_1_3) {
         lane_bound = (unsigned int)0;
     }
     if (lane < 4) {
@@ -425,24 +425,24 @@ kernel_cake_kimi_k3_fused_router_ad9f02f1f70dd3c957ee(float* __restrict__ logits
     }
     cand_slot += ((keys[0] >= cand_floor) ? 1 : 0);
     if (keys[1] >= cand_floor && cand_slot < 32) {
-        int cand_index1 = warp * 32 + cand_slot;
-        cand_keys[cand_index1] = keys[1];
-        cand_ids[cand_index1] = expert_base + 1;
-        cand_scores[cand_index1] = unbiased[1];
+        int cand_index_0 = warp * 32 + cand_slot;
+        cand_keys[cand_index_0] = keys[1];
+        cand_ids[cand_index_0] = expert_base + 1;
+        cand_scores[cand_index_0] = unbiased[1];
     }
     cand_slot += ((keys[1] >= cand_floor) ? 1 : 0);
     if (keys[2] >= cand_floor && cand_slot < 32) {
-        int cand_index2 = warp * 32 + cand_slot;
-        cand_keys[cand_index2] = keys[2];
-        cand_ids[cand_index2] = expert_base + 2;
-        cand_scores[cand_index2] = unbiased[2];
+        int cand_index_1 = warp * 32 + cand_slot;
+        cand_keys[cand_index_1] = keys[2];
+        cand_ids[cand_index_1] = expert_base + 2;
+        cand_scores[cand_index_1] = unbiased[2];
     }
     cand_slot += ((keys[2] >= cand_floor) ? 1 : 0);
     if (keys[3] >= cand_floor && cand_slot < 32) {
-        int cand_index3 = warp * 32 + cand_slot;
-        cand_keys[cand_index3] = keys[3];
-        cand_ids[cand_index3] = expert_base + 3;
-        cand_scores[cand_index3] = unbiased[3];
+        int cand_index_2 = warp * 32 + cand_slot;
+        cand_keys[cand_index_2] = keys[3];
+        cand_ids[cand_index_2] = expert_base + 3;
+        cand_scores[cand_index_2] = unbiased[3];
     }
     if (lane == 0) {
         cand_counts[warp] = cand_warp;
@@ -1072,25 +1072,25 @@ kernel_cake_kimi_k3_fused_router_ad9f02f1f70dd3c957ee(float* __restrict__ logits
     }
     int mask_lane_blocks = (int)(unsigned int)__popc(mask_lane_word);
     int mask_inclusive = mask_lane_blocks;
-    int mask_peer = __shfl_up_sync(0xFFFFFFFF, mask_inclusive, 1, 32);
+    int mask_peer_4_0 = __shfl_up_sync(0xFFFFFFFF, mask_inclusive, 1, 32);
     if (lane >= 1) {
-        mask_inclusive += mask_peer;
+        mask_inclusive += mask_peer_4_0;
     }
-    int mask_peer_0 = __shfl_up_sync(0xFFFFFFFF, mask_inclusive, 2, 32);
+    int mask_peer_4_1 = __shfl_up_sync(0xFFFFFFFF, mask_inclusive, 2, 32);
     if (lane >= 2) {
-        mask_inclusive += mask_peer_0;
+        mask_inclusive += mask_peer_4_1;
     }
-    int mask_peer_1 = __shfl_up_sync(0xFFFFFFFF, mask_inclusive, 4, 32);
+    int mask_peer_4_2 = __shfl_up_sync(0xFFFFFFFF, mask_inclusive, 4, 32);
     if (lane >= 4) {
-        mask_inclusive += mask_peer_1;
+        mask_inclusive += mask_peer_4_2;
     }
-    int mask_peer_2 = __shfl_up_sync(0xFFFFFFFF, mask_inclusive, 8, 32);
+    int mask_peer_4_3 = __shfl_up_sync(0xFFFFFFFF, mask_inclusive, 8, 32);
     if (lane >= 8) {
-        mask_inclusive += mask_peer_2;
+        mask_inclusive += mask_peer_4_3;
     }
-    int mask_peer_3 = __shfl_up_sync(0xFFFFFFFF, mask_inclusive, 16, 32);
+    int mask_peer_4_4 = __shfl_up_sync(0xFFFFFFFF, mask_inclusive, 16, 32);
     if (lane >= 16) {
-        mask_inclusive += mask_peer_3;
+        mask_inclusive += mask_peer_4_4;
     }
     int mask_exclusive = mask_inclusive - mask_lane_blocks;
     int mask_total = __shfl_sync(0xFFFFFFFF, mask_inclusive, 31);

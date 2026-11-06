@@ -21,6 +21,7 @@ synchronization in between, eagerly and under CUDA Graph replay.
 
 from __future__ import annotations
 
+import ctypes
 from dataclasses import replace
 
 import pytest
@@ -263,6 +264,50 @@ def test_chain_reads_inputs_written_after_an_early_trigger(
         module.cake_fused_moe_warp_decode_release_workspace(receipt)
 
 
+class _EdgeData(ctypes.Structure):
+    """``CUgraphEdgeData`` of the driver API (CUDA 12.3 and newer)."""
+
+    _fields_ = (
+        ("from_port", ctypes.c_uint8),
+        ("to_port", ctypes.c_uint8),
+        ("type", ctypes.c_uint8),
+        ("reserved", ctypes.c_uint8 * 5),
+    )
+
+
+def _graph_edges(graph_handle: int) -> list[tuple[int, int, int]]:
+    """``(source node, target node, CUgraphDependencyType)`` of every edge of
+    the graph, read with ``cuGraphGetEdges_v2`` of the driver library itself.
+
+    cuda-bindings before 12.9.7 and 13.3.0 return the edge data of
+    ``cuGraphGetEdges`` from a buffer they have already freed (cuda-python
+    issue #1804), so the edge types they report are whatever that memory holds
+    by then; the ctypes call keeps the test independent of the bindings' version.
+    """
+    driver = ctypes.CDLL("libcuda.so.1")
+    get_edges = driver.cuGraphGetEdges_v2
+    get_edges.restype = ctypes.c_int
+    get_edges.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(_EdgeData),
+        ctypes.POINTER(ctypes.c_size_t),
+    )
+    count = ctypes.c_size_t(0)
+    assert get_edges(graph_handle, None, None, None, ctypes.byref(count)) == 0
+    total = count.value
+    sources = (ctypes.c_void_p * total)()
+    targets = (ctypes.c_void_p * total)()
+    data = (_EdgeData * total)()
+    assert get_edges(graph_handle, sources, targets, data, ctypes.byref(count)) == 0
+    assert count.value == total
+    return [
+        (int(sources[i] or 0), int(targets[i] or 0), int(data[i].type))
+        for i in range(total)
+    ]
+
+
 def _kernel_graph(graph) -> tuple[list[str], list[tuple[int, int, int]]]:
     """Kernel node names and kernel-to-kernel edges (source, target, type) of
     a captured graph that has not been instantiated."""
@@ -288,17 +333,10 @@ def _kernel_graph(graph) -> tuple[list[str], list[tuple[int, int, int]]]:
             func = checked(driver.cuKernelGetFunction(params.kern))
         index[int(node)] = len(names)
         names.append(checked(driver.cuFuncGetName(func)).decode())
-    # The edge types come from cuGraphGetEdges_v2 in CUDA 12 bindings and from
-    # cuGraphGetEdges in CUDA 13 bindings.
-    get_edges = getattr(driver, "cuGraphGetEdges_v2", None) or driver.cuGraphGetEdges
-    *_, count = checked(get_edges(raw, 0))
-    sources, targets, data, count = checked(get_edges(raw, count))
     edges = [
-        (index[int(source)], index[int(target)], int(edge.type))
-        for source, target, edge in zip(
-            sources[:count], targets[:count], data[:count], strict=True
-        )
-        if int(source) in index and int(target) in index
+        (index[source], index[target], kind)
+        for source, target, kind in _graph_edges(int(raw))
+        if source in index and target in index
     ]
     return names, edges
 

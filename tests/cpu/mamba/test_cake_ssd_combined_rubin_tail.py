@@ -24,9 +24,19 @@ def test_source_tail_full_grid_rule_is_rubin_only():
         min_chunks_varlen=8,
         render_penalty_batched=1 / 12,
         render_penalty_varlen=1 / 5,
+        long_chunks_varlen=16,
+        render_penalty_varlen_long=1 / 8,
     )
     assert rule.min_chunks(False) == 16 and rule.min_chunks(True) == 8
     assert rule.render_penalty(False) == 1 / 12 and rule.render_penalty(True) == 1 / 5
+    # varlen items of 16 or more chunks take the long-item penalty unless the
+    # call has z; the batched penalty depends on neither
+    assert rule.render_penalty(True, 15) == 1 / 5
+    assert rule.render_penalty(True, 16) == 1 / 8
+    assert rule.render_penalty(True, 64) == 1 / 8
+    assert rule.render_penalty(True, 64, has_z=True) == 1 / 5
+    assert rule.render_penalty(False, 64) == 1 / 12
+    assert rule.render_penalty(False, 64, has_z=True) == 1 / 12
     assert module.tail_full_grid_rule((10, 0)) is None
     assert module.tail_full_grid_rule((10, 3)) is None
     assert module._TAIL_MIN_CHUNKS == 16
@@ -110,7 +120,9 @@ def test_source_tail_route_default_arguments_keep_the_blackwell_rule():
 R200_SCREEN_ROWS = (
     ("perf_varlen_32x32", 256, 32, True, True),  # 1.096
     ("perf_batched_64x16", 512, 16, False, True),  # 1.047
-    ("perf_varlen_64x32", 512, 32, True, False),  # 0.936 (main kernel 0.922)
+    # 0.936 in round 9; the current varlen pair render wins 1.159 (long-item
+    # varlen penalty)
+    ("perf_varlen_64x32", 512, 32, True, True),
     ("perf_varlen_32x8", 256, 8, True, True),  # 1.026 (chunk floor 8)
     ("perf_varlen_64x8", 512, 8, True, False),  # 0.864 (main kernel 0.815)
     (
@@ -176,16 +188,20 @@ def test_source_tail_full_grid_rule_geometry():
         assert route(256, chunks, False)
     assert not route(256, 8, False)  # batched floor 16 (a fused-window call)
     # 512 items: 3 waves vs 2.5 rounds -- batched 16 / 32 chunks win (1.06 /
-    # 1.13); batched 8 chunks (0.98) and every varlen form (0.90-0.99) do not
+    # 1.13); batched 8 chunks (0.98) does not; varlen items of 16 or more
+    # chunks take the long-item penalty (2.5 x 9 / 8 + one hand-off chunk
+    # step < 3) and win (32 chunks: 1.111), 8-chunk varlen items do not
     assert route(512, 16, False) and route(512, 32, False)
     assert not route(512, 8, False)
-    for chunks in (8, 16, 32, 64):
-        assert not route(512, chunks, True)
-    # 640 items: 4 waves vs 3.5 rounds -- batched wins (1.07-1.13), varlen is
-    # neutral (0.98-1.04) and refused
+    assert not route(512, 8, True)
+    for chunks in (16, 32, 64):
+        assert route(512, chunks, True)
+    # 640 items: 4 waves vs 3.5 rounds -- batched wins (1.07-1.13); varlen
+    # items need more than 16 chunks (3.5 x 9 / 8 + 1 / 16 = 4 is not below 4)
     assert route(640, 16, False) and route(640, 32, False)
-    for chunks in (8, 16, 32):
+    for chunks in (8, 16):
         assert not route(640, chunks, True)
+    assert route(640, 32, True)
     # equal makespans (384: 2 vs 2, 768: 4 vs 4, 1024: 5 vs 5, 2048: 10 vs
     # 10) lose by the pair overhead on every form
     for items in (384, 768, 1024, 2048):
@@ -260,3 +276,69 @@ def test_source_chunk_parallel_workspace_cap_rubin():
     assert 8192 * 48 * 1024 == 384 << 20
     assert module._CHUNK_PARALLEL_WORKSPACE_CAP_BYTES < 384 << 20
     assert module.chunk_parallel_workspace_cap_bytes((10, 7)) >= 384 << 20
+
+
+@pytest.mark.cpu_only
+def test_source_tail_full_grid_long_varlen_items_without_z():
+    """The long-item varlen penalty (1/8 from 16 chunks per item) admits
+    full-grid varlen calls without z of 425-530 items with 16 or more chunks
+    and of 637-742 items with more than 16 chunks; calls with z, 8-chunk
+    items and the batched form keep their admission."""
+
+    module = _module()
+    rule = module.tail_full_grid_rule((10, 7))
+
+    def route(items, chunks, mode_varlen=True, has_z=False):
+        return module.tail_selected(
+            total_work=items,
+            chunks_per_item=chunks,
+            sm_count=212,
+            mode_varlen=mode_varlen,
+            full_grid_rule=rule,
+            has_z=has_z,
+        )
+
+    def full_grid(items):
+        return module._persistent_grid_size(total_work=items, sm_count=212) == 212
+
+    for items in range(213, 1100):
+        if not full_grid(items):
+            continue
+        for chunks in (8, 15, 16, 17, 24, 32, 64):
+            pair_rounds = math.ceil(items / 106)
+            waves = math.ceil(items / 212)
+            hand_off = (pair_rounds % 2) / chunks
+
+            def admitted(penalty):
+                return pair_rounds / 2 * (1 + penalty) + hand_off < waves
+
+            short = admitted(1 / 5)
+            long = admitted(1 / 8) if chunks >= 16 else short
+            assert route(items, chunks) is long, (items, chunks)
+            assert route(items, chunks, has_z=True) is short, (items, chunks)
+            if long and not short:
+                assert 425 <= items <= 530 or (637 <= items <= 742 and chunks > 16)
+            batched = module.tail_selected(
+                total_work=items,
+                chunks_per_item=chunks,
+                sm_count=212,
+                mode_varlen=False,
+                full_grid_rule=rule,
+                has_z=False,
+            )
+            assert batched is module.tail_selected(
+                total_work=items,
+                chunks_per_item=chunks,
+                sm_count=212,
+                mode_varlen=False,
+                full_grid_rule=rule,
+                has_z=True,
+            )
+    # perf_varlen_64x32 (512 items x 32 chunks, no z): 1.16x on R200
+    assert route(512, 32) and not route(512, 32, has_z=True)
+    assert route(512, 16) and not route(512, 16, has_z=True)
+    assert not route(512, 8) and not route(640, 16) and route(640, 32)
+    # the Blackwell default (no rule) never admits a full grid
+    assert not module.tail_selected(
+        total_work=512, chunks_per_item=32, sm_count=212, mode_varlen=True
+    )
