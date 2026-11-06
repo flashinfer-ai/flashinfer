@@ -72,12 +72,12 @@ def _row_id(row) -> str:
     return "s" + "_".join(map(str, lengths)) + f"-w{W}-{layout.split(':')[0]}-c{C}"
 
 
-def _partition(plan, lengths, W: int, layout: str):
+def _partition(partition, lengths, W: int, layout: str):
     cu = [0]
     for n in lengths:
         cu.append(cu[-1] + n)
     if not layout.startswith("ragged:"):
-        return plan.cake_kda_det_train_kcp_partition(cu, W, layout=layout), cu
+        return partition(cu, W, layout=layout), cu
     t_r = [int(x) for x in layout.split(":")[1].split(",")]
     assert len(t_r) == W and sum(t_r) == cu[-1]
     # contiguous ragged split of the global buffer, cut at document boundaries, in local order
@@ -96,7 +96,7 @@ def _partition(plan, lengths, W: int, layout: str):
             p = e
             d += 1
         pos = end
-    return plan.cake_kda_det_train_kcp_partition(cu, W, fragments=nested), cu
+    return partition(cu, W, fragments=nested), cu
 
 
 def _local(part, rank: int, cu: list[int], t: torch.Tensor) -> torch.Tensor:
@@ -220,7 +220,7 @@ def _run_rank(
         os.environ.setdefault("MASTER_PORT", str(port))
         dist.init_process_group("nccl", rank=rank, world_size=W, device_id=device)
     group = dist.group.WORLD
-    part, cu = _partition(plan, lengths, W, layout)
+    part, cu = _partition(plan.cake_kda_det_train_kcp_partition, lengths, W, layout)
     ctx = plan.cake_kda_det_train_kcp_build_context(
         part, group, rank, device, conv_kernel_size=WIDTH
     )

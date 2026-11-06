@@ -100,7 +100,7 @@ def _run_rank(
         os.environ.setdefault("MASTER_PORT", str(port))
         dist.init_process_group("nccl", rank=rank, world_size=W, device_id=device)
     group = dist.group.WORLD
-    part, cu = _partition(plan, lengths, W, layout)
+    part, cu = _partition(plan.cake_kda_det_train_kcp_partition, lengths, W, layout)
     ctx = plan.cake_kda_det_train_kcp_build_context(
         part, group, rank, device, conv_kernel_size=WIDTH
     )
