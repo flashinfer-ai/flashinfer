@@ -118,7 +118,7 @@ For vendoring builds that copy a backend directory.
 | `flashinfer/experimental/cake_gdn_det_train_kcp/` | - | det | `flashinfer/experimental/cake/cake_gdn_det_train_kcp/` | planned | KCP. |
 | `flashinfer/experimental/cake/cake_gdn_train/` | - | nondet | `flashinfer/experimental/cake/cake_gdn_nondet_train/` | #8959 | Single rank. Not the same directory as `flashinfer/experimental/cake_gdn_train/`. |
 | `flashinfer/experimental/cake_gdn_train_kcp/` | - | nondet, det by default | `flashinfer/experimental/cake/cake_gdn_nondet_train_kcp/` | #8959 | KCP. The facade `flashinfer.cake_gdn_train_kcp` routed the default to det; the directory accepted only `deterministic=False`. |
-| `flashinfer/experimental/cake_kda_train/` | det | det alias of `flashinfer/experimental/cake_kda_det_train/` and `flashinfer/experimental/cake_kda_det_train_kcp/` | `flashinfer/experimental/cake/cake_kda_det_train/` and `flashinfer/experimental/cake/cake_kda_det_train_kcp/` | planned | Held single rank and KCP. A KCP build needs both new directories. Not the same directory as `flashinfer/experimental/cake/cake_kda_train/`. |
+| `flashinfer/experimental/cake_kda_train/` | det | det alias of `flashinfer/experimental/cake_kda_det_train/` and `flashinfer/experimental/cake_kda_det_train_kcp/` | `flashinfer/experimental/cake/cake_kda_det_train/` and `flashinfer/experimental/cake/cake_kda_det_train_kcp/` | planned | Held single rank and KCP. A KCP build needs both new directories. Not the same directory as `flashinfer/experimental/cake/cake_kda_train/`. Removed from main by #8908. |
 | `flashinfer/experimental/cake_kda_det_train/` | - | det | `flashinfer/experimental/cake/cake_kda_det_train/` | planned | Single rank. |
 | `flashinfer/experimental/cake_kda_det_train_kcp/` | - | det | `flashinfer/experimental/cake/cake_kda_det_train_kcp/` | planned | KCP. Needs its single-rank sibling `flashinfer/experimental/cake/cake_kda_det_train/` (in 0.7.4rc1: `flashinfer/experimental/cake_kda_det_train/`). |
 | `flashinfer/experimental/cake/cake_kda_train/` | - | nondet, det by default | `flashinfer/experimental/cake/cake_kda_nondet_train/` | planned | Single rank. The facade `flashinfer.cake_kda_train` routed the default to det; the directory accepted only `deterministic=False`. Not the same directory as `flashinfer/experimental/cake_kda_train/`. |
@@ -381,7 +381,7 @@ The GDN PR #8959 renames the `nondet` modules; its description says that the `de
 | `flashinfer.experimental.cake_kda_train_kcp.ChunkKDAFunctionKcp` | 0.7.4rc1 | `flashinfer.cake_kda_nondet_train_kcp.CakeKDANondetKcpFunction` | planned |
 | package `flashinfer.experimental.cake_kda_train_kcp` | 0.7.4rc1 | package `flashinfer.experimental.cake.cake_kda_nondet_train_kcp` | planned |
 
-Planned: the other public names of these modules (for example `flashinfer.cake_kda_train_kcp.{kda_handoff_bytes_kcp, kcp_handoff_stats}`) get their final names in the KDA family PRs.
+On main, #8908 already removed the module `flashinfer.kda_train`, the package `flashinfer.experimental.cake_kda_train` and the names without `det` in `flashinfer.experimental.cake_kda_det_train` (`ChunkKDAFunction`, `KdaArena`, `KdaChunkSaved`, `KdaWorkspace`, `chunk_kda`, `chunk_kda_fwd`, `chunk_kda_bwd`). Planned: the other public names of these modules (for example `flashinfer.cake_kda_train_kcp.{kda_handoff_bytes_kcp, kcp_handoff_stats}`) get their final names in the KDA family PRs.
 
 ### MoE grouped GEMM
 
