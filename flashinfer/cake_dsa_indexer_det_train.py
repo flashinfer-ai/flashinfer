@@ -217,6 +217,31 @@ def cake_dsa_indexer_det_train_topk_workspace_size(
     the q / k dtype: ``torch.float8_e4m3fn`` bounds the FP8 form, whose
     programs differ.  Raises ``NotImplementedError`` while no generated program
     of the form is registered for the device's architecture.
+
+    Parameters
+    ----------
+    num_queries : int
+        ``T``, the number of packed queries of the call.
+    num_keys : int
+        ``Tkv``, the number of packed keys of the call.
+    num_segments : int
+        ``S``, the number of segments (``len(cu_seqlens_q) - 1``).
+    top_k : int
+        Output slots per query, as passed to :func:`cake_dsa_indexer_det_train_topk`
+        (default 2048).
+    ratio : int
+        Key compression ratio, as passed to :func:`cake_dsa_indexer_det_train_topk`
+        (default 1).
+    device : Optional[torch.device]
+        The device whose SM count and architecture select the scan program;
+        the current CUDA device when omitted.
+    dtype : torch.dtype
+        The q / k dtype: ``torch.bfloat16`` (default) or ``torch.float8_e4m3fn``.
+
+    Returns
+    -------
+    int
+        The workspace bound in bytes for this geometry.
     """
     return _backend().cake_dsa_indexer_det_train_topk_workspace_size(
         num_queries,

@@ -73,7 +73,8 @@ only where ``narrow`` is registered for the row's fit); the recorded
 ``forced_policy``), ``cake_main`` / ``cake_main_nosample`` (a
 second copy of the package loaded from ``--main-package DIR``, e.g. the
 ``flashinfer/experimental/cake/cake_dsa_indexer_det_train``
-directory of a FlashInfer main checkout, in the same process: the package is
+directory of a FlashInfer main checkout (``flashinfer/experimental/cake_dsa_indexer_det``
+in a checkout before flashinfer-ai/flashinfer#8928), in the same process: the package is
 self-contained -- relative imports, ``Path(__file__)`` manifest, JIT names
 salted by its own closure digests -- so both versions run on the same input
 tensors), ``cake_aa`` / ``cake_far_aa`` / ``cake_main_aa`` (the same arm prepared a second time:
@@ -149,6 +150,7 @@ Usage::
         [--reps 20] [--strided-k] [--verify] [--json out.json]
     python benchmarks/bench_cake_dsa_indexer_det_train.py --rows sink --arms cake,cake_nosample,cake_main,cake_main_nosample
         --main-package /path/to/main/flashinfer/experimental/cake/cake_dsa_indexer_det_train --cupti-required --json out.json
+        (a main checkout before flashinfer-ai/flashinfer#8928: --main-package /path/to/main/flashinfer/experimental/cake_dsa_indexer_det)
     python benchmarks/bench_cake_dsa_indexer_det_train.py --rows sink --arms cake,cake_far,cake_aa,cake_far_aa --cupti-required --json out.json
     python benchmarks/bench_cake_dsa_indexer_det_train.py --rows sink --arms cake,cake_wide,cake_l6,cake_pair_l6,cake_wide_c1 --cupti-required --json out.json
     python benchmarks/bench_cake_dsa_indexer_det_train.py --form fp8 --rows fp8 --arms cake_fp8,cake,deepgemm_topk,deepgemm_ragged_topk
@@ -1615,7 +1617,11 @@ def main():
     parser.add_argument(
         "--main-package",
         default=None,
-        help="directory of a second copy of the package (e.g. a FlashInfer main checkout's flashinfer/experimental/cake/cake_dsa_indexer_det_train) for the cake_main arms",
+        help=(
+            "directory of a second copy of the package (e.g. a FlashInfer main checkout's "
+            "flashinfer/experimental/cake/cake_dsa_indexer_det_train, or "
+            "flashinfer/experimental/cake_dsa_indexer_det in a checkout before #8928) for the cake_main arms"
+        ),
     )
     parser.add_argument(
         "--cupti-required",
