@@ -118,6 +118,12 @@ kernel_cake_mla_value_gate_00ca8bb1c760493fa672(__nv_bfloat16* latent, __nv_bflo
     int first_row = blockIdx.z * 16;
     int value = blockIdx.x * 32 + warp * 8 + group;
     int column = head * 128 + blockIdx.x * 32 + warp * 8 + 2 * quarter;
+    int read_rows[2];
+    int requests[2];
+    read_rows[0] = ((first_row + group < rows) ? first_row + group : first_row);
+    requests[0] = (int)((unsigned int)read_rows[0] / (unsigned int)rows_per_request);
+    read_rows[1] = ((first_row + group + 8 < rows) ? first_row + group + 8 : first_row);
+    requests[1] = (int)((unsigned int)read_rows[1] / (unsigned int)rows_per_request);
     unsigned int weights[64];
     #pragma unroll
     for (int c = 0; c < 16; c++) {
@@ -135,47 +141,58 @@ kernel_cake_mla_value_gate_00ca8bb1c760493fa672(__nv_bfloat16* latent, __nv_bflo
         }
     }
     asm volatile("griddepcontrol.wait;" ::: "memory");
-    #pragma unroll
-    for (int chunk = tid; chunk < 1024; chunk += 128) {
-        int tile_row = chunk >> 6;
-        bool live = first_row + tile_row < rows;
-        asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-            :: "r"(staged_addr + (unsigned int)((tile_row * 544 + 8 * (chunk & 63)) * 2)), "l"(latent + (((long long)((live) ? first_row + tile_row : first_row) * (long long)heads + (long long)head) * 512 + (long long)(8 * (chunk & 63)))), "r"(((live) ? 16 : 0)));
-    }
+    int stage_row = tid >> 6;
+    int stage_col = 8 * (tid & 63);
+    bool live_0 = first_row + stage_row < rows;
+    asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
+        :: "r"(staged_addr + (unsigned int)((stage_row * 544 + stage_col) * 2)), "l"(latent + (((long long)first_row * (long long)heads + (long long)head) * 512 + (long long)stage_col + ((live_0) ? (long long)stage_row * (long long)heads * 512 : 0))), "r"(((live_0) ? 16 : 0)));
+    bool live_1 = first_row + stage_row + 2 < rows;
+    asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
+        :: "r"(staged_addr + (unsigned int)(((stage_row + 2) * 544 + stage_col) * 2)), "l"(latent + (((long long)first_row * (long long)heads + (long long)head) * 512 + (long long)stage_col + ((live_1) ? (long long)(stage_row + 2) * (long long)heads * 512 : 0))), "r"(((live_1) ? 16 : 0)));
+    bool live_2 = first_row + stage_row + 4 < rows;
+    asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
+        :: "r"(staged_addr + (unsigned int)(((stage_row + 4) * 544 + stage_col) * 2)), "l"(latent + (((long long)first_row * (long long)heads + (long long)head) * 512 + (long long)stage_col + ((live_2) ? (long long)(stage_row + 4) * (long long)heads * 512 : 0))), "r"(((live_2) ? 16 : 0)));
+    bool live_3 = first_row + stage_row + 6 < rows;
+    asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
+        :: "r"(staged_addr + (unsigned int)(((stage_row + 6) * 544 + stage_col) * 2)), "l"(latent + (((long long)first_row * (long long)heads + (long long)head) * 512 + (long long)stage_col + ((live_3) ? (long long)(stage_row + 6) * (long long)heads * 512 : 0))), "r"(((live_3) ? 16 : 0)));
+    bool live_4 = first_row + stage_row + 8 < rows;
+    asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
+        :: "r"(staged_addr + (unsigned int)(((stage_row + 8) * 544 + stage_col) * 2)), "l"(latent + (((long long)first_row * (long long)heads + (long long)head) * 512 + (long long)stage_col + ((live_4) ? (long long)(stage_row + 8) * (long long)heads * 512 : 0))), "r"(((live_4) ? 16 : 0)));
+    bool live_5 = first_row + stage_row + 10 < rows;
+    asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
+        :: "r"(staged_addr + (unsigned int)(((stage_row + 10) * 544 + stage_col) * 2)), "l"(latent + (((long long)first_row * (long long)heads + (long long)head) * 512 + (long long)stage_col + ((live_5) ? (long long)(stage_row + 10) * (long long)heads * 512 : 0))), "r"(((live_5) ? 16 : 0)));
+    bool live_6 = first_row + stage_row + 12 < rows;
+    asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
+        :: "r"(staged_addr + (unsigned int)(((stage_row + 12) * 544 + stage_col) * 2)), "l"(latent + (((long long)first_row * (long long)heads + (long long)head) * 512 + (long long)stage_col + ((live_6) ? (long long)(stage_row + 12) * (long long)heads * 512 : 0))), "r"(((live_6) ? 16 : 0)));
+    bool live_7 = first_row + stage_row + 14 < rows;
+    asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
+        :: "r"(staged_addr + (unsigned int)(((stage_row + 14) * 544 + stage_col) * 2)), "l"(latent + (((long long)first_row * (long long)heads + (long long)head) * 512 + (long long)stage_col + ((live_7) ? (long long)(stage_row + 14) * (long long)heads * 512 : 0))), "r"(((live_7) ? 16 : 0)));
     asm volatile("cp.async.commit_group;");
     unsigned int gate_words[2];
     int request_lengths[2];
-    gate_words[0] = 0;
-    request_lengths[0] = 0;
-    if (first_row + group < rows) {
-        {
-            uint32_t _scalar_bits_1;
-            asm volatile("ld.global.cg.b32 %0, [%1];"
-                : "=r"(_scalar_bits_1) : "l"((const void*)(reinterpret_cast<unsigned int*>(gate + (long long)(first_row + group) * (long long)gate_pitch) + (column >> 1))) : "memory");
-            gate_words[0] = (unsigned int)_scalar_bits_1;
-        }
-        {
-            uint32_t _scalar_bits_2;
-            asm volatile("ld.global.cg.b32 %0, [%1];"
-                : "=r"(_scalar_bits_2) : "l"((const void*)(valid_lengths + ((int)((unsigned int)(first_row + group) / (unsigned int)rows_per_request)))) : "memory");
-            request_lengths[0] = (int32_t)_scalar_bits_2;
-        }
+    {
+        uint32_t _scalar_bits_1;
+        asm volatile("ld.global.cg.b32 %0, [%1];"
+            : "=r"(_scalar_bits_1) : "l"((const void*)(valid_lengths + (requests[0]))) : "memory");
+        request_lengths[0] = (int32_t)_scalar_bits_1;
     }
-    gate_words[1] = 0;
-    request_lengths[1] = 0;
-    if (first_row + group + 8 < rows) {
-        {
-            uint32_t _scalar_bits_3;
-            asm volatile("ld.global.cg.b32 %0, [%1];"
-                : "=r"(_scalar_bits_3) : "l"((const void*)(reinterpret_cast<unsigned int*>(gate + (long long)(first_row + group + 8) * (long long)gate_pitch) + (column >> 1))) : "memory");
-            gate_words[1] = (unsigned int)_scalar_bits_3;
-        }
-        {
-            uint32_t _scalar_bits_4;
-            asm volatile("ld.global.cg.b32 %0, [%1];"
-                : "=r"(_scalar_bits_4) : "l"((const void*)(valid_lengths + ((int)((unsigned int)(first_row + group + 8) / (unsigned int)rows_per_request)))) : "memory");
-            request_lengths[1] = (int32_t)_scalar_bits_4;
-        }
+    {
+        uint32_t _scalar_bits_2;
+        asm volatile("ld.global.cg.b32 %0, [%1];"
+            : "=r"(_scalar_bits_2) : "l"((const void*)(valid_lengths + (requests[1]))) : "memory");
+        request_lengths[1] = (int32_t)_scalar_bits_2;
+    }
+    {
+        uint32_t _scalar_bits_3;
+        asm volatile("ld.global.cg.b32 %0, [%1];"
+            : "=r"(_scalar_bits_3) : "l"((const void*)(reinterpret_cast<unsigned int*>(gate + (long long)read_rows[0] * (long long)gate_pitch) + (column >> 1))) : "memory");
+        gate_words[0] = (unsigned int)_scalar_bits_3;
+    }
+    {
+        uint32_t _scalar_bits_4;
+        asm volatile("ld.global.cg.b32 %0, [%1];"
+            : "=r"(_scalar_bits_4) : "l"((const void*)(reinterpret_cast<unsigned int*>(gate + (long long)read_rows[1] * (long long)gate_pitch) + (column >> 1))) : "memory");
+        gate_words[1] = (unsigned int)_scalar_bits_4;
     }
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     asm volatile("cp.async.wait_group 0;");
