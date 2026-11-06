@@ -66,11 +66,26 @@ def chunks_for(N: int, K: int, in_fmt: str = "bf16") -> int:
     return C
 
 
+#: The sm_107 instructions' classes of the MX formats (the sm_100 / sm_103 instructions' classes elsewhere).
+MX_SM107_CLASS = {"mxfp8": "mxfp8_k64", "mxfp4": "mxfp4_k128"}
+
+
 def mx_class_for(base: str, family: Optional[str]) -> str:
     """The MX class a part runs for an MX format: the sm_107 instruction's class (64 elements per step for mxfp8,
-    ``mxfp8_k64``) on the sm_107 parts, the sm_100 instruction's class (``mxfp8``) elsewhere. A function of the
-    architecture family only (the fingerprint is scoped to the architecture), never of the shape."""
-    return f"{base}_k64" if (base == "mxfp8" and family == "sm_107") else base
+    ``mxfp8_k64``; 128 for mxfp4, ``mxfp4_k128``) on the sm_107 parts, the sm_100 instruction's class (``mxfp8`` /
+    ``mxfp4``) elsewhere. A function of the architecture family only (the fingerprint is scoped to the architecture),
+    never of the shape."""
+    return MX_SM107_CLASS.get(base, base) if family == "sm_107" else base
+
+
+def fp4_class_for(N: int, K: int, family: Optional[str]) -> str:
+    """The NVFP4 class a part runs for a weight shape: on the sm_107 parts the sm_107 instruction's class (128 elements per
+    step, ``nvfp4_k128``) for every weight shape whose chunk rule at that step is unsplit, the sm_100 instruction's class
+    (``nvfp4``) for the split shapes; ``nvfp4`` elsewhere. A function of (N, K) and the architecture family only, never of M
+    (a token's bits may not depend on the batch), so a weight that takes the wider step at prefill takes it at decode too."""
+    if family == "sm_107" and chunks_for(N, K, "nvfp4_k128") == 1:
+        return "nvfp4_k128"
+    return "nvfp4"
 
 
 def rank_topk(

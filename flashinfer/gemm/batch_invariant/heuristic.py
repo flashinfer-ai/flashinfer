@@ -298,9 +298,10 @@ def estimate_cycles(
     flops = 2.0 * rows * tn * kk
     mma_eff = 1.0 if rows >= 128 else p["rows64_eff"]
     mma_cycles = flops / (rate * mma_eff)
-    # a narrow N tile (the CTA's share tn / group, in bytes): its B box wastes transactions for a row-major weight and each
-    # MMA's A-operand read is amortised over fewer MACs in either layout; the cost is measured alike in both layouts
-    wb = tn / group * eb
+    # a narrow N tile (the CTA's share tn / group, in bytes of a one-byte element): its B box wastes transactions for a
+    # row-major weight and each MMA's A-operand read is amortised over fewer MACs in either layout; the cost is measured
+    # alike in both layouts, per MMA column: a 4-bit element is a column like an 8-bit one
+    wb = tn / group * max(eb, 1.0)
     b_eff = (
         p["eff16b"]
         if wb <= 16

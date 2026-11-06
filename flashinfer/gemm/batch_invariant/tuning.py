@@ -32,30 +32,36 @@ from ...fused_moe.utils import (
 from ...batch_invariant.support import unsupported
 from .api import (
     CLASS,
+    CLASS_FP4,
     CLASS_FP8,
     CLASS_MXFP8,
+    MM_FP4_API_OUT_DTYPES,
     MM_MXFP8_API_OUT_DTYPES,
     bmm_fp8_batch_invariant,
+    fp4_format_for,
     mm_bf16_batch_invariant,
+    mm_fp4_batch_invariant,
     mm_mxfp8_batch_invariant,
     mx_format_for,
     part_of,
     prepare_bias,
     prepare_bmm_fp8_operands,
+    prepare_fp4_operands,
     prepare_mxfp8_operands,
     prepare_operands,
 )
 from .generator import Knobs
 from .schedule import chunks_for, default_config, rank_topk
-from .spec import sf_bytes
+from .spec import ELEM_BITS_OF, NVFP4_FMTS, sf_bytes
 
 #: The autotuner op names of the classes per API; ``skip_ops={"bf16_gemm_batch_invariant"}`` skips an API's profiling.
 CUSTOM_OP = "bf16_gemm_batch_invariant"
 CUSTOM_OP_BMM_FP8 = "fp8_bmm_batch_invariant"
 CUSTOM_OP_MM_MXFP8 = "mxfp8_gemm_batch_invariant"
+CUSTOM_OP_MM_FP4 = "fp4_gemm_batch_invariant"
 #: The APIs the runner serves and the position of the output in their input lists.
-APIS = ("mm_bf16", "bmm_fp8", "mm_mxfp8")
-OUT_INDEX = {"mm_bf16": 2, "bmm_fp8": 4, "mm_mxfp8": 4}
+APIS = ("mm_bf16", "bmm_fp8", "mm_mxfp8", "mm_fp4")
+OUT_INDEX = {"mm_bf16": 2, "bmm_fp8": 4, "mm_mxfp8": 4, "mm_fp4": 5}
 #: How many of the dispatcher's configurations the autotuner profiles per shape bucket.
 TOP_K = 10
 
@@ -63,6 +69,7 @@ __all__ = [
     "CUSTOM_OP",
     "CUSTOM_OP_BMM_FP8",
     "CUSTOM_OP_MM_MXFP8",
+    "CUSTOM_OP_MM_FP4",
     "TOP_K",
     "BatchInvariantGemmRunner",
     "BatchInvariantBf16GemmRunner",
@@ -71,6 +78,7 @@ __all__ = [
     "knobs_to_tactic",
     "mm_bf16_batch_invariant_auto",
     "mm_mxfp8_batch_invariant_auto",
+    "mm_fp4_batch_invariant_auto",
 ]
 
 
@@ -113,19 +121,26 @@ def knobs_from_tactic(t: Any) -> Knobs:
     )
 
 
-def _tuning_config(out_index: int, sf_index: Optional[int] = None) -> TuningConfig:
-    """inputs = [a, b, out, bias] / [A, B, A_scale, B_scale, out] / [a, b, a_descale, b_descale, out]: a's row count (its
-    second-to-last mode, also for the batched operands) is the tuned dimension (the hybrid token buckets of the GEMM
-    backends), out follows it, and so does the byte count of A's block scales (``sf_index``: the 128x4 swizzled layout of
-    the profiled row count, so the kernel never reads past the caller's buffer while a larger bucket is profiled); b is
-    static and lives in the profiling arena so that its layout is the caller's."""
+def _tuning_config(
+    out_index: int, sf_index: Optional[int] = None, in_fmt: str = "mxfp8"
+) -> TuningConfig:
+    """inputs = [a, b, out, bias] / [A, B, A_scale, B_scale, out] / [a, b, a_descale, b_descale, out] /
+    [a, b, a_descale, b_descale, alpha, out]: a's row count (its second-to-last mode, also for the batched operands) is
+    the tuned dimension (the hybrid token buckets of the GEMM backends), out follows it, and so does the byte count of A's
+    block scales (``sf_index``: the 128x4 swizzled layout of the profiled row count for the format's block size, so the
+    kernel never reads past the caller's buffer while a larger bucket is profiled; a's last mode is in the operand's own
+    units, bytes of two elements for the 4-bit formats); b is static and lives in the profiling arena so that its layout
+    is the caller's."""
     constraints = [ConstraintSpec(out_index, -2, lambda shapes: shapes[0][-2])]
     if sf_index is not None:
-        constraints.append(
-            ConstraintSpec(
-                sf_index, 0, lambda shapes: sf_bytes(shapes[0][-2], shapes[0][-1])
-            )
-        )
+        per_unit = (
+            2 if ELEM_BITS_OF[in_fmt] == 4 else 1
+        )  # elements per unit of a's last mode (byte-packed 4-bit formats)
+
+        def _sf(shapes, fmt: str = in_fmt, per_unit: int = per_unit) -> int:
+            return sf_bytes(shapes[0][-2], per_unit * shapes[0][-1], fmt)
+
+        constraints.append(ConstraintSpec(sf_index, 0, _sf))
     return TuningConfig(
         use_cuda_graph=True,
         use_cold_l2_graph_replay=True,
@@ -151,6 +166,10 @@ TUNING_CONFIG_BMM_FP8 = _tuning_config(
 TUNING_CONFIG_MM_MXFP8 = _tuning_config(
     OUT_INDEX["mm_mxfp8"], sf_index=2
 )  # inputs [a, b, a_descale, b_descale, out]
+TUNING_CONFIG_MM_FP4 = {  # inputs [a, b, a_descale, b_descale, alpha, out]; the scale bytes per block size
+    fmt: _tuning_config(OUT_INDEX["mm_fp4"], sf_index=2, in_fmt=fmt)
+    for fmt in ("nvfp4", "mxfp4")
+}
 
 
 class BatchInvariantGemmRunner(TunableRunner):
@@ -159,7 +178,9 @@ class BatchInvariantGemmRunner(TunableRunner):
     profiled shape. Any tactic computes the class, so a cached tactic from another bucket or another process is as
     correct as the default; one the kernel cannot implement for the real shape falls back to the default configuration.
     Inputs: ``mm_bf16`` ``[a (M, K), b (K, N), out]``; ``bmm_fp8`` ``[A (b, M, K), B (b, K, N), A_scale, B_scale, out]``;
-    ``mm_mxfp8`` ``[a (M, K), b (K, N), a_descale, b_descale, out]`` (the scales as flat uint8 buffers)."""
+    ``mm_mxfp8`` ``[a (M, K), b (K, N), a_descale, b_descale, out]`` (the scales as flat uint8 buffers); ``mm_fp4``
+    ``[a (M, K / 2), b (K / 2, N), a_descale, b_descale, alpha, out]`` (packed-fp4 bytes, the scales flat, alpha a
+    1-element fp32 tensor)."""
 
     def __init__(
         self,
@@ -180,7 +201,10 @@ class BatchInvariantGemmRunner(TunableRunner):
 
     def _shape(self, inputs: List[torch.Tensor]) -> tuple:
         a, b = inputs[0], inputs[1]
-        return a.shape[-2], b.shape[-1], a.shape[-1]
+        per_unit = (
+            2 if ELEM_BITS_OF[self.in_fmt] == 4 else 1
+        )  # the 4-bit formats arrive byte-packed: two elements per unit of a's K mode; every other format, one
+        return a.shape[-2], b.shape[-1], per_unit * a.shape[-1]
 
     def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
         return (
@@ -260,6 +284,23 @@ class BatchInvariantGemmRunner(TunableRunner):
                 sfb,
                 out,
                 out_dtype=out.dtype,
+                config=cfg,
+                chunks=self.chunks,
+                in_fmt=self.in_fmt,
+            )
+        if self.api == "mm_fp4":
+            a, b, sfa, sfb, alpha, out = inputs
+            nv = self.in_fmt in NVFP4_FMTS
+            return mm_fp4_batch_invariant(
+                a,
+                b,
+                sfa,
+                sfb,
+                alpha,
+                out.dtype,
+                out,
+                block_size=16 if nv else 32,
+                use_nvfp4=nv,
                 config=cfg,
                 chunks=self.chunks,
                 in_fmt=self.in_fmt,
@@ -389,6 +430,69 @@ def mm_mxfp8_batch_invariant_auto(
     inputs = [a, b, sfa, sfb, out]
     chosen, tactic = AutoTuner.get().choose_one(
         CUSTOM_OP_MM_MXFP8, [runner], TUNING_CONFIG_MM_MXFP8, inputs
+    )
+    chosen(inputs=inputs, tactic=tactic)
+    return out
+
+
+def mm_fp4_batch_invariant_auto(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
+    alpha: Optional[torch.Tensor],
+    out_dtype: torch.dtype,
+    out: Optional[torch.Tensor],
+    block_size: int,
+    use_8x4_sf_layout: bool,
+    backend: str,
+    use_nvfp4: bool,
+) -> torch.Tensor:
+    """``flashinfer.mm_fp4(a, b, a_descale, b_descale, alpha, ..., batch_invariant=True)``: the NVFP4 (``use_nvfp4=True``)
+    or MXFP4 class of the device's architecture and the weight shape behind the FlashInfer API's autotuner (the block
+    scales applied inside the instruction, the caller's scalar alpha applied once after the whole fold; bf16 or fp16
+    output; the 128x4 swizzled scale-factor layout only; a per-token alpha is not a class of the mode)."""
+    if backend != "auto":
+        raise unsupported(
+            CLASS_FP4,
+            f"backend={backend!r} together with batch_invariant=True",
+            'backend="auto" (the flag selects the batch-invariant class in place of the backends)',
+        )
+    if use_8x4_sf_layout:
+        raise unsupported(
+            CLASS_FP4,
+            "the 8x4 scale-factor layout (use_8x4_sf_layout=True)",
+            "the 128x4 swizzled layout (nvfp4_quantize(..., sfLayout=SfLayout.layout_128x4, do_shuffle=False) / mxfp4_quantize)",
+        )
+    if block_size != (16 if use_nvfp4 else 32):
+        raise unsupported(
+            CLASS_FP4,
+            f"block_size={block_size} with use_nvfp4={use_nvfp4}",
+            "block_size 16 for NVFP4 and 32 for MXFP4 (the formats' block scales)",
+        )
+    a, b, sfa, sfb, alpha, out, M, N, K = prepare_fp4_operands(
+        a,
+        b,
+        a_descale,
+        b_descale,
+        alpha,
+        out,
+        out_dtype,
+        use_nvfp4,
+        MM_FP4_API_OUT_DTYPES,
+    )
+    if M == 0:
+        return out
+    in_fmt = fp4_format_for(a.device, use_nvfp4, N, K)
+    runner = _runner(
+        "mm_fp4", in_fmt, "k", chunks_for(N, K, in_fmt), *part_of(a.device)
+    )
+    inputs = [a, b, sfa, sfb, alpha, out]
+    chosen, tactic = AutoTuner.get().choose_one(
+        CUSTOM_OP_MM_FP4,
+        [runner],
+        TUNING_CONFIG_MM_FP4["nvfp4" if use_nvfp4 else "mxfp4"],
+        inputs,
     )
     chosen(inputs=inputs, tactic=tactic)
     return out
