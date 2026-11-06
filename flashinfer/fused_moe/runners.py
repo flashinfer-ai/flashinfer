@@ -7920,11 +7920,16 @@ class PrimsTsRunner(_TrtllmRunnerBase):
             output.dtype != torch.bfloat16
             or tuple(output.shape) != (num_tokens, hidden_size)
             or not output.is_contiguous()
+            or output.device != act.hidden_states_q.device
+            # The finalize kernels store 16-byte vectors.
+            or output.data_ptr() % 16 != 0
         ):
             raise ValueError(
-                f"{type(self).__name__} output must be a contiguous bfloat16 "
-                f"[{num_tokens}, {hidden_size}] tensor, got {output.dtype} "
-                f"{tuple(output.shape)}."
+                f"{type(self).__name__} output must be a contiguous, 16-byte "
+                f"aligned bfloat16 [{num_tokens}, {hidden_size}] tensor on "
+                f"{act.hidden_states_q.device}, got {output.dtype} "
+                f"{tuple(output.shape)} on {output.device} at "
+                f"{output.data_ptr():#x}."
             )
         moe_inputs = MoeRunnerInputs(
             output=output,

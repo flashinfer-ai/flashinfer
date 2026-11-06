@@ -3716,7 +3716,8 @@ class MoEActivationPack:
     routing_bias: Optional[Tensor] = field(
         default=None, kw_only=True
     )  # [num_experts] bfloat16 or float32 (independent of logits dtype)
-    # Optional contiguous [M, H] bfloat16 buffer for the finalized output.
+    # Optional contiguous, 16-byte aligned [M, H] bfloat16 buffer on the
+    # device of the activations, for the finalized output.
     # Runners that write it in place (Prims-TS) write it here and return it;
     # the others allocate their own. Callers use the returned tensor.
     output: Optional[Tensor] = field(default=None, kw_only=True)

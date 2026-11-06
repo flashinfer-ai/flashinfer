@@ -592,6 +592,9 @@ def test_split_layer_leaves_rows_the_combine_never_reads(lamport, monkeypatch):
     try:
         # Tunes the fused MoE, so both measured calls run the same tactics.
         layer(t)
+        # The ranks agree on the transport, so they all skip together.
+        if lamport and not layer._communication.lamport_enabled:
+            pytest.skip("the Lamport transport is unavailable here")
         monkeypatch.setattr(FusedMoeSplitKernelBackend, "compute", compute_into_nan)
         skipped = layer(t)
         monkeypatch.setattr(
