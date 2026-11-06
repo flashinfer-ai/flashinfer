@@ -20,7 +20,7 @@ The packed batch is split over the ranks of a process group (``partition_det_kcp
 holds its fragments of the documents, and the per-document state recurrences cross the rank
 boundaries through the plan's collectives (``build_context_det_kcp``).  The per-rank launch
 sequences, the autograd Function, the plan and the generated kernels live in
-``flashinfer.experimental.cake_kda_det_train_kcp``; the single-rank entry points are in
+``flashinfer.experimental.cake.cake_kda_det_train_kcp``; the single-rank entry points are in
 ``flashinfer.cake_kda_det_train``::
 
     from flashinfer.cake_kda_det_train_kcp import partition_det_kcp, build_context_det_kcp, chunk_kda_det_kcp
@@ -46,7 +46,7 @@ import torch
 from .api_logging import flashinfer_experimental_api
 from .cake_kda_det_train import _FEATURE, DEFAULT_SCALE
 
-# The KCP entry points forward to ``flashinfer.experimental.cake_kda_det_train_kcp.cake_kcp`` (the per-rank
+# The KCP entry points forward to ``flashinfer.experimental.cake.cake_kda_det_train_kcp.cake_kcp`` (the per-rank
 # launch sequences over the kernels of the ``cake_kcp_jit`` registry) and ``cake_kcp_plan`` (the partition, the
 # context's tables and collectives, the byte queries).  Every keyword is forwarded; nothing is validated here.
 
@@ -78,7 +78,7 @@ def partition_det_kcp(
     ``PartitionDetKcp``: per rank its fragments (document, token range) of the batch; the input of
     :func:`build_context_det_kcp` on every rank.
     """
-    from .experimental.cake_kda_det_train_kcp import cake_kcp_plan
+    from .experimental.cake.cake_kda_det_train_kcp import cake_kcp_plan
 
     return cake_kcp_plan.partition_det_kcp(
         cu_seqlens_global_cpu, world_size, layout, fragments, cut_points=cut_points
@@ -126,7 +126,7 @@ def build_context_det_kcp(
     -------
     ``ContextDetKcp``: the argument every KCP entry point takes; reusable across calls of the same batch layout.
     """
-    from .experimental.cake_kda_det_train_kcp import cake_kcp_plan
+    from .experimental.cake.cake_kda_det_train_kcp import cake_kcp_plan
 
     return cake_kcp_plan.build_context_det_kcp(
         part,
@@ -206,7 +206,7 @@ def chunk_kda_det_fwd_kcp(
     -------
     ``(out, saved)``: ``out`` BF16 like ``v`` (this rank's tokens); ``saved`` a ``SavedDetKcp`` or ``None``.
     """
-    from .experimental.cake_kda_det_train_kcp import cake_kcp
+    from .experimental.cake.cake_kda_det_train_kcp import cake_kcp
 
     return cake_kcp.chunk_kda_det_fwd_kcp(
         q,
@@ -270,7 +270,7 @@ def chunk_kda_det_bwd_kcp(
     replicated parameter, or with :func:`reduce_gate_param_grads_det_kcp` for a bitwise reproducible sum (an NCCL
     all-reduce does not fix its summation order).
     """
-    from .experimental.cake_kda_det_train_kcp import cake_kcp
+    from .experimental.cake.cake_kda_det_train_kcp import cake_kcp
 
     return cake_kcp.chunk_kda_det_bwd_kcp(
         q,
@@ -345,7 +345,7 @@ def chunk_kda_det_kcp(
     torch.Tensor
         BF16 ``out`` like ``v`` (this rank's tokens).
     """
-    from .experimental.cake_kda_det_train_kcp import cake_kcp
+    from .experimental.cake.cake_kda_det_train_kcp import cake_kcp
 
     return cake_kcp.chunk_kda_det_kcp(
         q,
@@ -400,7 +400,7 @@ def kda_det_workspace_bytes_kcp(
     change).  ``use_qk_l2norm_in_kernel``: the workspace's in-kernel Q / K L2 norm mode
     (``WorkspaceDetKcp(use_qk_l2norm_in_kernel=True)``: the local arena of that mode, the replay arena; the pools do
     not change)."""
-    from .experimental.cake_kda_det_train_kcp import cake_kcp_plan
+    from .experimental.cake.cake_kda_det_train_kcp import cake_kcp_plan
 
     if save_transfer is None:
         save_transfer = cake_kcp_plan.SAVE_TRANSFER_DEFAULT
@@ -427,7 +427,7 @@ def reduce_gate_param_grads_det_kcp(
     rank gets the same bits under every schedule.  An NCCL all-reduce gives the same sum to FP32 rounding but does
     not fix its summation order.  A collective: every rank of ``ctx.group`` calls it.  With ``world_size == 1``
     copies of the inputs; with ``world_size > 1`` and no initialized process group it raises ``RuntimeError``."""
-    from .experimental.cake_kda_det_train_kcp import cake_kcp
+    from .experimental.cake.cake_kda_det_train_kcp import cake_kcp
 
     return cake_kcp.reduce_gate_param_grads_det_kcp(ctx, dA_log, ddt_bias)
 
@@ -454,7 +454,7 @@ def kda_det_saved_bytes_kcp(
     bytes (a recompute handle's bytes do not change).  ``use_gate_in_kernel``: the call's gate mode; the bytes do not
     depend on it, but with ``use_qk_l2norm_in_kernel=True`` the query raises ``NotImplementedError`` while the
     in-kernel Q / K L2 norm is not available in that gate mode, as the call does."""
-    from .experimental.cake_kda_det_train_kcp import cake_kcp_plan
+    from .experimental.cake.cake_kda_det_train_kcp import cake_kcp_plan
 
     if save_transfer is None and checkpoint_keep is None:
         save_transfer = False
@@ -486,7 +486,7 @@ def kda_det_comm_bytes_kcp(
     as a table per collective and per boundary (``cake_kcp_plan.kda_det_comm_bytes_kcp``).  ``checkpoint_keep``: the
     traffic of a checkpointed step with a recompute handle of that tier (the tier fixes ``save_transfer``; ``None``
     is ``False`` without a tier; an explicit value that contradicts the tier raises ``ValueError``)."""
-    from .experimental.cake_kda_det_train_kcp import cake_kcp_plan
+    from .experimental.cake.cake_kda_det_train_kcp import cake_kcp_plan
 
     if save_transfer is None and checkpoint_keep is None:
         save_transfer = False
@@ -519,7 +519,9 @@ def __getattr__(name: str) -> Any:
     from importlib import import_module  # noqa: PLC0415
 
     return getattr(
-        import_module(f"flashinfer.experimental.cake_kda_det_train_kcp.{submodule}"),
+        import_module(
+            f"flashinfer.experimental.cake.cake_kda_det_train_kcp.{submodule}"
+        ),
         name,
     )
 

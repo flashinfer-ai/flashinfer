@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 flashinfer public-API tests of the Cake deterministic context-parallel (KCP) packed KDA training package
-(``flashinfer.experimental.cake_kda_det_train_kcp``), device-free: the keywords the entry points of
+(``flashinfer.experimental.cake.cake_kda_det_train_kcp``), device-free: the keywords the entry points of
 ``flashinfer.cake_kda_det_train_kcp`` forward, the det names of the facade, the package and its modules, and the
 absence of the names before the det rename.
 """
@@ -33,7 +33,9 @@ from flashinfer.api_logging import ExperimentalWarning
 
 pytestmark = pytest.mark.cpu_only
 
-PACKAGE = "flashinfer.experimental.cake_kda_det_train_kcp"
+PACKAGE = "flashinfer.experimental.cake.cake_kda_det_train_kcp"
+# the package path before the move under flashinfer/experimental/cake/ (#8928 rule 1): no alias
+PREVIOUS_PACKAGE = "flashinfer.experimental.cake_kda_det_train_kcp"
 
 # the entry points of flashinfer.cake_kda_det_train_kcp
 FACADE_NAMES = (
@@ -142,6 +144,14 @@ def test_previous_names_are_gone(old: str) -> None:
     assert old not in dir(kcp_api) and old not in dir(package)
 
 
+@pytest.mark.parametrize(
+    "module", ("", ".cake_kcp", ".cake_kcp_plan", ".cake_kcp_jit", ".cake_build")
+)
+def test_previous_package_path_is_gone(module: str) -> None:
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module(f"{PREVIOUS_PACKAGE}{module}")
+
+
 def test_errors_name_the_det_entry_points() -> None:
     plan = importlib.import_module(f"{PACKAGE}.cake_kcp_plan")
     with pytest.raises(ValueError, match=r"^partition_det_kcp: "):
@@ -171,7 +181,7 @@ def test_workspace_query_resolves_save_transfer_like_the_forward(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # An unset save_transfer resolves to the plan default, as the a2a forward does; an explicit value passes through.
-    from flashinfer.experimental.cake_kda_det_train_kcp import cake_kcp_plan
+    from flashinfer.experimental.cake.cake_kda_det_train_kcp import cake_kcp_plan
 
     calls = []
     monkeypatch.setattr(
@@ -207,7 +217,10 @@ def test_recompute_handle_keywords_are_forwarded(
     ``kda_det_saved_bytes_kcp`` / ``kda_det_comm_bytes_kcp`` forward ``checkpoint_keep`` (and ``save_transfer=None`` under a tier,
     ``False`` without one); ``RecomputeHandleDetKcp`` resolves lazily to
     the KCP module's class.  Device-free (recorders)."""
-    from flashinfer.experimental.cake_kda_det_train_kcp import cake_kcp, cake_kcp_plan
+    from flashinfer.experimental.cake.cake_kda_det_train_kcp import (
+        cake_kcp,
+        cake_kcp_plan,
+    )
 
     calls = []
 
@@ -320,7 +333,10 @@ def test_public_module_forwards_the_raw_gate(monkeypatch: pytest.MonkeyPatch) ->
     reads it for the in-kernel Q / K L2 norm's check) and ``reduce_gate_param_grads_det_kcp`` forwards to the KCP
     module's helper,
     which the package lists in ``__all__``.  Device-free (recorders)."""
-    from flashinfer.experimental.cake_kda_det_train_kcp import cake_kcp, cake_kcp_plan
+    from flashinfer.experimental.cake.cake_kda_det_train_kcp import (
+        cake_kcp,
+        cake_kcp_plan,
+    )
 
     package = importlib.import_module(PACKAGE)
     assert "reduce_gate_param_grads_det_kcp" in package.__all__
@@ -383,7 +399,10 @@ def test_public_module_forwards_the_qk_l2norm(monkeypatch: pytest.MonkeyPatch) -
     """The in-kernel Q / K L2 norm on the public module (issue #7817): ``use_qk_l2norm_in_kernel`` is a keyword-only
     ``bool = False`` of the three KCP wrappers and the workspace / saved byte queries, and each forwards it to the
     KCP module unchanged.  Device-free (recorders)."""
-    from flashinfer.experimental.cake_kda_det_train_kcp import cake_kcp, cake_kcp_plan
+    from flashinfer.experimental.cake.cake_kda_det_train_kcp import (
+        cake_kcp,
+        cake_kcp_plan,
+    )
 
     for name in (
         "chunk_kda_det_fwd_kcp",

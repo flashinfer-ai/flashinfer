@@ -682,7 +682,7 @@ def _memory(step, forward, dout: torch.Tensor, device: torch.device) -> tuple[in
 def _stage_of_symbol() -> dict[str, tuple[str, str]]:
     """The kernel symbols of the local stages and of the KCP programs: symbol -> (record, stage)."""
     from flashinfer.experimental.cake_kda_det_train import cake_jit
-    from flashinfer.experimental.cake_kda_det_train_kcp import cake_kcp_jit
+    from flashinfer.experimental.cake.cake_kda_det_train_kcp import cake_kcp_jit
 
     out = {}
     for default, modules in (

@@ -62,11 +62,11 @@ from tests.test_helpers.cake_host_sync import (
 from tests.test_helpers.cake_kda_train_kcp_saved import written_tensors
 from tests.test_helpers.cake_package import cake_package
 
-kp = cake_package("cake_kda_det_train_kcp", "cake_kcp_plan")
-cake_kcp = cake_package("cake_kda_det_train_kcp", "cake_kcp")
+kp = cake_package("cake.cake_kda_det_train_kcp", "cake_kcp_plan")
+cake_kcp = cake_package("cake.cake_kda_det_train_kcp", "cake_kcp")
 cake_backend = cake_package("cake_kda_det_train", "cake_backend")
 cake_jit = cake_package("cake_kda_det_train", "cake_jit")
-cake_kcp_jit = cake_package("cake_kda_det_train_kcp", "cake_kcp_jit")
+cake_kcp_jit = cake_package("cake.cake_kda_det_train_kcp", "cake_kcp_jit")
 
 LEAN = kp.LOCAL_LAYOUT_BWD_LEAN
 CONTRACT_HEADS = (1, 2, 4, 8, 16, 32, 64)

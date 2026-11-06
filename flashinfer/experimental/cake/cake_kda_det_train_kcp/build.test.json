@@ -439,6 +439,6 @@
       ]
     }
   ],
-  "package": "flashinfer.experimental.cake_kda_det_train_kcp",
+  "package": "flashinfer.experimental.cake.cake_kda_det_train_kcp",
   "schema": "cake-build/1"
 }

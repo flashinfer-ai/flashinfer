@@ -312,7 +312,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from ..cake_kda_det_train import cake_backend, cake_jit
+from ...cake_kda_det_train import cake_backend, cake_jit
 from . import cake_kcp_plan
 
 D = cake_backend.D  # head dimension (128)
