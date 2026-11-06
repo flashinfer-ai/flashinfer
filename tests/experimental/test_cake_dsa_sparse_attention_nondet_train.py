@@ -26,8 +26,10 @@ import pytest
 import torch
 from torch.utils.checkpoint import checkpoint
 
-from tests.test_helpers import cake_dsa_train_reference as nope_ref
-from tests.test_helpers.cake_dsa_train_reference import (
+from tests.test_helpers import (
+    cake_dsa_sparse_attention_nondet_train_reference as nope_ref,
+)
+from tests.test_helpers.cake_dsa_sparse_attention_nondet_train_reference import (
     calibrate_beta,
     compact_rows,
     compact_rows_loop,
@@ -43,11 +45,13 @@ from tests.test_helpers.cake_package import cake_package
 # The backend suite names its package once, through the shared alias helper, and imports nothing else from
 # flashinfer: a build that vendors the package under another import path runs it unchanged after pointing the
 # ``PACKAGES`` entry at its own package.  The flashinfer public entry points and the environment variables the
-# flashinfer wrapper resolves into the package's keyword switches are covered by ``test_cake_dsa_train_api.py``.
-cake_backend = cake_package("cake_dsa_train", "cake_backend")
-cake_build = cake_package("cake_dsa_train", "cake_build")
-cake_jit = cake_package("cake_dsa_train", "cake_jit")
-cake_launch = cake_package("cake_dsa_train", "cake_launch")
+# flashinfer wrapper resolves into the package's keyword switches are covered by ``test_cake_dsa_sparse_attention_nondet_train_api.py``.
+cake_backend = cake_package(
+    "cake.cake_dsa_sparse_attention_nondet_train", "cake_backend"
+)
+cake_build = cake_package("cake.cake_dsa_sparse_attention_nondet_train", "cake_build")
+cake_jit = cake_package("cake.cake_dsa_sparse_attention_nondet_train", "cake_jit")
+cake_launch = cake_package("cake.cake_dsa_sparse_attention_nondet_train", "cake_launch")
 D_LATENT = cake_backend.D_LATENT
 D_QK = cake_backend.D_QK
 D_ROPE = cake_backend.D_ROPE
@@ -2420,7 +2424,7 @@ def test_autograd_function_with_dkv_acc_returns_no_kv_grads_and_accumulates():
     ]
     S = inp.total_k
     acc = torch.zeros(S, D_QK, device="cuda")
-    out, lse = cake_backend.DSASparseAttentionFunction.apply(
+    out, lse = cake_backend.CakeDSASparseAttentionNondetFunction.apply(
         *leaves, inp.idx_global, None, default_softmax_scale(), None, acc, None
     )
     out.backward(inp.dout)
@@ -2433,7 +2437,7 @@ def test_autograd_function_with_dkv_acc_returns_no_kv_grads_and_accumulates():
         S, device="cuda", generator=torch.Generator(device="cuda").manual_seed(5)
     ).to(torch.int32)
     acc_p = torch.zeros(S, D_QK, device="cuda")
-    out2, _ = cake_backend.DSASparseAttentionFunction.apply(
+    out2, _ = cake_backend.CakeDSASparseAttentionNondetFunction.apply(
         *leaves, inp.idx_global, None, default_softmax_scale(), None, acc_p, perm
     )
     out2.backward(inp.dout)
@@ -2450,7 +2454,7 @@ def test_autograd_function_with_dkv_acc_returns_no_kv_grads_and_accumulates():
 # ---------------------------------------------------------------------------
 #
 # The NoPE entries (``forward_nope`` / ``backward_nope`` / ``prepare_dsa_nope_train`` /
-# ``DSASparseAttentionNopeFunction``) share the host layer with the rope program through the ``program`` keyword
+# ``CakeDSASparseAttentionNondetNopeFunction``) share the host layer with the rope program through the ``program`` keyword
 # of every stage-name consumer.  The host-level tests below run everywhere.  The plan-level tests run on a
 # supported device over the registered record completed with stand-in entries whose launch entries record their
 # arguments (no kernel runs), so the plans, bound values and launch sequences are covered before every library is
@@ -3186,7 +3190,7 @@ def test_nope_varlen_backend_entry_checks_cu_seqlens_before_any_device_work():
     structure on every call, their values with ``check_cu_seqlens=True`` (the default leaves the values to the
     caller: that check synchronizes with the device)."""
     q, kv, idx = _nope_host_inputs()
-    varlen = cake_backend.dsa_sparse_attention_nope_varlen
+    varlen = cake_backend.cake_dsa_sparse_attention_nondet_nope_varlen
     with pytest.raises(ValueError, match=r"cu_seqlens_k\[-1\]"):
         varlen(q, kv, idx, _i32(0, 8), _i32(0, 12), 8, 12, check_cu_seqlens=True)
     with pytest.raises(ValueError, match="seqlen_q"):
@@ -3879,7 +3883,7 @@ def test_nope_eager_entries_without_query_rows_neither_bind_nor_launch(monkeypat
     with pytest.raises(ValueError, match="derive_topk_length"):
         forward_nope(q, kv, idx, derive_topk_length=True)
     # the autograd function without query rows: empty out / lse, no gradient flow needed
-    out, lse = cake_backend.DSASparseAttentionNopeFunction.apply(
+    out, lse = cake_backend.CakeDSASparseAttentionNondetNopeFunction.apply(
         q, kv, idx, None, NOPE_SOFTMAX_SCALE
     )
     assert tuple(out.shape) == (0, NUM_HEADS, D_LATENT) and tuple(lse.shape) == (
@@ -4124,7 +4128,7 @@ def test_nope_index_prep_launch_values(monkeypatch):
     # the packed entry: the compacting stage into the fresh global-row buffer and counts, then the forward over
     # those rows with convert = 0 (the conversion operands bound but never read), reading the stage's counts
     q, kv, _ = _nope_host_inputs(total_q=T, total_k=18, topk=K, device="cuda")
-    varlen = cake_backend.dsa_sparse_attention_nope_varlen
+    varlen = cake_backend.cake_dsa_sparse_attention_nondet_nope_varlen
     out, lse = varlen(q, kv, local, cu_q, cu_k, causal=True, return_lse=True)
     assert [c[0] for c in calls] == [NOPE_INDEX_PREP_STAGE, "nope_fwd"]
     prep, fwd = calls[0][1], calls[1][1]
@@ -4204,7 +4208,7 @@ def test_nope_flat_entry_route_follows_the_table_size(monkeypatch, route):
     assert cake_backend.nope_flat_index_mode(T, K) == route
     q, kv, idx, _ = _nope_device_inputs(T, S, K)
     q.requires_grad_()
-    out = cake_backend.dsa_sparse_attention_nope(q, kv, idx)
+    out = cake_backend.cake_dsa_sparse_attention_nondet_nope(q, kv, idx)
     saved = out.grad_fn.saved_tensors  # (q, kv, out, lse, o_lo, rows, lengths)
     assert len(saved) == 7 and out.grad_fn.nope_prep.has_topk_length
     wide = torch.zeros(T, K + 8, dtype=torch.int32, device="cuda")
@@ -4230,7 +4234,7 @@ def test_nope_flat_entry_route_follows_the_table_size(monkeypatch, route):
         # a column slice of a wider buffer is read in place by the forward (its stride and offset); the never-read
         # ``indices_out`` operand is then the contiguous span of its storage (the binding takes contiguous pointers)
         del calls[:]
-        cake_backend.dsa_sparse_attention_nope(q, kv, wide[:, 3 : 3 + K])
+        cake_backend.cake_dsa_sparse_attention_nondet_nope(q, kv, wide[:, 3 : 3 + K])
         assert [c[0] for c in calls] == ["nope_fwd"]
         fwd = calls[0][1]
         assert (fwd["idx_stride"], fwd["indices_offset"]) == (K + 8, 3)
@@ -4270,14 +4274,16 @@ def test_nope_flat_entry_route_follows_the_table_size(monkeypatch, route):
         assert saved[6].data_ptr() == prep["topk_length"].data_ptr()
         # a column slice of a wider buffer and a view inside a storage are read in place by the flat stage
         del calls[:]
-        cake_backend.dsa_sparse_attention_nope(q, kv, wide[:, 3 : 3 + K])
+        cake_backend.cake_dsa_sparse_attention_nondet_nope(q, kv, wide[:, 3 : 3 + K])
         prep = calls[0][1]
         assert (prep["idx_stride"], prep["indices_offset"]) == (K + 8, 3)
         assert prep["indices"].data_ptr() == wide.data_ptr()
     # caller lengths: unchanged on either route -- the forward alone over the caller's rows, no stage launch
     mine = torch.full((T,), 3, dtype=torch.int32, device="cuda")
     del calls[:]
-    out_m = cake_backend.dsa_sparse_attention_nope(q, kv, idx, topk_length=mine)
+    out_m = cake_backend.cake_dsa_sparse_attention_nondet_nope(
+        q, kv, idx, topk_length=mine
+    )
     assert [c[0] for c in calls] == ["nope_fwd"]
     fwd = calls[0][1]
     assert fwd["indices"].data_ptr() == idx.data_ptr() and fwd["topk_length"] is mine
@@ -4349,7 +4355,7 @@ def test_nope_varlen_index_mode_follows_the_table_size(monkeypatch):
     cu_q = torch.tensor([0, 1024], dtype=torch.int32, device="cuda")
     cu_k = torch.tensor([0, 1024], dtype=torch.int32, device="cuda")
     q, kv, _ = _nope_host_inputs(total_q=1024, total_k=1024, topk=1024, device="cuda")
-    varlen = cake_backend.dsa_sparse_attention_nope_varlen
+    varlen = cake_backend.cake_dsa_sparse_attention_nondet_nope_varlen
     # at or above the limit: the stage, then the forward over its rows
     del calls[:]
     varlen(q, kv, large, cu_q, cu_k)
@@ -4479,7 +4485,7 @@ def test_nope_autograd_backward_is_settled_at_forward_and_launches_back_to_back(
     acc = torch.empty(S, D_LATENT, device="cuda")
     # the packed entry with a caller accumulator: the check runs at forward time, the backward allocates dq and
     # delta, binds and launches delta + main with no fill (the caller owns the zeroing)
-    out, lse = cake_backend.dsa_sparse_attention_nope_varlen(
+    out, lse = cake_backend.cake_dsa_sparse_attention_nondet_nope_varlen(
         q, kv, local, cu_q, cu_k, return_lse=True, dkv_acc=acc
     )
     prep = out.grad_fn.nope_prep
@@ -4507,7 +4513,7 @@ def test_nope_autograd_backward_is_settled_at_forward_and_launches_back_to_back(
     # the flat entry without an accumulator: the fresh dkv's zero fill sits right before the stages
     del events[:], calls[:]
     idx = torch.zeros(T, K, dtype=torch.int32, device="cuda")
-    out2 = cake_backend.dsa_sparse_attention_nope(q, kv, idx)
+    out2 = cake_backend.cake_dsa_sparse_attention_nondet_nope(q, kv, idx)
     assert (
         len(out2.grad_fn.saved_tensors) == 7 and out2.grad_fn.nope_prep.dkv_acc is None
     )
@@ -4703,7 +4709,7 @@ def test_nope_kernel_level_packed_pair_matches_the_autograd_entry(
     S = inp.total_k
     q = inp.q.detach().requires_grad_()
     acc = torch.zeros(S, D_LATENT, device="cuda")
-    out, lse = cake_backend.dsa_sparse_attention_nope_varlen(
+    out, lse = cake_backend.cake_dsa_sparse_attention_nondet_nope_varlen(
         q,
         inp.kv,
         inp.idx_local,
@@ -4786,7 +4792,7 @@ def test_nope_packed_entry_route_when_the_forward_program_converts(monkeypatch):
     wide = torch.zeros(T, K + 8, dtype=torch.int32, device="cuda")
     wide[:, 3 : 3 + K] = local
     q, kv, _ = _nope_host_inputs(total_q=T, total_k=18, topk=K, device="cuda")
-    varlen = cake_backend.dsa_sparse_attention_nope_varlen
+    varlen = cake_backend.cake_dsa_sparse_attention_nondet_nope_varlen
     varlen(q, kv, wide[:, 3 : 3 + K], cu_q, cu_k, causal=True)
     assert [c[0] for c in calls] == [NOPE_INDEX_PREP_STAGE, "nope_fwd"]
     prep, v = calls[0][1], calls[1][1]
@@ -5868,7 +5874,7 @@ def test_nope_autograd_function_matches_explicit_backward():
     out, lse, o_lo = forward_nope(inp.q, inp.kv, inp.idx_global)
     dq, dkv = backward_nope(inp.q, inp.kv, inp.idx_global, out, o_lo, lse, inp.dout)
     leaves = [t.detach().clone().requires_grad_() for t in (inp.q, inp.kv)]
-    out_f, lse_f = cake_backend.DSASparseAttentionNopeFunction.apply(
+    out_f, lse_f = cake_backend.CakeDSASparseAttentionNondetNopeFunction.apply(
         *leaves, inp.idx_global, None, NOPE_SOFTMAX_SCALE
     )
     with pytest.raises(NotImplementedError, match="lse"):
@@ -5881,7 +5887,7 @@ def test_nope_autograd_function_matches_explicit_backward():
     assert rel_l2(leaves[1].grad, dkv) < 1e-2
     acc = torch.zeros(inp.total_k, D_LATENT, device="cuda")
     leaves = [t.detach().clone().requires_grad_() for t in (inp.q, inp.kv)]
-    out_f, _ = cake_backend.DSASparseAttentionNopeFunction.apply(
+    out_f, _ = cake_backend.CakeDSASparseAttentionNondetNopeFunction.apply(
         *leaves, inp.idx_global, None, NOPE_SOFTMAX_SCALE, None, acc
     )
     out_f.backward(inp.dout)
@@ -5893,12 +5899,12 @@ def test_nope_autograd_function_matches_explicit_backward():
 def test_nope_backend_entry_squeezes_the_one_head_kv():
     _require_nope_program(backward=True)
     inp = _nope_inputs(256, 1024, seed=NOPE_SEED + 21, topk=128)
-    out, lse = cake_backend.dsa_sparse_attention_nope(
+    out, lse = cake_backend.cake_dsa_sparse_attention_nondet_nope(
         inp.q, inp.kv, inp.idx_global, return_lse=True
     )
     one_head = inp.kv.unsqueeze(1).detach().clone().requires_grad_()
     q = inp.q.detach().clone().requires_grad_()
-    out_h, lse_h = cake_backend.dsa_sparse_attention_nope(
+    out_h, lse_h = cake_backend.cake_dsa_sparse_attention_nondet_nope(
         q, one_head, inp.idx_global, return_lse=True
     )
     out_h.backward(inp.dout)
@@ -5913,7 +5919,9 @@ def test_nope_backend_entry_squeezes_the_one_head_kv():
         inp.total_k, 2, D_LATENT, dtype=torch.bfloat16, device="cuda"
     )
     with pytest.raises(ValueError, match="kv_latent"):
-        cake_backend.dsa_sparse_attention_nope(inp.q, two_heads, inp.idx_global)
+        cake_backend.cake_dsa_sparse_attention_nondet_nope(
+            inp.q, two_heads, inp.idx_global
+        )
 
 
 # --- packed form: the index-preparation stage against the torch formulation (GPU; skips until the stage ships) ---
@@ -6222,7 +6230,7 @@ def test_nope_packed_entry_with_on_device_index_prep_is_bitwise_the_glue_path(
         acc = torch.zeros(S, D_LATENT, device="cuda")
         if fused:
             assert cake_backend.varlen_index_mode(local) == mode
-            out, lse = cake_backend.dsa_sparse_attention_nope_varlen(
+            out, lse = cake_backend.cake_dsa_sparse_attention_nondet_nope_varlen(
                 leaves[0],
                 leaves[1],
                 local,
@@ -6247,7 +6255,7 @@ def test_nope_packed_entry_with_on_device_index_prep_is_bitwise_the_glue_path(
             )
             torch.cuda.synchronize()
             assert torch.equal(got[3], idx) and torch.equal(got[4], lengths)
-            out, lse = cake_backend.dsa_sparse_attention_nope(
+            out, lse = cake_backend.cake_dsa_sparse_attention_nondet_nope(
                 leaves[0],
                 leaves[1],
                 idx,
@@ -6396,7 +6404,7 @@ def test_nope_hole_rows_are_bitwise_their_stable_compaction_through_the_kernels(
         assert torch.equal(side[3], c.rows) and torch.equal(side[4], c.counts)
     if c.T == 0:
         assert tuple(a[0].shape) == (0, NUM_HEADS, D_LATENT) and a[3].numel() == 0
-        out_v = cake_backend.dsa_sparse_attention_nope_varlen(
+        out_v = cake_backend.cake_dsa_sparse_attention_nondet_nope_varlen(
             c.q, c.kv, c.local, c.cu_q, c.cu_k, causal=True
         )
         assert tuple(out_v.shape) == (0, NUM_HEADS, D_LATENT)
@@ -6427,7 +6435,7 @@ def test_nope_hole_rows_are_bitwise_their_stable_compaction_through_the_kernels(
     assert torch.equal(ga[0], gb[0])
     _rel_or_equal(ga[1], gb[1], 1e-5)
     varlen = _public_nope_step(
-        cake_backend.dsa_sparse_attention_nope_varlen,
+        cake_backend.cake_dsa_sparse_attention_nondet_nope_varlen,
         c.q,
         c.kv,
         c.dout,
@@ -6437,7 +6445,7 @@ def test_nope_hole_rows_are_bitwise_their_stable_compaction_through_the_kernels(
         causal=True,
     )
     flat_c = _public_nope_step(
-        cake_backend.dsa_sparse_attention_nope,
+        cake_backend.cake_dsa_sparse_attention_nondet_nope,
         c.q,
         c.kv,
         c.dout,
@@ -6446,7 +6454,7 @@ def test_nope_hole_rows_are_bitwise_their_stable_compaction_through_the_kernels(
         num_segments=c.num_docs,
     )
     flat_h = _public_nope_step(
-        cake_backend.dsa_sparse_attention_nope,
+        cake_backend.cake_dsa_sparse_attention_nondet_nope,
         c.q,
         c.kv,
         c.dout,
@@ -6497,7 +6505,7 @@ def test_nope_hole_rows_below_the_limit_are_bitwise_the_position_preserving_forw
         assert torch.equal(x, y)
     if c.T == 0:
         assert tuple(a[0].shape) == (0, NUM_HEADS, D_LATENT) and a[3].numel() == 0
-        out_v = cake_backend.dsa_sparse_attention_nope_varlen(
+        out_v = cake_backend.cake_dsa_sparse_attention_nondet_nope_varlen(
             c.q, c.kv, c.local, c.cu_q, c.cu_k, causal=True
         )
         assert tuple(out_v.shape) == (0, NUM_HEADS, D_LATENT)
@@ -6528,7 +6536,7 @@ def test_nope_hole_rows_below_the_limit_are_bitwise_the_position_preserving_forw
     assert torch.equal(ga[0], gb[0])
     _rel_or_equal(ga[1], gb[1], 1e-5)
     varlen = _public_nope_step(
-        cake_backend.dsa_sparse_attention_nope_varlen,
+        cake_backend.cake_dsa_sparse_attention_nondet_nope_varlen,
         c.q,
         c.kv,
         c.dout,
@@ -6538,7 +6546,7 @@ def test_nope_hole_rows_below_the_limit_are_bitwise_the_position_preserving_forw
         causal=True,
     )
     flat_h = _public_nope_step(
-        cake_backend.dsa_sparse_attention_nope,
+        cake_backend.cake_dsa_sparse_attention_nondet_nope,
         c.q,
         c.kv,
         c.dout,
@@ -6546,7 +6554,7 @@ def test_nope_hole_rows_below_the_limit_are_bitwise_the_position_preserving_forw
         num_segments=c.num_docs,
     )
     flat_l = _public_nope_step(
-        cake_backend.dsa_sparse_attention_nope,
+        cake_backend.cake_dsa_sparse_attention_nondet_nope,
         c.q,
         c.kv,
         c.dout,
@@ -6563,12 +6571,12 @@ def test_nope_hole_rows_below_the_limit_are_bitwise_the_position_preserving_forw
     _rel_or_equal(varlen[3], ga[1], 1e-5)
     # the saved pair of both Functions: the position-preserving rows and the last valid slot + 1
     q_leaf = c.q.detach().clone().requires_grad_()
-    out_v = cake_backend.dsa_sparse_attention_nope_varlen(
+    out_v = cake_backend.cake_dsa_sparse_attention_nondet_nope_varlen(
         q_leaf, c.kv, c.local, c.cu_q, c.cu_k, causal=True
     )
     saved = out_v.grad_fn.saved_tensors
     assert torch.equal(saved[5], c.glob) and torch.equal(saved[6], lengths)
-    out_f = cake_backend.dsa_sparse_attention_nope(
+    out_f = cake_backend.cake_dsa_sparse_attention_nondet_nope(
         q_leaf, c.kv, c.glob, num_segments=c.num_docs
     )
     saved = out_f.grad_fn.saved_tensors
@@ -6605,7 +6613,7 @@ def test_nope_caller_cut_on_hole_rows_is_the_flat_entry_on_the_cut_compaction(na
     torch.cuda.synchronize()
     assert torch.equal(a[3], rows) and torch.equal(a[4], counts)
     varlen = _public_nope_step(
-        cake_backend.dsa_sparse_attention_nope_varlen,
+        cake_backend.cake_dsa_sparse_attention_nondet_nope_varlen,
         c.q,
         c.kv,
         c.dout,
@@ -6616,7 +6624,7 @@ def test_nope_caller_cut_on_hole_rows_is_the_flat_entry_on_the_cut_compaction(na
         topk_length=cut,
     )
     flat = _public_nope_step(
-        cake_backend.dsa_sparse_attention_nope,
+        cake_backend.cake_dsa_sparse_attention_nondet_nope,
         c.q,
         c.kv,
         c.dout,
@@ -6629,7 +6637,7 @@ def test_nope_caller_cut_on_hole_rows_is_the_flat_entry_on_the_cut_compaction(na
     _rel_or_equal(flat[3], varlen[3], 1e-5)
     # caller lengths on the flat entry: the caller's rows as given (no compaction), bitwise the kernel-level pair
     kept = _public_nope_step(
-        cake_backend.dsa_sparse_attention_nope,
+        cake_backend.cake_dsa_sparse_attention_nondet_nope,
         c.q,
         c.kv,
         c.dout,
@@ -6684,11 +6692,13 @@ def test_nope_flat_entry_hole_variants_on_every_slot_width(
     view[:, 1::3] = -1
     view[5] = -1
     q, kv, dout = _nope_qkv(T, S, seed=NOPE_SEED + 821 + topk)
-    holes = _public_nope_step(cake_backend.dsa_sparse_attention_nope, q, kv, dout, view)
+    holes = _public_nope_step(
+        cake_backend.cake_dsa_sparse_attention_nondet_nope, q, kv, dout, view
+    )
     if route == "mask":
         lengths = nope_ref.last_valid_plus_one(view, S)
         twin = _public_nope_step(
-            cake_backend.dsa_sparse_attention_nope,
+            cake_backend.cake_dsa_sparse_attention_nondet_nope,
             q,
             kv,
             dout,
@@ -6701,7 +6711,7 @@ def test_nope_flat_entry_hole_variants_on_every_slot_width(
         assert torch.equal(holes[0], out) and torch.equal(holes[1], lse)
         assert torch.equal(holes[2], dq)
         q_leaf = q.detach().clone().requires_grad_()
-        saved = cake_backend.dsa_sparse_attention_nope(
+        saved = cake_backend.cake_dsa_sparse_attention_nondet_nope(
             q_leaf, kv, view
         ).grad_fn.saved_tensors
         assert saved[5].data_ptr() == view.data_ptr() and torch.equal(saved[6], lengths)
@@ -6711,7 +6721,7 @@ def test_nope_flat_entry_hole_variants_on_every_slot_width(
         torch.cuda.synchronize()
         assert torch.equal(got[0], rows) and torch.equal(got[1], counts)
         twin = _public_nope_step(
-            cake_backend.dsa_sparse_attention_nope,
+            cake_backend.cake_dsa_sparse_attention_nondet_nope,
             q,
             kv,
             dout,
@@ -6743,7 +6753,7 @@ def test_nope_kernel_route_compacts_like_the_stage_on_hole_rows(monkeypatch):
         c.q, c.kv, c.local, c.cu_q, c.cu_k, causal=True
     )
     stage_pub = _public_nope_step(
-        cake_backend.dsa_sparse_attention_nope_varlen,
+        cake_backend.cake_dsa_sparse_attention_nondet_nope_varlen,
         c.q,
         c.kv,
         c.dout,
@@ -6762,7 +6772,7 @@ def test_nope_kernel_route_compacts_like_the_stage_on_hole_rows(monkeypatch):
         c.q, c.kv, c.local, c.cu_q, c.cu_k, causal=True
     )
     kernel_pub = _public_nope_step(
-        cake_backend.dsa_sparse_attention_nope_varlen,
+        cake_backend.cake_dsa_sparse_attention_nondet_nope_varlen,
         c.q,
         c.kv,
         c.dout,
@@ -6787,7 +6797,7 @@ def test_nope_hole_rows_are_deterministic_run_to_run():
     _require_nope_program(backward=True)
     c = _hole_case_tensors("interleaved", seed=NOPE_SEED + 830)
     first = _public_nope_step(
-        cake_backend.dsa_sparse_attention_nope_varlen,
+        cake_backend.cake_dsa_sparse_attention_nondet_nope_varlen,
         c.q,
         c.kv,
         c.dout,
@@ -6797,7 +6807,7 @@ def test_nope_hole_rows_are_deterministic_run_to_run():
         causal=True,
     )
     second = _public_nope_step(
-        cake_backend.dsa_sparse_attention_nope_varlen,
+        cake_backend.cake_dsa_sparse_attention_nondet_nope_varlen,
         c.q,
         c.kv,
         c.dout,
@@ -6852,14 +6862,14 @@ def test_nope_public_entries_capture_into_a_cuda_graph_on_hole_rows():
     q_leaf = c.q.detach().clone().requires_grad_()
 
     def varlen():
-        out, lse = cake_backend.dsa_sparse_attention_nope_varlen(
+        out, lse = cake_backend.cake_dsa_sparse_attention_nondet_nope_varlen(
             q_leaf, c.kv, c.local, c.cu_q, c.cu_k, causal=True, return_lse=True
         )
         (dq,) = torch.autograd.grad(out, [q_leaf], c.dout)
         return out, lse, dq
 
     def flat():
-        out, lse = cake_backend.dsa_sparse_attention_nope(
+        out, lse = cake_backend.cake_dsa_sparse_attention_nondet_nope(
             q_leaf, c.kv, c.glob, return_lse=True, num_segments=c.num_docs
         )
         (dq,) = torch.autograd.grad(out, [q_leaf], c.dout)
@@ -6910,7 +6920,7 @@ def test_nope_flat_entry_hole_rows_meet_the_floor_on_their_processing_order(
         "the construction must carry holes before valid slots"
     )
     out, lse, dq, acc = _public_nope_step(
-        cake_backend.dsa_sparse_attention_nope, inp.q, inp.kv, inp.dout, idx
+        cake_backend.cake_dsa_sparse_attention_nondet_nope, inp.q, inp.kv, inp.dout, idx
     )
     ref = nope_ref.reference_fp64_nope(
         inp.q,
@@ -6959,7 +6969,7 @@ def test_nope_autograd_backward_on_masked_rows_in_raw_order_matches_the_referenc
     lengths = nope_ref.last_valid_plus_one(glob, S)
     assert cake_backend.varlen_index_mode(local) == "mask"
     varlen = _public_nope_step(
-        cake_backend.dsa_sparse_attention_nope_varlen,
+        cake_backend.cake_dsa_sparse_attention_nondet_nope_varlen,
         inp.q,
         inp.kv,
         inp.dout,
@@ -6969,7 +6979,7 @@ def test_nope_autograd_backward_on_masked_rows_in_raw_order_matches_the_referenc
         causal=True,
     )
     flat = _public_nope_step(
-        cake_backend.dsa_sparse_attention_nope,
+        cake_backend.cake_dsa_sparse_attention_nondet_nope,
         inp.q,
         inp.kv,
         inp.dout,
@@ -7027,7 +7037,7 @@ def test_nope_issue_repro_rows_match_their_stable_twin_bitwise_large():
     )
     args = (inp.cu_seqlens_q, inp.cu_seqlens_k)
     holes = _public_nope_step(
-        cake_backend.dsa_sparse_attention_nope_varlen,
+        cake_backend.cake_dsa_sparse_attention_nondet_nope_varlen,
         inp.q,
         inp.kv,
         inp.dout,
@@ -7036,7 +7046,7 @@ def test_nope_issue_repro_rows_match_their_stable_twin_bitwise_large():
         causal=True,
     )
     stable = _public_nope_step(
-        cake_backend.dsa_sparse_attention_nope_varlen,
+        cake_backend.cake_dsa_sparse_attention_nondet_nope_varlen,
         inp.q,
         inp.kv,
         inp.dout,
@@ -7048,7 +7058,7 @@ def test_nope_issue_repro_rows_match_their_stable_twin_bitwise_large():
         assert torch.equal(x, y)
     _rel_or_equal(holes[3], stable[3], 1e-5)
     sorted_twin = _public_nope_step(
-        cake_backend.dsa_sparse_attention_nope_varlen,
+        cake_backend.cake_dsa_sparse_attention_nondet_nope_varlen,
         inp.q,
         inp.kv,
         inp.dout,
@@ -7264,7 +7274,7 @@ def test_rope_backward_head_major_dout_matches_the_dense_path_without_a_copy():
     torch.cuda.synchronize()
     assert torch.equal(grads_r[0], grads_d[0]) and torch.equal(grads_r[1], grads_d[1])
     leaves = [t.detach().clone().requires_grad_() for t in args[:4]]
-    out_f = cake_backend.dsa_sparse_attention(*leaves, inp.idx_global)
+    out_f = cake_backend.cake_dsa_sparse_attention_nondet(*leaves, inp.idx_global)
     out_f.backward(inp.dout)
     torch.cuda.synchronize()
     assert torch.equal(out_f, out)
@@ -7294,7 +7304,7 @@ def test_rope_varlen_entry_takes_the_compacting_stage_then_the_forward(monkeypat
     assert mode(local, torch.stack([cu_q, cu_q], 1)[:, 0], cu_k, T) == "torch"
     assert mode(local[:, :0], cu_q, cu_k, T) == "torch"
     q_latent, q_rope, kv_latent, k_rope, _, _ = _rope_device_inputs(T, S, K)
-    varlen = cake_backend.dsa_sparse_attention_varlen
+    varlen = cake_backend.cake_dsa_sparse_attention_nondet_varlen
     varlen(q_latent, q_rope, kv_latent, k_rope, local, cu_q, cu_k, causal=True)
     assert [c[0] for c in calls] == [NOPE_INDEX_PREP_STAGE, "fwd"]
     prep, fwd = calls[0][1], calls[1][1]
@@ -7353,7 +7363,7 @@ def test_rope_varlen_fallback_routes_give_the_stage_route_results_on_hole_rows()
     q_latent, q_rope, kv_latent, k_rope, _, dout = _rope_device_inputs(
         T, S, 128, seed=SEED + 73
     )
-    varlen = cake_backend.dsa_sparse_attention_varlen
+    varlen = cake_backend.cake_dsa_sparse_attention_nondet_varlen
 
     def run(cu_q_arg, cu_k_arg, expected_mode):
         assert (
@@ -7517,7 +7527,7 @@ def _ckpt_entry(name, inp, *, acc_form=None, dst_map=False):
         leaves = (inp.q, inp.kv)
 
         def fn(q, kv):
-            return cake_backend.dsa_sparse_attention_nope_varlen(
+            return cake_backend.cake_dsa_sparse_attention_nondet_nope_varlen(
                 q, kv, inp.idx, inp.cu, inp.cu, causal=True, softmax_scale=1 / 16, **kw
             )
 
@@ -7525,7 +7535,7 @@ def _ckpt_entry(name, inp, *, acc_form=None, dst_map=False):
         leaves = (inp.q, inp.kv)
 
         def fn(q, kv):
-            return cake_backend.dsa_sparse_attention_nope(
+            return cake_backend.cake_dsa_sparse_attention_nondet_nope(
                 q, kv, inp.idx, softmax_scale=1 / 16, **kw
             )
 
@@ -7533,7 +7543,7 @@ def _ckpt_entry(name, inp, *, acc_form=None, dst_map=False):
         leaves = (inp.q, inp.q_rope, inp.kv, inp.k_rope)
 
         def fn(q, q_rope, kv, k_rope):
-            return cake_backend.dsa_sparse_attention(
+            return cake_backend.cake_dsa_sparse_attention_nondet(
                 q, q_rope, kv, k_rope, inp.idx, **kw
             )
 
@@ -7541,7 +7551,7 @@ def _ckpt_entry(name, inp, *, acc_form=None, dst_map=False):
         leaves = (inp.q, inp.q_rope, inp.kv, inp.k_rope)
 
         def fn(q, q_rope, kv, k_rope):
-            return cake_backend.dsa_sparse_attention_varlen(
+            return cake_backend.cake_dsa_sparse_attention_nondet_varlen(
                 q, q_rope, kv, k_rope, inp.idx, inp.cu, inp.cu, causal=True, **kw
             )
 
