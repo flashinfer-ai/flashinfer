@@ -16,8 +16,11 @@ limitations under the License.
 Benchmark of the context-parallel (KCP) Cake packed width-4 depthwise causal convolution + SiLU training step in its
 two numerical modes, ``deterministic=True`` (the deterministic KCP backward: a cooperative launch whose grid reduces
 the ``dweight`` partial in a fixed order) against ``deterministic=False`` (one ordinary launch with unordered
-``dweight`` accumulators), both through ``flashinfer.cake_causal_conv1d_train_kcp``: ``cake_causal_conv1d_kcp``, or
-``cake_causal_conv1d_multi_kcp`` over ``--tensors`` convolutions of one layer (one halo exchange per direction).
+``dweight`` accumulators): the deterministic mode through ``flashinfer.cake_causal_conv1d_det_train_kcp``
+(``cake_causal_conv1d_det_kcp`` / ``cake_causal_conv1d_det_multi_kcp``), the non-deterministic one through
+``flashinfer.cake_causal_conv1d_train_kcp`` with ``deterministic=False`` (``cake_causal_conv1d_kcp`` /
+``cake_causal_conv1d_multi_kcp``); the multi entry runs ``--tensors`` convolutions of one layer (one halo exchange
+per direction).
 One process per rank: ``torchrun --nproc_per_node W`` (W = 2 / 4 / 8), or a plain ``python`` launch for a one-rank
 group (W = 1).
 
@@ -112,7 +115,9 @@ from torch.utils.checkpoint import checkpoint
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import flashinfer.cake_causal_conv1d_det_train as det_conv  # noqa: E402
 import flashinfer.cake_causal_conv1d_det_train_backend as det_backend  # noqa: E402
+import flashinfer.cake_causal_conv1d_det_train_kcp as det_kcp_api  # noqa: E402
 import flashinfer.cake_causal_conv1d_train_kcp as kcp_api  # noqa: E402
 import flashinfer.experimental.cake.cake_causal_conv1d_train as conv  # noqa: E402
 import flashinfer.experimental.cake.cake_causal_conv1d_train_backend as nondet_backend  # noqa: E402
@@ -430,18 +435,24 @@ def _calls(p: Problem, deterministic: bool) -> dict[str, Callable[[], object]]:
     n = len(xs)
     state: dict[str, tuple] = {}
 
+    # The deterministic KCP entry points take no mode keyword; the non-deterministic ones need deterministic=False.
+    if deterministic:
+        single, multi, mode_kw = (
+            det_kcp_api.cake_causal_conv1d_det_kcp,
+            det_kcp_api.cake_causal_conv1d_det_multi_kcp,
+            {},
+        )
+    else:
+        single, multi, mode_kw = (
+            kcp_api.cake_causal_conv1d_kcp,
+            kcp_api.cake_causal_conv1d_multi_kcp,
+            {"deterministic": False},
+        )
+
     def layer(*args) -> tuple:
         if n == 1:
-            return (
-                kcp_api.cake_causal_conv1d_kcp(
-                    args[0], args[1], p.ctx, deterministic=deterministic
-                ),
-            )
-        return tuple(
-            kcp_api.cake_causal_conv1d_multi_kcp(
-                args[:n], args[n:], p.ctx, deterministic=deterministic
-            )
-        )
+            return (single(args[0], args[1], p.ctx, **mode_kw),)
+        return tuple(multi(args[:n], args[n:], p.ctx, **mode_kw))
 
     def reset() -> None:
         for leaf in (*xs, *ws):
@@ -832,9 +843,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     warnings.simplefilter("ignore", ExperimentalWarning)
     rank, world, device = _init()
     for mode, deterministic in MODES.items():
-        if not conv.is_cake_causal_conv1d_train_supported(
-            device, deterministic=deterministic
-        ):
+        supported = (
+            det_conv.is_cake_causal_conv1d_det_train_supported(device)
+            if deterministic
+            else conv.is_cake_causal_conv1d_train_supported(device, deterministic=False)
+        )
+        if not supported:
             raise SystemExit(
                 f"the {mode} package has no exported route on this device (or is not rendered)"
             )

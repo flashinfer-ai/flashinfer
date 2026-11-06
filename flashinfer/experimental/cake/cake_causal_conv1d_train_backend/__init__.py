@@ -17,10 +17,10 @@ Non-deterministic backend of the Cake packed width-4 depthwise causal
 convolution + SiLU training forward / backward (SM100 / SM103 / SM107), one
 self-contained package (host API bodies, the ``cake_jit`` registry, the pinned
 ``cake_build`` loader and the generated CUDA sources under ``csrc/``).  It
-imports nothing from other flashinfer packages.  The dispatching entry points
-(``deterministic=True`` -> the deterministic package
-``flashinfer.cake_causal_conv1d_det_train``) and the user-facing documentation
-live in :mod:`flashinfer.experimental.cake.cake_causal_conv1d_train`.
+imports nothing from other flashinfer packages.  The experimental entry points
+and the user-facing documentation live in
+:mod:`flashinfer.experimental.cake.cake_causal_conv1d_train` (non-deterministic
+only, like this package).
 
 Numerical contract against the deterministic package: the forward runs this
 package's copies of the det forward programs, so ``y`` is the det ``y`` bit
@@ -42,8 +42,9 @@ launch, no grid barrier.
 
 Numerical-mode keyword: every entry point takes ``deterministic: bool = True``
 and raises a ``ValueError`` unless it is ``False`` -- this package has no
-deterministic programs, so the call must opt in explicitly (the facade routes
-``deterministic=True`` to the deterministic package).  With
+deterministic programs, so the call must opt in explicitly (the deterministic
+programs are ``flashinfer.cake_causal_conv1d_det_train``; nothing here routes
+to them).  With
 ``torch.use_deterministic_algorithms(True)`` the entry points that launch the
 unordered reduction (the backward, hence the autograd backward) raise
 PyTorch's alert for an operation without a deterministic implementation (a
@@ -238,8 +239,8 @@ def _require_nondeterministic(deterministic: object, entry: str) -> None:
         raise ValueError(
             f"{entry} is the non-deterministic implementation (unordered dweight / dbias reductions) and needs "
             f"deterministic=False, got deterministic={deterministic!r}; the deterministic programs are "
-            "flashinfer.cake_causal_conv1d_det_train (or the facade "
-            "flashinfer.experimental.cake.cake_causal_conv1d_train with deterministic=True)"
+            "flashinfer.cake_causal_conv1d_det_train and flashinfer.cake_causal_conv1d_det_train_kcp (pass "
+            "deterministic=False here for the non-deterministic path)"
         )
 
 

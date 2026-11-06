@@ -575,3 +575,60 @@ def test_torch_deterministic_mode_alerts_on_the_backward() -> None:
             _bwd(p.x_local, p.w, p.ctx, p.dy_local, hist)
     finally:
         torch.use_deterministic_algorithms(prev, warn_only=prev_warn)
+
+
+@pytest.mark.parametrize("multi", [False, True], ids=["single", "multi"])
+def test_kcp_module_is_nondeterministic_only(multi) -> None:
+    """``flashinfer.cake_causal_conv1d_train_kcp`` on a device: the default and every value but ``False`` raise the
+    mode ``ValueError`` before anything runs; with ``False`` it returns the package's bits; under torch's
+    deterministic mode the forward runs and the backward raises (strict) or warns and runs (``warn_only``)."""
+
+    from flashinfer import cake_causal_conv1d_train_kcp as facade
+
+    device = torch.device("cuda")
+    p = _problem((5000, 1003), (1, 2, 4997, 1003), 512, device)
+
+    def call(x, w, **mode):
+        if multi:
+            (y,) = facade.cake_causal_conv1d_multi_kcp((x,), (w,), p.ctx, **mode)
+            return y
+        return facade.cake_causal_conv1d_kcp(x, w, p.ctx, **mode)
+
+    def run(before_backward=None):
+        x = p.x_local.clone().requires_grad_(True)
+        w = p.w.clone().requires_grad_(True)
+        y = call(x, w, **NONDET)
+        if before_backward is not None:
+            before_backward()
+        y.backward(p.dy_local)
+        return {"y": y.detach(), "dx": x.grad, "dw": w.grad}
+
+    for mode in ({}, {"deterministic": True}, {"deterministic": None}):
+        with pytest.raises(ValueError, match="needs deterministic=False"):
+            call(p.x_local, p.w, **mode)
+    y_direct, hist = _fwd(p.x_local, p.w, p.ctx)
+    dx_direct, dw_direct = _bwd(p.x_local, p.w, p.ctx, p.dy_local, hist)
+    direct = {"y": y_direct, "dx": dx_direct, "dw": dw_direct}
+    assert _same(run(), direct)
+
+    alert = "cake_causal_conv1d_(multi_)?backward_kcp does not have a deterministic"
+    prev, prev_warn = (
+        torch.are_deterministic_algorithms_enabled(),
+        torch.is_deterministic_algorithms_warn_only_enabled(),
+    )
+    try:
+        torch.use_deterministic_algorithms(True)
+        with pytest.raises(RuntimeError, match=alert):
+            run()
+        torch.use_deterministic_algorithms(False)
+        with pytest.raises(RuntimeError, match=alert):
+            run(before_backward=lambda: torch.use_deterministic_algorithms(True))
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        with pytest.warns(UserWarning, match=alert):
+            got = run()
+        assert _same(got, direct)
+        for mode in ({}, {"deterministic": True}):
+            with pytest.raises(ValueError, match="needs deterministic=False"):
+                call(p.x_local, p.w, **mode)
+    finally:
+        torch.use_deterministic_algorithms(prev, warn_only=prev_warn)

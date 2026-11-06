@@ -104,6 +104,41 @@ of 64-256 sequences, is reproducible with::
 Training causal conv1d (Cake)
 -----------------------------
 
+.. rubric:: Numerical mode
+
+.. list-table:: Deterministic and non-deterministic entry points
+   :header-rows: 1
+   :widths: 22 39 39
+
+   * -
+     - Deterministic
+     - Non-deterministic (experimental)
+   * - single-rank
+     - ``flashinfer.cake_causal_conv1d_det_train``: ``cake_causal_conv1d_det``,
+       ``cake_causal_conv1d_det_train_forward``,
+       ``cake_causal_conv1d_det_train_backward``
+     - ``flashinfer.experimental.cake.cake_causal_conv1d_train``:
+       ``cake_causal_conv1d``, ``cake_causal_conv1d_train_forward``,
+       ``cake_causal_conv1d_train_backward``
+   * - context-parallel (KCP)
+     - ``flashinfer.cake_causal_conv1d_det_train_kcp``:
+       ``cake_causal_conv1d_det_kcp``, ``cake_causal_conv1d_det_multi_kcp``
+     - ``flashinfer.cake_causal_conv1d_train_kcp``: ``cake_causal_conv1d_kcp``,
+       ``cake_causal_conv1d_multi_kcp``
+   * - ``deterministic`` keyword
+     - none: passing one raises ``TypeError``
+     - pass ``deterministic=False``; the default ``True`` and every other value
+       raise ``ValueError`` naming the deterministic entry point
+   * - results
+     - ``y``, ``dx``, ``dweight`` and ``dbias`` bitwise reproducible
+     - ``y`` and ``dx`` bitwise the deterministic package's; ``dweight`` and
+       ``dbias`` within its error budget, not bitwise reproducible
+   * - ``torch.use_deterministic_algorithms(True)``
+     - no effect
+     - the forward runs; the backward raises ``RuntimeError`` (with
+       ``warn_only=True``: ``UserWarning``, then it runs); nothing falls back
+       to the deterministic package
+
 Packed width-4 depthwise causal convolution + SiLU forward / backward for
 training on SM100, SM103 and SM107: documents delimited by ``cu_seqlens`` and
 convolved on their own, FP32 or BF16 taps and an optional FP32 or BF16
@@ -153,74 +188,64 @@ and ``KcpRecomputeHandle`` as aliases of the same objects.
     cake_causal_conv1d_det_multi_kcp
     RecomputeHandleDetKcp
 
-Training causal conv1d with a selectable numerical mode (Cake, experimental)
-----------------------------------------------------------------------------
+Training causal conv1d, non-deterministic (Cake, experimental)
+---------------------------------------------------------------
 
-The same convolution, single-rank and context-parallel, with a
-``deterministic: bool = True`` keyword on every entry point.  These entry
-points are experimental (``@flashinfer_experimental_api``: the first call warns
-once with ``ExperimentalWarning``) and are not listed in the API summaries
-above.
-
-.. list-table:: Entry points by numerical mode
-   :header-rows: 1
-
-   * -
-     - ``deterministic=True`` (default)
-     - ``deterministic=False``
-   * - single-rank
-     - ``flashinfer.cake_causal_conv1d_det_train`` (unchanged)
-     - ``flashinfer.experimental.cake.cake_causal_conv1d_train_backend``
-   * - context-parallel (KCP)
-     - ``flashinfer.cake_causal_conv1d_det_train_kcp`` (unchanged)
-     - ``flashinfer.experimental.cake.cake_causal_conv1d_train_backend.kcp``
-
-Dispatching entry points (they select a row of the table by ``deterministic``):
+The same convolution, single-rank and context-parallel, with a backward whose
+``dweight`` / ``dbias`` reductions are unordered.  These entry points are
+experimental (``@flashinfer_experimental_api``: the first call warns once with
+``ExperimentalWarning``) and are not listed in the API summaries above.  Every
+entry point, workspace helper and support query takes a keyword-only
+``deterministic: bool = True`` and runs only with ``deterministic=False``; any
+other value, the default included, raises ``ValueError`` that names the
+deterministic entry point, before anything runs.  Nothing here runs the
+deterministic package.
 
 * ``flashinfer.experimental.cake.cake_causal_conv1d_train``:
   ``cake_causal_conv1d``, ``cake_causal_conv1d_train_forward``,
   ``cake_causal_conv1d_train_backward``, the forward / backward workspace
   helpers ``cake_causal_conv1d_train_{forward,backward}_workspace{,_bytes}``
-  and ``is_cake_causal_conv1d_train_supported``.
+  and ``is_cake_causal_conv1d_train_supported``.  The parameters are the
+  deterministic entry points' plus ``deterministic``.
 * ``flashinfer.cake_causal_conv1d_train_kcp``: ``cake_causal_conv1d_kcp``,
-  ``cake_causal_conv1d_multi_kcp`` and ``RecomputeHandleKcp`` (any object with
-  an ``entries`` dict serves either mode).
+  ``cake_causal_conv1d_multi_kcp`` and ``RecomputeHandleKcp``, with the
+  keyword-only ``bwd_reserve_sms`` (SMs the main backward leaves free; refused
+  on SM107).  ``cooperative=True`` is refused: the backward is one ordinary
+  launch.
+* ``flashinfer.experimental.cake.cake_causal_conv1d_train_backend`` (and its
+  ``kcp`` module): the package behind both, with the same rule.
 
-Each name maps to a deterministic name: ``cake_causal_conv1d_det`` ->
-``cake_causal_conv1d``, ``cake_causal_conv1d_det_train_{forward,backward}``
--> ``cake_causal_conv1d_train_{forward,backward}``,
-``cake_causal_conv1d_det_kcp`` -> ``cake_causal_conv1d_kcp``,
-``cake_causal_conv1d_det_multi_kcp`` -> ``cake_causal_conv1d_multi_kcp``,
-``RecomputeHandleDetKcp`` -> ``RecomputeHandleKcp``.  The deterministic names,
-the legacy module ``flashinfer.cake_causal_conv1d_train`` and the legacy
-top-level names ``flashinfer.cake_causal_conv1d`` /
-``flashinfer.cake_causal_conv1d_train_forward`` / ``_backward`` stay bound to
-the deterministic objects.
+Each name maps to a deterministic name: ``cake_causal_conv1d`` ->
+``cake_causal_conv1d_det``, ``cake_causal_conv1d_train_{forward,backward}``
+-> ``cake_causal_conv1d_det_train_{forward,backward}``,
+``cake_causal_conv1d_kcp`` -> ``cake_causal_conv1d_det_kcp``,
+``cake_causal_conv1d_multi_kcp`` -> ``cake_causal_conv1d_det_multi_kcp``,
+``RecomputeHandleKcp`` -> ``RecomputeHandleDetKcp``.  Example::
 
-Numerical contract of ``deterministic=False``: the forward runs copies of the
-deterministic forward programs, so ``y`` is bitwise the same.  The backward is
-one ordinary launch per call (no reduce program, no cooperative grid): ``dx``
-is bitwise the deterministic backward's, and the CTAs add their ``dweight`` /
-``dbias`` rows into zeroed accumulators with unordered global reductions (FP32,
-or FP64 under ``silu_grad_preactivation="fp32"``), rounded once into the
-requested dtype.  ``dweight`` / ``dbias`` stay within the deterministic error
-budget but are not bitwise reproducible from run to run.  The KCP backward
-returns the rank-local FP32 ``dweight`` partial with the same property.
+    from flashinfer.experimental.cake.cake_causal_conv1d_train import (
+        cake_causal_conv1d,
+    )
 
-Interaction with ``torch.use_deterministic_algorithms(True)``:
+    y = cake_causal_conv1d(x, weight, cu_seqlens, bias, deterministic=False)
 
-* The dispatching entry points run the deterministic package for
-  ``deterministic=False`` and warn once per entry point (``UserWarning``).
-  They do not pass a non-deterministic backward workspace to the
-  deterministic package.
-* The backend entry points never fall back.  The entry points that launch the
-  unordered reduction (the single-rank backward, the KCP backward, the KCP
-  multi backward, and so the autograd backward) raise PyTorch's alert for an
-  operation without a deterministic implementation: a ``RuntimeError``, or a
-  ``UserWarning`` with ``warn_only=True``.  The forward and the checkpoint recompute run the
-  deterministic forward programs and do not alert.
-* Every backend entry point raises ``ValueError`` unless
-  ``deterministic=False``: the backend has no deterministic programs.
+Numerical contract: the forward runs copies of the deterministic forward
+programs, so ``y`` is bitwise the same.  The backward is one ordinary launch
+per call (no reduce program, no cooperative grid): ``dx`` is bitwise the
+deterministic backward's, and the CTAs add their ``dweight`` / ``dbias`` rows
+into zeroed accumulators with unordered global reductions (FP32, or FP64 under
+``silu_grad_preactivation="fp32"``), rounded once into the requested dtype.
+``dweight`` / ``dbias`` stay within the deterministic error budget but are not
+bitwise reproducible from run to run.  The KCP backward returns the rank-local
+FP32 ``dweight`` partial with the same property.
+
+Under ``torch.use_deterministic_algorithms(True)`` the forward and the
+checkpoint recompute run (they are fixed-order).  The entry points that launch
+the unordered reduction (the single-rank backward, the KCP backward, the KCP
+multi backward, and so the autograd backward) raise PyTorch's alert for an
+operation without a deterministic implementation before they launch anything:
+a ``RuntimeError``, or a ``UserWarning`` with ``warn_only=True``, after which
+the backward runs.  The mode is read when the backward runs.  Use the
+deterministic entry points for deterministic results.
 
 The non-deterministic backward workspace holds the accumulators and one
 ticket counter per channel tile.  Allocate it with
@@ -229,4 +254,6 @@ ticket counter per channel tile.  Allocate it with
 on ``C`` and the route, not on ``S``.  Do not share one workspace between two
 backward launches that can run at the same time, for example on two streams.
 Without a caller workspace the package keeps one zeroed buffer per device and
-stream, and allocates a fresh zeroed buffer inside a CUDA Graph capture.
+stream; inside a CUDA Graph capture it keeps one zeroed buffer per capture and
+stream (when CUDA's capture id is not available, every captured call allocates
+its own).

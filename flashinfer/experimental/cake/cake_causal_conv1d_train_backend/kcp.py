@@ -20,8 +20,8 @@ before each continuing fragment, received from the ranks that hold them by one
 ``all_to_all_single`` per direction, and the backward sends the first rows'
 derivative back to the predecessor fragments, which fold it into their last
 rows' ``dx`` before the one BF16 rounding.  ``cake_causal_conv1d_kcp(x_local,
-weight, ctx, deterministic=False)`` is the autograd entry; the dispatching
-facade is :mod:`flashinfer.cake_causal_conv1d_train_kcp`.  This module imports
+weight, ctx, deterministic=False)`` is the autograd entry; its experimental
+entry points are :mod:`flashinfer.cake_causal_conv1d_train_kcp`.  This module imports
 only ``os``, torch, torch.distributed, tvm_ffi and its own package.
 
 The host flow mirrors the deterministic package's
@@ -419,7 +419,7 @@ def _handle_hist(
         raise ValueError("recompute_handle: the 'conv' entry holds no hist tensor")
     if entry.get("ctx") is not ctx:
         raise ValueError(
-            "recompute_handle: the 'conv' entry belongs to another KcpContext"
+            "recompute_handle: the 'conv' entry belongs to another ContextDetKcp"
         )
     S = int(x_local.shape[-2]) if x_local.ndim >= 2 else -1
     C = int(x_local.shape[-1]) if x_local.ndim >= 1 else -1
@@ -840,7 +840,7 @@ def cake_causal_conv1d_forward_kcp(
     ``deterministic`` must be ``False`` (``ValueError`` otherwise); ``y`` and ``hist`` are the det KCP forward's bits.
 
     ``x_local`` BF16 ``[T_r, C]`` (or ``[1, T_r, C]``) contiguous, the rank's fragments back to back in the order of
-    ``ctx.cu_seqlens_local``; ``weight`` FP32 ``[C, 4]``; ``ctx`` a ``KcpContext`` (its halo plan ``ctx.halo``, the
+    ``ctx.cu_seqlens_local``; ``weight`` FP32 ``[C, 4]``; ``ctx`` a ``ContextDetKcp`` (its halo plan ``ctx.halo``, the
     device tables ``ctx.halo_tables`` and the process group ``ctx.group``).  Every rank of the group calls this
     function once per layer, in the same order: the forward halo exchange is a collective (a rank without tokens
     joins it with empty splits and returns empty outputs).  ``hist`` is a fresh ``[n_hist_rows, C]`` BF16 tensor
@@ -1700,15 +1700,15 @@ def cake_causal_conv1d_kcp(
         order of ``ctx.cu_seqlens_local``.
     weight : torch.Tensor
         FP32 ``[C, 4]`` contiguous taps; ``weight[c, 3]`` multiplies the current token.
-    ctx : KcpContext
-        The rank's context (``flashinfer.experimental.cake_kda_train.build_kcp_context``): fragment table, halo
+    ctx : ContextDetKcp
+        The rank's context (``flashinfer.cake_kda_det_train_kcp.build_context_det_kcp``): fragment table, halo
         plan, process group.  Every rank of the group calls this function once per layer, in the same order.
     graph : str, optional
         ``None`` (the shipped default ``GRAPH_DEFAULT`` = ``"off"``, the eager path) or ``"replay"``: keyed CUDA-graph
         capture / replay of this call.  The first call of a validity key (this
         context, its world size, and the shape / stride / dtype / data pointer of ``x_local`` and ``weight``) runs
         eagerly, the second is captured, every later one replays the graph (bitwise the eager result).  Requirements:
-        pointer-stable operands and the same ``KcpContext`` per layer, outputs consumed before the next call of the
+        pointer-stable operands and the same ``ContextDetKcp`` per layer, outputs consumed before the next call of the
         same layer (a replay overwrites the graph's static tensors); any other key runs eagerly (``GRAPH_STATS``,
         ``LAST_CALL``).  Each cached key pins a private memory pool (at most ``GRAPH_CACHE_MAX`` keys); call
         :func:`graph_cache_clear` before ``torch.distributed.destroy_process_group()``.
@@ -1725,8 +1725,8 @@ def cake_causal_conv1d_kcp(
         between two convolution calls (also not in nested regions), and never ``clear()`` or reuse a handle while a
         backward that needs it is pending.
     cooperative : bool, optional
-        The deterministic package's launch-form keyword, accepted so the dispatching facade takes one parameter
-        list in both modes.  The main backward here is always one ordinary launch, so ``None`` (default) and
+        The deterministic package's launch-form keyword, accepted so both packages take one parameter list.
+        The main backward here is always one ordinary launch, so ``None`` (default) and
         ``False`` mean the same; ``True`` raises ``ValueError`` and a non-``bool`` ``TypeError``.
     deterministic : bool
         Must be ``False`` (``ValueError`` otherwise): the numerical mode of this package.  Under
@@ -2142,7 +2142,7 @@ def _handle_hists(
         )
     if entry.get("ctx") is not ctx:
         raise ValueError(
-            "recompute_handle: the 'conv' entry belongs to another KcpContext"
+            "recompute_handle: the 'conv' entry belongs to another ContextDetKcp"
         )
     return tuple(
         _handle_hist(
@@ -2277,7 +2277,7 @@ def cake_causal_conv1d_multi_kcp(
         order of ``ctx.cu_seqlens_local``; the channel counts may differ.
     weights : sequence of torch.Tensor
         FP32 ``[C_i, 4]`` contiguous taps, one per tensor.
-    ctx : KcpContext
+    ctx : ContextDetKcp
         The rank's context, as in :func:`cake_causal_conv1d_kcp`.  Every rank of the group calls this function once
         per layer, in the same order, with the same tensor count and channel counts.  The ranks are not compared
         (that would cost a collective): a different count, channel count or order hangs the exchange or silently

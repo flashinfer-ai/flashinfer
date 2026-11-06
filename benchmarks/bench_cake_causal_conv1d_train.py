@@ -15,8 +15,9 @@ limitations under the License.
 
 Benchmark of the Cake packed width-4 depthwise causal convolution + SiLU training kernels in their two numerical
 modes: ``deterministic=True`` (the deterministic package: a main backward program plus a fixed-order reduce) against
-``deterministic=False`` (one backward launch with unordered ``dweight`` / ``dbias`` reductions), both through the
-dispatching entry points of ``flashinfer.experimental.cake.cake_causal_conv1d_train``.
+``deterministic=False`` (one backward launch with unordered ``dweight`` / ``dbias`` reductions): the deterministic
+package by its det names (``flashinfer.cake_causal_conv1d_det_train``) and the non-deterministic package through
+``flashinfer.experimental.cake.cake_causal_conv1d_train`` with ``deterministic=False``.
 
 The rows are the deterministic benchmark's performance matrix: ``C = 512`` over eight packed token counts and
 ``S = 250340`` over the channel counts (the multi-sub-tile tiles C = 1280 / 1536 and the partial last tiles
@@ -83,6 +84,7 @@ from typing import Callable, Optional, Sequence
 
 import torch
 
+import flashinfer.cake_causal_conv1d_det_train as det_conv
 import flashinfer.cake_causal_conv1d_det_train_backend as det_backend
 import flashinfer.experimental.cake.cake_causal_conv1d_train as conv
 import flashinfer.experimental.cake.cake_causal_conv1d_train_backend as nondet_backend
@@ -105,6 +107,29 @@ PERF_FRACTIONS = (0.37, 0.29, 0.21)
 SEED = 0
 DTYPES = {"float32": torch.float32, "bfloat16": torch.bfloat16}
 MODES = {"det": True, "nondet": False}
+# The deterministic package's name of each entry point: the deterministic mode runs it (it takes no mode keyword),
+# the non-deterministic mode runs ``conv``'s entry point with ``deterministic=False``.
+DET_NAMES = {
+    "cake_causal_conv1d": "cake_causal_conv1d_det",
+    "cake_causal_conv1d_train_forward": "cake_causal_conv1d_det_train_forward",
+    "cake_causal_conv1d_train_backward": "cake_causal_conv1d_det_train_backward",
+    "cake_causal_conv1d_train_forward_workspace": "cake_causal_conv1d_det_train_forward_workspace",
+    "cake_causal_conv1d_train_backward_workspace": "cake_causal_conv1d_det_train_backward_workspace",
+    "cake_causal_conv1d_train_backward_workspace_bytes": "cake_causal_conv1d_det_train_backward_workspace_bytes",
+    "is_cake_causal_conv1d_train_supported": "is_cake_causal_conv1d_det_train_supported",
+}
+
+
+def _api(name: str, deterministic: bool) -> Callable:
+    """Entry point ``name`` of one mode: the deterministic package's det-named function, or ``conv``'s entry point
+    with ``deterministic=False`` bound."""
+
+    if deterministic:
+        return getattr(det_conv, DET_NAMES[name])
+    fn = getattr(conv, name)
+    return lambda *args, **kwargs: fn(*args, **kwargs, deterministic=False)
+
+
 PHASES = ("fwd", "bwd", "step", "ckpt")
 KINDS = ("gpu", "wall", "host")
 ROUNDS = 7
@@ -343,22 +368,23 @@ def _calls(p: Problem, route: Route, deterministic: bool, *, own_workspace: bool
     db = None if p.b is None else torch.empty(channels, dtype=p.b.dtype, device=device)
     fws = bws = None
     if own_workspace:
-        fws = conv.cake_causal_conv1d_train_forward_workspace(
-            tokens, channels, device, deterministic=deterministic
+        fws = _api("cake_causal_conv1d_train_forward_workspace", deterministic)(
+            tokens, channels, device
         )
-        bws = conv.cake_causal_conv1d_train_backward_workspace(
-            tokens, channels, device, deterministic=deterministic
+        bws = _api("cake_causal_conv1d_train_backward_workspace", deterministic)(
+            tokens, channels, device
         )
+    forward = _api("cake_causal_conv1d_train_forward", deterministic)
+    backward = _api("cake_causal_conv1d_train_backward", deterministic)
+    autograd = _api("cake_causal_conv1d", deterministic)
 
     def fwd():
-        return conv.cake_causal_conv1d_train_forward(
-            p.x, p.w, p.cu, bias=p.b, out=y, workspace=fws, deterministic=deterministic
-        )
+        return forward(p.x, p.w, p.cu, bias=p.b, out=y, workspace=fws)
 
     def bwd():
-        return conv.cake_causal_conv1d_train_backward(
+        return backward(
             p.x, p.w, p.cu, p.dy, bias=p.b, silu_grad_preactivation=route.silu_grad_preactivation,
-            workspace=bws, dx=dx, dweight=dw, dbias=db, deterministic=deterministic,
+            workspace=bws, dx=dx, dweight=dw, dbias=db,
         )  # fmt: skip
 
     def step():
@@ -371,13 +397,12 @@ def _calls(p: Problem, route: Route, deterministic: bool, *, own_workspace: bool
     leaves = [leaf for leaf in (xl, wl, bl) if leaf is not None]
 
     def layer(x_, w_, b_):
-        return conv.cake_causal_conv1d(
+        return autograd(
             x_,
             w_,
             p.cu,
             b_,
             silu_grad_preactivation=route.silu_grad_preactivation,
-            deterministic=deterministic,
         )
 
     def ckpt():
@@ -485,9 +510,9 @@ def bench_row(
     timed: dict[str, dict] = {}
     for mode, deterministic in MODES.items():
         entry: dict = {
-            "backward_workspace_bytes": conv.cake_causal_conv1d_train_backward_workspace_bytes(
-                tokens, channels, device, deterministic=deterministic
-            )
+            "backward_workspace_bytes": _api(
+                "cake_causal_conv1d_train_backward_workspace_bytes", deterministic
+            )(tokens, channels, device)
         }
         entries[mode] = entry
         try:
@@ -724,9 +749,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     warnings.simplefilter("ignore", ExperimentalWarning)
     device = torch.device("cuda", torch.cuda.current_device())
     for mode, deterministic in MODES.items():
-        if not conv.is_cake_causal_conv1d_train_supported(
-            device, deterministic=deterministic
-        ):
+        if not _api("is_cake_causal_conv1d_train_supported", deterministic)(device):
             raise SystemExit(
                 f"the {mode} package has no exported route on this device (or is not rendered)"
             )
