@@ -283,10 +283,8 @@ from .cake_rmsnorm_det_train import (
     cake_rmsnorm_det_train_forward as cake_rmsnorm_det_train_forward,
 )
 
-# The package with the non-deterministic weight gradient is reached only as the
-# module ``flashinfer.cake_rmsnorm_train``: the top level binds none of its names.
-from . import cake_rmsnorm_train as cake_rmsnorm_train
-from . import cake_rmsnorm_train_backend as cake_rmsnorm_train_backend
+# The non-deterministic RMSNorm package is reached as the module flashinfer.cake_rmsnorm_nondet_train.
+from . import cake_rmsnorm_nondet_train as cake_rmsnorm_nondet_train
 from .cake_rmsnorm_silu_gate_det_train import (
     CakeRMSNormSiLUGateDetFunction as CakeRMSNormSiLUGateDetFunction,
 )

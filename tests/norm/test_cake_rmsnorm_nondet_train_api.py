@@ -15,21 +15,18 @@ limitations under the License.
 
 Tests of the flashinfer public surface of the Cake fused BF16 RMSNorm training
 package with the non-deterministic weight gradient: the
-``flashinfer.cake_rmsnorm_train`` facade (the only way to reach it: the
-``flashinfer`` top level binds none of its names), the explicit
-``deterministic=False`` every entry point requires (the
-default ``True`` raises ``ValueError`` naming the det entry point), the
-interplay with ``torch.use_deterministic_algorithms`` (only the backward and the
-autograd backward alert: ``RuntimeError``; with ``warn_only``, one warning
-naming the det entry point, then this package's kernels), the standalone import
-of the backend, the workspace contract (one
-buffer serves any sequence of layouts and is at rest after every call), the
-one-kernel launch of a single-kernel window and the N-D autograd gradients.
-Every call here passes ``deterministic=False``, except the calls that check
-that the default and ``True`` raise ``ValueError``.  The names of both packages
-and the flag's full value matrix (``ValueError`` for every value but ``False``)
-are ``test_cake_rmsnorm_det_train_names.py``'s; the numerical contract of the
-kernels is ``test_cake_rmsnorm_train.py``'s.
+``flashinfer.cake_rmsnorm_nondet_train`` facade (the only way to reach it: the
+``flashinfer`` top level binds none of its names), the absent
+``deterministic`` keyword (the mode is part of the name only; passing it is
+Python's ``TypeError``), the interplay with
+``torch.use_deterministic_algorithms`` (only the backward and the autograd
+backward alert: ``RuntimeError``; with ``warn_only``, one warning naming the
+det entry point, then this package's kernels), the standalone import of the
+backend, the workspace contract (one buffer serves any sequence of layouts and
+is at rest after every call), the one-kernel launch of a single-kernel window
+and the N-D autograd gradients.  The names of both packages and the old names
+that fail at import are ``test_cake_rmsnorm_det_train_names.py``'s; the
+numerical contract of the kernels is ``test_cake_rmsnorm_nondet_train.py``'s.
 """
 
 from __future__ import annotations
@@ -46,17 +43,18 @@ import torch
 
 import flashinfer
 import flashinfer.cake_rmsnorm_det_train as det
-import flashinfer.cake_rmsnorm_train_backend as backend
-from flashinfer.cake_rmsnorm_train import (
-    CakeRMSNormFunction,
-    cake_rmsnorm,
-    cake_rmsnorm_train_backward,
-    cake_rmsnorm_train_backward_workspace,
-    cake_rmsnorm_train_backward_workspace_bytes,
-    cake_rmsnorm_train_forward,
-    is_cake_rmsnorm_train_supported,
+import flashinfer.experimental.cake as cake_namespace
+import flashinfer.experimental.cake.cake_rmsnorm_nondet_train as backend
+from flashinfer.cake_rmsnorm_nondet_train import (
+    CakeRMSNormNondetFunction,
+    cake_rmsnorm_nondet,
+    cake_rmsnorm_nondet_train_backward,
+    cake_rmsnorm_nondet_train_backward_workspace,
+    cake_rmsnorm_nondet_train_backward_workspace_bytes,
+    cake_rmsnorm_nondet_train_forward,
+    is_cake_rmsnorm_nondet_train_supported,
 )
-from flashinfer.cake_rmsnorm_train_backend import cake_jit as loader
+from flashinfer.experimental.cake.cake_rmsnorm_nondet_train import cake_jit as loader
 from flashinfer.jit.env import has_flashinfer_jit_cache
 from flashinfer.utils import get_compute_capability
 
@@ -65,14 +63,13 @@ WIDTHS = ((6144, 1e-5), (4096, 1e-5), (2048, 1e-6), (1536, 1e-6), (512, 1e-6))
 HIDDEN_SIZES = tuple(hidden for hidden, _eps in WIDTHS)
 EPS = {hidden: eps for hidden, eps in WIDTHS}
 SEED = 8066
-PHRASE = "pass deterministic=False for the non-deterministic path"
 ENTRY_POINTS = (
-    cake_rmsnorm_train_forward,
-    cake_rmsnorm_train_backward,
-    cake_rmsnorm_train_backward_workspace,
-    cake_rmsnorm_train_backward_workspace_bytes,
-    cake_rmsnorm,
-    is_cake_rmsnorm_train_supported,
+    cake_rmsnorm_nondet_train_forward,
+    cake_rmsnorm_nondet_train_backward,
+    cake_rmsnorm_nondet_train_backward_workspace,
+    cake_rmsnorm_nondet_train_backward_workspace_bytes,
+    cake_rmsnorm_nondet,
+    is_cake_rmsnorm_nondet_train_supported,
 )
 
 
@@ -84,13 +81,13 @@ def _supported() -> bool:
     return (
         torch.cuda.is_available()
         and get_compute_capability(_device()) in SUPPORTED_CAPABILITIES
-        and is_cake_rmsnorm_train_supported(_device(), deterministic=False)
+        and is_cake_rmsnorm_nondet_train_supported(_device())
     )
 
 
 requires_device = pytest.mark.skipif(
     not _supported(),
-    reason="cake_rmsnorm_train needs an SM100 / SM103 / SM107 device with exported routes",
+    reason="cake_rmsnorm_nondet_train needs an SM100 / SM103 / SM107 device with exported routes",
 )
 
 
@@ -127,7 +124,7 @@ def _randn(*shape: int, generator: torch.Generator) -> torch.Tensor:
 
 
 def _skip_unless_hidden(hidden: int) -> None:
-    if not is_cake_rmsnorm_train_supported(_device(), hidden, deterministic=False):
+    if not is_cake_rmsnorm_nondet_train_supported(_device(), hidden):
         pytest.skip(f"hidden={hidden} has no exported route on this device")
 
 
@@ -136,7 +133,7 @@ def _package_warnings(caught) -> list[str]:
     return [
         str(item.message)
         for item in caught
-        if "flashinfer.cake_rmsnorm_train." in str(item.message)
+        if "flashinfer.cake_rmsnorm_nondet_train." in str(item.message)
     ]
 
 
@@ -150,22 +147,24 @@ def _names(text: str, name: str) -> bool:
 
 
 def test_entry_points_are_reached_through_the_module_only() -> None:
-    module = flashinfer.cake_rmsnorm_train
-    assert module.cake_rmsnorm is cake_rmsnorm
-    assert module.cake_rmsnorm_train_forward is cake_rmsnorm_train_forward
-    assert module.cake_rmsnorm_train_backward is cake_rmsnorm_train_backward
+    module = flashinfer.cake_rmsnorm_nondet_train
+    assert module.cake_rmsnorm_nondet is cake_rmsnorm_nondet
+    assert module.cake_rmsnorm_nondet_train_forward is cake_rmsnorm_nondet_train_forward
     assert (
-        module.cake_rmsnorm_train_backward_workspace_bytes
-        is cake_rmsnorm_train_backward_workspace_bytes
+        module.cake_rmsnorm_nondet_train_backward is cake_rmsnorm_nondet_train_backward
     )
-    assert module.CakeRMSNormFunction is CakeRMSNormFunction
+    assert (
+        module.cake_rmsnorm_nondet_train_backward_workspace_bytes
+        is cake_rmsnorm_nondet_train_backward_workspace_bytes
+    )
+    assert module.CakeRMSNormNondetFunction is CakeRMSNormNondetFunction
     # the top level binds none of these names, only the det package's
     for name in (
-        "cake_rmsnorm",
-        "cake_rmsnorm_train_forward",
-        "cake_rmsnorm_train_backward",
-        "cake_rmsnorm_train_backward_workspace_bytes",
-        "CakeRMSNormFunction",
+        "cake_rmsnorm_nondet",
+        "cake_rmsnorm_nondet_train_forward",
+        "cake_rmsnorm_nondet_train_backward",
+        "cake_rmsnorm_nondet_train_backward_workspace_bytes",
+        "CakeRMSNormNondetFunction",
     ):
         assert not hasattr(flashinfer, name), name
     assert flashinfer.cake_rmsnorm_det is det.cake_rmsnorm_det
@@ -173,21 +172,19 @@ def test_entry_points_are_reached_through_the_module_only() -> None:
 
 
 @pytest.mark.parametrize("entry", ENTRY_POINTS, ids=lambda f: f.__name__)
-def test_every_entry_point_requires_an_explicit_false(entry) -> None:
-    """``deterministic`` defaults to ``True`` (which raises): keyword-only, but on
-    ``cake_rmsnorm``, which keeps its call shape; the autograd function takes it
-    as its last forward input."""
-    parameter = inspect.signature(entry).parameters["deterministic"]
-    assert parameter.default is True
-    expected = (
-        inspect.Parameter.POSITIONAL_OR_KEYWORD
-        if entry is cake_rmsnorm
-        else inspect.Parameter.KEYWORD_ONLY
-    )
-    assert parameter.kind == expected, parameter.kind
-    forward = inspect.signature(CakeRMSNormFunction.forward).parameters
-    assert forward["deterministic"].default is True
-    assert list(forward)[-1] == "deterministic"
+def test_no_entry_point_takes_a_deterministic_keyword(entry) -> None:
+    """The mode is part of the name only: no entry point (nor the autograd
+    function's forward) has a ``deterministic`` parameter, and
+    ``cake_rmsnorm_nondet`` keeps its call shape ``(x, w, eps, residual)``."""
+    assert "deterministic" not in inspect.signature(entry).parameters
+    forward = inspect.signature(CakeRMSNormNondetFunction.forward).parameters
+    assert list(forward) == ["ctx", "x", "w", "eps", "residual"]
+    assert list(inspect.signature(cake_rmsnorm_nondet).parameters) == [
+        "x",
+        "w",
+        "eps",
+        "residual",
+    ]
 
 
 def _cpu_tensors():
@@ -218,9 +215,9 @@ def test_only_the_backward_consults_deterministic_algorithms(
         w = w.float()
     torch.use_deterministic_algorithms(True, warn_only=mode == "warn_only")
     for run in (
-        lambda: cake_rmsnorm_train_forward(x, w, 1e-6, deterministic=False),
-        lambda: cake_rmsnorm(x, w, 1e-6, deterministic=False),
-        lambda: CakeRMSNormFunction.apply(x, w, 1e-6, None, False),
+        lambda: cake_rmsnorm_nondet_train_forward(x, w, 1e-6),
+        lambda: cake_rmsnorm_nondet(x, w, 1e-6),
+        lambda: CakeRMSNormNondetFunction.apply(x, w, 1e-6, None),
     ):
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
@@ -230,20 +227,20 @@ def test_only_the_backward_consults_deterministic_algorithms(
     det_name = "flashinfer.cake_rmsnorm_det_train.cake_rmsnorm_det_train_backward"
     if mode == "strict":
         with pytest.raises(RuntimeError) as info:
-            cake_rmsnorm_train_backward(x, x, w, rstd, deterministic=False)
+            cake_rmsnorm_nondet_train_backward(x, x, w, rstd)
         assert _names(str(info.value), det_name), str(info.value)
         return
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         with pytest.raises(ValueError, match="CUDA"):
-            cake_rmsnorm_train_backward(x, x, w, rstd, deterministic=False)
+            cake_rmsnorm_nondet_train_backward(x, x, w, rstd)
     messages = _package_warnings(caught)
     assert len(messages) == 1, messages
     assert _names(messages[0], det_name), messages[0]
     assert "running this package's kernels" in messages[0]
 
 
-@pytest.mark.parametrize("entry", ["cake_rmsnorm", "CakeRMSNormFunction"])
+@pytest.mark.parametrize("entry", ["cake_rmsnorm_nondet", "CakeRMSNormNondetFunction"])
 @pytest.mark.parametrize("mode", ["strict", "warn_only"])
 def test_autograd_backward_consults_deterministic_algorithms_when_it_runs(
     mode: str, entry: str, monkeypatch: pytest.MonkeyPatch, restore_determinism
@@ -271,10 +268,10 @@ def test_autograd_backward_consults_deterministic_algorithms_when_it_runs(
     torch.use_deterministic_algorithms(True, warn_only=mode == "warn_only")
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        if entry == "cake_rmsnorm":
-            y = cake_rmsnorm(xa, wa, 1e-6, deterministic=False)
+        if entry == "cake_rmsnorm_nondet":
+            y = cake_rmsnorm_nondet(xa, wa, 1e-6)
         else:
-            y = CakeRMSNormFunction.apply(xa, wa, 1e-6, None, False)
+            y = CakeRMSNormNondetFunction.apply(xa, wa, 1e-6, None)
     assert _package_warnings(caught) == []
     det_name = "flashinfer.cake_rmsnorm_det_train.cake_rmsnorm_det"
     if mode == "strict":
@@ -304,14 +301,12 @@ def test_workspace_helpers_and_support_query_ignore_deterministic_algorithms(
     torch.use_deterministic_algorithms(True, warn_only=mode == "warn_only")
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        assert is_cake_rmsnorm_train_supported("cpu", 512, deterministic=False) is False
-        assert is_cake_rmsnorm_train_supported("cpu", deterministic=False) is False
+        assert is_cake_rmsnorm_nondet_train_supported("cpu", 512) is False
+        assert is_cake_rmsnorm_nondet_train_supported("cpu") is False
         with pytest.raises(ValueError, match="CUDA"):
-            cake_rmsnorm_train_backward_workspace_bytes(
-                4, 512, "cpu", deterministic=False
-            )
+            cake_rmsnorm_nondet_train_backward_workspace_bytes(4, 512, "cpu")
         with pytest.raises(ValueError, match="CUDA"):
-            cake_rmsnorm_train_backward_workspace(4, 512, "cpu", deterministic=False)
+            cake_rmsnorm_nondet_train_backward_workspace(4, 512, "cpu")
     assert _package_warnings(caught) == []
 
 
@@ -320,10 +315,9 @@ def test_backend_never_needs_the_det_package(
 ) -> None:
     """The backend imports and runs on its own (a vendored copy has no det
     sibling): no import of the det package anywhere in its source, and with
-    the det package unimportable every entry point behaves as before --
-    ``deterministic=True`` and the default still raise ``ValueError`` naming
-    the det entry point, the ``deterministic=False`` call reaches this
-    package's own checks."""
+    the det package unimportable every entry point behaves as before -- the
+    calls reach this package's own checks and a ``deterministic`` keyword is
+    still Python's ``TypeError``."""
     tree = ast.parse(inspect.getsource(backend))
     imports = [
         node
@@ -332,17 +326,19 @@ def test_backend_never_needs_the_det_package(
         and "cake_rmsnorm_det_train" in ast.unparse(node)
     ]
     assert imports == []
-    monkeypatch.delattr(flashinfer, "cake_rmsnorm_det_train_backend", raising=False)
-    monkeypatch.setitem(sys.modules, "flashinfer.cake_rmsnorm_det_train_backend", None)
+    monkeypatch.delattr(cake_namespace, "cake_rmsnorm_det_train", raising=False)
+    monkeypatch.setitem(
+        sys.modules, "flashinfer.experimental.cake.cake_rmsnorm_det_train", None
+    )
     x, w, rstd = _cpu_tensors()
-    assert is_cake_rmsnorm_train_supported("cpu", 512, deterministic=False) is False
+    assert is_cake_rmsnorm_nondet_train_supported("cpu", 512) is False
     with pytest.raises(ValueError, match="CUDA"):
-        cake_rmsnorm_train_forward(x, w, 1e-6, deterministic=False)
+        cake_rmsnorm_nondet_train_forward(x, w, 1e-6)
     with pytest.raises(ValueError, match="CUDA"):
-        cake_rmsnorm_train_backward(x, x, w, rstd, deterministic=False)
-    for flag in ({"deterministic": True}, {}):
-        with pytest.raises(ValueError, match="cake_rmsnorm_det_train_forward"):
-            cake_rmsnorm_train_forward(x, w, 1e-6, **flag)
+        cake_rmsnorm_nondet_train_backward(x, x, w, rstd)
+    for value in (True, False):
+        with pytest.raises(TypeError, match="unexpected keyword argument"):
+            cake_rmsnorm_nondet_train_forward(x, w, 1e-6, deterministic=value)
 
 
 # --------------------------------------------------------------------------- on the device
@@ -350,15 +346,14 @@ def test_backend_never_needs_the_det_package(
 
 @requires_device
 @pytest.mark.parametrize("hidden", HIDDEN_SIZES)
-def test_default_call_raises_and_the_false_call_runs_this_package(
+def test_every_call_runs_this_package(
     hidden: int, warmup_jit, no_determinism, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The default call of every entry point raises ``ValueError`` naming the det
-    entry point and launches nothing; the ``deterministic=False`` call launches
-    this package's modules, the same ones on a repeat with the same ``y``,
-    ``rstd`` and ``dx`` bits (``dx`` is bitwise reproducible) and ``dw``
-    within the budget of the FP64 reference; the autograd wrapper returns that
-    ``y`` and ``dx`` and the kernel's ``dw`` in the weight's dtype."""
+    """Every call launches this package's modules, the same ones on a repeat
+    with the same ``y``, ``rstd`` and ``dx`` bits (``dx`` is bitwise
+    reproducible) and ``dw`` within the budget of the FP64 reference; the
+    autograd wrapper returns that ``y`` and ``dx`` and the kernel's ``dw`` in
+    the weight's dtype."""
     _skip_unless_hidden(hidden)
     eps = EPS[hidden]
     launched: list[str] = []
@@ -373,34 +368,12 @@ def test_default_call_raises_and_the_false_call_runs_this_package(
     x = _randn(129, hidden, generator=generator)
     g = _randn(129, hidden, generator=generator)
     w = _randn(hidden, generator=generator)
-    rstd_any = torch.ones(129, dtype=torch.float32, device=_device())
-    for call, det_name in (
-        (
-            lambda: cake_rmsnorm_train_forward(x, w, eps),
-            "cake_rmsnorm_det_train_forward",
-        ),
-        (
-            lambda: cake_rmsnorm_train_backward(g, x, w, rstd_any),
-            "cake_rmsnorm_det_train_backward",
-        ),
-        (
-            lambda: cake_rmsnorm_train_backward_workspace_bytes(129, hidden, _device()),
-            "cake_rmsnorm_det_train_backward_workspace_bytes",
-        ),
-        (lambda: cake_rmsnorm(x, w, eps), "cake_rmsnorm_det"),
-    ):
-        with pytest.raises(ValueError) as info:
-            call()
-        text = str(info.value)
-        assert _names(text, f"flashinfer.cake_rmsnorm_det_train.{det_name}"), text
-        assert PHRASE in text, text
-    assert launched == []
-    y, rstd = cake_rmsnorm_train_forward(x, w, eps, deterministic=False)
-    dx, dw = cake_rmsnorm_train_backward(g, x, w, rstd, deterministic=False)
+    y, rstd = cake_rmsnorm_nondet_train_forward(x, w, eps)
+    dx, dw = cake_rmsnorm_nondet_train_backward(g, x, w, rstd)
     first = list(launched)
     launched.clear()
-    y_nd, rstd_nd = cake_rmsnorm_train_forward(x, w, eps, deterministic=False)
-    dx_nd, dw_nd = cake_rmsnorm_train_backward(g, x, w, rstd, deterministic=False)
+    y_nd, rstd_nd = cake_rmsnorm_nondet_train_forward(x, w, eps)
+    dx_nd, dw_nd = cake_rmsnorm_nondet_train_backward(g, x, w, rstd)
     assert first == launched and all(name in loader.MODULES for name in first)
     assert torch.equal(y, y_nd) and torch.equal(rstd, rstd_nd)
     assert torch.equal(dx, dx_nd)
@@ -409,7 +382,7 @@ def test_default_call_raises_and_the_false_call_runs_this_package(
     xa = x.clone().requires_grad_(True)
     wa = w.clone().requires_grad_(True)
     launched.clear()
-    ya = cake_rmsnorm(xa, wa, eps, deterministic=False)
+    ya = cake_rmsnorm_nondet(xa, wa, eps)
     assert torch.equal(ya, y)
     ya.backward(g)
     assert launched == first, launched
@@ -421,12 +394,12 @@ def test_default_call_raises_and_the_false_call_runs_this_package(
 
 @requires_device
 @pytest.mark.parametrize("hidden", HIDDEN_SIZES)
-def test_nondeterministic_flag_selects_this_package(
+def test_nondet_calls_select_this_package(
     hidden: int, warmup_jit, no_determinism, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``deterministic=False`` launches this package's modules (and no det
-    module) -- exactly the records the registry's windows select for the call:
-    one forward, then one single backward kernel or a det pair's main kernel and
+    """The nondet calls launch this package's modules (and no det module) --
+    exactly the records the registry's windows select for the call: one
+    forward, then one single backward kernel or a det pair's main kernel and
     dw reduce; the forward bits equal the det forward's where the two packages
     select the same program, and ``dx`` equals the det ``dx`` up to the BF16
     rounding of the same formula."""
@@ -444,8 +417,8 @@ def test_nondeterministic_flag_selects_this_package(
     x = _randn(257, hidden, generator=generator)
     g = _randn(257, hidden, generator=generator)
     w = _randn(hidden, generator=generator)
-    y, rstd = cake_rmsnorm_train_forward(x, w, eps, deterministic=False)
-    dx, dw = cake_rmsnorm_train_backward(g, x, w, rstd, deterministic=False)
+    y, rstd = cake_rmsnorm_nondet_train_forward(x, w, eps)
+    dx, dw = cake_rmsnorm_nondet_train_backward(g, x, w, rstd)
     assert launched and all(name in loader.MODULES for name in launched)
     arch = loader.device_arch(_device().index or 0)
     expected = [
@@ -511,30 +484,24 @@ def test_nondeterministic_workspace_serves_every_call_up_to_its_rows(
             sums = max(r["workspace_rule"]["sum_bytes"] for r in records)
             for rows in (0, 1, 12345, 65536):
                 assert (
-                    cake_rmsnorm_train_backward_workspace_bytes(
-                        rows, hidden, _device(), deterministic=False
+                    cake_rmsnorm_nondet_train_backward_workspace_bytes(
+                        rows, hidden, _device()
                     )
                     == loader.SUMS_OFFSET + -(-sums // 256) * 256
                 )
         generator = torch.Generator(device=_device()).manual_seed(SEED + hidden)
         for rows in (257, 4096):
-            ws = cake_rmsnorm_train_backward_workspace(
-                rows, hidden, _device(), deterministic=False
-            )
+            ws = cake_rmsnorm_nondet_train_backward_workspace(rows, hidden, _device())
             assert ws.dtype == torch.uint8 and not bool(ws.any())
-            assert ws.numel() == cake_rmsnorm_train_backward_workspace_bytes(
-                rows, hidden, _device(), deterministic=False
+            assert ws.numel() == cake_rmsnorm_nondet_train_backward_workspace_bytes(
+                rows, hidden, _device()
             )
             for tokens in (1, rows // 2, rows):
                 x = _randn(tokens, hidden, generator=generator)
                 g = _randn(tokens, hidden, generator=generator)
                 w = _randn(hidden, generator=generator)
-                _y, rstd = cake_rmsnorm_train_forward(
-                    x, w, EPS[hidden], deterministic=False
-                )
-                dx, dw = cake_rmsnorm_train_backward(
-                    g, x, w, rstd, deterministic=False, workspace=ws
-                )
+                _y, rstd = cake_rmsnorm_nondet_train_forward(x, w, EPS[hidden])
+                dx, dw = cake_rmsnorm_nondet_train_backward(g, x, w, rstd, workspace=ws)
                 rel = _rel(dw, _dw_reference(g, x, rstd))
                 assert rel <= 1e-4, (hidden, rows, tokens, rel)
                 assert _at_rest(ws), (hidden, rows, tokens)
@@ -571,11 +538,11 @@ def _call(hidden, residual, w_dtype, tokens, ws, generator):
     w = (1.0 + 0.1 * _randn(hidden, generator=generator).float()).to(w_dtype)
     u = _randn(tokens, hidden, generator=generator) if residual else None
     gh = _randn(tokens, hidden, generator=generator) if residual else None
-    outputs = cake_rmsnorm_train_forward(x, w, eps, residual=u, deterministic=False)
+    outputs = cake_rmsnorm_nondet_train_forward(x, w, eps, residual=u)
     normalized = outputs[2] if residual else x
     rstd = outputs[1]
-    dx, dw = cake_rmsnorm_train_backward(
-        g, normalized, w, rstd, deterministic=False, g_residual=gh, workspace=ws
+    dx, dw = cake_rmsnorm_nondet_train_backward(
+        g, normalized, w, rstd, g_residual=gh, workspace=ws
     )
     return _rel(dw, _dw_reference(g, normalized, rstd))
 
@@ -591,8 +558,8 @@ def test_one_workspace_serves_a_sequence_of_layouts(no_determinism) -> None:
     calls = _sequence(arch)
     assert len({(h, r, d) for h, r, d, _t in calls}) >= 3, calls
     nbytes = max(
-        cake_rmsnorm_train_backward_workspace_bytes(
-            tokens, hidden, _device(), residual=residual, deterministic=False
+        cake_rmsnorm_nondet_train_backward_workspace_bytes(
+            tokens, hidden, _device(), residual=residual
         )
         for hidden, residual, _d, tokens in calls
     )
@@ -613,8 +580,8 @@ def test_a_stale_workspace_is_correct_after_the_fresh_form(no_determinism) -> No
     arch = loader.device_arch(_device().index or 0)
     calls = _sequence(arch)
     nbytes = max(
-        cake_rmsnorm_train_backward_workspace_bytes(
-            tokens, hidden, _device(), residual=residual, deterministic=False
+        cake_rmsnorm_nondet_train_backward_workspace_bytes(
+            tokens, hidden, _device(), residual=residual
         )
         for hidden, residual, _d, tokens in calls
     )
@@ -666,7 +633,9 @@ def test_a_single_kernel_window_launches_exactly_one_kernel(no_determinism) -> N
     profiler, independently of the host's module selection.  An architecture
     whose every backward route is listed in ``DET_PAIR_ROUTES`` ships no single
     kernel to count."""
-    from flashinfer.cake_rmsnorm_train_backend import cake_windows as windows
+    from flashinfer.experimental.cake.cake_rmsnorm_nondet_train import (
+        cake_windows as windows,
+    )
     from tests.test_helpers.cake_profiler import cuda_kernel_names
 
     arch = loader.device_arch(_device().index or 0)
@@ -683,22 +652,19 @@ def test_a_single_kernel_window_launches_exactly_one_kernel(no_determinism) -> N
     g = _randn(tokens, hidden, generator=generator)
     w = _randn(hidden, generator=generator).to(w_dtype)
     gh = _randn(tokens, hidden, generator=generator) if residual else None
-    _y, rstd = cake_rmsnorm_train_forward(
-        x, w, EPS.get(hidden, 1e-6), deterministic=False
-    )
-    ws = cake_rmsnorm_train_backward_workspace(
-        tokens, hidden, _device(), residual=residual, deterministic=False
+    _y, rstd = cake_rmsnorm_nondet_train_forward(x, w, EPS.get(hidden, 1e-6))
+    ws = cake_rmsnorm_nondet_train_backward_workspace(
+        tokens, hidden, _device(), residual=residual
     )
     dx = torch.empty_like(x)
     dw = torch.empty(hidden, dtype=torch.float32, device=_device())
 
     def call():
-        cake_rmsnorm_train_backward(
+        cake_rmsnorm_nondet_train_backward(
             g,
             x,
             w,
             rstd,
-            deterministic=False,
             g_residual=gh,
             workspace=ws,
             dx=dx,
@@ -743,7 +709,7 @@ def test_nd_autograd_gradients(heads: int, consumer: str, no_determinism) -> Non
     w = (1.0 + 0.1 * _randn(hidden, generator=generator).float()).to(torch.bfloat16)
     w.requires_grad_(True)
     scale = _randn(heads, tokens, hidden, generator=generator).float()
-    y = cake_rmsnorm(x, w, eps, deterministic=False)
+    y = cake_rmsnorm_nondet(x, w, eps)
     if consumer == "sum":
         loss = y.float().sum()
         grad_y = torch.ones(
@@ -797,11 +763,9 @@ def test_warn_only_warns_at_the_backward_and_runs_this_package(
         torch.float32 if w_token == "f32" else torch.bfloat16
     )
     torch.use_deterministic_algorithms(False)
-    y0, rstd0 = cake_rmsnorm_train_forward(x, w, eps, deterministic=False)
-    dx0, _dw0 = cake_rmsnorm_train_backward(g, x, w, rstd0, deterministic=False)
-    ws = cake_rmsnorm_train_backward_workspace(
-        tokens, hidden, _device(), deterministic=False
-    )
+    y0, rstd0 = cake_rmsnorm_nondet_train_forward(x, w, eps)
+    dx0, _dw0 = cake_rmsnorm_nondet_train_backward(g, x, w, rstd0)
+    ws = cake_rmsnorm_nondet_train_backward_workspace(tokens, hidden, _device())
     launched: list[str] = []
     run_module = loader.run_module
 
@@ -827,13 +791,9 @@ def test_warn_only_warns_at_the_backward_and_runs_this_package(
         return result
 
     torch.use_deterministic_algorithms(True, warn_only=True)
-    y, rstd = warned(
-        lambda: cake_rmsnorm_train_forward(x, w, eps, deterministic=False), None
-    )
+    y, rstd = warned(lambda: cake_rmsnorm_nondet_train_forward(x, w, eps), None)
     dx, dw = warned(
-        lambda: cake_rmsnorm_train_backward(
-            g, x, w, rstd, deterministic=False, workspace=ws
-        ),
+        lambda: cake_rmsnorm_nondet_train_backward(g, x, w, rstd, workspace=ws),
         "cake_rmsnorm_det_train_backward",
     )
     expected = [
@@ -852,7 +812,7 @@ def test_warn_only_warns_at_the_backward_and_runs_this_package(
     xa = x.clone().requires_grad_(True)
     wa = w.clone().requires_grad_(True)
     launched.clear()
-    ya = warned(lambda: cake_rmsnorm(xa, wa, eps, deterministic=False), None)
+    ya = warned(lambda: cake_rmsnorm_nondet(xa, wa, eps), None)
     warned(lambda: ya.backward(g), "cake_rmsnorm_det")
     assert launched == expected, launched
     assert torch.equal(ya, y0) and torch.equal(xa.grad, dx0)

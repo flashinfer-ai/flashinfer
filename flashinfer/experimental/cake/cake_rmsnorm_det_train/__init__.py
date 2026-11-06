@@ -19,12 +19,12 @@ API bodies, the ``cake_jit`` loader and the generated CUDA sources under ``csrc/
 The stable, ``@flashinfer_api``-decorated entry points and the full user-facing
 documentation live in :mod:`flashinfer.cake_rmsnorm_det_train`; import that module.
 
-This is the deterministic package: every forward, backward, workspace,
-support-query and autograd entry point name carries ``det`` and the weight
-gradient is always the fixed-order reduction.  No entry point takes
-a ``deterministic`` keyword (passing one raises Python's ``TypeError`` for an
-unexpected keyword argument); the non-deterministic weight gradient is
-:mod:`flashinfer.cake_rmsnorm_train`.
+This is the deterministic package: every public name carries ``det`` (the
+constants excepted) and the weight gradient is always the fixed-order
+reduction.  No entry point takes a ``deterministic`` keyword (passing one
+raises Python's ``TypeError`` for an unexpected keyword argument); the
+non-deterministic weight gradient is
+:mod:`flashinfer.cake_rmsnorm_nondet_train`.
 """
 
 from __future__ import annotations
@@ -44,13 +44,13 @@ from .cake_jit import (
     FORWARD_ALIGNMENT_BYTES,
     FP32_WEIGHT_ALIGNMENT_BYTES,
     arch_for_capability,
-    program_windows,
+    program_windows as cake_rmsnorm_det_train_program_windows,
     route_applies,
-    route_key,
+    route_key as cake_rmsnorm_det_train_route_key,
     route_modules,
     selected_modules,
     supported_hidden_sizes,
-    weight_dtypes,
+    weight_dtypes as cake_rmsnorm_det_train_weight_dtypes,
 )
 
 SUPPORTED_COMPUTE_CAPABILITIES: tuple[tuple[int, int], ...] = tuple(
@@ -287,7 +287,7 @@ def _route_error(
     on ``arch`` and the weight dtypes this route ships for."""
 
     word = "forward" if kind == "fwd" else "backward"
-    shipped = weight_dtypes(arch, hidden, kind, residual)
+    shipped = cake_rmsnorm_det_train_weight_dtypes(arch, hidden, kind, residual)
     dtypes = tuple(dtype for dtype, token in _WEIGHT_DTYPES.items() if token in shipped)
     return ValueError(
         f"no exported Cake RMSNorm training {word} for hidden={hidden} "
@@ -395,7 +395,7 @@ def _backward_selection_rows(
     """
 
     edge = _windows.ACCURACY_EDGES.get(arch, {}).get(
-        route_key(hidden, "bwd", residual, w_dtype)
+        cake_rmsnorm_det_train_route_key(hidden, "bwd", residual, w_dtype)
     )
     if (
         edge is None
@@ -437,7 +437,8 @@ def cake_rmsnorm_det_train_backward_workspace_bytes(
     # Every module of a route shares its owner's partial capacity; the buffer
     # also holds the widest counter table any module of the routes declares.
     total = 0
-    for w_dtype in weight_dtypes(arch, hidden, "bwd", residual) or ("bf16",):
+    dtypes = cake_rmsnorm_det_train_weight_dtypes(arch, hidden, "bwd", residual)
+    for w_dtype in dtypes or ("bf16",):
         owner = _workspace_record(arch, hidden, residual, max(rows, 1), w_dtype)
         selection = _backward_selection_rows(
             arch, hidden, residual, max(rows, 1), w_dtype, device_index
@@ -554,7 +555,7 @@ def cake_rmsnorm_det_train_forward(
         -- the effective weight ``1 + w`` a zero-centred model computes in FP32
         -- when contiguous and 32-byte aligned; any other layout is copied once.
         An FP32 weight needs the FP32-weight route of the width on the device
-        (:func:`weight_dtypes`), else ``ValueError``.
+        (:func:`cake_rmsnorm_det_train_weight_dtypes`), else ``ValueError``.
     eps : float
         Variance epsilon (FP32 inside the kernel).
     residual : torch.Tensor, optional
@@ -695,7 +696,8 @@ def cake_rmsnorm_det_train_backward(
         BF16 or FP32 ``[H]`` weight (the forward's).  BF16 is read in place when
         contiguous and 16-byte aligned, FP32 when contiguous and 32-byte aligned;
         any other layout is copied once.  An FP32 weight needs the FP32-weight
-        route of the width (:func:`weight_dtypes`), else ``ValueError``.
+        route of the width (:func:`cake_rmsnorm_det_train_weight_dtypes`), else
+        ``ValueError``.
     rstd : torch.Tensor
         FP32 ``[T]`` reciprocal RMS returned by the forward (of the leading
         shape ``[...]`` for an N-D call, or flat ``[prod(...)]``).
@@ -898,8 +900,8 @@ def cake_rmsnorm_det(
         dimensions collapse into rows).
     w : torch.Tensor
         BF16 or FP32 ``[H]`` RMSNorm weight (FP32 on the routes that ship the
-        FP32-weight programs, see :func:`weight_dtypes`); the weight gradient is
-        returned in ``w.dtype``.
+        FP32-weight programs, see :func:`cake_rmsnorm_det_train_weight_dtypes`);
+        the weight gradient is returned in ``w.dtype``.
     eps : float
         Variance epsilon evaluated in FP32 by the kernel.
     residual : torch.Tensor, optional
@@ -923,7 +925,8 @@ def _with_program_selection(doc: Optional[str], kind: str) -> str:
     The notes are the exporter's rendering of the registry (``cake_windows``):
     the row-count windows of every route, the measured outcome at every window
     edge and the contract of the outputs across the windows, so the documented
-    thresholds are the registry's.  ``program_windows`` returns the windows.
+    thresholds are the registry's.  ``cake_rmsnorm_det_train_program_windows``
+    returns the windows.
     """
 
     section = textwrap.indent(_windows.SECTIONS[kind].strip("\n"), "    ")
@@ -947,8 +950,8 @@ __all__ = [
     "cake_rmsnorm_det_train_backward_workspace",
     "cake_rmsnorm_det_train_backward_workspace_bytes",
     "cake_rmsnorm_det_train_forward",
+    "cake_rmsnorm_det_train_program_windows",
+    "cake_rmsnorm_det_train_route_key",
+    "cake_rmsnorm_det_train_weight_dtypes",
     "is_cake_rmsnorm_det_train_supported",
-    "program_windows",
-    "route_key",
-    "weight_dtypes",
 ]

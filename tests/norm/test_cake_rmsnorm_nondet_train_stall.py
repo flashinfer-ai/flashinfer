@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Stall regression of the Cake BF16 RMSNorm training backward with the
-non-deterministic weight gradient (``deterministic=False``; issues #7038,
-#7548 item 2, #8066).
+non-deterministic weight gradient (``flashinfer.cake_rmsnorm_nondet_train``;
+issues #7038, #7548 item 2, #8066).
 
 The backward runs, per token-count window, one kernel whose persistent CTAs
 claim row chunks from a counter and add their per-column ``dw`` sums into FP64
@@ -60,7 +60,6 @@ replaces is measured for reference.
 from __future__ import annotations
 
 import ctypes
-import functools
 import statistics
 
 import pytest
@@ -68,14 +67,12 @@ import torch
 
 from tests.test_helpers.cake_package import cake_package
 
-pkg = cake_package("cake_rmsnorm_train")
-loader = cake_package("cake_rmsnorm_train", "cake_jit")
-windows = cake_package("cake_rmsnorm_train", "cake_windows")
-backward = functools.partial(pkg.cake_rmsnorm_train_backward, deterministic=False)
-workspace_for = functools.partial(
-    pkg.cake_rmsnorm_train_backward_workspace, deterministic=False
-)
-forward = functools.partial(pkg.cake_rmsnorm_train_forward, deterministic=False)
+pkg = cake_package("cake_rmsnorm_nondet_train")
+loader = cake_package("cake_rmsnorm_nondet_train", "cake_jit")
+windows = cake_package("cake_rmsnorm_nondet_train", "cake_windows")
+backward = pkg.cake_rmsnorm_nondet_train_backward
+workspace_for = pkg.cake_rmsnorm_nondet_train_backward_workspace
+forward = pkg.cake_rmsnorm_nondet_train_forward
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 WIDTHS = (
@@ -123,13 +120,13 @@ def _supported() -> bool:
     return (
         torch.cuda.is_available()
         and _capability() in SUPPORTED_CAPABILITIES
-        and pkg.is_cake_rmsnorm_train_supported(_device(), deterministic=False)
+        and pkg.is_cake_rmsnorm_nondet_train_supported(_device())
     )
 
 
 pytestmark = pytest.mark.skipif(
     not _supported(),
-    reason="cake_rmsnorm_train(deterministic=False) needs an SM100 / SM103 / SM107 device with exported routes",
+    reason="cake_rmsnorm_nondet_train needs an SM100 / SM103 / SM107 device with exported routes",
 )
 
 
@@ -143,7 +140,7 @@ def warmup_jit():
 
 
 def _skip_unless_route(hidden: int, residual: bool) -> None:
-    if not pkg.is_cake_rmsnorm_train_supported(_device(), hidden, deterministic=False):
+    if not pkg.is_cake_rmsnorm_nondet_train_supported(_device(), hidden):
         pytest.skip(f"hidden={hidden} has no exported route on this device")
     if residual and not loader.route_applies(
         device_capability=_capability(), hidden=hidden, kind="bwd", residual=True

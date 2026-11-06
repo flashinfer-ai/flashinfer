@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Tests for the Cake fused BF16 RMSNorm training kernels with the
-non-deterministic weight gradient (``deterministic=False``; SM100 / SM103 /
-SM107).
+non-deterministic weight gradient (``flashinfer.cake_rmsnorm_nondet_train``;
+SM100 / SM103 / SM107).
 
 Every kernel output is compared with an FP64 reference of the same math: BF16
 ``y`` / ``dx`` at ``atol = rtol = 1e-2`` after normalizing both sides to unit
@@ -52,7 +52,7 @@ per-architecture CUDA floors and flags are checked without a device.
 
 This suite exercises the backend packages alone, through
 ``tests.test_helpers.cake_package``; the facade and the ``flashinfer`` top
-level are ``test_cake_rmsnorm_train_api.py``'s.
+level are ``test_cake_rmsnorm_nondet_train_api.py``'s.
 """
 
 from __future__ import annotations
@@ -71,18 +71,16 @@ import torch.utils.checkpoint
 
 from tests.test_helpers.cake_package import cake_package
 
-pkg = cake_package("cake_rmsnorm_train")
-loader = cake_package("cake_rmsnorm_train", "cake_jit")
-cake_build = cake_package("cake_rmsnorm_train", "cake_build")
+pkg = cake_package("cake_rmsnorm_nondet_train")
+loader = cake_package("cake_rmsnorm_nondet_train", "cake_jit")
+cake_build = cake_package("cake_rmsnorm_nondet_train", "cake_build")
 det = cake_package("cake_rmsnorm_det_train")
 det_loader = cake_package("cake_rmsnorm_det_train", "cake_jit")
 det_build = cake_package("cake_rmsnorm_det_train", "cake_build")
-forward = functools.partial(pkg.cake_rmsnorm_train_forward, deterministic=False)
-backward = functools.partial(pkg.cake_rmsnorm_train_backward, deterministic=False)
-workspace_for = functools.partial(
-    pkg.cake_rmsnorm_train_backward_workspace, deterministic=False
-)
-rmsnorm = functools.partial(pkg.cake_rmsnorm, deterministic=False)
+forward = pkg.cake_rmsnorm_nondet_train_forward
+backward = pkg.cake_rmsnorm_nondet_train_backward
+workspace_for = pkg.cake_rmsnorm_nondet_train_backward_workspace
+rmsnorm = pkg.cake_rmsnorm_nondet
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 WIDTHS = (
@@ -144,7 +142,7 @@ def _supported() -> bool:
     return (
         torch.cuda.is_available()
         and _capability() in SUPPORTED_CAPABILITIES
-        and pkg.is_cake_rmsnorm_train_supported(_device(), deterministic=False)
+        and pkg.is_cake_rmsnorm_nondet_train_supported(_device())
     )
 
 
@@ -157,7 +155,7 @@ def device_or_skip(request):
     """Every test needs a supported device except the ``cpu_only`` ones."""
     if request.node.get_closest_marker("cpu_only") is None and not _supported():
         pytest.skip(
-            "cake_rmsnorm_train needs an SM100 / SM103 / SM107 device with exported routes"
+            "cake_rmsnorm_nondet_train needs an SM100 / SM103 / SM107 device with exported routes"
         )
 
 
@@ -281,8 +279,8 @@ def _workspace_at_rest(ws: torch.Tensor) -> bool:
 
 
 def _bytes(rows: int, hidden: int, residual: bool = False) -> int:
-    return pkg.cake_rmsnorm_train_backward_workspace_bytes(
-        rows, hidden, _device(), residual=residual, deterministic=False
+    return pkg.cake_rmsnorm_nondet_train_backward_workspace_bytes(
+        rows, hidden, _device(), residual=residual
     )
 
 
@@ -1112,7 +1110,7 @@ def test_workspace_reused_across_token_counts_and_weight_dtypes(hidden: int) -> 
     """One buffer serves a width's calls of every token count up to its rows,
     every window and both weight dtypes with no host write but NaN poison in its
     pair partial rows before each call; at rest after every call.  (Reuse across
-    widths, residual flags and stale bytes: ``test_cake_rmsnorm_train_api.py``.)"""
+    widths, residual flags and stale bytes: ``test_cake_rmsnorm_nondet_train_api.py``.)"""
     _skip_unless_route(hidden)
     ws = torch.zeros(_bytes(65536, hidden), dtype=torch.uint8, device=_device())
     w_dtypes = ["bf16"] + (["f32"] if _routes(hidden, "bwd", False, "f32") else [])
@@ -1482,7 +1480,7 @@ def test_autograd_backward_checks_deterministic_algorithms_when_it_runs(
         return [
             str(item.message)
             for item in caught
-            if "flashinfer.cake_rmsnorm_train." in str(item.message)
+            if "flashinfer.cake_rmsnorm_nondet_train." in str(item.message)
         ]
 
     # strict determinism: the forward runs, the backward refuses
@@ -1550,9 +1548,8 @@ def _refused(error: type, call, why: str) -> None:
 def test_argument_validation(hidden: int) -> None:
     """Wrong dtypes, shapes, devices, layouts, output buffers and workspaces
     (too small for the call, wrong dtype, on the CPU, misaligned, 2-D) are
-    refused with ``ValueError`` before any launch (the ``deterministic`` flag's
-    ``ValueError`` for every value but ``False``:
-    ``test_cake_rmsnorm_det_train_names.py``)."""
+    refused with ``ValueError`` before any launch (the ``deterministic``
+    keyword is Python's ``TypeError``: ``test_cake_rmsnorm_det_train_names.py``)."""
     _skip_unless_route(hidden)
     eps = EPS[hidden]
     rows = 4096
@@ -1593,8 +1590,8 @@ def test_argument_validation(hidden: int) -> None:
             "dw shape",
         ),
         (
-            lambda: pkg.cake_rmsnorm_train_backward_workspace_bytes(
-                -1, hidden, device, deterministic=False
+            lambda: pkg.cake_rmsnorm_nondet_train_backward_workspace_bytes(
+                -1, hidden, device
             ),
             "negative rows",
         ),

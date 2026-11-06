@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Co-residence of the Cake BF16 RMSNorm training kernels with the
-non-deterministic weight gradient (``deterministic=False``) beside kernels
-resident on other streams, for the routes the backend stall suite
-(``test_cake_rmsnorm_train_stall.py``: BF16 weights, the all-SM case without the
+non-deterministic weight gradient (``flashinfer.cake_rmsnorm_nondet_train``)
+beside kernels resident on other streams, for the routes the backend stall suite
+(``test_cake_rmsnorm_nondet_train_stall.py``: BF16 weights, the all-SM case without the
 residual route) does not cover (issues #7038, #7548 item 2, #8066):
 
 * the backward of every FP32-weight route and of the residual route (both
@@ -62,14 +62,12 @@ import torch
 from tests.test_helpers import cake_rmsnorm_train_reference as ref
 from tests.test_helpers.cake_package import cake_package
 
-pkg = cake_package("cake_rmsnorm_train")
-loader = cake_package("cake_rmsnorm_train", "cake_jit")
-windows_table = cake_package("cake_rmsnorm_train", "cake_windows")
-forward = functools.partial(pkg.cake_rmsnorm_train_forward, deterministic=False)
-backward = functools.partial(pkg.cake_rmsnorm_train_backward, deterministic=False)
-workspace_for = functools.partial(
-    pkg.cake_rmsnorm_train_backward_workspace, deterministic=False
-)
+pkg = cake_package("cake_rmsnorm_nondet_train")
+loader = cake_package("cake_rmsnorm_nondet_train", "cake_jit")
+windows_table = cake_package("cake_rmsnorm_nondet_train", "cake_windows")
+forward = pkg.cake_rmsnorm_nondet_train_forward
+backward = pkg.cake_rmsnorm_nondet_train_backward
+workspace_for = pkg.cake_rmsnorm_nondet_train_backward_workspace
 
 
 def _det_package():
@@ -117,7 +115,7 @@ def _supported() -> bool:
     return (
         torch.cuda.is_available()
         and _capability() in SUPPORTED_CAPABILITIES
-        and pkg.is_cake_rmsnorm_train_supported(_device(), deterministic=False)
+        and pkg.is_cake_rmsnorm_nondet_train_supported(_device())
     )
 
 
@@ -127,7 +125,7 @@ def _arch() -> str:
 
 pytestmark = pytest.mark.skipif(
     not _supported(),
-    reason="cake_rmsnorm_train(deterministic=False) needs an SM100 / SM103 / SM107 device with exported routes",
+    reason="cake_rmsnorm_nondet_train needs an SM100 / SM103 / SM107 device with exported routes",
 )
 
 

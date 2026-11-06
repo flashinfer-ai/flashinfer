@@ -18,7 +18,7 @@ collectives (issues #7038, #8066): two processes, one per GPU, joined by a
 ``torch.distributed`` NCCL process group, run the forward and backward on the
 compute stream while an all-gather or a reduce-scatter is in flight on a side
 stream -- of the deterministic package (``flashinfer.cake_rmsnorm_det_train``)
-and of this package (its ``deterministic=False`` calls), BF16 and FP32 weights,
+and of this package (``flashinfer.cake_rmsnorm_nondet_train``), BF16 and FP32 weights,
 the plain and the residual route.
 
 Two kinds of resident collective:
@@ -138,8 +138,8 @@ def _worker(rank: int, port: int, out_dir: Path) -> int:
         device_id=device,
     )
     cpu = dist.new_group(backend="gloo")
-    pkg = cake_package("cake_rmsnorm_train")
-    loader = cake_package("cake_rmsnorm_train", "cake_jit")
+    pkg = cake_package("cake_rmsnorm_nondet_train")
+    loader = cake_package("cake_rmsnorm_nondet_train", "cake_jit")
     det_pkg = cake_package("cake_rmsnorm_det_train")
     arch = loader.arch_for_capability(torch.cuda.get_device_capability(device))
     side = torch.cuda.Stream(device)
@@ -219,22 +219,20 @@ def _worker(rank: int, port: int, out_dir: Path) -> int:
             )
             weight = (1 + 0.1 * torch.randn(hidden, **kw)).to(ref.W_DTYPES[w])
             eps = ref.EPS[hidden]
-            # the deterministic arm runs the deterministic package (no flag),
-            # the other this package with ``deterministic=False``
+            # the deterministic arm runs the deterministic package, the other
+            # this package (the mode is part of the name)
             if deterministic:
                 forward = det_pkg.cake_rmsnorm_det_train_forward
                 backward = det_pkg.cake_rmsnorm_det_train_backward
                 workspace = det_pkg.cake_rmsnorm_det_train_backward_workspace
-                flag = {}
             else:
-                forward = pkg.cake_rmsnorm_train_forward
-                backward = pkg.cake_rmsnorm_train_backward
-                workspace = pkg.cake_rmsnorm_train_backward_workspace
-                flag = {"deterministic": False}
-            ws = workspace(rows, hidden, device, residual=residual, **flag)
+                forward = pkg.cake_rmsnorm_nondet_train_forward
+                backward = pkg.cake_rmsnorm_nondet_train_backward
+                workspace = pkg.cake_rmsnorm_nondet_train_backward_workspace
+            ws = workspace(rows, hidden, device, residual=residual)
 
             def call():
-                outputs = forward(x, weight, eps, residual=u, **flag)
+                outputs = forward(x, weight, eps, residual=u)
                 normalized = outputs[2] if residual else x
                 dx, dw = backward(
                     g,
@@ -243,7 +241,6 @@ def _worker(rank: int, port: int, out_dir: Path) -> int:
                     outputs[1],
                     g_residual=g_h,
                     workspace=ws,
-                    **flag,
                 )
                 return tuple(t.clone() for t in (*outputs, dx, dw))
 

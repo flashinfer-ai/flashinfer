@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Backend of :mod:`flashinfer.cake_rmsnorm_train`: Cake fused BF16 RMSNorm training
+Backend of :mod:`flashinfer.cake_rmsnorm_nondet_train`: Cake fused BF16 RMSNorm training
 forward / backward (SM100 / SM103 / SM107) with the non-deterministic weight
 gradient, as one self-contained package (host API bodies, the ``cake_jit``
 loader and the generated CUDA sources under ``csrc/``).
@@ -24,17 +24,19 @@ and, per token-count window, the backward form the registry lists for it: in
 the windows that ship it, one kernel whose CTAs add their ``dw`` sums into FP64
 workspace sums in the order they finish, so ``dw`` is not guaranteed bitwise
 reproducible; in the others, the deterministic package's backward pair (main
-kernel and fixed-order ``dw`` reduce) rendered here.  Every entry point
-requires ``deterministic=False``: any other value, the default ``True``
-included, raises ``ValueError`` naming the entry point of the deterministic
-package (:mod:`flashinfer.cake_rmsnorm_det_train`) to call instead.  Under
+kernel and fixed-order ``dw`` reduce) rendered here.  The mode is part of the
+name only: every public name carries ``nondet`` (the constants excepted) and no
+entry point takes a ``deterministic`` keyword (passing one raises Python's
+``TypeError`` for an unexpected keyword argument); the deterministic package is
+:mod:`flashinfer.cake_rmsnorm_det_train`.  Under
 ``torch.use_deterministic_algorithms(True)`` the backward raises
 ``RuntimeError`` naming the deterministic package's backward (the autograd
 function's backward, when it runs, names ``cake_rmsnorm_det``), or, with
 ``warn_only=True``, warns once and runs this package's backward; the forward,
-the workspace helpers and the support query do not consult the setting.  The
-stable, ``@flashinfer_api``-decorated entry points and the full user-facing
-documentation live in :mod:`flashinfer.cake_rmsnorm_train`; import that module.
+the workspace helpers, the route helper and the support query do not consult
+the setting.  The stable, ``@flashinfer_api``-decorated entry points and the
+full user-facing documentation live in
+:mod:`flashinfer.cake_rmsnorm_nondet_train`; import that module.
 
 Vendoring: this package imports and runs on its own; it never imports the
 deterministic package.
@@ -60,66 +62,35 @@ from .cake_jit import (
     FP32_WEIGHT_ALIGNMENT_BYTES,
     arch_for_capability,
     route_applies,
-    route_key,
+    route_key as cake_rmsnorm_nondet_train_route_key,
     selected_modules,
     supported_hidden_sizes,
-    weight_dtypes,
 )
 
 SUPPORTED_COMPUTE_CAPABILITIES: tuple[tuple[int, int], ...] = tuple(
     sorted(ARCH_BY_CAPABILITY)
 )
 
-# The entry point of the deterministic package (``flashinfer.cake_rmsnorm_det_train``)
-# of the same role as each entry point of this package: the name its errors point
-# a deterministic caller to.  This package never imports or runs that package.
-_DET_NAMES = {
-    "cake_rmsnorm_train_forward": "cake_rmsnorm_det_train_forward",
-    "cake_rmsnorm_train_backward": "cake_rmsnorm_det_train_backward",
-    "cake_rmsnorm_train_backward_workspace": "cake_rmsnorm_det_train_backward_workspace",
-    "cake_rmsnorm_train_backward_workspace_bytes": "cake_rmsnorm_det_train_backward_workspace_bytes",
-    "cake_rmsnorm": "cake_rmsnorm_det",
-    "CakeRMSNormFunction": "CakeRMSNormDetFunction",
-    "is_cake_rmsnorm_train_supported": "is_cake_rmsnorm_det_train_supported",
-}
-
-
-def _check_flag(deterministic: bool, api: str) -> None:
-    """``deterministic`` of the entry point ``api`` must be the object ``False``:
-    any other value (the default ``True``, ``None``, ``0``, ``1``, ``"False"``,
-    a NumPy bool, ...) raises ``ValueError`` naming the deterministic package's
-    entry point.  This package computes the non-deterministic weight gradient
-    only, and an explicit ``False`` keeps that choice visible at every call."""
-
-    if deterministic is not False:
-        raise ValueError(
-            f"flashinfer.cake_rmsnorm_train.{api} computes the non-deterministic "
-            f"weight gradient and got deterministic={deterministic!r} "
-            f"({type(deterministic).__name__}); the deterministic entry point is "
-            f"flashinfer.cake_rmsnorm_det_train.{_DET_NAMES[api]}; pass "
-            "deterministic=False for the non-deterministic path"
-        )
-
-
-def _check_deterministic_algorithms(api: str) -> None:
+def _check_deterministic_algorithms(api: str, det_api: str) -> None:
     """``torch.use_deterministic_algorithms(True)`` before the backward of ``api``
     (PyTorch's rule: an alert before work whose result can vary from run to run;
     this package does not guarantee a bitwise-reproducible weight gradient, as
     some token-count windows sum it in a scheduling-dependent order, so every
     backward call alerts, whatever window form it runs):
-    ``RuntimeError`` naming the deterministic package's entry point, or, with
-    ``warn_only=True``, one ``UserWarning`` naming it, after which this
-    package's backward runs.  The forward (no cross-row reduction), the
-    workspace helpers and the support query never call it."""
+    ``RuntimeError`` naming ``det_api``, the deterministic package's entry point
+    of the same role, or, with ``warn_only=True``, one ``UserWarning`` naming
+    it, after which this package's backward runs (never the deterministic
+    package's).  The forward (no cross-row reduction), the workspace helpers,
+    the route helper and the support query never call it."""
 
     if not torch.are_deterministic_algorithms_enabled():
         return
     message = (
-        f"flashinfer.cake_rmsnorm_train.{api} does not guarantee a "
+        f"flashinfer.cake_rmsnorm_nondet_train.{api} does not guarantee a "
         "bitwise-reproducible weight gradient (some token-count windows sum it "
         "in a scheduling-dependent order), but "
         "torch.use_deterministic_algorithms(True) is in effect; call "
-        f"flashinfer.cake_rmsnorm_det_train.{_DET_NAMES[api]}"
+        f"flashinfer.cake_rmsnorm_det_train.{det_api}"
     )
     if not torch.is_deterministic_algorithms_warn_only_enabled():
         raise RuntimeError(message)
@@ -157,20 +128,18 @@ def _device_arch(device: torch.device) -> str:
     return arch
 
 
-def is_cake_rmsnorm_train_supported(
-    device: torch.device, hidden: Optional[int] = None, *, deterministic: bool = True
+def is_cake_rmsnorm_nondet_train_supported(
+    device: torch.device, hidden: Optional[int] = None
 ) -> bool:
     """Whether ``device`` (and optionally ``hidden``) has an exported route of
     this package.
 
-    The answer is for this package's non-deterministic routes only and needs
-    ``deterministic=False``; any other value, the default included, raises
-    ``ValueError`` naming the deterministic package's query
-    (:func:`flashinfer.cake_rmsnorm_det_train.is_cake_rmsnorm_det_train_supported`).
+    The answer is for this package's non-deterministic routes only (the
+    deterministic package's query is
+    :func:`flashinfer.cake_rmsnorm_det_train.is_cake_rmsnorm_det_train_supported`).
     The answer does not depend on ``torch.use_deterministic_algorithms``.
     """
 
-    _check_flag(deterministic, "is_cake_rmsnorm_train_supported")
     device = torch.device(device)
     if device.type != "cuda":
         return False
@@ -389,7 +358,7 @@ def _route_error(
     on ``arch`` and the weight dtypes this route ships for."""
 
     word = "forward" if kind == "fwd" else "backward"
-    shipped = weight_dtypes(arch, hidden, kind, residual)
+    shipped = _loader.weight_dtypes(arch, hidden, kind, residual)
     dtypes = tuple(dtype for dtype, token in _WEIGHT_DTYPES.items() if token in shipped)
     return ValueError(
         f"no exported non-deterministic Cake RMSNorm training {word} for "
@@ -462,7 +431,7 @@ def _backward_owners(arch: str, hidden: int, residual: bool, rows: int) -> list[
     whose window admits a token count of at most ``rows``."""
 
     owners = []
-    for w_dtype in weight_dtypes(arch, hidden, "bwd", residual):
+    for w_dtype in _loader.weight_dtypes(arch, hidden, "bwd", residual):
         for name in _loader.route_modules(arch, hidden, "bwd", residual, w_dtype):
             record = _loader.MODULES[name]
             rule = record["select_rule"]
@@ -551,13 +520,12 @@ def _workspace_bytes_of(
     )
 
 
-def cake_rmsnorm_train_backward_workspace_bytes(
+def cake_rmsnorm_nondet_train_backward_workspace_bytes(
     rows: int,
     hidden: int,
     device: torch.device,
     *,
     residual: bool = False,
-    deterministic: bool = True,
 ) -> int:
     """Bytes of the caller-owned backward workspace of width ``hidden`` on ``device`` for up to ``rows`` tokens.
 
@@ -573,7 +541,7 @@ def cake_rmsnorm_train_backward_workspace_bytes(
     The size returned is the largest layout of the records the width's
     backward routes (``hidden``, ``residual``, both weight dtypes) run for up
     to ``rows`` tokens.  The buffer must be zero on first use (allocate with
-    ``torch.zeros`` or use :func:`cake_rmsnorm_train_backward_workspace`);
+    ``torch.zeros`` or use :func:`cake_rmsnorm_nondet_train_backward_workspace`);
     after every launch the kernels leave the counters at rest and the sums at
     zero, so with no host write one buffer serves any sequence of this
     package's backward calls -- hidden sizes, residual flags, weight dtypes,
@@ -581,36 +549,31 @@ def cake_rmsnorm_train_backward_workspace_bytes(
     Zeroing it again between calls is harmless.  Backward calls that may run
     at the same time (on different streams) need one buffer each.
 
-    ``deterministic`` must be ``False``; any other value, the default
-    included, raises ``ValueError`` naming the deterministic package's helper
-    (:func:`flashinfer.cake_rmsnorm_det_train.cake_rmsnorm_det_train_backward_workspace_bytes`;
-    that package's workspace has another layout).  The size does not depend on
-    ``torch.use_deterministic_algorithms``.
+    The deterministic package's workspace has another layout (size it with
+    :func:`flashinfer.cake_rmsnorm_det_train.cake_rmsnorm_det_train_backward_workspace_bytes`).
+    The size does not depend on ``torch.use_deterministic_algorithms``.
     """
 
-    _check_flag(deterministic, "cake_rmsnorm_train_backward_workspace_bytes")
     device = torch.device(device)
     if int(rows) < 0:
         raise ValueError("rows must be non-negative")
     return _workspace_bytes(rows, hidden, device, residual)
 
 
-def cake_rmsnorm_train_backward_workspace(
+def cake_rmsnorm_nondet_train_backward_workspace(
     rows: int,
     hidden: int,
     device: torch.device,
     *,
     residual: bool = False,
-    deterministic: bool = True,
 ) -> torch.Tensor:
-    """Allocate a zero-initialized backward workspace (see ``..._workspace_bytes``;
-    ``deterministic`` must be ``False``: any other value, the default included,
-    raises ``ValueError`` naming
+    """Allocate a zero-initialized backward workspace (see
+    :func:`cake_rmsnorm_nondet_train_backward_workspace_bytes`; the deterministic
+    package's is
     :func:`flashinfer.cake_rmsnorm_det_train.cake_rmsnorm_det_train_backward_workspace`)."""
 
-    _check_flag(deterministic, "cake_rmsnorm_train_backward_workspace")
-    nbytes = cake_rmsnorm_train_backward_workspace_bytes(
-        rows, hidden, device, residual=residual, deterministic=False
+    nbytes = cake_rmsnorm_nondet_train_backward_workspace_bytes(
+        rows, hidden, device, residual=residual
     )
     return torch.zeros(nbytes, dtype=torch.uint8, device=torch.device(device))
 
@@ -647,7 +610,7 @@ def _workspace_views(
         raise ValueError(
             f"workspace holds {workspace.numel()} bytes; this call needs "
             f"{layout['total_bytes']} "
-            "(cake_rmsnorm_train_backward_workspace_bytes(..., deterministic=False))"
+            "(cake_rmsnorm_nondet_train_backward_workspace_bytes(...))"
         )
     begin = layout["partial_offset"]
     hidden = int(record["hidden"])
@@ -723,7 +686,7 @@ def _forward(
     rstd: Optional[torch.Tensor],
     residual_out: Optional[torch.Tensor],
 ) -> tuple[torch.Tensor, ...]:
-    """The forward of this package's programs (no flag or determinism checks)."""
+    """The forward of this package's programs (no determinism check)."""
 
     x, lead = _row_view(x, "x")
     nd = lead if len(lead) > 1 else None
@@ -817,7 +780,7 @@ def _forward(
     return results
 
 
-def cake_rmsnorm_train_forward(
+def cake_rmsnorm_nondet_train_forward(
     x: torch.Tensor,
     w: torch.Tensor,
     eps: float,
@@ -826,13 +789,13 @@ def cake_rmsnorm_train_forward(
     out: Optional[torch.Tensor] = None,
     rstd: Optional[torch.Tensor] = None,
     residual_out: Optional[torch.Tensor] = None,
-    deterministic: bool = True,
 ) -> tuple[torch.Tensor, ...]:
     r"""Fused BF16 RMSNorm forward with FP32 statistics.
 
     This package's forward programs: the deterministic package's programs
     rendered here (the forward has no cross-row reduction, so its outputs are
-    deterministic either way).
+    bitwise reproducible).  ``torch.use_deterministic_algorithms`` does not
+    affect the forward.
 
     Parameters
     ----------
@@ -867,13 +830,6 @@ def cake_rmsnorm_train_forward(
         its leading shape (``[T]``) and (residual only) BF16 ``h_new`` of ``x``'s
         shape.  Contiguous aligned buffers are written directly; any other layout
         receives a copy after the launch.
-    deterministic : bool
-        Must be ``False``.  Any other value, the default ``True`` included,
-        raises ``ValueError`` naming
-        :func:`flashinfer.cake_rmsnorm_det_train.cake_rmsnorm_det_train_forward`,
-        the deterministic package's forward.
-        ``torch.use_deterministic_algorithms`` does not affect the forward: it
-        has no cross-row reduction, so its results are bitwise reproducible.
 
     Returns
     -------
@@ -882,7 +838,6 @@ def cake_rmsnorm_train_forward(
     needs; no other ``[T, H]`` temporary is produced.
     """
 
-    _check_flag(deterministic, "cake_rmsnorm_train_forward")
     return _forward(
         x, w, eps, residual=residual, out=out, rstd=rstd, residual_out=residual_out
     )
@@ -899,7 +854,7 @@ def _backward(
     dx: Optional[torch.Tensor],
     dw: Optional[torch.Tensor],
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """The backward of this package's kernels (no flag or determinism checks)."""
+    """The backward of this package's kernels (no determinism check)."""
 
     x, lead = _row_view(x, "x")
     nd = lead if len(lead) > 1 else None
@@ -1012,13 +967,12 @@ def _backward(
     return dx_result, dw_result
 
 
-def cake_rmsnorm_train_backward(
+def cake_rmsnorm_nondet_train_backward(
     g: torch.Tensor,
     x: torch.Tensor,
     w: torch.Tensor,
     rstd: torch.Tensor,
     *,
-    deterministic: bool = True,
     g_residual: Optional[torch.Tensor] = None,
     workspace: Optional[torch.Tensor] = None,
     dx: Optional[torch.Tensor] = None,
@@ -1035,6 +989,15 @@ def cake_rmsnorm_train_backward(
     depends on scheduling, so ``dw`` is not guaranteed bitwise reproducible);
     in the others, the deterministic package's backward pair rendered into
     this package.
+
+    While ``torch.use_deterministic_algorithms(True)`` is in effect every call
+    raises ``RuntimeError`` naming
+    :func:`flashinfer.cake_rmsnorm_det_train.cake_rmsnorm_det_train_backward`,
+    the deterministic package's backward (``dw`` through a fixed row-chunk
+    partition and a fixed-order reduction, bitwise reproducible for a given
+    token count on devices with the same SM count), whatever window form it
+    would run; with ``warn_only=True`` it warns once and runs this package's
+    backward (never the deterministic package's).
 
     Parameters
     ----------
@@ -1055,27 +1018,16 @@ def cake_rmsnorm_train_backward(
     rstd : torch.Tensor
         FP32 ``[T]`` reciprocal RMS returned by the forward (of the leading
         shape ``[...]`` for an N-D call, or flat ``[prod(...)]``).
-    deterministic : bool
-        Must be ``False``.  Any other value, the default ``True`` included,
-        raises ``ValueError`` naming
-        :func:`flashinfer.cake_rmsnorm_det_train.cake_rmsnorm_det_train_backward`,
-        the deterministic package's backward (``dw`` through a fixed row-chunk
-        partition and a fixed-order reduction, bitwise reproducible for a given
-        token count on devices with the same SM count); this check comes first.
-        While ``torch.use_deterministic_algorithms(True)`` is in effect every
-        ``deterministic=False`` call then raises ``RuntimeError`` naming that
-        entry point (whatever window form it would run); with
-        ``warn_only=True`` it warns once and runs this package's backward.
     g_residual : torch.Tensor, optional
         BF16 gradient of ``g``'s shape flowing directly through ``h_new``
         (residual forward), any layout.  It is added once so that the returned
         ``dx`` is the gradient of both residual-add inputs.
     workspace : torch.Tensor, optional
         Caller-owned ``uint8`` buffer from
-        :func:`cake_rmsnorm_train_backward_workspace`, at least as large as that
+        :func:`cake_rmsnorm_nondet_train_backward_workspace`, at least as large as that
         helper returns for this call (one buffer serves calls of any hidden
         size, residual flag and weight dtype it is large enough for; see
-        :func:`cake_rmsnorm_train_backward_workspace_bytes`).  The call issues
+        :func:`cake_rmsnorm_nondet_train_backward_workspace_bytes`).  The call issues
         no memset, copy or synchronization on it.  When omitted, the call
         allocates and zero-fills one: a caching-allocator call, one fill kernel
         (about 3 us on B200) and about 35 us of host time per call.  One buffer
@@ -1091,9 +1043,9 @@ def cake_rmsnorm_train_backward(
     ``T == 0`` launches nothing and returns an empty ``dx`` and a zero ``dw``.
     """
 
-    api = "cake_rmsnorm_train_backward"
-    _check_flag(deterministic, api)
-    _check_deterministic_algorithms(api)
+    _check_deterministic_algorithms(
+        "cake_rmsnorm_nondet_train_backward", "cake_rmsnorm_det_train_backward"
+    )
     return _backward(
         g,
         x,
@@ -1106,18 +1058,16 @@ def cake_rmsnorm_train_backward(
     )
 
 
-class CakeRMSNormFunction(torch.autograd.Function):
+class CakeRMSNormNondetFunction(torch.autograd.Function):
     """Autograd wrapper saving only ``(x_or_h_new, w, rstd)`` for the backward.
 
-    ``forward(x, w, eps, residual=None, deterministic=True)`` returns ``y`` or
-    ``(y, h_new)`` and runs this package's kernels in both directions.  Pass
-    ``deterministic`` positionally as ``False``
-    (``CakeRMSNormFunction.apply(x, w, eps, residual, False)``); any other
-    value, the default included, raises ``ValueError`` naming
-    :class:`flashinfer.cake_rmsnorm_det_train.CakeRMSNormDetFunction`.  The
+    ``forward(x, w, eps, residual=None)`` returns ``y`` or ``(y, h_new)`` and
+    runs this package's kernels in both directions (the deterministic
+    package's is
+    :class:`flashinfer.cake_rmsnorm_det_train.CakeRMSNormDetFunction`).  The
     forward does not consult ``torch.use_deterministic_algorithms``; the
-    backward does when it runs, as :func:`cake_rmsnorm_train_backward` does
-    (``RuntimeError`` naming
+    backward does when it runs, as :func:`cake_rmsnorm_nondet_train_backward`
+    does (``RuntimeError`` naming
     :func:`flashinfer.cake_rmsnorm_det_train.cake_rmsnorm_det`; with
     ``warn_only=True`` one warning, then this package's backward).  In residual
     mode the gradient of ``x`` and of ``residual`` is the same tensor
@@ -1126,8 +1076,7 @@ class CakeRMSNormFunction(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x, w, eps, residual=None, deterministic=True):
-        _check_flag(deterministic, "CakeRMSNormFunction")
+    def forward(ctx, x, w, eps, residual=None):
         outputs = _forward(
             x, w, eps, residual=residual, out=None, rstd=None, residual_out=None
         )
@@ -1141,8 +1090,8 @@ class CakeRMSNormFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_y, *grad_rest):
-        # both autograd entry points (``cake_rmsnorm`` applies this Function)
-        _check_deterministic_algorithms("cake_rmsnorm")
+        # both autograd entry points (``cake_rmsnorm_nondet`` applies this Function)
+        _check_deterministic_algorithms("cake_rmsnorm_nondet", "cake_rmsnorm_det")
         normalized, w, rstd = ctx.saved_tensors
         grad_h = None
         if ctx.has_residual and grad_rest and grad_rest[0] is not None:
@@ -1160,15 +1109,14 @@ class CakeRMSNormFunction(torch.autograd.Function):
             dw=None,
         )
         dw = dw if w.dtype == torch.float32 else dw.to(w.dtype)
-        return dx, dw, None, (dx if ctx.has_residual else None), None
+        return dx, dw, None, (dx if ctx.has_residual else None)
 
 
-def cake_rmsnorm(
+def cake_rmsnorm_nondet(
     x: torch.Tensor,
     w: torch.Tensor,
     eps: float = 1e-6,
     residual: Optional[torch.Tensor] = None,
-    deterministic: bool = True,
 ):
     """Autograd-enabled fused BF16 RMSNorm (optionally with a fused residual add).
 
@@ -1176,7 +1124,7 @@ def cake_rmsnorm(
     ----------
     x : torch.Tensor
         BF16 ``[T, H]`` input on a supported CUDA device, or ``[..., H]`` under
-        the layout rule of :func:`cake_rmsnorm_train_forward`.
+        the layout rule of :func:`cake_rmsnorm_nondet_train_forward`.
     w : torch.Tensor
         BF16 ``[H]`` RMSNorm weight (FP32 on the routes that ship the
         FP32-weight programs); the weight gradient is returned in ``w.dtype``.
@@ -1185,28 +1133,27 @@ def cake_rmsnorm(
     residual : torch.Tensor, optional
         BF16 update of ``x``'s shape added to ``x`` before normalization.  When
         provided, the normalized input ``h_new`` is returned with the output.
-    deterministic : bool
-        Must be ``False``: this package's kernels, whose weight gradient is not
-        guaranteed bitwise reproducible (some token-count windows sum it over
-        the CTAs in a scheduling-dependent order).  Any other value, the
-        default ``True`` included, raises ``ValueError`` naming
-        :func:`flashinfer.cake_rmsnorm_det_train.cake_rmsnorm_det`, the
-        deterministic package's autograd entry point.  The forward does not
-        consult ``torch.use_deterministic_algorithms``; while it is ``True``
-        the backward raises ``RuntimeError`` naming that entry point when it
-        runs, or, with ``warn_only=True``, warns once and runs this package's
-        backward.
 
     Returns
     -------
     torch.Tensor or tuple[torch.Tensor, torch.Tensor]
         BF16 ``y`` of ``x``'s shape, or ``(y, h_new)`` when ``residual`` is
         given.  Backward launches the kernels of
-        :func:`cake_rmsnorm_train_backward`.
+        :func:`cake_rmsnorm_nondet_train_backward`.
+
+    Notes
+    -----
+    This package's kernels, whose weight gradient is not guaranteed bitwise
+    reproducible (some token-count windows sum it over the CTAs in a
+    scheduling-dependent order); the deterministic package's autograd entry
+    point is :func:`flashinfer.cake_rmsnorm_det_train.cake_rmsnorm_det`.  The
+    forward does not consult ``torch.use_deterministic_algorithms``; while it
+    is ``True`` the backward raises ``RuntimeError`` naming that entry point
+    when it runs, or, with ``warn_only=True``, warns once and runs this
+    package's backward.
     """
 
-    _check_flag(deterministic, "cake_rmsnorm")
-    return CakeRMSNormFunction.apply(x, w, eps, residual, deterministic)
+    return CakeRMSNormNondetFunction.apply(x, w, eps, residual)
 
 
 def _with_program_selection(doc: Optional[str], kind: str) -> str:
@@ -1222,23 +1169,23 @@ def _with_program_selection(doc: Optional[str], kind: str) -> str:
     return f"{(doc or '').rstrip()}\n\n    Notes\n    -----\n{section}\n    "
 
 
-cake_rmsnorm_train_forward.__doc__ = _with_program_selection(
-    cake_rmsnorm_train_forward.__doc__, "fwd"
+cake_rmsnorm_nondet_train_forward.__doc__ = _with_program_selection(
+    cake_rmsnorm_nondet_train_forward.__doc__, "fwd"
 )
-cake_rmsnorm_train_backward.__doc__ = _with_program_selection(
-    cake_rmsnorm_train_backward.__doc__, "bwd"
+cake_rmsnorm_nondet_train_backward.__doc__ = _with_program_selection(
+    cake_rmsnorm_nondet_train_backward.__doc__, "bwd"
 )
 
 
 __all__ = [
     "ARCHES",
     "SUPPORTED_COMPUTE_CAPABILITIES",
-    "CakeRMSNormFunction",
-    "cake_rmsnorm",
-    "cake_rmsnorm_train_backward",
-    "cake_rmsnorm_train_backward_workspace",
-    "cake_rmsnorm_train_backward_workspace_bytes",
-    "cake_rmsnorm_train_forward",
-    "is_cake_rmsnorm_train_supported",
-    "route_key",
+    "CakeRMSNormNondetFunction",
+    "cake_rmsnorm_nondet",
+    "cake_rmsnorm_nondet_train_backward",
+    "cake_rmsnorm_nondet_train_backward_workspace",
+    "cake_rmsnorm_nondet_train_backward_workspace_bytes",
+    "cake_rmsnorm_nondet_train_forward",
+    "cake_rmsnorm_nondet_train_route_key",
+    "is_cake_rmsnorm_nondet_train_supported",
 ]

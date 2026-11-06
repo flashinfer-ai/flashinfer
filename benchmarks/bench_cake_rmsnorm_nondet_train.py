@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Benchmark of the Cake BF16 RMSNorm training kernels with the non-deterministic
-weight gradient (``flashinfer.cake_rmsnorm_train``, every call with
-``deterministic=False``) against the deterministic package
-(``flashinfer.cake_rmsnorm_det_train``: its main kernel and its fixed-order
-``dw`` reduction) wherever the deterministic package serves the shape.
+weight gradient (``flashinfer.cake_rmsnorm_nondet_train``) against the
+deterministic package (``flashinfer.cake_rmsnorm_det_train``: its main kernel
+and its fixed-order ``dw`` reduction) wherever the deterministic package serves
+the shape.
 
 For every shape (hidden size, token count, residual flag, weight dtype) and
 mode the benchmark records:
@@ -47,9 +47,9 @@ markdown table.
 
 Example::
 
-    python benchmarks/bench_cake_rmsnorm_train.py --hidden 6144 --rows 256 4096 65536 \\
+    python benchmarks/bench_cake_rmsnorm_nondet_train.py --hidden 6144 --rows 256 4096 65536 \\
         --residual --w-dtype bf16 f32 --jsonl s1.jsonl --session s1
-    python benchmarks/bench_cake_rmsnorm_train.py --report s1.jsonl s2.jsonl --markdown table.md
+    python benchmarks/bench_cake_rmsnorm_nondet_train.py --report s1.jsonl s2.jsonl --markdown table.md
 """
 
 from __future__ import annotations
@@ -58,7 +58,6 @@ import argparse
 import bisect
 import collections
 import datetime
-import functools
 import json
 import os
 import statistics
@@ -75,15 +74,15 @@ from flashinfer.cake_rmsnorm_det_train import (
     cake_rmsnorm_det_train_backward_workspace_bytes,
     cake_rmsnorm_det_train_forward,
 )
-from flashinfer.cake_rmsnorm_train import (
-    cake_rmsnorm,
-    cake_rmsnorm_train_backward,
-    cake_rmsnorm_train_backward_workspace,
-    cake_rmsnorm_train_backward_workspace_bytes,
-    cake_rmsnorm_train_forward,
-    is_cake_rmsnorm_train_supported,
+from flashinfer.cake_rmsnorm_nondet_train import (
+    cake_rmsnorm_nondet,
+    cake_rmsnorm_nondet_train_backward,
+    cake_rmsnorm_nondet_train_backward_workspace,
+    cake_rmsnorm_nondet_train_backward_workspace_bytes,
+    cake_rmsnorm_nondet_train_forward,
+    is_cake_rmsnorm_nondet_train_supported,
 )
-from flashinfer.cake_rmsnorm_train_backend import cake_jit
+from flashinfer.experimental.cake.cake_rmsnorm_nondet_train import cake_jit
 
 SCHEMA = "cake_rmsnorm_train_bench/1"
 WIDTHS = (
@@ -98,8 +97,8 @@ WIDTHS = (
 EPS = {hidden: eps for hidden, eps in WIDTHS}
 ROWS = (256, 1024, 4096, 16384, 32768, 65536)
 # mode -> the entry points it measures: (forward, backward, workspace,
-# workspace bytes, autograd) of the deterministic package (no flag) and of this
-# package (each requires ``deterministic=False``).
+# workspace bytes, autograd) of the deterministic package and of this package
+# (the mode is part of the name; no entry point takes a ``deterministic`` flag).
 MODES = {
     "det": (
         cake_rmsnorm_det_train_forward,
@@ -108,15 +107,12 @@ MODES = {
         cake_rmsnorm_det_train_backward_workspace_bytes,
         cake_rmsnorm_det,
     ),
-    "nondet": tuple(
-        functools.partial(entry, deterministic=False)
-        for entry in (
-            cake_rmsnorm_train_forward,
-            cake_rmsnorm_train_backward,
-            cake_rmsnorm_train_backward_workspace,
-            cake_rmsnorm_train_backward_workspace_bytes,
-            cake_rmsnorm,
-        )
+    "nondet": (
+        cake_rmsnorm_nondet_train_forward,
+        cake_rmsnorm_nondet_train_backward,
+        cake_rmsnorm_nondet_train_backward_workspace,
+        cake_rmsnorm_nondet_train_backward_workspace_bytes,
+        cake_rmsnorm_nondet,
     ),
 }
 W_DTYPES = {"bf16": torch.bfloat16, "f32": torch.float32}
@@ -645,8 +641,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0
 
     device = torch.device("cuda", torch.cuda.current_device())
-    if not is_cake_rmsnorm_train_supported(device, deterministic=False):
-        raise SystemExit("cake_rmsnorm_train has no exported route on this device")
+    if not is_cake_rmsnorm_nondet_train_supported(device):
+        raise SystemExit(
+            "cake_rmsnorm_nondet_train has no exported route on this device"
+        )
     meta = _meta(device, args.session)
     plans = [
         (hidden, rows, False, w_token)
@@ -661,7 +659,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "host bwd us | workspace KiB | kernels of one bwd"
     )
     for hidden, rows, residual, w_token in plans:
-        if not is_cake_rmsnorm_train_supported(device, hidden, deterministic=False):
+        if not is_cake_rmsnorm_nondet_train_supported(device, hidden):
             print(f"H={hidden}: no exported non-deterministic route, skipped")
             continue
         form = _form(device, hidden, rows, residual, w_token)

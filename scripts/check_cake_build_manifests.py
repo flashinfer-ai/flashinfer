@@ -11,7 +11,7 @@ through FlashInfer.  The package registries (``cake_jit.py`` / ``jit.py`` /
 
 The manifest's ``package`` field is the dotted import path of the package
 directory (``flashinfer.experimental.cake_mok_bf16``,
-``flashinfer.cake_rmsnorm_det_train_backend``): the one spelling every exporter
+``flashinfer.experimental.cake.cake_rmsnorm_det_train``): the one spelling every exporter
 writes and this checker compares (``Package.name``); a directory path is not
 accepted.  ``name`` is the unique key of ``libraries``; ``closure_sha256`` is
 not unique (two entries of one program and architecture, for example two tile
@@ -371,14 +371,14 @@ class Package:
 # nvfp4_attention, cake_nvfp4_ptilemax_attention, vsa_sm90, Kimi-K3 AttnRes, deepgemm_fp8_gemm, deepgemm_batched_gemm and deepgemm_mega_gate MODULES) or per-stage sub-records carrying ``library`` (dsa_train).
 PACKAGES: tuple[Package, ...] = (
     Package(
-        "flashinfer.cake_rmsnorm_det_train_backend",
-        "flashinfer/cake_rmsnorm_det_train_backend",
+        "flashinfer.experimental.cake.cake_rmsnorm_det_train",
+        "flashinfer/experimental/cake/cake_rmsnorm_det_train",
         "cake_jit.py",
         refs_generic,
     ),
     Package(
-        "flashinfer.cake_rmsnorm_train_backend",
-        "flashinfer/cake_rmsnorm_train_backend",
+        "flashinfer.experimental.cake.cake_rmsnorm_nondet_train",
+        "flashinfer/experimental/cake/cake_rmsnorm_nondet_train",
         "cake_jit.py",
         refs_generic,
     ),

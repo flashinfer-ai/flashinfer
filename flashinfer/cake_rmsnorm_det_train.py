@@ -17,20 +17,25 @@ Cake fused BF16 RMSNorm training forward / backward (SM100 / SM103 / SM107).
 
 Mode and dispatch rules:
 
-* This is the deterministic package: its weight gradient ``dw`` is bitwise
-  reproducible and every forward, backward, workspace, support-query and
-  autograd entry point name carries ``det``.  No entry point takes a
+* The mode is part of the name, and only of the name.  This is the
+  deterministic package: its weight gradient ``dw`` is bitwise reproducible
+  and every public name carries ``det`` (the constants ``ARCHES`` and
+  ``SUPPORTED_COMPUTE_CAPABILITIES`` excepted).  No entry point takes a
   ``deterministic`` keyword; passing one raises Python's ``TypeError`` for an
   unexpected keyword argument.
-* The non-deterministic package is :mod:`flashinfer.cake_rmsnorm_train`
-  (names without ``det``).  Its entry points require ``deterministic=False``
-  and raise ``ValueError`` naming the matching entry point here otherwise.
-  Neither package runs the other.
+* The non-deterministic package is :mod:`flashinfer.cake_rmsnorm_nondet_train`
+  (names with ``nondet``; its entry points take no ``deterministic`` keyword
+  either).  Neither package runs the other.
 * ``torch.use_deterministic_algorithms`` changes nothing here (every launch
   is fixed-order).  The non-deterministic package's backward alerts
   under it (``RuntimeError``; ``warn_only=True``: one ``UserWarning``, then its
   own backward); its forward and helpers never alert.
-* There are no aliases: a name without ``det`` never runs this package.
+* There are no aliases: a name without ``det`` never runs this package, and
+  the former helper names ``route_key``, ``program_windows`` and
+  ``weight_dtypes`` do not exist (use
+  :func:`cake_rmsnorm_det_train_route_key`,
+  :func:`cake_rmsnorm_det_train_program_windows` and
+  :func:`cake_rmsnorm_det_train_weight_dtypes`).
 
 Forward: ``r_t = (mean_j x_tj^2 + eps)^(-1/2)`` in FP32, ``y = BF16((x * r) * w)``.
 The only tensor saved for the backward besides the inputs is the FP32 per-row
@@ -49,7 +54,8 @@ All kernels use FP32 statistics and accumulation with IEEE division and
 square root (no fast-math).  Inputs and outputs are BF16; ``rstd`` and ``dw``
 are FP32.  ``w`` is BF16, or FP32 on the routes that ship the FP32-weight
 programs (the effective weight ``1 + w`` of a zero-centred model, computed by
-the caller in FP32; :func:`weight_dtypes` lists them per route).  Row-strided inputs (``x``, ``residual``, ``g``, ``g_residual``)
+the caller in FP32; :func:`cake_rmsnorm_det_train_weight_dtypes` lists them
+per route).  Row-strided inputs (``x``, ``residual``, ``g``, ``g_residual``)
 are accepted when ``stride(1) == 1``, ``stride(0)`` is a multiple of eight
 elements and the storage is aligned (32 bytes for the forward inputs, 16 for
 the backward); outputs are contiguous.  An input of more dimensions,
@@ -61,7 +67,8 @@ token count ``T`` is a runtime scalar: it may change between calls, ``T == 1``
 is supported and ``T == 0`` returns empty outputs without launching.  Each
 route selects one of several programs from ``T``; within one program window
 a row's results do not depend on ``T`` (see "Program selection by token
-count" in the forward / backward docstrings and :func:`program_windows`).
+count" in the forward / backward docstrings and
+:func:`cake_rmsnorm_det_train_program_windows`).
 
 Beside kernels resident on other streams: a call's kernels (the forward
 kernel; the backward main kernel, then its dw reduce kernel) start on an SM
@@ -124,18 +131,18 @@ from typing import Optional
 
 import torch
 
-from . import cake_rmsnorm_det_train_backend as _backend
 from .api_logging import flashinfer_api
-from .cake_rmsnorm_det_train_backend import (  # noqa: F401
+from .experimental.cake import cake_rmsnorm_det_train as _backend
+from .experimental.cake.cake_rmsnorm_det_train import (  # noqa: F401
     ARCHES,
     SUPPORTED_COMPUTE_CAPABILITIES,
     CakeRMSNormDetFunction,
     cake_rmsnorm_det_train_backward_workspace,
     cake_rmsnorm_det_train_backward_workspace_bytes,
+    cake_rmsnorm_det_train_program_windows,
+    cake_rmsnorm_det_train_route_key,
+    cake_rmsnorm_det_train_weight_dtypes,
     is_cake_rmsnorm_det_train_supported,
-    program_windows,
-    route_key,
-    weight_dtypes,
 )
 
 # The three stable entry points are real ``def``s here (public-API tooling reads the
@@ -154,7 +161,7 @@ def cake_rmsnorm_det_train_forward(
     rstd: Optional[torch.Tensor] = None,
     residual_out: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, ...]:
-    """See :func:`flashinfer.cake_rmsnorm_det_train_backend.cake_rmsnorm_det_train_forward`."""
+    """See :func:`flashinfer.experimental.cake.cake_rmsnorm_det_train.cake_rmsnorm_det_train_forward`."""
 
     return _backend.cake_rmsnorm_det_train_forward(
         x, w, eps, residual=residual, out=out, rstd=rstd, residual_out=residual_out
@@ -173,7 +180,7 @@ def cake_rmsnorm_det_train_backward(
     dx: Optional[torch.Tensor] = None,
     dw: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """See :func:`flashinfer.cake_rmsnorm_det_train_backend.cake_rmsnorm_det_train_backward`."""
+    """See :func:`flashinfer.experimental.cake.cake_rmsnorm_det_train.cake_rmsnorm_det_train_backward`."""
 
     return _backend.cake_rmsnorm_det_train_backward(
         g,
@@ -194,7 +201,7 @@ def cake_rmsnorm_det(
     eps: float = 1e-6,
     residual: Optional[torch.Tensor] = None,
 ):
-    """See :func:`flashinfer.cake_rmsnorm_det_train_backend.cake_rmsnorm_det`."""
+    """See :func:`flashinfer.experimental.cake.cake_rmsnorm_det_train.cake_rmsnorm_det`."""
 
     return _backend.cake_rmsnorm_det(x, w, eps, residual=residual)
 
@@ -216,8 +223,8 @@ __all__ = [
     "cake_rmsnorm_det_train_backward_workspace",
     "cake_rmsnorm_det_train_backward_workspace_bytes",
     "cake_rmsnorm_det_train_forward",
+    "cake_rmsnorm_det_train_program_windows",
+    "cake_rmsnorm_det_train_route_key",
+    "cake_rmsnorm_det_train_weight_dtypes",
     "is_cake_rmsnorm_det_train_supported",
-    "program_windows",
-    "route_key",
-    "weight_dtypes",
 ]

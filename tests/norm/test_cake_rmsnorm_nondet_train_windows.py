@@ -14,7 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Token-count invariance of the Cake BF16 RMSNorm training kernels with the
-non-deterministic weight gradient (``deterministic=False``; issue #7045 items 6-7).
+non-deterministic weight gradient (``flashinfer.cake_rmsnorm_nondet_train``;
+issue #7045 items 6-7).
 
 Within one program window a row's outputs do not depend on the token count:
 for every window of every route of the device -- each width, the residual route,
@@ -42,7 +43,6 @@ edge it lists as ``unmeasured`` is printed with its measured class
 from __future__ import annotations
 
 import ast
-import functools
 from pathlib import Path
 from typing import Optional
 
@@ -52,11 +52,11 @@ import torch
 from tests.test_helpers import cake_rmsnorm_train_reference as ref
 from tests.test_helpers.cake_package import cake_package
 
-pkg = cake_package("cake_rmsnorm_train")
-loader = cake_package("cake_rmsnorm_train", "cake_jit")
-windows_table = cake_package("cake_rmsnorm_train", "cake_windows")
-forward = functools.partial(pkg.cake_rmsnorm_train_forward, deterministic=False)
-backward = functools.partial(pkg.cake_rmsnorm_train_backward, deterministic=False)
+pkg = cake_package("cake_rmsnorm_nondet_train")
+loader = cake_package("cake_rmsnorm_nondet_train", "cake_jit")
+windows_table = cake_package("cake_rmsnorm_nondet_train", "cake_windows")
+forward = pkg.cake_rmsnorm_nondet_train_forward
+backward = pkg.cake_rmsnorm_nondet_train_backward
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 HIDDEN_SIZES = (256, 512, 1536, 2048, 4096, 5120, 6144)
@@ -80,7 +80,7 @@ det = _det_package()
 def _dx_bitwise_with() -> dict[str, str]:
     """The backend suite's ``DX_BITWISE_WITH`` table (single-kernel library ->
     the det module whose ``dx`` bits it claims), read from its source."""
-    source = Path(__file__).with_name("test_cake_rmsnorm_train.py")
+    source = Path(__file__).with_name("test_cake_rmsnorm_nondet_train.py")
     if not source.exists():
         return {}
     for node in ast.parse(source.read_text()).body:
@@ -109,7 +109,7 @@ def _supported() -> bool:
     return (
         torch.cuda.is_available()
         and _capability() in SUPPORTED_CAPABILITIES
-        and pkg.is_cake_rmsnorm_train_supported(_device(), deterministic=False)
+        and pkg.is_cake_rmsnorm_nondet_train_supported(_device())
     )
 
 
@@ -119,7 +119,7 @@ def _arch() -> str:
 
 pytestmark = pytest.mark.skipif(
     not _supported(),
-    reason="cake_rmsnorm_train(deterministic=False) needs an SM100 / SM103 / SM107 device with exported routes",
+    reason="cake_rmsnorm_nondet_train needs an SM100 / SM103 / SM107 device with exported routes",
 )
 
 

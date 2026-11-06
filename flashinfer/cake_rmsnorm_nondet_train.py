@@ -18,34 +18,33 @@ with the non-deterministic weight gradient.
 
 Mode and dispatch rules:
 
-* This is the non-deterministic package (names without ``det``); it runs its
-  own kernels only and never the deterministic package
+* The mode is part of the name, and only of the name.  This is the
+  non-deterministic package: every public name carries ``nondet`` (the
+  constants ``ARCHES`` and ``SUPPORTED_COMPUTE_CAPABILITIES`` excepted).  It
+  runs its own kernels only and never the deterministic package
   :mod:`flashinfer.cake_rmsnorm_det_train`, whose weight gradient ``dw`` is
-  bitwise reproducible, whose names carry ``det`` and whose entry points take
-  no ``deterministic`` keyword.
-* Every entry point here requires ``deterministic=False``.  Any other value --
-  the default ``True``, ``None``, ``0``, ``1``, ``"False"``, a NumPy bool --
-  raises ``ValueError`` naming the matching entry point of the deterministic
-  package and saying "pass deterministic=False for the non-deterministic
-  path".  A ``False`` default would silently switch callers of the former
-  deterministic default to the non-deterministic kernels; the explicit
-  ``False`` keeps the mode visible at every call.
+  bitwise reproducible and whose names carry ``det``.  No entry point of
+  either package takes a ``deterministic`` keyword: passing one raises
+  Python's ``TypeError`` for an unexpected keyword argument.
 * ``torch.use_deterministic_algorithms(True)`` alerts only before work whose
   result can vary from run to run (PyTorch's rule).
-  :func:`cake_rmsnorm_train_backward` always alerts (whatever window form the
-  call runs): ``RuntimeError`` naming
+  :func:`cake_rmsnorm_nondet_train_backward` always alerts (whatever window
+  form the call runs): ``RuntimeError`` naming
   ``flashinfer.cake_rmsnorm_det_train.cake_rmsnorm_det_train_backward``; with
   ``warn_only=True`` one ``UserWarning`` naming it, then this package's
   backward runs (no fallback to the deterministic package).
-  :func:`cake_rmsnorm_train_forward` never alerts (no cross-row reduction; its
-  results are bitwise reproducible).  The autograd :func:`cake_rmsnorm` /
-  :class:`CakeRMSNormFunction`: the forward never alerts; the backward alerts
-  when it runs, by the same rule, naming
-  ``flashinfer.cake_rmsnorm_det_train.cake_rmsnorm_det``.  The workspace
-  helpers and :func:`is_cake_rmsnorm_train_supported` never consult the
-  setting.
+  :func:`cake_rmsnorm_nondet_train_forward` never alerts (no cross-row
+  reduction; its results are bitwise reproducible).  The autograd
+  :func:`cake_rmsnorm_nondet` / :class:`CakeRMSNormNondetFunction`: the
+  forward never alerts; the backward alerts when it runs, by the same rule,
+  naming ``flashinfer.cake_rmsnorm_det_train.cake_rmsnorm_det``.  The
+  workspace helpers, :func:`cake_rmsnorm_nondet_train_route_key` and
+  :func:`is_cake_rmsnorm_nondet_train_supported` never consult the setting.
+* The ``flashinfer`` top level binds none of this package's names; reach it
+  as the module ``flashinfer.cake_rmsnorm_nondet_train``.
 * There are no aliases: no name here resolves to an object of the
-  deterministic package.
+  deterministic package, and the names of the former ``cake_rmsnorm_train``
+  module do not exist.
 * A backward does not check which package produced its inputs: both packages
   run the same forward programs and save the same ``rstd``, and a workspace is
   an untagged raw buffer (size it with the helper of the package that uses it).
@@ -92,8 +91,8 @@ the backward); outputs are contiguous.  The token count ``T`` is a runtime
 scalar: it may change between calls, ``T == 1`` is supported and ``T == 0``
 returns empty outputs (a zero ``dw``) without launching.
 
-The backward's workspace (``cake_rmsnorm_train_backward_workspace_bytes(T, H,
-device, deterministic=False)`` bytes) has one layout, with offsets fixed by the
+The backward's workspace (``cake_rmsnorm_nondet_train_backward_workspace_bytes(T,
+H, device)`` bytes) has one layout, with offsets fixed by the
 package, for every call: the deterministic pair's counters, the single kernel's
 counters and FP64 column sums (``cake_jit.SUMS_BYTES``, the largest of the
 package's single kernels) and, when a window up to ``T`` runs the deterministic
@@ -139,19 +138,23 @@ deterministic package's; see :mod:`flashinfer.cake_rmsnorm_det_train`.
 
 Usage::
 
-    y, rstd = cake_rmsnorm_train_forward(x, w, eps, deterministic=False)
-    # dw is FP32 [H]
-    dx, dw = cake_rmsnorm_train_backward(g, x, w, rstd, deterministic=False)
+    from flashinfer.cake_rmsnorm_nondet_train import (
+        cake_rmsnorm_nondet,
+        cake_rmsnorm_nondet_train_backward,
+        cake_rmsnorm_nondet_train_backward_workspace,
+        cake_rmsnorm_nondet_train_forward,
+    )
+
+    y, rstd = cake_rmsnorm_nondet_train_forward(x, w, eps)
+    dx, dw = cake_rmsnorm_nondet_train_backward(g, x, w, rstd)  # dw is FP32 [H]
 
     # autograd (dw is returned in w.dtype; the kernels accumulate in FP32)
-    y = cake_rmsnorm(x, w, eps, deterministic=False)
-    y, h_new = cake_rmsnorm(h, w, eps, residual=u, deterministic=False)  # fused add
+    y = cake_rmsnorm_nondet(x, w, eps)
+    y, h_new = cake_rmsnorm_nondet(h, w, eps, residual=u)  # fused add
 
     # caller-owned workspace (counters, FP64 column sums, partial rows)
-    ws = cake_rmsnorm_train_backward_workspace(T, H, x.device, deterministic=False)
-    dx, dw = cake_rmsnorm_train_backward(
-        g, x, w, rstd, deterministic=False, workspace=ws
-    )
+    ws = cake_rmsnorm_nondet_train_backward_workspace(T, H, x.device)
+    dx, dw = cake_rmsnorm_nondet_train_backward(g, x, w, rstd, workspace=ws)
 
     # the bitwise-reproducible weight gradient: the deterministic package
     from flashinfer.cake_rmsnorm_det_train import cake_rmsnorm_det
@@ -164,16 +167,16 @@ from typing import Optional
 
 import torch
 
-from . import cake_rmsnorm_train_backend as _backend
 from .api_logging import flashinfer_api
-from .cake_rmsnorm_train_backend import (  # noqa: F401
+from .experimental.cake import cake_rmsnorm_nondet_train as _backend
+from .experimental.cake.cake_rmsnorm_nondet_train import (  # noqa: F401
     ARCHES,
     SUPPORTED_COMPUTE_CAPABILITIES,
-    CakeRMSNormFunction,
-    cake_rmsnorm_train_backward_workspace,
-    cake_rmsnorm_train_backward_workspace_bytes,
-    is_cake_rmsnorm_train_supported,
-    route_key,
+    CakeRMSNormNondetFunction,
+    cake_rmsnorm_nondet_train_backward_workspace,
+    cake_rmsnorm_nondet_train_backward_workspace_bytes,
+    cake_rmsnorm_nondet_train_route_key,
+    is_cake_rmsnorm_nondet_train_supported,
 )
 
 # The three stable entry points are real ``def``s here (public-API tooling reads the
@@ -182,7 +185,7 @@ from .cake_rmsnorm_train_backend import (  # noqa: F401
 
 
 @flashinfer_api
-def cake_rmsnorm_train_forward(
+def cake_rmsnorm_nondet_train_forward(
     x: torch.Tensor,
     w: torch.Tensor,
     eps: float,
@@ -191,11 +194,10 @@ def cake_rmsnorm_train_forward(
     out: Optional[torch.Tensor] = None,
     rstd: Optional[torch.Tensor] = None,
     residual_out: Optional[torch.Tensor] = None,
-    deterministic: bool = True,
 ) -> tuple[torch.Tensor, ...]:
-    """See :func:`flashinfer.cake_rmsnorm_train_backend.cake_rmsnorm_train_forward`."""
+    """See :func:`flashinfer.experimental.cake.cake_rmsnorm_nondet_train.cake_rmsnorm_nondet_train_forward`."""
 
-    return _backend.cake_rmsnorm_train_forward(
+    return _backend.cake_rmsnorm_nondet_train_forward(
         x,
         w,
         eps,
@@ -203,31 +205,28 @@ def cake_rmsnorm_train_forward(
         out=out,
         rstd=rstd,
         residual_out=residual_out,
-        deterministic=deterministic,
     )
 
 
 @flashinfer_api
-def cake_rmsnorm_train_backward(
+def cake_rmsnorm_nondet_train_backward(
     g: torch.Tensor,
     x: torch.Tensor,
     w: torch.Tensor,
     rstd: torch.Tensor,
     *,
-    deterministic: bool = True,
     g_residual: Optional[torch.Tensor] = None,
     workspace: Optional[torch.Tensor] = None,
     dx: Optional[torch.Tensor] = None,
     dw: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """See :func:`flashinfer.cake_rmsnorm_train_backend.cake_rmsnorm_train_backward`."""
+    """See :func:`flashinfer.experimental.cake.cake_rmsnorm_nondet_train.cake_rmsnorm_nondet_train_backward`."""
 
-    return _backend.cake_rmsnorm_train_backward(
+    return _backend.cake_rmsnorm_nondet_train_backward(
         g,
         x,
         w,
         rstd,
-        deterministic=deterministic,
         g_residual=g_residual,
         workspace=workspace,
         dx=dx,
@@ -236,35 +235,36 @@ def cake_rmsnorm_train_backward(
 
 
 @flashinfer_api
-def cake_rmsnorm(
+def cake_rmsnorm_nondet(
     x: torch.Tensor,
     w: torch.Tensor,
     eps: float = 1e-6,
     residual: Optional[torch.Tensor] = None,
-    deterministic: bool = True,
 ):
-    """See :func:`flashinfer.cake_rmsnorm_train_backend.cake_rmsnorm`."""
+    """See :func:`flashinfer.experimental.cake.cake_rmsnorm_nondet_train.cake_rmsnorm_nondet`."""
 
-    return _backend.cake_rmsnorm(
-        x, w, eps, residual=residual, deterministic=deterministic
-    )
+    return _backend.cake_rmsnorm_nondet(x, w, eps, residual=residual)
 
 
 # Sphinx renders the backend docstrings; the one-line delegations satisfy the checker.
-cake_rmsnorm_train_forward.__doc__ = _backend.cake_rmsnorm_train_forward.__doc__
-cake_rmsnorm_train_backward.__doc__ = _backend.cake_rmsnorm_train_backward.__doc__
-cake_rmsnorm.__doc__ = _backend.cake_rmsnorm.__doc__
+cake_rmsnorm_nondet_train_forward.__doc__ = (
+    _backend.cake_rmsnorm_nondet_train_forward.__doc__
+)
+cake_rmsnorm_nondet_train_backward.__doc__ = (
+    _backend.cake_rmsnorm_nondet_train_backward.__doc__
+)
+cake_rmsnorm_nondet.__doc__ = _backend.cake_rmsnorm_nondet.__doc__
 
 
 __all__ = [
     "ARCHES",
     "SUPPORTED_COMPUTE_CAPABILITIES",
-    "CakeRMSNormFunction",
-    "cake_rmsnorm",
-    "cake_rmsnorm_train_backward",
-    "cake_rmsnorm_train_backward_workspace",
-    "cake_rmsnorm_train_backward_workspace_bytes",
-    "cake_rmsnorm_train_forward",
-    "is_cake_rmsnorm_train_supported",
-    "route_key",
+    "CakeRMSNormNondetFunction",
+    "cake_rmsnorm_nondet",
+    "cake_rmsnorm_nondet_train_backward",
+    "cake_rmsnorm_nondet_train_backward_workspace",
+    "cake_rmsnorm_nondet_train_backward_workspace_bytes",
+    "cake_rmsnorm_nondet_train_forward",
+    "cake_rmsnorm_nondet_train_route_key",
+    "is_cake_rmsnorm_nondet_train_supported",
 ]

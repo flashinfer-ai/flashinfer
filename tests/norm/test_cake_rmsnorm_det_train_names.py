@@ -13,25 +13,27 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Names and the ``deterministic`` flag of the two Cake fused BF16 RMSNorm training
-packages (no device).
+Names and modes of the two Cake fused BF16 RMSNorm training packages (no device).
 
-The deterministic package (the ``flashinfer.cake_rmsnorm_det_train`` facade and its
-backend package) defines only names with ``det``: no name from before the det
-rename resolves on it.  The non-deterministic package (the
-``flashinfer.cake_rmsnorm_train`` facade and its backend package) resolves no det
-name and never imports the deterministic package.  No det entry point takes
-``deterministic`` (passing it raises ``TypeError``).  Every non-det entry point
-requires ``deterministic=False``: any other value, the default ``True`` included,
-raises ``ValueError`` naming the det entry point of the same role and saying
-"pass deterministic=False for the non-deterministic path", before any warning;
-``False`` passes the check.  The deterministic package does
-not consult ``torch.use_deterministic_algorithms``.  The ``flashinfer`` top level
-binds only the det names, each to the det package's object, and no name of the
-non-deterministic package, which is reached only as the module
-``flashinfer.cake_rmsnorm_train`` (``from flashinfer import cake_rmsnorm`` fails
-at import).  The non-deterministic package is self-contained (its own registry,
-submodules, star import and ``dir``; checked in fresh interpreters too).
+The mode is part of the name, and only of the name (flashinfer issue #8928).
+The deterministic package (the ``flashinfer.cake_rmsnorm_det_train`` facade and
+its backend ``flashinfer.experimental.cake.cake_rmsnorm_det_train``) and the
+non-deterministic package (the ``flashinfer.cake_rmsnorm_nondet_train`` facade
+and its backend ``flashinfer.experimental.cake.cake_rmsnorm_nondet_train``)
+export only constants (``ARCHES``, ``SUPPORTED_COMPUTE_CAPABILITIES``) and
+names that carry their mode word (``det`` / ``nondet`` as a ``_``-separated
+token, ``Det`` / ``Nondet`` in a CamelCase name); no name of one package
+resolves on the other.  No entry point of either package takes
+``deterministic``: passing it raises ``TypeError``.  The names from before the
+rename fail at import: the former modules raise ``ModuleNotFoundError``, the
+former names raise ``ImportError`` (checked in fresh interpreters).  The
+``flashinfer`` top level binds the five det entry points and the module
+``cake_rmsnorm_nondet_train``, and no name of the non-deterministic package.
+Under ``torch.use_deterministic_algorithms(True)`` only the non-deterministic
+backward alerts (``RuntimeError`` naming the det entry point; with
+``warn_only=True`` one ``UserWarning``, then its own backward); its forward and
+helpers and the whole det package never do.  The non-deterministic package is
+self-contained (its own registry, submodules, star import and ``dir``).
 """
 
 from __future__ import annotations
@@ -46,44 +48,51 @@ import sys
 import warnings
 from pathlib import Path
 
-import numpy as np
 import pytest
 import torch
 
 import flashinfer
 import flashinfer.cake_rmsnorm_det_train as det_facade
-import flashinfer.cake_rmsnorm_det_train_backend as det_backend
-import flashinfer.cake_rmsnorm_train as facade
-import flashinfer.cake_rmsnorm_train_backend as backend
+import flashinfer.cake_rmsnorm_nondet_train as facade
+import flashinfer.experimental.cake.cake_rmsnorm_det_train as det_backend
+import flashinfer.experimental.cake.cake_rmsnorm_nondet_train as backend
 
 pytestmark = pytest.mark.cpu_only
 
-FACADE = "flashinfer.cake_rmsnorm_train"
+FACADE = "flashinfer.cake_rmsnorm_nondet_train"
 DET_FACADE = "flashinfer.cake_rmsnorm_det_train"
-PACKAGE = "flashinfer.cake_rmsnorm_train_backend"
-DET_PACKAGE = "flashinfer.cake_rmsnorm_det_train_backend"
+PACKAGE = "flashinfer.experimental.cake.cake_rmsnorm_nondet_train"
+DET_PACKAGE = "flashinfer.experimental.cake.cake_rmsnorm_det_train"
 SUBMODULES = ("cake_build", "cake_jit")
 
-# (non-det name, det name) of every entry point of the two packages.
+# (non-det name, det name) of the entry points and helpers of the same role.
 PAIRS = (
-    ("CakeRMSNormFunction", "CakeRMSNormDetFunction"),
-    ("cake_rmsnorm", "cake_rmsnorm_det"),
-    ("cake_rmsnorm_train_backward", "cake_rmsnorm_det_train_backward"),
+    ("CakeRMSNormNondetFunction", "CakeRMSNormDetFunction"),
+    ("cake_rmsnorm_nondet", "cake_rmsnorm_det"),
+    ("cake_rmsnorm_nondet_train_backward", "cake_rmsnorm_det_train_backward"),
     (
-        "cake_rmsnorm_train_backward_workspace",
+        "cake_rmsnorm_nondet_train_backward_workspace",
         "cake_rmsnorm_det_train_backward_workspace",
     ),
     (
-        "cake_rmsnorm_train_backward_workspace_bytes",
+        "cake_rmsnorm_nondet_train_backward_workspace_bytes",
         "cake_rmsnorm_det_train_backward_workspace_bytes",
     ),
-    ("cake_rmsnorm_train_forward", "cake_rmsnorm_det_train_forward"),
-    ("is_cake_rmsnorm_train_supported", "is_cake_rmsnorm_det_train_supported"),
+    ("cake_rmsnorm_nondet_train_forward", "cake_rmsnorm_det_train_forward"),
+    ("cake_rmsnorm_nondet_train_route_key", "cake_rmsnorm_det_train_route_key"),
+    ("is_cake_rmsnorm_nondet_train_supported", "is_cake_rmsnorm_det_train_supported"),
 )
+CONSTANTS = ("ARCHES", "SUPPORTED_COMPUTE_CAPABILITIES")
 NONDET_NAMES = tuple(nondet for nondet, _det in PAIRS)
-DET_NAMES = tuple(det for _nondet, det in PAIRS)
-DET_OF = dict(PAIRS)
-# The names the ``flashinfer`` top level exports: the det package's only.
+DET_NAMES = (
+    *(det for _nondet, det in PAIRS),
+    "cake_rmsnorm_det_train_program_windows",
+    "cake_rmsnorm_det_train_weight_dtypes",
+)
+# The ``__all__`` of the facade and of the backend package of each mode.
+NONDET_ALL = sorted([*CONSTANTS, *NONDET_NAMES])
+DET_ALL = sorted([*CONSTANTS, *DET_NAMES])
+# The names the ``flashinfer`` top level exports: five det entry points.
 TOP_LEVEL_DET = (
     "CakeRMSNormDetFunction",
     "cake_rmsnorm_det",
@@ -91,28 +100,42 @@ TOP_LEVEL_DET = (
     "cake_rmsnorm_det_train_backward_workspace_bytes",
     "cake_rmsnorm_det_train_forward",
 )
-DET_NAMESPACES = {"facade": det_facade, "backend": det_backend}
-NONDET_NAMESPACES = {"facade": facade, "backend": backend}
-# The ``__all__`` of the non-deterministic facade and backend package.
-NONDET_ALL = sorted(
-    ["ARCHES", "SUPPORTED_COMPUTE_CAPABILITIES", "route_key", *NONDET_NAMES]
-)
-PHRASE = "pass deterministic=False for the non-deterministic path"
-# ``deterministic`` omitted: the entry point's default.
-DEFAULT = object()
-# Every value of ``deterministic`` a non-det entry point refuses: anything but the
-# object ``False``.
-NOT_FALSE = {
-    "default": DEFAULT,
-    "True": True,
-    "None": None,
-    "0": 0,
-    "1": 1,
-    "str_False": "False",
-    "np_False": np.bool_(False),
-    "np_True": np.bool_(True),
-    "tensor_False": torch.tensor(False),
+NAMESPACES = {
+    "det_facade": (det_facade, "det"),
+    "det_backend": (det_backend, "det"),
+    "nondet_facade": (facade, "nondet"),
+    "nondet_backend": (backend, "nondet"),
 }
+DET_NAMESPACES = ("det_backend", "det_facade")
+NONDET_NAMESPACES = ("nondet_backend", "nondet_facade")
+# The module constants keep their names (no mode word).
+CONSTANT = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+# The names from before the rename: they fail at import.
+OLD_MODULES = (
+    "flashinfer.cake_rmsnorm_train",
+    "flashinfer.cake_rmsnorm_train_backend",
+    "flashinfer.cake_rmsnorm_det_train_backend",
+)
+OLD_NONDET_NAMES = (
+    "CakeRMSNormFunction",
+    "cake_rmsnorm",
+    "cake_rmsnorm_train_backward",
+    "cake_rmsnorm_train_backward_workspace",
+    "cake_rmsnorm_train_backward_workspace_bytes",
+    "cake_rmsnorm_train_forward",
+    "is_cake_rmsnorm_train_supported",
+)
+OLD_HELPERS = ("program_windows", "route_key", "weight_dtypes")
+OLD_NAMES = (*OLD_NONDET_NAMES, *OLD_HELPERS)
+
+
+def _carries(name: str, mode: str) -> bool:
+    """Whether ``name`` carries the mode word ``mode`` (``det`` / ``nondet``): a
+    ``_``-separated token, or the CamelCase part ``Det`` / ``Nondet``."""
+    if mode in name.split("_"):
+        return True
+    return re.search(rf"{mode.capitalize()}(?=[A-Z0-9]|$)", name) is not None
 
 
 def _cpu_tensors():
@@ -122,70 +145,65 @@ def _cpu_tensors():
     return x, w, rstd
 
 
-def _nondet_calls(module, flag) -> dict:
-    """Every entry point of the non-det ``module``, called on CPU tensors with
-    ``deterministic=flag`` (omitted for ``DEFAULT``; the autograd function takes
-    it as its last forward input).  The flag is checked before any device
-    query."""
-    x, w, rstd = _cpu_tensors()
-    kw = {} if flag is DEFAULT else {"deterministic": flag}
-    last = () if flag is DEFAULT else (flag,)
-    return {
-        "cake_rmsnorm_train_forward": functools.partial(
-            module.cake_rmsnorm_train_forward, x, w, 1e-6, **kw
-        ),
-        "cake_rmsnorm_train_backward": functools.partial(
-            module.cake_rmsnorm_train_backward, x, x, w, rstd, **kw
-        ),
-        "cake_rmsnorm_train_backward_workspace": functools.partial(
-            module.cake_rmsnorm_train_backward_workspace, 4, 512, "cpu", **kw
-        ),
-        "cake_rmsnorm_train_backward_workspace_bytes": functools.partial(
-            module.cake_rmsnorm_train_backward_workspace_bytes, 4, 512, "cpu", **kw
-        ),
-        "is_cake_rmsnorm_train_supported": functools.partial(
-            module.is_cake_rmsnorm_train_supported, "cpu", 512, **kw
-        ),
-        "cake_rmsnorm": functools.partial(module.cake_rmsnorm, x, w, 1e-6, **kw),
-        "CakeRMSNormFunction": functools.partial(
-            module.CakeRMSNormFunction.apply, x, w, 1e-6, None, *last
-        ),
-    }
-
-
-def _det_calls(module, **flag) -> dict:
-    """Every entry point of the det package ``module``, called on CPU tensors
-    with the keyword arguments ``flag`` (the autograd function with
-    ``flag["deterministic"]`` as an extra forward input when given)."""
+def _calls(namespace: str, **flag) -> dict:
+    """Every callable of ``namespace``'s ``__all__``, called on CPU tensors with
+    the keyword arguments ``flag`` (the autograd function with the values of
+    ``flag`` as extra forward inputs)."""
+    module, mode = NAMESPACES[namespace]
+    stem = f"cake_rmsnorm_{mode}_train"
     x, w, rstd = _cpu_tensors()
     extra = tuple(flag.values())
-    return {
-        "cake_rmsnorm_det_train_forward": functools.partial(
-            module.cake_rmsnorm_det_train_forward, x, w, 1e-6, **flag
+    arch = module.ARCHES[0]
+    calls = {
+        f"{stem}_forward": functools.partial(
+            getattr(module, f"{stem}_forward"), x, w, 1e-6, **flag
         ),
-        "cake_rmsnorm_det_train_backward": functools.partial(
-            module.cake_rmsnorm_det_train_backward, x, x, w, rstd, **flag
+        f"{stem}_backward": functools.partial(
+            getattr(module, f"{stem}_backward"), x, x, w, rstd, **flag
         ),
-        "cake_rmsnorm_det_train_backward_workspace": functools.partial(
-            module.cake_rmsnorm_det_train_backward_workspace, 4, 512, "cpu", **flag
+        f"{stem}_backward_workspace": functools.partial(
+            getattr(module, f"{stem}_backward_workspace"), 4, 512, "cpu", **flag
         ),
-        "cake_rmsnorm_det_train_backward_workspace_bytes": functools.partial(
-            module.cake_rmsnorm_det_train_backward_workspace_bytes,
-            4,
-            512,
-            "cpu",
-            **flag,
+        f"{stem}_backward_workspace_bytes": functools.partial(
+            getattr(module, f"{stem}_backward_workspace_bytes"), 4, 512, "cpu", **flag
         ),
-        "is_cake_rmsnorm_det_train_supported": functools.partial(
-            module.is_cake_rmsnorm_det_train_supported, "cpu", 512, **flag
+        f"{stem}_route_key": functools.partial(
+            getattr(module, f"{stem}_route_key"), 512, "bwd", False, **flag
         ),
-        "cake_rmsnorm_det": functools.partial(
-            module.cake_rmsnorm_det, x, w, 1e-6, **flag
+        f"is_{stem}_supported": functools.partial(
+            getattr(module, f"is_{stem}_supported"), "cpu", 512, **flag
         ),
-        "CakeRMSNormDetFunction": functools.partial(
-            module.CakeRMSNormDetFunction.apply, x, w, 1e-6, None, *extra
+        f"cake_rmsnorm_{mode}": functools.partial(
+            getattr(module, f"cake_rmsnorm_{mode}"), x, w, 1e-6, **flag
+        ),
+        f"CakeRMSNorm{mode.capitalize()}Function": functools.partial(
+            getattr(module, f"CakeRMSNorm{mode.capitalize()}Function").apply,
+            x,
+            w,
+            1e-6,
+            None,
+            *extra,
         ),
     }
+    if mode == "det":
+        hidden = det_backend.cake_jit.supported_hidden_sizes(arch)[0]
+        calls[f"{stem}_program_windows"] = functools.partial(
+            module.cake_rmsnorm_det_train_program_windows,
+            arch,
+            hidden,
+            "fwd",
+            False,
+            **flag,
+        )
+        calls[f"{stem}_weight_dtypes"] = functools.partial(
+            module.cake_rmsnorm_det_train_weight_dtypes,
+            arch,
+            hidden,
+            "fwd",
+            False,
+            **flag,
+        )
+    return calls
 
 
 def _names(text: str, name: str) -> bool:
@@ -206,47 +224,65 @@ def no_determinism():
 # --------------------------------------------------------------------------- names
 
 
-@pytest.mark.parametrize("namespace", sorted(DET_NAMESPACES))
-@pytest.mark.parametrize("name", NONDET_NAMES)
-def test_det_package_has_no_name_from_before_the_rename(
-    namespace: str, name: str
-) -> None:
-    module = DET_NAMESPACES[namespace]
-    assert not hasattr(module, name), f"{module.__name__}.{name} resolves"
-    assert name not in dir(module), (namespace, name)
-    assert name not in module.__all__, (namespace, name)
+@pytest.mark.parametrize("namespace", sorted(NAMESPACES))
+def test_public_names_are_constants_or_carry_their_mode(namespace: str) -> None:
+    """Every name of ``__all__`` is a module constant or carries the mode word
+    of its package and not the other package's."""
+    module, mode = NAMESPACES[namespace]
+    other = "det" if mode == "nondet" else "nondet"
+    assert sorted(module.__all__) == (DET_ALL if mode == "det" else NONDET_ALL)
+    for name in module.__all__:
+        assert hasattr(module, name), (namespace, name)
+        if CONSTANT.match(name):
+            continue
+        assert _carries(name, mode), (namespace, name)
+        assert not _carries(name, other), (namespace, name)
 
 
-@pytest.mark.parametrize("namespace", sorted(DET_NAMESPACES))
-def test_det_package_rmsnorm_names_carry_det(namespace: str) -> None:
-    """Every public RMSNorm name of the det package carries ``det``; its det
-    names are in ``__all__``."""
-    module = DET_NAMESPACES[namespace]
-    public = [n for n in dir(module) if not n.startswith("_")]
-    rmsnorm = [n for n in public if "rmsnorm" in n.lower()]
-    assert rmsnorm, namespace
-    assert all("det" in n.lower() for n in rmsnorm), sorted(
-        n for n in rmsnorm if "det" not in n.lower()
-    )
-    assert set(DET_NAMES) <= set(module.__all__), namespace
+def test_mode_word_rule() -> None:
+    """The mode-word check itself: ``Nondet`` is not ``Det`` and ``nondet`` is
+    not ``det``."""
+    assert _carries("CakeRMSNormDetFunction", "det")
+    assert not _carries("CakeRMSNormDetFunction", "nondet")
+    assert _carries("CakeRMSNormNondetFunction", "nondet")
+    assert not _carries("CakeRMSNormNondetFunction", "det")
+    assert _carries("cake_rmsnorm_nondet_train_forward", "nondet")
+    assert not _carries("cake_rmsnorm_nondet_train_forward", "det")
+    assert not _carries("cake_rmsnorm", "det")
+    assert not _carries("route_key", "nondet")
 
 
-@pytest.mark.parametrize("namespace", sorted(NONDET_NAMESPACES))
+@pytest.mark.parametrize("namespace", NONDET_NAMESPACES)
 @pytest.mark.parametrize("name", DET_NAMES)
 def test_nondet_package_resolves_no_det_name(namespace: str, name: str) -> None:
-    module = NONDET_NAMESPACES[namespace]
+    module = NAMESPACES[namespace][0]
     assert not hasattr(module, name), f"{module.__name__}.{name} resolves"
-    with pytest.raises(AttributeError):
-        getattr(module, name)
     assert name not in dir(module), (namespace, name)
     assert "__getattr__" not in vars(module), namespace
 
 
-@pytest.mark.parametrize("namespace", sorted(NONDET_NAMESPACES))
+@pytest.mark.parametrize("namespace", DET_NAMESPACES)
+@pytest.mark.parametrize("name", NONDET_NAMES)
+def test_det_package_resolves_no_nondet_name(namespace: str, name: str) -> None:
+    module = NAMESPACES[namespace][0]
+    assert not hasattr(module, name), f"{module.__name__}.{name} resolves"
+    assert name not in dir(module), (namespace, name)
+    assert "__getattr__" not in vars(module), namespace
+
+
+@pytest.mark.parametrize("namespace", sorted(NAMESPACES))
+@pytest.mark.parametrize("name", OLD_NAMES)
+def test_no_name_from_before_the_rename_resolves(namespace: str, name: str) -> None:
+    module = NAMESPACES[namespace][0]
+    assert not hasattr(module, name), f"{module.__name__}.{name} resolves"
+    assert name not in dir(module), (namespace, name)
+
+
+@pytest.mark.parametrize("namespace", NONDET_NAMESPACES)
 def test_nondet_package_never_imports_the_det_package(namespace: str) -> None:
     """No import of the det package anywhere in the non-det facade or backend
     (module level or inside a function), and no import by name."""
-    module = NONDET_NAMESPACES[namespace]
+    module = NAMESPACES[namespace][0]
     source = inspect.getsource(module)
     tree = ast.parse(source)
     imports = [
@@ -256,111 +292,115 @@ def test_nondet_package_never_imports_the_det_package(namespace: str) -> None:
     ]
     assert not [line for line in imports if "cake_rmsnorm_det_train" in line], imports
     assert "import_module" not in source, namespace
-    public = [n for n in dir(module) if not n.startswith("_") and "rmsnorm" in n]
-    assert not [n for n in public if "det" in n.lower()], public
 
 
-# --------------------------------------------------------------------------- the deterministic flag
+# --------------------------------------------------------------------------- no ``deterministic`` keyword
 
 
-def _det_signatures():
-    """``(module, name, signature)`` of every det entry point (the autograd
-    function's forward)."""
-    for module in (det_facade, det_backend):
-        for name in DET_NAMES:
-            entry = getattr(module, name)
-            if name == "CakeRMSNormDetFunction":
-                entry = entry.forward
-            yield module, name, inspect.signature(entry)
+def _entries(module):
+    """``(name, callable)`` of every callable of ``module.__all__`` (the autograd
+    function's ``forward`` for the class)."""
+    for name in module.__all__:
+        entry = getattr(module, name)
+        if inspect.isclass(entry):
+            yield name, entry.forward
+        elif callable(entry):
+            yield name, entry
 
 
-def test_det_entries_take_no_deterministic_parameter() -> None:
-    for module, name, signature in _det_signatures():
-        assert "deterministic" not in signature.parameters, (module, name)
+@pytest.mark.parametrize("namespace", sorted(NAMESPACES))
+def test_no_entry_point_has_a_deterministic_parameter(namespace: str) -> None:
+    module = NAMESPACES[namespace][0]
+    entries = dict(_entries(module))
+    assert set(entries) == set(module.__all__) - set(CONSTANTS), namespace
+    for name, entry in entries.items():
+        parameters = inspect.signature(entry).parameters
+        assert "deterministic" not in parameters, (namespace, name)
 
 
-def test_nondet_flag_defaults_to_true_and_is_keyword_only() -> None:
-    """``deterministic`` defaults to ``True`` (which raises) on every non-det entry
-    point: keyword-only, but on ``cake_rmsnorm`` (its call shape is kept) and the
-    autograd function's forward (``apply`` takes positional inputs only), where it
-    is the last parameter."""
-    for name in NONDET_NAMES:
-        for module in (facade, backend):
-            entry = getattr(module, name)
-            if name == "CakeRMSNormFunction":
-                entry = entry.forward
-            parameters = inspect.signature(entry).parameters
-            parameter = parameters["deterministic"]
-            assert parameter.default is True, (module, name)
-            if name in ("cake_rmsnorm", "CakeRMSNormFunction"):
-                assert list(parameters)[-1] == "deterministic", (module, name)
-                assert parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
-            else:
-                assert parameter.kind is inspect.Parameter.KEYWORD_ONLY, (module, name)
+def test_autograd_call_shapes() -> None:
+    """Both autograd functionals take ``(x, w, eps, residual)`` and both autograd
+    functions' forwards ``(ctx, x, w, eps, residual)``."""
+    for module, mode in NAMESPACES.values():
+        functional = getattr(module, f"cake_rmsnorm_{mode}")
+        assert list(inspect.signature(functional).parameters) == [
+            "x",
+            "w",
+            "eps",
+            "residual",
+        ]
+        function = getattr(module, f"CakeRMSNorm{mode.capitalize()}Function")
+        assert list(inspect.signature(function.forward).parameters) == [
+            "ctx",
+            "x",
+            "w",
+            "eps",
+            "residual",
+        ]
 
 
-@pytest.mark.parametrize("namespace", sorted(DET_NAMESPACES))
-@pytest.mark.parametrize("entry", DET_NAMES)
+@pytest.mark.parametrize("namespace", sorted(NAMESPACES))
 @pytest.mark.parametrize("value", [True, False], ids=["True", "False"])
-def test_det_entry_rejects_the_deterministic_keyword(
-    namespace: str, entry: str, value: bool, no_determinism
+def test_the_deterministic_keyword_is_a_type_error(
+    namespace: str, value: bool, no_determinism
 ) -> None:
-    """Passing ``deterministic`` to a det entry point is Python's ``TypeError``
-    (an unexpected keyword argument; for the autograd function, an extra
-    forward input), whatever its value."""
-    call = _det_calls(DET_NAMESPACES[namespace], deterministic=value)[entry]
-    if entry == "CakeRMSNormDetFunction":
-        expected = "positional argument"
-    else:
-        expected = "unexpected keyword argument 'deterministic'"
-    with pytest.raises(TypeError, match=expected):
-        call()
-
-
-@pytest.mark.parametrize("namespace", sorted(NONDET_NAMESPACES))
-@pytest.mark.parametrize("entry", NONDET_NAMES)
-@pytest.mark.parametrize("value", list(NOT_FALSE.values()), ids=list(NOT_FALSE))
-@pytest.mark.parametrize("algorithms", ["off", "on", "warn_only"])
-def test_nondet_entry_rejects_every_value_but_false(
-    namespace: str, entry: str, value, algorithms: str, no_determinism
-) -> None:
-    """The default and every value of ``deterministic`` but the object ``False``
-    raise ``ValueError`` naming the det entry point of the same role and saying
-    how to request this package, before any device query and whatever
-    ``torch.use_deterministic_algorithms`` says (no warning, no
-    ``RuntimeError``)."""
-    call = _nondet_calls(NONDET_NAMESPACES[namespace], value)[entry]
-    if algorithms != "off":
-        torch.use_deterministic_algorithms(True, warn_only=algorithms == "warn_only")
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        with pytest.raises(ValueError) as info:
+    """Passing ``deterministic`` to any entry point of either package is
+    Python's ``TypeError`` (an unexpected keyword argument; for the autograd
+    function, an extra forward input), whatever its value."""
+    module = NAMESPACES[namespace][0]
+    calls = _calls(namespace, deterministic=value)
+    assert set(calls) == set(module.__all__) - set(CONSTANTS), namespace
+    for name, call in calls.items():
+        if name.startswith("CakeRMSNorm"):
+            expected = "positional argument"
+        else:
+            expected = "unexpected keyword argument 'deterministic'"
+        with pytest.raises(TypeError, match=expected):
             call()
-    assert [str(item.message) for item in caught] == []
-    text = str(info.value)
-    assert _names(text, f"flashinfer.cake_rmsnorm_det_train.{DET_OF[entry]}"), text
-    assert _names(text, f"flashinfer.cake_rmsnorm_train.{entry}"), text
-    assert PHRASE in text, text
 
 
-@pytest.mark.parametrize("namespace", sorted(NONDET_NAMESPACES))
-@pytest.mark.parametrize("entry", NONDET_NAMES)
-def test_nondet_entry_runs_with_false(
-    namespace: str, entry: str, no_determinism
+# --------------------------------------------------------------------------- torch.use_deterministic_algorithms
+
+
+@pytest.mark.parametrize("namespace", NONDET_NAMESPACES)
+@pytest.mark.parametrize("algorithms", ["on", "warn_only"])
+def test_only_the_nondet_backward_alerts(
+    namespace: str, algorithms: str, no_determinism
 ) -> None:
-    """``deterministic=False`` passes the flag check: the support query answers
-    ``False`` for the CPU, every other entry point goes on to this package's
-    CUDA check (here: CPU tensors)."""
-    call = _nondet_calls(NONDET_NAMESPACES[namespace], False)[entry]
-    if entry == "is_cake_rmsnorm_train_supported":
-        assert call() is False
-        return
-    with pytest.raises(ValueError, match="requires CUDA tensors") as info:
-        call()
-    assert PHRASE not in str(info.value)
+    """With ``torch.use_deterministic_algorithms(True)`` the non-det backward
+    raises ``RuntimeError`` naming the det backward (``warn_only``: one
+    ``UserWarning`` naming it, then this package's own CUDA check); the
+    forward, the autograd forward, the workspace helpers, the route helper and
+    the support query neither warn nor raise ``RuntimeError``."""
+    torch.use_deterministic_algorithms(True, warn_only=algorithms == "warn_only")
+    det_name = "flashinfer.cake_rmsnorm_det_train.cake_rmsnorm_det_train_backward"
+    for name, call in _calls(namespace).items():
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            if name == "cake_rmsnorm_nondet_train_backward" and algorithms == "on":
+                with pytest.raises(RuntimeError) as info:
+                    call()
+                text = str(info.value)
+                assert _names(text, det_name), text
+                assert _names(text, f"{FACADE}.{name}"), text
+                assert "deterministic=False" not in text, text
+            elif name == "is_cake_rmsnorm_nondet_train_supported":
+                assert call() is False
+            elif name == "cake_rmsnorm_nondet_train_route_key":
+                assert call() == "bwd_h512"
+            else:
+                with pytest.raises(ValueError, match="requires CUDA tensors"):
+                    call()
+        messages = [str(item.message) for item in caught]
+        if name == "cake_rmsnorm_nondet_train_backward" and algorithms == "warn_only":
+            assert len(messages) == 1, messages
+            assert _names(messages[0], det_name), messages[0]
+            assert "deterministic=False" not in messages[0], messages[0]
+        else:
+            assert messages == [], (name, messages)
 
 
-@pytest.mark.parametrize("namespace", sorted(DET_NAMESPACES))
+@pytest.mark.parametrize("namespace", DET_NAMESPACES)
 @pytest.mark.parametrize("algorithms", ["on", "warn_only"])
 def test_det_package_ignores_deterministic_algorithms(
     namespace: str, algorithms: str, no_determinism
@@ -368,9 +408,9 @@ def test_det_package_ignores_deterministic_algorithms(
     """The det package does not consult ``torch.use_deterministic_algorithms``:
     its source never reads the setting, and with it on (strict or
     ``warn_only``) every det entry point refuses a CPU tensor with its own
-    ``ValueError`` only (no ``RuntimeError``, no warning) and the support query
-    answers ``False``."""
-    module = DET_NAMESPACES[namespace]
+    ``ValueError`` only (no ``RuntimeError``, no warning), the helpers answer
+    and the support query answers ``False``."""
+    module = NAMESPACES[namespace][0]
     tree = ast.parse(inspect.getsource(module))
     consulted = [
         node.attr
@@ -381,20 +421,26 @@ def test_det_package_ignores_deterministic_algorithms(
     torch.use_deterministic_algorithms(True, warn_only=algorithms == "warn_only")
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        for name, call in _det_calls(module).items():
+        for name, call in _calls(namespace).items():
             if name == "is_cake_rmsnorm_det_train_supported":
-                continue
-            with pytest.raises(ValueError, match="requires CUDA tensors"):
-                call()
-        assert module.is_cake_rmsnorm_det_train_supported("cpu") is False
-        assert module.is_cake_rmsnorm_det_train_supported("cpu", 512) is False
+                assert call() is False
+            elif name == "cake_rmsnorm_det_train_route_key":
+                assert call() == "bwd_h512"
+            elif name in (
+                "cake_rmsnorm_det_train_program_windows",
+                "cake_rmsnorm_det_train_weight_dtypes",
+            ):
+                assert call(), name
+            else:
+                with pytest.raises(ValueError, match="requires CUDA tensors"):
+                    call()
     assert [str(item.message) for item in caught] == []
 
 
 # --------------------------------------------------------------------------- the flashinfer top level
 
 
-@pytest.mark.parametrize("name", NONDET_NAMES)
+@pytest.mark.parametrize("name", sorted({*NONDET_NAMES, *OLD_NAMES}))
 def test_top_level_binds_no_nondet_name(name: str) -> None:
     assert not hasattr(flashinfer, name), name
     assert name not in dir(flashinfer), name
@@ -406,13 +452,16 @@ def test_top_level_det_name_is_the_det_object(name: str) -> None:
 
 
 def test_top_level_modules() -> None:
-    assert flashinfer.cake_rmsnorm_train is facade
-    assert flashinfer.cake_rmsnorm_train_backend is backend
+    assert flashinfer.cake_rmsnorm_nondet_train is facade
+    assert flashinfer.cake_rmsnorm_det_train is det_facade
+    for old in OLD_MODULES:
+        assert not hasattr(flashinfer, old.rpartition(".")[2]), old
+        assert old not in sys.modules, old
     assert sys.modules[FACADE] is not sys.modules[DET_FACADE]
-    assert facade.CakeRMSNormFunction is backend.CakeRMSNormFunction
+    assert facade.CakeRMSNormNondetFunction is backend.CakeRMSNormNondetFunction
     assert det_facade.CakeRMSNormDetFunction is det_backend.CakeRMSNormDetFunction
     assert not issubclass(
-        backend.CakeRMSNormFunction, det_backend.CakeRMSNormDetFunction
+        backend.CakeRMSNormNondetFunction, det_backend.CakeRMSNormDetFunction
     )
 
 
@@ -421,13 +470,13 @@ def test_top_level_modules() -> None:
 
 def test_nondet_facade_is_its_own_module() -> None:
     assert importlib.import_module(FACADE) is facade
-    assert Path(facade.__file__).name == "cake_rmsnorm_train.py"
+    assert Path(facade.__file__).name == "cake_rmsnorm_nondet_train.py"
     assert sorted(facade.__all__) == NONDET_ALL
     for name in facade.__all__:
         assert getattr(facade, name) is getattr(backend, name) or name in (
-            "cake_rmsnorm",
-            "cake_rmsnorm_train_backward",
-            "cake_rmsnorm_train_forward",
+            "cake_rmsnorm_nondet",
+            "cake_rmsnorm_nondet_train_backward",
+            "cake_rmsnorm_nondet_train_forward",
         ), name
 
 
@@ -444,6 +493,7 @@ def test_nondet_package_is_self_contained() -> None:
     assert sorted(backend.__all__) == NONDET_ALL
     # its own registry: the forward programs of the det package renamed, the
     # backward records of its single kernels and of the det pairs it renders
+    # (the kernel library names keep their internal prefix)
     modules = backend.cake_jit.MODULES
     assert modules and all(name.startswith("cake_rmsnorm_train_") for name in modules)
     assert all(
@@ -464,6 +514,9 @@ def test_nondet_package_is_self_contained() -> None:
         "build.json",
         "csrc",
     } <= files
+    for package in (PACKAGE, DET_PACKAGE):
+        manifest = importlib.import_module(f"{package}.cake_build").manifest()
+        assert manifest["package"] == package, package
 
 
 def test_nondet_package_star_import_binds_its_own_objects() -> None:
@@ -481,8 +534,9 @@ def test_nondet_package_dir_lists_its_own_names() -> None:
     assert not set(DET_NAMES) & listed
 
 
-# Import forms in a fresh interpreter: the submodule path first, the attributes of
-# flashinfer, a top-level import of a removed name, and a star import of the package.
+# Import forms in a fresh interpreter: the submodule path first, the attributes
+# of flashinfer, the names and modules from before the rename, and a star
+# import of the package.
 FRESH = {
     "submodule_first": (
         "import importlib\n"
@@ -494,21 +548,33 @@ FRESH = {
     "flashinfer_attributes": (
         "import sys\nimport flashinfer\n"
         f"assert flashinfer.{FACADE.rpartition('.')[2]} is sys.modules['{FACADE}']\n"
-        f"assert flashinfer.{PACKAGE.rpartition('.')[2]} is sys.modules['{PACKAGE}']\n"
         f"assert not hasattr(flashinfer, '{PAIRS[0][0]}')\n"
         f"assert flashinfer.{PAIRS[0][1]} is sys.modules['{DET_FACADE}'].{PAIRS[0][1]}\n"
         f"assert not hasattr(sys.modules['{DET_FACADE}'], '{PAIRS[0][0]}')\n"
     ),
-    "top_level_from_import_fails": (
-        "try:\n"
-        "    from flashinfer import cake_rmsnorm\n"
-        "except ImportError as e:\n"
-        "    assert \"cannot import name 'cake_rmsnorm' from 'flashinfer'\" in str(e), e\n"
-        "else:\n"
-        "    raise AssertionError('flashinfer.cake_rmsnorm still imports')\n"
+    "old_modules_fail": (
+        "import importlib\n"
+        f"for name in {OLD_MODULES!r}:\n"
+        "    try:\n"
+        "        importlib.import_module(name)\n"
+        "    except ModuleNotFoundError as e:\n"
+        "        assert e.name == name, (name, e.name)\n"
+        "    else:\n"
+        "        raise AssertionError(f'{name} still imports')\n"
+    ),
+    "old_names_fail": (
+        f"for module, names in (('flashinfer', {OLD_NAMES!r}),"
+        f" ('{FACADE}', {OLD_NAMES!r}), ('{DET_FACADE}', {OLD_NAMES!r})):\n"
+        "    for name in names:\n"
+        "        try:\n"
+        "            exec(f'from {module} import {name}', {})\n"
+        "        except ImportError as e:\n"
+        "            assert f\"cannot import name '{name}'\" in str(e), e\n"
+        "        else:\n"
+        "            raise AssertionError(f'{module}.{name} still imports')\n"
         "from flashinfer import cake_rmsnorm_det\n"
-        f"from {FACADE} import cake_rmsnorm\n"
-        "assert cake_rmsnorm is not cake_rmsnorm_det\n"
+        f"from {FACADE} import cake_rmsnorm_nondet\n"
+        "assert cake_rmsnorm_nondet is not cake_rmsnorm_det\n"
     ),
     "package_star_import": (
         "import importlib\n"

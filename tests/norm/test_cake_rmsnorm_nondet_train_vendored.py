@@ -14,25 +14,23 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Vendored copies of the Cake RMSNorm training package with the
-non-deterministic weight gradient (``flashinfer/cake_rmsnorm_train_backend``)
-and its deterministic sibling (``flashinfer/cake_rmsnorm_det_train_backend``),
-imported with flashinfer blocked (issues #6553, #7047, #8066).
+non-deterministic weight gradient
+(``flashinfer/experimental/cake/cake_rmsnorm_nondet_train``) and its
+deterministic sibling (``flashinfer/experimental/cake/cake_rmsnorm_det_train``),
+imported with flashinfer blocked (issues #6553, #7047, #8066, #8928).
 
 This package never imports the deterministic package: a consumer vendors it
-alone.  Every entry point requires ``deterministic=False``; the default and
-``deterministic=True`` raise ``ValueError`` naming the deterministic package's
-entry point, with or without that package.  The pair under one parent serves
-the backend suites that compare against the deterministic package.
+alone.  No entry point takes a ``deterministic`` keyword (passing one raises
+``TypeError``), with or without that package.  The pair under one parent
+serves the backend suites that compare against the deterministic package.
 
 * Device-free (``cpu_only``): both forms are copied (without ``aot/`` and
   ``__pycache__/``) and imported in a fresh ``python -I`` interpreter in which
-  every ``flashinfer`` import raises: the pair under one parent (the
-  ``deterministic=False`` call reaches this package's own checks and the
-  vendored sibling is never imported), the lone copy (it imports; the
-  ``deterministic=False`` call reaches this package's own checks; the default
-  and ``deterministic=True`` raise ``ValueError`` naming the deterministic
-  entry point), the lone deterministic copy; no ``flashinfer`` module is
-  loaded.
+  every ``flashinfer`` import raises: the pair under one parent (the calls
+  reach this package's own checks and the vendored sibling is never
+  imported), the lone copy (it imports; the calls reach this package's own
+  checks; a ``deterministic`` keyword raises ``TypeError``), the lone
+  deterministic copy; no ``flashinfer`` module is loaded.
 * Device (opt-in, ``FLASHINFER_CAKE_VENDORED_SUITE=1``: it compiles both
   manifests with plain ``nvcc``, minutes): ``scripts/check_cake_build_manifests.py
   --vendored-gate`` builds both copies for the visible GPUs' architecture and
@@ -57,23 +55,25 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-NONDET = "cake_rmsnorm_train_backend"
-DET = "cake_rmsnorm_det_train_backend"
+# The package directories under ``flashinfer/experimental/cake/``.
+SOURCE = REPO_ROOT / "flashinfer" / "experimental" / "cake"
+NONDET = "cake_rmsnorm_nondet_train"
+DET = "cake_rmsnorm_det_train"
 PARENT = "vendored_cake_rmsnorm"
 LONE = f"vendored_{NONDET}"
 LONE_DET = f"vendored_{DET}"
 # The backend suites run against the vendored pair, and the ones that do not
 # compare against the deterministic package, run against the lone copy.
 PAIR_SUITES = (
-    "tests/norm/test_cake_rmsnorm_train.py",
-    "tests/norm/test_cake_rmsnorm_train_pairs.py",
-    "tests/norm/test_cake_rmsnorm_train_ckpt.py",
-    "tests/norm/test_cake_rmsnorm_train_windows.py",
+    "tests/norm/test_cake_rmsnorm_nondet_train.py",
+    "tests/norm/test_cake_rmsnorm_nondet_train_pairs.py",
+    "tests/norm/test_cake_rmsnorm_nondet_train_ckpt.py",
+    "tests/norm/test_cake_rmsnorm_nondet_train_windows.py",
 )
 LONE_SUITES = (
-    "tests/norm/test_cake_rmsnorm_train_pairs.py",
-    "tests/norm/test_cake_rmsnorm_train_ckpt.py",
-    "tests/norm/test_cake_rmsnorm_train_windows.py",
+    "tests/norm/test_cake_rmsnorm_nondet_train_pairs.py",
+    "tests/norm/test_cake_rmsnorm_nondet_train_ckpt.py",
+    "tests/norm/test_cake_rmsnorm_nondet_train_windows.py",
 )
 SUITE_TIMEOUT_S = 5400
 
@@ -188,33 +188,23 @@ check(
 check(
     "pair: no device -> unsupported",
     lambda: None
-    if not nd.is_cake_rmsnorm_train_supported(torch.device("cpu"), deterministic=False)
+    if not nd.is_cake_rmsnorm_nondet_train_supported(torch.device("cpu"))
     else 1 / 0,
 )
 check(
-    "pair: the deterministic=False call runs this package (its CUDA check)",
+    "pair: the call runs this package (its CUDA check)",
     lambda: raises(
         ValueError,
-        lambda: nd.cake_rmsnorm_train_forward(x, w, 1e-6, deterministic=False),
+        lambda: nd.cake_rmsnorm_nondet_train_forward(x, w, 1e-6),
         "CUDA",
     ),
 )
 check(
-    "pair: the default call names the deterministic entry point",
+    "pair: a deterministic keyword is a TypeError",
     lambda: raises(
-        ValueError,
-        lambda: nd.cake_rmsnorm_train_forward(x, w, 1e-6),
-        "cake_rmsnorm_det_train_forward",
-        "pass deterministic=False for the non-deterministic path",
-    ),
-)
-check(
-    "pair: deterministic=True names the deterministic entry point",
-    lambda: raises(
-        ValueError,
-        lambda: nd.cake_rmsnorm_train_forward(x, w, 1e-6, deterministic=True),
-        "cake_rmsnorm_det_train_forward",
-        "pass deterministic=False for the non-deterministic path",
+        TypeError,
+        lambda: nd.cake_rmsnorm_nondet_train_forward(x, w, 1e-6, deterministic=False),
+        "deterministic",
     ),
 )
 check(
@@ -233,45 +223,35 @@ _LONE_CHECKS = (
 lone = importlib.import_module("{LONE}")
 check("lone: the copy is imported", lambda: None if os.path.realpath(lone.__file__).startswith(COPY) else 1 / 0)
 check(
-    "lone: the deterministic=False call runs this package (its CUDA check)",
+    "lone: the call runs this package (its CUDA check)",
     lambda: raises(
         ValueError,
-        lambda: lone.cake_rmsnorm_train_forward(x, w, 1e-6, deterministic=False),
+        lambda: lone.cake_rmsnorm_nondet_train_forward(x, w, 1e-6),
         "CUDA",
     ),
 )
 check(
-    "lone: the deterministic=False backward runs this package (its CUDA check)",
+    "lone: the backward runs this package (its CUDA check)",
     lambda: raises(
         ValueError,
-        lambda: lone.cake_rmsnorm_train_backward(
-            x, x, w, torch.ones(4), deterministic=False
+        lambda: lone.cake_rmsnorm_nondet_train_backward(x, x, w, torch.ones(4)),
+        "CUDA",
+    ),
+)
+check(
+    "lone: a deterministic keyword is a TypeError",
+    lambda: raises(
+        TypeError,
+        lambda: lone.cake_rmsnorm_nondet_train_backward(
+            x, x, w, torch.ones(4), deterministic=True
         ),
-        "CUDA",
-    ),
-)
-check(
-    "lone: the default call names the deterministic entry point",
-    lambda: raises(
-        ValueError,
-        lambda: lone.cake_rmsnorm_train_backward(x, x, w, torch.ones(4)),
-        "cake_rmsnorm_det_train_backward",
-        "pass deterministic=False for the non-deterministic path",
-    ),
-)
-check(
-    "lone: deterministic=True names the deterministic entry point",
-    lambda: raises(
-        ValueError,
-        lambda: lone.cake_rmsnorm_train_forward(x, w, 1e-6, deterministic=True),
-        "cake_rmsnorm_det_train_forward",
-        "pass deterministic=False for the non-deterministic path",
+        "deterministic",
     ),
 )
 check(
     "lone: support query",
     lambda: None
-    if not lone.is_cake_rmsnorm_train_supported(torch.device("cpu"), deterministic=False)
+    if not lone.is_cake_rmsnorm_nondet_train_supported(torch.device("cpu"))
     else 1 / 0,
 )
 det = importlib.import_module("{LONE_DET}")
@@ -297,14 +277,13 @@ def _results(proc) -> dict:
 @pytest.mark.cpu_only
 def test_vendored_copies_import_with_flashinfer_blocked(tmp_path: Path) -> None:
     paths = _dependency_paths()
-    source = REPO_ROOT / "flashinfer"
     pair = tmp_path / "pair"
-    _copy(source / NONDET, pair / PARENT / NONDET)
-    _copy(source / DET, pair / PARENT / DET)
+    _copy(SOURCE / NONDET, pair / PARENT / NONDET)
+    _copy(SOURCE / DET, pair / PARENT / DET)
     (pair / PARENT / "__init__.py").write_text("")
     lone = tmp_path / "lone"
-    _copy(source / NONDET, lone / LONE)
-    _copy(source / DET, lone / LONE_DET)
+    _copy(SOURCE / NONDET, lone / LONE)
+    _copy(SOURCE / DET, lone / LONE_DET)
     report = {}
     for _label, root, script in (
         ("pair", pair, _PAIR_CHECKS),
@@ -354,9 +333,9 @@ def vendored_build(tmp_path_factory):
             str(REPO_ROOT / "scripts" / "check_cake_build_manifests.py"),
             "--vendored-gate",
             "--package",
-            f"flashinfer.{DET}",
+            f"flashinfer.experimental.cake.{DET}",
             "--package",
-            f"flashinfer.{NONDET}",
+            f"flashinfer.experimental.cake.{NONDET}",
             "--jobs",
             str(min(32, os.cpu_count() or 8)),
             "--work-dir",
@@ -476,7 +455,7 @@ def test_backend_suites_against_the_vendored_pair(vendored_build) -> None:
     rc, counts, failing, proc = _run_suites(
         root,
         {
-            "cake_rmsnorm_train": f"{PARENT}.{NONDET}",
+            "cake_rmsnorm_nondet_train": f"{PARENT}.{NONDET}",
             "cake_rmsnorm_det_train": f"{PARENT}.{DET}",
         },
         PAIR_SUITES,
@@ -496,9 +475,9 @@ def test_det_independent_suites_against_the_lone_copy(vendored_build) -> None:
     rc, counts, failing, proc = _run_suites(
         root,
         {
-            "cake_rmsnorm_train": LONE,
+            "cake_rmsnorm_nondet_train": LONE,
             # no deterministic package anywhere: any use of it raises ImportError
-            "cake_rmsnorm_det_train": "vendored_cake_rmsnorm_det_train_backend_absent",
+            "cake_rmsnorm_det_train": "vendored_cake_rmsnorm_det_train_absent",
         },
         LONE_SUITES,
         vendored_build["work"],
