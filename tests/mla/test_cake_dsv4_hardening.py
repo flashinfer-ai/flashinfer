@@ -67,13 +67,17 @@ SEED_BASE = ref.TEST_SEED_BASE + 10_000
 _seed_counter = 0
 
 
-def _skip_unless_cake_gpu() -> None:
+def _skip_unless_cake_gpu(*, sm107: bool = False) -> None:
+    """Skip unless the GPU is SM100 or SM103, or SM107 when ``sm107`` is set
+    (the tests whose programs SM107 builds)."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for CAKE DSv4 hardening tests")
     compute_capability = get_compute_capability(torch.device("cuda"))
-    if compute_capability not in ((10, 0), (10, 3)):
+    supported = ((10, 0), (10, 3), (10, 7)) if sm107 else ((10, 0), (10, 3))
+    if compute_capability not in supported:
+        names = "SM100/SM103/SM107" if sm107 else "SM100/SM103"
         pytest.skip(
-            "CAKE DeepSeek V4 sparse MLA requires SM100/SM103, "
+            f"CAKE DeepSeek V4 sparse MLA requires {names}, "
             f"got SM{compute_capability[0]}{compute_capability[1]}"
         )
 
@@ -1461,7 +1465,7 @@ def test_enable_pdl_lowhead_prefill_matches_and_waits_for_the_query_producer(
     program above (68 rows), elsewhere the route's program.  As a programmatic
     dependent each is bitwise equal to the plain launch and, inside a graph,
     reads the query the copy right before it writes."""
-    _skip_unless_cake_gpu()
+    _skip_unless_cake_gpu(sm107=True)
     import flashinfer.mla.cake_dsv4 as cake
 
     launched: list = []
@@ -1873,7 +1877,7 @@ def test_misaligned_caller_out_matches_aligned(
     allocates nothing.  On SM107 the low-head prefill cases run the early-PV
     sibling up to its row ceiling (12 rows) and the route's program above it
     (66 rows); elsewhere they run the route's program."""
-    _skip_unless_cake_gpu()
+    _skip_unless_cake_gpu(sm107=route == "fp8_lowhead_prefill")
     import flashinfer.mla.cake_dsv4 as cake
 
     calls = _count_dispatches(monkeypatch)
