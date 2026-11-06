@@ -3507,7 +3507,7 @@ CKPT_IDS = [f"s{'_'.join(map(str, lens))}-h{H}" for lens, H in CKPT_ROWS]
 
 def _ckpt_problem(device, lengths, H):
     """A one-rank problem: the context, the operands (the delta rule's contract) and ``dout``."""
-    from tests.test_helpers.cake_kda_train_reference import make_inputs
+    from tests.test_helpers.cake_kda_det_train_reference import make_inputs
 
     cu = [0]
     for n in lengths:

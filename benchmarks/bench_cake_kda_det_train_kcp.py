@@ -133,7 +133,7 @@ from tests.test_helpers.cake_kda_det_train_reference import (  # noqa: E402
     make_raw_inputs,
     raw_gate,
 )
-from tests.test_helpers.cake_kda_train_reference import make_inputs  # noqa: E402
+from tests.test_helpers.cake_kda_det_train_reference import make_inputs  # noqa: E402
 
 ARMS = ("cake", "control", "local", "fla")
 GATE_ARMS = ("R", "E_T", "E_F")
