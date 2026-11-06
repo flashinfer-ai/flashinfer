@@ -372,7 +372,10 @@ re-running the intra program, WY, the K1 tape walk and, at `P > 1`, the
 offset re-walk and the carry merges.  Non-reentrant checkpoint keeps the set
 in both passes (the original forward's goes at its return); reentrant
 checkpoint runs its first pass under no_grad, so only its recompute keeps
-one.  The forward's launch list and every collective are unchanged.  On the
+one.  An engaged forward runs the tape walk and `kcp_fwd_o` where the light
+forward runs the fused walk `kcp_fwdh_o` (the backward reads the `h` /
+`v_new` tapes the tape walk writes); every other launch and every collective
+are unchanged.  On the
 devices of `KCP_HANDOFF_VERIFIED` the outputs and gradients are bitwise those
 of `"off"` (the hand-off rows of
 `tests/experimental/test_cake_kda_train_kcp_handoff.py`); `"on"` on another
@@ -406,7 +409,9 @@ every H16 and H64 row 5 % or more faster.  H8 at CP8 (261392) is refused as
 `"work"` on the 8-GPU parts.  The bound admits every measured row that gains
 5 % or more and refuses every measured loss.  A new device, toolkit or head
 count needs these rows and the hand-off rows before it enters
-`KCP_HANDOFF_VERIFIED` or `KCP_HANDOFF_HEADS`.  H, the batch's total and the
+`KCP_HANDOFF_VERIFIED` or `KCP_HANDOFF_HEADS`.  These rows predate the fused
+forward walk, which the light path's forwards run and an engaged forward does
+not.  H, the batch's total and the
 world size are the same on every rank, so the ranks of a group of one device
 kind decide alike; a rank that decides otherwise (a rank without tokens never
 keeps a set) still runs the same collectives, because the launches the
@@ -630,15 +635,22 @@ families of a phase in one launch; off by default).
 
 The files of this package:
 
-* `cake_kcp_jit.py` -- the `MODULES` registry of the eleven shipped programs (copies of the deterministic
+* `cake_kcp_jit.py` -- the `MODULES` registry of the sixteen shipped programs (copies of the deterministic
   package's records under the `cake_kda_train_` library prefix, the same twenty hex digits; the
   fragment walks of the forward and backward state recurrences in their
   `offset` and `tape` forms, the BF16x3 transfer walk (two CTAs per segment
   and head, each over one 64-column half of the state), the affine
-  merge at `cols_per_cta` 8 and 16, and the two chunk stages of the
+  merge in one record per register-blocked build, and the two chunk stages of the
   context-parallel route, `kcp_fwd_o` (the output from the K1 tapes) and
-  `kcp_dav` (`dA_qk` and the `dv1` K2 reads); selection by `always` or by
-  `columns` on the merge's `ncols`, grids by `kcp_segments_heads`,
+  `kcp_dav` (`dA_qk` and the `dv1` K2 reads), and the fused forward walk
+  `kcp_fwdh_o` (the forward state walk with the chunk output inside it: the
+  same bits as the tape walk followed by `kcp_fwd_o`, no tape written; in its
+  full-width and two-CTA records), which the forward that keeps no tape
+  launches in place of those two; selection by `always`, by
+  `walk_form`, by `walk_heads` (the `WALK_HEADS_RULE` bands of the launch's
+  head count: the plain or the overlap-schedule full-width adjoint offset
+  walk), or by `merge_rule` (the `MERGE_RULE` bands of the merge
+  launch's 128-column chain blocks per architecture), grids by `kcp_segments_heads`,
   `kcp_chains`, `kcp_tile_items` or `kcp_pairs`), the logical vocabulary of
   the KCP arguments, `run_program(name, args, device_index=)`, the lowering
   of the host backend's walk and merge requests to the registry's launches,
@@ -658,11 +670,11 @@ The files of this package:
   tests; without the file those tests skip.  The package reads no
   environment variable.
 * `cake_build.py` + `build.json` -- the loader shared by every Cake-exported
-  package (byte-identical copies) and the manifest of the eleven shipped
+  package (byte-identical copies) and the manifest of the sixteen shipped
   programs (schema `cake-build/1`, one entry per `<library>_<arch>`);
   `aot/` is never tracked (`.gitignore`).
 * `csrc/cake_ffi_checks.h` -- the TVM-FFI helper header the bindings include.
-* `csrc/cake_kda_train_<digest>_kcp_{kernel,binding}.cu` of the sixteen
+* `csrc/cake_kda_train_<digest>_kcp_{kernel,binding}.cu` of the twenty-one
   context-parallel programs (the chunk stage `kcp_fwd_o` among them) and
   `csrc/cake_kda_train_<digest>_{kernel,binding}.cu` of the chunk stage
   `kcp_dav`, rendered like the single-rank ones (digests in `build.json` and
@@ -671,7 +683,7 @@ The files of this package:
 
 ## Status
 
-The registry holds eleven shipped programs (`cake_kcp_jit.MODULES`, in
+The registry holds sixteen shipped programs (`cake_kcp_jit.MODULES`, in
 `build.json`) and six test-only programs (`cake_kcp_jit.TEST_MODULES`, in
 `build.test.json`) for `sm_100a`, `sm_103a` and `sm_107a`.
 
