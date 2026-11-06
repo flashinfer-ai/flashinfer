@@ -23,6 +23,12 @@ limitations under the License.
 # ``offs`` before the GEMM runs, as it does for a built-in op: a non-reentrant
 # checkpoint with early stop on (the torch default) then skips the recomputed
 # GEMM when these are the last saves of the innermost checkpointed region.
+#
+# The package is deterministic only: no entry point takes a ``deterministic``
+# argument (passing one raises ``TypeError``), and
+# ``torch.use_deterministic_algorithms(True)`` changes nothing here (every launch
+# reduces in a fixed order).  The non-deterministic counterpart is
+# ``flashinfer.experimental.cake.cake_moe_grouped_gemm``.
 
 from __future__ import annotations
 
@@ -66,10 +72,10 @@ def _bf16_rows(t: torch.Tensor) -> torch.Tensor:
     return t
 
 
-# Passed by ``cake_grouped_det_mm`` as the fifth argument of
+# Passed by ``cake_grouped_det_mm`` as the fourth argument of
 # ``CakeGroupedDetMm.apply``: ``forward`` then allocates ``Y`` without launching,
 # and the wrapper fills it after ``apply`` returns (after autograd saved the
-# inputs).
+# inputs).  ``forward`` accepts nothing else in that position.
 _DEFER_FWD = object()
 
 
@@ -90,9 +96,11 @@ class CakeGroupedDetMm(torch.autograd.Function):
     both reductions are bitwise deterministic and empty groups give exact
     zeros.  Through :func:`cake_grouped_det_mm` the forward GEMM runs after
     autograd saved ``x``, ``w`` and ``offs``, so a checkpoint's early stop can
-    skip it; a direct ``CakeGroupedDetMm.apply(x, w, offs, deterministic)``
-    launches inside ``forward`` and a checkpoint always recomputes it, as does
-    the wrapper under ``torch.jit.trace`` and ``torch.compile``.
+    skip it; a direct ``CakeGroupedDetMm.apply(x, w, offs)`` launches inside
+    ``forward`` and a checkpoint always recomputes it, as does the wrapper
+    under ``torch.jit.trace`` and ``torch.compile``.  ``apply`` takes no mode
+    argument: a fourth argument (such as a stale ``True`` / ``False``
+    numerical mode) raises ``TypeError``.
     """
 
     @staticmethod
@@ -101,9 +109,15 @@ class CakeGroupedDetMm(torch.autograd.Function):
         x: torch.Tensor,
         w: torch.Tensor,
         offs: torch.Tensor,
-        deterministic: bool,
         _launch=None,
     ):
+        if _launch is not None and _launch is not _DEFER_FWD:
+            raise TypeError(
+                "CakeGroupedDetMm.apply(x, w, offs) takes no fourth argument, got "
+                f"{_launch!r}: the deterministic package has no deterministic argument "
+                "(the non-deterministic autograd function is "
+                "flashinfer.experimental.cake.cake_moe_grouped_gemm.CakeGroupedMm)"
+            )
         num_groups = int(w.shape[0])
         y = torch.empty(x.shape[0], w.shape[1], dtype=torch.bfloat16, device=x.device)
         if _launch is not _DEFER_FWD:
@@ -137,7 +151,6 @@ def cake_grouped_det_mm(
     x: torch.Tensor,
     w: torch.Tensor,
     offs: torch.Tensor,
-    deterministic: bool = True,
 ) -> torch.Tensor:
     """Differentiable ragged grouped GEMM ``Y[offs[e-1]:offs[e]] = X[offs[e-1]:offs[e]] @ W[e].T``.
 
@@ -150,10 +163,6 @@ def cake_grouped_det_mm(
     offs : torch.Tensor
         int32 device tensor: ``[E]`` cumulative end offsets or ``m_indptr``
         ``[E + 1]``.  Read by the kernels, never on the host.
-    deterministic : bool
-        Reduction mode of the gradients.  The Cake programs always reduce in a
-        fixed order (no atomics); ``False`` is accepted for API compatibility
-        and currently runs the same deterministic programs.
 
     Returns
     -------
@@ -165,14 +174,24 @@ def cake_grouped_det_mm(
         under a non-reentrant checkpoint with early stop on, the recomputation
         skips it when these are the last saves of the innermost checkpointed
         region, as for a built-in op.
+
+    Notes
+    -----
+    Deterministic only: the forward and both gradients reduce in a fixed order
+    and are bitwise reproducible run to run.  There is no ``deterministic``
+    parameter (passing one raises ``TypeError``) and
+    ``torch.use_deterministic_algorithms(True)`` changes nothing (no alert, no
+    warning).  The non-deterministic wrapper is
+    ``flashinfer.experimental.cake.cake_moe_grouped_gemm.cake_grouped_mm(...,
+    deterministic=False)``.
     """
     if x.dtype != torch.bfloat16 or w.dtype != torch.bfloat16:
         raise ValueError(f"x and w must be bfloat16 (got {x.dtype} and {w.dtype})")
     if torch.jit.is_tracing() or torch.compiler.is_compiling():
         # A trace records ``apply`` only, and Dynamo cannot lift the deferred
         # launch out of a checkpointed region: keep the launch inside ``forward``.
-        return CakeGroupedDetMm.apply(x, w, offs, bool(deterministic))
+        return CakeGroupedDetMm.apply(x, w, offs)
     # ``apply`` saves x, w and offs; a checkpoint recomputation may stop inside it.
-    y = CakeGroupedDetMm.apply(x, w, offs, bool(deterministic), _DEFER_FWD)
+    y = CakeGroupedDetMm.apply(x, w, offs, _DEFER_FWD)
     _fill_fwd(x, w, offs, y)
     return y

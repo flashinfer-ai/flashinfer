@@ -408,7 +408,7 @@ def cake_grouped_mm(
             )
         from ..cake_moe_grouped_det_gemm.cake_autograd import cake_grouped_det_mm
 
-        return cake_grouped_det_mm(x, w, offs, deterministic=True)
+        return cake_grouped_det_mm(x, w, offs)
     from .cake_moe_grouped_gemm.cake_autograd import cake_grouped_mm as _impl
 
     return _impl(

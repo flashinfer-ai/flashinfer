@@ -38,7 +38,7 @@ gate_up, ``silu(a) * b`` on its two halves, down, with the gradients of ``x``,
 skipped.  The rate of the ``step`` rows counts the four GEMMs every arm runs;
 that of the other autograd rows the useful work only (forward, data and
 weight gradient of each GEMM).  Opt-in arm ``cake_inforward``: ``cake``
-through a direct ``CakeGroupedDetMm.apply(x, w, offs, True)``, whose forward
+through a direct ``CakeGroupedDetMm.apply(x, w, offs)``, whose forward
 GEMM launches inside ``forward`` so that a checkpoint always recomputes it
 (autograd rows only; when it runs with ``cake``, the JSON records the elements
 in which their outputs and gradients differ -- none).  ``--census`` adds the
@@ -285,7 +285,7 @@ def cake_inforward_arm(row, t):
     op = row["op"]
     if op not in AUTOGRAD_OPS:
         raise NotImplementedError("the in-forward control has autograd rows only")
-    fn = _autograd(lambda x, w, offs: CakeGroupedDetMm.apply(x, w, offs, True), row, t)
+    fn = _autograd(lambda x, w, offs: CakeGroupedDetMm.apply(x, w, offs), row, t)
     return fn, f"{AUTOGRAD_NOTES[op]} (direct CakeGroupedDetMm.apply)"
 
 

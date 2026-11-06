@@ -115,7 +115,6 @@ def cake_grouped_det_mm(
     x: torch.Tensor,
     w: torch.Tensor,
     offs: torch.Tensor,
-    deterministic: bool = True,
 ) -> torch.Tensor:
     """Differentiable ragged grouped GEMM ``Y[offs[e-1]:offs[e]] = X[offs[e-1]:offs[e]] @ W[e].T``.
 
@@ -128,10 +127,6 @@ def cake_grouped_det_mm(
     offs : torch.Tensor
         int32 device tensor: ``[E]`` cumulative end offsets or ``m_indptr``
         ``[E + 1]``.  Read by the kernels, never on the host.
-    deterministic : bool
-        Reduction mode of the gradients.  The Cake programs always reduce in a
-        fixed order (no atomics); ``False`` is accepted for API compatibility
-        and currently runs the same deterministic programs.
 
     Returns
     -------
@@ -143,9 +138,19 @@ def cake_grouped_det_mm(
         under a non-reentrant checkpoint with early stop on, the recomputation
         skips it when these are the last saves of the innermost checkpointed
         region, as for a built-in op.
+
+    Notes
+    -----
+    Deterministic only: the forward and both gradients reduce in a fixed order
+    and are bitwise reproducible run to run.  There is no ``deterministic``
+    parameter (passing one raises ``TypeError``) and
+    ``torch.use_deterministic_algorithms(True)`` changes nothing (no alert, no
+    warning).  The non-deterministic wrapper is
+    ``flashinfer.experimental.cake.cake_moe_grouped_gemm.cake_grouped_mm(...,
+    deterministic=False)``.
     """
     from ..experimental.cake_moe_grouped_det_gemm.cake_autograd import (
         cake_grouped_det_mm as _impl,
     )
 
-    return _impl(x, w, offs, deterministic=deterministic)
+    return _impl(x, w, offs)
