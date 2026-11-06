@@ -38,8 +38,10 @@ import torch
 import flashinfer
 import flashinfer.cake_gqa_nondet_train as public
 from tests.test_helpers.cake_mode_names import (
-    assert_cake_mode_module,
     assert_mode_names,
+    assert_no_deterministic_keyword,
+    assert_old_names_fail,
+    assert_same_object_same_name,
 )
 
 pytestmark = pytest.mark.cpu_only
@@ -52,6 +54,8 @@ ENTRIES = (
     "cake_gqa_nondet_train_workspace",
     "cake_gqa_nondet_train_workspace_bytes",
 )
+# The ``typing.Callable`` alias the facade re-exports: a type, not an entry point.
+TYPE_ALIASES = ("CakeGQANondetDkvAccSource",)
 # Backend classes and types the facade re-exports (resolved on first access).
 REEXPORTED = (
     "CakeGQANondetDkvAccSource",
@@ -164,10 +168,15 @@ def test_facade_all_is_the_entries_and_reexports():
 
 
 def test_the_shared_mode_rules_hold():
-    """The #8928 rules shared by every family (``assert_cake_mode_module``): the facade's public names carry
-    ``nondet`` after the op, no entry point takes ``deterministic``, ``flashinfer``, the backend package and
+    """The #8928 rules shared by every family (``tests.test_helpers.cake_mode_names``): the facade's public names
+    carry ``nondet`` after the op, no entry point takes ``deterministic``, ``flashinfer``, the backend package and
     ``cake_backend`` bind each facade object and each backend object a facade entry calls only under the facade's
-    name, and the former module paths and names fail at import in a fresh interpreter."""
+    name, and the former module paths and names fail at import in a fresh interpreter.
+
+    These are the checks of ``assert_cake_mode_module``, called one by one so that the keyword check leaves out
+    ``CakeGQANondetDkvAccSource``: a ``typing.Callable`` alias has typing's ``(*args, **kwargs)`` signature, but it
+    is a type, not an entry point (calling it raises ``TypeError``).  ``test_no_entry_takes_a_mode_keyword`` covers
+    the entry points by their own signatures."""
     package, backend = _backend(), _backend("cake_backend")
     old_names = [("flashinfer", "gqa_train")]
     old_names += [
@@ -178,14 +187,20 @@ def test_the_shared_mode_rules_hold():
         for module in (package, backend)
         for name in REMOVED_NAMES
     ]
-    assert_cake_mode_module(
+    assert_mode_names(public)
+    assert_no_deterministic_keyword(
+        [getattr(public, name) for name in public.__all__ if name not in TYPE_ALIASES]
+    )
+    assert_same_object_same_name(
         public,
-        namespaces=(flashinfer, package, backend),
+        (flashinfer, package, backend),
         forwards=[
             (name, getattr(backend, name)) for name in FORWARDED if name in ENTRIES
         ],
-        old_modules=REMOVED_MODULES + ("flashinfer.experimental.cake_gqa_train",),
-        old_names=old_names,
+    )
+    assert_old_names_fail(
+        REMOVED_MODULES + ("flashinfer.experimental.cake_gqa_train",),
+        old_names,
         cwd=Path(__file__).resolve().parents[2],
     )
 
