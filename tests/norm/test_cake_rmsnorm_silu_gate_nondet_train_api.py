@@ -995,7 +995,7 @@ def test_autograd_and_checkpoint_match_the_deterministic_package(
     y.backward(dy)
     check(y, xa.grad, za.grad, wa.grad, "autograd")
     xf, zf, wf = (t.clone().requires_grad_(True) for t in (x, z, w))
-    yf = CakeRMSNormSiLUGateNondetFunction.apply(xf, zf, wf, EPS, False)
+    yf = CakeRMSNormSiLUGateNondetFunction.apply(xf, zf, wf, EPS)
     yf.backward(dy)
     check(yf, xf.grad, zf.grad, wf.grad, "autograd function")
     xc, zc, wc = (t.clone().requires_grad_(True) for t in (x, z, w))
