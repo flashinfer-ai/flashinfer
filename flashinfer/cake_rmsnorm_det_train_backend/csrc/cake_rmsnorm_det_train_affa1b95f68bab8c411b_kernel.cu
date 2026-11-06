@@ -72,7 +72,7 @@ kernel_cake_rmsnorm_det_train_affa1b95f68bab8c411b(float* __restrict__ partial, 
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* red_fold = reinterpret_cast<float*>(smem_raw + 0);
     const int red_fold_addr = smem + 0;
 

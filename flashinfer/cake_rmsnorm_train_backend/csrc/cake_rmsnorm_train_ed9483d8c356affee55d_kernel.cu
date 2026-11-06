@@ -47,10 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define THREADS 64
-#define LAUNCH_BOUNDS_THREADS 64
-
 #include <math_constants.h>
 
 
@@ -68,7 +64,7 @@ __device__ __forceinline__ float2 cake_bf16x2_to_f32x2(__nv_bfloat162 v) {
 
 extern "C" {
 
-__global__ __launch_bounds__(LAUNCH_BOUNDS_THREADS) void
+__global__ __launch_bounds__(64) void
 kernel_cake_rmsnorm_train_ed9483d8c356affee55d(__nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ u, __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ y, __nv_bfloat16* __restrict__ h_new, float* __restrict__ r, int T, float eps, long long x_stride_p0, long long u_stride_p0)
 {
     const int tid = threadIdx.x;

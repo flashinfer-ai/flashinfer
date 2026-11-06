@@ -7024,6 +7024,90 @@ MODULES: dict[str, dict[str, Any]] = {
         "stage": "bwd_prep",
         "variant": "g8_replay_l2n",
     },
+    # The saved-rstd twin of bwd_prep_g8_replay_l2n (glm_bwd_prep v11_g8, FlashInfer #7817): the same plan, run
+    # in its place by the KCP backward's launch that reads the saved rstd (read_rstd = 1) on the twin's
+    # architectures; its rule ``saved_rstd_twin`` admits no problem, so no plan selects it.
+    "bwd_prep_g8_replay_saved_l2n": {
+        "arches": ["sm_100a", "sm_103a"],
+        "arg_plan": [
+            ["buffer", "g"],
+            ["buffer", "beta"],
+            ["buffer", "do"],
+            ["buffer", "chunk_bos"],
+            ["buffer", "chunk_len"],
+            ["buffer", "gk_out"],
+            ["buffer", "kb_out"],
+            ["buffer", "qg_out"],
+            ["buffer", "kg_out"],
+            ["buffer", "do_int"],
+            ["buffer", "beta_int"],
+            ["buffer", "v_new"],
+            ["buffer", "dv2"],
+            ["parameter", "num_qk_heads"],
+            ["parameter", "num_heads"],
+            ["parameter", "group"],
+            ["buffer", "q_raw"],
+            ["buffer", "k_raw"],
+            ["buffer", "qn"],
+            ["buffer", "kn"],
+            ["buffer", "qk_rstd"],
+            ["parameter", "num_tokens"],
+            ["parameter", "q_raw_row_stride"],
+            ["parameter", "q_raw_head_stride"],
+            ["parameter", "k_raw_row_stride"],
+            ["parameter", "k_raw_head_stride"],
+            ["parameter", "read_rstd"],
+            ["parameter", "write_rstd"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {"kind": "chunks", "x_factor": 1},
+        "kernel_symbol": "kernel_cake_kda_det_train_50721aa4cea4ff2fe68f",
+        "l2n": ["fused"],
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 53248,
+            "use_pdl": False,
+        },
+        "library": "cake_kda_det_train_50721aa4cea4ff2fe68f",
+        "logical": {
+            "beta": "beta",
+            "beta_int": "beta_int",
+            "chunk_bos": "chunk_bos",
+            "chunk_len": "chunk_len",
+            "do": "dout",
+            "do_int": "do_int",
+            "dv2": "dv2",
+            "g": "g",
+            "gk_out": "gk",
+            "group": "group",
+            "k_raw": "k_raw",
+            "k_raw_head_stride": "k_raw_head_stride",
+            "k_raw_row_stride": "k_raw_row_stride",
+            "kb_out": "kb",
+            "kg_out": "kg",
+            "kn": "kn",
+            "num_heads": "num_heads",
+            "num_qk_heads": "num_heads",
+            "num_tokens": "num_tokens",
+            "q_raw": "q_raw",
+            "q_raw_head_stride": "q_raw_head_stride",
+            "q_raw_row_stride": "q_raw_row_stride",
+            "qg_out": "qg",
+            "qk_rstd": "qk_rstd",
+            "qn": "qn",
+            "read_rstd": "read_rstd",
+            "v_new": "v_new",
+            "write_rstd": "write_rstd",
+        },
+        "select_rule": {"kind": "saved_rstd_twin"},
+        "stage": "bwd_prep",
+        "variant": "g8_replay_saved_l2n",
+    },
     "bwd_prep_g8_noqg_l2n": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
@@ -7282,7 +7366,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "chunks", "x_factor": 1},
-        "kernel_symbol": "kernel_cake_kda_det_train_328afe43951979e798d1",
+        "kernel_symbol": "kernel_cake_kda_det_train_ad4c93dbb0435933c8a1",
         "l2n": ["fused"],
         "launch": {
             "block": (288, 1, 1),
@@ -7291,7 +7375,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 115200,
             "use_pdl": False,
         },
-        "library": "cake_kda_det_train_328afe43951979e798d1",
+        "library": "cake_kda_det_train_ad4c93dbb0435933c8a1",
         "logical": {
             "beta": "beta_int",
             "chunk_bos": "chunk_bos",
@@ -7324,9 +7408,106 @@ MODULES: dict[str, dict[str, Any]] = {
             "q_raw_row_stride": "q_raw_row_stride",
             "qk_rstd": "qk_rstd",
         },
-        "select_rule": {"kind": "always"},
+        "select_rule": {
+            "kind": "all_of",
+            "rules": [
+                {"kind": "always"},
+                {"arches": ["sm_100a", "sm_107a"], "kind": "arch_in"},
+            ],
+        },
         "stage": "glm_intra",
         "variant": "l2n",
+    },
+    "glm_intra_v30_l2n": {
+        "arches": ["sm_103a"],
+        "arg_plan": [
+            ["buffer", "dAqk"],
+            ["buffer", "dAkk"],
+            ["buffer", "gk"],
+            ["buffer", "k_e"],
+            ["buffer", "q_e"],
+            ["buffer", "dq_f_t"],
+            ["buffer", "dk_f_t"],
+            ["buffer", "dg_f_t"],
+            ["buffer", "beta"],
+            ["buffer", "dq_f"],
+            ["buffer", "dk_f"],
+            ["buffer", "dg_f"],
+            ["buffer", "db_f"],
+            ["buffer", "chunk_bos"],
+            ["buffer", "chunk_len"],
+            ["buffer", "q_raw"],
+            ["buffer", "k_raw"],
+            ["buffer", "qk_rstd"],
+            ["buffer", "dq_ext"],
+            ["buffer", "dk_ext"],
+            ["buffer", "dg_ext"],
+            ["buffer", "dbeta_ext"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_qk_heads"],
+            ["parameter", "group"],
+            ["parameter", "num_tokens"],
+            ["parameter", "q_raw_row_stride"],
+            ["parameter", "q_raw_head_stride"],
+            ["parameter", "k_raw_row_stride"],
+            ["parameter", "k_raw_head_stride"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {"kind": "chunks", "x_factor": 1},
+        "kernel_symbol": "kernel_cake_kda_det_train_a135a53a639f33f921ab",
+        "l2n": ["fused"],
+        "launch": {
+            "block": (288, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 115200,
+            "use_pdl": False,
+        },
+        "library": "cake_kda_det_train_a135a53a639f33f921ab",
+        "logical": {
+            "beta": "beta_int",
+            "chunk_bos": "chunk_bos",
+            "chunk_len": "chunk_len",
+            "dAkk": "dAkk",
+            "dAqk": "dAqk",
+            "db_f": "db_f",
+            "dbeta_ext": "dbeta",
+            "dg_ext": "dg",
+            "dg_f": "dg_f",
+            "dg_f_t": "dg_f",
+            "dk_ext": "dk",
+            "dk_f": "dk_f",
+            "dk_f_t": "dk_f",
+            "dq_ext": "dq",
+            "dq_f": "dq_f",
+            "dq_f_t": "dq_f",
+            "gk": "gk",
+            "group": "group",
+            "k_e": "k",
+            "k_raw": "k_raw",
+            "k_raw_head_stride": "k_raw_head_stride",
+            "k_raw_row_stride": "k_raw_row_stride",
+            "num_heads": "num_heads",
+            "num_qk_heads": "num_heads",
+            "num_tokens": "num_tokens",
+            "q_e": "q",
+            "q_raw": "q_raw",
+            "q_raw_head_stride": "q_raw_head_stride",
+            "q_raw_row_stride": "q_raw_row_stride",
+            "qk_rstd": "qk_rstd",
+        },
+        "select_rule": {
+            "kind": "all_of",
+            "rules": [
+                {"kind": "always"},
+                {"arches": ["sm_103a"], "kind": "arch_in"},
+            ],
+        },
+        "stage": "glm_intra",
+        "variant": "v30_l2n",
     },
     "fwd_intra_raw_l2n": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
@@ -8467,6 +8648,9 @@ def _admits(
         return path in rule["paths"]
     if kind == "l2n_in":
         return l2n in rule["modes"]
+    if kind == "saved_rstd_twin":
+        # a saved-rstd twin: launched by name in place of its record, never selected
+        return False
     raise ValueError(f"unknown Cake KDA training selection rule: {kind!r}")
 
 
@@ -8622,6 +8806,8 @@ def select_record(
     of the mode is refused (the architecture's records do not serve it).  The
     ``l2n_in`` rule reads the mode (``modes``): a record serving several modes
     (a plain record the l2n route keeps on some paths) narrows its rule there.
+    ``saved_rstd_twin`` admits no problem: the record is the saved-rstd twin a
+    launch names in place of another record, never a plan's selection.
 
     ``ctas = num_chunks_pad * num_heads`` is the chunk-shaped CTA count the
     preparation stages switch on (``ctas_at_least`` / ``ctas_below`` /
@@ -8896,6 +9082,49 @@ def _argument_plan(name: str) -> tuple[tuple[str | None, int], ...]:
     return tuple(plan)
 
 
+@functools.cache
+def _ffi_entry(name: str, device_index: int) -> Any:
+    """The FFI entry of record ``name`` loaded for CUDA device
+    ``device_index``'s architecture (:func:`load`), looked up once."""
+    module = load(name, device_arch(device_index))
+    return getattr(module, MODULES[name]["ffi_entry"])
+
+
+@functools.cache
+def _raw_stream_getter() -> Any:
+    """``torch._C._cuda_getCurrentRawStream``: the handle of a device's
+    current torch stream as an integer, without constructing a ``Stream``
+    object; or the ``torch.cuda`` form on a torch build without it."""
+    import torch
+
+    getter = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+    if getter is not None:
+        return getter
+
+    def fallback(device_index: int) -> int:
+        return torch.cuda.current_stream(device_index).cuda_stream
+
+    return fallback
+
+
+_FFI_DEVICES: dict[int, Any] = {}
+
+
+def _stream_context() -> Any:
+    """The tvm-ffi environment-stream context of torch's current stream on
+    the current CUDA device (a CUDA graph's capture stream during capture),
+    the stream ``tvm_ffi.use_torch_stream()`` enters, without building a
+    ``torch.cuda.Stream`` and parsing a device string on every launch (the
+    FFI device is kept per index)."""
+    import torch
+
+    index = torch.cuda.current_device()
+    device = _FFI_DEVICES.get(index)
+    if device is None:
+        device = _FFI_DEVICES[index] = tvm_ffi.device(f"cuda:{index}")
+    return tvm_ffi.use_raw_stream(device, _raw_stream_getter()(index))
+
+
 def run_module(
     name: str,
     values: dict[str, Any],
@@ -8910,7 +9139,6 @@ def run_module(
     vocabulary and ``grid`` is the plan's launch grid (:func:`launch_grid`).
     The kernel runs on the current torch stream of the device.
     """
-    record = MODULES[name]
     args = []
     for logical_name, axis in _argument_plan(name):
         if logical_name is None:
@@ -8922,9 +9150,9 @@ def run_module(
                 raise ValueError(
                     f"record {name} needs logical argument {logical_name!r}"
                 ) from None
-    module = load(name, device_arch(device_index))
-    with tvm_ffi.use_torch_stream():
-        getattr(module, record["ffi_entry"])(*args)
+    entry = _ffi_entry(name, device_index)
+    with _stream_context():
+        entry(*args)
 
 
 __all__ = [

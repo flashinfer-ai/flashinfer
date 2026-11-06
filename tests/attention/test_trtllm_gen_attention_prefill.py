@@ -2103,3 +2103,396 @@ def test_trtllm_batch_prefill_nvfp4_kv_matches_reference(
             out_half.flatten(1), ref_half.flatten(1), dim=-1
         )
         assert cos.min() > 0.995, f"min per-token cosine {cos.min():.4f}"
+
+
+def _tiny_kv_context_inputs(
+    batch_size=8, case="uniform", tensor_scales=False, max_kv_len=2
+):
+    """Fixed represented inputs; never infer Q lengths from a random prefix."""
+    from flashinfer.utils import get_trtllm_gen_multi_ctas_kv_counter_bytes
+
+    q_lengths = [2] * batch_size
+    kv_lengths = [max_kv_len] * batch_size
+    if case == "ragged_q":
+        q_lengths = [1 + b % 2 for b in range(batch_size)]
+    elif case == "q1":
+        q_lengths = [1] * batch_size
+    elif case == "q3":
+        q_lengths = kv_lengths = [3] * batch_size
+    elif case == "kv33":
+        kv_lengths = [33] * batch_size
+    elif case == "shortkv":
+        kv_lengths = [1 + b % 2 for b in range(batch_size)]
+
+    qptr = [0]
+    kvptr = [0]
+    for q_length, kv_length in zip(q_lengths, kv_lengths, strict=True):
+        qptr.append(qptr[-1] + q_length)
+        kvptr.append(kvptr[-1] + kv_length)
+    generator = torch.Generator().manual_seed(7965 + batch_size)
+    q_values = torch.randn(qptr[-1], 16, 128, generator=generator).to(torch.bfloat16)
+    query = q_values.to(GPU_DEVICE)
+    if case == "noncontiguous_q":
+        storage = torch.empty(
+            qptr[-1] * 2, 16, 128, device=GPU_DEVICE, dtype=torch.bfloat16
+        )
+        query = storage[::2]
+        query.copy_(q_values)
+        assert not query.is_contiguous() and query.stride(-1) == 1
+    kv_values = torch.randn(batch_size, 2, 1, 128, 128, generator=generator).to(
+        torch.bfloat16
+    )
+    kv_cache = kv_values.to(GPU_DEVICE)
+    if case == "padded_kv":
+        storage = torch.empty(
+            batch_size, 2, 1, 256, 128, device=GPU_DEVICE, dtype=torch.bfloat16
+        )
+        kv_cache = storage[:, :, :, :128, :]
+        kv_cache.copy_(kv_values)
+        assert kv_cache.stride(0) != 32768 and kv_cache.stride(-1) == 1
+
+    def integer(values):
+        return torch.tensor(values, dtype=torch.int32, device=GPU_DEVICE)
+
+    # The reference uses these explicit page IDs, independent of kernel offsets.
+    page_ids = list(reversed(range(batch_size)))
+    block_tables = integer(page_ids).view(batch_size, 1)
+    if case == "page_table_padding":
+        block_tables = torch.cat([block_tables, block_tables], dim=1)
+    elif case == "separate_indices":
+        block_tables = block_tables[:, None, :].repeat(1, 2, 1)
+    counter_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
+        batch_size,
+        16,
+        torch.cuda.get_device_properties(GPU_DEVICE).multi_processor_count,
+    )
+    kwargs = dict(
+        query=query,
+        kv_cache=kv_cache,
+        workspace_buffer=torch.empty(128 << 20, dtype=torch.uint8, device=GPU_DEVICE),
+        block_tables=block_tables,
+        seq_lens=integer(kv_lengths),
+        max_q_len=max(q_lengths),
+        max_kv_len=max(kv_lengths),
+        bmm1_scale=1.75 / math.sqrt(128),
+        bmm2_scale=0.625,
+        batch_size=batch_size,
+        cum_seq_lens_q=integer(qptr),
+        cum_seq_lens_kv=integer(kvptr),
+        out=torch.full(query.shape, float("nan"), dtype=query.dtype, device=GPU_DEVICE),
+        out_dtype=query.dtype,
+        kv_layout="HND",
+        enable_pdl=True,
+        causal=case != "dense",
+        window_left=0 if case == "window" else -1,
+        multi_ctas_kv_counter_buffer=torch.zeros(
+            counter_bytes, dtype=torch.uint8, device=GPU_DEVICE
+        ),
+        backend="trtllm-gen",
+    )
+    if tensor_scales:
+        for name in ("bmm1_scale", "bmm2_scale"):
+            kwargs[name] = torch.tensor(
+                kwargs[name], dtype=torch.float32, device=GPU_DEVICE
+            )
+    if case in ("returned_lse", "returned_provided_lse"):
+        kwargs["return_lse"] = True
+    if case in ("provided_lse", "returned_provided_lse"):
+        kwargs["lse"] = torch.full(
+            query.shape[:2], float("nan"), dtype=torch.float32, device=GPU_DEVICE
+        )
+    if case == "sink":
+        kwargs["sinks"] = torch.linspace(-1, 1, 16, device=GPU_DEVICE)
+    elif case == "variable_window":
+        kwargs["variable_window_token_starts"] = integer([0, 1] * batch_size)
+        kwargs["variable_window_token_ends"] = integer([0, 1] * batch_size)
+    elif case == "separate_indices":
+        kwargs["uses_shared_paged_kv_idx"] = False
+    return dict(
+        kwargs=kwargs,
+        q_lengths=q_lengths,
+        kv_lengths=kv_lengths,
+        qptr=qptr,
+        page_ids=page_ids,
+    )
+
+
+def _tiny_kv_context_reference(data):
+    """Independent FP64 attention on the actual represented Q/K/V values."""
+    kwargs = data["kwargs"]
+    q = kwargs["query"].double().cpu()
+    kv = kwargs["kv_cache"].double().cpu()
+    scale_qk, scale_v = float(kwargs["bmm1_scale"]), float(kwargs["bmm2_scale"])
+    outputs, logsumexp, valid_rows = [], [], []
+    for b, (q_length, kv_length) in enumerate(
+        zip(data["q_lengths"], data["kv_lengths"], strict=True)
+    ):
+        q0, q1 = data["qptr"][b : b + 2]
+        k = kv[data["page_ids"][b], 0, 0, :kv_length]
+        v = kv[data["page_ids"][b], 1, 0, :kv_length]
+        scores = torch.einsum("qhd,kd->hqk", q[q0:q1], k) * scale_qk
+        q_pos = torch.arange(q_length) + kv_length - q_length
+        k_pos = torch.arange(kv_length)
+        mask = torch.ones(q_length, kv_length, dtype=torch.bool)
+        if kwargs["causal"]:
+            mask &= k_pos[None, :] <= q_pos[:, None]
+        if kwargs["window_left"] >= 0:
+            mask &= k_pos[None, :] >= q_pos[:, None] - kwargs["window_left"]
+        if "variable_window_token_starts" in kwargs:
+            starts = kwargs["variable_window_token_starts"][q0:q1].cpu()
+            ends = kwargs["variable_window_token_ends"][q0:q1].cpu()
+            mask = (k_pos[None, :] >= starts[:, None]) & (
+                k_pos[None, :] <= ends[:, None]
+            )
+        scores.masked_fill_(~mask[None], float("-inf"))
+        if "sinks" in kwargs:
+            sink = kwargs["sinks"].double().cpu()[:, None, None].expand(-1, q_length, 1)
+            scores = torch.cat([scores, sink], dim=-1)
+        probabilities = scores.softmax(-1)[..., :kv_length]
+        outputs.append(torch.einsum("hqk,kd->qhd", probabilities, v) * scale_v)
+        # Native TRTLLM-Gen exposes the online-softmax statistic in base 2.
+        logsumexp.append(scores.logsumexp(-1).transpose(0, 1) * math.log2(math.e))
+        valid_rows.append(mask.any(-1))
+    return torch.cat(outputs), torch.cat(logsumexp), torch.cat(valid_rows)
+
+
+def _tiny_kv_context_call(data, api):
+    kwargs = data["kwargs"]
+    if api == "native":
+        return lambda: flashinfer.prefill.trtllm_batch_context_with_kv_cache(**kwargs)
+    batch_size = kwargs["batch_size"]
+    indptr = torch.arange(batch_size + 1, dtype=torch.int32, device=GPU_DEVICE)
+    indices = kwargs["block_tables"].flatten()
+    last_page_len = kwargs["seq_lens"].clone()
+    wrapper = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
+        kwargs["workspace_buffer"],
+        "HND",
+        backend="trtllm-gen",
+        use_cuda_graph=True,
+        qo_indptr_buf=kwargs["cum_seq_lens_q"].clone(),
+        paged_kv_indptr_buf=indptr.clone(),
+        paged_kv_indices_buf=indices.clone(),
+        paged_kv_last_page_len_buf=last_page_len.clone(),
+    )
+    wrapper.plan(
+        kwargs["cum_seq_lens_q"],
+        indptr,
+        indices,
+        last_page_len,
+        16,
+        1,
+        128,
+        128,
+        causal=True,
+        sm_scale=1.0,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+        o_data_type=torch.bfloat16,
+        block_tables=kwargs["block_tables"],
+        seq_lens=kwargs["seq_lens"],
+        max_token_per_sequence=kwargs["max_q_len"],
+        max_sequence_kv=kwargs["max_kv_len"],
+    )
+    return lambda: wrapper.run(
+        kwargs["query"],
+        kwargs["kv_cache"],
+        out=kwargs["out"],
+        q_scale=kwargs["bmm1_scale"],
+        k_scale=1.0,
+        v_scale=kwargs["bmm2_scale"],
+        enable_pdl=True,
+    )
+
+
+def _tiny_kv_assert_result(data, result, *, allow_fully_masked=False):
+    kwargs = data["kwargs"]
+    output, lse = result if isinstance(result, tuple) else (result, kwargs.get("lse"))
+    assert output is kwargs["out"]
+    reference, lse_reference, valid_rows = _tiny_kv_context_reference(data)
+    actual = output.float().cpu()
+    if allow_fully_masked:
+        # Preserve the existing native context convention: Q2/KV1 has an empty
+        # first causal row and returns NaNs. Never relax unmasked-row checks.
+        assert (~valid_rows).any()
+        assert torch.isnan(actual[~valid_rows]).all()
+        assert torch.isnan(reference[~valid_rows]).all()
+    else:
+        assert valid_rows.all()
+    assert actual[valid_rows].isfinite().all()
+    torch.testing.assert_close(
+        actual[valid_rows], reference[valid_rows].float(), atol=1e-2, rtol=1e-2
+    )
+    if lse is not None:
+        if "lse" in kwargs:
+            assert lse is kwargs["lse"]
+        torch.testing.assert_close(
+            lse.cpu(), lse_reference.float(), atol=1e-3, rtol=1e-3
+        )
+    return actual
+
+
+@pytest.mark.parametrize("api", ["native", "wrapper"])
+@pytest.mark.parametrize(
+    "batch_size,max_kv_len",
+    [
+        (4, 1),
+        (4, 32),
+        (7, 3),
+        (8, 2),
+        (16, 3),
+        (64, 2),
+        (64, 8),
+        (65, 32),
+        (128, 16),
+        (256, 1),
+        (256, 32),
+    ],
+)
+@pytest.mark.parametrize("tensor_scales", [False, True])
+def test_trtllm_tiny_kv_context_scales(api, batch_size, max_kv_len, tensor_scales):
+    _skip_if_not_blackwell()
+    data = _tiny_kv_context_inputs(
+        batch_size, tensor_scales=tensor_scales, max_kv_len=max_kv_len
+    )
+    data["kwargs"]["out"].fill_(1.25)
+    _tiny_kv_assert_result(
+        data,
+        _tiny_kv_context_call(data, api)(),
+        allow_fully_masked=max_kv_len == 1,
+    )
+
+
+@pytest.mark.parametrize("api", ["native", "wrapper"])
+@pytest.mark.parametrize("batch_size,max_kv_len", [(8, 2), (4, 1), (64, 8), (256, 32)])
+def test_trtllm_tiny_kv_context_graph_updates(api, batch_size, max_kv_len):
+    _skip_if_not_blackwell()
+    data = _tiny_kv_context_inputs(
+        batch_size, tensor_scales=True, max_kv_len=max_kv_len
+    )
+    kwargs = data["kwargs"]
+    run = _tiny_kv_context_call(data, api)
+    kwargs["out"].fill_(1.25)
+    before = _tiny_kv_assert_result(data, run(), allow_fully_masked=max_kv_len == 1)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        captured_output = run()
+    assert captured_output is kwargs["out"]
+    # Change storage contents, not pointers; both attention inputs and device
+    # scalar values must be consumed at replay, rather than frozen at capture.
+    kwargs["query"].mul_(-0.75)
+    kwargs["kv_cache"][:, 1].add_(0.375)
+    kwargs["bmm1_scale"].fill_(0.5 / math.sqrt(128))
+    kwargs["bmm2_scale"].fill_(1.25)
+    kwargs["out"].fill_(1.25)
+    graph.replay()
+    torch.cuda.synchronize()
+    after = _tiny_kv_assert_result(
+        data, captured_output, allow_fully_masked=max_kv_len == 1
+    )
+    # NaN rows must not make this input-mutation assertion pass by themselves.
+    visible_rows = after.isfinite().all(dim=(-2, -1))
+    assert not torch.allclose(
+        after[visible_rows], before[visible_rows], atol=1e-2, rtol=1e-2
+    )
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "ragged_q",
+        "returned_lse",
+        "provided_lse",
+        "returned_provided_lse",
+        "sink",
+        "dense",
+        "window",
+        "variable_window",
+        "noncontiguous_q",
+        "padded_kv",
+        "q1",
+        "q3",
+        "kv33",
+        "batch3",
+        "batch257",
+        "page_table_padding",
+        "separate_indices",
+    ],
+)
+def test_trtllm_tiny_kv_context_fallback_contracts(case):
+    _skip_if_not_blackwell()
+    batch_size = 3 if case == "batch3" else 257 if case == "batch257" else 8
+    data = _tiny_kv_context_inputs(batch_size, case=case)
+    _tiny_kv_assert_result(data, _tiny_kv_context_call(data, "native")())
+
+
+@pytest.mark.parametrize("api", ["native", "wrapper"])
+def test_trtllm_tiny_kv_context_shorter_kv_compatibility(api):
+    _skip_if_not_blackwell()
+    data = _tiny_kv_context_inputs(case="shortkv")
+    # A NaN poison would let a kernel that never writes fully masked rows pass.
+    data["kwargs"]["out"].fill_(1.25)
+    _tiny_kv_assert_result(
+        data, _tiny_kv_context_call(data, api)(), allow_fully_masked=True
+    )
+
+
+@pytest.mark.parametrize(
+    "batch_size,max_kv_len", [(8, 2), (4, 1), (4, 32), (64, 8), (256, 32)]
+)
+def test_trtllm_tiny_kv_context_graph_updates_kv_lengths(batch_size, max_kv_len):
+    _skip_if_not_blackwell()
+    data = _tiny_kv_context_inputs(batch_size, max_kv_len=max_kv_len)
+    kwargs = data["kwargs"]
+    run = _tiny_kv_context_call(data, "native")
+    kwargs["out"].fill_(1.25)
+    _tiny_kv_assert_result(data, run(), allow_fully_masked=max_kv_len == 1)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        captured_output = run()
+    assert captured_output is kwargs["out"]
+
+    # Keep the declared maximum fixed while replay changes actual lengths to
+    # empty, fully masked, interior, and maximum-length requests.
+    pattern = [0, 1, max(1, max_kv_len // 2), max_kv_len]
+    data["kv_lengths"] = [pattern[b % len(pattern)] for b in range(batch_size)]
+    kvptr = [0]
+    for length in data["kv_lengths"]:
+        kvptr.append(kvptr[-1] + length)
+    kwargs["seq_lens"].copy_(
+        torch.tensor(data["kv_lengths"], dtype=torch.int32, device=GPU_DEVICE)
+    )
+    kwargs["cum_seq_lens_kv"].copy_(
+        torch.tensor(kvptr, dtype=torch.int32, device=GPU_DEVICE)
+    )
+    kwargs["out"].fill_(1.25)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    actual = captured_output.float().cpu()
+    reference, _, valid_rows = _tiny_kv_context_reference(data)
+    for b, kv_length in enumerate(data["kv_lengths"]):
+        q0, q1 = data["qptr"][b : b + 2]
+        if kv_length == 0:
+            # Existing context semantics skip an empty request entirely.
+            torch.testing.assert_close(
+                actual[q0:q1], torch.full_like(actual[q0:q1], 1.25), atol=0, rtol=0
+            )
+        elif kv_length == 1:
+            assert torch.isnan(actual[q0]).all()
+            assert torch.isnan(reference[q0]).all()
+    assert actual[valid_rows].isfinite().all()
+    torch.testing.assert_close(
+        actual[valid_rows], reference[valid_rows].float(), atol=1e-2, rtol=1e-2
+    )

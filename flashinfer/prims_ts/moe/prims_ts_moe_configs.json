@@ -684,8 +684,8 @@
             ],
             "sf_layout_b": "linear",
             "mma_n,tile_n,epi_tile_n,tile_k,num_stages_a,num_stages_b,num_stages_smem_sfa,num_stages_smem_sfb,num_stages_tmem_sfa,num_stages_tmem_sfb,sf_layout_c,epilogue_regs,mma_regs,load_regs,load_sf_regs,copy_sf_regs,padding_regs,workid_regs,num_stages_tmem_acc,num_load_b_warps,num_load_sfb_warps,load_b_regs,load_sfb_regs": [
-                [64, 64, 64, 256, 4, 4, 4, 4, 4, 4, "8x4", 168, 48, 48, 48, 48, 48, 48, 2, 1, 1, 48, 48],
-                [64, 64, 64, 128, 7, 7, 7, 7, 7, 7, "8x4", 168, 48, 48, 48, 48, 48, 48, 2, 1, 1, 48, 48],
+                [64, 64, 64, 256, 4, 4, 4, 4, 4, 4, "8x4", 168, 48, 48, 48, 48, 48, 48, 2, 0, 1, 48, 48],
+                [64, 64, 64, 128, 7, 7, 7, 7, 7, 7, "8x4", 168, 48, 48, 48, 48, 48, 48, 2, 0, 1, 48, 48],
                 [128, 128, 32, 256, 3, 3, 3, 3, 3, 3, "128x4", 152, 48, 48, 48, 48, 48, 48, 2, 8, 4, 48, 48],
                 [128, 128, 32, 128, 3, 3, 3, 3, 3, 3, "128x4", 152, 48, 48, 48, 48, 48, 48, 2, 8, 4, 48, 48]
             ],

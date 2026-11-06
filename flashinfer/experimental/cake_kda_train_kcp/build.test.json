@@ -128,7 +128,7 @@
       "closure_sha256": "b960762a4fcc8de82d8fae43951c2c0d66571cde62482df5af8e11373a1215bf",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
-      "min_cuda": "12.8",
+      "min_cuda": "12.9",
       "name": "cake_kda_train_3808ea4d567b82ea21a4_kcp_sm_100a",
       "nvcc_flags": [
         "--use_fast_math"
@@ -254,7 +254,7 @@
       "closure_sha256": "30e676bb4a5364a574f8cf36e0f642fc2f84dcb14f06375d0c18511489fedfcb",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
-      "min_cuda": "12.8",
+      "min_cuda": "12.9",
       "name": "cake_kda_train_9cfe05bce78410f1304b_kcp_sm_100a",
       "nvcc_flags": [
         "--use_fast_math"

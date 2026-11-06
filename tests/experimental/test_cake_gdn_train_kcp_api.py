@@ -16,10 +16,10 @@ between it and the deterministic twin: the options validator (``cake_gdn_train_k
 signatures, the facade's contract names, the numerical mode (``deterministic`` on every entry: the package refuses
 everything but ``False`` and, every path being fixed-order, raises no alert under ``torch.use_deterministic_algorithms``; the
 facade routes ``True`` and torch's deterministic mode to the twin, warns once, refuses a non-bool and a saved set of
-the other route; no context, partition or options field holds the mode), the names (the twin's legacy aliases stay
-the twin's objects; this package copies none of them and no public name carries a mode), the package hygiene rules
-(no environment variable, no ``cake_kda_train`` import, standalone: no import of another FlashInfer package, its twin
-included, and no library name of the twin) and the host tables built on the CPU for the correctness rows'
+the other route; no context, partition or options field holds the mode), the names (this package and the facade copy
+none of the twin's pre-rename names and share no entry or type with it; no public name carries a mode), the package
+hygiene rules (no environment variable, no KDA package import, standalone: no import of another FlashInfer package,
+its twin included, and no library name of the twin) and the host tables built on the CPU for the correctness rows'
 partitions.  No kernel runs here: the compute entries run on the fake backend (the CPU emulation), directly or
 through ``KernelBackend`` with a stub launch glue (the architecture the kernel backend passes to the #7 walks).
 """
@@ -198,22 +198,21 @@ def test_enumerated_fields(field, values) -> None:
             make_options(**{field: bad})
 
 
-def test_reuse_recompute_tapes_defaults_to_auto_never_captured() -> None:
+def test_reuse_recompute_tapes_defaults_to_auto_in_both_graph_modes() -> None:
     """The checkpoint-aware light backward is a keyword-only switch -- ``"auto"`` (the shipped default: the tapes are
-    kept only when the node closes the checkpointed region), ``True`` (always) or ``False`` (the replay form); under
-    ``graph="replay"`` the default resolves to ``False`` -- part of the options key (so of the CUDA-graph key), typed,
-    and refused with ``graph="replay"`` (a captured graph bakes the arena addresses of its tapes; the kept tapes are
-    fresh tensors handed from the recompute forward to the backward)."""
+    kept only when the node closes the checkpointed region), ``True`` (always) or ``False`` (the replay form) -- part
+    of the options key (so of the CUDA-graph key) and typed; ``graph="replay"`` has the same default and accepts every
+    value (the kept tapes are then the workspace arena's own: ``cake_kcp._kept_stale``)."""
     assert "reuse_recompute_tapes" in opt.OPTION_NAMES
     # the shipped default is this one constant (and this line) -- every other test names the state it exercises
     assert opt.REUSE_RECOMPUTE_TAPES_DEFAULT == "auto"
     assert make_options().reuse_recompute_tapes == opt.REUSE_RECOMPUTE_TAPES_DEFAULT
-    # None = the shipped default; under graph="replay" (the one mode that excludes the kept tapes) it is False
+    # None = the shipped default, under graph="replay" too
     assert make_options(reuse_recompute_tapes=None).reuse_recompute_tapes == "auto"
-    assert make_options(graph="replay").reuse_recompute_tapes is False
+    assert make_options(graph="replay").reuse_recompute_tapes == "auto"
     both = make_options(reuse_recompute_tapes=None, graph="replay")
-    assert both.reuse_recompute_tapes is False
-    assert OptionsKcp(graph="replay").reuse_recompute_tapes is False
+    assert both.reuse_recompute_tapes == "auto"
+    assert OptionsKcp(graph="replay").reuse_recompute_tapes == "auto"
     assert make_options(graph="replay").key() != make_options().key()
     on = make_options(reuse_recompute_tapes=True)
     off = make_options(reuse_recompute_tapes=False)
@@ -223,10 +222,9 @@ def test_reuse_recompute_tapes_defaults_to_auto_never_captured() -> None:
     assert from_instance.reuse_recompute_tapes is True
     with pytest.raises(TypeError):
         make_options(reuse_recompute_tapes=1)
-    with pytest.raises(ValueError, match="graph"):
-        make_options(reuse_recompute_tapes=True, graph="replay")
-    with pytest.raises(ValueError, match="graph"):
-        make_options(reuse_recompute_tapes="auto", graph="replay")
+    for value in (True, False, "auto"):
+        o = make_options(reuse_recompute_tapes=value, graph="replay")
+        assert o.reuse_recompute_tapes == value and o.graph == "replay"
     # the other modes accept the switch (it has no effect there: documented as a no-op)
     for extra in (
         {"boundary_mode": "replay"},
@@ -248,7 +246,7 @@ def test_recompute_output_is_a_two_value_keyword_switch_defaulting_to_auto() -> 
     """``recompute_output`` -- whether the recompute of a checkpointed forward launches its dead output program -- is a
     keyword-only field of the options (so part of the CUDA-graph key), ``"auto"`` by default (the frame-proof skip),
     ``"always"`` the unconditional launch; anything else is refused.  It is independent of the kept-tape switch and
-    of the graph mode (a captured graph never skips, the option value stays ``"auto"``)."""
+    of the graph mode (under ``graph="replay"`` the recompute's decision is part of its CUDA-graph key)."""
     assert "recompute_output" in opt.OPTION_NAMES
     assert opt.RECOMPUTE_OUTPUTS == ("auto", "always")
     assert opt.RECOMPUTE_OUTPUT_DEFAULT == "auto"
@@ -334,6 +332,24 @@ def test_walk_pair_knob_defaults_to_auto() -> None:
     assert len(keys) == 3
     with pytest.raises(TypeError):
         make_options(walk_pair=1)  # a test knob, never a public option
+
+
+@pytest.mark.parametrize("knob", ("fused_o", "fused_o_tape"))
+def test_output_walk_knobs_default_to_the_shipped_walks(knob: str) -> None:
+    """``fused_o`` (the light forward's output walk) and ``fused_o_tape`` (the ``save_mode="full"`` forward's
+    tape-and-output walk) are private levers: 1 (shipped) or 0 (the split tape walk and #5), part of the options key
+    (a captured graph of one form never replays for the other), never public options."""
+    assert opt.TEST_KNOBS[knob] == (0, 1)
+    assert opt.TEST_KNOB_DEFAULTS[knob] == 1
+    assert make_options().knob(knob) == 1
+    assert make_options(test_knobs={knob: 0}).knob(knob) == 0
+    for bad in (2, -1, True, False, None, "1"):
+        with pytest.raises(ValueError):
+            make_options(test_knobs={knob: bad})
+    keys = {make_options(test_knobs={knob: v}).key() for v in (0, 1)}
+    assert len(keys) == 2
+    with pytest.raises(TypeError):
+        make_options(**{knob: 0})  # a test knob, never a public option
 
 
 @pytest.mark.parametrize(
@@ -647,141 +663,72 @@ def test_package_init_re_exports_the_route() -> None:
         assert n in pkg.__all__
 
 
-# The deterministic twin's pre-rename names: legacy facade name -> det canonical facade name, legacy package-only
-# name -> det canonical name, and the module-level aliases at the ends of the det package's modules.  None of them is
-# copied into this package; ``chunk_gdn_kcp`` is the one spelling both carry (a det legacy alias there, this package's
-# canonical entry here).
-LEGACY_FACADE_NAMES = {
-    "kcp_partition": "partition_det_kcp",
-    "build_kcp_context": "build_context_det_kcp",
-    "chunk_gdn_kcp": "chunk_gdn_det_kcp",
-    "chunk_gdn_kcp_fwd": "chunk_gdn_det_fwd_kcp",
-    "chunk_gdn_kcp_bwd": "chunk_gdn_det_bwd_kcp",
-    "gdn_kcp_workspace_bytes": "gdn_det_workspace_bytes_kcp",
-    "gdn_kcp_saved_bytes": "gdn_det_saved_bytes_kcp",
-    "gdn_kcp_comm_bytes": "gdn_det_comm_bytes_kcp",
-    "is_gdn_train_supported": "is_gdn_det_train_kcp_supported",
-    "KcpOptions": "OptionsDetKcp",
-    "KcpContext": "ContextDetKcp",
-    "KcpPartition": "PartitionDetKcp",
-    "KcpRecomputeHandle": "RecomputeHandleDetKcp",
-    "KcpSaved": "SavedDetKcp",
-    "KcpWorkspace": "WorkspaceDetKcp",
-}
-LEGACY_PACKAGE_NAMES = {
-    **{
-        k: v
-        for k, v in LEGACY_FACADE_NAMES.items()
-        if k not in ("is_gdn_train_supported",)
-    },
-    "ChunkGDNKcpFunction": "ChunkGDNDetFunctionKcp",
-    "KcpCall": "CallDetKcp",
-    "KcpFragment": "FragmentDetKcp",
-}
-LEGACY_MODULE_ALIASES = {
-    "cake_kcp": {
-        "ChunkGDNKcpFunction": "ChunkGDNDetFunctionKcp",
-        "KcpCall": "CallDetKcp",
-        "KcpOptions": "OptionsDetKcp",
-        "KcpRecomputeHandle": "RecomputeHandleDetKcp",
-        "KcpSaved": "SavedDetKcp",
-        "KcpWorkspace": "WorkspaceDetKcp",
-        "chunk_gdn_kcp": "chunk_gdn_det_kcp",
-        "chunk_gdn_kcp_bwd": "chunk_gdn_det_bwd_kcp",
-        "chunk_gdn_kcp_fwd": "chunk_gdn_det_fwd_kcp",
-        "gdn_kcp_comm_bytes": "gdn_det_comm_bytes_kcp",
-        "gdn_kcp_saved_bytes": "gdn_det_saved_bytes_kcp",
-        "gdn_kcp_workspace_bytes": "gdn_det_workspace_bytes_kcp",
-    },
-    "cake_kcp_plan": {
-        "KcpContext": "ContextDetKcp",
-        "KcpFragment": "FragmentDetKcp",
-        "KcpPartition": "PartitionDetKcp",
-        "build_kcp_context": "build_context_det_kcp",
-        "kcp_partition": "partition_det_kcp",
-    },
-    "cake_bytes": {
-        "gdn_kcp_comm_bytes": "gdn_det_comm_bytes_kcp",
-        "gdn_kcp_saved_bytes": "gdn_det_saved_bytes_kcp",
-        "gdn_kcp_workspace_bytes": "gdn_det_workspace_bytes_kcp",
-        "gdn_kcp_saved_layout": "gdn_det_saved_layout_kcp",
-        "gdn_kcp_workspace_layout": "gdn_det_workspace_layout_kcp",
-    },
-    "cake_options": {"KcpOptions": "OptionsDetKcp"},
-}
-SHARED_SPELLINGS = {
-    "chunk_gdn_kcp"
-}  # a det legacy alias and this package's canonical entry
+# The deterministic twin's pre-rename spellings (its former facade, package and module-level names).  This package
+# and the facade copy none of them.  ``chunk_gdn_kcp`` is not listed: it is this package's canonical entry.
+LEGACY_DET_SPELLINGS = frozenset(
+    {
+        "kcp_partition",
+        "build_kcp_context",
+        "chunk_gdn_kcp_fwd",
+        "chunk_gdn_kcp_bwd",
+        "gdn_kcp_workspace_bytes",
+        "gdn_kcp_saved_bytes",
+        "gdn_kcp_comm_bytes",
+        "gdn_kcp_saved_layout",
+        "gdn_kcp_workspace_layout",
+        "is_gdn_train_supported",
+        "ChunkGDNKcpFunction",
+        "KcpCall",
+        "KcpContext",
+        "KcpFragment",
+        "KcpOptions",
+        "KcpPartition",
+        "KcpRecomputeHandle",
+        "KcpSaved",
+        "KcpWorkspace",
+    }
+)
 SUBMODULES = (
+    "cake_backend",
+    "cake_build",
     "cake_bytes",
     "cake_fake_backend",
     "cake_jit",
     "cake_kcp",
     "cake_kcp_plan",
+    "cake_l2n",
     "cake_options",
     "cake_tables",
 )
 
 
-def _nondet_objects() -> list:
-    """Every public object of this package (its ``__all__``, every function / class its modules define) and of the
-    facade (its ``__all__`` and its entries)."""
-    pkg, facade = _mod(), importlib.import_module(FACADE)
-    objs = [getattr(pkg, n) for n in pkg.__all__]
-    objs += [getattr(facade, n) for n in facade.__all__]
-    for sub in SUBMODULES:
-        mod = _mod(sub)
-        objs += [
-            v
-            for v in vars(mod).values()
-            if callable(v) and str(getattr(v, "__module__", "")).startswith(PACKAGE)
-        ]
-    return objs
-
-
-def test_legacy_names_are_the_deterministic_objects_never_the_non_deterministic_ones() -> (
-    None
-):
-    """``flashinfer.gdn_train``, ``flashinfer.experimental.cake_gdn_train`` and the det package's module-level aliases
-    stay the deterministic twin's compatibility paths: every legacy name IS its det object and is NOT any object of
-    this package or of the ``flashinfer.cake_gdn_train_kcp`` facade (in particular ``chunk_gdn_kcp``, spelled by both)."""
-    det_facade = importlib.import_module(DET_FACADE)
-    det_pkg = importlib.import_module(DET_PACKAGE)
-    nondet = _nondet_objects()
-    assert len(nondet) > 50
-
-    def is_nondet(obj) -> bool:
-        return any(obj is o for o in nondet)
-
-    legacy = importlib.import_module("flashinfer.gdn_train")
-    for old, new in LEGACY_FACADE_NAMES.items():
-        obj = getattr(legacy, old)
-        assert obj is getattr(det_facade, new), old
-        assert not is_nondet(obj), old
-    legacy_pkg = importlib.import_module("flashinfer.experimental.cake_gdn_train")
-    for old, new in LEGACY_PACKAGE_NAMES.items():
-        obj = getattr(legacy_pkg, old)
-        assert obj is getattr(det_pkg, new), old
-        assert not is_nondet(obj), old
-    for sub, aliases in LEGACY_MODULE_ALIASES.items():
-        det_mod = importlib.import_module(f"{DET_PACKAGE}.{sub}")
-        for old, new in aliases.items():
-            obj = getattr(det_mod, old)
-            assert obj is getattr(det_mod, new), (sub, old)
-            assert not is_nondet(obj), (sub, old)
-    # the shared spelling: the det alias, never this package's entry or the facade's dispatcher
+def test_no_module_of_the_package_or_the_facade_binds_a_legacy_det_spelling() -> None:
+    """No pre-rename spelling of the twin was copied: the package, each of its modules and the facade neither bind
+    nor export any of them.  ``chunk_gdn_kcp`` is this package's own entry, defined in ``cake_kcp`` under that name."""
     facade = importlib.import_module(FACADE)
-    assert legacy.chunk_gdn_kcp is det_facade.chunk_gdn_det_kcp
-    assert legacy_pkg.chunk_gdn_kcp is det_pkg.chunk_gdn_det_kcp
+    pkg = _mod()
+    for module in [pkg, facade] + [_mod(sub) for sub in SUBMODULES]:
+        exported = set(getattr(module, "__all__", ()))
+        for name in sorted(LEGACY_DET_SPELLINGS):
+            assert not hasattr(module, name), (module.__name__, name)
+            assert name not in exported, (module.__name__, name)
+    entry = _mod("cake_kcp").chunk_gdn_kcp
+    assert pkg.chunk_gdn_kcp is entry
+    assert (
+        entry.__module__ == f"{PACKAGE}.cake_kcp" and entry.__name__ == "chunk_gdn_kcp"
+    )
+
+
+def test_the_package_shares_no_entry_or_type_with_the_twin() -> None:
+    """This package's entries (also through the facade) and types are never the twin's objects (the twin's det names)."""
+    det_pkg = importlib.import_module(DET_PACKAGE)
+    facade = importlib.import_module(FACADE)
     for nondet_entry in (
         _mod().chunk_gdn_kcp,
         _mod("cake_kcp").chunk_gdn_kcp,
         facade.chunk_gdn_kcp,
     ):
-        assert nondet_entry is not legacy.chunk_gdn_kcp
-        assert nondet_entry is not legacy_pkg.chunk_gdn_kcp
         assert nondet_entry is not det_pkg.chunk_gdn_det_kcp
-    # and this package's types are not the twin's
     for name in (
         "OptionsKcp",
         "ContextKcp",
@@ -791,32 +738,7 @@ def test_legacy_names_are_the_deterministic_objects_never_the_non_deterministic_
     ):
         assert getattr(_mod(), name) is not getattr(
             det_pkg, name.replace("Kcp", "DetKcp")
-        )
-
-
-def test_the_package_exports_no_legacy_alias_name() -> None:
-    """No pre-rename name of the twin was copied: the package, its modules and the facade bind none of them (except
-    ``chunk_gdn_kcp``, this package's canonical entry, defined in ``cake_kcp`` under its own name)."""
-    legacy_names = (
-        set(LEGACY_FACADE_NAMES)
-        | set(LEGACY_PACKAGE_NAMES)
-        | {n for aliases in LEGACY_MODULE_ALIASES.values() for n in aliases}
-    )
-    facade = importlib.import_module(FACADE)
-    pkg = _mod()
-    for name in sorted(legacy_names - SHARED_SPELLINGS):
-        assert not hasattr(pkg, name), name
-        assert name not in pkg.__all__, name
-        assert not hasattr(facade, name), name
-        for sub in SUBMODULES:
-            assert not hasattr(_mod(sub), name), (sub, name)
-    entry = _mod("cake_kcp").chunk_gdn_kcp
-    assert pkg.chunk_gdn_kcp is entry
-    assert (
-        entry.__module__ == f"{PACKAGE}.cake_kcp" and entry.__name__ == "chunk_gdn_kcp"
-    )
-    for module in [pkg] + [_mod(sub) for sub in SUBMODULES]:
-        assert not hasattr(module, "KcpContext"), module.__name__
+        ), name
 
 
 def test_no_public_name_of_the_package_or_the_facade_names_a_mode() -> None:
@@ -1177,6 +1099,69 @@ def test_facade_routes_by_mode(monkeypatch) -> None:
         facade.is_gdn_train_kcp_supported("cpu", deterministic=None)
 
 
+def test_facade_refuses_non_deterministic_only_save_modes_on_the_deterministic_route(
+    monkeypatch, torch_deterministic
+) -> None:
+    """``ND_ONLY_SAVE_MODES`` are the save_mode values of this package that the twin does not take; the
+    deterministic route (the default, ``deterministic=True``, and ``deterministic=False`` under torch's
+    deterministic algorithms) refuses each one before the twin is reached, on every compute entry and in the saved /
+    workspace byte queries, as a keyword, a knob, an options mapping or an options instance, with an error naming
+    ``deterministic=False``; the non-deterministic route passes it on unchanged."""
+    facade = importlib.import_module(FACADE)
+    det_opt = importlib.import_module(f"{DET_PACKAGE}.cake_options")
+    assert facade.ND_ONLY_SAVE_MODES == ("light_akk",)
+    assert set(facade.ND_ONLY_SAVE_MODES) == set(opt.SAVE_MODES) - set(
+        det_opt.SAVE_MODES
+    )
+    seen = _route_recorders(monkeypatch)
+    monkeypatch.setattr(facade, "_DET_FALLBACK_WARNED", True)
+    calls = _facade_calls(facade)
+    entries = (
+        "chunk_gdn_kcp",
+        "chunk_gdn_fwd_kcp",
+        "chunk_gdn_bwd_kcp",
+        "gdn_workspace_bytes_kcp",
+        "gdn_saved_bytes_kcp",
+    )
+    for mode in facade.ND_ONLY_SAVE_MODES:
+        forms = [
+            {"save_mode": mode},
+            {"options": {"save_mode": mode}},
+            {"options": OptionsKcp(save_mode=mode, use_qk_l2norm_in_kernel=True)},
+        ]
+        for deterministic_mode in (False, True):
+            torch.use_deterministic_algorithms(deterministic_mode)
+            routes = (
+                ({"deterministic": False},)
+                if deterministic_mode
+                else ({}, {"deterministic": True})
+            )
+            for entry in entries:
+                for form in forms:
+                    for kw in routes:
+                        seen.clear()
+                        with pytest.raises(
+                            ValueError,
+                            match=f"{entry}: save_mode='{mode}' .*needs deterministic=False",
+                        ):
+                            calls[entry](**form, **kw)
+                        assert seen == [], (entry, form, kw)
+        torch.use_deterministic_algorithms(False)
+        for entry in entries:
+            for form in forms:
+                seen.clear()
+                assert calls[entry](**form, deterministic=False) == f"nondet:{entry}"
+                sent = seen[-1][1]
+                got = sent.get("options") if "options" in form else sent
+                got = got if isinstance(got, dict) else dataclasses.asdict(got)
+                assert got["save_mode"] == mode, (entry, form, sent)
+    # the twin's own values pass on the deterministic route
+    for entry in entries:
+        for mode in det_opt.SAVE_MODES:
+            seen.clear()
+            assert calls[entry](save_mode=mode).startswith("det:"), (entry, mode)
+
+
 def test_facade_imports_each_route_once(monkeypatch) -> None:
     """The facade imports each routed module on first use only: later calls on either route run no import and reach
     the same module objects."""
@@ -1336,19 +1321,96 @@ def test_facade_under_torch_deterministic_mode_takes_the_twin_and_warns_once(
         calls["chunk_gdn_kcp"](deterministic=None)
 
 
+def test_facade_maps_the_replay_auto_tape_option_onto_the_deterministic_default(
+    monkeypatch, torch_deterministic
+) -> None:
+    """``OptionsKcp(graph="replay")`` (``reuse_recompute_tapes`` defaults to ``"auto"``) on the deterministic route --
+    the default ``deterministic=True``, and ``deterministic=False`` under ``torch.use_deterministic_algorithms(True)``
+    -- reaches the twin with ``reuse_recompute_tapes=None`` on every compute entry, which the twin's ``make_options``
+    resolves to its own default (``False`` under replay) and accepts; so does ``OptionsKcp()`` (``graph="off"``) with
+    ``graph="replay"`` as the call's keyword (``chunk_gdn_kcp``) or knob (the two explicit entries), which the twin
+    applies on top of the mapping; an explicit ``True`` passes on and the twin refuses it; under ``graph="off"`` the
+    ``None`` resolves to the twin's ``"auto"``; the non-deterministic route gets the instance."""
+    facade = importlib.import_module(FACADE)
+    det_opt = importlib.import_module(f"{DET_PACKAGE}.cake_options")
+    seen = _route_recorders(monkeypatch)
+    # no fallback warning in this test
+    monkeypatch.setattr(facade, "_DET_FALLBACK_WARNED", True)
+    t = torch.zeros(1)
+    calls = {
+        "chunk_gdn_kcp": lambda **m: facade.chunk_gdn_kcp(t, t, t, t, t, object(), **m),
+        "chunk_gdn_fwd_kcp": lambda **m: facade.chunk_gdn_fwd_kcp(
+            t, t, t, t, t, object(), **m
+        ),
+        "chunk_gdn_bwd_kcp": lambda **m: facade.chunk_gdn_bwd_kcp(
+            t, t, t, t, t, object(), t, **m
+        ),
+    }
+    replay = OptionsKcp(graph="replay")
+    assert replay.reuse_recompute_tapes == "auto"
+    explicit = OptionsKcp(graph="replay", reuse_recompute_tapes=True)
+    off = OptionsKcp(graph="off")
+    for deterministic_mode in (False, True):
+        torch.use_deterministic_algorithms(deterministic_mode)
+        routes = (
+            ({"deterministic": False},)
+            if deterministic_mode
+            else ({}, {"deterministic": True})
+        )
+        for entry, call in calls.items():
+            for kw in routes:
+                seen.clear()
+                assert call(options=replay, **kw).startswith("det:"), (entry, kw)
+                got = seen[-1][1]["options"]
+                assert isinstance(got, dict) and got["graph"] == "replay", (entry, got)
+                assert got["reuse_recompute_tapes"] is None, (entry, kw, got)
+                assert det_opt.make_options(got).reuse_recompute_tapes is False
+                call(options=explicit, **kw)
+                got = seen[-1][1]["options"]
+                assert got["reuse_recompute_tapes"] is True, (entry, got)
+                with pytest.raises(ValueError, match="needs graph='off'"):
+                    det_opt.make_options(got)
+                call(options=off, **kw)
+                got = seen[-1][1]["options"]
+                assert got["graph"] == "off", (entry, got)
+                assert got["reuse_recompute_tapes"] is None, (entry, got)
+                assert det_opt.make_options(got).reuse_recompute_tapes == "auto"
+                # the instance says graph="off", the call's keyword / knob says "replay"
+                seen.clear()
+                assert call(options=OptionsKcp(), graph="replay", **kw).startswith(
+                    "det:"
+                ), (entry, kw)
+                got, sent = seen[-1][1]["options"], seen[-1][1]
+                assert sent.get("graph") == "replay", (entry, kw, sent)
+                assert got["graph"] == "off", (entry, got)
+                assert got["reuse_recompute_tapes"] is None, (entry, kw, got)
+                assert (
+                    det_opt.make_options(got, graph="replay").reuse_recompute_tapes
+                    is False
+                ), (entry, kw)
+                call(
+                    options=OptionsKcp(reuse_recompute_tapes=True), graph="replay", **kw
+                )
+                got = seen[-1][1]["options"]
+                assert got["reuse_recompute_tapes"] is True, (entry, got)
+                with pytest.raises(ValueError, match="needs graph='off'"):
+                    det_opt.make_options(got, graph="replay")
+    torch.use_deterministic_algorithms(False)
+    for entry, call in calls.items():
+        assert call(options=replay, deterministic=False) == f"nondet:{entry}"
+        assert seen[-1][1]["options"] is replay
+
+
 def test_facade_default_route_returns_the_twins_objects() -> None:
     """Without the recorders: the facade's default route builds the twin's partition / context
     (``PartitionDetKcp`` / ``ContextDetKcp``), ``deterministic=False`` this package's; both describe the same plan
-    (partition tables, segment plan, the comm byte query, the saved byte query at the default options on this
-    ``P = 1`` pack, and at ``P = 2`` with either ``save_mode`` and ``save_transfer``: both count ``M_seg`` as ``P
-    n_frag s`` with ``save_transfer`` or ``save_mode="full"``).  The saved queries differ (until the twin adopts this
-    package's rule, pinned here) under ``boundary_mode="replay"`` with ``save_mode="full"``: this package keeps no
-    tape (a replay boundary saves nothing) where the twin counts the ten full-mode tapes.  The workspace query is
-    not compared: on a rank with crossing fragments this package's counts pools the twin's query leaves out (the
-    ``M_f^T`` tiles and the fused walks' carry slots at ``P > 1``, the larger b1 split form, the forward exchange
-    pools of a saved backward on a caller-held workspace), and its ``graph`` / ``save_for_backward`` /
-    ``fused_walks`` keywords are this package's only: through the facade they need ``deterministic=False`` (the
-    default route raises ``TypeError``)."""
+    (partition tables, segment plan, the comm byte query, the saved byte query at the default options, under the
+    replay boundary and at ``P = 2`` with either ``save_mode`` and ``save_transfer``) and the same workspace terms
+    for every keyword of the workspace query (``graph``, ``save_for_backward``, ``fused_walks``, ``P``) except the b1
+    pools, whose layouts differ: the twin's b1 send carries the re-sent maps of the fragments crossing in and out
+    (``n_io``), this package's maps are paired with the crossing-in slots.  Under ``graph="replay"`` only this
+    package's query takes ``reuse_recompute_tapes=True`` (the arena hand-off) and ``"auto"``; the twin's refuses
+    both, as its options do.  The default (``None``) gives the replay form's terms on both routes."""
     facade = importlib.import_module(FACADE)
     det_pkg = importlib.import_module(DET_PACKAGE)
     pkg = _mod()
@@ -1371,21 +1433,11 @@ def test_facade_default_route_returns_the_twins_objects() -> None:
             det_value = getattr(facade, query)(det_ctx, H_qk=2, HV=6)
             value = getattr(facade, query)(ctx, H_qk=2, HV=6, deterministic=False)
             assert det_value == value, (rank, query)
-        # the saved-query difference of today (the twin keeps its rule until it adopts this one)
-        full_tapes = sum(
-            v
-            for k, v in _mod("cake_bytes")
-            .gdn_saved_layout_kcp(ctx, H_qk=2, HV=6, save_mode="full")
-            .items()
-            if k not in ("S_in", "c1_recv", "M_seg", "hist")
-        )
-        assert full_tapes > 0
+        # a replay boundary saves nothing in either package (save_mode="full" included)
         replay_full = dict(H_qk=2, HV=6, save_mode="full", boundary_mode="replay")
-        assert (
-            facade.gdn_saved_bytes_kcp(det_ctx, **replay_full)
-            - facade.gdn_saved_bytes_kcp(ctx, **replay_full, deterministic=False)
-            == full_tapes
-        ), rank
+        assert facade.gdn_saved_bytes_kcp(
+            det_ctx, **replay_full
+        ) == facade.gdn_saved_bytes_kcp(ctx, **replay_full, deterministic=False), rank
         # the M_seg rule at P > 1 is shared (P n_frag s with save_transfer or save_mode="full")
         assert ctx.n_frag > 0
         for kw in (
@@ -1399,25 +1451,91 @@ def test_facade_default_route_returns_the_twins_objects() -> None:
                 ctx, H_qk=2, HV=6, P=2, deterministic=False, **kw
             )
             assert det_value == value, (rank, kw)
-        # this package's workspace keywords: the non-deterministic route only
+        # the workspace queries take the same keywords on both routes and count the same terms, except the b1 pools:
+        # the twin's dense b1 send carries the re-sent maps of the n_io fragments crossing in and out (its d_f plane +
+        # n_io map slots), this package's the maps paired with the n_in crossing-in slots
+        state = 6 * _mod("cake_bytes").STATE_TILE_BYTES
+        det_gb = importlib.import_module(DET_PACKAGE + ".cake_bytes")
+        b1_keys = ("bwd.b1_send", "bwd.b1_recv")
         for kw in (
+            {},
+            {"P": 2},
+            {"P": 2, "save_transfer": False},
             {"graph": "replay"},
             {"save_for_backward": False},
             {"fused_walks": 0, "P": 2, "backward": False},
         ):
+            det_lay = det_gb.gdn_det_workspace_layout_kcp(det_ctx, H_qk=2, HV=6, **kw)
+            lay = _mod("cake_bytes").gdn_workspace_layout_kcp(ctx, H_qk=2, HV=6, **kw)
+            assert set(det_lay) == set(lay), (rank, kw)
+            fwd_keys = [
+                k
+                for k in lay
+                if k.startswith("fwd.") or k in ("forward", "forward_split")
+            ]
+            assert {k: det_lay[k] for k in fwd_keys} == {k: lay[k] for k in fwd_keys}, (
+                rank,
+                kw,
+            )
+            assert facade.gdn_workspace_bytes_kcp(
+                det_ctx, H_qk=2, HV=6, **kw
+            ) == det_gb.gdn_det_workspace_bytes_kcp(det_ctx, H_qk=2, HV=6, **kw), (
+                rank,
+                kw,
+            )
             assert facade.gdn_workspace_bytes_kcp(
                 ctx, H_qk=2, HV=6, deterministic=False, **kw
             ) == pkg.gdn_workspace_bytes_kcp(ctx, H_qk=2, HV=6, **kw), (rank, kw)
-            with pytest.raises(TypeError, match=next(iter(kw))):
-                facade.gdn_workspace_bytes_kcp(det_ctx, H_qk=2, HV=6, **kw)
+            if kw.get("backward", True):
+                hp = det_ctx.heads(6)
+                n_io, N_io = hp.n_io_by_rank[rank], sum(hp.n_io_by_rank)
+                assert (
+                    lay["bwd.b1_send"] - det_lay["bwd.b1_send"]
+                    == (det_ctx.n_in - n_io) * state
+                ), (rank, kw)
+                # an owner receives the b1 of every crossing-in fragment of the group (and the maps of the N_io
+                # fragments on the twin's side, of the N_in crossing-in slots on this package's)
+                s_owner = hp.Hg_r * _mod("cake_bytes").STATE_TILE_BYTES
+                assert (
+                    lay["bwd.b1_recv"] - det_lay["bwd.b1_recv"]
+                    == (det_ctx.N_in - N_io) * s_owner
+                ), (rank, kw)
+                # the .phase. keys are moment sums, some of which hold the b1 pools: they carry the b1 deltas above,
+                # so they are left out of this term-by-term comparison
+                rest = {
+                    k: v
+                    for k, v in lay.items()
+                    if k.startswith("bwd.") and k not in b1_keys and ".phase." not in k
+                }
+                assert rest == {k: det_lay[k] for k in rest}, (rank, kw)
+        # reuse_recompute_tapes=True (the arena hand-off) and "auto" under graph="replay": this package's query takes
+        # them, the twin's refuses both, as its options do
+        for reuse in (True, "auto"):
+            graph_kw = dict(H_qk=2, HV=6, graph="replay", reuse_recompute_tapes=reuse)
+            assert facade.gdn_workspace_bytes_kcp(
+                ctx, **graph_kw, deterministic=False
+            ) == pkg.gdn_workspace_bytes_kcp(ctx, **graph_kw), (rank, reuse)
+            with pytest.raises(ValueError, match="needs graph='off'"):
+                facade.gdn_workspace_bytes_kcp(det_ctx, **graph_kw)
+        # save_for_backward (a forward without a backward): both routes, each to its own query
+        no_saved_set = dict(H_qk=2, HV=6, save_for_backward=False, backward=False)
+        assert facade.gdn_workspace_bytes_kcp(
+            det_ctx, **no_saved_set
+        ) == det_gb.gdn_det_workspace_bytes_kcp(det_ctx, **no_saved_set), rank
+        assert facade.gdn_workspace_bytes_kcp(
+            ctx, **no_saved_set, deterministic=False
+        ) == pkg.gdn_workspace_bytes_kcp(ctx, **no_saved_set), rank
         # the facade passes fused_walks=0 on: at P = 2 its forward has no carry slots for the crossing fragments
         assert max(ctx.n_in, ctx.n_out) > 0
-        split_walks = facade.gdn_workspace_bytes_kcp(
-            ctx, H_qk=2, HV=6, deterministic=False, fused_walks=0, P=2, backward=False
-        )
-        fused = pkg.gdn_workspace_bytes_kcp(ctx, H_qk=2, HV=6, P=2, backward=False)
-        state = 6 * _mod("cake_bytes").STATE_TILE_BYTES
-        assert fused - split_walks == max(ctx.n_in, ctx.n_out) * state, rank
+        for c, det in ((ctx, False), (det_ctx, True)):
+            route = {} if det else {"deterministic": False}
+            split_walks = facade.gdn_workspace_bytes_kcp(
+                c, H_qk=2, HV=6, fused_walks=0, P=2, backward=False, **route
+            )
+            fused = facade.gdn_workspace_bytes_kcp(
+                c, H_qk=2, HV=6, P=2, backward=False, **route
+            )
+            assert fused - split_walks == max(c.n_in, c.n_out) * state, (rank, det)
 
 
 def test_the_context_holds_no_mode() -> None:
@@ -1520,7 +1638,7 @@ def test_the_registry_names_no_library_of_the_deterministic_twin() -> None:
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# package hygiene (no cake_kda_train import; no os.environ; the host module's import allow-list)
+# package hygiene (no KDA package import; no os.environ; the host module's import allow-list)
 
 
 def _package_sources() -> list[pathlib.Path]:
@@ -1534,25 +1652,22 @@ def _facade_source() -> pathlib.Path:
     return pathlib.Path(importlib.import_module(FACADE).__file__).resolve()
 
 
-def test_package_never_imports_cake_kda_train() -> None:
+def test_package_never_imports_a_kda_package() -> None:
+    """Neither the package nor the facade imports a KDA package: no imported module path or name contains ``cake_kda``
+    (the deterministic and the non-deterministic KDA packages)."""
     for path in _package_sources() + [_facade_source()]:
         tree = ast.parse(path.read_text())
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for a in node.names:
-                    assert "cake_kda_train" not in a.name, (path.name, a.name)
+                    assert "cake_kda" not in a.name, (path.name, a.name)
             elif isinstance(node, ast.ImportFrom):
-                assert "cake_kda_train" not in (node.module or ""), (
+                assert "cake_kda" not in (node.module or ""), (
                     path.name,
                     node.module,
                 )
                 for a in node.names:
-                    assert a.name != "cake_kda_train", (path.name, a.name)
-        assert (
-            "cake_kda_train"
-            not in path.read_text().replace("Provenance", "").split("import os")[0]
-            or True
-        )
+                    assert "cake_kda" not in a.name, (path.name, a.name)
 
 
 def test_package_reads_no_environment_variable() -> None:
@@ -1626,6 +1741,7 @@ def test_program_vocabulary_is_the_design_list() -> None:
         "kcp_fwdh_offset",
         "kcp_fwdh_tape",
         "kcp_fwdh_out",
+        "kcp_fwdh_out_tape",
         "kcp_transfer_walk",
         "kcp_affine_merge",
         "fwd_o",
@@ -1637,6 +1753,7 @@ def test_program_vocabulary_is_the_design_list() -> None:
         "fwd_prep_l2n",
         "bwd_dqkg_l2n",
         "qk_apply",
+        "fwd_prep_replay_l2n",
     )
     # the in-kernel Q / K L2 norm (use_qk_l2norm_in_kernel): #1 / #8 siblings and the backward's qk_apply
     assert kcp.L2N_PROGRAMS == ("fwd_prep_l2n", "bwd_dqkg_l2n", "qk_apply")
@@ -1650,10 +1767,27 @@ def test_program_vocabulary_is_the_design_list() -> None:
     assert (
         kcp.TART_MODULE_OF["kcp_affine_merge"] == "kda_chunk_kcp_affine_merge_fp32_v1"
     )  # reused verbatim
-    # the output walk is this package's own program: a det-neutral module that no deterministic twin ships
+    # the output walks are this package's own programs: det-neutral modules that no deterministic twin ships
     assert kcp.TART_MODULE_OF["kcp_fwdh_out"] == "gdn_chunk_fwdh_out_v1_kcp"
+    assert kcp.TART_MODULE_OF["kcp_fwdh_out_tape"] == "gdn_chunk_fwdh_out_tape_v1_kcp"
+    # save_mode="light_akk": the solve-free light replay of #1_l2n (this package's own module; a local program,
+    # launched only in place of fwd_prep_l2n when the saved set holds the Akk tape)
+    assert (
+        kcp.TART_MODULE_OF["fwd_prep_replay_l2n"]
+        == "gdn_chunk_train_fwd_prep_replay_l2n_v1"
+    )
+    assert kcp.AKK_REPLAY_OF == {"fwd_prep_l2n": "fwd_prep_replay_l2n"}
+    assert kcp.AKK_REPLAY_PROGRAMS == ("fwd_prep_replay_l2n",)
+    assert set(kcp.AKK_REPLAY_PROGRAMS) <= set(kcp.LOCAL_PROGRAMS)
+    assert kcp.PROGRAM_ARGS["fwd_prep_replay_l2n"] == kcp.PROGRAM_ARGS["fwd_prep_l2n"]
+    own = (
+        "kcp_affine_merge",
+        "kcp_fwdh_out",
+        "kcp_fwdh_out_tape",
+        "fwd_prep_replay_l2n",
+    )
     for name, module in kcp.TART_MODULE_OF.items():
-        if name not in ("kcp_affine_merge", "kcp_fwdh_out"):
+        if name not in own:
             # the other programs' kernel modules are, so far, the deterministic family's (provenance stems; a lever
             # that replaces a program updates this line)
             assert module.startswith("gdn_chunk_det_"), (name, module)
@@ -1683,6 +1817,7 @@ def test_program_vocabulary_is_the_design_list() -> None:
     for prog in (
         "kcp_fwdh_offset",
         "kcp_fwdh_out",
+        "kcp_fwdh_out_tape",
         "kcp_transfer_walk",
         "kcp_dhu_offset",
     ):
@@ -1712,6 +1847,13 @@ def test_program_vocabulary_is_the_design_list() -> None:
     assert {"q", "aqk", "qscale", "o", "h0", "h0_index"} <= set(fused)
     assert not {"h_tape", "v_new", "out", "out_index", "ticket"} & set(fused)
     assert set(fused) - {"q", "aqk", "qscale", "o"} <= set(
+        kcp.PROGRAM_ARGS["kcp_fwdh_tape"]
+    )
+    # the tape-and-output walk: the output walk's arguments and the tape walk's h / v_new tapes, no final-state pool
+    fused_tape = kcp.PROGRAM_ARGS["kcp_fwdh_out_tape"]
+    assert set(fused_tape) == set(fused) | {"h_tape", "v_new"}
+    assert not {"out", "out_index", "ticket"} & set(fused_tape)
+    assert set(fused_tape) - {"q", "aqk", "qscale", "o"} <= set(
         kcp.PROGRAM_ARGS["kcp_fwdh_tape"]
     )
     assert (
@@ -1781,7 +1923,12 @@ def test_fwdh_form_rule_follows_the_chain_clause() -> None:
     vh = 128; the test knob ``fwdh_vh`` forces a form (the two forms are within the same accuracy budget; the
     fake-backend suite checks it)."""
     kcp = _mod("cake_kcp")
-    assert kcp.FWDH_PROGRAMS == ("kcp_fwdh_offset", "kcp_fwdh_tape", "kcp_fwdh_out")
+    assert kcp.FWDH_PROGRAMS == (
+        "kcp_fwdh_offset",
+        "kcp_fwdh_tape",
+        "kcp_fwdh_out",
+        "kcp_fwdh_out_tape",
+    )
     assert kcp.fwdh_vh(3, 48, 152) == 64  # 144 head-CTAs <= 152 SMs (GB300)
     assert kcp.fwdh_vh(4, 48, 152) == 128  # 192 > 152, no chain clause
     assert kcp.fwdh_vh(4, 48, 152, fits=True) == 64
@@ -2083,6 +2230,7 @@ def test_host_tables_build_on_the_cpu_for_every_rank(row) -> None:
             "kcp_fwdh_offset",
             "kcp_fwdh_tape",
             "kcp_fwdh_out",
+            "kcp_fwdh_out_tape",
             "kcp_transfer_walk",
             "kcp_affine_merge",
             "fwd_o",

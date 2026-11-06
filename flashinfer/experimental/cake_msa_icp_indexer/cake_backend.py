@@ -44,7 +44,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 import torch
 
@@ -59,8 +59,14 @@ NUM_SLOT_SETS = 3
 # A prefill merge runs the prefill program (``merge_prefill``: one exchange,
 # no spin).  A legacy decode merge of at least this many tokens runs one token
 # per CTA (``merge_legacy``); every other decode merge (tagged rows, fewer
-# tokens) runs 4 per CTA (``merge``).
+# tokens) runs 4 per CTA (``merge``), and the facade's tagged decode merge at
+# world 4 runs ``merge_tagged`` (4 per CTA; it polls its rows before it waits
+# on its predecessor, see ``MSAIcpIndexerPlan.decode``).
 LEGACY_MERGE_MIN_TOKENS = 8
+# The facade's tagged decode merge runs ``merge_tagged`` only at these world
+# sizes.  In serving it shortens the decode step at world 4 (P128 and P256)
+# and does not at world 2, so world 2 keeps ``merge``.
+POLL_FIRST_WORLD_SIZES = (4,)
 # The merge ranks at most this many B128 blocks per token.
 MAX_BLOCKS = 8192
 # Upper bound (exclusive) of the score-row width the selectors accept.
@@ -82,6 +88,10 @@ _PLAN_FIELD_MAX = (1 << 16) - 1
 # The fused prefill path's list pool: one piece per (scorer CTA, plan item)
 # cell, each piece one sorted 16-key uint64 list per (item query row, head).
 PREFILL_PIECE_WORDS = PLAN_ITEM_TOKENS * NUM_INDEX_HEADS * TOPK
+# Prefill windows of at least this many tokens at TP2 P256 run the list build
+# with two pages per MMA (``score_topk16_n256``) where it ships; shorter ones
+# keep ``score_topk16``.
+N256_MIN_TOKENS = 4096
 _FP8 = torch.float8_e4m3fn
 
 
@@ -129,6 +139,27 @@ def _vector(name: str, t: torch.Tensor, dtype: torch.dtype, size: int) -> None:
         raise ValueError(
             f"{name} must be a contiguous 1-D {dtype} tensor of {size} elements"
         )
+
+
+def _peer_rows(
+    peers: Sequence[torch.Tensor], world: int, shape: tuple, device: torch.device
+) -> None:
+    """Every rank's receive rows of a prefill publish, as tensors on the
+    publisher's device in rank order (``world`` of them)."""
+    if len(peers) != world:
+        raise ValueError(f"publish peer_rows must hold {world} tensors (one per rank)")
+    for p in peers:
+        if (
+            not isinstance(p, torch.Tensor)
+            or p.dtype != torch.int64
+            or tuple(p.shape) != tuple(shape)
+            or not p.is_contiguous()
+            or p.device != device
+        ):
+            raise ValueError(
+                f"publish peer_rows must be contiguous int64 {list(shape)} "
+                f"tensors on {device}"
+            )
 
 
 def _heads(h: int) -> None:
@@ -418,6 +449,37 @@ def comm_layout(world_size: int, heads_per_rank: int, capacity: int) -> dict[str
             capacity,
             TAGGED_WORDS,
         ),
+        "generations_shape": (NUM_SLOT_SETS, world_size * heads_per_rank, capacity),
+        "expected_shape": (NUM_SLOT_SETS, heads_per_rank, capacity),
+    }
+
+
+def prefill_publish_layout(
+    world_size: int, heads_per_rank: int, capacity: int
+) -> dict[str, Any]:
+    """Layout of the caller's prefill publish storage (the prefill exchange
+    as a peer publish, :func:`prefill_score_select` with ``publish``): one
+    symmetric int64 allocation per rank of ``rows_shape = [3, W, hpr,
+    capacity, 32]`` tagged rows (``rows_bytes`` bytes), zeroed once and never
+    reset, passed to the publisher as every rank's view of them
+    (``peer_rows``, ``W`` tensors in rank order); the
+    publisher's generation counters ``generations_shape = [3, H, capacity]``
+    and the merge's ``expected_shape = [3, hpr, capacity]`` (int32, zeroed
+    with the rows on every rank).  Slot ``s`` of a layer is its decode slot
+    set: consecutive uses of one slot must be at least two sparse layers
+    apart, including across steps."""
+    _world(world_size, 0)
+    if heads_per_rank < 1 or capacity < 1:
+        raise ValueError("heads_per_rank and capacity must be positive")
+    shape = (NUM_SLOT_SETS, world_size, heads_per_rank, capacity, TAGGED_WORDS)
+    return {
+        "rows_shape": shape,
+        "rows_bytes": 8
+        * NUM_SLOT_SETS
+        * world_size
+        * heads_per_rank
+        * capacity
+        * TAGGED_WORDS,
         "generations_shape": (NUM_SLOT_SETS, world_size * heads_per_rank, capacity),
         "expected_shape": (NUM_SLOT_SETS, heads_per_rank, capacity),
     }
@@ -911,6 +973,7 @@ def prefill_score_select(
     force_begin_blocks: int = 0,
     force_end_blocks: int = 0,
     enable_pdl: bool = False,
+    publish: Optional[dict[str, Any]] = None,
 ) -> None:
     """The fused prefill path of one query chunk: the list scorer keeps, per
     (CTA, plan item) cell, each query row's sorted Top16 candidate keys in
@@ -919,7 +982,15 @@ def prefill_score_select(
     :func:`index_score_sharded` into score rows of ``K`` columns followed by
     :func:`topk_select_prefill` with the layout's ``index_scale`` /
     ``index_offset``, for every ``K`` of at least the plan's columns (half,
-    rounded up, when ``compact``), without the score rows."""
+    rounded up, when ``compact``), without the score rows.
+
+    With ``publish`` (keys ``peer_rows``, ``generations``, ``slot``,
+    ``t_base``, ``capacity``; :func:`prefill_publish_layout`) the same rows
+    go to their owners' receive rows instead, as tagged words: row ``(h,
+    t)`` to rank ``h / hpr``'s rows ``[slot, rank, h % hpr, t_base + t]``;
+    ``carrier`` is then unused (``None``).  The owner's
+    :func:`merge_candidates` with ``prefill=True`` and that slot's
+    ``expected_generations`` merges them."""
     _world(tp, rank)
     _query("q", q)
     if not isinstance(plan, MSAIcpScorePlan):
@@ -943,7 +1014,31 @@ def prefill_score_select(
         block_table, plan.batch, (plan.columns + blocks_per_page - 1) // blocks_per_page
     )
     _vector("num_valid_pages", num_valid_pages, torch.int32, t)
-    _carrier(carrier, h, t)
+    if publish is None:
+        _carrier(carrier, h, t)
+    else:
+        hpr = h // tp
+        pub_gens = publish["generations"]
+        if (
+            pub_gens.dtype != torch.int32
+            or not pub_gens.is_contiguous()
+            or tuple(pub_gens.shape) != (NUM_SLOT_SETS, h, int(publish["capacity"]))
+        ):
+            raise ValueError(
+                "publish generations must be contiguous int32 [3, H, capacity]"
+            )
+        _peer_rows(
+            publish["peer_rows"],
+            tp,
+            (NUM_SLOT_SETS, tp, hpr, int(publish["capacity"]), TAGGED_WORDS),
+            q.device,
+        )
+        if publish["slot"] not in range(NUM_SLOT_SETS):
+            raise ValueError("publish slot must be 0, 1 or 2")
+        if not 0 <= publish["t_base"] <= publish["t_base"] + t <= publish["capacity"]:
+            raise ValueError("publish rows t_base + T must fit the capacity")
+        if hpr * tp != h:
+            raise ValueError("the heads must split evenly over the ranks")
     _forced(force_begin_blocks, force_end_blocks)
     num_ctas = plan.packed_work_range.numel()
     need = (
@@ -971,10 +1066,25 @@ def prefill_score_select(
         pool=pool,
         carrier=carrier,
         work_range=plan.packed_work_range,
+        **({} if publish is None else {"generations": publish["generations"]}),
     )
     arch = cake_jit.device_arch(dev)
-    scorer = cake_jit.route("score_topk16", rows, arch, page=page_size)
-    merger = cake_jit.route("prefill_list_carrier", None, arch)
+    # Long TP2 P256 windows take the list build with two pages per MMA (the
+    # same lists in the same pool) where it ships.
+    n256 = (
+        tp == 2
+        and page_size == 256
+        and t >= N256_MIN_TOKENS
+        and cake_jit.has_role("score_topk16_n256", arch)
+    )
+    scorer = cake_jit.route(
+        "score_topk16_n256" if n256 else "score_topk16", rows, arch, page=page_size
+    )
+    merger = cake_jit.route(
+        "prefill_list_carrier" if publish is None else "prefill_list_publish",
+        None,
+        arch,
+    )
     values = {
         # The TMA descriptors read FP8 bytes.
         "q": q.view(torch.uint8),
@@ -1007,11 +1117,27 @@ def prefill_score_select(
         "page_size": page_size,
         "compact": int(compact),
         "bt_stride": block_table.stride(0),
-        "carrier_stride_h": carrier.stride(0),
-        "carrier_stride_t": carrier.stride(1),
+        "carrier_stride_h": 0 if carrier is None else carrier.stride(0),
+        "carrier_stride_t": 0 if carrier is None else carrier.stride(1),
         "force_begin": force_begin_blocks,
         "force_end": force_end_blocks,
     }
+    if publish is not None:
+        peers = publish["peer_rows"]
+        values.update(
+            # The owners' rows as the publisher's uint64 pointer parameters
+            # recv_0 .. recv_3 in rank order (views of the int64 rows); those
+            # past the world are never stored to.
+            {
+                f"recv_{o}": (peers[o] if o < tp else peers[0]).view(torch.uint64)
+                for o in range(NUM_INDEX_HEADS)
+            },
+            generations=publish["generations"],
+            t_base=int(publish["t_base"]),
+            slot=int(publish["slot"]),
+            heads_per_rank=h // tp,
+            capacity=int(publish["capacity"]),
+        )
     cake_jit.run_module(
         scorer,
         values,
@@ -1411,12 +1537,19 @@ def decode_score_publish(
     )
 
 
-def merge_role(*, prefill: bool, tagged: bool, num_tokens: int) -> str:
+def merge_role(
+    *, prefill: bool, tagged: bool, num_tokens: int, poll_first: bool = False
+) -> str:
     """The merge role of one call (launch metadata only, every arch):
-    ``merge_prefill`` for a prefill merge, ``merge_legacy`` for a legacy decode
-    merge of at least ``LEGACY_MERGE_MIN_TOKENS`` tokens, else ``merge``."""
+    ``merge_prefill`` for a prefill merge (``merge_prefill_tagged`` over the
+    tagged rows of a prefill publish), ``merge_tagged`` for a tagged decode
+    merge with ``poll_first`` (the facade's decode chain), ``merge_legacy`` for
+    a legacy decode merge of at least ``LEGACY_MERGE_MIN_TOKENS`` tokens, else
+    ``merge``."""
     if prefill:
-        return "merge_prefill"
+        return "merge_prefill_tagged" if tagged else "merge_prefill"
+    if tagged and poll_first:
+        return "merge_tagged"
     if not tagged and num_tokens >= LEGACY_MERGE_MIN_TOKENS:
         return "merge_legacy"
     return "merge"
@@ -1436,19 +1569,21 @@ def merge_candidates(
     prefill: bool = False,
     token_count: Optional[torch.Tensor] = None,
     _trusted: bool = False,
+    _poll_first: bool = False,
 ) -> None:
     # ``_trusted``: the caller (MSAIcpIndexerPlan.decode) passes one slot of
     # receive rows and counters its ``check_comm`` validated, and its own
     # validated scalars; only the per-call tensors are checked here.
+    # ``_poll_first``: the caller (MSAIcpIndexerPlan.decode) meets the
+    # precondition of a merge that reads before it waits; a tagged merge of a
+    # by-value token count then runs ``merge_tagged``.
     # ``token_count`` (int32 [1]): only the rows below token_count[0] (read on
     # the device, at most T) are merged; the record follows T, as without it.
     tagged = expected_generations is not None
     dc = _token_count(token_count)
     if not _trusted:
-        if prefill and (tagged or enable_pdl):
-            raise ValueError(
-                "the prefill merge takes neither expected_generations nor enable_pdl"
-            )
+        if prefill and enable_pdl:
+            raise ValueError("the prefill merge takes no enable_pdl")
         if recv_slot.ndim != 4:
             raise ValueError("recv_slot must be [world, heads_per_rank, capacity, row]")
     world, hpr, capacity, row = recv_slot.shape
@@ -1507,7 +1642,9 @@ def merge_candidates(
     if t == 0:
         return
     arch = cake_jit.device_arch(dev)
-    role = merge_role(prefill=prefill, tagged=tagged, num_tokens=t)
+    role = merge_role(
+        prefill=prefill, tagged=tagged, num_tokens=t, poll_first=_poll_first and not dc
+    )
     name = cake_jit.route(role + dc, None, arch)
     # One program reads both row forms through int32 words: a tagged row is
     # its 32 int64 words viewed as 64 int32 words (strides in int32 elements).

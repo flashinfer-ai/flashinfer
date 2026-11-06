@@ -1151,6 +1151,7 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
         out_dtype,
         use_separate_reduction_kernel=spec.config.use_separate_reduction_kernel,
         use_split_kv=spec.config.use_split_kv,
+        scratch_reserve=spec.scratch_reserve,
     )
     attention_scratch_bytes = attention_layout.total_bytes
     attention_workspace_byte_offset = _align_up_q_token_kv_block_sparse_workspace(

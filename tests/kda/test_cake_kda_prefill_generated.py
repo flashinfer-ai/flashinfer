@@ -26,7 +26,14 @@ cooperative launches take instead of the pair-share or routed program, and
 ``_RENDERED_WORK_BIN_MIX_ROUTES`` the bin-mix builds of the turnover programs,
 which turnover launches whose bin table the bin-mix rule admits take
 cooperatively instead of the turnover program on the ``WORK_BIN_MIX_ARCHES``
-parts.
+parts, and ``_RENDERED_WORK_BIN_MIX_LONG_ROUTES`` the long-task builds of the
+bin-mix programs, which bin-mix launches of longer tasks take instead,
+``_RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES`` the hybrid builds of the M64
+owner/helper programs, which the equal-length launches of a one-helper rule row
+take cooperatively instead of the pair-share program, and
+``_RENDERED_WORK_BIN_TURN_E128_ROUTES`` the 128-token builds of the turnover
+programs, which turnover launches whose sequences all hold 128 tokens take
+instead (bit for bit the turnover launch).
 
 The CPU checks hold both tables to the units, to the shipped argument plans and
 to the factory lookup. The GPU checks run the prepared BF16 prefill on the
@@ -240,6 +247,56 @@ def test_routes_point_shipped_modules_at_generated_programs():
             assert program in registry._RENDERED_MODULES, (arch, program)
             assert arch in registry._RENDERED_MODULES[program]["arches"]
             routed.add(program)
+    assert set(registry._RENDERED_WORK_BIN_TURN_SHORT_ROUTES) == set(registry.ARCHES)
+    for arch, modules in registry._RENDERED_WORK_BIN_TURN_SHORT_ROUTES.items():
+        for module, program in modules.items():
+            # Every other turnover launch keeps the module's turnover program.
+            assert module in registry._RENDERED_WORK_BIN_TURN_ROUTES[arch], (
+                arch,
+                module,
+            )
+            assert program != registry._RENDERED_WORK_BIN_TURN_ROUTES[arch][module]
+            assert program in registry._RENDERED_MODULES, (arch, program)
+            assert arch in registry._RENDERED_MODULES[program]["arches"]
+            routed.add(program)
+    assert set(registry._RENDERED_WORK_BIN_TURN_E128_ROUTES) == set(registry.ARCHES)
+    for arch, modules in registry._RENDERED_WORK_BIN_TURN_E128_ROUTES.items():
+        for module, program in modules.items():
+            # Every other turnover launch keeps the module's turnover program.
+            assert module in registry._RENDERED_WORK_BIN_TURN_ROUTES[arch], (
+                arch,
+                module,
+            )
+            assert program != registry._RENDERED_WORK_BIN_TURN_ROUTES[arch][module]
+            assert program in registry._RENDERED_MODULES, (arch, program)
+            assert arch in registry._RENDERED_MODULES[program]["arches"]
+            routed.add(program)
+    assert set(registry._RENDERED_WORK_BIN_MIX_LONG_ROUTES) == set(registry.ARCHES)
+    for arch, modules in registry._RENDERED_WORK_BIN_MIX_LONG_ROUTES.items():
+        for module, program in modules.items():
+            # Every other bin-mix launch keeps the module's bin-mix program.
+            assert module in registry._RENDERED_WORK_BIN_MIX_ROUTES[arch], (
+                arch,
+                module,
+            )
+            assert program != registry._RENDERED_WORK_BIN_MIX_ROUTES[arch][module]
+            assert program in registry._RENDERED_MODULES, (arch, program)
+            assert arch in registry._RENDERED_MODULES[program]["arches"]
+            routed.add(program)
+    hybrids = registry._RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES
+    assert set(hybrids) == set(registry.ARCHES)
+    for arch, modules in hybrids.items():
+        for module, program in modules.items():
+            # Every other launch of the module keeps its owner/helper,
+            # pair-share or routed program.
+            helped = registry._RENDERED_M64_OWNER_HELPER_ROUTES[arch]
+            assert module in helped, (arch, module)
+            assert program != helped[module]
+            assert program != registry._RENDERED_PAIR_SHARE_ROUTES[arch][module]
+            assert program != registry._RENDERED_ROUTES[arch][module]
+            assert program in registry._RENDERED_MODULES, (arch, program)
+            assert arch in registry._RENDERED_MODULES[program]["arches"]
+            routed.add(program)
     assert routed == set(GENERATED)
 
 
@@ -308,6 +365,10 @@ def test_generated_plans_bind_from_the_shipped_plans():
             *registry._RENDERED_M64_OWNER_HELPER_ROUTES[arch].items(),
             *registry._RENDERED_WORK_BIN_MIX_ROUTES[arch].items(),
             *registry._RENDERED_WORK_BIN_POOL_ROUTES[arch].items(),
+            *registry._RENDERED_WORK_BIN_TURN_SHORT_ROUTES[arch].items(),
+            *registry._RENDERED_WORK_BIN_MIX_LONG_ROUTES[arch].items(),
+            *registry._RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES[arch].items(),
+            *registry._RENDERED_WORK_BIN_TURN_E128_ROUTES[arch].items(),
         ]
         for module, program in routes:
             shipped = {
@@ -1118,6 +1179,10 @@ def unrouted(monkeypatch):
             "_RENDERED_M64_OWNER_HELPER_ROUTES",
             "_RENDERED_WORK_BIN_MIX_ROUTES",
             "_RENDERED_WORK_BIN_POOL_ROUTES",
+            "_RENDERED_WORK_BIN_TURN_SHORT_ROUTES",
+            "_RENDERED_WORK_BIN_MIX_LONG_ROUTES",
+            "_RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES",
+            "_RENDERED_WORK_BIN_TURN_E128_ROUTES",
         ):
             monkeypatch.setattr(registry, table, {arch: {} for arch in registry.ARCHES})
 
@@ -1164,6 +1229,9 @@ def test_serving_rows_match_the_fp32_reference(
         | set(registry._RENDERED_WORK_BIN_TURN_ROUTES[arch].values())
         | set(registry._RENDERED_WORK_BIN_MIX_ROUTES[arch].values())
         | set(registry._RENDERED_WORK_BIN_POOL_ROUTES[arch].values())
+        | set(registry._RENDERED_WORK_BIN_TURN_SHORT_ROUTES[arch].values())
+        | set(registry._RENDERED_WORK_BIN_MIX_LONG_ROUTES[arch].values())
+        | set(registry._RENDERED_WORK_BIN_TURN_E128_ROUTES[arch].values())
     )
     if loaded & work_bin_programs:
         with monkeypatch.context() as patch:
@@ -1365,14 +1433,35 @@ def _turnover_chunk_limit():
 
 
 def _turn_programs():
-    return set(registry._RENDERED_WORK_BIN_TURN_ROUTES[registry.device_arch()].values())
-
-
-def _turn_of():
-    """Work-binned program -> its turnover build, for the turn table's modules."""
+    """The turnover builds, with the short-task and 128-token ones."""
     arch = registry.device_arch()
+    return (
+        set(registry._RENDERED_WORK_BIN_TURN_ROUTES[arch].values())
+        | set(registry._RENDERED_WORK_BIN_TURN_SHORT_ROUTES[arch].values())
+        | set(registry._RENDERED_WORK_BIN_TURN_E128_ROUTES[arch].values())
+    )
+
+
+def _turn_of(lengths=None, heads=None):
+    """Work-binned program -> its turnover build, for the turn table's modules;
+    for a launch of ``lengths`` at ``heads`` heads in the short-task scope
+    (``runtime._work_bin_turn_short_scope``), the short-task build where the
+    loader names one, else in the 128-token scope
+    (``runtime._work_bin_turn_e128_scope``) the 128-token build where the
+    loader names one."""
+    arch = registry.device_arch()
+    short = {}
+    if lengths is not None and runtime._work_bin_turn_short_scope(
+        lengths, heads, _sm_count()
+    ):
+        short = registry._RENDERED_WORK_BIN_TURN_SHORT_ROUTES[arch]
+    e128 = {}
+    if lengths is not None and runtime._work_bin_turn_e128_scope(lengths):
+        e128 = registry._RENDERED_WORK_BIN_TURN_E128_ROUTES[arch]
     return {
-        registry._RENDERED_WORK_BIN_ROUTES[arch][module]: program
+        registry._RENDERED_WORK_BIN_ROUTES[arch][module]: short.get(
+            module, e128.get(module, program)
+        )
         for module, program in registry._RENDERED_WORK_BIN_TURN_ROUTES[arch].items()
     }
 
@@ -1395,7 +1484,7 @@ def _assert_turnover_schedule(turn, plain, expect):
     plain_schedule = str(plain.prepared.schedule)
     plain_programs = _modules(plain.prepared)
     if expect:
-        turn_of = _turn_of()
+        turn_of = _turn_of(turn.d["lengths"], turn.d["heads"])
         assert plain_programs & set(turn_of), plain_schedule
         assert schedule.count("_turnover") == 1, schedule
         assert schedule.replace("_turnover", "", 1) == plain_schedule
@@ -1427,6 +1516,15 @@ def _assert_route(route, prepared):
     schedule = str(prepared.schedule)
     loaded = _modules(prepared)
     owner_helper = set(registry._RENDERED_M64_OWNER_HELPER_ROUTES[arch].values())
+    hybrid = set(registry._RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES[arch].values())
+    if route == "m64-hybrid" and not hybrid:
+        route = "pair-share"  # a loader without the build keeps the pair-share one
+    if route == "m64-hybrid":
+        if (arch, _sm_count()) != HYBRID_PART:
+            pytest.skip(f"the hybrid rule row is for {HYBRID_PART}")
+        assert schedule == HYBRID_SCHEDULE, schedule
+        assert loaded & hybrid
+        return
     if route == "m64-owner-helper" and not owner_helper:
         route = "pair-share"  # a loader without the build keeps the pair-share one
     if route == "m64-owner-helper":
@@ -1505,15 +1603,36 @@ def _bin_mix_programs():
         )
     programs = set(registry._RENDERED_WORK_BIN_MIX_ROUTES[arch].values())
     assert programs, f"the loader names no bin-mix build on {arch}"
-    return programs
+    return programs | set(registry._RENDERED_WORK_BIN_MIX_LONG_ROUTES[arch].values())
+
+
+def _long_task_bin_mix(lengths):
+    """Whether a bin-mix launch of ``lengths`` takes the long-task builds of
+    the bin-mix programs where the loader names them (its longest task longer
+    than ``BF16_WORK_BIN_MIX_LONG_TASK_CHUNKS`` chunks)."""
+    limit = runtime.BF16_WORK_BIN_MIX_LONG_TASK_CHUNKS * runtime.BF16_M128_CHUNK
+    return max(lengths) > limit
+
+
+def _expected_bin_mix_programs(lengths):
+    """The bin-mix programs a bin-mix launch of ``lengths`` takes on this
+    device: the long-task build of a module's bin-mix program where the loader
+    names one and the launch's longest task is long enough, else its bin-mix
+    program."""
+    arch = registry.device_arch()
+    mix = registry._RENDERED_WORK_BIN_MIX_ROUTES[arch]
+    if not _long_task_bin_mix(lengths):
+        return set(mix.values())
+    long_task = registry._RENDERED_WORK_BIN_MIX_LONG_ROUTES[arch]
+    return {long_task.get(module, program) for module, program in mix.items()}
 
 
 def _without_bin_mix(patch):
-    patch.setattr(
-        registry,
+    for table in (
         "_RENDERED_WORK_BIN_MIX_ROUTES",
-        {arch: {} for arch in registry.ARCHES},
-    )
+        "_RENDERED_WORK_BIN_MIX_LONG_ROUTES",
+    ):
+        patch.setattr(registry, table, {arch: {} for arch in registry.ARCHES})
 
 
 @requires_blackwell
@@ -1541,6 +1660,8 @@ def test_bin_mix_launch_is_bitwise_the_turnover_launch(
     schedule = str(mixed.prepared.schedule)
     assert schedule.endswith("_turnover_bin_mix"), schedule
     assert _modules(mixed.prepared) & mix
+    expected = _expected_bin_mix_programs(lengths)
+    assert _modules(mixed.prepared) & mix <= expected, (lengths, expected)
     with monkeypatch.context() as patch:
         _without_bin_mix(patch)
         turned = _Call(d, None, rows=rows)
@@ -1557,6 +1678,25 @@ def test_bin_mix_launch_is_bitwise_the_turnover_launch(
     _assert_bitwise(got, plain.run(), "bin-mix vs work-binned")
     _assert_bitwise(mixed.run(), want, "bin-mix after the other launches")
     _assert_bitwise(turned.run(), got, "turnover repeat")
+    # A launch that takes a long-task build: bit for bit the bin-mix build it
+    # replaces (the long-task table cleared), with the same schedule.
+    arch = registry.device_arch()
+    long_task = set(registry._RENDERED_WORK_BIN_MIX_LONG_ROUTES[arch].values())
+    if _modules(mixed.prepared) & long_task:
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                registry,
+                "_RENDERED_WORK_BIN_MIX_LONG_ROUTES",
+                {name: {} for name in registry.ARCHES},
+            )
+            stock = _Call(d, None, rows=rows)
+        assert str(stock.prepared.schedule) == schedule
+        assert not _modules(stock.prepared) & long_task
+        assert _modules(stock.prepared) & set(
+            registry._RENDERED_WORK_BIN_MIX_ROUTES[arch].values()
+        )
+        _assert_bitwise(stock.run(), got, "bin-mix vs long-task bin-mix")
+        _assert_bitwise(mixed.run(), got, "long-task bin-mix repeat")
 
 
 @requires_blackwell
@@ -1581,8 +1721,9 @@ def test_bin_mix_rows_keep_the_turnover_build_elsewhere(
     assert str(turned.prepared.schedule).endswith("_turnover"), str(
         turned.prepared.schedule
     )
-    assert not _modules(turned.prepared) & set(
-        registry._RENDERED_WORK_BIN_MIX_ROUTES[arch].values()
+    assert not _modules(turned.prepared) & (
+        set(registry._RENDERED_WORK_BIN_MIX_ROUTES[arch].values())
+        | set(registry._RENDERED_WORK_BIN_MIX_LONG_ROUTES[arch].values())
     )
     with monkeypatch.context() as patch:
         _without_turnover(patch)
@@ -1740,6 +1881,66 @@ def test_bounded_turnover_launch_is_bitwise_the_work_binned_launch(
     _assert_bitwise(got, want, "turnover vs work-binned")
     _assert_bitwise(turn.run(), want, "turnover after the work-binned launch")
     _assert_bitwise(plain.run(), got, "work-binned repeat")
+
+
+# Bounded turnover launches on either side of the 128-token scope: every
+# sequence exactly 128 tokens (the 128-token build where the loader names one,
+# on sm_103a), and 127 / 129 tokens or one sequence off 128 (the turnover
+# build).
+E128_ROWS = [
+    pytest.param([128] * 16, 12, True, id="bs16x128-h12"),
+    pytest.param([128] * 16, 16, True, id="bs16x128-h16"),
+    pytest.param([128] * 25, 12, True, id="bs25x128-h12"),
+    pytest.param([128] * 46, 8, True, id="bs46x128-h8"),
+    pytest.param([127] * 16, 12, False, id="bs16x127-h12"),
+    pytest.param([129] * 16, 16, False, id="bs16x129-h16"),
+    pytest.param([128] * 15 + [127], 12, False, id="bs15x128+127-h12"),
+]
+
+
+@requires_blackwell
+@pytest.mark.parametrize("rows", [True, False], ids=["rows", "no-rows"])
+@pytest.mark.parametrize("lengths,heads,takes", E128_ROWS)
+def test_e128_launch_is_bitwise_the_turnover_launch(
+    lengths, heads, takes, rows, monkeypatch
+):
+    """A bounded turnover launch whose sequences all hold exactly 128 tokens
+    takes its module's 128-token build where the loader names one: the same
+    bins and schedule, the turnover program replaced, bit for bit the turnover
+    launch (the same call without the 128-token table), with and without
+    checkpoint rows, in either order.  Every other launch keeps the turnover
+    build."""
+    if not _bounded_turnover_expected(lengths, heads):
+        pytest.skip("this part keeps the bounded launch on its work-binned build")
+    arch = registry.device_arch()
+    e128_routes = registry._RENDERED_WORK_BIN_TURN_E128_ROUTES[arch]
+    e128_of = {
+        registry._RENDERED_WORK_BIN_TURN_ROUTES[arch][module]: program
+        for module, program in e128_routes.items()
+    }
+    d = _inputs(lengths, heads)
+    got_call = _Call(d, -5.0, rows=rows)
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            registry,
+            "_RENDERED_WORK_BIN_TURN_E128_ROUTES",
+            {name: {} for name in registry.ARCHES},
+        )
+        turn = _Call(d, -5.0, rows=rows)
+    assert str(got_call.prepared.schedule) == str(turn.prepared.schedule)
+    turned = _modules(turn.prepared)
+    loaded = _modules(got_call.prepared)
+    if takes and e128_routes:
+        assert turned & set(e128_of), str(turn.prepared.schedule)
+        assert loaded == {e128_of.get(p, p) for p in turned}
+    else:
+        assert loaded == turned
+        assert not loaded & set(e128_routes.values())
+    got = got_call.run()
+    want = turn.run()
+    _assert_bitwise(got, want, "128-token vs turnover")
+    _assert_bitwise(got_call.run(), want, "128-token after the turnover launch")
+    _assert_bitwise(turn.run(), got, "turnover repeat")
 
 
 TURNOVER_PARTS = [
@@ -2292,6 +2493,7 @@ GRAPH_ROWS = [
         id="2x(8128+64)-h16-lb5-pair-share",
     ),
     pytest.param([4096] * 4, 16, None, "pool", False, id="4x4096-h16-pool"),
+    pytest.param([4096] * 4, 12, -5.0, "m64-hybrid", False, id="4x4096-h12-lb5-m64ohl"),
     pytest.param([8192], 12, -5.0, "map-fold", False, id="8192-h12-lb5-map-fold"),
 ]
 
@@ -2808,6 +3010,114 @@ def test_refused_m64_owner_helper_launch_runs_its_fallback(monkeypatch):
     _assert_bitwise(result, kept.run(), "refused owner/helper vs its fallback")
 
 
+# The M64 owner/helper hybrid build: equal-length launches of 37 to 48 tasks
+# at 2048 tokens or more that the pair-share rule takes (the shipped one-helper
+# row of a 148-SM sm_100a part), on a grid (tasks, 3).
+HYBRID_PART = ("sm_100a", 148)
+HYBRID_SCHEDULE = "fused_m64_independent_dvsplit_fp32_state_owner1helper_hybrid"
+M64_HYBRID_ROWS = [
+    pytest.param([4096] * 4, 12, id="4x4096-h12"),
+    pytest.param([2049] * 5, 9, id="5x2049-h9"),
+    pytest.param([2600] * 2, 19, id="2x2600-h19"),
+    pytest.param([2048] * 4, 12, id="4x2048-h12"),
+    pytest.param([7000] * 3, 13, id="3x7000-h13"),
+]
+
+
+def _m64_hybrid_programs():
+    arch = registry.device_arch()
+    programs = set(registry._RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES[arch].values())
+    if not programs:
+        pytest.skip(f"the loader names no M64 owner/helper hybrid build on {arch}")
+    if (arch, _sm_count()) != HYBRID_PART:
+        pytest.skip(f"the hybrid rule row is for {HYBRID_PART}")
+    return programs
+
+
+@requires_blackwell
+@pytest.mark.usefixtures("stock_m64_route")
+@pytest.mark.parametrize("state", M64_OWNER_HELPER_STATES)
+@pytest.mark.parametrize("lengths,heads", M64_HYBRID_ROWS)
+def test_m64_owner_helper_hybrid_is_bitwise_the_pair_share_and_routed_programs(
+    lengths, heads, state, monkeypatch
+):
+    """A launch the shipped one-helper row takes runs the hybrid build and
+    equals, bit for bit, the pair-share program it replaces and the routed
+    program: output, final states and checkpoint rows, launch after launch
+    (the program leaves its words zero), with and without initial states and
+    checkpoint rows."""
+    hybrid = _m64_hybrid_programs()
+    tasks = len(lengths) * heads
+    device = torch.device("cuda", torch.cuda.current_device())
+    capacity = runtime._probe_m64_cooperative_capacity(device)
+    assert capacity, "the cooperative capacity probe failed"
+    if tasks * 3 > capacity:
+        pytest.skip(f"{capacity} resident CTAs for {tasks} x 3")
+    d = _inputs(lengths, heads)
+    taken = _Call(_own_pool(d), -5.0, indexed=False, **state)
+    assert str(taken.prepared.schedule) == HYBRID_SCHEDULE
+    assert _modules(taken.prepared) & hybrid
+    result = taken.run()
+    _assert_bitwise(taken.run(), result, "hybrid repeat")
+
+    monkeypatch.setattr(
+        registry,
+        "_RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES",
+        {name: {} for name in registry.ARCHES},
+    )
+    base = HYBRID_SCHEDULE.removesuffix("_owner1helper_hybrid")
+    kept = _Call(_own_pool(d), -5.0, indexed=False, **state)
+    assert str(kept.prepared.schedule) == base + "_pair_share"
+    assert not _modules(kept.prepared) & hybrid
+    _assert_bitwise(result, kept.run(), "hybrid vs pair-share")
+    monkeypatch.setattr(
+        registry,
+        "_RENDERED_PAIR_SHARE_ROUTES",
+        {name: {} for name in registry.ARCHES},
+    )
+    routed = _Call(_own_pool(d), -5.0, indexed=False, **state)
+    assert str(routed.prepared.schedule) == base
+    _assert_bitwise(result, routed.run(), "hybrid vs routed M64")
+
+
+@requires_blackwell
+@pytest.mark.usefixtures("stock_m64_route")
+def test_refused_m64_owner_helper_hybrid_launch_runs_its_fallback(monkeypatch):
+    """A hybrid grid the device cannot hold (60 tasks x 3 CTAs, the capacity
+    probe and the rule rows overridden): the driver refuses it, the plan
+    switches for good to the pair-share program and matches it bit for bit."""
+    hybrid = _m64_hybrid_programs()
+    lengths, heads = [4096] * 5, 12
+    tasks = len(lengths) * heads
+    assert tasks * 3 > _sm_count()
+    d = _inputs(lengths, heads)
+    monkeypatch.setattr(runtime, "_m64_cooperative_capacity", lambda device: 1 << 20)
+    monkeypatch.setattr(runtime, "M64_OWNER_HELPER_MIN_SEQ_LEN", ((tasks, 2048, 1),))
+    monkeypatch.setattr(runtime, "M64_PAIR_SHARE_MIN_SEQ_LEN", ((tasks, 2048),))
+    device = torch.device("cuda", torch.cuda.current_device())
+    if runtime._probe_m64_pair_cluster_capacity(device) < tasks:
+        pytest.skip(f"fewer 2-CTA clusters than {tasks} tasks")
+    refused = _Call(_own_pool(d), -5.0, indexed=False)
+    assert str(refused.prepared.schedule) == HYBRID_SCHEDULE
+    assert _modules(refused.prepared) & hybrid
+    result = refused.run()
+    assert not _modules(refused.prepared) & hybrid
+    assert str(refused.prepared.schedule).endswith("_pair_share")
+    probe = torch.zeros(1024, device="cuda")
+    probe.add_(1)
+    torch.cuda.synchronize()
+    assert float(probe.sum()) == 1024.0
+    _assert_bitwise(refused.run(), result, "fallback repeat")
+    monkeypatch.setattr(
+        registry,
+        "_RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES",
+        {name: {} for name in registry.ARCHES},
+    )
+    kept = _Call(_own_pool(d), -5.0, indexed=False)
+    assert str(kept.prepared.schedule).endswith("_pair_share")
+    _assert_bitwise(result, kept.run(), "refused hybrid vs its fallback")
+
+
 CHAIN_ROWS = [
     pytest.param([8192], 12, id="8192-h12"),
     pytest.param([3000, 13384], 16, id="3000+13384-h16"),
@@ -3110,9 +3420,9 @@ def test_pair_cluster_capacity_probe_caches_only_an_answer(monkeypatch):
 # A launch whose stock plan is the M64 value split and whose sequences mix long
 # (>= MIXLEN_LONG_MIN tokens) and short ones runs as parts: the long sequences
 # as owner/helper parts with MIXLEN_HELPERS helpers per task, the short ones as
-# plain M64 parts.  "rng": one owner/helper part over the first..last long
-# sequence and the short parts after it, all on the caller stream; "cc": one
-# side-stream owner/helper part per run of long sequences.
+# plain M64 parts.  "rng": one side-stream owner/helper part over the
+# first..last long sequence, the short parts beside it on the caller stream;
+# "cc": one side-stream owner/helper part per run of long sequences.
 MIXLEN_ROWS = [
     pytest.param(
         [8192, 17], 12, "rng", dict(indexed=False), id="8192+17-h12-dense-state"
@@ -3159,8 +3469,8 @@ def _mixlen_parts(schedule, mode):
 
 def _assert_mixlen_route(prepared, lengths, mode):
     """The split plan of ``prepared``: every sequence in one part, long parts
-    on the owner/helper build (side streams under "cc"), short parts on the M64
-    value split."""
+    on the owner/helper build on side streams, short parts on the M64 value
+    split on the caller stream."""
     arch = registry.device_arch()
     parts = _mixlen_parts(str(prepared.schedule), mode)
     covered = sorted(i for _, i0, i1, _ in parts for i in range(i0, i1 + 1))
@@ -3170,7 +3480,7 @@ def _assert_mixlen_route(prepared, lengths, mode):
         assert schedule.startswith("fused_m64_independent_dvsplit_fp32_state"), parts
         if schedule.endswith(helpers):
             assert any(n >= runtime.MIXLEN_LONG_MIN for n in lengths[i0 : i1 + 1])
-            assert bool(side) == (mode == "cc"), parts
+            assert side, parts
         else:
             assert all(n < runtime.MIXLEN_LONG_MIN for n in lengths[i0 : i1 + 1])
             assert not side, parts
@@ -3229,6 +3539,10 @@ def test_mixlen_split_is_bitwise_the_stock_m64_program(lengths, heads, mode, sta
 
 
 MIXLEN_GRAPH_LENGTHS, MIXLEN_GRAPH_HEADS = [8128, 64] * 2, 16
+MIXLEN_GRAPH_ROWS = [
+    pytest.param([8128, 64] * 2, 16, "cc", id="2x(8128+64)-h16-cc"),
+    pytest.param([1024, 64], 12, "rng", id="1024+64-h12-rng"),
+]
 
 
 @requires_blackwell
@@ -3254,17 +3568,17 @@ def test_mixlen_split_plan_cache_hit_matches_a_fresh_preparation():
 
 
 @requires_blackwell
-def test_mixlen_split_replays_from_a_cuda_graph():
+@pytest.mark.parametrize("lengths,heads,mode", MIXLEN_GRAPH_ROWS)
+def test_mixlen_split_replays_from_a_cuda_graph(lengths, heads, mode):
     """The split's fork / join of its side-stream parts is captured: a graph
     replay matches the eager launch bit for bit."""
-    lengths, heads = MIXLEN_GRAPH_LENGTHS, MIXLEN_GRAPH_HEADS
-    _mixlen_capacity_or_skip(lengths, heads, "cc")
+    _mixlen_capacity_or_skip(lengths, heads, mode)
     d = _inputs(lengths, heads)
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
         call = _Call(d, -5.0)
-        _assert_mixlen_route(call.prepared, lengths, "cc")
+        _assert_mixlen_route(call.prepared, lengths, mode)
         eager = call.run()
     torch.cuda.current_stream().wait_stream(side)
     call.poison()

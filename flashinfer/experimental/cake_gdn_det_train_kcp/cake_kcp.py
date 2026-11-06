@@ -44,7 +44,10 @@ offset walk from zero, #2 ``program=offset``, and the TF32-hi/lo transfer walk,
 on the caller's group); the owner composes every document chain in document
 order with the exact FP32 affine merge (#4) and returns each continuing
 fragment's initial state ``S_in`` (``c2``); the tape walk (#2 ``program=tape``)
-then runs from ``S_in`` and ``fwd_o`` (#5) writes the output.  Backward:
+then runs from ``S_in`` and ``fwd_o`` (#5) writes the output -- or, in a
+forward whose ``h`` / ``v_new`` tapes have no reader (test knob ``fused_o``,
+:func:`_fuse_o`), the output walk ``kcp_fwdh_out`` (#2 with #5 folded into
+each chunk step, no tape written) does both.  Backward:
 ``bwd_prep`` (#6); the adjoint offsets ``d_f`` (#7 ``program=offset``, the
 reverse walk from zero) and, unless the forward's transfer was kept, ``M_f``
 again go to the owners (``b1``); the owner walks each chain backwards
@@ -150,6 +153,7 @@ PROGRAMS = (
     "fwd_prep",  # #1 chunk-local prep: gcum, gamma, A^-1 (Akk), w, u, Aqk, rowscale, qscale
     "kcp_fwdh_offset",  # #2 program=offset: walk from zero, final state -> compact tiles (B_f / b_seg); no tapes
     "kcp_fwdh_tape",  # #2 program=tape: walk from an indexed initial state, h / v_new tapes
+    "kcp_fwdh_out",  # #2 program=out: the tape walk with #5 folded into each chunk step, o instead of the tapes
     "kcp_transfer_walk",  # #3: FP32-class transfer M_f^T (TF32 hi/lo; init_mode = 1 / use_u = 1: the FP32-class offset)
     "kcp_affine_merge",  # #4: exact FP32 affine chains (state / map / transposed modes), reused from the KDA package
     "fwd_o",  # #5: o = scale e^G q h_c + (Aqk o mask) v_new
@@ -176,6 +180,7 @@ LOCAL_PROGRAMS = (
 WALK_PROGRAMS = (
     "kcp_fwdh_offset",
     "kcp_fwdh_tape",
+    "kcp_fwdh_out",
     "kcp_transfer_walk",
     "kcp_dhu_offset",
     "kcp_dhu_tape",
@@ -184,6 +189,7 @@ TART_MODULE_OF = {
     "fwd_prep": "gdn_chunk_det_train_fwd_prep_v1",
     "kcp_fwdh_offset": "gdn_chunk_det_fwdh_v1_kcp",
     "kcp_fwdh_tape": "gdn_chunk_det_fwdh_v1_kcp",
+    "kcp_fwdh_out": "gdn_chunk_fwdh_out_v1_kcp",  # det-neutral: the non-det package ships the same module
     "kcp_transfer_walk": "gdn_chunk_det_transfer_walk_v1_kcp",
     "kcp_affine_merge": "kda_chunk_kcp_affine_merge_fp32_v1",
     "fwd_o": "gdn_chunk_det_train_fwd_o_v1",
@@ -401,6 +407,24 @@ PROGRAM_ARGS: dict[str, tuple[str, ...]] = {
     ),
 }
 PROGRAM_ARGS["kcp_fwdh_tape"] = PROGRAM_ARGS["kcp_fwdh_offset"]
+# the output walk: the tape walk's inputs (no final-state pool, no tape) and #5's (q, aqk, qscale -> o)
+PROGRAM_ARGS["kcp_fwdh_out"] = (
+    "k",
+    "w",
+    "u",
+    "rowscale",
+    "gamma",
+    *_WALK_COMMON_ARGS,
+    "h0",
+    "h0_index",
+    "h0_hg",
+    "h0_n",
+    "tile_stride",
+    "q",
+    "aqk",
+    "qscale",
+    "o",
+)
 PROGRAM_ARGS["kcp_dhu_tape"] = PROGRAM_ARGS["kcp_dhu_offset"]
 # The in-kernel Q / K L2 norm: the extra logical names of the two siblings over #1 / #8 and the arguments of
 # ``qk_apply``.  #1_l2n reads the RAW ``q`` / ``k`` (TMA, as #1) and writes ``qn`` / ``kn`` (contiguous
@@ -456,7 +480,7 @@ PROVISIONAL_ARGS: tuple[str, ...] = ("ticket",)
 # b // 2 over the value columns (b % 2) * 64 .. + 64) and ``vh = 128`` (one CTA per (segment, head)); both write
 # bitwise-identical tapes / pools, so the host picks per launch on plan integers.  The vh64 records are
 # ``<record>_vh64`` in the registry (selected by ``ctas_per_head = 2``; the grid rule carries it).
-FWDH_PROGRAMS = ("kcp_fwdh_offset", "kcp_fwdh_tape")
+FWDH_PROGRAMS = ("kcp_fwdh_offset", "kcp_fwdh_tape", "kcp_fwdh_out")
 DHU_PROGRAMS = ("kcp_dhu_offset", "kcp_dhu_tape")
 VH64_SUFFIX = "_vh64"
 
@@ -656,6 +680,9 @@ SAVED_TENSOR_OF_BUFFER: dict[str, str] = {
 # The #7 offset walk's never-dereferenced tape pointer: the forward tape of the same shape and dtype, live by then
 # (saved or replayed), so ``dh_tape`` is first allocated by the first tape walk -- after the adjoint merge.
 DHU_OFFSET_TAPE_STANDIN = "h_tape"
+# The #2 offset walk's never-dereferenced tape pointers ``h_tape`` / ``v_new``: the ``u`` tape (BF16 and contiguous like
+# both, written by #1 before any walk), so the summaries bind neither and the first tape walk allocates both.
+FWDH_OFFSET_TAPE_STANDIN = "u"
 BWD_DEAD_AFTER_ADJ_MERGE: tuple[str, ...] = (
     "c1_send",
     "c1_recv",
@@ -688,6 +715,10 @@ def saved_tapes(save_mode: str) -> tuple[str, ...]:
 # FWD_DEAD_AFTER_PREP / FWD_DEAD_BEFORE_O): the arena state a forward leaves, and the state a kept backward restores.
 FWD_TAPES_ARENA_AFTER_FWD: tuple[str, ...] = tuple(
     n for n in FWD_TAPES if n not in FWD_DEAD_BEFORE_O and n not in FWD_DEAD_AFTER_PREP
+)
+# The tapes a fused forward (``kcp_fwdh_out``: #5 inside the walks) binds and leaves: no ``h`` / ``v_new`` tape.
+FWD_TAPES_ARENA_AFTER_FUSED: tuple[str, ...] = tuple(
+    n for n in FWD_TAPES_ARENA_AFTER_FWD if n not in ("h_tape", "v_new")
 )
 
 
@@ -1349,7 +1380,8 @@ class Backend:
 
 
 def _public_args(args: dict[str, Any]) -> dict[str, Any]:
-    return {k: v for k, v in args.items() if not k.startswith("_")}
+    """``args`` without its private keys (a leading ``_``; ``k[:1]`` is ``k.startswith("_")`` without a method call)."""
+    return {k: v for k, v in args.items() if k[:1] != "_"}
 
 
 def _registry() -> Any | None:
@@ -1361,16 +1393,64 @@ def _registry() -> Any | None:
     return cake_jit
 
 
+# The registry answers of l2n_records_shipped / fused_o_shipped, derived once per registry identity: they are read on
+# every call and launch, and the registry is the package's generated record table (data, never changed at run time).
+# The key is the registry module, its record table and its records_of_program function (a registry or a table put in
+# their place -- a test's stand-in -- is another key); the entry holds the keyed objects, so their ids stay theirs.
+_REGISTRY_ANSWERS: dict[tuple, tuple[bool, tuple]] = {}
+
+
+def _registry_answer(question: tuple, jit: Any, derive: Callable[[], bool]) -> bool:
+    modules = getattr(jit, "MODULES", None)
+    lookup = getattr(jit, "records_of_program", None)
+    try:
+        size = len(modules)
+    except TypeError:  # no record table: nothing to key on, derived per call
+        return derive()
+    key = (*question, id(jit), id(modules), size, id(lookup))
+    hit = _REGISTRY_ANSWERS.get(key)
+    if hit is None:
+        hit = _REGISTRY_ANSWERS[key] = (bool(derive()), (jit, modules, lookup))
+    return hit[0]
+
+
 def l2n_records_shipped() -> bool:
     """Whether the registry ships a record of every in-kernel Q / K L2 norm program (:data:`L2N_PROGRAMS`): the
     kernel backend runs ``use_qk_l2norm_in_kernel=True`` only then; the fake backend emulates them either way."""
     jit = _registry()
     if jit is None:
         return False
-    try:
-        return all(jit.records_of_program(p) for p in L2N_PROGRAMS)
-    except ValueError:  # a registry that does not know the programs
+
+    def derive() -> bool:
+        try:
+            return all(jit.records_of_program(p) for p in L2N_PROGRAMS)
+        except ValueError:  # a registry that does not know the programs
+            return False
+
+    return _registry_answer(("l2n",), jit, derive)
+
+
+def fused_o_shipped(arch: str | None = None) -> bool:
+    """Whether the registry ships the output walk ``kcp_fwdh_out`` in both forms (the ``vh = 128`` record and the
+    ``_vh64`` one) for ``arch`` (``None``: for any architecture, the fake backend's emulation): a forward folds #5
+    into its tape walks only then (:func:`_fuse_o`), so a registry without them keeps every forward split."""
+    jit = _registry()
+    if jit is None:
         return False
+
+    def derive() -> bool:
+        try:
+            names = jit.records_of_program("kcp_fwdh_out")
+        except ValueError:  # a registry that does not know the program
+            return False
+        forms = {
+            int(jit.MODULES[n].get("grid_rule", {}).get("ctas_per_head", 1))
+            for n in names
+            if arch is None or arch in jit.MODULES[n].get("arches", ())
+        }
+        return forms >= {1, 2}
+
+    return _registry_answer(("fused_o", arch), jit, derive)
 
 
 def resolve_launch(
@@ -1823,8 +1903,8 @@ class _Tables:
             "fwd_b_off": SUMMARY_TILE,
             "fwd_out_off": TILE,
             "adj_d_off_d": TILE,
-            "adj_d_off_dm": SUMMARY_TILE,
-            "adj_m_off_b1": SUMMARY_TILE,
+            "adj_d_off_dm": TILE,
+            "adj_m_off_b1": TILE,
             "adj_m_off_c1": SUMMARY_TILE,
             "adj_out_off": TILE,
         }
@@ -1896,12 +1976,8 @@ class _Tables:
             in_slot[s // P] if (s % P == 0 and frags[s // P].crossing_in) else -1
             for s in range(NSEG)
         )
-        self.m_b1_index = tuple(
-            in_slot[s // P]
-            if (s % P == 0 and frags[s // P].crossing_in and frags[s // P].crossing_out)
-            else -1
-            for s in range(NSEG)
-        )
+        # io_slot (the b1 map plane) of segment 0 of a fragment crossing in and out, else -1
+        self.m_b1_index = tuple(int(i) for i in hp.b1_m_index)
         self.seg_index = tuple(range(NSEG))
         # the head plan's own device tables (uploaded once at first use) by content, so dev() never re-uploads them
         self._named: dict[tuple[torch.dtype, tuple[int, ...]], str] = {}
@@ -2217,11 +2293,12 @@ class _Tables:
             for f in ins:
                 if f.crossing_out:
                     S = [f.slot * P + p for p in range(P)]
+                    io = self.m_b1_index[f.slot * P]  # the map plane slot
                     for h in range(H):
                         ch["tmap_m"].add(
                             [(mt(s, h), -1, -1) for s in S],
                             x0=0,
-                            y_final=self.b1_m_tiles[in_slot[f.slot]][h] * TILE,
+                            y_final=self.b1_m_tiles[io][h] * TILE,
                         )
             for name, fs in (("dcarry_end", ends), ("dcarry_cross", outs)):
                 for f in fs:
@@ -2500,6 +2577,22 @@ def _identity_tile(
         if isinstance(caches, dict):
             caches[key] = t
     return t
+
+
+def _chunk_tokens(ctx: Any, chunk_len: Sequence[int]) -> int:
+    """The tokens the context's chunk table ``chunk_len`` covers (its sum; the in-kernel L2 norm's coverage check).
+    A context's table is an immutable tuple: its sum is derived once and kept in the context's cache with the table
+    it was taken over (a context without a cache, or a table of another type, sums per call)."""
+    caches = getattr(ctx, "_caches", None)
+    if not isinstance(caches, dict) or type(chunk_len) is not tuple:
+        return sum(int(n) for n in chunk_len)
+    hit = caches.get(("kcp_chunk_tokens",))
+    if hit is None or hit[0] is not chunk_len:
+        hit = caches[("kcp_chunk_tokens",)] = (
+            chunk_len,
+            sum(int(n) for n in chunk_len),
+        )
+    return hit[1]
 
 
 def _context_tables(
@@ -2958,6 +3051,15 @@ class CallDetKcp:
             )
 
     # -- buffers
+    def output(self) -> torch.Tensor:
+        """The forward's output ``o`` ``[T_r, HV, 128]``, allocated at its first writer: the first output walk of a
+        fused forward (after the summaries and the exchange's send planes), else :func:`_fwd_body` before #5."""
+        if self.out is None:
+            self.out = _alloc(
+                (self.T_r, self.HV, D), self.backend.dtypes["out"], self.device
+            )
+        return self.out
+
     def buf(self, name: str) -> torch.Tensor:
         t = self.bufs.get(name)
         return t if t is not None else self.ws.pool(name, self.tb.sizes[name])
@@ -3104,7 +3206,24 @@ class CallDetKcp:
         walk = [int(s) for s in walk]
         self.counters["walks"] += 1
         args = self._walk_common(walk)
-        if name in ("kcp_fwdh_offset", "kcp_fwdh_tape"):
+        if name == "kcp_fwdh_out":
+            # the tape walk's inputs from the indexed initial states and #5's operands: o rows of the walked chunks,
+            # no tape and no final-state pool
+            h0 = self.block(kw.get("h0"))
+            args.update(
+                k=self.qk("k"),
+                w=self.tape("w"),
+                u=self.tape("u"),
+                rowscale=self.tape("rowscale"),
+                gamma=self.tape("gamma"),
+                **self._block_args("h0", h0),
+                tile_stride=h0.stride,
+                q=self.qk("q"),
+                aqk=self.tape("aqk"),
+                qscale=self.tape("qscale"),
+                o=self.output(),
+            )
+        elif name in ("kcp_fwdh_offset", "kcp_fwdh_tape"):
             tape = name == "kcp_fwdh_tape"
             # The unused pool of a walk is the ZERO block (every index -1, a never-read base pointer): the tape
             # walk reads h0 and writes the tapes only; the offset walk starts from zero and writes the indexed final
@@ -3121,8 +3240,11 @@ class CallDetKcp:
                 **self._block_args("h0", h0),
                 **self._block_args("out", out),
                 tile_stride=h0.stride if tape else out.stride,
-                h_tape=self.tape("h_tape"),
-                v_new=self.tape("v_new"),
+                # The offset program never dereferences the tape pointers (its build holds no load or store of them),
+                # so it gets ``u`` for both (``FWDH_OFFSET_TAPE_STANDIN``): binding ``h_tape`` / ``v_new`` here would
+                # allocate them at the summaries, while every forward pool is live, for a walk that never writes them.
+                h_tape=self.tape("h_tape" if tape else FWDH_OFFSET_TAPE_STANDIN),
+                v_new=self.tape("v_new" if tape else FWDH_OFFSET_TAPE_STANDIN),
             )
         elif name == "kcp_transfer_walk":
             out = self.block(kw["out"])
@@ -3614,7 +3736,7 @@ def _record(kind: str, call: CallDetKcp) -> None:
         ),  # forward: its tapes were kept for the backward of this graph task
         "fwd_o": call.scratch.get(
             "fwd_o"
-        ),  # forward: "launched" | "skipped" (recompute_output="auto": the recompute's dead #5)
+        ),  # forward: "launched" | "skipped" (recompute_output="auto": the recompute's dead #5) | "fused" (kcp_fwdh_out)
         "fwd_o_reason": call.scratch.get(
             "fwd_o_reason"
         ),  # forward: "always" | "dead" | "not_executable" | why the frame proof did not hold (the decision, recorded on every rank)
@@ -3772,10 +3894,12 @@ def _ring_chain(elems: list[tuple[int, int, int, int]]) -> Chains:
     return ch
 
 
-def _ring_forward(call: CallDetKcp, *, walk_starts: bool = False) -> None:
+def _ring_forward(
+    call: CallDetKcp, *, walk_starts: bool = False, program: str = "kcp_fwdh_tape"
+) -> None:
     """Hops of the forward ring; afterwards ``S_in`` holds the crossing-in fragments' initial states (as after c2).
-    ``walk_starts``: the document-start tape walk runs under hop 1 (overlap schedule); the caller then walks only the
-    crossing-in segments."""
+    ``walk_starts``: the document-start tape walk (``program``: the tape walk or the output walk) runs under hop 1
+    (overlap schedule); the caller then walks only the crossing-in segments."""
     tb, H = call.tb, call.H
     ring = _ring_tables(tb)
     out_pool, in_pool = call.buf("ring_out"), call.buf("ring_in")
@@ -3841,9 +3965,7 @@ def _ring_forward(call: CallDetKcp, *, walk_starts: bool = False) -> None:
                 if tb.P > 1
                 else None
             )
-            call.walk(
-                "kcp_fwdh_tape", tb.walk_start, h0=carry
-            )  # document starts: under hop 1
+            call.walk(program, tb.walk_start, h0=carry)  # document starts: under hop 1
         _ring_wait(works)
         for f in receivers:
             _ring_scatter(
@@ -3885,7 +4007,7 @@ def _ring_backward(call: CallDetKcp, *, walk_ends: bool = False) -> None:
             elems = [
                 (
                     tb.ds_out_tiles[ring.out_slot[f.slot]][hh],
-                    m_tiles[ring.in_slot[f.slot]][hh],
+                    m_tiles[tb.m_b1_index[f.slot * tb.P]][hh],
                     d_tiles[ring.in_slot[f.slot]][hh],
                     ring.in_slot[f.slot] * H + hh,
                 )
@@ -4001,6 +4123,34 @@ def _walk_pair_enabled(
     if knob is None:
         return _device_capability(device) in WALK_PAIR_AUTO_CAPABILITIES
     return bool(knob)
+
+
+def _fuse_o_enabled(call: CallDetKcp) -> bool:
+    """Whether this call's forwards fold #5 into their tape walks where the tapes have no reader: test knob
+    ``fused_o`` = 1 (shipped), ``save_mode="light"`` and ``boundary_mode="saved"`` (no saved tape, no replayed
+    forward exchange), and the registry ships the output walk in both forms for the device's architecture
+    (:func:`fused_o_shipped`; the fake backend emulates any shipped record)."""
+    opts = call.opts
+    if int(opts.knob("fused_o")) != 1:
+        return False
+    if opts.save_mode != "light" or opts.boundary_mode != "saved":
+        return False
+    arch = None
+    if isinstance(call.backend, KernelBackend) and call.device.type == "cuda":
+        index = (
+            call.device.index
+            if call.device.index is not None
+            else torch.cuda.current_device()
+        )
+        arch = call.backend.launcher().device_arch(index)
+    return fused_o_shipped(arch)
+
+
+def _fuse_o(call: CallDetKcp, *, launch: bool, hand_off: bool) -> bool:
+    """Whether this forward runs the output walk ``kcp_fwdh_out`` on every tape-walk launch list in place of the tape
+    walk and #5: #5 launches, the tapes go to no backward (not a hand-off forward), the rank holds tokens and
+    :func:`_fuse_o_enabled`."""
+    return bool(launch and not hand_off and call.T_r > 0 and _fuse_o_enabled(call))
 
 
 def _side_stream(device: torch.device) -> torch.cuda.Stream:
@@ -4119,8 +4269,15 @@ def _summaries(call: CallDetKcp) -> None:
     )  # M_f^T into the c1 pairs (bitwise); the gather lands in the carry plane, which nothing has written yet
 
 
-def _fwd_tapes(call: CallDetKcp, *, carry: Indexed | None, wait_first: bool) -> None:
-    """The forward tape walk(s) after ``S_in`` is complete.  ``fused_walks``: one launch from one pool -- the carry
+def _fwd_tapes(
+    call: CallDetKcp,
+    *,
+    carry: Indexed | None,
+    wait_first: bool,
+    program: str = "kcp_fwdh_tape",
+) -> None:
+    """The forward tape walk(s) after ``S_in`` is complete (``program``: the tape walk, or the output walk of a fused
+    forward on the same launch list).  ``fused_walks``: one launch from one pool -- the carry
     plane at ``P > 1`` (``h0_index_fused``: carries, the ``S_in`` copies of ``carry_in``, ``-1`` zero states),
     ``S_in`` itself at ``P = 1`` -- over every live segment (``wait_first``) or the crossing-in fragments' segments
     (the document-start walk ran under c1); otherwise the three separate launches."""
@@ -4132,17 +4289,13 @@ def _fwd_tapes(call: CallDetKcp, *, carry: Indexed | None, wait_first: bool) -> 
             if tb.P > 1
             else h0_in
         )
-        call.walk(
-            "kcp_fwdh_tape", tb.walk_live if wait_first else tb.walk_in_fused, h0=h0
-        )
+        call.walk(program, tb.walk_live if wait_first else tb.walk_in_fused, h0=h0)
         return
     if wait_first:
-        call.walk(
-            "kcp_fwdh_tape", tb.walk_start, h0=carry
-        )  # document starts: after wait(c2)
-    call.walk("kcp_fwdh_tape", tb.walk_in_p0, h0=h0_in)
+        call.walk(program, tb.walk_start, h0=carry)  # document starts: after wait(c2)
+    call.walk(program, tb.walk_in_p0, h0=h0_in)
     if tb.P > 1:
-        call.walk("kcp_fwdh_tape", tb.walk_in_p1, h0=carry)
+        call.walk(program, tb.walk_in_p1, h0=carry)
 
 
 def _adj_tapes(call: CallDetKcp, *, dcarry: Indexed | None, wait_first: bool) -> None:
@@ -4177,13 +4330,15 @@ def _forward(
     replay: bool,
     hand_off: bool = False,
     s_in: torch.Tensor | None = None,
+    fuse_o: bool = False,
 ) -> None:
-    """The forward sequence.  ``save``: the saved set is kept (fresh ``S_in``; with ``save_transfer`` also the c1
-    receive tensor; ``M_seg`` at ``P > 1`` with ``save_transfer`` or ``save_mode="full"``; with ``save_mode="full"``
-    fresh forward tapes); ``replay``: the forward of a replay-mode backward (no ``fwd_o``, nothing kept);
-    ``hand_off``: the forward tapes go to the backward of this graph task (``reuse_recompute_tapes``): no tape is
-    dropped and the tape walk takes the light replay's form (:func:`_replay_tape_walk`).
-    ``s_in``: the recompute of a forward that stored its incoming states in a recompute
+    """The forward sequence.  ``fuse_o``: every tape-walk launch runs the output walk ``kcp_fwdh_out`` on its launch
+    list instead (``o`` written in the walk, no ``h`` / ``v_new`` tape; :func:`_fuse_o`).  ``save``: the saved set is
+    kept (fresh ``S_in``; with ``save_transfer`` also the c1 receive tensor; ``M_seg`` at ``P > 1`` with
+    ``save_transfer`` or ``save_mode="full"``; with ``save_mode="full"`` fresh forward tapes); ``replay``: the forward
+    of a replay-mode backward (no ``fwd_o``, nothing kept); ``hand_off``: the forward tapes go to the backward of this
+    graph task (``reuse_recompute_tapes``): no tape is dropped and the tape walk takes the light replay's form
+    (:func:`_replay_tape_walk`).  ``s_in``: the recompute of a forward that stored its incoming states in a recompute
     handle -- no collective, no summary walk over the crossing-out fragments, no merge of the owners: #1, at
     ``P > 1`` the local segment walks and carry merges from ``S_in``, and the light replay's tape walk
     (:func:`_replay_from_states`), the very launches of the light backward's replay.  ``schedule="wait_first"``: ``c1 -> wait -> fwd merge -> c2 ->
@@ -4191,6 +4346,16 @@ def _forward(
     read only ``c1_recv`` / the staging planes and the tapes read no collective buffer, so every published bit is the
     same under either schedule."""
     tb, opts = call.tb, call.opts
+    if fuse_o and (hand_off or replay):
+        raise ValueError(
+            "fuse_o: a hand-off or replay forward writes the tapes its backward reads"
+        )
+    # the walk every tape-walk launch site of this forward runs
+    walk_program = "kcp_fwdh_out" if fuse_o else "kcp_fwdh_tape"
+    if fuse_o and opts.graph == "off":
+        # a caller-held arena may still bind the h / v_new tapes a split forward or a kept backward left
+        # (FWD_TAPES_ARENA_AFTER_FWD): this forward writes neither, so they go before #1
+        call.release_tapes(("h_tape", "v_new"))
     # before the first launch: the backend record reads it
     call.scratch["hand_off"] = bool(hand_off)
     wait_first = call.schedule == "wait_first"
@@ -4234,7 +4399,7 @@ def _forward(
         )
     if s_in is not None:
         call.bufs["S_in"] = s_in
-        _replay_from_states(call, have_m=False)
+        _replay_from_states(call, have_m=False, program=walk_program)
         if call.opts.knob("record_states"):
             call.scratch["states"] = {"S_in": gather_states(s_in, tb.s_in_tiles)}
         return
@@ -4259,7 +4424,7 @@ def _forward(
             merged_start = True
         # a hand-off forward walks every tape in the replay's single form below
         started_early = not wait_first and not hand_off
-        _ring_forward(call, walk_starts=started_early)
+        _ring_forward(call, walk_starts=started_early, program=walk_program)
     else:
         w1 = call.a2a("c1", "c1_send", "c1_recv", *tb.split_elems("c1"))
         if not wait_first:
@@ -4271,7 +4436,7 @@ def _forward(
             # a hand-off forward walks every tape in the replay's single form below
             if not hand_off:
                 call.walk(
-                    "kcp_fwdh_tape", tb.walk_start, h0=carry
+                    walk_program, tb.walk_start, h0=carry
                 )  # document starts: under c1
                 started_early = True
         call.wait(w1)
@@ -4307,7 +4472,7 @@ def _forward(
         _replay_tape_walk(call)
     else:
         _fwd_tapes(
-            call, carry=carry, wait_first=not started_early
+            call, carry=carry, wait_first=not started_early, program=walk_program
         )  # no exchange (N_out = 0) or the wait_first schedule: every walk runs here
     if call.opts.knob("record_states"):
         call.scratch["states"] = {
@@ -4342,10 +4507,13 @@ def _replay_tapes(call: CallDetKcp, saved: SavedDetKcp) -> None:
     _replay_from_states(call, have_m=saved.M_seg is not None)
 
 
-def _replay_from_states(call: CallDetKcp, *, have_m: bool) -> None:
+def _replay_from_states(
+    call: CallDetKcp, *, have_m: bool, program: str = "kcp_fwdh_tape"
+) -> None:
     """The light replay after #1, once ``S_in`` is bound: at ``P > 1`` the carries again (``b_seg``, and ``M_seg^T``
-    unless ``have_m``, from zero; the carry merges from ``S_in``), then the tape walk(s).  Shared by the light
-    backward and the recompute of a forward whose states a recompute handle carries (no collective either way)."""
+    unless ``have_m``, from zero; the carry merges from ``S_in``), then the tape walk(s) (``program``: the output walk
+    in a fused forward).  Shared by the light backward and the recompute of a forward whose states a recompute handle
+    carries (no collective either way)."""
     tb = call.tb
     if (
         tb.P > 1
@@ -4375,31 +4543,30 @@ def _replay_from_states(call: CallDetKcp, *, have_m: bool) -> None:
             )
         call.merge("carry_start")
         call.merge("carry_in")
-    _replay_tape_walk(call)
+    _replay_tape_walk(call, program=program)
 
 
-def _replay_tape_walk(call: CallDetKcp) -> None:
+def _replay_tape_walk(call: CallDetKcp, *, program: str = "kcp_fwdh_tape") -> None:
     """The #2 tape walk(s) of the light replay once ``S_in`` (and at ``P > 1`` the carry plane) is in place: one
     fused launch over every live segment from the carry plane at ``P > 1``, else the segment-0 walk over every segment
     from ``S_in`` (plus the ``p > 0`` segments from the carries without fused walks).  Also the tape walk of a
-    hand-off forward (``reuse_recompute_tapes``), so the kept tapes are this launch list."""
+    hand-off forward (``reuse_recompute_tapes``), so the kept tapes are this launch list; ``program``: the output
+    walk of a fused recompute from a recompute handle (same launch list)."""
     tb = call.tb
     if (
         tb.fused_walks and tb.P > 1
     ):  # the whole tape replay from the carry plane in one launch
         call.walk(
-            "kcp_fwdh_tape",
+            program,
             tb.walk_live,
             h0=call.indexed("carry", tb.h0_index_fused, tb.carry_tiles),
         )
     else:
         p0 = [s for s in tb.walk_all if s % tb.P == 0]
-        call.walk(
-            "kcp_fwdh_tape", p0, h0=call.indexed("S_in", tb.h0_index, tb.s_in_tiles)
-        )
+        call.walk(program, p0, h0=call.indexed("S_in", tb.h0_index, tb.s_in_tiles))
         if tb.P > 1:
             call.walk(
-                "kcp_fwdh_tape",
+                program,
                 [s for s in tb.walk_all if s % tb.P != 0],
                 h0=call.indexed("carry", tb.carry_index, tb.carry_tiles),
             )
@@ -4407,19 +4574,21 @@ def _replay_tape_walk(call: CallDetKcp) -> None:
 
 def _kept_release(call: CallDetKcp, kept: _KeptTapes) -> None:
     """The kept tapes leave the backward after #8, their last reader: unbound from the call; the tapes an eager
-    forward leaves in the arena (:data:`FWD_TAPES_ARENA_AFTER_FWD`) return to this call's workspace when it holds
+    forward leaves in the arena (:data:`FWD_TAPES_ARENA_AFTER_FWD`, or :data:`FWD_TAPES_ARENA_AFTER_FUSED` when this
+    call's forwards fuse #5: the next forward binds no ``h`` / ``v_new``) return to this call's workspace when it holds
     none of that name at the same geometry -- a caller-held workspace ends a kept backward as a forward leaves it,
     so the next checkpointed forward allocates nothing but its output (#7039, caller-workspace form) -- and the
-    other six are freed here, with the handed-over ``stage_m`` plane and the handed-over ``qn`` / ``kn`` (already
+    others are freed here, with the handed-over ``stage_m`` plane and the handed-over ``qn`` / ``kn`` (already
     unbound from the call after #8 with the norm's other buffers; a forward leaves no norm row in the arena)."""
+    leaves = (
+        FWD_TAPES_ARENA_AFTER_FUSED
+        if _fuse_o_enabled(call)
+        else FWD_TAPES_ARENA_AFTER_FWD
+    )
     for name in FWD_TAPES:
         t = kept.tapes.get(name)
         call.tapes.pop(name, None)
-        if (
-            t is not None
-            and name in FWD_TAPES_ARENA_AFTER_FWD
-            and call.ws.geometry == kept.geometry
-        ):
+        if t is not None and name in leaves and call.ws.geometry == kept.geometry:
             call.ws.adopt_tape(name, t)
     kept.clear()
     KEPT_STATS["released"] += 1
@@ -4822,10 +4991,12 @@ def _prepare(
     if opts.use_qk_l2norm_in_kernel:
         # #1_l2n writes qn / kn / r for the tokens of the real chunks only: they must cover [0, T_r) (metadata)
         chunk_len = getattr(ctx, "chunk_len", None)
-        if chunk_len is not None and sum(int(n) for n in chunk_len) != int(T):
-            raise ValueError(
-                f"use_qk_l2norm_in_kernel: the context's chunks cover {sum(int(n) for n in chunk_len)} of {T} tokens"
-            )
+        if chunk_len is not None:
+            covered = _chunk_tokens(ctx, chunk_len)
+            if covered != int(T):
+                raise ValueError(
+                    f"use_qk_l2norm_in_kernel: the context's chunks cover {covered} of {T} tokens"
+                )
     if opts.exchange == "ring":
         validate_ring(ctx.n_d_max)
     device = torch.device(ctx.device)
@@ -5134,7 +5305,27 @@ def _fwd_body(
     call.scratch["hand_off_reason"] = hand_off_reason
     if hand_off:
         _kept_evict_all()  # one live entry: the previous set is freed before this forward materialises its own
-    _forward(call, save=save, replay=False, hand_off=hand_off, s_in=s_in)
+    # #5's decision comes before the forward, which folds #5 into its tape walks when it launches (``fuse_o``): the
+    # frame proof reads the count the Function saves after this forward (memoised per count; this forward packs
+    # nothing), asserted against the saved set below
+    n_saved = _saved_count(call, save)
+    launch, reason = True, "always"
+    if (
+        autograd_node
+        and call.opts.recompute_output == "auto"
+        and call.opts.graph == "off"
+    ):
+        if not executable:
+            # autograd creates no node and packs nothing: the holders still waiting are a later op's
+            reason = "not_executable"
+        else:
+            # the Function saves the five operands and saved.tensors() right after this forward returns
+            dead, reason = frame_proof(n_saved)
+            launch = not dead
+            if reason in _RECOMPUTE_FRAME_REASONS:
+                RECOMPUTE_OUTPUT_STATS["skipped" if dead else "launched"] += 1
+    fuse_o = _fuse_o(call, launch=launch, hand_off=hand_off)
+    _forward(call, save=save, replay=False, hand_off=hand_off, s_in=s_in, fuse_o=fuse_o)
     stage_m = None
     if hand_off and call.tb.P > 1 and not call.opts.save_transfer:
         # the transfer walk's M_seg^T plane: the backward's merges read it and no saved M_seg replaces it; the view
@@ -5152,28 +5343,16 @@ def _fwd_body(
             # the tape walks were kn's last readers (a hand-off forward hands kn over with its tapes)
             call.release_tapes(("kn",))
         call.release_pools(FWD_DEAD_POOLS)
-    call.out = _alloc((call.T_r, call.HV, D), call.backend.dtypes["out"], call.device)
+    call.output()  # a fused forward's output walks wrote it; else allocated here, after the releases, for #5
     saved = _saved_set(call) if save else None
-    launch, reason = True, "always"
-    if (
-        autograd_node
-        and call.opts.recompute_output == "auto"
-        and call.opts.graph == "off"
-    ):
-        if not executable:
-            # autograd creates no node and packs nothing: the holders still waiting are a later op's
-            reason = "not_executable"
-        else:
-            # the Function saves the five operands and saved.tensors() right after this forward returns
-            dead, reason = frame_proof(
-                _SAVED_OPERANDS + (len(saved.tensors()) if saved is not None else 0)
-            )
-            launch = not dead
-            if reason in _RECOMPUTE_FRAME_REASONS:
-                RECOMPUTE_OUTPUT_STATS["skipped" if dead else "launched"] += 1
-    call.scratch["fwd_o"] = "launched" if launch else "skipped"
+    if _SAVED_OPERANDS + (len(saved.tensors()) if saved is not None else 0) != n_saved:
+        raise RuntimeError(
+            f"_saved_count {n_saved} differs from the saved set the Function packs "
+            f"({_SAVED_OPERANDS} + {len(saved.tensors()) if saved is not None else 0})"
+        )
+    call.scratch["fwd_o"] = "fused" if fuse_o else ("launched" if launch else "skipped")
     call.scratch["fwd_o_reason"] = reason
-    if launch:
+    if launch and not fuse_o:
         call.local("fwd_o")
     if call.l2n and call.opts.graph == "off" and not hand_off:
         call.release_tapes(("qn",))  # #5 was qn's last reader (or #5 is left out)
@@ -5376,6 +5555,23 @@ def _saved_fresh_pools(saved: SavedDetKcp | None) -> tuple[str, ...]:
     return tuple(names)
 
 
+def _check_mode_objects(saved: Any, workspace: Any) -> None:
+    """The deterministic backward reads the deterministic forward's :class:`SavedDetKcp` and a caller-held
+    :class:`WorkspaceDetKcp` only.  A saved set or workspace of the non-deterministic package (or any other object) is
+    refused with ``ValueError`` before any launch.  The check is by type: the saved sets of both modes have the same
+    fields and version, so their fields cannot tell them apart."""
+    for name, obj, cls in (
+        ("saved", saved, SavedDetKcp),
+        ("workspace", workspace, WorkspaceDetKcp),
+    ):
+        if obj is not None and not isinstance(obj, cls):
+            raise ValueError(
+                f"chunk_gdn_det_bwd_kcp: {name} must be a {cls.__name__} of the deterministic mode (got "
+                f"{type(obj).__module__}.{type(obj).__qualname__}); the deterministic backward reads the "
+                f"deterministic forward's {name} only"
+            )
+
+
 def chunk_gdn_det_bwd_kcp(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -5393,7 +5589,10 @@ def chunk_gdn_det_bwd_kcp(
     **knobs: Any,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """The KCP backward: ``(dq, dk, dv, dbeta, dg)``, fresh.  ``saved=None`` replays the forward.
-    ``use_qk_l2norm_in_kernel`` must be the forward's (a saved set of the other form is refused)."""
+    ``use_qk_l2norm_in_kernel`` must be the forward's (a saved set of the other form is refused).  ``saved`` and
+    ``workspace`` must be this package's :class:`SavedDetKcp` / :class:`WorkspaceDetKcp`: a saved set or workspace of
+    the non-deterministic mode is refused with ``ValueError`` (:func:`_check_mode_objects`)."""
+    _check_mode_objects(saved, workspace)
     over = _literal_overrides(
         options,
         (
@@ -5827,6 +6026,7 @@ __all__ = [
     "LAST_CALL",
     "BWD_DEAD_AFTER_ADJ_MERGE",
     "DHU_OFFSET_TAPE_STANDIN",
+    "FWDH_OFFSET_TAPE_STANDIN",
     "DHU_PROGRAMS",
     "BWD_DEAD_BEFORE_DQKG",
     "BWD_DEAD_BEFORE_TAPES",
@@ -5836,6 +6036,7 @@ __all__ = [
     "FWD_DEAD_BEFORE_O",
     "FWD_DEAD_POOLS",
     "FWD_TAPES_ARENA_AFTER_FWD",
+    "FWD_TAPES_ARENA_AFTER_FUSED",
     "KEPT_STATS",
     "L2N_PROGRAMS",
     "L2N_SIBLING_OF",
@@ -5889,6 +6090,7 @@ __all__ = [
     "gdn_det_workspace_bytes_kcp",
     "get_backend",
     "graph_cache_clear",
+    "fused_o_shipped",
     "kept_registry_size",
     "l2n_records_shipped",
     "make_options",

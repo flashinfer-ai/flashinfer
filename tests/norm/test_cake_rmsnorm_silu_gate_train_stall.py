@@ -686,11 +686,11 @@ FORWARD_EDGES = ("first", "last")
 
 def _persistent_forward_tokens(role: str, edge: str) -> tuple[int, int, float]:
     """``(blocks_per_slot, T, cta_share)``: the row blocks per CTA slot of the
-    forward module of ``role`` (``fwd_long`` or ``fwd_mid``) at ``edge`` of
-    its rows, the fewest tokens ``T`` whose ``T * H`` rows give each slot that
-    many, and the share of one CTA's blocks in the call alone (blocks a CTA
-    walks over blocks a slot runs); skips where the architecture routes no such
-    module."""
+    forward module of ``role`` (``fwd_xlong``, ``fwd_long`` or ``fwd_mid``)
+    at ``edge`` of its rows, the fewest tokens ``T`` whose ``T * H`` rows give
+    each slot that many, and the share of one CTA's blocks in the call alone
+    (blocks a CTA walks over blocks a slot runs); skips where the architecture
+    routes no such module."""
     device_index = torch.cuda.current_device()
     arch = loader.device_arch(device_index)
     routes = loader.ROUTES[arch]
@@ -704,11 +704,18 @@ def _persistent_forward_tokens(role: str, edge: str) -> tuple[int, int, float]:
     # rows per SM that give each slot of the SM one more row block
     step = int(rule["ctas_per_sm"]) * rows_per_block
     blocks_per_slot = -(-loader.min_rows_per_sm(name, arch) // step)
-    if edge == "last" and role == "fwd_long":
-        blocks_per_slot *= 4
+    # the "last" edge: the most below the next tier's start where the
+    # architecture routes one (the mid forward below the long one, or on
+    # sm_107a, which routes no long forward, below the extra-long one; on
+    # sm_103a the long forward below the extra-long one), else four times
+    # "first"
+    uppers = {"fwd_mid": ("fwd_long", "fwd_xlong"), "fwd_long": ("fwd_xlong",)}
+    upper = next((u for u in uppers.get(role, ()) if u in routes), None)
+    if edge == "last" and upper is not None:
+        upper_start = loader.min_rows_per_sm(routes[upper], arch)
+        blocks_per_slot = (upper_start - 1) // step
     elif edge == "last":
-        long_start = loader.min_rows_per_sm(routes["fwd_long"], arch)
-        blocks_per_slot = (long_start - 1) // step
+        blocks_per_slot *= 4
     tokens = -(-(blocks_per_slot * slots * rows_per_block) // H)
     rows = tokens * H
     assert loader.module_for_rows(arch, "fwd", rows, sms) == name
@@ -755,6 +762,16 @@ def test_long_forward_slows_in_proportion_to_the_sms_held(
     edge: str, ctas: int, threads: int
 ) -> None:
     _forward_slows_in_proportion("fwd_long", edge, ctas, threads)
+
+
+@pytest.mark.parametrize(
+    "ctas,threads", PROPORTIONAL_SIDES, ids=["1x128", "16x640", "32x640"]
+)
+@pytest.mark.parametrize("edge", FORWARD_EDGES)
+def test_extra_long_forward_slows_in_proportion_to_the_sms_held(
+    edge: str, ctas: int, threads: int
+) -> None:
+    _forward_slows_in_proportion("fwd_xlong", edge, ctas, threads)
 
 
 @pytest.mark.parametrize(

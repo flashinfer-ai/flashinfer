@@ -472,7 +472,8 @@ _PERSISTENT_FLAG_PWA = 1
 _PERSISTENT_FLAG_PREFIX_BF16_ADD = 2
 _PERSISTENT_FLAG_PREFIX_ROUND_ONCE = 3
 _PERSISTENT_FLAG_REGISTER_CARRY_ONLY = 4
-# ``persistent:k<K>_nc<nc>_d<depth>_f<15 bits>[_fm][_crfnone][_crheld][_rcp][_write][_cta2][_clc[_cla][_fpf]]``:
+# ``persistent:k<K>_nc<nc>_d<depth>_f<15 bits>[_fm][_crfnone][_crheld][_rcp][_write][_cta2][_clc[_cla][_fpf]]
+# [_fpl][_fpw][r<R>][_tokb]``:
 # ``_fm`` is the fast-math twin, ``_crfnone`` (round 3) the fence-authored twin -- the same program built
 # with ``consumed_release_fence_mode="none"`` (the kernel states its own tcgen05 fences), a
 # registered program of its own whose schedule label ends in ``_authored_fences`` --, ``_crheld``
@@ -496,13 +497,38 @@ _PERSISTENT_FLAG_REGISTER_CARRY_ONLY = 4
 # producer requests a trip's successor at the start of the trip) and with an L2 prefetch of the
 # first token's rows at kernel entry; the per-token work, the output and the grid are the ``_clc``
 # program's, and the schedule label adds ``_clc_lookahead`` / ``_first_chunk_prefetch_l2``.
+# ``_fpl`` and ``_fpw`` issue the first token's L2 prefetches off the barrier / TMEM setup path,
+# one row per lane of warp 8 or one row per warp over warps 2-8; ``_tokb`` (``_clc`` keys only)
+# lets the producer alone read the CLC responses and hand each trip's token to the consumers
+# through shared memory.  The per-token work, the output and the grid are the program's without
+# the suffix, and the schedule label adds ``_first_chunk_prefetch_l2_lanes`` /
+# ``_first_chunk_prefetch_l2_warps`` / ``_clc_token_broadcast``.  An ``r<R>`` right after
+# ``_fpl`` / ``_fpw`` (``_fplr3``, ``_fpwr2``) limits those prefetches to the first token's first
+# R rows in load order, with the same per-token work, output and grid; the schedule label then
+# adds ``_first_chunk_prefetch_l2_rows<R>`` after the lane / warp label.  A fallback never
+# resolves to one of these programs.
 _PERSISTENT_KEY = re.compile(
     r"^persistent:k(?P<K>\d+)_nc(?P<nc>\d+)_d(?P<depth>\d+)_f(?P<bits>[01]+)"
     r"(?P<fm>_fm)?(?P<crfnone>_crfnone)?(?P<crheld>_crheld)?(?P<rcp>_rcp)?(?P<write>_write)?"
-    r"(?P<cta2>_cta2)?(?:(?P<clc>_clc)(?P<cla>_cla)?(?P<fpf>_fpf)?)?$"
+    r"(?P<cta2>_cta2)?(?:(?P<clc>_clc)(?P<cla>_cla)?(?P<fpf>_fpf)?)?"
+    r"(?P<fpl>_fpl)?(?P<fpw>_fpw)?(?P<rows>(?<=_fpl|_fpw)r[1-9][0-9]*)?"
+    r"(?P<tokb>_tokb)?$"
 )
 #: The grid policy of a ``_clc`` program (one CTA per token) and its schedule label's suffix.
 _CLC_GRID_POLICY = "clc_token_queue"
+#: The key groups of the token-queue build and the opt-in levers, in key order; a snapshot-write
+#: key spells ``_write`` before the first of them.
+_PERSISTENT_LEVER_GROUPS = ("clc", "cla", "fpf", "fpl", "fpw", "rows", "tokb")
+#: The schedule label suffix of each opt-in lever group of a persistent key.
+_PERSISTENT_LEVER_LABELS = (
+    ("cla", "_clc_lookahead"),
+    ("fpf", "_first_chunk_prefetch_l2"),
+    ("fpl", "_first_chunk_prefetch_l2_lanes"),
+    ("fpw", "_first_chunk_prefetch_l2_warps"),
+    ("tokb", "_clc_token_broadcast"),
+)
+#: The schedule label suffix of an ``r<R>`` key (``R`` follows it), after the lever labels.
+_PERSISTENT_ROWS_LABEL = "_first_chunk_prefetch_l2_rows"
 _SMALL_M_KEY = re.compile(
     r"^small_m_(direct|cluster(\d+)):k(\d+)(?:_nc(\d+))?(_fm)?(_write)?$"
 )
@@ -601,10 +627,16 @@ def _small_m_plan(
 
 def _write_key(dense_key: str) -> str:
     """The key of the snapshot-write variant of the dense persistent key ``dense_key``: ``_write``
-    goes before a ``_clc`` suffix, so the write variant of a token-queue program is ``..._write_clc``."""
-    if dense_key.endswith("_clc"):
-        return f"{dense_key.removesuffix('_clc')}_write_clc"
-    return f"{dense_key}_write"
+    goes before the ``_clc[_cla][_fpf][_fpl][_fpw][r<R>][_tokb]`` tail, so the write variant of a
+    token-queue program is ``..._write_clc`` and that of an ``_fpl`` program ``..._write_fpl``."""
+    match = _PERSISTENT_KEY.match(dense_key)
+    if match is None or match["write"]:
+        return f"{dense_key}_write"
+    tail = min(
+        (match.start(g) for g in _PERSISTENT_LEVER_GROUPS if match[g]),
+        default=len(dense_key),
+    )
+    return f"{dense_key[:tail]}_write{dense_key[tail:]}"
 
 
 def _cell_pinned_write_keys(arch: Optional[str]) -> frozenset[str]:
@@ -623,8 +655,8 @@ def _persistent_fallback(
     plan: RoutePlan, table: dict[str, str], num_sms: int, M: int, K: int, exact_key: str
 ) -> Optional[RoutePlan]:
     """The registered persistent variant of block count ``K`` closest to the exact plan
-    (never a cell-pinned write program, never a ``_clc`` program; an exact ``_clc`` plan
-    resolves to a program without the suffix, on that program's own grid)."""
+    (never a cell-pinned write program, never a ``_clc``, ``_fpl``, ``_fpw`` or ``_tokb`` program;
+    an exact ``_clc`` plan resolves to a program without the suffix, on that program's own grid)."""
     exact = (
         _PERSISTENT_KEY.match(plan.kernel_key) if plan.kind == "persistent" else None
     )
@@ -650,6 +682,9 @@ def _persistent_fallback(
             continue
         if match["clc"]:
             # a token-queue program covers every token only on its cell's grid of M CTAs
+            continue
+        if match["fpl"] or match["fpw"] or match["tokb"]:
+            # an opt-in lever program serves the cells that name it only
             continue
         if bool(match["write"]) != want_write:
             # the snapshot store exists only in the write variants: never cross that line
@@ -979,10 +1014,17 @@ def _persistent_plan_for_key(
     of its fields (what ``_persistent_plan_exact`` derives for a legacy cell; a ``_crfnone`` key
     labels its schedule ``_authored_fences``, a ``_crheld`` key ``_held_release``, a ``_rcp`` key
     ``_packed_register_carry``, a ``_cta2`` key ``_two_ctas_per_sm``, a ``_clc`` key
-    ``_clc_token_queue``, then a ``_cla`` key ``_clc_lookahead`` and a ``_fpf`` key
-    ``_first_chunk_prefetch_l2``)."""
+    ``_clc_token_queue``, then a ``_cla`` key ``_clc_lookahead``, a ``_fpf`` key
+    ``_first_chunk_prefetch_l2``, a ``_fpl`` key ``_first_chunk_prefetch_l2_lanes``, a ``_fpw``
+    key ``_first_chunk_prefetch_l2_warps`` and a ``_tokb`` key ``_clc_token_broadcast``; an
+    ``r<R>`` key then adds ``_first_chunk_prefetch_l2_rows<R>``)."""
     match = _PERSISTENT_KEY.match(key)
-    if match is None or int(match["K"]) != K or match["write"]:
+    if (
+        match is None
+        or int(match["K"]) != K
+        or match["write"]
+        or (match["tokb"] and not match["clc"])
+    ):
         raise ValueError(
             f"round-2 cell ({M}, {K}) names {key!r}, not a dense persistent key of K={K}"
         )
@@ -1007,10 +1049,11 @@ def _persistent_plan_for_key(
         schedule_id += "_two_ctas_per_sm"
     if match["clc"]:
         schedule_id += f"_{_CLC_GRID_POLICY}"
-    if match["cla"]:
-        schedule_id += "_clc_lookahead"
-    if match["fpf"]:
-        schedule_id += "_first_chunk_prefetch_l2"
+    for group, label in _PERSISTENT_LEVER_LABELS:
+        if match[group]:
+            schedule_id += label
+    if match["rows"]:
+        schedule_id += f"{_PERSISTENT_ROWS_LABEL}{match['rows'].removeprefix('r')}"
     wait_policy = "deferred_wait_st" if _wait_policy(arch) else "control_wait_st"
     route_id = f"{schedule_id}.{arch}.{wait_policy}.k{K}.delta1.write0.norm1.pdl{int(use_pdl)}.{grid_policy}"
     return RoutePlan(

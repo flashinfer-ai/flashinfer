@@ -54,54 +54,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define CAKE_PROGRAM_KERNEL kernel_cake_dsa_indexer_det_topk_58f1c8a36e2cf5f302ae
 #endif
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_S_OUT_ID_OFF 0
-#define SMEM_S_OUT_ID_STAGE_BYTES 8192
-#define SMEM_S_OUT_ID_STRIDE 8192
-#define SMEM_S_OUT_SC_OFF 8192
-#define SMEM_S_OUT_SC_STAGE_BYTES 8192
-#define SMEM_S_OUT_SC_STRIDE 8192
-#define SMEM_S_BITS_OFF 16384
-#if CAKE_INDEXER_WINDOW == 65536
-#define SMEM_S_BITS_STAGE_BYTES 8192
-#define SMEM_S_BITS_STRIDE 8192
-#define SMEM_S_PREF_OFF 24576
-#define SMEM_S_PREF_STAGE_BYTES 4096
-#define SMEM_S_PREF_STRIDE 4096
-#define SMEM_S_XCH_OFF 28672
-#define SMEM_S_XCH_STAGE_BYTES 544
-#define SMEM_S_XCH_STRIDE 544
-#define SMEM_TOTAL 29312
-#elif CAKE_INDEXER_WINDOW == 16384
-#define SMEM_S_BITS_STAGE_BYTES 2048
-#define SMEM_S_BITS_STRIDE 2048
-#define SMEM_S_PREF_OFF 18432
-#define SMEM_S_PREF_STAGE_BYTES 1024
-#define SMEM_S_PREF_STRIDE 1024
-#define SMEM_S_XCH_OFF 19456
-#define SMEM_S_XCH_STAGE_BYTES 352
-#define SMEM_S_XCH_STRIDE 352
-#define SMEM_TOTAL 19840
-#else
-#define SMEM_S_BITS_STAGE_BYTES 1024
-#define SMEM_S_BITS_STRIDE 1024
-#define SMEM_S_PREF_OFF 17408
-#define SMEM_S_PREF_STAGE_BYTES 512
-#define SMEM_S_PREF_STRIDE 512
-#define SMEM_S_XCH_OFF 17920
-#define SMEM_S_XCH_STAGE_BYTES 320
-#define SMEM_S_XCH_STRIDE 320
-#define SMEM_TOTAL 18304
-#endif
-#define THREADS 256
-#if CAKE_INDEXER_WINDOW == 65536
-#define RANK_XCH_PAD 64
-#elif CAKE_INDEXER_WINDOW == 16384
-#define RANK_XCH_PAD 16
-#else
-#define RANK_XCH_PAD 8
-#endif
-
 #include <math_constants.h>
 
 extern "C" {
@@ -127,7 +79,7 @@ CAKE_PROGRAM_KERNEL(int* __restrict__ Indices, float* __restrict__ Scores, int* 
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     int* s_out_id = reinterpret_cast<int*>(smem_raw + 0);
     const int s_out_id_addr = smem + 0;
     unsigned int* s_out_sc = reinterpret_cast<unsigned int*>(smem_raw + 8192);
@@ -192,7 +144,13 @@ CAKE_PROGRAM_KERNEL(int* __restrict__ Indices, float* __restrict__ Scores, int* 
         }
         unsigned int pad_mask = __ballot_sync(0xFFFFFFFF, is_pad != 0);
         if (lane_1 == 0) {
-            s_xch[RANK_XCH_PAD + i * 8 + warp_1] = (unsigned int)__popc(pad_mask);
+#if CAKE_INDEXER_WINDOW == 65536
+            s_xch[64 + i * 8 + warp_1] = (unsigned int)__popc(pad_mask);
+#elif CAKE_INDEXER_WINDOW == 16384
+            s_xch[16 + i * 8 + warp_1] = (unsigned int)__popc(pad_mask);
+#else
+            s_xch[8 + i * 8 + warp_1] = (unsigned int)__popc(pad_mask);
+#endif
         }
     }
     #pragma unroll 1
@@ -202,9 +160,21 @@ CAKE_PROGRAM_KERNEL(int* __restrict__ Indices, float* __restrict__ Scores, int* 
     __syncthreads();
     if (warp_1 == 0) {
         unsigned int pad_sum = 0;
-        unsigned int pad_e_1_0 = s_xch[RANK_XCH_PAD + lane_1 * 2];
+#if CAKE_INDEXER_WINDOW == 65536
+        unsigned int pad_e_1_0 = s_xch[64 + lane_1 * 2];
+#elif CAKE_INDEXER_WINDOW == 16384
+        unsigned int pad_e_1_0 = s_xch[16 + lane_1 * 2];
+#else
+        unsigned int pad_e_1_0 = s_xch[8 + lane_1 * 2];
+#endif
         pad_sum += pad_e_1_0;
-        unsigned int pad_e_1_1 = s_xch[RANK_XCH_PAD + lane_1 * 2 + 1];
+#if CAKE_INDEXER_WINDOW == 65536
+        unsigned int pad_e_1_1 = s_xch[64 + lane_1 * 2 + 1];
+#elif CAKE_INDEXER_WINDOW == 16384
+        unsigned int pad_e_1_1 = s_xch[16 + lane_1 * 2 + 1];
+#else
+        unsigned int pad_e_1_1 = s_xch[8 + lane_1 * 2 + 1];
+#endif
         pad_sum += pad_e_1_1;
         uint32_t pad_incl = pad_sum;
         { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, pad_incl, 1, 32); if (lane >= 1) { pad_incl += peer; } }
@@ -213,11 +183,27 @@ CAKE_PROGRAM_KERNEL(int* __restrict__ Indices, float* __restrict__ Scores, int* 
         { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, pad_incl, 8, 32); if (lane >= 8) { pad_incl += peer; } }
         { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, pad_incl, 16, 32); if (lane >= 16) { pad_incl += peer; } }
         unsigned int pad_run = pad_incl - pad_sum;
-        unsigned int pad_f_2_0 = s_xch[RANK_XCH_PAD + lane_1 * 2];
-        s_xch[RANK_XCH_PAD + lane_1 * 2] = pad_run;
+#if CAKE_INDEXER_WINDOW == 65536
+        unsigned int pad_f_2_0 = s_xch[64 + lane_1 * 2];
+        s_xch[64 + lane_1 * 2] = pad_run;
+#elif CAKE_INDEXER_WINDOW == 16384
+        unsigned int pad_f_2_0 = s_xch[16 + lane_1 * 2];
+        s_xch[16 + lane_1 * 2] = pad_run;
+#else
+        unsigned int pad_f_2_0 = s_xch[8 + lane_1 * 2];
+        s_xch[8 + lane_1 * 2] = pad_run;
+#endif
         pad_run += pad_f_2_0;
-        unsigned int pad_f_2_1 = s_xch[RANK_XCH_PAD + lane_1 * 2 + 1];
-        s_xch[RANK_XCH_PAD + lane_1 * 2 + 1] = pad_run;
+#if CAKE_INDEXER_WINDOW == 65536
+        unsigned int pad_f_2_1 = s_xch[64 + lane_1 * 2 + 1];
+        s_xch[64 + lane_1 * 2 + 1] = pad_run;
+#elif CAKE_INDEXER_WINDOW == 16384
+        unsigned int pad_f_2_1 = s_xch[16 + lane_1 * 2 + 1];
+        s_xch[16 + lane_1 * 2 + 1] = pad_run;
+#else
+        unsigned int pad_f_2_1 = s_xch[8 + lane_1 * 2 + 1];
+        s_xch[8 + lane_1 * 2 + 1] = pad_run;
+#endif
         pad_run += pad_f_2_1;
     }
     #pragma unroll
@@ -305,7 +291,13 @@ CAKE_PROGRAM_KERNEL(int* __restrict__ Indices, float* __restrict__ Scores, int* 
                 unsigned int masked_o = bw_o & below_o;
                 dst = pref_o + (unsigned int)__popc(masked_o);
             } else {
-                unsigned int pad_before = s_xch[RANK_XCH_PAD + i_2 * 8 + warp_1];
+#if CAKE_INDEXER_WINDOW == 65536
+                unsigned int pad_before = s_xch[64 + i_2 * 8 + warp_1];
+#elif CAKE_INDEXER_WINDOW == 16384
+                unsigned int pad_before = s_xch[16 + i_2 * 8 + warp_1];
+#else
+                unsigned int pad_before = s_xch[8 + i_2 * 8 + warp_1];
+#endif
                 uint32_t _rank_in_mask_0 = (uint32_t)__popc(pad_mask_o & ((1u << (unsigned int)lane) - 1u));
                 dst = n_valid + pad_before + _rank_in_mask_0;
             }

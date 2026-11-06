@@ -221,8 +221,27 @@ CTA_ROWS_CHOICES = (64, 128, 256)
 ROUTER_BLOCK_M = 128
 ROUTER_BLOCK_K = 32  # fp32 elements split per stage
 ROUTER_BLOCK_N = 128  # output columns per CTA pair
-# Production split-K counts per instance layout (router_det_forward / router_det_dgrad / router_det_wgrad).
+# Default split-K counts per instance layout (router_det_forward / router_det_dgrad / router_det_wgrad), where
+# ROUTER_SPLIT_RULES names no count for the device and the row.
 ROUTER_SPLITS = {"kk": 4, "kn": 1, "nn_t": 6}
+# The router rows' output width (experts) the measured split counts below apply to.
+ROUTER_RULE_N = 256
+# Measured split-K counts by device and row: (arch, SM count, layout, H) -> ((T_lo, T_hi, splits), ...), H the hidden size
+# (K of the forward ``kk``, M of the swapped weight gradient ``nn_t``) and T the token count (M of ``kk``, K of ``nn_t``) in
+# the inclusive window [T_lo, T_hi], for N = ROUTER_RULE_N.  The window T 16129-16384 holds every token count with the
+# forward's 128 M tiles (505-512 K blocks of the weight gradient).  Each count was measured faster than the default one
+# on GB200 / GB300 (152 SMs) and on B200 / B300 (148 SMs) for the whole router launch (the BF16x3 split, the program and the sum of
+# the partials), alone and while a kernel on another stream holds 8, 16 or 32 SMs (a count that wins alone but loses
+# with fewer free SMs is not listed); other SM counts keep the default.  A different split count is a different K
+# partition: its outputs are bit-exact run to run but not bitwise equal to the default count's.
+ROUTER_SPLIT_RULES: dict[
+    tuple[str, int, str, int], tuple[tuple[int, int, int], ...]
+] = {
+    ("sm_100a", 148, "nn_t", 5120): ((16129, 16384, 9),),
+    ("sm_100a", 152, "nn_t", 5120): ((16129, 16384, 9),),
+    ("sm_103a", 148, "nn_t", 5120): ((16129, 16384, 9),),
+    ("sm_103a", 152, "nn_t", 5120): ((16129, 16384, 9),),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -1447,6 +1466,7 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_107a', True, True, True, True, False, 48, 16384, 4096): {"block_n": 128, "cta_rows": 64, "hints": ('evict_first', 'none'), "pro": 15},
     ('sm_107a', True, True, True, True, False, 64, 16384, 4096): {"block_n": 128, "cta_rows": 64, "hints": ('evict_first', 'none'), "pro": 15},
     ('sm_107a', True, True, True, False, False, 4096, 16384, 512): {"block_n": 192, "cta_rows": 128, "b_swz": 64, "hints": ('none', 'evict_first'), "f32_v8": True, "store_ef": True, "sk_sync": True, "sk_slab": 2, "pro": 15, "epi": 'reg', "pd": 0, "pf": 0},
+    ('sm_107a', True, True, True, False, False, 4096, 16384, 1024): {"block_n": 160, "cta_rows": 256, "b_swz": 64, "f32_v8": True, "store_ef": True, "pro": 15},
     ('sm_107a', True, True, True, True, False, 32, 16384, 5120): {"block_n": 128, "cta_rows": 64, "hints": ('evict_first', 'none'), "pro": 15},
     ('sm_107a', True, True, True, True, False, 48, 16384, 5120): {"block_n": 128, "cta_rows": 64, "hints": ('evict_first', 'none'), "pro": 15},
     ('sm_107a', True, True, True, True, False, 64, 16384, 5120): {"block_n": 128, "cta_rows": 64, "hints": ('evict_first', 'none'), "pro": 15},
@@ -1571,6 +1591,35 @@ ROW_RULES: dict[tuple, dict] = {
     #      the row's plan without it, measured on GB200 against that plan ----
     ('sm_100a', False, True, False, False, False, 5120, 17408, 16231): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 12, "epi": 'tma', "slots": 1},
     ('sm_100a', False, True, False, False, False, 5120, 17408, 16384): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 12, "epi": 'tma', "slots": 1},
+    # ---- sm_100a: the GB T-exact rules of round 5 - the 12288 -> 4096 forward at T 16231 / 16384 (the ragged rule's
+    #      overlapped half-tail program with the column-grouped raster in 8-column-tile groups), with the bf16 tiles
+    #      through the one-slot TMA store and the per-tile K partitions of the row's plan without them, measured on
+    #      GB200 against that plan ----
+    ('sm_100a', False, False, False, False, False, 4096, 12288, 16231): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 8, "epi": 'tma', "slots": 1},
+    ('sm_100a', False, False, False, False, False, 4096, 12288, 16384): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 8, "epi": 'tma', "slots": 1},
+    # ---- sm_100a: the GB T-exact rules of round 6 - the 17408 -> 5120 forward at T 16231 / 16384 (the ragged rule's
+    #      overlapped half-tail program with the column-grouped raster in 12-column-tile groups, in place of the ragged
+    #      rule's 8; round 8 at T 16231 / 16384: the tall epilogue released by row half in place of the column-chunk
+    #      one, measured against the round-6 program), with the per-tile K partitions of the row's plan without them,
+    #      measured on GB200 against that plan ----
+    ('sm_100a', False, False, False, False, False, 5120, 17408, 16231): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 12},
+    ('sm_100a', False, False, False, False, False, 5120, 17408, 16384): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 12},
+    # ---- sm_100a: the GB T-exact rules of round 7 - the 5120 -> 17408 weight gradient at T 16231 / 16384 in its direct
+    #      orientation (the half-tail program through the one-slot TMA store, 12-row raster groups: the sm_103a
+    #      keys' rule of the row), with the per-tile K partitions of the row's plan without them, measured on
+    #      GB200 against that plan ----
+    ('sm_100a', True, True, False, False, False, 5120, 16231, 17408): {"cta_rows": 256, "htail": True, "epi": 'tma', "slots": 1, "group_m": 12},
+    ('sm_100a', True, True, False, False, False, 5120, 16384, 17408): {"cta_rows": 256, "htail": True, "epi": 'tma', "slots": 1, "group_m": 12},
+    # ---- sm_100a: the GB T-exact rules of round 8 - the 16384 -> 6144 forward at T 16231 (the half-tail program with
+    #      the tall epilogue released by row half and the column-grouped raster in 8-column-tile groups, in place of the
+    #      ragged rule's overlapped half-tail program), with the per-tile K partitions of the row's plan without it,
+    #      measured on GB200 against that plan ----
+    ('sm_100a', False, False, False, False, False, 6144, 16384, 16231): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 8},
+    # ---- sm_100a: the GB T-exact rules of round 10 - the 4096 -> 12288 input gradient at T 16384 (the half-tail
+    #      program with the tall epilogue released by row half and the column-grouped raster in 16-column-tile groups,
+    #      in place of the ragged rule's overlapped half-tail program in the same groups), with the per-tile K
+    #      partitions of the row's plan without it, measured on GB200 against that plan ----
+    ('sm_100a', False, True, False, False, False, 4096, 12288, 16384): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 16},
     # ---- sm_103a: the shapes tranche - forward / input gradient / weight gradient rows at K 4096 - 17408 and N 32 - 17408,
     #      measured with this package's planner against cuBLAS on GB300 at T 16172 - 16384 (see the test table
     #      MEASURED_SHAPE_ROWS); a row whose measured choice equals the planner's default carries no rule ----
@@ -1698,6 +1747,36 @@ ROW_RULES: dict[tuple, dict] = {
     #      partitions of the row's plan without it, measured on GB300 against that plan ----
     ('sm_103a', True, True, False, False, False, 2048, 16172, 4096): {"cta_rows": 256, "sk_sync": True, "sk_sync_m": 62, "sk_slab": 2, "epi": 'tma', "slots": 1},
     ('sm_103a', True, True, False, False, False, 2048, 16231, 4096): {"cta_rows": 256, "sk_sync": True, "sk_sync_m": 62, "sk_slab": 2, "epi": 'tma', "slots": 1},
+    # ---- sm_103a: the GB T-exact rules of round 4 - the 5120 -> 17408 input gradient at T 16231 / 16384 (the
+    #      overlapped half-tail program with the column-grouped raster in 12-column-tile groups, in place of the ragged
+    #      rule's row-half program), with the bf16 tiles through the one-slot TMA store and the per-tile K partitions of
+    #      the row's plan without it, measured on GB300 against that plan ----
+    ('sm_103a', False, True, False, False, False, 5120, 17408, 16231): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 12, "epi": 'tma', "slots": 1},
+    ('sm_103a', False, True, False, False, False, 5120, 17408, 16384): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 12, "epi": 'tma', "slots": 1},
+    # ---- sm_103a: the GB T-exact rules of round 6 - the 17408 -> 5120 forward at T 16231 / 16384 (the ragged rule's
+    #      overlapped half-tail program with the column-grouped raster in 12-column-tile groups, in place of the ragged
+    #      rule's 8; round 9 at T 16231 / 16384: the tall epilogue released by row half in place of the column-chunk
+    #      one, the sm_100a keys' rule, measured against the round-6 program), with the per-tile K partitions of the
+    #      row's plan without them, measured on GB300 against that plan ----
+    ('sm_103a', False, False, False, False, False, 5120, 17408, 16231): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 12},
+    ('sm_103a', False, False, False, False, False, 5120, 17408, 16384): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 12},
+    # ---- sm_103a: the GB T-exact rules of round 8 - the 16384 -> 6144 forward at T 16231 (the sm_100a key's program:
+    #      the half-tail program with the tall epilogue released by row half and the column-grouped raster in
+    #      8-column-tile groups, in place of the inherited sm_100a ragged rule's overlapped half-tail program), with the
+    #      per-tile K partitions of the row's plan without it, measured on GB300 against that plan ----
+    ('sm_103a', False, False, False, False, False, 6144, 16384, 16231): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 8},
+    # ---- sm_103a: the GB T-exact rules of round 9 - the 12288 -> 4096 forward at T 16231 / 16384 (the half-tail
+    #      program with the tall epilogue released by row half and the column-grouped raster in 8-column-tile groups,
+    #      in place of the ragged rule's overlapped half-tail program in 16-column-tile groups), with the per-tile K
+    #      partitions of the row's plan without them, measured on GB300 against that plan ----
+    ('sm_103a', False, False, False, False, False, 4096, 12288, 16231): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 8},
+    ('sm_103a', False, False, False, False, False, 4096, 12288, 16384): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 8},
+    # ---- sm_103a: the GB T-exact rules of round 10 - the 4096 -> 12288 input gradient at T 16231 / 16384 (the sm_100a
+    #      key's program: the half-tail program with the tall epilogue released by row half and the column-grouped
+    #      raster in 16-column-tile groups, in place of the ragged rule's overlapped half-tail program), with the
+    #      per-tile K partitions of the row's plan without them, measured on GB300 against that plan ----
+    ('sm_103a', False, True, False, False, False, 4096, 12288, 16231): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 16},
+    ('sm_103a', False, True, False, False, False, 4096, 12288, 16384): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 16},
 }
 # fmt: on
 
@@ -3956,11 +4035,15 @@ def _plan_entry(
 
 
 def _forget_arena_views(arena: _Arena) -> None:
-    """Drop the memoised workspace views of every cached entry of ``arena`` (a buffer was replaced)."""
+    """Drop the memoised workspace views of every cached entry and the converted workspace of every binding
+    (:class:`_BoundGemm`) of ``arena`` (a buffer was replaced)."""
     entries: list[_CachedLaunch] = [*_K1_CACHE.values(), *_K2_CACHE.values()]
     for entry in entries:
         if entry.arena is arena:
             entry.views = None
+    for bound in [*_K1_BOUND_CACHE.values()]:
+        if type(bound) is _BoundGemm and bound.arena is arena:
+            bound.state = (-1, None)
 
 
 def _numel(shape: tuple[int, ...]) -> int:
@@ -4379,22 +4462,19 @@ def _prepare_cached_gemm(
     ), rebuilt
 
 
-def _launch_cached_gemm(
+def _cached_gemm(
     A: torch.Tensor,
     B: torch.Tensor,
     out: torch.Tensor,
-    *,
-    transposed_out: bool = False,
-    enable_pdl: Optional[bool] = None,
-    **knobs: Any,
-) -> torch.Tensor:
-    """The convenience path of K1: plan on the first call for a (device, stream, geometry, knobs) key; rebind
-    the caller's views, resolve the workspace out of the arena of the device and stream and launch on every
-    call (no planning, no device query, no allocation), as a programmatic dependent launch under ``enable_pdl``
-    (default: the device supports it)."""
-    device = _same_cuda_device(A, B, out)
-    index = _cuda_index(device)
-    stream = _current_raw_stream(index)
+    transposed_out: bool,
+    knobs: dict[str, Any],
+    index: int,
+    stream: int,
+    device: torch.device,
+) -> tuple[_CachedGemm, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """``(entry, (a_desc, b_desc, out3))``: the cached planned launch of the K1 convenience call ``(A, B, out,
+    transposed_out, **knobs)`` on the raw ``stream`` of device ``index`` -- planned on the first call of its key --
+    and the operand views of this call."""
     key = convenience_key(
         index, stream, (bool(transposed_out), *sorted(knobs.items())), A, B, out
     )
@@ -4413,7 +4493,28 @@ def _launch_cached_gemm(
         )
     if operands is None:
         operands = _k1_views(A, B, out, swapped=cached.swapped)
-    a_desc, b_desc, O3 = operands
+    return cached, operands
+
+
+def _launch_cached_gemm(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    transposed_out: bool = False,
+    enable_pdl: Optional[bool] = None,
+    **knobs: Any,
+) -> torch.Tensor:
+    """The convenience path of K1: plan on the first call for a (device, stream, geometry, knobs) key; rebind
+    the caller's views, resolve the workspace out of the arena of the device and stream and launch on every
+    call (no planning, no device query, no allocation), as a programmatic dependent launch under ``enable_pdl``
+    (default: the device supports it)."""
+    device = _same_cuda_device(A, B, out)
+    index = _cuda_index(device)
+    stream = _current_raw_stream(index)
+    cached, (a_desc, b_desc, O3) = _cached_gemm(
+        A, B, out, transposed_out, knobs, index, stream, device
+    )
     views = dict(
         A=a_desc,
         B=b_desc,
@@ -4640,6 +4741,13 @@ def dense_projection_det_gemm(
     stream writes ``B`` (a weight of the model between updates): the swapped program then starts its weight loads
     before the wait, so the weight stream overlaps the preceding kernel's tail, and only its token loads wait.  The
     default never reads ``B`` before the preceding kernel completes."""
+    if _k1_entry(
+        ("gemm", bool(transposed_out), bool(weights_static)),
+        (A, B, out),
+        enable_pdl,
+        lambda: (A, B, out, transposed_out, {}, bool(weights_static)),
+    ):
+        return out
     pdl = pdl_enabled(enable_pdl, out.device)
     swap = _swap_ab_cached(A, B, out, transposed_out, bool(weights_static) and pdl)
     if swap is not None:
@@ -4663,6 +4771,10 @@ def projection_det_forward(
     :func:`dense_projection_det_gemm`."""
     if out is None:
         out = torch.empty(X.shape[0], W.shape[0], device=X.device, dtype=torch.bfloat16)
+    if _k1_entry(
+        _FWD_HEAD, (X, W, out), enable_pdl, lambda: (X, W.t(), out, False, {}, False)
+    ):
+        return out
     return dense_projection_det_gemm(X, W.t(), out, enable_pdl=enable_pdl)
 
 
@@ -4679,6 +4791,10 @@ def projection_det_dgrad(
         out = torch.empty(
             G.shape[0], W.shape[1], device=G.device, dtype=out_dtype or torch.bfloat16
         )
+    if _k1_entry(
+        _DGRAD_HEAD, (G, W, out), enable_pdl, lambda: (G, W, out, False, {}, False)
+    ):
+        return out
     return dense_projection_det_gemm(G, W, out, enable_pdl=enable_pdl)
 
 
@@ -4778,6 +4894,17 @@ def projection_det_wgrad(
     N, K = int(G.shape[1]), int(X.shape[1])
     if out is None:
         out = torch.empty(N, K, device=G.device, dtype=out_dtype or torch.bfloat16)
+
+    o = out
+
+    def call() -> tuple:
+        A, B, transposed = wgrad_views(
+            G, X, arch=arch_for(o.device), out_f32=o.dtype == torch.float32
+        )
+        return A, B, o, transposed, dict(sk=sk, cta_rows=cta_rows), None
+
+    if _k1_entry(("wgrad", sk, cta_rows), (G, X, o), enable_pdl, call):
+        return o
     A, B, transposed = wgrad_views(
         G, X, arch=arch_for(out.device), out_f32=out.dtype == torch.float32
     )
@@ -4790,6 +4917,264 @@ def projection_det_wgrad(
         sk=sk,
         cta_rows=cta_rows,
     )
+
+
+# ---------------------------------------------------------------------------
+# K1 entry points: the bound launch of a key
+# ---------------------------------------------------------------------------
+
+# The K1 entry points (``dense_projection_det_gemm``, ``projection_det_forward`` / ``projection_det_dgrad`` /
+# ``projection_det_wgrad``) bind their launch once per key of their own tensors: the device, the raw stream, the entry
+# point with its flags and knobs, the PDL flag and the geometry of the entry point's tensors (as ``convenience_key``).
+# The binding (:class:`_BoundGemm`) holds the cached planned launch of the call (the ``_K1_CACHE`` entry: the same plan
+# and program, so the same bits), its argument list in the program's order with the PDL flag bound and the constant
+# tensors converted once, the arena's workspace converted once per arena growth, and how each per-call view is rebuilt
+# from the entry point's tensors: the tensor itself, its ``unsqueeze(0)`` or one strided view, each checked against the
+# planner's view when bound.  A call whose key is bound rebuilds only those views and launches in its thread's stream
+# context of the (device, stream), made once: no planning, no view derivation, no orientation lookup, no allocation.
+# A row on the swapped small-token forward keeps its routed launch (``_SwapLaunch``) under the key of
+# ``dense_projection_det_gemm``.  A key whose views the entry point's tensors do not rebuild (tensors that start at one
+# data pointer; the key does not record aliasing) is kept unbound and takes the convenience path above, as does a call
+# whose tensors are not on one CUDA device.  A binding holds a reference on its arena like a cached entry (released on
+# eviction); the bindings live in a least-recently-used cache of ``CONVENIENCE_CACHE_SIZE`` keys that
+# ``clear_convenience_caches`` drops with the stream contexts.
+
+#: How a per-call view of a bound launch is rebuilt from one of the entry point's tensors (:class:`_BoundGemm`): the
+#: tensor itself, its ``unsqueeze(0)``, or its ``as_strided`` view of the bound shape and strides.
+_VIEW_SELF, _VIEW_UNSQUEEZE, _VIEW_STRIDED = 0, 1, 2
+#: The arena kinds of the workspace slots of a K1 launch.
+_K1_WORKSPACE_KINDS = {"ws": "k1_ws", "counters": "k1_counters"}
+#: The leading key flags of the forward and the input gradient.
+_FWD_HEAD = ("fwd",)
+_DGRAD_HEAD = ("dgrad",)
+
+
+@dataclass
+class _BoundGemm:
+    """The bound launch of a K1 entry point's key: the cached planned launch it runs (``gemm``), its argument list in
+    the program's order with the constants converted and the PDL flag bound (``template``), the positions of the
+    arena's workspace buffers (``workspace``: ``(position, arena kind)``), the per-call views (``recipes``:
+    ``(position, source, recipe, shape, strides)``, rebuilt from the entry point's tensor ``source``), and ``state``:
+    the argument list with the workspace converted and the arena version it was converted at."""
+
+    gemm: _CachedGemm
+    template: list = field(repr=False)
+    recipes: tuple = field(repr=False)
+    workspace: tuple = field(repr=False)
+    state: tuple = field(default=(-1, None), repr=False)
+
+    @property
+    def arena(self) -> _Arena:
+        return self.gemm.arena
+
+
+_K1_BOUND_CACHE: "OrderedDict[tuple, Union[_BoundGemm, _SwapLaunch, bool]]" = (
+    OrderedDict()
+)
+#: The tvm-ffi stream context of every (thread, device index, raw stream) a bound launch ran on, made by the first
+#: launch: a context keeps the stream it replaced while it is entered, so a thread enters only its own.
+_STREAM_CONTEXTS: dict[tuple[int, int, int], Any] = {}
+
+
+def _release_bound(entry: Union[_BoundGemm, _SwapLaunch, bool]) -> None:
+    """``on_evict`` of ``_K1_BOUND_CACHE``: a binding releases its reference on the arena (as :func:`_release_entry`)."""
+    if type(entry) is _BoundGemm:
+        arena = entry.arena
+        arena.refs -= 1
+        if arena.refs <= 0 and _ARENAS.get(arena.key) is arena:
+            del _ARENAS[arena.key]
+
+
+def _stream_context(index: int, stream: int) -> Any:
+    """The calling thread's tvm-ffi stream context of (device ``index``, raw ``stream``)."""
+    key = (threading.get_ident(), index, stream)
+    context = _STREAM_CONTEXTS.get(key)
+    if context is None:
+        context = _STREAM_CONTEXTS[key] = _ffi_stream_context(index, stream)
+    return context
+
+
+def _entry_index(sources: tuple) -> int:
+    """The CUDA device index of an entry point's tensors (the last one's), or ``-1`` when they are not all on that
+    CUDA device."""
+    index = sources[-1].get_device()
+    if index < 0:
+        return -1
+    for t in sources[:-1]:
+        if t.get_device() != index:
+            return -1
+    return index
+
+
+def _view_recipe(
+    view: torch.Tensor, sources: tuple, *, pointer: bool
+) -> Optional[tuple[int, int, tuple[int, ...], tuple[int, ...]]]:
+    """``(source, recipe, shape, strides)`` rebuilding the launch view ``view`` from one of the entry point's tensors
+    ``sources``, checked against ``view`` (its data pointer, shape, strides and dtype), or ``None`` when none does.  A
+    ``pointer`` argument (the program reads its data pointer; the binding checks its dtype, device and contiguity)
+    takes a contiguous source of the same data pointer and dtype as is.  The source is the one tensor that starts at
+    the view's data pointer: with several (tensors that alias, which the key does not record) there is no recipe."""
+    ptr = view.data_ptr()
+    found = [s for s, t in enumerate(sources) if t.data_ptr() == ptr]
+    if len(found) != 1:
+        return None
+    s = found[0]
+    t = sources[s]
+    if t.dtype != view.dtype:
+        return None
+    shape, strides = tuple(view.shape), tuple(view.stride())
+    if (pointer and t.is_contiguous()) or _same_view(t, view):
+        return s, _VIEW_SELF, shape, strides
+    if t.dim() == 2 and _same_view(t.unsqueeze(0), view):
+        return s, _VIEW_UNSQUEEZE, shape, strides
+    try:
+        strided = t.as_strided(shape, strides)
+    except RuntimeError:  # the view leaves this tensor's storage
+        return None
+    if _same_view(strided, view):
+        return s, _VIEW_STRIDED, shape, strides
+    return None
+
+
+def _bind_gemm(
+    gemm: _CachedGemm,
+    operands: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    sources: tuple,
+    pdl: int,
+) -> Union[_BoundGemm, bool]:
+    """The :class:`_BoundGemm` of the cached launch ``gemm`` for an entry point's tensors ``sources``
+    (``operands``: the launch's ``(a_desc, b_desc, out3)`` for them; ``pdl``: the PDL flag, 0 or 1), or ``False``
+    when a launch view is not rebuilt from ``sources`` (:func:`_view_recipe`)."""
+    a_desc, b_desc, O3 = operands
+    views = dict(
+        A=(a_desc, False),
+        B=(b_desc, False),
+        out3=(O3, False),
+        o_alias=(flat_alias(O3), True),
+    )
+    template, recipes, workspace = list(gemm.template), [], []
+    for i, item in enumerate(template):
+        if isinstance(item, torch.Tensor):
+            template[i] = tvm_ffi.from_dlpack(item, require_contiguous=False)
+        elif type(item) is _Slot:
+            if item.name in _K1_WORKSPACE_KINDS:
+                workspace.append((i, _K1_WORKSPACE_KINDS[item.name]))
+            elif item.name == "enable_pdl":
+                template[i] = pdl
+            else:
+                view, pointer = views[item.name]
+                recipe = _view_recipe(view, sources, pointer=pointer)
+                if recipe is None:
+                    return False
+                recipes.append((i, *recipe))
+    return _BoundGemm(gemm, template, tuple(recipes), tuple(workspace))
+
+
+def _bind_k1_entry(
+    key: tuple,
+    sources: tuple,
+    call: Callable[[], tuple],
+    index: int,
+    stream: int,
+    pdl: int,
+) -> Union[_BoundGemm, _SwapLaunch, bool]:
+    """Bind the key of an entry point's call: ``call()`` gives the convenience call ``(A, B, out, transposed_out,
+    knobs, weights_static)`` the entry point makes (``weights_static`` ``None``: the call never runs the swapped
+    forward); its planned launch comes from ``_K1_CACHE`` (planned there on a miss, the planner's errors raised), its
+    routed swapped forward from ``_SWAP_CACHE``.  The binding is cached under ``_PLAN_LOCK`` (a key bound meanwhile
+    by another thread is returned)."""
+    A, B, out, transposed_out, knobs, weights_static = call()
+    bound: Union[_BoundGemm, _SwapLaunch, bool] = False
+    swap = None
+    if weights_static is not None:
+        swap = _swap_ab_cached(
+            A, B, out, transposed_out, bool(weights_static) and bool(pdl)
+        )
+    if swap is not None:
+        # the routed launch takes the call's own tensors: kept only when they are the entry point's
+        if all(a is b for a, b in zip((A, B, out), sources, strict=True)):
+            bound = swap
+    else:
+        gemm, operands = _cached_gemm(
+            A, B, out, transposed_out, knobs, index, stream, out.device
+        )
+        bound = _bind_gemm(gemm, operands, sources, pdl)
+    with _PLAN_LOCK:
+        hit = _cache_get(_K1_BOUND_CACHE, key)
+        if hit is not None:
+            return hit
+        if type(bound) is _BoundGemm:
+            bound.arena.refs += 1
+        _cache_put(_K1_BOUND_CACHE, key, bound, on_evict=_release_bound)
+    return bound
+
+
+def _launch_bound(bound: _BoundGemm, sources: tuple, index: int, stream: int) -> None:
+    """Launch a bound K1 program with the views of the entry point's tensors ``sources`` in place (rebuilt here;
+    torch tensors, each converted in the FFI call), after converting the arena's workspace again if the arena grew
+    (under the arena's lock), in the thread's stream context of (device ``index``, raw ``stream``)."""
+    arena = bound.gemm.arena
+    version, args = bound.state
+    if version != arena.version:
+        with arena.lock:
+            version, args = bound.state
+            if version != arena.version:
+                # the version is read before converting: a growth that interleaves leaves the state stale
+                version = arena.version
+                args = bound.template.copy()
+                for i, kind in bound.workspace:
+                    args[i] = tvm_ffi.from_dlpack(
+                        arena.buffers[kind], require_contiguous=False
+                    )
+                bound.state = (version, args)
+    args = args.copy()
+    for i, s, recipe, shape, strides in bound.recipes:
+        t = sources[s]
+        if recipe == _VIEW_UNSQUEEZE:
+            t = t.unsqueeze(0)
+        elif recipe == _VIEW_STRIDED:
+            t = t.as_strided(shape, strides)
+        args[i] = t
+    with _stream_context(index, stream):
+        bound.gemm.entry(*args)
+
+
+def _k1_entry(
+    head: tuple,
+    sources: tuple,
+    enable_pdl: Optional[bool],
+    call: Callable[[], tuple],
+) -> bool:
+    """Launch a K1 entry point's call through the binding of its key -- ``head`` (the entry point, its flags and
+    knobs), the PDL flag (``enable_pdl`` resolved for the device) and the geometry of the entry point's tensors
+    ``sources`` (the last is ``out``) on the device and raw stream -- binding the key on its first call
+    (:func:`_bind_k1_entry`, ``call`` as there).  ``False`` (nothing launched) when the tensors are not on one CUDA
+    device or the key is kept unbound: the entry point then makes the convenience call."""
+    index = _entry_index(sources)
+    if index < 0:
+        return False
+    stream = _current_raw_stream(index)
+    pdl = int(pdl_enabled(enable_pdl, index))
+    A, B, out = sources
+    key = (
+        index,
+        stream,
+        head,
+        pdl,
+        (A.shape, A.stride(), A.dtype, A.storage_offset(), A.data_ptr() & 15),
+        (B.shape, B.stride(), B.dtype, B.storage_offset(), B.data_ptr() & 15),
+        (out.shape, out.stride(), out.dtype, out.storage_offset(), out.data_ptr() & 15),
+    )
+    bound = _cache_get(_K1_BOUND_CACHE, key)
+    if bound is None:
+        bound = _bind_k1_entry(key, sources, call, index, stream, pdl)
+    if type(bound) is _BoundGemm:
+        _launch_bound(bound, sources, index, stream)
+        return True
+    if type(bound) is _SwapLaunch:
+        _run_swap_ab(bound, A, B, out, bool(pdl))
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -4864,6 +5249,28 @@ def _router_b_layout(B: torch.Tensor) -> bool:
     raise ValueError("router_fp32_det_gemm: B needs a unit stride on k or n")
 
 
+def router_splits(
+    layout: str,
+    M: int,
+    N: int,
+    K: int,
+    arch: Optional[str] = None,
+    sm_count: Optional[int] = None,
+) -> int:
+    """The split-K count of a router plan without a caller's ``splits``: the :data:`ROUTER_SPLIT_RULES` count of
+    ``(arch, sm_count, layout, H)`` whose window holds the token count (``kk``: ``H = K``, ``T = M``; ``nn_t``, the
+    swapped weight gradient's ``M`` / ``K``: ``H = M``, ``T = K``; ``N`` = :data:`ROUTER_RULE_N` only), else
+    :data:`ROUTER_SPLITS` of the layout (also for an unknown device: ``arch`` or ``sm_count`` ``None``)."""
+    if arch is not None and sm_count is not None and int(N) == ROUTER_RULE_N:
+        H, T = (int(K), int(M)) if layout == "kk" else (int(M), int(K))
+        for lo, hi, splits in ROUTER_SPLIT_RULES.get(
+            (arch, int(sm_count), layout, H), ()
+        ):
+            if lo <= T <= hi:
+                return splits
+    return ROUTER_SPLITS[layout]
+
+
 def plan_router_fp32_det_gemm(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -4875,7 +5282,8 @@ def plan_router_fp32_det_gemm(
 
     Returns ``(plan, A_eff, B_eff)``: the operands of the launched (possibly swapped) GEMM;
     ``B_eff`` is the operand the host splits into BF16x3 parts.  ``splits`` overrides the
-    production split-K count of the layout class (:data:`ROUTER_SPLITS`)."""
+    split-K count :func:`router_splits` resolves for the device of ``out`` (a CUDA tensor; on another device the
+    layout's :data:`ROUTER_SPLITS` count)."""
     if (
         A.dtype != torch.float32
         or B.dtype != torch.float32
@@ -4925,7 +5333,15 @@ def plan_router_fp32_det_gemm(
             "router_fp32_det_gemm: out must have unit inner stride and 16-byte rows; N a multiple of 8"
         )
     if splits is None:
-        splits = ROUTER_SPLITS[layout]
+        facts = device_facts(out.device) if out.is_cuda else None
+        splits = router_splits(
+            layout,
+            M_eff,
+            N_eff,
+            K,
+            None if facts is None else facts.arch,
+            None if facts is None else facts.sm_count,
+        )
     splits = int(splits)
     if splits < 1:
         raise ValueError("router_fp32_det_gemm: splits must be >= 1")
@@ -5260,13 +5676,16 @@ _K2_CACHE: "OrderedDict[tuple, _CachedRouter]" = OrderedDict()
 
 
 def clear_convenience_caches() -> None:
-    """Drop every cached convenience-path launch (K1 and K2) and release every workspace arena; a launch in
+    """Drop every cached convenience-path launch (K1 and K2), every K1 entry-point binding with the stream contexts
+    the bindings made, and release every workspace arena; a launch in
     flight keeps a reference to the buffers it was bound with until its FFI call has enqueued it, and the
     freed blocks are reused stream-ordered (see :class:`_Arena`)."""
     with _PLAN_LOCK:
         _K1_CACHE.clear()
         _K2_CACHE.clear()
         _SWAP_CACHE.clear()
+        _K1_BOUND_CACHE.clear()
+        _STREAM_CONTEXTS.clear()
         _ARENAS.clear()
 
 
@@ -5408,10 +5827,11 @@ def router_det_forward(
     W: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     *,
-    splits: int = 4,
+    splits: Optional[int] = None,
     enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
-    """``out[T, N] = X[T, K] @ W[N, K].T`` in FP32 through the emulation."""
+    """``out[T, N] = X[T, K] @ W[N, K].T`` in FP32 through the emulation; ``splits`` defaults to
+    :func:`router_splits` of the device and the row."""
     if out is None:
         out = torch.empty(X.shape[0], W.shape[0], device=X.device, dtype=torch.float32)
     return router_fp32_det_gemm(X, W.t(), out, splits=splits, enable_pdl=enable_pdl)
@@ -5435,10 +5855,11 @@ def router_det_wgrad(
     X: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     *,
-    splits: int = 6,
+    splits: Optional[int] = None,
     enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
-    """``out[N, K] = G[T, N].T @ X[T, K]`` in FP32: the swapped GEMM ``X.T @ G`` with a transposed store."""
+    """``out[N, K] = G[T, N].T @ X[T, K]`` in FP32: the swapped GEMM ``X.T @ G`` with a transposed store; ``splits``
+    defaults to :func:`router_splits` of the device and the row."""
     if out is None:
         out = torch.empty(G.shape[1], X.shape[1], device=G.device, dtype=torch.float32)
     return router_fp32_det_gemm(G.t(), X, out, splits=splits, enable_pdl=enable_pdl)

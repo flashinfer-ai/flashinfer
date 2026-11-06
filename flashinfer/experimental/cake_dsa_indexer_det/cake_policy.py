@@ -47,12 +47,22 @@ Nothing here reads device memory: the segment boundaries stay on the device
 and the dispatch sees only host-known integers.  The chosen program never
 changes a result -- every form computes the same ids and score bits -- so a
 wrong choice costs time, not correctness.
+
+The opt-in FP8 input form (float8_e4m3fn ``q`` / ``k``) has its own scan
+programs, keyed ``scan:<kind>:u<unroll>:s0:f1:fp8[:lsf]``, for the narrow, l6
+and split kinds, and on sm_100a / sm_103a the wide kind.  An FP8 call runs the same
+decision procedure under the architecture's FP8 record (``fp8_policy_record``:
+the ``POLICY`` record with the fields of the registry's ``POLICY_FP8`` record
+replaced) and then the registered FP8 program of the decided kind, or of its
+``FP8_KIND_FALLBACK`` kind (``select_fp8_program``).  Every FP8 program of one
+architecture computes the same ids and score bits.
 """
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-from typing import Any, Collection, Optional, Tuple
+import re
+from dataclasses import asdict, dataclass, replace
+from typing import Any, Collection, NamedTuple, Optional, Tuple
 
 # Record fields in canonical order (the export writes them in this order).
 POLICY_FIELDS = (
@@ -78,6 +88,7 @@ POLICY_FIELDS = (
     "split_min_range_tiles",  # a split's key range is at least this many tiles
     "split_wave_rule",  # [min mean unit tiles, min CTA-efficiency gain] for a two-way split, or None
     "split_wave_scope",  # [unit geometries, max segments, sampled calls only] the two-way split of split_wave_rule is limited to, or None (every call)
+    "split_fit_rule",  # [merge chunk entries]: a call the split rule splits takes ceil(mean unit keys / top_k) splits, rounded up to whole merge chunks, where that is more and fits split_max and the grid; or None
     "split_units",  # unit geometries ("l6", "narrow", "wide") whose split program the architecture registers; any other unit never splits
     "pair_rule",  # [min mean unit tiles, max mean unit tiles, min top_k] of the CTA-pair program, or None
     "pair_units",  # unit geometries ("l6", "narrow", "wide") whose CTA-pair program the architecture registers; the pair rule applies to these units only
@@ -100,6 +111,7 @@ POLICY_FIELDS = (
     "sample_class_rule",  # [tiny-unit sample tiles, shift permille] for the wide-unit programs (shift only) and the tiny dispatch class (tiles and shift), or None; explicit knobs override it
     "sample_shift_rule",  # [min top_k, shift permille] replacing sample_shift_permille from that top_k on, or None (the default shift on every call); an explicit sample_shift_permille knob overrides both
     "lsf_programs",  # the architecture ships the longest-first segment order copy (scan key suffix :lsf) of every scan program; the host runs it on packed calls whose key segments differ in length (#7549)
+    "static_scan_kinds",  # physical scan kinds whose programs keep the static unit enumeration on a ticket architecture: they never touch the ticket tail, so the host gives their runners none
     "far_sample",  # 1: the sampled first threshold of the ascending-tile-order programs ranks the far sample tiles only (the tile nearest the diagonal left out); 0: every sample tile
     "check_period_max",  # cap on the default selection-trigger check period (tiles)
     "check_period_knob_max",  # cap on an explicit check period (tiles)
@@ -140,11 +152,34 @@ PHYSICAL_KINDS = tuple(
     sorted(set(KINDS) - {"split"} | {f"split_{unit}" for unit in UNITS})
 )
 MERGE_KEY = "merge"
+# Input forms of a call, selected by its q / k dtype: ``bf16`` (the default) and ``fp8`` (float8_e4m3fn q / k with
+# per-key FP32 scales, opt-in).  An FP8 scan program's key carries the form tag before the LSF suffix,
+# ``scan:<kind>:u<unroll>:s<snake>:f<fit>:fp8[:lsf]``; the merge and finalize programs serve both forms.
+BF16 = "bf16"
+FP8 = "fp8"
+FORMS = (BF16, FP8)
+# The FP8 scan programs exist for the narrow, l6 and split kinds, and on sm_100a / sm_103a the wide kind, with no snake
+# order and in the sampled-fit form.  An FP8 call runs the decision procedure of ``select_program`` under the FP8 record
+# (``fp8_policy_record``); a decided kind without an FP8 program runs the FP8 program of its fallback kind below
+# (unpaired; the same unit geometry where it has one, except that a CTA-pair wide unit runs l6).  An unpaired, unsplit
+# wide unit (8 queries) runs the FP8 wide program where the architecture registers one; else it, and a CTA-pair wide
+# unit always, runs the l6 unit (6 queries), the largest FP8 unit below the wide one: per key tile it reads K once for 6
+# queries rather than for the narrow unit's 4.  A split wide unit (sm_107a only) runs split_narrow: no architecture that
+# splits wide units registers an FP8 split_l6 program.
+FP8_KIND_FALLBACK = {
+    "wide": "l6",
+    "pair_l6": "l6",
+    "pair_narrow": "narrow",
+    "pair_wide": "l6",
+    "split_wide": "split_narrow",
+    "split_l6": "split_narrow",
+}
 # Admissible sampled rank shift (permille): the backend's ``sample_shift_permille`` knob bound and the bound of a record's
 # ``sample_shift_rule`` shift.  Every value gives the same bits; the shift only sets how conservative the sampled first
 # threshold is.
 SAMPLE_SHIFT_PERMILLE_BOUNDS = (-1000, 10000)
-# Global unit tickets (every sm_100a / sm_103a scan program): the CTAs draw every
+# Global unit tickets (every scan program but the kinds of a record's
+# ``static_scan_kinds``, on ``cake_jit.TICKET_TAIL_ARCHES``): the CTAs draw every
 # work unit from the low u32 word of the first int64 behind the candidate buffers
 # (and behind the split staging), the first of a tail every plan's workspace
 # carries: 16 int64 for the ticket word, then the longest-first segment order the
@@ -153,7 +188,12 @@ SAMPLE_SHIFT_PERMILLE_BOUNDS = (-1000, 10000)
 # zeroes the tail once at prepare on a backend-owned workspace and before every
 # run on a caller-owned ``workspace_buffer``, which others may write between
 # runs -- except where the call always takes the static fast path
-# (``ticket_static_path``: the scan never touches the word).  sm_107a leaves the tail unused.
+# (``ticket_static_path``: the scan never touches the word) or runs a program of
+# ``static_scan_kinds``.  A scan program whose registry record lists the
+# architecture in ``ticket_arg_arches`` draws from its ``TicketWord`` block
+# instead and never reads this tail (the eager entry hands it the tail's first
+# 16 bytes); every plan still carries the tail, so the size does not depend on
+# the program.
 TICKET_TAIL_BYTES = 8 * (16 + 1024)
 
 
@@ -186,6 +226,46 @@ CLASS_RULE_MIN_SEGMENTS = 2
 CLASS_RULE_MAX_QUERIES_PER_SEGMENT = 4096
 # lever LSF: the longest-first segment order copy of a scan program runs on calls of at least this many segments
 LSF_MIN_SEGMENTS = 2
+
+
+def sample_class_for(
+    policy: "DispatchPolicy",
+    physical: str,
+    num_queries: int,
+    num_keys: int,
+    num_segments: int,
+    ratio: int,
+    tiles: int,
+    shift: int,
+    *,
+    tiles_knob: bool,
+    shift_knob: bool,
+) -> tuple[int, int]:
+    """The sampled first threshold ``(tiles, shift)`` of a scan program of the physical kind ``physical`` under the
+    record's ``sample_class_rule``, from the call's ``tiles`` / ``shift``: the wide-unit programs take the rule's shift on
+    packed calls (at least ``CLASS_RULE_MIN_SEGMENTS`` segments), the tiny dispatch class (packed calls of short query
+    segments and few mean unit tiles) also its tile count.  A knob
+    the caller set (``tiles_knob`` / ``shift_knob``) stays; without the rule or with sampling off nothing changes."""
+    class_rule = policy.sample_class_rule
+    T, S = int(num_queries), int(num_segments)
+    if class_rule is None or tiles <= 0:
+        return tiles, shift
+    # the wide-unit programs shift only; the tiny dispatch class also samples more tiles (#7549)
+    if "wide" in physical:
+        if not shift_knob and S >= CLASS_RULE_MIN_SEGMENTS:
+            shift = int(class_rule[1])
+    elif (
+        not tiles_knob
+        and policy.mean_unit_tiles(T, num_keys, S, ratio)
+        <= policy.sample_dispatch_tiny_tiles_max
+        and S >= CLASS_RULE_MIN_SEGMENTS
+        and T <= CLASS_RULE_MAX_QUERIES_PER_SEGMENT * S
+    ):
+        tiles = int(class_rule[0])
+        if not shift_knob:
+            shift = int(class_rule[1])
+    return tiles, shift
+
 
 _INT = ("tile_keys", "block_q_narrow", "block_q_wide", "block_q_l6", "candidate_entry_bytes", "candidate_multiplier",
         "candidate_multiplier_unsampled", "candidate_slack", "split_max", "split_min_range_tiles", "tile_unroll_default", "tile_unroll_factor",
@@ -226,6 +306,7 @@ _OPTIONAL_RULE = (
     "wide_first_rule",
     "split_wave_rule",
     "split_wave_scope",
+    "split_fit_rule",
     "pair_rule",
     "l6_solo_rule",
     "snake_rule",
@@ -277,6 +358,7 @@ class DispatchPolicy:
     split_min_range_tiles: int
     split_wave_rule: Optional[list]
     split_wave_scope: Optional[list]
+    split_fit_rule: Optional[list]
     split_units: list
     pair_rule: Optional[list]
     pair_units: list
@@ -299,6 +381,7 @@ class DispatchPolicy:
     sample_shift_rule: Optional[list]
     sample_class_rule: Optional[list]
     lsf_programs: bool
+    static_scan_kinds: list
     far_sample: int
     check_period_max: int
     check_period_knob_max: int
@@ -409,6 +492,13 @@ class DispatchPolicy:
         ):
             raise ValueError(
                 f"policy['split_wave_scope'] must be [ascending unit geometries {UNITS}, max segments >= 1, sampled only (bool)] or None, got {scope!r}"
+            )
+        fit_rule = raw["split_fit_rule"]
+        if fit_rule is not None and (
+            len(fit_rule) != 1 or not _is_int(fit_rule[0]) or fit_rule[0] < 1
+        ):
+            raise ValueError(
+                f"policy['split_fit_rule'] must be [merge chunk entries >= 1] or None, got {fit_rule!r}"
             )
         solo = raw["l6_solo_rule"]
         if solo is not None and (
@@ -543,6 +633,15 @@ class DispatchPolicy:
                     f"policy[{ceiling_name!r}] must be a positive slot count at or above policy[{floor_name!r}]"
                     f"{' and the floor of policy[' + repr(rule_name) + ']' if rule_name else ''}, got {ceiling!r}"
                 )
+        static_kinds = raw["static_scan_kinds"]
+        if (
+            not isinstance(static_kinds, (list, tuple))
+            or not all(isinstance(k, str) and k in PHYSICAL_KINDS for k in static_kinds)
+            or list(static_kinds) != sorted(set(static_kinds))
+        ):
+            raise ValueError(
+                f"policy['static_scan_kinds'] must be an ascending list of physical scan kinds {PHYSICAL_KINDS}, got {static_kinds!r}"
+            )
         fit_kinds = raw["sample_fit_kinds"]
         if (
             not isinstance(fit_kinds, (list, tuple))
@@ -598,6 +697,7 @@ class DispatchPolicy:
         ]
         values["rank_t16_slots"] = [int(v) for v in values["rank_t16_slots"]]
         values["sample_fit_kinds"] = [str(k) for k in values["sample_fit_kinds"]]
+        values["static_scan_kinds"] = [str(k) for k in values["static_scan_kinds"]]
         values["pair_units"] = [str(u) for u in values["pair_units"]]
         values["split_units"] = [str(u) for u in values["split_units"]]
         values["check_period_kind_overrides"] = {
@@ -815,13 +915,14 @@ class DispatchPolicy:
         grid: int,
         block_q: int,
         sampled: bool = True,
+        top_k: Optional[int] = None,
     ) -> int:
         """Key-range splits per unit of the unit ``block_q``: the split rule (``split_rule_for``) for a unit of
         ``split_units``; 1 for any other unit, whose split program the architecture does not register."""
         if self.unit_name(block_q) not in self.split_units:
             return 1
         return self.split_rule_for(
-            num_queries, num_keys, num_segments, ratio, grid, block_q, sampled
+            num_queries, num_keys, num_segments, ratio, grid, block_q, sampled, top_k
         )
 
     def split_rule_for(
@@ -833,6 +934,7 @@ class DispatchPolicy:
         grid: int,
         block_q: int,
         sampled: bool = True,
+        top_k: Optional[int] = None,
     ) -> int:
         """The split rule alone (no registration guard): ``min(grid // units, mean tiles // split_min_range_tiles,
         split_max)``, at least 1, and the two-way wave split of ``split_wave_rule`` where that gives 1 -- inside
@@ -874,6 +976,22 @@ class DispatchPolicy:
 
             if eff(2) - eff(1) >= float(rule[1]):
                 n = 2
+        fit = self.split_fit_rule
+        if fit is not None and n > 1 and top_k is not None and int(top_k) > 0:
+            # split_fit_rule: a split call whose splits can each hold at most top_k keys needs no selection inside a
+            # split; the merge reads its staging in chunks of fit[0] entries, so the split count is rounded up to whole
+            # chunks (more splits in the last chunk cost the merge nothing)
+            segments = max(1, int(num_segments))
+            r = max(1, int(ratio))
+            mean_keys = max(
+                0.0, (int(num_keys) - int(num_queries) / (2 * r)) / segments
+            )
+            k = int(top_k)
+            n_fit = max(1, -(-int(mean_keys) // k))
+            per_chunk = max(1, int(fit[0]) // k)
+            n_fit = -(-n_fit // per_chunk) * per_chunk
+            if n < n_fit <= min(int(grid) // units, self.split_max):
+                n = n_fit
         return n
 
     def pair_for(
@@ -1174,11 +1292,84 @@ def physical_kind(kind: str, unit: str) -> str:
 
 
 def scan_key(
-    physical: str, tile_unroll: int, snake: bool, sample_fit: bool, lsf: bool = False
+    physical: str,
+    tile_unroll: int,
+    snake: bool,
+    sample_fit: bool,
+    lsf: bool = False,
+    form: str = BF16,
 ) -> str:
-    """``:lsf``: the copy of the program that hands out its tickets longest segment first (lever LSF)."""
+    """``:lsf``: the longest-first (LSF) copy, which hands out the program's tickets longest segment first; ``form``
+    ``"fp8"``: the FP8 program, tagged ``:fp8`` before the ``:lsf`` suffix."""
     key = f"scan:{physical}:u{int(tile_unroll)}:s{int(bool(snake))}:f{int(bool(sample_fit))}"
+    if form == FP8:
+        key += ":fp8"
+    elif form != BF16:
+        raise ValueError(f"form must be one of {FORMS}, got {form!r}")
     return key + ":lsf" if lsf else key
+
+
+class ScanKeyFields(NamedTuple):
+    """The fields of a scan program key (``scan_key``)."""
+
+    physical: str
+    tile_unroll: int
+    snake: bool
+    sample_fit: bool
+    form: str
+    lsf: bool
+
+
+_SCAN_KEY = re.compile(r"scan:([a-z0-9_]+):u([0-9]+):s([01]):f([01])(:fp8)?(:lsf)?")
+
+
+def scan_key_fields(key: str) -> Optional[ScanKeyFields]:
+    """The fields of the scan program key ``key``; None for any other key."""
+    match = _SCAN_KEY.fullmatch(key)
+    if match is None:
+        return None
+    physical, unroll, snake, fit, fp8, lsf = match.groups()
+    return ScanKeyFields(
+        physical, int(unroll), snake == "1", fit == "1", FP8 if fp8 else BF16, bool(lsf)
+    )
+
+
+def scan_key_form(key: str) -> Optional[str]:
+    """The input form (``FORMS``) of the scan program key ``key``; None for any other key."""
+    fields = scan_key_fields(key)
+    return None if fields is None else fields.form
+
+
+def fp8_policy_record(record: dict, fp8_record: dict) -> dict:
+    """The FP8 form's dispatch record of an architecture: its record ``record`` (``POLICY[arch]``) with the fields of
+    its FP8 record ``fp8_record`` (``POLICY_FP8[arch]``) replaced.  ``fp8_record`` names its own ``static_scan_kinds``
+    (the FP8 programs never keep the BF16 programs' static kinds) and no field outside ``POLICY_FIELDS``."""
+    if (
+        not isinstance(fp8_record, dict)
+        or "static_scan_kinds" not in fp8_record
+        or not set(fp8_record) <= set(POLICY_FIELDS)
+    ):
+        raise ValueError(
+            f"an FP8 dispatch record must name static_scan_kinds and only fields of {POLICY_FIELDS}, got {fp8_record!r}"
+        )
+    return {**record, **fp8_record}
+
+
+def fp8_scan_programs(scan_keys: Collection[str]) -> dict:
+    """The dispatchable FP8 scan programs of a registry's keys: ``{(physical kind, lsf): {tile unroll: key}}`` over the
+    FP8 keys of the form the FP8 programs are built in (no snake order, the sampled-fit form: ``s0`` / ``f1``)."""
+    programs: dict = {}
+    for key in scan_keys:
+        fields = scan_key_fields(key)
+        if (
+            fields is None
+            or fields.form != FP8
+            or fields.snake
+            or not fields.sample_fit
+        ):
+            continue
+        programs.setdefault((fields.physical, fields.lsf), {})[fields.tile_unroll] = key
+    return programs
 
 
 FINALIZE_ROLE = "finalize"  # CUB block radix sort programs
@@ -1394,7 +1585,9 @@ def select_program(
         else int(candidate_multiplier)
     )
     block_q = policy.unit_block_q_for(T, Tkv, S, r, grid, K)
-    n_split = policy.n_split_for(T, Tkv, S, r, grid, block_q, sampled=tiles > 0)
+    n_split = policy.n_split_for(
+        T, Tkv, S, r, grid, block_q, sampled=tiles > 0, top_k=K
+    )
     split = n_split > 1
     pair = (not split) and policy.pair_for(T, Tkv, S, r, grid, K, block_q)
     # lever LSF (#7549): the longest-first segment order pays off only where the segments differ, so the copy that
@@ -1460,22 +1653,18 @@ def select_program(
     unroll = policy.tile_unroll_for(kind, K, snake, block_q)
     grid_ctas = grid - grid % 2 if pair else grid
     physical = physical_kind(kind, unit)
-    class_rule = policy.sample_class_rule
-    if class_rule is not None and tiles > 0:
-        # the wide-unit programs shift only; the tiny dispatch class also samples more tiles (#7549)
-        if "wide" in physical:
-            if sample_shift_permille is None and S >= CLASS_RULE_MIN_SEGMENTS:
-                shift = int(class_rule[1])
-        elif (
-            sample_tiles_max is None
-            and policy.mean_unit_tiles(T, Tkv, S, r)
-            <= policy.sample_dispatch_tiny_tiles_max
-            and S >= CLASS_RULE_MIN_SEGMENTS
-            and T <= CLASS_RULE_MAX_QUERIES_PER_SEGMENT * S
-        ):
-            tiles = int(class_rule[0])
-            if sample_shift_permille is None:
-                shift = int(class_rule[1])
+    tiles, shift = sample_class_for(
+        policy,
+        physical,
+        T,
+        Tkv,
+        S,
+        r,
+        tiles,
+        shift,
+        tiles_knob=sample_tiles_max is not None,
+        shift_knob=sample_shift_permille is not None,
+    )
     fit = policy.sample_fit_for(T, Tkv, S, r, cap, physical)
     if check_period is None:
         period = policy.check_period_for(K, cap, kind)
@@ -1569,9 +1758,141 @@ def select_program(
     )
 
 
+def fp8_program_choice(
+    policy: DispatchPolicy,
+    choice: ProgramChoice,
+    key: str,
+    n_split: Optional[int] = None,
+) -> ProgramChoice:
+    """``choice`` run by the FP8 scan program ``key``: the unit geometry, the split and the tile unroll follow the key,
+    an FP8 program has no CTA pair (the launched grid is the requested one), and the capacity, check period, sampling
+    knobs and finalize of ``choice`` stay.  ``n_split``: the key-range splits of a split key (default: the plan's, at
+    least 2); the workspace bound follows the unit geometry and the split."""
+    fields = scan_key_fields(key)
+    if fields is None or fields.form != FP8:
+        raise ValueError(f"{key!r} is not an FP8 scan program key")
+    physical = fields.physical
+    split = physical.startswith("split_")
+    unit = physical[len("split_") :] if split else physical
+    if unit not in UNITS:
+        raise ValueError(f"no FP8 program runs the scan kind of {key!r}")
+    block_q = {
+        "narrow": policy.block_q_narrow,
+        "wide": policy.block_q_wide,
+        "l6": policy.block_q_l6,
+    }[unit]
+    if not split:
+        n = 1
+    elif n_split is None:
+        n = max(2, int(choice.n_split))
+    else:
+        n = int(n_split)
+        if n < 2:
+            raise ValueError(f"a split program needs n_split >= 2, got {n_split!r}")
+    grid_ctas = int(choice.grid)
+    scan_entries = grid_ctas * block_q * int(choice.cand_cap)
+    staging = int(choice.num_queries) * n * int(choice.top_k) if split else 0
+    return replace(
+        choice,
+        grid_ctas=grid_ctas,
+        block_q=block_q,
+        unit=unit,
+        n_split=n,
+        split=split,
+        pair=False,
+        kind="split" if split else unit,
+        physical_kind=physical,
+        snake=fields.snake,
+        tile_unroll=fields.tile_unroll,
+        sample_fit=fields.sample_fit,
+        lsf=fields.lsf,
+        scan_key=key,
+        merge_key=MERGE_KEY if split else None,
+        scan_entries=scan_entries,
+        staging_entries=staging,
+        workspace_bytes=(scan_entries + staging) * policy.candidate_entry_bytes
+        + TICKET_TAIL_BYTES,
+    )
+
+
+def fallback_knobs(
+    policy: DispatchPolicy, choice: ProgramChoice, physical: str, call: dict
+) -> ProgramChoice:
+    """``choice`` with the sampled first threshold and the check period of the scan kind ``physical`` that runs in place
+    of the decided one (``FP8_KIND_FALLBACK``): the record's ``sample_class_rule`` and ``check_period_kind_overrides``
+    key on the program kind, so a wide decision's wide-unit shift and check period do not carry over to the l6
+    program.  The knobs ``call`` sets stay."""
+    T, Tkv, S, r, K = (
+        choice.num_queries,
+        choice.num_keys,
+        choice.num_segments,
+        choice.ratio,
+        choice.top_k,
+    )
+    tiles_knob = call.get("sample_tiles_max")
+    shift_knob = call.get("sample_shift_permille")
+    tiles, shift = sample_class_for(
+        policy,
+        physical,
+        T,
+        Tkv,
+        S,
+        r,
+        policy.sample_tiles_for(T, Tkv, S, r)
+        if tiles_knob is None
+        else int(tiles_knob),
+        policy.sample_shift_for(K) if shift_knob is None else int(shift_knob),
+        tiles_knob=tiles_knob is not None,
+        shift_knob=shift_knob is not None,
+    )
+    period = choice.check_period
+    if call.get("check_period") is None:
+        kind = "split" if physical.startswith("split_") else physical
+        period = policy.check_period_for(K, choice.cand_cap, kind)
+    return replace(
+        choice, sample_tiles_max=tiles, sample_shift_permille=shift, check_period=period
+    )
+
+
+def select_fp8_program(
+    policy: DispatchPolicy,
+    *,
+    scan_keys: Collection[str],
+    fp8_programs: Optional[dict] = None,
+    **call: Any,
+) -> ProgramChoice:
+    """The host dispatch of one FP8 call: the decision procedure of ``select_program`` (``call``: its keywords) under the
+    architecture's FP8 record ``policy`` (``fp8_policy_record``) with the registry's ``scan_keys``, run by the FP8
+    program (``fp8_program_choice``) of the decided physical kind -- of its ``FP8_KIND_FALLBACK`` kind, with that
+    kind's sampled first threshold and check period (``fallback_knobs``), where no FP8 program of the decided kind is
+    registered -- in the decided segment order (``:lsf`` where its FP8 copy is registered) and with the decided tile
+    unroll where an FP8 program of it is registered, else the smallest registered one.  ``fp8_programs``:
+    ``fp8_scan_programs(scan_keys)``, made once by the caller.  Raises ``NotImplementedError`` when no FP8 program
+    serves the kind."""
+    choice = select_program(policy, scan_keys=scan_keys, **call)
+    programs = fp8_scan_programs(scan_keys) if fp8_programs is None else fp8_programs
+    physical = choice.physical_kind
+    if not any(kind == physical for kind, _lsf in programs):
+        physical = FP8_KIND_FALLBACK.get(physical, physical)
+    unrolls = programs.get((physical, choice.lsf)) or programs.get((physical, False))
+    if not unrolls:
+        raise NotImplementedError(
+            f"the FP8 dispatch selected the {physical!r} scan kind, which no registered FP8 program serves "
+            f"(registered FP8 kinds: {sorted({kind for kind, _lsf in programs})})"
+        )
+    key = unrolls.get(choice.tile_unroll, unrolls[min(unrolls)])
+    if physical != choice.physical_kind:
+        choice = fallback_knobs(policy, choice, physical, call)
+    return fp8_program_choice(policy, choice, key)
+
+
 __all__ = [
+    "BF16",
     "FINALIZE_RANK_ROLE",
     "FINALIZE_ROLE",
+    "FORMS",
+    "FP8",
+    "FP8_KIND_FALLBACK",
     "KINDS",
     "MERGE_KEY",
     "POLICY_FIELDS",
@@ -1580,10 +1901,19 @@ __all__ = [
     "UNITS",
     "DispatchPolicy",
     "ProgramChoice",
+    "ScanKeyFields",
+    "fallback_knobs",
     "finalize_key",
     "finalize_role",
+    "fp8_policy_record",
+    "fp8_program_choice",
+    "fp8_scan_programs",
     "physical_kind",
+    "sample_class_for",
     "scan_key",
+    "scan_key_fields",
+    "scan_key_form",
+    "select_fp8_program",
     "select_program",
     "stage_slug",
     "ticket_static_path",

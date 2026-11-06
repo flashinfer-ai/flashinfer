@@ -142,6 +142,9 @@ class TmemCorrResource(DecodeGenResourceBase):
     b_idx: Int32 = None
     q_group_idx: Int32 = None
     active_splits_kv: Int32 = None
+    # Runtime launch fanout used as the GMEM partial split stride; None keeps
+    # the configured capacity stride.
+    partial_split_stride: Int32 = None
     static_full_split_prefix: Constexpr[bool] = False
     smem_p0_ref: Constexpr[SmemPResource] = None
     smem_p1_ref: Constexpr[SmemPResource] = None
@@ -421,9 +424,12 @@ class TmemCorrResource(DecodeGenResourceBase):
     ) -> Int64:
         """Return a split/row workspace offset using 64-bit arithmetic."""
 
-        return (
-            Int64(logical_kv_idx) * Int64(self.cfg.max_splits_kv) + Int64(cta_idx_kv)
-        ) * Int64(self.h_r) + Int64(row_idx)
+        split_stride = Int64(self.cfg.max_splits_kv)
+        if cutlass.const_expr(self.partial_split_stride is not None):
+            split_stride = Int64(self.partial_split_stride)
+        return (Int64(logical_kv_idx) * split_stride + Int64(cta_idx_kv)) * Int64(
+            self.h_r
+        ) + Int64(row_idx)
 
     @cute.jit
     def _cluster_reduction_rows_per_cta(self, splits_kv: Int32) -> Int32:

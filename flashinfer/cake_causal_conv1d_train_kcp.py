@@ -34,9 +34,9 @@ them mixes reproducibility contracts across ranks.
 
 Name map: ``cake_causal_conv1d_det_kcp`` -> :func:`cake_causal_conv1d_kcp`, ``cake_causal_conv1d_det_multi_kcp``
 -> :func:`cake_causal_conv1d_multi_kcp`, ``RecomputeHandleDetKcp`` -> ``RecomputeHandleKcp`` (any object with an
-``entries`` dict serves either mode).  The deterministic names and their previous aliases
-(``flashinfer.cake_causal_conv1d_det_train.cake_causal_conv1d_kcp`` / ``cake_causal_conv1d_kcp_multi`` /
-``KcpRecomputeHandle``) are unchanged and always deterministic::
+``entries`` dict serves either mode).  The deterministic names are unchanged and always deterministic; their
+names before the det rename (``flashinfer.cake_causal_conv1d_det_train.cake_causal_conv1d_kcp`` /
+``cake_causal_conv1d_kcp_multi`` / ``KcpRecomputeHandle``) are removed::
 
     from flashinfer.cake_causal_conv1d_train_kcp import cake_causal_conv1d_kcp, cake_causal_conv1d_multi_kcp
 

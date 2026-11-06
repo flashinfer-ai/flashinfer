@@ -778,7 +778,7 @@ def test_ep16_sparse_reference_and_repeated_result(backend) -> None:
             else:
                 session = CakeMxfp8MegaMoeEp16(weights, topk_ids, backend=backend)
             workspace = session._workspace
-            assert workspace.flags.tensor.numel() == (66 if backend else 2)
+            assert workspace.flags.tensor.numel() == 2
             for symm in (
                 workspace.flags,
                 workspace.published_hidden,
@@ -795,11 +795,10 @@ def test_ep16_sparse_reference_and_repeated_result(backend) -> None:
                     assert symm.peer_pointers is None
                     assert symm.peers.dtype == torch.int64
                     assert symm.peers.numel() == 16
-            if backend != "cute_dsl":
-                # The CUDA backend keeps one row and route slot per source rank.
-                assert workspace.published_hidden.tensor.shape == (16, tokens, 3072)
-                assert workspace.published_topk_ids.tensor.shape == (16, tokens, 8)
-                assert workspace.published_topk_weights.tensor.shape == (16, tokens, 8)
+            # Both backends keep one row and route slot per source rank.
+            assert workspace.published_hidden.tensor.shape == (16, tokens, 3072)
+            assert workspace.published_topk_ids.tensor.shape == (16, tokens, 8)
+            assert workspace.published_topk_weights.tensor.shape == (16, tokens, 8)
 
             first_copy = None
             for repeat in range(32):

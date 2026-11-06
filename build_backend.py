@@ -1072,10 +1072,19 @@ def _create_build_metadata():
         return version
 
     # In git repo (editable) or file doesn't exist, create/update it
-    with open(build_meta_file, "w") as f:
-        f.write('"""Build metadata for flashinfer package."""\n')
-        f.write(f'__version__ = "{version}"\n')
-        f.write(f'__git_commit__ = "{git_version}"\n')
+    content = (
+        '"""Build metadata for flashinfer package."""\n'
+        f'__version__ = "{version}"\n'
+        f'__git_commit__ = "{git_version}"\n'
+    )
+    # Concurrent AOT provider builds import this module at start-up while
+    # others import flashinfer, so a reader must never see a truncated file:
+    # skip an identical rewrite and replace the file atomically otherwise.
+    if build_meta_file.exists() and build_meta_file.read_text() == content:
+        return version
+    tmp_file = build_meta_file.with_name(f"{build_meta_file.name}.{os.getpid()}.tmp")
+    tmp_file.write_text(content)
+    os.replace(tmp_file, build_meta_file)
 
     print(f"Created build metadata file with version {version}")
     return version
@@ -1098,7 +1107,11 @@ def _create_data_dir(use_symlinks=True):
     def ln(source: str, target: str) -> None:
         src = _root / source
         dst = _data_dir / target
-        if dst.exists():
+        if use_symlinks and dst.is_symlink() and dst.resolve() == src.resolve():
+            # Already correct. Concurrent provider builds call this at start-up,
+            # and unlinking a link another build is compiling through breaks it.
+            return
+        if dst.exists() or dst.is_symlink():
             if dst.is_symlink():
                 dst.unlink()
             elif dst.is_dir():

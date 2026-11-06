@@ -799,8 +799,8 @@ UE8M0_ARCHES = ["sm_107a"]
 # "fp8_group128_ue8m0" the UE8M0 mode's, "nvfp4" the NVFP4 layout's) takes
 # launches on the devices of an SM count alone, at the split count and grid
 # of the program it replaces (16 splits, or 13 at the tailpipe regime's
-# two-wave counts, so the same outputs; its launch stages the RMSNorm weight,
-# 4096 BF16 values, in shared memory): the
+# larger two-wave counts, so the same outputs; its launch stages the RMSNorm
+# weight, 4096 BF16 values, in shared memory): the
 # deterministic launches of the plain variant's regime ("bf16") at the token
 # counts of that count's WSMEM_SM_DETERMINISTIC_TOKENS and the launches of the
 # tailpipe regime outside the deterministic mode at those of WSMEM_SM_TOKENS
@@ -826,13 +826,13 @@ WSMEM_SM_DETERMINISTIC_TOKENS = {
 WSMEM_SM_TOKENS = {
     208: {
         "fp8_group128": [[1665, 2496], [2816, 3328]],
-        "fp8_group128_ue8m0": [[1665, 2496], [2944, 3328]],
+        "fp8_group128_ue8m0": [[1472, 1664], [1665, 2496], [2944, 3328]],
         "nvfp4": [[1665, 2496], [2497, 3328]],
     },
     216: {
         "fp8_group128": [[2113, 2560], [2880, 3456]],
-        "fp8_group128_ue8m0": [[1729, 2560], [3008, 3456]],
-        "nvfp4": [[2113, 2560], [2561, 3456]],
+        "fp8_group128_ue8m0": [[1536, 1728], [1729, 2560], [3008, 3456]],
+        "nvfp4": [[1664, 1728], [2113, 2560], [2561, 3456]],
     },
 }
 # The plain FP8 group-128 variant's fast-division program on sm_107a (its FP8

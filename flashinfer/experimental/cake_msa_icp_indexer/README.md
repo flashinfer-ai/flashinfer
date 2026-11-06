@@ -66,8 +66,14 @@ scorer, read `seq_lens` and `block_table` and start loading the history
 index-K pages (those ending at or before `seq_len - decode_query_len`) before
 their wait.  The kernel launched just before the scorer must not write them,
 and must either be launched without programmatic dependent launch or wait on
-its own predecessor before it triggers its dependents.  `enable_pdl=False`
-removes the requirement.
+its own predecessor before it triggers its dependents.  The decode merge of
+`MSAIcpIndexerPlan.decode` with tagged rows at world size 4 (vLLM's
+decode-only steps) reads
+`num_valid_pages`, its receive rows and the merge counters before its wait and
+waits before it exits: no kernel of the step may write `num_valid_pages`, and a
+kernel launched without programmatic dependent launch must run between two
+decodes on one slot set (vLLM's decode K writer).  `enable_pdl=False` removes
+both requirements.
 
 The caller owns every buffer and every collective step: it allocates the
 receive storage (`msa_icp_comm_layout`) in symmetric memory, exchanges the
