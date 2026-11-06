@@ -30,10 +30,14 @@ def kernel_name(
 
 
 @functools.cache
-def get_compiled_swaps(D: int, g: int, page: int, n_pad: int, ragged: bool = False):
+def get_compiled_swaps(
+    D: int, g: int, page: int, n_pad: int, ragged: bool = False, cap: int = 0
+):
+    """``cap``: the shared-memory capacity the ring is sized for (the execution device's; the current device's when 0): part of
+    the kernel's identity in this process's cache and on disk."""
     from .operands import arch_smem_cap
 
-    cap = arch_smem_cap()  # the ring depth follows the compile target's capacity: part of the kernel's identity
+    cap = cap or arch_smem_cap()
     name = kernel_name(D, g, page, n_pad, ragged, cap)
 
     def compile_fn():

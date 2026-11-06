@@ -522,9 +522,25 @@ def run_attention(
         raise ValueError(
             "the K / V caches must have a unit stride along the head dim (the kernels are compiled for it)"
         )
+    for name, t in (("q", q), ("k_cache", k_cache), ("v_cache", v_cache)):
+        if t.data_ptr() % 16:
+            raise ValueError(
+                f"{name} must be 16-byte aligned (the TMA descriptors' requirement); its base address is not"
+            )
     if out is None:
         out = torch.empty_like(q)
     assert out.shape == q.shape and out.dtype == torch.bfloat16 and out.is_contiguous()
+    if out.data_ptr() % 16:
+        raise ValueError(
+            "out must be 16-byte aligned (the TMA descriptors' requirement)"
+        )
+    if out.untyped_storage().data_ptr() in (
+        k_cache.untyped_storage().data_ptr(),
+        v_cache.untyped_storage().data_ptr(),
+    ):
+        raise ValueError(
+            "out must not alias the K / V cache: CTAs store output rows while others still read pages"
+        )
     c = check_sm_scale(sm_scale)
     plan = planned.plan
     if total_q == 0 or plan.num_units == 0:
@@ -543,7 +559,10 @@ def run_attention(
     if n_pad:  # every unit has <= 32 live rows: the Swaps-AB kernel (same descriptors, same bits)
         from .swaps.compile import get_compiled_swaps
 
-        kernel = get_compiled_swaps(D, g, page, n_pad, ragged)
+        from .swaps.operands import arch_smem_cap
+
+        # the ring depth follows the execution device's shared memory: part of the kernel's identity, in-process and on disk
+        kernel = get_compiled_swaps(D, g, page, n_pad, ragged, arch_smem_cap(q.device))
         kernel(
             q_view,
             kv_k,

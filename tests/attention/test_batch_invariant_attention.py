@@ -258,6 +258,16 @@ def test_cache_key_covers_every_kernel_source():
     )  # the API module stays outside the closure
 
 
+def test_swaps_kernel_identity_carries_its_capacity():
+    """The Swaps kernel's name (its cache key, in-process and on disk) differs between the shared-memory capacities its ring is sized
+    for, so a kernel compiled for one part is never loaded for another."""
+    from flashinfer.attention.batch_invariant.swaps.compile import kernel_name
+
+    a = kernel_name(128, 8, 16, 8, False, cap=228 << 10)
+    b = kernel_name(128, 8, 16, 8, False, cap=328 << 10)
+    assert a != b and a.endswith("_c228") and b.endswith("_c328")
+
+
 def test_unsupported_device_raises_before_any_kernel():
     ws = torch.empty(1 << 20, dtype=torch.uint8)
     with pytest.raises(bi.BatchInvariantUnsupportedError):
@@ -327,6 +337,9 @@ def test_determinism_and_graph_replay(D):
     )
     out = torch.empty_like(pr.q)
     s = torch.cuda.Stream()
+    s.wait_stream(
+        torch.cuda.current_stream()
+    )  # the plan's device copies precede the side stream's warm-up
     with torch.cuda.stream(s):
         w.run(pr.q, pr.cache("NHD"), out=out)
         g = torch.cuda.CUDAGraph()
@@ -999,6 +1012,29 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         bi.BatchInvariantUnsupportedError
     ):  # a q whose base is not 16-byte aligned
         w.run(qoff, (k, v))
+    # the functional API refuses the same misuse with ValueError: misaligned operands, an output aliasing the cache
+    from flashinfer.attention.batch_invariant import engine as eng
+
+    planned = w._batch_invariant._planned
+    for bad in (
+        dict(q=qoff),
+        dict(k_cache=off),
+        dict(out=k.flatten()[: pr.q.numel()].view(pr.q.shape)),
+        dict(out=v.flatten()[: pr.q.numel()].view(pr.q.shape)),
+    ):
+        args = dict(q=pr.q, k_cache=k, v_cache=v, out=None)
+        args.update(bad)
+        with pytest.raises(ValueError):
+            eng.run_attention(
+                planned,
+                args["q"],
+                args["k_cache"],
+                args["v_cache"],
+                pr.kv_indptr,
+                pr.kv_indices,
+                1.0 / math.sqrt(128),
+                out=args["out"],
+            )
     # a plan with no query rows: nothing is launched, the (empty) output comes back
     w.plan(
         torch.tensor([0, 0], dtype=torch.int32, device=pr.device),
@@ -1074,6 +1110,24 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
     assert dec._batch_invariant._config.split_policy == "auto"
     q_last = big.q[[int(big.qo_indptr[i + 1]) - 1 for i in range(4)]].contiguous()
     assert torch.equal(bits(dec.run(q_last, big.cache("NHD"))), bits(out_big))
+    # the deprecated forward() of both prefill wrappers: an fp16 QK reduction is refused after a supported plan (forward() keeps
+    # its options on the wrapper, so this comes last)
+    w.plan(
+        pr.qo_indptr,
+        pr.kv_indptr,
+        pr.kv_indices,
+        pr.kv_last,
+        32,
+        8,
+        128,
+        16,
+        causal=True,
+        **kw,
+    )
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        w.forward(pr.q, (k, v), causal=True, use_fp16_qk_reduction=True)
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        rag.forward(pr.q, pr.k_rag, pr.v_rag, causal=True, use_fp16_qk_reduction=True)
 
 
 @needs_device
@@ -1140,7 +1194,7 @@ def test_output_beyond_2_31_elements():
     alone.kv_last = pr.kv_last[-1:].contiguous()
     for merge in ("fixup", "inkernel"):
         cfg = replace(engine.default_config(D=D), split_policy="split", merge=merge)
-        outs = []
+        outs, plans = [], []
         for problem in (pr, alone):
             planned = engine.plan_attention(
                 problem.qo_indptr,
@@ -1155,6 +1209,7 @@ def test_output_beyond_2_31_elements():
                 ws,
                 pr.device,
             )
+            plans.append(planned)
             outs.append(
                 engine.run_attention(
                     planned,
@@ -1172,7 +1227,7 @@ def test_output_beyond_2_31_elements():
             )
         big_out, alone_out = outs
         assert big_out.numel() > 2**31
-        assert planned.plan.ws_rows > 0, merge
+        assert plans[0].plan.ws_rows > 0, merge  # the large batch's plan splits
         assert torch.equal(bits(big_out[-ql:]), bits(alone_out)), merge
         del outs, big_out, alone_out
 
