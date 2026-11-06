@@ -184,12 +184,17 @@ def default_knobs(
 
 @deprecated_aliases(apply_topk_in_fc1="apply_routing_weights_before_fc2")
 def is_valid(
-    knobs: Dict[str, Any], *, apply_routing_weights_before_fc2: bool = True
+    knobs: Dict[str, Any],
+    *,
+    apply_routing_weights_before_fc2: bool = True,
+    fp8_scale_mode: Optional[str] = None,
 ) -> bool:
     """``True`` if ``knobs`` is a compilable SM90 FP8 MegaMoE combo.
 
     Mirrors the kernel ctor / config ``__post_init__`` rules; unspecified
-    knobs fall back to the kernel defaults, so a partial dict is fine.
+    knobs fall back to the kernel defaults, so a partial dict is fine.  The
+    swap-AB N72/N80 token tiles are blockwise-only: they are rejected when
+    ``fp8_scale_mode`` is given and is not ``"blockwise"``.
     """
     swap_ab = bool(knobs.get("swap_ab", False))
     pingpong = bool(knobs.get("pingpong", False))
@@ -199,7 +204,9 @@ def is_valid(
     in_kernel = knobs.get("in_kernel_fc2_reduce", False)
 
     if swap_ab:
-        if m not in (128, 256) or n not in (8, 16, 32, 64, 128):
+        if m not in (128, 256) or n not in (8, 16, 32, 64, 72, 80, 128):
+            return False
+        if n in (72, 80) and (m != 256 or fp8_scale_mode not in (None, "blockwise")):
             return False
         if pingpong and m != 128:
             return False

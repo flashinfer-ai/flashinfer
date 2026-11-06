@@ -208,7 +208,8 @@ dispatch warp, no `dedup_dispatch`), every `epi_warps` candidate also gets
 three dispatch-pull variants (rotation alone; three rows in flight in the
 4-slot buffer, without and with rotation; see `dispatch_pull_batch` below),
 ping-pong candidates the rotation only (batching never measured faster on
-them) — 81 candidates.
+them) — 81 candidates.  Blockwise also gets the swap-AB M256 N72/N80 cga(1,1,1)
+`epi_warps` tiles (40 candidates, 89 from 1024 tokens per rank).
 
 - `fp8_scale_mode` — `"per_tensor"` (per-expert weight scalar + static
   activation calibration scalars, identical on all EP ranks by contract) or
@@ -230,7 +231,8 @@ them) — 81 candidates.
   drop-driver defaults for the rest (non-swap (64, 128, 128), swap-AB
   (256, 32, 128), (128, 32, 128) with ping-pong; cluster (1, 1, 1)).
   Kernel-legal geometry: non-swap M∈{64}, N∈{128,256}; swap-AB M∈{128,256},
-  N∈{8,16,32,64,128} (N=8 = wgmma m64n8k32, admitted 2026-09-10 and used by
+  N∈{8,16,32,64,128}, blockwise also N∈{72,80} with M=256 (see below)
+  (N=8 = wgmma m64n8k32, admitted 2026-09-10 and used by
   the per_tensor 32/64/128 rows; bit-exact for per_tensor
   ping-pong / cooperative and blockwise ping-pong / cooperative
   since 2026-09-10 — the blockwise token-scale box (n×4 fp32 = n·16 B) used
@@ -352,6 +354,17 @@ them) — 81 candidates.
   4-slot buffer costs 21 KiB of AB-stage SMEM and the GEMM dominates:
   rotation 0.99-1.01, batches 0.5-6.6% slower.  Hence autotune
   candidates, not defaults.
+- Blockwise swap-AB N72/N80 (M=256, 2026-11) — one task holds an expert's
+  65-80 rows, where N64 needs a second, nearly empty tile and blockwise N128
+  spills (728-byte stack; N72 has none, N80 24 bytes, N64 about 100
+  bytes).  The shim pads the activation-SF pool to a multiple of N (the SF
+  TMA addresses a tile as `(expert SF base + tile * N) // N`; every
+  power-of-two tile keeps 128).  Outputs are byte-identical to N64.
+  Measured on H200 (H2560/I640/E512/top-10/EP2, blockwise, batch 3, against
+  the best non-swap M64N256 with the same pull): N72 0.978 / 0.910 at 1664 /
+  1792 tokens per rank (65 / 70 rows per expert), N80 + rotation 0.970 at
+  2048 (80 rows); outside 65-80 rows, and on H7168/E384/EP4, the non-swap
+  tiles stay ahead or tie.  Autotune candidates only.
 - `fold_producer_warps` (default True; requires `active_dispatch_warps == 1`)
   — folds the TMA-A / TMA-B / scheduler warps into the three idle
   dispatch-warpgroup slots and drops the separate producer warpgroup

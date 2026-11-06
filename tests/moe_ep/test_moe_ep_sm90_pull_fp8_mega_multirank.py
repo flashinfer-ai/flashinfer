@@ -1148,15 +1148,21 @@ def test_moe_ep_sm90_pull_fp8_mega_layer_graph_replay(fp8_scale_mode):
 @pytest.mark.parametrize(
     "case",
     [
-        ("per_tensor", (128, 8, 128), True, (2, 1, 1)),
-        ("per_tensor", (256, 8, 128), False, (2, 1, 1)),
+        ("per_tensor", (128, 8, 128), True, (2, 1, 1), 16),
+        ("per_tensor", (256, 8, 128), False, (2, 1, 1), 16),
         # cga (2,1): B multicast splits the (8 x 4 fp32) token-scale box into
         # 64 B sub-boxes, which the kernel now loads non-multicast (TMA needs a
         # 128 B-aligned smem destination).  cga (1,1): the same tile without
         # any cluster split.
-        ("blockwise", (256, 8, 128), False, (2, 1, 1)),
-        ("blockwise", (256, 8, 128), False, (1, 1, 1)),
-        ("blockwise", (128, 8, 128), True, (1, 2, 1)),
+        ("blockwise", (256, 8, 128), False, (2, 1, 1), 16),
+        ("blockwise", (256, 8, 128), False, (1, 1, 1), 16),
+        ("blockwise", (128, 8, 128), True, (1, 2, 1), 16),
+        # Blockwise N72/N80 (activation-SF pool padded to a multiple of N):
+        # 35 tokens give ~70 rows per expert (one tile), 64 tokens ~128 rows
+        # (a full and a partial tile).
+        ("blockwise", (256, 72, 128), False, (1, 1, 1), 35),
+        ("blockwise", (256, 72, 128), False, (1, 1, 1), 64),
+        ("blockwise", (256, 80, 128), False, (1, 1, 1), 64),
     ],
     ids=[
         "pt_pp_M128N8",
@@ -1164,11 +1170,18 @@ def test_moe_ep_sm90_pull_fp8_mega_layer_graph_replay(fp8_scale_mode):
         "bw_coop_M256N8",
         "bw_coop_M256N8_cga1",
         "bw_pp_M128N8",
+        "bw_coop_M256N72_t35",
+        "bw_coop_M256N72_t64",
+        "bw_coop_M256N80_t64",
     ],
 )
 def test_moe_ep_sm90_pull_fp8_mega_layer_swapab_token_tile_8(case):
-    """Experimental swap-AB token tile N=8 (wgmma m64n8k32) bit-exact check."""
-    scale, tile, pingpong, cga = case
+    """Swap-AB token tiles outside the N16-N128 range, bit-exact check.
+
+    N=8 (wgmma m64n8k32) is experimental; blockwise N72/N80 hold an
+    expert's 65-80 rows in one task.
+    """
+    scale, tile, pingpong, cga, num_tokens = case
     _require_cuda()
     rank, world_size = _launcher_ranks()
     if world_size < 4:
@@ -1179,13 +1192,14 @@ def test_moe_ep_sm90_pull_fp8_mega_layer_swapab_token_tile_8(case):
         quantize_input=True,
         fp8_scale_mode=scale,
         swap_ab=True,
-        num_tokens=16,
+        num_tokens=num_tokens,
         mma_tiler_mnk=tile,
         pingpong=pingpong,
         cluster_shape_mnk=cga,
     )
     print(
-        f"rank {rank}: swap-AB token tile 8 ({scale} tile={tile} pp={pingpong} cga={cga}) matches reference"
+        f"rank {rank}: swap-AB token tile {tile[1]} ({scale} tile={tile} "
+        f"pp={pingpong} cga={cga} tokens={num_tokens}) matches reference"
     )
 
 

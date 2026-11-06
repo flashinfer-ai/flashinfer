@@ -46,16 +46,17 @@ Fc1EpilogueStoreTileN = 64
 SwapABTileMChoices = (128, 256)
 # 8 is experimental (wgmma m64n8k32; every n-derived count divides): see TUNING.md.
 SwapABTokenTileNChoices = (8, 16, 32, 64, 128)
-# Packed FP4 (fp8_scale_mode "mxfp4_hybrid") also takes N72/N80: one task holds
-# an expert's 65-80 rows where N64 needs a second, nearly empty tile. Its shim
-# pads the activation-SF pool to a multiple of N, which the SF TMA coordinate
-# (expert SF base + tile * N) // N needs; FP8 keeps 128-row SF padding.
-SwapABPackedFp4TokenTileNChoices = (8, 16, 32, 64, 72, 80, 128)
+# Packed FP4 (fp8_scale_mode "mxfp4_hybrid") and blockwise FP8 also take
+# N72/N80: one task holds an expert's 65-80 rows where N64 needs a second,
+# nearly empty tile (blockwise N128 spills). Their shims pad the activation-SF
+# pool to a multiple of N, which the SF TMA coordinate
+# (expert SF base + tile * N) // N needs; per-tensor FP8 keeps its list.
+SwapABTokenTileNChoicesN72N80 = (8, 16, 32, 64, 72, 80, 128)
 
 
 def swapab_token_tile_n_choices(fp8_scale_mode: str) -> tuple[int, ...]:
-    if fp8_scale_mode == "mxfp4_hybrid":
-        return SwapABPackedFp4TokenTileNChoices
+    if fp8_scale_mode in ("mxfp4_hybrid", "blockwise"):
+        return SwapABTokenTileNChoicesN72N80
     return SwapABTokenTileNChoices
 
 

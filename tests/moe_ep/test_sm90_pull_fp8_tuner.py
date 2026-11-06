@@ -114,6 +114,11 @@ class TestIsValid:
         assert pkg.is_valid(
             {**batched, "dispatch_pull_batch": 2, "active_dispatch_warps": 2}
         )
+        # Swap-AB N72/N80: M=256, blockwise only.
+        n72 = dict(swap_ab=True, mma_tiler_mnk=(256, 72, 128))
+        assert pkg.is_valid(n72, fp8_scale_mode="blockwise")
+        assert not pkg.is_valid(n72, fp8_scale_mode="per_tensor")
+        assert not pkg.is_valid(dict(swap_ab=True, mma_tiler_mnk=(128, 80, 128)))
         # Rotation needs token-back in the epilogue warps.
         assert pkg.is_valid({**ok, "dispatch_pull_rotate": True})
         assert not pkg.is_valid(
@@ -148,6 +153,9 @@ class TestIsValid:
         assert bool(pulled) == (max_tokens >= 1024)
         assert all(c["token_back_mode"] == "epi_warps" for c in pulled)
         assert not any(c["pingpong"] and "dispatch_pull_batch" in c for c in pulled)
+        # Blockwise also gets the swap-AB M256 N72/N80 tiles.
+        rows_fit = [c for c in cands if c["mma_tiler_mnk"][1] in (72, 80)]
+        assert bool(rows_fit) == (scale_mode == "blockwise")
         # deduplicated.
         keys = [json.dumps(c, sort_keys=True, default=list) for c in cands]
         assert len(keys) == len(set(keys))

@@ -228,10 +228,12 @@ not picked them up):
   while the K128 changes above stay local.
 - Swap-AB token tiles N72/N80 for packed FP4 (2026-10-28, measured on
   H2560/I640/E512/top10/EP2): `src/moe_hopper_fp8/epilogue_fp8_swapab.py`
-  adds `SwapABPackedFp4TokenTileNChoices` (with 72 and 80) and
+  adds `SwapABTokenTileNChoicesN72N80` (with 72 and 80) and
   `swapab_token_tile_n_choices`, which the swap-AB kernel and epilogue take
-  for `fp8_scale_mode="mxfp4_hybrid"`; FP8 keeps `SwapABTokenTileNChoices`
-  and its shim list. The swap-AB kernel also rejects N72/N80 without M=256
+  for `fp8_scale_mode="mxfp4_hybrid"` and, since 2026-11, `"blockwise"`
+  (the FP8 shim pads the activation-SF pool to a multiple of N and adds the
+  M256 N72/N80 tiles to the blockwise autotune candidates); per-tensor FP8
+  keeps `SwapABTokenTileNChoices`, its N128 does not spill. The swap-AB kernel also rejects N72/N80 without M=256
   and, for the scale modes with activation SF (`blockwise`, `mxfp4_hybrid`),
   an `sf_padding_block` that is not a multiple of N, because the
   activation-SF TMA addresses a tile as `(expert SF base + tile * N) // N`;

@@ -75,6 +75,8 @@ _NONSWAP_TILE_M_CHOICES = (64,)
 _NONSWAP_TILE_N_CHOICES = (128, 256)
 _SWAPAB_TILE_M_CHOICES = (128, 256)
 _SWAPAB_TILE_N_CHOICES = (8, 16, 32, 64, 128)
+# Blockwise also takes N72/N80 with M=256: one task for an expert's 65-80 rows.
+_SWAPAB_BLOCKWISE_TILE_N_CHOICES = (8, 16, 32, 64, 72, 80, 128)
 
 # CGA shapes accepted by the drop's _validate_mma_tiler_and_cluster_shape
 # (both geometries).  Cluster K must stay 1; peers only cooperate through
@@ -368,10 +370,20 @@ class MegaMoEHopperFp8Config:
                     f"got mma_tiler_mnk={self.mma_tiler_mnk}."
                 )
         if self.swap_ab:
-            if m not in _SWAPAB_TILE_M_CHOICES or n not in _SWAPAB_TILE_N_CHOICES:
+            n_choices = (
+                _SWAPAB_BLOCKWISE_TILE_N_CHOICES
+                if self.blockwise
+                else _SWAPAB_TILE_N_CHOICES
+            )
+            if m not in _SWAPAB_TILE_M_CHOICES or n not in n_choices:
                 raise ValueError(
                     "swap-AB Hopper FP8 requires mma_tiler M in "
-                    f"{_SWAPAB_TILE_M_CHOICES} and N in {_SWAPAB_TILE_N_CHOICES}; "
+                    f"{_SWAPAB_TILE_M_CHOICES} and N in {n_choices}; "
+                    f"got mma_tiler_mnk={self.mma_tiler_mnk}."
+                )
+            if n in (72, 80) and m != 256:
+                raise ValueError(
+                    "swap-AB Hopper FP8 token tiles N72/N80 require M=256; "
                     f"got mma_tiler_mnk={self.mma_tiler_mnk}."
                 )
         else:
@@ -835,7 +847,10 @@ class MegaMoEHopperFp8Frontend:
             use_2cta_instrs=c.use_2cta_instrs,
             group_hint=group_hint,
             token_padding_block=token_padding_block,
-            sf_padding_block=SfPaddingBlock,
+            # The activation-SF TMA addresses token tile t of an expert as
+            # (expert SF base + t * N) // N: pad each expert to a multiple of
+            # the token tile (128 for every power-of-two tile, as before).
+            sf_padding_block=_round_up(SfPaddingBlock, token_padding_block),
             load_balance_mode=c.load_balance_mode,
             static_expert_shape=static_expert_shape,
             force_static_sched=c.force_static_sched,
