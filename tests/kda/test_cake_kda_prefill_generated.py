@@ -27,10 +27,13 @@ cooperative launches take instead of the pair-share or routed program, and
 which turnover launches whose bin table the bin-mix rule admits take
 cooperatively instead of the turnover program on the ``WORK_BIN_MIX_ARCHES``
 parts, and ``_RENDERED_WORK_BIN_MIX_LONG_ROUTES`` the long-task builds of the
-bin-mix programs, which bin-mix launches of longer tasks take instead, and
+bin-mix programs, which bin-mix launches of longer tasks take instead,
 ``_RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES`` the hybrid builds of the M64
 owner/helper programs, which the equal-length launches of a one-helper rule row
-take cooperatively instead of the pair-share program.
+take cooperatively instead of the pair-share program, and
+``_RENDERED_WORK_BIN_TURN_E128_ROUTES`` the 128-token builds of the turnover
+programs, which turnover launches whose sequences all hold 128 tokens take
+instead (bit for bit the turnover launch).
 
 The CPU checks hold both tables to the units, to the shipped argument plans and
 to the factory lookup. The GPU checks run the prepared BF16 prefill on the
@@ -256,6 +259,18 @@ def test_routes_point_shipped_modules_at_generated_programs():
             assert program in registry._RENDERED_MODULES, (arch, program)
             assert arch in registry._RENDERED_MODULES[program]["arches"]
             routed.add(program)
+    assert set(registry._RENDERED_WORK_BIN_TURN_E128_ROUTES) == set(registry.ARCHES)
+    for arch, modules in registry._RENDERED_WORK_BIN_TURN_E128_ROUTES.items():
+        for module, program in modules.items():
+            # Every other turnover launch keeps the module's turnover program.
+            assert module in registry._RENDERED_WORK_BIN_TURN_ROUTES[arch], (
+                arch,
+                module,
+            )
+            assert program != registry._RENDERED_WORK_BIN_TURN_ROUTES[arch][module]
+            assert program in registry._RENDERED_MODULES, (arch, program)
+            assert arch in registry._RENDERED_MODULES[program]["arches"]
+            routed.add(program)
     assert set(registry._RENDERED_WORK_BIN_MIX_LONG_ROUTES) == set(registry.ARCHES)
     for arch, modules in registry._RENDERED_WORK_BIN_MIX_LONG_ROUTES.items():
         for module, program in modules.items():
@@ -353,6 +368,7 @@ def test_generated_plans_bind_from_the_shipped_plans():
             *registry._RENDERED_WORK_BIN_TURN_SHORT_ROUTES[arch].items(),
             *registry._RENDERED_WORK_BIN_MIX_LONG_ROUTES[arch].items(),
             *registry._RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES[arch].items(),
+            *registry._RENDERED_WORK_BIN_TURN_E128_ROUTES[arch].items(),
         ]
         for module, program in routes:
             shipped = {
@@ -1166,6 +1182,7 @@ def unrouted(monkeypatch):
             "_RENDERED_WORK_BIN_TURN_SHORT_ROUTES",
             "_RENDERED_WORK_BIN_MIX_LONG_ROUTES",
             "_RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES",
+            "_RENDERED_WORK_BIN_TURN_E128_ROUTES",
         ):
             monkeypatch.setattr(registry, table, {arch: {} for arch in registry.ARCHES})
 
@@ -1214,6 +1231,7 @@ def test_serving_rows_match_the_fp32_reference(
         | set(registry._RENDERED_WORK_BIN_POOL_ROUTES[arch].values())
         | set(registry._RENDERED_WORK_BIN_TURN_SHORT_ROUTES[arch].values())
         | set(registry._RENDERED_WORK_BIN_MIX_LONG_ROUTES[arch].values())
+        | set(registry._RENDERED_WORK_BIN_TURN_E128_ROUTES[arch].values())
     )
     if loaded & work_bin_programs:
         with monkeypatch.context() as patch:
@@ -1415,10 +1433,12 @@ def _turnover_chunk_limit():
 
 
 def _turn_programs():
-    """The turnover builds, with the short-task ones."""
+    """The turnover builds, with the short-task and 128-token ones."""
     arch = registry.device_arch()
-    return set(registry._RENDERED_WORK_BIN_TURN_ROUTES[arch].values()) | set(
-        registry._RENDERED_WORK_BIN_TURN_SHORT_ROUTES[arch].values()
+    return (
+        set(registry._RENDERED_WORK_BIN_TURN_ROUTES[arch].values())
+        | set(registry._RENDERED_WORK_BIN_TURN_SHORT_ROUTES[arch].values())
+        | set(registry._RENDERED_WORK_BIN_TURN_E128_ROUTES[arch].values())
     )
 
 
@@ -1426,6 +1446,8 @@ def _turn_of(lengths=None, heads=None):
     """Work-binned program -> its turnover build, for the turn table's modules;
     for a launch of ``lengths`` at ``heads`` heads in the short-task scope
     (``runtime._work_bin_turn_short_scope``), the short-task build where the
+    loader names one, else in the 128-token scope
+    (``runtime._work_bin_turn_e128_scope``) the 128-token build where the
     loader names one."""
     arch = registry.device_arch()
     short = {}
@@ -1433,8 +1455,13 @@ def _turn_of(lengths=None, heads=None):
         lengths, heads, _sm_count()
     ):
         short = registry._RENDERED_WORK_BIN_TURN_SHORT_ROUTES[arch]
+    e128 = {}
+    if lengths is not None and runtime._work_bin_turn_e128_scope(lengths):
+        e128 = registry._RENDERED_WORK_BIN_TURN_E128_ROUTES[arch]
     return {
-        registry._RENDERED_WORK_BIN_ROUTES[arch][module]: short.get(module, program)
+        registry._RENDERED_WORK_BIN_ROUTES[arch][module]: short.get(
+            module, e128.get(module, program)
+        )
         for module, program in registry._RENDERED_WORK_BIN_TURN_ROUTES[arch].items()
     }
 
@@ -1854,6 +1881,66 @@ def test_bounded_turnover_launch_is_bitwise_the_work_binned_launch(
     _assert_bitwise(got, want, "turnover vs work-binned")
     _assert_bitwise(turn.run(), want, "turnover after the work-binned launch")
     _assert_bitwise(plain.run(), got, "work-binned repeat")
+
+
+# Bounded turnover launches on either side of the 128-token scope: every
+# sequence exactly 128 tokens (the 128-token build where the loader names one,
+# on sm_103a), and 127 / 129 tokens or one sequence off 128 (the turnover
+# build).
+E128_ROWS = [
+    pytest.param([128] * 16, 12, True, id="bs16x128-h12"),
+    pytest.param([128] * 16, 16, True, id="bs16x128-h16"),
+    pytest.param([128] * 25, 12, True, id="bs25x128-h12"),
+    pytest.param([128] * 46, 8, True, id="bs46x128-h8"),
+    pytest.param([127] * 16, 12, False, id="bs16x127-h12"),
+    pytest.param([129] * 16, 16, False, id="bs16x129-h16"),
+    pytest.param([128] * 15 + [127], 12, False, id="bs15x128+127-h12"),
+]
+
+
+@requires_blackwell
+@pytest.mark.parametrize("rows", [True, False], ids=["rows", "no-rows"])
+@pytest.mark.parametrize("lengths,heads,takes", E128_ROWS)
+def test_e128_launch_is_bitwise_the_turnover_launch(
+    lengths, heads, takes, rows, monkeypatch
+):
+    """A bounded turnover launch whose sequences all hold exactly 128 tokens
+    takes its module's 128-token build where the loader names one: the same
+    bins and schedule, the turnover program replaced, bit for bit the turnover
+    launch (the same call without the 128-token table), with and without
+    checkpoint rows, in either order.  Every other launch keeps the turnover
+    build."""
+    if not _bounded_turnover_expected(lengths, heads):
+        pytest.skip("this part keeps the bounded launch on its work-binned build")
+    arch = registry.device_arch()
+    e128_routes = registry._RENDERED_WORK_BIN_TURN_E128_ROUTES[arch]
+    e128_of = {
+        registry._RENDERED_WORK_BIN_TURN_ROUTES[arch][module]: program
+        for module, program in e128_routes.items()
+    }
+    d = _inputs(lengths, heads)
+    got_call = _Call(d, -5.0, rows=rows)
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            registry,
+            "_RENDERED_WORK_BIN_TURN_E128_ROUTES",
+            {name: {} for name in registry.ARCHES},
+        )
+        turn = _Call(d, -5.0, rows=rows)
+    assert str(got_call.prepared.schedule) == str(turn.prepared.schedule)
+    turned = _modules(turn.prepared)
+    loaded = _modules(got_call.prepared)
+    if takes and e128_routes:
+        assert turned & set(e128_of), str(turn.prepared.schedule)
+        assert loaded == {e128_of.get(p, p) for p in turned}
+    else:
+        assert loaded == turned
+        assert not loaded & set(e128_routes.values())
+    got = got_call.run()
+    want = turn.run()
+    _assert_bitwise(got, want, "128-token vs turnover")
+    _assert_bitwise(got_call.run(), want, "128-token after the turnover launch")
+    _assert_bitwise(turn.run(), got, "turnover repeat")
 
 
 TURNOVER_PARTS = [

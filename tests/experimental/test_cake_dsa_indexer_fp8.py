@@ -57,6 +57,7 @@ DispatchPolicy = cake_policy.DispatchPolicy
 fp8_policy_record = cake_policy.fp8_policy_record
 fp8_program_choice = cake_policy.fp8_program_choice
 fp8_scan_programs = cake_policy.fp8_scan_programs
+sample_class_for = cake_policy.sample_class_for
 scan_key = cake_policy.scan_key
 scan_key_fields = cake_policy.scan_key_fields
 scan_key_form = cake_policy.scan_key_form
@@ -69,17 +70,22 @@ E4M3 = torch.float8_e4m3fn
 _GRIDS = {"sm_100a": (148,), "sm_103a": (148, 152, 160), "sm_107a": (212,)}
 # DeepGEMM's fp8_mqa_logits accumulates in four K = 32 steps, the order of the sm_100a / sm_103a FP8 programs.
 _K32_ARCHES = ("sm_100a", "sm_103a")
+# The architectures that register an FP8 wide program; elsewhere an FP8 wide decision runs l6 (``FP8_KIND_FALLBACK``).
+_FP8_WIDE_ARCHES = ("sm_103a",)
 
 
 def _spec_fp8_keys(arch: str) -> set[str]:
     """The FP8 scan keys the export registers per architecture: narrow, l6, split_narrow and split_l6 with
-    their :lsf copies on sm_100a / sm_103a; narrow, l6 and split_narrow on sm_107a.  A stand-in registry for the host
-    tests while a checkout registers none; the dispatch reads the tile unroll from the keys, so two unrolls appear."""
+    their :lsf copies on sm_100a / sm_103a, and wide with its :lsf copy on sm_103a; narrow, l6 and split_narrow on
+    sm_107a.  A stand-in registry for the host tests while a checkout registers none; the dispatch reads the tile
+    unroll from the keys, so two unrolls appear."""
     if arch == "sm_107a":
         kinds, lsf = (("narrow", 2), ("l6", 1), ("split_narrow", 1)), (False,)
     else:
         kinds = (("narrow", 1), ("l6", 1), ("split_narrow", 1), ("split_l6", 1))
         lsf = (False, True)
+    if arch in _FP8_WIDE_ARCHES:
+        kinds += (("wide", 2),)
     return {
         scan_key(kind, unroll, False, True, copy, form=FP8)
         for (kind, unroll), copy in itertools.product(kinds, lsf)
@@ -103,6 +109,16 @@ def _fp8_policy(arch: str) -> DispatchPolicy:
     return DispatchPolicy.from_record(
         fp8_policy_record(cake_jit.POLICY[arch], cake_jit.POLICY_FP8[arch])
     )
+
+
+def _fp8_programs_without_wide(keys) -> dict:
+    """``fp8_scan_programs(keys)`` with the FP8 wide programs hidden: a wide decision then runs the l6 program
+    (``FP8_KIND_FALLBACK``, ``fallback_knobs``) as on an architecture that registers none."""
+    return {
+        kind: unrolls
+        for kind, unrolls in fp8_scan_programs(keys).items()
+        if kind[0] != "wide"
+    }
 
 
 def _geometries(policy, *, steps_t=16, steps_m=14):
@@ -210,6 +226,11 @@ def test_fp8_record_replaces_only_its_fields_and_leaves_the_bf16_record():
         "sm_103a": [],
         "sm_107a": ["l6", "narrow", "split_narrow"],
     }
+    # the FP8 records' own rules: sm_107a keeps no split-fit rule (no FP8 split program is measured under one)
+    assert {
+        arch: {f: v for f, v in fields.items() if f != "static_scan_kinds"}
+        for arch, fields in cake_jit.POLICY_FP8.items()
+    } == {"sm_100a": {}, "sm_103a": {}, "sm_107a": {"split_fit_rule": None}}
     # the FP8 record never inherits the BF16 programs' static kinds, and takes only record fields
     with pytest.raises(ValueError, match="static_scan_kinds"):
         fp8_policy_record(cake_jit.POLICY["sm_107a"], {})
@@ -263,8 +284,13 @@ def test_fp8_program_choice_follows_the_key():
         grid=148,
         scan_keys=keys,
     )
-    unit = {"narrow": policy.block_q_narrow, "l6": policy.block_q_l6}
-    for key in sorted(_spec_fp8_keys("sm_100a")):
+    unit = {
+        "narrow": policy.block_q_narrow,
+        "wide": policy.block_q_wide,
+        "l6": policy.block_q_l6,
+    }
+    # sm_103a's keys add the wide program
+    for key in sorted(_spec_fp8_keys("sm_100a") | _spec_fp8_keys("sm_103a")):
         fields = scan_key_fields(key)
         c = fp8_program_choice(policy, base, key)
         split = fields.physical.startswith("split_")
@@ -316,17 +342,17 @@ def test_fp8_program_choice_follows_the_key():
     _registries(),
     ids=lambda v: v if isinstance(v, str) else None,
 )
-def test_fp8_dispatch_maps_the_bf16_decision_and_reaches_every_fp8_key(
+def test_fp8_dispatch_maps_the_decision_under_the_fp8_record_and_reaches_every_fp8_key(
     label, arch, keys, fp8_keys
 ):
     """The FP8 dispatch runs the BF16 decision procedure under the FP8 record and maps its kind to a registered FP8
     kind (``FP8_KIND_FALLBACK``); on a geometry grid every program it selects is an FP8 key of the registry, never a
-    CTA pair, a snake order or the plain fit form, the split, unroll and :lsf choices follow the BF16 decision where an
-    FP8 program carries them, and every FP8 key is selected by some call."""
+    CTA pair, a snake order or the plain fit form, the split, unroll and :lsf choices follow that decision where an
+    FP8 program carries them, the sampled first threshold and the check period are those of the kind that runs, and
+    every FP8 key is selected by some call."""
     if not fp8_keys:
         pytest.skip(f"this checkout registers no FP8 scan program for {arch}")
     policy = _fp8_policy(arch)
-    bf16_policy = DispatchPolicy.from_record(cake_jit.POLICY[arch])
     programs = fp8_scan_programs(keys)
     fp8_kinds = {kind for kind, _lsf in programs}
     reached = set()
@@ -345,7 +371,7 @@ def test_fp8_dispatch_maps_the_bf16_decision_and_reaches_every_fp8_key(
                     max_seqlen_k=bound,
                     scan_keys=keys,
                 )
-                decided = select_program(bf16_policy, **call)
+                decided = select_program(policy, **call)
                 c = select_fp8_program(policy, fp8_programs=programs, **call)
                 where = (arch, grid, T, Tkv, S, ratio, top_k, bound, sample)
                 assert c.scan_key in fp8_keys, (*where, c.scan_key)
@@ -363,10 +389,153 @@ def test_fp8_dispatch_maps_the_bf16_decision_and_reaches_every_fp8_key(
                     if decided.tile_unroll in unrolls
                     else min(unrolls)
                 ), where
+                tiles = (
+                    policy.sample_tiles_for(T, Tkv, S, ratio)
+                    if sample is None
+                    else sample
+                )
+                assert (
+                    c.sample_tiles_max,
+                    c.sample_shift_permille,
+                ) == sample_class_for(
+                    policy,
+                    physical,
+                    T,
+                    Tkv,
+                    S,
+                    ratio,
+                    tiles,
+                    policy.sample_shift_for(top_k),
+                    tiles_knob=sample is not None,
+                    shift_knob=False,
+                ), where
+                assert c.check_period == policy.check_period_for(
+                    top_k, c.cand_cap, c.kind
+                ), where
+                if physical == decided.physical_kind:
+                    assert (
+                        c.sample_tiles_max,
+                        c.sample_shift_permille,
+                        c.check_period,
+                    ) == (
+                        decided.sample_tiles_max,
+                        decided.sample_shift_permille,
+                        decided.check_period,
+                    ), where
                 if arch == "sm_107a":
                     assert not c.lsf, where
                 reached.add(c.scan_key)
     assert reached == fp8_keys, sorted(fp8_keys - reached)
+
+
+@pytest.mark.parametrize(
+    "arch, grid", [("sm_100a", 148), ("sm_103a", 152), ("sm_107a", 212)]
+)
+def test_fp8_wide_call_runs_the_wide_or_l6_program(arch, grid):
+    """s1_8k_on_64k (8192 queries over 73728 keys, one segment, top_k 2048): the BF16 record plans a wide unit, and the
+    FP8 form runs its wide program (8 queries per unit) where the architecture registers one (sm_103a), else its l6
+    program (``FP8_KIND_FALLBACK``), unpaired and unsplit, rather than the narrow one."""
+    keys = set((cake_jit.PROGRAM_KEYS or {}).get(arch) or ())
+    if not any(scan_key_form(k) == FP8 for k in keys):
+        pytest.skip(f"this checkout registers no FP8 scan program for {arch}")
+    call = dict(
+        num_queries=8192,
+        num_keys=73728,
+        num_segments=1,
+        ratio=1,
+        top_k=2048,
+        grid=grid,
+        scan_keys=keys,
+    )
+    bf16 = select_program(DispatchPolicy.from_record(cake_jit.POLICY[arch]), **call)
+    assert bf16.physical_kind in ("wide", "pair_wide"), bf16.scan_key
+    fp8 = select_fp8_program(_fp8_policy(arch), **call)
+    key, block_q = (
+        ("scan:wide:u2:s0:f1:fp8", 8)
+        if arch in _FP8_WIDE_ARCHES
+        else ("scan:l6:u1:s0:f1:fp8", 6)
+    )
+    assert fp8.scan_key == key, fp8.scan_key
+    assert (fp8.block_q, fp8.pair, fp8.n_split, fp8.grid_ctas) == (
+        block_q,
+        False,
+        1,
+        grid,
+    )
+
+
+def test_fp8_wide_fallback_takes_the_sampling_class_of_l6():
+    """s2_4x2k_packed on sm_100a (four segments of 2048 queries over 229376 keys, the longest 100352): the BF16 record
+    plans a wide unit with the wide-unit sample shift of ``sample_class_rule``; with the FP8 wide programs hidden (as
+    where none is registered), the FP8 l6 program that runs instead takes the l6 kind's shift, as an l6 decision of the
+    call would (sm_100a's record keys no check period on the kind: the next test covers sm_103a's).  Explicit knobs
+    stay."""
+    keys = set((cake_jit.PROGRAM_KEYS or {}).get("sm_100a") or ())
+    if not any(scan_key_form(k) == FP8 for k in keys):
+        pytest.skip("this checkout registers no FP8 scan program for sm_100a")
+    policy = _fp8_policy("sm_100a")
+    programs = _fp8_programs_without_wide(keys)
+    call = dict(
+        num_queries=8192,
+        num_keys=229376,
+        num_segments=4,
+        ratio=1,
+        top_k=2048,
+        grid=148,
+        max_seqlen_k=100352,
+        scan_keys=keys,
+    )
+    decided = select_program(policy, **call)
+    assert decided.physical_kind == "wide", decided.scan_key
+    assert decided.sample_shift_permille == policy.sample_class_rule[1]
+    c = select_fp8_program(policy, fp8_programs=programs, **call)
+    assert c.scan_key == "scan:l6:u1:s0:f1:fp8:lsf", c.scan_key
+    assert c.sample_shift_permille == policy.sample_shift_for(2048)
+    assert c.sample_tiles_max == decided.sample_tiles_max
+    assert c.check_period == policy.check_period_for(2048, c.cand_cap, "l6")
+    knobbed = select_fp8_program(
+        policy, fp8_programs=programs, sample_shift_permille=500, check_period=8, **call
+    )
+    assert (knobbed.sample_shift_permille, knobbed.check_period) == (500, 8)
+
+
+def test_fp8_wide_fallback_takes_the_check_period_of_l6_on_sm103a():
+    """sm_103a's record overrides the wide kind's check period (``check_period_kind_overrides``): with sm_103a's FP8
+    wide programs hidden (as where none is registered), the FP8 l6 program run for a wide decision takes the l6 period
+    instead.  The unsampled wide decisions of the geometry grid whose two periods differ must exist, and each one runs
+    with the l6 period."""
+    keys = set((cake_jit.PROGRAM_KEYS or {}).get("sm_103a") or ())
+    if not any(scan_key_form(k) == FP8 for k in keys):
+        pytest.skip("this checkout registers no FP8 scan program for sm_103a")
+    policy = _fp8_policy("sm_103a")
+    programs = _fp8_programs_without_wide(keys)
+    seen = 0
+    for T, Tkv, S, ratio, top_k in _geometries(policy):
+        call = dict(
+            num_queries=T,
+            num_keys=Tkv,
+            num_segments=S,
+            ratio=ratio,
+            top_k=top_k,
+            grid=152,
+            sample_tiles_max=0,
+            scan_keys=keys,
+        )
+        decided = select_program(policy, **call)
+        if decided.physical_kind not in ("wide", "pair_wide"):
+            continue
+        wide = policy.check_period_for(top_k, decided.cand_cap, decided.kind)
+        l6 = policy.check_period_for(top_k, decided.cand_cap, "l6")
+        if wide == l6:
+            continue
+        c = select_fp8_program(policy, fp8_programs=programs, **call)
+        where = (T, Tkv, S, ratio, top_k)
+        assert decided.check_period == wide, where
+        assert (c.physical_kind, c.check_period) == ("l6", l6), where
+        seen += 1
+    assert seen, (
+        "no unsampled wide decision of the grid has a check period other than l6's"
+    )
 
 
 def test_bf16_plans_and_workspace_bounds_are_the_unchanged_procedure():
@@ -622,8 +791,20 @@ def _scan_argument(runner, name: str):
     return scan.arguments[index]
 
 
+# s1_8k_on_64k (8192 queries over 73728 keys, one segment, top_k 2048): the BF16 planner decides a wide unit, which the
+# FP8 wide program runs where the architecture registers one
+_S1 = dict(seg_q_len=[8192], seg_k_len=[73728], top_k=2048)
+
+
+def _assert_fp8_wide_on_wide_arches(plan):
+    """A wide-decision case (``_S1``) must run the FP8 wide program on the architectures of ``_FP8_WIDE_ARCHES``."""
+    if arch_for(torch.device("cuda")) in _FP8_WIDE_ARCHES:
+        assert plan.physical_kind == "wide", plan.scan_key
+
+
 _ACCURACY = {
     "single": dict(seg_q_len=[512], seg_k_len=[8192], top_k=2048),
+    "s1_8k_on_64k": _S1,
     "split_tail": dict(seg_q_len=[4], seg_k_len=[22018], top_k=2048),
     "packed_unequal": dict(
         seg_q_len=[600, 400, 300], seg_k_len=[600, 12000, 5000], top_k=1024
@@ -655,6 +836,8 @@ def test_fp8_random_accuracy_within_bound(name):
     inputs = ref.make_fp8_inputs(seed=31, device="cuda", label=name, **_ACCURACY[name])
     plan = _plan(inputs)
     assert scan_key_form(plan.scan_key) == FP8 and not plan.pair
+    if _ACCURACY[name] is _S1:
+        _assert_fp8_wide_on_wide_arches(plan)
     out = _cloned(_run(inputs))
     torch.cuda.synchronize()
     _judge_ok(out, ref.select_reference(inputs))
@@ -671,10 +854,16 @@ def test_fp8_empty_rows_and_no_keys_are_all_padding():
     assert indices.shape == (0, 16) and scores.shape == (0, 16)
 
 
-def test_fp8_dispatch_invariance_over_every_registered_program(monkeypatch):
+@pytest.mark.parametrize(
+    "shape",
+    [dict(seg_q_len=[700, 300, 200], seg_k_len=[700, 9000, 4000], top_k=1024), _S1],
+    ids=["packed", "s1_8k_on_64k"],
+)
+def test_fp8_dispatch_invariance_over_every_registered_program(monkeypatch, shape):
     """Every FP8 program of the device's architecture, forced on the same call (the planned capacity, check period,
     sampling and finalize; the split and unit geometry of the forced key), returns the dispatched program's ids and
-    score bits: within one architecture the dispatched FP8 program never changes a result."""
+    score bits: within one architecture the dispatched FP8 program never changes a result.  The packed call is judged
+    against the reference; on ``_S1`` every unit kind outnumbers the CTAs, so a drawing program draws tickets."""
     _require_fp8_program()
     arch = arch_for(torch.device("cuda"))
     policy = policy_for(arch, FP8)
@@ -683,16 +872,15 @@ def test_fp8_dispatch_invariance_over_every_registered_program(monkeypatch):
         for unrolls in cake_backend.fp8_programs_for(arch).values()
         for key in unrolls.values()
     )
-    inputs = ref.make_fp8_inputs(
-        [700, 300, 200], [700, 9000, 4000], top_k=1024, seed=41, device="cuda"
-    )
-    reference = ref.select_reference(inputs)
+    inputs = ref.make_fp8_inputs(seed=41, device="cuda", **shape)
+    reference = None if shape is _S1 else ref.select_reference(inputs)
     original = cake_backend.plan_dsa_indexer_det_topk
     for sample in (None, 0):
         extra = {} if sample is None else {"sample_tiles_max": sample}
         expected = _cloned(_run(inputs, **extra))
         torch.cuda.synchronize()
-        _judge_ok(expected, reference)
+        if reference is not None:
+            _judge_ok(expected, reference)
         for key in keys:
 
             def forced(*args, _key=key, **kwargs):
@@ -742,14 +930,20 @@ def test_fp8_ticket_decision_is_per_form_and_exact_on_a_poisoned_workspace():
     """The FP8 form decides its ticket tail by its own record: on sm_107a every FP8 program keeps the static unit
     enumeration (no tail, no ticket block, the device's placeholder); elsewhere a drawing FP8 program gets the tail
     (zeroed by the scan binding on a caller-owned buffer).  Rows stay bit-exact on a caller-owned buffer poisoned
-    everywhere."""
+    everywhere.  The last shape (``_S1``) runs the FP8 wide program where the architecture registers one, and its
+    units outnumber the CTAs, so that program draws tickets."""
     _require_fp8_program()
     device = torch.device("cuda", torch.cuda.current_device())
     arch = arch_for(device)
     static_kinds = set(policy_for(arch, FP8).static_scan_kinds)
-    for (T, Tkv, S), sample in itertools.product(
-        ((8192, 32768, 1), (4096, 16384, 2), (2048, 65536, 1), (4, 22018, 1)), (None, 0)
-    ):
+    shapes = (
+        (8192, 32768, 1),
+        (4096, 16384, 2),
+        (2048, 65536, 1),
+        (4, 22018, 1),
+        (8192, 73728, 1),
+    )
+    for (T, Tkv, S), sample in itertools.product(shapes, (None, 0)):
         inputs = ref.make_fp8_inputs(
             [T // S] * S, [Tkv // S] * S, top_k=2048, seed=47, device="cuda"
         )
@@ -760,6 +954,8 @@ def test_fp8_ticket_decision_is_per_form_and_exact_on_a_poisoned_workspace():
         )
         shared = torch.full((nbytes,), 7, dtype=torch.uint8, device=device)
         runner = _prepare(inputs, workspace_buffer=shared, **extra)
+        if (T, Tkv, S, sample) == (8192, 73728, 1, None):
+            _assert_fp8_wide_on_wide_arches(runner.choice)
         static_kind = runner.choice.physical_kind in static_kinds
         reads = cake_backend.reads_ticket_word(runner.programs["scan"], arch)
         if arch == "sm_107a":
@@ -789,12 +985,17 @@ def test_fp8_ticket_decision_is_per_form_and_exact_on_a_poisoned_workspace():
             assert not runner.ticket_tail[: 8 * 16].any()
 
 
-def test_fp8_workspace_bound_is_respected():
+@pytest.mark.parametrize(
+    "shape",
+    [dict(seg_q_len=[900, 300], seg_k_len=[900, 7000], top_k=2048), _S1],
+    ids=["packed", "s1_8k_on_64k"],
+)
+def test_fp8_workspace_bound_is_respected(shape):
     _require_fp8_program()
     device = torch.device("cuda", torch.cuda.current_device())
-    inputs = ref.make_fp8_inputs(
-        [900, 300], [900, 7000], top_k=2048, seed=53, device="cuda"
-    )
+    inputs = ref.make_fp8_inputs(seed=53, device="cuda", **shape)
+    if shape is _S1:
+        _assert_fp8_wide_on_wide_arches(_plan(inputs))
     nbytes = dsa_indexer_det_workspace_size(
         inputs.num_queries,
         inputs.num_keys,
@@ -854,10 +1055,11 @@ def test_fp8_prepared_runner_graph_capture_and_replay():
     assert ref.same_bits(_cloned(captured), _run(fresh))
 
 
-def test_fp8_k32_logits_match_deep_gemm_bitwise():
-    """Diagnostic: on sm_100a / sm_103a the FP8 programs accumulate in DeepGEMM's four K = 32 steps, so every returned
-    score equals the stock DeepGEMM FP8 MQA logit of its (query, key) pair bit for bit (up to the sign of zero).  The
-    logits come from ``deep_gemm.fp8_mqa_logits``, or in a build without it from ``deep_gemm.fp8_fp4_mqa_logits`` with
+def test_fp8_k32_logits_match_deep_gemm_bitwise(monkeypatch):
+    """Diagnostic: on sm_100a / sm_103a the FP8 programs accumulate in DeepGEMM's four K = 32 steps, so every score
+    returned by the dispatched program, and by every FP8 program of the architecture forced on the same call, equals
+    the stock DeepGEMM FP8 MQA logit of its (query, key) pair bit for bit (up to the sign of zero).  The logits come
+    from ``deep_gemm.fp8_mqa_logits``, or in a build without it from ``deep_gemm.fp8_fp4_mqa_logits`` with
     the same e4m3 ``q`` / ``k``, FP32 per-key scales and FP32 logits.  Skips on sm_107a (two K = 64 steps; last-bit
     differences allowed), where DeepGEMM does not import, where the build has neither entry point, where an entry
     point takes other arguments, and where ``fp8_fp4_mqa_logits`` rejects FP32 per-key scales on this architecture
@@ -868,7 +1070,10 @@ def test_fp8_k32_logits_match_deep_gemm_bitwise():
         pytest.skip(f"{arch} accumulates in K = 64 steps: no bitwise DeepGEMM claim")
     if importlib.util.find_spec("deep_gemm") is None:
         pytest.skip("deep_gemm is not installed")
-    import deep_gemm
+    try:
+        import deep_gemm
+    except (ImportError, OSError) as exc:  # installed, but its extension does not load
+        pytest.skip(f"deep_gemm does not import: {exc}")
 
     inputs = ref.make_fp8_inputs([512], [8192], top_k=2048, seed=67, device="cuda")
     indices, scores = _run(inputs)
@@ -909,12 +1114,35 @@ def test_fp8_k32_logits_match_deep_gemm_bitwise():
             "this deep_gemm build has neither fp8_mqa_logits nor fp8_fp4_mqa_logits"
         )
     logits = logits[:, : inputs.num_keys].float()
-    valid = indices >= 0
-    picked = logits.gather(1, indices.clamp_min(0).to(torch.int64))
-    got = torch.where(valid, scores + 0.0, torch.zeros_like(scores))
-    want = torch.where(valid, picked + 0.0, torch.zeros_like(picked))
-    mismatch = got.view(torch.int32) != want.view(torch.int32)
-    assert not mismatch.any(), (
-        f"{int(mismatch.sum())} scores differ from the DeepGEMM logits; first at "
-        f"{mismatch.nonzero()[0].tolist()}"
+
+    def check(indices, scores, program):
+        valid = indices >= 0
+        picked = logits.gather(1, indices.clamp_min(0).to(torch.int64))
+        got = torch.where(valid, scores + 0.0, torch.zeros_like(scores))
+        want = torch.where(valid, picked + 0.0, torch.zeros_like(picked))
+        mismatch = got.view(torch.int32) != want.view(torch.int32)
+        assert not mismatch.any(), (
+            f"{program}: {int(mismatch.sum())} scores differ from the DeepGEMM logits; first at "
+            f"{mismatch.nonzero()[0].tolist()}"
+        )
+
+    check(indices, scores, "the dispatched program")
+    # every FP8 program forced on the call as in the dispatch invariance test (the planned capacity, check period,
+    # sampling and finalize; the split and unit geometry of the forced key)
+    policy = policy_for(arch, FP8)
+    keys = sorted(
+        key
+        for unrolls in cake_backend.fp8_programs_for(arch).values()
+        for key in unrolls.values()
     )
+    original = cake_backend.plan_dsa_indexer_det_topk
+    for key in keys:
+
+        def forced(*args, _key=key, **kwargs):
+            return fp8_program_choice(policy, original(*args, **kwargs), _key)
+
+        monkeypatch.setattr(cake_backend, "plan_dsa_indexer_det_topk", forced)
+        runner = _prepare(inputs)
+        assert runner.choice.scan_key == key and runner.form == FP8
+        check(*runner(), key)
+        monkeypatch.setattr(cake_backend, "plan_dsa_indexer_det_topk", original)

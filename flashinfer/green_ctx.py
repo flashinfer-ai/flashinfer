@@ -109,7 +109,8 @@ def create_green_ctx_streams(
     cu_dev: CUdevResource, resources: List[CUdevResource]
 ) -> List[torch.Stream]:
     # cake_fmha's small-M decode plans its split count on the launch
-    # stream's SMs once a green context exists.
+    # stream's SMs (the default); turn that back on if the process had
+    # turned it off, since these streams run on an SM partition.
     enable_cake_fmha_sm_partitions()
     streams = []
     for split in resources:

@@ -842,13 +842,20 @@ class KernelBackend(Backend):
         self,
         programs: Any | None = None,
         *,
-        cols_per_cta: int = 8,
+        cols_per_cta: int | None = None,
         path: str = "fi-rendered",
     ) -> None:
         self._programs = programs
-        if cols_per_cta not in (8, 16, 32) or D % cols_per_cta:
-            raise ValueError(f"cols_per_cta must be 8, 16 or 32, got {cols_per_cta}")
-        self.cols_per_cta = int(cols_per_cta)
+        if cols_per_cta is not None and (
+            cols_per_cta not in (8, 16, 32, 64) or D % cols_per_cta
+        ):
+            raise ValueError(
+                f"cols_per_cta must be None (the registry's merge record per launch) or 8, 16, 32 or 64, got {cols_per_cta}"
+            )
+        # The K4 column block of the positional merge ABI: None = the column block of the registry record the
+        # launch's (ncols, n_chains, transpose_m) selects (cake_kcp_jit.merge_record), the same record the
+        # registry's run_program launches.
+        self.cols_per_cta = None if cols_per_cta is None else int(cols_per_cta)
         self.path = path
         self._dev: dict[tuple[Any, ...], torch.Tensor] = {}
         self._checked_chains: set[int] = set()
@@ -1367,7 +1374,12 @@ class KernelBackend(Backend):
         call.merge_log.append(
             (str(args.get("family")), int(ch.ncols), int(ch.n_chains), cols)
         )  # D1 evidence: None = registry record
-        cols = self.cols_per_cta if cols is None else cols
+        if cols is None:
+            cols = (
+                self.cols_per_cta
+                if self.cols_per_cta is not None
+                else _registry_merge_cols(ch.ncols, ch.n_chains, call.device)
+            )
         if ch.ncols % cols:
             raise ValueError(
                 f"ncols {ch.ncols} is not a multiple of cols_per_cta {cols}"
@@ -1399,6 +1411,20 @@ class KernelBackend(Backend):
             cols,
         ]
         return abi, ch.n_chains * (ch.ncols // cols)
+
+
+def _registry_merge_cols(ncols: int, n_chains: int, device: torch.device) -> int:
+    """``cols_per_cta`` of the K4 record the registry selects for the launch on ``device``
+    (:func:`.cake_kcp_jit.merge_record`; a device that is not CUDA: the record every architecture's rule names)."""
+    from . import cake_kcp_jit  # noqa: PLC0415 - H3's registry; optional at import time
+
+    arch = (
+        cake_kcp_jit.device_arch(device.index if device.index is not None else 0)
+        if device.type == "cuda"
+        else None
+    )
+    record = cake_kcp_jit.merge_record(ncols, n_chains, arch)
+    return int(cake_kcp_jit.MODULES[record]["grid_rule"]["cols_per_cta"])
 
 
 def merge_cols_per_cta(ncols: int, n_chains: int, rule: str) -> int | None:
@@ -1499,16 +1525,16 @@ ABI_PARAMS["dhu_tape"] = ABI_PARAMS["dhu_offset"]
 
 
 # Walk-launch geometry one_cta_per_sm / tape_one_cta_per_sm: the K1 / K2 walk kernels' occupancy capped from the host.
-# Their launch footprint (192 threads, 115712 B of dynamic shared memory) admits two CTAs per SM only at the full 228 KiB
-# carveout; the smallest configuration that fits one CTA admits exactly one.  The runtime picks a kernel's configuration at
-# launch from its function attribute (unset here) and otherwise from the device-wide preference (cudaDeviceSetCacheConfig):
-# cudaFuncCachePreferL1 selects the smallest fitting shared-memory configuration, i.e. one CTA per SM.  The generated
-# binding compiles the launch (cudaLaunchKernelExC with the fixed dynamic shared memory) and exports no symbol for the
-# kernel's registered host function (its wrapper survives only as the mangled `__device_stub__`, which the runtime does
-# not accept), so the per-function attribute cannot be set from the host; the knob brackets each capped launch with the
-# device-wide preference instead (PreferL1 before, PreferNone after).  The preference is host-side state read at launch:
-# launches already queued keep their configuration and only the bracketed launch takes PreferL1.  Host side only; no
-# kernel, launch-configuration or argument change.
+# Their launch footprint (192 threads, 320 for the split-role fwdh offset build; 115712 B of dynamic shared memory)
+# admits two CTAs per SM only at the full 228 KiB carveout; the smallest configuration that fits one CTA admits exactly
+# one.  The runtime picks a kernel's configuration at launch from its function attribute (unset here) and otherwise from
+# the device-wide preference (cudaDeviceSetCacheConfig): cudaFuncCachePreferL1 selects the smallest fitting
+# shared-memory configuration, i.e. one CTA per SM.  The generated binding compiles the launch (cudaLaunchKernelExC with
+# the fixed dynamic shared memory) and exports no symbol for the kernel's registered host function (its wrapper survives
+# only as the mangled `__device_stub__`, which the runtime does not accept), so the per-function attribute cannot be set
+# from the host; the knob brackets each capped launch with the device-wide preference instead (PreferL1 before,
+# PreferNone after).  The preference is host-side state read at launch: launches already queued keep their configuration
+# and only the bracketed launch takes PreferL1.  Host side only; no kernel, launch-configuration or argument change.
 WALK_CACHE_CONFIG_CAP = 2  # cudaFuncCachePreferL1 (driver_types.h): the smallest shared-memory configuration that fits
 WALK_CACHE_CONFIG_DEFAULT = (
     0  # cudaFuncCachePreferNone: the runtime's own choice (today's launches)
@@ -2375,6 +2401,11 @@ class _FiPrograms:
             if rule == "fit":
                 if walk_form == "split":
                     record += "_vh64"
+                elif record in getattr(jit, "WALK_HEADS_RULE", {}):
+                    # the full-width record the head-count rule names (the ABI carries the head count)
+                    record = jit.walk_heads_record(
+                        record, int(abi[ABI_PARAMS[program].index("num_heads")])
+                    )
             elif walk_form in ("full", "split") and walk_form != rule:
                 record += f"_{walk_form}"
             if walk_form == "split":  # two CTAs per segment and head
@@ -2385,9 +2416,18 @@ class _FiPrograms:
             elif transfer_walk != TRANSFER_WALKS[0]:
                 record += f"_{transfer_walk}"
         elif program == "affine_merge":
-            record += (
-                "_c8" if int(abi[ABI_PARAMS[program].index("ncols")]) == D else "_c16"
+            # the registry's record of the launch; the positional ABI carries its column block
+            params = ABI_PARAMS[program]
+            ncols = int(abi[params.index("ncols")])
+            cols = int(abi[params.index("cols_per_cta")])
+            record = jit.merge_record(
+                ncols, int(grid) // (ncols // cols), jit.device_arch(device_index)
             )
+            if int(jit.MODULES[record]["grid_rule"]["cols_per_cta"]) != cols:
+                raise ValueError(
+                    f"the merge ABI carries cols_per_cta {cols}; the registry's record {record} is built for "
+                    f"{jit.MODULES[record]['grid_rule']['cols_per_cta']}"
+                )
         values = dict(zip(ABI_PARAMS[program], abi, strict=True))
         jit.run_module(
             record, values, grid=(int(grid), 1, 1), device_index=device_index

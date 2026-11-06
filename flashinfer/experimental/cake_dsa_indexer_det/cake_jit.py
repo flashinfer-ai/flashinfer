@@ -151,6 +151,11 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "library": "cake_dsa_indexer_det_topk_04db38446d526901fed3",
         "arches": ["sm_100a", "sm_103a"],
     },
+    "cake_dsa_indexer_det_topk_074bab39c7585acbdab3": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_det_topk_074bab39c7585acbdab3",
+        "arches": ["sm_103a"],
+    },
     "cake_dsa_indexer_det_topk_091795a85161d6e55248": {
         "role": "scan",
         "library": "cake_dsa_indexer_det_topk_091795a85161d6e55248",
@@ -260,6 +265,11 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "role": "scan",
         "library": "cake_dsa_indexer_det_topk_4fe9fa13b895edcb24e3",
         "arches": ["sm_100a"],
+    },
+    "cake_dsa_indexer_det_topk_503938c0119dc4ce1520": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_det_topk_503938c0119dc4ce1520",
+        "arches": ["sm_103a"],
     },
     "cake_dsa_indexer_det_topk_506cb2b2c57f0a514cde": {
         "role": "scan",
@@ -789,6 +799,8 @@ PROGRAM_KEYS: dict[str, dict[str, str]] = {
         "scan:wide:u2:s0:f0": "cake_dsa_indexer_det_topk_3c6dc460295ddf3c44de",
         "scan:wide:u2:s0:f0:lsf": "cake_dsa_indexer_det_topk_091795a85161d6e55248",
         "scan:wide:u2:s0:f1": "cake_dsa_indexer_det_topk_808a62a6315ae38034c6",
+        "scan:wide:u2:s0:f1:fp8": "cake_dsa_indexer_det_topk_074bab39c7585acbdab3",
+        "scan:wide:u2:s0:f1:fp8:lsf": "cake_dsa_indexer_det_topk_503938c0119dc4ce1520",
         "scan:wide:u2:s0:f1:lsf": "cake_dsa_indexer_det_topk_dcddd514cbc366dca9f3",
     },
     "sm_107a": {
@@ -1032,7 +1044,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "split_min_range_tiles": 32,
         "split_wave_rule": [1000, 0.12],
         "split_wave_scope": [["narrow"], 1, True],
-        "split_fit_rule": None,
+        "split_fit_rule": [4096],
         "split_units": ["narrow", "wide"],
         "pair_rule": [0.0, 4096.0, 512],
         "pair_units": ["l6", "narrow", "wide"],
@@ -1108,11 +1120,15 @@ POLICY: dict[str, dict[str, Any]] = {
 # The FP8 input form's dispatch record of an architecture is its ``POLICY``
 # record with these fields replaced (``cake_policy.fp8_policy_record``); each
 # names its own ``static_scan_kinds``: on sm_107a every FP8 scan program keeps
-# the static unit enumeration.
+# the static unit enumeration.  sm_107a keeps no split-fit rule until the FP8
+# split programs are measured under one.
 POLICY_FP8: dict[str, dict[str, Any]] = {
     "sm_100a": {"static_scan_kinds": []},
     "sm_103a": {"static_scan_kinds": []},
-    "sm_107a": {"static_scan_kinds": ["l6", "narrow", "split_narrow"]},
+    "sm_107a": {
+        "static_scan_kinds": ["l6", "narrow", "split_narrow"],
+        "split_fit_rule": None,
+    },
 }
 TRACKING_ISSUE = "flashinfer-ai/flashinfer#5676"
 

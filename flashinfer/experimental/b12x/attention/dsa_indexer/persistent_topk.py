@@ -307,6 +307,119 @@ def _store_output_index(
     output[row_idx * output_stride + output_pos] = out_val
 
 
+@cute.jit
+def _radix_round(
+    tx: Int32,
+    cta_in_group: Int32,
+    group_id: Int32,
+    ctas_per_group: Int32,
+    barrier_phase: Int32,
+    hist_round: Int32,
+    round_idx: cutlass.Constexpr[int],
+    select_index: cutlass.Constexpr[bool],
+    ordered_pivot: Uint32,
+    chunk_start: Int32,
+    actual_chunk_size: Int32,
+    state: cute.Tensor,
+    s_ordered: cute.Tensor,
+    s_hist: cute.Tensor,
+    s_suffix: cute.Tensor,
+    s_scalars: cute.Tensor,
+    hist_ptr: Int32,
+) -> Int32:
+    """One group-wide radix-select round over score keys or, if ``select_index``, over complemented pivot-tie columns."""
+    current_hist_word = (hist_round % Int32(3)) * Int32(_RADIX)
+    next_hist_word = ((hist_round + Int32(1)) % Int32(3)) * Int32(_RADIX)
+    shift = Uint32(24 - round_idx * 8)
+    prefix = Uint32(s_scalars[0])
+    remaining_k = Int32(s_scalars[1])
+    mask = Uint32(0)
+    if cutlass.const_expr(round_idx != 0):
+        mask = Uint32(0xFFFFFFFF) << Uint32(32 - round_idx * 8)
+
+    i = tx
+    while i < Int32(_RADIX):
+        s_hist[i] = Int32(0)
+        i = i + Int32(_THREADS_PER_CTA)
+    cute.arch.sync_threads()
+
+    i = tx
+    key = Uint32(0)
+    bucket = Int32(0)
+    while i < actual_chunk_size:
+        key = Uint32(s_ordered[i])
+        if cutlass.const_expr(select_index):
+            if key == ordered_pivot:
+                key = ~Uint32(chunk_start + i)
+                if (key & mask) == prefix:
+                    bucket = Int32((key >> shift) & Uint32(0xFF))
+                    _smem_red_add(hist_ptr, bucket, Int32(1))
+        else:
+            if (key & mask) == prefix:
+                bucket = Int32((key >> shift) & Uint32(0xFF))
+                _smem_red_add(hist_ptr, bucket, Int32(1))
+        i = i + Int32(_THREADS_PER_CTA)
+    cute.arch.sync_threads()
+
+    i = tx
+    local_count = Int32(0)
+    while i < Int32(_RADIX):
+        local_count = Int32(s_hist[i])
+        if local_count > Int32(0):
+            atomic_add_global_i32(
+                _global_state_ptr(state, group_id, current_hist_word + i),
+                local_count,
+            )
+        i = i + Int32(_THREADS_PER_CTA)
+
+    if cta_in_group == Int32(0):
+        i = tx
+        while i < Int32(_RADIX):
+            state[_state_offset(group_id, next_hist_word + i)] = Int32(0)
+            i = i + Int32(_THREADS_PER_CTA)
+
+    phase = _group_barrier(state, group_id, barrier_phase, ctas_per_group, tx)
+
+    i = tx
+    while i < Int32(_RADIX):
+        s_suffix[i] = Int32(state[_state_offset(group_id, current_hist_word + i)])
+        i = i + Int32(_THREADS_PER_CTA)
+    cute.arch.sync_threads()
+
+    for stage in cutlass.range_constexpr(8):
+        stride_scan = Int32(1 << stage)
+        scan_val = Int32(0)
+        if tx < Int32(_RADIX):
+            scan_val = Int32(s_suffix[tx])
+            if tx < Int32(_RADIX) - stride_scan:
+                scan_val = scan_val + Int32(s_suffix[tx + stride_scan])
+        cute.arch.sync_threads()
+        if tx < Int32(_RADIX):
+            s_suffix[tx] = scan_val
+        cute.arch.sync_threads()
+
+    if tx == Int32(0):
+        s_scalars[2] = Uint32(0)
+        s_scalars[3] = Uint32(remaining_k)
+    cute.arch.sync_threads()
+
+    if tx < Int32(_RADIX):
+        count_ge = Int32(s_suffix[tx])
+        count_gt = Int32(0)
+        if tx + Int32(1) < Int32(_RADIX):
+            count_gt = Int32(s_suffix[tx + Int32(1)])
+        if count_ge >= remaining_k and count_gt < remaining_k:
+            s_scalars[2] = Uint32(tx)
+            s_scalars[3] = Uint32(remaining_k - count_gt)
+    cute.arch.sync_threads()
+
+    if tx == Int32(0):
+        s_scalars[0] = prefix | (Uint32(s_scalars[2]) << shift)
+        s_scalars[1] = s_scalars[3]
+    cute.arch.sync_threads()
+    return phase
+
+
 class DSAPersistentTopK2048Kernel:
     def __init__(self, *, paged_output: bool, topk: int = _TOPK):
         self.paged_output = bool(paged_output)
@@ -410,6 +523,7 @@ class DSAPersistentTopK2048Kernel:
         cute.arch.sync_threads()
 
         barrier_phase = Int32(0)
+        hist_round = Int32(0)
         total_iters = (num_rows + num_groups - Int32(1)) // num_groups
         iter_idx = Int32(0)
         row_idx = Int32(0)
@@ -420,24 +534,11 @@ class DSAPersistentTopK2048Kernel:
         chunk_end = Int32(0)
         actual_chunk_size = Int32(0)
         val = Float32(0.0)
-        ordered = Uint32(0)
-        mask = Uint32(0)
         bucket = Int32(0)
-        local_count = Int32(0)
-        global_round = Int32(0)
-        hist_buf = Int32(0)
-        next_hist_buf = Int32(0)
-        current_hist_word = Int32(0)
-        next_hist_word = Int32(0)
-        shift = Uint32(0)
-        prefix = Uint32(0)
         remaining_k = Int32(0)
-        stride_scan = Int32(0)
-        scan_val = Int32(0)
-        count_ge = Int32(0)
-        count_gt = Int32(0)
-        bucket_u32 = Uint32(0)
         ordered_pivot = Uint32(0)
+        count_eq = Int32(0)
+        index_floor = Uint32(0)
         local_gt_count = Int32(0)
         base = Int32(0)
         local_pos = Int32(0)
@@ -451,24 +552,11 @@ class DSAPersistentTopK2048Kernel:
             chunk_end = Int32(0)
             actual_chunk_size = Int32(0)
             val = Float32(0.0)
-            ordered = Uint32(0)
-            mask = Uint32(0)
             bucket = Int32(0)
-            local_count = Int32(0)
-            global_round = Int32(0)
-            hist_buf = Int32(0)
-            next_hist_buf = Int32(0)
-            current_hist_word = Int32(0)
-            next_hist_word = Int32(0)
-            shift = Uint32(0)
-            prefix = Uint32(0)
             remaining_k = Int32(0)
-            stride_scan = Int32(0)
-            scan_val = Int32(0)
-            count_ge = Int32(0)
-            count_gt = Int32(0)
-            bucket_u32 = Uint32(0)
             ordered_pivot = Uint32(0)
+            count_eq = Int32(0)
+            index_floor = Uint32(0)
             local_gt_count = Int32(0)
             base = Int32(0)
             local_pos = Int32(0)
@@ -482,24 +570,11 @@ class DSAPersistentTopK2048Kernel:
                 chunk_end = Int32(0)
                 actual_chunk_size = Int32(0)
                 val = Float32(0.0)
-                ordered = Uint32(0)
-                mask = Uint32(0)
                 bucket = Int32(0)
-                local_count = Int32(0)
-                global_round = Int32(0)
-                hist_buf = Int32(0)
-                next_hist_buf = Int32(0)
-                current_hist_word = Int32(0)
-                next_hist_word = Int32(0)
-                shift = Uint32(0)
-                prefix = Uint32(0)
                 remaining_k = Int32(0)
-                stride_scan = Int32(0)
-                scan_val = Int32(0)
-                count_ge = Int32(0)
-                count_gt = Int32(0)
-                bucket_u32 = Uint32(0)
                 ordered_pivot = Uint32(0)
+                count_eq = Int32(0)
+                index_floor = Uint32(0)
                 local_gt_count = Int32(0)
                 base = Int32(0)
                 local_pos = Int32(0)
@@ -559,105 +634,62 @@ class DSAPersistentTopK2048Kernel:
                     cute.arch.sync_threads()
 
                     for round_idx in cutlass.range_constexpr(4):
-                        global_round = iter_idx * Int32(4) + Int32(round_idx)
-                        hist_buf = global_round % Int32(3)
-                        next_hist_buf = (global_round + Int32(1)) % Int32(3)
-                        current_hist_word = hist_buf * Int32(_RADIX)
-                        next_hist_word = next_hist_buf * Int32(_RADIX)
-                        shift = Uint32(24 - round_idx * 8)
-                        prefix = Uint32(s_scalars[0])
-                        remaining_k = Int32(s_scalars[1])
-
-                        i = tx
-                        while i < Int32(_RADIX):
-                            s_hist[i] = Int32(0)
-                            i = i + Int32(_THREADS_PER_CTA)
-                        cute.arch.sync_threads()
-
-                        i = tx
-                        ordered = Uint32(0)
-                        mask = Uint32(0)
-                        bucket = Int32(0)
-                        while i < actual_chunk_size:
-                            ordered = Uint32(s_ordered[i])
-                            mask = Uint32(0)
-                            if cutlass.const_expr(round_idx != 0):
-                                mask = Uint32(0xFFFFFFFF) << Uint32(32 - round_idx * 8)
-                            if (ordered & mask) == prefix:
-                                bucket = Int32((ordered >> shift) & Uint32(0xFF))
-                                _smem_red_add(hist_ptr, bucket, Int32(1))
-                            i = i + Int32(_THREADS_PER_CTA)
-                        cute.arch.sync_threads()
-
-                        i = tx
-                        local_count = Int32(0)
-                        while i < Int32(_RADIX):
-                            local_count = Int32(s_hist[i])
-                            if local_count > Int32(0):
-                                atomic_add_global_i32(
-                                    _global_state_ptr(
-                                        state, group_id, current_hist_word + i
-                                    ),
-                                    local_count,
-                                )
-                            i = i + Int32(_THREADS_PER_CTA)
-
-                        if cta_in_group == Int32(0):
-                            i = tx
-                            while i < Int32(_RADIX):
-                                state[_state_offset(group_id, next_hist_word + i)] = (
-                                    Int32(0)
-                                )
-                                i = i + Int32(_THREADS_PER_CTA)
-
-                        barrier_phase = _group_barrier(
-                            state, group_id, barrier_phase, ctas_per_group, tx
+                        barrier_phase = _radix_round(
+                            tx,
+                            cta_in_group,
+                            group_id,
+                            ctas_per_group,
+                            barrier_phase,
+                            hist_round,
+                            round_idx,
+                            False,
+                            Uint32(0),
+                            chunk_start,
+                            actual_chunk_size,
+                            state,
+                            s_ordered,
+                            s_hist,
+                            s_suffix,
+                            s_scalars,
+                            hist_ptr,
                         )
-
-                        i = tx
-                        while i < Int32(_RADIX):
-                            s_suffix[i] = Int32(
-                                state[_state_offset(group_id, current_hist_word + i)]
-                            )
-                            i = i + Int32(_THREADS_PER_CTA)
-                        cute.arch.sync_threads()
-
-                        for stage in cutlass.range_constexpr(8):
-                            stride_scan = Int32(1 << stage)
-                            scan_val = Int32(0)
-                            if tx < Int32(_RADIX):
-                                scan_val = Int32(s_suffix[tx])
-                                if tx < Int32(_RADIX) - stride_scan:
-                                    scan_val = scan_val + Int32(
-                                        s_suffix[tx + stride_scan]
-                                    )
-                            cute.arch.sync_threads()
-                            if tx < Int32(_RADIX):
-                                s_suffix[tx] = scan_val
-                            cute.arch.sync_threads()
-
-                        if tx == Int32(0):
-                            s_scalars[2] = Uint32(0)
-                            s_scalars[3] = Uint32(remaining_k)
-                        cute.arch.sync_threads()
-
-                        if tx < Int32(_RADIX):
-                            count_ge = Int32(s_suffix[tx])
-                            count_gt = Int32(0)
-                            if tx + Int32(1) < Int32(_RADIX):
-                                count_gt = Int32(s_suffix[tx + Int32(1)])
-                            if count_ge >= remaining_k and count_gt < remaining_k:
-                                s_scalars[2] = Uint32(tx)
-                                s_scalars[3] = Uint32(remaining_k - count_gt)
-                        cute.arch.sync_threads()
-
-                        if tx == Int32(0):
-                            bucket_u32 = Uint32(s_scalars[2])
-                            s_scalars[0] = prefix | (bucket_u32 << shift)
-                            s_scalars[1] = s_scalars[3]
-                        cute.arch.sync_threads()
+                        hist_round = hist_round + Int32(1)
 
                     ordered_pivot = Uint32(s_scalars[0])
+                    remaining_k = Int32(s_scalars[1])
+                    bucket = Int32(s_scalars[2])
+                    count_eq = Int32(s_suffix[bucket])
+                    if bucket + Int32(1) < Int32(_RADIX):
+                        count_eq = count_eq - Int32(s_suffix[bucket + Int32(1)])
+                    cute.arch.sync_threads()
+
+                    index_floor = Uint32(0)
+                    if count_eq > remaining_k:
+                        if tx == Int32(0):
+                            s_scalars[0] = Uint32(0)
+                        cute.arch.sync_threads()
+                        for round_idx in cutlass.range_constexpr(4):
+                            barrier_phase = _radix_round(
+                                tx,
+                                cta_in_group,
+                                group_id,
+                                ctas_per_group,
+                                barrier_phase,
+                                hist_round,
+                                round_idx,
+                                True,
+                                ordered_pivot,
+                                chunk_start,
+                                actual_chunk_size,
+                                state,
+                                s_ordered,
+                                s_hist,
+                                s_suffix,
+                                s_scalars,
+                                hist_ptr,
+                            )
+                            hist_round = hist_round + Int32(1)
+                        index_floor = Uint32(s_scalars[0])
 
                     if tx == Int32(0):
                         s_counters[0] = Int32(0)
@@ -711,23 +743,24 @@ class DSAPersistentTopK2048Kernel:
                     pos = Int32(0)
                     while i < actual_chunk_size:
                         if Uint32(s_ordered[i]) == ordered_pivot:
-                            pos = atomic_add_global_i32(
-                                _global_state_ptr(
-                                    state, group_id, Int32(_STATE_OUTPUT_COUNTER)
-                                ),
-                                Int32(1),
-                            )
-                            if pos < Int32(self.topk_static):
-                                _store_output_index(
-                                    output,
-                                    page_table,
-                                    row_idx,
-                                    pos,
-                                    chunk_start + i,
-                                    page_table_stride,
-                                    Int32(self.topk_static),
-                                    self.paged_output,
+                            if ~Uint32(chunk_start + i) >= index_floor:
+                                pos = atomic_add_global_i32(
+                                    _global_state_ptr(
+                                        state, group_id, Int32(_STATE_OUTPUT_COUNTER)
+                                    ),
+                                    Int32(1),
                                 )
+                                if pos < Int32(self.topk_static):
+                                    _store_output_index(
+                                        output,
+                                        page_table,
+                                        row_idx,
+                                        pos,
+                                        chunk_start + i,
+                                        page_table_stride,
+                                        Int32(self.topk_static),
+                                        self.paged_output,
+                                    )
                         i = i + Int32(_THREADS_PER_CTA)
 
             iter_idx = iter_idx + Int32(1)

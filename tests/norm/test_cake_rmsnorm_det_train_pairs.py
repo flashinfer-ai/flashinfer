@@ -50,13 +50,13 @@ SHIPPED_SLABS = (4, 16, 32, 64)
 # Row counts of the contract: the small counts, both sides of every backward window edge of every route
 # (``test_rows_cover_every_backward_window_edge``) and the training shapes.
 ROWS = (
-    1, 2, 6, 7, 20, 21, 25, 26, 32, 33, 63, 64, 65, 87, 88, 109, 110, 121, 122, 127, 128, 129, 152, 153, 171, 172,
-    203, 204, 214, 215, 227, 228, 255, 256, 257, 288, 289, 1023, 1024, 1025, 1680, 1681, 2048, 2049, 3072, 3073, 4096,
-    4097, 5120, 5121, 6144, 6145, 12288, 12289, 14928, 14929, 15566, 15567, 16231, 16263, 16384, 16385, 19456, 19457,
-    19968, 19969, 20480, 20481, 24064, 24065, 32768, 32769, 36352, 36353, 40448, 40449, 40960, 40961, 42496, 42497,
-    44032, 44033, 45056, 45057, 48640, 48641, 50688, 50689, 52736, 52737, 55296, 55297, 58880, 58881, 65536, 65537,
-    70656, 70657, 80896, 80897, 81920, 81921, 99840, 99841, 114688, 114689, 139264, 139265, 720896, 720897, 1179648,
-    1179649, 1572864, 1572865,
+    1, 2, 3, 4, 5, 6, 7, 8, 20, 21, 25, 26, 31, 32, 33, 63, 64, 65, 87, 88, 109, 110, 121, 122, 127, 128, 129, 152, 153,
+    171, 172, 203, 204, 214, 215, 227, 228, 255, 256, 257, 288, 289, 576, 577, 768, 769, 960, 961, 1023, 1024, 1025,
+    1280, 1281, 1664, 1665, 1680, 1681, 2048, 2049, 3072, 3073, 4096, 4097, 5120, 5121, 6144, 6145, 12288, 12289, 14928,
+    14929, 15566, 15567, 16231, 16263, 16384, 16385, 19456, 19457, 19968, 19969, 20480, 20481, 24064, 24065, 32768,
+    32769, 36352, 36353, 40448, 40449, 40960, 40961, 42496, 42497, 44032, 44033, 45056, 45057, 48640, 48641, 50688,
+    50689, 52736, 52737, 55296, 55297, 58880, 58881, 65536, 65537, 70656, 70657, 80896, 80897, 81920, 81921, 99840,
+    99841, 114688, 114689, 139264, 139265, 720896, 720897, 1179648, 1179649, 1572864, 1572865,
 )  # fmt: skip
 # The row count standing in for an unbounded window's upper edge.
 OPEN_WINDOW_ROWS = 65536
@@ -369,12 +369,12 @@ def test_rows_cover_every_backward_window_edge() -> None:
 
 # The H = 256 backward route: per sm_100a / sm_103a window the faster of the four-CTA pipeline (``pd4``) and the
 # five-CTA ring at issue distance three without the L2 hint (``a3``), both at ``tail_div=4``, in two sessions per
-# architecture (BF16 and FP32 weight alike); sm_107a runs the pipeline to 65536 rows and the ring above.  Above the
-# ring's dw accuracy edge of each architecture (80896 rows on sm_100a, 99840 on sm_103a, 70656 on sm_107a) the ring
-# with compensated dw sums runs instead: its lean form ``dcln`` (two rows per iteration with the same arithmetic in the
-# same order), on sm_103a to 720896 rows and the ring itself (``dc``) above; above 1572864 rows its form with hi / lo
-# partial rows (``dchl``).  On sm_100a and sm_103a the lean compensated ring also runs the smallest row counts (to 87
-# and 1680 rows), where the plain windows' dw drifts with the SM count.
+# architecture (BF16 and FP32 weight alike).  Above the ring's dw accuracy edge (80896 rows on sm_100a, 99840 on
+# sm_103a) the ring with compensated dw sums runs instead: its lean form ``dcln`` (two rows per iteration with the same
+# arithmetic in the same order), on sm_103a to 720896 rows and the ring itself (``dc``) above; above 1572864 rows its
+# form with hi / lo partial rows (``dchl``).  On sm_100a and sm_103a the lean compensated ring also runs the smallest
+# row counts (to 87 and 1680 rows), where the plain windows' dw drifts with the SM count; sm_107a runs it at every row
+# count to 1572864.
 H256_BWD_PROGRAMS = {
     "pd4": "rmsnorm_train_bwd_h256_t128x4_pd4_k_s32_split_pts_cl_td4",
     "a3": "rmsnorm_train_bwd_h256_t128x5_cpa8a3nhkc8_k_s32_split_pts_cl_td4_cs",
@@ -406,9 +406,7 @@ H256_BWD_SPLIT = {
         (1572864, None, "dchl"),
     ),
     "sm_107a": (
-        (0, 65536, "pd4"),
-        (65536, 70656, "a3"),
-        (70656, 1572864, "dcln"),
+        (0, 1572864, "dcln"),
         (1572864, None, "dchl"),
     ),
 }
@@ -626,7 +624,7 @@ def test_fp32_weight_routes_mirror_their_bf16_routes(arch: str) -> None:
 # R200 212 and 216) and a device of the same architecture with more SMs (GB200 152, a 160-SM GB300).
 BOARD_SMS = {"sm_100a": (148, 152), "sm_103a": (152, 160), "sm_107a": (212, 216)}
 # The accuracy edges: the plain programs of H = 1536 / 2048 / 4096 / 5120 / 6144 -> their block-compensated forms,
-# the H = 256 ring -> the compensated-dot ring.
+# the H = 256 ring -> the compensated-dot ring (0 on sm_107a: its H = 256 route runs compensated programs only).
 ACCURACY_EDGES = {
     "sm_100a": {
         "h1536": 36352,
@@ -647,7 +645,7 @@ ACCURACY_EDGES = {
     "sm_107a": {
         "h1536": 45056,
         "h2048": 50688,
-        "h256": 70656,
+        "h256": 0,
         "h4096": 24064,
         "h5120": 19968,
         "h6144": 19456,
@@ -684,7 +682,10 @@ def test_accuracy_guard_names_the_measured_sm_counts_and_edges() -> None:
             for w32 in ("", "_w32")
         }, arch
         for route, edge in windows.ACCURACY_EDGES[arch].items():
-            assert edge in _edges(windows.PROGRAM_WINDOWS[arch][route]), (arch, route)
+            assert edge == 0 or edge in _edges(windows.PROGRAM_WINDOWS[arch][route]), (
+                arch,
+                route,
+            )
 
 
 @pytest.mark.parametrize("arch", sorted(BOARD_SMS))

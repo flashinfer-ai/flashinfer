@@ -15,10 +15,11 @@ hypothesis sits:
 * tile shape, cluster, 2-CTA mode, raster order and swizzle choose which CTA owns which tile and in which order; they
   never enter the per-element term (`config_invariance`).
 
-Everything is stated for the opaque primitive `mma16`. The hardware hypothesis is that every MMA instruction variant
-the space selects (`tm ∈ {64,128}` 1-CTA, `{128,256}` 2-CTA, `tn ∈ 32..256` and the decode tiles 8 / 16) is this
-same per-element function. No Lean statement can discharge it; the GPU test `test_config_agreement` checks the
-dispatcher's candidates bit for bit against each other.
+Everything is stated for the opaque primitive of the class: `mma16` (bf16) and, through the same definitions at any
+step (`tileResultG`), `mma32` (the fp8 classes, whose knob constraints `ConfigOKFp8` lack the 8-wide tile). The
+hardware hypothesis is that every MMA instruction variant the space selects (`tm ∈ {64,128}` 1-CTA, `{128,256}` 2-CTA,
+`tn ∈ 32..256` and the decode tiles) is the same per-element function of its primitive. No Lean statement can
+discharge it; the GPU test `test_config_agreement` checks the dispatcher's candidates bit for bit against each other.
 -/
 namespace BIK.GEMM
 
@@ -55,6 +56,10 @@ def ConfigOK (c : Config) : Bool :=
   (c.clusterM * c.clusterN ≤ 16) && (!c.twoCta || c.clusterM % 2 == 0) &&
   (c.swizzle == 1 || c.swizzle == 2 || c.swizzle == 4 || c.swizzle == 8) && CtaChunksOK 256 c
 
+/-- The fp8 classes' knob constraints (mirror of `Knobs.well_formed("e4m3")`): `kind::f8f6f4` has no 8-wide tile. The
+generated `gemm_fp8_space_ok` checks every emitted fp8 record against it. -/
+def ConfigOKFp8 (c : Config) : Bool := ConfigOK c && c.tn != 8
+
 /-- The in-CTA chunk fold (`ctaChunks`, `gemm/blocks/epilogue.py`) is the split kernel with the CONSTANT assignment
 of every chunk to one CTA: that CTA computes each chunk's partial from +0 in turn (the mainloop's fold per chunk) and
 folds the partials in chunk order from +0 with `add` (the TMEM running sum) -- the `fixup` of `splitKernel`, so the
@@ -64,6 +69,12 @@ def ctaSplit (a : RowData) (b : ColData) (C kc : Nat) : GTerm := splitKernel a b
 
 theorem ctaSplit_eq_kchunk (a : RowData) (b : ColData) (C kc : Nat) : ctaSplit a b C kc = kchunk a b C kc :=
   splitKernel_eq_kchunk a b C kc _
+
+/-- The same for the fp8 classes (the in-CTA fold applies the chain after its last chunk exactly as the fixup does). -/
+def ctaSplit32 (a : RowData) (b : ColData) (C kc : Nat) : GTerm := splitKernel32 a b C kc (fun _ => 0)
+
+theorem ctaSplit32_eq_kchunk32 (a : RowData) (b : ColData) (C kc : Nat) : ctaSplit32 a b C kc = kchunk32 a b C kc :=
+  splitKernel32_eq_kchunk32 a b C kc _
 
 /-- `foldSteps` splits anywhere: `m + n` steps from `t0` are `m` steps, then `n` from `t0 + m`. -/
 theorem foldSteps_add (a : RowData) (b : ColData) (acc : GTerm) (t0 m n : Nat) :
@@ -101,6 +112,45 @@ theorem kblockLoop_eq_kfold (a : RowData) (b : ColData) (kb S nblk : Nat) :
     kblockLoop a b kb S .zero nblk = kfold a b (nblk * kb) := by
   unfold kfold; exact kblockLoop_eq_foldSteps a b kb S .zero nblk
 
+/-- `foldStepsG` splits anywhere, at any step. -/
+theorem foldStepsG_add (step : KStep) (a : RowData) (b : ColData) (acc : GTerm) (t0 m n : Nat) :
+    foldStepsG step a b acc t0 (m + n) = foldStepsG step a b (foldStepsG step a b acc t0 m) (t0 + m) n := by
+  induction n with
+  | zero => rfl
+  | succ n ih =>
+    show foldStepsG step a b acc t0 (m + n + 1) = _
+    simp [foldStepsG, ih, Nat.add_assoc]
+
+/-- The same loop model at any step: the model of the mainloop executing `MainloopBlock(in_fmt).lowering()` (the same
+`canon.BlockedFold`) with the format's step; the fp8 mainloop issues `kind::f8f6f4` steps of 32 elements, four per
+128-byte stage like the bf16 one. -/
+def kblockLoopG (step : KStep) (a : RowData) (b : ColData) (kb S : Nat) (acc : GTerm) : Nat → GTerm
+  | 0 => acc
+  | blk+1 =>
+    let _stage := blk % S
+    foldStepsG step a b (kblockLoopG step a b kb S acc blk) (blk * kb) kb
+
+theorem kblockLoopG_eq_foldStepsG (step : KStep) (a : RowData) (b : ColData) (kb S : Nat) (acc : GTerm) (nblk : Nat) :
+    kblockLoopG step a b kb S acc nblk = foldStepsG step a b acc 0 (nblk * kb) := by
+  induction nblk with
+  | zero => rw [Nat.zero_mul]; rfl
+  | succ n ih =>
+    simp only [kblockLoopG, ih]
+    rw [Nat.add_mul, Nat.one_mul, foldStepsG_add, Nat.zero_add]
+
+theorem kblockLoopG_eq_kfoldG (step : KStep) (a : RowData) (b : ColData) (kb S nblk : Nat) :
+    kblockLoopG step a b kb S .zero nblk = kfoldG step a b (nblk * kb) := by
+  unfold kfoldG; exact kblockLoopG_eq_foldStepsG step a b kb S .zero nblk
+
+/-- The fp8 mainloop computes the fp8 class, for every stage count and block size; the generated `gemm32loop*` cases
+conform it to the Python trace node for node. -/
+def kblockLoop32 (a : RowData) (b : ColData) (kb S : Nat) (acc : GTerm) (nblk : Nat) : GTerm :=
+  kblockLoopG GTerm.mma32 a b kb S acc nblk
+
+theorem kblockLoop32_eq_kfold32 (a : RowData) (b : ColData) (kb S nblk : Nat) :
+    kblockLoop32 a b kb S .zero nblk = kfold32 a b (nblk * kb) :=
+  kblockLoopG_eq_kfoldG GTerm.mma32 a b kb S nblk
+
 /-- One output tile under `cfg`: the owning CTA (a function of the config) runs the k-block loop from a reset
 accumulator. `prev` is whatever that CTA's accumulator held from the previous tile of its persistent schedule. -/
 def tileResult (cfg : Config) (S : Nat) (_prev : GTerm) (a : RowData) (b : ColData) (kb nblk : Nat) : GTerm :=
@@ -131,16 +181,84 @@ theorem space_invariant (space : List Config) :
       tileResult c₁ S₁ p a b kb nblk = tileResult c₂ S₂ q a b kb nblk :=
   fun c₁ _ c₂ _ S₁ S₂ p q a b kb nblk => config_invariance c₁ c₂ S₁ S₂ p q a b kb nblk
 
-/-- Through the chain: the *output* element of a tile is the unsplit class's output, so no configuration, stage
-count or carried accumulator reaches the output. -/
-theorem tileOutput_eq_outputKfold (fmt : String) (cfg : Config) (S : Nat) (p : GTerm)
+/-- Through the chain: the *output* element of a tile is the unsplit class's output for either kind of chain, so no
+configuration, stage count or carried accumulator reaches the output. -/
+theorem tileOutput_eq_outputKfold (scaled : Bool) (fmt : String) (cfg : Config) (S : Nat) (p : GTerm)
     (a : RowData) (b : ColData) (kb nblk : Nat) :
-    outputElem fmt (tileResult cfg S p a b kb nblk) = outputKfold fmt a b (nblk * kb) := by
+    outputElem scaled fmt (tileResult cfg S p a b kb nblk) = outputKfold scaled fmt a b (nblk * kb) := by
   unfold outputKfold; rw [tileResult_eq_kfold]
 
-theorem output_config_invariance (fmt : String) (c₁ c₂ : Config) (S₁ S₂ : Nat) (p q : GTerm)
+theorem output_config_invariance (scaled : Bool) (fmt : String) (c₁ c₂ : Config) (S₁ S₂ : Nat) (p q : GTerm)
     (a : RowData) (b : ColData) (kb nblk : Nat) :
-    outputElem fmt (tileResult c₁ S₁ p a b kb nblk) = outputElem fmt (tileResult c₂ S₂ q a b kb nblk) := by
+    outputElem scaled fmt (tileResult c₁ S₁ p a b kb nblk) = outputElem scaled fmt (tileResult c₂ S₂ q a b kb nblk) := by
+  rw [config_invariance c₁ c₂ S₁ S₂ p q a b kb nblk]
+
+/-! ## The fp8 tile: the same statements at the `mma32` step
+
+`tileResultG step` is the tile model at any opaque step (the `_owner` erases the configuration exactly as `tileResult`
+does); `tileResult32` instantiates it for the fp8 classes, whose A2 surface -- the `kind::f8f6f4` instruction variants
+of the fp8 space -- is checked bit for bit by the fp8 configuration-agreement tests. -/
+
+def tileResultG (step : KStep) (cfg : Config) (S : Nat) (_prev : GTerm) (a : RowData) (b : ColData) (kb nblk : Nat) : GTerm :=
+  let _owner := (cfg.tm, cfg.tn, cfg.clusterM, cfg.clusterN, cfg.twoCta, cfg.rasterM, cfg.swizzle)
+  kblockLoopG step a b kb S .zero nblk
+
+theorem tileResultG_eq_kfoldG (step : KStep) (cfg : Config) (S : Nat) (p : GTerm) (a : RowData) (b : ColData) (kb nblk : Nat) :
+    tileResultG step cfg S p a b kb nblk = kfoldG step a b (nblk * kb) := by
+  unfold tileResultG; exact kblockLoopG_eq_kfoldG step a b kb S nblk
+
+theorem config_invarianceG (step : KStep) (c₁ c₂ : Config) (S₁ S₂ : Nat) (p q : GTerm) (a : RowData) (b : ColData) (kb nblk : Nat) :
+    tileResultG step c₁ S₁ p a b kb nblk = tileResultG step c₂ S₂ q a b kb nblk := by
+  rw [tileResultG_eq_kfoldG, tileResultG_eq_kfoldG]
+
+def tileResult32 (cfg : Config) (S : Nat) (prev : GTerm) (a : RowData) (b : ColData) (kb nblk : Nat) : GTerm :=
+  tileResultG GTerm.mma32 cfg S prev a b kb nblk
+
+theorem tileResult32_eq_kfold32 (cfg : Config) (S : Nat) (p : GTerm) (a : RowData) (b : ColData) (kb nblk : Nat) :
+    tileResult32 cfg S p a b kb nblk = kfold32 a b (nblk * kb) := tileResultG_eq_kfoldG GTerm.mma32 cfg S p a b kb nblk
+
+/-- **Config invariance (R3) of the fp8 classes**, and its instantiation over any enumerated fp8 space (the generated
+`gemm_fp8_space_invariant`). -/
+theorem config_invariance32 (c₁ c₂ : Config) (S₁ S₂ : Nat) (p q : GTerm) (a : RowData) (b : ColData) (kb nblk : Nat) :
+    tileResult32 c₁ S₁ p a b kb nblk = tileResult32 c₂ S₂ q a b kb nblk := config_invarianceG GTerm.mma32 c₁ c₂ S₁ S₂ p q a b kb nblk
+
+theorem space_invariant32 (space : List Config) :
+    ∀ c₁ ∈ space, ∀ c₂ ∈ space, ∀ (S₁ S₂ : Nat) (p q : GTerm) (a : RowData) (b : ColData) (kb nblk : Nat),
+      tileResult32 c₁ S₁ p a b kb nblk = tileResult32 c₂ S₂ q a b kb nblk :=
+  fun c₁ _ c₂ _ S₁ S₂ p q a b kb nblk => config_invariance32 c₁ c₂ S₁ S₂ p q a b kb nblk
+
+/-- Through the scaled chain: the output element of an fp8 tile is the fp8 class's output. -/
+theorem tileOutput32_eq_outputKfold32 (fmt : String) (cfg : Config) (S : Nat) (p : GTerm)
+    (a : RowData) (b : ColData) (kb nblk : Nat) :
+    outputElem true fmt (tileResult32 cfg S p a b kb nblk) = outputKfold32 fmt a b (nblk * kb) := by
+  unfold outputKfold32; rw [tileResult32_eq_kfold32]
+
+theorem output32_config_invariance (fmt : String) (c₁ c₂ : Config) (S₁ S₂ : Nat) (p q : GTerm)
+    (a : RowData) (b : ColData) (kb nblk : Nat) :
+    outputElem true fmt (tileResult32 c₁ S₁ p a b kb nblk) = outputElem true fmt (tileResult32 c₂ S₂ q a b kb nblk) := by
+  rw [config_invariance32 c₁ c₂ S₁ S₂ p q a b kb nblk]
+
+theorem config_invariance32_bits {α : Type} (P : Prims α) (c₁ c₂ : Config) (S₁ S₂ : Nat) (p q : GTerm)
+    (a : RowData) (b : ColData) (kb nblk : Nat) :
+    eval P (tileResult32 c₁ S₁ p a b kb nblk) = eval P (tileResult32 c₂ S₂ q a b kb nblk) := by
+  rw [config_invariance32 c₁ c₂ S₁ S₂ p q a b kb nblk]
+
+/-- The in-CTA chunk fold with the bias added once after the last chunk's fold (its epilogue's chain) is the biased
+split class, as the workspace split with the bias in its fixup is (`outputBias_split_eq_kchunk`). -/
+theorem outputBias_ctaSplit_eq_kchunk (fmt : String) (a : RowData) (b : ColData) (C kc : Nat) :
+    outputElemBias fmt (ctaSplit a b C kc) b = outputKchunkBias fmt a b C kc := by
+  unfold outputKchunkBias; rw [ctaSplit_eq_kchunk]
+
+/-- Through the biased chain: the biased output of a tile is the biased unsplit class's output, so no configuration,
+stage count or carried accumulator reaches it. -/
+theorem tileOutputBias_eq_outputKfoldBias (fmt : String) (cfg : Config) (S : Nat) (p : GTerm)
+    (a : RowData) (b : ColData) (kb nblk : Nat) :
+    outputElemBias fmt (tileResult cfg S p a b kb nblk) b = outputKfoldBias fmt a b (nblk * kb) := by
+  unfold outputKfoldBias; rw [tileResult_eq_kfold]
+
+theorem outputBias_config_invariance (fmt : String) (c₁ c₂ : Config) (S₁ S₂ : Nat) (p q : GTerm)
+    (a : RowData) (b : ColData) (kb nblk : Nat) :
+    outputElemBias fmt (tileResult c₁ S₁ p a b kb nblk) b = outputElemBias fmt (tileResult c₂ S₂ q a b kb nblk) b := by
   rw [config_invariance c₁ c₂ S₁ S₂ p q a b kb nblk]
 
 /-- Bits, not terms: under any primitives `P`, both configurations evaluate to the same value. -/
