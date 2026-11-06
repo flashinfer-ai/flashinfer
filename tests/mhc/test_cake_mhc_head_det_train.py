@@ -245,6 +245,11 @@ def test_autograd_matches_torch(hidden: int) -> None:
     ref.mean(dim=1).float().sum().backward()
     _assert_bitwise(ours.grad, ref.grad)
     assert flashinfer.cake_mhc_head_det is facade.cake_mhc_head_det
+    assert flashinfer._LAZY_EXPORTS["CakeMHCHeadDetFunction"] == (
+        ".cake_mhc_head_det_train",
+        "CakeMHCHeadDetFunction",
+    )
+    assert flashinfer.CakeMHCHeadDetFunction is facade.CakeMHCHeadDetFunction
 
 
 @pytest.mark.parametrize("use_reentrant", [False, True])

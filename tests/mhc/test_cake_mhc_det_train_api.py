@@ -105,6 +105,10 @@ def test_top_level_exports_are_the_facade_objects() -> None:
         assert name in facade.__all__ and name in dir(facade), name
         assert getattr(facade, name) is getattr(backend, name), name
     assert facade.SUPPORTED_COMPUTE_CAPABILITIES == SUPPORTED_CAPABILITIES
+    # The autograd classes are top-level names bound on first access (``flashinfer._LAZY_EXPORTS``).
+    for name in ("CakeMHCDetPrepareFunction", "CakeMHCDetFinishFunction"):
+        assert flashinfer._LAZY_EXPORTS[name] == (".cake_mhc_det_train", name), name
+        assert getattr(flashinfer, name) is getattr(backend, name), name
 
 
 _LAZY_CHILD = r"""
