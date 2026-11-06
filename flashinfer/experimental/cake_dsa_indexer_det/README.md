@@ -130,7 +130,7 @@ s[t, j] = k_scale[j] * sum_h w[t, h] * relu(sum_d q[t, h, d] * k[j, d])
   in the last bits.
 * **Programs**: `sm_100a` / `sm_103a` register the `narrow`, `l6`,
   `split_narrow` and `split_l6` scan programs, each with its longest-first
-  segment order copy (`:lsf`), and `sm_103a` also the unpaired `wide`
+  segment order copy (`:lsf`), and also the unpaired `wide`
   program (8 queries per unit, tile unroll 2) with its `:lsf` copy;
   `sm_107a` registers `narrow`, `l6` and `split_narrow`.  Keys carry the
   form tag before the order suffix: `scan:<kind>:u<n>:s0:f1:fp8[:lsf]`.  The
@@ -142,7 +142,7 @@ s[t, j] = k_scale[j] * sum_h w[t, h] * relu(sum_d q[t, h, d] * k[j, d])
   FP8 `static_scan_kinds` itself.
   `cake_policy.select_fp8_program` runs the BF16 decision procedure under it
   and maps the decided kind to a registered FP8 kind: its own where an FP8
-  program of it is registered (`wide` on `sm_103a`), else its fallback
+  program of it is registered (`wide` on `sm_100a` / `sm_103a`), else its fallback
   (`FP8_KIND_FALLBACK`: `wide` / `pair_wide` / `pair_l6` -> `l6`, the largest
   FP8 unit below `wide`, `pair_narrow` -> `narrow`, `split_wide` -> `split_narrow`, and
   `split_l6` -> `split_narrow` where no FP8 `split_l6` program is registered); the program
@@ -152,7 +152,7 @@ s[t, j] = k_scale[j] * sum_h w[t, h] * relu(sum_d q[t, h, d] * k[j, d])
   the BF16 rule picks it and an FP8 copy exists.  A fallback kind takes its
   own `sample_class_rule` class and `check_period_kind_overrides` period
   (`cake_policy.fallback_knobs`): an `l6` program run for a `wide` decision
-  samples like an `l6` decision, while the FP8 `wide` program of `sm_103a`
+  samples like an `l6` decision, while the FP8 `wide` program of `sm_100a` / `sm_103a`
   keeps the `wide` decision's sampling and check period; explicit knobs stay.
   On `sm_107a` every FP8 kind keeps the static unit enumeration
   (`static_scan_kinds`): no ticket tail, nothing zeroed.  An architecture
@@ -160,13 +160,13 @@ s[t, j] = k_scale[j] * sum_h w[t, h] * relu(sum_d q[t, h, d] * k[j, d])
 * **Workspace**: `dsa_indexer_det_topk_workspace_size(...,
   dtype=torch.float8_e4m3fn)` bounds the FP8 programs' workspace; the
   default `dtype=torch.bfloat16` returns the BF16 bound unchanged.  On
-  `sm_103a` a `wide` decision runs the FP8 `wide` unit, 8 queries per unit,
+  `sm_100a` / `sm_103a` a `wide` decision runs the FP8 `wide` unit, 8 queries per unit,
   so its FP8 bound is the BF16 bound of the call, with 4/3 the scan entries
   of the `l6` fallback.  Elsewhere a `wide` / `pair_wide` decision runs the
   FP8 `l6` unit, 6 queries per unit rather than the narrow unit's 4, so its
   FP8 bound has 1.5x the scan entries of the narrow fallback.  An FP8 buffer
   sized for such a call under an earlier, smaller fallback (`narrow`, and on
-  `sm_103a` also `l6`) is rejected (`workspace_buffer needs N bytes`) and
+  `sm_100a` / `sm_103a` also `l6`) is rejected (`workspace_buffer needs N bytes`) and
   must be sized again with this function.
 * **Prepared runners** bind `k_scale` with `q` / `k`: new values written into
   it are read by the next run.

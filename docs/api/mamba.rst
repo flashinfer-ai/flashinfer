@@ -140,9 +140,7 @@ Context-parallel training causal conv1d (Cake)
 The context-parallel (KCP) route of the same convolution: every rank convolves
 its fragments of the packed batch, and the first tokens of a fragment that
 continues a document read the history rows of the preceding fragment through
-the halo collective of the KDA step's context.  ``flashinfer.cake_causal_conv1d_det_train``
-keeps the previous names ``cake_causal_conv1d_kcp``, ``cake_causal_conv1d_kcp_multi``
-and ``KcpRecomputeHandle`` as aliases of the same objects.
+the halo collective of the KDA step's context.
 
 .. currentmodule:: flashinfer.cake_causal_conv1d_det_train_kcp
 
@@ -191,11 +189,15 @@ Each name maps to a deterministic name: ``cake_causal_conv1d_det`` ->
 -> ``cake_causal_conv1d_train_{forward,backward}``,
 ``cake_causal_conv1d_det_kcp`` -> ``cake_causal_conv1d_kcp``,
 ``cake_causal_conv1d_det_multi_kcp`` -> ``cake_causal_conv1d_multi_kcp``,
-``RecomputeHandleDetKcp`` -> ``RecomputeHandleKcp``.  The deterministic names,
-the legacy module ``flashinfer.cake_causal_conv1d_train`` and the legacy
-top-level names ``flashinfer.cake_causal_conv1d`` /
-``flashinfer.cake_causal_conv1d_train_forward`` / ``_backward`` stay bound to
-the deterministic objects.
+``RecomputeHandleDetKcp`` -> ``RecomputeHandleKcp``.  The deterministic
+package's names before the det rename (the modules
+``flashinfer.cake_causal_conv1d_train`` and
+``flashinfer.cake_causal_conv1d_train_backend``, the top-level
+``flashinfer.cake_causal_conv1d`` / ``CakeCausalConv1dFunction`` /
+``cake_causal_conv1d_train_{forward,backward}`` and the KCP names
+``cake_causal_conv1d_kcp`` / ``cake_causal_conv1d_kcp_multi`` /
+``KcpRecomputeHandle`` of ``flashinfer.cake_causal_conv1d_det_train``) are
+removed; use the ``det`` names.
 
 Numerical contract of ``deterministic=False``: the forward runs copies of the
 deterministic forward programs, so ``y`` is bitwise the same.  The backward is

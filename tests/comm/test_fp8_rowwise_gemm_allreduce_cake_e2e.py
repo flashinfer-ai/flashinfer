@@ -45,6 +45,11 @@ from flashinfer.utils import get_compute_capability
 N = 3072
 K_L = 768
 FP8 = torch.float8_e4m3fn
+# On SM90 the FP8 tensor-core (WGMMA) accumulation leaves an error floor that
+# scales with Q[m, n] = sqrt(sum_r sum_k (a_scale_r[m] a_r[m, k] w_scale_r[n]
+# w_r[n, k]) ** 2): the elementwise bound adds SM90_FLOOR_C1 * Q there. SM100 /
+# SM103 accumulate in fp32 and keep the bound without it.
+SM90_FLOOR_C1 = 2**-10
 
 
 def _visible_arch():
@@ -85,23 +90,41 @@ def _refill(a, a_scale, w, w_scale, generator):
 
 
 def _expected(a, a_scale, w, w_scale, group):
-    """fp32 all-reduce of the scaled partial products; returns (bf16 result, sum |P_r|)."""
+    """fp32 all-reduce of the scaled partial products.
+
+    Returns (bf16 result, sum |P_r|, Q): Q is the SM90 floor scale (None elsewhere).
+    """
 
     partial = (a.float() @ w.float().t()) * a_scale[:, None] * w_scale[None, :]
     total = partial.clone()
     dist.all_reduce(total, op=dist.ReduceOp.SUM, group=group)
     magnitude = partial.abs()
     dist.all_reduce(magnitude, op=dist.ReduceOp.SUM, group=group)
-    return total.to(torch.bfloat16), magnitude
+    floor_scale = _sm90_floor_scale(a, a_scale, w, w_scale, group)
+    return total.to(torch.bfloat16), magnitude, floor_scale
+
+
+def _sm90_floor_scale(a, a_scale, w, w_scale, group):
+    """SM90 floor scale Q = sqrt(sum_r sum_k (sa * a * sw * w) ** 2), else None."""
+
+    if _visible_arch() != "sm_90a":
+        return None
+    square = a.float().square() @ w.float().square().t()
+    square *= a_scale.square()[:, None] * w_scale.square()[None, :]
+    dist.all_reduce(square, op=dist.ReduceOp.SUM, group=group)
+    return square.sqrt()
 
 
 def _check(actual, expected):
-    """|y - r| <= 1e-2 + 1e-2 * sum_r |P_r| elementwise and relative L2 within 2**-7."""
+    """|y - r| <= 1e-2 + 1e-2 * sum_r |P_r| (+ SM90_FLOOR_C1 * Q on SM90)
+    elementwise and relative L2 within 2**-7."""
 
-    reference, magnitude = expected
+    reference, magnitude, floor_scale = expected
     assert actual.dtype == torch.bfloat16 and actual.shape == reference.shape
     error = (actual.float() - reference.float()).abs()
     bound = 1e-2 + 1e-2 * magnitude
+    if floor_scale is not None:
+        bound = bound + SM90_FLOOR_C1 * floor_scale
     assert bool((error <= bound).all()), (
         f"max |error| {error.max().item():.4f} exceeds the bound at "
         f"{int((error > bound).sum())} elements"
