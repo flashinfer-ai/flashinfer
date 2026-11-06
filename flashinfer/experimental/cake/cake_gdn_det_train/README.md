@@ -7,7 +7,10 @@
   `CakeGDNDetFunction` (its autograd class), `cake_gdn_det_train_forward` and
   `cake_gdn_det_train_backward` (the low-level chain over a chunk table and a
   tape).  The package exports no other name; the planner and table helpers
-  stay in `cake_chain`.
+  stay in `cake_chain`.  The facade `flashinfer.cake_gdn_det_train` exports
+  `cake_gdn_det`, `CakeGDNDetFunction` and the support query
+  `is_cake_gdn_det_train_supported`; the low-level chain stays in this
+  package because it takes the package's chunk table and tape.
 - The entries take no `deterministic` keyword.  Passing one, with any value,
   raises `TypeError`.
 - `torch.use_deterministic_algorithms(True)` changes nothing: every launch is
@@ -40,11 +43,14 @@ otherwise.  The package reads no environment variable.
 
 ## Opt-in
 
-Import the entry point explicitly; nothing in `flashinfer` imports this
-package.
+Import the entry point explicitly from the experimental facade
+`flashinfer.cake_gdn_det_train` (it exports `cake_gdn_det`,
+`CakeGDNDetFunction` and `is_cake_gdn_det_train_supported`, and forwards every
+argument to this package); nothing in `flashinfer` imports this package
+otherwise.
 
 ```python
-from flashinfer.experimental.cake.cake_gdn_det_train import cake_gdn_det
+from flashinfer.cake_gdn_det_train import cake_gdn_det
 
 o, final_state = cake_gdn_det(
     q, k, v, g, beta,                    # [B, T, H, 128] / [B, T, HV, 128] bf16; g, beta [B, T, HV]
