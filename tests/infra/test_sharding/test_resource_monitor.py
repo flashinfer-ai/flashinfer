@@ -34,8 +34,17 @@ def test_missing_gpu_does_not_lose_host_samples_or_report_zero(
     assert snapshot["process_memory_mib"] is None
 
 
-def test_nested_shell_reuses_sampler_and_preserves_failure(tmp_path: Path) -> None:
-    helper = Path(telemetry.__file__).parents[1] / "test_resource_monitor.sh"
+@pytest.mark.parametrize("redirect", [False, True], ids=["infra", "scripts-redirect"])
+def test_nested_shell_reuses_sampler_and_preserves_failure(
+    tmp_path: Path, redirect: bool
+) -> None:
+    # The redirect is the old scripts/ path that GitLab CI still sources.
+    infra_dir = Path(telemetry.__file__).parents[1]
+    helper = (
+        infra_dir.parent / "test_resource_monitor.sh"
+        if redirect
+        else infra_dir / "test_resource_monitor.sh"
+    )
     env = os.environ.copy()
     for key in ("FLASHINFER_RESOURCE_SNAPSHOT", "FLASHINFER_RESOURCE_MONITOR_PID"):
         env.pop(key, None)
