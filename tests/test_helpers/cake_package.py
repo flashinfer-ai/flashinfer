@@ -25,7 +25,7 @@ PACKAGES: dict[str, str] = {
     "cake_sage_block_sparse_attention": "flashinfer.cake_sage_block_sparse_attention_backend",
     "cake.cake_mhc_det_train": "flashinfer.experimental.cake.cake_mhc_det_train",
     "cake.cake_mhc_head_det_train": "flashinfer.experimental.cake.cake_mhc_head_det_train",
-    "cake_dsa_train": "flashinfer.experimental.cake_dsa_train",
+    "cake.cake_dsa_sparse_attention_nondet_train": "flashinfer.experimental.cake.cake_dsa_sparse_attention_nondet_train",
     "cake.cake_dsa_indexer_det_train": "flashinfer.experimental.cake.cake_dsa_indexer_det_train",
     "cake_lm_head_det_loss": "flashinfer.experimental.cake_lm_head_det_loss",
     # the non-deterministic package (deterministic=False); its key carries the namespace
@@ -36,10 +36,8 @@ PACKAGES: dict[str, str] = {
     # the non-deterministic package (deterministic=False); its key carries the namespace
     "cake.cake_moe_grouped_gemm": "flashinfer.experimental.cake.cake_moe_grouped_gemm",
     "cake_mok_bf16": "flashinfer.experimental.cake_mok_bf16",
-    "cake_kda_train": "flashinfer.experimental.cake_kda_train",
     "cake_kda_det_train": "flashinfer.experimental.cake_kda_det_train",
-    # the non-deterministic package (deterministic=False); its key carries the namespace because
-    # ``cake_kda_train`` stays the deterministic compatibility package's key above
+    # the non-deterministic package (deterministic=False); its key carries the namespace
     "cake.cake_kda_train": "flashinfer.experimental.cake.cake_kda_train",
     "cake_kda_det_train_kcp": "flashinfer.experimental.cake_kda_det_train_kcp",
     # its non-deterministic counterpart (deterministic=False)
