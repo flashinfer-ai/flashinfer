@@ -418,7 +418,7 @@ import flashinfer
 out = {
     "flashinfer": loaded(),
     "facade_loaded": "flashinfer.cake_mhc_nondet_train" in sys.modules,
-    "nondet_names": sorted(n for n in dir(flashinfer) if "nondet" in n.lower()),
+    "mhc_nondet_names": sorted(n for n in dir(flashinfer) if "mhc" in n.lower() and "nondet" in n.lower()),
 }
 import flashinfer.cake_mhc_nondet_train as facade
 
@@ -435,12 +435,13 @@ print(json.dumps(out))
 @pytest.mark.cpu_only
 def test_the_backend_is_imported_on_first_use() -> None:
     """In a fresh interpreter, ``import flashinfer`` loads nothing of ``flashinfer.experimental.cake`` and not this
-    module, and the top level exposes no ``nondet`` name; ``import flashinfer.cake_mhc_nondet_train`` and reading an
-    entry point load no backend either; the first lazily resolved attribute (``ARCHES``) imports the backend."""
+    module, and the top level exposes no mHC ``nondet`` name (other families' lazy rows may add theirs); ``import
+    flashinfer.cake_mhc_nondet_train`` and reading an entry point load no backend either; the first lazily resolved
+    attribute (``ARCHES``) imports the backend."""
     out = _run_child(_LAZY_CHILD, _BACKEND)
     assert out["flashinfer"] == [], out
     assert out["facade_loaded"] is False, out
-    assert out["nondet_names"] == [], out
+    assert out["mhc_nondet_names"] == [], out
     assert out["facade"] == [] and out["entry_point"] == [], out
     assert _BACKEND in out["lazy_attribute"] and out["backend"] is True, out
 
