@@ -153,6 +153,15 @@ def _reduction_active_splits_kv(
 
 
 @cute.jit
+def _release_reduction_dependents(
+    cfg: cutlass.Constexpr[FmhaDecodeConfig],
+) -> None:
+    """Release the following PDL grid once this thread's output is stored."""
+    if cutlass.const_expr(cfg.use_pdl):
+        prims.griddepcontrol(kind=prims.GridDepAction.LAUNCH_DEPENDENTS)
+
+
+@cute.jit
 def _reduce_exact_splits_body(
     o_iter: cute.Pointer,
     g_seqlens_kv: cute.Pointer | DirectSparseMetadataView,
@@ -163,7 +172,6 @@ def _reduce_exact_splits_body(
     g_q_output_rows: Int32,
     cfg: cutlass.Constexpr[FmhaDecodeConfig],
     static_full_split_prefix: cutlass.Constexpr[bool] = False,
-    wait_for_pdl_producer: cutlass.Constexpr[bool] = False,
     lse_ptr: cute.Pointer | None = None,
     requested_splits=None,
 ) -> None:
@@ -172,8 +180,8 @@ def _reduce_exact_splits_body(
     ``g_partial_stats`` stores one log2-LSE scalar for each split and output
     row. ``g_partial_o`` stores the corresponding normalized 16-bit O fragment.
     This body is shared by the serial reference kernel and the compact S2-S4
-    production schedule. The production caller requests its PDL acquire after
-    this body's local register state is initialized and before partial reads.
+    production schedule. Under ``cfg.use_pdl`` it acquires the attention grid
+    before its first global read and releases the following grid at its tail.
     """
 
     thread_idx, _, _ = cute.arch.thread_idx()
@@ -201,6 +209,10 @@ def _reduce_exact_splits_body(
     reduce_col_idx = (reduce_base_offset % bytes_per_output_row) // Int32(
         PARTIAL_O_ELEMENT_BYTES
     )
+    # Every input below (query offsets, seq_lens, partials) may be written by
+    # an earlier grid; acquire the attention grid before the first read.
+    if cutlass.const_expr(cfg.use_pdl):
+        prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
     q_token_offset, seq_len_q = _q_seq_bounds(cfg, g_cu_seqlens_q, b_idx)
     active_splits_kv = (
         Int32(cfg.splits_kv) if requested_splits is None else Int32(requested_splits)
@@ -234,13 +246,7 @@ def _reduce_exact_splits_body(
 
     global_lse = Float32(-Float32.inf)
 
-    if cutlass.const_expr(wait_for_pdl_producer):
-        prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
-
     if cutlass.const_expr(not static_full_split_prefix):
-        # Sparse-route seq_lens may originate two PDL stages upstream. Keep this read
-        # behind the attention-producer acquire together with partial O/stats;
-        # ordinary reducers preserve the same instruction ordering harmlessly.
         active_splits_kv = _reduction_active_splits_kv(
             cfg,
             g_seqlens_kv,
@@ -325,6 +331,7 @@ def _reduce_exact_splits_body(
             cfg,
             lse_ptr=lse_ptr,
         )
+    _release_reduction_dependents(cfg)
 
 
 @cute.kernel
@@ -515,7 +522,6 @@ def decode_gen_parallel_separate_reduction_kernel(
             g_q_output_rows,
             cfg,
             static_full_split_prefix,
-            cfg.use_parallel_separate_reduction_pdl,
             lse_ptr=lse_ptr,
             requested_splits=requested_splits,
         )
@@ -549,6 +555,10 @@ def decode_gen_parallel_separate_reduction_kernel(
     reduce_col_idx = (reduce_base_offset % bytes_per_output_row) // Int32(
         PARTIAL_O_ELEMENT_BYTES
     )
+    # Acquire the attention grid before the first read of an input an earlier
+    # grid may write (query offsets, seq_lens, partials).
+    if cutlass.const_expr(cfg.use_pdl):
+        prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
     q_token_offset, seq_len_q = _q_seq_bounds(cfg, g_cu_seqlens_q, b_idx)
     active_splits_kv = (
         Int32(cfg.splits_kv) if requested_splits is None else Int32(requested_splits)
@@ -587,8 +597,8 @@ def decode_gen_parallel_separate_reduction_kernel(
     local_splits = cfg.parallel_reduction_splits_per_cta
     lane_splits = local_splits // slot_lanes
 
-    # Allocate the clustered path's local SMEM before acquiring the producer.
-    # Cluster-size-one profiles compile out every later use of these arrays.
+    # Local SMEM for the clustered path. Cluster-size-one profiles compile out
+    # every later use of these arrays.
     smem_lse = cutlass.Array(
         Float32,
         SEPARATE_REDUCTION_LSE_VALUES_PER_ROW * PARALLEL_REDUCTION_THREADS_PER_CTA,
@@ -601,11 +611,6 @@ def decode_gen_parallel_separate_reduction_kernel(
         space=cutlass.AddressSpace.smem,
         alignment=16,
     )
-
-    # Pair with the producer only after local state is ready, but before the
-    # first producer-dependent partial-O or partial-statistics read.
-    if cutlass.const_expr(cfg.use_parallel_separate_reduction_pdl):
-        prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
 
     if cutlass.const_expr(not static_full_split_prefix):
         active_splits_kv = _reduction_active_splits_kv(
@@ -796,6 +801,7 @@ def decode_gen_parallel_separate_reduction_kernel(
                 cfg,
                 lse_ptr=lse_ptr,
             )
+        _release_reduction_dependents(cfg)
         return
 
     # Each G2+ thread publishes one normalized ``(LSE, O)`` state using the
@@ -957,6 +963,7 @@ def decode_gen_parallel_separate_reduction_kernel(
     # Keep every peer CTA alive until rank zero has finished its DSMEM reads.
     prims.barrier_cluster_arrive_relaxed()
     prims.barrier_cluster_wait()
+    _release_reduction_dependents(cfg)
 
 
 @cute.jit
@@ -1051,7 +1058,7 @@ def fmha_decode_separate_reduction_launch(
                     block=[REDUCTION_THREADS_PER_CTA, 1, 1],
                     cluster=[1, 1, 1],
                     stream=stream,
-                    use_pdl=cfg.use_parallel_separate_reduction_pdl,
+                    use_pdl=cfg.use_pdl,
                 )
             else:
                 decode_gen_parallel_separate_reduction_kernel(
@@ -1071,7 +1078,7 @@ def fmha_decode_separate_reduction_launch(
                     block=[cfg.parallel_reduction_threads_per_cta, 1, 1],
                     cluster=[cluster_size, 1, 1],
                     stream=stream,
-                    use_pdl=cfg.use_parallel_separate_reduction_pdl,
+                    use_pdl=cfg.use_pdl,
                 )
         else:
             decode_gen_parallel_separate_reduction_kernel(
@@ -1091,7 +1098,7 @@ def fmha_decode_separate_reduction_launch(
                 block=[cfg.parallel_reduction_threads_per_cta, 1, 1],
                 cluster=[cluster_size, 1, 1],
                 stream=stream,
-                use_pdl=cfg.use_parallel_separate_reduction_pdl,
+                use_pdl=cfg.use_pdl,
             )
         return
     decode_gen_separate_reduction_kernel(
@@ -1113,4 +1120,5 @@ def fmha_decode_separate_reduction_launch(
         block=[REDUCTION_THREADS_PER_CTA, 1, 1],
         cluster=[1, 1, 1],
         stream=stream,
+        use_pdl=cfg.use_pdl,
     )

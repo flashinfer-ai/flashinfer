@@ -247,6 +247,7 @@ def _build_block_sparse_plan_state(
     use_proxy_routes: bool = False,
     sm_scale: GlobalScale | None = None,
     output_scale: GlobalScale = 1.0,
+    enable_pdl: bool = False,
 ) -> _BlockSparsePlanState:
     """Build one format- and route-specialized plan atomically."""
 
@@ -304,6 +305,7 @@ def _build_block_sparse_plan_state(
             sage=static.sage,
             scale_types=scale_types(sm_scale, output_scale),
             softmax_rescale_threshold_log2=static.softmax_rescale_threshold_log2,
+            enable_pdl=enable_pdl,
         )
         policy = (
             *spec.policy,
