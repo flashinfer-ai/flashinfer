@@ -1138,7 +1138,7 @@ POLICY_FP8: dict[str, dict[str, Any]] = {
     "sm_100a": {"static_scan_kinds": []},
     "sm_103a": {"static_scan_kinds": []},
     "sm_107a": {
-        "static_scan_kinds": ["l6", "narrow", "split_narrow"],
+        "static_scan_kinds": ["l6", "narrow", "split_narrow", "wide"],
         "split_fit_rule": None,
     },
 }
