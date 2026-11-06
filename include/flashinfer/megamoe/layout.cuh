@@ -364,7 +364,9 @@ struct RemoteRegions {
   void* base;
 
   // Header of an inbox / outbound block: the number of packed tokens, then per
-  // expert of the receiving node its count and its list of `slot * topk + k`.
+  // expert of the receiving node its count, then per expert a fixed-stride list
+  // of `capacity` entries `slot * topk + k` (the index pass writes it in place,
+  // so nothing is compacted before the put).
   static constexpr uint32_t kHeaderControlBytes = 128;
 
   CUTLASS_HOST_DEVICE
@@ -381,9 +383,10 @@ struct RemoteRegions {
         base(base) {}
 
   CUTLASS_HOST_DEVICE uint64_t header_bytes() const {
-    return math::align<uint64_t>(kHeaderControlBytes + num_experts_per_node * 2 * sizeof(uint32_t) +
-                                     static_cast<uint64_t>(capacity) * topk * sizeof(uint32_t),
-                                 128);
+    return math::align<uint64_t>(
+        kHeaderControlBytes + num_experts_per_node * sizeof(uint32_t) +
+            static_cast<uint64_t>(num_experts_per_node) * capacity * sizeof(uint32_t),
+        128);
   }
   CUTLASS_HOST_DEVICE uint64_t inbox_bytes() const { return header_bytes() + input_block_bytes; }
   CUTLASS_HOST_DEVICE uint64_t return_bytes() const {
@@ -392,17 +395,11 @@ struct RemoteRegions {
   CUTLASS_HOST_DEVICE uint64_t slot_map_bytes() const {
     return math::align<uint64_t>(capacity * sizeof(int32_t) + 128, 128);
   }
-  // Fixed-stride lists the index pass writes before the per-expert totals are
-  // known; compacted into the outbound header after the grid sync.
-  CUTLASS_HOST_DEVICE uint64_t list_scratch_bytes() const {
-    return math::align<uint64_t>(
-        static_cast<uint64_t>(num_experts_per_node) * capacity * sizeof(uint32_t), 128);
-  }
   // Per remote node: inbox, outbound, outbox, return inbox, return outbound,
-  // slot map with control words, list scratch.
+  // slot map with control words.
   CUTLASS_HOST_DEVICE uint64_t bytes_per_node() const {
     return inbox_bytes() * 2 + math::align<uint64_t>(combine_block_bytes, 128) +
-           return_bytes() * 2 + slot_map_bytes() + list_scratch_bytes();
+           return_bytes() * 2 + slot_map_bytes();
   }
   CUTLASS_HOST_DEVICE uint64_t get_num_bytes() const {
     return math::align<uint64_t>(bytes_per_node() * num_remote_nodes, 16);
@@ -455,29 +452,22 @@ struct RemoteRegions {
     return reinterpret_cast<uint64_t*>(packed_slot_map(node) + capacity + 4);
   }
   CUTLASS_HOST_DEVICE uint32_t* launch_epoch() const { return packed_token_count(0) + 6; }
-  CUTLASS_HOST_DEVICE uint32_t* list_scratch(const uint32_t& node, const uint32_t& expert) const {
-    return static_cast<uint32_t*>(math::advance_ptr(packed_slot_map(node), slot_map_bytes())) +
-           static_cast<uint64_t>(expert) * capacity;
-  }
-  // Header: control words ([0] packed tokens, [1] list entries), then per
-  // expert of the receiving node its count and the start of its entries, then
-  // the concatenated entries `slot * topk + k`.
+  // Header: control word [0] packed tokens, then per expert of the receiving
+  // node its count, then per expert its list of `capacity` entries.
   CUTLASS_HOST_DEVICE uint32_t* header_control(void* header) const {
     return static_cast<uint32_t*>(header);
   }
   CUTLASS_HOST_DEVICE uint32_t* header_expert_counts(void* header) const {
     return static_cast<uint32_t*>(math::advance_ptr(header, kHeaderControlBytes));
   }
-  CUTLASS_HOST_DEVICE uint32_t* header_expert_starts(void* header) const {
-    return header_expert_counts(header) + num_experts_per_node;
+  CUTLASS_HOST_DEVICE uint32_t* header_list(void* header, const uint32_t& expert) const {
+    return header_expert_counts(header) + num_experts_per_node +
+           static_cast<uint64_t>(expert) * capacity;
   }
-  CUTLASS_HOST_DEVICE uint32_t* header_entries(void* header) const {
-    return header_expert_starts(header) + num_experts_per_node;
-  }
-  CUTLASS_HOST_DEVICE uint64_t header_used_bytes(const uint32_t& num_entries) const {
-    return math::align<uint64_t>(kHeaderControlBytes + num_experts_per_node * 2 * sizeof(uint32_t) +
-                                     static_cast<uint64_t>(num_entries) * sizeof(uint32_t),
-                                 16);
+  // The list of `expert` of `node` that this rank's index pass fills, in the
+  // outbound header.
+  CUTLASS_HOST_DEVICE uint32_t* outbound_list(const uint32_t& node, const uint32_t& expert) const {
+    return header_list(outbound_header(node), expert);
   }
 };
 

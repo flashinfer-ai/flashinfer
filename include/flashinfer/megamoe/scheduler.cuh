@@ -438,9 +438,9 @@ struct InterleavedMegaMoEScheduler {
 
   // Rows of every local expert that were pulled from other nodes: the sources
   // outside this node's `num_local_ranks` consecutive ranks from
-  // `local_rank_base`. Each source published its count with a sys-scope
-  // release before its share of the count sum, so one acquire of the complete
-  // sum (see `fetch_expert_recv_count`) orders the per-source reads.
+  // `local_rank_base`. The mirror publishes each such source's count with a
+  // sys-scope release before its share of the count sum, so one acquire of the
+  // complete sum (see `fetch_expert_recv_count`) orders the per-source reads.
   CUTLASS_DEVICE void fetch_remote_rows(const uint32_t& local_rank_base,
                                         const uint32_t& num_local_ranks) {
     const uint32_t lane_idx = ptx::get_lane_idx();

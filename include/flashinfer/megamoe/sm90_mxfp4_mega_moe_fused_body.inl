@@ -617,6 +617,11 @@ if (warp_idx < kNumDispatchWarps) {
   });
   if (thread_idx == 0) stamp_max(9);
 
+  // Inter-node: every SM's packed rows and list entries are complete, so this
+  // rank's tokens leave now; their wire time overlaps the count publication.
+  remote_send();
+  if (sm_idx == 0 and thread_idx == 0) stamp_max(10);
+
   if (sm_idx == 0 and thread_idx < kNumActiveDispatchThreads) {
 #pragma unroll
     for (uint32_t i = thread_idx; i < kNumExperts; i += kNumActiveDispatchThreads) {
@@ -630,9 +635,7 @@ if (warp_idx < kNumDispatchWarps) {
       *sym_buffer.map(
           workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
           dst_rank_idx) = expert_status & 0xffffffff;
-      // Release: the task producer reads the per-source counts after one
-      // acquire of the complete sum (`fetch_remote_rows`).
-      ptx::red_add_rel_sys(
+      ptx::atomic_add_sys(
           sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx),
                          dst_rank_idx),
           expert_status);
@@ -640,10 +643,8 @@ if (warp_idx < kNumDispatchWarps) {
   }
   ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
-  // Inter-node: ship this rank's packed tokens, then publish the mirrored
-  // sources' counts and lists into this node's owners before the barrier.
-  remote_send();
-  if (sm_idx == 0 and thread_idx == 0) stamp_max(10);
+  // Inter-node: the mirrored sources' counts and lists are published into
+  // this node's owners.
   remote_publish_by_proxy();
   if (thread_idx == 0) stamp_max(12);
 

@@ -7,10 +7,10 @@
 //                             such node and is copied once into the outbound
 //                             staging of that node (row, scales, ids, weights).
 //   remote_list_entry         the index pass writes `slot * topk + k` for an
-//                             expert on another node into the list scratch.
-//   remote_send               SM 0, after the grid sync: puts the rows, compacts
-//                             the lists, then puts scales, routing and header in
-//                             one signalled put.
+//                             expert on another node into the outbound header.
+//   remote_send               SM 0, right after the grid sync: puts the rows,
+//                             then scales, routing, weights and the header
+//                             (counts and lists) in one signalled put.
 //   remote_publish_by_proxy   every SM, before the node-local barrier: waits for
 //                             the inbox of every remote node and publishes its
 //                             share of the experts into this node's owners.
@@ -73,8 +73,8 @@ const auto remote_pack_tokens = [&]() {
   }
 };
 
-// Index pass entry for an expert on another node: the owner's list gets the
-// packed index of the token, staged in the list scratch until the totals are known.
+// Index pass entry for an expert on another node: the owner's list in the
+// outbound header gets the packed index of the token.
 const auto remote_list_entry = [&](const uint32_t& token_topk_idx, const uint32_t& expert_idx,
                                    const uint32_t& dst_slot_idx) {
   if constexpr (kNumRemoteNodes > 0) {
@@ -82,18 +82,22 @@ const auto remote_list_entry = [&](const uint32_t& token_topk_idx, const uint32_
     const uint32_t j = remote_index_of_node(node);
     const uint32_t token_idx = token_topk_idx / kNumTopk;
     const int32_t slot = remote.packed_slot_map(j)[token_idx];
-    remote.list_scratch(j, expert_idx - node * kNumExpertsPerNode)[dst_slot_idx] =
+    remote.outbound_list(j, expert_idx - node * kNumExpertsPerNode)[dst_slot_idx] =
         static_cast<uint32_t>(slot) * kNumTopk + token_topk_idx % kNumTopk;
   }
 };
 
-// SM 0 after the grid sync, one remote node at a time: two puts per node. The
-// rows leave first; the scales, routing, weights and the compacted header are
-// adjacent in the layout and leave as one put that carries the signal, which
-// orders the rows put before it on the same context.
+// SM 0, warp 0, right after the index-pass grid sync (every SM's packed rows
+// and list entries are complete): two puts per remote node. The rows leave
+// first; the scales, routing, weights and the header (the per-expert counts
+// and the lists the index pass wrote in place) are adjacent in the layout and
+// leave as one put that carries the signal, which orders the rows put before
+// it on the same context. The lists are not compacted: at a capacity of 512
+// tokens they are 32 KB per node, under a microsecond on the wire, and the
+// compaction kept the header put behind the count publication.
 const auto remote_send = [&]() {
   if constexpr (kNumRemoteNodes > 0) {
-    if (sm_idx != 0) return;
+    if (sm_idx != 0 or warp_idx != 0) return;
     comm::RemoteIO<kNumRemoteNodes> io(remote_links);
 #pragma unroll 1
     for (uint32_t j = 0; j < kNumRemoteNodes; ++j) {
@@ -101,65 +105,22 @@ const auto remote_send = [&]() {
       const uint32_t at = remote_links.peers[j].node_at_mirror;
       auto* header = remote.outbound_header(j);
       auto* counts = remote.header_expert_counts(header);
-      auto* starts = remote.header_expert_starts(header);
-      auto* entries = remote.header_entries(header);
       auto* dst_block = static_cast<uint8_t*>(remote.inbox_input_block(at));
       auto* src_block = static_cast<uint8_t*>(remote.outbound_input_block(j));
       const uint32_t num_packed = *remote.packed_token_count(j);
-      if (thread_idx == 0) remote.header_control(header)[0] = num_packed;
-      if (warp_idx == 0 and num_packed > 0)
-        io.put_warp(j, dst_block, src_block, static_cast<uint64_t>(num_packed) * kHidden, lane_idx,
-                    false, nullptr, 0);
-      for (uint32_t e = thread_idx; e < kNumExpertsPerNode; e += kNumDispatchThreads)
+      if (lane_idx == 0) remote.header_control(header)[0] = num_packed;
+      for (uint32_t e = lane_idx; e < kNumExpertsPerNode; e += 32)
         counts[e] = static_cast<uint32_t>(
             *workspace.get_expert_send_count_ptr(node * kNumExpertsPerNode + e) & 0xffffffffu);
-      ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
-      // Exclusive prefix of the counts by warp 0: a few experts per lane, then a
-      // warp scan (the serial loop over the experts cost a memory latency each).
-      if (warp_idx == 0) {
-        constexpr uint32_t kPerLane = math::constexpr_ceil_div(kNumExpertsPerNode, 32u);
-        uint32_t local[kPerLane], sum = 0;
-#pragma unroll
-        for (uint32_t i = 0; i < kPerLane; ++i) {
-          const uint32_t e = lane_idx * kPerLane + i;
-          local[i] = e < kNumExpertsPerNode ? counts[e] : 0u;
-          sum += local[i];
-        }
-        uint32_t running = math::warp_inclusive_sum(sum, lane_idx) - sum;
-#pragma unroll
-        for (uint32_t i = 0; i < kPerLane; ++i) {
-          const uint32_t e = lane_idx * kPerLane + i;
-          if (e < kNumExpertsPerNode) starts[e] = running;
-          running += local[i];
-        }
-        if (lane_idx == 31) remote.header_control(header)[1] = running;
-      }
-      ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
-      const uint32_t num_entries = remote.header_control(header)[1];
-      // Compaction: one thread per expert, its entries copied eight at a time
-      // (loads first, then stores), so the experts' lists move in parallel.
-      for (uint32_t e = thread_idx; e < kNumExpertsPerNode; e += kNumDispatchThreads) {
-        const auto* src = remote.list_scratch(j, e);
-        const uint32_t n = counts[e], s0 = starts[e];
-        for (uint32_t k0 = 0; k0 < n; k0 += 8) {
-          uint32_t v[8];
-#pragma unroll
-          for (uint32_t u = 0; u < 8; ++u)
-            if (k0 + u < n) v[u] = src[k0 + u];
-#pragma unroll
-          for (uint32_t u = 0; u < 8; ++u)
-            if (k0 + u < n) entries[s0 + k0 + u] = v[u];
-        }
-      }
-      ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
-      if (warp_idx == 0) {
-        // Scales, routing ids, weights (whole regions) and the used header, contiguous.
-        const uint64_t tail = static_cast<uint64_t>(remote.input_block_bytes) - sf_block_offset +
-                              remote.header_used_bytes(num_entries);
-        io.put_warp(j, dst_block + sf_block_offset, src_block + sf_block_offset, tail, lane_idx,
-                    true, remote.inbox_flag(at), comm::remote_inbox_signal(at));
-      }
-      ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+      __syncwarp();
+      if (num_packed > 0)
+        io.put_warp(j, dst_block, src_block, static_cast<uint64_t>(num_packed) * kHidden, lane_idx,
+                    false, nullptr, 0);
+      // Scales, routing ids, weights (whole regions) and the header, contiguous.
+      const uint64_t tail =
+          static_cast<uint64_t>(remote.input_block_bytes) - sf_block_offset + remote.header_bytes();
+      io.put_warp(j, dst_block + sf_block_offset, src_block + sf_block_offset, tail, lane_idx, true,
+                  remote.inbox_flag(at), comm::remote_inbox_signal(at));
     }
   }
 };
@@ -183,8 +144,6 @@ const auto remote_publish_by_proxy = [&]() {
       if (thread_idx == 0) stamp_max(11);
       auto* header = remote.inbox_header(j);
       const auto* counts = remote.header_expert_counts(header);
-      const auto* starts = remote.header_expert_starts(header);
-      const auto* entries = remote.header_entries(header);
       // Per expert: one thread writes the count as the source would have, every
       // thread copies a share of the list.
       for (uint32_t e = sm_idx; e < kNumExpertsPerNode; e += kNumSMs) {
@@ -201,9 +160,10 @@ const auto remote_publish_by_proxy = [&]() {
               sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(local_expert), owner),
               (static_cast<uint64_t>(kNumSMs) << 32) | count);
         }
+        const auto* list = remote.header_list(header, e);
         for (uint32_t k = thread_idx; k < count; k += kNumDispatchThreads)
           *sym_buffer.map(workspace.get_src_token_topk_idx_ptr(local_expert, source_rank, k),
-                          owner) = entries[starts[e] + k];
+                          owner) = list[k];
       }
       ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
     }
