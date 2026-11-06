@@ -447,6 +447,3 @@ __all__ = [
     "validate_heads",
     "validate_ring",
 ]
-
-# Compatibility aliases: the pre-rename names bound to the same objects (not in ``__all__``).
-KcpOptions = OptionsDetKcp

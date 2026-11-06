@@ -6,7 +6,11 @@ top-k selection with aligned scores, in one device-side pipeline (target
 geometry: 32 indexer heads, head dimension 128, top-k 2048).  Tracking issue:
 flashinfer-ai/flashinfer#5676.
 
-Both the API and the backend are experimental: no compatibility guarantee.
+The public entry points live in the module `flashinfer.cake_dsa_indexer_det_train`;
+this backend package under `flashinfer/experimental/cake/` is their implementation
+and carries no compatibility guarantee of its own.  The non-deterministic
+counterpart `flashinfer.cake_dsa_indexer_nondet_train` is a reserved name for a
+planned package (flashinfer-ai/flashinfer#8928).
 SM107 (Rubin) is the primary target of the request, SM100 (B200 / GB200) the
 comparison architecture, SM103 (B300 / GB300) the third target.  The feature
 does not participate in automatic backend selection, autotuning or
@@ -14,28 +18,34 @@ trace-apply; its libraries are loaded prebuilt from `aot/` when the package
 ships them and JIT-built by FlashInfer from `build.json` otherwise (see
 "Layout of this package").
 
-## Public entry points (`flashinfer/dsa_indexer.py`)
+## Public entry points (`flashinfer/cake_dsa_indexer_det_train.py`)
 
 ```python
-from flashinfer.dsa_indexer import dsa_indexer_det_topk, dsa_indexer_det_topk_workspace_size
+from flashinfer.cake_dsa_indexer_det_train import (
+    cake_dsa_indexer_det_train_topk,
+    cake_dsa_indexer_det_train_topk_workspace_size,
+)
 
-indices, scores = dsa_indexer_det_topk(q, k, w, cu_seqlens_q, cu_seqlens_k,
-                                   top_k=2048, softmax_scale=None, q_causal_offsets=None, ratio=1,
-                                   max_seqlen_q=None, max_seqlen_k=None,
-                                   workspace_buffer=None, indices=None, scores=None)
-nbytes = dsa_indexer_det_topk_workspace_size(T, Tkv, S, top_k=2048, ratio=1, device=q.device)
+indices, scores = cake_dsa_indexer_det_train_topk(q, k, w, cu_seqlens_q, cu_seqlens_k,
+                                                  top_k=2048, softmax_scale=None, q_causal_offsets=None, ratio=1,
+                                                  max_seqlen_q=None, max_seqlen_k=None,
+                                                  workspace_buffer=None, indices=None, scores=None)
+nbytes = cake_dsa_indexer_det_train_topk_workspace_size(T, Tkv, S, top_k=2048, ratio=1, device=q.device)
 
 # the FP8 form (opt-in): float8_e4m3fn q / k, per-key FP32 k_scale, every other scale folded into w
-indices, scores = dsa_indexer_det_topk(q_fp8, k_fp8, w, cu_seqlens_q, cu_seqlens_k, k_scale=k_scale)
-nbytes = dsa_indexer_det_topk_workspace_size(T, Tkv, S, device=q.device, dtype=torch.float8_e4m3fn)
+indices, scores = cake_dsa_indexer_det_train_topk(q_fp8, k_fp8, w, cu_seqlens_q, cu_seqlens_k, k_scale=k_scale)
+nbytes = cake_dsa_indexer_det_train_topk_workspace_size(T, Tkv, S, device=q.device, dtype=torch.float8_e4m3fn)
 ```
 
-The previous names `dsa_indexer_topk` and `dsa_indexer_topk_workspace_size`,
-the backend's previous names (`DSAIndexerRunner`, `plan_dsa_indexer_topk`,
-`prepare_dsa_indexer_topk`, `dsa_indexer_workspace_size`,
-`validate_dsa_indexer_inputs`, `cake_backend.dsa_indexer_topk`) and the
-previous package path `flashinfer.experimental.cake_dsa_indexer` remain
-available as aliases of the same objects.
+Every name carries the mode word `det`, and no entry point takes a
+`deterministic=` keyword (flashinfer-ai/flashinfer#8928).  The previous names
+(`flashinfer.dsa_indexer.dsa_indexer_det_topk(..., backend="cake")`,
+`flashinfer.dsa_indexer.dsa_indexer_det_topk_workspace_size`, `dsa_indexer_topk`,
+`dsa_indexer_topk_workspace_size`, the backend's `dsa_indexer_*` aliases) and
+the package paths `flashinfer.experimental.cake_dsa_indexer_det` and
+`flashinfer.experimental.cake_dsa_indexer` are removed, with no aliases;
+`flashinfer.dsa_indexer.dsa_indexer_det_topk` keeps only its
+`backend="sm120"` form.
 
 | argument | shape and type | meaning |
 |---|---|---|
@@ -50,7 +60,7 @@ available as aliases of the same objects.
 | `ratio` | positive int | key compression ratio (normally 1) |
 | `max_seqlen_q` | optional int | host mirror of the longest query segment; accepted, not read by any launch decision |
 | `max_seqlen_k` | optional int | the caller's bound on every key segment (`max(cu_seqlens_k[1:] - cu_seqlens_k[:-1])`); sizes the rank finalize's bitmap pool and so selects its program variant (`rank_seg_window`) -- the results are bitwise identical with and without it; a value above `Tkv` or below `ceil(Tkv / S)` is rejected |
-| `workspace_buffer` | optional uint8 tensor | at least `dsa_indexer_det_topk_workspace_size(T, Tkv, S, top_k=..., ratio=..., device=...)` bytes, 8-byte aligned |
+| `workspace_buffer` | optional uint8 tensor | at least `cake_dsa_indexer_det_train_topk_workspace_size(T, Tkv, S, top_k=..., ratio=..., device=...)` bytes, 8-byte aligned |
 | `indices`, `scores` (outputs) | `[T, top_k]` int32 and FP32 | selected segment-local ids in ascending order and their aligned scores; tail padding `-1` / `-inf` |
 
 `T`, `Tkv`, the segment lengths and the last tile are arbitrary (the recorded
@@ -159,7 +169,7 @@ s[t, j] = k_scale[j] * sum_h w[t, h] * relu(sum_d q[t, h, d] * k[j, d])
   On `sm_107a` every FP8 kind keeps the static unit enumeration
   (`static_scan_kinds`): no ticket tail, nothing zeroed.  An architecture
   without FP8 programs raises `NotImplementedError`.
-* **Workspace**: `dsa_indexer_det_topk_workspace_size(...,
+* **Workspace**: `cake_dsa_indexer_det_train_topk_workspace_size(...,
   dtype=torch.float8_e4m3fn)` bounds the FP8 programs' workspace; the
   default `dtype=torch.bfloat16` returns the BF16 bound unchanged.  A plain
   `wide` decision (no CTA pair, no split) runs the FP8 `wide` unit, 8
@@ -266,7 +276,7 @@ that writes the registry verifies the record against them before it is frozen.
 
 ## Workspace and host behaviour
 
-* **Workspace bound** (`dsa_indexer_det_topk_workspace_size(T, Tkv, S, top_k=,
+* **Workspace bound** (`cake_dsa_indexer_det_train_topk_workspace_size(T, Tkv, S, top_k=,
   ratio=, device=)`): `grid_ctas x queries_per_unit x
   candidate_capacity(top_k) x 8` bytes of persistent candidate buffers for the
   dispatched unit geometry and capacity (for example about 74 MiB at `top_k =
@@ -283,7 +293,7 @@ that writes the registry verifies the record against them before it is frozen.
   package needed 114 / 228 MiB (119537664 / 239075328 B); a reused buffer
   sized under the previous package for such a call must be re-sized (the
   runner rejects it with `workspace_buffer needs N bytes`), and
-  `dsa_indexer_det_topk_workspace_size` follows the new plan automatically.  It is
+  `cake_dsa_indexer_det_train_topk_workspace_size` follows the new plan automatically.  It is
   the larger of the sampled default's plan and the plan with the sampled first
   threshold off (`sample_tiles_max=0`): on sm_107a the unpaired
   three-warpgroup preference can give an unsampled call six queries per unit
@@ -363,10 +373,12 @@ per entry.  `csrc/.clang-format` disables formatting so the digests stay valid.
 
 ## Tests and benchmark
 
-Tests: `tests/experimental/test_cake_dsa_indexer.py` (the backend suite, which
-imports the package only through `tests/test_helpers/cake_package.py`) and
-`tests/experimental/test_cake_dsa_indexer_api.py` (the `flashinfer.dsa_indexer`
-wrapper), with the independent
+Tests: `tests/experimental/test_cake_dsa_indexer_det_train.py` (the backend suite, which
+imports the package only through `tests/test_helpers/cake_package.py`),
+`tests/experimental/test_cake_dsa_indexer_det_train_api.py` (the
+`flashinfer.cake_dsa_indexer_det_train` entry points) and
+`tests/experimental/test_cake_dsa_indexer_det_train_names.py` (the #8928 naming
+rules), with the independent
 FP64 / FP32 reference in `tests/test_helpers/cake_dsa_indexer_reference.py`
 (exact semantic cases incl. cutoff ties, all-equal scores, mixed signed zeros
 at the boundary with bit checks, negative scores and a few winners over a
@@ -378,14 +390,14 @@ repeatability, partition-knob and program-dispatch invariance; strided `k`;
 non-finite inputs; CUDA-graph capture; the workspace bound).  The host-only
 tests (registry shape, dispatch policy, validation, binding, the reference
 itself) run without a GPU.  The FP8 form has its own suite,
-`tests/experimental/test_cake_dsa_indexer_fp8.py`: host-only key grammar,
+`tests/experimental/test_cake_dsa_indexer_det_train_fp8.py`: host-only key grammar,
 FP8 record, kind mapping and reachability of every registered FP8 key,
 validation and BF16 plan / workspace identity; on the GPU, accuracy against
 an FP64 reference of the e4m3 inputs under the `gamma_n A` bound with exact
 ids up to near ties, bitwise program-dispatch invariance over every
 registered FP8 key, the prepared runner's `k_scale` binding, the per-form
 ticket decision and, where `deep_gemm` imports on `sm_100a` / `sm_103a`, a
-bitwise comparison of the logits with `deep_gemm.fp8_mqa_logits`.  Benchmark: `benchmarks/bench_cake_dsa_indexer.py`
+bitwise comparison of the logits with `deep_gemm.fp8_mqa_logits`.  Benchmark: `benchmarks/bench_cake_dsa_indexer_det_train.py`
 (paired AB / BA / interleaved CUPTI spans of the complete operator against two
 torch + FlashInfer compositions; both baseline arms are reconstructions of the
 training stack's chunked scoring / coarse top-k / rescoring path written for

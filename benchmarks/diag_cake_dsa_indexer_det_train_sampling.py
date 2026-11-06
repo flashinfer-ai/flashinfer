@@ -16,7 +16,7 @@ limitations under the License.
 
 """Diagnose the sampled first threshold of the experimental Cake DSA indexer top-k backend.
 
-The scan kernel of ``flashinfer.experimental.cake_dsa_indexer_det`` streams the visible key
+The scan kernel of ``flashinfer.experimental.cake.cake_dsa_indexer_det_train`` streams the visible key
 prefix of every work unit (a block of ``block_q`` consecutive queries of one segment) in
 128-key tiles.  A unit whose stream would overflow its candidate buffer first walks one tile
 of every ``stride`` (``n_sample`` sample tiles); at the last sample tile each query picks
@@ -52,8 +52,8 @@ Inputs are one of:
   bf16, ``w`` ``[T, 32]`` fp32, ``cu_seqlens_q`` / ``cu_seqlens_k`` int32 ``[S + 1]``, and
   optionally ``q_causal_offsets`` (int64 ``[S]``), ``top_k`` (default 2048), ``ratio``
   (default 1), ``max_seqlen_k``, ``softmax_scale`` (default ``128 ** -0.5``) -- one rank's
-  arguments to ``dsa_indexer_det_topk`` saved as they were passed;
-* ``--row NAME``: a row of ``benchmarks/bench_cake_dsa_indexer.py`` (``S4sink``, ``Z1``, ``P1``,
+  arguments to ``cake_dsa_indexer_det_train_topk`` saved as they were passed;
+* ``--row NAME``: a row of ``benchmarks/bench_cake_dsa_indexer_det_train.py`` (``S4sink``, ``Z1``, ``P1``,
   ...), built with that script's generators and seeds;
 * ``--cp16 MIX --dist DIST --rank R``: one rank of a 16-way context-parallel zigzag split of a
   synthetic document mix (``doc262k``: one 262144-token document; ``packed11``: eleven
@@ -78,10 +78,10 @@ the K-th key are within an ulp; the per-CTA attribution assumes the static assig
 
 Usage::
 
-    python benchmarks/diag_cake_dsa_indexer_sampling.py --row S4sink
-    python benchmarks/diag_cake_dsa_indexer_sampling.py --load rank3.pt --csv rank3_units.csv
-    python benchmarks/diag_cake_dsa_indexer_sampling.py --cp16 packed11 --dist topic --rank 3 --time
-    python benchmarks/diag_cake_dsa_indexer_sampling.py --row Z1 --arch sm_100a --num-sms 148 --device cpu
+    python benchmarks/diag_cake_dsa_indexer_det_train_sampling.py --row S4sink
+    python benchmarks/diag_cake_dsa_indexer_det_train_sampling.py --load rank3.pt --csv rank3_units.csv
+    python benchmarks/diag_cake_dsa_indexer_det_train_sampling.py --cp16 packed11 --dist topic --rank 3 --time
+    python benchmarks/diag_cake_dsa_indexer_det_train_sampling.py --row Z1 --arch sm_100a --num-sms 148 --device cpu
 """
 
 import argparse
@@ -97,9 +97,9 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import bench_cake_dsa_indexer as bcdi  # noqa: E402  (benchmarks/ is the script directory)
+import bench_cake_dsa_indexer_det_train as bcdi  # noqa: E402  (benchmarks/ is the script directory)
 from flashinfer.api_logging import ExperimentalWarning  # noqa: E402
-from flashinfer.experimental.cake_dsa_indexer_det import cake_backend  # noqa: E402
+from flashinfer.experimental.cake.cake_dsa_indexer_det_train import cake_backend  # noqa: E402
 from tests.test_helpers import cake_dsa_indexer_reference as ref  # noqa: E402
 
 TILE = 128
@@ -974,7 +974,9 @@ def main():
     )
     src = parser.add_mutually_exclusive_group(required=True)
     src.add_argument("--load", help="torch.save dict of one rank's inputs")
-    src.add_argument("--row", help="a row of benchmarks/bench_cake_dsa_indexer.py")
+    src.add_argument(
+        "--row", help="a row of benchmarks/bench_cake_dsa_indexer_det_train.py"
+    )
     src.add_argument(
         "--cp16",
         choices=sorted(CP16_MIXES),

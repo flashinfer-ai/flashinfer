@@ -14,10 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-# Deprecated alias: this module is ``flashinfer.experimental.cake_moe_grouped_det_gemm.cake_autograd``.
-
-import sys
-
-from ..cake_moe_grouped_det_gemm import cake_autograd as _module
-
-sys.modules[__name__] = _module
+# Cake backend of flashinfer.cake_dsa_indexer_det_train: fused DSA indexer scoring + deterministic
+# exact top-k selection for training (flashinfer-ai/flashinfer#5676; target geometry: 32 indexer heads,
+# head dimension 128, top-k 2048) on SM100 / SM103 / SM107.  The public entry points are
+# ``flashinfer.cake_dsa_indexer_det_train.cake_dsa_indexer_det_train_topk`` and
+# ``cake_dsa_indexer_det_train_topk_workspace_size``; the host binding, workspace policy, JIT registration and
+# the generated kernel sources live in this package.
