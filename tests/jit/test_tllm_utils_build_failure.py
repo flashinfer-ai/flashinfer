@@ -1,5 +1,6 @@
 import threading
 import time
+from contextlib import nullcontext
 
 import pytest
 
@@ -25,6 +26,8 @@ def failing_trtllm_utils_build(monkeypatch):
     monkeypatch.setattr(
         tllm_utils.logger, "warning", lambda msg, *args: warnings.append(msg % args)
     )
+    # Unit tests do not need a real Torch CUDA stream binding.
+    monkeypatch.setattr(tllm_utils.tvm_ffi, "use_torch_stream", lambda: nullcontext())
     tllm_utils._load_trtllm_utils_module.cache_clear()
     yield warnings
     tllm_utils._load_trtllm_utils_module.cache_clear()
@@ -81,6 +84,7 @@ def test_trtllm_utils_module_is_built_once_on_success(monkeypatch):
             return _Module()
 
     monkeypatch.setattr(tllm_utils, "gen_trtllm_utils_module", _Spec)
+    monkeypatch.setattr(tllm_utils.tvm_ffi, "use_torch_stream", lambda: nullcontext())
     tllm_utils._load_trtllm_utils_module.cache_clear()
     try:
         tllm_utils.delay_kernel(5)
