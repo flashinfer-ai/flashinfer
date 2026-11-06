@@ -15,6 +15,23 @@ limitations under the License.
 
 Cake fused BF16 RMSNorm training forward / backward (SM100 / SM103 / SM107).
 
+Mode and dispatch rules:
+
+* This is the deterministic package: its weight gradient ``dw`` is bitwise
+  reproducible and every forward, backward, workspace, support-query and
+  autograd entry point name carries ``det``.  No entry point takes a
+  ``deterministic`` keyword; passing one raises Python's ``TypeError`` for an
+  unexpected keyword argument.
+* The non-deterministic package is :mod:`flashinfer.cake_rmsnorm_train`
+  (names without ``det``).  Its entry points require ``deterministic=False``
+  and raise ``ValueError`` naming the matching entry point here otherwise.
+  Neither package runs the other.
+* ``torch.use_deterministic_algorithms`` changes nothing here (every launch
+  is fixed-order).  The non-deterministic package's backward alerts
+  under it (``RuntimeError``; ``warn_only=True``: one ``UserWarning``, then its
+  own backward); its forward and helpers never alert.
+* There are no aliases: a name without ``det`` never runs this package.
+
 Forward: ``r_t = (mean_j x_tj^2 + eps)^(-1/2)`` in FP32, ``y = BF16((x * r) * w)``.
 The only tensor saved for the backward besides the inputs is the FP32 per-row
 reciprocal RMS ``rstd`` (``[T]``).  Backward: one fused pass produces
@@ -151,7 +168,6 @@ def cake_rmsnorm_det_train_backward(
     w: torch.Tensor,
     rstd: torch.Tensor,
     *,
-    deterministic: bool = True,
     g_residual: Optional[torch.Tensor] = None,
     workspace: Optional[torch.Tensor] = None,
     dx: Optional[torch.Tensor] = None,
@@ -164,7 +180,6 @@ def cake_rmsnorm_det_train_backward(
         x,
         w,
         rstd,
-        deterministic=deterministic,
         g_residual=g_residual,
         workspace=workspace,
         dx=dx,
@@ -178,13 +193,10 @@ def cake_rmsnorm_det(
     w: torch.Tensor,
     eps: float = 1e-6,
     residual: Optional[torch.Tensor] = None,
-    deterministic: bool = True,
 ):
     """See :func:`flashinfer.cake_rmsnorm_det_train_backend.cake_rmsnorm_det`."""
 
-    return _backend.cake_rmsnorm_det(
-        x, w, eps, residual=residual, deterministic=deterministic
-    )
+    return _backend.cake_rmsnorm_det(x, w, eps, residual=residual)
 
 
 # Sphinx renders the backend docstrings; the one-line delegations satisfy the checker.
@@ -193,18 +205,6 @@ cake_rmsnorm_det_train_backward.__doc__ = (
     _backend.cake_rmsnorm_det_train_backward.__doc__
 )
 cake_rmsnorm_det.__doc__ = _backend.cake_rmsnorm_det.__doc__
-
-
-# The names before the det rename, the same objects as the det names of this facade (not in __all__).
-CakeRMSNormFunction = CakeRMSNormDetFunction
-cake_rmsnorm = cake_rmsnorm_det
-cake_rmsnorm_train_backward = cake_rmsnorm_det_train_backward
-cake_rmsnorm_train_backward_workspace = cake_rmsnorm_det_train_backward_workspace
-cake_rmsnorm_train_backward_workspace_bytes = (
-    cake_rmsnorm_det_train_backward_workspace_bytes
-)
-cake_rmsnorm_train_forward = cake_rmsnorm_det_train_forward
-is_cake_rmsnorm_train_supported = is_cake_rmsnorm_det_train_supported
 
 
 __all__ = [

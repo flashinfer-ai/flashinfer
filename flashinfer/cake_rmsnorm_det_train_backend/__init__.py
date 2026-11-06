@@ -18,6 +18,13 @@ forward / backward (SM100 / SM103 / SM107) as one self-contained package (host
 API bodies, the ``cake_jit`` loader and the generated CUDA sources under ``csrc/``).
 The stable, ``@flashinfer_api``-decorated entry points and the full user-facing
 documentation live in :mod:`flashinfer.cake_rmsnorm_det_train`; import that module.
+
+This is the deterministic package: every forward, backward, workspace,
+support-query and autograd entry point name carries ``det`` and the weight
+gradient is always the fixed-order reduction.  No entry point takes
+a ``deterministic`` keyword (passing one raises Python's ``TypeError`` for an
+unexpected keyword argument); the non-deterministic weight gradient is
+:mod:`flashinfer.cake_rmsnorm_train`.
 """
 
 from __future__ import annotations
@@ -664,7 +671,6 @@ def cake_rmsnorm_det_train_backward(
     w: torch.Tensor,
     rstd: torch.Tensor,
     *,
-    deterministic: bool = True,
     g_residual: Optional[torch.Tensor] = None,
     workspace: Optional[torch.Tensor] = None,
     dx: Optional[torch.Tensor] = None,
@@ -693,9 +699,6 @@ def cake_rmsnorm_det_train_backward(
     rstd : torch.Tensor
         FP32 ``[T]`` reciprocal RMS returned by the forward (of the leading
         shape ``[...]`` for an N-D call, or flat ``[prod(...)]``).
-    deterministic : bool
-        Only the deterministic fixed-order ``dw`` reduction is exported;
-        ``False`` is rejected.
     g_residual : torch.Tensor, optional
         BF16 gradient of ``g``'s shape flowing directly through ``h_new``
         (residual forward), any layout.  It is added once so that the returned
@@ -718,10 +721,6 @@ def cake_rmsnorm_det_train_backward(
     ``dw`` bits.
     """
 
-    if not deterministic:
-        raise ValueError(
-            "cake_rmsnorm_det_train_backward exports only the deterministic dw reduction"
-        )
     x, lead = _row_view(x, "x")
     nd = lead if len(lead) > 1 else None
     device = x.device
@@ -851,19 +850,18 @@ def cake_rmsnorm_det_train_backward(
 class CakeRMSNormDetFunction(torch.autograd.Function):
     """Autograd wrapper saving only ``(x_or_h_new, w, rstd)`` for the backward.
 
-    ``forward(x, w, eps, residual=None, deterministic=True)`` returns ``y`` or
-    ``(y, h_new)``.  In residual mode the gradient of ``x`` and of ``residual``
-    is the same tensor (``dx + g_h_new``).  The weight gradient is accumulated
-    in FP32 by the kernel and returned in ``w.dtype``.
+    ``forward(x, w, eps, residual=None)`` returns ``y`` or ``(y, h_new)``.  In
+    residual mode the gradient of ``x`` and of ``residual`` is the same tensor
+    (``dx + g_h_new``).  The weight gradient is accumulated in FP32 by the
+    kernel and returned in ``w.dtype``.
     """
 
     @staticmethod
-    def forward(ctx, x, w, eps, residual=None, deterministic=True):
+    def forward(ctx, x, w, eps, residual=None):
         outputs = cake_rmsnorm_det_train_forward(x, w, eps, residual=residual)
         y, rstd = outputs[0], outputs[1]
         normalized = outputs[2] if residual is not None else x
         ctx.save_for_backward(normalized, w, rstd)
-        ctx.deterministic = bool(deterministic)
         ctx.has_residual = residual is not None
         if residual is not None:
             return y, outputs[2]
@@ -878,15 +876,10 @@ class CakeRMSNormDetFunction(torch.autograd.Function):
         if grad_y is None:
             grad_y = torch.zeros_like(normalized)
         dx, dw = cake_rmsnorm_det_train_backward(
-            grad_y.to(torch.bfloat16),
-            normalized,
-            w,
-            rstd,
-            deterministic=ctx.deterministic,
-            g_residual=grad_h,
+            grad_y.to(torch.bfloat16), normalized, w, rstd, g_residual=grad_h
         )
         dw = dw if w.dtype == torch.float32 else dw.to(w.dtype)
-        return dx, dw, None, (dx if ctx.has_residual else None), None
+        return dx, dw, None, (dx if ctx.has_residual else None)
 
 
 def cake_rmsnorm_det(
@@ -894,7 +887,6 @@ def cake_rmsnorm_det(
     w: torch.Tensor,
     eps: float = 1e-6,
     residual: Optional[torch.Tensor] = None,
-    deterministic: bool = True,
 ):
     """Autograd-enabled fused BF16 RMSNorm (optionally with a fused residual add).
 
@@ -913,9 +905,6 @@ def cake_rmsnorm_det(
     residual : torch.Tensor, optional
         BF16 update of ``x``'s shape added to ``x`` before normalization.  When
         provided, the normalized input ``h_new`` is returned with the output.
-    deterministic : bool
-        Whether to use the deterministic fixed-order weight-gradient reduction.
-        Only ``True`` is supported; ``False`` is rejected during backward.
 
     Returns
     -------
@@ -925,7 +914,7 @@ def cake_rmsnorm_det(
         kernels of :func:`cake_rmsnorm_det_train_backward`.
     """
 
-    return CakeRMSNormDetFunction.apply(x, w, eps, residual, deterministic)
+    return CakeRMSNormDetFunction.apply(x, w, eps, residual)
 
 
 def _with_program_selection(doc: Optional[str], kind: str) -> str:
@@ -947,18 +936,6 @@ cake_rmsnorm_det_train_forward.__doc__ = _with_program_selection(
 cake_rmsnorm_det_train_backward.__doc__ = _with_program_selection(
     cake_rmsnorm_det_train_backward.__doc__, "bwd"
 )
-
-
-# The names before the det rename, the same objects as the det names of this backend package (not in __all__).
-CakeRMSNormFunction = CakeRMSNormDetFunction
-cake_rmsnorm = cake_rmsnorm_det
-cake_rmsnorm_train_backward = cake_rmsnorm_det_train_backward
-cake_rmsnorm_train_backward_workspace = cake_rmsnorm_det_train_backward_workspace
-cake_rmsnorm_train_backward_workspace_bytes = (
-    cake_rmsnorm_det_train_backward_workspace_bytes
-)
-cake_rmsnorm_train_forward = cake_rmsnorm_det_train_forward
-is_cake_rmsnorm_train_supported = is_cake_rmsnorm_det_train_supported
 
 
 __all__ = [

@@ -18,19 +18,21 @@ non-deterministic weight gradient (``flashinfer/cake_rmsnorm_train_backend``)
 and its deterministic sibling (``flashinfer/cake_rmsnorm_det_train_backend``),
 imported with flashinfer blocked (issues #6553, #7047, #8066).
 
-``deterministic=True`` (the default) runs the deterministic package, which this
-package imports lazily as its sibling (``from .. import``); ``deterministic=False``
-needs nothing outside this package.  So a consumer vendors the two packages
-under one parent package to keep the default, or this package alone for
-``deterministic=False`` only.
+This package never imports the deterministic package: a consumer vendors it
+alone.  Every entry point requires ``deterministic=False``; the default and
+``deterministic=True`` raise ``ValueError`` naming the deterministic package's
+entry point, with or without that package.  The pair under one parent serves
+the backend suites that compare against the deterministic package.
 
 * Device-free (``cpu_only``): both forms are copied (without ``aot/`` and
   ``__pycache__/``) and imported in a fresh ``python -I`` interpreter in which
   every ``flashinfer`` import raises: the pair under one parent (the
-  deterministic default reaches the vendored sibling), the lone copy (it
-  imports; a deterministic call raises ``RuntimeError`` naming the missing
-  package; a ``deterministic=False`` call reaches this package's own checks),
-  the lone deterministic copy; no ``flashinfer`` module is loaded.
+  ``deterministic=False`` call reaches this package's own checks and the
+  vendored sibling is never imported), the lone copy (it imports; the
+  ``deterministic=False`` call reaches this package's own checks; the default
+  and ``deterministic=True`` raise ``ValueError`` naming the deterministic
+  entry point), the lone deterministic copy; no ``flashinfer`` module is
+  loaded.
 * Device (opt-in, ``FLASHINFER_CAKE_VENDORED_SUITE=1``: it compiles both
   manifests with plain ``nvcc``, minutes): ``scripts/check_cake_build_manifests.py
   --vendored-gate`` builds both copies for the visible GPUs' architecture and
@@ -61,7 +63,7 @@ PARENT = "vendored_cake_rmsnorm"
 LONE = f"vendored_{NONDET}"
 LONE_DET = f"vendored_{DET}"
 # The backend suites run against the vendored pair, and the ones that do not
-# import the deterministic package, run against the lone copy.
+# compare against the deterministic package, run against the lone copy.
 PAIR_SUITES = (
     "tests/norm/test_cake_rmsnorm_train.py",
     "tests/norm/test_cake_rmsnorm_train_pairs.py",
@@ -177,10 +179,6 @@ _PAIR_CHECKS = (
     + f"""
 nd = importlib.import_module("{PARENT}.{NONDET}")
 check("pair: the copy is imported", lambda: None if os.path.realpath(nd.__file__).startswith(COPY) else 1 / 0)
-check(
-    "pair: deterministic=True reaches the vendored sibling",
-    lambda: None if nd._det_package().__name__ == "{PARENT}.{DET}" else 1 / 0,
-)
 check("pair: registry", lambda: None if nd.cake_jit.ARCHES == ("sm_100a", "sm_103a", "sm_107a") else 1 / 0)
 check("pair: manifest", lambda: None if nd.cake_build.manifest()["schema"] == "cake-build/1" else 1 / 0)
 check(
@@ -188,21 +186,40 @@ check(
     lambda: None if nd.cake_jit.program_windows("sm_100a", 512, "bwd", False, "bf16") else 1 / 0,
 )
 check(
-    "pair: no device -> unsupported (both modes)",
+    "pair: no device -> unsupported",
     lambda: None
     if not nd.is_cake_rmsnorm_train_supported(torch.device("cpu"), deterministic=False)
-    and not nd.is_cake_rmsnorm_train_supported(torch.device("cpu"))
     else 1 / 0,
 )
 check(
-    "pair: the default call runs the vendored det package (its CUDA check)",
-    lambda: raises(ValueError, lambda: nd.cake_rmsnorm_train_forward(x, w, 1e-6), "CUDA"),
+    "pair: the deterministic=False call runs this package (its CUDA check)",
+    lambda: raises(
+        ValueError,
+        lambda: nd.cake_rmsnorm_train_forward(x, w, 1e-6, deterministic=False),
+        "CUDA",
+    ),
 )
 check(
-    "pair: deterministic=False runs this package (its CUDA check)",
+    "pair: the default call names the deterministic entry point",
     lambda: raises(
-        ValueError, lambda: nd.cake_rmsnorm_train_forward(x, w, 1e-6, deterministic=False), "CUDA"
+        ValueError,
+        lambda: nd.cake_rmsnorm_train_forward(x, w, 1e-6),
+        "cake_rmsnorm_det_train_forward",
+        "pass deterministic=False for the non-deterministic path",
     ),
+)
+check(
+    "pair: deterministic=True names the deterministic entry point",
+    lambda: raises(
+        ValueError,
+        lambda: nd.cake_rmsnorm_train_forward(x, w, 1e-6, deterministic=True),
+        "cake_rmsnorm_det_train_forward",
+        "pass deterministic=False for the non-deterministic path",
+    ),
+)
+check(
+    "pair: the vendored sibling is never imported",
+    lambda: None if "{PARENT}.{DET}" not in sys.modules else 1 / 0,
 )
 check("pair: no flashinfer module", lambda: None if not leaked() else 1 / 0)
 results["leaked"] = leaked()
@@ -216,32 +233,46 @@ _LONE_CHECKS = (
 lone = importlib.import_module("{LONE}")
 check("lone: the copy is imported", lambda: None if os.path.realpath(lone.__file__).startswith(COPY) else 1 / 0)
 check(
-    "lone: _det_package names the missing package",
-    lambda: raises(RuntimeError, lone._det_package, "cake_rmsnorm_det_train_backend", "deterministic=False"),
-)
-check(
-    "lone: the default call raises naming the missing package",
+    "lone: the deterministic=False call runs this package (its CUDA check)",
     lambda: raises(
-        RuntimeError, lambda: lone.cake_rmsnorm_train_forward(x, w, 1e-6), "cake_rmsnorm_det_train_backend"
+        ValueError,
+        lambda: lone.cake_rmsnorm_train_forward(x, w, 1e-6, deterministic=False),
+        "CUDA",
     ),
 )
 check(
-    "lone: the default support query raises naming the missing package",
+    "lone: the deterministic=False backward runs this package (its CUDA check)",
     lambda: raises(
-        RuntimeError,
-        lambda: lone.is_cake_rmsnorm_train_supported(torch.device("cpu")),
-        "cake_rmsnorm_det_train_backend",
+        ValueError,
+        lambda: lone.cake_rmsnorm_train_backward(
+            x, x, w, torch.ones(4), deterministic=False
+        ),
+        "CUDA",
     ),
 )
 check(
-    "lone: deterministic=False runs this package (its CUDA check)",
+    "lone: the default call names the deterministic entry point",
     lambda: raises(
-        ValueError, lambda: lone.cake_rmsnorm_train_forward(x, w, 1e-6, deterministic=False), "CUDA"
+        ValueError,
+        lambda: lone.cake_rmsnorm_train_backward(x, x, w, torch.ones(4)),
+        "cake_rmsnorm_det_train_backward",
+        "pass deterministic=False for the non-deterministic path",
     ),
 )
 check(
-    "lone: deterministic=False support query",
-    lambda: None if not lone.is_cake_rmsnorm_train_supported(torch.device("cpu"), deterministic=False) else 1 / 0,
+    "lone: deterministic=True names the deterministic entry point",
+    lambda: raises(
+        ValueError,
+        lambda: lone.cake_rmsnorm_train_forward(x, w, 1e-6, deterministic=True),
+        "cake_rmsnorm_det_train_forward",
+        "pass deterministic=False for the non-deterministic path",
+    ),
+)
+check(
+    "lone: support query",
+    lambda: None
+    if not lone.is_cake_rmsnorm_train_supported(torch.device("cpu"), deterministic=False)
+    else 1 / 0,
 )
 det = importlib.import_module("{LONE_DET}")
 check(

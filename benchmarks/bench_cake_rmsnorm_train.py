@@ -13,11 +13,11 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Benchmark of the Cake BF16 RMSNorm training kernels with the opt-in
-non-deterministic weight gradient (``deterministic=False``) against the
-deterministic default (``deterministic=True``: the deterministic package's main
-kernel and its fixed-order ``dw`` reduction) wherever the deterministic package
-serves the shape.
+Benchmark of the Cake BF16 RMSNorm training kernels with the non-deterministic
+weight gradient (``flashinfer.cake_rmsnorm_train``, every call with
+``deterministic=False``) against the deterministic package
+(``flashinfer.cake_rmsnorm_det_train``: its main kernel and its fixed-order
+``dw`` reduction) wherever the deterministic package serves the shape.
 
 For every shape (hidden size, token count, residual flag, weight dtype) and
 mode the benchmark records:
@@ -32,7 +32,7 @@ mode the benchmark records:
   launch work; an eager step that does not capture the call pays the larger of
   host and GPU time).
 * Memory: the workspace bytes the mode documents for the shape; the peak and
-  retained ``torch.cuda.memory_allocated`` deltas of a default call (no output
+  retained ``torch.cuda.memory_allocated`` deltas of a plain call (no output
   buffers, no workspace), of a call with preallocated outputs and workspace,
   and of the autograd wrapper (what its forward keeps for the backward, and the
   backward's peak); and what a ``torch.utils.checkpoint(use_reentrant=False)``
@@ -58,6 +58,7 @@ import argparse
 import bisect
 import collections
 import datetime
+import functools
 import json
 import os
 import statistics
@@ -67,6 +68,13 @@ from typing import Callable, Optional
 import torch
 import torch.utils.checkpoint
 
+from flashinfer.cake_rmsnorm_det_train import (
+    cake_rmsnorm_det,
+    cake_rmsnorm_det_train_backward,
+    cake_rmsnorm_det_train_backward_workspace,
+    cake_rmsnorm_det_train_backward_workspace_bytes,
+    cake_rmsnorm_det_train_forward,
+)
 from flashinfer.cake_rmsnorm_train import (
     cake_rmsnorm,
     cake_rmsnorm_train_backward,
@@ -89,7 +97,28 @@ WIDTHS = (
 )
 EPS = {hidden: eps for hidden, eps in WIDTHS}
 ROWS = (256, 1024, 4096, 16384, 32768, 65536)
-MODES = (("det", True), ("nondet", False))
+# mode -> the entry points it measures: (forward, backward, workspace,
+# workspace bytes, autograd) of the deterministic package (no flag) and of this
+# package (each requires ``deterministic=False``).
+MODES = {
+    "det": (
+        cake_rmsnorm_det_train_forward,
+        cake_rmsnorm_det_train_backward,
+        cake_rmsnorm_det_train_backward_workspace,
+        cake_rmsnorm_det_train_backward_workspace_bytes,
+        cake_rmsnorm_det,
+    ),
+    "nondet": tuple(
+        functools.partial(entry, deterministic=False)
+        for entry in (
+            cake_rmsnorm_train_forward,
+            cake_rmsnorm_train_backward,
+            cake_rmsnorm_train_backward_workspace,
+            cake_rmsnorm_train_backward_workspace_bytes,
+            cake_rmsnorm,
+        )
+    ),
+}
 W_DTYPES = {"bf16": torch.bfloat16, "f32": torch.float32}
 PHASES = ("fwd", "bwd", "step")
 
@@ -308,7 +337,7 @@ def bench_mode(
     *,
     residual: bool,
     w_token: str,
-    deterministic: bool,
+    mode: str,
     device,
     iters: int,
     warmup: int,
@@ -319,13 +348,11 @@ def bench_mode(
 
     eps = EPS[hidden]
     x, w, g, u, g_h = _inputs(hidden, rows, residual, W_DTYPES[w_token], device)
-    kw = {"deterministic": deterministic}
+    forward, backward, workspace_for, workspace_bytes_for, autograd = MODES[mode]
     entry: dict = {"supported": True}
     try:
-        workspace_bytes = cake_rmsnorm_train_backward_workspace_bytes(
-            rows, hidden, device, residual=residual, **kw
-        )
-        cake_rmsnorm_train_forward(x, w, eps, residual=u, **kw)
+        workspace_bytes = workspace_bytes_for(rows, hidden, device, residual=residual)
+        forward(x, w, eps, residual=u)
     except (ValueError, RuntimeError) as exc:
         return {"supported": False, "reason": str(exc).splitlines()[0][:300]}
     y = torch.empty_like(x)
@@ -333,18 +360,14 @@ def bench_mode(
     h_new = torch.empty_like(x) if residual else None
     dx = torch.empty_like(x)
     dw = torch.empty(hidden, dtype=torch.float32, device=device)
-    workspace = cake_rmsnorm_train_backward_workspace(
-        rows, hidden, device, residual=residual, **kw
-    )
+    workspace = workspace_for(rows, hidden, device, residual=residual)
     normalized = h_new if residual else x
 
     def fwd():
-        return cake_rmsnorm_train_forward(
-            x, w, eps, residual=u, out=y, rstd=rstd, residual_out=h_new, **kw
-        )
+        return forward(x, w, eps, residual=u, out=y, rstd=rstd, residual_out=h_new)
 
     def bwd():
-        return cake_rmsnorm_train_backward(
+        return backward(
             g,
             normalized,
             w,
@@ -353,7 +376,6 @@ def bench_mode(
             workspace=workspace,
             dx=dx,
             dw=dw,
-            **kw,
         )
 
     try:
@@ -371,13 +393,9 @@ def bench_mode(
         "fwd": _host_time(fwd, host_runs),
         "bwd": _host_time(bwd, host_runs),
     }
-    fwd_peak, fwd_kept = _memory(
-        lambda: cake_rmsnorm_train_forward(x, w, eps, residual=u, **kw)
-    )
+    fwd_peak, fwd_kept = _memory(lambda: forward(x, w, eps, residual=u))
     bwd_peak, bwd_kept = _memory(
-        lambda: cake_rmsnorm_train_backward(
-            g, normalized, w, rstd, g_residual=g_h, **kw
-        )
+        lambda: backward(g, normalized, w, rstd, g_residual=g_h)
     )
     pre_peak, _pre_kept = _memory(bwd)
     xa = x.clone().requires_grad_(True)
@@ -385,7 +403,7 @@ def bench_mode(
     ua = u.clone().requires_grad_(True) if residual else None
     torch.cuda.synchronize()
     base = torch.cuda.memory_allocated()
-    outputs = cake_rmsnorm(xa, wa, eps, residual=ua, **kw)
+    outputs = autograd(xa, wa, eps, residual=ua)
     torch.cuda.synchronize()
     outputs_bytes = sum(
         t.numel() * t.element_size() for t in (outputs if residual else (outputs,))
@@ -403,7 +421,7 @@ def bench_mode(
     torch.cuda.synchronize()
     base = torch.cuda.memory_allocated()
     checkpointed = torch.utils.checkpoint.checkpoint(
-        lambda a, b, c: cake_rmsnorm(a, b, eps, residual=c, **kw),
+        lambda a, b, c: autograd(a, b, eps, residual=c),
         xc,
         wc,
         uc,
@@ -501,7 +519,7 @@ def report(paths: list[str]) -> tuple[list[dict], str]:
             "w_dtype": key[3],
             "form": next((r["form"] for r in records if r["mode"] == "nondet"), "-"),
         }
-        for mode, _flag in MODES:
+        for mode in MODES:
             mine = [r for r in records if r["mode"] == mode and r["supported"]]
             if not mine:
                 reasons = {r.get("reason", "") for r in records if r["mode"] == mode}
@@ -628,9 +646,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     device = torch.device("cuda", torch.cuda.current_device())
     if not is_cake_rmsnorm_train_supported(device, deterministic=False):
-        raise SystemExit(
-            "cake_rmsnorm_train(deterministic=False) has no exported route on this device"
-        )
+        raise SystemExit("cake_rmsnorm_train has no exported route on this device")
     meta = _meta(device, args.session)
     plans = [
         (hidden, rows, False, w_token)
@@ -649,13 +665,13 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(f"H={hidden}: no exported non-deterministic route, skipped")
             continue
         form = _form(device, hidden, rows, residual, w_token)
-        for mode, deterministic in MODES:
+        for mode in MODES:
             entry = bench_mode(
                 hidden,
                 rows,
                 residual=residual,
                 w_token=w_token,
-                deterministic=deterministic,
+                mode=mode,
                 device=device,
                 iters=args.iters,
                 warmup=args.warmup,

@@ -1502,7 +1502,8 @@ def test_argument_validation(hidden: int) -> None:
     y_odd_ref, _, _ = _reference_forward(odd_view, w, eps)
     _assert_bf16_close(y_odd, y_odd_ref, "y odd row stride")
     y, rstd = cake_rmsnorm_det_train_forward(x, w, eps)
-    with pytest.raises(ValueError):
+    # The det package takes no ``deterministic`` keyword.
+    with pytest.raises(TypeError, match="unexpected keyword argument 'deterministic'"):
         cake_rmsnorm_det_train_backward(y, x, w, rstd, deterministic=False)
     with pytest.raises(ValueError):
         cake_rmsnorm_det_train_backward(y, x, w, rstd.double())
