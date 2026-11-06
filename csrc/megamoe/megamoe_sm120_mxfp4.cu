@@ -72,13 +72,16 @@ static void sm120_launch(s::Args& a, int dev, cudaStream_t stream) {
 void megamoe_sm120_mxfp4_fused(
     tvm::ffi::TensorView y, tvm::ffi::TensorView symm_buffer,
     tvm::ffi::Array<int64_t> symm_buffer_ptrs, int64_t rank_idx, tvm::ffi::TensorView l1_weights,
-    tvm::ffi::TensorView l2_weights, tvm::ffi::Array<int64_t> offsets,
-    tvm::ffi::Array<int64_t> dims, int64_t num_tokens, double activation_clamp,
+    tvm::ffi::TensorView l2_weights, tvm::ffi::TensorView l1_scales, tvm::ffi::TensorView l2_scales,
+    tvm::ffi::Array<int64_t> offsets, tvm::ffi::Array<int64_t> dims, int64_t num_tokens,
+    double activation_clamp,
     tvm::ffi::Optional<tvm::ffi::TensorView> cumulative_local_expert_recv_stats,
     tvm::ffi::Optional<tvm::ffi::TensorView> l1_global_scales,
     tvm::ffi::Optional<tvm::ffi::TensorView> l2_global_scales, tvm::ffi::Array<int64_t> gin,
     int64_t tokens_per_item) {
   // dims: [num_experts, num_topk, hidden, intermediate_hidden, num_max_tokens_per_rank]
+  // l1/l2_weights: row-major packed E2M1 [EL][2I][H/2] / [EL][H][I/2] (the cake / cutedsl layout);
+  // l1/l2_scales: [EL][bytes] UE8M0 words per 16-row block and K128
   // gin: [] (every pair P2P) or [device ncclDevComm*, ncclWindow_t, GIN rank mask, GIN contexts]
   TVM_FFI_ICHECK_EQ(offsets.size(), kNumSm120Offsets);
   TVM_FFI_ICHECK_EQ(dims.size(), 5);
@@ -100,10 +103,16 @@ void megamoe_sm120_mxfp4_fused(
   a.out = static_cast<__nv_bfloat16*>(y.data_ptr());
   a.l1 = static_cast<const uint8_t*>(l1_weights.data_ptr());
   a.l2 = static_cast<const uint8_t*>(l2_weights.data_ptr());
-  a.l1_stride = static_cast<size_t>(l1_weights.size(1));
-  a.l2_stride = static_cast<size_t>(l2_weights.size(1));
-  a.l1_w_bytes = static_cast<size_t>(2 * inter) * hidden / 2;
-  a.l2_w_bytes = static_cast<size_t>(hidden) * inter / 2;
+  a.l1s = static_cast<const uint8_t*>(l1_scales.data_ptr());
+  a.l2s = static_cast<const uint8_t*>(l2_scales.data_ptr());
+  a.l1_stride = static_cast<size_t>(2 * inter) * hidden / 2;
+  a.l2_stride = static_cast<size_t>(hidden) * inter / 2;
+  a.l1s_stride = a.l1_stride / 16;
+  a.l2s_stride = a.l2_stride / 16;
+  TVM_FFI_ICHECK_EQ(l1_weights.numel(), int64_t(experts / world) * int64_t(a.l1_stride));
+  TVM_FFI_ICHECK_EQ(l2_weights.numel(), int64_t(experts / world) * int64_t(a.l2_stride));
+  TVM_FFI_ICHECK_EQ(l1_scales.numel(), int64_t(experts / world) * int64_t(a.l1s_stride));
+  TVM_FFI_ICHECK_EQ(l2_scales.numel(), int64_t(experts / world) * int64_t(a.l2s_stride));
   auto opt = [](const tvm::ffi::Optional<tvm::ffi::TensorView>& t) -> void* {
     return t.has_value() ? t.value().data_ptr() : nullptr;
   };

@@ -22,9 +22,15 @@
 //
 // Compute core: mma.sync.aligned.m16n8k32.kind::mxf8f6f4.block_scale (E2M1 weights as A, E4M3
 // activations as B, UE8M0 scales per 32 on both): 16 weight rows x 8 tokens per MMA, weights loaded
-// global -> registers in a lane-fragment layout (flashinfer.moe_ep SM120 mxfp4_mxfp8_bf16_nosync
-// backend, weights.py). FC1 rows are interleaved per 16-row block (gate rows 8b..8b+7, then up rows
-// 8b..8b+7), so each SwiGLU pair lands in one thread.
+// global -> registers from the row-major packed E2M1 layout the sibling moe_ep SM120 backends
+// (cake, cutedsl) use, so a layer can share one weight copy with them: [rows][K/2] bytes, element
+// 2i in the low nibble of byte i, FC1 rows interleaved per 16-row block (gate rows 8b..8b+7, then
+// up rows 8b..8b+7) so each SwiGLU pair lands in one thread. Within each 32-wide scale block the K
+// order is permuted (MMA k = 16p + 4c + j reads element 8c + 4p + j, for both operands), so lane c
+// needs weight bytes 4c..4c+3 of each row and block and activation bytes 8c..8c+7. Each lane loads
+// 16 contiguous bytes (one block) of a row per K128, coalesced, and the four lanes of a quad
+// exchange words with a 4x4 shuffle transpose. The UE8M0 weight scales are a separate per-expert
+// array (mxfp4_mxfp8_bf16_nosync/weights.py).
 //
 // Every spin wait times out and records an error code in the counter block instead of hanging the
 // GPU; the last CTA to exit resets the per-call counters and advances the epoch (CUDA-graph replay
@@ -70,6 +76,10 @@ constexpr int kNbPerWarp = 1;                           // 16-row weight blocks 
 constexpr int kRowsPerItem = kWarps * kNbPerWarp * 16;  // 128 weight rows per work item
 constexpr int kTile = 8;  // tokens per MMA (N); a work item covers kTileN = 8, 16, 24 or 32 tokens
 constexpr int kPfBytes = 8192;  // per 16-row weight block, prefetched to L2 during dispatch
+// row-major weights: each warp also prefetches its 16 rows this many bytes ahead of its loads, so
+// DRAM sees longer runs per row than 16 interleaved 64-byte reads (RTX 6000D, cold L2: 128 B ahead
+// was best of 0 / 128 / 256 / 512 / 1024 B; without it the shared layout was 25-30% slower)
+constexpr int kPfAhead = 128;
 constexpr size_t kPf0Bytes = size_t(64)
                              << 20;  // t=0 L2 prefetch budget over the locally known experts
 constexpr int kUnroll = 4;           // K64 steps in flight per warp
@@ -136,9 +146,11 @@ struct Args {
   const int64_t* topk_ids;  // [T][TOPK] global expert ids, -1 = masked route
   const float* topk_w;      // [T][TOPK]
   __nv_bfloat16* out;       // [T][H]
-  const uint8_t* l1;        // [EL][l1_stride]: packed W13 (l1_w_bytes) then its scale words
-  const uint8_t* l2;        // [EL][l2_stride]: packed W2 (l2_w_bytes) then its scale words
-  size_t l1_stride, l1_w_bytes, l2_stride, l2_w_bytes;
+  const uint8_t* l1;        // [EL][2I][H/2] packed E2M1 W13, row-major, gate/up rows interleaved
+  const uint8_t* l2;        // [EL][H][I/2] packed E2M1 W2, row-major
+  const uint8_t* l1s;       // [EL][2I/16][H/128][16] UE8M0 x4 words of W13
+  const uint8_t* l2s;       // [EL][H/16][I/128][16] UE8M0 x4 words of W2
+  size_t l1_stride, l2_stride, l1s_stride, l2s_stride;  // bytes per expert
   const float *gs1, *gs2;      // optional [EL] per-expert FC1 / FC2 output multipliers
   int* stats;                  // optional [EL] cumulative received-token counts
   uint8_t* inter;              // [EL][W*TCAP][I] e4m3 (local)
@@ -151,17 +163,17 @@ struct Args {
   float swiglu_limit;
 };
 
-__device__ __forceinline__ const uint4* w13_of(const Args& a, int el) {
-  return reinterpret_cast<const uint4*>(a.l1 + size_t(el) * a.l1_stride);
+__device__ __forceinline__ const uint8_t* w13_of(const Args& a, int el) {
+  return a.l1 + size_t(el) * a.l1_stride;
 }
 __device__ __forceinline__ const uint32_t* ws13_of(const Args& a, int el) {
-  return reinterpret_cast<const uint32_t*>(a.l1 + size_t(el) * a.l1_stride + a.l1_w_bytes);
+  return reinterpret_cast<const uint32_t*>(a.l1s + size_t(el) * a.l1s_stride);
 }
-__device__ __forceinline__ const uint4* w2_of(const Args& a, int el) {
-  return reinterpret_cast<const uint4*>(a.l2 + size_t(el) * a.l2_stride);
+__device__ __forceinline__ const uint8_t* w2_of(const Args& a, int el) {
+  return a.l2 + size_t(el) * a.l2_stride;
 }
 __device__ __forceinline__ const uint32_t* ws2_of(const Args& a, int el) {
-  return reinterpret_cast<const uint32_t*>(a.l2 + size_t(el) * a.l2_stride + a.l2_w_bytes);
+  return reinterpret_cast<const uint32_t*>(a.l2s + size_t(el) * a.l2s_stride);
 }
 
 __device__ __forceinline__ uint64_t gtime() {
@@ -244,45 +256,90 @@ __device__ __forceinline__ void mma_w4a8(float (&d)[4], const uint32_t (&a)[4], 
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(sfa), "h"(byte_a),
         "h"(uint16_t{0}), "r"(sfb), "h"(byte_b), "h"(uint16_t{0}));
 }
-__device__ __forceinline__ void expand(uint32_t w, uint32_t& lo, uint32_t& hi) {
-  lo = (w & 0x0F0F0F0Fu) << 2;
-  hi = (w >> 2) & 0x3C3C3C3Cu;
+// 4x4 word transpose across the lanes of a quad: v[q] of lane c becomes v[c] of lane q
+__device__ __forceinline__ void quad_transpose(uint32_t (&v)[4], int c) {
+#pragma unroll
+  for (int m = 2; m >= 1; m >>= 1) {
+    const bool hi = (c & m) != 0;
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+      if (q & m) continue;
+      const uint32_t r = __shfl_xor_sync(0xffffffffu, hi ? v[q] : v[q | m], m);
+      if (hi)
+        v[q] = r;
+      else
+        v[q | m] = r;
+    }
+  }
 }
 
-// warp GEMM over one 256-row item: acc[j][h] = rows (nb0+j)*16 + {g, g+8}, cols = tokens
-// 8h + 2c, 8h + 2c + 1. xrow[h]: this lane's token 8h + g (e4m3, K bytes), xsrow[h]: its ue8m0 x4
-// words (K/128). The NH token groups share every weight fragment load.
-// [kc_begin, kc_end) restricts K to a range of K64 chunks (split-K); both multiples of kUnroll (and
-// of 2 for scales).
+// 4 consecutive E2M1 nibbles (one 16-bit half of w, low nibble first) -> 4 bytes, each holding its
+// value in bits 5..2 as the mxf8f6f4 E2M1 operand expects
+__device__ __forceinline__ uint32_t spread4(uint32_t w, uint32_t half_selector) {
+  const uint32_t t = __byte_perm(w, 0u, half_selector);  // 0x00 b1 0x00 b0 of the chosen half
+  return ((t & 0x000F000Fu) << 2) | ((t & 0x00F000F0u) << 6);
+}
+
+// warp GEMM over one item: acc[j][h] = rows (nb0+j)*16 + {g, g+8}, cols = tokens 8h + 2c,
+// 8h + 2c + 1. W: row-major packed E2M1 [rows][K/2]; WS: UE8M0 x4 words per 16-row block and K128.
+// xrow[h]: this lane's token 8h + g (e4m3, K bytes), xsrow[h]: its ue8m0 x4 words (K/128). The NH
+// token groups share every weight load. Lane c loads block c of each K128 of rows g and g + 8 and
+// the quad transposes, so lane c holds weight bytes 4c..4c+3 (elements 8c..8c+7) of every block,
+// and reads activation bytes 8c..8c+7: the same K permutation on both operands (file comment).
+// [kc_begin, kc_end) restricts K to a range of K64 chunks (split-K); both multiples of kUnroll.
 template <int NH>
-__device__ __forceinline__ void item_gemm(float (&acc)[kNbPerWarp][NH][4], const uint4* W,
+__device__ __forceinline__ void item_gemm(float (&acc)[kNbPerWarp][NH][4], const uint8_t* W,
                                           const uint32_t* WS, int nblocks, int nb0, int K,
                                           const uint8_t* const (&xrow)[NH],
                                           const uint32_t* const (&xsrow)[NH], int lane,
                                           int kc_begin = 0, int kc_end = -1) {
   const int g = lane / 4, c = lane % 4;
   const int kch = K / 64, kq = K / 128;
-  const uint4* wp[kNbPerWarp];
+  const uint4* wp[kNbPerWarp][2];  // rows g, g + 8 of block nb0 + j, at this lane's 16 bytes
   const uint32_t* sp[kNbPerWarp];
 #pragma unroll
   for (int j = 0; j < kNbPerWarp; ++j) {
-    wp[j] = W + size_t(nb0 + j) * kch * 32 + lane;
+#pragma unroll
+    for (int r = 0; r < 2; ++r)
+      wp[j][r] =
+          reinterpret_cast<const uint4*>(W + size_t((nb0 + j) * 16 + g + 8 * r) * (K / 2)) + c;
     sp[j] = WS + size_t(nb0 + j) * kq * 16 + g + (lane & 1) * 8;
   }
-  const uint32_t* xp[NH];
+  const uint2* xp[NH];
 #pragma unroll
-  for (int h = 0; h < NH; ++h) xp[h] = reinterpret_cast<const uint32_t*>(xrow[h]) + c;
+  for (int h = 0; h < NH; ++h) xp[h] = reinterpret_cast<const uint2*>(xrow[h]) + c;
 #pragma unroll
   for (int j = 0; j < kNbPerWarp; ++j)
 #pragma unroll
     for (int h = 0; h < NH; ++h) acc[j][h][0] = acc[j][h][1] = acc[j][h][2] = acc[j][h][3] = 0.f;
   if (kc_end < 0) kc_end = kch;
+  // lanes 0..15 prefetch row lane of the block kPfAhead bytes ahead, one 128-byte line (an
+  // iteration's K256) per iteration
+  const char* pf = reinterpret_cast<const char*>(W) + size_t(nb0 * 16 + (lane & 15)) * (K / 2);
   for (int k0 = kc_begin; k0 < kc_end; k0 += kUnroll) {
-    uint4 wv[kNbPerWarp][kUnroll];
+    if (kPfAhead > 0 && lane < 16 && k0 * 32 + kPfAhead < K / 2)
+      asm volatile("prefetch.global.L2 [%0];" ::"l"(pf + k0 * 32 + kPfAhead));
+    uint32_t wv[kNbPerWarp][kUnroll][2][2];  // [block][K64 chunk][step][row g / g + 8]
+    {
+      uint4 wq[kNbPerWarp][kUnroll / 2][2];  // [block][K128 chunk][row]: this lane's 32-block
 #pragma unroll
-    for (int u = 0; u < kUnroll; ++u)
+      for (int p = 0; p < kUnroll / 2; ++p)
 #pragma unroll
-      for (int j = 0; j < kNbPerWarp; ++j) wv[j][u] = __ldcs(wp[j] + (k0 + u) * 32);
+        for (int j = 0; j < kNbPerWarp; ++j)
+#pragma unroll
+          for (int r = 0; r < 2; ++r) wq[j][p][r] = __ldcs(wp[j][r] + (k0 / 2 + p) * 4);
+#pragma unroll
+      for (int p = 0; p < kUnroll / 2; ++p)
+#pragma unroll
+        for (int j = 0; j < kNbPerWarp; ++j)
+#pragma unroll
+          for (int r = 0; r < 2; ++r) {
+            uint32_t v[4] = {wq[j][p][r].x, wq[j][p][r].y, wq[j][p][r].z, wq[j][p][r].w};
+            quad_transpose(v, c);  // v[b]: bytes 4c..4c+3 of 32-block b of this K128
+#pragma unroll
+            for (int b = 0; b < 4; ++b) wv[j][p * 2 + b / 2][b % 2][r] = v[b];
+          }
+    }
     uint32_t sfa[kNbPerWarp][(kUnroll + 1) / 2];
 #pragma unroll
     for (int q = 0; q < (kUnroll + 1) / 2; ++q)
@@ -298,17 +355,17 @@ __device__ __forceinline__ void item_gemm(float (&acc)[kNbPerWarp][NH][4], const
       for (int s = 0; s < 2; ++s) {
         const int step = kc * 2 + s;
         const uint16_t sel = uint16_t(step & 3);
+        uint2 b[NH];
+#pragma unroll
+        for (int h = 0; h < NH; ++h) b[h] = xp[h][step * 4];
 #pragma unroll
         for (int j = 0; j < kNbPerWarp; ++j) {
-          const uint32_t w0 = s ? wv[j][u].z : wv[j][u].x;
-          const uint32_t w1 = s ? wv[j][u].w : wv[j][u].y;
-          uint32_t a[4];
-          expand(w0, a[0], a[1]);
-          expand(w1, a[2], a[3]);
+          const uint32_t wg = wv[j][u][s][0], wg8 = wv[j][u][s][1];
+          const uint32_t a[4] = {spread4(wg, 0x4140u), spread4(wg8, 0x4140u), spread4(wg, 0x4342u),
+                                 spread4(wg8, 0x4342u)};
 #pragma unroll
           for (int h = 0; h < NH; ++h)
-            mma_w4a8(acc[j][h], a, xp[h][step * 8], xp[h][step * 8 + 4], sfa[j][u / 2], sel, sfb[h],
-                     sel);
+            mma_w4a8(acc[j][h], a, b[h].x, b[h].y, sfa[j][u / 2], sel, sfb[h], sel);
         }
       }
     }
@@ -434,7 +491,7 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
     const unsigned long long known = s_known;
     const int nk = __popcll(known);
     if (nk > 0) {
-      const size_t per = min(a.l1_w_bytes, kPf0Bytes / nk) & ~size_t(127);
+      const size_t per = min(a.l1_stride, kPf0Bytes / nk) & ~size_t(127);
       const size_t lines = per / 128 * nk;
       for (size_t l = size_t(blockIdx.x) * blockDim.x + threadIdx.x; l < lines;
            l += size_t(gridDim.x) * blockDim.x) {
@@ -672,7 +729,7 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
 #pragma unroll
       for (int jb = 0; jb < kNbPerWarp; ++jb) {
         const char* base =
-            reinterpret_cast<const char*>(w13_of(a, el) + size_t(nb0 + jb) * (H / 64) * 32);
+            reinterpret_cast<const char*>(w13_of(a, el) + size_t(nb0 + jb) * 16 * (H / 2));
         for (int off = lane * 128; off < min(kPfBytes, blk_bytes); off += 32 * 128)
           asm volatile("prefetch.global.L2 [%0];" ::"l"(base + off));
       }

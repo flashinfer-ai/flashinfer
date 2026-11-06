@@ -265,8 +265,7 @@ class NosyncWorkspace:
     def launch(
         self,
         y: torch.Tensor,
-        w13: torch.Tensor,
-        w2: torch.Tensor,
+        weights: Any,
         num_tokens: int,
         swiglu_limit: float,
         tokens_per_item: int | None,
@@ -276,8 +275,10 @@ class NosyncWorkspace:
             self.buffer,
             self.peer_ptrs,
             self.rank,
-            w13,
-            w2,
+            weights.w13,
+            weights.w2,
+            weights.w13_scale,
+            weights.w2_scale,
             self.offsets,
             [
                 self.num_experts,

@@ -1,11 +1,13 @@
-"""SM120 MXFP4 x MXFP8 nosync MegaMoE (moe_ep backend ``sm120_mxfp4_mxfp8_bf16_nosync``) through
-``MoEEpLayer`` against a dense reference with the kernel's numerics.
+"""SM120 MXFP4 x MXFP8 nosync MegaMoE (moe_ep backend ``sm120_mxfp4_mxfp8_bf16_nosync``) as the
+small-batch option of ``MoEEpLayer``: the configured backend (cake, or cutedsl) is built as
+usual, ``nosync=NosyncOptions(...)`` adds the nosync kernel.
 
-``stage_inputs`` quantizes the BF16 activations to MXFP8 (E4M3, one power-of-two scale per 32
-channels, 2**ceil(log2(amax / 448))); the kernel quantizes the clamped SwiGLU output the same way
-and applies the routing weight to each expert's BF16 output in the top-k combine. The reference
-follows those rules; it also reports the error of both against an unquantized-intermediate
-reference.
+Calls of up to ``NosyncOptions.max_tokens_per_rank`` tokens per rank run the nosync kernel and are checked
+against a dense reference with its numerics: ``stage_inputs`` quantizes the BF16 activations to
+MXFP8 (E4M3, one power-of-two scale per 32 channels, 2**ceil(log2(amax / 448))); the kernel
+quantizes the clamped SwiGLU output the same way and applies the routing weight to each expert's
+BF16 output in the top-k combine. Larger calls run the configured backend and must match a layer
+built without the option, bit for bit.
 
 Run with plain Python (workers are spawned here):
     python tests/moe_ep/test_moe_ep_sm120_w4a8_nosync_mega.py --ep 4 --tokens 1 8 20 64
@@ -103,37 +105,43 @@ def _rel(a, b):
     ).item()
 
 
-def _layer(args, rank, experts, raw1, raw2, backend="nosync"):
+def _fallback_config(args):
+    if args.fallback == "cake":
+        from flashinfer.moe_ep import (
+            Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig as Config,
+        )
+
+        transport = os.environ.get(
+            "FLASHINFER_TEST_SM120_CAKE_TRANSPORT",
+            "all_gin" if args.ep > 4 else "all_lsa",
+        )
+        return Config(
+            intermediate_size=args.intermediate,
+            top_k=args.topk,
+            swiglu_limit=10,
+            transport_table=transport,
+        )
+    from flashinfer.moe_ep import Sm120_Mxfp4_Mxfp8_Bf16_Cutedsl_MegaMoeConfig as Config
+
+    return Config(
+        intermediate_size=args.intermediate,
+        top_k=args.topk,
+        gate_up_clamp=10.0,
+        # the default dual-N8 tail reclaim hangs at small buckets on this GPU class
+        knobs={"k2_tail_reclaim": False},
+    )
+
+
+def _layer(args, rank, experts, raw1, raw2, nosync=True):
     from flashinfer.moe_ep import (
         BootstrapConfig,
         FleetParams,
         MegaConfig,
         MoEEpLayer,
+        NosyncOptions,
         PrequantizedMoEWeights,
     )
 
-    if backend == "nosync":
-        from flashinfer.moe_ep import (
-            Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig as Config,
-        )
-
-        config = Config(
-            intermediate_size=args.intermediate,
-            top_k=args.topk,
-            transport=args.transport,
-            tokens_per_item=args.tokens_per_item,
-        )
-    else:
-        from flashinfer.moe_ep import (
-            Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig as Config,
-        )
-
-        config = Config(
-            intermediate_size=args.intermediate,
-            top_k=args.topk,
-            swiglu_limit=10,
-            transport_table="all_lsa",
-        )
     return MoEEpLayer(
         bootstrap=BootstrapConfig(
             world_size=args.ep,
@@ -152,9 +160,19 @@ def _layer(args, rank, experts, raw1, raw2, backend="nosync"):
             w13_scale=raw1[1].view(torch.float8_e8m0fnu),
             w2_scale=raw2[1].view(torch.float8_e8m0fnu),
         ),
+        # configured as without the option
         backend=MegaConfig(
-            megakernel=config, quantize_input=True, preprocess_weights=True
+            megakernel=_fallback_config(args),
+            quantize_input=True,
+            preprocess_weights=True,
         ),
+        nosync=NosyncOptions(
+            max_tokens_per_rank=args.threshold,
+            transport=args.transport,
+            tokens_per_item=args.tokens_per_item,
+        )
+        if nosync
+        else None,
     )
 
 
@@ -206,26 +224,41 @@ def _worker(rank, args):
     raw1, ref1 = _weights(epr, ih * 2, h, generator)
     raw2, ref2 = _weights(epr, h, ih, generator)
     layer = _layer(args, rank, experts, raw1, raw2)
-    cake = _layer(args, rank, experts, raw1, raw2, "cake") if args.vs_cake else None
+    # the configured backend alone, on the same weights: large calls must match it bit for bit,
+    # small calls agree with it up to the intermediate-quantization recipe
+    alone = _layer(args, rank, experts, raw1, raw2, nosync=False)
+    assert layer.nosync is not None, "the nosync kernel must be on for these shapes"
     for m_all in args.tokens:
         # uneven: ranks stage different row counts in the same call, one rank none
         m = (m_all, 0, max(m_all // 2, 1), 1)[rank % 4] if args.uneven else m_all
+        nosync = m_all <= args.threshold  # m_all is the largest row count of any rank
         x = torch.randn(m, h, device="cuda", generator=generator, dtype=torch.bfloat16)
         idx, routing = _routing(args, m, experts, topk, generator)
         ref_idx = _effective_routes(idx, experts)
-        expected = _reference(
-            x.float(), ref_idx, routing, ref1, ref2, rank, epr, args.capacity
-        )
-        exact = _reference(
-            x.float(), ref_idx, routing, ref1, ref2, rank, epr, args.capacity, False
-        )
         t = MoEEpTensors(hidden_states=x, topk_ids=idx, topk_weights=routing)
+        # cake alone hangs on hot routing from 96 tokens per rank (EP4); compare where it runs
+        with_alone = not (args.routing == "hot" and m_all > 64)
+        y_alone = alone.forward(t) if with_alone else None
+        torch.cuda.synchronize()
+        if nosync:
+            expected = _reference(
+                x.float(), ref_idx, routing, ref1, ref2, rank, epr, args.capacity
+            )
+            exact = _reference(
+                x.float(), ref_idx, routing, ref1, ref2, rank, epr, args.capacity, False
+            )
         for repetition in range(args.repeats):
             y = layer.forward(t)
             torch.cuda.synchronize()
-            assert layer._kernel.protocol_error(layer._workspace) == 0
+            assert layer.last_call_nosync == nosync, (m_all, nosync)
+            if nosync:
+                assert layer.nosync._kernel.protocol_error(layer.nosync._workspace) == 0
             assert y.shape == (m, h) and torch.isfinite(y).all()
-            if args.routing == "empty":
+            if not nosync:
+                assert torch.equal(y, y_alone), (
+                    "large calls must match the configured backend"
+                )
+            elif args.routing == "empty":
                 assert not y.any(), (
                     "a token with every route masked must come back zero"
                 )
@@ -236,65 +269,69 @@ def _worker(rank, args):
                 first = y.clone()
             else:
                 assert torch.equal(y, first), "workspace reuse changed the output"
-        # pre-quantized activations (quantize_input=False contract): the same bits
-        codes, exponents = quantize_activations_k32(x)
-        layer._kernel.stage_inputs(
-            MoEEpTensors(
-                hidden_states=codes.view(torch.float8_e4m3fn),
-                topk_ids=idx,
-                topk_weights=routing,
-                scales=exponents.view(torch.float8_e8m0fnu),
-            ),
-            layer._workspace,
-            quantize_input=False,
-        )
-        y = layer._kernel.compute(
-            layer._workspace, layer._get_transformed_weights(), output=None
-        )
-        torch.cuda.synchronize()
-        assert torch.equal(y, first), "pre-quantized staging changed the output"
-        # CUDA graph: staging (quantization included) and the kernel
+        if nosync:
+            # pre-quantized activations (quantize_input=False): the same bits
+            codes, exponents = quantize_activations_k32(x)
+            kernel, ws = layer.nosync._kernel, layer.nosync._workspace
+            kernel.set_compile_tokens_per_rank(ws, m_all)
+            kernel.stage_inputs(
+                MoEEpTensors(
+                    hidden_states=codes.view(torch.float8_e4m3fn),
+                    topk_ids=idx,
+                    topk_weights=routing,
+                    scales=exponents.view(torch.float8_e8m0fnu),
+                ),
+                ws,
+                quantize_input=False,
+            )
+            y = kernel.compute(ws, layer.nosync._get_transformed_weights(), output=None)
+            torch.cuda.synchronize()
+            assert torch.equal(y, first), "pre-quantized staging changed the output"
+        # CUDA graph at this call's token bound: staging (quantization included) and the kernel
         out = layer.output_buffer
+        # eager at the same bound first (cutedsl compiles per bucket before capture)
+        layer.stage_inputs(t, compile_tokens_per_rank=m_all)
+        layer.compute_staged(output=out)
+        torch.cuda.synchronize()
+        assert torch.equal(out[:m], first), "the bounded call changed the output"
         dist.barrier()
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            layer.stage_inputs(t, compile_tokens_per_rank=args.capacity)
+            layer.stage_inputs(t, compile_tokens_per_rank=m_all)
             layer.compute_staged(output=out)
+        assert layer.last_call_nosync == nosync
         for _ in range(args.repeats):
             out.zero_()
             graph.replay()
             torch.cuda.synchronize()
             assert torch.equal(out[:m], first), "CUDA graph replay changed the output"
         del graph
-        rel = 0.0 if args.routing == "empty" or not m else _rel(first, expected)
-        rel_exact = 0.0 if args.routing == "empty" or not m else _rel(first, exact)
-        rel_cake = 0.0
-        if cake is not None:
-            y_cake = cake.forward(t)
-            torch.cuda.synchronize()
-            if m and args.routing != "empty":
-                # cake applies the routing weight before quantizing the SwiGLU output, this backend
-                # after FC2 (in the combine): the two differ by that rounding (4-5% here), and each
-                # stays as close to the unquantized reference as the MXFP8 recipe allows
-                rel_cake = _rel(first, y_cake)
-                assert rel_cake < 6e-2, (m, rel_cake)
-                assert _rel(y_cake, exact) < 8e-2 and _rel(first, exact) < 8e-2
-        metrics = torch.tensor([rel, rel_exact, rel_cake], device="cuda")
+        live = m and args.routing != "empty"
+        rel = _rel(first, expected) if nosync and live else 0.0
+        rel_exact = _rel(first, exact) if nosync and live else 0.0
+        rel_alone = _rel(first, y_alone) if live and with_alone else 0.0
+        if nosync and live and with_alone and args.routing != "invalid":
+            # (invalid ids: each backend masks them its own way; the reference check above holds)
+            # cake applies the routing weight before quantizing the SwiGLU output, this kernel
+            # after FC2: the two differ by that rounding (4-5% at a few tokens and more, up to ~7%
+            # at one token)
+            assert rel_alone < 1e-1, (m, rel_alone)
+            assert _rel(y_alone, exact) < 1e-1 and rel_exact < 1e-1
+        metrics = torch.tensor([rel, rel_exact, rel_alone], device="cuda")
         dist.all_reduce(metrics, op=dist.ReduceOp.MAX)
         if rank == 0:
             print(
                 f"PASS sm120 nosync EP{ep} M={m_all}{' uneven' if args.uneven else ''} "
-                f"routing={args.routing} transport={args.transport} "
-                f"relative_l2={metrics[0].item():.3g} "
-                f"vs_unquantized_intermediate={metrics[1].item():.3g}"
-                + (f" vs_cake={metrics[2].item():.3g}" if cake is not None else "")
-                + " reuse/prequantized/graph=exact",
+                f"routing={args.routing} kernel={'nosync' if nosync else args.fallback} "
+                f"transport={args.transport} relative_l2={metrics[0].item():.3g} "
+                f"vs_unquantized_intermediate={metrics[1].item():.3g} "
+                f"vs_{args.fallback}={metrics[2].item():.3g} "
+                "reuse/prequantized/graph=exact",
                 flush=True,
             )
     layer.destroy()
-    if cake is not None:
-        cake.destroy()
+    alone.destroy()
     dist.destroy_process_group()
 
 
@@ -312,13 +349,14 @@ def _args(**overrides):
         experts=256,
         topk=6,
         capacity=128,
+        threshold=128,
         tokens=[1, 8, 20, 64, 128],
         routing="random",
         repeats=2,
         transport="p2p",
         tokens_per_item=None,
         uneven=False,
-        vs_cake=False,
+        fallback="cake",
     )
     args.update(overrides)
     return argparse.Namespace(**args)
@@ -328,6 +366,11 @@ def _sm120_gpus(n):
     return torch.cuda.device_count() >= n and all(
         torch.cuda.get_device_capability(i) == (12, 0) for i in range(n)
     )
+
+
+# cutedsl's FlashInfer shim needs NVSHMEM and does not capture on every SM120 SKU (RTX 6000D);
+# opt in where it runs.
+_CUTEDSL = os.environ.get("FLASHINFER_TEST_SM120_CUTEDSL") == "1"
 
 
 @pytest.mark.parametrize("ep", [2, 4, 8])
@@ -345,19 +388,29 @@ def test_sm120_nosync_skewed_routing(routing):
     _run(_args(routing=routing, repeats=3))
 
 
-def test_sm120_nosync_uneven_rows():
-    """Ranks stage different row counts in the same call, one of them none."""
+@pytest.mark.parametrize("uneven", [False, True], ids=["even", "uneven"])
+def test_sm120_nosync_switch(uneven):
+    """Capacity 512: calls up to 128 tokens per rank run the nosync kernel, larger ones the
+    configured backend (bit-identical to a layer without the option), eager (all-reduced token count) and under CUDA
+    graphs (compile_tokens_per_rank); with uneven rows the largest rank decides."""
     if not _sm120_gpus(4):
         pytest.skip("requires 4 SM120 GPUs")
-    _run(_args(uneven=True, tokens=[1, 20, 128]))
+    _run(
+        _args(
+            hidden=4096,
+            intermediate=2048,
+            capacity=512,
+            tokens=[1, 128, 129, 512],
+            uneven=uneven,
+        )
+    )
 
 
-@pytest.mark.parametrize("hidden", [256, 768])
-def test_sm120_nosync_hidden_widths(hidden):
-    """Hidden sizes whose MXFP8 scale row (hidden / 32 bytes) is not a multiple of 16 bytes."""
+def test_sm120_nosync_threshold():
+    """A lower NosyncOptions.max_tokens_per_rank moves the switch point."""
     if not _sm120_gpus(4):
         pytest.skip("requires 4 SM120 GPUs")
-    _run(_args(hidden=hidden, tokens=[1, 20, 64]))
+    _run(_args(threshold=16, tokens=[16, 17, 64], capacity=128))
 
 
 @pytest.mark.parametrize("ep", [4, 8])
@@ -390,19 +443,18 @@ def test_sm120_nosync_tokens_per_item(tokens_per_item):
     _run(_args(tokens=[1, 20, 64, 128], tokens_per_item=tokens_per_item))
 
 
-def test_sm120_nosync_matches_cake():
-    """Same weights and inputs through the sibling cake backend: the two agree up to their
-    intermediate-quantization recipes."""
+@pytest.mark.parametrize("hidden", [256, 768])
+def test_sm120_nosync_cutedsl_fallback(hidden):
+    """cutedsl as the fallback, at hidden sizes whose MXFP8 scale row (hidden / 32 bytes) is not a
+    multiple of 16 bytes (cake needs hidden % 512 == 0)."""
+    if not _CUTEDSL:
+        pytest.skip(
+            "set FLASHINFER_TEST_SM120_CUTEDSL=1 where the cutedsl backend runs"
+        )
     if not _sm120_gpus(4):
         pytest.skip("requires 4 SM120 GPUs")
     _run(
-        _args(
-            hidden=4096,
-            intermediate=2048,
-            tokens=[1, 16, 128],
-            repeats=1,
-            vs_cake=True,
-        )
+        _args(hidden=hidden, capacity=256, tokens=[1, 20, 128, 256], fallback="cutedsl")
     )
 
 
@@ -422,23 +474,36 @@ def test_sm120_nosync_nic_transport(ep, routing):
 
 
 def test_sm120_nosync_auto_transport():
-    """transport="auto": P2P where NCCL maps the pair, GIN elsewhere, with uneven rows."""
+    """transport="auto": P2P where NCCL maps the pair, GIN elsewhere, with uneven rows, across
+    the switch point."""
     if not _NIC:
         pytest.skip("set FLASHINFER_TEST_MEGAMOE_SM120_NIC=1 on a GIN-capable host")
     if not _sm120_gpus(8):
         pytest.skip("requires 8 SM120 GPUs")
-    _run(_args(ep=8, hidden=4096, intermediate=2048, transport="auto", uneven=True))
+    _run(
+        _args(
+            ep=8,
+            hidden=4096,
+            intermediate=2048,
+            capacity=256,
+            tokens=[1, 20, 128, 256],
+            transport="auto",
+            uneven=True,
+        )
+    )
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ep", type=int, choices=[1, 2, 4, 8], default=4)
+    parser.add_argument("--ep", type=int, choices=[2, 4, 8], default=4)
     parser.add_argument("--tokens", type=int, nargs="+", default=[1, 8, 20, 64, 128])
     parser.add_argument("--hidden", type=int, default=512)
     parser.add_argument("--intermediate", type=int, default=256)
     parser.add_argument("--experts", type=int, default=256)
     parser.add_argument("--topk", type=int, default=6)
     parser.add_argument("--capacity", type=int, default=128)
+    parser.add_argument("--threshold", type=int, default=128)
+    parser.add_argument("--fallback", choices=["cake", "cutedsl"], default="cake")
     parser.add_argument(
         "--routing", choices=["random", "hot", "empty", "invalid"], default="random"
     )
@@ -448,5 +513,4 @@ if __name__ == "__main__":
         "--tokens-per-item", type=int, choices=[8, 16, 24, 32], default=None
     )
     parser.add_argument("--uneven", action="store_true")
-    parser.add_argument("--vs-cake", action="store_true")
     _run(parser.parse_args())

@@ -85,38 +85,39 @@ def _moe_ep(args, h, ih, experts, topk, generator, raw):
         w13_scale=s1.view(torch.float8_e8m0fnu),
         w2_scale=s2.view(torch.float8_e8m0fnu),
     )
-    if args.backend == "nosync":
-        from flashinfer.moe_ep import (
-            Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig as Config,
-        )
 
-        cfg = Config(
-            intermediate_size=ih,
-            top_k=topk,
-            transport=args.nosync_transport,
-            tokens_per_item=args.tokens_per_item,
-        )
-    elif args.backend == "cutedsl":
-        from flashinfer.moe_ep import (
-            Sm120_Mxfp4_Mxfp8_Bf16_Cutedsl_MegaMoeConfig as Config,
-        )
+    def fallback_config():
+        if args.backend == "cutedsl" or (
+            args.backend == "nosync" and args.fallback == "cutedsl"
+        ):
+            from flashinfer.moe_ep import (
+                Sm120_Mxfp4_Mxfp8_Bf16_Cutedsl_MegaMoeConfig as Config,
+            )
 
-        cfg = Config(
-            intermediate_size=ih,
-            top_k=topk,
-            gate_up_clamp=10.0,
-            knobs=json.loads(args.knobs) if args.knobs else None,
-        )
-    else:
+            return Config(
+                intermediate_size=ih,
+                top_k=topk,
+                gate_up_clamp=10.0,
+                knobs=json.loads(args.knobs) if args.knobs else None,
+            )
         from flashinfer.moe_ep import (
             Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig as Config,
         )
 
-        cfg = Config(
+        return Config(
             intermediate_size=ih,
             top_k=topk,
             swiglu_limit=10,
             transport_table=args.transport,
+        )
+
+    cfg = fallback_config()
+    nosync = None
+    if args.backend == "nosync":  # the configured backend plus the small-batch option
+        from flashinfer.moe_ep import NosyncOptions
+
+        nosync = NosyncOptions(
+            transport=args.nosync_transport, tokens_per_item=args.tokens_per_item
         )
     layer = MoEEpLayer(
         bootstrap=BootstrapConfig(
@@ -132,6 +133,7 @@ def _moe_ep(args, h, ih, experts, topk, generator, raw):
         backend=MegaConfig(
             megakernel=cfg, quantize_input=True, preprocess_weights=True
         ),
+        nosync=nosync,
     )
 
     def setup(m, x_bf16, idx, weights_):
@@ -253,11 +255,23 @@ if __name__ == "__main__":
         "--backend",
         choices=["nosync", "cutedsl", "cake"],
         default="nosync",
-        help="moe_ep backend sm120_mxfp4_mxfp8_bf16_nosync / _cutedsl / _cake",
+        help="cutedsl / cake: that moe_ep backend; nosync: the --fallback backend with "
+        "MoEEpLayer(nosync=NosyncOptions()), so calls up to 128 tokens per rank run "
+        "sm120_mxfp4_mxfp8_bf16_nosync",
+    )
+    parser.add_argument(
+        "--fallback",
+        choices=["cake", "cutedsl"],
+        default="cake",
+        help="nosync: the configured backend (its options: --transport for cake, --knobs for "
+        "cutedsl)",
     )
     parser.add_argument("--knobs", type=str, default="", help="cutedsl: JSON knobs")
     parser.add_argument(
-        "--transport", type=str, default="all_lsa", help="cake: transport table"
+        "--transport",
+        type=str,
+        default="all_lsa",
+        help="cake (also as the nosync fallback): transport table",
     )
     parser.add_argument(
         "--tokens-per-item",

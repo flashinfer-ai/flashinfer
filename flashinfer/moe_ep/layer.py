@@ -10,10 +10,18 @@ from .config import BootstrapConfig, FleetParams
 from .core.kernel.registry import is_mega_kernel_config, is_split_kernel_config
 from .modes.config import MegaConfig, SplitConfig
 from .modes.mega_layer import MoEEpMegaLayer, MoEEpMegaWorkspace
+from .modes.nosync_layer import MoEEpNosyncLayer, NosyncOptions
 from .modes.split_layer import MoEEpSplitLayer
 from .weights import MoEWeightPack
 
-__all__ = ["MoEEpLayer", "MoEEpMegaLayer", "MoEEpMegaWorkspace", "MoEEpSplitLayer"]
+__all__ = [
+    "MoEEpLayer",
+    "MoEEpMegaLayer",
+    "MoEEpMegaWorkspace",
+    "MoEEpNosyncLayer",
+    "MoEEpSplitLayer",
+    "NosyncOptions",
+]
 
 
 def MoEEpLayer(
@@ -22,7 +30,8 @@ def MoEEpLayer(
     weights: MoEWeightPack,
     fleet_knobs: Sequence[AlgoKnob] = (),
     backend: Union[str, SplitConfig, MegaConfig, object] = "nccl_ep",
-) -> Union[MoEEpSplitLayer, MoEEpMegaLayer]:
+    nosync: NosyncOptions | None = None,
+) -> Union[MoEEpSplitLayer, MoEEpMegaLayer, MoEEpNosyncLayer]:
     """Construct the appropriate EP layer for ``backend``.
 
     - ``SplitConfig`` or a comm string/config → :class:`MoEEpSplitLayer`
@@ -33,7 +42,16 @@ def MoEEpLayer(
     kernel) preprocessed at construction. The layer does not retain the pack
     afterwards — the kernel's transformed/retained tensors own the memory, so
     callers can drop their reference to reclaim the source copy.
+
+    ``nosync`` (optional, SM120 MXFP4): also build the nosync kernel and run every call of at
+    most ``nosync.max_tokens_per_rank`` tokens per rank on it, every other call on the layer
+    ``backend`` configures (:class:`MoEEpNosyncLayer`). ``backend`` is configured as without
+    the option.
     """
+    if nosync is not None:
+        base = MoEEpLayer(bootstrap, fleet_params, weights, fleet_knobs, backend)
+        return MoEEpNosyncLayer(base, bootstrap, fleet_params, weights, backend, nosync)
+
     if isinstance(backend, MegaConfig):
         if fleet_knobs:
             warnings.warn(
