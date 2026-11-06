@@ -8869,7 +8869,6 @@ def kernel_chain_dv2(
         wait_mbar_slot = cutlass.Int32(0)
         ready_stage = cutlass.Int32(0)
         tma_phase = cutlass.Int32(0)
-        ready_chunk = cutlass.Int32(0)
         for chunk in cutlass.range(num_chunks, unroll=1):
             ws_chunk = chunk_base + chunk
             ws_row_start = ws_chunk * cutlass.Int32(BT)
@@ -8908,13 +8907,6 @@ def kernel_chain_dv2(
                     wait_mbar_slot, 1, K2_TMA_MBAR_STAGE_COUNT
                 )
                 tma_phase = tma_phase ^ wait_wrapped
-                zero_chain_v_tail(
-                    v_raw_smem.subview(ready_stage * V_TILE_ELEMS),
-                    lane,
-                    seqlen - ready_chunk * cutlass.Int32(BT),
-                    input_dtype,
-                )
-                ready_chunk += cutlass.Int32(1)
                 raw_ready_arrive(raw_ready_mbar.subview(ready_stage))
                 ready_stage, _ = advance_ring_stage(ready_stage, 1, K2_RAW_STAGE_COUNT)
             raw_stage, raw_wrapped = advance_ring_stage(
@@ -8928,6 +8920,8 @@ def kernel_chain_dv2(
             tma_full * cutlass.Int32(K2_TMA_MBAR_STAGE_COUNT - 1)
             + (cutlass.Int32(1) - tma_full) * num_chunks
         )
+        # The lookahead keeps the partial final V tile in the drain.
+        ready_chunk = num_chunks - tma_tail
         for _tail in cutlass.range(tma_tail, unroll=1):
             tma_transfer_wait(tma_mbar.subview(wait_mbar_slot), tma_phase)
             wait_mbar_slot, wait_wrapped = advance_ring_stage(

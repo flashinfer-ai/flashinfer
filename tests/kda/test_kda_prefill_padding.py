@@ -13,8 +13,18 @@ from flashinfer.utils import get_compute_capability
 
 @pytest.mark.parametrize("poison", [float("nan"), float("inf")])
 @pytest.mark.parametrize("capture", [False, True])
-@pytest.mark.parametrize("bucket", [4, 64])
-def test_kda_prefill_ignores_nonfinite_padding(poison, capture, bucket):
+@pytest.mark.parametrize(
+    ("num_sequences", "extent"),
+    [
+        pytest.param(3, 4, id="decomp-short"),
+        pytest.param(3, 80, id="decomp-drain-only"),
+        pytest.param(3, 96, id="decomp-first-handoff"),
+        pytest.param(3, 144, id="decomp-ring-wrap"),
+        pytest.param(64, 64, id="engine-guard"),
+    ],
+)
+def test_kda_prefill_ignores_nonfinite_padding(poison, capture, num_sequences, extent):
+    """Keep poisoned V padding out of output and state across producer schedules."""
     if not torch.cuda.is_available() or get_compute_capability(
         torch.device("cuda")
     ) not in ((10, 0), (10, 3)):
@@ -22,7 +32,13 @@ def test_kda_prefill_ignores_nonfinite_padding(poison, capture, bucket):
     torch.manual_seed(42)
     device = "cuda"
     heads, dim, slots = 12, 128, 8
-    shape = (1, bucket + 1, heads, dim)
+    if num_sequences == 3:
+        # Ensure these cases exercise the chain kernel, including on 80-SM B300.
+        assert (
+            num_sequences * heads * 2
+            <= torch.cuda.get_device_properties(device).multi_processor_count
+        )
+    shape = (1, extent + 1, heads, dim)
     q, k, v, g = [
         torch.randn(shape, device=device, dtype=torch.bfloat16) for _ in range(4)
     ]
@@ -31,10 +47,10 @@ def test_kda_prefill_ignores_nonfinite_padding(poison, capture, bucket):
     dt_bias = torch.zeros(heads * dim, device=device)
     seed_state = torch.randn(slots, heads, dim, dim, device=device) * 0.1
     state = seed_state.clone()
-    indices = torch.zeros(bucket, device=device, dtype=torch.int32)
+    indices = torch.zeros(num_sequences, device=device, dtype=torch.int32)
     indices[0] = 3
-    cu = torch.zeros(bucket + 1, device=device, dtype=torch.int64)
-    cu[1:] = bucket - 1
+    cu = torch.zeros(num_sequences + 1, device=device, dtype=torch.int64)
+    cu[1:] = extent - 1
     wrapper = kda.RecurrentKDAPrefillWrapper(device)
     wrapper.plan(cu)
     output = torch.empty_like(q)
@@ -75,7 +91,7 @@ def test_kda_prefill_ignores_nonfinite_padding(poison, capture, bucket):
         run()
 
     # Replay the same captured extent with changing logical token counts.
-    for n in (bucket - 1, bucket - 2):
+    for n in (extent, extent - 1, extent - 2):
         cu[1:] = n
         wrapper.plan(cu)
         state.copy_(seed_state)
