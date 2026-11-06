@@ -195,7 +195,37 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     ),
     "cake_rmsnorm_det_train": (".cake_rmsnorm_det_train", None),
     "cake_rmsnorm_nondet_train": (".cake_rmsnorm_nondet_train", None),
+    "CakeCausalConv1dDetFunction": (
+        ".cake_causal_conv1d_det_train",
+        "CakeCausalConv1dDetFunction",
+    ),
+    "cake_causal_conv1d_det_train_backward_workspace_bytes": (
+        ".cake_causal_conv1d_det_train",
+        "cake_causal_conv1d_det_train_backward_workspace_bytes",
+    ),
+    "cake_causal_conv1d_det_train_forward_workspace_bytes": (
+        ".cake_causal_conv1d_det_train",
+        "cake_causal_conv1d_det_train_forward_workspace_bytes",
+    ),
     "cake_lm_head_det_train": (".cake_lm_head_det_train", None),
+    # The deterministic Cake MoE grouped GEMM: the names of its module.
+    **{
+        name: (".cake_moe_grouped_gemm_det_train", name)
+        for name in (
+            "CakeMoEGroupedGemmDetFunction",
+            "CakeMoEGroupedGemmDetLaunch",
+            "cake_moe_grouped_gemm_det",
+            "cake_moe_grouped_gemm_det_train_dgrad",
+            "cake_moe_grouped_gemm_det_train_forward",
+            "cake_moe_grouped_gemm_det_train_prepare_dgrad",
+            "cake_moe_grouped_gemm_det_train_prepare_forward",
+            "cake_moe_grouped_gemm_det_train_prepare_wgrad",
+            "cake_moe_grouped_gemm_det_train_wgrad",
+            "is_cake_moe_grouped_gemm_det_train_supported",
+        )
+    },
+    # Its non-deterministic counterpart is reached through its module only.
+    "cake_moe_grouped_gemm_nondet_train": (".cake_moe_grouped_gemm_nondet_train", None),
     # SiLU-gated RMSNorm training (Cake), both modes: each facade imports its
     # backend package (under flashinfer.experimental.cake) on first use.
     "cake_rmsnorm_silu_gate_det_train": (".cake_rmsnorm_silu_gate_det_train", None),
@@ -348,9 +378,9 @@ from .norm import rmsnorm as rmsnorm
 from .norm import rmsnorm_quant as rmsnorm_quant
 from .norm import fused_rmsnorm_silu as fused_rmsnorm_silu
 from .norm import fused_qk_rmsnorm_rope as fused_qk_rmsnorm_rope
-from .cake_causal_conv1d_det_train import (
-    CakeCausalConv1dDetFunction as CakeCausalConv1dDetFunction,
-)
+
+# CakeCausalConv1dDetFunction and the workspace-bytes helpers are served by
+# ``_LAZY_EXPORTS`` above: they live in the backend package under flashinfer/experimental/cake/.
 from .cake_causal_conv1d_det_train import (
     cake_causal_conv1d_det as cake_causal_conv1d_det,
 )
@@ -358,13 +388,7 @@ from .cake_causal_conv1d_det_train import (
     cake_causal_conv1d_det_train_backward as cake_causal_conv1d_det_train_backward,
 )
 from .cake_causal_conv1d_det_train import (
-    cake_causal_conv1d_det_train_backward_workspace_bytes as cake_causal_conv1d_det_train_backward_workspace_bytes,
-)
-from .cake_causal_conv1d_det_train import (
     cake_causal_conv1d_det_train_forward as cake_causal_conv1d_det_train_forward,
-)
-from .cake_causal_conv1d_det_train import (
-    cake_causal_conv1d_det_train_forward_workspace_bytes as cake_causal_conv1d_det_train_forward_workspace_bytes,
 )
 
 from .cake_mhc_det_train import (

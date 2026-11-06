@@ -195,7 +195,7 @@ def test_words_split_at_underscores_and_camel_case() -> None:
         "cake_causal_conv1d_nondeterministic",
         "CakeCausalConv1dNondeterministicFunction",
         "cake_causal_conv1d_det",
-        "RecomputeHandleDetKcp",
+        "CakeCausalConv1dDetKcpRecomputeHandle",
     ):
         assert MODE_WORD not in _words(name), name
 
