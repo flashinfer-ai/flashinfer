@@ -170,16 +170,7 @@ _PRIMS_TS_LAZY_EXPORTS = frozenset(
 )
 
 
-# Compatibility module paths of the causal conv1d facade and its backend package; each
-# resolves on first attribute access and loads no KCP host module.
-_COMPAT_SUBMODULES = frozenset(
-    {"cake_causal_conv1d_train", "cake_causal_conv1d_train_backend"}
-)
-
-
 def __getattr__(name: str):
-    if name in _COMPAT_SUBMODULES:
-        return importlib.import_module(f"{__name__}.{name}")
     if name not in _PRIMS_TS_LAZY_EXPORTS:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     from . import fused_moe as _fused_moe
@@ -361,24 +352,6 @@ from .cake_causal_conv1d_det_train import (
 )
 from .cake_causal_conv1d_det_train import (
     cake_causal_conv1d_det_train_forward_workspace_bytes as cake_causal_conv1d_det_train_forward_workspace_bytes,
-)
-
-# Use import aliases so strict JIT keys treat these as re-exports, not setup code.
-from .cake_causal_conv1d_det_train import (
-    CakeCausalConv1dDetFunction as CakeCausalConv1dFunction,
-)
-from .cake_causal_conv1d_det_train import cake_causal_conv1d_det as cake_causal_conv1d
-from .cake_causal_conv1d_det_train import (
-    cake_causal_conv1d_det_train_backward as cake_causal_conv1d_train_backward,
-)
-from .cake_causal_conv1d_det_train import (
-    cake_causal_conv1d_det_train_backward_workspace_bytes as cake_causal_conv1d_train_backward_workspace_bytes,
-)
-from .cake_causal_conv1d_det_train import (
-    cake_causal_conv1d_det_train_forward as cake_causal_conv1d_train_forward,
-)
-from .cake_causal_conv1d_det_train import (
-    cake_causal_conv1d_det_train_forward_workspace_bytes as cake_causal_conv1d_train_forward_workspace_bytes,
 )
 
 from .cake_mhc_det_train import (

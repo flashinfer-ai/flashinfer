@@ -2066,14 +2066,3 @@ __all__ = [
     "cake_causal_conv1d_det_multi_backward_kcp",
     "cake_causal_conv1d_det_multi_forward_kcp",
 ]
-
-# The names before the det rename, bound to the same objects (not in ``__all__``).
-CakeCausalConv1dKcpFunction = CakeCausalConv1dDetFunctionKcp
-CakeCausalConv1dKcpMultiFunction = CakeCausalConv1dDetMultiFunctionKcp
-KcpRecomputeHandle = RecomputeHandleDetKcp
-cake_causal_conv1d_kcp = cake_causal_conv1d_det_kcp
-cake_causal_conv1d_kcp_backward = cake_causal_conv1d_det_backward_kcp
-cake_causal_conv1d_kcp_forward = cake_causal_conv1d_det_forward_kcp
-cake_causal_conv1d_kcp_multi = cake_causal_conv1d_det_multi_kcp
-cake_causal_conv1d_kcp_multi_backward = cake_causal_conv1d_det_multi_backward_kcp
-cake_causal_conv1d_kcp_multi_forward = cake_causal_conv1d_det_multi_forward_kcp

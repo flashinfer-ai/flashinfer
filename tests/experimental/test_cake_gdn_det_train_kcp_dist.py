@@ -2103,7 +2103,7 @@ def test_public_api_cannot_select_test_programs() -> None:
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# C7: the convolution halo row.  The user calls FlashInfer's ``cake_causal_conv1d_kcp(x_local, weight, ctx)`` with
+# C7: the convolution halo row.  The user calls FlashInfer's ``cake_causal_conv1d_det_kcp(x_local, weight, ctx)`` with
 # THIS package's context: the conv package reads the halo plan (``ctx.halo``, ``ctx.halo_tables``), the local
 # ``cu_seqlens`` and the process group by duck typing.  The row's partition: document 0 = [1, 2, 300] on ranks 0,
 # 1 and 3 (the three history rows of rank 3's first outputs come from TWO predecessor ranks), rank 2 holds no token
@@ -2198,7 +2198,8 @@ def _run_rank_conv(
     """C7 on one rank: ``y`` / ``dx`` / ``dweight`` of the rank's tokens against the FP64 oracle of the whole pack,
     ``y`` bitwise equal to the single-rank conv of the whole pack on the rank's tokens, repeat bitwise, and the
     halo-row gradients delivered to the predecessor ranks (rank 0 / 1: 1 / 2 tokens of document 0)."""
-    from flashinfer import cake_causal_conv1d_train as conv
+    from flashinfer import cake_causal_conv1d_det_train as conv
+    from flashinfer import cake_causal_conv1d_det_train_kcp as conv_kcp
 
     part, cu = _partition(row)
     ctx = plan.build_context_det_kcp(part, group, rank, device)
@@ -2217,10 +2218,10 @@ def _run_rank_conv(
     w_dev = w.to(device).requires_grad_(True)
     dy_local = dy_all[l2g].to(device)
     t0 = time.time()
-    y = conv.cake_causal_conv1d_kcp(x_local, w_dev, ctx)
+    y = conv_kcp.cake_causal_conv1d_det_kcp(x_local, w_dev, ctx)
     y.backward(dy_local)
     dx, dw = x_local.grad, w_dev.grad
-    y2 = conv.cake_causal_conv1d_kcp(x_local.detach(), w_dev.detach(), ctx)
+    y2 = conv_kcp.cake_causal_conv1d_det_kcp(x_local.detach(), w_dev.detach(), ctx)
     torch.cuda.synchronize(device)
     # the oracle (FP64 on this rank's device, the whole pack) and the single-rank conv of the whole pack
     y_ref, dx_ref, dpre, taps = _conv_reference(
@@ -2231,7 +2232,7 @@ def _run_rank_conv(
         [(dpre[sel] * tap[sel]).sum(0) for tap in taps], dim=1
     )  # this rank's partial of dweight (the framework reduces the ranks)
     cu_dev = torch.tensor(cu, dtype=torch.int32, device=device)
-    y_single = conv.cake_causal_conv1d(x_all.to(device), w.to(device), cu_dev)
+    y_single = conv.cake_causal_conv1d_det(x_all.to(device), w.to(device), cu_dev)
     flags: dict[str, bool] = {}
     metrics: dict[str, dict] = {}
     metrics["y"] = _outside(y, y_ref[sel], atol=CONV_Y_ATOL, rtol=CONV_Y_RTOL)
@@ -2287,13 +2288,13 @@ def _run_rank_conv(
 
 
 def test_conv_halo_row(slurm) -> None:
-    """C7: FlashInfer's ``cake_causal_conv1d_kcp`` through this package's context (duck typing): ``y`` / ``dx`` /
+    """C7: FlashInfer's ``cake_causal_conv1d_det_kcp`` through this package's context (duck typing): ``y`` / ``dx`` /
     ``dweight`` vs FP64 on every rank, ``y`` bitwise the single-rank conv, history rows from two predecessor ranks,
     an empty predecessor and a document start.  Runs under Slurm with >= 4 ranks."""
     if slurm is None:
         pytest.skip("the conv halo row runs under Slurm (4 ranks)")
-    conv = pytest.importorskip("flashinfer.cake_causal_conv1d_train")
-    if not conv.is_cake_causal_conv1d_train_supported(slurm.device):
+    conv = pytest.importorskip("flashinfer.cake_causal_conv1d_det_train")
+    if not conv.is_cake_causal_conv1d_det_train_supported(slurm.device):
         pytest.skip("the conv package does not support this device")
     _slurm_row(C7_ROW, slurm, "conv", _run_rank_conv)
 
@@ -2349,7 +2350,7 @@ def _run_rank_layer(
     caller's norm)."""
     import inspect
 
-    from flashinfer import cake_causal_conv1d_train as conv
+    from flashinfer import cake_causal_conv1d_det_train_kcp as conv_kcp
 
     H_qk, HV = row.heads
     C = (2 * H_qk + HV) * 128
@@ -2369,12 +2370,13 @@ def _run_rank_layer(
     ops = _local_inputs(row, part, cu, rank, device)
     g, beta, dout = ops["g"], ops["beta"], ops["dout"]
     conv_takes_handle = (
-        "recompute_handle" in inspect.signature(conv.cake_causal_conv1d_kcp).parameters
+        "recompute_handle"
+        in inspect.signature(conv_kcp.cake_causal_conv1d_det_kcp).parameters
     )
 
     def layer(x, w, g_, b_, h):
         ckw = {"recompute_handle": h} if (h is not None and conv_takes_handle) else {}
-        y = conv.cake_causal_conv1d_kcp(x, w, ctx, **ckw)
+        y = conv_kcp.cake_causal_conv1d_det_kcp(x, w, ctx, **ckw)
         qkv = y.view(y.shape[0], 2 * H_qk + HV, 128)
         if l2n:  # #7817: the raw views; the recurrence normalizes q / k itself
             q, k = qkv[:, :H_qk], qkv[:, H_qk : 2 * H_qk]
@@ -2429,7 +2431,7 @@ def _run_rank_layer(
 
     # the convolution's own forward collectives (its halo exchange), for the pending whole-layer count
     with CollectiveCounter() as cc_conv:
-        conv.cake_causal_conv1d_kcp(x_local, w_all.to(device), ctx)
+        conv_kcp.cake_causal_conv1d_det_kcp(x_local, w_all.to(device), ctx)
     conv_fwd = cc_conv.record()
     t0 = time.time()
     res_d, rec_d = run("direct")
@@ -2506,8 +2508,8 @@ def test_layer_checkpoint_rows(row: Row, slurm) -> None:
     recompute handle (see the block comment above).  Runs under Slurm with >= the row's ranks."""
     if slurm is None:
         pytest.skip("the layer rows run under Slurm")
-    conv = pytest.importorskip("flashinfer.cake_causal_conv1d_train")
-    if not conv.is_cake_causal_conv1d_train_supported(slurm.device):
+    conv = pytest.importorskip("flashinfer.cake_causal_conv1d_det_train")
+    if not conv.is_cake_causal_conv1d_det_train_supported(slurm.device):
         pytest.skip("the conv package does not support this device")
     _slurm_row(row, slurm, _backend_name(), _run_rank_layer)
 
@@ -3163,8 +3165,8 @@ def test_l2n_layer_checkpoint_rows(row: Row, slurm) -> None:
     out / dx / dw / dg / dbeta bitwise the direct pass; L8 is the ``C = 10240`` (16, 48) row."""
     if slurm is None:
         pytest.skip("the layer rows run under Slurm")
-    conv = pytest.importorskip("flashinfer.cake_causal_conv1d_train")
-    if not conv.is_cake_causal_conv1d_train_supported(slurm.device):
+    conv = pytest.importorskip("flashinfer.cake_causal_conv1d_det_train")
+    if not conv.is_cake_causal_conv1d_det_train_supported(slurm.device):
         pytest.skip("the conv package does not support this device")
     backend = _backend_name()
     _skip_unless_l2n(backend)
