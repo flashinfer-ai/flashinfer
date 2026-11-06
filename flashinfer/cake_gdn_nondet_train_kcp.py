@@ -88,6 +88,8 @@ with this module's ``ctx``.
 from __future__ import annotations
 
 import functools
+import inspect
+from collections.abc import Callable
 from typing import Any, Optional
 
 import torch
@@ -104,6 +106,63 @@ def _pkg():
     from .experimental.cake import cake_gdn_nondet_train_kcp  # noqa: PLC0415 - the backend package, imported on first use
 
     return cake_gdn_nondet_train_kcp
+
+
+class _PackageKeywordsSignature(inspect.Signature):
+    """``__signature__`` of a facade function that hands its ``**`` keywords to the package function of its name: the
+    facade function's own parameters without ``**``, then each keyword-only parameter of the package function that the
+    facade function does not name (every option field, keyword-only).  The package parameters are read on first use of
+    the signature, which imports the package, so importing this module still imports nothing; the facade function
+    stays a plain function (its source and type hints are its own)."""
+
+    __slots__ = ("_own", "_name", "_full")
+
+    def __init__(
+        self, fn: Callable[..., Any]
+    ) -> None:  # no Signature.__init__: the parameters are read on first use
+        self._own = inspect.signature(fn)
+        self._name = fn.__name__
+        self._full: Optional[inspect.Signature] = None
+
+    def _resolved(self) -> inspect.Signature:
+        if self._full is None:
+            params = [
+                p for p in self._own.parameters.values() if p.kind is not p.VAR_KEYWORD
+            ]
+            named = {p.name for p in params}
+            theirs = inspect.signature(getattr(_pkg(), self._name)).parameters
+            params += [
+                p
+                for p in theirs.values()
+                if p.kind is p.KEYWORD_ONLY and p.name not in named
+            ]
+            self._full = self._own.replace(parameters=params)
+        return self._full
+
+    # every Signature method (parameters, bind, str, ==, hash) reads these two slots of the base class
+    @property  # type: ignore[override]
+    def _parameters(self) -> Any:
+        return self._resolved().parameters
+
+    @property  # type: ignore[override]
+    def _return_annotation(self) -> Any:
+        return self._own.return_annotation
+
+    def replace(self, **changes: Any) -> inspect.Signature:  # type: ignore[override]
+        return self._resolved().replace(**changes)
+
+    def __reduce__(self) -> Any:
+        return self._resolved().__reduce__()
+
+    def __repr__(self) -> str:
+        return repr(self._resolved())
+
+
+def _forwards_keywords(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Mark ``fn`` as handing its ``**`` keywords to the package function of its name: its ``__signature__`` is a
+    :class:`_PackageKeywordsSignature`."""
+    fn.__signature__ = _PackageKeywordsSignature(fn)  # type: ignore[attr-defined]
+    return fn
 
 
 def _options_for(options: Any) -> Any:
@@ -193,6 +252,7 @@ def cake_gdn_nondet_train_kcp_build_context(
 
 
 @flashinfer_api
+@_forwards_keywords
 def cake_gdn_nondet_train_kcp_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -257,6 +317,7 @@ def cake_gdn_nondet_train_kcp_forward(
 
 
 @flashinfer_api
+@_forwards_keywords
 def cake_gdn_nondet_train_kcp_backward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -309,6 +370,7 @@ def cake_gdn_nondet_train_kcp_backward(
 
 
 @flashinfer_api
+@_forwards_keywords
 def cake_gdn_nondet_kcp(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -444,6 +506,7 @@ def cake_gdn_nondet_train_kcp_packed_qkv_views(
 
 
 @flashinfer_api
+@_forwards_keywords
 def cake_gdn_nondet_train_kcp_workspace_bytes(
     ctx: Any, *, H_qk: int, HV: int, **kw: Any
 ) -> int:
@@ -457,6 +520,7 @@ def cake_gdn_nondet_train_kcp_workspace_bytes(
 
 
 @flashinfer_api
+@_forwards_keywords
 def cake_gdn_nondet_train_kcp_saved_bytes(
     ctx: Any, *, H_qk: int, HV: int, **kw: Any
 ) -> int:
@@ -466,6 +530,7 @@ def cake_gdn_nondet_train_kcp_saved_bytes(
 
 
 @flashinfer_api
+@_forwards_keywords
 def cake_gdn_nondet_train_kcp_comm_bytes(
     ctx: Any,
     *,
