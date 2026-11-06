@@ -1888,6 +1888,16 @@ def test_every_entry_requires_deterministic_false(mode) -> None:
             match=f"^{name} is the non-deterministic route and takes deterministic=False",
         ):
             call()
+    # the refusal names the entry's deterministic counterpart
+    for (name, call), det_name in zip(
+        _entry_calls(**mode).items(), DET_NAMES, strict=True
+    ):
+        with pytest.raises(ValueError) as info:
+            call()
+        assert str(info.value).endswith(
+            "pass deterministic=False for the non-deterministic path; the deterministic entry is "
+            f"flashinfer.experimental.cake_gdn_det_train.{det_name}"
+        ), (name, str(info.value))
     # the refusal comes first, also with PyTorch's deterministic algorithms on
     with _deterministic_algorithms(True):
         for name, call in _entry_calls(**mode).items():
