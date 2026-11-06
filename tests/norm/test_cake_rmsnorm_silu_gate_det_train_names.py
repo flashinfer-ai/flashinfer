@@ -22,8 +22,10 @@ The mode is part of every public name, and only of the name.  For each mode
 autograd functional ``cake_rmsnorm_silu_gate_<mode>``, the autograd class
 ``CakeRMSNormSiLUGate<Mode>Function``, the support query
 ``is_cake_rmsnorm_silu_gate_<mode>_train_supported`` and functions named by the
-module plus a verb; the only other names are the two architecture constants
-``ARCHES`` and ``SUPPORTED_COMPUTE_CAPABILITIES`` (module constants, exempt).
+module plus a verb.  Module constants are exempt by their pattern: an
+``^[A-Z][A-Z0-9_]*$`` name bound to a plain value (here ``ARCHES`` and
+``SUPPORTED_COMPUTE_CAPABILITIES``); any other public name, an ALL_CAPS type
+or alias included, carries the mode word.
 No entry point has a ``deterministic`` parameter.  The modules and names the
 family had before (``flashinfer.cake_rmsnorm_silu_gate_train``, the packages
 ``flashinfer.cake_rmsnorm_silu_gate_train_backend`` and
@@ -72,9 +74,11 @@ NAMESPACES = {
 }
 NAMESPACE_IDS = [f"{mode}-{kind}" for mode, kind in NAMESPACES]
 SUBMODULES = ("cake_build", "cake_jit")
-# Module constants of every Cake training package (no mode word: the module
-# path carries the mode).
-CONSTANTS = {"ARCHES", "SUPPORTED_COMPUTE_CAPABILITIES"}
+# Module constants carry no mode word (the module path carries the mode): a
+# name of this pattern bound to a plain value.  An ALL_CAPS name bound to
+# anything else (a type, a type alias, a function) is not a constant.
+CONSTANT = re.compile(r"[A-Z][A-Z0-9_]*")
+PLAIN = (bool, int, float, str, bytes, tuple, frozenset, list, dict, set, type(None))
 CLASS = {
     "det": "CakeRMSNormSiLUGateDetFunction",
     "nondet": "CakeRMSNormSiLUGateNondetFunction",
@@ -140,11 +144,20 @@ def _mode_words(name: str) -> list:
     return [w for w in words if w in MODES]
 
 
+def _constants(module) -> set:
+    """The module constants of ``module.__all__``."""
+    return {
+        name
+        for name in module.__all__
+        if CONSTANT.fullmatch(name) and isinstance(getattr(module, name), PLAIN)
+    }
+
+
 def _entries(module) -> dict:
     """The callables of ``module.__all__``: functions, and the autograd class's
     ``forward`` and ``backward``."""
     entries = {}
-    for name in set(module.__all__) - CONSTANTS:
+    for name in set(module.__all__) - _constants(module):
         obj = getattr(module, name)
         if inspect.isclass(obj):
             entries[f"{name}.forward"] = obj.forward
@@ -161,19 +174,19 @@ def _entries(module) -> dict:
 def test_all_is_the_mode_names_and_the_constants(key) -> None:
     mode, _ = key
     module = NAMESPACES[key]
-    assert set(module.__all__) == PUBLIC[mode] | CONSTANTS, key
+    assert set(module.__all__) - _constants(module) == PUBLIC[mode], key
     for name in PUBLIC[mode]:
         assert hasattr(module, name), (key, name)
 
 
 @pytest.mark.parametrize("key", list(NAMESPACES), ids=NAMESPACE_IDS)
 def test_every_public_name_carries_its_mode(key) -> None:
-    """Every public name but the two constants carries exactly one mode word,
-    its package's; the names follow rules 2 to 6 and 10 of the scheme."""
+    """Every public name but the module constants carries exactly one mode
+    word, its package's; the names follow rules 2 to 6 and 10 of the scheme."""
     mode, _ = key
     module = NAMESPACES[key]
     prefix = f"{OP}_{mode}_train"
-    for name in set(module.__all__) - CONSTANTS:
+    for name in set(module.__all__) - _constants(module):
         assert _mode_words(name) == [mode], (key, name)
         obj = getattr(module, name)
         if inspect.isclass(obj):
