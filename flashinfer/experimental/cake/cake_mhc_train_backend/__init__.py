@@ -33,7 +33,8 @@ the host rule picks, the two-size tail schedule over other chunk sizes): the
 column slab adds the ``dfn`` sum of every (column slab, token chunk) unit into
 ``dfn`` with FP32 reductions, so only the summation order of ``dfn`` varies
 from run to run (each element within ``P <= 32`` FP32 roundings of the
-fixed-order sum of its per-chunk partials; the FP32 reduction flushes
+fixed-order sum of its starting value -- zero, or the caller's ``dfn`` under
+``accumulate=True`` -- and its per-chunk partials; the FP32 reduction flushes
 subnormal addends and results to zero).  ``dX`` is the deterministic package's
 bits; ``dscale`` and ``dbase`` are the bits of its per-CTA reduction (see
 :mod:`.cake_jit` for the group-row band where they can differ).  There is no
@@ -1748,7 +1749,8 @@ def cake_mhc_train_backward_finish(
         ``True``: the caller passes all three; the column slab adds the ``dfn``
         sums onto its current values with the same FP32 reductions, and
         ``dscale`` / ``dbase`` add their current value last in the FP64 fold,
-        rounded once (the deterministic package's accumulation, bit for bit).
+        rounded once (the order of the deterministic package's per-CTA
+        reduction).
     workspace : torch.Tensor, optional
         Caller-owned ``uint8`` buffer from :func:`cake_mhc_train_backward_workspace`
         (sized for this ``H``: ``hidden=X.shape[2]``; or a deterministic
@@ -1766,14 +1768,18 @@ def cake_mhc_train_backward_finish(
     Returns
     -------
     ``(dX, dfn, dscale, dbase)``: the BF16 ``dX`` sums the mapping, collapse and
-    residual-mixing contributions in FP32 and rounds once, and ``dscale`` /
-    ``dbase`` are fixed-order FP64 folds rounded once: all three bitwise the
-    deterministic package's.  ``dfn`` adds the per-unit FP32 sums of at most
-    ``P <= 32`` token chunks (the host rule's chunk sizes per token count and
-    device) per element in an order that varies from run to run (each element
-    within ``P`` FP32 roundings of the fixed-order sum of the same chunk
-    partials; the FP32 reduction flushes subnormal addends and results to
-    zero).  With ``T == 0`` nothing is launched: ``dX`` is empty and the
+    residual-mixing contributions in FP32 and rounds once, bitwise the
+    deterministic package's ``dX``.  ``dscale`` / ``dbase`` are fixed-order FP64
+    folds rounded once, bitwise the deterministic package's per-CTA reduction;
+    where that package sums them over 8-token group rows instead (hidden 4096
+    above 14927 tokens on sm_100a and sm_103a; see :mod:`.cake_jit`), their
+    low-order bits can differ from its results.  ``dfn`` adds the per-unit FP32
+    sums of at most ``P <= 32`` token chunks (the host rule's chunk sizes per
+    token count and device) per element onto its starting value (zero, or the
+    caller's ``dfn`` under ``accumulate=True``) in an order that varies from run
+    to run (each element within ``P`` FP32 roundings of the fixed-order sum of
+    that value and the same chunk partials; the FP32 reduction flushes
+    subnormal addends and results to zero).  With ``T == 0`` nothing is launched: ``dX`` is empty and the
     parameter gradients are zeroed (``accumulate=False``) or left untouched
     (``accumulate=True``).
 

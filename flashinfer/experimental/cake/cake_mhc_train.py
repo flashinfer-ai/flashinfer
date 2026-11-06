@@ -35,7 +35,8 @@ Numerical contract: ``backward_finish`` has no final reduction kernel: the
 column-slab pass adds the ``dfn`` sum of every (column slab, token chunk) unit
 into ``dfn`` with FP32 reductions and folds ``dscale`` / ``dbase`` in the same
 grid.  Only the summation order of ``dfn`` varies from run to run: each element
-lies within ``P`` FP32 roundings of the fixed-order sum of its per-chunk
+lies within ``P`` FP32 roundings of the fixed-order sum of its starting value
+(zero, or the caller's ``dfn`` under ``accumulate=True``) and its per-chunk
 partials (``P <= 32`` token chunks; the chunk sizes are the host rule's per
 token count and device, so the low-order bits can also differ from the
 deterministic ``dfn``), and the FP32 reduction flushes subnormal addends and
@@ -463,13 +464,14 @@ def cake_mhc_train_backward_finish(
     :func:`~flashinfer.cake_mhc_det_train.cake_mhc_det_train_backward_finish`;
     the call runs the non-deterministic backward.  ``dfn`` is summed with FP32
     reductions in a run-to-run varying order, each element within ``P <= 32``
-    FP32 roundings of the fixed-order sum of its per-chunk partials (the chunk
-    sizes are the host rule's per token count and device, so the low-order
-    bits can also differ from the deterministic ``dfn``); ``dX`` is bitwise the
-    deterministic value; ``dscale`` and ``dbase`` are bitwise the deterministic
-    package's per-CTA reduction (in its group-row bands their low-order bits
-    can differ from the deterministic result; see the module docstring);
-    ``accumulate=True`` adds onto the caller's values the same way.  Under
+    FP32 roundings of the fixed-order sum of its starting value (zero, or the
+    caller's ``dfn`` under ``accumulate=True``) and its per-chunk partials (the
+    chunk sizes are the host rule's per token count and device, so the
+    low-order bits can also differ from the deterministic ``dfn``); ``dX`` is
+    bitwise the deterministic value; ``dscale`` and ``dbase`` are bitwise the
+    deterministic package's per-CTA reduction (in its group-row bands their
+    low-order bits can differ from the deterministic result; see the module
+    docstring); ``accumulate=True`` adds onto the caller's values the same way.  Under
     ``torch.use_deterministic_algorithms(True)`` the call raises PyTorch's
     alert right before its launches (``RuntimeError``; under
     ``warn_only=True`` a ``UserWarning``, and the call runs).

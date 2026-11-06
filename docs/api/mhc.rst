@@ -139,10 +139,11 @@ deterministic package, now raises this error.
 
 Numerical contract of the non-deterministic module: only the summation order
 of ``dfn`` varies from run to run. Each element lies within ``P`` FP32
-roundings of the fixed-order sum of its per-chunk partials (``P <= 32`` token
-chunks), and the FP32 reduction flushes subnormal addends and results to zero;
-the chunk sizes follow the host rule, so the low-order bits of ``dfn`` can also
-differ from the deterministic ``dfn``. ``dX``, the forward, the statistics
+roundings of the fixed-order sum of its starting value and its per-chunk
+partials (``P <= 32`` token chunks). The starting value is zero, or the
+caller's ``dfn`` with ``accumulate=True``. The FP32 reduction flushes subnormal
+addends and results to zero; the chunk sizes follow the host rule, so the
+low-order bits of ``dfn`` can also differ from the deterministic ``dfn``. ``dX``, the forward, the statistics
 replay and ``backward_prepare`` are bitwise the deterministic values.
 ``dscale`` and ``dbase`` are bitwise the deterministic package's per-CTA
 reduction; in the token-count bands where the deterministic package sums them
