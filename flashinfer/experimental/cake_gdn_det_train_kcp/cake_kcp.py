@@ -6106,17 +6106,3 @@ __all__ = [
     "torch_release",
     "torch_release_verified",
 ]
-
-# Compatibility aliases: the pre-rename names bound to the same objects (not in ``__all__``).
-ChunkGDNKcpFunction = ChunkGDNDetFunctionKcp
-KcpCall = CallDetKcp
-KcpOptions = OptionsDetKcp
-KcpRecomputeHandle = RecomputeHandleDetKcp
-KcpSaved = SavedDetKcp
-KcpWorkspace = WorkspaceDetKcp
-chunk_gdn_kcp = chunk_gdn_det_kcp
-chunk_gdn_kcp_bwd = chunk_gdn_det_bwd_kcp
-chunk_gdn_kcp_fwd = chunk_gdn_det_fwd_kcp
-gdn_kcp_comm_bytes = gdn_det_comm_bytes_kcp
-gdn_kcp_saved_bytes = gdn_det_saved_bytes_kcp
-gdn_kcp_workspace_bytes = gdn_det_workspace_bytes_kcp
