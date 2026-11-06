@@ -1409,7 +1409,9 @@ def arena_for_budget(
     tokens = max(longest, p.S // 2)
     passes = 4 if lean_ok else 1
     while True:
-        option = CakeKDANondetArena(lean=lean_ok, tail_passes=passes, batch_tokens=tokens)
+        option = CakeKDANondetArena(
+            lean=lean_ok, tail_passes=passes, batch_tokens=tokens
+        )
         verdict = fits(option)
         if verdict:
             return option
@@ -4274,7 +4276,9 @@ def _values(
     return values
 
 
-def _values_base(ws: CakeKDANondetWorkspace, views: types.SimpleNamespace) -> dict[str, Any]:
+def _values_base(
+    ws: CakeKDANondetWorkspace, views: types.SimpleNamespace
+) -> dict[str, Any]:
     """The call-independent part of :func:`_values` on ``views``: the arena buffers, the transposed views of ``w``
     and the plan scalars.  Built once per layout of the workspace: ``views`` of :meth:`CakeKDANondetWorkspace.views` (the
     workspace keeps them, and their buffers, for its lifetime) are kept with the part; any other namespace is

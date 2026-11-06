@@ -782,7 +782,9 @@ def test_the_handoff_backward_launches_the_tape_path_with_the_light_prep(
         leaves = _leaves(inputs)
         launched.clear()
         out = checkpoint(
-            lambda *a, m=mode: cake_kda_nondet(*a, cu, workspace=ws, checkpoint_handoff=m),
+            lambda *a, m=mode: cake_kda_nondet(
+                *a, cu, workspace=ws, checkpoint_handoff=m
+            ),
             *leaves,
             use_reentrant=False,
         )
@@ -960,7 +962,9 @@ def test_a_record_the_backward_refuses_is_released_and_stays_correct(
     assert rec.h is None and rec.v_new is None and rec.w is None and rec.aqk is None
     assert rec.seg_m is None and rec.aliases == ()
     assert rec.gk is None and rec.kg is None and rec.beta_int is None and rec.kb is None
-    assert backward_arenas == [(None, "CakeKDANondetWorkspace", p.arena_bytes())], backward_arenas
+    assert backward_arenas == [(None, "CakeKDANondetWorkspace", p.arena_bytes())], (
+        backward_arenas
+    )
     _check_grads(on, off, "refused in _backward")
 
 

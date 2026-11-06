@@ -90,7 +90,9 @@ SAVED_TENSORS = (
     "u",
     "qk_rstd",
 )
-ATOL = RTOL = 1e-2  # the package's declared elementwise gate (test_cake_kda_nondet_train.py)
+ATOL = RTOL = (
+    1e-2  # the package's declared elementwise gate (test_cake_kda_nondet_train.py)
+)
 
 
 # the package's entries (they take no mode argument)
@@ -270,13 +272,19 @@ def test_saved_set_fields_and_their_checks_read_either_package() -> None:
     package's ``_check_saved_l2n`` and the deterministic package's apply the same rule to a set of either package's
     type (the entries refuse the other package's type before this check)."""
     S, H = 3, 2
-    fields = {f.name: f.default for f in dataclasses.fields(cake_backend.CakeKDANondetChunkSaved)}
+    fields = {
+        f.name: f.default
+        for f in dataclasses.fields(cake_backend.CakeKDANondetChunkSaved)
+    }
     assert fields["qk_rstd"] is None and fields["qk_l2norm"] is False
     for version in (cake_backend.SAVED_VERSION, cake_backend.SAVED_VERSION_TAPE):
         assert cake_backend._EXTRA_FIELDS[version][-1] == "qk_rstd"
     rstd = torch.zeros(2, S, H, dtype=torch.float32)
     checked = 0
-    for saved_type in (cake_backend.CakeKDANondetChunkSaved, det_backend.CakeKDADetChunkSaved):
+    for saved_type in (
+        cake_backend.CakeKDANondetChunkSaved,
+        det_backend.CakeKDADetChunkSaved,
+    ):
         on = _saved(saved_type, S, H, qk_rstd=rstd, qk_l2norm=True)
         off = _saved(saved_type, S, H)
         for check in (cake_backend._check_saved_l2n, det_backend._check_saved_l2n):
@@ -311,10 +319,14 @@ def test_saved_set_fields_and_their_checks_read_either_package() -> None:
                     )
     assert checked == 2 * 2 * 3
     # the autograd extras: qk_rstd rides last, absent with the flag off
-    on = _saved(cake_backend.CakeKDANondetChunkSaved, S, H, qk_rstd=rstd, qk_l2norm=True)
+    on = _saved(
+        cake_backend.CakeKDANondetChunkSaved, S, H, qk_rstd=rstd, qk_l2norm=True
+    )
     extra, names = cake_backend._saved_extra(on)
     assert names == ("qk_rstd",) and extra[0] is rstd
-    assert cake_backend._saved_extra(_saved(cake_backend.CakeKDANondetChunkSaved, S, H)) == (
+    assert cake_backend._saved_extra(
+        _saved(cake_backend.CakeKDANondetChunkSaved, S, H)
+    ) == (
         (),
         (),
     )
@@ -351,7 +363,10 @@ def test_check_saved_l2n_agrees_in_both_directions() -> None:
         return None
 
     compared = accepted = 0
-    for saved_type in (cake_backend.CakeKDANondetChunkSaved, det_backend.CakeKDADetChunkSaved):
+    for saved_type in (
+        cake_backend.CakeKDANondetChunkSaved,
+        det_backend.CakeKDADetChunkSaved,
+    ):
         for state, fields in states.items():
             saved = _saved(saved_type, S, H, **fields)
             for mode in ("off", *L2N_ON):
@@ -915,7 +930,8 @@ def test_autograd_node_returns_one_gradient_slot_per_input_and_takes_no_handoff(
     """The node's backward of an l2n set: one gradient slot per forward input (the raw mode's parameter gradients in
     theirs), the backward called with the flag and the set's ``qk_rstd``, and no checkpoint hand-off record taken."""
     n_inputs = (
-        len(inspect.signature(cake_backend.CakeKDANondetFunction.forward).parameters) - 1
+        len(inspect.signature(cake_backend.CakeKDANondetFunction.forward).parameters)
+        - 1
     )
     raw = gate == "raw"
     seen: dict = {}
@@ -1050,7 +1066,9 @@ def _names(gate: str) -> tuple[str, ...]:
 def _fwd(inputs, gate="g", *, det=False, q=None, k=None, **kwargs):
     """The l2n forward of this package (``det``: of the deterministic package); ``q`` / ``k``: other views of the
     same raw rows."""
-    fn = det_backend.cake_kda_det_train_forward if det else cake_kda_nondet_train_forward
+    fn = (
+        det_backend.cake_kda_det_train_forward if det else cake_kda_nondet_train_forward
+    )
     return fn(
         inputs["q"] if q is None else q,
         inputs["k"] if k is None else k,
@@ -1068,7 +1086,11 @@ def _fwd(inputs, gate="g", *, det=False, q=None, k=None, **kwargs):
 def _bwd(inputs, saved, gate="g", *, det=False, q=None, k=None, **kwargs):
     """The l2n backward of this package (``det``: of the deterministic package) from ``saved`` (``None``: the
     replay)."""
-    fn = det_backend.cake_kda_det_train_backward if det else cake_kda_nondet_train_backward
+    fn = (
+        det_backend.cake_kda_det_train_backward
+        if det
+        else cake_kda_nondet_train_backward
+    )
     return fn(
         inputs["q"] if q is None else q,
         inputs["k"] if k is None else k,
@@ -1587,7 +1609,9 @@ def test_l2n_lean_and_batched_arenas_are_bitwise_the_deterministic_l2n(
         del ws
     for label, kw in parts:
         for lean in (False, True):
-            arena = cake_backend.CakeKDANondetArena(lean=lean, tail_passes=3 if lean else 1, **kw)
+            arena = cake_backend.CakeKDANondetArena(
+                lean=lean, tail_passes=3 if lean else 1, **kw
+            )
             tag = (label, lean)
             ws = cake_backend.CakeKDANondetWorkspace.for_problem(
                 S,

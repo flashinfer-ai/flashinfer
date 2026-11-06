@@ -516,7 +516,9 @@ def _as_cu_seqlens(cu_seqlens) -> tuple[int, ...]:
         )
     for a, b in zip(values, values[1:], strict=False):
         if b < a:
-            raise ValueError("cake_kda_nondet_train_kcp_partition: cu_seqlens must be non-decreasing")
+            raise ValueError(
+                "cake_kda_nondet_train_kcp_partition: cu_seqlens must be non-decreasing"
+            )
     return values
 
 
@@ -569,7 +571,9 @@ def _validate_cut_points(cuts, length: int, pieces: int, doc: int) -> list[int]:
         )
     for a, b in zip(values, values[1:], strict=False):
         if b < a:
-            raise ValueError(f"cake_kda_nondet_train_kcp_partition: cut_points[{doc}] must be non-decreasing")
+            raise ValueError(
+                f"cake_kda_nondet_train_kcp_partition: cut_points[{doc}] must be non-decreasing"
+            )
     return values
 
 
@@ -686,12 +690,16 @@ def _finish(
             )
     fragments = tuple(
         tuple(
-            CakeKDANondetKcpFragment(doc, off, ln, r, s, prev.get((r, s)), nxt.get((r, s)))
+            CakeKDANondetKcpFragment(
+                doc, off, ln, r, s, prev.get((r, s)), nxt.get((r, s))
+            )
             for s, (doc, off, ln) in enumerate(frs)
         )
         for r, frs in enumerate(per_rank)
     )
-    return CakeKDANondetKcpPartition(world_size=W, layout=layout, cu_seqlens=cu, fragments=fragments)
+    return CakeKDANondetKcpPartition(
+        world_size=W, layout=layout, cu_seqlens=cu, fragments=fragments
+    )
 
 
 def cake_kda_nondet_train_kcp_partition(
@@ -713,7 +721,9 @@ def cake_kda_nondet_train_kcp_partition(
     cu = _as_cu_seqlens(cu_seqlens_global_cpu)
     W = int(world_size)
     if W < 1:
-        raise ValueError(f"cake_kda_nondet_train_kcp_partition: world_size must be >= 1, got {world_size}")
+        raise ValueError(
+            f"cake_kda_nondet_train_kcp_partition: world_size must be >= 1, got {world_size}"
+        )
     if fragments is not None:
         return _finish(cu, W, EXPLICIT_LAYOUT, _explicit_entries(cu, W, fragments))
     if layout not in LAYOUTS:
@@ -2254,7 +2264,9 @@ def cake_kda_nondet_train_kcp_build_context(
     W = part.world_size
     rank = int(rank)
     if not 0 <= rank < W:
-        raise ValueError(f"cake_kda_nondet_train_kcp_build_context: rank {rank} out of range [0, {W})")
+        raise ValueError(
+            f"cake_kda_nondet_train_kcp_build_context: rank {rank} out of range [0, {W})"
+        )
     if group is not None and dist.is_available() and dist.is_initialized():
         gw, gr = dist.get_world_size(group), dist.get_rank(group)
         if gw != W or gr != rank:
@@ -2276,7 +2288,9 @@ def cake_kda_nondet_train_kcp_build_context(
         )
     sm_count = int(sm_count)
     if sm_count < 1:
-        raise ValueError(f"cake_kda_nondet_train_kcp_build_context: sm_count must be >= 1, got {sm_count}")
+        raise ValueError(
+            f"cake_kda_nondet_train_kcp_build_context: sm_count must be >= 1, got {sm_count}"
+        )
     knobs = _kcp_test_knobs
     upload, table_cache = UPLOAD_DEFAULT, TABLE_CACHE_DEFAULT
     if isinstance(knobs, dict) and ("upload" in knobs or "table_cache" in knobs):
@@ -2499,7 +2513,9 @@ KCP_HANDOFF_MIN_HEAD_TOKENS = 393216
 KCP_HANDOFF_BUFFERS = ("h", "v_new", "w", "aqk_int", "akk_int")
 
 
-def cake_kda_nondet_train_kcp_handoff_bytes(ctx: CakeKDANondetKcpContext, *, H: int = 64) -> int:
+def cake_kda_nondet_train_kcp_handoff_bytes(
+    ctx: CakeKDANondetKcpContext, *, H: int = 64
+) -> int:
     """Bytes of the checkpoint hand-off's tape set on this rank (:data:`KCP_HANDOFF_BUFFERS`)::
 
     NC_pad * H * 32768                                         # the h tape
@@ -3512,7 +3528,9 @@ def _qk_l2norm_missing(mode: str, gate: str, arch: str | None) -> str | None:
     cake_backend = _single_rank.module("cake_backend")
     cake_build = _single_rank.module("cake_build")
     cake_jit = _single_rank.module("cake_jit")
-    if not _takes(cake_backend.cake_kda_nondet_train_forward, "use_qk_l2norm_in_kernel"):
+    if not _takes(
+        cake_backend.cake_kda_nondet_train_forward, "use_qk_l2norm_in_kernel"
+    ):
         return "the single-rank backend does not take use_qk_l2norm_in_kernel"
     if (
         not _takes(cake_backend.plan, "l2n")

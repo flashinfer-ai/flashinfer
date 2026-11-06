@@ -1279,7 +1279,9 @@ class KernelBackend(Backend):
             **variant,
         )
 
-    def _run_trim(self, name: str, args: dict[str, Any], call: CakeKDANondetKcpCall) -> bool:
+    def _run_trim(
+        self, name: str, args: dict[str, Any], call: CakeKDANondetKcpCall
+    ) -> bool:
         """Trimmed host path: the launch without :meth:`abi` when the provider launches from the abstract ``args`` anyway (the
         registry's ``run_program`` form discards the positional ABI, whose walk / index / chain device tables cost 100-300 us of
         host time per launch).  Keeps the D1 bookkeeping of the merge (alignment check, ``cols_per_cta``, ``merge_log``).
@@ -1492,7 +1494,9 @@ class KernelBackend(Backend):
         ]
         return abi, len(args["walk"]) * call.H
 
-    def _merge_args(self, call: CakeKDANondetKcpCall, args: dict[str, Any]) -> tuple[list[Any], int]:
+    def _merge_args(
+        self, call: CakeKDANondetKcpCall, args: dict[str, Any]
+    ) -> tuple[list[Any], int]:
         ch: Chains = args["chains"]
         if id(ch) not in self._checked_chains:
             ch.check_alignment()
@@ -2150,10 +2154,10 @@ def kcp_local_grid(stage: str, p: Any) -> tuple[int, int, int]:
 
 
 VIEW_CACHE_MAX = 64  # plan views of one local arena a CakeKDANondetKcpWorkspace keeps (the least recently bound goes first)
-SLICE_CACHE_MAX = 256  # pool[:n] views a CakeKDANondetKcpWorkspace keeps (cleared when full)
-ENSURE_CACHE_MAX = (
-    128  # trimmed-path ensure records a CakeKDANondetKcpWorkspace keeps (cleared when full)
+SLICE_CACHE_MAX = (
+    256  # pool[:n] views a CakeKDANondetKcpWorkspace keeps (cleared when full)
 )
+ENSURE_CACHE_MAX = 128  # trimmed-path ensure records a CakeKDANondetKcpWorkspace keeps (cleared when full)
 # plans whose local_scratch_table_bytes _scratch_bytes keeps (cleared when full)
 SCRATCH_BYTES_MAX = 256
 # cake_kcp_plan.local_scratch_table_bytes by plan object: id -> (the plan, its bytes).  A plan is immutable and the
@@ -5524,7 +5528,9 @@ def _fwd_tapes(
         call.walk(walk, tb.walk_in_p1, h0=carry, out=out)
 
 
-def _adj_tapes(call: CakeKDANondetKcpCall, *, dcarry: Indexed | None, wait_first: bool) -> None:
+def _adj_tapes(
+    call: CakeKDANondetKcpCall, *, dcarry: Indexed | None, wait_first: bool
+) -> None:
     """The adjoint tape walk(s) after ``dS_out`` is complete (the mirror of :func:`_fwd_tapes`: the carry plane holds
     the adjoint carries and the ``dS_out`` copies of ``dcarry_cross`` at ``P > 1``; ``b2_recv`` itself at ``P = 1``)."""
     tb = call.tb
@@ -6115,7 +6121,9 @@ def _graph_cap_bracket(call: CakeKDANondetKcpCall) -> tuple[str, int | None]:
     return "capture_pref", WALK_CACHE_CONFIG_CAP
 
 
-def _graph_capture(kind: str, entry: _GraphEntry, call: CakeKDANondetKcpCall, body: Any) -> Any:
+def _graph_capture(
+    kind: str, entry: _GraphEntry, call: CakeKDANondetKcpCall, body: Any
+) -> Any:
     """Capture ``body()`` (the call's allocations, launches and collectives) into a CUDA graph on the capture's side
     stream, replay it once and keep it for the key; returns the body's result, or ``None`` when the capture failed
     (recorded in the entry; the key then runs eagerly for the rest of the process).  The cache-config preference of the
@@ -6209,7 +6217,11 @@ def _graph_release(pinned: Any) -> int:
     be reused, and a later call that builds an equal key finds no entry and starts a new one.  Returns the number
     dropped.  A pinned plan view of the arena ``pinned`` (:func:`_plan_view`, the same ``arena`` tensor) matches
     too."""
-    arena = pinned.arena if isinstance(pinned, cake_backend.CakeKDANondetWorkspace) else None
+    arena = (
+        pinned.arena
+        if isinstance(pinned, cake_backend.CakeKDANondetWorkspace)
+        else None
+    )
     stale = [
         key
         for key, e in _GRAPHS.items()
@@ -6377,7 +6389,9 @@ def _prepare(
     use_qk_l2norm_in_kernel: bool = False,
 ):
     backend = get_backend()
-    opts = options if isinstance(options, CakeKDANondetKcpOptions) else _options(options)
+    opts = (
+        options if isinstance(options, CakeKDANondetKcpOptions) else _options(options)
+    )
     if save_mode not in SAVE_MODES:
         raise ValueError(f"save_mode must be one of {SAVE_MODES}, got {save_mode!r}")
     if save_mode != "light":
@@ -6637,7 +6651,9 @@ def _check_saved(saved: CakeKDANondetKcpSaved, call: CakeKDANondetKcpCall) -> No
     if saved.version != KCP_SAVED_VERSION:
         raise ValueError(f"saved: version {saved.version} is not {KCP_SAVED_VERSION}")
     if saved.ctx is not call.ctx:
-        raise ValueError("saved: the saved set belongs to another CakeKDANondetKcpContext")
+        raise ValueError(
+            "saved: the saved set belongs to another CakeKDANondetKcpContext"
+        )
     if (saved.T_r, saved.H, saved.n_frag, saved.P) != (
         call.T_r,
         call.H,
@@ -6901,7 +6917,9 @@ def _shaped_grads(
 _RAW_GRADS = ("dq", "dk", "dv", "dbeta", "dg_raw", "dA_log", "ddt_bias")
 
 
-def _bwd_body(call: CakeKDANondetKcpCall, saved: CakeKDANondetKcpSaved | None) -> tuple[torch.Tensor, ...]:
+def _bwd_body(
+    call: CakeKDANondetKcpCall, saved: CakeKDANondetKcpSaved | None
+) -> tuple[torch.Tensor, ...]:
     """The backward's allocations and launches (eagerly or inside a capture): ``(dq, dk, dv, dbeta, dg)``; in raw
     gate mode ``(dq, dk, dv, dbeta, dg_raw, dA_log, ddt_bias)`` with ``dg_raw`` the BF16 gradient of the raw gate
     (contiguous ``[T_r, H, 128]``), ``dA_log`` FP32 ``[H]`` and ``ddt_bias`` FP32 ``[H * 128]``: this rank's partial
@@ -7240,7 +7258,9 @@ def _kcp_in_backward() -> bool:
     return int(_GRAPH_TASK_ID_BINDING()) != -1
 
 
-def _handle_refusals(opts: CakeKDANondetKcpOptions, boundary_mode: str, handle: Any) -> None:
+def _handle_refusals(
+    opts: CakeKDANondetKcpOptions, boundary_mode: str, handle: Any
+) -> None:
     """The refusals of a call with a handle, shared by :func:`cake_kda_nondet_kcp` and the autograd Function: graph replay
     (keyword or test knob), a forward inside a CUDA-graph capture, ``debug_sequence``, ``spec3_probe``,
     ``boundary_mode="replay"`` and a handle without an ``entries`` dict."""
@@ -7271,7 +7291,9 @@ def _handle_refusals(opts: CakeKDANondetKcpOptions, boundary_mode: str, handle: 
 
 
 def _handle_options(
-    opts: CakeKDANondetKcpOptions, checkpoint_keep: str | None, explicit_save_transfer: Any
+    opts: CakeKDANondetKcpOptions,
+    checkpoint_keep: str | None,
+    explicit_save_transfer: Any,
 ) -> CakeKDANondetKcpOptions:
     """The options of a call with a handle: ``checkpoint_keep`` (default ``"states"``) fixes ``save_transfer``
     (``"states"`` -> ``False``, ``"transfer"`` -> ``True``); an explicit ``save_transfer`` that contradicts it, and
@@ -7501,7 +7523,9 @@ KCP_HANDOFF_DEFAULT = cake_kcp_plan.KCP_HANDOFF_DEFAULT
 KCP_HANDOFF_VERIFIED = cake_kcp_plan.KCP_HANDOFF_VERIFIED
 KCP_HANDOFF_HEADS = cake_kcp_plan.KCP_HANDOFF_HEADS
 KCP_HANDOFF_MIN_HEAD_TOKENS = cake_kcp_plan.KCP_HANDOFF_MIN_HEAD_TOKENS
-cake_kda_nondet_train_kcp_handoff_bytes = cake_kcp_plan.cake_kda_nondet_train_kcp_handoff_bytes
+cake_kda_nondet_train_kcp_handoff_bytes = (
+    cake_kcp_plan.cake_kda_nondet_train_kcp_handoff_bytes
+)
 # calls recorded with a kept ("save") / read ("bound") tape set, and the requests refused by the static keys, by reason
 # in _handoff_refusal's order (boundary, graph, spec3, backend, device, then "auto"'s heads / work / unverified):
 # counted once per checkpointed call, where the decision is made -- the original forward / the reentrant recompute,
@@ -7709,7 +7733,11 @@ def _handoff_phase(*inputs: Any) -> str | None:
 
 
 def _handoff_static(
-    mode: str, opts: CakeKDANondetKcpOptions, boundary_mode: str, v: torch.Tensor, ctx: Any
+    mode: str,
+    opts: CakeKDANondetKcpOptions,
+    boundary_mode: str,
+    v: torch.Tensor,
+    ctx: Any,
 ) -> str | None:
     """The refusal the call's own arguments decide (``None``: they admit the request; see the rule above):
     ``boundary_mode``, the ``graph`` and ``spec3_probe`` options, ``v`` off CUDA and, under ``"auto"``,
@@ -7742,7 +7770,11 @@ def _handoff_backend() -> str | None:
 
 
 def _handoff_refusal(
-    mode: str, opts: CakeKDANondetKcpOptions, boundary_mode: str, v: torch.Tensor, ctx: Any
+    mode: str,
+    opts: CakeKDANondetKcpOptions,
+    boundary_mode: str,
+    v: torch.Tensor,
+    ctx: Any,
 ) -> str | None:
     """Why a request the phase admitted keeps the light set (``None``: the forward keeps its tape set), in the order
     boundary, graph, spec3, backend, device, then under ``"auto"`` :func:`cake_kcp_plan.kcp_handoff_auto_refusal` of
@@ -8218,9 +8250,15 @@ def cake_kda_nondet_train_kcp_reduce_gate_param_grads(
 
 
 # the plan module's byte queries, re-exported for the KCP contract §3.2 literal forms
-cake_kda_nondet_train_kcp_saved_bytes = cake_kcp_plan.cake_kda_nondet_train_kcp_saved_bytes
-cake_kda_nondet_train_kcp_comm_bytes = cake_kcp_plan.cake_kda_nondet_train_kcp_comm_bytes
-cake_kda_nondet_train_kcp_workspace_bytes = cake_kcp_plan.cake_kda_nondet_train_kcp_workspace_bytes
+cake_kda_nondet_train_kcp_saved_bytes = (
+    cake_kcp_plan.cake_kda_nondet_train_kcp_saved_bytes
+)
+cake_kda_nondet_train_kcp_comm_bytes = (
+    cake_kcp_plan.cake_kda_nondet_train_kcp_comm_bytes
+)
+cake_kda_nondet_train_kcp_workspace_bytes = (
+    cake_kcp_plan.cake_kda_nondet_train_kcp_workspace_bytes
+)
 
 __all__ = [
     "ABI_PARAMS",
