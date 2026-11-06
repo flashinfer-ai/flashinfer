@@ -226,6 +226,13 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
         ".cake_rmsnorm_silu_gate_nondet_train",
         "CakeRMSNormSiLUGateNondetFunction",
     ),
+    # KDA chunked training (Cake), both modes, single rank and KCP: the facade
+    # modules; each imports its backend package (under
+    # flashinfer.experimental.cake) on first use.
+    "cake_kda_det_train": (".cake_kda_det_train", None),
+    "cake_kda_det_train_kcp": (".cake_kda_det_train_kcp", None),
+    "cake_kda_nondet_train": (".cake_kda_nondet_train", None),
+    "cake_kda_nondet_train_kcp": (".cake_kda_nondet_train_kcp", None),
 }
 
 

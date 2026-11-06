@@ -362,7 +362,7 @@ class Package:
     requires: tuple[str, ...] = ()
 
 
-# dsa_train, kda_det_train (and its non-deterministic counterpart cake.cake_kda_train), dsa_indexer, the rmsnorm, the mhc training, the causal conv1d, the ulysses, the NVFP4 SVDQuant GEMM, the Sage
+# dsa_train, cake.cake_kda_det_train (and cake.cake_kda_nondet_train), dsa_indexer, the rmsnorm, the mhc training, the causal conv1d, the ulysses, the NVFP4 SVDQuant GEMM, the Sage
 # block-sparse attention, the fused QK RoPE append (BF16 / FP8), the experimental NVFP4 attention (and its per-tile-max
 # variant cake_nvfp4_ptilemax_attention), the SM90 VSA,
 # the Kimi-K3 AttnRes, the experimental FP8 1D1D GEMM (deepgemm_fp8_gemm), the experimental batched FP8 projection (deepgemm_batched_gemm) and the experimental Mega Gate (deepgemm_mega_gate) backends are read with the generic walker (a mapping carrying ``library`` under an ``arches`` /
@@ -479,8 +479,8 @@ PACKAGES: tuple[Package, ...] = (
         refs_generic,
     ),
     Package(
-        "flashinfer.experimental.cake.cake_kda_train",
-        "flashinfer/experimental/cake/cake_kda_train",
+        "flashinfer.experimental.cake.cake_kda_nondet_train",
+        "flashinfer/experimental/cake/cake_kda_nondet_train",
         "cake_jit.py",
         refs_generic,
     ),
@@ -491,10 +491,12 @@ PACKAGES: tuple[Package, ...] = (
         refs_shipped_modules,
     ),
     Package(
-        "flashinfer.experimental.cake_kda_train_kcp",
-        "flashinfer/experimental/cake_kda_train_kcp",
+        "flashinfer.experimental.cake.cake_kda_nondet_train_kcp",
+        "flashinfer/experimental/cake/cake_kda_nondet_train_kcp",
         "cake_kcp_jit.py",
         refs_shipped_modules,
+        # each rank runs the non-deterministic single-rank package's chunk stages (its ``_single_rank``)
+        requires=("flashinfer.experimental.cake.cake_kda_nondet_train",),
     ),
     Package(
         "flashinfer.experimental.cake_gdn_det_train_kcp",
