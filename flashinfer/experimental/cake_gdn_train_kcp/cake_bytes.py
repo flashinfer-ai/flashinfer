@@ -559,7 +559,8 @@ def gdn_workspace_layout_kcp(
     (``c1_send_mf``, ``n_out`` states; ``c1_send`` stays the collective's bytes) follow it; the split terms do not
     depend on ``P``.  ``fused_walks`` is the call's test knob (1, the shipped form).  ``graph``,
     ``save_for_backward`` and ``fused_walks`` are keywords of this package's query only (the deterministic twin's has
-    none of them): through the facade they need ``deterministic=False`` with torch's deterministic algorithms off.
+    none of them).  Through the facade they need ``deterministic=False``, like every facade call;
+    ``torch.use_deterministic_algorithms`` does not change the route.
     The b1 pools are counted at the larger of their two split forms, as the host sizes them.  A backward on a
     caller-held workspace sizes the forward exchange pools too (``c1_send`` / ``c1_send_mf``, ``c2_send`` and
     ``c1_recv`` unless the saved set holds it; a call without ``workspace=`` skips them after a saved forward).

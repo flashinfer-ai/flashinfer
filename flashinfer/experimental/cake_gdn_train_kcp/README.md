@@ -28,6 +28,31 @@ the twin) and reads no environment variable.
 
 The numbers of this file (shapes, bytes, limits) are the contract.
 
+## Mode and dispatch rules
+
+| call | `deterministic=False` | any other value (the default, `True`, `None`, `0`, `1`, `"False"`) | under `torch.use_deterministic_algorithms(True)` (strict or `warn_only=True`) |
+|---|---|---|---|
+| `flashinfer.cake_gdn_train_kcp.*` (every entry, the byte queries and `is_gdn_train_kcp_supported` included) | runs this package | `ValueError` naming the deterministic entry, before any work | runs this package; no reroute, no mode or fallback warning (each entry's one-time `ExperimentalWarning` is unrelated to the mode) |
+| this package's compute entries (`chunk_gdn_kcp`, `chunk_gdn_fwd_kcp`, `chunk_gdn_bwd_kcp`) | runs | `ValueError` naming the deterministic entry | runs; no alert (every launch is fixed-order) |
+| `flashinfer.cake_gdn_det_train_kcp.*_det_*` (the deterministic route) | no `deterministic` keyword (`TypeError`) | no `deterministic` keyword | unchanged: every launch is fixed-order |
+
+* This package and its facade `flashinfer.cake_gdn_train_kcp` are the
+  non-deterministic route only.  Nothing routes a call to the deterministic
+  package and nothing falls back to it: a caller who wants the deterministic
+  route calls `flashinfer.cake_gdn_det_train_kcp` (`partition_det_kcp`,
+  `build_context_det_kcp`, `chunk_gdn_det_kcp`, ...).
+* Every call states the mode: pass `deterministic=False` on every facade
+  call, the partition, the context and the byte queries included.
+* PyTorch's deterministic algorithms do not change the route.  A launch whose
+  result can vary run to run raises PyTorch's alert immediately before it runs
+  (`RuntimeError`; a `UserWarning` and then the launch under
+  `warn_only=True`).  Every launch of this version is fixed-order, so no call
+  raises it.
+* The partition / context / byte-query functions of this package
+  (`partition_kcp`, `build_context_kcp`, `gdn_*_bytes_kcp`) take no mode
+  keyword; their facade copies take `deterministic=False` like every facade
+  entry.
+
 ## Public entry points (`flashinfer/cake_gdn_train_kcp.py`)
 
 ```python
@@ -38,15 +63,16 @@ from flashinfer.cake_gdn_train_kcp import (
     is_gdn_train_kcp_supported,
 )
 
-part = partition_kcp(cu_seqlens_global_cpu, world_size, layout="zigzag_per_document")   # once per batch layout
-ctx = build_context_kcp(part, group, rank, device, conv_kernel_size=4)                 # tables and collectives of this rank
+nd = dict(deterministic=False)                                                         # required on every call
+part = partition_kcp(cu_seqlens_global_cpu, world_size, layout="zigzag_per_document", **nd)  # once per batch layout
+ctx = build_context_kcp(part, group, rank, device, conv_kernel_size=4, **nd)          # tables and collectives of this rank
 
-out = chunk_gdn_kcp(q, k, v, g, beta, ctx)                                             # autograd
-out, saved = chunk_gdn_fwd_kcp(q, k, v, g, beta, ctx, save_for_backward=True)
-dq, dk, dv, dbeta, dg = chunk_gdn_bwd_kcp(q, k, v, g, beta, ctx, dout, saved=saved)
-dq, dk, dv, dbeta, dg = chunk_gdn_bwd_kcp(q, k, v, g, beta, ctx, dout)                 # saved=None: checkpoint replay
+out = chunk_gdn_kcp(q, k, v, g, beta, ctx, **nd)                                       # autograd
+out, saved = chunk_gdn_fwd_kcp(q, k, v, g, beta, ctx, save_for_backward=True, **nd)
+dq, dk, dv, dbeta, dg = chunk_gdn_bwd_kcp(q, k, v, g, beta, ctx, dout, saved=saved, **nd)
+dq, dk, dv, dbeta, dg = chunk_gdn_bwd_kcp(q, k, v, g, beta, ctx, dout, **nd)           # saved=None: checkpoint replay
 
-ws = gdn_workspace_bytes_kcp(ctx, H_qk=16, HV=48)                                      # per rank, pure CPU: a fresh workspace's first call
+ws = gdn_workspace_bytes_kcp(ctx, H_qk=16, HV=48, **nd)                                # per rank, pure CPU: a fresh workspace's first call
 ```
 
 These thirteen names are the whole public surface (the `__all__` of
@@ -98,15 +124,11 @@ The packed GDN training routes come in four combinations:
 | deterministic | `flashinfer.experimental.cake_gdn_det_train` | `flashinfer.cake_gdn_det_train_kcp` -> `flashinfer.experimental.cake_gdn_det_train_kcp` |
 | non-deterministic | `flashinfer.experimental.cake.cake_gdn_train` | `flashinfer.cake_gdn_train_kcp` with `deterministic=False` -> this package |
 
-* The facade `flashinfer.cake_gdn_train_kcp` takes `deterministic: bool = True`
-  on every entry: `True` runs the deterministic package's objects, `False`
-  runs this package.  With `torch.use_deterministic_algorithms(True)`,
-  `deterministic=False` runs the deterministic package and warns once per
-  process.
-* This package's compute entries (`chunk_gdn_kcp`, `chunk_gdn_fwd_kcp`,
-  `chunk_gdn_bwd_kcp`) take `deterministic: bool = True` as well and raise
-  `ValueError` unless it is `False`: the package holds no deterministic
-  program and never falls back.
+* The facade `flashinfer.cake_gdn_train_kcp` and this package's compute
+  entries take `deterministic: bool = True` on every entry and raise
+  `ValueError` unless it is `False` (see "Mode and dispatch rules"): the
+  package holds no deterministic program, never routes to the deterministic
+  package and never falls back.
 * Faster schedule: the default segment plan of this package (`fill_small_guard`)
   walks fewer intra-rank segments than the deterministic package's plan where
   segment merges cost more than they save: at `HV <= 12`, when no fragment
@@ -138,8 +160,7 @@ The packed GDN training routes come in four combinations:
 * The mode is not stored in the context, the partition or the options: both
   routes build the same plan objects.  The autograd node records its
   forward's mode and its backward refuses another; `chunk_gdn_bwd_kcp`
-  refuses a saved set that is not this package's (`SavedKcp`), and the
-  facade's deterministic backward refuses this package's saved set.
+  refuses a saved set that is not this package's (`SavedKcp`).
 * Accuracy: every output stays within the deterministic route's budgets
   against the FP64 reference (`rel-RMS <= 1e-2`, `max-abs <= 2e-2` of
   `max|ref|`; the per-tensor KCP budgets of the deterministic tests).  The
@@ -348,7 +369,7 @@ a `RecomputeHandleKcp` to the checkpointed function and to `chunk_gdn_kcp`:
 ```python
 def layer(x, handle):
     ...                                   # convolution, split, gates
-    return chunk_gdn_kcp(q, k, v, g, beta, ctx, recompute_handle=handle)
+    return chunk_gdn_kcp(q, k, v, g, beta, ctx, recompute_handle=handle, deterministic=False)
 
 y = torch.utils.checkpoint.checkpoint(layer, x, RecomputeHandleKcp(), use_reentrant=False)
 ```
@@ -493,7 +514,8 @@ gdn_workspace_bytes_kcp(ctx, *, H_qk, HV, save_mode="light", boundary_mode="save
     At P > 1 the c1 send pool also holds the M_f^T tiles (`c1_send_mf` = s * n_out(r)) and, with the fused walks, the
     carry plane max(n_in(r), n_out(r)) more slots (`fused_walks=0` is the test knob's split form); graph=,
     save_for_backward= and fused_walks= are keywords of this package's query only (the deterministic twin's query
-    has none: through the facade they need deterministic=False with torch's deterministic algorithms off); the b1
+    has none; through the facade they need deterministic=False, like every facade call, and
+    torch.use_deterministic_algorithms does not change the route); the b1
     pools take the larger split form; a backward on a caller-held workspace also sizes the forward exchange pools
     (c1_send, c2_send, c1_recv unless saved); with_conv=True (default) adds the layer convolution's halo rows, which
     the entry points do not allocate (with_conv=False: what a call binds); boundary_mode="replay" gives the same
