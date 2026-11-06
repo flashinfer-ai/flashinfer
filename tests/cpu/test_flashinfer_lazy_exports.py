@@ -44,9 +44,12 @@ import flashinfer
 
 rows = flashinfer._LAZY_EXPORTS
 assert rows, "the table is empty"
-for name, (module_name, attribute) in sorted(rows.items()):
+# Check every row before the first access: importing a row's module binds that
+# submodule on flashinfer, which also serves a module-valued row for it.
+for name in rows:
     assert name not in vars(flashinfer), f"{name} is bound by import flashinfer"
     assert name in dir(flashinfer), name
+for name, (module_name, attribute) in sorted(rows.items()):
     value = getattr(flashinfer, name)
     module = importlib.import_module(module_name, "flashinfer")
     if attribute is None:
