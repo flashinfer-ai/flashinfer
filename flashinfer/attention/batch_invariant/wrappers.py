@@ -644,6 +644,12 @@ class BatchInvariantAttention:
                 )
         if not q.is_contiguous():
             q = q.contiguous()
+        if q.data_ptr() % 16:
+            raise unsupported(
+                CLASS,
+                "a q whose base address is not 16-byte aligned",
+                "a 16-byte-aligned q (the TMA descriptor's requirement)",
+            )
         if out is None:
             out = torch.empty_like(q)
         elif (
@@ -651,6 +657,7 @@ class BatchInvariantAttention:
             or out.dtype != torch.bfloat16
             or out.device != self.device
             or not out.is_contiguous()
+            or out.data_ptr() % 16
         ):
             raise unsupported(
                 CLASS,
