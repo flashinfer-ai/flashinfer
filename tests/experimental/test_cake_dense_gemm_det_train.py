@@ -20,6 +20,7 @@ import dataclasses
 import gc
 import re
 import threading
+import warnings
 from collections import OrderedDict
 from pathlib import Path
 from types import SimpleNamespace
@@ -31,9 +32,9 @@ from tests.test_helpers.cake_package import cake_package
 
 # Backend suite: the package is named once, through ``cake_package``; nothing else
 # of flashinfer is imported here.
-cake_backend = cake_package("dense_projection_det_gemm", "cake_backend")
-cake_build = cake_package("dense_projection_det_gemm", "cake_build")
-cake_jit = cake_package("dense_projection_det_gemm", "cake_jit")
+cake_backend = cake_package("cake_dense_gemm_det_train", "cake_backend")
+cake_build = cake_package("cake_dense_gemm_det_train", "cake_build")
+cake_jit = cake_package("cake_dense_gemm_det_train", "cake_jit")
 ARCH_RULE_DEFAULTS = cake_backend.ARCH_RULE_DEFAULTS
 BLOCK_K = cake_backend.BLOCK_K
 BLOCK_N_CHOICES = cake_backend.BLOCK_N_CHOICES
@@ -71,11 +72,21 @@ sk_exact_plan = cake_backend.sk_exact_plan
 sk_sync_plan = cake_backend.sk_sync_plan
 check_stream_k_plan = cake_backend.check_stream_k_plan
 operand_view = cake_backend.operand_view
-plan_dense_projection_det_gemm = cake_backend.plan_dense_projection_det_gemm
-plan_router_fp32_det_gemm = cake_backend.plan_router_fp32_det_gemm
-prepare_dense_projection_det_gemm = cake_backend.prepare_dense_projection_det_gemm
-prepare_projection_det_wgrad = cake_backend.prepare_projection_det_wgrad
-prepare_router_fp32_det_gemm = cake_backend.prepare_router_fp32_det_gemm
+cake_dense_gemm_det_train_projection_plan = (
+    cake_backend.cake_dense_gemm_det_train_projection_plan
+)
+cake_dense_gemm_det_train_router_plan = (
+    cake_backend.cake_dense_gemm_det_train_router_plan
+)
+cake_dense_gemm_det_train_projection_prepare = (
+    cake_backend.cake_dense_gemm_det_train_projection_prepare
+)
+cake_dense_gemm_det_train_projection_wgrad_prepare = (
+    cake_backend.cake_dense_gemm_det_train_projection_wgrad_prepare
+)
+cake_dense_gemm_det_train_router_prepare = (
+    cake_backend.cake_dense_gemm_det_train_router_prepare
+)
 router_layout_class = cake_backend.router_layout_class
 row_rule = cake_backend.row_rule
 sk_parts_plan = cake_backend.sk_parts_plan
@@ -1545,7 +1556,7 @@ def test_round15_store_hint_knob():
     # the round-15 sm_107a rule: the batched MLA qabs forward (N = 512, K = 192) plans the 8-head interleave with
     # evict_last stores; sm_100a keeps the round-13 plan without the operand
     v = _views("mla", "qabs", "fwd", "bf16", 1001)
-    r200, *_ = plan_dense_projection_det_gemm(
+    r200, *_ = cake_dense_gemm_det_train_projection_plan(
         v["A"],
         v["B"],
         v["out"],
@@ -1556,7 +1567,7 @@ def test_round15_store_hint_knob():
     )
     assert r200.store_hint == "evict_last" and r200.batch_group == 8
     assert _nopro(r200.template) == "dense_proj_det_gemm_kn_n256_tma1_bg8_sol"
-    b200, *_ = plan_dense_projection_det_gemm(
+    b200, *_ = cake_dense_gemm_det_train_projection_plan(
         v["A"],
         v["B"],
         v["out"],
@@ -1611,7 +1622,7 @@ def test_round15_pd_sh_knobs():
     # the round-15 rules: the sm_107a indexer_k bf16 input gradient (N = 6144, K = 128) plans the 128-row two-slot
     # TMA-store family with the cross-tile pipelined drain; a caller-forced tall tile drops the family knob
     v = _views("proj", "indexer_k", "dgrad", "bf16", 1001)
-    r200, *_ = plan_dense_projection_det_gemm(
+    r200, *_ = cake_dense_gemm_det_train_projection_plan(
         v["A"],
         v["B"],
         v["out"],
@@ -1622,7 +1633,7 @@ def test_round15_pd_sh_knobs():
     )
     assert r200.pd == 2 and r200.slots == 2 and r200.cta_rows == 128
     assert _nopro(r200.template) == "dense_proj_det_gemm_kn_n256_tma2_pd2"
-    tall, *_ = plan_dense_projection_det_gemm(
+    tall, *_ = cake_dense_gemm_det_train_projection_plan(
         v["A"],
         v["B"],
         v["out"],
@@ -1803,7 +1814,7 @@ def test_sk_sync_rule_yields_to_caller_forced_forms():
     # registrations of the ``_m256`` / ``_ov`` programs), while a caller-forced ``sk_sync`` keeps raising on the conflict
     v = _views("proj", "q_a", "wgrad", "bf16", 16231)
     kw = dict(sm_count=212, l2_bytes=L2_BYTES, arch="sm_107a", _fallback=False)
-    rule, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], **kw)
+    rule, *_ = cake_dense_gemm_det_train_projection_plan(v["A"], v["B"], v["out"], **kw)
     assert (
         rule.sk_sync and rule.cta_rows == 128 and "_sks" in _nopro(rule.template)
     )  # round 25: the row's rule adds the slab path (`_sks_sb2`)
@@ -1814,7 +1825,7 @@ def test_sk_sync_rule_yields_to_caller_forced_forms():
         216,
     )
     assert rule.sk_iters == 86 and rule.sk_collectors == 20
-    tall, *_ = plan_dense_projection_det_gemm(
+    tall, *_ = cake_dense_gemm_det_train_projection_plan(
         v["A"], v["B"], v["out"], cta_rows=256, **kw
     )
     assert (
@@ -1823,12 +1834,12 @@ def test_sk_sync_rule_yields_to_caller_forced_forms():
         and "_sks" not in _nopro(tall.template)
     )
     assert tall.sk_iters == tall.tail_tiles and tall.sk_collectors == 0
-    ov, *_ = plan_dense_projection_det_gemm(
+    ov, *_ = cake_dense_gemm_det_train_projection_plan(
         v["A"], v["B"], v["out"], cta_rows=256, ovl=True, **kw
     )
     assert not ov.sk_sync and ov.ovl and "_ov" in _nopro(ov.template)
     with pytest.raises(ValueError, match="sk_sync needs the single-pass"):
-        plan_dense_projection_det_gemm(
+        cake_dense_gemm_det_train_projection_plan(
             v["A"], v["B"], v["out"], cta_rows=256, ovl=True, sk_sync=True, **kw
         )
 
@@ -1962,7 +1973,9 @@ def test_round19_cta1_plans_one_cta_per_tile(T):
     # policy, and the raster group may be any count >= 1  [Cake launcher]
     v = _views("proj", "indexer_hw", "fwd", "bf16", T)
     kw = dict(sm_count=148, l2_bytes=L2_BYTES, arch="sm_100a", _fallback=False)
-    plan, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], cta1=True, **kw)
+    plan, *_ = cake_dense_gemm_det_train_projection_plan(
+        v["A"], v["B"], v["out"], cta1=True, **kw
+    )
     assert plan.cta1 and _nopro(plan.template) == "dense_proj_det_gemm_kk_n128_hen_c1"
     assert (plan.m_tiles, plan.n_tiles, plan.pair_tiles, plan.sm_pairs) == (
         127,
@@ -1974,7 +1987,7 @@ def test_round19_cta1_plans_one_cta_per_tile(T):
     assert plan.grid == (plan.m_tiles * plan.n_tiles, 1, 1) == (127, 1, 1)
     assert plan.stages == 7 and plan.ws_f32_elems == 0 and plan.sk_slab == 0
     assert plan.wave_working_set_bytes == wave_working_set(127, 1, 6144, 16, 148)
-    pair, *_ = plan_dense_projection_det_gemm(
+    pair, *_ = cake_dense_gemm_det_train_projection_plan(
         v["A"], v["B"], v["out"], cta1=False, **kw
     )
     assert not pair.cta1 and _nopro(pair.template) == "dense_proj_det_gemm_kk_n128_hen"
@@ -1986,12 +1999,12 @@ def test_round19_cta1_plans_one_cta_per_tile(T):
     )
     assert pair.grid == (128, 1, 1)
     # a raster group of one is admitted under cta1 only
-    one, *_ = plan_dense_projection_det_gemm(
+    one, *_ = cake_dense_gemm_det_train_projection_plan(
         v["A"], v["B"], v["out"], cta1=True, group_m=1, **kw
     )
     assert one.group_m == 1 and _nopro(one.template) == _nopro(plan.template)
     with pytest.raises(ValueError, match="group_m must be an even number"):
-        plan_dense_projection_det_gemm(
+        cake_dense_gemm_det_train_projection_plan(
             v["A"], v["B"], v["out"], cta1=False, group_m=1, **kw
         )
     # the form carries no tail policy: a caller combining it with one asked for two incompatible forms
@@ -2004,12 +2017,12 @@ def test_round19_cta1_plans_one_cta_per_tile(T):
         dict(sk_max_units=48),
     ):
         with pytest.raises(ValueError, match="cta1 excludes"):
-            plan_dense_projection_det_gemm(
+            cake_dense_gemm_det_train_projection_plan(
                 v["A"], v["B"], v["out"], cta1=True, **bad, **kw
             )
     # a small T: one wave's panels fit the L2, so the form keeps the hint-free program
     small = _views("proj", "indexer_hw", "fwd", "bf16", 2049)
-    short, *_ = plan_dense_projection_det_gemm(
+    short, *_ = cake_dense_gemm_det_train_projection_plan(
         small["A"], small["B"], small["out"], cta1=True, **kw
     )
     assert _nopro(
@@ -2058,7 +2071,9 @@ def test_round19_rules_plan_like_the_cake_launcher(T):
     # streaming A operand evict_first (one column tile, the wave's panels exceed the L2)
     for row in ("indexer_hw", "indexer_k"):
         v = _views("proj", row, "fwd", "bf16", T)
-        plan, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], **kw)
+        plan, *_ = cake_dense_gemm_det_train_projection_plan(
+            v["A"], v["B"], v["out"], **kw
+        )
         assert (
             plan.cta1 and _nopro(plan.template) == "dense_proj_det_gemm_kk_n128_hen_c1"
         ), row
@@ -2074,14 +2089,14 @@ def test_round19_rules_plan_like_the_cake_launcher(T):
     # stages (``_s4``: the single-CTA default is five), 127 x 48 tiles; a caller forcing the pair form drops the
     # rule's stage count (the pair default of that family is six)
     v = _views("proj", "indexer_hw", "dgrad", "f32", T)
-    plan, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], **kw)
+    plan, *_ = cake_dense_gemm_det_train_projection_plan(v["A"], v["B"], v["out"], **kw)
     assert (
         plan.cta1
         and _nopro(plan.template) == "dense_proj_det_gemm_kn_n128_f32_tma2_s4_c1"
     )
     assert (plan.m_tiles, plan.n_tiles, plan.stages, plan.sm_pairs) == (127, 48, 4, 148)
     assert plan.grid == (127 * 48, 1, 1) and plan.sk_units == 0
-    pair, *_ = plan_dense_projection_det_gemm(
+    pair, *_ = cake_dense_gemm_det_train_projection_plan(
         v["A"], v["B"], v["out"], cta1=False, **kw
     )
     assert (
@@ -2097,7 +2112,7 @@ def test_round19_rules_plan_like_the_cake_launcher(T):
     # test_gb_t_exact_sks_wgrad_rules_plan_their_programs)
     v = _views("proj", "indexer_q", "wgrad", "bf16", T + 1)
     assert not v["transposed"]
-    bf16, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], **kw)
+    bf16, *_ = cake_dense_gemm_det_train_projection_plan(v["A"], v["B"], v["out"], **kw)
     assert bf16.sk_sync and bf16.sk_slab == 2
     assert _nopro(bf16.template) == "dense_proj_det_gemm_nn_n256_m256_sks_sb2"
     assert (bf16.pair_tiles, bf16.k_blocks, bf16.sm_pairs) == (
@@ -2115,7 +2130,9 @@ def test_round19_rules_plan_like_the_cake_launcher(T):
     assert bf16.grid == (148, 1, 1) and bf16.sk_iters == 64
     assert bf16.ws_f32_elems == 64 * 2 * 256 * 256
     vf = _views("proj", "indexer_q", "wgrad", "f32", T)
-    f32, *_ = plan_dense_projection_det_gemm(vf["A"], vf["B"], vf["out"], **kw)
+    f32, *_ = cake_dense_gemm_det_train_projection_plan(
+        vf["A"], vf["B"], vf["out"], **kw
+    )
     assert f32.sk_sync and f32.sk_slab == 3 and f32.epi == "tma"
     assert _nopro(f32.template) == "dense_proj_det_gemm_nn_n256_m256_f32_tma1_sks_sb3"
     assert (f32.num_full, f32.tail_tiles, f32.sk_units, f32.iters_per_unit) == (
@@ -2129,34 +2146,40 @@ def test_round19_rules_plan_like_the_cake_launcher(T):
     # pipeline cannot stage the eight 16 KiB warp slabs, so the row keeps the plain synchronised program; a
     # caller-forced ``sk_slab`` keeps raising on such a conflict, and a caller-forced tile family drops the rule's
     # synchronised plan with its slab path
-    reg, *_ = plan_dense_projection_det_gemm(
+    reg, *_ = cake_dense_gemm_det_train_projection_plan(
         vf["A"], vf["B"], vf["out"], epi="reg", **kw
     )
     assert reg.sk_sync and reg.sk_slab == 2
     assert _nopro(reg.template) == "dense_proj_det_gemm_nn_n256_m256_f32_sks_sb2"
-    narrow, *_ = plan_dense_projection_det_gemm(
+    narrow, *_ = cake_dense_gemm_det_train_projection_plan(
         v["A"], v["B"], v["out"], stages=2, **kw
     )
     assert narrow.sk_sync and narrow.sk_slab == 0
     assert _nopro(narrow.template) == "dense_proj_det_gemm_nn_n256_m256_s2_sks"
     with pytest.raises(ValueError, match="sk_slab=3"):
-        plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], sk_slab=3, **kw)
+        cake_dense_gemm_det_train_projection_plan(
+            v["A"], v["B"], v["out"], sk_slab=3, **kw
+        )
     with pytest.raises(ValueError, match="too small"):
-        plan_dense_projection_det_gemm(
+        cake_dense_gemm_det_train_projection_plan(
             v["A"], v["B"], v["out"], stages=2, sk_slab=2, **kw
         )
-    std, *_ = plan_dense_projection_det_gemm(
+    std, *_ = cake_dense_gemm_det_train_projection_plan(
         v["A"], v["B"], v["out"], cta_rows=128, **kw
     )
     assert not std.sk_sync and std.sk_slab == 0 and "_sks" not in _nopro(std.template)
-    off, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], sk=False, **kw)
+    off, *_ = cake_dense_gemm_det_train_projection_plan(
+        v["A"], v["B"], v["out"], sk=False, **kw
+    )
     assert (
         not off.sk_sync and _nopro(off.template) == "dense_proj_det_gemm_nn_n256_m256"
     )
     # at the test tables' T the synchronised plan is not admitted (a part under SK_MIN_ITERS): the plain tall plan
     for short_T in (2049, 1001):
         vs = _views("proj", "indexer_q", "wgrad", "bf16", short_T)
-        short, *_ = plan_dense_projection_det_gemm(vs["A"], vs["B"], vs["out"], **kw)
+        short, *_ = cake_dense_gemm_det_train_projection_plan(
+            vs["A"], vs["B"], vs["out"], **kw
+        )
         assert (
             not short.sk_sync
             and short.sk_slab == 0
@@ -2178,21 +2201,21 @@ def test_round20_rules_plan_like_the_cake_launcher(T):
     # the table size is asserted by the newest round's test (round 21: 98 = 49 + 49); round 20 shipped 98 = 49 + 49
     kw = dict(sm_count=148, l2_bytes=L2_BYTES, arch="sm_100a", _fallback=False)
     v = _views("proj", "shared_down", "dgrad", "bf16", T)
-    plan, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], **kw)
+    plan, *_ = cake_dense_gemm_det_train_projection_plan(v["A"], v["B"], v["out"], **kw)
     assert _nopro(plan.template) == "dense_proj_det_gemm_kn_n256" and not plan.cta1
     assert plan.group_m == 8
     assert (
         default_group_m(False, True, plan.m_tiles, plan.pair_tiles, plan.sm_pairs) == 16
     )
     # a caller-forced raster group overrides the rule on the same program
-    forced, *_ = plan_dense_projection_det_gemm(
+    forced, *_ = cake_dense_gemm_det_train_projection_plan(
         v["A"], v["B"], v["out"], group_m=16, **kw
     )
     assert _nopro(forced.template) == _nopro(plan.template) and forced.group_m == 16
     # the shared_down forward (X @ W^T, 6144 x 2048) has no ragged rule and keeps the 16-row default on ``kk_n256``
     # (one token off the GB T-exact keys at T 16172 / 16231: test_gb_t_exact_rules_plan_their_programs)
     f = _views("proj", "shared_down", "fwd", "bf16", T + 1)
-    fwd, *_ = plan_dense_projection_det_gemm(f["A"], f["B"], f["out"], **kw)
+    fwd, *_ = cake_dense_gemm_det_train_projection_plan(f["A"], f["B"], f["out"], **kw)
     assert fwd.group_m == 16 and _nopro(fwd.template) == "dense_proj_det_gemm_kk_n256"
 
 
@@ -2232,7 +2255,9 @@ def test_round21_rules_plan_like_the_cake_launcher(T):
     v = _views("proj", "kv_a", "dgrad", "bf16", T)
     # (the row's eight-warp CTA form is forced off here - its own test is
     # test_eight_warp_form_rules_plan_their_programs; the ten-warp program below is the row's program where it yields)
-    plan, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], form="", **kw)
+    plan, *_ = cake_dense_gemm_det_train_projection_plan(
+        v["A"], v["B"], v["out"], form="", **kw
+    )
     assert (
         _nopro(plan.template) == "dense_proj_det_gemm_kn_n256_tma1_pd2"
         and not plan.cta1
@@ -2247,7 +2272,7 @@ def test_round21_rules_plan_like_the_cake_launcher(T):
     ) == ("tma", 1, 2, 12, 128, 256)
     # a caller forcing the former form still plans the round-20 program of the row; the rule's ``pd`` carries over
     # into a forced form unless the caller sets it (``pd=0``), exactly as in the Cake launcher
-    old, *_ = plan_dense_projection_det_gemm(
+    old, *_ = cake_dense_gemm_det_train_projection_plan(
         v["A"], v["B"], v["out"], epi="reg", quad_store=True, stages=6, pd=0, **kw
     )
     assert (
@@ -2258,16 +2283,18 @@ def test_round21_rules_plan_like_the_cake_launcher(T):
     # the sibling rows keep their programs: the sm_107a kv_a bf16 input gradient (quad stores + in-tile drain), the fp32 kv_a input
     # gradient (one-slot TMA store, no drain) and the indexer_hw bf16 input gradient (two-slot TMA store + the cross-tile drain)
     kw107 = dict(sm_count=212, l2_bytes=L2_BYTES, arch="sm_107a", _fallback=False)
-    p107, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], **kw107)
+    p107, *_ = cake_dense_gemm_det_train_projection_plan(
+        v["A"], v["B"], v["out"], **kw107
+    )
     assert (
         _nopro(p107.template) == "dense_proj_det_gemm_kn_n256_q_pd1"
         and p107.group_m == 8
     )
     f = _views("proj", "kv_a", "dgrad", "f32", T)
-    pf, *_ = plan_dense_projection_det_gemm(f["A"], f["B"], f["out"], **kw)
+    pf, *_ = cake_dense_gemm_det_train_projection_plan(f["A"], f["B"], f["out"], **kw)
     assert _nopro(pf.template) == "dense_proj_det_gemm_kn_n256_f32_tma1" and pf.pd == 0
     h = _views("proj", "indexer_hw", "dgrad", "bf16", T)
-    ph, *_ = plan_dense_projection_det_gemm(h["A"], h["B"], h["out"], **kw)
+    ph, *_ = cake_dense_gemm_det_train_projection_plan(h["A"], h["B"], h["out"], **kw)
     assert _nopro(ph.template) == "dense_proj_det_gemm_kn_n256_tma2_pd2"
     # round 21 (W3, lever B): the sm_100a shared_gate_up forward bf16 (X @ W^T, 2048 x 6144 x T) keeps its raster group 8
     # and takes the column-grouped raster form (``kk_n256_cg``, instance-key field 29: the group counts column tiles);
@@ -2281,18 +2308,18 @@ def test_round21_rules_plan_like_the_cake_launcher(T):
         "cgrp": True,
     }
     g = _views("proj", "shared_gate_up", "fwd", "bf16", T)
-    pg, *_ = plan_dense_projection_det_gemm(g["A"], g["B"], g["out"], **kw)
+    pg, *_ = cake_dense_gemm_det_train_projection_plan(g["A"], g["B"], g["out"], **kw)
     assert (
         pg.cgrp
         and _nopro(pg.template) == "dense_proj_det_gemm_kk_n256_cg"
         and pg.group_m == 8
     )
-    pg107, *_ = plan_dense_projection_det_gemm(
+    pg107, *_ = cake_dense_gemm_det_train_projection_plan(
         g["A"], g["B"], g["out"], cgrp=False, **kw107
     )
     assert not pg107.cgrp and _nopro(pg107.template) == "dense_proj_det_gemm_kk_n256"
     q = _views("proj", "q_a", "fwd", "bf16", T)
-    pq, *_ = plan_dense_projection_det_gemm(q["A"], q["B"], q["out"], **kw)
+    pq, *_ = cake_dense_gemm_det_train_projection_plan(q["A"], q["B"], q["out"], **kw)
     assert (
         pq.cgrp
         and _nopro(pq.template) == "dense_proj_det_gemm_kk_n256_cg"
@@ -2323,7 +2350,9 @@ def test_round24_rules_plan_like_the_cake_launcher(T):
         "cta1": True,
     }
     h = _views("proj", "indexer_hw", "dgrad", "bf16", T)
-    ph, *_ = plan_dense_projection_det_gemm(h["A"], h["B"], h["out"], **kw107)
+    ph, *_ = cake_dense_gemm_det_train_projection_plan(
+        h["A"], h["B"], h["out"], **kw107
+    )
     # TEMPLATES_REACHED_NEW (the kernel's rule comment names kn_n256_tma2_pd3_c1: K = 32 <= K_TMA_BF16 keeps the row's two-slot
     # TMA-store epilogue; the K-less by-kwargs identity render kn_n256_pd3_c1 is the register-epilogue sibling, not this plan)
     assert _nopro(ph.template) == "dense_proj_det_gemm_kn_n256_tma2_pd3_c1" and ph.cta1
@@ -2336,7 +2365,7 @@ def test_round24_rules_plan_like_the_cake_launcher(T):
         256,
     )
     # a caller forcing the former form still plans the round-21 program of the row (pd passed explicitly)
-    old_h, *_ = plan_dense_projection_det_gemm(
+    old_h, *_ = cake_dense_gemm_det_train_projection_plan(
         h["A"], h["B"], h["out"], cta1=False, pd=2, **kw107
     )
     assert (
@@ -2345,9 +2374,13 @@ def test_round24_rules_plan_like_the_cake_launcher(T):
     )
     # the control row indexer_k (K 128 is another key) and the sm_100a sibling keep their round-21 programs
     k_ = _views("proj", "indexer_k", "dgrad", "bf16", T)
-    pk, *_ = plan_dense_projection_det_gemm(k_["A"], k_["B"], k_["out"], **kw107)
+    pk, *_ = cake_dense_gemm_det_train_projection_plan(
+        k_["A"], k_["B"], k_["out"], **kw107
+    )
     assert _nopro(pk.template) == "dense_proj_det_gemm_kn_n256_tma2_pd2" and not pk.cta1
-    ph100, *_ = plan_dense_projection_det_gemm(h["A"], h["B"], h["out"], **kw)
+    ph100, *_ = cake_dense_gemm_det_train_projection_plan(
+        h["A"], h["B"], h["out"], **kw
+    )
     assert (
         _nopro(ph100.template) == "dense_proj_det_gemm_kn_n256_tma2_pd2"
         and not ph100.cta1
@@ -2357,7 +2390,9 @@ def test_round24_rules_plan_like_the_cake_launcher(T):
     fkey = ("sm_107a", False, True, True, False, False, 6144, 32, None)
     assert ROW_RULES[fkey] == {"block_n": 128, "slots": 1, "group_m": 2, "cta1": True}
     f = _views("proj", "indexer_hw", "dgrad", "f32", T)
-    pf, *_ = plan_dense_projection_det_gemm(f["A"], f["B"], f["out"], **kw107)
+    pf, *_ = cake_dense_gemm_det_train_projection_plan(
+        f["A"], f["B"], f["out"], **kw107
+    )
     assert (
         _nopro(pf.template) == "dense_proj_det_gemm_kn_n128_f32_tma1_c1" and pf.cta1
     )  # TEMPLATES_REACHED_NEW (the kernel's rule comment names kn_n128_f32_tma1_c1)
@@ -2368,7 +2403,7 @@ def test_round24_rules_plan_like_the_cake_launcher(T):
         128,
         128,
     )
-    old_f, *_ = plan_dense_projection_det_gemm(
+    old_f, *_ = cake_dense_gemm_det_train_projection_plan(
         f["A"], f["B"], f["out"], cta1=False, slots=2, **kw107
     )
     assert (
@@ -2380,13 +2415,15 @@ def test_round24_rules_plan_like_the_cake_launcher(T):
     wkey = ("sm_107a", True, True, False, False, False, 2048, None, 6144)
     assert ROW_RULES[wkey] == {"sk_sync": True, "sk_sync_m": 38, "sk_slab": 2}
     w = _views("proj", "shared_down", "wgrad", "bf16", T)
-    pw, *_ = plan_dense_projection_det_gemm(w["A"], w["B"], w["out"], **kw107)
+    pw, *_ = cake_dense_gemm_det_train_projection_plan(
+        w["A"], w["B"], w["out"], **kw107
+    )
     assert (
         _nopro(pw.template) == "dense_proj_det_gemm_nn_n256_sks_sb2"
         and pw.sk_sync
         and pw.sk_slab == 2
     )  # TEMPLATES_REACHED_NEW (by-kwargs identity: nn_n256_sks_sb2)
-    old_w, *_ = plan_dense_projection_det_gemm(
+    old_w, *_ = cake_dense_gemm_det_train_projection_plan(
         w["A"], w["B"], w["out"], sk_sync=False, **kw107
     )
     assert (
@@ -2405,7 +2442,9 @@ def test_round24_rules_plan_like_the_cake_launcher(T):
     ] == {"group_m": 8, "cgrp": True}  # unchanged since round 21
     for row in ("q_a", "shared_gate_up"):
         g = _views("proj", row, "fwd", "bf16", T)
-        pg, *_ = plan_dense_projection_det_gemm(g["A"], g["B"], g["out"], **kw107)
+        pg, *_ = cake_dense_gemm_det_train_projection_plan(
+            g["A"], g["B"], g["out"], **kw107
+        )
         # TEMPLATES_REACHED_NEW / the figen tables (dense_proj_det_gemm_kk_n256_cg = the round-21 sm_100a program; the cgrp hint gate stays
         # ('none', 'none') at 106 pairs - wave_working_set_cgrp(128, 8, 6144, 8, 106) = 22 x 256 x 6144 x 2 B = 69 206 016 B <= L2_BYTES)
         assert (
@@ -2413,7 +2452,7 @@ def test_round24_rules_plan_like_the_cake_launcher(T):
             and _nopro(pg.template) == "dense_proj_det_gemm_kk_n256_cg"
             and pg.group_m == 8
         ), row
-        old_g, *_ = plan_dense_projection_det_gemm(
+        old_g, *_ = cake_dense_gemm_det_train_projection_plan(
             g["A"], g["B"], g["out"], cgrp=False, **kw107
         )
         assert (
@@ -2430,7 +2469,9 @@ def test_round24_rules_plan_like_the_cake_launcher(T):
         "group_m": 12,
     }
     d = _views("proj", "dense_down", "fwd", "bf16", T)
-    pd_, *_ = plan_dense_projection_det_gemm(d["A"], d["B"], d["out"], **kw107)
+    pd_, *_ = cake_dense_gemm_det_train_projection_plan(
+        d["A"], d["B"], d["out"], **kw107
+    )
     # TEMPLATES_REACHED_NEW: the `_cg_or` tall program WITHOUT `_ht` (sk_parts is the row's tail policy; by-kwargs identity: kk_n256_m256_cg_or)
     assert (
         _nopro(pd_.template) == "dense_proj_det_gemm_kk_n256_m256_cg_or"
@@ -2440,7 +2481,7 @@ def test_round24_rules_plan_like_the_cake_launcher(T):
         and not pd_.htail
     )
     assert (pd_.cta_rows, pd_.block_n, pd_.group_m) == (256, 256, 12)
-    old_d, *_ = plan_dense_projection_det_gemm(
+    old_d, *_ = cake_dense_gemm_det_train_projection_plan(
         d["A"], d["B"], d["out"], ovr=False, cgrp=False, **kw107
     )
     assert (
@@ -2459,7 +2500,9 @@ def test_round24_rules_plan_like_the_cake_launcher(T):
         "group_m": 8,
     }
     o = _views("proj", "o_proj", "fwd", "bf16", T)
-    po, *_ = plan_dense_projection_det_gemm(o["A"], o["B"], o["out"], **kw107)
+    po, *_ = cake_dense_gemm_det_train_projection_plan(
+        o["A"], o["B"], o["out"], **kw107
+    )
     # TEMPLATES_REACHED_NEW (the kernel registers dense_projection_det_gemm_kk_m256_ht_or_cg -> symbol ..._m256_ht_cg_or)
     assert (
         _nopro(po.template) == "dense_proj_det_gemm_kk_n256_m256_ht_cg_or"
@@ -2469,7 +2512,7 @@ def test_round24_rules_plan_like_the_cake_launcher(T):
         and not po.ovl
     )
     assert (po.cta_rows, po.block_n, po.group_m) == (256, 256, 8)
-    old_o, *_ = plan_dense_projection_det_gemm(
+    old_o, *_ = cake_dense_gemm_det_train_projection_plan(
         o["A"], o["B"], o["out"], ovr=False, ovl=True, cgrp=False, **kw107
     )
     assert (
@@ -2479,13 +2522,17 @@ def test_round24_rules_plan_like_the_cake_launcher(T):
     )
     # the sm_100a dense_down / o_proj forwards carry no ovr rule and keep their round-21 programs (o_proj at T 16231:
     # the round-8 T-exact key's row-half-release program, test_gb_t_exact_rules_plan_their_programs)
-    pd100, *_ = plan_dense_projection_det_gemm(d["A"], d["B"], d["out"], **kw)
+    pd100, *_ = cake_dense_gemm_det_train_projection_plan(
+        d["A"], d["B"], d["out"], **kw
+    )
     assert (
         _nopro(pd100.template) == "dense_proj_det_gemm_kk_n256_m256_ov_ht"
         and not pd100.ovr
         and not pd100.cgrp
     )
-    po100, *_ = plan_dense_projection_det_gemm(o["A"], o["B"], o["out"], **kw)
+    po100, *_ = cake_dense_gemm_det_train_projection_plan(
+        o["A"], o["B"], o["out"], **kw
+    )
     if T == 16231:
         assert (
             _nopro(po100.template) == "dense_proj_det_gemm_kk_n256_m256_ht_cg_or"
@@ -2526,7 +2573,9 @@ def test_round25_rules_plan_like_the_cake_launcher(T):
         "store_ef": True,
     }
     sdf = _views("proj", "shared_down", "wgrad", "f32", T)
-    p_sdf, *_ = plan_dense_projection_det_gemm(sdf["A"], sdf["B"], sdf["out"], **kw107)
+    p_sdf, *_ = cake_dense_gemm_det_train_projection_plan(
+        sdf["A"], sdf["B"], sdf["out"], **kw107
+    )
     assert (
         _nopro(p_sdf.template) == "dense_proj_det_gemm_nn_n256_f32_v8_ef_sks_sb2"
     )  # ROUTE_TEMPLATE_NEW of the round-25 templates step = TEMPLATES_REACHED_NEW (nn_n256_f32_v8_ef_sks_sb2, the round-25 sweep symbol)
@@ -2540,7 +2589,7 @@ def test_round25_rules_plan_like_the_cake_launcher(T):
     assert (p_sdf.cta_rows, p_sdf.block_n) == (128, 256) and not p_sdf.htail
     # a caller forcing the former tall form plans the lock-e9d8042b program of the row (the forced cta_rows leaves the rule's 128-row family,
     # so the planner drops the rule's epilogue / tail knobs; sk_sync and the TMA-store epilogue are passed explicitly all the same)
-    old_sdf, *_ = plan_dense_projection_det_gemm(
+    old_sdf, *_ = cake_dense_gemm_det_train_projection_plan(
         sdf["A"], sdf["B"], sdf["out"], cta_rows=256, sk_sync=False, epi="tma", **kw107
     )
     assert (
@@ -2561,7 +2610,9 @@ def test_round25_rules_plan_like_the_cake_launcher(T):
     }
     for row in ("q_a", "shared_gate_up"):
         v = _views("proj", row, "wgrad", "f32", T)
-        p, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], **kw107)
+        p, *_ = cake_dense_gemm_det_train_projection_plan(
+            v["A"], v["B"], v["out"], **kw107
+        )
         assert _nopro(p.template) == "dense_proj_det_gemm_nn_n256_f32_v8_ef_sks_sb2", (
             row
         )  # ROUTE_TEMPLATE_NEW of the round-25 templates step = TEMPLATES_REACHED_NEW (nn_n256_f32_v8_ef_sks_sb2)
@@ -2573,7 +2624,7 @@ def test_round25_rules_plan_like_the_cake_launcher(T):
             and p.store_ef
             and p.cta_rows == 128
         ), row
-        old, *_ = plan_dense_projection_det_gemm(
+        old, *_ = cake_dense_gemm_det_train_projection_plan(
             v["A"], v["B"], v["out"], cta_rows=256, sk_sync=False, epi="tma", **kw107
         )
         assert (
@@ -2588,12 +2639,14 @@ def test_round25_rules_plan_like_the_cake_launcher(T):
     assert ROW_RULES[qab_key] == {"sk_sync": True, "sk_sync_m": 26, "sk_slab": 2}
     for row in ("q_a", "shared_gate_up"):
         v = _views("proj", row, "wgrad", "bf16", T)
-        p, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], **kw107)
+        p, *_ = cake_dense_gemm_det_train_projection_plan(
+            v["A"], v["B"], v["out"], **kw107
+        )
         assert _nopro(p.template) == "dense_proj_det_gemm_nn_n256_sks_sb2", (
             row
         )  # ROUTE_TEMPLATE_NEW of the round-25 templates step (nn_n256_sks_sb2 = the round-24 sm_107a shared_down wgrad bf16 program, no new template)
         assert p.sk_sync and p.sk_slab == 2 and p.cta_rows == 128, row
-        old, *_ = plan_dense_projection_det_gemm(
+        old, *_ = cake_dense_gemm_det_train_projection_plan(
             v["A"], v["B"], v["out"], sk_slab=0, **kw107
         )
         assert (
@@ -2606,7 +2659,7 @@ def test_round25_rules_plan_like_the_cake_launcher(T):
         ("sm_107a", True, True, False, False, False, 2048, None, 6144)
     ] == {"sk_sync": True, "sk_sync_m": 38, "sk_slab": 2}
     sdb107 = _views("proj", "shared_down", "wgrad", "bf16", T)
-    p_ctl, *_ = plan_dense_projection_det_gemm(
+    p_ctl, *_ = cake_dense_gemm_det_train_projection_plan(
         sdb107["A"], sdb107["B"], sdb107["out"], **kw107
     )
     assert (
@@ -2624,7 +2677,7 @@ def test_round25_rules_plan_like_the_cake_launcher(T):
         "sk_sync_m": 26,
         "sk_slab": 2,
     }
-    p_sdb, *_ = plan_dense_projection_det_gemm(
+    p_sdb, *_ = cake_dense_gemm_det_train_projection_plan(
         sdb107["A"], sdb107["B"], sdb107["out"], **kw
     )
     assert (
@@ -2637,7 +2690,7 @@ def test_round25_rules_plan_like_the_cake_launcher(T):
         and p_sdb.group_m == 4
         and p_sdb.cta_rows == 128
     )
-    old_sdb, *_ = plan_dense_projection_det_gemm(
+    old_sdb, *_ = cake_dense_gemm_det_train_projection_plan(
         sdb107["A"], sdb107["B"], sdb107["out"], sk_sync=False, sk_exact=3, **kw
     )
     assert (
@@ -2651,12 +2704,14 @@ def test_round25_rules_plan_like_the_cake_launcher(T):
     assert ROW_RULES[qab100_key] == {"sk_sync": True, "sk_sync_m": 26, "sk_slab": 2}
     for row in ("q_a", "shared_gate_up"):
         v = _views("proj", row, "wgrad", "bf16", T)
-        p, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], **kw)
+        p, *_ = cake_dense_gemm_det_train_projection_plan(
+            v["A"], v["B"], v["out"], **kw
+        )
         assert _nopro(p.template) == "dense_proj_det_gemm_nn_n256_sks_sb2", row
         assert p.sk_sync and p.sk_slab == 2 and p.sk_exact == 0 and p.cta_rows == 128, (
             row
         )
-        old, *_ = plan_dense_projection_det_gemm(
+        old, *_ = cake_dense_gemm_det_train_projection_plan(
             v["A"], v["B"], v["out"], sk_sync=False, sk_exact=3, **kw
         )
         assert (
@@ -2676,7 +2731,9 @@ def test_round25_rules_plan_like_the_cake_launcher(T):
         "sk_sync_m": 26,
         "sk_slab": 2,
     }
-    p_sdf100, *_ = plan_dense_projection_det_gemm(sdf["A"], sdf["B"], sdf["out"], **kw)
+    p_sdf100, *_ = cake_dense_gemm_det_train_projection_plan(
+        sdf["A"], sdf["B"], sdf["out"], **kw
+    )
     assert (
         _nopro(p_sdf100.template) == "dense_proj_det_gemm_nn_n256_f32_v8_ef_sks_sb2"
     )  # ROUTE_TEMPLATE_NEW of the templates step = TEMPLATES_REACHED_NEW (predicted nn_n256_f32_v8_ef_sks_sb2 - the same new program as the sm_107a fp32 rows; confirm per route)
@@ -2688,7 +2745,7 @@ def test_round25_rules_plan_like_the_cake_launcher(T):
         and p_sdf100.store_ef
         and p_sdf100.group_m == 8
     )
-    old_sdf100, *_ = plan_dense_projection_det_gemm(
+    old_sdf100, *_ = cake_dense_gemm_det_train_projection_plan(
         sdf["A"], sdf["B"], sdf["out"], sk_sync=False, sk_exact=3, **kw
     )
     assert (
@@ -2711,7 +2768,9 @@ def test_round25_rules_plan_like_the_cake_launcher(T):
     }
     for row in ("q_a", "shared_gate_up"):
         v = _views("proj", row, "wgrad", "f32", T)
-        p, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], **kw)
+        p, *_ = cake_dense_gemm_det_train_projection_plan(
+            v["A"], v["B"], v["out"], **kw
+        )
         assert _nopro(p.template) == "dense_proj_det_gemm_nn_n256_f32_v8_ef_sks_sb2", (
             row
         )
@@ -2723,7 +2782,7 @@ def test_round25_rules_plan_like_the_cake_launcher(T):
             and p.store_ef
             and p.group_m == 32
         ), row
-        old, *_ = plan_dense_projection_det_gemm(
+        old, *_ = cake_dense_gemm_det_train_projection_plan(
             v["A"], v["B"], v["out"], sk_sync=False, sk_exact=3, **kw
         )
         assert (
@@ -2760,7 +2819,9 @@ def test_round26_rules_plan_like_the_cake_launcher(T):
         "group_m": 12,
     }
     g = _views("proj", "dense_gate_up", "fwd", "bf16", T)
-    pg, *_ = plan_dense_projection_det_gemm(g["A"], g["B"], g["out"], **kw107)
+    pg, *_ = cake_dense_gemm_det_train_projection_plan(
+        g["A"], g["B"], g["out"], **kw107
+    )
     assert (
         _nopro(pg.template) == "dense_proj_det_gemm_kk_n256_m256_ht_cg_or"
         and pg.ovr
@@ -2769,7 +2830,7 @@ def test_round26_rules_plan_like_the_cake_launcher(T):
         and not pg.ovl
     )  # ROUTE_TEMPLATE_NEW of the templates step (predicted kk_n256_m256_ht_cg_or - the sweep symbol)
     assert (pg.cta_rows, pg.block_n, pg.group_m) == (256, 256, 12)
-    old_g, *_ = plan_dense_projection_det_gemm(
+    old_g, *_ = cake_dense_gemm_det_train_projection_plan(
         g["A"],
         g["B"],
         g["out"],
@@ -2796,7 +2857,9 @@ def test_round26_rules_plan_like_the_cake_launcher(T):
         "store_ef": True,
     }
     wf = _views("proj", "dense_down", "wgrad", "f32", T)
-    pwf, *_ = plan_dense_projection_det_gemm(wf["A"], wf["B"], wf["out"], **kw107)
+    pwf, *_ = cake_dense_gemm_det_train_projection_plan(
+        wf["A"], wf["B"], wf["out"], **kw107
+    )
     assert (
         _nopro(pwf.template) == "dense_proj_det_gemm_nn_n256_m256_f32_v8_ef_ht"
         and pwf.htail
@@ -2808,7 +2871,7 @@ def test_round26_rules_plan_like_the_cake_launcher(T):
         and not pwf.sk_sync
         and not pwf.sk_exact
     )
-    old_wf, *_ = plan_dense_projection_det_gemm(
+    old_wf, *_ = cake_dense_gemm_det_train_projection_plan(
         wf["A"], wf["B"], wf["out"], cta_rows=128, htail=False, epi="tma", **kw107
     )
     assert (
@@ -2821,14 +2884,16 @@ def test_round26_rules_plan_like_the_cake_launcher(T):
     wbkey = ("sm_107a", True, True, False, False, False, 12288, None, 6144)
     assert ROW_RULES[wbkey] == {"cta_rows": 256, "htail": True}
     wb = _views("proj", "dense_down", "wgrad", "bf16", T)
-    pwb, *_ = plan_dense_projection_det_gemm(wb["A"], wb["B"], wb["out"], **kw107)
+    pwb, *_ = cake_dense_gemm_det_train_projection_plan(
+        wb["A"], wb["B"], wb["out"], **kw107
+    )
     assert (
         _nopro(pwb.template) == "dense_proj_det_gemm_nn_n256_m256_ht"
         and pwb.htail
         and not pwb.sk_sync
     )  # ROUTE_TEMPLATE_NEW of the templates step (predicted nn_n256_m256_ht - a template the previous lock already declares)
     assert (pwb.cta_rows, pwb.block_n) == (256, 256)
-    old_wb, *_ = plan_dense_projection_det_gemm(
+    old_wb, *_ = cake_dense_gemm_det_train_projection_plan(
         wb["A"], wb["B"], wb["out"], cta_rows=128, htail=False, **kw107
     )
     assert (
@@ -2848,7 +2913,9 @@ def test_round26_rules_plan_like_the_cake_launcher(T):
         "group_m": 12,
     }
     dg = _views("proj", "dense_gate_up", "dgrad", "bf16", T)
-    pdg, *_ = plan_dense_projection_det_gemm(dg["A"], dg["B"], dg["out"], **kw107)
+    pdg, *_ = cake_dense_gemm_det_train_projection_plan(
+        dg["A"], dg["B"], dg["out"], **kw107
+    )
     assert (
         _nopro(pdg.template) == "dense_proj_det_gemm_kn_n256_m256_cg_or"
         and pdg.ovr
@@ -2857,7 +2924,7 @@ def test_round26_rules_plan_like_the_cake_launcher(T):
         and not pdg.htail
     )  # ROUTE_TEMPLATE_NEW of the templates step (predicted kn_n256_m256_cg_or)
     assert (pdg.cta_rows, pdg.block_n, pdg.group_m) == (256, 256, 12)
-    old_dg, *_ = plan_dense_projection_det_gemm(
+    old_dg, *_ = cake_dense_gemm_det_train_projection_plan(
         dg["A"], dg["B"], dg["out"], cta_rows=128, ovr=False, cgrp=False, **kw107
     )
     assert (
@@ -2870,7 +2937,9 @@ def test_round26_rules_plan_like_the_cake_launcher(T):
     qkey = ("sm_107a", False, True, False, False, False, 2048, 16384, None)
     assert ROW_RULES[qkey] == {"cgrp": True, "group_m": 8}
     q = _views("proj", "q_b", "dgrad", "bf16", T)
-    pq, *_ = plan_dense_projection_det_gemm(q["A"], q["B"], q["out"], **kw107)
+    pq, *_ = cake_dense_gemm_det_train_projection_plan(
+        q["A"], q["B"], q["out"], **kw107
+    )
     assert (
         _nopro(pq.template) == "dense_proj_det_gemm_kn_n256_cg"
         and pq.cgrp
@@ -2878,7 +2947,7 @@ def test_round26_rules_plan_like_the_cake_launcher(T):
         and not pq.htail
     )  # ROUTE_TEMPLATE_NEW of the templates step (predicted kn_n256_cg)
     assert (pq.cta_rows, pq.block_n, pq.group_m) == (128, 256, 8)
-    old_q, *_ = plan_dense_projection_det_gemm(
+    old_q, *_ = cake_dense_gemm_det_train_projection_plan(
         q["A"], q["B"], q["out"], cgrp=False, **kw107
     )
     assert (
@@ -2889,14 +2958,16 @@ def test_round26_rules_plan_like_the_cake_launcher(T):
     gwkey = ("sm_107a", True, True, True, False, False, 6144, None, 12288)
     assert ROW_RULES[gwkey] == {"cta_rows": 256, "htail": True}
     gw = _views("proj", "dense_gate_up", "wgrad", "f32", T)
-    pgw, *_ = plan_dense_projection_det_gemm(gw["A"], gw["B"], gw["out"], **kw107)
+    pgw, *_ = cake_dense_gemm_det_train_projection_plan(
+        gw["A"], gw["B"], gw["out"], **kw107
+    )
     assert (
         _nopro(pgw.template) == "dense_proj_det_gemm_nn_n256_m256_f32_ht_tma1"
         and pgw.htail
         and pgw.epi == "tma"
     )  # ROUTE_TEMPLATE_NEW of the templates step (predicted nn_n256_m256_f32_ht_tma1 - a template the previous lock already declares; the rule names no epi, so the fp32-out tile takes the planner's default TMA-store epilogue like the sm_100a twin's nn_n256_m256_f32_tma1)
     assert (pgw.cta_rows, pgw.block_n) == (256, 256) and not pgw.sk_sync
-    old_gw, *_ = plan_dense_projection_det_gemm(
+    old_gw, *_ = cake_dense_gemm_det_train_projection_plan(
         gw["A"],
         gw["B"],
         gw["out"],
@@ -2934,7 +3005,9 @@ def test_round26_rules_plan_like_the_cake_launcher(T):
         ),
     ):
         v = _views("proj", row, op, dt, T + 1 if row == "q_b" else T)
-        p100, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], **kw)
+        p100, *_ = cake_dense_gemm_det_train_projection_plan(
+            v["A"], v["B"], v["out"], **kw
+        )
         assert _nopro(p100.template) == tmpl and not p100.cgrp and not p100.ovr, (
             row,
             op,
@@ -2958,7 +3031,7 @@ def test_round27_rules_plan_like_the_cake_launcher(T):
     akey = ("sm_100a", False, True, True, False, False, 6144, 128, None)
     assert ROW_RULES[akey] == {"block_n": 128, "group_m": 2}
     a = _views("proj", "indexer_k", "dgrad", "f32", T)
-    pa, *_ = plan_dense_projection_det_gemm(a["A"], a["B"], a["out"], **kw)
+    pa, *_ = cake_dense_gemm_det_train_projection_plan(a["A"], a["B"], a["out"], **kw)
     assert (
         _nopro(pa.template) == "dense_proj_det_gemm_kn_n128_f32_tma1"
         and pa.group_m == 2
@@ -2971,7 +3044,9 @@ def test_round27_rules_plan_like_the_cake_launcher(T):
     #      drain; the previous lock planned the pair form dense_proj_det_gemm_kn_n128_f32_tma1 ----
     bkey = ("sm_107a", False, True, True, False, False, 6144, 128, None)
     assert ROW_RULES[bkey] == {"block_n": 128, "cta1": True, "group_m": 2, "pd": 2}
-    pb, *_ = plan_dense_projection_det_gemm(a["A"], a["B"], a["out"], **kw107)
+    pb, *_ = cake_dense_gemm_det_train_projection_plan(
+        a["A"], a["B"], a["out"], **kw107
+    )
     assert (
         _nopro(pb.template) == "dense_proj_det_gemm_kn_n128_f32_tma1_pd2_c1"
         and pb.cta1
@@ -2979,7 +3054,7 @@ def test_round27_rules_plan_like_the_cake_launcher(T):
         and pb.group_m == 2
         and pb.block_n == 128
     )  # ROUTE_TEMPLATE_NEW of the templates step (predicted kn_n128_f32_tma1_pd2_c1)
-    old_b, *_ = plan_dense_projection_det_gemm(
+    old_b, *_ = cake_dense_gemm_det_train_projection_plan(
         a["A"], a["B"], a["out"], cta1=False, pd=0, **kw107
     )
     assert (
@@ -3001,7 +3076,7 @@ def test_round27_rules_plan_like_the_cake_launcher(T):
         "pro": 15,
     }
     c = _views("proj", "kv_a", "wgrad", "bf16", T)
-    pc, *_ = plan_dense_projection_det_gemm(
+    pc, *_ = cake_dense_gemm_det_train_projection_plan(
         c["A"], c["B"], c["out"], transposed_out=c["transposed"], **kw107
     )
     assert (
@@ -3017,7 +3092,7 @@ def test_round27_rules_plan_like_the_cake_launcher(T):
         128,
         8,
     ) and pc.hints == ("evict_first", "evict_first")
-    old_c, *_ = plan_dense_projection_det_gemm(
+    old_c, *_ = cake_dense_gemm_det_train_projection_plan(
         c["A"], c["B"], c["out"], transposed_out=c["transposed"], stt=False, **kw107
     )
     assert (
@@ -3037,7 +3112,7 @@ def test_round27_rules_plan_like_the_cake_launcher(T):
     )  # the plan arithmetic is the pair form's
     # controls: the sm_100a kv_a weight gradient bf16 keeps its TMA-store epilogue program (no stt rule on sm_100a), and the fp32-out twins of the
     # kv_a weight gradient carry no stt on either architecture (stmatrix is .b16)
-    p100, *_ = plan_dense_projection_det_gemm(
+    p100, *_ = cake_dense_gemm_det_train_projection_plan(
         c["A"], c["B"], c["out"], transposed_out=c["transposed"], **kw
     )
     assert (
@@ -3047,7 +3122,7 @@ def test_round27_rules_plan_like_the_cake_launcher(T):
     )
     f = _views("proj", "kv_a", "wgrad", "f32", T)
     for kwx in (kw, kw107):
-        pf, *_ = plan_dense_projection_det_gemm(
+        pf, *_ = cake_dense_gemm_det_train_projection_plan(
             f["A"], f["B"], f["out"], transposed_out=f["transposed"], **kwx
         )
         assert not pf.stt and pf.out_f32
@@ -3117,7 +3192,7 @@ def test_round27_stt_knob(T):
     # a row whose output is fp32 raises like the Cake launcher
     kw107 = dict(sm_count=212, l2_bytes=L2_BYTES, arch="sm_107a", _fallback=False)
     v = _views("proj", "kv_a", "wgrad", "bf16", T)
-    p, *_ = plan_dense_projection_det_gemm(
+    p, *_ = cake_dense_gemm_det_train_projection_plan(
         v["A"], v["B"], v["out"], transposed_out=v["transposed"], **kw107
     )
     assert (
@@ -3126,7 +3201,7 @@ def test_round27_stt_knob(T):
         and p.epi == "reg"
         and _nopro(p.template).endswith("_t_sks_stt")
     )
-    q, *_ = plan_dense_projection_det_gemm(
+    q, *_ = cake_dense_gemm_det_train_projection_plan(
         v["A"], v["B"], v["out"], transposed_out=v["transposed"], stt=False, **kw107
     )
     assert (
@@ -3137,7 +3212,7 @@ def test_round27_stt_knob(T):
     )
     f = _views("proj", "kv_a", "wgrad", "f32", T)
     with pytest.raises(ValueError):
-        plan_dense_projection_det_gemm(
+        cake_dense_gemm_det_train_projection_plan(
             f["A"], f["B"], f["out"], transposed_out=f["transposed"], stt=True, **kw107
         )
     # a caller-forced form outside the staging's admission on the stt row keeps that form WITHOUT the staging (the rule's stt does not carry
@@ -3146,7 +3221,7 @@ def test_round27_stt_knob(T):
     # pd (the pipelined TMEM drain) is not a caller form of this row at all: it needs a row-major output and a 128 / 256-column
     # tile, so the planner rejects it here with or without stt, like the Cake launcher
     with pytest.raises(ValueError, match="pd needs"):
-        plan_dense_projection_det_gemm(
+        cake_dense_gemm_det_train_projection_plan(
             v["A"], v["B"], v["out"], transposed_out=v["transposed"], pd=2, **kw107
         )
     for forced in (
@@ -3154,7 +3229,7 @@ def test_round27_stt_knob(T):
         dict(sk_sync=True, sk_slab=2),
         dict(cta_rows=256),
     ):
-        r, *_ = plan_dense_projection_det_gemm(
+        r, *_ = cake_dense_gemm_det_train_projection_plan(
             v["A"], v["B"], v["out"], transposed_out=v["transposed"], **forced, **kw107
         )
         assert (
@@ -3163,7 +3238,7 @@ def test_round27_stt_knob(T):
             and r.tma_out == (r.epi == "tma")
         ), forced
         with pytest.raises(ValueError):
-            plan_dense_projection_det_gemm(
+            cake_dense_gemm_det_train_projection_plan(
                 v["A"],
                 v["B"],
                 v["out"],
@@ -3408,30 +3483,38 @@ def test_round33_rules_plan_like_the_cake_launcher(T):
     #      architectures; a caller-forced pro 0 is the previous lock's program with the same plan arithmetic ----
     q = _views("proj", "indexer_q", "fwd", "bf16", T)
     for kwx in (kw, kw107):
-        p, *_ = plan_dense_projection_det_gemm(q["A"], q["B"], q["out"], **kwx)
+        p, *_ = cake_dense_gemm_det_train_projection_plan(
+            q["A"], q["B"], q["out"], **kwx
+        )
         assert p.pro == 15 and p.template.endswith("_pro15") and not p.cta1, kwx["arch"]
-        old, *_ = plan_dense_projection_det_gemm(q["A"], q["B"], q["out"], pro=0, **kwx)
+        old, *_ = cake_dense_gemm_det_train_projection_plan(
+            q["A"], q["B"], q["out"], pro=0, **kwx
+        )
         assert (
             old.pro == 0
             and old.template == p.template[: -len("_pro15")]
             and old.grid == p.grid
             and old.stages == p.stages
         ), kwx["arch"]
-    p107, *_ = plan_dense_projection_det_gemm(q["A"], q["B"], q["out"], **kw107)
+    p107, *_ = cake_dense_gemm_det_train_projection_plan(
+        q["A"], q["B"], q["out"], **kw107
+    )
     assert (
         p107.template == "dense_proj_det_gemm_kk_n256_pro15"
     )  # ROUTE_TEMPLATE_NEW of the templates step (predicted kk_n256_pro15)
     # the shared_down input gradient bf16: sm_100a pins pro 0 (the round-27 program, no suffix), sm_107a has no rule (the default pro 7)
     s = _views("proj", "shared_down", "dgrad", "bf16", T)
-    ps, *_ = plan_dense_projection_det_gemm(s["A"], s["B"], s["out"], **kw)
+    ps, *_ = cake_dense_gemm_det_train_projection_plan(s["A"], s["B"], s["out"], **kw)
     assert (
         ps.pro == 0 and not re.search(r"_pro\d+$", ps.template) and ps.group_m == 8
     )  # NOT `"_pro" not in`: `dense_proj` contains it
-    ps107, *_ = plan_dense_projection_det_gemm(s["A"], s["B"], s["out"], **kw107)
+    ps107, *_ = cake_dense_gemm_det_train_projection_plan(
+        s["A"], s["B"], s["out"], **kw107
+    )
     assert ps107.pro == 7 and ps107.template.endswith("_pro7")
     # the q_b weight gradient fp32-out on sm_107a: pro 15 on the register epilogue with the 256-bit stores (the round-27 knobs)
     w = _views("proj", "q_b", "wgrad", "f32", T)
-    pw, *_ = plan_dense_projection_det_gemm(
+    pw, *_ = cake_dense_gemm_det_train_projection_plan(
         w["A"], w["B"], w["out"], transposed_out=w["transposed"], **kw107
     )
     assert (
@@ -3445,7 +3528,7 @@ def test_round33_rules_plan_like_the_cake_launcher(T):
         pw.template == "dense_proj_det_gemm_nn_n256_f32_v8_pro15"
     )  # ROUTE_TEMPLATE_NEW of the templates step (predicted nn_n256_f32_v8_pro15)
     # a caller-forced tile family drops the rule's pro with the rule's other family-bound knobs (the launcher's filter): pro 0, no suffix
-    tall_w, *_ = plan_dense_projection_det_gemm(
+    tall_w, *_ = cake_dense_gemm_det_train_projection_plan(
         w["A"], w["B"], w["out"], transposed_out=w["transposed"], cta_rows=256, **kw107
     )
     assert (
@@ -3456,7 +3539,7 @@ def test_round33_rules_plan_like_the_cake_launcher(T):
     # the kv_a weight gradient fp32-out on sm_107a: the synchronised stream-K program takes the bulk slab read (sk_slab 2) and the default
     # pro 7; a caller-forced sk_slab 0 / pro 0 is the previous lock's program with the same plan arithmetic
     f = _views("proj", "kv_a", "wgrad", "f32", T)
-    pf, *_ = plan_dense_projection_det_gemm(
+    pf, *_ = cake_dense_gemm_det_train_projection_plan(
         f["A"], f["B"], f["out"], transposed_out=f["transposed"], **kw107
     )
     assert (
@@ -3469,7 +3552,7 @@ def test_round33_rules_plan_like_the_cake_launcher(T):
     assert (
         pf.template == "dense_proj_det_gemm_nn_n192_bz64_hee_f32_t_sks_sb2_pro7"
     )  # ROUTE_TEMPLATE_NEW of the templates step (predicted nn_n192_bz64_hee_f32_t_sks_sb2_pro7)
-    old_f, *_ = plan_dense_projection_det_gemm(
+    old_f, *_ = cake_dense_gemm_det_train_projection_plan(
         f["A"],
         f["B"],
         f["out"],
@@ -3485,15 +3568,19 @@ def test_round33_rules_plan_like_the_cake_launcher(T):
     # a single-CTA row: the indexer_hw input gradient fp32-out on sm_107a keeps its round-19 program (no pro; the merged rule's default is
     # zeroed), a caller-forced pro raises like the Cake launcher, and a caller-forced pair form takes the architecture default
     h = _views("proj", "indexer_hw", "dgrad", "f32", T)
-    ph, *_ = plan_dense_projection_det_gemm(h["A"], h["B"], h["out"], **kw107)
+    ph, *_ = cake_dense_gemm_det_train_projection_plan(
+        h["A"], h["B"], h["out"], **kw107
+    )
     assert (
         ph.cta1
         and ph.pro == 0
         and ph.template == "dense_proj_det_gemm_kn_n128_f32_tma1_c1"
     )
     with pytest.raises(ValueError, match="needs the cluster pair"):
-        plan_dense_projection_det_gemm(h["A"], h["B"], h["out"], pro=7, **kw107)
-    pair_h, *_ = plan_dense_projection_det_gemm(
+        cake_dense_gemm_det_train_projection_plan(
+            h["A"], h["B"], h["out"], pro=7, **kw107
+        )
+    pair_h, *_ = cake_dense_gemm_det_train_projection_plan(
         h["A"], h["B"], h["out"], cta1=False, **kw107
     )
     assert not pair_h.cta1 and pair_h.pro == 7 and pair_h.template.endswith("_pro7")
@@ -3579,17 +3666,17 @@ def test_round33_pro_knob(T):
     kw = dict(sm_count=148, l2_bytes=L2_BYTES, arch="sm_100a", _fallback=False)
     kw107 = dict(sm_count=212, l2_bytes=L2_BYTES, arch="sm_107a", _fallback=False)
     g = _views("proj", "dense_gate_up", "fwd", "bf16", T)
-    pg, *_ = plan_dense_projection_det_gemm(g["A"], g["B"], g["out"], **kw)
+    pg, *_ = cake_dense_gemm_det_train_projection_plan(g["A"], g["B"], g["out"], **kw)
     assert (
         pg.pro == 7 and pg.template.endswith("_pro7") and not pg.rule_fallback
     )  # no sm_100a rule: the default alone
     w = _views("proj", "q_b", "wgrad", "f32", T)
-    pw, *_ = plan_dense_projection_det_gemm(
+    pw, *_ = cake_dense_gemm_det_train_projection_plan(
         w["A"], w["B"], w["out"], transposed_out=w["transposed"], **kw107
     )
     assert pw.pro == 15 and pw.template.endswith("_pro15")
     for forced in (0, 7, 8, 15):
-        pfx, *_ = plan_dense_projection_det_gemm(
+        pfx, *_ = cake_dense_gemm_det_train_projection_plan(
             w["A"],
             w["B"],
             w["out"],
@@ -3603,7 +3690,7 @@ def test_round33_pro_knob(T):
         assert pfx.grid == pw.grid and pfx.stages == pw.stages, (
             forced
         )  # the program changes, the plan arithmetic does not
-    nr, *_ = plan_dense_projection_det_gemm(
+    nr, *_ = cake_dense_gemm_det_train_projection_plan(
         w["A"],
         w["B"],
         w["out"],
@@ -3618,14 +3705,18 @@ def test_round33_pro_knob(T):
         and "_f32_v8" not in nr.template
     )
     h = _views("proj", "indexer_hw", "dgrad", "f32", T)
-    ph, *_ = plan_dense_projection_det_gemm(h["A"], h["B"], h["out"], **kw107)
+    ph, *_ = cake_dense_gemm_det_train_projection_plan(
+        h["A"], h["B"], h["out"], **kw107
+    )
     assert (
         ph.cta1
         and ph.pro == 0
         and ph.template == "dense_proj_det_gemm_kn_n128_f32_tma1_c1"
     )
     with pytest.raises(ValueError, match="needs the cluster pair"):
-        plan_dense_projection_det_gemm(h["A"], h["B"], h["out"], pro=15, **kw107)
+        cake_dense_gemm_det_train_projection_plan(
+            h["A"], h["B"], h["out"], pro=15, **kw107
+        )
 
 
 @pytest.mark.parametrize("T", [16172, 16231])
@@ -3702,7 +3793,7 @@ def test_round21_cgrp_knob(T):
     # pair tiles on 74 pairs, the half-height tail wave) is the pair form's - only the program and the raster differ
     kw = dict(sm_count=148, l2_bytes=L2_BYTES, arch="sm_100a", _fallback=False)
     v = _views("proj", "dense_down", "fwd", "bf16", T)
-    plan, *_ = plan_dense_projection_det_gemm(
+    plan, *_ = cake_dense_gemm_det_train_projection_plan(
         v["A"], v["B"], v["out"], cgrp=True, group_m=12, **kw
     )
     assert (
@@ -3724,7 +3815,7 @@ def test_round21_cgrp_knob(T):
         == wave_working_set_cgrp(64, 24, 12288, 12, 74)
         == 19 * 256 * 12288 * 2
     )
-    base, *_ = plan_dense_projection_det_gemm(
+    base, *_ = cake_dense_gemm_det_train_projection_plan(
         v["A"], v["B"], v["out"], group_m=12, **kw
     )
     assert (
@@ -3749,27 +3840,31 @@ def test_round21_cgrp_knob(T):
     ):
         assert getattr(plan, f) == getattr(base, f), f
     # the raster width defaults to the row default (16, ``default_group_m``) under cgrp as well, now as column tiles
-    cg16, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], cgrp=True, **kw)
+    cg16, *_ = cake_dense_gemm_det_train_projection_plan(
+        v["A"], v["B"], v["out"], cgrp=True, **kw
+    )
     assert cg16.group_m == 16 and _nopro(cg16.template) == _nopro(plan.template)
     # the pair invariant holds whatever the column count, so the count has no parity constraint under cgrp: 3 (or 1)
     # column tiles per group are admitted where the row raster rejects an odd count (CTA pairs are adjacent row
     # tiles); a count < 1 is rejected on both
-    odd, *_ = plan_dense_projection_det_gemm(
+    odd, *_ = cake_dense_gemm_det_train_projection_plan(
         v["A"], v["B"], v["out"], cgrp=True, group_m=3, **kw
     )
     assert odd.group_m == 3 and _nopro(odd.template) == _nopro(plan.template)
-    one, *_ = plan_dense_projection_det_gemm(
+    one, *_ = cake_dense_gemm_det_train_projection_plan(
         v["A"], v["B"], v["out"], cgrp=True, group_m=1, **kw
     )
     assert one.group_m == 1 and _nopro(one.template) == _nopro(plan.template)
     with pytest.raises(ValueError, match="group_m must be an even number"):
-        plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], group_m=3, **kw)
+        cake_dense_gemm_det_train_projection_plan(
+            v["A"], v["B"], v["out"], group_m=3, **kw
+        )
     with pytest.raises(ValueError, match="group_m must be an even number"):
-        plan_dense_projection_det_gemm(
+        cake_dense_gemm_det_train_projection_plan(
             v["A"], v["B"], v["out"], cgrp=False, group_m=1, **kw
         )
     with pytest.raises(ValueError, match="group_m must be an even number"):
-        plan_dense_projection_det_gemm(
+        cake_dense_gemm_det_train_projection_plan(
             v["A"], v["B"], v["out"], cgrp=True, group_m=0, **kw
         )
     # the planner selects the gate by the raster: one 256-column tile over 25600 rows at K = 3200 (no rule) streams A
@@ -3777,8 +3872,8 @@ def test_round21_cgrp_knob(T):
     A = torch.empty(25600, 3200, dtype=torch.bfloat16)
     Bt = torch.empty(256, 3200, dtype=torch.bfloat16).t()
     out = torch.empty(25600, 256, dtype=torch.bfloat16)
-    row, *_ = plan_dense_projection_det_gemm(A, Bt, out, **kw)
-    col, *_ = plan_dense_projection_det_gemm(A, Bt, out, cgrp=True, **kw)
+    row, *_ = cake_dense_gemm_det_train_projection_plan(A, Bt, out, **kw)
+    col, *_ = cake_dense_gemm_det_train_projection_plan(A, Bt, out, cgrp=True, **kw)
     assert (row.m_tiles, row.n_tiles, row.group_m, row.sm_pairs) == (200, 1, 16, 74)
     assert _nopro(row.template) == "dense_proj_det_gemm_kk_n256_hen" and row.hints == (
         "evict_first",
@@ -3854,15 +3949,17 @@ def test_round24_ovr_knob(T, monkeypatch):
             ("sm_100a", False, False, False, False, False, 6144, 16384, 16231),
             raising=False,
         )
-        cake_backend.clear_convenience_caches()
-        base, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], **kw)
+        cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
+        base, *_ = cake_dense_gemm_det_train_projection_plan(
+            v["A"], v["B"], v["out"], **kw
+        )
         assert (
             base.ovl
             and base.htail
             and not base.ovr
             and _nopro(base.template) == "dense_proj_det_gemm_kk_n256_m256_ov_ht"
         )
-        forced, *_ = plan_dense_projection_det_gemm(
+        forced, *_ = cake_dense_gemm_det_train_projection_plan(
             v["A"], v["B"], v["out"], ovr=True, **kw
         )
         assert (
@@ -3890,17 +3987,17 @@ def test_round24_ovr_knob(T, monkeypatch):
         ):
             assert getattr(forced, f) == getattr(base, f), f
         with pytest.raises(ValueError):
-            plan_dense_projection_det_gemm(
+            cake_dense_gemm_det_train_projection_plan(
                 v["A"], v["B"], v["out"], ovr=True, ovl=True, **kw
             )
-    cake_backend.clear_convenience_caches()
+    cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
     # (2) the reverse direction (Cake 95da40d6e8 L2745-L2746, `if ovr and ovl and not rule_ovl: ovr = False` inside the rule read of ovr): a
     # caller-forced ovl=True on the sm_107a o_proj fwd row (rule {cta_rows 256, htail, ovr, cgrp, group_m 8}) drops the rule's ovr - the
     # rule's cgrp / htail / group_m stay and the plan is the `_ov_ht_cg` program of test_round21_cgrp_knob, not a ValueError (ovl + ovr);
     # without this mirror every forced-ovl planner call on these rows raises in FlashInfer while the Cake launcher plans the `_ov` program
     kw107 = dict(sm_count=212, l2_bytes=L2_BYTES, arch="sm_107a", _fallback=False)
     o107 = _views("proj", "o_proj", "fwd", "bf16", T)
-    forced_ovl, *_ = plan_dense_projection_det_gemm(
+    forced_ovl, *_ = cake_dense_gemm_det_train_projection_plan(
         o107["A"], o107["B"], o107["out"], ovl=True, **kw107
     )
     assert (
@@ -3913,7 +4010,7 @@ def test_round24_ovr_knob(T, monkeypatch):
     assert _nopro(forced_ovl.template) == "dense_proj_det_gemm_kk_n256_m256_ov_ht_cg"
     # the same on the dense_down fwd row (rule {cta_rows 256, sk_parts 3, ovr, cgrp, group_m 12}: no htail) -> the `_ov_cg` tall program
     d107 = _views("proj", "dense_down", "fwd", "bf16", T)
-    forced_ovl_d, *_ = plan_dense_projection_det_gemm(
+    forced_ovl_d, *_ = cake_dense_gemm_det_train_projection_plan(
         d107["A"], d107["B"], d107["out"], ovl=True, **kw107
     )
     assert (
@@ -3925,7 +4022,7 @@ def test_round24_ovr_knob(T, monkeypatch):
     )
     assert _nopro(forced_ovl_d.template) == "dense_proj_det_gemm_kk_n256_m256_ov_cg"
     with pytest.raises(ValueError):
-        plan_dense_projection_det_gemm(
+        cake_dense_gemm_det_train_projection_plan(
             v["A"], v["B"], v["out"], ovr=True, cta_rows=128, **kw
         )
 
@@ -4085,7 +4182,7 @@ def test_instance_key_rejects_bad_configurations():
     # the promotion is validated where it is resolved, by the planner
     v = _views("proj", "o_proj", "fwd", "bf16", 257)
     with pytest.raises(ValueError, match="promo"):
-        plan_dense_projection_det_gemm(
+        cake_dense_gemm_det_train_projection_plan(
             v["A"],
             v["B"],
             v["out"],
@@ -4198,7 +4295,7 @@ def test_check_stream_k_plan_refuses_a_plan_outside_the_launch_contract():
     # the dgrad of T = 1024, N = 1032, K = 1000 on 76 CTA pairs: 16 tail tiles of 17 K steps, one partial wave
     E = lambda *shape: torch.empty(*shape, dtype=torch.bfloat16)  # noqa: E731
     kw = dict(sm_count=152, l2_bytes=L2_BYTES, _fallback=False)
-    plan, *_ = plan_dense_projection_det_gemm(
+    plan, *_ = cake_dense_gemm_det_train_projection_plan(
         E(1024, 1032), E(1032, 1000), E(1024, 1000), pd=2, slots=2, epi="tma", **kw
     )
     assert plan.pd == 2 and (plan.tail_tiles, plan.k_blocks) == (16, 17)
@@ -4299,7 +4396,7 @@ def test_stream_k_workspace_holds_every_slab_the_program_reaches():
     # program reaches slab 3 * 69 + 1 = 208, past the sk_units + tail_tiles = 146 slabs of the unit-keyed sizing
     assert stream_k_plan(70, 65, 76, True) == (0, 70, 76, 60)
     E = lambda *shape: torch.empty(*shape, dtype=torch.bfloat16)  # noqa: E731
-    base, *_ = plan_dense_projection_det_gemm(
+    base, *_ = cake_dense_gemm_det_train_projection_plan(
         E(1024, 1032), E(1032, 1000), E(1024, 1000), sm_count=152, l2_bytes=L2_BYTES
     )
     review = dataclasses.replace(
@@ -4317,7 +4414,7 @@ def test_stream_k_workspace_holds_every_slab_the_program_reaches():
     assert _slabs_reached(review, True) == 208 and _slabs_reached(review, False) == 144
     assert review.ws_f32_elems == WS_PARTS * 70 * slab
     # public-API plans of the planner on the four target devices: the weight gradient with the linearised policy
-    # (projection_det_wgrad's sk / cta_rows), and forward / input gradients with prepare's stream-K knobs; every plan
+    # (cake_dense_gemm_det_train_projection_wgrad's sk / cta_rows), and forward / input gradients with prepare's stream-K knobs; every plan
     # the planner accepts fits its workspace, and a tile-keyed program never gets more than WS_PARTS units on a tile
     checked, short_before, refused = 0, 0, 0
     for arch, sm_count in (
@@ -4352,7 +4449,7 @@ def test_stream_k_workspace_holds_every_slab_the_program_reaches():
                     cases.append((E(T, N), E(N, K), E(T, K), knobs))
         for A, B, out, knobs in cases:
             try:
-                plan, *_ = plan_dense_projection_det_gemm(
+                plan, *_ = cake_dense_gemm_det_train_projection_plan(
                     A, B, out, sm_count=sm_count, l2_bytes=L2_BYTES, arch=arch, **knobs
                 )
             except ValueError as e:
@@ -4380,7 +4477,7 @@ def test_planner_defaults_to_auto_stream_k_and_guards_the_slice_counters():
     # round-9 sm_100a rule plans this row's 64-row family (48 pair tiles, which 74 pairs cannot split two ways), so
     # the 128-row family is forced here to keep the split under test
     v = _views("proj", "indexer_hw", "wgrad", "bf16", 1001)
-    plan, *_ = plan_dense_projection_det_gemm(
+    plan, *_ = cake_dense_gemm_det_train_projection_plan(
         v["A"],
         v["B"],
         v["out"],
@@ -4400,7 +4497,7 @@ def test_planner_defaults_to_auto_stream_k_and_guards_the_slice_counters():
     assert plan.grid == (96, 1, 1) and plan.sk_iters == 24 * 16
     assert plan.ws_f32_elems == (48 + 24) * 2 * 128 * 128
     assert plan.counters_u32 == 24 * 16 and plan.counters_alloc_u32 == 8192
-    off, *_ = plan_dense_projection_det_gemm(
+    off, *_ = cake_dense_gemm_det_train_projection_plan(
         v["A"],
         v["B"],
         v["out"],
@@ -4429,10 +4526,10 @@ def test_planner_defaults_to_auto_stream_k_and_guards_the_slice_counters():
     out = torch.empty(256, dtype=torch.bfloat16).as_strided((300 * 256, 256), (0, 1))
     assert SK_DUMMY_BASE == 4096
     with pytest.raises(ValueError, match="slice-counter budget"):
-        plan_dense_projection_det_gemm(
+        cake_dense_gemm_det_train_projection_plan(
             A, W.t(), out, sm_count=1000, l2_bytes=L2_BYTES, _fallback=False, sk=True
         )
-    plan, *_ = plan_dense_projection_det_gemm(
+    plan, *_ = cake_dense_gemm_det_train_projection_plan(
         A, W.t(), out, sm_count=1000, l2_bytes=L2_BYTES, _fallback=False
     )  # auto: 2 * 300 > 500 pairs -> whole tiles
     assert (plan.num_full, plan.tail_tiles, plan.sk_units) == (300, 0, 0)
@@ -4523,7 +4620,7 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
         for op in ("fwd", "dgrad", "wgrad"):
             for out_dtype in ("bf16", "f32") if op != "fwd" else ("bf16",):
                 v = _views("proj", row, op, out_dtype, T)
-                plan, a_desc, b_desc, out3 = plan_dense_projection_det_gemm(
+                plan, a_desc, b_desc, out3 = cake_dense_gemm_det_train_projection_plan(
                     v["A"],
                     v["B"],
                     v["out"],
@@ -4884,7 +4981,7 @@ def test_mla_rows_plan_as_batched_views(T, sm_count):
     for row in MLA_ROWS:
         for op in ("fwd", "dgrad", "wgrad"):
             v = _views("mla", row, op, "bf16", T)
-            plan, a_desc, b_desc, out3 = plan_dense_projection_det_gemm(
+            plan, a_desc, b_desc, out3 = cake_dense_gemm_det_train_projection_plan(
                 v["A"],
                 v["B"],
                 v["out"],
@@ -4928,7 +5025,7 @@ def test_mla_rows_plan_as_batched_views(T, sm_count):
     # qabs dgrad writes the first 192 columns of a 256-wide slot of a token-major [T, H, 256] buffer:
     # the [H, T, D] output view has batch stride 256 (heads) and row stride 64 * 256 (tokens)
     v = _views("mla", "qabs", "dgrad", "bf16", 33)
-    plan, _, _, out3 = plan_dense_projection_det_gemm(
+    plan, _, _, out3 = cake_dense_gemm_det_train_projection_plan(
         v["A"], v["B"], v["out"], sm_count=148, l2_bytes=L2_BYTES
     )
     assert (out3.stride(0), out3.stride(1), out3.stride(2)) == (256, 64 * 256, 1)
@@ -4972,11 +5069,11 @@ def test_operand_view_classification_and_rejections():
     A2 = torch.empty(16, 64, dtype=torch.bfloat16)
     B2 = torch.empty(64, 24, dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="bf16"):
-        plan_dense_projection_det_gemm(
+        cake_dense_gemm_det_train_projection_plan(
             A2.float(), B2, torch.empty(16, 24), sm_count=148, l2_bytes=L2_BYTES
         )
     with pytest.raises(ValueError, match="bf16 or fp32"):
-        plan_dense_projection_det_gemm(
+        cake_dense_gemm_det_train_projection_plan(
             A2,
             B2,
             torch.empty(16, 24, dtype=torch.float16),
@@ -4984,7 +5081,7 @@ def test_operand_view_classification_and_rejections():
             l2_bytes=L2_BYTES,
         )
     with pytest.raises(ValueError, match=r"B must be \[L=1, K=64, N\]"):
-        plan_dense_projection_det_gemm(
+        cake_dense_gemm_det_train_projection_plan(
             A2,
             torch.empty(32, 24, dtype=torch.bfloat16),
             torch.empty(16, 24),
@@ -4992,11 +5089,11 @@ def test_operand_view_classification_and_rejections():
             l2_bytes=L2_BYTES,
         )
     with pytest.raises(ValueError, match="out must be"):
-        plan_dense_projection_det_gemm(
+        cake_dense_gemm_det_train_projection_plan(
             A2, B2, torch.empty(24, 16), sm_count=148, l2_bytes=L2_BYTES
         )
     with pytest.raises(ValueError, match="multiple of 8"):
-        plan_dense_projection_det_gemm(
+        cake_dense_gemm_det_train_projection_plan(
             A2,
             torch.empty(64, 20, dtype=torch.bfloat16),
             torch.empty(16, 20),
@@ -5004,11 +5101,11 @@ def test_operand_view_classification_and_rejections():
             l2_bytes=L2_BYTES,
         )
     with pytest.raises(ValueError, match="unit inner stride"):
-        plan_dense_projection_det_gemm(
+        cake_dense_gemm_det_train_projection_plan(
             A2, B2, torch.empty(24, 16).t(), sm_count=148, l2_bytes=L2_BYTES
         )
     # transposed output: [N, M] with unit stride on m
-    plan, *_ = plan_dense_projection_det_gemm(
+    plan, *_ = cake_dense_gemm_det_train_projection_plan(
         A2,
         B2,
         torch.empty(24, 16),
@@ -5054,7 +5151,7 @@ def test_batched_small_m_swap_and_row_rules():
     out = torch.empty(H, M, N, dtype=torch.bfloat16)
     assert swap_small_m(H, M, N, False) and not swap_small_m(1, M, N, False)
     assert not swap_small_m(H, 512, 192, False) and not swap_small_m(H, M, N, True)
-    plan, a_desc, b_desc, out3 = plan_dense_projection_det_gemm(
+    plan, a_desc, b_desc, out3 = cake_dense_gemm_det_train_projection_plan(
         Q.permute(1, 2, 0),
         dL.permute(1, 0, 2),
         out,
@@ -5097,7 +5194,7 @@ def test_batched_small_m_swap_and_row_rules():
         # a rule fills only the knobs the caller left unset
         ROW_RULES.clear()
         ROW_RULES[ident + (M, None, N)] = {"cta_rows": 256, "group_m": 8}
-        ruled, *_ = plan_dense_projection_det_gemm(
+        ruled, *_ = cake_dense_gemm_det_train_projection_plan(
             Q.permute(1, 2, 0),
             dL.permute(1, 0, 2),
             out,
@@ -5113,7 +5210,7 @@ def test_batched_small_m_swap_and_row_rules():
             and "_m256" in _nopro(ruled.template)
             and re.search(r"_g\d+", _nopro(ruled.template)) is None
         )
-        pinned, *_ = plan_dense_projection_det_gemm(
+        pinned, *_ = cake_dense_gemm_det_train_projection_plan(
             Q.permute(1, 2, 0),
             dL.permute(1, 0, 2),
             out,
@@ -5133,7 +5230,7 @@ def test_batched_small_m_swap_and_row_rules():
             "stages": 3,
             "epi": "reg",
         }
-        ruled, *_ = plan_dense_projection_det_gemm(
+        ruled, *_ = cake_dense_gemm_det_train_projection_plan(
             Q.permute(1, 2, 0),
             dL.permute(1, 0, 2),
             out,
@@ -5148,7 +5245,7 @@ def test_batched_small_m_swap_and_row_rules():
             (128, "dense_proj_det_gemm_nn_n192_t"),
             (64, "dense_proj_det_gemm_nn_n192_m64_t"),
         ):
-            forced, *_ = plan_dense_projection_det_gemm(
+            forced, *_ = cake_dense_gemm_det_train_projection_plan(
                 Q.permute(1, 2, 0),
                 dL.permute(1, 0, 2),
                 out,
@@ -5184,7 +5281,7 @@ def _ht_rows_without_half_fit(sm_count, arch):
                     _fallback=False,
                 )
                 try:
-                    plan, *_ = plan_dense_projection_det_gemm(
+                    plan, *_ = cake_dense_gemm_det_train_projection_plan(
                         v["A"], v["B"], v["out"], sk=True, **kw
                     )
                 except (ValueError, NotImplementedError):
@@ -5213,7 +5310,7 @@ def test_ht_program_never_plans_linearised_stream_k_units(arch, sm_count):
         ), (row, op, T, plan.template)
         # the same row with the default policy plans identically (auto never splits where the half items do not fit)
         v = _views("proj", row, op, "bf16", T)
-        auto, *_ = plan_dense_projection_det_gemm(
+        auto, *_ = cake_dense_gemm_det_train_projection_plan(
             v["A"],
             v["B"],
             v["out"],
@@ -5240,7 +5337,7 @@ def test_ht_program_never_plans_linearised_stream_k_units(arch, sm_count):
 def _plan_or_none(row, op, T, sm_count, arch, **knobs):
     v = _views("proj", row, op, "bf16", T)
     try:
-        plan, *_ = plan_dense_projection_det_gemm(
+        plan, *_ = cake_dense_gemm_det_train_projection_plan(
             v["A"],
             v["B"],
             v["out"],
@@ -5272,7 +5369,9 @@ def test_ht_program_with_forced_stream_k_matches_fp64_reference():
     row, op, T, _ = found[0]
     v = _make_inputs("proj", row, op, "bf16", T, seed=SEED + 7)
     _require_program(_plan_template(v, sk=True))
-    prepared = prepare_dense_projection_det_gemm(v["A"], v["B"], v["out"], sk=True)
+    prepared = cake_dense_gemm_det_train_projection_prepare(
+        v["A"], v["B"], v["out"], sk=True
+    )
     assert "_ht" in prepared.plan.template and prepared.plan.sk_units == 0
     out = prepared.launch()
     torch.cuda.synchronize()
@@ -5361,7 +5460,7 @@ def test_sk_parts_rule(pairs):
             ("indexer_k", "f32", (128, 0, 48, 96, 127)),
         ):
             v = _views("proj", row, "wgrad", dt, T)
-            plan = plan_dense_projection_det_gemm(
+            plan = cake_dense_gemm_det_train_projection_plan(
                 v["A"],
                 v["B"],
                 v["out"],
@@ -5381,7 +5480,7 @@ def test_sk_parts_rule(pairs):
             assert plan.num_cluster_tiles == want[1] + want[3]
         # an explicit caller split wins over the rule, and sm_100a keeps its own (ruleless) plan
         v = _views("proj", "indexer_hw", "wgrad", "bf16", T)
-        pinned = plan_dense_projection_det_gemm(
+        pinned = cake_dense_gemm_det_train_projection_plan(
             v["A"],
             v["B"],
             v["out"],
@@ -5400,7 +5499,7 @@ def test_sk_parts_rule(pairs):
         )
         # (sm_100a has no sk_parts rule; its round-9 rule plans the 64-row family for this row, so the 128-row
         # family is forced to keep the auto two-way split of the 24 tiles under test)
-        other = plan_dense_projection_det_gemm(
+        other = cake_dense_gemm_det_train_projection_plan(
             v["A"],
             v["B"],
             v["out"],
@@ -5419,7 +5518,7 @@ def test_sk_parts_rule(pairs):
                 48,
             )
         )  # sm_100a has no sk_parts rule: its 128-wide tiles keep the auto two-way split
-        forced = plan_dense_projection_det_gemm(
+        forced = cake_dense_gemm_det_train_projection_plan(
             v["A"],
             v["B"],
             v["out"],
@@ -5463,21 +5562,25 @@ def test_router_layout_classification_and_swap():
     X = torch.empty(T, K)
     W = torch.empty(N, K)
     G = torch.empty(T, N)
-    plan, A_eff, B_eff = plan_router_fp32_det_gemm(X, W.t(), torch.empty(T, N))
+    plan, A_eff, B_eff = cake_dense_gemm_det_train_router_plan(
+        X, W.t(), torch.empty(T, N)
+    )
     assert (plan.layout, plan.template, plan.splits) == (
         "kk",
         "router_fp32_det_gemm_kk",
         ROUTER_SPLITS["kk"],
     )
     assert not plan.swapped and (plan.M, plan.N, plan.K) == (T, N, K)
-    plan, A_eff, B_eff = plan_router_fp32_det_gemm(G, W, torch.empty(T, K))
+    plan, A_eff, B_eff = cake_dense_gemm_det_train_router_plan(G, W, torch.empty(T, K))
     assert (plan.layout, plan.template, plan.splits) == (
         "kn",
         "router_fp32_det_gemm_kn",
         1,
     )
     assert (plan.M, plan.N, plan.K) == (T, K, N) and plan.b_mn
-    plan, A_eff, B_eff = plan_router_fp32_det_gemm(G.t(), X, torch.empty(N, K))
+    plan, A_eff, B_eff = cake_dense_gemm_det_train_router_plan(
+        G.t(), X, torch.empty(N, K)
+    )
     assert (plan.layout, plan.template, plan.splits) == (
         "nn_t",
         "router_fp32_det_gemm_nn_t",
@@ -5493,30 +5596,38 @@ def test_router_layout_classification_and_swap():
         1,
         1,
     )
-    plan, *_ = plan_router_fp32_det_gemm(X, W.t(), torch.empty(T, N), splits=2)
+    plan, *_ = cake_dense_gemm_det_train_router_plan(
+        X, W.t(), torch.empty(T, N), splits=2
+    )
     assert plan.splits == 2 and plan.k_iters_split == -(-plan.k_blocks // 2)
     with pytest.raises(NotImplementedError, match="MN-major A"):
         router_layout_class(True, False)
     with pytest.raises(ValueError, match="fp32"):
-        plan_router_fp32_det_gemm(X.to(torch.bfloat16), W.t(), torch.empty(T, N))
+        cake_dense_gemm_det_train_router_plan(
+            X.to(torch.bfloat16), W.t(), torch.empty(T, N)
+        )
     with pytest.raises(ValueError, match="K must agree"):
-        plan_router_fp32_det_gemm(X, torch.empty(K + 32, N), torch.empty(T, N))
+        cake_dense_gemm_det_train_router_plan(
+            X, torch.empty(K + 32, N), torch.empty(T, N)
+        )
     with pytest.raises(ValueError, match="out must be"):
-        plan_router_fp32_det_gemm(X, W.t(), torch.empty(N, T))
+        cake_dense_gemm_det_train_router_plan(X, W.t(), torch.empty(N, T))
     with pytest.raises(ValueError, match="multiple of 8"):
-        plan_router_fp32_det_gemm(
+        cake_dense_gemm_det_train_router_plan(
             X, torch.empty(K, 20).t().contiguous().t(), torch.empty(T, 20)
         )
     with pytest.raises(ValueError, match="unit stride"):
-        plan_router_fp32_det_gemm(
+        cake_dense_gemm_det_train_router_plan(
             torch.empty(T, 2 * K)[:, ::2], W.t(), torch.empty(T, N)
         )
     # a ragged batch with T = 0: M = 0 for the forward / input gradient, K = 0 for the
     # weight gradient -- rejected before a zero-sized grid or TMA extent is planned
     with pytest.raises(ValueError, match="must be >= 1"):
-        plan_router_fp32_det_gemm(torch.empty(0, K), W.t(), torch.empty(0, N))
+        cake_dense_gemm_det_train_router_plan(
+            torch.empty(0, K), W.t(), torch.empty(0, N)
+        )
     with pytest.raises(ValueError, match="must be >= 1"):
-        plan_router_fp32_det_gemm(
+        cake_dense_gemm_det_train_router_plan(
             torch.empty(N, 0), torch.empty(0, K), torch.empty(N, K)
         )
 
@@ -5541,7 +5652,7 @@ def test_router_planner_refuses_a_misaligned_out_of_a_single_split_row_major_sto
     cases = dict(kk=(X, W.t(), T, N), kn=(G, W, T, K), nn_t=(G.t(), X, N, K))
     for layout, (A, B, rows, cols) in cases.items():
         for splits in sorted({1, 2, ROUTER_SPLITS[layout]}):
-            plan, *_ = plan_router_fp32_det_gemm(
+            plan, *_ = cake_dense_gemm_det_train_router_plan(
                 A, B, _offset_out(rows, cols, 0), splits=splits
             )
             assert (plan.layout, plan.splits) == (layout, splits)
@@ -5549,16 +5660,24 @@ def test_router_planner_refuses_a_misaligned_out_of_a_single_split_row_major_sto
                 out = _offset_out(rows, cols, offset)
                 if splits == 1 and layout != "nn_t":
                     with pytest.raises(ValueError, match="16-byte aligned address"):
-                        plan_router_fp32_det_gemm(A, B, out, splits=splits)
+                        cake_dense_gemm_det_train_router_plan(A, B, out, splits=splits)
                 else:
-                    plan, *_ = plan_router_fp32_det_gemm(A, B, out, splits=splits)
+                    plan, *_ = cake_dense_gemm_det_train_router_plan(
+                        A, B, out, splits=splits
+                    )
                     assert (plan.layout, plan.splits) == (layout, splits)
     # the production split counts: the input gradient (kn, one split) refuses, the forward (kk, 4) and the
     # weight gradient (nn_t, 6) plan
     with pytest.raises(ValueError, match="16-byte aligned address"):
-        plan_router_fp32_det_gemm(G, W, _offset_out(T, K, 1))
-    assert plan_router_fp32_det_gemm(X, W.t(), _offset_out(T, N, 1))[0].splits == 4
-    assert plan_router_fp32_det_gemm(G.t(), X, _offset_out(N, K, 1))[0].splits == 6
+        cake_dense_gemm_det_train_router_plan(G, W, _offset_out(T, K, 1))
+    assert (
+        cake_dense_gemm_det_train_router_plan(X, W.t(), _offset_out(T, N, 1))[0].splits
+        == 4
+    )
+    assert (
+        cake_dense_gemm_det_train_router_plan(G.t(), X, _offset_out(N, K, 1))[0].splits
+        == 6
+    )
 
 
 def test_router_split_rules_are_measured_windows_and_resolve_by_device():
@@ -5608,7 +5727,10 @@ def test_router_split_rules_are_measured_windows_and_resolve_by_device():
             A, B, out = X, torch.empty(256, H).t(), torch.empty(lo, 256)
         else:
             A, B, out = G.t(), X, torch.empty(256, H)
-        assert plan_router_fp32_det_gemm(A, B, out)[0].splits == ROUTER_SPLITS[layout]
+        assert (
+            cake_dense_gemm_det_train_router_plan(A, B, out)[0].splits
+            == ROUTER_SPLITS[layout]
+        )
 
 
 def test_router_split_rules_rows_plan_rerun_bit_exact_and_match_fp64_reference():
@@ -5632,20 +5754,22 @@ def test_router_split_rules_rows_plan_rerun_bit_exact_and_match_fp64_reference()
             (facts.arch, facts.sm_count, layout, H)
         ]
         v = _router_inputs(op, 16231, seed=SEED + 23, K=H)
-        plan, *_ = plan_router_fp32_det_gemm(v["A"], v["B"], v["out"])
+        plan, *_ = cake_dense_gemm_det_train_router_plan(v["A"], v["B"], v["out"])
         _require_program(plan.template)
         assert (plan.layout, plan.splits) == (layout, splits)
-        cake_backend.clear_convenience_caches()
-        prepared = prepare_router_fp32_det_gemm(v["A"], v["B"], v["out"])
+        cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
+        prepared = cake_dense_gemm_det_train_router_prepare(v["A"], v["B"], v["out"])
         assert prepared.splits == splits
         first = prepared.launch().clone()
         prepared.launch()
         torch.cuda.synchronize()
         assert torch.equal(first, v["out"])
         if op == "fwd":
-            eager = cake_backend.router_det_forward(v["X"], v["W"])
+            eager = cake_backend.cake_dense_gemm_det_train_router_forward(
+                v["X"], v["W"]
+            )
         else:
-            eager = cake_backend.router_det_wgrad(v["G"], v["X"])
+            eager = cake_backend.cake_dense_gemm_det_train_router_wgrad(v["G"], v["X"])
         torch.cuda.synchronize()
         assert torch.equal(eager, first)
         expected = torch.matmul(v["A"].double(), v["B"].double())
@@ -5889,7 +6013,7 @@ def test_convenience_cache_put_reports_every_entry_that_leaves_the_cache():
 def _cpu_router_entry(arena, op, T, splits=None):
     """A planned K2 convenience entry on CPU views (no module: a no-op entry callable)."""
     v = _router_inputs(op, T, seed=SEED + 8, device="cpu")
-    plan, A_eff, B_eff = plan_router_fp32_det_gemm(
+    plan, A_eff, B_eff = cake_dense_gemm_det_train_router_plan(
         v["A"], v["B"], v["out"], splits=splits
     )
     _, split_src = cake_backend._k2_views(v["A"], v["B"], plan)
@@ -5997,7 +6121,7 @@ def test_convenience_arena_grows_to_the_largest_requirement_and_carves_views(
     assert fwd.views_version == arena.version
     # a K1 entry carves the buffers themselves (pointer parameters)
     v = _views("proj", "kv_a", "fwd", "bf16", 257)
-    plan, *_ = plan_dense_projection_det_gemm(
+    plan, *_ = cake_dense_gemm_det_train_projection_plan(
         v["A"], v["B"], v["out"], sm_count=148, l2_bytes=L2_BYTES, arch="sm_100a"
     )
     arena.require("k1_ws", plan.ws_f32_elems)
@@ -6015,7 +6139,7 @@ def test_convenience_arena_grows_to_the_largest_requirement_and_carves_views(
 
 def test_convenience_arena_is_released_with_its_last_entry(monkeypatch):
     """``_release_entry`` (the caches' ``on_evict``) drops an arena from the registry once its last cached
-    entry is evicted; ``clear_convenience_caches`` drops them all."""
+    entry is evicted; ``cake_dense_gemm_det_train_convenience_cache_clear`` drops them all."""
     monkeypatch.setattr(cake_backend, "_K1_CACHE", OrderedDict())
     monkeypatch.setattr(cake_backend, "_K2_CACHE", OrderedDict())
     monkeypatch.setattr(cake_backend, "_ARENAS", {})
@@ -6046,7 +6170,7 @@ def test_convenience_arena_is_released_with_its_last_entry(monkeypatch):
     a7b = cake_backend._arena_for(0, 7, device)
     cake_backend._release_entry(e1)
     assert cake_backend._ARENAS[(0, 7)] is a7b
-    cake_backend.clear_convenience_caches()
+    cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
     assert cake_backend._ARENAS == {} and cache == OrderedDict()
 
 
@@ -6322,7 +6446,9 @@ def test_router_paths_split_through_the_registry(monkeypatch, fused):
     n = v["W"].numel()
     split_args = (n, -(-n // cake_backend.SPLIT_BLOCK_ELEMS), 1, 1)
     # the prepared path
-    prepared = prepare_router_fp32_det_gemm(v["A"], v["B"], v["out"], splits=4)
+    prepared = cake_dense_gemm_det_train_router_prepare(
+        v["A"], v["B"], v["out"], splits=4
+    )
     assert prepared.fused_split is fused and ("resid" in prepared.tensors) is not fused
     prepared.launch()
     if fused:
@@ -6337,7 +6463,9 @@ def test_router_paths_split_through_the_registry(monkeypatch, fused):
     # the convenience path
     calls.clear()
     chain.clear()
-    out = cake_backend.router_fp32_det_gemm(v["A"], v["B"], v["out"], splits=4)
+    out = cake_backend.cake_dense_gemm_det_train_router(
+        v["A"], v["B"], v["out"], splits=4
+    )
     assert out is v["out"]
     cached = next(iter(cake_backend._K2_CACHE.values()))
     arena = cached.arena
@@ -6382,7 +6510,7 @@ def test_convenience_views_match_the_planner_views(sm_count):
         for family, row, op, dt, T in cases:
             v = _views(family, row, op, dt, T)
             transposed = v.get("transposed", False)
-            plan, a_desc, b_desc, out3 = plan_dense_projection_det_gemm(
+            plan, a_desc, b_desc, out3 = cake_dense_gemm_det_train_projection_plan(
                 v["A"],
                 v["B"],
                 v["out"],
@@ -6579,7 +6707,7 @@ def test_registry_fallback_serves_every_registered_class(arch):
                 for K in _CLASS_SWEEP_K:
                     v = _class_views(layout, out_f32, out_t, M, N, K)
                     try:
-                        mirror, *_ = plan_dense_projection_det_gemm(
+                        mirror, *_ = cake_dense_gemm_det_train_projection_plan(
                             v["A"],
                             v["B"],
                             v["out"],
@@ -6595,7 +6723,7 @@ def test_registry_fallback_serves_every_registered_class(arch):
                         arch, mirror.a_mn, mirror.b_mn, out_f32, out_t, False, N, K, M
                     ):
                         continue
-                    plan, *_ = plan_dense_projection_det_gemm(
+                    plan, *_ = cake_dense_gemm_det_train_projection_plan(
                         v["A"], v["B"], v["out"], transposed_out=out_t, **kw
                     )
                     where = (
@@ -6687,7 +6815,7 @@ def test_registry_fallback_reaches_the_shapes_tranche_programs(monkeypatch):
         neighbour = next((c for c in candidates if c in registered), None)
         assert neighbour is not None, (M, N, K, launcher)
         v = _class_views(layout, out_f32, out_t, M, N, K)
-        mirror, *_ = plan_dense_projection_det_gemm(
+        mirror, *_ = cake_dense_gemm_det_train_projection_plan(
             v["A"], v["B"], v["out"], transposed_out=out_t, _fallback=False, **kw
         )
         assert mirror.template == launcher and launcher not in registered, (
@@ -6696,7 +6824,7 @@ def test_registry_fallback_reaches_the_shapes_tranche_programs(monkeypatch):
             K,
             mirror.template,
         )
-        plan, *_ = plan_dense_projection_det_gemm(
+        plan, *_ = cake_dense_gemm_det_train_projection_plan(
             v["A"], v["B"], v["out"], transposed_out=out_t, **kw
         )
         assert plan.template == neighbour, (M, N, K, plan.template, neighbour)
@@ -6709,7 +6837,9 @@ def test_registry_fallback_reaches_the_shapes_tranche_programs(monkeypatch):
     # a caller-forced tail policy keeps the row on a registered program: a pair form admits it, the single-CTA
     # form (``cta1`` clears the tail knobs) stays reachable when no pair form is registered
     v = _class_views("kk", False, False, 16384, 128, 4096)
-    plan, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], sk=True, **kw)
+    plan, *_ = cake_dense_gemm_det_train_projection_plan(
+        v["A"], v["B"], v["out"], sk=True, **kw
+    )
     assert plan.template in registered and plan.knob_fallback, plan.template
     if plan.template.endswith("_c1"):
         assert plan.cta1 and plan.sk_units == 0 and not plan.sk_sync
@@ -6718,10 +6848,10 @@ def test_registry_fallback_reaches_the_shapes_tranche_programs(monkeypatch):
     registered107 = _registered("sm_107a")
     neighbour107 = next(c for c in nn_n128_t if c in registered107)
     v = _class_views("nn", False, True, 4096, 128, 16384)
-    mirror, *_ = plan_dense_projection_det_gemm(
+    mirror, *_ = cake_dense_gemm_det_train_projection_plan(
         v["A"], v["B"], v["out"], transposed_out=True, _fallback=False, **kw107
     )
-    plan, *_ = plan_dense_projection_det_gemm(
+    plan, *_ = cake_dense_gemm_det_train_projection_plan(
         v["A"], v["B"], v["out"], transposed_out=True, **kw107
     )
     assert (
@@ -6749,11 +6879,11 @@ def test_registry_fallback_decodes_the_nearest_generated_program(monkeypatch):
     monkeypatch.setattr(cake_backend, "ROW_RULES", {})
     kw = dict(sm_count=148, l2_bytes=L2_BYTES, arch="sm_100a")
     v = _class_views("nn", False, False, 4096, 4096, 16384)
-    mirror, *_ = plan_dense_projection_det_gemm(
+    mirror, *_ = cake_dense_gemm_det_train_projection_plan(
         v["A"], v["B"], v["out"], _fallback=False, **kw
     )
     assert mirror.template not in fake["sm_100a"]
-    plan, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], **kw)
+    plan, *_ = cake_dense_gemm_det_train_projection_plan(v["A"], v["B"], v["out"], **kw)
     assert plan.template in (
         "dense_proj_det_gemm_nn_n256_sks_sb2_pro7",
         "dense_proj_det_gemm_nn_n160_m256_bz64_pro15",
@@ -6769,12 +6899,12 @@ def test_registry_fallback_decodes_the_nearest_generated_program(monkeypatch):
     )
     # a class without a program stays unregistered (the launch binding raises, not the planner) and unflagged
     v = _class_views("kn", False, False, 4096, 4096, 16384)
-    plan, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], **kw)
+    plan, *_ = cake_dense_gemm_det_train_projection_plan(v["A"], v["B"], v["out"], **kw)
     assert plan.template not in fake["sm_100a"]
     assert not (plan.knob_fallback or plan.rule_fallback or plan.swap_fallback)
     # a caller-forced knob wins over a decoded one: the forced 256-row tile never reaches the 128-row sync program
     v = _class_views("nn", False, False, 4096, 4096, 16384)
-    plan, *_ = plan_dense_projection_det_gemm(
+    plan, *_ = cake_dense_gemm_det_train_projection_plan(
         v["A"], v["B"], v["out"], cta_rows=256, **kw
     )
     assert (
@@ -7192,7 +7322,7 @@ def test_measured_shape_rules_plan_their_programs(arch):
         kw = dict(
             sm_count=sm_count, l2_bytes=L2_BYTES, transposed_out=key[4], arch=arch
         )
-        mirror, *_ = plan_dense_projection_det_gemm(
+        mirror, *_ = cake_dense_gemm_det_train_projection_plan(
             v["A"], v["B"], v["out"], _fallback=False, **kw
         )
         assert mirror.template == template, (key, T, mirror.template)
@@ -7203,7 +7333,9 @@ def test_measured_shape_rules_plan_their_programs(arch):
             T,
             template,
         )
-        plan, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], **kw)
+        plan, *_ = cake_dense_gemm_det_train_projection_plan(
+            v["A"], v["B"], v["out"], **kw
+        )
         if template in registered:
             assert plan.template == template, (key, T, plan.template)
             assert not (
@@ -7318,17 +7450,17 @@ def test_sm103a_inherits_the_sm100a_rules_where_it_has_none():
     direct = fallen = own_rows = 0
     for label, v, extra in _owner_rows():
         kw = dict(sm_count=sm, l2_bytes=L2_BYTES, **extra)
-        mirror, *_ = plan_dense_projection_det_gemm(
+        mirror, *_ = cake_dense_gemm_det_train_projection_plan(
             v["A"], v["B"], v["out"], arch="sm_103a", _fallback=False, **kw
         )
         if _own_measured_rule("sm_103a", mirror) is not None:
             own_rows += 1  # a GB300-measured row: its own rule, checked by the measured-rows test
             continue
-        parent, *_ = plan_dense_projection_det_gemm(
+        parent, *_ = cake_dense_gemm_det_train_projection_plan(
             v["A"], v["B"], v["out"], arch="sm_100a", _fallback=False, **kw
         )
         assert _plan_signature(mirror) == _plan_signature(parent), label
-        plan, *_ = plan_dense_projection_det_gemm(
+        plan, *_ = cake_dense_gemm_det_train_projection_plan(
             v["A"], v["B"], v["out"], arch="sm_103a", **kw
         )
         if parent.template in registered:
@@ -7352,7 +7484,7 @@ def test_rule_inheritance_leaves_the_other_architectures_unchanged(monkeypatch):
         out = {}
         for label, v, extra in _owner_rows():
             try:
-                plan, *_ = plan_dense_projection_det_gemm(
+                plan, *_ = cake_dense_gemm_det_train_projection_plan(
                     v["A"],
                     v["B"],
                     v["out"],
@@ -7426,7 +7558,7 @@ def test_wgrad_swap_follows_the_measured_rule():
     assert not transposed and A.shape == (512, T) and B is X
     A, B, transposed = wgrad_views(G, X, arch="sm_100a")
     assert transposed and A.shape == (4096, T) and B is G
-    plan, *_ = plan_dense_projection_det_gemm(
+    plan, *_ = cake_dense_gemm_det_train_projection_plan(
         A,
         B,
         torch.empty(512, 4096, dtype=torch.bfloat16),
@@ -7557,7 +7689,9 @@ def test_round2_rules_plan_their_knobs():
         for M, N in ((12288, 4096), (4096, 12288)):
             for T, k_blocks in ((16384, 256), (16231, 254)):
                 v = _class_views("nn", False, False, M, N, T)
-                plan, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], **a)
+                plan, *_ = cake_dense_gemm_det_train_projection_plan(
+                    v["A"], v["B"], v["out"], **a
+                )
                 assert (
                     plan.template == "dense_proj_det_gemm_nn_n256_m256_skx_skf_pro7"
                 ), (
@@ -7585,7 +7719,7 @@ def test_round2_rules_plan_their_knobs():
                     and plan.ws_f32_elems > 0
                 )
                 # a caller-forced synchronised plan or single-CTA form drops the rule's order with its split
-                forced, *_ = plan_dense_projection_det_gemm(
+                forced, *_ = cake_dense_gemm_det_train_projection_plan(
                     v["A"], v["B"], v["out"], sk_sync=True, **a
                 )
                 assert (
@@ -7593,7 +7727,7 @@ def test_round2_rules_plan_their_knobs():
                     and not forced.sk_first
                     and "_skf" not in forced.template
                 )
-                forced, *_ = plan_dense_projection_det_gemm(
+                forced, *_ = cake_dense_gemm_det_train_projection_plan(
                     v["A"], v["B"], v["out"], sk=False, **a
                 )
                 assert (
@@ -7602,7 +7736,7 @@ def test_round2_rules_plan_their_knobs():
                     and forced.template == "dense_proj_det_gemm_nn_n256_m256_pro7"
                 )
                 with pytest.raises(ValueError):
-                    plan_dense_projection_det_gemm(
+                    cake_dense_gemm_det_train_projection_plan(
                         v["A"], v["B"], v["out"], sk=False, sk_first=True, **a
                     )
         # LGF-R2: the 4096 squares take the half-tail column-grouped programs (group 16), the N 5120 rows group 12
@@ -7611,7 +7745,9 @@ def test_round2_rules_plan_their_knobs():
             ("kn", "dense_proj_det_gemm_kn_n256_ht_cg_pro15"),
         ):
             v = _class_views(layout, False, False, 16384, 4096, 4096)
-            plan, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], **a)
+            plan, *_ = cake_dense_gemm_det_train_projection_plan(
+                v["A"], v["B"], v["out"], **a
+            )
             assert (
                 plan.template == template
                 and plan.htail
@@ -7630,7 +7766,9 @@ def test_round2_rules_plan_their_knobs():
             ("kk", 17408, 5120, "dense_proj_det_gemm_kk_n256_cg_pro15"),
         ):
             v = _class_views(layout, False, False, 16384, N, K)
-            plan, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], **a)
+            plan, *_ = cake_dense_gemm_det_train_projection_plan(
+                v["A"], v["B"], v["out"], **a
+            )
             assert plan.template == template and plan.cgrp and plan.group_m == 12, (
                 arch,
                 layout,
@@ -7656,7 +7794,7 @@ def test_round2_rules_plan_their_knobs():
                     if (K_layer, N_layer) == (4096, 48)
                     else {}
                 )
-                plan, *_ = plan_dense_projection_det_gemm(
+                plan, *_ = cake_dense_gemm_det_train_projection_plan(
                     v["A"], v["B"], v["out"], **forced_h, **a
                 )
                 assert plan.template == template and plan.lw and plan.pd == 0, (
@@ -7673,20 +7811,22 @@ def test_round2_rules_plan_their_knobs():
                     plan.iters_per_unit,
                 ) == plan_fields
                 # the load-warp form yields to a caller-forced single-CTA form or a pro without bit 4
-                forced, *_ = plan_dense_projection_det_gemm(
+                forced, *_ = cake_dense_gemm_det_train_projection_plan(
                     v["A"], v["B"], v["out"], cta1=True, **a
                 )
                 assert not forced.lw and forced.template.endswith("_c1")
-                forced, *_ = plan_dense_projection_det_gemm(
+                forced, *_ = cake_dense_gemm_det_train_projection_plan(
                     v["A"], v["B"], v["out"], pro=3, **a
                 )
                 assert not forced.lw and forced.template.endswith("_pro3")
                 with pytest.raises(ValueError):
-                    plan_dense_projection_det_gemm(
+                    cake_dense_gemm_det_train_projection_plan(
                         v["A"], v["B"], v["out"], pro=3, lw=True, **a
                     )
         v = _class_views("kn", False, False, 16384, 5120, 128)
-        plan, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], **a)
+        plan, *_ = cake_dense_gemm_det_train_projection_plan(
+            v["A"], v["B"], v["out"], **a
+        )
         assert (
             plan.template == "dense_proj_det_gemm_kn_n256_tma2_pd2_lw_pro15"
             and plan.pd == 2
@@ -7696,7 +7836,7 @@ def test_round2_rules_plan_their_knobs():
     # the GB300-only round-2 picks: the 4096 -> 64 load-warp program, the l2_256b promotion of the N 512 input gradients
     a = dict(kw, arch="sm_103a")
     v = _class_views("kn", False, False, 16384, 4096, 64)
-    plan, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], **a)
+    plan, *_ = cake_dense_gemm_det_train_projection_plan(v["A"], v["B"], v["out"], **a)
     assert (
         plan.template == "dense_proj_det_gemm_kn_n256_tma2_pd2_lw_pro15"
         and plan.group_m == 32
@@ -7704,13 +7844,17 @@ def test_round2_rules_plan_their_knobs():
     # (the two rows' eight-warp CTA form is forced off here - its own test is
     # test_eight_warp_form_rules_plan_their_programs; the ten-warp program below is the row's program where it yields)
     v = _class_views("kn", False, False, 16384, 4096, 512)
-    plan, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], form="", **a)
+    plan, *_ = cake_dense_gemm_det_train_projection_plan(
+        v["A"], v["B"], v["out"], form="", **a
+    )
     assert (
         plan.template == "dense_proj_det_gemm_kn_n256_tma1_pd2_lw_mg_pro15"
         and plan.promo == "l2_256b"
     )  # + the whole-tile tile resolve (test_mg_rules_plan_the_whole_tile_programs)
     v = _class_views("kn", False, False, 16384, 5120, 512)
-    plan, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], form="", **a)
+    plan, *_ = cake_dense_gemm_det_train_projection_plan(
+        v["A"], v["B"], v["out"], form="", **a
+    )
     assert (
         plan.template == "dense_proj_det_gemm_kn_n256_tma1_pd2_mg_sw25_pro15"
         and plan.promo == "l2_256b"
@@ -7721,14 +7865,14 @@ def test_round2_rules_plan_their_knobs():
     # single-CTA program
     a = dict(kw, arch="sm_100a")
     v = _class_views("kn", False, False, 16384, 4096, 64)
-    plan, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], **a)
+    plan, *_ = cake_dense_gemm_det_train_projection_plan(v["A"], v["B"], v["out"], **a)
     assert (
         plan.template == "dense_proj_det_gemm_kn_n256_tma1_w8r"
         and plan.form == "w8r"
         and plan.group_m == 8
         and not plan.lw
     )
-    plan, *_ = plan_dense_projection_det_gemm(
+    plan, *_ = cake_dense_gemm_det_train_projection_plan(
         v["A"], v["B"], v["out"], epi="tma", slots=2, cta1=True, pd=3, **a
     )
     assert (
@@ -7739,7 +7883,9 @@ def test_round2_rules_plan_their_knobs():
     # (the row's eight-warp CTA form is forced off here - its own test is
     # test_eight_warp_form_rules_plan_their_programs; the ten-warp program below is the row's program where it yields)
     v = _class_views("kn", False, False, 16384, 5120, 512)
-    plan, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], form="", **a)
+    plan, *_ = cake_dense_gemm_det_train_projection_plan(
+        v["A"], v["B"], v["out"], form="", **a
+    )
     assert (
         plan.template == "dense_proj_det_gemm_kn_n256_tma1_pd2_pro15"
         and plan.promo == "none"
@@ -7747,15 +7893,17 @@ def test_round2_rules_plan_their_knobs():
     )
     # the column-grouped raster takes any group count; the pair raster still needs an even one
     v = _class_views("kk", False, False, 16384, 5120, 5120)
-    plan, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], group_m=3, **a)
+    plan, *_ = cake_dense_gemm_det_train_projection_plan(
+        v["A"], v["B"], v["out"], group_m=3, **a
+    )
     assert plan.group_m == 3 and plan.cgrp
     with pytest.raises(ValueError):
-        plan_dense_projection_det_gemm(
+        cake_dense_gemm_det_train_projection_plan(
             v["A"], v["B"], v["out"], group_m=3, cgrp=False, **a
         )
     # WGR2 E1: the 4096 -> 1024 bf16 weight gradient runs direct on sm_100a now (the sm_103a program)
     v = _class_views("nn", False, False, 1024, 4096, 16384)
-    plan, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], **a)
+    plan, *_ = cake_dense_gemm_det_train_projection_plan(v["A"], v["B"], v["out"], **a)
     assert (
         plan.template == "dense_proj_det_gemm_nn_n224_hne_cg_pro15"
         and plan.block_n == 224
@@ -7816,7 +7964,7 @@ def test_mg_rules_plan_the_whole_tile_programs(T):
         # (these three rows carry the eight-warp CTA form too: it is forced off here, the whole-tile tile resolve is
         # the row's program where the form yields; test_eight_warp_form_rules_plan_their_programs tests the form)
         v = _class_views("kn", False, False, T, K_layer, N_layer)
-        plan, *_ = plan_dense_projection_det_gemm(
+        plan, *_ = cake_dense_gemm_det_train_projection_plan(
             v["A"], v["B"], v["out"], form="", **a
         )
         assert plan.template == template, (key, T, plan.template)
@@ -7832,7 +7980,7 @@ def test_mg_rules_plan_the_whole_tile_programs(T):
         assert plan.num_full == plan.pair_tiles and plan.ws_f32_elems == 0
         assert plan.grid == (2 * plan.pair_tiles, 1, 1) and not plan.cta1
         # the twin without the resolve: the same plan, only the program differs
-        plain, *_ = plan_dense_projection_det_gemm(
+        plain, *_ = cake_dense_gemm_det_train_projection_plan(
             v["A"], v["B"], v["out"], mg=False, **a
         )
         assert not plain.mg and plain.template == template.replace("_mg", "")
@@ -7853,17 +8001,17 @@ def test_mg_rules_plan_the_whole_tile_programs(T):
             == template
         )
         # a caller forcing a form the program excludes: the rule's mg yields and the forced form plans
-        forced, *_ = plan_dense_projection_det_gemm(
+        forced, *_ = cake_dense_gemm_det_train_projection_plan(
             v["A"], v["B"], v["out"], cta1=True, **a
         )
         assert not forced.mg and forced.template.endswith("_c1"), forced.template
-        forced, *_ = plan_dense_projection_det_gemm(
+        forced, *_ = cake_dense_gemm_det_train_projection_plan(
             v["A"], v["B"], v["out"], cgrp=True, **a
         )
         assert not forced.mg and forced.cgrp and "_mg" not in forced.template
         assert "_cg" in forced.template
         with pytest.raises(ValueError, match=r"mg \(whole-tile"):
-            plan_dense_projection_det_gemm(
+            cake_dense_gemm_det_train_projection_plan(
                 v["A"], v["B"], v["out"], cgrp=True, mg=True, **a
             )
     # the K 512 rows: ``sk=True`` admits no split (8 K steps = SK_MIN_ITERS: 36 units over the 36 tail tiles of the
@@ -7871,17 +8019,21 @@ def test_mg_rules_plan_the_whole_tile_programs(T):
     # 18 units over the 16 tail tiles, so the rule's mg yields to the plain program, and forcing mg on that plan is
     # refused
     v = _class_views("kn", False, False, T, 4096, 512)
-    sk, *_ = plan_dense_projection_det_gemm(
+    sk, *_ = cake_dense_gemm_det_train_projection_plan(
         v["A"], v["B"], v["out"], sk=True, form="", **a
     )
     assert sk.sk_units == 0 and sk.mg
     assert sk.template == "dense_proj_det_gemm_kn_n256_tma1_pd2_lw_mg_pro15"
     v = _class_views("kn", False, False, T, 6144, 576)
-    sk, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], sk=True, **a)
+    sk, *_ = cake_dense_gemm_det_train_projection_plan(
+        v["A"], v["B"], v["out"], sk=True, **a
+    )
     assert (sk.sk_units, sk.tail_tiles, sk.iters_per_unit) == (18, 16, 8)
     assert not sk.mg and sk.template == "dense_proj_det_gemm_kn_n256_tma1_pd2_pro15"
     with pytest.raises(ValueError, match="whole-tile plan"):
-        plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], sk=True, mg=True, **a)
+        cake_dense_gemm_det_train_projection_plan(
+            v["A"], v["B"], v["out"], sk=True, mg=True, **a
+        )
     # the rows without the resolve keep their program (5120 -> 1024 paces its stores), the fp32 twins and sm_100a
     # never carry the resolve (both rows carry the eight-warp CTA form: forced off here)
     for K_layer, N_layer, template in (
@@ -7889,7 +8041,7 @@ def test_mg_rules_plan_the_whole_tile_programs(T):
         (5120, 1024, "dense_proj_det_gemm_kn_n256_tma1_pd2_sw25_pro15"),
     ):
         v = _class_views("kn", False, False, T, K_layer, N_layer)
-        plan, *_ = plan_dense_projection_det_gemm(
+        plan, *_ = cake_dense_gemm_det_train_projection_plan(
             v["A"], v["B"], v["out"], form="", **a
         )
         assert not plan.mg, (K_layer, N_layer)
@@ -7902,10 +8054,12 @@ def test_mg_rules_plan_the_whole_tile_programs(T):
         )
     for K_layer, N_layer, _t, _g, _p, _lw in rows:
         f = _class_views("kn", True, False, T, K_layer, N_layer)
-        plan, *_ = plan_dense_projection_det_gemm(f["A"], f["B"], f["out"], **a)
+        plan, *_ = cake_dense_gemm_det_train_projection_plan(
+            f["A"], f["B"], f["out"], **a
+        )
         assert not plan.mg and "_mg" not in plan.template, (K_layer, N_layer, "f32")
         v = _class_views("kn", False, False, T, K_layer, N_layer)
-        plan, *_ = plan_dense_projection_det_gemm(
+        plan, *_ = cake_dense_gemm_det_train_projection_plan(
             v["A"], v["B"], v["out"], **dict(kw, arch="sm_100a")
         )
         assert not plan.mg and "_mg" not in plan.template, (K_layer, N_layer, "sm_100a")
@@ -7968,7 +8122,7 @@ def test_sw_rules_plan_the_paced_store_programs(T):
         # (both rows carry the eight-warp CTA form too: forced off here, the paced program is the row's program
         # where the form yields; test_eight_warp_form_rules_plan_their_programs tests the form)
         v = _class_views("kn", False, False, T, K_layer, N_layer)
-        plan, *_ = plan_dense_projection_det_gemm(
+        plan, *_ = cake_dense_gemm_det_train_projection_plan(
             v["A"], v["B"], v["out"], form="", **a
         )
         assert plan.template == template, (key, T, plan.template)
@@ -7976,7 +8130,9 @@ def test_sw_rules_plan_the_paced_store_programs(T):
         assert (plan.epi, plan.slots, plan.pd, plan.pro) == ("tma", 1, 2, 15), key
         assert plan.sk_units == 0 and not plan.cta1
         # the twin without the pacing: the same plan, only the program differs
-        plain, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], sw=0, **a)
+        plain, *_ = cake_dense_gemm_det_train_projection_plan(
+            v["A"], v["B"], v["out"], sw=0, **a
+        )
         assert plain.sw == 0 and plain.template == template.replace("_sw25", "")
         assert {**_plan_signature(plan), "template": None, "sw": None} == {
             **_plan_signature(plain),
@@ -7997,24 +8153,26 @@ def test_sw_rules_plan_the_paced_store_programs(T):
         # a caller forcing a program outside the drain or the single-CTA form: the rule's sw yields and the forced
         # form plans; forcing sw with it is refused
         for forced_knobs in (dict(pd=0), dict(pd=3)):
-            forced, *_ = plan_dense_projection_det_gemm(
+            forced, *_ = cake_dense_gemm_det_train_projection_plan(
                 v["A"], v["B"], v["out"], **forced_knobs, **a
             )
             assert forced.sw == 0 and forced.pd == forced_knobs["pd"], forced.template
             assert "_sw" not in forced.template, forced.template
             with pytest.raises(ValueError, match=r"sw \(paced output stores\)"):
-                plan_dense_projection_det_gemm(
+                cake_dense_gemm_det_train_projection_plan(
                     v["A"], v["B"], v["out"], sw=25, **forced_knobs, **a
                 )
-        forced, *_ = plan_dense_projection_det_gemm(
+        forced, *_ = cake_dense_gemm_det_train_projection_plan(
             v["A"], v["B"], v["out"], cta1=True, **a
         )
         assert forced.sw == 0 and forced.template.endswith("_c1"), forced.template
         # the fp32 twin and sm_100a never carry the pacing
         f = _class_views("kn", True, False, T, K_layer, N_layer)
-        plan, *_ = plan_dense_projection_det_gemm(f["A"], f["B"], f["out"], **a)
+        plan, *_ = cake_dense_gemm_det_train_projection_plan(
+            f["A"], f["B"], f["out"], **a
+        )
         assert plan.sw == 0 and "_sw" not in plan.template, (K_layer, N_layer, "f32")
-        plan, *_ = plan_dense_projection_det_gemm(
+        plan, *_ = cake_dense_gemm_det_train_projection_plan(
             v["A"], v["B"], v["out"], **dict(kw, arch="sm_100a")
         )
         assert plan.sw == 0 and "_sw" not in plan.template, (K_layer, N_layer)
@@ -8025,7 +8183,7 @@ def test_sw_rules_plan_the_paced_store_programs(T):
         (6144, 576, "dense_proj_det_gemm_kn_n256_tma1_pd2_mg_pro15"),
     ):
         v = _class_views("kn", False, False, T, K_layer, N_layer)
-        plan, *_ = plan_dense_projection_det_gemm(
+        plan, *_ = cake_dense_gemm_det_train_projection_plan(
             v["A"], v["B"], v["out"], form="", **a
         )
         assert plan.sw == 0 and plan.template == template, (K_layer, N_layer)
@@ -8126,7 +8284,9 @@ def test_eight_warp_form_rules_plan_their_programs(arch, T, monkeypatch):
         rule = ROW_RULES[key]
         assert rule["form"] == form and rule["sk"] is False, key
         v = _class_views("kn", False, False, T, N_layer, K_layer)
-        plan, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], **mirror)
+        plan, *_ = cake_dense_gemm_det_train_projection_plan(
+            v["A"], v["B"], v["out"], **mirror
+        )
         assert plan.template == template, (key, T, plan.template)
         assert plan.form == form and plan.tma_out and plan.epi == "tma"
         assert (plan.slots, plan.stages, plan.block_n, plan.cta_rows) == (
@@ -8143,7 +8303,9 @@ def test_eight_warp_form_rules_plan_their_programs(arch, T, monkeypatch):
         assert plan.pd == 0 and plan.pro == 0 and plan.pf == 0 and plan.sh == 0, key
         assert plan.hints == ("none", "none") and plan.store_hint == "none", key
         # the registered program plans directly (no fallback)
-        served, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], **kw)
+        served, *_ = cake_dense_gemm_det_train_projection_plan(
+            v["A"], v["B"], v["out"], **kw
+        )
         assert served.template == template and template in registered, (key, T)
         assert not (
             served.swap_fallback
@@ -8152,7 +8314,7 @@ def test_eight_warp_form_rules_plan_their_programs(arch, T, monkeypatch):
             or served.wave_fallback
         ), key
         # the ten-warp twin: the same plan arithmetic, the row's program with its pipeline knobs
-        plain, *_ = plan_dense_projection_det_gemm(
+        plain, *_ = cake_dense_gemm_det_train_projection_plan(
             v["A"], v["B"], v["out"], form="", **mirror
         )
         assert plain.form == "" and "_w8" not in plain.template, plain.template
@@ -8203,37 +8365,41 @@ def test_eight_warp_form_rules_plan_their_programs(arch, T, monkeypatch):
     # register epilogue or a caller-forced pipeline knob plan the row's ten-warp program; a caller-forced form is
     # refused on every such plan
     v = _class_views("kn", False, False, T, 6144, 576)
-    sk, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], sk=True, **mirror)
+    sk, *_ = cake_dense_gemm_det_train_projection_plan(
+        v["A"], v["B"], v["out"], sk=True, **mirror
+    )
     assert (sk.sk_units, sk.tail_tiles) == (18, 16) and sk.form == ""
     assert sk.template == "dense_proj_det_gemm_kn_n256_tma1_pd2_pro15"
     with pytest.raises(ValueError, match="whole-tile"):
-        plan_dense_projection_det_gemm(
+        cake_dense_gemm_det_train_projection_plan(
             v["A"], v["B"], v["out"], sk=True, form="w8rs", **mirror
         )
     for N_layer, K_layer in rows:
         v = _class_views("kn", False, False, T, N_layer, K_layer)
-        forced, *_ = plan_dense_projection_det_gemm(
+        forced, *_ = cake_dense_gemm_det_train_projection_plan(
             v["A"], v["B"], v["out"], cta1=True, **mirror
         )
         assert forced.form == "" and forced.template.endswith("_c1"), forced.template
-        forced, *_ = plan_dense_projection_det_gemm(
+        forced, *_ = cake_dense_gemm_det_train_projection_plan(
             v["A"], v["B"], v["out"], epi="reg", **mirror
         )
         assert forced.form == "" and forced.epi == "reg", forced.template
         assert "_w8" not in forced.template, forced.template
-        forced, *_ = plan_dense_projection_det_gemm(
+        forced, *_ = cake_dense_gemm_det_train_projection_plan(
             v["A"], v["B"], v["out"], pro=7, **mirror
         )
         assert forced.form == "" and forced.pro == 7, forced.template
         assert forced.template.endswith("_pro7"), forced.template
         for bad in (dict(epi="reg"), dict(cta1=True), dict(pro=7), dict(pd=2)):
             with pytest.raises(ValueError, match="form"):
-                plan_dense_projection_det_gemm(
+                cake_dense_gemm_det_train_projection_plan(
                     v["A"], v["B"], v["out"], form="w8r", **bad, **mirror
                 )
         # the fp32 twin carries no form on either architecture (the fp32 rows are other rules)
         f = _class_views("kn", True, False, T, N_layer, K_layer)
-        plan, *_ = plan_dense_projection_det_gemm(f["A"], f["B"], f["out"], **mirror)
+        plan, *_ = cake_dense_gemm_det_train_projection_plan(
+            f["A"], f["B"], f["out"], **mirror
+        )
         assert plan.form == "" and "_w8" not in plan.template, (N_layer, K_layer)
         # the other architectures' plans of the row: the five sm_100a rows shared with sm_103a carry the sm_103a form
         # (``w8rs`` / ``w8rs`` / ``w8r`` / ``w8r`` / ``w8rs``) and the sm_100a 4096 -> 64 and 5120 -> 64 rows none there
@@ -8244,7 +8410,7 @@ def test_eight_warp_form_rules_plan_their_programs(arch, T, monkeypatch):
         for other_arch, other_rows in EIGHT_WARP_ROW_PLANS.items():
             if other_arch == arch:
                 continue
-            other, *_ = plan_dense_projection_det_gemm(
+            other, *_ = cake_dense_gemm_det_train_projection_plan(
                 v["A"], v["B"], v["out"], **dict(mirror, arch=other_arch)
             )
             expected_other = other_rows.get((N_layer, K_layer))
@@ -8265,7 +8431,7 @@ def test_eight_warp_form_rules_plan_their_programs(arch, T, monkeypatch):
                     0,
                     other_group_m,
                 ), (other_arch, N_layer, K_layer)
-        other, *_ = plan_dense_projection_det_gemm(
+        other, *_ = cake_dense_gemm_det_train_projection_plan(
             v["A"], v["B"], v["out"], **dict(mirror, arch="sm_107a")
         )
         assert other.form == "" and "_w8" not in other.template, (N_layer, K_layer)
@@ -8524,7 +8690,7 @@ def test_gb_t_exact_rules_plan_their_programs(arch, monkeypatch):
             plans = {}
             for t in (T - 1, T, T + 1):
                 v = _class_views("kn" if b_mn else "kk", False, False, t, N, K)
-                plans[t], *_ = plan_dense_projection_det_gemm(
+                plans[t], *_ = cake_dense_gemm_det_train_projection_plan(
                     v["A"], v["B"], v["out"], **kw
                 )
             plan = plans[T]
@@ -8539,12 +8705,12 @@ def test_gb_t_exact_rules_plan_their_programs(arch, monkeypatch):
                 for k in _gb_t_exact_keys_of(key):
                     m.delitem(ROW_RULES, k)
                 v = _class_views("kn" if b_mn else "kk", False, False, T, N, K)
-                ragged, *_ = plan_dense_projection_det_gemm(
+                ragged, *_ = cake_dense_gemm_det_train_projection_plan(
                     v["A"], v["B"], v["out"], **kw
                 )
                 for t in (T - 1, T + 1):
                     v = _class_views("kn" if b_mn else "kk", False, False, t, N, K)
-                    without, *_ = plan_dense_projection_det_gemm(
+                    without, *_ = cake_dense_gemm_det_train_projection_plan(
                         v["A"], v["B"], v["out"], **kw
                     )
                     assert _plan_signature(plans[t]) == _plan_signature(without), (
@@ -8614,8 +8780,8 @@ def test_gb_t_exact_rows_match_fp64_and_their_plan_without_the_key(key, monkeypa
     template = GB_T_EXACT_ROWS[(arch, b_mn, N, K)][1]
     _require_program(template)
     out = torch.full((T, N), float("nan"), dtype=torch.bfloat16, device=device)
-    cake_backend.clear_convenience_caches()
-    prepared = prepare_dense_projection_det_gemm(A, B, out)
+    cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
+    prepared = cake_dense_gemm_det_train_projection_prepare(A, B, out)
     assert prepared.template == template, prepared.template
     assert _whole_k(prepared.plan)
     prepared.launch()
@@ -8625,8 +8791,8 @@ def test_gb_t_exact_rows_match_fp64_and_their_plan_without_the_key(key, monkeypa
     with monkeypatch.context() as m:
         for k in _gb_t_exact_keys_of(key):
             m.delitem(ROW_RULES, k)
-        cake_backend.clear_convenience_caches()
-        plain = prepare_dense_projection_det_gemm(A, B, plain_out)
+        cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
+        plain = cake_dense_gemm_det_train_projection_prepare(A, B, plain_out)
     if (arch, b_mn, N, K) in GB_T_EXACT_RASTER_ROWS:
         assert plain.template == template and _whole_k(plain.plan), plain.template
         assert plain.plan.group_m != prepared.plan.group_m, plain.plan.group_m
@@ -8769,7 +8935,7 @@ def test_gb_t_exact_wgrad_rules_plan_their_programs(arch, monkeypatch):
         G, X, out = _gb_wgrad_views(N, T, M)
         A, B, transposed = wgrad_views(G, X, arch=arch)
         assert not transposed, (N, T, M)
-        plan, *_ = plan_dense_projection_det_gemm(A, B, out, **kw)
+        plan, *_ = cake_dense_gemm_det_train_projection_plan(A, B, out, **kw)
         return plan
 
     for key in exact:
@@ -8831,8 +8997,8 @@ def test_gb_t_exact_wgrad_rows_match_fp64_and_their_plan_without_the_key(
     template = GB_T_EXACT_WGRAD_ROWS[key]
     _require_program(template)
     out = torch.full((M, N), float("nan"), dtype=torch.bfloat16, device=device)
-    cake_backend.clear_convenience_caches()
-    prepared = prepare_projection_det_wgrad(G, X, out)
+    cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
+    prepared = cake_dense_gemm_det_train_projection_wgrad_prepare(G, X, out)
     assert prepared.template == template, prepared.template
     assert not prepared.plan.transposed_out and _whole_k(prepared.plan)
     prepared.launch()
@@ -8842,8 +9008,8 @@ def test_gb_t_exact_wgrad_rows_match_fp64_and_their_plan_without_the_key(
     with monkeypatch.context() as m:
         for k in _gb_t_exact_keys_of(key):
             m.delitem(ROW_RULES, k)
-        cake_backend.clear_convenience_caches()
-        plain = prepare_projection_det_wgrad(G, X, plain_out)
+        cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
+        plain = cake_dense_gemm_det_train_projection_wgrad_prepare(G, X, plain_out)
     assert plain.template != template and _whole_k(plain.plan), plain.template
     plain.launch()
     torch.cuda.synchronize()
@@ -8851,7 +9017,7 @@ def test_gb_t_exact_wgrad_rows_match_fp64_and_their_plan_without_the_key(
         key,
         plain.template,
     )
-    cake_backend.clear_convenience_caches()
+    cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
 
 
 # The GB T-exact weight-gradient rules of round 3: ROW_RULES key -> the program it plans at its T (K = T, in the direct
@@ -8920,7 +9086,7 @@ def test_gb_t_exact_sks_wgrad_rules_plan_their_programs(arch, monkeypatch):
         G, X, out = _gb_wgrad_views(N, T, M)
         A, B, transposed = wgrad_views(G, X, arch=arch)
         assert not transposed, (N, T, M)
-        plan, *_ = plan_dense_projection_det_gemm(A, B, out, **kw)
+        plan, *_ = cake_dense_gemm_det_train_projection_plan(A, B, out, **kw)
         return plan
 
     for key in keys:
@@ -8995,8 +9161,8 @@ def test_gb_t_exact_sks_wgrad_rows_match_fp64_and_their_plan_without_the_key(
     template = GB_T_EXACT_SKS_WGRAD_ROWS[key]
     _require_program(template)
     out = torch.full((M, N), float("nan"), dtype=torch.bfloat16, device=device)
-    cake_backend.clear_convenience_caches()
-    prepared = prepare_projection_det_wgrad(G, X, out)
+    cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
+    prepared = cake_dense_gemm_det_train_projection_wgrad_prepare(G, X, out)
     assert prepared.template == template, prepared.template
     assert not prepared.plan.transposed_out and prepared.plan.sk_sync
     prepared.launch()
@@ -9006,8 +9172,8 @@ def test_gb_t_exact_sks_wgrad_rows_match_fp64_and_their_plan_without_the_key(
     with monkeypatch.context() as m:
         for k in _gb_t_exact_keys_of(key):
             m.delitem(ROW_RULES, k)
-        cake_backend.clear_convenience_caches()
-        plain = prepare_projection_det_wgrad(G, X, plain_out)
+        cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
+        plain = cake_dense_gemm_det_train_projection_wgrad_prepare(G, X, plain_out)
     assert plain.template != template and plain.plan.sk_sync, plain.template
     plain.launch()
     torch.cuda.synchronize()
@@ -9015,7 +9181,7 @@ def test_gb_t_exact_sks_wgrad_rows_match_fp64_and_their_plan_without_the_key(
         key,
         plain.template,
     )
-    cake_backend.clear_convenience_caches()
+    cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
 
 
 def test_sync_tma_store_programs_serve_only_rows_that_name_the_epilogue():
@@ -9030,7 +9196,7 @@ def test_sync_tma_store_programs_serve_only_rows_that_name_the_epilogue():
     N, M, T = 12288, 6144, 1001
     kw = dict(sm_count=160, l2_bytes=L2_BYTES, arch=arch)
     v = _class_views("nn", False, False, M, N, T)
-    mirror, *_ = plan_dense_projection_det_gemm(
+    mirror, *_ = cake_dense_gemm_det_train_projection_plan(
         v["A"], v["B"], v["out"], _fallback=False, **kw
     )
     assert mirror.template == template, mirror.template
@@ -9038,7 +9204,7 @@ def test_sync_tma_store_programs_serve_only_rows_that_name_the_epilogue():
     assert "epi" not in cake_backend.row_rule(
         arch, True, True, False, False, False, N, T, M
     )
-    plan, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], **kw)
+    plan, *_ = cake_dense_gemm_det_train_projection_plan(v["A"], v["B"], v["out"], **kw)
     assert plan.template != template and plan.template in _registered(arch), (
         plan.template
     )
@@ -9049,12 +9215,14 @@ def test_sync_tma_store_programs_serve_only_rows_that_name_the_epilogue():
     }
     with pytest.MonkeyPatch.context() as m:
         m.setattr(cake_backend, "KERNELS", without)
-        before, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], **kw)
+        before, *_ = cake_dense_gemm_det_train_projection_plan(
+            v["A"], v["B"], v["out"], **kw
+        )
     assert _plan_signature(plan) == _plan_signature(before), (
         plan.template,
         before.template,
     )
-    forced, *_ = plan_dense_projection_det_gemm(
+    forced, *_ = cake_dense_gemm_det_train_projection_plan(
         v["A"], v["B"], v["out"], epi="tma", **kw
     )
     assert forced.template == template, forced.template
@@ -9087,7 +9255,9 @@ def test_half_tail_fit_gates_the_plan_not_the_program(monkeypatch):
         (5120, (1280, 0, 0, 1), False),
     ):
         v = _class_views("kn", False, False, 16384, K_layer, 32)
-        ruled, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], **kw)
+        ruled, *_ = cake_dense_gemm_det_train_projection_plan(
+            v["A"], v["B"], v["out"], **kw
+        )
         assert ruled.template == "dense_proj_det_gemm_kn_n256_ht_tma2_lw_pro15"
         assert ruled.htail and ruled.htail_plan == half
         assert (
@@ -9099,11 +9269,13 @@ def test_half_tail_fit_gates_the_plan_not_the_program(monkeypatch):
         assert ruled.sk_iters == (72 if half else 0) and ruled.ws_f32_elems == 0
         with monkeypatch.context() as m:
             m.setattr(cake_backend, "ROW_RULES", {})
-            plain, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], **kw)
+            plain, *_ = cake_dense_gemm_det_train_projection_plan(
+                v["A"], v["B"], v["out"], **kw
+            )
             assert (
                 not plain.htail and not plain.htail_plan and "_ht" not in plain.template
             )
-            forced, *_ = plan_dense_projection_det_gemm(
+            forced, *_ = cake_dense_gemm_det_train_projection_plan(
                 v["A"], v["B"], v["out"], **knobs, **kw
             )
             assert forced.template == ruled.template
@@ -9116,7 +9288,7 @@ def test_half_tail_fit_gates_the_plan_not_the_program(monkeypatch):
             ) == fields
     # the fit follows the device: on 84 pairs the K 5120 tail of 20 tiles fits as 40 half items
     v = _class_views("kn", False, False, 16384, 5120, 32)
-    wide, *_ = plan_dense_projection_det_gemm(
+    wide, *_ = cake_dense_gemm_det_train_projection_plan(
         v["A"], v["B"], v["out"], **dict(kw, sm_count=168)
     )
     assert wide.htail and wide.htail_plan and "_ht_" in wide.template
@@ -9147,7 +9319,7 @@ def test_exact_wave_gate_follows_the_device_pair_count():
         base = dict(
             l2_bytes=L2_BYTES, transposed_out=key[4], arch=arch, _fallback=False
         )
-        plan, *_ = plan_dense_projection_det_gemm(
+        plan, *_ = cake_dense_gemm_det_train_projection_plan(
             v["A"], v["B"], v["out"], sm_count=152, **base
         )
         assert (
@@ -9157,7 +9329,7 @@ def test_exact_wave_gate_follows_the_device_pair_count():
         tiles_256 = plan.L * (plan.m_tiles // 2) * -(-plan.N // 256)
         for sm_count in (148, 160):
             pairs = sm_count // 2
-            plan, *_ = plan_dense_projection_det_gemm(
+            plan, *_ = cake_dense_gemm_det_train_projection_plan(
                 v["A"], v["B"], v["out"], sm_count=sm_count, **base
             )
             expect = not exact_waves(tiles_224, pairs) and -(-tiles_224 // pairs) > -(
@@ -9169,13 +9341,13 @@ def test_exact_wave_gate_follows_the_device_pair_count():
                     key,
                     T,
                 )  # the same waves on 80 pairs: the rule's tile stays
-        plan, *_ = plan_dense_projection_det_gemm(
+        plan, *_ = cake_dense_gemm_det_train_projection_plan(
             v["A"], v["B"], v["out"], sm_count=148, **base
         )
         if plan.wave_fallback:
             fired.add(key)
             assert plan.block_n == 256 and "_n256_" in plan.template, (key, T)
-            forced, *_ = plan_dense_projection_det_gemm(
+            forced, *_ = cake_dense_gemm_det_train_projection_plan(
                 v["A"], v["B"], v["out"], sm_count=148, block_n=256, **base
             )
             assert dataclasses.replace(plan, wave_fallback=False) == forced, (key, T)
@@ -9187,7 +9359,7 @@ def test_exact_wave_gate_follows_the_device_pair_count():
                 exact_waves(tiles_224, 74) or -(-tiles_224 // 74) == -(-tiles_256 // 74)
             ), (key, T)
 
-        kept, *_ = plan_dense_projection_det_gemm(
+        kept, *_ = cake_dense_gemm_det_train_projection_plan(
             v["A"], v["B"], v["out"], sm_count=148, block_n=224, **base
         )
         assert kept.block_n == 224 and not kept.wave_fallback, (key, T)
@@ -9197,7 +9369,7 @@ def test_exact_wave_gate_follows_the_device_pair_count():
         key for key, _ in rows if (key[6], key[8]) in ((4096, 4096), (4096, 1024))
     }, sorted(fired, key=repr)
     for key in fired:
-        plan, *_ = plan_dense_projection_det_gemm(
+        plan, *_ = cake_dense_gemm_det_train_projection_plan(
             *(_key_views(key, 16384)[k] for k in ("A", "B", "out")),
             sm_count=148,
             l2_bytes=L2_BYTES,
@@ -9226,7 +9398,7 @@ def test_batched_rows_satisfy_the_kernel_output_layout_predicate():
         for op in ("fwd", "dgrad", "wgrad"):
             for T in (1001, 16231):
                 v = _views("mla", row, op, "bf16", T)
-                plan, _, _, out3 = plan_dense_projection_det_gemm(
+                plan, _, _, out3 = cake_dense_gemm_det_train_projection_plan(
                     v["A"],
                     v["B"],
                     v["out"],
@@ -9253,7 +9425,7 @@ def test_batched_rows_satisfy_the_kernel_output_layout_predicate():
     assert checked == 12
     # the interleaved store of the qabs input gradient (D = 192 of a 256-wide slot): the second form, with equality
     v = _views("mla", "qabs", "dgrad", "bf16", 33)
-    plan, _, _, out3 = plan_dense_projection_det_gemm(
+    plan, _, _, out3 = cake_dense_gemm_det_train_projection_plan(
         v["A"], v["B"], v["out"], sm_count=152, l2_bytes=L2_BYTES
     )
     ldo, out_l = cake_backend._out_strides(out3)
@@ -9264,7 +9436,7 @@ def test_batched_rows_satisfy_the_kernel_output_layout_predicate():
     )
     # a batch of one: the matrix span satisfies the batch-major form
     v = _views("proj", "q_a", "fwd", "bf16", 1001)
-    plan, _, _, out3 = plan_dense_projection_det_gemm(
+    plan, _, _, out3 = cake_dense_gemm_det_train_projection_plan(
         v["A"], v["B"], v["out"], sm_count=152, l2_bytes=L2_BYTES
     )
     ldo, out_l = cake_backend._out_strides(out3)
@@ -9274,7 +9446,9 @@ def test_batched_rows_satisfy_the_kernel_output_layout_predicate():
 def test_router_convenience_views_match_the_planner():
     for op, T in (("fwd", 257), ("dgrad", 257), ("wgrad", 1001)):
         v = _router_inputs(op, T, seed=SEED + 5, device="cpu")
-        plan, A_eff, B_eff = plan_router_fp32_det_gemm(v["A"], v["B"], v["out"])
+        plan, A_eff, B_eff = cake_dense_gemm_det_train_router_plan(
+            v["A"], v["B"], v["out"]
+        )
         a_view, split_src = cake_backend._k2_views(v["A"], v["B"], plan)
         want_split = B_eff if plan.b_mn else B_eff.t()
         want_a = A_eff.t().unsqueeze(0) if plan.a_mn else A_eff.unsqueeze(0)
@@ -9372,7 +9546,7 @@ def _check(actual, expected_f64, *, untouched=None):
 
 
 def _plan_template(v, **knobs):
-    plan, *_ = plan_dense_projection_det_gemm(
+    plan, *_ = cake_dense_gemm_det_train_projection_plan(
         v["A"],
         v["B"],
         v["out"],
@@ -9400,10 +9574,14 @@ def test_projection_rows_match_fp64_reference(row, op, out_dtype, T):
     v = _make_inputs("proj", row, op, out_dtype, T, seed=SEED)
     _require_program(_plan_template(v))
     if op == "wgrad":
-        prepared = prepare_projection_det_wgrad(v["G"], v["X"], v["out"])
+        prepared = cake_dense_gemm_det_train_projection_wgrad_prepare(
+            v["G"], v["X"], v["out"]
+        )
         assert prepared.plan.transposed_out == v["transposed"]
     else:
-        prepared = prepare_dense_projection_det_gemm(v["A"], v["B"], v["out"])
+        prepared = cake_dense_gemm_det_train_projection_prepare(
+            v["A"], v["B"], v["out"]
+        )
     out = prepared.launch()
     torch.cuda.synchronize()
     assert out is v["out"]
@@ -9442,13 +9620,13 @@ def test_eight_warp_form_rows_match_fp64_reference(key, T):
     A = torch.randn(T, K, device=device, generator=g).to(torch.bfloat16)
     B = (torch.randn(K, N, device=device, generator=g) * K**-0.5).to(torch.bfloat16)
     out = torch.empty(T, N, dtype=torch.bfloat16, device=device)
-    plan, *_ = plan_dense_projection_det_gemm(
+    plan, *_ = cake_dense_gemm_det_train_projection_plan(
         A, B, out, sm_count=_sm_count(), l2_bytes=_l2_bytes(), arch=arch_for(device)
     )
     if not plan.form:
         pytest.skip(f"the eight-warp form is not a rule of {arch_for(device)}")
     _require_program(plan.template)
-    prepared = prepare_dense_projection_det_gemm(A, B, out)
+    prepared = cake_dense_gemm_det_train_projection_prepare(A, B, out)
     assert prepared.template == plan.template and "_w8" in prepared.template
     assert prepared.plan.form == ROW_RULES[key]["form"]
     assert prepared.plan.sk_units == 0 and prepared.plan.m_tiles % 2 == 0
@@ -9458,7 +9636,7 @@ def test_eight_warp_form_rows_match_fp64_reference(key, T):
     expected = torch.matmul(A.double(), B.double())
     _check(out, expected)
     plain_out = torch.empty_like(out)
-    plain = prepare_dense_projection_det_gemm(A, B, plain_out, form="")
+    plain = cake_dense_gemm_det_train_projection_prepare(A, B, plain_out, form="")
     assert plain.plan.form == "" and "_w8" not in plain.template, plain.template
     plain.launch()
     torch.cuda.synchronize()
@@ -9484,7 +9662,7 @@ def test_mla_batched_rows_match_fp64_reference(row, op):
         )
     v = _make_inputs("mla", row, op, "bf16", 257, seed=SEED + 1)
     _require_program(_plan_template(v))
-    prepared = prepare_dense_projection_det_gemm(v["A"], v["B"], v["out"])
+    prepared = cake_dense_gemm_det_train_projection_prepare(v["A"], v["B"], v["out"])
     out = prepared.launch()
     torch.cuda.synchronize()
     assert out is v["out"] and prepared.plan.L == 64
@@ -9514,7 +9692,7 @@ def test_strided_views_and_storage_offsets_match_fp64_reference():
     )
     out = out_buf[3:, 8 : 8 + N]
     _require_program(_plan_template(dict(A=A, B=W.t(), out=out)))
-    prepared = prepare_dense_projection_det_gemm(A, W.t(), out)
+    prepared = cake_dense_gemm_det_train_projection_prepare(A, W.t(), out)
     prepared.launch()
     torch.cuda.synchronize()
     _check(out, torch.matmul(A.double(), W.double().t()))
@@ -9534,7 +9712,9 @@ def test_strided_views_and_storage_offsets_match_fp64_reference():
     # small-N weight gradients to the 64-row family, so only that family's instance is exported there)
     v_t = dict(A=A.t(), B=Gs, out=out_t, transposed=True)
     knobs_t = _registered_knobs(v_t, {}, dict(cta_rows=64))
-    prepared = prepare_projection_det_wgrad(Gs, A, out_t, **knobs_t)
+    prepared = cake_dense_gemm_det_train_projection_wgrad_prepare(
+        Gs, A, out_t, **knobs_t
+    )
     assert prepared.plan.transposed_out and prepared.template == _plan_template(
         v_t, **knobs_t
     )
@@ -9571,7 +9751,7 @@ def test_prepared_gemm_launches_without_allocation_and_is_deterministic():
     out = torch.empty(N, K, device=device, dtype=torch.bfloat16)
     v = dict(A=X.t(), B=G, out=out, transposed=True)
     knobs = _registered_knobs(v, dict(cta_rows=64), dict(cta_rows=128))
-    prepared = prepare_projection_det_wgrad(G, X, out, **knobs)
+    prepared = cake_dense_gemm_det_train_projection_wgrad_prepare(G, X, out, **knobs)
     pair_tiles = prepared.plan.M // (
         2 * prepared.plan.cta_rows
     )  # 24 (64-row instance) or 12 (128-row instance)
@@ -9615,8 +9795,8 @@ def test_convenience_path_reuses_its_planned_launch_without_allocation():
     facts = cake_backend.device_facts(device)
     assert facts is cake_backend.device_facts(torch.device("cuda", facts.index))
     assert (facts.sm_count, facts.l2_bytes) == (_sm_count(), _l2_bytes())
-    cake_backend.clear_convenience_caches()
-    first = cake_backend.projection_det_forward(X, W, out).clone()
+    cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
+    first = cake_backend.cake_dense_gemm_det_train_projection_forward(X, W, out).clone()
     torch.cuda.synchronize()
     _check(out, torch.matmul(X.double(), W.double().t()))
     assert len(cake_backend._K1_CACHE) == 1
@@ -9624,17 +9804,19 @@ def test_convenience_path_reuses_its_planned_launch_without_allocation():
     X2 = torch.randn(T, K, device=device, generator=g).to(torch.bfloat16)
     out2 = torch.empty_like(out)
     before = torch.cuda.memory_stats()
-    cake_backend.projection_det_forward(X2, W, out2)
+    cake_backend.cake_dense_gemm_det_train_projection_forward(X2, W, out2)
     torch.cuda.synchronize()
     after = torch.cuda.memory_stats()
     assert after["allocation.all.allocated"] == before["allocation.all.allocated"]
     assert len(cake_backend._K1_CACHE) == 1
     _check(out2, torch.matmul(X2.double(), W.double().t()))
-    assert torch.equal(cake_backend.projection_det_forward(X, W, out), first)
+    assert torch.equal(
+        cake_backend.cake_dense_gemm_det_train_projection_forward(X, W, out), first
+    )
     assert len(cake_backend._ARENAS) == 1
     # another stream never shares an entry (nor its workspace arena)
     with torch.cuda.stream(torch.cuda.Stream(device=device)):
-        cake_backend.projection_det_forward(X, W, out2)
+        cake_backend.cake_dense_gemm_det_train_projection_forward(X, W, out2)
     torch.cuda.synchronize()
     assert len(cake_backend._K1_CACHE) == 2 and torch.equal(out2, first)
     first_entry, second_entry = cake_backend._K1_CACHE.values()
@@ -9645,7 +9827,7 @@ def test_convenience_path_reuses_its_planned_launch_without_allocation():
         cake_backend._ARENAS
     )
     # the prepared path of the same binding gives the same bits
-    prepared = prepare_dense_projection_det_gemm(X, W.t(), out2)
+    prepared = cake_dense_gemm_det_train_projection_prepare(X, W.t(), out2)
     assert (
         prepared.template == next(iter(cake_backend._K1_CACHE.values())).plan.template
     )
@@ -9677,8 +9859,10 @@ def test_convenience_path_replays_a_stream_k_row_bit_exact():
         transposed=True,
     )
     knobs = _registered_knobs(v, dict(cta_rows=64), dict(cta_rows=128))
-    cake_backend.clear_convenience_caches()
-    out1 = cake_backend.projection_det_wgrad(G, X, **knobs)  # ``out`` allocated here
+    cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
+    out1 = cake_backend.cake_dense_gemm_det_train_projection_wgrad(
+        G, X, **knobs
+    )  # ``out`` allocated here
     torch.cuda.synchronize()
     _check(out1.t(), torch.matmul(X.t().double(), G.double()))
     assert len(cake_backend._K1_CACHE) == 1
@@ -9688,7 +9872,7 @@ def test_convenience_path_replays_a_stream_k_row_bit_exact():
     assert entry.plan.transposed_out and not entry.swapped
     out2 = torch.empty_like(out1)
     before = torch.cuda.memory_stats()
-    cake_backend.projection_det_wgrad(G, X, out2, **knobs)
+    cake_backend.cake_dense_gemm_det_train_projection_wgrad(G, X, out2, **knobs)
     torch.cuda.synchronize()
     after = torch.cuda.memory_stats()
     assert after["allocation.all.allocated"] == before["allocation.all.allocated"]
@@ -9784,7 +9968,7 @@ def test_k1_entry_points_launch_the_bound_launch_of_their_key(monkeypatch):
     """Once a key is bound, the K1 entry points launch it straight from the key: no planning and no convenience call,
     the arguments of the convenience path's launch of the same call (fresh tensors of the key's geometry rebound), the
     stream context of a (thread, device, stream) made once.  The arena's workspace is converted again after a growth;
-    tensors that alias keep their key unbound (the convenience path); ``clear_convenience_caches`` drops the bindings,
+    tensors that alias keep their key unbound (the convenience path); ``cake_dense_gemm_det_train_convenience_cache_clear`` drops the bindings,
     their arena references and the stream contexts."""
     calls, made = _cpu_k1_entry_points(monkeypatch)
     bf16, T = torch.bfloat16, 1000
@@ -9800,10 +9984,21 @@ def test_k1_entry_points_launch_the_bound_launch_of_their_key(monkeypatch):
     )
 
     def run():
-        assert cake_backend.projection_det_forward(X, W, out_f) is out_f
-        assert cake_backend.projection_det_dgrad(G, W, out_d) is out_d
-        assert cake_backend.projection_det_wgrad(G, X, out_w) is out_w
-        assert cake_backend.dense_projection_det_gemm(X, W.t(), out_f) is out_f
+        assert (
+            cake_backend.cake_dense_gemm_det_train_projection_forward(X, W, out_f)
+            is out_f
+        )
+        assert (
+            cake_backend.cake_dense_gemm_det_train_projection_dgrad(G, W, out_d)
+            is out_d
+        )
+        assert (
+            cake_backend.cake_dense_gemm_det_train_projection_wgrad(G, X, out_w)
+            is out_w
+        )
+        assert (
+            cake_backend.cake_dense_gemm_det_train_projection(X, W.t(), out_f) is out_f
+        )
 
     def same_calls(got, want):
         assert len(got) == len(want)
@@ -9845,7 +10040,9 @@ def test_k1_entry_points_launch_the_bound_launch_of_their_key(monkeypatch):
     assert len(made) == 1
     # fresh tensors of the key's geometry are rebound
     other = torch.empty_like(out_f)
-    assert cake_backend.projection_det_forward(X, W, other) is other
+    assert (
+        cake_backend.cake_dense_gemm_det_train_projection_forward(X, W, other) is other
+    )
     pointers = {a.data_ptr() for a in calls[-1][1] if isinstance(a, torch.Tensor)}
     assert other.data_ptr() in pointers and out_f.data_ptr() not in pointers
     # a growth of the arena: the bound launches convert its workspace again
@@ -9865,18 +10062,23 @@ def test_k1_entry_points_launch_the_bound_launch_of_their_key(monkeypatch):
     worker.start()
     worker.join()
     assert len(made) == 2 and made[0][0] != made[1][0] and made[0][1:] == made[1][1:]
-    cake_backend.clear_convenience_caches()
+    cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
     assert not cake_backend._K1_BOUND_CACHE and not cake_backend._STREAM_CONTEXTS
     assert cake_backend._ARENAS == {} and not cake_backend._K1_CACHE
     # tensors that alias (``W`` starts at ``X``): the key stays unbound and the convenience path launches
     monkeypatch.undo()
     calls, made = _cpu_k1_entry_points(monkeypatch)
     monkeypatch.setattr(cake_backend, "_entry_index", lambda sources: 0)
-    assert cake_backend.projection_det_forward(X, X[:128], out_f) is out_f
+    assert (
+        cake_backend.cake_dense_gemm_det_train_projection_forward(X, X[:128], out_f)
+        is out_f
+    )
     assert list(cake_backend._K1_BOUND_CACHE.values()) == [False, False]
     assert len(calls) == 1
     # the key does not record aliasing: a call of that geometry takes the convenience path as well
-    assert cake_backend.projection_det_forward(X, W, out_f) is out_f
+    assert (
+        cake_backend.cake_dense_gemm_det_train_projection_forward(X, W, out_f) is out_f
+    )
     assert len(cake_backend._K1_BOUND_CACHE) == 2 and len(calls) == 2
     (arena,) = cake_backend._ARENAS.values()
     assert arena.refs == 1  # the cached entry; an unbound key holds no reference
@@ -9922,12 +10124,18 @@ def test_k1_entry_points_bound_launch_is_bit_exact():
 
     def entry(op, v, out):
         if op == "fwd":
-            return cake_backend.projection_det_forward(v["X"], v["W"], out)
+            return cake_backend.cake_dense_gemm_det_train_projection_forward(
+                v["X"], v["W"], out
+            )
         if op == "dgrad":
-            return cake_backend.projection_det_dgrad(v["G"], v["W"], out)
-        return cake_backend.projection_det_wgrad(v["G"], v["X"], out)
+            return cake_backend.cake_dense_gemm_det_train_projection_dgrad(
+                v["G"], v["W"], out
+            )
+        return cake_backend.cake_dense_gemm_det_train_projection_wgrad(
+            v["G"], v["X"], out
+        )
 
-    cake_backend.clear_convenience_caches()
+    cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
     want = [convenience(op, v) for op, v in cases]
     got = [entry(op, v, torch.empty_like(v["out"])) for op, v in cases]
     torch.cuda.synchronize()
@@ -9961,7 +10169,7 @@ def test_k1_entry_points_bound_launch_is_bit_exact():
     assert all(torch.equal(a, b) for a, b in zip(fresh, want, strict=True))
     counters = arena.buffers["k1_counters"].view(torch.int32)
     assert int(torch.count_nonzero(counters)) == 0
-    cake_backend.clear_convenience_caches()
+    cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
     assert not cake_backend._K1_BOUND_CACHE and cake_backend._ARENAS == {}
 
 
@@ -9988,7 +10196,7 @@ def test_convenience_path_memory_is_bounded_across_token_counts():
     W = torch.randn(256, 6144, device=device, generator=g)
 
     def held_after(T_values):
-        cake_backend.clear_convenience_caches()
+        cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
         gc.collect()  # device tensors that only cyclic garbage of earlier tests still holds are not held here
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
@@ -9996,9 +10204,9 @@ def test_convenience_path_memory_is_bounded_across_token_counts():
         for T in T_values:
             X = torch.randn(T, 6144, device=device, generator=g)
             G = torch.randn(T, 256, device=device, generator=g)
-            cake_backend.router_det_forward(X, W)
-            cake_backend.router_det_dgrad(G, W)
-            cake_backend.router_det_wgrad(G, X)
+            cake_backend.cake_dense_gemm_det_train_router_forward(X, W)
+            cake_backend.cake_dense_gemm_det_train_router_dgrad(G, W)
+            cake_backend.cake_dense_gemm_det_train_router_wgrad(G, X)
         del X, G
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
@@ -10019,21 +10227,23 @@ def test_convenience_path_memory_is_bounded_across_token_counts():
     X = torch.randn(T, 6144, device=device, generator=g)
     G = torch.randn(T, 256, device=device, generator=g)
     outs = [torch.empty(T, 256, device=device) for _ in range(3)]
-    cake_backend.router_det_forward(X, W, outs[0])
+    cake_backend.cake_dense_gemm_det_train_router_forward(X, W, outs[0])
     torch.cuda.synchronize()
     before = torch.cuda.memory_stats()
-    cake_backend.router_det_forward(X, W, outs[1])
+    cake_backend.cake_dense_gemm_det_train_router_forward(X, W, outs[1])
     torch.cuda.synchronize()
     after = torch.cuda.memory_stats()
     assert after["allocation.all.allocated"] == before["allocation.all.allocated"]
-    prepared = prepare_router_fp32_det_gemm(X, W.t(), outs[2], splits=4)
+    prepared = cake_dense_gemm_det_train_router_prepare(X, W.t(), outs[2], splits=4)
     prepared.launch()
     torch.cuda.synchronize()
     assert torch.equal(outs[0], outs[1]) and torch.equal(outs[0], outs[2])
-    dw = cake_backend.router_det_wgrad(G, X)
-    prepared_w = prepare_router_fp32_det_gemm(G.t(), X, torch.empty_like(dw), splits=6)
+    dw = cake_backend.cake_dense_gemm_det_train_router_wgrad(G, X)
+    prepared_w = cake_dense_gemm_det_train_router_prepare(
+        G.t(), X, torch.empty_like(dw), splits=6
+    )
     assert torch.equal(dw, prepared_w.launch())
-    cake_backend.clear_convenience_caches()
+    cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
     assert cake_backend._ARENAS == {}
 
 
@@ -10064,7 +10274,9 @@ def test_pd2_stream_k_on_an_odd_k_completes():
         dict(pd=2, slots=2, epi="tma", pro=15),
         dict(pd=2, slots=1, epi="tma", pro=15),
     )
-    prepared = prepare_dense_projection_det_gemm(v["A"], v["B"], v["out"], **knobs)
+    prepared = cake_dense_gemm_det_train_projection_prepare(
+        v["A"], v["B"], v["out"], **knobs
+    )
     plan = prepared.plan
     assert plan.pd == 2 and plan.k_blocks == 17 and plan.tail_tiles * 2 <= plan.sm_pairs
     assert (
@@ -10099,9 +10311,9 @@ def test_router_rows_match_fp64_reference_and_rerun_bit_exact(op, T):
             f"(compute capability {_registered_capabilities()})"
         )
     v = _router_inputs(op, T, seed=SEED + 4)
-    plan, *_ = plan_router_fp32_det_gemm(v["A"], v["B"], v["out"])
+    plan, *_ = cake_dense_gemm_det_train_router_plan(v["A"], v["B"], v["out"])
     _require_program(plan.template)
-    prepared = prepare_router_fp32_det_gemm(v["A"], v["B"], v["out"])
+    prepared = cake_dense_gemm_det_train_router_prepare(v["A"], v["B"], v["out"])
     assert prepared.splits == ROUTER_SPLITS[plan.layout]
     first = prepared.launch().clone()
     torch.cuda.synchronize()
@@ -10125,11 +10337,17 @@ def test_router_rows_match_fp64_reference_and_rerun_bit_exact(op, T):
         assert int((top != ref_top).any(dim=1).sum()) == 0
     # the eager entry point of the row gives the same bits
     eager_fn = dict(
-        fwd=lambda: cake_backend.router_det_forward(v["X"], v["W"]),
-        dgrad=lambda: cake_backend.router_det_dgrad(v["G"], v["W"]),
-        wgrad=lambda: cake_backend.router_det_wgrad(v["G"], v["X"]),
+        fwd=lambda: cake_backend.cake_dense_gemm_det_train_router_forward(
+            v["X"], v["W"]
+        ),
+        dgrad=lambda: cake_backend.cake_dense_gemm_det_train_router_dgrad(
+            v["G"], v["W"]
+        ),
+        wgrad=lambda: cake_backend.cake_dense_gemm_det_train_router_wgrad(
+            v["G"], v["X"]
+        ),
     )[op]
-    cake_backend.clear_convenience_caches()
+    cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
     eager = eager_fn()
     torch.cuda.synchronize()
     assert torch.equal(eager, v["out"])
@@ -10155,7 +10373,7 @@ def test_router_misaligned_out_is_refused_or_matches_fp64_reference(op, T):
             f"(compute capability {_registered_capabilities()})"
         )
     v = _router_inputs(op, T, seed=SEED + 22)
-    plan, *_ = plan_router_fp32_det_gemm(v["A"], v["B"], v["out"])
+    plan, *_ = cake_dense_gemm_det_train_router_plan(v["A"], v["B"], v["out"])
     _require_program(plan.template)
     rows, cols = (int(s) for s in v["out"].shape)
     expected = torch.matmul(v["A"].double(), v["B"].double())
@@ -10163,25 +10381,31 @@ def test_router_misaligned_out_is_refused_or_matches_fp64_reference(op, T):
         aligned = _offset_out(rows, cols, 0, device="cuda")
         shifted = _offset_out(rows, cols, 1, device="cuda")
         eager = _offset_out(rows, cols, 1, device="cuda")
-        cake_backend.clear_convenience_caches()
+        cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
         if splits == 1 and not plan.transposed_out:
             with pytest.raises(ValueError, match="16-byte aligned address"):
-                prepare_router_fp32_det_gemm(v["A"], v["B"], shifted, splits=splits)
+                cake_dense_gemm_det_train_router_prepare(
+                    v["A"], v["B"], shifted, splits=splits
+                )
             with pytest.raises(ValueError, match="16-byte aligned address"):
-                cake_backend.router_fp32_det_gemm(v["A"], v["B"], eager, splits=splits)
+                cake_backend.cake_dense_gemm_det_train_router(
+                    v["A"], v["B"], eager, splits=splits
+                )
             torch.cuda.synchronize()  # nothing was launched: the context stays healthy
-            prepare_router_fp32_det_gemm(
+            cake_dense_gemm_det_train_router_prepare(
                 v["A"], v["B"], aligned, splits=splits
             ).launch()
             outs = [aligned]
         else:
-            prepare_router_fp32_det_gemm(
+            cake_dense_gemm_det_train_router_prepare(
                 v["A"], v["B"], aligned, splits=splits
             ).launch()
-            prepare_router_fp32_det_gemm(
+            cake_dense_gemm_det_train_router_prepare(
                 v["A"], v["B"], shifted, splits=splits
             ).launch()
-            cake_backend.router_fp32_det_gemm(v["A"], v["B"], eager, splits=splits)
+            cake_backend.cake_dense_gemm_det_train_router(
+                v["A"], v["B"], eager, splits=splits
+            )
             outs = [shifted, eager]
         torch.cuda.synchronize()
         for out in outs:
@@ -10241,19 +10465,19 @@ def test_fused_split_matches_the_torch_chain_bit_exactly():
     # two paths agree bit for bit
     _require_program("router_fp32_det_gemm_kk")
     X = torch.randn(257, 6144, device=device, generator=g)
-    prepared = prepare_router_fp32_det_gemm(
+    prepared = cake_dense_gemm_det_train_router_prepare(
         X, W.t(), torch.empty(257, 256, device=device), splits=4
     )
     assert prepared.fused_split and "resid" not in prepared.tensors
     first = prepared.launch().clone()
-    cake_backend.clear_convenience_caches()
-    eager = cake_backend.router_det_forward(X, W)
+    cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
+    eager = cake_backend.cake_dense_gemm_det_train_router_forward(X, W)
     cached = next(iter(cake_backend._K2_CACHE.values()))
     assert cached.split is not None and "k2_resid" not in cached.arena.buffers
     assert "resid" not in cake_backend._entry_views(cached)
     torch.cuda.synchronize()
     assert torch.equal(first, eager)
-    cake_backend.clear_convenience_caches()
+    cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
 
 
 def test_sm107a_n128_wgrad_rules_plan():
@@ -10284,7 +10508,7 @@ def test_sm107a_n128_wgrad_rules_plan():
             out = torch.empty(128, K, dtype=torch.float32 if f32 else torch.bfloat16)
             A, B, transposed = wgrad_views(G, X, arch="sm_107a", out_f32=f32)
             assert transposed
-            plan = plan_dense_projection_det_gemm(
+            plan = cake_dense_gemm_det_train_projection_plan(
                 A,
                 B,
                 out,
@@ -10336,7 +10560,7 @@ def _sm107a_wgrad_plan(N, T, M, sm_count):
     out = torch.empty(M, N, dtype=torch.float32)
     A, B, transposed = wgrad_views(G, X, arch="sm_107a", out_f32=True)
     assert not transposed, (N, T, M)
-    plan, *_ = plan_dense_projection_det_gemm(
+    plan, *_ = cake_dense_gemm_det_train_projection_plan(
         A,
         B,
         out,
@@ -10400,8 +10624,8 @@ def test_sm107a_t16384_wgrad_key_matches_fp64_and_the_plan_without_it(monkeypatc
     G = torch.randn(T, M, device=device, generator=g).to(torch.bfloat16)
     X = (torch.randn(T, N, device=device, generator=g) * T**-0.5).to(torch.bfloat16)
     out = torch.full((M, N), float("nan"), dtype=torch.float32, device=device)
-    cake_backend.clear_convenience_caches()
-    prepared = prepare_projection_det_wgrad(G, X, out)
+    cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
+    prepared = cake_dense_gemm_det_train_projection_wgrad_prepare(G, X, out)
     template = prepared.template
     _require_program(template)
     assert not prepared.plan.transposed_out
@@ -10412,8 +10636,8 @@ def test_sm107a_t16384_wgrad_key_matches_fp64_and_the_plan_without_it(monkeypatc
     plain_out = torch.full_like(out, float("nan"))
     with monkeypatch.context() as m:
         m.delitem(ROW_RULES, key)
-        cake_backend.clear_convenience_caches()
-        plain = prepare_projection_det_wgrad(G, X, plain_out)
+        cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
+        plain = cake_dense_gemm_det_train_projection_wgrad_prepare(G, X, plain_out)
     assert plain.template != template, plain.template
     plain.launch()
     torch.cuda.synchronize()
@@ -10421,7 +10645,7 @@ def test_sm107a_t16384_wgrad_key_matches_fp64_and_the_plan_without_it(monkeypatc
         template,
         plain.template,
     )
-    cake_backend.clear_convenience_caches()
+    cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
 
 
 # The determinism contract of the package: a prepared launch rerun over the same operands gives the same bits.
@@ -10440,9 +10664,13 @@ def test_repeated_launches_are_bitwise_identical(row, op, out_dtype, T):
     v = _make_inputs("proj", row, op, out_dtype, T, seed=SEED + 7)
     _require_program(_plan_template(v))
     if op == "wgrad":
-        prepared = prepare_projection_det_wgrad(v["G"], v["X"], v["out"])
+        prepared = cake_dense_gemm_det_train_projection_wgrad_prepare(
+            v["G"], v["X"], v["out"]
+        )
     else:
-        prepared = prepare_dense_projection_det_gemm(v["A"], v["B"], v["out"])
+        prepared = cake_dense_gemm_det_train_projection_prepare(
+            v["A"], v["B"], v["out"]
+        )
     first = prepared.launch().clone()
     torch.cuda.synchronize()
     assert bool(torch.isfinite(first).all())
@@ -10463,9 +10691,9 @@ def test_repeated_router_launches_are_bitwise_identical(op, T):
             f"(compute capability {_registered_capabilities()})"
         )
     v = _router_inputs(op, T, seed=SEED + 8)
-    plan, *_ = plan_router_fp32_det_gemm(v["A"], v["B"], v["out"])
+    plan, *_ = cake_dense_gemm_det_train_router_plan(v["A"], v["B"], v["out"])
     _require_program(plan.template)
-    prepared = prepare_router_fp32_det_gemm(v["A"], v["B"], v["out"])
+    prepared = cake_dense_gemm_det_train_router_prepare(v["A"], v["B"], v["out"])
     first = prepared.launch().clone()
     torch.cuda.synchronize()
     assert bool(torch.isfinite(first).all())
@@ -10547,7 +10775,7 @@ def test_swapped_forward_matches_fp64_on_the_grouped_views(T, token_major):
         template is not None
     )  # the grouped wo_a rows fit two waves of a Blackwell part
     assert cake_jit.MODULES[launch.module_name]["template"] == template
-    cake_backend.dense_projection_det_gemm(A, B, out)
+    cake_backend.cake_dense_gemm_det_train_projection(A, B, out)
     torch.cuda.synchronize()
     _check(out, torch.einsum("gtd,gdr->gtr", A.double(), B.double()))
 
@@ -10562,7 +10790,7 @@ def test_swapped_forward_other_shapes(L, T, K, N):
     launch = _swap_launch(A, B, out)
     assert launch is not None
     assert cake_jit.MODULES[launch.module_name]["template"] == _swap_expected(A, B)
-    cake_backend.dense_projection_det_gemm(A, B, out)
+    cake_backend.cake_dense_gemm_det_train_projection(A, B, out)
     torch.cuda.synchronize()
     _check(out, torch.einsum("gtd,gdr->gtr", A.double(), B.double()))
 
@@ -10594,11 +10822,13 @@ def test_swapped_forward_is_bitwise_repeatable():
     _require_swap()
     for T in (64, 128):
         A, B, out = _swap_views(T, seed=SEED + 2)
-        cake_backend.dense_projection_det_gemm(A, B, out)
+        cake_backend.cake_dense_gemm_det_train_projection(A, B, out)
         first = out.clone()
         for _ in range(REPEATS):
             out.fill_(float("nan"))
-            cake_backend.dense_projection_det_gemm(A, B, out, enable_pdl=True)
+            cake_backend.cake_dense_gemm_det_train_projection(
+                A, B, out, enable_pdl=True
+            )
             torch.cuda.synchronize()
             assert torch.equal(out, first)
 
@@ -10625,8 +10855,8 @@ def test_swapped_forward_pdl_waits_for_an_early_producer(T):
         A2, B2, O2 = mid.transpose(0, 1), w2.transpose(1, 2), y.transpose(0, 1)
         assert _swap_launch(A1, B1, O1) is not None
         assert _swap_launch(A2, B2, O2) is not None
-        cake_backend.dense_projection_det_gemm(A1, B1, O1, enable_pdl=True)
-        cake_backend.dense_projection_det_gemm(A2, B2, O2, enable_pdl=True)
+        cake_backend.cake_dense_gemm_det_train_projection(A1, B1, O1, enable_pdl=True)
+        cake_backend.cake_dense_gemm_det_train_projection(A2, B2, O2, enable_pdl=True)
         torch.cuda.synchronize()
         assert bool(torch.isfinite(mid).all()) and bool(torch.isfinite(y).all())
         _check(O2, torch.einsum("gtd,gdr->gtr", A2.double(), B2.double()))
@@ -10656,8 +10886,8 @@ def test_swapped_forward_default_waits_for_an_early_producer_writing_b(T):
         w.fill_(float("nan"))
         res.fill_(float("nan"))
         # the producer of the weights: w[g] = y[g] @ z[g].T on the planner's program (N < 2 M: not swapped)
-        cake_backend.dense_projection_det_gemm(y, z.transpose(1, 2), w)
-        cake_backend.dense_projection_det_gemm(A, B, O)
+        cake_backend.cake_dense_gemm_det_train_projection(y, z.transpose(1, 2), w)
+        cake_backend.cake_dense_gemm_det_train_projection(A, B, O)
         torch.cuda.synchronize()
         assert bool(torch.isfinite(w).all())
         _check(O, torch.einsum("gtd,gdr->gtr", A.double(), B.double()))
@@ -10673,10 +10903,10 @@ def test_weights_static_runs_the_weights_early_program():
     early = cake_backend._swap_ab_cached(A, B, out, False, True)
     assert early is not None
     assert cake_jit.MODULES[early.module_name]["template"].endswith("_we")
-    cake_backend.dense_projection_det_gemm(A, B, out)
+    cake_backend.cake_dense_gemm_det_train_projection(A, B, out)
     first = out.clone()
     out.fill_(float("nan"))
-    cake_backend.dense_projection_det_gemm(A, B, out, weights_static=True)
+    cake_backend.cake_dense_gemm_det_train_projection(A, B, out, weights_static=True)
     torch.cuda.synchronize()
     assert torch.equal(out, first)
 
@@ -10690,8 +10920,8 @@ def test_swapped_forward_replays_in_a_cuda_graph_with_pdl():
     A2 = out  # the second projection reads the first's output
 
     def chain():
-        cake_backend.dense_projection_det_gemm(A, B, out, enable_pdl=True)
-        cake_backend.dense_projection_det_gemm(A2, B2, out2, enable_pdl=True)
+        cake_backend.cake_dense_gemm_det_train_projection(A, B, out, enable_pdl=True)
+        cake_backend.cake_dense_gemm_det_train_projection(A2, B2, out2, enable_pdl=True)
 
     chain()
     torch.cuda.synchronize()
@@ -10773,15 +11003,19 @@ def test_planner_pdl_waits_for_an_early_producer(T):
     for _ in range(3):
         mid.fill_(float("nan"))
         y.fill_(float("nan"))
-        cake_backend.projection_det_forward(x, w1, mid, enable_pdl=True)
-        cake_backend.projection_det_forward(mid, w2, y, enable_pdl=True)
+        cake_backend.cake_dense_gemm_det_train_projection_forward(
+            x, w1, mid, enable_pdl=True
+        )
+        cake_backend.cake_dense_gemm_det_train_projection_forward(
+            mid, w2, y, enable_pdl=True
+        )
         torch.cuda.synchronize()
         _check(mid, x.double() @ w1.double().t())
         _check(y, mid.double() @ w2.double().t())
     # the default (the device supports PDL) gives the same bits
     first = y.clone()
-    cake_backend.projection_det_forward(x, w1, mid)
-    cake_backend.projection_det_forward(mid, w2, y)
+    cake_backend.cake_dense_gemm_det_train_projection_forward(x, w1, mid)
+    cake_backend.cake_dense_gemm_det_train_projection_forward(mid, w2, y)
     torch.cuda.synchronize()
     assert torch.equal(y, first)
 
@@ -10795,10 +11029,10 @@ def test_prepared_pdl_chain_replays_in_a_cuda_graph():
     x, w1, w2 = _pdl_chain_inputs(T, 4096, 2048, 1024, SEED + 7)
     mid = torch.empty(T, 2048, device="cuda", dtype=torch.bfloat16)
     y = torch.empty(T, 1024, device="cuda", dtype=torch.bfloat16)
-    first = cake_backend.prepare_dense_projection_det_gemm(
+    first = cake_backend.cake_dense_gemm_det_train_projection_prepare(
         x, w1.t(), mid, enable_pdl=True
     )
-    second = cake_backend.prepare_dense_projection_det_gemm(
+    second = cake_backend.cake_dense_gemm_det_train_projection_prepare(
         mid, w2.t(), y, enable_pdl=True
     )
     first()
@@ -10817,3 +11051,50 @@ def test_prepared_pdl_chain_replays_in_a_cuda_graph():
     torch.cuda.synchronize()
     _check(mid, x.double() @ w1.double().t())
     _check(y, mid.double() @ w2.double().t())
+
+
+# The module selects the mode: torch.use_deterministic_algorithms (strict or warn_only) changes nothing.
+@pytest.mark.parametrize("warn_only", [False, True])
+def test_the_entry_points_run_unchanged_under_torch_deterministic_mode(warn_only):
+    if arch_for(torch.device("cuda")) is None:
+        pytest.skip("needs an SM100 / SM103 / SM107 GPU")
+    device = torch.device("cuda", torch.cuda.current_device())
+    m = cake_backend
+    g = torch.Generator(device=device).manual_seed(0)
+    T, K, N, R = 257, 6144, 576, 256  # the kv_a projection and the 256-expert router
+    X = torch.randn(T, K, device=device, generator=g).bfloat16()
+    W = (torch.randn(N, K, device=device, generator=g) * K**-0.5).bfloat16()
+    G = torch.randn(T, N, device=device, generator=g).bfloat16()
+    Xr = torch.randn(T, K, device=device, generator=g)
+    Wr = torch.randn(R, K, device=device, generator=g) * K**-0.5
+    Gr = torch.randn(T, R, device=device, generator=g)
+
+    def run():
+        return [
+            m.cake_dense_gemm_det_train_projection_forward(X, W),
+            m.cake_dense_gemm_det_train_projection_dgrad(G, W),
+            m.cake_dense_gemm_det_train_projection_wgrad(G, X),
+            m.cake_dense_gemm_det_train_router_forward(Xr, Wr),
+            m.cake_dense_gemm_det_train_router_dgrad(Gr, Wr),
+            m.cake_dense_gemm_det_train_router_wgrad(Gr, Xr),
+        ]
+
+    try:
+        reference = run()
+    except NotImplementedError as exc:  # a build without one of these programs
+        pytest.skip(str(exc))
+    previous = (
+        torch.are_deterministic_algorithms_enabled(),
+        torch.is_deterministic_algorithms_warn_only_enabled(),
+    )
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=warn_only)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            outputs = run()
+            torch.cuda.synchronize(device)
+    finally:
+        torch.use_deterministic_algorithms(previous[0], warn_only=previous[1])
+    assert [w for w in caught if "determinis" in str(w.message)] == []
+    for got, want in zip(outputs, reference, strict=True):
+        assert torch.equal(got, want)

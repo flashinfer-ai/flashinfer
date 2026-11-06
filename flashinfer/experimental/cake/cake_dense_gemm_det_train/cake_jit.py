@@ -296,10 +296,6 @@ def load_cake_dense_projection_det_gemm_module(name: str, arch: str):
     return cake_build.load_library(library_name(name, arch))
 
 
-# The loader's former name (before the det rename), an alias of the same cached function.
-load_cake_dense_projection_gemm_module = load_cake_dense_projection_det_gemm_module
-
-
 def specs_for_arch(arch: str):
     """JIT specs of every ``build.json`` entry of ``arch`` without a prebuilt library (the
     ``flashinfer.jit.build_jit_specs`` warm-up)."""

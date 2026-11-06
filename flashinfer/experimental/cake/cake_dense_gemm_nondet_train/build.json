@@ -45,6 +45,9 @@
       "cuda_toolkit": {
         "min": "12.8"
       },
+      "packages": [
+        "cake_dense_gemm_det_train"
+      ],
       "tvm_ffi": {
         "include_dirs": [
           "tvm_ffi.libinfo.find_include_path()",
@@ -1315,6 +1318,6 @@
       ]
     }
   ],
-  "package": "flashinfer.experimental.dense_projection_gemm",
+  "package": "flashinfer.experimental.cake.cake_dense_gemm_nondet_train",
   "schema": "cake-build/1"
 }
