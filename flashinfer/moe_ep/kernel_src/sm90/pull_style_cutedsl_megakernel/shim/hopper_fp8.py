@@ -718,9 +718,11 @@ class MegaMoEHopperFp8Frontend:
             c.grouped_token_back,
             c.combine_format,
             c.active_dispatch_warps,
+            c.compact_pull_buffer,
             c.fc1_store_offload,
             c.fc1_early_done_publish,
             c.fold_producer_warps,
+            c.generate_c,
             self._gate_up_clamp,
             c.enable_iket,
         )
