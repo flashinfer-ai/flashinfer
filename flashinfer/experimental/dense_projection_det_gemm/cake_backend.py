@@ -231,19 +231,16 @@ ROUTER_RULE_N = 256
 # the inclusive window [T_lo, T_hi], for N = ROUTER_RULE_N.  The window T 16129-16384 holds every token count with the
 # forward's 128 M tiles (505-512 K blocks of the weight gradient).  Each count was measured faster than the default one
 # on GB200 / GB300 (152 SMs) and on B200 / B300 (148 SMs) for the whole router launch (the BF16x3 split, the program and the sum of
-# the partials); other SM counts keep the default.  A different split count is a different K partition: its outputs are
-# bit-exact run to run but not bitwise equal to the default count's.
+# the partials), alone and while a kernel on another stream holds 8, 16 or 32 SMs (a count that wins alone but loses
+# with fewer free SMs is not listed); other SM counts keep the default.  A different split count is a different K
+# partition: its outputs are bit-exact run to run but not bitwise equal to the default count's.
 ROUTER_SPLIT_RULES: dict[
     tuple[str, int, str, int], tuple[tuple[int, int, int], ...]
 ] = {
     ("sm_100a", 148, "nn_t", 5120): ((16129, 16384, 9),),
-    ("sm_100a", 148, "nn_t", 6144): ((16129, 16384, 3),),
     ("sm_100a", 152, "nn_t", 5120): ((16129, 16384, 9),),
-    ("sm_100a", 152, "nn_t", 6144): ((16129, 16384, 3),),
     ("sm_103a", 148, "nn_t", 5120): ((16129, 16384, 9),),
-    ("sm_103a", 148, "nn_t", 6144): ((16129, 16384, 3),),
     ("sm_103a", 152, "nn_t", 5120): ((16129, 16384, 9),),
-    ("sm_103a", 152, "nn_t", 6144): ((16129, 16384, 3),),
 }
 
 

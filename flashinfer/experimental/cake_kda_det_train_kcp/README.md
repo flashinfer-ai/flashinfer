@@ -472,13 +472,17 @@ families of a phase in one launch; off by default).
 
 The files of this package:
 
-* `cake_kcp_jit.py` -- the `MODULES` registry of the fourteen shipped programs (the
+* `cake_kcp_jit.py` -- the `MODULES` registry of the sixteen shipped programs (the
   fragment walks of the forward and backward state recurrences in their
   `offset` and `tape` forms, the BF16x3 transfer walk (two CTAs per segment
   and head, each over one 64-column half of the state), the affine
   merge in one record per register-blocked build, and the two chunk stages of the
   context-parallel route, `kcp_fwd_o` (the output from the K1 tapes) and
-  `kcp_dav` (`dA_qk` and the `dv1` K2 reads); selection by `always`, by
+  `kcp_dav` (`dA_qk` and the `dv1` K2 reads), and the fused forward walk
+  `kcp_fwdh_o` (the forward state walk with the chunk output inside it: the
+  same bits as the tape walk followed by `kcp_fwd_o`, no tape written; in its
+  full-width and two-CTA records), which the forward that keeps no tape
+  launches in place of those two; selection by `always`, by
   `walk_form`, by `walk_heads` (the `WALK_HEADS_RULE` bands of the launch's
   head count: the plain or the overlap-schedule full-width adjoint offset
   walk), or by `merge_rule` (the `MERGE_RULE` bands of the merge
@@ -502,18 +506,18 @@ The files of this package:
   tests; without the file those tests skip.  The package reads no
   environment variable.
 * `cake_build.py` + `build.json` -- the loader shared by every Cake-exported
-  package (byte-identical copies) and the manifest of the fourteen shipped
+  package (byte-identical copies) and the manifest of the sixteen shipped
   programs (schema `cake-build/1`, one entry per `<library>_<arch>`);
   `aot/` is never tracked (`.gitignore`).
 * `csrc/cake_ffi_checks.h` -- the TVM-FFI helper header the bindings include.
-* `csrc/cake_kda_det_train_<digest>_kcp_{kernel,binding}.cu` of the eighteen
+* `csrc/cake_kda_det_train_<digest>_kcp_{kernel,binding}.cu` of the twenty
   context-parallel-only programs and `csrc/cake_kda_det_train_<digest>_{kernel,binding}.cu`
   of the two chunk stages (`kcp_fwd_o`, `kcp_dav`), rendered like the
   single-rank ones (digests in `build.json` and `build.test.json`).
 
 ## Status
 
-The registry holds fourteen shipped programs (`cake_kcp_jit.MODULES`, in
+The registry holds sixteen shipped programs (`cake_kcp_jit.MODULES`, in
 `build.json`) and six test-only programs (`cake_kcp_jit.TEST_MODULES`, in
 `build.test.json`) for `sm_100a`, `sm_103a` and `sm_107a`.
 

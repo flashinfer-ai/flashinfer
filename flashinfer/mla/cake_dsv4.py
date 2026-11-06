@@ -974,9 +974,22 @@ def _fp8_persistent_program(
 # (minimum width, minimum width up to 16 tokens).
 _FP8_H64_PERSISTENT_ONE_TILE_MIN_WIDTH = {"sm_107a": (192, 176)}
 
+# SM107 launches whose multi-tile M64 route runs its four-stage sibling
+# (:func:`_fp8_h64_kv4_edges`): per complete-tile count, the minimum width that
+# keeps the persistent body at 13-16 tokens.  R200 (208 and 216 SMs, three
+# boards), q_len 1 and 4, eight distinct-input calls per CUDA graph / single
+# cold calls, persistent body -> four-stage M64 body: width 176 1.007-1.030x /
+# 1.037-1.085x, widths 260-352 0.999-1.060x / 1.029-1.091x; width 380 trailed
+# in the graph at 13 tokens (q_len 1) and 16 tokens (q_len 4), down to 0.990x,
+# so widths 353-383 keep the persistent body.
+_FP8_H64_PERSISTENT_SHORT_MIN_WIDTH_KV4 = {"sm_107a": {1: 177, 2: 353}}
+
 
 def _fp8_h64_uses_persistent_body(
-    sparse_topk: int, num_query_tokens: int, arch: Optional[str] = None
+    sparse_topk: int,
+    num_query_tokens: int,
+    arch: Optional[str] = None,
+    kv4: bool = False,
 ) -> bool:
     """FP8/H64 rows that run the FP8/H128 persistent body while it fits one wave
     (Cake seed ``portfolio_v34.uses_persistent_body``).
@@ -989,10 +1002,19 @@ def _fp8_h64_uses_persistent_body(
     24 tokens); width 176 at 13-16 tokens 5.93-6.03 -> 5.78-5.90 us
     (1.02-1.03x), 0.97-1.01x past 16 tokens.  Narrower widths stay on the M64
     body (1.00-1.02x up to 16 tokens, 0.97-1.00x past them, one board).
+    Launches whose multi-tile M64 route runs its four-stage sibling (``kv4``)
+    take the minimum widths up to 16 tokens from
+    ``_FP8_H64_PERSISTENT_SHORT_MIN_WIDTH_KV4`` where it has an entry.
     """
     full_tiles = sparse_topk // 128
     if num_query_tokens <= 12:
         return full_tiles >= 3
+    if kv4 and num_query_tokens <= 16:
+        short_min_width = _FP8_H64_PERSISTENT_SHORT_MIN_WIDTH_KV4.get(arch, {}).get(
+            full_tiles
+        )
+        if short_min_width is not None:
+            return sparse_topk >= short_min_width
     if full_tiles == 1:
         min_width, short_min_width = _FP8_H64_PERSISTENT_ONE_TILE_MIN_WIDTH.get(
             arch, (2 * _TILE_KV, 2 * _TILE_KV)
@@ -1018,6 +1040,30 @@ _FP8_H64_M64_EARLY_WAVE = {
     },
 }
 
+# The same form, read in place of ``_FP8_H64_M64_EARLY_WAVE`` on the launches
+# whose multi-tile M64 route runs its four-stage sibling
+# (:func:`_fp8_h64_kv4_edges`).  R200 (208 and 216 SMs, three boards), eight
+# distinct-input calls per CUDA graph / single cold calls, persistent body ->
+# four-stage M64 body on the rows each entry moves: width 256 (13-27 tokens,
+# q_len 1 and 4) 1.018-1.073x / 1.039-1.099x, width 384 (1-16 tokens, q_len 1,
+# 2 and 4) 1.011-1.039x / 1.035-1.091x, widths 260-380 (52-55 tokens, q_len 1
+# and 4) 1.002-1.023x / 1.011-1.044x, width 512 (52-56 tokens, q_len 1 and 4)
+# 1.023-1.050x / 1.037-1.069x, widths 896-1152 (80-104 tokens, q_len 4 only)
+# 1.026-1.087x / 1.015-1.097x.
+_FP8_H64_M64_EARLY_WAVE_KV4 = {
+    "sm_107a": {
+        (2, 1): (3, 20),
+        (2, 2): (0, 1),  # width 256: every token count
+        (3, 2): (14, 57),  # widths 257-383: 52 / 54 tokens (208 / 216 SMs)
+        (3, 3): (0, 1),  # width 384: every token count
+        (4, 3): (3, 10),
+        (4, 4): (19, 79),  # width 512: 51 / 52 tokens
+        (7, 7): (77, 208),  # width 896: 78 / 80 tokens
+        (8, 8): (23, 52),  # width 1024: 93 / 96 tokens
+        (9, 9): (77, 208),  # width 1152: 78 / 80 tokens
+    },
+}
+
 
 def _fp8_h64_uses_m64_body(
     num_query_tokens: int,
@@ -1025,6 +1071,7 @@ def _fp8_h64_uses_m64_body(
     *,
     sparse_topk: Optional[int] = None,
     arch: Optional[str] = None,
+    kv4: bool = False,
 ) -> bool:
     """FP8/H64 decode rows (``max_q_len < 257``) whose two-CTA-per-token bodies
     no longer fit one wave.
@@ -1048,14 +1095,18 @@ def _fp8_h64_uses_m64_body(
     (widths 260-380, measured at 260 and 320) keep the persistent body at 53
     tokens (M64 7.22-7.34 vs 7.08-7.20 us); and four complete tiles (width
     512) take the M64 body from 55 tokens (8.28-8.65 -> 8.11-8.25 us at 55-62
-    tokens).
+    tokens).  Launches whose multi-tile M64 route runs its four-stage sibling
+    (``kv4``) take the edges of ``_FP8_H64_M64_EARLY_WAVE_KV4`` instead.
     """
     if 2 * num_query_tokens > sm_count:
         return True
     if sparse_topk is None:
         return False
     tiles = (_ceil_div(sparse_topk, _TILE_KV), sparse_topk // _TILE_KV)
-    early = _FP8_H64_M64_EARLY_WAVE.get(arch, {}).get(tiles)
+    table = _FP8_H64_M64_EARLY_WAVE
+    if kv4 and arch in _FP8_H64_M64_EARLY_WAVE_KV4:
+        table = _FP8_H64_M64_EARLY_WAVE_KV4
+    early = table.get(arch, {}).get(tiles)
     return early is not None and early[1] * num_query_tokens > early[0] * sm_count
 
 
@@ -1067,7 +1118,8 @@ def _fp8_h64_uses_m64_body(
 # load-warp code layout on the multi-tile rows even when the in-kernel gate
 # kept it off.  Same bits from both programs.  SM107 runs the multi-tile
 # program's launches on its four-stage sibling where this process can launch
-# it (:func:`_kv4_variant`).
+# it (:func:`_kv4_variant`), and routes the FP8/H64 decode rows by the
+# four-stage edges there (:func:`_fp8_h64_kv4_edges`).
 def _fp8_h64_m64_program(sparse_topk: int) -> str:
     if sparse_topk == _TILE_KV:
         return "fp8_h64_prefill_source_persistent_m64"
@@ -1279,12 +1331,15 @@ def _route(
     num_query_tokens: int,
     sm_count: int,
     arch: Optional[str] = None,
+    kv4: bool = False,
 ) -> str:
     """The variant one call runs; ``sm_count`` is the device's SM count (the
     FP8/H64 decode rows, and on SM107 the FP8 8/16/32-head SWA-only decode
     rows, pick their body by the waves of its grid) and ``arch`` its
     ``sm_XYa`` target (``None``: the architecture-independent choice, which
-    SM107 may not build: it has no BF16 programs)."""
+    SM107 may not build: it has no BF16 programs).  ``kv4``: the call's
+    multi-tile M64 launches run the four-stage sibling
+    (:func:`_fp8_h64_kv4_edges`); only the FP8/H64 decode rows read it."""
     if max_q_len <= 0:
         raise ValueError("max_q_len must be positive")
     is_swa = sparse_topk == 128
@@ -1355,13 +1410,15 @@ def _route(
             return "fp8_h8_h16_source_exact"
         if num_heads == 64:
             if _fp8_h64_uses_m64_body(
-                num_query_tokens, sm_count, sparse_topk=sparse_topk, arch=arch
+                num_query_tokens, sm_count, sparse_topk=sparse_topk, arch=arch, kv4=kv4
             ):
                 # H64-specific single-CTA M64 persistent body (one CTA per
                 # token, unified 128-row KV stage, no V gathers).  Two exported
                 # programs, selected by the item width.
                 return _fp8_h64_m64_program(sparse_topk)
-            if _fp8_h64_uses_persistent_body(sparse_topk, num_query_tokens, arch):
+            if _fp8_h64_uses_persistent_body(
+                sparse_topk, num_query_tokens, arch, kv4=kv4
+            ):
                 # Same persistent FP8 body as FP8/H128 (heads >= num_heads
                 # predicated) for the multi-tile rows of one wave: GB300 10.5-12.0
                 # us vs 13.4-14.1 us for the M64 body on the 1-72-token topk4x
@@ -1375,7 +1432,8 @@ def _route(
             # the H64 cluster body at every token count (GB300, topk128x widths
             # 204-252, 1-72 tokens: 7.9-8.5 us vs 8.8-10.4 us).  On SM107 the
             # rows of _FP8_H64_PERSISTENT_ONE_TILE_MIN_WIDTH took the persistent
-            # body above.
+            # body above; with kv4, width 176 and widths 257-352 at 13-16 tokens
+            # land here (_FP8_H64_PERSISTENT_SHORT_MIN_WIDTH_KV4).
             return _fp8_h64_m64_program(sparse_topk)
         if is_swa:
             if _fp8_lowhead_swa_uses_m64_body(num_query_tokens, sm_count, arch):
@@ -1662,6 +1720,7 @@ def cake_dsv4_workspace_requirement(
     ragged: bool,
     sm_count: Optional[int] = None,
     arch: Optional[str] = None,
+    kv4: Optional[bool] = None,
 ) -> WorkspaceRequirement:
     """Route and exact workspace requirement of one call.
 
@@ -1676,9 +1735,13 @@ def cake_dsv4_workspace_requirement(
     ``sm_XYa`` target (``None``: the current CUDA device's whenever CUDA is
     available, else the architecture-independent route, which SM107 may not
     build: it has no BF16 programs; the workspace numbers do not depend on it
-    either). Raises ``ValueError`` for a shape
-    ``backend="cake"`` has no kernel for.
+    either), ``kv4`` = whether the call's multi-tile M64 launches run the
+    four-stage sibling (:func:`_fp8_h64_kv4_edges`; ``None``: the current CUDA
+    device's answer when ``arch`` is ``None`` and CUDA is available, else
+    ``False``; the workspace numbers do not depend on it either). Raises
+    ``ValueError`` for a shape ``backend="cake"`` has no kernel for.
     """
+    device_arch = arch is None
     if sm_count is None:
         sm_count = _device_sm_count(torch.device("cuda", torch.cuda.current_device()))
     if arch is None and torch.cuda.is_available():
@@ -1687,10 +1750,24 @@ def cake_dsv4_workspace_requirement(
     heads = _positive_int(num_heads, "num_heads")
     batch = _positive_int(batch_size, "batch_size")
     topk = _positive_int(sparse_topk, "sparse_topk")
+    q_len = _positive_int(max_q_len, "max_q_len")
+    if kv4 is None:
+        kv4 = (
+            device_arch
+            and arch is not None
+            and _fp8_h64_kv4_edges(
+                dtype=dtype,
+                num_heads=heads,
+                max_q_len=q_len,
+                sparse_topk=topk,
+                arch=arch,
+                device=torch.device("cuda", torch.cuda.current_device()),
+            )
+        )
     route = _route(
         dtype=dtype,
         num_heads=heads,
-        max_q_len=_positive_int(max_q_len, "max_q_len"),
+        max_q_len=q_len,
         ragged=bool(ragged),
         sparse_topk=topk,
         batch_size=batch,
@@ -1698,6 +1775,7 @@ def cake_dsv4_workspace_requirement(
         num_query_tokens=tokens,
         sm_count=_positive_int(sm_count, "sm_count"),
         arch=arch,
+        kv4=bool(kv4),
     )
     plan = _route_plan(
         route, num_query_tokens=tokens, num_heads=heads, sparse_topk=topk
@@ -1972,6 +2050,8 @@ _K64_SIBLING_OVERSIZED_SMEM_BYTES = {"sm_107a": 272512}
 # graph and single cold calls: the four-stage program led the two-stage one by
 # 0.4-28.8 % on every multi-tile row but one and tied or trailed it by up to
 # 2.3 % on that one, 64-head 2 x 257-token prefill on topk128x items 256 wide.
+# Where the sibling launches, SM107 routes the FP8/H64 decode rows by its
+# edges (:func:`_fp8_h64_kv4_edges`, ``_FP8_H64_M64_EARLY_WAVE_KV4``).
 _KV4_SIBLING_ROUTES = frozenset({"fp8_h64_prefill_source_persistent_m64_multi_tile"})
 
 # The dynamic shared memory of the four-stage sibling programs, per
@@ -2114,6 +2194,30 @@ def _kv4_variant(route: str, *, arch: str, device: torch.device) -> str:
     if programs.get(sibling, programs.get(route)) == programs.get(route):
         return route
     return sibling if _kv4_sibling_launchable(arch, device) else route
+
+
+def _fp8_h64_kv4_edges(
+    *,
+    dtype: torch.dtype,
+    num_heads: int,
+    max_q_len: int,
+    sparse_topk: int,
+    arch: Optional[str],
+    device: torch.device,
+) -> bool:
+    """Whether :func:`_route` takes the four-stage-sibling edges for this call:
+    an FP8/H64 decode call wider than one tile whose multi-tile M64 launches
+    run the sibling on ``device`` (the predicate :func:`_kv4_variant` applies
+    at launch).  Other calls do not reach the launch check."""
+    route = "fp8_h64_prefill_source_persistent_m64_multi_tile"
+    return (
+        dtype == torch.float8_e4m3fn
+        and num_heads == 64
+        and max_q_len < 257
+        and sparse_topk > _TILE_KV
+        and arch is not None
+        and _kv4_variant(route, arch=arch, device=device) != route
+    )
 
 
 def _pdl_variant(
@@ -2352,6 +2456,14 @@ def run_cake_dsv4(
         num_query_tokens=meta.num_query_tokens,
         sm_count=_device_sm_count(device),
         arch=arch,
+        kv4=_fp8_h64_kv4_edges(
+            dtype=query.dtype,
+            num_heads=num_heads,
+            max_q_len=max_q_len,
+            sparse_topk=sparse_topk,
+            arch=arch,
+            device=device,
+        ),
     )
 
     if out is None:
@@ -2685,7 +2797,8 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
         # caller-owned workspace), grid = tokens.  Both M64 programs share the
         # kernel ABI; _fp8_h64_m64_program picks one by the item width.  SM107
         # runs the multi-tile program's launches on its four-stage sibling
-        # where this process can launch it (_kv4_variant).
+        # where this process can launch it (_kv4_variant); run_cake_dsv4
+        # routed the FP8/H64 decode rows by the same check (_fp8_h64_kv4_edges).
         parts = L.partials(1)
         program = _pdl_variant(
             _kv4_variant(route, arch=L.arch, device=v["Q"].device),

@@ -85,7 +85,11 @@ tape CTAs, which thrash when co-resident).  The test knob ``walk_form``
 the call's ``walk_form_log`` records ``(program, form, n_walk)`` per launch
 (``LAST_CALL[kind]["walk_forms"]`` keeps the copy).
 The tape programs' rule is ``split`` (their full-width records are test-only,
-under ``walk_form="full"``).  The rule's inputs are static per ``(ctx, H)``, so
+under ``walk_form="full"``).  The fused forward walk's rule is per architecture
+(``cake_kcp_jit.FWDH_O_FORM_RULE``, from kernel A/B medians): on sm_100a and
+sm_103a the two-CTA form up to 32 value heads and the full-width form above,
+on sm_107a the fit rule up to 48 value heads and the full-width form above.
+The rule's inputs are static per ``(ctx, H)``, so
 the form of each ``(program, walk list)`` is decided once per table set
 (``_Tables.walk_form``) and looked up on every later launch: the eager call
 carries no per-launch list scheduling.
@@ -170,6 +174,20 @@ A/B record; the D1 explicit-record merge form (``cols_rule="by_chains"`` beyond
 ``COLS_RULE_CHAINS`` state chains) needs the positional ABI and a diagnostics
 launcher on the arena keeps ``KdaWorkspace.run``: both keep the previous path
 under either value of ``host_trim``.
+
+Fused forward output (``FWD_O_FUSE_DEFAULT = 1``): the forward that keeps
+no tape (every forward but the one a replay-mode backward runs) launches the
+fused walk ``kcp_fwdh_o`` wherever it launched the tape walk ``kcp_fwdh_tape``
+-- the same segment lists, the same initial states -- and no ``fwd_o``: the
+walk writes ``out`` for its segments' token rows and no ``h`` / ``v_new`` tape.
+``out`` is the bits of the tape walk followed by ``fwd_o`` (the same two MMAs on
+the same BF16 tiles in the same order, one rounding).  The forward's tapes have
+no reader but ``fwd_o`` in the same call: the saved set holds no tape, a
+backward replays its own tapes into the backward layout before its first tape
+reader, and the replay forward of a replay-mode backward keeps the tape walk.
+The forward's ``h`` / ``v_new`` views keep their arena bytes (the previous form
+and the replay forward use them).  ``_kcp_test_knobs={"fwd_o_fuse": 0}``
+selects the tape walk and ``fwd_o`` for the A/B record.
 
 Saved carry plane (``SAVED_CARRY_DEFAULT = 1``): the forward of a ``P > 1``
 rank keeps its whole carry plane in the saved set (``SavedDetKcp.carry``) and the
@@ -286,7 +304,7 @@ import functools
 import types
 import warnings
 import weakref
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import torch
@@ -348,6 +366,9 @@ _WALK_K12 = (
     "dhu_tape",
 )  # K3 (193 KiB) is one CTA per SM by its footprint
 _WALK_TAPES = ("fwdh_tape", "dhu_tape")
+# The walk programs whose record form (full-width / two-CTA) the registry's rule picks per launch: K1 / K2 and the
+# fused forward walk (its full-width form is one CTA per SM by its footprint; no cap applies to it)
+_WALK_FORMED = (*_WALK_K12, "fwdh_o")
 WALK_CAP_PROGRAMS: dict[
     str, tuple[str, ...]
 ] = {  # geometry -> the programs launched at one CTA per SM
@@ -404,9 +425,16 @@ MERGE_FUSE_DEFAULT = "none"  # shipped: the separate launches; "carry" via _kcp_
 # (the A/B record).
 SAVED_CARRIES = (0, 1)
 SAVED_CARRY_DEFAULT = 1
+# Fused forward output: 1 (shipped) launches the fused walk kcp_fwdh_o in place of every forward tape walk launch of a
+# forward that keeps no tape (not the replay forward of a replay-mode backward) and no fwd_o -- out bitwise the same,
+# no h / v_new tape written; 0 = the tape walk(s) + fwd_o (the previous form), via _kcp_test_knobs only (the A/B
+# record).  The replay forward runs the tape walk under both values.
+FWD_O_FUSES = (0, 1)
+FWD_O_FUSE_DEFAULT = 1
 # Walk form of the K1 / K2 state walks: "auto" (shipped) = the registry's rule per launch (cake_kcp_jit.walk_form: the
 # offset programs take their two-CTA ``_vh64`` record when the launch list-schedules within its longest chain, else the
-# full-width record; the tape programs take their two-CTA record always, their full-width records being test-only);
+# full-width record; the tape programs take their two-CTA record always, their full-width records being test-only;
+# the fused forward walk takes the form its architecture's rule names, cake_kcp_jit.FWDH_O_FORM_RULE);
 # "full" / "split" force one form on every launch, _kcp_test_knobs only (the A/B record).  The forms are bitwise equal:
 # the form never changes a bit.  A split tape launch is never capped at one CTA per SM (the cap serves the full-width
 # tape CTAs).
@@ -423,6 +451,7 @@ P2_KNOBS = {  # knob -> admitted values
     "host_trim": HOST_TRIMS,
     "merge_fuse": MERGE_FUSES,
     "saved_carry": SAVED_CARRIES,
+    "fwd_o_fuse": FWD_O_FUSES,
 }
 # Shipped defaults of the schedule / fused-walk pair (adopted together, the keep
 # rule): the "wait_first" schedule with the fused tape walks (one launch per phase).  "overlap" / fused_walks=0 stay
@@ -442,6 +471,7 @@ KCP_PROGRAMS = (
     "kcp_dhu_tape",  # K2 ``_tape``: reverse walk from an indexed final adjoint, dh tape
     "kcp_transfer_walk",  # K3: FP32-class transfer M_f (^T) (or the FP32-class offset with init_mode = 1)
     "kcp_affine_merge",  # K4: exact FP32 affine chain (state / map / transposed modes)
+    "kcp_fwdh_o",  # K1 ``_tape`` with the chunk output fused in: out, no tape (the forward that keeps no tape)
 )
 LOCAL_STAGES_FWD = ("fwd_intra", "wy_fwd", "fwd_o")
 LOCAL_STAGES_BWD = (
@@ -741,18 +771,23 @@ _PROGRAM_OF = {
     "kcp_dhu_tape": "dhu_tape",
     "kcp_transfer_walk": "transfer_walk",
     "kcp_affine_merge": "affine_merge",
+    "kcp_fwdh_o": "fwdh_o",
 }
 
 
 def _walk_form_of(call: Any, programs: Any, name: str, args: dict[str, Any]) -> str:
     """The record form of walk launch ``name`` (``"full"`` / ``"split"``): the registry's rule
     (``cake_kcp_jit.walk_form``) on the launch's chains (the chunk counts of its listed segments), the call's head
-    count and the device's SM count, under the call's ``walk_form`` knob -- decided once per ``(program, walk list)``
-    of the call's table set and looked up on every later launch (:meth:`_Tables.walk_form`); ``"full"`` with a
-    registry that has no form rule (one record per walk program)."""
+    count, the device's SM count and, for a per-architecture rule, its architecture, under the call's ``walk_form``
+    knob -- decided once per ``(program, walk list)`` of the call's table set and looked up on every later launch
+    (:meth:`_Tables.walk_form`); ``"full"`` with a registry that has no form rule (one record per walk program).
+    The provider's ``walk_form`` is called as ``walk_form(program, chains, num_heads, sm_count, *, knob)``, plus
+    ``arch=`` (the jit's ``device_arch`` of the launch's device) only when ``WALK_FORM_RULES[name]`` is a mapping
+    (a per-architecture rule): a provider whose rules are all strings needs no ``arch`` parameter."""
     jit = getattr(programs, "jit", None)
     rule = getattr(jit, "walk_form", None)
-    if rule is None or name not in getattr(jit, "WALK_FORM_RULES", {}):
+    rules = getattr(jit, "WALK_FORM_RULES", {})
+    if rule is None or name not in rules:
         return "full"
     return call.tb.walk_form(
         name,
@@ -761,6 +796,10 @@ def _walk_form_of(call: Any, programs: Any, name: str, args: dict[str, Any]) -> 
         int(jit.sm_count(call.device.index)),
         str(call.walk_form),
         rule,
+        arch_of=getattr(jit, "device_arch", None)
+        if isinstance(rules[name], Mapping)
+        else None,
+        device_index=call.device.index,
     )
 
 
@@ -1143,6 +1182,8 @@ class KernelBackend(Backend):
         prog = _PROGRAM_OF[name]
         if prog in ("fwdh_offset", "fwdh_tape"):
             abi, grid = self._fwdh_args(call, args, tape=prog == "fwdh_tape")
+        elif prog == "fwdh_o":
+            abi, grid = self._fwdh_o_args(call, args)
         elif prog in ("dhu_offset", "dhu_tape"):
             abi, grid = self._dhu_args(call, args, tape=prog == "dhu_tape")
         elif prog == "transfer_walk":
@@ -1159,7 +1200,7 @@ class KernelBackend(Backend):
                 "cols_per_cta": int(args["cols_per_cta"])
             }  # D1: an explicit record instead of the registry's choice
         if (
-            prog in _WALK_K12
+            prog in _WALK_FORMED
         ):  # the record form of this walk launch (the registry's rule or the knob)
             variant = {"walk_form": _walk_form_of(call, self.programs(), name, args)}
             args["walk_form"] = variant["walk_form"]
@@ -1214,7 +1255,7 @@ class KernelBackend(Backend):
                 "transfer_walk": call.transfer_walk,
             }
         elif (
-            prog in _WALK_K12
+            prog in _WALK_FORMED
         ):  # the record form of this walk launch (the registry's rule or the knob)
             variant = {"walk_form": _walk_form_of(call, programs, name, args)}
             args["walk_form"] = variant["walk_form"]
@@ -1297,6 +1338,38 @@ class KernelBackend(Backend):
             out.stride if not tape else h0.stride,
             v.h,
             v.v_new,
+        ]
+        return abi, len(args["walk"]) * call.H
+
+    def _fwdh_o_args(
+        self, call: CallDetKcp, args: dict[str, Any]
+    ) -> tuple[list[Any], int]:
+        """The fused forward walk's positional ABI (:data:`ABI_PARAMS` ``fwdh_o``): the tape walk's operands, segment
+        table, walk list and initial-state block, then the output stage's ``qg`` / ``Aqk`` rows, the call's output,
+        the chunk tables and ``scale``; no tape and no output pool."""
+        walk_seg, seg_table, nseg, v = self._walk_common(call, args)
+        h0 = self._block(call, args.get("h0"))
+        values = call.local_values
+        abi = [
+            v.w,
+            v.kg,
+            v.u,
+            v.gk,
+            call.H,
+            seg_table,
+            nseg,
+            walk_seg,
+            h0.ptr,
+            h0.index,
+            h0.hg,
+            h0.n,
+            h0.stride,
+            v.qg,
+            v.aqk_int,
+            call.out,
+            values["chunk_bos"],
+            values["chunk_len"],
+            float(call.scale),
         ]
         return abi, len(args["walk"]) * call.H
 
@@ -1522,6 +1595,27 @@ ABI_PARAMS = {
 }
 ABI_PARAMS["fwdh_tape"] = ABI_PARAMS["fwdh_offset"]
 ABI_PARAMS["dhu_tape"] = ABI_PARAMS["dhu_offset"]
+ABI_PARAMS["fwdh_o"] = (
+    "w_tma",
+    "kg_tma",
+    "u",
+    "gk",
+    "num_heads",
+    "seq_chunk_start",
+    "num_seqs",
+    "walk_seg",
+    "h0",
+    "h0_index",
+    "h0_hg",
+    "h0_n",
+    "tile_stride",
+    "qg_tma",
+    "aqk_tma",
+    "o_out",
+    "chunk_bos",
+    "chunk_len",
+    "scale",
+)
 
 
 # Walk-launch geometry one_cta_per_sm / tape_one_cta_per_sm: the K1 / K2 walk kernels' occupancy capped from the host.
@@ -2394,11 +2488,13 @@ class _FiPrograms:
             return
         record = f"kcp_{program}"
         if (
-            program in _WALK_K12
+            program in _WALK_FORMED
         ):  # the record of this launch's form: a fit program's two-CTA record is its ``_vh64``
             # variant, a fixed-rule program's other form its test-only ``_<form>`` record
             rule = getattr(jit, "WALK_FORM_RULES", {}).get(record, "fit")
-            if rule == "fit":
+            if rule == "fit" or isinstance(
+                rule, Mapping
+            ):  # both records shipped (a per-architecture rule: the fused forward walk)
                 if walk_form == "split":
                     record += "_vh64"
                 elif record in getattr(jit, "WALK_HEADS_RULE", {}):
@@ -3346,24 +3442,38 @@ class _Tables:
         sm_count: int,
         knob: str,
         rule: Any,
+        arch_of: Any = None,
+        device_index: int | None = None,
     ) -> str:
         """The record form (``"full"`` / ``"split"``) of walk launch ``name`` over the segments ``walk``: the registry's
         rule ``rule`` (``cake_kcp_jit.walk_form``) on the launch's chains (the chunk counts of its listed segments), the
-        head count ``H``, the device's SM count and the ``walk_form`` knob -- evaluated once per ``(name, walk list, H,
-        SM count, knob, rule)`` of this table set and looked up on every later launch.  The rule's inputs are static per
+        head count ``H``, the device's SM count, the ``walk_form`` knob and the architecture ``arch_of(device_index)``
+        (passed to the rule as ``arch=`` only where ``arch_of`` is given, which :func:`_walk_form_of` does for a
+        per-architecture rule alone; read on the first launch of a key only) -- evaluated once per
+        ``(name, walk list, H, SM count, knob, rule, device index)`` of this table set and looked up on every later
+        launch.  The rule's inputs are static per
         ``(ctx, H)`` (the walk lists and ``hp.seg_chunk_start`` are this set's, never mutated), so the lookup returns
         what a per-launch evaluation would; the evaluation itself (the ``fit`` rule list-schedules the chains in
         Python) leaves the launch path.  Keyed by value: a fresh equal list finds the same entry.  The first launch
         per key of a context pays that one evaluation (milliseconds of Python for the ``fit`` rule on long chain
         lists: the one-time cost of an eager first call, not a per-launch regression); every later launch pays a
         dictionary lookup."""
-        key = (str(name), tuple(walk), int(H), int(sm_count), str(knob), rule)
+        key = (
+            str(name),
+            tuple(walk),
+            int(H),
+            int(sm_count),
+            str(knob),
+            rule,
+            device_index,
+        )
         cache = self.__dict__.setdefault("_walk_forms", {})
         form = cache.get(key)
         if form is None:
             if len(cache) >= self.ID_CACHE_MAX:
                 cache.clear()
             seg = self.hp.seg_chunk_start
+            extra = {} if arch_of is None else {"arch": str(arch_of(device_index))}
             form = cache[key] = str(
                 rule(
                     name,
@@ -3371,6 +3481,7 @@ class _Tables:
                     int(H),
                     int(sm_count),
                     knob=str(knob),
+                    **extra,
                 )
             )
         return form
@@ -4211,12 +4322,13 @@ class OptionsDetKcp:
     fused_walks: int = FUSED_WALKS_DEFAULT  # shipped 1: one tape launch per phase from the carry plane (+ the S_in / dS_out copies); 0 via _kcp_test_knobs
     cols_rule: str = "fixed"  # D1: "by_chains" = c8 up to COLS_RULE_CHAINS state chains, c16 beyond; _kcp_test_knobs only
     walk_geometry: str = WALK_GEOMETRY_DEFAULT  # walk geometry: shipped "lpt_tape_one_cta_per_sm"; "shipped" (the earlier geometry) and the other WALK_GEOMETRIES via _kcp_test_knobs only
-    walk_form: str = WALK_FORM_DEFAULT  # the record form of the K1 / K2 walk launches: "auto" (shipped) = the registry's rule per launch; "full" / "split" via _kcp_test_knobs only
+    walk_form: str = WALK_FORM_DEFAULT  # the record form of the K1 / K2 and fused forward walk launches: "auto" (shipped) = the registry's rule per launch; "full" / "split" via _kcp_test_knobs only
     graph: str = GRAPH_DEFAULT  # graph replay: public keyword; "replay" captures a call once per validity key and replays it (eager on a key miss); also reachable through _kcp_test_knobs for the A/B record
     graph_cap: str = GRAPH_CAP_DEFAULT  # the cache-config form of a captured call ("node_attr" shipped | "none" the previous form of record | "capture_pref" rejected | "node_attr_post"); _kcp_test_knobs only
     host_trim: int = HOST_TRIM_DEFAULT  # shipped 1 = the trimmed host path of the eager call (same launches, bitwise); 0 = the previous path, _kcp_test_knobs only
     merge_fuse: str = MERGE_FUSE_DEFAULT  # "carry" = carry_start + carry_in (dcarry_end + dcarry_cross) in one K4 launch; _kcp_test_knobs only
     saved_carry: int = SAVED_CARRY_DEFAULT  # shipped 1 = the forward's carry plane stays in the saved set and the saved-mode backward skips the P > 1 re-walk + carry merges; 0 = the re-walk, _kcp_test_knobs only
+    fwd_o_fuse: int = FWD_O_FUSE_DEFAULT  # shipped 1 = the forward that keeps no tape runs kcp_fwdh_o (out, no tape) in place of the tape walk(s) + fwd_o; 0 = the tape walk(s) + fwd_o, _kcp_test_knobs only
 
     def check(self) -> OptionsDetKcp:
         if self.exchange not in EXCHANGES:
@@ -4325,7 +4437,7 @@ def _options(kwargs: dict[str, Any]) -> OptionsDetKcp:
             if key in raw:
                 p2[key] = (
                     int(raw.pop(key))
-                    if key in ("fused_walks", "host_trim", "saved_carry")
+                    if key in ("fused_walks", "host_trim", "saved_carry", "fwd_o_fuse")
                     else str(raw.pop(key))
                 )
     if (
@@ -4475,6 +4587,12 @@ class CallDetKcp:
         self.saved_carry = int(
             opts.saved_carry
         )  # 1 (shipped) = the saved carry plane; 0 = the re-walk (test knob)
+        self.fwd_o_fuse = int(
+            opts.fwd_o_fuse
+        )  # 1 (shipped) = the fused forward walk; 0 = the tape walk(s) + fwd_o (test knob)
+        # the forward state walk program of the forward in progress (_forward sets it): kcp_fwdh_o, or kcp_fwdh_tape
+        # where the forward keeps its tapes (the replay forward) or the knob asks for the previous form
+        self.fwd_walk = "kcp_fwdh_tape"
 
     # -- buffers
     def buf(self, name: str) -> torch.Tensor:
@@ -4680,6 +4798,7 @@ def _record(kind: str, call: CallDetKcp) -> None:
         "host_trim": call.host_trim,
         "merge_fuse": call.merge_fuse,  # the fused carry merges (test knob)
         "saved_carry": call.saved_carry,  # 1 (shipped) = the saved carry plane; 0 = the re-walk (test knob)
+        "fwd_o_fuse": call.fwd_o_fuse,  # 1 (shipped) = the fused forward walk; 0 = the tape walk(s) + fwd_o (test knob)
         "saved_carry_plane": call.scratch.get(
             "saved_carry_plane"
         ),  # bytes of the carry plane kept (forward) / read (backward) on a P > 1 rank under saved_carry=1, None otherwise
@@ -4969,10 +5088,11 @@ def _ring_forward(call: CallDetKcp) -> None:
 
 
 def _ring_start_walk(call: CallDetKcp) -> None:
-    """The overlap schedule's document-start tape walk of the ring forward (under hop 1; alone when there is none)."""
+    """The overlap schedule's document-start tape walk of the ring forward (under hop 1; alone when there is none;
+    the forward's walk program, :func:`_forward`)."""
     tb = call.tb
     carry = call.indexed("carry", tb.carry_index, tb.carry_tiles) if tb.P > 1 else None
-    call.walk("kcp_fwdh_tape", tb.walk_start, h0=carry, out=call.out)
+    call.walk(call.fwd_walk, tb.walk_start, h0=carry, out=call.out)
 
 
 def _ring_end_walk(call: CallDetKcp) -> None:
@@ -5117,12 +5237,13 @@ def _fwd_tapes(
     carry: Indexed | None,
     wait_first: bool,
 ) -> None:
-    """The forward tape walk(s) after ``S_in`` is complete.  ``fused_walks``: one launch from one pool -- the
-    carry plane at ``P > 1`` (``h0_index_fused``: carries, the ``S_in`` copies of ``carry_in``, ``-1`` zero states),
-    ``S_in`` itself at ``P = 1`` -- over every live segment (``wait_first``) or the crossing-in fragments' segments
-    (the document-start walk ran under c1); otherwise the three launches of the design note §3.5 (the document-start
-    walk here only under ``wait_first``)."""
-    tb = call.tb
+    """The forward tape walk(s) after ``S_in`` is complete (the forward's walk program ``call.fwd_walk``: the tape
+    walk, or the fused walk that writes ``out`` instead of the tapes, :func:`_forward`).  ``fused_walks``: one launch
+    from one pool -- the carry plane at ``P > 1`` (``h0_index_fused``: carries, the ``S_in`` copies of ``carry_in``,
+    ``-1`` zero states), ``S_in`` itself at ``P = 1`` -- over every live segment (``wait_first``) or the crossing-in
+    fragments' segments (the document-start walk ran under c1); otherwise the three launches of the design note §3.5
+    (the document-start walk here only under ``wait_first``)."""
+    tb, walk = call.tb, call.fwd_walk
     h0_in = call.indexed("S_in", tb.h0_index, tb.s_in_tiles)
     if tb.fused_walks:
         h0 = (
@@ -5131,7 +5252,7 @@ def _fwd_tapes(
             else h0_in
         )
         call.walk(
-            "kcp_fwdh_tape",
+            walk,
             tb.walk_live if wait_first else tb.walk_in_fused,
             h0=h0,
             out=out,
@@ -5139,11 +5260,11 @@ def _fwd_tapes(
         return
     if wait_first:
         call.walk(
-            "kcp_fwdh_tape", tb.walk_start, h0=carry, out=out
+            walk, tb.walk_start, h0=carry, out=out
         )  # document starts: after wait(c2)
-    call.walk("kcp_fwdh_tape", tb.walk_in_p0, h0=h0_in, out=out)
+    call.walk(walk, tb.walk_in_p0, h0=h0_in, out=out)
     if tb.P > 1:
-        call.walk("kcp_fwdh_tape", tb.walk_in_p1, h0=carry, out=out)
+        call.walk(walk, tb.walk_in_p1, h0=carry, out=out)
 
 
 def _adj_tapes(call: CallDetKcp, *, dcarry: Indexed | None, wait_first: bool) -> None:
@@ -5187,9 +5308,14 @@ def _forward(
     ``schedule="wait_first"`` (the shipped default since an earlier revision): ``c1 -> wait -> fwd merge -> c2 -> wait -> carry merges -> tape walk(s)``
     -- no merge or walk is issued while a collective is in flight (the R7 overlap of the document-start walk under c1
     is dropped); the merges read only ``c1_recv`` / the staging planes and the tapes read no collective buffer, so
-    every published bit is the same."""
+    every published bit is the same.
+    The forward's state walk program (``call.fwd_walk``, every forward tape-walk launch site): the fused walk
+    ``kcp_fwdh_o`` (``out`` from the walk, no tape, no ``fwd_o`` launch) unless the forward keeps its tapes
+    (``replay``: the backward reads them) or the ``fwd_o_fuse`` knob is ``0``; then the tape walk and ``fwd_o``."""
     tb, opts = call.tb, call.opts
     wait_first = call.schedule == "wait_first"
+    fuse_o = not replay and call.fwd_o_fuse == 1
+    call.fwd_walk = "kcp_fwdh_o" if fuse_o else "kcp_fwdh_tape"
     keep_transfer = opts.save_transfer and save and not replay
     if bound is None:
         call.fresh("S_in")
@@ -5227,7 +5353,7 @@ def _forward(
         if not wait_first:
             if tb.P > 1:
                 call.merge("carry_start")
-            call.walk("kcp_fwdh_tape", tb.walk_start, h0=carry, out=call.out)
+            call.walk(call.fwd_walk, tb.walk_start, h0=carry, out=call.out)
     elif (
         call.exchange == "ring"
     ):  # SPEC-2: per-document hops; S_in filled as c2 would (bitwise)
@@ -5244,7 +5370,7 @@ def _forward(
                     "carry_start"
                 )  # reads the staging planes only (R7: no collective buffer)
             call.walk(
-                "kcp_fwdh_tape", tb.walk_start, h0=carry, out=call.out
+                call.fwd_walk, tb.walk_start, h0=carry, out=call.out
             )  # document starts: under c1 (R7)
         call.wait(w1)
         call.merge("fwd")  # the owner's chains: S_in slices into the c2 send layout
@@ -5260,7 +5386,7 @@ def _forward(
                 "carry_in"
             )  # with fused_walks also the S_in copies into the extra carry slots (write_states)
     _fwd_tapes(call, out=call.out, carry=carry, wait_first=wait_first)
-    if not replay:
+    if not replay and not fuse_o:
         call.stage("fwd_o")
 
 
