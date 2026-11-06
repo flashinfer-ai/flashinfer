@@ -1152,6 +1152,17 @@ def test_nvlink_two_sided_marks_padding_rows_invalid(monkeypatch) -> None:
     assert per_slot.shape == (2, 8)
     torch.testing.assert_close(out, torch.full((1, 8), 2.0))
 
+    # A rank without local tokens still runs the return collective.
+    for expert_output, out in (
+        (torch.ones(3, 8), None),
+        (torch.ones(1, 3, 8), torch.empty(0, 8)),
+    ):
+        comm.dispatch(torch.ones(0, 8), torch.ones(0, 2, dtype=torch.int32))
+        num_calls = len(calls["comm"])
+        combined = comm.combine(expert_output, output=out)
+        assert len(calls["comm"]) == num_calls + 1 and combined.shape == (0, 8)
+        assert out is None or combined is out
+
     comm.destroy()
     with pytest.raises(RuntimeError, match="destroyed"):
         comm.dispatch(torch.ones(1, 8), torch.tensor([[1, 3]]))
