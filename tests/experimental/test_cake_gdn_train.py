@@ -1820,15 +1820,11 @@ def test_the_package_exports_the_det_free_names_only() -> None:
     for name in DET_NAMES:
         for module in (cake_gdn_train, cake_chain):
             assert not hasattr(module, name) and name not in module.__all__, name
-    # the deterministic package keeps its names and its aliases, distinct objects from this package's entries
-    assert (
-        cake_gdn_det_train.chunk_gated_delta_rule
-        is cake_gdn_det_train.chunk_gated_delta_rule_det
-    )
-    assert (
-        cake_gdn_train.chunk_gated_delta_rule
-        is not cake_gdn_det_train.chunk_gated_delta_rule
-    )
+    # the deterministic package's entries (its det names) are distinct objects from this package's entries
+    for name, det_name in zip(ENTRY_NAMES, DET_NAMES, strict=True):
+        assert getattr(cake_gdn_train, name) is not getattr(
+            cake_gdn_det_train, det_name
+        ), name
     assert cake_jit.PACKAGE == "flashinfer.experimental.cake.cake_gdn_train"
     assert cake_jit.LIBRARY_PREFIX == "cake_gdn_train"
 
