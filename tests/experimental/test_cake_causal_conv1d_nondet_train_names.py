@@ -104,7 +104,6 @@ KCP_PACKAGE_NAMES = (
         "cake_causal_conv1d_nondet_train_kcp_multi_backward",
     ),
     ("graph_cache_clear", "cake_causal_conv1d_nondet_train_kcp_graph_cache_clear"),
-    ("host_cache_clear", "cake_causal_conv1d_nondet_train_kcp_host_cache_clear"),
 )
 RENAMED = {
     FACADE: SINGLE_RANK,
@@ -112,7 +111,12 @@ RENAMED = {
     PACKAGE: SINGLE_RANK,
     KCP_PACKAGE: KCP_PACKAGE_NAMES,
 }
-OLD_NAMES = sorted({old for pairs in RENAMED.values() for old, _ in pairs})
+# Renamed names that no module lists in ``__all__`` (the KCP backend's host-plan cache helper, now
+# ``cake_causal_conv1d_nondet_train_kcp_host_cache_clear``): only their absence is checked.
+UNLISTED_OLD_NAMES = ("host_cache_clear",)
+OLD_NAMES = sorted(
+    {old for pairs in RENAMED.values() for old, _ in pairs} | set(UNLISTED_OLD_NAMES)
+)
 
 
 def _public(module: ModuleType) -> list[tuple[str, object]]:
