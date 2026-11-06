@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Provenance: package-local copy of ``flashinfer/experimental/cake_kda_train/cake_kcp_plan.py`` (now
-``flashinfer/experimental/cake_kda_det_train_kcp/cake_kcp_plan.py``) at FlashInfer
+``flashinfer/experimental/cake/cake_kda_det_train_kcp/cake_kcp_plan.py``) at FlashInfer
 commit 13d7fcf4041635f5b7f573bb0dbab23570ae1034 (sha256 0f2d8b06bbea49df37b043fba3026a06799f0a0cba09d697e490d02bb747dfbf),
 adapted for the GDN KCP route: the head count of every per-head state is the value-head count ``HV``
 (``H := HV``), the plan rule is a keyword-only argument (no environment variable), and the byte queries live

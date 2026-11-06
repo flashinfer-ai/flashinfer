@@ -316,7 +316,7 @@ def test_multi_recompute_handle_misuse_raises() -> None:
         conv_kcp._handle_hists(h.entries["conv"], xs[:2], ctx)
     with pytest.raises(ValueError, match="hist"):
         conv_kcp._handle_hist(h.entries["conv"], xs[0], ctx)
-    with pytest.raises(ValueError, match="ContextDetKcp"):
+    with pytest.raises(ValueError, match="CakeKDADetKcpContext"):
         other, _, _, _ = _problem((5000, 1003), (1, 2, 4997, 1003), (512,), device)
         conv_kcp._handle_hists(h.entries["conv"], xs, other)
     bound = conv_kcp._handle_hists(h.entries["conv"], xs, ctx)

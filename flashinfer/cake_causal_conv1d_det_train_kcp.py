@@ -18,7 +18,7 @@ Deterministic context-parallel (KCP) packed width-4 depthwise causal convolution
 
 Every rank convolves its fragments of the packed batch; the first tokens of a fragment that continues a
 document read the history rows of the preceding fragment, exchanged through the halo collective of the
-context-parallel context of the KDA step (``flashinfer.cake_kda_det_train_kcp.build_context_det_kcp``).
+context-parallel context of the KDA step (``flashinfer.cake_kda_det_train_kcp.cake_kda_det_train_kcp_build_context``).
 The per-rank launch sequences, the autograd Functions and the kernels of the ``kcp_jit`` registry live in
 ``flashinfer.cake_causal_conv1d_det_train_backend.kcp``; the single-rank entry points are in
 ``flashinfer.cake_causal_conv1d_det_train``::
@@ -69,8 +69,8 @@ def cake_causal_conv1d_det_kcp(
         partition's order; ``C`` is a multiple of 8.
     weight : torch.Tensor
         FP32 ``[C, 4]`` contiguous taps.
-    ctx : ContextDetKcp
-        From ``flashinfer.cake_kda_det_train_kcp.build_context_det_kcp`` (the same context the KDA step of the rank uses).
+    ctx : CakeKDADetKcpContext
+        From ``flashinfer.cake_kda_det_train_kcp.cake_kda_det_train_kcp_build_context`` (the same context the KDA step of the rank uses).
     recompute_handle : RecomputeHandleDetKcp, optional
         Keyword-only, default ``None`` (unchanged behavior).  A handle (any object with an ``entries`` dict, such as
         ``flashinfer.cake_causal_conv1d_det_train_kcp.RecomputeHandleDetKcp``) makes the checkpoint recompute of
@@ -138,7 +138,7 @@ def cake_causal_conv1d_det_multi_kcp(
         fragments, in the partition's order; each ``C_i`` is a multiple of 8 (they may differ).
     weights : sequence of torch.Tensor
         FP32 ``[C_i, 4]`` contiguous taps, one per tensor.
-    ctx : ContextDetKcp
+    ctx : CakeKDADetKcpContext
         As in :func:`cake_causal_conv1d_det_kcp`.  Every rank of the group calls this function once per layer, in the
         same order, with the same tensor count and channel counts.  The ranks are not compared (that would cost a
         collective): a different count, channel count or order hangs the exchange or silently corrupts the history

@@ -92,7 +92,7 @@ The light backward's solve-free replay of #1 (``save_mode="light_akk"``, which k
                              ``akk`` read, not written; grid (NC, H_qk), two resident CTAs per SM as #1
 
 Provenance of the rules: ``flashinfer/experimental/cake_kda_train/cake_kcp_jit.py`` (now
-``flashinfer/experimental/cake_kda_det_train_kcp/cake_kcp_jit.py``; records_of_program,
+``flashinfer/experimental/cake/cake_kda_det_train_kcp/cake_kcp_jit.py``; records_of_program,
 select_record, launch_grid; sha256 c405e7dcd36c9cbe0ff01e3e3194fd760491504655bda28a646c2067a23b4c90) at
 FlashInfer 13d7fcf4041635f5b7f573bb0dbab23570ae1034, adapted to the GDN vocabulary; the loader glue moved to
 :mod:`.cake_backend`.

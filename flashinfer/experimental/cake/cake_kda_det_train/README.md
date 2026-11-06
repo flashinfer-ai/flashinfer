@@ -652,7 +652,7 @@ record in both modes.
 ## Context-parallel training (KCP)
 
 The context-parallel entry points (`flashinfer.cake_kda_det_train_kcp`) and
-their package (`flashinfer/experimental/cake_kda_det_train_kcp`: the plan, the
+their package (`flashinfer/experimental/cake/cake_kda_det_train_kcp`: the plan, the
 per-rank launch sequences, the KCP programs and their manifests) run the
 chunk stages of this package at each rank's shape; see that package's
 README.
@@ -705,4 +705,4 @@ FP64 reference) and `tests/experimental/test_cake_kda_det_train_api.py` (the
 public entry points;
 `tests/experimental/test_cake_kda_det_train_names.py` checks the previous names).
 Benchmark: `benchmarks/bench_cake_kda_det_train.py`.  The context-parallel
-path has its own package, `flashinfer/experimental/cake_kda_det_train_kcp`.
+path has its own package, `flashinfer/experimental/cake/cake_kda_det_train_kcp`.
