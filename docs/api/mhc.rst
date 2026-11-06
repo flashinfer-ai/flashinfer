@@ -20,16 +20,20 @@ Training mHC (Cake)
 
 .. note::
 
-   Every public name of the deterministic package ``flashinfer.cake_mhc_det_train``
-   and of its backends ``flashinfer.cake_mhc_det_train_backend`` and
-   ``flashinfer.cake_mhc_det_train_head_backend`` contains ``det``, and its entry
-   points take no ``deterministic`` keyword. FlashInfer 0.7.3 named this package
-   ``flashinfer.cake_mhc_train`` (with ``flashinfer.cake_mhc_train_*`` and
-   ``CakeMHCTrain*`` at the top level). Those names are removed, with no alias:
-   replace ``cake_mhc_train`` with ``cake_mhc_det_train`` and ``CakeMHCTrain``
-   with ``CakeMHCDetTrain``. The names without ``det`` now belong only to the
-   selectable-mode module ``flashinfer.experimental.cake.cake_mhc_train``
-   described below.
+   Every function and class exported by the deterministic package
+   ``flashinfer.cake_mhc_det_train`` and by its backends
+   ``flashinfer.cake_mhc_det_train_backend`` and
+   ``flashinfer.cake_mhc_det_train_head_backend`` has ``det`` in its name (the
+   generic constants and route helpers ``ARCHES``,
+   ``SUPPORTED_COMPUTE_CAPABILITIES``, ``TENSOR_ALIGNMENT_BYTES``,
+   ``WORKSPACE_ALIGNMENT_BYTES``, ``route_key`` and ``route_modules`` are
+   qualified by the module path). Its entry points take no ``deterministic``
+   keyword. FlashInfer 0.7.3 named this package ``flashinfer.cake_mhc_train``,
+   with ``flashinfer.cake_mhc_train_*`` and ``CakeMHCTrain*`` at the top level.
+   Those names are removed, with no alias: replace ``cake_mhc_train`` with
+   ``cake_mhc_det_train`` and ``CakeMHCTrain`` with ``CakeMHCDetTrain``. The
+   names without ``det`` now belong only to the selectable-mode module
+   ``flashinfer.experimental.cake.cake_mhc_train`` described below.
 
 Four-stream mHC training forward / backward for hidden sizes 4096, 5120 and
 7168 on SM100 and SM103 (4096 on SM107); each call takes the hidden size ``H``
@@ -186,16 +190,3 @@ Names: ``flashinfer.cake_mhc_det_train.cake_mhc_det_train_<name>`` ->
 ``is_cake_mhc_det_train_supported`` -> ``is_cake_mhc_train_supported`` and
 ``CakeMHCDetTrain<Node>Function`` -> ``CakeMHCTrain<Node>Function`` (the
 non-deterministic package's nodes).
-
-.. currentmodule:: flashinfer.experimental.cake.cake_mhc_train
-
-.. autosummary::
-    :toctree: ../generated
-
-    cake_mhc_train_forward_prepare
-    cake_mhc_train_forward_stats
-    cake_mhc_train_forward_finish
-    cake_mhc_train_backward_prepare
-    cake_mhc_train_backward_finish
-    cake_mhc_train_prepare
-    cake_mhc_train_finish

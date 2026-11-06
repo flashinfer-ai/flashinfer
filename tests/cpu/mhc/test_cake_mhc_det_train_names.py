@@ -70,6 +70,7 @@ def test_top_level_has_no_mhc_training_name_without_det() -> None:
 @pytest.mark.parametrize("module_name", DET)
 def test_det_names_and_no_mode_keyword(module_name: str) -> None:
     module = importlib.import_module(module_name)
+    assert module.__all__, module_name
     without_det = [
         n
         for n in module.__all__

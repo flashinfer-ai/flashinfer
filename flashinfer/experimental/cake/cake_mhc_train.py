@@ -100,9 +100,9 @@ Name map (the deterministic names are unchanged and always deterministic)::
       route_key                                     route_key
 
 This module is the namespace of the selectable mode.  The deterministic
-package's public names all carry ``det`` (``flashinfer.cake_mhc_det_train``);
-FlashInfer has no other spelling of them (0.7.3's ``flashinfer.cake_mhc_train``
-names are removed, with no alias).  The model's head
+package's functions and classes carry ``det`` in their names
+(``flashinfer.cake_mhc_det_train``); 0.7.3's ``flashinfer.cake_mhc_train``
+names are removed, with no alias.  The model's head
 (``cake_mhc_det_train_head*``) has no cross-token reduction and no counterpart
 here: use
 ``flashinfer.cake_mhc_det_train.cake_mhc_det_train_head_forward`` /
