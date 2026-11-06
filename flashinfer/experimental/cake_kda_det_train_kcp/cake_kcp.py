@@ -4408,6 +4408,8 @@ def _options(kwargs: dict[str, Any]) -> OptionsDetKcp:
                 "_kcp_options is the validated OptionsDetKcp of the entry point and travels alone"
             )
         return pre
+    if not kwargs:
+        return _default_options()
     kwargs = dict(kwargs)
     raw = kwargs.pop("_kcp_test_knobs", None)
     transfer_walk: str | None = (
@@ -4468,6 +4470,22 @@ def _options(kwargs: dict[str, Any]) -> OptionsDetKcp:
         p_rule=p_rule,
         **p2,
     ).check()
+
+
+# The validated options of an empty ``**options``: (the plan module's SAVE_TRANSFER_DEFAULT it resolved, the options).
+_DEFAULT_OPTIONS: list[tuple[Any, OptionsDetKcp]] = []
+
+
+def _default_options() -> OptionsDetKcp:
+    """``_options({})``: an entry point called without keyword options validates the defaults, which depend on no
+    input (only on this module's defaults and the plan module's ``SAVE_TRANSFER_DEFAULT``, the cache key); the first
+    call validates them through the full path, every call gets a fresh copy of that result (equal field by field)."""
+    key = cake_kcp_plan.SAVE_TRANSFER_DEFAULT
+    if not _DEFAULT_OPTIONS or _DEFAULT_OPTIONS[0][0] is not key:
+        _DEFAULT_OPTIONS[:] = [(key, _options({"_kcp_test_knobs": None}))]
+    opts = object.__new__(OptionsDetKcp)
+    opts.__dict__.update(_DEFAULT_OPTIONS[0][1].__dict__)
+    return opts
 
 
 def _exchange_scheme(tb: _Tables, opts: OptionsDetKcp) -> str:
