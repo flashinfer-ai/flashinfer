@@ -76,6 +76,14 @@ fusion and an autograd wrapper.
      non-deterministic backward. The forward (no cross-row reduction, bitwise
      reproducible), the workspace helpers and
      ``is_cake_rmsnorm_train_supported`` never alert.
+   * The ``flashinfer`` top level binds only the ``det`` names
+     (``cake_rmsnorm_det``, ``CakeRMSNormDetFunction``,
+     ``cake_rmsnorm_det_train_forward``, ``cake_rmsnorm_det_train_backward``,
+     ``cake_rmsnorm_det_train_backward_workspace_bytes``). The non-deterministic
+     package is reached only as the module ``flashinfer.cake_rmsnorm_train``:
+     the top-level ``cake_rmsnorm``, ``CakeRMSNormFunction`` and
+     ``cake_rmsnorm_train_*`` names are removed, so code that imports them fails
+     at import.
    * There are no aliases: a name without ``det`` never runs the deterministic
      package, and neither package runs the other.
 

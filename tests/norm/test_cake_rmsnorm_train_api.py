@@ -15,8 +15,9 @@ limitations under the License.
 
 Tests of the flashinfer public surface of the Cake fused BF16 RMSNorm training
 package with the non-deterministic weight gradient: the
-``flashinfer.cake_rmsnorm_train`` facade, its re-export from the ``flashinfer``
-top level, the explicit ``deterministic=False`` every entry point requires (the
+``flashinfer.cake_rmsnorm_train`` facade (the only way to reach it: the
+``flashinfer`` top level binds none of its names), the explicit
+``deterministic=False`` every entry point requires (the
 default ``True`` raises ``ValueError`` naming the det entry point), the
 interplay with ``torch.use_deterministic_algorithms`` (only the backward and the
 autograd backward alert: ``RuntimeError``; with ``warn_only``, one warning
@@ -148,16 +149,25 @@ def _names(text: str, name: str) -> bool:
 # --------------------------------------------------------------------------- the surface (no device)
 
 
-def test_function_signature_is_exported() -> None:
-    assert flashinfer.cake_rmsnorm is cake_rmsnorm
-    assert flashinfer.cake_rmsnorm_train_forward is cake_rmsnorm_train_forward
-    assert flashinfer.cake_rmsnorm_train_backward is cake_rmsnorm_train_backward
+def test_entry_points_are_reached_through_the_module_only() -> None:
+    module = flashinfer.cake_rmsnorm_train
+    assert module.cake_rmsnorm is cake_rmsnorm
+    assert module.cake_rmsnorm_train_forward is cake_rmsnorm_train_forward
+    assert module.cake_rmsnorm_train_backward is cake_rmsnorm_train_backward
     assert (
-        flashinfer.cake_rmsnorm_train_backward_workspace_bytes
+        module.cake_rmsnorm_train_backward_workspace_bytes
         is cake_rmsnorm_train_backward_workspace_bytes
     )
-    assert flashinfer.CakeRMSNormFunction is CakeRMSNormFunction
-    # the det names stay the det package's objects
+    assert module.CakeRMSNormFunction is CakeRMSNormFunction
+    # the top level binds none of these names, only the det package's
+    for name in (
+        "cake_rmsnorm",
+        "cake_rmsnorm_train_forward",
+        "cake_rmsnorm_train_backward",
+        "cake_rmsnorm_train_backward_workspace_bytes",
+        "CakeRMSNormFunction",
+    ):
+        assert not hasattr(flashinfer, name), name
     assert flashinfer.cake_rmsnorm_det is det.cake_rmsnorm_det
     assert flashinfer.CakeRMSNormDetFunction is det.CakeRMSNormDetFunction
 

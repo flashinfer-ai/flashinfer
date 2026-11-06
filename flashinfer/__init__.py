@@ -292,20 +292,8 @@ from .cake_rmsnorm_det_train import (
     cake_rmsnorm_det_train_forward as cake_rmsnorm_det_train_forward,
 )
 
-# The package with the non-deterministic weight gradient (names without ``det``;
-# every entry point requires ``deterministic=False`` and otherwise raises
-# ``ValueError`` naming the det entry point above).
-from .cake_rmsnorm_train import CakeRMSNormFunction as CakeRMSNormFunction
-from .cake_rmsnorm_train import cake_rmsnorm as cake_rmsnorm
-from .cake_rmsnorm_train import (
-    cake_rmsnorm_train_backward as cake_rmsnorm_train_backward,
-)
-from .cake_rmsnorm_train import (
-    cake_rmsnorm_train_backward_workspace_bytes as cake_rmsnorm_train_backward_workspace_bytes,
-)
-from .cake_rmsnorm_train import (
-    cake_rmsnorm_train_forward as cake_rmsnorm_train_forward,
-)
+# The package with the non-deterministic weight gradient is reached only as the
+# module ``flashinfer.cake_rmsnorm_train``: the top level binds none of its names.
 from . import cake_rmsnorm_train as cake_rmsnorm_train
 from . import cake_rmsnorm_train_backend as cake_rmsnorm_train_backend
 from .cake_rmsnorm_silu_gate_det_train import (

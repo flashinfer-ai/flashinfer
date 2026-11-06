@@ -27,9 +27,11 @@ raises ``ValueError`` naming the det entry point of the same role and saying
 "pass deterministic=False for the non-deterministic path", before any warning;
 ``False`` passes the check.  The deterministic package does
 not consult ``torch.use_deterministic_algorithms``.  The ``flashinfer`` top level
-binds each name to its own package's object, and the non-deterministic package is
-self-contained (its own registry, submodules, star import and ``dir``; checked
-in fresh interpreters too).
+binds only the det names, each to the det package's object, and no name of the
+non-deterministic package, which is reached only as the module
+``flashinfer.cake_rmsnorm_train`` (``from flashinfer import cake_rmsnorm`` fails
+at import).  The non-deterministic package is self-contained (its own registry,
+submodules, star import and ``dir``; checked in fresh interpreters too).
 """
 
 from __future__ import annotations
@@ -81,14 +83,7 @@ PAIRS = (
 NONDET_NAMES = tuple(nondet for nondet, _det in PAIRS)
 DET_NAMES = tuple(det for _nondet, det in PAIRS)
 DET_OF = dict(PAIRS)
-# The names the ``flashinfer`` top level exports from each package.
-TOP_LEVEL_NONDET = (
-    "CakeRMSNormFunction",
-    "cake_rmsnorm",
-    "cake_rmsnorm_train_backward",
-    "cake_rmsnorm_train_backward_workspace_bytes",
-    "cake_rmsnorm_train_forward",
-)
+# The names the ``flashinfer`` top level exports: the det package's only.
 TOP_LEVEL_DET = (
     "CakeRMSNormDetFunction",
     "cake_rmsnorm_det",
@@ -399,10 +394,10 @@ def test_det_package_ignores_deterministic_algorithms(
 # --------------------------------------------------------------------------- the flashinfer top level
 
 
-@pytest.mark.parametrize("name", TOP_LEVEL_NONDET)
-def test_top_level_nondet_name_is_the_nondet_object(name: str) -> None:
-    assert getattr(flashinfer, name) is getattr(facade, name), name
-    assert getattr(flashinfer, name) is not getattr(flashinfer, DET_OF[name]), name
+@pytest.mark.parametrize("name", NONDET_NAMES)
+def test_top_level_binds_no_nondet_name(name: str) -> None:
+    assert not hasattr(flashinfer, name), name
+    assert name not in dir(flashinfer), name
 
 
 @pytest.mark.parametrize("name", TOP_LEVEL_DET)
@@ -487,7 +482,7 @@ def test_nondet_package_dir_lists_its_own_names() -> None:
 
 
 # Import forms in a fresh interpreter: the submodule path first, the attributes of
-# flashinfer, and a star import of the package.
+# flashinfer, a top-level import of a removed name, and a star import of the package.
 FRESH = {
     "submodule_first": (
         "import importlib\n"
@@ -500,9 +495,20 @@ FRESH = {
         "import sys\nimport flashinfer\n"
         f"assert flashinfer.{FACADE.rpartition('.')[2]} is sys.modules['{FACADE}']\n"
         f"assert flashinfer.{PACKAGE.rpartition('.')[2]} is sys.modules['{PACKAGE}']\n"
-        f"assert flashinfer.{PAIRS[0][0]} is sys.modules['{FACADE}'].{PAIRS[0][0]}\n"
+        f"assert not hasattr(flashinfer, '{PAIRS[0][0]}')\n"
         f"assert flashinfer.{PAIRS[0][1]} is sys.modules['{DET_FACADE}'].{PAIRS[0][1]}\n"
         f"assert not hasattr(sys.modules['{DET_FACADE}'], '{PAIRS[0][0]}')\n"
+    ),
+    "top_level_from_import_fails": (
+        "try:\n"
+        "    from flashinfer import cake_rmsnorm\n"
+        "except ImportError as e:\n"
+        "    assert 'cake_rmsnorm' in str(e), e\n"
+        "else:\n"
+        "    raise AssertionError('flashinfer.cake_rmsnorm still imports')\n"
+        "from flashinfer import cake_rmsnorm_det\n"
+        f"from {FACADE} import cake_rmsnorm\n"
+        "assert cake_rmsnorm is not cake_rmsnorm_det\n"
     ),
     "package_star_import": (
         "import importlib\n"
