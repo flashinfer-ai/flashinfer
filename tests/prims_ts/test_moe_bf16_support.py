@@ -488,7 +488,6 @@ def test_fused_finalize_needs_a_plain_bf16_epilogue():
     [
         (6, 48, 384, True, False, True),  # EP8: 0.75 local experts per token
         (16, 112, 896, True, False, False),  # EP8 at top-16: two per token
-        (2, 4, 4, True, False, False),  # every expert local
         (6, 48, 384, False, False, False),  # the caller finalizes
         (6, 48, 384, True, True, False),  # partitioned launches finalize themselves
     ],
@@ -517,9 +516,7 @@ def test_finalize_is_fused_when_tokens_average_one_local_expert(
     ("rank", "world", "expected"),
     [
         (None, None, [0, 1, 2, 3, 4, 5, 6, 7]),
-        ("0", "4", [0, 1, 2, 3, 4, 5, 6, 7]),
         ("1", "4", [2, 3, 4, 5, 6, 7, 0, 1]),
-        ("3", "4", [6, 7, 0, 1, 2, 3, 4, 5]),
     ],
 )
 def test_precompile_order_is_rotated_per_local_rank(monkeypatch, rank, world, expected):

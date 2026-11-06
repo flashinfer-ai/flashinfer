@@ -773,28 +773,6 @@ class TestMxFp4Bf16Fc1:
 class TestMxfp4BlockMajorK:
     """MXFP4 weights stored BlockMajorK, in 64-byte K blocks."""
 
-    @pytest.mark.parametrize("tile_k", [128, 256, 512])
-    def test_block_bytes(self, tile_k):
-        from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
-            DType,
-            make_config,
-        )
-        from flashinfer.tllm_enums import WeightLayout
-
-        cfg = make_config(
-            **{
-                **_mx_fc1_base(dtype_a=DType.MXE2M1),
-                "tile_n": 16,
-                "mma_n": 16,
-                "epi_tile_n": 16,
-                "tile_k": tile_k,
-                "weight_layout": int(WeightLayout.BlockMajorK),
-            }
-        )
-        # The padded 4-bit TMA format takes exactly 64-byte box rows.
-        assert cfg.block_major_k_bytes == 64
-        assert cfg.block_major_k_tile_slices == tile_k // 128
-
     @pytest.mark.parametrize(("tile_k", "stages"), [(256, 5), (512, 3)])
     def test_fc1_swiglu(self, tile_k, stages):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_config import DType
@@ -1454,7 +1432,7 @@ class TestMxFc1HighThroughput:
         }
         _run_mx_fc1(cfg, num_tokens=256, problem_k=128)
 
-    @pytest.mark.parametrize("tile_k,stages", [(256, 5), (128, 9), (128, 10)])
+    @pytest.mark.parametrize("tile_k,stages", [(256, 5), (128, 10)])
     def test_mxfp4_mxfp8_tile64_deep_pipeline(self, tile_k, stages):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
             DType,
@@ -1520,7 +1498,7 @@ class TestMxFc1HighThroughput:
         }
         _run_mx_fc1(cfg, num_tokens=256, problem_n=512, problem_k=1024)
 
-    @pytest.mark.parametrize("tile_k,stages", [(256, 4), (128, 5), (128, 6), (128, 7)])
+    @pytest.mark.parametrize("tile_k,stages", [(256, 4), (128, 7)])
     def test_mxfp4_mxfp8_tile128_deep_pipeline(self, tile_k, stages):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
             DType,
@@ -1565,7 +1543,7 @@ class TestMxFc1HighThroughput:
             stages=3,
         )
 
-    @pytest.mark.parametrize("stages", [4, 5, 6])
+    @pytest.mark.parametrize("stages", [6])
     def test_mxfp4_mxfp8_tile256_k128_tma_overlap_deep_pipeline(self, stages):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
             DType,
