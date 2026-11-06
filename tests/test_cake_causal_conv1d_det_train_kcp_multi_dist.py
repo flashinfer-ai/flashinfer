@@ -94,7 +94,9 @@ def _same(a: torch.Tensor, b: torch.Tensor) -> bool:
 
 
 def _setup(rank: int, W: int, row, port: int, local_id: int):
-    from flashinfer.experimental.cake_kda_det_train_kcp import cake_kcp_plan as plan
+    from flashinfer.experimental.cake.cake_kda_det_train_kcp import (
+        cake_kcp_plan as plan,
+    )
 
     lengths, _w, layout, Cs = row
     device = torch.device("cuda", local_id % max(torch.cuda.device_count(), 1))
@@ -104,7 +106,7 @@ def _setup(rank: int, W: int, row, port: int, local_id: int):
         os.environ.setdefault("MASTER_PORT", str(port))
         dist.init_process_group("nccl", rank=rank, world_size=W, device_id=device)
     part, cu = _partition(plan, lengths, W, layout)
-    ctx = plan.build_context_det_kcp(
+    ctx = plan.cake_kda_det_train_kcp_build_context(
         part, dist.group.WORLD, rank, device, conv_kernel_size=WIDTH
     )
     g = torch.Generator(device="cpu").manual_seed(7815)
