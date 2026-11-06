@@ -3187,6 +3187,9 @@ class GdnDecodeUCacheFlushKernel:
 # Requires SM90+ (TMA + mbarrier); K == V == 128.
 # ============================================================================
 
+# Strided calls reuse compiled kernels across batch and pool capacities.
+SUPPORTS_DYNAMIC_STRIDED_SHAPES = True
+
 _CACHE: dict = {}
 # Persistent pre-zeroed T=16 input staging buffers for the T<16 path, keyed by
 # (device, B, H, HK, HV, K, V, dtype, T). Reused across calls so short-T decode
@@ -3801,9 +3804,10 @@ def gated_delta_rule_mtp_ucache_flush(
     # B / pool_size are NOT in the key: the batch (mode-0) dim of every per-batch
     # tensor is marked shape-dynamic below, so one cubin serves all batch and pool
     # sizes (grid derives B from gH0idx at launch; the H0 TMA descriptor takes the
-    # pool extent at launch). mbp still varies with B, but only over <=4 buckets.
-    # Exception: the strided-qkv opt-in path passes non-compact q/k/v whose
-    # descriptors stay fully static, so it keeps B/pool in the key (fallback).
+    # pool extent at launch). mbp still varies with B, over at most six default
+    # buckets (2 through 7).
+    # Strided tensors keep their exact strides, but their leading extents are
+    # symbolic too. Pool capacity changes must not trigger another compilation.
     # HV/H/V_dim MUST be in the key: they are runtime Int32 kernel args, but the
     # compiled artifact bakes in the captured tensors' layouts (H0 TMA descriptor,
     # q/k/v/out head+feature strides — only the batch mode-0 dim is dynamic), so a
@@ -3827,16 +3831,14 @@ def gated_delta_rule_mtp_ucache_flush(
     )
     if not _pools_contig and _qkv_rs == 0:
         raise NotImplementedError(
-            "block-strided state pools require the static-descriptor mode: set "
+            "block-strided state pools require the strided-QKV mode: set "
             "SGLANG_GDN_WY_STRIDED_QKV=1 and pass q/k/v slices sharing a token "
             "stride (the compact-dynamic descriptors assume contiguous pools)."
         )
     if _qkv_rs > 0:
-        # Static descriptors bake tensor strides into the cubin: key on the
+        # Descriptors bake tensor strides into the cubin: key on the
         # pool layout too (paged vs dense pools must compile separately).
         cache_key = cache_key + (
-            B,
-            h0.shape[0],
             h0.stride(0),
             k_cache.stride(0),
             u_cache.stride(0),
@@ -3849,8 +3851,6 @@ def gated_delta_rule_mtp_ucache_flush(
         # dims static so the kernel keeps constexpr tile geometry. Requires a
         # compact (contiguous) tensor — every tensor below is either staged into
         # a contiguous buffer or .contiguous()'d by this wrapper.
-        if _qkv_rs > 0:
-            return mk(t, 16)  # strided fallback: fully static descriptor
         return mk(t, 16).mark_compact_shape_dynamic(
             mode=0, stride_order=tuple(range(t.dim())), divisibility=1
         )
@@ -3885,22 +3885,24 @@ def gated_delta_rule_mtp_ucache_flush(
         out16 = torch.empty(B, T_KERNEL, HV, V_dim, dtype=_io_dtype, device=device)
 
     stream = cuda.CUstream(torch.cuda.current_stream(device=device).cuda_stream)
-    args = [
-        mk_dyn(q),
-        mk_dyn(k),
-        mk_dyn(v),
-        mk_dyn(a),
-        mk_dyn(b),
-        mk(A_log, 16),
-        mk(dt_bias, 16),
-        mk_dyn(h0),
-        mk_dyn(initial_state_indices),
-        mk_dyn(k_cache),
-        mk_dyn(u_cache),
-        mk_dyn(g_cache),
-        mk_dyn(hist_len),
-        mk_dyn(cache_base),
-        mk_dyn(out16),
+    tensors = [
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        h0,
+        initial_state_indices,
+        k_cache,
+        u_cache,
+        g_cache,
+        hist_len,
+        cache_base,
+        out16,
+    ]
+    scalars = [
         scale,
         HV,
         V_dim,
@@ -3908,9 +3910,30 @@ def gated_delta_rule_mtp_ucache_flush(
         int(flush_min),
         stream,
     ]
+    args = (
+        tensors
+        if _qkv_rs > 0
+        else [mk(t, 16) if i in (5, 6) else mk_dyn(t) for i, t in enumerate(tensors)]
+    ) + scalars
 
     if cache_key not in _CACHE:
-        _CACHE[cache_key] = cute.compile[gdn_compile_options(device)](
+        compile_args = args
+        options = gdn_compile_options(device)
+        if _qkv_rs > 0:
+            # Only the leading extent varies. Static inner geometry and exact
+            # page strides preserve TMA and vector-load alignment. Explicit
+            # strides also avoid DLPack's singleton-stride canonicalization.
+            compile_args = [
+                cute.runtime.make_fake_tensor(
+                    mk(t, 16).element_type,
+                    shape=t.shape if i in (5, 6) else (cute.sym_int(), *t.shape[1:]),
+                    stride=t.stride(),
+                    assumed_align=16,
+                )
+                for i, t in enumerate(tensors)
+            ] + scalars
+            options = gdn_compile_options(device, cute.EnableTVMFFI(True))
+        _CACHE[cache_key] = cute.compile[options](
             GdnDecodeUCacheFlushKernel(
                 disable_state_update=True,
                 min_blocks_per_mp=mbp,
@@ -3921,7 +3944,7 @@ def gated_delta_rule_mtp_ucache_flush(
                 ab_t_stride=_ab_ts,
                 pdl_trigger=pdl_trigger,
             ),
-            *args,
+            *compile_args,
         )
     _CACHE[cache_key](*args)
 
@@ -3945,6 +3968,7 @@ def gated_delta_rule_mtp_ucache_flush(
 
 
 __all__ = [
+    "SUPPORTS_DYNAMIC_STRIDED_SHAPES",
     "gated_delta_rule_mtp_ucache_flush",
     "GdnDecodeUCacheFlushKernel",
     "K_DIM",

@@ -604,6 +604,124 @@ def test_strided_ab_matches_compact():
     )
 
 
+def test_strided_batch_and_pool_reuse(monkeypatch):
+    """Changing batch or pool capacity must reuse a stride-compatible kernel."""
+    _skip_if_not_sm90_or_later()
+    monkeypatch.setenv("GDN_WY_MBP", "1")  # Keep the launch tactic fixed.
+    monkeypatch.setenv("SGLANG_GDN_WY_NATIVE_AB", "1")
+    for name in (
+        "GDN_UCACHE_IO_DTYPE",
+        "GDN_UCACHE_STATE_DTYPE",
+        "GDN_UCACHE_RING_DTYPE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    mod = _load_flush_strided()
+    compiled = None
+
+    # Grow both extents, then exercise singleton descriptors. The last case
+    # changes the page stride and must compile a separate kernel.
+    for batch, capacity, padding in ((2, 4, 64), (3, 7, 64), (1, 1, 64), (2, 4, 128)):
+        case = _make_case(
+            batch,
+            [4, 13, 0][:batch],
+            torch.bfloat16,
+            torch.bfloat16,
+            seed=91,
+            bases=[28, 30, 0][:batch],
+        )
+        q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = case
+        # Use T=8 (draft length 7) with packed QKV and gate inputs.
+        qkv = torch.cat([x.flatten(2) for x in (q, k, v)], dim=-1).repeat(1, 2, 1)
+        q, k, v = [
+            x.view(batch, 8, heads, width)
+            for x, heads, width in zip(
+                qkv.split((H * K, H * K, HV * V), dim=-1),
+                (H, H, HV),
+                (K, K, V),
+                strict=True,
+            )
+        ]
+        ab = torch.cat((a, b), dim=-1).repeat(1, 2, 1)
+        a, b = ab.chunk(2, dim=-1)
+        idx.copy_(
+            torch.arange(capacity - batch, capacity, dtype=torch.int32, device=DEV)
+        )
+        initial, paged = [], []
+        for source in (pool, kc, uc, gc):
+            dense = torch.zeros(
+                capacity, *source.shape[1:], dtype=source.dtype, device=DEV
+            )
+            dense[-batch:].copy_(source)
+            view = torch.empty_strided(
+                dense.shape,
+                (dense.stride(0) + padding, *dense.stride()[1:]),
+                dtype=dense.dtype,
+                device=DEV,
+            )
+            view.copy_(dense)
+            initial.append(dense)
+            paged.append(view)
+
+        def run(pools, packed):
+            inputs = (q, k, v, a, b)
+            if not packed:
+                inputs = tuple(x.contiguous() for x in inputs)
+            q_, k_, v_, a_, b_ = inputs
+            return mod.gated_delta_rule_mtp_ucache_flush(
+                A_log,
+                a_,
+                dt_bias,
+                q=q_,
+                k=k_,
+                v=v_,
+                b=b_,
+                initial_state_source=pools[0],
+                initial_state_indices=idx,
+                k_cache=pools[1],
+                u_cache=pools[2],
+                g_cache=pools[3],
+                hist_len=hl,
+                cache_base=cb,
+                flush_min=9,
+                restart_hist_on_flush=False,
+                scale=SCALE,
+                backend="hmma",
+                output=torch.zeros_like(v_),  # Padding rows do not write output.
+            )
+
+        expected_pools = [x.clone() for x in initial]
+        expected = run(expected_pools, packed=False)
+        actual = run(paged, packed=True)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        for actual_pool, expected_pool in zip(paged, expected_pools, strict=True):
+            torch.testing.assert_close(actual_pool, expected_pool, rtol=0, atol=0)
+
+        strided = [value for key, value in mod._CACHE.items() if key[8] > 0]
+        assert len(strided) == (1 if padding == 64 else 2)
+        if compiled is None:
+            compiled = strided[0]
+        assert strided[0] is compiled
+
+        if batch == 3:
+            # Capture an existing specialization, then change tensor contents
+            # and slot IDs. Replay must read the new data through the same ABI.
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured = run(paged, packed=True)
+            qkv.mul_(0.75)
+            idx.copy_(idx.flip(0))
+            idx[-1] = -1  # Keep slots 6 and 5 valid, and pad the final row.
+            for destination, source in zip(paged, initial, strict=True):
+                destination.copy_(source)
+            expected_pools = [x.clone() for x in initial]
+            expected = run(expected_pools, packed=False)
+            graph.replay()
+            torch.testing.assert_close(captured, expected, rtol=0, atol=0)
+            for actual_pool, expected_pool in zip(paged, expected_pools, strict=True):
+                torch.testing.assert_close(actual_pool, expected_pool, rtol=0, atol=0)
+            assert len(mod._CACHE) == 2  # One compact and one strided kernel.
+
+
 def test_standalone_commit_guards_reject_silent_corruption_patterns():
     """The standalone-commit path (restart_hist_on_flush=True) mutates the
     cursors in place, so the wrapper must fail LOUDLY on the calling patterns
