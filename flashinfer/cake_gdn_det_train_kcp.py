@@ -74,7 +74,7 @@ forward and the backward and never retained.  Pass the same value to
 light / full, checkpoint, recompute handle, CUDA-graph replay, ring) supports it.
 
 The width-4 causal convolution with halo of the same partition is
-``flashinfer.cake_causal_conv1d_train.cake_causal_conv1d_kcp(x_local, weight, ctx)``
+``flashinfer.cake_causal_conv1d_det_train_kcp.cake_causal_conv1d_det_kcp(x_local, weight, ctx)``
 with this module's ``ctx``.
 """
 

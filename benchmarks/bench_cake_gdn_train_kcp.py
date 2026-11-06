@@ -15,7 +15,7 @@ limitations under the License.
 
 Benchmark of the context-parallel (KCP) Cake packed GDN training step on both numerical routes: one process per
 rank (``torchrun --nproc_per_node N``), every rank timing the module boundary of its fragments -- the KCP causal
-convolution (``flashinfer.cake_causal_conv1d_train.cake_causal_conv1d_kcp``, 10,240 channels; ``--no-conv`` leaves
+convolution (``flashinfer.cake_causal_conv1d_det_train_kcp.cake_causal_conv1d_det_kcp``, 10,240 channels; ``--no-conv`` leaves
 it out) followed by the KCP GDN step -- with CUDA events, the slowest rank's time counting for the iteration.
 
 Arms (``--arms``; every one on the same packed batch, the same partition and the same input storage):
@@ -128,7 +128,7 @@ if (
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import flashinfer  # noqa: E402
-from flashinfer import cake_causal_conv1d_train as conv_api  # noqa: E402
+from flashinfer import cake_causal_conv1d_det_train_kcp as conv_api  # noqa: E402
 
 BASE_ARMS = ("det", "nondet")
 # CUDA-graph replay arms: the route each one runs
@@ -694,7 +694,7 @@ def _forward_fn(
     options: Any,
     workspace: Any = None,
 ) -> Callable[..., tuple]:
-    conv = conv_api.cake_causal_conv1d_kcp
+    conv = conv_api.cake_causal_conv1d_det_kcp
 
     def forward(q, k, v, g, beta, x, w, handle=None):
         hk = {} if handle is None else {"recompute_handle": handle}

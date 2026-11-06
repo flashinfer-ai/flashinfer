@@ -989,27 +989,6 @@ def cake_causal_conv1d_det(
     )
 
 
-# Compatibility names of the entry points, bound to the same objects as the det names.  They are attributes, not
-# ``__all__`` entries.
-CakeCausalConv1dFunction = CakeCausalConv1dDetFunction
-cake_causal_conv1d = cake_causal_conv1d_det
-cake_causal_conv1d_train_backward = cake_causal_conv1d_det_train_backward
-cake_causal_conv1d_train_backward_workspace = (
-    cake_causal_conv1d_det_train_backward_workspace
-)
-cake_causal_conv1d_train_backward_workspace_bytes = (
-    cake_causal_conv1d_det_train_backward_workspace_bytes
-)
-cake_causal_conv1d_train_forward = cake_causal_conv1d_det_train_forward
-cake_causal_conv1d_train_forward_workspace = (
-    cake_causal_conv1d_det_train_forward_workspace
-)
-cake_causal_conv1d_train_forward_workspace_bytes = (
-    cake_causal_conv1d_det_train_forward_workspace_bytes
-)
-is_cake_causal_conv1d_train_supported = is_cake_causal_conv1d_det_train_supported
-
-
 __all__ = [
     "ARCHES",
     "BWD_GRID_MULTS",
