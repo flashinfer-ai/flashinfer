@@ -432,6 +432,85 @@ def test_each_supported_architecture_has_its_record_and_libraries():
     assert cake_jit.MODULES[sm107]["geometry"] == cake_jit.MODULES[sm103]["geometry"]
 
 
+def test_sm107_takes_the_sm103_rule_tables_except_the_long_chunk_ring():
+    """``sm_107a`` (R200, the ``sm_103a`` programs) takes the ``sm_103a`` entry of every per-architecture GEMM tile rule
+    table except ``DX_LONG_CHUNK_STAGES``: its chunks of ``>= DW_LONG_CHUNK_MIN_ROWS`` rows keep the 512-wide dX tile's
+    table ring.  At the same SM count (B300 148, R200 212 and 216) its plans are the ``sm_103a`` plans but for that
+    ring depth (the C 4096 plans are the same), and its record registers every form they launch.  The zero-gradient
+    row skip is not a GEMM tile rule: ``ZERO_DLOGP_MIN_ROWS_BY_ARCH`` has no ``sm_107a`` entry, so ``sm_107a`` keeps
+    the generic 4097-row floor."""
+    b = cake_backend
+    for table in (
+        b.RASTER_WIDE_GROUPS,
+        b.DW_LONG_CHUNK_GROUPS,
+        b.LOGITS_LONG_RASTER_GROUPS,
+        b.DW_BLOCK_GROUPS,
+        b.DW_CAST_TMA_MAX_ROWS,
+    ):
+        assert table["sm_107a"] == table["sm_103a"], table
+    for archs in (
+        b.DX_SPLIT_ARCHES,
+        b.DX_SPLIT_LONG_RING_ARCHES,
+        b.DX_SPLIT_WHOLE_ARCHES,
+        b.DX_SWAB_ARCHES,
+    ):
+        assert {"sm_103a", "sm_107a"} <= set(archs), archs
+    for table in (b.DX_SPLIT_WHOLE_FEW_CHUNKS_ARCHES, b.DX_WIDE_MIN_EFF):
+        assert "sm_103a" not in table and "sm_107a" not in table, table
+    assert b.DX_LONG_CHUNK_STAGES == {"sm_100a": 3, "sm_103a": 3}
+    assert "sm_107a" not in b.ZERO_DLOGP_MIN_ROWS_BY_ARCH
+    assert b.ZERO_DLOGP_MIN_ROWS_DEFAULT == 4097
+    sm107 = next(n for n, r in cake_jit.MODULES.items() if r["arch"] == "sm_107a")
+    registered = set(cake_jit.registered_stages(sm107))
+    g = b.Geometry.from_record({"geometry": {"hidden": 6144, "vocab": 154880}})
+    common = dict(
+        need_dx=True,
+        need_dw=True,
+        geometry=g,
+        dx_max_slices=4,
+        fuse_dw_cast=True,
+        dx_finalize=True,
+    )
+    long_ring = 0
+    for num_sms in (148, 212, 216):
+        for T, C, entry in (
+            (16231, 4096, "loss"),
+            (16231, 4096, "logprob"),
+            (65031, 4096, "logprob"),
+            (16231, 8192, "loss"),
+            (16231, 8192, "logprob"),
+        ):
+            case = (num_sms, T, C, entry)
+            problem = _keep_problem(T, 6144, 154880, C, entry=entry)
+            kw = dict(
+                common,
+                num_sms=num_sms,
+                dx_resident=num_sms // 2,
+                valid_rows=T,
+                logprob_dz=entry == "logprob",
+            )
+            p103 = b.make_plan(problem, arch="sm_103a", **kw)
+            p107 = b.make_plan(problem, arch="sm_107a", **kw)
+            assert p107.chunks == p103.chunks, case
+            assert p107.dx_slices == p103.dx_slices, case
+            assert not any(v.dx_stages for v in p107.variants), case
+            assert p107.variants == tuple(
+                dataclasses.replace(v, dx_stages=None) for v in p103.variants
+            ), case
+            if C <= b.DW_BLOCK_MAX_ROWS:
+                assert p107.variants == p103.variants, case
+                assert p107.stages == p103.stages, case
+            long_ring += sum(
+                v.dx_stages == b.DX_LONG_CHUNK_STAGES["sm_103a"] for v in p103.variants
+            )
+            assert not [s for s in p107.stages if "_st3" in s], case
+            assert set(p107.stages) <= registered, (
+                case,
+                sorted(set(p107.stages) - registered),
+            )
+    assert long_ring, "no C 8192 chunk took the sm_103a long-chunk ring"
+
+
 def _mode_calls(X, W, labels):
     """Every entry of the package that takes ``deterministic``, as ``name -> call(deterministic)`` on host tensors
     (the reference backend, so a call that passes the mode check computes on the CPU)."""
@@ -3379,8 +3458,8 @@ def test_device_loads_the_libraries_of_its_architecture():
 @pytest.mark.parametrize("stage", RED_STAGES)
 def test_device_every_reduction_form_runs_within_the_budgets(glm_weight, stage):
     """Every ``gemm_dx_red*`` form the running architecture registers and its tuning accepts (``gemm_dx_red_swab`` on
-    the ``DX_SWAB_ARCHES`` only: ``sm_107a`` registers it with the ``sm_103a`` stages, but no rule or pin selects it),
-    pinned at four K slices on a call of two whole 4096-row chunks: the launch record shows it launched on both, the
+    the ``DX_SWAB_ARCHES`` only: ``sm_103a`` and ``sm_107a``, which registers it with the ``sm_103a`` stages), pinned
+    at four K slices on a call of two whole 4096-row chunks: the launch record shows it launched on both, the
     outputs pass the deterministic suite's gates against the FP64 oracle, and ``loss`` / ``logp`` / ``dW`` are the
     deterministic package's bits."""
     _require_program(entry="loss")
@@ -7159,7 +7238,7 @@ def test_plan_counts_the_short_last_chunk_of_a_long_call():
     )
     rows = 15 * 4096 + 339
     problem = _keep_problem(65031, 6144, 154880, 4096, entry="logprob")
-    for arch in ("sm_100a", "sm_103a"):
+    for arch in ("sm_100a", "sm_103a", "sm_107a"):
         kw = dict(common, arch=arch)
         plain = cake_backend.make_plan(problem, valid_rows=rows, **kw)
         plan = cake_backend.make_plan(problem, valid_rows=rows, dcnt=True, **kw)

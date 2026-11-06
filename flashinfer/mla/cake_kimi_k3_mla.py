@@ -101,6 +101,12 @@ WIDE_MIN_TILES_PER_SPLIT = 2
 # SMs): 16384.  None (GB300, 152 SMs: pending its own measurement) or a missing SM count keeps
 # the shipped kernels.
 PERSISTENT_MAX_ITEM_KV = {148: 16384, 152: None}
+# Merge reducer classes (``reduce_warps_per_row`` of the plan's merge rows) that keep the shipped
+# kernels instead of the persistent wide route, per SM count.  B200 (148 SMs): single-warp reducer
+# plans (more than 1024 merge rows) keep the shipped kernels.  On one such shape the measurement
+# did not show the persistent route faster than the shipped kernels, so the class keeps them
+# until a separate measurement confirms a gain.
+PERSISTENT_SHIPPED_REDUCE_WARPS = {148: (1,)}
 # Per-wave fixed cost (prologue + drain of a work item) in 128-token tile periods.  Calibrated
 # on B200 (148 SMs: one wave of 305 tiles beat three waves of 99) and GB300 (152 SMs: one wave
 # of 9 splits over 298 tiles beat two full waves of 19 splits by 3 % on the 8-request H96 decode
@@ -393,12 +399,15 @@ def use_persistent_route(plan: AttentionPlan, sm_count: int, max_seq_len: int) -
     work) are fixed per item boundary, so the route also needs a tail plan (``nf > 0``: unsplit
     items whose boundaries overlap) and items no longer than ``PERSISTENT_MAX_ITEM_KV`` for the
     device's SM count (``max_seq_len``, the keys one unsplit item streams).  An SM count without a
-    value keeps the shipped kernels.
+    value keeps the shipped kernels, as does a plan whose merge reducer class is listed in
+    ``PERSISTENT_SHIPPED_REDUCE_WARPS`` for the SM count (``reduce_warps``).
     """
     if not plan.wide or not 2 <= plan.num_split <= REDUCE_WARP_MAX_SPLITS:
         return False
     max_item_kv = PERSISTENT_MAX_ITEM_KV.get(int(sm_count))
     if plan.n_full_items == 0 or max_item_kv is None or int(max_seq_len) > max_item_kv:
+        return False
+    if plan.reduce_warps in PERSISTENT_SHIPPED_REDUCE_WARPS.get(int(sm_count), ()):
         return False
     work = wide_work_clusters(plan)
     pairs = max(1, sm_count // WIDE_CLUSTER)

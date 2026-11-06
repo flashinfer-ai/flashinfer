@@ -8140,18 +8140,19 @@ def _mixlen_split(stock, args, kwargs):
         )
         <= capacity
     )
-    # "rng": one owner/helper part over the first..last long sequence, then the
-    # short head / tail parts, all on the caller stream.  "cc": one side-stream
-    # owner/helper part per run of long sequences, short runs on the caller stream.
+    # "rng": one side-stream owner/helper part over the first..last long
+    # sequence; the short head / tail parts run beside it on the caller stream.
+    # "cc": one side-stream owner/helper part per run of long sequences, short
+    # runs on the caller stream.
     if rng_fits:
         mode = "rng"
         plan = []
         if first > 0:
             plan.append((0, first - 1, False, 0))
-        plan.append((first, last, True, 0))
+        plan.append((first, last, True, 1))
         if last < num_seqs - 1:
             plan.append((last + 1, num_seqs - 1, False, 0))
-        # owner/helper part first, the short tails after it
+        # owner/helper part enqueued first, the short tails after it
         plan.sort(key=lambda part: not part[2])
     elif cc_fits:
         mode = "cc"
