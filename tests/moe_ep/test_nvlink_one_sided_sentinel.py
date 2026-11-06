@@ -1137,6 +1137,8 @@ def _landing_rows(comm) -> list:
 
 def _rounds_under_skew(fmt) -> list:
     """test_rounds_under_rank_skew, in the child process of every rank."""
+    import torch.distributed as dist
+
     g = _group()
     num_experts = 32 * g.world
     sentinel, fence = _pair(
@@ -1150,6 +1152,10 @@ def _rounds_under_skew(fmt) -> list:
         timeout_sec=_SKEW_TIMEOUT_SEC,
     )
     armed = [rows.clone() for rows in _landing_rows(sentinel)]
+    # Every rank holds its copy before a peer's first dispatch writes into
+    # these rows.
+    torch.cuda.synchronize()
+    dist.barrier()
     schedule = _skew_schedule(g.world)
 
     def inputs(offset):
