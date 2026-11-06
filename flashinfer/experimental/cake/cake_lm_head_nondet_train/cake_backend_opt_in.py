@@ -52,9 +52,9 @@ its budget still counts every valid row and its model adds the zero-weight
 rows' logp-only pass -- but not with ``num_valid_rows``: a caller-given count
 carries no split of the rows, so that form keeps every valid row in the chunk
 loop.  The
-entries take ``deterministic=False`` only and raise PyTorch's alert under
-torch's deterministic algorithms as :mod:`.cake_backend`'s do.  This module
-reads no environment variable.
+entries take ``deterministic=False`` only and, under torch's deterministic
+algorithms, raise PyTorch's alert before a K-sliced dX launch as
+:mod:`.cake_backend`'s do.  This module reads no environment variable.
 """
 
 from __future__ import annotations
@@ -108,7 +108,7 @@ from .cake_backend import (
     zero_weight_split,
     _OWNED_VALUES,
     _RECOUNT,
-    _alert_nondeterministic,
+    _alert_unordered_dx,
     _TemperatureGeometry,
     _assert_on_device,
     _carve,
@@ -1863,10 +1863,16 @@ class LmHeadLossRunner:
                     self.engine.run(key[0], self.values[key])
 
     def forward(self):
-        """Loss entry: ``(loss [1], logp [T])``; log-probability entry: ``(logp, lse)``."""
+        """Loss entry: ``(loss [1], logp [T])``; log-probability entry: ``(logp, lse)``.  The loss entry's forward
+        runs the dX GEMMs: under torch's deterministic algorithms a plan with a K-sliced dX chunk raises PyTorch's
+        alert first (:func:`.cake_backend._alert_unordered_dx`)."""
+        if self.problem.entry == "loss":
+            _alert_unordered_dx(self.plan, "LmHeadLossRunner.forward")
+        return self._forward()
+
+    def _forward(self):
+        """:meth:`forward` without the alert (the eager entries raise their own first)."""
         t = self.tensors
-        if self.problem.entry == "loss" and (self.plan.need_dx or self.plan.need_dw):
-            _alert_nondeterministic("LmHeadLossRunner.forward")
         self._run(self.forward_order)
         return (
             (t["loss"], t["logp"])
@@ -1880,15 +1886,20 @@ class LmHeadLossRunner:
         Loss entry: ``grad`` is the incoming scalar gradient (``None`` = 1);
         the saved accumulators are read, never written.  Log-probability
         entry: the caller has written ``dlogp`` into the bound ``dlogp``
-        tensor; ``grad`` must be ``None`` (the cast scale is 1).
+        tensor; ``grad`` must be ``None`` (the cast scale is 1).  The
+        log-probability entry's backward runs the dX GEMMs: under torch's
+        deterministic algorithms a plan with a K-sliced dX chunk raises
+        PyTorch's alert first (:func:`.cake_backend._alert_unordered_dx`);
+        the loss entry's backward (casts and the deferred weight-gradient
+        GEMM) has one fixed order and does not alert.
         """
+        if self.problem.entry == "logprob":
+            _alert_unordered_dx(self.plan, "LmHeadLossRunner.backward")
+        return self._backward(grad)
+
+    def _backward(self, grad: Optional[torch.Tensor] = None):
+        """:meth:`backward` without the alert (the eager entries raise their own first)."""
         t = self.tensors
-        if (
-            self.plan.need_dx or self.plan.need_dw
-            if self.problem.entry == "logprob"
-            else self.plan.need_dw and self.plan.dw_deferred
-        ):
-            _alert_nondeterministic("LmHeadLossRunner.backward")
         if self.problem.entry == "logprob":
             if grad is not None:
                 raise ValueError(
@@ -3892,8 +3903,6 @@ class ForwardResult(_BudgetResultState, _main._TemperatureResultState):
                 raise ValueError(
                     "memory_mode='budget' produces a BF16 weight gradient (grad_weight_dtype=torch.bfloat16)"
                 )
-            # the recompute runs weight-gradient GEMMs
-            _alert_nondeterministic("backward_loss")
             dx = (
                 None
                 if self.dx_acc is None
@@ -4168,8 +4177,6 @@ def forward_loss(
         deterministic=deterministic,
         entry="loss",
     )
-    if need_dx or need_dw:
-        _alert_nondeterministic("forward_loss")
     stream_mode = dw_stream_mode(dw_stream)
     tuning = _resolve_gemm_tuning(gemm_tuning)
     # read once: the binding key and the plan take the same settings
@@ -4343,6 +4350,7 @@ def forward_loss(
             key += (options["dw_rows"], True)  # a recompute form's plan options
         binding = cache.lookup(key)
         if binding is not None:
+            _alert_unordered_dx(binding.plan, "forward_loss")
             loss, logp, dx_acc, dw_acc, deferred, row_state = binding.forward(
                 X,
                 W,
@@ -4404,6 +4412,7 @@ def forward_loss(
         **common,
         **(options or {}),
     )
+    _alert_unordered_dx(runner.plan, "forward_loss")
     if backend == "cake":
         # The first call launches through the templated binding too: its per-call temporaries come from the caching
         # allocator, so the deferred ``dz`` rows keep the chunk buffer alive and nothing else -- a view into the
@@ -4428,7 +4437,7 @@ def forward_loss(
         )
         memory, plan = binding.memory, binding.plan
     else:
-        loss, logp = runner.forward()
+        loss, logp = runner._forward()
         dx_acc, dw_acc = runner.dx_acc, runner.dw_acc
         deferred = _deferred_operands(runner.plan, runner.tensors)
         row_state = _row_state(runner.plan, runner.tensors)
@@ -5497,10 +5506,11 @@ def backward_loss(
     scale-cast-scatter of the compact rows (:func:`finalize_dx`); without it the compact rows are cast,
     then scattered into a zero BF16 ``[T, H]``.  Both give the same bits.  ``gemm_tuning`` (default
     :func:`gemm_tuning_default`; ``ForwardResult.gemm_tuning``): the forward's explicit GEMM knobs, which pin the
-    deferred weight-gradient GEMM's form (:func:`dw_cast`).  The deferred weight-gradient GEMM raises PyTorch's
-    alert under torch's deterministic algorithms (:func:`cake_backend._alert_nondeterministic`)."""
-    if dz_last is not None:
-        _alert_nondeterministic("backward_loss")
+    deferred weight-gradient GEMM's form (:func:`dw_cast`).
+
+    This call continues a :func:`forward_loss` call of this package (which checked the mode) and takes no
+    ``deterministic``; pass it only that call's accumulators and operands.  Its launches (the casts and the deferred
+    weight-gradient GEMM) have one fixed order: no alert under torch's deterministic algorithms."""
     dx = None
     if dx_acc is not None:
         if row_index is not None and num_rows is None:
@@ -5736,8 +5746,6 @@ def backward_logprob(
         deterministic=deterministic,
         entry="logprob",
     )
-    if need_dx or need_dw:
-        _alert_nondeterministic("backward_logprob")
     stream_mode = dw_stream_mode(dw_stream)
     tuning = _resolve_gemm_tuning(gemm_tuning)
     dz_arm = _resolve_logprob_dz(logprob_dz)
@@ -5853,6 +5861,7 @@ def backward_logprob(
             )  # a budget form's accumulated rows (:attr:`Plan.dw_rows`)
         binding = cache.lookup(key)
         if binding is not None:
+            _alert_unordered_dx(binding.plan, "backward_logprob")
             dx, dw = binding.backward_logprob(
                 X, W, labels, lse, dlogp, row_index, hc, stream_mode, fill_side
             )
@@ -5880,6 +5889,7 @@ def backward_logprob(
         _template_only=backend == "cake" and hc is not None,
         dx_rule=rule,
     )
+    _alert_unordered_dx(runner.plan, "backward_logprob")
     if hc is not None:
         binding = _Binding.from_runner(runner, hc)
         del runner
@@ -5889,7 +5899,7 @@ def backward_logprob(
             X, W, labels, lse, dlogp, row_index, hc, stream_mode, fill_side
         )
         return finish_dx(dx), dw
-    dx, dw = runner.backward()
+    dx, dw = runner._backward()
     if key is not None:
         cache.remember(key, _Binding.from_runner(runner))
     # the runner's chunk workspace is not needed by the dX finalize: dropped before its output is allocated
@@ -6152,8 +6162,6 @@ def backward_logprob_temperature(
         deterministic=deterministic,
         entry="logprob",
     )
-    if need_dx or need_dw:
-        _alert_nondeterministic("backward_logprob_temperature")
     if temperature_rows is not None and temperature is not None:
         raise ValueError(
             "pass the forward's temperature_rows or the call's temperature, not both"
@@ -6301,6 +6309,7 @@ def backward_logprob_temperature(
             key = temperature_binding_key(key)
         binding = cache.lookup(key)
         if binding is not None:
+            _alert_unordered_dx(binding.plan, "backward_logprob_temperature")
             dx, dw = (
                 cast(_TemperatureBinding, binding).backward_logprob(
                     X,
@@ -6344,6 +6353,7 @@ def backward_logprob_temperature(
         _template_only=backend == "cake" and hc is not None,
         dx_rule=rule,
     )
+    _alert_unordered_dx(runner.plan, "backward_logprob_temperature")
     if hc is not None:
         binding = _TemperatureBinding.from_runner(runner, hc)
         del runner
@@ -6353,7 +6363,7 @@ def backward_logprob_temperature(
             X, W, labels, lse, dlogp, row_index, hc, stream_mode, fill_side
         )
         return finish_dx(dx), dw
-    dx, dw = runner.backward()
+    dx, dw = runner._backward()
     if key is not None:
         cache.remember(key, _TemperatureBinding.from_runner(runner))
     # the runner's chunk workspace is not needed by the dX finalize: dropped before its output is allocated
@@ -6632,9 +6642,6 @@ class ChunkedLmHeadLossFunction(torch.autograd.Function):
         else:
             mplan = None  # the fast form, or a budget form without a recompute: the weight gradient as before
             dz_last, x_last, x_src, x_idx = saved
-        if mplan is not None or dz_last is not None:
-            # this backward runs weight-gradient GEMMs
-            _alert_nondeterministic("backward_loss")
         # the operations of :func:`backward_loss`, with the saved state released as soon as it is used
         dx = None
         if ctx.dx_acc is not None:

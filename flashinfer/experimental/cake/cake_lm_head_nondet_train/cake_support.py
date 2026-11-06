@@ -81,9 +81,11 @@ deterministic, no synchronization.  The programs of these entries are the determ
 vocabulary block and the sparse split) except the dense dX: its blocks add into the chunk sum through
 the reduction form of the dX GEMM, bitwise the deterministic dX at one K slice and an unordered FP32
 sum of the slices above one.  As part of the non-deterministic package the entries take
-``deterministic=False`` only (any other value is a ``ValueError``), make no run-to-run bitwise promise
-for the gradients, and their backward raises PyTorch's alert under torch's deterministic algorithms
-(:func:`cake_backend._alert_nondeterministic`).  The device bytes of a step by bucket: :func:`support_memory_report`.  A token
+``deterministic=False`` only (any other value is a ``ValueError``) and make no run-to-run bitwise promise for the
+gradients.  Under torch's deterministic algorithms the
+backward raises PyTorch's alert (:func:`cake_backend._alert_nondeterministic`) when its dense dX runs a block of more
+than one K slice (:func:`_dense_dx_unordered`; only inside a cell of :data:`SUPPORT_DX_SLICE_CELLS`), before its first
+launch; every other backward has one fixed order and does not alert.  The device bytes of a step by bucket: :func:`support_memory_report`.  A token
 of two or more candidates that no upstream reaches gets ``dX = +0`` for finite ``W`` (``+0`` times its
 rows), as the reference backend does.
 """
@@ -1395,6 +1397,23 @@ def _dense_logits(
             )
 
 
+def _dense_dx_unordered(cx: _Cake, plan: SupportPlan, problem: SupportProblem) -> bool:
+    """Whether the dense dX pass of a backward (:func:`_dense_backward`) runs a vocabulary block of more than one K
+    slice (:func:`support_dx_form`), whose slices add into the chunk sum in the order they finish: the host rule over
+    the pass's token chunks and vocabulary blocks, no launch.  ``False`` for the sparse dX pass, ``T == 0`` and a call
+    without a pair (they launch no dense dX)."""
+    T, H, V, M = problem.num_rows, problem.hidden, problem.vocab, problem.num_pairs
+    if plan.dx != "dense" or T == 0 or M == 0:
+        return False
+    k_block = int(cx.geometry.k_block)
+    blocks = _blocks(V, plan.vocab_block)
+    return any(
+        support_dx_form(rows_c, H, width // k_block, cx.num_sms, cx.arch)[0] > 1
+        for _, rows_c in _blocks(T, min(plan.dense_chunk, T))
+        for _, width in blocks
+    )
+
+
 def _dense_backward(
     cx: _Cake,
     plan: SupportPlan,
@@ -2069,7 +2088,15 @@ class SupportLogprobFunction(torch.autograd.Function):
         need_dx, need_dw = bool(ctx.needs_input_grad[0]), bool(ctx.needs_input_grad[1])
         if (g is None and d is None and e is None) or not (need_dx or need_dw):
             return (None, None) + rest
-        _alert_nondeterministic("SupportLogprobFunction.backward")
+        if (
+            ctx.backend == "cake"
+            and need_dx
+            and torch.are_deterministic_algorithms_enabled()
+            and _dense_dx_unordered(*ctx.cake, problem)
+        ):
+            # before the backward's first launch: its dense dX adds K slices in the order they finish (torch's flag
+            # read first: outside its deterministic algorithms the slice rule is not evaluated)
+            _alert_nondeterministic("SupportLogprobFunction.backward")
         T, H, V = problem.num_rows, problem.hidden, problem.vocab
         if T == 0:
             (X,) = ctx.saved_tensors
