@@ -7505,7 +7505,7 @@ def _cute_dsl_gemm_mxfp8_sm107_runner(out_dtype: torch.dtype):
     return CuteDSLMxfp8Sm107GemmRunner()
 
 
-_CUTE_DSL_BMM_MXFP8_SM107_KERNEL_CACHE: dict[tuple, tuple] = {}
+_CUTE_DSL_BMM_MXFP8_SM107_KERNEL_CACHE: dict[tuple, Callable[..., Any]] = {}
 
 
 def _bmm_mxfp8_sm107_out_scale_geometry(
@@ -13450,7 +13450,7 @@ def _cute_dsl_bmm_mxfp8_requirement(
         return False
     if m % 128 != 0 or n % 128 != 0 or A.stride(1) % 16 != 0 or A.stride(0) % 16 != 0:
         return False
-    if A.data_ptr() % 16 != 0 or B.data_ptr() % 16 != 0:
+    if any(t.data_ptr() % 16 != 0 for t in (A, B, A_scale, B_scale)):
         return False
     # The kernel reads the scales from their data pointers as 128x4-swizzled bytes
     if not (A_scale.is_contiguous() and B_scale.is_contiguous()):
