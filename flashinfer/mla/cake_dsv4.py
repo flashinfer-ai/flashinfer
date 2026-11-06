@@ -2165,6 +2165,22 @@ _KV4_SIBLING_ROUTES = frozenset({"fp8_h64_prefill_source_persistent_m64_multi_ti
 # (:func:`_kv4_sibling_launchable`, :func:`_kv4_variant`).
 _KV4_SIBLING_OVERSIZED_SMEM_BYTES = {"sm_107a": 322688}
 
+# The routes with an early-PV sibling ``<route>_overlap`` on SM107: the route's
+# program whose P x V MMAs start once the softmax has written the low half of
+# P and whose epilogues drain the output of the first V block while the MMA of
+# the second one runs, with the route's arguments, grid and launch and the
+# same output bits.  It takes the launches of at most the row ceiling below;
+# the larger launches keep the route's program.
+_OVERLAP_SIBLING_ROUTES = frozenset({"fp8_lowhead_prefill"})
+
+# The most query rows a launch may have to take the early-PV sibling, per
+# architecture, and the SM count of the part that measured it.  A part with
+# fewer SMs scales the ceiling down with its SM count, which keeps the
+# measured share of busy SMs (two CTAs per row); a part with more SMs keeps
+# the measured ceiling (:func:`_overlap_variant`).
+_OVERLAP_SIBLING_MAX_TOKENS = {"sm_107a": 64}
+_OVERLAP_SIBLING_MEASURED_SMS = {"sm_107a": 216}
+
 # The CUDA toolkit and runtime (``cudaRuntimeGetVersion``) version that added
 # the oversized shared-memory mode, and the driver's device attribute for its
 # ceiling (CU_DEVICE_ATTRIBUTE_MAX_OVERSIZED_SHARED_MEMORY_PER_BLOCK).
@@ -2322,6 +2338,34 @@ def _fp8_h64_kv4_edges(
         and arch is not None
         and _kv4_variant(route, arch=arch, device=device) != route
     )
+
+
+def _overlap_variant(
+    route: str, *, arch: str, num_query_tokens: int, device: torch.device
+) -> str:
+    """The variant a launch of ``route`` over ``num_query_tokens`` rows on
+    ``device`` runs: its early-PV sibling when ``route`` is in
+    ``_OVERLAP_SIBLING_ROUTES``, ``arch`` has a ceiling in
+    ``_OVERLAP_SIBLING_MAX_TOKENS``, the launch has at most that many rows
+    scaled by the device's SM count up to ``_OVERLAP_SIBLING_MEASURED_SMS``
+    (64 rows at 216 SMs, 62 at 212, 61 at 208) and ``arch`` routes the sibling
+    to a program other than the route's, else ``route``."""
+    if route not in _OVERLAP_SIBLING_ROUTES:
+        return route
+    max_tokens = _OVERLAP_SIBLING_MAX_TOKENS.get(arch)
+    if max_tokens is None:
+        return route
+    measured_sms = _OVERLAP_SIBLING_MEASURED_SMS[arch]
+    sm_count = min(_device_sm_count(device), measured_sms)
+    if num_query_tokens > max_tokens * sm_count // measured_sms:
+        return route
+    from ..jit.cake_dsv4 import VARIANTS
+
+    programs = VARIANTS.get(arch, {})
+    sibling = f"{route}_overlap"
+    if programs.get(sibling, programs.get(route)) == programs.get(route):
+        return route
+    return sibling
 
 
 def _pdl_variant(
@@ -2632,6 +2676,12 @@ def run_cake_dsv4(
     metadata rows over items 1025-1152 wide (``_K64_SPLIT_RULES``) run a
     split-KV producer and a merge when the workspace holds their carve
     (:func:`_k64_split`; :func:`cake_dsv4_workspace_requirement` includes it).
+
+    On SM107 the FP8 low-head prefill route runs launches of at most 64 query
+    rows (fewer on a part with fewer than 216 SMs) on its early-PV sibling and
+    the larger ones on its own program (``_overlap_variant``).  Each program
+    builds and loads its module on its first launch: warm up launches on both
+    sides of that ceiling eagerly before a capture.
 
     ``out=None`` allocates the output here, after the route is known, so the
     routes in ``_OUT_PHASE_BY_ROUTE`` get their measured-fast base phase;
@@ -3135,11 +3185,19 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
     ):
         # One producer partition writes the final output directly.  The
         # prefill producer runs one CTA per work item over two items per
-        # token; the decode producers run one two-CTA cluster per token.
+        # token; the decode producers run one two-CTA cluster per token.  SM107
+        # runs the prefill producer's launches up to a row ceiling on its
+        # early-PV sibling (_overlap_variant).
         work_items = 2 * T if route == "fp8_lowhead_prefill" else T
+        program = _overlap_variant(
+            route, arch=L.arch, num_query_tokens=T, device=v["Q"].device
+        )
         L.run(
             L.variant(
-                route, grid=(2 * T, 1, 1), total_work_items=work_items, **L.partials(1)
+                program,
+                grid=(2 * T, 1, 1),
+                total_work_items=work_items,
+                **L.partials(1),
             )
         )
         return
