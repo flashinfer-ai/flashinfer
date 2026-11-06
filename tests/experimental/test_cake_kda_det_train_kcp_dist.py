@@ -12,7 +12,7 @@ limitations under the License.
 
 Multi-GPU rows of the context-parallel (KCP) KDA training route (``cake_kda_det_train_kcp.cake_kcp``): ``W`` ranks over
 NCCL, each holding the fragments of one partition of a packed batch, compared with the exact FP64 per-document
-recurrence of the same operands (``tests/test_helpers/cake_kda_train_reference``) and with one another (saved ==
+recurrence of the same operands (``tests/test_helpers/cake_kda_det_train_reference``) and with one another (saved ==
 replay, repeat, autograd == explicit, checkpoint == direct, document-alone == slice, graph replay == eager with
 every rank capturing the same calls).
 
@@ -41,7 +41,7 @@ from tests.test_helpers.cake_kda_train_kcp_saved import (
     poison_unwritten_carry,
     written_tensors,
 )
-from tests.test_helpers.cake_kda_train_reference import (
+from tests.test_helpers.cake_kda_det_train_reference import (
     GRAD_NAMES,
     kda_exact_with_grads,
     make_inputs,
