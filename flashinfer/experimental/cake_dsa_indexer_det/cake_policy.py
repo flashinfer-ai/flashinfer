@@ -50,7 +50,7 @@ wrong choice costs time, not correctness.
 
 The opt-in FP8 input form (float8_e4m3fn ``q`` / ``k``) has its own scan
 programs, keyed ``scan:<kind>:u<unroll>:s0:f1:fp8[:lsf]``, for the narrow, l6
-and split kinds, and on sm_103a the wide kind.  An FP8 call runs the same
+and split kinds, and on sm_100a / sm_103a the wide kind.  An FP8 call runs the same
 decision procedure under the architecture's FP8 record (``fp8_policy_record``:
 the ``POLICY`` record with the fields of the registry's ``POLICY_FP8`` record
 replaced) and then the registered FP8 program of the decided kind, or of its
@@ -158,8 +158,8 @@ MERGE_KEY = "merge"
 BF16 = "bf16"
 FP8 = "fp8"
 FORMS = (BF16, FP8)
-# The FP8 scan programs exist for the narrow, l6 and split kinds, and on sm_103a the wide kind, with no snake order and
-# in the sampled-fit form.  An FP8 call runs the decision procedure of ``select_program`` under the FP8 record
+# The FP8 scan programs exist for the narrow, l6 and split kinds, and on sm_100a / sm_103a the wide kind, with no snake
+# order and in the sampled-fit form.  An FP8 call runs the decision procedure of ``select_program`` under the FP8 record
 # (``fp8_policy_record``); a decided kind without an FP8 program runs the FP8 program of its fallback kind below
 # (unpaired; the same unit geometry where it has one, except that a CTA-pair wide unit runs l6).  An unpaired, unsplit
 # wide unit (8 queries) runs the FP8 wide program where the architecture registers one; else it, and a CTA-pair wide
