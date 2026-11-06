@@ -6,6 +6,7 @@ reuse, ragged KV), plus CUDA-Graph replay with a changed page table, row-strided
 views on a row-tile route and on the wide route, the route selection and the split planners.
 """
 
+import dataclasses
 import math
 
 import pytest
@@ -652,13 +653,15 @@ def test_wide_tail_plan(clusters, max_seq_len, sm_count, expected):
 # Persistent wide route (main_wide_persistent + reduce_w<N>_tile_flags)
 # ---------------------------------------------------------------------------
 
-# (batch, q_len, num_heads, kv): wide tail plans on both sides of the item-length bound and a
-# uniform plan.  On 148 SMs: (1, 1024, 12, 8192) and (7, 256, 12, 12288) take the persistent
-# route; (5, 256, 24, 24576) streams items longer than PERSISTENT_MAX_ITEM_KV and
-# (1, 1024, 12, 16384) is a uniform plan (no unsplit item), so both keep the shipped kernels.
+# (batch, q_len, num_heads, kv): wide tail plans on both sides of the item-length bound and of
+# the reducer class, and a uniform plan.  On 148 SMs: (13, 64, 12, 8192) and (13, 128, 12, 10240)
+# merge on the two-warp reducer and take the persistent route; (1, 1024, 12, 8192) merges on the
+# single-warp reducer, (5, 256, 24, 24576) streams items longer than PERSISTENT_MAX_ITEM_KV and
+# (1, 1024, 12, 16384) is a uniform plan (no unsplit item), so these keep the shipped kernels.
 PERSISTENT_CASES = [
+    (13, 64, 12, 8192),
+    (13, 128, 12, 10240),
     (1, 1024, 12, 8192),
-    (7, 256, 12, 12288),
     (5, 256, 24, 24576),
     (1, 1024, 12, 16384),
 ]
@@ -684,14 +687,36 @@ def _persistent_route(batch, q_len, num_heads, kv, sm_count):
 
 
 def test_persistent_route_predicate():
-    from flashinfer.mla.cake_kimi_k3_mla import PERSISTENT_MAX_ITEM_KV
+    from flashinfer.mla.cake_kimi_k3_mla import (
+        PERSISTENT_MAX_ITEM_KV,
+        PERSISTENT_SHIPPED_REDUCE_WARPS,
+        use_persistent_route,
+    )
 
     assert PERSISTENT_MAX_ITEM_KV[148] == 16384
-    # Tail plans (unsplit full waves, split last wave) with a second round and idle pairs.
-    for shape in ((4, 1024, 12, 8192), (1, 1024, 12, 8192), (13, 256, 12, 16384)):
+    assert PERSISTENT_SHIPPED_REDUCE_WARPS == {148: (1,)}
+    # Tail plans (unsplit full waves, split last wave) with a second round and idle pairs whose
+    # merge runs on the two-warp reducer.
+    for shape in ((13, 64, 12, 8192), (13, 128, 12, 8192), (13, 128, 12, 10240)):
         plan, routed = _persistent_route(*shape, 148)
         assert plan.wide and plan.n_full_items > 0 and 2 <= plan.num_split <= 32
+        assert plan.reduce_kind == "reduce_w2", (shape, plan.reduce_kind)
         assert routed, shape
+    # The same tail-plan conditions with a single-warp reducer (more than 1024 merge rows) keep
+    # the shipped kernels on 148 SMs; the reducer class alone decides.
+    for shape in (
+        (4, 1024, 12, 8192),
+        (1, 1024, 12, 8192),
+        (13, 256, 12, 16384),
+        (15, 64, 24, 16384),
+    ):
+        plan, routed = _persistent_route(*shape, 148)
+        assert plan.wide and plan.n_full_items > 0 and 2 <= plan.num_split <= 32
+        assert plan.reduce_kind == "reduce_w1", (shape, plan.reduce_kind)
+        assert not routed, shape
+        for warps in (2, 4):
+            other = dataclasses.replace(plan, reduce_warps=warps)
+            assert use_persistent_route(other, 148, shape[3]), (shape, warps)
     # Items longer than the bound, uniform plans, row tiles and an SM count without a bound keep
     # the shipped kernels.
     for shape, sm_count in (
@@ -700,6 +725,7 @@ def test_persistent_route_predicate():
         ((8, 2, 96, 342305), 148),
         ((1, 1, 12, 40000), 148),
         ((4, 1024, 12, 8192), 160),
+        ((13, 64, 12, 8192), 152),
     ):
         assert not _persistent_route(*shape, sm_count)[1], (shape, sm_count)
 
