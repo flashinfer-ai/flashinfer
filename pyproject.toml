@@ -22,7 +22,7 @@ authors = [{ name = "FlashInfer team" }]
 license = "Apache-2.0"
 readme = "README.md"
 urls = { Homepage = "https://github.com/flashinfer-ai/flashinfer" }
-license-files = ["LICENSE", "LICENSE*.txt", "licenses/LICENSE.kda-for-kda", "licenses/LICENSE.cudnn-frontend-MIT.txt"]
+license-files = ["LICENSE", "NOTICE", "LICENSE*.txt", "licenses/LICENSE.kda-for-kda", "licenses/LICENSE.cudnn-frontend-MIT.txt", "licenses/LICENSE.batch-invariant-ops.txt"]
 
 [project.optional-dependencies]
 b12x = ["torch>=2.12.0", "nvidia-cutlass-dsl[cu13]>=4.8.0", "rich>=13", "safetensors>=0.6"]
@@ -82,6 +82,7 @@ exclude = [
 "flashinfer.data.cccl" = "3rdparty/cccl"
 
 [tool.setuptools.package-data]
+"flashinfer.experimental.hc_sum_sm100" = ["csrc/**", "README.md", "SOURCES.md"]
 "flashinfer.experimental.b12x.comm.roce" = ["*.c"]
 "flashinfer.experimental.b12x.loader" = ["*.c", "*.h"]
 # Cake-exported packages (flashinfer-ai/flashinfer#6553): the generated csrc tree plus the
