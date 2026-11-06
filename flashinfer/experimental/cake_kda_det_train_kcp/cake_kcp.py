@@ -301,6 +301,7 @@ from __future__ import annotations
 import ctypes
 import dataclasses
 import functools
+import operator
 import types
 import warnings
 import weakref
@@ -2148,13 +2149,52 @@ def _scratch_tables(local: Any) -> dict[str, torch.Tensor]:
     return tables
 
 
+# (record, arch) -> [cake_jit.load, cake_jit.MODULES, fetch, grid axes, FFI entry or None] of _launch_record_trim
+_LAUNCH_PLANS: dict[tuple[str, str], list[Any]] = {}
+
+
+def _launch_plan(name: str, arch: str) -> list[Any]:
+    """The launch plan of record ``name`` on ``arch`` for :func:`_launch_record_trim`: where every grid argument
+    follows the logical ones in the record's argument plan, an ``operator.itemgetter`` of the logical names (in plan
+    order) and the grid axes after them (``fetch=None`` keeps the loop otherwise); the FFI entry is filled in by the
+    first launch that gets its arguments (``cake_jit.load`` is cached per (record, arch): the same object on every
+    launch)."""
+    order = cake_jit._argument_plan(name)
+    names = [logical for logical, _ in order if logical is not None]
+    axes = tuple(axis for logical, axis in order if logical is None)
+    trailing = all(logical is None for logical, _ in order[len(names) :])
+    fetch = operator.itemgetter(*names) if trailing and len(names) >= 2 else None
+    plan = [cake_jit.load, cake_jit.MODULES, fetch, axes, None]
+    _LAUNCH_PLANS[(name, arch)] = plan
+    return plan
+
+
 def _launch_record_trim(
     local: Any, name: str, grid: tuple[int, int, int], values: dict[str, Any]
 ) -> None:
     """Trimmed host path: ``cake_jit.run_module(name, values, grid=grid, device_index=local.device_index)`` with the
     launch inlined -- the record's argument plan (cached by cake_jit), the arena's cached arch, the raw-stream FFI
-    context.  Same record, same grid, same positional arguments, same stream as ``local.run``."""
+    context.  Same record, same grid, same positional arguments, same stream as ``local.run``.  The record's launch
+    plan (:func:`_launch_plan`: its FFI entry and one fetch of its logical arguments) is built once per (record,
+    architecture) while ``cake_jit``'s ``load`` / ``MODULES`` stay the same objects; a missing logical argument
+    raises as the loop below does."""
     jit = cake_jit
+    plan = _LAUNCH_PLANS.get((name, local.arch))
+    if plan is None or plan[0] is not jit.load or plan[1] is not jit.MODULES:
+        plan = _launch_plan(name, local.arch)
+    if plan[2] is not None:
+        try:
+            args = [*plan[2](values), *(int(grid[axis]) for axis in plan[3])]
+        except KeyError:
+            args = None  # the loop below names the missing argument
+        if args is not None:
+            if plan[4] is None:
+                plan[4] = getattr(
+                    jit.load(name, local.arch), jit.MODULES[name]["ffi_entry"]
+                )
+            with _ffi_stream(local.device_index):
+                plan[4](*args)
+            return
     record = jit.MODULES[name]
     args = []
     for logical_name, axis in jit._argument_plan(name):
