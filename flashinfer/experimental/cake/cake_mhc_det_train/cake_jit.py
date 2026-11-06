@@ -9007,7 +9007,7 @@ FWD_MAP_XNRM = {
     "sm_103a": ((64, 6144),),
     "sm_107a": ((64, 14928), (15288, 65536)),
 }
-# FWD_MAP_XNRM_PATHS (r11 private probe): extra _xn bands per architecture and call path (cake_jit.PDL_PATHS);
+# FWD_MAP_XNRM_PATHS: extra _xn bands per architecture and call path (as PDL_PATHS);
 # the forward path runs fwd_prepare, the checkpoint path fwd_recompute. H 4096 only.
 FWD_MAP_XNRM_PATHS: dict[str, dict[str, tuple[tuple[int, int], ...]]] = {
     "sm_100a": {"checkpoint": ((7168, 7680),)},
@@ -9330,7 +9330,7 @@ BWD_DPL_BANDS = {
     "sm_103a": (),
     "sm_107a": (),
 }
-# BWD_DPL_PATHS (r11 private probe): extra _dpl bands per architecture and call path (backward / checkpoint:
+# BWD_DPL_PATHS: extra _dpl bands per architecture and call path (backward / checkpoint:
 # both run bwd_finish). H 4096 only.
 BWD_DPL_PATHS: dict[str, dict[str, tuple[tuple[int, int], ...]]] = {
     "sm_100a": {
@@ -9698,7 +9698,7 @@ def fwd_map_program(
         and int(hidden) == HIDDEN
         and not program.endswith("_xn")
         and _in_bands(T, FWD_MAP_XNRM_PATHS.get(arch, {}).get(path, ()))
-    ):  # r11 probe: the X loads hinted on this call path only
+    ):  # the X loads hinted on this call path only
         program += "_xn"
     return program
 
@@ -9834,7 +9834,7 @@ def bwd_slab_program(
                 and _in_bands(T, BWD_DPL_PATHS.get(arch, {}).get(path, ()))
             )
         )
-    ):  # the dfn_part partials kept in L2 for the final reduction (r11 probe: + the call path's bands)
+    ):  # the dfn_part partials kept in L2 for the final reduction (+ the call path's bands)
         program += "_dpl"
     return program
 
@@ -10343,7 +10343,7 @@ SELECT_RULE_KINDS = (
 # record: a call at another count needs the role's run-time-count record.
 RUN_TIME_ITERS_ROLES = ("fwd_coef", "bwd_token")
 # The host rules a ``program`` selection rule may name (the record's program key must equal the rule's value).
-# r11 probe: the program rules that read the call path
+# the program rules that read the call path
 PATH_PROGRAM_RULES = ("fwd_map_program", "bwd_slab_program", "bwd_reduce_program")
 PROGRAM_RULES = (
     "fwd_map_program",
