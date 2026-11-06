@@ -4310,10 +4310,10 @@ def test_device_dw_stream_modes(glm_weight):
 
 def test_device_fresh_thread_and_preload(glm_weight):
     """A call from a thread that never called the package before forms that thread's state (side
-    streams, count cells) and gives the main thread's ``loss`` / ``logp`` / ``dW`` bits; ``chunked_lm_head_preload(
-    deterministic=False)`` forms the calling thread's state ahead of its first call."""
+    streams, count cells) and gives the main thread's ``loss`` / ``logp`` / ``dW`` bits;
+    ``cake_lm_head_nondet_train_preload`` forms the calling thread's state ahead of its first call."""
     _require_program(entry="loss")
-    import flashinfer.chunked_lm_head as public
+    import flashinfer.cake_lm_head_nondet_train as public
 
     inp = _device_inputs(12289, "ce", W=glm_weight)
     main = _run(inp, 4096, backend="cake")
@@ -4331,9 +4331,7 @@ def test_device_fresh_thread_and_preload(glm_weight):
 
     def preloaded():
         try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                public.chunked_lm_head_preload(CUDA, deterministic=False)
+            public.cake_lm_head_nondet_train_preload(CUDA)
             index = torch.cuda.current_device()
             out["preloaded"] = (
                 index in cake_backend._thread_state("dw_streams"),
