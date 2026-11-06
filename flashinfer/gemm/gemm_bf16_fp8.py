@@ -380,15 +380,29 @@ def _mm_16bit_fp8(
     return out
 
 
-_DOC = r"""{dtype} GEMM whose ``[N, K]`` operand is stored as FP8 e4m3 (W8A16).
+@backend_requirement({"cute-dsl": _cute_dsl_check}, heuristic_func=_heuristic)
+@flashinfer_api(trace=mm_bf16_fp8_trace_dispatch)
+def mm_bf16_fp8(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    alpha: torch.Tensor,
+    *,
+    bias: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    out: Optional[torch.Tensor] = None,
+    backend: _Backend = "auto",
+    tactic: Optional[str] = None,
+    workspace: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""bfloat16 GEMM whose ``[N, K]`` operand is stored as FP8 e4m3 (W8A16).
 
     ``out = a @ (b.float() * alpha).T + bias`` with the weight dequantized
     inside the kernel; no 16-bit copy of the weight is allocated.  "fp8" says
     how the weight is *stored* (e4m3 plus one per-tensor fp32 scale); the
-    arithmetic is a 16-bit GEMM in ``{dtype}``.  :func:`{other}` is the same
-    kernel for {other_dtype} activations.
+    arithmetic is a 16-bit GEMM in ``bfloat16``.  :func:`mm_fp16_fp8` is the same
+    kernel for float16 activations.
 
-    Numerics.  Each e4m3 weight value is converted to ``{dtype}`` exactly
+    Numerics.  Each e4m3 weight value is converted to ``bfloat16`` exactly
     (every finite e4m3 value is representable in both bf16 and fp16, denormals
     included), the unscaled products are accumulated in fp32, and ``alpha``
     and ``bias`` are applied to the fp32 accumulator before the single
@@ -401,7 +415,7 @@ _DOC = r"""{dtype} GEMM whose ``[N, K]`` operand is stored as FP8 e4m3 (W8A16).
     Parameters
     ----------
     a: torch.Tensor
-        Activation, shape ``(..., K)``, ``{dtype}``, contiguous, on a CUDA
+        Activation, shape ``(..., K)``, ``bfloat16``, contiguous, on a CUDA
         device (Hopper or Blackwell; every other tensor must be on the same
         device).  Leading dimensions are flattened into ``M``; a leading
         dimension of 0 returns the empty output without launching.
@@ -412,16 +426,16 @@ _DOC = r"""{dtype} GEMM whose ``[N, K]`` operand is stored as FP8 e4m3 (W8A16).
         One ``float32`` value (shape ``()`` or ``(1,)``) on ``a``'s device:
         the per-tensor dequantization scale of ``b``.
     bias: Optional[torch.Tensor]
-        Optional bias, shape ``(N,)``, ``{dtype}``, on ``a``'s device,
+        Optional bias, shape ``(N,)``, ``bfloat16``, on ``a``'s device,
         contiguous.
     out_dtype: Optional[torch.dtype]
-        Output dtype.  Only ``{dtype}`` (``a``'s dtype, the default) is
+        Output dtype.  Only ``bfloat16`` (``a``'s dtype, the default) is
         supported: the kernels round the fp32 accumulator once into the
         activation dtype.  The argument exists for uniformity with the other
         ``mm_*`` functions.
     out: Optional[torch.Tensor]
         Optional output, shape ``(..., N)`` (``a``'s leading dimensions),
-        ``{dtype}``, on ``a``'s device, contiguous.  Allocated when omitted.
+        ``bfloat16``, on ``a``'s device, contiguous.  Allocated when omitted.
     backend: str
         ``"auto"`` (default) or ``"cute-dsl"``, the one implementation there
         is (CuTe-DSL kernels for Hopper and Blackwell).
@@ -447,10 +461,10 @@ _DOC = r"""{dtype} GEMM whose ``[N, K]`` operand is stored as FP8 e4m3 (W8A16).
         wave over the idle SMs (plain when that tail is at least half a wave
         or ``K`` is short); on Blackwell it picks, by a wave-fill cost model,
         between the plain 2SM tiles and split-K on the 256x128 tile.
-        :func:`{ws_fn}` reports what the resolved policy needs.
+        :func:`mm_bf16_fp8_workspace_bytes` reports what the resolved policy needs.
     workspace: Optional[torch.Tensor]
         Optional scratch buffer: contiguous, 16-byte aligned, of any dtype, on
-        ``a``'s device, at least :func:`{ws_fn}` bytes for this call's shape,
+        ``a``'s device, at least :func:`mm_bf16_fp8_workspace_bytes` bytes for this call's shape,
         device and ``tactic`` (its byte size counts, not its dtype).
         Allocated per call when omitted and needed.  A caller that wants a
         fixed memory budget sizes one buffer once and passes it to every call,
@@ -464,7 +478,7 @@ _DOC = r"""{dtype} GEMM whose ``[N, K]`` operand is stored as FP8 e4m3 (W8A16).
     Notes
     -----
     Runs on Hopper (``sm_90a``) and Blackwell (``sm_100a`` / ``sm_103a``);
-    ``{fn}.is_compute_capability_supported(cc)`` answers for a device.  The
+    ``mm_bf16_fp8.is_compute_capability_supported(cc)`` answers for a device.  The
     kernels are CuTe-DSL, compiled on first use of each kernel variant a call
     resolves to (so the first call of a new configuration is slow), and are
     not part of the AOT packages.  Compiled kernels are cached on disk under
@@ -500,7 +514,7 @@ _DOC = r"""{dtype} GEMM whose ``[N, K]`` operand is stored as FP8 e4m3 (W8A16).
     Returns
     -------
     out: torch.Tensor
-        ``(..., N)`` in ``{dtype}``.
+        ``(..., N)`` in ``bfloat16``.
 
     Raises
     ------
@@ -515,22 +529,6 @@ _DOC = r"""{dtype} GEMM whose ``[N, K]`` operand is stored as FP8 e4m3 (W8A16).
     RuntimeError
         A launch failure reported by the CUDA runtime.
     """
-
-
-@backend_requirement({"cute-dsl": _cute_dsl_check}, heuristic_func=_heuristic)
-@flashinfer_api(trace=mm_bf16_fp8_trace_dispatch)
-def mm_bf16_fp8(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    alpha: torch.Tensor,
-    *,
-    bias: Optional[torch.Tensor] = None,
-    out_dtype: Optional[torch.dtype] = None,
-    out: Optional[torch.Tensor] = None,
-    backend: _Backend = "auto",
-    tactic: Optional[str] = None,
-    workspace: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
     return _mm_16bit_fp8(
         "mm_bf16_fp8",
         torch.bfloat16,
@@ -561,6 +559,21 @@ def mm_fp16_fp8(
     tactic: Optional[str] = None,
     workspace: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    r"""float16 GEMM whose ``[N, K]`` operand is stored as FP8 e4m3 (W8A16).
+
+    ``out = a @ (b.float() * alpha).T + bias`` with the weight dequantized
+    inside the kernel: :func:`mm_bf16_fp8` for ``float16`` activations.  Same
+    kernels, same arguments, same contract, with ``float16`` wherever that
+    function says ``bfloat16``: ``a`` is ``(..., K)`` ``float16``; ``bias`` and
+    ``out`` are ``float16``; ``out_dtype`` accepts only ``torch.float16``; the
+    result is ``(..., N)`` in ``float16``.  The e4m3 weight is converted to
+    ``float16`` exactly, the products are accumulated in fp32, and ``alpha``
+    and ``bias`` are applied before the single rounding into ``float16``.
+    ``tactic`` takes the same keys (``MM_BF16_FP8_TACTICS_SM100`` /
+    ``MM_BF16_FP8_TACTICS_SM90``); :func:`mm_fp16_fp8_workspace_bytes` sizes
+    the ``workspace``.  See :func:`mm_bf16_fp8` for the full description of
+    every argument, the shape, alignment and aliasing rules, and the errors.
+    """
     return _mm_16bit_fp8(
         "mm_fp16_fp8",
         torch.float16,
@@ -575,22 +588,6 @@ def mm_fp16_fp8(
         tactic,
         workspace,
     )
-
-
-mm_bf16_fp8.__doc__ = _DOC.format(
-    dtype="bfloat16",
-    other="mm_fp16_fp8",
-    other_dtype="float16",
-    fn="mm_bf16_fp8",
-    ws_fn="mm_bf16_fp8_workspace_bytes",
-)
-mm_fp16_fp8.__doc__ = _DOC.format(
-    dtype="float16",
-    other="mm_bf16_fp8",
-    other_dtype="bfloat16",
-    fn="mm_fp16_fp8",
-    ws_fn="mm_fp16_fp8_workspace_bytes",
-)
 
 
 def _check_operands(
