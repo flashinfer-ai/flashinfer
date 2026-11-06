@@ -13,8 +13,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Backend suite of the Cake packed-varlen GQA training attention package (head dimension 256,
-``flashinfer.experimental.cake_gqa_train``).
+Backend suite of the Cake non-deterministic packed-varlen GQA training attention package (head dimension 256,
+``flashinfer.experimental.cake.cake_gqa_nondet_train``, the backend of ``flashinfer.cake_gqa_nondet_train``).
 
 Without a device: the registry (one record per stage and architecture, the argument plans the host passes), the
 build manifest (every record's library, the recorded source digests), the standalone loader and its pinned bytes,
@@ -27,7 +27,9 @@ zero gradients); document isolation; repeated destination rows accumulated into 
 dynamic shapes through one reused workspace; launches on the operands' device and stream while another device is
 current; non-reentrant checkpointing (nothing retained, gradients equal to the
 eager pair); no device synchronization in steady state; and the speed of the forward and the backward beside a
-kernel resident on another stream.
+kernel resident on another stream; under ``torch.use_deterministic_algorithms(True)`` the forward runs and the
+backward raises PyTorch's alert before it launches (``warn_only=True``: one warning, then the non-deterministic
+backward runs; no deterministic fallback).
 
 The suite names its package once, through the shared alias helper, and imports nothing else from flashinfer.
 """
@@ -42,6 +44,7 @@ import random
 import statistics
 import subprocess
 import sys
+import warnings
 from pathlib import Path
 
 import pytest
@@ -50,10 +53,10 @@ from torch.utils.checkpoint import checkpoint
 
 from tests.test_helpers.cake_package import cake_package
 
-pkg = cake_package("cake_gqa_train")
-cake_backend = cake_package("cake_gqa_train", "cake_backend")
-cake_build = cake_package("cake_gqa_train", "cake_build")
-cake_jit = cake_package("cake_gqa_train", "cake_jit")
+pkg = cake_package("cake.cake_gqa_nondet_train")
+cake_backend = cake_package("cake.cake_gqa_nondet_train", "cake_backend")
+cake_build = cake_package("cake.cake_gqa_nondet_train", "cake_build")
+cake_jit = cake_package("cake.cake_gqa_nondet_train", "cake_jit")
 
 PACKAGE_DIR = Path(cake_jit.__file__).resolve().parent
 PACKAGE_IMPORT = cake_jit.PACKAGE
@@ -161,9 +164,10 @@ def test_registry_records_are_well_formed() -> None:
     for name, rec in cake_jit.MODULES.items():
         assert set(rec["arches"]) <= set(ARCHES), name
         assert rec["ffi_entry"] == "run", name
-        assert len(rec["library"]) == len("cake_gqa_train_") + 20 and rec[
-            "library"
-        ].startswith("cake_gqa_train_")
+        prefix = cake_jit.LIBRARY_PREFIX + "_"
+        assert len(rec["library"]) == len(prefix) + 20 and rec["library"].startswith(
+            prefix
+        )
         assert rec["kernel_symbol"] == "kernel_" + rec["library"], name
         launch = rec["launch"]
         assert launch["cooperative"] is False and launch["use_pdl"] is False, name
@@ -218,10 +222,16 @@ def test_the_loader_imports_standalone_without_flashinfer() -> None:
 
 def test_the_loader_and_header_are_the_pinned_bytes_of_every_cake_package() -> None:
     _manifest_or_skip()
-    # Another package's copy, read from the repository (not imported: the vendored gate blocks flashinfer).
-    other = (
-        Path(__file__).resolve().parents[2]
-        / "flashinfer/experimental/cake_kda_det_train"
+    # Another package's copy, read from the repository (not imported: the vendored gate blocks flashinfer): the
+    # KDA det backend's, wherever the KDA rename (#8928) has put its directory.
+    experimental = Path(__file__).resolve().parents[2] / "flashinfer/experimental"
+    other = next(
+        path
+        for path in (
+            experimental / "cake" / "cake_kda_det_train",
+            experimental / "cake_kda_det_train",
+        )
+        if path.is_dir()
     )
     for relative in ("cake_build.py", "csrc/cake_ffi_checks.h"):
         assert (PACKAGE_DIR / relative).read_bytes() == (
@@ -315,7 +325,7 @@ def test_scratch_layout_is_aligned_and_sized() -> None:
         floats = (heads // 2) * rows * (D + 2)
         assert (
             4 * floats
-            <= cake_backend.workspace_bytes(total_q, heads, segs)
+            <= cake_backend.cake_gqa_nondet_train_workspace_bytes(total_q, heads, segs)
             <= 4 * floats + 3 * 256
         )
 
@@ -406,7 +416,7 @@ def _no_key_rows(x, h_q):
 
 def _run(x, form, *, workspace=None, dst_init=None, row_map=None):
     """Forward and backward of the package: ``{"out", "lse", "dq", "dk", "dv"}`` (dk / dv as the form returns them)."""
-    out, lse = cake_backend.gqa_attention_fwd(
+    out, lse = cake_backend.cake_gqa_nondet_train_forward(
         x["q"],
         x["k"],
         x["v"],
@@ -426,7 +436,7 @@ def _run(x, form, *, workspace=None, dst_init=None, row_map=None):
         )
     elif form == "fp32":
         kwargs["dkv_dtype"] = torch.float32
-    dq, dk, dv = cake_backend.gqa_attention_bwd(
+    dq, dk, dv = cake_backend.cake_gqa_nondet_train_backward(
         x["q"], x["k"], x["v"], out, lse, x["dout"], x["cu_q"], x["cu_k"], **kwargs
     )
     return {"out": out, "lse": lse, "dq": dq, "dk": dk, "dv": dv}
@@ -531,7 +541,7 @@ def test_documents_are_isolated(device) -> None:
 
 
 def test_dynamic_shapes_reuse_one_workspace(device) -> None:
-    ws = cake_backend.Workspace(device)
+    ws = cake_backend.CakeGQANondetWorkspace(device)
     sizes = []
     for i, (q_lens, k_lens) in enumerate(
         (
@@ -543,7 +553,7 @@ def test_dynamic_shapes_reuse_one_workspace(device) -> None:
     ):
         x = _inputs(q_lens, k_lens, 24, 4, device, seed=i)
         shared = _run(x, "fp32", workspace=ws)
-        fresh = _run(x, "fp32", workspace=cake_backend.Workspace(device))
+        fresh = _run(x, "fp32", workspace=cake_backend.CakeGQANondetWorkspace(device))
         torch.cuda.synchronize()
         for t in ("out", "lse", "dk", "dv"):
             assert torch.equal(shared[t], fresh[t]), (q_lens, t)
@@ -551,7 +561,7 @@ def test_dynamic_shapes_reuse_one_workspace(device) -> None:
         sizes.append(ws.nbytes)
     assert sizes == sorted(sizes), "the workspace shrank"
     need = max(
-        cake_backend.workspace_bytes(sum(q), 24, len(q))
+        cake_backend.cake_gqa_nondet_train_workspace_bytes(sum(q), 24, len(q))
         for q in ((3000, 77), (1,), (500, 0, 260), (2900, 300))
     )
     assert ws.nbytes - ws.tile_counter().untyped_storage().nbytes() == need
@@ -600,7 +610,7 @@ def _ckpt_retained_mib(fn, *inputs) -> float:
 def test_checkpoint_keeps_nothing_alive_and_matches_eager(form, device) -> None:
     q_lens, k_lens = (1000, 3000), (1000, 24000)
     x = _inputs(q_lens, k_lens, 24, 4, device)
-    ws = cake_backend.Workspace(device)
+    ws = cake_backend.CakeGQANondetWorkspace(device)
     row_map, n_dst = _window_row_map(x)
     dst = {}
 
@@ -608,7 +618,7 @@ def test_checkpoint_keeps_nothing_alive_and_matches_eager(form, device) -> None:
         return dst["k"], dst["v"], row_map
 
     def fn(q, k, v):
-        return pkg.varlen_gqa_attention(
+        return pkg.cake_gqa_nondet(
             q,
             k,
             v,
@@ -659,11 +669,11 @@ def test_steady_state_does_not_synchronize(device) -> None:
         _inputs(q, k, 24, 4, device, seed=i)
         for i, (q, k) in enumerate((((700, 77), (3000, 77)), ((300,), (300,))))
     ]
-    ws = cake_backend.Workspace(device)
+    ws = cake_backend.CakeGQANondetWorkspace(device)
 
     def step(x):
         q, k, v = (x[t].clone().requires_grad_() for t in ("q", "k", "v"))
-        out = pkg.varlen_gqa_attention(
+        out = pkg.cake_gqa_nondet(
             q, k, v, x["cu_q"], x["cu_k"], softmax_scale=SCALE, workspace=ws
         )
         out.backward(x["dout"])
@@ -703,14 +713,14 @@ def _timed(call, *, side):
 def test_keeps_its_speed_beside_a_resident_kernel(stage, device) -> None:
     q_lens, k_lens = (3000, 1100), (3000, 17000)
     x = _inputs(q_lens, k_lens, 24, 4, device)
-    ws = cake_backend.Workspace(device)
-    out, lse = cake_backend.gqa_attention_fwd(
+    ws = cake_backend.CakeGQANondetWorkspace(device)
+    out, lse = cake_backend.cake_gqa_nondet_train_forward(
         x["q"], x["k"], x["v"], x["cu_q"], x["cu_k"], softmax_scale=SCALE
     )
 
     def call():
         if stage == "fwd":
-            o, l = cake_backend.gqa_attention_fwd(
+            o, l = cake_backend.cake_gqa_nondet_train_forward(
                 x["q"],
                 x["k"],
                 x["v"],
@@ -720,7 +730,7 @@ def test_keeps_its_speed_beside_a_resident_kernel(stage, device) -> None:
                 workspace=ws,
             )
             return (o, l)
-        _dq, dk, dv = cake_backend.gqa_attention_bwd(
+        _dq, dk, dv = cake_backend.cake_gqa_nondet_train_backward(
             x["q"],
             x["k"],
             x["v"],
@@ -761,12 +771,115 @@ def test_rejects_unsupported_inputs(device) -> None:
     x = _inputs((10,), (10,), 24, 4, device)
     q, k, v, cq, ck = x["q"], x["k"], x["v"], x["cu_q"], x["cu_k"]
     with pytest.raises(ValueError, match="even multiple"):
-        cake_backend.gqa_attention_fwd(q[:, :12], k[:, :4], v[:, :4], cq, ck)  # group 3
+        cake_backend.cake_gqa_nondet_train_forward(
+            q[:, :12], k[:, :4], v[:, :4], cq, ck
+        )  # group 3
     with pytest.raises(ValueError, match="bfloat16"):
-        cake_backend.gqa_attention_fwd(q.half(), k, v, cq, ck)
+        cake_backend.cake_gqa_nondet_train_forward(q.half(), k, v, cq, ck)
     with pytest.raises(ValueError, match="int32"):
-        cake_backend.gqa_attention_fwd(q, k, v, cq.long(), ck)
+        cake_backend.cake_gqa_nondet_train_forward(q, k, v, cq.long(), ck)
     with pytest.raises(ValueError, match="num_segments"):
-        cake_backend.gqa_attention_fwd(q, k, v, cq, ck[:1])
+        cake_backend.cake_gqa_nondet_train_forward(q, k, v, cq, ck[:1])
     with pytest.raises(NotImplementedError):
-        pkg.varlen_gqa_attention(q, k, v, cq, ck, causal=False)
+        pkg.cake_gqa_nondet(q, k, v, cq, ck, causal=False)
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# torch.use_deterministic_algorithms (#8928 rule 8)
+
+ALERT = "does not have a deterministic implementation"
+
+
+@pytest.fixture
+def deterministic_algorithms():
+    """Restores torch's deterministic-algorithms mode after a test that sets it."""
+    enabled = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    yield
+    torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
+
+
+def test_deterministic_mode_alerts_at_the_backward_only(
+    device, deterministic_algorithms
+) -> None:
+    """The fixed-order forward runs silently; the backward (atomic FP32 dQ reductions) raises PyTorch's alert after
+    its checks and before it launches anything, through the low-level entry and through autograd."""
+    x = _inputs((130, 77), (200, 77), 24, 4, device)
+    q, k, v, cq, ck = x["q"], x["k"], x["v"], x["cu_q"], x["cu_k"]
+    ref_out, ref_lse = cake_backend.cake_gqa_nondet_train_forward(
+        q, k, v, cq, ck, softmax_scale=SCALE
+    )
+    torch.use_deterministic_algorithms(True)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        out, lse = cake_backend.cake_gqa_nondet_train_forward(
+            q, k, v, cq, ck, softmax_scale=SCALE
+        )
+    torch.cuda.synchronize()
+    assert torch.equal(out, ref_out) and torch.equal(lse, ref_lse)
+    dq = torch.full_like(q, 7.0)
+    with pytest.raises(RuntimeError, match=ALERT):
+        cake_backend.cake_gqa_nondet_train_backward(
+            q, k, v, out, lse, x["dout"], cq, ck, softmax_scale=SCALE, dq=dq
+        )
+    torch.cuda.synchronize()
+    assert bool((dq == 7.0).all()), "the alert must come before any launch"
+    # A bad argument is reported as such, not as the alert.
+    with pytest.raises(ValueError, match="dkv_dtype"):
+        cake_backend.cake_gqa_nondet_train_backward(
+            q, k, v, out, lse, x["dout"], cq, ck, dkv_dtype=torch.float16
+        )
+    qg = q.clone().requires_grad_()
+    out_ag = pkg.cake_gqa_nondet(qg, k, v, cq, ck, softmax_scale=SCALE)
+    with pytest.raises(RuntimeError, match=ALERT):
+        out_ag.backward(x["dout"])
+    assert qg.grad is None
+
+
+def test_deterministic_mode_lets_an_empty_backward_run(
+    device, deterministic_algorithms
+) -> None:
+    """No (query, key) pair launches nothing non-deterministic: zero gradients, no alert."""
+    x = _inputs((0, 0), (5, 9), 24, 4, device)
+    q, k, v, cq, ck = x["q"], x["k"], x["v"], x["cu_q"], x["cu_k"]
+    out, lse = cake_backend.cake_gqa_nondet_train_forward(q, k, v, cq, ck)
+    torch.use_deterministic_algorithms(True)
+    dq, dk, dv = cake_backend.cake_gqa_nondet_train_backward(
+        q, k, v, out, lse, x["dout"], cq, ck
+    )
+    assert dq.numel() == 0
+    assert not dk.any() and not dv.any()
+
+
+@pytest.mark.parametrize("form", DKV_FORMS)
+def test_warn_only_mode_warns_and_runs_the_nondet_backward(
+    form, device, deterministic_algorithms
+) -> None:
+    """``warn_only=True``: one ``UserWarning`` per backward call, then the same non-deterministic backward (dK / dV
+    and the forward bitwise equal to a run outside deterministic mode, dQ within the reduction-order rounding)."""
+    x = _inputs((130, 77, 300), (200, 77, 301), 24, 4, device)
+    dst = None
+    row_map = None
+    if form == "rowmap":
+        row_map, n_dst = _window_row_map(x)
+        dst = (
+            torch.zeros(n_dst, 4, D, dtype=torch.float32, device=device),
+            torch.zeros(n_dst, 4, D, dtype=torch.float32, device=device),
+        )
+    base = _run(x, form, dst_init=dst, row_map=row_map)
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        got = _run(x, form, dst_init=dst, row_map=row_map)
+    torch.cuda.synchronize()
+    alerts = [w for w in caught if ALERT in str(w.message)]
+    assert len(alerts) == 1 and issubclass(alerts[0].category, UserWarning), [
+        str(w.message) for w in caught
+    ]
+    assert torch.equal(got["out"], base["out"])
+    assert torch.equal(got["lse"], base["lse"])
+    if form != "rowmap":
+        # Row-map destinations add in an unordered FP32 reduction where rows repeat.
+        assert torch.equal(got["dk"], base["dk"])
+        assert torch.equal(got["dv"], base["dv"])
+    _assert_dq_close(got["dq"], base["dq"])
