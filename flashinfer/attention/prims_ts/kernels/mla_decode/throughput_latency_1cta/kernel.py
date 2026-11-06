@@ -504,6 +504,7 @@ def build_throughput_latency_mla_task_manager(
     requested_splits=None,
     kv_producer=None,
     kv_producer_args=None,
+    tma_desc_o=None,
 ) -> tuple[TaskManager, object]:
     """Build the throughput-latency 1CTA MLA TaskManager for validation or execution.
 
@@ -541,6 +542,7 @@ def build_throughput_latency_mla_task_manager(
             tma_desc_bulk_extra=tma_desc_bulk_extra,
             tma_desc_sparse_rope=tma_desc_sparse_rope,
             tma_desc_sparse_extra_rope=tma_desc_sparse_extra_rope,
+            tma_desc_o=tma_desc_o,
             c_rope_tensor=c_rope_tensor,
             c_latent_tensor=c_latent_tensor,
             q_tensor=q_tensor,
@@ -1234,6 +1236,7 @@ def _make_single_kv_pipe_task_graph(
     requested_splits=None,
     kv_producer=None,
     kv_producer_args=None,
+    tma_desc_o=None,
 ) -> tuple[TaskManager, object]:
     """Build the single-stream 1CTA task graph.
 
@@ -1524,6 +1527,7 @@ def _make_single_kv_pipe_task_graph(
         cta_idx_q=cta_idx_q,
         cta_idx_kv=cta_idx_kv,
         cta_idx_head_dim_v=cta_idx_head_dim_v,
+        tma_o_desc=tma_desc_o,
         name="ll_mla_q64_corr",
     )
 
@@ -2467,6 +2471,73 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                     extra_format=cfg.extra_kv_cache_format,
                 )
 
+        # The WS TMA output stores one correction warp's 32 rows x 64 channels
+        # per box. Rows run over heads, then queries, of the public
+        # [H, D, SQ, B] output; TMA clips boxes past the last query.
+        tma_desc_o = tma_desc_q_latent
+        quantizes_output = cutlass.const_expr(
+            self.output_quant is not None
+            and (cfg.fuse_sparse_epilogue or cfg.fuse_sparse_cluster_epilogue)
+        )
+        if cutlass.const_expr(cfg.ws_tma_output and quantizes_output):
+            if cutlass.const_expr(cu_seqlens_q is not None):
+                raise ValueError("WS TMA output stores need fixed query lengths")
+            # Grouped E4M3 [G, T, (H/G) * 512] viewed as (channel, head in group,
+            # token, group). A box holds one correction warp's 32 heads x 128
+            # channels: whole groups of one token.
+            heads_per_group = cutlass.const_expr(
+                self.output_quant.num_heads // self.output_quant.num_groups
+            )
+            if cutlass.const_expr(32 % heads_per_group != 0):
+                raise ValueError("WS TMA MXFP8 output needs groups of at most 32 heads")
+            if cutlass.const_expr(cfg.logical_num_heads_q % cfg.tile_size_q != 0):
+                # The quantizer stores every staged row's block scales.
+                raise ValueError("WS TMA MXFP8 output needs whole query tiles of heads")
+            flat_o = output_quant_args[0]
+            output_tokens = cute.size(flat_o) // (self.output_quant.num_heads * 512)
+            o_rows = cute.make_tensor(
+                flat_o.iterator,
+                cute.make_layout(
+                    (512, heads_per_group, output_tokens, self.output_quant.num_groups),
+                    stride=(
+                        1,
+                        512,
+                        heads_per_group * 512,
+                        output_tokens * heads_per_group * 512,
+                    ),
+                ),
+            )
+            tma_desc_o = create_tensor_map_tiled_from_view(
+                o_rows,
+                box_dims=(128, heads_per_group, 1, 32 // heads_per_group),
+                stride_order=(0, 1, 2, 3),
+                swizzle=cuda.TensorMapSwizzle.s128b,
+                l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
+            )
+        elif cutlass.const_expr(cfg.ws_tma_output):
+            if cutlass.const_expr(cu_seqlens_q is not None):
+                raise ValueError("WS TMA output stores need fixed query lengths")
+            runtime_assert(
+                o.stride[2] == o.shape[0] * o.stride[0]
+                and o.stride[3] == o.shape[2] * o.stride[2],
+                "o must be compact across the head, query and batch dimensions",
+            )
+            box_heads = cutlass.const_expr(min(o.shape[0], 32))
+            o_rows = cute.make_tensor(
+                o.iterator,
+                cute.make_layout(
+                    (o.shape[1], o.shape[0], o.shape[2] * o.shape[3]),
+                    stride=(o.stride[1], o.stride[0], o.stride[2]),
+                ),
+            )
+            tma_desc_o = create_tensor_map_tiled_from_view(
+                o_rows,
+                box_dims=(64, box_heads, 32 // box_heads),
+                stride_order=(0, 1, 2),
+                swizzle=cuda.TensorMapSwizzle.s128b,
+                l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
+            )
+
         scale_softmax_log2 = softmax_scale * LOG2_E
         use_gmem_reduction = cutlass.const_expr(
             cfg.use_multi_ctas_kv == 1 and cfg.use_cluster_reduction != 1
@@ -2562,6 +2633,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             requested_splits=requested_splits,
             max_q_len=max_q_len,
             kv_producer_args=kv_producer_args,
+            tma_desc_o=tma_desc_o,
         ).launch(
             grid=grid,
             block=[cfg.threads_per_cta, 1, 1],
@@ -2693,6 +2765,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         requested_splits=None,
         max_q_len: cutlass.Int32 = 0,
         kv_producer_args=None,
+        tma_desc_o: cutlass.GridConstant[cuda.TensorMap] = None,
     ):
         """Execute one flat-Q, batch, KV-split, and V head-dimension tile."""
         cfg = self.runtime_config(max_q_len)
@@ -2867,6 +2940,9 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
 
         clc_response_ptr = None
 
+        tma_o_ptr = None
+        if cutlass.const_expr(cfg.ws_tma_output):
+            tma_o_ptr = tma_desc_o.get_ptr()
         task_manager, cluster_corr_resource = build_throughput_latency_mla_task_manager(
             cfg,
             total_kv_tiles=cfg.total_kv_tiles,
@@ -2879,6 +2955,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             tma_desc_bulk_extra=tma_desc_bulk_extra.get_ptr(),
             tma_desc_sparse_rope=tma_desc_sparse_rope.get_ptr(),
             tma_desc_sparse_extra_rope=tma_desc_sparse_extra_rope.get_ptr(),
+            tma_desc_o=tma_o_ptr,
             c_rope_tensor=c_rope,
             c_latent_tensor=c_latent,
             q_tensor=q_nope_tensor,

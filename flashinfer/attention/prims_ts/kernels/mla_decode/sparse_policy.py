@@ -40,6 +40,13 @@ class SparseMlaProfile:
     kv_tile_size: int = 128
     page_pipeline_stages: int = 0
     whole_kv_tile: bool = False
+    # Keep-AB with retained FP8 K: warp-specialized M64 QK/PV (Layout E), P in
+    # shared memory and one N=256 PV pass per two D128 slices.
+    ws_mma: bool = False
+    # With ws_mma: columns per SMEM-transposed output chunk (32 or 64), 0 = direct.
+    ws_store_cols: int = 0
+    # With ws_store_cols=64: store each output chunk with a TMA tensor store.
+    ws_tma_store: bool = False
 
 
 def base_fp8_profile(rows, heads, capacity, sm_count, rope_dim):

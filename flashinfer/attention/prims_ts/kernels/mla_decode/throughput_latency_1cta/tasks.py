@@ -674,6 +674,8 @@ def create_keeps_mma_ab_correction_task(
                 tail_o_stage_idx_0,
                 tail_o_stage_idx_1,
             ) = correct_tail_o(local_state, tail_o_stage_idx_0, tail_o_stage_idx_1)
+        if cfg.ws_tma_output:
+            tmem_corr.drain_output_stores()
 
     schedule_result = (
         correction_schedule(tmem_softmax_local, tmem_o, tmem_corr)
@@ -1956,6 +1958,11 @@ def create_single_kv_pipe_mma_task(
                 consumer_label="k_desc_0",
                 release_k=not cfg.sparse_reuse_kv,
             )
+            if cfg.q_tmem_mma_copy:
+                # QK reads Q from TMEM, so the commit-based release arrives after
+                # the copy and the first QK; the loader prefetches the next Q
+                # during the rest of this tile.
+                smem_q.release()
             with domain_loop(0, domain, 1):
                 if pv_before_qk:
                     pv_mma(
@@ -2000,7 +2007,8 @@ def create_single_kv_pipe_mma_task(
                 producer_label=pv_tail,
                 **pv_kwargs,
             )
-            smem_q.release()
+            if not cfg.q_tmem_mma_copy:
+                smem_q.release()
 
     schedule_result = (
         mma_schedule(smem_q, smem_kv, tmem_s, p_resource, tmem_o)
