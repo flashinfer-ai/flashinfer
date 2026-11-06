@@ -27,9 +27,11 @@ Construction uses one CUDA C++ CTA per route. Q1 maps selected and tail blocks
 directly. Q2--Q8 union at most ``G * (topk + 1)`` selected/tail IDs using a
 shared byte/bit map when its model-context footprint fits without adding CTA
 waves, or a bounded radix-sort fallback. No global-cache-sized scratch is
-required. On SM90 and newer, each metadata CTA releases the attention grid
-through programmatic dependent launch (PDL) after its last output store; the
-consumer wait covers metadata completion.
+required. With ``enable_pdl`` (by default on devices that support programmatic
+dependent launch, PDL), the metadata grid is PDL-launched: each CTA waits for
+the preceding grid before reading its inputs and releases the attention grid
+after its last output store; the attention's own wait covers metadata
+completion.
 """
 
 from __future__ import annotations
@@ -43,7 +45,7 @@ from typing import TYPE_CHECKING, Any, Literal, Optional
 import torch
 from flashinfer.api_logging import flashinfer_experimental_api
 
-from ...utils import device_support_pdl
+from ...utils import resolve_enable_pdl
 from ._block_sparse.common import _num_sparse_pattern_heads
 from ._q_token_kv_block_sparse_policy import membership_planes
 from ._scales import GlobalScale, normalize_scale, resolve_scale, scale_types
@@ -294,7 +296,10 @@ class _PrimsTSQTokenKvBlockSparseMetadataPlan:
     sparse_block_size: int
     storage_page_size: int
     max_seq_len_kv: int
-    release_attention_pdl: bool
+    # The metadata kernel's PDL switch. The combined plan passes the
+    # enable_pdl it also requests for attention, which runs with PDL where
+    # its decode configuration supports it.
+    enable_pdl: bool
     locator_head_multiplier: int = 1
     count_current_block_in_topk: bool = True
     fixed_query_len: int = 0
@@ -322,7 +327,7 @@ class _PrimsTSQTokenKvBlockSparseMetadataPlan:
                 self.storage_page_size,
                 self.sparse_block_size,
                 self.max_seq_len_kv,
-                self.release_attention_pdl,
+                self.enable_pdl,
                 self.locator_head_multiplier,
                 self.count_current_block_in_topk,
                 self.fixed_query_len,
@@ -340,7 +345,7 @@ class _PrimsTSQTokenKvBlockSparseMetadataPlan:
                 self.storage_page_size,
                 self.sparse_block_size,
                 self.max_seq_len_kv,
-                self.release_attention_pdl,
+                self.enable_pdl,
                 self.locator_head_multiplier,
                 self.count_current_block_in_topk,
                 self.fixed_query_len,
@@ -502,6 +507,7 @@ class _QTokenKvBlockSparsePlanConfig:
     out_dtype: torch.dtype
     sm_scale: GlobalScale
     v_scale: GlobalScale
+    enable_pdl: bool
 
 
 def _q_token_tensor_abi_key(
@@ -572,6 +578,7 @@ class QTokenKvBlockSparsePagedTSWrapper:
         out_dtype: Optional[torch.dtype] = None,
         sm_scale: Optional[GlobalScale] = None,
         v_scale: GlobalScale = 1.0,
+        enable_pdl: Optional[bool] = None,
     ) -> None:
         """Publish a capacity-only QToken-KvBlock-Sparse-Attention plan.
 
@@ -608,6 +615,12 @@ class QTokenKvBlockSparsePagedTSWrapper:
         FP32 tensors of shape () or (1,). They establish the compiled argument kinds
         and default run values. Softmax scales are in natural units. Device
         values must remain finite and positive and may change during replay.
+
+        ``enable_pdl`` launches the metadata kernel, attention and its reducer
+        with programmatic dependent launch (PDL); each kernel waits in-kernel
+        for the preceding grid before it reads its inputs. ``None`` (default)
+        enables it on devices that support PDL. It does not change the
+        workspace size.
         """
 
         from .decode import (
@@ -647,6 +660,7 @@ class QTokenKvBlockSparsePagedTSWrapper:
             out_dtype = q_dtype
         planned_device, device_index = _resolve_cuda_device(device)
         _validate_runtime_device(planned_device)
+        enable_pdl = resolve_enable_pdl(enable_pdl, planned_device)
         sm_scale = normalize_scale(
             head_dim**-0.5 if sm_scale is None else sm_scale,
             "sm_scale",
@@ -710,6 +724,7 @@ class QTokenKvBlockSparsePagedTSWrapper:
             out_dtype=out_dtype,
             sm_scale=sm_scale,
             v_scale=v_scale,
+            enable_pdl=enable_pdl,
         )
         with self._plan_lock:
             self._config = candidate
@@ -1077,6 +1092,7 @@ class QTokenKvBlockSparsePagedTSWrapper:
                         count_current_block_in_topk=config.count_current_block_in_topk,
                         fixed_query_len=fixed_query_len,
                         kv_scale_factors=kv_scale_factors,
+                        enable_pdl=config.enable_pdl,
                     )
                     self._prepared_key = prepared_key
         assert self._prepared_plan is not None
@@ -1299,10 +1315,11 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
         packed_query,
         -1,
         storage_page_size,
-        True,
-        True,
-        split_kv,
-        share_pattern_across_kv_heads,
+        use_q_token_kv_block_sparse_route=True,
+        # PDL changes neither the selected launch nor its scratch.
+        use_pdl=False,
+        split_kv=split_kv,
+        share_pattern_across_kv_heads=share_pattern_across_kv_heads,
     )
     # Eligible Keeps G2..G8/page-4 profiles consume one bit-plane per query.
     # Other profiles and the standalone metadata API retain page-byte masks.
@@ -1577,9 +1594,9 @@ def _build_prims_ts_q_token_kv_block_sparse_metadata(
     sparse_block_size: int = 4,
     qo_indptr: Optional[torch.Tensor] = None,
     out: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
-    release_attention_pdl: bool = False,
     share_pattern_across_kv_heads: bool = True,
     count_current_block_in_topk: bool = True,
+    enable_pdl: Optional[bool] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build dense QToken-KvBlock-Sparse-Attention indices and memberships from compact sparse-block IDs.
 
@@ -1606,8 +1623,12 @@ def _build_prims_ts_q_token_kv_block_sparse_metadata(
     ``group_size * (block_topk + 1)`` candidates with a shared map or radix
     sort, OR membership bits, and map the sorted unique logical blocks through
     the dense block table. A map is used only when it fits shared memory and
-    requires no extra CTA waves. The combined API releases attention at
-    metadata entry; the consumer wait still covers every output store.
+    requires no extra CTA waves. ``enable_pdl`` is the metadata kernel's PDL
+    switch; ``None`` (default) enables it on devices that support PDL. A PDL
+    launch waits for the preceding grid and then releases its dependents at
+    entry, before its output stores, so a PDL-launched consumer must wait for
+    this grid before it reads the outputs. ``False`` keeps plain stream
+    ordering.
     Packed ``qo_indptr`` must be an Int32 device copy of CPU-validated route
     offsets; this builder checks only its structural tensor contract and does
     not read route values back to the host.
@@ -1625,6 +1646,7 @@ def _build_prims_ts_q_token_kv_block_sparse_metadata(
         share_pattern_across_kv_heads,
         count_current_block_in_topk,
     )
+    enable_pdl = resolve_enable_pdl(enable_pdl, block_indices.device)
     rows, block_topk = block_indices.shape[0], block_indices.shape[-1]
     pattern_heads = block_indices.shape[1] if block_indices.ndim == 3 else 1
     packed_query = qo_indptr is not None
@@ -1677,9 +1699,7 @@ def _build_prims_ts_q_token_kv_block_sparse_metadata(
     _validate_wide_metadata_fits(
         group_size, max_seq_len_kv, sparse_block_size, block_indices.device.index
     )
-    enable_pdl = device_support_pdl(block_indices.device)
     metadata_module = _get_prims_ts_q_token_kv_block_sparse_metadata_module()
-    release_attention_pdl = enable_pdl and release_attention_pdl
     if packed_query:
         metadata_module.run_packed(
             block_indices,
@@ -1694,7 +1714,7 @@ def _build_prims_ts_q_token_kv_block_sparse_metadata(
             storage_page_size,
             sparse_block_size,
             max_seq_len_kv,
-            release_attention_pdl,
+            enable_pdl,
             1,
             count_current_block_in_topk,
             0,
@@ -1712,7 +1732,7 @@ def _build_prims_ts_q_token_kv_block_sparse_metadata(
             storage_page_size,
             sparse_block_size,
             max_seq_len_kv,
-            release_attention_pdl,
+            enable_pdl,
             1,
             count_current_block_in_topk,
             0,
@@ -1734,6 +1754,7 @@ def _build_q_token_kv_block_sparse_metadata(
     out: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     share_pattern_across_kv_heads: bool = True,
     count_current_block_in_topk: bool = True,
+    enable_pdl: Optional[bool] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build dense QToken-KvBlock-Sparse-Attention page indices and memberships from sparse-block IDs.
 
@@ -1794,6 +1815,12 @@ def _build_q_token_kv_block_sparse_metadata(
         True (default) uses one pattern per query, shared by KV heads.
         False uses independent per-KV-head patterns. Match this setting in
         workspace sizing and planning; it does not change the attention grid.
+    enable_pdl : Optional[bool]
+        Launch with programmatic dependent launch (PDL). ``None`` (default)
+        enables it on devices that support PDL. The kernel then waits for the
+        preceding grid and releases its dependents at entry, before its
+        output stores, so a PDL-launched consumer must wait for this grid
+        before it reads the outputs. ``False`` keeps plain stream ordering.
 
     Returns
     -------
@@ -1816,6 +1843,7 @@ def _build_q_token_kv_block_sparse_metadata(
         out=out,
         share_pattern_across_kv_heads=share_pattern_across_kv_heads,
         count_current_block_in_topk=count_current_block_in_topk,
+        enable_pdl=enable_pdl,
     )
 
 
@@ -1837,6 +1865,7 @@ def _prepare_prims_ts_q_token_kv_block_sparse_metadata_plan(
     locator_head_multiplier: int = 1,
     count_current_block_in_topk: bool = True,
     fixed_query_len: int = 0,
+    enable_pdl: Optional[bool] = None,
 ) -> _PrimsTSQTokenKvBlockSparseMetadataPlan:
     """Freeze validated metadata tensors and launch constants.
 
@@ -1845,7 +1874,10 @@ def _prepare_prims_ts_q_token_kv_block_sparse_metadata_plan(
     The rank-two tensor flattens eight slots per tile, with unused slots and
     tail bits zero. This encoding must match the attention plan. Standalone
     metadata retains per-fragment membership bytes; Q/K/V layouts, the union,
-    and page indices are unchanged.
+    and page indices are unchanged. ``enable_pdl`` (``None`` resolves to
+    device support) launches the metadata kernel with PDL: it waits for the
+    preceding grid and then releases its dependents at entry. The combined
+    plan passes the enable_pdl it also requests for attention.
     """
 
     sparse_block_size = _validate_sparse_block_size(sparse_block_size)
@@ -1860,7 +1892,7 @@ def _prepare_prims_ts_q_token_kv_block_sparse_metadata_plan(
         max_seq_len_kv,
         block_table_token_capacity=block_table.shape[1] * storage_page_size,
     )
-    release_attention_pdl = device_support_pdl(block_indices.device)
+    enable_pdl = resolve_enable_pdl(enable_pdl, block_indices.device)
     metadata_module = _get_prims_ts_q_token_kv_block_sparse_metadata_module()
     if query_major_memberships:
         metadata_run = (
@@ -1883,7 +1915,7 @@ def _prepare_prims_ts_q_token_kv_block_sparse_metadata_plan(
         sparse_block_size=sparse_block_size,
         storage_page_size=storage_page_size,
         max_seq_len_kv=max_seq_len_kv,
-        release_attention_pdl=release_attention_pdl,
+        enable_pdl=enable_pdl,
         locator_head_multiplier=locator_head_multiplier,
         count_current_block_in_topk=count_current_block_in_topk,
         fixed_query_len=fixed_query_len,
@@ -1911,6 +1943,7 @@ def _prepare_q_token_kv_block_sparse_attention(
     count_current_block_in_topk: bool = True,
     fixed_query_len: int = 0,
     kv_scale_factors: Optional[PagedKVScaleFactors] = None,
+    enable_pdl: Optional[bool] = None,
 ) -> _PrimsTSQTokenKvBlockSparsePlan:
     """Prepare one graph-stable metadata-plus-attention QToken-KvBlock-Sparse-Attention launch.
 
@@ -1987,6 +2020,10 @@ def _prepare_q_token_kv_block_sparse_attention(
         True (default) uses one pattern per query, shared by KV heads.
         False uses independent per-KV-head patterns. Match this setting in
         workspace sizing and planning; it does not change the attention grid.
+    enable_pdl : Optional[bool]
+        Launch with programmatic dependent launch (PDL); see
+        :meth:`QTokenKvBlockSparsePagedTSWrapper.plan`. ``None`` (default)
+        enables it on devices that support PDL.
 
     Returns
     -------
@@ -1999,6 +2036,7 @@ def _prepare_q_token_kv_block_sparse_attention(
     k_cache, v_cache = _validate_q_token_kv_block_sparse_paged_kv_cache(paged_kv_cache)
     if not isinstance(query, torch.Tensor):
         raise TypeError("query must be a torch.Tensor")
+    enable_pdl = resolve_enable_pdl(enable_pdl, query.device)
     if not isinstance(out, torch.Tensor):
         raise TypeError("out must be a caller-owned torch.Tensor")
 
@@ -2102,7 +2140,7 @@ def _prepare_q_token_kv_block_sparse_attention(
         direct_q1_sparse_block_size=sparse_block_size,
         query_major_memberships=layout.query_major_memberships,
         use_q_token_kv_block_sparse_route=True,
-        use_pdl=True,
+        use_pdl=enable_pdl,
         split_kv=split_kv,
         share_pattern_across_kv_heads=share_pattern_across_kv_heads,
         count_current_block_in_topk=count_current_block_in_topk,
@@ -2139,6 +2177,7 @@ def _prepare_q_token_kv_block_sparse_attention(
         locator_head_multiplier=attention_plan._flat_locator_heads,
         count_current_block_in_topk=count_current_block_in_topk,
         fixed_query_len=fixed_query_len,
+        enable_pdl=enable_pdl,
     )
     return _PrimsTSQTokenKvBlockSparsePlan(
         _metadata_plan=metadata_plan,
@@ -2183,6 +2222,7 @@ def q_token_kv_block_sparse_attention_with_paged_kv_cache(
     count_current_block_in_topk: bool = True,
     seq_lens: Optional[torch.Tensor] = None,
     kv_scale_factors: Optional[PagedKVScaleFactors] = None,
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     """Plan and run one QToken-KvBlock-Sparse-Attention launch.
 
@@ -2272,6 +2312,10 @@ def q_token_kv_block_sparse_attention_with_paged_kv_cache(
         interleaved scales, as in paged decode; see
         :meth:`QTokenKvBlockSparsePagedTSWrapper.run` for both packed NVFP4
         layouts and the MMA precision each Q dtype selects.
+    enable_pdl : Optional[bool]
+        Launch with programmatic dependent launch (PDL). ``None`` (default)
+        enables it on devices that support PDL; see
+        :meth:`QTokenKvBlockSparsePagedTSWrapper.plan`.
 
     Returns
     -------
@@ -2332,6 +2376,7 @@ def q_token_kv_block_sparse_attention_with_paged_kv_cache(
         out_dtype=out_dtype,
         sm_scale=sm_scale,
         v_scale=1.0 if v_scale is None else v_scale,
+        enable_pdl=enable_pdl,
     )
     return wrapper.run(
         q,
