@@ -908,8 +908,10 @@ def release_packages() -> None:
     by construction: first every sealed Solution ``load_packages`` enabled whose
     Definition no captured binding serves leaves Trace Apply's mapping, by
     identity (a curated Solution enabled for the same Definition since is not a
-    sealed one and stays; a wrapper a caller kept, resolved or not, routes
-    nowhere from then on), then their preloaded entries go, so at no point is a
+    sealed one and stays; a wrapper a caller kept before its first matching call
+    routes nowhere from then on, and one that had already resolved keeps its
+    callable, which a released binding refuses), then their preloaded entries go,
+    so at no point is a
     sealed Solution enabled without its preloaded entry, which is what would
     send a call to the on-disk build path, the one place sealed sources must
     never reach; curated Solutions enabled beside them stay enabled. Then each
