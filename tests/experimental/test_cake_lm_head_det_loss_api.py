@@ -143,13 +143,6 @@ OLD_NAMES = {
         "load_cake_lm_head_loss_module": "load_cake_lm_head_det_loss_module",
     },
 }
-PACKAGE_MODULES = (
-    "cake_backend",
-    "cake_backend_opt_in",
-    "cake_build",
-    "cake_jit",
-    "cake_support",
-)
 
 
 def test_old_names_are_the_canonical_objects():
@@ -174,44 +167,20 @@ def test_backend_loader_aliases_are_the_jit_loader():
         module = importlib.import_module(
             f"flashinfer.experimental.cake_lm_head_det_loss.{name}"
         )
-        old = importlib.import_module(
-            f"flashinfer.experimental.cake_lm_head_loss.{name}"
-        )
         assert module.load_cake_lm_head_det_loss_module is loader, name
         assert module.load_cake_lm_head_loss_module is loader, name
-        assert old.load_cake_lm_head_loss_module is loader, name
 
 
-def test_old_package_path_is_the_canonical_package():
-    """``flashinfer.experimental.cake_lm_head_loss.<module>`` is the module of the same name of
-    ``flashinfer.experimental.cake_lm_head_det_loss`` (the same module object: one binding cache, one registry),
-    whether reached by ``import`` or by ``from ... import``, and its old names resolve through it."""
-    for name in PACKAGE_MODULES:
-        canonical = importlib.import_module(
-            f"flashinfer.experimental.cake_lm_head_det_loss.{name}"
-        )
-        old = importlib.import_module(
-            f"flashinfer.experimental.cake_lm_head_loss.{name}"
-        )
-        assert old is canonical, name
-        assert (
-            canonical.__name__
-            == f"flashinfer.experimental.cake_lm_head_det_loss.{name}"
-        )
-    from flashinfer.experimental.cake_lm_head_loss import cake_backend as old_backend
-    from flashinfer.experimental.cake_lm_head_loss.cake_backend import (
-        chunked_lm_head_loss as old_entry,
-    )
-    from flashinfer.experimental.cake_lm_head_loss.cake_support import (
-        SupportLogprobFunction as old_support,
-    )
-
-    assert old_backend is cake_backend
-    assert old_entry is cake_backend.chunked_lm_head_det_loss
+def test_old_package_path_is_gone():
+    """The package path before the deterministic naming (``flashinfer.experimental.cake_lm_head_loss``) is gone; the
+    modules' former names that remain resolve to the canonical objects."""
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("flashinfer.experimental.cake_lm_head_loss")
     support = importlib.import_module(
         "flashinfer.experimental.cake_lm_head_det_loss.cake_support"
     )
-    assert old_support is support.SupportDetLogprobFunction
+    assert cake_backend.chunked_lm_head_loss is cake_backend.chunked_lm_head_det_loss
+    assert support.SupportLogprobFunction is support.SupportDetLogprobFunction
     assert set(support.__all__) >= {
         "SupportDetLogprobFunction",
         "SupportLogprobFunction",

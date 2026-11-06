@@ -493,25 +493,10 @@ def test_deterministic_entries_still_refuse_false():
 
 
 def test_remaining_aliases_are_the_canonical_objects():
-    """Every alias that remains after the dispatchers is an identity: the legacy package path
-    ``flashinfer.experimental.cake_lm_head_loss`` is the deterministic package (module for module), never the
-    non-deterministic one, and the deterministic modules' former names are their canonical objects."""
-    nd_root = "flashinfer.experimental.cake.cake_lm_head_loss"
-    for name in (
-        "cake_backend",
-        "cake_backend_opt_in",
-        "cake_build",
-        "cake_jit",
-        "cake_support",
-    ):
-        legacy = importlib.import_module(
-            f"flashinfer.experimental.cake_lm_head_loss.{name}"
-        )
-        det = importlib.import_module(
-            f"flashinfer.experimental.cake_lm_head_det_loss.{name}"
-        )
-        nd = importlib.import_module(f"{nd_root}.{name}")
-        assert legacy is det and legacy is not nd, name
+    """Every alias that remains after the dispatchers is an identity: the deterministic modules' former names are
+    their canonical objects.  The package path before the deterministic naming is gone."""
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("flashinfer.experimental.cake_lm_head_loss")
     det_backend = importlib.import_module(
         "flashinfer.experimental.cake_lm_head_det_loss.cake_backend"
     )

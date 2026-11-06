@@ -18,7 +18,6 @@ plans or parallel partitions. `kcp` is the suffix for a context-parallel route.
 | `flashinfer.chunked_lm_head.chunked_lm_head_det_preload` | `chunked_lm_head_preload` (now a dispatcher) |
 | `flashinfer.chunked_lm_head.chunked_lm_head_det_support_logprob` | `chunked_lm_head_support_logprob` (now a dispatcher) |
 | `flashinfer.chunked_lm_head.chunked_lm_head_det_support_kl` | `chunked_lm_head_support_kl` (now a dispatcher) |
-| package `flashinfer.experimental.cake_lm_head_det_loss` | `flashinfer.experimental.cake_lm_head_loss` (each module is the same module object) |
 | `cake_backend.prepare_lm_head_det_loss` | `prepare_lm_head_loss` |
 | `cake_backend.validate_lm_head_det_inputs` | `validate_lm_head_inputs` |
 | `cake_backend.lm_head_det_loss_workspace_size` | `lm_head_loss_workspace_size` |
@@ -50,7 +49,7 @@ their fixed order. Its names are the deterministic names without `det`:
 
 | Deterministic name | Non-deterministic name | Former alias |
 | --- | --- | --- |
-| package `flashinfer.experimental.cake_lm_head_det_loss` | package `flashinfer.experimental.cake.cake_lm_head_loss` | `flashinfer.experimental.cake_lm_head_loss` stays the deterministic package |
+| package `flashinfer.experimental.cake_lm_head_det_loss` | package `flashinfer.experimental.cake.cake_lm_head_loss` | none (the former path `flashinfer.experimental.cake_lm_head_loss` is removed) |
 | `flashinfer.chunked_lm_head.chunked_lm_head_det_loss` | `flashinfer.chunked_lm_head.chunked_lm_head_loss(..., deterministic=False)` | `chunked_lm_head_loss` is a dispatcher, default `deterministic=True` |
 | `flashinfer.chunked_lm_head.chunked_lm_head_det_logprob` | `chunked_lm_head_logprob(..., deterministic=False)` | dispatcher |
 | `flashinfer.chunked_lm_head.chunked_lm_head_det_preload` | `chunked_lm_head_preload(..., deterministic=False)` | dispatcher |
