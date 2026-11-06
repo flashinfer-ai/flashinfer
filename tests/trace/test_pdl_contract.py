@@ -127,8 +127,8 @@ def _row_scale(inputs):
 
 
 _LOW_M = (dict(M=1), dict(M=8), dict(M=32))
-# quantize_with_block_size is compiled empty below SM100 and returns
-# uninitialized output there without raising.
+# The FP4 quantizers raise RuntimeError below SM100, which is not a skip. The
+# mm_fp4 template's init quantizes its inputs with them.
 _FP4_QUANTIZE_CCS = (100, 103, 107, 110, 120, 121)
 
 _PDL_APIS = [
@@ -151,6 +151,7 @@ _PDL_APIS = [
         axes=tuple(dict(M=m, N=2048, K=4096) for m in (8, 128)),
         variants=tuple({"backend": b} for b in ("cudnn", "cutlass", "cute-dsl")),
         extra_inputs={"alpha": _scale},
+        compute_capabilities=_FP4_QUANTIZE_CCS,
     ),
     *(
         PdlApi(
