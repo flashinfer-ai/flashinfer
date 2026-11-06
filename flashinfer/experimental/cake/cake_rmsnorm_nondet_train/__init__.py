@@ -981,15 +981,16 @@ def cake_rmsnorm_nondet_train_backward(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     r"""Fused BF16 RMSNorm backward: ``dx`` and the FP32 weight gradient ``dw``.
 
-    The call runs, per window of ``T``, the form the notes below list for it:
-    in the windows that ship it, one kernel that writes ``dx`` and adds the
-    ``dw`` sums of its CTAs into FP64 sums in the workspace, which the CTA that
-    finishes last rounds into ``dw`` (``dx`` is bitwise reproducible and within
-    one BF16 ulp of ``max(|dx|, rms(dx))`` of the deterministic kernel's
-    ``dx``, not always bitwise equal to it; the order of the FP64 additions
-    depends on scheduling, so ``dw`` is not guaranteed bitwise reproducible);
-    in the others, the deterministic package's backward pair rendered into
-    this package.
+    The call runs, per window of ``T``, the form the "Program selection by
+    token count" notes list for that window: in the windows that ship it, one
+    kernel that writes ``dx`` and adds the ``dw`` sums of its CTAs into FP64
+    sums in the workspace, which the CTA that finishes last rounds into ``dw``
+    (``dx`` is bitwise reproducible and within one BF16 ulp of
+    ``max(|dx|, rms(dx))`` of the deterministic kernel's ``dx``, not always
+    bitwise equal to it; the order of the FP64 additions depends on
+    scheduling, so ``dw`` is not guaranteed bitwise reproducible); in the
+    others, the deterministic package's backward pair rendered into this
+    package.
 
     While ``torch.use_deterministic_algorithms(True)`` is in effect every call
     raises ``RuntimeError`` naming
