@@ -77,12 +77,12 @@ from pathlib import Path
 import pytest
 import torch
 
-import flashinfer.cake_mhc_det_train_backend as det_backend
+import flashinfer.experimental.cake.cake_mhc_det_train as det_backend
 import flashinfer.cake_mhc_nondet_train as facade
 import flashinfer.experimental.cake.cake_mhc_nondet_train as backend
 from flashinfer import cake_mhc_det_train as det_facade
 from flashinfer.api_logging import ExperimentalWarning
-from flashinfer.cake_mhc_det_train_backend import cake_jit as det_loader
+from flashinfer.experimental.cake.cake_mhc_det_train import cake_jit as det_loader
 from flashinfer.experimental.cake.cake_mhc_nondet_train import cake_jit as loader
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))

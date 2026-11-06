@@ -19,7 +19,7 @@ package with the non-deterministic backward
 #8068; no GPU needed, nothing is built or launched).
 
 The package is a standalone copy of the deterministic package
-(``flashinfer.cake_mhc_det_train_backend``) under the ``cake_mhc_train_``
+(``flashinfer.experimental.cake.cake_mhc_det_train``) under the ``cake_mhc_train_``
 prefix at its hidden sizes (4096 on every architecture, 5120 and 7168 on
 sm_100a / sm_103a), except the ``bwd_finish`` routes.  This module checks the
 registry ``cake_jit.py`` against the deterministic registry's records, routes
@@ -145,8 +145,8 @@ FORMER_PACKAGES = (
 pkg = cake_package(KEY)
 nd = cake_package(KEY, "cake_jit")
 cake_build = cake_package(KEY, "cake_build")
-det = cake_package("cake_mhc_det_train", "cake_jit")
-det_build = cake_package("cake_mhc_det_train", "cake_build")
+det = cake_package("cake.cake_mhc_det_train", "cake_jit")
+det_build = cake_package("cake.cake_mhc_det_train", "cake_build")
 
 PACKAGE_DIR = Path(nd.__file__).resolve().parent
 REPO = Path(__file__).resolve().parents[2]
@@ -3488,7 +3488,7 @@ def test_entry_points_refuse_a_deterministic_keyword_first(value) -> None:
 def test_every_entry_point_has_a_deterministic_counterpart() -> None:
     """The two modes share their verbs: every entry point of this package (``is_..._supported`` included) has the
     deterministic package's entry point of the same verb (``cake_mhc_det_train_<verb>``) with the same parameters."""
-    det_package = cake_package("cake_mhc_det_train")
+    det_package = cake_package("cake.cake_mhc_det_train")
     for entry in FACADE_ENTRIES:
         det_entry = entry.replace(NONDET_API, DET_API, 1)
         assert det_entry != entry and det_entry in det_package.__all__, entry

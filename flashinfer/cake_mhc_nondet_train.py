@@ -91,9 +91,9 @@ Name map (the same verbs in both modes)::
         workspace{,_bytes}                            workspace{,_bytes}
       cake_mhc_det_train_reset_workspace            cake_mhc_nondet_train_reset_workspace
       is_cake_mhc_det_train_supported               is_cake_mhc_nondet_train_supported
-      CakeMHCDetTrainPrepareFunction                CakeMHCNondetPrepareFunction
-      CakeMHCDetTrainFinishFunction                 CakeMHCNondetFinishFunction
-      route_key                                     cake_mhc_nondet_train_route_key
+      CakeMHCDetPrepareFunction                     CakeMHCNondetPrepareFunction
+      CakeMHCDetFinishFunction                      CakeMHCNondetFinishFunction
+      cake_mhc_det_train_route_key                  cake_mhc_nondet_train_route_key
 
 The model's head (``cake_mhc_det_train_head*``) has no cross-token reduction
 and no counterpart here: use

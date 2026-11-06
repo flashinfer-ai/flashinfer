@@ -18,7 +18,7 @@ the non-deterministic backward (hidden sizes 4096, 5120 and 7168, 4 streams;
 SM100 / SM103, and SM107 at hidden 4096).
 
 This registry is a self-contained copy of the deterministic package's registry
-(``flashinfer.cake_mhc_det_train_backend.cake_jit``): every record, route, host
+(``flashinfer.experimental.cake.cake_mhc_det_train.cake_jit``): every record, route, host
 rule and table below is that registry's under the ``cake_mhc_train_`` prefix,
 except what the backward's ``bwd_finish`` route changes.  The deterministic
 column-slab records (``bwd_slab``) and final-reduction records (``bwd_reduce``)

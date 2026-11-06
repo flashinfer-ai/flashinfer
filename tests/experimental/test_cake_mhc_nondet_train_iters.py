@@ -68,8 +68,8 @@ KEY = "cake.cake_mhc_nondet_train"
 pkg = cake_package(KEY)
 loader = cake_package(KEY, "cake_jit")
 # The deterministic package: the same-input comparison point.
-det = cake_package("cake_mhc_det_train")
-det_loader = cake_package("cake_mhc_det_train", "cake_jit")
+det = cake_package("cake.cake_mhc_det_train")
+det_loader = cake_package("cake.cake_mhc_det_train", "cake_jit")
 # The package's entry points.
 forward_prepare = pkg.cake_mhc_nondet_train_forward_prepare
 forward_stats = pkg.cake_mhc_nondet_train_forward_stats

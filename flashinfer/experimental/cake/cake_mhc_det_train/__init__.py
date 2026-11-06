@@ -50,11 +50,11 @@ from .cake_jit import (
     STREAMS,
     arch_for_capability,
     route_applies,
-    route_key,
-    route_modules,
     selected_modules,
     supported_hidden_sizes,
 )
+from .cake_jit import route_key as cake_mhc_det_train_route_key
+from .cake_jit import route_modules as cake_mhc_det_train_route_modules
 
 SUPPORTED_COMPUTE_CAPABILITIES: tuple[tuple[int, int], ...] = tuple(
     sorted(ARCH_BY_CAPABILITY)
@@ -308,7 +308,7 @@ def _check_route(device: torch.device, arch: str, kind: str, hidden: int) -> Non
         kind=kind,
     ):
         raise ValueError(
-            f"no exported Cake mHC training route {route_key(hidden, kind)!r} on {arch}; "
+            f"no exported Cake mHC training route {cake_mhc_det_train_route_key(hidden, kind)!r} on {arch}; "
             f"supported hidden sizes: {supported_hidden_sizes(arch)}"
         )
     _ROUTES_CHECKED.add((arch, kind, hidden))
@@ -974,7 +974,7 @@ def _build_fast_route(
                 statics.append(host[logical_name])
             else:
                 raise ValueError(
-                    f"the {route_key(hidden, kind)!r} route needs the logical value {logical_name!r}"
+                    f"the {cake_mhc_det_train_route_key(hidden, kind)!r} route needs the logical value {logical_name!r}"
                 )
         launches.append((launch.run, _tuple_getter(sources)))
     workspace_getter = (
@@ -1035,7 +1035,7 @@ def _run_route(
                     args[position] = values[logical_name]
             except KeyError as missing:
                 raise ValueError(
-                    f"the {route_key(hidden, kind)!r} route needs the logical value {missing.args[0]!r}"
+                    f"the {cake_mhc_det_train_route_key(hidden, kind)!r} route needs the logical value {missing.args[0]!r}"
                 ) from None
             launch.run(*args)
 
@@ -2068,7 +2068,7 @@ def _as_bf16(
     return grad.contiguous().to(_BF16)
 
 
-class CakeMHCDetTrainPrepareFunction(torch.autograd.Function):
+class CakeMHCDetPrepareFunction(torch.autograd.Function):
     """Autograd node of ``forward_prepare``: ``forward(X, fn, scale, base, state) -> (U, *edges)``.
 
     Its backward is ``backward_finish``: it receives ``dU`` from the external
@@ -2153,7 +2153,7 @@ class CakeMHCDetTrainPrepareFunction(torch.autograd.Function):
         return dX, dfn, dscale, dbase, None
 
 
-class CakeMHCDetTrainFinishFunction(torch.autograd.Function):
+class CakeMHCDetFinishFunction(torch.autograd.Function):
     """Autograd node of ``forward_finish``: ``forward(X, B, state, *edges) -> Y``.
 
     Its backward is ``backward_prepare``: it returns ``dB`` for the external
@@ -2276,7 +2276,7 @@ def cake_mhc_det_train_prepare(
         workspace=workspace,
         backward_workspace=backward_workspace,
     )
-    out = CakeMHCDetTrainPrepareFunction.apply(X, fn, scale, base, state)
+    out = CakeMHCDetPrepareFunction.apply(X, fn, scale, base, state)
     U = out[0]
     # ``U`` requires grad exactly when the prepare node was recorded.
     state.recorded = U.requires_grad
@@ -2311,7 +2311,7 @@ def cake_mhc_det_train_finish(
     # The forward takes the edges off the handle: the handle then holds nothing of
     # the prepare node, and a checkpoint rerun of this call runs without them.
     edges, handle.edges = handle.edges, ()
-    return CakeMHCDetTrainFinishFunction.apply(X, B, handle.state, *edges)
+    return CakeMHCDetFinishFunction.apply(X, B, handle.state, *edges)
 
 
 __all__ = [
@@ -2319,8 +2319,8 @@ __all__ = [
     "SUPPORTED_COMPUTE_CAPABILITIES",
     "TENSOR_ALIGNMENT_BYTES",
     "WORKSPACE_ALIGNMENT_BYTES",
-    "CakeMHCDetTrainFinishFunction",
-    "CakeMHCDetTrainPrepareFunction",
+    "CakeMHCDetFinishFunction",
+    "CakeMHCDetPrepareFunction",
     "cake_mhc_det_train_backward_finish",
     "cake_mhc_det_train_backward_prepare",
     "cake_mhc_det_train_backward_workspace",
@@ -2333,7 +2333,7 @@ __all__ = [
     "cake_mhc_det_train_forward_workspace_bytes",
     "cake_mhc_det_train_prepare",
     "cake_mhc_det_train_reset_workspace",
+    "cake_mhc_det_train_route_key",
+    "cake_mhc_det_train_route_modules",
     "is_cake_mhc_det_train_supported",
-    "route_key",
-    "route_modules",
 ]

@@ -44,7 +44,7 @@ region overwritten with 0xFF before every replay, its ticket region zero after
 every replay).  Three replays, each after the static outputs and gradients were
 overwritten with 0xFF bytes, are compared with the eager non-deterministic
 iteration and the eager iteration of the deterministic package
-(``flashinfer.cake_mhc_det_train_backend``) on the same inputs: every output and
+(``flashinfer.experimental.cake.cake_mhc_det_train``) on the same inputs: every output and
 gradient but ``dfn`` bitwise; ``dfn`` within ``2 P u (sum_t |dz'_t| |x_t|)``
 per element (``P`` the chunk count of the column-slab pass, ``u = 2^-24``,
 ``dz'`` the FP64 reference's).  The graphed callables get new input values on
@@ -72,8 +72,8 @@ KEY = "cake.cake_mhc_nondet_train"
 pkg = cake_package(KEY)
 loader = cake_package(KEY, "cake_jit")
 # The deterministic package: the same-input comparison point.
-det = cake_package("cake_mhc_det_train")
-det_loader = cake_package("cake_mhc_det_train", "cake_jit")
+det = cake_package("cake.cake_mhc_det_train")
+det_loader = cake_package("cake.cake_mhc_det_train", "cake_jit")
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 STREAMS, HIDDEN, MAPPING_ROWS = 4, 4096, 24

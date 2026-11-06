@@ -20,22 +20,46 @@ Training mHC (Cake)
 
 .. note::
 
-   Every function and class exported by the deterministic package
-   ``flashinfer.cake_mhc_det_train`` and by its backends
-   ``flashinfer.cake_mhc_det_train_backend`` and
-   ``flashinfer.cake_mhc_det_train_head_backend`` has ``det`` in its name (the
-   generic constants and route helpers ``ARCHES``,
-   ``SUPPORTED_COMPUTE_CAPABILITIES``, ``TENSOR_ALIGNMENT_BYTES``,
-   ``WORKSPACE_ALIGNMENT_BYTES``, ``route_key`` and ``route_modules`` are
-   qualified by the module path). Its entry points take no ``deterministic``
-   keyword. FlashInfer 0.7.3 named this package ``flashinfer.cake_mhc_train``,
-   with ``flashinfer.cake_mhc_train_*`` and ``CakeMHCTrain*`` at the top level.
-   Those names are removed, with no alias: replace ``cake_mhc_train`` with
-   ``cake_mhc_det_train`` and ``CakeMHCTrain`` with ``CakeMHCDetTrain``. The
-   non-deterministic mode is the module ``flashinfer.cake_mhc_nondet_train``
-   described below; its former module
-   ``flashinfer.experimental.cake.cake_mhc_train`` (``cake_mhc_train_*`` with
-   ``deterministic=False``) is removed, with no alias.
+   The mode is part of every name: the deterministic module
+   ``flashinfer.cake_mhc_det_train`` (``det``) and the non-deterministic module
+   ``flashinfer.cake_mhc_nondet_train`` (``nondet``) export the same verbs, and
+   no entry point takes a ``deterministic`` keyword. Each module imports its
+   backend package under ``flashinfer.experimental.cake`` on first use. The
+   former names below are removed, with no alias: importing them fails.
+   FlashInfer 0.7.3's ``cake_mhc_train`` names were the deterministic package
+   at the top level and the non-deterministic one under
+   ``flashinfer.experimental.cake``.
+
+   .. list-table::
+      :header-rows: 1
+      :widths: 50 50
+
+      * - Former name
+        - Name now
+      * - ``flashinfer.cake_mhc_train.cake_mhc_train_<verb>`` and the top-level
+          ``flashinfer.cake_mhc_train_<verb>`` (0.7.3)
+        - ``flashinfer.cake_mhc_det_train.cake_mhc_det_train_<verb>`` (the
+          entry points and ``*_workspace_bytes`` also at the top level)
+      * - ``flashinfer.cake_mhc_train.CakeMHCTrain{Prepare,Finish}Function``
+          (0.7.3),
+          ``flashinfer.cake_mhc_det_train.CakeMHCDetTrain{Prepare,Finish}Function``
+        - ``flashinfer.cake_mhc_det_train.CakeMHCDet{Prepare,Finish}Function``
+      * - ``flashinfer.cake_mhc_det_train.route_key``
+        - ``flashinfer.cake_mhc_det_train.cake_mhc_det_train_route_key``
+      * - ``flashinfer.cake_mhc_train_backend`` (0.7.3),
+          ``flashinfer.cake_mhc_det_train_backend``
+        - ``flashinfer.experimental.cake.cake_mhc_det_train``
+      * - ``flashinfer.experimental.cake.cake_mhc_train.cake_mhc_train_<verb>``
+          with ``deterministic=False``
+        - ``flashinfer.cake_mhc_nondet_train.cake_mhc_nondet_train_<verb>``
+      * - ``flashinfer.experimental.cake.cake_mhc_train.is_cake_mhc_train_supported``
+        - ``flashinfer.cake_mhc_nondet_train.is_cake_mhc_nondet_train_supported``
+      * - ``flashinfer.experimental.cake.cake_mhc_train.CakeMHCTrain{Prepare,Finish}Function``
+        - ``flashinfer.cake_mhc_nondet_train.CakeMHCNondet{Prepare,Finish}Function``
+      * - ``flashinfer.experimental.cake.cake_mhc_train.route_key``
+        - ``flashinfer.cake_mhc_nondet_train.cake_mhc_nondet_train_route_key``
+      * - ``flashinfer.experimental.cake.cake_mhc_train_backend``
+        - ``flashinfer.experimental.cake.cake_mhc_nondet_train``
 
 Four-stream mHC training forward / backward for hidden sizes 4096, 5120 and
 7168 on SM100 and SM103 (4096 on SM107); each call takes the hidden size ``H``
@@ -98,8 +122,10 @@ static schedule.
     cake_mhc_det_train_backward_finish
     cake_mhc_det_train_prepare
     cake_mhc_det_train_finish
-    CakeMHCDetTrainPrepareFunction
-    CakeMHCDetTrainFinishFunction
+    cake_mhc_det_train_forward_workspace_bytes
+    cake_mhc_det_train_backward_workspace_bytes
+    CakeMHCDetPrepareFunction
+    CakeMHCDetFinishFunction
 
 The model's head, the mean of the last layer's four residual streams, has its
 own kernels for hidden sizes 4096, 5120 and 7168 (4096 on SM107):

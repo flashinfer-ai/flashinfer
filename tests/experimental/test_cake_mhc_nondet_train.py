@@ -38,7 +38,7 @@ part of the names: no entry point takes a ``deterministic`` keyword (passing one
 is a ``TypeError``) and nothing falls back to the deterministic package (checked
 without a device by ``test_cake_mhc_nondet_train_rules.py``).  The deterministic
 package
-(``flashinfer.cake_mhc_det_train_backend``) is the same-input reference
+(``flashinfer.experimental.cake.cake_mhc_det_train``) is the same-input reference
 throughout, never a source of tolerances.  This module checks:
 
 * accuracy against the FP64 reference of ``test_cake_mhc_det_train.py`` under
@@ -142,8 +142,8 @@ KEY = "cake.cake_mhc_nondet_train"
 pkg = cake_package(KEY)
 loader = cake_package(KEY, "cake_jit")
 # The deterministic package: the same-input comparison point (never a source of tolerances).
-det = cake_package("cake_mhc_det_train")
-det_loader = cake_package("cake_mhc_det_train", "cake_jit")
+det = cake_package("cake.cake_mhc_det_train")
+det_loader = cake_package("cake.cake_mhc_det_train", "cake_jit")
 # The package's entry points.
 backward_finish = pkg.cake_mhc_nondet_train_backward_finish
 forward_prepare = pkg.cake_mhc_nondet_train_forward_prepare

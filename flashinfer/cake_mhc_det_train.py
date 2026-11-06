@@ -66,15 +66,15 @@ without launching.  Calls of different hidden sizes may be mixed in one
 process.  Every behaviour
 switch is a keyword argument with its default in the docstring.
 
-Names and mode: this is the deterministic package.  Every function and class
-exported by this module and by its backends
-(``flashinfer.cake_mhc_det_train_backend``,
-``flashinfer.cake_mhc_det_train_head_backend``) carries ``det`` in its name,
-except the generic ``ARCHES``, ``SUPPORTED_COMPUTE_CAPABILITIES``,
-``TENSOR_ALIGNMENT_BYTES``, ``WORKSPACE_ALIGNMENT_BYTES``, ``route_key`` and
-``route_modules``.  These objects have no alias names (0.7.3's
-``flashinfer.cake_mhc_train`` names are removed, with no alias).  The
-entry points take no ``deterministic`` keyword and give the same results
+Names and mode: this is the deterministic module.  Its backend package
+``flashinfer.experimental.cake.cake_mhc_det_train`` is imported on the first
+call or attribute access (importing this module imports no backend).  Every
+name this module exports carries the mode word ``det``
+(``cake_mhc_det_train_*``, ``CakeMHCDet*Function``) except the constants
+``ARCHES`` and ``SUPPORTED_COMPUTE_CAPABILITIES``; former names have no alias
+(FlashInfer 0.7.3's ``flashinfer.cake_mhc_train`` names,
+``CakeMHCDetTrain{Prepare,Finish}Function`` and ``route_key`` fail at import).
+The entry points take no ``deterministic`` keyword, give the same results
 under ``torch.use_deterministic_algorithms(True)`` and raise no alert.  The
 non-deterministic mode is ``flashinfer.cake_mhc_nondet_train``.
 
@@ -108,34 +108,109 @@ on SM107), bit for bit torch's BF16 ``X.mean(dim=1)`` and its gradient::
 
 from __future__ import annotations
 
-from typing import Optional
+import functools
+from typing import Any, Optional
 
 import torch
 
-from . import cake_mhc_det_train_backend as _backend
 from . import cake_mhc_det_train_head_backend as _head_backend
 from .api_logging import flashinfer_api
-from .cake_mhc_det_train_backend import (  # noqa: F401
-    ARCHES,
-    SUPPORTED_COMPUTE_CAPABILITIES,
-    CakeMHCDetTrainFinishFunction,
-    CakeMHCDetTrainPrepareFunction,
-    cake_mhc_det_train_backward_workspace,
-    cake_mhc_det_train_backward_workspace_bytes,
-    cake_mhc_det_train_forward_workspace,
-    cake_mhc_det_train_forward_workspace_bytes,
-    cake_mhc_det_train_reset_workspace,
-    is_cake_mhc_det_train_supported,
-    route_key,
-)
 from .cake_mhc_det_train_head_backend import (  # noqa: F401
     CakeMHCDetTrainHeadFunction,
     is_cake_mhc_det_train_head_supported,
 )
 
+# The default hidden size of the workspace helpers: the backend's ``cake_jit.HIDDEN``,
+# spelled here so that defining the entry points imports no backend (a test checks
+# that the two agree).
+_HIDDEN = 4096
+
+
+# The backend package is imported on first use and cached: a call does not repeat the import.
+@functools.cache
+def _pkg():
+    from .experimental.cake import cake_mhc_det_train  # noqa: PLC0415 - the backend package, imported on first use
+
+    return cake_mhc_det_train
+
+
 # The stable entry points are real ``def``s here (public-API tooling reads the
 # decorated signatures of this module); their bodies live in the self-contained
-# backend package next to the generated CUDA sources.
+# backend package next to the generated CUDA sources, imported on the first call.
+
+
+@flashinfer_api
+def cake_mhc_det_train_forward_workspace_bytes(
+    T: int, device: torch.device, *, hidden: int = _HIDDEN
+) -> int:
+    r"""Bytes of the caller-owned forward workspace for up to ``T`` tokens of hidden size ``hidden``.
+
+    The forward routes (``forward_prepare`` and the ``forward_stats`` replay)
+    hold one 256-byte ticket region (first, at the same offset for every token
+    count), the BF16 pieces of ``fn`` in the mapping operand layout and the
+    FP32 per-K-unit partials of the mapping pass.  The ticket words must be
+    zero on first use (allocate with ``torch.zeros`` or
+    :func:`cake_mhc_det_train_forward_workspace`); the kernels leave them zero.
+
+    Parameters
+    ----------
+    T : int
+        Largest token count the buffer serves.  The size is the maximum over
+        every token count up to ``T``, so the buffer also serves every smaller
+        one (and CUDA graph replays at a smaller ``T``); ``T == 0`` needs no
+        workspace (nothing is launched).
+    device : torch.device
+        CUDA device of the calls.
+    hidden : int
+        Hidden size ``H`` of the calls the buffer serves (``X.shape[2]``;
+        default ``4096``): a hidden size the device's architecture exports
+        (4096, 5120 or 7168 on SM100 / SM103, 4096 on SM107), else
+        ``ValueError``.  The ``fn`` pieces and the partials scale with ``4 H``;
+        every call checks the buffer against its own ``H`` and ``T``, so a
+        buffer sized for one ``H`` is refused (``ValueError``) by a call of a
+        larger ``H`` it is too small for.
+
+    Returns
+    -------
+    The size of the forward workspace in bytes.
+    """
+
+    return _pkg().cake_mhc_det_train_forward_workspace_bytes(T, device, hidden=hidden)
+
+
+@flashinfer_api
+def cake_mhc_det_train_backward_workspace_bytes(
+    T: int, device: torch.device, *, hidden: int = _HIDDEN
+) -> int:
+    r"""Bytes of the caller-owned backward workspace for up to ``T`` tokens of hidden size ``hidden``.
+
+    The ``backward_finish`` route holds one 256-byte ticket region (first, at
+    the same offset for every token count), the transposed BF16 pieces of
+    ``fn``, the per-token records of the token-owner pass (``dz'`` pieces and
+    the per-token scalars, padded to a multiple of 128 rows), the per-CTA
+    parameter partials and the per-chunk FP32 partials of ``dfn``.  The ticket
+    words must be zero on first use (allocate with ``torch.zeros`` or
+    :func:`cake_mhc_det_train_backward_workspace`); the kernels leave them zero.
+
+    Parameters
+    ----------
+    T : int
+        Largest token count the buffer serves (the size is the maximum over
+        every token count up to ``T``); ``T == 0`` needs no workspace.
+    device : torch.device
+        CUDA device of the calls.
+    hidden : int
+        Hidden size ``H`` of the calls the buffer serves (``X.shape[2]``;
+        default ``4096``), as in
+        :func:`cake_mhc_det_train_forward_workspace_bytes`: a buffer sized for
+        one ``H`` is refused by a call of a larger ``H`` it is too small for.
+
+    Returns
+    -------
+    The size of the backward workspace in bytes.
+    """
+
+    return _pkg().cake_mhc_det_train_backward_workspace_bytes(T, device, hidden=hidden)
 
 
 @flashinfer_api
@@ -192,7 +267,7 @@ def cake_mhc_det_train_forward_prepare(
     (256 bytes per token) that the finish and backward entry points consume.
     """
 
-    return _backend.cake_mhc_det_train_forward_prepare(
+    return _pkg().cake_mhc_det_train_forward_prepare(
         X,
         fn,
         scale,
@@ -251,7 +326,7 @@ def cake_mhc_det_train_forward_stats(
     same device (the same work partition without the ``U`` write).
     """
 
-    return _backend.cake_mhc_det_train_forward_stats(
+    return _pkg().cake_mhc_det_train_forward_stats(
         X,
         fn,
         scale,
@@ -291,7 +366,7 @@ def cake_mhc_det_train_forward_finish(
     BF16 ``Y`` of shape ``[T, 4, H]``; the FP32 sum is rounded once.
     """
 
-    return _backend.cake_mhc_det_train_forward_finish(X, B, stats, out=out)
+    return _pkg().cake_mhc_det_train_forward_finish(X, B, stats, out=out)
 
 
 @flashinfer_api
@@ -329,7 +404,7 @@ def cake_mhc_det_train_backward_prepare(
     ``dpost[4] | dC[16] | zeros[12]`` that :func:`cake_mhc_det_train_backward_finish` consumes.
     """
 
-    return _backend.cake_mhc_det_train_backward_prepare(
+    return _pkg().cake_mhc_det_train_backward_prepare(
         dY, B, X, stats, dB=dB, grad_stats_out=grad_stats_out
     )
 
@@ -413,7 +488,7 @@ def cake_mhc_det_train_backward_finish(
     or left untouched (``accumulate=True``).
     """
 
-    return _backend.cake_mhc_det_train_backward_finish(
+    return _pkg().cake_mhc_det_train_backward_finish(
         X,
         dY,
         dU,
@@ -488,7 +563,7 @@ def cake_mhc_det_train_prepare(
     ``dbase``.
     """
 
-    return _backend.cake_mhc_det_train_prepare(
+    return _pkg().cake_mhc_det_train_prepare(
         X,
         fn,
         scale,
@@ -524,7 +599,7 @@ def cake_mhc_det_train_finish(X: torch.Tensor, B: torch.Tensor, handle) -> torch
     of the single-cast ``dX`` of the prepare node).
     """
 
-    return _backend.cake_mhc_det_train_finish(X, B, handle)
+    return _pkg().cake_mhc_det_train_finish(X, B, handle)
 
 
 @flashinfer_api
@@ -622,28 +697,53 @@ def cake_mhc_det_train_head(X: torch.Tensor) -> torch.Tensor:
     return _head_backend.cake_mhc_det_train_head(X)
 
 
-__all__ = [
+# The backend objects this module re-exports, resolved on first access so that
+# importing this module imports no backend.
+_LAZY = (
     "ARCHES",
     "SUPPORTED_COMPUTE_CAPABILITIES",
-    "CakeMHCDetTrainFinishFunction",
+    "CakeMHCDetFinishFunction",
+    "CakeMHCDetPrepareFunction",
+    "cake_mhc_det_train_backward_workspace",
+    "cake_mhc_det_train_forward_workspace",
+    "cake_mhc_det_train_reset_workspace",
+    "cake_mhc_det_train_route_key",
+    "is_cake_mhc_det_train_supported",
+)
+
+
+def __getattr__(name: str) -> Any:
+    if name in _LAZY:
+        return getattr(_pkg(), name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(_LAZY))
+
+
+__all__ = [
+    "ARCHES",  # noqa: F822 - resolved by __getattr__
+    "SUPPORTED_COMPUTE_CAPABILITIES",  # noqa: F822
+    "CakeMHCDetFinishFunction",  # noqa: F822
+    "CakeMHCDetPrepareFunction",  # noqa: F822
     "CakeMHCDetTrainHeadFunction",
-    "CakeMHCDetTrainPrepareFunction",
     "cake_mhc_det_train_backward_finish",
     "cake_mhc_det_train_backward_prepare",
-    "cake_mhc_det_train_backward_workspace",
+    "cake_mhc_det_train_backward_workspace",  # noqa: F822
     "cake_mhc_det_train_backward_workspace_bytes",
     "cake_mhc_det_train_finish",
     "cake_mhc_det_train_forward_finish",
     "cake_mhc_det_train_forward_prepare",
     "cake_mhc_det_train_forward_stats",
-    "cake_mhc_det_train_forward_workspace",
+    "cake_mhc_det_train_forward_workspace",  # noqa: F822
     "cake_mhc_det_train_forward_workspace_bytes",
     "cake_mhc_det_train_head",
     "cake_mhc_det_train_head_backward",
     "cake_mhc_det_train_head_forward",
     "cake_mhc_det_train_prepare",
-    "cake_mhc_det_train_reset_workspace",
+    "cake_mhc_det_train_reset_workspace",  # noqa: F822
+    "cake_mhc_det_train_route_key",  # noqa: F822
     "is_cake_mhc_det_train_head_supported",
-    "is_cake_mhc_det_train_supported",
-    "route_key",
+    "is_cake_mhc_det_train_supported",  # noqa: F822
 ]

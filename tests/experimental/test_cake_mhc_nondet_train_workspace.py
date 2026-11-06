@@ -36,7 +36,7 @@ Before every call the bytes of the backward buffer past the ticket region are
 overwritten with 0xFF (no call may depend on what an earlier call left there).
 Every call is compared with the same call on fresh zeroed exact-size
 workspaces and with the deterministic package
-(``flashinfer.cake_mhc_det_train_backend``) on the same inputs: every output but
+(``flashinfer.experimental.cake.cake_mhc_det_train``) on the same inputs: every output but
 ``dfn`` bitwise (``dscale`` / ``dbase`` against the deterministic per-CTA
 reduction where the deterministic backward runs its group-row forms, which this
 package does not copy: :func:`_det_reduction`); ``dfn`` within ``2 P u sum_t
@@ -86,8 +86,8 @@ KEY = "cake.cake_mhc_nondet_train"
 pkg = cake_package(KEY)
 loader = cake_package(KEY, "cake_jit")
 # The deterministic package: the same-input comparison point.
-det = cake_package("cake_mhc_det_train")
-det_loader = cake_package("cake_mhc_det_train", "cake_jit")
+det = cake_package("cake.cake_mhc_det_train")
+det_loader = cake_package("cake.cake_mhc_det_train", "cake_jit")
 backward_finish = pkg.cake_mhc_nondet_train_backward_finish
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
@@ -663,7 +663,7 @@ def test_default_workspace_reported_sequence(Ts: tuple, hidden: int) -> None:
             "-c",
             _REPORTED_CHILD,
             PACKAGES[KEY],
-            PACKAGES["cake_mhc_det_train"],
+            PACKAGES["cake.cake_mhc_det_train"],
             ",".join(map(str, Ts)),
             str(hidden),
         ],
