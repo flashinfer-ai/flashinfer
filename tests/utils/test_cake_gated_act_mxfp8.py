@@ -30,7 +30,7 @@ argument validation, zero-size disabled outputs, CUDA Graph replay, the
 absence of rebuilds on a changed shape and the ``build.json`` contract.
 
 This suite exercises the backend package alone: it names the package once,
-through ``tests.infra.test_helpers.cake_package``, and imports nothing else from
+through ``tests.cake.test_helpers.cake_package``, and imports nothing else from
 flashinfer, so a build that vendors the package under another import path
 runs it unchanged after pointing that table entry at its package.  The
 ``flashinfer.gated_act_mxfp8`` facade is covered by
@@ -46,7 +46,7 @@ import pytest
 import torch
 
 from tests.utils.test_helpers import cake_gated_act_mxfp8_reference as reference
-from tests.infra.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 pkg = cake_package("cake_gated_act_mxfp8")
 cake_build = cake_package("cake_gated_act_mxfp8", "cake_build")

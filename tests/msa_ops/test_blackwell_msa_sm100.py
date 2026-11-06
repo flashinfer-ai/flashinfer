@@ -1646,7 +1646,7 @@ def test_uniform_fp8_two_split_eager_calls_are_one_kernel_on_one_counter():
     device = _current_device()
     from flashinfer.msa_ops import _blackwell_sm100 as backend
     from flashinfer.msa_ops import msa_sparse_decode_attention
-    from tests.infra.test_helpers.cake_profiler import cuda_kernel_names
+    from tests.cake.test_helpers.cake_profiler import cuda_kernel_names
 
     seqlen_q = 8
     batch = _two_split_batch(backend, device, seqlen_q)
@@ -1677,7 +1677,7 @@ def test_uniform_fp8_two_split_eager_calls_are_one_kernel_on_one_counter():
 
     # Every CUDA activity of the window, read between sentinel kernels that
     # prove the session kept it whole (a session can lose its device records;
-    # see tests.infra.test_helpers.cake_profiler).  When every session lost them, the
+    # see tests.cake.test_helpers.cake_profiler).  When every session lost them, the
     # outputs and counters of the last window are still checked before the
     # launch count is skipped.
     lost = None
@@ -1995,7 +1995,7 @@ def test_union_decode_eager_calls_without_a_workspace_are_one_kernel():
     device = _current_device()
     from flashinfer.msa_ops import _blackwell_sm100 as backend
     from flashinfer.msa_ops import msa_sparse_decode_attention
-    from tests.infra.test_helpers.cake_profiler import cuda_kernel_names
+    from tests.cake.test_helpers.cake_profiler import cuda_kernel_names
 
     sets = [_union_inputs(device, batch=64, seed=181, use_workspace=False)]
     sets.append(_union_inputs(device, batch=128, seed=191, use_workspace=False))
@@ -2016,7 +2016,7 @@ def test_union_decode_eager_calls_without_a_workspace_are_one_kernel():
             outputs.append(run(sets[call % 2]))
 
     # Every CUDA activity of the window, read between sentinel kernels that
-    # prove the session kept it whole (tests.infra.test_helpers.cake_profiler).  When
+    # prove the session kept it whole (tests.cake.test_helpers.cake_profiler).  When
     # every session lost them, the outputs and carriers of the last window are
     # still checked before the launch count is skipped.
     lost = None

@@ -505,7 +505,7 @@ python benchmarks/bench_cake_moe_grouped_det_gemm.py --help
 ```
 
 `test_cake_moe_grouped_det_gemm.py` (the backend suite, which imports the package
-through `tests.infra.test_helpers.cake_package`) compares against a per-group fp64
+through `tests.cake.test_helpers.cake_package`) compares against a per-group fp64
 reference (including an empty group, a one-row group, padded outputs,
 determinism and the fp32 output) and skips when no supported device or no
 registered program is present. `test_cake_moe_grouped_det_gemm_api.py` covers the

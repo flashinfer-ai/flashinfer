@@ -44,7 +44,7 @@ from flashinfer.experimental.cake import cake_causal_conv1d_nondet_train as pkg
 from flashinfer.experimental.cake.cake_causal_conv1d_nondet_train import (
     kcp as conv_kcp,
 )
-from tests.infra.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 from tests.experimental.test_cake_causal_conv1d_nondet_train_kcp import (
     _bwd,
     _dw_within,

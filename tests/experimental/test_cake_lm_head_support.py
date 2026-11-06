@@ -23,7 +23,7 @@ weight gradient equal the deterministic entries' bits on the same inputs; the de
 the chunk sum through the K-sliced reduction (``cake_support.support_dx_form``: one slice keeps the deterministic
 bits, more slices -- only inside the rule's measured cells, or forced by a test -- add in the order they finish).  The
 gradients carry no run-to-run promise in this package and are checked over repeated runs against the gate.  The
-package is reached through ``tests.infra.test_helpers.cake_package``.
+package is reached through ``tests.cake.test_helpers.cake_package``.
 """
 
 import contextlib
@@ -39,7 +39,7 @@ from tests.experimental.test_helpers.cake_lm_head_support_reference import (
     reference_support_fp64,
     support_error_report,
 )
-from tests.infra.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 cake_support = cake_package("cake.cake_lm_head_loss", "cake_support")
 cake_backend = cake_package("cake.cake_lm_head_loss", "cake_backend")

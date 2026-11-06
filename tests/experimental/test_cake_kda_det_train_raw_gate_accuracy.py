@@ -100,7 +100,7 @@ from tests.experimental.test_helpers.cake_kda_det_train_reference import (  # no
     raw_gate,
     t_quantile,
 )
-from tests.infra.test_helpers.cake_package import cake_package  # noqa: E402
+from tests.cake.test_helpers.cake_package import cake_package  # noqa: E402
 
 cake_backend = cake_package("cake_kda_det_train", "cake_backend")
 cake_jit = cake_package("cake_kda_det_train", "cake_jit")

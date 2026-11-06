@@ -40,7 +40,7 @@ from tests.experimental.test_helpers.cake_host_sync import (
     sleep_cycles,
     summary,
 )
-from tests.infra.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 kp = cake_package("cake_kda_det_train_kcp", "cake_kcp_plan")
 cake_kcp = cake_package("cake_kda_det_train_kcp", "cake_kcp")

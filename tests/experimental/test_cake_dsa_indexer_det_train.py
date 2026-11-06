@@ -23,7 +23,7 @@ limitations under the License.
 # through the FP64 reference (minutes on B200).
 #
 # This suite exercises the package alone: it names the package once, through
-# ``tests.infra.test_helpers.cake_package``, and imports nothing else from flashinfer,
+# ``tests.cake.test_helpers.cake_package``, and imports nothing else from flashinfer,
 # so a build that vendors the package under another import path runs it
 # unchanged after pointing that table entry at its package.  The flashinfer
 # public entry points (``flashinfer.cake_dsa_indexer_det_train``) are covered by
@@ -41,7 +41,7 @@ import pytest
 import torch
 
 from tests.experimental.test_helpers import cake_dsa_indexer_reference as ref
-from tests.infra.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 cake_backend = cake_package("cake.cake_dsa_indexer_det_train", "cake_backend")
 cake_build = cake_package("cake.cake_dsa_indexer_det_train", "cake_build")

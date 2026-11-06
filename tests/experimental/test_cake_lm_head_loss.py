@@ -67,7 +67,7 @@ from tests.experimental.test_helpers.cake_lm_head_loss_reference import (
     reference_unchunked,
     rel_l2,
 )
-from tests.infra.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 # The package under test, named once through ``cake_package``; the deterministic package is the comparison arm.
 pkg = cake_package("cake.cake_lm_head_loss")
@@ -4319,7 +4319,7 @@ import torch
 
 sys.path.insert(0, sys.argv[1])
 from tests.experimental.test_helpers.cake_lm_head_loss_reference import make_inputs  # noqa: E402
-from tests.infra.test_helpers.cake_package import cake_package  # noqa: E402
+from tests.cake.test_helpers.cake_package import cake_package  # noqa: E402
 
 backend = cake_package("cake.cake_lm_head_loss", "cake_backend")
 modes = []
@@ -5678,7 +5678,7 @@ import functools, sys, torch
 import torch.utils.checkpoint as tuc
 sys.path.insert(0, {root!r})
 from tests.experimental.test_helpers.cake_lm_head_loss_reference import make_inputs
-from tests.infra.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 backend = cake_package("cake.cake_lm_head_loss", {module!r})
 W = make_inputs(1, seed={seed_w}, device="cuda", ignore_frac=0.0).W
 inp = make_inputs({T}, seed={seed}, device="cuda", W=W, ignore_frac=0.05)
@@ -10871,7 +10871,7 @@ _FRESH_PROCESS_TAU_SCRIPT = """
 import sys, torch
 sys.path.insert(0, {root!r})
 from tests.experimental.test_helpers.cake_lm_head_loss_reference import make_inputs
-from tests.infra.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 cake_backend = cake_package("cake.cake_lm_head_loss", "cake_backend")
 W = make_inputs(1, seed={seed_w}, device="cuda", ignore_frac=0.0).W  # the module fixture's weight
 inp = make_inputs({T}, seed={seed}, device="cuda", W=W, ignore_frac=0.05, temperature="hetero")
@@ -11082,7 +11082,7 @@ _TAU_ASSERT_SCRIPT = """
 import sys, torch
 sys.path.insert(0, {root!r})
 from tests.experimental.test_helpers.cake_lm_head_loss_reference import make_weight
-from tests.infra.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 cake_backend = cake_package("cake.cake_lm_head_loss", "cake_backend")
 H, V = {H}, {V}
 labels = torch.tensor([0, -100, 3, 1, -100, 2], device="cuda")

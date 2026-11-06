@@ -42,7 +42,7 @@ import torch
 from torch.utils.checkpoint import checkpoint
 
 from tests.experimental.test_helpers.cake_kda_det_train_reference import make_inputs
-from tests.infra.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 cake_backend = cake_package("cake.cake_kda_train", "cake_backend")
 cake_build = cake_package("cake.cake_kda_train", "cake_build")

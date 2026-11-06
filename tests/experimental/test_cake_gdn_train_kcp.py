@@ -65,7 +65,7 @@ from tests.experimental.test_helpers import cake_gdn_det_train_kcp_reference as 
 
 def _package(submodule: str):
     try:
-        from tests.infra.test_helpers.cake_package import cake_package
+        from tests.cake.test_helpers.cake_package import cake_package
 
         return cake_package("cake_gdn_train_kcp", submodule)
     except (

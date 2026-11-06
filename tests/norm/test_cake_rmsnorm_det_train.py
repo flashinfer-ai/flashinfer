@@ -28,7 +28,7 @@ gradient), bitwise reproducibility of ``dw``, changing token counts in one
 process and the autograd wrapper end to end.
 
 This suite exercises the backend package alone: it names the package once,
-through ``tests.infra.test_helpers.cake_package``, and imports nothing else from
+through ``tests.cake.test_helpers.cake_package``, and imports nothing else from
 flashinfer, so a build that vendors the package under another import path
 runs it unchanged after pointing that table entry at its package.  The
 ``flashinfer.cake_rmsnorm_det_train`` facade and the ``flashinfer`` top-level
@@ -44,7 +44,7 @@ from pathlib import Path
 
 import torch
 
-from tests.infra.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 pkg = cake_package("cake_rmsnorm_det_train")
 cake_build = cake_package("cake_rmsnorm_det_train", "cake_build")

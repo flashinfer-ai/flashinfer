@@ -38,7 +38,7 @@ import statistics
 import pytest
 import torch
 
-from tests.infra.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 pkg = cake_package("cake_rmsnorm_silu_gate_det_train")
 cake_rmsnorm_silu_gate_det_train_backward = (

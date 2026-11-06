@@ -45,7 +45,7 @@ import torch
 from tests.experimental.test_helpers import cake_kda_kcp_inputs as kcp_inputs
 from tests.experimental.test_helpers import cake_kda_kcp_reference as rk
 from tests.experimental.test_helpers import cake_kda_kcp_shapes as kcp_shapes
-from tests.infra.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 kp = cake_package("cake_kda_det_train_kcp", "cake_kcp_plan")
 

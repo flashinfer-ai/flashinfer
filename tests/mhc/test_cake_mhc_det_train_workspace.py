@@ -57,7 +57,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.infra.test_helpers.cake_package import PACKAGES, cake_package
+from tests.cake.test_helpers.cake_package import PACKAGES, cake_package
 
 pkg = cake_package("cake_mhc_det_train")
 loader = cake_package("cake_mhc_det_train", "cake_jit")

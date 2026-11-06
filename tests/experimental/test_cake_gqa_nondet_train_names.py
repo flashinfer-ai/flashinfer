@@ -18,7 +18,7 @@ Names of the non-deterministic GQA HD256 training module ``flashinfer.cake_gqa_n
 The public names are the facade's ``__all__`` and the backend objects it forwards to or re-exports
 (``flashinfer.experimental.cake.cake_gqa_nondet_train``): each carries the mode (``nondet``) as a token, the
 former names and package paths are gone (no alias), and no entry point takes a ``deterministic`` keyword.  The rules
-shared by every #8928 family are checked with ``tests.infra.test_helpers.cake_mode_names``; the checks here are this
+shared by every #8928 family are checked with ``tests.cake.test_helpers.cake_mode_names``; the checks here are this
 family's own.  Torch's deterministic mode is read only by the backward's alert.  Internal helpers and build identities (program and library
 stems ``cake_gqa_train_<hex>``, kernel symbols, csrc file names) keep their names.
 """
@@ -37,7 +37,7 @@ import torch
 
 import flashinfer
 import flashinfer.cake_gqa_nondet_train as public
-from tests.infra.test_helpers.cake_mode_names import (
+from tests.cake.test_helpers.cake_mode_names import (
     assert_mode_names,
     assert_no_deterministic_keyword,
     assert_old_names_fail,
@@ -168,7 +168,7 @@ def test_facade_all_is_the_entries_and_reexports():
 
 
 def test_the_shared_mode_rules_hold():
-    """The #8928 rules shared by every family (``tests.infra.test_helpers.cake_mode_names``): the facade's public names
+    """The #8928 rules shared by every family (``tests.cake.test_helpers.cake_mode_names``): the facade's public names
     carry ``nondet`` after the op, no entry point takes ``deterministic``, ``flashinfer``, the backend package and
     ``cake_backend`` bind each facade object and each backend object a facade entry calls only under the facade's
     name, and the former module paths and names fail at import in a fresh interpreter.

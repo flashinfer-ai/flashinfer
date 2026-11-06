@@ -40,7 +40,7 @@ from tests.experimental.test_helpers.cake_dsa_sparse_attention_nondet_train_refe
     rel_l2,
     rel_l2_rows,
 )
-from tests.infra.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 # The backend suite names its package once, through the shared alias helper, and imports nothing else from
 # flashinfer: a build that vendors the package under another import path runs it unchanged after pointing the

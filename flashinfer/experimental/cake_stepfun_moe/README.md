@@ -157,7 +157,7 @@ unchanged except for the four files only StepFun used.
 ## Tests
 
 `tests/experimental/test_cake_stepfun_moe.py` is the backend suite (imports the
-package only through `tests/infra/test_helpers/cake_package.py`);
+package only through `tests/cake/test_helpers/cake_package.py`);
 `tests/experimental/test_cake_stepfun_moe_api.py` tests the
 `flashinfer.fused_moe` route against the native trtllm-gen kernels and writes
 the per-family error table; its `fc1` Cake-vs-native rows are `n/a` (no

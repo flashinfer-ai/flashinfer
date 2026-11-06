@@ -9,7 +9,7 @@ every exported scheduler layout and the epilogues, plus the host-only
 communication-split tables, resolvers and configuration switches.
 
 Backend suite: the package is imported only through
-:func:`tests.infra.test_helpers.cake_package.cake_package`; the :mod:`flashinfer.mok`
+:func:`tests.cake.test_helpers.cake_package.cake_package`; the :mod:`flashinfer.mok`
 wrapper is covered by ``test_mok_bf16_api.py``.
 """
 
@@ -17,7 +17,7 @@ import pytest
 import torch
 
 from tests.experimental._mok_reference import require_gpu, single_rank_schedule
-from tests.infra.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 kernels = cake_package("cake_mok_bf16", "_kernels")
 api = cake_package("cake_mok_bf16", "api")

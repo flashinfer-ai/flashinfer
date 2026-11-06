@@ -52,7 +52,7 @@ import torch
 pytest.importorskip("tvm_ffi")
 
 import flashinfer.experimental.cake.grouped_mm as facade
-from tests.infra.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 cb = cake_package("cake.cake_moe_grouped_gemm", "cake_backend")
 cake_jit = cake_package("cake.cake_moe_grouped_gemm", "cake_jit")

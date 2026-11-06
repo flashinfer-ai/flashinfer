@@ -29,7 +29,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.infra.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 cake_build = cake_package("cake_causal_conv1d_det_train", "cake_build")
 cake_jit = cake_package("cake_causal_conv1d_det_train", "cake_jit")

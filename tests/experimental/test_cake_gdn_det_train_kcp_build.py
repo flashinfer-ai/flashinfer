@@ -33,7 +33,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.infra.test_helpers.cake_package import PACKAGES, cake_package
+from tests.cake.test_helpers.cake_package import PACKAGES, cake_package
 
 PACKAGE = "cake_gdn_det_train_kcp"
 cake_build = cake_package(PACKAGE, "cake_build")

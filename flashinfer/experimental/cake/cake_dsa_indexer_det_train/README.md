@@ -391,7 +391,7 @@ per entry.  `csrc/.clang-format` disables formatting so the digests stay valid.
 ## Tests and benchmark
 
 Tests: `tests/experimental/test_cake_dsa_indexer_det_train.py` (the backend suite, which
-imports the package only through `tests/infra/test_helpers/cake_package.py`),
+imports the package only through `tests/cake/test_helpers/cake_package.py`),
 `tests/experimental/test_cake_dsa_indexer_det_train_api.py` (the
 `flashinfer.cake_dsa_indexer_det_train` entry points) and
 `tests/experimental/test_cake_dsa_indexer_det_train_names.py` (the #8928 naming

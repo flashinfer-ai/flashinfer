@@ -22,7 +22,7 @@ checkpointing, side streams and repeated-call determinism of the weight
 gradient.
 
 This suite exercises the backend package alone: it names the package once,
-through ``tests.infra.test_helpers.cake_package``, and imports nothing else from
+through ``tests.cake.test_helpers.cake_package``, and imports nothing else from
 flashinfer.  The ``flashinfer.cake_rmsnorm_silu_gate_det_train`` facade and the
 ``flashinfer`` top-level exposure are covered by
 ``test_cake_rmsnorm_silu_gate_det_train_api.py``.
@@ -34,7 +34,7 @@ import pytest
 import torch
 import torch.utils.checkpoint
 
-from tests.infra.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 pkg = cake_package("cake_rmsnorm_silu_gate_det_train")
 cake_build = cake_package("cake_rmsnorm_silu_gate_det_train", "cake_build")

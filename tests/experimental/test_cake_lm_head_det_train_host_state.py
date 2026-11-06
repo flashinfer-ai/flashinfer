@@ -29,7 +29,7 @@ import torch
 
 import flashinfer.cake_lm_head_det_train as public
 from tests.experimental.test_helpers.cake_lm_head_loss_reference import make_inputs
-from tests.infra.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 cake_backend = cake_package("cake.cake_lm_head_det_train", "cake_backend")
 opt_in = cake_package("cake.cake_lm_head_det_train", "cake_backend_opt_in")

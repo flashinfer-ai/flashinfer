@@ -40,7 +40,7 @@ from tests.experimental.test_helpers.cake_kda_train_kcp_saved import (
     written_carry,
     written_tensors,
 )
-from tests.infra.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 kp = cake_package("cake_kda_train_kcp", "cake_kcp_plan")
 cake_backend = cake_package("cake.cake_kda_train", "cake_backend")

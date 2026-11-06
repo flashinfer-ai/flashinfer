@@ -105,7 +105,7 @@ The largest cases hold the FP64 reference in row blocks of 8192 tokens and
 the FP32 comparator in one block (about 40 GB of device memory at T = 65536
 and H = 4096; the footprint grows in proportion to H).
 This suite exercises the backend package alone: it names the package once,
-through ``tests.infra.test_helpers.cake_package``, and imports nothing else from
+through ``tests.cake.test_helpers.cake_package``, and imports nothing else from
 flashinfer, so a build that vendors the package under another import path
 runs it unchanged after pointing that table entry at its package.  The
 ``flashinfer.cake_mhc_det_train`` facade and the ``flashinfer`` top-level
@@ -126,7 +126,7 @@ import numpy as np
 import pytest
 import torch
 
-from tests.infra.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 pkg = cake_package("cake_mhc_det_train")
 cake_build = cake_package("cake_mhc_det_train", "cake_build")

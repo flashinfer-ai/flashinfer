@@ -616,7 +616,7 @@ def test_a_single_kernel_window_launches_exactly_one_kernel(no_determinism) -> N
     whose every backward route is listed in ``DET_PAIR_ROUTES`` ships no single
     kernel to count."""
     from flashinfer.cake_rmsnorm_train_backend import cake_windows as windows
-    from tests.infra.test_helpers.cake_profiler import cuda_kernel_names
+    from tests.cake.test_helpers.cake_profiler import cuda_kernel_names
 
     arch = loader.device_arch(_device().index or 0)
     found = _single_window(arch)
@@ -658,7 +658,7 @@ def test_a_single_kernel_window_launches_exactly_one_kernel(no_determinism) -> N
     torch.cuda.synchronize()
     # Every CUDA activity of the call, memsets and copies included, read
     # between sentinel kernels that prove the session kept the whole window (a
-    # session can lose its device records; see tests.infra.test_helpers.cake_profiler).
+    # session can lose its device records; see tests.cake.test_helpers.cake_profiler).
     # When every session lost them, the workspace is still checked before the
     # launch count is skipped.
     lost = None

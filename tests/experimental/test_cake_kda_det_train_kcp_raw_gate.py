@@ -86,7 +86,7 @@ from tests.experimental.test_helpers.cake_kda_det_train_reference import (
     raw_gate,
     t_quantile,
 )
-from tests.infra.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 cake_kcp = cake_package("cake_kda_det_train_kcp", "cake_kcp")
 cake_kcp_plan = cake_package("cake_kda_det_train_kcp", "cake_kcp_plan")

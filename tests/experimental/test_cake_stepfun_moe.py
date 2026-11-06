@@ -34,7 +34,7 @@ reference module.  CUDA-graph replays and fresh-process first replays must
 equal eager bitwise, and a whole-graph forward launches only Cake kernels.
 
 This suite exercises the backend package alone: it names the package once,
-through ``tests.infra.test_helpers.cake_package``, and imports nothing else from
+through ``tests.cake.test_helpers.cake_package``, and imports nothing else from
 flashinfer, so a build that vendors the package under another import path
 runs it unchanged after pointing that table entry at its package.  The
 registry and keyword tests run on CPU; every kernel test skips without an
@@ -59,7 +59,7 @@ import pytest
 import torch
 
 from tests.experimental.test_helpers import cake_stepfun_moe_reference as ref
-from tests.infra.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 pkg = cake_package("cake_stepfun_moe")
 cb = cake_package("cake_stepfun_moe", "cake_backend")

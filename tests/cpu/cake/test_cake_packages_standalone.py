@@ -19,7 +19,7 @@ imports it under its own name, without flashinfer (#6553).  The renames of
 #8928 must keep that working
 (https://github.com/flashinfer-ai/flashinfer/issues/8928#issuecomment-6680200530):
 every backend is self-contained.  This is the one check that imports every
-package of ``PACKAGES`` (``tests/infra/test_helpers/cake_package.py``); family suites
+package of ``PACKAGES`` (``tests/cake/test_helpers/cake_package.py``); family suites
 do not repeat it.  It reads the table when it runs, so a rename PR updates that
 table and nothing here; a row whose directory does not exist fails.
 
@@ -82,7 +82,7 @@ CI runs this file in the unit-test run over ``tests/``; it lives in
 The ``experimental-tests`` block of a PR body accepts only
 ``tests/experimental/``, so a PR that changes ``PACKAGES``, a package directory
 or a sibling declaration names this file when it asks for CI:
-``@flashinfer-bot run tests/cpu/infra/test_cake_packages_standalone.py``.
+``@flashinfer-bot run tests/cpu/cake/test_cake_packages_standalone.py``.
 
 CPU-only: the children run with ``CUDA_VISIBLE_DEVICES`` empty, as on a
 CPU-only consumer, and write no bytecode into the repository.  This module
@@ -102,7 +102,7 @@ from typing import Any
 
 import pytest
 
-from tests.infra.test_helpers.cake_package import PACKAGES
+from tests.cake.test_helpers.cake_package import PACKAGES
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 MANIFEST_CHECKER = REPO_ROOT / "scripts" / "check_cake_build_manifests.py"
@@ -506,7 +506,7 @@ def test_allowlist_names_packages() -> None:
     module of an import path of ``PACKAGES`` that no other entry names."""
     problems = []
     if not KEYS:
-        problems.append("PACKAGES in tests/infra/test_helpers/cake_package.py is empty")
+        problems.append("PACKAGES in tests/cake/test_helpers/cake_package.py is empty")
     paths = [path for path, _, _ in ALLOWLIST]
     stale = sorted(set(paths) - set(KEYS))
     if stale:

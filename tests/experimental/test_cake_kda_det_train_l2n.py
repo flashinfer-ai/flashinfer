@@ -27,7 +27,7 @@ import types
 import pytest
 import torch
 
-from tests.infra.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 cake_backend = cake_package("cake_kda_det_train", "cake_backend")
 cake_jit = cake_package("cake_kda_det_train", "cake_jit")

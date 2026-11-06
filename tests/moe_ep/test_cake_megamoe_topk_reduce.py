@@ -18,7 +18,7 @@ import pytest
 import torch
 
 from flashinfer.jit import cake_megamoe_topk_reduce as reducer
-from tests.infra.test_helpers.cake_profiler import cuda_kernel_names
+from tests.cake.test_helpers.cake_profiler import cuda_kernel_names
 
 _ARCHS = ("sm_100a", "sm_103a", "sm_107a")
 _CAPABILITIES = {"sm_100a": (10, 0), "sm_103a": (10, 3), "sm_107a": (10, 7)}
