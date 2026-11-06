@@ -71,6 +71,7 @@ SUPPORTED_COMPUTE_CAPABILITIES: tuple[tuple[int, int], ...] = tuple(
     sorted(ARCH_BY_CAPABILITY)
 )
 
+
 def _check_deterministic_algorithms(api: str, det_api: str) -> None:
     """``torch.use_deterministic_algorithms(True)`` before the backward of ``api``
     (PyTorch's rule: an alert before work whose result can vary from run to run;
