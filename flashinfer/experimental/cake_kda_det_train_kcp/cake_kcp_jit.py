@@ -130,7 +130,7 @@ from typing import Any
 
 import tvm_ffi
 
-from ..cake_kda_det_train import cake_jit
+from ..cake.cake_kda_det_train import cake_jit
 from . import cake_build, cake_kcp_plan
 
 # One verified build per architecture: B200 (``sm_100a``), B300 / GB300
