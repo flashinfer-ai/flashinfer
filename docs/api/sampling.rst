@@ -33,6 +33,11 @@ Kernels for LLM sampling.
     log_softmax
     log_probs
     entropy
+    log_probs_tp_partials
+    log_probs_tp_merge
+    log_probs_tp
+    log_softmax_tp
+    softmax_tp
     top_p_sampling_from_probs
     top_k_sampling_from_probs
     min_p_sampling_from_probs

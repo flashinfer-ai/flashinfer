@@ -10,4 +10,5 @@ import BIKernels.Quant
 import BIKernels.QuantExport
 import BIKernels.QuantCases
 import BIKernels.Sampling
+import BIKernels.SamplingTP
 import BIKernels.SamplingCases

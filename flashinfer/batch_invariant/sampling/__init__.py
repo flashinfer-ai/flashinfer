@@ -15,3 +15,9 @@ _jit.MODULE_ROOTS.setdefault(
 _jit.MODULE_ROOTS.setdefault(
     "batch_invariant_sampling_mufu", ("batch_invariant/sampling/mufu_device.py",)
 )
+# the tensor-parallel kernels of lse.row (a rank's partials, the merge, the sharded outputs): their own module, so an
+# edit to them never recompiles the row kernels (they import the row kernel's loader / peers plumbing, so a row-kernel
+# edit recompiles both)
+_jit.MODULE_ROOTS.setdefault(
+    "batch_invariant_sampling_tp", ("batch_invariant/sampling/tp_kernel.py",)
+)

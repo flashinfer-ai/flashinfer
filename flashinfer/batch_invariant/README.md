@@ -129,6 +129,7 @@ depend on the batch; the class is what the mode promises instead.
 | `log_softmax(logits, temperature)` | the same class and fingerprint (`fingerprint("log_softmax", ...)`) | the row `logp_j = mul.rn(add.rn(z_j, neg(lg2.approx.ftz(s))), ln 2)` in fp32, shape `logits.shape` | as above; this entry has no non-invariant implementation (`batch_invariant=False` raises) |
 | `log_probs(logits, token_ids, temperature, return_lse=, return_entropy=)` | the same class and fingerprint (`fingerprint("log_probs", ...)`); with `return_entropy` also the entropy member below (its own fingerprint) | the log-softmax row above gathered at the row's token ids (NaN for an id outside `[0, N)`), with `return_lse` the row's `lse = mul.rn(add.rn(mul.rn(m, c), lg2.approx.ftz(s)), ln 2)`, with `return_entropy` the row's entropy below (one launch; the tuple is `logp`, then `lse`, then `entropy` as asked); fp32 outputs of the ids' shape / `logits.shape[:-1]` | as above; `token_ids` int32 / int64 of shape `logits.shape[:-1]` (one id per row) or `logits.shape[:-1] + (K,)` (`K` ids per row in one launch); `batch_invariant=False` raises |
 | `entropy(logits, temperature)` | the entropy member of `lse.row`; `fingerprint("entropy", N=, dtype=, temperature=)` (its own: the member's tree and chain; the class's other fingerprints do not move) | a third tree `W` with the digits of `s` over `w_j = ZSEL(e_j, mul.rn(e_j, z_j))`, `ZSEL(e, p) = +0 if e == 0 else p` an exact select (`setp.eq` + `selp`: a `-inf` logit's weight-less NaN product becomes the additive identity `+0`, the identity the padded elements feed; a NaN weight passes); `H = mul.rn(add.rn(lg2.approx.ftz(s), neg(div.rn(W, s))), ln 2)`, the natural entropy `-sum p ln p` of `softmax(x / T)` (`p_j = e_j / s`, `ln p_j = ln 2 (z_j - lg2 s)`); `W` rides the sum pass (no third pass); fp32 of shape `logits.shape[:-1]`; a one-hot row is exactly `0`, an all-`-inf` or NaN row is NaN | as above; `batch_invariant=False` raises |
+| `log_probs_tp_partials(...)`, `log_probs_tp_merge(...)`, `log_probs_tp(...)`, `log_softmax_tp(...)`, `softmax_tp(...)` | the same class and fingerprint, on a vocabulary shard of a tensor-parallel rank | the tensor-parallel protocol of the class: two rounds of the class's own sub-trees and their merge, the sharded outputs from the merged statistics -- the subsection "The tensor-parallel protocol" below | the shard as `(..., hi - lo)`; the ranks' shards a contiguous tiling of `[0, N)` on multiples of 8 columns |
 
 The entropy is what the RL trainers form next to the token log-probability on the same logits (verl's `entropy_from_logits`,
 Miles' `_VocabParallelEntropy`, NeMo RL's `ChunkedDistributedEntropy`: the entropy of `softmax(x / T)`), so the member
@@ -170,3 +171,63 @@ kernel bit for bit under the restricted identity hypotheses the spec's digits cl
 rendered by `sampling/lean_cases.py`; kernel `decide` only), which the device-free test
 `tests/batch_invariant/test_sampling_lean.py` compares with the Python specification. Tests:
 `tests/utils/test_batch_invariant_sampling.py`.
+
+### The tensor-parallel protocol
+
+The RL trainers hold the vocabulary sharded over the tensor-parallel ranks and form the token log-probability from a
+per-rank maximum and a per-rank `exp(x - m)` sum joined by two all-reduces (Megatron's `vocab_parallel_cross_entropy`,
+NeMo RL's distributed log-softmax, Miles and verl under Megatron); that dataflow rounds differently from the full row,
+so their parity modes gather the whole row. The class's trees are defined on the global vocabulary, so a rank holding
+the slot-aligned shard `[lo, hi)` (multiples of 8; the last shard may end at `N`) can compute every **maximal complete
+sub-tree** of the row trees inside its shard, and the ranks' partials merged by the fixed upper part of the tree are the
+global term node for node. The entries, on every rank:
+
+| API | Class and fingerprint | Numerics | Supported inputs |
+|---|---|---|---|
+| `log_probs_tp_partials(shard_logits, shard_start, shard_end, vocab_size, temperature, m=None, width=)` | `lse.row`; `fingerprint("log_probs", N=, dtype=, temperature=)` -- the partials are the class's own sub-trees, the wire format (`sampling/shards.py: ShardLayout`) a layout, not a class | round 1 (`m=None`): per lane of the row tree the dyadic decomposition of the lane's in-shard block range, each piece the `max.f32` sub-tree at that position, concatenated lane by lane (`P_r` fp32 per row: 104..264 for the eight shards of 152064; a function of `(lo, hi, N)` only); round 2 (`m` the merged maximum): the same pieces of the `add.rn` tree over `ex2.approx.ftz(mul.rn(add.rn(x, neg(m)), c))` | the shard as `(..., hi - lo)` bf16 / f16 / fp32; `width >= P_r` pads to the all-gather's common width; SM100 / SM103 / SM107 |
+| `log_probs_tp_merge(partials, bounds, vocab_size, kind="max" \| "sum")` | the same | every rank: the ranks' pieces combined in the trees' own association (a node is a rank's piece or the combine of its children; absent children dropped), then the lane tree -- the row class's `m` / `s` bit for bit, identical on every rank | `partials` `(..., R, Pmax)` fp32 in rank order; `bounds` a contiguous tiling of `[0, N)` on multiples of 8 |
+| `log_probs_tp(shard_logits, token_ids, shard_start, shard_end, vocab_size, m, s, temperature, return_lse=)` | the same | the class's `logp` chain where the row's id lies in the shard, exactly `+0` for the other ids in `[0, N)` (one non-zero term per row: the trainer's all-reduce SUM is exact, `x + (+0) = x`; a log-probability of this class is never `-0.0`), NaN outside `[0, N)`; `lse` from `(m, s)` | as above; `token_ids` one global id per row |
+| `log_softmax_tp(...)`, `softmax_tp(...)` | the same | the shard's columns of the log-softmax / softmax row from `(m, s)`: the full row's `[..., lo:hi]` bit for bit | as above |
+
+**Two rounds, by necessity.** The class's sum tree is over `e_j = ex2((x_j - m) c)` with the *global* maximum. A
+one-round protocol exchanging per-rank `(m_r, s_r)` and merging them with the online-softmax rescale
+`s = sum_r s_r ex2((m_r - m) c)` is a different term (a different rounding sequence: `ex2(a) ex2(b)` is not `ex2(a + b)`
+in binary32, and `x - m_r` is not `x - m`), i.e. a different class, never bit-identical to the TP = 1 row; the test
+`test_online_merge_is_not_the_class` pins the structural inequality. So: max partials -> all-gather -> merge -> `m`;
+sum partials over `ex2((x - m) c)` -> all-gather -> merge -> `s`; the sharded outputs from `(m, s)`. The collectives are
+the trainer's (the API takes the gathered tensor); a rank sends `2 x 4 Pmax` bytes per row (256 B at 32768 / 262144 at
+any TP, 1.6-2.6 KB at 128256 / 152064) against the 2 x 4 B of the two-all-reduce protocol and the `2 N` bytes of a full
+row gather (304 KB at 152064); `tp_api.lse_row_tp_stats` runs the two rounds given the trainer's all-gather.
+
+The partials kernel (`sampling/tp_kernel.py`) covers the shard's block span with `kpw W C` blocks aligned to the CTA
+unit, runs the engine's slot fold (`canon.init_state`), forms the pieces as the adjacent-pairs trees over the thread's
+chunk, the warps' chunk roots (the engine's warp exchange) and the CTAs' roots (the cluster exchange), and stores each
+candidate at its layout slot when it is a maximal in-shard sub-tree; its configuration space (`sampling/tp_schedule.py`)
+is a placement space (every member writes the identical tensor; the vector width follows the shard tensor's alignment,
+a view of a wider tensor or the last shard of a vocabulary that is not a multiple of 8 forcing a narrow one). The merge
+kernel stages the CTA's rows' partials in shared memory, gives every tree lane its own warp (the lane class's
+straight-line program -- `shards.merge_ops`, the merge recursion linearised -- is then a warp-uniform branch) and runs
+the engine's lane butterfly per row; a tiling with one lane class keeps the lane-mapped form.
+
+The Lean model (`lean/BIKernels/SamplingTP.lean`) proves the merge: `mergeNode_eq_subtree` (rebuilding a block tree from
+any family of given nodes that carry the tree's own sub-trees yields the tree, provided every present leaf lies under a
+given node), `tiling_cover` (for shards tiling `[0, N)` on slot boundaries every present block of every lane lies under a
+piece of the rank holding it), **`tpMax_eq_specMax` / `tpSum_eq_specSum` / `tp_protocol` / `tpOutputs_eq_specOutputs`**:
+the merge of the ranks' pieces, then the lane tree, *is* the spec's maximum / sum term, round 2 over the merged maximum
+is `specSumOfMax`, and every rank's outputs are the spec's -- term identities, so bitwise equality needs no commutativity
+assumption; `piece_via_units` (a piece formed over an aligned group of chunk roots is the sub-tree). The generated cases
+print the merged maximum and sum of three toy tilings and a shard's piece terms, and the production layouts' piece
+tables (32000 / 8, 32768 / 2, 128256 / 8, 151936 / 4, 152064 / 8, 262144 / 8 and Megatron's padded 152576 / 8 and
+129024 / 8) next to their tiling facts and the protocol theorem instantiated for any row and temperature; `lake exe samplingconformance` prints them and the device-free test compares them with
+Python's. Tests: `tests/utils/test_batch_invariant_sampling_tp.py` (device-free: the layout equals the maximal
+sub-trees, the partials program traced over every unit of every configuration stores exactly the layout's pieces as the
+canonical sub-tree terms, the merge program rebuilds the row term; on a device: TP 1 / 2 / 4 / 8 of the production
+vocabularies and Megatron's padded shards bit-identical to the TP = 1 kernel and the exact model, every sharded output
+equal to the full row's, whole-space agreement of the partials tensor, batch invariance per shard, masked / NaN / inf
+rows, a partial last slot, empty shards, M = 0, graph replay, the `+0` filler).
+
+Measured (CUPTI kernel time of one rank's five kernels, cold L2, bf16, the sandbox's `bench_sampling.py --ops
+log_probs_tp{2,4,8}`): at M = 4096 a TP-8 rank finishes in 1.8-4.7x (Vera Rubin, SM107) / 2.3-5.0x (B200, SM100) less
+time than one device needs for the whole row (the two shard reads against the full-row kernel's single
+register-resident pass: the ideal is TP / 2) and 8-33x faster than the trainers' per-rank max + exp-sum dataflow in
+torch; at M <= 64 the five kernel floors (~2-4 us each) cost 10-26 us against a 4-8 us full row.

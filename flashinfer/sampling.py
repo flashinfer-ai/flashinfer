@@ -17,7 +17,7 @@ limitations under the License.
 import functools
 from numbers import Real
 from types import SimpleNamespace
-from typing import Optional, Tuple, Union
+from typing import Optional, Sequence, Tuple, Union
 import torch
 
 from .api_logging import flashinfer_api
@@ -1266,6 +1266,334 @@ def entropy(
     from .batch_invariant.sampling.api import entropy_batch_invariant
 
     return entropy_batch_invariant(logits, temperature, enable_pdl)
+
+
+@flashinfer_api
+def log_probs_tp_partials(
+    shard_logits: torch.Tensor,
+    shard_start: int,
+    shard_end: int,
+    vocab_size: int,
+    temperature: Optional[Union[torch.Tensor, float]] = None,
+    *,
+    m: Optional[torch.Tensor] = None,
+    width: Optional[int] = None,
+    enable_pdl: Optional[bool] = None,
+    batch_invariant: bool = True,
+) -> torch.Tensor:
+    r"""A tensor-parallel rank's partials of the batch-invariant log-probability class over its vocabulary shard: the
+    first of the two rounds that let ``TP = N`` ranks reproduce the full-row :func:`log_probs` bit for bit without
+    gathering the row (the trainers' vocabulary-parallel seam: Megatron's ``vocab_parallel_cross_entropy``, NeMo RL's
+    distributed log-softmax, Miles and verl under Megatron compute a per-rank maximum and a per-rank ``exp(x - m)`` sum
+    joined by two all-reduces, which round differently from the full row).
+
+    The class ``lse.row`` (``flashinfer/batch_invariant/README.md``) defines its row maximum and sum as fixed trees over
+    the whole vocabulary; a rank holding the slot-aligned shard ``logits[..., shard_start:shard_end]`` (multiples of 8;
+    the last shard may end at ``vocab_size``) computes every maximal complete sub-tree of those trees inside its shard.
+    Round 1 (``m=None``) gives the max tree's partials; the trainer all-gathers them and every rank merges them with
+    :func:`log_probs_tp_merge` into the row maximum ``m``. Round 2 (``m=`` that maximum) gives the sum tree's partials
+    over ``ex2((x - m) * c)``; merged, they give the row sum ``s``. Two rounds are necessary: a one-round merge of
+    per-rank ``(m_r, s_r)`` pairs is a different dataflow (a different class), never the full row's bits. The partials
+    carry the class's fingerprint, ``flashinfer.batch_invariant.fingerprint("log_probs", N=, dtype=, temperature=)``:
+    the wire format is a layout of the class's own sub-trees, not a class.
+
+    Parameters
+    ----------
+    shard_logits : torch.Tensor
+        CUDA tensor of shape ``(..., shard_end - shard_start)``, dtype bfloat16, float16 or float32: this rank's
+        columns of the logits.
+    shard_start : int
+        The first vocabulary column of the shard (a multiple of 8).
+    shard_end : int
+        One past the last column (a multiple of 8, or ``vocab_size`` for the last shard).
+    vocab_size : int
+        The full vocabulary size ``N`` (the trees are defined on it).
+    temperature : Optional[Union[torch.Tensor, float]]
+        As in :func:`log_probs`: ``None``, a positive scalar, or one value per row.
+    m : Optional[torch.Tensor]
+        ``None`` for round 1; for round 2 the merged row maximum (float32 of shape ``shard_logits.shape[:-1]``).
+    width : Optional[int]
+        Pad the partials to this many columns (zeros in the tail) so every rank's tensor has the all-gather's common
+        width ``Pmax = max_r P_r``; ``None`` writes exactly this shard's ``P_r`` columns.
+    enable_pdl : Optional[bool]
+        Whether to launch with Programmatic Dependent Launch; ``None`` (default) follows the device.
+    batch_invariant : bool
+        This entry has no other implementation: ``True`` (the default) is the only accepted value.
+
+    Returns
+    -------
+    partials : torch.Tensor
+        float32 tensor of shape ``shard_logits.shape[:-1] + (P,)`` with ``P = width`` or this shard's partial count (a
+        few hundred values per row: 104..264 for the eight shards of a 152064 vocabulary; a function of the shard and
+        the vocabulary only, never of the kernel configuration).
+
+    Raises
+    ------
+    flashinfer.batch_invariant.BatchInvariantUnsupportedError
+        For inputs outside the class (dtype, device, architecture, a shard boundary that is not a multiple of 8); the
+        entry never falls back.
+
+    Examples
+    --------
+    >>> import torch
+    >>> import flashinfer
+    >>> N, R = 32768, 4                                  # a vocabulary over four ranks
+    >>> bounds = [(r * N // R, (r + 1) * N // R) for r in range(R)]
+    >>> full = torch.randn(2, N, device="cuda", dtype=torch.bfloat16)
+    >>> lo, hi = bounds[1]                               # rank 1's shard
+    >>> p1 = flashinfer.sampling.log_probs_tp_partials(full[:, lo:hi], lo, hi, N, width=32)
+    >>> p1.shape, p1.dtype
+    (torch.Size([2, 32]), torch.float32)
+    """
+    if not batch_invariant:
+        raise ValueError(
+            "log_probs_tp_partials has only its batch-invariant class; batch_invariant=False selects nothing"
+        )
+    if not shard_logits.is_cuda:
+        raise ValueError(
+            f"shard_logits must be a CUDA tensor, got device={shard_logits.device}"
+        )
+    from .batch_invariant.sampling.tp_api import log_probs_tp_partials_batch_invariant
+
+    return log_probs_tp_partials_batch_invariant(
+        shard_logits,
+        shard_start,
+        shard_end,
+        vocab_size,
+        temperature,
+        m=m,
+        width=width,
+        enable_pdl=enable_pdl,
+    )
+
+
+@flashinfer_api
+def log_probs_tp_merge(
+    partials: torch.Tensor,
+    bounds: Sequence[Tuple[int, int]],
+    vocab_size: int,
+    *,
+    kind: str,
+    enable_pdl: Optional[bool] = None,
+    batch_invariant: bool = True,
+) -> torch.Tensor:
+    r"""Merge every tensor-parallel rank's partials (:func:`log_probs_tp_partials`) into the row statistic of the
+    batch-invariant log-probability class: the row maximum (``kind="max"``, round 1) or the row sum (``kind="sum"``,
+    round 2), fp32 per row, identical on every rank and bit for bit the statistic the full-row :func:`log_probs` forms.
+
+    The merge rebuilds the class's trees from the ranks' sub-trees in the trees' own association (every node is a
+    rank's piece or the combine of its children, absent children dropped), then runs the lane tree: no new arithmetic
+    exists. Run it on every rank after the trainer's all-gather of the partials.
+
+    Parameters
+    ----------
+    partials : torch.Tensor
+        float32 tensor of shape ``(..., R, Pmax)``: rank ``r``'s partials in ``[..., r, :]`` (padded to the common
+        width ``Pmax``), in the order of ``bounds``.
+    bounds : Sequence[Tuple[int, int]]
+        The ranks' shards ``[(lo_0, hi_0), ..., (lo_{R-1}, hi_{R-1})]``: a contiguous tiling of ``[0, vocab_size)`` on
+        multiples of 8 columns (Megatron's equal splits of the padded vocabulary are such tilings).
+    vocab_size : int
+        The full vocabulary size.
+    kind : str
+        ``"max"`` for round 1, ``"sum"`` for round 2.
+    enable_pdl : Optional[bool]
+        Whether to launch with Programmatic Dependent Launch; ``None`` (default) follows the device.
+    batch_invariant : bool
+        This entry has no other implementation: ``True`` (the default) is the only accepted value.
+
+    Returns
+    -------
+    statistic : torch.Tensor
+        float32 tensor of shape ``partials.shape[:-2]``: the row maximum ``m`` (round 1) or the row sum ``s`` (round 2).
+
+    Raises
+    ------
+    flashinfer.batch_invariant.BatchInvariantUnsupportedError
+        For a tiling outside the class (a boundary that is not a multiple of 8, a gap or an overlap) or an unsupported
+        device; the entry never falls back.
+    """
+    if not batch_invariant:
+        raise ValueError(
+            "log_probs_tp_merge has only its batch-invariant class; batch_invariant=False selects nothing"
+        )
+    if not partials.is_cuda:
+        raise ValueError(
+            f"partials must be a CUDA tensor, got device={partials.device}"
+        )
+    from .batch_invariant.sampling.tp_api import log_probs_tp_merge_batch_invariant
+
+    return log_probs_tp_merge_batch_invariant(
+        partials, bounds, vocab_size, kind=kind, enable_pdl=enable_pdl
+    )
+
+
+@flashinfer_api
+def log_probs_tp(
+    shard_logits: torch.Tensor,
+    token_ids: torch.Tensor,
+    shard_start: int,
+    shard_end: int,
+    vocab_size: int,
+    m: torch.Tensor,
+    s: torch.Tensor,
+    temperature: Optional[Union[torch.Tensor, float]] = None,
+    *,
+    return_lse: bool = False,
+    enable_pdl: Optional[bool] = None,
+    batch_invariant: bool = True,
+):
+    r"""The token log-probability of the batch-invariant class on a tensor-parallel rank's vocabulary shard, from the
+    merged row statistics: the rows whose token id lies in ``[shard_start, shard_end)`` get the class's
+    ``logp = ((x_t - m) * c - lg2(s)) * ln2``, every other row with an id in ``[0, vocab_size)`` gets exactly ``+0``,
+    so the trainer's all-reduce SUM over the ranks is exact (one non-zero term per row) and yields the full-row
+    :func:`log_probs` bit for bit. An id outside ``[0, vocab_size)`` gives NaN on every rank.
+
+    ``m`` and ``s`` are the two merges of :func:`log_probs_tp_merge` (identical on every rank), so ``lse`` is too.
+
+    Parameters
+    ----------
+    shard_logits : torch.Tensor
+        CUDA tensor of shape ``(..., shard_end - shard_start)``, dtype bfloat16, float16 or float32.
+    token_ids : torch.Tensor
+        Integer tensor of shape ``shard_logits.shape[:-1]``: one global vocabulary id per row.
+    shard_start, shard_end, vocab_size : int
+        The shard (multiples of 8; the last may end at ``vocab_size``) and the full vocabulary size.
+    m, s : torch.Tensor
+        The merged row maximum and row sum (float32 of shape ``shard_logits.shape[:-1]``).
+    temperature : Optional[Union[torch.Tensor, float]]
+        As in :func:`log_probs`; the same value the partials were formed with.
+    return_lse : bool
+        Also return the row's natural log-sum-exp from ``(m, s)``.
+    enable_pdl : Optional[bool]
+        Whether to launch with Programmatic Dependent Launch; ``None`` (default) follows the device.
+    batch_invariant : bool
+        This entry has no other implementation: ``True`` (the default) is the only accepted value.
+
+    Returns
+    -------
+    logp : torch.Tensor
+        float32 tensor of shape ``shard_logits.shape[:-1]``: this rank's term of the token log-probability.
+    lse : torch.Tensor
+        Only with ``return_lse=True``: float32 tensor of the same shape with the row's log-sum-exp.
+
+    Raises
+    ------
+    flashinfer.batch_invariant.BatchInvariantUnsupportedError
+        For inputs outside the class; the entry never falls back.
+    """
+    if not batch_invariant:
+        raise ValueError(
+            "log_probs_tp has only its batch-invariant class; batch_invariant=False selects nothing"
+        )
+    if not shard_logits.is_cuda:
+        raise ValueError(
+            f"shard_logits must be a CUDA tensor, got device={shard_logits.device}"
+        )
+    from .batch_invariant.sampling.tp_api import log_probs_tp_batch_invariant
+
+    return log_probs_tp_batch_invariant(
+        shard_logits,
+        token_ids,
+        shard_start,
+        shard_end,
+        vocab_size,
+        m,
+        s,
+        temperature,
+        return_lse=return_lse,
+        enable_pdl=enable_pdl,
+    )
+
+
+@flashinfer_api
+def log_softmax_tp(
+    shard_logits: torch.Tensor,
+    shard_start: int,
+    shard_end: int,
+    vocab_size: int,
+    m: torch.Tensor,
+    s: torch.Tensor,
+    temperature: Optional[Union[torch.Tensor, float]] = None,
+    *,
+    enable_pdl: Optional[bool] = None,
+    batch_invariant: bool = True,
+) -> torch.Tensor:
+    r"""The shard's columns of the batch-invariant log-softmax row from the merged statistics ``m`` and ``s``
+    (:func:`log_probs_tp_merge`): fp32 of ``shard_logits.shape``, bit for bit
+    ``log_softmax(full_logits, temperature)[..., shard_start:shard_end]``. The arguments are those of
+    :func:`log_probs_tp` without the token ids.
+
+    Raises
+    ------
+    flashinfer.batch_invariant.BatchInvariantUnsupportedError
+        For inputs outside the class; the entry never falls back.
+    """
+    if not batch_invariant:
+        raise ValueError(
+            "log_softmax_tp has only its batch-invariant class; batch_invariant=False selects nothing"
+        )
+    if not shard_logits.is_cuda:
+        raise ValueError(
+            f"shard_logits must be a CUDA tensor, got device={shard_logits.device}"
+        )
+    from .batch_invariant.sampling.tp_api import log_softmax_tp_batch_invariant
+
+    return log_softmax_tp_batch_invariant(
+        shard_logits,
+        shard_start,
+        shard_end,
+        vocab_size,
+        m,
+        s,
+        temperature,
+        enable_pdl=enable_pdl,
+    )
+
+
+@flashinfer_api
+def softmax_tp(
+    shard_logits: torch.Tensor,
+    shard_start: int,
+    shard_end: int,
+    vocab_size: int,
+    m: torch.Tensor,
+    s: torch.Tensor,
+    temperature: Optional[Union[torch.Tensor, float]] = None,
+    *,
+    enable_pdl: Optional[bool] = None,
+    batch_invariant: bool = True,
+) -> torch.Tensor:
+    r"""The shard's columns of the batch-invariant softmax row (the input dtype) from the merged statistics ``m`` and
+    ``s`` (:func:`log_probs_tp_merge`): bit for bit
+    ``softmax(full_logits, temperature, batch_invariant=True)[..., shard_start:shard_end]``. The arguments are those
+    of :func:`log_probs_tp` without the token ids.
+
+    Raises
+    ------
+    flashinfer.batch_invariant.BatchInvariantUnsupportedError
+        For inputs outside the class; the entry never falls back.
+    """
+    if not batch_invariant:
+        raise ValueError(
+            "softmax_tp has only its batch-invariant class; batch_invariant=False selects nothing"
+        )
+    if not shard_logits.is_cuda:
+        raise ValueError(
+            f"shard_logits must be a CUDA tensor, got device={shard_logits.device}"
+        )
+    from .batch_invariant.sampling.tp_api import softmax_tp_batch_invariant
+
+    return softmax_tp_batch_invariant(
+        shard_logits,
+        shard_start,
+        shard_end,
+        vocab_size,
+        m,
+        s,
+        temperature,
+        enable_pdl=enable_pdl,
+    )
 
 
 @flashinfer_api(trace=sampling_from_logits_trace)
