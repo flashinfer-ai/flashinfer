@@ -24,7 +24,10 @@ stem (its ``build.json`` entries are ``<library>_<arch>``), the architectures
 it is delivered for, the source ``module`` and ``build`` keywords it was
 rendered from, the sigmoid numerics it implements (``sigmoid``: ``"fp32"``,
 the only mode the API offers), the ``ffi_entry`` it exports and the grid rule
-:func:`launch_grid` evaluates.  The derived leaves of a record
+:func:`launch_grid` evaluates.  An architecture may have one program per row
+tile: the records of one ``(arch, sigmoid)`` differ in ``grid_rule["rows"]``
+(16 or 8 token rows per CTA), the key the host selects on
+(:func:`tile_rows`).  The derived leaves of a record
 (``kernel_symbol``, ``launch.block``, ``launch.cluster``,
 ``launch.cooperative``, ``launch.dynamic_smem_bytes``, ``launch.use_pdl``,
 ``arg_plan`` and ``logical``) are rewritten by the exporter from the rendered
@@ -118,6 +121,50 @@ MODULES: dict[str, dict[str, Any]] = {
             "w_uv": "w_uv",
         },
     },
+    "cake_mla_value_gate_0df66a90a1dc776a3834": {
+        "library": "cake_mla_value_gate_0df66a90a1dc776a3834",
+        "kernel": "cake_mla_value_gate_0df66a90a1dc776a3834",
+        "arches": ["sm_100a", "sm_103a"],
+        "module": "tart.mla_value_proj_sigmoid_gate_bf16.sm100_sm103.mla_value_gate",
+        "build": {"tile_rows": 8},
+        "sigmoid": "fp32",
+        "ffi_entry": "run",
+        "grid_rule": {"kind": "value_tiles", "cols": 32, "rows": 8},
+        "kernel_symbol": "kernel_cake_mla_value_gate_0df66a90a1dc776a3834",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 8704,
+            "use_pdl": "runtime",
+        },
+        "arg_plan": [
+            ["buffer", "latent"],
+            ["buffer", "w_uv"],
+            ["buffer", "gate"],
+            ["buffer", "valid_lengths"],
+            ["buffer", "out"],
+            ["parameter", "rows"],
+            ["parameter", "heads"],
+            ["parameter", "rows_per_request"],
+            ["parameter", "gate_pitch"],
+            ["launch", "enable_pdl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "logical": {
+            "gate": "gate",
+            "gate_pitch": "gate_pitch",
+            "heads": "heads",
+            "latent": "latent",
+            "out": "out",
+            "rows": "rows",
+            "rows_per_request": "rows_per_request",
+            "valid_lengths": "valid_lengths",
+            "w_uv": "w_uv",
+        },
+    },
 }
 
 
@@ -137,6 +184,14 @@ def device_arch(device_index: int) -> str | None:
     return arch_for_capability(tuple(torch.cuda.get_device_capability(device_index)))
 
 
+@functools.cache
+def device_sm_count(device_index: int) -> int:
+    """Streaming multiprocessor count of one CUDA device (immutable per process)."""
+    import torch
+
+    return int(torch.cuda.get_device_properties(device_index).multi_processor_count)
+
+
 def records_for(arch: str, sigmoid: str) -> list[str]:
     """Names of the records delivered for ``arch`` that implement ``sigmoid``, in registry order."""
     return [
@@ -144,6 +199,23 @@ def records_for(arch: str, sigmoid: str) -> list[str]:
         for name, record in MODULES.items()
         if arch in record["arches"] and record["sigmoid"] == sigmoid
     ]
+
+
+def tile_rows(record: dict[str, Any]) -> int:
+    """Token rows per CTA of one record (its ``grid_rule["rows"]``): the key that tells the
+    programs of one ``(arch, sigmoid)`` apart."""
+    rule = record["grid_rule"]
+    rows = rule.get("rows")
+    if (
+        rule.get("kind") != "value_tiles"
+        or isinstance(rows, bool)
+        or not isinstance(rows, int)
+        or rows <= 0
+    ):
+        raise RuntimeError(
+            f"record {record['library']} has no positive value_tiles row tile: {rule}"
+        )
+    return rows
 
 
 def library_name(name: str, arch: str) -> str:
@@ -204,9 +276,11 @@ __all__ = [
     "VALUE_DIM",
     "arch_for_capability",
     "device_arch",
+    "device_sm_count",
     "launch_grid",
     "library_name",
     "load",
     "records_for",
     "specs_for_arch",
+    "tile_rows",
 ]
