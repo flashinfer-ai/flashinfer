@@ -685,7 +685,7 @@ def lazy_exported_names(tree: ast.Module) -> dict[str, str]:
             for target in targets
         ):
             continue
-        for key, row in zip(value.keys, value.values):
+        for key, row in zip(value.keys, value.values, strict=True):
             if not (
                 isinstance(key, ast.Constant)
                 and isinstance(key.value, str)

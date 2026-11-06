@@ -686,8 +686,17 @@ class LazyExportTableTest(unittest.TestCase):
         }
         findings = compare_snapshots(base, head)
         self.assertEqual(
-            [(f.check, f.message) for f in findings if f.check == "public_export_removed"],
-            [("public_export_removed", "Public top-level export `facade` was removed.")],
+            [
+                (f.check, f.message)
+                for f in findings
+                if f.check == "public_export_removed"
+            ],
+            [
+                (
+                    "public_export_removed",
+                    "Public top-level export `facade` was removed.",
+                )
+            ],
         )
 
 
