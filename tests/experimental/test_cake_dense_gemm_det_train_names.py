@@ -173,15 +173,29 @@ def test_no_entry_point_takes_a_mode_keyword(name):
 
 @pytest.mark.parametrize("name", sorted(PUBLIC))
 def test_the_module_returns_the_backend_object(name):
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")  # no ExperimentalWarning: a stable module
-        obj = getattr(importlib.import_module(MODULE), name)
+    obj = getattr(importlib.import_module(MODULE), name)
     submodule = "cake_jit" if name == "ARCHES" else "cake_backend"
     assert obj is getattr(importlib.import_module(f"{BACKEND}.{submodule}"), name)
     if inspect.isfunction(obj) or inspect.isclass(obj):
         assert obj.__name__ == name
         assert inspect.unwrap(obj).__name__ == name
         assert obj.__module__ == f"{BACKEND}.cake_backend"
+
+
+def test_first_access_issues_no_experimental_warning():
+    """A stable module: the first access of every name, in a fresh process, issues no ExperimentalWarning."""
+    code = f"""
+import warnings
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    import {MODULE} as m
+    for name in m.__all__:
+        getattr(m, name)
+print(sorted({{type(w.message).__name__ for w in caught if "Experimental" in type(w.message).__name__}}))
+"""
+    result = _run(code)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().splitlines()[-1] == "[]"
 
 
 def test_an_unknown_name_raises_attribute_error():
@@ -198,9 +212,21 @@ def test_the_former_names_are_removed(submodule, names):
 
 @pytest.mark.parametrize("name", FORMER_MODULES)
 def test_the_former_modules_fail_at_import(name):
-    result = _run(f"import importlib; importlib.import_module({name!r})")
-    assert result.returncode != 0
-    assert "ModuleNotFoundError" in result.stderr
+    code = f"""
+import importlib
+try:
+    importlib.import_module({name!r})
+except ModuleNotFoundError as exc:
+    print("missing", exc.name)
+else:
+    print("imported")
+"""
+    result = _run(code)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().splitlines()[-1] in (
+        f"missing {name}",
+        f"missing {FORMER_PACKAGE}",
+    )
 
 
 def test_the_former_package_is_gone():
@@ -321,14 +347,6 @@ def test_no_former_spelling_in_the_package():
     ]
 
 
-def _supported_device():
-    if not torch.cuda.is_available():
-        return None
-    module = importlib.import_module(MODULE)
-    device = torch.device("cuda", torch.cuda.current_device())
-    return device if module.is_cake_dense_gemm_det_train_supported(device) else None
-
-
 def test_the_support_query():
     module = importlib.import_module(MODULE)
     assert module.is_cake_dense_gemm_det_train_supported(torch.device("cpu")) is False
@@ -339,47 +357,85 @@ def test_the_support_query():
         ) == ((major, minor) in module.SUPPORTED_COMPUTE_CAPABILITIES)
 
 
+# entry point -> its positional arguments on CPU tensors (T, K, N) = (257, 6144, 576), the kv_a projection, and the
+# 256-expert router
+def _cpu_calls():
+    T, K, N, R = 257, 6144, 576, 256
+    bf, f32 = torch.bfloat16, torch.float32
+    X, W, G = (
+        torch.zeros(T, K, dtype=bf),
+        torch.zeros(N, K, dtype=bf),
+        torch.zeros(T, N, dtype=bf),
+    )
+    Xr, Wr, Gr = torch.zeros(T, K), torch.zeros(R, K), torch.zeros(T, R)
+    plan = dict(
+        arch="sm_100a", sm_count=148, l2_bytes=126 * 2**20
+    )  # the B200 device facts
+    return {
+        "cake_dense_gemm_det_train_projection": (
+            (X, W.t(), torch.zeros(T, N, dtype=bf)),
+            {},
+        ),
+        "cake_dense_gemm_det_train_projection_forward": ((X, W), {}),
+        "cake_dense_gemm_det_train_projection_dgrad": ((G, W), {}),
+        "cake_dense_gemm_det_train_projection_wgrad": ((G, X), {}),
+        "cake_dense_gemm_det_train_projection_plan": (
+            (X, W.t(), torch.zeros(T, N, dtype=bf)),
+            plan,
+        ),
+        "cake_dense_gemm_det_train_projection_prepare": (
+            (X, W.t(), torch.zeros(T, N, dtype=bf)),
+            {},
+        ),
+        "cake_dense_gemm_det_train_projection_wgrad_prepare": (
+            (G, X, torch.zeros(N, K, dtype=f32)),
+            {},
+        ),
+        "cake_dense_gemm_det_train_router": ((Xr, Wr.t(), torch.zeros(T, R)), {}),
+        "cake_dense_gemm_det_train_router_forward": ((Xr, Wr), {}),
+        "cake_dense_gemm_det_train_router_dgrad": ((Gr, Wr), {}),
+        "cake_dense_gemm_det_train_router_wgrad": ((Gr, Xr), {}),
+        "cake_dense_gemm_det_train_router_plan": ((Xr, Wr.t(), torch.zeros(T, R)), {}),
+        "cake_dense_gemm_det_train_router_prepare": (
+            (Xr, Wr.t(), torch.zeros(T, R)),
+            {},
+        ),
+        "cake_dense_gemm_det_train_convenience_cache_clear": ((), {}),
+    }
+
+
+def test_every_entry_point_is_covered_by_the_mode_test():
+    callables = {n for n in PUBLIC if not CONSTANT.match(n) and not n[0].isupper()}
+    assert set(_cpu_calls()) == callables - {"is_cake_dense_gemm_det_train_supported"}
+
+
 @pytest.mark.parametrize("warn_only", [False, True])
-def test_the_entry_points_run_unchanged_under_torch_deterministic_mode(warn_only):
-    device = _supported_device()
-    if device is None:
-        pytest.skip("needs an SM100 / SM103 / SM107 GPU")
+@pytest.mark.parametrize("name", sorted(_cpu_calls()))
+def test_no_entry_point_alerts_under_torch_deterministic_mode(name, warn_only):
+    """Under ``torch.use_deterministic_algorithms(True)`` (strict or ``warn_only``) a deterministic entry point raises
+    no deterministic-mode RuntimeError and issues no deterministic-mode warning.  On CPU tensors the launches stop at
+    the device check (a ValueError); the planner runs (``..._projection_plan`` returns its plan)."""
     m = importlib.import_module(MODULE)
-    g = torch.Generator(device=device).manual_seed(0)
-    T, K, N, R = 257, 6144, 576, 256  # the kv_a projection and the 256-expert router
-    X = torch.randn(T, K, device=device, generator=g).bfloat16()
-    W = (torch.randn(N, K, device=device, generator=g) * K**-0.5).bfloat16()
-    G = torch.randn(T, N, device=device, generator=g).bfloat16()
-    Xr = torch.randn(T, K, device=device, generator=g)
-    Wr = torch.randn(R, K, device=device, generator=g) * K**-0.5
-    Gr = torch.randn(T, R, device=device, generator=g)
-
-    def run():
-        return [
-            m.cake_dense_gemm_det_train_projection_forward(X, W),
-            m.cake_dense_gemm_det_train_projection_dgrad(G, W),
-            m.cake_dense_gemm_det_train_projection_wgrad(G, X),
-            m.cake_dense_gemm_det_train_router_forward(Xr, Wr),
-            m.cake_dense_gemm_det_train_router_dgrad(Gr, Wr),
-            m.cake_dense_gemm_det_train_router_wgrad(Gr, Xr),
-        ]
-
-    try:
-        reference = run()
-    except NotImplementedError as exc:  # a build without one of these programs
-        pytest.skip(str(exc))
+    args, kwargs = _cpu_calls()[name]
     previous = (
         torch.are_deterministic_algorithms_enabled(),
         torch.is_deterministic_algorithms_warn_only_enabled(),
     )
+    error = None
     try:
         torch.use_deterministic_algorithms(True, warn_only=warn_only)
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            outputs = run()
-            torch.cuda.synchronize(device)
+            try:
+                result = getattr(m, name)(*args, **kwargs)
+            except Exception as exc:  # noqa: BLE001
+                error = exc
     finally:
         torch.use_deterministic_algorithms(previous[0], warn_only=previous[1])
     assert [w for w in caught if "determinis" in str(w.message)] == []
-    for got, want in zip(outputs, reference, strict=True):
-        assert torch.equal(got, want)
+    assert not (isinstance(error, RuntimeError) and "determinis" in str(error)), error
+    if name in (
+        "cake_dense_gemm_det_train_projection_plan",
+        "cake_dense_gemm_det_train_router_plan",
+    ):
+        assert error is None and result is not None  # the planners need no device

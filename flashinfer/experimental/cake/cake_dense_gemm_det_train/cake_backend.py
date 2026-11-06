@@ -1943,7 +1943,9 @@ def stream_k_plan(
     return pair_tiles - tail, tail, units, iters_per_unit
 
 
-def check_stream_k_plan(plan: "CakeDenseGemmDetProjectionPlan", arch: Optional[str] = None) -> None:
+def check_stream_k_plan(
+    plan: "CakeDenseGemmDetProjectionPlan", arch: Optional[str] = None
+) -> None:
     """Refuse a stream-K plan outside the program's launch contract (the Cake kernel's ``requires``) before it
     launches.  The programs that hand off the work inside an item's last segment (``pd`` 2, ``sk_slab`` 2,
     ``stt``) never finish an item that holds no K step: the linearised plan needs ``iters_per_unit >= 1`` and
@@ -2420,7 +2422,9 @@ def cake_dense_gemm_det_train_projection_plan(
     if A.dtype != torch.bfloat16 or B.dtype != torch.bfloat16:
         raise ValueError("cake_dense_gemm_det_train_projection: A and B must be bf16")
     if out.dtype not in (torch.bfloat16, torch.float32):
-        raise ValueError("cake_dense_gemm_det_train_projection: out must be bf16 or fp32")
+        raise ValueError(
+            "cake_dense_gemm_det_train_projection: out must be bf16 or fp32"
+        )
     A3, B3, O3 = as_batched(A, "A"), as_batched(B, "B"), as_batched(out, "out")
     L, M, K = (int(s) for s in A3.shape)
     if tuple(B3.shape) != (L, K, int(B3.shape[2])):
@@ -3957,7 +3961,9 @@ def _k1_plan(
     *,
     transposed_out: bool,
     knobs: dict[str, Any],
-) -> tuple[CakeDenseGemmDetProjectionPlan, torch.Tensor, torch.Tensor, torch.Tensor, str, str]:
+) -> tuple[
+    CakeDenseGemmDetProjectionPlan, torch.Tensor, torch.Tensor, torch.Tensor, str, str
+]:
     """Plan one K1 binding for its device: ``(plan, a_desc, b_desc, out3, arch, module_name)`` (the device facts
     come from the per-device cache, the module from the registry; see :func:`cake_dense_gemm_det_train_projection_plan`)."""
     device = _same_cuda_device(A, B, out)
@@ -4176,7 +4182,11 @@ def cake_dense_gemm_det_train_projection_prepare(
 
 
 def _k1_swapped(
-    plan: CakeDenseGemmDetProjectionPlan, A: torch.Tensor, B: torch.Tensor, *, transposed_out: bool
+    plan: CakeDenseGemmDetProjectionPlan,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    *,
+    transposed_out: bool,
 ) -> bool:
     """Did the planner run the swapped GEMM (``B.T @ A.T`` with the transposed store) for these views?  The
     launcher's small-M swap rule on the caller's dimensions, unless the registry fallback undid the swap
@@ -4554,7 +4564,7 @@ def wgrad_views(
     when ``wgrad_swapped`` the swapped GEMM ``X.T @ G`` runs with the transposed store (the
     result lands directly in ``[N, K]``), otherwise ``G.T @ X``.  ``arch`` / ``out_f32`` let a
     measured rule of that architecture and output dtype decide the orientation (see ``wgrad_swapped``).
-    [Cake ``cake_dense_gemm_det_train_projection_wgrad`` L1507-L1518 / ``wgrad_swapped`` L1496-L1504]"""
+    [Cake K1 kernel host weight-gradient entry L1507-L1518 / ``wgrad_swapped`` L1496-L1504]"""
     N, K = int(G.shape[1]), int(X.shape[1])
     if wgrad_swapped(N, K, arch=arch, out_f32=out_f32):
         return X.t(), G, True
@@ -4698,7 +4708,9 @@ def _router_a_layout(A: torch.Tensor) -> bool:
         return False
     if A.stride(0) == 1:
         return True
-    raise ValueError("cake_dense_gemm_det_train_router: A needs a unit stride on m or k")
+    raise ValueError(
+        "cake_dense_gemm_det_train_router: A needs a unit stride on m or k"
+    )
 
 
 def _router_b_layout(B: torch.Tensor) -> bool:
@@ -4706,7 +4718,9 @@ def _router_b_layout(B: torch.Tensor) -> bool:
         return False
     if B.stride(1) == 1:  # n contiguous -> MN-major parts [3, K, N]
         return True
-    raise ValueError("cake_dense_gemm_det_train_router: B needs a unit stride on k or n")
+    raise ValueError(
+        "cake_dense_gemm_det_train_router: B needs a unit stride on k or n"
+    )
 
 
 def cake_dense_gemm_det_train_router_plan(
@@ -4728,7 +4742,9 @@ def cake_dense_gemm_det_train_router_plan(
     ):
         raise ValueError("cake_dense_gemm_det_train_router: A, B and out must be fp32")
     if A.dim() != 2 or B.dim() != 2 or out.dim() != 2:
-        raise ValueError("cake_dense_gemm_det_train_router: A, B and out must be 2-D views")
+        raise ValueError(
+            "cake_dense_gemm_det_train_router: A, B and out must be 2-D views"
+        )
     M, K = (int(s) for s in A.shape)
     Kb, N = (int(s) for s in B.shape)
     if Kb != K:
@@ -4759,7 +4775,9 @@ def cake_dense_gemm_det_train_router_plan(
     a_eff_mn, b_eff_mn = _router_a_layout(A_eff), _router_b_layout(B_eff)
     lda = int(A_eff.stride(1)) if a_eff_mn else int(A_eff.stride(0))
     if lda % 4 != 0 or A_eff.data_ptr() % 16 != 0:
-        raise ValueError("cake_dense_gemm_det_train_router: A rows must be 16-byte aligned")
+        raise ValueError(
+            "cake_dense_gemm_det_train_router: A rows must be 16-byte aligned"
+        )
     if B_eff.data_ptr() % 16 != 0:
         raise ValueError(
             "cake_dense_gemm_det_train_router: B must start at a 16-byte aligned address"
@@ -5260,4 +5278,3 @@ def cake_dense_gemm_det_train_router_wgrad(
     if out is None:
         out = torch.empty(G.shape[1], X.shape[1], device=G.device, dtype=torch.float32)
     return cake_dense_gemm_det_train_router(G.t(), X, out, splits=splits)
-

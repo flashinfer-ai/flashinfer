@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-"""Benchmark the experimental Cake dense projection GEMMs (SM100 / SM103 / SM107).
+"""Benchmark the deterministic Cake dense GEMMs (SM100 / SM103 / SM107).
 
 Times the GLM-5.2 training GEMMs of ``flashinfer.experimental.cake.cake_dense_gemm_det_train``
 paired against ``torch.matmul`` on the same strided views:
@@ -38,7 +38,7 @@ time of back-to-back calls on the host, not GPU time).
 
 Usage::
 
-    python benchmarks/bench_cake_dense_projection_det_gemm.py [--rows kv_a_fwd_bf16_t16231 ...]
+    python benchmarks/bench_cake_dense_gemm_det_train.py [--rows kv_a_fwd_bf16_t16231 ...]
         [--ops fwd,dgrad,wgrad] [--T 16231,16172] [--f32-grads] [--no-mla] [--no-router]
         [--steps 20] [--accuracy] [--host-overhead] [--json out.json]
 """
@@ -208,9 +208,13 @@ def eager_arm(spec, inp):
     """The convenience entry point of the row (the cached planned launch; ``out`` is passed, so a cache
     hit allocates nothing)."""
     if spec["family"] == "router":
-        return lambda: cake_backend.cake_dense_gemm_det_train_router(inp["A"], inp["B"], inp["out"])
+        return lambda: cake_backend.cake_dense_gemm_det_train_router(
+            inp["A"], inp["B"], inp["out"]
+        )
     if spec["family"] == "proj" and spec["op"] == "wgrad":
-        return lambda: cake_backend.cake_dense_gemm_det_train_projection_wgrad(inp["G"], inp["X"], inp["out"])
+        return lambda: cake_backend.cake_dense_gemm_det_train_projection_wgrad(
+            inp["G"], inp["X"], inp["out"]
+        )
     return lambda: cake_backend.cake_dense_gemm_det_train_projection(
         inp["A"], inp["B"], inp["out"]
     )

@@ -67,12 +67,12 @@ prepared.launch()   # re-splits B, launches, reduces the split-K partials; .spli
 Both paths run the same planner once per binding and bind the same generated
 module; they differ in who owns the plan and the workspace.
 
-| | prepared path (`prepare_*` + `launch()`) | convenience path (`cake_dense_gemm_det_train_projection`, `projection_*`, `router_*`) |
+| | prepared path (`*_prepare` + `launch()`) | convenience path (`cake_dense_gemm_det_train_{projection,router}` and their `_forward` / `_dgrad` / `_wgrad`) |
 |---|---|---|
-| planning | once, in `prepare_*` | once per cache key, on the first call |
+| planning | once, in `*_prepare` | once per cache key, on the first call |
 | workspace (K1: stream-K slabs + slice counters; K2: BF16x3 stack, the torch-chain split's fp32 scratch, split-K partials) | owned by the prepared object | carved out of the workspace arena of the (device, stream): one growable buffer per kind shared by every cached entry of that device and stream, grown to the largest requirement seen, never per entry |
 | per call | bind nothing: launch the bound views | rebind the caller's views (view objects only), resolve the workspace views of the arena (memoised until the arena grows), launch; `out` is allocated only when the caller passes none |
-| device queries | none after `prepare_*` | none after the first call |
+| device queries | none after `*_prepare` | none after the first call |
 | cache | none | per process, per kind (K1 / K2), `CONVENIENCE_CACHE_SIZE` = 64 entries, least recently used first out; the arena of a (device, stream) is released with its last entry and by `cake_dense_gemm_det_train_convenience_cache_clear()` |
 | memory held | the prepared object's workspace | bounded by the largest geometry seen per workspace kind, however many token counts the cache has planned (a ragged T adds entries, not workspace) |
 | CUDA Graphs | capture `launch()` | do not capture (a later growth replaces, an eviction frees, the workspace a graph replays) |
@@ -156,7 +156,7 @@ hints); every
 rule is a verbatim copy of the Cake kernel host's (each function names its
 source line range).  Two device facts enter the plan: the SM count (CTA pairs:
 stream-K split, raster group, wave working set) and the L2 size (hint gate);
-`prepare_*` and the convenience path read both once per device index
+`*_prepare` and the convenience path read both once per device index
 (`device_facts`: `device_sm_count`, `device_l2_bytes` =
 `torch.cuda.get_device_properties(...).L2_cache_size`, falling back to
 `cuDeviceGetAttribute`), `cake_dense_gemm_det_train_projection_plan` takes them as inputs:
@@ -296,8 +296,8 @@ export has generated and for every template on a device whose architecture the
 registry does not list.
 
 CUDA Graphs: prepare outside capture and replay the prepared launch
-(`prepare_*` once, `launch` many times).  The convenience entry points
-(`cake_dense_gemm_det_train_projection`, `projection_*`, `router_*`) reuse a cached planned
+(`*_prepare` once, `launch` many times).  The convenience entry points
+(`cake_dense_gemm_det_train_{projection,router}` and their `_forward` / `_dgrad` / `_wgrad`) reuse a cached planned
 launch per (device, stream, geometry) key and the shared workspace arena of its
 (device, stream); capture a prepared launch object rather than the convenience
 entry points (see "Host paths").
