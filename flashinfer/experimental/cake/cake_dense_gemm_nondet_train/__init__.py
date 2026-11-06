@@ -14,16 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-# Experimental Cake backend, non-deterministic: the GLM-5.2 dense projection
-# GEMMs for training and the FP32 router-gate GEMM on SM100 / SM103 / SM107
+# Cake backend, non-deterministic: the GLM-5.2 dense projection GEMMs for training
+# and the FP32 router-gate GEMM on SM100 / SM103 / SM107
 # (flashinfer-ai/flashinfer#5677), with programs that add split-K partials in
-# the order they finish.  Every compute entry point of ``cake_backend`` takes
-# the keyword-only ``deterministic: bool = True`` and accepts only
-# ``deterministic=False``: any other value, the default included, raises
-# ``ValueError`` naming the entry point of the deterministic package
-# ``flashinfer.experimental.cake.cake_dense_gemm_det_train``.  Importing this package
-# imports nothing: ``cake_backend``, ``cake_jit`` and ``cake_build`` load on
-# first attribute access.
+# the order they finish.  The public module is
+# flashinfer.cake_dense_gemm_nondet_train; it selects the mode, so no entry
+# point takes a mode argument.  The rows that run fixed-order programs reuse the
+# programs of the deterministic sibling package cake_dense_gemm_det_train.
+# Importing this package imports nothing: ``cake_backend``, ``cake_jit`` and
+# ``cake_build`` load on first attribute access.
 
 __all__ = ["cake_backend", "cake_build", "cake_jit"]
 
