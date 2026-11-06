@@ -125,6 +125,17 @@ The shared contract is covered by CPU admission tests. The GPU tests below
 validate the routed kernel; they are not an end-to-end K3.1 Pro checkpoint
 accuracy or serving benchmark.
 
+``tests/moe_ep/test_sm100_kimi_k31.py`` is a runnable K3.1 Pro usage example.
+It maps the checkpoint fields into the public API and checks eager execution
+and CUDA graph replay with sparse weights and normalized route scores:
+
+.. code-block:: bash
+
+   python -m pytest --confcutdir=tests/moe_ep -q tests/moe_ep/test_sm100_kimi_k31.py
+   torchrun --standalone --nproc_per_node=8 -m pytest --confcutdir=tests/moe_ep -q tests/moe_ep/test_sm100_kimi_k31.py
+
+For EP16, use the multi-node launch below with this test file.
+
 Weights and scales
 ------------------
 
