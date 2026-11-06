@@ -27,8 +27,14 @@ resolves on the other.  No entry point of either package takes
 ``deterministic``: passing it raises ``TypeError``.  The names from before the
 rename fail at import: the former modules raise ``ModuleNotFoundError``, the
 former names raise ``ImportError`` (checked in fresh interpreters).  The
-``flashinfer`` top level binds the five det entry points and the module
-``cake_rmsnorm_nondet_train``, and no name of the non-deterministic package.
+``flashinfer`` top level serves the five det entry points and the module
+``cake_rmsnorm_nondet_train`` as rows of its lazy-export table
+(``flashinfer._LAZY_EXPORTS``), and no name of the non-deterministic package.
+Nothing loads a backend early (fresh interpreters): ``import flashinfer``
+loads no RMSNorm module, importing a facade loads no backend package, and the
+first use of a facade's entry point or backend object loads that package's
+backend only; each lazily resolved name is the backend's object.  The facade
+entry points carry the backend's written docstrings.
 Under ``torch.use_deterministic_algorithms(True)`` only the non-deterministic
 backward alerts (``RuntimeError`` naming the det entry point; with
 ``warn_only=True`` one ``UserWarning``, then its own backward); its forward and
@@ -42,6 +48,7 @@ import ast
 import functools
 import importlib
 import inspect
+import json
 import re
 import subprocess
 import sys
@@ -99,6 +106,24 @@ TOP_LEVEL_DET = (
     "cake_rmsnorm_det_train_backward",
     "cake_rmsnorm_det_train_backward_workspace_bytes",
     "cake_rmsnorm_det_train_forward",
+)
+# Their rows of ``flashinfer._LAZY_EXPORTS`` (``name -> (module, attribute)``),
+# with the module of the non-deterministic package.
+TOP_LEVEL_ROWS = {
+    **{name: (".cake_rmsnorm_det_train", name) for name in TOP_LEVEL_DET},
+    "cake_rmsnorm_nondet_train": (".cake_rmsnorm_nondet_train", None),
+}
+# The keys of another family that share the ``cake_rmsnorm`` prefix.
+OTHER_FAMILY_PREFIXES = ("cake_rmsnorm_silu_gate", "CakeRMSNormSiLUGate")
+# The RMSNorm modules: the two facades and the two backend packages (with
+# their submodules).
+RMSNORM_MODULES = (DET_FACADE, FACADE, DET_PACKAGE, PACKAGE)
+# The modules the RMSNorm rows of the lazy-export table may name.
+ROW_MODULES = (
+    ".cake_rmsnorm_det_train",
+    ".cake_rmsnorm_nondet_train",
+    DET_FACADE,
+    FACADE,
 )
 NAMESPACES = {
     "det_facade": (det_facade, "det"),
@@ -258,7 +283,8 @@ def test_nondet_package_resolves_no_det_name(namespace: str, name: str) -> None:
     module = NAMESPACES[namespace][0]
     assert not hasattr(module, name), f"{module.__name__}.{name} resolves"
     assert name not in dir(module), (namespace, name)
-    assert "__getattr__" not in vars(module), namespace
+    if namespace.endswith("_backend"):
+        assert "__getattr__" not in vars(module), namespace
 
 
 @pytest.mark.parametrize("namespace", DET_NAMESPACES)
@@ -267,7 +293,8 @@ def test_det_package_resolves_no_nondet_name(namespace: str, name: str) -> None:
     module = NAMESPACES[namespace][0]
     assert not hasattr(module, name), f"{module.__name__}.{name} resolves"
     assert name not in dir(module), (namespace, name)
-    assert "__getattr__" not in vars(module), namespace
+    if namespace.endswith("_backend"):
+        assert "__getattr__" not in vars(module), namespace
 
 
 @pytest.mark.parametrize("namespace", sorted(NAMESPACES))
@@ -463,6 +490,199 @@ def test_top_level_modules() -> None:
     assert not issubclass(
         backend.CakeRMSNormNondetFunction, det_backend.CakeRMSNormDetFunction
     )
+
+
+def _rmsnorm_row(name: str, module_name: str) -> bool:
+    """Whether a row of ``flashinfer._LAZY_EXPORTS`` is RMSNorm's: it names an
+    RMSNorm facade, or its key has the ``cake_rmsnorm`` prefix of no other
+    family."""
+    if module_name in ROW_MODULES:
+        return True
+    prefixed = name.startswith(("cake_rmsnorm", "CakeRMSNorm"))
+    return prefixed and not name.startswith(OTHER_FAMILY_PREFIXES)
+
+
+def test_top_level_rows_are_the_lazy_exports() -> None:
+    """The RMSNorm names of the top level are exactly the six rows of
+    ``flashinfer._LAZY_EXPORTS``; ``dir(flashinfer)`` lists them and each
+    resolves to its facade's object (the nondet row to the facade module)."""
+    rows = flashinfer._LAZY_EXPORTS
+    family = {n: row for n, row in rows.items() if _rmsnorm_row(n, row[0])}
+    assert family == TOP_LEVEL_ROWS
+    for name in family:
+        assert _carries(name, "det") or _carries(name, "nondet"), name
+    removed = {*OLD_NAMES, *(old.rpartition(".")[2] for old in OLD_MODULES)}
+    assert not removed & set(rows), sorted(removed & set(rows))
+    listed = dir(flashinfer)
+    for name, (module_name, attribute) in TOP_LEVEL_ROWS.items():
+        assert name in listed, name
+        module = importlib.import_module(module_name, "flashinfer")
+        expected = module if attribute is None else getattr(module, attribute)
+        assert getattr(flashinfer, name) is expected, name
+    assert flashinfer.cake_rmsnorm_det is det_facade.cake_rmsnorm_det
+    assert flashinfer.cake_rmsnorm_nondet_train is sys.modules[FACADE]
+
+
+# --------------------------------------------------------------------------- lazy facades
+
+
+def _defs(mode: str) -> tuple[str, ...]:
+    """The three entry points a facade defines itself (``def``s)."""
+    stem = f"cake_rmsnorm_{mode}_train"
+    return (f"cake_rmsnorm_{mode}", f"{stem}_forward", f"{stem}_backward")
+
+
+def _lazy(mode: str) -> list[str]:
+    """The names of a facade's ``__all__`` that resolve to the backend's objects."""
+    return sorted(set(DET_ALL if mode == "det" else NONDET_ALL) - set(_defs(mode)))
+
+
+@pytest.mark.parametrize("namespace", ["det_facade", "nondet_facade"])
+def test_facade_resolves_backend_objects_on_first_access(namespace: str) -> None:
+    """Every name of the facade's ``__all__`` that it does not define is the
+    backend's object itself, cached in the facade on first access and listed
+    by ``dir``; any other name is an ``AttributeError``."""
+    module, mode = NAMESPACES[namespace]
+    package = NAMESPACES[f"{mode}_backend"][0]
+    for name in _lazy(mode):
+        assert getattr(module, name) is getattr(package, name), name
+        assert vars(module)[name] is getattr(package, name), name
+        assert name in dir(module), name
+    for name in _defs(mode):
+        assert name in vars(module), name
+        assert getattr(module, name) is not getattr(package, name), name
+    with pytest.raises(AttributeError, match="has no attribute 'no_such_name'"):
+        module.no_such_name  # noqa: B018
+
+
+def _written_docstrings(module) -> dict[str, str]:
+    """The docstring each top-level function of ``module`` has in its source
+    (cleaned), before any text the module appends at import."""
+    tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+    return {
+        node.name: ast.get_docstring(node) or ""
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+    }
+
+
+@pytest.mark.parametrize("namespace", ["det_facade", "nondet_facade"])
+def test_facade_docstrings_are_the_backend_written_docstrings(namespace: str) -> None:
+    """A facade entry point's docstring is the backend function's written
+    docstring (without the program-selection notes the backend appends from its
+    registry at import); the forward's and the backward's then add one "Notes"
+    section naming the backend function whose docstring lists the windows."""
+    module, mode = NAMESPACES[namespace]
+    package = DET_PACKAGE if mode == "det" else PACKAGE
+    written = _written_docstrings(NAMESPACES[f"{mode}_backend"][0])
+    autograd = f"cake_rmsnorm_{mode}"
+    for name in _defs(mode):
+        doc = inspect.getdoc(getattr(module, name)) or ""
+        assert written[name] and doc.startswith(written[name]), name
+        notes = doc[len(written[name]) :]
+        if name == autograd:
+            assert notes == "", (name, notes)
+            continue
+        assert notes.startswith("\n\nNotes\n-----\n"), (name, notes)
+        assert f":func:`{package}.{name}`" in notes, (name, notes)
+        assert notes.count("\n\n") == 1, (name, notes)
+
+
+def _loaded_after(*steps: str) -> list[list[str]]:
+    """Run ``steps`` in order in a fresh interpreter: the RMSNorm modules
+    (``RMSNORM_MODULES`` and their submodules) loaded after each step."""
+    prefixes = tuple(f"{name}." for name in RMSNORM_MODULES)
+    condition = f"m in {RMSNORM_MODULES!r} or m.startswith({prefixes!r})"
+    code = [
+        "import json, sys",
+        "def loaded():",
+        f"    return sorted(m for m in sys.modules if {condition})",
+        "snapshots = []",
+    ]
+    for step in steps:
+        code += [step, "snapshots.append(loaded())"]
+    code.append("print(json.dumps(snapshots))")
+    r = subprocess.run(
+        [sys.executable, "-c", "\n".join(code)],
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert r.returncode == 0, (steps, r.stdout, r.stderr)
+    return json.loads(r.stdout.strip().splitlines()[-1])
+
+
+def _modules(mode: str) -> tuple[str, str]:
+    """The names of ``mode``'s facade module and backend package."""
+    return (DET_FACADE, DET_PACKAGE) if mode == "det" else (FACADE, PACKAGE)
+
+
+def _owned(name: str, mode: str) -> bool:
+    """Whether the module ``name`` is ``mode``'s facade or in its backend package."""
+    facade_name, package = _modules(mode)
+    return name in (facade_name, package) or name.startswith(f"{package}.")
+
+
+def test_import_flashinfer_loads_no_rmsnorm_module() -> None:
+    """``import flashinfer`` (and ``dir(flashinfer)``) loads neither facade nor
+    backend: the RMSNorm names are bound on first access only."""
+    after_import, after_dir = _loaded_after(
+        "import flashinfer", "listed = dir(flashinfer)"
+    )
+    assert after_import == [] and after_dir == []
+
+
+# The first use of a facade that loads its backend: a backend object, a
+# constant, and a call of an entry point (CPU tensors: the backend refuses them
+# with its own ``ValueError``).
+FIRST_USES = {
+    "autograd_class": "facade.CakeRMSNorm{Mode}Function",
+    "constant": "facade.ARCHES",
+    "entry_point_call": (
+        "import torch\n"
+        "try:\n"
+        "    facade.cake_rmsnorm_{mode}_train_forward(torch.zeros(4, 512,"
+        " dtype=torch.bfloat16), torch.ones(512, dtype=torch.bfloat16), 1e-6)\n"
+        "except ValueError as e:\n"
+        "    assert 'requires CUDA tensors' in str(e), e\n"
+        "else:\n"
+        "    raise AssertionError('the forward accepted CPU tensors')"
+    ),
+}
+
+
+@pytest.mark.parametrize("use", sorted(FIRST_USES))
+@pytest.mark.parametrize("mode", ["det", "nondet"])
+def test_facade_loads_only_its_own_backend_on_first_use(mode: str, use: str) -> None:
+    """Importing a facade loads no backend package (its lazily resolved names are
+    absent from the module until accessed); the first use loads that facade's
+    backend package and nothing of the other package."""
+    facade_name, package = _modules(mode)
+    unresolved = "sorted(set(facade.__all__) - set(vars(facade)))"
+    on_import, checked, on_use = _loaded_after(
+        f"import {facade_name} as facade",
+        f"assert {unresolved} == {_lazy(mode)!r}, {unresolved}",
+        FIRST_USES[use].format(mode=mode, Mode=mode.capitalize()),
+    )
+    assert on_import == checked == [facade_name]
+    assert package in on_use, on_use
+    assert [name for name in on_use if not _owned(name, mode)] == [], on_use
+
+
+def test_top_level_rows_load_their_facade_only() -> None:
+    """A top-level det entry point loads the det facade only, the nondet row the
+    nondet facade only, and a backend object of a row its own backend."""
+    on_import, det_entry, nondet_module, det_class = _loaded_after(
+        "import flashinfer",
+        "flashinfer.cake_rmsnorm_det",
+        "flashinfer.cake_rmsnorm_nondet_train",
+        "flashinfer.CakeRMSNormDetFunction",
+    )
+    assert on_import == []
+    assert det_entry == [DET_FACADE]
+    assert nondet_module == sorted([DET_FACADE, FACADE])
+    assert DET_PACKAGE in det_class, det_class
+    assert [name for name in det_class if not _owned(name, "det")] == [FACADE]
 
 
 # --------------------------------------------------------------------------- the non-deterministic package is self-contained

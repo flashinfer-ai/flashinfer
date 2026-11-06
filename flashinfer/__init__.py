@@ -178,6 +178,22 @@ _PRIMS_TS_LAZY_EXPORTS = frozenset(
 # import the experimental tree.
 _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     **{name: (".fused_moe", name) for name in sorted(_PRIMS_TS_LAZY_EXPORTS)},
+    # RMSNorm training: det names from the det facade; the nondet package only as its module.
+    "cake_rmsnorm_det": (".cake_rmsnorm_det_train", "cake_rmsnorm_det"),
+    "CakeRMSNormDetFunction": (".cake_rmsnorm_det_train", "CakeRMSNormDetFunction"),
+    "cake_rmsnorm_det_train_forward": (
+        ".cake_rmsnorm_det_train",
+        "cake_rmsnorm_det_train_forward",
+    ),
+    "cake_rmsnorm_det_train_backward": (
+        ".cake_rmsnorm_det_train",
+        "cake_rmsnorm_det_train_backward",
+    ),
+    "cake_rmsnorm_det_train_backward_workspace_bytes": (
+        ".cake_rmsnorm_det_train",
+        "cake_rmsnorm_det_train_backward_workspace_bytes",
+    ),
+    "cake_rmsnorm_nondet_train": (".cake_rmsnorm_nondet_train", None),
 }
 
 
@@ -283,20 +299,6 @@ from .norm import rmsnorm as rmsnorm
 from .norm import rmsnorm_quant as rmsnorm_quant
 from .norm import fused_rmsnorm_silu as fused_rmsnorm_silu
 from .norm import fused_qk_rmsnorm_rope as fused_qk_rmsnorm_rope
-from .cake_rmsnorm_det_train import CakeRMSNormDetFunction as CakeRMSNormDetFunction
-from .cake_rmsnorm_det_train import cake_rmsnorm_det as cake_rmsnorm_det
-from .cake_rmsnorm_det_train import (
-    cake_rmsnorm_det_train_backward as cake_rmsnorm_det_train_backward,
-)
-from .cake_rmsnorm_det_train import (
-    cake_rmsnorm_det_train_backward_workspace_bytes as cake_rmsnorm_det_train_backward_workspace_bytes,
-)
-from .cake_rmsnorm_det_train import (
-    cake_rmsnorm_det_train_forward as cake_rmsnorm_det_train_forward,
-)
-
-# The non-deterministic RMSNorm package is reached as the module flashinfer.cake_rmsnorm_nondet_train.
-from . import cake_rmsnorm_nondet_train as cake_rmsnorm_nondet_train
 from .cake_rmsnorm_silu_gate_det_train import (
     CakeRMSNormSiLUGateDetFunction as CakeRMSNormSiLUGateDetFunction,
 )
