@@ -22,7 +22,7 @@ queries.  Pure host metadata: nothing here reads the contents of a tensor or
 launches a kernel; the module imports ``dataclasses``, ``os``, ``torch`` and
 ``torch.distributed`` only and is importable and testable on the CPU.
 
-Partition.  ``partition_det_kcp(cu_seqlens_global_cpu, world_size, layout, fragments=None)``
+Partition.  ``cake_kda_det_train_kcp_partition(cu_seqlens_global_cpu, world_size, layout, fragments=None)``
 cuts the global token order (``cu_seqlens`` of the packed documents, CPU
 int64) into per-rank fragments ``(doc, offset in the document, length)``
 stored on every rank in document order, then offset order (the rank's local
@@ -39,7 +39,7 @@ recurrence starts from a carried state), one with a successor is
 *crossing-out* (it produces a summary).  Zero-length fragments are skipped by
 the chains.  The partition is built once and reused across layers.
 
-Context.  ``build_context_det_kcp(part, group, rank, device, conv_kernel_size=4)``
+Context.  ``cake_kda_det_train_kcp_build_context(part, group, rank, device, conv_kernel_size=4)``
 derives, for one rank, the local ``cu_seqlens`` (int32 device; one local
 sequence per fragment), the device fragment table, the crossing slots, the
 chunk / sequence tables of the existing chunk-parallel stages (bitwise the
@@ -139,8 +139,8 @@ P_RULES = (
 P_RULE_DEFAULT = "wave_fill1_p1tie"  # shipped; "wave_fill1" = the previous default, via _kcp_test_knobs only
 # The shipped default of ``save_transfer`` (the design note §6.2) -- the merge owner
 # keeps its c1 receive tensor (and the home rank its M_seg at P > 1) for the backward instead of re-sending M_f^T in b1.
-# Default of the byte queries below and of ``cake_kcp.OptionsDetKcp``; ``False`` (the earlier recompute form) stays
-# selectable through the ``save_transfer`` argument; ``kda_det_saved_bytes_kcp`` reports the delta.
+# Default of the byte queries below and of ``cake_kcp.CakeKDADetKcpOptions``; ``False`` (the earlier recompute form) stays
+# selectable through the ``save_transfer`` argument; ``cake_kda_det_train_kcp_saved_bytes`` reports the delta.
 SAVE_TRANSFER_DEFAULT = True
 # Wave-aware P rule: per-CTA-step constants at one CTA per SM on GB300, H = 64, in 10 ns units (exact integer arithmetic
 # keeps the argmin and its ties identical on every rank), measured on the CP4 / CP8 profiles and the walk / merge
@@ -230,7 +230,7 @@ def _round_up(n: int, m: int) -> int:
 # ----------------------------------------------------------------------------------------------------------------
 # Host-built integer tables on the device without a synchronizing call
 
-# Test knobs of build_context_det_kcp (after enable_test_knobs(), for the A/B record and the negative control of the
+# Test knobs of cake_kda_det_train_kcp_build_context (after enable_test_knobs(), for the A/B record and the negative control of the
 # host-synchronization tests): ``upload="blocking"`` = the previous per-table ``torch.tensor(values, device=)`` copies
 # (pageable; each synchronizes the stream), eager at preparation as before; ``table_cache="workspace"`` = the previous
 # per-workspace table-set cache (keyed by the context) instead of the context's own.
@@ -249,7 +249,7 @@ def _stream_capturing(s) -> bool:
 @dataclasses.dataclass(eq=False)
 class KcpUpload:
     """One asynchronous upload: the device ``blob`` its tables view, the ``stream`` that ran the copy and the ``ready``
-    event recorded after it (:meth:`ContextDetKcp.wait_ready`)."""
+    event recorded after it (:meth:`CakeKDADetKcpContext.wait_ready`)."""
 
     blob: Any
     stream: Any
@@ -380,7 +380,7 @@ class _LazyTables(Mapping):
 
 
 @dataclasses.dataclass(frozen=True)
-class FragmentDetKcp:
+class CakeKDADetKcpFragment:
     """One fragment of the partition: ``[off, off + length)`` of document ``doc``, held by ``rank`` at local
     position ``slot`` (the rank's buffer order); ``prev`` / ``next`` are the ``(rank, slot)`` of the neighbours in
     the document chain (``None`` at a document start / end and for zero-length fragments, which the chain skips)."""
@@ -413,14 +413,14 @@ class FragmentDetKcp:
 
 
 @dataclasses.dataclass(frozen=True)
-class PartitionDetKcp:
+class CakeKDADetKcpPartition:
     """The fragment tables of every rank (``fragments[rank][slot]``), the global ``cu_seqlens`` they cut and the
     layout that produced them (``"explicit"`` for a caller-given table)."""
 
     world_size: int
     layout: str
     cu_seqlens: tuple[int, ...]
-    fragments: tuple[tuple[FragmentDetKcp, ...], ...]
+    fragments: tuple[tuple[CakeKDADetKcpFragment, ...], ...]
 
     @property
     def num_docs(self) -> int:
@@ -433,7 +433,7 @@ class PartitionDetKcp:
     def doc_length(self, doc: int) -> int:
         return self.cu_seqlens[doc + 1] - self.cu_seqlens[doc]
 
-    def fragment(self, rank: int, slot: int) -> FragmentDetKcp:
+    def fragment(self, rank: int, slot: int) -> CakeKDADetKcpFragment:
         return self.fragments[rank][slot]
 
     def rank_tokens(self, rank: int) -> int:
@@ -456,7 +456,7 @@ class PartitionDetKcp:
 
     def chains(self) -> tuple[tuple[tuple[int, int], ...], ...]:
         """Per document the ``(rank, slot)`` of its non-empty fragments in offset order (the document chain)."""
-        by_doc: dict[int, list[FragmentDetKcp]] = {}
+        by_doc: dict[int, list[CakeKDADetKcpFragment]] = {}
         for frs in self.fragments:
             for f in frs:
                 if f.length > 0:
@@ -490,12 +490,12 @@ def _as_cu_seqlens(cu_seqlens) -> tuple[int, ...]:
     if isinstance(cu_seqlens, torch.Tensor):
         if cu_seqlens.device.type != "cpu":
             raise ValueError(
-                "partition_det_kcp: cu_seqlens is CPU metadata (the partition reads no device tensor); "
+                "cake_kda_det_train_kcp_partition: cu_seqlens is CPU metadata (the partition reads no device tensor); "
                 f"got a tensor on {cu_seqlens.device}"
             )
         if cu_seqlens.dim() != 1 or cu_seqlens.dtype not in (torch.int32, torch.int64):
             raise ValueError(
-                f"partition_det_kcp: cu_seqlens must be a 1-D int32 / int64 tensor, got {tuple(cu_seqlens.shape)} "
+                f"cake_kda_det_train_kcp_partition: cu_seqlens must be a 1-D int32 / int64 tensor, got {tuple(cu_seqlens.shape)} "
                 f"{cu_seqlens.dtype}"
             )
         values = tuple(int(v) for v in cu_seqlens.tolist())
@@ -503,11 +503,13 @@ def _as_cu_seqlens(cu_seqlens) -> tuple[int, ...]:
         values = tuple(int(v) for v in cu_seqlens)
     if len(values) < 1 or values[0] != 0:
         raise ValueError(
-            f"partition_det_kcp: cu_seqlens must start with 0 and hold num_docs + 1 entries, got {values[:4]}..."
+            f"cake_kda_det_train_kcp_partition: cu_seqlens must start with 0 and hold num_docs + 1 entries, got {values[:4]}..."
         )
     for a, b in zip(values, values[1:], strict=False):
         if b < a:
-            raise ValueError("partition_det_kcp: cu_seqlens must be non-decreasing")
+            raise ValueError(
+                "cake_kda_det_train_kcp_partition: cu_seqlens must be non-decreasing"
+            )
     return values
 
 
@@ -555,13 +557,13 @@ def _validate_cut_points(cuts, length: int, pieces: int, doc: int) -> list[int]:
     values = [int(c) for c in cuts]
     if len(values) != pieces + 1 or values[0] != 0 or values[-1] != length:
         raise ValueError(
-            f"partition_det_kcp: cut_points[{doc}] must hold {pieces + 1} offsets from 0 to the document length {length}, "
+            f"cake_kda_det_train_kcp_partition: cut_points[{doc}] must hold {pieces + 1} offsets from 0 to the document length {length}, "
             f"got {len(values)} entries {values[:3]}...{values[-2:]}"
         )
     for a, b in zip(values, values[1:], strict=False):
         if b < a:
             raise ValueError(
-                f"partition_det_kcp: cut_points[{doc}] must be non-decreasing"
+                f"cake_kda_det_train_kcp_partition: cut_points[{doc}] must be non-decreasing"
             )
     return values
 
@@ -573,7 +575,7 @@ def _entries_zigzag_per_document(
     pieces = 2 * W
     if cut_points is not None and len(cut_points) != num_docs:
         raise ValueError(
-            f"partition_det_kcp: cut_points must give one list per document ({num_docs}), got {len(cut_points)}"
+            f"cake_kda_det_train_kcp_partition: cut_points must give one list per document ({num_docs}), got {len(cut_points)}"
         )
     entries: list[tuple[int, int, int, int]] = []
     for d in range(num_docs):
@@ -606,28 +608,28 @@ def _explicit_entries(
             for y in frs:
                 if len(y) != 3:
                     raise ValueError(
-                        f"partition_det_kcp: fragments[{rank}] entries must be (doc, off, len), got {y!r}"
+                        f"cake_kda_det_train_kcp_partition: fragments[{rank}] entries must be (doc, off, len), got {y!r}"
                     )
                 entries.append((int(y[0]), int(y[1]), int(y[2]), rank))
     else:
         for y in items:
             if not isinstance(y, (list, tuple)) or len(y) != 4:
                 raise ValueError(
-                    f"partition_det_kcp: flat fragments entries must be (doc, off, len, rank), got {y!r}"
+                    f"cake_kda_det_train_kcp_partition: flat fragments entries must be (doc, off, len, rank), got {y!r}"
                 )
             entries.append((int(y[0]), int(y[1]), int(y[2]), int(y[3])))
     for doc, off, ln, rank in entries:
         if not 0 <= doc < num_docs:
             raise ValueError(
-                f"partition_det_kcp: fragment document {doc} out of range [0, {num_docs})"
+                f"cake_kda_det_train_kcp_partition: fragment document {doc} out of range [0, {num_docs})"
             )
         if not 0 <= rank < W:
             raise ValueError(
-                f"partition_det_kcp: fragment rank {rank} out of range [0, {W})"
+                f"cake_kda_det_train_kcp_partition: fragment rank {rank} out of range [0, {W})"
             )
         if ln < 0 or off < 0 or off + ln > cu[doc + 1] - cu[doc]:
             raise ValueError(
-                f"partition_det_kcp: fragment (doc {doc}, off {off}, len {ln}) does not fit document {doc} of "
+                f"cake_kda_det_train_kcp_partition: fragment (doc {doc}, off {off}, len {ln}) does not fit document {doc} of "
                 f"{cu[doc + 1] - cu[doc]} tokens"
             )
     # every document covered exactly once by its non-empty fragments, offsets monotone
@@ -638,13 +640,13 @@ def _explicit_entries(
         for off, ln in parts:
             if off != pos:
                 raise ValueError(
-                    f"partition_det_kcp: document {d} is not covered exactly once (gap or overlap at offset {pos}, "
+                    f"cake_kda_det_train_kcp_partition: document {d} is not covered exactly once (gap or overlap at offset {pos}, "
                     f"fragment starts at {off})"
                 )
             pos = off + ln
         if pos != n:
             raise ValueError(
-                f"partition_det_kcp: document {d} is covered up to {pos} of {n} tokens"
+                f"cake_kda_det_train_kcp_partition: document {d} is covered up to {pos} of {n} tokens"
             )
     # the given per-rank order is the local buffer order: document then offset (ties: empty pieces keep their place)
     for rank in range(W):
@@ -652,7 +654,7 @@ def _explicit_entries(
         for a, b in zip(keys, keys[1:], strict=False):
             if b < a:
                 raise ValueError(
-                    f"partition_det_kcp: rank {rank}'s fragments must be listed in document then offset order "
+                    f"cake_kda_det_train_kcp_partition: rank {rank}'s fragments must be listed in document then offset order "
                     f"(the local buffer order), got {a} before {b}"
                 )
     return entries
@@ -660,7 +662,7 @@ def _explicit_entries(
 
 def _finish(
     cu: tuple[int, ...], W: int, layout: str, entries: list[tuple[int, int, int, int]]
-) -> PartitionDetKcp:
+) -> CakeKDADetKcpPartition:
     per_rank: list[list[tuple[int, int, int]]] = [[] for _ in range(W)]
     for doc, off, ln, rank in entries:
         per_rank[rank].append((doc, off, ln))
@@ -679,24 +681,24 @@ def _finish(
             )
     fragments = tuple(
         tuple(
-            FragmentDetKcp(doc, off, ln, r, s, prev.get((r, s)), nxt.get((r, s)))
+            CakeKDADetKcpFragment(doc, off, ln, r, s, prev.get((r, s)), nxt.get((r, s)))
             for s, (doc, off, ln) in enumerate(frs)
         )
         for r, frs in enumerate(per_rank)
     )
-    return PartitionDetKcp(
+    return CakeKDADetKcpPartition(
         world_size=W, layout=layout, cu_seqlens=cu, fragments=fragments
     )
 
 
-def partition_det_kcp(
+def cake_kda_det_train_kcp_partition(
     cu_seqlens_global_cpu,
     world_size: int,
     layout: str = "contiguous",
     fragments=None,
     *,
     cut_points=None,
-) -> PartitionDetKcp:
+) -> CakeKDADetKcpPartition:
     """The per-rank fragment tables of one packed batch (the KCP contract §3.1).
 
     ``cu_seqlens_global_cpu``: the packed documents' ``cu_seqlens`` (CPU int64 tensor or a sequence of ints);
@@ -709,19 +711,19 @@ def partition_det_kcp(
     W = int(world_size)
     if W < 1:
         raise ValueError(
-            f"partition_det_kcp: world_size must be >= 1, got {world_size}"
+            f"cake_kda_det_train_kcp_partition: world_size must be >= 1, got {world_size}"
         )
     if fragments is not None:
         return _finish(cu, W, EXPLICIT_LAYOUT, _explicit_entries(cu, W, fragments))
     if layout not in LAYOUTS:
         raise ValueError(
-            f"partition_det_kcp: layout must be one of {LAYOUTS}, got {layout!r}"
+            f"cake_kda_det_train_kcp_partition: layout must be one of {LAYOUTS}, got {layout!r}"
         )
     total = cu[-1]
     if layout == "contiguous":
         if cut_points is not None:
             raise ValueError(
-                "partition_det_kcp: cut_points apply to layout 'zigzag_per_document' only"
+                "cake_kda_det_train_kcp_partition: cut_points apply to layout 'zigzag_per_document' only"
             )
         entries = _intervals_to_entries(
             cu, [(s, e, r) for r, (s, e) in enumerate(near_equal(total, W))]
@@ -729,7 +731,7 @@ def partition_det_kcp(
     elif layout == "zigzag":
         if cut_points is not None:
             raise ValueError(
-                "partition_det_kcp: cut_points apply to layout 'zigzag_per_document' only"
+                "cake_kda_det_train_kcp_partition: cut_points apply to layout 'zigzag_per_document' only"
             )
         pieces = near_equal(total, 2 * W)
         bounds = []
@@ -1194,11 +1196,11 @@ MAX_HEAD_CONSUMERS = 3  # send-layout slots per head dpre row for conv_kernel_si
 # consecutive 1-token predecessors, e.g. the C3 row of record at layout D), so the table holds `halo` slots.
 
 
-def _halo_sources(part: PartitionDetKcp, halo: int):
+def _halo_sources(part: CakeKDADetKcpPartition, halo: int):
     """Global halo sources.  ``hist[(rank, slot)][k]`` = ``(src_rank, src_slot, row_in_src)`` of history row ``k`` of a
     continuing fragment (``None`` before the document start); ``tail[(rank, slot)][m]`` = ``(succ_rank, succ_slot,
     head_row_k)`` of the successor token ``end + m`` of a fragment with a successor (``None`` past the document end)."""
-    chains: dict[int, list[FragmentDetKcp]] = {}
+    chains: dict[int, list[CakeKDADetKcpFragment]] = {}
     for frs in part.fragments:
         for f in frs:
             if f.length > 0:
@@ -1209,7 +1211,7 @@ def _halo_sources(part: PartitionDetKcp, halo: int):
     # (the non-empty fragments of a document tile it, so a bisect replaces the O(chain) scan)
     starts = {doc: [g.off for g in lst] for doc, lst in chains.items()}
 
-    def owner(doc: int, t: int) -> FragmentDetKcp:
+    def owner(doc: int, t: int) -> CakeKDADetKcpFragment:
         lst = chains.get(doc)
         if lst:
             i = bisect.bisect_right(starts[doc], t) - 1
@@ -1246,7 +1248,7 @@ def _halo_sources(part: PartitionDetKcp, halo: int):
 
 
 def _halo_plan(
-    part: PartitionDetKcp, rank: int, halo: int, local_cu: tuple[int, ...]
+    part: CakeKDADetKcpPartition, rank: int, halo: int, local_cu: tuple[int, ...]
 ) -> KcpHaloPlan:
     W = part.world_size
     hist, tail = _halo_sources(part, halo)
@@ -1307,7 +1309,7 @@ def _halo_plan(
                     free = [c for c in range(halo) if slots[c] == -1]
                     if not free:
                         raise ValueError(
-                            f"build_context_det_kcp: head row {e[2]} of fragment {e[1]} on rank {rank} has more than "
+                            f"cake_kda_det_train_kcp_build_context: head row {e[2]} of fragment {e[1]} on rank {rank} has more than "
                             f"{halo} consumers; this cannot happen (a head token has at most {halo} consuming "
                             "predecessor fragments): the halo plan is inconsistent"
                         )
@@ -1467,7 +1469,7 @@ def _check_tile_offsets(name: str, values) -> None:
             )
 
 
-def _build_head_plan(ctx: ContextDetKcp, H: int) -> KcpHeadPlan:
+def _build_head_plan(ctx: CakeKDADetKcpContext, H: int) -> KcpHeadPlan:
     part = ctx.partition
     W, r = part.world_size, ctx.rank
     H = int(H)
@@ -1844,11 +1846,11 @@ class KcpSequence:
         self.log.clear()
 
 
-# ContextDetKcp: argument omitted (the former default_factory fields)
+# CakeKDADetKcpContext: argument omitted (the former default_factory fields)
 _DEFAULT: Any = object()
 
 
-class ContextDetKcp:
+class CakeKDADetKcpContext:
     """One rank's view of the partition: CPU ints / tuples plus small int32 device tables; built once, reused across
     layers; never reads a tensor's contents.
 
@@ -1924,7 +1926,7 @@ class ContextDetKcp:
         f for f in _FIELDS if f != "sequence" and not f.startswith("_")
     )
 
-    partition: PartitionDetKcp
+    partition: CakeKDADetKcpPartition
     rank: int
     world_size: int
     group: object
@@ -1976,7 +1978,7 @@ class ContextDetKcp:
 
     def __init__(
         self,
-        partition: PartitionDetKcp,
+        partition: CakeKDADetKcpPartition,
         rank: int,
         world_size: int,
         group: object,
@@ -2043,7 +2045,7 @@ class ContextDetKcp:
         return f"{type(self).__qualname__}({fields})"
 
     @property
-    def fragments(self) -> tuple[FragmentDetKcp, ...]:
+    def fragments(self) -> tuple[CakeKDADetKcpFragment, ...]:
         return self.partition.fragments[self.rank]
 
     @property
@@ -2206,8 +2208,8 @@ def _device_of(device) -> torch.device:
     return device
 
 
-def build_context_det_kcp(
-    part: PartitionDetKcp,
+def cake_kda_det_train_kcp_build_context(
+    part: CakeKDADetKcpPartition,
     group,
     rank: int,
     device,
@@ -2217,8 +2219,8 @@ def build_context_det_kcp(
     heads=None,
     stream=None,
     _kcp_test_knobs: dict | None = None,
-) -> ContextDetKcp:
-    """The :class:`ContextDetKcp` of ``rank`` (the KCP contract §3.1).
+) -> CakeKDADetKcpContext:
+    """The :class:`CakeKDADetKcpContext` of ``rank`` (the KCP contract §3.1).
 
     ``group`` is the caller's ``torch.distributed`` process group (or ``None`` on the CPU / in a single process);
     when a group is given and the default process group is initialized, its size and this process's rank are
@@ -2244,25 +2246,27 @@ def build_context_det_kcp(
     current stream themselves).  A thread other than the one that runs the pack must pass ``stream`` (the current
     stream is per thread).  Not under CUDA-graph capture (``RuntimeError``).
     """
-    if not isinstance(part, PartitionDetKcp):
+    if not isinstance(part, CakeKDADetKcpPartition):
         raise TypeError(
-            "build_context_det_kcp: part must be the PartitionDetKcp of partition_det_kcp()"
+            "cake_kda_det_train_kcp_build_context: part must be the CakeKDADetKcpPartition of cake_kda_det_train_kcp_partition()"
         )
     W = part.world_size
     rank = int(rank)
     if not 0 <= rank < W:
-        raise ValueError(f"build_context_det_kcp: rank {rank} out of range [0, {W})")
+        raise ValueError(
+            f"cake_kda_det_train_kcp_build_context: rank {rank} out of range [0, {W})"
+        )
     if group is not None and dist.is_available() and dist.is_initialized():
         gw, gr = dist.get_world_size(group), dist.get_rank(group)
         if gw != W or gr != rank:
             raise ValueError(
-                f"build_context_det_kcp: the process group has world_size {gw} / rank {gr}, the partition and the call "
+                f"cake_kda_det_train_kcp_build_context: the process group has world_size {gw} / rank {gr}, the partition and the call "
                 f"say {W} / {rank}"
             )
     halo = int(conv_kernel_size) - 1
     if halo < 0:
         raise ValueError(
-            f"build_context_det_kcp: conv_kernel_size must be >= 1, got {conv_kernel_size}"
+            f"cake_kda_det_train_kcp_build_context: conv_kernel_size must be >= 1, got {conv_kernel_size}"
         )
     device = _device_of(device)
     if sm_count is None:
@@ -2274,7 +2278,7 @@ def build_context_det_kcp(
     sm_count = int(sm_count)
     if sm_count < 1:
         raise ValueError(
-            f"build_context_det_kcp: sm_count must be >= 1, got {sm_count}"
+            f"cake_kda_det_train_kcp_build_context: sm_count must be >= 1, got {sm_count}"
         )
     knobs = _kcp_test_knobs
     upload, table_cache = UPLOAD_DEFAULT, TABLE_CACHE_DEFAULT
@@ -2313,7 +2317,7 @@ def build_context_det_kcp(
     n_frag = len(mine)
     if n_frag > MAX_FRAGS:
         raise ValueError(
-            f"build_context_det_kcp: rank {rank} holds {n_frag} fragments; the kernels' tables admit at most {MAX_FRAGS}"
+            f"cake_kda_det_train_kcp_build_context: rank {rank} holds {n_frag} fragments; the kernels' tables admit at most {MAX_FRAGS}"
         )
     local_cu = part.local_cu_seqlens(rank)
     T_r = local_cu[-1]
@@ -2385,7 +2389,7 @@ def build_context_det_kcp(
         name: dev_tables[name]
         for name in ("hist_row_off", "tail_row_off", "head_row_off", "hist_index")
     }
-    ctx = ContextDetKcp(
+    ctx = CakeKDADetKcpContext(
         partition=part,
         rank=rank,
         world_size=W,
@@ -2444,7 +2448,7 @@ def _check_save_mode(save_mode: str) -> None:
         raise ValueError(f"save_mode must be 'light' or 'tape', got {save_mode!r}")
 
 
-# What a checkpoint recompute handle keeps of one KDA call (``cake_kcp.chunk_kda_det_kcp(..., recompute_handle=,
+# What a checkpoint recompute handle keeps of one KDA call (``cake_kcp.cake_kda_det_kcp(..., recompute_handle=,
 # checkpoint_keep=)``): ``"states"`` (the default) the incoming states ``S_in`` -- the call runs with
 # ``save_transfer=False`` --, ``"transfer"`` also the owner's c1 receive tensor (``save_transfer=True``).
 CHECKPOINT_KEEPS = ("states", "transfer")
@@ -2471,8 +2475,8 @@ def _check_checkpoint_keep(
     return transfer
 
 
-def kda_det_saved_bytes_kcp(
-    ctx: ContextDetKcp,
+def cake_kda_det_train_kcp_saved_bytes(
+    ctx: CakeKDADetKcpContext,
     *,
     H: int = 64,
     save_mode: str = "light",
@@ -2484,7 +2488,7 @@ def kda_det_saved_bytes_kcp(
     use_qk_l2norm_in_kernel: bool = False,
     use_gate_in_kernel: bool = False,
 ) -> int:
-    """Saved-set bytes of one layer on this rank (the KCP contract §3.2 ``kda_det_saved_bytes_kcp(ctx, ...)``)::
+    """Saved-set bytes of one layer on this rank (the KCP contract §3.2 ``cake_kda_det_train_kcp_saved_bytes(ctx, ...)``)::
 
     tables_bytes(NC_pad, n_frag, NSEG)                         # the int32 tables
     + n_in * s                                                 # S_in, s = H * 128 * 128 * 4
@@ -2506,7 +2510,7 @@ def kda_det_saved_bytes_kcp(
 
     The retained ``S_in`` and c1 tensors are the padded receive buffers (``s`` -> ``n_owners Hg`` tiles,
     ``Hg_r`` -> ``Hg_pad_r``); identical to the formula for ``H = 64``, and the padding is reported by
-    ``kda_det_comm_bytes_kcp(...)["padding"]``.  ``M_seg`` stays the dense copy of §9 (``NSEG s``).
+    ``cake_kda_det_train_kcp_comm_bytes(...)["padding"]``.  ``M_seg`` stays the dense copy of §9 (``NSEG s``).
 
     ``checkpoint_keep`` (``None`` = the saved set above): the bytes a checkpoint recompute handle retains for this
     layer while its backward is pending -- the tensors the handle's ``"kda"`` entry holds (exactly
@@ -2523,7 +2527,7 @@ def kda_det_saved_bytes_kcp(
     (#7039).
 
     ``use_qk_l2norm_in_kernel`` (issue #7817): the saved set of the in-kernel Q / K L2 norm adds the per-token FP32
-    rstd of q and k (``SavedDetKcp.qk_rstd``, empty on a rank without tokens; the raw q / k are the caller's tensors,
+    rstd of q and k (``CakeKDADetKcpSaved.qk_rstd``, empty on a rank without tokens; the raw q / k are the caller's tensors,
     not counted here).  A recompute handle's entry does not change: the recompute writes its rstd afresh.  While the
     single-rank programs of the mode are absent it raises ``NotImplementedError`` as the workspace does
     (:func:`require_qk_l2norm`), for the gate mode ``use_gate_in_kernel`` (the call's; the bytes do not depend on
@@ -2568,8 +2572,8 @@ def kda_det_saved_bytes_kcp(
     return total
 
 
-def kda_det_comm_bytes_kcp(
-    ctx: ContextDetKcp,
+def cake_kda_det_train_kcp_comm_bytes(
+    ctx: CakeKDADetKcpContext,
     *,
     H: int = 64,
     C: int = 8192,
@@ -2577,7 +2581,7 @@ def kda_det_comm_bytes_kcp(
     boundary_mode: str = "saved",
     checkpoint_keep: str | None = None,
 ) -> dict:
-    """Bytes this rank moves per collective and per boundary (the KCP contract §3.2 ``kda_det_comm_bytes_kcp(ctx)``; ``send`` / ``recv``
+    """Bytes this rank moves per collective and per boundary (the KCP contract §3.2 ``cake_kda_det_train_kcp_comm_bytes(ctx)``; ``send`` / ``recv``
     per collective, totals ``B1`` = forward (c1, c2, halo_fwd), ``B2`` = backward from the saved context (b1 with
     the re-sent maps unless ``save_transfer``, b2, halo_bwd), ``B3`` = the replayed forward + the backward with b1
     in its replay form (offsets only); plus the crossing-fragment counts and the per-fragment state bytes.
@@ -2677,7 +2681,7 @@ def kda_det_comm_bytes_kcp(
     return table
 
 
-# The pools of a rank's KCP workspace (``cake_kcp.WorkspaceDetKcp``) that share one storage: each backward send pool
+# The pools of a rank's KCP workspace (``cake_kcp.CakeKDADetKcpWorkspace``) that share one storage: each backward send pool
 # reuses the bytes of the forward send pool beside it.  A forward call waits its c1 / c2 sends before it returns and
 # a replay-mode backward runs its forward (waiting those sends) before the first write of b1_send / b2_send, so the
 # lifetimes never overlap; c1_recv keeps its own storage (the replay-mode backward's adjoint merge reads it).
@@ -2709,7 +2713,7 @@ BWD_POOLS = ("b1_send", "b1_recv", "b2_send", "b2_recv")
 
 
 def kcp_pool_numel(
-    ctx: ContextDetKcp, *, H: int = 64, fused_walks: int = 1
+    ctx: CakeKDADetKcpContext, *, H: int = 64, fused_walks: int = 1
 ) -> dict[str, int]:
     """Elements (FP32) of every pool of a rank's KCP workspace and of the call's fresh ``S_in``, by buffer name: the
     one source of the sizes ``cake_kcp`` gives its pools and fresh tensors.  ``fused_walks`` (shipped ``1``) adds one
@@ -2741,7 +2745,7 @@ def kcp_pool_numel(
 
 
 def kcp_arena_layout(
-    ctx: ContextDetKcp,
+    ctx: CakeKDADetKcpContext,
     *,
     H: int = 64,
     save_mode: str = "light",
@@ -2749,7 +2753,7 @@ def kcp_arena_layout(
     save_transfer: bool = SAVE_TRANSFER_DEFAULT,
     C: int = 8192,
 ) -> dict[str, int]:
-    """The KCP pools of a rank's workspace (``cake_kcp.WorkspaceDetKcp``) in bytes, as the workspace allocates them.
+    """The KCP pools of a rank's workspace (``cake_kcp.CakeKDADetKcpWorkspace``) in bytes, as the workspace allocates them.
 
     ``pool.<name>``: the bytes each pool of a forward (``backward=False``) or a backward workspace needs
     (:func:`kcp_pool_numel`, 4 B per element); ``arena``: the bytes the workspace allocates -- every pool once, each
@@ -2761,8 +2765,8 @@ def kcp_arena_layout(
     workspace, which counts every pool in ``arena``).  The ring exchange receives no c1 tensor: its forward workspace
     holds ``pool.c1_recv`` bytes fewer than the ``save_transfer=False`` ``arena`` (the option resolves to ``False``
     there) and ``ring`` more.  The saved set (``S_in``, the c1 receive tensor kept with ``save_transfer``, ``M_seg``, the forward's saved
-    copy of the carry plane; :func:`kda_det_saved_bytes_kcp`; the ``carry`` pool the backward's adjoint carries use is a
-    workspace pool) and the convolution route's halo rows (per-call tensors; their traffic: :func:`kda_det_comm_bytes_kcp`
+    copy of the carry plane; :func:`cake_kda_det_train_kcp_saved_bytes`; the ``carry`` pool the backward's adjoint carries use is a
+    workspace pool) and the convolution route's halo rows (per-call tensors; their traffic: :func:`cake_kda_det_train_kcp_comm_bytes`
     ``halo_fwd`` / ``halo_bwd``) are never workspace pools, so ``C`` leaves the workspace unchanged, and so does
     ``save_transfer`` a backward workspace."""
     _check_save_mode(save_mode)
@@ -2825,10 +2829,10 @@ def intra_writes_tables(plan, path: str = LOCAL_PATH_FWD) -> bool:
     """Whether the existing backend's intra record of ``path`` (a :class:`cake_backend.Plan`) computes the chunk
     layout from ``cu_seqlens`` and writes the tables itself (its logical vocabulary binds ``cu_seqlens``): the kernel
     backend then hands it a scratch table set so the KCP's CPU-built tables are never rewritten by a kernel."""
-    from ..cake.cake_kda_det_train import (
-        cake_jit,
-    )  # the registry literal; imported here so the metadata module stays torch-only
+    from . import _single_rank
 
+    # the registry literal; imported here so the metadata module stays torch-only
+    cake_jit = _single_rank.module("cake_jit")
     record = plan.record("fwd_intra", path)
     return "cu_seqlens" in cake_jit.MODULES[record]["logical"].values()
 
@@ -2839,7 +2843,7 @@ def local_scratch_table_bytes(plan) -> int:
     return int(plan.table_words()) * 4 if intra_writes_tables(plan) else 0
 
 
-# The local arena of a backward workspace (``cake_kcp.WorkspaceDetKcp`` ``local_arena``): ``"replay"`` (the default)
+# The local arena of a backward workspace (``cake_kcp.CakeKDADetKcpWorkspace`` ``local_arena``): ``"replay"`` (the default)
 # is the existing backend's replay layout (4488 B per internal token-head) with its forward layout; ``"lean"`` (opt-in)
 # runs the backward on this route's lean layout (:data:`LOCAL_LAYOUT_BWD_LEAN`, registered on the existing backend:
 # 3460 B per internal token-head plus the per-pass set where it does not fit; the fused gradient, GLM intra and the
@@ -2909,8 +2913,9 @@ def _lean_slots(
     note above it).  ``NSEG`` is unused: the layout has no state blocks.  ``l2n``: the plan's in-kernel Q / K L2 norm
     mode (the slot functions' seventh argument): the KCP never runs this layout with the norm (a lean workspace
     refuses it), so the slots are the flag-off occupants' in every mode."""
-    from ..cake.cake_kda_det_train import cake_backend
+    from . import _single_rank
 
+    cake_backend = _single_rank.module("cake_backend")
     R_b = cake_backend.BT * -(-NC // passes)
     unit_w, unit_p = R * H, R_b * H
     capacity = {host: per * unit_w for host, per in _LEAN_HOSTS}
@@ -2939,8 +2944,9 @@ def _lean_slots(
 def register_lean_layout():
     """Register :data:`LOCAL_LAYOUT_BWD_LEAN` on the existing backend's arenas (``cake_backend._register_route_slots``;
     idempotent) and return that backend module."""
-    from ..cake.cake_kda_det_train import cake_backend
+    from . import _single_rank
 
+    cake_backend = _single_rank.module("cake_backend")
     cake_backend._register_route_slots(LOCAL_LAYOUT_BWD_LEAN, _lean_slots)
     return cake_backend
 
@@ -3158,8 +3164,9 @@ def _takes(fn: Any, name: str) -> bool:
 @functools.cache
 def _cuda_arch(index: int) -> str | None:
     """The exported architecture of CUDA device ``index``, ``None`` when no record targets it (fixed per process)."""
-    from ..cake.cake_kda_det_train import cake_jit
+    from . import _single_rank
 
+    cake_jit = _single_rank.module("cake_jit")
     return cake_jit.arch_for_capability(torch.cuda.get_device_capability(index))
 
 
@@ -3204,8 +3211,9 @@ def qk_l2norm_twin(record: str) -> bool:
     """Whether the existing backend's record ``record`` is the ``_l2n`` twin of its stage, the program that normalizes
     the raw q / k rows itself: the registry's ``l2n`` key of the record lists the fused mode only (absent:
     ``["off"]``).  The key decides, not the name: a twin may carry a version suffix (``fwd_intra_l2n_v37``)."""
-    from ..cake.cake_kda_det_train import cake_jit
+    from . import _single_rank
 
+    cake_jit = _single_rank.module("cake_jit")
     return list(cake_jit.MODULES[record].get("l2n", ("off",))) == ["fused"]
 
 
@@ -3228,8 +3236,10 @@ def saved_rstd_record(record: str, arch: str | None) -> str:
     twin = SAVED_RSTD_TWINS.get(record)
     if twin is None or arch is None:
         return record
-    from ..cake.cake_kda_det_train import cake_build, cake_jit
+    from . import _single_rank
 
+    cake_build = _single_rank.module("cake_build")
+    cake_jit = _single_rank.module("cake_jit")
     try:
         entry = cake_jit.MODULES[twin]
     except KeyError:
@@ -3257,8 +3267,9 @@ def _qk_l2norm_problem(
     not serve mode ``mode``, ``None`` when they do: every stage of :data:`QK_L2NORM_STAGES` selects a record (no
     ``ValueError``, no ``None``) delivered for ``arch`` with a library in ``libraries`` (``build.json``), and the
     readers give the route's order (:func:`_qk_l2norm_readers`)."""
-    from ..cake.cake_kda_det_train import cake_jit
+    from . import _single_rank
 
+    cake_jit = _single_rank.module("cake_jit")
     nc, docs, heads = problem
     where = f"{arch}, {sm} SMs, {docs} documents, {heads} heads, {nc} chunks"
     picked: dict[tuple[str, str], str] = {}
@@ -3302,9 +3313,13 @@ def _qk_l2norm_inputs() -> tuple[Any, ...]:
     and libraries query, and this module's stages, grid, SM counts, layouts, slots and helpers."""
     global _QK_L2NORM_MODULES
     if not _QK_L2NORM_MODULES:
-        from ..cake.cake_kda_det_train import cake_backend, cake_build, cake_jit
+        from . import _single_rank
 
-        _QK_L2NORM_MODULES = (cake_backend, cake_build, cake_jit)
+        _QK_L2NORM_MODULES = (
+            _single_rank.module("cake_backend"),
+            _single_rank.module("cake_build"),
+            _single_rank.module("cake_jit"),
+        )
     cake_backend, cake_build, cake_jit = _QK_L2NORM_MODULES
     return (
         cake_backend.cake_kda_det_train_forward,
@@ -3361,8 +3376,11 @@ def _qk_l2norm_missing(mode: str, gate: str, arch: str | None) -> str | None:
     """The uncached check of :func:`qk_l2norm_missing`."""
     if mode == "off":
         return None
-    from ..cake.cake_kda_det_train import cake_backend, cake_build, cake_jit
+    from . import _single_rank
 
+    cake_backend = _single_rank.module("cake_backend")
+    cake_build = _single_rank.module("cake_build")
+    cake_jit = _single_rank.module("cake_jit")
     if not _takes(cake_backend.cake_kda_det_train_forward, "use_qk_l2norm_in_kernel"):
         return "the single-rank backend does not take use_qk_l2norm_in_kernel"
     if (
@@ -3417,8 +3435,8 @@ def qk_l2norm_intra_first(plan, path: str = LOCAL_PATH_BWD) -> bool:
     return qk_l2norm_twin(str(plan.record("fwd_intra", path)))
 
 
-def kda_det_workspace_bytes_kcp(
-    ctx: ContextDetKcp | Sequence[ContextDetKcp],
+def cake_kda_det_train_kcp_workspace_bytes(
+    ctx: CakeKDADetKcpContext | Sequence[CakeKDADetKcpContext],
     *,
     H: int = 64,
     save_mode: str = "light",
@@ -3438,23 +3456,23 @@ def kda_det_workspace_bytes_kcp(
     workspace, ``backward=False``, takes the KCP forward layout :data:`LOCAL_LAYOUT_FWD_ONLY`, 2432 B per internal
     token-head) with the intra record's scratch table set where it writes one (:func:`local_scratch_table_bytes`), plus the KCP
     arena of transient buffers (:func:`kcp_arena_layout`; CONSISTENCY-6, SPEC-4: saved-set tensors are counted by
-    :func:`kda_det_saved_bytes_kcp`).  A forward-only workspace has two states: these bytes after its forwards with a saved
+    :func:`cake_kda_det_train_kcp_saved_bytes`).  A forward-only workspace has two states: these bytes after its forwards with a saved
     set (the training forward) under ``save_transfer`` -- pass the forward's value: without it such a forward also
     allocates the :data:`FWD_TRANSFER_POOLS` -- and ``kcp_arena_layout(..., save_transfer=save_transfer)["lazy"]``
     more once a forward without one has read the rest of the :data:`FWD_LAZY_POOLS`.  The ring exchange's hop pools
     (``["ring"]``) are not counted; its forward-only workspace holds no c1 receive pool (``["pool.c1_recv"]``).
 
-    A sequence of contexts gives the bytes of one workspace that serves all of them (``WorkspaceDetKcp.reserve``):
+    A sequence of contexts gives the bytes of one workspace that serves all of them (``CakeKDADetKcpWorkspace.reserve``):
     each pool at its largest need over the contexts (each :data:`SHARED_POOLS` pair one storage of the larger), the
     largest local arena (the first of the largest in list order, with its tail-count table where it is a lean one, as
     ``reserve`` binds it), and the scratch table set of every distinct ``(T_r, n_frag)`` that has one (zero at
     ``H = 64``; KiB scale where present).  The bytes of a list of one context are those of the context.
-    ``lean_passes``: the tail passes a lean arena is sized for (``WorkspaceDetKcp(lean_passes=...)``; ``None``:
+    ``lean_passes``: the tail passes a lean arena is sized for (``CakeKDADetKcpWorkspace(lean_passes=...)``; ``None``:
     :data:`LEAN_PASSES_DEFAULT`).  ``use_gate_in_kernel``: the workspace's gate mode
-    (``WorkspaceDetKcp(use_gate_in_kernel=)``): the raw mode's local arena is planned in the raw mode (its backward
+    (``CakeKDADetKcpWorkspace(use_gate_in_kernel=)``): the raw mode's local arena is planned in the raw mode (its backward
     layout carries no gate epilogue buffers on any architecture) and is the replay arena (``local_arena="lean"`` is
     refused in this mode, as by the workspace); the pools do not depend on it.  ``use_qk_l2norm_in_kernel``: the
-    workspace's in-kernel Q / K L2 norm mode (``WorkspaceDetKcp(use_qk_l2norm_in_kernel=True)``, issue #7817): the
+    workspace's in-kernel Q / K L2 norm mode (``CakeKDADetKcpWorkspace(use_qk_l2norm_in_kernel=True)``, issue #7817): the
     local arena is planned in the form of the flag (``l2n="fused"``, :func:`qk_l2norm_plan_kwargs`: on sm_100a a backward
     layout without the gate epilogue's buffers) and is the replay arena (``local_arena="lean"`` is refused in this
     mode, as by the workspace); the pools do not depend on it.  The mode's per-call tensors (the backward's normalized
@@ -3470,13 +3488,13 @@ def kda_det_workspace_bytes_kcp(
     gate = "raw" if use_gate_in_kernel else "g"
     if gate == "raw" and check_local_arena(local_arena) == "lean":
         raise NotImplementedError(
-            'kda_det_workspace_bytes_kcp: use_gate_in_kernel=True runs on the replay local arena; local_arena="lean" '
+            'cake_kda_det_train_kcp_workspace_bytes: use_gate_in_kernel=True runs on the replay local arena; local_arena="lean" '
             "is not supported in the raw gate mode"
         )
     if l2n and check_local_arena(local_arena) == "lean":
-        # as WorkspaceDetKcp: the lean layout's support of the mode follows the single-rank layout of its programs
+        # as CakeKDADetKcpWorkspace: the lean layout's support of the mode follows the single-rank layout of its programs
         raise NotImplementedError(
-            'kda_det_workspace_bytes_kcp: use_qk_l2norm_in_kernel=True runs on the replay local arena; local_arena="lean" '
+            'cake_kda_det_train_kcp_workspace_bytes: use_qk_l2norm_in_kernel=True runs on the replay local arena; local_arena="lean" '
             "is not supported with the in-kernel Q/K L2 norm yet"
         )
     mode = qk_l2norm_mode(l2n)
@@ -3486,7 +3504,7 @@ def kda_det_workspace_bytes_kcp(
     )
     ctxs = list(ctx) if isinstance(ctx, (list, tuple)) else [ctx]
     if not ctxs:
-        raise ValueError("kda_det_workspace_bytes_kcp: no context given")
+        raise ValueError("cake_kda_det_train_kcp_workspace_bytes: no context given")
     if l2n:
         # before any plan: the refusal of every rank alike (rank-independent inputs only: the device model of the
         # contexts, never the current CUDA device); the flag-off query makes no CUDA call here
@@ -3497,10 +3515,10 @@ def kda_det_workspace_bytes_kcp(
     for c in ctxs:
         if c.T_r <= 0:
             continue
-        from ..cake.cake_kda_det_train import (
-            cake_backend,
-        )  # the existing backend's arena rule; imported here so the metadata module stays torch-only
+        from . import _single_rank
 
+        # the existing backend's arena rule; imported here so the metadata module stays torch-only
+        cake_backend = _single_rank.module("cake_backend")
         p = cake_backend.plan(c.T_r, c.n_frag, int(H), c.sm_count, gate=gate, **l2n_kw)
         if lean and local_lean_serves(p):
             a = local_lean_bytes(p, local_lean_passes(p, passes=lean_passes))
@@ -3578,7 +3596,7 @@ def validate_test_knobs(knobs) -> dict:
     three-MMA form of the R1 bitwise test; 2 plain TF32, the optional G2 cross-check) and a known ``p_rule``
     (:data:`P_RULES`; ``"wave_fill1"`` = the previous rule (the fill without the tie line), ``"wave"`` = the equal-segment
     wave rule above the chain cap alone, ``"occ"`` = the occupancy rule, ``"wave_fill"`` = the unadopted fill; read by
-    :func:`build_context_det_kcp`).  The public API can
+    :func:`cake_kda_det_train_kcp_build_context`).  The public API can
     therefore never select a non-zero mode or a P rule other than the shipped one."""
     if knobs is None:
         return {"precision_mode": 0, "p_rule": P_RULE_DEFAULT}
@@ -3640,24 +3658,24 @@ __all__ = [
     "TILE",
     "TILE_B",
     "TILE_M",
-    "ContextDetKcp",
-    "FragmentDetKcp",
+    "CakeKDADetKcpContext",
+    "CakeKDADetKcpFragment",
     "KcpHaloPlan",
     "KcpHeadPlan",
-    "PartitionDetKcp",
+    "CakeKDADetKcpPartition",
     "KcpSegmentPlan",
     "KcpSequence",
-    "build_context_det_kcp",
+    "cake_kda_det_train_kcp_build_context",
     "chunk_geometry",
     "chunk_tables",
     "head_groups",
     "kcp_arena_layout",
-    "kda_det_comm_bytes_kcp",
+    "cake_kda_det_train_kcp_comm_bytes",
     "kcp_pool_numel",
-    "partition_det_kcp",
+    "cake_kda_det_train_kcp_partition",
     "kcp_plan",
-    "kda_det_saved_bytes_kcp",
-    "kda_det_workspace_bytes_kcp",
+    "cake_kda_det_train_kcp_saved_bytes",
+    "cake_kda_det_train_kcp_workspace_bytes",
     "near_equal",
     "owner_of_head",
     "seg_chunk_start",

@@ -45,6 +45,9 @@
       "cuda_toolkit": {
         "min": "12.8"
       },
+      "packages": [
+        "cake_kda_det_train"
+      ],
       "tvm_ffi": {
         "include_dirs": [
           "tvm_ffi.libinfo.find_include_path()",
@@ -1048,6 +1051,6 @@
       ]
     }
   ],
-  "package": "flashinfer.experimental.cake_kda_det_train_kcp",
+  "package": "flashinfer.experimental.cake.cake_kda_det_train_kcp",
   "schema": "cake-build/1"
 }

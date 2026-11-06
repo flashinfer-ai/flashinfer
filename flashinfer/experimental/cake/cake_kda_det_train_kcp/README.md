@@ -1,12 +1,13 @@
 # Cake deterministic context-parallel (KCP) packed KDA chunked training backend (SM100 / SM103 / SM107)
 
-Experimental backend of the context-parallel route of the packed Kimi Delta
+Backend of the context-parallel route of the packed Kimi Delta
 Attention (KDA) chunked training forward and backward: the packed batch is
 split over the ranks of a `torch.distributed` process group and the
 per-document state recurrences cross the rank boundaries exactly.  The public
 entry points are in `flashinfer/cake_kda_det_train_kcp.py`; each rank runs the
 chunk stages of `flashinfer.experimental.cake.cake_kda_det_train` at its own shape.
-Both the API and the backend are experimental: no compatibility guarantee.
+The entry points of `flashinfer.cake_kda_det_train_kcp` are a stable top-level
+API; the modules of this package are their backend.
 
 The path is deterministic: the same inputs, hardware, plan and process group
 give bitwise the same outputs and gradients.
@@ -14,10 +15,10 @@ give bitwise the same outputs and gradients.
 ## Usage
 
 The packed batch of one training step may be split over the ranks of a
-`torch.distributed` process group.  `partition_det_kcp` cuts the documents into
+`torch.distributed` process group.  `cake_kda_det_train_kcp_partition` cuts the documents into
 per-rank fragments (`"contiguous"`, `"zigzag"` or `"zigzag_per_document"`
 layouts, an explicit `fragments` table, or `cut_points` with the
-`"zigzag_per_document"` layout); `build_context_det_kcp` gives every rank the
+`"zigzag_per_document"` layout); `cake_kda_det_train_kcp_build_context` gives every rank the
 device tables of its fragments, the collectives that carry the per-document
 state recurrences and the convolution's history rows across the rank
 boundaries, and the segment plan of its fragment walks.  The per-rank entry
@@ -25,18 +26,18 @@ points take the rank's shard of the operands (the tokens of its fragments, in
 the partition's order) and return that shard's outputs and gradients:
 
 ```python
-from flashinfer.cake_kda_det_train_kcp import (partition_det_kcp, build_context_det_kcp, chunk_kda_det_kcp,
-                                  chunk_kda_det_fwd_kcp, chunk_kda_det_bwd_kcp,
-                                  kda_det_workspace_bytes_kcp, kda_det_saved_bytes_kcp, kda_det_comm_bytes_kcp)
+from flashinfer.cake_kda_det_train_kcp import (cake_kda_det_train_kcp_partition, cake_kda_det_train_kcp_build_context, cake_kda_det_kcp,
+                                  cake_kda_det_train_kcp_forward, cake_kda_det_train_kcp_backward,
+                                  cake_kda_det_train_kcp_workspace_bytes, cake_kda_det_train_kcp_saved_bytes, cake_kda_det_train_kcp_comm_bytes)
 from flashinfer.cake_causal_conv1d_det_train_kcp import cake_causal_conv1d_det_kcp
 
-part = partition_det_kcp(cu_seqlens_global_cpu, world_size)          # the same object on every rank
-ctx = build_context_det_kcp(part, group, rank, device)               # this rank's tables and collectives
+part = cake_kda_det_train_kcp_partition(cu_seqlens_global_cpu, world_size)          # the same object on every rank
+ctx = cake_kda_det_train_kcp_build_context(part, group, rank, device)               # this rank's tables and collectives
 y_local = cake_causal_conv1d_det_kcp(x_local, conv_weight, ctx)  # the convolution before the KDA step
-out_local = chunk_kda_det_kcp(q_local, k_local, v_local, g_local, beta_local, ctx)   # autograd
-out_local, saved = chunk_kda_det_fwd_kcp(q_local, k_local, v_local, g_local, beta_local, ctx,
+out_local = cake_kda_det_kcp(q_local, k_local, v_local, g_local, beta_local, ctx)   # autograd
+out_local, saved = cake_kda_det_train_kcp_forward(q_local, k_local, v_local, g_local, beta_local, ctx,
                                      save_mode="light", boundary_mode="saved")
-dq, dk, dv, dbeta, dg = chunk_kda_det_bwd_kcp(q_local, k_local, v_local, g_local, beta_local, ctx,
+dq, dk, dv, dbeta, dg = cake_kda_det_train_kcp_backward(q_local, k_local, v_local, g_local, beta_local, ctx,
                                           dout_local, saved=saved)
 ```
 
@@ -45,15 +46,15 @@ of FSDP2 (`fully_shard`) walk every dataclass, dict, list and tuple of a
 module's arguments, and see the context as one leaf. Per-layer metadata that
 carries it costs no walk time per fragment.
 
-CUDA-graph replay: the three KDA entry points -- `chunk_kda_det_kcp`,
-`chunk_kda_det_fwd_kcp` and `chunk_kda_det_bwd_kcp` -- take `graph="replay"`
+CUDA-graph replay: the three KDA entry points -- `cake_kda_det_kcp`,
+`cake_kda_det_train_kcp_forward` and `cake_kda_det_train_kcp_backward` -- take `graph="replay"`
 (default `"off"`, the eager path); the convolution halo takes `graph=` only
 through the backend module's function, the `cake_causal_conv1d_det_kcp` facade
 has no such parameter. The first call of a
 validity key runs eagerly, the second is captured into a CUDA graph and every
 later call of the key replays it: the same launches and collectives, bitwise
 the eager result, with no host work between them. The key is the call's kind,
-its `ContextDetKcp` / workspace / backend objects, every option and the shape,
+its `CakeKDADetKcpContext` / workspace / backend objects, every option and the shape,
 stride, dtype and data pointer of every operand and saved tensor.
 Requirements: the operands of a layer must keep their data pointers, shapes,
 strides and dtypes across steps (static activation buffers), the same context,
@@ -88,20 +89,20 @@ bound of what a framework sees.
 Limits of a partition: at most 65536 fragments per rank (the layout table's
 document search), at most 64 segments per fragment and no walk chain longer
 than 256 chunk steps (the segment plan's bounds); the byte queries
-`kda_det_workspace_bytes_kcp(ctx, H=...)`, `kda_det_saved_bytes_kcp(ctx, H=...)` and
-`kda_det_comm_bytes_kcp(ctx, H=..., C=...)` size the rank's workspace, saved set and
+`cake_kda_det_train_kcp_workspace_bytes(ctx, H=...)`, `cake_kda_det_train_kcp_saved_bytes(ctx, H=...)` and
+`cake_kda_det_train_kcp_comm_bytes(ctx, H=..., C=...)` size the rank's workspace, saved set and
 one step's traffic before any allocation.  Every rank of the group calls the
 same entry points in the same order; the collectives are issued inside them.
 
-Workspace of a rank (`WorkspaceDetKcp`, caller-held, reused across calls and
+Workspace of a rank (`CakeKDADetKcpWorkspace`, caller-held, reused across calls and
 layers): the local arena of the token-side stages plus the boundary pools.
 The backward's b1 / b2 send pools reuse the storage of the forward's c1 / c2
 send pools (a call waits its sends before a backward writes either), and the
 ring exchange's hop pools are allocated by the first `exchange="ring"` call.
-`kda_det_workspace_bytes_kcp` is the number of bytes an a2a workspace allocates
-(`WorkspaceDetKcp.bytes` after its first backward); the saved set and the
+`cake_kda_det_train_kcp_workspace_bytes` is the number of bytes an a2a workspace allocates
+(`CakeKDADetKcpWorkspace.bytes` after its first backward); the saved set and the
 convolution's halo rows are per-call tensors outside it.  A workspace that
-has served forwards only (`kda_det_workspace_bytes_kcp(..., backward=False)`) holds
+has served forwards only (`cake_kda_det_train_kcp_workspace_bytes(..., backward=False)`) holds
 its local arena in the KCP forward layout (`fwd_kcp`: 2432 B per internal
 token-head against at least 2560 for the existing backend's forward layout;
 no segment state blocks, the internal `Akk` rows under the `h` tape) and leaves
@@ -126,7 +127,7 @@ before the first call (host work and allocations only; `ring=True` also
 sizes the ring exchange's hop pools); the calls of those
 packs then allocate nothing, keep every pointer (so graph keys stay valid) and
 never re-size it -- a forward never turns a backward arena into a forward-only
-one.  `kda_det_workspace_bytes_kcp([ctx_a, ctx_b, ...], H=H)` is its size: each pool at
+one.  `cake_kda_det_train_kcp_workspace_bytes([ctx_a, ctx_b, ...], H=H)` is its size: each pool at
 its largest need, the largest local arena and, where the intra record writes
 one, each pack's scratch table set (KiB scale; none at 64 heads).  No content
 crosses calls, so outputs, saved sets and gradients are bitwise those of one
@@ -137,11 +138,11 @@ marks the workspace's storages as used on its own stream (`record_stream`),
 so a pool or arena that a later call replaces, or a dropped workspace, is
 reused by the caching allocator only after every stream that used it has
 run its queued work.  Calls on one stream do neither.
-`WorkspaceDetKcp(ctx, H, allocate=False)` allocates nothing until its first call
+`CakeKDADetKcpWorkspace(ctx, H, allocate=False)` allocates nothing until its first call
 and sizes that call for the backward, so a first forward does not build a
 forward-only arena that the first backward replaces.
 
-Saved set of a rank (`SavedDetKcp`, `boundary_mode="saved"`): the fresh `S_in`
+Saved set of a rank (`CakeKDADetKcpSaved`, `boundary_mode="saved"`): the fresh `S_in`
 (the initial states of its fragments), with `save_transfer` the owner's c1
 receive tensor and `M_seg`, on a rank whose fragments are split into `P > 1`
 segments the forward's carry plane (the saved-mode backward replays its tape
@@ -150,7 +151,7 @@ private test knob `saved_carry=0` selects the re-walk), and the call's
 scalars; the int32 tables are rebuilt from the context.  The token-row `Aqk` /
 `Akk` of the single-rank saved set are not part of it: the backward recomputes
 the internal rows in both modes (saved set and checkpoint replay run the same
-local programs), so `kda_det_saved_bytes_kcp` counts the tables, `S_in`, the
+local programs), so `cake_kda_det_train_kcp_saved_bytes` counts the tables, `S_in`, the
 `save_transfer` tensors and the carry plane (and the convolution's history
 rows with `with_conv`).
 
@@ -181,7 +182,7 @@ through the private test knob `host_trim` (after
 
 Host synchronization: no KCP call and no pack preparation copies a table from
 pageable memory or waits for queued device work, with or without a
-caller-owned workspace. `build_context_det_kcp` copies the context's tables in one
+caller-owned workspace. `cake_kda_det_train_kcp_build_context` copies the context's tables in one
 pinned non-blocking copy on `stream=` (default: the current stream), so pack
 N+1 can be prepared while pack N runs; `heads=H` derives the head plans there
 as well (host work; their device tables are copied only when read, and the
@@ -210,7 +211,7 @@ exchange -- the default with the all-to-all exchange (an earlier revision).
 `exchange="ring"` (available when every document spans at most three ranks)
 receives no such tensor, so `save_transfer` resolves to `False` there
 automatically; an explicit `save_transfer=True` together with the ring is a
-`ValueError`. `SavedDetKcp.save_transfer` always reports the value that was used.
+`ValueError`. `CakeKDADetKcpSaved.save_transfer` always reports the value that was used.
 `spec3_probe` sets the debug probe of the backend's first saved-mode backward,
 which compares the backward's prep and WY rows with the forward's: `"off"` (the
 default) skips it, `"record"` stores the comparison in
@@ -220,7 +221,7 @@ default) skips it, `"record"` stores the comparison in
 chunk-padded token layout) allocated through its prep and WY programs, so its
 peak memory is higher by up to that amount.
 The backward reads the value of its own call (pass it to
-`chunk_kda_det_bwd_kcp`; the forward's is not kept in `SavedDetKcp`).  Pass the
+`cake_kda_det_train_kcp_backward`; the forward's is not kept in `CakeKDADetKcpSaved`).  Pass the
 same value on every rank: the probe is a rank-local check, so `"assert"`
 serves single-process debugging.  Under `graph="replay"` the probing
 backward runs eagerly; a rank without tokens does not hold back its capture.
@@ -232,7 +233,7 @@ with it the forward's c1 / c2 exchanges (and the convolution's halo exchange).
 A recompute handle keeps what the original forward received instead:
 
 ```python
-from flashinfer.cake_kda_det_train_kcp import RecomputeHandleDetKcp, chunk_kda_det_kcp
+from flashinfer.cake_kda_det_train_kcp import CakeKDADetKcpRecomputeHandle, cake_kda_det_kcp
 from flashinfer.cake_causal_conv1d_det_train_kcp import cake_causal_conv1d_det_kcp
 
 def layer(xq, xk, xv, g, beta, hq, hk, hv):
@@ -240,9 +241,9 @@ def layer(xq, xk, xv, g, beta, hq, hk, hv):
     k = cake_causal_conv1d_det_kcp(xk, wk, ctx, recompute_handle=hk)
     v = cake_causal_conv1d_det_kcp(xv, wv, ctx, recompute_handle=hv)
     ...                                                          # split heads, normalize q / k
-    return chunk_kda_det_kcp(q, k, v, g, beta, ctx, recompute_handle=hq)   # "kda" entry of hq
+    return cake_kda_det_kcp(q, k, v, g, beta, ctx, recompute_handle=hq)   # "kda" entry of hq
 
-handles = [RecomputeHandleDetKcp() for _ in range(3)]               # per layer and micro-step
+handles = [CakeKDADetKcpRecomputeHandle() for _ in range(3)]               # per layer and micro-step
 out = torch.utils.checkpoint.checkpoint(layer, xq, xk, xv, g, beta, *handles, use_reentrant=False)
 ```
 
@@ -258,9 +259,9 @@ in b1; bitwise the default form); `checkpoint_keep="transfer"` also keeps the
 owner's c1 receive tensor (`save_transfer=True`; not with the ring exchange).
 An explicit `save_transfer` that contradicts the tier raises `ValueError`, in
 the entry point and in both byte queries.  The handle retains
-`kda_det_saved_bytes_kcp(ctx, H=..., checkpoint_keep=..., with_conv=False)` bytes for
+`cake_kda_det_train_kcp_saved_bytes(ctx, H=..., checkpoint_keep=..., with_conv=False)` bytes for
 the KDA entry until it is dropped (`with_conv` adds one convolution's history
-rows); `kda_det_comm_bytes_kcp(ctx, ..., checkpoint_keep=...)` reports the step's
+rows); `cake_kda_det_train_kcp_comm_bytes(ctx, ..., checkpoint_keep=...)` reports the step's
 traffic (`B1 + B2`; the recompute moves nothing when the layer's convolutions
 carry handles too -- a convolution without one still sends its `halo_fwd`
 rows in the recompute).  Rules: create the handles outside the outermost checkpoint
@@ -289,9 +290,9 @@ the layer's `"kda"` entry, so the checkpointed layer above needs one handle:
 def layer(xq, xk, xv, g, beta, h):
     q, k, v = cake_causal_conv1d_det_multi_kcp((xq, xk, xv), (wq, wk, wv), ctx, recompute_handle=h)
     ...
-    return chunk_kda_det_kcp(q, k, v, g, beta, ctx, recompute_handle=h)
+    return cake_kda_det_kcp(q, k, v, g, beta, ctx, recompute_handle=h)
 
-out = torch.utils.checkpoint.checkpoint(layer, xq, xk, xv, g, beta, RecomputeHandleDetKcp(),
+out = torch.utils.checkpoint.checkpoint(layer, xq, xk, xv, g, beta, CakeKDADetKcpRecomputeHandle(),
                                         use_reentrant=False)
 ```
 
@@ -307,16 +308,16 @@ any view under the stride rule of "Raw gate mode" in the single-rank README,
 `A_log` / `dt_bias` are the full parameters, the same tensors on every rank).
 
 ```python
-from flashinfer.cake_kda_det_train_kcp import WorkspaceDetKcp, reduce_gate_param_grads_det_kcp
+from flashinfer.cake_kda_det_train_kcp import CakeKDADetKcpWorkspace, cake_kda_det_train_kcp_reduce_gate_param_grads
 
-ws = WorkspaceDetKcp(use_gate_in_kernel=True)                     # the workspace's mode, fixed
-out_local, saved = chunk_kda_det_fwd_kcp(q_local, k_local, v_local, raw_local, beta_local, ctx,
+ws = CakeKDADetKcpWorkspace(use_gate_in_kernel=True)                     # the workspace's mode, fixed
+out_local, saved = cake_kda_det_train_kcp_forward(q_local, k_local, v_local, raw_local, beta_local, ctx,
                                          workspace=ws, use_gate_in_kernel=True, A_log=A_log,
                                          dt_bias=dt_bias, lower_bound=-5.0)
-dq, dk, dv, dbeta, draw, dA_log_r, ddt_bias_r = chunk_kda_det_bwd_kcp(
+dq, dk, dv, dbeta, draw, dA_log_r, ddt_bias_r = cake_kda_det_train_kcp_backward(
     q_local, k_local, v_local, raw_local, beta_local, ctx, dout_local, saved=saved, workspace=ws,
     use_gate_in_kernel=True, A_log=A_log, dt_bias=dt_bias, lower_bound=-5.0)
-dA_log, ddt_bias = reduce_gate_param_grads_det_kcp(ctx, dA_log_r, ddt_bias_r)   # optional, see below
+dA_log, ddt_bias = cake_kda_det_train_kcp_reduce_gate_param_grads(ctx, dA_log_r, ddt_bias_r)   # optional, see below
 ```
 
 * The local stages run the raw records of the rank's plan (the intra and prep
@@ -334,18 +335,18 @@ dA_log, ddt_bias = reduce_gate_param_grads_det_kcp(ctx, dA_log_r, ddt_bias_r)   
   replicated across the context-parallel ranks.  An NCCL all-reduce gives
   that sum to FP32 rounding but does not fix its summation order (it changes
   with the algorithm, topology and message size), so it is not bitwise
-  reproducible; `reduce_gate_param_grads_det_kcp(ctx, dA_log, ddt_bias)` is:
+  reproducible; `cake_kda_det_train_kcp_reduce_gate_param_grads(ctx, dA_log, ddt_bias)` is:
   one `all_gather_into_tensor` of the `H + 128 H` values, then an FP32 sum in
   rank order on every rank (the same bits everywhere).
-* The mode is fixed per workspace (`WorkspaceDetKcp(use_gate_in_kernel=True)`:
+* The mode is fixed per workspace (`CakeKDADetKcpWorkspace(use_gate_in_kernel=True)`:
   its local arena is the replay arena planned in raw mode, whose backward
   layouts carry no gate epilogue buffers; the KCP pools do not change;
   `local_arena="lean"` is refused in raw mode), recorded in the saved set
-  (`SavedDetKcp.gate`, `.lower_bound`) and in a recompute handle's
+  (`CakeKDADetKcpSaved.gate`, `.lower_bound`) and in a recompute handle's
   fingerprint; a call in the other mode, a backward with another
   `lower_bound` and a recompute of another mode are refused with
-  `ValueError`.  `kda_det_workspace_bytes_kcp(ctx, H=..., use_gate_in_kernel=True)`
-  sizes it; `kda_det_saved_bytes_kcp` and `kda_det_comm_bytes_kcp` do not
+  `ValueError`.  `cake_kda_det_train_kcp_workspace_bytes(ctx, H=..., use_gate_in_kernel=True)`
+  sizes it; `cake_kda_det_train_kcp_saved_bytes` and `cake_kda_det_train_kcp_comm_bytes` do not
   depend on the mode.
 * The backward allocates the raw gate's BF16 gradient, the partials (two FP32
   `[NC_pad, H, 128, 2]` buffers of the rank's chunks, for the duration of the
@@ -353,7 +354,7 @@ dA_log, ddt_bias = reduce_gate_param_grads_det_kcp(ctx, dA_log_r, ddt_bias_r)   
   parameter gradients.
 
 In-kernel Q / K L2 norm on the KCP route (issue #7817): the three KDA entry
-points, `WorkspaceDetKcp` and the workspace and saved byte queries take the
+points, `CakeKDADetKcpWorkspace` and the workspace and saved byte queries take the
 keyword-only `use_qk_l2norm_in_kernel=False`.  With `True` the local stages
 normalize `q` and `k` per token and per 128-channel head (FP32 sum of squares,
 `r = 1 / sqrt(ss + 1e-6)`, `x_hat = bf16(x * r)`; `v` is not normalized) and
@@ -361,10 +362,10 @@ the GLM intra programs fuse the FP32 pullback into the BF16 `dq` / `dk`, so
 `q_local` / `k_local` are the rank's raw rows and the gradients are theirs.
 
 ```python
-ws = WorkspaceDetKcp(use_qk_l2norm_in_kernel=True)                # the workspace's mode, fixed
-out_local, saved = chunk_kda_det_fwd_kcp(q_raw, k_raw, v_local, g_local, beta_local, ctx,
+ws = CakeKDADetKcpWorkspace(use_qk_l2norm_in_kernel=True)                # the workspace's mode, fixed
+out_local, saved = cake_kda_det_train_kcp_forward(q_raw, k_raw, v_local, g_local, beta_local, ctx,
                                          workspace=ws, use_qk_l2norm_in_kernel=True)
-dq_raw, dk_raw, dv, dbeta, dg = chunk_kda_det_bwd_kcp(
+dq_raw, dk_raw, dv, dbeta, dg = cake_kda_det_train_kcp_backward(
     q_raw, k_raw, v_local, g_local, beta_local, ctx, dout_local, saved=saved, workspace=ws,
     use_qk_l2norm_in_kernel=True)
 ```
@@ -382,8 +383,8 @@ dq_raw, dk_raw, dv, dbeta, dg = chunk_kda_det_bwd_kcp(
 * The normalization is token-local: the halo, the context, the KCP programs,
   every collective and its byte count are those of the flag-off route.
 * The saved set keeps the raw `q` / `k` (the caller's tensors) and adds the
-  FP32 rstd `SavedDetKcp.qk_rstd` `[2, S_local, H]` (plane 0 q, plane 1 k;
-  empty on a rank without tokens): `kda_det_saved_bytes_kcp(...,
+  FP32 rstd `CakeKDADetKcpSaved.qk_rstd` `[2, S_local, H]` (plane 0 q, plane 1 k;
+  empty on a rank without tokens): `cake_kda_det_train_kcp_saved_bytes(...,
   use_qk_l2norm_in_kernel=True)` is `8 * S_local * H` bytes more.  The
   normalized q / k are never saved: the backward rebuilds them bitwise from
   the raw rows and the rstd, and a checkpoint recompute writes its rstd
@@ -397,7 +398,7 @@ dq_raw, dk_raw, dv, dbeta, dg = chunk_kda_det_bwd_kcp(
   per-call buffer (`256 * S_local * H` bytes each) instead.
 * The mode is fixed per workspace (the replay local arena of that mode;
   `local_arena="lean"` is refused with it), recorded in the saved set
-  (`SavedDetKcp.qk_l2norm`), the graph validity key and a recompute handle's
+  (`CakeKDADetKcpSaved.qk_l2norm`), the graph validity key and a recompute handle's
   fingerprint; a call, a saved set or a recompute of the other mode is
   refused with `ValueError`.
 * With `use_qk_l2norm_in_kernel=False` (the default) every launch, saved
@@ -411,7 +412,7 @@ dq_raw, dk_raw, dv, dbeta, dg = chunk_kda_det_bwd_kcp(
   counts), each delivered and exported for the device's architecture, with
   exactly one normalizing first reader on the replay, and its forward and
   replay layouts carry the normalized slot views `qn_int` / `kn_int`, a
-  call, a `WorkspaceDetKcp` and the byte queries with the flag on raise
+  call, a `CakeKDADetKcpWorkspace` and the byte queries with the flag on raise
   `NotImplementedError` before any workspace build, plan, launch or
   collective.  The check reads rank-independent inputs only (the
   architecture of the context's device, the registry's selection over that
@@ -463,6 +464,8 @@ The files of this package:
   tables and collectives, with the byte queries.
 * `cake_kcp.py` -- the per-rank launch sequences, the saved set and workspace
   of a rank, the autograd `Function` and the three entry points.
+* `_single_rank.py` -- the name of the single-rank package this package
+  requires (see "Vendoring") and the import of its modules.
 * `build.test.json` -- a `cake-build/1` manifest of the same form as
   `build.json` holding the test-only programs of `cake_kcp_jit.TEST_MODULES`
   (the TF32 hi/lo transfer walk, its static `precision_mode` 1 and 2 forms,
@@ -482,6 +485,16 @@ The files of this package:
   of the two chunk stages (`kcp_fwd_o`, `kcp_dav`), rendered like the
   single-rank ones (digests in `build.json` and `build.test.json`).
 
+## Vendoring
+
+This package needs its single-rank sibling `cake_kda_det_train`: it runs that
+package's chunk stages and reads its registry.  `build.json` and
+`build.test.json` declare it as `common.requires.packages:
+["cake_kda_det_train"]` (directory names).  `_single_rank.py` finds the
+sibling by name from this package's parent, so vendor the two directories
+together, either as siblings under one parent package or both as top-level
+packages.  Importing them needs no `flashinfer`.
+
 ## Status
 
 The registry holds sixteen shipped programs (`cake_kcp_jit.MODULES`, in
@@ -491,7 +504,9 @@ The registry holds sixteen shipped programs (`cake_kcp_jit.MODULES`, in
 Tests: `tests/experimental/test_cake_kda_det_train_kcp_build.py` (the KCP
 registries and manifests, no device needed),
 `tests/experimental/test_cake_kda_det_train_kcp.py` (the per-rank path),
-`tests/experimental/test_cake_kda_det_train_kcp_dist.py` (multi-GPU rows) and
+`tests/experimental/test_cake_kda_det_train_kcp_dist.py` (multi-GPU rows),
+`tests/experimental/test_cake_kda_det_train_kcp_standalone.py` (the two
+vendored layouts without `flashinfer`) and
 `tests/experimental/test_cake_kda_det_train_kcp_api.py` (the public entry
 points and the previous names); benchmark
 `benchmarks/bench_cake_kda_det_train_kcp.py` (`torchrun`, one process per
