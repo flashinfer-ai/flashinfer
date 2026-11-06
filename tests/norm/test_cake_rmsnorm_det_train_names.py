@@ -503,7 +503,7 @@ FRESH = {
         "try:\n"
         "    from flashinfer import cake_rmsnorm\n"
         "except ImportError as e:\n"
-        "    assert 'cake_rmsnorm' in str(e), e\n"
+        "    assert \"cannot import name 'cake_rmsnorm' from 'flashinfer'\" in str(e), e\n"
         "else:\n"
         "    raise AssertionError('flashinfer.cake_rmsnorm still imports')\n"
         "from flashinfer import cake_rmsnorm_det\n"

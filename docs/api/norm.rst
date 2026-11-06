@@ -80,10 +80,16 @@ fusion and an autograd wrapper.
      (``cake_rmsnorm_det``, ``CakeRMSNormDetFunction``,
      ``cake_rmsnorm_det_train_forward``, ``cake_rmsnorm_det_train_backward``,
      ``cake_rmsnorm_det_train_backward_workspace_bytes``). The non-deterministic
-     package is reached only as the module ``flashinfer.cake_rmsnorm_train``:
-     the top-level ``cake_rmsnorm``, ``CakeRMSNormFunction`` and
-     ``cake_rmsnorm_train_*`` names are removed, so code that imports them fails
-     at import.
+     package is reached only as the module ``flashinfer.cake_rmsnorm_train``.
+     The top-level ``flashinfer.cake_rmsnorm``, ``flashinfer.CakeRMSNormFunction``,
+     ``flashinfer.cake_rmsnorm_train_forward``,
+     ``flashinfer.cake_rmsnorm_train_backward`` and
+     ``flashinfer.cake_rmsnorm_train_backward_workspace_bytes`` are removed, so
+     code that imports them fails at import. Callers that want the
+     deterministic behavior of those names use the ``det`` names (for example
+     ``flashinfer.cake_rmsnorm_det``); callers of the non-deterministic package
+     call ``flashinfer.cake_rmsnorm_train.cake_rmsnorm`` with
+     ``deterministic=False``.
    * There are no aliases: a name without ``det`` never runs the deterministic
      package, and neither package runs the other.
 
