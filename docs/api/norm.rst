@@ -85,26 +85,76 @@ fusion and an autograd wrapper.
      non-deterministic package's names: that package is reached through its
      module only.
    * The names from before the rename are removed, with no aliases; code that
-     uses them fails at import:
+     uses them fails at import.  In v0.7.3 every former name ran the
+     deterministic programs (``deterministic=False`` raised an error).  In
+     v0.7.4rc1 a former entry ran the deterministic package by default
+     (``deterministic=True``) and the non-deterministic package with
+     ``deterministic=False``.  A v0.7.4rc1 ``deterministic=False`` call under
+     ``torch.use_deterministic_algorithms(True)`` raised ``RuntimeError``
+     (with ``warn_only=True`` it warned and computed deterministically), so
+     it moves to the deterministic name.  The deterministic package now
+     carries every deterministic name; the non-deterministic package never
+     falls back to it:
 
-     ===================================================  ===========================================================
-     Removed                                              Use
-     ===================================================  ===========================================================
-     module ``flashinfer.cake_rmsnorm_train``             module ``flashinfer.cake_rmsnorm_nondet_train``
-     ``cake_rmsnorm(..., deterministic=False)``           ``cake_rmsnorm_nondet(...)``
-     ``CakeRMSNormFunction``                              ``CakeRMSNormNondetFunction``
-     ``cake_rmsnorm_train_forward``                       ``cake_rmsnorm_nondet_train_forward``
-     ``cake_rmsnorm_train_backward``                      ``cake_rmsnorm_nondet_train_backward``
-     ``cake_rmsnorm_train_backward_workspace``            ``cake_rmsnorm_nondet_train_backward_workspace``
-     ``cake_rmsnorm_train_backward_workspace_bytes``      ``cake_rmsnorm_nondet_train_backward_workspace_bytes``
-     ``is_cake_rmsnorm_train_supported``                  ``is_cake_rmsnorm_nondet_train_supported``
-     ``route_key`` (non-deterministic package)            ``cake_rmsnorm_nondet_train_route_key``
-     ``route_key`` (deterministic package)                ``cake_rmsnorm_det_train_route_key``
-     ``program_windows``                                  ``cake_rmsnorm_det_train_program_windows``
-     ``weight_dtypes``                                    ``cake_rmsnorm_det_train_weight_dtypes``
-     ``flashinfer.cake_rmsnorm_det_train_backend``        ``flashinfer.experimental.cake.cake_rmsnorm_det_train``
-     ``flashinfer.cake_rmsnorm_train_backend``            ``flashinfer.experimental.cake.cake_rmsnorm_nondet_train``
-     ===================================================  ===========================================================
+     .. list-table::
+         :header-rows: 1
+
+         * - Former name
+           - v0.7.3, and the v0.7.4rc1 default (``deterministic=True``)
+           - v0.7.4rc1 ``deterministic=False``
+         * - module ``flashinfer.cake_rmsnorm_train``
+           - module ``flashinfer.cake_rmsnorm_det_train``
+           - module ``flashinfer.cake_rmsnorm_nondet_train``
+         * - ``cake_rmsnorm``
+           - ``cake_rmsnorm_det``
+           - ``cake_rmsnorm_nondet``
+         * - ``CakeRMSNormFunction``
+           - ``CakeRMSNormDetFunction``
+           - ``CakeRMSNormNondetFunction``
+         * - ``cake_rmsnorm_train_forward``
+           - ``cake_rmsnorm_det_train_forward``
+           - ``cake_rmsnorm_nondet_train_forward``
+         * - ``cake_rmsnorm_train_backward``
+           - ``cake_rmsnorm_det_train_backward``
+           - ``cake_rmsnorm_nondet_train_backward``
+         * - ``cake_rmsnorm_train_backward_workspace``
+           - ``cake_rmsnorm_det_train_backward_workspace``
+           - ``cake_rmsnorm_nondet_train_backward_workspace``
+         * - ``cake_rmsnorm_train_backward_workspace_bytes``
+           - ``cake_rmsnorm_det_train_backward_workspace_bytes``
+           - ``cake_rmsnorm_nondet_train_backward_workspace_bytes``
+         * - ``is_cake_rmsnorm_train_supported``
+           - ``is_cake_rmsnorm_det_train_supported``
+           - ``is_cake_rmsnorm_nondet_train_supported``
+         * - package ``flashinfer.cake_rmsnorm_train_backend``
+           - ``flashinfer.experimental.cake.cake_rmsnorm_det_train``
+           - ``flashinfer.experimental.cake.cake_rmsnorm_nondet_train``
+
+     Names that did not depend on ``deterministic``:
+
+     .. list-table::
+         :header-rows: 1
+
+         * - Former name
+           - Name
+         * - ``route_key`` of ``flashinfer.cake_rmsnorm_train`` (v0.7.3)
+           - ``cake_rmsnorm_det_train_route_key``
+         * - ``route_key`` of ``flashinfer.cake_rmsnorm_train`` (v0.7.4rc1)
+           - ``cake_rmsnorm_nondet_train_route_key``
+         * - ``route_key``, ``program_windows`` and ``weight_dtypes`` of
+             ``flashinfer.cake_rmsnorm_det_train``
+           - ``cake_rmsnorm_det_train_route_key``,
+             ``cake_rmsnorm_det_train_program_windows`` and
+             ``cake_rmsnorm_det_train_weight_dtypes``
+         * - the names without ``det`` of ``flashinfer.cake_rmsnorm_det_train``
+             (v0.7.4rc1: ``cake_rmsnorm``, ``CakeRMSNormFunction``,
+             ``cake_rmsnorm_train_*``, ``is_cake_rmsnorm_train_supported``)
+           - the same name with ``det`` in ``flashinfer.cake_rmsnorm_det_train``
+         * - the ``det`` names that ``flashinfer.cake_rmsnorm_train`` re-exported
+             (v0.7.4rc1)
+           - the same name in ``flashinfer.cake_rmsnorm_det_train``
+         * - package ``flashinfer.cake_rmsnorm_det_train_backend``
+           - ``flashinfer.experimental.cake.cake_rmsnorm_det_train``
 
 .. currentmodule:: flashinfer.cake_rmsnorm_det_train
 
