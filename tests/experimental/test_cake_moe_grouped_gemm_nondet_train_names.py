@@ -113,12 +113,24 @@ def _public_objects():
     return found
 
 
+def _leftover_directory(path):
+    """The directory that the former import path ``path`` names in this checkout (it
+    exists only as a development leftover)."""
+    root = Path(_module("flashinfer").__file__).parent
+    return root.joinpath(*path.split(".")[1:])
+
+
 @pytest.mark.parametrize("path", REMOVED_MODULES)
 def test_removed_module_paths_do_not_import(path):
-    """Every former import path raises ``ModuleNotFoundError``.  A development
-    checkout may keep untracked ``__pycache__`` or ignored ``aot`` directories at a
-    former package path, which Python imports as an empty namespace package; such a
-    leftover holds no module (``git clean -fdX`` of the path removes it)."""
+    """Every former import path raises ``ModuleNotFoundError``.  Only where a
+    development checkout keeps a directory at a former package path (untracked
+    ``__pycache__`` or ignored ``aot``), which Python imports as an empty namespace
+    package, the check accepts that leftover if it holds no module (``git clean -fdX``
+    of the path removes it)."""
+    if not _leftover_directory(path).is_dir():
+        with pytest.raises(ModuleNotFoundError):
+            importlib.import_module(path)
+        return
     try:
         spec = importlib.util.find_spec(path)
     except ModuleNotFoundError:

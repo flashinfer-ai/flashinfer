@@ -108,6 +108,12 @@ FORMER_HELPER_KEYS = (
     "cake_moe_grouped_det_gemm",
     "cake_moe_grouped_gemm",
 )
+# Hand-offs into the package outside the ``__all__`` lists: the stable
+# ``grouped_mm_bf16(..., backend="cake")`` and the backend function it calls.
+HANDOFFS = (
+    ("flashinfer.grouped_mm", "grouped_mm_bf16"),
+    (f"{PACKAGE}.cake_backend", "grouped_det_mm_bf16_cake"),
+)
 
 
 def _module(name):
@@ -133,12 +139,24 @@ def _public_objects():
     return found
 
 
+def _leftover_directory(path):
+    """The directory that the former import path ``path`` names in this checkout (it
+    exists only as a development leftover)."""
+    root = Path(_module("flashinfer").__file__).parent
+    return root.joinpath(*path.split(".")[1:])
+
+
 @pytest.mark.parametrize("path", REMOVED_MODULES)
 def test_removed_module_paths_do_not_import(path):
-    """Every former import path raises ``ModuleNotFoundError``.  A development
-    checkout may keep untracked ``__pycache__`` or ignored ``aot`` directories at a
-    former package path, which Python imports as an empty namespace package; such a
-    leftover holds no module (``git clean -fdX`` of the path removes it)."""
+    """Every former import path raises ``ModuleNotFoundError``.  Only where a
+    development checkout keeps a directory at a former package path (untracked
+    ``__pycache__`` or ignored ``aot``), which Python imports as an empty namespace
+    package, the check accepts that leftover if it holds no module (``git clean -fdX``
+    of the path removes it)."""
+    if not _leftover_directory(path).is_dir():
+        with pytest.raises(ModuleNotFoundError):
+            importlib.import_module(path)
+        return
     try:
         spec = importlib.util.find_spec(path)
     except ModuleNotFoundError:
@@ -214,13 +232,17 @@ def _callables():
 
 
 def test_no_callable_takes_a_deterministic_argument():
-    """No public callable binds ``deterministic=False``: no ``deterministic``
-    parameter and no catch-all ``**kwargs`` that would swallow one.  The autograd
-    function's ``forward`` takes the operands, the internal deferred-launch slot and
-    the fuse flag only."""
+    """No public callable, and neither hand-off of ``grouped_mm_bf16(...,
+    backend="cake")``, binds ``deterministic=False``: no ``deterministic`` parameter
+    and no catch-all ``**kwargs`` that would swallow one.  The autograd function's
+    ``forward`` takes the operands, the internal deferred-launch slot and the fuse
+    flag only."""
     found = _callables()
     labels = {label.rpartition(".")[2] for label, _ in found}
     assert {"forward", "backward", "launch"} <= labels, labels
+    found += [
+        (f"{where}.{name}", getattr(_module(where), name)) for where, name in HANDOFFS
+    ]
     for label, fn in found:
         signature = inspect.signature(fn)
         with pytest.raises(TypeError):
