@@ -17,10 +17,11 @@ Non-deterministic backend of the Cake packed width-4 depthwise causal
 convolution + SiLU training forward / backward (SM100 / SM103 / SM107), one
 self-contained package (host API bodies, the ``cake_jit`` registry, the pinned
 ``cake_build`` loader and the generated CUDA sources under ``csrc/``).  It
-imports nothing from other flashinfer packages.  The dispatching entry points
-(``deterministic=True`` -> the deterministic package
-``flashinfer.cake_causal_conv1d_det_train``) and the user-facing documentation
-live in :mod:`flashinfer.experimental.cake.cake_causal_conv1d_train`.
+imports nothing from other flashinfer packages.  The stable entry points and
+the user-facing documentation live in the non-deterministic package's
+facades :mod:`flashinfer.cake_causal_conv1d_nondet_train` and
+:mod:`flashinfer.cake_causal_conv1d_nondet_train_kcp` (the KCP entry points of
+the :mod:`.kcp` module here).
 
 Numerical contract against the deterministic package: the forward runs this
 package's copies of the det forward programs, so ``y`` is the det ``y`` bit
@@ -40,16 +41,16 @@ accumulation dtypes, rounding boundaries and accuracy budgets are the det
 package's).  No reduce program, no host synchronization, no cooperative
 launch, no grid barrier.
 
-Numerical-mode keyword: every entry point takes ``deterministic: bool = True``
-and raises a ``ValueError`` unless it is ``False`` -- this package has no
-deterministic programs, so the call must opt in explicitly (the facade routes
-``deterministic=True`` to the deterministic package).  With
-``torch.use_deterministic_algorithms(True)`` the entry points that launch the
-unordered reduction (the backward, hence the autograd backward) raise
-PyTorch's alert for an operation without a deterministic implementation (a
-``RuntimeError``, or a ``UserWarning`` under ``warn_only=True``) and never fall
-back.  The forward is deterministic (the
-det programs' bits) and does not alert.
+Numerical mode: the package is chosen by its module name and no entry point
+takes a mode keyword.  This package has no deterministic programs (they are the
+deterministic package's, ``flashinfer.cake_causal_conv1d_det_train[_kcp]``;
+nothing here routes to them).  With ``torch.use_deterministic_algorithms(True)``
+the entry points that launch the unordered reduction (the backward, hence the
+autograd backward) raise PyTorch's alert for an operation without a
+deterministic implementation (a ``RuntimeError``, or a ``UserWarning`` under
+``warn_only=True``, after which they run), reading the setting when the
+backward runs, and never fall back.  The forward is fixed-order (the det
+programs' bits) and does not alert.
 
 Host design (the knobs are keywords; no environment variable):
 
@@ -65,8 +66,9 @@ Host design (the knobs are keywords; no environment variable):
 - The backward workspace holds the accumulators ``acc`` and the per channel
   tile ticket counters ``work`` (``cake_jit.accumulator_layout``): zero before
   the first launch and left zero by every launch.  A caller-owned buffer
-  (``workspace=``, from :func:`cake_causal_conv1d_train_backward_workspace`,
-  which returns it zeroed) serves every later backward call of one stream;
+  (``workspace=``, from
+  :func:`cake_causal_conv1d_nondet_train_backward_workspace`, which returns it
+  zeroed) serves every later backward call of one stream;
   when omitted the package keeps one zeroed buffer per (device, current
   stream), grown as needed and never zeroed again.  Inside a CUDA Graph
   capture with a nonzero CUDA capture id (``cudaStreamGetCaptureInfo``) an
@@ -231,24 +233,12 @@ def _device_arch(device: torch.device) -> str:
     return arch
 
 
-def _require_nondeterministic(deterministic: object, entry: str) -> None:
-    """Refuse every numerical mode but ``deterministic=False``: this package has no deterministic programs."""
-
-    if not isinstance(deterministic, bool) or deterministic:
-        raise ValueError(
-            f"{entry} is the non-deterministic implementation (unordered dweight / dbias reductions) and needs "
-            f"deterministic=False, got deterministic={deterministic!r}; the deterministic programs are "
-            "flashinfer.cake_causal_conv1d_det_train (or the facade "
-            "flashinfer.experimental.cake.cake_causal_conv1d_train with deterministic=True)"
-        )
-
-
 def _alert_nondeterministic(entry: str) -> None:
     """PyTorch's alert for an operation without a deterministic implementation, when torch's deterministic
     algorithms are enabled: a ``RuntimeError``, or a ``UserWarning`` under
     ``torch.use_deterministic_algorithms(True, warn_only=True)``; nothing otherwise.  Called by the entry points that
     launch the unordered reduction (the single-rank backward, the KCP backward and the KCP multi backward), before
-    they allocate, launch or exchange anything.  The alert is raised here, not through a private PyTorch hook
+    they launch or exchange anything (output tensors the caller did not pass may already be allocated).  The alert is raised here, not through a private PyTorch hook
     (PyTorch exposes no public Python entry for it)."""
 
     if not torch.are_deterministic_algorithms_enabled():
@@ -269,7 +259,7 @@ def _alert_nondeterministic(entry: str) -> None:
     )
 
 
-def is_cake_causal_conv1d_train_supported(device: torch.device) -> bool:
+def is_cake_causal_conv1d_nondet_train_supported(device: torch.device) -> bool:
     """Whether ``device`` has the exported routes every architecture ships (``fwd`` and ``bwd``) and the package
     is rendered (its ``build.json`` exists).
 
@@ -694,16 +684,14 @@ def _check_shape_args(S: int, C: int) -> tuple[int, int]:
     return S, C
 
 
-def cake_causal_conv1d_train_backward_workspace_bytes(
+def cake_causal_conv1d_nondet_train_backward_workspace_bytes(
     S: int,
     C: int,
     device: torch.device,
     *,
     bwd_grid_mult: int = 1,
-    deterministic: bool = True,
 ) -> int:
-    """Bytes of the caller-owned backward workspace for ``C`` channels on ``device`` (``deterministic=False``
-    required).
+    """Bytes of the caller-owned backward workspace for ``C`` channels on ``device``.
 
     The workspace holds the backward's accumulators and per channel tile ticket
     counters (``cake_jit.accumulator_layout``): ``taps x C`` FP32 words (FP64
@@ -719,45 +707,36 @@ def cake_causal_conv1d_train_backward_workspace_bytes(
     buffer serves the calls of every ``bwd_grid_mult``.
     """
 
-    _require_nondeterministic(
-        deterministic, "cake_causal_conv1d_train_backward_workspace_bytes"
-    )
     _bwd_grid_mult(bwd_grid_mult)
     device = torch.device(device)
     S, C = _check_shape_args(S, C)
     return backward_workspace_bytes(_device_arch(device), C)
 
 
-def cake_causal_conv1d_train_backward_workspace(
+def cake_causal_conv1d_nondet_train_backward_workspace(
     S: int,
     C: int,
     device: torch.device,
     *,
     bwd_grid_mult: int = 1,
-    deterministic: bool = True,
 ) -> torch.Tensor:
-    """Allocate a ZEROED ``uint8`` backward workspace (see ``..._workspace_bytes``; ``deterministic=False``
-    required).
+    """Allocate a ZEROED ``uint8`` backward workspace (see ``..._workspace_bytes``).
 
     Every launch leaves it zero, so one buffer serves every later backward call
     of one stream, CUDA Graph replays and every ``bwd_grid_mult`` included.
     Two launches that may run at once need two buffers.
     """
 
-    _require_nondeterministic(
-        deterministic, "cake_causal_conv1d_train_backward_workspace"
-    )
-    nbytes = cake_causal_conv1d_train_backward_workspace_bytes(
-        S, C, device, bwd_grid_mult=bwd_grid_mult, deterministic=False
+    nbytes = cake_causal_conv1d_nondet_train_backward_workspace_bytes(
+        S, C, device, bwd_grid_mult=bwd_grid_mult
     )
     return torch.zeros(nbytes, dtype=torch.uint8, device=torch.device(device))
 
 
-def cake_causal_conv1d_train_forward_workspace_bytes(
-    S: int, C: int, device: torch.device, *, deterministic: bool = True
+def cake_causal_conv1d_nondet_train_forward_workspace_bytes(
+    S: int, C: int, device: torch.device
 ) -> int:
-    """Bytes of the caller-owned forward workspace for ``C`` channels on ``device`` (``deterministic=False``
-    required).
+    """Bytes of the caller-owned forward workspace for ``C`` channels on ``device``.
 
     The forward's programs take their token chunks from int32 counters, two
     per channel tile, sized by the most over every forward program of every
@@ -767,26 +746,18 @@ def cake_causal_conv1d_train_forward_workspace_bytes(
     may run at once need two buffers.
     """
 
-    _require_nondeterministic(
-        deterministic, "cake_causal_conv1d_train_forward_workspace_bytes"
-    )
     device = torch.device(device)
     S, C = _check_shape_args(S, C)
     return 4 * forward_workspace_words(_device_arch(device), C)
 
 
-def cake_causal_conv1d_train_forward_workspace(
-    S: int, C: int, device: torch.device, *, deterministic: bool = True
+def cake_causal_conv1d_nondet_train_forward_workspace(
+    S: int, C: int, device: torch.device
 ) -> torch.Tensor:
-    """Allocate a zeroed int32 forward workspace (see ``..._workspace_bytes``; ``deterministic=False`` required);
-    keep it for every later forward call of one stream."""
+    """Allocate a zeroed int32 forward workspace (see ``..._workspace_bytes``); keep it for every later forward call
+    of one stream."""
 
-    _require_nondeterministic(
-        deterministic, "cake_causal_conv1d_train_forward_workspace"
-    )
-    nbytes = cake_causal_conv1d_train_forward_workspace_bytes(
-        S, C, device, deterministic=False
-    )
+    nbytes = cake_causal_conv1d_nondet_train_forward_workspace_bytes(S, C, device)
     return torch.zeros(nbytes // 4, dtype=torch.int32, device=torch.device(device))
 
 
@@ -847,8 +818,7 @@ def _forward_work(
         if ws.numel() < words:
             raise ValueError(
                 f"workspace holds {ws.numel()} int32 words; this call needs at least "
-                f"{words}; allocate cake_causal_conv1d_train_forward_workspace(S, C, device, "
-                "deterministic=False)"
+                f"{words}; allocate cake_causal_conv1d_nondet_train_forward_workspace(S, C, device)"
             )
         return ws
     if words == 0:
@@ -967,7 +937,7 @@ def _backward_accumulators(
 
     A caller-owned ``workspace`` (1-D uint8, contiguous, 16-byte aligned, on
     ``device``, at least ``layout["total_bytes"]`` bytes, ZERO before its first
-    launch: allocate it with :func:`cake_causal_conv1d_train_backward_workspace`)
+    launch: allocate it with :func:`cake_causal_conv1d_nondet_train_backward_workspace`)
     is used as is.  Without one: inside a CUDA Graph capture with a nonzero
     capture id the zeroed buffer of that capture and stream
     (``_CAPTURE_WORKSPACES``: zeroed by the capture's first backward call on
@@ -1000,8 +970,7 @@ def _backward_accumulators(
         if ws.numel() < nbytes:
             raise ValueError(
                 f"workspace holds {ws.numel()} bytes; {entry} needs at least {nbytes}; allocate "
-                "cake_causal_conv1d_train_backward_workspace(S, C, device, deterministic=False) "
-                "(a zeroed buffer)"
+                "cake_causal_conv1d_nondet_train_backward_workspace(S, C, device) (a zeroed buffer)"
             )
     elif torch.cuda.is_current_stream_capturing():
         # the buffer of this capture and stream: plain views, not cached per layout
@@ -1034,7 +1003,7 @@ def _backward_accumulators(
     return _accumulator_views(ws, layout)
 
 
-def cake_causal_conv1d_train_forward(
+def cake_causal_conv1d_nondet_train_forward(
     x: torch.Tensor,
     weight: torch.Tensor,
     cu_seqlens: torch.Tensor,
@@ -1042,9 +1011,8 @@ def cake_causal_conv1d_train_forward(
     bias: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
     workspace: Optional[torch.Tensor] = None,
-    deterministic: bool = True,
 ) -> torch.Tensor:
-    r"""Packed width-4 depthwise causal convolution + SiLU, training forward (``deterministic=False`` required).
+    r"""Packed width-4 depthwise causal convolution + SiLU, training forward.
 
     The forward has no cross-CTA reduction: this package's programs are copies
     of the det forward programs, so ``y`` is bitwise the det
@@ -1070,15 +1038,12 @@ def cake_causal_conv1d_train_forward(
         Preallocated BF16 output of ``x``'s shape, contiguous.
     workspace : torch.Tensor, optional
         Caller-owned int32 buffer from
-        :func:`cake_causal_conv1d_train_forward_workspace` (the token-chunk
-        counters, zero before its first launch; every launch leaves it zero,
-        so one buffer serves every later call of one stream).  Two launches
-        that may run at once need two buffers.  When omitted the package
-        uses a zeroed buffer it keeps per (device, current stream), or a
-        fresh zeroed one inside a CUDA Graph capture.
-    deterministic : bool
-        Must be ``False`` (``ValueError`` otherwise): the numerical mode of this
-        package.
+        :func:`cake_causal_conv1d_nondet_train_forward_workspace` (the
+        token-chunk counters, zero before its first launch; every launch leaves
+        it zero, so one buffer serves every later call of one stream).  Two
+        launches that may run at once need two buffers.  When omitted the
+        package uses a zeroed buffer it keeps per (device, current stream), or
+        a fresh zeroed one inside a CUDA Graph capture.
 
     Returns
     -------
@@ -1088,7 +1053,6 @@ def cake_causal_conv1d_train_forward(
         first token.  ``S == 0`` returns the empty output without launching.
     """
 
-    _require_nondeterministic(deterministic, "cake_causal_conv1d_train_forward")
     x = _require_tensor(x, "x")
     device = x.device
     arch = _device_arch(device)
@@ -1133,7 +1097,7 @@ def cake_causal_conv1d_train_forward(
     return y
 
 
-def cake_causal_conv1d_train_backward(
+def cake_causal_conv1d_nondet_train_backward(
     x: torch.Tensor,
     weight: torch.Tensor,
     cu_seqlens: torch.Tensor,
@@ -1146,16 +1110,20 @@ def cake_causal_conv1d_train_backward(
     dweight: Optional[torch.Tensor] = None,
     dbias: Optional[torch.Tensor] = None,
     bwd_grid_mult: int = 1,
-    deterministic: bool = True,
 ) -> tuple[torch.Tensor, ...]:
     r"""Packed width-4 depthwise causal convolution + SiLU, training backward, ONE ordinary launch with unordered
-    cross-CTA ``dweight`` / ``dbias`` reductions (``deterministic=False`` required).
+    cross-CTA ``dweight`` / ``dbias`` reductions.
+
+    Under ``torch.use_deterministic_algorithms(True)`` (read when the call runs) the call raises a
+    ``RuntimeError`` (a ``UserWarning``, then it runs, with ``warn_only=True``) after its arguments are validated
+    and its outputs are prepared (an output not passed is already allocated), before its kernel launches; it never
+    falls back to the deterministic package.
 
     Parameters
     ----------
     x, weight, cu_seqlens, bias
         The forward's inputs (same contracts as
-        :func:`cake_causal_conv1d_train_forward`); nothing else is saved.
+        :func:`cake_causal_conv1d_nondet_train_forward`); nothing else is saved.
     dy : torch.Tensor
         BF16 gradient of ``y``, ``x``'s shape, contiguous.
     silu_grad_preactivation : {"bf16", "fp32"}
@@ -1166,10 +1134,10 @@ def cake_causal_conv1d_train_backward(
         BF16 ulp of exact either way, and bitwise the det package's.
     workspace : torch.Tensor, optional
         Caller-owned ZEROED ``uint8`` buffer from
-        :func:`cake_causal_conv1d_train_backward_workspace` (the accumulators and
-        ticket counters; every launch leaves it zero, so one buffer serves every
-        later call of one stream; never share one between two launches that may
-        run at once).  When omitted the package uses a zeroed buffer it keeps per
+        :func:`cake_causal_conv1d_nondet_train_backward_workspace` (the
+        accumulators and ticket counters; every launch leaves it zero, so one
+        buffer serves every later call of one stream; never share one between
+        two launches that may run at once).  When omitted the package uses a zeroed buffer it keeps per
         (device, current stream), or inside a CUDA Graph capture one zeroed
         buffer per capture and stream, shared by the capture's backward calls
         on that stream (one fill node, and another for a larger buffer when a
@@ -1189,11 +1157,6 @@ def cake_causal_conv1d_train_backward(
         ``dweight`` / ``dbias`` keep the route's budget.  The workspace size does
         not depend on it.  ``TypeError`` for a non-int, ``ValueError`` for
         another value.
-    deterministic : bool
-        Must be ``False`` (``ValueError`` otherwise).  Under
-        ``torch.use_deterministic_algorithms(True)`` the call raises a
-        ``RuntimeError`` (a ``UserWarning`` with ``warn_only=True``) before it
-        launches.
 
     Returns
     -------
@@ -1205,7 +1168,6 @@ def cake_causal_conv1d_train_backward(
     without launching.
     """
 
-    _require_nondeterministic(deterministic, "cake_causal_conv1d_train_backward")
     policy = _silu_grad_preactivation(silu_grad_preactivation)
     bwd_grid_mult = _bwd_grid_mult(bwd_grid_mult)
     x = _require_tensor(x, "x")
@@ -1245,8 +1207,8 @@ def cake_causal_conv1d_train_backward(
             dtypes=PARAMETER_DTYPES,
         )
     # Every argument is valid: a call under torch's deterministic mode is refused (or warned about) here, before
-    # anything is allocated or launched.
-    _alert_nondeterministic("cake_causal_conv1d_train_backward")
+    # the kernel launches (outputs the caller did not pass are already allocated).
+    _alert_nondeterministic("cake_causal_conv1d_nondet_train_backward")
     if S == 0:
         dw_out.zero_()
         if db_out is None:
@@ -1278,7 +1240,7 @@ def cake_causal_conv1d_train_backward(
         layout,
         device=device,
         device_index=device_index,
-        entry="cake_causal_conv1d_train_backward",
+        entry="cake_causal_conv1d_nondet_train_backward",
     )
     values: dict[str, object] = {
         "x": x_flat,
@@ -1301,15 +1263,14 @@ def cake_causal_conv1d_train_backward(
     return dx_out, dw_out, db_out
 
 
-class CakeCausalConv1dFunction(torch.autograd.Function):
+class CakeCausalConv1dNondetFunction(torch.autograd.Function):
     """Autograd wrapper saving only ``(x, weight, cu_seqlens, bias)`` for the backward.
 
-    ``forward(x, weight, cu_seqlens, bias=None, silu_grad_preactivation="bf16", bwd_grid_mult=1,
-    deterministic=True)`` returns ``y`` and refuses every ``deterministic`` but ``False`` (``ValueError``); the
-    backward runs the one-launch ``dx`` + unordered ``dweight`` (+ ``dbias``) program of
-    :func:`cake_causal_conv1d_train_backward` (with ``bwd_grid_mult``) on the incoming gradient (materialized as
-    a contiguous BF16 tensor when autograd hands over another layout or dtype) and returns the gradients of
-    ``weight`` and ``bias`` in the parameters' dtypes.
+    ``forward(x, weight, cu_seqlens, bias=None, silu_grad_preactivation="bf16", bwd_grid_mult=1)`` returns ``y``;
+    the backward runs the one-launch ``dx`` + unordered ``dweight`` (+ ``dbias``) program of
+    :func:`cake_causal_conv1d_nondet_train_backward` (with ``bwd_grid_mult``; it alerts under torch's deterministic
+    mode) on the incoming gradient (materialized as a contiguous BF16 tensor when autograd hands over another layout
+    or dtype) and returns the gradients of ``weight`` and ``bias`` in the parameters' dtypes.
     """
 
     @staticmethod
@@ -1321,14 +1282,10 @@ class CakeCausalConv1dFunction(torch.autograd.Function):
         bias=None,
         silu_grad_preactivation="bf16",
         bwd_grid_mult=1,
-        deterministic=True,
     ):
-        _require_nondeterministic(deterministic, "CakeCausalConv1dFunction")
         policy = _silu_grad_preactivation(silu_grad_preactivation)
         bwd_grid_mult = _bwd_grid_mult(bwd_grid_mult)
-        y = cake_causal_conv1d_train_forward(
-            x, weight, cu_seqlens, bias=bias, deterministic=False
-        )
+        y = cake_causal_conv1d_nondet_train_forward(x, weight, cu_seqlens, bias=bias)
         ctx.save_for_backward(x, weight, cu_seqlens, bias)
         ctx.silu_grad_preactivation = policy
         ctx.bwd_grid_mult = bwd_grid_mult
@@ -1340,7 +1297,7 @@ class CakeCausalConv1dFunction(torch.autograd.Function):
         if grad_y is None:
             grad_y = torch.zeros_like(x)
         dy = grad_y.to(torch.bfloat16).contiguous()
-        grads = cake_causal_conv1d_train_backward(
+        grads = cake_causal_conv1d_nondet_train_backward(
             x,
             weight,
             cu_seqlens,
@@ -1348,13 +1305,12 @@ class CakeCausalConv1dFunction(torch.autograd.Function):
             bias=bias,
             silu_grad_preactivation=ctx.silu_grad_preactivation,
             bwd_grid_mult=ctx.bwd_grid_mult,
-            deterministic=False,
         )
         dbias = grads[2] if bias is not None else None
-        return grads[0], grads[1], None, dbias, None, None, None
+        return grads[0], grads[1], None, dbias, None, None
 
 
-def cake_causal_conv1d(
+def cake_causal_conv1d_nondet(
     x: torch.Tensor,
     weight: torch.Tensor,
     cu_seqlens: torch.Tensor,
@@ -1362,10 +1318,8 @@ def cake_causal_conv1d(
     *,
     silu_grad_preactivation: str = "bf16",
     bwd_grid_mult: int = 1,
-    deterministic: bool = True,
 ) -> torch.Tensor:
-    """Autograd-enabled packed width-4 depthwise causal convolution + SiLU, non-deterministic backward
-    (``deterministic=False`` required).
+    """Autograd-enabled packed width-4 depthwise causal convolution + SiLU, non-deterministic backward.
 
     Parameters
     ----------
@@ -1380,25 +1334,23 @@ def cake_causal_conv1d(
         FP32 or BF16 ``[C]`` contiguous per-channel bias.
     silu_grad_preactivation : {"bf16", "fp32"}
         The weight gradient's SiLU' policy (see
-        :func:`cake_causal_conv1d_train_backward`).
+        :func:`cake_causal_conv1d_nondet_train_backward`).
     bwd_grid_mult : {1, 2, 3, 4}
         The backward's opt-in finer partition (default 1; see
-        :func:`cake_causal_conv1d_train_backward`); checked here, used by the
-        backward.
-    deterministic : bool
-        Must be ``False`` (``ValueError`` otherwise).
+        :func:`cake_causal_conv1d_nondet_train_backward`); checked here, used by
+        the backward.
 
     Returns
     -------
     torch.Tensor
         BF16 ``y`` of ``x``'s shape.  The backward saves only ``x``, ``weight``,
         ``cu_seqlens`` and ``bias`` and returns BF16 ``dx`` and the ``dweight``
-        (and ``dbias``) in the parameters' dtypes.
+        (and ``dbias``) in the parameters' dtypes; under torch's deterministic
+        mode it alerts like :func:`cake_causal_conv1d_nondet_train_backward`.
     """
 
-    _require_nondeterministic(deterministic, "cake_causal_conv1d")
-    return CakeCausalConv1dFunction.apply(
-        x, weight, cu_seqlens, bias, silu_grad_preactivation, bwd_grid_mult, False
+    return CakeCausalConv1dNondetFunction.apply(
+        x, weight, cu_seqlens, bias, silu_grad_preactivation, bwd_grid_mult
     )
 
 
@@ -1408,14 +1360,14 @@ __all__ = [
     "PARAMETER_DTYPES",
     "SILU_GRAD_PREACTIVATIONS",
     "SUPPORTED_COMPUTE_CAPABILITIES",
-    "CakeCausalConv1dFunction",
-    "cake_causal_conv1d",
-    "cake_causal_conv1d_train_backward",
-    "cake_causal_conv1d_train_backward_workspace",
-    "cake_causal_conv1d_train_backward_workspace_bytes",
-    "cake_causal_conv1d_train_forward",
-    "cake_causal_conv1d_train_forward_workspace",
-    "cake_causal_conv1d_train_forward_workspace_bytes",
-    "is_cake_causal_conv1d_train_supported",
+    "CakeCausalConv1dNondetFunction",
+    "cake_causal_conv1d_nondet",
+    "cake_causal_conv1d_nondet_train_backward",
+    "cake_causal_conv1d_nondet_train_backward_workspace",
+    "cake_causal_conv1d_nondet_train_backward_workspace_bytes",
+    "cake_causal_conv1d_nondet_train_forward",
+    "cake_causal_conv1d_nondet_train_forward_workspace",
+    "cake_causal_conv1d_nondet_train_forward_workspace_bytes",
+    "is_cake_causal_conv1d_nondet_train_supported",
     "plan_cache_clear",
 ]

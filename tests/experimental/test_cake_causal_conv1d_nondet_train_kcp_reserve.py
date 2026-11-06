@@ -16,10 +16,10 @@ limitations under the License.
 The opt-in SM reserve of the non-deterministic KCP backward (``bwd_reserve_sms``, FlashInfer issue #8365): one
 process, world size 1, the deterministic KCP suite's contexts and FP64 oracle.
 
-(a) The facade keyword: ``None`` is never validated or forwarded; a ``bool`` or a non-``int`` raises ``TypeError``, a
-    negative value ``ValueError``; ``deterministic=True`` with ``>= 1`` raises ``ValueError`` naming
-    ``cooperative=False``; ``deterministic=True`` with 0 runs the deterministic entry point without the keyword;
-    torch's deterministic mode runs the deterministic entry point without forwarding it.
+(a) The keyword of ``flashinfer.cake_causal_conv1d_nondet_train_kcp``: ``None`` is never forwarded; a given value
+    reaches the non-deterministic backend, which raises ``TypeError`` for a ``bool`` or a non-``int`` and
+    ``ValueError`` below zero; torch's deterministic mode changes nothing at the call (the value is forwarded,
+    nothing warns here); nothing runs the deterministic package.
 (b) ``K`` = 1 and 2: the main backward launches the single-wave grid less ``K x ctas_per_sm`` CTAs on both host
     paths, at a width the shipped grid already trims and at one it does not; ``dx`` is bitwise the deterministic
     backward's, ``dweight`` within budget of the FP64 oracle, the workspace reads back zero.
@@ -34,16 +34,18 @@ process, world size 1, the deterministic KCP suite's contexts and FP64 oracle.
 
 from __future__ import annotations
 
+import warnings
+
 import pytest
 import torch
 
-from flashinfer import cake_causal_conv1d_train_kcp as facade
-from flashinfer.cake_causal_conv1d_det_train_backend import kcp as det_kcp
-from flashinfer.experimental.cake import cake_causal_conv1d_train_backend as pkg
-from flashinfer.experimental.cake.cake_causal_conv1d_train_backend import (
+from flashinfer import cake_causal_conv1d_nondet_train_kcp as facade
+from flashinfer.experimental.cake import cake_causal_conv1d_nondet_train as pkg
+from flashinfer.experimental.cake.cake_causal_conv1d_nondet_train import (
     kcp as conv_kcp,
 )
-from tests.experimental.test_cake_causal_conv1d_train_kcp import (
+from tests.test_helpers.cake_package import cake_package
+from tests.experimental.test_cake_causal_conv1d_nondet_train_kcp import (
     _bwd,
     _dw_within,
     _fwd,
@@ -55,12 +57,16 @@ from tests.test_cake_causal_conv1d_det_train_kcp import (
     _reference,
 )
 
+# the deterministic package's KCP backend, through the one place the suites name packages
+det_kcp = cake_package("cake_causal_conv1d_det_train", "kcp")
+
 LENS, CUTS = (5000, 1003), (1, 2, 4997, 1003)
 
 
 def _device_arch_or_none():
-    if not torch.cuda.is_available() or not pkg.is_cake_causal_conv1d_train_supported(
-        torch.device("cuda")
+    if (
+        not torch.cuda.is_available()
+        or not pkg.is_cake_causal_conv1d_nondet_train_supported(torch.device("cuda"))
     ):
         return None
     return conv_kcp._device_arch(torch.device("cuda"))
@@ -70,9 +76,9 @@ ARCH = _device_arch_or_none()
 
 needs_gpu = pytest.mark.skipif(
     not torch.cuda.is_available()
-    or not pkg.is_cake_causal_conv1d_train_supported(torch.device("cuda")),
+    or not pkg.is_cake_causal_conv1d_nondet_train_supported(torch.device("cuda")),
     reason=(
-        "the non-deterministic cake_causal_conv1d_train package needs a supported CUDA device (SM100 / SM103 / "
+        "the non-deterministic cake_causal_conv1d_nondet_train package needs a supported CUDA device (SM100 / SM103 / "
         "SM107) and its rendered build.json / csrc"
     ),
 )
@@ -103,89 +109,72 @@ def _route_recorders(monkeypatch):
     det_single, det_multi, nd_single, nd_multi = (_Recorder() for _ in range(4))
     monkeypatch.setattr(det_facade, "cake_causal_conv1d_det_kcp", det_single)
     monkeypatch.setattr(det_facade, "cake_causal_conv1d_det_multi_kcp", det_multi)
-    monkeypatch.setattr(conv_kcp, "cake_causal_conv1d_kcp", nd_single)
-    monkeypatch.setattr(conv_kcp, "cake_causal_conv1d_multi_kcp", nd_multi)
+    monkeypatch.setattr(conv_kcp, "cake_causal_conv1d_nondet_kcp", nd_single)
+    monkeypatch.setattr(conv_kcp, "cake_causal_conv1d_nondet_kcp_multi", nd_multi)
     return det_single, det_multi, nd_single, nd_multi
 
 
+def _entry(multi: bool):
+    return (
+        facade.cake_causal_conv1d_nondet_kcp_multi
+        if multi
+        else facade.cake_causal_conv1d_nondet_kcp
+    )
+
+
 @pytest.mark.parametrize("bad", [True, False, 1.0, "1", (1,)])
-@pytest.mark.parametrize("deterministic", [True, False])
 @pytest.mark.parametrize("multi", [False, True], ids=["single", "multi"])
-def test_keyword_type_is_checked_when_given(bad, deterministic, multi) -> None:
-    entry = (
-        facade.cake_causal_conv1d_multi_kcp if multi else facade.cake_causal_conv1d_kcp
-    )
-    with pytest.raises(TypeError, match="bwd_reserve_sms"):
-        entry(None, None, None, deterministic=deterministic, bwd_reserve_sms=bad)
+def test_keyword_type_is_checked_when_given(bad, multi) -> None:
+    with pytest.raises(TypeError, match="bwd_reserve_sms must be an int or None"):
+        _entry(multi)(None, None, None, bwd_reserve_sms=bad)
 
 
-@pytest.mark.parametrize("deterministic", [True, False])
-def test_negative_reserve_is_refused(deterministic) -> None:
+@pytest.mark.parametrize("multi", [False, True], ids=["single", "multi"])
+def test_negative_reserve_is_refused(multi) -> None:
     with pytest.raises(ValueError, match="bwd_reserve_sms must be >= 0"):
-        facade.cake_causal_conv1d_kcp(
-            None, None, None, deterministic=deterministic, bwd_reserve_sms=-1
-        )
-
-
-@pytest.mark.parametrize("k", [1, 3])
-@pytest.mark.parametrize("multi", [False, True], ids=["single", "multi"])
-def test_deterministic_with_a_reserve_points_to_cooperative_false(k, multi) -> None:
-    entry = (
-        facade.cake_causal_conv1d_multi_kcp if multi else facade.cake_causal_conv1d_kcp
-    )
-    with pytest.raises(ValueError, match="cooperative=False"):
-        entry(None, None, None, deterministic=True, bwd_reserve_sms=k)
+        _entry(multi)(None, None, None, bwd_reserve_sms=-1)
 
 
 def test_keyword_routing(monkeypatch) -> None:
-    """``None`` is not forwarded anywhere; ``deterministic=True`` with 0 runs the deterministic entry without the
-    keyword; ``deterministic=False`` forwards the value; torch's deterministic mode drops it (validated) with the
-    fallback warning."""
+    """``None`` is not forwarded; a given value reaches the non-deterministic backend unchanged, also under torch's
+    deterministic mode (strict), where nothing warns at the call; no ``deterministic`` keyword is forwarded and
+    nothing runs the deterministic package."""
 
     det_single, det_multi, nd_single, nd_multi = _route_recorders(monkeypatch)
-    facade.cake_causal_conv1d_kcp(None, None, None, deterministic=True)
-    facade.cake_causal_conv1d_kcp(
-        None, None, None, deterministic=True, bwd_reserve_sms=0
-    )
-    facade.cake_causal_conv1d_kcp(None, None, None, deterministic=False)
-    facade.cake_causal_conv1d_kcp(
-        None, None, None, deterministic=False, bwd_reserve_sms=0
-    )
-    facade.cake_causal_conv1d_kcp(
-        None, None, None, deterministic=False, bwd_reserve_sms=2
-    )
-    facade.cake_causal_conv1d_multi_kcp(
-        None, None, None, deterministic=False, bwd_reserve_sms=1
-    )
-    facade.cake_causal_conv1d_multi_kcp(
-        None, None, None, deterministic=True, bwd_reserve_sms=0
-    )
-    assert [("bwd_reserve_sms" in c) for c in det_single.calls] == [False, False]
+    facade.cake_causal_conv1d_nondet_kcp(None, None, None)
+    facade.cake_causal_conv1d_nondet_kcp(None, None, None, bwd_reserve_sms=0)
+    facade.cake_causal_conv1d_nondet_kcp(None, None, None, bwd_reserve_sms=2)
+    facade.cake_causal_conv1d_nondet_kcp_multi(None, None, None, bwd_reserve_sms=1)
+    facade.cake_causal_conv1d_nondet_kcp_multi(None, None, None)
     assert [c.get("bwd_reserve_sms", "absent") for c in nd_single.calls] == [
         "absent",
         0,
         2,
     ]
-    assert [c.get("bwd_reserve_sms") for c in nd_multi.calls] == [1]
-    assert [("bwd_reserve_sms" in c) for c in det_multi.calls] == [False]
+    assert [c.get("bwd_reserve_sms", "absent") for c in nd_multi.calls] == [
+        1,
+        "absent",
+    ]
 
-    facade._FALLBACK_WARNED.clear()
-    prev = torch.are_deterministic_algorithms_enabled()
+    prev, prev_warn = (
+        torch.are_deterministic_algorithms_enabled(),
+        torch.is_deterministic_algorithms_warn_only_enabled(),
+    )
     torch.use_deterministic_algorithms(True)
     try:
-        with pytest.warns(UserWarning, match="runs the deterministic implementation"):
-            facade.cake_causal_conv1d_kcp(
-                None, None, None, deterministic=False, bwd_reserve_sms=1
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            facade.cake_causal_conv1d_nondet_kcp(None, None, None, bwd_reserve_sms=1)
+            facade.cake_causal_conv1d_nondet_kcp_multi(
+                None, None, None, bwd_reserve_sms=3
             )
-        with pytest.raises(TypeError, match="bwd_reserve_sms"):
-            facade.cake_causal_conv1d_kcp(
-                None, None, None, deterministic=False, bwd_reserve_sms=True
-            )
+        assert caught == []
     finally:
-        torch.use_deterministic_algorithms(prev)
-        facade._FALLBACK_WARNED.clear()
-    assert len(det_single.calls) == 3 and "bwd_reserve_sms" not in det_single.calls[-1]
-    assert len(nd_single.calls) == 3
+        torch.use_deterministic_algorithms(prev, warn_only=prev_warn)
+    assert nd_single.calls[-1]["bwd_reserve_sms"] == 1
+    assert nd_multi.calls[-1]["bwd_reserve_sms"] == 3
+    assert all("deterministic" not in c for c in nd_single.calls + nd_multi.calls)
+    assert det_single.calls == [] and det_multi.calls == []
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -257,7 +246,7 @@ def test_backward_launches_the_reserved_grid(monkeypatch, reserve) -> None:
             _, _, dw_ref = _reference(p.x, p.w, p.cu, p.dy)
             for host_trim in (1, 0):
                 conv_kcp._set_test_knobs({"host_trim": host_trim})
-                conv_kcp.host_cache_clear()
+                conv_kcp.cake_causal_conv1d_nondet_train_kcp_host_cache_clear()
                 for k_res, expected in ((0, shipped), (reserve, full - reserve * k)):
                     seen.clear()
                     dx, dw = _bwd(
@@ -272,7 +261,7 @@ def test_backward_launches_the_reserved_grid(monkeypatch, reserve) -> None:
                     assert held is None or int(torch.count_nonzero(held)) == 0, label
     finally:
         conv_kcp._set_test_knobs(None)
-        conv_kcp.host_cache_clear()
+        conv_kcp.cake_causal_conv1d_nondet_train_kcp_host_cache_clear()
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -282,7 +271,7 @@ def test_backward_launches_the_reserved_grid(monkeypatch, reserve) -> None:
 def _autograd(p, entry, **kw):
     x = p.x_local.clone().requires_grad_(True)
     w = p.w.clone().requires_grad_(True)
-    y = entry(x, w, p.ctx, deterministic=False, **kw)
+    y = entry(x, w, p.ctx, **kw)
     y.backward(p.dy_local)
     return y.detach(), x.grad, w.grad
 
@@ -295,10 +284,10 @@ def test_autograd_single_and_multi_keep_the_reserve(monkeypatch) -> None:
     )  # a width whose shipped grid is whole: K = 1 changes it
     p = _problem(LENS, CUTS, C, device)
     seen = _record_main_grids(monkeypatch)
-    conv_kcp.host_cache_clear()
-    y0, dx0, _ = _autograd(p, facade.cake_causal_conv1d_kcp)
+    conv_kcp.cake_causal_conv1d_nondet_train_kcp_host_cache_clear()
+    y0, dx0, _ = _autograd(p, facade.cake_causal_conv1d_nondet_kcp)
     seen.clear()
-    y1, dx1, dw1 = _autograd(p, facade.cake_causal_conv1d_kcp, bwd_reserve_sms=1)
+    y1, dx1, dw1 = _autograd(p, facade.cake_causal_conv1d_nondet_kcp, bwd_reserve_sms=1)
     assert seen == [(full - k, 1, 1)], seen
     assert torch.equal(_bits(y1), _bits(y0)) and torch.equal(_bits(dx1), _bits(dx0))
     _, _, dw_ref = _reference(p.x, p.w, p.cu, p.dy)
@@ -306,11 +295,9 @@ def test_autograd_single_and_multi_keep_the_reserve(monkeypatch) -> None:
 
     xs = [p.x_local.clone().requires_grad_(True) for _ in range(2)]
     ws = [p.w.clone().requires_grad_(True) for _ in range(2)]
-    conv_kcp.host_cache_clear()  # the single call above cached this key's plan
+    conv_kcp.cake_causal_conv1d_nondet_train_kcp_host_cache_clear()  # the single call above cached this key's plan
     seen.clear()
-    ys = facade.cake_causal_conv1d_multi_kcp(
-        xs, ws, p.ctx, deterministic=False, bwd_reserve_sms=1
-    )
+    ys = facade.cake_causal_conv1d_nondet_kcp_multi(xs, ws, p.ctx, bwd_reserve_sms=1)
     torch.autograd.backward(ys, [p.dy_local, p.dy_local])
     # Both tensors share one (ctx, S, C, device, cu_seqlens, reserve) host-cache entry: one plan, on the reserved grid.
     assert seen == [(full - k, 1, 1)], seen
@@ -331,21 +318,18 @@ def test_checkpoint_with_a_recompute_handle_keeps_the_reserve(monkeypatch) -> No
         device
     )  # a width whose shipped grid is whole: K = 1 changes it
     p = _problem(LENS, CUTS, C, device)
-    _, dx_direct, _ = _autograd(p, facade.cake_causal_conv1d_kcp, bwd_reserve_sms=1)
+    _, dx_direct, _ = _autograd(
+        p, facade.cake_causal_conv1d_nondet_kcp, bwd_reserve_sms=1
+    )
     seen = _record_main_grids(monkeypatch)
-    conv_kcp.host_cache_clear()
-    handle = conv_kcp.RecomputeHandleKcp()
+    conv_kcp.cake_causal_conv1d_nondet_train_kcp_host_cache_clear()
+    handle = conv_kcp.CakeCausalConv1dNondetKcpRecomputeHandle()
     x = p.x_local.clone().requires_grad_(True)
     w = p.w.clone().requires_grad_(True)
 
     def fn(x_, w_):
-        return facade.cake_causal_conv1d_kcp(
-            x_,
-            w_,
-            p.ctx,
-            recompute_handle=handle,
-            deterministic=False,
-            bwd_reserve_sms=1,
+        return facade.cake_causal_conv1d_nondet_kcp(
+            x_, w_, p.ctx, recompute_handle=handle, bwd_reserve_sms=1
         )
 
     y = checkpoint(fn, x, w, use_reentrant=False)
@@ -383,7 +367,7 @@ def test_graph_replay_keys_the_reserve(monkeypatch) -> None:
         assert shipped == full and full - k < shipped
         seen = _record_main_grids(monkeypatch)
         conv_kcp._GRAPHS.clear()
-        conv_kcp.host_cache_clear()
+        conv_kcp.cake_causal_conv1d_nondet_train_kcp_host_cache_clear()
         _bwd(x, w, ctx, dy, hist, bwd_reserve_sms=1)
         assert seen == [(full - k, 1, 1)], seen
     finally:
@@ -396,9 +380,7 @@ def test_reserve_at_the_sm_count_is_refused_before_the_forward() -> None:
     sms = torch.cuda.get_device_properties(device).multi_processor_count
     p = _problem(LENS, CUTS, 512, device)
     with pytest.raises(ValueError, match="SMs"):
-        facade.cake_causal_conv1d_kcp(
-            p.x_local, p.w, p.ctx, deterministic=False, bwd_reserve_sms=sms
-        )
+        facade.cake_causal_conv1d_nondet_kcp(p.x_local, p.w, p.ctx, bwd_reserve_sms=sms)
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -413,31 +395,31 @@ def test_sm_107a_is_the_refused_architecture() -> None:
 
 
 def _refused_entries(p):
-    """Every entry point with ``deterministic=False``, as ``(name, call(K))``."""
+    """Every entry point that takes ``bwd_reserve_sms``, as ``(name, call(K))``."""
     x, w, ctx, dy = p.x_local, p.w, p.ctx, p.dy_local
     return [
         (
-            "cake_causal_conv1d_kcp",
-            lambda k: facade.cake_causal_conv1d_kcp(
-                x, w, ctx, deterministic=False, bwd_reserve_sms=k
+            "cake_causal_conv1d_nondet_kcp",
+            lambda k: facade.cake_causal_conv1d_nondet_kcp(
+                x, w, ctx, bwd_reserve_sms=k
             ),
         ),
         (
-            "cake_causal_conv1d_multi_kcp",
-            lambda k: facade.cake_causal_conv1d_multi_kcp(
-                (x,), (w,), ctx, deterministic=False, bwd_reserve_sms=k
+            "cake_causal_conv1d_nondet_kcp_multi",
+            lambda k: facade.cake_causal_conv1d_nondet_kcp_multi(
+                (x,), (w,), ctx, bwd_reserve_sms=k
             ),
         ),
         (
-            "cake_causal_conv1d_backward_kcp",
-            lambda k: conv_kcp.cake_causal_conv1d_backward_kcp(
-                x, w, ctx, dy, None, deterministic=False, bwd_reserve_sms=k
+            "cake_causal_conv1d_nondet_train_kcp_backward",
+            lambda k: conv_kcp.cake_causal_conv1d_nondet_train_kcp_backward(
+                x, w, ctx, dy, None, bwd_reserve_sms=k
             ),
         ),
         (
-            "cake_causal_conv1d_multi_backward_kcp",
-            lambda k: conv_kcp.cake_causal_conv1d_multi_backward_kcp(
-                [x], [w], ctx, [dy], [None], deterministic=False, bwd_reserve_sms=k
+            "cake_causal_conv1d_nondet_train_kcp_multi_backward",
+            lambda k: conv_kcp.cake_causal_conv1d_nondet_train_kcp_multi_backward(
+                [x], [w], ctx, [dy], [None], bwd_reserve_sms=k
             ),
         ),
     ]
@@ -447,8 +429,10 @@ def _launch_nothing(monkeypatch):
     def launched(*args, **kwargs):
         raise AssertionError("a refused call reached a forward or backward launch")
 
-    monkeypatch.setattr(conv_kcp.CakeCausalConv1dFunctionKcp, "apply", launched)
-    monkeypatch.setattr(conv_kcp.CakeCausalConv1dMultiFunctionKcp, "apply", launched)
+    monkeypatch.setattr(conv_kcp.CakeCausalConv1dNondetKcpFunction, "apply", launched)
+    monkeypatch.setattr(
+        conv_kcp.CakeCausalConv1dNondetKcpMultiFunction, "apply", launched
+    )
     monkeypatch.setattr(conv_kcp, "_kcp_backward", launched)
     monkeypatch.setattr(conv_kcp, "_kcp_backward_multi", launched)
 
