@@ -18,25 +18,21 @@ PACKAGES: dict[str, str] = {
     "cake_rmsnorm_train": "flashinfer.cake_rmsnorm_train_backend",
     "cake_causal_conv1d_det_train": "flashinfer.cake_causal_conv1d_det_train_backend",
     "cake_gated_act_mxfp8": "flashinfer.cake_gated_act_mxfp8_backend",
-    "cake_rmsnorm_silu_gate_det_train": "flashinfer.cake_rmsnorm_silu_gate_det_train_backend",
-    "cake_rmsnorm_silu_gate_train": "flashinfer.cake_rmsnorm_silu_gate_train_backend",
+    "cake_rmsnorm_silu_gate_det_train": "flashinfer.experimental.cake.cake_rmsnorm_silu_gate_det_train",
+    "cake_rmsnorm_silu_gate_nondet_train": "flashinfer.experimental.cake.cake_rmsnorm_silu_gate_nondet_train",
     "cake_ulysses": "flashinfer.cake_ulysses_backend",
     "cake_fused_qk_rope_append": "flashinfer.cake_fused_qk_rope_append_backend",
     "cake_sage_block_sparse_attention": "flashinfer.cake_sage_block_sparse_attention_backend",
     "cake_mhc_det_train": "flashinfer.cake_mhc_det_train_backend",
     "cake_dsa_train": "flashinfer.experimental.cake_dsa_train",
-    "cake_dsa_indexer_det": "flashinfer.experimental.cake_dsa_indexer_det",
-    "cake_dsa_indexer": "flashinfer.experimental.cake_dsa_indexer",
+    "cake.cake_dsa_indexer_det_train": "flashinfer.experimental.cake.cake_dsa_indexer_det_train",
     "cake_lm_head_det_loss": "flashinfer.experimental.cake_lm_head_det_loss",
     # the non-deterministic package (deterministic=False); its key carries the namespace
     "cake.cake_lm_head_loss": "flashinfer.experimental.cake.cake_lm_head_loss",
     "dense_projection_det_gemm": "flashinfer.experimental.dense_projection_det_gemm",
     "dense_projection_gemm": "flashinfer.experimental.dense_projection_gemm",
     "cake_moe_grouped_det_gemm": "flashinfer.experimental.cake_moe_grouped_det_gemm",
-    # the suite name before the deterministic-family rename (compatibility alias)
-    "cake_moe_grouped_gemm": "flashinfer.experimental.cake_moe_grouped_det_gemm",
-    # the non-deterministic package (deterministic=False); its key carries the namespace because
-    # ``cake_moe_grouped_gemm`` stays the det package's compatibility key above
+    # the non-deterministic package (deterministic=False); its key carries the namespace
     "cake.cake_moe_grouped_gemm": "flashinfer.experimental.cake.cake_moe_grouped_gemm",
     "cake_mok_bf16": "flashinfer.experimental.cake_mok_bf16",
     "cake_kda_train": "flashinfer.experimental.cake_kda_train",
@@ -54,6 +50,7 @@ PACKAGES: dict[str, str] = {
     "cake_nvfp4_svdquant_gemm": "flashinfer.cake_nvfp4_svdquant_gemm_backend",
     "cake_fused_qk_rope_fp8_append": "flashinfer.cake_fused_qk_rope_fp8_append_backend",
     "nvfp4_attention": "flashinfer.experimental.nvfp4_attention",
+    "cake_nvfp4_ptilemax_attention": "flashinfer.experimental.cake_nvfp4_ptilemax_attention",
     "cake_vsa_sm90": "flashinfer.cake_vsa_sm90_backend",
     "cake_gdp": "flashinfer.cake_gdp_backend",
     "deepgemm_fp8_gemm": "flashinfer.experimental.deepgemm_fp8_gemm",
@@ -61,14 +58,11 @@ PACKAGES: dict[str, str] = {
     "sm110_xqa": "flashinfer.experimental.sm110_xqa",
     "cake_gdn_det_train": "flashinfer.experimental.cake_gdn_det_train",
     "cake.cake_gdn_train": "flashinfer.experimental.cake.cake_gdn_train",
-    "cake_gqa_train": "flashinfer.experimental.cake_gqa_train",
+    # the non-deterministic GQA HD256 training package; its key carries the namespace
+    "cake.cake_gqa_nondet_train": "flashinfer.experimental.cake.cake_gqa_nondet_train",
     "cake.cake_mhc_train": "flashinfer.experimental.cake.cake_mhc_train_backend",
-    # the non-deterministic causal conv1d package (``deterministic=False``); its key carries the namespace because
-    # ``cake_causal_conv1d_train`` stays the det package's compatibility key below
-    "cake.cake_causal_conv1d_train": "flashinfer.experimental.cake.cake_causal_conv1d_train_backend",
+    "cake_causal_conv1d_nondet_train": "flashinfer.experimental.cake.cake_causal_conv1d_nondet_train",
 }
-# Compatibility key: suites that name the causal conv1d package ``cake_causal_conv1d_train`` load the det package.
-PACKAGES["cake_causal_conv1d_train"] = PACKAGES["cake_causal_conv1d_det_train"]
 
 
 def cake_package(name: str, submodule: str | None = None) -> ModuleType:

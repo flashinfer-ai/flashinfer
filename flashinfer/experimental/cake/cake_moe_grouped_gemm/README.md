@@ -21,38 +21,51 @@ an int32 **device** tensor `offs[E]` of cumulative end offsets, or
 | `grouped_gemm_dgrad(g, w, offs, out=None, *, deterministic=True)` | `dX[offs[e-1]:offs[e]] = G[offs[e-1]:offs[e]] @ W[e]` (W read in place) | `dX [sum_m, K]` bf16 |
 | `grouped_gemm_wgrad(g, x, offs, out=None, out_dtype=None, num_groups=None, *, deterministic=True, accumulate=False)` | `dW[e] = G[offs[e-1]:offs[e]].T @ X[offs[e-1]:offs[e]]`; with `accumulate=True`, `out[e] += dW[e]` | `dW [E, N, K]` bf16 or fp32 |
 
-## Numerical mode and dispatch
+## Mode and dispatch rules
 
-Every function of this package (`grouped_gemm_*`, `prepare_grouped_gemm_*`,
-`cake_grouped_mm` / `CakeGroupedMm`) takes `deterministic: bool = True` and
-raises `ValueError` unless it is `False`: the package has no deterministic
-programs of its own. The facade `flashinfer.experimental.cake.grouped_mm`
-dispatches:
+This package and its facade `flashinfer.experimental.cake.grouped_mm` are
+non-deterministic only. Every function (`grouped_gemm_*`, `prepare_grouped_gemm_*`,
+`cake_grouped_mm` / `CakeGroupedMm`, and the facade's four) takes the
+keyword-only `deterministic: bool = True` (`CakeGroupedMm.apply` takes it as its
+fourth argument, `True` when omitted; its fifth argument is an internal slot, and
+anything there but `None` raises `TypeError`), and nothing here routes to the
+deterministic package:
 
-| `deterministic` | `torch.are_deterministic_algorithms_enabled()` | runs |
-| --- | --- | --- |
-| `True` (default) | any | the deterministic package, unchanged bits |
-| `False` | `False` | this package |
-| `False` | `True` | the deterministic package, one `UserWarning` per entry point |
+| call | result |
+| --- | --- |
+| `deterministic=False` | this package |
+| `deterministic` omitted or `True`, or any value that is not the bool `False` (`None`, `0`, `1`, `"False"`) | `ValueError` naming the deterministic entry (`grouped_det_gemm_*`, `prepare_grouped_det_gemm_*`, `cake_grouped_det_mm`, `CakeGroupedDetMm`) and saying "pass deterministic=False for the non-deterministic path"; nothing runs |
+| `deterministic=False` under `torch.use_deterministic_algorithms(True)` | PyTorch's non-determinism alert, naming the deterministic entry, immediately before an order-varying launch (`RuntimeError`, nothing launches; `warn_only=True`: a `UserWarning`, then the launch runs; it names the caller's line for a direct call of `grouped_gemm_wgrad` or `launch()`, a frame of PyTorch's autograd for the backward); never a deterministic fallback |
 
-Called directly under `torch.use_deterministic_algorithms(True)`, the entry
-points that can launch the unordered weight gradient (`prepare_grouped_gemm_wgrad`,
-`grouped_gemm_wgrad` and the backward of `CakeGroupedMm` when it computes `dW`)
-raise PyTorch's non-determinism alert (a `RuntimeError`, or a `UserWarning`
-under `warn_only=True`, naming the deterministic package) and never fall back.
-A prepared weight gradient checks again at every `GroupedGemmLaunch.launch()`,
-so switching the mode on after the preparation is not missed; under CUDA graph
-capture that check runs when the launch is captured, not at replay. The forward and data-gradient entry
-points do not alert: they give the deterministic bits.
+An order-varying launch (`GroupedGemmLaunch.order_varying`) is the weight
+gradient whose 512-wide k tile splits its tail (`plan["unordered_tail"]` and
+`plan["tail_splits"] > 1`), in overwrite or accumulate mode: `grouped_gemm_wgrad`,
+`GroupedGemmLaunch.launch()` and the backward of `CakeGroupedMm` when it computes
+`dW` alert there. A prepared launch checks at every `launch()`, so switching the
+mode on after the preparation is not missed; under CUDA graph capture that check
+runs when the launch is captured, not at replay. The preparation, the forward,
+the data gradient, the 256-wide k tile's weight gradient (ordered tail reduce)
+and an unsplit tail run in a fixed order and never alert. No tape, saved tensor
+or workspace crosses between this package and the deterministic one. The
+deterministic package's entries take no `deterministic` argument at all.
 
 What changes with `deterministic=False`:
 
 - `fwd`, `dgrad` and the weight gradient with the 256-wide k tile run this
-  package's copies of the deterministic programs, with the same host plan:
-  bitwise the deterministic outputs. The 256-wide k tile's `main_wave`
-  program is the same kernel rendered from a newer source: it takes two more
-  buffer arguments (`A_rows`, `B_rows`) that its sm_100a / sm_103a builds
-  never read, and it has no sm_107a build.
+  package's copies of the deterministic programs and host plan (but for the
+  sm_100a `dgrad` evict-first twin below): bitwise the deterministic outputs.
+  The 256-wide k tile's `main_wave` program is the same kernel rendered from a
+  newer source: it takes two more buffer arguments (`A_rows`, `B_rows`) that
+  its sm_100a / sm_103a builds never read, and it has no sm_107a build.
+- On sm_100a the data gradient also has an L2 evict-first twin of its wide
+  tile (`main_wide_ef`), this package's own build: the deterministic
+  package's sm_100a wide domain-scheduled program with the G loads and the
+  dX stores marked evict-first, so that each group's weights stay in L2. The
+  host takes it under the deterministic package's evict-first rule
+  (`dgrad_evict_first`: at least `dgrad_evict_first_min_rows` rows per group
+  on average and `K >= dgrad_evict_first_min_k`), with sm_100a added to
+  `dgrad_evict_first_archs`. The eviction priority changes no arithmetic: dX
+  is bitwise the deterministic package's.
 - The weight gradient with the 512-wide k tile runs builds of the
   deterministic package's k512 forms (`main`, `main_wave`, `main_halves`,
   `main_wave_halves`, `main_halves_k256t`) whose split tail -- the tiles of
@@ -184,14 +197,8 @@ temporary), the fused route with `grad_added_to_main_grad` saves `2 * S` bytes
 then the fp32 add) the peak is equal. The benchmark's accumulation arms report
 the measured peak.
 
-The facade `flashinfer.experimental.cake.grouped_mm` takes the same keywords:
-
-| entry | `deterministic` | torch det. mode | runs |
-| --- | --- | --- | --- |
-| `grouped_gemm_wgrad(..., accumulate=True)` | `False` | off | this package's accumulate mode |
-| `grouped_gemm_wgrad(..., accumulate=True)` | `True`, or `False` with det. mode on (warns) | any | the deterministic `dW` in `out.dtype` into a scratch, then `out.add_` (the same checks first) |
-| `cake_grouped_mm(..., fuse_wgrad_accumulation=True)` | `False` | off | this package's wrapper |
-| `cake_grouped_mm(..., fuse_wgrad_accumulation=True)` | `True`, or `False` with det. mode on (warns) | any | `NotImplementedError`: the deterministic package has not adopted the accumulation yet |
+The facade `flashinfer.experimental.cake.grouped_mm` takes the same keywords and
+hands them to this package with the same mode rules; it has no deterministic route.
 
 ```python
 from flashinfer.experimental.cake.cake_moe_grouped_gemm import prepare_grouped_gemm_wgrad
@@ -257,7 +264,7 @@ backend="cake")` stays on the deterministic package.
 non-reentrant activation-checkpoint replay recomputes the same `Y`; its
 backward produces `x.grad` with the `dgrad` programs and `w.grad` with the
 `wgrad` programs in the dtype of `w`, accumulated into an existing `.grad` by
-autograd as usual. The facade fixes the mode at the forward call.
+autograd as usual; forward and backward always run this package.
 The wrapper launches the forward GEMM after `CakeGroupedMm.apply` returns,
 that is after autograd saved `x`, `w` and `offs`, as for a built-in op. Under
 `torch.utils.checkpoint(..., use_reentrant=False)` with early stop on (the
@@ -274,6 +281,12 @@ Every decision is the deterministic package's (`cake_backend.py` carries the
 same planner, constants and stage rules: grid, output tile, evict-first and
 3 / 3 head / tail twins, probed queue split, k tile, wave sync, accumulator
 release, k256 tail); see that package's README. Differences:
+
+- Data-gradient evict-first twin: `HOST_PLAN_CONSTANTS["dgrad_evict_first_archs"]`
+  lists sm_100a and sm_107a (the deterministic package: sm_107a). On sm_100a
+  `main_wide_ef` is this package's own build of the domain-scheduled wide
+  tile (same domain schedule and probed queue split as `main_wide`); on
+  sm_107a it is the copy of the deterministic A-collector twin.
 
 - Unordered tail (`plan_wgrad(..., unordered_tail=True)`): the 512-wide k
   tile on the architectures of `HOST_PLAN_CONSTANTS["unordered_tail_archs"]`
@@ -312,13 +325,15 @@ tail-reduce programs are copies of the deterministic package's under this
 package's prefix (`cake_moe_grouped_gemm_<digest>`, the same digests), except
 that the 256-wide k tile's `main_wave` program is rendered from a newer source
 of the same kernel (two more, unused buffer arguments; sm_100a / sm_103a
-only); the 512-wide k tile's routes bind the unordered-tail builds.
+only) and that the data gradient's sm_100a `main_wide_ef` program is this
+package's own evict-first build of the deterministic wide domain-scheduled
+kernel; the 512-wide k tile's routes bind the unordered-tail builds.
 
 | feature | sm_100a | sm_103a | sm_107a |
 | --- | --- | --- | --- |
 | `fwd` / `dgrad` `main`, `main_wide` | domain schedule | domain schedule | static schedule (A collector on `main_wide`) |
 | `fwd` `main_wide_ef` / `main_wide_ts33` | - / - | - / yes | yes / - |
-| `dgrad` `main_wide_ef` / `main_wide_ts33` | - / - | - / yes | yes / - |
+| `dgrad` `main_wide_ef` / `main_wide_ts33` | yes (this package's build) / - | - / yes | yes / - |
 | `dgrad` probed queue split | yes | yes | - |
 | `wgrad` k256 `main` + ordered `tail_reduce` | yes | yes | yes |
 | `wgrad` k256 `main_wave` | yes | yes | - |
@@ -360,11 +375,12 @@ over repeats), empty groups, the #6570 shape relaunched and on concurrent
 streams, CUDA graph replay with changed offsets, checkpointing, gradient
 accumulation, changed shapes with reused and garbage-filled scratch, and the
 tail workspaces at rest. `test_cake_moe_grouped_gemm_api.py` covers the facade
-(marking, signatures, dispatch, the torch-deterministic fallback) and the
-package's mode checks and alert. `test_cake_moe_grouped_gemm_reproducibility.py`
-checks that `deterministic=True` gives the deterministic package's bits, that
-`fwd` / `dgrad` give them with `deterministic=False`, and reports the
-run-to-run variation of the unordered weight gradient.
+(marking, signatures, the handoff with no deterministic route, the `ValueError`
+of every mode but `False`) and the package's mode checks and its alert before an
+order-varying launch only. `test_cake_moe_grouped_gemm_reproducibility.py`
+checks that `fwd` / `dgrad` give the deterministic package's bits (also through
+the facade), and reports the run-to-run variation of the unordered weight
+gradient.
 `test_cake_moe_grouped_gemm_standalone.py` imports a copy with `flashinfer`
 blocked. `test_cake_moe_grouped_gemm_acc.py` covers the accumulate mode: the
 `_acc` stages against the shipped set and their twins, the plans, the routes

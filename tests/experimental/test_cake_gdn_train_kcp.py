@@ -15,8 +15,8 @@ limitations under the License.
 
 CPU tests of the GDN KCP metadata layer of the NON-DETERMINISTIC package ``flashinfer.experimental.cake_gdn_train_kcp``
 (the twin of ``cake_gdn_det_train_kcp`` with the same contract and accuracy budgets, not its bitwise reproducibility):
-the package-local plan module against ``cake_kda_train.cake_kcp_plan`` (field-identical partitions and contexts on the
-step-0 rows with ``H := HV``; the KDA package is imported HERE only, never by the package), the per-rank crossing
+the package-local plan module against ``cake_kda_det_train_kcp.cake_kcp_plan`` (field-identical partitions and contexts on
+the step-0 rows with ``H := HV``; the KDA package is imported HERE only, never by the package), the per-rank crossing
 counts and exchange bytes against the rows of record, the table builders (pool addressing, segment lists, chains),
 head ownership incl. the padded ``(HV, W) = (3, 2)`` case, the byte queries, the registry seed, an emulated multi-rank
 row (W ranks on threads), and the package's host orchestration on the fake backend
@@ -381,14 +381,14 @@ def _sha(obj) -> str:
 @ROWS
 @pytest.mark.parametrize("path", ROW_FILES, ids=ROW_IDS)
 def test_plan_parity_with_kda_on_rows(path, monkeypatch) -> None:
-    """Result 1: ``cake_gdn_train_kcp.cake_kcp_plan`` is field-identical to ``cake_kda_train.cake_kcp_plan`` on every
-    step-0 row (partition, every rank's context and head plan at ``H := HV``) and reproduces the row's recorded
+    """Result 1: ``cake_gdn_train_kcp.cake_kcp_plan`` is field-identical to ``cake_kda_det_train_kcp.cake_kcp_plan`` on
+    every step-0 row (partition, every rank's context and head plan at ``H := HV``) and reproduces the row's recorded
     fragment table.  Result 2: ``n_in`` / ``n_out`` / ``max_chain_fragments`` and the exchange bytes of
     ``gdn_comm_bytes_kcp`` equal the row JSON.  Both modules plan under the per-rank rule they share,
     ``"wave_fill1"`` (the GDN default is the row rule, the KDA default its own tie rule; each is selected explicitly
     here: the keyword-only ``p_rule`` on the GDN side, the private test hook on the KDA side)."""
     kp = importlib.import_module(
-        "flashinfer.experimental.cake_kda_train.cake_kcp_plan"
+        "flashinfer.experimental.cake_kda_det_train_kcp.cake_kcp_plan"
     )  # the test only
     # the KDA module accepts its private test hook only after its opt-in (enable_test_knobs)
     monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
@@ -398,7 +398,7 @@ def test_plan_parity_with_kda_on_rows(path, monkeypatch) -> None:
     W = int(row["cp"])
     args = _partition_inputs(row)
     part = gp.partition_kcp(**args)
-    kpart = kp.kcp_partition(**args)
+    kpart = kp.partition_det_kcp(**args)
     assert part.to_dict() == kpart.to_dict(), "partition differs from the KDA module"
     assert _plain(part.to_dict()["fragments"]) == row["fragments"], (
         "partition differs from the row of record"
@@ -419,7 +419,7 @@ def test_plan_parity_with_kda_on_rows(path, monkeypatch) -> None:
         ctx = gp.build_context_kcp(
             part, None, r, CPU, 4, sm_count=SM_COUNT, p_rule="wave_fill1"
         )  # the per-rank rule both modules share; the GDN default "row_cost" is tested on the rows below
-        kctx = kp.build_kcp_context(
+        kctx = kp.build_context_det_kcp(
             kpart,
             None,
             r,
@@ -1482,9 +1482,11 @@ def _saved_formula(ctx, H_qk, HV, save_mode, boundary_mode, save_transfer, C) ->
 
 @pytest.mark.parametrize("W", (2, 4))
 def test_byte_queries(W) -> None:
-    """Result 3: the byte queries follow the design formulas for both ``save_mode`` and ``boundary_mode`` values,
-    ``save_transfer`` on / off; the exchange terms depend on ``HV`` only, ``H_qk`` enters through the default
-    channel count; the validators reject ``HV % H_qk != 0``."""
+    """Result 3: the byte queries follow the design formulas for every ``save_mode`` and ``boundary_mode`` value,
+    ``save_transfer`` on / off (``"light_akk"`` with the in-kernel norm, which it needs: the light figures of the
+    norm plus #1's ``Akk`` tape in the saved set of a saved boundary and out of the arenas); the exchange terms
+    depend on ``HV`` only, ``H_qk`` enters through the default channel count; the validators reject
+    ``HV % H_qk != 0``."""
     cu = torch.tensor([0, 100, 740, 817, 1817, 1946], dtype=torch.int64)  # C1
     part = gp.partition_kcp(cu, W, "contiguous")
     H_qk, HV = 2, 6
@@ -1559,7 +1561,20 @@ def test_byte_queries(W) -> None:
             other = gb.gdn_comm_bytes_kcp(ctx, H_qk=hq, HV=HV, C=C_CONV)
             assert all(other[k] == cb[k] for k in ("c1", "c2", "b1", "b2"))
         planes = 0  # kept-form rows that hand the M_seg^T plane over
+        akk = ctx.R * HV * 128  # #1's BF16 Akk tape
         for save_mode in gb.SAVE_MODES:
+            # the in-kernel-norm-only modes ("light_akk") refuse a norm-off call: their rows run with the norm on
+            norm = {}
+            if save_mode in gb.AKK_SAVE_MODES:
+                with pytest.raises(ValueError, match="use_qk_l2norm_in_kernel"):
+                    gb.gdn_saved_bytes_kcp(
+                        ctx, H_qk=H_qk, HV=HV, save_mode=save_mode, C=C_CONV
+                    )
+                with pytest.raises(ValueError, match="use_qk_l2norm_in_kernel"):
+                    gb.gdn_workspace_layout_kcp(
+                        ctx, H_qk=H_qk, HV=HV, save_mode=save_mode, C=C_CONV
+                    )
+                norm = {"use_qk_l2norm_in_kernel": True}
             for boundary_mode in gb.BOUNDARY_MODES:
                 for save_transfer in (True, False):
                     got = gb.gdn_saved_bytes_kcp(
@@ -1570,10 +1585,29 @@ def test_byte_queries(W) -> None:
                         boundary_mode=boundary_mode,
                         save_transfer=save_transfer,
                         C=C_CONV,
+                        **norm,
                     )
-                    want = _saved_formula(
-                        ctx, H_qk, HV, save_mode, boundary_mode, save_transfer, C_CONV
-                    )
+                    if norm:
+                        # the light set of the norm plus the Akk tape (a saved boundary; the replay keeps none)
+                        want = gb.gdn_saved_bytes_kcp(
+                            ctx,
+                            H_qk=H_qk,
+                            HV=HV,
+                            boundary_mode=boundary_mode,
+                            save_transfer=save_transfer,
+                            C=C_CONV,
+                            **norm,
+                        ) + (akk if boundary_mode == "saved" else 0)
+                    else:
+                        want = _saved_formula(
+                            ctx,
+                            H_qk,
+                            HV,
+                            save_mode,
+                            boundary_mode,
+                            save_transfer,
+                            C_CONV,
+                        )
                     assert got == want, (r, save_mode, boundary_mode, save_transfer)
                     layout = gb.gdn_saved_layout_kcp(
                         ctx,
@@ -1583,6 +1617,7 @@ def test_byte_queries(W) -> None:
                         boundary_mode=boundary_mode,
                         save_transfer=save_transfer,
                         C=C_CONV,
+                        **norm,
                     )
                     assert sum(layout.values()) == got and all(
                         v >= 0 for v in layout.values()
@@ -1595,6 +1630,7 @@ def test_byte_queries(W) -> None:
                         boundary_mode=boundary_mode,
                         save_transfer=save_transfer,
                         C=C_CONV,
+                        **norm,
                     )
                     assert (
                         ws["workspace"]
@@ -1607,6 +1643,7 @@ def test_byte_queries(W) -> None:
                             boundary_mode=boundary_mode,
                             save_transfer=save_transfer,
                             C=C_CONV,
+                            **norm,
                         )
                     )
                     # the forward is the larger of its two moments (#1, the tape walk), each below the sum of what
@@ -1656,6 +1693,7 @@ def test_byte_queries(W) -> None:
                                 C=C_CONV,
                                 P=P_q,
                                 reuse_recompute_tapes=form,
+                                **norm,
                             )
                             for form in (True, False)
                         )
@@ -1718,6 +1756,29 @@ def test_byte_queries(W) -> None:
                                 - c1_gone,
                             )
                         )
+                    elif save_mode in gb.AKK_SAVE_MODES and boundary_mode == "saved":
+                        # the light form of the norm, but #1's Akk goes to the saved set: no fwd.akk / bwd.akk
+                        # term, no h tape, #1's moment and every backward phase lower by the tape
+                        light_ws = gb.gdn_workspace_layout_kcp(
+                            ctx,
+                            H_qk=H_qk,
+                            HV=HV,
+                            boundary_mode=boundary_mode,
+                            save_transfer=save_transfer,
+                            C=C_CONV,
+                            **norm,
+                        )
+                        assert "fwd.akk" not in ws and "bwd.akk" not in ws
+                        assert light_ws["fwd.akk"] == light_ws["bwd.akk"] == akk
+                        assert "fwd.h_tape" not in ws and layout["h_tape"] == 0
+                        assert layout["akk"] == akk
+                        assert light_ws["fwd.phase.prep"] - ws["fwd.phase.prep"] == akk
+                        akk_phases = [k for k in light_ws if k.startswith("bwd.phase.")]
+                        assert akk_phases == [
+                            k for k in ws if k.startswith("bwd.phase.")
+                        ]
+                        for k in akk_phases:
+                            assert light_ws[k] - ws[k] == akk, (r, k, save_transfer)
                     elif save_mode == "light" or boundary_mode == "replay":
                         # the replay boundary keeps no tape: "full" there is the light replay's arena
                         assert (
@@ -1976,8 +2037,8 @@ def test_registry_seed() -> None:
 
 
 def test_package_imports_no_kda_and_no_environ() -> None:
-    """The package never imports ``cake_kda_train`` and reads no environment variable; the plan
-    module imports torch, torch.distributed and dataclasses only."""
+    """The package never imports a KDA package (no module path or name containing ``cake_kda``) and reads no
+    environment variable; the plan module imports torch, torch.distributed and dataclasses only."""
     for path in sorted(PACKAGE_DIR.glob("*.py")):
         tree = ast.parse(path.read_text())
         for node in ast.walk(tree):
@@ -1987,8 +2048,8 @@ def test_package_imports_no_kda_and_no_environ() -> None:
                     if isinstance(node, ast.ImportFrom) and node.module
                     else []
                 )
-                assert not any("cake_kda_train" in n for n in names), (
-                    f"{path.name} imports cake_kda_train"
+                assert not any("cake_kda" in n for n in names), (
+                    f"{path.name} imports a KDA package"
                 )
                 assert "os" not in [
                     a.name for a in node.names if isinstance(node, ast.Import)
@@ -6728,8 +6789,14 @@ def test_workspace_layout_follows_the_arena_of_every_rank(
 
 @pytest.mark.parametrize(
     "opts",
-    [{}, _FULL_NO_ST, {"boundary_mode": "replay"}, {"save_for_backward": False}],
-    ids=["light", "full", "replay", "no_saved_set"],
+    [
+        {},
+        _FULL_NO_ST,
+        {"boundary_mode": "replay"},
+        {"save_for_backward": False},
+        {"save_mode": "light_akk", "use_qk_l2norm_in_kernel": True},
+    ],
+    ids=["light", "full", "replay", "no_saved_set", "light_akk"],
 )
 def test_workspace_reused_across_steps_binds_the_graph_replay_figure(
     monkeypatch, opts
@@ -6798,6 +6865,145 @@ def test_workspace_reused_across_steps_binds_the_graph_replay_figure(
                 # the forward peaks at its ensure, the previous backward's h / v_new still bound
                 assert fwd == graph["backward"] - bwd_only, (r, steps[r], graph)
                 assert fwd > eager["forward"], (r, steps[r])
+
+
+@pytest.mark.parametrize("save_transfer", [True, False])
+def test_two_rank_light_akk_is_bitwise_light(monkeypatch, save_transfer) -> None:
+    """``save_mode="light_akk"`` on two ranks (a crossing fragment, ``P = 2``, the in-kernel norm, fake backend):
+    out and the five gradients of every rank are the bits of ``"light"`` through the explicit entries and through
+    autograd (the saved set through ``save_for_backward`` / ``SavedKcp.from_tensors``), eager and in four
+    ``graph="replay"`` steps on the same caller-held workspace per rank (CPU captures whose replays re-issue their
+    collectives; the last step replays both graphs).  The backward's launch census is light's with ``fwd_prep_l2n``
+    swapped for ``fwd_prep_replay_l2n`` once per light replay (the forward's is light's), and each rank's saved set
+    gains its ``Akk`` tape, ``128 R HV`` bytes, the byte query's difference."""
+    kcp = _package("cake_kcp")
+    H_qk, HV = CKPT_HEADS
+    replay = kcp.AKK_REPLAY_OF["fwd_prep_l2n"]
+    part = gp.partition_kcp(torch.tensor(CKPT_CU, dtype=torch.int64), 2, "contiguous")
+    ctxs = [
+        gp.build_context_kcp(part, None, r, CPU, 4, sm_count=SM_COUNT) for r in range(2)
+    ]
+    assert sum(c.n_out for c in ctxs) > 0 and all(int(c.T_r) > 0 for c in ctxs)
+    # the kernels write every element of a per-call buffer; the fake backend writes each Akk block's valid rows and
+    # columns only, so zero-filled buffers keep the unwritten entries equal across the arms
+    monkeypatch.setattr(
+        kcp,
+        "_alloc",
+        lambda shape, dtype, device: torch.zeros(
+            tuple(shape), dtype=dtype, device=device
+        ),
+    )
+    monkeypatch.setattr(kcp, "LAST_CALL", _ThreadLastCall())
+    _fake_captures_threaded(kcp, monkeypatch)
+    ops = _inputs(CKPT_CU, H_qk, HV)
+    base = dict(
+        backend="fake",
+        segments=2,
+        save_transfer=save_transfer,
+        use_qk_l2norm_in_kernel=True,
+    )
+    graphs = ("off",) + ("replay",) * 4
+
+    def run(**o) -> list:
+        kcp.graph_cache_clear()
+
+        def rank_fn(r, comm):
+            loc = fake.slice_local(ops, part, r)
+            args = [loc[n] for n in LEAVES]
+            out, saved = kcp.chunk_gdn_fwd_kcp(
+                *args, ctxs[r], deterministic=False, **base, **o
+            )
+            fwd = dict(kcp.LAST_CALL["fwd"])
+            grads = kcp.chunk_gdn_bwd_kcp(
+                *args,
+                ctxs[r],
+                loc["dout"],
+                saved=saved,
+                deterministic=False,
+                **base,
+                **o,
+            )
+            explicit = {
+                "out": out,
+                **dict(zip(EXPLICIT_GRADS, grads, strict=True)),
+                "saved_bytes": int(saved.bytes),
+                "fwd": fwd,
+                "bwd": dict(kcp.LAST_CALL["bwd"]),
+            }
+            leaves = [loc[n].detach().clone().requires_grad_(True) for n in LEAVES]
+            ws = kcp.WorkspaceKcp()
+            steps = []
+            for graph in graphs:
+                for lf in leaves:
+                    lf.grad = None
+                y = kcp.chunk_gdn_kcp(
+                    *leaves,
+                    ctxs[r],
+                    workspace=ws,
+                    graph=graph,
+                    deterministic=False,
+                    **base,
+                    **o,
+                )
+                y.backward(loc["dout"])
+                res = {
+                    "out": y.detach().clone(),
+                    **{
+                        n: lf.grad.clone()
+                        for n, lf in zip(CKPT_GRADS, leaves, strict=True)
+                    },
+                }
+                steps.append(
+                    (res, dict(kcp.LAST_CALL["fwd"]), dict(kcp.LAST_CALL["bwd"]))
+                )
+            return explicit, steps
+
+        return _run_threaded(kcp, 2, rank_fn, monkeypatch)
+
+    light = run()
+    akk = run(save_mode="light_akk")
+    kcp.graph_cache_clear()
+    names = ("out",) + CKPT_GRADS
+    for r, c in enumerate(ctxs):
+        (le, lsteps), (ae, asteps) = light[r], akk[r]
+        for n in names:
+            assert torch.equal(ae[n], le[n]), (r, "explicit", n)
+        lb, ab = le["bwd"], ae["bwd"]
+        assert ab["akk_source"] == "saved" and lb["akk_source"] is None, r
+        assert ab["tapes_source"] == lb["tapes_source"] == "replay", r
+        assert ae["fwd"]["sequence"] == le["fwd"]["sequence"], r
+        assert lb["sequence"].count("fwd_prep_l2n") >= 1, r
+        assert ab["sequence"] == [
+            replay if p == "fwd_prep_l2n" else p for p in lb["sequence"]
+        ], r
+        assert "fwd_prep_l2n" not in ab["sequence"], r
+        q = dict(
+            H_qk=H_qk,
+            HV=HV,
+            P=2,
+            save_transfer=save_transfer,
+            with_conv=False,
+            use_qk_l2norm_in_kernel=True,
+        )
+        tape = int(c.R) * HV * 128
+        assert ae["saved_bytes"] - le["saved_bytes"] == tape, r
+        assert (
+            gb.gdn_saved_bytes_kcp(c, save_mode="light_akk", **q)
+            - gb.gdn_saved_bytes_kcp(c, **q)
+            == tape
+        ), r
+        for i, ((lres, _lf, lbw), (ares, _af, abw)) in enumerate(
+            zip(lsteps, asteps, strict=True)
+        ):
+            for n in names:
+                assert torch.equal(ares[n], lres[n]), (r, i, n)
+                assert torch.equal(ares[n], ae[n]), (r, i, n)
+            assert abw["akk_source"] == "saved", (r, i, abw["akk_source"])
+            assert abw["sequence"] == [
+                replay if p == "fwd_prep_l2n" else p for p in lbw["sequence"]
+            ], (r, i)
+        _res, af, abw = asteps[-1]
+        assert af["graph_event"] == abw["graph_event"] == "replay", (r, af, abw)
 
 
 class _ThreadLastCall(dict):

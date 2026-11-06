@@ -23,22 +23,29 @@ limitations under the License.
 # ``dX = G @ W[e]`` (``grouped_gemm_dgrad``) and the weight gradient
 # ``dW[e] = G[e].T @ X[e]`` with bf16 or fp32 output (``grouped_gemm_wgrad``).
 #
-# Every entry point takes ``deterministic: bool = True`` and raises
-# ``ValueError`` unless it is ``False``.  The forward pass, the activation
+# Every entry point takes the keyword-only ``deterministic: bool = True`` and
+# raises ``ValueError`` for every value but the bool ``False`` (the default
+# included), naming the deterministic entry of
+# ``flashinfer.experimental.cake_moe_grouped_det_gemm``; nothing here routes to
+# that package.  The forward pass, the activation
 # gradient and the 256-wide k tile's weight gradient run copies of the
-# deterministic programs (the same bits); the 512-wide k tile's weight
+# deterministic programs, but for the sm_100a activation gradient's L2
+# evict-first twin, this package's own build of the deterministic wide tile
+# (all of them the same bits); the 512-wide k tile's weight
 # gradient adds its split tail in place with unordered fp32 reductions, so its
 # ``dW`` is not bitwise reproducible run to run (``cake_backend``, numerical
-# mode).  Under ``torch.use_deterministic_algorithms(True)`` the weight
-# gradient's entry points raise the non-determinism alert (a ``RuntimeError``,
-# or a ``UserWarning`` under ``warn_only=True``).
+# mode).  Under ``torch.use_deterministic_algorithms(True)`` a launch of such a
+# split tail raises the non-determinism alert immediately before it launches (a
+# ``RuntimeError``, or a ``UserWarning`` under ``warn_only=True``, after which
+# it runs); the fixed-order launches (forward, activation gradient, the
+# 256-wide k tile and an unsplit tail) never alert.
 #
 # The public (experimental) entry points are the facade functions
 # ``flashinfer.experimental.cake.grouped_mm.grouped_gemm_fwd`` /
-# ``grouped_gemm_dgrad`` / ``grouped_gemm_wgrad`` / ``cake_grouped_mm``, whose
-# ``deterministic=True`` (the default) runs the deterministic package and
-# ``deterministic=False`` this one; they carry the experimental-API marking and
-# the once-only warnings and hand off to the plain functions of this package.
+# ``grouped_gemm_dgrad`` / ``grouped_gemm_wgrad`` / ``cake_grouped_mm``, which
+# take the same arguments, accept only ``deterministic=False``, carry the
+# experimental-API marking and the once-only warnings and hand off to the
+# plain functions of this package.
 # The package holds those plain functions (the three one-shot helpers below,
 # which prepare and launch in one call), the ``torch.autograd`` wrapper
 # ``cake_grouped_mm`` / ``CakeGroupedMm`` of ``cake_autograd``, the host
@@ -105,8 +112,10 @@ def grouped_gemm_fwd(
     out : Optional[torch.Tensor]
         ``[sum_m, N]`` bfloat16 output (allocated when omitted); may be row-padded.
     deterministic : bool
-        Must be ``False`` (``ValueError`` otherwise).  The forward programs are
-        copies of the deterministic package's and give its bits.
+        Must be ``False`` (``ValueError`` naming ``grouped_det_gemm_fwd``
+        otherwise, the default included).  The forward programs are copies of
+        the deterministic package's and give its bits; they never alert under
+        torch's deterministic mode.
 
     Returns
     -------
@@ -138,8 +147,11 @@ def grouped_gemm_dgrad(
     ``g`` is ``[sum_m, N]`` bfloat16, ``w`` is ``[E, N, K]`` bfloat16 and is
     read in place (no transpose copy), ``offs`` is ``[E]`` int32 device end
     offsets (or ``m_indptr`` ``[E + 1]``) and ``out`` is ``[sum_m, K]`` bfloat16.  ``K % 256 == 0`` and
-    ``N % 64 == 0`` are required.  ``deterministic`` must be ``False``; the
-    programs are copies of the deterministic package's and give its bits.  See
+    ``N % 64 == 0`` are required.  ``deterministic`` must be ``False``
+    (``ValueError`` naming ``grouped_det_gemm_dgrad`` otherwise); the programs
+    are copies of the deterministic package's, but for the sm_100a evict-first
+    twin, this package's own build of the deterministic wide tile, and all give
+    its bits (no alert under torch's deterministic mode).  See
     ``grouped_gemm_fwd`` for the prepared form.
     """
     from .cake_backend import _require_deterministic_false, prepare_grouped_gemm_dgrad
@@ -166,11 +178,13 @@ def grouped_gemm_wgrad(
     ``num_groups=E`` to hand in ``m_indptr`` ``[E + 1]`` instead) and ``out``
     is ``[E, N, K]`` in ``out_dtype`` (bfloat16 or float32; defaults to the
     dtype of ``out``, else bfloat16).  fp32 accumulation, one rounding at the
-    store, exact zeros for empty groups.  ``deterministic`` must be ``False``:
-    with the 512-wide k tile the split tail is added with unordered fp32
-    reductions, so ``dW`` is not bitwise reproducible run to run, and under
-    ``torch.use_deterministic_algorithms(True)`` this function raises the
-    non-determinism alert.  ``N % 256 == 0`` and ``K`` a
+    store, exact zeros for empty groups.  ``deterministic`` must be ``False``
+    (``ValueError`` naming ``grouped_det_gemm_wgrad`` otherwise): with the
+    512-wide k tile a split tail is added with unordered fp32 reductions, so
+    ``dW`` is not bitwise reproducible run to run, and under
+    ``torch.use_deterministic_algorithms(True)`` such a launch raises the
+    non-determinism alert immediately before it runs (a fixed-order launch does
+    not).  ``N % 256 == 0`` and ``K`` a
     multiple of the selected k tile (256, or 512 when chosen) are required.
     See ``grouped_gemm_fwd`` for the prepared form.
 
@@ -182,17 +196,12 @@ def grouped_gemm_wgrad(
     (``prepare_grouped_gemm_wgrad`` and the package README give the routes and
     the numerical contract).
     """
-    from .cake_backend import (
-        _alert_not_deterministic,
-        _prepare_wgrad,
-        _require_deterministic_false,
-    )
+    from .cake_backend import _prepare_wgrad, _require_deterministic_false
 
     _require_deterministic_false(deterministic, "grouped_gemm_wgrad")
-    _alert_not_deterministic("grouped_gemm_wgrad")
     return _prepare_wgrad(
         g, x, offs, out, out_dtype, num_groups, accumulate=accumulate
-    )._run()
+    )._run("grouped_gemm_wgrad")
 
 
 def __getattr__(name: str) -> Any:

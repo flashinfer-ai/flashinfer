@@ -47,164 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 512
-#define TMEM_ACC_DQS_OFFSET 0
-#define TMEM_ACC_DKS_OFFSET 64
-#define TMEM_ACC_DQ_OFFSET 128
-#define TMEM_ACC_DK_OFFSET 192
-#define TMEM_ACC_DW_OFFSET 256
-#define TMEM_ACC_DA_OFFSET 320
-#define TMEM_ACC_DAQ_OFFSET 384
-#define TMEM_ACC_DVB_OFFSET 384
-#define TMEM_ACC_DKGB_OFFSET 256
-#define TMEM_ACC_DA1_OFFSET 256
-#define TMEM_ACC_DA2_OFFSET 320
-#define TMEM_ACC_DKSRC_OFFSET 256
-#define TMEM_ACC_X_OFFSET 384
-#define TMEM_ACC_GP_OFFSET 448
-#define NUM_ONE_STAGES 1
-#define NUM_TK_PIPE_STAGES 2
-#define SMEM_SMEM_V0_OFF 1024
-#define SMEM_SMEM_V0_STAGE_BYTES 8192
-#define SMEM_SMEM_V0_STRIDE 8192
-#define SMEM_SMEM_V0_0_OFF 17408
-#define SMEM_SMEM_V0_0_STAGE_BYTES 8192
-#define SMEM_SMEM_V0_0_STRIDE 8192
-#define SMEM_SMEM_V0_1_OFF 148480
-#define SMEM_SMEM_V0_1_STAGE_BYTES 8192
-#define SMEM_SMEM_V0_1_STRIDE 8192
-#define SMEM_SMEM_V0_2_OFF 99328
-#define SMEM_SMEM_V0_2_STAGE_BYTES 8192
-#define SMEM_SMEM_V0_2_STRIDE 8192
-#define SMEM_SMEM_V0_3_OFF 115712
-#define SMEM_SMEM_V0_3_STAGE_BYTES 8192
-#define SMEM_SMEM_V0_3_STRIDE 8192
-#define SMEM_SMEM_V0_4_OFF 132096
-#define SMEM_SMEM_V0_4_STAGE_BYTES 8192
-#define SMEM_SMEM_V0_4_STRIDE 8192
-#define SMEM_SMEM_V6_OFF 1024
-#define SMEM_SMEM_V6_STAGE_BYTES 16384
-#define SMEM_SMEM_V6_STRIDE 16384
-#define SMEM_SMEM_V6_0_OFF 17408
-#define SMEM_SMEM_V6_0_STAGE_BYTES 16384
-#define SMEM_SMEM_V6_0_STRIDE 16384
-#define SMEM_SMEM_V6_1_OFF 148480
-#define SMEM_SMEM_V6_1_STAGE_BYTES 16384
-#define SMEM_SMEM_V6_1_STRIDE 16384
-#define SMEM_SMEM_V9_OFF 1024
-#define SMEM_SMEM_V9_STAGE_BYTES 16384
-#define SMEM_SMEM_V9_STRIDE 16384
-#define SMEM_SMEM_V9_0_OFF 17408
-#define SMEM_SMEM_V9_0_STAGE_BYTES 16384
-#define SMEM_SMEM_V9_0_STRIDE 16384
-#define SMEM_SMEM_V6_2_OFF 99328
-#define SMEM_SMEM_V6_2_STAGE_BYTES 16384
-#define SMEM_SMEM_V6_2_STRIDE 16384
-#define SMEM_SMEM_V6_3_OFF 115712
-#define SMEM_SMEM_V6_3_STAGE_BYTES 16384
-#define SMEM_SMEM_V6_3_STRIDE 16384
-#define SMEM_SMEM_V6_4_OFF 132096
-#define SMEM_SMEM_V6_4_STAGE_BYTES 16384
-#define SMEM_SMEM_V6_4_STRIDE 16384
-#define SMEM_SMEM_V9_1_OFF 132096
-#define SMEM_SMEM_V9_1_STAGE_BYTES 16384
-#define SMEM_SMEM_V9_1_STRIDE 16384
-#define SMEM_H_P_OFF 33792
-#define SMEM_H_P_STAGE_BYTES 16384
-#define SMEM_H_P_STRIDE 16384
-#define SMEM_DH_P_OFF 66560
-#define SMEM_DH_P_STAGE_BYTES 16384
-#define SMEM_DH_P_STRIDE 16384
-#define SMEM_H_K_OFF 33792
-#define SMEM_H_K_STAGE_BYTES 32768
-#define SMEM_H_K_STRIDE 32768
-#define SMEM_DH_K_OFF 66560
-#define SMEM_DH_K_STAGE_BYTES 32768
-#define SMEM_DH_K_STRIDE 32768
-#define SMEM_AKK_S_OFF 164864
-#define SMEM_AKK_S_STAGE_BYTES 8192
-#define SMEM_AKK_S_STRIDE 8192
-#define SMEM_SMEM_V20_OFF 164864
-#define SMEM_SMEM_V20_STAGE_BYTES 8192
-#define SMEM_SMEM_V20_STRIDE 8192
-#define SMEM_SMEM_V21_OFF 164864
-#define SMEM_SMEM_V21_STAGE_BYTES 8192
-#define SMEM_SMEM_V21_STRIDE 8192
-#define SMEM_DWBT_K_OFF 33792
-#define SMEM_DWBT_K_STAGE_BYTES 16384
-#define SMEM_DWBT_K_STRIDE 16384
-#define SMEM_DWBT_MN_OFF 33792
-#define SMEM_DWBT_MN_STAGE_BYTES 16384
-#define SMEM_DWBT_MN_STRIDE 16384
-#define SMEM_SMEM_V6_5_OFF 50176
-#define SMEM_SMEM_V6_5_STAGE_BYTES 16384
-#define SMEM_SMEM_V6_5_STRIDE 16384
-#define SMEM_SMEM_V6_6_OFF 210944
-#define SMEM_SMEM_V6_6_STAGE_BYTES 16384
-#define SMEM_SMEM_V6_6_STRIDE 16384
-#define SMEM_SMEM_V9_2_OFF 210944
-#define SMEM_SMEM_V9_2_STAGE_BYTES 16384
-#define SMEM_SMEM_V9_2_STRIDE 16384
-#define SMEM_SMEM_V20_0_OFF 173056
-#define SMEM_SMEM_V20_0_STAGE_BYTES 8192
-#define SMEM_SMEM_V20_0_STRIDE 8192
-#define SMEM_SMEM_V20_1_OFF 181248
-#define SMEM_SMEM_V20_1_STAGE_BYTES 8192
-#define SMEM_SMEM_V20_1_STRIDE 8192
-#define SMEM_SMEM_V21_0_OFF 181248
-#define SMEM_SMEM_V21_0_STAGE_BYTES 8192
-#define SMEM_SMEM_V21_0_STRIDE 8192
-#define SMEM_SMEM_V20_2_OFF 189440
-#define SMEM_SMEM_V20_2_STAGE_BYTES 8192
-#define SMEM_SMEM_V20_2_STRIDE 8192
-#define SMEM_SMEM_V21_1_OFF 189440
-#define SMEM_SMEM_V21_1_STAGE_BYTES 8192
-#define SMEM_SMEM_V21_1_STRIDE 8192
-#define SMEM_SMEM_V20_3_OFF 197632
-#define SMEM_SMEM_V20_3_STAGE_BYTES 8192
-#define SMEM_SMEM_V20_3_STRIDE 8192
-#define SMEM_SMEM_V21_2_OFF 197632
-#define SMEM_SMEM_V21_2_STAGE_BYTES 8192
-#define SMEM_SMEM_V21_2_STRIDE 8192
-#define SMEM_STAGE_DV_OFF 132096
-#define SMEM_STAGE_DV_STAGE_BYTES 16384
-#define SMEM_STAGE_DV_STRIDE 16384
-#define SMEM_STAGE_DQ_OFF 173056
-#define SMEM_STAGE_DQ_STAGE_BYTES 16384
-#define SMEM_STAGE_DQ_STRIDE 16384
-#define SMEM_STAGE_DK_OFF 189440
-#define SMEM_STAGE_DK_STAGE_BYTES 16384
-#define SMEM_STAGE_DK_STRIDE 16384
-#define SMEM_BETA_S_OFF 205824
-#define SMEM_BETA_S_STAGE_BYTES 256
-#define SMEM_BETA_S_STRIDE 256
-#define SMEM_EG_S_OFF 206080
-#define SMEM_EG_S_STAGE_BYTES 256
-#define SMEM_EG_S_STRIDE 256
-#define SMEM_RS_S_OFF 206336
-#define SMEM_RS_S_STAGE_BYTES 256
-#define SMEM_RS_S_STRIDE 256
-#define SMEM_GC_S_OFF 206592
-#define SMEM_GC_S_STAGE_BYTES 256
-#define SMEM_GC_S_STRIDE 256
-#define SMEM_RED_DG_OFF 206848
-#define SMEM_RED_DG_STAGE_BYTES 1024
-#define SMEM_RED_DG_STRIDE 1024
-#define SMEM_RED_DB_OFF 207872
-#define SMEM_RED_DB_STAGE_BYTES 1024
-#define SMEM_RED_DB_STRIDE 1024
-#define SMEM_RED_HK_OFF 208896
-#define SMEM_RED_HK_STAGE_BYTES 1024
-#define SMEM_RED_HK_STRIDE 1024
-#define SMEM_RED_HD_OFF 209920
-#define SMEM_RED_HD_STAGE_BYTES 32
-#define SMEM_RED_HD_STRIDE 32
-#define SMEM_TK_S_OFF 209984
-#define SMEM_TK_S_STAGE_BYTES 16
-#define SMEM_TK_S_STRIDE 16
-#define SMEM_TOTAL 227328
-#define THREADS 384
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -383,7 +225,7 @@ kernel_cake_gdn_det_train_3e6562c2f739184a3765(const __grid_constant__ CUtensorM
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* smem_v0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int smem_v0_addr = smem + 1024;
     __nv_bfloat16* smem_v0_0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
@@ -477,8 +319,7 @@ kernel_cake_gdn_det_train_3e6562c2f739184a3765(const __grid_constant__ CUtensorM
     unsigned int* tk_s = reinterpret_cast<unsigned int*>(smem_raw + 209984);
     const int tk_s_addr = smem + 209984;
 
-    // Mbarrier init (27 pipeline groups, 0 ordered-sequence groups, 29 barriers)
-    // Mbarriers at smem_raw[0..232)
+    // Mbarrier init (29 barriers at smem_raw[0..232))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -560,23 +401,23 @@ kernel_cake_gdn_det_train_3e6562c2f739184a3765(const __grid_constant__ CUtensorM
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_acc_dqs = taddr;
+    const unsigned int tmem_acc_dks = taddr + 64;
+    const unsigned int tmem_acc_dq = taddr + 128;
+    const unsigned int tmem_acc_dk = taddr + 192;
+    const unsigned int tmem_acc_dw = taddr + 256;
+    const unsigned int tmem_acc_da = taddr + 320;
+    const unsigned int tmem_acc_daq = taddr + 384;
+    const unsigned int tmem_acc_dvb = taddr + 384;
+    const unsigned int tmem_acc_dkgb = taddr + 256;
+    const unsigned int tmem_acc_da1 = taddr + 256;
+    const unsigned int tmem_acc_da2 = taddr + 320;
+    const unsigned int tmem_acc_dksrc = taddr + 256;
+    const unsigned int tmem_acc_x = taddr + 384;
+    const unsigned int tmem_acc_gp = taddr + 448;
 
     // Kernel post-init ops
-    const int tmem_acc_dqs = taddr;
-    const int tmem_acc_dks = taddr + 64;
-    const int tmem_acc_dq = taddr + 128;
-    const int tmem_acc_dk = taddr + 192;
-    const int tmem_acc_dw = taddr + 256;
-    const int tmem_acc_da = taddr + 320;
-    const int tmem_acc_daq = taddr + 384;
-    const int tmem_acc_dvb = taddr + 384;
-    const int tmem_acc_dkgb = taddr + 256;
-    const int tmem_acc_da1 = taddr + 256;
-    const int tmem_acc_da2 = taddr + 320;
-    const int tmem_acc_dksrc = taddr + 256;
-    const int tmem_acc_x = taddr + 384;
-    const int tmem_acc_gp = taddr + 448;
     if (warp >= 8 && warp <= 11) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 40;");
     }

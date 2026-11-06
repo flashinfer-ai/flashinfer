@@ -7366,7 +7366,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "chunks", "x_factor": 1},
-        "kernel_symbol": "kernel_cake_kda_det_train_328afe43951979e798d1",
+        "kernel_symbol": "kernel_cake_kda_det_train_ad4c93dbb0435933c8a1",
         "l2n": ["fused"],
         "launch": {
             "block": (288, 1, 1),
@@ -7375,7 +7375,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 115200,
             "use_pdl": False,
         },
-        "library": "cake_kda_det_train_328afe43951979e798d1",
+        "library": "cake_kda_det_train_ad4c93dbb0435933c8a1",
         "logical": {
             "beta": "beta_int",
             "chunk_bos": "chunk_bos",
@@ -7457,7 +7457,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "chunks", "x_factor": 1},
-        "kernel_symbol": "kernel_cake_kda_det_train_9ad80f98f22e0b3bce08",
+        "kernel_symbol": "kernel_cake_kda_det_train_a135a53a639f33f921ab",
         "l2n": ["fused"],
         "launch": {
             "block": (288, 1, 1),
@@ -7466,7 +7466,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 115200,
             "use_pdl": False,
         },
-        "library": "cake_kda_det_train_9ad80f98f22e0b3bce08",
+        "library": "cake_kda_det_train_a135a53a639f33f921ab",
         "logical": {
             "beta": "beta_int",
             "chunk_bos": "chunk_bos",

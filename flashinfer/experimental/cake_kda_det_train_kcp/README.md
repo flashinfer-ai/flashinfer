@@ -11,39 +11,6 @@ Both the API and the backend are experimental: no compatibility guarantee.
 The path is deterministic: the same inputs, hardware, plan and process group
 give bitwise the same outputs and gradients.
 
-### Names
-
-The names before the det rename stay bound to the same objects:
-`flashinfer.kda_train` (`chunk_kda_kcp`, `chunk_kda_kcp_fwd`,
-`chunk_kda_kcp_bwd`, `kcp_partition`, `build_kcp_context`,
-`kcp_workspace_bytes`, `kcp_saved_bytes`, `kcp_comm_bytes`,
-`KcpRecomputeHandle`, `KcpContext`, `KcpPartition`, `KcpOptions`,
-`KcpSaved`, `KcpWorkspace`, `kcp_reduce_gate_param_grads`), the modules
-`flashinfer.experimental.cake_kda_train.cake_kcp` / `cake_kcp_plan` /
-`cake_kcp_jit` (the same module objects) and the previous names inside
-`cake_kcp` and `cake_kcp_plan`.
-
-| previous name | det name |
-|---|---|
-| `chunk_kda_kcp_fwd` | `chunk_kda_det_fwd_kcp` |
-| `chunk_kda_kcp_bwd` | `chunk_kda_det_bwd_kcp` |
-| `chunk_kda_kcp` | `chunk_kda_det_kcp` |
-| `kcp_partition` | `partition_det_kcp` |
-| `build_kcp_context` | `build_context_det_kcp` |
-| `kcp_workspace_bytes` | `kda_det_workspace_bytes_kcp` |
-| `kcp_saved_bytes` | `kda_det_saved_bytes_kcp` |
-| `kcp_comm_bytes` | `kda_det_comm_bytes_kcp` |
-| `kcp_reduce_gate_param_grads` | `reduce_gate_param_grads_det_kcp` |
-| `KcpRecomputeHandle` | `RecomputeHandleDetKcp` |
-| `KcpWorkspace` | `WorkspaceDetKcp` |
-| `KcpSaved` | `SavedDetKcp` |
-| `KcpOptions` | `OptionsDetKcp` |
-| `KcpCall` | `CallDetKcp` |
-| `KcpContext` | `ContextDetKcp` |
-| `KcpPartition` | `PartitionDetKcp` |
-| `KcpFragment` | `FragmentDetKcp` |
-| `ChunkKDAKcpFunction` | `ChunkKDADetFunctionKcp` |
-
 ## Usage
 
 The packed batch of one training step may be split over the ranks of a
@@ -61,11 +28,11 @@ the partition's order) and return that shard's outputs and gradients:
 from flashinfer.cake_kda_det_train_kcp import (partition_det_kcp, build_context_det_kcp, chunk_kda_det_kcp,
                                   chunk_kda_det_fwd_kcp, chunk_kda_det_bwd_kcp,
                                   kda_det_workspace_bytes_kcp, kda_det_saved_bytes_kcp, kda_det_comm_bytes_kcp)
-from flashinfer.cake_causal_conv1d_train import cake_causal_conv1d_kcp
+from flashinfer.cake_causal_conv1d_det_train_kcp import cake_causal_conv1d_det_kcp
 
 part = partition_det_kcp(cu_seqlens_global_cpu, world_size)          # the same object on every rank
 ctx = build_context_det_kcp(part, group, rank, device)               # this rank's tables and collectives
-y_local = cake_causal_conv1d_kcp(x_local, conv_weight, ctx)      # the convolution before the KDA step
+y_local = cake_causal_conv1d_det_kcp(x_local, conv_weight, ctx)  # the convolution before the KDA step
 out_local = chunk_kda_det_kcp(q_local, k_local, v_local, g_local, beta_local, ctx)   # autograd
 out_local, saved = chunk_kda_det_fwd_kcp(q_local, k_local, v_local, g_local, beta_local, ctx,
                                      save_mode="light", boundary_mode="saved")
@@ -81,7 +48,7 @@ carries it costs no walk time per fragment.
 CUDA-graph replay: the three KDA entry points -- `chunk_kda_det_kcp`,
 `chunk_kda_det_fwd_kcp` and `chunk_kda_det_bwd_kcp` -- take `graph="replay"`
 (default `"off"`, the eager path); the convolution halo takes `graph=` only
-through the backend module's function, the `cake_causal_conv1d_kcp` facade
+through the backend module's function, the `cake_causal_conv1d_det_kcp` facade
 has no such parameter. The first call of a
 validity key runs eagerly, the second is captured into a CUDA graph and every
 later call of the key replays it: the same launches and collectives, bitwise
@@ -266,12 +233,12 @@ A recompute handle keeps what the original forward received instead:
 
 ```python
 from flashinfer.cake_kda_det_train_kcp import RecomputeHandleDetKcp, chunk_kda_det_kcp
-from flashinfer.cake_causal_conv1d_train import cake_causal_conv1d_kcp
+from flashinfer.cake_causal_conv1d_det_train_kcp import cake_causal_conv1d_det_kcp
 
 def layer(xq, xk, xv, g, beta, hq, hk, hv):
-    q = cake_causal_conv1d_kcp(xq, wq, ctx, recompute_handle=hq)   # "conv" entry of hq
-    k = cake_causal_conv1d_kcp(xk, wk, ctx, recompute_handle=hk)
-    v = cake_causal_conv1d_kcp(xv, wv, ctx, recompute_handle=hv)
+    q = cake_causal_conv1d_det_kcp(xq, wq, ctx, recompute_handle=hq)   # "conv" entry of hq
+    k = cake_causal_conv1d_det_kcp(xk, wk, ctx, recompute_handle=hk)
+    v = cake_causal_conv1d_det_kcp(xv, wv, ctx, recompute_handle=hv)
     ...                                                          # split heads, normalize q / k
     return chunk_kda_det_kcp(q, k, v, g, beta, ctx, recompute_handle=hq)   # "kda" entry of hq
 
@@ -309,8 +276,8 @@ others.  The phase comes from `torch._C._current_graph_task_id()`; a torch
 without it refuses the handle.
 
 One halo exchange for a layer's q / k / v convolutions:
-`cake_causal_conv1d_kcp_multi((xq, xk, xv), (wq, wk, wv), ctx)` returns the
-three outputs bitwise equal to three `cake_causal_conv1d_kcp` calls (outputs,
+`cake_causal_conv1d_det_multi_kcp((xq, xk, xv), (wq, wk, wv), ctx)` returns the
+three outputs bitwise equal to three `cake_causal_conv1d_det_kcp` calls (outputs,
 `dx` and `dweight`), but its forward and its backward each issue one halo
 collective instead of three: the history rows of the three tensors travel side
 by side in one `all_to_all_single` and are copied out after the wait, and each
@@ -320,7 +287,7 @@ the layer's `"kda"` entry, so the checkpointed layer above needs one handle:
 
 ```python
 def layer(xq, xk, xv, g, beta, h):
-    q, k, v = cake_causal_conv1d_kcp_multi((xq, xk, xv), (wq, wk, wv), ctx, recompute_handle=h)
+    q, k, v = cake_causal_conv1d_det_multi_kcp((xq, xk, xv), (wq, wk, wv), ctx, recompute_handle=h)
     ...
     return chunk_kda_det_kcp(q, k, v, g, beta, ctx, recompute_handle=h)
 
@@ -472,14 +439,21 @@ families of a phase in one launch; off by default).
 
 The files of this package:
 
-* `cake_kcp_jit.py` -- the `MODULES` registry of the eleven shipped programs (the
+* `cake_kcp_jit.py` -- the `MODULES` registry of the sixteen shipped programs (the
   fragment walks of the forward and backward state recurrences in their
   `offset` and `tape` forms, the BF16x3 transfer walk (two CTAs per segment
   and head, each over one 64-column half of the state), the affine
-  merge at `cols_per_cta` 8 and 16, and the two chunk stages of the
+  merge in one record per register-blocked build, and the two chunk stages of the
   context-parallel route, `kcp_fwd_o` (the output from the K1 tapes) and
-  `kcp_dav` (`dA_qk` and the `dv1` K2 reads); selection by `always` or by
-  `columns` on the merge's `ncols`, grids by `kcp_segments_heads`,
+  `kcp_dav` (`dA_qk` and the `dv1` K2 reads), and the fused forward walk
+  `kcp_fwdh_o` (the forward state walk with the chunk output inside it: the
+  same bits as the tape walk followed by `kcp_fwd_o`, no tape written; in its
+  full-width and two-CTA records), which the forward that keeps no tape
+  launches in place of those two; selection by `always`, by
+  `walk_form`, by `walk_heads` (the `WALK_HEADS_RULE` bands of the launch's
+  head count: the plain or the overlap-schedule full-width adjoint offset
+  walk), or by `merge_rule` (the `MERGE_RULE` bands of the merge
+  launch's 128-column chain blocks per architecture), grids by `kcp_segments_heads`,
   `kcp_chains`, `kcp_tile_items` or `kcp_pairs`), the logical vocabulary of
   the KCP arguments, `run_program(name, args, device_index=)`, the lowering
   of the host backend's walk and merge requests to the registry's launches,
@@ -499,18 +473,18 @@ The files of this package:
   tests; without the file those tests skip.  The package reads no
   environment variable.
 * `cake_build.py` + `build.json` -- the loader shared by every Cake-exported
-  package (byte-identical copies) and the manifest of the eleven shipped
+  package (byte-identical copies) and the manifest of the sixteen shipped
   programs (schema `cake-build/1`, one entry per `<library>_<arch>`);
   `aot/` is never tracked (`.gitignore`).
 * `csrc/cake_ffi_checks.h` -- the TVM-FFI helper header the bindings include.
-* `csrc/cake_kda_det_train_<digest>_kcp_{kernel,binding}.cu` of the fifteen
+* `csrc/cake_kda_det_train_<digest>_kcp_{kernel,binding}.cu` of the twenty
   context-parallel-only programs and `csrc/cake_kda_det_train_<digest>_{kernel,binding}.cu`
   of the two chunk stages (`kcp_fwd_o`, `kcp_dav`), rendered like the
   single-rank ones (digests in `build.json` and `build.test.json`).
 
 ## Status
 
-The registry holds eleven shipped programs (`cake_kcp_jit.MODULES`, in
+The registry holds sixteen shipped programs (`cake_kcp_jit.MODULES`, in
 `build.json`) and six test-only programs (`cake_kcp_jit.TEST_MODULES`, in
 `build.test.json`) for `sm_100a`, `sm_103a` and `sm_107a`.
 

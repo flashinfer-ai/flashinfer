@@ -16,7 +16,7 @@ limitations under the License.
 Benchmark of the context-parallel (KCP) Cake packed GDN training step: one
 process per rank (``torchrun --nproc_per_node N``), every rank timing the
 module boundary of its fragments -- the KCP causal convolution
-(``flashinfer.cake_causal_conv1d_det_train.cake_causal_conv1d_kcp``, 10,240
+(``flashinfer.cake_causal_conv1d_det_train_kcp.cake_causal_conv1d_det_kcp``, 10,240
 channels) followed by the KCP GDN step (``flashinfer.cake_gdn_det_train_kcp.chunk_gdn_det_kcp``)
 -- with CUDA events, the slowest rank's time counting for the iteration.
 
@@ -34,7 +34,9 @@ input storage:
   the pack is padded to a multiple of ``2 * world_size`` tokens for it and the
   padding cost is part of its time;
 * ``local``: the single-rank Cake kernels on the rank's shard as a batch of
-  its own (no exchange; the per-rank work without the boundaries);
+  its own (no exchange; the per-rank work without the boundaries): the
+  deterministic causal convolution and
+  ``flashinfer.experimental.cake_gdn_det_train.chunk_gated_delta_rule_det``;
 * ``control``: the KCP path again -- the identical-program control.
 
 Protocol: ``--groups`` groups (at least 3); in every group the arms run in the
@@ -77,7 +79,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from flashinfer.cake_causal_conv1d_det_train import (  # noqa: E402
     cake_causal_conv1d_det,
-    cake_causal_conv1d_kcp,
+)
+from flashinfer.cake_causal_conv1d_det_train_kcp import (  # noqa: E402
+    cake_causal_conv1d_det_kcp,
 )
 from flashinfer.cake_gdn_det_train_kcp import (  # noqa: E402
     build_context_det_kcp,
@@ -86,6 +90,9 @@ from flashinfer.cake_gdn_det_train_kcp import (  # noqa: E402
     gdn_det_saved_bytes_kcp,
     gdn_det_workspace_bytes_kcp,
     partition_det_kcp,
+)
+from flashinfer.experimental.cake_gdn_det_train import (  # noqa: E402
+    chunk_gated_delta_rule_det,
 )
 
 ARMS = ("cake", "fla", "local", "control")
@@ -248,7 +255,7 @@ def _cake_arm(problem: dict[str, Any], boundary: str) -> Callable[[], None]:
     local, ctx, weight = problem["local"], problem["ctx"], problem["weight"]
 
     def forward(q, k, v, g, beta, x, w):
-        y = cake_causal_conv1d_kcp(x, w, ctx)
+        y = cake_causal_conv1d_det_kcp(x, w, ctx)
         out = chunk_gdn_det_kcp(q, k, v, g, beta, ctx)
         return y, out
 
@@ -257,19 +264,25 @@ def _cake_arm(problem: dict[str, Any], boundary: str) -> Callable[[], None]:
     )
 
 
-def _local_arm(problem: dict[str, Any], boundary: str) -> Callable[[], None] | None:
-    """The single-rank Cake path on the rank's shard; absent until the CP = 1 entry point ships."""
-    try:
-        from flashinfer.cake_gdn_det_train_kcp import chunk_gdn  # type: ignore
-    except ImportError:
-        return None
+def _local_arm(problem: dict[str, Any], boundary: str) -> Callable[[], None]:
+    """The single-rank Cake path on the rank's shard: the rank's fragments as a packed batch of their own, through the
+    deterministic non-KCP GDN entry (``B = 1``, ``cu_seqlens`` on the device and on the host)."""
     local, weight = problem["local"], problem["weight"]
     cu = local["cu_seqlens"]
+    cu_cpu = cu.cpu()
 
     def forward(q, k, v, g, beta, x, w):
         y = cake_causal_conv1d_det(x, w, cu)
-        out = chunk_gdn(q, k, v, g, beta, cu)
-        return y, out
+        out, _ = chunk_gated_delta_rule_det(
+            q[None],
+            k[None],
+            v[None],
+            g[None],
+            beta[None],
+            cu_seqlens=cu,
+            cu_seqlens_cpu=cu_cpu,
+        )
+        return y, out[0]
 
     return _bounded(
         forward, lambda: _leaves(local, weight), [local["dy"], local["dout"]], boundary
@@ -394,9 +407,7 @@ def run(args, rank: int, world: int, device: torch.device) -> dict[str, Any]:
         "cake": _cake_arm(problem, args.boundary),
         "control": _cake_arm(problem, args.boundary),
     }
-    local = _local_arm(problem, args.boundary)
-    if local is not None:
-        steps["local"] = local
+    steps["local"] = _local_arm(problem, args.boundary)
     fla = _fla_arm(problem, args.boundary, args.layout, device, world, rank)
     if fla is not None:
         steps["fla"] = fla

@@ -76,6 +76,92 @@ compute_jit_cache_parallelism() {
   export MEM_PER_JOB=$mem_per_job
 }
 
+# Signal PID and everything below it: killing only a background subshell leaves
+# its `python -m build`, ninja and nvcc children running.
+_kill_process_tree() {
+  local pid=$1 child
+  for child in $(pgrep -P "$pid" 2>/dev/null || true); do
+    _kill_process_tree "$child"
+  done
+  kill "$pid" 2>/dev/null || true
+}
+
+# The pool's polling runs with xtrace off: callers use `set -x`, and a trace of
+# every 0.2 s check would bury the build output. Restoring is done by each helper.
+#
+# Collect the status of items that have finished, without blocking. Works on the
+# caller's `pids` (items still counted as running) and `failed` variables: bash
+# forgets finished jobs in `jobs`, so the pids are tracked here. A pid is waited
+# for exactly once, so its status is never lost or read twice.
+_reap_finished_items() {
+  { local pid alive=() xtrace=0; [[ $- == *x* ]] && xtrace=1; set +x; } 2>/dev/null
+  for pid in ${pids[@]+"${pids[@]}"}; do
+    if kill -0 "$pid" 2>/dev/null; then
+      alive+=("$pid")
+    else
+      wait "$pid" || failed=1
+    fi
+  done
+  pids=(${alive[@]+"${alive[@]}"})
+  if (( xtrace )); then set -x; fi
+  return 0
+}
+
+# Block until a slot is free or an item has failed (`failed` is set then).
+# Uses the caller's `limit`, `pids` and `failed`.
+_wait_for_free_slot() {
+  { local xtrace=0; [[ $- == *x* ]] && xtrace=1; set +x; } 2>/dev/null
+  while :; do
+    _reap_finished_items
+    if (( failed || ${#pids[@]} < limit )); then break; fi
+    sleep 0.2
+  done
+  if (( xtrace )); then set -x; fi
+  return 0
+}
+
+# Block until every item has finished or one has failed.
+_wait_for_all_items() {
+  { local xtrace=0; [[ $- == *x* ]] && xtrace=1; set +x; } 2>/dev/null
+  while (( ${#pids[@]} > 0 && ! failed )); do
+    sleep 0.2
+    _reap_finished_items
+  done
+  if (( xtrace )); then set -x; fi
+  return 0
+}
+
+# Run "FUNCTION ITEM" for every ITEM, at most CONCURRENCY at a time, as a pool: a
+# finished item frees its slot for the next one. Output of different items
+# interleaves, so FUNCTION should prefix its own lines. On the first failure,
+# including one after the last item has started, the running items are killed
+# with their descendants and no more start. Finished items are polled every
+# 0.2 s, which is negligible against builds that take minutes.
+#
+# Args: $1 - CONCURRENCY (>= 1), $2 - function name, $3... - items.
+# Returns 0 when every item succeeded, else 1.
+run_bounded_parallel() {
+  local limit=$1 fn=$2
+  shift 2
+  local item pid failed=0 pids=()
+  for item in "$@"; do
+    _wait_for_free_slot
+    if (( failed )); then break; fi
+    "$fn" "$item" &
+    pids+=($!)
+  done
+  # Drain what is still running, stopping it at the first failure.
+  _wait_for_all_items
+  if (( failed )); then
+    for pid in ${pids[@]+"${pids[@]}"}; do _kill_process_tree "$pid"; done
+  fi
+  # Reaps the killed items.
+  for pid in ${pids[@]+"${pids[@]}"}; do
+    wait "$pid" || failed=1
+  done
+  return $failed
+}
+
 # Verify that the selected compiler matches the CUDA matrix entry.
 #
 # Args:
@@ -282,10 +368,15 @@ install_sccache() {
 # Reads (optional): SCCACHE_REGION, SCCACHE_STATS_DIR,
 # AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY.
 # Sets/exports: SCCACHE_*, FLASHINFER_NVCC_LAUNCHER, FLASHINFER_CXX_LAUNCHER.
+# Launchers and ACTIVE are enabled only after startup and zero-stats succeed.
+# Each setup starts a new stats session, discarding inherited runtime state.
 setup_sccache() {
   local key_prefix=$1
   local source_root=$2
   local sccache_arch
+  local setup_status
+  unset FLASHINFER_CXX_LAUNCHER FLASHINFER_NVCC_LAUNCHER
+  unset FLASHINFER_SCCACHE_ACTIVE FLASHINFER_SCCACHE_STATS_COLLECTED
   sccache_arch=$(uname -m)
   if [ "$(sccache --version 2>/dev/null)" = "sccache ${SCCACHE_VERSION}" ]; then
     # Already installed (e.g. by run_with_test_sccache.sh's fail-open probe).
@@ -304,8 +395,6 @@ setup_sccache() {
   # /proc system-wide, including daemon-owned compilers, and docker --rm is the
   # final containment boundary if the watchdog cannot signal one of them.
   unset SCCACHE_CLIENT_SIDE
-  export FLASHINFER_CXX_LAUNCHER="sccache"
-  export FLASHINFER_NVCC_LAUNCHER="sccache"
 
   # Avoid leaking AWS credentials under set -x.
   local _sccache_xtrace=0
@@ -322,10 +411,20 @@ setup_sccache() {
   fi
   (( _sccache_xtrace )) && set -x
 
-  # Explicit return: a caller that guards setup_sccache with `if` runs it with
-  # errexit off, and must still see a failed startup.
-  sccache --start-server || return $?
-  sccache --zero-stats
+  # Explicit returns: a caller that guards setup_sccache with `if` runs it with
+  # errexit off, and must still see failed control commands.
+  sccache --start-server || {
+    setup_status=$?
+    stop_sccache_after_setup_failure
+    return "${setup_status}"
+  }
+  sccache --zero-stats || {
+    setup_status=$?
+    stop_sccache_after_setup_failure
+    return "${setup_status}"
+  }
+  export FLASHINFER_CXX_LAUNCHER="sccache"
+  export FLASHINFER_NVCC_LAUNCHER="sccache"
   export FLASHINFER_SCCACHE_ACTIVE=true
   echo "sccache version: $(sccache --version)"
   echo "sccache install source: ${FLASHINFER_SCCACHE_INSTALL_SOURCE}"
@@ -356,6 +455,13 @@ setup_sccache() {
       printf 'cuda_version=%s\n' "${CUDA_VERSION:-unknown}"
       printf 'cuda_arch_list=%s\n' "${FLASHINFER_CUDA_ARCH_LIST:-unknown}"
     } > "${SCCACHE_STATS_DIR}/sccache-metadata.txt"
+  fi
+}
+
+# Best-effort cleanup must not mask the original setup failure.
+stop_sccache_after_setup_failure() {
+  if ! run_sccache_control_command --stop-server >/dev/null 2>&1; then
+    echo "WARNING: Failed to stop sccache after setup failure; daemon may remain running" >&2
   fi
 }
 

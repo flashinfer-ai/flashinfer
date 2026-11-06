@@ -316,7 +316,7 @@ def test_multi_recompute_handle_misuse_raises() -> None:
         conv_kcp._handle_hists(h.entries["conv"], xs[:2], ctx)
     with pytest.raises(ValueError, match="hist"):
         conv_kcp._handle_hist(h.entries["conv"], xs[0], ctx)
-    with pytest.raises(ValueError, match="KcpContext"):
+    with pytest.raises(ValueError, match="ContextDetKcp"):
         other, _, _, _ = _problem((5000, 1003), (1, 2, 4997, 1003), (512,), device)
         conv_kcp._handle_hists(h.entries["conv"], xs, other)
     bound = conv_kcp._handle_hists(h.entries["conv"], xs, ctx)
@@ -415,8 +415,8 @@ def test_multi_one_rank_issues_no_exchange(monkeypatch) -> None:
 
 def test_facade_multi_entry_is_lazy_and_keyword_only() -> None:
     """The KCP facade's ``cake_causal_conv1d_det_multi_kcp`` is exported, takes ``recompute_handle`` and ``cooperative``
-    keyword-only (default ``None``), is the det facade's previous ``cake_causal_conv1d_kcp_multi``, and importing either facade
-    still does not import the KCP host modules (fresh interpreter)."""
+    keyword-only (default ``None``), the single-rank det facade binds no ``cake_causal_conv1d_kcp_multi`` (the name before
+    the det rename), and importing either facade still does not import the KCP host modules (fresh interpreter)."""
     import subprocess
     import sys
 
@@ -431,7 +431,7 @@ def test_facade_multi_entry_is_lazy_and_keyword_only() -> None:
         "for n in ('recompute_handle', 'cooperative'):\n"
         "    p = s[n]\n"
         "    assert p.kind is inspect.Parameter.KEYWORD_ONLY and p.default is None, n\n"
-        "assert d.cake_causal_conv1d_kcp_multi is f.cake_causal_conv1d_det_multi_kcp\n"
+        "assert not hasattr(d, 'cake_causal_conv1d_kcp_multi')\n"
         "assert 'cake_causal_conv1d_det_multi_kcp' in f.__all__ and kcp not in sys.modules\n"
         "print('FACADE_MULTI_OK')\n"
     )

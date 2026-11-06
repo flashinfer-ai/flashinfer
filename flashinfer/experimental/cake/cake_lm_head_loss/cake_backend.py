@@ -262,8 +262,8 @@ from typing import (
 )
 
 import torch
-import torch.utils.checkpoint as _torch_checkpoint
 import torch.utils._python_dispatch as _torch_dispatch
+import torch.utils.checkpoint as _torch_checkpoint
 
 from .cake_jit import (
     BASE_STAGES,
@@ -289,8 +289,10 @@ GRAD_WEIGHT_DTYPES = (torch.bfloat16, torch.float32)
 # ``mode`` scalar of ``row_finalize`` / ``loss_reduce``: which per-row quantities the stage forms.
 MODE_CE, MODE_POLICY, MODE_EXTERNAL, MODE_NONE = 0, 1, 2, 3
 WORKSPACE_ALIGN = 256
-# One registry record and its build.json libraries per architecture (SM107 runs SM103's programs, built for sm_107a,
-# under the base dispatch rules: no per-architecture rule table lists sm_107a).
+# One registry record and its build.json libraries per architecture (SM107 runs SM103's programs, built for sm_107a;
+# the per-architecture GEMM tile rule tables give sm_107a the sm_103a entries, except DX_LONG_CHUNK_STAGES; the
+# zero-gradient row skip has R200-timed sm_107a entries: the 1946-row floor of ZERO_DLOGP_MIN_ROWS_BY_ARCH and the
+# two-slice counted dX of DX_COUNTED_MIN_SLICES_BY_ARCH).
 SUPPORTED_COMPUTE_CAPABILITIES = {
     (10, 0): "sm_100a",
     (10, 3): "sm_103a",
@@ -375,6 +377,12 @@ STAGE_TENSORS = {
         stage: ("A", "B", "C", "STATS_OUT", "WS", "CNT")
         for stage in GEMM_STAGES
         if stage.endswith("_dcnt")
+    },
+    # the accumulate's cast at the last live chunk also reads the next chunk's count cell
+    **{
+        stage: ("A", "B", "C", "STATS_OUT", "WS", "CNT", "CNT_NEXT")
+        for stage in GEMM_STAGES
+        if stage.startswith("gemm_dw_acc") and stage.endswith("_lc_dcnt")
     },
     "gemm_logits_dz_dcnt": (
         "A",
@@ -650,20 +658,28 @@ RASTER_RULE_MIN_ROWS = 2049
 RASTER_WIDE_GROUPS = {
     "sm_100a": (16, 32),
     "sm_103a": (16, 32),
+    "sm_107a": (16, 32),
 }  # (logits group_m, weight-gradient group_m) of the wide geometries, per architecture
 DW_LONG_CHUNK_GROUP_M = 16  # weight-gradient group_m of the long chunks (>= DW_LONG_CHUNK_MIN_ROWS rows) below RASTER_RULE_MIN_HIDDEN
 DW_LONG_CHUNK_GROUPS = {
     "sm_100a": DW_LONG_CHUNK_GROUP_M,
     "sm_103a": DW_LONG_CHUNK_GROUP_M,
+    "sm_107a": DW_LONG_CHUNK_GROUP_M,
 }  # the same height on every supported architecture (the kernel source keeps a per-architecture table; the export mirrors it)
 DW_LONG_CHUNK_MIN_ROWS = 4097
 LOGITS_LONG_RASTER_GROUPS = {
     "sm_100a": 16,
     "sm_103a": 16,
+    "sm_107a": 16,
 }  # logits group_m of the GLM-class chunks of >= LOGITS_LONG_RASTER_MIN_ROWS rows below RASTER_RULE_MIN_HIDDEN, per architecture
 LOGITS_LONG_RASTER_MIN_ROWS = (
     3841  # 30 row tiles of 128 + 1: the first chunk size with 31 row tiles
 )
+# sm_107a is not listed: its long chunks keep the table ring depth (DX_WIDE_TILE_STAGES).  Timed on FlashInfer main
+# f2a5262c (#8612) with the sm_107a table entries patched in at run time (PyTorch 2.14.1+cu130, nvcc 13.4), CUPTI
+# per-launch cycles at z = 0, one run on each of three 212-SM R200 nodes, T 16231, C 8192, cross-entropy and plain /
+# temperature log-prob: the dX GEMM launches of a call took 18853-19014 kcycles in total on the 3-deep ring and
+# 17851-18145 kcycles on the 4-deep ring (the split-tail dX form the shipped tables select).
 DX_LONG_CHUNK_STAGES = {
     "sm_100a": 3,
     "sm_103a": 3,
@@ -672,6 +688,7 @@ DX_WIDE_TILE_STAGES = 4  # the 512-wide dX tile's table ring depth (an explicit 
 DW_BLOCK_GROUPS = {
     "sm_100a": 12,
     "sm_103a": 12,
+    "sm_107a": 12,
 }  # column tiles per raster block of the weight-gradient accumulate / fp32 fused cast at the C 4096 chunk, per architecture
 DW_BLOCK_MIN_ROWS = RASTER_RULE_MIN_ROWS  # 2049
 DW_BLOCK_MAX_ROWS = (
@@ -700,12 +717,16 @@ DX_K_SLICES_MAX = 4  # the deterministic slice rule's largest count (:func:`reco
 DX_SPLIT_ARCHES = (
     "sm_100a",
     "sm_103a",
+    "sm_107a",
 )
 DX_SPLIT_LONG_RING_ARCHES = (
     "sm_103a",
-)  # architectures whose long-chunk ring (``_st3``) also takes the split (the deterministic package's list)
+    "sm_107a",
+)  # architectures whose long-chunk ring (``_st3``) also takes the split (the deterministic package's list, plus sm_107a,
+#    where only an explicit ``stages`` pin selects the ring)
 DX_SPLIT_WHOLE_ARCHES: tuple[str, ...] = (
     "sm_103a",
+    "sm_107a",
 )  # whole-tile chunks below RASTER_RULE_MIN_HIDDEN split in every call
 DX_SPLIT_WHOLE_FEW_CHUNKS_ARCHES: tuple[str, ...] = (
     "sm_100a",
@@ -716,7 +737,7 @@ DX_TOKEN_TILE = 512  # rows of a whole dX token tile (:func:`dx_whole_tiles`)
 # of whole 512-token tiles of a cross-entropy loss call of >= DW_STREAM_MIN_CHUNKS chunks (:func:`dx_swab_rule`), ahead
 # of the split-tail rule and of the H >= RASTER_RULE_MIN_HIDDEN base form.  Bitwise: the same bf16 products summed
 # over the same K slices in the same K order.
-DX_SWAB_ARCHES: tuple[str, ...] = ("sm_103a",)
+DX_SWAB_ARCHES: tuple[str, ...] = ("sm_103a", "sm_107a")
 _TUNING_KNOBS = {
     "logits": ("group_m",),
     "dx": ("k_slices", "tile_n", "stages", "split", "swap_ab"),
@@ -725,7 +746,7 @@ _TUNING_KNOBS = {
 _STAGE_RE = re.compile(
     r"(?P<base>" + "|".join(sorted(BASE_STAGES, key=len, reverse=True)) + r")"
     r"(?P<mcnt>_mcnt)?(?:_tn(?P<tile>\d+))?(?:_st(?P<stages>\d+))?(?P<split>_split)?(?P<swab>_swab)?"
-    r"(?P<gn>_gn)?(?P<tma>_tma)?(?P<dcnt>_dcnt)?(?P<tau>_tau)?"
+    r"(?P<gn>_gn)?(?P<tma>_tma)?(?P<lc>_lc)?(?P<dcnt>_dcnt)?(?P<tau>_tau)?"
 )
 STAGE_KNOBS = (
     "count",
@@ -735,6 +756,7 @@ STAGE_KNOBS = (
     "swab",
     "blocked",
     "epi_store",
+    "live_cast",
     "dcnt",
     "temperature",
 )
@@ -748,6 +770,15 @@ STAGE_KNOBS = (
 # The bases that have the form (not the swapped dX tile, not the accumulate's TMA epilogue; the bf16 fused cast's TMA
 # store has it too, :data:`DW_CAST_TMA_DCNT_STAGE`):
 DCNT_BASES = ("gemm_logits_dz", "gemm_dx_red", "gemm_dw_acc", "gemm_dw_cast_bf16")
+# The cast at the last live chunk (``_lc``, before ``_dcnt``; :attr:`Plan.live_cast`): under the skip the live rows of a
+# backward's chunks are a prefix (:func:`zero_dlogp_partition`), so the counted weight-gradient accumulate of every
+# chunk but the last reads the next chunk's count cell too (``CNT_NEXT``): with a live next chunk it adds its FP32 tile
+# into the sum as the counted accumulate does; else it writes ``bf16(g * (sum + tile))`` (``bf16(g * tile)`` on a first
+# chunk) into the bf16 gradient and leaves the sum, and the counted deferred cast of the last chunk (per-thread or TMA
+# store) writes nothing when that chunk has no K step.  So exactly one program writes the gradient and a backward whose
+# trailing chunks hold no live row runs no cast-only pass.  The bases that have the form (the accumulate on its 1-D or
+# 2-D raster, not its TMA epilogue; the bf16 fused cast in both stores):
+DW_LIVE_CAST_BASES = ("gemm_dw_acc", "gemm_dw_cast_bf16")
 
 
 def stage_variant(
@@ -760,10 +791,11 @@ def stage_variant(
     swab: bool = False,
     blocked: bool = False,
     epi_store: Optional[str] = None,
+    live_cast: bool = False,
     dcnt: bool = False,
 ) -> str:
     """Stage name of one structural form of ``base``: the rule outputs that select a kernel body, in the fixed suffix
-    order ``_mcnt``, ``_tn256``, ``_st<stages>``, ``_split``, ``_swab``, ``_gn``, ``_tma``, ``_dcnt``; ``split``: the wide
+    order ``_mcnt``, ``_tn256``, ``_st<stages>``, ``_split``, ``_swab``, ``_gn``, ``_tma``, ``_lc``, ``_dcnt``; ``split``: the wide
     dX tile with its last wave's trailing items run as half items (:func:`dx_split_rule`); ``swab``: the wide dX tile
     with swapped operands at the table ring depth (:func:`dx_swab_rule`); a default output (the host-bound row
     count, the wide tile, the table ring depth, the 1-D raster, the default epilogue) adds nothing, so
@@ -774,7 +806,8 @@ def stage_variant(
     (``group_n`` set); ``epi_store="tma"``: the weight-gradient accumulate's TMA reduce-add or the bf16 fused cast's
     TMA store (:func:`dw_cast_tma_rule`); ``dcnt``: the form bounded by the device count of the chunk's live rows
     (:data:`DCNT_BASES`, the zero-gradient row skip; the bf16 fused cast's TMA store has one too,
-    :data:`DW_CAST_TMA_DCNT_STAGE`).  The slice count, the raster height and the block width
+    :data:`DW_CAST_TMA_DCNT_STAGE`); ``live_cast``: the cast at the last live chunk of a counted weight-gradient form
+    (:data:`DW_LIVE_CAST_BASES`, with ``dcnt`` only).  The slice count, the raster height and the block width
     themselves are launch scalars (:func:`gemm_scalars`), not part of the name."""
     if base not in BASE_STAGES:
         raise ValueError(f"unknown base stage {base!r}")
@@ -827,11 +860,25 @@ def stage_variant(
                 f"{base}: the only epilogue variants are the weight-gradient accumulate's TMA reduce-add and the bf16 fused cast's TMA store, got {epi_store!r}"
             )
         name += "_tma"
+    if live_cast:
+        if (
+            not dcnt
+            or base not in DW_LIVE_CAST_BASES
+            or (name.endswith("_tma") and base != "gemm_dw_cast_bf16")
+        ):
+            raise ValueError(
+                f"{base}: the cast at the last live chunk exists for the counted forms of {DW_LIVE_CAST_BASES} only "
+                "(not the accumulate's TMA epilogue)"
+            )
+        name += "_lc"
     if dcnt:
         if (
             base not in DCNT_BASES
             or swab
-            or (name.endswith("_tma") and base != "gemm_dw_cast_bf16")
+            or (
+                name.removesuffix("_lc").endswith("_tma")
+                and base != "gemm_dw_cast_bf16"
+            )
         ):
             raise ValueError(
                 f"{base}: the device-count row bound exists for {DCNT_BASES} only (not the swapped or the accumulate's TMA-epilogue forms)"
@@ -879,6 +926,7 @@ def _parse_stage(stage: str) -> tuple[str, tuple[tuple[str, Any], ...]]:
         swab=bool(m["swab"]),
         blocked=bool(m["gn"]),
         epi_store="tma" if m["tma"] else None,
+        live_cast=bool(m["lc"]),
         dcnt=bool(m["dcnt"]),
         temperature=bool(m["tau"]),
     )
@@ -888,7 +936,7 @@ def _parse_stage(stage: str) -> tuple[str, tuple[tuple[str, Any], ...]]:
 
 
 def parse_stage(stage: str) -> tuple[str, dict[str, Any]]:
-    """``(base, {count, tile_n, stages, split, swab, blocked, epi_store, dcnt, temperature})`` of a stage name (the inverse of
+    """``(base, {count, tile_n, stages, split, swab, blocked, epi_store, live_cast, dcnt, temperature})`` of a stage name (the inverse of
     :func:`stage_variant`; the knob keys are ``STAGE_KNOBS``)."""
     base, knobs = _parse_stage(stage)
     return base, dict(knobs)
@@ -1956,6 +2004,43 @@ def plan_dx_slices(
     return ()
 
 
+# Under the zero-gradient row skip (:data:`DCNT_BASES`) the smallest dX slice count of a chunk, per architecture (an
+# architecture not listed keeps the slice rule's counts).  The one-slice plain store has no counted form: it computes
+# every row of its chunk, a chunk past the live rows included, while the K-sliced reduction's counted form skips the
+# work items past the chunk's count.  So a counted plan runs its one-slice chunks as two-slice reductions
+# (:func:`counted_dx_slices`).  sm_107a takes the rule with its 1946-row floor, the two timed together on R200
+# (:data:`ZERO_DLOGP_MIN_ROWS_BY_ARCH`).
+DX_COUNTED_MIN_SLICES_BY_ARCH: dict[str, int] = {
+    "sm_100a": 2,
+    "sm_103a": 2,
+    "sm_107a": 2,
+}
+
+
+def counted_dx_slices(
+    slices: tuple[int, ...],
+    *,
+    arch: Optional[str],
+    dx_max_slices: int,
+    k_iters: int,
+    tuning: dict[str, dict[str, Any]],
+) -> tuple[int, ...]:
+    """The per-chunk dX slice counts of a plan under the zero-gradient row skip: ``slices`` (:func:`plan_dx_slices`)
+    with every count below ``arch``'s :data:`DX_COUNTED_MIN_SLICES_BY_ARCH` entry raised to it.  ``slices`` itself
+    when ``arch`` has no entry, when the record serves fewer slices (``dx_max_slices``), when that many slices do not
+    all hold one of the ``k_iters`` K steps (:func:`dx_slices_fit`) or when ``tuning`` pins the dX slice count."""
+    least = DX_COUNTED_MIN_SLICES_BY_ARCH.get(arch, 1) if arch is not None else 1
+    if (
+        least <= 1
+        or not slices
+        or "k_slices" in tuning.get("dx", {})
+        or int(dx_max_slices) < least
+        or dx_slices_fit(least, k_iters) != least
+    ):
+        return slices
+    return tuple(max(int(s), least) for s in slices)
+
+
 def _dx_fill(values: dict[str, Any]) -> None:
     """Fill the rows of ``dX_acc`` the call's K-sliced reduction launches add into with :data:`DX_FILL_VALUE` (host side,
     one ``fill_`` launch on the caller's stream: capturable, no allocation)."""
@@ -2927,30 +3012,117 @@ def set_zero_weight_min_rows(rows: int) -> int:
 # The smallest log-probability backward (rows of its chunk loop) that runs the zero-gradient row skip
 # (:func:`set_zero_dlogp_min_rows`, no environment variable; ``None`` = never).  The skip orders the rows on the device
 # (one partition launch per call, no host synchronization) at the start of the backward, where the GPU waits for the
-# host; a backward of one default chunk is too short to repay that host time, so the default floor is one row above
-# one default chunk and a smaller call keeps the shipped backward.
+# host.  The generic floor is one row above one default chunk: a smaller call keeps the shipped backward on an
+# architecture without a floor of its own (:data:`ZERO_DLOGP_MIN_ROWS_BY_ARCH`).
 ZERO_DLOGP_MIN_ROWS_DEFAULT: Optional[int] = DEFAULT_CHUNK_SIZE + 1
-_ZERO_DLOGP_MIN_ROWS: dict[str, Optional[int]] = {"rows": ZERO_DLOGP_MIN_ROWS_DEFAULT}
+# Per-architecture default floors (valid rows); an architecture not listed uses :data:`ZERO_DLOGP_MIN_ROWS_DEFAULT`.
+# Timed on FlashInfer PR #8687 at its commit 6ab51864 (PyTorch 2.14.1+cu130, nvcc 13.4), plain and temperature
+# log-probability, cooled and after an idle gap, against the same head with the skip off: ratio = time without the
+# skip / time with it, with its CI95.
+# B200 (sm_100a), floor 1946 valid rows (T = 2048 with 5 % ignored rows): with no zero-gradient row, of the backward,
+# step and checkpointed step of 1946 and 3891 valid rows none is slower under the timing rule (CI95 below
+# 1 - max(1 %, A/A)); the lowest point ratio is 0.984 [0.974, 0.996] (temperature backward, 1946 valid rows, cooled).
+# GB300 (sm_103a), floor 3891 valid rows (T = 4096): at 3891 valid rows none is slower under the timing rule; the
+# lowest point ratio is 0.989 [0.985, 0.994] (temperature backward, cooled).  At 1946 valid rows the GB300
+# temperature backward with no zero-gradient row has point ratio 0.981 [0.978, 0.990] (the CI95 crosses the band
+# edge) and 0.984 on each of two clusters alone (each CI95 below the band, fewer steps than the rule needs), so the
+# GB300 floor is 3891.  With 16.6 % zero-gradient rows the step at the shipped floors is 4.6 % to 10.6 % faster on
+# B200 (1946 and 3891 valid rows) and 8.8 % to 9.5 % faster on GB300 (3891 valid rows), each faster under the timing
+# rule.
+# R200 (sm_107a), floor 1946 valid rows with the two-slice counted dX rule (:data:`DX_COUNTED_MIN_SLICES_BY_ARCH`).
+# The two were chosen together by timing on FlashInfer main ed5b3885 with both set at run time (backward, step and
+# checkpointed step of 1100, 1946 and 3891 valid rows: none slower on either R200 board), then timed in this code at
+# commit 237877ca (PyTorch 2.14.1+cu130, nvcc 13.4), cooled, against the same code without its two sm_107a entries
+# (FlashInfer main d3e87763: the generic floor and the slice rule's dX counts), the 212-SM and the 216-SM R200 board
+# each alone, two machines each: ratio = time without the entries / time with them, with its CI95.  Plain, per-token
+# and scalar temperature log-probability, T = 4600 to 65031 with 0, 16.6 % and 50 % zero-gradient rows (195 cells of
+# the forward, backward, step and checkpointed step per board): none is slower under the timing rule; 21 cells on the
+# 212-SM board and 30 on the 216-SM board are faster, all with zero-gradient rows, up to 1.2225 [1.2158, 1.2342] and
+# 1.2562 [1.2493, 1.2659] (per-token temperature backward, 15419 valid rows, chunk 2048, 50 % zero-gradient rows).
+# The lowest point ratio is 0.9913 [0.9760, 1.0077] on the 212-SM board (checkpointed step, 8550 valid rows, 50 %
+# zero-gradient rows; band 2.35 %) and 0.9815 [0.9751, 1.0000] on the 216-SM board (per-token temperature forward,
+# 61779 valid rows, 50 %; band 1.88 %).  At T = 4600 with 4000 valid rows (on the skip with this floor, off it with
+# the generic one), plain and per-token temperature, none of the 18 cells of the forward, backward and step is slower:
+# with no zero-gradient row the lowest point ratio is 0.9814 [0.9665, 0.9929] on the 212-SM board (plain backward;
+# band 2.23 %) and 0.9973 [0.9951, 0.9993] on the 216-SM board (temperature backward); with 16.6 % and 50 %
+# zero-gradient rows the backward reads 1.0678 to 1.8747 on the 212-SM board and 1.1087 to 1.8036 on the 216-SM
+# board, the step 1.0536 to 1.4244 and 1.0764 to 1.4940, each faster.
+ZERO_DLOGP_MIN_ROWS_BY_ARCH: dict[str, int] = {
+    "sm_100a": 1946,
+    "sm_103a": 3891,
+    "sm_107a": 1946,
+}
 
 
-def zero_dlogp_min_rows() -> Optional[int]:
+class _ArchDefaultFloor:
+    """The type of :data:`ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT`, one object per process: a copy, a deep copy and a pickle
+    round trip give that object back, and :func:`set_zero_dlogp_min_rows` stores it for any value of this type."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT"
+
+    def __reduce__(self) -> str:
+        return "ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT"
+
+    def __copy__(self) -> "_ArchDefaultFloor":
+        return ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT
+
+    def __deepcopy__(self, memo: dict) -> "_ArchDefaultFloor":
+        return ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT
+
+
+# The floor setting "no override" (:func:`set_zero_dlogp_min_rows`): each device uses its architecture's default floor.
+# ``set_zero_dlogp_min_rows`` returns it when no override was set, and passing it back restores that state.
+ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT = _ArchDefaultFloor()
+_ZERO_DLOGP_MIN_ROWS: dict[str, Any] = {"rows": ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT}
+# Per CUDA device index: its architecture tag (:func:`arch_for`; ``""`` when unsupported), resolved once per device.
+_ZERO_DLOGP_ARCH: dict[int, str] = {}
+
+
+def zero_dlogp_min_rows(device: Optional[int] = None) -> Optional[int]:
     """The smallest log-probability backward (rows of its chunk loop) that runs the zero-gradient row skip, ``None`` =
-    never (:func:`set_zero_dlogp_min_rows`; default :data:`ZERO_DLOGP_MIN_ROWS_DEFAULT`)."""
-    return _ZERO_DLOGP_MIN_ROWS["rows"]
+    never: the override of :func:`set_zero_dlogp_min_rows` when one is set, else the default floor -- of CUDA device
+    index ``device`` (its architecture's, :data:`ZERO_DLOGP_MIN_ROWS_BY_ARCH`), or the generic
+    :data:`ZERO_DLOGP_MIN_ROWS_DEFAULT` without a device."""
+    rows = _ZERO_DLOGP_MIN_ROWS["rows"]
+    if rows is not ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT:
+        return rows
+    if device is None:
+        return ZERO_DLOGP_MIN_ROWS_DEFAULT
+    arch = _ZERO_DLOGP_ARCH.get(device)
+    if arch is None:
+        arch = _ZERO_DLOGP_ARCH.setdefault(
+            device, arch_for(torch.device("cuda", device)) or ""
+        )
+    return ZERO_DLOGP_MIN_ROWS_BY_ARCH.get(arch, ZERO_DLOGP_MIN_ROWS_DEFAULT)
 
 
-def set_zero_dlogp_min_rows(rows: Optional[int]) -> Optional[int]:
-    """Set the smallest log-probability backward (rows of its chunk loop) that runs the zero-gradient row skip for the
-    following calls of this process (``0``: every eligible call; ``None``: never) and return the previous value.  Read
-    once per call; the binding key holds whether a call runs it."""
-    if rows is not None and (
-        isinstance(rows, bool) or int(rows) != rows or int(rows) < 0
+def set_zero_dlogp_min_rows(
+    rows: Union[Optional[int], _ArchDefaultFloor],
+) -> Union[Optional[int], _ArchDefaultFloor]:
+    """Set the smallest log-probability backward (rows of its chunk loop) that runs the zero-gradient row skip on every
+    architecture for the following calls of this process (``0``: every eligible call; ``None``: never;
+    :data:`ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT`: no override, each architecture's default floor; any value of its type, a
+    copy or an unpickled one included, stores that object) and return the previous setting, which passed back restores
+    it exactly.  Read once per call; the binding key holds whether a call runs it."""
+    if (
+        rows is not None
+        and not isinstance(rows, _ArchDefaultFloor)
+        and (isinstance(rows, bool) or int(rows) != rows or int(rows) < 0)
     ):
         raise ValueError(
-            f"zero-dlogp min rows must be None or a non-negative integer, got {rows!r}"
+            "zero-dlogp min rows must be None, a non-negative integer or ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT, "
+            f"got {rows!r}"
         )
     previous = _ZERO_DLOGP_MIN_ROWS["rows"]
-    _ZERO_DLOGP_MIN_ROWS["rows"] = None if rows is None else int(rows)
+    if rows is None:
+        _ZERO_DLOGP_MIN_ROWS["rows"] = None
+    elif isinstance(rows, _ArchDefaultFloor):
+        _ZERO_DLOGP_MIN_ROWS["rows"] = ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT
+    else:
+        _ZERO_DLOGP_MIN_ROWS["rows"] = int(rows)
     return previous
 
 
@@ -3773,6 +3945,11 @@ class Plan:
     # reductions and the weight-gradient GEMMs run their ``_dcnt`` forms, bounded by the per-chunk device counts
     # ``t["dcnt"]`` of the rows the call ordered first (:func:`zero_dlogp_partition`)
     dcnt: bool = False
+    # the cast at the last live chunk (:data:`DW_LIVE_CAST_BASES`, ``_lc``) of a counted plan of two chunks or more with
+    # the fused bf16 weight-gradient cast: every accumulate but the last chunk's runs its ``_lc`` form and the deferred
+    # cast its ``_lc`` form.  Set by the log-probability backward's eager skip path only (:func:`make_plan` resolves
+    # it, ``_skip_forms``); a runner of the public entry points never runs it, so its ``dw_acc`` keeps its meaning
+    live_cast: bool = False
     # the plan runs the temperature forms (:class:`_TemperaturePlan`, :func:`make_plan_temperature`).  A class
     # attribute, not a field: a plan without a temperature is built as before
     temperature: ClassVar[bool] = False
@@ -3838,6 +4015,7 @@ class Plan:
             "gemm_dw_acc",
             blocked=v.dw_group_n is not None,
             epi_store=v.dw_epi_store,
+            live_cast=self.live_cast,
             dcnt=self.dcnt,
         )
 
@@ -3941,6 +4119,7 @@ class Plan:
                 epi_store="tma"
                 if v.dw_cast_tma
                 else None,  # the TMA form of the bf16 cast (dw_cast_tma_rule)
+                live_cast=self.live_cast,
                 dcnt=self.dcnt,
             )
         return "scale_cast_f32" if fp32 else "scale_cast_bf16"
@@ -3970,6 +4149,7 @@ class _TemperaturePlan(Plan):
         zero-gradient row skip are checked on the plan itself (:class:`_CountedTemperaturePlan` keeps it on)."""
         values = {f.name: getattr(self, f.name) for f in fields(self)}
         values["dcnt"] = False
+        values["live_cast"] = False
         return self.plain(**values)
 
     def hidden_logits_stage(self) -> str:
@@ -4099,6 +4279,7 @@ def make_plan(
     logprob_keep: bool = False,
     dcnt: bool = False,
     counted_tma_cast: bool = True,
+    live_cast: bool = False,
 ) -> Plan:
     """The chunk schedule; ``dx_max_slices`` > 1 (the K-sliced reduction form registered) picks each chunk's slice count
     with :func:`dx_slices` under ``dx_slice_policy`` (``None`` = :func:`dx_slice_policy`; ``dx_resident`` = the device's
@@ -4115,10 +4296,14 @@ def make_plan(
     ``logprob_lbl`` (a log-probability plan of a record that registers them) run the entry's logits GEMM arms
     (:attr:`Plan.logprob_dz`, :attr:`Plan.logprob_lbl`).  ``logprob_keep`` (a log-probability plan, a registered
     program): the kept-logits plan (:class:`_KeptPlan`), which runs neither arm.  ``dcnt`` (a log-probability plan
-    with the dz arm, a registered program): the zero-gradient row skip's ``_dcnt`` forms (:attr:`Plan.dcnt`), the
+    with the dz arm, a registered program): the zero-gradient row skip's ``_dcnt`` forms (:attr:`Plan.dcnt`), each
+    chunk's dX at the architecture's counted slice count at least (:func:`counted_dx_slices`; the slice rule's counts
+    when the plan with those would have no counted forms), the
     last chunk's bf16 fused cast in the TMA epilogue's counted form where :func:`dw_cast_tma_rule` takes the TMA
     epilogue (``counted_tma_cast=False``, a record without that form: the shipped cast's counted form instead); off when
-    a chunk takes a form without one (an explicitly pinned weight-gradient TMA epilogue or swapped dX tile)."""
+    a chunk takes a form without one (an explicitly pinned weight-gradient TMA epilogue or swapped dX tile).
+    ``live_cast`` (the log-probability backward's eager skip path only): a counted plan of two chunks or more with the
+    fused bf16 weight-gradient cast runs the cast at the last live chunk (:attr:`Plan.live_cast`); ignored otherwise."""
     if (logprob_dz or logprob_lbl or logprob_keep) and problem.entry != "logprob":
         raise ValueError("the logits GEMM arms belong to the log-probability entry")
     if logprob_keep:
@@ -4159,14 +4344,16 @@ def make_plan(
                     f"gemm_tuning dx split={explicit_f}: the split-tail form runs 1 .. W of a chunk's W wide dX items "
                     f"as half items; the chunk of {rows_c} rows has W = {wide}"
                 )
-    variants: tuple[ChunkVariants, ...] = ()
-    if arch is not None or tuning:
-        variants = tuple(
+
+    def variants_of(slices_: tuple[int, ...]) -> tuple[ChunkVariants, ...]:
+        if arch is None and not tuning:
+            return ()
+        return tuple(
             chunk_variants(
                 rows_c,
                 problem.hidden,
                 num_sms,
-                slices[i] if slices else 1,
+                slices_[i] if slices_ else 1,
                 geometry,
                 arch,
                 tuning,
@@ -4175,8 +4362,15 @@ def make_plan(
             )
             for i, (_, rows_c) in enumerate(chunks)
         )
-    # the zero-gradient row skip's counted forms: none for an explicitly pinned swapped dX tile or weight-gradient TMA
-    # epilogue (the swap rule itself serves the cross-entropy loss only)
+
+    def has_counted_forms(variants_: tuple[ChunkVariants, ...]) -> bool:
+        # none for an explicitly pinned swapped dX tile or weight-gradient TMA epilogue (the swap rule itself serves
+        # the cross-entropy loss only)
+        return not any(
+            v.dx_swab or v.dw_epi_store not in (None, "redsm") for v in variants_
+        )
+
+    # the zero-gradient row skip's counted forms
     dcnt = bool(
         dcnt
         and arch is not None
@@ -4184,10 +4378,25 @@ def make_plan(
         and logprob_dz
         and not logprob_keep
         and not hidden_count
-        and not any(
-            v.dx_swab or v.dw_epi_store not in (None, "redsm") for v in variants
-        )
     )
+    variants: Optional[tuple[ChunkVariants, ...]] = None
+    if dcnt:
+        # the counted plan's slices (:data:`DX_COUNTED_MIN_SLICES_BY_ARCH`) when that plan keeps the counted forms,
+        # else the slice rule's
+        raised = counted_dx_slices(
+            slices,
+            arch=arch,
+            dx_max_slices=dx_max_slices,
+            k_iters=int(problem.vocab) // int(geometry.k_block),
+            tuning=tuning,
+        )
+        if raised != slices:
+            raised_variants = variants_of(raised)
+            if has_counted_forms(raised_variants):
+                slices, variants = raised, raised_variants
+    if variants is None:
+        variants = variants_of(slices)
+    dcnt = dcnt and has_counted_forms(variants)
     if (
         variants
         and (not dcnt or counted_tma_cast)
@@ -4229,6 +4438,18 @@ def make_plan(
         logprob_dz=bool(logprob_dz),
         logprob_lbl=bool(logprob_lbl),
         dcnt=dcnt,
+        # the cast at the last live chunk: a counted plan of two chunks or more whose bf16 weight gradient comes out of
+        # the fused cast (the log-probability entry's dW is bf16)
+        live_cast=bool(
+            live_cast
+            and dcnt
+            and need_dw
+            and fuse_dw_cast
+            and len(chunks) >= 2
+            and not (
+                problem.entry == "loss" and problem.grad_weight_dtype == torch.float32
+            )
+        ),
     )
 
 
@@ -5486,12 +5707,15 @@ def stage_values(
                 f"chunk {index} plans the weight-gradient accumulate {want!r}; stage {stage!r} was requested"
             )
         v = plan.variants_of(index)
+        lc = parse_stage(stage)[1]["live_cast"]
+        if lc and last:
+            raise ValueError(
+                f"stage {stage!r} reads the next chunk's count; chunk {index} is the last of {plan.num_chunks}"
+            )
         values.update(
             A=dz_chunk,
             B=x_chunk,
-            C=t["dw_acc"],
-            STATS_OUT=t["stats"],
-            WS=t["f32_dummy"],
+            **_dw_acc_operands(t, p, lc),
             **gemm_scalars(
                 stage,
                 g,
@@ -5503,6 +5727,8 @@ def stage_values(
                 first_chunk=first,
             ),
         )
+        if lc:
+            values.update(CNT_NEXT=t["dcnt"][index + 1 : index + 2])
     elif base in DW_CAST_STAGES:
         # the deferred last chunk (backward): the same GEMM as ``gemm_dw_acc`` with the upstream scale and the output cast
         # fused into its epilogue -- ``C`` is the final ``dW``, ``WS`` the read-only FP32 sum of the chunks before it (a
@@ -5570,6 +5796,21 @@ def stage_values(
         raise ValueError(f"unknown stage {stage!r}")
     _dcnt_value(stage, t, plan, index, values)
     return values
+
+
+def _dw_acc_operands(t: dict[str, Any], p: Problem, live_cast: bool) -> dict[str, Any]:
+    """The tensor operands of a weight-gradient accumulate: the FP32 sum ``dw_acc`` as ``C`` (the statistics and a
+    dummy in the unused slots); its cast at the last live chunk (``_lc``) writes the bf16 ``dw_out`` (``C``), reads and
+    adds into the sum ``dw_acc`` (``WS``) and scales by the upstream cell (``STATS_OUT``), the deferred cast's operands
+    (the next chunk's count ``CNT_NEXT`` is bound beside them).  The gradient slots are allocated before the chunk
+    loop's first dX launch, ahead of any accumulate on the side stream."""
+    if live_cast:
+        return dict(
+            C=t["dw_out"],
+            STATS_OUT=t["grad_scale"] if p.entry == "loss" else t["unit_scale"],
+            WS=t["dw_acc"],
+        )
+    return dict(C=t["dw_acc"], STATS_OUT=t["stats"], WS=t["f32_dummy"])
 
 
 def _dcnt_value(
@@ -5671,13 +5912,10 @@ def _slot_values(stage: str, t: dict[str, Any], plan: Plan, index) -> dict[str, 
     elif base in DX_BASES:
         _dx_slots(stage, t, plan, index, values)
     elif base == "gemm_dw_acc":
-        values.update(
-            A=logits[:rows_c],
-            B=x_chunk,
-            C=t["dw_acc"],
-            STATS_OUT=t["stats"],
-            WS=t["f32_dummy"],
-        )
+        lc = parse_stage(stage)[1]["live_cast"]
+        values.update(A=logits[:rows_c], B=x_chunk, **_dw_acc_operands(t, p, lc))
+        if lc:
+            values.update(CNT_NEXT=t["dcnt"][index + 1 : index + 2])
     elif base in DW_CAST_STAGES:
         values.update(
             A=logits[:rows_c],
@@ -6590,6 +6828,7 @@ def prepare_lm_head_loss(
     dx_rule: Optional[tuple] = None,
     logprob_keep: bool = False,
     dcnt: Optional[torch.Tensor] = None,
+    _skip_forms: bool = False,
 ) -> LmHeadLossRunner:
     """Validate one binding and prepare its launches.
 
@@ -6774,10 +7013,16 @@ def prepare_lm_head_loss(
         dx_red_min_rows=red_min_rows,
         logprob_keep=keep,
     )
-    plan = plan_of(dcnt=dcnt is not None)
-    if plan.dcnt and any(s not in stages for s in plan.stages):
-        # a record without the counted TMA cast: the counted plan with the shipped cast's counted form
-        plan = plan_of(dcnt=True, counted_tma_cast=False)
+    # the eager skip path (``_skip_forms``, :func:`backward_logprob`) tries the cast at the last live chunk first; a
+    # plan takes it whole or not at all (every accumulate but the last chunk's and the deferred cast)
+    for live_cast in (True, False) if _skip_forms else (False,):
+        plan = plan_of(dcnt=dcnt is not None, live_cast=live_cast)
+        if plan.dcnt and any(s not in stages for s in plan.stages):
+            # a record without the counted TMA cast: the counted plan with the shipped cast's counted form
+            plan = plan_of(dcnt=True, counted_tma_cast=False, live_cast=live_cast)
+        if live_cast and not (plan.live_cast and all(s in stages for s in plan.stages)):
+            continue
+        break
     if plan.dcnt and any(s not in stages for s in plan.stages):
         # a record without the counted forms: the shipped plan, every row computed
         plan = plan_of(dcnt=False)
@@ -6994,6 +7239,7 @@ def prepare_lm_head_loss_temperature(
     dx_rule: Optional[tuple] = None,
     temperature: Optional[torch.Tensor] = None,
     dcnt: Optional[torch.Tensor] = None,
+    _skip_forms: bool = False,
 ) -> LmHeadLossRunner:
     """Validate one binding and prepare its launches.
 
@@ -7212,12 +7458,23 @@ def prepare_lm_head_loss_temperature(
         )
     plan = plan_of(dcnt=dcnt is not None)
     if plan.dcnt:
-        for dz_form in dz_forms:
-            for cast_form in ({}, {"counted_tma_cast": False}):
-                plan = plan_of(dcnt=True, **dz_form, **cast_form)
-                if not plan.dcnt or all(s in stages for s in plan.stages):
+        # the eager skip path (``_skip_forms``, :func:`backward_logprob_temperature`) tries the cast at the last live
+        # chunk first (whole or not at all), each with the dz forms, each with the two cast forms
+        searched = False
+        for live_cast in (True, False) if _skip_forms else (False,):
+            for dz_form in dz_forms:
+                for cast_form in ({}, {"counted_tma_cast": False}):
+                    plan = plan_of(
+                        dcnt=True, live_cast=live_cast, **dz_form, **cast_form
+                    )
+                    if live_cast and not plan.live_cast:
+                        break
+                    if not plan.dcnt or all(s in stages for s in plan.stages):
+                        searched = True
+                        break
+                if searched or (live_cast and not plan.live_cast):
                     break
-            if not plan.dcnt or all(s in stages for s in plan.stages):
+            if searched:
                 break
     if plan.dcnt and any(s not in stages for s in plan.stages):
         # a record without the counted forms: the shipped plan, every row computed
@@ -7620,6 +7877,97 @@ def check_kept_logits(plan: Plan, logits) -> tuple:
 # cache that holds the bindings takes no lock and skips a step whose entry another thread removed (:class:`BindingCache`).
 _OWNED_VALUES = ("workspace", "tma_descriptor_workspace")
 
+# The per-call scratch slots of a remembered binding (:meth:`_Binding._scratch`): the row vectors ``d`` / ``term`` and
+# the loss cells ``loss_acc`` / ``loss``.  A binding allocates per call only the slots its launch sequence binds
+# (:func:`_scratch_slots`): the log-probability forward binds ``d`` and ``term`` (``row_finalize``), its backward none
+# of them, the loss entry's forward all four.
+_SCRATCH_SLOTS = ("d", "term", "loss_acc", "loss")
+
+
+class _ReadRecorder(dict):
+    """A copy of a call's host values that records the names read from it (``t[name]`` / ``t.get(name)``)."""
+
+    def __init__(self, values: dict[str, Any]):
+        super().__init__(values)
+        self.read: set[str] = set()
+
+    def __getitem__(self, name):
+        self.read.add(name)
+        return super().__getitem__(name)
+
+    def get(self, name, default=None):
+        self.read.add(name)
+        return super().get(name, default)
+
+
+def _scratch_slots(
+    slot_values: Callable[..., dict[str, Any]],
+    keys: tuple,
+    t: dict[str, Any],
+    plan: Plan,
+    returned: tuple = (),
+) -> tuple[str, ...]:
+    """The scratch slots (:data:`_SCRATCH_SLOTS`, in that order) the launch sequence ``keys`` binds -- every name its
+    per-call host values read (``slot_values``: :func:`_slot_values` or its temperature form, which the binding's
+    launches and host steps take per call) -- plus ``returned`` (the slots the call returns).  Replayed once per binding
+    on the runner's own tensors (:meth:`_Binding.from_runner`); a replay that fails keeps every slot."""
+    recorder = _ReadRecorder(t)
+    try:
+        for key in keys:
+            slot_values(key[0], recorder, plan, key[1])
+    except Exception:  # fail safe: the shipped allocation of every slot
+        return _SCRATCH_SLOTS
+    read = recorder.read | set(returned)
+    return tuple(name for name in _SCRATCH_SLOTS if name in read)
+
+
+# The log-probability backward's gradient accumulators and outputs (:meth:`_Binding.backward_logprob`).
+_GRADIENT_SLOTS = ("dx_acc", "dx_out", "dw_acc", "dw_out")
+
+
+def _gradients_at_first_dx(
+    slot_values: Callable[..., dict[str, Any]],
+    keys: tuple,
+    t: dict[str, Any],
+    plan: Plan,
+) -> bool:
+    """Whether a log-probability backward can make its gradient accumulators and outputs (:data:`_GRADIENT_SLOTS`)
+    right before the first dX GEMM key of ``keys`` (:func:`_before_first_dx`): the sequence has one and no key ahead of
+    it reads them.  Replayed once per binding on the runner's own tensors (like :func:`_scratch_slots`); a replay that
+    fails keeps them up front."""
+    first = next(
+        (i for i, key in enumerate(keys) if key[0].startswith("gemm_dx")), None
+    )
+    if first is None:
+        return False
+    recorder = _ReadRecorder(t)
+    try:
+        for key in keys[:first]:
+            slot_values(key[0], recorder, plan, key[1])
+    except Exception:  # fail safe: made up front
+        return False
+    return not (recorder.read & set(_GRADIENT_SLOTS))
+
+
+def _before_first_dx(
+    run_key: Callable[[Any], None], before_dx: Optional[Callable[[], None]]
+) -> tuple[Callable[[Any], None], Callable[[], None]]:
+    """``run_key`` that calls ``before_dx`` once right before the first dX GEMM key -- on the caller's stream:
+    :func:`side_stream_schedule` never moves a dX key -- and the call that runs it after the sequence when the sequence
+    had none (the host work it does follows the launches ahead of that key)."""
+    pending = [] if before_dx is None else [before_dx]
+
+    def run(key) -> None:
+        if pending and key[0].startswith("gemm_dx"):
+            pending.pop()()
+        run_key(key)
+
+    def finish() -> None:
+        if pending:
+            pending.pop()()
+
+    return run, finish
+
 
 @dataclass
 class _Binding:
@@ -7649,6 +7997,13 @@ class _Binding:
     owned_bytes: int = 0
     layout: dict = field(default_factory=dict, repr=False)
     memory: dict = field(default_factory=dict, repr=False)
+    # the scratch slots (:data:`_SCRATCH_SLOTS`) a forward / backward call allocates: the ones its sequence binds or
+    # returns (:func:`_scratch_slots`)
+    forward_scratch: tuple = _SCRATCH_SLOTS
+    backward_scratch: tuple = _SCRATCH_SLOTS
+    # the log-probability backward makes its gradient accumulators and outputs right before its first dX GEMM key
+    # (behind the row gathers and the recompute launch) instead of up front (:func:`_gradients_at_first_dx`)
+    backward_gradients_at_dx: bool = False
 
     @classmethod
     def from_runner(
@@ -7700,6 +8055,7 @@ class _Binding:
             (i for i, key in enumerate(early) if _reads_labels(key[0])), len(early)
         )
         forward_late = tuple(key for key in forward_order if key not in early)
+        forward_run, backward_run = _unfilled(forward_order), _unfilled(backward_order)
         return cls(
             plan=plan,
             device=t["X"].device,
@@ -7714,14 +8070,26 @@ class _Binding:
             forward_early=early[:split],
             forward_early_labels=early[split:],
             forward_late=forward_late,
-            forward_run=_unfilled(forward_order),
-            backward_run=_unfilled(backward_order),
+            forward_run=forward_run,
+            backward_run=backward_run,
             forward_late_run=_unfilled(forward_late),
             fill_rows=plan.dx_fill_rows,
             owned=owned,
             owned_bytes=sum(v.numel() * v.element_size() for v in owned.values()),
             layout=runner.layout,
             memory=memory,
+            # the loss entry's forward returns the finished-loss cell
+            forward_scratch=_scratch_slots(
+                _slot_values,
+                forward_run,
+                t,
+                plan,
+                ("loss",) if plan.problem.entry == "loss" else (),
+            ),
+            backward_scratch=_scratch_slots(_slot_values, backward_run, t, plan),
+            backward_gradients_at_dx=_gradients_at_first_dx(
+                _slot_values, backward_run, t, plan
+            ),
         )
 
     def holds_no_tensor(self) -> bool:
@@ -7737,12 +8105,15 @@ class _Binding:
         hidden: Optional[_HiddenCount] = None,
         *,
         chunk_buffers: bool = True,
+        backward: bool = False,
     ) -> None:
         """Per-call temporaries from the caching allocator into ``t`` (the runner's regions, minus the owned ones);
         with ``hidden`` the chunk buffers are the prologue's (chunk 0's logits / statistics / gathered rows already in
         them, ``min(chunk, T)`` rows) -- the entry points check that a hidden-count plan gets its prologue.
         ``chunk_buffers=False``: the chunk buffers are already bound (:meth:`_chunk_buffers`, the early launch of
-        :meth:`forward`) and the rest is allocated."""
+        :meth:`forward`) and the rest is allocated.  Of the scratch slots (:data:`_SCRATCH_SLOTS`) only the ones the
+        call's sequence binds or returns: ``backward`` selects the backward's (:attr:`backward_scratch`), else the
+        forward's (:attr:`forward_scratch`)."""
         p = self.plan.problem
         rows = self.layout["logits"][1] // (p.vocab * 2)
         if chunk_buffers and hidden is not None:
@@ -7756,10 +8127,15 @@ class _Binding:
                 dtype=torch.float32,
                 device=self.device,
             )
-        t["d"] = torch.empty((rows,), dtype=torch.float32, device=self.device)
-        t["term"] = torch.empty((rows,), dtype=torch.float32, device=self.device)
-        t["loss_acc"] = torch.empty((1,), dtype=torch.float64, device=self.device)
-        t["loss"] = torch.empty((1,), dtype=torch.float32, device=self.device)
+        scratch = self.backward_scratch if backward else self.forward_scratch
+        if "d" in scratch:
+            t["d"] = torch.empty((rows,), dtype=torch.float32, device=self.device)
+        if "term" in scratch:
+            t["term"] = torch.empty((rows,), dtype=torch.float32, device=self.device)
+        if "loss_acc" in scratch:
+            t["loss_acc"] = torch.empty((1,), dtype=torch.float64, device=self.device)
+        if "loss" in scratch:
+            t["loss"] = torch.empty((1,), dtype=torch.float32, device=self.device)
         t.update(
             _device_constants(self.device_index)
         )  # constant cells: no per-call fill launches
@@ -7819,7 +8195,9 @@ class _Binding:
         t: dict[str, Any],
         dw_stream: str = "auto",
         fill_join: Optional[Any] = None,
+        before_dx: Optional[Callable[[], None]] = None,
     ) -> None:
+        """Run ``keys`` with the call's tensors ``t``; ``before_dx`` as in :func:`_before_first_dx`."""
         plan, launches = self.plan, self.launches
 
         def run_key(key) -> None:
@@ -7840,7 +8218,9 @@ class _Binding:
                 launch.prepare(*arguments)
             launch.entry(*arguments)
 
-        _run_keys(self.plan, self.device_index, keys, run_key, dw_stream, fill_join)
+        run, finish = _before_first_dx(run_key, before_dx)
+        _run_keys(self.plan, self.device_index, keys, run, dw_stream, fill_join)
+        finish()
 
     def forward(
         self,
@@ -7969,21 +8349,38 @@ class _Binding:
             if fill_side and plan.need_dx
             else None
         )
-        self._scratch(t, hidden)
-        if plan.need_dx:
-            if join is None:
-                t["dx_acc"] = _filled_dx_acc(T, H, self.fill_rows, self.device)
-            if plan.dx_cast:
-                t["dx_out"] = torch.empty(
-                    (T, H), dtype=torch.bfloat16, device=self.device
+        self._scratch(t, hidden, backward=True)
+
+        def gradient_buffers() -> None:
+            if plan.need_dx:
+                if join is None:
+                    t["dx_acc"] = _filled_dx_acc(T, H, self.fill_rows, self.device)
+                if plan.dx_cast:
+                    t["dx_out"] = torch.empty(
+                        (T, H), dtype=torch.bfloat16, device=self.device
+                    )
+            if plan.need_dw:
+                if plan.dw_acc_needed:
+                    t["dw_acc"] = torch.empty(
+                        (V, H), dtype=torch.float32, device=self.device
+                    )
+                t["dw_out"] = torch.empty(
+                    (V, H), dtype=torch.bfloat16, device=self.device
                 )
-        if plan.need_dw:
-            if plan.dw_acc_needed:
-                t["dw_acc"] = torch.empty(
-                    (V, H), dtype=torch.float32, device=self.device
-                )
-            t["dw_out"] = torch.empty((V, H), dtype=torch.bfloat16, device=self.device)
-        self._launch(self.backward_run, t, dw_stream, join)
+
+        # The gradient accumulators and outputs (with the dX_acc fill) are made right before the first dX GEMM key,
+        # behind the row gathers and the recompute launch, which read none of them: a call of a few rows is host-bound
+        # up to its first GEMM, and those launches are no longer held back by this host work.  The same buffers, fill
+        # rows and stream order ahead of every launch that reads or writes them.  Without dX (the first gradient key
+        # is a dW GEMM, possibly on the dW side stream) or when a key ahead of the first dX GEMM reads them
+        # (:attr:`backward_gradients_at_dx`), they are made up front.
+        if plan.need_dx and self.backward_gradients_at_dx:
+            self._launch(
+                self.backward_run, t, dw_stream, join, before_dx=gradient_buffers
+            )
+        else:
+            gradient_buffers()
+            self._launch(self.backward_run, t, dw_stream, join)
         dx = (
             t.get("dx_out") if plan.dx_cast else t.get("dx_acc")
         )  # dx_cast=False: the caller finalizes the accumulator
@@ -8063,6 +8460,7 @@ class _TemperatureBinding(_Binding):
             len(early),
         )
         forward_late = tuple(key for key in forward_order if key not in early)
+        forward_run, backward_run = _unfilled(forward_order), _unfilled(backward_order)
         return (cls if tau else _Binding)(
             plan=plan,
             device=t["X"].device,
@@ -8077,14 +8475,25 @@ class _TemperatureBinding(_Binding):
             forward_early=early[:split],
             forward_early_labels=early[split:],
             forward_late=forward_late,
-            forward_run=_unfilled(forward_order),
-            backward_run=_unfilled(backward_order),
+            forward_run=forward_run,
+            backward_run=backward_run,
             forward_late_run=_unfilled(forward_late),
             fill_rows=plan.dx_fill_rows,
             owned=owned,
             owned_bytes=sum(v.numel() * v.element_size() for v in owned.values()),
             layout=runner.layout,
             memory=memory,
+            forward_scratch=_scratch_slots(
+                slot_values,
+                forward_run,
+                t,
+                plan,
+                ("loss",) if plan.problem.entry == "loss" else (),
+            ),
+            backward_scratch=_scratch_slots(slot_values, backward_run, t, plan),
+            backward_gradients_at_dx=_gradients_at_first_dx(
+                slot_values, backward_run, t, plan
+            ),
         )
 
     # the rows of the call in progress, per thread (set and cleared around the inherited sequence)
@@ -8170,6 +8579,7 @@ class _TemperatureBinding(_Binding):
         t: dict[str, Any],
         dw_stream: str = "auto",
         fill_join: Optional[Any] = None,
+        before_dx: Optional[Callable[[], None]] = None,
     ) -> None:
         plan, launches = self.plan, self.launches
 
@@ -8193,9 +8603,11 @@ class _TemperatureBinding(_Binding):
                 launch.prepare(*arguments)
             launch.entry(*arguments)
 
+        run, finish = _before_first_dx(run_key, before_dx)
         _run_keys_temperature(
-            self.plan, self.device_index, keys, run_key, dw_stream, fill_join
+            self.plan, self.device_index, keys, run, dw_stream, fill_join
         )
+        finish()
 
 
 class _KeptBinding(_Binding):
@@ -8210,11 +8622,12 @@ class _KeptBinding(_Binding):
         t: dict[str, Any],
         dw_stream: str = "auto",
         fill_join: Optional[Any] = None,
+        before_dx: Optional[Callable[[], None]] = None,
     ) -> None:
         kept = t.get("logits_keep")
         if kept is None:
             # chunk 0's early launches, ahead of the kept views: chunk 0's view is the chunk buffer's first rows
-            super()._launch(keys, t, dw_stream, fill_join)
+            super()._launch(keys, t, dw_stream, fill_join, before_dx)
             return
         plan, launches = self.plan, self.launches
 
@@ -8237,7 +8650,9 @@ class _KeptBinding(_Binding):
                 launch.prepare(*arguments)
             launch.entry(*arguments)
 
-        _run_keys(self.plan, self.device_index, keys, run_key, dw_stream, fill_join)
+        run, finish = _before_first_dx(run_key, before_dx)
+        _run_keys(self.plan, self.device_index, keys, run, dw_stream, fill_join)
+        finish()
 
     def forward_keep(
         self, X, W, labels, row_index=None, hidden=None, dw_stream: str = "auto"
@@ -8309,7 +8724,7 @@ class _KeptBinding(_Binding):
         )
         if plan.compact:
             t["x_c"] = torch.empty((rows, H), dtype=torch.bfloat16, device=self.device)
-        self._scratch(t, chunk_buffers=False)
+        self._scratch(t, chunk_buffers=False, backward=True)
         t["logits_keep"] = logits
         if plan.need_dx:
             if join is None:
@@ -8521,8 +8936,17 @@ class _TemperatureResultState:
     temperature_rows: Optional[torch.Tensor] = None
 
 
+class _ProblemResultState:
+    """The validated :class:`Problem` of a log-probability forward (``problem``, without the temperature form): its
+    autograd backward takes it back (:func:`backward_logprob`'s ``_problem``) instead of validating the same ``X``,
+    ``W`` and ``labels`` again.  A plain base class like :class:`_TemperatureResultState`: a typed class default
+    (``None``), not a dataclass field."""
+
+    problem: Optional[Problem] = None
+
+
 @dataclass
-class ForwardResult(_TemperatureResultState):
+class ForwardResult(_TemperatureResultState, _ProblemResultState):
     loss: Optional[torch.Tensor]  # FP32 [] (loss entry)
     logp: (
         torch.Tensor
@@ -9593,7 +10017,7 @@ def forward_logprob(
         tuning=tuning,
         lbl=lbl,
     )
-    return ForwardResult(
+    result = ForwardResult(
         loss=None,
         logp=scatter_rows(logp, row_index, T),
         lse=lse,
@@ -9602,6 +10026,8 @@ def forward_logprob(
         row_index=row_index,
         num_rows=T,
     )
+    result.problem = problem
+    return result
 
 
 def _forward_logprob_rows(
@@ -9677,6 +10103,22 @@ def _forward_logprob_rows(
     return logp, lse, runner.memory
 
 
+def _dlogp_rows(dlogp: torch.Tensor, T: int) -> torch.Tensor:
+    """The incoming ``dlogp`` as the FP32 contiguous ``[T]`` tensor a log-probability backward binds
+    (``dlogp.detach().reshape(T).to(torch.float32).contiguous()``): ``dlogp`` itself when it already is one and needs
+    no detach (the autograd backward's gradient of the FP32 ``[T]`` ``logp``), without those four host calls ahead of
+    the backward's first launch."""
+    if (
+        dlogp.dtype == torch.float32
+        and dlogp.dim() == 1
+        and dlogp.shape[0] == T
+        and not dlogp.requires_grad
+        and dlogp.is_contiguous()
+    ):
+        return dlogp
+    return dlogp.detach().reshape(T).to(torch.float32).contiguous()
+
+
 def _zero_dlogp_skip(
     device: torch.device,
     row_index: Optional[torch.Tensor],
@@ -9690,22 +10132,22 @@ def _zero_dlogp_skip(
     with the ``dz`` arm and, when it produces ``dX``, the fused dX finalize (which writes the skipped rows' exact zeros),
     on a record that registers the counted dz arm (:data:`LOGPROB_DZ_DCNT_STAGE`) and the partition kernel
     (:data:`ZERO_DLOGP_PARTITION_STAGE`).  An eligible call runs the skip when its plan has the counted forms
-    (:attr:`Plan.dcnt`), and the backward without it otherwise."""
-    floor = zero_dlogp_min_rows()
+    (:attr:`Plan.dcnt`), and the backward without it otherwise.  The floor is the device's
+    (:func:`zero_dlogp_min_rows` of its index: the override, else its architecture's default)."""
     if (
-        floor is None
-        or row_index is None
-        or int(row_index.numel()) < floor
+        row_index is None
         or backend != "cake"
         or not dz_arm
         or (need_dx and not fused_dx)
         or device.type != "cuda"
     ):
         return False
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    floor = zero_dlogp_min_rows(index)
+    if floor is None or int(row_index.numel()) < floor:
+        return False
     # the device's record and its stages, resolved once per device (:func:`_skip_record`)
-    return _skip_record(
-        device.index if device.index is not None else torch.cuda.current_device()
-    )[3]
+    return _skip_record(index)[3]
 
 
 def backward_logprob(
@@ -9728,6 +10170,7 @@ def backward_logprob(
     gemm_tuning: Optional[dict[str, dict[str, Any]]] = None,
     logprob_dz: Optional[bool] = None,
     row_index: Any = _RECOUNT,
+    _problem: Optional[Problem] = None,
 ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Backward of the log-probability entry: recompute each chunk's logits, ``dz = dlogp_t *
     (1[v = y_t] - softmax)`` (ignored rows zero), then ``dX`` (BF16) and ``dW`` (BF16) through
@@ -9754,16 +10197,24 @@ def backward_logprob(
     capturable).  The rows of a zero ``dlogp`` get exact-zero ``dX`` rows and add nothing to ``dW``; ``dX`` of every
     other row is the same; ``dW`` sums the same nonzero products over the live rows in the new row order (FP32).  The
     call's plan decides: a plan whose chunks take a form without a counted one (an explicitly pinned swapped dX tile or
-    weight-gradient TMA epilogue) runs the backward without the skip, rows in the forward's order."""
+    weight-gradient TMA epilogue) runs the backward without the skip, rows in the forward's order.
+
+    ``_problem`` (internal, the autograd Function's): the forward's validated :class:`Problem` of these same ``X``,
+    ``W`` and ``labels`` (:attr:`ForwardResult.problem`, passed only when no saved-tensor hooks could have unpacked
+    another ``X``), taken instead of validating them again."""
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
-    problem = validate_lm_head_inputs(
-        X,
-        W,
-        labels,
-        chunk_size=chunk_size,
-        deterministic=deterministic,
-        entry="logprob",
+    problem = (
+        _problem
+        if _problem is not None
+        else validate_lm_head_inputs(
+            X,
+            W,
+            labels,
+            chunk_size=chunk_size,
+            deterministic=deterministic,
+            entry="logprob",
+        )
     )
     if need_dx or need_dw:
         _alert_nondeterministic("backward_logprob")
@@ -9785,15 +10236,17 @@ def backward_logprob(
     # the call's plan has its counted forms (``order_rows``)
     skip = False
     scan = counts = None
+    # the fused dX finalize's valid-row mask (labels >= 0) of a call that reuses the forward's row index: one device
+    # comparison, no synchronization, formed in finish_dx behind the queued GEMMs (the call's first launches are not
+    # held back by it)
+    labels_mask = False
     if row_index is not _RECOUNT:
-        # the forward's valid-row index: the plan is known without a count (the valid-row mask of the fused dX finalize
-        # is one device comparison, no synchronization)
+        # the forward's valid-row index: the plan is known without a count
         if row_index is not None and not compact:
             raise ValueError("a valid-row index belongs to a compacted backward")
         skip = _zero_dlogp_skip(X.device, row_index, backend, dz_arm, need_dx, fused_dx)
-        row_valid = (
-            (labels >= 0) if (row_index is not None and fused_dx and not skip) else None
-        )
+        row_valid = None
+        labels_mask = row_index is not None and fused_dx and not skip
     else:
         hc = _hidden_count(
             problem,
@@ -9824,7 +10277,7 @@ def backward_logprob(
             else None,
         )
     _check_output(lse, "lse", (rows,), torch.float32)
-    dlogp = dlogp.detach().reshape(T).to(torch.float32).contiguous()
+    dlogp = _dlogp_rows(dlogp, T)
     cache = BINDING_CACHE
     key = None
     valid_count = None if row_index is None else rows
@@ -9838,21 +10291,20 @@ def backward_logprob(
             return None
         if dx_cast:
             return scatter_rows(dx, row_index, T)
-        return finalize_dx(
-            dx, None, row_index, row_valid, T, backend=backend, scan=scan
-        )
+        valid = (labels >= 0) if labels_mask else row_valid
+        return finalize_dx(dx, None, row_index, valid, T, backend=backend, scan=scan)
 
     def order_rows(counted: bool) -> None:
         # the plan decides the skip: its counted forms order the rows (one partition launch); a plan without them runs
         # the shipped backward over the forward's row order (no partition, the fused finalize's valid-row mask)
-        nonlocal skip, row_index, lse, scan, counts, row_valid
+        nonlocal skip, row_index, lse, scan, counts, labels_mask
         skip = skip and counted
         if skip:
             row_index, lse, scan, counts = zero_dlogp_partition(
                 labels, dlogp, row_index, lse, problem.chunk
             )
         elif row_valid is None and row_index is not None and fused_dx:
-            row_valid = labels >= 0
+            labels_mask = True
 
     if backend == "cake" and cache.enabled:
         key = logprob_backward_binding_key(
@@ -9908,6 +10360,9 @@ def backward_logprob(
         )
         if skip
         else None,
+        # the skip's private forms (the cast at the last live chunk): the counts come from zero_dlogp_partition (zeros
+        # form a suffix) and the gradient buffers are this call's own
+        _skip_forms=skip,
     )
     order_rows(runner.plan.dcnt)
     if hc is not None or skip:
@@ -9964,6 +10419,8 @@ def forward_logprob_temperature(
         deterministic=deterministic,
         entry="logprob",
     )
+    # the validated problem without the temperature form (:attr:`ForwardResult.problem`)
+    checked = problem
     tau = _resolve_temperature(
         temperature, problem.num_rows, X.device, check=check_temperature
     )
@@ -10059,6 +10516,7 @@ def forward_logprob_temperature(
                 num_rows=T,
             )
             result.temperature_rows = tau_rows
+            result.problem = checked
             return result
     runner = prepare_lm_head_loss_temperature(
         X,
@@ -10105,6 +10563,7 @@ def forward_logprob_temperature(
         num_rows=T,
     )
     result.temperature_rows = tau_rows
+    result.problem = checked
     return result
 
 
@@ -10131,6 +10590,7 @@ def backward_logprob_temperature(
     temperature=None,
     check_temperature: bool = False,
     temperature_rows: Optional[torch.Tensor] = None,
+    _problem: Optional[Problem] = None,
 ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     """:func:`backward_logprob` with a temperature (:func:`_backward_logprob` is the path without one).  Backward
     of the log-probability entry: recompute each chunk's logits, ``dz = dlogp_t *
@@ -10168,16 +10628,21 @@ def backward_logprob_temperature(
     the same as without the skip; ``dW`` sums the live rows in the new row order (FP32), so its bits may differ when a
     row is zero.  The skip needs the temperature itself: the call's ``temperature``, or with ``temperature_rows`` the
     forward's resolved temperature (the autograd Function passes both); ``temperature_rows`` alone runs the backward
-    without the skip."""
+    without the skip.  ``_problem`` (internal) as in :func:`backward_logprob`: the forward's validated problem without
+    the temperature form."""
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
-    problem = validate_lm_head_inputs(
-        X,
-        W,
-        labels,
-        chunk_size=chunk_size,
-        deterministic=deterministic,
-        entry="logprob",
+    problem = (
+        _problem
+        if _problem is not None
+        else validate_lm_head_inputs(
+            X,
+            W,
+            labels,
+            chunk_size=chunk_size,
+            deterministic=deterministic,
+            entry="logprob",
+        )
     )
     if need_dx or need_dw:
         _alert_nondeterministic("backward_logprob_temperature")
@@ -10218,6 +10683,7 @@ def backward_logprob_temperature(
             gemm_tuning=gemm_tuning,
             logprob_dz=logprob_dz,
             row_index=row_index,
+            _problem=problem,
         )
     problem = _with_temperature(problem)
     stream_mode = dw_stream_mode(dw_stream)
@@ -10239,17 +10705,19 @@ def backward_logprob_temperature(
     # (``order_rows``)
     skip = False
     scan = counts = None
+    # the fused dX finalize's valid-row mask (labels >= 0) of a call that reuses the forward's row index: one device
+    # comparison, no synchronization, formed in finish_dx behind the queued GEMMs (the call's first launches are not
+    # held back by it)
+    labels_mask = False
     if row_index is not _RECOUNT:
-        # the forward's valid-row index: the plan is known without a count (the valid-row mask of the fused dX finalize
-        # is one device comparison, no synchronization)
+        # the forward's valid-row index: the plan is known without a count
         if row_index is not None and not compact:
             raise ValueError("a valid-row index belongs to a compacted backward")
         skip = tau is not None and _zero_dlogp_skip(
             X.device, row_index, backend, dz_arm, need_dx, fused_dx
         )
-        row_valid = (
-            (labels >= 0) if (row_index is not None and fused_dx and not skip) else None
-        )
+        row_valid = None
+        labels_mask = row_index is not None and fused_dx and not skip
     else:
         # a recount with a temperature takes the host count: the device-count recompute stores ``z`` for ``row_grad``,
         # which has no temperature form
@@ -10317,14 +10785,13 @@ def backward_logprob_temperature(
             return None
         if dx_cast:
             return scatter_rows(dx, row_index, T)
-        return finalize_dx(
-            dx, None, row_index, row_valid, T, backend=backend, scan=scan
-        )
+        valid = (labels >= 0) if labels_mask else row_valid
+        return finalize_dx(dx, None, row_index, valid, T, backend=backend, scan=scan)
 
     def order_rows(counted: bool) -> None:
         # :func:`backward_logprob`'s: the plan decides the skip (its counted forms order the rows, one partition
         # launch; a plan without them runs over the forward's row order); the temperature rows follow the order
-        nonlocal skip, row_index, lse, scan, counts, row_valid, tau_rows
+        nonlocal skip, row_index, lse, scan, counts, labels_mask, tau_rows
         skip = skip and counted
         if skip:
             row_index, lse, scan, counts = zero_dlogp_partition(
@@ -10333,7 +10800,7 @@ def backward_logprob_temperature(
             tau_rows = tau_rows_of(row_index)
             return
         if row_valid is None and row_index is not None and fused_dx:
-            row_valid = labels >= 0
+            labels_mask = True
         if tau_rows is None:
             tau_rows = tau_rows_of(row_index)
 
@@ -10407,6 +10874,9 @@ def backward_logprob_temperature(
         )
         if skip
         else None,
+        # the skip's private forms (the cast at the last live chunk): the counts come from zero_dlogp_partition (zeros
+        # form a suffix) and the gradient buffers are this call's own
+        _skip_forms=skip,
     )
     order_rows(runner.plan.dcnt)
     if hc is not None or skip:
@@ -10616,7 +11086,7 @@ def backward_logprob_keep(
             else None,
         )
     _check_output(lse, "lse", (rows,), torch.float32)
-    dlogp = dlogp.detach().reshape(T).to(torch.float32).contiguous()
+    dlogp = _dlogp_rows(dlogp, T)
     fuse = bool(need_dw and _resolve_fuse(fuse_dw_cast))
     dx_cast = not (fused_dx and row_index is not None)
     cache = BINDING_CACHE
@@ -10780,6 +11250,14 @@ _TOP_SAVED_HOOKS = (
     if _TOP_SAVED_HOOKS_C is not None
     else (lambda ignore_is_tracing: None)
 )
+
+
+def _saved_problem(result: ForwardResult) -> Optional[Problem]:
+    """The forward's validated problem for its autograd backward (:attr:`ForwardResult.problem`), or ``None`` when
+    saved-tensor hooks are active (``torch.utils.checkpoint``, ``save_on_cpu``, offloading): those may unpack an ``X``
+    of another stride or alignment, so the backward validates what it gets.  Without hooks the backward gets back the
+    tensors the forward validated."""
+    return result.problem if _TOP_SAVED_HOOKS(False) is None else None
 
 
 def _nested_code(cls, name: str) -> Optional[types.CodeType]:
@@ -11376,6 +11854,7 @@ class ChunkedLmHeadLogprobFunction(torch.autograd.Function):
         ctx.set_materialize_grads(False)
         # the valid-row index rides along: the backward plans its chunks without counting the rows again
         ctx.save_for_backward(X, W, labels, result.lse, result.row_index)
+        ctx.problem = _saved_problem(result)
         ctx.chunk_size, ctx.deterministic, ctx.backend, ctx.compact = (
             chunk_size,
             deterministic,
@@ -11415,6 +11894,7 @@ class ChunkedLmHeadLogprobFunction(torch.autograd.Function):
             gemm_tuning=ctx.gemm_tuning,
             logprob_dz=ctx.logprob_dz,
             row_index=row_index,
+            _problem=ctx.problem,
         )
         return (dx, dw) + (None,) * 12
 
@@ -11510,6 +11990,7 @@ class ChunkedLmHeadLogprobTemperatureFunction(torch.autograd.Function):
         ctx.temperature_scalar = (
             tau.value if tau is not None and tau.kind == "scalar" else None
         )
+        ctx.problem = _saved_problem(result)
         ctx.chunk_size, ctx.deterministic, ctx.backend, ctx.compact = (
             chunk_size,
             deterministic,
@@ -11559,6 +12040,7 @@ class ChunkedLmHeadLogprobTemperatureFunction(torch.autograd.Function):
             row_index=row_index,
             temperature=tau if tau_rows is not None else None,
             temperature_rows=tau_rows,
+            _problem=ctx.problem,
         )
         return (dx, dw) + (None,) * 14
 

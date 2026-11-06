@@ -1371,10 +1371,11 @@ __global__ void checkpointing_ssu_kernel_8bit(CheckpointingSsuParams params) {
   if (cache_slot == params.pad_slot_id) return;
 
   auto const* __restrict__ ring_start_ptr = reinterpret_cast<int32_t const*>(params.ring_start);
-  int const ring_start = __ldg(&ring_start_ptr[cache_slot]);
+  int const ring_start =
+      __ldg(&ring_start_ptr[tracker_offset(cache_slot, params.ring_start_stride)]);
 
   auto const* __restrict__ prev_ptr = reinterpret_cast<int32_t const*>(params.prev_num_accepted);
-  int const prev_k = prev_ptr[cache_slot];
+  int const prev_k = prev_ptr[tracker_offset(cache_slot, params.prev_num_accepted_stride)];
 
   // ── Varlen vs non-varlen prologue.  The kernel branches once on the
   // VARLEN template; downstream helpers receive `seq_len` (constexpr-foldable

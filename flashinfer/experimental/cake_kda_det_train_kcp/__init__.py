@@ -21,9 +21,7 @@ limitations under the License.
 # (``cake_kcp``), the partition and context plan (``cake_kcp_plan``), the registry of the KCP programs
 # (``cake_kcp_jit``) and their generated sources live here.  The chunk stages a rank runs at its own shape are
 # those of ``flashinfer.experimental.cake_kda_det_train``.  The names below resolve on first access, so importing
-# the package imports neither the host module (``torch.distributed``) nor the loader.  The names before the det
-# rename (``KcpContext``, ``chunk_kda_kcp``, ...) stay bound to the same objects in ``cake_kcp`` and
-# ``cake_kcp_plan`` and are not in ``__all__``.
+# the package imports neither the host module (``torch.distributed``) nor the loader.
 
 from importlib import import_module
 from typing import Any

@@ -1833,6 +1833,44 @@ def test_fused_prefill_is_byte_identical_to_the_materialized_chain(
     assert_guard(guard, what)
 
 
+@pytest.mark.parametrize("scenario", PREFILL_SCENARIOS)
+def test_fused_prefill_n256_lists_are_byte_identical(
+    monkeypatch, scenario: str
+) -> None:
+    """TP2 P256: the list build with two pages per MMA (``score_topk16_n256``,
+    taken here for every window) writes the carrier rows of the materialized
+    path, padding rows included."""
+    lay = ref.IcpLayout(256, 2)
+    if not cake_jit.has_role("score_topk16_n256", cake_jit.device_arch(DEV.index)):
+        pytest.skip("no score_topk16_n256 program on this architecture")
+    monkeypatch.setattr(cake_backend, "N256_MIN_TOKENS", 1)
+    case, fast = _make_prefill(lay.page_size, scenario)
+    exp = prefill_expect(case, lay, fast=fast, with_global=not fast)
+    what = f"{case.label} {lay.name} n256"
+    mat = run_prefill(
+        case,
+        lay,
+        exp,
+        initialize=False,
+        what=f"{what} materialized",
+        check_scores=False,
+    )
+    t_max = max(w.total_q for w in case.windows())
+    pool, guard = prefill_pool(t_max, case.batch)
+    fused = run_prefill(
+        case,
+        lay,
+        exp,
+        initialize=False,
+        what=f"{what} fused",
+        carriers=_poisoned_carriers(lay, case.total_q),
+        pool=pool,
+    )
+    for r in range(lay.tp):
+        assert_words(fused[r], mat[r], f"{what}: rank {r} n256 vs materialized")
+    assert_guard(guard, what)
+
+
 @pytest.mark.parametrize("lay", LAYOUTS, ids=LAYOUT_IDS)
 def test_fused_prefill_reuses_stale_buffers(lay: ref.IcpLayout) -> None:
     """One pool / carrier / output set reused by a step, the step with the

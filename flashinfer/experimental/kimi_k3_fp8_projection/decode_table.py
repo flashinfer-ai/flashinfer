@@ -47,7 +47,9 @@ limitations under the License.
 # pair's tensor memory freed by the MMA warps, ``_tde`` alone a GEMM program
 # with the pair's tensor memory freed by the MMA warps; ``_prg`` a TMA-store GEMM
 # program whose MMA warp allocates the pair's tensor memory, the load warp left
-# out of the allocation rendezvous), measured faster on that
+# out of the allocation rendezvous; ``_pre`` a single-CTA fused decode program
+# whose load warp issues the first ring stage of its first work item before the
+# tensor memory allocation, which its MMA warp makes), measured faster on that
 # architecture's rows of the cell; ``route_twins(arch)`` reads it.
 # ``DECODE_TABLE_M_RANGES`` holds, per architecture and cell, in-bucket row
 # ranges ``(lo, hi, entry)`` whose rows take ``entry`` instead of the cell's
@@ -1446,6 +1448,12 @@ ROUTE_TWINS: dict[str, dict[str, dict[str, str]]] = {
         "5,28,4096": {
             "quant:u4": "quant:u4_xef_qel",
         },
+        "12,1,1": {
+            "decode:t16_p4_fused": "decode:t16_p4_fused_pre",
+        },
+        "12,1,8": {
+            "decode:t16_p4_fused": "decode:t16_p4_fused_pre",
+        },
         "12,1,4096": {
             "quant:u1": "quant:u1_xef_qel",
             "gemm_tstore_n192_k128_gs": "gemm_tstore_n192_k128_gs_prg",
@@ -1488,6 +1496,9 @@ ROUTE_TWINS: dict[str, dict[str, dict[str, str]]] = {
         },
         "17,28,4096": {
             "quant:u4": "quant:u4_xef_qel",
+        },
+        "18,6,1": {
+            "decode:t16_p4_fused": "decode:t16_p4_fused_pre",
         },
         "18,6,256": {
             "quant:u1": "quant:u1_xef_qel",
@@ -1561,6 +1572,12 @@ ROUTE_TWINS: dict[str, dict[str, dict[str, str]]] = {
         "50,28,4096": {
             "quant:u4": "quant:u4_xef_qel",
         },
+        "56,6,1": {
+            "decode:t16_p4_fused": "decode:t16_p4_fused_pre",
+        },
+        "56,6,8": {
+            "decode:t16_p4_fused": "decode:t16_p4_fused_pre",
+        },
         "56,6,256": {
             "quant:u1": "quant:u1_xef_qel",
         },
@@ -1598,6 +1615,18 @@ ROUTE_TWINS: dict[str, dict[str, dict[str, str]]] = {
         },
         "56,48,4096": {
             "quant:u4": "quant:u4_xef_qel",
+        },
+        "96,1,1": {
+            "decode:t16_p4_fused": "decode:t16_p4_fused_pre",
+        },
+        "96,1,8": {
+            "decode:t16_p4_fused": "decode:t16_p4_fused_pre",
+        },
+        "96,1,64": {
+            "decode:t64_p2_fused_res_tso": "decode:t64_p2_fused_res_tso_pre",
+        },
+        "96,1,256": {
+            "decode:t64_p2_fused_res_tso": "decode:t64_p2_fused_res_tso_pre",
         },
         "96,1,512": {
             "gemm_tstore_n192_k128": "gemm_tstore_n192_k128_ts3_tde",
@@ -1653,6 +1682,9 @@ ROUTE_TWINS: dict[str, dict[str, dict[str, str]]] = {
         },
         "144,6,1024": {
             "quant:u2": "quant:u2_xef_qel",
+        },
+        "192,2,1": {
+            "decode:t16_p4_fused": "decode:t16_p4_fused_pre",
         },
         "192,2,256": {
             "gemm_tstore_n192_k128": "gemm_tstore_n192_k128_ts3_tde",
@@ -1931,6 +1963,9 @@ ROUTE_TWINS: dict[str, dict[str, dict[str, str]]] = {
         },
         "192,2,256": {
             "gemm_tstore_n192_k128_gs": "gemm_tstore_n192_k128_gs_ts3_tde_prg",
+        },
+        "192,2,1024": {
+            "gemm_tstore_n192_k128": "gemm_tstore_n192_k128_prg",
         },
         "384,28,1": {
             "decode:t16_p4_fused": "decode:t16_p4_fused_wef",
