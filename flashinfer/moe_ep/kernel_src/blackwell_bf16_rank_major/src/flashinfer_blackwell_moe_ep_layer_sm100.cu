@@ -504,6 +504,71 @@ kernel_rank_major_stage_inputs_v1(const __nv_bfloat16* __restrict__ hidden_in, c
         topk_weights[route] = weights_in[route];
     }
 }
+#if __CUDA_ARCH__ == 1070
+
+// sm_107a: stage_inputs_v1 that also builds the route codes input_arrive_v2 builds (one warp per token instead
+// of one warp for all tokens), so the input barrier only sends them.
+__global__ __launch_bounds__(256) void
+kernel_rank_major_stage_inputs_v2(const __nv_bfloat16* __restrict__ hidden_in, const void* __restrict__ ids_in, const float* __restrict__ weights_in, __nv_bfloat16* __restrict__ hidden_states, int* __restrict__ topk_ids, float* __restrict__ topk_weights, int ids_is_int64, int hidden_copy, int active_tokens_per_rank, unsigned* __restrict__ route_codes_out)
+{
+    // One CTA per active token: the hidden row (7168 BF16 = 896 x 16 B) into the symmetric hidden_states row, the 8
+    // routing ids narrowed to int32 (same value as the int64 hop: (int)(long long)id), the 8 weights, and the token's
+    // route codes for every owner o (one byte per route: o's local expert, or 0xff for a route owned elsewhere) into
+    // the local route_codes_out[o][token]; input_arrive_v3 sends them to the owners.
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    const int tid = threadIdx.x;
+    const int token = blockIdx.x;
+    if (hidden_copy) {
+        const uint4* src = reinterpret_cast<const uint4*>(hidden_in + (unsigned long long)token * 7168);
+        uint4* dst = reinterpret_cast<uint4*>(hidden_states + (unsigned long long)token * 7168);
+        uint4 v[4];
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const int idx = tid + i * 256;
+            if (idx < 896) {
+                v[i] = src[idx];
+            }
+        }
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const int idx = tid + i * 256;
+            if (idx < 896) {
+                dst[idx] = v[i];
+            }
+        }
+    }
+    if (tid < 32) {
+        // warp 0: lane k < 8 loads route k; lane o < 8 then builds owner o's 8 code bytes from all 8 ids
+        int id = -1;
+        if (tid < 8) {
+            const int route = token * 8 + tid;
+            if (ids_is_int64) {
+                id = (int)(reinterpret_cast<const long long*>(ids_in)[route]);
+            } else {
+                id = (int)(long long)(reinterpret_cast<const int*>(ids_in)[route]);
+            }
+            topk_ids[route] = id;
+            topk_weights[route] = weights_in[route];
+        }
+        unsigned int lo = 0u;
+        unsigned int hi = 0u;
+        #pragma unroll
+        for (int slot = 0; slot < 8; slot++) {
+            const int slot_id = __shfl_sync(0xffffffff, id, slot);
+            const int local = slot_id - tid * 32;
+            const unsigned int code = ((unsigned int)slot_id < 256u && (unsigned int)local < 32u) ? (unsigned int)local : 0xffu;
+            if (slot < 4) {
+                lo |= code << (8 * slot);
+            } else {
+                hi |= code << (8 * (slot - 4));
+            }
+        }
+        if (tid < 8) {
+            reinterpret_cast<uint2*>(route_codes_out)[tid * 128 + token] = make_uint2(lo, hi);
+        }
+    }
+}
+#endif
 
 } // extern "C"
 
@@ -634,6 +699,74 @@ kernel_rank_major_input_arrive_v2(int* __restrict__ topk_ids, int active_tokens_
         }
     }
 }
+#if __CUDA_ARCH__ == 1070
+
+__global__ __launch_bounds__(32) void
+kernel_rank_major_input_arrive_v3(int active_tokens_per_rank, int32_t pg_world, int32_t pg_rank, unsigned* const* __restrict__ pg_flags, const unsigned* __restrict__ route_codes_out, unsigned* const* __restrict__ route_codes_peers)
+{
+    // Sends the route codes kernel_rank_major_stage_inputs_v2 built (route_codes_out[o][token]) into every owner o's
+    // route_codes[this rank], then releases this rank's staged inputs (rows, ids, weights, codes) to every peer.
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    {
+        // every lane moves 16 bytes (two tokens' codes) per owner and step (a coalesced 512-byte warp store per owner
+        // and step; at most two steps for 128 rows); all loads are issued before the stores. The __syncwarp below
+        // orders all lanes' code stores before each lane's release.
+        const int pairs = (active_tokens_per_rank + 1) / 2;
+        const uint4* src = reinterpret_cast<const uint4*>(route_codes_out);
+        uint4 v[2][8];
+        #pragma unroll
+        for (int k = 0; k < 2; k++) {
+            const int i = (int)lane + 32 * k;
+            #pragma unroll
+            for (int o = 0; o < 8; o++) {
+                if (i < pairs) {
+                    v[k][o] = src[o * 64 + i];
+                }
+            }
+        }
+        #pragma unroll
+        for (int k = 0; k < 2; k++) {
+            const int i = (int)lane + 32 * k;
+            #pragma unroll
+            for (int o = 0; o < 8; o++) {
+                if (i < pairs && o < pg_world) {
+                    reinterpret_cast<uint4*>(route_codes_peers[o])[pg_rank * 64 + i] = v[k][o];
+                }
+            }
+        }
+        __syncwarp();
+    }
+
+    // nvlink_arrive(pg_flags) phase=0: publish this rank's epoch to every peer's mailbox; consumers wait per peer.
+    {
+        const int __ws = pg_world;
+        const int __me = pg_rank;
+        const int __lane = lane;
+        unsigned* __local_epoch = pg_flags[__me] + 0;
+        unsigned __previous_epoch;
+        asm volatile("ld.relaxed.sys.global.u32 %0, [%1];"
+            : "=r"(__previous_epoch) : "l"(__local_epoch) : "memory");
+        const unsigned __epoch = __previous_epoch + 1u;
+        const int __bank = (int)(__epoch & 1u);
+        const int __mailbox_base = 2 + (0 * 2 + __bank) * __ws;
+        asm volatile("fence.proxy.async.global;" ::: "memory");
+        asm volatile("fence.proxy.alias;" ::: "memory");
+        if (__lane < __ws) {
+            unsigned* __peer_mailbox = pg_flags[__lane] + __mailbox_base + __me;
+            asm volatile("st.release.sys.global.u32 [%0], %1;"
+                :: "l"(__peer_mailbox), "r"(__epoch) : "memory");
+        }
+        __syncwarp();
+        if (__lane == 0) {
+            asm volatile("st.relaxed.gpu.global.u32 [%0], %1;"
+                :: "l"(__local_epoch), "r"(__epoch) : "memory");
+        }
+    }
+}
+#endif
 
 } // extern "C"
 
@@ -860,9 +993,17 @@ kernel_rank_major_dispatch_v4(__nv_bfloat16* __restrict__ recv_hidden, int* __re
     }
     __syncthreads();
     {
+#if __CUDA_ARCH__ == 1070
+        // sm_107a (input_arrive_v3 sends no routed bits): the source's route codes of this token for this owner (stored
+        // before the release acquired above); all eight bytes 0xff = no route of the token lands here
+        unsigned int code_lo, code_hi;
+        asm volatile("ld.relaxed.sys.global.v2.u32 {%0,%1}, [%2];" : "=r"(code_lo), "=r"(code_hi) : "l"(route_codes + (src_rank * 128 + src_token) * 2) : "memory");
+        if ((code_lo & code_hi) == 0xffffffffu) {
+#else
         unsigned int routed_word;
         asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(routed_word) : "l"(routed + src_rank * 4 + (src_token >> 5)) : "memory");
         if (((routed_word >> (src_token & 31)) & 1u) == 0u) {
+#endif
             // No route of this token lands here: same route entries as a pulled all-remote id row, no row pull.
             if (tid < 8) {
                 unsigned long long route_index = (unsigned long long)recv_token * 8 + (unsigned long long)tid;
@@ -3977,6 +4118,13 @@ kernel_rank_major_combine_v3(__nv_bfloat16* __restrict__ output, int32_t pg_worl
     const int tid = threadIdx.x;
     extern __shared__ __align__(1024) char smem_raw[];
     const int smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+#if __CUDA_ARCH__ == 1070
+    // sm_107a: before the wait only an L2 prefetch hint of this token's topk_ids line (no memory-model effect; the
+    // ids are loaded after the wait)
+    if (tid == 0) {
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(topk_ids + blockIdx.x * 8) : "memory");
+    }
+#endif
     asm volatile("griddepcontrol.wait;" ::: "memory");
     const int token = blockIdx.x;
     const int chunk = blockIdx.y;
@@ -4104,6 +4252,9 @@ kernel_rank_major_combine_v3(__nv_bfloat16* __restrict__ output, int32_t pg_worl
 // accesses). No flag or fence orders the data.
 // Epoch: ll_control[0] = epoch of the last LL forward (read by ll_push, which uses e = [0] + 1 and stores [1] = e);
 // ll_recv, exact_unpermute_v6 and combine_v6 read [1] after griddepcontrol.wait; ll_recv's CTA 0 stores [0] = e.
+// sm_107a: ll_recv computes the same e from [0] before its griddepcontrol.wait (it polls while ll_push runs) and
+// does not store [0]; combine_v6 (CTA (0, 0), thread 128) stores [0] = e after its wait, when every reader of [0] in
+// this forward has completed. ll_push is launched without PDL, so [0] is final before any reader of a forward starts.
 // Buffers start zeroed and e >= 1. Slots are double-banked by e & 1.
 // Buffer reuse: a bank is rewritten two LL forwards later. At the start of every LL forward each rank releases its
 // epoch to every rank (ll_push warp 8: fence.acq_rel.sys, then st.relaxed.sys into ll_reuse[this rank] of the peer);
@@ -4361,17 +4512,38 @@ __global__ __launch_bounds__(256) void
 kernel_rank_major_ll_recv_v2(__nv_bfloat16* __restrict__ recv_hidden, int* __restrict__ recv_local_ids, float* __restrict__ recv_weights, int active_tokens_per_rank, int32_t pg_world, int32_t pg_rank, const unsigned long long* __restrict__ ll_dispatch, unsigned* __restrict__ ll_control, int* __restrict__ expert_scatter_offsets, int* __restrict__ token_to_permuted, int* __restrict__ cta_to_expert, int* __restrict__ cta_to_mn_limit, int* __restrict__ expert_padded_row_offsets, int* __restrict__ num_non_exiting_ctas, int* __restrict__ total_padded_rows, int* __restrict__ route_map, __nv_bfloat16* __restrict__ zero_sentinel, int row_splits)
 {
     const int tid = threadIdx.x;
+#if __CUDA_ARCH__ == 1070
+    // sm_107a: polls while ll_push (the primary grid) still runs: nothing read here before the final
+    // griddepcontrol.wait is written by ll_push. The LL words carry their epoch; ll_control[0] (the last LL forward's
+    // epoch, stored by that forward's combine_v6) was written by a grid that completed before ll_push, which is
+    // launched without PDL, began. The epoch is computed as in ll_push. Every thread executes griddepcontrol.wait
+    // before it exits, so this grid completes only after ll_push completed (later grids read ll_push's stores through
+    // this grid's completion).
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    unsigned previous;
+    asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(previous) : "l"(ll_control + 0) : "memory");
+    unsigned epoch = previous + 1u;
+    if (epoch == 0u) {
+        epoch = 2u;
+    }
+#else
     asm volatile("griddepcontrol.wait;" ::: "memory");
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     unsigned epoch;
     asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(epoch) : "l"(ll_control + 1) : "memory");
+#endif
     const unsigned long long* bank_words = ll_dispatch + (unsigned long long)(((int)(epoch & 1u)) * 8 * LL_MAX_T) * LL_SLOT_WORDS;
     const int bid = blockIdx.x;
     if (bid == 0) {
+#if __CUDA_ARCH__ == 1070
+        rank_major_route_cta_ll(active_tokens_per_rank, pg_rank, bank_words, epoch, expert_scatter_offsets, token_to_permuted, cta_to_expert, cta_to_mn_limit, expert_padded_row_offsets, num_non_exiting_ctas, total_padded_rows, route_map, zero_sentinel);
+        asm volatile("griddepcontrol.wait;" ::: "memory");
+#else
         if (tid == 0) {
             asm volatile("st.relaxed.gpu.global.u32 [%0], %1;" :: "l"(ll_control + 0), "r"(epoch) : "memory");
         }
         rank_major_route_cta_ll(active_tokens_per_rank, pg_rank, bank_words, epoch, expert_scatter_offsets, token_to_permuted, cta_to_expert, cta_to_mn_limit, expert_padded_row_offsets, num_non_exiting_ctas, total_padded_rows, route_map, zero_sentinel);
+#endif
         return;
     }
     const int unit = bid - 1;
@@ -4406,6 +4578,9 @@ kernel_rank_major_ll_recv_v2(__nv_bfloat16* __restrict__ recv_hidden, int* __res
         }
     }
     if (!__any_sync(0xffffffff, hit)) {
+#if __CUDA_ARCH__ == 1070
+        asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
         return;
     }
     // 1792 16-byte LL vectors (two payload words = four BF16 each) per row; this split polls 1792 / row_splits
@@ -4439,6 +4614,9 @@ kernel_rank_major_ll_recv_v2(__nv_bfloat16* __restrict__ recv_hidden, int* __res
     }
     // recv_hidden is read by FC1 through TMA (async proxy) in a later grid
     asm volatile("fence.proxy.async.global;" ::: "memory");
+#if __CUDA_ARCH__ == 1070
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
 }
 
 } // extern "C"
@@ -4468,6 +4646,17 @@ kernel_rank_major_exact_unpermute_v6(__nv_bfloat16* __restrict__ expert_output, 
     unsigned int token = (unsigned int)(src_rank * 128 + src_token);
     unsigned int route_base = token * 8;
     // recv_weights / token_to_permuted come from ll_recv (an earlier grid): read them after griddepcontrol.wait
+#if __CUDA_ARCH__ == 1070
+    // sm_107a: before the wait only L2 prefetch hints of their two 32-byte lines and of ll_control are issued (no
+    // memory-model effect; the values are loaded after the wait).
+    if (tid == 0) {
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(topk_weights + route_base) : "memory");
+    } else if (tid == 32) {
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(token_to_permuted + route_base) : "memory");
+    } else if (tid == 64) {
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(ll_control) : "memory");
+    }
+#endif
     asm volatile("griddepcontrol.wait;" ::: "memory");
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     if (tid < 8) {
@@ -4581,11 +4770,27 @@ kernel_rank_major_combine_v6(__nv_bfloat16* __restrict__ output, int32_t pg_rank
     // One CTA per (token, 1024-column chunk): poll every routed owner's LL partial words, then the FP32 sum in owner
     // order of kernel_rank_major_combine_v3 (+0.0 for owners without a route of this token).
     const int tid = threadIdx.x;
+#if __CUDA_ARCH__ == 1070
+    // sm_107a: before the wait only L2 prefetch hints of this token's topk_ids line and of ll_control (no memory-model
+    // effect; the values are loaded after the wait)
+    if (tid == 0) {
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(topk_ids + blockIdx.x * 8) : "memory");
+    } else if (tid == 32) {
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(ll_control) : "memory");
+    }
+#endif
     asm volatile("griddepcontrol.wait;" ::: "memory");
     const int token = blockIdx.x;
     const int chunk = blockIdx.y;
     unsigned epoch;
     asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(epoch) : "l"(ll_control + 1) : "memory");
+#if __CUDA_ARCH__ == 1070
+    if (tid == 128 && token == 0 && chunk == 0) {
+        // sm_107a: last LL epoch for the next LL forward's ll_push and ll_recv: every reader of ll_control[0] in this
+        // forward (ll_push, ll_recv) completed before the wait above returned
+        asm volatile("st.relaxed.gpu.global.u32 [%0], %1;" :: "l"(ll_control + 0), "r"(epoch) : "memory");
+    }
+#endif
     if (tid >= 128) {
         // warp 4: acquire pattern (buffer reuse, see the LL protocol note) of every peer's release of this forward,
         // CTA (0, 0) only, off the combine's data path

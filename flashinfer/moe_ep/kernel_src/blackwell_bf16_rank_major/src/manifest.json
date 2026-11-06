@@ -1,4 +1,34 @@
 {
+  "arch_stage_overrides": {
+    "sm_107a": {
+      "input_arrive": {
+        "bindings": [
+          "active_tokens_per_rank",
+          "pg_world",
+          "pg_rank",
+          "pg_flags",
+          "route_codes_out",
+          "route_codes_peers"
+        ],
+        "symbol": "kernel_rank_major_input_arrive_v3"
+      },
+      "stage_inputs": {
+        "bindings": [
+          "hidden_in",
+          "ids_in",
+          "weights_in",
+          "hidden_states",
+          "topk_ids",
+          "topk_weights",
+          "ids_is_int64",
+          "hidden_copy",
+          "active_tokens_per_rank",
+          "route_codes_out"
+        ],
+        "symbol": "kernel_rank_major_stage_inputs_v2"
+      }
+    }
+  },
   "archs": [
     "sm_100a",
     "sm_107a"
@@ -35,7 +65,7 @@
     "kernel_rank_major_combine_v6"
   ],
   "schema_version": 1,
-  "source_sha256": "96c463441177f629dbdceaecdaa0d6fbffcf2600ad192313d845125205892b34",
+  "source_sha256": "88ea25fd37749f3072c7985d3b3bb43439bb938f08a3d66cda72ccce0735080d",
   "stages": [
     {
       "bindings": [
