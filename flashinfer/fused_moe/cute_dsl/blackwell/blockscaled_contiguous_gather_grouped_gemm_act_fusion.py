@@ -328,6 +328,10 @@ if not hasattr(cutlass, "__version__"):
     cutlass.utils.StaticPersistentTileScheduler._get_cluster_work_idx_with_fastdivmod = hooked_get_cluster_work_idx_with_fastdivmod
 
 
+def _identity_epilogue(x):
+    return x
+
+
 class BlockScaledContiguousGatherGroupedGemmKernel:
     """This class implements contiguous grouped matrix multiplication with gather operation and SwiGLU fusion
     for FC1 layer computation (C = up * silu(gate), where up/gate come from interleaved GEMM result).
@@ -818,7 +822,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         clamped_relu2_limit: Optional[cute.Tensor],
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
-        epilogue_op: cutlass.Constexpr = lambda x: x,
+        epilogue_op: cutlass.Constexpr = _identity_epilogue,
     ):
         """Execute the contiguous grouped GEMM with gather operation and SwiGLU fusion.
 
@@ -932,8 +936,13 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         self.generate_sfc = sfc_tensor is not None
         # Fold ClampedRelu2's L ** 2 into the output scales to avoid per-element
         # multiplies by L. Assumes L ** 2 and alpha / L stay normal in fp32,
-        # which holds for any practical clamp limit.
-        self.fold_clamped_relu2_l2 = self.use_clamped_relu2 and self.generate_sfc
+        # which holds for any practical clamp limit. A custom epilogue_op must
+        # see the full activation, not act / L ** 2, so it disables the fold.
+        self.fold_clamped_relu2_l2 = (
+            self.use_clamped_relu2
+            and self.generate_sfc
+            and epilogue_op is _identity_epilogue
+        )
         if cutlass.const_expr(
             self.generate_sfc and not self.is_mxfp8_output and norm_const_tensor is None
         ):
@@ -4103,7 +4112,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         scaling_vector_size: cutlass.Constexpr,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
-        epilogue_op: cutlass.Constexpr = lambda x: x,
+        epilogue_op: cutlass.Constexpr = _identity_epilogue,
     ):
         scale_k = k // scaling_vector_size
         interm_size = n // self.out_n_factor
