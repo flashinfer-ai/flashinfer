@@ -348,15 +348,19 @@ def test_registry_records_are_well_formed():
         assert set(keys) == set(scan_keys) | set(finalize_keys) | set(rank_keys) | {
             MERGE_KEY
         }, arch
-        # every scan key follows the key grammar; an FP8 key (``:fp8`` before ``:lsf``) runs in the plain unit order
-        # and the sampled-fit form, and the BF16 record's rules below are the BF16 programs' (the FP8 form has a
-        # record of its own, ``policy_for(arch, "fp8")``)
+        # every scan key follows the key grammar; an FP8 key (``:fp8`` before ``:lsf``) runs the sampled-fit form, in
+        # the plain unit order or as the snake copy of a registered plain FP8 program, and the BF16 record's rules
+        # below are the BF16 programs' (the FP8 form has a record of its own, ``policy_for(arch, "fp8")``)
         for key in scan_keys:
             fields = scan_key_fields(key)
             assert fields is not None, (arch, key)
             assert (key.split(":")[-1] == "lsf") == fields.lsf, (arch, key)
             if fields.form == cake_policy.FP8:
-                assert not fields.snake and fields.sample_fit, (arch, key)
+                assert fields.sample_fit, (arch, key)
+                assert not fields.snake or key.replace(":s1:", ":s0:", 1) in keys, (
+                    arch,
+                    key,
+                )
         scan_keys = [k for k in scan_keys if scan_key_form(k) == cake_policy.BF16]
         # the rank finalize programs are registered exactly where the architecture's rule admits a call
         assert bool(rank_keys) == (

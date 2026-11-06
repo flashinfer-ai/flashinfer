@@ -160,7 +160,9 @@ s[t, j] = k_scale[j] * sum_h w[t, h] * relu(sum_d q[t, h, d] * k[j, d])
   -> `l6`, the largest FP8 unit below `wide`, `pair_narrow` -> `narrow`,
   `split_wide` -> `split_narrow`, and `split_l6` -> `split_narrow` where no
   FP8 `split_l6` program is registered); the program
-  runs without a CTA pair, in the plain unit order, in its sampled-fit form,
+  runs without a CTA pair, in the plain unit order (the snake order where
+  the decision takes it and the snake copy of the FP8 program is
+  registered: the `l6` program on `sm_107a`), in its sampled-fit form,
   with the decided tile unroll where an FP8 program of it is registered
   (else the smallest registered one) and in the longest-first order where
   the BF16 rule picks it and an FP8 copy exists.  A fallback kind takes its

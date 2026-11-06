@@ -1894,8 +1894,9 @@ def select_fp8_program(
     architecture's FP8 record ``policy`` (``fp8_policy_record``) with the registry's ``scan_keys``, run by the FP8
     program (``fp8_program_choice``) of the decided physical kind -- of its ``FP8_KIND_FALLBACK`` kind, with that
     kind's sampled first threshold and check period (``fallback_knobs``), where no FP8 program of the decided kind is
-    registered -- in the decided segment order (``:lsf`` where its FP8 copy is registered) and with the decided tile
-    unroll where an FP8 program of it is registered, else the smallest registered one.  ``fp8_programs``:
+    registered -- in the decided segment order (``:lsf`` where its FP8 copy is registered), with the decided tile
+    unroll where an FP8 program of it is registered, else the smallest registered one, and in the snake unit order
+    where the decision marks it and the registry has the snake copy (``s1``) of that program.  ``fp8_programs``:
     ``fp8_scan_programs(scan_keys)``, made once by the caller.  Raises ``NotImplementedError`` when no FP8 program
     serves the kind."""
     choice = select_program(policy, scan_keys=scan_keys, **call)
@@ -1910,6 +1911,8 @@ def select_fp8_program(
             f"(registered FP8 kinds: {sorted({kind for kind, _lsf in programs})})"
         )
     key = unrolls.get(choice.tile_unroll, unrolls[min(unrolls)])
+    if choice.snake and key.replace(":s0:", ":s1:", 1) in scan_keys:
+        key = key.replace(":s0:", ":s1:", 1)
     if physical != choice.physical_kind:
         choice = fallback_knobs(policy, choice, physical, call)
     return fp8_program_choice(policy, choice, key)
