@@ -490,6 +490,9 @@ def test_test_manifest_is_the_test_only_programs_under_the_opt_in(
 
 
 DET_PREFIX, PREFIX = "cake_kda_det_train_", "cake_kda_train_"
+# The deterministic package's programs this package has no form of: the fused forward walk (the forward state walk
+# with the chunk output inside it), whose records only the deterministic package ships.
+DET_ONLY_PROGRAMS = ("kcp_fwdh_o",)
 # The records whose builds differ between the two packages: the deterministic package ships newer builds of the
 # affine merge (selected by its MERGE_RULE), of the full-width offset walks (the adjoint one beside the plain build,
 # selected by its WALK_HEADS_RULE) and of the shipped transfer walk; this package keeps its own builds of these
@@ -524,12 +527,15 @@ def test_the_records_are_the_deterministic_records_under_this_packages_names() -
     """The KCP programs have no non-deterministic form: both tables hold the deterministic package's records, every
     field equal but the library stem and the kernel symbol, which carry the same twenty hex digits under this
     package's prefix; no library or kernel symbol of this package is one of the deterministic package's.  The records
-    of ``OWN`` are this package's own builds."""
+    of ``OWN`` are this package's own builds; the programs of ``DET_ONLY_PROGRAMS`` are the deterministic package's
+    alone."""
     own_programs = {kcp_jit.MODULES[name]["program"] for name in OWN}
     for table in ("MODULES", "TEST_MODULES"):
         ours, theirs = getattr(kcp_jit, table), getattr(det_kcp_jit, table)
         assert set(ours) <= set(theirs), table
-        assert {theirs[n]["program"] for n in set(theirs) - set(ours)} <= own_programs
+        assert {
+            theirs[n]["program"] for n in set(theirs) - set(ours)
+        } <= own_programs | set(DET_ONLY_PROGRAMS)
         for name, record in ours.items():
             assert record["library"].startswith(PREFIX), name
             if name in OWN:
@@ -543,7 +549,12 @@ def test_the_records_are_the_deterministic_records_under_this_packages_names() -
         for r in {**det_kcp_jit.MODULES, **det_kcp_jit.TEST_MODULES}.values()
     }
     assert not ours & theirs
-    assert kcp_jit.PROGRAMS == det_kcp_jit.PROGRAMS
+    assert set(DET_ONLY_PROGRAMS) <= set(det_kcp_jit.PROGRAMS)
+    assert not set(DET_ONLY_PROGRAMS) & set(kcp_jit.PROGRAMS)
+    assert (
+        tuple(p for p in det_kcp_jit.PROGRAMS if p not in DET_ONLY_PROGRAMS)
+        == kcp_jit.PROGRAMS
+    )
     assert kcp_jit.LOGICAL_TENSORS == det_kcp_jit.LOGICAL_TENSORS
     assert kcp_jit.LOGICAL_SCALARS == det_kcp_jit.LOGICAL_SCALARS
 

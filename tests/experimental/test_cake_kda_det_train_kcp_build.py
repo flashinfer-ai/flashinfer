@@ -70,6 +70,13 @@ FWD_O_PLAN = [
     ["buffer", "chunk_bos"], ["buffer", "chunk_len"], ["buffer", "seq_chunk_start"], ["parameter", "num_seqs"],
     ["parameter", "num_heads"], ["parameter", "scale"], *GRID,
 ]  # fmt: skip
+FWDH_O_PLAN = [
+    ["buffer", "w_tma"], ["buffer", "kg_tma"], ["buffer", "u"], ["buffer", "gk"], ["parameter", "num_heads"],
+    ["buffer", "seq_chunk_start"], ["parameter", "num_seqs"], ["buffer", "walk_seg"], ["buffer", "h0"],
+    ["buffer", "h0_index"], ["parameter", "h0_hg"], ["parameter", "h0_n"], ["parameter", "tile_stride"],
+    ["buffer", "qg_tma"], ["buffer", "aqk_tma"], ["buffer", "o_out"], ["buffer", "chunk_bos"], ["buffer", "chunk_len"],
+    ["parameter", "scale"], *GRID,
+]  # fmt: skip
 DAV_PLAN = [
     ["buffer", "do_tma"], ["buffer", "vnew_tma"], ["buffer", "aqk_tma"], ["buffer", "dAqk"], ["buffer", "dv1"],
     ["parameter", "num_heads"], ["parameter", "scale"], *GRID,
@@ -90,13 +97,13 @@ MERGE_RECORDS = {
         ARCHES,
     ),
     "kcp_affine_merge_c32": (
-        {"chunk_k": 32, "cols_per_cta": 32, "pairs": True, "ring": 4, "tile": "4x8"},
+        {"chunk_k": 32, "cols_per_cta": 32, "pairs": True, "ring": 4, "tile": "8x4"},
         128,
         ARCHES,
     ),
     "kcp_affine_merge_c64": (
-        {"chunk_k": 32, "cols_per_cta": 64, "pairs": True, "ring": 4, "tile": "8x8"},
-        128,
+        {"chunk_k": 32, "cols_per_cta": 64, "pairs": True, "ring": 4, "tile": "8x4"},
+        256,
         ("sm_100a", "sm_103a"),
     ),
 }
@@ -105,11 +112,15 @@ MERGE_RECORDS = {
 MERGE_SELECT = {
     ("sm_103a", 128, 64): "kcp_affine_merge_c64",
     ("sm_100a", 128, 57): "kcp_affine_merge_c64",
-    ("sm_107a", 128, 64): "kcp_affine_merge_c32",
+    ("sm_107a", 128, 64): "kcp_affine_merge_c16",
+    ("sm_107a", 128, 49): "kcp_affine_merge_c16",
+    ("sm_107a", 128, 48): "kcp_affine_merge_c32",
     ("sm_103a", 128, 56): "kcp_affine_merge_c16",
     ("sm_103a", 256, 21): "kcp_affine_merge_c16",
     ("sm_103a", 128, 40): "kcp_affine_merge_c32",
-    ("sm_107a", 128, 21): "kcp_affine_merge_c32",
+    ("sm_107a", 256, 13): "kcp_affine_merge_c32",
+    ("sm_107a", 128, 24): "kcp_affine_merge_c16",
+    ("sm_107a", 128, 21): "kcp_affine_merge_c16",
     ("sm_103a", 256, 10): "kcp_affine_merge_c16",
     ("sm_103a", 128, 13): "kcp_affine_merge_c16",
     ("sm_103a", 128, 12): "kcp_affine_merge_c8",
@@ -128,6 +139,8 @@ PLANS = {
     **dict.fromkeys(MERGE_RECORDS, MERGE_PLAN),
     "kcp_fwd_o": FWD_O_PLAN,
     "kcp_dav": DAV_PLAN,
+    "kcp_fwdh_o": FWDH_O_PLAN,
+    "kcp_fwdh_o_vh64": FWDH_O_PLAN,
     "kcp_transfer_walk_three_mma": TRANSFER_PLAN,
     "kcp_transfer_walk_plain_tf32": TRANSFER_PLAN,
     "kcp_transfer_walk_bf16x3": TRANSFER_PLAN,
@@ -137,8 +150,14 @@ PLANS = {
 }
 # Launch block of the records that are not 192 threads wide (the merge records: MERGE_RECORDS); the full-width fwdh
 # offset walk runs the split-role schedule (four state, four decay, one TMA and one MMA warp), the shipped transfer
-# walk two compute warpgroups (eight compute, one load and one MMA warp).
-BLOCKS = {"kcp_fwdh_offset": 320, "kcp_transfer_walk": 320}
+# walk two compute warpgroups (eight compute, one load and one MMA warp), the fused forward walk ten warps in both
+# forms.
+BLOCKS = {
+    "kcp_fwdh_offset": 320,
+    "kcp_transfer_walk": 320,
+    "kcp_fwdh_o": 320,
+    "kcp_fwdh_o_vh64": 320,
+}
 # The identity rule: ``cake_kda_det_train_<20 hex of sha256("<source module>\\n<sorted JSON of the build keywords>")>``,
 # then ``_kcp`` for a program only the context-parallel route runs (every one but the single-rank ``dav`` stage).
 # The digest hashes the source module path the program shipped under, so the digests are those of the previous names
@@ -180,6 +199,14 @@ IDENTITIES = {
     **{name: (MERGE_V2_MODULE, row[0]) for name, row in MERGE_RECORDS.items()},
     "kcp_fwd_o": (f"tart.kda_chunk_kcp_fwd_o.{_W}.kda_chunk_det_fwd_o_v1_kcp", {}),
     "kcp_dav": (f"tart.kda_chunk_bwd_dav.{_W}.kda_chunk_train_bwd_dav_v1", {}),
+    "kcp_fwdh_o": (
+        f"tart.kda_chunk_kcp_fwd_h.{_W}.kda_chunk_det_fwdh_o_v1_kcp",
+        {"vh": 128},
+    ),
+    "kcp_fwdh_o_vh64": (
+        f"tart.kda_chunk_kcp_fwd_h.{_W}.kda_chunk_det_fwdh_o_v1_kcp",
+        {"vh": 64},
+    ),
     "kcp_transfer_walk_three_mma": (
         f"tart.kda_chunk_kcp_transfer_walk.{_W}.kda_chunk_kcp_transfer_walk_v1",
         {"precision_mode": 1},
@@ -236,7 +263,9 @@ def test_the_tables_are_disjoint_and_complete() -> None:
         "kcp_affine_merge",
         "kcp_fwd_o",
         "kcp_dav",
+        "kcp_fwdh_o",
     )
+    assert (*kcp_jit.PROGRAMS[:5], "kcp_fwdh_o") == kcp_jit.WALK_PROGRAMS
     assert kcp_jit.PRECISION_MODES == (0, 1, 2)
     assert kcp_jit.TRANSFER_WALKS == ("bf16x3_hw64", "tf32_hilo", "bf16x3")
 
@@ -319,7 +348,8 @@ def test_merge_selection_covers_every_launch_once() -> None:
                 assert arch in kcp_jit.MODULES[record]["arches"], (arch, record)
                 named.setdefault(record, set()).add(arch)
     assert named == {name: set(MERGE_RECORDS[name][2]) for name in MERGE_RECORDS}
-    # without an architecture: the record every architecture names, refused where they differ (T > 56)
+    # without an architecture: the record every architecture names, refused where they differ (T 21-24, 41-48 and
+    # above 56)
     assert kcp_jit.merge_record(128, 8) == "kcp_affine_merge_c8"
     with pytest.raises(ValueError):
         kcp_jit.merge_record(128, 64)
@@ -340,6 +370,12 @@ def test_selection_and_grids() -> None:
     with pytest.raises(ValueError):
         kcp_jit.select_record("kcp_fwdh_offset")  # two records: the form must be given
     assert kcp_jit.select_record("kcp_fwdh_tape", form="split") == "kcp_fwdh_tape"
+    assert kcp_jit.select_record("kcp_fwdh_o", form="full") == "kcp_fwdh_o"
+    assert kcp_jit.select_record("kcp_fwdh_o", form="split") == "kcp_fwdh_o_vh64"
+    with pytest.raises(ValueError):
+        kcp_jit.select_record("kcp_fwdh_o")
+    assert kcp_jit.launch_grid("kcp_fwdh_o", n_walk=3, num_heads=4) == (12, 1, 1)
+    assert kcp_jit.launch_grid("kcp_fwdh_o_vh64", n_walk=3, num_heads=4) == (24, 1, 1)
     assert kcp_jit.launch_grid("kcp_fwdh_offset", n_walk=3, num_heads=4) == (12, 1, 1)
     assert kcp_jit.launch_grid("kcp_fwdh_offset_vh64", n_walk=3, num_heads=4) == (
         24,
@@ -414,14 +450,21 @@ def test_test_record_selection_by_knobs() -> None:
 
 
 def test_walk_form_rules_and_records() -> None:
-    # the offset programs: the fit rule (two shipped records); the tape programs: split on every launch, the
-    # full-width record test-only under walk_form "full"
+    # the offset programs: the fit rule (two shipped records); the tape programs: split on every launch, the full-width
+    # record test-only under walk_form "full"; the fused forward walk: a rule per architecture (two shipped records)
     assert kcp_jit.WALK_FORM_RULES == {
         "kcp_fwdh_offset": "fit",
         "kcp_fwdh_tape": "split",
         "kcp_dhu_offset": "fit",
         "kcp_dhu_tape": "split",
+        "kcp_fwdh_o": kcp_jit.FWDH_O_FORM_RULE,
     }
+    assert kcp_jit.FWDH_O_FORM_RULE == {
+        "sm_100a": ((32, "split"), (None, "full")),
+        "sm_103a": ((32, "split"), (None, "full")),
+        "sm_107a": ((48, "fit"), (None, "full")),
+    }
+    assert set(kcp_jit.FWDH_O_FORM_RULE) == set(ARCHES)
     sms = 152
     assert kcp_jit.walk_form("kcp_fwdh_offset", [222, 222], 64, sms) == "split"
     assert kcp_jit.walk_form("kcp_fwdh_offset", [111, 59, 52], 64, sms) == "split"
@@ -435,6 +478,58 @@ def test_walk_form_rules_and_records() -> None:
     assert kcp_jit.walk_form("kcp_fwdh_offset", [64] * 7, 1, sms) == "split"
     assert kcp_jit.walk_form("kcp_fwdh_offset", [], 64, sms) == "full"
     assert kcp_jit.walk_form("kcp_fwdh_tape", [124, 124, 124], 64, sms) == "split"
+    # the fused forward walk: the architecture's rule on every launch (one wave or several; on sm_100a / sm_103a the
+    # two-CTA record up to 32 heads, the full-width one above; on sm_107a the fit rule up to 48 heads, the full-width
+    # record above: the W4 list at 32 to 48 heads, 512 to 768 two-CTA CTAs on 304 slots, outlasts its longest chain),
+    # the knob's form where given
+    w4 = [48, 48, 32, 32, 28, 28, 20, 20]
+    by_heads = {
+        1: "split",
+        4: "split",
+        16: "split",
+        32: "split",
+        33: "full",
+        64: "full",
+    }
+    fit_by_heads = {
+        1: "split",
+        4: "split",
+        16: "split",
+        32: "split",
+        33: "split",
+        48: "split",
+        49: "full",
+        64: "full",
+    }
+    for arch in ARCHES:
+        for chains in (w4, [222, 222], [48]):
+            for heads, form in (
+                fit_by_heads if arch == "sm_107a" else by_heads
+            ).items():
+                if arch == "sm_107a" and chains is w4 and heads in (32, 33, 48):
+                    form = "full"
+                assert (
+                    kcp_jit.walk_form("kcp_fwdh_o", chains, heads, sms, arch=arch)
+                    == form
+                ), (arch, chains, heads)
+        assert (
+            kcp_jit.walk_form("kcp_fwdh_o", [48], 4, sms, knob="full", arch=arch)
+            == "full"
+        )
+        assert (
+            kcp_jit.walk_form("kcp_fwdh_o", [48], 4, sms, knob="split", arch=arch)
+            == "split"
+        )
+    with pytest.raises(ValueError, match="per architecture"):
+        kcp_jit.walk_form("kcp_fwdh_o", w4, 64, sms)
+    with pytest.raises(ValueError, match="per architecture"):
+        kcp_jit.walk_form("kcp_fwdh_o", w4, 64, sms, arch="sm_90a")
+    assert kcp_jit.walk_form("kcp_fwdh_o", w4, 64, sms, knob="split") == "split"
+    # the other programs' rules take no architecture
+    assert (
+        kcp_jit.walk_form("kcp_fwdh_offset", [222, 222], 64, sms, arch="sm_107a")
+        == "split"
+    )
     assert kcp_jit.walk_form("kcp_dhu_tape", [39] * 14, 64, sms) == "split"
     assert (
         kcp_jit.walk_form("kcp_fwdh_offset", [222, 222], 64, sms, knob="full") == "full"
@@ -453,11 +548,14 @@ def test_walk_form_rules_and_records() -> None:
         assert record["test_knobs"] == {"walk_form": "full"}
         assert record["select_rule"] == {"kind": "always"}
         assert record["grid_rule"] == {"kind": "kcp_segments_heads"}
+    with pytest.raises(ValueError):
+        kcp_jit.test_walk_record("kcp_fwdh_o", "full")
     for name in (
         "kcp_fwdh_offset_vh64",
         "kcp_dhu_offset_vh64",
         "kcp_fwdh_tape",
         "kcp_dhu_tape",
+        "kcp_fwdh_o_vh64",
     ):
         assert kcp_jit.MODULES[name]["grid_rule"] == {
             "ctas_per_head": 2,
@@ -468,6 +566,15 @@ def test_walk_form_rules_and_records() -> None:
         "kind": "walk_form",
     }
     assert kcp_jit.MODULES["kcp_fwdh_tape"]["select_rule"] == {"kind": "always"}
+    assert kcp_jit.MODULES["kcp_fwdh_o"]["select_rule"] == {
+        "form": "full",
+        "kind": "walk_form",
+    }
+    assert kcp_jit.MODULES["kcp_fwdh_o_vh64"]["select_rule"] == {
+        "form": "split",
+        "kind": "walk_form",
+    }
+    assert kcp_jit.MODULES["kcp_fwdh_o"]["grid_rule"] == {"kind": "kcp_segments_heads"}
 
 
 def test_walk_heads_selection() -> None:
