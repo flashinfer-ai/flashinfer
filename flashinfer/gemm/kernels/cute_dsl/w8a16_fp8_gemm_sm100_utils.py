@@ -296,6 +296,46 @@ def ld_acquire_gpu_u64(addr: cutlass.Int64, *, loc=None, ip=None) -> cutlass.Int
 
 
 @dsl_user_op
+def atomic_cas_acq_rel_gpu_u64(
+    addr: cutlass.Int64,
+    expected: cutlass.Int64,
+    desired: cutlass.Int64,
+    *,
+    loc=None,
+    ip=None,
+) -> cutlass.Int64:
+    """``atom.acq_rel.gpu.global.cas.b64`` on the global 64-bit word at ``addr``:
+    stores ``desired`` if the word equals ``expected``; returns the value found."""
+    found = _asm_op(
+        Uint64.mlir_type,
+        [
+            addr.ir_value(loc=loc, ip=ip),
+            expected.ir_value(loc=loc, ip=ip),
+            desired.ir_value(loc=loc, ip=ip),
+        ],
+        "atom.acq_rel.gpu.global.cas.b64 $0, [$1], $2, $3;",
+        "=l,l,l,l",
+        loc=loc,
+        ip=ip,
+    )
+    return cutlass.Int64(found)
+
+
+@dsl_user_op
+def popc_u64(value: cutlass.Int64, *, loc=None, ip=None) -> cutlass.Int32:
+    """The number of set bits of ``value`` (``popc.b64``)."""
+    count = _asm_op(
+        Uint32.mlir_type,
+        [value.ir_value(loc=loc, ip=ip)],
+        "popc.b64 $0, $1;",
+        "=r,l",
+        loc=loc,
+        ip=ip,
+    )
+    return cutlass.Int32(count)
+
+
+@dsl_user_op
 def nanosleep(ns: int, *, loc=None, ip=None) -> None:
     _asm_op(None, [], f"nanosleep.u32 {int(ns)};", "", loc=loc, ip=ip)
 

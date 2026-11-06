@@ -299,8 +299,8 @@ def test_w8a16_fp8_gemm_workspace_bytes_splitk_overflow():
     partials, which within the admitted tile count stays far inside the signed
     64-bit range the query returns in, and is reported exactly even though no one
     would allocate it (the long-K rule compares wave counts scaled by the split
-    count).  On Hopper the split-K variants run a one-wave fused tail: a grid
-    whose slices cannot all be resident runs the plain tile and needs no
+    count).  On Hopper the split-K variants run a one-wave fused tail: a tail
+    whose slices would not fit one wave of SMs runs the plain tile and needs no
     workspace, so the query reports 0 there.  Dimensions whose partials would
     leave the range are rejected by the tile-count bound before the query is
     asked."""
@@ -1100,3 +1100,46 @@ def test_w8a16_fp8_gemm_scalar_scale_minimally_aligned(split, monkeypatch):
         out = w8a16_fp8_gemm(act, w_fp8, view, algo=algo)
         torch.cuda.synchronize()
         assert torch.equal(out, ref)
+
+
+@pytest.mark.parametrize("wait_ns", [0, 2_000])
+def test_w8a16_fp8_gemm_tail_withdrawal(wait_ns, monkeypatch):
+    """The slices of a Hopper tail tile wait for each other only for a bounded time;
+    a slice whose wait runs out withdraws, and the slices present when the last one
+    arrives share the tile.  Compiled with a wait of 0 ns (every slice that is not
+    last withdraws at its first look) or 2 us (some do, depending on arrival skew),
+    the fix-up lands on changing subsets of the slices, down to the last slice alone.
+    The summation order is fixed, so the output must be bitwise the default kernel's
+    whatever the subset."""
+    if _major() != 9:
+        pytest.skip("the bounded tail wait is the Hopper kernel's")
+    from flashinfer.gemm import w8a16_fp8_dispatch as dispatch
+
+    dev = torch.device("cuda")
+    torch.manual_seed(0)
+    cases = [
+        (algo, _shape_needing_workspace(algo, dev))
+        for algo in (
+            "128x256_streamk",
+            "128x192_streamk",
+            "128x128_splitk",
+            "64x128_splitk",
+        )
+    ]
+    # A shape whose automatic plan cuts a multi-slice tail on H100 (43 tiles x 3).
+    cases.append((None, (1283, 3080, 25600)))
+    problems = []
+    for algo, (m, n, k) in cases:
+        act = torch.randn(m, k, device=dev, dtype=torch.bfloat16)
+        w_fp8, scale = _quantize(torch.randn(n, k, device=dev) * 0.02)
+        bias = torch.randn(n, device=dev, dtype=torch.bfloat16)
+        ref = w8a16_fp8_gemm(act, w_fp8, scale, bias=bias, algo=algo)
+        problems.append((algo, act, w_fp8, scale, bias, ref))
+    torch.cuda.synchronize()
+    monkeypatch.setattr(dispatch, "_SM90_TAIL_WAIT_NS", wait_ns)
+    dispatch._KERNEL_CACHE.clear()
+    for rep in range(6):
+        for algo, act, w_fp8, scale, bias, ref in problems:
+            out = w8a16_fp8_gemm(act, w_fp8, scale, bias=bias, algo=algo)
+            torch.cuda.synchronize()
+            assert torch.equal(out, ref), (wait_ns, algo, rep)

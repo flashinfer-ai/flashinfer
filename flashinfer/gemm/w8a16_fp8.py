@@ -363,8 +363,8 @@ def w8a16_fp8_gemm(
         a multiple of 64 whose 64-deep tile count divides into 2..8 equal
         slices of at least 8 tiles; Blackwell: ``K`` a multiple of 128 whose
         128-deep tile count has a divisor in 2..8), and runs the tile plain
-        (no workspace) where the split cannot run (Hopper: a grid too large
-        for all slices of a tile to be resident; Blackwell: ``splits x M`` at
+        (no workspace) where the split cannot run (Hopper: a tail whose
+        slices would not fit one wave of SMs; Blackwell: ``splits x M`` at
         or above ``2**31``).  A ``_streamk`` name is a policy on the named
         tile, not a stream-K kernel: on Hopper it runs the whole waves of that
         tile plain and splits only the last partial wave over the idle SMs

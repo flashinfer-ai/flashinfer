@@ -860,6 +860,7 @@ def _get_sm90_kernel(
         group,
         num_persistent,
         has_tail,
+        _SM90_TAIL_WAIT_NS,
     )
     compiled = _KERNEL_CACHE.get(key)
     if compiled is not None:
@@ -868,15 +869,21 @@ def _get_sm90_kernel(
 
     from .kernels.cute_dsl.w8a16_fp8_gemm_sm90 import Sm90W8A16Fp8GemmKernel
 
+    from .kernels.cute_dsl.w8a16_fp8_gemm_sm90 import TAIL_WAIT_NS
+
     kernel = Sm90W8A16Fp8GemmKernel(
         _SM90_TILES[tile_algo].rows,
         has_bias=has_bias,
         group_size=group,
         has_tail=has_tail,
+        tail_wait_ns=(
+            TAIL_WAIT_NS if _SM90_TAIL_WAIT_NS is None else _SM90_TAIL_WAIT_NS
+        ),
     )
     kernel_name = (
         f"sm90_algo{tile_algo}_{_dtype_tag(act_dtype)}_bias{int(has_bias)}"
         f"_grp{group}_np{num_persistent}_tail{int(has_tail)}"
+        + ("" if _SM90_TAIL_WAIT_NS is None else f"_wait{_SM90_TAIL_WAIT_NS}")
     )
     compiled = _build_kernel(
         kernel_name,
@@ -900,6 +907,9 @@ def _get_sm90_kernel(
 
 _SM90_TAIL_WORKSPACE_CAP = 64 << 20
 _SM90_TAIL_MAX_SPLITS = 16
+# Test hook: how long a tail slice waits for the others before withdrawing from the
+# fix-up, in ns (None: the kernel's default, TAIL_WAIT_NS).  Part of the kernel key.
+_SM90_TAIL_WAIT_NS: Optional[int] = None
 
 
 def _sm90_workspace_layout(
@@ -936,9 +946,9 @@ def sm90_tail_plan(
     tail = tiles - full * num_sms
     if tail == 0 or 2 * tail >= num_sms or k_tiles < 4:
         return tile_algo, tiles, 1
-    # The most slices that still run in one round (the slices of a tile reduce it
-    # among themselves and must be resident together), at least two k-tiles each,
-    # under the workspace cap.
+    # The most slices that still run in one round (the tail is sized to the idle
+    # SMs of the last wave; the fix-up itself needs no co-residency), at least two
+    # k-tiles each, under the workspace cap.
     block_bytes = tile_w * tile_a * 4
     best_s = 1
     for s in range(2, _SM90_TAIL_MAX_SPLITS + 1):

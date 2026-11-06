@@ -33,12 +33,17 @@ Work decomposition: the first ``body_items`` tiles are plain (whole K, output wr
 by the epilogue); the tiles after them are the *tail*, each cut into ``tail_splits``
 K-slices that write fp32 partial tiles into a compact workspace (one tile_m x tile_a
 block per (tile, slice)).  The slices of a tile then reduce it among themselves: each
-CTA publishes its block, counts in on the tile's counter, waits for all slices and
-sums its own share of the tile's columns, applying scale and bias and casting into
-the output (the CUTLASS stream-K "separate reduction" shape; the slices of one tile
-run concurrently, so every CTA holds at most one tail item).  Split-K is body 0
-(every tile split); the stream-K codes run the whole waves plain and split only the
-last partial wave over the idle SMs.
+CTA publishes its block, counts in on the tile's counter and waits, for a bounded
+time, for the other slices; the slices present when the last one arrives share the
+tile's activation columns and each sums its share over all blocks, applying scale and
+bias and casting into the output (the CUTLASS stream-K "separate reduction" shape).
+A slice whose wait runs out withdraws (its bit in the counter word) and moves on, so
+the tail never depends on its slices being resident together: however few SMs the
+launch gets, the slices that are present do the work, with the same summation order
+and so the same bits.  The plan sizes the tail to one wave (every CTA holds at most
+one tail item), so in the normal run all slices are present and the wait is short.
+Split-K is body 0 (every tile split); the stream-K codes run the whole waves plain
+and split only the last partial wave over the idle SMs.
 """
 
 import cuda.bindings.driver as cuda
@@ -51,23 +56,31 @@ from cutlass.cute.nvgpu import cpasync, warpgroup
 
 from .w8a16_fp8_gemm_sm100_utils import (
     atomic_add_acq_rel_gpu_u64,
+    atomic_cas_acq_rel_gpu_u64,
     bulk_store_complete_fence,
     convert_e4m3_words,
     ld_acquire_gpu_u64,
     load_e4m3_unit,
     nanosleep,
+    popc_u64,
 )
 
-# The tail tiles' arrival counters: one 64-bit word per tail tile, owned by the call's
+# The tail tiles' counters: one 64-bit word per tail tile, owned by the call's
 # workspace and zeroed on the call's stream before the launch (the dispatcher's
-# precondition).  Every slice of a tile adds ``TAIL_COUNTER_STRIDE // splits`` with
-# release semantics after publishing its partial block, so the tile is complete when
-# its counter reaches one stride whatever its split count (the stride is lcm(1..16);
-# 16 is the most slices a tile is cut into); a slice then waits, with acquire loads,
-# for the counter to reach the stride boundary above the value its own add returned.
-# The add's return value also tells the last slice it is last, so only the others
-# poll.
-TAIL_COUNTER_STRIDE = 720720
+# precondition).  Bits [0, 32) count the slices that have published their partial
+# block (each adds 1 with release semantics); bit 32 + s is set by slice s when it
+# gives up waiting for the others and withdraws from the fix-up.  A withdrawal is a
+# compare-and-swap against a word whose count is still short, so once the count
+# reaches the split count the word is frozen: every slice that sees it complete reads
+# the same set of withdrawn slices and the present ones partition the tile's columns
+# consistently.  The withdrawn slices' blocks are published all the same (they counted
+# in first), so the sum over all slices, in slice order, is unchanged.
+TAIL_ARRIVED_MASK = (1 << 32) - 1
+TAIL_WITHDRAWN_SHIFT = 32
+# How long a slice waits for the others before withdrawing.  The slices of a tile
+# start in the same wave after equal work, so they arrive within a few microseconds
+# of each other; the wait only runs out when the launch did not get all its SMs.
+TAIL_WAIT_NS = 50_000
 
 
 @cute.jit
@@ -107,6 +120,7 @@ class Sm90W8A16Fp8GemmKernel:
         group_size: int = 1,
         has_tail: bool = False,
         enable_pdl: bool = False,
+        tail_wait_ns: int = TAIL_WAIT_NS,
     ):
         # tile_shape_mn: (weight rows, activation rows) per CTA tile.  The CTA always
         # has two consumer warpgroups: a 128-row tile is shared by both (64 rows each),
@@ -129,6 +143,11 @@ class Sm90W8A16Fp8GemmKernel:
         # has_tail: the kernel also carries the fp32 partial-tile epilogue (split tail
         # work items write to the workspace; the reduce applies scale / bias).
         self.has_tail = has_tail
+        # tail_wait_ns: how long a tail slice waits for the others before withdrawing
+        # from the fix-up (TAIL_WAIT_NS; tests lower it to force withdrawals).
+        if tail_wait_ns < 0:
+            raise ValueError("tail_wait_ns must be non-negative")
+        self.tail_wait_ns = int(tail_wait_ns)
         self.enable_pdl = enable_pdl
         self.acc_dtype = cutlass.Float32
 
@@ -298,6 +317,9 @@ class Sm90W8A16Fp8GemmKernel:
             ]
             # Ping-pong ordering: [phase (mainloop, epilogue)][consumer warpgroup].
             order_barriers: cute.struct.MemRange[cutlass.Int64, 4]
+            # Split tail: the tile's counter word as this epilogue group's slice last
+            # saw it (which slices withdrew; see TAIL_ARRIVED_MASK), one per group.
+            tail_word: cute.struct.MemRange[cutlass.Int64, 2]
             # The bias of the tile's weight rows, fp32, double-buffered by tile parity.
             bias_tile: cute.struct.Align[
                 cute.struct.MemRange[cutlass.Float32, 2 * tile_m], 16
@@ -448,6 +470,7 @@ class Sm90W8A16Fp8GemmKernel:
         sBias = storage.bias_tile.get_tensor(
             cute.make_layout((tile_m, 2), stride=(1, tile_m))
         )
+        sWord = storage.tail_word.get_tensor(cute.make_layout(2))
 
         # (bM, bK, RestM, RestK, L) / (bN, bK, RestN, RestK, L) / (bM, bN, RestM, RestN, L)
         gA_mkl = cute.local_tile(mA_mkl, (tile_m, tile_k), (None, None, None))
@@ -548,6 +571,7 @@ class Sm90W8A16Fp8GemmKernel:
                 sC,
                 sW,
                 sBias,
+                sWord,
                 tma_atom_c,
                 gC_mnl,
                 tma_atom_w,
@@ -675,6 +699,7 @@ class Sm90W8A16Fp8GemmKernel:
         sC: cute.Tensor,
         sW: cute.Tensor,
         sBias: cute.Tensor,
+        sWord: cute.Tensor,
         tma_atom_c: cute.CopyAtom,
         gC_mnl: cute.Tensor,
         tma_atom_w: cute.CopyAtom,
@@ -878,6 +903,7 @@ class Sm90W8A16Fp8GemmKernel:
                 tRS_rD_out,
                 sW,
                 sBias,
+                sWord,
                 tma_atom_w,
                 gC_mnl,
                 gW_mnl,
@@ -932,6 +958,7 @@ class Sm90W8A16Fp8GemmKernel:
         tRS_rD_out: cute.Tensor,
         sW: cute.Tensor,
         sBias: cute.Tensor,
+        sWord: cute.Tensor,
         tma_atom_w: cute.CopyAtom,
         gC_mnl: cute.Tensor,
         gW_mnl: cute.Tensor,
@@ -1066,6 +1093,7 @@ class Sm90W8A16Fp8GemmKernel:
                     cv,
                     bv,
                     counters,
+                    sWord,
                     scale,
                     warp_idx,
                     epi_store_warp,
@@ -1198,18 +1226,23 @@ class Sm90W8A16Fp8GemmKernel:
         cv: cute.Tensor,
         bv: cute.Tensor,
         counters: cute.Tensor,
+        sWord: cute.Tensor,
         scale: cute.Tensor,
         warp_idx: cutlass.Int32,
         epi_store_warp: cutlass.Constexpr,
         etid: cutlass.Int32,
     ):
         """After this CTA's partial block of tail tile ``tail_tile`` is stored: publish
-        it (bulk stores complete, release), count in on the tile's counter, wait for
-        the tile's ``tail_splits`` slices, then reduce this slice's share of the tile's
-        activation columns over all blocks, apply scale and bias and store the 16-bit
-        output.  The counter arrives zeroed for this call (see ``TAIL_COUNTER_STRIDE``);
-        the add's return value tells the last slice it is last, so only the others
-        poll."""
+        it (bulk stores complete, release), count in on the tile's counter word and
+        wait, at most ``tail_wait_ns``, for the tile's ``tail_splits`` slices.  Once
+        all have counted in, the slices still present (those that did not withdraw;
+        see ``TAIL_ARRIVED_MASK``) partition the tile's activation columns by their
+        rank among themselves, and each sums its share over all blocks, applies scale
+        and bias and stores the 16-bit output.  A slice whose wait runs out withdraws
+        and returns: its block is already published, and the columns it would have
+        taken fall to the slices present when the tile completes.  The last slice to
+        arrive is always present, so every tile is reduced, and no slice ever waits
+        unboundedly on another: the tail needs no co-residency."""
         tile_m, tile_a, _ = self.tile_shape_mnk
         epi_barrier = pipeline.NamedBarrier(
             barrier_id=barrier_id, num_threads=self.num_epi_threads
@@ -1220,48 +1253,78 @@ class Sm90W8A16Fp8GemmKernel:
         if warp_idx == epi_store_warp:
             bulk_store_complete_fence()
         epi_barrier.arrive_and_wait()
+        # The word is group-uniform; the group reads it only after the barrier below
+        # and the next tail item's thread 0 rewrites it only after the barrier above,
+        # which every reader of the previous value has passed.
         if etid == 0:
-            step = cutlass.Int64(TAIL_COUNTER_STRIDE // tail_splits)
-            old = atomic_add_acq_rel_gpu_u64(counter_addr, step)
-            target = (old // TAIL_COUNTER_STRIDE + 1) * TAIL_COUNTER_STRIDE
-            seen = old + step
-            while seen < target:
-                nanosleep(64)
-                seen = ld_acquire_gpu_u64(counter_addr)
-        epi_barrier.arrive_and_wait()
-
-        # This slice's columns: [slice * q + min(slice, rem), ...), q = tile_a / splits.
-        q = tile_a // tail_splits
-        rem = tile_a % tail_splits
-        col_begin = slice_idx * q + cutlass.min(slice_idx, rem)
-        col_cnt = q
-        if slice_idx < rem:
-            col_cnt = q + 1
-        vecs_per_col = tile_m // 8
-        block0 = tail_tile * tail_splits
-        scale_val = cutlass.Float32(scale[0])
-        act_base = n_tile * tile_a
-        w_base = m_tile * tile_m
-        items = col_cnt * vecs_per_col
-        for it in cutlass.range(etid, items, self.num_epi_threads, unroll=1):
-            col = col_begin + it // vecs_per_col
-            rvec = it % vecs_per_col
-            act_row = act_base + col
-            w_row = w_base + rvec * 8
-            if act_row < act_rows:
-                if w_row < weight_rows:
-                    # Unrolled so the slices' loads are all in flight before the first
-                    # add (a thread usually owns one vector; serial loads would cost a
-                    # global-memory latency per slice).
-                    acc = wv[(None, rvec, block0 * tile_a + col)].load()
-                    for sl in cutlass.range(1, tail_splits, 1, unroll=8):
-                        acc = (
-                            acc + wv[(None, rvec, (block0 + sl) * tile_a + col)].load()
+            word = atomic_add_acq_rel_gpu_u64(counter_addr, cutlass.Int64(1)) + 1
+            if (word & TAIL_ARRIVED_MASK) < tail_splits:
+                my_bit = cutlass.Int64(1) << (
+                    TAIL_WITHDRAWN_SHIFT + slice_idx.to(cutlass.Int64)
+                )
+                t0 = cute.arch.globaltimer()
+                waiting = cutlass.Boolean(True)
+                while waiting:
+                    word = ld_acquire_gpu_u64(counter_addr)
+                    if (word & TAIL_ARRIVED_MASK) == tail_splits:
+                        waiting = cutlass.Boolean(False)
+                    elif cute.arch.globaltimer() - t0 > self.tail_wait_ns:
+                        # Withdraw, unless the word moved under us (then re-read: the
+                        # tile may just have completed).
+                        found = atomic_cas_acq_rel_gpu_u64(
+                            counter_addr, word, word | my_bit
                         )
-                    acc = scale_val * acc
-                    if cutlass.const_expr(self.has_bias):
-                        acc = acc + bv[(None, w_row // 8)].load().to(cutlass.Float32)
-                    cv[(None, w_row // 8, act_row)].store(acc.to(cv.element_type))
+                        if found == word:
+                            word = word | my_bit
+                            waiting = cutlass.Boolean(False)
+                    else:
+                        nanosleep(64)
+            sWord[barrier_id - 1] = word
+        epi_barrier.arrive_and_wait()
+        word = sWord[barrier_id - 1]
+        withdrawn = word >> TAIL_WITHDRAWN_SHIFT
+        if ((withdrawn >> slice_idx.to(cutlass.Int64)) & 1) == 0:
+            # Present: the count is complete and the withdrawn set final.  Thread 0's
+            # acquire of the other slices' releases orders their blocks before this
+            # group's loads through the barrier just passed.
+            present = tail_splits - popc_u64(withdrawn)
+            below = withdrawn & ((cutlass.Int64(1) << slice_idx.to(cutlass.Int64)) - 1)
+            rank = slice_idx - popc_u64(below)
+            # This slice's columns: [rank * q + min(rank, rem), ...), q = tile_a / present.
+            q = tile_a // present
+            rem = tile_a % present
+            col_begin = rank * q + cutlass.min(rank, rem)
+            col_cnt = q
+            if rank < rem:
+                col_cnt = q + 1
+            vecs_per_col = tile_m // 8
+            block0 = tail_tile * tail_splits
+            scale_val = cutlass.Float32(scale[0])
+            act_base = n_tile * tile_a
+            w_base = m_tile * tile_m
+            items = col_cnt * vecs_per_col
+            for it in cutlass.range(etid, items, self.num_epi_threads, unroll=1):
+                col = col_begin + it // vecs_per_col
+                rvec = it % vecs_per_col
+                act_row = act_base + col
+                w_row = w_base + rvec * 8
+                if act_row < act_rows:
+                    if w_row < weight_rows:
+                        # Unrolled so the slices' loads are all in flight before the
+                        # first add (serial loads would cost a global-memory latency
+                        # per slice).
+                        acc = wv[(None, rvec, block0 * tile_a + col)].load()
+                        for sl in cutlass.range(1, tail_splits, 1, unroll=8):
+                            acc = (
+                                acc
+                                + wv[(None, rvec, (block0 + sl) * tile_a + col)].load()
+                            )
+                        acc = scale_val * acc
+                        if cutlass.const_expr(self.has_bias):
+                            acc = acc + bv[(None, w_row // 8)].load().to(
+                                cutlass.Float32
+                            )
+                        cv[(None, w_row // 8, act_row)].store(acc.to(cv.element_type))
 
     # ------------------------------------------------------- output epilogue
     @cute.jit
