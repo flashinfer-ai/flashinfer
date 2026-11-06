@@ -11173,8 +11173,8 @@ def test_gpu_prepared_k1_reset_counters():
 GRAPH_SAFETY_KINDS = {
     "k1_wgrad": {"k1_slots", "k1_tickets"},
     "k1_forward": {"k1_det_ws", "k1_det_counters"},
-    "cake_dense_gemm_nondet_train_router_wgrad": {"k2_stack"},
-    "cake_dense_gemm_nondet_train_router_forward": {"k2_stack", "k2_splitk_partials"},
+    "k2_wgrad": {"k2_stack"},
+    "k2_forward": {"k2_stack", "k2_splitk_partials"},
 }
 GRAPH_SAFETY_CASES = tuple(GRAPH_SAFETY_KINDS)
 #: ``(N, K, (T_small, T_large))`` of the k1_forward case: forwards whose deterministic plan splits K across stream-K
@@ -11293,7 +11293,7 @@ def _graph_safety_bound(case, stream):
     else:
         entries = [e for k, e in cake_backend._K2_ENTRY_CACHE.items() if k[1] == key]
         assert entries and all(e.launch is not None for e in entries)
-        if case == "cake_dense_gemm_nondet_train_router_wgrad":
+        if case == "k2_wgrad":
             assert all(e.atomic and e.launch.plan.simt is None for e in entries)
         else:
             assert all(e.launch.k2.partials_shape is not None for e in entries)
