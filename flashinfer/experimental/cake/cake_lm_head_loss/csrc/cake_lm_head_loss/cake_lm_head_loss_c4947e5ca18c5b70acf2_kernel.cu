@@ -74,7 +74,7 @@ kernel_cake_lm_head_loss_c4947e5ca18c5b70acf2(float* __restrict__ acc, float* __
         int src = ((n_incl > 0) ? n_incl - 1 : 0);
         int _vec_load_0[1];
         {
-            _vec_load_0[0] = *reinterpret_cast<const int*>(idx_lo + ((unsigned long long)src * 2) + 0);
+            _vec_load_0[0] = *reinterpret_cast<const int*>(idx_lo + (unsigned long long)src * 2 + 0);
         }
         int owner = _vec_load_0[0];
         unsigned long long row_in = (unsigned long long)src * vecs64;

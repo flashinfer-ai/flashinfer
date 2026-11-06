@@ -121,6 +121,7 @@ exclude = [
 "flashinfer.experimental.cake.cake_lm_head_loss" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_mok_bf16" = ["csrc/*.cu", "csrc/*/*.cu", "csrc/*.h", "sources.json", "build.json", "README.md"]
 "flashinfer.experimental.nvfp4_attention" = ["csrc/**", "build.json"]
+"flashinfer.experimental.cake_nvfp4_ptilemax_attention" = ["csrc/**", "build.json"]
 "flashinfer.experimental.deepgemm_fp8_gemm" = ["csrc/**", "build.json", "DEEPGEMM_NOTICE.txt"]
 "flashinfer.experimental.cake_mla_varq_dcp_decode" = ["csrc/**"]
 "flashinfer.experimental.cake_mla_nvfp4_paged_decode" = ["csrc/**"]
@@ -134,6 +135,9 @@ exclude = [
 # Generated sources and the build manifest (build.json) of the experimental exact-SM100a/SM103a Kimi-K3
 # attention-residual (AttnRes) backend; its cake_build loader compiles them on demand, prebuilt aot/ libraries never ship.
 "flashinfer.experimental.cake_kimi_k3_attn_res" = ["csrc/**", "build.json"]
+# Generated sources and the build manifest (build.json) of the experimental exact-SM100a/SM103a MLA value
+# projection + sigmoid output gate backend, compiled on demand; README.md carries its attribution.
+"flashinfer.experimental.cake_mla_value_gate" = ["csrc/**", "build.json", "README.md"]
 # Generated sources for the experimental exact-SM100a/SM103a Kimi-K3 FP8 projection backend, compiled on demand.
 "flashinfer.experimental.kimi_k3_fp8_projection" = ["csrc/**"]
 # JIT sources for the Kimi-K3 latent MoE front/tail and fused router.
@@ -150,7 +154,6 @@ exclude = [
 "flashinfer.experimental.deepgemm_dense_mqa" = ["*.json"]
 "flashinfer" = ["_build_meta.py", "mla_kv_pack_fp8_workloads.json"]
 # The batch-invariant GEMM dispatcher's fitted constants, read at runtime next to its module.
-"flashinfer.gemm.batch_invariant" = ["cost_model_fits.json"]
 "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe" = ["*.md"]
 "flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe" = ["*.md"]
 "flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe" = ["*.md"]
@@ -269,6 +272,8 @@ exclude = [
   "flashinfer-jit-cache/",
   # CUTLASS DSL kernel bodies are compiler-lowered rather than ordinary Python.
   "flashinfer/attention/prims_ts/kernels/",
+  # Imported CuTe DSL kernels are kept byte-faithful to their source.
+  "flashinfer/experimental/attn_scores/kernels/selective_topk/",
   "3rdparty/",
   "flashinfer/data/cutlass/",
   "flashinfer/cute_dsl/attention/fmha/fmha.py",
@@ -317,6 +322,7 @@ exclude = [
 [tool.ruff]
 # Ruff infers the target from project.requires-python.
 extend-exclude = [
+  "flashinfer/experimental/attn_scores/kernels/selective_topk/",
   "flashinfer/fused_moe/backends/cudnn_frost/artifacts/*/sources/",
   "flashinfer/cute_dsl/attention/fmha/fmha.py",
   "flashinfer/cute_dsl/attention/fmha/fmha_blockscaled.py",

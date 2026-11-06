@@ -57,6 +57,7 @@ _LAZY_EXPORTS = {
     "nvfp4_quantize_cute_dsl": ".nvfp4_quantize",
     "nvfp4_quantize_per_token_cute_dsl": ".nvfp4_quantize",
     "NVFP4KVMaterializeKernel": ".nvfp4_kv_materialize",
+    "NVFP4KVMaterializer": ".nvfp4_kv_materialize",
     "nvfp4_kv_materialize_fp8": ".nvfp4_kv_materialize",
 }
 

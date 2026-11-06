@@ -22,6 +22,21 @@ def _cpu_sm_count(monkeypatch):
     monkeypatch.setattr(cake, "_device_sm_count", lambda device: _SM_COUNT)
 
 
+# The K=64 and four-stage sibling gates as the host defines them; the tests of
+# the gates call them.
+_K64_SIBLING_LAUNCHABLE = cake._k64_sibling_launchable
+_KV4_SIBLING_LAUNCHABLE = cake._kv4_sibling_launchable
+
+
+@pytest.fixture(autouse=True)
+def _launchable_siblings(monkeypatch):
+    """The sibling gates probe the process's CUDA runtime and the device; these
+    CPU tests route as in a process that can launch every K=64 and four-stage
+    sibling."""
+    monkeypatch.setattr(cake, "_k64_sibling_launchable", lambda arch, device: True)
+    monkeypatch.setattr(cake, "_kv4_sibling_launchable", lambda arch, device: True)
+
+
 # Both cache layouts and sink settings retain the same physical selection.
 def _canonical_query_tokens(batch_size: int, max_q_len: int, ragged: bool) -> int:
     """Query-token count of a canonical contract row.
@@ -1263,8 +1278,9 @@ def test_bf16_h64_compressed_rows_use_the_prefill_body_from_24_tokens(
         (32, 2, 2, "fp8_h64_prefill_source_persistent_m64_multi_tile"),
         (16, 1, 64, "fp8_h64_prefill_source_persistent_m64_multi_tile"),
         (16, 2, 2, "fp8_h64_prefill_source_persistent_m64_multi_tile"),
-        # 8-head prefill rows keep the low-head prefill producer (unmeasured
-        # on the M64 body).
+        # Without an architecture (as on SM100 / SM103) 8-head prefill rows
+        # keep the low-head prefill producer; SM107 runs them on the M64 body
+        # (test_sm107a_fp8_h8_prefill_rows_take_the_m64_body).
         (8, 1, 64, "fp8_lowhead_prefill"),
         # FP8/H128 rows with 16+ tokens use the persistent body for every
         # batch size and cache layout (measured 1.12-1.75x vs trtllm-gen on
@@ -1308,8 +1324,10 @@ def test_sm107a_registers_the_fp8_decode_route_only():
     assert set(_ARCH_REGISTRATIONS["sm_107a"]["variants"]) == {
         "fp8_h128_prefill_source_persistent",
         "fp8_h128_prefill_source_persistent_uniform",
+        "fp8_h128_prefill_source_persistent_uniform_k64",
         "fp8_h64_prefill_source_persistent_m64",
         "fp8_h64_prefill_source_persistent_m64_multi_tile",
+        "fp8_h64_prefill_source_persistent_m64_multi_tile_kv4",
         "fp8_lowhead_prefill",
     }
     for spec in _ARCH_REGISTRATIONS["sm_107a"]["variants"].values():
@@ -2240,7 +2258,9 @@ class _RecordingLauncher:
 
     def __init__(self, arch: str, **values):
         self.arch = arch
-        self.values = values
+        # The call's PDL switch and longest request (run_cake_dsv4 sets both):
+        # PDL off and one-token requests unless given.
+        self.values = {"enable_pdl": False, "max_q_len": 1, **values}
         self.calls: list[tuple[str, dict]] = []
 
     def variant(self, name, *, grid, **overrides):
@@ -2403,6 +2423,7 @@ def test_every_route_result_has_a_registered_kernel(monkeypatch, arch):
                             compressed_page_size=page_size,
                             num_query_tokens=tokens,
                             sm_count=_SM_COUNT,
+                            arch=arch,
                         )
                     except ValueError:
                         rejected += 1
@@ -2510,7 +2531,7 @@ def test_bf16_h128_prefill_launches_the_snake_body_for_tail_majority_rows(
             2,
             260,
             "fp8_h64_prefill_source_persistent_m64_multi_tile",
-        ),  # 12 tokens, 2 tiles: the M64 body beats the H64 cluster body
+        ),  # 12 tokens, 2 tiles, no arch: the M64 body (SM100 / SM103: below)
         (16, 64, 640, "fp8_h128_prefill_source_persistent_uniform"),  # hardening-000018
         (64, 64, 640, "fp8_h128_prefill_source_persistent_uniform"),  # hardening-000030
         (
@@ -2572,6 +2593,78 @@ def test_fp8_h64_rows_follow_the_persistent_body_rule(
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a", None])
+@pytest.mark.parametrize("page_size", [2, 64])
+@pytest.mark.parametrize("sparse_topk", [252, 256, 260, 380, 384])
+def test_fp8_h64_two_tile_decode_rows_take_the_h64_cluster_body_on_sm100_sm103(
+    arch, page_size, sparse_topk
+):
+    """FP8/H64 decode rows of at most 12 tokens with two complete tiles and a
+    partial third run the H64 cluster body where it is built (SM100 / SM103);
+    width 256 and one complete tile keep the M64 body, three tiles or 13+
+    tokens the persistent body, and SM107 or an unknown architecture the M64
+    body (SM107 runs width 252 past 12 tokens on the persistent body)."""
+    for tokens in range(1, 14):
+        route = _route(
+            dtype=torch.float8_e4m3fn,
+            num_heads=64,
+            batch_size=3,
+            max_q_len=5,
+            ragged=True,
+            sparse_topk=sparse_topk,
+            compressed_page_size=page_size,
+            num_query_tokens=tokens,
+            sm_count=_SM_COUNT,
+            arch=arch,
+        )
+        full_tiles = sparse_topk // 128
+        if full_tiles >= (3 if tokens <= 12 else 2) or (
+            tokens > 12 and arch == "sm_107a"
+        ):
+            expected = "fp8_h128_prefill_source_persistent_uniform"
+        elif 256 < sparse_topk < 384 and arch in ("sm_100a", "sm_103a"):
+            expected = "fp8_lowhead_h64"
+        else:
+            expected = "fp8_h64_prefill_source_persistent_m64_multi_tile"
+        assert route == expected, (tokens, route)
+        if arch is not None:
+            assert route in _ARCH_REGISTRATIONS[arch]["variants"], (arch, route)
+
+
+@pytest.mark.cpu_only
+def test_workspace_requirement_routes_by_the_device_arch(monkeypatch):
+    """The requirement's route follows the architecture the launch routes by;
+    the workspace numbers do not depend on it."""
+    shape = dict(
+        dtype=torch.float8_e4m3fn,
+        num_heads=64,
+        num_query_tokens=12,
+        sm_count=_SM_COUNT,
+        sparse_topk=260,
+        compressed_page_size=2,
+        max_q_len=5,
+        batch_size=3,
+        ragged=True,
+    )
+    h64 = cake.cake_dsv4_workspace_requirement(**shape, arch="sm_100a")
+    m64 = cake.cake_dsv4_workspace_requirement(**shape, arch="sm_107a")
+    assert h64.route == "fp8_lowhead_h64"
+    assert m64.route == "fp8_h64_prefill_source_persistent_m64_multi_tile"
+    assert (h64.single_launch_bytes, h64.minimum_bytes) == (
+        m64.single_launch_bytes,
+        m64.minimum_bytes,
+    )
+    # arch=None: the current CUDA device's architecture, whatever sm_count says.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(cake, "_target_arch", lambda device: "sm_103a")
+    assert cake.cake_dsv4_workspace_requirement(**shape).route == "fp8_lowhead_h64"
+    # Without CUDA: the route every architecture builds.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    assert cake.cake_dsv4_workspace_requirement(**shape).route == m64.route
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("sm_count", [148, 152, 160])
 @pytest.mark.parametrize(
     "sparse_topk,page_size,below",
@@ -2604,6 +2697,350 @@ def test_fp8_h64_decode_rows_take_the_m64_body_once_two_ctas_per_token_exceed_th
     assert route(sm_count // 2 + 1) == m64
     for tokens in (108, 120):
         assert route(tokens) == m64
+
+
+# The SM count of the R200 board the SM107 low-head rules were measured on.
+_SM107_SM_COUNT = 216
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a", None])
+@pytest.mark.parametrize("sm_count", [_SM_COUNT, _SM107_SM_COUNT])
+@pytest.mark.parametrize(
+    "sparse_topk,page_size,m64",
+    [
+        (128, 256, "fp8_h64_prefill_source_persistent_m64"),
+        (640, 64, "fp8_h64_prefill_source_persistent_m64_multi_tile"),
+        (1152, 64, "fp8_h64_prefill_source_persistent_m64_multi_tile"),
+        (260, 2, "fp8_h64_prefill_source_persistent_m64_multi_tile"),
+    ],
+)
+def test_sm107a_fp8_h8_prefill_rows_take_the_m64_body(
+    arch, sm_count, sparse_topk, page_size, m64
+):
+    """FP8 8-head prefill rows (``max_q_len >= 257``) run the M64 body on SM107
+    at every token count: the single-tile program for the SWA-only width, the
+    multi-tile program for wider items of either compressed cache layout.
+    SM100, SM103 and an unknown architecture keep the low-head prefill
+    producer; 16- and 32-head prefill rows run the M64 body everywhere."""
+    expected = m64 if arch == "sm_107a" else "fp8_lowhead_prefill"
+    for batch_size, max_q_len, tokens, ragged in (
+        (1, 257, 257, True),
+        (2, 257, 386, True),
+        (2, 512, 1024, False),
+        (2, 1024, 2048, True),
+        (1, 2048, 2048, True),
+    ):
+        for num_heads in (8, 16, 32):
+            route = _route(
+                dtype=torch.float8_e4m3fn,
+                num_heads=num_heads,
+                batch_size=batch_size,
+                max_q_len=max_q_len,
+                ragged=ragged,
+                sparse_topk=sparse_topk,
+                compressed_page_size=page_size,
+                num_query_tokens=tokens,
+                sm_count=sm_count,
+                arch=arch,
+            )
+            want = expected if num_heads == 8 else m64
+            assert route == want, (num_heads, batch_size, max_q_len, tokens, route)
+            if arch is not None:
+                assert route in _ARCH_REGISTRATIONS[arch]["variants"], (arch, route)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a", None])
+@pytest.mark.parametrize("page_size", [2, 64])
+def test_fp8_h8_prefill_wider_than_1152_is_rejected(arch, page_size):
+    """8-head prefill items wider than 1152 sparse slots have no FP8 kernel:
+    the low-head prefill producer stages at most 1152 indices per item (nine
+    tiles of 128) and the M64 bindings require ``sparse_topk <= 1152``.  The
+    route raises instead of launching a producer that writes past its
+    shared-memory index buffer.  1152 itself still routes: the multi-tile M64
+    program on SM107, the low-head prefill producer elsewhere."""
+    assert cake._FP8_M64_MAX_WIDTH == 1152
+    assert cake._FP8_LOWHEAD_PREFILL_MAX_WIDTH == 1152
+    kwargs = dict(
+        dtype=torch.float8_e4m3fn,
+        num_heads=8,
+        batch_size=1,
+        max_q_len=1024,
+        ragged=True,
+        compressed_page_size=page_size,
+        num_query_tokens=1024,
+        sm_count=_SM107_SM_COUNT if arch == "sm_107a" else _SM_COUNT,
+        arch=arch,
+    )
+    expected = (
+        "fp8_h64_prefill_source_persistent_m64_multi_tile"
+        if arch == "sm_107a"
+        else "fp8_lowhead_prefill"
+    )
+    assert _route(sparse_topk=1152, **kwargs) == expected
+    for sparse_topk in (1156, 1280, 2048):
+        with pytest.raises(ValueError, match=r"sparse_topk \d+ > 1152"):
+            _route(sparse_topk=sparse_topk, **kwargs)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a", None])
+@pytest.mark.parametrize("num_heads", [8, 16, 32])
+@pytest.mark.parametrize("sm_count", [_SM_COUNT, _SM107_SM_COUNT])
+def test_sm107a_lowhead_swa_decode_rows_take_the_m64_body_past_one_wave(
+    arch, num_heads, sm_count
+):
+    """FP8 SWA-only decode rows (``max_q_len < 257``) of 8, 16 and 32 heads run
+    the single-tile M64 program on SM107 once the low-head prefill producer's
+    two CTAs per token exceed the SM count (216 SMs: 108 tokens keep the
+    producer, 109 take the M64 program); SM100, SM103 and an unknown
+    architecture keep the producer at every token count."""
+    m64 = "fp8_h64_prefill_source_persistent_m64"
+    assert cake._fp8_h64_m64_program(128) == m64
+    for tokens in (1, 12, 96, sm_count // 2, sm_count // 2 + 1, 112, 144, 256, 1024):
+        two_waves = 2 * tokens > sm_count
+        expected = m64 if arch == "sm_107a" and two_waves else "fp8_lowhead_prefill"
+        for max_q_len, ragged in ((1, False), (4, True), (256, True)):
+            if max_q_len > tokens:
+                continue
+            route = _route(
+                dtype=torch.float8_e4m3fn,
+                num_heads=num_heads,
+                batch_size=-(-tokens // max_q_len),
+                max_q_len=max_q_len,
+                ragged=ragged,
+                sparse_topk=128,
+                compressed_page_size=256,
+                num_query_tokens=tokens,
+                sm_count=sm_count,
+                arch=arch,
+            )
+            assert route == expected, (tokens, max_q_len, route)
+            if arch is not None:
+                assert route in _ARCH_REGISTRATIONS[arch]["variants"], (arch, route)
+
+
+@pytest.mark.cpu_only
+def test_sm107a_lowhead_m64_rule_does_not_follow_the_h64_rule(monkeypatch):
+    """The SM107 low-head decode rule is its own: a different 64-head wave rule,
+    stricter or looser, moves the 64-head rows only."""
+
+    def route(num_heads, tokens):
+        return _route(
+            dtype=torch.float8_e4m3fn,
+            num_heads=num_heads,
+            batch_size=tokens,
+            max_q_len=1,
+            ragged=False,
+            sparse_topk=128,
+            compressed_page_size=256,
+            num_query_tokens=tokens,
+            sm_count=_SM107_SM_COUNT,
+            arch="sm_107a",
+        )
+
+    m64 = "fp8_h64_prefill_source_persistent_m64"
+    for num_heads in (8, 16, 32, 64):
+        assert route(num_heads, 108) == "fp8_lowhead_prefill"
+        assert route(num_heads, 109) == m64
+    monkeypatch.setattr(cake, "_fp8_h64_uses_m64_body", lambda *a, **kw: False)
+    assert route(64, 109) == "fp8_lowhead_prefill"
+    for num_heads in (8, 16, 32):
+        assert route(num_heads, 108) == "fp8_lowhead_prefill"
+        assert route(num_heads, 109) == m64
+    monkeypatch.setattr(cake, "_fp8_h64_uses_m64_body", lambda *a, **kw: True)
+    assert route(64, 108) == m64
+    for num_heads in (8, 16, 32):
+        assert route(num_heads, 108) == "fp8_lowhead_prefill"
+        assert route(num_heads, 109) == m64
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "num_heads,num_query_tokens,max_q_len,batch_size,sparse_topk,page_size",
+    [
+        (8, 257, 257, 1, 128, 256),
+        (8, 386, 257, 2, 640, 64),
+        (8, 2048, 1024, 2, 1152, 64),
+        (8, 112, 4, 28, 128, 256),
+        (16, 144, 4, 36, 128, 256),
+        (32, 256, 4, 64, 128, 256),
+    ],
+)
+def test_sm107a_lowhead_m64_routes_need_the_low_head_workspace(
+    num_heads, num_query_tokens, max_q_len, batch_size, sparse_topk, page_size
+):
+    """The sizing API routes by the architecture as the launch does; the M64
+    routes that replace the low-head prefill producer on SM107 carve the same
+    one-split workspace (LSE region only)."""
+    shape = dict(
+        dtype=torch.float8_e4m3fn,
+        num_heads=num_heads,
+        num_query_tokens=num_query_tokens,
+        sm_count=_SM107_SM_COUNT,
+        sparse_topk=sparse_topk,
+        compressed_page_size=page_size,
+        max_q_len=max_q_len,
+        batch_size=batch_size,
+        ragged=True,
+    )
+    low = cake.cake_dsv4_workspace_requirement(**shape, arch="sm_103a")
+    m64 = cake.cake_dsv4_workspace_requirement(**shape, arch="sm_107a")
+    assert low.route == "fp8_lowhead_prefill"
+    assert m64.route == cake._fp8_h64_m64_program(sparse_topk)
+    assert m64.num_splits == 1 and m64.uses_workspace
+    assert (low.single_launch_bytes, low.minimum_bytes) == (
+        m64.single_launch_bytes,
+        m64.minimum_bytes,
+    )
+    assert m64.single_launch_bytes == cake._PARTIAL_OFFSET + cake._align_up(
+        num_query_tokens * num_heads * 4
+    )
+
+
+def _run_fake_lowhead_swa_fp8(monkeypatch, *, arch, num_heads, batch_size, q_len):
+    """Drive run_cake_dsv4 on CPU tensors for a dense FP8 SWA-only call on
+    ``arch`` (216 SMs); return the launched program and its bound arguments."""
+    plans = {
+        route: _PERSISTENT_PLAN
+        for route in (
+            "fp8_lowhead_prefill",
+            "fp8_h64_prefill_source_persistent_m64",
+            "fp8_h64_prefill_source_persistent_m64_multi_tile",
+        )
+    }
+    recorder = _install_fake_variants(monkeypatch, plans)
+    seen = []
+
+    def module(variant, **kwargs):
+        seen.append(variant)
+        return recorder
+
+    monkeypatch.setattr(cake, "_variant_module", module)
+    monkeypatch.setattr(cake, "_target_arch", lambda device: arch)
+    monkeypatch.setattr(cake, "_device_sm_count", lambda device: _SM107_SM_COUNT)
+    rows = batch_size * q_len
+    table, lens = _combined_metadata(rows, 0)
+    seq_lens = torch.full((batch_size,), 1000, dtype=torch.int32)
+    out = cake.run_cake_dsv4(
+        query=torch.zeros((rows, num_heads, 512), dtype=torch.float8_e4m3fn),
+        swa_kv_cache=torch.zeros((4, 1, 256, 512), dtype=torch.float8_e4m3fn),
+        compressed_kv_cache=torch.zeros((4, 1, 256, 512), dtype=torch.float8_e4m3fn),
+        workspace_buffer=_aligned_u8(
+            get_cake_dsv4_workspace_bytes(rows, num_heads, 128, torch.float8_e4m3fn)
+        ),
+        out=None,
+        bmm1_scale=0.5,
+        bmm2_scale=1.0,
+        sinks=None,
+        max_q_len=q_len,
+        cum_seq_lens_q=None,
+        seq_lens=seq_lens,
+        backend="cake",
+        sparse_indices=table,
+        sparse_topk_lens=lens,
+    )
+    (program,) = seen
+    (call,) = recorder.calls
+    bound = dict(zip((name for _, name in _PERSISTENT_PLAN), call, strict=True))
+    return program, bound, seq_lens, out
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("num_heads", [8, 16, 32])
+def test_sm107a_lowhead_swa_rows_launch_the_m64_program_with_dense_offsets(
+    monkeypatch, num_heads
+):
+    """A dense SWA-only call of two waves (60 x 2 = 120 tokens on 216 SMs) runs
+    the single-tile M64 program on SM107: one CTA per token and the cached
+    dense request offsets (the M64 programs read cum_seq_lens_q
+    unconditionally); SM103 runs the low-head prefill producer (two CTAs per
+    token, seq_lens in place of the never-read offsets).  Neither pins the
+    output phase for these head counts."""
+    route, bound, _, out = _run_fake_lowhead_swa_fp8(
+        monkeypatch, arch="sm_107a", num_heads=num_heads, batch_size=60, q_len=2
+    )
+    assert route == "fp8_h64_prefill_source_persistent_m64"
+    assert route in cake._RAGGED_ONLY_ROUTES
+    assert (bound["grid_x"], bound["grid_y"], bound["grid_z"]) == (120, 1, 1)
+    assert bound["total_work_items"] == bound["num_query_tokens"] == 120
+    assert bound["cum_seq_lens_q"].tolist() == list(range(0, 122, 2))
+    assert bound["O"].data_ptr() == out.data_ptr()
+    assert tuple(out.shape) == (120, num_heads, 512)
+    route, bound, seq_lens, _ = _run_fake_lowhead_swa_fp8(
+        monkeypatch, arch="sm_103a", num_heads=num_heads, batch_size=60, q_len=2
+    )
+    assert route == "fp8_lowhead_prefill"
+    assert (bound["grid_x"], bound["grid_y"], bound["grid_z"]) == (240, 1, 1)
+    assert bound["total_work_items"] == 240
+    assert bound["cum_seq_lens_q"].data_ptr() == seq_lens.data_ptr()
+    for name in ("fp8_lowhead_prefill", "fp8_h64_prefill_source_persistent_m64"):
+        phase = cake.cake_dsv4_out_phase(name, num_heads=num_heads, sparse_topk=128)
+        assert phase is None and cake._OUT_ALIGN_BY_ROUTE[name] == 32
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a", None])
+@pytest.mark.parametrize(
+    "sparse_topk,page_size,sm107_first",
+    [
+        # (width, page size, first M64 token count on SM107 at 208 / 216 SMs)
+        (160, 2, (13, 13)),  # one complete tile, 32 keys more: M64 throughout
+        (175, 2, (13, 13)),
+        (176, 2, (17, 17)),  # 48 keys more: the persistent body up to 16 tokens
+        (191, 2, (17, 17)),
+        (192, 2, (32, 33)),  # 64+ keys more: 20 * tokens > 3 * sm_count
+        (252, 2, (32, 33)),
+        (256, 2, (27, 28)),  # two complete tiles: 8 * tokens > sm_count
+        (260, 2, (54, 56)),  # three tiles, two complete: 200 * t > 51 * sm
+        (320, 64, (54, 56)),
+        (384, 2, (53, 55)),  # three complete tiles: 4 * tokens > sm_count
+        (400, 2, (63, 65)),  # four tiles, three complete: 10 * t > 3 * sm
+        (500, 2, (63, 65)),
+        (512, 2, (55, 57)),  # four complete tiles: 50 * t > 13 * sm
+        (516, 2, (105, 109)),  # five tiles and up: the half wave
+        (640, 64, (105, 109)),
+    ],
+)
+def test_fp8_h64_decode_rows_take_m64_before_the_half_wave_on_sm107(
+    arch, sparse_topk, page_size, sm107_first
+):
+    """On SM107 the FP8/H64 decode rows of two to four sparse tiles take the
+    M64 body before ``2 * tokens > sm_count``, by their tile and complete-tile
+    counts, and the rows of one complete tile and 64 or more keys of a second
+    run the persistent body until then (48-63 keys: up to 16 tokens); other
+    widths and architectures keep the half-wave rule."""
+    m64 = cake._fp8_h64_m64_program(sparse_topk)
+    for sm_count, sm107 in zip((208, 216), sm107_first, strict=True):
+
+        def route(tokens):
+            return _route(
+                dtype=torch.float8_e4m3fn,
+                num_heads=64,
+                batch_size=tokens // 4 + 1,
+                max_q_len=4,
+                ragged=True,
+                sparse_topk=sparse_topk,
+                compressed_page_size=page_size,
+                num_query_tokens=tokens,
+                sm_count=sm_count,
+                arch=arch,
+            )
+
+        if arch == "sm_107a":
+            first = sm107
+        elif sparse_topk < 256:
+            first = 13
+        else:
+            first = sm_count // 2 + 1
+        below = "fp8_h128_prefill_source_persistent_uniform"
+        for tokens in range(13, first):
+            assert route(tokens) == below, (sm_count, tokens)
+        for tokens in range(first, sm_count // 2 + 2):
+            assert route(tokens) == m64, (sm_count, tokens)
+        if arch is not None:
+            assert m64 in _ARCH_REGISTRATIONS[arch]["variants"]
 
 
 @pytest.mark.cpu_only
@@ -2655,11 +3092,1284 @@ def test_fp8_h64_m64_program_is_selected_by_the_item_width(
 )
 def test_fp8_h64_m64_programs_launch_one_cta_per_token(arch, route):
     tokens = 192
-    L = _RecordingLauncher(arch, num_query_tokens=tokens, num_heads=64, sparse_topk=388)
+    L = _RecordingLauncher(
+        arch, Q=torch.empty(0), num_query_tokens=tokens, num_heads=64, sparse_topk=388
+    )
     cake._dispatch_route(route, L)
     assert L.calls == [
         (route, {"grid": (tokens, 1, 1), "total_work_items": tokens, **L.partials(1)})
     ]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+def test_calls_without_pdl_launch_the_pdl_free_twins(arch):
+    """SM100 and SM103 route the FP8 H128 persistent route's PDL-free twin to
+    programs of their own.  Without PDL, SM103 runs it on launches of at least
+    384 rows and SM100 on calls whose longest request has at least 257 tokens;
+    other launches run the route.  SM107 does not route the twin and launches
+    the route."""
+    from flashinfer.jit.cake_dsv4 import VARIANTS
+
+    assert {"fp8_h128_prefill_source_persistent"} == cake._NO_PDL_TWIN_ROUTES
+    assert cake._NO_PDL_TWIN_MIN_TOKENS == {"sm_103a": 384}
+    assert cake._NO_PDL_TWIN_MIN_QUERY_LEN == {"sm_100a": 257}
+    for route in sorted(cake._NO_PDL_TWIN_ROUTES):
+        twin = f"{route}_no_pdl"
+        assert (twin in VARIANTS[arch]) == (arch != "sm_107a")
+        own = arch in ("sm_100a", "sm_103a")
+        program = VARIANTS[arch][route]
+        assert (VARIANTS[arch].get(twin, program) != program) == own
+        for tokens in (128, 256, 383, 384, 386, 512, 4096):
+            for max_q_len in (1, 8, 128, 256, 257, 512):
+                if max_q_len > tokens:
+                    continue
+                takes = (arch == "sm_103a" and tokens >= 384) or (
+                    arch == "sm_100a" and max_q_len >= 257
+                )
+                for enable_pdl in (False, True):
+                    expected = twin if takes and not enable_pdl else route
+                    assert (
+                        cake._pdl_variant(
+                            route,
+                            arch=arch,
+                            enable_pdl=enable_pdl,
+                            num_query_tokens=tokens,
+                            max_q_len=max_q_len,
+                        )
+                        == expected
+                    ), (tokens, max_q_len, enable_pdl)
+        if own:
+            spec = get_cake_dsv4_spec(twin, arch=arch)
+            assert ("launch", "enable_pdl") not in spec["arg_plan"]
+            pdl = get_cake_dsv4_spec(route, arch=arch)["arg_plan"]
+            assert spec["arg_plan"] == tuple(
+                pair for pair in pdl if pair != ("launch", "enable_pdl")
+            )
+    for other in ("fp8_lowhead_prefill", "fp8_h64_prefill_source_persistent_m64"):
+        assert (
+            cake._pdl_variant(
+                other,
+                arch=arch,
+                enable_pdl=False,
+                num_query_tokens=512,
+                max_q_len=512,
+            )
+            == other
+        )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+@pytest.mark.parametrize("tokens", [256, 386, 512])
+@pytest.mark.parametrize("max_q_len", [8, 257])
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_fp8_h128_persistent_launch_takes_the_twin_at_its_floors(
+    arch, tokens, max_q_len, enable_pdl
+):
+    route = "fp8_h128_prefill_source_persistent"
+    L = _RecordingLauncher(
+        arch,
+        Q=torch.empty(0),
+        num_query_tokens=tokens,
+        num_heads=128,
+        sparse_topk=260,
+        max_q_len=max_q_len,
+        enable_pdl=enable_pdl,
+    )
+    cake._dispatch_route(route, L)
+    takes = (arch == "sm_103a" and tokens >= 384) or (
+        arch == "sm_100a" and max_q_len >= 257
+    )
+    program = f"{route}_no_pdl" if takes and not enable_pdl else route
+    assert L.calls == [
+        (
+            program,
+            {"grid": (tokens * 2, 1, 1), "total_work_items": tokens, **L.partials(1)},
+        )
+    ]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+def test_sm107a_launches_take_the_k64_sibling_from_its_floor(arch):
+    """SM107 routes the FP8 H128 uniform-gather route's K=64 sibling to a
+    program of its own, with the route's arguments, and runs it on launches of
+    at least 48 rows; SM100 and SM103 route the sibling to the route's program
+    and launch the route."""
+    from flashinfer.jit.cake_dsv4 import VARIANTS
+
+    assert {"fp8_h128_prefill_source_persistent_uniform"} == cake._K64_SIBLING_ROUTES
+    assert cake._K64_SIBLING_MIN_TOKENS == {"sm_107a": 48}
+    for route in sorted(cake._K64_SIBLING_ROUTES):
+        sibling = f"{route}_k64"
+        own = arch == "sm_107a"
+        assert (VARIANTS[arch][sibling] != VARIANTS[arch][route]) == own
+        for tokens in (1, 8, 32, 47, 48, 64, 96, 127):
+            expected = sibling if own and tokens >= 48 else route
+            assert (
+                cake._k64_variant(
+                    route, arch=arch, num_query_tokens=tokens, device=_DEVICE
+                )
+                == expected
+            ), tokens
+        assert (
+            get_cake_dsv4_spec(sibling, arch=arch)["arg_plan"]
+            == get_cake_dsv4_spec(route, arch=arch)["arg_plan"]
+        )
+    for other in (
+        "fp8_h128_prefill_source_persistent",
+        "fp8_h64_prefill_source_persistent_m64",
+        "fp8_lowhead_prefill",
+    ):
+        assert (
+            cake._k64_variant(other, arch=arch, num_query_tokens=64, device=_DEVICE)
+            == other
+        )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+@pytest.mark.parametrize("tokens", [8, 47, 48, 127, 128, 160, 1024])
+@pytest.mark.parametrize("enable_pdl", [False, True])
+@pytest.mark.parametrize("launchable", [True, False])
+def test_fp8_h128_uniform_launch_takes_the_k64_sibling_at_its_floor(
+    monkeypatch, arch, tokens, enable_pdl, launchable
+):
+    """SM107 runs the uniform route's launches of at least 48 rows on its K=64
+    sibling.  Where the process cannot launch the sibling on the query's device
+    (the gate is asked only there), launches below the lane-gather floor run
+    the route's own program and the others the lane-issued program, over the
+    same grid and partials."""
+    asked = []
+
+    def gate(gate_arch, device):
+        asked.append((gate_arch, device))
+        return launchable
+
+    monkeypatch.setattr(cake, "_k64_sibling_launchable", gate)
+    route = "fp8_h128_prefill_source_persistent_uniform"
+    L = _RecordingLauncher(
+        arch,
+        Q=torch.empty(0),
+        num_query_tokens=tokens,
+        num_heads=128,
+        sparse_topk=1152,
+        max_q_len=4,
+        enable_pdl=enable_pdl,
+    )
+    cake._dispatch_route(route, L)
+    sibling = arch == "sm_107a" and tokens >= 48
+    if sibling and launchable:
+        program = f"{route}_k64"
+    elif sibling and tokens >= 128:
+        program = "fp8_h128_prefill_source_persistent"
+    else:
+        program = route
+    assert L.calls == [
+        (
+            program,
+            {"grid": (tokens * 2, 1, 1), "total_work_items": tokens, **L.partials(1)},
+        )
+    ]
+    assert asked == ([("sm_107a", _DEVICE)] if sibling else [])
+
+
+# (sparse_topk, compressed_page_size) of a topk4x, a topk128x and a SWA-only item.
+_SHORT_QUERY_ITEMS = {"topk4x": (1152, 64), "topk128x": (1152, 2), "swa": (128, 64)}
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", [None, "sm_100a", "sm_103a", "sm_107a"])
+def test_sm107a_short_query_decode_keeps_the_uniform_route(arch):
+    """On SM107, FP8 H128 launches of at least 160 rows keep the uniform-gather
+    route (its K=64 sibling runs them) when their requests hold one query row
+    (at most 2 from 256 rows), or on topk4x items at most 4 (at most 8 from 256
+    rows); fewer rows, longer requests and the other architectures take the
+    lane-gather route from 128 rows."""
+    assert cake._FP8_PERSISTENT_SHORT_QUERY_UNIFORM == {
+        "sm_107a": ((160, 1, False), (256, 2, False), (160, 4, True), (256, 8, True))
+    }
+    for item, tokens, max_q_len, sm107_uniform in (
+        ("topk4x", 127, 8, True),
+        ("topk4x", 128, 1, False),
+        ("topk4x", 159, 4, False),
+        ("topk4x", 160, 1, True),
+        ("topk4x", 160, 4, True),
+        ("topk4x", 160, 5, False),
+        ("topk4x", 255, 8, False),
+        ("topk4x", 256, 8, True),
+        ("topk4x", 4096, 8, True),
+        ("topk4x", 4096, 9, False),
+        ("topk4x", 514, 257, False),
+        ("topk4x", 255, 2, True),
+        ("topk128x", 127, 4, True),
+        ("topk128x", 159, 1, False),
+        ("topk128x", 160, 1, True),
+        ("topk128x", 1024, 1, True),
+        ("topk128x", 255, 2, False),
+        ("topk128x", 256, 2, True),
+        ("topk128x", 1024, 3, False),
+        ("topk128x", 1024, 4, False),
+        ("swa", 160, 1, True),
+        ("swa", 160, 2, False),
+        ("swa", 4096, 2, True),
+        ("swa", 384, 4, False),
+    ):
+        sparse_topk, page_size = _SHORT_QUERY_ITEMS[item]
+        uniform = tokens < 128 or (arch == "sm_107a" and sm107_uniform)
+        expected = (
+            "fp8_h128_prefill_source_persistent_uniform"
+            if uniform
+            else "fp8_h128_prefill_source_persistent"
+        )
+        assert (
+            _route(
+                dtype=torch.float8_e4m3fn,
+                num_heads=128,
+                batch_size=max(1, tokens // max_q_len),
+                max_q_len=max_q_len,
+                ragged=True,
+                sparse_topk=sparse_topk,
+                compressed_page_size=page_size,
+                num_query_tokens=tokens,
+                sm_count=_SM_COUNT,
+                arch=arch,
+            )
+            == expected
+        ), (item, tokens, max_q_len)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("tokens", [160, 1024])
+def test_sm107a_short_query_decode_runs_the_k64_sibling(tokens):
+    """The short-query launches the uniform route keeps on SM107 run its K=64
+    sibling over the same grid and partials, and need the workspace the
+    lane-gather route needs on the other architectures."""
+    route = "fp8_h128_prefill_source_persistent_uniform"
+    L = _RecordingLauncher(
+        "sm_107a",
+        Q=torch.empty(0),
+        num_query_tokens=tokens,
+        num_heads=128,
+        sparse_topk=1152,
+        max_q_len=4,
+        enable_pdl=True,
+    )
+    cake._dispatch_route(route, L)
+    assert L.calls == [
+        (
+            f"{route}_k64",
+            {"grid": (tokens * 2, 1, 1), "total_work_items": tokens, **L.partials(1)},
+        )
+    ]
+    shape = dict(
+        dtype=torch.float8_e4m3fn,
+        num_heads=128,
+        num_query_tokens=tokens,
+        sm_count=_SM_COUNT,
+        sparse_topk=1152,
+        compressed_page_size=64,
+        max_q_len=4,
+        batch_size=tokens // 4,
+        ragged=False,
+    )
+    short = cake.cake_dsv4_workspace_requirement(**shape, arch="sm_107a")
+    lane = cake.cake_dsv4_workspace_requirement(**shape, arch="sm_103a")
+    assert short.route == route
+    assert lane.route == "fp8_h128_prefill_source_persistent"
+    assert (short.single_launch_bytes, short.minimum_bytes, short.num_splits) == (
+        lane.single_launch_bytes,
+        lane.minimum_bytes,
+        lane.num_splits,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# K=64 sibling gate: CUDA 13.4's oversized shared-memory mode                 #
+# --------------------------------------------------------------------------- #
+
+_UNIFORM_ROUTE = "fp8_h128_prefill_source_persistent_uniform"
+
+
+@pytest.fixture
+def oversized_check():
+    """The host's oversized launch check (both sibling gates ask it), its cache
+    per shared-memory size and device empty before and after."""
+    cake._oversized_smem_launchable.cache_clear()
+    yield cake._oversized_smem_launchable
+    cake._oversized_smem_launchable.cache_clear()
+
+
+@pytest.fixture
+def k64_gate(oversized_check):
+    """The host's K=64 gate over an empty launch-check cache."""
+    return _K64_SIBLING_LAUNCHABLE
+
+
+@pytest.fixture
+def kv4_gate(oversized_check):
+    """The host's four-stage gate over an empty launch-check cache."""
+    return _KV4_SIBLING_LAUNCHABLE
+
+
+def _stub_gate_probes(monkeypatch, *, toolkit, runtime, ceiling):
+    """Stub the gates' probes: the CUDA toolkit (nvcc) version, the version of
+    the process's runtime and the device's oversized ceiling (one value, or a
+    dict by device index).  Returns the probe calls."""
+    from packaging.version import Version
+
+    from flashinfer.jit import cpp_ext
+
+    asked = {"runtime": [], "ceiling": []}
+
+    def runtime_version(major):
+        asked["runtime"].append(major)
+        return runtime
+
+    def oversized_ceiling(device):
+        asked["ceiling"].append(device)
+        return ceiling[device.index] if isinstance(ceiling, dict) else ceiling
+
+    monkeypatch.setattr(cpp_ext, "get_cuda_version", lambda: Version(toolkit))
+    monkeypatch.setattr(cake, "_cuda_runtime_version", runtime_version)
+    monkeypatch.setattr(cake, "_device_oversized_smem_per_block", oversized_ceiling)
+    return asked
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "toolkit,runtime,ceiling,launchable",
+    [
+        ("13.4", 13040, 272512, True),
+        ("13.5", 13050, 300000, True),
+        # The driver does not report the ceiling: it has no oversized mode.
+        ("13.4", 13040, None, False),
+        # A 13.0 runtime wheel next to a 13.4 toolkit: the binding's
+        # cudaFuncSetAttribute fails with "invalid argument".
+        ("13.4", 13000, 272512, False),
+        ("13.4", 13000, None, False),
+        # The runtime the JIT modules link does not load.
+        ("13.4", None, 272512, False),
+        # The oversized ceiling does not hold the program's shared memory.
+        ("13.4", 13040, 272511, False),
+        ("13.4", 13040, 0, False),
+        # The binding needs a 13.4 toolkit to build.
+        ("13.3", 13040, 272512, False),
+    ],
+)
+def test_k64_gate_needs_cuda_13_4_and_the_oversized_ceiling(
+    monkeypatch, k64_gate, toolkit, runtime, ceiling, launchable
+):
+    """SM107's K=64 sibling launches only with a CUDA toolkit and a process
+    runtime of at least 13.4 and a driver that reports an oversized ceiling of
+    at least its 272512 B; the probes stop at the first refusal and the
+    runtime is asked by the toolkit's major (the JIT modules' soname)."""
+    from packaging.version import Version
+
+    asked = _stub_gate_probes(
+        monkeypatch, toolkit=toolkit, runtime=runtime, ceiling=ceiling
+    )
+    device = torch.device("cuda", 0)
+    assert k64_gate("sm_107a", device) is launchable
+    built = Version(toolkit) >= Version("13.4")
+    loaded = built and runtime is not None and runtime >= 13040
+    assert asked == {
+        "runtime": [13] if built else [],
+        "ceiling": [device] if loaded else [],
+    }
+
+
+@pytest.mark.cpu_only
+def test_k64_gate_probes_each_device_once(monkeypatch, k64_gate):
+    """The gate's launch check is cached per device: the probes run once per
+    device, and an architecture without an oversized sibling needs none."""
+    asked = _stub_gate_probes(
+        monkeypatch, toolkit="13.4", runtime=13040, ceiling={0: 272512, 1: 232448}
+    )
+    first, second = torch.device("cuda", 0), torch.device("cuda", 1)
+    for _ in range(3):
+        assert k64_gate("sm_107a", first)
+        assert not k64_gate("sm_107a", second)
+    assert k64_gate("sm_100a", first) and k64_gate("sm_103a", second)
+    assert asked == {"runtime": [13, 13], "ceiling": [first, second]}
+
+
+class _FakeCudart:
+    """``libcudart`` stand-in whose cudaRuntimeGetVersion reports ``version``
+    and returns ``status``."""
+
+    def __init__(self, version, status=0):
+        self.version = version
+        self.status = status
+
+    def cudaRuntimeGetVersion(self, out):
+        out[0] = self.version
+        return self.status
+
+
+class _FakeLibcuda:
+    """``libcuda`` stand-in: device ``i`` has the handle ``100 + i`` and every
+    attribute asked (recorded with the handle) reads ``ceiling`` with
+    ``status``."""
+
+    def __init__(self, ceiling, status=0):
+        self.ceiling = ceiling
+        self.status = status
+        self.asked = []
+
+    def cuInit(self, flags):
+        return 0
+
+    def cuDeviceGet(self, out, ordinal):
+        out[0] = 100 + ordinal
+        return 0
+
+    def cuDeviceGetAttribute(self, out, attribute, handle):
+        self.asked.append((attribute, handle.value))
+        out[0] = self.ceiling
+        return self.status
+
+
+@pytest.mark.cpu_only
+def test_k64_gate_probes_read_the_process_runtime_and_the_driver(monkeypatch):
+    """The runtime probe reads cudaRuntimeGetVersion of ``libcudart.so.<major>``;
+    the ceiling probe reads the driver's attribute 150 for the device's handle.
+    A library that does not load or a call that fails reports nothing."""
+    libraries = {}
+    opened = []
+
+    def shared_library(soname):
+        opened.append(soname)
+        return libraries.get(soname)
+
+    monkeypatch.setattr(cake, "_shared_library", shared_library)
+    assert cake._cuda_runtime_version(13) is None
+    libraries["libcudart.so.13"] = _FakeCudart(13000)
+    assert cake._cuda_runtime_version(13) == 13000
+    libraries["libcudart.so.13"] = _FakeCudart(13040, status=35)
+    assert cake._cuda_runtime_version(13) is None
+    assert opened == ["libcudart.so.13"] * 3
+
+    device = torch.device("cuda", 2)
+    assert cake._device_oversized_smem_per_block(device) is None
+    libcuda = libraries["libcuda.so.1"] = _FakeLibcuda(272512)
+    assert cake._device_oversized_smem_per_block(device) == 272512
+    assert libcuda.asked == [(150, 102)]
+    # CUDA_ERROR_INVALID_VALUE: a driver that does not know the attribute.
+    libraries["libcuda.so.1"] = _FakeLibcuda(272512, status=1)
+    assert cake._device_oversized_smem_per_block(device) is None
+
+
+@pytest.mark.cpu_only
+def test_shared_library_prefers_the_copy_already_in_the_process(monkeypatch):
+    """A soname already mapped resolves without loading (the copy the JIT
+    modules bind to); otherwise the dynamic linker loads it; a library that
+    loads neither way is ``None``."""
+    import ctypes
+    import os
+
+    mapped = {"libcudart.so.13"}
+    opened = []
+
+    def cdll(soname, mode=ctypes.DEFAULT_MODE):
+        opened.append((soname, mode))
+        if mode & os.RTLD_NOLOAD and soname not in mapped:
+            raise OSError(f"{soname}: not mapped")
+        if soname == "libmissing.so.1":
+            raise OSError(f"{soname}: not found")
+        return f"handle:{soname}"
+
+    monkeypatch.setattr(cake.ctypes, "CDLL", cdll)
+    noload = os.RTLD_NOLOAD | os.RTLD_NOW
+    assert cake._shared_library("libcudart.so.13") == "handle:libcudart.so.13"
+    assert opened == [("libcudart.so.13", noload)]
+    opened.clear()
+    assert cake._shared_library("libcuda.so.1") == "handle:libcuda.so.1"
+    assert opened == [
+        ("libcuda.so.1", noload),
+        ("libcuda.so.1", ctypes.DEFAULT_MODE),
+    ]
+    opened.clear()
+    assert cake._shared_library("libmissing.so.1") is None
+    assert len(opened) == 2
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("runtime,program", [(13000, ""), (13040, "_k64")])
+def test_sm107a_uniform_launch_follows_the_process_runtime(
+    monkeypatch, k64_gate, runtime, program
+):
+    """With a 13.4 toolkit, a 13.0 runtime in the process runs SM107's 48-row
+    uniform launches on the route's program instead of failing in the K=64
+    sibling's binding; a 13.4 runtime runs the sibling.  The probes run once."""
+    from types import SimpleNamespace
+
+    from packaging.version import Version
+
+    from flashinfer.jit import cpp_ext
+
+    monkeypatch.setattr(cake, "_k64_sibling_launchable", k64_gate)
+    monkeypatch.setattr(cpp_ext, "get_cuda_version", lambda: Version("13.4"))
+    cudart, libcuda = _FakeCudart(runtime), _FakeLibcuda(272512)
+    libraries = {"libcudart.so.13": cudart, "libcuda.so.1": libcuda}
+    monkeypatch.setattr(cake, "_shared_library", libraries.get)
+    for _ in range(2):
+        L = _RecordingLauncher(
+            "sm_107a",
+            Q=SimpleNamespace(device=torch.device("cuda", 0)),
+            num_query_tokens=48,
+            num_heads=128,
+            sparse_topk=1152,
+            max_q_len=4,
+        )
+        cake._dispatch_route(_UNIFORM_ROUTE, L)
+        assert L.calls == [
+            (
+                f"{_UNIFORM_ROUTE}{program}",
+                {"grid": (96, 1, 1), "total_work_items": 48, **L.partials(1)},
+            )
+        ]
+    assert libcuda.asked == ([(150, 100)] if runtime >= 13040 else [])
+
+
+@pytest.mark.cpu_only
+def test_sibling_gates_know_every_oversized_binding():
+    """The programs whose generated bindings launch in CUDA 13.4's oversized
+    shared-memory mode are exactly the K=64 and four-stage siblings the gates
+    hold, each with the dynamic shared memory its gate compares with the
+    device's oversized ceiling; every other program, including those the gates
+    fall back to, launches in the standard mode."""
+    import re
+
+    from flashinfer.jit.cake_dsv4 import VARIANTS, _get_csrc_dir
+
+    siblings = (
+        ("_k64", cake._K64_SIBLING_ROUTES, cake._K64_SIBLING_OVERSIZED_SMEM_BYTES),
+        ("_kv4", cake._KV4_SIBLING_ROUTES, cake._KV4_SIBLING_OVERSIZED_SMEM_BYTES),
+    )
+    gated = {
+        VARIANTS[arch][f"{route}{suffix}"]: smem
+        for suffix, routes, smem_by_arch in siblings
+        for arch, smem in smem_by_arch.items()
+        for route in routes
+    }
+    oversized = {}
+    for path in sorted(_get_csrc_dir().glob("*/*_binding.cu")):
+        text = path.read_text(encoding="utf-8")
+        if "cudaSharedMemoryModeAllowOversizedSharedMemory" in text:
+            (smem,) = re.findall(r"config\.dynamicSmemBytes = (\d+);", text)
+            oversized[path.name.removesuffix("_binding.cu")] = int(smem)
+    assert oversized == gated
+
+
+# --------------------------------------------------------------------------- #
+# Four-stage sibling: SM107's multi-tile M64 program in the oversized mode    #
+# --------------------------------------------------------------------------- #
+
+_M64_MULTI_TILE_ROUTE = "fp8_h64_prefill_source_persistent_m64_multi_tile"
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+def test_sm107a_m64_multi_tile_launches_take_the_kv4_sibling(arch):
+    """SM107 routes the multi-tile M64 route's four-stage sibling to a program
+    of its own, with the route's arguments, and runs it on every launch; SM100
+    and SM103 route the sibling to the route's program and launch the route."""
+    from flashinfer.jit.cake_dsv4 import VARIANTS
+
+    assert {_M64_MULTI_TILE_ROUTE} == cake._KV4_SIBLING_ROUTES
+    assert cake._KV4_SIBLING_OVERSIZED_SMEM_BYTES == {"sm_107a": 322688}
+    for route in sorted(cake._KV4_SIBLING_ROUTES):
+        sibling = f"{route}_kv4"
+        own = arch == "sm_107a"
+        assert (VARIANTS[arch][sibling] != VARIANTS[arch][route]) == own
+        expected = sibling if own else route
+        assert cake._kv4_variant(route, arch=arch, device=_DEVICE) == expected
+        assert (
+            get_cake_dsv4_spec(sibling, arch=arch)["arg_plan"]
+            == get_cake_dsv4_spec(route, arch=arch)["arg_plan"]
+        )
+    for other in (
+        "fp8_h64_prefill_source_persistent_m64",
+        "fp8_h128_prefill_source_persistent_uniform",
+        "fp8_lowhead_prefill",
+    ):
+        assert cake._kv4_variant(other, arch=arch, device=_DEVICE) == other
+
+
+@pytest.mark.cpu_only
+def test_kv4_variant_needs_a_sibling_program_of_its_own(monkeypatch):
+    """A launch takes the four-stage sibling only where its architecture routes
+    the sibling to a program other than the route's: a table without the
+    sibling, one that routes it to the route's program and one of another
+    architecture run the route without asking the gate.  The FP8/H64 decode
+    rows take the four-stage edges exactly where the launch takes the sibling,
+    through the same check."""
+    import flashinfer.jit.cake_dsv4 as jit
+
+    asked = []
+
+    def gate(arch, device):
+        asked.append((arch, device))
+        return True
+
+    monkeypatch.setattr(cake, "_kv4_sibling_launchable", gate)
+    route, sibling = _M64_MULTI_TILE_ROUTE, f"{_M64_MULTI_TILE_ROUTE}_kv4"
+    two, four = "cake_dsv4_two_stage", "cake_dsv4_four_stage"
+    for table, expected in (
+        ({"sm_107a": {route: two, sibling: four}}, sibling),
+        ({"sm_107a": {route: two}}, route),
+        ({"sm_107a": {route: two, sibling: two}}, route),
+        ({"sm_103a": {route: two, sibling: four}}, route),
+    ):
+        monkeypatch.setattr(jit, "VARIANTS", table)
+        assert cake._kv4_variant(route, arch="sm_107a", device=_DEVICE) == expected
+        edges = cake._fp8_h64_kv4_edges(
+            dtype=torch.float8_e4m3fn,
+            num_heads=64,
+            max_q_len=1,
+            sparse_topk=384,
+            arch="sm_107a",
+            device=_DEVICE,
+        )
+        assert edges == (expected == sibling)
+    assert asked == [("sm_107a", _DEVICE)] * 2
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+@pytest.mark.parametrize(
+    "route", ["fp8_h64_prefill_source_persistent_m64", _M64_MULTI_TILE_ROUTE]
+)
+@pytest.mark.parametrize("tokens", [1, 64, 208, 4096])
+@pytest.mark.parametrize("enable_pdl", [False, True])
+@pytest.mark.parametrize("launchable", [True, False])
+def test_fp8_h64_m64_launch_takes_the_kv4_sibling(
+    monkeypatch, arch, route, tokens, enable_pdl, launchable
+):
+    """SM107 runs every multi-tile M64 launch on its four-stage sibling over
+    the same grid and partials.  Where the process cannot launch the sibling
+    on the query's device (the gate is asked only there), the route's program
+    runs; the single-tile program and SM100 and SM103 launch the route."""
+    asked = []
+
+    def gate(gate_arch, device):
+        asked.append((gate_arch, device))
+        return launchable
+
+    monkeypatch.setattr(cake, "_kv4_sibling_launchable", gate)
+    L = _RecordingLauncher(
+        arch,
+        Q=torch.empty(0),
+        num_query_tokens=tokens,
+        num_heads=64,
+        sparse_topk=388,
+        enable_pdl=enable_pdl,
+    )
+    cake._dispatch_route(route, L)
+    sibling = arch == "sm_107a" and route == _M64_MULTI_TILE_ROUTE
+    program = f"{route}_kv4" if sibling and launchable else route
+    assert L.calls == [
+        (program, {"grid": (tokens, 1, 1), "total_work_items": tokens, **L.partials(1)})
+    ]
+    assert asked == ([("sm_107a", _DEVICE)] if sibling else [])
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "toolkit,runtime,ceiling,launchable",
+    [
+        # SM107's oversized ceiling, and one that holds exactly 322688 B.
+        ("13.4", 13040, 334848, True),
+        ("13.5", 13050, 334848, True),
+        ("13.4", 13040, 322688, True),
+        # The ceiling holds the K=64 sibling's 272512 B but not 322688 B.
+        ("13.4", 13040, 322687, False),
+        ("13.4", 13040, 272512, False),
+        # The driver does not report the ceiling: it has no oversized mode.
+        ("13.4", 13040, None, False),
+        # A 13.0 runtime wheel next to a 13.4 toolkit.
+        ("13.4", 13000, 334848, False),
+        # The runtime the JIT modules link does not load.
+        ("13.4", None, 334848, False),
+        # The binding needs a 13.4 toolkit to build.
+        ("13.3", 13040, 334848, False),
+    ],
+)
+def test_kv4_gate_needs_cuda_13_4_and_the_oversized_ceiling(
+    monkeypatch, kv4_gate, toolkit, runtime, ceiling, launchable
+):
+    """SM107's four-stage sibling launches under the K=64 sibling's conditions
+    with an oversized ceiling of at least its 322688 B; the probes run as for
+    the K=64 sibling."""
+    from packaging.version import Version
+
+    asked = _stub_gate_probes(
+        monkeypatch, toolkit=toolkit, runtime=runtime, ceiling=ceiling
+    )
+    device = torch.device("cuda", 0)
+    assert kv4_gate("sm_107a", device) is launchable
+    built = Version(toolkit) >= Version("13.4")
+    loaded = built and runtime is not None and runtime >= 13040
+    assert asked == {
+        "runtime": [13] if built else [],
+        "ceiling": [device] if loaded else [],
+    }
+
+
+@pytest.mark.cpu_only
+def test_sibling_gates_share_the_launch_check(monkeypatch, k64_gate, kv4_gate):
+    """Both gates ask the one launch check, cached per shared-memory size and
+    device: a ceiling that holds the K=64 sibling's 272512 B but not the
+    four-stage sibling's 322688 B launches only the former, each size probes
+    each device once, and SM100 and SM103 need no probe."""
+    asked = _stub_gate_probes(
+        monkeypatch, toolkit="13.4", runtime=13040, ceiling={0: 334848, 1: 300000}
+    )
+    first, second = torch.device("cuda", 0), torch.device("cuda", 1)
+    for _ in range(3):
+        assert k64_gate("sm_107a", first) and kv4_gate("sm_107a", first)
+        assert k64_gate("sm_107a", second) and not kv4_gate("sm_107a", second)
+    assert kv4_gate("sm_100a", first) and kv4_gate("sm_103a", second)
+    assert asked == {"runtime": [13] * 4, "ceiling": [first, first, second, second]}
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "runtime,ceiling,program",
+    [
+        (13040, 334848, "_kv4"),
+        # A 13.0 runtime wheel next to a 13.4 toolkit.
+        (13000, 334848, ""),
+        # A ceiling that holds the K=64 sibling but not the four-stage one.
+        (13040, 300000, ""),
+    ],
+)
+def test_sm107a_m64_multi_tile_launch_follows_the_process_runtime(
+    monkeypatch, kv4_gate, runtime, ceiling, program
+):
+    """With a 13.4 toolkit, SM107's multi-tile M64 launches run the four-stage
+    sibling where the process runtime is at least 13.4 and the device's
+    oversized ceiling holds its 322688 B, and the route's two-stage program
+    otherwise instead of failing in the sibling's binding.  The probes run
+    once."""
+    from types import SimpleNamespace
+
+    from packaging.version import Version
+
+    from flashinfer.jit import cpp_ext
+
+    monkeypatch.setattr(cake, "_kv4_sibling_launchable", kv4_gate)
+    monkeypatch.setattr(cpp_ext, "get_cuda_version", lambda: Version("13.4"))
+    cudart, libcuda = _FakeCudart(runtime), _FakeLibcuda(ceiling)
+    libraries = {"libcudart.so.13": cudart, "libcuda.so.1": libcuda}
+    monkeypatch.setattr(cake, "_shared_library", libraries.get)
+    for _ in range(2):
+        L = _RecordingLauncher(
+            "sm_107a",
+            Q=SimpleNamespace(device=torch.device("cuda", 0)),
+            num_query_tokens=208,
+            num_heads=64,
+            sparse_topk=388,
+            max_q_len=4,
+        )
+        cake._dispatch_route(_M64_MULTI_TILE_ROUTE, L)
+        assert L.calls == [
+            (
+                f"{_M64_MULTI_TILE_ROUTE}{program}",
+                {"grid": (208, 1, 1), "total_work_items": 208, **L.partials(1)},
+            )
+        ]
+    assert libcuda.asked == ([(150, 100)] if runtime >= 13040 else [])
+
+
+# --------------------------------------------------------------------------- #
+# SM107 FP8/H64 decode routes where the four-stage sibling launches           #
+# --------------------------------------------------------------------------- #
+
+# The token counts up to the half wave that take the multi-tile M64 body on
+# SM107 (FP8, 64 heads, max_q_len < 257), per width, per SM count and without
+# or with the four-stage edges ("-": none, the half wave).  The other token
+# counts up to the half wave run the persistent body, every token count past
+# it the M64 body.
+_SM107_KV4_M64_SPANS = """
+widths             | 208         | 208 kv4     | 216         | 216 kv4     | 224 kv4
+176                | 1-12 17-104 | 1-104       | 1-12 17-108 | 1-108       | 1-112
+177 191            | 1-12 17-104 | 1-12 17-104 | 1-12 17-108 | 1-12 17-108 | 1-12 17-112
+192 255            | 1-12 32-104 | 1-12 32-104 | 1-12 33-108 | 1-12 33-108 | 1-12 34-112
+256                | 1-12 27-104 | 1-104       | 1-12 28-108 | 1-108       | 1-112
+257 288 289 352    | 1-12 54-104 | 1-16 52-104 | 1-12 56-108 | 1-16 54-108 | 1-16 56-112
+353 383            | 1-12 54-104 | 1-12 52-104 | 1-12 56-108 | 1-12 54-108 | 1-12 56-112
+384                | 53-104      | 1-104       | 55-108      | 1-108       | 1-112
+385 511            | 63-104      | 63-104      | 65-108      | 65-108      | 68-112
+512                | 55-104      | 51-104      | 57-108      | 52-108      | 54-112
+896 1152           | -           | 78-104      | -           | 80-108      | 83-112
+1024               | -           | 93-104      | -           | 96-108      | 100-112
+513 640 768 895    | -           | -           | -           | -           | -
+897 1023 1025 1151 | -           | -           | -           | -           | -
+"""
+
+
+def _span_tokens(cell):
+    """The token counts of ``"a-b c-d"`` spans (``"-"``: none)."""
+    tokens = set()
+    for span in cell.split():
+        if span != "-":
+            first, last = span.split("-")
+            tokens.update(range(int(first), int(last) + 1))
+    return tokens
+
+
+def _sm107_kv4_m64_spans():
+    """``_SM107_KV4_M64_SPANS`` as ``(widths, {(sm_count, kv4): M64 tokens})`` rows."""
+    header, *rows = _SM107_KV4_M64_SPANS.strip().splitlines()
+    columns = [
+        (int(column.split()[0]), column.split()[-1] == "kv4")
+        for column in header.split("|")[1:]
+    ]
+    table = []
+    for row in rows:
+        widths, *cells = row.split("|")
+        spans = {
+            column: _span_tokens(cell)
+            for column, cell in zip(columns, cells, strict=True)
+        }
+        table.append((tuple(int(width) for width in widths.split()), spans))
+    return table
+
+
+def _sm107_kv4_widths():
+    """The widths of ``_SM107_KV4_M64_SPANS``: every edge of the SM107 rules."""
+    return sorted({width for widths, _ in _sm107_kv4_m64_spans() for width in widths})
+
+
+def _h64_decode_route(width, tokens, sm_count, arch, **kwargs):
+    """``_route`` of a dense FP8/H64 decode call of ``tokens`` one-row requests."""
+    return _route(
+        dtype=torch.float8_e4m3fn,
+        num_heads=64,
+        max_q_len=1,
+        ragged=False,
+        sparse_topk=width,
+        batch_size=tokens,
+        compressed_page_size=64,
+        num_query_tokens=tokens,
+        sm_count=sm_count,
+        arch=arch,
+        **kwargs,
+    )
+
+
+@pytest.mark.cpu_only
+def test_fp8_h64_decode_rows_route_by_the_kv4_edges_on_sm107():
+    """On SM107 every FP8/H64 decode row up to two tokens past the half wave
+    (208, 216 and 224 SMs) routes as ``_SM107_KV4_M64_SPANS`` lists, without
+    and with the four-stage edges.  They take widths 176, 256 and 384 at every
+    token count, widths 257-352 at 1-16 tokens (then the persistent body again
+    until 52 tokens at 208 SMs), widths 257-383 and 512 a few tokens earlier,
+    and widths 896, 1024 and 1152 before the half wave."""
+    table = _sm107_kv4_m64_spans()
+    assert len(_sm107_kv4_widths()) == sum(len(widths) for widths, _ in table)
+    for widths, spans in table:
+        for (sm_count, kv4), m64_tokens in spans.items():
+            assert max(m64_tokens, default=0) <= sm_count // 2, (widths, sm_count)
+            for width in widths:
+                for tokens in range(1, sm_count // 2 + 3):
+                    m64 = tokens in m64_tokens or 2 * tokens > sm_count
+                    expected = _M64_MULTI_TILE_ROUTE if m64 else _UNIFORM_ROUTE
+                    route = _h64_decode_route(
+                        width, tokens, sm_count, "sm_107a", kv4=kv4
+                    )
+                    assert route == expected, (width, sm_count, kv4, tokens)
+
+
+@pytest.mark.cpu_only
+def test_kv4_edges_only_promote_sm107a_h64_decode_rows():
+    """The four-stage edges only move SM107 FP8/H64 decode rows of more than
+    one tile from the persistent body to the multi-tile M64 body: both tables
+    key SM107 alone, no M64 edge comes later than today's, no short-window
+    width keeps a row persistent that today runs on the M64 body, and the
+    other architectures, head counts, BF16 and prefill rows route as without
+    them."""
+    import itertools
+
+    short = cake._FP8_H64_PERSISTENT_SHORT_MIN_WIDTH_KV4
+    early = cake._FP8_H64_M64_EARLY_WAVE_KV4
+    assert set(short) == set(early) == {"sm_107a"}
+    for arch, edges in early.items():
+        base = cake._FP8_H64_M64_EARLY_WAVE[arch]
+        for tiles, (num, den) in edges.items():
+            assert tiles[0] >= 2, tiles
+            if tiles in base:
+                base_num, base_den = base[tiles]
+                assert num * base_den <= base_num * den, tiles
+    for arch, entries in short.items():
+        # Today the one-tile rows run the persistent body up to 16 tokens from
+        # the one-tile short-window width on; wider rows from two tiles on.
+        assert entries[1] >= cake._FP8_H64_PERSISTENT_ONE_TILE_MIN_WIDTH[arch][1]
+    moved = 0
+    sweeps = [("sm_107a", range(129, 1153))]
+    sweeps += [(arch, _sm107_kv4_widths()) for arch in ("sm_100a", "sm_103a", None)]
+    for arch, widths in sweeps:
+        for sm_count in (208, 216):
+            for width in widths:
+                for tokens in range(1, sm_count // 2 + 3):
+                    old = _h64_decode_route(width, tokens, sm_count, arch, kv4=False)
+                    new = _h64_decode_route(width, tokens, sm_count, arch, kv4=True)
+                    if new != old:
+                        assert arch == "sm_107a", (arch, sm_count, width, tokens)
+                        assert (old, new) == (_UNIFORM_ROUTE, _M64_MULTI_TILE_ROUTE)
+                        moved += 1
+    assert moved
+
+    def outcome(**shape):
+        try:
+            return _route(**shape)
+        except ValueError as error:
+            return str(error)
+
+    shapes = itertools.product(
+        ("sm_100a", "sm_103a", "sm_107a", None),
+        (torch.float8_e4m3fn, torch.bfloat16),
+        (8, 16, 32, 64, 128),
+        (1, 4, 257),
+        (128, 129, 256, 384, 640, 1152),
+        (2, 64),
+        (1, 12, 16, 52, 104, 109, 257, 514),
+    )
+    for arch, dtype, num_heads, max_q_len, width, page_size, tokens in shapes:
+        h64_decode = (
+            dtype == torch.float8_e4m3fn and num_heads == 64 and max_q_len < 257
+        )
+        if h64_decode or max_q_len > tokens:
+            continue
+        shape = dict(
+            dtype=dtype,
+            num_heads=num_heads,
+            max_q_len=max_q_len,
+            ragged=max_q_len > 1,
+            sparse_topk=width,
+            batch_size=-(-tokens // max_q_len),
+            compressed_page_size=page_size,
+            num_query_tokens=tokens,
+            sm_count=216,
+            arch=arch,
+        )
+        assert outcome(**shape, kv4=True) == outcome(**shape, kv4=False), shape
+
+
+# Today's SM107 early-wave edges of the FP8/H64 decode rows, frozen.
+_TODAYS_SM107_H64_EARLY_WAVE = {
+    (2, 1): (3, 20),
+    (2, 2): (1, 8),
+    (3, 2): (51, 200),
+    (3, 3): (1, 4),
+    (4, 3): (3, 10),
+    (4, 4): (13, 50),
+}
+
+
+def _todays_h64_decode_route(width, tokens, sm_count, arch):
+    """The FP8/H64 decode route (``max_q_len < 257``) before the four-stage
+    edges, restated: the M64 body past the half wave and from today's SM107
+    edges on; else the persistent body for three complete tiles up to 12
+    tokens and for two past them (SM107: also one complete tile from width
+    192, from 176 up to 16 tokens); else the SWA producer (width 128), the H64
+    cluster body on SM100 / SM103 (widths 257-383 up to 12 tokens) or the M64
+    body."""
+    m64 = _M64_MULTI_TILE_ROUTE
+    if width == 128:
+        m64 = "fp8_h64_prefill_source_persistent_m64"
+    full_tiles = width // 128
+    edge = None
+    if arch == "sm_107a":
+        edge = _TODAYS_SM107_H64_EARLY_WAVE.get((-(-width // 128), full_tiles))
+    if 2 * tokens > sm_count or (edge and edge[1] * tokens > edge[0] * sm_count):
+        return m64
+    if tokens <= 12:
+        persistent = full_tiles >= 3
+    elif full_tiles == 1 and arch == "sm_107a":
+        persistent = width >= (176 if tokens <= 16 else 192)
+    else:
+        persistent = full_tiles >= 2
+    if persistent and tokens < 128:
+        return _UNIFORM_ROUTE
+    if persistent:
+        return "fp8_h128_prefill_source_persistent"
+    if width == 128:
+        return "fp8_lowhead_prefill"
+    if arch in ("sm_100a", "sm_103a") and tokens <= 12 and 256 < width < 384:
+        return "fp8_lowhead_h64"
+    return m64
+
+
+@pytest.mark.cpu_only
+def test_kv4_false_routes_are_todays():
+    """Without the four-stage edges (``kv4=False``, the default: the sibling
+    does not launch, or another architecture) the FP8/H64 decode rows route as
+    before them: today's tables are unchanged and every row of the sweep
+    routes as the restated rule."""
+    assert cake._FP8_H64_M64_EARLY_WAVE == {"sm_107a": _TODAYS_SM107_H64_EARLY_WAVE}
+    assert cake._FP8_H64_PERSISTENT_ONE_TILE_MIN_WIDTH == {"sm_107a": (192, 176)}
+    edges = sorted({128, 129, 175, *_sm107_kv4_widths()})
+    for arch in ("sm_100a", "sm_103a", "sm_107a", None):
+        widths = range(128, 1153) if arch == "sm_107a" else edges
+        for sm_count in (208, 216):
+            for width in widths:
+                for tokens in range(1, sm_count // 2 + 3):
+                    expected = _todays_h64_decode_route(width, tokens, sm_count, arch)
+                    default = _h64_decode_route(width, tokens, sm_count, arch)
+                    off = _h64_decode_route(width, tokens, sm_count, arch, kv4=False)
+                    assert default == off == expected, (arch, sm_count, width, tokens)
+
+
+def _bf16_out_at(rows, num_heads, offset):
+    """A bf16 ``[rows, num_heads, 512]`` output whose data pointer is
+    ``offset`` bytes past a 32-byte boundary."""
+    numel = rows * num_heads * 512
+    backing = torch.empty(numel + 16, dtype=torch.bfloat16)
+    start = ((offset - backing.data_ptr()) % 32) // 2
+    return backing[start : start + numel].view(rows, num_heads, 512)
+
+
+def _run_fake_h64_decode_fp8(
+    monkeypatch, *, arch, width, tokens, workspace=None, out=None
+):
+    """Drive run_cake_dsv4 on CPU tensors for a dense FP8/H64 decode call of
+    ``tokens`` one-row requests over ``width`` keys on ``arch`` (208 SMs);
+    return the launched programs, their bound arguments and the output."""
+    plans = {
+        route: _PERSISTENT_PLAN
+        for route in (
+            _UNIFORM_ROUTE,
+            f"{_UNIFORM_ROUTE}_k64",
+            _M64_MULTI_TILE_ROUTE,
+            f"{_M64_MULTI_TILE_ROUTE}_kv4",
+        )
+    }
+    recorder = _install_fake_variants(monkeypatch, plans)
+    programs = []
+
+    def module(variant, **kwargs):
+        programs.append(variant)
+        return recorder
+
+    monkeypatch.setattr(cake, "_variant_module", module)
+    monkeypatch.setattr(cake, "_target_arch", lambda device: arch)
+    monkeypatch.setattr(cake, "_device_sm_count", lambda device: 208)
+    table, lens = _combined_metadata(tokens, width - 128)
+    if workspace is None:
+        workspace = _aligned_u8(
+            get_cake_dsv4_workspace_bytes(tokens, 64, width, torch.float8_e4m3fn)
+        )
+    result = cake.run_cake_dsv4(
+        query=torch.zeros((tokens, 64, 512), dtype=torch.float8_e4m3fn),
+        swa_kv_cache=torch.zeros((4, 1, 256, 512), dtype=torch.float8_e4m3fn),
+        compressed_kv_cache=torch.zeros((4, 1, 64, 512), dtype=torch.float8_e4m3fn),
+        workspace_buffer=workspace,
+        out=out,
+        bmm1_scale=0.5,
+        bmm2_scale=1.0,
+        sinks=None,
+        max_q_len=1,
+        cum_seq_lens_q=None,
+        seq_lens=torch.full((tokens,), 1000, dtype=torch.int32),
+        backend="cake",
+        sparse_indices=table,
+        sparse_topk_lens=lens,
+    )
+    calls = [
+        dict(zip((name for _, name in _PERSISTENT_PLAN), call, strict=True))
+        for call in recorder.calls
+    ]
+    return programs, calls, result
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("width,tokens", [(384, 4), (256, 20)])
+def test_run_cake_dsv4_routes_h64_decode_rows_by_the_kv4_launch_check(
+    monkeypatch, width, tokens
+):
+    """run_cake_dsv4 routes SM107's FP8/H64 decode rows by the four-stage
+    edges where the process can launch the sibling on the query's device:
+    rows they promote (208 SMs) run the sibling, one CTA per token, after one
+    gate ask at route time and one at launch.  Where it cannot, they keep the
+    uniform route, two CTAs per token, after one ask; SM103 never asks.  A
+    caller ``out`` 16 bytes past a 32-byte boundary is staged for the M64
+    route only (its stores need 32 bytes, the uniform route's 16)."""
+    answer = {}
+    asked = []
+
+    def gate(arch, device):
+        asked.append((arch, device))
+        return answer["launchable"]
+
+    monkeypatch.setattr(cake, "_kv4_sibling_launchable", gate)
+    for arch, launchable, program, grid, asks, staged in (
+        ("sm_107a", True, f"{_M64_MULTI_TILE_ROUTE}_kv4", tokens, 2, True),
+        ("sm_107a", False, _UNIFORM_ROUTE, 2 * tokens, 1, False),
+        ("sm_103a", True, _UNIFORM_ROUTE, 2 * tokens, 0, False),
+    ):
+        answer["launchable"] = launchable
+        asked.clear()
+        out = _bf16_out_at(tokens, 64, 16)
+        assert out.data_ptr() % 32 == 16
+        programs, calls, result = _run_fake_h64_decode_fp8(
+            monkeypatch, arch=arch, width=width, tokens=tokens, out=out
+        )
+        (bound,) = calls
+        assert programs == [program], (arch, launchable)
+        assert (bound["grid_x"], bound["grid_y"], bound["grid_z"]) == (grid, 1, 1)
+        assert bound["total_work_items"] == bound["num_query_tokens"] == tokens
+        assert asked == [("sm_107a", _DEVICE)] * asks
+        assert result is out
+        assert (bound["O"].data_ptr() != out.data_ptr()) == staged
+
+
+@pytest.mark.cpu_only
+def test_row_tiled_h64_decode_chunks_run_the_kv4_sibling(monkeypatch):
+    """A workspace below the single-launch carve tiles a promoted FP8/H64
+    decode call (width 384, 20 tokens, 208 SMs): every chunk runs the
+    four-stage sibling, one CTA per row, and the gate is asked once at route
+    time and once per chunk."""
+    asked = []
+
+    def gate(arch, device):
+        asked.append((arch, device))
+        return True
+
+    monkeypatch.setattr(cake, "_kv4_sibling_launchable", gate)
+    tokens = 20
+    plan = cake._route_plan(
+        _M64_MULTI_TILE_ROUTE, num_query_tokens=tokens, num_heads=64, sparse_topk=384
+    )
+    chunk_bytes = cake._launch_workspace_bytes(plan, 8, 64, tokens + 1)
+    rows = cake._rows_per_launch(
+        plan,
+        num_query_tokens=tokens,
+        num_heads=64,
+        batch_size=tokens,
+        workspace_bytes=chunk_bytes,
+    )
+    assert rows == 8
+    programs, calls, _ = _run_fake_h64_decode_fp8(
+        monkeypatch,
+        arch="sm_107a",
+        width=384,
+        tokens=tokens,
+        workspace=_aligned_u8(chunk_bytes),
+    )
+    assert programs == [f"{_M64_MULTI_TILE_ROUTE}_kv4"] * 3
+    grids = [(c["grid_x"], c["grid_y"], c["grid_z"]) for c in calls]
+    assert grids == [(8, 1, 1), (8, 1, 1), (4, 1, 1)]
+    assert [c["total_work_items"] for c in calls] == [8, 8, 4]
+    assert asked == [("sm_107a", _DEVICE)] * 4
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("width,tokens", [(384, 48), (512, 52)])
+def test_k64_only_ceiling_keeps_todays_h64_decode_routes(
+    monkeypatch, k64_gate, kv4_gate, width, tokens
+):
+    """A device whose oversized ceiling holds the K=64 sibling's 272512 B but
+    not the four-stage sibling's 322688 B routes without the four-stage edges:
+    rows they would promote (208 SMs) keep the uniform route and run its K=64
+    sibling from 48 rows, two CTAs per token."""
+    monkeypatch.setattr(cake, "_k64_sibling_launchable", k64_gate)
+    monkeypatch.setattr(cake, "_kv4_sibling_launchable", kv4_gate)
+    _stub_gate_probes(monkeypatch, toolkit="13.4", runtime=13040, ceiling=300000)
+    promoted = _h64_decode_route(width, tokens, 208, "sm_107a", kv4=True)
+    assert promoted == _M64_MULTI_TILE_ROUTE
+    programs, calls, _ = _run_fake_h64_decode_fp8(
+        monkeypatch, arch="sm_107a", width=width, tokens=tokens
+    )
+    assert programs == [f"{_UNIFORM_ROUTE}_k64"]
+    (bound,) = calls
+    assert (bound["grid_x"], bound["grid_y"], bound["grid_z"]) == (2 * tokens, 1, 1)
+    assert bound["total_work_items"] == tokens
+
+
+@pytest.mark.cpu_only
+def test_kv4_edges_follow_each_devices_launch_check(monkeypatch, kv4_gate):
+    """In one process, devices whose oversized ceilings differ route the same
+    FP8/H64 decode row apart (width 384, 4 tokens, 208 SMs): the device that
+    can launch the four-stage sibling takes the M64 route and runs the
+    sibling, the other keeps the uniform route.  The launch check probes each
+    device once."""
+    monkeypatch.setattr(cake, "_kv4_sibling_launchable", kv4_gate)
+    asked = _stub_gate_probes(
+        monkeypatch, toolkit="13.4", runtime=13040, ceiling={0: 334848, 1: 300000}
+    )
+    first, second = torch.device("cuda", 0), torch.device("cuda", 1)
+    for _ in range(2):
+        for device, route in ((first, _M64_MULTI_TILE_ROUTE), (second, _UNIFORM_ROUTE)):
+            kv4 = cake._fp8_h64_kv4_edges(
+                dtype=torch.float8_e4m3fn,
+                num_heads=64,
+                max_q_len=1,
+                sparse_topk=384,
+                arch="sm_107a",
+                device=device,
+            )
+            assert kv4 == (device == first)
+            assert _h64_decode_route(384, 4, 208, "sm_107a", kv4=kv4) == route
+    program = cake._kv4_variant(_M64_MULTI_TILE_ROUTE, arch="sm_107a", device=first)
+    assert program == f"{_M64_MULTI_TILE_ROUTE}_kv4"
+    assert asked == {"runtime": [13, 13], "ceiling": [first, second]}
+
+
+@pytest.mark.cpu_only
+def test_workspace_requirement_takes_the_kv4_edges_from_the_device(monkeypatch):
+    """The sizing API takes the four-stage edges from the current device's
+    launch check when it reads the architecture from the device too, so its
+    route is the one run_cake_dsv4 launches there.  With an explicit ``arch``
+    it takes them from ``kv4`` alone (default: without), whether or not CUDA
+    is available.  The workspace numbers do not depend on them."""
+    shape = dict(
+        dtype=torch.float8_e4m3fn,
+        num_heads=64,
+        num_query_tokens=4,
+        sm_count=208,
+        sparse_topk=384,
+        compressed_page_size=64,
+        max_q_len=1,
+        batch_size=4,
+        ragged=False,
+    )
+    asked = []
+
+    def gate(arch, device):
+        asked.append((arch, device))
+        return True
+
+    monkeypatch.setattr(cake, "_kv4_sibling_launchable", gate)
+    requirement = cake.cake_dsv4_workspace_requirement
+    with_kv4 = requirement(**shape, arch="sm_107a", kv4=True)
+    without = requirement(**shape, arch="sm_107a", kv4=False)
+    assert (with_kv4.route, without.route) == (_M64_MULTI_TILE_ROUTE, _UNIFORM_ROUTE)
+    for name in ("single_launch_bytes", "minimum_bytes", "num_splits"):
+        assert getattr(with_kv4, name) == getattr(without, name), name
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    for available in (False, True):
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: available)
+        assert requirement(**shape, arch="sm_107a").route == _UNIFORM_ROUTE
+    assert asked == []
+    # arch=None: the current CUDA device's architecture and launch check.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(cake, "_target_arch", lambda device: "sm_107a")
+    current = requirement(**shape)
+    assert current.route == _M64_MULTI_TILE_ROUTE
+    assert asked == [("sm_107a", torch.device("cuda", 0))]
+    programs, _, _ = _run_fake_h64_decode_fp8(
+        monkeypatch, arch="sm_107a", width=384, tokens=4
+    )
+    assert programs == [f"{current.route}_kv4"]
+    # Without CUDA: no launch check, the architecture-independent route.
+    asked.clear()
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    assert requirement(**shape).route == _UNIFORM_ROUTE
+    assert asked == []
 
 
 # --------------------------------------------------------------------------- CAKE-957 / CAKE-939: query layout, route plan, row tiling
@@ -2943,6 +4653,7 @@ def test_workspace_requirement_is_exact_per_route():
         max_q_len=1,
         batch_size=1024,
         ragged=False,
+        arch="sm_103a",
     )
     assert fp8.route == "fp8_h128_prefill_source_persistent" and fp8.num_splits == 1
     assert fp8.single_launch_bytes == cake._PARTIAL_OFFSET + 1024 * 128 * 4
@@ -3022,6 +4733,7 @@ def test_route_plan_matches_the_dispatcher(monkeypatch, arch):
                             compressed_page_size=page_size,
                             num_query_tokens=tokens,
                             sm_count=_SM_COUNT,
+                            arch=arch,
                         )
                     except ValueError:
                         continue

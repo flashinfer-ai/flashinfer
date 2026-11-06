@@ -30,8 +30,8 @@ Every entry point takes ``deterministic`` (default ``True``):
 * ``deterministic=True`` runs :mod:`flashinfer.cake_rmsnorm_det_train` with the
   same arguments: ``dw`` through a fixed row-chunk partition and a fixed-order
   reduction (a main kernel and a reduce kernel), bitwise reproducible for a
-  given token count on a given architecture.  The default call returns exactly
-  that package's results.
+  given token count on devices with the same SM count.  The default call
+  returns exactly that package's results.
 * ``deterministic=False`` runs this package's kernels: the same forward programs
   (the forward has no cross-row reduction) and, per token-count window, the
   backward form this build's registry lists for the window
@@ -40,13 +40,16 @@ Every entry point takes ``deterministic`` (default ``True``):
   CTAs claim row chunks, write ``dx`` and add their per-column ``dw`` sums into
   FP64 sums in the workspace in the order they finish; the CTA that finishes
   last rounds the sums into ``dw``.  ``dx`` is bitwise reproducible and within
-  one BF16 ulp of max(|dx|, rms(dx)) of the deterministic backward's ``dx``
+  one BF16 ulp of ``max(|dx|, rms(dx))`` of the deterministic backward's ``dx``
   (not always bitwise equal to it); ``dw`` is not guaranteed bitwise
   reproducible (the order of the FP64 additions depends on scheduling).  In
   the windows the backward docstring's notes name, a twosum single kernel keeps
   each thread's ``dw`` column sums exact (error-free FP32 products, TwoSum
   compensation) before the FP64 additions, so its ``dw`` error does not grow
-  with ``T``.  Every other window runs
+  with ``T``; a kblock single kernel adds the ``dw`` products of each block of
+  8 rows in FP32 and keeps the block sums as FP32 TwoSum pairs before
+  the FP64 additions, so its ``dw`` error grows slowly with ``T``.  Every other
+  window runs
   the deterministic package's backward pair (main kernel and fixed-order
   reduce), rendered into this package.  This path also accepts ``[..., H]`` inputs whose leading dimensions collapse into
   rows (for example a ``[T, heads, 256]`` per-head view sharing one ``w[256]``)

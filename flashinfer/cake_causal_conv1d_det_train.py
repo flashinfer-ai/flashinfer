@@ -117,24 +117,28 @@ Usage::
     fws = cake_causal_conv1d_det_train_forward_workspace(S, C, x.device)
     y = cake_causal_conv1d_det_train_forward(x, weight, cu_seqlens, workspace=fws)
 
-    # context-parallel training: this rank's fragments of the packed batch, with the
-    # history rows of the preceding fragments exchanged through the KCP context
-    # (FP32 taps, no bias)
-    y_local = cake_causal_conv1d_kcp(x_local, weight, ctx)
+    # context-parallel training (flashinfer.cake_causal_conv1d_det_train_kcp): this
+    # rank's fragments of the packed batch, with the history rows of the preceding
+    # fragments exchanged through the KCP context (FP32 taps, no bias)
+    from flashinfer.cake_causal_conv1d_det_train_kcp import (
+        cake_causal_conv1d_det_kcp,
+        cake_causal_conv1d_det_multi_kcp,
+    )
+
+    y_local = cake_causal_conv1d_det_kcp(x_local, weight, ctx)
 
     # a layer's q / k / v convolutions with one halo exchange per direction
     # (bitwise three single calls)
-    q, k, v = cake_causal_conv1d_kcp_multi((xq, xk, xv), (wq, wk, wv), ctx)
+    q, k, v = cake_causal_conv1d_det_multi_kcp((xq, xk, xv), (wq, wk, wv), ctx)
 """
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Optional
 
 import torch
 
 from . import cake_causal_conv1d_det_train_backend as _backend
-from . import cake_causal_conv1d_det_train_kcp as _kcp_facade
 from .api_logging import flashinfer_api
 from .cake_causal_conv1d_det_train_backend import (  # noqa: F401
     ARCHES,
@@ -359,48 +363,10 @@ def cake_causal_conv1d_det(
     )
 
 
-# The context-parallel (KCP) entry points live in ``flashinfer.cake_causal_conv1d_det_train_kcp``; their previous
-# names stay bound here to the same objects.
-cake_causal_conv1d_kcp = _kcp_facade.cake_causal_conv1d_det_kcp
-cake_causal_conv1d_kcp_multi = _kcp_facade.cake_causal_conv1d_det_multi_kcp
-
-
-# Compatibility names of the single-rank entry points, each bound to the same object as its det name
-# (one ``flashinfer_api`` wrapper per entry point).  They are attributes, not ``__all__`` entries.
-CakeCausalConv1dFunction = CakeCausalConv1dDetFunction
-cake_causal_conv1d = cake_causal_conv1d_det
-cake_causal_conv1d_train_backward = cake_causal_conv1d_det_train_backward
-cake_causal_conv1d_train_backward_workspace = (
-    cake_causal_conv1d_det_train_backward_workspace
-)
-cake_causal_conv1d_train_backward_workspace_bytes = (
-    cake_causal_conv1d_det_train_backward_workspace_bytes
-)
-cake_causal_conv1d_train_forward = cake_causal_conv1d_det_train_forward
-cake_causal_conv1d_train_forward_workspace = (
-    cake_causal_conv1d_det_train_forward_workspace
-)
-cake_causal_conv1d_train_forward_workspace_bytes = (
-    cake_causal_conv1d_det_train_forward_workspace_bytes
-)
-is_cake_causal_conv1d_train_supported = is_cake_causal_conv1d_det_train_supported
-
-
-def __getattr__(name: str) -> Any:
-    # ``KcpRecomputeHandle`` (the KCP route's checkpoint recompute handle) resolves on first access, so importing the
-    # facade does not import the KCP host module (torch.distributed, the KCP loader), like the entry point above.
-    if name == "KcpRecomputeHandle":
-        from .cake_causal_conv1d_det_train_backend.kcp import RecomputeHandleDetKcp
-
-        return RecomputeHandleDetKcp
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
 __all__ = [
     "ARCHES",
     "SUPPORTED_COMPUTE_CAPABILITIES",
     "CakeCausalConv1dDetFunction",
-    "KcpRecomputeHandle",  # noqa: F822 - resolved by __getattr__
     "cake_causal_conv1d_det",
     "cake_causal_conv1d_det_train_backward",
     "cake_causal_conv1d_det_train_backward_workspace",
@@ -408,7 +374,5 @@ __all__ = [
     "cake_causal_conv1d_det_train_forward",
     "cake_causal_conv1d_det_train_forward_workspace",
     "cake_causal_conv1d_det_train_forward_workspace_bytes",
-    "cake_causal_conv1d_kcp",
-    "cake_causal_conv1d_kcp_multi",
     "is_cake_causal_conv1d_det_train_supported",
 ]

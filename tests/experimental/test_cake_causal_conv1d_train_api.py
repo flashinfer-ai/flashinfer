@@ -21,8 +21,8 @@ Dispatch (CPU, the packages replaced by recorders): ``deterministic=True`` (the 
 package with the caller's arguments unchanged, ``deterministic=False`` the non-deterministic package; a non-bool
 mode is a ``TypeError``; under ``torch.use_deterministic_algorithms(True)`` a ``deterministic=False`` call runs the
 deterministic package and warns once per entry point, without handing it a non-deterministic workspace.  The
-entry points are marked experimental, mirror the packages' signatures, and leave every deterministic and legacy
-name unchanged; ``import flashinfer`` imports neither facade.  The opt-in ``bwd_grid_mult`` reaches the selected
+entry points are marked experimental, mirror the packages' signatures, and leave every deterministic name unchanged
+(the deterministic package's names before the det rename are gone); ``import flashinfer`` imports neither facade.  The opt-in ``bwd_grid_mult`` reaches the selected
 package unchanged (the fallback included) and is refused with the deterministic package's errors in both modes.  On
 a device (once the non-deterministic package is rendered): the facades return the packages' bits, at every
 ``bwd_grid_mult``.  The numerical contract itself is
@@ -365,6 +365,66 @@ def test_kcp_facade_dispatch(kcp_recorded) -> None:
 
 
 @pytest.mark.cpu_only
+def test_kcp_facade_forwards_cooperative_when_given(kcp_recorded) -> None:
+    """``cooperative`` reaches the entry point that runs only when given: the deterministic one with either value,
+    the non-deterministic one with ``False`` (there ``None`` and ``False`` mean the same)."""
+
+    x, w, ctx = (object() for _ in range(3))
+    for entry, det_name in KCP_ENTRIES.items():
+        for coop in (True, False):
+            kcp_recorded.clear()
+            result, _ = _quiet(
+                lambda: getattr(kcp_facade, entry)(x, w, ctx, cooperative=coop)
+            )
+            assert result == f"det.{det_name}"
+            assert kcp_recorded == [
+                (
+                    f"det.{det_name}",
+                    (x, w, ctx),
+                    {"recompute_handle": None, "cooperative": coop},
+                )
+            ]
+        kcp_recorded.clear()
+        result, _ = _quiet(
+            lambda: getattr(kcp_facade, entry)(
+                x, w, ctx, cooperative=False, deterministic=False
+            )
+        )
+        assert result == f"nondet.{entry}"
+        assert kcp_recorded == [
+            (
+                f"nondet.{entry}",
+                (x, w, ctx),
+                {
+                    "recompute_handle": None,
+                    "deterministic": False,
+                    "cooperative": False,
+                },
+            )
+        ]
+
+
+@pytest.mark.cpu_only
+def test_kcp_package_refuses_a_cooperative_backward() -> None:
+    """The non-deterministic package's main backward is one ordinary launch: ``cooperative=True`` is a
+    ``ValueError`` and a non-``bool`` a ``TypeError``, both before anything runs."""
+
+    from flashinfer.experimental.cake.cake_causal_conv1d_train_backend import (
+        kcp as kcp_backend,
+    )
+
+    x, w, ctx = (object() for _ in range(3))
+    for entry in KCP_ENTRIES:
+        fn = getattr(kcp_backend, entry)
+        with pytest.raises(ValueError, match=f"{entry}: cooperative=True applies to"):
+            fn(x, w, ctx, cooperative=True, deterministic=False)
+        with pytest.raises(
+            TypeError, match=f"{entry}: cooperative must be None or a bool"
+        ):
+            fn(x, w, ctx, cooperative=1, deterministic=False)
+
+
+@pytest.mark.cpu_only
 def test_kcp_facade_falls_back_under_torch_deterministic_mode(
     kcp_recorded, torch_deterministic
 ) -> None:
@@ -438,10 +498,11 @@ def test_facade_signatures_mirror_the_packages() -> None:
 
     for entry, det_name in KCP_ENTRIES.items():
         mine = _parameters(getattr(kcp_facade, entry))
-        assert mine[-1] == ("deterministic", inspect.Parameter.KEYWORD_ONLY, True), (
-            entry
-        )
-        assert mine[:-1] == _parameters(getattr(det_kcp_facade, det_name)), entry
+        assert mine[-2:] == [
+            ("deterministic", inspect.Parameter.KEYWORD_ONLY, True),
+            ("bwd_reserve_sms", inspect.Parameter.KEYWORD_ONLY, None),
+        ], entry
+        assert mine[:-2] == _parameters(getattr(det_kcp_facade, det_name)), entry
         theirs = {name for name, *_ in _parameters(getattr(kcp_backend, entry))}
         assert {name for name, *_ in mine} <= theirs, entry
 
@@ -462,27 +523,37 @@ def test_entry_points_are_experimental() -> None:
 
 
 @pytest.mark.cpu_only
-def test_deterministic_and_legacy_names_are_unchanged() -> None:
-    """Every deterministic name, and every legacy compatibility name, is still the deterministic object: the new
-    same-spelled names live in other modules only."""
+def test_deterministic_names_are_unchanged_and_carry_det() -> None:
+    """Every deterministic name is the deterministic object and carries ``det``; the names the deterministic package
+    had before the det rename are bound nowhere, and the same-spelled selectable-mode names live in other modules
+    only."""
 
-    assert flashinfer.cake_causal_conv1d is det_facade.cake_causal_conv1d_det
-    assert (
-        flashinfer.cake_causal_conv1d_train_forward
-        is det_facade.cake_causal_conv1d_det_train_forward
-    )
-    assert (
-        flashinfer.cake_causal_conv1d_train_backward
-        is det_facade.cake_causal_conv1d_det_train_backward
-    )
-    assert flashinfer.CakeCausalConv1dFunction is det_facade.CakeCausalConv1dDetFunction
-    assert flashinfer.cake_causal_conv1d_train is det_facade
-    assert (
-        det_facade.cake_causal_conv1d_kcp is det_kcp_facade.cake_causal_conv1d_det_kcp
-    )
+    for name in (
+        "cake_causal_conv1d_det",
+        "cake_causal_conv1d_det_train_forward",
+        "cake_causal_conv1d_det_train_backward",
+        "CakeCausalConv1dDetFunction",
+    ):
+        assert getattr(flashinfer, name) is getattr(det_facade, name), name
+    for name in (
+        "cake_causal_conv1d",
+        "cake_causal_conv1d_train_forward",
+        "cake_causal_conv1d_train_backward",
+        "CakeCausalConv1dFunction",
+        "cake_causal_conv1d_train",
+        "cake_causal_conv1d_train_backend",
+    ):
+        assert not hasattr(flashinfer, name), name
+    for name in (
+        "cake_causal_conv1d_kcp",
+        "cake_causal_conv1d_kcp_multi",
+        "KcpRecomputeHandle",
+    ):
+        assert not hasattr(det_facade, name), name
+        assert not hasattr(det_kcp_facade, name), name
     for entry in ENTRIES:
-        assert getattr(det_facade, entry) is not getattr(facade, entry), entry
-    assert det_facade.CakeCausalConv1dFunction is not facade.CakeCausalConv1dFunction
+        assert not hasattr(det_facade, entry), entry
+    assert not hasattr(det_facade, "CakeCausalConv1dFunction")
     assert (
         det_kcp_facade.cake_causal_conv1d_det_kcp
         is not kcp_facade.cake_causal_conv1d_kcp

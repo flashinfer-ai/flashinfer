@@ -35,7 +35,9 @@ Every entry point takes ``deterministic: bool = True``:
 
 Numerical contract of ``deterministic=False``: only the run-to-run bitwise
 reproducibility of the weight gradient ``dW`` is relaxed.  ``Y`` and ``dX`` are
-bitwise the deterministic package's (copies of the same programs), and so is
+bitwise the deterministic package's (copies of the same programs; on sm_100a the
+data gradient's L2 evict-first twin is the package's own build of the
+deterministic wide program, whose cache policy changes no arithmetic), and so is
 ``dW`` wherever the 256-wide k tile runs or the 512-wide k tile does not split
 its tail.  Every whole tile of ``dW`` is reduced by one CTA pair over the
 group's rows in a fixed order; only the units of a split tail tile are added
@@ -53,6 +55,23 @@ Dispatch (one row per call; "warns" is a ``UserWarning`` once per entry point)::
     True            any                                             deterministic package
     False           False                                           cake.cake_moe_grouped_gemm
     False           True                                            deterministic package, warns
+
+Weight-gradient accumulation (``grouped_gemm_wgrad(..., out=out, accumulate=True)``,
+``out[e] += G[e].T @ X[e]``, and ``cake_grouped_mm(..., fuse_wgrad_accumulation=True)``,
+which adds into ``w.main_grad`` in the backward; Megatron's
+``gradient_accumulation_fusion``), one row per call::
+
+    entry               deterministic   torch det. mode   runs
+    grouped_gemm_wgrad  False           False             cake.cake_moe_grouped_gemm accumulate mode (fused or composed)
+    (accumulate=True)   True            any               deterministic dW into a scratch of out's dtype, then out.add_
+                        False           True              the same deterministic compose, warns
+    cake_grouped_mm     False           False             cake.cake_moe_grouped_gemm, adds into w.main_grad
+    (fuse_wgrad_        True            any               NotImplementedError (not yet in the deterministic package)
+    accumulation=True)  False           True              warns, then NotImplementedError
+
+Both routes of ``accumulate=True`` make the same checks of ``out`` before running
+anything.  ``accumulate=False`` and ``fuse_wgrad_accumulation=False`` (the defaults)
+dispatch exactly as above and pass no new keyword to the deterministic package.
 
 The mode of :func:`cake_grouped_mm` is fixed at its forward call: the backward
 runs the package the forward chose (a non-reentrant activation-checkpoint
@@ -240,8 +259,10 @@ def grouped_gemm_dgrad(
     offsets (or ``m_indptr`` ``[E + 1]``) and ``out`` is ``[sum_m, K]`` bfloat16.
     ``K % 256 == 0`` and ``N % 64 == 0`` are required.  ``deterministic=True``
     (default) runs the deterministic package; ``False`` the non-deterministic
-    package's copy of the same programs (bitwise the same ``dX``); torch's
-    deterministic mode turns ``False`` into ``True`` with a one-time warning.
+    package's copy of the same programs (on sm_100a, where the evict-first rule
+    holds, its own build of the deterministic wide program with L2 evict-first
+    loads and stores; bitwise the same ``dX``); torch's deterministic mode turns
+    ``False`` into ``True`` with a one-time warning.
     """
     if _deterministic(deterministic, "grouped_gemm_dgrad"):
         from ..cake_moe_grouped_det_gemm import grouped_det_gemm_dgrad
@@ -262,6 +283,7 @@ def grouped_gemm_wgrad(
     num_groups: Optional[int] = None,
     *,
     deterministic: bool = True,
+    accumulate: bool = False,
 ) -> torch.Tensor:
     """``dW[e] = G[offs[e-1]:offs[e]].T @ X[offs[e-1]:offs[e]]`` for every group ``e``.
 
@@ -279,13 +301,36 @@ def grouped_gemm_wgrad(
     the same error budgets but not bitwise reproducible run to run; with the
     256-wide k tile the deterministic programs run.  torch's deterministic mode
     turns ``False`` into ``True`` with a one-time warning.
+
+    ``accumulate=True`` adds into ``out`` (required, bfloat16 or float32;
+    ``out_dtype`` None or its dtype) and returns it: ``out[e] += G[e].T @ X[e]``.
+    With ``deterministic=False`` the non-deterministic package's accumulate mode
+    runs (fused into the 512-wide k tile's epilogue where served, else the
+    overwrite into a scratch and ``out.add_``); on the deterministic route the
+    deterministic weight gradient in ``out``'s dtype is computed into a scratch
+    and added with ``out.add_`` (fp32: the fp32 ``dW`` added in fp32; bf16: the
+    bf16 ``dW`` added in bf16, AccumulateGrad's bits).  Both routes check
+    ``out`` (no overlap with itself, ``g``, ``x`` or ``offs``) before running
+    anything.  Every call adds again.
     """
     if _deterministic(deterministic, "grouped_gemm_wgrad"):
         from ..cake_moe_grouped_det_gemm import grouped_det_gemm_wgrad
 
-        return grouped_det_gemm_wgrad(
-            g, x, offs, out=out, out_dtype=out_dtype, num_groups=num_groups
+        if accumulate is False:
+            return grouped_det_gemm_wgrad(
+                g, x, offs, out=out, out_dtype=out_dtype, num_groups=num_groups
+            )
+        from .cake_moe_grouped_gemm.cake_backend import _check_accumulate_call
+
+        _check_accumulate_call(
+            g, x, offs, out, out_dtype, num_groups, accumulate, "grouped_gemm_wgrad"
         )
+        dw = grouped_det_gemm_wgrad(
+            g, x, offs, out_dtype=out.dtype, num_groups=num_groups
+        )
+        with torch.inference_mode() if out.is_inference() else torch.no_grad():
+            out.add_(dw)
+        return out
     from .cake_moe_grouped_gemm import grouped_gemm_wgrad as _impl
 
     return _impl(
@@ -296,6 +341,7 @@ def grouped_gemm_wgrad(
         out_dtype=out_dtype,
         num_groups=num_groups,
         deterministic=False,
+        accumulate=accumulate,
     )
 
 
@@ -305,6 +351,8 @@ def cake_grouped_mm(
     w: torch.Tensor,
     offs: torch.Tensor,
     deterministic: bool = True,
+    *,
+    fuse_wgrad_accumulation: bool = False,
 ) -> torch.Tensor:
     """Differentiable ragged grouped GEMM ``Y[offs[e-1]:offs[e]] = X[offs[e-1]:offs[e]] @ W[e].T``.
 
@@ -325,6 +373,16 @@ def cake_grouped_mm(
         the unordered split tail.  The mode is chosen at the forward call
         (torch's deterministic mode then turns ``False`` into ``True`` with a
         one-time warning) and the backward runs the same package.
+    fuse_wgrad_accumulation : bool
+        ``False`` (default): ``dW`` is returned as ``w``'s gradient.  ``True``
+        (Megatron's ``gradient_accumulation_fusion``): the backward adds ``dW``
+        into ``w.main_grad`` (fp32 or bf16) and returns a placeholder or no
+        gradient for ``w``, as
+        ``flashinfer.experimental.cake.cake_moe_grouped_gemm.cake_grouped_mm``
+        documents.  Only with ``deterministic=False`` outside torch's
+        deterministic mode: the deterministic package has not adopted it yet, so
+        the deterministic route raises ``NotImplementedError`` (after the
+        one-time fallback warning when torch's deterministic mode chose it).
 
     Returns
     -------
@@ -335,9 +393,24 @@ def cake_grouped_mm(
         gradient.
     """
     if _deterministic(deterministic, "cake_grouped_mm"):
+        if fuse_wgrad_accumulation is not False:
+            if not isinstance(fuse_wgrad_accumulation, bool):
+                raise ValueError(
+                    "cake_grouped_mm: fuse_wgrad_accumulation must be a bool, got "
+                    f"{fuse_wgrad_accumulation!r}"
+                )
+            raise NotImplementedError(
+                "cake_grouped_mm(fuse_wgrad_accumulation=True) runs the deterministic package here "
+                "(deterministic=True, or torch.use_deterministic_algorithms(True)), which does not "
+                "fuse the weight-gradient accumulation yet (pending its adoption of the accumulate "
+                "builds); pass deterministic=False with torch's deterministic mode off, or "
+                "fuse_wgrad_accumulation=False"
+            )
         from ..cake_moe_grouped_det_gemm.cake_autograd import cake_grouped_det_mm
 
         return cake_grouped_det_mm(x, w, offs, deterministic=True)
     from .cake_moe_grouped_gemm.cake_autograd import cake_grouped_mm as _impl
 
-    return _impl(x, w, offs, deterministic=False)
+    return _impl(
+        x, w, offs, deterministic=False, fuse_wgrad_accumulation=fuse_wgrad_accumulation
+    )

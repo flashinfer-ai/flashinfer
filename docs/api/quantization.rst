@@ -216,6 +216,24 @@ kernels that do not read NVFP4 K/V directly.
 
     nvfp4_kv_materialize_fp8
 
+.. autoclass:: NVFP4KVMaterializer
+    :members: run
+
+CSF Block Scales
+----------------
+
+Block-scale matrices compressed per 16-row slab (CSF), such as NVFP4 MoE expert
+scales kept compressed on the GPU and expanded into the fused MoE scale layout
+before each call.
+
+.. currentmodule:: flashinfer.quantization
+
+.. autosummary::
+    :toctree: ../generated
+
+    encode_csf_scales
+    expand_csf_scales
+
 FP8 Quantization
 ----------------
 
@@ -248,35 +266,3 @@ Fused gated-activation MXFP8 quantization
 
     silu_and_mul_mxfp8_quantize
     silu_and_mul_mxfp8_quantize_backward
-
-CuTe-DSL Quantization Kernels (experimental)
---------------------------------------------
-
-The CuTe-DSL backends are conditionally available when the
-``nvidia-cutlass-dsl`` package is installed. At runtime they are also
-re-exported as ``flashinfer.quantization.{nvfp4,mxfp4,mxfp8}_quantize_cute_dsl``
-when available; documenting them here via their canonical submodule
-path keeps the docs build from depending on the CuTe-DSL stack being
-importable.
-
-.. currentmodule:: flashinfer.quantization.kernels.nvfp4_quantize
-
-.. autosummary::
-    :toctree: ../generated
-
-    nvfp4_quantize_cute_dsl
-    nvfp4_quantize_per_token_cute_dsl
-
-.. currentmodule:: flashinfer.quantization.kernels.mxfp4_quantize
-
-.. autosummary::
-    :toctree: ../generated
-
-    mxfp4_quantize_cute_dsl
-
-.. currentmodule:: flashinfer.quantization.kernels.mxfp8_quantize
-
-.. autosummary::
-    :toctree: ../generated
-
-    mxfp8_quantize_cute_dsl

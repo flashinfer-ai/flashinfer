@@ -363,9 +363,9 @@ def test_recompute_handle_hist_validation() -> None:
 @pytest.mark.cpu_only
 def test_facade_reexports_the_handle_lazily() -> None:
     """``flashinfer.cake_causal_conv1d_det_train_kcp.RecomputeHandleDetKcp`` is the backend's class; importing the KCP
-    facade (or the det facade, which keeps the previous KCP names) does not import the KCP host modules (``kcp`` imports
-    torch.distributed; ``kcp_jit``) -- checked in a fresh interpreter; the facade's KCP entry carries the keyword-only
-    ``recompute_handle=None``, and the previous names are the same objects."""
+    facade (or the single-rank det facade) does not import the KCP host modules (``kcp`` imports torch.distributed;
+    ``kcp_jit``) -- checked in a fresh interpreter; the facade's KCP entry carries the keyword-only
+    ``recompute_handle=None``, and the names before the det rename are bound nowhere."""
     import subprocess
     import sys
 
@@ -378,15 +378,35 @@ def test_facade_reexports_the_handle_lazily() -> None:
         "assert kcp not in sys.modules and jit not in sys.modules, sorted(m for m in sys.modules if 'kcp' in m)\n"
         "p = inspect.signature(f.cake_causal_conv1d_det_kcp).parameters['recompute_handle']\n"
         "assert p.kind is inspect.Parameter.KEYWORD_ONLY and p.default is None\n"
-        "assert d.cake_causal_conv1d_kcp is f.cake_causal_conv1d_det_kcp\n"
+        "assert not hasattr(d, 'cake_causal_conv1d_kcp') and not hasattr(d, 'KcpRecomputeHandle')\n"
         "assert kcp not in sys.modules\n"
         "from flashinfer.cake_causal_conv1d_det_train_kcp import RecomputeHandleDetKcp\n"
         "from flashinfer.cake_causal_conv1d_det_train_backend.kcp import RecomputeHandleDetKcp as B\n"
-        "from flashinfer.cake_causal_conv1d_det_train_backend.kcp import KcpRecomputeHandle as C\n"
-        "assert RecomputeHandleDetKcp is B is C is d.KcpRecomputeHandle and 'RecomputeHandleDetKcp' in f.__all__\n"
+        "import flashinfer.cake_causal_conv1d_det_train_backend.kcp as C\n"
+        "assert RecomputeHandleDetKcp is B and 'RecomputeHandleDetKcp' in f.__all__\n"
+        "assert not hasattr(C, 'KcpRecomputeHandle') and not hasattr(f, 'KcpRecomputeHandle')\n"
         "print('FACADE_IMPORT_OK')\n"
     )
     r = subprocess.run(
         [sys.executable, "-c", code], capture_output=True, text=True, timeout=600
     )
     assert r.returncode == 0 and "FACADE_IMPORT_OK" in r.stdout, (r.stdout, r.stderr)
+
+
+@pytest.mark.cpu_only
+def test_graph_key_holds_the_backward_launch_form(monkeypatch) -> None:
+    """The backward's launch form (``cooperative``, FlashInfer issue #8365) is part of the graph validity key: the same
+    operands under the two forms are two keys, the same form one.  No kernel runs here."""
+    monkeypatch.delenv(conv_kcp.TEST_KNOBS_ENV, raising=False)
+    ctx = types.SimpleNamespace(T_r=8, n_frag=1, world_size=1)
+    x = torch.zeros(8, 16, dtype=torch.bfloat16)
+    try:
+        coop = conv_kcp._graph_entry("bwd", ctx, (x, None), "replay", variant=True)
+        split = conv_kcp._graph_entry("bwd", ctx, (x, None), "replay", variant=False)
+        assert coop is not None and split is not None and coop is not split
+        assert (
+            conv_kcp._graph_entry("bwd", ctx, (x, None), "replay", variant=False)
+            is split
+        )
+    finally:
+        conv_kcp._GRAPHS.clear()

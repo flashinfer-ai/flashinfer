@@ -47,29 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 256
-#define TMEM_ACC_OFFSET 0
-#define NUM_RING_STAGES 2
-#define NUM_ACCS_STAGES 2
-#define NUM_TK_PIPE_STAGES 2
-#define SMEM_DO_S_OFF 1024
-#define SMEM_DO_S_STAGE_BYTES 16384
-#define SMEM_DO_S_STRIDE 24576
-#define SMEM_AQK_S_OFF 17408
-#define SMEM_AQK_S_STAGE_BYTES 8192
-#define SMEM_AQK_S_STRIDE 24576
-#define SMEM_DO_MN_OFF 1024
-#define SMEM_DO_MN_STAGE_BYTES 16384
-#define SMEM_DO_MN_STRIDE 24576
-#define SMEM_AQK_MN_OFF 17408
-#define SMEM_AQK_MN_STAGE_BYTES 8192
-#define SMEM_AQK_MN_STRIDE 24576
-#define SMEM_TK_S_OFF 50176
-#define SMEM_TK_S_STAGE_BYTES 16
-#define SMEM_TK_S_STRIDE 16
-#define SMEM_TOTAL 50304
-#define THREADS 192
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -189,7 +166,7 @@ kernel_cake_gdn_det_train_d4be7d17c0c64e05e81c(const __grid_constant__ CUtensorM
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* do_s = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int do_s_addr = smem + 1024;
     __nv_bfloat16* aqk_s = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
@@ -201,8 +178,7 @@ kernel_cake_gdn_det_train_d4be7d17c0c64e05e81c(const __grid_constant__ CUtensorM
     unsigned int* tk_s = reinterpret_cast<unsigned int*>(smem_raw + 50176);
     const int tk_s_addr = smem + 50176;
 
-    // Mbarrier init (6 pipeline groups, 0 ordered-sequence groups, 12 barriers)
-    // Mbarriers at smem_raw[0..96)
+    // Mbarrier init (12 barriers at smem_raw[0..96))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -246,10 +222,8 @@ kernel_cake_gdn_det_train_d4be7d17c0c64e05e81c(const __grid_constant__ CUtensorM
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_acc = taddr;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_acc = taddr;
 
     // ---- Role: compute ----
     if (warp <= 3) {

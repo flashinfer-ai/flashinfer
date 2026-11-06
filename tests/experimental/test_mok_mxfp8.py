@@ -156,10 +156,16 @@ def _flat(value):
 
 
 @pytest.mark.parametrize("experts_per_chunk", [1, 2, 3])
-def test_weight_quantizer_paths_are_bitwise(monkeypatch, experts_per_chunk):
-    """The fused CUDA quantizer, the chunked PyTorch path and the per-matrix
-    reference produce the same bytes, NaN / infinity / zero blocks included."""
+@pytest.mark.parametrize("use_gluon", [True, False], ids=["gluon", "triton"])
+def test_weight_quantizer_paths_are_bitwise(monkeypatch, use_gluon, experts_per_chunk):
+    """The Gluon kernel, the Triton kernels, the chunked PyTorch path and the
+    per-matrix reference produce the same bytes, NaN / infinity / zero blocks
+    included."""
     require_gpu()
+    if use_gluon and mxfp8.gluon is None:
+        pytest.skip("Gluon is not available")
+    if not use_gluon:
+        monkeypatch.setattr(mxfp8, "gluon", None)
     torch.manual_seed(23)
     gate = torch.randn(5, 256, 512, device="cuda", dtype=torch.bfloat16)
     gate[2, 9, 32:64] = float("nan")
@@ -177,15 +183,21 @@ def test_weight_quantizer_paths_are_bitwise(monkeypatch, experts_per_chunk):
             torch.equal(a.view(torch.uint8), b.view(torch.uint8))
             for a, b in zip(single, quantize(matrix), strict=True)
         )
-    # One layout at a time runs the per-layout kernel; both run the dual kernel.
+    # One layout at a time runs the per-layout Triton kernel; both layouts run
+    # the Gluon kernel, or the Triton dual kernel without Gluon.
     both = mxfp8.mxfp8_quantize(gate)
     normal = mxfp8.mxfp8_quantize(gate, return_transposed=False)[:2]
     transposed = mxfp8.mxfp8_quantize(gate, return_normal=False)[2:]
     for a, b in zip(both, normal + transposed, strict=True):
         assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
     fused = quantize_mok_mxfp8_weights(gate, up, down)
+    assert (mxfp8.gluon is not None) == use_gluon  # no fallback was taken
+    # Without Triton (and so without Gluon) the chunked PyTorch path runs.
     monkeypatch.setattr(mxfp8, "triton", None)
+    monkeypatch.setattr(mxfp8, "gluon", None)
     monkeypatch.setattr(mxfp8, "_CHUNK_BYTES", experts_per_chunk * 256 * 512 * 4)
+    for a, b in zip(both, mxfp8.mxfp8_quantize(gate), strict=True):
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
     chunked = quantize_mok_mxfp8_weights(gate, up, down)
     pairs = list(zip(_flat(fused), _flat(chunked), strict=True))
     assert len(pairs) == 16
@@ -775,7 +787,7 @@ def test_mxfp8_launch_counters_are_one_slab_per_launch():
             dg_ready=shared_rows + routed_rows,
             replay_gu=routed_rows * ib,
             replay_h=routed_rows,
-            buffers_done=macros,
+            buffers_done=macros * (len(routed[0]) + 1),
             weight_ready=macros,
         ),
     )

@@ -478,12 +478,19 @@ DX_RULE_EXPECTED = {
     (4096, 8192, 244, 148, "sm_100a"): (1, 34),
     (1808, 6144, 242, 148, "sm_100a"): (1, 22),
     (257, 512, 8, 148, "sm_100a"): (1, 2),
-    # no cell on sm_103a (split forms); sm_107a: no cell, no split forms
+    # no cell on sm_103a / sm_107a (split forms on both)
     (4096, 5120, 240, 148, "sm_103a"): (1, 12),
     (1024, 6144, 242, 148, "sm_103a"): (1, 0),
     (512, 4096, 242, 148, "sm_103a"): (1, 16),
-    (4096, 5120, 240, 148, "sm_107a"): (1, 0),
-    (1808, 6144, 242, 148, "sm_107a"): (1, 0),
+    (4096, 5120, 240, 148, "sm_107a"): (1, 12),
+    (1808, 6144, 242, 148, "sm_107a"): (1, 22),
+    (1024, 6144, 242, 148, "sm_107a"): (1, 0),
+    # the shipped R200 split tail (212 SMs: 106 pairs, 216 SMs: 108): 12 row pairs x 4 = 48 items -> F 48 on both;
+    # 16 row pairs x 8 = 128 items -> F 22 / F 20
+    (3072, 2048, 244, 212, "sm_107a"): (1, 48),
+    (3072, 2048, 244, 216, "sm_107a"): (1, 48),
+    (4096, 4096, 242, 212, "sm_107a"): (1, 22),
+    (4096, 4096, 242, 216, "sm_107a"): (1, 20),
 }
 
 
@@ -537,10 +544,13 @@ def test_dense_stages_follow_the_rule():
     stages = cake_support.support_dense_stages
     split = set(cake_support.SUPPORT_DENSE_SPLIT_STAGES)
     assert split == {"gemm_dx_split", "gemm_dx_red_split"}
+    assert set(cake_backend.DX_SPLIT_ARCHES) == {"sm_100a", "sm_103a", "sm_107a"}
     for arch in cake_backend.DX_SPLIT_ARCHES:
         assert split <= set(stages(arch))
-    assert not split & set(stages("sm_107a"))
-    assert set(cake_support.SUPPORT_DENSE_STAGES) <= set(stages("sm_107a"))
+        assert set(cake_support.SUPPORT_DENSE_STAGES) <= set(stages(arch))
+    # an architecture outside DX_SPLIT_ARCHES requires no split-tail program
+    assert not split & set(stages("sm_90a"))
+    assert set(cake_support.SUPPORT_DENSE_STAGES) <= set(stages("sm_90a"))
     # the later blocks of a chunk add through the reduction form at one slice too
     assert "gemm_dx_red" in cake_support.SUPPORT_DENSE_STAGES
     for name, record in cake_support.MODULES.items():

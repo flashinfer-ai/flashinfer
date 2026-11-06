@@ -12000,7 +12000,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_453069def52efc7aca98_2081c7216fe3.cu"
+          "path": "cuda/cake_gdn_453069def52efc7aca98_1ebc50ce7606.cu"
         }
       ],
       "specializations": {
@@ -12039,7 +12039,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_453069def52efc7aca98_2081c7216fe3.cu"
+          "path": "cuda/cake_gdn_453069def52efc7aca98_1ebc50ce7606.cu"
         }
       ],
       "specializations": {
@@ -12078,7 +12078,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_453069def52efc7aca98_2081c7216fe3.cu"
+          "path": "cuda/cake_gdn_453069def52efc7aca98_1ebc50ce7606.cu"
         }
       ],
       "specializations": {
@@ -12117,7 +12117,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_453069def52efc7aca98_2081c7216fe3.cu"
+          "path": "cuda/cake_gdn_453069def52efc7aca98_1ebc50ce7606.cu"
         }
       ],
       "specializations": {
@@ -12156,7 +12156,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_453069def52efc7aca98_2081c7216fe3.cu"
+          "path": "cuda/cake_gdn_453069def52efc7aca98_1ebc50ce7606.cu"
         }
       ],
       "specializations": {
@@ -12532,19 +12532,6 @@
       }
     },
     {
-      "defines": {
-        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_2b64b167aeacd18e9b2b",
-        "CAKE_GDN_METADATA_I64": "1",
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "5",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "host_binding": {
         "cuda_symbol": "kernel_cake_gdn_2b64b167aeacd18e9b2b",
         "module_ident": "cake_gdn_2b64b167aeacd18e9b2b_19282c39ce",
@@ -12568,7 +12555,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_prefill_initial_f16io_85046d4a9c55.cu"
+          "path": "cuda/cake_gdn_2b64b167aeacd18e9b2b_30cac865dc80.cu"
         }
       ],
       "specializations": {
@@ -12584,19 +12571,6 @@
       }
     },
     {
-      "defines": {
-        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_2b64b167aeacd18e9b2b",
-        "CAKE_GDN_METADATA_I64": "1",
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "5",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "host_binding": {
         "cuda_symbol": "kernel_cake_gdn_2b64b167aeacd18e9b2b",
         "module_ident": "cake_gdn_2b64b167aeacd18e9b2b_999027d256",
@@ -12620,7 +12594,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_prefill_initial_f16io_85046d4a9c55.cu"
+          "path": "cuda/cake_gdn_2b64b167aeacd18e9b2b_30cac865dc80.cu"
         }
       ],
       "specializations": {
@@ -12636,19 +12610,6 @@
       }
     },
     {
-      "defines": {
-        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_2b64b167aeacd18e9b2b",
-        "CAKE_GDN_METADATA_I64": "1",
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "4",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "host_binding": {
         "cuda_symbol": "kernel_cake_gdn_2b64b167aeacd18e9b2b",
         "module_ident": "cake_gdn_2b64b167aeacd18e9b2b_fb5953ff36",
@@ -12672,7 +12633,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_prefill_initial_f16io_85046d4a9c55.cu"
+          "path": "cuda/cake_gdn_2b64b167aeacd18e9b2b_30cac865dc80.cu"
         }
       ],
       "specializations": {
@@ -12688,19 +12649,6 @@
       }
     },
     {
-      "defines": {
-        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_2b64b167aeacd18e9b2b",
-        "CAKE_GDN_METADATA_I64": "1",
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "-1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "-1",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "host_binding": {
         "cuda_symbol": "kernel_cake_gdn_2b64b167aeacd18e9b2b",
         "module_ident": "cake_gdn_2b64b167aeacd18e9b2b_638709d342",
@@ -12717,7 +12665,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_prefill_initial_f16io_85046d4a9c55.cu"
+          "path": "cuda/cake_gdn_2b64b167aeacd18e9b2b_30cac865dc80.cu"
         }
       ],
       "specializations": {
@@ -12733,19 +12681,6 @@
       }
     },
     {
-      "defines": {
-        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_2b64b167aeacd18e9b2b",
-        "CAKE_GDN_METADATA_I64": "1",
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "3",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "host_binding": {
         "cuda_symbol": "kernel_cake_gdn_2b64b167aeacd18e9b2b",
         "module_ident": "cake_gdn_2b64b167aeacd18e9b2b_2249c33e8e",
@@ -12769,7 +12704,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_prefill_initial_f16io_85046d4a9c55.cu"
+          "path": "cuda/cake_gdn_2b64b167aeacd18e9b2b_30cac865dc80.cu"
         }
       ],
       "specializations": {
@@ -12785,19 +12720,6 @@
       }
     },
     {
-      "defines": {
-        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_2b64b167aeacd18e9b2b",
-        "CAKE_GDN_METADATA_I64": "1",
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "0",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "4",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "host_binding": {
         "cuda_symbol": "kernel_cake_gdn_2b64b167aeacd18e9b2b",
         "module_ident": "cake_gdn_2b64b167aeacd18e9b2b_9b290aa259",
@@ -12821,7 +12743,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_prefill_initial_f16io_85046d4a9c55.cu"
+          "path": "cuda/cake_gdn_2b64b167aeacd18e9b2b_30cac865dc80.cu"
         }
       ],
       "specializations": {
@@ -12837,19 +12759,6 @@
       }
     },
     {
-      "defines": {
-        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_2b64b167aeacd18e9b2b",
-        "CAKE_GDN_METADATA_I64": "1",
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "6",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "host_binding": {
         "cuda_symbol": "kernel_cake_gdn_2b64b167aeacd18e9b2b",
         "module_ident": "cake_gdn_2b64b167aeacd18e9b2b_1db0a3c637",
@@ -12873,7 +12782,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_prefill_initial_f16io_85046d4a9c55.cu"
+          "path": "cuda/cake_gdn_2b64b167aeacd18e9b2b_30cac865dc80.cu"
         }
       ],
       "specializations": {
@@ -12889,19 +12798,6 @@
       }
     },
     {
-      "defines": {
-        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_2b64b167aeacd18e9b2b",
-        "CAKE_GDN_METADATA_I64": "1",
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "0",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "5",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "host_binding": {
         "cuda_symbol": "kernel_cake_gdn_2b64b167aeacd18e9b2b",
         "module_ident": "cake_gdn_2b64b167aeacd18e9b2b_d80990a735",
@@ -12925,7 +12821,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_prefill_initial_f16io_85046d4a9c55.cu"
+          "path": "cuda/cake_gdn_2b64b167aeacd18e9b2b_30cac865dc80.cu"
         }
       ],
       "specializations": {
@@ -12964,7 +12860,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_d48ff4b056112bb361ba_76070ae09d3b.cu"
+          "path": "cuda/cake_gdn_d48ff4b056112bb361ba_f68eb7571366.cu"
         }
       ],
       "specializations": {
@@ -13003,7 +12899,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_d48ff4b056112bb361ba_76070ae09d3b.cu"
+          "path": "cuda/cake_gdn_d48ff4b056112bb361ba_f68eb7571366.cu"
         }
       ],
       "specializations": {
@@ -13042,7 +12938,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_d48ff4b056112bb361ba_76070ae09d3b.cu"
+          "path": "cuda/cake_gdn_d48ff4b056112bb361ba_f68eb7571366.cu"
         }
       ],
       "specializations": {
@@ -13081,7 +12977,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_d48ff4b056112bb361ba_76070ae09d3b.cu"
+          "path": "cuda/cake_gdn_d48ff4b056112bb361ba_f68eb7571366.cu"
         }
       ],
       "specializations": {
@@ -13120,7 +13016,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_d48ff4b056112bb361ba_76070ae09d3b.cu"
+          "path": "cuda/cake_gdn_d48ff4b056112bb361ba_f68eb7571366.cu"
         }
       ],
       "specializations": {
@@ -13159,7 +13055,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_d48ff4b056112bb361ba_76070ae09d3b.cu"
+          "path": "cuda/cake_gdn_d48ff4b056112bb361ba_f68eb7571366.cu"
         }
       ],
       "specializations": {
@@ -13198,7 +13094,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_d48ff4b056112bb361ba_76070ae09d3b.cu"
+          "path": "cuda/cake_gdn_d48ff4b056112bb361ba_f68eb7571366.cu"
         }
       ],
       "specializations": {
@@ -13237,7 +13133,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_bb43956e2bec6dae2d72_54a98265da81.cu"
+          "path": "cuda/cake_gdn_bb43956e2bec6dae2d72_1906012ca80e.cu"
         }
       ],
       "specializations": {
@@ -13276,7 +13172,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_bb43956e2bec6dae2d72_54a98265da81.cu"
+          "path": "cuda/cake_gdn_bb43956e2bec6dae2d72_1906012ca80e.cu"
         }
       ],
       "specializations": {
@@ -13315,7 +13211,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_bb43956e2bec6dae2d72_54a98265da81.cu"
+          "path": "cuda/cake_gdn_bb43956e2bec6dae2d72_1906012ca80e.cu"
         }
       ],
       "specializations": {
@@ -13354,7 +13250,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_bb43956e2bec6dae2d72_54a98265da81.cu"
+          "path": "cuda/cake_gdn_bb43956e2bec6dae2d72_1906012ca80e.cu"
         }
       ],
       "specializations": {
@@ -13393,7 +13289,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_bb43956e2bec6dae2d72_54a98265da81.cu"
+          "path": "cuda/cake_gdn_bb43956e2bec6dae2d72_1906012ca80e.cu"
         }
       ],
       "specializations": {
@@ -13432,7 +13328,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_bb43956e2bec6dae2d72_54a98265da81.cu"
+          "path": "cuda/cake_gdn_bb43956e2bec6dae2d72_1906012ca80e.cu"
         }
       ],
       "specializations": {
@@ -13471,7 +13367,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_bb43956e2bec6dae2d72_54a98265da81.cu"
+          "path": "cuda/cake_gdn_bb43956e2bec6dae2d72_1906012ca80e.cu"
         }
       ],
       "specializations": {
@@ -13510,7 +13406,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_bb43956e2bec6dae2d72_54a98265da81.cu"
+          "path": "cuda/cake_gdn_bb43956e2bec6dae2d72_1906012ca80e.cu"
         }
       ],
       "specializations": {
@@ -14208,6 +14104,66 @@
         "T_STEPS": 4,
         "UPDATE_STATE": 0
       }
+    },
+    {
+      "host_binding": {
+        "cuda_symbol": "kernel_gdn_decode_nontranspose_fp32_t1_hqsplit_tma3",
+        "module_ident": "gdn_decode_nontranspose_fp32_t1_hqsplit_tma3_1e00a2fb6b",
+        "params": {
+          "CTAS_PER_BATCH_ROW": 32,
+          "DYNAMIC_SMEM_BYTES": 51328,
+          "H": 16,
+          "HV": 32,
+          "HV_MINUS_1": 31
+        },
+        "shim_namespace": "8eb8c2ae7952e520",
+        "template": "host/templates/decode_fp32_t1_tma_state.cc.in"
+      },
+      "name": "decode_gdn_decode_nontranspose_fp32_t1_hqsplit_tma3_1cb5777c16ae",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_decode_nontranspose_fp32_t1_hqsplit_tma3_262a56fae786.cu"
+        }
+      ],
+      "specializations": {
+        "H": 16,
+        "HV": 32,
+        "SCALE": 0.08838834764831845
+      },
+      "tma_abi": "grid_constant"
+    },
+    {
+      "host_binding": {
+        "cuda_symbol": "kernel_gdn_decode_nontranspose_fp32_t1_hqsplit_tma3",
+        "module_ident": "gdn_decode_nontranspose_fp32_t1_hqsplit_tma3_9130432fee",
+        "params": {
+          "CTAS_PER_BATCH_ROW": 32,
+          "DYNAMIC_SMEM_BYTES": 51328,
+          "H": 16,
+          "HV": 32,
+          "HV_MINUS_1": 31
+        },
+        "shim_namespace": "e4e5506d7761d628",
+        "template": "host/templates/decode_fp32_t1_tma_state.cc.in"
+      },
+      "name": "decode_gdn_decode_nontranspose_fp32_t1_hqsplit_tma3_45d75d2d4a46",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_decode_nontranspose_fp32_t1_hqsplit_tma3_262a56fae786.cu"
+        }
+      ],
+      "specializations": {
+        "H": 16,
+        "HV": 32,
+        "SCALE": 1.0
+      },
+      "tma_abi": "grid_constant"
     }
   ]
 }

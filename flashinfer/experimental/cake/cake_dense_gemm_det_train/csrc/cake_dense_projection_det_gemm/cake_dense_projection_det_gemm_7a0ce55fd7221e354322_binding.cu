@@ -144,7 +144,7 @@ CUtensorMap EncodeTma_B(const TensorView& t) {
   return map;
 }
 
-void Run(TensorView a_A, TensorView a_B, TensorView a_out32, int64_t a_M, int64_t a_N, int64_t a_m_tiles, int64_t a_n_tiles, int64_t a_k_iters_split, int64_t a_ldo, int64_t a_out_l, int64_t a_num_cluster_tiles, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+void Run(TensorView a_A, TensorView a_B, TensorView a_out32, int64_t a_M, int64_t a_N, int64_t a_m_tiles, int64_t a_n_tiles, int64_t a_k_iters_split, int64_t a_ldo, int64_t a_out_l, int64_t a_num_cluster_tiles, int64_t a_enable_pdl, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   DLDevice dev = a_A.device();
   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
   check_cuda_tensor(a_A, "A");
@@ -180,6 +180,8 @@ void Run(TensorView a_A, TensorView a_B, TensorView a_out32, int64_t a_M, int64_
   check_same_device(a_B, a_A, "B", "A");
   check_contiguous(a_out32, "out32");
   check_same_device(a_out32, a_A, "out32", "A");
+  TVM_FFI_CHECK(a_enable_pdl == 0LL || a_enable_pdl == 1LL, ValueError)
+      << KERNEL_NAME << ": 'enable_pdl' = " << a_enable_pdl << " is not 0 or 1";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";
   TVM_FFI_CHECK(grid_x <= 2147483647 && grid_y <= 65535 && grid_z <= 65535, ValueError)
@@ -215,15 +217,21 @@ void Run(TensorView a_A, TensorView a_B, TensorView a_out32, int64_t a_M, int64_
   config.blockDim = dim3(448, 1, 1);
   config.dynamicSmemBytes = 214144;
   config.stream = stream;
-  cudaLaunchAttribute attrs[2] = {};
+  cudaLaunchAttribute attrs[3] = {};
   attrs[0].id = cudaLaunchAttributeClusterDimension;
   attrs[0].val.clusterDim.x = 2;
   attrs[0].val.clusterDim.y = 1;
   attrs[0].val.clusterDim.z = 1;
   attrs[1].id = cudaLaunchAttributeClusterSchedulingPolicyPreference;
   attrs[1].val.clusterSchedulingPolicyPreference = cudaClusterSchedulingPolicySpread;
+  int n = 2;
+  if (a_enable_pdl) {
+    attrs[n].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[n].val.programmaticStreamSerializationAllowed = 1;
+    ++n;
+  }
   config.attrs = attrs;
-  config.numAttrs = 2;
+  config.numAttrs = n;
   CheckCuda(cudaLaunchKernelExC(&config, reinterpret_cast<const void*>(kernel_cake_dense_projection_det_gemm_7a0ce55fd7221e354322), kernel_args),
             "cudaLaunchKernelExC");
 }

@@ -37,7 +37,7 @@ void CheckCuda(cudaError_t status, const char* what) {
 
 void* DataPtr(const TensorView& t) { return static_cast<char*>(t.data_ptr()) + t.byte_offset(); }
 
-void Run(TensorView a_src, TensorView a_parts, int64_t a_n, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+void Run(TensorView a_src, TensorView a_parts, int64_t a_n, int64_t a_enable_pdl, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   DLDevice dev = a_src.device();
   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
   check_cuda_tensor(a_src, "src");
@@ -50,6 +50,8 @@ void Run(TensorView a_src, TensorView a_parts, int64_t a_n, int64_t grid_x, int6
   check_contiguous(a_src, "src");
   check_contiguous(a_parts, "parts");
   check_same_device(a_parts, a_src, "parts", "src");
+  TVM_FFI_CHECK(a_enable_pdl == 0LL || a_enable_pdl == 1LL, ValueError)
+      << KERNEL_NAME << ": 'enable_pdl' = " << a_enable_pdl << " is not 0 or 1";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";
   TVM_FFI_CHECK(grid_x <= 2147483647 && grid_y <= 65535 && grid_z <= 65535, ValueError)
@@ -64,6 +66,15 @@ void Run(TensorView a_src, TensorView a_parts, int64_t a_n, int64_t grid_x, int6
   config.blockDim = dim3(256, 1, 1);
   config.dynamicSmemBytes = 0;
   config.stream = stream;
+  cudaLaunchAttribute attrs[1] = {};
+  int n = 0;
+  if (a_enable_pdl) {
+    attrs[n].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[n].val.programmaticStreamSerializationAllowed = 1;
+    ++n;
+  }
+  config.attrs = attrs;
+  config.numAttrs = n;
   CheckCuda(cudaLaunchKernelExC(&config, reinterpret_cast<const void*>(kernel_cake_dense_projection_det_gemm_5b4e87b523f799e09384), kernel_args),
             "cudaLaunchKernelExC");
 }

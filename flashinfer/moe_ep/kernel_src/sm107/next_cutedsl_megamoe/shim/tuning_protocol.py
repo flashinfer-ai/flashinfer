@@ -226,6 +226,19 @@ class RubinTuningProtocol:
             entries=[e for e in records.values() if isinstance(e, dict)],
             **{k: v for k, v in query.items() if k != "live_tokens"},
         )
+        if context.tuning_enabled:
+            # Replay fallbacks do not establish tuning coverage for this workload.
+            entries = [
+                e
+                for e in entries
+                if e["max_tokens"] == query["max_tokens"]
+                and (
+                    e["max_tokens"]
+                    if e.get("live_tokens") is None
+                    else e["live_tokens"]
+                )
+                == query["live_tokens"]
+            ]
         valid = [self._compatible(e, contract, context, measurement) for e in entries]
         ranks = self._gather(valid)
         return knob_cache.lookup_record(

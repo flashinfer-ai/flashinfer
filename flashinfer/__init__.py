@@ -135,14 +135,13 @@ from .attn_scores import (
 )
 from .attn_scores import fp4_paged_mqa_logits as fp4_paged_mqa_logits
 from .attn_scores import fp8_paged_mqa_logits as fp8_paged_mqa_logits
+from .attn_scores import FP8MQATopKWrapper as FP8MQATopKWrapper
 from .attn_scores import precompile_paged_mqa_logits as precompile_paged_mqa_logits
-from .attn_scores import (
-    single_head_paged_mqa_logits as single_head_paged_mqa_logits,
-)
 from .fused_moe import (
     cutlass_fused_moe,
     cudnn_frost_grouped_gemm1_swiglu,
     cudnn_frost_grouped_gemm1_swiglu_workspace_size,
+    deinterleave_gated_rows,
     reorder_rows_for_gated_act_gemm,
     trtllm_bf16_moe,
     trtllm_bf16_routed_moe,
@@ -171,16 +170,7 @@ _PRIMS_TS_LAZY_EXPORTS = frozenset(
 )
 
 
-# Compatibility module paths of the causal conv1d facade and its backend package; each
-# resolves on first attribute access and loads no KCP host module.
-_COMPAT_SUBMODULES = frozenset(
-    {"cake_causal_conv1d_train", "cake_causal_conv1d_train_backend"}
-)
-
-
 def __getattr__(name: str):
-    if name in _COMPAT_SUBMODULES:
-        return importlib.import_module(f"{__name__}.{name}")
     if name not in _PRIMS_TS_LAZY_EXPORTS:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     from . import fused_moe as _fused_moe
@@ -364,18 +354,6 @@ from .cake_causal_conv1d_det_train import (
     cake_causal_conv1d_det_train_forward_workspace_bytes as cake_causal_conv1d_det_train_forward_workspace_bytes,
 )
 
-# Compatibility names of the causal conv1d entry points, bound to the same objects as the det names.
-CakeCausalConv1dFunction = CakeCausalConv1dDetFunction
-cake_causal_conv1d = cake_causal_conv1d_det
-cake_causal_conv1d_train_backward = cake_causal_conv1d_det_train_backward
-cake_causal_conv1d_train_backward_workspace_bytes = (
-    cake_causal_conv1d_det_train_backward_workspace_bytes
-)
-cake_causal_conv1d_train_forward = cake_causal_conv1d_det_train_forward
-cake_causal_conv1d_train_forward_workspace_bytes = (
-    cake_causal_conv1d_det_train_forward_workspace_bytes
-)
-
 from .cake_mhc_det_train import (
     CakeMHCDetTrainFinishFunction as CakeMHCDetTrainFinishFunction,
 )
@@ -415,39 +393,6 @@ from .cake_mhc_det_train import (
     cake_mhc_det_train_head_forward as cake_mhc_det_train_head_forward,
 )
 from .cake_mhc_det_train import cake_mhc_det_train_prepare as cake_mhc_det_train_prepare
-from .cake_mhc_train import CakeMHCTrainFinishFunction as CakeMHCTrainFinishFunction
-from .cake_mhc_train import CakeMHCTrainHeadFunction as CakeMHCTrainHeadFunction
-from .cake_mhc_train import CakeMHCTrainPrepareFunction as CakeMHCTrainPrepareFunction
-from .cake_mhc_train import (
-    cake_mhc_train_backward_finish as cake_mhc_train_backward_finish,
-)
-from .cake_mhc_train import (
-    cake_mhc_train_backward_prepare as cake_mhc_train_backward_prepare,
-)
-from .cake_mhc_train import (
-    cake_mhc_train_backward_workspace_bytes as cake_mhc_train_backward_workspace_bytes,
-)
-from .cake_mhc_train import cake_mhc_train_finish as cake_mhc_train_finish
-from .cake_mhc_train import (
-    cake_mhc_train_forward_finish as cake_mhc_train_forward_finish,
-)
-from .cake_mhc_train import (
-    cake_mhc_train_forward_prepare as cake_mhc_train_forward_prepare,
-)
-from .cake_mhc_train import (
-    cake_mhc_train_forward_stats as cake_mhc_train_forward_stats,
-)
-from .cake_mhc_train import (
-    cake_mhc_train_forward_workspace_bytes as cake_mhc_train_forward_workspace_bytes,
-)
-from .cake_mhc_train import cake_mhc_train_head as cake_mhc_train_head
-from .cake_mhc_train import (
-    cake_mhc_train_head_backward as cake_mhc_train_head_backward,
-)
-from .cake_mhc_train import (
-    cake_mhc_train_head_forward as cake_mhc_train_head_forward,
-)
-from .cake_mhc_train import cake_mhc_train_prepare as cake_mhc_train_prepare
 from .cake_gdp import (
     cake_gated_delta_product_mtp as cake_gated_delta_product_mtp,
 )

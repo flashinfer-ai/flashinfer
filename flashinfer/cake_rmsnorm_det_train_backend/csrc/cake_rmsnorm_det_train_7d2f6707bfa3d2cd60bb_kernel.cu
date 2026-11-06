@@ -47,30 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_STAGE_BUF_OFF 1024
-#define SMEM_STAGE_BUF_STAGE_BYTES 98304
-#define SMEM_STAGE_BUF_STRIDE 98304
-#define SMEM_ROW_FOLD_OFF 1024
-#define SMEM_ROW_FOLD_STAGE_BYTES 128
-#define SMEM_ROW_FOLD_STRIDE 128
-#define SMEM_RED_FOLD_OFF 1152
-#define SMEM_RED_FOLD_STAGE_BYTES 6144
-#define SMEM_RED_FOLD_STRIDE 6144
-#define SMEM_DOT_SLOTS_OFF 99328
-#define SMEM_DOT_SLOTS_STAGE_BYTES 96
-#define SMEM_DOT_SLOTS_STRIDE 96
-#define SMEM_PART_SM_OFF 99456
-#define SMEM_PART_SM_STAGE_BYTES 16
-#define SMEM_PART_SM_STRIDE 16
-#define SMEM_DESC_OFF 99584
-#define SMEM_DESC_STAGE_BYTES 72
-#define SMEM_DESC_STRIDE 72
-#define SMEM_RTAB_OFF 99712
-#define SMEM_RTAB_STAGE_BYTES 128
-#define SMEM_RTAB_STRIDE 128
-#define SMEM_TOTAL 99840
-#define THREADS 384
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -151,7 +127,7 @@ kernel_cake_rmsnorm_det_train_7d2f6707bfa3d2cd60bb(__nv_bfloat16* __restrict__ g
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     uint8_t* stage_buf = reinterpret_cast<uint8_t*>(smem_raw + 1024);
     const int stage_buf_addr = smem + 1024;
     float* row_fold = reinterpret_cast<float*>(smem_raw + 1024);
@@ -167,8 +143,7 @@ kernel_cake_rmsnorm_det_train_7d2f6707bfa3d2cd60bb(__nv_bfloat16* __restrict__ g
     int* rtab = reinterpret_cast<int*>(smem_raw + 99712);
     const int rtab_addr = smem + 99712;
 
-    // Mbarrier init (2 pipeline groups, 0 ordered-sequence groups, 10 barriers)
-    // Mbarriers at smem_raw[0..80)
+    // Mbarrier init (10 barriers at smem_raw[0..80))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -337,13 +312,13 @@ kernel_cake_rmsnorm_det_train_7d2f6707bfa3d2cd60bb(__nv_bfloat16* __restrict__ g
     int w1 = desc[word_1 + 1];
     int w2 = desc[word_1 + 2];
     int _warp_redux_5;
-    asm volatile("redux.sync.max.s32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_5) : "r"(w0));
+    asm volatile("redux.sync.max.s32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_5) : "r"(w0));
     nd[0] = _warp_redux_5;
     int _warp_redux_6;
-    asm volatile("redux.sync.max.s32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_6) : "r"(w1));
+    asm volatile("redux.sync.max.s32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_6) : "r"(w1));
     nd[1] = _warp_redux_6;
     int _warp_redux_7;
-    asm volatile("redux.sync.max.s32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_7) : "r"(w2));
+    asm volatile("redux.sync.max.s32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_7) : "r"(w2));
     nd[2] = _warp_redux_7;
     int c0 = nd[0];
     int cb = nd[1];
@@ -438,13 +413,13 @@ kernel_cake_rmsnorm_det_train_7d2f6707bfa3d2cd60bb(__nv_bfloat16* __restrict__ g
                 int w1_3 = desc[word_1_1 + 1];
                 int w2_4 = desc[word_1_1 + 2];
                 int _warp_redux_10;
-                asm volatile("redux.sync.max.s32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_10) : "r"(w0_2));
+                asm volatile("redux.sync.max.s32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_10) : "r"(w0_2));
                 nd[0] = _warp_redux_10;
                 int _warp_redux_11;
-                asm volatile("redux.sync.max.s32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_11) : "r"(w1_3));
+                asm volatile("redux.sync.max.s32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_11) : "r"(w1_3));
                 nd[1] = _warp_redux_11;
                 int _warp_redux_12;
-                asm volatile("redux.sync.max.s32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_12) : "r"(w2_4));
+                asm volatile("redux.sync.max.s32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_12) : "r"(w2_4));
                 nd[2] = _warp_redux_12;
                 ps[0] = nd[1];
                 ps[1] = nd[2];
@@ -640,13 +615,13 @@ kernel_cake_rmsnorm_det_train_7d2f6707bfa3d2cd60bb(__nv_bfloat16* __restrict__ g
                 int w1_0 = desc[word_0 + 1];
                 int w2_0 = desc[word_0 + 2];
                 int _warp_redux_17;
-                asm volatile("redux.sync.max.s32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_17) : "r"(w0_0));
+                asm volatile("redux.sync.max.s32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_17) : "r"(w0_0));
                 nd[0] = _warp_redux_17;
                 int _warp_redux_18;
-                asm volatile("redux.sync.max.s32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_18) : "r"(w1_0));
+                asm volatile("redux.sync.max.s32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_18) : "r"(w1_0));
                 nd[1] = _warp_redux_18;
                 int _warp_redux_19;
-                asm volatile("redux.sync.max.s32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_19) : "r"(w2_0));
+                asm volatile("redux.sync.max.s32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_19) : "r"(w2_0));
                 nd[2] = _warp_redux_19;
                 row_n_1 = cb;
                 if (nd[1] < T) {
@@ -780,13 +755,13 @@ kernel_cake_rmsnorm_det_train_7d2f6707bfa3d2cd60bb(__nv_bfloat16* __restrict__ g
                     int w1_3_1 = desc[word_1_2 + 1];
                     int w2_4_1 = desc[word_1_2 + 2];
                     int _warp_redux_25;
-                    asm volatile("redux.sync.max.s32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_25) : "r"(w0_2_1));
+                    asm volatile("redux.sync.max.s32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_25) : "r"(w0_2_1));
                     nd[0] = _warp_redux_25;
                     int _warp_redux_26;
-                    asm volatile("redux.sync.max.s32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_26) : "r"(w1_3_1));
+                    asm volatile("redux.sync.max.s32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_26) : "r"(w1_3_1));
                     nd[1] = _warp_redux_26;
                     int _warp_redux_27;
-                    asm volatile("redux.sync.max.s32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_27) : "r"(w2_4_1));
+                    asm volatile("redux.sync.max.s32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_27) : "r"(w2_4_1));
                     nd[2] = _warp_redux_27;
                     ps[0] = nd[1];
                     ps[1] = nd[2];
@@ -858,13 +833,13 @@ kernel_cake_rmsnorm_det_train_7d2f6707bfa3d2cd60bb(__nv_bfloat16* __restrict__ g
         int w1_1 = desc[word_1_3 + 1];
         int w2_1 = desc[word_1_3 + 2];
         int _warp_redux_28;
-        asm volatile("redux.sync.max.s32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_28) : "r"(w0_1));
+        asm volatile("redux.sync.max.s32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_28) : "r"(w0_1));
         nd[0] = _warp_redux_28;
         int _warp_redux_29;
-        asm volatile("redux.sync.max.s32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_29) : "r"(w1_1));
+        asm volatile("redux.sync.max.s32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_29) : "r"(w1_1));
         nd[1] = _warp_redux_29;
         int _warp_redux_30;
-        asm volatile("redux.sync.max.s32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_30) : "r"(w2_1));
+        asm volatile("redux.sync.max.s32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_30) : "r"(w2_1));
         nd[2] = _warp_redux_30;
         int cid_f = nd[0];
         unsigned long long pbase = (unsigned long long)cid_f * 6144;
@@ -897,13 +872,13 @@ kernel_cake_rmsnorm_det_train_7d2f6707bfa3d2cd60bb(__nv_bfloat16* __restrict__ g
         int w1_2 = desc[word_2_2 + 1];
         int w2_2 = desc[word_2_2 + 2];
         int _warp_redux_32;
-        asm volatile("redux.sync.max.s32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_32) : "r"(w0_2_2));
+        asm volatile("redux.sync.max.s32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_32) : "r"(w0_2_2));
         nd[0] = _warp_redux_32;
         int _warp_redux_33;
-        asm volatile("redux.sync.max.s32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_33) : "r"(w1_2));
+        asm volatile("redux.sync.max.s32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_33) : "r"(w1_2));
         nd[1] = _warp_redux_33;
         int _warp_redux_34;
-        asm volatile("redux.sync.max.s32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_34) : "r"(w2_2));
+        asm volatile("redux.sync.max.s32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_34) : "r"(w2_2));
         nd[2] = _warp_redux_34;
         cb = nd[1];
         ce = nd[2];

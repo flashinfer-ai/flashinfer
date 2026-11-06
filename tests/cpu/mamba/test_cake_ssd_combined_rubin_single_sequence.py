@@ -185,6 +185,7 @@ def test_rule_is_its_definition():
 
 
 def _rubin(module, monkeypatch, launches, arch):
+    monkeypatch.setattr(module, "_load_generated_program", lambda *_: None)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(module, "_target_arch", lambda *_: arch)
     monkeypatch.setattr(module, "_cuda_device_index", lambda _: 0)

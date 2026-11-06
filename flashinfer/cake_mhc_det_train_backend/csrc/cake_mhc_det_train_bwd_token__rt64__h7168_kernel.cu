@@ -83,7 +83,7 @@ kernel_cake_mhc_det_train_bwd_token__rt64__h7168(__nv_bfloat16* __restrict__ X, 
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* dpre_part = reinterpret_cast<float*>(smem_raw + 0);
     const int dpre_part_addr = smem + 0;
     float* fold = reinterpret_cast<float*>(smem_raw + 1024);

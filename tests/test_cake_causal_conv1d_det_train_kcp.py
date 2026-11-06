@@ -30,7 +30,7 @@ the history rows, the backward's head rows and the tail fold all run through the
     the direct forward / backward calls, and the fold of the received ``dpre`` rows reproduces the unpartitioned
     launch's ``dx`` through the same host flow.
 
-A ``KcpContext`` is built with ``build_kcp_context`` when the KCP plan module is importable, else from the same
+A ``ContextDetKcp`` is built with ``build_context_det_kcp`` when the KCP plan module is importable, else from the same
 tables hand-built here (the plan's halo layout for one rank).
 """
 
@@ -176,19 +176,19 @@ def _halo_tables(lens, frags):
 
 
 def _context(lens, cuts, device):
-    """A one-rank ``KcpContext`` for ``cuts`` over documents ``lens``: ``build_kcp_context`` when the plan module
+    """A one-rank ``ContextDetKcp`` for ``cuts`` over documents ``lens``: ``build_context_det_kcp`` when the plan module
     is importable, else a stand-in with the same fields the conv host module reads."""
     S, cu_global, frags = _fragments(lens, cuts)
     try:
-        from flashinfer.experimental.cake_kda_train.cake_kcp_plan import (
-            build_kcp_context,
-            kcp_partition,
+        from flashinfer.experimental.cake_kda_det_train_kcp.cake_kcp_plan import (
+            build_context_det_kcp,
+            partition_det_kcp,
         )
 
-        part = kcp_partition(
+        part = partition_det_kcp(
             torch.tensor(cu_global, dtype=torch.int64), 1, fragments=[frags]
         )
-        ctx = build_kcp_context(part, None, 0, device, conv_kernel_size=WIDTH)
+        ctx = build_context_det_kcp(part, None, 0, device, conv_kernel_size=WIDTH)
         return ctx, S, cu_global, frags
     except ImportError:
         pass
@@ -921,3 +921,134 @@ def test_recompute_handle_both_host_paths(monkeypatch, host_trim) -> None:
     assert _same(plain, direct) and _same(got, direct)
     assert plain_cc.table() == {"orig": 1, "recompute": 1, "bwd": 1}, plain_cc.table()
     assert cc.table() == {"orig": 1, "recompute": 0, "bwd": 1}, cc.table()
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# The backward's launch forms (FlashInfer issue #8365): ``cooperative=True`` runs the cooperative ``kcp_bwd`` record,
+# ``cooperative=False`` the ``kcp_bwd_split`` record (an ordinary launch one SM short of co-resident) and its fixed-order
+# reduce program.  ``dx`` is bitwise the same in both forms; ``dweight`` is reproducible in each form and within the
+# FP64-oracle bound, its bits differ between the forms (each sums its own partial rows).
+
+
+class _RouteRecorder:
+    """Records the backward kinds the host flow selects (``kcp.selected_modules``)."""
+
+    def __init__(self, monkeypatch, conv_kcp) -> None:
+        self.kinds: list[str] = []
+        original = conv_kcp.selected_modules
+
+        def recording(arch, kind, **kwargs):
+            if kind in ("kcp_bwd", "kcp_bwd_split"):
+                self.kinds.append(kind)
+            return original(arch, kind, **kwargs)
+
+        monkeypatch.setattr(conv_kcp, "selected_modules", recording)
+
+
+@pytest.mark.parametrize(
+    "name,lens,cuts,C", [*ROWS[:3], ROWS[5]], ids=[r[0] for r in [*ROWS[:3], ROWS[5]]]
+)
+@pytest.mark.parametrize("host_trim", [0, 1])
+def test_backward_launch_forms(monkeypatch, name, lens, cuts, C, host_trim) -> None:
+    from flashinfer.cake_causal_conv1d_det_train_backend import kcp as conv_kcp
+
+    device = torch.device("cuda")
+    p = _problem(lens, cuts, C, device)
+    monkeypatch.setenv(conv_kcp.TEST_KNOBS_ENV, "1")
+    conv_kcp._set_test_knobs({"host_trim": host_trim})
+    conv_kcp.host_cache_clear()
+    routes = _RouteRecorder(monkeypatch, conv_kcp)
+    try:
+        _, hist = cake_causal_conv1d_det_forward_kcp(p.x_local, p.w, p.ctx)
+        out = {}
+        for coop in (True, False):
+            runs = [
+                cake_causal_conv1d_det_backward_kcp(
+                    p.x_local, p.w, p.ctx, p.dy_local, hist, cooperative=coop
+                )
+                for _ in range(3)
+            ]
+            out[coop] = runs
+        default = cake_causal_conv1d_det_backward_kcp(
+            p.x_local, p.w, p.ctx, p.dy_local, hist
+        )
+        torch.cuda.synchronize()
+    finally:
+        conv_kcp._set_test_knobs(None)
+    expected = (
+        ["kcp_bwd"] * 3
+        + ["kcp_bwd_split"] * 3
+        + [conv_kcp._bwd_kind(conv_kcp.COOPERATIVE_DEFAULT)]
+    )
+    if host_trim == 1:  # the trimmed path selects once per cache key
+        expected = ["kcp_bwd", "kcp_bwd_split"]
+    assert routes.kinds == expected, routes.kinds
+    _, dx_ref, dw_ref = _reference(p.x, p.w, p.cu, p.dy)
+    dx_coop, dw_coop = out[True][0]
+    for coop, runs in out.items():
+        dx0, dw0 = runs[0]
+        for dx, dw in runs[1:]:
+            assert torch.equal(_bits(dx), _bits(dx0)) and torch.equal(
+                _bits(dw), _bits(dw0)
+            ), f"cooperative={coop}: a repeat differs"
+        assert torch.equal(_bits(dx0), _bits(dx_coop)), (
+            f"cooperative={coop}: dx differs from the cooperative form"
+        )
+        _assert_within(
+            dw0, dw_ref, atol=DW_ATOL, rtol=DW_RTOL, label=f"dw (cooperative={coop})"
+        )
+        _assert_within(
+            dx0,
+            dx_ref[p.l2g],
+            atol=Y_ATOL,
+            rtol=Y_RTOL,
+            label=f"dx (cooperative={coop})",
+        )
+    dx_d, dw_d = default
+    dx_e, dw_e = out[conv_kcp.COOPERATIVE_DEFAULT][0]
+    assert torch.equal(_bits(dx_d), _bits(dx_e)) and torch.equal(
+        _bits(dw_d), _bits(dw_e)
+    ), "cooperative=None is not the package default"
+
+
+def test_backward_launch_form_autograd_graph_and_refusal(monkeypatch) -> None:
+    """The autograd entry carries ``cooperative`` to its backward (bitwise the direct backward of that form), a graph
+    replay of either form is bitwise its eager result (the form is part of the graph key), and a non-bool is
+    refused."""
+    from flashinfer.cake_causal_conv1d_det_train_backend import kcp as conv_kcp
+
+    device = torch.device("cuda")
+    p = _problem((5000, 1003), (1, 2, 4997, 1003), 512, device)
+    x, w, ctx = p.x_local, p.w, p.ctx
+    dy = p.dy_local
+    _, hist = cake_causal_conv1d_det_forward_kcp(x, w, ctx)
+    direct = {
+        coop: cake_causal_conv1d_det_backward_kcp(x, w, ctx, dy, hist, cooperative=coop)
+        for coop in (True, False)
+    }
+    for coop in (True, False):
+        xg = x.clone().requires_grad_(True)
+        wg = w.clone().requires_grad_(True)
+        y = cake_causal_conv1d_det_kcp(xg, wg, ctx, cooperative=coop)
+        y.backward(dy)
+        assert torch.equal(_bits(xg.grad), _bits(direct[coop][0]))
+        assert torch.equal(_bits(wg.grad), _bits(direct[coop][1])), (
+            f"autograd dweight differs from the direct backward (cooperative={coop})"
+        )
+    try:
+        for coop in (True, False, True, False, True, False):
+            dx, dw = cake_causal_conv1d_det_backward_kcp(
+                x, w, ctx, dy, hist, graph="replay", cooperative=coop
+            )
+            assert torch.equal(dx, direct[coop][0]) and torch.equal(
+                dw, direct[coop][1]
+            ), f"graph replay differs from eager (cooperative={coop})"
+        assert conv_kcp.LAST_CALL["bwd"]["graph_event"] == "replay"
+        assert conv_kcp.GRAPH_STATS["fallback"] == 0
+    finally:
+        conv_kcp._GRAPHS.clear()
+    for bad in (1, "split"):
+        with pytest.raises(TypeError, match="cooperative"):
+            cake_causal_conv1d_det_backward_kcp(x, w, ctx, dy, hist, cooperative=bad)
+        with pytest.raises(TypeError, match="cooperative"):
+            cake_causal_conv1d_det_kcp(x, w, ctx, cooperative=bad)

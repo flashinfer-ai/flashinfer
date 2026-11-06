@@ -47,33 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_DOT_SLOTS_OFF 0
-#define SMEM_DOT_SLOTS_STAGE_BYTES 32
-#define SMEM_DOT_SLOTS_STRIDE 32
-#define SMEM_FLAGS_OFF 128
-#define SMEM_FLAGS_STAGE_BYTES 32
-#define SMEM_FLAGS_STRIDE 32
-#define SMEM_RED_FOLD_OFF 256
-#define SMEM_RED_FOLD_STAGE_BYTES 2048
-#define SMEM_RED_FOLD_STRIDE 2048
-#define SMEM_ROW_FOLD_OFF 2304
-#define SMEM_ROW_FOLD_STAGE_BYTES 4096
-#define SMEM_ROW_FOLD_STRIDE 4096
-#define SMEM_COMP_SMEM_OFF 6400
-#define SMEM_COMP_SMEM_STAGE_BYTES 128
-#define SMEM_COMP_SMEM_STRIDE 128
-#define SMEM_W_SM_OFF 6528
-#define SMEM_W_SM_STAGE_BYTES 16
-#define SMEM_W_SM_STRIDE 16
-#define SMEM_PART_SM_OFF 6656
-#define SMEM_PART_SM_STAGE_BYTES 16
-#define SMEM_PART_SM_STRIDE 16
-#define SMEM_RING_OFF 6784
-#define SMEM_RING_STAGE_BYTES 36864
-#define SMEM_RING_STRIDE 36864
-#define SMEM_TOTAL 43648
-#define THREADS 128
 #define LAUNCH_MIN_BLOCKS 5
 
 #include <math_constants.h>
@@ -130,7 +103,7 @@ kernel_cake_rmsnorm_det_train_0291949ba535c646c3a8(__nv_bfloat16* __restrict__ g
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* dot_slots = reinterpret_cast<float*>(smem_raw + 0);
     const int dot_slots_addr = smem + 0;
     int* flags = reinterpret_cast<int*>(smem_raw + 128);

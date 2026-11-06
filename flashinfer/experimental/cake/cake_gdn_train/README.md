@@ -85,15 +85,19 @@ non-deterministic one).
 
 No launch of this package is unordered, so PyTorch's deterministic algorithms
 (`torch.use_deterministic_algorithms(True)`, with or without `warn_only`)
-change nothing: no entry raises PyTorch's alert.  The deterministic packages,
-their names, defaults and aliases are unchanged.
+change nothing: no entry raises PyTorch's alert.
 
-| name | what it is now |
+The deterministic packages are named by their det names only:
+
+| name | what it is |
 |---|---|
-| `flashinfer.experimental.cake_gdn_det_train` and its aliases `chunk_gated_delta_rule`, `ChunkGatedDeltaRuleFunction`, `gdn_chunk_forward`, `gdn_chunk_backward` | unchanged: the deterministic one-rank package |
-| `flashinfer.experimental.cake_gdn_train` (the KCP package of FlashInfer v0.7.3rc1) | unchanged: a legacy alias of the deterministic KCP package `flashinfer.experimental.cake_gdn_det_train_kcp` |
-| `flashinfer.gdn_train`, `flashinfer.cake_gdn_det_train_kcp` | unchanged: deterministic KCP entry points |
-| `flashinfer.experimental.cake.cake_gdn_train` | new: this non-deterministic one-rank package |
+| `flashinfer.experimental.cake_gdn_det_train` (`chunk_gated_delta_rule_det`, `ChunkGatedDeltaRuleDetFunction`, `gdn_chunk_det_forward`, `gdn_chunk_det_backward`) | the deterministic one-rank package |
+| `flashinfer.experimental.cake_gdn_det_train_kcp`, `flashinfer.cake_gdn_det_train_kcp` | the deterministic KCP package and its entry points |
+| `flashinfer.experimental.cake.cake_gdn_train` | this non-deterministic one-rank package |
+
+The no-det spellings `chunk_gated_delta_rule`, `ChunkGatedDeltaRuleFunction`,
+`gdn_chunk_forward` and `gdn_chunk_backward` name this package's
+non-deterministic entries; a deterministic call uses the det names above.
 
 ## Chain
 
@@ -104,7 +108,10 @@ grid needs a second, short wave: with `slots = 6 x SMs` and
 `CTAs = chunks x H`, the plain prep runs for `slots < CTAs <= 2.5 x slots`
 (`sm_100a`, `sm_103a`; `sm_107a` has no plain-prep band and runs `prep_tma`
 for every grid), and
-for Q or K not 16-byte aligned.  Both preps give the same bits.  A long sequence can be
+for Q or K not 16-byte aligned.  Both preps give the same bits.  The WY stage
+runs `wy_tc2`: the chains and outputs of `wy_tc` (the same bits) with a
+64-column TMEM accumulator and packed shared-memory operands, so five CTAs fit
+on an SM where `wy_tc` fits four.  A long sequence can be
 split into segments: a pre-scan and a stitch then give every segment its start
 state.  The backward runs the adjoint scan, either `dv_local` plus a register
 scan or, on a serial plan, the tcgen05 scan with `dv_local` fused (`dhu_tc2`),
@@ -128,10 +135,11 @@ runs it (`fwd_ho` for the forward, `dhu_tc2` for the adjoint) with R200 step
 times and fitted split costs, when it saves at least 2 us and prices at most
 0.95 of the chosen table; a serial table that
 the two-stream rule groups keeps its form, and `sm_100a` / `sm_103a` keep their
-tables.  On `sm_107a` (`SPLIT_R_FORM`) a value-head group of three with the
-`tail_g3` tail also keeps the planner's `(64, 1)` split adjoint table when the
-`dhu_tc2` pricing runs its pass 2 and the two-stream rule groups its segments
-(the R form below; the deterministic package's table and groups).
+tables.  On `sm_100a`, `sm_103a` and `sm_107a` (`SPLIT_R_FORM`) a value-head
+group of three with the `tail_g3` tail also keeps the planner's `(64, 1)` split
+adjoint table when the `dhu_tc2` pricing runs its pass 2 and the two-stream rule
+groups its segments (the R form below; the deterministic package's table and
+groups).
 Elsewhere the forward table is the planner's.  A different table
 changes the bits of the outputs that depend on it (other segment boundaries),
 so the deterministic package's bits need its tables: pin `scan_config` /
@@ -204,12 +212,14 @@ larger `k`).  The scan is split only if `idle(k x HV) < idle(n x HV)`; a scan
 with `n < 2` or `n x HV <= SMs` is never split.  The groups follow the table
 order (longest first unless `lpt=False`).  The adjoint `dhu_tc2` scan of a
 value-head group of two runs the first `k` sequences on the caller's stream,
-then their fused tail while a side stream scans the rest.  The forward runs
-`wy_tc` and `fwd_ho` of the first `n - k` sequences on the side stream; once
-that `wy_tc` is done, the caller's stream runs those of the last `k`.  On
-`sm_107a` the `dhu_tc2` pass 2 of a split adjoint table beside `tail_g3` runs
-the same way over its segments (`n` segments, the first `k` on the caller's
-stream).  The side
+then their fused tail while a side stream scans the rest; so does the scan
+beside `tail_g3` (a group of three) on `sm_100a` and `sm_103a`
+(`TWO_STREAM_SERIAL_G3_ARCHS`, the deterministic package's rule).  The forward
+runs `wy_tc` and `fwd_ho` of the first `n - k` sequences on the side stream;
+once that `wy_tc` is done, the caller's stream runs those of the last `k`.  On
+`sm_100a`, `sm_103a` and `sm_107a` (`SPLIT_R_FORM`) the `dhu_tc2` pass 2 of a
+split adjoint table beside `tail_g3` runs the same way over its segments (`n`
+segments, the first `k` on the caller's stream).  The side
 stream is a stream of PyTorch's pool with the device's greatest priority, one
 per caller stream; it is forked from the caller's stream with events and joined
 before the stage returns (also when a launch raises), so the call can be
