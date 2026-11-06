@@ -238,7 +238,7 @@ def _alert_nondeterministic(entry: str) -> None:
     algorithms are enabled: a ``RuntimeError``, or a ``UserWarning`` under
     ``torch.use_deterministic_algorithms(True, warn_only=True)``; nothing otherwise.  Called by the entry points that
     launch the unordered reduction (the single-rank backward, the KCP backward and the KCP multi backward), before
-    they allocate, launch or exchange anything.  The alert is raised here, not through a private PyTorch hook
+    they launch or exchange anything (output tensors the caller did not pass may already be allocated).  The alert is raised here, not through a private PyTorch hook
     (PyTorch exposes no public Python entry for it)."""
 
     if not torch.are_deterministic_algorithms_enabled():
@@ -1116,7 +1116,8 @@ def cake_causal_conv1d_nondet_train_backward(
 
     Under ``torch.use_deterministic_algorithms(True)`` (read when the call runs) the call raises a
     ``RuntimeError`` (a ``UserWarning``, then it runs, with ``warn_only=True``) after its arguments are validated
-    and before it allocates or launches anything; it never falls back to the deterministic package.
+    and its outputs are prepared (an output not passed is already allocated), before its kernel launches; it never
+    falls back to the deterministic package.
 
     Parameters
     ----------
@@ -1206,7 +1207,7 @@ def cake_causal_conv1d_nondet_train_backward(
             dtypes=PARAMETER_DTYPES,
         )
     # Every argument is valid: a call under torch's deterministic mode is refused (or warned about) here, before
-    # anything is allocated or launched.
+    # the kernel launches (outputs the caller did not pass are already allocated).
     _alert_nondeterministic("cake_causal_conv1d_nondet_train_backward")
     if S == 0:
         dw_out.zero_()

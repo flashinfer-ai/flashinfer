@@ -103,6 +103,8 @@ KCP_PACKAGE_NAMES = (
         "cake_causal_conv1d_multi_backward_kcp",
         "cake_causal_conv1d_nondet_train_kcp_multi_backward",
     ),
+    ("graph_cache_clear", "cake_causal_conv1d_nondet_train_kcp_graph_cache_clear"),
+    ("host_cache_clear", "cake_causal_conv1d_nondet_train_kcp_host_cache_clear"),
 )
 RENAMED = {
     FACADE: SINGLE_RANK,

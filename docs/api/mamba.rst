@@ -291,8 +291,10 @@ its own).
 The non-deterministic modules and names below were renamed.  The old names
 were removed without aliases: importing an old module raises
 ``ModuleNotFoundError``.  The ``deterministic`` keyword was removed as well:
-the module selects the mode, so call the deterministic package's names for
-deterministic results.
+the module selects the mode.  The old names ran the deterministic package by
+default: a call that relied on that default moves to the deterministic
+package's names (``flashinfer.cake_causal_conv1d_det_train[_kcp]``), not to
+the names below.  The backend's ``plan_cache_clear`` keeps its name.
 
 .. list-table:: Old and new non-deterministic names
    :header-rows: 1
@@ -345,6 +347,10 @@ deterministic results.
      - ``cake_causal_conv1d_nondet_train_kcp_multi_forward``
    * - ``cake_causal_conv1d_multi_backward_kcp``
      - ``cake_causal_conv1d_nondet_train_kcp_multi_backward``
+   * - ``graph_cache_clear`` (of the backend's ``kcp`` module)
+     - ``cake_causal_conv1d_nondet_train_kcp_graph_cache_clear``
+   * - ``host_cache_clear`` (of the backend's ``kcp`` module)
+     - ``cake_causal_conv1d_nondet_train_kcp_host_cache_clear``
 
 The deterministic package's names before its ``det`` rename (the modules
 ``flashinfer.cake_causal_conv1d_train`` and

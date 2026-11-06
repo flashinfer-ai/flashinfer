@@ -105,7 +105,9 @@ def recorded(monkeypatch):
 
     log: list = []
     nondet_names = [*ENTRIES, *HELPERS, SUPPORTED[0]]
-    monkeypatch.setattr(facade, "_backend", _namespace("nondet", nondet_names, log))
+    backend = _namespace("nondet", nondet_names, log)
+    # the module imports its package on first use, through ``_backend()``
+    monkeypatch.setattr(facade, "_backend", lambda: backend)
     for det_name in [*ENTRIES.values(), *HELPERS.values(), SUPPORTED[1]]:
         monkeypatch.setattr(det_facade, det_name, _Recorder(f"det.{det_name}", log))
     yield log
