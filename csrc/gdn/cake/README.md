@@ -80,7 +80,7 @@ with per-variant SASS equivalence checks against the generated originals.
   and its second arm otherwise, so the int32-or-int64 metadata checks of the
   SM107a prefill records render from their base's template; the directive
   lines are dropped. `flashinfer/jit/cake_gdn.py` renders the shim
-  text at load time; `tests/cpu/gdn/cake_gdn_host_shim_sha256.json` pins
+  text at load time; `tests/gdn/cpu/cake_gdn_host_shim_sha256.json` pins
   the rendered text per variant. The helpers the launchers share
   (device guard, tensor checks, the `EncodeTma3D` TMA encoder, dynamic
   shared-memory opt-in) live in `host/cake_gdn_host_common.h`.

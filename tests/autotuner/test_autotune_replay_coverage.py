@@ -19,7 +19,7 @@ from .test_autotune_cache_scope import (
     _choose,
     _load_legacy,
 )
-from tests.cpu.autotuner.test_tuning_protocol import RecordingProtocol
+from tests.autotuner.cpu.test_tuning_protocol import RecordingProtocol
 from .utils import DummyRunner, make_scoped_tuner
 
 

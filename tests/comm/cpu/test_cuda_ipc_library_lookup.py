@@ -3,7 +3,7 @@
 Pure string matching against a mocked maps table -- no GPU, MPI, or CUDA runtime required beyond
 importing the module.
 
-Run with: pytest tests/cpu/comm/test_cuda_ipc_library_lookup.py -vv
+Run with: pytest tests/comm/cpu/test_cuda_ipc_library_lookup.py -vv
 """
 
 from unittest import mock

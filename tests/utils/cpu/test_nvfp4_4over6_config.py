@@ -34,7 +34,7 @@ What is pinned here:
    ``csrc/`` decodes; a silent change here miscompiles every 4over6 kernel.
 4. **The on-disk cache key.** ``nvfp4_4over6_cache_key`` string literals are
    part of every user's CuTe-DSL artifact directory, so they are pinned
-   character-for-character (see ``tests/cpu/jit/test_cute_dsl_cache.py`` for the
+   character-for-character (see ``tests/jit/cpu/test_cute_dsl_cache.py`` for the
    cross-check against the kernel-name function itself).
 5. **Canonicalization.** A subclass of ``NVFP44Over6Config`` must collapse to
    the base class before it can reach a ``@functools.cache`` key.
@@ -461,7 +461,7 @@ class TestCacheKey:
     """``nvfp4_4over6_cache_key`` must keep the ``_4over6_<e4m3>_<mode>_<fast>``
     suffix ``_nvfp4_kernel_name`` has always used, or every on-disk CuTe-DSL
     artifact is invalidated on upgrade. The cross-check against the
-    kernel-name function is in ``tests/cpu/jit/test_cute_dsl_cache.py``.
+    kernel-name function is in ``tests/jit/cpu/test_cute_dsl_cache.py``.
     """
 
     @pytest.mark.cpu_only
