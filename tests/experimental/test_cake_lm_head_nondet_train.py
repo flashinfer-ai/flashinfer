@@ -526,150 +526,151 @@ def test_sm107_takes_the_sm103_rule_tables_except_the_long_chunk_ring():
 
 
 def _former_mode_calls(X, W, labels):
-    """Every entry of the package that took ``deterministic`` before issue #8928, as ``name -> call(deterministic)`` on
-    host tensors (the reference backend; the ``cake`` backend for the kept-logits pair)."""
+    """Every entry of the package that took ``deterministic`` before issue #8928, as ``name -> call(**mode)`` on host
+    tensors (the reference backend; the ``cake`` backend for the kept-logits pair): ``call()`` runs the entry,
+    ``call(deterministic=False)`` passes the former mode keyword."""
     common = dict(chunk_size=4, backend="reference")
     loss_kw = dict(common, loss_div=1.0)
     rows = labels.shape[0]
     return {
-        "validate_lm_head_inputs": lambda d: cake_backend.validate_lm_head_inputs(
-            X, W, labels, loss_div=1.0, deterministic=d
+        "validate_lm_head_inputs": lambda **mode: cake_backend.validate_lm_head_inputs(
+            X, W, labels, loss_div=1.0, **mode
         ),
-        "forward_loss": lambda d: cake_backend.forward_loss(
-            X, W, labels, deterministic=d, **loss_kw
+        "forward_loss": lambda **mode: cake_backend.forward_loss(
+            X, W, labels, **mode, **loss_kw
         ),
-        "forward_logprob": lambda d: cake_backend.forward_logprob(
-            X, W, labels, deterministic=d, **common
+        "forward_logprob": lambda **mode: cake_backend.forward_logprob(
+            X, W, labels, **mode, **common
         ),
-        "backward_logprob": lambda d: cake_backend.backward_logprob(
+        "backward_logprob": lambda **mode: cake_backend.backward_logprob(
             X,
             W,
             labels,
             torch.zeros(labels.shape[0]),
             torch.zeros(labels.shape[0]),
-            deterministic=d,
+            **mode,
             **common,
         ),
-        "prepare_lm_head_loss": lambda d: cake_backend.prepare_lm_head_loss(
-            X, W, labels, deterministic=d, **loss_kw
+        "prepare_lm_head_loss": lambda **mode: cake_backend.prepare_lm_head_loss(
+            X, W, labels, **mode, **loss_kw
         ),
-        "cake_lm_head_nondet_train_loss": lambda d: cake_backend.cake_lm_head_nondet_train_loss(
-            X, W, labels, deterministic=d, **loss_kw
+        "cake_lm_head_nondet_train_loss": lambda **mode: cake_backend.cake_lm_head_nondet_train_loss(
+            X, W, labels, **mode, **loss_kw
         ),
-        "cake_lm_head_nondet_train_logprob": lambda d: cake_backend.cake_lm_head_nondet_train_logprob(
-            X, W, labels, deterministic=d, **common
+        "cake_lm_head_nondet_train_logprob": lambda **mode: cake_backend.cake_lm_head_nondet_train_logprob(
+            X, W, labels, **mode, **common
         ),
-        "opt_in.forward_loss": lambda d: opt_in.forward_loss(
-            X, W, labels, deterministic=d, **loss_kw
+        "opt_in.forward_loss": lambda **mode: opt_in.forward_loss(
+            X, W, labels, **mode, **loss_kw
         ),
-        "opt_in.prepare_lm_head_loss": lambda d: opt_in.prepare_lm_head_loss(
-            X, W, labels, deterministic=d, **loss_kw
+        "opt_in.prepare_lm_head_loss": lambda **mode: opt_in.prepare_lm_head_loss(
+            X, W, labels, **mode, **loss_kw
         ),
-        "opt_in.cake_lm_head_nondet_train_loss": lambda d: opt_in.cake_lm_head_nondet_train_loss(
-            X, W, labels, deterministic=d, memory_mode="fast", **loss_kw
+        "opt_in.cake_lm_head_nondet_train_loss": lambda **mode: opt_in.cake_lm_head_nondet_train_loss(
+            X, W, labels, **mode, memory_mode="fast", **loss_kw
         ),
-        "opt_in.cake_lm_head_nondet_train_logprob": lambda d: opt_in.cake_lm_head_nondet_train_logprob(
-            X, W, labels, deterministic=d, memory_mode="fast", **common
+        "opt_in.cake_lm_head_nondet_train_logprob": lambda **mode: opt_in.cake_lm_head_nondet_train_logprob(
+            X, W, labels, **mode, memory_mode="fast", **common
         ),
-        "forward_logprob_temperature": lambda d: (
+        "forward_logprob_temperature": lambda **mode: (
             cake_backend.forward_logprob_temperature(
-                X, W, labels, deterministic=d, temperature=0.7, **common
+                X, W, labels, **mode, temperature=0.7, **common
             )
         ),
-        "backward_logprob_temperature": lambda d: (
+        "backward_logprob_temperature": lambda **mode: (
             cake_backend.backward_logprob_temperature(
                 X,
                 W,
                 labels,
                 torch.zeros(labels.shape[0]),
                 torch.zeros(labels.shape[0]),
-                deterministic=d,
+                **mode,
                 temperature=0.7,
                 **common,
             )
         ),
-        "prepare_lm_head_loss_temperature": lambda d: (
+        "prepare_lm_head_loss_temperature": lambda **mode: (
             cake_backend.prepare_lm_head_loss_temperature(
                 X,
                 W,
                 labels,
-                deterministic=d,
+                **mode,
                 entry="logprob",
                 temperature=torch.full((labels.shape[0],), 0.7),
                 **common,
             )
         ),
-        "cake_lm_head_nondet_train_logprob_temperature": lambda d: (
+        "cake_lm_head_nondet_train_logprob_temperature": lambda **mode: (
             cake_backend.cake_lm_head_nondet_train_logprob_temperature(
-                X, W, labels, deterministic=d, temperature=0.7, **common
+                X, W, labels, **mode, temperature=0.7, **common
             )
         ),
-        "opt_in.forward_logprob_temperature": lambda d: (
+        "opt_in.forward_logprob_temperature": lambda **mode: (
             opt_in.forward_logprob_temperature(
-                X, W, labels, deterministic=d, temperature=0.7, **common
+                X, W, labels, **mode, temperature=0.7, **common
             )
         ),
-        "opt_in.prepare_lm_head_loss_temperature": lambda d: (
+        "opt_in.prepare_lm_head_loss_temperature": lambda **mode: (
             opt_in.prepare_lm_head_loss_temperature(
                 X,
                 W,
                 labels,
-                deterministic=d,
+                **mode,
                 entry="logprob",
                 temperature=torch.full((labels.shape[0],), 0.7),
                 **common,
             )
         ),
-        "opt_in.cake_lm_head_nondet_train_logprob_temperature": lambda d: (
+        "opt_in.cake_lm_head_nondet_train_logprob_temperature": lambda **mode: (
             opt_in.cake_lm_head_nondet_train_logprob_temperature(
                 X,
                 W,
                 labels,
-                deterministic=d,
+                **mode,
                 num_valid_rows=int((labels >= 0).sum()),
                 temperature=0.7,
                 **common,
             )
         ),
-        "cake_lm_head_nondet_train_logprob_keep": lambda d: (
+        "cake_lm_head_nondet_train_logprob_keep": lambda **mode: (
             cake_backend.cake_lm_head_nondet_train_logprob_keep(
-                X, W, labels, deterministic=d, **common
+                X, W, labels, **mode, **common
             )
         ),
-        "forward_logprob_keep": lambda d: cake_backend.forward_logprob_keep(
-            X, W, labels, deterministic=d, chunk_size=4, backend="cake"
+        "forward_logprob_keep": lambda **mode: cake_backend.forward_logprob_keep(
+            X, W, labels, **mode, chunk_size=4, backend="cake"
         ),
-        "backward_logprob_keep": lambda d: cake_backend.backward_logprob_keep(
+        "backward_logprob_keep": lambda **mode: cake_backend.backward_logprob_keep(
             X,
             W,
             labels,
             torch.zeros(rows),
             torch.zeros(rows),
             (),
-            deterministic=d,
+            **mode,
             chunk_size=4,
             backend="cake",
         ),
-        "opt_in.forward_logprob": lambda d: opt_in.forward_logprob(
-            X, W, labels, deterministic=d, **common
+        "opt_in.forward_logprob": lambda **mode: opt_in.forward_logprob(
+            X, W, labels, **mode, **common
         ),
-        "opt_in.backward_logprob": lambda d: opt_in.backward_logprob(
+        "opt_in.backward_logprob": lambda **mode: opt_in.backward_logprob(
             X,
             W,
             labels,
             torch.zeros(rows),
             torch.zeros(rows),
-            deterministic=d,
+            **mode,
             **common,
         ),
-        "opt_in.backward_logprob_temperature": lambda d: (
+        "opt_in.backward_logprob_temperature": lambda **mode: (
             opt_in.backward_logprob_temperature(
                 X,
                 W,
                 labels,
                 torch.zeros(rows),
                 torch.zeros(rows),
-                deterministic=d,
+                **mode,
                 temperature=0.7,
                 **common,
             )
@@ -686,7 +687,7 @@ def test_no_entry_takes_a_mode_keyword():
     assert len(calls) == 24
     for call in calls.values():
         with pytest.raises(TypeError, match="deterministic"):
-            call(False)
+            call(deterministic=False)
     functions = {
         f"{module.__name__}.{name}": obj
         for module in (cake_backend, opt_in)
@@ -709,6 +710,20 @@ def test_no_entry_takes_a_mode_keyword():
     for fn in functions.values():
         with pytest.raises(TypeError):
             inspect.signature(fn.forward).bind_partial(deterministic=False)
+
+
+def test_former_mode_entries_run_without_a_mode_keyword():
+    """Every entry of :func:`_former_mode_calls` on the reference backend runs on the host without a mode keyword
+    (the kept-logits forward / backward pair takes the ``cake`` backend only and is left out)."""
+    inp = _host_inputs(8, device=CPU)
+    calls = _former_mode_calls(inp.X, inp.W, inp.labels)
+    ran = []
+    for name, call in calls.items():
+        if name in ("forward_logprob_keep", "backward_logprob_keep"):
+            continue
+        call()  # the reference backend computes on the host
+        ran.append(name)
+    assert len(ran) == 22, ran
 
 
 def _det_counterpart(name: str) -> str:
