@@ -7,39 +7,51 @@ plans or parallel partitions. `kcp` is the suffix for a context-parallel route.
 
 | Training family | Canonical backend / route name |
 | --- | --- |
-| LM head + loss | `cake_lm_head_det_loss` (deterministic); `cake.cake_lm_head_loss` (non-deterministic) |
+| LM head + loss | `cake_lm_head_det_train` (deterministic: module `flashinfer.cake_lm_head_det_train`, backend `flashinfer.experimental.cake.cake_lm_head_det_train`); `cake.cake_lm_head_loss` (non-deterministic) |
 
 ## LM head + loss
 
-| Canonical name | Name before the `det` naming |
+The deterministic module is `flashinfer.cake_lm_head_det_train`; its backend
+package is `flashinfer.experimental.cake.cake_lm_head_det_train`. No entry takes
+a `deterministic` keyword, and `torch.use_deterministic_algorithms(True)` changes
+nothing. The former names are removed without aliases: importing one fails.
+
+| Name | Former names (removed, no alias) |
 | --- | --- |
-| `flashinfer.chunked_lm_head.chunked_lm_head_det_loss` | `chunked_lm_head_loss` (now a dispatcher of the non-deterministic package only, which needs `deterministic=False`; see below) |
-| `flashinfer.chunked_lm_head.chunked_lm_head_det_logprob` | `chunked_lm_head_logprob` (now a non-deterministic dispatcher) |
-| `flashinfer.chunked_lm_head.chunked_lm_head_det_preload` | `chunked_lm_head_preload` (now a non-deterministic dispatcher) |
-| `flashinfer.chunked_lm_head.chunked_lm_head_det_support_logprob` | `chunked_lm_head_support_logprob` (now a non-deterministic dispatcher) |
-| `flashinfer.chunked_lm_head.chunked_lm_head_det_support_kl` | `chunked_lm_head_support_kl` (now a non-deterministic dispatcher) |
-| package `flashinfer.experimental.cake_lm_head_det_loss` | `flashinfer.experimental.cake_lm_head_loss`: removed, no alias |
-| `cake_backend.chunked_lm_head_det_loss` | `chunked_lm_head_loss` (in `cake_backend` and `cake_backend_opt_in`): removed, no alias |
-| `cake_backend.chunked_lm_head_det_logprob` | `chunked_lm_head_logprob` (in `cake_backend` and `cake_backend_opt_in`): removed, no alias |
-| `cake_backend.prepare_lm_head_det_loss` | `prepare_lm_head_loss` (in `cake_backend` and `cake_backend_opt_in`): removed, no alias |
-| `cake_backend.validate_lm_head_det_inputs` | `validate_lm_head_inputs` (in `cake_backend` and `cake_backend_opt_in`): removed, no alias |
-| `cake_backend.lm_head_det_loss_workspace_size` | `lm_head_loss_workspace_size`: removed, no alias |
-| `cake_backend.LmHeadDetLossRunner` | `LmHeadLossRunner` (in `cake_backend` and `cake_backend_opt_in`): removed, no alias |
-| `cake_backend.ChunkedLmHeadDetLossFunction` | `ChunkedLmHeadLossFunction` (in `cake_backend` and `cake_backend_opt_in`): removed, no alias |
-| `cake_backend.ChunkedLmHeadDetLogprobFunction` | `ChunkedLmHeadLogprobFunction` (in `cake_backend` and `cake_backend_opt_in`): removed, no alias |
-| `cake_support.SupportDetLogprobFunction` | `SupportLogprobFunction`: removed, no alias |
-| `cake_support.chunked_lm_head_det_support_logprob` | `chunked_lm_head_support_logprob` (in `cake_support`): removed, no alias |
-| `cake_support.chunked_lm_head_det_support_kl` | `chunked_lm_head_support_kl` (in `cake_support`): removed, no alias |
-| `cake_jit.load_cake_lm_head_det_loss_module` | `load_cake_lm_head_loss_module` (in `cake_jit`, `cake_backend` and `cake_backend_opt_in`): removed, no alias |
+| module `flashinfer.cake_lm_head_det_train` | the deterministic entries of `flashinfer.chunked_lm_head` (that module keeps only the non-deterministic dispatchers) |
+| `flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_loss` | `flashinfer.chunked_lm_head.chunked_lm_head_det_loss`; before the `det` naming `chunked_lm_head_loss` (now a non-deterministic dispatcher) |
+| `flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_logprob` | `flashinfer.chunked_lm_head.chunked_lm_head_det_logprob`; before the `det` naming `chunked_lm_head_logprob` |
+| `flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_preload` | `flashinfer.chunked_lm_head.chunked_lm_head_det_preload`; before the `det` naming `chunked_lm_head_preload` |
+| `flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_support_logprob` | `flashinfer.chunked_lm_head.chunked_lm_head_det_support_logprob`; before the `det` naming `chunked_lm_head_support_logprob` |
+| `flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_support_kl` | `flashinfer.chunked_lm_head.chunked_lm_head_det_support_kl`; before the `det` naming `chunked_lm_head_support_kl` |
+| package `flashinfer.experimental.cake.cake_lm_head_det_train` | `flashinfer.experimental.cake_lm_head_det_loss`; before the `det` naming `flashinfer.experimental.cake_lm_head_loss` |
+| `cake_backend.cake_lm_head_det_train_{loss,logprob,logprob_temperature}` (also in `cake_backend_opt_in`) | `chunked_lm_head_det_{loss,logprob,logprob_temperature}`; before the `det` naming `chunked_lm_head_{loss,logprob}` |
+| `cake_backend.cake_lm_head_det_train_logprob_keep` | `chunked_lm_head_det_logprob_keep` |
+| `cake_backend_opt_in.cake_lm_head_det_train_preload` | `preload` |
+| `cake_backend.CakeLMHeadDet{Loss,Logprob,LogprobTemperature}Function` (also in `cake_backend_opt_in`) | `ChunkedLmHeadDet{Loss,Logprob,LogprobTemperature}Function`; before the `det` naming `ChunkedLmHead{Loss,Logprob}Function` |
+| `cake_backend.CakeLMHeadDetLogprobKeepFunction` | `ChunkedLmHeadDetLogprobKeepFunction` |
+| `cake_support.cake_lm_head_det_train_support_{logprob,kl}` | `chunked_lm_head_det_support_{logprob,kl}`; before the `det` naming `chunked_lm_head_support_{logprob,kl}` |
+| `cake_support.CakeLMHeadDetSupportFunction` (serves both support entries) | `SupportDetLogprobFunction`; before the `det` naming `SupportLogprobFunction` |
+| `cake_backend.prepare_lm_head_det_loss` (internal, kept) | `prepare_lm_head_loss` (in `cake_backend` and `cake_backend_opt_in`) |
+| `cake_backend.validate_lm_head_det_inputs` (internal, kept) | `validate_lm_head_inputs` (in `cake_backend` and `cake_backend_opt_in`) |
+| `cake_backend.lm_head_det_loss_workspace_size` (internal, kept) | `lm_head_loss_workspace_size` |
+| `cake_backend.LmHeadDetLossRunner` (internal, kept) | `LmHeadLossRunner` (in `cake_backend` and `cake_backend_opt_in`) |
+| `cake_jit.load_cake_lm_head_det_loss_module` (internal, kept) | `load_cake_lm_head_loss_module` (in `cake_jit`, `cake_backend` and `cake_backend_opt_in`) |
+
+`cake_support.__all__` lists the two support entries, their autograd class and
+the constants of their contract; its helpers stay module attributes.
 
 The generated sources, programs, kernel symbols and libraries are named
 `cake_lm_head_det_loss_<20 hex>` (`csrc/cake_lm_head_det_loss/`,
 `kernel_cake_lm_head_det_loss_<20 hex>`, `cake_lm_head_det_loss_<20 hex>_<arch>`);
-the 20-hex program digests are unchanged. The `FLASHINFER_CAKE_LM_HEAD_LOSS_*`
-environment variables and the registry's binding profile `abi = lm_head_loss_v1`
-keep their names. Generated CUDA symbols and content-addressed library
-identifiers are build identities; they do not establish the operator's
-determinism contract.
+the 20-hex program digests are unchanged. The registry's binding profile
+`abi = lm_head_loss_v1` keeps its name. Generated CUDA symbols and
+content-addressed library identifiers are build identities; they do not
+establish the operator's determinism contract.
+
+The `FLASHINFER_CAKE_LM_HEAD_LOSS_*` environment variables keep their names.
+Both LM-head facades read them through the private module
+`flashinfer/_cake_lm_head_train_knobs.py`.
 
 ## LM head + loss: non-deterministic package
 

@@ -30,12 +30,10 @@ logp = cake_lm_head_det_train_logprob(X, W, labels, temperature=tau)   # per-tok
 `det`: for fixed inputs, hardware, chunk plan and initial accumulation
 buffers, repeated forward and backward calls give bitwise-identical outputs and
 gradients (not promised across architectures, shapes or chunk plans).  The
-five names without `det` (`chunked_lm_head_loss`, `chunked_lm_head_logprob`,
-`chunked_lm_head_preload`, `chunked_lm_head_support_logprob` and
-`chunked_lm_head_support_kl`) are the non-deterministic package's dispatchers,
-not aliases: they need `deterministic=False` and raise `ValueError` naming
-these entries otherwise.  These entries take no `deterministic` keyword (see
-`docs/training_backend_names.md`).
+entries are `cake_lm_head_det_train_{loss,logprob,preload,support_logprob,support_kl}`
+(the module's `__all__`); the former names fail at import (see
+`docs/training_backend_names.md`).  These entries take no `deterministic`
+keyword.
 
 * `X [T, H]` BF16 hidden states, row-major with any leading stride (`H` a
   multiple of 256; a row pitch that is not a multiple of 16 bytes is copied
@@ -559,7 +557,8 @@ log-probability forward and `logprob_dz` to its backward), `None` selecting the 
 (`cake_backend.compact_rows_default()` and friends return the constants); the
 autograd entries resolve every switch once in the forward.  **The package reads
 no environment variable.**  The `FLASHINFER_CAKE_LM_HEAD_LOSS_*` variables are
-FlashInfer's own A/B knobs and are read by `flashinfer.cake_lm_head_det_train` only: a
+FlashInfer's own A/B knobs, read only by the LM-head facades (through
+`flashinfer/_cake_lm_head_train_knobs.py`): a
 switch keyword left at `None` there falls back to its variable and the resolved
 value is passed down; the two binding-cache variables are read when that
 module is imported and applied through `BINDING_CACHE.configure` when it first
