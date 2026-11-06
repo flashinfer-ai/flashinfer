@@ -1651,7 +1651,7 @@ with its windows: within one window a row's ``y`` and ``rstd`` do not depend on 
 and at a forward edge between programs of different per-row thread groups ``rstd``
 moves by at most two FP32 ulps (three on R200 at the residual H = 6144 edge 1024) and
 ``y`` by at most one BF16 ulp, on up to about 32 % of the rows (measured on B200, GB300
-and R200).  A backward window (``deterministic=False``) runs one of two forms.  The
+and R200).  A backward window runs one of two forms.  The
 single kernel computes ``dx`` row by row (bitwise reproducible, within one BF16 ulp of
 ``max(|dx|, rms(dx))`` of the deterministic backward's ``dx``, not always bitwise equal to
 it) and adds the ``dw`` sums of its CTAs into FP64 column sums in a
@@ -1753,7 +1753,7 @@ with its windows: within one window a row's ``y`` and ``rstd`` do not depend on 
 and at a forward edge between programs of different per-row thread groups ``rstd``
 moves by at most two FP32 ulps (three on R200 at the residual H = 6144 edge 1024) and
 ``y`` by at most one BF16 ulp, on up to about 32 % of the rows (measured on B200, GB300
-and R200).  A backward window (``deterministic=False``) runs one of two forms.  The
+and R200).  A backward window runs one of two forms.  The
 single kernel computes ``dx`` row by row (bitwise reproducible, within one BF16 ulp of
 ``max(|dx|, rms(dx))`` of the deterministic backward's ``dx``, not always bitwise equal to
 it) and adds the ``dw`` sums of its CTAs into FP64 column sums in a
@@ -1941,7 +1941,7 @@ with its windows: within one window a row's ``y`` and ``rstd`` do not depend on 
 and at a forward edge between programs of different per-row thread groups ``rstd``
 moves by at most two FP32 ulps (three on R200 at the residual H = 6144 edge 1024) and
 ``y`` by at most one BF16 ulp, on up to about 32 % of the rows (measured on B200, GB300
-and R200).  A backward window (``deterministic=False``) runs one of two forms.  The
+and R200).  A backward window runs one of two forms.  The
 single kernel computes ``dx`` row by row (bitwise reproducible, within one BF16 ulp of
 ``max(|dx|, rms(dx))`` of the deterministic backward's ``dx``, not always bitwise equal to
 it) and adds the ``dw`` sums of its CTAs into FP64 column sums in a
