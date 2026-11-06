@@ -42,7 +42,8 @@ Training mHC (Cake)
           ``flashinfer.cake_mhc_train_<verb>`` (0.7.3)
         - ``flashinfer.cake_mhc_det_train.cake_mhc_det_train_<verb>`` (the
           entry points and ``*_workspace_bytes`` also at the top level)
-      * - ``flashinfer.cake_mhc_train.CakeMHCTrain{Prepare,Finish}Function``
+      * - ``flashinfer.cake_mhc_train.CakeMHCTrain{Prepare,Finish}Function`` and
+          the top-level ``flashinfer.CakeMHCTrain{Prepare,Finish}Function``
           (0.7.3),
           ``flashinfer.cake_mhc_det_train.CakeMHCDetTrain{Prepare,Finish}Function``
         - ``flashinfer.cake_mhc_det_train.CakeMHCDet{Prepare,Finish}Function``
