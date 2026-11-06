@@ -716,8 +716,10 @@ TRT-LLM Gen path does not. One shared view can be registered for both keys::
     )
     output = MoELayer(config)(activations, weights)
 
-``intermediate_size`` must be a multiple of 128. Fused shared experts and
-LoRA stay out of scope.
+``intermediate_size`` must be a multiple of 128, except for DeepSeekFp8 with
+32x32 scale blocks and MajorK weights, where ``hidden_size`` and
+``intermediate_size`` need only be multiples of 32 (BlockMajorK weights keep
+the 128 requirement). Fused shared experts and LoRA stay out of scope.
 
 .. autosummary::
     :toctree: ../generated

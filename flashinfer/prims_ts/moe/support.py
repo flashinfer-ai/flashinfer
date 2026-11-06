@@ -798,16 +798,20 @@ def _deepseek_fp8_scale_block(
             f"hidden_size and intermediate_size must be multiples of {block}",
             0,
         )
-    if (
-        _enum_eq(
-            kwargs.get("weight_layout", runner.weight_layout), WeightLayout.BlockMajorK
-        )
-        and intermediate_size % 128 != 0
-    ):
+    if block != 128 and _sm_arch_for_device(moe_inputs.hidden_states.device) == 107:
         return (
             False,
-            "BlockMajorK stores FC2 weights in 128-element K blocks, so "
-            f"intermediate_size={intermediate_size} needs the MajorK layout",
+            "DeepSeek FP8 32x32 scale blocks are not validated on SM107 yet",
+            0,
+        )
+    if _enum_eq(
+        kwargs.get("weight_layout", runner.weight_layout), WeightLayout.BlockMajorK
+    ) and (hidden_size % 128 != 0 or intermediate_size % 128 != 0):
+        return (
+            False,
+            "BlockMajorK stores weights in 128-element K blocks, so "
+            f"hidden_size={hidden_size} and intermediate_size={intermediate_size} "
+            "must be multiples of 128 or use the MajorK layout",
             0,
         )
     fc1_rows = 2 * intermediate_size
@@ -815,8 +819,17 @@ def _deepseek_fp8_scale_block(
         ("gemm1_weights_scale", (fc1_rows // block, hidden_size // block)),
         ("gemm2_weights_scale", (hidden_size // block, intermediate_size // block)),
     )
+    num_local_experts = int(runner.num_local_experts)
     for name, shape in expected:
-        actual = tuple(kwargs[name].shape[-2:])
+        scale = kwargs[name]
+        if scale.ndim != 3 or int(scale.shape[0]) != num_local_experts:
+            return (
+                False,
+                f"DeepSeek FP8 {name} must be [num_local_experts={num_local_experts}, "
+                f"rows / {block}, K / {block}], got {tuple(scale.shape)}",
+                0,
+            )
+        actual = tuple(scale.shape[-2:])
         if actual != shape:
             return (
                 False,

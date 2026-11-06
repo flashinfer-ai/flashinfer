@@ -2802,7 +2802,8 @@ class Fp8BlockScaleStagedMoeLauncher : public StagedMoeLauncher {
           << "Staged DeepSeek FP8 MoE: hidden_states_scale must be float32.";
       TVM_FFI_ICHECK_EQ(hidden_states_scale.ndim(), 2)
           << "Staged DeepSeek FP8 MoE: hidden_states_scale must be 2D.";
-      TVM_FFI_ICHECK(sf_block == 128 || sf_block == 32)
+      TVM_FFI_ICHECK((sf_block == 128 || sf_block == 32) &&
+                     hidden_states_scale.size(0) * sf_block == args->hidden_size)
           << "Staged DeepSeek FP8 MoE: hidden_states_scale dim0 must be hidden_size / 128 or "
              "hidden_size / 32, got "
           << hidden_states_scale.size(0) << " for hidden_size " << args->hidden_size << ".";

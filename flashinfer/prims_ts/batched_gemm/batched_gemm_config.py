@@ -729,8 +729,8 @@ class BatchedGemmConfig:
 
     # DeepSeek FP8: per-K-tile FP32 dequant scales loaded into SMEM via
     # cp.async and applied as ffma2 in the epilogue, BEFORE the FP32 output cast.
-    # Requires E4M3 MMA with tile_k equal to the scale block and is mutually
-    # exclusive with MX/NVFP4 block scaling and per-token SF.
+    # Requires E4M3 MMA with tile_k=128 (the scale block, 128 or 32, divides
+    # it) and is mutually exclusive with MX/NVFP4 block scaling and per-token SF.
     use_deepseek_fp8: int = 0
     deepseek_fp8_block_size: int = 128
     """Side of the square DeepSeek FP8 scale block, in elements. ``128`` or ``32``.

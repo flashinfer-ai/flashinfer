@@ -2717,15 +2717,22 @@ class GmemCResource(MemoryResource):
         warp_in_epi4,
         warpgroup_idx,
     ):
-        # The first warp of each scale row group stores that group's scale.
-        warps_per_group = (
-            self.cfg.warp_layout.num_epilogue_warps
-            // self.cfg.dsfp8_row_groups_per_tile
-        )
-        warp_in_epi = warpgroup_idx * Int32(4) + warp_in_epi4
-        should_store = ((warp_in_epi % Int32(warps_per_group)) == Int32(0)) & (
-            (lane_id // Int32(4)) == Int32(0)
-        )
+        lane_stores = (lane_id // Int32(4)) == Int32(0)
+        if cutlass.const_expr(self.cfg.has_deepseek_fp8_two_epilogue):
+            # The warpgroups split the tile rows: the first warp of each scale
+            # row group stores that group's scale.
+            warps_per_group = (
+                self.cfg.warp_layout.num_epilogue_warps
+                // self.cfg.dsfp8_row_groups_per_tile
+            )
+            warp_in_epi = warpgroup_idx * Int32(4) + warp_in_epi4
+            should_store = (
+                (warp_in_epi % Int32(warps_per_group)) == Int32(0)
+            ) & lane_stores
+        else:
+            # The warpgroups split the tile columns: warp 0 of each stores the
+            # scale of its own columns.
+            should_store = (warp_in_epi4 == Int32(0)) & lane_stores
         if should_store:
             if output_in_bounds:
                 if cutlass.const_expr(self.cfg.use_tma_oob_opt):
