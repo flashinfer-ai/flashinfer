@@ -109,7 +109,7 @@ DET_PACKAGE = "flashinfer.experimental.cake_gdn_det_train_kcp"
 DET_API = (
     "flashinfer.cake_gdn_det_train_kcp"  # the deterministic route's public objects
 )
-FACADE = "flashinfer.cake_gdn_train_kcp"  # the mode-dispatching facade (deterministic=False -> this package)
+FACADE = "flashinfer.cake_gdn_train_kcp"  # this package's facade (takes deterministic=False only)
 
 
 @pytest.fixture(autouse=True, scope="module")

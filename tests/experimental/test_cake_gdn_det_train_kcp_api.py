@@ -12,7 +12,7 @@ limitations under the License.
 
 CPU tests of the public surface of the context-parallel packed GDN training route: the options validator
 (``cake_gdn_det_train_kcp.cake_options``), the keyword-only signatures, the facade ``flashinfer.cake_gdn_det_train_kcp`` (the contract names),
-the package hygiene rules (no environment variable, no ``cake_kda_train`` import, the host module's import allow-list)
+the package hygiene rules (no environment variable, no KDA package import, the host module's import allow-list)
 and the host tables built on the CPU for the correctness rows' partitions.  No kernel runs here.
 """
 
@@ -591,7 +591,7 @@ def test_facade_exposes_the_contract_names_keyword_only() -> None:
     assert facade.PartitionDetKcp is pkg.PartitionDetKcp
     assert facade.RecomputeHandleDetKcp is pkg.RecomputeHandleDetKcp
     assert facade.SavedDetKcp is pkg.SavedDetKcp
-    assert facade.DEFAULT_SCALE == 128**-0.5 == pkg.SCALE
+    assert facade.DEFAULT_SCALE == 128**-0.5 == _mod("cake_kcp").SCALE
     with pytest.raises(AttributeError):
         facade.no_such_name  # noqa: B018
 
@@ -617,35 +617,7 @@ def test_package_init_re_exports_the_route() -> None:
         assert n in pkg.__all__
 
 
-# The pre-rename names: legacy facade name -> canonical facade name, legacy package-only name -> canonical name,
-# and the legacy package's submodules.
-LEGACY_FACADE_NAMES = {
-    "kcp_partition": "partition_det_kcp",
-    "build_kcp_context": "build_context_det_kcp",
-    "chunk_gdn_kcp": "chunk_gdn_det_kcp",
-    "chunk_gdn_kcp_fwd": "chunk_gdn_det_fwd_kcp",
-    "chunk_gdn_kcp_bwd": "chunk_gdn_det_bwd_kcp",
-    "gdn_kcp_workspace_bytes": "gdn_det_workspace_bytes_kcp",
-    "gdn_kcp_saved_bytes": "gdn_det_saved_bytes_kcp",
-    "gdn_kcp_comm_bytes": "gdn_det_comm_bytes_kcp",
-    "is_gdn_train_supported": "is_gdn_det_train_kcp_supported",
-    "KcpOptions": "OptionsDetKcp",
-    "KcpContext": "ContextDetKcp",
-    "KcpPartition": "PartitionDetKcp",
-    "KcpRecomputeHandle": "RecomputeHandleDetKcp",
-    "KcpSaved": "SavedDetKcp",
-    "KcpWorkspace": "WorkspaceDetKcp",
-}
-LEGACY_PACKAGE_NAMES = {
-    **{
-        k: v
-        for k, v in LEGACY_FACADE_NAMES.items()
-        if k not in ("is_gdn_train_supported",)
-    },
-    "ChunkGDNKcpFunction": "ChunkGDNDetFunctionKcp",
-    "KcpCall": "CallDetKcp",
-    "KcpFragment": "FragmentDetKcp",
-}
+# The pre-rename names, removed without aliases: the legacy modules and every legacy spelling of a det object.
 LEGACY_SUBMODULES = (
     "cake_backend",
     "cake_build",
@@ -657,63 +629,123 @@ LEGACY_SUBMODULES = (
     "cake_options",
     "cake_tables",
 )
+LEGACY_MODULES = (
+    "flashinfer.gdn_train",
+    "flashinfer.experimental.cake_gdn_train",
+    *(f"flashinfer.experimental.cake_gdn_train.{sub}" for sub in LEGACY_SUBMODULES),
+)
+LEGACY_NAMES = (
+    "kcp_partition",
+    "build_kcp_context",
+    "chunk_gdn_kcp",
+    "chunk_gdn_kcp_fwd",
+    "chunk_gdn_kcp_bwd",
+    "gdn_kcp_workspace_bytes",
+    "gdn_kcp_saved_bytes",
+    "gdn_kcp_comm_bytes",
+    "gdn_kcp_saved_layout",
+    "gdn_kcp_workspace_layout",
+    "is_gdn_train_supported",
+    "KcpOptions",
+    "KcpContext",
+    "KcpPartition",
+    "KcpRecomputeHandle",
+    "KcpSaved",
+    "KcpWorkspace",
+    "KcpCall",
+    "KcpFragment",
+    "ChunkGDNKcpFunction",
+)
+# The package-level names without ``det``: they stay in their modules and are not exported by the package.
+DET_FREE_NAMES = (
+    "KCP_SAVED_VERSION",
+    "LAST_CALL",
+    "PROGRAMS",
+    "SCALE",
+    "Backend",
+    "FakeBackend",
+    "KernelBackend",
+    "get_backend",
+    "graph_cache_clear",
+    "make_options",
+    "set_backend",
+    "validate_heads",
+    "validate_ring",
+)
 
 
-def test_legacy_names_are_aliases_of_the_canonical_objects() -> None:
-    """``flashinfer.gdn_train`` and ``flashinfer.experimental.cake_gdn_train`` are compatibility paths: every legacy
-    name is the very object of its canonical name, and every legacy submodule is the canonical module object."""
+def test_legacy_names_are_removed() -> None:
+    """``flashinfer.gdn_train`` and ``flashinfer.experimental.cake_gdn_train`` (and its modules) do not import, and no
+    module of the deterministic route binds a pre-rename name."""
+    for name in LEGACY_MODULES:
+        with pytest.raises(ModuleNotFoundError):
+            importlib.import_module(name)
     facade = importlib.import_module("flashinfer.cake_gdn_det_train_kcp")
-    legacy = importlib.import_module("flashinfer.gdn_train")
-    assert set(legacy.__all__) == {
-        n for n in LEGACY_FACADE_NAMES if n not in ("KcpSaved", "KcpWorkspace")
-    }
-    for old, new in LEGACY_FACADE_NAMES.items():
-        assert getattr(legacy, old) is getattr(facade, new), old
-        assert old not in facade.__all__, old
-    assert legacy.DEFAULT_SCALE == facade.DEFAULT_SCALE
-    with pytest.raises(AttributeError):
-        legacy.no_such_name  # noqa: B018
+    modules = [facade, _mod()] + [_mod(sub) for sub in (*LEGACY_SUBMODULES, "cake_l2n")]
+    for module in modules:
+        for old in LEGACY_NAMES:
+            assert not hasattr(module, old), (module.__name__, old)
 
-    pkg = importlib.import_module(PACKAGE)
-    legacy_pkg = importlib.import_module("flashinfer.experimental.cake_gdn_train")
-    # star-import of the legacy package binds the canonical names and the pre-rename ones
-    assert set(legacy_pkg.__all__) == set(pkg.__all__) | set(LEGACY_PACKAGE_NAMES)
-    assert len(legacy_pkg.__all__) == len(set(legacy_pkg.__all__))
-    for old in LEGACY_PACKAGE_NAMES:
-        assert old in legacy_pkg.__all__, old
-    for n in pkg.__all__:
-        assert getattr(legacy_pkg, n) is getattr(pkg, n), n
-    for old, new in LEGACY_PACKAGE_NAMES.items():
-        assert old not in pkg.__all__, old
-        assert getattr(pkg, old) is getattr(pkg, new), old
-        assert getattr(legacy_pkg, old) is getattr(pkg, new), old
-    for sub in LEGACY_SUBMODULES:
-        canonical = importlib.import_module(f"{PACKAGE}.{sub}")
-        # bound as an attribute by the legacy package's import, before any import of the legacy submodule path
-        assert getattr(legacy_pkg, sub) is canonical, sub
-        assert (
-            importlib.import_module(f"flashinfer.experimental.cake_gdn_train.{sub}")
-            is canonical
-        ), sub
-    # the defining modules keep the old names as aliases too (``from <old path>.cake_kcp_plan import KcpContext``)
-    plan = importlib.import_module(
-        "flashinfer.experimental.cake_gdn_train.cake_kcp_plan"
-    )
-    assert plan.KcpContext is plan.ContextDetKcp is pkg.ContextDetKcp
-    assert plan.build_kcp_context is plan.build_context_det_kcp
-    assert plan.kcp_partition is plan.partition_det_kcp
-    kcp = importlib.import_module(f"{PACKAGE}.cake_kcp")
-    assert kcp.chunk_gdn_kcp is kcp.chunk_gdn_det_kcp
-    gb = importlib.import_module(f"{PACKAGE}.cake_bytes")
-    assert gb.gdn_kcp_saved_layout is gb.gdn_det_saved_layout_kcp
-    assert gb.gdn_kcp_workspace_layout is gb.gdn_det_workspace_layout_kcp
-    assert kcp.KcpOptions is kcp.OptionsDetKcp is _mod("cake_options").KcpOptions
-    assert pkg.ContextDetKcp.__qualname__ == "ContextDetKcp"
-    assert pkg.chunk_gdn_det_kcp.__name__ == "chunk_gdn_det_kcp"
+
+def test_package_exports_the_det_names_only() -> None:
+    """The package's ``__all__`` holds the names that carry ``det`` only, each bound; the constants and backend
+    controls without ``det`` are neither exported nor bound by the package, and are read from their modules."""
+    pkg = _mod()
+    assert pkg.__all__ and [n for n in pkg.__all__ if "det" not in n.lower()] == []
+    assert all(hasattr(pkg, n) for n in pkg.__all__)
+    holders = (_mod("cake_kcp"), _mod("cake_options"))
+    for n in DET_FREE_NAMES:
+        assert n not in pkg.__all__ and not hasattr(pkg, n), n
+        assert any(hasattr(m, n) for m in holders), n
+
+
+def test_det_entries_take_no_deterministic_keyword() -> None:
+    """The det entries of the facade and the package take no ``deterministic`` keyword: any value is a
+    ``TypeError``; the same call without it runs (fake backend, CPU)."""
+    facade = importlib.import_module("flashinfer.cake_gdn_det_train_kcp")
+    pkg = _mod()
+    cpu = torch.device("cpu")
+    cu = torch.tensor([0, 300], dtype=torch.int64)
+    part = pkg.partition_det_kcp(cu, 1)
+    ctx = pkg.build_context_det_kcp(part, None, 0, cpu)
+    T, H_qk, HV = 300, 1, 1
+    q = torch.zeros(T, H_qk, 128, dtype=torch.bfloat16)
+    v = torch.zeros(T, HV, 128, dtype=torch.bfloat16)
+    g = torch.zeros(T, HV)
+    beta = torch.full((T, HV), 0.5)
+    qkv = torch.zeros(T, (2 * H_qk + HV) * 128, dtype=torch.bfloat16)
+    calls = {
+        "partition_det_kcp": lambda f, **kw: f(cu, 1, **kw),
+        "build_context_det_kcp": lambda f, **kw: f(part, None, 0, cpu, **kw),
+        "chunk_gdn_det_kcp": lambda f, **kw: f(
+            q, q, v, g, beta, ctx, backend="fake", **kw
+        ),
+        "chunk_gdn_det_fwd_kcp": lambda f, **kw: f(
+            q, q, v, g, beta, ctx, backend="fake", **kw
+        ),
+        "chunk_gdn_det_bwd_kcp": lambda f, **kw: f(
+            q, q, v, g, beta, ctx, v, backend="fake", **kw
+        ),
+        "gdn_det_workspace_bytes_kcp": lambda f, **kw: f(ctx, H_qk=H_qk, HV=HV, **kw),
+        "gdn_det_saved_bytes_kcp": lambda f, **kw: f(ctx, H_qk=H_qk, HV=HV, **kw),
+        "gdn_det_comm_bytes_kcp": lambda f, **kw: f(ctx, H_qk=H_qk, HV=HV, **kw),
+        "packed_qkv_views_det_kcp": lambda f, **kw: f(qkv, H_qk=H_qk, HV=HV, **kw),
+    }
+    for name, call in calls.items():
+        for fn in (getattr(facade, name), getattr(pkg, name)):
+            assert "deterministic" not in inspect.signature(fn).parameters, name
+            call(fn)
+            for value in (True, False, None):
+                with pytest.raises(TypeError, match="deterministic"):
+                    call(fn, deterministic=value)
+    fn = facade.is_gdn_det_train_kcp_supported
+    assert "deterministic" not in inspect.signature(fn).parameters
+    with pytest.raises(TypeError, match="deterministic"):
+        fn(None, deterministic=True)
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# package hygiene (no cake_kda_train import; no os.environ; the host module's import allow-list)
+# package hygiene (no KDA package import; no os.environ; the host module's import allow-list)
 
 
 def _package_sources() -> list[pathlib.Path]:
@@ -729,25 +761,20 @@ def _facade_source() -> pathlib.Path:
     ).resolve()
 
 
-def test_package_never_imports_cake_kda_train() -> None:
+def test_package_never_imports_a_kda_package() -> None:
     for path in _package_sources() + [_facade_source()]:
         tree = ast.parse(path.read_text())
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for a in node.names:
-                    assert "cake_kda_train" not in a.name, (path.name, a.name)
+                    assert "cake_kda" not in a.name, (path.name, a.name)
             elif isinstance(node, ast.ImportFrom):
-                assert "cake_kda_train" not in (node.module or ""), (
+                assert "cake_kda" not in (node.module or ""), (
                     path.name,
                     node.module,
                 )
                 for a in node.names:
-                    assert a.name != "cake_kda_train", (path.name, a.name)
-        assert (
-            "cake_kda_train"
-            not in path.read_text().replace("Provenance", "").split("import os")[0]
-            or True
-        )
+                    assert "cake_kda" not in a.name, (path.name, a.name)
 
 
 def test_package_reads_no_environment_variable() -> None:
