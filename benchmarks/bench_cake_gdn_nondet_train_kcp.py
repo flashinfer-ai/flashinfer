@@ -22,10 +22,10 @@ Arms (``--arms``; every one on the same packed batch, the same partition and the
 
 * ``det``: the deterministic route, the entries of ``flashinfer.cake_gdn_det_train_kcp`` called directly, with its
   own partition and context;
-* ``nondet``: ``flashinfer.cake_gdn_train_kcp`` with ``deterministic=False`` (the package
-  ``flashinfer.experimental.cake_gdn_train_kcp``), default options;
-* ``det_graph`` / ``nondet_graph``: ``det`` / ``nondet`` with a caller-owned workspace (``WorkspaceDetKcp`` /
-  ``WorkspaceKcp``, one per arm and configuration) and ``graph="replay"``: the GDN call's steady state replays a captured
+* ``nondet``: the non-deterministic route, the entries of ``flashinfer.cake_gdn_nondet_train_kcp`` (the package
+  ``flashinfer.experimental.cake.cake_gdn_nondet_train_kcp``), default options;
+* ``det_graph`` / ``nondet_graph``: ``det`` / ``nondet`` with a caller-owned workspace (``CakeGDNDetKcpWorkspace`` /
+  ``CakeGDNNondetKcpWorkspace``, one per arm and configuration) and ``graph="replay"``: the GDN call's steady state replays a captured
   CUDA graph (the package captures only with a caller-owned workspace); the convolution stays eager; no ``B3h`` form
   (a recompute handle needs ``graph="off"``); the graphs are released after each configuration;
 * ``nondet_graph`` runs on a context built with ``graph_replay=True`` (the package's plan for graph replay);
@@ -55,7 +55,7 @@ recompute-handle form (``B3h``).
 Boundaries (``--boundaries``): ``B1`` the module forward with autograd recording; ``B2`` forward + backward;
 ``B3`` ``torch.utils.checkpoint(use_reentrant=False)`` forward + recompute + backward (``2 x forward + backward``)
 without a recompute handle (the deterministic benchmark's B3); ``B3h`` the same with a recompute handle
-(``RecomputeHandleDetKcp`` on ``det``, ``RecomputeHandleKcp`` on the non-deterministic arms): one handle per step,
+(``CakeGDNDetKcpRecomputeHandle`` on ``det``, ``CakeGDNNondetKcpRecomputeHandle`` on the non-deterministic arms): one handle per step,
 created outside the checkpoint and passed as an argument of the checkpointed function, shared by the convolution
 (key ``"conv"``) and the GDN call (key ``"gdn"``).
 
@@ -92,11 +92,11 @@ and keeps its fragments.  No environment variable selects anything; the FlashInf
 Examples::
 
     # CP8 on one 8-GPU node
-    torchrun --nproc_per_node 8 benchmarks/bench_cake_gdn_train_kcp.py --rows P1,P2,P3,P4,P5 --out-dir kcp_cp8
+    torchrun --nproc_per_node 8 benchmarks/bench_cake_gdn_nondet_train_kcp.py --rows P1,P2,P3,P4,P5 --out-dir kcp_cp8
 
     # CP8 on two 4-GPU nodes (one torchrun per node; HEAD = the first node of the allocation)
     srun -N 2 --ntasks-per-node 1 bash -c 'torchrun --nnodes 2 --nproc_per_node 4 --rdzv_backend c10d \\
-        --rdzv_endpoint "$HEAD:29500" --rdzv_id "$SLURM_JOB_ID" benchmarks/bench_cake_gdn_train_kcp.py \\
+        --rdzv_endpoint "$HEAD:29500" --rdzv_id "$SLURM_JOB_ID" benchmarks/bench_cake_gdn_nondet_train_kcp.py \\
         --rows P2,P4 --layouts C,Z,D --out-dir kcp_cp8'
 """
 
@@ -246,47 +246,46 @@ def _query(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
 
 
 class Route:
-    """The entry points of one numerical route.  ``det``: the entries of ``flashinfer.cake_gdn_det_train_kcp`` (called
-    directly; they take no mode keyword); ``nondet``: ``flashinfer.cake_gdn_train_kcp`` with ``deterministic=False``
-    (the package ``flashinfer.experimental.cake_gdn_train_kcp``)."""
+    """The entry points of one numerical route.  ``det``: the entries of ``flashinfer.cake_gdn_det_train_kcp``;
+    ``nondet``: the entries of ``flashinfer.cake_gdn_nondet_train_kcp`` (the package
+    ``flashinfer.experimental.cake.cake_gdn_nondet_train_kcp``).  The mode is in the module name: no entry takes a
+    mode keyword."""
 
     def __init__(self, kind: str) -> None:
         self.kind = kind
         if kind == "det":
             self.api = importlib.import_module("flashinfer.cake_gdn_det_train_kcp")
             self.pkg = importlib.import_module(
-                "flashinfer.experimental.cake_gdn_det_train_kcp"
+                "flashinfer.experimental.cake.cake_gdn_det_train_kcp"
             )
-            self.mode: dict[str, Any] = {}
-            self._partition = self.api.partition_det_kcp
-            self._context = self.api.build_context_det_kcp
-            self._chunk = self.api.chunk_gdn_det_kcp
-            self._workspace = self.api.gdn_det_workspace_bytes_kcp
-            self._saved = self.api.gdn_det_saved_bytes_kcp
-            self._comm = self.api.gdn_det_comm_bytes_kcp
-            self.handle_name = "RecomputeHandleDetKcp"
-            self.workspace_name = "WorkspaceDetKcp"
+            self._partition = self.api.cake_gdn_det_train_kcp_partition
+            self._context = self.api.cake_gdn_det_train_kcp_build_context
+            self._chunk = self.api.cake_gdn_det_kcp
+            self._workspace = self.api.cake_gdn_det_train_kcp_workspace_bytes
+            self._saved = self.api.cake_gdn_det_train_kcp_saved_bytes
+            self._comm = self.api.cake_gdn_det_train_kcp_comm_bytes
+            self.handle_name = "CakeGDNDetKcpRecomputeHandle"
+            self.workspace_name = "CakeGDNDetKcpWorkspace"
         else:
-            self.api = importlib.import_module("flashinfer.cake_gdn_train_kcp")
+            self.api = importlib.import_module("flashinfer.cake_gdn_nondet_train_kcp")
             self.pkg = importlib.import_module(
-                "flashinfer.experimental.cake_gdn_train_kcp"
+                "flashinfer.experimental.cake.cake_gdn_nondet_train_kcp"
             )
-            self.mode = {"deterministic": False}
-            self._partition = self.api.partition_kcp
-            self._context = self.api.build_context_kcp
-            self._chunk = self.api.chunk_gdn_kcp
-            self._workspace = self.api.gdn_workspace_bytes_kcp
-            self._saved = self.api.gdn_saved_bytes_kcp
-            self._comm = self.api.gdn_comm_bytes_kcp
-            self.handle_name = "RecomputeHandleKcp"
-            self.workspace_name = "WorkspaceKcp"
+            self._partition = self.api.cake_gdn_nondet_train_kcp_partition
+            self._context = self.api.cake_gdn_nondet_train_kcp_build_context
+            self._chunk = self.api.cake_gdn_nondet_kcp
+            self._workspace = self.api.cake_gdn_nondet_train_kcp_workspace_bytes
+            self._saved = self.api.cake_gdn_nondet_train_kcp_saved_bytes
+            self._comm = self.api.cake_gdn_nondet_train_kcp_comm_bytes
+            self.handle_name = "CakeGDNNondetKcpRecomputeHandle"
+            self.workspace_name = "CakeGDNNondetKcpWorkspace"
         # the host module of the route's package: its ``LAST_CALL`` records and ``graph_cache_clear`` live there
         self.kcp = importlib.import_module(f"{self.pkg.__name__}.cake_kcp")
 
     def partition(
         self, cu: torch.Tensor, world: int, layout: str, cut_points: Any
     ) -> Any:
-        kw = dict(self.mode)
+        kw: dict[str, Any] = {}
         if cut_points is not None:
             kw["cut_points"] = cut_points
         return self._partition(cu, world, layout, **kw)
@@ -302,10 +301,10 @@ class Route:
         if (
             p_rule is not None
         ):  # the package's own context builder: the facade selects no plan rule
-            return self.pkg.cake_kcp_plan.build_context_kcp(
+            return self.pkg.cake_kcp_plan.cake_gdn_nondet_train_kcp_build_context(
                 part, dist.group.WORLD, rank, device, WIDTH, p_rule=p_rule
             )
-        kw = dict(self.mode)
+        kw: dict[str, Any] = {}
         if graph_replay:  # the facade's hint for contexts used with graph="replay"
             kw["graph_replay"] = True
         return self._context(
@@ -325,7 +324,7 @@ class Route:
         handle: Any,
         workspace: Any = None,
     ) -> torch.Tensor:
-        kw = dict(self.mode)
+        kw: dict[str, Any] = {}
         if options is not None:
             kw["options"] = options
         if handle is not None:
@@ -336,40 +335,31 @@ class Route:
 
     def workspace(self, ctx: Any, heads: tuple[int, int], device: torch.device) -> Any:
         """A caller-owned workspace of this route for ``ctx`` (the graph arms)."""
-        cls = getattr(self.api, self.workspace_name, None) or getattr(
-            self.pkg, self.workspace_name
-        )
+        cls = getattr(self.api, self.workspace_name)
         return cls(ctx, heads[0], heads[1], device)
 
     def graph_cache_clear(self) -> None:
         """Release this route's captured graphs (before the next configuration and the process group's end)."""
-        fn = getattr(self.kcp, "graph_cache_clear", None)
-        if fn is not None:
-            fn()
+        self.kcp.graph_cache_clear()
 
     def handle_class(self) -> tuple[Optional[Callable[[], Any]], Optional[str]]:
-        try:
-            return getattr(self.api, self.handle_name), None
-        except AttributeError as exc:
-            return None, f"{self.api.__name__} has no {self.handle_name} ({exc})"
+        """The route's recompute-handle class (a public type of its entry module) and no reason."""
+        return getattr(self.api, self.handle_name), None
 
     def bytes(
         self, ctx: Any, heads: dict[str, int], channels: int, save_mode: str
     ) -> dict[str, Any]:
         return {
-            "workspace": _query(self._workspace, ctx, **heads, **self.mode),
-            "saved": _query(
-                self._saved, ctx, **heads, save_mode=save_mode, **self.mode
-            ),
+            "workspace": _query(self._workspace, ctx, **heads),
+            "saved": _query(self._saved, ctx, **heads, save_mode=save_mode),
             "saved_handle": _query(
                 self._saved,
                 ctx,
                 **heads,
                 save_mode="light",
                 save_transfer=False,
-                **self.mode,
             ),
-            "comm": _query(self._comm, ctx, **heads, C=channels, **self.mode),
+            "comm": _query(self._comm, ctx, **heads, C=channels),
         }
 
     def modules(self) -> dict[str, Any]:
@@ -1824,11 +1814,6 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    if torch.are_deterministic_algorithms_enabled():
-        raise SystemExit(
-            "torch deterministic algorithms are enabled: this bench measures with them off (they can change or "
-            "refuse the kernels of other arms); neither GDN route depends on them"
-        )
     rank, world, device = _init()
     arms = args.arm_list
     routes = {
@@ -1847,7 +1832,7 @@ def main() -> int:
     if rank == 0:
         out_dir.mkdir(parents=True, exist_ok=True)
         print(
-            f"bench_cake_gdn_train_kcp: {env['device']} x{world} (sm_count {env['sm_count']}, torch {env['torch']}, "
+            f"bench_cake_gdn_nondet_train_kcp: {env['device']} x{world} (sm_count {env['sm_count']}, torch {env['torch']}, "
             f"CUDA {env['cuda']}) hosts {env['host_map']}",
             flush=True,
         )

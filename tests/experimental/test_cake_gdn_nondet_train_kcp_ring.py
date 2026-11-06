@@ -13,8 +13,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-CPU test of the ring exchange of the non-deterministic KCP GDN package (``exchange="ring"``, every compute entry
-called with ``deterministic=False``) under both launch schedules: the
+CPU test of the ring exchange of the non-deterministic KCP GDN package (``exchange="ring"``) under both launch
+schedules: the
 ``"overlap"`` schedule (test knob; the document-start tape walk issued under the first hop) must publish the same
 bits as the shipped ``"wait_first"`` schedule -- forward output and every gradient, on every rank, with the norm off
 and with ``use_qk_l2norm_in_kernel``.  Two partitions of a four-rank group: one whose documents cross rank boundaries
@@ -38,7 +38,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-PACKAGE = "flashinfer.experimental.cake_gdn_train_kcp"
+PACKAGE = "flashinfer.experimental.cake.cake_gdn_nondet_train_kcp"
 W = 4
 H_QK, HV = 2, 4
 # contiguous layout: 256 tokens per rank
@@ -56,7 +56,7 @@ def _mod(sub: str):
     try:
         from tests.test_helpers.cake_package import cake_package
 
-        return cake_package("cake_gdn_train_kcp", sub)
+        return cake_package("cake_gdn_nondet_train_kcp", sub)
     except (ImportError, KeyError):
         return importlib.import_module(f"{PACKAGE}.{sub}")
 
@@ -101,18 +101,15 @@ def _local(part, cu: list[int], rank: int, glob: dict[str, torch.Tensor]):
 def _pass(kcp, ctx, ops, **o) -> tuple[dict[str, torch.Tensor], list[str]]:
     """Forward + backward (saved set) of one rank; the published tensors and the forward's launch sequence."""
     args = (ops["q"], ops["k"], ops["v"], ops["g"], ops["beta"])
-    out, saved = kcp.chunk_gdn_fwd_kcp(
-        *args, ctx, backend="fake", deterministic=False, **o
-    )
+    out, saved = kcp.cake_gdn_nondet_train_kcp_forward(*args, ctx, backend="fake", **o)
     seq = list(kcp.LAST_CALL["fwd"]["sequence"])
-    dq, dk, dv, dbeta, dg = kcp.chunk_gdn_bwd_kcp(
+    dq, dk, dv, dbeta, dg = kcp.cake_gdn_nondet_train_kcp_backward(
         *args,
         ctx,
         ops["dout"],
         saved=saved,
         backend="fake",
         **o,
-        deterministic=False,
     )
     return {"out": out, "dq": dq, "dk": dk, "dv": dv, "dbeta": dbeta, "dg": dg}, seq
 
@@ -120,7 +117,7 @@ def _pass(kcp, ctx, ops, **o) -> tuple[dict[str, torch.Tensor], list[str]]:
 def _few_cpu_threads() -> None:
     """Each rank process runs the CPU emulation's many small ops.  On a host with hundreds of CPUs, torch's default
     intra-op pool (one per rank) and the oneDNN matmul path (its own pool, which torch.set_num_threads does not resize)
-    spend far more time synchronizing threads than computing (see ``test_cake_gdn_train_kcp.py``), so every rank runs
+    spend far more time synchronizing threads than computing (see ``test_cake_gdn_nondet_train_kcp.py``), so every rank runs
     with at most 2 threads (8 for the four ranks) and oneDNN off; the rank process ends with the test."""
     torch.set_num_threads(min(torch.get_num_threads(), 2))
     torch.backends.mkldnn.enabled = False
@@ -134,8 +131,12 @@ def _rank(rank: int, init_file: str, cu: list[int], crossing: bool) -> None:
         _few_cpu_threads()
         torch.set_flush_denormal(False)
         kcp, plan, l2n_ref = _mod("cake_kcp"), _mod("cake_kcp_plan"), _mod("cake_l2n")
-        part = plan.partition_kcp(torch.tensor(cu, dtype=torch.int64), W, "contiguous")
-        ctx = plan.build_context_kcp(part, dist.group.WORLD, rank, torch.device("cpu"))
+        part = plan.cake_gdn_nondet_train_kcp_partition(
+            torch.tensor(cu, dtype=torch.int64), W, "contiguous"
+        )
+        ctx = plan.cake_gdn_nondet_train_kcp_build_context(
+            part, dist.group.WORLD, rank, torch.device("cpu")
+        )
         assert int(ctx.n_d_max) - 1 <= kcp.RING_MAX_HOPS, int(ctx.n_d_max)
         if crossing:
             assert int(ctx.N_out) > 0 and int(ctx.n_d_max) == 3, (
@@ -210,10 +211,12 @@ def _rank_full(rank: int, init_file: str) -> None:
         _few_cpu_threads()
         torch.set_flush_denormal(False)
         kcp, plan, l2n_ref = _mod("cake_kcp"), _mod("cake_kcp_plan"), _mod("cake_l2n")
-        part = plan.partition_kcp(
+        part = plan.cake_gdn_nondet_train_kcp_partition(
             torch.tensor(FULL_P2, dtype=torch.int64), W, "contiguous"
         )
-        ctx = plan.build_context_kcp(part, dist.group.WORLD, rank, torch.device("cpu"))
+        ctx = plan.cake_gdn_nondet_train_kcp_build_context(
+            part, dist.group.WORLD, rank, torch.device("cpu")
+        )
         assert int(ctx.N_out) > 0 and int(ctx.n_d_max) - 1 <= kcp.RING_MAX_HOPS
         raw = _local(part, FULL_P2, rank, _global_inputs(FULL_P2))
         hat = dict(raw)
@@ -237,12 +240,11 @@ def _rank_full(rank: int, init_file: str) -> None:
                         "segments": 2,
                         "use_qk_l2norm_in_kernel": l2n,
                     }
-                    _, saved = kcp.chunk_gdn_fwd_kcp(
+                    _, saved = kcp.cake_gdn_nondet_train_kcp_forward(
                         *(ops[n] for n in ("q", "k", "v", "g", "beta")),
                         ctx,
                         backend="fake",
                         save_mode="full",
-                        deterministic=False,
                         **base,
                     )
                     assert saved.P == 2 and saved.M_seg is not None, (rank, exchange)

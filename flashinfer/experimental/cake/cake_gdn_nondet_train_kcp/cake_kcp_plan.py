@@ -18,7 +18,7 @@ Provenance: package-local copy of ``flashinfer/experimental/cake_kda_train/cake_
 commit 13d7fcf4041635f5b7f573bb0dbab23570ae1034 (sha256 0f2d8b06bbea49df37b043fba3026a06799f0a0cba09d697e490d02bb747dfbf),
 adapted for the GDN KCP route: the head count of every per-head state is the value-head count ``HV``
 (``H := HV``), the plan rule is a keyword-only argument (no environment variable), and the byte queries live
-in ``cake_bytes`` (GDN saved set and exchange formulas).  ``cake_gdn_train_kcp`` never imports a KDA package;
+in ``cake_bytes`` (GDN saved set and exchange formulas).  ``cake_gdn_nondet_train_kcp`` never imports a KDA package;
 a CPU test asserts field-identical partitions and contexts on the same inputs.
 
 Metadata layer of the context-parallel (KCP) route of the Cake packed GDN
@@ -30,7 +30,7 @@ queries.  Pure host metadata: nothing here reads the contents of a tensor or
 launches a kernel; the module imports ``dataclasses``, ``torch`` and
 ``torch.distributed`` only and is importable and testable on the CPU.
 
-Partition.  ``partition_kcp(cu_seqlens_global_cpu, world_size, layout, fragments=None)``
+Partition.  ``cake_gdn_nondet_train_kcp_partition(cu_seqlens_global_cpu, world_size, layout, fragments=None)``
 cuts the global token order (``cu_seqlens`` of the packed documents, CPU
 int64) into per-rank fragments ``(doc, offset in the document, length)``
 stored on every rank in document order, then offset order (the rank's local
@@ -47,7 +47,7 @@ recurrence starts from a carried state), one with a successor is
 *crossing-out* (it produces a summary).  Zero-length fragments are skipped by
 the chains.  The partition is built once and reused across layers.
 
-Context.  ``build_context_kcp(part, group, rank, device, conv_kernel_size=4)``
+Context.  ``cake_gdn_nondet_train_kcp_build_context(part, group, rank, device, conv_kernel_size=4)``
 derives, for one rank, the local ``cu_seqlens`` (int32 device; one local
 sequence per fragment), the device fragment table, the crossing slots, the
 chunk / sequence tables of the existing chunk-parallel stages (bitwise the
@@ -93,7 +93,7 @@ CTA per SM instead of the occ ``ceil`` (:data:`WAVE_FILL_N_FRAG_MAX`; a rank wit
 the cap, more than three fragments, or an empty longest fragment) keeps the
 earlier ``"occ"`` rule ``clamp(max(P_occ, P_chain), 1, ...)``.  ``"wave_fill1"``,
 ``"wave"``, ``"occ"``, ``"wave_fill"``, ``"chain_min"`` and ``"one"`` stay selectable
-through the keyword-only ``p_rule`` argument of :func:`build_context_kcp` (a test
+through the keyword-only ``p_rule`` argument of :func:`cake_gdn_nondet_train_kcp_build_context` (a test
 knob of the options object, never a default) for the A/B record.  ``"row_cost_lpt"``
 (selectable the same way) is the row rule whose wave-regime ranks take the argmin of
 the crossing-aware cost over their real fragment table, capped at the smallest ``P``
@@ -160,7 +160,7 @@ P_RULES = (
 # the keyword-only ``p_rule`` argument (options-object test knob) for the A/B record.  Every rule is a pure function of
 # (the fragment tables, HV, SM count), identical on every rank, so G3 holds under any of them.
 P_RULE_DEFAULT = "fill_small_guard"
-# The plan rule of a context built for CUDA-graph replay (build_context_kcp(..., graph_replay=True)): the default
+# The plan rule of a context built for CUDA-graph replay (cake_gdn_nondet_train_kcp_build_context(..., graph_replay=True)): the default
 # without its "small_one" rows.  The P = 1 rows trade segment merges for longer walks, which pays while the host
 # launches every program; under graph replay the launch cost is gone and those walks are measured slower than the
 # deterministic twin's plan on small-head packs, while the one-wave fill of the other rows stays faster under graph
@@ -233,7 +233,7 @@ ROW_COST_LPT_MARGIN_PCT = ROW_COST_MARGIN_PCT["occ"]
 ROW_COST_LPT_ROW_MARGIN_PCT = 4
 # The shipped default of ``save_transfer`` (the design note §6.2) -- the merge owner
 # keeps its c1 receive tensor (and the home rank its M_seg at P > 1) for the backward instead of re-sending M_f^T in b1.
-# Default of the byte queries below and of ``cake_kcp.OptionsKcp``; ``False`` (the earlier recompute form) stays
+# Default of the byte queries below and of ``cake_kcp.CakeGDNNondetKcpOptions``; ``False`` (the earlier recompute form) stays
 # selectable through the ``save_transfer`` argument; ``kcp_saved_bytes`` reports the delta.
 SAVE_TRANSFER_DEFAULT = True
 # Wave-aware P rule: per-CTA-step constants at one CTA per SM on GB300 (KDA, 64 heads; a GDN walk micro-benchmark refits them), in 10 ns
@@ -292,7 +292,7 @@ def _ceil_div(a: int, b: int) -> int:
 
 
 @dataclasses.dataclass(frozen=True)
-class FragmentKcp:
+class CakeGDNNondetKcpFragment:
     """One fragment of the partition: ``[off, off + length)`` of document ``doc``, held by ``rank`` at local
     position ``slot`` (the rank's buffer order); ``prev`` / ``next`` are the ``(rank, slot)`` of the neighbours in
     the document chain (``None`` at a document start / end and for zero-length fragments, which the chain skips)."""
@@ -325,14 +325,14 @@ class FragmentKcp:
 
 
 @dataclasses.dataclass(frozen=True)
-class PartitionKcp:
+class CakeGDNNondetKcpPartition:
     """The fragment tables of every rank (``fragments[rank][slot]``), the global ``cu_seqlens`` they cut and the
     layout that produced them (``"explicit"`` for a caller-given table)."""
 
     world_size: int
     layout: str
     cu_seqlens: tuple[int, ...]
-    fragments: tuple[tuple[FragmentKcp, ...], ...]
+    fragments: tuple[tuple[CakeGDNNondetKcpFragment, ...], ...]
 
     @property
     def num_docs(self) -> int:
@@ -345,7 +345,7 @@ class PartitionKcp:
     def doc_length(self, doc: int) -> int:
         return self.cu_seqlens[doc + 1] - self.cu_seqlens[doc]
 
-    def fragment(self, rank: int, slot: int) -> FragmentKcp:
+    def fragment(self, rank: int, slot: int) -> CakeGDNNondetKcpFragment:
         return self.fragments[rank][slot]
 
     def rank_tokens(self, rank: int) -> int:
@@ -368,7 +368,7 @@ class PartitionKcp:
 
     def chains(self) -> tuple[tuple[tuple[int, int], ...], ...]:
         """Per document the ``(rank, slot)`` of its non-empty fragments in offset order (the document chain)."""
-        by_doc: dict[int, list[FragmentKcp]] = {}
+        by_doc: dict[int, list[CakeGDNNondetKcpFragment]] = {}
         for frs in self.fragments:
             for f in frs:
                 if f.length > 0:
@@ -468,12 +468,12 @@ def _as_cu_seqlens(cu_seqlens) -> tuple[int, ...]:
     if isinstance(cu_seqlens, torch.Tensor):
         if cu_seqlens.device.type != "cpu":
             raise ValueError(
-                "partition_kcp: cu_seqlens is CPU metadata (the partition reads no device tensor); "
+                "cake_gdn_nondet_train_kcp_partition: cu_seqlens is CPU metadata (the partition reads no device tensor); "
                 f"got a tensor on {cu_seqlens.device}"
             )
         if cu_seqlens.dim() != 1 or cu_seqlens.dtype not in (torch.int32, torch.int64):
             raise ValueError(
-                f"partition_kcp: cu_seqlens must be a 1-D int32 / int64 tensor, got {tuple(cu_seqlens.shape)} "
+                f"cake_gdn_nondet_train_kcp_partition: cu_seqlens must be a 1-D int32 / int64 tensor, got {tuple(cu_seqlens.shape)} "
                 f"{cu_seqlens.dtype}"
             )
         values = tuple(int(v) for v in cu_seqlens.tolist())
@@ -481,11 +481,13 @@ def _as_cu_seqlens(cu_seqlens) -> tuple[int, ...]:
         values = tuple(int(v) for v in cu_seqlens)
     if len(values) < 1 or values[0] != 0:
         raise ValueError(
-            f"partition_kcp: cu_seqlens must start with 0 and hold num_docs + 1 entries, got {values[:4]}..."
+            f"cake_gdn_nondet_train_kcp_partition: cu_seqlens must start with 0 and hold num_docs + 1 entries, got {values[:4]}..."
         )
     for a, b in zip(values, values[1:], strict=False):
         if b < a:
-            raise ValueError("partition_kcp: cu_seqlens must be non-decreasing")
+            raise ValueError(
+                "cake_gdn_nondet_train_kcp_partition: cu_seqlens must be non-decreasing"
+            )
     return values
 
 
@@ -533,12 +535,14 @@ def _validate_cut_points(cuts, length: int, pieces: int, doc: int) -> list[int]:
     values = [int(c) for c in cuts]
     if len(values) != pieces + 1 or values[0] != 0 or values[-1] != length:
         raise ValueError(
-            f"partition_kcp: cut_points[{doc}] must hold {pieces + 1} offsets from 0 to the document length {length}, "
+            f"cake_gdn_nondet_train_kcp_partition: cut_points[{doc}] must hold {pieces + 1} offsets from 0 to the document length {length}, "
             f"got {len(values)} entries {values[:3]}...{values[-2:]}"
         )
     for a, b in zip(values, values[1:], strict=False):
         if b < a:
-            raise ValueError(f"partition_kcp: cut_points[{doc}] must be non-decreasing")
+            raise ValueError(
+                f"cake_gdn_nondet_train_kcp_partition: cut_points[{doc}] must be non-decreasing"
+            )
     return values
 
 
@@ -549,7 +553,7 @@ def _entries_zigzag_per_document(
     pieces = 2 * W
     if cut_points is not None and len(cut_points) != num_docs:
         raise ValueError(
-            f"partition_kcp: cut_points must give one list per document ({num_docs}), got {len(cut_points)}"
+            f"cake_gdn_nondet_train_kcp_partition: cut_points must give one list per document ({num_docs}), got {len(cut_points)}"
         )
     entries: list[tuple[int, int, int, int]] = []
     for d in range(num_docs):
@@ -582,28 +586,28 @@ def _explicit_entries(
             for y in frs:
                 if len(y) != 3:
                     raise ValueError(
-                        f"partition_kcp: fragments[{rank}] entries must be (doc, off, len), got {y!r}"
+                        f"cake_gdn_nondet_train_kcp_partition: fragments[{rank}] entries must be (doc, off, len), got {y!r}"
                     )
                 entries.append((int(y[0]), int(y[1]), int(y[2]), rank))
     else:
         for y in items:
             if not isinstance(y, (list, tuple)) or len(y) != 4:
                 raise ValueError(
-                    f"partition_kcp: flat fragments entries must be (doc, off, len, rank), got {y!r}"
+                    f"cake_gdn_nondet_train_kcp_partition: flat fragments entries must be (doc, off, len, rank), got {y!r}"
                 )
             entries.append((int(y[0]), int(y[1]), int(y[2]), int(y[3])))
     for doc, off, ln, rank in entries:
         if not 0 <= doc < num_docs:
             raise ValueError(
-                f"partition_kcp: fragment document {doc} out of range [0, {num_docs})"
+                f"cake_gdn_nondet_train_kcp_partition: fragment document {doc} out of range [0, {num_docs})"
             )
         if not 0 <= rank < W:
             raise ValueError(
-                f"partition_kcp: fragment rank {rank} out of range [0, {W})"
+                f"cake_gdn_nondet_train_kcp_partition: fragment rank {rank} out of range [0, {W})"
             )
         if ln < 0 or off < 0 or off + ln > cu[doc + 1] - cu[doc]:
             raise ValueError(
-                f"partition_kcp: fragment (doc {doc}, off {off}, len {ln}) does not fit document {doc} of "
+                f"cake_gdn_nondet_train_kcp_partition: fragment (doc {doc}, off {off}, len {ln}) does not fit document {doc} of "
                 f"{cu[doc + 1] - cu[doc]} tokens"
             )
     # every document covered exactly once by its non-empty fragments, offsets monotone
@@ -614,13 +618,13 @@ def _explicit_entries(
         for off, ln in parts:
             if off != pos:
                 raise ValueError(
-                    f"partition_kcp: document {d} is not covered exactly once (gap or overlap at offset {pos}, "
+                    f"cake_gdn_nondet_train_kcp_partition: document {d} is not covered exactly once (gap or overlap at offset {pos}, "
                     f"fragment starts at {off})"
                 )
             pos = off + ln
         if pos != n:
             raise ValueError(
-                f"partition_kcp: document {d} is covered up to {pos} of {n} tokens"
+                f"cake_gdn_nondet_train_kcp_partition: document {d} is covered up to {pos} of {n} tokens"
             )
     # the given per-rank order is the local buffer order: document then offset (ties: empty pieces keep their place)
     for rank in range(W):
@@ -628,7 +632,7 @@ def _explicit_entries(
         for a, b in zip(keys, keys[1:], strict=False):
             if b < a:
                 raise ValueError(
-                    f"partition_kcp: rank {rank}'s fragments must be listed in document then offset order "
+                    f"cake_gdn_nondet_train_kcp_partition: rank {rank}'s fragments must be listed in document then offset order "
                     f"(the local buffer order), got {a} before {b}"
                 )
     return entries
@@ -636,7 +640,7 @@ def _explicit_entries(
 
 def _finish(
     cu: tuple[int, ...], W: int, layout: str, entries: list[tuple[int, int, int, int]]
-) -> PartitionKcp:
+) -> CakeGDNNondetKcpPartition:
     per_rank: list[list[tuple[int, int, int]]] = [[] for _ in range(W)]
     for doc, off, ln, rank in entries:
         per_rank[rank].append((doc, off, ln))
@@ -655,22 +659,26 @@ def _finish(
             )
     fragments = tuple(
         tuple(
-            FragmentKcp(doc, off, ln, r, s, prev.get((r, s)), nxt.get((r, s)))
+            CakeGDNNondetKcpFragment(
+                doc, off, ln, r, s, prev.get((r, s)), nxt.get((r, s))
+            )
             for s, (doc, off, ln) in enumerate(frs)
         )
         for r, frs in enumerate(per_rank)
     )
-    return PartitionKcp(world_size=W, layout=layout, cu_seqlens=cu, fragments=fragments)
+    return CakeGDNNondetKcpPartition(
+        world_size=W, layout=layout, cu_seqlens=cu, fragments=fragments
+    )
 
 
-def partition_kcp(
+def cake_gdn_nondet_train_kcp_partition(
     cu_seqlens_global_cpu,
     world_size: int,
     layout: str = "contiguous",
     fragments=None,
     *,
     cut_points=None,
-) -> PartitionKcp:
+) -> CakeGDNNondetKcpPartition:
     """The per-rank fragment tables of one packed batch (the KCP contract §3.1).
 
     ``cu_seqlens_global_cpu``: the packed documents' ``cu_seqlens`` (CPU int64 tensor or a sequence of ints);
@@ -682,18 +690,20 @@ def partition_kcp(
     cu = _as_cu_seqlens(cu_seqlens_global_cpu)
     W = int(world_size)
     if W < 1:
-        raise ValueError(f"partition_kcp: world_size must be >= 1, got {world_size}")
+        raise ValueError(
+            f"cake_gdn_nondet_train_kcp_partition: world_size must be >= 1, got {world_size}"
+        )
     if fragments is not None:
         return _finish(cu, W, EXPLICIT_LAYOUT, _explicit_entries(cu, W, fragments))
     if layout not in LAYOUTS:
         raise ValueError(
-            f"partition_kcp: layout must be one of {LAYOUTS}, got {layout!r}"
+            f"cake_gdn_nondet_train_kcp_partition: layout must be one of {LAYOUTS}, got {layout!r}"
         )
     total = cu[-1]
     if layout == "contiguous":
         if cut_points is not None:
             raise ValueError(
-                "partition_kcp: cut_points apply to layout 'zigzag_per_document' only"
+                "cake_gdn_nondet_train_kcp_partition: cut_points apply to layout 'zigzag_per_document' only"
             )
         entries = _intervals_to_entries(
             cu, [(s, e, r) for r, (s, e) in enumerate(near_equal(total, W))]
@@ -701,7 +711,7 @@ def partition_kcp(
     elif layout == "zigzag":
         if cut_points is not None:
             raise ValueError(
-                "partition_kcp: cut_points apply to layout 'zigzag_per_document' only"
+                "cake_gdn_nondet_train_kcp_partition: cut_points apply to layout 'zigzag_per_document' only"
             )
         pieces = near_equal(total, 2 * W)
         bounds = []
@@ -910,7 +920,9 @@ def wave_rule_lpt_P(nc_frags: "list[int]", HV: int, sm_count: int) -> int:
     return best_P
 
 
-def row_tables(part: "PartitionKcp") -> tuple[tuple[tuple[int, bool], ...], ...]:
+def row_tables(
+    part: "CakeGDNNondetKcpPartition",
+) -> tuple[tuple[tuple[int, bool], ...], ...]:
     """The row rule's input: per rank the ``(chunk count, crossing_out)`` of every fragment, in local order."""
     return tuple(
         tuple((_ceil_div(f.length, CHUNK), f.crossing_out) for f in frs)
@@ -1378,11 +1390,11 @@ MAX_HEAD_CONSUMERS = 3  # send-layout slots per head dpre row for conv_kernel_si
 # consecutive 1-token predecessors, e.g. the C3 row of record at layout D), so the table holds `halo` slots.
 
 
-def _halo_sources(part: PartitionKcp, halo: int):
+def _halo_sources(part: CakeGDNNondetKcpPartition, halo: int):
     """Global halo sources.  ``hist[(rank, slot)][k]`` = ``(src_rank, src_slot, row_in_src)`` of history row ``k`` of a
     continuing fragment (``None`` before the document start); ``tail[(rank, slot)][m]`` = ``(succ_rank, succ_slot,
     head_row_k)`` of the successor token ``end + m`` of a fragment with a successor (``None`` past the document end)."""
-    chains: dict[int, list[FragmentKcp]] = {}
+    chains: dict[int, list[CakeGDNNondetKcpFragment]] = {}
     for frs in part.fragments:
         for f in frs:
             if f.length > 0:
@@ -1390,7 +1402,7 @@ def _halo_sources(part: PartitionKcp, halo: int):
     for lst in chains.values():
         lst.sort(key=lambda f: f.off)
 
-    def owner(doc: int, t: int) -> FragmentKcp:
+    def owner(doc: int, t: int) -> CakeGDNNondetKcpFragment:
         for g in chains[doc]:
             if g.off <= t < g.end:
                 return g
@@ -1425,7 +1437,7 @@ def _halo_sources(part: PartitionKcp, halo: int):
 
 
 def _halo_plan(
-    part: PartitionKcp, rank: int, halo: int, local_cu: tuple[int, ...]
+    part: CakeGDNNondetKcpPartition, rank: int, halo: int, local_cu: tuple[int, ...]
 ) -> KcpHaloPlan:
     W = part.world_size
     hist, tail = _halo_sources(part, halo)
@@ -1486,7 +1498,7 @@ def _halo_plan(
                     free = [c for c in range(halo) if slots[c] == -1]
                     if not free:
                         raise ValueError(
-                            f"build_context_kcp: head row {e[2]} of fragment {e[1]} on rank {rank} has more than "
+                            f"cake_gdn_nondet_train_kcp_build_context: head row {e[2]} of fragment {e[1]} on rank {rank} has more than "
                             f"{halo} consumers; this cannot happen (a head token has at most {halo} consuming "
                             "predecessor fragments): the halo plan is inconsistent"
                         )
@@ -1644,7 +1656,9 @@ def _check_tile_offsets(name: str, values) -> None:
             )
 
 
-def _build_head_plan(ctx: ContextKcp, HV: int, *, P: int | None = None) -> KcpHeadPlan:
+def _build_head_plan(
+    ctx: CakeGDNNondetKcpContext, HV: int, *, P: int | None = None
+) -> KcpHeadPlan:
     part = ctx.partition
     W, r = part.world_size, ctx.rank
     HV = int(HV)
@@ -2033,10 +2047,10 @@ class KcpSequence:
         self.log.clear()
 
 
-_DEFAULT = object()  # ContextKcp: argument omitted
+_DEFAULT = object()  # CakeGDNNondetKcpContext: argument omitted
 
 
-class ContextKcp:
+class CakeGDNNondetKcpContext:
     """One rank's view of the partition: CPU ints / tuples plus small int32 device tables; built once, reused across
     layers; never reads a tensor's contents.
 
@@ -2059,7 +2073,7 @@ class ContextKcp:
     behaves as the frozen dataclass it was: the same constructor, ``dataclasses.FrozenInstanceError`` on attribute
     assignment, identity equality; ``_FIELDS`` lists the fields in constructor order."""
 
-    partition: PartitionKcp
+    partition: CakeGDNNondetKcpPartition
     rank: int
     world_size: int
     group: object
@@ -2169,7 +2183,7 @@ class ContextKcp:
         return f"{type(self).__qualname__}({fields})"
 
     @property
-    def fragments(self) -> tuple[FragmentKcp, ...]:
+    def fragments(self) -> tuple[CakeGDNNondetKcpFragment, ...]:
         return self.partition.fragments[self.rank]
 
     @property
@@ -2197,7 +2211,7 @@ class ContextKcp:
 
     def prepare(self, H_qk: int, HV: int, *, P: int | None = None):
         """The device-resident GDN table bundle of this context for the head pair, built once per
-        ``(HV, sm_count, P)`` key at first use (never at ``build_context_kcp``, which has no ``HV``, and
+        ``(HV, sm_count, P)`` key at first use (never at ``cake_gdn_nondet_train_kcp_build_context``, which has no ``HV``, and
         never per call).  ``HV`` must be a multiple of ``H_qk``.  Delegates to :func:`cake_tables.prepare`."""
         from . import (
             cake_tables,
@@ -2276,8 +2290,8 @@ def _device_of(device) -> torch.device:
     return device
 
 
-def build_context_kcp(
-    part: PartitionKcp,
+def cake_gdn_nondet_train_kcp_build_context(
+    part: CakeGDNNondetKcpPartition,
     group,
     rank: int,
     device,
@@ -2286,8 +2300,8 @@ def build_context_kcp(
     sm_count: int | None = None,
     p_rule: str | None = None,
     graph_replay: bool = False,
-) -> ContextKcp:
-    """The :class:`ContextKcp` of ``rank`` (the KCP contract §3.1).
+) -> CakeGDNNondetKcpContext:
+    """The :class:`CakeGDNNondetKcpContext` of ``rank`` (the KCP contract §3.1).
 
     ``group`` is the caller's ``torch.distributed`` process group (or ``None`` on the CPU / in a single process);
     when a group is given and the default process group is initialized, its size and this process's rank are
@@ -2309,25 +2323,27 @@ def build_context_kcp(
     its plan is :data:`P_RULE_GRAPH` (``"fill_small_guard"`` without its ``P = 1`` rows) unless ``p_rule`` names a rule.
     A context serves calls of either graph mode; the hint only selects the plan.
     """
-    if not isinstance(part, PartitionKcp):
+    if not isinstance(part, CakeGDNNondetKcpPartition):
         raise TypeError(
-            "build_context_kcp: part must be the PartitionKcp of partition_kcp()"
+            "cake_gdn_nondet_train_kcp_build_context: part must be the CakeGDNNondetKcpPartition of cake_gdn_nondet_train_kcp_partition()"
         )
     W = part.world_size
     rank = int(rank)
     if not 0 <= rank < W:
-        raise ValueError(f"build_context_kcp: rank {rank} out of range [0, {W})")
+        raise ValueError(
+            f"cake_gdn_nondet_train_kcp_build_context: rank {rank} out of range [0, {W})"
+        )
     if group is not None and dist.is_available() and dist.is_initialized():
         gw, gr = dist.get_world_size(group), dist.get_rank(group)
         if gw != W or gr != rank:
             raise ValueError(
-                f"build_context_kcp: the process group has world_size {gw} / rank {gr}, the partition and the call "
+                f"cake_gdn_nondet_train_kcp_build_context: the process group has world_size {gw} / rank {gr}, the partition and the call "
                 f"say {W} / {rank}"
             )
     halo = int(conv_kernel_size) - 1
     if halo < 0:
         raise ValueError(
-            f"build_context_kcp: conv_kernel_size must be >= 1, got {conv_kernel_size}"
+            f"cake_gdn_nondet_train_kcp_build_context: conv_kernel_size must be >= 1, got {conv_kernel_size}"
         )
     device = _device_of(device)
     if sm_count is None:
@@ -2338,22 +2354,24 @@ def build_context_kcp(
         )
     sm_count = int(sm_count)
     if sm_count < 1:
-        raise ValueError(f"build_context_kcp: sm_count must be >= 1, got {sm_count}")
+        raise ValueError(
+            f"cake_gdn_nondet_train_kcp_build_context: sm_count must be >= 1, got {sm_count}"
+        )
     if not isinstance(graph_replay, bool):
         raise TypeError(
-            f"build_context_kcp: graph_replay must be a bool, got {type(graph_replay).__name__}"
+            f"cake_gdn_nondet_train_kcp_build_context: graph_replay must be a bool, got {type(graph_replay).__name__}"
         )
     if p_rule is None:
         p_rule = P_RULE_GRAPH if graph_replay else P_RULE_DEFAULT
     if p_rule not in P_RULES:
         raise ValueError(
-            f"build_context_kcp: p_rule must be one of {P_RULES}, got {p_rule!r}"
+            f"cake_gdn_nondet_train_kcp_build_context: p_rule must be one of {P_RULES}, got {p_rule!r}"
         )
     mine = part.fragments[rank]
     n_frag = len(mine)
     if n_frag > MAX_FRAGS:
         raise ValueError(
-            f"build_context_kcp: rank {rank} holds {n_frag} fragments; the kernels' tables admit at most {MAX_FRAGS}"
+            f"cake_gdn_nondet_train_kcp_build_context: rank {rank} holds {n_frag} fragments; the kernels' tables admit at most {MAX_FRAGS}"
         )
     local_cu = part.local_cu_seqlens(rank)
     T_r = local_cu[-1]
@@ -2425,7 +2443,7 @@ def build_context_kcp(
         name: uploaded[name]
         for name in ("hist_row_off", "tail_row_off", "head_row_off", "hist_index")
     }
-    return ContextKcp(
+    return CakeGDNNondetKcpContext(
         partition=part,
         rank=rank,
         world_size=W,
@@ -2490,18 +2508,18 @@ __all__ = [
     "TILE",
     "TILE_B",
     "TILE_M",
-    "ContextKcp",
-    "FragmentKcp",
+    "CakeGDNNondetKcpContext",
+    "CakeGDNNondetKcpFragment",
     "KcpHaloPlan",
     "KcpHeadPlan",
-    "PartitionKcp",
+    "CakeGDNNondetKcpPartition",
     "KcpSegmentPlan",
     "KcpSequence",
-    "build_context_kcp",
+    "cake_gdn_nondet_train_kcp_build_context",
     "chunk_geometry",
     "chunk_tables",
     "head_groups",
-    "partition_kcp",
+    "cake_gdn_nondet_train_kcp_partition",
     "kcp_plan",
     "near_equal",
     "owner_of_head",

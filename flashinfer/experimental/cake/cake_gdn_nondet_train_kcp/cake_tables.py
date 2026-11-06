@@ -23,12 +23,12 @@ per (document, owned head)), the head ownership table (``head_groups``, the
 padded owner when ``HV % Hg != 0``) and the convolution halo row counts.
 
 Everything is derived from the package-local :mod:`.cake_kcp_plan` context
-(``build_context_kcp``) and its head plan ``ctx.heads(HV)``; the segment count
+(``cake_gdn_nondet_train_kcp_build_context``) and its head plan ``ctx.heads(HV)``; the segment count
 ``P`` per fragment comes from the context's plan rule (``kcp_plan_row`` over every
 rank's fragment table under the shipped ``"row_cost"`` rule, the per-rank
 ``kcp_plan`` under a rule selected by the test knobs) -- the state of the GDN route is per value
 head, so every head count here is ``HV``.  Tables are built once per ``(HV, sm_count, P)`` key at
-first use (``ctx.prepare(H_qk, HV)``; never at ``build_context_kcp``,
+first use (``ctx.prepare(H_qk, HV)``; never at ``cake_gdn_nondet_train_kcp_build_context``,
 never per call) and cached on the context (``ctx._caches``) together with their
 int32 / int64 device copies (int32 everywhere except the merge's int64 element
 offsets ``INT64_TABLES``): no per-call host-to-device copy, no device read,
@@ -60,7 +60,7 @@ from .cake_kcp_plan import (
     TILE_M,
     TILE_STRIDE_PAIR,
     TILE_STRIDE_PLANE,
-    ContextKcp,
+    CakeGDNNondetKcpContext,
     KcpHeadPlan,
     head_groups,
 )
@@ -157,7 +157,7 @@ def owner_table(HV: int, world_size: int) -> dict:
     }
 
 
-def halo_rows(ctx: ContextKcp) -> dict:
+def halo_rows(ctx: CakeGDNNondetKcpContext) -> dict:
     """Row counts of the convolution halo plan of this rank (rows of ``C`` channels; BF16 forward history rows,
     FP32 backward ``dpre`` rows): the per-peer split sizes in rows and their sums."""
     h = ctx.halo
@@ -209,7 +209,9 @@ class PoolAddressing:
         return self.n_tiles * self.tile_stride * TILE
 
 
-def pool_addressing(hp: KcpHeadPlan, ctx: ContextKcp, name: str) -> PoolAddressing:
+def pool_addressing(
+    hp: KcpHeadPlan, ctx: CakeGDNNondetKcpContext, name: str
+) -> PoolAddressing:
     """The :class:`PoolAddressing` of pool ``name`` (:data:`POOLS`) for head plan ``hp`` of ``ctx``."""
     split, slots, stride, half = POOLS[name]
     n = int(getattr(ctx, slots))
@@ -447,7 +449,7 @@ class WalkTables:
         return range(self.seg_chunk_start[seg], self.seg_chunk_start[seg + 1])
 
 
-def local_tables(ctx: ContextKcp) -> LocalTables:
+def local_tables(ctx: CakeGDNNondetKcpContext) -> LocalTables:
     """The :class:`LocalTables` of ``ctx`` (built once, cached on the context)."""
     key = ("gdn_local_tables",)
     cached = ctx._caches.get(key)
@@ -468,7 +470,9 @@ def local_tables(ctx: ContextKcp) -> LocalTables:
     return cached
 
 
-def walk_tables(ctx: ContextKcp, HV: int, *, P: int | None = None) -> WalkTables:
+def walk_tables(
+    ctx: CakeGDNNondetKcpContext, HV: int, *, P: int | None = None
+) -> WalkTables:
     """The :class:`WalkTables` of ``ctx`` at ``HV`` value heads (built once per ``(ctx, HV, P)``, cached on the
     context; the head plan ``ctx.heads(HV, P=P)`` is cached too).  ``P`` overrides the plan rule's segment count
     (the GDN host's segments knob)."""
@@ -562,10 +566,10 @@ def table_dtype(name: str) -> torch.dtype:
 
 
 def prepare(
-    ctx: ContextKcp, H_qk: int, HV: int, *, P: int | None = None
+    ctx: CakeGDNNondetKcpContext, H_qk: int, HV: int, *, P: int | None = None
 ) -> PreparedTables:
     """Build (once per ``(HV, sm_count, P)`` key) and return the :class:`PreparedTables` of ``ctx`` for the head pair:
-    the first-use upload (``build_context_kcp`` has no ``HV``; the host calls this before the
+    the first-use upload (``cake_gdn_nondet_train_kcp_build_context`` has no ``HV``; the host calls this before the
     first forward and the #7039 test before measuring).  ``HV`` must be a multiple of ``H_qk``; ``P`` is the
     segments override.  Every table dtype is checked against the design here, before any launch."""
     H_qk, HV = int(H_qk), int(HV)
@@ -604,7 +608,7 @@ def prepare(
     return cached
 
 
-def describe(ctx: ContextKcp, HV: int) -> dict:
+def describe(ctx: CakeGDNNondetKcpContext, HV: int) -> dict:
     """Plain-int summary of both bundles for reports."""
     lt, wt = local_tables(ctx), walk_tables(ctx, HV)
     return {

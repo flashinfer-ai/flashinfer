@@ -11,8 +11,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Multi-GPU rows of the non-deterministic context-parallel (KCP) packed GDN training package
-(``flashinfer.experimental.cake_gdn_train_kcp``, ``cake_kcp``; every compute entry is called with
-``deterministic=False``): ``W`` ranks over NCCL, each holding the fragments of one partition of a packed batch, compared
+(``flashinfer.experimental.cake.cake_gdn_nondet_train_kcp``, ``cake_kcp``; the mode is in the package name):
+``W`` ranks over NCCL, each holding the fragments of one partition of a packed batch, compared
 with the exact FP64 per-document recurrence of the same operands.  The package keeps the deterministic twin's contract
 and accuracy budgets; its results are not bitwise equal to the deterministic route's and bitwise equality between two
 of its own runs is not part of its contract, so every comparison of two results of this package is a budget check;
@@ -39,7 +39,7 @@ what stays exact is structural (zero gradients, collective counts, byte counts, 
 * semantics (G4): the zero-gradient leak stays exact (``dout`` zero outside one document -> exactly zero gradients on
   the others); independence (the other documents' operands replaced) within the budget constants;
 * contracts (G10, as in the deterministic rows): retained bytes after a checkpointed forward, the exchange bytes against
-  ``gdn_comm_bytes_kcp``, CUDA-graph capture (replay events; asserted for the kernel backend), no synchronizing call in
+  ``cake_gdn_nondet_train_kcp_comm_bytes``, CUDA-graph capture (replay events; asserted for the kernel backend), no synchronizing call in
   context preparation or the ``"auto"`` checkpoint form, the side-stream ratio (reported);
 * the collectives of one backward (counted by ``torch.distributed`` name): exactly the deterministic route's set
   (``b1``, ``b2``) and no ``all_reduce`` / ``reduce_scatter`` of parameters;
@@ -48,17 +48,17 @@ what stays exact is structural (zero gradients, collective counts, byte counts, 
 * the deterministic route (``flashinfer.cake_gdn_det_train_kcp``) on the same operands in the same process: both routes
   within the same FP64 budgets and their difference within the same budget constants (FP64 is the reference).
 
-``test_poisoned_workspace_pairs``: one ``WorkspaceKcp`` reused across two rows of different token layouts on one group,
+``test_poisoned_workspace_pairs``: one ``CakeGDNNondetKcpWorkspace`` reused across two rows of different token layouts on one group,
 every pool and tape of the workspace filled with NaN in between; both rows within the FP64 budgets, each also in the
 ``save_mode="full"`` / ``save_transfer=False`` form (and its ring form where eligible), at the plan's ``P`` and at the forced
 ``P = 2`` where every rank's fragments take it, under NaN-filled allocations.  The convolution
 halo row C7 (``cake_causal_conv1d_det_kcp`` through this package's context) and the whole-layer checkpoint rows
-(``RecomputeHandleKcp``: the recompute exchanges nothing; out / dx / dweight / dg / dbeta within the budget constants of
+(``CakeGDNNondetKcpRecomputeHandle``: the recompute exchanges nothing; out / dx / dweight / dg / dbeta within the budget constants of
 the plain checkpoint and the direct pass and within the correctness clause of the FP64 layer oracle; the backward's
 collectives are the deterministic layer's) run under Slurm.
 
 Packed QKV (#7817): under ``layout="tma"`` the backward of strided packed views writes one packed dQKV row, and
-``packed_qkv_views_kcp`` hands it to a packed leaf without a concatenation (both within the budgets of the contiguous
+``cake_gdn_nondet_train_kcp_packed_qkv_views`` hands it to a packed leaf without a concatenation (both within the budgets of the contiguous
 call); plain ``split`` views of the leaf, direct and checkpointed, get three contiguous gradients and keep torch's
 split backward and their hooks and ``retain_grad`` (issue #8367; within the same budgets).  ``test_l2n_rows`` / ``test_l2n_layer_checkpoint_rows``: the in-kernel Q / K L2 norm
 (``use_qk_l2norm_in_kernel=True``) on raw rows, every form within the FP64 budgets of the norm-off rows and of its
@@ -102,19 +102,19 @@ import torch.multiprocessing as mp
 
 from tests.test_helpers.kcp_collective_shims import CollectiveCounter, RecomputePhase
 
-PACKAGE = "flashinfer.experimental.cake_gdn_train_kcp"
-DET_PACKAGE = "flashinfer.experimental.cake_gdn_det_train_kcp"
+PACKAGE = "flashinfer.experimental.cake.cake_gdn_nondet_train_kcp"
+DET_PACKAGE = "flashinfer.experimental.cake.cake_gdn_det_train_kcp"
 DET_API = (
     "flashinfer.cake_gdn_det_train_kcp"  # the deterministic route's public objects
 )
-FACADE = "flashinfer.cake_gdn_train_kcp"  # this package's facade (takes deterministic=False only)
+FACADE = "flashinfer.cake_gdn_nondet_train_kcp"  # this package's facade
 
 
 @pytest.fixture(autouse=True, scope="module")
 def _few_cpu_threads():
     """The CPU emulation runs many small matmuls and elementwise ops.  On a host with hundreds of CPUs, torch's default
     intra-op pool and the oneDNN matmul path (its own pool, which torch.set_num_threads does not resize) spend far more
-    time synchronizing threads than computing (see ``test_cake_gdn_train_kcp.py``), so this module runs with at most 8
+    time synchronizing threads than computing (see ``test_cake_gdn_nondet_train_kcp.py``), so this module runs with at most 8
     threads and oneDNN off, as that suite does."""
     threads, onednn = torch.get_num_threads(), torch.backends.mkldnn.enabled
     torch.set_num_threads(min(threads, 8))
@@ -130,7 +130,7 @@ def _mod(sub: str | None = None):
     try:
         from tests.test_helpers.cake_package import cake_package
 
-        return cake_package("cake_gdn_train_kcp", sub)
+        return cake_package("cake_gdn_nondet_train_kcp", sub)
     except (ImportError, KeyError):
         return importlib.import_module(PACKAGE if sub is None else f"{PACKAGE}.{sub}")
 
@@ -828,8 +828,8 @@ def _ragged(cu: list[int], t_r: list[int]) -> list[list[tuple[int, int, int]]]:
 
 
 def _partition_with(fn, row: Row):
-    """``fn(cu, W, layout=... | fragments=...)``: this package's ``partition_kcp`` or the deterministic route's
-    ``partition_det_kcp`` (the same partition of the row)."""
+    """``fn(cu, W, layout=... | fragments=...)``: this package's ``cake_gdn_nondet_train_kcp_partition`` or the deterministic route's
+    ``cake_gdn_det_train_kcp_partition`` (the same partition of the row)."""
     cu = _cu(row.lengths)
     if row.layout.startswith("ragged:"):
         t_r = [int(x) for x in row.layout.split(":")[1].split(",")]
@@ -843,7 +843,7 @@ def _partition_with(fn, row: Row):
 
 
 def _partition(row: Row):
-    return _partition_with(plan.partition_kcp, row)
+    return _partition_with(plan.cake_gdn_nondet_train_kcp_partition, row)
 
 
 def _programs_exported() -> bool:
@@ -1217,7 +1217,7 @@ def _live_blocks_since(mark: int, device, *, skip=()) -> list[dict]:
             if (
                 "/torch/" in fn
                 and "checkpoint" not in fn
-                and "cake_gdn_train_kcp" not in fn
+                and "cake_gdn_nondet_train_kcp" not in fn
             ):
                 continue
             frames.append(f"{fn.rsplit('/', 1)[-1]}:{f.get('line')} {f.get('name')}")
@@ -1339,11 +1339,11 @@ def _run_rank_fwd(
     budgets, and the crossing-in fragments' ``S_in`` against the FP64 cut states; nothing of the backward runs."""
     H_qk, HV = row.heads
     part, cu = _partition(row)
-    ctx = plan.build_context_kcp(part, group, rank, device)
+    ctx = plan.cake_gdn_nondet_train_kcp_build_context(part, group, rank, device)
     total = cu[-1]
     ops = _local_inputs(row, part, cu, rank, device)
     q, k, v, g, beta = (ops[n] for n in ("q", "k", "v", "g", "beta"))
-    ws = kcp.WorkspaceKcp()
+    ws = kcp.CakeGDNNondetKcpWorkspace()
     base = {"backend": backend}
     t_start = time.time()
     ref_mod = _reference()
@@ -1352,7 +1352,7 @@ def _run_rank_fwd(
     OUT = ("out",)
 
     def fwd(qq=q, kk=k, vv=v, **opts):
-        return kcp.chunk_gdn_fwd_kcp(
+        return kcp.cake_gdn_nondet_train_kcp_forward(
             qq,
             kk,
             vv,
@@ -1360,7 +1360,6 @@ def _run_rank_fwd(
             beta,
             ctx,
             workspace=ws,
-            deterministic=False,
             **{**base, **opts},
         )
 
@@ -1527,11 +1526,11 @@ def _run_rank(
     route on the same operands."""
     H_qk, HV = row.heads
     part, cu = _partition(row)
-    ctx = plan.build_context_kcp(part, group, rank, device)
+    ctx = plan.cake_gdn_nondet_train_kcp_build_context(part, group, rank, device)
     total = cu[-1]
     ops = _local_inputs(row, part, cu, rank, device)
     q, k, v, g, beta, dout = (ops[n] for n in ("q", "k", "v", "g", "beta", "dout"))
-    ws = kcp.WorkspaceKcp()
+    ws = kcp.CakeGDNNondetKcpWorkspace()
     base = {"backend": backend}
     t_start = time.time()
     ref_mod = _reference()
@@ -1541,10 +1540,10 @@ def _run_rank(
 
     def saved_pass(qq=q, kk=k, vv=v, gg=g, bb=beta, dd=dout, **opts) -> dict:
         o = {**base, **opts}
-        out, saved = kcp.chunk_gdn_fwd_kcp(
-            qq, kk, vv, gg, bb, ctx, workspace=ws, deterministic=False, **o
+        out, saved = kcp.cake_gdn_nondet_train_kcp_forward(
+            qq, kk, vv, gg, bb, ctx, workspace=ws, **o
         )
-        dq, dk, dv, dbeta, dg = kcp.chunk_gdn_bwd_kcp(
+        dq, dk, dv, dbeta, dg = kcp.cake_gdn_nondet_train_kcp_backward(
             qq,
             kk,
             vv,
@@ -1554,7 +1553,6 @@ def _run_rank(
             dd,
             saved=saved,
             workspace=ws,
-            deterministic=False,
             **o,
         )
         return {
@@ -1572,9 +1570,7 @@ def _run_rank(
         o = {**base, **opts}
 
         def fn(*a):
-            return kcp.chunk_gdn_kcp(
-                *a, ctx, workspace=workspace, deterministic=False, **o
-            )
+            return kcp.cake_gdn_nondet_kcp(*a, ctx, workspace=workspace, **o)
 
         if ckpt:
             from torch.utils.checkpoint import checkpoint
@@ -1746,7 +1742,7 @@ def _run_rank(
         for k_, v_ in {"put": n_auto, "take": n_auto, "miss": 0}.items()
     )
 
-    # issue #7818: a RecomputeHandleKcp carries this rank's incoming states S_in from the checkpointed forward to
+    # issue #7818: a CakeGDNNondetKcpRecomputeHandle carries this rank's incoming states S_in from the checkpointed forward to
     # torch's recompute, which then issues no collective and waits on none (counted by phase through shims on
     # torch.distributed; the recompute phase is marked by the checkpoint's context_fn).  Out and the five gradients
     # are within the budgets of the plain checkpoint (same options) and of the direct pass; the original forward and
@@ -1755,10 +1751,10 @@ def _run_rank(
     def handle_pass(handle: bool, *, twice: bool = False, workspace=ws, **opts):
         leaves = [x.detach().clone().requires_grad_(True) for x in (q, k, v, g, beta)]
         o = {**base, "save_transfer": False, **opts}
-        hd = kcp.RecomputeHandleKcp() if handle else None
+        hd = kcp.CakeGDNNondetKcpRecomputeHandle() if handle else None
 
         def fn(q_, k_, v_, g_, b_, h_):
-            return kcp.chunk_gdn_kcp(
+            return kcp.cake_gdn_nondet_kcp(
                 q_,
                 k_,
                 v_,
@@ -1767,7 +1763,6 @@ def _run_rank(
                 ctx,
                 workspace=workspace,
                 recompute_handle=h_,
-                deterministic=False,
                 **o,
             )
 
@@ -1841,7 +1836,7 @@ def _run_rank(
         "modes"
     ] == ["capture", "replay", "replay"]
     s_in_query = int(
-        kcp.gdn_saved_bytes_kcp(
+        kcp.cake_gdn_nondet_train_kcp_saved_bytes(
             ctx,
             H_qk=H_qk,
             HV=HV,
@@ -1858,10 +1853,10 @@ def _run_rank(
     torch.cuda.synchronize(device)
     gc.collect()
     leaves_h = [x.detach().clone().requires_grad_(True) for x in (q, k, v, g, beta)]
-    hd_r = kcp.RecomputeHandleKcp()
+    hd_r = kcp.CakeGDNNondetKcpRecomputeHandle()
 
     def fn_r(q_, k_, v_, g_, b_, h_):
-        return kcp.chunk_gdn_kcp(
+        return kcp.cake_gdn_nondet_kcp(
             q_,
             k_,
             v_,
@@ -1870,7 +1865,6 @@ def _run_rank(
             ctx,
             recompute_handle=h_,
             save_transfer=False,
-            deterministic=False,
             **base,
         )
 
@@ -1960,9 +1954,11 @@ def _run_rank(
     split_before = dict(kcp.PACKED_SPLIT_STATS)
     qkv_leaf = _buf.detach().clone().requires_grad_(True)
     g_leaf, b_leaf = (x.detach().clone().requires_grad_(True) for x in (g, beta))
-    pq, pk, pv = kcp.packed_qkv_views_kcp(qkv_leaf, H_qk=H_qk, HV=HV)
-    out_split = kcp.chunk_gdn_kcp(
-        pq, pk, pv, g_leaf, b_leaf, ctx, workspace=ws, deterministic=False, **base
+    pq, pk, pv = kcp.cake_gdn_nondet_train_kcp_packed_qkv_views(
+        qkv_leaf, H_qk=H_qk, HV=HV
+    )
+    out_split = kcp.cake_gdn_nondet_kcp(
+        pq, pk, pv, g_leaf, b_leaf, ctx, workspace=ws, **base
     )
     out_split.backward(dout)
     ga = qkv_leaf.grad
@@ -1984,7 +1980,7 @@ def _run_rank(
     # issue #8367: plain split views of the packed leaf keep torch's autograd path (its split backward concatenates):
     # within the budgets of the autograd call, direct and checkpointed, with the hooks and retain_grad on the views firing
     def gdn_call(*a):
-        return kcp.chunk_gdn_kcp(*a, ctx, workspace=ws, deterministic=False, **base)
+        return kcp.cake_gdn_nondet_kcp(*a, ctx, workspace=ws, **base)
 
     for ck, tag in ((False, "direct"), (True, "ckpt")):
         res_plain, hooks_ok = _plain_split_pass(
@@ -1992,7 +1988,7 @@ def _run_rank(
         )
         arm(f"plain_split_{tag}", res_plain, res_auto, "autograd")
         flags[f"plain_split_{tag}_hooks_fire"] = hooks_ok
-        # three contiguous gradients (one packed row only for packed_qkv_views_kcp's split)
+        # three contiguous gradients (one packed row only for cake_gdn_nondet_train_kcp_packed_qkv_views's split)
         flags[f"plain_split_{tag}_grad_layout_separate"] = (
             kcp.LAST_CALL["bwd"]["grad_layout"] == "separate"
         )
@@ -2007,7 +2003,9 @@ def _run_rank(
     torch.cuda.synchronize(device)
     torch.cuda.set_sync_debug_mode("error")
     try:
-        fresh_ctx = plan.build_context_kcp(part, group, rank, device)
+        fresh_ctx = plan.cake_gdn_nondet_train_kcp_build_context(
+            part, group, rank, device
+        )
         fresh_ctx.prepare(H_qk, HV)
         flags["prepare_no_sync"] = True
     except RuntimeError as exc:  # "called a synchronizing CUDA operation"
@@ -2035,7 +2033,7 @@ def _run_rank(
         leaves = [x.detach().clone().requires_grad_(True) for x in (q, k, v, g, beta)]
 
         def fn(*a, _wsp=wsp, _o=form_opts):
-            return kcp.chunk_gdn_kcp(*a, ctx, workspace=_wsp, deterministic=False, **_o)
+            return kcp.cake_gdn_nondet_kcp(*a, ctx, workspace=_wsp, **_o)
 
         from torch.utils.checkpoint import checkpoint
 
@@ -2119,9 +2117,11 @@ def _run_rank(
         sb: dict[str, int] = {"T_r": int(q.shape[0])}
         for mode in ("light", "full"):
             sb[f"{mode}_query"] = int(
-                kcp.gdn_saved_bytes_kcp(ctx, H_qk=H_qk, HV=HV, save_mode=mode)
+                kcp.cake_gdn_nondet_train_kcp_saved_bytes(
+                    ctx, H_qk=H_qk, HV=HV, save_mode=mode
+                )
             )
-            _, s_obj = kcp.chunk_gdn_fwd_kcp(
+            _, s_obj = kcp.cake_gdn_nondet_train_kcp_forward(
                 q,
                 k,
                 v,
@@ -2130,7 +2130,6 @@ def _run_rank(
                 ctx,
                 workspace=ws,
                 save_mode=mode,
-                deterministic=False,
                 **base,
             )
             sb[f"{mode}_actual"] = int(s_obj.bytes())
@@ -2152,13 +2151,15 @@ def _run_rank(
     moved["b1_dm"] = {"send": 4 * sum(s), "recv": 4 * sum(r)}
     info["moved_bytes"] = moved
     try:
-        query = kcp.gdn_comm_bytes_kcp(ctx, H_qk=H_qk, HV=HV, C=C_CONV)
+        query = kcp.cake_gdn_nondet_train_kcp_comm_bytes(
+            ctx, H_qk=H_qk, HV=HV, C=C_CONV
+        )
         info["query_bytes"] = {
             c: query[c] for c in ("c1", "c2", "b1", "b2", "b1_design") if c in query
         }
         # save_transfer=False: "b1" = the plan's split tables (maps paired with the crossing-IN slots; what the
         # collective moves) must equal the b1_dm split sums; "b1_design" is the per-rank lower bound
-        query_dm = kcp.gdn_comm_bytes_kcp(
+        query_dm = kcp.cake_gdn_nondet_train_kcp_comm_bytes(
             ctx, H_qk=H_qk, HV=HV, C=C_CONV, save_transfer=False
         )
         info["query_bytes_dm"] = {
@@ -2190,7 +2191,7 @@ def _run_rank(
         g_res = None
         events: list[list[str]] = []
         for _ in range(4):
-            out, saved = kcp.chunk_gdn_fwd_kcp(
+            out, saved = kcp.cake_gdn_nondet_train_kcp_forward(
                 q,
                 k,
                 v,
@@ -2199,10 +2200,9 @@ def _run_rank(
                 ctx,
                 workspace=ws,
                 graph="replay",
-                deterministic=False,
                 **base,
             )
-            grads = kcp.chunk_gdn_bwd_kcp(
+            grads = kcp.cake_gdn_nondet_train_kcp_backward(
                 q,
                 k,
                 v,
@@ -2213,7 +2213,6 @@ def _run_rank(
                 saved=saved,
                 workspace=ws,
                 graph="replay",
-                deterministic=False,
                 **base,
             )
             g_res = {
@@ -2303,16 +2302,14 @@ def _run_rank(
             else:  # no frame proof on this torch: the replay form (its reason names the torch build)
                 expect = (False, None, "replay")
             kcp.graph_cache_clear()
-            wsg = kcp.WorkspaceKcp()
+            wsg = kcp.CakeGDNNondetKcpWorkspace()
             leaves = [
                 x.detach().clone().requires_grad_(True) for x in (q, k, v, g, beta)
             ]
             o = {**base, "graph": "replay", "reuse_recompute_tapes": reuse}
 
             def fn(*a, o=o, wsg=wsg):
-                return kcp.chunk_gdn_kcp(
-                    *a, ctx, workspace=wsg, deterministic=False, **o
-                )
+                return kcp.cake_gdn_nondet_kcp(*a, ctx, workspace=wsg, **o)
 
             steps: list[list] = []
             for _ in range(5):
@@ -2370,7 +2367,7 @@ def _run_rank(
     flags["graph_ckpt_capture"] = bool(capture_ok)
     # #7038: the backward's time with a resident one-thread kernel on a side stream, over its time alone
     ratio = _side_stream_ratio(
-        lambda: kcp.chunk_gdn_bwd_kcp(
+        lambda: kcp.cake_gdn_nondet_train_kcp_backward(
             q,
             k,
             v,
@@ -2380,7 +2377,6 @@ def _run_rank(
             dout,
             saved=res["saved"],
             workspace=ws,
-            deterministic=False,
             **base,
         ),
         device,
@@ -2435,7 +2431,7 @@ def _run_rank(
     # the deterministic route's (b1, b2 as all_to_all_single where any fragment crosses), no parameter reduction
     with _NamedCounter() as cc_nd:
         cc_nd.phase = "bwd"
-        kcp.chunk_gdn_bwd_kcp(
+        kcp.cake_gdn_nondet_train_kcp_backward(
             q,
             k,
             v,
@@ -2445,7 +2441,6 @@ def _run_rank(
             dout,
             saved=res["saved"],
             workspace=ws,
-            deterministic=False,
             **base,
         )
     coll_nd = {
@@ -2453,19 +2448,21 @@ def _run_rank(
         "tags": _coll_tags(kcp.LAST_CALL["bwd"]["sequence"]),
     }
     # (f) the deterministic route (flashinfer.cake_gdn_det_train_kcp objects, its own partition / context /
-    # workspace of the same row) and this route through the facade (deterministic=False) on the same operands
+    # workspace of the same row) and this route through its facade on the same operands
     det_api = importlib.import_module(DET_API)
     det_kcp = _det_mod("cake_kcp")
     api = importlib.import_module(FACADE)
-    det_part, _ = _partition_with(det_api.partition_det_kcp, row)
-    det_ctx = det_api.build_context_det_kcp(det_part, group, rank, device)
-    det_ws = det_api.WorkspaceDetKcp()
-    d_out, d_saved = det_api.chunk_gdn_det_fwd_kcp(
+    det_part, _ = _partition_with(det_api.cake_gdn_det_train_kcp_partition, row)
+    det_ctx = det_api.cake_gdn_det_train_kcp_build_context(
+        det_part, group, rank, device
+    )
+    det_ws = det_api.CakeGDNDetKcpWorkspace()
+    d_out, d_saved = det_api.cake_gdn_det_train_kcp_forward(
         q, k, v, g, beta, det_ctx, workspace=det_ws, **base
     )
     with _NamedCounter() as cc_det:
         cc_det.phase = "bwd"
-        d_grads = det_api.chunk_gdn_det_bwd_kcp(
+        d_grads = det_api.cake_gdn_det_train_kcp_backward(
             q, k, v, g, beta, det_ctx, dout, saved=d_saved, workspace=det_ws, **base
         )
     coll_det = {
@@ -2476,10 +2473,10 @@ def _run_rank(
         "out": d_out,
         **dict(zip(("dq", "dk", "dv", "dbeta", "dg"), d_grads, strict=True)),
     }
-    f_out, f_saved = api.chunk_gdn_fwd_kcp(
-        q, k, v, g, beta, ctx, workspace=ws, deterministic=False, **base
+    f_out, f_saved = api.cake_gdn_nondet_train_kcp_forward(
+        q, k, v, g, beta, ctx, workspace=ws, **base
     )
-    f_grads = api.chunk_gdn_bwd_kcp(
+    f_grads = api.cake_gdn_nondet_train_kcp_backward(
         q,
         k,
         v,
@@ -2489,7 +2486,6 @@ def _run_rank(
         dout,
         saved=f_saved,
         workspace=ws,
-        deterministic=False,
         **base,
     )
     res_facade = {
@@ -2501,7 +2497,8 @@ def _run_rank(
         "facade_saved": type(f_saved).__name__,
     }
     flags["facade_routes_nondet"] = (
-        type(f_saved).__name__ == "SavedKcp" and type(d_saved).__name__ == "SavedDetKcp"
+        type(f_saved).__name__ == "CakeGDNNondetKcpSaved"
+        and type(d_saved).__name__ == "CakeGDNDetKcpSaved"
     )
     judge.fp64("det_route", res_det, refs)
     judge.fp64("facade_nondet", res_facade, refs)
@@ -2707,10 +2704,10 @@ def _run_rank_poison(
     result_dir: str | None,
     backend: str,
 ) -> dict:
-    """(d) one ``WorkspaceKcp`` for both rows of the pair: the first row's forward + backward, every pool and tape it
+    """(d) one ``CakeGDNNondetKcpWorkspace`` for both rows of the pair: the first row's forward + backward, every pool and tape it
     left NaN, the workspace sized for the second row (pools kept where large enough, the second row's tapes bound),
     every pool and tape NaN again, then the second row's forward + backward.  Both rows within the FP64 budgets."""
-    ws = kcp.WorkspaceKcp()
+    ws = kcp.CakeGDNNondetKcpWorkspace()
     ref_mod = _reference()
     t_start = time.time()
     flags: dict[str, bool] = {}
@@ -2719,7 +2716,7 @@ def _run_rank_poison(
     for i, row in enumerate(pair.rows):
         H_qk, HV = row.heads
         part, cu = _partition(row)
-        ctx = plan.build_context_kcp(part, group, rank, device)
+        ctx = plan.cake_gdn_nondet_train_kcp_build_context(part, group, rank, device)
         ops = _local_inputs(row, part, cu, rank, device)
         q, k, v, g, beta, dout = (ops[n] for n in ("q", "k", "v", "g", "beta", "dout"))
         refs = _local_reference(row, part, cu, rank, device)
@@ -2740,7 +2737,7 @@ def _run_rank_poison(
             flags["poisoned"] = p_bound["bytes"] > 0
 
         def one_pass(**opts) -> dict:
-            out, saved = kcp.chunk_gdn_fwd_kcp(
+            out, saved = kcp.cake_gdn_nondet_train_kcp_forward(
                 q,
                 k,
                 v,
@@ -2748,11 +2745,10 @@ def _run_rank_poison(
                 beta,
                 ctx,
                 workspace=ws,
-                deterministic=False,
                 backend=backend,
                 **opts,
             )
-            dq, dk, dv, dbeta, dg = kcp.chunk_gdn_bwd_kcp(
+            dq, dk, dv, dbeta, dg = kcp.cake_gdn_nondet_train_kcp_backward(
                 q,
                 k,
                 v,
@@ -2762,7 +2758,6 @@ def _run_rank_poison(
                 dout,
                 saved=saved,
                 workspace=ws,
-                deterministic=False,
                 backend=backend,
                 **opts,
             )
@@ -2878,7 +2873,7 @@ def _rendezvous_port_taken(err: BaseException) -> bool:
 def _spawn_row(obj, backend: str, kind: str) -> None:
     """``obj`` (a row or a poison pair) on ``obj.W`` spawned ranks of this node; rank 0's report decides.  A start
     whose rendezvous port was taken is retried on a fresh port (:data:`RENDEZVOUS_TRIES`)."""
-    with tempfile.TemporaryDirectory(prefix="cake_gdn_train_kcp_dist_") as tmp:
+    with tempfile.TemporaryDirectory(prefix="cake_gdn_nondet_train_kcp_dist_") as tmp:
         result_dir = os.environ.get("KCP_TEST_RESULT_DIR") or tmp
         for attempt in range(RENDEZVOUS_TRIES):
             try:
@@ -3125,7 +3120,7 @@ def test_multi_gpu_rows(row: Row, slurm) -> None:
 
 @pytest.mark.parametrize("pair", _selected_poison_pairs(), ids=_pair_id)
 def test_poisoned_workspace_pairs(pair: PoisonPair, slurm) -> None:
-    """(d) one ``WorkspaceKcp`` reused across the pair's two token layouts on one group, every pool and tape NaN in
+    """(d) one ``CakeGDNNondetKcpWorkspace`` reused across the pair's two token layouts on one group, every pool and tape NaN in
     between: both rows within the FP64 budgets."""
     if _test_mode() != "full":
         pytest.skip("KCP_TEST_MODE=forward: the forward-only rows run instead")
@@ -3238,10 +3233,10 @@ def test_long_chain_rows_have_long_owner_chains() -> None:
         part, _ = _partition(row)
         owned = 0
         for r in range(row.W):
-            ctx = plan.build_context_kcp(
+            ctx = plan.cake_gdn_nondet_train_kcp_build_context(
                 part, None, r, torch.device("cpu"), 4, sm_count=148
             )
-            tb = kcp.WorkspaceKcp().tables(ctx, HV)
+            tb = kcp.CakeGDNNondetKcpWorkspace().tables(ctx, HV)
             for fam in OWNER_FAMILIES:
                 ch = tb.chains[fam]
                 lengths = [
@@ -3376,7 +3371,7 @@ def _run_rank_conv(
     from flashinfer import cake_causal_conv1d_det_train_kcp as conv_kcp
 
     part, cu = _partition(row)
-    ctx = plan.build_context_kcp(part, group, rank, device)
+    ctx = plan.cake_gdn_nondet_train_kcp_build_context(part, group, rank, device)
     total = cu[-1]
     gen = torch.Generator(device="cpu").manual_seed(43567)
     x_all = (torch.randn(total, CONV_C, generator=gen) * 0.5).to(torch.bfloat16)
@@ -3471,7 +3466,7 @@ def test_conv_halo_row(slurm) -> None:
 
 # ----------------------------------------------------------------------------------------------------------------
 # Whole-layer checkpoint rows (issue #7818): KCP convolution -> packed q | k | v views -> caller L2 norm of q, k ->
-# chunk_gdn_kcp (deterministic=False), one checkpointed region per layer with one RecomputeHandleKcp.  Gated: the GDN
+# cake_gdn_nondet_kcp, one checkpointed region per layer with one CakeGDNNondetKcpRecomputeHandle.  Gated: the GDN
 # part of the recompute exchanges nothing (with a convolution that takes the handle the whole recompute exchanges
 # nothing; before that, exactly the convolution's own forward collectives remain, the whole-layer zero is reported as
 # pending); the original forward and the backward exchange as in the plain checkpoint; the direct backward's
@@ -3586,7 +3581,7 @@ def _run_rank_layer(
     H_qk, HV = row.heads
     C = (2 * H_qk + HV) * 128
     part, cu = _partition(row)
-    ctx = plan.build_context_kcp(part, group, rank, device)
+    ctx = plan.cake_gdn_nondet_train_kcp_build_context(part, group, rank, device)
     gen = torch.Generator(device="cpu").manual_seed(78180)
     x_all = (torch.randn(cu[-1], C, generator=gen) * 0.5).to(torch.bfloat16)
     w_all = (torch.randn(C, CONV_WIDTH, generator=gen) * 0.5).float()
@@ -3609,7 +3604,7 @@ def _run_rank_layer(
             q = _l2_normalize(qkv[:, :H_qk])
             k = _l2_normalize(qkv[:, H_qk : 2 * H_qk])
         v = qkv[:, 2 * H_qk :]
-        return kcp.chunk_gdn_kcp(
+        return kcp.cake_gdn_nondet_kcp(
             q,
             k,
             v,
@@ -3619,7 +3614,6 @@ def _run_rank_layer(
             recompute_handle=h,
             save_transfer=False,
             backend=backend,
-            deterministic=False,
             **({"use_qk_l2norm_in_kernel": True} if l2n else {}),
         )
 
@@ -3633,7 +3627,7 @@ def _run_rank_layer(
 
     def run(mode: str):
         leaves = leaves_of()
-        hd = kcp.RecomputeHandleKcp() if mode == "handle" else None
+        hd = kcp.CakeGDNNondetKcpRecomputeHandle() if mode == "handle" else None
         from torch.utils.checkpoint import checkpoint
 
         with _NamedCounter() as cc:
@@ -3668,8 +3662,10 @@ def _run_rank_layer(
     # (b) the deterministic layer (its own context of the same partition; the convolution reads it by duck typing):
     # the direct backward's collectives by name
     det_api = importlib.import_module(DET_API)
-    det_part, _ = _partition_with(det_api.partition_det_kcp, row)
-    det_ctx = det_api.build_context_det_kcp(det_part, group, rank, device)
+    det_part, _ = _partition_with(det_api.cake_gdn_det_train_kcp_partition, row)
+    det_ctx = det_api.cake_gdn_det_train_kcp_build_context(
+        det_part, group, rank, device
+    )
     det_leaves = leaves_of()
     with _NamedCounter() as cc_det:
         y_d = conv_kcp.cake_causal_conv1d_det_kcp(det_leaves[0], det_leaves[1], det_ctx)
@@ -3679,7 +3675,7 @@ def _run_rank_layer(
         else:
             qd = _l2_normalize(qkv_d[:, :H_qk])
             kd = _l2_normalize(qkv_d[:, H_qk : 2 * H_qk])
-        out_det = det_api.chunk_gdn_det_kcp(
+        out_det = det_api.cake_gdn_det_kcp(
             qd,
             kd,
             qkv_d[:, 2 * H_qk :],
@@ -3780,7 +3776,7 @@ def _run_rank_layer(
 
 @pytest.mark.parametrize("row", LAYER_ROWS, ids=_row_id)
 def test_layer_checkpoint_rows(row: Row, slurm) -> None:
-    """#7818 whole-layer rows: KCP convolution + L2 norm + chunk_gdn_kcp (deterministic=False) in one checkpointed
+    """#7818 whole-layer rows: KCP convolution + L2 norm + cake_gdn_nondet_kcp in one checkpointed
     region with one recompute handle (see the block comment above).  Runs under Slurm with >= the row's ranks."""
     if slurm is None:
         pytest.skip("the layer rows run under Slurm")
@@ -3814,7 +3810,7 @@ def test_layer_checkpoint_rows(row: Row, slurm) -> None:
 # * norm off unchanged: the v1 records keep their library names and the norm-off route launches only them (the sha256
 #   of their 36 sources is reported; the render's SASS identity against the previous package decides the bits);
 # * packed QKV views with the norm: within the budgets of the contiguous call; the backward writes one packed dQKV
-#   row and ``packed_qkv_views_kcp`` hands it to the packed leaf without a concatenation;
+#   row and ``cake_gdn_nondet_train_kcp_packed_qkv_views`` hands it to the packed leaf without a concatenation;
 # * memory: no ``qn`` / ``kn`` / ``qk_rstd`` in the arena after a forward or a backward; the bytes a forward retains
 #   with the norm == without + ``8 T_r H_qk`` (the saved r); saved bytes on - off == the query's ``qk_rstd`` term;
 # * ``save_mode="light_akk"`` (the light set plus #1_l2n's ``Akk`` tape; the light replay runs ``fwd_prep_replay_l2n``,
@@ -3992,7 +3988,7 @@ def _prep_tapes(
         ctx,
         scale=None,
         opts=opts,
-        workspace=kcp.WorkspaceKcp(),
+        workspace=kcp.CakeGDNNondetKcpWorkspace(),
         backward=apply,
         dout=(torch.zeros(v.shape, dtype=v.dtype, device=v.device) if apply else None),
     )
@@ -4030,14 +4026,14 @@ def _run_rank_l2n(
     jit = _mod("cake_jit")
     H_qk, HV = row.heads
     part, cu = _partition(row)
-    ctx = plan.build_context_kcp(part, group, rank, device)
+    ctx = plan.cake_gdn_nondet_train_kcp_build_context(part, group, rank, device)
     ops = _local_inputs(row, part, cu, rank, device)
     q = _raw_qk(row, part, cu, rank, ops["q"], 1)
     k = _raw_qk(row, part, cu, rank, ops["k"], 2)
     v, g, beta, dout = (ops[n] for n in ("v", "g", "beta", "dout"))
     del ops
     T_r = int(q.shape[0])
-    ws = kcp.WorkspaceKcp()
+    ws = kcp.CakeGDNNondetKcpWorkspace()
     base = {"backend": backend}
     kernels = backend == "kernels"
     t_start = time.time()
@@ -4054,11 +4050,11 @@ def _run_rank_l2n(
 
     def saved_pass(qq=q, kk=k, workspace=ws, **opts) -> dict:
         o = {**base, **opts}
-        out, saved = kcp.chunk_gdn_fwd_kcp(
-            qq, kk, v, g, beta, ctx, workspace=workspace, deterministic=False, **o
+        out, saved = kcp.cake_gdn_nondet_train_kcp_forward(
+            qq, kk, v, g, beta, ctx, workspace=workspace, **o
         )
         rec_f = dict(kcp.LAST_CALL["fwd"])
-        dq, dk, dv, dbeta, dg = kcp.chunk_gdn_bwd_kcp(
+        dq, dk, dv, dbeta, dg = kcp.cake_gdn_nondet_train_kcp_backward(
             qq,
             kk,
             v,
@@ -4068,7 +4064,6 @@ def _run_rank_l2n(
             dout,
             saved=saved,
             workspace=workspace,
-            deterministic=False,
             **o,
         )
         return {
@@ -4086,10 +4081,10 @@ def _run_rank_l2n(
     def autograd_pass(ckpt: bool, *, handle=False, twice=False, **opts) -> dict:
         leaves = [x.detach().clone().requires_grad_(True) for x in (q, k, v, g, beta)]
         o = {**base, **opts}
-        hd = kcp.RecomputeHandleKcp() if handle else None
+        hd = kcp.CakeGDNNondetKcpRecomputeHandle() if handle else None
 
         def fn(q_, k_, v_, g_, b_, h_):
-            return kcp.chunk_gdn_kcp(
+            return kcp.cake_gdn_nondet_kcp(
                 q_,
                 k_,
                 v_,
@@ -4098,7 +4093,6 @@ def _run_rank_l2n(
                 ctx,
                 workspace=ws,
                 recompute_handle=h_,
-                deterministic=False,
                 **o,
             )
 
@@ -4268,10 +4262,12 @@ def _run_rank_l2n(
             ] == [g_ for _r, g_ in lb["records"]]
         tape = int(ctx.R) * HV * 128
         q_light = int(
-            gb.gdn_saved_bytes_kcp(ctx, H_qk=H_qk, HV=HV, with_conv=False, **L2N)
+            gb.cake_gdn_nondet_train_kcp_saved_bytes(
+                ctx, H_qk=H_qk, HV=HV, with_conv=False, **L2N
+            )
         )
         q_akk = int(
-            gb.gdn_saved_bytes_kcp(
+            gb.cake_gdn_nondet_train_kcp_saved_bytes(
                 ctx, H_qk=H_qk, HV=HV, save_mode="light_akk", with_conv=False, **L2N
             )
         )
@@ -4344,13 +4340,15 @@ def _run_rank_l2n(
 
     # (b) the deterministic package with the norm on the same raw operands (its own partition / context / workspace)
     det_api = importlib.import_module(DET_API)
-    det_part, _ = _partition_with(det_api.partition_det_kcp, row)
-    det_ctx = det_api.build_context_det_kcp(det_part, group, rank, device)
-    det_ws = det_api.WorkspaceDetKcp()
-    d_out, d_saved = det_api.chunk_gdn_det_fwd_kcp(
+    det_part, _ = _partition_with(det_api.cake_gdn_det_train_kcp_partition, row)
+    det_ctx = det_api.cake_gdn_det_train_kcp_build_context(
+        det_part, group, rank, device
+    )
+    det_ws = det_api.CakeGDNDetKcpWorkspace()
+    d_out, d_saved = det_api.cake_gdn_det_train_kcp_forward(
         q, k, v, g, beta, det_ctx, workspace=det_ws, **base, **L2N
     )
-    d_grads = det_api.chunk_gdn_det_bwd_kcp(
+    d_grads = det_api.cake_gdn_det_train_kcp_backward(
         q, k, v, g, beta, det_ctx, dout, saved=d_saved, workspace=det_ws, **base, **L2N
     )
     res_det = {
@@ -4363,7 +4361,7 @@ def _run_rank_l2n(
 
     # (c) the composed chain on the forward's own rows.  The reference pass exchanges states, so every rank issues it (a
     # rank without tokens passes its empty rows); skipping it there would put the ranks' collectives out of step.
-    ws0 = kcp.WorkspaceKcp()
+    ws0 = kcp.CakeGDNNondetKcpWorkspace()
     ref = saved_pass(
         qq=(rec_fwd_qk["qn"] if T_r > 0 else q).clone(),
         kk=(rec_fwd_qk["kn"] if T_r > 0 else k).clone(),
@@ -4440,12 +4438,14 @@ def _run_rank_l2n(
     split_before = dict(kcp.PACKED_SPLIT_STATS)
     qkv_leaf = buf.detach().clone().requires_grad_(True)
     g_leaf, b_leaf = (x.detach().clone().requires_grad_(True) for x in (g, beta))
-    pq, pk, pv = kcp.packed_qkv_views_kcp(qkv_leaf, H_qk=H_qk, HV=HV)
+    pq, pk, pv = kcp.cake_gdn_nondet_train_kcp_packed_qkv_views(
+        qkv_leaf, H_qk=H_qk, HV=HV
+    )
     try:
         from torch.profiler import ProfilerActivity, profile
 
         with profile(activities=[ProfilerActivity.CPU]) as prof:
-            out_split = kcp.chunk_gdn_kcp(
+            out_split = kcp.cake_gdn_nondet_kcp(
                 pq,
                 pk,
                 pv,
@@ -4453,7 +4453,6 @@ def _run_rank_l2n(
                 b_leaf,
                 ctx,
                 workspace=ws,
-                deterministic=False,
                 **base,
                 **L2N,
             )
@@ -4468,7 +4467,7 @@ def _run_rank_l2n(
         info["profiler_copy_ops"] = (
             f"unavailable: {type(exc).__name__}: {str(exc)[:120]}"
         )
-        out_split = kcp.chunk_gdn_kcp(
+        out_split = kcp.cake_gdn_nondet_kcp(
             pq,
             pk,
             pv,
@@ -4476,7 +4475,6 @@ def _run_rank_l2n(
             b_leaf,
             ctx,
             workspace=ws,
-            deterministic=False,
             **base,
             **L2N,
         )
@@ -4501,9 +4499,7 @@ def _run_rank_l2n(
 
     # issue #8367 with the norm: plain split views, direct and checkpointed (see _run_rank)
     def gdn_call(*a):
-        return kcp.chunk_gdn_kcp(
-            *a, ctx, workspace=ws, deterministic=False, **base, **L2N
-        )
+        return kcp.cake_gdn_nondet_kcp(*a, ctx, workspace=ws, **base, **L2N)
 
     for ck, tag in ((False, "direct"), (True, "ckpt")):
         res_plain, hooks_ok = _plain_split_pass(
@@ -4524,7 +4520,7 @@ def _run_rank_l2n(
         kcp.graph_cache_clear()
         events = []
         for _ in range(4):
-            out_g, saved_g = kcp.chunk_gdn_fwd_kcp(
+            out_g, saved_g = kcp.cake_gdn_nondet_train_kcp_forward(
                 q,
                 k,
                 v,
@@ -4533,11 +4529,10 @@ def _run_rank_l2n(
                 ctx,
                 workspace=ws,
                 graph="replay",
-                deterministic=False,
                 **base,
                 **L2N,
             )
-            grads_g = kcp.chunk_gdn_bwd_kcp(
+            grads_g = kcp.cake_gdn_nondet_train_kcp_backward(
                 q,
                 k,
                 v,
@@ -4548,7 +4543,6 @@ def _run_rank_l2n(
                 saved=saved_g,
                 workspace=ws,
                 graph="replay",
-                deterministic=False,
                 **base,
                 **L2N,
             )
@@ -4596,7 +4590,7 @@ def _run_rank_l2n(
             kcp.graph_cache_clear()
             events, sources = [], []
             for _ in range(4):
-                out_g, saved_g = kcp.chunk_gdn_fwd_kcp(
+                out_g, saved_g = kcp.cake_gdn_nondet_train_kcp_forward(
                     q,
                     k,
                     v,
@@ -4606,11 +4600,10 @@ def _run_rank_l2n(
                     workspace=ws,
                     graph="replay",
                     save_mode="light_akk",
-                    deterministic=False,
                     **base,
                     **L2N,
                 )
-                grads_g = kcp.chunk_gdn_bwd_kcp(
+                grads_g = kcp.cake_gdn_nondet_train_kcp_backward(
                     q,
                     k,
                     v,
@@ -4622,7 +4615,6 @@ def _run_rank_l2n(
                     workspace=ws,
                     graph="replay",
                     save_mode="light_akk",
-                    deterministic=False,
                     **base,
                     **L2N,
                 )
@@ -4664,13 +4656,13 @@ def _run_rank_l2n(
     flags["l2n_graph_capture_light_akk"] = bool(akk_graph_ok)
 
     # (f) memory: nothing of the norm in the arena after a forward / a backward; retained after a forward = off + r
-    wsm = kcp.WorkspaceKcp()
+    wsm = kcp.CakeGDNNondetKcpWorkspace()
     bad = {*kcp.QK_TAPES, kcp.QK_RSTD}
-    out_m, saved_m = kcp.chunk_gdn_fwd_kcp(
-        q, k, v, g, beta, ctx, workspace=wsm, deterministic=False, **base, **L2N
+    out_m, saved_m = kcp.cake_gdn_nondet_train_kcp_forward(
+        q, k, v, g, beta, ctx, workspace=wsm, **base, **L2N
     )
     flags["l2n_absent_after_forward"] = not (set(wsm._tapes) & bad)
-    kcp.chunk_gdn_bwd_kcp(
+    kcp.cake_gdn_nondet_train_kcp_backward(
         q,
         k,
         v,
@@ -4680,7 +4672,6 @@ def _run_rank_l2n(
         dout,
         saved=saved_m,
         workspace=wsm,
-        deterministic=False,
         **base,
         **L2N,
     )
@@ -4688,16 +4679,16 @@ def _run_rank_l2n(
     del out_m, saved_m, wsm
 
     def retained(**opts) -> tuple[int, int, int]:
-        kcp.chunk_gdn_fwd_kcp(
-            q, k, v, g, beta, ctx, workspace=None, deterministic=False, **base, **opts
+        kcp.cake_gdn_nondet_train_kcp_forward(
+            q, k, v, g, beta, ctx, workspace=None, **base, **opts
         )  # warm-up of the form
         torch.cuda.synchronize(device)
         gc.collect()
         torch.cuda.reset_peak_memory_stats(device)
         before = _alloc_stats(device)
         live = torch.cuda.memory_allocated(device)
-        out_r, saved_r = kcp.chunk_gdn_fwd_kcp(
-            q, k, v, g, beta, ctx, workspace=None, deterministic=False, **base, **opts
+        out_r, saved_r = kcp.cake_gdn_nondet_train_kcp_forward(
+            q, k, v, g, beta, ctx, workspace=None, **base, **opts
         )
         torch.cuda.synchronize(device)
         after = _alloc_stats(device)
@@ -4725,9 +4716,11 @@ def _run_rank_l2n(
     }
     flags["l2n_post_forward_eq_off_plus_rstd"] = kept_on - kept_off == rstd_bytes
     q_on = int(
-        gb.gdn_saved_bytes_kcp(ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=True)
+        gb.cake_gdn_nondet_train_kcp_saved_bytes(
+            ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=True
+        )
     )
-    q_off = int(gb.gdn_saved_bytes_kcp(ctx, H_qk=H_qk, HV=HV))
+    q_off = int(gb.cake_gdn_nondet_train_kcp_saved_bytes(ctx, H_qk=H_qk, HV=HV))
     info["saved_query"] = {"on": q_on, "off": q_off}
     flags["l2n_saved_bytes_on_minus_off"] = (
         saved_on_b - saved_off_b == rstd_bytes == q_on - q_off
@@ -4807,8 +4800,8 @@ def test_l2n_rows(row: Row, slurm) -> None:
 
 @pytest.mark.parametrize("row", LAYER_ROWS, ids=_row_id)
 def test_l2n_layer_checkpoint_rows(row: Row, slurm) -> None:
-    """#7817 whole-layer rows: KCP convolution + ``chunk_gdn_kcp(use_qk_l2norm_in_kernel=True,
-    deterministic=False)`` on the RAW convolution output views in one checkpointed region (the B3 boundary), with
+    """#7817 whole-layer rows: KCP convolution + ``cake_gdn_nondet_kcp(use_qk_l2norm_in_kernel=True)``
+    on the RAW convolution output views in one checkpointed region (the B3 boundary), with
     and without a recompute handle, against the FP64 layer oracle and one another within the budgets."""
     if slurm is None:
         pytest.skip("the layer rows run under Slurm")

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 The registry (``cake_jit``), the loader glue (``cake_backend``) and the manifests of the non-deterministic Cake packed
-GDN KCP training package ``flashinfer.experimental.cake_gdn_train_kcp``: the package contract that needs no device --
+GDN KCP training package ``flashinfer.experimental.cake.cake_gdn_nondet_train_kcp``: the package contract that needs no device --
 ``build.json`` (schema ``cake-build/1``, the shipped programs, never a test-only one, digests over the listed sources),
 ``build.test.json`` (the test-only programs), the program names against the identity rule (prefix ``cake_gdn_train``,
 never a library name of the deterministic twin), the records against the frozen kernel ABIs, the loader's independence
@@ -36,14 +36,14 @@ from pathlib import Path
 import pytest
 import torch
 
-PACKAGE = "cake_gdn_train_kcp"
+PACKAGE = "cake_gdn_nondet_train_kcp"
 
 
 @pytest.fixture(autouse=True, scope="module")
 def _few_cpu_threads():
     """The CPU emulation runs many small matmuls and elementwise ops.  On a host with hundreds of CPUs, torch's default
     intra-op pool and the oneDNN matmul path (its own pool, which torch.set_num_threads does not resize) spend far more
-    time synchronizing threads than computing (see ``test_cake_gdn_train_kcp.py``), so this module runs with at most 8
+    time synchronizing threads than computing (see ``test_cake_gdn_nondet_train_kcp.py``), so this module runs with at most 8
     threads and oneDNN off, as that suite does."""
     threads, onednn = torch.get_num_threads(), torch.backends.mkldnn.enabled
     torch.set_num_threads(min(threads, 8))
@@ -56,25 +56,19 @@ def _few_cpu_threads():
 
 
 def _package_import() -> str:
-    """The import path of the package: the test-helper registry's entry when it lists the package, else the in-tree
-    path (the registry has no entry for this package yet)."""
+    """The import path of the package: the test-helper registry's entry when the registry is importable, else the
+    in-tree path."""
     try:
         from tests.test_helpers.cake_package import PACKAGES
-
-        return PACKAGES[PACKAGE]
-    except (ImportError, KeyError):
-        return f"flashinfer.experimental.{PACKAGE}"
+    except ImportError:
+        return f"flashinfer.experimental.cake.{PACKAGE}"
+    return PACKAGES[PACKAGE]
 
 
 def _package(sub: str | None = None):
-    """The package (or one of its modules) through the test-helper registry when it lists the package, else directly."""
-    try:
-        from tests.test_helpers.cake_package import cake_package
-
-        return cake_package(PACKAGE, sub)
-    except (ImportError, KeyError):
-        path = _package_import()
-        return importlib.import_module(path if sub is None else f"{path}.{sub}")
+    """The package (or one of its modules) at :func:`_package_import`'s path."""
+    path = _package_import()
+    return importlib.import_module(path if sub is None else f"{path}.{sub}")
 
 
 PACKAGE_IMPORT = _package_import()
@@ -230,8 +224,8 @@ SELECT_RULES = ("always", "columns", "ctas_per_head")
 
 
 def _registry():
-    """The registry module, or a skip while the seed registry is not in the tree yet."""
-    return pytest.importorskip(f"{PACKAGE_IMPORT}.cake_jit")
+    """The registry module (a hard import: a stale package path fails, never skips)."""
+    return importlib.import_module(f"{PACKAGE_IMPORT}.cake_jit")
 
 
 def _cake_build():

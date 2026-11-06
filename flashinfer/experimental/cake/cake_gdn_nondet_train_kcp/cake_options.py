@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Options of the context-parallel (KCP) packed GDN training route
-(``flashinfer.experimental.cake_gdn_train_kcp``): every behaviour switch of the
-entry points is a keyword-only field of :class:`OptionsKcp`, validated once
-per call by :meth:`OptionsKcp.check`.  No field is read from the environment;
+(``flashinfer.experimental.cake.cake_gdn_nondet_train_kcp``): every behaviour switch of the
+entry points is a keyword-only field of :class:`CakeGDNNondetKcpOptions`, validated once
+per call by :meth:`CakeGDNNondetKcpOptions.check`.  No field is read from the environment;
 the package reads ``os.environ`` nowhere.
 
 Public fields (defaults are the shipped behaviour)::
@@ -230,8 +230,8 @@ def validate_ring(n_d_max: int) -> None:
 
 
 @dataclasses.dataclass(kw_only=True)
-class OptionsKcp:
-    """The keyword-only options of ``chunk_gdn_kcp`` / ``chunk_gdn_fwd_kcp`` / ``chunk_gdn_bwd_kcp`` (module docstring).
+class CakeGDNNondetKcpOptions:
+    """The keyword-only options of ``cake_gdn_nondet_kcp`` / ``cake_gdn_nondet_train_kcp_forward`` / ``cake_gdn_nondet_train_kcp_backward`` (module docstring).
 
     :meth:`check` validates the field values and the cross-field rules (ring needs ``save_transfer=False``;
     ``reuse_recompute_tapes`` a bool or ``"auto"``; ``use_qk_l2norm_in_kernel`` a bool; a
@@ -266,7 +266,7 @@ class OptionsKcp:
             # (a captured graph bakes their addresses), guarded by the workspace's call count (cake_kcp._kept_stale)
             self.reuse_recompute_tapes = REUSE_RECOMPUTE_TAPES_DEFAULT
 
-    def check(self) -> OptionsKcp:
+    def check(self) -> CakeGDNNondetKcpOptions:
         if self.exchange not in EXCHANGES:
             raise ValueError(
                 f"exchange must be one of {EXCHANGES}, got {self.exchange!r}"
@@ -404,13 +404,13 @@ class OptionsKcp:
         )
 
 
-OPTION_NAMES = tuple(f.name for f in dataclasses.fields(OptionsKcp))
+OPTION_NAMES = tuple(f.name for f in dataclasses.fields(CakeGDNNondetKcpOptions))
 
 
-def make_options(options: Any = None, /, **kwargs: Any) -> OptionsKcp:
-    """A validated :class:`OptionsKcp` from an instance, a mapping, or keyword arguments (unknown names are a
+def make_options(options: Any = None, /, **kwargs: Any) -> CakeGDNNondetKcpOptions:
+    """A validated :class:`CakeGDNNondetKcpOptions` from an instance, a mapping, or keyword arguments (unknown names are a
     ``TypeError``: no option is ever read from anywhere but the call)."""
-    if isinstance(options, OptionsKcp):
+    if isinstance(options, CakeGDNNondetKcpOptions):
         if kwargs:
             options = dataclasses.replace(options, **kwargs)
         return options.check()
@@ -418,7 +418,7 @@ def make_options(options: Any = None, /, **kwargs: Any) -> OptionsKcp:
     if options is not None:
         if not isinstance(options, dict):
             raise TypeError(
-                f"options must be a OptionsKcp, a dict or None, got {type(options).__name__}"
+                f"options must be a CakeGDNNondetKcpOptions, a dict or None, got {type(options).__name__}"
             )
         merged.update(options)
     merged.update(kwargs)
@@ -427,7 +427,7 @@ def make_options(options: Any = None, /, **kwargs: Any) -> OptionsKcp:
         raise TypeError(
             f"unexpected option(s) {unknown}; known options: {list(OPTION_NAMES)}"
         )
-    return OptionsKcp(**merged).check()
+    return CakeGDNNondetKcpOptions(**merged).check()
 
 
 __all__ = [
@@ -468,7 +468,7 @@ __all__ = [
     "TRANSFER_WALKS_UNBUILT",
     "TRANSFER_WALK_DEFAULT",
     "USE_QK_L2NORM_DEFAULT",
-    "OptionsKcp",
+    "CakeGDNNondetKcpOptions",
     "make_options",
     "validate_heads",
     "validate_ring",

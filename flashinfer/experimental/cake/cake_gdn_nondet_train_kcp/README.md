@@ -5,15 +5,16 @@ DeltaNet) layers with native grouped Q/K heads: forward, backward and
 checkpoint replay over a process group whose ranks each hold fragments of the
 documents of one packed batch, with precise (FP32 / TF32x3-class) cross-rank
 passing of the per-document recurrent state.  Tokens never move between ranks;
-only affine summaries of the state do.  The deterministic twin of this package is
-`flashinfer.experimental.cake_gdn_det_train_kcp`: the same entry points and
-the same accuracy budgets, bitwise reproducible; it does not take this
-package's non-deterministic-only `save_mode` values (`"light_akk"`, see
-"Options").  This package's results stay
-within the deterministic route's accuracy budgets and are not bitwise equal
-to its results; today they are run-to-run reproducible for a fixed plan and
-partition, and later versions may use unordered reductions
-(`deterministic=False` is the opt-in).
+only affine summaries of the state do.
+
+The mode is in the name: this package is the non-deterministic route, and no
+entry takes a `deterministic` keyword.  Its deterministic counterpart is
+`flashinfer.cake_gdn_det_train_kcp` (backend
+`flashinfer.experimental.cake.cake_gdn_det_train_kcp`), a separate package.
+This package keeps that package's entry points and accuracy budgets; its
+results are not bitwise equal to that package's.  It also takes the
+`save_mode` value `"light_akk"`, which the deterministic package does not
+take (see "Options").
 
 Both the API and the backend are experimental: no compatibility guarantee.
 SM100 (B200 / GB200) and SM103 (B300 / GB300) are the acceptance architectures
@@ -23,113 +24,111 @@ backend selection, autotuning or trace-apply.  Its libraries are loaded
 prebuilt from `aot/` when the package ships them and JIT-built by FlashInfer
 from `build.json` otherwise (see "Layout of this package").  The package
 imports nothing else from FlashInfer (neither the KDA training package nor its
-deterministic twin: it ships its own copies of the programs it shares with
-the twin) and reads no environment variable.
+deterministic counterpart: it ships its own copies of the programs it shares
+with that package) and reads no environment variable.
 
 The numbers of this file (shapes, bytes, limits) are the contract.
 
-## Mode and dispatch rules
+## Mode
 
-| call | `deterministic=False` | any other value (the default, `True`, `None`, `0`, `1`, `"False"`) | under `torch.use_deterministic_algorithms(True)` (strict or `warn_only=True`) |
-|---|---|---|---|
-| `flashinfer.cake_gdn_train_kcp.*` (every entry, the byte queries and `is_gdn_train_kcp_supported` included) | runs this package | `ValueError` naming the deterministic entry, before any work | runs this package; no reroute, no mode or fallback warning (each entry's one-time `ExperimentalWarning` is unrelated to the mode) |
-| this package's compute entries (`chunk_gdn_kcp`, `chunk_gdn_fwd_kcp`, `chunk_gdn_bwd_kcp`) | runs | `ValueError` naming the deterministic entry | runs; no alert (every launch is fixed-order) |
-| `flashinfer.cake_gdn_det_train_kcp.*_det_*` (the deterministic route) | no `deterministic` keyword (`TypeError`) | no `deterministic` keyword | unchanged: every launch is fixed-order |
+* `flashinfer.cake_gdn_nondet_train_kcp` and this package run the
+  non-deterministic programs only.  No entry takes a `deterministic` keyword:
+  a stray one is a `TypeError`.  No call is routed to the deterministic
+  package, and nothing falls back to it.  A caller who wants the
+  deterministic route calls `flashinfer.cake_gdn_det_train_kcp`.
+* Every launch of this version is fixed-order today, so
+  `torch.use_deterministic_algorithms(True)`, strict or with
+  `warn_only=True`, runs this package unchanged: no alert, no warning and no
+  fallback.  The contract does not promise run-to-run bits: a later version
+  may launch unordered reductions.
+* The results are not bitwise equal to the deterministic package's: the
+  default segment plan and the fixed-order levers of this package
+  reassociate FP32 sums (see "Faster schedule").
 
-* This package and its facade `flashinfer.cake_gdn_train_kcp` are the
-  non-deterministic route only.  Nothing routes a call to the deterministic
-  package and nothing falls back to it: a caller who wants the deterministic
-  route calls `flashinfer.cake_gdn_det_train_kcp` (`partition_det_kcp`,
-  `build_context_det_kcp`, `chunk_gdn_det_kcp`, ...).
-* Every call states the mode: pass `deterministic=False` on every facade
-  call, the partition, the context and the byte queries included.
-* PyTorch's deterministic algorithms do not change the route.  A launch whose
-  result can vary run to run raises PyTorch's alert immediately before it runs
-  (`RuntimeError`; a `UserWarning` and then the launch under
-  `warn_only=True`).  Every launch of this version is fixed-order, so no call
-  raises it.
-* The partition / context / byte-query functions of this package
-  (`partition_kcp`, `build_context_kcp`, `gdn_*_bytes_kcp`) take no mode
-  keyword; their facade copies take `deterministic=False` like every facade
-  entry.
-
-## Public entry points (`flashinfer/cake_gdn_train_kcp.py`)
+## Public entry points (`flashinfer/cake_gdn_nondet_train_kcp.py`)
 
 ```python
-from flashinfer.cake_gdn_train_kcp import (
-    partition_kcp, build_context_kcp, PartitionKcp, ContextKcp, OptionsKcp,
-    RecomputeHandleKcp, chunk_gdn_kcp, chunk_gdn_fwd_kcp, chunk_gdn_bwd_kcp,
-    gdn_workspace_bytes_kcp, gdn_saved_bytes_kcp, gdn_comm_bytes_kcp,
-    is_gdn_train_kcp_supported,
+from flashinfer.cake_gdn_nondet_train_kcp import (
+    cake_gdn_nondet_kcp,
+    cake_gdn_nondet_train_kcp_backward,
+    cake_gdn_nondet_train_kcp_build_context,
+    cake_gdn_nondet_train_kcp_forward,
+    cake_gdn_nondet_train_kcp_partition,
+    cake_gdn_nondet_train_kcp_workspace_bytes,
 )
 
-nd = dict(deterministic=False)                                                         # required on every call
-part = partition_kcp(cu_seqlens_global_cpu, world_size, layout="zigzag_per_document", **nd)  # once per batch layout
-ctx = build_context_kcp(part, group, rank, device, conv_kernel_size=4, **nd)          # tables and collectives of this rank
+part = cake_gdn_nondet_train_kcp_partition(cu_seqlens_global_cpu, world_size, layout="zigzag_per_document")  # once per batch layout
+ctx = cake_gdn_nondet_train_kcp_build_context(part, group, rank, device, conv_kernel_size=4)                 # tables and collectives of this rank
 
-out = chunk_gdn_kcp(q, k, v, g, beta, ctx, **nd)                                       # autograd
-out, saved = chunk_gdn_fwd_kcp(q, k, v, g, beta, ctx, save_for_backward=True, **nd)
-dq, dk, dv, dbeta, dg = chunk_gdn_bwd_kcp(q, k, v, g, beta, ctx, dout, saved=saved, **nd)
-dq, dk, dv, dbeta, dg = chunk_gdn_bwd_kcp(q, k, v, g, beta, ctx, dout, **nd)           # saved=None: checkpoint replay
+out = cake_gdn_nondet_kcp(q, k, v, g, beta, ctx)                                                 # autograd
+out, saved = cake_gdn_nondet_train_kcp_forward(q, k, v, g, beta, ctx, save_for_backward=True)
+dq, dk, dv, dbeta, dg = cake_gdn_nondet_train_kcp_backward(q, k, v, g, beta, ctx, dout, saved=saved)
+dq, dk, dv, dbeta, dg = cake_gdn_nondet_train_kcp_backward(q, k, v, g, beta, ctx, dout)           # saved=None: checkpoint replay
 
-ws = gdn_workspace_bytes_kcp(ctx, H_qk=16, HV=48, **nd)                                # per rank, pure CPU: a fresh workspace's first call
+ws = cake_gdn_nondet_train_kcp_workspace_bytes(ctx, H_qk=16, HV=48)   # per rank, pure CPU: a fresh workspace's first call
 ```
 
-These thirteen names are the whole public surface (the `__all__` of
-`flashinfer/cake_gdn_train_kcp.py`; this package's `__init__.py` exports
-them beside its backend controls).  Every switch is a keyword argument of the
-public call (`OptionsKcp` fields); no module-level global and no environment
-variable selects anything.
+The public surface is the `__all__` of `flashinfer/cake_gdn_nondet_train_kcp.py`:
 
-### Names
+* functions: `cake_gdn_nondet_kcp`, `cake_gdn_nondet_train_kcp_forward`,
+  `cake_gdn_nondet_train_kcp_backward`, `cake_gdn_nondet_train_kcp_partition`,
+  `cake_gdn_nondet_train_kcp_build_context`,
+  `cake_gdn_nondet_train_kcp_packed_qkv_views`,
+  `cake_gdn_nondet_train_kcp_workspace_bytes`,
+  `cake_gdn_nondet_train_kcp_saved_bytes`,
+  `cake_gdn_nondet_train_kcp_comm_bytes` and
+  `is_cake_gdn_nondet_train_kcp_supported`;
+* types (resolved on first use): `CakeGDNNondetKcpContext`,
+  `CakeGDNNondetKcpOptions`, `CakeGDNNondetKcpPartition`,
+  `CakeGDNNondetKcpRecomputeHandle`, `CakeGDNNondetKcpSaved`,
+  `CakeGDNNondetKcpWorkspace` and `CakeGDNNondetKcpFunction`.
 
-Every name of this package is the deterministic twin's name without `det`:
+This package's `__init__.py` exports the same names except the support query,
+plus `CakeGDNNondetKcpFragment`, `CakeGDNNondetKcpCall` and
+`CakeGDNNondetKcpPackedQKVSplitFunction`.  Every public name contains
+`nondet`.  The submodules keep their internal names (`cake_kcp.SCALE`,
+`cake_kcp.LAST_CALL`, `cake_kcp.set_backend`, `cake_options.make_options`,
+`cake_bytes.cake_gdn_nondet_train_kcp_workspace_layout`, ...); they are not
+public.  Every switch is a keyword argument of the public call
+(`CakeGDNNondetKcpOptions` fields); no module-level global and no environment
+variable selects anything.  An options instance of another package is a
+`TypeError`; pass a mapping or this package's `CakeGDNNondetKcpOptions`.
 
-| deterministic (`cake_gdn_det_train_kcp`) | this package (`cake_gdn_train_kcp`) |
+### Migration from the former names
+
+The former names fail at import; there are no aliases.
+
+| former name | new name |
 |---|---|
-| `flashinfer.cake_gdn_det_train_kcp` | `flashinfer.cake_gdn_train_kcp` |
-| `flashinfer.experimental.cake_gdn_det_train_kcp` | `flashinfer.experimental.cake_gdn_train_kcp` |
-| `partition_det_kcp` | `partition_kcp` |
-| `build_context_det_kcp` | `build_context_kcp` |
-| `chunk_gdn_det_kcp` | `chunk_gdn_kcp` |
-| `chunk_gdn_det_fwd_kcp` | `chunk_gdn_fwd_kcp` |
-| `chunk_gdn_det_bwd_kcp` | `chunk_gdn_bwd_kcp` |
-| `gdn_det_workspace_bytes_kcp` | `gdn_workspace_bytes_kcp` |
-| `gdn_det_saved_bytes_kcp` | `gdn_saved_bytes_kcp` |
-| `gdn_det_comm_bytes_kcp` | `gdn_comm_bytes_kcp` |
-| `is_gdn_det_train_kcp_supported` | `is_gdn_train_kcp_supported` |
-| `OptionsDetKcp`, `ContextDetKcp`, `PartitionDetKcp`, `RecomputeHandleDetKcp`, `SavedDetKcp`, `WorkspaceDetKcp`, `CallDetKcp`, `FragmentDetKcp` | `OptionsKcp`, `ContextKcp`, `PartitionKcp`, `RecomputeHandleKcp`, `SavedKcp`, `WorkspaceKcp`, `CallKcp`, `FragmentKcp` |
-| `ChunkGDNDetFunctionKcp` | `ChunkGDNFunctionKcp` |
-| `packed_qkv_views_det_kcp`, `PackedQKVSplitDetKcp` | `packed_qkv_views_kcp`, `PackedQKVSplitKcp` (package level) |
+| `flashinfer.cake_gdn_train_kcp` | `flashinfer.cake_gdn_nondet_train_kcp` |
+| `flashinfer.experimental.cake_gdn_train_kcp` | `flashinfer.experimental.cake.cake_gdn_nondet_train_kcp` |
+| `chunk_gdn_kcp` | `cake_gdn_nondet_kcp` |
+| `ChunkGDNFunctionKcp` | `CakeGDNNondetKcpFunction` |
+| `chunk_gdn_fwd_kcp` / `chunk_gdn_bwd_kcp` | `cake_gdn_nondet_train_kcp_forward` / `cake_gdn_nondet_train_kcp_backward` |
+| `partition_kcp` / `build_context_kcp` | `cake_gdn_nondet_train_kcp_partition` / `cake_gdn_nondet_train_kcp_build_context` |
+| `packed_qkv_views_kcp` | `cake_gdn_nondet_train_kcp_packed_qkv_views` |
+| `gdn_workspace_bytes_kcp` / `gdn_saved_bytes_kcp` / `gdn_comm_bytes_kcp` | `cake_gdn_nondet_train_kcp_workspace_bytes` / `_saved_bytes` / `_comm_bytes` |
+| `gdn_workspace_layout_kcp` / `gdn_saved_layout_kcp` (in `cake_bytes`) | `cake_gdn_nondet_train_kcp_workspace_layout` / `_saved_layout` |
+| `is_gdn_train_kcp_supported` | `is_cake_gdn_nondet_train_kcp_supported` |
+| `ContextKcp`, `PartitionKcp`, `FragmentKcp`, `OptionsKcp`, `RecomputeHandleKcp`, `SavedKcp`, `WorkspaceKcp`, `CallKcp` | `CakeGDNNondetKcpContext`, `...Partition`, `...Fragment`, `...Options`, `...RecomputeHandle`, `...Saved`, `...Workspace`, `...Call` |
+| `PackedQKVSplitKcp` | `CakeGDNNondetKcpPackedQKVSplitFunction` |
+| `deterministic=False` on every entry | removed (no keyword) |
+| `MODE`, `check_mode`, `DEFAULT_SCALE`, `ND_ONLY_SAVE_MODES` | removed |
 
-The deterministic package is named by its det names (left column) only.
-This package binds none of the deterministic package's former no-det names
-(such as `kcp_partition` or `KcpContext`), and `chunk_gdn_kcp` is this
-package's own non-deterministic entry, never a deterministic object.
+### Library names
 
 The generated libraries are named `cake_gdn_train_<20 hex>` for the
 per-chunk programs and `cake_gdn_train_<20 hex>_kcp` for the
 context-parallel-only programs (`kcp_*`); the kernel symbol of a library is
-`kernel_<library>`.  No library name equals one of the deterministic
-package's libraries, past or present (`cake_gdn_det_train_<20 hex>[_kcp]`,
-and the `cake_gdn_train_<20 hex>` libraries the deterministic package shipped
-under its pre-rename name, whose context-parallel programs carried no `_kcp`).
+`kernel_<library>`.  The package rename does not change them.  No library
+name equals one of the deterministic package's libraries, past or present
+(`cake_gdn_det_train_<20 hex>[_kcp]`, and the `cake_gdn_train_<20 hex>`
+libraries the deterministic package shipped under its pre-rename name, whose
+context-parallel programs carried no `_kcp`).
 
-### Numerical mode
+### Faster schedule
 
-The packed GDN training routes come in four combinations:
-
-| | single rank (local) | context-parallel (KCP) |
-|---|---|---|
-| deterministic | `flashinfer.experimental.cake_gdn_det_train` | `flashinfer.cake_gdn_det_train_kcp` -> `flashinfer.experimental.cake_gdn_det_train_kcp` |
-| non-deterministic | `flashinfer.experimental.cake.cake_gdn_train` | `flashinfer.cake_gdn_train_kcp` with `deterministic=False` -> this package |
-
-* The facade `flashinfer.cake_gdn_train_kcp` and this package's compute
-  entries take `deterministic: bool = True` on every entry and raise
-  `ValueError` unless it is `False` (see "Mode and dispatch rules"): the
-  package holds no deterministic program, never routes to the deterministic
-  package and never falls back.
-* Faster schedule: the default segment plan of this package (`fill_small_guard`)
+* The default segment plan of this package (`fill_small_guard`)
   walks fewer intra-rank segments than the deterministic package's plan where
   segment merges cost more than they save: at `HV <= 12`, when no fragment
   exceeds 160 chunks, every rank walks each fragment as one chain (`P = 1`: no
@@ -148,19 +147,13 @@ The packed GDN training routes come in four combinations:
   `graph="replay"`) keeps the one-wave fill and the guard but not the `P = 1`
   rows (`fill_down_guard`): graph replay removes the launch cost that the
   fewer merges save, and the longer walks then cost more.
-* Reproducibility: the results are not bitwise equal to the deterministic
-  package's (the different segment plan and the fixed-order levers of this
-  package reassociate FP32 sums).  Every path of
-  this version is fixed-order, so for a fixed plan and partition the results
-  are run-to-run reproducible today; later versions may use unordered
-  reductions.  Only a path that launches an unordered reduction raises
-  PyTorch's alert for an operation without a deterministic implementation
-  under `torch.use_deterministic_algorithms(True)`; this version has none,
-  so no entry of this package raises it.
-* The mode is not stored in the context, the partition or the options: both
-  routes build the same plan objects.  The autograd node records its
-  forward's mode and its backward refuses another; `chunk_gdn_bwd_kcp`
-  refuses a saved set that is not this package's (`SavedKcp`).
+* The partition algorithm is the same as the deterministic package's, but the
+  head plan of a context is not: the per-rank `P` rule above and the table
+  layout differ.  The mode is not stored in the context, the partition or the
+  options; use each package's own context.  The autograd node keeps a private
+  package tag and its backward refuses a node of another package;
+  `cake_gdn_nondet_train_kcp_backward` refuses a saved set that is not this
+  package's (`CakeGDNNondetKcpSaved`).
 * Accuracy: every output stays within the deterministic route's budgets
   against the FP64 reference (`rel-RMS <= 1e-2`, `max-abs <= 2e-2` of
   `max|ref|`; the per-tensor KCP budgets of the deterministic tests).  The
@@ -188,7 +181,7 @@ The packed GDN training routes come in four combinations:
   measured module when reported.  Strided and contiguous inputs give the
   same results within the accuracy budgets.
 * When `q` / `k` / `v` are head views of one packed row, take them with
-  `packed_qkv_views_kcp` for full backward speed: plain `split` views of the
+  `cake_gdn_nondet_train_kcp_packed_qkv_views` for full backward speed: plain `split` views of the
   row give the same gradients, but torch's split backward concatenates them:
   about 0.2 ms (6-7 %) more backward on B200 and GB300 and 0.17 ms (7-8 %) on
   R200 at `(16, 48)` and 32,768 tokens (**Packed Q/K/V** below).
@@ -228,7 +221,7 @@ The packed GDN training routes come in four combinations:
   difference when it is positive, else at #1 too.  Under `graph="replay"`
   nothing is released, and the split form peaks above #1 by the `h` /
   `v_new` tapes (36,864 B per padded row at `HV = 48`).
-  `gdn_workspace_layout_kcp(...)` reports both as `forward` and
+  `cake_gdn_nondet_train_kcp_workspace_layout(...)` reports both as `forward` and
   `forward_split`.  The output and the saved set are
   bitwise those of the split form.  `save_mode="full"`,
   `boundary_mode="replay"`, a forward that hands its tapes to the kept-tape
@@ -264,7 +257,7 @@ The packed GDN training routes come in four combinations:
 
 ### Partition and context
 
-`partition_kcp(cu_seqlens_global_cpu, world_size, layout, fragments=None)`
+`cake_gdn_nondet_train_kcp_partition(cu_seqlens_global_cpu, world_size, layout, fragments=None)`
 splits the packed batch over `world_size` ranks: `"contiguous"` (equal
 contiguous slices), `"zigzag"` (the whole buffer in `2 * world_size` pieces,
 rank `r` holding pieces `r` and `2W - 1 - r`), `"zigzag_per_document"` (the
@@ -273,17 +266,17 @@ need not be multiples of the chunk length (64); ranks may hold unequal token
 counts; a fragment may be empty, one token long or cross a chunk boundary; a
 document may span any number of ranks including the whole group.
 
-`build_context_kcp(part, group, rank, device, conv_kernel_size=4)` returns
-the rank's `ContextKcp`: the fragment table, the state-ownership plan (head
+`cake_gdn_nondet_train_kcp_build_context(part, group, rank, device, conv_kernel_size=4)` returns
+the rank's `CakeGDNNondetKcpContext`: the fragment table, the state-ownership plan (head
 groups over `HV`, padded when `HV` does not divide by the group size), the
 causal-convolution halo plan (`conv_kernel_size - 1` history rows per
 crossing-in fragment) and the int32 device tables of the kernels.  The same
 context serves every call of the same batch layout and head pair.
-`build_context_kcp(..., graph_replay=True)` selects the segment plan for
-calls with `graph="replay"` (see "Numerical mode"); such a context serves
+`cake_gdn_nondet_train_kcp_build_context(..., graph_replay=True)` selects the segment plan for
+calls with `graph="replay"` (see "Faster schedule"); such a context serves
 eager calls too.
 
-### Options (`OptionsKcp`, keyword-only; defaults in bold)
+### Options (`CakeGDNNondetKcpOptions`, keyword-only; defaults in bold)
 
 | option | values | meaning |
 |---|---|---|
@@ -295,9 +288,9 @@ eager calls too.
 | `transfer_walk` | **`"tf32_hilo"`** | the transfer-walk program; the vocabulary also names `"bf16x3"` (BF16x3 state products), which this package does not build: the validator refuses it as not built |
 | `layout` | **`"tma"`**, `"copy"` | strided input read in place, or a timed contiguous copy |
 | `graph` | **`"off"`**, `"replay"` | CUDA-graph replay of the steady state (a static pool per key). The process keeps up to `cake_kcp.GRAPH_CACHE_MAX` = 256 keys, least recently used first out: a plain layer holds one forward and one backward key, a checkpointed layer three (the original forward, the recompute in its hand-off form, the kept backward; two below the size rule of `reuse_recompute_tapes`), so 85 checkpointed layers replay without recapture; each key's graph holds its static results (out, saved set, gradients) until it leaves the cache or `graph_cache_clear()` |
-| `reuse_recompute_tapes` | **`"auto"`**, `True`, `False` | under `torch.utils.checkpoint(use_reentrant=False)` the light backward binds the forward tapes torch's recompute just wrote instead of replaying #1 and the #2 tape walk (bitwise the same gradients, the retention unchanged; a no-op outside that backward; `False` restores the replay form). `"auto"` keeps the tapes only when the GDN node is the last operation of the checkpointed region that saves a tensor (the same checkpoint-frame proof as `recompute_output="auto"`): then its backward is the region's first and the kept tapes die before any other backward runs; with a later saver in the region (an output projection, an MLP) the kept set would live through those operations' backward and raise the region's backward peak by the full tape set (`gdn_saved_bytes_kcp(save_mode="full")` minus the saved states), so `"auto"` takes the replay form there. Measured on one GB300 (torch 2.14.1), 261,987 tokens, `(H_qk, HV) = (2, 6)`: a region of GDN + a 768x768 output projection + a 768->2x2048->768 SwiGLU has a backward peak of 9250.54 MiB with the kept tapes (`True`) and 6927.31 MiB with the replay form (`False` and `"auto"`), at 21.29 vs 22.70 ms per training step of the region; a region the GDN node closes keeps the tapes under `"auto"` (five 240k-262k-token (16, 48) packs: training step and steady peak unchanged against `True`). `True` always keeps the tapes, `False` never. With `graph="replay"` (same default) the kept tapes are the caller-held workspace's own arena tapes (a captured graph bakes their addresses, so nothing is unbound and the kept tapes add no memory); the recompute captures its hand-off form as a graph of its own and the kept backward its own graph (three graph keys per checkpointed layer, see `graph`), so a checkpointed step replays the eager step's programs. Like every key, the recompute's hand-off graph holds its own static results: one more static saved set per checkpointed layer (`gdn_saved_bytes_kcp` of the call) and, when that recompute launches #5 (`recompute_output="always"`, or `True` with a later saver in the region), a full static output (`T_r * HV * 256` bytes) per checkpointed layer. Size rule of `"auto"` under `graph="replay"` (caller-held workspace): a rank with fewer token x value-head rows (`T_r * HV`) than `cake_kcp.GRAPH_RECOMPUTE_MIN_ROWS` of its architecture (61440 on sm_100a; 0 on sm_103a and sm_107a) decides nothing -- the recompute replays the original forward's graph (#5 included, nothing kept, two graph keys per checkpointed layer) and the backward replays #1 and the tape walk -- because such a checkpointed step is host-bound: the decision and the hand-off add host time per layer (the checkpoint-frame read, the stamp and the backward's checks) that the GPU work they save does not repay there (one checkpointed layer, previous / hand-off step time: B200 0.953 at 49152 rows, 1.016 at 61440 rows; GB300 1.013 and R200 1.07 at 49152 rows); `True` / `False` and `graph="off"` decide at every size. The hand-off holds only while the workspace has made no other call since the recompute, still binds those tapes and the backward runs on the recompute's stream; otherwise the backward replays #1 and the tape walk (same bits; `cake_kcp.KEPT_STALE_STATS` counts why). One live kept set: in a checkpoint segment with several GDN layers only the last layer skips the replay, the earlier layers replay as before |
+| `reuse_recompute_tapes` | **`"auto"`**, `True`, `False` | under `torch.utils.checkpoint(use_reentrant=False)` the light backward binds the forward tapes torch's recompute just wrote instead of replaying #1 and the #2 tape walk (bitwise the same gradients, the retention unchanged; a no-op outside that backward; `False` restores the replay form). `"auto"` keeps the tapes only when the GDN node is the last operation of the checkpointed region that saves a tensor (the same checkpoint-frame proof as `recompute_output="auto"`): then its backward is the region's first and the kept tapes die before any other backward runs; with a later saver in the region (an output projection, an MLP) the kept set would live through those operations' backward and raise the region's backward peak by the full tape set (`cake_gdn_nondet_train_kcp_saved_bytes(save_mode="full")` minus the saved states), so `"auto"` takes the replay form there. Measured on one GB300 (torch 2.14.1), 261,987 tokens, `(H_qk, HV) = (2, 6)`: a region of GDN + a 768x768 output projection + a 768->2x2048->768 SwiGLU has a backward peak of 9250.54 MiB with the kept tapes (`True`) and 6927.31 MiB with the replay form (`False` and `"auto"`), at 21.29 vs 22.70 ms per training step of the region; a region the GDN node closes keeps the tapes under `"auto"` (five 240k-262k-token (16, 48) packs: training step and steady peak unchanged against `True`). `True` always keeps the tapes, `False` never. With `graph="replay"` (same default) the kept tapes are the caller-held workspace's own arena tapes (a captured graph bakes their addresses, so nothing is unbound and the kept tapes add no memory); the recompute captures its hand-off form as a graph of its own and the kept backward its own graph (three graph keys per checkpointed layer, see `graph`), so a checkpointed step replays the eager step's programs. Like every key, the recompute's hand-off graph holds its own static results: one more static saved set per checkpointed layer (`cake_gdn_nondet_train_kcp_saved_bytes` of the call) and, when that recompute launches #5 (`recompute_output="always"`, or `True` with a later saver in the region), a full static output (`T_r * HV * 256` bytes) per checkpointed layer. Size rule of `"auto"` under `graph="replay"` (caller-held workspace): a rank with fewer token x value-head rows (`T_r * HV`) than `cake_kcp.GRAPH_RECOMPUTE_MIN_ROWS` of its architecture (61440 on sm_100a; 0 on sm_103a and sm_107a) decides nothing -- the recompute replays the original forward's graph (#5 included, nothing kept, two graph keys per checkpointed layer) and the backward replays #1 and the tape walk -- because such a checkpointed step is host-bound: the decision and the hand-off add host time per layer (the checkpoint-frame read, the stamp and the backward's checks) that the GPU work they save does not repay there (one checkpointed layer, previous / hand-off step time: B200 0.953 at 49152 rows, 1.016 at 61440 rows; GB300 1.013 and R200 1.07 at 49152 rows); `True` / `False` and `graph="off"` decide at every size. The hand-off holds only while the workspace has made no other call since the recompute, still binds those tapes and the backward runs on the recompute's stream; otherwise the backward replays #1 and the tape walk (same bits; `cake_kcp.KEPT_STALE_STATS` counts why). One live kept set: in a checkpoint segment with several GDN layers only the last layer skips the replay, the earlier layers replay as before |
 | `recompute_output` | **`"auto"`**, `"always"` | under `torch.utils.checkpoint(use_reentrant=False)` torch re-runs the forward inside `.backward()` only to re-save its tensors and discards that run's output; when the GDN node is the last operation of the checkpointed region that saves a tensor, `"auto"` does not launch the output program (#5) of that re-run. The proof is read from torch's checkpoint frame (the node is executable, the remaining saved-tensor holders are exactly this node's, early stop is on, and the torch release -- `torch.__version__` without its local `+cuNNN` build tag (`cake_kcp.torch_release`) -- is one of the verified releases in `cake_kcp.RECOMPUTE_OUTPUT_TORCH_VERSIONS`); any other state -- a later saver in the region such as the next layer or a norm on the output, a non-executable node, a reentrant checkpoint, another torch build -- launches it as before (with `graph="replay"` the proof is read only inside a backward pass and the decision is part of the recompute's CUDA-graph key; the left-out output is a one-element broadcast view there, so the captured graph holds no output buffer; on a caller-held workspace with `reuse_recompute_tapes="auto"`, a rank below `cake_kcp.GRAPH_RECOMPUTE_MIN_ROWS`, the size rule of `reuse_recompute_tapes`, decides nothing and launches #5 with reason `"small"`, while an explicit `True` / `False` reads the proof at every size), and `cake_kcp.LAST_CALL["fwd"]["fwd_o_reason"]` records why. Gradients and retained bytes are the same either way; `"always"` is the unconditional launch |
-| `segments` | **`None`**, an int | how many intra-rank segments a fragment is walked as (`P`): `None` takes the context's plan, an int overrides it within `[1, min(64, chunks of the rank's longest fragment)]` (the byte queries' `P=`). The plan (test knob `p_rule` names its policy) is a function of metadata and the SM count only. The shipped policy `fill_small_guard` starts from the deterministic twin's `row_cost_lpt` plan, which costs the three per-rank programs over every rank's fragment table with a crossing-aware model and switches the whole row away from the per-rank default only when an alternative is cheaper by at least its margin (2 % for the `occ` program; 0 % for the `one` program, which has no segment composition and takes a model tie), then lowers `P` as described under "Numerical mode" (faster schedule); the same topology gives the same `P` on every rank |
+| `segments` | **`None`**, an int | how many intra-rank segments a fragment is walked as (`P`): `None` takes the context's plan, an int overrides it within `[1, min(64, chunks of the rank's longest fragment)]` (the byte queries' `P=`). The plan (test knob `p_rule` names its policy) is a function of metadata and the SM count only. The shipped policy `fill_small_guard` starts from the deterministic twin's `row_cost_lpt` plan, which costs the three per-rank programs over every rank's fragment table with a crossing-aware model and switches the whole row away from the per-rank default only when an alternative is cheaper by at least its margin (2 % for the `occ` program; 0 % for the `one` program, which has no segment composition and takes a model tie), then lowers `P` as described under "Faster schedule"; the same topology gives the same `P` on every rank |
 | `offset_class` | **`"fla"`**, `"fp32"` | the class of the forward offset `B_f`: the walk from zero with the reference rounding points, or an FP32 walk (`B_f` only) |
 | `use_qk_l2norm_in_kernel` | **`False`**, `True` | the per-token L2 norm of every 128-channel Q / K head inside the programs (FLA's `use_qk_l2norm_in_kernel`; see "In-kernel Q / K L2 norm" below); a literal keyword of the three entry points as well |
 | `test_knobs` | **`None`** | names the test-only values a test selects (`precision_mode` 1 or 2) and private levers such as `fwdh_vh` (forces the #2 value width), `fused_o` (`0` forces the split tape walk and #5 in a light forward) and `fused_o_tape` (`0` forces it in a `save_mode="full"` forward); without it every test-only value is refused |
@@ -364,14 +357,14 @@ Two replays exist, and they differ:
 Both replays give bitwise the gradients of the saved-set backward.
 
 A **recompute handle** removes the exchange from the checkpoint replay.  Pass
-a `RecomputeHandleKcp` to the checkpointed function and to `chunk_gdn_kcp`:
+a `CakeGDNNondetKcpRecomputeHandle` to the checkpointed function and to `cake_gdn_nondet_kcp`:
 
 ```python
 def layer(x, handle):
     ...                                   # convolution, split, gates
-    return chunk_gdn_kcp(q, k, v, g, beta, ctx, recompute_handle=handle, deterministic=False)
+    return cake_gdn_nondet_kcp(q, k, v, g, beta, ctx, recompute_handle=handle)
 
-y = torch.utils.checkpoint.checkpoint(layer, x, RecomputeHandleKcp(), use_reentrant=False)
+y = torch.utils.checkpoint.checkpoint(layer, x, CakeGDNNondetKcpRecomputeHandle(), use_reentrant=False)
 ```
 
 The original forward exchanges as always and stores this rank's incoming
@@ -382,7 +375,7 @@ tape walk from `S_in`, then the output program): no collective, no summary
 walk over the crossing-out fragments, no owner merge.  The gradients
 are bitwise those of the same checkpoint without a handle; the backward still
 exchanges.  The handle retains `S_in` --
-`gdn_saved_bytes_kcp(ctx, ..., save_mode="light", save_transfer=False,
+`cake_gdn_nondet_train_kcp_saved_bytes(ctx, ..., save_mode="light", save_transfer=False,
 with_conv=False)` -- until the checkpoint frame that holds it is freed.
 Create one handle per layer and micro-step, outside the outermost checkpoint
 region (a handle created inside a region is empty again in that region's
@@ -395,10 +388,10 @@ handle holds one entry per key: it serves one GDN call and at most one
 convolution call; a layer with separate Q / K / V convolutions uses one handle
 per convolution call, and the GDN call shares one of them.
 
-**Packed Q/K/V.**  `packed_qkv_views_kcp(qkv, H_qk=..., HV=...)` (this package's
+**Packed Q/K/V.**  `cake_gdn_nondet_train_kcp_packed_qkv_views(qkv, H_qk=..., HV=...)` (this package's
 `__init__.py`; not a facade name) splits a packed
 `[T, (2 H_qk + HV) * 128]` row (the convolution's output) into `q` / `k` /
-`v` head views without a copy; `chunk_gdn_kcp` takes them as they are (token
+`v` head views without a copy; `cake_gdn_nondet_kcp` takes them as they are (token
 stride `(2 H_qk + HV) * 128`).  When `q` / `k` / `v` are such views, the
 backward writes `dq` / `dk` / `dv` as the same views of one fresh packed
 row, and the split's backward returns that row as the gradient of `qkv`: no
@@ -407,7 +400,7 @@ backward.  The gradient values are bitwise those of separate operands
 (`LAST_CALL["bwd"]["grad_layout"]` is `"packed"` or `"separate"`).
 
 Callers whose `q` / `k` / `v` are head views of one packed row get the full
-backward speed through `packed_qkv_views_kcp`.  Its conditions: `qkv` is
+backward speed through `cake_gdn_nondet_train_kcp_packed_qkv_views`.  Its conditions: `qkv` is
 dense over `[..., T, (2 H_qk + HV) * 128]` (channel stride 1 and token stride
 exactly `(2 H_qk + HV) * 128`; a column slice of a wider row does not
 qualify), `q` / `k` / `v` are its three head views in that order, and the GDN
@@ -418,14 +411,14 @@ concatenates them).  Plain views of the same row
 `.view(T, heads, 128)`) run the same programs on the same operands and give
 the same results (within the accuracy budgets; bitwise in every run measured
 below).  The backward writes one packed row only for the outputs of
-`packed_qkv_views_kcp` (or of the deterministic package's
-`packed_qkv_views_det_kcp`), as recorded by the forward.  For plain views,
+`cake_gdn_nondet_train_kcp_packed_qkv_views` (or of the deterministic package's
+`cake_gdn_det_train_kcp_packed_qkv_views`), as recorded by the forward.  For plain views,
 column slices and other views it writes three contiguous `dq` / `dk` / `dv`,
 and torch's split backward concatenates them into a new row.  Measured cost
-of the plain views (the #8367 repro with `deterministic=False`:
+of the plain views (the #8367 repro on this package:
 `(H_qk, HV) = (16, 48)`, 32,768 tokens in five documents, one-rank context,
 forward and backward to the packed row, and the checkpointed step
-`torch.utils.checkpoint(views + chunk_gdn_kcp, use_reentrant=False)` =
+`torch.utils.checkpoint(views + cake_gdn_nondet_kcp, use_reentrant=False)` =
 two forwards and one backward; CUDA-event ms, the median of 16 group
 medians (2 runs x 8 groups; a group = 2 blocks of 5 warm-up + 20 timed calls
 per view form, the forms interleaved in palindromic order).  The B200
@@ -455,21 +448,21 @@ concatenate.  Autograd refuses an in-place change to the views while `qkv`
 requires grad.  Plain `split` views keep torch's own autograd path and hooks.
 
 ```
-gdn_comm_bytes_kcp(ctx, *, H_qk, HV, C=None, save_transfer=True, boundary_mode="saved")
+cake_gdn_nondet_train_kcp_comm_bytes(ctx, *, H_qk, HV, C=None, save_transfer=True, boundary_mode="saved")
     -> this rank's {c1, c2, b1, b2, halo_fwd, halo_bwd: {send, recv}; B1, B2, B3 (the boundary totals); b1_d, b1_m,
     b1_design, b1_replay; padding; the crossing counts and state bytes}
     c1 send = 2 * s_pad * n_out(r)      c2 recv = s_pad * n_in(r)      b2 recv = s_pad * n_out(r)
     b1 send = s_pad * n_in(r), twice that with the re-sent maps (boundary_mode="saved", save_transfer=False)
     on an owner: c1 recv = 2 * s_owner * N_out      c2 send = s_owner * N_in      b2 send = s_owner * N_out
     b1 recv = s_owner * N_in (twice that with the re-sent maps)      halo = rows(r) * C * 2 forward, * 4 backward
-gdn_saved_bytes_kcp(ctx, *, H_qk, HV, save_mode="light", boundary_mode="saved", save_transfer=True, with_conv=True,
+cake_gdn_nondet_train_kcp_saved_bytes(ctx, *, H_qk, HV, save_mode="light", boundary_mode="saved", save_transfer=True, with_conv=True,
     C=None, P=None, use_qk_l2norm_in_kernel=False) -> per rank (the table above)
-gdn_workspace_bytes_kcp(ctx, *, H_qk, HV, save_mode="light", boundary_mode="saved", save_transfer=True, backward=True,
+cake_gdn_nondet_train_kcp_workspace_bytes(ctx, *, H_qk, HV, save_mode="light", boundary_mode="saved", save_transfer=True, backward=True,
     with_conv=True, C=None, P=None, group_reduce="fused", reuse_recompute_tapes=None, use_qk_l2norm_in_kernel=False,
     fused_walks=1, graph="off", save_for_backward=True)
     -> per rank: the most the caller-held workspace binds in the forward or the backward.  Covered: exchange="a2a"
     under the shipped wait_first schedule, graph "off" or "replay", with or without a saved set, on a workspace
-    created empty (WorkspaceKcp()): its first forward and the backward that follows on the arena that forward left
+    created empty (CakeGDNNondetKcpWorkspace()): its first forward and the backward that follows on the arena that forward left
     (save_for_backward=False: with backward=True the replay a saved=None backward runs, with backward=False a
     forward-only call).  A backward leaves its tapes bound, so every later backward on the same workspace (another
     layer, the next step) binds the graph="replay" figure (measured for the replay form; at most that figure right
@@ -477,17 +470,17 @@ gdn_workspace_bytes_kcp(ctx, *, H_qk, HV, save_mode="light", boundary_mode="save
     v_new: its replayed forward binds them again only after the c1 release) and every later forward more than the
     first (the backward's tapes stay bound; under graph="replay" its b1 / b2 pools too) and at most that figure
     (equal to it under graph="replay"): size a reused workspace with graph="replay".
-    WorkspaceKcp(ctx, H_qk, HV, device) sizes every pool up front at the plan's P with the fused walks (the ring
+    CakeGDNNondetKcpWorkspace(ctx, H_qk, HV, device) sizes every pool up front at the plan's P with the fused walks (the ring
     pools, c2_send, the c1_recv / stage_m pools a saving call replaces, the b1 / b2 pools; for a call with a smaller
     segments override or fused_walks=0 also the plan's larger staging, carry and M_f^T pools) and binds them from #1
     on.  Not covered: exchange="ring" (also binds ring_out / ring_in, max(n_in(r), n_out(r)) states each, and its
     forward -- also the forward a replay backward re-runs -- keeps the c2 send pool and the c1 send pool with the
     M_f^T tiles through the tape walk: up to fwd.c1_send + fwd.c1_send_mf more, plus the c2 send pool (bwd.c2_send)
-    in the forward), the schedule="overlap" test knob and the kept form's recompute under a RecomputeHandleKcp (a
+    in the forward), the schedule="overlap" test knob and the kept form's recompute under a CakeGDNNondetKcpRecomputeHandle (a
     handle forces save_transfer=False; with the query given save_transfer=False too, its c1 send pool stays bound
     through its tape walk, up to fwd.c1_send + fwd.c1_send_mf above bwd.phase.recompute_forward; the replay form's
     figure bounds it).  The figures plan a workspace: no call checks a workspace against them (a caller-held
-    WorkspaceKcp grows any pool or tape a call needs).
+    CakeGDNNondetKcpWorkspace grows any pool or tape a call needs).
     graph="off": the forward is the larger of #1 (the pools, the eight tapes #1 writes -- none with save_mode="full"
     and a saved set, whose tapes are saved-set tensors -- and the arena qk_rstd of a forward without a saved set) and
     the tape walk (akk / gcum gone; the split form, also `forward_split` of the layout, adds h / v_new; with a
@@ -500,7 +493,7 @@ gdn_workspace_bytes_kcp(ctx, *, H_qk, HV, save_mode="light", boundary_mode="save
     ten forward tapes are workspace (no forward tape with save_mode="full" and a saved set) and whose workspace
     bounds the kept form's; `reuse_recompute_tapes=True` gives the kept-tape figure (light save_mode, saved set), in
     which they are the recompute forward's hand-off tensors outside the workspace, with its M_seg^T staging plane at
-    P > 1 without save_transfer (`gdn_workspace_layout_kcp` lists them as `bwd.kept_tapes` and the total as
+    P > 1 without save_transfer (`cake_gdn_nondet_train_kcp_workspace_layout` lists them as `bwd.kept_tapes` and the total as
     `backward_transient`, which that plane can put above the replay form's).  graph="replay": nothing is released,
     so the forward is every forward pool and tape it writes (no tape with save_mode="full" and a saved set) and the
     backward every backward pool, the ten light tapes (none with save_mode="full" and a saved set) and every
@@ -514,8 +507,7 @@ gdn_workspace_bytes_kcp(ctx, *, H_qk, HV, save_mode="light", boundary_mode="save
     At P > 1 the c1 send pool also holds the M_f^T tiles (`c1_send_mf` = s * n_out(r)) and, with the fused walks, the
     carry plane max(n_in(r), n_out(r)) more slots (`fused_walks=0` is the test knob's split form); graph=,
     save_for_backward= and fused_walks= are keywords of this package's query only (the deterministic twin's query
-    has none; through the facade they need deterministic=False, like every facade call, and
-    torch.use_deterministic_algorithms does not change the route); the b1
+    has none; the facade passes them on unchanged); the b1
     pools take the larger split form; a backward on a caller-held workspace also sizes the forward exchange pools
     (c1_send, c2_send, c1_recv unless saved); with_conv=True (default) adds the layer convolution's halo rows, which
     the entry points do not allocate (with_conv=False: what a call binds); boundary_mode="replay" gives the same
@@ -689,5 +681,5 @@ from the same Cake sources under this package's names, and the output walks
 `kcp_fwdh_out` and `kcp_fwdh_out_tape`, which have no deterministic twin;
 `build.json`'s `generator` block names the producing revision.  This package
 differs from its deterministic twin in the default segment plan
-(`fill_small_guard`, see "Numerical mode").  The tests are `tests/experimental/test_cake_gdn_train_kcp*.py`
+(`fill_small_guard`, see "Faster schedule").  The tests are `tests/experimental/test_cake_gdn_nondet_train_kcp*.py`
 (API, single GPU and multi-GPU rows).

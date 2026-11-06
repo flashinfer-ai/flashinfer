@@ -20,7 +20,7 @@ rank's crossing-in / crossing-out fragments (a fragment with a predecessor /
 with a successor in its document chain), ``N_in`` / ``N_out`` the group totals,
 ``Hg = ceil(HV / W)`` the heads per owner.
 
-* ``gdn_comm_bytes_kcp(ctx, *, H_qk, HV, C)``: bytes this rank moves per
+* ``cake_gdn_nondet_train_kcp_comm_bytes(ctx, *, H_qk, HV, C)``: bytes this rank moves per
   collective and per boundary.  Per crossing-out fragment c1 sends ``2 s``
   (``[B_f | M_f^T]`` pair tiles) and b2 receives ``s`` (``dS_out``); per
   crossing-in fragment c2 receives ``s`` (``S_in``) and b1 sends ``s`` (``d_f``);
@@ -48,7 +48,7 @@ with a successor in its document chain), ``N_in`` / ``N_out`` the group totals,
   The padded owner (``HV % Hg != 0``) carries ``pad_tiles`` never-read tiles
   per slot, reported under ``padding`` and included in the totals (the buffers
   the ranks actually move).
-* ``gdn_saved_bytes_kcp(ctx, *, H_qk, HV, save_mode, boundary_mode, ...)``: the
+* ``cake_gdn_nondet_train_kcp_saved_bytes(ctx, *, H_qk, HV, save_mode, boundary_mode, ...)``: the
   saved set of one layer on this rank (design table 4.1): ``S_in`` (``n_in s_pad``:
   the receive buffer, padded to whole owners, ``s_pad = n_owners Hg 128 * 128 * 4``;
   ``n_in s`` when ``HV % Hg == 0``), the owner's c1 receive tensor with
@@ -73,7 +73,7 @@ with a successor in its document chain), ``N_in`` / ``N_out`` the group totals,
   and the tapes; ``save_mode="full"`` / ``"light_akk"`` there run the same
   backward as ``"light"``).  Inputs are references (0 extra bytes); the int32
   tables live on the context (not per layer).
-* ``gdn_workspace_bytes_kcp(ctx, *, H_qk, HV, ...)``: the caller-held
+* ``cake_gdn_nondet_train_kcp_workspace_bytes(ctx, *, H_qk, HV, ...)``: the caller-held
   workspace of one rank: the exchange pools (the send pools, the c1 / b1 / b2
   receive pools a call does not replace with a saved tensor, the ``P > 1``
   staging and carry planes and ``M_f^T`` tiles, the halo send rows of the
@@ -86,7 +86,7 @@ with a successor in its document chain), ``N_in`` / ``N_out`` the group totals,
   and the persistent programs' dynamic-ticket slots (one 128-byte u32 word per
   launch site, zeroed once with the workspace, never read by the host).
   ``forward`` / ``backward`` are the two lifetimes, the workspace their maximum,
-  for the calls :func:`gdn_workspace_layout_kcp` names as covered (``exchange="a2a"``
+  for the calls :func:`cake_gdn_nondet_train_kcp_workspace_layout` names as covered (``exchange="a2a"``
   under the ``wait_first`` schedule; ``graph`` ``"off"`` / ``"replay"``; with or
   without a saved set).  The c2 receive buffer ``S_in`` is never a workspace
   term: every call allocates it fresh (the saved set's with a saved set); a call
@@ -94,7 +94,7 @@ with a successor in its document chain), ``N_in`` / ``N_out`` the group totals,
   to the end of its forward, or to #8 of a replay backward (under
   ``graph="replay"`` to the end of the backward).  The local terms are
   the design's tape sizes; the kernels' own scratch is added when the programs
-  exist (every term is listed by :func:`gdn_workspace_layout_kcp` so the host
+  exist (every term is listed by :func:`cake_gdn_nondet_train_kcp_workspace_layout` so the host
   can account for it).
 
 * ``use_qk_l2norm_in_kernel=True`` (the in-kernel Q / K L2 norm): the saved
@@ -118,7 +118,7 @@ with a successor in its document chain), ``N_in`` / ``N_out`` the group totals,
 
 All sizes are exact integers of the shapes the host allocates (``R = 64
 NC_pad`` padded token rows, ``NC_pad`` the even chunk bound), not estimates;
-the workspace lifetimes hold for the calls :func:`gdn_workspace_layout_kcp`
+the workspace lifetimes hold for the calls :func:`cake_gdn_nondet_train_kcp_workspace_layout`
 covers.
 """
 
@@ -131,7 +131,7 @@ from .cake_kcp_plan import (
     MAX_SEGMENTS,
     SAVE_TRANSFER_DEFAULT,
     STATE_TILE_BYTES,
-    ContextKcp,
+    CakeGDNNondetKcpContext,
 )
 from .cake_options import REUSE_RECOMPUTE_TAPES_DEFAULT
 from .cake_options import SAVE_MODES as _OPTION_SAVE_MODES
@@ -240,7 +240,7 @@ def _mode(value: str, allowed: tuple[str, ...], name: str) -> str:
 
 def _save_mode(save_mode: str, l2n: bool) -> str:
     """``save_mode`` checked against :data:`SAVE_MODES`; a mode of :data:`AKK_SAVE_MODES` needs the in-kernel norm
-    (the ``ValueError`` of ``OptionsKcp.check``: the replay program is built in its in-kernel-norm form only)."""
+    (the ``ValueError`` of ``CakeGDNNondetKcpOptions.check``: the replay program is built in its in-kernel-norm form only)."""
     _mode(save_mode, SAVE_MODES, "save_mode")
     if save_mode in AKK_SAVE_MODES and not l2n:
         raise ValueError(
@@ -255,10 +255,10 @@ def state_bytes(HV: int) -> int:
     return int(HV) * STATE_TILE_BYTES
 
 
-def _segments(ctx: ContextKcp, plan_P: int, P: int | None) -> int:
+def _segments(ctx: CakeGDNNondetKcpContext, plan_P: int, P: int | None) -> int:
     """``P`` segments per fragment of a byte query: the plan's (``plan_P``) when ``P`` is ``None``, else the caller's
     override (the ``segments`` option of the call) in the range the call accepts, ``[1, min(MAX_SEGMENTS, chunks of
-    the longest fragment of this rank)]`` (:meth:`ContextKcp.heads`); read from the fragments, no plan is built."""
+    the longest fragment of this rank)]`` (:meth:`CakeGDNNondetKcpContext.heads`); read from the fragments, no plan is built."""
     if P is None:
         return plan_P
     P = int(P)
@@ -271,8 +271,8 @@ def _segments(ctx: ContextKcp, plan_P: int, P: int | None) -> int:
     return P
 
 
-def gdn_comm_bytes_kcp(
-    ctx: ContextKcp,
+def cake_gdn_nondet_train_kcp_comm_bytes(
+    ctx: CakeGDNNondetKcpContext,
     *,
     H_qk: int,
     HV: int,
@@ -384,8 +384,8 @@ def gdn_comm_bytes_kcp(
     }
 
 
-def gdn_saved_layout_kcp(
-    ctx: ContextKcp,
+def cake_gdn_nondet_train_kcp_saved_layout(
+    ctx: CakeGDNNondetKcpContext,
     *,
     H_qk: int,
     HV: int,
@@ -454,8 +454,8 @@ def gdn_saved_layout_kcp(
     return terms
 
 
-def gdn_saved_bytes_kcp(
-    ctx: ContextKcp,
+def cake_gdn_nondet_train_kcp_saved_bytes(
+    ctx: CakeGDNNondetKcpContext,
     *,
     H_qk: int,
     HV: int,
@@ -467,9 +467,9 @@ def gdn_saved_bytes_kcp(
     P: int | None = None,
     use_qk_l2norm_in_kernel: bool = False,
 ) -> int:
-    """Saved-set bytes of one layer on this rank (the sum of :func:`gdn_saved_layout_kcp`)."""
+    """Saved-set bytes of one layer on this rank (the sum of :func:`cake_gdn_nondet_train_kcp_saved_layout`)."""
     return sum(
-        gdn_saved_layout_kcp(
+        cake_gdn_nondet_train_kcp_saved_layout(
             ctx,
             H_qk=H_qk,
             HV=HV,
@@ -498,8 +498,8 @@ def _fwdh_out_shipped() -> bool:
     return forms >= {1, 2}
 
 
-def gdn_workspace_layout_kcp(
-    ctx: ContextKcp,
+def cake_gdn_nondet_train_kcp_workspace_layout(
+    ctx: CakeGDNNondetKcpContext,
     *,
     H_qk: int,
     HV: int,
@@ -519,10 +519,10 @@ def gdn_workspace_layout_kcp(
 ) -> dict[str, int]:
     """The caller-held workspace of one rank, term by term (``fwd.*`` / ``bwd.*`` in bytes), with the lifetime
     maxima ``forward`` / ``backward`` and their maximum ``workspace`` (module docstring).  Saved-set tensors are
-    counted by :func:`gdn_saved_layout_kcp`, never here.
+    counted by :func:`cake_gdn_nondet_train_kcp_saved_layout`, never here.
 
     Covered calls: ``exchange="a2a"`` under the shipped ``schedule="wait_first"``, ``graph`` ``"off"`` or
-    ``"replay"``, with or without a saved set, on a caller-held workspace created empty (``WorkspaceKcp()``): its
+    ``"replay"``, with or without a saved set, on a caller-held workspace created empty (``CakeGDNNondetKcpWorkspace()``): its
     first forward (an arena that binds no tape yet) and the backward that follows on the arena that forward left.
     ``save_for_backward=False`` is a forward that keeps no saved set: with ``backward=False`` a forward-only call;
     with ``backward=True`` its backward is the replay a ``saved=None`` backward runs (the ``boundary_mode="replay"``
@@ -533,7 +533,7 @@ def gdn_workspace_layout_kcp(
     replayed forward binds again only after its c1 release; less on a rank whose fragment crosses out) -- and
     every later forward binds more than ``forward`` (the backward's tapes stay bound; under ``graph="replay"`` its
     b1 / b2 pools too) and at most that figure (equal to it under ``graph="replay"``).
-    ``WorkspaceKcp(ctx, H_qk, HV, device)`` sizes every pool up front at the plan's
+    ``CakeGDNNondetKcpWorkspace(ctx, H_qk, HV, device)`` sizes every pool up front at the plan's
     ``P`` with the fused walks, and a call leaves a held pool bound: the ring pools (``2 max(n_in, n_out)`` states),
     the c2 send pool, the ``c1_recv`` / ``stage_m`` pools a saving call replaces with fresh tensors, with its default
     ``backward=True`` the b1 / b2 pools and, for a call with a smaller ``segments`` override or ``fused_walks=0``,
@@ -546,11 +546,11 @@ def gdn_workspace_layout_kcp(
     ``schedule="overlap"`` test knob (its document-start tape walk runs under c1 and its document-end adjoint walk
     under b2: a split forward binds up to ``fwd.c1_send + fwd.c1_send_mf`` more, the backward up to ``bwd.b2_send``,
     the staging planes and, with the fused walks at ``P > 1``, ``bwd.b2_recv`` more); the kept form's recompute
-    under a ``RecomputeHandleKcp`` (a handle forces ``save_transfer=False``; with the query given
+    under a ``CakeGDNNondetKcpRecomputeHandle`` (a handle forces ``save_transfer=False``; with the query given
     ``save_transfer=False`` too: the recompute exchanges nothing, so the c1 send pool, ``M_f^T`` tiles included,
     stays bound through its tape walk, up to ``fwd.c1_send + fwd.c1_send_mf`` above ``bwd.phase.recompute_forward``;
     the replay form's figure, ``reuse_recompute_tapes=False`` or ``"auto"``, bounds it).  These figures plan a
-    workspace; no call checks a workspace against them (a caller-held ``WorkspaceKcp`` grows any pool or tape a call
+    workspace; no call checks a workspace against them (a caller-held ``CakeGDNNondetKcpWorkspace`` grows any pool or tape a call
     needs).
 
     ``P`` overrides the plan's segment count as the call's ``segments`` option does (the range the call accepts):
@@ -559,8 +559,7 @@ def gdn_workspace_layout_kcp(
     (``c1_send_mf``, ``n_out`` states; ``c1_send`` stays the collective's bytes) follow it; the split terms do not
     depend on ``P``.  ``fused_walks`` is the call's test knob (1, the shipped form).  ``graph``,
     ``save_for_backward`` and ``fused_walks`` are keywords of this package's query only (the deterministic twin's has
-    none of them).  Through the facade they need ``deterministic=False``, like every facade call;
-    ``torch.use_deterministic_algorithms`` does not change the route.
+    none of them); the facade passes them on unchanged.
     The b1 pools are counted at the larger of their two split forms, as the host sizes them.  A backward on a
     caller-held workspace sizes the forward exchange pools too (``c1_send`` / ``c1_send_mf``, ``c2_send`` and
     ``c1_recv`` unless the saved set holds it; a call without ``workspace=`` skips them after a saved forward).
@@ -698,7 +697,7 @@ def gdn_workspace_layout_kcp(
     )
     c1_send_mf = ctx.n_out * s if P > 1 else 0
     # the forward tapes (#1 outputs + the #2 tape walk); in "light" they are workspace in the forward and, replayed,
-    # in the backward; in "full" with a saved set they are saved-set bytes (gdn_saved_layout_kcp), not workspace
+    # in the backward; in "full" with a saved set they are saved-set bytes (cake_gdn_nondet_train_kcp_saved_layout), not workspace
     light_tapes = {
         "w": R * HV * ROW_BF16_128,
         "u": R * HV * ROW_BF16_128,
@@ -777,7 +776,7 @@ def gdn_workspace_layout_kcp(
     }
     # the b1 pools hold either split form (d only, or d + the re-sent maps; their map half pairs with the crossing-in
     # slots), so the host sizes the larger of the two (cake_kcp _Tables.sizes); the design's per-rank b1 QUERY is in
-    # gdn_comm_bytes_kcp -- the workspace counts what the host allocates.  A caller-held workspace's backward sizes
+    # cake_gdn_nondet_train_kcp_comm_bytes -- the workspace counts what the host allocates.  A caller-held workspace's backward sizes
     # the forward exchange pools as well, in either boundary mode (the replay writes them again; only the per-call
     # workspace of a saved backward skips them, cake_kcp SAVED_BWD_DEAD_POOLS); S_in is a fresh tensor, never a pool
     bwd_pools = {
@@ -937,8 +936,8 @@ def gdn_workspace_layout_kcp(
     return out
 
 
-def gdn_workspace_bytes_kcp(
-    ctx: ContextKcp,
+def cake_gdn_nondet_train_kcp_workspace_bytes(
+    ctx: CakeGDNNondetKcpContext,
     *,
     H_qk: int,
     HV: int,
@@ -956,12 +955,12 @@ def gdn_workspace_bytes_kcp(
     graph: str = "off",
     save_for_backward: bool = True,
 ) -> int:
-    """Caller-held workspace bytes of one rank (the ``workspace`` entry of :func:`gdn_workspace_layout_kcp`): the
+    """Caller-held workspace bytes of one rank (the ``workspace`` entry of :func:`cake_gdn_nondet_train_kcp_workspace_layout`): the
     most the workspace binds in the forward or the backward of these options (the calls that query covers).
     ``save_mode="light_akk"`` gives the figure of a call outside a checkpoint; under
     ``torch.utils.checkpoint(use_reentrant=False)`` the call runs as ``"light"`` and binds the ``save_mode="light"``
     figure, so a checkpointed ``"light_akk"`` layer is sized with ``save_mode="light"``."""
-    return gdn_workspace_layout_kcp(
+    return cake_gdn_nondet_train_kcp_workspace_layout(
         ctx,
         H_qk=H_qk,
         HV=HV,
@@ -999,10 +998,10 @@ __all__ = [
     "FWD_TAPES_ARENA_AFTER_FWD",
     "FWD_TAPES_DEAD_AFTER_PREP",
     "TAPE_NAME_OF",
-    "gdn_comm_bytes_kcp",
-    "gdn_saved_bytes_kcp",
-    "gdn_saved_layout_kcp",
-    "gdn_workspace_bytes_kcp",
-    "gdn_workspace_layout_kcp",
+    "cake_gdn_nondet_train_kcp_comm_bytes",
+    "cake_gdn_nondet_train_kcp_saved_bytes",
+    "cake_gdn_nondet_train_kcp_saved_layout",
+    "cake_gdn_nondet_train_kcp_workspace_bytes",
+    "cake_gdn_nondet_train_kcp_workspace_layout",
     "state_bytes",
 ]

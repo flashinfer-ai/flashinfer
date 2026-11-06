@@ -11,18 +11,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 CPU tests of the public surface of the NON-DETERMINISTIC context-parallel packed GDN training package
-``flashinfer.experimental.cake_gdn_train_kcp`` and of its facade ``flashinfer.cake_gdn_train_kcp`` (this package only;
-the deterministic twin is ``flashinfer.cake_gdn_det_train_kcp``): the options validator
-(``cake_gdn_train_kcp.cake_options``), the keyword-only signatures, the facade's contract names, the numerical mode
-(``deterministic`` on every entry: the package and the facade run with ``False`` only and refuse every other value
-with a ``ValueError`` naming the twin's entry; every path being fixed-order, nothing alerts, reroutes or warns under
-``torch.use_deterministic_algorithms``; no context, partition or options field holds the mode), the names (this
-package and the facade copy none of the twin's pre-rename names and share no entry or type with it; no public name
-carries a mode), the package hygiene rules (no environment variable, no KDA package import, standalone: no import of
-another FlashInfer package, its twin included, and no library name of the twin) and the host tables built on the CPU
-for the correctness rows' partitions.  No kernel runs here: the compute entries run on the fake backend (the CPU
-emulation), directly or through ``KernelBackend`` with a stub launch glue (the architecture the kernel backend passes
-to the #7 walks).
+``flashinfer.experimental.cake.cake_gdn_nondet_train_kcp`` and of its facade ``flashinfer.cake_gdn_nondet_train_kcp`` (this
+package only; the deterministic counterpart is ``flashinfer.cake_gdn_det_train_kcp``): the options validator
+(``cake_options``), the keyword-only signatures, the facade's and the package's exact public names (every one names
+the mode ``nondet``; the former names and module paths fail at import), the numerical mode (in the name only: no
+entry takes ``deterministic``, a stray keyword is a ``TypeError``; every launch being fixed-order, nothing alerts,
+reroutes or warns under ``torch.use_deterministic_algorithms``; no context, partition or options field holds the
+mode), the package hygiene rules (no environment variable, no KDA package import, standalone: no import of another
+FlashInfer package, its deterministic counterpart included, and no library name of that package) and the host tables
+built on the CPU for the correctness rows' partitions.  No kernel runs here: the compute entries run on the fake
+backend (the CPU emulation), directly or through ``KernelBackend`` with a stub launch glue (the architecture the
+kernel backend passes to the #7 walks).
 """
 
 from __future__ import annotations
@@ -30,11 +29,12 @@ from __future__ import annotations
 import ast
 import builtins
 import dataclasses
-import functools
 import importlib
+import importlib.util
 import inspect
 import json
 import pathlib
+import subprocess
 import sys
 import types
 import warnings
@@ -42,9 +42,8 @@ import warnings
 import pytest
 import torch
 
-PACKAGE = "flashinfer.experimental.cake_gdn_train_kcp"
-FACADE = "flashinfer.cake_gdn_train_kcp"
-DET_PACKAGE = "flashinfer.experimental.cake_gdn_det_train_kcp"
+PACKAGE = "flashinfer.experimental.cake.cake_gdn_nondet_train_kcp"
+FACADE = "flashinfer.cake_gdn_nondet_train_kcp"
 DET_FACADE = "flashinfer.cake_gdn_det_train_kcp"
 
 
@@ -69,13 +68,13 @@ def _mod(sub: str | None = None):
     try:
         from tests.test_helpers.cake_package import cake_package
 
-        return cake_package("cake_gdn_train_kcp", sub)
+        return cake_package("cake_gdn_nondet_train_kcp", sub)
     except (ImportError, KeyError):
         return importlib.import_module(PACKAGE if sub is None else f"{PACKAGE}.{sub}")
 
 
 opt = _mod("cake_options")
-OptionsKcp, make_options = opt.OptionsKcp, opt.make_options
+CakeGDNNondetKcpOptions, make_options = opt.CakeGDNNondetKcpOptions, opt.make_options
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -105,10 +104,10 @@ def test_options_defaults_are_the_shipped_behaviour() -> None:
 
 
 def test_every_option_field_is_keyword_only() -> None:
-    for f in dataclasses.fields(OptionsKcp):
+    for f in dataclasses.fields(CakeGDNNondetKcpOptions):
         assert f.kw_only, f.name
     with pytest.raises(TypeError):
-        OptionsKcp("ring")  # type: ignore[misc]
+        CakeGDNNondetKcpOptions("ring")  # type: ignore[misc]
 
 
 @pytest.mark.parametrize("mode", [1, 2, 3, -1, True, False, 1.0, "0"])
@@ -214,13 +213,13 @@ def test_reuse_recompute_tapes_defaults_to_auto_in_both_graph_modes() -> None:
     assert make_options(graph="replay").reuse_recompute_tapes == "auto"
     both = make_options(reuse_recompute_tapes=None, graph="replay")
     assert both.reuse_recompute_tapes == "auto"
-    assert OptionsKcp(graph="replay").reuse_recompute_tapes == "auto"
+    assert CakeGDNNondetKcpOptions(graph="replay").reuse_recompute_tapes == "auto"
     assert make_options(graph="replay").key() != make_options().key()
     on = make_options(reuse_recompute_tapes=True)
     off = make_options(reuse_recompute_tapes=False)
     assert on.reuse_recompute_tapes is True and off.reuse_recompute_tapes is False
     assert on.key() != off.key()
-    from_instance = make_options(OptionsKcp(reuse_recompute_tapes=True))
+    from_instance = make_options(CakeGDNNondetKcpOptions(reuse_recompute_tapes=True))
     assert from_instance.reuse_recompute_tapes is True
     with pytest.raises(TypeError):
         make_options(reuse_recompute_tapes=1)
@@ -255,7 +254,10 @@ def test_recompute_output_is_a_two_value_keyword_switch_defaulting_to_auto() -> 
     assert make_options().recompute_output == "auto"
     assert make_options(recompute_output="always").recompute_output == "always"
     assert (
-        make_options(OptionsKcp(recompute_output="always")).recompute_output == "always"
+        make_options(
+            CakeGDNNondetKcpOptions(recompute_output="always")
+        ).recompute_output
+        == "always"
     )
     for bad in ("never", "", None, True, 1):
         with pytest.raises((ValueError, TypeError)):
@@ -456,7 +458,7 @@ class _Stream:
 def _walk_pair_stub(monkeypatch, *, walk_pair: bool, device: str):
     """A stand-in call for ``cake_kcp._walk_pair`` with CPU stand-ins for the CUDA stream / event API: every
     stream operation and every backend launch (with the stream it was issued on) goes to the returned log; the call's
-    ``kernel`` is the host module's own ``CallKcp.kernel`` (the deferral under test)."""
+    ``kernel`` is the host module's own ``CakeGDNNondetKcpCall.kernel`` (the deferral under test)."""
     kcp = _mod("cake_kcp")
     log: list = []
     current, side = _Stream("current", log), _Stream("side", log)
@@ -498,7 +500,7 @@ def _walk_pair_stub(monkeypatch, *, walk_pair: bool, device: str):
     )
 
     def launch(name: str):
-        return lambda: kcp.CallKcp.kernel(call, name, 1)
+        return lambda: kcp.CakeGDNNondetKcpCall.kernel(call, name, 1)
 
     return kcp, call, log, launch
 
@@ -548,7 +550,7 @@ def test_walk_pair_with_an_empty_side_walk_issues_on_the_current_stream(
 
 
 def test_options_from_instance_mapping_and_keywords_agree() -> None:
-    a = make_options(OptionsKcp(save_mode="full"), boundary_mode="replay")
+    a = make_options(CakeGDNNondetKcpOptions(save_mode="full"), boundary_mode="replay")
     b = make_options({"save_mode": "full", "boundary_mode": "replay"})
     c = make_options(save_mode="full", boundary_mode="replay")
     assert a == b == c
@@ -574,101 +576,188 @@ def _after(sig: inspect.Signature, anchor: str) -> list[inspect.Parameter]:
 def test_entry_points_take_every_knob_keyword_only() -> None:
     kcp = _mod("cake_kcp")
     for fn, anchor in (
-        (kcp.chunk_gdn_kcp, "ctx"),
-        (kcp.chunk_gdn_fwd_kcp, "ctx"),
-        (kcp.chunk_gdn_bwd_kcp, "dout"),
+        (kcp.cake_gdn_nondet_kcp, "ctx"),
+        (kcp.cake_gdn_nondet_train_kcp_forward, "ctx"),
+        (kcp.cake_gdn_nondet_train_kcp_backward, "dout"),
     ):
         sig = inspect.signature(fn)
         for p in _after(sig, anchor):
             assert p.kind in (p.KEYWORD_ONLY, p.VAR_KEYWORD), (fn.__name__, p.name)
-    sig = inspect.signature(kcp.chunk_gdn_kcp)
+    sig = inspect.signature(kcp.cake_gdn_nondet_kcp)
     assert sig.parameters["save_mode"].default == "light"
     assert sig.parameters["boundary_mode"].default == "saved"
     assert sig.parameters["graph"].default == "off"
     assert sig.parameters["scale"].default is None
 
 
+# The public surface of the facade: the functions and the types it resolves on first use (the exact ``__all__``).
+FACADE_FUNCTIONS = (
+    "cake_gdn_nondet_kcp",
+    "cake_gdn_nondet_train_kcp_forward",
+    "cake_gdn_nondet_train_kcp_backward",
+    "cake_gdn_nondet_train_kcp_partition",
+    "cake_gdn_nondet_train_kcp_build_context",
+    "cake_gdn_nondet_train_kcp_packed_qkv_views",
+    "cake_gdn_nondet_train_kcp_workspace_bytes",
+    "cake_gdn_nondet_train_kcp_saved_bytes",
+    "cake_gdn_nondet_train_kcp_comm_bytes",
+    "is_cake_gdn_nondet_train_kcp_supported",
+)
+FACADE_TYPES = (
+    "CakeGDNNondetKcpContext",
+    "CakeGDNNondetKcpOptions",
+    "CakeGDNNondetKcpPartition",
+    "CakeGDNNondetKcpRecomputeHandle",
+    "CakeGDNNondetKcpSaved",
+    "CakeGDNNondetKcpWorkspace",
+    "CakeGDNNondetKcpFunction",
+)
+# The package root exports the facade's names except the support query, plus three package-level objects.
+PACKAGE_NAMES = (set(FACADE_FUNCTIONS) - {"is_cake_gdn_nondet_train_kcp_supported"}) | {
+    *FACADE_TYPES,
+    "CakeGDNNondetKcpFragment",
+    "CakeGDNNondetKcpCall",
+    "CakeGDNNondetKcpPackedQKVSplitFunction",
+}
+
+
+def _det(sub: str | None = None):
+    """The deterministic package (or one of its modules) through the test-helper registry: a stale entry fails here
+    and never skips."""
+    from tests.test_helpers.cake_package import cake_package
+
+    return cake_package("cake_gdn_det_train_kcp", sub)
+
+
 def test_facade_exposes_the_contract_names_keyword_only() -> None:
-    facade = importlib.import_module("flashinfer.cake_gdn_train_kcp")
-    names = (
-        "partition_kcp",
-        "build_context_kcp",
-        "chunk_gdn_kcp",
-        "chunk_gdn_fwd_kcp",
-        "chunk_gdn_bwd_kcp",
-        "gdn_workspace_bytes_kcp",
-        "gdn_saved_bytes_kcp",
-        "gdn_comm_bytes_kcp",
-        "is_gdn_train_kcp_supported",
-    )
-    for n in names:
+    facade = importlib.import_module(FACADE)
+    assert set(facade.__all__) == set(FACADE_FUNCTIONS) | set(FACADE_TYPES)
+    assert len(facade.__all__) == len(set(facade.__all__))
+    for n in FACADE_FUNCTIONS:
         assert callable(getattr(facade, n)), n
-        assert n in facade.__all__
-    # exactly the contract names plus the three public types; nothing else is public (the package-level
-    # packed_qkv_views_kcp is not a facade name)
-    types = (
-        "OptionsKcp",
-        "ContextKcp",
-        "PartitionKcp",
-        "RecomputeHandleKcp",
-    )
-    assert set(facade.__all__) == set(names) | set(types)
-    for n in ("DEFAULT_SCALE", "SavedKcp", "WorkspaceKcp"):
-        assert n not in facade.__all__
-    assert set(types) <= set(dir(facade))
+    assert set(FACADE_TYPES) <= set(dir(facade))
     for fn, anchor in (
-        (facade.chunk_gdn_kcp, "ctx"),
-        (facade.chunk_gdn_fwd_kcp, "ctx"),
-        (facade.chunk_gdn_bwd_kcp, "dout"),
+        (facade.cake_gdn_nondet_kcp, "ctx"),
+        (facade.cake_gdn_nondet_train_kcp_forward, "ctx"),
+        (facade.cake_gdn_nondet_train_kcp_backward, "dout"),
     ):
         for p in _after(inspect.signature(fn), anchor):
             assert p.kind in (p.KEYWORD_ONLY, p.VAR_KEYWORD), (fn.__name__, p.name)
     for fn in (
-        facade.gdn_workspace_bytes_kcp,
-        facade.gdn_saved_bytes_kcp,
-        facade.gdn_comm_bytes_kcp,
+        facade.cake_gdn_nondet_train_kcp_workspace_bytes,
+        facade.cake_gdn_nondet_train_kcp_saved_bytes,
+        facade.cake_gdn_nondet_train_kcp_comm_bytes,
     ):
         for p in _after(inspect.signature(fn), "ctx"):
             assert p.kind in (p.KEYWORD_ONLY, p.VAR_KEYWORD), (fn.__name__, p.name)
-    assert (
-        getattr(facade.chunk_gdn_kcp, "is_experimental", False) or True
-    )  # decorated as experimental (soft)
+    for p in _after(
+        inspect.signature(facade.cake_gdn_nondet_train_kcp_packed_qkv_views), "qkv"
+    ):
+        assert p.kind == p.KEYWORD_ONLY, p.name
     pkg = _mod()
-    assert facade.OptionsKcp is pkg.OptionsKcp
-    assert facade.ContextKcp is pkg.ContextKcp
-    assert facade.PartitionKcp is pkg.PartitionKcp
-    assert facade.RecomputeHandleKcp is pkg.RecomputeHandleKcp
-    assert facade.SavedKcp is pkg.SavedKcp
-    assert facade.DEFAULT_SCALE == 128**-0.5 == pkg.SCALE
+    for n in FACADE_TYPES:
+        assert getattr(facade, n) is getattr(pkg, n), n
+    # the default scale is private (no mode word): the package's SCALE
+    assert "_DEFAULT_SCALE" not in facade.__all__
+    assert facade._DEFAULT_SCALE == 128**-0.5 == _mod("cake_kcp").SCALE
     with pytest.raises(AttributeError):
         facade.no_such_name  # noqa: B018
 
 
-def test_package_init_re_exports_the_route() -> None:
+def test_package_init_exports_exactly_the_mode_named_names() -> None:
+    """The package root exports the public names only (every one names the mode); the internals (``SCALE``,
+    ``LAST_CALL``, the backend controls, the option helpers, the plan internals) stay in their submodules."""
     pkg = _mod()
+    assert set(pkg.__all__) == PACKAGE_NAMES
+    assert len(pkg.__all__) == len(set(pkg.__all__))
+    for n in PACKAGE_NAMES:
+        assert hasattr(pkg, n), n
+    kcp, opt_mod = _mod("cake_kcp"), _mod("cake_options")
     for n in (
-        "partition_kcp",
-        "build_context_kcp",
+        "SCALE",
+        "LAST_CALL",
+        "PROGRAMS",
+        "KCP_SAVED_VERSION",
+        "Backend",
+        "KernelBackend",
+        "FakeBackend",
+        "get_backend",
+        "set_backend",
+        "graph_cache_clear",
+    ):
+        assert hasattr(kcp, n), n
+        assert not hasattr(pkg, n), n
+    for n in ("make_options", "validate_heads", "validate_ring"):
+        assert hasattr(opt_mod, n), n
+        assert not hasattr(pkg, n), n
+    assert pkg.cake_gdn_nondet_kcp is kcp.cake_gdn_nondet_kcp
+    assert pkg.CakeGDNNondetKcpFunction is kcp.CakeGDNNondetKcpFunction
+    assert pkg.CakeGDNNondetKcpFunction.__name__ == "CakeGDNNondetKcpFunction"
+    assert pkg.CakeGDNNondetKcpFunction.__qualname__ == "CakeGDNNondetKcpFunction"
+
+
+def test_every_public_name_names_the_nondet_mode() -> None:
+    """Every name of the facade's and the package's ``__all__`` contains the whole mode word ``nondet`` (``det``
+    alone is not enough: ``"det" in "nondet"``)."""
+    facade = importlib.import_module(FACADE)
+    names = set(facade.__all__) | set(_mod().__all__)
+    bad = sorted(n for n in names if "nondet" not in n.lower())
+    assert not bad, bad
+
+
+def test_importing_the_facade_does_not_import_the_package() -> None:
+    """A fresh interpreter imports the facade without importing the backend package; the package is imported on the
+    first use of a facade name."""
+    code = (
+        "import sys\n"
+        f"import {FACADE} as facade\n"
+        f"assert {PACKAGE!r} not in sys.modules, 'imported at facade import'\n"
+        "facade.CakeGDNNondetKcpOptions\n"
+        f"assert {PACKAGE!r} in sys.modules, 'not imported on first use'\n"
+    )
+    root = pathlib.Path(__file__).resolve().parents[2]
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert proc.returncode == 0, proc.stderr[-4000:]
+
+
+# The former names of this route (#8928) and the deterministic package's pre-rename spellings: no module of the
+# package, nor the facade, binds or exports one.
+OLD_NAMES = frozenset(
+    {
+        # this route's former names
         "chunk_gdn_kcp",
+        "ChunkGDNFunctionKcp",
         "chunk_gdn_fwd_kcp",
         "chunk_gdn_bwd_kcp",
-        "gdn_comm_bytes_kcp",
-        "gdn_saved_bytes_kcp",
-        "gdn_workspace_bytes_kcp",
+        "partition_kcp",
+        "build_context_kcp",
         "packed_qkv_views_kcp",
-        "OptionsKcp",
+        "gdn_workspace_bytes_kcp",
+        "gdn_saved_bytes_kcp",
+        "gdn_comm_bytes_kcp",
+        "gdn_saved_layout_kcp",
+        "gdn_workspace_layout_kcp",
+        "is_gdn_train_kcp_supported",
         "ContextKcp",
+        "PartitionKcp",
+        "FragmentKcp",
+        "OptionsKcp",
+        "RecomputeHandleKcp",
         "SavedKcp",
         "WorkspaceKcp",
-    ):
-        assert hasattr(pkg, n), n
-        assert n in pkg.__all__
-
-
-# The deterministic twin's pre-rename spellings (its former facade, package and module-level names).  This package
-# and the facade copy none of them.  ``chunk_gdn_kcp`` is not listed: it is this package's canonical entry.
-LEGACY_DET_SPELLINGS = frozenset(
-    {
+        "CallKcp",
+        "PackedQKVSplitKcp",
+        "MODE",
+        "check_mode",
+        "DEFAULT_SCALE",
+        "ND_ONLY_SAVE_MODES",
+        # the deterministic package's pre-rename spellings
         "kcp_partition",
         "build_kcp_context",
         "chunk_gdn_kcp_fwd",
@@ -690,6 +779,11 @@ LEGACY_DET_SPELLINGS = frozenset(
         "KcpWorkspace",
     }
 )
+# The former module paths of this route: they fail at import (no alias, no shim).
+OLD_MODULES = (
+    "flashinfer.cake_gdn_train_kcp",
+    "flashinfer.experimental.cake_gdn_train_kcp",
+)
 SUBMODULES = (
     "cake_backend",
     "cake_build",
@@ -704,62 +798,81 @@ SUBMODULES = (
 )
 
 
-def test_no_module_of_the_package_or_the_facade_binds_a_legacy_det_spelling() -> None:
-    """No pre-rename spelling of the twin was copied: the package, each of its modules and the facade neither bind
-    nor export any of them.  ``chunk_gdn_kcp`` is this package's own entry, defined in ``cake_kcp`` under that name."""
+def test_no_module_of_the_package_or_the_facade_binds_an_old_name() -> None:
+    """The package, each of its modules and the facade neither bind nor export a former name of this route or a
+    pre-rename spelling of the deterministic package."""
     facade = importlib.import_module(FACADE)
     pkg = _mod()
     for module in [pkg, facade] + [_mod(sub) for sub in SUBMODULES]:
         exported = set(getattr(module, "__all__", ()))
-        for name in sorted(LEGACY_DET_SPELLINGS):
+        for name in sorted(OLD_NAMES):
             assert not hasattr(module, name), (module.__name__, name)
             assert name not in exported, (module.__name__, name)
-    entry = _mod("cake_kcp").chunk_gdn_kcp
-    assert pkg.chunk_gdn_kcp is entry
-    assert (
-        entry.__module__ == f"{PACKAGE}.cake_kcp" and entry.__name__ == "chunk_gdn_kcp"
-    )
+    entry = _mod("cake_kcp").cake_gdn_nondet_kcp
+    assert pkg.cake_gdn_nondet_kcp is entry
+    assert entry.__module__ == f"{PACKAGE}.cake_kcp"
+    assert entry.__name__ == "cake_gdn_nondet_kcp"
+    for name in ("chunk_gdn_kcp", "partition_kcp", "OptionsKcp"):
+        with pytest.raises(ImportError):
+            exec(f"from {FACADE} import {name}", {})
+        with pytest.raises(ImportError):
+            exec(f"from {PACKAGE} import {name}", {})
 
 
-def test_the_package_shares_no_entry_or_type_with_the_twin() -> None:
-    """This package's entries (also through the facade) and types are never the twin's objects (the twin's det names)."""
-    det_pkg = importlib.import_module(DET_PACKAGE)
+def test_the_former_modules_fail_at_import() -> None:
+    """``flashinfer.cake_gdn_train_kcp`` and ``flashinfer.experimental.cake_gdn_train_kcp`` raise
+    ``ModuleNotFoundError``.  A checkout may keep an untracked leftover of the former package directory (``aot/``,
+    ``__pycache__``), which Python imports as an empty namespace package: such a leftover holds no module and none of
+    the former names."""
+    for old in OLD_MODULES:
+        spec = importlib.util.find_spec(old)
+        if (
+            spec is not None
+            and spec.origin in (None, "namespace")
+            and spec.submodule_search_locations
+        ):
+            mod = importlib.import_module(old)
+            for name in sorted(OLD_NAMES):
+                assert not hasattr(mod, name), (old, name)
+            for sub in SUBMODULES:
+                with pytest.raises(ModuleNotFoundError):
+                    importlib.import_module(f"{old}.{sub}")
+            continue
+        with pytest.raises(ModuleNotFoundError):
+            importlib.import_module(old)
+
+
+def test_the_package_shares_no_entry_or_type_with_the_deterministic_package() -> None:
+    """This package's entries (also through the facade) and types are never the deterministic package's objects."""
+    det_pkg = _det()
     facade = importlib.import_module(FACADE)
     for nondet_entry in (
-        _mod().chunk_gdn_kcp,
-        _mod("cake_kcp").chunk_gdn_kcp,
-        facade.chunk_gdn_kcp,
+        _mod().cake_gdn_nondet_kcp,
+        _mod("cake_kcp").cake_gdn_nondet_kcp,
+        facade.cake_gdn_nondet_kcp,
     ):
-        assert nondet_entry is not det_pkg.chunk_gdn_det_kcp
+        assert nondet_entry is not det_pkg.cake_gdn_det_kcp
     for name in (
-        "OptionsKcp",
-        "ContextKcp",
-        "PartitionKcp",
-        "SavedKcp",
-        "WorkspaceKcp",
+        "CakeGDNNondetKcpOptions",
+        "CakeGDNNondetKcpContext",
+        "CakeGDNNondetKcpPartition",
+        "CakeGDNNondetKcpSaved",
+        "CakeGDNNondetKcpWorkspace",
+        "CakeGDNNondetKcpFunction",
     ):
         assert getattr(_mod(), name) is not getattr(
-            det_pkg, name.replace("Kcp", "DetKcp")
+            det_pkg, name.replace("Nondet", "Det")
         ), name
 
 
-def test_no_public_name_of_the_package_or_the_facade_names_a_mode() -> None:
-    """The mode lives in the ``deterministic`` keyword (and the package's ``MODE`` / ``check_mode``), never in a
-    public name: no exported name of the package, its modules or the facade contains ``det`` / ``non_det``."""
-    facade = importlib.import_module(FACADE)
-    names = set(_mod().__all__) | set(facade.__all__)
-    names |= {n for n in dir(facade) if not n.startswith("_")}
-    for sub in SUBMODULES:
-        names |= set(getattr(_mod(sub), "__all__", ()))
-    bad = sorted(n for n in names if "det" in n.lower() or "non_det" in n.lower())
-    assert not bad, bad
-    assert {"MODE", "check_mode"} <= set(_mod().__all__)
-
-
 # ----------------------------------------------------------------------------------------------------------------
-# the numerical mode (``deterministic`` on every entry; the package is non-deterministic only)
+# the numerical mode: in the name only (no ``deterministic`` keyword; fixed-order launches)
 
-ENTRIES = ("chunk_gdn_kcp", "chunk_gdn_fwd_kcp", "chunk_gdn_bwd_kcp")
+ENTRIES = (
+    "cake_gdn_nondet_kcp",
+    "cake_gdn_nondet_train_kcp_forward",
+    "cake_gdn_nondet_train_kcp_backward",
+)
 MODE_CU = [0, 100, 230, 307]  # three documents, boundaries inside chunks
 MODE_HEADS = (2, 6)
 
@@ -802,92 +915,127 @@ def _mode_ops(
 def _mode_case():
     """A one-rank CPU context of :data:`MODE_CU` and its operands."""
     plan = _mod("cake_kcp_plan")
-    part = plan.partition_kcp(MODE_CU, 1, "contiguous")
-    ctx = plan.build_context_kcp(part, None, 0, "cpu", sm_count=148)
+    part = plan.cake_gdn_nondet_train_kcp_partition(MODE_CU, 1, "contiguous")
+    ctx = plan.cake_gdn_nondet_train_kcp_build_context(
+        part, None, 0, "cpu", sm_count=148
+    )
     return ctx, _mode_ops()
 
 
-def _call(entry: str, ctx, ops, **kw):
-    """One package compute entry on the fake backend (``chunk_gdn_bwd_kcp`` without a saved set: the replay)."""
-    kcp = _mod("cake_kcp")
+def _call(entry: str, ctx, ops, module=None, **kw):
+    """One compute entry of the package (or of ``module``, the facade) on the fake backend
+    (``cake_gdn_nondet_train_kcp_backward`` without a saved set: the replay)."""
+    mod = _mod("cake_kcp") if module is None else module
     args = [ops[n] for n in ("q", "k", "v", "g", "beta")]
-    if entry == "chunk_gdn_bwd_kcp":
-        return kcp.chunk_gdn_bwd_kcp(*args, ctx, ops["dout"], backend="fake", **kw)
-    return getattr(kcp, entry)(*args, ctx, backend="fake", **kw)
+    if entry == "cake_gdn_nondet_train_kcp_backward":
+        return mod.cake_gdn_nondet_train_kcp_backward(
+            *args, ctx, ops["dout"], backend="fake", **kw
+        )
+    return getattr(mod, entry)(*args, ctx, backend="fake", **kw)
 
 
-def test_every_entry_takes_the_mode_keyword_only_defaulting_to_true() -> None:
-    """``deterministic`` is a keyword-only parameter defaulting to ``True`` on every package compute entry and on every
-    facade entry (the package's default is refused: a caller states the mode)."""
-    kcp = _mod("cake_kcp")
-    for name in ENTRIES:
-        p = inspect.signature(getattr(kcp, name)).parameters["deterministic"]
-        assert p.kind == p.KEYWORD_ONLY and p.default is True, name
+def _callables(module) -> list:
+    """``(name, callable)`` for every callable of ``module.__all__``, with the ``forward`` / ``backward`` of an
+    autograd Function class."""
+    out = []
+    for name in module.__all__:
+        obj = getattr(module, name)
+        if not callable(obj):
+            continue
+        out.append((name, obj))
+        if isinstance(obj, type) and issubclass(obj, torch.autograd.Function):
+            out += [
+                (f"{name}.forward", obj.forward),
+                (f"{name}.backward", obj.backward),
+            ]
+    return out
+
+
+def test_no_public_callable_takes_a_deterministic_parameter() -> None:
+    """No callable of the facade's or the package's ``__all__`` (and no public function of the submodules the
+    package root exports from) has a ``deterministic`` parameter."""
     facade = importlib.import_module(FACADE)
-    for name in (
-        "partition_kcp",
-        "build_context_kcp",
-        "chunk_gdn_kcp",
-        "chunk_gdn_fwd_kcp",
-        "chunk_gdn_bwd_kcp",
-        "gdn_workspace_bytes_kcp",
-        "gdn_saved_bytes_kcp",
-        "gdn_comm_bytes_kcp",
-        "is_gdn_train_kcp_supported",
+    checked = 0
+    for module in (facade, _mod()):
+        for name, fn in _callables(module):
+            try:
+                sig = inspect.signature(fn)
+            except (TypeError, ValueError):
+                continue
+            assert "deterministic" not in sig.parameters, (module.__name__, name)
+            checked += 1
+    assert checked >= len(FACADE_FUNCTIONS)
+    plan = _mod("cake_kcp_plan")
+    for fn in (
+        plan.cake_gdn_nondet_train_kcp_partition,
+        plan.cake_gdn_nondet_train_kcp_build_context,
     ):
-        p = inspect.signature(getattr(facade, name)).parameters["deterministic"]
-        assert p.kind == p.KEYWORD_ONLY and p.default is True, name
-    assert kcp.MODE == "nondeterministic" and _mod().MODE is kcp.MODE
-    assert _mod().check_mode is kcp.check_mode
+        assert "deterministic" not in fn.__code__.co_varnames, fn.__name__
 
 
+@pytest.mark.parametrize("value", [True, False])
 @pytest.mark.parametrize("entry", ENTRIES)
-@pytest.mark.parametrize(
-    "value", [True, "omitted", 1, None, 0, "False"], ids=lambda v: repr(v)
-)
-def test_package_entries_refuse_every_mode_but_false(entry, value) -> None:
-    """The package ships no deterministic program and never falls back: every value but ``False`` (the default
-    ``True``, an omitted keyword, ``1``, ``None``, ``0``, ``"False"``) is a ``ValueError`` naming the entry, raised
-    before any work."""
+def test_a_deterministic_keyword_is_a_type_error(entry, value) -> None:
+    """A stray ``deterministic=`` keyword (``True`` or ``False``) is refused with ``TypeError`` before any work, on
+    the package's compute entries and on the facade's: it never lands silently in the options."""
     ctx, ops = _mode_case()
-    kw = {} if value == "omitted" else {"deterministic": value}
-    det = FACADE_DET_NAMES[entry]
-    with pytest.raises(
-        ValueError, match=f"{entry}: .*needs deterministic=False"
-    ) as info:
-        _call(entry, ctx, ops, **kw)
-    assert str(info.value).endswith(
-        "pass deterministic=False for the non-deterministic path; the deterministic entry is "
-        f"flashinfer.cake_gdn_det_train_kcp.{det}"
-    ), str(info.value)
-    with pytest.raises(ValueError, match="needs deterministic=False"):
-        _mod().check_mode(True if value == "omitted" else value, entry)
+    facade = importlib.import_module(FACADE)
+    for module in (None, facade):
+        with pytest.raises(TypeError, match="deterministic"):
+            _call(entry, ctx, ops, module=module, deterministic=value)
 
 
-def test_package_entries_run_with_false_on_the_fake_backend() -> None:
-    """``deterministic=False``: the forward, the saved-set backward, the replay backward and the autograd node run on
-    the fake backend (finite outputs of the contract's shapes and dtypes; the accuracy is the fake-backend suite's)."""
+def test_the_other_entries_refuse_a_deterministic_keyword() -> None:
+    """The plan, byte-query, view and support entries of the facade refuse ``deterministic=`` with ``TypeError``."""
+    facade = importlib.import_module(FACADE)
+    ctx, _ops = _mode_case()
+    kw = {"deterministic": False}
+    calls = (
+        lambda: facade.cake_gdn_nondet_train_kcp_partition(MODE_CU, 1, **kw),
+        lambda: facade.cake_gdn_nondet_train_kcp_build_context(
+            ctx.partition, None, 0, "cpu", **kw
+        ),
+        lambda: facade.cake_gdn_nondet_train_kcp_workspace_bytes(
+            ctx, H_qk=2, HV=6, **kw
+        ),
+        lambda: facade.cake_gdn_nondet_train_kcp_saved_bytes(ctx, H_qk=2, HV=6, **kw),
+        lambda: facade.cake_gdn_nondet_train_kcp_comm_bytes(ctx, H_qk=2, HV=6, **kw),
+        lambda: facade.cake_gdn_nondet_train_kcp_packed_qkv_views(
+            torch.zeros(4, 10 * 128, dtype=torch.bfloat16), H_qk=2, HV=6, **kw
+        ),
+        lambda: facade.is_cake_gdn_nondet_train_kcp_supported("cpu", **kw),
+    )
+    for call in calls:
+        with pytest.raises(TypeError, match="deterministic"):
+            call()
+
+
+def test_the_support_query_returns_a_bool() -> None:
+    facade = importlib.import_module(FACADE)
+    assert isinstance(facade.is_cake_gdn_nondet_train_kcp_supported(), bool)
+    assert facade.is_cake_gdn_nondet_train_kcp_supported("cpu") is False
+    assert isinstance(facade.is_cake_gdn_nondet_train_kcp_supported(0), bool)
+
+
+def test_package_entries_run_on_the_fake_backend() -> None:
+    """The forward, the saved-set backward, the replay backward and the autograd node run on the fake backend
+    (finite outputs of the contract's shapes and dtypes; the accuracy is the fake-backend suite's)."""
     kcp = _mod("cake_kcp")
     ctx, ops = _mode_case()
     args = [ops[n] for n in ("q", "k", "v", "g", "beta")]
-    out, saved = kcp.chunk_gdn_fwd_kcp(*args, ctx, backend="fake", deterministic=False)
-    assert isinstance(saved, kcp.SavedKcp)
+    out, saved = kcp.cake_gdn_nondet_train_kcp_forward(*args, ctx, backend="fake")
+    assert isinstance(saved, kcp.CakeGDNNondetKcpSaved)
     assert out.shape == ops["v"].shape and out.dtype == torch.bfloat16
     for saved_set in (saved, None):
-        grads = kcp.chunk_gdn_bwd_kcp(
-            *args,
-            ctx,
-            ops["dout"],
-            saved=saved_set,
-            backend="fake",
-            deterministic=False,
+        grads = kcp.cake_gdn_nondet_train_kcp_backward(
+            *args, ctx, ops["dout"], saved=saved_set, backend="fake"
         )
         for t, like in zip(grads, ("q", "k", "v", "beta", "g"), strict=True):
             assert t.shape == ops[like].shape and t.dtype == ops[like].dtype, like
             assert bool(torch.isfinite(t.float()).all()), like
     leaves = [t.detach().clone().requires_grad_(True) for t in args]
-    y = kcp.chunk_gdn_kcp(*leaves, ctx, backend="fake", deterministic=False)
-    assert y.grad_fn is not None and y.grad_fn.kcp_mode == kcp.MODE
+    y = kcp.cake_gdn_nondet_kcp(*leaves, ctx, backend="fake")
+    assert y.grad_fn is not None and y.grad_fn.kcp_mode == kcp._MODE
     y.backward(ops["dout"])
     assert all(
         lf.grad is not None and bool(torch.isfinite(lf.grad.float()).all())
@@ -900,21 +1048,20 @@ def test_package_entries_run_with_false_on_the_fake_backend() -> None:
 def test_no_alert_under_torch_deterministic_algorithms(
     entry, warn_only, torch_deterministic
 ) -> None:
-    """Every path of this version is fixed-order (run-to-run reproducible for a fixed plan and partition), so with
-    ``torch.use_deterministic_algorithms(True)`` (and with ``warn_only=True``) a ``deterministic=False`` call of the
-    package runs: no ``RuntimeError``, no warning.  Only a path that launches an unordered reduction may alert."""
+    """Every launch of this version is fixed-order, so with ``torch.use_deterministic_algorithms(True)`` (and with
+    ``warn_only=True``) a call of the package runs: no ``RuntimeError``, no warning, no fallback."""
     ctx, ops = _mode_case()
     torch.use_deterministic_algorithms(True, warn_only=warn_only)
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        _call(entry, ctx, ops, deterministic=False)
+        _call(entry, ctx, ops)
 
 
 def test_autograd_backward_runs_under_torch_deterministic_mode(
     torch_deterministic,
 ) -> None:
     """A forward run with torch's deterministic algorithms off and a backward with them on (and the reverse): the
-    node's backward runs without an alert or a warning, and both give the same gradients (fixed-order paths)."""
+    node's backward runs without an alert or a warning, and both give the same gradients (fixed-order launches)."""
     kcp = _mod("cake_kcp")
     ctx, ops = _mode_case()
     grads = []
@@ -926,7 +1073,7 @@ def test_autograd_backward_runs_under_torch_deterministic_mode(
         torch.use_deterministic_algorithms(fwd_det)
         with warnings.catch_warnings():
             warnings.simplefilter("error")
-            y = kcp.chunk_gdn_kcp(*leaves, ctx, backend="fake", deterministic=False)
+            y = kcp.cake_gdn_nondet_kcp(*leaves, ctx, backend="fake")
             torch.use_deterministic_algorithms(bwd_det)
             y.backward(ops["dout"])
         grads.append([y.detach()] + [t.grad for t in leaves])
@@ -935,17 +1082,17 @@ def test_autograd_backward_runs_under_torch_deterministic_mode(
             assert torch.equal(x, y)
 
 
-def test_autograd_function_refuses_a_forward_of_another_mode() -> None:
-    """The node records its forward's mode (``fctx.kcp_mode = MODE``); a backward whose node carries another mode (or
-    none) is refused before any work -- on a real node and on a stand-in context."""
+def test_autograd_function_refuses_a_node_of_another_package() -> None:
+    """The node keeps this package's private tag (``fctx.kcp_mode = _MODE``); a backward whose node carries another
+    tag (or none) is refused before any work -- on a real node and on a stand-in context."""
     kcp = _mod("cake_kcp")
     ctx, ops = _mode_case()
     leaves = [
         ops[n].detach().clone().requires_grad_(True)
         for n in ("q", "k", "v", "g", "beta")
     ]
-    y = kcp.chunk_gdn_kcp(*leaves, ctx, backend="fake", deterministic=False)
-    assert y.grad_fn.kcp_mode == "nondeterministic"
+    y = kcp.cake_gdn_nondet_kcp(*leaves, ctx, backend="fake")
+    assert y.grad_fn.kcp_mode == "nondeterministic" == kcp._MODE
     y.grad_fn.kcp_mode = "deterministic"
     with pytest.raises(ValueError, match="forward ran in mode 'deterministic'"):
         y.backward(ops["dout"])
@@ -958,8 +1105,11 @@ def test_autograd_function_refuses_a_forward_of_another_mode() -> None:
         fctx = StandIn()
         if mode is not None:
             fctx.kcp_mode = mode
-        with pytest.raises(ValueError, match="forward ran in mode"):
-            kcp.ChunkGDNFunctionKcp.backward(fctx, torch.zeros(1))
+        with pytest.raises(
+            ValueError,
+            match="^CakeGDNNondetKcpFunction.backward: the forward ran in mode",
+        ):
+            kcp.CakeGDNNondetKcpFunction.backward(fctx, torch.zeros(1))
 
 
 def _saved_kwargs(mod) -> dict:
@@ -987,60 +1137,45 @@ def _saved_kwargs(mod) -> dict:
     )
 
 
-def test_a_saved_set_is_read_by_its_own_routes_backward_only() -> None:
-    """The package backward refuses a deterministic twin's ``SavedDetKcp`` (and any other object) with ``ValueError``;
-    so does the facade with ``deterministic=False`` (it hands the saved set to the package), and without it the
-    facade refuses the call by its mode before reading the saved set."""
+def test_a_saved_set_is_read_by_its_own_packages_backward_only() -> None:
+    """The package backward refuses a deterministic package's ``CakeGDNDetKcpSaved`` (and any other object) with
+    ``ValueError``; so does the facade, which hands the saved set to the package."""
     kcp = _mod("cake_kcp")
-    det_kcp = importlib.import_module(f"{DET_PACKAGE}.cake_kcp")
-    det_saved = det_kcp.SavedDetKcp(**_saved_kwargs(det_kcp))
-    nondet_saved = kcp.SavedKcp(**_saved_kwargs(kcp))
+    det_kcp = _det("cake_kcp")
+    det_saved = det_kcp.CakeGDNDetKcpSaved(**_saved_kwargs(det_kcp))
     ctx, ops = _mode_case()
     args = [ops[n] for n in ("q", "k", "v", "g", "beta")]
     facade = importlib.import_module(FACADE)
     for bad in (det_saved, object()):
-        with pytest.raises(
-            ValueError,
-            match="not a saved set of flashinfer.experimental.cake_gdn_train_kcp",
-        ):
-            kcp.chunk_gdn_bwd_kcp(
-                *args, ctx, ops["dout"], saved=bad, backend="fake", deterministic=False
-            )
-        with pytest.raises(
-            ValueError,
-            match="not a saved set of flashinfer.experimental.cake_gdn_train_kcp",
-        ):
-            facade.chunk_gdn_bwd_kcp(
-                *args, ctx, ops["dout"], saved=bad, backend="fake", deterministic=False
-            )
-    for kw in ({}, {"deterministic": True}):
-        with pytest.raises(ValueError, match="pass deterministic=False"):
-            facade.chunk_gdn_bwd_kcp(*args, ctx, ops["dout"], saved=nondet_saved, **kw)
+        for module in (kcp, facade):
+            with pytest.raises(
+                ValueError,
+                match=f"not a saved set of {PACKAGE}",
+            ):
+                module.cake_gdn_nondet_train_kcp_backward(
+                    *args, ctx, ops["dout"], saved=bad, backend="fake"
+                )
 
 
-# facade entry -> the twin's entry (``flashinfer.cake_gdn_det_train_kcp``) that its refusal names
+# facade entry -> the deterministic facade's entry (``flashinfer.cake_gdn_det_train_kcp``) that the facade must never
+# reach (the recorders below fail a call that does)
 FACADE_DET_NAMES = {
-    "partition_kcp": "partition_det_kcp",
-    "build_context_kcp": "build_context_det_kcp",
-    "chunk_gdn_kcp": "chunk_gdn_det_kcp",
-    "chunk_gdn_fwd_kcp": "chunk_gdn_det_fwd_kcp",
-    "chunk_gdn_bwd_kcp": "chunk_gdn_det_bwd_kcp",
-    "gdn_workspace_bytes_kcp": "gdn_det_workspace_bytes_kcp",
-    "gdn_saved_bytes_kcp": "gdn_det_saved_bytes_kcp",
-    "gdn_comm_bytes_kcp": "gdn_det_comm_bytes_kcp",
+    "cake_gdn_nondet_train_kcp_partition": "cake_gdn_det_train_kcp_partition",
+    "cake_gdn_nondet_train_kcp_build_context": "cake_gdn_det_train_kcp_build_context",
+    "cake_gdn_nondet_kcp": "cake_gdn_det_kcp",
+    "cake_gdn_nondet_train_kcp_forward": "cake_gdn_det_train_kcp_forward",
+    "cake_gdn_nondet_train_kcp_backward": "cake_gdn_det_train_kcp_backward",
+    "cake_gdn_nondet_train_kcp_packed_qkv_views": "cake_gdn_det_train_kcp_packed_qkv_views",
+    "cake_gdn_nondet_train_kcp_workspace_bytes": "cake_gdn_det_train_kcp_workspace_bytes",
+    "cake_gdn_nondet_train_kcp_saved_bytes": "cake_gdn_det_train_kcp_saved_bytes",
+    "cake_gdn_nondet_train_kcp_comm_bytes": "cake_gdn_det_train_kcp_comm_bytes",
 }
-# every value of ``deterministic`` the facade refuses ("omitted": the default)
-REFUSED_MODES = ("omitted", True, None, 0, 1, "False", "True")
-
-
-def _mode_kw(value) -> dict:
-    return {} if value == "omitted" else {"deterministic": value}
 
 
 def _route_recorders(monkeypatch) -> list:
     """Replace every entry of this package that the facade calls by a recorder returning its tag (``nondet:<name>``),
-    and every entry of the twin's facade by one returning ``det:<name>`` (the facade must never reach those); the calls
-    ``(tag, kwargs)`` land in the returned list."""
+    and every entry of the deterministic facade by one returning ``det:<name>`` (the facade must never reach those);
+    the calls ``(tag, kwargs)`` land in the returned list."""
     det_facade = importlib.import_module(DET_FACADE)
     pkg = _mod()
     seen: list = []
@@ -1057,8 +1192,8 @@ def _route_recorders(monkeypatch) -> list:
         monkeypatch.setattr(pkg, entry, recorder(f"nondet:{entry}"))
     monkeypatch.setattr(
         det_facade,
-        "is_gdn_det_train_kcp_supported",
-        recorder("det:is_gdn_det_train_kcp_supported"),
+        "is_cake_gdn_det_train_kcp_supported",
+        recorder("det:is_cake_gdn_det_train_kcp_supported"),
     )
     return seen
 
@@ -1067,112 +1202,117 @@ def _facade_calls(facade) -> dict:
     t = torch.zeros(1)
     ctx = object()  # the recorders read nothing
     return {
-        "partition_kcp": lambda **m: facade.partition_kcp([0, 4], 1, **m),
-        "build_context_kcp": lambda **m: facade.build_context_kcp(
-            object(), None, 0, "cpu", **m
+        "cake_gdn_nondet_train_kcp_partition": lambda **m: (
+            facade.cake_gdn_nondet_train_kcp_partition([0, 4], 1, **m)
         ),
-        "chunk_gdn_kcp": lambda **m: facade.chunk_gdn_kcp(t, t, t, t, t, ctx, **m),
-        "chunk_gdn_fwd_kcp": lambda **m: facade.chunk_gdn_fwd_kcp(
+        "cake_gdn_nondet_train_kcp_build_context": lambda **m: (
+            facade.cake_gdn_nondet_train_kcp_build_context(
+                object(), None, 0, "cpu", **m
+            )
+        ),
+        "cake_gdn_nondet_kcp": lambda **m: facade.cake_gdn_nondet_kcp(
             t, t, t, t, t, ctx, **m
         ),
-        "chunk_gdn_bwd_kcp": lambda **m: facade.chunk_gdn_bwd_kcp(
-            t, t, t, t, t, ctx, t, **m
+        "cake_gdn_nondet_train_kcp_forward": lambda **m: (
+            facade.cake_gdn_nondet_train_kcp_forward(t, t, t, t, t, ctx, **m)
         ),
-        "gdn_workspace_bytes_kcp": lambda **m: facade.gdn_workspace_bytes_kcp(
-            ctx, H_qk=2, HV=6, **m
+        "cake_gdn_nondet_train_kcp_backward": lambda **m: (
+            facade.cake_gdn_nondet_train_kcp_backward(t, t, t, t, t, ctx, t, **m)
         ),
-        "gdn_saved_bytes_kcp": lambda **m: facade.gdn_saved_bytes_kcp(
-            ctx, H_qk=2, HV=6, **m
+        "cake_gdn_nondet_train_kcp_packed_qkv_views": lambda **m: (
+            facade.cake_gdn_nondet_train_kcp_packed_qkv_views(t, H_qk=2, HV=6, **m)
         ),
-        "gdn_comm_bytes_kcp": lambda **m: facade.gdn_comm_bytes_kcp(
-            ctx, H_qk=2, HV=6, **m
+        "cake_gdn_nondet_train_kcp_workspace_bytes": lambda **m: (
+            facade.cake_gdn_nondet_train_kcp_workspace_bytes(ctx, H_qk=2, HV=6, **m)
+        ),
+        "cake_gdn_nondet_train_kcp_saved_bytes": lambda **m: (
+            facade.cake_gdn_nondet_train_kcp_saved_bytes(ctx, H_qk=2, HV=6, **m)
+        ),
+        "cake_gdn_nondet_train_kcp_comm_bytes": lambda **m: (
+            facade.cake_gdn_nondet_train_kcp_comm_bytes(ctx, H_qk=2, HV=6, **m)
         ),
     }
 
 
-def _refusal(entry: str, det_name: str) -> str:
-    return (
-        f"^{entry}: flashinfer.cake_gdn_train_kcp runs the non-deterministic package only and needs "
-        r"deterministic=False \(got .*\): pass deterministic=False for the non-deterministic path; "
-        f"the deterministic entry is flashinfer.cake_gdn_det_train_kcp.{det_name}$"
-    )
+# torch's deterministic-algorithms settings: off, strict, warn-only
+TORCH_MODES = ((False, False), (True, False), (True, True))
 
 
-def test_facade_runs_the_package_with_false_and_refuses_every_other_mode(
-    monkeypatch,
+@pytest.mark.parametrize("torch_mode", TORCH_MODES, ids=("off", "strict", "warn_only"))
+def test_facade_runs_this_package_only(
+    monkeypatch, torch_deterministic, torch_mode
 ) -> None:
-    """``deterministic=False`` runs this package's object (with ``deterministic=False`` and the contract's default
-    scale on the compute entries).  Every other value -- the default, ``True``, ``None``, ``0``, ``1``, ``"False"``,
-    ``"True"`` -- is a ``ValueError`` that names the twin's entry and says to pass ``deterministic=False``, raised
-    before any call: the facade never reaches the twin."""
+    """Every facade entry runs this package's object (the compute entries with the contract's default scale), the
+    support query included, with torch's deterministic algorithms off, on and on with ``warn_only``: no reroute to
+    the deterministic package, no fallback and no warning."""
     facade = importlib.import_module(FACADE)
-    assert not torch.are_deterministic_algorithms_enabled()
+    from flashinfer.api_logging import ExperimentalWarning
+
+    facade.is_cake_gdn_nondet_train_kcp_supported()  # its first call imports the package's loader
     seen = _route_recorders(monkeypatch)
-    for entry, call in _facade_calls(facade).items():
+    torch.use_deterministic_algorithms(torch_mode[0], warn_only=torch_mode[1])
+    calls = _facade_calls(facade)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        warnings.filterwarnings("ignore", category=ExperimentalWarning)
+        for _ in range(2):
+            for entry, call in calls.items():
+                seen.clear()
+                assert call() == f"nondet:{entry}", entry
+                assert [tag for tag, _ in seen] == [f"nondet:{entry}"], entry
+                if entry in ENTRIES:
+                    assert seen[-1][1]["scale"] == 128**-0.5, entry
         seen.clear()
-        assert call(deterministic=False) == f"nondet:{entry}", entry
-        if entry.startswith("chunk_gdn"):
-            assert seen[-1][1]["deterministic"] is False, entry
-            assert seen[-1][1]["scale"] == 128**-0.5, entry
-        for value in REFUSED_MODES:
-            seen.clear()
-            with pytest.raises(
-                ValueError, match=_refusal(entry, FACADE_DET_NAMES[entry])
-            ):
-                call(**_mode_kw(value))
-            assert seen == [], (entry, value)
-    assert isinstance(
-        facade.is_gdn_train_kcp_supported("cpu", deterministic=False), bool
-    )
-    for value in REFUSED_MODES:
-        with pytest.raises(
-            ValueError,
-            match=_refusal(
-                "is_gdn_train_kcp_supported", "is_gdn_det_train_kcp_supported"
-            ),
-        ):
-            facade.is_gdn_train_kcp_supported("cpu", **_mode_kw(value))
+        assert isinstance(facade.is_cake_gdn_nondet_train_kcp_supported("cpu"), bool)
+        assert isinstance(facade.is_cake_gdn_nondet_train_kcp_supported(), bool)
     assert not seen
-    for name in ("_det", "_deterministic", "_DET_FALLBACK_WARNED", "_refuse_nd_only"):
+    for name in (
+        "_det",
+        "_deterministic",
+        "_DET_FALLBACK_WARNED",
+        "_refuse_nd_only",
+        "_require_nondeterministic",
+        "_DET_ENTRIES",
+        "_DET_MODULE",
+    ):
         assert not hasattr(facade, name), name
 
 
-def test_facade_passes_non_deterministic_only_save_modes_on(
+def test_facade_passes_the_light_akk_save_mode_on(
     monkeypatch, torch_deterministic
 ) -> None:
-    """``ND_ONLY_SAVE_MODES`` are the save_mode values of this package that the twin does not take; with
-    ``deterministic=False`` the facade passes each one on unchanged (keyword, knob, options mapping or options
-    instance), on every compute entry and in the saved / workspace byte queries, also under torch's deterministic
-    algorithms (strict and ``warn_only``)."""
+    """``"light_akk"`` is the save_mode value of this package that the deterministic package does not take; the
+    facade passes it on unchanged (keyword, knob, options mapping or options instance), on every compute entry and in
+    the saved / workspace byte queries, also under torch's deterministic algorithms (strict and ``warn_only``)."""
     facade = importlib.import_module(FACADE)
-    det_opt = importlib.import_module(f"{DET_PACKAGE}.cake_options")
-    assert facade.ND_ONLY_SAVE_MODES == ("light_akk",)
-    assert set(facade.ND_ONLY_SAVE_MODES) == set(opt.SAVE_MODES) - set(
-        det_opt.SAVE_MODES
-    )
+    det_opt = _det("cake_options")
+    nondet_only = ("light_akk",)
+    assert set(nondet_only) == set(opt.SAVE_MODES) - set(det_opt.SAVE_MODES)
     seen = _route_recorders(monkeypatch)
     calls = _facade_calls(facade)
     entries = (
-        "chunk_gdn_kcp",
-        "chunk_gdn_fwd_kcp",
-        "chunk_gdn_bwd_kcp",
-        "gdn_workspace_bytes_kcp",
-        "gdn_saved_bytes_kcp",
+        "cake_gdn_nondet_kcp",
+        "cake_gdn_nondet_train_kcp_forward",
+        "cake_gdn_nondet_train_kcp_backward",
+        "cake_gdn_nondet_train_kcp_workspace_bytes",
+        "cake_gdn_nondet_train_kcp_saved_bytes",
     )
-    for mode in facade.ND_ONLY_SAVE_MODES:
+    for mode in nondet_only:
         forms = [
             {"save_mode": mode},
             {"options": {"save_mode": mode}},
-            {"options": OptionsKcp(save_mode=mode, use_qk_l2norm_in_kernel=True)},
+            {
+                "options": CakeGDNNondetKcpOptions(
+                    save_mode=mode, use_qk_l2norm_in_kernel=True
+                )
+            },
         ]
-        for torch_mode in ((False, False), (True, False), (True, True)):
+        for torch_mode in TORCH_MODES:
             torch.use_deterministic_algorithms(torch_mode[0], warn_only=torch_mode[1])
             for entry in entries:
                 for form in forms:
                     seen.clear()
-                    assert (
-                        calls[entry](**form, deterministic=False) == f"nondet:{entry}"
-                    )
+                    assert calls[entry](**form) == f"nondet:{entry}"
                     sent = seen[-1][1]
                     got = sent.get("options") if "options" in form else sent
                     got = got if isinstance(got, dict) else dataclasses.asdict(got)
@@ -1181,12 +1321,12 @@ def test_facade_passes_non_deterministic_only_save_modes_on(
 
 def test_facade_imports_the_package_once(monkeypatch) -> None:
     """The facade imports the package on first use only: later calls run no import and reach the same module object.
-    It holds no reference to the twin."""
+    It imports nothing of the deterministic package."""
     facade = importlib.import_module(FACADE)
     _route_recorders(monkeypatch)
     calls = _facade_calls(facade).values()
     for call in calls:  # first use
-        call(deterministic=False)
+        call()
     imports: list = []
     real_import = builtins.__import__
 
@@ -1197,7 +1337,7 @@ def test_facade_imports_the_package_once(monkeypatch) -> None:
     with monkeypatch.context() as m:
         m.setattr(builtins, "__import__", counting_import)
         for call in calls:
-            call(deterministic=False)
+            call()
     assert imports == [], imports
     assert facade._pkg() is importlib.import_module(PACKAGE)
     tree = ast.parse(pathlib.Path(facade.__file__).read_text())
@@ -1209,142 +1349,90 @@ def test_facade_imports_the_package_once(monkeypatch) -> None:
     ] + [
         node.module or "" for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
     ]
-    assert not [n for n in imported if "det" in n], imported
+    assert not [n for n in imported if "cake_gdn_det" in n], imported
 
 
 def test_facade_context_graph_replay_hint(monkeypatch) -> None:
-    """``build_context_kcp(..., graph_replay=...)``: keyword-only, default ``False``, a non-bool is a ``TypeError``; the
-    package receives the hint."""
+    """``cake_gdn_nondet_train_kcp_build_context(..., graph_replay=...)``: keyword-only, default ``False``, a non-bool
+    is a ``TypeError``; the package receives the hint."""
     facade = importlib.import_module(FACADE)
-    p = inspect.signature(facade.build_context_kcp).parameters["graph_replay"]
+    p = inspect.signature(facade.cake_gdn_nondet_train_kcp_build_context).parameters[
+        "graph_replay"
+    ]
     assert p.kind is p.KEYWORD_ONLY and p.default is False
     seen = _route_recorders(monkeypatch)
     for hint in (False, True):
         seen.clear()
         assert (
-            facade.build_context_kcp(
-                object(), None, 0, "cpu", graph_replay=hint, deterministic=False
+            facade.cake_gdn_nondet_train_kcp_build_context(
+                object(), None, 0, "cpu", graph_replay=hint
             )
-            == "nondet:build_context_kcp"
+            == "nondet:cake_gdn_nondet_train_kcp_build_context"
         )
         assert seen[-1][1]["graph_replay"] is hint
     for bad in (1, None, "True"):
-        with pytest.raises(TypeError, match="graph_replay must be a bool"):
-            facade.build_context_kcp(
-                object(), None, 0, "cpu", graph_replay=bad, deterministic=False
+        with pytest.raises(
+            TypeError,
+            match="^cake_gdn_nondet_train_kcp_build_context: graph_replay must be a bool",
+        ):
+            facade.cake_gdn_nondet_train_kcp_build_context(
+                object(), None, 0, "cpu", graph_replay=bad
             )
 
 
 def test_facade_forwards_the_l2n_option_to_the_package(monkeypatch) -> None:
-    """#7817 / #8063: ``use_qk_l2norm_in_kernel`` reaches the package unchanged (keyword, mapping and the twin's options
-    instance) on every compute entry and byte query."""
+    """#7817 / #8063: ``use_qk_l2norm_in_kernel`` reaches the package unchanged (keyword, mapping and this package's
+    options instance) on every compute entry and byte query."""
     facade = importlib.import_module(FACADE)
-    det_opt = importlib.import_module(f"{DET_PACKAGE}.cake_options")
     seen = _route_recorders(monkeypatch)
     calls = _facade_calls(facade)
     for entry in (
-        "chunk_gdn_kcp",
-        "chunk_gdn_fwd_kcp",
-        "chunk_gdn_bwd_kcp",
-        "gdn_workspace_bytes_kcp",
-        "gdn_saved_bytes_kcp",
+        "cake_gdn_nondet_kcp",
+        "cake_gdn_nondet_train_kcp_forward",
+        "cake_gdn_nondet_train_kcp_backward",
+        "cake_gdn_nondet_train_kcp_workspace_bytes",
+        "cake_gdn_nondet_train_kcp_saved_bytes",
     ):
         for flag in (False, True):
             seen.clear()
-            assert calls[entry](use_qk_l2norm_in_kernel=flag, deterministic=False) == (
-                f"nondet:{entry}"
-            )
+            assert calls[entry](use_qk_l2norm_in_kernel=flag) == f"nondet:{entry}"
             assert seen[-1][1]["use_qk_l2norm_in_kernel"] is flag, entry
     t = torch.zeros(1)
-    det_o = det_opt.OptionsDetKcp(use_qk_l2norm_in_kernel=True)
-    facade.chunk_gdn_kcp(t, t, t, t, t, object(), options=det_o, deterministic=False)
-    assert seen[-1][0] == "nondet:chunk_gdn_kcp"
-    assert seen[-1][1]["options"]["use_qk_l2norm_in_kernel"] is True
     mapping = {"use_qk_l2norm_in_kernel": True}
-    facade.chunk_gdn_fwd_kcp(
-        t, t, t, t, t, object(), options=mapping, deterministic=False
-    )
-    assert (
-        seen[-1][0] == "nondet:chunk_gdn_fwd_kcp" and seen[-1][1]["options"] == mapping
-    )
-    nd_o = OptionsKcp(use_qk_l2norm_in_kernel=True)
+    facade.cake_gdn_nondet_train_kcp_forward(t, t, t, t, t, object(), options=mapping)
+    assert seen[-1][0] == "nondet:cake_gdn_nondet_train_kcp_forward"
+    assert seen[-1][1]["options"] == mapping
+    nd_o = CakeGDNNondetKcpOptions(use_qk_l2norm_in_kernel=True)
     assert nd_o.use_qk_l2norm_in_kernel is True
-    facade.chunk_gdn_bwd_kcp(
-        t, t, t, t, t, object(), t, options=nd_o, deterministic=False
-    )
-    assert seen[-1][0] == "nondet:chunk_gdn_bwd_kcp" and seen[-1][1]["options"] is nd_o
+    facade.cake_gdn_nondet_train_kcp_backward(t, t, t, t, t, object(), t, options=nd_o)
+    assert seen[-1][0] == "nondet:cake_gdn_nondet_train_kcp_backward"
+    assert seen[-1][1]["options"] is nd_o
 
 
-def test_facade_converts_an_options_instance_of_the_twin(monkeypatch) -> None:
-    """An options instance of the twin reaches the package as the mapping of all its fields (the package validates
-    it); the package's own instance, a mapping and ``None`` pass through unchanged."""
+def test_facade_refuses_an_options_instance_of_another_package(monkeypatch) -> None:
+    """An options instance of another package (the deterministic one's, or any other object) is a ``TypeError``
+    before the package is called; this package's own instance, a mapping and ``None`` pass through unchanged."""
     facade = importlib.import_module(FACADE)
-    det_opt = importlib.import_module(f"{DET_PACKAGE}.cake_options")
+    det_opt = _det("cake_options")
     seen = _route_recorders(monkeypatch)
-    t = torch.zeros(1)
-    det_o = det_opt.OptionsDetKcp(save_mode="full")
-    own_o = OptionsKcp(save_mode="full")
-    facade.chunk_gdn_fwd_kcp(
-        t, t, t, t, t, object(), options=det_o, deterministic=False
-    )
-    got = seen[-1][1]["options"]
-    assert isinstance(got, dict) and got["save_mode"] == "full"
-    assert got == {f.name: getattr(det_o, f.name) for f in dataclasses.fields(det_o)}
-    facade.chunk_gdn_fwd_kcp(
-        t, t, t, t, t, object(), options=own_o, deterministic=False
-    )
-    assert seen[-1][1]["options"] is own_o
-    replay = OptionsKcp(graph="replay")
-    facade.chunk_gdn_kcp(t, t, t, t, t, object(), options=replay, deterministic=False)
-    assert seen[-1][1]["options"] is replay
-    for passthrough in (None, {"save_mode": "full"}):
-        facade.chunk_gdn_kcp(
-            t, t, t, t, t, object(), options=passthrough, deterministic=False
-        )
-        assert (
-            seen[-1][1]["options"] is passthrough
-            or seen[-1][1]["options"] == passthrough
-        )
-
-
-@pytest.mark.parametrize("warn_only", [False, True])
-def test_facade_under_torch_deterministic_mode_runs_the_package_without_a_warning(
-    monkeypatch, torch_deterministic, warn_only
-) -> None:
-    """With ``torch.use_deterministic_algorithms(True)`` (strict and ``warn_only``) every ``deterministic=False`` facade
-    call, ``is_gdn_train_kcp_supported`` included, runs this package -- no reroute to the twin, no fallback warning --
-    and every other value is still the ``ValueError`` of the mode rule."""
-    facade = importlib.import_module(FACADE)
-    from flashinfer.api_logging import ExperimentalWarning
-
-    seen = _route_recorders(monkeypatch)
-    torch.use_deterministic_algorithms(True, warn_only=warn_only)
     calls = _facade_calls(facade)
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
-        warnings.filterwarnings("ignore", category=ExperimentalWarning)
-        for _ in range(2):
-            for entry, call in calls.items():
-                seen.clear()
-                assert call(deterministic=False) == f"nondet:{entry}", entry
-                assert [tag for tag, _ in seen] == [f"nondet:{entry}"], entry
-        for entry, call in calls.items():
+    det_o = det_opt.CakeGDNDetKcpOptions(save_mode="full")
+    for entry in ENTRIES:
+        for bad in (det_o, object(), ["save_mode"]):
+            seen.clear()
             with pytest.raises(
-                ValueError, match=_refusal(entry, FACADE_DET_NAMES[entry])
+                TypeError, match="^options must be a CakeGDNNondetKcpOptions"
             ):
-                call()
-        seen.clear()
-        assert isinstance(
-            facade.is_gdn_train_kcp_supported("cpu", deterministic=False), bool
-        )
-        with pytest.raises(
-            ValueError,
-            match=_refusal(
-                "is_gdn_train_kcp_supported", "is_gdn_det_train_kcp_supported"
-            ),
-        ):
-            facade.is_gdn_train_kcp_supported("cpu")
-    assert not seen
+                calls[entry](options=bad)
+            assert seen == [], (entry, bad)
+        own_o = CakeGDNNondetKcpOptions(save_mode="full")
+        for passthrough in (own_o, CakeGDNNondetKcpOptions(graph="replay"), None):
+            seen.clear()
+            calls[entry](options=passthrough)
+            assert seen[-1][1]["options"] is passthrough, entry
+        mapping = {"save_mode": "full"}
+        calls[entry](options=mapping)
+        assert seen[-1][1]["options"] == mapping, entry
 
 
 @pytest.mark.parametrize("warn_only", [False, True])
@@ -1352,34 +1440,35 @@ def test_facade_compute_runs_the_package_under_torch_deterministic_mode(
     torch_deterministic, warn_only
 ) -> None:
     """Without the recorders, on the fake backend: under ``torch.use_deterministic_algorithms(True)`` (strict and
-    ``warn_only``) the facade's ``deterministic=False`` forward, backward and autograd node run this package (its
-    saved set, its node mode) without an alert or a warning.  The explicit forward's output and backward's gradients,
-    and the autograd node's output and leaf gradients (``q``, ``k``, ``v``, ``g``, ``beta``), equal the package's own
-    forward and explicit backward called with torch's deterministic algorithms off (every path of the package is
-    fixed-order)."""
+    ``warn_only``) the facade's forward, backward and autograd node run this package (its saved set, its node tag)
+    without an alert or a warning.  The explicit forward's output and backward's gradients, and the autograd node's
+    output and leaf gradients (``q``, ``k``, ``v``, ``g``, ``beta``), equal the package's own forward and explicit
+    backward called with torch's deterministic algorithms off (every launch of the package is fixed-order)."""
     from flashinfer.api_logging import ExperimentalWarning
 
     facade = importlib.import_module(FACADE)
     kcp = _mod("cake_kcp")
     ctx, ops = _mode_case()
     args = [ops[n] for n in ("q", "k", "v", "g", "beta")]
-    nd = dict(scale=facade.DEFAULT_SCALE, backend="fake", deterministic=False)
-    want_out, want_saved = kcp.chunk_gdn_fwd_kcp(*args, ctx, **nd)
-    want_grads = kcp.chunk_gdn_bwd_kcp(*args, ctx, ops["dout"], saved=want_saved, **nd)
+    nd = dict(scale=facade._DEFAULT_SCALE, backend="fake")
+    want_out, want_saved = kcp.cake_gdn_nondet_train_kcp_forward(*args, ctx, **nd)
+    want_grads = kcp.cake_gdn_nondet_train_kcp_backward(
+        *args, ctx, ops["dout"], saved=want_saved, **nd
+    )
     torch.use_deterministic_algorithms(True, warn_only=warn_only)
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         warnings.filterwarnings("ignore", category=ExperimentalWarning)
-        out, saved = facade.chunk_gdn_fwd_kcp(
-            *args, ctx, backend="fake", deterministic=False
+        out, saved = facade.cake_gdn_nondet_train_kcp_forward(
+            *args, ctx, backend="fake"
         )
-        assert isinstance(saved, kcp.SavedKcp)
-        grads = facade.chunk_gdn_bwd_kcp(
-            *args, ctx, ops["dout"], saved=saved, backend="fake", deterministic=False
+        assert isinstance(saved, kcp.CakeGDNNondetKcpSaved)
+        grads = facade.cake_gdn_nondet_train_kcp_backward(
+            *args, ctx, ops["dout"], saved=saved, backend="fake"
         )
         leaves = [t.detach().clone().requires_grad_(True) for t in args]
-        y = facade.chunk_gdn_kcp(*leaves, ctx, backend="fake", deterministic=False)
-        assert y.grad_fn is not None and y.grad_fn.kcp_mode == kcp.MODE
+        y = facade.cake_gdn_nondet_kcp(*leaves, ctx, backend="fake")
+        assert y.grad_fn is not None and y.grad_fn.kcp_mode == kcp._MODE
         y.backward(ops["dout"])
     assert torch.equal(out, want_out)
     for got, want in zip(grads, want_grads, strict=True):
@@ -1393,11 +1482,13 @@ def test_facade_compute_runs_the_package_under_torch_deterministic_mode(
         assert leaf.grad is not None and torch.equal(leaf.grad, want), name
 
 
-def test_facade_and_twin_describe_the_same_plan() -> None:
-    """Without the recorders: the facade (``deterministic=False``) builds this package's partition / context
-    (``PartitionKcp`` / ``ContextKcp``), the twin's own facade entries the twin's (``PartitionDetKcp`` /
-    ``ContextDetKcp``); both describe the same plan (partition tables, segment plan, the comm byte query, the saved
-    byte query at the default options, under the replay boundary and at ``P = 2`` with either ``save_mode`` and
+def test_facade_and_the_deterministic_facade_agree_on_this_small_plan() -> None:
+    """Without the recorders: the facade builds this package's partition / context (``CakeGDNNondetKcpPartition`` /
+    ``CakeGDNNondetKcpContext``), the deterministic facade its own (``CakeGDNDetKcpPartition`` /
+    ``CakeGDNDetKcpContext``).  The partition algorithm is the same, so the partitions are equal; the head plans are
+    each package's own (their ``P`` rules and table layouts differ in general), and on this small two-rank row they
+    give the same ``P`` and segment count.  On it both describe the same plan (the comm byte query, the saved byte
+    query at the default options, under the replay boundary and at ``P = 2`` with either ``save_mode`` and
     ``save_transfer``) and the same workspace terms for every keyword of the workspace query (``graph``,
     ``save_for_backward``, ``fused_walks``, ``P``) except the b1 pools, whose layouts differ: the twin's b1 send
     carries the re-sent maps of the fragments crossing in and out (``n_io``), this package's maps are paired with the
@@ -1406,39 +1497,38 @@ def test_facade_and_twin_describe_the_same_plan() -> None:
     replay form's terms on both packages."""
     facade = importlib.import_module(FACADE)
     det_facade = importlib.import_module(DET_FACADE)
-    det_pkg = importlib.import_module(DET_PACKAGE)
+    det_pkg = _det()
     pkg = _mod()
-    nd = {"deterministic": False}
     cu = [0, 100, 740, 817, 1817, 1946]
-    det_part = det_facade.partition_det_kcp(cu, 2, "zigzag")
-    nondet_part = facade.partition_kcp(cu, 2, "zigzag", **nd)
-    assert isinstance(det_part, det_pkg.PartitionDetKcp)
-    assert isinstance(nondet_part, pkg.PartitionKcp)
+    det_part = det_facade.cake_gdn_det_train_kcp_partition(cu, 2, "zigzag")
+    nondet_part = facade.cake_gdn_nondet_train_kcp_partition(cu, 2, "zigzag")
+    assert isinstance(det_part, det_pkg.CakeGDNDetKcpPartition)
+    assert isinstance(nondet_part, pkg.CakeGDNNondetKcpPartition)
     assert det_part.to_dict() == nondet_part.to_dict()
     det_queries = {
-        "gdn_comm_bytes_kcp": det_facade.gdn_det_comm_bytes_kcp,
-        "gdn_saved_bytes_kcp": det_facade.gdn_det_saved_bytes_kcp,
+        "cake_gdn_nondet_train_kcp_comm_bytes": det_facade.cake_gdn_det_train_kcp_comm_bytes,
+        "cake_gdn_nondet_train_kcp_saved_bytes": det_facade.cake_gdn_det_train_kcp_saved_bytes,
     }
     for rank in range(2):
-        det_ctx = det_facade.build_context_det_kcp(
+        det_ctx = det_facade.cake_gdn_det_train_kcp_build_context(
             det_part, None, rank, "cpu", sm_count=148
         )
-        ctx = facade.build_context_kcp(
-            nondet_part, None, rank, "cpu", sm_count=148, **nd
+        ctx = facade.cake_gdn_nondet_train_kcp_build_context(
+            nondet_part, None, rank, "cpu", sm_count=148
         )
-        assert isinstance(det_ctx, det_pkg.ContextDetKcp)
-        assert isinstance(ctx, pkg.ContextKcp)
+        assert isinstance(det_ctx, det_pkg.CakeGDNDetKcpContext)
+        assert isinstance(ctx, pkg.CakeGDNNondetKcpContext)
         det_hp, hp = det_ctx.heads(6), ctx.heads(6)
         assert (det_hp.P, det_hp.NSEG) == (hp.P, hp.NSEG), rank
         for query, det_query in det_queries.items():
             det_value = det_query(det_ctx, H_qk=2, HV=6)
-            value = getattr(facade, query)(ctx, H_qk=2, HV=6, **nd)
+            value = getattr(facade, query)(ctx, H_qk=2, HV=6)
             assert det_value == value, (rank, query)
         # a replay boundary saves nothing in either package (save_mode="full" included)
         replay_full = dict(H_qk=2, HV=6, save_mode="full", boundary_mode="replay")
-        assert det_facade.gdn_det_saved_bytes_kcp(
+        assert det_facade.cake_gdn_det_train_kcp_saved_bytes(
             det_ctx, **replay_full
-        ) == facade.gdn_saved_bytes_kcp(ctx, **replay_full, **nd), rank
+        ) == facade.cake_gdn_nondet_train_kcp_saved_bytes(ctx, **replay_full), rank
         # the M_seg rule at P > 1 is shared (P n_frag s with save_transfer or save_mode="full")
         assert ctx.n_frag > 0
         for kw in (
@@ -1447,16 +1537,18 @@ def test_facade_and_twin_describe_the_same_plan() -> None:
             {"save_mode": "full"},
             {"save_mode": "full", "save_transfer": False},
         ):
-            det_value = det_facade.gdn_det_saved_bytes_kcp(
+            det_value = det_facade.cake_gdn_det_train_kcp_saved_bytes(
                 det_ctx, H_qk=2, HV=6, P=2, **kw
             )
-            value = facade.gdn_saved_bytes_kcp(ctx, H_qk=2, HV=6, P=2, **nd, **kw)
+            value = facade.cake_gdn_nondet_train_kcp_saved_bytes(
+                ctx, H_qk=2, HV=6, P=2, **kw
+            )
             assert det_value == value, (rank, kw)
         # the workspace queries take the same keywords on both packages and count the same terms, except the b1
         # pools: the twin's dense b1 send carries the re-sent maps of the n_io fragments crossing in and out (its d_f
         # plane + n_io map slots), this package's the maps paired with the n_in crossing-in slots
         state = 6 * _mod("cake_bytes").STATE_TILE_BYTES
-        det_gb = importlib.import_module(DET_PACKAGE + ".cake_bytes")
+        det_gb = _det("cake_bytes")
         b1_keys = ("bwd.b1_send", "bwd.b1_recv")
         for kw in (
             {},
@@ -1466,8 +1558,12 @@ def test_facade_and_twin_describe_the_same_plan() -> None:
             {"save_for_backward": False},
             {"fused_walks": 0, "P": 2, "backward": False},
         ):
-            det_lay = det_gb.gdn_det_workspace_layout_kcp(det_ctx, H_qk=2, HV=6, **kw)
-            lay = _mod("cake_bytes").gdn_workspace_layout_kcp(ctx, H_qk=2, HV=6, **kw)
+            det_lay = det_gb.cake_gdn_det_train_kcp_workspace_layout(
+                det_ctx, H_qk=2, HV=6, **kw
+            )
+            lay = _mod("cake_bytes").cake_gdn_nondet_train_kcp_workspace_layout(
+                ctx, H_qk=2, HV=6, **kw
+            )
             assert set(det_lay) == set(lay), (rank, kw)
             fwd_keys = [
                 k
@@ -1478,15 +1574,19 @@ def test_facade_and_twin_describe_the_same_plan() -> None:
                 rank,
                 kw,
             )
-            assert det_facade.gdn_det_workspace_bytes_kcp(
+            assert det_facade.cake_gdn_det_train_kcp_workspace_bytes(
                 det_ctx, H_qk=2, HV=6, **kw
-            ) == det_gb.gdn_det_workspace_bytes_kcp(det_ctx, H_qk=2, HV=6, **kw), (
+            ) == det_gb.cake_gdn_det_train_kcp_workspace_bytes(
+                det_ctx, H_qk=2, HV=6, **kw
+            ), (
                 rank,
                 kw,
             )
-            assert facade.gdn_workspace_bytes_kcp(
-                ctx, H_qk=2, HV=6, **nd, **kw
-            ) == pkg.gdn_workspace_bytes_kcp(ctx, H_qk=2, HV=6, **kw), (rank, kw)
+            assert facade.cake_gdn_nondet_train_kcp_workspace_bytes(
+                ctx, H_qk=2, HV=6, **kw
+            ) == pkg.cake_gdn_nondet_train_kcp_workspace_bytes(
+                ctx, H_qk=2, HV=6, **kw
+            ), (rank, kw)
             if kw.get("backward", True):
                 hp = det_ctx.heads(6)
                 n_io, N_io = hp.n_io_by_rank[rank], sum(hp.n_io_by_rank)
@@ -1513,24 +1613,29 @@ def test_facade_and_twin_describe_the_same_plan() -> None:
         # them, the twin's refuses both, as its options do
         for reuse in (True, "auto"):
             graph_kw = dict(H_qk=2, HV=6, graph="replay", reuse_recompute_tapes=reuse)
-            assert facade.gdn_workspace_bytes_kcp(
-                ctx, **graph_kw, **nd
-            ) == pkg.gdn_workspace_bytes_kcp(ctx, **graph_kw), (rank, reuse)
+            assert facade.cake_gdn_nondet_train_kcp_workspace_bytes(
+                ctx, **graph_kw
+            ) == pkg.cake_gdn_nondet_train_kcp_workspace_bytes(ctx, **graph_kw), (
+                rank,
+                reuse,
+            )
             with pytest.raises(ValueError, match="needs graph='off'"):
-                det_facade.gdn_det_workspace_bytes_kcp(det_ctx, **graph_kw)
+                det_facade.cake_gdn_det_train_kcp_workspace_bytes(det_ctx, **graph_kw)
         # save_for_backward (a forward without a backward): each package's own query
         no_saved_set = dict(H_qk=2, HV=6, save_for_backward=False, backward=False)
-        assert det_facade.gdn_det_workspace_bytes_kcp(
+        assert det_facade.cake_gdn_det_train_kcp_workspace_bytes(
             det_ctx, **no_saved_set
-        ) == det_gb.gdn_det_workspace_bytes_kcp(det_ctx, **no_saved_set), rank
-        assert facade.gdn_workspace_bytes_kcp(
-            ctx, **no_saved_set, **nd
-        ) == pkg.gdn_workspace_bytes_kcp(ctx, **no_saved_set), rank
+        ) == det_gb.cake_gdn_det_train_kcp_workspace_bytes(det_ctx, **no_saved_set), (
+            rank
+        )
+        assert facade.cake_gdn_nondet_train_kcp_workspace_bytes(
+            ctx, **no_saved_set
+        ) == pkg.cake_gdn_nondet_train_kcp_workspace_bytes(ctx, **no_saved_set), rank
         # fused_walks=0 passes on: at P = 2 the forward has no carry slots for the crossing fragments
         assert max(ctx.n_in, ctx.n_out) > 0
         for c, query in (
-            (ctx, functools.partial(facade.gdn_workspace_bytes_kcp, **nd)),
-            (det_ctx, det_facade.gdn_det_workspace_bytes_kcp),
+            (ctx, facade.cake_gdn_nondet_train_kcp_workspace_bytes),
+            (det_ctx, det_facade.cake_gdn_det_train_kcp_workspace_bytes),
         ):
             split_walks = query(c, H_qk=2, HV=6, fused_walks=0, P=2, backward=False)
             fused = query(c, H_qk=2, HV=6, P=2, backward=False)
@@ -1538,13 +1643,14 @@ def test_facade_and_twin_describe_the_same_plan() -> None:
 
 
 def test_the_context_holds_no_mode() -> None:
-    """No field of ``ContextKcp`` / ``PartitionKcp`` / ``FragmentKcp`` / ``OptionsKcp`` names a mode, nor any attribute
-    of a built context, its partition record or its description: the plan is the same for both routes."""
+    """No field of ``CakeGDNNondetKcpContext`` / ``CakeGDNNondetKcpPartition`` / ``CakeGDNNondetKcpFragment`` /
+    ``CakeGDNNondetKcpOptions`` names a mode, nor any attribute of a built context, its partition record or its
+    description: the mode is in the package name only."""
     plan = _mod("cake_kcp_plan")
-    fields = list(plan.ContextKcp._FIELDS)
-    fields += [f.name for f in dataclasses.fields(plan.PartitionKcp)]
-    fields += [f.name for f in dataclasses.fields(plan.FragmentKcp)]
-    fields += [f.name for f in dataclasses.fields(OptionsKcp)]
+    fields = list(plan.CakeGDNNondetKcpContext._FIELDS)
+    fields += [f.name for f in dataclasses.fields(plan.CakeGDNNondetKcpPartition)]
+    fields += [f.name for f in dataclasses.fields(plan.CakeGDNNondetKcpFragment)]
+    fields += [f.name for f in dataclasses.fields(CakeGDNNondetKcpOptions)]
     fields += list(opt.OPTION_NAMES)
     ctx, _ops = _mode_case()
     fields += [n for n in dir(ctx) if not n.startswith("__")]
@@ -1552,8 +1658,14 @@ def test_the_context_holds_no_mode() -> None:
     fields += list(ctx.describe(6))
     bad = sorted({f for f in fields if "determin" in f.lower() or f.lower() == "mode"})
     assert not bad, bad
-    assert "deterministic" not in plan.build_context_kcp.__code__.co_varnames
-    assert "deterministic" not in plan.partition_kcp.__code__.co_varnames
+    assert (
+        "deterministic"
+        not in plan.cake_gdn_nondet_train_kcp_build_context.__code__.co_varnames
+    )
+    assert (
+        "deterministic"
+        not in plan.cake_gdn_nondet_train_kcp_partition.__code__.co_varnames
+    )
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -1604,7 +1716,7 @@ def test_the_registry_names_no_library_of_the_deterministic_twin() -> None:
     """Every record of this package's registry (shipped and test-only) names a ``cake_gdn_train_`` library and a
     kernel symbol of its own; none equals a name of the twin's registry or rendered manifests."""
     jit = _mod("cake_jit")
-    det_jit = importlib.import_module(f"{DET_PACKAGE}.cake_jit")
+    det_jit = _det("cake_jit")
     assert jit.PACKAGE == PACKAGE and jit.LIBRARY_PREFIX == "cake_gdn_train"
     records = {**jit.MODULES, **jit.TEST_MODULES}
     det_records = {**det_jit.MODULES, **det_jit.TEST_MODULES}
@@ -1971,15 +2083,17 @@ def test_forward_walk_form_follows_the_plan_chains() -> None:
     ops = _mode_ops(cu, (2, 6))
     args = [ops[n] for n in ("q", "k", "v", "g", "beta")]
     for sm, want in ((20, True), (12, False)):
-        ctx = plan.build_context_kcp(
-            plan.partition_kcp(cu, 1, "contiguous"), None, 0, "cpu", sm_count=sm
+        ctx = plan.cake_gdn_nondet_train_kcp_build_context(
+            plan.cake_gdn_nondet_train_kcp_partition(cu, 1, "contiguous"),
+            None,
+            0,
+            "cpu",
+            sm_count=sm,
         )
         tb = kcp._Tables(ctx, 6, P=1)
         assert len(tb.walk_live) == 4 and tb.walk_fits(tb.walk_live, sm) is want
         assert kcp.fwdh_vh(4, 6, sm) == 128
-        kcp.chunk_gdn_fwd_kcp(
-            *args, ctx, backend="fake", deterministic=False, segments=1
-        )
+        kcp.cake_gdn_nondet_train_kcp_forward(*args, ctx, backend="fake", segments=1)
         walks = [
             r
             for r, _ in kcp.LAST_CALL["fwd"]["records"]
@@ -1996,7 +2110,7 @@ def test_walk_forms_agree_across_forward_recompute_and_handle(
     monkeypatch, sm, want
 ) -> None:
     """The width rules read host plan integers only, so the forward, torch's checkpoint recompute and the recompute
-    from a :class:`RecomputeHandleKcp` launch the same form of every #2 and #7 walk program.  The rank of
+    from a :class:`CakeGDNNondetKcpRecomputeHandle` launch the same form of every #2 and #7 walk program.  The rank of
     :func:`test_forward_walk_form_follows_the_plan_chains` (HV 6, one segment per document): at 20 SMs the chain
     clause takes the ``_vh64`` record of the forward walks, at 12 SMs vh = 128; the fake backend has no
     architecture, so #7 takes vh = 64 (the #7 forms per architecture across the three paths:
@@ -2005,8 +2119,12 @@ def test_walk_forms_agree_across_forward_recompute_and_handle(
     kcp, plan = _mod("cake_kcp"), _mod("cake_kcp_plan")
     cu = _cu((24 * 64, 16 * 64, 14 * 64, 10 * 64))
     ops = _mode_ops(cu, (2, 6))
-    ctx = plan.build_context_kcp(
-        plan.partition_kcp(cu, 1, "contiguous"), None, 0, "cpu", sm_count=sm
+    ctx = plan.cake_gdn_nondet_train_kcp_build_context(
+        plan.cake_gdn_nondet_train_kcp_partition(cu, 1, "contiguous"),
+        None,
+        0,
+        "cpu",
+        sm_count=sm,
     )
     log: list = []
     record = kcp._record
@@ -2023,10 +2141,10 @@ def test_walk_forms_agree_across_forward_recompute_and_handle(
             ops[n].detach().clone().requires_grad_(True)
             for n in ("q", "k", "v", "g", "beta")
         ]
-        hd = kcp.RecomputeHandleKcp() if handle else None
+        hd = kcp.CakeGDNNondetKcpRecomputeHandle() if handle else None
 
         def fn(q, k, v, g, beta, h):
-            return kcp.chunk_gdn_kcp(
+            return kcp.cake_gdn_nondet_kcp(
                 q,
                 k,
                 v,
@@ -2036,7 +2154,6 @@ def test_walk_forms_agree_across_forward_recompute_and_handle(
                 recompute_handle=h,
                 backend="fake",
                 segments=1,
-                deterministic=False,
             )
 
         if ckpt:
@@ -2162,8 +2279,10 @@ def _partition(lengths, W, layout):
     if layout.startswith("ragged:"):
         t_r = [int(x) for x in layout.split(":")[1].split(",")]
         assert len(t_r) == W and sum(t_r) == cu[-1]
-        return plan.partition_kcp(cu, W, fragments=_ragged(cu, t_r)), cu
-    return plan.partition_kcp(cu, W, layout=layout), cu
+        return plan.cake_gdn_nondet_train_kcp_partition(
+            cu, W, fragments=_ragged(cu, t_r)
+        ), cu
+    return plan.cake_gdn_nondet_train_kcp_partition(cu, W, layout=layout), cu
 
 
 @pytest.mark.parametrize(
@@ -2180,8 +2299,10 @@ def test_host_tables_build_on_the_cpu_for_every_rank(row) -> None:
     kcp, plan = _mod("cake_kcp"), _mod("cake_kcp_plan")
     part, cu = _partition(lengths, W, layout)
     for rank in range(W):
-        ctx = plan.build_context_kcp(part, None, rank, "cpu", sm_count=148)
-        ws = kcp.WorkspaceKcp()
+        ctx = plan.cake_gdn_nondet_train_kcp_build_context(
+            part, None, rank, "cpu", sm_count=148
+        )
+        ws = kcp.CakeGDNNondetKcpWorkspace()
         tb = ws.ensure(ctx, H_qk, HV, device="cpu", backward=True)
         nseg = ctx.n_frag * tb.P
         assert tb.H == HV and tb.P >= 1 and nseg == tb.NSEG
@@ -2266,9 +2387,9 @@ def test_host_tables_build_on_the_cpu_for_every_rank(row) -> None:
         ws.ensure(ctx, H_qk, HV, device="cpu", backward=True)
         assert ws.has("stage_b")
         # the launch tables are plan data cached on the context: a second (per-call) workspace reuses them
-        assert kcp.WorkspaceKcp().tables(ctx, HV) is tb
+        assert kcp.CakeGDNNondetKcpWorkspace().tables(ctx, HV) is tb
         assert ("kcp_tables", HV, 1, None) in ctx._caches
-        ws2 = kcp.WorkspaceKcp()
+        ws2 = kcp.CakeGDNNondetKcpWorkspace()
         ws2.ensure(ctx, H_qk, HV, device="cpu", backward=False)
         assert ws2.pool("eye") is ws.pool(
             "eye"
@@ -2278,8 +2399,10 @@ def test_host_tables_build_on_the_cpu_for_every_rank(row) -> None:
 def test_workspace_rejects_a_bad_head_pair_and_device_change() -> None:
     kcp, plan = _mod("cake_kcp"), _mod("cake_kcp_plan")
     part, _ = _partition((300, 200), 2, "contiguous")
-    ctx = plan.build_context_kcp(part, None, 0, "cpu", sm_count=148)
-    ws = kcp.WorkspaceKcp()
+    ctx = plan.cake_gdn_nondet_train_kcp_build_context(
+        part, None, 0, "cpu", sm_count=148
+    )
+    ws = kcp.CakeGDNNondetKcpWorkspace()
     with pytest.raises(ValueError):
         ws.ensure(ctx, 4, 6, device="cpu")
     ws.ensure(ctx, 2, 6, device="cpu")
@@ -2290,16 +2413,20 @@ def test_workspace_rejects_a_bad_head_pair_and_device_change() -> None:
 def test_exchange_scheme_ring_is_refused_beyond_two_hops() -> None:
     kcp, plan = _mod("cake_kcp"), _mod("cake_kcp_plan")
     part, _ = _partition((3000,), 4, "zigzag")  # one document over 8 pieces: 7 hops
-    ctx = plan.build_context_kcp(part, None, 0, "cpu", sm_count=148)
-    tb = kcp.WorkspaceKcp().ensure(ctx, 4, 12, device="cpu")
+    ctx = plan.cake_gdn_nondet_train_kcp_build_context(
+        part, None, 0, "cpu", sm_count=148
+    )
+    tb = kcp.CakeGDNNondetKcpWorkspace().ensure(ctx, 4, 12, device="cpu")
     with pytest.raises(ValueError):
         kcp._exchange_scheme(tb, make_options(exchange="ring", save_transfer=False))
     assert kcp._exchange_scheme(tb, make_options()) == "a2a"
     part2, _ = _partition(
         (100, 640, 77, 1000, 129), 2, "contiguous"
     )  # CP2 contiguous: at most 1 hop
-    ctx2 = plan.build_context_kcp(part2, None, 0, "cpu", sm_count=148)
-    tb2 = kcp.WorkspaceKcp().ensure(ctx2, 2, 6, device="cpu")
+    ctx2 = plan.cake_gdn_nondet_train_kcp_build_context(
+        part2, None, 0, "cpu", sm_count=148
+    )
+    tb2 = kcp.CakeGDNNondetKcpWorkspace().ensure(ctx2, 2, 6, device="cpu")
     assert (
         kcp._exchange_scheme(tb2, make_options(exchange="ring", save_transfer=False))
         == "ring"
@@ -2329,7 +2456,7 @@ def test_saved_set_round_trips_through_tensors_and_meta() -> None:
     kcp = _mod("cake_kcp")
     S_in = torch.zeros(4)
     tapes = tuple(torch.zeros(1) for _ in kcp.FWD_TAPES)
-    saved = kcp.SavedKcp(
+    saved = kcp.CakeGDNNondetKcpSaved(
         version=kcp.KCP_SAVED_VERSION,
         S_in=S_in,
         c1_recv=None,
@@ -2350,7 +2477,9 @@ def test_saved_set_round_trips_through_tensors_and_meta() -> None:
         transfer_walk="tf32_hilo",
         ctx=None,
     )
-    back = kcp.SavedKcp.from_tensors(saved.tensors(), saved.flags(), saved.meta(), None)
+    back = kcp.CakeGDNNondetKcpSaved.from_tensors(
+        saved.tensors(), saved.flags(), saved.meta(), None
+    )
     _assert_same_saved(back, saved)
     assert back.tape("h_tape") is tapes[kcp.FWD_TAPES.index("h_tape")]
     assert saved.bytes == 4 * 4 + 4 * len(kcp.FWD_TAPES)
@@ -2358,7 +2487,7 @@ def test_saved_set_round_trips_through_tensors_and_meta() -> None:
     light = dataclasses.replace(saved, tapes=light_tapes, save_mode="light")
     assert light.flags() == (False, False, True)
     assert len(light.tensors()) == 1 + len(kcp.LIGHT_TAPES) == 1
-    back_light = kcp.SavedKcp.from_tensors(
+    back_light = kcp.CakeGDNNondetKcpSaved.from_tensors(
         light.tensors(), light.flags(), light.meta(), None
     )
     _assert_same_saved(back_light, light)
@@ -2383,9 +2512,11 @@ def test_graph_entry_key_ignores_the_arena_and_the_capture_pins_its_signature() 
     and is captured again."""
     kcp, plan = _mod("cake_kcp"), _mod("cake_kcp_plan")
     part, _cu = _partition([100, 640, 77], 2, "contiguous")
-    ctx = plan.build_context_kcp(part, None, 0, "cpu", sm_count=148)
+    ctx = plan.cake_gdn_nondet_train_kcp_build_context(
+        part, None, 0, "cpu", sm_count=148
+    )
     H_qk, HV = 2, 6
-    ws = kcp.WorkspaceKcp()
+    ws = kcp.CakeGDNNondetKcpWorkspace()
     ws.ensure(ctx, H_qk, HV, device="cpu", backward=True)
     for name in kcp.FWD_TAPES:
         ws.tape(name)
@@ -2409,7 +2540,14 @@ def test_graph_entry_key_ignores_the_arena_and_the_capture_pins_its_signature() 
     # another workspace, context or operand pointer is another key
     assert (
         kcp._graph_entry(
-            "fwd", ctx, kcp.WorkspaceKcp(), backend, opts, None, ops, (True,)
+            "fwd",
+            ctx,
+            kcp.CakeGDNNondetKcpWorkspace(),
+            backend,
+            opts,
+            None,
+            ops,
+            (True,),
         )
         is not e1
     )
@@ -2593,8 +2731,12 @@ def test_dhu_long_chain_flag_follows_the_plan_chains(monkeypatch, longest) -> No
     monkeypatch.setattr(kcp, "DHU_LONG_CHAIN_MIN_CHUNKS", 24)
     cu = _cu((longest * 64,) + (10 * 64,) * 5)
     ops = _mode_ops(cu, (2, 6))
-    ctx = plan.build_context_kcp(
-        plan.partition_kcp(cu, 1, "contiguous"), None, 0, "cpu", sm_count=18
+    ctx = plan.cake_gdn_nondet_train_kcp_build_context(
+        plan.cake_gdn_nondet_train_kcp_partition(cu, 1, "contiguous"),
+        None,
+        0,
+        "cpu",
+        sm_count=18,
     )
     tb = kcp._Tables(ctx, 6, P=1)
     assert sorted(tb._walk_chains(tb.walk_live)) == [(10, 5), (longest, 1)]
@@ -2611,9 +2753,7 @@ def test_dhu_long_chain_flag_follows_the_plan_chains(monkeypatch, longest) -> No
         ops[n].detach().clone().requires_grad_(True)
         for n in ("q", "k", "v", "g", "beta")
     ]
-    out = kcp.chunk_gdn_kcp(
-        *leaves, ctx, backend="fake", segments=1, deterministic=False
-    )
+    out = kcp.cake_gdn_nondet_kcp(*leaves, ctx, backend="fake", segments=1)
     out.backward(ops["dout"])
     assert seen and all(isinstance(x, bool) for x in seen)
     assert any(seen) is (longest == 24), seen
@@ -2717,8 +2857,12 @@ def _arch_case(monkeypatch, long_chain: bool):
     if long_chain:
         monkeypatch.setattr(kcp, "DHU_LONG_CHAIN_MIN_CHUNKS", ARCH_LONG_CHAIN_MIN)
     cu = _cu(tuple(n * 64 for n in ARCH_CHUNKS))
-    ctx = plan.build_context_kcp(
-        plan.partition_kcp(cu, 1, "contiguous"), None, 0, "cpu", sm_count=ARCH_SM
+    ctx = plan.cake_gdn_nondet_train_kcp_build_context(
+        plan.cake_gdn_nondet_train_kcp_partition(cu, 1, "contiguous"),
+        None,
+        0,
+        "cpu",
+        sm_count=ARCH_SM,
     )
     HV = ARCH_HEADS[1]
     tb = kcp._Tables(ctx, HV, P=2)
@@ -2749,9 +2893,7 @@ def test_kernel_backend_passes_the_device_architecture_to_the_dhu_walks(
         ops[n].detach().clone().requires_grad_(True)
         for n in ("q", "k", "v", "g", "beta")
     ]
-    out = kcp.chunk_gdn_kcp(
-        *leaves, ctx, backend="kernels", segments=2, deterministic=False
-    )
+    out = kcp.cake_gdn_nondet_kcp(*leaves, ctx, backend="kernels", segments=2)
     out.backward(ops["dout"])
     launches = _dhu_launches(glue, resolved)
     assert {x["program"] for x in launches} == set(kcp.DHU_PROGRAMS), launches
@@ -2799,7 +2941,7 @@ def test_dhu_forms_agree_across_forward_recompute_and_handle_on_each_architectur
 ) -> None:
     """The #7 form of every launch reads host plan integers and the architecture ``KernelBackend.run`` passes, so
     the backward after the forward, after torch's checkpoint recompute and after the recompute from a
-    :class:`RecomputeHandleKcp` launch the same #7 records on the same grids.  The :data:`ARCH_CHUNKS` rank with
+    :class:`CakeGDNNondetKcpRecomputeHandle` launch the same #7 records on the same grids.  The :data:`ARCH_CHUNKS` rank with
     ``segments=2`` and the long-chain threshold lowered, through the stub launch glue of
     :func:`test_kernel_backend_passes_the_device_architecture_to_the_dhu_walks`: on ``sm_100a`` the long-chain
     clause fires (the offset and the tape walk launch vh = 128); on ``sm_103a`` it does not (vh = 64), for the
@@ -2824,10 +2966,10 @@ def test_dhu_forms_agree_across_forward_recompute_and_handle_on_each_architectur
             ops[n].detach().clone().requires_grad_(True)
             for n in ("q", "k", "v", "g", "beta")
         ]
-        hd = kcp.RecomputeHandleKcp() if handle else None
+        hd = kcp.CakeGDNNondetKcpRecomputeHandle() if handle else None
 
         def fn(q, k, v, g, beta, h):
-            return kcp.chunk_gdn_kcp(
+            return kcp.cake_gdn_nondet_kcp(
                 q,
                 k,
                 v,
@@ -2837,7 +2979,6 @@ def test_dhu_forms_agree_across_forward_recompute_and_handle_on_each_architectur
                 recompute_handle=h,
                 backend="kernels",
                 segments=2,
-                deterministic=False,
             )
 
         if ckpt:
@@ -2884,9 +3025,11 @@ def test_workspace_holds_one_zeroed_ticket_slot_per_persistent_site() -> None:
         assert kcp.PROGRAM_ARGS[site][-1] == "ticket"
     assert "ticket" in kcp.PROVISIONAL_ARGS
     part, _cu = _partition([100, 640, 77], 2, "contiguous")
-    ctx = plan.build_context_kcp(part, None, 0, "cpu", sm_count=148)
+    ctx = plan.cake_gdn_nondet_train_kcp_build_context(
+        part, None, 0, "cpu", sm_count=148
+    )
     H_qk, HV = 2, 6
-    ws = kcp.WorkspaceKcp()
+    ws = kcp.CakeGDNNondetKcpWorkspace()
     assert ws.ticket_bytes == 0 and ws.bytes == 0
     with pytest.raises(KeyError, match="ensure"):
         ws.ticket("fwd_o")
@@ -2912,15 +3055,15 @@ def test_workspace_holds_one_zeroed_ticket_slot_per_persistent_site() -> None:
     assert all(ws.ticket(s).data_ptr() == slots[s].data_ptr() for s in kcp.TICKET_SITES)
     sig = kcp._arena_sig(ws)
     assert sig[2] == (("tickets", ws._tickets.data_ptr(), 3 * 32),)
-    other = kcp.WorkspaceKcp()
+    other = kcp.CakeGDNNondetKcpWorkspace()
     other.ensure(ctx, H_qk, HV, device="cpu", backward=True)
     assert other.ticket("fwd_o").data_ptr() != ws.ticket("fwd_o").data_ptr()
     # the public query counts every site's slot in both lifetimes
-    layout = gb.gdn_workspace_layout_kcp(ctx, H_qk=H_qk, HV=HV)
+    layout = gb.cake_gdn_nondet_train_kcp_workspace_layout(ctx, H_qk=H_qk, HV=HV)
     assert layout["fwd.tickets"] == layout["bwd.tickets"] == gb.TICKET_BYTES
     assert (
-        gb.gdn_workspace_layout_kcp(ctx, H_qk=H_qk, HV=HV, backward=False)[
-            "fwd.tickets"
-        ]
+        gb.cake_gdn_nondet_train_kcp_workspace_layout(
+            ctx, H_qk=H_qk, HV=HV, backward=False
+        )["fwd.tickets"]
         == gb.TICKET_BYTES
     )
