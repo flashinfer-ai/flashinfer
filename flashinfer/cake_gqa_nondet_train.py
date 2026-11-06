@@ -204,8 +204,31 @@ def cake_gqa_nondet_train_forward(
     lse: Optional[torch.Tensor] = None,
     workspace: Optional[Any] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    r"""Forward without autograd: ``(out [T_q, H_q, 256] bf16, lse [H_q, T_q] fp32)``; ``out`` / ``lse`` may be
-    given (contiguous).  Fixed-order: it never raises the deterministic-algorithms alert."""
+    r"""Forward without autograd, causal with bottom-right alignment per segment.
+
+    Parameters
+    ----------
+    q, k, v : torch.Tensor
+        As in :func:`cake_gqa_nondet`.
+    cu_seqlens_q, cu_seqlens_k : torch.Tensor
+        As in :func:`cake_gqa_nondet`.
+    softmax_scale : float, optional
+        Default ``256 ** -0.5``.
+    out : torch.Tensor, optional
+        A contiguous BF16 ``[T_q, H_q, 256]`` output to write; ``None`` allocates one.
+    lse : torch.Tensor, optional
+        A contiguous FP32 ``[H_q, T_q]`` natural-log LSE to write; ``None`` allocates one.
+    workspace : optional
+        As in :func:`cake_gqa_nondet`.
+
+    Returns
+    -------
+    ``(out, lse)``.  A row that sees no key gets ``out = 0`` and ``lse = -inf``.
+
+    Notes
+    -----
+    Fixed-order: it never raises the deterministic-algorithms alert.
+    """
     return _pkg().cake_gqa_nondet_train_forward(
         q,
         k,
@@ -241,14 +264,50 @@ def cake_gqa_nondet_train_backward(
     max_seqlen_k: Optional[int] = None,
     workspace: Optional[Any] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-    r"""Backward without autograd: ``(dq, dk, dv)`` from the forward's ``out`` and ``lse`` and a contiguous ``dout``.
+    r"""Backward without autograd: ``(dq, dk, dv)`` from the forward's ``out`` and ``lse``.
 
-    ``dq`` is BF16.  dK / dV are FP32 sums over the query heads of each key head, returned as BF16
-    (``dkv_dtype=torch.bfloat16``), as FP32 window gradients (``dkv_dtype=torch.float32``) or, with ``row_map``,
-    added into the FP32 destinations ``dk_acc`` / ``dv_acc`` ``[N_dst, H_kv, 256]`` (returned as ``dk`` / ``dv``).
-    ``max_seqlen_k``: see :func:`cake_gqa_nondet`.  The dQ partials (and the row-map adds) are atomic FP32
-    reductions: under ``torch.use_deterministic_algorithms(True)`` a call that launches raises PyTorch's alert
-    (``warn_only=True``: a warning, and the backward runs).
+    dK / dV are FP32 sums over the query heads of each key head.
+
+    Parameters
+    ----------
+    q, k, v : torch.Tensor
+        The forward's operands (see :func:`cake_gqa_nondet`).
+    out, lse : torch.Tensor
+        The forward's BF16 ``[T_q, H_q, 256]`` output and FP32 ``[H_q, T_q]`` LSE.
+    dout : torch.Tensor
+        Contiguous BF16 ``[T_q, H_q, 256]`` gradient of ``out``.
+    cu_seqlens_q, cu_seqlens_k : torch.Tensor
+        As in :func:`cake_gqa_nondet`.
+    softmax_scale : float, optional
+        The forward's scale; default ``256 ** -0.5``.
+    dq : torch.Tensor, optional
+        A contiguous BF16 ``[T_q, H_q, 256]`` to write; ``None`` allocates one.
+    dk, dv : torch.Tensor, optional
+        Contiguous ``[T_k, H_kv, 256]`` tensors of ``dkv_dtype`` to write (overwritten); ``None`` allocates them.
+        Not used with ``row_map``.
+    dkv_dtype : torch.dtype
+        ``torch.bfloat16`` (default): dK / dV rounded once to BF16.  ``torch.float32``: the FP32 window
+        gradients are stored.
+    dk_acc, dv_acc : torch.Tensor, optional
+        FP32 ``[N_dst, H_kv, 256]`` destinations that the window gradients are added into; they need ``row_map``.
+    row_map : torch.Tensor, optional
+        int32 ``[T_k]``: window row ``j`` adds into destination row ``row_map[j]`` (rows may repeat;
+        out-of-range rows are not checked).
+    max_seqlen_k : int, optional
+        As in :func:`cake_gqa_nondet`.
+    workspace : optional
+        As in :func:`cake_gqa_nondet`.
+
+    Returns
+    -------
+    ``(dq, dk, dv)``; with ``row_map``, ``dk`` / ``dv`` are ``dk_acc`` / ``dv_acc``.
+
+    Notes
+    -----
+    Not bitwise reproducible run to run: the dQ partials (and the row-map adds) are atomic FP32 reductions.
+    Under ``torch.use_deterministic_algorithms(True)`` a call with a (query, key) pair raises PyTorch's alert
+    after its checks and before anything is allocated or launched (``warn_only=True``: a warning, and the
+    backward runs).
     """
     return _pkg().cake_gqa_nondet_train_backward(
         q,
@@ -276,9 +335,20 @@ def cake_gqa_nondet_train_backward(
 def cake_gqa_nondet_train_workspace(
     device: Union[torch.device, str, int, None] = None,
 ) -> Any:
-    r"""A workspace (``CakeGQANondetWorkspace``) for :func:`cake_gqa_nondet` on ``device``: the forward's tile
-    counter and the backward scratch, grown to the largest shape seen (``.nbytes``; ``.release()`` drops the
-    scratch)."""
+    r"""A workspace (``CakeGQANondetWorkspace``) for :func:`cake_gqa_nondet` and its two halves.
+
+    It holds the forward's tile counter and the backward scratch, grown to the largest shape seen and never
+    shrunk (``.nbytes``; ``.release()`` drops the scratch).  One workspace serves one stream at a time.
+
+    Parameters
+    ----------
+    device : torch.device, str or int, optional
+        The CUDA device; ``None`` is the current device.
+
+    Returns
+    -------
+    A ``CakeGQANondetWorkspace``.
+    """
     return _pkg().CakeGQANondetWorkspace(device)
 
 
@@ -286,8 +356,22 @@ def cake_gqa_nondet_train_workspace(
 def cake_gqa_nondet_train_workspace_bytes(
     total_q: int, num_heads_q: int, num_segments: int
 ) -> int:
-    r"""Bytes of backward scratch one call needs: FP32 ``[H_q / 2, rows_pad, 256]`` plus two ``[H_q / 2,
-    rows_pad]``, ``rows_pad = round_up(2 T_q + 128 B, 128)``."""
+    r"""Bytes of backward scratch one call needs.
+
+    Parameters
+    ----------
+    total_q : int
+        ``T_q``, the packed query rows.
+    num_heads_q : int
+        ``H_q``, the query heads.
+    num_segments : int
+        ``B``, the segments (``len(cu_seqlens_q) - 1``).
+
+    Returns
+    -------
+    The bytes of FP32 ``[H_q / 2, rows_pad, 256]`` plus two ``[H_q / 2, rows_pad]``, with
+    ``rows_pad = round_up(2 T_q + 128 B, 128)``.
+    """
     return _pkg().cake_gqa_nondet_train_workspace_bytes(
         total_q, num_heads_q, num_segments
     )
