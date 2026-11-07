@@ -74,28 +74,93 @@ FWD_O_PLAN = [
     ["buffer", "chunk_bos"], ["buffer", "chunk_len"], ["buffer", "seq_chunk_start"], ["parameter", "num_seqs"],
     ["parameter", "num_heads"], ["parameter", "scale"], *GRID,
 ]  # fmt: skip
+FWDH_O_PLAN = [
+    ["buffer", "w_tma"], ["buffer", "kg_tma"], ["buffer", "u"], ["buffer", "gk"], ["parameter", "num_heads"],
+    ["buffer", "seq_chunk_start"], ["parameter", "num_seqs"], ["buffer", "walk_seg"], ["buffer", "h0"],
+    ["buffer", "h0_index"], ["parameter", "h0_hg"], ["parameter", "h0_n"], ["parameter", "tile_stride"],
+    ["buffer", "qg_tma"], ["buffer", "aqk_tma"], ["buffer", "o_out"], ["buffer", "chunk_bos"], ["buffer", "chunk_len"],
+    ["parameter", "scale"], *GRID,
+]  # fmt: skip
 DAV_PLAN = [
     ["buffer", "do_tma"], ["buffer", "vnew_tma"], ["buffer", "aqk_tma"], ["buffer", "dAqk"], ["buffer", "dv1"],
     ["parameter", "num_heads"], ["parameter", "scale"], *GRID,
 ]  # fmt: skip
+# The K4 merge records (the register-blocked v2 builds the rule names): record -> (build keywords, threads per CTA =
+# 128 * cols_per_cta / the thread tile's outputs, architectures).  The pairs builds are scalar on sm_107a (the
+# exporter's per-architecture keywords; the program name hashes the keywords above).
+MERGE_V2_MODULE = "tart.kda_chunk_kcp_affine_merge.sm100_sm103_sm107.kda_chunk_det_affine_merge_fp32_v2_kcp"
+MERGE_RECORDS = {
+    "kcp_affine_merge_c8": (
+        {"chunk_k": 16, "cols_per_cta": 8, "pairs": True, "ring": 4, "tile": "4x4"},
+        64,
+        ARCHES,
+    ),
+    "kcp_affine_merge_c16": (
+        {"chunk_k": 16, "cols_per_cta": 16, "pairs": True, "ring": 4, "tile": "4x4"},
+        128,
+        ARCHES,
+    ),
+    "kcp_affine_merge_c32": (
+        {"chunk_k": 32, "cols_per_cta": 32, "pairs": True, "ring": 4, "tile": "8x4"},
+        128,
+        ARCHES,
+    ),
+    "kcp_affine_merge_c64": (
+        {"chunk_k": 32, "cols_per_cta": 64, "pairs": True, "ring": 4, "tile": "8x4"},
+        256,
+        ("sm_100a", "sm_103a"),
+    ),
+}
+# The K4 rule at sample launches: (arch, ncols, n_chains) -> record; T = n_chains * ncols / 128 (the W4 merge launches
+# are T = 64; a 256-column map chain counts twice).
+MERGE_SELECT = {
+    ("sm_103a", 128, 64): "kcp_affine_merge_c64",
+    ("sm_100a", 128, 57): "kcp_affine_merge_c64",
+    ("sm_107a", 128, 64): "kcp_affine_merge_c16",
+    ("sm_107a", 128, 49): "kcp_affine_merge_c16",
+    ("sm_107a", 128, 48): "kcp_affine_merge_c32",
+    ("sm_103a", 128, 56): "kcp_affine_merge_c16",
+    ("sm_103a", 256, 21): "kcp_affine_merge_c16",
+    ("sm_103a", 128, 40): "kcp_affine_merge_c32",
+    ("sm_107a", 256, 13): "kcp_affine_merge_c32",
+    ("sm_107a", 128, 24): "kcp_affine_merge_c16",
+    ("sm_107a", 128, 21): "kcp_affine_merge_c16",
+    ("sm_103a", 256, 10): "kcp_affine_merge_c16",
+    ("sm_103a", 128, 13): "kcp_affine_merge_c16",
+    ("sm_103a", 128, 12): "kcp_affine_merge_c8",
+    ("sm_107a", 256, 6): "kcp_affine_merge_c8",
+    ("sm_100a", 128, 1): "kcp_affine_merge_c8",
+}
 PLANS = {
     "kcp_fwdh_offset": FWDH_PLAN,
     "kcp_fwdh_offset_vh64": FWDH_PLAN,
     "kcp_fwdh_tape": FWDH_PLAN,
     "kcp_dhu_offset": DHU_PLAN,
+    "kcp_dhu_offset_overlap": DHU_PLAN,
     "kcp_dhu_offset_vh64": DHU_PLAN,
     "kcp_dhu_tape": DHU_PLAN,
     "kcp_transfer_walk": TRANSFER_PLAN,
-    "kcp_affine_merge_c8": MERGE_PLAN,
-    "kcp_affine_merge_c16": MERGE_PLAN,
+    **dict.fromkeys(MERGE_RECORDS, MERGE_PLAN),
     "kcp_fwd_o": FWD_O_PLAN,
     "kcp_dav": DAV_PLAN,
+    "kcp_fwdh_o": FWDH_O_PLAN,
+    "kcp_fwdh_o_vh64": FWDH_O_PLAN,
     "kcp_transfer_walk_three_mma": TRANSFER_PLAN,
     "kcp_transfer_walk_plain_tf32": TRANSFER_PLAN,
     "kcp_transfer_walk_bf16x3": TRANSFER_PLAN,
     "kcp_transfer_walk_tf32_hilo": TRANSFER_PLAN,
     "kcp_fwdh_tape_full": FWDH_PLAN,
     "kcp_dhu_tape_full": DHU_PLAN,
+}
+# Launch block of the records that are not 192 threads wide (the merge records: MERGE_RECORDS); the full-width fwdh
+# offset walk runs the split-role schedule (four state, four decay, one TMA and one MMA warp), the shipped transfer
+# walk two compute warpgroups (eight compute, one load and one MMA warp), the fused forward walk ten warps in both
+# forms.
+BLOCKS = {
+    "kcp_fwdh_offset": 320,
+    "kcp_transfer_walk": 320,
+    "kcp_fwdh_o": 320,
+    "kcp_fwdh_o_vh64": 320,
 }
 # The identity rule: ``cake_kda_train_<20 hex of sha256("<source module>\\n<sorted JSON of the build keywords>")>``,
 # then ``_kcp`` for a program only the context-parallel route runs (every one but the single-rank ``dav`` stage).
@@ -104,8 +169,8 @@ PLANS = {
 _W = "sm100_sm103_sm107"
 IDENTITIES = {
     "kcp_fwdh_offset": (
-        f"tart.kda_chunk_kcp_fwd_h.{_W}.kda_chunk_kcp_fwdh_v1",
-        {"program": "offset"},
+        f"tart.kda_chunk_kcp_fwd_h.{_W}.kda_chunk_det_fwdh_v2_kcp",
+        {"program": "offset", "tile_prefetch": 0},
     ),
     "kcp_fwdh_offset_vh64": (
         f"tart.kda_chunk_kcp_fwd_h.{_W}.kda_chunk_kcp_fwdh_v1",
@@ -119,6 +184,10 @@ IDENTITIES = {
         f"tart.kda_chunk_kcp_dhu.{_W}.kda_chunk_kcp_dhu_v1",
         {"program": "offset"},
     ),
+    "kcp_dhu_offset_overlap": (
+        f"tart.kda_chunk_kcp_dhu.{_W}.kda_chunk_det_dhu_v2_kcp",
+        {"program": "offset", "tile_prefetch": 0},
+    ),
     "kcp_dhu_offset_vh64": (
         f"tart.kda_chunk_kcp_dhu.{_W}.kda_chunk_kcp_dhu_v1",
         {"program": "offset", "vh": 64},
@@ -128,19 +197,20 @@ IDENTITIES = {
         {"program": "tape", "vh": 64, "tape_store": "tma"},
     ),
     "kcp_transfer_walk": (
-        f"tart.kda_chunk_kcp_transfer_walk.{_W}.kda_chunk_kcp_transfer_walk_bf16x3_v1",
+        f"tart.kda_chunk_kcp_transfer_walk.{_W}.kda_chunk_det_transfer_walk_bf16x3_v2_kcp",
         {"vh": 64},
     ),
-    "kcp_affine_merge_c8": (
-        f"tart.kda_chunk_kcp_affine_merge.{_W}.kda_chunk_kcp_affine_merge_fp32_v1",
-        {"cols_per_cta": 8},
-    ),
-    "kcp_affine_merge_c16": (
-        f"tart.kda_chunk_kcp_affine_merge.{_W}.kda_chunk_kcp_affine_merge_fp32_v1",
-        {"cols_per_cta": 16},
-    ),
+    **{name: (MERGE_V2_MODULE, row[0]) for name, row in MERGE_RECORDS.items()},
     "kcp_fwd_o": (f"tart.kda_chunk_kcp_fwd_o.{_W}.kda_chunk_det_fwd_o_v1_kcp", {}),
     "kcp_dav": (f"tart.kda_chunk_bwd_dav.{_W}.kda_chunk_train_bwd_dav_v1", {}),
+    "kcp_fwdh_o": (
+        f"tart.kda_chunk_kcp_fwd_h.{_W}.kda_chunk_det_fwdh_o_v1_kcp",
+        {"vh": 128},
+    ),
+    "kcp_fwdh_o_vh64": (
+        f"tart.kda_chunk_kcp_fwd_h.{_W}.kda_chunk_det_fwdh_o_v1_kcp",
+        {"vh": 64},
+    ),
     "kcp_transfer_walk_three_mma": (
         f"tart.kda_chunk_kcp_transfer_walk.{_W}.kda_chunk_kcp_transfer_walk_v1",
         {"precision_mode": 1},
@@ -197,7 +267,9 @@ def test_the_tables_are_disjoint_and_complete() -> None:
         "kcp_affine_merge",
         "kcp_fwd_o",
         "kcp_dav",
+        "kcp_fwdh_o",
     )
+    assert (*kcp_jit.PROGRAMS[:5], "kcp_fwdh_o") == kcp_jit.WALK_PROGRAMS
     assert kcp_jit.PRECISION_MODES == (0, 1, 2)
     assert kcp_jit.TRANSFER_WALKS == ("bf16x3_hw64", "tf32_hilo", "bf16x3")
 
@@ -206,7 +278,9 @@ def test_the_tables_are_disjoint_and_complete() -> None:
 def test_record_matches_the_frozen_abi(name: str) -> None:
     record = _records()[name]
     assert record["arg_plan"] == PLANS[name], name
-    assert record["arches"] == list(ARCHES)
+    assert record["arches"] == list(
+        MERGE_RECORDS[name][2] if name in MERGE_RECORDS else ARCHES
+    )
     assert record["ffi_entry"] == "run"
     assert record["kernel_symbol"] == f"kernel_{record['library']}"
     assert (
@@ -215,8 +289,15 @@ def test_record_matches_the_frozen_abi(name: str) -> None:
     )
     assert record["launch"]["cluster"] == (1, 1, 1)
     assert record["launch"]["block"] == (
-        (128, 1, 1) if record["program"] == "kcp_affine_merge" else (192, 1, 1)
+        (MERGE_RECORDS[name][1], 1, 1)
+        if record["program"] == "kcp_affine_merge"
+        else (BLOCKS.get(name, 192), 1, 1)
     )
+    if record["program"] == "kcp_affine_merge":
+        assert record["grid_rule"] == {
+            "cols_per_cta": MERGE_RECORDS[name][0]["cols_per_cta"],
+            "kind": "kcp_chains",
+        }
     assert isinstance(record["launch"]["dynamic_smem_bytes"], int)
     expected_name = (
         record["program"]
@@ -251,13 +332,41 @@ def test_program_names_follow_the_identity_rule() -> None:
     )
 
 
-def test_selection_and_grids() -> None:
-    assert kcp_jit.select_record("kcp_affine_merge", ncols=128) == "kcp_affine_merge_c8"
-    assert (
-        kcp_jit.select_record("kcp_affine_merge", ncols=256) == "kcp_affine_merge_c16"
-    )
+def test_merge_selection_covers_every_launch_once() -> None:
+    assert tuple(kcp_jit.MERGE_RULE) == ARCHES
+    for (arch, ncols, n_chains), record in MERGE_SELECT.items():
+        assert (
+            kcp_jit.select_record(
+                "kcp_affine_merge", ncols=ncols, n_chains=n_chains, arch=arch
+            )
+            == record
+        ), (arch, ncols, n_chains)
+        assert kcp_jit.merge_record(ncols, n_chains, arch) == record
+    # every state / map launch is admitted by exactly one record built for its architecture (select_record raises
+    # otherwise), and the rule names every merge record on every architecture it ships for
+    named: dict[str, set[str]] = {}
+    for arch in ARCHES:
+        for ncols in (128, 256):
+            for n_chains in range(1, 300):
+                record = kcp_jit.merge_record(ncols, n_chains, arch)
+                assert arch in kcp_jit.MODULES[record]["arches"], (arch, record)
+                named.setdefault(record, set()).add(arch)
+    assert named == {name: set(MERGE_RECORDS[name][2]) for name in MERGE_RECORDS}
+    # without an architecture: the record every architecture names, refused where they differ (T 21-24, 41-48 and
+    # above 56)
+    assert kcp_jit.merge_record(128, 8) == "kcp_affine_merge_c8"
     with pytest.raises(ValueError):
-        kcp_jit.select_record("kcp_affine_merge", ncols=64)
+        kcp_jit.merge_record(128, 64)
+    with pytest.raises(ValueError):
+        kcp_jit.merge_record(64, 4, "sm_103a")
+    with pytest.raises(ValueError):
+        kcp_jit.merge_record(128, 4, "sm_90a")
+    # the rule needs the chain count
+    with pytest.raises(ValueError):
+        kcp_jit.select_record("kcp_affine_merge", ncols=128, arch="sm_103a")
+
+
+def test_selection_and_grids() -> None:
     assert kcp_jit.select_record("kcp_fwdh_offset", form="full") == "kcp_fwdh_offset"
     assert (
         kcp_jit.select_record("kcp_fwdh_offset", form="split") == "kcp_fwdh_offset_vh64"
@@ -265,6 +374,12 @@ def test_selection_and_grids() -> None:
     with pytest.raises(ValueError):
         kcp_jit.select_record("kcp_fwdh_offset")  # two records: the form must be given
     assert kcp_jit.select_record("kcp_fwdh_tape", form="split") == "kcp_fwdh_tape"
+    assert kcp_jit.select_record("kcp_fwdh_o", form="full") == "kcp_fwdh_o"
+    assert kcp_jit.select_record("kcp_fwdh_o", form="split") == "kcp_fwdh_o_vh64"
+    with pytest.raises(ValueError):
+        kcp_jit.select_record("kcp_fwdh_o")
+    assert kcp_jit.launch_grid("kcp_fwdh_o", n_walk=3, num_heads=4) == (12, 1, 1)
+    assert kcp_jit.launch_grid("kcp_fwdh_o_vh64", n_walk=3, num_heads=4) == (24, 1, 1)
     assert kcp_jit.launch_grid("kcp_fwdh_offset", n_walk=3, num_heads=4) == (12, 1, 1)
     assert kcp_jit.launch_grid("kcp_fwdh_offset_vh64", n_walk=3, num_heads=4) == (
         24,
@@ -291,8 +406,13 @@ def test_selection_and_grids() -> None:
         1,
         1,
     )
-    assert kcp_jit.launch_grid("kcp_affine_merge_c8", n_chains=2, ncols=128) == (
-        32,
+    assert kcp_jit.launch_grid("kcp_affine_merge_c64", n_chains=2, ncols=128) == (
+        4,
+        1,
+        1,
+    )
+    assert kcp_jit.launch_grid("kcp_affine_merge_c32", n_chains=3, ncols=256) == (
+        24,
         1,
         1,
     )
@@ -334,14 +454,21 @@ def test_test_record_selection_by_knobs() -> None:
 
 
 def test_walk_form_rules_and_records() -> None:
-    # the offset programs: the fit rule (two shipped records); the tape programs: split on every launch, the
-    # full-width record test-only under walk_form "full"
+    # the offset programs: the fit rule (two shipped records); the tape programs: split on every launch, the full-width
+    # record test-only under walk_form "full"; the fused forward walk: a rule per architecture (two shipped records)
     assert kcp_jit.WALK_FORM_RULES == {
         "kcp_fwdh_offset": "fit",
         "kcp_fwdh_tape": "split",
         "kcp_dhu_offset": "fit",
         "kcp_dhu_tape": "split",
+        "kcp_fwdh_o": kcp_jit.FWDH_O_FORM_RULE,
     }
+    assert kcp_jit.FWDH_O_FORM_RULE == {
+        "sm_100a": ((32, "split"), (None, "full")),
+        "sm_103a": ((32, "split"), (None, "full")),
+        "sm_107a": ((48, "fit"), (None, "full")),
+    }
+    assert set(kcp_jit.FWDH_O_FORM_RULE) == set(ARCHES)
     sms = 152
     assert kcp_jit.walk_form("kcp_fwdh_offset", [222, 222], 64, sms) == "split"
     assert kcp_jit.walk_form("kcp_fwdh_offset", [111, 59, 52], 64, sms) == "split"
@@ -355,6 +482,58 @@ def test_walk_form_rules_and_records() -> None:
     assert kcp_jit.walk_form("kcp_fwdh_offset", [64] * 7, 1, sms) == "split"
     assert kcp_jit.walk_form("kcp_fwdh_offset", [], 64, sms) == "full"
     assert kcp_jit.walk_form("kcp_fwdh_tape", [124, 124, 124], 64, sms) == "split"
+    # the fused forward walk: the architecture's rule on every launch (one wave or several; on sm_100a / sm_103a the
+    # two-CTA record up to 32 heads, the full-width one above; on sm_107a the fit rule up to 48 heads, the full-width
+    # record above: the W4 list at 32 to 48 heads, 512 to 768 two-CTA CTAs on 304 slots, outlasts its longest chain),
+    # the knob's form where given
+    w4 = [48, 48, 32, 32, 28, 28, 20, 20]
+    by_heads = {
+        1: "split",
+        4: "split",
+        16: "split",
+        32: "split",
+        33: "full",
+        64: "full",
+    }
+    fit_by_heads = {
+        1: "split",
+        4: "split",
+        16: "split",
+        32: "split",
+        33: "split",
+        48: "split",
+        49: "full",
+        64: "full",
+    }
+    for arch in ARCHES:
+        for chains in (w4, [222, 222], [48]):
+            for heads, form in (
+                fit_by_heads if arch == "sm_107a" else by_heads
+            ).items():
+                if arch == "sm_107a" and chains is w4 and heads in (32, 33, 48):
+                    form = "full"
+                assert (
+                    kcp_jit.walk_form("kcp_fwdh_o", chains, heads, sms, arch=arch)
+                    == form
+                ), (arch, chains, heads)
+        assert (
+            kcp_jit.walk_form("kcp_fwdh_o", [48], 4, sms, knob="full", arch=arch)
+            == "full"
+        )
+        assert (
+            kcp_jit.walk_form("kcp_fwdh_o", [48], 4, sms, knob="split", arch=arch)
+            == "split"
+        )
+    with pytest.raises(ValueError, match="per architecture"):
+        kcp_jit.walk_form("kcp_fwdh_o", w4, 64, sms)
+    with pytest.raises(ValueError, match="per architecture"):
+        kcp_jit.walk_form("kcp_fwdh_o", w4, 64, sms, arch="sm_90a")
+    assert kcp_jit.walk_form("kcp_fwdh_o", w4, 64, sms, knob="split") == "split"
+    # the other programs' rules take no architecture
+    assert (
+        kcp_jit.walk_form("kcp_fwdh_offset", [222, 222], 64, sms, arch="sm_107a")
+        == "split"
+    )
     assert kcp_jit.walk_form("kcp_dhu_tape", [39] * 14, 64, sms) == "split"
     assert (
         kcp_jit.walk_form("kcp_fwdh_offset", [222, 222], 64, sms, knob="full") == "full"
@@ -373,11 +552,14 @@ def test_walk_form_rules_and_records() -> None:
         assert record["test_knobs"] == {"walk_form": "full"}
         assert record["select_rule"] == {"kind": "always"}
         assert record["grid_rule"] == {"kind": "kcp_segments_heads"}
+    with pytest.raises(ValueError):
+        kcp_jit.test_walk_record("kcp_fwdh_o", "full")
     for name in (
         "kcp_fwdh_offset_vh64",
         "kcp_dhu_offset_vh64",
         "kcp_fwdh_tape",
         "kcp_dhu_tape",
+        "kcp_fwdh_o_vh64",
     ):
         assert kcp_jit.MODULES[name]["grid_rule"] == {
             "ctas_per_head": 2,
@@ -388,12 +570,66 @@ def test_walk_form_rules_and_records() -> None:
         "kind": "walk_form",
     }
     assert kcp_jit.MODULES["kcp_fwdh_tape"]["select_rule"] == {"kind": "always"}
+    assert kcp_jit.MODULES["kcp_fwdh_o"]["select_rule"] == {
+        "form": "full",
+        "kind": "walk_form",
+    }
+    assert kcp_jit.MODULES["kcp_fwdh_o_vh64"]["select_rule"] == {
+        "form": "split",
+        "kind": "walk_form",
+    }
+    assert kcp_jit.MODULES["kcp_fwdh_o"]["grid_rule"] == {"kind": "kcp_segments_heads"}
+
+
+def test_walk_heads_selection() -> None:
+    # the full-width adjoint offset walk: the plain build up to 63 heads, the overlap-schedule build from 64 (the W4
+    # rows); its split form and the forward offset walk keep the walk_form rule
+    assert kcp_jit.WALK_HEADS_RULE == {
+        "kcp_dhu_offset": ((63, "kcp_dhu_offset"), (None, "kcp_dhu_offset_overlap"))
+    }
+    for name in ("kcp_dhu_offset", "kcp_dhu_offset_overlap"):
+        assert kcp_jit.MODULES[name]["select_rule"] == {
+            "form": "full",
+            "kind": "walk_heads",
+        }
+        assert kcp_jit.MODULES[name]["grid_rule"] == {"kind": "kcp_segments_heads"}
+    for heads, record in (
+        (1, "kcp_dhu_offset"),
+        (4, "kcp_dhu_offset"),
+        (63, "kcp_dhu_offset"),
+        (64, "kcp_dhu_offset_overlap"),
+        (128, "kcp_dhu_offset_overlap"),
+    ):
+        assert kcp_jit.walk_heads_record("kcp_dhu_offset", heads) == record
+        assert (
+            kcp_jit.select_record("kcp_dhu_offset", form="full", num_heads=heads)
+            == record
+        )
+        assert (
+            kcp_jit.select_record("kcp_dhu_offset", form="split", num_heads=heads)
+            == "kcp_dhu_offset_vh64"
+        )
+        assert (
+            kcp_jit.select_record("kcp_fwdh_offset", form="full", num_heads=heads)
+            == "kcp_fwdh_offset"
+        )
+    assert kcp_jit.launch_grid("kcp_dhu_offset_overlap", n_walk=3, num_heads=64) == (
+        192,
+        1,
+        1,
+    )
+    with pytest.raises(ValueError):
+        kcp_jit.select_record("kcp_dhu_offset", form="full")  # the head count is needed
+    with pytest.raises(ValueError):
+        kcp_jit.walk_heads_record("kcp_dhu_offset", 0)
+    with pytest.raises(ValueError):
+        kcp_jit.walk_heads_record("kcp_fwdh_offset", 64)
 
 
 def test_the_shipped_transfer_walk_is_the_half_width_bf16x3_program() -> None:
     record = kcp_jit.MODULES["kcp_transfer_walk"]
     assert record["grid_rule"] == {"ctas_per_head": 2, "kind": "kcp_segments_heads"}
-    assert record["library"] == "cake_kda_train_9a3f306bacf8c8a1547d_kcp"
+    assert record["library"] == "cake_kda_train_8ffd931ca0595948b608_kcp"
     previous = kcp_jit.TEST_MODULES["kcp_transfer_walk_tf32_hilo"]
     assert previous["grid_rule"] == {"kind": "kcp_segments_heads"}
     assert previous["library"] == "cake_kda_train_1ac972f0cb7cc7b13cf7_kcp"
@@ -405,7 +641,7 @@ def test_shipped_manifest_lists_the_kcp_programs_and_no_test_only_one() -> None:
     manifest = cake_build.manifest()
     libraries = cake_build.libraries_by_name()
     for name, record in kcp_jit.MODULES.items():
-        for arch in ARCHES:
+        for arch in record["arches"]:
             library = kcp_jit.library_name(name, arch)
             assert library == f"{record['library']}_{arch}"
             entry = libraries[library]
@@ -441,8 +677,8 @@ _PTX_ISA_8_8 = re.compile(
 
 @pytest.mark.parametrize("manifest", ["build.json", "build.test.json"])
 def test_an_entry_whose_units_use_ptx_isa_8_8_needs_cuda_12_9(manifest: str) -> None:
-    """An entry whose units use a PTX ISA 8.8 instruction (the 256-bit stores of the output stages and the
-    full-width tape walks) states ``min_cuda`` 12.9 or newer: CUDA 12.8 cannot build it."""
+    """An entry whose units use a PTX ISA 8.8 instruction (the 256-bit stores of the fused forward walk, the output
+    stages and the full-width tape walks) states ``min_cuda`` 12.9 or newer: CUDA 12.8 cannot build it."""
     path = PACKAGE_DIR / manifest
     if not path.is_file():
         pytest.skip(f"{manifest} is not shipped here")
@@ -517,26 +753,6 @@ def test_test_manifest_is_the_test_only_programs_under_the_opt_in(
 
 
 DET_PREFIX, PREFIX = "cake_kda_det_train_", "cake_kda_train_"
-# The deterministic package's programs this package has no form of: the fused forward walk (the forward state walk
-# with the chunk output inside it), whose records only the deterministic package ships.
-DET_ONLY_PROGRAMS = ("kcp_fwdh_o",)
-# The records whose builds differ between the two packages: the deterministic package ships newer builds of the
-# affine merge (selected by its MERGE_RULE), of the full-width offset walks (the adjoint one beside the plain build,
-# selected by its WALK_HEADS_RULE) and of the shipped transfer walk; this package keeps its own builds of these
-# records.  The deterministic package's
-# extra records belong to those programs.  Every other record and unit is the deterministic package's under this
-# package's names.
-OWN = {
-    "kcp_fwdh_offset": PREFIX + "7658fcc297c6fd906d53_kcp",
-    "kcp_dhu_offset": PREFIX + "1c66573e87150245374b_kcp",
-    "kcp_transfer_walk": PREFIX + "9a3f306bacf8c8a1547d_kcp",
-    "kcp_affine_merge_c8": PREFIX + "c6958a0a4ed5cb55a9a1_kcp",
-    "kcp_affine_merge_c16": PREFIX + "89f5ff59f03eb170e3bf_kcp",
-}
-
-
-def _library_stem(name: str) -> str:
-    return name.rsplit("_sm_", 1)[0]
 
 
 def _renamed(value):
@@ -553,35 +769,20 @@ def _renamed(value):
 def test_the_records_are_the_deterministic_records_under_this_packages_names() -> None:
     """The KCP programs have no non-deterministic form: both tables hold the deterministic package's records, every
     field equal but the library stem and the kernel symbol, which carry the same twenty hex digits under this
-    package's prefix; no library or kernel symbol of this package is one of the deterministic package's.  The records
-    of ``OWN`` are this package's own builds; the programs of ``DET_ONLY_PROGRAMS`` are the deterministic package's
-    alone."""
-    own_programs = {kcp_jit.MODULES[name]["program"] for name in OWN}
+    package's prefix; no library or kernel symbol of this package is one of the deterministic package's."""
     for table in ("MODULES", "TEST_MODULES"):
         ours, theirs = getattr(kcp_jit, table), getattr(det_kcp_jit, table)
-        assert set(ours) <= set(theirs), table
-        assert {
-            theirs[n]["program"] for n in set(theirs) - set(ours)
-        } <= own_programs | set(DET_ONLY_PROGRAMS)
+        assert set(ours) == set(theirs), table
         for name, record in ours.items():
             assert record["library"].startswith(PREFIX), name
-            if name in OWN:
-                assert record["library"] == OWN[name], name
-            else:
-                assert record == _renamed(theirs[name]), (table, name)
-    assert set(OWN) <= set(kcp_jit.MODULES)
+            assert record == _renamed(theirs[name]), (table, name)
     ours = {r["library"] for r in _records().values()}
     theirs = {
         r["library"]
         for r in {**det_kcp_jit.MODULES, **det_kcp_jit.TEST_MODULES}.values()
     }
     assert not ours & theirs
-    assert set(DET_ONLY_PROGRAMS) <= set(det_kcp_jit.PROGRAMS)
-    assert not set(DET_ONLY_PROGRAMS) & set(kcp_jit.PROGRAMS)
-    assert (
-        tuple(p for p in det_kcp_jit.PROGRAMS if p not in DET_ONLY_PROGRAMS)
-        == kcp_jit.PROGRAMS
-    )
+    assert kcp_jit.PROGRAMS == det_kcp_jit.PROGRAMS
     assert kcp_jit.LOGICAL_TENSORS == det_kcp_jit.LOGICAL_TENSORS
     assert kcp_jit.LOGICAL_SCALARS == det_kcp_jit.LOGICAL_SCALARS
 
@@ -590,34 +791,27 @@ def test_the_records_are_the_deterministic_records_under_this_packages_names() -
 def test_the_units_are_the_deterministic_units_under_this_packages_names(
     manifest: str,
 ) -> None:
-    """Every library of this package's manifest is the deterministic package's library of the same digits: the same
-    architecture, flags and entry, and sources whose text is the deterministic unit's with the deterministic prefix
-    renamed (file names, kernel symbols, binding namespaces); nothing else differs.  The libraries of the records whose
-    builds differ between the two packages (``OWN``, and the deterministic package's extra records) are left out on
-    both sides."""
+    """Every library of this package's manifest is the deterministic package's library of the same digits: every
+    field of the entry the same (architecture, gencode, minimum CUDA, flags, conditional flags, entry) but the name,
+    the path (the deterministic path renamed), the sources and their hashes; the sources' text is the deterministic
+    unit's with the deterministic prefix renamed (file names, kernel symbols, binding namespaces); nothing else
+    differs."""
     det_dir = Path(det_kcp_jit.__file__).resolve().parent
     path, det_path = PACKAGE_DIR / manifest, det_dir / manifest
     if not path.is_file() or not det_path.is_file():
         pytest.skip(f"{manifest} is not rendered in both packages here")
-    own = set(OWN.values())
-    det_records = {**det_kcp_jit.MODULES, **det_kcp_jit.TEST_MODULES}
-    left_out = set(OWN) | (set(det_records) - set(_records()))
-    det_own = {det_records[n]["library"] for n in left_out if n in det_records}
-    ours = {
-        e["name"]: e
-        for e in json.loads(path.read_text())["libraries"]
-        if _library_stem(e["name"]) not in own
-    }
+    ours = {e["name"]: e for e in json.loads(path.read_text())["libraries"]}
     theirs = {
-        _renamed(e["name"]): e
-        for e in json.loads(det_path.read_text())["libraries"]
-        if _library_stem(e["name"]) not in det_own
+        _renamed(e["name"]): e for e in json.loads(det_path.read_text())["libraries"]
     }
     assert set(ours) == set(theirs), manifest
     for name, entry in ours.items():
         det_entry = theirs[name]
-        for key in ("arch", "entry", "nvcc_flags"):
-            assert entry.get(key) == det_entry.get(key), (name, key)
+        own = {"name", "path", "sources", "sha256", "closure_sha256"}
+        assert {k: v for k, v in entry.items() if k not in own} == {
+            k: v for k, v in det_entry.items() if k not in own
+        }, name
+        assert entry["path"] == _renamed(det_entry["path"]), name
         assert entry["sources"] == _renamed(det_entry["sources"]), name
         for source, det_source in zip(
             entry["sources"], det_entry["sources"], strict=True

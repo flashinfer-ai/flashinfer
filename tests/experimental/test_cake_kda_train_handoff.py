@@ -20,9 +20,9 @@ every call with ``deterministic=False``).  On a GPU: the gradients under both ch
 tapes; a row record: the recompute launches the intra twin, ``cake_jit.HANDOFF_TWINS``, and the record also keeps the
 prep's rows), also with the tape WY twin (``cake_jit.TAPE_TWINS``) on the rows whose record keeps no ``w``, the
 record is taken, stale or refused records fall back, the byte budget demotes and refuses, and ``"auto"`` engages
-exactly where ``HANDOFF_HEADS``, ``HANDOFF_VERIFIED`` and ``HANDOFF_ROWS_VERIFIED`` say.  Host only: the rules, the
-admission, the mode parsing and torch's recompute, capture, compile and dispatch-mode state as the hand-off reads
-it.
+exactly where ``HANDOFF_HEADS``, ``HANDOFF_VERIFIED``, the size bounds (``HANDOFF_MIN_HEAD_TOKENS``,
+``HANDOFF_MIN_DOC_TOKENS``) and ``HANDOFF_ROWS_VERIFIED`` say.  Host only: the rules, the admission, the mode parsing
+and torch's recompute, capture, compile and dispatch-mode state as the hand-off reads it.
 
 Like the backend suite it names its package through the shared alias helper and imports nothing else from
 flashinfer.
@@ -285,6 +285,14 @@ def _plan(lengths, heads, device):
         heads,
         cake_jit.sm_count(device.index),
         cake_jit.device_arch(device.index),
+    )
+
+
+def _smallest_admitted(heads: int) -> int:
+    """The tokens of the smallest one-document problem the size bounds admit at ``heads`` heads."""
+    return max(
+        cake_backend.HANDOFF_MIN_DOC_TOKENS,
+        -(-cake_backend.HANDOFF_MIN_HEAD_TOKENS // heads),
     )
 
 
@@ -1258,11 +1266,13 @@ def test_the_byte_budget_admits_two_records_of_the_shape(
 def test_auto_follows_the_head_counts_and_the_verified_devices(
     device, manifest, monkeypatch
 ) -> None:
-    """The default (``"auto"``, no keyword) with the toolkit and the verified set patched, so the test runs on any
-    device: it hands off at a ``HANDOFF_HEADS`` head count on a verified device, and stays off on another device
-    (counting ``unverified``) and at a head count outside ``HANDOFF_HEADS`` (no request: nothing counted).  The
-    gradients are bitwise ``"off"``'s in every case."""
+    """The default (``"auto"``, no keyword) with the toolkit, the verified set and the size bounds patched, so the
+    test runs on any device: it hands off at a ``HANDOFF_HEADS`` head count on a verified device with the problem at
+    both size bounds (``H * S == HANDOFF_MIN_HEAD_TOKENS``, ``S // N == HANDOFF_MIN_DOC_TOKENS``), and stays off on
+    another device (counting ``unverified``), at a head count outside ``HANDOFF_HEADS`` and with either bound raised by
+    one (no request: nothing counted).  The gradients are bitwise ``"off"``'s in every case."""
     lengths = (100, 640, 77, 1000, 129)
+    S, N = sum(lengths), len(lengths)
     arch, sms = cake_jit.device_arch(device.index), cake_jit.sm_count(device.index)
     monkeypatch.setattr(
         cake_backend, "HANDOFF_VERIFIED", frozenset({(arch, sms, "9.9")})
@@ -1270,32 +1280,53 @@ def test_auto_follows_the_head_counts_and_the_verified_devices(
     # no device listed for row records: every record is a tape record
     monkeypatch.setattr(cake_backend, "HANDOFF_ROWS_VERIFIED", frozenset())
     heads = min(cake_backend.HANDOFF_HEADS)
-    # (heads, toolkit, published and hits, unverified)
-    cases = ((heads, "9.9", 1, 0), (heads, "9.8", 0, 1), (1, "9.9", 0, 0))
-    for H, toolkit, engaged, unverified in cases:
+    # the largest bounds the problem meets at that head count, and each one past it
+    at = (heads * S, S // N)
+    assert at[1] * N <= S < (at[1] + 1) * N, (S, N)
+    # (heads, toolkit, (min head-tokens, min mean document length), published and hits, unverified)
+    cases = (
+        (heads, "9.9", at, 1, 0),
+        (heads, "9.8", at, 0, 1),
+        (1, "9.9", at, 0, 0),
+        (heads, "9.9", (at[0] + 1, at[1]), 0, 0),
+        (heads, "9.9", (at[0], at[1] + 1), 0, 0),
+    )
+    for H, toolkit, (min_head_tokens, min_doc), engaged, unverified in cases:
         monkeypatch.setattr(cake_backend, "_handoff_toolkit", lambda a, t=toolkit: t)
+        monkeypatch.setattr(cake_backend, "HANDOFF_MIN_HEAD_TOKENS", min_head_tokens)
+        monkeypatch.setattr(cake_backend, "HANDOFF_MIN_DOC_TOKENS", min_doc)
         inputs = make_inputs(lengths, H, device)
         _, off = _checkpointed_step(inputs, reentrant=False, handoff="off")
         cake_backend._handoff_reset()
         _, auto = _checkpointed_step(inputs, reentrant=False, handoff=None)
         s = _stats(device)
-        assert s["published"] == s["hits"] == engaged, (H, toolkit, s)
-        assert s["unverified"] == unverified, (H, toolkit, s)
-        assert s["live_records"] == 0, (H, toolkit, s)
+        tag = (H, toolkit, min_head_tokens, min_doc)
+        assert s["published"] == s["hits"] == engaged, (tag, s)
+        assert s["unverified"] == unverified, (tag, s)
+        assert s["live_records"] == 0, (tag, s)
         twin = _plan(lengths, H, device).handoff_twin
-        assert s["published_rows"] == 0, (H, toolkit, s)
-        assert s["rows_unverified"] == engaged * (twin is not None), (H, toolkit, s)
-        _check_grads(auto, off, (H, toolkit))
+        assert s["published_rows"] == 0, (tag, s)
+        assert s["rows_unverified"] == engaged * (twin is not None), (tag, s)
+        if not engaged and not unverified:
+            nonzero = [name for name in cake_backend._HANDOFF_COUNTERS if s[name]]
+            assert not nonzero, (tag, nonzero, s)
+        _check_grads(auto, off, tag)
 
 
 def test_the_shipped_rule_on_this_device(device, manifest) -> None:
     """The default as shipped, nothing patched: this build's toolkit reads as ``major.minor``, and at the smallest
-    ``HANDOFF_HEADS`` head count the default hands off exactly when this device (architecture, SM count, toolkit)
-    is in ``HANDOFF_VERIFIED``, else it counts ``unverified``.  The toolkit of the one build of the twin, its intra
-    record and the light prep reads as ``major.minor.patch``; the record (the call's own workspace) is a row record
-    exactly when the device with that toolkit is in ``HANDOFF_ROWS_VERIFIED`` (else ``rows_unverified``) and the
-    twin loads (else ``rows_unready``); the gradients are bitwise ``"off"``'s."""
-    lengths, heads = (63, 1, 65), min(cake_backend.HANDOFF_HEADS)
+    ``HANDOFF_HEADS`` head count ``H``, on the smallest one-document problem the size bounds admit there
+    (``max(HANDOFF_MIN_DOC_TOKENS, ceil(HANDOFF_MIN_HEAD_TOKENS / H))`` tokens), the default hands off exactly when
+    this device (architecture, SM count, toolkit) is in ``HANDOFF_VERIFIED``, else it counts ``unverified``.  The
+    toolkit of the one build of the twin, its intra record and the light prep reads as ``major.minor.patch``; the
+    record (the call's own workspace) is a row record exactly when the device with that toolkit is in
+    ``HANDOFF_ROWS_VERIFIED`` (else ``rows_unverified``) and the twin loads (else ``rows_unready``); the gradients
+    are bitwise ``"off"``'s.  With one token fewer, and with the same tokens in more documents than the mean-length
+    bound allows, the default makes no request on any device: nothing is published or counted."""
+    heads = min(cake_backend.HANDOFF_HEADS)
+    min_doc = cake_backend.HANDOFF_MIN_DOC_TOKENS
+    S = _smallest_admitted(heads)
+    lengths = (S,)
     p = _plan(lengths, heads, device)
     key = (p.arch, p.sm_count, cake_backend._handoff_toolkit(p.arch))
     assert re.fullmatch(r"\d+\.\d+", key[2] or ""), key
@@ -1323,6 +1354,19 @@ def test_the_shipped_rule_on_this_device(device, manifest) -> None:
     assert s["rows_unverified"] == int(engaged and not listed), (key, toolkit, s)
     assert s["rows_unready"] == 0, (key, toolkit, s)
     _check_grads(auto, off, key)
+    # below the bounds: one token fewer (under the token-head bound, or the mean-length bound where that one binds),
+    # and the S tokens in one document more than S // HANDOFF_MIN_DOC_TOKENS (under the mean-length bound)
+    n_docs = S // min_doc + 1
+    base = S // n_docs
+    split = (base,) * (n_docs - 1) + (S - base * (n_docs - 1),)
+    for small in ((S - 1,), split):
+        assert not cake_backend._handoff_large(sum(small), len(small), heads), small
+        cake_backend._handoff_reset()
+        inputs = make_inputs(small, heads, device)
+        _checkpointed_step(inputs, reentrant=False, handoff=None)
+        s = _stats(device)
+        nonzero = [name for name in cake_backend._HANDOFF_COUNTERS if s[name]]
+        assert not nonzero and s["live_records"] == 0, (len(small), s)
 
 
 class _Built:
@@ -1513,16 +1557,20 @@ def test_capture_blocks_the_handoff(device) -> None:
 def test_the_auto_rule(monkeypatch) -> None:
     """Host only: ``"on"`` engages on every plan and ``"off"`` on none; ``"auto"`` at a ``HANDOFF_HEADS`` head count
     on a ``HANDOFF_VERIFIED`` (architecture, SM count, toolkit) device, counting ``unverified`` at those head counts
-    on another architecture, SM count or toolkit (also one that cannot be read).  The node makes no ``"auto"``
-    request at other head counts, before it reads any torch state.  A plan of the raw gate mode (``gate="raw"``)
-    engages in no mode and counts nothing.  The shipped devices name exported architectures and ``major.minor``
-    toolkits; the head counts start at two (one head is host-bound)."""
+    on another architecture, SM count or toolkit (also one that cannot be read), on a one-document problem both size
+    bounds admit (:func:`test_the_auto_size_bounds` covers the bounds).  The node makes no ``"auto"`` request at
+    other head counts, below either size bound or with a ``cu_seqlens`` that is not a tensor, before it reads any
+    torch state.  A plan of the raw gate mode (``gate="raw"``) or of an in-kernel Q/K L2 norm mode (``l2n``
+    ``"fused"`` / ``"fallback"``) engages in no mode and counts nothing.  The shipped devices name exported
+    architectures and ``major.minor`` toolkits; the head counts start at two (one head is host-bound)."""
     for arch, sms, toolkit in cake_backend.HANDOFF_VERIFIED:
         assert arch in ARCHES and sms > 0, (arch, sms, toolkit)
         assert re.fullmatch(r"\d+\.\d+", toolkit), (arch, sms, toolkit)
     heads = min(cake_backend.HANDOFF_HEADS)
     assert heads == 2, cake_backend.HANDOFF_HEADS
     gap = next(h for h in range(heads, 1024) if h not in cake_backend.HANDOFF_HEADS)
+    # a one-document problem both size bounds admit at every HANDOFF_HEADS head count
+    S0 = _smallest_admitted(heads)
     arch, other = ARCHES[0], ARCHES[1]
     monkeypatch.setattr(
         cake_backend, "HANDOFF_VERIFIED", frozenset({(arch, 152, "9.9")})
@@ -1543,15 +1591,31 @@ def test_the_auto_rule(monkeypatch) -> None:
     unverified = 0
     for mode, arch_, sms, toolkit, H, want, counted in cases:
         monkeypatch.setattr(cake_backend, "_handoff_toolkit", lambda a, t=toolkit: t)
-        p = types.SimpleNamespace(arch=arch_, sm_count=sms, H=H, gate="g")
+        p = types.SimpleNamespace(
+            arch=arch_, sm_count=sms, H=H, S=S0, N=1, gate="g", l2n="off"
+        )
         assert cake_backend._handoff_engages(p, mode, 0) is want, (mode, p, toolkit)
         unverified += counted
         assert cake_backend._handoff_stats(0)["unverified"] == unverified, (mode, p)
     monkeypatch.setattr(cake_backend, "_handoff_toolkit", lambda a: "9.9")
+    refused = 0
+    off_modes = [("raw", "off")] + [
+        (g, m) for g in ("g", "raw") for m in ("fused", "fallback")
+    ]
     for mode in ("on", "auto", "off"):
         for sms in (152, 148):
-            p = types.SimpleNamespace(arch=arch, sm_count=sms, H=heads, gate="raw")
-            assert cake_backend._handoff_engages(p, mode, 0) is False, (mode, sms)
+            for gate, l2n in off_modes:
+                p = types.SimpleNamespace(
+                    arch=arch, sm_count=sms, H=heads, gate=gate, l2n=l2n
+                )
+                assert cake_backend._handoff_engages(p, mode, 0) is False, (
+                    mode,
+                    sms,
+                    gate,
+                    l2n,
+                )
+                refused += 1
+    assert refused == 3 * 2 * 5
     assert cake_backend._handoff_stats(0)["unverified"] == unverified
 
     def read_torch_state():
@@ -1560,16 +1624,93 @@ def test_the_auto_rule(monkeypatch) -> None:
     monkeypatch.setattr(cake_backend, "_handoff_task", read_torch_state)
     ctx = types.SimpleNamespace(needs_input_grad=(True,) * 5)
 
-    def v(H):  # an operand on a CUDA device, without one
+    def v(H, S=S0):  # an operand on a CUDA device, without one
         return types.SimpleNamespace(
-            device=torch.device("cuda", 0), shape=(64, H, D), dim=lambda: 3
+            device=torch.device("cuda", 0), shape=(S, H, D), dim=lambda: 3
         )
 
-    for mode, H in (("auto", 1), ("auto", gap), ("off", heads)):
-        assert cake_backend._handoff_request(ctx, mode, v(H)) is None, (mode, H)
-    for mode, H in (("auto", heads), ("on", 1)):
+    def cu(N=1):  # the offsets of N documents (only their count is read)
+        return torch.zeros(N + 1, dtype=torch.int32)
+
+    n_docs = S0 // cake_backend.HANDOFF_MIN_DOC_TOKENS + 1
+    no_request = (
+        ("auto", v(1), cu()),
+        ("auto", v(gap), cu()),
+        ("off", v(heads), cu()),
+        ("auto", v(heads, S0 - 1), cu()),
+        ("auto", v(heads), cu(n_docs)),
+        ("auto", v(heads), None),
+    )
+    for mode, v_, cu_ in no_request:
+        assert cake_backend._handoff_request(ctx, mode, v_, cu_) is None, mode
+    for mode, v_ in (("auto", v(heads)), ("on", v(1)), ("on", v(heads, 64))):
         with pytest.raises(RuntimeError, match="torch state"):
-            cake_backend._handoff_request(ctx, mode, v(H))
+            cake_backend._handoff_request(ctx, mode, v_, cu())
+
+
+def test_the_auto_size_bounds(monkeypatch) -> None:
+    """Host only: ``"auto"`` admits a problem of ``S`` tokens in ``N`` documents at ``H`` heads by its size exactly
+    when ``H * S >= HANDOFF_MIN_HEAD_TOKENS`` and ``S >= HANDOFF_MIN_DOC_TOKENS * N`` (zero-length documents count).
+    At every ``HANDOFF_HEADS`` head count the smallest admitted one-document problem passes and one token fewer does
+    not; at the mean-length bound ``N`` documents pass and ``N + 1`` do not.  The shipped bounds admit the measured
+    12-head rows where the hand-off made the checkpointed step faster than the deterministic package (32768 tokens
+    in one or four documents, 16384 in one) and refuse those where it made it slower (16384 tokens in four
+    documents, 8192 in one or four).  On the plan, ``"auto"`` engages at the bounds on a verified device; a refusal
+    by size counts nothing, on a verified device or another one; ``"on"`` ignores the bounds."""
+    min_head_tokens = cake_backend.HANDOFF_MIN_HEAD_TOKENS
+    min_doc = cake_backend.HANDOFF_MIN_DOC_TOKENS
+    large = cake_backend._handoff_large
+    # the measured rows at 12 heads: (tokens, documents) -> admitted
+    measured = {
+        (32768, 1): True,
+        (32768, 4): True,
+        (16384, 1): True,
+        (16384, 4): False,
+        (8192, 1): False,
+        (8192, 4): False,
+    }
+    for (S, N), admitted in measured.items():
+        assert large(S, N, 12) is admitted, (S, N)
+    for H in sorted(cake_backend.HANDOFF_HEADS):
+        S = _smallest_admitted(H)
+        assert min_head_tokens <= H * S and min_doc <= S, (H, S)
+        assert large(S, 1, H) and not large(S - 1, 1, H), (H, S)
+    heads = max(cake_backend.HANDOFF_HEADS)
+    for N in (1, 2, 4, 13, 300):
+        S = min_doc * N
+        assert heads * (S - 1) >= min_head_tokens, (N, S)
+        assert large(S, N, heads) and not large(S - 1, N, heads), (N, S)
+        assert not large(S, N + 1, heads), (N, S)
+
+    arch = ARCHES[0]
+    monkeypatch.setattr(
+        cake_backend, "HANDOFF_VERIFIED", frozenset({(arch, 152, "9.9")})
+    )
+    monkeypatch.setattr(cake_backend, "_handoff_toolkit", lambda a: "9.9")
+    heads = min(cake_backend.HANDOFF_HEADS)
+    S = _smallest_admitted(heads)
+    n_docs = S // min_doc + 1
+    # (mode, SM count: 152 verified, 148 not; tokens; documents; engages; counts unverified)
+    cases = (
+        ("auto", 152, S, 1, True, False),
+        ("auto", 152, S - 1, 1, False, False),
+        ("auto", 152, S, n_docs, False, False),
+        ("auto", 148, S - 1, 1, False, False),
+        ("auto", 148, S, n_docs, False, False),
+        ("auto", 148, S, 1, False, True),
+        ("on", 148, 1, 1, True, False),
+    )
+    unverified = 0
+    for mode, sms, S_, N, want, counted in cases:
+        p = types.SimpleNamespace(
+            arch=arch, sm_count=sms, H=heads, S=S_, N=N, gate="g", l2n="off"
+        )
+        assert cake_backend._handoff_engages(p, mode, 0) is want, (mode, sms, S_, N)
+        unverified += counted
+        s = cake_backend._handoff_stats(0)
+        assert s["unverified"] == unverified, (mode, sms, S_, N, s)
+        others = [n for n in cake_backend._HANDOFF_COUNTERS if n != "unverified"]
+        assert not any(s[n] for n in others), (mode, sms, S_, N, s)
 
 
 def test_a_full_window_of_misses_and_hits_turns_the_handoff_off(monkeypatch) -> None:
