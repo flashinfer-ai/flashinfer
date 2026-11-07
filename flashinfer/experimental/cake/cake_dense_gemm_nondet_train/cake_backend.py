@@ -1185,11 +1185,11 @@ K1_FORWARD_SINGLE_CTA_KNOBS: dict[str, Any] = {
     "hints": ("none", "none"),
 }
 #: The K1 forward rows of this package that run another plan of the deterministic package's programs than
-#: its own plan of the row, ``(arch, sm_count) -> {(K, N, T): knobs}``: on a part of exactly ``sm_count`` SMs,
+#: its own plan of the row, ``(arch, sm_count) -> {(K, N, T): knobs or program}``: on a part of exactly ``sm_count`` SMs,
 #: :func:`cake_dense_gemm_nondet_train_projection_forward` of ``X[T, K]`` and ``W[N, K]`` (both K-major) into a BF16 ``out`` of exactly these ``K``,
 #: ``N`` and ``T`` runs the program the deterministic planner gives the row with these knobs (:func:`k1_forward_knobs`);
 #: every other part, row, token count, layout and output dtype runs the deterministic plan.  On 152-SM ``sm_100a`` and
-#: ``sm_103a`` parts the deterministic plan of these rows splits K two ways over CTA pairs of 256-wide tiles (stream-K,
+#: ``sm_103a`` parts the deterministic plan of the knob rows (1024 to 4096 tokens) splits K two ways over CTA pairs of 256-wide tiles (stream-K,
 #: the partials added in a fixed order); the single-CTA program (:data:`K1_FORWARD_SINGLE_CTA_KNOBS`) keeps every tile's
 #: whole K in one CTA, so a forward still repeats bit for bit and a recomputed forward reproduces its result, with other
 #: bits than the deterministic package's plan (within the deterministic package's BF16 budget against FP64).  Measured at exactly
@@ -1202,29 +1202,48 @@ K1_FORWARD_SINGLE_CTA_KNOBS: dict[str, Any] = {
 #: Not in the table: ``4096 -> 512`` at 4096 tokens (next to a kernel holding 32 SMs it was up to 4.7 % slower), and
 #: ``4096 -> 512`` at 3072 tokens on both parts and ``5120 -> 512`` at 4096 tokens on ``sm_103a`` (in one run a training
 #: step with eager launches was further above the deterministic plan than that plan against itself).
+#:
+#: A row whose entry is a program symbol of the deterministic package (``kk_n256_ht_cg_pro15``: its template without
+#: the ``dense_proj_det_gemm_`` prefix; 16172 to 16384 tokens, also on 148-SM ``sm_100a`` parts) runs that program,
+#: planned with the knobs that name it (:func:`k1_program_knobs`), where the deterministic plan of the row is
+#: ``kk_n256_pro7``.  Measured at exactly these rows and token counts on one part of each SM count, against the
+#: deterministic plan of the row in the same process: faster in eager launches and in CUDA graph replays in at least 4
+#: of 5 paired groups of a screen, the output equal to the deterministic plan's bit for bit, and the same bits on 20
+#: repeats.  The other rows of that screen (``5120 -> 512`` at 16172 and 16231 tokens on 152-SM ``sm_100a`` parts:
+#: faster in 3 of 5 groups in graph replays) keep the deterministic plan.
+# fmt: off
 K1_FORWARD_RULES_BY_SM: dict[
-    tuple[str, int], dict[tuple[int, int, int], dict[str, Any]]
+    tuple[str, int], dict[tuple[int, int, int], Union[dict[str, Any], str]]
 ] = {
+    ("sm_100a", 148): {
+        (4096, 512, 16172): "kk_n256_ht_cg_pro15", (5120, 512, 16172): "kk_n256_ht_cg_pro15",
+        (5120, 512, 16231): "kk_n256_ht_cg_pro15", (5120, 512, 16384): "kk_n256_ht_cg_pro15",
+    },
     ("sm_100a", 152): {
         (4096, 512, 2048): K1_FORWARD_SINGLE_CTA_KNOBS,
         (5120, 512, 1024): K1_FORWARD_SINGLE_CTA_KNOBS,
         (5120, 512, 4096): K1_FORWARD_SINGLE_CTA_KNOBS,
+        (4096, 512, 16172): "kk_n256_ht_cg_pro15", (5120, 512, 16384): "kk_n256_ht_cg_pro15",
     },
     ("sm_103a", 152): {
         (4096, 512, 2048): K1_FORWARD_SINGLE_CTA_KNOBS,
         (5120, 512, 1024): K1_FORWARD_SINGLE_CTA_KNOBS,
+        (4096, 512, 16172): "kk_n256_ht_cg_pro15", (5120, 512, 16172): "kk_n256_ht_cg_pro15",
     },
 }
+# fmt: on
 
 
 def k1_forward_knobs(*, arch: str, sm_count: int, K: int, N: int, T: int) -> tuple:
     """The deterministic package's planner knobs of the forward ``out[T, N] = X[T, K] @ W[N, K].T`` (both operands
     K-major, BF16 ``out``) of this package on a device of exactly ``sm_count`` SMs: the row's entry in
     the table of :data:`K1_FORWARD_RULES_BY_SM` for ``(arch, sm_count)`` at exactly ``T`` tokens, as sorted
-    ``(name, value)`` pairs, or ``()`` -- the deterministic plan."""
+    ``(name, value)`` pairs (a program symbol: :func:`k1_program_knobs`), or ``()`` -- the deterministic plan."""
     knobs = K1_FORWARD_RULES_BY_SM.get((arch, int(sm_count)), {}).get(
         (int(K), int(N), int(T))
     )
+    if isinstance(knobs, str):
+        return k1_program_knobs(knobs)
     return tuple(sorted(knobs.items())) if knobs else ()
 
 
@@ -1243,6 +1262,186 @@ def _k1_forward_knobs_of(X: torch.Tensor, W: torch.Tensor, out: torch.Tensor) ->
     if facts.arch is None:
         return ()
     return k1_forward_knobs(arch=facts.arch, sm_count=facts.sm_count, K=K, N=N, T=T)
+
+
+def k1_program_knobs(program: str) -> tuple:
+    """The deterministic package's planner knobs that name its program ``program`` (a template symbol without the
+    ``dense_proj_det_gemm_`` prefix, e.g. ``kn_n128_f32_tma2_s4_c1``), as sorted ``(name, value)`` pairs: that
+    package's inverse of its symbol (``_template_knobs``).  ``ValueError`` for a symbol that names no planner knobs."""
+    det = deterministic_backend()
+    knobs = det._template_knobs(det._TEMPLATE_PREFIX + program)
+    if knobs is None:
+        raise ValueError(
+            f"cake_dense_gemm_nondet_train: {program!r} names no program of the deterministic planner"
+        )
+    return tuple(sorted(knobs.items()))
+
+
+#: The K1 input-gradient rows of this package that run another program of the deterministic package than its own
+#: plan of the row, ``(arch, sm_count) -> {(K, N, T, out_dtype): program}``: on a part of exactly ``sm_count`` SMs,
+#: :func:`cake_dense_gemm_nondet_train_projection_dgrad` of ``G[T, N]`` and ``W[N, K]`` (both with a unit stride on
+#: their last axis) into an ``out[T, K]`` of ``out_dtype`` (``"bf16"`` or ``"f32"``) at exactly these ``K``, ``N``
+#: and ``T`` runs the deterministic package's program ``program`` (its template without the ``dense_proj_det_gemm_``
+#: prefix), planned with the knobs that name it (:func:`k1_program_knobs`); every other part, row, token count, layout
+#: and output dtype runs the deterministic plan.  The table's programs (``kn_n128_f32_tma2_s4_c1``,
+#: ``kn_n256_tma1_w8`` / ``_w8r`` / ``_w8rs``, ``kn_n256_f32_v8_ef_pro7``) were measured at exactly these rows and token
+#: counts on one part of each SM count, against the deterministic plan of the row in the same process: faster in eager
+#: launches and in CUDA graph replays in at least 4 of 5 paired groups of a screen, the output equal to the
+#: deterministic plan's bit for bit, and the same bits on 20 repeats; the rows and token counts of that screen that
+#: missed keep the deterministic plan.  ``sm_107a`` parts have no measured row yet.
+# fmt: off
+K1_DGRAD_RULES_BY_SM: dict[tuple[str, int], dict[tuple[int, int, int, str], str]] = {
+    ("sm_100a", 148): {
+        (4096, 32, 16172, "bf16"): "kn_n256_tma1_w8r", (4096, 32, 16172, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (4096, 32, 16231, "bf16"): "kn_n256_tma1_w8r", (4096, 32, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (4096, 32, 16384, "bf16"): "kn_n256_tma1_w8r", (4096, 32, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (4096, 48, 16172, "bf16"): "kn_n256_tma1_w8rs", (4096, 48, 16172, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (4096, 48, 16231, "f32"): "kn_n128_f32_tma2_s4_c1", (4096, 48, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (4096, 64, 16172, "bf16"): "kn_n256_tma1_w8rs", (4096, 64, 16172, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (4096, 64, 16231, "f32"): "kn_n128_f32_tma2_s4_c1", (4096, 64, 16384, "bf16"): "kn_n256_tma1_w8rs",
+        (4096, 64, 16384, "f32"): "kn_n128_f32_tma2_s4_c1", (4096, 128, 16172, "bf16"): "kn_n256_tma1_w8r",
+        (4096, 128, 16172, "f32"): "kn_n128_f32_tma2_s4_c1", (4096, 128, 16231, "bf16"): "kn_n256_tma1_w8r",
+        (4096, 128, 16231, "f32"): "kn_n128_f32_tma2_s4_c1", (4096, 128, 16384, "bf16"): "kn_n256_tma1_w8rs",
+        (4096, 128, 16384, "f32"): "kn_n128_f32_tma2_s4_c1", (4096, 1024, 16172, "f32"): "kn_n256_f32_v8_ef_pro7",
+        (4096, 1024, 16231, "f32"): "kn_n256_f32_v8_ef_pro7", (4096, 1024, 16384, "f32"): "kn_n256_f32_v8_ef_pro7",
+        (5120, 32, 16172, "bf16"): "kn_n256_tma1_w8r", (5120, 32, 16172, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (5120, 32, 16231, "bf16"): "kn_n256_tma1_w8rs", (5120, 32, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (5120, 32, 16384, "bf16"): "kn_n256_tma1_w8rs", (5120, 32, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (5120, 48, 16172, "bf16"): "kn_n256_tma1_w8rs", (5120, 48, 16172, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (5120, 48, 16231, "bf16"): "kn_n256_tma1_w8r", (5120, 48, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (5120, 48, 16384, "bf16"): "kn_n256_tma1_w8r", (5120, 48, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (5120, 64, 16172, "f32"): "kn_n128_f32_tma2_s4_c1", (5120, 64, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (5120, 64, 16384, "f32"): "kn_n128_f32_tma2_s4_c1", (5120, 128, 16172, "bf16"): "kn_n256_tma1_w8r",
+        (5120, 128, 16172, "f32"): "kn_n128_f32_tma2_s4_c1", (5120, 128, 16231, "bf16"): "kn_n256_tma1_w8rs",
+        (5120, 128, 16231, "f32"): "kn_n128_f32_tma2_s4_c1", (5120, 128, 16384, "bf16"): "kn_n256_tma1_w8r",
+        (5120, 1024, 16172, "f32"): "kn_n256_f32_v8_ef_pro7", (5120, 1024, 16231, "f32"): "kn_n256_f32_v8_ef_pro7",
+        (5120, 1024, 16384, "f32"): "kn_n256_f32_v8_ef_pro7", (6144, 32, 16172, "bf16"): "kn_n256_tma1_w8r",
+        (6144, 32, 16231, "bf16"): "kn_n256_tma1_w8r", (6144, 32, 16384, "bf16"): "kn_n256_tma1_w8rs",
+        (6144, 48, 16172, "bf16"): "kn_n256_tma1_w8rs", (6144, 48, 16172, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (6144, 48, 16231, "bf16"): "kn_n256_tma1_w8rs", (6144, 48, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (6144, 48, 16384, "bf16"): "kn_n256_tma1_w8r", (6144, 48, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (6144, 64, 16172, "bf16"): "kn_n256_tma1_w8r", (6144, 64, 16172, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (6144, 64, 16231, "bf16"): "kn_n256_tma1_w8r", (6144, 64, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (6144, 64, 16384, "bf16"): "kn_n256_tma1_w8r", (6144, 64, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (6144, 128, 16172, "bf16"): "kn_n256_tma1_w8r", (6144, 128, 16172, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (6144, 128, 16231, "bf16"): "kn_n256_tma1_w8rs", (6144, 128, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (6144, 128, 16384, "bf16"): "kn_n256_tma1_w8rs", (6144, 128, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (8192, 128, 16172, "bf16"): "kn_n256_tma1_w8r", (8192, 128, 16172, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (8192, 128, 16231, "bf16"): "kn_n256_tma1_w8rs", (8192, 128, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (8192, 128, 16384, "bf16"): "kn_n256_tma1_w8r", (8192, 128, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+    },
+    ("sm_100a", 152): {
+        (4096, 32, 16172, "bf16"): "kn_n256_tma1_w8r", (4096, 32, 16172, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (4096, 32, 16231, "bf16"): "kn_n256_tma1_w8rs", (4096, 32, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (4096, 32, 16384, "bf16"): "kn_n256_tma1_w8", (4096, 32, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (4096, 48, 16172, "bf16"): "kn_n256_tma1_w8r", (4096, 48, 16172, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (4096, 48, 16231, "f32"): "kn_n128_f32_tma2_s4_c1", (4096, 48, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (4096, 64, 16172, "f32"): "kn_n128_f32_tma2_s4_c1", (4096, 64, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (4096, 64, 16384, "bf16"): "kn_n256_tma1_w8rs", (4096, 64, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (4096, 128, 16172, "bf16"): "kn_n256_tma1_w8rs", (4096, 128, 16172, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (4096, 128, 16231, "bf16"): "kn_n256_tma1_w8r", (4096, 128, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (4096, 128, 16384, "bf16"): "kn_n256_tma1_w8r", (4096, 128, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (5120, 32, 16172, "bf16"): "kn_n256_tma1_w8", (5120, 32, 16172, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (5120, 32, 16231, "bf16"): "kn_n256_tma1_w8r", (5120, 32, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (5120, 32, 16384, "bf16"): "kn_n256_tma1_w8rs", (5120, 32, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (5120, 48, 16172, "bf16"): "kn_n256_tma1_w8r", (5120, 48, 16172, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (5120, 48, 16231, "bf16"): "kn_n256_tma1_w8", (5120, 48, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (5120, 48, 16384, "bf16"): "kn_n256_tma1_w8r", (5120, 48, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (5120, 64, 16172, "f32"): "kn_n128_f32_tma2_s4_c1", (5120, 64, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (5120, 64, 16384, "f32"): "kn_n128_f32_tma2_s4_c1", (5120, 128, 16172, "bf16"): "kn_n256_tma1_w8rs",
+        (5120, 128, 16172, "f32"): "kn_n128_f32_tma2_s4_c1", (5120, 128, 16231, "bf16"): "kn_n256_tma1_w8r",
+        (5120, 128, 16384, "bf16"): "kn_n256_tma1_w8r", (5120, 128, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (6144, 32, 16172, "bf16"): "kn_n256_tma1_w8rs", (6144, 32, 16231, "bf16"): "kn_n256_tma1_w8rs",
+        (6144, 32, 16384, "bf16"): "kn_n256_tma1_w8rs", (6144, 48, 16172, "bf16"): "kn_n256_tma1_w8rs",
+        (6144, 48, 16172, "f32"): "kn_n128_f32_tma2_s4_c1", (6144, 48, 16231, "bf16"): "kn_n256_tma1_w8rs",
+        (6144, 48, 16231, "f32"): "kn_n128_f32_tma2_s4_c1", (6144, 48, 16384, "bf16"): "kn_n256_tma1_w8rs",
+        (6144, 48, 16384, "f32"): "kn_n128_f32_tma2_s4_c1", (6144, 64, 16172, "bf16"): "kn_n256_tma1_w8r",
+        (6144, 64, 16172, "f32"): "kn_n128_f32_tma2_s4_c1", (6144, 64, 16231, "bf16"): "kn_n256_tma1_w8r",
+        (6144, 64, 16231, "f32"): "kn_n128_f32_tma2_s4_c1", (6144, 64, 16384, "bf16"): "kn_n256_tma1_w8r",
+        (6144, 64, 16384, "f32"): "kn_n128_f32_tma2_s4_c1", (6144, 128, 16172, "bf16"): "kn_n256_tma1_w8rs",
+        (6144, 128, 16172, "f32"): "kn_n128_f32_tma2_s4_c1", (6144, 128, 16231, "bf16"): "kn_n256_tma1_w8r",
+        (6144, 128, 16231, "f32"): "kn_n128_f32_tma2_s4_c1", (6144, 128, 16384, "bf16"): "kn_n256_tma1_w8r",
+        (6144, 128, 16384, "f32"): "kn_n128_f32_tma2_s4_c1", (8192, 128, 16172, "bf16"): "kn_n256_tma1_w8rs",
+        (8192, 128, 16172, "f32"): "kn_n128_f32_tma2_s4_c1", (8192, 128, 16231, "bf16"): "kn_n256_tma1_w8rs",
+        (8192, 128, 16384, "bf16"): "kn_n256_tma1_w8r", (8192, 128, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+    },
+    ("sm_103a", 152): {
+        (4096, 32, 16172, "bf16"): "kn_n256_tma1_w8r", (4096, 32, 16172, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (4096, 32, 16231, "bf16"): "kn_n256_tma1_w8rs", (4096, 32, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (4096, 32, 16384, "bf16"): "kn_n256_tma1_w8r", (4096, 32, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (4096, 48, 16172, "f32"): "kn_n128_f32_tma2_s4_c1", (4096, 48, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (4096, 48, 16384, "f32"): "kn_n128_f32_tma2_s4_c1", (4096, 64, 16172, "bf16"): "kn_n256_tma1_w8rs",
+        (4096, 64, 16172, "f32"): "kn_n128_f32_tma2_s4_c1", (4096, 64, 16231, "bf16"): "kn_n256_tma1_w8rs",
+        (4096, 64, 16231, "f32"): "kn_n128_f32_tma2_s4_c1", (4096, 64, 16384, "bf16"): "kn_n256_tma1_w8r",
+        (4096, 64, 16384, "f32"): "kn_n128_f32_tma2_s4_c1", (4096, 128, 16172, "bf16"): "kn_n256_tma1_w8rs",
+        (4096, 128, 16172, "f32"): "kn_n128_f32_tma2_s4_c1", (4096, 128, 16231, "bf16"): "kn_n256_tma1_w8rs",
+        (4096, 128, 16231, "f32"): "kn_n128_f32_tma2_s4_c1", (4096, 128, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (4096, 1024, 16172, "f32"): "kn_n256_f32_v8_ef_pro7", (4096, 1024, 16231, "f32"): "kn_n256_f32_v8_ef_pro7",
+        (4096, 1024, 16384, "f32"): "kn_n256_f32_v8_ef_pro7", (5120, 32, 16172, "bf16"): "kn_n256_tma1_w8r",
+        (5120, 32, 16172, "f32"): "kn_n128_f32_tma2_s4_c1", (5120, 32, 16231, "bf16"): "kn_n256_tma1_w8r",
+        (5120, 32, 16231, "f32"): "kn_n128_f32_tma2_s4_c1", (5120, 32, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (5120, 48, 16172, "bf16"): "kn_n256_tma1_w8r", (5120, 48, 16172, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (5120, 48, 16231, "bf16"): "kn_n256_tma1_w8r", (5120, 48, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (5120, 48, 16384, "bf16"): "kn_n256_tma1_w8r", (5120, 48, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (5120, 64, 16172, "f32"): "kn_n128_f32_tma2_s4_c1", (5120, 64, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (5120, 64, 16384, "f32"): "kn_n128_f32_tma2_s4_c1", (5120, 128, 16172, "bf16"): "kn_n256_tma1_w8rs",
+        (5120, 128, 16172, "f32"): "kn_n128_f32_tma2_s4_c1", (5120, 128, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (5120, 128, 16384, "f32"): "kn_n128_f32_tma2_s4_c1", (5120, 1024, 16231, "f32"): "kn_n256_f32_v8_ef_pro7",
+        (5120, 1024, 16384, "f32"): "kn_n256_f32_v8_ef_pro7", (6144, 32, 16172, "bf16"): "kn_n256_tma1_w8rs",
+        (6144, 32, 16231, "bf16"): "kn_n256_tma1_w8rs", (6144, 32, 16384, "bf16"): "kn_n256_tma1_w8rs",
+        (6144, 48, 16172, "bf16"): "kn_n256_tma1_w8r", (6144, 48, 16172, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (6144, 48, 16231, "bf16"): "kn_n256_tma1_w8rs", (6144, 48, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (6144, 48, 16384, "bf16"): "kn_n256_tma1_w8r", (6144, 48, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (6144, 64, 16172, "bf16"): "kn_n256_tma1_w8r", (6144, 64, 16172, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (6144, 64, 16231, "bf16"): "kn_n256_tma1_w8r", (6144, 64, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (6144, 64, 16384, "bf16"): "kn_n256_tma1_w8r", (6144, 64, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (6144, 128, 16172, "bf16"): "kn_n256_tma1_w8r", (6144, 128, 16172, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (6144, 128, 16231, "bf16"): "kn_n256_tma1_w8r", (6144, 128, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (6144, 128, 16384, "bf16"): "kn_n256_tma1_w8rs", (6144, 128, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (8192, 128, 16172, "f32"): "kn_n128_f32_tma2_s4_c1", (8192, 128, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (8192, 128, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+    },
+    ("sm_107a", 212): {},
+}
+# fmt: on
+
+
+def k1_dgrad_knobs(
+    *, arch: str, sm_count: int, K: int, N: int, T: int, out_f32: bool
+) -> tuple:
+    """The deterministic package's planner knobs of the input gradient ``out[T, K] = G[T, N] @ W[N, K]`` of this
+    package on a device of exactly ``sm_count`` SMs (``out`` FP32 when ``out_f32``, else BF16): those of the program of
+    the row's entry in the table of :data:`K1_DGRAD_RULES_BY_SM` for ``(arch, sm_count)`` at exactly ``T`` tokens
+    (:func:`k1_program_knobs`), or ``()`` -- the deterministic plan."""
+    program = K1_DGRAD_RULES_BY_SM.get((arch, int(sm_count)), {}).get(
+        (int(K), int(N), int(T), "f32" if out_f32 else "bf16")
+    )
+    return k1_program_knobs(program) if program else ()
+
+
+def _k1_dgrad_knobs_of(G: torch.Tensor, W: torch.Tensor, out: torch.Tensor) -> tuple:
+    """:func:`k1_dgrad_knobs` of the input-gradient call ``(G, W, out)`` on ``out``'s device; ``()`` (the
+    deterministic plan) without a row of :data:`K1_DGRAD_RULES_BY_SM` of the call's shape and output dtype, and for an
+    operand without a unit stride on its last axis.  The device is read only for a shape of the table."""
+    if G.dim() != 2 or W.dim() != 2 or out.dtype not in (torch.bfloat16, torch.float32):
+        return ()
+    K, N, T = int(W.shape[1]), int(W.shape[0]), int(G.shape[0])
+    key = (K, N, T, "f32" if out.dtype == torch.float32 else "bf16")
+    if not any(key in rows for rows in K1_DGRAD_RULES_BY_SM.values()):
+        return ()
+    if G.stride(1) != 1 or W.stride(1) != 1:
+        return ()
+    facts = deterministic_backend().device_facts(out.device)
+    if facts.arch is None:
+        return ()
+    return k1_dgrad_knobs(
+        arch=facts.arch,
+        sm_count=facts.sm_count,
+        K=K,
+        N=N,
+        T=T,
+        out_f32=out.dtype == torch.float32,
+    )
 
 
 def atomic_k1_template(block_n: int, out_f32: bool, chains: int = 1) -> str:
@@ -5369,7 +5568,9 @@ def cake_dense_gemm_nondet_train_projection_dgrad(
     enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     """``out[T, K] = G[T, N] @ W[N, K]``.  The deterministic program (whole output tiles) through this package's
-    binding of it (:func:`_det_k1`: the same plan, program and bits).  ``enable_pdl`` as for
+    binding of it (:func:`_det_k1`: the same plan, program and bits), except on a row of :data:`K1_DGRAD_RULES_BY_SM`
+    for the device, which runs the table's program of the deterministic package (:func:`k1_dgrad_knobs`; the same
+    bits as the deterministic plan, every run).  ``enable_pdl`` as for
     :func:`cake_dense_gemm_nondet_train_projection`."""
     if out is None:
         out = torch.empty(
@@ -5386,7 +5587,7 @@ def cake_dense_gemm_nondet_train_projection_dgrad(
     return _det_k1(
         (G, W, o),
         ("dgrad",),
-        lambda: (G, W, o, False, ()),
+        lambda: (G, W, o, False, _k1_dgrad_knobs_of(G, W, o)),
         lambda: deterministic_backend().cake_dense_gemm_det_train_projection_dgrad(
             G, W, o, out_dtype=out_dtype, **_pdl_kw(enable_pdl)
         ),
