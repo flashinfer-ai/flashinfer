@@ -125,6 +125,7 @@ PAIR_STAGES = (
 FIRST_PARAMETER = {
     "fwd": "Q",
     "bwd_pre": "O",
+    "bwd_plan": "cu_seqlens_q",
     "bwd_main_fp32": "Q",
     "bwd_main_bf16": "Q",
     "bwd_dk_fp32": "dsw",
@@ -207,6 +208,7 @@ def test_registry_records_are_well_formed() -> None:
     assert tuple(cake_jit.STAGES) == (
         "fwd",
         "bwd_pre",
+        "bwd_plan",
         "bwd_main_fp32",
         "bwd_main_bf16",
         "bwd_dk_fp32",
@@ -489,6 +491,7 @@ def test_chunk_plan_and_grids_cover_every_tile() -> None:
         rows = cake_jit.rows_pad(t_q, n)
         assert rows % 128 == 0 and rows >= sum(-(-2 * q // 128) * 128 for q in q_lens)
         assert cake_jit.grid("bwd_pre", **dims) == (rows // 32, h_q // 2, 1)
+        assert cake_jit.grid("bwd_plan", **dims) == (1, 1, 1)
         assert cake_jit.grid("bwd_post", **dims) == (rows // 64, h_q // 2, 1)
         # The fold: one warp per (window row, key head), every one in the grid, no CTA without one.
         gx, gy, gz = cake_jit.grid("bwd_fold", **dims)
@@ -813,6 +816,48 @@ def _assert_matches_reference(label, x, form, got, ref, dst_init=None, row_map=N
 
 # ----------------------------------------------------------------------------------------------------------------
 # On SM100 / SM103 / SM107
+
+
+def test_the_plan_kernel_writes_the_pytorch_tables(device) -> None:
+    """``bwd_plan`` (one CTA) writes the integers of the PyTorch plan: random layouts with empty and one-row segments,
+    more segments than the CTA has threads, the pair bound at the kernel's limit, and the PyTorch fallback past it."""
+    rng = random.Random(7076)
+    layouts = []
+    for _ in range(40):
+        n = rng.randint(1, 24)
+        q_lens = [
+            rng.choice((0, 1, rng.randint(1, 600), rng.randint(1, 5000)))
+            for _ in range(n)
+        ]
+        k_lens = [rng.choice((0, q, q + rng.randint(0, 9000))) for q in q_lens]
+        layouts.append((q_lens, k_lens))
+    many = [rng.randint(0, 300) for _ in range(1100)]
+    layouts.append((many, [q + rng.randint(0, 200) for q in many]))
+    for extra in (0, 1):
+        q = 2 * cake_jit.BWD_TILE_ROWS * (cake_jit.PLAN_MAX_PAIRS - 1 + extra)
+        assert cake_jit.pair_bound(q, 1) == cake_jit.PLAN_MAX_PAIRS + extra
+        layouts.append(([q], [q]))
+    for trial, (q_lens, k_lens) in enumerate(layouts):
+        total_q, total_k = sum(q_lens), sum(k_lens)
+        blocks = cake_jit.key_blocks(total_k, max(k_lens))
+        dims = {
+            "total_q": total_q,
+            "total_k": total_k,
+            "num_heads_q": 8,
+            "num_heads_kv": 2,
+            "num_segments": len(q_lens),
+        }
+        cu_q = torch.tensor(_cu(q_lens), dtype=torch.int32)
+        cu_k = torch.tensor(_cu(k_lens), dtype=torch.int32)
+        got = cake_backend._plan_tables(
+            cu_q.to(device), cu_k.to(device), blocks, total_q, dims, device.index
+        )
+        want = cake_backend._tile_plan(cu_q, cu_k, blocks, total_q)
+        for name, g, w in zip(
+            ("tile_base", "pair_base", "pair_order"), got, want, strict=True
+        ):
+            assert g.dtype == torch.int32 and g.device == device, (trial, name)
+            assert torch.equal(g.cpu(), w), (trial, name)
 
 
 @pytest.mark.parametrize("form", DKV_FORMS)

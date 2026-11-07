@@ -58,6 +58,7 @@ MANIFEST = "build.json"
 STAGES = (
     "fwd",
     "bwd_pre",
+    "bwd_plan",
     "bwd_main_fp32",
     "bwd_main_bf16",
     "bwd_dk_fp32",
@@ -129,6 +130,33 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "library": "cake_gqa_det_train_a91752e8a2732bf2e246",
         "stage": "bwd_pre",
+    },
+    "bwd_plan": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "cu_seqlens_q"],
+            ["buffer", "cu_seqlens_k"],
+            ["buffer", "tile_base"],
+            ["buffer", "pair_base"],
+            ["buffer", "pair_order"],
+            ["parameter", "num_segments"],
+            ["parameter", "key_blocks"],
+            ["parameter", "pair_bound"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "kernel_symbol": "kernel_cake_gqa_det_train_00000000000000000000",
+        "launch": {
+            "block": (1024, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_gqa_det_train_00000000000000000000",
+        "stage": "bwd_plan",
     },
     "bwd_main_fp32": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
@@ -389,6 +417,10 @@ DS_TILE_BYTES = 32768
 DS_TILE_LINES = 256
 # Row-map fold: one warp per (window row, key head), eight per CTA.
 FOLD_ITEMS_PER_CTA = 8
+# The tile tables (``bwd_plan``): one CTA; it keeps one count per Q-tile pair
+# position in shared memory, so a call with more positions than this builds
+# the tables with PyTorch ops instead.
+PLAN_MAX_PAIRS = 16384
 # Pack-2 scratch: scratch head ``s`` holds query heads ``2 s`` and ``2 s + 1``;
 # every segment starts on a 128-row tile.  The preprocess runs one CTA per 32
 # packed rows of one scratch head, the postprocess one per 64 (each program's
@@ -448,6 +480,12 @@ def key_blocks(total_k: int, max_seqlen_k: Optional[int]) -> int:
     longest = total_k if max_seqlen_k is None else min(int(max_seqlen_k), total_k)
     blocks = max(1, -(-longest // BWD_TILE_KEYS))
     return blocks + (blocks & 1)
+
+
+def pair_bound(total_q: int, num_segments: int) -> int:
+    """A bound on the Q-tile pairs (128 query rows of one segment) of a call: ``sum_b ceil(q_b / 128) <= ceil(T_q /
+    128) + B``; the length of the dQ GEMM's work order."""
+    return -(-total_q // (2 * BWD_TILE_ROWS)) + num_segments
 
 
 def tiles_per_key_block(total_q: int, num_segments: int) -> int:
@@ -514,6 +552,8 @@ def grid(
         tiles = num_heads_q * (total_q // FWD_TILE_ROWS + num_segments)
         pairs = max(1, min(sm_count // FWD_CLUSTER, tiles))
         return (FWD_CLUSTER * pairs, 1, 1)
+    if stage == "bwd_plan":
+        return (1, 1, 1)
     if stage in ("bwd_pre", "bwd_post"):
         rows = rows_pad(total_q, num_segments)
         per_cta = PRE_ROWS_PER_CTA if stage == "bwd_pre" else POST_ROWS_PER_CTA
@@ -523,8 +563,11 @@ def grid(
     if stage in ("bwd_dk_fp32", "bwd_dk_bf16"):
         return (BWD_CLUSTER * (-(-chunk_blocks // 2)), chunk_heads, num_segments)
     if stage == "bwd_dq":
-        tile_pairs = -(-total_q // (2 * BWD_TILE_ROWS)) + num_segments
-        items = tile_pairs * chunk_heads * (num_heads_q // num_heads_kv // 2)
+        items = (
+            pair_bound(total_q, num_segments)
+            * chunk_heads
+            * (num_heads_q // num_heads_kv // 2)
+        )
         return (BWD_CLUSTER * max(1, min(sm_count // BWD_CLUSTER, items)), 1, 1)
     if stage == "bwd_fold":
         return (-(-total_k * num_heads_kv // FOLD_ITEMS_PER_CTA), 1, 1)
@@ -556,6 +599,7 @@ __all__ = [
     "MANIFEST",
     "MODULES",
     "PACKAGE",
+    "PLAN_MAX_PAIRS",
     "POST_ROWS_PER_CTA",
     "PRE_ROWS_PER_CTA",
     "SCRATCH_ALIGN",
@@ -564,6 +608,7 @@ __all__ = [
     "chunk_plan",
     "grid",
     "key_blocks",
+    "pair_bound",
     "rows_pad",
     "scratch_bytes",
     "scratch_layout",
