@@ -26,13 +26,15 @@ deterministic package's determinism suite (seeded fixed inputs per case):
   (it runs where the deterministic package launches its wide tile);
 * the non-deterministic weight gradient, launched ``REPEATS`` times into an
   output filled with zero bytes and ``REPEATS`` times into one filled with
-  ``FILL_BYTE``, stays within the deterministic package's budget of the
-  deterministic weight gradient on every launch, and of its own first launch;
-  the worst run-to-run variation is reported (``REPRO`` lines);
+  ``FILL_BYTE`` (the split-tail slots poisoned with ``FILL_BYTE`` before every
+  launch), gives the bits of its own first launch every time and stays within
+  the deterministic package's budget of the deterministic weight gradient; a
+  case without a split one-launch tail gives the deterministic bits (``REPRO``
+  lines report the comparison);
 * with the tail split switched off in both packages, the 512-wide k tile's
-  unordered-tail builds give the deterministic builds' bits (every whole tile is
-  reduced in the deterministic order);
-* the cases reach the unordered split tail on this device for both output dtypes;
+  ordered one-launch tail builds give the deterministic builds' bits (every
+  whole tile is reduced in the deterministic order);
+* the cases reach the ordered split tail on this device for both output dtypes;
 * row-padded ``g`` and ``x`` on the shape of the 256-wide k tile's ``main_wave``
   weight gradient give the deterministic package's bits.
 
@@ -325,6 +327,14 @@ def _bits(out):
     return out.view(INT_VIEW[out.dtype])
 
 
+def _poison_tail_sums(device):
+    """Fill the split-tail slots kept for the current stream with ``FILL_BYTE`` bytes (they
+    have no rest state: the ordered builds overwrite every slot they read)."""
+    buffer = cb.stream_workspace("tail_sums", device)
+    if buffer is not None:
+        buffer.view(torch.uint8).fill_(FILL_BYTE)
+
+
 def _budget(out, ref, out_dtype):
     """Error of ``out`` against ``ref`` in the budget's unit: the worst
     ``|out - ref| / (atol + rtol |ref|)`` for bf16 (<= 1 passes), the rel-L2 over
@@ -347,6 +357,7 @@ def _plan_record(launch):
         "num_tail",
         "tail_splits",
         "unordered_tail",
+        "ordered_tail",
         "raster_rows",
         "wave_mode",
         "launches",
@@ -377,9 +388,9 @@ def _own_stage(case, name, arch):
 # ---------------------------------------------------------------------------
 
 
-def _unordered_plan(arg_plan):
+def _one_launch_plan(arg_plan):
     """The deterministic argument plan of a k512 program with its fp32 partials replaced
-    by the split tail's sums and tickets."""
+    by the one-launch split tail's slots and tickets."""
     out = []
     for item in arg_plan:
         if tuple(item) == ("buffer", "partials"):
@@ -394,9 +405,9 @@ def test_routes_mirror_the_deterministic_package():
     over the same architectures and, per architecture, the same stages bound to
     programs with the same launch shape.  The fwd, dgrad and 256-wide k tile programs
     take the deterministic argument plans; on the architectures of
-    ``unordered_tail_archs`` the 512-wide k tile's take the split tail's ``tail_sums``
-    and ``tail_tickets`` in place of the partials, and those routes serve no
-    ``tail_reduce`` stage there.  A program may also take the row bases of ``A`` / ``B``
+    ``ordered_tail_archs`` (every architecture of the k512 routes) the 512-wide k
+    tile's take the one-launch split tail's ``tail_sums`` slots and ``tail_tickets`` in
+    place of the partials, and those routes serve no ``tail_reduce`` stage there.  A program may also take the row bases of ``A`` / ``B``
     (``cake_backend.ROW_BASES``: the same tensors again), which a deterministic build
     of an older kernel does not.  A wave-synchronised stage may be missing on an
     architecture whose host plan never selects it (not in ``wave_sync_archs`` for the
@@ -422,9 +433,12 @@ def test_routes_mirror_the_deterministic_package():
         assert route["op"] == det_route["op"]
         assert route["arches"] == det_route["arches"]
         for arch in route["arches"]:
-            unordered = cb.wgrad_unordered_tail(
-                512 if name.endswith("_k512") else 256, arch, HOST_PLAN_CONSTANTS
-            )
+            tile_k = 512 if name.endswith("_k512") else 256
+            one_launch = cb.wgrad_ordered_tail(
+                tile_k, arch, HOST_PLAN_CONSTANTS
+            ) or cb.wgrad_unordered_tail(tile_k, arch, HOST_PLAN_CONSTANTS)
+            if route["op"] == "wgrad":
+                assert one_launch == (tile_k == 512), (name, arch)
             det_stages = {
                 s["name"]
                 for s in det_route["stages"]
@@ -471,7 +485,7 @@ def test_routes_mirror_the_deterministic_package():
                     )
                     not in det_programs
                 )
-            expected_stages = det_stages - {"tail_reduce"} if unordered else det_stages
+            expected_stages = det_stages - {"tail_reduce"} if one_launch else det_stages
             unselected = set()
             if route["op"] == "wgrad":
                 tile_k = 512 if name.endswith("_k512") else 256
@@ -492,8 +506,8 @@ def test_routes_mirror_the_deterministic_package():
                 assert program["launch"] == det_program["launch"], (name, stage, arch)
                 assert program["ffi_entry"] == det_program["ffi_entry"]
                 expected = (
-                    _unordered_plan(det_program["arg_plan"])
-                    if unordered
+                    _one_launch_plan(det_program["arg_plan"])
+                    if one_launch
                     else [tuple(i) for i in det_program["arg_plan"]]
                 )
                 row_bases = {("buffer", rows) for rows in cb.ROW_BASES}
@@ -571,6 +585,7 @@ def test_against_the_deterministic_package(label, record_property):
     worst_elems = 0
     for fill in (0, FILL_BYTE):
         for _ in range(case.repeats):
+            _poison_tail_sums(device)
             out.view(torch.uint8).fill_(fill)
             launch.launch()
             launches += 1
@@ -600,16 +615,22 @@ def test_against_the_deterministic_package(label, record_property):
         launches_differing_from_det=differ_from_det,
         worst_vs_det_budget=worst_vs_det,
         exercised=bool(
-            launch.plan["unordered_tail"] and launch.plan["tail_splits"] > 1
+            (launch.plan["ordered_tail"] or launch.plan["unordered_tail"])
+            and launch.plan["tail_splits"] > 1
         ),
+        order_varying=launch.order_varying,
     )
     print("REPRO " + json.dumps(record, sort_keys=True))
     record_property("repro", json.dumps(record, sort_keys=True))
+    assert not launch.order_varying, record
+    # Every launch gives the bits of the first, whatever the output and the slots held.
+    assert mismatches == 0 and worst_vs_first == 0.0, record
     if not record["exercised"]:
-        # No split unordered tail: the deterministic programs' order, the same bits.
-        assert mismatches == 0 and differ_from_det == 0, record
+        # No split one-launch tail: the deterministic programs' order, the same bits.
+        assert differ_from_det == 0, record
+    # A split tail's bits may differ from the deterministic package's (another tail
+    # plan and group order), within its budget.
     assert worst_vs_det <= 1.0, record
-    assert worst_vs_first <= 1.0, record
 
 
 @pytest.mark.parametrize("label,sizes,n,k", EF_CASES, ids=[c[0] for c in EF_CASES])
@@ -702,8 +723,9 @@ def test_dgrad_evict_first_gives_the_deterministic_bits(
 @pytest.mark.parametrize("label", K512_LABELS)
 def test_unsplit_k512_builds_give_the_deterministic_bits(label, monkeypatch):
     """With the tail split switched off in both packages (``max_splits`` 1), a weight
-    gradient on the 512-wide k tile runs every tile whole in both, and the unordered-tail
-    build gives the deterministic build's bits for every form the case selects."""
+    gradient on the 512-wide k tile runs every tile whole in both, and the ordered
+    one-launch tail build gives the deterministic build's bits for every form the case
+    selects."""
     case = CASE_BY_LABEL[label]
     device = _device()
     _require_programs(case, device)
@@ -764,10 +786,10 @@ def test_row_padded_wgrad_gives_the_deterministic_bits(out_dtype):
     assert torch.equal(_bits(out), _bits(det_out))
 
 
-def test_cases_exercise_the_unordered_tail(record_property):
-    """The cases reach, on this device, the 512-wide k tile's unordered split tail
-    (``unordered_tail`` and ``tail_splits > 1``) for both output dtypes, and the
-    256-wide k tile with its ordered tail reduce."""
+def test_cases_exercise_the_ordered_tail(record_property):
+    """The cases reach, on this device, the 512-wide k tile's ordered one-launch split
+    tail (``ordered_tail`` and ``tail_splits > 1``) for both output dtypes, and the
+    256-wide k tile with its two-launch tail reduce."""
     device = _device()
     arch = cb.arch_for(device)
     seen = {}
@@ -785,17 +807,19 @@ def test_cases_exercise_the_unordered_tail(record_property):
             str(case.out_dtype).replace("torch.", ""),
             plan["tile_k"],
             "+".join(launch.stages),
-            bool(plan["unordered_tail"] and plan["tail_splits"] > 1),
+            bool(plan["ordered_tail"] and plan["tail_splits"] > 1),
         )
+        assert not plan["unordered_tail"], (case.label, plan)
         seen.setdefault(key, []).append(case.label)
         del a, b, offs, launch
     rows = sorted([*key, len(labels)] for key, labels in seen.items())
     record_property("coverage", json.dumps(dict(arch=arch, rows=rows)))
     print("COVERAGE " + json.dumps(dict(arch=arch, rows=rows)))
+    assert cb.wgrad_ordered_tail(512, arch), arch
     for dtype in ("bfloat16", "float32"):
-        assert not cb.wgrad_unordered_tail(512, arch) or any(
-            key[0] == dtype and key[1] == 512 and key[3] for key in seen
-        ), f"no case splits the unordered {dtype} tail on {arch}"
+        assert any(key[0] == dtype and key[1] == 512 and key[3] for key in seen), (
+            f"no case splits the ordered {dtype} tail on {arch}"
+        )
         assert any(
             key[0] == dtype and key[1] == 256 and key[2].endswith("+tail_reduce")
             for key in seen
