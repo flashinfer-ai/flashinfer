@@ -962,7 +962,7 @@ def test_main_grid_literal_table() -> None:
         loader.main_grid(304, arch="sm_103a", grid_mult=0)
 
 
-# The default backward route's program per ``(arch, S, C)`` below C = 512
+# The default backward route's program per ``(arch, S, C)`` up to C = 1024
 # (``cake_jit.selected_modules``): the ``stage_pair`` fallback of each arch,
 # except for 264 <= C < 512, where its ``straddle_rows`` build (the row-group
 # program) runs, and on sm_107a for 256 <= C < 264 from S = 262144 tokens,
@@ -974,6 +974,11 @@ def test_main_grid_literal_table() -> None:
 # 264 <= C < 296 and 344 <= C < 416 from S = 32768.  The rows are
 # the kernel module's rules-test rows on both sides of the token and channel
 # boundaries; C = 512 is the first channel-selected program of every arch.
+# From C = 512: sm_100a runs the eight-token-stage program, sm_103a the
+# fold-overlap program below 768 and the eight-token-stage program from 768,
+# sm_107a the fold-overlap program below 520, its fallback's build under the
+# 520 channel band's own name for 520 <= C < 1024, and the eight-token-stage
+# program from 1024.
 BWD_FALLBACK = {
     "sm_100a": "cake_causal_conv1d_det_train_9bfa65707a49df6a48ce",
     "sm_103a": "cake_causal_conv1d_det_train_9bfa65707a49df6a48ce",
@@ -998,6 +1003,10 @@ BWD_AT_512 = {
     "sm_103a": "cake_causal_conv1d_det_train_d46036aa2bc5f90bb0f6",
     "sm_107a": "cake_causal_conv1d_det_train_d46036aa2bc5f90bb0f6",
 }
+BWD_STAGE8 = "cake_causal_conv1d_det_train_37e428406a0cc4a8ca1b"
+# arch -> the channel count from which the eight-token-stage program runs.
+BWD_STAGE8_FROM = {"sm_100a": 512, "sm_103a": 768, "sm_107a": 1024}
+BWD_C520_R200 = "cake_causal_conv1d_det_train_0d99ef0e0ed10b11dfd5"
 BWD_SELECTION_TOKENS = (
     12287,
     12288,
@@ -1015,6 +1024,7 @@ BWD_SELECTION_TOKENS = (
 BWD_SELECTION_CHANNELS = (
     *(128, 248, 255, 256, 264, 272, 280, 288, 296, 336, 344, 384, 408, 416),
     *(432, 440, 464, 472, 480, 504, 511, 512),
+    *(516, 519, 520, 640, 760, 767, 768, 1016, 1023, 1024),
 )
 
 
@@ -1024,6 +1034,10 @@ def _sm_cta_band(arch: str, C: int) -> bool:
 
 
 def _bwd_selection_of_record(arch: str, S: int, C: int) -> str:
+    if C >= BWD_STAGE8_FROM[arch]:
+        return BWD_STAGE8
+    if arch == "sm_107a" and C >= 520:
+        return BWD_C520_R200
     if C >= 512:
         return BWD_AT_512[arch]
     if _sm_cta_band(arch, C):
@@ -1040,10 +1054,12 @@ def _bwd_selection_of_record(arch: str, S: int, C: int) -> str:
 
 
 def test_backward_selection_literal_table() -> None:
-    """The default backward route's program below C = 512 against the literal
+    """The default backward route's program up to C = 1024 against the literal
     table, per arch, S and C; a token floor needs S (``ValueError`` without
     it, on sm_107a for 256 <= C < 264 and on the SM-wide row-group program's
-    channel bands), and no other route has one."""
+    channel bands), and no other route has one.  The sm_107a 520 band's
+    record is the fallback's build under its own name: the same knobs plus
+    ``c_band``, the same launch, grid, workspace, arguments and reduce."""
 
     rule = loader.select_rule(loader.MODULES[BWD_R200_ST4])
     assert rule == {
@@ -1069,6 +1085,11 @@ def test_backward_selection_literal_table() -> None:
         "kind": "channels_at_least",
     }
     assert loader.MODULES[BWD_ROW_GROUP_R200]["arches"] == ["sm_107a"]
+    band, fallback = (loader.MODULES[n] for n in (BWD_C520_R200, BWD_FALLBACK["sm_107a"]))
+    assert loader.select_rule(band) == {"channels": {"sm_107a": 520}, "kind": "channels_at_least"}
+    assert band["arches"] == fallback["arches"] == ["sm_107a"]
+    for key in ("launch", "grid_rule", "workspace_rule", "arg_plan", "logical", "reduce"):
+        assert band[key] == fallback[key], key
     for arch in loader.ARCHES:
         for S in BWD_SELECTION_TOKENS:
             for C in BWD_SELECTION_CHANNELS:
