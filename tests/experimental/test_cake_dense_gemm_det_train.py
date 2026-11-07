@@ -744,9 +744,14 @@ def _assert_mirrors_cake(plan, cake_template, where, arch, rule=None):
     the Cake host JIT-compiles) the FlashInfer planner must have fallen back onto a generated program.  A rule that
     pins ``htail`` names its ``_ht`` program on every device and T (``_rule_program``); a rule of record that carries
     the eight-warp CTA form names its eight-warp program (``_eight_warp_program``: the launcher's plans carry no
-    ``form``)."""
-    cake_template = _rule_program(cake_template, rule)
-    cake_template = _eight_warp_program(cake_template, plan, arch)
+    ``form``).  Where the launcher swapped such a row (the batched small-M swap on a tiny T: a transposed template),
+    the eight-warp program serves only the caller's orientation, so the planner drops the swap and keeps the rule
+    (``plan.swap_fallback``, the planner's first fallback)."""
+    launcher_template = _rule_program(cake_template, rule)
+    cake_template = _eight_warp_program(launcher_template, plan, arch)
+    swap_dropped = cake_template != launcher_template and _transposed_template(
+        _nopro(launcher_template)
+    )
     registered = _registered(arch)
     assert registered <= EXPORTED_TEMPLATES, (
         arch,
@@ -756,9 +761,8 @@ def _assert_mirrors_cake(plan, cake_template, where, arch, rule=None):
         arch, cake_template, plan
     ):
         assert plan.template == cake_template, (*where, plan.template)
-        assert not (plan.swap_fallback or plan.rule_fallback or plan.knob_fallback), (
-            where
-        )
+        assert plan.swap_fallback == swap_dropped, (*where, swap_dropped)
+        assert not (plan.rule_fallback or plan.knob_fallback), where
     else:
         assert plan.swap_fallback or plan.rule_fallback or plan.knob_fallback, (
             *where,
@@ -3278,7 +3282,7 @@ def test_round27_stt_knob(T):
 
 
 @pytest.mark.parametrize("T", [16172, 16231])
-def test_round33_rules_plan_like_the_cake_launcher(T):
+def test_round33_rules_plan_like_the_cake_launcher(T, monkeypatch):
     # the round-33 rule changes (Cake 8b34a0b1725): an architecture-wide default under every rule (ARCH_RULE_DEFAULTS: the pair prologue /
     # cleanup sync form ``pro`` 7 on sm_100a and sm_107a - instance-key field 32, symbol ``_pro{n}``), six keys inserted (pro 15 rows: the
     # indexer_q forward / input gradient bf16 on both architectures, the sm_107a indexer_k forward bf16 and q_b weight gradient bf16),
@@ -3553,7 +3557,8 @@ def test_round33_rules_plan_like_the_cake_launcher(T):
     assert (
         p107.template == "dense_proj_det_gemm_kk_n256_pro15"
     )  # ROUTE_TEMPLATE_NEW of the templates step (predicted kk_n256_pro15)
-    # the shared_down input gradient bf16: sm_100a pins pro 0 (the round-27 program, no suffix), sm_107a has no rule (the default pro 7)
+    # the shared_down input gradient bf16: sm_100a pins pro 0 (the round-27 program, no suffix); sm_107a had no rule (the
+    # default pro 7) until the 212-SM tranche, whose rule plans the column-grouped pro-15 program (restated below)
     s = _views("proj", "shared_down", "dgrad", "bf16", T)
     ps, *_ = cake_dense_gemm_det_train_projection_plan(s["A"], s["B"], s["out"], **kw)
     assert (
@@ -3562,7 +3567,14 @@ def test_round33_rules_plan_like_the_cake_launcher(T):
     ps107, *_ = cake_dense_gemm_det_train_projection_plan(
         s["A"], s["B"], s["out"], **kw107
     )
+    assert ps107.pro == 15 and ps107.cgrp and ps107.template.endswith("_cg_pro15")
+    sdk107 = ("sm_107a", False, True, False, False, False, 2048, 6144, None)
+    monkeypatch.delitem(ROW_RULES, sdk107)
+    ps107, *_ = cake_dense_gemm_det_train_projection_plan(
+        s["A"], s["B"], s["out"], **kw107
+    )
     assert ps107.pro == 7 and ps107.template.endswith("_pro7")
+    monkeypatch.undo()
     # the q_b weight gradient fp32-out on sm_107a: pro 15 on the register epilogue with the 256-bit stores (the round-27 knobs)
     w = _views("proj", "q_b", "wgrad", "f32", T)
     pw, *_ = cake_dense_gemm_det_train_projection_plan(
