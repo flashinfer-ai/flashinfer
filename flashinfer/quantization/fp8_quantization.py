@@ -1,4 +1,5 @@
 import functools
+import math
 from types import SimpleNamespace
 from typing import Dict, Literal, Optional, Tuple
 
@@ -160,6 +161,22 @@ def _compute_swizzled_layout_sf_size(total_row, total_column, row_size=128):
     padded_row = (total_row + row_size - 1) // row_size * row_size
     padded_column = (total_column + 3) // 4 * 4
     return padded_row * padded_column
+
+
+def _mxfp8_sf_row_block(sf_swizzle_layout: SfLayout) -> int:
+    if sf_swizzle_layout == SfLayout.layout_128x4:
+        return 128
+    if sf_swizzle_layout == SfLayout.layout_8x4:
+        return 8
+    return 1
+
+
+def _mxfp8_sf_shape_2d(m, k, sf_swizzle_layout, alignment=32):
+    """``[rows, cols]`` of the scale buffer for one ``[m, k]`` matrix; a view of the flat buffer."""
+    cols = _round_up(k, alignment) // 32
+    if sf_swizzle_layout == SfLayout.layout_linear:
+        return (m, cols)
+    return (_round_up(m, _mxfp8_sf_row_block(sf_swizzle_layout)), _round_up(cols, 4))
 
 
 @functools.cache
@@ -364,6 +381,7 @@ def mxfp8_quantize(
     enable_pdl: Optional[bool] = None,
     backend: Literal["auto", "cuda", "cute-dsl"] = "auto",
     sf_swizzle_layout: Optional[SfLayout] = None,
+    rank_preserving: bool = False,
     *,
     batch_invariant: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -378,7 +396,8 @@ def mxfp8_quantize(
     input : torch.Tensor
         Input tensor of shape ``[M, K]`` with dtype fp16/bf16/fp8_quantized.
         The ``"cute-dsl"`` backend additionally supports fp32 input; the
-        ``"cuda"`` backend does not.
+        ``"cuda"`` backend does not.  Any leading dimensions are folded into
+        ``M`` (see Notes).
     is_sf_swizzled_layout : bool
         Whether to use the swizzled layout for scale factors.  Defaults to
         ``True``.
@@ -397,6 +416,20 @@ def mxfp8_quantize(
     sf_swizzle_layout : SfLayout, optional
         Swizzle layout for scale factors; when supplied this overrides
         ``is_sf_swizzled_layout``.
+    rank_preserving : bool
+        Scale-factor shape convention.  Defaults to ``False``.
+
+        - ``False``: ``sf`` is a flat 1D buffer whatever the input rank.  A
+          batched ``[B, M, K]`` input is quantized as ``[B * M, K]``, so the
+          swizzle padding is applied once to the folded ``B * M`` rows.
+        - ``True``: the rank of ``sf`` mirrors the input.  A 2D ``[M, K]``
+          input returns ``[round_up(M, R), round_up(K / 32, 4)]`` (the 2D
+          convention :func:`nvfp4_quantize` uses) and a ``[B, M, K]`` input
+          returns ``[B, round_up(M, R), round_up(K / 32, 4)]``, padded
+          **per batch**: ``sf[i]`` is exactly the scale buffer of
+          ``input[i]``.  The per-batch form is the layout batched consumers
+          such as :func:`flashinfer.gemm.bmm_mxfp8` read.  Only
+          ``backend="cuda"`` supports it.
     batch_invariant : bool
         ``True`` runs the batch-invariant MXFP8 quantization class in place
         of the backends (requires ``backend="auto"``): a row's bits depend on
@@ -412,15 +445,46 @@ def mxfp8_quantize(
     -------
     Tuple[torch.Tensor, torch.Tensor]
         ``(x_q, sf)`` where ``x_q`` has shape ``[M, K]`` with dtype
-        ``FLOAT8_E4M3`` and ``sf`` is the scale-factor tensor whose
-        shape depends on the chosen layout and ``sf_vec_size`` (fixed at
-        ``32`` here).
+        ``FLOAT8_E4M3`` and ``sf`` holds ``uint8`` (E8M0) scales, one per
+        32 elements along ``K``.  With ``rank_preserving=False`` it is a
+        flat 1D tensor: for the swizzled layouts its length is
+        ``round_up(M, R) * round_up(K / 32, 4)`` with ``R = 128`` for
+        ``layout_128x4`` and ``R = 8`` for ``layout_8x4``; for
+        ``layout_linear`` it is ``M * K / 32`` in row-major order with no
+        padding.  With ``rank_preserving=True`` it has the 2D or per-batch
+        3D shape described under ``rank_preserving``.
 
     Warnings
     --------
     The ``"cute-dsl"`` backend is **experimental** and not part of the
     stable API.  It may change or be removed in future versions without
     notice.
+
+    Notes
+    -----
+    Scale-factor layout convention: by default ``sf`` is 1D whatever the
+    input rank.  An input with more than two dimensions is quantized as
+    ``[prod(leading dims), K]``, so the leading dimensions are folded into
+    the row dimension and the swizzle padding is applied once to the folded
+    row count, not to each batch.  A batched ``[B, M, K]`` input therefore
+    yields ``round_up(B * M, R) * round_up(K / 32, 4)`` scales, not
+    ``B * round_up(M, R) * round_up(K / 32, 4)``; the two agree only when
+    ``M`` is a multiple of ``R``.  The 2D view of a swizzled buffer is
+    ``sf.view(round_up(M, R), round_up(K / 32, 4))``.
+
+    :func:`flashinfer.gemm.bmm_mxfp8` reads one swizzled block per batch,
+    ``[B, round_up(M, 128), round_up(K / 32, 4)]``, which is what
+    ``rank_preserving=True`` returns for a 3D input; the folded 1D buffer
+    only matches it when ``M % 128 == 0``.
+
+    The per-batch ``[B, round_up(M, R), round_up(K / vec, 4)]`` shape, with
+    ``vec`` the block size (32 here, ``sf_vec_size`` for the NVFP4
+    quantizers), is the block-scale layout convention shared with
+    :func:`nvfp4_batched_quantize`.  The MoE weight-refit layout contract
+    refers to this convention: a refit path that ships quantized expert
+    weights with their block scales describes the scales in this form,
+    one padded swizzled block per expert or batch, instead of defining a
+    padding rule of its own.
     """
     sf_vec_size = 32
 
@@ -429,6 +493,10 @@ def mxfp8_quantize(
             SfLayout.layout_128x4 if is_sf_swizzled_layout else SfLayout.layout_linear
         )
     if batch_invariant:
+        if rank_preserving:
+            raise NotImplementedError(
+                "mxfp8_quantize: rank_preserving=True is not supported with batch_invariant=True."
+            )
         if backend != "auto":
             raise ValueError(
                 "mxfp8_quantize: batch_invariant=True requires backend='auto' "
@@ -448,6 +516,16 @@ def mxfp8_quantize(
     )
     if backend == "auto":
         backend = "cuda"
+
+    if rank_preserving and backend != "cuda":
+        raise NotImplementedError(
+            "rank_preserving=True is only supported with backend='cuda'."
+        )
+
+    if rank_preserving and input.dim() >= 3:
+        return _mxfp8_quantize_per_batch(
+            input, sf_swizzle_layout, alignment, enable_pdl
+        )
 
     if backend == "cute-dsl":
         from ..cute_dsl import is_cute_dsl_available
@@ -479,7 +557,46 @@ def mxfp8_quantize(
             alignment,
             enable_pdl,
         )
+        if rank_preserving:
+            sf = sf.view(
+                _mxfp8_sf_shape_2d(
+                    input.shape[0], input.shape[1], sf_swizzle_layout, alignment
+                )
+            )
         return x_q, sf
+
+
+def _mxfp8_quantize_per_batch(
+    input: torch.Tensor,
+    sf_swizzle_layout: SfLayout,
+    alignment: int,
+    enable_pdl: Optional[bool],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """``[*, M, K]`` input to ``[*, M, K_pad]`` codes and ``[*, M_pad, cols]`` scales, padded per batch."""
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(input.device)
+    *batch_dims, m, k = input.shape
+    bsz = math.prod(batch_dims)
+    m_pad, cols = _mxfp8_sf_shape_2d(m, k, sf_swizzle_layout, alignment)
+    quantize = get_mxfp8_quantization_sm100_module().mxfp8_quantize_sm100
+    if m % _mxfp8_sf_row_block(sf_swizzle_layout) == 0:
+        # The folded buffer is already per-batch separable: one launch, then a view.
+        x_q, sf = quantize(
+            input.reshape(bsz * m, k), sf_swizzle_layout, alignment, enable_pdl
+        )
+        x_q = x_q.view(*batch_dims, m, x_q.shape[-1])
+    else:
+        flat_in = input.reshape(bsz, m, k)
+        qs, sfs = [], []
+        for i in range(bsz):
+            q_i, sf_i = quantize(
+                flat_in[i].contiguous(), sf_swizzle_layout, alignment, enable_pdl
+            )
+            qs.append(q_i)
+            sfs.append(sf_i)
+        x_q = torch.stack(qs, 0).view(*batch_dims, m, qs[0].shape[-1])
+        sf = torch.stack(sfs, 0)
+    return x_q, sf.view(*batch_dims, m_pad, cols)
 
 
 @functools.cache

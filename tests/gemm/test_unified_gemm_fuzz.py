@@ -43,7 +43,8 @@ STATUS: framework + 7 grounded adapters (bf16 mm+bmm / fp8 bmm incl e4m3+e5m2 / 
 mxfp8 mm+bmm) + a standalone quantize-root fuzzer. This file REPLACES the earlier per-op
 ``test_mm_fp4_fuzz.py`` / ``test_bmm_fp8_fuzz.py`` (their logic + the #2440 quantize test are folded
 in here). Validated on A100/SM80, L40S/SM89, H100/SM90, B200/SM100. The mxfp8 adapters surfaced two
-real cuDNN findings (a ``_KNOWN_FAILURES`` ledger entry + the ``min_dim`` note record them). EXTEND
+real cuDNN findings (the ``min_dim`` note records one; the #3604 b>1 scale-layout finding is fixed by
+the per-batch scale in ``_mxfp8_quantize_bmm_operand`` and its ``_KNOWN_FAILURES`` entry is gone). EXTEND
 by folding in more adapters one ``GemmAdapter`` at a time: mm_fp8 (low-latency decode-shape regime,
 needs ``prepare_low_latency_gemm_weights``) and the grouped ``group_*`` / ``*deepgemm*`` entries
 (m_indptr op-shape).
@@ -280,16 +281,19 @@ def _run_mm_mxfp8(a, b, out, backend, cfg):
         out.copy_(res)
 
 
+def _mxfp8_quantize_bmm_operand(x):
+    # Per-batch [b, rows_pad, k_pad] scale; the folded 1D layout is only valid when rows % 128 == 0 (#3604).
+    return mxfp8_quantize(x, True, rank_preserving=True)
+
+
 def _run_mxfp8_bmm(a, b, out, backend, cfg):
     # bmm_mxfp8: per-block(32) mxfp8. A=[B,M,K] row-major; the weight is quantized as the contiguous
     # [B,N,K] (blocked along K, like every other adapter) and passed as B = weight_q.transpose(-2,-1)
     # -> a COLUMN-major [B,K,N] VIEW (the kernel rejects a row-major/contiguous B). reference = a@b^T.
     # cudnn here drives the override-shape (dynamic-M) path -- the #3455 regression surface.
-    a_q, a_s = mxfp8_quantize(
-        a, True
-    )  # is_sf_swizzled_layout=True (values identical to linear)
-    b_q, b_s = mxfp8_quantize(
-        b, True
+    a_q, a_s = _mxfp8_quantize_bmm_operand(a)
+    b_q, b_s = _mxfp8_quantize_bmm_operand(
+        b
     )  # b is the [B,N,K] weight; do NOT .contiguous() the transpose
     bmm_mxfp8(a_q, b_q.transpose(-2, -1), a_s, b_s, out.dtype, out, backend=backend)
 
@@ -433,27 +437,10 @@ _CONVENTION_DIVERGENCES = [
 # Each entry is (predicate, reason, crash_capable). crash_capable=True entries are xfailed UP FRONT
 # (the kernel is never launched): the same root cause that yields garbage on one library stack can
 # be an out-of-bounds access on another, and one IMA poisons the CUDA context for every later test
-# in the session (seen live in CI, see the #3604 entry). crash_capable=False entries still RUN and
-# xfail only if an invariant actually fails -> they keep the xpass "fixed -> remove me" signal.
-_KNOWN_FAILURES = [
-    (
-        lambda cfg: cfg.adapter.key == "bmm_mxfp8" and cfg.b > 1 and (cfg.m % 128) != 0,
-        "TRACKED: flashinfer-ai/flashinfer#3604. "
-        "bmm_mxfp8 returns GARBAGE/inf for batch indices > 0 when b>1 AND M is not a multiple of 128 "
-        "(batch 0 is always correct; b==1 is correct for any M; b>1 with M%128==0 is correct). This is "
-        "BOTH-backend, not cuDNN-specific: verified on cuDNN/SM100 (9.23.0 AND 9.23.1) and CUTLASS/"
-        "SM120 (RTX 5080) -- identical fingerprint, 30 xfail / 0 xpass. Shared root cause: the default "
-        "mxfp8_quantize([b,m,k]) pads the FLATTENED b*m dim (round_up(b*m,128)), so the 128x4-swizzled "
-        "scale-factor tile interleaves batch boundaries and is not per-batch-separable; both the cuDNN "
-        "override-shape stride math and the CUTLASS kernel then index batch>0's scales wrong. The known "
-        "#3455 'b>1 SF-padding' follow-up; real fix = per-batch / rank_preserving 3D SF (#3457), which "
-        "is NOT in tree and is unfixed in 9.23.1. Keep this predicate arch/backend-agnostic. On the "
-        "cu129 CI stack this root cause escalates from garbage to an ILLEGAL MEMORY ACCESS (GB200, "
-        "b=16 m=7 n=512 k=2688). To probe fixed-ness, run the REPRO with this entry removed. "
-        "See HANDOFF_SM120_MXFP8_BMM_VERIFY.md.",
-        True,  # crash-capable: IMA'd on GB200/cu129
-    ),
-]
+# in the session (seen live in CI with the since-fixed #3604 bmm_mxfp8 entry). crash_capable=False
+# entries still RUN and xfail only if an invariant actually fails -> they keep the xpass
+# "fixed -> remove me" signal.
+_KNOWN_FAILURES = []
 
 
 def _known_failure(cfg: Cfg, crash_only: bool = False) -> Optional[str]:
