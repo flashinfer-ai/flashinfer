@@ -134,6 +134,7 @@ exclude = [
 "flashinfer.experimental.cake_msa_icp_indexer" = ["csrc/**", "build.json"]
 "flashinfer.experimental.deepgemm_batched_gemm" = ["csrc/**", "build.json", "DEEPGEMM_NOTICE.txt"]
 "flashinfer.experimental.deepgemm_mega_gate" = ["csrc/**", "build.json", "DEEPGEMM_NOTICE.txt"]
+"flashinfer.experimental.sm12x_mega_gate" = ["DEEPGEMM_NOTICE.txt"]
 # Generated sources and the build manifest (build.json) of the experimental exact-SM100a/SM103a Kimi-K3
 # attention-residual (AttnRes) backend; its cake_build loader compiles them on demand, prebuilt aot/ libraries never ship.
 "flashinfer.experimental.cake_kimi_k3_attn_res" = ["csrc/**", "build.json"]
