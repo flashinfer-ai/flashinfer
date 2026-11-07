@@ -125,8 +125,14 @@ def lse_reference(
         k: torch.tensor(out[k], dtype=torch.float64).to(torch.float32)
         for k in ("m", "s", "lse", "logp")
     }
-    res["probs"] = torch.stack(out["probs"])
-    res["logprobs"] = torch.stack(out["logprobs"])
+    res["probs"] = (
+        torch.stack(out["probs"]) if out["probs"] else torch.empty(0, N, dtype=x.dtype)
+    )
+    res["logprobs"] = (
+        torch.stack(out["logprobs"])
+        if out["logprobs"]
+        else torch.empty(0, N, dtype=torch.float32)
+    )
     return res
 
 
@@ -165,6 +171,9 @@ def exact_rows(
             if isinstance(temperature, torch.Tensor)
             else [fp32.to_f32(float(temperature))] * M
         )
+        if len(ts) == 1 and M != 1:
+            ts = ts * M
+        assert len(ts) == M, (len(ts), M)
     out: Dict[str, list] = {
         k: [] for k in ("m", "s", "lse", "logp", "probs", "logprobs")
     }
@@ -230,6 +239,12 @@ def exact_rows(
         k: torch.tensor(out[k], dtype=torch.float64).to(torch.float32)
         for k in ("m", "s", "lse", "logp")
     }
-    res["probs"] = torch.stack(out["probs"])
-    res["logprobs"] = torch.stack(out["logprobs"])
+    res["probs"] = (
+        torch.stack(out["probs"]) if out["probs"] else torch.empty(0, N, dtype=x.dtype)
+    )
+    res["logprobs"] = (
+        torch.stack(out["logprobs"])
+        if out["logprobs"]
+        else torch.empty(0, N, dtype=torch.float32)
+    )
     return res

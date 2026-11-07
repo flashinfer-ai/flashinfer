@@ -268,6 +268,18 @@ top_k_top_p_sampling_trace = TraceTemplate(
 # ── Free-function sampling utilities ─────────────────────────────────────────
 
 
+def _scaled_fp32_logits(logits, temperature):
+    """The fp32 logits scaled by the temperature as the batch-invariant class scales them (``x / T``)."""
+    x = logits.to(torch.float32)
+    if temperature is not None:
+        if isinstance(temperature, torch.Tensor):
+            t = temperature.to(torch.float32).reshape(-1, 1)
+        else:
+            t = float(temperature)
+        x = x / t
+    return x
+
+
 @torch.no_grad()
 def _softmax_reference(logits, temperature=None, **_unused):
     """Online safe softmax with optional temperature scaling."""
@@ -311,6 +323,14 @@ softmax_trace = TraceTemplate(
             optional=True,
             description="Per-tensor or per-row temperature.",
         ),
+        "out_dtype": Scalar(
+            "dtype",
+            optional=True,
+            description=(
+                "batch_invariant=True only: None keeps the input dtype; torch.float32 returns the fp32 "
+                "probabilities (the softmax_f32 template)."
+            ),
+        ),
     },
     outputs={
         "output": Tensor(["batch_size", "vocab_size"], dtype_from="logits"),
@@ -321,16 +341,71 @@ softmax_trace = TraceTemplate(
 )
 
 
-def _scaled_fp32_logits(logits, temperature):
-    """The fp32 logits scaled by the temperature as the batch-invariant class scales them (``x / T``)."""
-    x = logits.to(torch.float32)
-    if temperature is not None:
-        if isinstance(temperature, torch.Tensor):
-            t = temperature.to(torch.float32).reshape(-1, 1)
-        else:
-            t = float(temperature)
-        x = x / t
-    return x
+@torch.no_grad()
+def _softmax_f32_reference(logits, temperature=None, **_unused):
+    """Softmax of the temperature-scaled row in fp32 (``softmax(batch_invariant=True, out_dtype=torch.float32)``)."""
+    return torch.softmax(_scaled_fp32_logits(logits, temperature), dim=-1)
+
+
+def _softmax_f32_init(
+    *,
+    batch_size: int,
+    vocab_size: int = 32000,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.softmax(..., batch_invariant=True, out_dtype=torch.float32)``."""
+    torch.manual_seed(seed)
+    return {
+        "logits": make_logits(
+            batch_size, vocab_size, device=device, dtype=torch.bfloat16
+        ),
+        "temperature": 1.0,
+        "batch_invariant": True,
+        "out_dtype": torch.float32,
+    }
+
+
+softmax_f32_trace = TraceTemplate(
+    op_type="sampling",
+    name_prefix="softmax_f32",
+    description=(
+        "Batch-invariant softmax with optional temperature scaling returning fp32 probabilities "
+        "(softmax(batch_invariant=True, out_dtype=torch.float32): the fp32 input's class for a 16-bit input)."
+    ),
+    axes={
+        "batch_size": Var(),
+        "vocab_size": Const(abbrev="v"),
+    },
+    inputs={
+        "logits": Tensor(["batch_size", "vocab_size"]),
+        "temperature": Scalar(
+            "float32",
+            optional=True,
+            description="Per-tensor or per-row temperature.",
+        ),
+        "out_dtype": Scalar("dtype", description="torch.float32."),
+    },
+    outputs={
+        "output": Tensor(["batch_size", "vocab_size"], dtype="float32"),
+    },
+    tags=["status:verified"],
+    reference=_softmax_f32_reference,
+    init=_softmax_f32_init,
+)
+
+
+def softmax_trace_dispatch(**kwargs):
+    """``softmax`` returns the input dtype unless ``out_dtype=torch.float32`` (batch-invariant class only)."""
+    if kwargs.get("out_dtype") is torch.float32:
+        return softmax_f32_trace
+    return softmax_trace
+
+
+softmax_trace_dispatch.templates = (  # type: ignore[attr-defined]
+    softmax_trace,
+    softmax_f32_trace,
+)
 
 
 @torch.no_grad()

@@ -9,6 +9,21 @@ from tests.trace.reference_utils import (
 )
 
 
+def _class_runs_here() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    import flashinfer.batch_invariant as bi
+    from flashinfer.batch_invariant.sampling.api import LSE_ROW_ARCHS
+
+    return bi.is_supported_device(torch.device("cuda"), LSE_ROW_ARCHS)
+
+
+pytestmark = pytest.mark.skipif(
+    not _class_runs_here(),
+    reason="the batch-invariant sampling class runs on SM100 / SM103 / SM107 only",
+)
+
+
 @pytest.mark.parametrize(
     "shape_kwargs",
     [dict(batch_size=8, vocab_size=128), dict(batch_size=3, vocab_size=257)],

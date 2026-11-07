@@ -181,7 +181,7 @@ def test_every_placement_traces_to_the_canonical_trees(N):
 def test_dispatcher_picks_are_members_of_the_space():
     """R3 membership: every configuration the closed-form dispatcher returns, for both regimes, both output kinds,
     both element widths and the SM counts of the SM100 / SM103 / SM107 parts, is a member of the enumerated space."""
-    for N in (64, 1000, 4097, 32000, 152064):
+    for N in (64, 1000, 4097, 32000, 152064, 65537, 262145):
         for eb in (2, 4):
             space = set(C.all_valid_configs(N, eb))
             for M in (1, 4, 37, 256, 4096):
@@ -581,3 +581,186 @@ def test_sanity_against_torch(dtype):
         lp, lpt[torch.arange(8, device="cuda"), ids], rtol=1e-5, atol=2e-5
     )
     assert torch.allclose(lse, torch.logsumexp(xs, dim=-1), rtol=1e-6, atol=2e-5)
+
+
+def test_space_members_are_bounded_in_loads_per_thread():
+    """Every member of the enumerated space issues at most ``LOADS_PER_THREAD_MAX`` loads per thread per pass: the
+    re-read and staged forms unroll them, and beyond the bound the compile takes minutes or crashes (T32_R1_V1_RR at
+    N = 65537: 4096 scalar loads). At large odd vocabularies (vector width 1) the single-CTA re-read members fall out,
+    and the dispatcher still returns a member for both regimes, both output kinds and every SM count."""
+    for N in (4097, 65537, 131073, 152065, 262145, 524289, 1048577):
+        for eb in (2, 4):
+            space = C.all_valid_configs(N, eb)
+            assert space, (N, eb)
+            for cfg in space:
+                assert (
+                    cfg.elems_per_thread(N) // cfg.vec_elems <= C.LOADS_PER_THREAD_MAX
+                ), (
+                    N,
+                    eb,
+                    cfg.describe(),
+                )
+            members = set(space)
+            for M in (1, 37, 4096):
+                for sm in SM_COUNTS:
+                    for row_output in (True, False):
+                        cfg = C.default_config(N, M, eb, sm, row_output)
+                        assert cfg in members, (
+                            N,
+                            eb,
+                            M,
+                            sm,
+                            row_output,
+                            cfg.describe(),
+                        )
+
+
+def test_forced_staged_config_checks_the_element_size():
+    """A staged config is validated against the element size when it is known: f16 at N = 256 with a 4-element
+    vector (8-byte loads; cp.async needs 16) is rejected, fp32 with the same vector is admitted."""
+    cfg = C.LSEConfig(32, 1, 4, "smem")
+    cfg.validate(256)
+    cfg.validate(256, 4)
+    with pytest.raises(ValueError, match="16-byte"):
+        cfg.validate(256, 2)
+    assert cfg.is_valid(256)
+
+
+@needs_device
+def test_configuration_agreement_large_odd_vocabulary():
+    """N = 65537 (vector width 1, 257 blocks padded to 512): the dispatcher's picks of both regimes and output kinds,
+    the re-read member with the most loads per thread the space admits and a cluster member agree bit for bit and
+    match the exact model."""
+    N = 65537
+    x = logits(3, N, torch.bfloat16)
+    ids = ids_for(x)
+    got = run_all(x, ids=ids)
+    check_ref(got, x, ids=ids)
+    space = C.all_valid_configs(N, 2)
+    heaviest = max(
+        (c for c in space if c.stage == "reread"),
+        key=lambda c: c.elems_per_thread(N) // c.vec_elems,
+    )
+    assert heaviest.elems_per_thread(N) // heaviest.vec_elems == C.LOADS_PER_THREAD_MAX
+    picks = {
+        C.default_config(N, M, 2, sm, ro)
+        for M in (1, 4096)
+        for sm in SM_COUNTS
+        for ro in (True, False)
+    }
+    cluster = next(c for c in space if c.cluster > 1)
+    for cfg in sorted(picks | {heaviest, cluster}, key=lambda c: c.describe()):
+        g2 = run_all(x, ids=ids, config=cfg)
+        for k in got:
+            assert same(g2[k], got[k]), (k, cfg.describe())
+    with pytest.raises(ValueError):
+        lse_row(
+            S.SOFTMAX,
+            torch.zeros(2, 256, device="cuda", dtype=torch.float16),
+            config=C.LSEConfig(32, 1, 4, "smem"),
+        )
+
+
+@needs_device
+def test_strided_views_are_copied():
+    """A view whose stride along the vocabulary is not 1 (a strided column view, a transposed matrix, one column of an
+    (N, 2) tensor) is copied first, a placement: the same bits as the contiguous copy, for every entry."""
+    N = 4097
+    views = [
+        logits(6, 2 * N, torch.bfloat16)[:, ::2],
+        logits(N, 6, torch.bfloat16).t(),
+        logits(N, 2, torch.bfloat16)[:, 0],
+    ]
+    for v in views:
+        assert v.stride(-1) != 1
+        c = v.contiguous()
+        assert same(softmax_batch_invariant(v), softmax_batch_invariant(c))
+        assert same(
+            flashinfer.sampling.log_softmax(v), flashinfer.sampling.log_softmax(c)
+        )
+        ids = torch.randint(0, N, v.shape[:-1], device="cuda")
+        assert same(
+            log_probs_batch_invariant(v, ids), log_probs_batch_invariant(c, ids)
+        )
+
+
+@needs_device
+def test_per_row_temperature_shapes_through_the_public_entries():
+    """3-D logits with a temperature tensor of the leading shape, of the flattened row count, on the CPU, or 0-d:
+    accepted by softmax(batch_invariant=True), log_softmax and log_probs alike (the hook branches to the class before
+    the operator's 1-D rule) and equal to the flattened call; a tensor of the batch dimension alone is rejected."""
+    N = 2048
+    x3 = logits(6, N, torch.bfloat16).view(2, 3, N)
+    t6 = torch.rand(6, device="cuda") + 0.5
+    ids3 = torch.randint(0, N, (2, 3), device="cuda")
+    p_flat = flashinfer.sampling.softmax(x3.view(6, N), t6, batch_invariant=True)
+    lp_flat = flashinfer.sampling.log_softmax(x3.view(6, N), t6)
+    g_flat = flashinfer.sampling.log_probs(x3.view(6, N), ids3.view(6), t6)
+    for t in (t6.view(2, 3), t6, t6.cpu(), t6.view(2, 3).cpu()):
+        assert same(
+            flashinfer.sampling.softmax(x3, t, batch_invariant=True).view(6, N), p_flat
+        )
+        assert same(flashinfer.sampling.log_softmax(x3, t).view(6, N), lp_flat)
+        assert same(flashinfer.sampling.log_probs(x3, ids3, t).view(6), g_flat)
+    t0 = torch.tensor(0.7, device="cuda")
+    assert same(
+        flashinfer.sampling.softmax(x3, t0, batch_invariant=True),
+        flashinfer.sampling.softmax(x3, 0.7, batch_invariant=True),
+    )
+    with pytest.raises(ValueError):
+        flashinfer.sampling.softmax(
+            x3, torch.ones(2, device="cuda"), batch_invariant=True
+        )
+    with pytest.raises(ValueError):
+        flashinfer.sampling.log_probs(x3, ids3, torch.ones(3, device="cuda"))
+
+
+@needs_device
+def test_per_row_temperature_values_are_not_validated():
+    """The documented contract: a per-row temperature tensor's values are not checked on the device (a check would
+    need a synchronisation and break CUDA-graph capture). A 0 yields a NaN row (``c = inf``); the other rows are the
+    model's, unaffected."""
+    x = logits(4, 1000, torch.bfloat16)
+    ids = ids_for(x)
+    t = torch.tensor([1.0, 0.0, 0.5, 2.0], device="cuda")
+    got = run_all(x, temp=t, ids=ids)
+    for k, v in got.items():
+        assert torch.isnan(v[1].float()).all(), k
+    t_ref = t.clone()
+    t_ref[1] = 1.0
+    check_ref(got, x, temp=t_ref, ids=ids, rows=[0, 2, 3])
+
+
+@needs_device
+def test_symbolic_oracle_temperature_broadcast_and_empty_rows():
+    """The all-symbolic oracle broadcasts a one-element temperature tensor like the entries do and returns shaped empty
+    outputs for an empty row selection, as the exact model does."""
+    x = logits(2, 64, torch.bfloat16)
+    one = torch.tensor([0.8], device="cuda")
+    o = R.exact_rows(x, one, rows=(0, 1))
+    r = R.lse_reference(x, one)
+    for k in ("m", "s", "lse", "probs", "logprobs"):
+        assert same(o[k], r[k]), k
+    e = R.exact_rows(x, rows=())
+    assert e["probs"].shape == (0, 64) and e["logprobs"].shape == (0, 64)
+    assert e["m"].shape == (0,)
+    e2 = R.lse_reference(x, rows=())
+    assert e2["probs"].shape == (0, 64) and e2["logprobs"].shape == (0, 64)
+
+
+def test_every_vocabulary_up_to_the_covered_size_has_a_member():
+    """The space is non-empty for every dtype at every vocabulary up to ``VOCAB_COVERED`` (sampled: powers of two and
+    their odd neighbours, the production sizes), the dispatcher's pick is a member, and an odd fp32 vocabulary just
+    beyond it has no member: the dispatcher raises and the entry reports the class as unsupported there."""
+    ns = sorted(
+        {1, 2, 7, 255, 257, 32000, 151936, 152064}
+        | {n for k in range(8, 22) for n in ((1 << k) - 1, 1 << k, (1 << k) + 1)}
+        | {C.VOCAB_COVERED - 1, C.VOCAB_COVERED}
+    )
+    for N in (n for n in ns if n <= C.VOCAB_COVERED):
+        for eb in (2, 4):
+            space = C.all_valid_configs(N, eb)
+            assert space, (N, eb)
+            assert C.default_config(N, 64, eb, 148, True) in set(space), (N, eb)
+    with pytest.raises(ValueError, match="no configuration"):
+        C.default_config(C.VOCAB_COVERED + 1, 64, 4, 148, True)

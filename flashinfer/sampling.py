@@ -31,7 +31,7 @@ from .trace.templates.sampling import (
     min_p_sampling_trace,
     sampling_from_logits_trace,
     sampling_from_probs_trace,
-    softmax_trace,
+    softmax_trace_dispatch,
     top_k_mask_logits_trace,
     top_k_renorm_probs_trace,
     top_k_sampling_trace,
@@ -941,7 +941,7 @@ def _validate_and_convert_seed_offset(
     return maybe_seed_arr, seed_val, maybe_offset_arr, offset_val
 
 
-@flashinfer_api(trace=softmax_trace)
+@flashinfer_api(trace=softmax_trace_dispatch)
 def softmax(
     logits: torch.Tensor,
     temperature: Optional[Union[torch.Tensor, float]] = None,
@@ -979,8 +979,14 @@ def softmax(
         maximum and the sum of ``ex2.approx`` weights), fingerprinted as
         ``flashinfer.batch_invariant.fingerprint("softmax", N=, dtype=, temperature=)``; the same trees
         serve :func:`log_probs`, so a token's log-probability and the softmax of its row agree by
-        construction. Supported: bf16 / f16 / fp32 logits of any vocabulary, every temperature form
-        above, SM100 / SM103 / SM107. Unsupported inputs raise
+        construction. Supported: bf16 / f16 / fp32 logits of any vocabulary up to 2^21 (and beyond it where
+        the row's alignment admits a configuration), every temperature form
+        above (a per-row tensor may also take the shape of the leading dimensions of 3-D logits; its values
+        are not validated on the device, so a ``0`` yields a NaN row: substitute ``1.0`` for greedy rows),
+        SM100 / SM103 / SM107. Cost: with 16-bit logits the class is faster than the operator's default
+        route (which casts to fp32 and writes fp32); with fp32 logits it is slower, about 0.4-0.7x of the
+        default route on SM100 / SM107 (three passes over the row against the fused route's one), while
+        faster than torch's softmax. Unsupported inputs raise
         :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` instead of falling back.
         See ``flashinfer/batch_invariant/README.md``.
     out_dtype : Optional[torch.dtype]
@@ -1015,15 +1021,18 @@ def softmax(
     if not logits.is_cuda:
         raise ValueError(f"logits must be a CUDA tensor, got device={logits.device}")
 
-    maybe_temperature_arr, temperature_val, temperature_is_none = (
-        _validate_softmax_temperature(logits, temperature)
-    )
     if batch_invariant:
+        # the class validates its own arguments (a per-row temperature may take the shape of the leading dimensions
+        # of 3-D logits, which the operator's 1-D rule below rejects)
         from .batch_invariant.sampling.api import softmax_batch_invariant
 
         return softmax_batch_invariant(
             logits, temperature, enable_pdl, out_dtype=out_dtype
         )
+
+    maybe_temperature_arr, temperature_val, temperature_is_none = (
+        _validate_softmax_temperature(logits, temperature)
+    )
     if out_dtype is not None:
         raise ValueError(
             "out_dtype is a parameter of the batch-invariant class (batch_invariant=True)"
@@ -1089,7 +1098,12 @@ def log_probs(
         ``[0, vocab_size)`` gives NaN.
     temperature : Optional[Union[torch.Tensor, float]]
         ``None`` (no scaling), a positive scalar, or a tensor with one positive value per row (float16,
-        bfloat16, float32 or float64; a float64 temperature is rounded to float32).
+        bfloat16, float32 or float64; a float64 temperature is rounded to float32), of shape ``logits.shape[:-1]``
+        or ``(rows,)``. A scalar is validated on the host; a tensor's values are not validated on the device (a
+        check would need a synchronisation and would break CUDA-graph capture): every value must be positive and
+        finite, a ``0`` yields a NaN row, a negative or non-finite value an undefined row. Callers whose
+        temperature tensors carry ``0`` for greedy rows (vLLM, SGLang) must substitute ``1.0`` there: the greedy
+        log-probabilities are read from the unscaled row.
     return_lse : bool
         Also return the natural log-sum-exp of each scaled row (the normaliser), from the same launch.
     enable_pdl : Optional[bool]
@@ -1155,8 +1169,9 @@ def log_softmax(
 
     The dataflow is the class ``lse.row`` (``flashinfer/batch_invariant/README.md``): the row maximum ``m`` and the sum
     ``s`` of the ``ex2.approx`` weights as fixed trees over the vocabulary, then ``logp_j = ((x_j - m) * c - lg2(s)) *
-    ln2`` with ``c = log2(e) / temperature``; :func:`log_probs` is this row gathered at the token ids and
-    :func:`softmax` under ``batch_invariant=True`` exponentiates it, so the three agree by construction. The
+    ln2`` with ``c = log2(e) / temperature``; :func:`log_probs` is this row gathered at the token ids, and
+    :func:`softmax` under ``batch_invariant=True`` forms its probabilities from the same ``m`` and ``s`` (``p_j = e_j /
+    s``), so the three share the row's statistics bit for bit. The
     fingerprint is ``flashinfer.batch_invariant.fingerprint("log_softmax", N=, dtype=, temperature=)``.
 
     Parameters
@@ -1166,7 +1181,12 @@ def log_softmax(
         inputs are widened exactly).
     temperature : Optional[Union[torch.Tensor, float]]
         ``None`` (no scaling), a positive scalar, or a tensor with one positive value per row (float16,
-        bfloat16, float32 or float64; a float64 temperature is rounded to float32).
+        bfloat16, float32 or float64; a float64 temperature is rounded to float32), of shape ``logits.shape[:-1]``
+        or ``(rows,)``. A scalar is validated on the host; a tensor's values are not validated on the device (a
+        check would need a synchronisation and would break CUDA-graph capture): every value must be positive and
+        finite, a ``0`` yields a NaN row, a negative or non-finite value an undefined row. Callers whose
+        temperature tensors carry ``0`` for greedy rows (vLLM, SGLang) must substitute ``1.0`` there: the greedy
+        log-probabilities are read from the unscaled row.
     enable_pdl : Optional[bool]
         Whether to launch with Programmatic Dependent Launch; ``None`` (default) follows the device.
     batch_invariant : bool

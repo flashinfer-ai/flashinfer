@@ -58,6 +58,13 @@ SMEM_BUDGET = (
     200 * 1024
 )  # bytes of dynamic shared memory a staged share may take (the exchange buffers come on top).
 SMEM_MIN_ELEMS = 64  # the staged form is enumerated where a thread's share is at least this many elements.
+VOCAB_COVERED = (
+    1 << 21
+)  # every vocabulary up to this has a member for every dtype and alignment (an odd fp32 row of
+#   2^21 + 1 elements has none: its tree pads to 16384 blocks, a thread of the widest cluster would keep 1 KB of fragments).
+LOADS_PER_THREAD_MAX = 1024  # the re-read and staged forms unroll a thread's loads per pass: a member issues at most this
+#   many (device-free compile of T32_R1_V1_RR: 256 loads 13 s, 1024 loads 39 s, 2048 loads 2 min, 4096 loads 20+ min, 8192 a
+#   compiler crash). The register form is bounded by KEPT_BYTES_MAX, the staged form by SMEM_BUDGET as well.
 
 
 @dataclass(frozen=True)
@@ -94,7 +101,10 @@ class LSEConfig:
     def elems_per_thread(self, N: int) -> int:
         return V * self.blocks_per_warp(N)
 
-    def validate(self, N: int) -> None:
+    def validate(self, N: int, elem_bytes: Optional[int] = None) -> None:
+        """Raise ``ValueError`` unless the config is a well-formed member for vocabulary ``N``; with ``elem_bytes`` the
+        staged form is checked against the element size (16-byte vectors on 16-byte rows within the budget) instead of
+        the element-size-agnostic lower bound."""
         if self.threads_per_row not in THREADS:
             raise ValueError(f"threads_per_row={self.threads_per_row}")
         if self.vec_elems not in (1, 2, 4, 8):
@@ -114,7 +124,13 @@ class LSEConfig:
         if self.stage == "smem":
             if self.rows_per_cta != 1:
                 raise ValueError("smem staging holds one row per CTA")
-            if (
+            if elem_bytes is not None:
+                if not self.smem_stage_ok(N, elem_bytes):
+                    raise ValueError(
+                        f"smem staging needs 16-byte vectors ({self.vec_elems} x {elem_bytes} bytes) on 16-byte rows "
+                        f"and a tile within {SMEM_BUDGET} bytes (this one: {self.smem_tile_bytes(N, elem_bytes)})"
+                    )
+            elif (
                 self.smem_tile_bytes(N, 2 if self.vec_elems == 8 else 4) > SMEM_BUDGET
                 and self.smem_tile_bytes(N, 1) > SMEM_BUDGET
             ):
@@ -201,7 +217,7 @@ def all_valid_configs(
                 e = cfg.elems_per_thread(N)
                 if e * elem_bytes <= KEPT_BYTES_MAX:
                     out.append(cfg)
-                if e >= REREAD_MIN_ELEMS:
+                if e >= REREAD_MIN_ELEMS and e // vec <= LOADS_PER_THREAD_MAX:
                     out.append(LSEConfig(T, rows, vec, stage="reread"))
         for C in CLUSTERS:
             cfg = LSEConfig(T, 1, vmax, cluster=C)
@@ -216,6 +232,7 @@ def all_valid_configs(
                 cfg.is_valid(N)
                 and cfg.smem_stage_ok(N, elem_bytes)
                 and cfg.elems_per_thread(N) >= SMEM_MIN_ELEMS
+                and cfg.elems_per_thread(N) // vmax <= LOADS_PER_THREAD_MAX
             ):
                 out.append(cfg)
     return out
@@ -289,6 +306,11 @@ def _rule(
     Kp = padded_blocks(N)
     row_bytes = N * elem_bytes
     space = all_valid_configs(N, elem_bytes)
+    if not space:
+        raise ValueError(
+            f"no configuration of the class covers a vocabulary of {N} with {elem_bytes}-byte elements (every vocabulary up "
+            f"to {VOCAB_COVERED} is covered; beyond it the row's alignment decides)"
+        )
 
     def staged(T, rows, C):
         cfg0 = LSEConfig(T, rows, vec, cluster=C)
@@ -332,7 +354,12 @@ def _rule(
                 cand = LSEConfig(TP_PAD_THREADS, 1, min(vec, TP_PAD_VEC), "reread", 1)
                 if cand in space:
                     return cand
-            C = 1
+            T1 = _clamp_T(-(-row_bytes // TP_BYTES_PER_THREAD), Kp)
+            T1 = max(T1, 128) if Kp >= 4 else T1
+            single = first_member(T1, 1)
+            if single is not None:
+                return single
+            # no single-CTA member within LOADS_PER_THREAD_MAX (a long odd row): the cluster path below
         while C >= 1:
             T = _clamp_T(-(-(row_bytes // C) // TP_BYTES_PER_THREAD), Kp // C)
             T = max(T, 128) if Kp // C >= 4 else T
@@ -353,7 +380,16 @@ def _rule(
     ):
         if alt in space:
             return alt
-    return space[0]  # pragma: no cover
+    # no regime candidate is a member (a long odd row whose single-CTA re-read members exceed the loads bound):
+    # the member with the fewest loads per thread, then the fewest CTAs per row, then the most threads
+    return min(
+        space,
+        key=lambda c: (
+            c.elems_per_thread(N) // c.vec_elems,
+            c.cluster,
+            -c.threads_per_row,
+        ),
+    )
 
 
 _sm_count_cache: dict = {}

@@ -4,7 +4,10 @@
 
 :func:`softmax_batch_invariant` is what :func:`flashinfer.sampling.softmax` runs under ``batch_invariant=True``:
 ``softmax(logits / temperature)`` along the last dimension in the input dtype (or in fp32 with ``out_dtype``), with
-FlashInfer's argument forms (temperature ``None``, a scalar or a per-row tensor of f16 / bf16 / f32 / f64).
+FlashInfer's argument forms (temperature ``None``, a scalar or a per-row tensor of f16 / bf16 / f32 / f64 of shape
+``logits.shape[:-1]`` or ``(rows,)``; a scalar is validated on the host, a tensor's values are not validated on the
+device -- a check would need a synchronisation and would break CUDA-graph capture -- so they must be positive and
+finite: a ``0`` yields a NaN row).
 :func:`log_softmax_batch_invariant` is :func:`flashinfer.sampling.log_softmax`: the fp32 log-softmax row.
 :func:`log_probs_batch_invariant` is :func:`flashinfer.sampling.log_probs`: the natural log-probability of one or ``K``
 token ids per row in fp32, and with ``return_lse`` the row's log-sum-exp (the same launch). Every unsupported input
@@ -22,7 +25,13 @@ from typing import Dict, Optional, Tuple, Union
 import torch
 
 from ..support import check_device, unsupported
-from .schedule import LSEConfig, default_config, device_sm_count, max_vec_elems
+from .schedule import (
+    VOCAB_COVERED,
+    LSEConfig,
+    default_config,
+    device_sm_count,
+    max_vec_elems,
+)
 from .spec import LOG_SOFTMAX, LOGP, LOGP_LSE, SOFTMAX, SOFTMAX_F32, Mode, scale_value
 
 CLASS = "lse.row"
@@ -53,9 +62,14 @@ def _rows(t: torch.Tensor, N: int, name: str) -> torch.Tensor:
     return t2
 
 
-def _temperature(temperature, M: int, device) -> Tuple[Optional[torch.Tensor], float]:
+def _temperature(
+    temperature, M: int, lead: Tuple[int, ...], device
+) -> Tuple[Optional[torch.Tensor], float]:
     """``(per-row f32 tensor | None, host scale c)``. A scalar is rounded to binary32 and ``c = div(LOG2E, T)`` is formed
-    on the host with the device's ``div.rn``; a tensor is widened / rounded (RNE) to f32 and the kernel forms ``c``."""
+    on the host with the device's ``div.rn``; a tensor of shape ``(M,)`` or ``lead`` (the logits' leading dimensions) is
+    widened / rounded (RNE) to f32 and the kernel forms ``c`` per row. The tensor's values are not validated (a device
+    check would need a synchronisation and break CUDA-graph capture): they must be positive and finite; a ``0`` gives
+    ``c = inf`` and a NaN row, a negative or non-finite value an undefined row."""
     if temperature is None:
         return None, scale_value(None)
     if isinstance(temperature, torch.Tensor):
@@ -68,9 +82,11 @@ def _temperature(temperature, M: int, device) -> Tuple[Optional[torch.Tensor], f
         t = temperature.to(device=device, dtype=torch.float32)
         if t.dim() == 0 or t.numel() == 1:
             t = t.reshape(1).expand(M)
+        elif tuple(t.shape) == tuple(lead):
+            t = t.reshape(M)
         if t.shape != (M,):
             raise ValueError(
-                f"temperature must have one value per row ({M}); got shape {tuple(temperature.shape)}"
+                f"temperature must have one value per row: shape ({M},) or {tuple(lead)}; got shape {tuple(temperature.shape)}"
             )
         return t.contiguous(), 0.0
     T = float(temperature)
@@ -93,7 +109,11 @@ def _check_logits(logits: torch.Tensor) -> int:
         )
     N = int(logits.shape[-1])
     if not (0 < N < MAX_VOCAB):
-        raise unsupported(CLASS, f"a vocabulary of {N}", "0 < vocabulary < 2^31")
+        raise unsupported(
+            CLASS,
+            f"a vocabulary of {N}",
+            f"0 < vocabulary < 2^31 (every vocabulary up to {VOCAB_COVERED} has a configuration; beyond it the row's alignment decides)",
+        )
     return N
 
 
@@ -128,20 +148,29 @@ def lse_row(
     try:
         x2 = _rows(logits, N, "logits")
     except ValueError:
-        x2 = logits.reshape(-1, N)  # a copy: the input could not be viewed as rows
+        # not viewable as rows with a unit stride along the vocabulary (a strided column view, a non-contiguous
+        # leading layout): copied first, a placement
+        x2 = logits.reshape(-1, N).contiguous()
     M = x2.shape[0]
-    temp_t, c = _temperature(temperature, M, logits.device)
+    temp_t, c = _temperature(temperature, M, tuple(lead), logits.device)
     elem_bytes = logits.element_size()
     if config is None:
-        config = default_config(
-            N,
-            M,
-            elem_bytes,
-            sm_count or device_sm_count(logits.device),
-            row_output=mode.row_output,
-        )
+        try:
+            config = default_config(
+                N,
+                M,
+                elem_bytes,
+                sm_count or device_sm_count(logits.device),
+                row_output=mode.row_output,
+            )
+        except (
+            ValueError
+        ) as e:  # an empty configuration space: a long odd row beyond VOCAB_COVERED
+            raise unsupported(
+                CLASS, str(e), f"vocabularies up to {VOCAB_COVERED}"
+            ) from None
     else:
-        config.validate(N)
+        config.validate(N, elem_bytes)
     if config.vec_elems > max_vec_elems(N, elem_bytes):
         raise ValueError("config vector width exceeds the row alignment")
     x2 = _aligned_rows(x2, config.vec_elems * elem_bytes)
