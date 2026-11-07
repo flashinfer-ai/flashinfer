@@ -1465,7 +1465,7 @@ TC_PLAN_STEP = {"sm_100a": (2.35, 2.44), "sm_103a": (2.17, 2.25)}
 # within a few chunks, so these prices then over-state the split tables.  An architecture not listed keeps the warm-up
 # price and every candidate (R200 prices its split tables with ``CHAIN_PLAN``).  The planner's table in the register
 # form is priced with the same pre-scan term.
-TC_PLAN_PRESCAN = {"sm_100a": (10.0, 2.95, 1.55), "sm_103a": (0.0, 3.05, 1.1)}
+TC_PLAN_PRESCAN = {"sm_100a": (10.0, 2.95, 1.55), "sm_103a": (25.0, 2.5, 1.55)}
 
 
 def tc_plan_thresholds(arch: str) -> tuple[float, float]:
