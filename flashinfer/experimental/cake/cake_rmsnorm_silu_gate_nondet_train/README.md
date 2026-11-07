@@ -98,21 +98,34 @@ package.  This package exports the same names.
 `cake_jit.py` routes each call by its row count `rows = T * H` and the
 device's SM count.  Each program's arithmetic is fixed.  The backward
 programs write `dx` and `dz` with the deterministic backward's row arithmetic.
-The forward programs may associate a row's sum of squares differently, so `y`
-repeats bit for bit for the same inputs on the same device.
+The forward programs associate a row's sum of squares differently: the short
+forward adds 8-term FMA chains of 16 lanes folded by XOR shuffles 1, 2, 4, 8,
+the other forward programs 16-term chains of 8 lanes folded by XOR shuffles
+1, 2, 4.  So `y`'s bits can differ between the programs, and so between the
+forward bands of one architecture; each program repeats `y` bit for bit for
+the same inputs on the same device.
 
 | role | program | runs |
 | --- | --- | --- |
-| `fwd_short` | persistent forward, 16 lanes a row, one CTA per 16-row block | up to 12 rows per SM on `sm_100a` and `sm_103a`, 59 on `sm_107a` |
-| `fwd` | forward, 64 threads, 8 lanes a row | between the short and the mid forward |
-| `fwd_mid` | persistent forward, at most 6 CTAs per SM, each at most 2 blocks of 16 rows | from 976 rows per SM (800 on `sm_107a`) |
-| `fwd_long` | persistent forward, at most 3 CTAs per SM, each at most 6 blocks of 32 rows | from 2400 rows per SM on `sm_100a` and `sm_103a` |
-| `fwd_xlong` | the long forward, also prefetching the next block with one bulk prefetch | from 3000 rows per SM on `sm_103a`, 1740 on `sm_107a` |
+| `fwd_short` | persistent forward, 16 lanes a row, one CTA per 16-row block | its forward bands |
+| `fwd` | forward, 64 threads, 8 lanes a row | the call role; no forward band names it |
+| `fwd_mid` | persistent forward, at most 6 CTAs per SM, each at most 2 blocks of 16 rows | its forward bands |
+| `fwd_long` | persistent forward, at most 3 CTAs per SM, each at most 6 blocks of 32 rows | its forward band (`sm_100a`) |
+| `fwd_xlong` | the long forward, also prefetching the next block with one bulk prefetch | its forward bands |
 | `bwd_bf16_t512`, `bwd_f32_t512` | exact tiny backward: one cluster of 16 CTAs of 4 teams of 128 threads, the deterministic backward's chunk partials summed on chip in its reduction order, no workspace | the rows of its bands (at most 512) |
 | `bwd_bf16_t1024`, `bwd_f32_t1024` | exact tiny backward of 8 teams | the rows of its bands (at most 1024) |
 | `bwd_bf16_short` | tiny backward: one cluster of 16 CTAs of 256 threads, the weight gradient summed on chip, no workspace; BF16 weight gradient only | the rows of its bands |
 | `bwd_bf16`, `bwd_f32` | static backward: CTA `b` runs chunks `b`, `b + grid`, ... | past the bands, while the chunks fit 8 CTAs per SM (up to 64 rows per SM) |
 | `bwd_bf16_mid`, `bwd_f32_mid` | claimed backward: CTAs claim runs of chunks at run time | past 8 chunks per SM |
+
+The forward bands (`FORWARD_BANDS`, rows per SM: a call of `rows` rows on a
+device of `SMs` SMs runs the first band with `rows <= last * SMs`):
+
+| architecture | forward bands (rows per SM) |
+| --- | --- |
+| `sm_100a` | 1-48 `short`, 49-140 `mid`, 141-400 `long`, 401-1000 `xlong`, past 1000 `mid` |
+| `sm_103a` | 1-48 `short`, 49-250 `mid`, 251-550 `xlong`, past 550 `mid` |
+| `sm_107a` | 1-64 `short`, 65-200 `mid`, 201-520 `xlong`, past 520 `mid` |
 
 The small-row backward bands (`BACKWARD_BANDS`, rows per call; a call with
 `compute_grad_weight=False` takes the BF16 bands):

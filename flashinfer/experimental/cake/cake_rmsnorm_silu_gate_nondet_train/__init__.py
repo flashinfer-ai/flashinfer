@@ -102,21 +102,29 @@ Host design (the input layout rules are the deterministic package's):
   good, so a replay launches no fill kernel (see ``_RESERVES``; with none
   ready, the graph zero-fills one of its own).
 - Grids (``cake_jit.module_for_rows`` picks the module from the rows and
-  the device's SM count): the forward launches one 64-thread CTA per block of
-  8 rows; up to 12 rows per SM on sm_100a and sm_103a (59 on sm_107a) the
-  short forward, one 256-thread CTA per block of 16 rows; and from more rows
-  a persistent forward whose CTA ``b`` walks the blocks ``b``, ``b + grid``,
-  ..., loading each next block while it computes the current one, in the
-  fewest whole waves that give no CTA more than a few blocks: from 976 rows
-  per SM on sm_100a and sm_103a (800 on sm_107a) the mid forward (6 CTAs per
-  SM, at most 2 blocks of 16 rows each, thread 0 warming the CTA's next block
-  and the first block of the CTA one wave later in L2 where x and z hold their
-  rows packed: head stride 128 and token stride ``H * 128``, which a ``[T, 1,
-  128]`` or ``[T, 128]`` input whose rows follow one another meets, see
-  ``_kernel_view``), from 2400 (sm_100a and sm_103a) the long forward (3 CTAs
-  per SM, at most 6 blocks of 32 rows each), and from 3000 on sm_103a and
-  1740 on sm_107a the extra-long forward (the long forward whose thread 0
-  also warms the CTA's next block in L2).  The static and the claimed
+  the device's SM count, the forward's by the bands of rows per SM of
+  ``cake_jit.FORWARD_BANDS``): the forward launches one 64-thread CTA per
+  block of 8 rows; the short forward (up to 48 rows per SM on sm_100a and
+  sm_103a, 64 on sm_107a) one 256-thread CTA per block of 16 rows; and the
+  persistent forwards a grid whose CTA ``b`` walks the blocks ``b``, ``b +
+  grid``, ..., loading each next block while it computes the current one, in
+  the fewest whole waves that give no CTA more than a few blocks: the mid
+  forward (6 CTAs per SM, at most 2 blocks of 16 rows each, thread 0 warming
+  the CTA's next block and the first block of the CTA one wave later in L2
+  where x and z hold their rows packed: head stride 128 and token stride ``H
+  * 128``, which a ``[T, 1, 128]`` or ``[T, 128]`` input whose rows follow
+  one another meets, see ``_kernel_view``), the long forward (3 CTAs per SM,
+  at most 6 blocks of 32 rows each; sm_100a) and the extra-long forward (the
+  long forward whose thread 0 also warms the CTA's next block in L2).  The
+  bands: on sm_100a the mid forward up to 140 rows per SM, the long forward
+  up to 400, the extra-long forward up to 1000 and the mid forward past it;
+  on sm_103a the mid forward up to 250, the extra-long forward up to 550 and
+  the mid forward past it; on sm_107a the mid forward up to 200, the
+  extra-long forward up to 520 and the mid forward past it.  The forward
+  programs associate a row's sum of squares differently (the short forward:
+  8-term FMA chains of 16 lanes folded by XOR shuffles 1, 2, 4, 8; the
+  others: 16-term chains of 8 lanes folded by 1, 2, 4), so ``y``'s bits can
+  differ between bands while each program repeats them.  The static and the claimed
   backward run 128-thread CTAs of 8-row blocks in the deterministic
   backward's chunks (``cake_jit.backward_chunks``) and launch
   ``cake_jit.backward_ctas`` ``G = min(chunks, ctas_per_sm * SMs)`` CTAs (8

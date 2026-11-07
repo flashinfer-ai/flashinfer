@@ -70,7 +70,7 @@ package's public forward and backward only.  This module checks:
   value too), ``dx`` and ``dz`` are the deterministic package's bits, ``y``,
   ``dx``, ``dz`` and ``dw`` lie within the error budget, and ``dw`` within
   the weight-gradient budget of the deterministic ``dw``; so do they around
-  the forward's short, mid, long and extra-long thresholds and
+  the ends of the forward's ``FORWARD_BANDS`` bands and
   at the first and last rows of each backward program, each call launching
   ``module_for_rows``' module: the small-row backwards (one cluster each, in
   the rows of their ``BACKWARD_BANDS`` bands), the static backward (at most 8
@@ -1277,7 +1277,7 @@ def test_autograd_and_checkpoint_repeat_the_functional_bits(
     check(yc, xc.grad, zc.grad, wc.grad, "checkpoint")
 
 
-# --------------------------------------------------------------------------- the forward's thresholds and the backward's programs
+# --------------------------------------------------------------------------- the forward's bands and the backward's programs
 
 
 def _spy_launches(monkeypatch: pytest.MonkeyPatch) -> list[str]:
@@ -1300,14 +1300,22 @@ def _sm_count() -> int:
 
 def _start_rows(arch: str, name: str, sms: int) -> int:
     """The fewest rows the routed module ``name`` runs for on ``arch`` with
-    ``sms`` SMs, from its grid rule: ``min_rows_per_sm * SMs``, or for the
-    claimed backward the first row of more than ``more_chunks_than_per_sm *
-    SMs`` chunks of one block."""
+    ``sms`` SMs: for a forward module the first row of its first
+    ``FORWARD_BANDS`` band (one more than the previous band's ``last * SMs``),
+    for the claimed backward the first row of more than
+    ``more_chunks_than_per_sm * SMs`` chunks of one block (its grid rule)."""
     rule = loader.MODULES[name]["grid_rule"]
     if "more_chunks_than_per_sm" in rule:
         chunks = int(rule["more_chunks_than_per_sm"]) * sms
         return chunks * int(rule["rows_per_block"]) + 1
-    return loader.min_rows_per_sm(name, arch) * sms
+    role = loader.MODULES[name]["role"]
+    first = 1
+    for last, band in loader.FORWARD_BANDS[arch]:
+        if band == role:
+            return first
+        assert last is not None, (arch, role)
+        first = int(last) * sms + 1
+    raise AssertionError(f"{arch} has no forward band of {role}")
 
 
 def _backward_tiers(
@@ -1333,38 +1341,30 @@ def _backward_tiers(
     return tiers
 
 
-# The forward's routed roles whose thresholds the ``flat-*`` forward inputs
-# take: the rows per SM up to which the short forward runs and from which the
-# mid, the long and the extra-long forward run.
-FLAT_FORWARD_ROLES = {
-    "flat-short": "fwd_short",
-    "flat-mid": "fwd_mid",
-    "flat-long": "fwd_long",
-    "flat-xlong": "fwd_xlong",
-}
-# Forward inputs around and past the forward's thresholds: (tokens, heads,
-# layout); ``heads=None`` takes ``threshold * SMs + tokens`` rows as one flat
-# [rows, 128] tensor, the threshold of the ``FLAT_FORWARD_ROLES`` role from
-# the loader's grid rule.
+# Forward inputs around and past the ends of the forward's bands: (tokens,
+# heads, layout); ``heads=None`` takes ``last * SMs + tokens`` rows as one flat
+# [rows, 128] tensor, ``last`` the rows per SM of the architecture's
+# ``FORWARD_BANDS`` band ``i`` of ``layout`` ``flat<i>`` (skipped where the
+# architecture has no such band with an end).
 FORWARD_CASES = [
     pytest.param(1, 48, "contiguous", id="1x48"),
     pytest.param(13, 7, "contiguous", id="13x7"),
     pytest.param(13, 48, "projection", id="13x48-projection"),
     pytest.param(21, 48, "head_major", id="21x48-head_major"),
-    pytest.param(0, None, "flat-short", id="short-threshold"),
-    pytest.param(1, None, "flat-short", id="short-threshold+1"),
-    pytest.param(-1, None, "flat-mid", id="mid-threshold-1"),
-    pytest.param(1, None, "flat-mid", id="mid-threshold+1"),
+    pytest.param(0, None, "flat0", id="band0-end"),
+    pytest.param(1, None, "flat0", id="band0-end+1"),
+    pytest.param(0, None, "flat1", id="band1-end"),
+    pytest.param(1, None, "flat1", id="band1-end+1"),
     pytest.param(2048, 48, "contiguous", id="2048x48"),
     pytest.param(4097, 48, "contiguous", id="4097x48"),
     pytest.param(4097, 48, "projection", id="4097x48-projection"),
     pytest.param(4097, 48, "head_major", id="4097x48-head_major"),
     pytest.param(6000, 32, "contiguous", id="6000x32"),
-    pytest.param(-1, None, "flat-long", id="long-threshold-1"),
-    pytest.param(1, None, "flat-long", id="long-threshold+1"),
-    pytest.param(-1, None, "flat-xlong", id="xlong-threshold-1"),
-    pytest.param(0, None, "flat-xlong", id="xlong-threshold"),
-    pytest.param(1, None, "flat-xlong", id="xlong-threshold+1"),
+    pytest.param(0, None, "flat2", id="band2-end"),
+    pytest.param(1, None, "flat2", id="band2-end+1"),
+    pytest.param(-1, None, "flat3", id="band3-end-1"),
+    pytest.param(0, None, "flat3", id="band3-end"),
+    pytest.param(1, None, "flat3", id="band3-end+1"),
     pytest.param(7685, 48, "contiguous", id="7685x48"),
     pytest.param(7685, 48, "projection", id="7685x48-projection"),
     pytest.param(7685, 48, "head_major", id="7685x48-head_major"),
@@ -1382,27 +1382,25 @@ FORWARD_CASES = [
 
 @requires_device
 @pytest.mark.parametrize("tokens,heads,layout", FORWARD_CASES)
-def test_forward_around_its_thresholds_within_the_deterministic_error(
+def test_forward_around_its_bands_within_the_deterministic_error(
     tokens, heads, layout, determinism_setting, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """On both sides of the forward's thresholds and past them, the forward
-    launches ``module_for_rows``' module: where the architecture routes them,
-    the short forward up to ``max_rows_per_sm * SMs`` rows, else the first of
-    the extra-long, the long and the mid forward from its ``min_rows_per_sm *
-    SMs`` rows, else the forward.  ``y`` repeats bit for bit and lies within
-    the error budget of the deterministic package's ``y``."""
+    """On both sides of the ends of the forward's bands and past them, the
+    forward launches ``module_for_rows``' module: the module of the first
+    ``FORWARD_BANDS`` band of the architecture with ``rows <= last * SMs``
+    (the short, mid, long and extra-long forwards and the forward, each where
+    the architecture's bands name it).  ``y`` repeats bit for bit and lies
+    within the error budget of the deterministic package's ``y``."""
     sms = _sm_count()
     arch = loader.device_arch(torch.cuda.current_device())
     routes = loader.ROUTES[arch]
+    bands = loader.FORWARD_BANDS[arch]
     if heads is None:
-        role = FLAT_FORWARD_ROLES[layout]
-        if role not in routes:
-            pytest.skip(f"{arch} routes no {role} module")
-        if role == "fwd_short":
-            start = loader.max_rows_per_sm(routes[role], arch)
-        else:
-            start = loader.min_rows_per_sm(routes[role], arch)
-        x, z, w, dy = suite.make(start * sms + tokens, 1, layout="flat", seed=21)
+        i = int(layout[len("flat") :])
+        if i >= len(bands) or bands[i][0] is None:
+            pytest.skip(f"{arch} has no forward band {i} with an end")
+        end = int(bands[i][0]) * sms
+        x, z, w, dy = suite.make(end + tokens, 1, layout="flat", seed=21)
     else:
         x, z, w, dy = suite.make(tokens, heads, layout=layout, seed=21)
     rows = x.numel() // D
@@ -1411,16 +1409,9 @@ def test_forward_around_its_thresholds_within_the_deterministic_error(
     assert_same_bits("y", nd_forward(x, z, w, EPS), y)
     name = loader.module_for_rows(arch, "fwd", rows, sms)
     assert launched == [name] * 2, launched
-    want = loader.route_module(arch, "fwd")
-    short = routes.get("fwd_short")
-    if short is not None and rows <= loader.max_rows_per_sm(short, arch) * sms:
-        want = short
-    else:
-        for role in ("fwd_xlong", "fwd_long", "fwd_mid"):
-            tier = routes.get(role)
-            if tier is not None and rows >= loader.min_rows_per_sm(tier, arch) * sms:
-                want = tier
-                break
+    want = next(
+        routes[band] for last, band in bands if last is None or rows <= last * sms
+    )
     assert name == want, (arch, rows, sms)
     y64 = suite.fp64_reference(dy, x, z, w, EPS)[0]
     assert_error_within_det("y", y, det_forward(x, z, w, EPS), y64)
@@ -1447,11 +1438,13 @@ GATE_EDGE_VALUES = [
     float("-inf"),
     float("nan"),
 ]
-# Forward inputs the short forward runs where the architecture routes it, and
-# those at its threshold on sm_100a and sm_103a, 12 rows per SM, on 148 SMs
-# (37x48, 253x7, 55x32) and on 152 SMs (38x48, 260x7, 57x32), and on sm_107a,
-# 59 rows per SM, on 212 SMs (260x48, 1786x7, 390x32) and one token past it
-# (261x48, 1787x7, 391x32).
+# Forward inputs the short forward runs, and those at the end of its band on
+# sm_100a and sm_103a, 48 rows per SM, on 148 SMs (148x48, 1014x7, 222x32) and
+# on 152 SMs (152x48, 1042x7, 228x32), and on sm_107a, 64 rows per SM, on 212
+# SMs (282x48, 1938x7, 424x32), and one token past each (the next band's
+# forward), with the earlier ones at 12 rows per SM on 148 and 152 SMs (37x48,
+# 253x7, 55x32 and 38x48, 260x7, 57x32) and at 59 on 212 SMs (260x48, 1786x7,
+# 390x32).
 GATE_EDGE_CASES = [
     pytest.param(1, 48, id="1x48"),
     pytest.param(13, 48, id="13x48"),
@@ -1467,12 +1460,30 @@ GATE_EDGE_CASES = [
     pytest.param(55, 32, id="55x32"),
     pytest.param(57, 32, id="57x32"),
     pytest.param(129, 48, id="129x48"),
+    pytest.param(148, 48, id="148x48"),
+    pytest.param(149, 48, id="149x48"),
+    pytest.param(152, 48, id="152x48"),
+    pytest.param(153, 48, id="153x48"),
+    pytest.param(1014, 7, id="1014x7"),
+    pytest.param(1015, 7, id="1015x7"),
+    pytest.param(1042, 7, id="1042x7"),
+    pytest.param(1043, 7, id="1043x7"),
+    pytest.param(222, 32, id="222x32"),
+    pytest.param(223, 32, id="223x32"),
+    pytest.param(228, 32, id="228x32"),
+    pytest.param(229, 32, id="229x32"),
     pytest.param(260, 48, id="260x48"),
     pytest.param(261, 48, id="261x48"),
     pytest.param(1786, 7, id="1786x7"),
     pytest.param(1787, 7, id="1787x7"),
     pytest.param(390, 32, id="390x32"),
     pytest.param(391, 32, id="391x32"),
+    pytest.param(282, 48, id="282x48"),
+    pytest.param(283, 48, id="283x48"),
+    pytest.param(1938, 7, id="1938x7"),
+    pytest.param(1939, 7, id="1939x7"),
+    pytest.param(424, 32, id="424x32"),
+    pytest.param(425, 32, id="425x32"),
 ]
 
 

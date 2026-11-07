@@ -224,15 +224,15 @@ inputs, outputs and gradients, a weight shared by every token and head whose
 gradient is summed in a fixed order (repeated calls return the same bits), and
 an autograd wrapper that saves only its inputs.  The forward runs one of several
 fixed-order modules chosen from the row count and the SM count (a short forward
-up to 12 rows per SM, 59 on SM107; from 976 rows per SM, 800 on SM107,
-persistent forwards whose CTAs each walk a few row blocks); every module returns
-the same bits.  Beside a kernel on another stream that holds ``k`` of the ``N``
+up to 48 rows per SM, 64 on SM107; past that, in bands of rows per SM,
+persistent forwards whose CTAs each walk a few row blocks); each module returns
+the same bits on every call.  Beside a kernel on another stream that holds ``k`` of the ``N``
 SMs, a persistent forward takes at most ``N / (N - k)`` times its time alone,
 plus one CTA's share of the row blocks, plus 0.02, and the short forward ends
 no later than the plain forward (within 2 % or 1.5 microseconds).
-On SM107 with fewer than 205 SMs, as on a small MIG instance, the short
-forward's grid at 59 rows per SM is more than one wave, and this bound of the
-short forward is not shown there.
+On SM100 and SM103 with fewer than 64 SMs, as on a small MIG instance, the
+short forward's grid at 48 rows per SM is more than one wave on all SMs but 16,
+and this bound of the short forward is not shown there.
 
 .. rubric:: Mode and dispatch rules
 
@@ -351,14 +351,18 @@ inputs, and within the deterministic package's absolute bounds.
 
 * The forward uses approximate FP32 intrinsics (``rsqrt.approx`` for
   ``rstd``; ``ex2.approx`` and ``rcp.approx`` for the sigmoid).  It runs one
-  of several modules chosen from the row count and the SM count: a short
-  forward up to 12 rows per SM on SM100 and SM103 (59 on SM107), the plain
-  forward, from 976 rows per SM (800 on SM107) a persistent forward whose CTAs
-  each walk at most 2 row blocks, and from 2400 rows per SM on SM100 and SM103
-  a long forward (on SM103 from 3000 and on SM107 from 1740, an extra-long
-  forward that also prefetches its next block).  Each module's arithmetic is
-  fixed, but the modules may associate a row's sum of squares differently, so
-  ``y`` repeats bit for bit for the same inputs on the same device.
+  of several modules chosen by bands of rows per SM: a short forward up to 48
+  rows per SM on SM100 and SM103 (64 on SM107); past that a persistent forward
+  whose CTAs each walk at most 2 row blocks (mid), a long forward, or an
+  extra-long forward that also prefetches its next block.  The bands: on
+  SM100 mid up to 140 rows per SM, long up to 400, extra-long up to 1000, mid
+  past it; on SM103 mid up to 250, extra-long up to 550, mid past it; on SM107
+  mid up to 200, extra-long up to 520, mid past it.  Each module's arithmetic
+  is fixed, but the modules associate a row's sum of squares differently (the
+  short forward: 8-term FMA chains of 16 lanes folded by XOR shuffles 1, 2, 4,
+  8; the others: 16-term chains of 8 lanes folded by 1, 2, 4), so ``y``'s bits
+  can differ between bands, and ``y`` repeats bit for bit for the same inputs
+  on the same device.
 * The backward is one kernel.  ``dx`` and ``dz`` use the deterministic
   backward's row arithmetic.  The weight gradient sums the deterministic
   backward's chunk partials exactly in 64-bit integer windows and rounds once,

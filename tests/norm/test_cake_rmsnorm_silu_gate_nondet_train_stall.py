@@ -17,17 +17,20 @@ Stall regression of the Cake SiLU-gated RMSNorm training forward and the
 non-deterministic (``nondet``) backward beside a kernel resident
 on another stream (the concurrent-launch contract of issues #7038 and #7548).
 
-The forward launches a plain grid of independent CTAs, one 64-thread CTA per
-block of 8 rows.  Up to 12 rows per SM on SM100 and SM103 (59 on SM107) the
-short forward launches one 256-thread CTA per block of 16 rows (fewer CTAs
-than SMs on SM100 and SM103; on SM107 with 205 SMs or more, as with 212 or
-216, at most 4 CTAs per SM on all SMs but 16, which fewer SMs do not keep at
-59 rows per SM).  From 976 rows per SM on SM100 and SM103 (800 on SM107) the
-mid forward launches whole waves of 6 CTAs per SM that each walk at most 2
-blocks of 16 rows; from 2400 rows per SM on SM100 and SM103 the long forward,
-and from 3000 rows per SM on SM103 (1740 on SM107, which routes no long
-forward) the extra-long forward, launch whole waves of 3 CTAs per SM that each
-walk at most 6 blocks of 32 rows.
+The forward runs the program of its architecture's ``FORWARD_BANDS`` band
+of rows per SM.  The plain forward launches a grid of independent CTAs, one
+64-thread CTA per block of 8 rows.  Up to 48 rows per SM on SM100 and SM103
+(64 on SM107) the short forward launches one 256-thread CTA per block of 16
+rows (with 64 SMs or more on SM100 and SM103, as with 148 or 152, at most 4
+CTAs per SM on all SMs but 16, which fewer SMs do not keep at the end of the
+band; on SM107, at most 4 CTAs per SM on all SMs).  The mid forward launches
+whole waves of 6 CTAs per SM that each walk at most 2 blocks of 16 rows; the
+long and the extra-long forward launch whole waves of 3 CTAs per SM that each
+walk at most 6 blocks of 32 rows.  Their bands: on SM100 the mid forward up to 140 rows
+per SM, the long forward up to 400, the extra-long forward up to 1000 and the
+mid forward past it; on SM103 the mid forward up to 250, the extra-long
+forward up to 550 and the mid forward past it; on SM107 the mid forward up to
+200, the extra-long forward up to 520 and the mid forward past it.
 
 The backward cuts the rows into blocks of 8 rows and the blocks into
 ``C = ceil(blocks / B)`` chunks of ``B = max(1, ceil(blocks / 8192))``
@@ -82,15 +85,15 @@ CTAs, so the claimed backward runs all three (there in chunks of 3, 5 and 24
 blocks).  The persistent forwards beside the same side kernels: busy / alone
 is at most ``N / (N - k)``, plus the share of one CTA's blocks in the call (a
 CTA whose slot the side kernel holds walks all of its blocks once it starts),
-plus ``PROPORTIONAL_SLACK``, at the token counts that give the module's CTA
-slots the fewest whole row blocks each at or above its threshold and the most
-below the threshold of the next module the architecture routes, or four times
-the fewest where it routes none: the mid forward 11 and 24 blocks of 16 rows
-(1056 and 2304 rows per SM) on SM100 and SM103, 9 and 18 (864 and 1728 rows
-per SM) on SM107; the long forward 25 and 100 blocks of 32 rows on SM100, 25
-and 31 on SM103; the extra-long forward 32 and 128 on SM103, 19 and 76 on
-SM107.  The short forward at 1 row per SM and at its threshold (12 rows per SM
-on SM100 and SM103, 59 on SM107; on SM107 also at 10 and 30 rows per SM) keeps
+plus ``PROPORTIONAL_SLACK``, in each band of the module, at the token counts
+that give the module's CTA slots the fewest whole row blocks each past the
+previous band's end and the most up to its band's end, or four times the
+fewest in the last band, which has no end: the mid forward 1 and 1 blocks of
+16 rows (96 rows per SM), then 11 and 44, on SM100, 1 and 2, then 6 and 24, on
+SM103 and SM107; the long forward 2 and 4 blocks of 32 rows on SM100; the
+extra-long forward 5 and 10 on SM100, 3 and 5 on SM103 and SM107.  The short
+forward at 1 row per SM and at the end of its band (48 rows per SM on SM100
+and SM103, also at 12; 64 on SM107, also at 10, 30 and 59) keeps
 its speed beside the one-thread kernel, starts beside the all-SM kernel with
 the max-shared carveout, and beside a side kernel that holds ``k`` SMs (the
 item 1 side kernels and 16 CTAs of 1024 threads with the max-shared carveout)
@@ -697,48 +700,58 @@ def test_backward_slows_in_proportion_to_the_sms_held(
 
 # The persistent forwards beside the item 1 side kernels: the CTA slots of the
 # long and the extra-long forward (3 per SM) get row blocks of 32 rows, the mid
-# forward's (6 per SM) row blocks of 16 rows, at the fewest whole blocks per
-# slot at or above the module's rows per SM on the device ("first": the mid
-# forward 11 on SM100 and SM103 and 9 on SM107, the long forward 25, the
-# extra-long forward 32 on SM103 and 19 on SM107) and at the most below the
-# rows per SM of the next module the architecture routes, else four times
-# "first" ("last": the mid forward 24 and 18, the long forward 100 on SM100
-# and 31 on SM103, the extra-long forward 128 on SM103 and 76 on SM107).
+# forward's (6 per SM) row blocks of 16 rows, in the module's ``nth`` band of
+# the architecture's FORWARD_BANDS, at the fewest whole blocks per slot past
+# the previous band's end ("first") and at the most up to the band's end, or
+# four times "first" in the last band, which has no end ("last"): the mid
+# forward 1 and 1, then 11 and 44, on SM100, 1 and 2, then 6 and 24, on SM103
+# and SM107; the long forward 2 and 4 on SM100; the extra-long forward 5 and
+# 10 on SM100, 3 and 5 on SM103 and SM107.
 FORWARD_EDGES = ("first", "last")
+FORWARD_BAND_ORDINALS = (1, 2)
 
 
-def _persistent_forward_tokens(role: str, edge: str) -> tuple[int, int, float]:
+def _forward_band(arch: str, role: str, nth: int) -> tuple[int, int | None]:
+    """``(first, last)`` rows per SM of the ``nth`` band (from 1) of ``role``
+    in the architecture's ``FORWARD_BANDS``: one more than the previous
+    band's end, and the band's end (``None``: no end); skips where the
+    architecture has fewer bands of ``role``."""
+    first, seen = 1, 0
+    for last, band in loader.FORWARD_BANDS[arch]:
+        if band == role:
+            seen += 1
+            if seen == nth:
+                return first, last
+        if last is not None:
+            first = int(last) + 1
+    pytest.skip(f"{arch} has {seen} forward band(s) of {role}, not {nth}")
+
+
+def _persistent_forward_tokens(
+    role: str, edge: str, nth: int
+) -> tuple[int, int, float]:
     """``(blocks_per_slot, T, cta_share)``: the row blocks per CTA slot of the
     forward module of ``role`` (``fwd_xlong``, ``fwd_long`` or ``fwd_mid``)
-    at ``edge`` of its rows, the fewest tokens ``T`` whose ``T * H`` rows give
-    each slot that many, and the share of one CTA's blocks in the call alone
-    (blocks a CTA walks over blocks a slot runs); skips where the architecture
-    routes no such module."""
+    at ``edge`` of its ``nth`` band, the fewest tokens ``T`` whose ``T * H``
+    rows give each slot that many, and the share of one CTA's blocks in the
+    call alone (blocks a CTA walks over blocks a slot runs); skips where the
+    architecture routes no such module or band."""
     device_index = torch.cuda.current_device()
     arch = loader.device_arch(device_index)
-    routes = loader.ROUTES[arch]
-    name = routes.get(role)
+    name = loader.ROUTES[arch].get(role)
     if name is None:
         pytest.skip(f"{arch} routes no {role} module")
+    first, last = _forward_band(arch, role, nth)
     sms = torch.cuda.get_device_properties(device_index).multi_processor_count
     rule = loader.MODULES[name]["grid_rule"]
     slots = int(rule["ctas_per_sm"]) * sms
     rows_per_block = int(rule["rows_per_block"])
     # rows per SM that give each slot of the SM one more row block
     step = int(rule["ctas_per_sm"]) * rows_per_block
-    blocks_per_slot = -(-loader.min_rows_per_sm(name, arch) // step)
-    # the "last" edge: the most below the next tier's start where the
-    # architecture routes one (the mid forward below the long one, or on
-    # sm_107a, which routes no long forward, below the extra-long one; on
-    # sm_103a the long forward below the extra-long one), else four times
-    # "first"
-    uppers = {"fwd_mid": ("fwd_long", "fwd_xlong"), "fwd_long": ("fwd_xlong",)}
-    upper = next((u for u in uppers.get(role, ()) if u in routes), None)
-    if edge == "last" and upper is not None:
-        upper_start = loader.min_rows_per_sm(routes[upper], arch)
-        blocks_per_slot = (upper_start - 1) // step
-    elif edge == "last":
-        blocks_per_slot *= 4
+    blocks_per_slot = -(-first // step)
+    if edge == "last":
+        blocks_per_slot = 4 * blocks_per_slot if last is None else last // step
+    assert blocks_per_slot >= 1, (arch, role, nth, edge)
     tokens = -(-(blocks_per_slot * slots * rows_per_block) // H)
     rows = tokens * H
     assert loader.module_for_rows(arch, "fwd", rows, sms) == name
@@ -747,8 +760,10 @@ def _persistent_forward_tokens(role: str, edge: str) -> tuple[int, int, float]:
     return blocks_per_slot, tokens, -(-blocks // ctas) * slots / blocks
 
 
-def _forward_slows_in_proportion(role: str, edge: str, ctas: int, threads: int) -> None:
-    blocks_per_slot, tokens, cta_share = _persistent_forward_tokens(role, edge)
+def _forward_slows_in_proportion(
+    role: str, edge: str, nth: int, ctas: int, threads: int
+) -> None:
+    blocks_per_slot, tokens, cta_share = _persistent_forward_tokens(role, edge, nth)
     x, z, w, _dy = _inputs(tokens)
     y = torch.empty_like(x)
 
@@ -781,42 +796,45 @@ def _forward_slows_in_proportion(role: str, edge: str, ctas: int, threads: int) 
     "ctas,threads", PROPORTIONAL_SIDES, ids=["1x128", "16x640", "32x640"]
 )
 @pytest.mark.parametrize("edge", FORWARD_EDGES)
+@pytest.mark.parametrize("nth", FORWARD_BAND_ORDINALS, ids=["band1", "band2"])
 def test_long_forward_slows_in_proportion_to_the_sms_held(
-    edge: str, ctas: int, threads: int
+    nth: int, edge: str, ctas: int, threads: int
 ) -> None:
-    _forward_slows_in_proportion("fwd_long", edge, ctas, threads)
+    _forward_slows_in_proportion("fwd_long", edge, nth, ctas, threads)
 
 
 @pytest.mark.parametrize(
     "ctas,threads", PROPORTIONAL_SIDES, ids=["1x128", "16x640", "32x640"]
 )
 @pytest.mark.parametrize("edge", FORWARD_EDGES)
+@pytest.mark.parametrize("nth", FORWARD_BAND_ORDINALS, ids=["band1", "band2"])
 def test_extra_long_forward_slows_in_proportion_to_the_sms_held(
-    edge: str, ctas: int, threads: int
+    nth: int, edge: str, ctas: int, threads: int
 ) -> None:
-    _forward_slows_in_proportion("fwd_xlong", edge, ctas, threads)
+    _forward_slows_in_proportion("fwd_xlong", edge, nth, ctas, threads)
 
 
 @pytest.mark.parametrize(
     "ctas,threads", PROPORTIONAL_SIDES, ids=["1x128", "16x640", "32x640"]
 )
 @pytest.mark.parametrize("edge", FORWARD_EDGES)
+@pytest.mark.parametrize("nth", FORWARD_BAND_ORDINALS, ids=["band1", "band2"])
 def test_mid_forward_slows_in_proportion_to_the_sms_held(
-    edge: str, ctas: int, threads: int
+    nth: int, edge: str, ctas: int, threads: int
 ) -> None:
-    _forward_slows_in_proportion("fwd_mid", edge, ctas, threads)
+    _forward_slows_in_proportion("fwd_mid", edge, nth, ctas, threads)
 
 
 # The short forward: the rows per SM of its token counts on each architecture
-# (one row per SM and its threshold, the largest, up to which the architecture
-# runs it: 12 on sm_100a and sm_103a, 59 on sm_107a, where 10 and 30 are probed
-# as well), and the side kernels of the item 1 test beside it, the issue's three
+# (one row per SM and the end of its band, the largest, up to which the
+# architecture runs it: 48 on sm_100a and sm_103a, where 12 is probed as well,
+# 64 on sm_107a, where 10, 30 and 59 are probed as well), and the side kernels of the item 1 test beside it, the issue's three
 # with the default carveout and 16 CTAs of 1024 threads with the max-shared
 # carveout.
 SHORT_FORWARD_ROWS_PER_SM = {
-    "sm_100a": (1, 12),
-    "sm_103a": (1, 12),
-    "sm_107a": (1, 10, 30, 59),
+    "sm_100a": (1, 12, 48),
+    "sm_103a": (1, 12, 48),
+    "sm_107a": (1, 10, 30, 59, 64),
 }
 SHORT_FORWARD_EDGES = tuple(sorted(set().union(*SHORT_FORWARD_ROWS_PER_SM.values())))
 SHORT_FORWARD_SIDES = ((1, 128, None), (16, 640, None), (32, 640, None)) + (
@@ -834,7 +852,7 @@ SHORT_EXTRA_ATTEMPTS = 2
 def _short_forward_tokens(rows_per_sm: int) -> int:
     """The most tokens ``T`` (at least one) whose ``T * H`` rows stay within
     ``rows_per_sm`` rows per SM, one of the architecture's
-    ``SHORT_FORWARD_ROWS_PER_SM`` (the largest its threshold), where the
+    ``SHORT_FORWARD_ROWS_PER_SM`` (the largest the end of its band), where the
     architecture routes the short forward (skips elsewhere)."""
     device_index = torch.cuda.current_device()
     arch = loader.device_arch(device_index)
@@ -844,7 +862,8 @@ def _short_forward_tokens(rows_per_sm: int) -> int:
     if rows_per_sm not in SHORT_FORWARD_ROWS_PER_SM[arch]:
         pytest.skip(f"{arch} does not probe {rows_per_sm} rows per SM")
     sms = torch.cuda.get_device_properties(device_index).multi_processor_count
-    assert loader.max_rows_per_sm(name, arch) == max(SHORT_FORWARD_ROWS_PER_SM[arch])
+    (last, role) = loader.FORWARD_BANDS[arch][0]
+    assert role == "fwd_short" and last == max(SHORT_FORWARD_ROWS_PER_SM[arch])
     tokens = max(1, rows_per_sm * sms // H)
     assert loader.module_for_rows(arch, "fwd", tokens * H, sms) == name
     return tokens
