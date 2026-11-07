@@ -446,6 +446,30 @@ def validate_values(ground_truth, topk_values_kernel, tokens_to_skip, data_type)
         raise
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
+def test_dsv3_fused_routing_normalizes_negative_logits(dtype, use_cuda_graph):
+    scores = torch.full((128, 256), -20.0, device="cuda", dtype=dtype)
+    bias = -torch.arange(256, device="cuda", dtype=torch.float32) / 8
+    weights = torch.empty((128, 8), device="cuda", dtype=dtype)
+    ids = torch.empty((128, 8), device="cuda", dtype=torch.int32)
+
+    def run():
+        fused_topk_deepseek(scores, bias, 8, 4, 8, 2.5, weights, ids, backend="default")
+
+    run()
+    if use_cuda_graph:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        graph.replay()
+    expected_ids = torch.arange(8, device="cuda").expand(128, 8)
+    torch.testing.assert_close(ids.long().sort(dim=1).values, expected_ids)
+    torch.testing.assert_close(
+        weights, torch.full_like(weights, 0.3125), rtol=0, atol=0
+    )
+
+
 @pytest.mark.parametrize("backend", ["default", "cake"])
 @pytest.mark.parametrize(
     "num_experts,n_group,topk_group,topk",
