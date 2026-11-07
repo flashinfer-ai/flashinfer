@@ -17,24 +17,29 @@ Tests for the Cake fused SwiGLU + MXFP8 quantization training kernels
 (forward and backward; SM100 / SM103 / SM107).
 
 Every output byte -- the E4M3 codes of the rowwise and colwise values and the
-E8M0 scale bytes in the swizzled 128 x 4 layout -- is compared exactly, with
-no tolerance, against a plain-torch reference of the same math
-(``tests/test_helpers/cake_gated_act_mxfp8_reference.py``).  Every program of
-every route (forward / backward x rowwise / colwise / both) on the device's
-architecture runs directly, whatever the selection rule would pick, on unit
-normals, block-scaled normals, special values (NaN, Inf, zero and subnormal
-blocks, overflowing products, gates around the reciprocal's 2^126 boundary)
-and every BF16 bit pattern as a gate; the entry points run at sizes at which
-the selection rule picks each program.  The suite also holds the selection rule,
-argument validation, zero-size disabled outputs, CUDA Graph replay, the
-absence of rebuilds on a changed shape and the ``build.json`` contract.
+E8M0 scale bytes in the swizzled 128 x 4 layout -- is compared exactly, with no
+tolerance, against a plain-torch reference of the same math
+(``tests/test_helpers/cake_gated_act_mxfp8_det_train_reference.py``).  Every
+program of every route (forward / backward x rowwise / colwise / both) on the
+device's architecture runs directly, whatever the selection rule would pick, on
+unit normals, block-scaled normals, special values (NaN, Inf, zero and
+subnormal blocks, overflowing products, gates around the reciprocal's 2^126
+boundary), blocks on the E4M3 and E8M0 boundaries (the E4M3 maximum and
+rounding ties, a block maximum of mantissa 1.75 and just above, powers of two,
+the smallest and largest scales; along rows and along columns) and every BF16
+bit pattern as a gate; the entry points run at sizes at which the selection
+rule picks each program.  Every output repeats bit for bit over five calls on
+identical inputs, through the entry points and through each program.  The suite
+also holds the selection rule, argument validation, zero-size disabled outputs,
+CUDA Graph replay, the absence of rebuilds on a changed shape and the
+``build.json`` contract.
 
 This suite exercises the backend package alone: it names the package once,
 through ``tests.test_helpers.cake_package``, and imports nothing else from
 flashinfer, so a build that vendors the package under another import path
 runs it unchanged after pointing that table entry at its package.  The
-``flashinfer.gated_act_mxfp8`` facade is covered by
-``test_cake_gated_act_mxfp8_api.py``.
+``flashinfer.cake_gated_act_mxfp8_det_train`` facade is covered by
+``test_cake_gated_act_mxfp8_det_train_api.py``.
 """
 
 from __future__ import annotations
@@ -45,12 +50,12 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.test_helpers import cake_gated_act_mxfp8_reference as reference
+from tests.test_helpers import cake_gated_act_mxfp8_det_train_reference as reference
 from tests.test_helpers.cake_package import cake_package
 
-pkg = cake_package("cake_gated_act_mxfp8")
-cake_build = cake_package("cake_gated_act_mxfp8", "cake_build")
-loader = cake_package("cake_gated_act_mxfp8", "cake_jit")
+pkg = cake_package("cake_gated_act_mxfp8_det_train")
+cake_build = cake_package("cake_gated_act_mxfp8_det_train", "cake_build")
+loader = cake_package("cake_gated_act_mxfp8_det_train", "cake_jit")
 
 ROUTES = {
     "fwd_row": (False, True, False),
@@ -91,7 +96,7 @@ def _supported() -> bool:
 
 pytestmark = pytest.mark.skipif(
     not _supported(),
-    reason="cake_gated_act_mxfp8 needs an SM100 / SM103 / SM107 device",
+    reason="cake_gated_act_mxfp8_det_train needs an SM100 / SM103 / SM107 device",
 )
 
 
@@ -122,13 +127,13 @@ def _expected(gated_input, grad_output, *, backward, rowwise, colwise):
 def _run_program(name, gated_input, grad_output, *, backward, rowwise, colwise):
     """Run module ``name`` directly (not through the selection rule)."""
 
-    M, K = pkg.check_inputs(
+    M, K = pkg.cake_gated_act_mxfp8_det_train_check_inputs(
         gated_input,
         grad_output if backward else None,
         rowwise=rowwise,
         colwise=colwise,
     )
-    outputs = pkg.empty_outputs(
+    outputs = pkg.cake_gated_act_mxfp8_det_train_empty_outputs(
         gated_input, backward=backward, rowwise=rowwise, colwise=colwise
     )
     row_output, col_output, row_scales, col_scales = outputs
@@ -144,7 +149,7 @@ def _run_program(name, gated_input, grad_output, *, backward, rowwise, colwise):
     if backward:
         values["grad_output"] = grad_output
     loader.run_module(name, values, device_index=0)
-    return pkg.logical_outputs(outputs)
+    return pkg.cake_gated_act_mxfp8_det_train_logical_outputs(outputs)
 
 
 def _assert_bytes(outputs, expected, *, rowwise, colwise, what):
@@ -199,17 +204,76 @@ def test_entry_points_match_the_reference(kind, shape) -> None:
     M, K = shape
     gated_input, grad_output = reference.make_inputs(M, K, values="normal", seed=7)
     if backward:
-        outputs = pkg.silu_and_mul_mxfp8_quantize_backward(
+        outputs = pkg.cake_gated_act_mxfp8_det_train_backward(
             gated_input, grad_output, rowwise=rowwise, colwise=colwise
         )
     else:
-        outputs = pkg.silu_and_mul_mxfp8_quantize(
+        outputs = pkg.cake_gated_act_mxfp8_det_train_forward(
             gated_input, rowwise=rowwise, colwise=colwise
         )
     expected = _expected(
         gated_input, grad_output, backward=backward, rowwise=rowwise, colwise=colwise
     )
     _assert_bytes(outputs, expected, rowwise=rowwise, colwise=colwise, what=kind)
+
+
+REPEATS = 5
+
+
+@pytest.mark.parametrize("values", ("scaled", "special", "boundary"))
+@pytest.mark.parametrize("kind", tuple(ROUTES))
+def test_outputs_repeat_bit_for_bit(kind, values) -> None:
+    """Every output (the E4M3 values and E8M0 scales of each enabled
+    orientation) repeats bit for bit over five calls on identical inputs:
+    through the entry point at every shape of ``ENTRY_SHAPES`` (so every
+    program the selection rule picks on this architecture runs) and through
+    every program of the route directly.  A checkpointed recompute of the
+    forward is such a repeated call, so it returns the saved bits."""
+
+    backward, rowwise, colwise = ROUTES[kind]
+
+    def call(gated_input, grad_output):
+        if backward:
+            return pkg.cake_gated_act_mxfp8_det_train_backward(
+                gated_input, grad_output, rowwise=rowwise, colwise=colwise
+            )
+        return pkg.cake_gated_act_mxfp8_det_train_forward(
+            gated_input, rowwise=rowwise, colwise=colwise
+        )
+
+    def same(runs, what):
+        first = reference.output_bytes(runs[0], rowwise=rowwise, colwise=colwise)
+        for repeat, outputs in enumerate(runs[1:], start=1):
+            got = reference.output_bytes(outputs, rowwise=rowwise, colwise=colwise)
+            assert set(got) == set(first), what
+            for key, want in first.items():
+                assert torch.equal(got[key], want), f"{what}: {key}, call {repeat}"
+
+    for M, K in ENTRY_SHAPES:
+        gated_input, grad_output = reference.make_inputs(
+            M, K, values=values, seed=M ^ K
+        )
+        same(
+            [call(gated_input, grad_output) for _ in range(REPEATS)],
+            f"{kind} entry M={M} K={K} {values}",
+        )
+    M, K = PROGRAM_SHAPES[1]
+    gated_input, grad_output = reference.make_inputs(M, K, values=values, seed=11)
+    for name in loader.route_modules(_arch(), kind):
+        same(
+            [
+                _run_program(
+                    name,
+                    gated_input,
+                    grad_output,
+                    backward=backward,
+                    rowwise=rowwise,
+                    colwise=colwise,
+                )
+                for _ in range(REPEATS)
+            ],
+            f"{kind} {name} M={M} K={K} {values}",
+        )
 
 
 def test_output_layouts_and_disabled_outputs() -> None:
@@ -219,11 +283,11 @@ def test_output_layouts_and_disabled_outputs() -> None:
         N = 2 * K if backward else K
         for rowwise, colwise in ((True, False), (False, True), (True, True)):
             if backward:
-                outputs = pkg.silu_and_mul_mxfp8_quantize_backward(
+                outputs = pkg.cake_gated_act_mxfp8_det_train_backward(
                     gated_input, grad_output, rowwise=rowwise, colwise=colwise
                 )
             else:
-                outputs = pkg.silu_and_mul_mxfp8_quantize(
+                outputs = pkg.cake_gated_act_mxfp8_det_train_forward(
                     gated_input, rowwise=rowwise, colwise=colwise
                 )
             row_output, col_output, row_scales, col_scales = outputs
@@ -284,8 +348,8 @@ def test_selection_rule() -> None:
 def test_argument_validation() -> None:
     M, K = 256, 256
     gated_input, grad_output = reference.make_inputs(M, K)
-    forward = pkg.silu_and_mul_mxfp8_quantize
-    backward = pkg.silu_and_mul_mxfp8_quantize_backward
+    forward = pkg.cake_gated_act_mxfp8_det_train_forward
+    backward = pkg.cake_gated_act_mxfp8_det_train_backward
     with pytest.raises(ValueError, match="CUDA tensor"):
         forward(gated_input.cpu())
     with pytest.raises(TypeError, match="bfloat16"):
@@ -320,13 +384,15 @@ def test_int32_index_bound() -> None:
     # is rejected although its last gate element (M * 2K - K - 1) is in range.
     accepted = torch.empty(2**23, 256, dtype=torch.bfloat16, device="cuda")
     for rowwise, colwise in ((True, False), (False, True), (True, True)):
-        m_k = pkg.check_inputs(accepted, None, rowwise=rowwise, colwise=colwise)
+        m_k = pkg.cake_gated_act_mxfp8_det_train_check_inputs(
+            accepted, None, rowwise=rowwise, colwise=colwise
+        )
         assert m_k == (2**23, 128)
     del accepted
     M, K = 128, 2**23 + 128
     rejected = torch.empty(M, 2 * K, dtype=torch.bfloat16, device="cuda")
     assert M * 2 * K - K - 1 <= 2**31 - 1 < M * 2 * K - 1
-    forward = pkg.silu_and_mul_mxfp8_quantize
+    forward = pkg.cake_gated_act_mxfp8_det_train_forward
     for rowwise, colwise in ((True, False), (False, True), (True, True)):
         with pytest.raises(ValueError, match="signed int32"):
             forward(rejected, rowwise=rowwise, colwise=colwise)
@@ -336,8 +402,10 @@ def test_cuda_graph_replays_match_eager() -> None:
     M, K = 512, 1024
     gated_input, grad_output = reference.make_inputs(M, K, values="scaled", seed=3)
     eager = [
-        pkg.silu_and_mul_mxfp8_quantize(gated_input, rowwise=True, colwise=True),
-        pkg.silu_and_mul_mxfp8_quantize_backward(
+        pkg.cake_gated_act_mxfp8_det_train_forward(
+            gated_input, rowwise=True, colwise=True
+        ),
+        pkg.cake_gated_act_mxfp8_det_train_backward(
             gated_input, grad_output, rowwise=True, colwise=True
         ),
     ]
@@ -345,13 +413,17 @@ def test_cuda_graph_replays_match_eager() -> None:
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         for _ in range(2):
-            pkg.silu_and_mul_mxfp8_quantize(gated_input, rowwise=True, colwise=True)
+            pkg.cake_gated_act_mxfp8_det_train_forward(
+                gated_input, rowwise=True, colwise=True
+            )
     torch.cuda.current_stream().wait_stream(stream)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = [
-            pkg.silu_and_mul_mxfp8_quantize(gated_input, rowwise=True, colwise=True),
-            pkg.silu_and_mul_mxfp8_quantize_backward(
+            pkg.cake_gated_act_mxfp8_det_train_forward(
+                gated_input, rowwise=True, colwise=True
+            ),
+            pkg.cake_gated_act_mxfp8_det_train_backward(
                 gated_input, grad_output, rowwise=True, colwise=True
             ),
         ]
@@ -373,11 +445,11 @@ def test_changing_shapes_do_not_rebuild() -> None:
         gated_input, grad_output = reference.make_inputs(M, K)
         for backward, rowwise, colwise in ROUTES.values():
             if backward:
-                pkg.silu_and_mul_mxfp8_quantize_backward(
+                pkg.cake_gated_act_mxfp8_det_train_backward(
                     gated_input, grad_output, rowwise=rowwise, colwise=colwise
                 )
             else:
-                pkg.silu_and_mul_mxfp8_quantize(
+                pkg.cake_gated_act_mxfp8_det_train_forward(
                     gated_input, rowwise=rowwise, colwise=colwise
                 )
     torch.cuda.synchronize()
@@ -405,7 +477,9 @@ def test_registry_records_reference_the_build_manifest() -> None:
     assert manifest["schema"] == "cake-build/1"
     # The package the manifest was written for, also when this copy is imported
     # under another name.
-    assert manifest["package"] == "flashinfer.cake_gated_act_mxfp8_backend"
+    assert manifest["package"] == (
+        "flashinfer.experimental.cake.cake_gated_act_mxfp8_det_train"
+    )
     libraries = cake_build.libraries_by_name()
     package = Path(cake_build.__file__).parent
     routed = {

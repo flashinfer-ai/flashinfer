@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Trace templates for fused gated activation and MXFP8 quantization."""
+"""Trace templates for the Cake fused SwiGLU + MXFP8 quantization (deterministic)."""
 
 from typing import Any, Callable, cast
 
@@ -276,7 +276,7 @@ def _make_trace(
     ]
     return TraceTemplate(
         op_type="activation_quantize",
-        name_prefix=f"silu_and_mul_mxfp8_{direction}_{mode}",
+        name_prefix=f"cake_gated_act_mxfp8_det_train_{direction}_{mode}",
         description=(
             f"Fused {'SwiGLU' if direction == 'forward' else 'SwiGLU backward'} "
             f"with RCEIL MXFP8 {mode} quantization."
@@ -301,65 +301,65 @@ def _make_trace(
     )
 
 
-silu_and_mul_mxfp8_forward_row_trace = _make_trace(
+cake_gated_act_mxfp8_det_train_forward_row_trace = _make_trace(
     "forward", True, False, _forward_row_init
 )
-silu_and_mul_mxfp8_forward_col_trace = _make_trace(
+cake_gated_act_mxfp8_det_train_forward_col_trace = _make_trace(
     "forward", False, True, _forward_col_init
 )
-silu_and_mul_mxfp8_forward_both_trace = _make_trace(
+cake_gated_act_mxfp8_det_train_forward_both_trace = _make_trace(
     "forward", True, True, _forward_both_init
 )
-silu_and_mul_mxfp8_backward_row_trace = _make_trace(
+cake_gated_act_mxfp8_det_train_backward_row_trace = _make_trace(
     "backward", True, False, _backward_row_init
 )
-silu_and_mul_mxfp8_backward_col_trace = _make_trace(
+cake_gated_act_mxfp8_det_train_backward_col_trace = _make_trace(
     "backward", False, True, _backward_col_init
 )
-silu_and_mul_mxfp8_backward_both_trace = _make_trace(
+cake_gated_act_mxfp8_det_train_backward_both_trace = _make_trace(
     "backward", True, True, _backward_both_init
 )
 
 
-def silu_and_mul_mxfp8_forward_trace_dispatch(**kwargs):
+def cake_gated_act_mxfp8_det_train_forward_trace_dispatch(**kwargs):
     rowwise = bool(kwargs.get("rowwise", True))
     colwise = bool(kwargs.get("colwise", False))
     if rowwise and colwise:
-        return silu_and_mul_mxfp8_forward_both_trace
+        return cake_gated_act_mxfp8_det_train_forward_both_trace
     if rowwise:
-        return silu_and_mul_mxfp8_forward_row_trace
+        return cake_gated_act_mxfp8_det_train_forward_row_trace
     if colwise:
-        return silu_and_mul_mxfp8_forward_col_trace
+        return cake_gated_act_mxfp8_det_train_forward_col_trace
     raise ValueError("at least one quantization route must be enabled")
 
 
-silu_and_mul_mxfp8_forward_trace_dispatch.templates = [  # type: ignore[attr-defined]
-    silu_and_mul_mxfp8_forward_row_trace,
-    silu_and_mul_mxfp8_forward_col_trace,
-    silu_and_mul_mxfp8_forward_both_trace,
+cake_gated_act_mxfp8_det_train_forward_trace_dispatch.templates = [  # type: ignore[attr-defined]
+    cake_gated_act_mxfp8_det_train_forward_row_trace,
+    cake_gated_act_mxfp8_det_train_forward_col_trace,
+    cake_gated_act_mxfp8_det_train_forward_both_trace,
 ]
 
 
-def silu_and_mul_mxfp8_backward_trace_dispatch(**kwargs):
+def cake_gated_act_mxfp8_det_train_backward_trace_dispatch(**kwargs):
     rowwise = bool(kwargs.get("rowwise", True))
     colwise = bool(kwargs.get("colwise", False))
     if rowwise and colwise:
-        return silu_and_mul_mxfp8_backward_both_trace
+        return cake_gated_act_mxfp8_det_train_backward_both_trace
     if rowwise:
-        return silu_and_mul_mxfp8_backward_row_trace
+        return cake_gated_act_mxfp8_det_train_backward_row_trace
     if colwise:
-        return silu_and_mul_mxfp8_backward_col_trace
+        return cake_gated_act_mxfp8_det_train_backward_col_trace
     raise ValueError("at least one quantization route must be enabled")
 
 
-silu_and_mul_mxfp8_backward_trace_dispatch.templates = [  # type: ignore[attr-defined]
-    silu_and_mul_mxfp8_backward_row_trace,
-    silu_and_mul_mxfp8_backward_col_trace,
-    silu_and_mul_mxfp8_backward_both_trace,
+cake_gated_act_mxfp8_det_train_backward_trace_dispatch.templates = [  # type: ignore[attr-defined]
+    cake_gated_act_mxfp8_det_train_backward_row_trace,
+    cake_gated_act_mxfp8_det_train_backward_col_trace,
+    cake_gated_act_mxfp8_det_train_backward_both_trace,
 ]
 
 
 __all__ = [
-    "silu_and_mul_mxfp8_backward_trace_dispatch",
-    "silu_and_mul_mxfp8_forward_trace_dispatch",
+    "cake_gated_act_mxfp8_det_train_backward_trace_dispatch",
+    "cake_gated_act_mxfp8_det_train_forward_trace_dispatch",
 ]

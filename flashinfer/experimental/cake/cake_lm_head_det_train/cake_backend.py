@@ -8521,6 +8521,32 @@ def _kept_result(result: ForwardResult, logits: Optional[tuple]) -> KeptForwardR
     )
 
 
+def _zero_accumulator(shape: tuple[int, ...], device: torch.device) -> torch.Tensor:
+    """An FP32 zero accumulator of ``shape`` without its storage: a stride-0 view of one zero element.  A call that
+    launches no gradient GEMM (:func:`_empty_forward`) returns it as ``dw_acc``, so no FP32 ``[V, H]`` buffer lives
+    from the forward to the backward."""
+    return torch.zeros((), dtype=torch.float32, device=device).expand(shape)
+
+
+def _is_zero_accumulator(acc: torch.Tensor) -> bool:
+    """``acc`` is a :func:`_zero_accumulator` (every stride 0, at least one element)."""
+    return acc.numel() > 0 and all(s == 0 for s in acc.stride())
+
+
+def _zero_gradient(
+    acc: torch.Tensor, grad: Optional[torch.Tensor], out_dtype: torch.dtype
+) -> torch.Tensor:
+    """``cast(g * 0)`` of a :func:`_zero_accumulator` in a new ``out_dtype`` tensor of its shape, without reading or
+    materializing the FP32 accumulator: the bits :func:`scale_cast` gives for a zero FP32 accumulator (``+0``, ``-0``
+    for a negative ``g``, NaN for a non-finite one)."""
+    if out_dtype not in GRAD_WEIGHT_DTYPES:
+        raise ValueError("the cast produces bfloat16 or float32")
+    out = torch.zeros(acc.shape, dtype=out_dtype, device=acc.device)
+    if grad is not None:
+        out.mul_(grad.detach().reshape(()).to(device=acc.device, dtype=torch.float32))
+    return out
+
+
 def _empty_forward(
     problem: Problem,
     X: torch.Tensor,
@@ -8531,11 +8557,14 @@ def _empty_forward(
     row_valid: Optional[torch.Tensor] = None,
     fuse_dw_cast: Optional[bool] = None,
     dx_finalize: Optional[bool] = None,
+    backend: str = "cake",
 ) -> ForwardResult:
     """Zeros without binding or launching: ``T == 0``, or every row ignored (``row_index`` empty).
 
     ``fuse_dw_cast`` / ``dx_finalize`` are the call's switches (``None`` = the documented default), so the memory
-    report records the form the caller asked for, as a launched call's would."""
+    report records the form the caller asked for, as a launched call's would.  ``backend``: the call's, kept on the
+    result for :meth:`ForwardResult.backward`.  The loss entry's ``dw_acc`` is a zero accumulator without ``[V, H]``
+    storage (:func:`_zero_accumulator`): the backward forms the zero weight gradient in the output dtype."""
     device = X.device
     T = int(problem.num_rows)
     memory = memory_report(
@@ -8560,12 +8589,11 @@ def _empty_forward(
             dx_acc=torch.zeros((0, problem.hidden), dtype=torch.float32, device=device)
             if need_dx
             else None,
-            dw_acc=torch.zeros(
-                (problem.vocab, problem.hidden), dtype=torch.float32, device=device
-            )
+            dw_acc=_zero_accumulator((problem.vocab, problem.hidden), device)
             if need_dw
             else None,
             memory=memory,
+            backend=backend,
             row_index=row_index,
             row_valid=row_valid,
             num_rows=T,
@@ -8749,6 +8777,7 @@ def forward_loss(
             need_dw=need_dw,
             fuse_dw_cast=fuse_dw_cast,
             dx_finalize=dx_finalize,
+            backend=backend,
         )
     fused_dx = bool(
         need_dx and _resolve_dx_finalize(dx_finalize)
@@ -8830,56 +8859,9 @@ def forward_loss(
     zero_pass = bool(zero_rows and return_logp)
     zero_first = zero_pass and zero_order
     chunk0_alive = zero_first and hc is not None
-    # Ahead of a loop that keeps the FP32 weight-gradient accumulator (``pass_arena``, :func:`zero_weight_memory`): the
-    # accumulator is allocated first and the pass's chunk buffers are views of it (:func:`_arena_views`; the loop writes
-    # it before reading it), so the reserved peak stays within the plain call's.
-    arena = (
-        torch.empty(
-            (problem.vocab, problem.hidden), dtype=torch.float32, device=X.device
-        )
-        if zero_arena and zero_first and backend == "cake"
-        else None
-    )
-    zero_logp = (
-        _zero_weight_logp(
-            problem,
-            X,
-            W,
-            labels,
-            zero_index,
-            backend=backend,
-            gemm_tuning=tuning,
-            arena=arena,
-        )
-        if zero_first
-        else None
-    )
-    if (
+    no_loop = (
         row_index is not None and row_index.numel() == 0
-    ):  # every row ignored (or of zero weight)
-        hc = None
-        result = _empty_forward(
-            problem,
-            X,
-            need_dx=need_dx,
-            need_dw=need_dw,
-            row_index=row_index,
-            row_valid=row_valid,
-            fuse_dw_cast=fuse_dw_cast,
-            dx_finalize=fused_dx,
-        )
-        if exact:
-            # the plain path's reduction of the zero-weight rows' terms (their weights): its bits on either backend
-            result.loss = _zero_weight_exact_loss(
-                problem, None, row_index, zero_index, loss_weights, backend=backend
-            ).reshape(())
-        if zero_pass and not zero_first:
-            zero_logp = _zero_weight_logp(
-                problem, X, W, labels, zero_index, backend=backend, gemm_tuning=tuning
-            )
-        return _with_zero_weight_rows(
-            result, zero_index, zero_logp, chunk0_alive=chunk0_alive, exact=exact
-        )
+    )  # every row ignored (or of zero weight)
     valid_count = None if row_index is None else int(row_index.numel())
     common = dict(
         objective=objective,
@@ -8896,22 +8878,95 @@ def forward_loss(
     cache = BINDING_CACHE
     key = None
     binding = None
-    if backend == "cake" and cache.enabled:
-        key = forward_binding_key(
+    # the pass arena below (the loop's FP32 weight-gradient accumulator, allocated ahead of the logp-only pass)
+    with_arena = bool(zero_arena and zero_first and backend == "cake")
+    if backend == "cake" and not no_loop:
+        if cache.enabled:
+            key = forward_binding_key(
+                X,
+                W,
+                labels,
+                entry="loss",
+                valid_rows=valid_count,
+                fuse_dw_cast=fuse,
+                gemm_tuning=tuning,
+                dx_finalize=fused_dx,
+                hidden_count=hc is not None,
+                **common,
+            )
+            if dx_cap is not None:  # the split's capped dX slice counts
+                key += ("dx_slices_cap", int(dx_cap))
+            binding = cache.lookup(key)
+        if binding is None and with_arena:
+            # a call that misses the cache prepares its binding (below) before the arena exists, so the runner's
+            # workspace and the arena never coexist
+            runner = prepare_lm_head_det_loss(
+                X,
+                W,
+                labels,
+                entry="loss",
+                backend=backend,
+                compact_rows=False if row_index is None else row_index,
+                fuse_dw_cast=fuse,
+                gemm_tuning=tuning,
+                dx_finalize=fused_dx,
+                dw_stream=stream_mode,
+                dx_slices_cap=dx_cap,
+                **common,
+            )
+            binding = _Binding.from_runner(runner, hc)
+            del runner
+            if key is not None:
+                cache.remember(key, binding)
+    # Ahead of a loop that keeps the FP32 weight-gradient accumulator (``pass_arena``, :func:`zero_weight_memory`): the
+    # accumulator is allocated first and the pass's chunk buffers are views of it (:func:`_arena_views`; the loop writes
+    # it before reading it), so the reserved peak stays within the plain call's.
+    arena = (
+        torch.empty(
+            (problem.vocab, problem.hidden), dtype=torch.float32, device=X.device
+        )
+        if with_arena
+        else None
+    )
+    zero_logp = (
+        _zero_weight_logp(
+            problem,
             X,
             W,
             labels,
-            entry="loss",
-            valid_rows=valid_count,
-            fuse_dw_cast=fuse,
+            zero_index,
+            backend=backend,
             gemm_tuning=tuning,
-            dx_finalize=fused_dx,
-            hidden_count=hc is not None,
-            **common,
+            arena=arena,
         )
-        if dx_cap is not None:
-            key += ("dx_slices_cap", int(dx_cap))  # the split's capped dX slice counts
-        binding = cache.lookup(key)
+        if zero_first
+        else None
+    )
+    if no_loop:
+        hc = None
+        result = _empty_forward(
+            problem,
+            X,
+            need_dx=need_dx,
+            need_dw=need_dw,
+            row_index=row_index,
+            row_valid=row_valid,
+            fuse_dw_cast=fuse_dw_cast,
+            dx_finalize=fused_dx,
+            backend=backend,
+        )
+        if exact:
+            # the plain path's reduction of the zero-weight rows' terms (their weights): its bits on either backend
+            result.loss = _zero_weight_exact_loss(
+                problem, None, row_index, zero_index, loss_weights, backend=backend
+            ).reshape(())
+        if zero_pass and not zero_first:
+            zero_logp = _zero_weight_logp(
+                problem, X, W, labels, zero_index, backend=backend, gemm_tuning=tuning
+            )
+        return _with_zero_weight_rows(
+            result, zero_index, zero_logp, chunk0_alive=chunk0_alive, exact=exact
+        )
     if binding is not None:
         memory = binding.memory
     else:
@@ -9616,6 +9671,9 @@ def backward_loss(
             backend=backend,
             gemm_tuning=gemm_tuning,
         )
+    elif dw_acc is not None and _is_zero_accumulator(dw_acc):
+        # a call without a gradient GEMM (:func:`_empty_forward`): no FP32 accumulator to read
+        dw = _zero_gradient(dw_acc, grad, grad_weight_dtype)
     else:
         dw = (
             None
