@@ -363,16 +363,18 @@ constants delivered with the generated programs (`HOST_PLAN_CONSTANTS`):
   same bits. The `sm_107a` `dgrad` program of that stage keeps each G tile in
   the tensor core's A collector for both 256-column halves of the tile.
 - `dgrad` L2 evict-first twin (`dgrad_evict_first`): on the architectures
-  listed in `dgrad_evict_first_archs`, when the groups average at least
-  `dgrad_evict_first_min_rows` rows (`sum_m // E`) and `dX` has at least
-  `dgrad_evict_first_min_k` columns (`K`), the wide tile is the route's
-  `main_wide_ef` stage: the same program with G loaded and `dX` stored under
-  the L2 evict-first policy, so a group's weights stay resident in L2 while
-  its row blocks stream past them, and with two head and two tail k steps of
-  an item split around the release of the accumulator's two halves instead of
-  four and three, so fewer of an item's k steps pay the split. Every element
-  still accumulates its k steps in order, so its output is bitwise that of
-  `main_wide`.
+  listed in `dgrad_evict_first_archs`, when the groups average at least the
+  architecture's `dgrad_evict_first_min_rows` rows (`sum_m // E`; 4096 on
+  `sm_100a`, 16384 on `sm_107a`) and `dX` has at least
+  `dgrad_evict_first_min_k` columns (`K`, the gate/up projection), the wide
+  tile is the route's `main_wide_ef` stage: the same program with G loaded and
+  `dX` stored under the L2 evict-first policy, so a group's weights stay
+  resident in L2 while its row blocks stream past them (the domain-scheduled
+  program on `sm_100a`; on `sm_107a` the A-collector program, which also
+  splits two head and two tail k steps of an item around the release of the
+  accumulator's two halves instead of four and three, so fewer of an item's k
+  steps pay the split). Every element still accumulates its k steps in order,
+  so its output is bitwise that of `main_wide`.
 - `fwd` / `dgrad` 3 / 3 head / tail twin (`fwd_wide_ts33` /
   `dgrad_wide_ts33`): where the evict-first twin does not apply, the wide tile
   is the route's `main_wide_ts33` stage, the same program with three head and
@@ -395,6 +397,14 @@ constants delivered with the generated programs (`HOST_PLAN_CONSTANTS`):
   splits two head and two tail k steps of an item around the release of the
   accumulator's two halves instead of four and three. Its output is bitwise
   that of `main_wide`.
+- `fwd` X / Y evict-first twin (`fwd_evict_first`): on the architectures
+  listed in `fwd_evict_first_archs`, when the reduction `K` is at least
+  `fwd_evict_first_min_k`, as in the gate/up projection, the wide tile is the
+  route's `main_wide_ef` stage: the domain-scheduled program with X loaded and
+  Y stored under the L2 evict-first policy, so the group's weights stay
+  resident in L2 while its rows stream past them. A shorter reduction (the
+  down projection) keeps `main_wide`. The cache policy changes no arithmetic:
+  its output is bitwise that of `main_wide`.
 - `fwd` / `dgrad` tile order on `sm_100a` / `sm_103a`: the column tiles of
   every 256-row block are split between two claim queues, one per locality
   domain of the device, in proportion to the clusters that claim each queue
@@ -503,6 +513,7 @@ fused one.
 | feature | sm_100a | sm_103a | sm_107a |
 | --- | --- | --- | --- |
 | `wgrad` k512 half-release stages | `main_halves` (planned walk), `main_wave_halves` (wave period 8) | `main_halves` (planned walk), `main_wave_halves` (wave period 8) | `main_halves`, `main_halves_k256t` |
+| `fwd` / `dgrad` L2 evict-first twin launched (`main_wide_ef`) | `fwd` (`K >= 6144`); `dgrad` (`K >= 4096`, `sum_m // E >= 4096`) | `fwd` (`K >= 6144`) | `fwd` (`K <= 2048`); `dgrad` (`K >= 4096`, `sum_m // E >= 16384`) |
 | `wgrad` accumulate, fused (`_acc` builds, fp32 `out` only) | `main_halves`, `main_wave_halves`, `tail_reduce` | `main_halves`, `main_wave_halves`, `tail_reduce` | `main_halves`, `main_halves_k256t`, `tail_reduce` |
 | `wgrad` accumulate, composed | bf16 `out`; k256 tile; `main` / `main_wave`; misaligned `out`; `_acc` library not loadable | bf16 `out`; k256 tile; `main` / `main_wave`; misaligned `out`; `_acc` library not loadable | bf16 `out`; k256 tile; `main`; misaligned `out`; `_acc` library not loadable |
 | CUDA toolkit floor of the fused main stages (`min_cuda`) | 13.4 | 13.4 | 13.4 |

@@ -60,16 +60,20 @@ from . import cake_build
 # data-gradient ``main_wide_ef`` stage is its twin that loads G and stores dX
 # with the L2 evict-first policy, so the group's weights stay resident in L2,
 # launched in its place on the architectures of ``dgrad_evict_first_archs``
-# when the groups average at least ``dgrad_evict_first_min_rows`` rows and the
-# output has at least ``dgrad_evict_first_min_k`` columns; the forward
-# ``main_wide_ef`` stage is its twin that releases the last wave of tiles in
-# halves and stores Y with the L2 evict-first policy, launched in its place on
-# the architectures of ``fwd_lwh_ef_archs`` when the reduction K is at most
-# ``fwd_lwh_ef_max_k`` (the down projection); both ``main_wide_ef`` programs
-# split two head and two tail k steps of an item around the release of the
+# when the groups average at least the architecture's
+# ``dgrad_evict_first_min_rows`` rows and the output has at least
+# ``dgrad_evict_first_min_k`` columns; the forward ``main_wide_ef`` stage is
+# its twin that stores Y with the L2 evict-first policy, launched in its place
+# on the architectures of ``fwd_lwh_ef_archs`` (the A-collector program that
+# also releases the last wave of tiles in halves) when the reduction K is at
+# most ``fwd_lwh_ef_max_k`` (the down projection), and on those of
+# ``fwd_evict_first_archs`` (the domain-scheduled program that also loads X
+# with that policy) when the reduction K is at least ``fwd_evict_first_min_k``
+# (the gate/up projection); the sm_107a ``main_wide_ef`` programs split two
+# head and two tail k steps of an item around the release of the
 # accumulator's halves instead of four and three; the data-gradient
 # ``main_wide_ts33`` stage is the twin of ``main_wide`` that splits three head
-# and three tail k steps there, launched in its place on the architectures of
+# and three tail k steps around that release, launched in its place on the architectures of
 # ``dgrad_wide_ts33_archs`` when the groups average at least the architecture's
 # ``dgrad_wide_ts33_min_rows`` rows and the output has at least
 # ``dgrad_wide_ts33_min_k`` columns, and the forward ``main_wide_ts33`` stage on
@@ -839,11 +843,13 @@ HOST_PLAN_CONSTANTS: dict[str, Any] = {
     "wide_block_n": 512,
     "wide_fwd_archs": ["sm_100a", "sm_103a", "sm_107a"],
     "wide_dgrad_archs": ["sm_100a", "sm_103a", "sm_107a"],
-    "dgrad_evict_first_archs": ["sm_107a"],
-    "dgrad_evict_first_min_rows": 16384,
+    "dgrad_evict_first_archs": ["sm_100a", "sm_107a"],
+    "dgrad_evict_first_min_rows": {"sm_100a": 4096, "sm_103a": 16384, "sm_107a": 16384},
     "dgrad_evict_first_min_k": 4096,
     "fwd_lwh_ef_archs": ["sm_107a"],
     "fwd_lwh_ef_max_k": 2048,
+    "fwd_evict_first_archs": ["sm_100a", "sm_103a"],
+    "fwd_evict_first_min_k": 6144,
     "dgrad_wide_ts33_archs": ["sm_103a"],
     "dgrad_wide_ts33_min_rows": {"sm_103a": 8192},
     "dgrad_wide_ts33_min_k": 4096,

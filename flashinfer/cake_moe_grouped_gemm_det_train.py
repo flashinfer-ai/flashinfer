@@ -195,7 +195,9 @@ def cake_moe_grouped_gemm_det_train_prepare_forward(
     ``x``: ``[sum_m, K]`` bf16; ``w``: ``[E, N, K]`` bf16; ``offs``: int32
     ``[E]`` device end offsets; ``N % 256 == 0``, ``K % 64 == 0`` (the
     512-column tile when ``N % 512 == 0`` on the architectures of
-    ``wide_fwd_archs``, its 3 / 3 head / tail twin where ``fwd_wide_ts33`` holds).
+    ``wide_fwd_archs``, its L2 evict-first twin where ``fwd_lwh_ef`` or
+    ``fwd_evict_first`` holds for ``K``, its 3 / 3 head / tail twin where
+    ``fwd_wide_ts33`` holds).
     ``out`` may be row-padded (any row stride, unit column
     stride).
     """
