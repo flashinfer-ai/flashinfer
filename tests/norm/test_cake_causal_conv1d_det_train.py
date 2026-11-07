@@ -3067,13 +3067,13 @@ def test_registry_records_reference_the_build_manifest() -> None:
             assert "flags" in logical, name
         # The selection vocabulary: a forward or backward rule is ``channels_at_least`` with one positive
         # multiple-of-8 threshold (or an increasing list of them) per architecture it names, or
-        # ``channels_tokens_at_least`` (a backward rule) with a positive token floor beside each as well.
+        # ``channels_tokens_at_least`` with a positive token floor beside each as well (backward programs, and
+        # the sm_107a two-stage forward programs).
         rule = loader.select_rule(record)
         if rule is not None:
             assert record["role"] in ("fwd", "bwd"), name
             assert rule["kind"] in loader.SELECT_KINDS, name
             if rule["kind"] == "channels_tokens_at_least":
-                assert record["role"] == "bwd", name
                 assert set(rule) == {"kind", "channels", "tokens"}, name
                 assert set(rule["tokens"]) == set(rule["channels"]), name
                 assert all(tokens > 0 for tokens in rule["tokens"].values()), name
