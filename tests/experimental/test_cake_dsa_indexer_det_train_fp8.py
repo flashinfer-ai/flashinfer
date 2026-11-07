@@ -237,7 +237,12 @@ def test_fp8_record_replaces_only_its_fields_and_leaves_the_bf16_record():
         arch: {f: v for f, v in fields.items() if f != "static_scan_kinds"}
         for arch, fields in cake_jit.POLICY_FP8.items()
     } == {
-        "sm_100a": {"wide_wave_rule": [1.7, 1.3, 84.0], "desc_walk_kinds": None},
+        "sm_100a": {
+            "wide_wave_rule": [1.7, 1.3, 84.0],
+            "desc_walk_kinds": None,
+            "snake_packed_rule": None,
+            "snake_l6_fallback_waves": None,
+        },
         "sm_103a": {
             "wide_wave_rule": [
                 1.7,
@@ -254,11 +259,15 @@ def test_fp8_record_replaces_only_its_fields_and_leaves_the_bf16_record():
             ],
             "lsf_single_rule": [64.0],
             "desc_walk_kinds": None,
+            "snake_packed_rule": None,
+            "snake_l6_fallback_waves": None,
         },
         "sm_107a": {
             "split_fit_rule": None,
             "snake_cap_rule": [1, 40],
             "desc_walk_kinds": None,
+            "snake_packed_rule": None,
+            "snake_l6_fallback_waves": None,
         },
     }
     # the FP8 record never inherits the BF16 programs' static kinds, and takes only record fields
