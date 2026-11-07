@@ -61,7 +61,8 @@ forward route ships the program of one eight-token stage per sub-tile and
 chunk for every channel count on sm_100a and sm_103a and, on sm_107a, below
 a per-route channel count (the fallback); from that count (C = 256 on
 ``fwd``, 512 on ``fwd_dt``, 1024 on ``fwd_bias``) sm_107a runs the program
-of two stages per chunk.  The counters
+of two stages per chunk from S = 65536, and a copy of it under its own name
+(``c_band=2048``) from C = 2048 at every S.  The counters
 are the forward workspace ``work`` (``workspace_rule`` ``tile_counters``:
 :func:`counter_words`, two int32 words per channel tile), zero before the first
 launch; the last CTA of each tile resets them, so the buffer is zero after
@@ -942,7 +943,9 @@ MODULES: dict[str, dict[str, Any]] = {
     # one-stage program loses to the shipped forward from C = 2048 (one sub-tile
     # per CTA over several channel tiles) and wins at C = 128, where two stages
     # lose; this program runs from the smallest measured C where it beats the
-    # one-stage program.  ``work`` as the ``fwd`` record's.
+    # one-stage program.  Below S = 65536 the one-stage program is faster up to
+    # C = 2048 (round 35): this record runs from S = 65536, and its channel
+    # band's copy from C = 2048 at every S.  ``work`` as the ``fwd`` record's.
     # ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows
     # the kernel (the exporter's ``KERNEL_SMEM_PROGRAMS``): the first render writes the
     # kernel's figure, the kernel symbol, the argument plan and the logical names it keeps.
@@ -1006,7 +1009,10 @@ MODULES: dict[str, dict[str, Any]] = {
             "channels": {
                 "sm_107a": 256,
             },
-            "kind": "channels_at_least",
+            "kind": "channels_tokens_at_least",
+            "tokens": {
+                "sm_107a": 65536,
+            },
         },
         "workspace_rule": {
             "kind": "tile_counters",
@@ -1015,8 +1021,9 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     # Route ``fwd_dt`` on sm_107a from C = 512 (round 9): the two-stage dynamic
     # token-chunk forward with ``dtype_flags``, built with ``dtype_flags=True,
-    # fast=True, sched="dynamic", chunk_stages=2, pair_math=True``; ``work`` as
-    # the ``fwd`` record's.
+    # fast=True, sched="dynamic", chunk_stages=2, pair_math=True``; from S =
+    # 65536, and its channel band's copy from C = 2048 at every S (round 35);
+    # ``work`` as the ``fwd`` record's.
     # ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows
     # the kernel (the exporter's ``KERNEL_SMEM_PROGRAMS``): the first render writes the
     # kernel's figure, the kernel symbol, the argument plan and the logical names it keeps.
@@ -1082,7 +1089,10 @@ MODULES: dict[str, dict[str, Any]] = {
             "channels": {
                 "sm_107a": 512,
             },
-            "kind": "channels_at_least",
+            "kind": "channels_tokens_at_least",
+            "tokens": {
+                "sm_107a": 65536,
+            },
         },
         "workspace_rule": {
             "kind": "tile_counters",
@@ -1092,7 +1102,8 @@ MODULES: dict[str, dict[str, Any]] = {
     # Route ``fwd_bias`` on sm_107a from C = 1024 (round 9): the two-stage dynamic
     # token-chunk forward with the per-channel bias, built with ``bias=True,
     # dtype_flags=True, fast=True, sched="dynamic", chunk_stages=2,
-    # pair_math=True``; ``work`` as the ``fwd`` record's.
+    # pair_math=True``; from S = 65536, and its channel band's copy from C =
+    # 2048 at every S (round 35); ``work`` as the ``fwd`` record's.
     # ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows
     # the kernel (the exporter's ``KERNEL_SMEM_PROGRAMS``): the first render writes the
     # kernel's figure, the kernel symbol, the argument plan and the logical names it keeps.
@@ -1160,7 +1171,10 @@ MODULES: dict[str, dict[str, Any]] = {
             "channels": {
                 "sm_107a": 1024,
             },
-            "kind": "channels_at_least",
+            "kind": "channels_tokens_at_least",
+            "tokens": {
+                "sm_107a": 65536,
+            },
         },
         "workspace_rule": {
             "kind": "tile_counters",
