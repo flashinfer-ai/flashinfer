@@ -46,6 +46,9 @@
   ],
   "license_header_prepended": true,
   "parameters": {
+   "MOE_ACTIVATION": "activation family: 0 SwiGLU silu(gate)*up, 1 SwiGLU with alpha / beta gate*sigmoid(alpha*gate)*(up+beta), 2 situ beta*tanh(gate/beta)*sigmoid(gate)*up' with up' = lb*tanh(up/lb) (up when lb = 0)",
+   "MOE_ACT_P0": "activation parameter 0 in 1/1000 units (alpha of family 1, situ beta); 0 for SwiGLU",
+   "MOE_ACT_P1": "activation parameter 1 in 1/1000 units (beta of family 1, situ up beta lb; 0 = unset)",
    "MOE_CODEC_OVF_BLOCKS": "return-codec raw-overflow capacity, 64-value blocks per row (16..256, default 16)",
    "MOE_EXPERTS": "routed experts, global (physical experts with EPLB replicas); MOE_EXPERTS % MOE_RANKS == 0",
    "MOE_HIDDEN": "hidden size (multiple of 512)",
@@ -54,6 +57,7 @@
    "MOE_LSA_COPIERS": "LSA copier CTAs of the copier instances (>= LSA destinations per rank; 1..min(ranks - 1, 16))",
    "MOE_MAX_ROWS": "max tokens per rank per call (multiple of 128)",
    "MOE_RANKS": "expert-parallel world size (ranks of the EP group)",
+   "MOE_RETURN_CODEC": "return codec of the expert results: 0 lossless BF16, 1 int8 with a BF16 scale per 64 values",
    "MOE_SHARED_EXPERT": "1: one in-kernel FP8 shared expert, 0: routed top-k sum only",
    "MOE_SWIGLU_LIMIT": "SwiGLU clamp L: gate <= L, up in [-L, L] (10 = DeepSeek-V4); 0 = unclamped SwiGLU",
    "MOE_TOPK": "routed experts per token"
@@ -65,30 +69,45 @@
    "CakeTensorMapPack"
   ],
   "sources": {
-   "cake_sm120_megamoe_kernel.cuh": "3f089d518e2d6de7f578c906b80b1c1cf3c75f345357de0d8796aef096dfc9be",
-   "cake_sm120_megamoe_kernel_part001.cuh": "4b2c722685f89708e4bd348965b2d9c12ab178e62ee07253e43b9c589f6f6869",
-   "cake_sm120_megamoe_kernel_part003.cuh": "9c32dc62e5049b24ce5e7b816bf69b94a4623a68bfd709878d5306bb0ae73c55",
-   "cake_sm120_megamoe_kernel_part004.cuh": "0c41ad6021a6d3b9acd32029e5bc6366ba9122aa97100523d180f1e180d1e1e8",
-   "cake_sm120_megamoe_kernel_part005.cuh": "8b5fcac0535eaf2207ece4971e4170e860169568d4518c27f4589f04d5d5b043",
-   "cake_sm120_megamoe_kernel_part006.cuh": "14b10ac25517444ee5cc445ec0828306b0074dddc01995c552223f942b0d0156",
-   "cake_sm120_megamoe_kernel_part007.cuh": "c72b36fffe34c4043fadba3c368ea04db9bf773a30b14b9f8cb2fbe2e7a6c27e",
-   "cake_sm120_megamoe_kernel_part008.cuh": "80e56a59e0f34ae1a2098f4bb8b9b168aa29140e0e7cfa0477d86874b7ec7610",
-   "cake_sm120_megamoe_kernel_part009.cuh": "5f1c0d73db7a0200403d70dac6932c4d86d1206261f1de0cbfdb1d0a876b1d4e",
-   "cake_sm120_megamoe_kernel_part010.cuh": "93138bb4022db7fedc6fbddfd7f4973f5956bf3af2021fee0218d89284571d73",
-   "cake_sm120_megamoe_kernel_part011.cuh": "4914fd68d32a807be5ea87b8cfd97bd321b106547f394d1d85d025c071703f77",
-   "cake_sm120_megamoe_kernel_part012.cuh": "2b48e3f060e24f7ca262780cb0491dc3f0817849a1e562fa84b4086621e4afc5"
+   "cake_sm120_megamoe_kernel.cuh": "9d6612f381602ab7e885e2a68466778df68d46b6489093706dbbaa78c72acf19",
+   "cake_sm120_megamoe_kernel_part001.cuh": "fe94f6638e222ea7d716f292f2ae3c7cdc57b4e79af65a169b39c76aabffe7d8",
+   "cake_sm120_megamoe_kernel_part003.cuh": "5a593520252a011afeca32505705e101a3168e96c6dae8a96f98720d3ec0eefb",
+   "cake_sm120_megamoe_kernel_part004.cuh": "c91c03c3ad71b3f48176a31fcbc5180e1719b0d59a7d66e74635f12c6028d106",
+   "cake_sm120_megamoe_kernel_part005.cuh": "f8bbd37de5a576e91e95125e1504f39052e2b9121104cf24e987d754ec64393c",
+   "cake_sm120_megamoe_kernel_part006.cuh": "f60bfaa96cbb506dd5408a31727426b19db63e15d99ea6621d7c190ac228d160",
+   "cake_sm120_megamoe_kernel_part008.cuh": "08992508792b6e8dfba154133bac60ea55b27d4495e6515ffa4513d6189bb064",
+   "cake_sm120_megamoe_kernel_part010.cuh": "42151045153d2a485cdcfc4ce71180e9d6770e7cc614ba03bb5eec19fbffcdd5",
+   "cake_sm120_megamoe_kernel_part013.cuh": "fb2c47f7518811cdecd1dfd69cc4833c945b9cc7cb15bf6b6d1928271fd702d6",
+   "cake_sm120_megamoe_kernel_part014.cuh": "c6991051fb7b27570093bc64d218f8db69098a95b9796ff838911a9610970ccc",
+   "cake_sm120_megamoe_kernel_part015.cuh": "62668689565b7bbab9e2fddffa830aacc3e0ac3868f49dfde04c8076a261e125",
+   "cake_sm120_megamoe_kernel_part016.cuh": "d40c36706dcbb5a2b00a246af4e96b0c719b09b6ba44456dedf240ebf72c69d8",
+   "cake_sm120_megamoe_kernel_part017.cuh": "1f71918c157c2238ed346966cd11445ebb821a8212d27f27b2ac0b4ce8c3fca1",
+   "cake_sm120_megamoe_kernel_part018.cuh": "8b70f011c3d4ee6318b9b9ea0f285345171dc203eb2047b7b7928dad26ea44c3",
+   "cake_sm120_megamoe_kernel_part019.cuh": "73bbd93af690da903fdeeed50ccc8413c663266411a8bd8c9fd29f25cfeaf82c",
+   "cake_sm120_megamoe_kernel_part020.cuh": "154429b28cab6556cd42b7b569bcb4c2da41cb984eb097dad9c6039a711d25e4",
+   "cake_sm120_megamoe_kernel_part021.cuh": "7f0da30704339dd05d9938848fd85ad5918a2bdc53b3242c12695d4160e1acad",
+   "cake_sm120_megamoe_kernel_part022.cuh": "653da1241ac8498c060c0ddf7092c3c7cdcb6bed06161689a16868928e43afa3",
+   "cake_sm120_megamoe_kernel_part023.cuh": "f9ec9129a153fc16c1821b22a4c10e7cdf3c1b92bff213777ae0d6027f879d37",
+   "cake_sm120_megamoe_kernel_part024.cuh": "d781a96e3353f734b07375d1969a70ed314ca9204e41c642f054154ad88ad342",
+   "cake_sm120_megamoe_kernel_part025.cuh": "7ce447ed33ec711220fefdecd32a0181b0d149df3299878a1f9f5be162d2af27",
+   "cake_sm120_megamoe_kernel_part026.cuh": "e815484c78602c85fe107f09a73175fdfad5ed289b29f9a9f9aa46381fc2dee7",
+   "cake_sm120_megamoe_kernel_part027.cuh": "9346a98e14346b6da6d7dcb8b4d1441347dae5edba512670578488dd7c742c86",
+   "cake_sm120_megamoe_kernel_part028.cuh": "42bd327a90e1e387f3b9c7fcd12315382c9709f4b1f0aaa9a81c818ce4b9e9c0",
+   "cake_sm120_megamoe_kernel_part029.cuh": "82f5ea7fdabe82ec0185d58ee9052e03886d257b5200ba31692ba610d9af3832",
+   "cake_sm120_megamoe_kernel_part030.cuh": "17913d12be5f733da56c52f135682a236066490519c7a7fc5a9615a1f6326060",
+   "cake_sm120_megamoe_kernel_part031.cuh": "b286893cdb9cb7fa8d6133c5a28a34c01af095190f258586d6fd00f1767ffb8b"
   },
   "threads": 384
  },
  "format": "cake-sm120-megamoe-manifest/3",
  "geometry": {
   "path": "cake_sm120_megamoe_geometry.json",
-  "sha256": "95c161d89a5f2cfc5e0ad4c4b14cc49e14fa65a99a01370032e19485f624daf6"
+  "sha256": "b20cb10e2f68816d7a3ab21b4ac36d8afec3180785354210abec501380d5e127"
  },
  "provenance": {
-  "generator_commit": "81d9149b4",
-  "geometry_module_sha256": "95c95541c9db64fda35ec927b31c8a593878c0674020c6aa8f29132a1d7d54c9",
-  "single_file_sha256": "bfe188bf116c5843706f2e44c724638f5a3cf5d59f53809b94f148e9b2f7717e",
-  "unrenamed_sha256": "c42ea17cfd1e0764b7422cbfd0de00b64a58b1e018bf6d62adafd7a4607eba19"
+  "generator_commit": "5dfff2329",
+  "geometry_module_sha256": "fbf2d57f383ea5775f106da7c2cf7e49bb3aec0952ccd9c927627c574d8db7e2",
+  "single_file_sha256": "43ed3c59bd5b48510dac689a79f71a54600d5a9533dfa3bc5250d379b06a0408",
+  "unrenamed_sha256": "25759ead281e184432d3b218a1848fb739740044b2292cff5e0dbb4a726087d1"
  }
 }

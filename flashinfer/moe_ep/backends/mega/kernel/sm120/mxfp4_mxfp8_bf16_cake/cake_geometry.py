@@ -17,7 +17,7 @@
 The device source ``cake_sm120_megamoe_kernel.cuh`` (``kernel_src/sm120/cake_mxfp4_megamoe/src/``)
 is one CUDA source with compile-time parameters (EP world size, global expert count, top-k,
 max rows per rank, hidden size, intermediate size, shared expert on/off, SwiGLU clamp,
-return-codec overflow capacity, LSA copier count).  Every
+return-codec overflow capacity, LSA copier count, activation family and parameters, return codec).  Every
 derived quantity the host needs — the structural switches that select code paths, the
 scratch and window extents, the dynamic shared memory, the kernel argument list and the
 kernel's own guards — is recorded by the generator in
@@ -80,6 +80,13 @@ class KernelParams:
     # Copier CTAs of the copier instances (one per LSA destination of a rank); the
     # copier-free instances ignore it.
     lsa_copiers: int = 1
+    # Activation family (0 SwiGLU, 1 SwiGLU with alpha / beta, 2 SiTU) and its parameters in
+    # 1/1000 units (P0: swiglu_alpha or situ_beta; P1: swiglu_beta or situ_linear_beta, 0 = unset).
+    activation: int = 0
+    act_p0: int = 0
+    act_p1: int = 0
+    # Wire format of the expert results: 0 lossless BF16 codec, 1 int8 + BF16 scale per 64 values.
+    return_codec: int = 0
 
     @property
     def local_experts(self) -> int:
@@ -99,6 +106,10 @@ class KernelParams:
             self.swiglu_limit,
             self.codec_ovf_blocks,
             self.lsa_copiers,
+            self.activation,
+            self.act_p0,
+            self.act_p1,
+            self.return_codec,
         )
 
     def env(self) -> dict[str, int]:
@@ -112,6 +123,10 @@ class KernelParams:
             "MOE_SWIGLU_LIMIT": self.swiglu_limit,
             "MOE_CODEC_OVF_BLOCKS": self.codec_ovf_blocks,
             "MOE_LSA_COPIERS": self.lsa_copiers,
+            "MOE_ACTIVATION": self.activation,
+            "MOE_ACT_P0": self.act_p0,
+            "MOE_ACT_P1": self.act_p1,
+            "MOE_RETURN_CODEC": self.return_codec,
         }
 
 
