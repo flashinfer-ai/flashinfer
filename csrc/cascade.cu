@@ -75,11 +75,13 @@ void merge_state_in_place(TensorView v, TensorView s, TensorView v_other, Tensor
   TVM_FFI_ICHECK_EQ(v.size(0), s.size(0));
   TVM_FFI_ICHECK_EQ(v.size(1), s.size(1));
   uint8_t* mask_ptr = nullptr;
+  int64_t mask_stride = 1;
   if (mask.has_value()) {
     CHECK_DIM(1, mask.value());
     TVM_FFI_ICHECK_EQ(v.size(0), mask.value().size(0));
     CHECK_DEVICE(mask.value(), v);
     mask_ptr = static_cast<uint8_t*>(mask.value().data_ptr());
+    mask_stride = mask.value().stride(0);
   }
   unsigned int seq_len = v.size(0);
   unsigned int num_heads = v.size(1);
@@ -91,7 +93,7 @@ void merge_state_in_place(TensorView v, TensorView s, TensorView v_other, Tensor
     cudaError_t status = MergeStateInPlace(
         static_cast<c_type*>(v.data_ptr()), static_cast<float*>(s.data_ptr()),
         static_cast<c_type*>(v_other.data_ptr()), static_cast<float*>(s_other.data_ptr()), seq_len,
-        num_heads, head_dim, mask_ptr, stream);
+        num_heads, head_dim, mask_ptr, stream, mask_stride);
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "MergeStateInPlace kernel launch failed: " << cudaGetErrorString(status);
     return true;
