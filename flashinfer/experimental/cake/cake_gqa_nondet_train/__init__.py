@@ -37,7 +37,6 @@ from .cake_backend import (
     cake_gqa_nondet_train_backward,
     cake_gqa_nondet_train_forward,
     cake_gqa_nondet_train_workspace_bytes,
-    default_workspace,
 )
 
 __all__ = [
@@ -50,5 +49,4 @@ __all__ = [
     "cake_gqa_nondet_train_backward",
     "cake_gqa_nondet_train_forward",
     "cake_gqa_nondet_train_workspace_bytes",
-    "default_workspace",
 ]
