@@ -1779,8 +1779,8 @@ ROUTER_SM_COUNT: dict[str, int] = {"sm_100a": 152, "sm_103a": 152, "sm_107a": 21
 #: too, a window that holds only with the head/tail program of :data:`ROUTER_HEAD_TAIL_TEMPLATES_BY_SM` (with
 #: ``router_fp32_gemm_atomic_nn_t_ht_c3_nreg`` it was up to 9.2 % slower than the deterministic plan next to a resident
 #: kernel).  Hidden 4096 keeps the deterministic plan on both SM counts (on 212 SMs "H0.5x4" with the tensor-memory
-#: program was up to 6.2 % slower next to a resident kernel), as do hidden 6144 on 208 SMs and the forward, as on
-#: 216 SMs.  On 212 SMs every hidden size takes the SIMT program with the 128 x 64 tile, from 1 to 256 tokens at
+#: program was up to 6.2 % slower next to a resident kernel), as do hidden 6144 on 208 SMs and on 208 SMs the forward,
+#: as on 216 SMs.  On 212 SMs every hidden size takes the SIMT program with the 128 x 64 tile, from 1 to 256 tokens at
 #: hidden 4096 and 5120 and from 1 to 224 tokens at hidden 6144 (measured at 64, 128, 192 and 256 tokens on 212-SM
 #: R200 parts, at hidden 6144 also at 192, 224 and 256 tokens in a second measurement on two parts; 128, 160 and 192
 #: CTAs of 256 threads, one wave; at hidden 6144 and 256 tokens it was up to 12 % slower than the deterministic plan
@@ -1792,6 +1792,11 @@ ROUTER_SM_COUNT: dict[str, int] = {"sm_100a": 152, "sm_103a": 152, "sm_107a": 21
 #: at 1, 17, 32, 64, 96 and 128 tokens at hidden 4096 and 5120 and at 1, 17, 32 and 64 tokens at hidden 6144, and at
 #: 192 tokens: from 192 tokens, from 128 at hidden 6144, more than 3 % slower than the deterministic program next to a
 #: resident kernel), up to 64 tokens at hidden 6144.
+#: On 212 SMs the forward takes the cluster SIMT program (:func:`router_forward_simt`) at hidden 4096, 5120 and 6144:
+#: the 8 x 4 tile in the compensated form from 1 to 8 tokens and the 16 x 32 FFMA tile from 9 to 192 tokens, measured
+#: under the rule of :data:`ROUTER_RULES` on two 212-SM R200 nodes at 1, 4, 5, 8, 9, 12, 16, 17, 32, 64, 96, 97, 112,
+#: 128, 129, 160, 176 and 192 tokens (every measured token count held); from 193 tokens the deterministic plan (not
+#: measured under the rule).
 #: The 148-SM B200 (sm_100a) and B300 (sm_103a) tables hold SIMT windows measured on one node of each part under the
 #: rule of :data:`ROUTER_RULES` against the plan the token count took before (both launch orders, eager and CUDA
 #: graphs, next to a kernel holding 8, 16 or 32 SMs, the backward pass and the checkpointed step, in a long-lived
@@ -1839,7 +1844,9 @@ ROUTER_RULES_BY_SM: dict[
         ("sm_107a", "nn_t", 6144, 256): None,
     }),
     ("sm_107a", 212): _VerdictTable({
-        ("sm_107a", "kk", 4096, 256): None, ("sm_107a", "kk", 5120, 256): None, ("sm_107a", "kk", 6144, 256): None,
+        ("sm_107a", "kk", 4096, 256): ((1, 8, "simt_c8_kg4_l32_e8t4"), (9, 192, "simt_c8_ffma_l16_e16t32")),
+        ("sm_107a", "kk", 5120, 256): ((1, 8, "simt_c8_kg4_l32_e8t4"), (9, 192, "simt_c8_ffma_l16_e16t32")),
+        ("sm_107a", "kk", 6144, 256): ((1, 8, "simt_c8_kg4_l32_e8t4"), (9, 192, "simt_c8_ffma_l16_e16t32")),
         ("sm_107a", "nn_t", 4096, 256): ((1, 256, "simt_n128m64s2"),),
         ("sm_107a", "nn_t", 5120, 256): ((1, 256, "simt_n128m64s2"), (16172, 16384, "H0.5x4")),
         ("sm_107a", "nn_t", 6144, 256): ((1, 224, "simt_n128m64s2"), (16172, 16384, "H0.5x4")),
