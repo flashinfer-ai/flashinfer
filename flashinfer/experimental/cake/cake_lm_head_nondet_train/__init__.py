@@ -14,15 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-# Experimental Cake backend, non-deterministic form:
+# Experimental Cake backend of ``flashinfer.cake_lm_head_nondet_train``:
 # chunked large-vocabulary LM-head projection + log-sum-exp / cross-entropy /
 # policy-gradient loss with a memory-bounded backward for training on
 # SM100 / SM103 / SM107, whose dX GEMM combines its K-slice partials in an unordered
-# FP32 reduction.  The public entry points are
-# ``flashinfer.chunked_lm_head.chunked_lm_head_loss``, ``chunked_lm_head_logprob``,
-# ``chunked_lm_head_preload`` and the candidate-support entries
-# ``chunked_lm_head_support_logprob`` / ``chunked_lm_head_support_kl`` with
-# ``deterministic=False`` (their default ``deterministic=True`` runs the
-# deterministic package ``flashinfer.experimental.cake.cake_lm_head_det_train``); the
-# autograd wrappers, host planning, JIT registration and the generated sources
-# live in this package.
+# FP32 reduction.  The public entry points are the module's
+# ``cake_lm_head_nondet_train_loss``, ``cake_lm_head_nondet_train_logprob``,
+# ``cake_lm_head_nondet_train_preload`` and the candidate-support entries
+# ``cake_lm_head_nondet_train_support_logprob`` /
+# ``cake_lm_head_nondet_train_support_kl``; none takes a ``deterministic``
+# keyword (the deterministic counterpart is ``flashinfer.cake_lm_head_det_train``).
+# The autograd wrappers, host planning, JIT registration and the generated
+# sources live in this package.

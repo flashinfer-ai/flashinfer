@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Backend suite of the non-deterministic chunked LM-head + loss package
-``flashinfer.experimental.cake.cake_lm_head_loss``.
+``flashinfer.experimental.cake.cake_lm_head_nondet_train`` (the backend of ``flashinfer.cake_lm_head_nondet_train``).
 
-The package is the ``deterministic=False`` form of the deterministic package
+The package is the non-deterministic counterpart of the deterministic package
 ``flashinfer.experimental.cake.cake_lm_head_det_train`` (``test_cake_lm_head_det_train.py``): the same
 precision boundaries, with the dX GEMM's K-slice partials of a chunk of more than one slice added by one
 launch into the ``-0.0``-filled FP32 accumulator in an unordered FP32 reduction (a one-slice chunk keeps the
@@ -26,7 +26,7 @@ unchunked PyTorch path (the same ``GATE_MARGIN`` / ``GATE_TINY`` / ``PRODUCTION_
 against that suite's source below), over repeated runs (worst case), and compared with the
 deterministic package on the same inputs: ``loss`` / ``logp`` / ``lse`` and ``dW`` keep their fixed
 order and equal its bits; ``dX`` meets the budgets and its distance to the deterministic ``dX`` is
-reported.  The host layer (mode contract, PyTorch's deterministic-algorithms alert, the reference
+reported.  The host layer (no mode keyword, PyTorch's deterministic-algorithms alert, the reference
 backend) runs anywhere; the device tests need an SM100 / SM103 / SM107 GPU and the package's
 rendered programs.
 """
@@ -70,11 +70,11 @@ from tests.test_helpers.cake_lm_head_loss_reference import (
 from tests.test_helpers.cake_package import cake_package
 
 # The package under test, named once through ``cake_package``; the deterministic package is the comparison arm.
-pkg = cake_package("cake.cake_lm_head_loss")
-cake_backend = cake_package("cake.cake_lm_head_loss", "cake_backend")
-opt_in = cake_package("cake.cake_lm_head_loss", "cake_backend_opt_in")
-cake_jit = cake_package("cake.cake_lm_head_loss", "cake_jit")
-cake_build = cake_package("cake.cake_lm_head_loss", "cake_build")
+pkg = cake_package("cake.cake_lm_head_nondet_train")
+cake_backend = cake_package("cake.cake_lm_head_nondet_train", "cake_backend")
+opt_in = cake_package("cake.cake_lm_head_nondet_train", "cake_backend_opt_in")
+cake_jit = cake_package("cake.cake_lm_head_nondet_train", "cake_jit")
+cake_build = cake_package("cake.cake_lm_head_nondet_train", "cake_build")
 det_backend = cake_package("cake.cake_lm_head_det_train", "cake_backend")
 det_opt_in = cake_package("cake.cake_lm_head_det_train", "cake_backend_opt_in")
 
@@ -92,8 +92,6 @@ GATE_TINY = dict(loss_rel=1e-6, logp_max_abs=1e-5, dX_rel_l2=1e-3, dW_rel_l2=1e-
 PRODUCTION_B0 = dict(dX_rel_l2=1.85e-3, dW_rel_l2=1.88e-3, logp_max_abs=4.1e-3)
 # Repeated runs of the worst-case tests (at least 20).
 REPEATS = 20
-# The non-deterministic mode is the only one this package serves.
-ND = dict(deterministic=False)
 # Seconds a two-thread test waits for a barrier or a thread before it fails
 TIMEOUT_S = 120
 
@@ -177,13 +175,13 @@ def _run(
     keep=False,
     **switches,
 ):
-    """One forward + backward through the autograd entry of ``package`` (``"nd"``: this package with
-    ``deterministic=False``; ``"det"``: the deterministic package) on ``backend``.  ``switches`` pass through
+    """One forward + backward through the autograd entry of ``package`` (``"nd"``: this package; ``"det"``: the
+    deterministic package) on ``backend``.  ``switches`` pass through
     (``memory_mode`` / ``num_valid_rows`` / ``check_num_valid_rows`` select the opt-in module); ``keep`` calls the
-    log-probability entry with the kept logits (``chunked_lm_head_logprob_keep`` /
+    log-probability entry with the kept logits (``cake_lm_head_nondet_train_logprob_keep`` /
     ``cake_lm_head_det_train_logprob_keep``); the log-probability entry also takes the inputs' ``temperature`` unless
     ``switches`` names one, and a call with ``temperature`` or ``check_temperature`` goes to the module's
-    ``chunked_lm_head_logprob_temperature`` / ``cake_lm_head_det_train_logprob_temperature``.  Returns ``loss`` /
+    ``cake_lm_head_nondet_train_logprob_temperature`` / ``cake_lm_head_det_train_logprob_temperature``.  Returns ``loss`` /
     ``logp`` / ``dX`` / ``dW`` and the leaves."""
     X = inp.X.detach().requires_grad_(train_x)
     W = inp.W.detach().requires_grad_(train_w)
@@ -194,12 +192,11 @@ def _run(
     if package == "nd":
         be = opt_in if opt else cake_backend
         loss_fn, logprob_fn = (
-            be.chunked_lm_head_loss,
-            be.chunked_lm_head_logprob_temperature
+            be.cake_lm_head_nondet_train_loss,
+            be.cake_lm_head_nondet_train_logprob_temperature
             if tau
-            else be.chunked_lm_head_logprob,
+            else be.cake_lm_head_nondet_train_logprob,
         )
-        mode = ND
     else:
         be = det_opt_in if opt else det_backend
         loss_fn, logprob_fn = (
@@ -208,10 +205,9 @@ def _run(
             if tau
             else be.cake_lm_head_det_train_logprob,
         )
-        mode = {}
     if keep:
         logprob_fn = (
-            cake_backend.chunked_lm_head_logprob_keep
+            cake_backend.cake_lm_head_nondet_train_logprob_keep
             if package == "nd"
             else det_backend.cake_lm_head_det_train_logprob_keep
         )
@@ -227,15 +223,12 @@ def _run(
             chunk_size=C,
             return_logp=True,
             backend=backend,
-            **mode,
             **switches,
         )
         if train_x or train_w:
             (loss if scale is None else loss * scale).backward()
     else:
-        logp = logprob_fn(
-            X, W, inp.labels, chunk_size=C, backend=backend, **mode, **switches
-        )
+        logp = logprob_fn(X, W, inp.labels, chunk_size=C, backend=backend, **switches)
         loss = (logp.detach() * inp.dlogp)[inp.valid].sum()
         if train_x or train_w:
             logp.backward(inp.dlogp if scale is None else inp.dlogp * scale)
@@ -311,25 +304,25 @@ NAMES = {
         "validate_lm_head_inputs": "validate_lm_head_det_inputs",
         "lm_head_loss_workspace_size": "lm_head_det_loss_workspace_size",
         "LmHeadLossRunner": "LmHeadDetLossRunner",
-        "ChunkedLmHeadLossFunction": "CakeLMHeadDetLossFunction",
-        "ChunkedLmHeadLogprobFunction": "CakeLMHeadDetLogprobFunction",
-        "chunked_lm_head_loss": "cake_lm_head_det_train_loss",
-        "chunked_lm_head_logprob": "cake_lm_head_det_train_logprob",
+        "CakeLMHeadNondetLossFunction": "CakeLMHeadDetLossFunction",
+        "CakeLMHeadNondetLogprobFunction": "CakeLMHeadDetLogprobFunction",
+        "cake_lm_head_nondet_train_loss": "cake_lm_head_det_train_loss",
+        "cake_lm_head_nondet_train_logprob": "cake_lm_head_det_train_logprob",
         "load_cake_lm_head_loss_module": "load_cake_lm_head_det_loss_module",
         "forward_loss": "forward_loss",
         "backward_loss": "backward_loss",
         "forward_logprob": "forward_logprob",
         "backward_logprob": "backward_logprob",
-        "ChunkedLmHeadLogprobKeepFunction": "CakeLMHeadDetLogprobKeepFunction",
-        "chunked_lm_head_logprob_keep": "cake_lm_head_det_train_logprob_keep",
+        "CakeLMHeadNondetLogprobKeepFunction": "CakeLMHeadDetLogprobKeepFunction",
+        "cake_lm_head_nondet_train_logprob_keep": "cake_lm_head_det_train_logprob_keep",
         "forward_logprob_keep": "forward_logprob_keep",
         "backward_logprob_keep": "backward_logprob_keep",
         "KeptForwardResult": "KeptForwardResult",
         "kept_memory_report": "kept_memory_report",
         "check_kept_logits": "check_kept_logits",
         "prepare_lm_head_loss_temperature": "prepare_lm_head_det_loss_temperature",
-        "ChunkedLmHeadLogprobTemperatureFunction": "CakeLMHeadDetLogprobTemperatureFunction",
-        "chunked_lm_head_logprob_temperature": "cake_lm_head_det_train_logprob_temperature",
+        "CakeLMHeadNondetLogprobTemperatureFunction": "CakeLMHeadDetLogprobTemperatureFunction",
+        "cake_lm_head_nondet_train_logprob_temperature": "cake_lm_head_det_train_logprob_temperature",
         "forward_logprob_temperature": "forward_logprob_temperature",
         "backward_logprob_temperature": "backward_logprob_temperature",
         "memory_report_temperature": "memory_report_temperature",
@@ -337,32 +330,32 @@ NAMES = {
     "cake_backend_opt_in": {
         "prepare_lm_head_loss": "prepare_lm_head_det_loss",
         "LmHeadLossRunner": "LmHeadDetLossRunner",
-        "ChunkedLmHeadLossFunction": "CakeLMHeadDetLossFunction",
-        "ChunkedLmHeadLogprobFunction": "CakeLMHeadDetLogprobFunction",
-        "chunked_lm_head_loss": "cake_lm_head_det_train_loss",
-        "chunked_lm_head_logprob": "cake_lm_head_det_train_logprob",
-        "preload": "cake_lm_head_det_train_preload",
+        "CakeLMHeadNondetLossFunction": "CakeLMHeadDetLossFunction",
+        "CakeLMHeadNondetLogprobFunction": "CakeLMHeadDetLogprobFunction",
+        "cake_lm_head_nondet_train_loss": "cake_lm_head_det_train_loss",
+        "cake_lm_head_nondet_train_logprob": "cake_lm_head_det_train_logprob",
+        "cake_lm_head_nondet_train_preload": "cake_lm_head_det_train_preload",
         "memory_plan": "memory_plan",
         "prepare_lm_head_loss_temperature": "prepare_lm_head_det_loss_temperature",
-        "ChunkedLmHeadLogprobTemperatureFunction": "CakeLMHeadDetLogprobTemperatureFunction",
-        "chunked_lm_head_logprob_temperature": "cake_lm_head_det_train_logprob_temperature",
+        "CakeLMHeadNondetLogprobTemperatureFunction": "CakeLMHeadDetLogprobTemperatureFunction",
+        "cake_lm_head_nondet_train_logprob_temperature": "cake_lm_head_det_train_logprob_temperature",
         "forward_logprob_temperature": "forward_logprob_temperature",
         "backward_logprob_temperature": "backward_logprob_temperature",
     },
     "cake_support": {
-        "SupportLogprobFunction": "CakeLMHeadDetSupportFunction",
-        "chunked_lm_head_support_logprob": "cake_lm_head_det_train_support_logprob",
-        "chunked_lm_head_support_kl": "cake_lm_head_det_train_support_kl",
+        "CakeLMHeadNondetSupportFunction": "CakeLMHeadDetSupportFunction",
+        "cake_lm_head_nondet_train_support_logprob": "cake_lm_head_det_train_support_logprob",
+        "cake_lm_head_nondet_train_support_kl": "cake_lm_head_det_train_support_kl",
     },
     "cake_jit": {"load_cake_lm_head_loss_module": "load_cake_lm_head_det_loss_module"},
 }
 
 
-def test_names_are_the_deterministic_names_without_det():
-    """Every name of the package is the deterministic package's name without ``det``, defined by this package (not
-    the deterministic object), and no name of the package carries ``det``."""
+def test_names_pair_with_the_deterministic_names():
+    """Every listed name of the package pairs with the deterministic package's name, is defined by this package (not
+    the deterministic object), and no name of the package carries ``_det_`` or ``Det``."""
     for module_name, names in NAMES.items():
-        nd = cake_package("cake.cake_lm_head_loss", module_name)
+        nd = cake_package("cake.cake_lm_head_nondet_train", module_name)
         det = cake_package("cake.cake_lm_head_det_train", module_name)
         for new, old in names.items():
             obj = getattr(nd, new)
@@ -532,107 +525,152 @@ def test_sm107_takes_the_sm103_rule_tables_except_the_long_chunk_ring():
     assert long_ring, "no C 8192 chunk took the sm_103a long-chunk ring"
 
 
-def _mode_calls(X, W, labels):
-    """Every entry of the package that takes ``deterministic``, as ``name -> call(deterministic)`` on host tensors
-    (the reference backend, so a call that passes the mode check computes on the CPU)."""
+def _former_mode_calls(X, W, labels):
+    """Every entry of the package that took ``deterministic`` before issue #8928, as ``name -> call(**mode)`` on host
+    tensors (the reference backend; the ``cake`` backend for the kept-logits pair): ``call()`` runs the entry,
+    ``call(deterministic=False)`` passes the former mode keyword."""
     common = dict(chunk_size=4, backend="reference")
     loss_kw = dict(common, loss_div=1.0)
+    rows = labels.shape[0]
     return {
-        "validate_lm_head_inputs": lambda d: cake_backend.validate_lm_head_inputs(
-            X, W, labels, loss_div=1.0, deterministic=d
+        "validate_lm_head_inputs": lambda **mode: cake_backend.validate_lm_head_inputs(
+            X, W, labels, loss_div=1.0, **mode
         ),
-        "forward_loss": lambda d: cake_backend.forward_loss(
-            X, W, labels, deterministic=d, **loss_kw
+        "forward_loss": lambda **mode: cake_backend.forward_loss(
+            X, W, labels, **mode, **loss_kw
         ),
-        "forward_logprob": lambda d: cake_backend.forward_logprob(
-            X, W, labels, deterministic=d, **common
+        "forward_logprob": lambda **mode: cake_backend.forward_logprob(
+            X, W, labels, **mode, **common
         ),
-        "backward_logprob": lambda d: cake_backend.backward_logprob(
+        "backward_logprob": lambda **mode: cake_backend.backward_logprob(
             X,
             W,
             labels,
             torch.zeros(labels.shape[0]),
             torch.zeros(labels.shape[0]),
-            deterministic=d,
+            **mode,
             **common,
         ),
-        "prepare_lm_head_loss": lambda d: cake_backend.prepare_lm_head_loss(
-            X, W, labels, deterministic=d, **loss_kw
+        "prepare_lm_head_loss": lambda **mode: cake_backend.prepare_lm_head_loss(
+            X, W, labels, **mode, **loss_kw
         ),
-        "chunked_lm_head_loss": lambda d: cake_backend.chunked_lm_head_loss(
-            X, W, labels, deterministic=d, **loss_kw
+        "cake_lm_head_nondet_train_loss": lambda **mode: cake_backend.cake_lm_head_nondet_train_loss(
+            X, W, labels, **mode, **loss_kw
         ),
-        "chunked_lm_head_logprob": lambda d: cake_backend.chunked_lm_head_logprob(
-            X, W, labels, deterministic=d, **common
+        "cake_lm_head_nondet_train_logprob": lambda **mode: cake_backend.cake_lm_head_nondet_train_logprob(
+            X, W, labels, **mode, **common
         ),
-        "opt_in.forward_loss": lambda d: opt_in.forward_loss(
-            X, W, labels, deterministic=d, **loss_kw
+        "opt_in.forward_loss": lambda **mode: opt_in.forward_loss(
+            X, W, labels, **mode, **loss_kw
         ),
-        "opt_in.prepare_lm_head_loss": lambda d: opt_in.prepare_lm_head_loss(
-            X, W, labels, deterministic=d, **loss_kw
+        "opt_in.prepare_lm_head_loss": lambda **mode: opt_in.prepare_lm_head_loss(
+            X, W, labels, **mode, **loss_kw
         ),
-        "opt_in.chunked_lm_head_loss": lambda d: opt_in.chunked_lm_head_loss(
-            X, W, labels, deterministic=d, memory_mode="fast", **loss_kw
+        "opt_in.cake_lm_head_nondet_train_loss": lambda **mode: opt_in.cake_lm_head_nondet_train_loss(
+            X, W, labels, **mode, memory_mode="fast", **loss_kw
         ),
-        "opt_in.chunked_lm_head_logprob": lambda d: opt_in.chunked_lm_head_logprob(
-            X, W, labels, deterministic=d, memory_mode="fast", **common
+        "opt_in.cake_lm_head_nondet_train_logprob": lambda **mode: opt_in.cake_lm_head_nondet_train_logprob(
+            X, W, labels, **mode, memory_mode="fast", **common
         ),
-        "forward_logprob_temperature": lambda d: (
+        "forward_logprob_temperature": lambda **mode: (
             cake_backend.forward_logprob_temperature(
-                X, W, labels, deterministic=d, temperature=0.7, **common
+                X, W, labels, **mode, temperature=0.7, **common
             )
         ),
-        "backward_logprob_temperature": lambda d: (
+        "backward_logprob_temperature": lambda **mode: (
             cake_backend.backward_logprob_temperature(
                 X,
                 W,
                 labels,
                 torch.zeros(labels.shape[0]),
                 torch.zeros(labels.shape[0]),
-                deterministic=d,
+                **mode,
                 temperature=0.7,
                 **common,
             )
         ),
-        "prepare_lm_head_loss_temperature": lambda d: (
+        "prepare_lm_head_loss_temperature": lambda **mode: (
             cake_backend.prepare_lm_head_loss_temperature(
                 X,
                 W,
                 labels,
-                deterministic=d,
+                **mode,
                 entry="logprob",
                 temperature=torch.full((labels.shape[0],), 0.7),
                 **common,
             )
         ),
-        "chunked_lm_head_logprob_temperature": lambda d: (
-            cake_backend.chunked_lm_head_logprob_temperature(
-                X, W, labels, deterministic=d, temperature=0.7, **common
+        "cake_lm_head_nondet_train_logprob_temperature": lambda **mode: (
+            cake_backend.cake_lm_head_nondet_train_logprob_temperature(
+                X, W, labels, **mode, temperature=0.7, **common
             )
         ),
-        "opt_in.forward_logprob_temperature": lambda d: (
+        "opt_in.forward_logprob_temperature": lambda **mode: (
             opt_in.forward_logprob_temperature(
-                X, W, labels, deterministic=d, temperature=0.7, **common
+                X, W, labels, **mode, temperature=0.7, **common
             )
         ),
-        "opt_in.prepare_lm_head_loss_temperature": lambda d: (
+        "opt_in.prepare_lm_head_loss_temperature": lambda **mode: (
             opt_in.prepare_lm_head_loss_temperature(
                 X,
                 W,
                 labels,
-                deterministic=d,
+                **mode,
                 entry="logprob",
                 temperature=torch.full((labels.shape[0],), 0.7),
                 **common,
             )
         ),
-        "opt_in.chunked_lm_head_logprob_temperature": lambda d: (
-            opt_in.chunked_lm_head_logprob_temperature(
+        "opt_in.cake_lm_head_nondet_train_logprob_temperature": lambda **mode: (
+            opt_in.cake_lm_head_nondet_train_logprob_temperature(
                 X,
                 W,
                 labels,
-                deterministic=d,
+                **mode,
                 num_valid_rows=int((labels >= 0).sum()),
+                temperature=0.7,
+                **common,
+            )
+        ),
+        "cake_lm_head_nondet_train_logprob_keep": lambda **mode: (
+            cake_backend.cake_lm_head_nondet_train_logprob_keep(
+                X, W, labels, **mode, **common
+            )
+        ),
+        "forward_logprob_keep": lambda **mode: cake_backend.forward_logprob_keep(
+            X, W, labels, **mode, chunk_size=4, backend="cake"
+        ),
+        "backward_logprob_keep": lambda **mode: cake_backend.backward_logprob_keep(
+            X,
+            W,
+            labels,
+            torch.zeros(rows),
+            torch.zeros(rows),
+            (),
+            **mode,
+            chunk_size=4,
+            backend="cake",
+        ),
+        "opt_in.forward_logprob": lambda **mode: opt_in.forward_logprob(
+            X, W, labels, **mode, **common
+        ),
+        "opt_in.backward_logprob": lambda **mode: opt_in.backward_logprob(
+            X,
+            W,
+            labels,
+            torch.zeros(rows),
+            torch.zeros(rows),
+            **mode,
+            **common,
+        ),
+        "opt_in.backward_logprob_temperature": lambda **mode: (
+            opt_in.backward_logprob_temperature(
+                X,
+                W,
+                labels,
+                torch.zeros(rows),
+                torch.zeros(rows),
+                **mode,
                 temperature=0.7,
                 **common,
             )
@@ -640,57 +678,67 @@ def _mode_calls(X, W, labels):
     }
 
 
-@pytest.mark.parametrize("value", [True, None, 1, 0, "False"])
-def test_every_entry_refuses_any_mode_but_false(value):
-    """``deterministic`` other than ``False`` (the default ``True`` included; ``0`` and other falsy values too) is a
-    ``ValueError`` that names the deterministic package, raised before any work."""
+def test_no_entry_takes_a_mode_keyword():
+    """The mode is part of the package name (issue #8928): passing ``deterministic`` to any entry that took it before
+    is Python's own ``TypeError``, raised before any work, and no autograd ``Function.forward`` of the two backends
+    binds a ``deterministic`` keyword."""
     inp = _host_inputs(8, device=CPU)
-    for name, call in _mode_calls(inp.X, inp.W, inp.labels).items():
-        with pytest.raises(ValueError, match="cake_lm_head_det_train") as info:
-            call(value)
-        assert "deterministic=False" in str(info.value), name
-    # the defaults refuse too: every entry of this package must be asked for the non-deterministic mode
-    with pytest.raises(ValueError, match="deterministic=False"):
-        cake_backend.chunked_lm_head_loss(
-            inp.X, inp.W, inp.labels, loss_div=1.0, backend="reference"
-        )
+    calls = _former_mode_calls(inp.X, inp.W, inp.labels)
+    assert len(calls) == 24
+    for call in calls.values():
+        with pytest.raises(TypeError, match="deterministic"):
+            call(deterministic=False)
+    functions = {
+        f"{module.__name__}.{name}": obj
+        for module in (cake_backend, opt_in)
+        for name, obj in vars(module).items()
+        if isinstance(obj, type)
+        and issubclass(obj, torch.autograd.Function)
+        and obj.__module__ == module.__name__
+    }
+    assert sorted(name.rsplit(".", 1)[1] for name in functions) == sorted(
+        [
+            "CakeLMHeadNondetLogprobFunction",
+            "CakeLMHeadNondetLogprobFunction",
+            "CakeLMHeadNondetLogprobKeepFunction",
+            "CakeLMHeadNondetLogprobTemperatureFunction",
+            "CakeLMHeadNondetLogprobTemperatureFunction",
+            "CakeLMHeadNondetLossFunction",
+            "CakeLMHeadNondetLossFunction",
+        ]
+    ), sorted(functions)
+    for fn in functions.values():
+        with pytest.raises(TypeError):
+            inspect.signature(fn.forward).bind_partial(deterministic=False)
 
 
-def test_every_entry_accepts_false():
+def test_former_mode_entries_run_without_a_mode_keyword():
+    """Every entry of :func:`_former_mode_calls` on the reference backend runs on the host without a mode keyword
+    (the kept-logits forward / backward pair takes the ``cake`` backend only and is left out)."""
     inp = _host_inputs(8, device=CPU)
-    for call in _mode_calls(inp.X, inp.W, inp.labels).values():
-        call(False)  # no exception: the reference backend computes on the host
+    calls = _former_mode_calls(inp.X, inp.W, inp.labels)
+    ran = []
+    for name, call in calls.items():
+        if name in ("forward_logprob_keep", "backward_logprob_keep"):
+            continue
+        call()  # the reference backend computes on the host
+        ran.append(name)
+    assert len(ran) == 22, ran
 
 
-def test_autograd_records_the_mode():
-    inp = _host_inputs(8, device=CPU)
-    X = inp.X.detach().requires_grad_(True)
-    W = inp.W.detach().requires_grad_(True)
-    loss = cake_backend.chunked_lm_head_loss(
-        X, W, inp.labels, loss_div=1.0, chunk_size=4, backend="reference", **ND
-    )
-    assert loss.grad_fn.deterministic is False
-    logp = cake_backend.chunked_lm_head_logprob(
-        X, W, inp.labels, chunk_size=4, backend="reference", **ND
-    )
-    assert logp.grad_fn.deterministic is False
+def _det_counterpart(name: str) -> str:
+    """The deterministic counterpart the alert of the call ``name`` (a key of :func:`_dx_calls`) names: the loss
+    entry's for the loss forwards, else the log-probability entry's."""
+    kind = "loss" if name.endswith(("forward_loss", ".forward", "_loss")) else "logprob"
+    return f"flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_{kind}"
 
 
-def _alerting_calls(inp):
-    """``name -> call()`` of every path that launches the gradient GEMMs (each raises PyTorch's alert under torch's
-    deterministic algorithms), on the reference backend."""
+def _dx_calls(inp):
+    """``name -> call()`` of every path that launches the dX GEMMs, on the reference backend: each raises PyTorch's
+    alert under torch's deterministic algorithms when its plan has a K-sliced dX chunk (:func:`_forced_dx_slices`)
+    and runs without one when every chunk is one slice (the reference backend's own plan)."""
     X, W, labels = inp.X, inp.W, inp.labels
-    kw = dict(chunk_size=4, backend="reference", **ND)
-
-    def deferred_backward():
-        with _torch_deterministic(False):
-            fwd = cake_backend.forward_loss(
-                X, W, labels, loss_div=1.0, fuse_dw_cast=True, **kw
-            )
-        assert (
-            fwd.dz_last is not None
-        )  # the plan deferred the last chunk's weight-gradient GEMM
-        return fwd.backward()
+    kw = dict(chunk_size=4, backend="reference")
 
     def runner_forward():
         with _torch_deterministic(False):
@@ -732,7 +780,7 @@ def _alerting_calls(inp):
     def autograd_temperature(mod, **extra):
         def call():
             with _torch_deterministic(False):
-                logp = mod.chunked_lm_head_logprob_temperature(
+                logp = mod.cake_lm_head_nondet_train_logprob_temperature(
                     X.detach().requires_grad_(True),
                     W,
                     labels,
@@ -744,6 +792,17 @@ def _alerting_calls(inp):
 
         return call
 
+    def autograd_logprob(mod, **extra):
+        def call():
+            with _torch_deterministic(False):
+                logp = mod.cake_lm_head_nondet_train_logprob(
+                    X.detach().requires_grad_(True), W, labels, **extra, **kw
+                )
+            return logp.backward(torch.ones_like(logp))
+
+        return call
+
+    valid_rows = int((labels >= 0).sum())
     return {
         "forward_loss": lambda: cake_backend.forward_loss(
             X, W, labels, loss_div=1.0, **kw
@@ -759,12 +818,22 @@ def _alerting_calls(inp):
             torch.zeros(labels.shape[0]),
             **kw,
         ),
-        "backward_loss": deferred_backward,
+        "opt_in.backward_logprob": lambda: opt_in.backward_logprob(
+            X,
+            W,
+            labels,
+            torch.zeros(labels.shape[0]),
+            torch.zeros(labels.shape[0]),
+            **kw,
+        ),
+        "opt_in.CakeLMHeadNondetLogprobFunction.backward": autograd_logprob(
+            opt_in, num_valid_rows=valid_rows
+        ),
         "LmHeadLossRunner.forward": runner_forward,
         "LmHeadLossRunner.backward": runner_backward_logprob,
         "opt_in.LmHeadLossRunner.forward": opt_in_runner_forward,
         "opt_in.LmHeadLossRunner.backward": opt_in_runner_backward_logprob,
-        "chunked_lm_head_loss": lambda: cake_backend.chunked_lm_head_loss(
+        "cake_lm_head_nondet_train_loss": lambda: cake_backend.cake_lm_head_nondet_train_loss(
             X.detach().requires_grad_(True), W, labels, loss_div=1.0, **kw
         ),
         "backward_logprob_temperature": lambda: (
@@ -790,43 +859,193 @@ def _alerting_calls(inp):
             )
         ),
         "LmHeadLossRunner.backward (temperature)": runner_backward_temperature,
-        "ChunkedLmHeadLogprobTemperatureFunction.backward": autograd_temperature(
+        "CakeLMHeadNondetLogprobTemperatureFunction.backward": autograd_temperature(
             cake_backend
         ),
-        "opt_in.ChunkedLmHeadLogprobTemperatureFunction.backward": autograd_temperature(
-            opt_in, num_valid_rows=int((labels >= 0).sum())
+        "opt_in.CakeLMHeadNondetLogprobTemperatureFunction.backward": autograd_temperature(
+            opt_in, num_valid_rows=valid_rows
         ),
     }
 
 
-def test_torch_deterministic_mode_raises_the_alert():
-    """Under ``torch.use_deterministic_algorithms(True)`` every gradient path raises PyTorch's ``RuntimeError`` (its
-    wording, naming the deterministic package); under ``warn_only=True`` it warns and computes."""
+def _fixed_order_backwards(inp):
+    """``name -> call()`` of the backward-only launches of a loss call whose forward ran outside torch's
+    deterministic algorithms -- the deferred last-chunk weight gradient (``backward_loss``), the loss runner's
+    backward and the loss autograd backward, both modules: casts and weight-gradient GEMMs of one fixed order, also
+    after a forward that ran a K-sliced dX (on the reference backend)."""
+    X, W, labels = inp.X, inp.W, inp.labels
+    kw = dict(chunk_size=4, backend="reference")
+
+    def deferred_backward(mod):
+        def call():
+            with _torch_deterministic(False):
+                fwd = mod.forward_loss(
+                    X, W, labels, loss_div=1.0, fuse_dw_cast=True, **kw
+                )
+            assert (
+                fwd.dz_last is not None
+            )  # the plan deferred the last chunk's weight-gradient GEMM
+            return fwd.backward()
+
+        return call
+
+    def runner_backward(mod):
+        def call():
+            with _torch_deterministic(False):
+                runner = mod.prepare_lm_head_loss(X, W, labels, loss_div=1.0, **kw)
+                runner.forward()
+            return runner.backward()
+
+        return call
+
+    def autograd_backward(mod):
+        def call():
+            with _torch_deterministic(False):
+                loss = mod.cake_lm_head_nondet_train_loss(
+                    X.detach().requires_grad_(True),
+                    W.detach().requires_grad_(True),
+                    labels,
+                    loss_div=1.0,
+                    **kw,
+                )
+            loss.backward()
+
+        return call
+
+    return {
+        "backward_loss": deferred_backward(cake_backend),
+        "opt_in.backward_loss": deferred_backward(opt_in),
+        "LmHeadLossRunner.backward (loss)": runner_backward(cake_backend),
+        "opt_in.LmHeadLossRunner.backward (loss)": runner_backward(opt_in),
+        "CakeLMHeadNondetLossFunction.backward": autograd_backward(cake_backend),
+        "opt_in.CakeLMHeadNondetLossFunction.backward": autograd_backward(opt_in),
+    }
+
+
+@contextlib.contextmanager
+def _forced_dx_slices(slices: int = 2):
+    """Every plan of both backend modules -- the reference backend's included, which plans one dX slice -- runs its
+    dX GEMM at ``slices`` K slices: the K-sliced reduction (``gemm_dx_red``; the reference engine adds the slices in
+    ascending order), so the host tests reach the alert of a K-sliced dX on the CPU."""
+    originals = (cake_backend.plan_dx_slices, opt_in.plan_dx_slices)
+
+    def forced(problem, chunks, *, need_dx, **_):
+        return tuple(slices for _ in chunks) if need_dx else ()
+
+    cake_backend.plan_dx_slices = opt_in.plan_dx_slices = forced
+    try:
+        yield
+    finally:
+        cake_backend.plan_dx_slices, opt_in.plan_dx_slices = originals
+
+
+def _record_reference_dx_red(monkeypatch) -> list:
+    """The reference engine's K-sliced dX launches (``gemm_dx_red``) of the calls that follow, in order."""
+    launched: list = []
+    reduce = cake_backend.ReferenceEngine.gemm_dx_red
+
+    def recording(values):
+        launched.append(int(values["k_slices"]))
+        return reduce(values)
+
+    monkeypatch.setattr(
+        cake_backend.ReferenceEngine, "gemm_dx_red", staticmethod(recording)
+    )
+    return launched
+
+
+_ALERT = "does not have a deterministic implementation"
+
+
+def test_torch_deterministic_mode_alerts_before_a_k_sliced_dx(monkeypatch):
+    """Under ``torch.use_deterministic_algorithms(True)`` every dX path whose plan has a K-sliced dX chunk (forced: the
+    reference backend plans one slice) raises PyTorch's ``RuntimeError`` (its wording, naming the entry and its
+    deterministic counterpart) before its first K-sliced dX launch; under ``warn_only=True`` it warns once per call, then
+    runs the reduction."""
     inp = _host_inputs(8, device=CPU)
-    for name, call in _alerting_calls(inp).items():
-        with (
-            _torch_deterministic(True),
-            pytest.raises(
-                RuntimeError, match="does not have a deterministic implementation"
-            ) as info,
-        ):
+    launched = _record_reference_dx_red(monkeypatch)
+    with _forced_dx_slices():
+        for name, call in _dx_calls(inp).items():
+            launched.clear()
+            with (
+                _torch_deterministic(True),
+                pytest.raises(RuntimeError, match=_ALERT) as info,
+            ):
+                call()
+            assert _det_counterpart(name) in str(info.value), name
+            assert not launched, name
+            with (
+                _torch_deterministic(True, warn_only=True),
+                warnings.catch_warnings(record=True) as record,
+            ):
+                warnings.simplefilter("always")
+                call()
+            alerts = [w for w in record if _ALERT in str(w.message)]
+            assert len(alerts) == 1, (name, [str(w.message) for w in alerts])
+            assert issubclass(alerts[0].category, UserWarning), name
+            assert launched and set(launched) == {2}, (name, launched)
+
+
+def test_warn_only_alert_names_the_callers_frame():
+    """Under ``warn_only=True`` the alert of an autograd entry's forward is attributed to the caller's frame: the
+    package's, flashinfer's and torch's frames (``Function.apply``) are skipped (forced K slices, reference
+    backend)."""
+    inp = _host_inputs(8, device=CPU)
+    X = inp.X.detach().requires_grad_(True)
+    W = inp.W.detach().requires_grad_(True)
+    with (
+        _forced_dx_slices(),
+        _torch_deterministic(True, warn_only=True),
+        warnings.catch_warnings(record=True) as record,
+    ):
+        warnings.simplefilter("always")
+        cake_backend.cake_lm_head_nondet_train_loss(
+            X, W, inp.labels, loss_div=1.0, chunk_size=4, backend="reference"
+        )
+    alerts = [w for w in record if _ALERT in str(w.message)]
+    assert len(alerts) == 1, [str(w.message) for w in record]
+    assert os.path.abspath(alerts[0].filename) == os.path.abspath(__file__), alerts[
+        0
+    ].filename
+
+
+def test_one_slice_and_fixed_order_launches_do_not_alert(monkeypatch):
+    """A plan whose dX chunks all have one slice (the reference backend's) runs every dX path under strict
+    ``torch.use_deterministic_algorithms(True)`` without an alert, and the backward-only launches of a loss call (the
+    deferred weight gradient, the casts, the runner's and the autograd backward) run without one even after a forward
+    that ran a K-sliced dX: their order is fixed."""
+    inp = _host_inputs(8, device=CPU)
+    launched = _record_reference_dx_red(monkeypatch)
+    with _torch_deterministic(True), warnings.catch_warnings():
+        warnings.filterwarnings("error", message=f".*{_ALERT}.*")
+        for call in _dx_calls(inp).values():
             call()
-        assert "cake_lm_head_det_train" in str(info.value), name
-        with (
-            _torch_deterministic(True, warn_only=True),
-            pytest.warns(
-                UserWarning, match="does not have a deterministic implementation"
-            ),
-        ):
+        for call in _fixed_order_backwards(inp).values():
             call()
+    assert not launched
+    with (
+        _forced_dx_slices(),
+        _torch_deterministic(True),
+        warnings.catch_warnings(),
+    ):
+        warnings.filterwarnings("error", message=f".*{_ALERT}.*")
+        for name, call in _fixed_order_backwards(inp).items():
+            launched.clear()
+            call()
+            assert launched, name  # the forward (outside the mode) ran the K-sliced dX
 
 
 def test_paths_without_gradient_gemms_do_not_alert():
-    """The log-probability forward and a loss forward without trainable inputs launch no gradient GEMM: no alert."""
+    """The log-probability forward and a loss forward without trainable inputs launch no gradient GEMM: no alert,
+    also with every dX plan forced to K slices."""
     inp = _host_inputs(8, device=CPU)
-    kw = dict(chunk_size=4, backend="reference", **ND)
-    with _torch_deterministic(True), warnings.catch_warnings():
-        warnings.filterwarnings("error", message=".*deterministic implementation.*")
+    kw = dict(chunk_size=4, backend="reference")
+    with (
+        _forced_dx_slices(),
+        _torch_deterministic(True),
+        warnings.catch_warnings(),
+    ):
+        warnings.filterwarnings("error", message=f".*{_ALERT}.*")
         cake_backend.forward_logprob(inp.X, inp.W, inp.labels, **kw)
         cake_backend.forward_loss(
             inp.X, inp.W, inp.labels, loss_div=1.0, need_dx=False, need_dw=False, **kw
@@ -1257,7 +1476,7 @@ def test_entries_read_the_slice_rule_once_and_key_and_plan_with_it(
         )
     cache = cake_backend.BINDING_CACHE
     cache.clear()
-    kw = dict(chunk_size=chunk, backend=backend, **ND)
+    kw = dict(chunk_size=chunk, backend=backend)
     cake_backend.forward_loss(inp.X, inp.W, inp.labels, loss_div=1.0, **kw)
     assert len(reads) == 1 and prepared == [reads[0]], (reads, prepared)
     if backend == "cake":
@@ -1445,7 +1664,6 @@ def test_fill_placement_and_zero_weight_floor_switches():
         infer_logp=inp.infer_logp,
         loss_weights=inp.loss_weights,
         chunk_size=64,
-        deterministic=False,
     )
     assert cake_backend.zero_weight_min_rows() == 0
     assert cake_backend.zero_weight_split(problem, True)
@@ -1465,7 +1683,6 @@ def test_fill_placement_and_zero_weight_floor_switches():
             loss_weights=weighted.loss_weights,
             chunk_size=64,
             backend="reference",
-            **ND,
         )
         below = cake_backend.forward_loss(inp.X, inp.W, weighted.labels, **kw)
         assert "zero_weight_rows" not in below.memory
@@ -2073,8 +2290,8 @@ def test_device_checkpoint_replay(glm_weight):
     inp = _device_inputs(4097, "ce", W=glm_weight)
 
     def head(X, W):
-        return cake_backend.chunked_lm_head_loss(
-            X, W, inp.labels, loss_div=inp.loss_div, chunk_size=4096, **ND
+        return cake_backend.cake_lm_head_nondet_train_loss(
+            X, W, inp.labels, loss_div=inp.loss_div, chunk_size=4096
         )
 
     X = inp.X.detach().requires_grad_(True)
@@ -2102,13 +2319,12 @@ def test_device_gradient_accumulation(glm_weight):
     seen_w = []
     W.register_hook(lambda g: seen_w.append(g.detach().clone()))
     for inp in (a, b):
-        loss = cake_backend.chunked_lm_head_loss(
+        loss = cake_backend.cake_lm_head_nondet_train_loss(
             X if inp is a else inp.X.detach().requires_grad_(False),
             W,
             inp.labels,
             loss_div=inp.loss_div,
             chunk_size=4096,
-            **ND,
         )
         loss.backward()
     assert len(seen_w) == 2
@@ -2129,7 +2345,7 @@ def test_device_retained_graph(glm_weight):
     inp = _device_inputs(4097, "policy", W=glm_weight)
     X = inp.X.detach().requires_grad_(True)
     W = inp.W.detach().requires_grad_(True)
-    loss = cake_backend.chunked_lm_head_loss(
+    loss = cake_backend.cake_lm_head_nondet_train_loss(
         X,
         W,
         inp.labels,
@@ -2137,7 +2353,6 @@ def test_device_retained_graph(glm_weight):
         infer_logp=inp.infer_logp,
         loss_weights=inp.loss_weights,
         chunk_size=4096,
-        **ND,
     )
     dx1, dw1 = torch.autograd.grad(loss, (X, W), retain_graph=True)
     dx2, dw2 = torch.autograd.grad(loss, (X, W))
@@ -2157,14 +2372,13 @@ def test_device_concurrent_streams(glm_weight):
         with torch.cuda.stream(stream):
             X = inp.X.detach().requires_grad_(True)
             W = inp.W.detach().requires_grad_(True)
-            loss, logp = cake_backend.chunked_lm_head_loss(
+            loss, logp = cake_backend.cake_lm_head_nondet_train_loss(
                 X,
                 W,
                 inp.labels,
                 loss_div=inp.loss_div,
                 chunk_size=4096,
                 return_logp=True,
-                **ND,
             )
             loss.backward()
             results[i] = dict(loss=loss.detach(), logp=logp, dX=X.grad, dW=W.grad)
@@ -2184,7 +2398,7 @@ def test_device_prepared_runner_and_cuda_graph(glm_weight, entry):
     new = _device_inputs(4097, "ce", W=glm_weight, seed=SEED + 11, ignore_frac=0.0)
     X = inp.X.clone()
     labels = inp.labels.clone()
-    kw = dict(chunk_size=4096, backend="cake", entry=entry, **ND)
+    kw = dict(chunk_size=4096, backend="cake", entry=entry)
     if entry == "loss":
         kw.update(loss_div=inp.loss_div)
     runner = cake_backend.prepare_lm_head_loss(X, inp.W, labels, **kw)
@@ -2424,7 +2638,6 @@ def test_device_one_slice_chunks_are_the_deterministic_bits(glm_weight, policy):
             inp.labels,
             loss_div=inp.loss_div,
             chunk_size=4096,
-            **ND,
         )
         assert runner.plan.compact is False or runner.plan.rows == T
         slices, chunks = runner.plan.dx_slices, runner.plan.chunks
@@ -2457,10 +2670,160 @@ def test_device_logp_statistics_never_change(glm_weight):
     """``loss`` / ``logp`` / ``lse`` keep their fixed order in this package: the deterministic package's bits."""
     _require_program(entry="logprob")
     inp = _device_inputs(8191, "ce", W=glm_weight)
-    nd = cake_backend.forward_logprob(inp.X, inp.W, inp.labels, chunk_size=4096, **ND)
+    nd = cake_backend.forward_logprob(inp.X, inp.W, inp.labels, chunk_size=4096)
     det = det_backend.forward_logprob(inp.X, inp.W, inp.labels, chunk_size=4096)
     assert _same_bits(nd.logp, det.logp) and _same_bits(nd.lse, det.lse)
     assert math.isfinite(float(nd.logp.sum()))
+
+
+@pytest.mark.parametrize("entry", ["loss", "logprob"])
+def test_device_one_slice_call_runs_under_strict_deterministic_algorithms(
+    glm_weight, entry
+):
+    """Under strict ``torch.use_deterministic_algorithms(True)`` a call whose dX chunks all have one slice (pinned; every
+    row valid, uncompacted) raises no alert: its launches have one order, so two runs give the same ``dX`` / ``dW``
+    bits and ``dX`` is the deterministic entry's (the same one-slice plain store).  This checks on the device the
+    fixed order of the weight gradient (chunk order, no atomics) that the package's docstrings state."""
+    _require_program(entry=entry)
+    inp = _device_inputs(8191, "ce", W=glm_weight, ignore_frac=0.0)
+    kw = dict(gemm_tuning={"dx": {"k_slices": None}}, compact_rows=False)
+    runs = []
+    for _ in range(2):
+        with _torch_deterministic(True), warnings.catch_warnings():
+            warnings.filterwarnings("error", message=f".*{_ALERT}.*")
+            runs.append(_run(inp, 4096, entry=entry, backend="cake", **kw))
+    det = _run(inp, 4096, entry=entry, backend="cake", package="det", **kw)
+    for key in ("loss", "logp", "dX", "dW"):
+        assert _same_bits(runs[0][key], runs[1][key]), key
+    assert _same_bits(runs[0]["dX"], det["dX"])
+    _check_against_references(runs[0], inp, entry=entry)
+
+
+@pytest.mark.parametrize("entry", ["loss", "logprob"])
+def test_device_k_sliced_call_alerts_before_its_dx_and_leaves_no_state(
+    glm_weight, entry
+):
+    """Under strict ``torch.use_deterministic_algorithms(True)`` a call whose plan has K-sliced dX chunks (two slices
+    pinned; the default compacted path with the hidden valid-row count) raises PyTorch's ``RuntimeError`` before any dX
+    launch -- the launch record holds no ``gemm_dx*`` key and no ``dX_acc`` fill -- on a call that forms its binding
+    and on a remembered one; the next call outside the mode gives the reference call's ``loss`` / ``logp`` / ``dW``
+    bits and a ``dX`` within the budgets (the raise leaves no half-built binding or thread state).  Under
+    ``warn_only=True`` the call warns and runs."""
+    _require_program(entry=entry)
+    inp = _device_inputs(8191, "ce", W=glm_weight)
+    kw = dict(gemm_tuning={"dx": {"k_slices": 2}})
+    name = "forward_loss" if entry == "loss" else "backward_logprob"
+    ref = _run(inp, 4096, entry=entry, backend="cake", **kw)
+    cake_backend.BINDING_CACHE.clear()
+    for attempt in ("binds", "remembered"):
+        with (
+            _torch_deterministic(True),
+            _launch_record() as launched,
+            pytest.raises(
+                RuntimeError,
+                match=f"{name} {_ALERT}.*cake_lm_head_det_train.cake_lm_head_det_train_{entry}",
+            ),
+        ):
+            _run(inp, 4096, entry=entry, backend="cake", **kw)
+        torch.cuda.synchronize()
+        dx_keys = [k for k in launched if str(k[0]).startswith(("gemm_dx", "dx_fill"))]
+        assert not dx_keys, (attempt, launched)
+        again = _run(inp, 4096, entry=entry, backend="cake", **kw)
+        for key in ("loss", "logp", "dW"):
+            assert _same_bits(again[key], ref[key]), (attempt, key)
+        _check_against_references(again, inp, entry=entry)
+    with (
+        _torch_deterministic(True, warn_only=True),
+        pytest.warns(UserWarning, match=f"{name} {_ALERT}"),
+    ):
+        warned = _run(inp, 4096, entry=entry, backend="cake", **kw)
+    for key in ("loss", "logp", "dW"):
+        assert _same_bits(warned[key], ref[key]), key
+    _check_against_references(warned, inp, entry=entry)
+
+
+def test_device_kept_backward_alerts_before_its_dx_and_keeps_the_logits(glm_weight):
+    """``backward_logprob_keep`` under strict ``torch.use_deterministic_algorithms(True)`` with K-sliced dX chunks (two
+    slices pinned) raises PyTorch's ``RuntimeError`` before any dX launch (no ``gemm_dx*`` key, no ``dX_acc`` fill)
+    and leaves the kept logits unconsumed: the same views then serve a backward outside the mode, which gives the
+    default call's ``dW`` bits and a ``dX`` within the budgets.  Under ``warn_only=True`` it warns once and runs."""
+    _require_program(entry="logprob")
+    inp = _device_inputs(8191, "ce", W=glm_weight)
+    tuning = {"dx": {"k_slices": 2}}
+    kw = dict(chunk_size=4096, gemm_tuning=tuning)
+    dlogp = torch.where(inp.valid, inp.dlogp, torch.zeros_like(inp.dlogp))
+    ref = _run(inp, 4096, entry="logprob", backend="cake", gemm_tuning=tuning)
+
+    def forward():
+        return cake_backend.forward_logprob_keep(inp.X, inp.W, inp.labels, **kw)
+
+    def backward(fr):
+        X, W, labels = inp.X, inp.W, inp.labels
+        return cake_backend.backward_logprob_keep(
+            X, W, labels, fr.lse, dlogp, fr.logits, row_index=fr.row_index, **kw
+        )
+
+    def check(dx, dw, tag):
+        torch.cuda.synchronize()
+        assert _same_bits(dw, ref["dW"]), tag
+        _check_against_references(dict(ref, dX=dx, dW=dw), inp, entry="logprob")
+
+    fr = forward()
+    with (
+        _torch_deterministic(True),
+        _launch_record() as launched,
+        pytest.raises(
+            RuntimeError,
+            match=f"backward_logprob_keep {_ALERT}.*cake_lm_head_det_train.cake_lm_head_det_train_logprob",
+        ),
+    ):
+        backward(fr)
+    torch.cuda.synchronize()
+    dx_keys = [k for k in launched if str(k[0]).startswith(("gemm_dx", "dx_fill"))]
+    assert not dx_keys, launched
+    check(*backward(fr), "after the strict raise")  # the same kept views
+    fr = forward()
+    with (
+        _torch_deterministic(True, warn_only=True),
+        warnings.catch_warnings(record=True) as record,
+    ):
+        warnings.simplefilter("always")
+        dx, dw = backward(fr)
+    alerts = [w for w in record if _ALERT in str(w.message)]
+    assert len(alerts) == 1, [str(w.message) for w in alerts]
+    assert "backward_logprob_keep" in str(alerts[0].message)
+    check(dx, dw, "warn_only")
+
+
+def test_device_budget_recompute_backward_does_not_alert(glm_weight, monkeypatch):
+    """The opt-in loss entry's recompute form of ``memory_mode="budget"`` (forced) finishes ``dW`` in the backward by
+    the vocabulary-block recompute: weight-gradient GEMMs of one fixed order.  After a forward outside torch's
+    deterministic algorithms (two dX slices pinned), the autograd backward and ``ForwardResult.backward`` run under
+    strict ``torch.use_deterministic_algorithms(True)`` without an alert and give the same ``dW`` bits."""
+    _require_program(entry="loss")
+    step = _require_recompute()
+    inp = _device_inputs(8191, "ce", W=glm_weight)
+    calls: list = []
+    _force_budget_plan(monkeypatch, ("recompute", 0, step), calls)
+    kw = dict(
+        loss_div=inp.loss_div,
+        chunk_size=4096,
+        memory_mode="budget",
+        gemm_tuning={"dx": {"k_slices": 2}},
+    )
+    X = inp.X.detach().requires_grad_(True)
+    W = inp.W.detach().requires_grad_(True)
+    loss = opt_in.cake_lm_head_nondet_train_loss(X, W, inp.labels, **kw)
+    fwd = opt_in.forward_loss(inp.X, inp.W, inp.labels, **kw)
+    assert calls and set(calls) == {"loss"}, calls
+    assert loss.grad_fn.memory_plan.recompute and fwd.memory_plan.recompute
+    with _torch_deterministic(True), warnings.catch_warnings():
+        warnings.filterwarnings("error", message=f".*{_ALERT}.*")
+        loss.backward()
+        dx, dw = fwd.backward()
+    torch.cuda.synchronize()
+    assert X.grad is not None and dx is not None
+    assert _same_bits(dw, W.grad)
 
 
 # ---------------------------------------------------------------------------
@@ -2528,9 +2891,9 @@ def _loss_call(
     X = inp.X.detach().requires_grad_(train_x)
     W = inp.W.detach().requires_grad_(train_w)
     if package == "nd":
-        fn, mode = cake_backend.chunked_lm_head_loss, ND
+        fn = cake_backend.cake_lm_head_nondet_train_loss
     else:
-        fn, mode = det_backend.cake_lm_head_det_train_loss, {}
+        fn = det_backend.cake_lm_head_det_train_loss
     out = fn(
         X,
         W,
@@ -2541,7 +2904,6 @@ def _loss_call(
         chunk_size=C,
         return_logp=return_logp,
         backend=backend,
-        **mode,
         **kw,
     )
     loss, logp = out if return_logp else (out, None)
@@ -2585,7 +2947,6 @@ def test_zero_weight_split_applies_to_compacted_policy_loss_calls_only():
         objective="policy",
         infer_logp=inp.infer_logp,
         loss_weights=inp.loss_weights,
-        **ND,
     )
     assert cake_backend.zero_weight_split(problem, True)
     assert not cake_backend.zero_weight_split(problem, False)
@@ -2639,7 +3000,6 @@ def test_reference_zero_weight_rows_without_return_logp():
         loss_weights=inp.loss_weights,
         chunk_size=64,
         backend="reference",
-        **ND,
     )
     with_logp = cake_backend.forward_loss(inp.X, inp.W, inp.labels, **kw)
     without = cake_backend.forward_loss(
@@ -2791,7 +3151,7 @@ def test_device_zero_weight_rows_repeat_and_both_count_paths(glm_weight):
     for key in ("loss", "logp", "dW"):
         assert _same_bits(firsts[True][key], firsts[False][key]), key
 
-    def syncs(forward, hidden, **mode):
+    def syncs(forward, hidden):
         counts = []
         for _ in range(3):
             torch.cuda.synchronize()
@@ -2808,7 +3168,6 @@ def test_device_zero_weight_rows_repeat_and_both_count_paths(glm_weight):
                         loss_weights=inp.loss_weights,
                         chunk_size=4096,
                         hidden_count=hidden,
-                        **mode,
                     )
             finally:
                 torch.cuda.set_sync_debug_mode("default")
@@ -2816,7 +3175,7 @@ def test_device_zero_weight_rows_repeat_and_both_count_paths(glm_weight):
         return min(counts)
 
     for hidden in (False, True):
-        nd_syncs = syncs(cake_backend.forward_loss, hidden, **ND)
+        nd_syncs = syncs(cake_backend.forward_loss, hidden)
         det_syncs = syncs(det_backend.forward_loss, hidden)
         print(
             f"\nzero-weight synchronizations hidden_count={hidden}: ND {nd_syncs} det {det_syncs}"
@@ -2835,11 +3194,10 @@ def test_device_zero_weight_rows_checkpoint_accumulation_retained_graph(glm_weig
         infer_logp=inp.infer_logp,
         loss_weights=inp.loss_weights,
         chunk_size=4096,
-        **ND,
     )
 
     def head(X, W):
-        return cake_backend.chunked_lm_head_loss(X, W, inp.labels, **kw)
+        return cake_backend.cake_lm_head_nondet_train_loss(X, W, inp.labels, **kw)
 
     X = inp.X.detach().requires_grad_(True)
     W = inp.W.detach().requires_grad_(True)
@@ -2934,7 +3292,9 @@ def test_device_zero_weight_pass_adds_no_peak_without_a_weight_gradient(
     def call(inp):
         X = inp.X.detach().requires_grad_(train_x)
         W = inp.W.detach()
-        loss, logp = (opt_in if memory_mode else cake_backend).chunked_lm_head_loss(
+        loss, logp = (
+            opt_in if memory_mode else cake_backend
+        ).cake_lm_head_nondet_train_loss(
             X,
             W,
             inp.labels,
@@ -2944,7 +3304,6 @@ def test_device_zero_weight_pass_adds_no_peak_without_a_weight_gradient(
             chunk_size=4096,
             return_logp=True,
             **({} if memory_mode is None else dict(memory_mode=memory_mode)),
-            **ND,
         )
         if train_x:
             loss.backward()
@@ -3002,7 +3361,6 @@ def test_device_zero_weight_pass_adds_no_peak_without_a_weight_gradient(
         chunk_size=4096,
         need_dx=train_x,
         need_dw=False,
-        **ND,
     )
     memory = result.memory
     assert memory.get("hidden_count") and memory["zero_weight_rows"] == int(zero.sum())
@@ -3074,7 +3432,6 @@ def test_device_zero_weight_pass_phase_matches_the_report(
         chunk_size=4096,
         need_dx=grads != "no_grad",
         need_dw=grads == "trainable",
-        **ND,
     )
     result = None
     for _ in range(2):  # binds, then the measured call from the remembered binding
@@ -3144,10 +3501,10 @@ def test_device_no_added_synchronization(glm_weight, T, objective):
     )
 
     def call(package, hidden):
-        fn, mode = (
-            (cake_backend.chunked_lm_head_loss, ND)
+        fn = (
+            cake_backend.cake_lm_head_nondet_train_loss
             if package == "nd"
-            else (det_backend.cake_lm_head_det_train_loss, {})
+            else det_backend.cake_lm_head_det_train_loss
         )
         X = inp.X.detach().requires_grad_(True)
         W = inp.W.detach().requires_grad_(True)
@@ -3159,7 +3516,6 @@ def test_device_no_added_synchronization(glm_weight, T, objective):
             return_logp=True,
             hidden_count=hidden,
             **kw,
-            **mode,
         )
         loss.backward()
 
@@ -3221,7 +3577,6 @@ def test_device_no_added_synchronization(glm_weight, T, objective):
                 chunk_size=4096,
                 hidden_count=True,
                 **kw,
-                **ND,
             )
             assert fwd.memory.get("hidden_count"), fwd.memory
 
@@ -3252,7 +3607,7 @@ def test_device_zero_weight_rows_concurrent_threads(glm_weight):
                 for _ in range(4):
                     X = inp.X.detach().requires_grad_(True)
                     W = inp.W.detach().requires_grad_(True)
-                    loss, logp = cake_backend.chunked_lm_head_loss(
+                    loss, logp = cake_backend.cake_lm_head_nondet_train_loss(
                         X,
                         W,
                         inp.labels,
@@ -3261,7 +3616,6 @@ def test_device_zero_weight_rows_concurrent_threads(glm_weight):
                         loss_weights=inp.loss_weights,
                         chunk_size=4096,
                         return_logp=True,
-                        **ND,
                     )
                     loss.backward()
                     runs[i].append(
@@ -3299,10 +3653,10 @@ def test_device_zero_weight_rows_under_a_non_finite_upstream_gradient(glm_weight
     out = {}
     for package in ("nd", "det"):
         X = inp.X.detach().requires_grad_(True)
-        fn, mode = (
-            (cake_backend.chunked_lm_head_loss, ND)
+        fn = (
+            cake_backend.cake_lm_head_nondet_train_loss
             if package == "nd"
-            else (det_backend.cake_lm_head_det_train_loss, {})
+            else det_backend.cake_lm_head_det_train_loss
         )
         loss = fn(
             X,
@@ -3313,7 +3667,6 @@ def test_device_zero_weight_rows_under_a_non_finite_upstream_gradient(glm_weight
             loss_weights=inp.loss_weights,
             chunk_size=4096,
             return_logp=False,
-            **mode,
         )
         loss.backward(torch.tensor(float("inf"), device=CUDA))
         torch.cuda.synchronize()
@@ -3340,7 +3693,6 @@ def test_opt_in_forms_split_zero_weight_rows_unless_the_count_is_given():
         loss_weights=inp.loss_weights,
         chunk_size=64,
         backend="reference",
-        **ND,
     )
     main = cake_backend.forward_loss(inp.X, inp.W, inp.labels, **kw)
     opt = opt_in.forward_loss(inp.X, inp.W, inp.labels, **kw)
@@ -3418,7 +3770,7 @@ def test_device_zero_weight_rows_budget_form(glm_weight, T, kind):
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
         start = torch.cuda.memory_allocated()
-        loss, logp = opt_in.chunked_lm_head_loss(
+        loss, logp = opt_in.cake_lm_head_nondet_train_loss(
             X,
             W,
             inp.labels,
@@ -3428,7 +3780,6 @@ def test_device_zero_weight_rows_budget_form(glm_weight, T, kind):
             chunk_size=4096,
             return_logp=True,
             memory_mode="budget",
-            **ND,
         )
         mplan = loss.grad_fn.memory_plan
         loss.backward()
@@ -3460,7 +3811,6 @@ def test_zero_weight_split_is_not_applied_to_the_excluded_forms():
         loss_weights=inp.loss_weights,
         chunk_size=64,
         backend="reference",
-        **ND,
     )
     flat = cake_backend.forward_loss(inp.X, inp.W, inp.labels, compact_rows=False, **kw)
     assert "zero_weight_rows" not in flat.memory and flat.row_index is None
@@ -3605,7 +3955,6 @@ def test_device_fp32_dx_acc_spread_over_repeated_runs(glm_weight):
                     chunk_size=4096,
                     need_dw=False,
                     gemm_tuning={"dx": {"k_slices": k}},
-                    **ND,
                 )
                 ref = (
                     oracle["dX"]
@@ -3651,7 +4000,7 @@ def _budget_step(inp, entry, **kw):
     base = torch.cuda.memory_allocated()
     mplan = None
     if entry == "loss":
-        loss, logp = opt_in.chunked_lm_head_loss(
+        loss, logp = opt_in.cake_lm_head_nondet_train_loss(
             X,
             W,
             inp.labels,
@@ -3659,18 +4008,17 @@ def _budget_step(inp, entry, **kw):
             chunk_size=4096,
             return_logp=True,
             **kw,
-            **ND,
         )
         mplan = getattr(loss.grad_fn, "memory_plan", None)
         loss.backward()
         loss = loss.detach()
     else:
         entry_fn = (
-            opt_in.chunked_lm_head_logprob_temperature
+            opt_in.cake_lm_head_nondet_train_logprob_temperature
             if TEMPERATURE_KEYWORDS & kw.keys()
-            else opt_in.chunked_lm_head_logprob
+            else opt_in.cake_lm_head_nondet_train_logprob
         )
-        logp = entry_fn(X, W, inp.labels, chunk_size=4096, **kw, **ND)
+        logp = entry_fn(X, W, inp.labels, chunk_size=4096, **kw)
         logp.backward(inp.dlogp)
         loss = None
     torch.cuda.synchronize()
@@ -3727,14 +4075,14 @@ def test_device_checkpointed_forward_keeps_no_more_than_the_deterministic_packag
         return torch.cuda.memory_stats()["requested_bytes.all.current"]
 
     def retained(package):
-        fn, mode = (
-            (cake_backend.chunked_lm_head_loss, ND)
+        fn = (
+            cake_backend.cake_lm_head_nondet_train_loss
             if package == "nd"
-            else (det_backend.cake_lm_head_det_train_loss, {})
+            else det_backend.cake_lm_head_det_train_loss
         )
 
         def head(X, W):
-            return fn(X, W, inp.labels, loss_div=inp.loss_div, chunk_size=4096, **mode)
+            return fn(X, W, inp.labels, loss_div=inp.loss_div, chunk_size=4096)
 
         X = inp.X.detach().requires_grad_(True)
         W = inp.W.detach().requires_grad_(True)
@@ -3778,7 +4126,7 @@ def test_device_fp32_weight_gradient(glm_weight, fuse):
         grad_weight_dtype=torch.float32,
         fuse_dw_cast=fuse,
     )
-    nd_fwd = cake_backend.forward_loss(inp.X, inp.W, inp.labels, **kw, **ND)
+    nd_fwd = cake_backend.forward_loss(inp.X, inp.W, inp.labels, **kw)
     dx, dw = nd_fwd.backward(grad_weight_dtype=torch.float32)
     det_fwd = det_backend.forward_loss(inp.X, inp.W, inp.labels, **kw)
     det_dx, det_dw = det_fwd.backward(grad_weight_dtype=torch.float32)
@@ -3910,41 +4258,39 @@ def test_device_wrong_valid_row_count_raises_on_every_path(glm_weight):
     frozen = inp.X.detach()
     common = dict(chunk_size=4096, num_valid_rows=wrong, check_num_valid_rows=True)
     calls = {
-        "loss-no-grad": lambda: opt_in.chunked_lm_head_loss(
-            frozen, inp.W, inp.labels, loss_div=inp.loss_div, **common, **ND
+        "loss-no-grad": lambda: opt_in.cake_lm_head_nondet_train_loss(
+            frozen, inp.W, inp.labels, loss_div=inp.loss_div, **common
         ),
-        "logprob-no-grad": lambda: opt_in.chunked_lm_head_logprob(
-            frozen, inp.W, inp.labels, **common, **ND
+        "logprob-no-grad": lambda: opt_in.cake_lm_head_nondet_train_logprob(
+            frozen, inp.W, inp.labels, **common
         ),
-        "logprob-budget": lambda: opt_in.chunked_lm_head_logprob(
-            X, inp.W, inp.labels, memory_mode="budget", **common, **ND
+        "logprob-budget": lambda: opt_in.cake_lm_head_nondet_train_logprob(
+            X, inp.W, inp.labels, memory_mode="budget", **common
         ),
-        "loss": lambda: opt_in.chunked_lm_head_loss(
-            X, inp.W, inp.labels, loss_div=inp.loss_div, **common, **ND
+        "loss": lambda: opt_in.cake_lm_head_nondet_train_loss(
+            X, inp.W, inp.labels, loss_div=inp.loss_div, **common
         ),
-        "loss-budget": lambda: opt_in.chunked_lm_head_loss(
+        "loss-budget": lambda: opt_in.cake_lm_head_nondet_train_loss(
             X,
             inp.W,
             inp.labels,
             loss_div=inp.loss_div,
             memory_mode="budget",
             **common,
-            **ND,
         ),
-        "loss-uncompacted": lambda: opt_in.chunked_lm_head_loss(
+        "loss-uncompacted": lambda: opt_in.cake_lm_head_nondet_train_loss(
             X,
             inp.W,
             inp.labels,
             loss_div=inp.loss_div,
             compact_rows=False,
             **common,
-            **ND,
         ),
-        "logprob": lambda: opt_in.chunked_lm_head_logprob(
-            X, inp.W, inp.labels, **common, **ND
+        "logprob": lambda: opt_in.cake_lm_head_nondet_train_logprob(
+            X, inp.W, inp.labels, **common
         ),
-        "logprob-uncompacted": lambda: opt_in.chunked_lm_head_logprob(
-            X, inp.W, inp.labels, compact_rows=False, **common, **ND
+        "logprob-uncompacted": lambda: opt_in.cake_lm_head_nondet_train_logprob(
+            X, inp.W, inp.labels, compact_rows=False, **common
         ),
     }
     for name, call in calls.items():
@@ -3979,10 +4325,10 @@ def test_device_dw_stream_modes(glm_weight):
 
 def test_device_fresh_thread_and_preload(glm_weight):
     """A call from a thread that never called the package before forms that thread's state (side
-    streams, count cells) and gives the main thread's ``loss`` / ``logp`` / ``dW`` bits; ``chunked_lm_head_preload(
-    deterministic=False)`` forms the calling thread's state ahead of its first call."""
+    streams, count cells) and gives the main thread's ``loss`` / ``logp`` / ``dW`` bits;
+    ``cake_lm_head_nondet_train_preload`` forms the calling thread's state ahead of its first call."""
     _require_program(entry="loss")
-    import flashinfer.chunked_lm_head as public
+    import flashinfer.cake_lm_head_nondet_train as public
 
     inp = _device_inputs(12289, "ce", W=glm_weight)
     main = _run(inp, 4096, backend="cake")
@@ -4000,9 +4346,7 @@ def test_device_fresh_thread_and_preload(glm_weight):
 
     def preloaded():
         try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                public.chunked_lm_head_preload(CUDA, deterministic=False)
+            public.cake_lm_head_nondet_train_preload(CUDA)
             index = torch.cuda.current_device()
             out["preloaded"] = (
                 index in cake_backend._thread_state("dw_streams"),
@@ -4151,7 +4495,7 @@ def test_device_side_stream_fill_in_the_log_probability_backward(glm_weight):
     GEMM and gives the caller-stream fill's ``dW`` bits and ``dX`` within the gates."""
     _require_program(entry="logprob")
     inp = _device_inputs(8191, "ce", W=glm_weight)
-    fwd = cake_backend.forward_logprob(inp.X, inp.W, inp.labels, chunk_size=4096, **ND)
+    fwd = cake_backend.forward_logprob(inp.X, inp.W, inp.labels, chunk_size=4096)
 
     def backward():
         return cake_backend.backward_logprob(
@@ -4162,7 +4506,6 @@ def test_device_side_stream_fill_in_the_log_probability_backward(glm_weight):
             inp.dlogp,
             chunk_size=4096,
             row_index=fwd.row_index,
-            **ND,
         )
 
     _, plain_dw = backward()
@@ -4321,7 +4664,7 @@ sys.path.insert(0, sys.argv[1])
 from tests.test_helpers.cake_lm_head_loss_reference import make_inputs  # noqa: E402
 from tests.test_helpers.cake_package import cake_package  # noqa: E402
 
-backend = cake_package("cake.cake_lm_head_loss", "cake_backend")
+backend = cake_package("cake.cake_lm_head_nondet_train", "cake_backend")
 modes = []
 set_mode = torch.cuda.set_sync_debug_mode
 torch.cuda.set_sync_debug_mode = lambda mode: (modes.append(mode), set_mode(mode))[1]
@@ -4331,8 +4674,8 @@ inp = make_inputs(
 X = inp.X.detach().requires_grad_(True)
 W = inp.W.detach().requires_grad_(True)
 assert backend._device_constants.cache_info().currsize == 0
-loss, _ = backend.chunked_lm_head_loss(
-    X, W, inp.labels, loss_div=inp.loss_div, chunk_size=4096, return_logp=True, deterministic=False
+loss, _ = backend.cake_lm_head_nondet_train_loss(
+    X, W, inp.labels, loss_div=inp.loss_div, chunk_size=4096, return_logp=True
 )
 loss.backward()
 torch.cuda.synchronize()
@@ -4413,14 +4756,13 @@ def test_device_first_calls_of_two_threads_keep_the_sync_debug_mode(glm_weight, 
             barrier.wait(TIMEOUT_S)
             X = inp.X.detach().requires_grad_(True)
             W = inp.W.detach().requires_grad_(True)
-            loss, logp = cake_backend.chunked_lm_head_loss(
+            loss, logp = cake_backend.cake_lm_head_nondet_train_loss(
                 X,
                 W,
                 inp.labels,
                 loss_div=inp.loss_div,
                 chunk_size=4096,
                 return_logp=True,
-                **ND,
             )
             loss.backward()
             results[i] = dict(
@@ -4556,7 +4898,7 @@ def _same_inputs_on_two_streams(
                 X = inp.X.detach().requires_grad_(True)
                 W = inp.W.detach().requires_grad_(True)
                 if entry == "loss":
-                    out, logp = cake_backend.chunked_lm_head_loss(
+                    out, logp = cake_backend.cake_lm_head_nondet_train_loss(
                         X,
                         W,
                         inp.labels,
@@ -4567,18 +4909,16 @@ def _same_inputs_on_two_streams(
                         chunk_size=4096,
                         return_logp=True,
                         backend="cake",
-                        **ND,
                         **tune,
                     )
                     upstream = None
                 else:
-                    out = logp = cake_backend.chunked_lm_head_logprob(
+                    out = logp = cake_backend.cake_lm_head_nondet_train_logprob(
                         X,
                         W,
                         inp.labels,
                         chunk_size=4096,
                         backend="cake",
-                        **ND,
                         **tune,
                     )
                     upstream = inp.dlogp
@@ -4804,7 +5144,7 @@ def test_device_logprob_backward_binding_holds_no_lse_or_dlogp_address(glm_weigh
     between the steps (each forward allocates a fresh ``lse``)."""
     _require_program(entry="logprob")
     inp = _device_inputs(4097, "ce", W=glm_weight)
-    fwd = cake_backend.forward_logprob(inp.X, inp.W, inp.labels, chunk_size=4096, **ND)
+    fwd = cake_backend.forward_logprob(inp.X, inp.W, inp.labels, chunk_size=4096)
     prepared: list = []
     original = cake_backend.prepare_lm_head_loss
 
@@ -4830,7 +5170,6 @@ def test_device_logprob_backward_binding_holds_no_lse_or_dlogp_address(glm_weigh
                     dlogp,
                     chunk_size=4096,
                     row_index=fwd.row_index,
-                    **ND,
                 )
             )
             hits.append(cache.hits - before)
@@ -4949,7 +5288,6 @@ def test_device_zero_weight_floor_keeps_small_calls_unsplit(glm_weight):
             infer_logp=inp.infer_logp,
             loss_weights=inp.loss_weights,
             chunk_size=4096,
-            **ND,
         )
     finally:
         cake_backend.set_zero_weight_min_rows(previous)
@@ -5124,7 +5462,7 @@ def _placement_step(inp, C, kind, *, module=None, memory=None, **switches):
         base = torch.cuda.memory_allocated()
 
     def head(a, b):
-        loss, logp = be.chunked_lm_head_loss(
+        loss, logp = be.cake_lm_head_nondet_train_loss(
             torch.tanh(a),
             b,
             inp.labels,
@@ -5134,7 +5472,6 @@ def _placement_step(inp, C, kind, *, module=None, memory=None, **switches):
             loss_weights=inp.loss_weights,
             chunk_size=C,
             return_logp=True,
-            **ND,
             **switches,
         )
         logps.append(logp)
@@ -5183,7 +5520,6 @@ def test_no_graph_runs_no_gradient_forward(objective, graph):
         chunk_size=64,
         return_logp=True,
         backend="reference",
-        **ND,
     )
     X = inp.X.detach().requires_grad_(graph != "frozen_inputs")
     W = inp.W.detach().requires_grad_(graph != "frozen_inputs")
@@ -5192,11 +5528,15 @@ def test_no_graph_runs_no_gradient_forward(objective, graph):
     def call():
         if graph == "no_grad":
             with torch.no_grad():
-                return cake_backend.chunked_lm_head_loss(X, W, inp.labels, **kw)
+                return cake_backend.cake_lm_head_nondet_train_loss(
+                    X, W, inp.labels, **kw
+                )
         if graph == "inference_mode":
             with torch.inference_mode():
-                return cake_backend.chunked_lm_head_loss(X, W, inp.labels, **kw)
-        return cake_backend.chunked_lm_head_loss(X, W, inp.labels, **kw)
+                return cake_backend.cake_lm_head_nondet_train_loss(
+                    X, W, inp.labels, **kw
+                )
+        return cake_backend.cake_lm_head_nondet_train_loss(X, W, inp.labels, **kw)
 
     with _gradient_forwards() as seen:
         loss, logp = call()
@@ -5219,7 +5559,7 @@ def test_frozen_head_with_a_trainable_policy_operand_keeps_the_autograd_entry():
         ops = dict(infer_logp=inp.infer_logp, loss_weights=inp.loss_weights)
         ops[name] = ops[name].detach().clone().requires_grad_(True)
         with _gradient_forwards() as seen:
-            loss = cake_backend.chunked_lm_head_loss(
+            loss = cake_backend.cake_lm_head_nondet_train_loss(
                 inp.X,
                 inp.W,
                 inp.labels,
@@ -5227,7 +5567,6 @@ def test_frozen_head_with_a_trainable_policy_operand_keeps_the_autograd_entry():
                 chunk_size=64,
                 backend="reference",
                 **ops,
-                **ND,
             )
         assert seen and _gradient_count(seen) == 0, seen
         assert loss.requires_grad and loss.grad_fn is not None, name
@@ -5261,27 +5600,37 @@ def test_checkpointed_step_forms_the_gradients_once(objective, kind):
 
 
 def test_checkpointed_forward_alerts_in_the_forward_under_deterministic_algorithms():
-    """Under torch's deterministic algorithms a checkpointed call keeps its fused forward: the alert stays raised in the
-    checkpointed forward, before anything is bound or launched, as without a checkpoint.  Under ``torch.no_grad`` the
-    call launches no gradient GEMM and does not alert."""
+    """Under torch's deterministic algorithms a checkpointed call keeps its fused forward: the alert of a K-sliced dX
+    (forced: the reference backend plans one slice) stays raised in the checkpointed forward, before its dX launch, as
+    without a checkpoint.  With one-slice dX chunks (the reference backend's plan) the checkpointed step, its
+    recomputation and its backward run without an alert.  Under ``torch.no_grad`` the call launches no gradient GEMM
+    and does not alert."""
     inp = _host_inputs(37, device=CPU)
     X = inp.X.detach().requires_grad_(True)
     W = inp.W.detach().requires_grad_(True)
 
     def head(a, b):
-        return cake_backend.chunked_lm_head_loss(
-            a, b, inp.labels, loss_div=1.0, chunk_size=16, backend="reference", **ND
+        return cake_backend.cake_lm_head_nondet_train_loss(
+            a, b, inp.labels, loss_div=1.0, chunk_size=16, backend="reference"
         )
 
     with (
+        _forced_dx_slices(),
         _torch_deterministic(True),
-        pytest.raises(
-            RuntimeError, match="does not have a deterministic implementation"
-        ),
+        pytest.raises(RuntimeError, match=f"forward_loss {_ALERT}"),
     ):
         torch.utils.checkpoint.checkpoint(head, X, W, use_reentrant=False)
-    with _torch_deterministic(True), warnings.catch_warnings(), torch.no_grad():
-        warnings.filterwarnings("error", message=".*deterministic implementation.*")
+    with _torch_deterministic(True), warnings.catch_warnings():
+        warnings.filterwarnings("error", message=f".*{_ALERT}.*")
+        torch.utils.checkpoint.checkpoint(head, X, W, use_reentrant=False).backward()
+    assert X.grad is not None and W.grad is not None
+    with (
+        _forced_dx_slices(),
+        _torch_deterministic(True),
+        warnings.catch_warnings(),
+        torch.no_grad(),
+    ):
+        warnings.filterwarnings("error", message=f".*{_ALERT}.*")
         head(X, W)
 
 
@@ -5334,7 +5683,7 @@ def test_checkpointed_retained_graph_forms_the_gradients_per_backward():
     W = inp.W.detach().requires_grad_(True)
 
     def head(a, b):
-        return cake_backend.chunked_lm_head_loss(
+        return cake_backend.cake_lm_head_nondet_train_loss(
             torch.tanh(a),
             b,
             inp.labels,
@@ -5343,7 +5692,6 @@ def test_checkpointed_retained_graph_forms_the_gradients_per_backward():
             loss_weights=inp.loss_weights,
             chunk_size=64,
             backend="reference",
-            **ND,
         )
 
     with _gradient_forwards() as seen:
@@ -5364,14 +5712,13 @@ def test_checkpointed_call_without_a_handed_result_forms_its_gradients_in_the_ba
     W = inp.W.detach().requires_grad_(True)
 
     def head(a, b):
-        return cake_backend.chunked_lm_head_loss(
+        return cake_backend.cake_lm_head_nondet_train_loss(
             torch.tanh(a),
             b,
             inp.labels,
             loss_div=inp.loss_div,
             chunk_size=64,
             backend="reference",
-            **ND,
         )
 
     loss = torch.utils.checkpoint.checkpoint(head, X, W, use_reentrant=False)
@@ -5434,7 +5781,7 @@ def test_opt_in_count_form_places_the_gradients_alike(kind):
     if kind == "no_grad":
         with torch.no_grad(), _gradient_forwards() as seen:
             # the plain step's head input (``tanh`` of X), trainable
-            loss, logp = opt_in.chunked_lm_head_loss(
+            loss, logp = opt_in.cake_lm_head_nondet_train_loss(
                 torch.tanh(inp.X).detach().requires_grad_(True),
                 inp.W.detach().requires_grad_(True),
                 inp.labels,
@@ -5445,7 +5792,6 @@ def test_opt_in_count_form_places_the_gradients_alike(kind):
                 return_logp=True,
                 backend="reference",
                 num_valid_rows=count,
-                **ND,
             )
         assert seen and _gradient_count(seen) == 0, seen
         _assert_step_bits(dict(loss=loss, logp=logp), plain, ("loss", "logp"))
@@ -5456,43 +5802,6 @@ def test_opt_in_count_form_places_the_gradients_alike(kind):
         )
     assert _gradient_count(seen) == 1, seen
     _assert_step_bits(run, plain)
-
-
-def test_deterministic_true_is_one_call_of_the_deterministic_entry_under_no_grad_and_checkpoint(
-    monkeypatch,
-):
-    """The public ``deterministic=True`` path stays one call of the deterministic entry with the caller's arguments
-    (no gradient placement of its own), under ``torch.no_grad`` and inside a checkpoint (its forward and its
-    recomputation)."""
-    from flashinfer import cake_lm_head_det_train as pub
-
-    calls = []
-
-    def recording(*args, **kwargs):
-        calls.append((args, kwargs))
-        # saves its input: a checkpoint's backward unpacks it and so runs the recomputation
-        return args[0].float().square().sum() * 0.0
-
-    class _DetBackend:
-        cake_lm_head_det_train_loss = staticmethod(recording)
-
-    monkeypatch.setattr(pub, "_cake_backend", lambda: _DetBackend)
-    inp = _host_inputs(64, "ce")
-    kw = dict(loss_div=inp.loss_div, chunk_size=32)
-    X = inp.X.detach().requires_grad_(True)
-
-    def given(call):
-        return {k: call[1][k] for k in kw}
-
-    with torch.no_grad():
-        pub.cake_lm_head_det_train_loss(X, inp.W, inp.labels, **kw)
-    assert len(calls) == 1 and calls[0][0][0] is X and given(calls[0]) == kw
-    torch.utils.checkpoint.checkpoint(
-        lambda a: pub.cake_lm_head_det_train_loss(a, inp.W, inp.labels, **kw),
-        X,
-        use_reentrant=False,
-    ).backward()
-    assert len(calls) == 3 and all(given(c) == kw for c in calls)
 
 
 @pytest.mark.parametrize("graph", ["no_grad", "inference_mode"])
@@ -5509,14 +5818,13 @@ def test_device_no_graph_launches_no_gradient_gemm(glm_weight, objective, graph)
         loss_weights=inp.loss_weights,
         chunk_size=4096,
         return_logp=True,
-        **ND,
     )
     fused = cake_backend.forward_loss(inp.X, inp.W, inp.labels, **kw)
     X = inp.X.detach().requires_grad_(True)
     W = inp.W.detach().requires_grad_(True)
     mode = torch.no_grad() if graph == "no_grad" else torch.inference_mode()
     with mode, _launch_record() as launched:
-        loss, logp = cake_backend.chunked_lm_head_loss(X, W, inp.labels, **kw)
+        loss, logp = cake_backend.cake_lm_head_nondet_train_loss(X, W, inp.labels, **kw)
     torch.cuda.synchronize()
     assert _gradient_gemm_keys(launched) == 0, sorted({k[0] for k in launched})
     assert any(k[0] == "row_finalize" for k in launched)
@@ -5611,8 +5919,8 @@ def test_device_checkpointed_logprob_step_launches_the_gradient_gemms_once(glm_w
         W = inp.W.detach().requires_grad_(True)
 
         def head(a, b):
-            logp = cake_backend.chunked_lm_head_logprob(
-                a, b, inp.labels, chunk_size=4096, **ND, **one
+            logp = cake_backend.cake_lm_head_nondet_train_logprob(
+                a, b, inp.labels, chunk_size=4096, **one
             )
             return (logp * inp.dlogp).sum()
 
@@ -5679,16 +5987,16 @@ import torch.utils.checkpoint as tuc
 sys.path.insert(0, {root!r})
 from tests.test_helpers.cake_lm_head_loss_reference import make_inputs
 from tests.test_helpers.cake_package import cake_package
-backend = cake_package("cake.cake_lm_head_loss", {module!r})
+backend = cake_package("cake.cake_lm_head_nondet_train", {module!r})
 W = make_inputs(1, seed={seed_w}, device="cuda", ignore_frac=0.0).W
 inp = make_inputs({T}, seed={seed}, device="cuda", W=W, ignore_frac=0.05)
-kw = dict(chunk_size={C}, backend="cake", deterministic=False, gemm_tuning={{"dx": {{"k_slices": 1}}}}, **{switches!r})
+kw = dict(chunk_size={C}, backend="cake", gemm_tuning={{"dx": {{"k_slices": 1}}}}, **{switches!r})
 
 
 def head(a, b):
     if {entry!r} == "loss":
-        return backend.chunked_lm_head_loss(a, b, inp.labels, loss_div=inp.loss_div, **kw)
-    return (backend.chunked_lm_head_logprob(a, b, inp.labels, **kw) * inp.dlogp).sum()
+        return backend.cake_lm_head_nondet_train_loss(a, b, inp.labels, loss_div=inp.loss_div, **kw)
+    return (backend.cake_lm_head_nondet_train_logprob(a, b, inp.labels, **kw) * inp.dlogp).sum()
 
 
 def policy(ctx, func, *args, **kwargs):
@@ -5776,14 +6084,14 @@ def test_device_selective_checkpoint_first_call_of_a_process(
 def _region_entry(entry, inp, X, W):
     """The scalar a selective-checkpoint region test differentiates: one entry of this package on ``X`` / ``W`` (one
     dX slice pinned)."""
-    one = dict(gemm_tuning={"dx": {"k_slices": 1}}, **ND)
+    one = dict(gemm_tuning={"dx": {"k_slices": 1}})
     if entry in ("loss", "loss_budget"):
         mod, kw = (
             (cake_backend, {})
             if entry == "loss"
             else (opt_in, dict(memory_mode="budget"))
         )
-        return mod.chunked_lm_head_loss(
+        return mod.cake_lm_head_nondet_train_loss(
             X, W, inp.labels, loss_div=inp.loss_div, chunk_size=4096, **kw, **one
         )
     if entry == "support":
@@ -5792,13 +6100,13 @@ def _region_entry(entry, inp, X, W):
         base = inp.labels.clamp_min(0)[:, None]
         ids = (base + 997 * torch.arange(K, device=X.device)[None, :]) % V
         offsets = torch.arange(0, T * K + 1, K, device=X.device)
-        support = cake_package("cake.cake_lm_head_loss", "cake_support")
-        logp = support.chunked_lm_head_support_logprob(
-            X, W, ids.reshape(-1), offsets, inp.labels, k_cap=K, **ND
+        support = cake_package("cake.cake_lm_head_nondet_train", "cake_support")
+        logp = support.cake_lm_head_nondet_train_support_logprob(
+            X, W, ids.reshape(-1), offsets, inp.labels, k_cap=K
         )
         return (logp * inp.dlogp).sum()
     if entry == "keep_backend":
-        logp = cake_backend.chunked_lm_head_logprob_keep(
+        logp = cake_backend.cake_lm_head_nondet_train_logprob_keep(
             X, W, inp.labels, chunk_size=4096, **one
         )
     else:
@@ -5807,7 +6115,7 @@ def _region_entry(entry, inp, X, W):
             "logprob_budget": "budget",
             "keep": "keep_logits",
         }[entry]
-        logp = opt_in.chunked_lm_head_logprob(
+        logp = opt_in.cake_lm_head_nondet_train_logprob(
             X, W, inp.labels, chunk_size=4096, memory_mode=memory_mode, **one
         )
     return (logp * inp.dlogp).sum()
@@ -5884,16 +6192,16 @@ def test_device_selective_checkpoint_region_input(glm_weight, entry, kind):
 
 @pytest.mark.parametrize("entry", ["backend", "opt_in"])
 def test_device_checkpointed_logprob_keep_step_is_bitwise(glm_weight, entry):
-    """The kept logits (``chunked_lm_head_logprob_keep``; the opt-in ``memory_mode="keep_logits"``) under a
+    """The kept logits (``cake_lm_head_nondet_train_logprob_keep``; the opt-in ``memory_mode="keep_logits"``) under a
     non-reentrant checkpoint, selective activation checkpointing and a dispatch mode (around the checkpointed forward;
     around the whole step) give the uncheckpointed default entry's ``dX`` / ``dW`` bits (one dX slice pinned)."""
     _require_program(entry="logprob")
     inp = _device_inputs(12289, "ce", W=glm_weight)
-    one = dict(gemm_tuning={"dx": {"k_slices": 1}}, **ND)
+    one = dict(gemm_tuning={"dx": {"k_slices": 1}})
 
     def head_default(a, b):
         return (
-            cake_backend.chunked_lm_head_logprob(
+            cake_backend.cake_lm_head_nondet_train_logprob(
                 a, b, inp.labels, chunk_size=4096, **one
             )
             * inp.dlogp
@@ -5901,11 +6209,11 @@ def test_device_checkpointed_logprob_keep_step_is_bitwise(glm_weight, entry):
 
     def head_keep(a, b):
         if entry == "backend":
-            logp = cake_backend.chunked_lm_head_logprob_keep(
+            logp = cake_backend.cake_lm_head_nondet_train_logprob_keep(
                 a, b, inp.labels, chunk_size=4096, **one
             )
         else:
-            logp = opt_in.chunked_lm_head_logprob(
+            logp = opt_in.cake_lm_head_nondet_train_logprob(
                 a, b, inp.labels, chunk_size=4096, memory_mode="keep_logits", **one
             )
         return (logp * inp.dlogp).sum()
@@ -5962,7 +6270,7 @@ def test_device_opt_in_forms_place_the_gradients_alike(glm_weight, memory_mode):
     X = torch.tanh(inp.X).detach().requires_grad_(True)
     W = inp.W.detach().requires_grad_(True)
     with torch.no_grad(), _launch_record() as launched:
-        loss, logp = opt_in.chunked_lm_head_loss(
+        loss, logp = opt_in.cake_lm_head_nondet_train_loss(
             X,
             W,
             inp.labels,
@@ -5971,7 +6279,6 @@ def test_device_opt_in_forms_place_the_gradients_alike(glm_weight, memory_mode):
             loss_weights=inp.loss_weights,
             chunk_size=4096,
             return_logp=True,
-            **ND,
             **sw,
         )
     torch.cuda.synchronize()
@@ -6157,29 +6464,30 @@ def test_logprob_keep_plan_keys_and_memory():
 
 
 def test_logprob_keep_entry_points_and_opt_in_mode(monkeypatch):
-    """The kept logits have their own entry points (``chunked_lm_head_logprob_keep``, ``forward_logprob_keep`` /
+    """The kept logits have their own entry points (``cake_lm_head_nondet_train_logprob_keep``, ``forward_logprob_keep`` /
     ``backward_logprob_keep``); the default entry points take no kept-logits keyword.  The kept autograd entry runs
     the default entry wherever no backward can follow -- grad mode off (``torch.no_grad``, ``torch.inference_mode``),
     no input requiring a gradient -- and on the reference backend; the explicit pair and the prepared runner of the
     kept plan belong to the ``cake`` backend.  The opt-in form ``memory_mode="keep_logits"`` belongs to the
     log-probability entry without ``num_valid_rows`` and runs the kept entry; elsewhere it is a ``ValueError``.  The
     deterministic package's kept entry takes the same keywords."""
-    default_params = inspect.signature(cake_backend.chunked_lm_head_logprob).parameters
+    default_params = inspect.signature(
+        cake_backend.cake_lm_head_nondet_train_logprob
+    ).parameters
     assert (
-        inspect.signature(cake_backend.chunked_lm_head_logprob_keep).parameters
+        inspect.signature(
+            cake_backend.cake_lm_head_nondet_train_logprob_keep
+        ).parameters
         == default_params
     )
-    assert [
-        name
-        for name in inspect.signature(
-            cake_backend.chunked_lm_head_logprob_keep
-        ).parameters
-        if name != "deterministic"
-    ] == list(
-        inspect.signature(det_backend.cake_lm_head_det_train_logprob_keep).parameters
-    )
+    # the deterministic entry's parameters without its mode keyword, if it still has one
+    keep = inspect.signature(
+        cake_backend.cake_lm_head_nondet_train_logprob_keep
+    ).parameters
+    det = inspect.signature(det_backend.cake_lm_head_det_train_logprob_keep).parameters
+    assert list(keep) == [n for n in det if n != "deterministic"]
     for fn in (
-        cake_backend.chunked_lm_head_logprob,
+        cake_backend.cake_lm_head_nondet_train_logprob,
         cake_backend.forward_logprob,
         cake_backend.backward_logprob,
     ):
@@ -6202,7 +6510,6 @@ def test_logprob_keep_entry_points_and_opt_in_mode(monkeypatch):
             chunk_size=16,
             backend="reference",
             logprob_keep=True,
-            **ND,
         )
     with pytest.raises(ValueError, match="cake backend"):
         cake_backend.prepare_lm_head_loss(
@@ -6213,11 +6520,10 @@ def test_logprob_keep_entry_points_and_opt_in_mode(monkeypatch):
             entry="logprob",
             backend="reference",
             logprob_keep=True,
-            **ND,
         )
     with pytest.raises(ValueError, match="cake backend"):
         cake_backend.forward_logprob_keep(
-            inp.X, inp.W, inp.labels, chunk_size=16, backend="reference", **ND
+            inp.X, inp.W, inp.labels, chunk_size=16, backend="reference"
         )
     with pytest.raises(ValueError, match="cake backend"):
         cake_backend.backward_logprob_keep(
@@ -6229,7 +6535,6 @@ def test_logprob_keep_entry_points_and_opt_in_mode(monkeypatch):
             (inp.X,),
             chunk_size=16,
             backend="reference",
-            **ND,
         )
     # the reference backend: the default entry, the same outputs
     ref = _run(inp, 16, entry="logprob")
@@ -6247,9 +6552,9 @@ def test_logprob_keep_entry_points_and_opt_in_mode(monkeypatch):
         calls.append(("keep", args))
         return torch.zeros(())
 
-    monkeypatch.setattr(cake_backend, "chunked_lm_head_logprob", default_spy)
+    monkeypatch.setattr(cake_backend, "cake_lm_head_nondet_train_logprob", default_spy)
     monkeypatch.setattr(
-        cake_backend.ChunkedLmHeadLogprobKeepFunction, "apply", keep_spy
+        cake_backend.CakeLMHeadNondetLogprobKeepFunction, "apply", keep_spy
     )
     X = inp.X.detach().requires_grad_(True)
     W = inp.W.detach().requires_grad_(True)
@@ -6266,16 +6571,15 @@ def test_logprob_keep_entry_points_and_opt_in_mode(monkeypatch):
     for tag, x, w, ctx, backend, expect in cases:
         calls.clear()
         with ctx():
-            cake_backend.chunked_lm_head_logprob_keep(
-                x, w, inp.labels, chunk_size=16, backend=backend, **ND
+            cake_backend.cake_lm_head_nondet_train_logprob_keep(
+                x, w, inp.labels, chunk_size=16, backend=backend
             )
         assert [c[0] for c in calls] == [expect], tag
         if expect == "default":
             assert calls[0][1]["backend"] == backend, tag
             assert calls[0][1]["chunk_size"] == 16, tag
-            assert calls[0][1]["deterministic"] is False, tag
         else:
-            assert calls[0][1][4] is False, tag  # the mode reaches the Function
+            assert calls[0][1][3] == 16, tag  # the call's arguments reach the Function
     monkeypatch.undo()
     # the opt-in form
     # the resolver (every entry's) rejects it; the log-probability entry maps that rejection to the kept form
@@ -6300,24 +6604,23 @@ def test_logprob_keep_entry_points_and_opt_in_mode(monkeypatch):
         seen.update(kw)
         return torch.zeros(())
 
-    monkeypatch.setattr(opt_in._main, "chunked_lm_head_logprob_keep", spy)
-    opt_in.chunked_lm_head_logprob(
+    monkeypatch.setattr(opt_in._main, "cake_lm_head_nondet_train_logprob_keep", spy)
+    opt_in.cake_lm_head_nondet_train_logprob(
         inp.X,
         inp.W,
         inp.labels,
         chunk_size=16,
         backend="cake",
         memory_mode="keep_logits",
-        **ND,
     )
     assert seen["backend"] == "cake" and seen["chunk_size"] == 16
-    assert seen["deterministic"] is False
+    assert "deterministic" not in seen
     assert set(seen) <= set(default_params)
 
 
 def test_device_logprob_keep_is_bitwise(glm_weight):
     """The kept logits against the default log-probability path on the generated program: the kept autograd entry
-    (``chunked_lm_head_logprob_keep``, first call and remembered binding; also through the opt-in
+    (``cake_lm_head_nondet_train_logprob_keep``, first call and remembered binding; also through the opt-in
     ``memory_mode="keep_logits"``) and the explicit pair (``forward_logprob_keep`` keeps one BF16 ``[rows_c, V]`` view
     per chunk, ``backward_logprob_keep`` on the forward's row index and on a recount) give bitwise the same ``logp`` /
     ``dW`` -- and ``dX`` wherever the call runs one dX slice per chunk (pinned or by the rule; else the same products
@@ -6425,7 +6728,7 @@ def test_device_logprob_keep_is_bitwise(glm_weight):
         bwd_kw = {k: v for k, v in switches.items() if k != "hidden_count"}
         for tag in ("index", "recount"):
             fr = cake_backend.forward_logprob_keep(
-                inp.X, inp.W, inp.labels, chunk_size=C, **fwd_kw, **ND
+                inp.X, inp.W, inp.labels, chunk_size=C, **fwd_kw
             )
             rows = int((inp.labels >= 0).sum()) if fr.row_index is not None else T
             assert len(fr.logits) == len(cake_backend.plan_chunks(rows, C)), case
@@ -6445,7 +6748,6 @@ def test_device_logprob_keep_is_bitwise(glm_weight):
                 chunk_size=C,
                 **bwd_kw,
                 **extra,
-                **ND,
             )
             _same_dx(dx, base[0], inp, plan, (case, tag))
             assert _same_bits(dw, base[0]["dW"]), (case, tag)
@@ -6535,11 +6837,11 @@ def test_device_logprob_keep_lifetimes(glm_weight, monkeypatch):
 
     def call(X, W, keep=True):
         fn = (
-            cake_backend.chunked_lm_head_logprob_keep
+            cake_backend.cake_lm_head_nondet_train_logprob_keep
             if keep
-            else cake_backend.chunked_lm_head_logprob
+            else cake_backend.cake_lm_head_nondet_train_logprob
         )
-        return fn(X, W, inp.labels, chunk_size=C, gemm_tuning=ONE_SLICE, **ND)
+        return fn(X, W, inp.labels, chunk_size=C, gemm_tuning=ONE_SLICE)
 
     launched = []
     run_keys = cake_backend._run_keys
@@ -6682,7 +6984,7 @@ def test_device_logprob_keep_lifetimes(glm_weight, monkeypatch):
     assert peak1 - peak0 <= saved + slack, (peak0, peak1, saved)
     assert abs(left1 - left0) <= slack and left1 <= slack, (left0, left1)
     # a kept views tuple that does not match the plan
-    kw = dict(chunk_size=C, gemm_tuning=ONE_SLICE, **ND)
+    kw = dict(chunk_size=C, gemm_tuning=ONE_SLICE)
     fr = cake_backend.forward_logprob_keep(inp.X, inp.W, inp.labels, **kw)
     dlogp = torch.where(inp.valid, inp.dlogp, torch.zeros_like(inp.dlogp))
     for bad in (fr.logits[:-1], (fr.logits[0].view(torch.int16),) + fr.logits[1:]):
@@ -6725,7 +7027,6 @@ def test_device_logprob_keep_lifetimes(glm_weight, monkeypatch):
         need_dx=False,
         need_dw=False,
         logprob_keep=True,
-        **ND,
     )
     assert runner.plan.logprob_keep
     with pytest.raises(NotImplementedError, match="eager entry points"):
@@ -7838,7 +8139,7 @@ def test_device_zero_dlogp_one_chunk_backward_cuda_graph(
     if tau is not None:
         _require_tau_program()
     inp, _zero = _one_chunk_skip_inputs(glm_weight, 2048, "none", tau)
-    kw = dict(chunk_size=4096, **ND)
+    kw = dict(chunk_size=4096)
     if tau is None:
         fr = cake_backend.forward_logprob(inp.X, inp.W, inp.labels, **kw)
         entry, extra = cake_backend.backward_logprob, {}
@@ -8525,8 +8826,8 @@ def test_device_zero_dlogp_live_cast(glm_weight, monkeypatch, kind, dw_stream):
     base = _device_inputs(13500, "ce", W=glm_weight)
     zero = _zero_dlogp_set(base, kind)
     inp = _with_zero_dlogp(base, zero)
-    kw = dict(chunk_size=4096, dw_stream=dw_stream, **ND)
-    fr = cake_backend.forward_logprob(inp.X, inp.W, inp.labels, chunk_size=4096, **ND)
+    kw = dict(chunk_size=4096, dw_stream=dw_stream)
+    fr = cake_backend.forward_logprob(inp.X, inp.W, inp.labels, chunk_size=4096)
     torch.cuda.synchronize()
     assert fr.row_index is not None
 
@@ -8580,7 +8881,6 @@ def test_device_zero_dlogp_live_cast(glm_weight, monkeypatch, kind, dw_stream):
             compact_rows=fr.row_index,
             logprob_dz=True,
             dcnt=torch.empty((-(-rows // 4096),), dtype=torch.int32, device=CUDA),
-            **ND,
         )
     assert runner.plan.dcnt and not runner.plan.live_cast
     assert not any(s.endswith("_lc_dcnt") for s in runner.plan.stages)
@@ -8723,8 +9023,8 @@ def test_device_zero_dlogp_skip_adds_no_synchronization(glm_weight):
     def backward_under_error_mode():
         X = inp.X.detach().requires_grad_(True)
         W = inp.W.detach().requires_grad_(True)
-        logp = cake_backend.chunked_lm_head_logprob(
-            X, W, inp.labels, chunk_size=4096, backend="cake", **ND
+        logp = cake_backend.cake_lm_head_nondet_train_logprob(
+            X, W, inp.labels, chunk_size=4096, backend="cake"
         )
         torch.cuda.synchronize()
         previous = torch.cuda.get_sync_debug_mode()
@@ -8749,7 +9049,7 @@ def test_device_zero_dlogp_backward_cuda_graph(glm_weight):
     the FP32 reduction order, the zero rows' ``dX`` exact ``+0``)."""
     _require_program(entry="logprob")
     base = _device_inputs(12289, "ce", W=glm_weight)
-    kw = dict(chunk_size=4096, **ND)
+    kw = dict(chunk_size=4096)
     fr = cake_backend.forward_logprob(base.X, base.W, base.labels, **kw)
     torch.cuda.synchronize()
     assert fr.row_index is not None
@@ -9205,7 +9505,7 @@ def test_temperature_rejects(case):
     value = make(inp)
     for check in (False, True) if kind == "host" or DEV.type != "cuda" else (True,):
         with pytest.raises(ValueError, match="temperature"):
-            cake_backend.chunked_lm_head_logprob_temperature(
+            cake_backend.cake_lm_head_nondet_train_logprob_temperature(
                 inp.X,
                 inp.W,
                 inp.labels,
@@ -9213,7 +9513,6 @@ def test_temperature_rejects(case):
                 backend="reference",
                 temperature=value,
                 check_temperature=check,
-                **ND,
             )
         with pytest.raises(ValueError, match="temperature"):
             cake_backend.forward_logprob_temperature(
@@ -9224,7 +9523,6 @@ def test_temperature_rejects(case):
                 backend="reference",
                 temperature=value,
                 check_temperature=check,
-                **ND,
             )
 
 
@@ -9413,14 +9711,13 @@ def test_temperature_upstream_gradients():
     assert torch.equal(twice["dW"], (2.0 * base["dW"].float()).to(torch.bfloat16))
     X = inp.X.detach().requires_grad_()
     W = inp.W.detach().requires_grad_()
-    logp = cake_backend.chunked_lm_head_logprob_temperature(
+    logp = cake_backend.cake_lm_head_nondet_train_logprob_temperature(
         X,
         W,
         inp.labels,
         chunk_size=32,
         backend="reference",
         temperature=inp.temperature,
-        **ND,
     )
     first = torch.autograd.grad(logp, (X, W), inp.dlogp, retain_graph=True)
     second = torch.autograd.grad(logp, (X, W), inp.dlogp)
@@ -9450,7 +9747,7 @@ def test_temperature_keywords():
     without the suffix (the log-probability entries keep their signatures) nor any loss entry; the checked call of a
     valid temperature gives the bits of the unchecked one."""
     for fn in (
-        cake_backend.chunked_lm_head_logprob_temperature,
+        cake_backend.cake_lm_head_nondet_train_logprob_temperature,
         cake_backend.forward_logprob_temperature,
     ):
         params = inspect.signature(fn).parameters
@@ -9467,10 +9764,10 @@ def test_temperature_keywords():
             is None
         ), fn.__name__
     for fn in (
-        cake_backend.chunked_lm_head_loss,
+        cake_backend.cake_lm_head_nondet_train_loss,
         cake_backend.forward_loss,
         cake_backend.backward_loss,
-        cake_backend.chunked_lm_head_logprob,
+        cake_backend.cake_lm_head_nondet_train_logprob,
         cake_backend.forward_logprob,
         cake_backend.backward_logprob,
     ):
@@ -9539,22 +9836,20 @@ def test_temperature_all_ignored_rows(monkeypatch):
             temperature=torch.zeros(37, device=DEV),
             check_temperature=True,
         )
-    empty = cake_backend.chunked_lm_head_logprob_temperature(
+    empty = cake_backend.cake_lm_head_nondet_train_logprob_temperature(
         inp.X[:0],
         inp.W,
         inp.labels[:0],
         backend="reference",
         temperature=torch.empty(0, device=DEV),
-        **ND,
     )
     assert tuple(empty.shape) == (0,)
-    empty = cake_backend.chunked_lm_head_logprob_temperature(
+    empty = cake_backend.cake_lm_head_nondet_train_logprob_temperature(
         inp.X[:0],
         inp.W,
         inp.labels[:0],
         backend="reference",
         temperature=0.7,
-        **ND,
     )
     assert tuple(empty.shape) == (0,)
 
@@ -9586,7 +9881,7 @@ def test_temperature_through_the_opt_in_fast_entry(monkeypatch):
         for mode in (None, "fast"):
             fell = _run(inp, 16, entry="logprob", temperature=tau, memory_mode=mode)
             _assert_same_bits(fell, main, _LOGPROB_KEYS)
-            logp = opt_in.chunked_lm_head_logprob_temperature(
+            logp = opt_in.cake_lm_head_nondet_train_logprob_temperature(
                 inp.X.detach().requires_grad_(),
                 inp.W,
                 inp.labels,
@@ -9594,11 +9889,10 @@ def test_temperature_through_the_opt_in_fast_entry(monkeypatch):
                 backend="reference",
                 memory_mode=mode,
                 temperature=tau,
-                **ND,
             )
             assert (
                 logp.grad_fn._forward_cls
-                is cake_backend.ChunkedLmHeadLogprobTemperatureFunction
+                is cake_backend.CakeLMHeadNondetLogprobTemperatureFunction
             )
     seen = {}
 
@@ -9606,11 +9900,13 @@ def test_temperature_through_the_opt_in_fast_entry(monkeypatch):
         seen.update(kw)
         return torch.zeros(())
 
-    monkeypatch.setattr(cake_backend, "chunked_lm_head_logprob_temperature", spy)
+    monkeypatch.setattr(
+        cake_backend, "cake_lm_head_nondet_train_logprob_temperature", spy
+    )
     for mode in (None, "fast"):
         for tau, check in ((inp.temperature, True), (0.7, False)):
             seen.clear()
-            opt_in.chunked_lm_head_logprob_temperature(
+            opt_in.cake_lm_head_nondet_train_logprob_temperature(
                 inp.X,
                 inp.W,
                 inp.labels,
@@ -9618,7 +9914,6 @@ def test_temperature_through_the_opt_in_fast_entry(monkeypatch):
                 memory_mode=mode,
                 temperature=tau,
                 check_temperature=check,
-                **ND,
             )
             assert seen["temperature"] is tau and seen["check_temperature"] is check
 
@@ -9635,22 +9930,22 @@ def test_temperature_through_the_opt_in_entry_with_a_count(monkeypatch):
     def refuse(*args, **kw):
         raise AssertionError("the path without a temperature resolves no temperature")
 
-    plain = opt_in.ChunkedLmHeadLogprobFunction
+    plain = opt_in.CakeLMHeadNondetLogprobFunction
     bits = []
     for tau, cls in (
         (None, plain),
         (1.0, plain),
-        (0.7, opt_in.ChunkedLmHeadLogprobTemperatureFunction),
-        (inp.temperature, opt_in.ChunkedLmHeadLogprobTemperatureFunction),
+        (0.7, opt_in.CakeLMHeadNondetLogprobTemperatureFunction),
+        (inp.temperature, opt_in.CakeLMHeadNondetLogprobTemperatureFunction),
     ):
         monkeypatch.setattr(
             opt_in, "_resolve_temperature", refuse if cls is plain else real
         )
         X = inp.X.detach().requires_grad_()
         entry = (
-            opt_in.chunked_lm_head_logprob
+            opt_in.cake_lm_head_nondet_train_logprob
             if tau is None
-            else opt_in.chunked_lm_head_logprob_temperature
+            else opt_in.cake_lm_head_nondet_train_logprob_temperature
         )
         logp = entry(
             X,
@@ -9660,7 +9955,6 @@ def test_temperature_through_the_opt_in_entry_with_a_count(monkeypatch):
             backend="reference",
             num_valid_rows=n,
             **({} if tau is None else dict(temperature=tau)),
-            **ND,
         )
         assert logp.grad_fn._forward_cls is cls, tau
         logp.sum().backward()
@@ -9690,8 +9984,8 @@ def test_device_temperature_through_the_opt_in_entry_with_a_count(
     def refuse(*args, **kw):
         raise AssertionError("the path without a temperature resolves no temperature")
 
-    plain = opt_in.ChunkedLmHeadLogprobFunction
-    tempered = opt_in.ChunkedLmHeadLogprobTemperatureFunction
+    plain = opt_in.CakeLMHeadNondetLogprobFunction
+    tempered = opt_in.CakeLMHeadNondetLogprobTemperatureFunction
     calls = (
         (None, plain),
         (1.0, plain),
@@ -9710,9 +10004,9 @@ def test_device_temperature_through_the_opt_in_entry_with_a_count(
             before = set(cache._bindings)
             X = inp.X.detach().requires_grad_()
             entry = (
-                opt_in.chunked_lm_head_logprob
+                opt_in.cake_lm_head_nondet_train_logprob
                 if tau is None
-                else opt_in.chunked_lm_head_logprob_temperature
+                else opt_in.cake_lm_head_nondet_train_logprob_temperature
             )
             logp = entry(
                 X,
@@ -9723,7 +10017,6 @@ def test_device_temperature_through_the_opt_in_entry_with_a_count(
                 num_valid_rows=n,
                 **({} if tau is None else dict(temperature=tau)),
                 **_TAU_ONE,
-                **ND,
             )
             assert logp.grad_fn._forward_cls is cls, tau
             (logp * inp.dlogp)[inp.valid].sum().backward()
@@ -10036,7 +10329,7 @@ def test_registry_declares_only_known_stages():
     ``STAGES_WITH_TEMPERATURE`` only, so a row under another name (``gemm_logits_tau`` for ``gemm_logits_mcnt_tau``)
     would drop out silently -- the hidden valid-row count would never find its temperature form and the device
     temperature tests would skip."""
-    cake_support = cake_package("cake.cake_lm_head_loss", "cake_support")
+    cake_support = cake_package("cake.cake_lm_head_nondet_train", "cake_support")
     known = set(cake_jit.STAGES_WITH_TEMPERATURE) | set(cake_support.SUPPORT_STAGES)
     for name, record in cake_jit.MODULES.items():
         unknown = set(record.get("stages", ())) - known
@@ -10101,7 +10394,6 @@ def test_temperature_stage_values_and_runner():
         inp.labels,
         temperature=inp.temperature,
         **kw,
-        **ND,
     )
     plan, t = runner.plan, runner.tensors
     assert plan.problem.temperature and not plan.temperature
@@ -10115,7 +10407,7 @@ def test_temperature_stage_values_and_runner():
             assert "temperature" not in cake_backend.stage_values(stage, t, plan, index)
         for stage in ("gemm_dx", "gemm_dw_acc"):
             assert tau_values(stage, t, plan, index).get("temperature") is None
-    plain = cake_backend.prepare_lm_head_loss(inp.X, inp.W, inp.labels, **kw, **ND)
+    plain = cake_backend.prepare_lm_head_loss(inp.X, inp.W, inp.labels, **kw)
     assert not plain.plan.problem.temperature
     for stage in ("gemm_logits", "row_finalize", "row_grad"):
         assert (
@@ -10134,7 +10426,6 @@ def test_temperature_stage_values_and_runner():
         compact_rows=row_index,
         temperature=tau_c,
         **kw,
-        **ND,
     )
     assert compact.plan.compact and compact.tensors["temperature"] is tau_c
     compact.forward()
@@ -10151,7 +10442,6 @@ def test_temperature_stage_values_and_runner():
                 compact_rows=row_index,
                 temperature=bad,
                 **kw,
-                **ND,
             )
     with pytest.raises(ValueError, match="temperature"):
         cake_backend.prepare_lm_head_loss_temperature(
@@ -10162,7 +10452,6 @@ def test_temperature_stage_values_and_runner():
             chunk_size=C,
             backend="reference",
             temperature=inp.temperature,
-            **ND,
         )
 
 
@@ -10185,7 +10474,6 @@ def test_temperature_logprob_arm_switches():
                 backend="reference",
                 temperature=inp.temperature,
                 **kw,
-                **ND,
             )
         _run(dataclasses.replace(inp, temperature=None), 16, entry="logprob", **kw)
     on = _run(inp, 16, entry="logprob", logprob_lbl=True, logprob_dz=True)
@@ -10246,7 +10534,7 @@ def test_temperature_refuses_keep_logits():
     for temperature in (0.5, 2, inp.temperature, torch.ones_like(inp.temperature)):
         for backend in ("cake", "reference"):
             with pytest.raises(ValueError, match="takes no temperature"):
-                opt_in.chunked_lm_head_logprob_temperature(
+                opt_in.cake_lm_head_nondet_train_logprob_temperature(
                     inp.X,
                     inp.W,
                     inp.labels,
@@ -10254,21 +10542,19 @@ def test_temperature_refuses_keep_logits():
                     backend=backend,
                     memory_mode="keep_logits",
                     temperature=temperature,
-                    **ND,
                 )
     with pytest.raises(ValueError) as plain:
-        opt_in.chunked_lm_head_logprob(
+        opt_in.cake_lm_head_nondet_train_logprob(
             inp.X,
             inp.W,
             inp.labels,
             chunk_size=16,
             backend="reference",
             memory_mode="keep_logits",
-            **ND,
         )
     for one in (1.0, 1, 1.0 + 2.0**-30):
         with pytest.raises(ValueError) as got:
-            opt_in.chunked_lm_head_logprob_temperature(
+            opt_in.cake_lm_head_nondet_train_logprob_temperature(
                 inp.X,
                 inp.W,
                 inp.labels,
@@ -10276,7 +10562,6 @@ def test_temperature_refuses_keep_logits():
                 backend="reference",
                 memory_mode="keep_logits",
                 temperature=one,
-                **ND,
             )
         assert str(got.value) == str(plain.value), one
     with pytest.raises(ValueError, match="takes no temperature"):
@@ -10851,7 +11136,7 @@ def test_device_temperature_upstream_gradients(glm_weight):
         _check_against_references(_run(g_inp, 4096, **kw), g_inp, entry="logprob")
     X = inp.X.detach().requires_grad_(True)
     W = inp.W.detach().requires_grad_(True)
-    logp = cake_backend.chunked_lm_head_logprob_temperature(
+    logp = cake_backend.cake_lm_head_nondet_train_logprob_temperature(
         X,
         W,
         inp.labels,
@@ -10859,7 +11144,6 @@ def test_device_temperature_upstream_gradients(glm_weight):
         backend="cake",
         temperature=inp.temperature,
         **_TAU_ONE,
-        **ND,
     )
     first = torch.autograd.grad(logp, (X, W), inp.dlogp, retain_graph=True)
     second = torch.autograd.grad(logp, (X, W), inp.dlogp)
@@ -10872,14 +11156,14 @@ import sys, torch
 sys.path.insert(0, {root!r})
 from tests.test_helpers.cake_lm_head_loss_reference import make_inputs
 from tests.test_helpers.cake_package import cake_package
-cake_backend = cake_package("cake.cake_lm_head_loss", "cake_backend")
+cake_backend = cake_package("cake.cake_lm_head_nondet_train", "cake_backend")
 W = make_inputs(1, seed={seed_w}, device="cuda", ignore_frac=0.0).W  # the module fixture's weight
 inp = make_inputs({T}, seed={seed}, device="cuda", W=W, ignore_frac=0.05, temperature="hetero")
 X = inp.X.detach().requires_grad_(True)
 W = inp.W.detach().requires_grad_(True)
-logp = cake_backend.chunked_lm_head_logprob_temperature(
+logp = cake_backend.cake_lm_head_nondet_train_logprob_temperature(
     X, W, inp.labels, chunk_size={C}, backend="cake", temperature=inp.temperature,
-    gemm_tuning={tuning!r}, deterministic=False,
+    gemm_tuning={tuning!r},
 )
 dX, dW = torch.autograd.grad(logp, (X, W), inp.dlogp)
 torch.cuda.synchronize()
@@ -10898,7 +11182,7 @@ def test_device_temperature_fresh_thread_process_and_changing_t(glm_weight, tmp_
     def grad_path():
         X = inp.X.detach().requires_grad_(True)
         W = inp.W.detach().requires_grad_(True)
-        logp = cake_backend.chunked_lm_head_logprob_temperature(
+        logp = cake_backend.cake_lm_head_nondet_train_logprob_temperature(
             X,
             W,
             inp.labels,
@@ -10906,7 +11190,6 @@ def test_device_temperature_fresh_thread_process_and_changing_t(glm_weight, tmp_
             backend="cake",
             temperature=inp.temperature,
             **_TAU_ONE,
-            **ND,
         )
         dX, dW = torch.autograd.grad(logp, (X, W), inp.dlogp)
         torch.cuda.synchronize()
@@ -11004,7 +11287,7 @@ def test_device_temperature_does_not_synchronize(glm_weight):
             X = inp.X.detach().requires_grad_(True)
             W = inp.W.detach().requires_grad_(True)
             for i in range(2):
-                logp = cake_backend.chunked_lm_head_logprob_temperature(
+                logp = cake_backend.cake_lm_head_nondet_train_logprob_temperature(
                     X,
                     W,
                     inp.labels,
@@ -11012,7 +11295,6 @@ def test_device_temperature_does_not_synchronize(glm_weight):
                     backend="cake",
                     compact_rows=compact,
                     temperature=form,
-                    **ND,
                 )
                 torch.cuda.synchronize()
                 if i:
@@ -11040,7 +11322,7 @@ def test_device_temperature_does_not_synchronize(glm_weight):
         torch.cuda.synchronize()
         torch.cuda.set_sync_debug_mode("error")
         try:
-            opt_in.chunked_lm_head_logprob_temperature(
+            opt_in.cake_lm_head_nondet_train_logprob_temperature(
                 inp.X,
                 inp.W,
                 inp.labels,
@@ -11048,7 +11330,6 @@ def test_device_temperature_does_not_synchronize(glm_weight):
                 backend="cake",
                 num_valid_rows=n,
                 temperature=form,
-                **ND,
             )
         finally:
             torch.cuda.set_sync_debug_mode("default")
@@ -11083,19 +11364,19 @@ import sys, torch
 sys.path.insert(0, {root!r})
 from tests.test_helpers.cake_lm_head_loss_reference import make_weight
 from tests.test_helpers.cake_package import cake_package
-cake_backend = cake_package("cake.cake_lm_head_loss", "cake_backend")
+cake_backend = cake_package("cake.cake_lm_head_nondet_train", "cake_backend")
 H, V = {H}, {V}
 labels = torch.tensor([0, -100, 3, 1, -100, 2], device="cuda")
 T = int(labels.numel())
 X = torch.randn(T, H, device="cuda").to(torch.bfloat16)
 W = make_weight(V, H, seed=1, device="cuda")
 good = torch.full((T,), 0.7, device="cuda")
-cake_backend.chunked_lm_head_logprob_temperature(X, W, labels, chunk_size=4, backend={backend!r}, temperature=good, deterministic=False)
+cake_backend.cake_lm_head_nondet_train_logprob_temperature(X, W, labels, chunk_size=4, backend={backend!r}, temperature=good)
 torch.cuda.synchronize()
 print("RIGHT", flush=True)
 bad = good.clone()
 bad[{row}] = {value}
-cake_backend.chunked_lm_head_logprob_temperature(X, W, labels, chunk_size=4, backend={backend!r}, temperature=bad, deterministic=False)
+cake_backend.cake_lm_head_nondet_train_logprob_temperature(X, W, labels, chunk_size=4, backend={backend!r}, temperature=bad)
 torch.cuda.synchronize()
 print("WRONG_PASSED", flush=True)
 """
@@ -11254,10 +11535,9 @@ def test_device_vocab_256_dx_slices_temperature(T, H):
         chunk_size=4096,
         entry="logprob",
         temperature=inp.temperature,
-        **ND,
     ).plan
     plain = cake_backend.prepare_lm_head_loss(
-        inp.X, inp.W, inp.labels, chunk_size=4096, entry="logprob", **ND
+        inp.X, inp.W, inp.labels, chunk_size=4096, entry="logprob"
     ).plan
     assert plan.temperature and not plain.temperature
     assert _slices_per_chunk(plan) == _slices_per_chunk(plain), (plan, plain)
@@ -11356,7 +11636,7 @@ def test_temperature_selective_checkpoint_runs_outside_the_dispatch_modes(
     logps = []
 
     def head(a, b):
-        logp = mod.chunked_lm_head_logprob_temperature(
+        logp = mod.cake_lm_head_nondet_train_logprob_temperature(
             a,
             b,
             inp.labels,
@@ -11364,7 +11644,6 @@ def test_temperature_selective_checkpoint_runs_outside_the_dispatch_modes(
             backend="reference",
             temperature=inp.temperature,
             **kw,
-            **ND,
         )
         logps.append(logp.detach())
         return (logp * inp.dlogp).sum()
@@ -11392,14 +11671,13 @@ def _tau_region_entry(entry, inp, X, W):
     temperature; ``opt_in_count``: the opt-in entry with a count, ``opt_in_budget``: its budget form; one dX slice
     pinned, ``_TAU_ONE``)."""
     if entry == "backend":
-        logp = cake_backend.chunked_lm_head_logprob_temperature(
+        logp = cake_backend.cake_lm_head_nondet_train_logprob_temperature(
             X,
             W,
             inp.labels,
             chunk_size=4096,
             temperature=inp.temperature,
             **_TAU_ONE,
-            **ND,
         )
     else:
         kw = (
@@ -11407,7 +11685,7 @@ def _tau_region_entry(entry, inp, X, W):
             if entry == "opt_in_count"
             else dict(memory_mode="budget")
         )
-        logp = opt_in.chunked_lm_head_logprob_temperature(
+        logp = opt_in.cake_lm_head_nondet_train_logprob_temperature(
             X,
             W,
             inp.labels,
@@ -11415,7 +11693,6 @@ def _tau_region_entry(entry, inp, X, W):
             temperature=inp.temperature,
             **kw,
             **_TAU_ONE,
-            **ND,
         )
     return (logp * inp.dlogp).sum()
 
@@ -11817,8 +12094,8 @@ def test_device_temperature_zero_dlogp_skip_adds_no_synchronization(glm_weight):
     def backward_under_error_mode():
         X = inp.X.detach().requires_grad_(True)
         W = inp.W.detach().requires_grad_(True)
-        logp = cake_backend.chunked_lm_head_logprob_temperature(
-            X, W, inp.labels, chunk_size=4096, backend="cake", temperature=tau, **ND
+        logp = cake_backend.cake_lm_head_nondet_train_logprob_temperature(
+            X, W, inp.labels, chunk_size=4096, backend="cake", temperature=tau
         )
         torch.cuda.synchronize()
         previous = torch.cuda.get_sync_debug_mode()
@@ -11846,7 +12123,7 @@ def test_device_temperature_zero_dlogp_backward_cuda_graph(glm_weight):
     _require_tau_program()
     base = _tau_inputs(12289, W=glm_weight)
     tau = _distinct_tau(12289)
-    kw = dict(chunk_size=4096, **ND)
+    kw = dict(chunk_size=4096)
     fr = cake_backend.forward_logprob_temperature(
         base.X, base.W, base.labels, temperature=tau, **kw
     )
@@ -11957,26 +12234,24 @@ def test_device_checkpointed_temperature_zero_dlogp_step_is_bitwise(
     assert not bool(_bits(plain[0][zero | ~valid]).any())
 
 
-def test_temperature_entries_carry_the_mode():
-    """The temperature entries take ``deterministic`` as the other entries of the package do (``False`` only;
-    ``_mode_calls``) and their autograd functions record it."""
+def test_temperature_entries_run_their_function():
+    """The temperature entries of both modules run :class:`CakeLMHeadNondetLogprobTemperatureFunction` (they take no
+    ``deterministic``: :func:`test_no_entry_takes_a_mode_keyword`)."""
     inp = _host_inputs(8, device=CPU, temperature="hetero")
     X = inp.X.detach().requires_grad_(True)
     for mod in (cake_backend, opt_in):
-        logp = mod.chunked_lm_head_logprob_temperature(
+        logp = mod.cake_lm_head_nondet_train_logprob_temperature(
             X,
             inp.W,
             inp.labels,
             chunk_size=4,
             backend="reference",
             temperature=inp.temperature,
-            **ND,
         )
         assert (
             logp.grad_fn._forward_cls.__name__
-            == "ChunkedLmHeadLogprobTemperatureFunction"
-        )
-        assert logp.grad_fn.deterministic is False, mod.__name__
+            == "CakeLMHeadNondetLogprobTemperatureFunction"
+        ), mod.__name__
 
 
 @pytest.mark.parametrize("form", ["scalar", "hetero"])
@@ -12084,14 +12359,13 @@ def _logprob_temperature_step(inp, chunk):
     """One log-probability step of this package's temperature entry (one dX slice pinned, ``_TAU_ONE``)."""
     X = inp.X.detach().requires_grad_(True)
     W = inp.W.detach().requires_grad_(True)
-    logp = cake_backend.chunked_lm_head_logprob_temperature(
+    logp = cake_backend.cake_lm_head_nondet_train_logprob_temperature(
         X,
         W,
         inp.labels,
         chunk_size=chunk,
         temperature=inp.temperature,
         **_TAU_ONE,
-        **ND,
     )
     logp.backward(inp.dlogp)
     return dict(logp=logp.detach(), dX=X.grad, dW=W.grad)

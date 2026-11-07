@@ -14,9 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Candidate-support entries (https://github.com/flashinfer-ai/flashinfer/issues/7636) of the non-deterministic LM-head
-package ``flashinfer.experimental.cake.cake_lm_head_loss``:
-``chunked_lm_head_support_logprob`` / ``chunked_lm_head_support_kl`` take ``deterministic=False`` only, raise
-PyTorch's deterministic-algorithms alert in their backward, and are held to the deterministic suite's gate
+package ``flashinfer.experimental.cake.cake_lm_head_nondet_train``:
+``cake_lm_head_nondet_train_support_logprob`` / ``cake_lm_head_nondet_train_support_kl`` take no ``deterministic``, raise
+PyTorch's deterministic-algorithms alert in their backward before a dense dX of more than one K slice (every other
+backward has one fixed order), and are held to the deterministic suite's gate
 (``tests/test_helpers/cake_lm_head_support_reference.py``: 1.05x the masked PyTorch baseline's error against the
 FP64 oracle plus a floor).  Their programs are the deterministic package's, so the outputs, the sparse dX and the
 weight gradient equal the deterministic entries' bits on the same inputs; the dense dX adds its vocabulary blocks into
@@ -28,6 +29,8 @@ package is reached through ``tests.test_helpers.cake_package``.
 
 import contextlib
 import dataclasses
+import inspect
+import warnings
 
 import pytest
 import torch
@@ -41,17 +44,16 @@ from tests.test_helpers.cake_lm_head_support_reference import (
 )
 from tests.test_helpers.cake_package import cake_package
 
-cake_support = cake_package("cake.cake_lm_head_loss", "cake_support")
-cake_backend = cake_package("cake.cake_lm_head_loss", "cake_backend")
+cake_support = cake_package("cake.cake_lm_head_nondet_train", "cake_support")
+cake_backend = cake_package("cake.cake_lm_head_nondet_train", "cake_backend")
 det_support = cake_package("cake.cake_lm_head_det_train", "cake_support")
-support_logprob = cake_support.chunked_lm_head_support_logprob
-support_kl = cake_support.chunked_lm_head_support_kl
+support_logprob = cake_support.cake_lm_head_nondet_train_support_logprob
+support_kl = cake_support.cake_lm_head_nondet_train_support_kl
 
 DEV = torch.device("cpu")
 CUDA = torch.device("cuda")
 SEED = 20261031
 REF = "reference"
-ND = dict(deterministic=False)
 REPEATS = 20
 
 
@@ -67,7 +69,6 @@ def run_support(
     kwargs.update(kw)
     if package == "nd":
         logprob_fn, kl_fn = support_logprob, support_kl
-        kwargs.update(ND)
     else:
         logprob_fn = det_support.cake_lm_head_det_train_support_logprob
         kl_fn = det_support.cake_lm_head_det_train_support_kl
@@ -187,14 +188,16 @@ def _torch_deterministic(enabled: bool, warn_only: bool = False):
 
 
 # ---------------------------------------------------------------------------
-# Host layer: the mode contract and the reference backend
+# Host layer: no mode keyword and the reference backend
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("value", [True, None, 1, 0])
-def test_entries_refuse_any_mode_but_false(value):
+def test_entries_take_no_mode_keyword():
+    """The mode is part of the package name (issue #8928): ``deterministic`` passed to either entry is Python's own
+    ``TypeError``, raised before any work, and :class:`CakeLMHeadNondetSupportFunction`'s ``forward`` binds no
+    ``deterministic`` keyword."""
     inp = small(T=8, k_cap=4, labels=True, teacher=True)
-    with pytest.raises(ValueError, match="deterministic=False"):
+    with pytest.raises(TypeError, match="deterministic"):
         support_logprob(
             inp.X,
             inp.W,
@@ -203,9 +206,9 @@ def test_entries_refuse_any_mode_but_false(value):
             inp.labels,
             **inp.kwargs(),
             backend=REF,
-            deterministic=value,
+            deterministic=False,
         )
-    with pytest.raises(ValueError, match="cake_lm_head_det_train"):
+    with pytest.raises(TypeError, match="deterministic"):
         support_kl(
             inp.X,
             inp.W,
@@ -214,40 +217,39 @@ def test_entries_refuse_any_mode_but_false(value):
             inp.teacher,
             **inp.kwargs(),
             backend=REF,
-            deterministic=value,
+            deterministic=False,
         )
-    with pytest.raises(
-        ValueError, match="deterministic=False"
-    ):  # the default is refused too
-        support_logprob(
-            inp.X,
-            inp.W,
-            inp.support_ids,
-            inp.support_offsets,
-            **inp.kwargs(),
-            backend=REF,
-        )
+    forward = inspect.signature(cake_support.CakeLMHeadNondetSupportFunction.forward)
+    with pytest.raises(TypeError):
+        forward.bind_partial(deterministic=False)
+    assert list(forward.parameters)[-1] == "cake"
 
 
-def test_names_are_the_deterministic_names_without_det():
+def test_names_pair_with_the_deterministic_names():
     assert (
-        cake_support.SupportLogprobFunction
+        cake_support.CakeLMHeadNondetSupportFunction
         is not det_support.CakeLMHeadDetSupportFunction
     )
     assert support_logprob is not det_support.cake_lm_head_det_train_support_logprob
     assert set(cake_support.__all__) >= {
-        "SupportLogprobFunction",
-        "chunked_lm_head_support_logprob",
-        "chunked_lm_head_support_kl",
+        "CakeLMHeadNondetSupportFunction",
+        "cake_lm_head_nondet_train_support_logprob",
+        "cake_lm_head_nondet_train_support_kl",
     }
     assert not [
         name for name in cake_support.__all__ if "_det_" in name or "Det" in name
     ]
 
 
-def test_backward_raises_the_alert_and_records_the_mode():
-    """The support backward raises PyTorch's alert under torch's deterministic algorithms (``RuntimeError``; a
-    ``UserWarning`` under ``warn_only``); a forward-only call (``torch.no_grad()``, teacher preparation) does not."""
+_ALERT = "does not have a deterministic implementation"
+
+
+def test_backward_runs_fixed_order_sums_without_an_alert():
+    """The reference backend sums in one fixed order: its backward and a
+    forward-only call (``torch.no_grad()``, teacher preparation) run under strict
+    ``torch.use_deterministic_algorithms(True)`` without an alert (the cake backend alerts only before a dense dX of
+    more than one K slice: :func:`test_dense_dx_alert_rule_is_the_slice_rule`,
+    :func:`test_cake_backward_alerts_only_before_a_k_sliced_dense_dx`)."""
     inp = small(T=33, k_cap=8, labels=True)
     X = inp.X.detach().requires_grad_(True)
     out = support_logprob(
@@ -258,14 +260,10 @@ def test_backward_raises_the_alert_and_records_the_mode():
         inp.labels,
         **inp.kwargs(),
         backend=REF,
-        **ND,
     )
-    assert out.grad_fn.deterministic is False
-    with _torch_deterministic(True):
-        with pytest.raises(
-            RuntimeError, match="does not have a deterministic implementation"
-        ):
-            out.backward(inp.d, retain_graph=True)
+    with _torch_deterministic(True), warnings.catch_warnings():
+        warnings.filterwarnings("error", message=f".*{_ALERT}.*")
+        out.backward(inp.d)
         with torch.no_grad():
             support_logprob(
                 inp.X,
@@ -275,14 +273,59 @@ def test_backward_raises_the_alert_and_records_the_mode():
                 inp.labels,
                 **inp.kwargs(),
                 backend=REF,
-                **ND,
             )
-    with (
-        _torch_deterministic(True, warn_only=True),
-        pytest.warns(UserWarning, match="does not have a deterministic implementation"),
-    ):
-        out.backward(inp.d)
     assert X.grad is not None
+
+
+def test_dense_dx_alert_rule_is_the_slice_rule():
+    """The backward's alert rule (``cake_support._dense_dx_unordered``, host sizes only) is the dense dX slice rule
+    over the pass's token chunks and vocabulary blocks: the B200 production row at H 5120 (``sm_100a``, 148 SMs, two
+    slices on every block) alerts; the same row on ``sm_103a`` / ``sm_107a`` (no cell) or another SM count, a sparse
+    dX pass and a call without pairs do not."""
+    problem = cake_support.SupportProblem(
+        num_rows=16231,
+        hidden=5120,
+        vocab=152064,
+        num_pairs=16231 * 1026,
+        k_cap=2048,
+        chunk=4096,
+        has_labels=False,
+        has_teacher=False,
+    )
+    plan = cake_support.SupportPlan(
+        arch="sm_100a",
+        forward="dense",
+        dx="dense",
+        dw="dense",
+        dw_mode="chunked",
+        dw_pairs=4096 * 1026,
+        vocab_block=15360,
+        dense_chunk=4096,
+        dw_split=None,
+    )
+
+    def cake(arch, num_sms=148):
+        return cake_support._Cake(
+            device=DEV,
+            index=0,
+            module="",
+            record={},
+            geometry=cake_backend.DEFAULT_GEOMETRY,
+            arch=arch,
+            num_sms=num_sms,
+        )
+
+    unordered = cake_support._dense_dx_unordered
+    assert unordered(cake("sm_100a"), plan, problem)
+    for arch in ("sm_103a", "sm_107a"):
+        assert arch not in cake_support.SUPPORT_DX_SLICE_CELLS
+        assert not unordered(cake(arch), plan, problem), arch
+    assert not unordered(cake("sm_100a", num_sms=132), plan, problem)
+    sparse = dataclasses.replace(plan, dx="sparse")
+    assert not unordered(cake("sm_100a"), sparse, problem)
+    assert not unordered(
+        cake("sm_100a"), plan, dataclasses.replace(problem, num_pairs=0)
+    )
 
 
 SUPPORT_CASES = {
@@ -414,7 +457,6 @@ def test_cake_frozen_inputs_and_retain_graph():
         inp.labels,
         **inp.kwargs(),
         backend="cake",
-        **ND,
     )
     g1 = torch.autograd.grad(out, (X, W), inp.d, retain_graph=True)
     g2 = torch.autograd.grad(out, (X, W), inp.d)
@@ -612,6 +654,63 @@ def test_cake_dense_dx_reduction_forms(case, form, vocab_block, monkeypatch):
         return
     assert_same(dict(res, dX=None), dict(det, dX=None))
     _within_rounding_of_det(res["dX"], det["dX"])
+
+
+def test_cake_backward_alerts_only_before_a_k_sliced_dense_dx(monkeypatch):
+    """Under strict ``torch.use_deterministic_algorithms(True)`` a cake-backend backward whose dense dX runs one K
+    slice on every block -- the rule at this shape on every architecture (``sm_103a`` and ``sm_107a`` have no cell at
+    all) -- raises no alert and gives the deterministic package's bits.  A dense dX of two slices (forced) raises
+    PyTorch's ``RuntimeError`` before the backward's first launch (launch record: the forward's stages only, no
+    ``support_row_grad``), and the next call outside the mode runs the two slices within rounding of the
+    deterministic dX.  Under ``warn_only=True`` it warns, then the backward runs (its ``dX`` within rounding)."""
+    _require_cake()
+    outputs, mk, kw = SUPPORT_CASES["kl two chunks"]
+    mk = dict(mk)
+    inp = cuda_inputs(mk.pop("T"), **mk)
+    kw = dict(kw, backend="cake", path={"X": "dense"})
+    arch = cake_backend.arch_for(CUDA)
+    if arch in ("sm_103a", "sm_107a"):
+        assert arch not in cake_support.SUPPORT_DX_SLICE_CELLS
+    det = run_support(inp, outputs, package="det", **kw)
+    with _torch_deterministic(True), warnings.catch_warnings():
+        warnings.filterwarnings("error", message=f".*{_ALERT}.*")
+        res = run_support(inp, outputs, **kw)
+    assert_same(res, det)
+    stages = []
+    launch = cake_support._run
+
+    def recording(cx, stage, values):
+        stages.append(stage)
+        return launch(cx, stage, values)
+
+    monkeypatch.setattr(cake_support, "_run", recording)
+    _force_dx_form(monkeypatch, (2, 0))
+    with (
+        _torch_deterministic(True),
+        pytest.raises(
+            RuntimeError,
+            match=f"CakeLMHeadNondetSupportFunction.backward {_ALERT}.*cake_lm_head_det_train.cake_lm_head_det_train_support_kl",
+        ),
+    ):
+        run_support(inp, outputs, **kw)
+    torch.cuda.synchronize()
+    assert stages and "support_row_grad" not in stages, stages
+    again = run_support(inp, outputs, **kw)
+    assert "support_row_grad" in stages
+    assert_same(dict(again, dX=None), dict(det, dX=None))
+    _within_rounding_of_det(again["dX"], det["dX"])
+    stages.clear()
+    with (
+        _torch_deterministic(True, warn_only=True),
+        pytest.warns(
+            UserWarning, match=f"CakeLMHeadNondetSupportFunction.backward {_ALERT}"
+        ),
+    ):
+        warned = run_support(inp, outputs, **kw)
+    assert "support_row_grad" in stages
+    assert warned["dX"] is not None
+    assert_same(dict(warned, dX=None), dict(det, dX=None))
+    _within_rounding_of_det(warned["dX"], det["dX"])
 
 
 def _repeat_dense_dx(label, inp, outputs, kw, *, oracle, b0err, det):
@@ -824,7 +923,7 @@ def test_cake_dense_dx_graph_streams_and_reused_buffers(form, monkeypatch):
     _require_cake()
     _force_dx_form(monkeypatch, form)
     exact = form[0] == 1
-    kw = dict(backend="cake", path="dense", **ND)
+    kw = dict(backend="cake", path="dense")
 
     def inputs(T, seed):
         inp = cuda_inputs(T, k_cap=32, kind="heavy", teacher=True, seed=seed)
@@ -848,7 +947,7 @@ def test_cake_dense_dx_graph_streams_and_reused_buffers(form, monkeypatch):
     big, big_kw = inputs(4097, SEED + 1)
     small_inp, small_kw = inputs(1300, SEED + 2)
     leaf = lambda t: t.detach().clone().requires_grad_(True)  # noqa: E731
-    det_kw = {k: v for k, v in small_kw.items() if k != "deterministic"}
+    det_kw = small_kw
     det_ref = run_support(small_inp, ("kl",), package="det", **det_kw)
     ref = (det_ref["kl"], det_ref["dX"], det_ref["dW"])
     # a larger call first: its freed blocks (nonzero) are reused by the smaller call

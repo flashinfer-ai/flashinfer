@@ -279,7 +279,7 @@ def refs_lm_head_det_loss(package_dir: Path, loader: str) -> set[str]:
 
 
 def refs_lm_head_loss(package_dir: Path, loader: str) -> set[str]:
-    """The non-deterministic package ``flashinfer.experimental.cake.cake_lm_head_loss``: the registry shape of
+    """The non-deterministic package ``flashinfer.experimental.cake.cake_lm_head_nondet_train``: the registry shape of
     :func:`refs_lm_head_det_loss`; the stage's library stem is ``cake_lm_head_loss_<unit>``."""
     registry = module_literals(package_dir / loader)["_REGISTRY"]
     return {
@@ -527,8 +527,8 @@ PACKAGES: tuple[Package, ...] = (
         refs_lm_head_det_loss,
     ),
     Package(
-        "flashinfer.experimental.cake.cake_lm_head_loss",
-        "flashinfer/experimental/cake/cake_lm_head_loss",
+        "flashinfer.experimental.cake.cake_lm_head_nondet_train",
+        "flashinfer/experimental/cake/cake_lm_head_nondet_train",
         "cake_jit.py",
         refs_lm_head_loss,
     ),

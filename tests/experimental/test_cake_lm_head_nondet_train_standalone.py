@@ -15,17 +15,17 @@ limitations under the License.
 
 Standalone-import tests of the non-deterministic Cake chunked LM-head + loss package.
 
-A copy of ``flashinfer/experimental/cake/cake_lm_head_loss`` must import and reach
-its host-side checks on its own: under another top-level name, in a
+A copy of ``flashinfer/experimental/cake/cake_lm_head_nondet_train`` must import
+and reach its host-side checks on its own: under another top-level name, in a
 ``python -I`` subprocess with ``flashinfer`` blocked (the form of a vendoring
 gate, ``scripts/check_cake_build_manifests.py --vendored-gate``).  The package
 imports only itself, ``torch`` and ``tvm_ffi`` (#6553 rule 1: nothing of the
-deterministic package or the rest of FlashInfer); the experimental marking and
-the environment switches belong to the public entry points
-``flashinfer.chunked_lm_head.chunked_lm_head_loss`` /
-``chunked_lm_head_logprob`` with ``deterministic=False`` (covered by
-``test_cake_lm_head_loss_api.py``), so a direct call of the package emits no
-warning, and the only ``flashinfer`` import is the JIT fallback of
+deterministic package or the rest of FlashInfer); the environment switches
+belong to the stable public entry points
+``flashinfer.cake_lm_head_nondet_train.cake_lm_head_nondet_train_loss`` /
+``cake_lm_head_nondet_train_logprob`` (covered by
+``test_cake_lm_head_nondet_train_api.py``), so a direct call of the package emits
+no warning, and the only ``flashinfer`` import is the JIT fallback of
 ``cake_build.py``.  The prebuilt path: a builder's ``aot/<library>.so`` is the
 library the loader serves first.  CPU-only: no GPU, no generated program and no
 JIT build is needed.
@@ -46,10 +46,10 @@ import torch
 
 tvm_ffi = pytest.importorskip("tvm_ffi")  # the package's load path imports it
 
-import flashinfer.experimental.cake.cake_lm_head_loss as pkg
+import flashinfer.experimental.cake.cake_lm_head_nondet_train as pkg
 
 PACKAGE_DIR = Path(pkg.__file__).resolve().parent
-VENDORED_NAME = "vendored_lm_head_loss"  # the copy's top-level name in the subprocess
+VENDORED_NAME = "vendored_cake_lm_head_nondet_train"  # the copy's top-level name
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +107,14 @@ cake_jit = importlib.import_module(PKG_NAME + ".cake_jit")
 cake_build = importlib.import_module(PKG_NAME + ".cake_build")
 for name in cake_build.__all__:
     getattr(cake_build, name)
+support = importlib.import_module(PKG_NAME + ".cake_support")
+for name in support.__all__:
+    getattr(support, name)
+assert {
+    "CakeLMHeadNondetSupportFunction",
+    "cake_lm_head_nondet_train_support_logprob",
+    "cake_lm_head_nondet_train_support_kl",
+}.issubset(support.__all__), support.__all__
 
 # The backend's public surface: its ``__all__`` when it defines one, else every
 # public callable the module itself defines.  Resolving each name imports
@@ -128,11 +136,11 @@ assert {
     "backward_loss",
     "forward_logprob",
     "backward_logprob",
-    "chunked_lm_head_loss",
-    "chunked_lm_head_logprob",
+    "cake_lm_head_nondet_train_loss",
+    "cake_lm_head_nondet_train_logprob",
     "forward_logprob_temperature",
     "backward_logprob_temperature",
-    "chunked_lm_head_logprob_temperature",
+    "cake_lm_head_nondet_train_logprob_temperature",
 }.issubset(public), sorted(public)
 assert isinstance(cake_jit.MODULES, dict) and cake_jit.STAGES  # registry loaded
 
@@ -147,42 +155,36 @@ def f32(*shape):
 
 T, H, V = 4, 256, 256  # H and V multiples of 256: the geometry checks pass
 labels = torch.zeros(T, dtype=torch.int64)
-ND = dict(deterministic=False)  # the package's only mode
 # Host-side rejections on CPU tensors, each raised by the shape / dtype / option
 # validation before any device query, program bind or launch:
 calls = [
-    # the mode: every entry refuses anything but deterministic=False (here the default True)
-    lambda: cb.forward_loss(bf16(T, H), bf16(V, H), labels, loss_div=1.0),
-    lambda: cb.chunked_lm_head_logprob(bf16(T, H), bf16(V, H), labels),
     # the loss forward: X must be BF16 (validate_lm_head_inputs)
-    lambda: cb.forward_loss(f32(T, H), bf16(V, H), labels, loss_div=1.0, **ND),
+    lambda: cb.forward_loss(f32(T, H), bf16(V, H), labels, loss_div=1.0),
     # the log-probability forward: labels must be int64
-    lambda: cb.forward_logprob(bf16(T, H), bf16(V, H), labels.to(torch.int32), **ND),
+    lambda: cb.forward_logprob(bf16(T, H), bf16(V, H), labels.to(torch.int32)),
     # the prepared runner: the cake backend takes CUDA tensors only
-    lambda: cb.prepare_lm_head_loss(bf16(T, H), bf16(V, H), labels, loss_div=1.0, **ND),
+    lambda: cb.prepare_lm_head_loss(bf16(T, H), bf16(V, H), labels, loss_div=1.0),
     # the autograd entry: grad_weight_dtype must equal W.dtype
-    lambda: cb.chunked_lm_head_loss(
-        bf16(T, H), bf16(V, H), labels, loss_div=1.0, grad_weight_dtype=torch.float32, **ND
+    lambda: cb.cake_lm_head_nondet_train_loss(
+        bf16(T, H), bf16(V, H), labels, loss_div=1.0, grad_weight_dtype=torch.float32
     ),
     # the loss backward: a compacted accumulator needs num_rows
     lambda: cb.backward_loss(f32(2, H), None, row_index=torch.tensor([0, 2])),
     # the output cast: the accumulator must be FP32
     lambda: cb.scale_cast(bf16(8), None, torch.float32),
     # the opt-in autograd entry: memory_mode is "fast" or "budget"
-    lambda: opt_in.chunked_lm_head_loss(bf16(T, H), bf16(V, H), labels, loss_div=1.0, memory_mode="slow", **ND),
+    lambda: opt_in.cake_lm_head_nondet_train_loss(bf16(T, H), bf16(V, H), labels, loss_div=1.0, memory_mode="slow"),
     # the opt-in loss forward: the caller's valid-row count lies in [0, T]
-    lambda: opt_in.forward_loss(bf16(T, H), bf16(V, H), labels, loss_div=1.0, num_valid_rows=T + 1, **ND),
+    lambda: opt_in.forward_loss(bf16(T, H), bf16(V, H), labels, loss_div=1.0, num_valid_rows=T + 1),
     # the budget rule: rows <= num_rows
     lambda: opt_in.memory_plan("loss", num_rows=T, rows=T + 1, hidden=H, vocab=V, chunk=T),
     # preload needs a CUDA device
-    lambda: opt_in.preload("cpu"),
-    # the temperature entry refuses anything but deterministic=False (here the default True)
-    lambda: cb.chunked_lm_head_logprob_temperature(bf16(T, H), bf16(V, H), labels, temperature=0.7),
+    lambda: opt_in.cake_lm_head_nondet_train_preload("cpu"),
     # the log-probability forward: a temperature must be positive and finite
-    lambda: cb.forward_logprob_temperature(bf16(T, H), bf16(V, H), labels, backend="reference", temperature=0.0, **ND),
+    lambda: cb.forward_logprob_temperature(bf16(T, H), bf16(V, H), labels, backend="reference", temperature=0.0),
     # the autograd entry: a per-token temperature is an FP32 [T] tensor
-    lambda: cb.chunked_lm_head_logprob_temperature(
-        bf16(T, H), bf16(V, H), labels, backend="reference", temperature=torch.ones(T + 1), **ND
+    lambda: cb.cake_lm_head_nondet_train_logprob_temperature(
+        bf16(T, H), bf16(V, H), labels, backend="reference", temperature=torch.ones(T + 1)
     ),
 ]
 
@@ -198,6 +200,21 @@ with warnings.catch_warnings(record=True) as rec:
                 raise AssertionError("the host-side check must reject the call")
 assert not rec, [f"{w.category.__name__}: {w.message}" for w in rec]
 
+# no entry takes a mode keyword (issue #8928: the mode is part of the package name)
+for call in (
+    lambda: cb.forward_loss(bf16(T, H), bf16(V, H), labels, loss_div=1.0, deterministic=False),
+    lambda: cb.cake_lm_head_nondet_train_logprob(bf16(T, H), bf16(V, H), labels, deterministic=False),
+    lambda: cb.cake_lm_head_nondet_train_logprob_temperature(
+        bf16(T, H), bf16(V, H), labels, temperature=0.7, deterministic=False
+    ),
+):
+    try:
+        call()
+    except TypeError as exc:
+        assert "deterministic" in str(exc), exc
+    else:
+        raise AssertionError("an entry took the deterministic keyword")
+
 leaked = sorted(
     k
     for k in sys.modules
@@ -212,10 +229,12 @@ print("OK")
 def test_vendored_copy_imports_with_flashinfer_blocked(tmp_path):
     """A copy of the package under another top-level name imports in a ``python -I``
     subprocess with ``flashinfer`` blocked (meta-path finder plus
-    ``sys.modules["flashinfer"] = None``), resolves the backend's public names and
-    the loader's ``__all__``, raises the host-side ``ValueError`` of fifteen entry
-    point calls on CPU operands (the mode and temperature checks among them) without
-    emitting a warning of any kind, and loads no ``flashinfer`` module."""
+    ``sys.modules["flashinfer"] = None``), resolves the public names of the backend
+    and ``cake_support`` and the loader's ``__all__``, raises the host-side
+    ``ValueError`` of twelve entry point calls on CPU operands (the temperature
+    checks among them) without emitting a warning of any kind, refuses a
+    ``deterministic`` keyword with ``TypeError``, and loads no ``flashinfer``
+    module."""
     root = tmp_path / "site"
     shutil.copytree(
         PACKAGE_DIR,
@@ -315,8 +334,8 @@ def test_the_prebuilt_library_is_served_first():
         pytest.skip(
             "the package's programs are not rendered in this checkout (no build.json)"
         )
-    import flashinfer.experimental.cake.cake_lm_head_loss.cake_build as cake_build
-    import flashinfer.experimental.cake.cake_lm_head_loss.cake_jit as cake_jit
+    import flashinfer.experimental.cake.cake_lm_head_nondet_train.cake_build as cake_build
+    import flashinfer.experimental.cake.cake_lm_head_nondet_train.cake_jit as cake_jit
 
     names = set()
     for name in cake_jit.MODULES:

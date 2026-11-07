@@ -211,6 +211,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "CakeMHCDetPrepareFunction": (".cake_mhc_det_train", "CakeMHCDetPrepareFunction"),
     "CakeMHCHeadDetFunction": (".cake_mhc_head_det_train", "CakeMHCHeadDetFunction"),
     "cake_lm_head_det_train": (".cake_lm_head_det_train", None),
+    "cake_lm_head_nondet_train": (".cake_lm_head_nondet_train", None),
     # The deterministic Cake MoE grouped GEMM: the names of its module.
     **{
         name: (".cake_moe_grouped_gemm_det_train", name)
