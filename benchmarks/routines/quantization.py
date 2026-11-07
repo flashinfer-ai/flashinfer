@@ -21,6 +21,7 @@ import numpy as np
 import torch
 
 import flashinfer
+from flashinfer.quantization.fp8_quantization import _mxfp8_input_dtypes
 from flashinfer.quantization.fp4_quantization import NVFP4_QUANT_ENV_VARS
 from flashinfer.quantization.nvfp4_quantization_utils import (
     current_nvfp4_4over6_config,
@@ -198,6 +199,32 @@ def parse_quantization_args(line, parser):
     return args
 
 
+def _filter_mxfp8_backends(
+    input_tensor,
+    backends,
+    *,
+    is_sf_swizzled_layout,
+    alignment,
+    enable_pdl,
+):
+    """Keep backends whose public input checks pass before benchmarking."""
+    supported_backends = []
+    for backend in backends:
+        try:
+            flashinfer.mxfp8_quantize.validate_call(
+                input_tensor,
+                is_sf_swizzled_layout=is_sf_swizzled_layout,
+                alignment=alignment,
+                enable_pdl=enable_pdl,
+                backend=backend,
+            )
+        except (ValueError, TypeError, RuntimeError, AssertionError) as exc:
+            print(f"[WARNING] Skipping {backend} for mxfp8_quantize: {exc}")
+        else:
+            supported_backends.append(backend)
+    return supported_backends
+
+
 def testMxfp8Quantize(args):
     """
     Test mxfp8_quantize API.
@@ -242,6 +269,7 @@ def testMxfp8Quantize(args):
     if k % sf_vec_size != 0:
         raise ValueError(f"k ({k}) must be divisible by {sf_vec_size} (sf_vec_size)")
 
+    # Preserve the benchmark's architecture coverage policy before input checks.
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
@@ -253,17 +281,37 @@ def testMxfp8Quantize(args):
             f"Unsupported input dtype: {args.input_dtype}. "
             "Supported dtypes are bfloat16, float16, float32."
         )
-    if input_dtype == torch.float32 and "cuda" in backends:
-        print("[INFO] cuda backend does not support float32 input for mxfp8_quantize")
-        backends = [b for b in backends if b != "cuda"]
-        if len(backends) == 0:
-            print("[ERROR] No backends to test. Exiting.")
-            return res
+    # Keep the cheap rejection before a potentially large allocation. The
+    # dtype rule is shared with full call validation; native execution also
+    # enforces its dtype contract in the binding.
+    admitted_backends = []
+    for backend in backends:
+        if input_dtype in _mxfp8_input_dtypes(device.type, backend):
+            admitted_backends.append(backend)
+        else:
+            print(
+                f"[INFO] {backend} backend does not support {input_dtype} "
+                "input for mxfp8_quantize"
+            )
+    backends = admitted_backends
+    if not backends:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
     ## Done parsing input arguments
 
     ## Prepare input tensors
     input_shape = (m, k)
     input_tensor = torch.randn(input_shape, dtype=input_dtype, device=device)
+    backends = _filter_mxfp8_backends(
+        input_tensor,
+        backends,
+        is_sf_swizzled_layout=is_sf_swizzled_layout,
+        alignment=alignment,
+        enable_pdl=enable_pdl,
+    )
+    if not backends:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {input_tensor.shape = }")

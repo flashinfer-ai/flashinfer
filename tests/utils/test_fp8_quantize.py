@@ -101,6 +101,20 @@ def _unswizzle_mxfp8_scales_128x4(
     return sf_unswizzled[:row, : (col // scale_vec_size)].contiguous()
 
 
+@pytest.mark.parametrize("backend", ["auto", "cuda"])
+def test_mxfp8_native_architecture_validation_matches_execution(backend):
+    """Both public entry points reject a real pre-SM100 CUDA tensor."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    device = torch.device("cuda", torch.cuda.current_device())
+    if get_compute_capability(device)[0] >= 10:
+        pytest.skip("Requires a CUDA device older than SM100")
+    x = torch.ones((1, 32), dtype=torch.bfloat16, device=device)
+    for call in (mxfp8_quantize.validate_call, mxfp8_quantize):
+        with pytest.raises(RuntimeError, match="requires SM100"):
+            call(x, backend=backend)
+
+
 @pytest.mark.parametrize("m", [1, 3, 16, 64, 1024])
 @pytest.mark.parametrize("k", [128, 1024, 8192])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])

@@ -256,6 +256,47 @@ FP8 Quantization
     dependency) and ``"cake"`` requires compute capability 10.0 or 10.3.
     ``K`` must be divisible by 32 and is padded internally to 128-column tiles.
 
+MXFP8 input preflight
+~~~~~~~~~~~~~~~~~~~~
+
+Functions decorated with ``backend_requirement`` expose ``validate_call``
+for explicit call-level validation without executing the operation.
+``mxfp8_quantize.validate_call`` accepts the same arguments as the quantizer
+and raises on known input violations without preparing tensors, allocating
+outputs, detecting PDL, or loading a quantization module. Benchmarks and
+integrations can reject an incompatible dtype or layout before attempting
+JIT compilation. It returns ``None`` rather than selecting another backend.
+The existing ``is_backend_supported`` queries describe backend/declared
+compute-capability metadata; they do not validate a tensor call.
+
+For example, the CPU host path accepts contiguous 2-D float32 inputs:
+
+.. code-block:: python
+
+    import torch
+    from flashinfer import mxfp8_quantize
+
+    x = torch.empty((2, 32), dtype=torch.float32)
+    mxfp8_quantize.validate_call(x, backend="cuda")
+
+CUDA native, CuTe-DSL and batch-invariant calls retain their distinct
+requirements. In particular, CuTe may prepare a non-contiguous strided input,
+but rejects non-strided layouts and an empty last dimension. ``auto`` keeps
+its existing route. Passing preflight does not certify build,
+storage-address alignment, launch or numerical correctness. Batch-invariant
+preflight reuses that mode's existing device and dependency checks.
+Native and CuTe calls require explicit ``SfLayout`` members and reject bare
+integers or unknown scale-factor layouts before backend mapping.
+Batch-invariant calls reject non-strided tensors with
+``BatchInvariantUnsupportedError`` before preparing input.
+
+MXFP8 keeps full admission in this explicit preflight. Eager native calls
+retain layout, CPU-contiguity, positive CUDA-alignment, nonempty CUDA-K and
+architecture guards; the native binding checks the remaining CUDA tensor
+requirements. CuTe execution checks tensor requirements once in its
+preparation entry point. Invalid calls can therefore reach dependency or
+binding errors during execution that explicit preflight would reject sooner.
+
 Fused gated-activation MXFP8 quantization
 -----------------------------------------
 
