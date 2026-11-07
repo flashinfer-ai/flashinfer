@@ -432,6 +432,16 @@ mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
 | `--backends`             | Backend to test. Default: `cuda`                                                                           |
 
 ### Sampling Flags
+
+Sampling uses deterministic kernels by default; pass `--no-deterministic` to
+measure the non-deterministic path. For the five probability-based samplers,
+`--with_softmax` includes a float32 PyTorch softmax in the timed call. Without
+this flag, probability preparation is outside the timing. Both options are
+recorded in CSV output. The unified entry point uses CUPTI by default:
+
+```bash
+python benchmarks/flashinfer_benchmark.py --routine top_k_sampling_from_probs --batch_size 16 --vocab_size 128256 --top_k 50 --with_softmax --no-deterministic
+```
 | Flag                     | Description                                                                                                 |
 |--------------------------|-------------------------------------------------------------------------------------------------------------|
 | `--batch_size`           | Batch size (number of sequences)                                                                           |
