@@ -302,16 +302,27 @@ class _StageTimer:
 
 def _communication_backend(backend, kernel: SplitKernelBackend):
     """The communication config for this kernel. A kernel that packs its
-    dispatch rows keeps NVLink one-sided's Lamport transport off: it rewrites
-    payload words equal to its sentinel, which preserves BF16 values but not
-    other bytes. The backend's name stands for its default config, which has
-    the transport on."""
+    dispatch rows keeps NVLink one-sided on its fence protocol: the sentinel
+    protocol rewrites payload words equal to its sentinel, which preserves
+    BF16 values but not other bytes. The backend's name stands for its default
+    config, which uses the sentinel protocol for small steps."""
     if not kernel.packs_dispatch_payload:
         return backend
     if isinstance(backend, str) and backend == NVLinkOneSidedConfig.backend_name:
         backend = NVLinkOneSidedConfig()
-    if getattr(backend, "lamport", False) is not False:
-        return dataclasses.replace(backend, lamport=False)
+    if (
+        isinstance(backend, NVLinkOneSidedConfig)
+        and backend._effective_sync_protocol() != "fence"
+    ):
+        return dataclasses.replace(
+            backend,
+            sync_protocol="fence",
+            cft=None,
+            cft_max_tokens_for_dispatch=None,
+            cft_max_tokens_for_combine=None,
+            lamport=None,
+            lamport_max_tokens=None,
+        )
     return backend
 
 
