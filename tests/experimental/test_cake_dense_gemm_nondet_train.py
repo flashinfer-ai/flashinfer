@@ -11769,14 +11769,21 @@ def test_gpu_cached_router_launch_runs_the_head_tail_windows_at_their_edges(
     cached launch (its bound arguments, ``_K2Binding``) runs the prepared launch's plan and program, meets the gate
     and, for a reproducible plan, gives the prepared launch's bits; the second call of the key reuses the binding.
     The shipped tables hold no head/tail window (those windows varied from run to run and missed the accuracy check);
-    the former hidden-5120 window ``"H0.5x3"`` at 16172 to 16384 tokens is set here in the device's table, so the
-    registered head/tail program keeps its coverage."""
+    the former hidden-5120 window at 16172 to 16384 tokens (``"H0.5x4"`` on ``sm_107a``, ``"H0.5x3"`` elsewhere) is
+    set here in the device's table in place of the device's own windows over those token counts (on 212-SM
+    ``sm_107a`` parts the ``"det_s12"`` window, which comes first), so the registered head/tail program keeps its
+    coverage."""
     device, arch = _atomic_device_or_skip()
     sm_count = det_backend.device_facts(device).sm_count
     rules, holds = cake_backend.router_rules(arch, sm_count)
     key = (arch, "nn_t", 5120, 256)
-    former = tuple(rules.get(key) or ()) + ((16172, 16384, "H0.5x3"),)
-    monkeypatch.setitem(rules, key, former)
+    former = (16172, 16384, "H0.5x4" if arch == "sm_107a" else "H0.5x3")
+    others = tuple(
+        window
+        for window in rules.get(key) or ()
+        if window[1] < former[0] or window[0] > former[1]
+    )
+    monkeypatch.setitem(rules, key, others + (former,))
     edges = []
     for (rule_arch, layout, hidden, _experts), rule in sorted(
         rules.items(), key=lambda kv: kv[0]
