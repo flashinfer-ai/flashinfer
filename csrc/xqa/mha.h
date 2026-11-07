@@ -166,8 +166,9 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
 #if SPEC_DEC
                          uint32_t qSeqLen, uint32_t const* qCuSeqLens, MaskType const* mask,
 #endif
-                         uint32_t* semaphores, void* scratch, bool enable_pdl,
-                         uint64_t kv_stride_page, uint64_t kv_stride_token, uint64_t kv_stride_head,
+                         uint32_t* semaphores, void* scratch, uint64_t scratchBytes,
+                         bool enable_pdl, uint64_t kv_stride_page, uint64_t kv_stride_token,
+                         uint64_t kv_stride_head,
 #if ENABLE_4BIT_KV_CACHE
                          uint64_t sf_stride_page, uint64_t sf_stride_token, uint64_t sf_stride_head,
 #endif
