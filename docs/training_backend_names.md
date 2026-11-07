@@ -230,7 +230,7 @@ Family rename PRs:
 | DSA indexer | det | #8936 |
 | GQA HD256 | nondet | #8939 |
 | KDA | nondet (single rank and KCP) | KDA family PR |
-| SwiGLU + MXFP8 quantization | det | __PR__ |
+| SwiGLU + MXFP8 quantization | det | #9100 |
 
 ### SwiGLU + MXFP8 quantization: deterministic package
 
