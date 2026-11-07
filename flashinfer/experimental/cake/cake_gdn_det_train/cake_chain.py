@@ -1445,8 +1445,10 @@ TC_PLAN_GAIN = 0.95
 TC_PLAN_MIN_SAVING = 10.0
 # (gain, min_saving) of an architecture in place of (TC_PLAN_GAIN, TC_PLAN_MIN_SAVING) (:func:`tc_plan_thresholds`).
 # R200 measured the priced table against the planner's (backward): faster at 4.2-5.6 us priced savings (-0.9 % to
-# -3.2 %), slower at 0.9 us (+0.35 %).
-TC_PLAN_SELECT = {"sm_107a": (1.0, 2.0)}
+# -3.2 %), slower at 0.9 us (+0.35 %).  B200 measured the pair layout over three value heads (30 us priced saving):
+# the backward's kernels 4 us shorter, but a fwd + bwd call 2 % longer (a host-bound call: the GPU idles 38 us more
+# on the tc-priced table); at 110 and 163 us priced savings the backward is 10 % and 24 % shorter.
+TC_PLAN_SELECT = {"sm_100a": (TC_PLAN_GAIN, 40.0), "sm_107a": (1.0, 2.0)}
 # The dhu_tc2 step time (microseconds) at low and full residency that prices these tables, measured (CUPTI kernel
 # durations of L = 64 tables, 3 to 288 CTAs: B200 2.32-2.44, GB300 2.15-2.26 per step); an architecture not listed takes
 # the dhu_tc2 record's t_lat / t_full.
