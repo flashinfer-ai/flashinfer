@@ -314,6 +314,30 @@ def test_hopper_attention():
 
 **Note:** `tests/conftest.py` auto-skips tests that trigger OOM, but tests should be written to avoid OOM by using appropriate problem sizes.
 
+### Autotuner cache changes
+
+The autotuner cache file (`load_configs` / `save_configs` /
+`autotune(cache=...)`) is shared by independent processes: `save_configs`
+re-reads the file and merges this process's entries over the on-disk ones
+instead of overwriting the file. Any change that drops, invalidates, or
+rewrites cached entries must respect that:
+
+- Decide what to remove from disk at save time against the entry currently on
+  disk, not from a load-time snapshot; another writer may have re-tuned the
+  same key to a valid tactic since this process loaded the file.
+- `AutoTuner._invalidated_file_keys` is reserved for superseded-runner
+  invalidation and is removed from the file unconditionally. Do not reuse it
+  for a new reason; keep separate state and re-check the on-disk value.
+- Before touching shared `AutoTuner` state, read every consumer of the field
+  and note what each one assumes.
+- Add a two-writer regression in `tests/autotuner/` using two independent
+  `AutoTuner` instances (reset `AutoTuner._instance` between them): writer A
+  drops or invalidates a key, writer B re-tunes it to a permitted tactic and
+  saves, writer A enters `autotune(False, cache=<another path>)` and then saves
+  to the original path; writer B's entry must survive. See
+  `TestBlocklistCacheFiles` in `tests/autotuner/test_tactics_blocklist.py`.
+  These tests run on CPU with a stubbed `_profile_single_kernel`.
+
 ### Attention plan and CUDA Graph lifetime
 
 When `auto` changes providers, an older captured call can still hold the previous
