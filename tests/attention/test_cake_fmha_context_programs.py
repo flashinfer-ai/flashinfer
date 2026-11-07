@@ -204,11 +204,21 @@ _RUNTIME_PACK |= {
 }
 
 
-# BF16 runtime-size program identifier -> its pack
+# BF16 runtime-size program identifier (every flag form) -> its pack
 _BF16_RUNTIME_PACK = {
     identifier: pack
-    for routes in cake_api._CONTEXT_BF16_RUNTIME_ROUTES.values()
+    for tables in cake_api._CONTEXT_RUNTIME_FLAG_ROUTES["context_bf16"].values()
+    for routes in tables.values()
     for (pack, _), identifier in routes.items()
+}
+# The BF16 flag forms ``(is_causal, return_lse, enable_sink)`` beside the
+# causal one without LSE or sink, and the suffix of their programs.
+_BF16_FLAG_FORMS = {
+    (True, False, True): "SINK",
+    (True, True, False): "LSE",
+    (False, False, False): "NONCAUSAL",
+    (False, False, True): "NONCAUSAL_SINK",
+    (False, True, False): "NONCAUSAL_LSE",
 }
 
 
@@ -298,11 +308,12 @@ def test_cake_fmha_context_program_table_matches_the_generated_loaders() -> None
                 served.setdefault(("context_fp8", identifier), set()).add(
                     _TARGET_ARCH[target]
                 )
-    for target, routes in cake_api._CONTEXT_BF16_RUNTIME_ROUTES.items():
-        for identifier in routes.values():
-            served.setdefault(("context_bf16", identifier), set()).add(
-                _TARGET_ARCH[target]
-            )
+    for table in cake_api._CONTEXT_RUNTIME_FLAG_ROUTES["context_bf16"].values():
+        for target, routes in table.items():
+            for identifier in routes.values():
+                served.setdefault(("context_bf16", identifier), set()).add(
+                    _TARGET_ARCH[target]
+                )
     for target, routes in cake_api._CONTEXT_NVFP4_RUNTIME_ROUTES.items():
         for identifier in routes.values():
             served.setdefault(("context_nvfp4", identifier), set()).add(
@@ -601,9 +612,7 @@ def test_cake_fmha_context_widened_classes_route_to_the_row_program(
 @pytest.mark.parametrize(
     ("row", "mutation"),
     [
-        ("bf16_b128_q64_k2048", {"is_causal": False}),
-        ("bf16_b128_q64_k2048", {"lse": "lse"}),
-        ("bf16_b128_q64_k2048", {"sinks": "sinks"}),
+        ("bf16_b128_q64_k2048", {"lse": "lse", "sinks": "sinks"}),
         ("fp8_b64_q32_k1024_g4", {"lse": "lse", "sinks": "sinks"}),
         ("nvfp4_b4_q511_k2047", {"sinks": "sinks"}),
         ("nvfp4_b4_q511_k2047", {"lse": "lse"}),
@@ -664,8 +673,8 @@ def test_cake_fmha_context_bf16_calls_outside_the_exact_programs_take_the_runtim
 ) -> None:
     """A causal BF16 call without LSE or sink that no exact route serves runs
     the runtime-size program of its JIT pack (:func:`_context_pack_g`), where
-    the target ships one and the call is not one of the power-of-two query
-    lengths it leaves to the JIT module, else the JIT module."""
+    the target ships one and the call is within its bounds, else the JIT
+    module."""
 
     monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: target)
     kwargs = _context_kwargs(row, device="meta")
@@ -803,6 +812,190 @@ def test_cake_fmha_context_nvfp4_calls_outside_the_exact_programs_take_the_runti
     route = cake_api.select_cake_fmha_context_route(torch.device("meta"), **kwargs)
     assert route is not None and route.program is None
     assert route.pack_g == pack
+
+
+def _bf16_form_program(target, form, kwargs):
+    """The runtime-size program a BF16 call (``select_cake_fmha_context_route``
+    inputs) of flag form ``form`` (sinks, LSE or not causal) takes when no exact
+    route serves it: its JIT pack's program in the form's table within the
+    target's bounds (:data:`_CONTEXT_BF16_RUNTIME_FLAG_BOUNDS`), else ``None``
+    (the JIT module)."""
+
+    q_len, kv_len = kwargs["max_q_len"], kwargs["max_kv_len"]
+    heads = kwargs["query"].shape[1]
+    pack = cake_api._context_pack_g(q_len, kv_len, heads, kwargs["key_cache"].shape[1])
+    keys, area, work = cake_api._CONTEXT_BF16_RUNTIME_FLAG_BOUNDS[target][form[0]].get(
+        pack, (None, None, None)
+    )
+    if (
+        (keys is not None and kv_len > keys)
+        or (area is not None and q_len * kv_len > area)
+        or (work is not None and kwargs["batch_size"] * heads * q_len * kv_len > work)
+    ):
+        return None
+    table = cake_api._CONTEXT_RUNTIME_FLAG_ROUTES["context_bf16"][form][target]
+    return table.get((pack, None))
+
+
+def test_cake_fmha_context_runtime_flag_routes_hold_the_bf16_form_tables() -> None:
+    """The BF16 runtime-size route table of each flag form: the causal form
+    without LSE or sink is ``_CONTEXT_BF16_RUNTIME_ROUTES``; every other form
+    routes the same packs to the program of its suffix; sinks with LSE is no
+    form."""
+
+    forms = cake_api._CONTEXT_RUNTIME_FLAG_ROUTES["context_bf16"]
+    assert set(forms) == {(True, False, False), *_BF16_FLAG_FORMS}
+    assert forms[(True, False, False)] is cake_api._CONTEXT_BF16_RUNTIME_ROUTES
+    for form, suffix in _BF16_FLAG_FORMS.items():
+        table = getattr(cake_api, f"_CONTEXT_BF16_RUNTIME_{suffix}_ROUTES")
+        assert forms[form] is table
+        for target, routes in table.items():
+            causal = cake_api._CONTEXT_BF16_RUNTIME_ROUTES[target]
+            assert routes == {
+                key: f"{identifier}_{suffix}" for key, identifier in causal.items()
+            }, (form, target)
+
+
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+@pytest.mark.parametrize("form", sorted(_BF16_FLAG_FORMS))
+@pytest.mark.parametrize(
+    "row",
+    [
+        "bf16_b128_q64_k2048",
+        "bf16_b1_q8192_k8192",
+        "bf16_b4_q511_k2047",
+        "bf16_b4_q257_k1024_page1024",
+        "bf16_b16_q32_k1024_g8_page32",
+        "bf16_b4_q64_k1024_g4_page64",
+        "bf16_b2_q256_k2048_g1_page1024",
+        "bf16_b4_q2048_k2048_g5",
+    ],
+)
+def test_cake_fmha_context_bf16_flag_forms_take_the_runtime_program_of_their_form(
+    monkeypatch, target, form, row
+) -> None:
+    """A BF16 call with attention sinks, an LSE output or no causal mask runs
+    the runtime-size program of its JIT pack from its flag form's table within
+    the target's bounds, the shapes of the exact rows included (the exact
+    programs serve the causal form without LSE or sink only)."""
+
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: target)
+    kwargs = _context_kwargs(row, device="meta")
+    is_causal, return_lse, enable_sink = form
+    kwargs["is_causal"] = is_causal
+    tokens, heads = kwargs["query"].shape[:2]
+    if return_lse:
+        kwargs["lse"] = torch.empty((tokens, heads), dtype=torch.float32, device="meta")
+    if enable_sink:
+        kwargs["sinks"] = torch.empty((heads,), dtype=torch.float32, device="meta")
+    route = cake_api.select_cake_fmha_context_route(torch.device("meta"), **kwargs)
+    assert route is not None and route.component == "context_bf16"
+    assert route.exact_profile is None
+    assert (route.is_causal, route.return_lse, route.enable_sink) == form
+    pack = cake_api._context_pack_g(
+        kwargs["max_q_len"],
+        kwargs["max_kv_len"],
+        heads,
+        kwargs["key_cache"].shape[1],
+    )
+    assert route.program == _bf16_form_program(target, form, kwargs), (
+        row,
+        form,
+        route,
+    )
+    assert route.pack_g == pack
+
+
+# Calls on either side of the bounds of the flag forms' BF16 runtime-size
+# programs (:data:`_CONTEXT_BF16_RUNTIME_FLAG_BOUNDS`): (causal, batch,
+# max_q_len, max_kv_len, num_q_heads, num_kv_heads, served on sm100a, served on
+# sm103a by the runtime-size programs of the flag forms of that mask).
+_BF16_FLAG_BOUND_ROWS = [
+    (True, 2, 6144, 6144, 32, 4, True, True),
+    (True, 16, 512, 5120, 64, 4, True, True),
+    (True, 16, 512, 6144, 64, 4, False, True),
+    (True, 8, 2048, 5120, 32, 8, True, True),
+    (True, 8, 2048, 6144, 32, 8, False, True),
+    (True, 1, 8192, 8192, 32, 4, False, True),
+    (True, 16, 512, 8192, 64, 4, False, True),
+    (True, 1, 12288, 12288, 32, 4, False, False),
+    (True, 1, 16384, 16384, 32, 4, False, False),
+    (True, 1, 1024, 16384, 32, 4, False, False),
+    (True, 1, 14336, 14336, 32, 32, True, True),
+    (True, 1, 16384, 16384, 32, 32, True, False),
+    (True, 1, 32768, 32768, 32, 32, False, False),
+    (False, 4, 4096, 4096, 32, 32, True, True),
+    (False, 8, 4096, 4096, 32, 32, False, True),
+    (False, 16, 4096, 4096, 32, 32, False, True),
+    (False, 64, 1024, 1024, 32, 32, True, True),
+    (False, 4, 2048, 8192, 32, 32, True, True),
+    (False, 8, 2048, 8192, 32, 32, False, True),
+    (False, 1, 1024, 16384, 32, 32, False, True),
+    (False, 1, 8192, 8192, 32, 32, False, True),
+    (False, 1, 16384, 4096, 32, 32, False, True),
+    (False, 1, 16384, 16384, 32, 32, False, False),
+    (False, 1, 16384, 12288, 32, 4, True, True),
+    (False, 2, 8192, 16384, 32, 4, True, True),
+    (False, 1, 16384, 16384, 32, 4, True, False),
+    (False, 1, 4096, 16384, 64, 4, True, True),
+    (False, 1, 8192, 16384, 64, 4, True, False),
+    (False, 1, 16384, 12288, 16, 1, True, True),
+    (False, 1, 16384, 12288, 64, 4, True, False),
+    (False, 2, 8192, 16384, 64, 4, True, False),
+]
+
+
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+@pytest.mark.parametrize("row", _BF16_FLAG_BOUND_ROWS)
+def test_cake_fmha_context_bf16_flag_form_bounds_keep_the_jit_past_them(
+    monkeypatch, target, row
+) -> None:
+    """A BF16 call with sinks, an LSE output or no causal mask past its
+    target's bounds for its mask and JIT pack keeps the JIT module of its form;
+    within them it takes its form's runtime-size program."""
+
+    causal, batch, q_len, kv_len, hq, hkv, served_sm100a, served_sm103a = row
+    served = served_sm100a if target == "sm100a" else served_sm103a
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: target)
+    pack = cake_api._context_pack_g(q_len, kv_len, hq, hkv)
+    keys, area, work = cake_api._CONTEXT_BF16_RUNTIME_FLAG_BOUNDS[target][causal].get(
+        pack, (None, None, None)
+    )
+    within = (
+        (keys is None or kv_len <= keys)
+        and (area is None or q_len * kv_len <= area)
+        and (work is None or batch * hq * q_len * kv_len <= work)
+    )
+    assert within == served, (row, pack, keys, area)
+    forms = [
+        form
+        for form in cake_api._CONTEXT_RUNTIME_FLAG_ROUTES["context_bf16"]
+        if form[0] == causal and form != (True, False, False)
+    ]
+    assert len(forms) == (2 if causal else 3)
+    for form in forms:
+        kwargs = _context_kwargs(
+            ("context_bf16", batch, q_len, kv_len, hq, hkv, 16, True, None),
+            device="meta",
+        )
+        _, return_lse, enable_sink = form
+        kwargs["is_causal"] = causal
+        tokens = kwargs["query"].shape[0]
+        if return_lse:
+            kwargs["lse"] = torch.empty(
+                (tokens, hq), dtype=torch.float32, device="meta"
+            )
+        if enable_sink:
+            kwargs["sinks"] = torch.empty((hq,), dtype=torch.float32, device="meta")
+        route = cake_api.select_cake_fmha_context_route(torch.device("meta"), **kwargs)
+        assert route is not None and route.exact_profile is None, (row, form)
+        table = cake_api._CONTEXT_RUNTIME_FLAG_ROUTES["context_bf16"][form][target]
+        assert route.pack_g == pack
+        assert route.program == (table[(pack, None)] if served else None), (
+            row,
+            form,
+            route.program,
+        )
 
 
 # --- The FP8 runtime-size route (host-only) ---------------------------------
@@ -2579,14 +2772,22 @@ def test_cake_fmha_context_fp8_short_kv_one_stage_pack(monkeypatch, target) -> N
 
 
 def _stand_in_module(
-    component="context_bf16", identifier="B128", *, device_scales=False, form=None
+    component="context_bf16",
+    identifier="B128",
+    *,
+    device_scales=False,
+    form=None,
 ):
     """The program module of a stand-in record (``B128`` unless ``component``
     / ``identifier`` name another) for 32 query heads over 4 KV heads and
-    16-token pages (of the FP8 ``form`` of ``_FP8_FORMS``, if given), whose
-    entry keeps every call's arguments (``module.calls``)."""
+    16-token pages, of the flag form ``form`` (an ``(is_causal, return_lse,
+    enable_sink)`` tuple or an FP8 form of ``_FP8_FORMS``; the causal form
+    without LSE or sink if not given), whose entry keeps every call's
+    arguments (``module.calls``)."""
 
-    is_causal, return_lse, enable_sink = _FP8_FORMS.get(form, (True, False, False))
+    is_causal, return_lse, enable_sink = (
+        form if isinstance(form, tuple) else _FP8_FORMS.get(form, (True, False, False))
+    )
 
     name, num_m_blocks, _ = cake_api._CONTEXT_PROGRAMS[(component, identifier)]
     args = (
@@ -2605,7 +2806,12 @@ def _stand_in_module(
         num_m_blocks=2 if num_m_blocks is None else num_m_blocks,
         num_q_heads=32,
         num_kv_heads=4,
-        pack_g={**_RUNTIME_PACK, **_SPLIT_PACK, **_ONE_STAGE_PACK}.get(identifier, 8),
+        pack_g={
+            **_RUNTIME_PACK,
+            **_SPLIT_PACK,
+            **_ONE_STAGE_PACK,
+            **_BF16_RUNTIME_PACK,
+        }.get(identifier, 8),
         page_size=16,
         l2_swizzle=1,
         is_causal=is_causal,
@@ -2969,6 +3175,43 @@ def test_cake_context_bf16_runtime_tail_order_follows_the_makespan_model(
     assert first["full_sections"] == 1
 
 
+@pytest.mark.parametrize("form", sorted(f for f in _BF16_FLAG_FORMS if f[0]))
+def test_cake_context_bf16_flag_form_programs_keep_the_plain_tail_order(
+    monkeypatch, form
+) -> None:
+    """A causal runtime-size program of a flag form (sinks or an LSE output)
+    runs its tail units in the plain order: the launch on which the program
+    of the causal form without LSE or sink takes the interleaved order keeps
+    bit 31 of ``full_sections`` clear."""
+
+    _, return_lse, enable_sink = form
+    identifier = f"RUNTIME_PACK8_{_BF16_FLAG_FORMS[form]}"
+    assert identifier in cake_api._CONTEXT_BF16_FLAG_FORM_PROGRAMS
+    assert "RUNTIME_PACK8" not in cake_api._CONTEXT_BF16_FLAG_FORM_PROGRAMS
+    tables = torch.arange(1024, dtype=torch.int32).view(1, 1024)
+    sizes = dict(batch=1, max_q_len=8192, max_kv_len=16384, is_causal=True)
+    plain = _launch_values(
+        monkeypatch,
+        tables,
+        shared=True,
+        module=_stand_in_module("context_bf16", "RUNTIME_PACK8"),
+        **sizes,
+    )
+    assert plain["full_sections"] == cake_api._CONTEXT_BF16_TAIL_INTERLEAVE
+    values = _launch_values(
+        monkeypatch,
+        tables,
+        shared=True,
+        module=_stand_in_module("context_bf16", identifier, form=form),
+        lse=torch.zeros((64, 32)) if return_lse else None,
+        lse_stride_tokens=32 if return_lse else 0,
+        lse_stride_heads=1 if return_lse else 0,
+        attention_sinks=torch.zeros(32) if enable_sink else None,
+        **sizes,
+    )
+    assert values["full_sections"] == 0
+
+
 def test_cake_context_one_stage_program_takes_one_stage_m_blocks(
     monkeypatch,
 ) -> None:
@@ -3133,6 +3376,39 @@ def test_cake_context_program_refuses_an_lse_or_sinks(monkeypatch, given) -> Non
     tensor = torch.zeros((3 * 64, 32) if given == "lse" else (32,))
     with pytest.raises(RuntimeError, match="the causal mask, LSE and sinks of its"):
         _launch_values(monkeypatch, tables, shared=True, **{given: tensor})
+
+
+@pytest.mark.parametrize("form", sorted(_BF16_FLAG_FORMS))
+def test_cake_context_flag_form_program_takes_the_callers_lse_and_sinks(
+    monkeypatch, form
+) -> None:
+    """The runtime-size program of a flag form reads the caller's LSE output
+    and sinks where its form takes them (the other pointer stays the unread
+    placeholder), and refuses a launch of another form."""
+
+    is_causal, return_lse, enable_sink = form
+    identifier = f"RUNTIME_PACK8_{_BF16_FLAG_FORMS[form]}"
+    module = _stand_in_module("context_bf16", identifier, form=form)
+    unread = _placeholder(torch.device("cpu"))
+    tables = torch.arange(12, dtype=torch.int32).view(3, 4)
+    lse = torch.zeros((3 * 64, 32)) if return_lse else None
+    sinks = torch.zeros(32) if enable_sink else None
+    values = _launch_values(
+        monkeypatch,
+        tables,
+        shared=True,
+        module=module,
+        is_causal=is_causal,
+        lse=lse,
+        lse_stride_tokens=32 if return_lse else 0,
+        lse_stride_heads=1 if return_lse else 0,
+        attention_sinks=sinks,
+    )
+    assert values["LSE_ptr"].data_ptr() == (unread if lse is None else lse.data_ptr())
+    assert values["sinks"].data_ptr() == (unread if sinks is None else sinks.data_ptr())
+    assert values["m_blocks"] is not None and values["q_heads"] == 32
+    with pytest.raises(RuntimeError, match="the causal mask, LSE and sinks of its"):
+        _launch_values(monkeypatch, tables, shared=True, module=module)
 
 
 @pytest.mark.parametrize("form", sorted(_FP8_FORMS))
@@ -3314,12 +3590,24 @@ def _whole_tile_routes(monkeypatch):
 
 
 def _reference_context(
-    query, key, value, tables_k, tables_v, q_lens, kv_lens, *, scale
+    query,
+    key,
+    value,
+    tables_k,
+    tables_v,
+    q_lens,
+    kv_lens,
+    *,
+    scale,
+    causal=True,
+    sinks=None,
 ):
     """FP32 bottom-right causal GQA attention over the paged HND pools: request
     ``b`` has ``q_lens[b]`` new tokens and attends its first ``kv_lens[b]``
-    cached tokens; query ``i`` sees keys ``j <= i + kv_len - q_len``.  An
-    empty request (no query token, no key) has no rows."""
+    cached tokens; query ``i`` sees keys ``j <= i + kv_len - q_len`` (every
+    key unless ``causal``).  ``sinks`` (one logit per query head) join the
+    softmax denominator only.  An empty request (no query token, no key) has
+    no rows."""
 
     num_q_heads, num_kv_heads, page = query.shape[1], key.shape[1], key.shape[2]
     group = num_q_heads // num_kv_heads
@@ -3327,6 +3615,11 @@ def _reference_context(
     start = 0
     for b, (q_len, kv_len) in enumerate(zip(q_lens, kv_lens, strict=True)):
         if q_len == 0:
+            continue
+        if kv_len == 0:
+            # No key: the rows' output is 0 (a sink alone adds no value).
+            out[start : start + q_len] = 0
+            start += q_len
             continue
         count = (kv_len + page - 1) // page
         k = (
@@ -3343,13 +3636,21 @@ def _reference_context(
         v = v.float().repeat_interleave(group, dim=0)
         q = query[start : start + q_len].float().transpose(0, 1)
         logits = torch.einsum("hqd,hkd->hqk", q, k) * scale
-        right = torch.arange(q_len, device=query.device)[:, None] + kv_len - q_len
-        logits.masked_fill_(
-            torch.arange(kv_len, device=query.device) > right, -math.inf
+        if causal:
+            right = torch.arange(q_len, device=query.device)[:, None] + kv_len - q_len
+            logits.masked_fill_(
+                torch.arange(kv_len, device=query.device) > right, -math.inf
+            )
+        if sinks is None:
+            probs = torch.softmax(logits, dim=-1)
+        else:
+            sink = sinks.float()[:, None, None]
+            peak = torch.maximum(logits.amax(-1, keepdim=True), sink)
+            weights = (logits - peak).exp()
+            probs = weights / (weights.sum(-1, keepdim=True) + (sink - peak).exp())
+        out[start : start + q_len] = torch.einsum("hqk,hkd->hqd", probs, v).transpose(
+            0, 1
         )
-        out[start : start + q_len] = torch.einsum(
-            "hqk,hkd->hqd", torch.softmax(logits, dim=-1), v
-        ).transpose(0, 1)
         start += q_len
     return out
 
@@ -3531,8 +3832,9 @@ def _bf16_batch(heads, q_lens, kv_lens, page_size, *, shared=True, seed=20261028
     )
 
 
-def _run_bf16_batch(case, *, return_lse=False):
-    """One causal launch of the batch, output and LSE filled with NaN first."""
+def _run_bf16_batch(case, *, return_lse=False, sinks=None, causal=True):
+    """One launch of the batch (causal unless ``causal`` is false, with the
+    ``sinks`` given), output and LSE filled with NaN first."""
 
     out = torch.full_like(case.query, float("nan"))
     lse = None
@@ -3556,6 +3858,8 @@ def _run_bf16_batch(case, *, return_lse=False):
         out=out,
         lse=lse,
         return_lse=return_lse,
+        sinks=sinks,
+        causal=causal,
         kv_layout="HND",
         uses_shared_paged_kv_idx=case.shared,
         multi_ctas_kv_counter_buffer=case.counter,
@@ -3649,7 +3953,7 @@ def test_cake_context_bf16_jit_route_runs_tiles_without_keys(
         return load(*args, **kwargs)
 
     monkeypatch.setattr(cake_api, "load_cake_fmha_context_bf16_module", spy)
-    monkeypatch.setattr(cake_api, "_CONTEXT_BF16_RUNTIME_ROUTES", {})
+    monkeypatch.setattr(cake_api, "_CONTEXT_RUNTIME_FLAG_ROUTES", {})
     assert _tiles_without_keys(heads, q_lens, kv_lens)
     # Every batch but the one with the empty request has rows without a key.
     assert _rows_without_keys(q_lens, kv_lens) or 0 in q_lens
@@ -3684,7 +3988,7 @@ def test_cake_context_bf16_program_and_jit_route_agree_on_rows_without_keys(
     assert served_programs == [program]
     _check_rows_with_and_without_keys(case, out, None)
     monkeypatch.setattr(cake_api, "_context_bf16_exact_profile", lambda *a, **k: None)
-    monkeypatch.setattr(cake_api, "_CONTEXT_BF16_RUNTIME_ROUTES", {})
+    monkeypatch.setattr(cake_api, "_CONTEXT_RUNTIME_FLAG_ROUTES", {})
     assert _tiles_without_keys((10, 2), q_lens, kv_lens)
     jit_out, _ = _run_bf16_batch(case)
     assert served_programs == [program]
@@ -3724,7 +4028,7 @@ def test_cake_context_bf16_runtime_programs_run_tiles_without_keys(
     out, _ = _run_bf16_batch(case)
     assert served_programs == [program]
     _check_rows_with_and_without_keys(case, out, None)
-    monkeypatch.setattr(cake_api, "_CONTEXT_BF16_RUNTIME_ROUTES", {})
+    monkeypatch.setattr(cake_api, "_CONTEXT_RUNTIME_FLAG_ROUTES", {})
     jit_out, _ = _run_bf16_batch(case)
     assert served_programs == [program]
     assert torch.equal(_bits(jit_out), _bits(out))
@@ -3772,6 +4076,76 @@ def test_cake_context_bf16_runtime_tail_orders_are_bitwise_the_same(
     assert len(served_programs) == served
     assert torch.equal(_bits(outs[1]), _bits(outs[0]))
     assert torch.equal(_bits(outs[0]), _bits(jit_out))
+
+
+@_GPU
+@pytest.mark.parametrize("form", sorted(_BF16_FLAG_FORMS))
+@pytest.mark.parametrize(
+    ("heads", "q_lens", "kv_lens", "page_size"),
+    [
+        # A request with query tokens but no key (pack 8).
+        ((32, 4), (200, 5, 64), (700, 0, 64), 16),
+        # An empty request (no query token, no key) between others (pack 4).
+        ((32, 8), (300, 0, 37, 64), (900, 0, 100, 130), 64),
+        # Requests with fewer keys than query tokens (pack 5).
+        ((40, 8), (64, 100), (32, 300), 32),
+        # Unpacked heads, 1024-token pages.
+        ((16, 16), (257, 300), (1000, 2047), 1024),
+    ],
+)
+def test_cake_context_bf16_flag_form_programs_match_the_jit_route_bitwise(
+    monkeypatch, served_programs, form, heads, q_lens, kv_lens, page_size
+) -> None:
+    """The runtime-size program of a flag form (attention sinks, an LSE output
+    or no causal mask) on the batch's JIT pack: the output and the LSE are
+    bitwise the JIT route's of the same form, and rows with a visible key
+    match the FP32 reference."""
+
+    is_causal, return_lse, enable_sink = form
+    target = cake_api._cake_fmha_target(torch.device("cuda"))
+    pack = cake_api._context_pack_g(max(q_lens), max(kv_lens), *heads)
+    table = cake_api._CONTEXT_RUNTIME_FLAG_ROUTES["context_bf16"][form][target]
+    program = table.get((pack, None))
+    if program is None:
+        pytest.skip(f"no {form} runtime-size program of pack {pack} on {target}")
+    case = _bf16_batch(heads, q_lens, kv_lens, page_size)
+    sinks = None
+    if enable_sink:
+        generator = torch.Generator(device="cpu").manual_seed(20261103)
+        sinks = (torch.rand(heads[0], generator=generator) * 5).to("cuda")
+    run = dict(return_lse=return_lse, sinks=sinks, causal=is_causal)
+    out, lse = _run_bf16_batch(case, **run)
+    assert served_programs == [program]
+    monkeypatch.setattr(cake_api, "_CONTEXT_RUNTIME_FLAG_ROUTES", {})
+    jit_out, jit_lse = _run_bf16_batch(case, **run)
+    assert served_programs == [program]
+    assert torch.equal(_bits(jit_out), _bits(out))
+    if return_lse:
+        assert torch.equal(jit_lse.view(torch.int32), lse.view(torch.int32))
+    blank = (
+        _rows_without_keys(q_lens, kv_lens)
+        if is_causal
+        else _rows_without_keys(
+            q_lens, [0 if k == 0 else q for q, k in zip(q_lens, kv_lens, strict=True)]
+        )
+    )
+    seen = torch.ones(out.shape[0], dtype=torch.bool, device=out.device)
+    seen[blank] = False
+    expected = _reference_context(
+        case.query,
+        case.key,
+        case.value,
+        case.tables_k,
+        case.tables_v,
+        q_lens,
+        kv_lens,
+        scale=128**-0.5,
+        causal=is_causal,
+        sinks=sinks,
+    )
+    torch.testing.assert_close(out.float()[seen], expected[seen], atol=1e-2, rtol=1e-2)
+    if return_lse:
+        assert bool(torch.isfinite(lse[seen]).all())
 
 
 # --- GPU: the other context JIT routes on tiles without a visible key -------
@@ -4089,11 +4463,17 @@ def _jit_route_of(monkeypatch, case, *, return_lse=False):
     def probe(device, route):
         raise _RouteProbe(route)
 
+    # The route leaves through the exception's own name: a kept ExceptionInfo
+    # would hold its traceback, whose frames keep the calling test's tensors and
+    # CUDA graphs alive until a cyclic collection, which may then run inside a
+    # later test's graph capture.
     with monkeypatch.context() as m:
         m.setattr(cake_api, "get_cake_fmha_context_module", probe)
-        with pytest.raises(_RouteProbe) as caught:
+        try:
             _run_jit_route_batch(case, return_lse=return_lse)
-    return caught.value.args[0]
+        except _RouteProbe as reached:
+            return reached.args[0]
+    pytest.fail("the dispatch reached no context module")
 
 
 def _jit_route_tiles_without_keys(case, route):
@@ -4153,7 +4533,7 @@ def test_cake_context_jit_routes_run_tiles_without_keys(
 
     _skip_without_nvfp4_programs(component)
     monkeypatch.setattr(cake_api, "_CONTEXT_PROGRAM_ROUTES", {})
-    monkeypatch.setattr(cake_api, "_CONTEXT_BF16_RUNTIME_ROUTES", {})
+    monkeypatch.setattr(cake_api, "_CONTEXT_RUNTIME_FLAG_ROUTES", {})
     monkeypatch.setattr(cake_api, "_CONTEXT_FP8_RUNTIME_ROUTES", {})
     monkeypatch.setattr(cake_api, "_CONTEXT_NVFP4_RUNTIME_ROUTES", {})
     monkeypatch.setattr(cake_api, "_CONTEXT_FP8_RUNTIME_FORM_ROUTES", {})
@@ -4219,7 +4599,7 @@ def test_cake_context_fp8_hd256_jit_route_runs_a_partial_l2_section(
     batch of whole sections (one more request, the same maxima)."""
 
     monkeypatch.setattr(cake_api, "_CONTEXT_PROGRAM_ROUTES", {})
-    monkeypatch.setattr(cake_api, "_CONTEXT_BF16_RUNTIME_ROUTES", {})
+    monkeypatch.setattr(cake_api, "_CONTEXT_RUNTIME_FLAG_ROUTES", {})
     monkeypatch.setattr(cake_api, "_CONTEXT_FP8_RUNTIME_ROUTES", {})
     monkeypatch.setattr(cake_api, "_CONTEXT_FP8_RUNTIME_FORM_ROUTES", {})
     monkeypatch.setattr(cake_api, "_CONTEXT_FP8_SPLIT_ROUTES", {})
@@ -4276,7 +4656,7 @@ def test_cake_context_quantized_program_and_jit_route_agree_on_rows_without_keys
     assert served_programs == [program]
     _check_jit_route_rows(case, out, None)
     monkeypatch.setattr(cake_api, "_CONTEXT_PROGRAM_ROUTES", {})
-    monkeypatch.setattr(cake_api, "_CONTEXT_BF16_RUNTIME_ROUTES", {})
+    monkeypatch.setattr(cake_api, "_CONTEXT_RUNTIME_FLAG_ROUTES", {})
     monkeypatch.setattr(cake_api, "_CONTEXT_FP8_RUNTIME_ROUTES", {})
     monkeypatch.setattr(cake_api, "_CONTEXT_NVFP4_RUNTIME_ROUTES", {})
     monkeypatch.setattr(cake_api, "_CONTEXT_FP8_RUNTIME_FORM_ROUTES", {})
@@ -4689,7 +5069,7 @@ def test_cake_context_programs_match_the_jit_route_bitwise(
         assert served_programs[-1] == _device_scale_program(program)
         assert torch.equal(_bits(device_out), _bits(out))
     monkeypatch.setattr(cake_api, "_CONTEXT_PROGRAM_ROUTES", {})
-    monkeypatch.setattr(cake_api, "_CONTEXT_BF16_RUNTIME_ROUTES", {})
+    monkeypatch.setattr(cake_api, "_CONTEXT_RUNTIME_FLAG_ROUTES", {})
     monkeypatch.setattr(cake_api, "_CONTEXT_FP8_RUNTIME_ROUTES", {})
     monkeypatch.setattr(cake_api, "_CONTEXT_NVFP4_RUNTIME_ROUTES", {})
     monkeypatch.setattr(cake_api, "_CONTEXT_FP8_RUNTIME_FORM_ROUTES", {})
@@ -4737,7 +5117,7 @@ def test_cake_context_programs_match_the_jit_route_with_fewer_keys_than_queries(
     out = _run_context(case)
     assert served_programs == [program]
     monkeypatch.setattr(cake_api, "_CONTEXT_PROGRAM_ROUTES", {})
-    monkeypatch.setattr(cake_api, "_CONTEXT_BF16_RUNTIME_ROUTES", {})
+    monkeypatch.setattr(cake_api, "_CONTEXT_RUNTIME_FLAG_ROUTES", {})
     monkeypatch.setattr(cake_api, "_CONTEXT_FP8_RUNTIME_ROUTES", {})
     monkeypatch.setattr(cake_api, "_CONTEXT_FP8_RUNTIME_FORM_ROUTES", {})
     jit_out = _run_context(case)

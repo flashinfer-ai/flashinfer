@@ -1502,7 +1502,8 @@ def test_argument_validation(hidden: int) -> None:
     y_odd_ref, _, _ = _reference_forward(odd_view, w, eps)
     _assert_bf16_close(y_odd, y_odd_ref, "y odd row stride")
     y, rstd = cake_rmsnorm_det_train_forward(x, w, eps)
-    with pytest.raises(ValueError):
+    # The det package takes no ``deterministic`` keyword.
+    with pytest.raises(TypeError, match="unexpected keyword argument 'deterministic'"):
         cake_rmsnorm_det_train_backward(y, x, w, rstd, deterministic=False)
     with pytest.raises(ValueError):
         cake_rmsnorm_det_train_backward(y, x, w, rstd.double())
@@ -1526,7 +1527,7 @@ def test_registry_records_reference_the_build_manifest() -> None:
     manifest = cake_build.manifest()
     assert manifest["schema"] == "cake-build/1"
     # build.json names the package's FlashInfer import path; a vendored copy ships the file unchanged under its own name.
-    assert manifest["package"] == "flashinfer.cake_rmsnorm_det_train_backend"
+    assert manifest["package"] == "flashinfer.experimental.cake.cake_rmsnorm_det_train"
     libraries = cake_build.libraries_by_name()
     package = Path(cake_build.__file__).parent
     referenced = set()

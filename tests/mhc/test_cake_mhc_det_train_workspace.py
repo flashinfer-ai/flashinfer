@@ -59,8 +59,8 @@ import torch
 
 from tests.cake.test_helpers.cake_package import PACKAGES, cake_package
 
-pkg = cake_package("cake_mhc_det_train")
-loader = cake_package("cake_mhc_det_train", "cake_jit")
+pkg = cake_package("cake.cake_mhc_det_train")
+loader = cake_package("cake.cake_mhc_det_train", "cake_jit")
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 STREAMS, MAPPING_ROWS = 4, 24
@@ -340,7 +340,7 @@ def test_default_workspace_reported_sequence(Ts: tuple, hidden: int) -> None:
             sys.executable,
             "-c",
             _REPORTED_CHILD,
-            PACKAGES["cake_mhc_det_train"],
+            PACKAGES["cake.cake_mhc_det_train"],
             ",".join(map(str, Ts)),
             str(hidden),
         ],

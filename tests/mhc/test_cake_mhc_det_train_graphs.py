@@ -53,8 +53,8 @@ from torch.utils.checkpoint import checkpoint
 
 from tests.cake.test_helpers.cake_package import cake_package
 
-pkg = cake_package("cake_mhc_det_train")
-loader = cake_package("cake_mhc_det_train", "cake_jit")
+pkg = cake_package("cake.cake_mhc_det_train")
+loader = cake_package("cake.cake_mhc_det_train", "cake_jit")
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 STREAMS, MAPPING_ROWS = 4, 24

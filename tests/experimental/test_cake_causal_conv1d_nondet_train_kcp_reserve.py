@@ -108,7 +108,7 @@ def _route_recorders(monkeypatch):
 
     det_single, det_multi, nd_single, nd_multi = (_Recorder() for _ in range(4))
     monkeypatch.setattr(det_facade, "cake_causal_conv1d_det_kcp", det_single)
-    monkeypatch.setattr(det_facade, "cake_causal_conv1d_det_multi_kcp", det_multi)
+    monkeypatch.setattr(det_facade, "cake_causal_conv1d_det_kcp_multi", det_multi)
     monkeypatch.setattr(conv_kcp, "cake_causal_conv1d_nondet_kcp", nd_single)
     monkeypatch.setattr(conv_kcp, "cake_causal_conv1d_nondet_kcp_multi", nd_multi)
     return det_single, det_multi, nd_single, nd_multi
@@ -237,10 +237,10 @@ def test_backward_launches_the_reserved_grid(monkeypatch, reserve) -> None:
         for C, full, k, shipped in rows:
             p = _problem(LENS, CUTS, C, device)
             _, hist = _fwd(p.x_local, p.w, p.ctx)
-            _, hist_det = det_kcp.cake_causal_conv1d_det_forward_kcp(
+            _, hist_det = det_kcp.cake_causal_conv1d_det_train_kcp_forward(
                 p.x_local, p.w, p.ctx
             )
-            dx_det, _ = det_kcp.cake_causal_conv1d_det_backward_kcp(
+            dx_det, _ = det_kcp.cake_causal_conv1d_det_train_kcp_backward(
                 p.x_local, p.w, p.ctx, p.dy_local, hist_det
             )
             _, _, dw_ref = _reference(p.x, p.w, p.cu, p.dy)

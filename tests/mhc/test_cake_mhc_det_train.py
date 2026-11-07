@@ -128,9 +128,9 @@ import torch
 
 from tests.cake.test_helpers.cake_package import cake_package
 
-pkg = cake_package("cake_mhc_det_train")
-cake_build = cake_package("cake_mhc_det_train", "cake_build")
-loader = cake_package("cake_mhc_det_train", "cake_jit")
+pkg = cake_package("cake.cake_mhc_det_train")
+cake_build = cake_package("cake.cake_mhc_det_train", "cake_build")
+loader = cake_package("cake.cake_mhc_det_train", "cake_jit")
 forward_prepare = pkg.cake_mhc_det_train_forward_prepare
 forward_stats = pkg.cake_mhc_det_train_forward_stats
 forward_finish = pkg.cake_mhc_det_train_forward_finish

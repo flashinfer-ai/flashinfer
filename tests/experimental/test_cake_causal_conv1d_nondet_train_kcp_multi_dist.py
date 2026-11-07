@@ -143,7 +143,7 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir, local_id: int) -> d
         def fn(*args):
             a_x, a_w, a_h = args[:n], args[n : 2 * n], args[2 * n :]
             if det:
-                return det_api.cake_causal_conv1d_det_multi_kcp(a_x, a_w, ctx)
+                return det_api.cake_causal_conv1d_det_kcp_multi(a_x, a_w, ctx)
             if multi:
                 return kcp_api.cake_causal_conv1d_nondet_kcp_multi(
                     a_x, a_w, ctx, recompute_handle=a_h[0]

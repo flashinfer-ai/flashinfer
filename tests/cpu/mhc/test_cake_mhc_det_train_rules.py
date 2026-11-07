@@ -68,7 +68,7 @@ import pytest
 
 from tests.cake.test_helpers.cake_package import cake_package
 
-loader = cake_package("cake_mhc_det_train", "cake_jit")
+loader = cake_package("cake.cake_mhc_det_train", "cake_jit")
 # The tables of record of this module describe the hidden size 4096: the H 4096 records, their routes and record
 # scalars. The sizes 5120 / 7168 are checked in test_cake_mhc_det_train_rules_hidden.py.
 H4096_MODULES = {

@@ -42,8 +42,8 @@ from tests.experimental.test_helpers.cake_kda_train_kcp_saved import (
 from tests.cake.test_helpers.cake_package import cake_package
 
 kp = cake_package("cake_kda_det_train_kcp", "cake_kcp_plan")
-cake_backend = cake_package("cake_kda_det_train", "cake_backend")
-cake_jit = cake_package("cake_kda_det_train", "cake_jit")
+cake_backend = cake_package("cake.cake_kda_det_train", "cake_backend")
+cake_jit = cake_package("cake.cake_kda_det_train", "cake_jit")
 cake_kcp_jit = cake_package("cake_kda_det_train_kcp", "cake_kcp_jit")
 
 SM_COUNT = 152  # GB300; the plan rule's examples of the design note §7.2
@@ -5121,7 +5121,7 @@ def test_forward_only_layout_bytes_and_prediction() -> None:
                 {
                     "backward": False,
                     "fwd_layout": "fwd_kcp",
-                    "arena": cake_backend.KdaDetArena(batch_tokens=S),
+                    "arena": cake_backend.CakeKDADetArena(batch_tokens=S),
                 }
             )
         for kw in bad:

@@ -27,7 +27,6 @@ import warnings
 
 import pytest
 
-import flashinfer.cake_kda_det_train as det_api
 import flashinfer.cake_kda_det_train_kcp as kcp_api
 from flashinfer.api_logging import ExperimentalWarning
 
@@ -103,7 +102,7 @@ PREVIOUS_NAMES = (
 def test_facade_entries_carry_the_det_names(new: str) -> None:
     fn = getattr(kcp_api, new)
     assert fn.__name__ == new and fn.__module__ == "flashinfer.cake_kda_det_train_kcp"
-    assert fn.experimental_feature == det_api._FEATURE
+    assert fn.experimental_feature == kcp_api._FEATURE
     assert new in kcp_api.__all__
 
 

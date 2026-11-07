@@ -35,7 +35,7 @@ import pytest
 
 from tests.cake.test_helpers.cake_package import cake_package
 
-loader = cake_package("cake_mhc_det_train", "cake_jit")
+loader = cake_package("cake.cake_mhc_det_train", "cake_jit")
 
 NEW_HIDDEN_SIZES = (5120, 7168)
 BOARDS = (("sm_100a", 148), ("sm_103a", 152), ("sm_107a", 208), ("sm_107a", 216))

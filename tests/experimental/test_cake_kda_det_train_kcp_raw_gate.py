@@ -90,8 +90,8 @@ from tests.cake.test_helpers.cake_package import cake_package
 
 cake_kcp = cake_package("cake_kda_det_train_kcp", "cake_kcp")
 cake_kcp_plan = cake_package("cake_kda_det_train_kcp", "cake_kcp_plan")
-cake_backend = cake_package("cake_kda_det_train", "cake_backend")
-cake_jit = cake_package("cake_kda_det_train", "cake_jit")
+cake_backend = cake_package("cake.cake_kda_det_train", "cake_backend")
+cake_jit = cake_package("cake.cake_kda_det_train", "cake_jit")
 cake_kcp_jit = cake_package("cake_kda_det_train_kcp", "cake_kcp_jit")
 
 D = cake_kcp.D
@@ -1026,10 +1026,10 @@ def _run_rank(rank: int, W: int, row, rdzv: str | None, result_dir: str | None) 
     if rank == 0:
         cu_t = torch.tensor(cu, dtype=torch.int32, device=device)
         # the single-rank raw path on the whole pack
-        out_s, saved_s = cake_backend.chunk_kda_det_fwd(
+        out_s, saved_s = cake_backend.cake_kda_det_train_forward(
             glob["q"], glob["k"], glob["v"], glob["g"], glob["beta"], cu_t, **GK
         )
-        grads_s = cake_backend.chunk_kda_det_bwd(
+        grads_s = cake_backend.cake_kda_det_train_backward(
             glob["q"], glob["k"], glob["v"], glob["g"], glob["beta"], cu_t, glob["dout"],
             saved=saved_s, **GK,
         )  # fmt: skip

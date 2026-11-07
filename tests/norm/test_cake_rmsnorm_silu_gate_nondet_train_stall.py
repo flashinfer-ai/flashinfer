@@ -89,8 +89,9 @@ SM107 also at 10 and 30 rows per SM) keeps its speed
 beside the one-thread kernel, starts beside the all-SM kernel with the
 max-shared carveout, and beside a side kernel that holds ``k`` SMs (the item 1
 side kernels and 16 CTAs of 1024 threads with the max-shared carveout) ends no
-later than the deterministic forward beside the same side kernel: the busy
-median is at most the deterministic forward's busy median times ``1 +
+later than the deterministic forward (the deterministic package's plain forward
+module, whatever the rows) beside the same side kernel: the busy median is at
+most the deterministic forward's busy median times ``1 +
 PROPORTIONAL_SLACK``, or at most ``SHORT_EXTRA_MS`` above it: one tick of
 the event timer (about 1 microsecond on SM103) and a half, the calls taking
 a few microseconds.  The two forwards' alone / busy pairs alternate round by
@@ -130,6 +131,7 @@ from tests.cake.test_helpers.cake_package import cake_package
 pkg = cake_package("cake_rmsnorm_silu_gate_nondet_train")
 loader = cake_package("cake_rmsnorm_silu_gate_nondet_train", "cake_jit")
 det_pkg = cake_package("cake_rmsnorm_silu_gate_det_train")
+det_loader = cake_package("cake_rmsnorm_silu_gate_det_train", "cake_jit")
 forward = pkg.cake_rmsnorm_silu_gate_nondet_train_forward
 backward = pkg.cake_rmsnorm_silu_gate_nondet_train_backward
 workspace_for = pkg.cake_rmsnorm_silu_gate_nondet_train_backward_workspace
@@ -805,6 +807,10 @@ SHORT_MAX_ALONE_SPREAD = 1.7
 SHORT_EXTRA_ATTEMPTS = 2
 
 
+def _det_plain(arch, role, rows, sm_count):
+    return det_loader.route_module(arch, role)
+
+
 def _short_forward_tokens(rows_per_sm: int) -> int:
     """The most tokens ``T`` (at least one) whose ``T * H`` rows stay within
     ``rows_per_sm`` rows per SM, one of the architecture's
@@ -901,9 +907,18 @@ def test_short_forward_ends_no_later_than_the_forward_beside_held_sms(
         return (forward(x, z, w, EPS, out=y),)
 
     def call_det():
-        return (
-            det_pkg.cake_rmsnorm_silu_gate_det_train_forward(x, z, w, EPS, out=y_det),
-        )
+        # the deterministic package's plain forward module whatever the rows
+        # (its short forward is this package's)
+        routed = det_loader.module_for_rows
+        det_loader.module_for_rows = _det_plain
+        try:
+            return (
+                det_pkg.cake_rmsnorm_silu_gate_det_train_forward(
+                    x, z, w, EPS, out=y_det
+                ),
+            )
+        finally:
+            det_loader.module_for_rows = routed
 
     spin = _spin(carveout, ctas=ctas, threads=threads)
     side = f"{ctas}x{threads}" + ("s" if carveout is not None else "")

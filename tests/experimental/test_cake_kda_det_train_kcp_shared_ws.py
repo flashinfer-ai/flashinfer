@@ -51,8 +51,8 @@ from tests.cake.test_helpers.cake_package import cake_package
 
 kp = cake_package("cake_kda_det_train_kcp", "cake_kcp_plan")
 cake_kcp = cake_package("cake_kda_det_train_kcp", "cake_kcp")
-cake_backend = cake_package("cake_kda_det_train", "cake_backend")
-cake_jit = cake_package("cake_kda_det_train", "cake_jit")
+cake_backend = cake_package("cake.cake_kda_det_train", "cake_backend")
+cake_jit = cake_package("cake.cake_kda_det_train", "cake_jit")
 
 SM_COUNT = 152
 # the document lengths of four packs of one rank: different T_r and n_frag; at H = 4 the one-document and
@@ -995,7 +995,7 @@ def test_gpu_graph_replay_on_a_reserved_shared_workspace(device) -> None:
         assert ws.local is not old
         for e in cake_kcp._GRAPHS.values():
             assert not any(
-                isinstance(p, cake_backend.KdaDetWorkspace) and p.arena is old.arena
+                isinstance(p, cake_backend.CakeKDADetWorkspace) and p.arena is old.arena
                 for p in e.pins
             )
     finally:

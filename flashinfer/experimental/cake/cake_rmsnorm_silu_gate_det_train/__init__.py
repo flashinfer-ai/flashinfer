@@ -40,7 +40,15 @@ Host design (every control is a keyword; no environment variable):
   FP64 over the chunks), rounded once to the output dtype: repeated calls
   return the same bits.
 - No call synchronizes the host or the device; every kernel runs on the
-  current torch stream with a plain (non-persistent, non-cooperative) grid.
+  current torch stream, and no launch is cooperative or uses programmatic
+  dependent launch.  The forward runs one of several fixed-order modules,
+  chosen from the row count and the device's SM count
+  (``cake_jit.module_for_rows``): a short forward up to a few rows per SM,
+  the plain forward, and from many rows per SM persistent forwards whose CTAs
+  each walk a few row blocks.  Each computes every row with the same FP32
+  operations in the same order, so ``y`` is the same bits whichever module
+  runs it; the backward reads only the upstream gradient, ``x``, ``z`` and
+  ``weight``, so its results do not depend on the forward module.
 - Mode: the mode is part of the name (``det``).  Every entry point is
   deterministic and takes no ``deterministic`` keyword (passing one is a
   ``TypeError``); every launch sums in a fixed order, so
@@ -148,7 +156,13 @@ def _kernel_view(
     The tensor is viewed as ``[T, H, 128]``; it is read in place when its last
     stride is 1, its storage offset and both strides are multiples of 16
     elements (32 bytes) and its storage is 32-byte aligned, else copied once.
-    A stride of a size-1 dimension is never dereferenced and is passed as 0.
+    A stride of a size-1 dimension is never dereferenced: a single token's
+    stride is passed as 0 and a single head's as 128, the stride of rows that
+    follow one another, so a ``[T, 1, 128]`` or ``[T, 128]`` input whose token
+    stride is 128 passes the persistent forwards' packed-rows test (head
+    stride 128 and token stride ``H * 128``: they then warm their next row
+    blocks in L2) as a ``[T, H, 128]`` input with packed rows does.  The
+    strides change no bits.
     """
 
     if not isinstance(tensor, torch.Tensor):
@@ -169,7 +183,7 @@ def _kernel_view(
         view = None
     if view is not None:
         tok = int(view.stride(0)) if tokens > 1 else 0
-        head = int(view.stride(1)) if heads > 1 else 0
+        head = int(view.stride(1)) if heads > 1 else HEAD_DIM
         if (
             view.stride(2) == 1
             and _aligned(tok)
@@ -183,7 +197,7 @@ def _kernel_view(
     return (
         copy,
         heads * HEAD_DIM if tokens > 1 else 0,
-        HEAD_DIM if heads > 1 else 0,
+        HEAD_DIM,
     )
 
 
@@ -250,6 +264,10 @@ def cake_rmsnorm_silu_gate_det_train_forward(
 
     ``rstd = 1 / sqrt(mean(x^2) + eps)`` over the last dimension (128), in FP32;
     ``silu(z) = z / (1 + exp(-z))`` in FP32; one rounding to BF16 at the end.
+    The module that runs it follows the row count and the device's SM count
+    (``cake_jit.module_for_rows``); every forward module computes a row with
+    the same FP32 operations in the same order, so ``y`` is the same bits on
+    every route.
 
     Parameters
     ----------
@@ -294,9 +312,9 @@ def cake_rmsnorm_silu_gate_det_train_forward(
         "z_head": z_head,
         "eps": float(eps),
     }
-    _loader.run_module(
-        route_module(arch, "fwd"), values, rows=rows, device_index=_device_index(device)
-    )
+    index = _device_index(device)
+    name = _loader.module_for_rows(arch, "fwd", rows, _loader.device_sm_count(index))
+    _loader.run_module(name, values, rows=rows, device_index=index)
     if y_user is not None:
         y_user.copy_(y)
         return y_user

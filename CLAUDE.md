@@ -1132,6 +1132,11 @@ for every provider and its shim when producing CUDA-specific or nightly wheels.
 
 ## Build System Details
 
+- **Portable descriptor locks**: `_flashinfer_filelock` uses stdlib `fcntl.flock`
+  on Unix and Portalocker's `Win32Locker` on Windows for shared/exclusive locks.
+  Callers own file opening, timeout policy and cleanup; nonblocking contention
+  raises `BlockingIOError`. The top-level module keeps standalone tools free of
+  GPU imports. Existing `filelock.FileLock` users remain unchanged.
 - **Build backend**: Custom PEP 517 backend in `build_backend.py`
 - **Data directories**: Build creates symlinks for editable installs:
   - `3rdparty/cutlass` → `flashinfer/data/cutlass`

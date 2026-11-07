@@ -2907,6 +2907,7 @@ def test_cake_fmha_context_route_is_optimized_only_on_exact_bf16_domain(
         is_causal=True,
         return_lse=True,
         enable_sink=False,
+        program="RUNTIME_PACK2_LSE",
     )
     assert cake_api.cake_fmha_route_is_optimized(route)
     assert (

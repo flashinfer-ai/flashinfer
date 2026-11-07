@@ -128,8 +128,22 @@ nd_backward = cake_rmsnorm_silu_gate_nondet_train_backward
 nd_workspace = cake_rmsnorm_silu_gate_nondet_train_backward_workspace
 nd_reset = cake_rmsnorm_silu_gate_nondet_train_reset_workspace
 nd_gated_rmsnorm = cake_rmsnorm_silu_gate_nondet
-det_forward = deterministic_facade.cake_rmsnorm_silu_gate_det_train_forward
 det_backward = deterministic_facade.cake_rmsnorm_silu_gate_det_train_backward
+
+
+def _det_plain(arch, role, rows, sm_count):
+    return deterministic_loader.route_module(arch, role)
+
+
+def det_forward(x, z, w, eps, **kwargs):
+    """The deterministic package's forward on its plain forward module whatever
+    the rows: its routed forwards are this package's forward programs under its
+    own names, so its public forward would compare them with themselves."""
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(deterministic_loader, "module_for_rows", _det_plain)
+        return deterministic_facade.cake_rmsnorm_silu_gate_det_train_forward(
+            x, z, w, eps, **kwargs
+        )
 
 
 def _supported() -> bool:
@@ -680,9 +694,7 @@ def test_nondet_entry_points_run_this_package(
     assert launched == [fwd, routes["bwd_bf16"]], launched
     for name in launched:
         assert name not in deterministic_loader.MODULES, name
-    assert torch.equal(
-        y, deterministic_facade.cake_rmsnorm_silu_gate_det_train_forward(x, z, w, EPS)
-    )
+    assert torch.equal(y, det_forward(x, z, w, EPS))
     dx_d, dz_d, dw_d = deterministic_facade.cake_rmsnorm_silu_gate_det_train_backward(
         dy, x, z, w, EPS
     )

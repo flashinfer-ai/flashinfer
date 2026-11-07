@@ -86,9 +86,9 @@ from tests.cake.test_helpers.cake_package import cake_package
 cake_kcp = cake_package("cake_kda_det_train_kcp", "cake_kcp")
 cake_kcp_plan = cake_package("cake_kda_det_train_kcp", "cake_kcp_plan")
 cake_kcp_jit = cake_package("cake_kda_det_train_kcp", "cake_kcp_jit")
-cake_backend = cake_package("cake_kda_det_train", "cake_backend")
-cake_build = cake_package("cake_kda_det_train", "cake_build")
-cake_jit = cake_package("cake_kda_det_train", "cake_jit")
+cake_backend = cake_package("cake.cake_kda_det_train", "cake_backend")
+cake_build = cake_package("cake.cake_kda_det_train", "cake_build")
+cake_jit = cake_package("cake.cake_kda_det_train", "cake_jit")
 
 D = cake_kcp.D
 SCALE = cake_kcp.SCALE
@@ -1463,7 +1463,7 @@ def _fake_registry(
         def __contains__(self, lib):
             return lib not in unexported
 
-    m.setattr(cake_backend, "chunk_kda_det_fwd", fwd)
+    m.setattr(cake_backend, "cake_kda_det_train_forward", fwd)
     m.setattr(cake_backend, "plan", plan)
     m.setattr(cake_backend, "lifetime_table", lifetime_table)
     m.setattr(cake_jit, "L2N_MODES", ("off", "fused", "fallback"), raising=False)
@@ -1649,7 +1649,7 @@ def test_l2n_capability_check() -> None:
                 m.setattr(cake_jit, "L2N_MODES", ("off", "fused"), raising=False)
                 if form == "fallback":
                     assert "plan" in cake_kcp_plan.qk_l2norm_missing(form, gate)
-                m.setattr(cake_backend, "chunk_kda_det_fwd", plain)
+                m.setattr(cake_backend, "cake_kda_det_train_forward", plain)
                 assert "use_qk_l2norm_in_kernel" in cake_kcp_plan.qk_l2norm_missing(
                     form, gate
                 )
@@ -1854,7 +1854,7 @@ def test_l2n_kernel_path_raises_until_bound() -> None:
         with pytest.MonkeyPatch.context() as m:
             for name in ("tables", "_size_pools", "_bind_local", "_local_plan"):
                 m.setattr(cake_kcp.WorkspaceDetKcp, name, _never(name))
-            for name in ("plan", "workspace_bytes", "KdaDetWorkspace"):
+            for name in ("plan", "workspace_bytes", "CakeKDADetWorkspace"):
                 real_fn = getattr(cake_backend, name)
                 m.setattr(cake_backend, name, _never(f"cake_backend.{name}", real_fn))
             # a CUDA device reads as dev_arch (no device is touched: the refusal comes first)
@@ -3051,10 +3051,10 @@ def _run_rank(
     if rank == 0:
         cu_t = torch.tensor(cu, dtype=torch.int32, device=device)
         kw_s = {**GK, **L2N}
-        out_s, saved_s = cake_backend.chunk_kda_det_fwd(
+        out_s, saved_s = cake_backend.cake_kda_det_train_forward(
             glob["q"], glob["k"], glob["v"], glob["g"], glob["beta"], cu_t, **kw_s
         )
-        grads_s = cake_backend.chunk_kda_det_bwd(
+        grads_s = cake_backend.cake_kda_det_train_backward(
             glob["q"], glob["k"], glob["v"], glob["g"], glob["beta"], cu_t, glob["dout"], saved=saved_s, **kw_s
         )  # fmt: skip
         single = {"out": out_s, **dict(zip(grad_names, grads_s, strict=True))}
