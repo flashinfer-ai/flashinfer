@@ -36,7 +36,7 @@ from ..api_logging import flashinfer_api
 from ..trace.templates.gemm import (
     batch_deepgemm_fp8_nt_groupwise_trace,
     bmm_bf16_trace,
-    bmm_fp8_trace,
+    bmm_fp8_trace_dispatch,
     bmm_mxfp8_trace,
     fp8_blockscale_gemm_sm90_trace,
     gemm_fp8_nt_groupwise_trace,
@@ -3208,6 +3208,9 @@ def fp8_gemm_sm100(
     runner_names: List[str],
     bias: Optional[torch.Tensor] = None,
 ) -> None:
+    if bias is not None and runner_names != ["cublas"]:
+        # The backend checks refuse this too, but skip_check=True skips them.
+        raise ValueError("bmm_fp8 supports a bias only with the cublas backend.")
     tuner = AutoTuner.get()
 
     # Keep the caller's order: untuned, the autotuner runs runners[0].
@@ -10500,7 +10503,7 @@ def _heuristic_func_bmm_fp8(
     common_check=_check_bmm_fp8_problem_size,
     heuristic_func=_heuristic_func_bmm_fp8,
 )
-@flashinfer_api(trace=bmm_fp8_trace)
+@flashinfer_api(trace=bmm_fp8_trace_dispatch)
 def bmm_fp8(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -10613,7 +10616,9 @@ def bmm_fp8(
     )
 
     if backend == "auto":
-        backends = bmm_fp8.suitable_auto_backends
+        # With a bias only cublas qualifies, whatever list the decorator last
+        # stored on the function (skip_check=True can leave it stale).
+        backends = ["cublas"] if bias is not None else bmm_fp8.suitable_auto_backends
     elif backend == "cutlass":
         backends = _heuristic_func_bmm_fp8(
             ["cutlass"], A, B, A_scale, B_scale, dtype, out, backend

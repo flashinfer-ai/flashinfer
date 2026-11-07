@@ -16,6 +16,7 @@
 
 #include <driver_types.h>
 
+#include <cstdint>
 #include <flashinfer/gemm/bmm_fp8.cuh>
 #include <unordered_map>
 
@@ -56,6 +57,8 @@ const DT* get_bias_ptr(const ffi::Optional<TensorView>& bias, const TensorView& 
   CHECK_DIM(1, tensor);
   CHECK_SAME_DTYPE(tensor, D);
   TVM_FFI_ICHECK_EQ(tensor.size(0), D.size(2)) << "bias must have one value per output column";
+  TVM_FFI_ICHECK(reinterpret_cast<uintptr_t>(tensor.data_ptr()) % 16 == 0)
+      << "bias must be 16-byte aligned";
   return static_cast<const DT*>(tensor.data_ptr());
 }
 

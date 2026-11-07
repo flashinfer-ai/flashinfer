@@ -23,7 +23,11 @@ def test_bmm_fp8_reference_correctness(shape_kwargs, with_bias):
     Matches tests/gemm/test_bmm_fp8.py: cos_sim > 0.99.
     """
     import flashinfer
-    from flashinfer.trace.templates.gemm import bmm_fp8_trace
+    from flashinfer.trace.templates.gemm import (
+        bmm_fp8_bias_trace,
+        bmm_fp8_trace,
+        bmm_fp8_trace_dispatch,
+    )
 
     _skip_if_not_sm100_or_103()
     inputs = bmm_fp8_trace.init(**shape_kwargs)
@@ -55,14 +59,18 @@ def test_bmm_fp8_reference_correctness(shape_kwargs, with_bias):
             dtype=torch.bfloat16,
             bias=bias,
         )
-    ref = bmm_fp8_trace.reference(
+    # A biased call gets its own definition; an unbiased one keeps the original.
+    template = bmm_fp8_trace_dispatch(bias=bias)
+    assert template is (bmm_fp8_bias_trace if with_bias else bmm_fp8_trace)
+    bias_kwargs = {"bias": bias} if with_bias else {}
+    ref = template.reference(
         inputs["A"],
         inputs["B"],
         inputs["A_scale"],
         inputs["B_scale"],
         dtype=torch.bfloat16,
-        bias=bias,
+        **bias_kwargs,
     )
-    _check(bmm_fp8_trace, ref, api, max_mismatch_pct=100.0, min_cos_sim=0.99)
+    _check(template, ref, api, max_mismatch_pct=100.0, min_cos_sim=0.99)
     if torch.cuda.is_available():
         torch.cuda.synchronize()

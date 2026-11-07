@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from flashinfer import autotune, bmm_fp8
+from flashinfer.gemm.gemm_base import get_gemm_module
 from flashinfer.utils import get_compute_capability
 from tests.utils_fp8 import to_float8
 
@@ -183,7 +184,10 @@ def test_bmm_fp8(b, m, n, k, input_dtype, mat2_dtype, res_dtype, backend, auto_t
 
 
 def _bias_case(
-    res_dtype: torch.dtype, b: int = 2, m: int = 48
+    res_dtype: torch.dtype,
+    b: int = 2,
+    m: int = 48,
+    mat2_dtype: torch.dtype = torch.float8_e4m3fn,
 ) -> tuple[torch.Tensor, ...]:
     major, minor = get_compute_capability(torch.device("cuda"))
     if not bmm_fp8.is_backend_supported("cublas", major * 10 + minor):
@@ -194,7 +198,7 @@ def _bias_case(
     )
     # Scaled so the output is O(1) like the bias; column major as bmm_fp8 requires.
     mat2 = torch.randn([b, n, k], device="cuda", dtype=torch.bfloat16) / k**0.5
-    mat2_fp8, mat2_inv_s = to_float8(mat2.transpose(-2, -1))
+    mat2_fp8, mat2_inv_s = to_float8(mat2.transpose(-2, -1), dtype=mat2_dtype)
     bias = torch.randn(n, device="cuda", dtype=res_dtype)
     return input_fp8, mat2_fp8, input_inv_s, mat2_inv_s, bias
 
@@ -202,13 +206,21 @@ def _bias_case(
 # The fuzzer has no bias axis, so the cuBLASLt bias epilogue is anchored here.
 # Batch 1 has no batch stride, and M=1 is a decode step.
 @pytest.mark.parametrize(("b", "m"), [(2, 48), (1, 1)])
+@pytest.mark.parametrize("mat2_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("auto_tuning", [False, True])
 @pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("backend", ["cublas", "auto"])
 def test_bmm_fp8_bias(
-    backend: str, res_dtype: torch.dtype, auto_tuning: bool, b: int, m: int
+    backend: str,
+    res_dtype: torch.dtype,
+    auto_tuning: bool,
+    mat2_dtype: torch.dtype,
+    b: int,
+    m: int,
 ) -> None:
-    input_fp8, mat2_fp8, input_inv_s, mat2_inv_s, bias = _bias_case(res_dtype, b, m)
+    input_fp8, mat2_fp8, input_inv_s, mat2_inv_s, bias = _bias_case(
+        res_dtype, b, m, mat2_dtype
+    )
     with autotune(auto_tuning):
         res = bmm_fp8(
             input_fp8,
@@ -229,9 +241,11 @@ def test_bmm_fp8_bias(
 def test_bmm_fp8_bias_rejected() -> None:
     input_fp8, mat2_fp8, input_inv_s, mat2_inv_s, bias = _bias_case(torch.bfloat16)
     args = (input_fp8, mat2_fp8, input_inv_s, mat2_inv_s, torch.bfloat16)
-    # A backend without the bias epilogue refuses the bias instead of dropping it.
-    with pytest.raises(ValueError, match="cublas"):
-        bmm_fp8(*args, backend="cudnn", bias=bias)
+    # A backend without the bias epilogue refuses the bias instead of dropping it,
+    # also when skip_check=True skips the backend checks.
+    for skip_check in (False, True):
+        with pytest.raises(ValueError, match="cublas"):
+            bmm_fp8(*args, backend="cudnn", bias=bias, skip_check=skip_check)
     # The batch-invariant class replaces the backends and takes no bias,
     # also when skip_check=True skips the problem-size check.
     for skip_check in (False, True):
@@ -254,6 +268,35 @@ def test_bmm_fp8_bias_rejected() -> None:
     misaligned = torch.empty(bias.numel() + 1, device="cuda", dtype=bias.dtype)[1:]
     with pytest.raises(ValueError, match="aligned"):
         bmm_fp8(*args, bias=misaligned)
+    # Under skip_check=True the binding refuses it.
+    with pytest.raises(RuntimeError, match="16-byte aligned"):
+        bmm_fp8(*args, bias=misaligned, skip_check=True)
+
+
+def test_bmm_fp8_bias_tuning_key() -> None:
+    """Unbiased calls keep their tuning key; a biased one adds the bias alignment,
+    which changes the cuBLASLt algo list a tuned tactic indexes."""
+    input_fp8, mat2_fp8, input_inv_s, mat2_inv_s, bias = _bias_case(torch.bfloat16)
+    runner = get_gemm_module().cublas_fp8_gemm_runner()
+    out = torch.empty(
+        input_fp8.shape[0],
+        input_fp8.shape[1],
+        bias.numel(),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    workspace = torch.empty(1024, device="cuda", dtype=torch.uint8)
+    inputs = [input_fp8, mat2_fp8, input_inv_s, mat2_inv_s, out, workspace]
+    assert runner.get_cache_key_extras(inputs) == (
+        input_fp8.dtype,
+        mat2_fp8.dtype,
+        torch.bfloat16,
+    )
+    # 16 bytes past a fresh allocation: aligned to 16 bytes but not to 32.
+    bias_16 = torch.empty(bias.numel() + 8, device="cuda", dtype=bias.dtype)[8:]
+    assert runner.get_cache_key_extras(inputs + [bias]) != runner.get_cache_key_extras(
+        inputs + [bias_16]
+    )
 
 
 if __name__ == "__main__":
