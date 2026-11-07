@@ -113,9 +113,8 @@ def test_backward_stage_order_is_fixed():
         "bwd_redo",
         "bwd_fold",
     )
-    assert cake_jit.NOPE_BACKWARD_STAGES == tuple(
-        f"nope_{s}" for s in cake_jit.BACKWARD_STAGES
-    )
+    nope_stages = tuple(f"nope_{s}" for s in cake_jit.BACKWARD_STAGES)
+    assert nope_stages == cake_jit.NOPE_BACKWARD_STAGES
     for program in cake_jit.PROGRAMS:
         registered = cake_jit.registered_stages(program)
         backward = [s for s in registered if s in cake_jit.BACKWARD_STAGES_OF[program]]

@@ -254,11 +254,11 @@ def generated_program_available(
     registered for the device's architecture and carries the forward stage (and every stage of
     ``cake_jit.BACKWARD_STAGES_OF[program]`` for the backward)."""
     try:
-        _, record = record_for(device, program)
+        record_for(device, program)
     except NotImplementedError:
         return False
     stages = cake_jit.registered_stages(program)
-    needed = (cake_jit.STAGES_OF[program][0],)
+    needed: tuple[str, ...] = (cake_jit.STAGES_OF[program][0],)
     if backward:
         needed += cake_jit.BACKWARD_STAGES_OF[program]
     return all(stage in stages for stage in needed)

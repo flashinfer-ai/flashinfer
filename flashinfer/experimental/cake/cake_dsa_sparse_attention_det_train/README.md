@@ -176,6 +176,12 @@ reaches FlashInfer only for the JIT fallback (flashinfer-ai/flashinfer#6553).
 
 ## Status
 
+The records of this revision register the forward stages only:
+`generated_program_available(device, backward=True)` is `False`, the forward
+entries run, and a backward raises `NotImplementedError` naming the stages
+of `cake_jit.BACKWARD_STAGES` it needs.  The storage plan, the runners and
+the tests of the backward are in place for those stages.
+
 Tests: `tests/experimental/test_cake_dsa_sparse_attention_det_train.py` (the
 backend suite: imports only this package; skips without a registered program
 or a compute capability 10.0 / 10.3 / 10.7 device),
