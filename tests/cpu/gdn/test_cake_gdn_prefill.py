@@ -659,9 +659,10 @@ def test_ragged_dvsplit_route_keeps_every_other_batch_on_its_rule(
 
 @pytest.mark.cpu_only
 def test_ragged_dvsplit_routes_pair_the_two_records_of_each_key() -> None:
-    """Each key of the map is an sm_107a-only full-DV record (base or gate-stream twin) of the
-    BF16-I/O FP32-state stateful contract, and its value is the DV-split record with the
-    same specializations; the map covers exactly the head geometries that ship both."""
+    """Each key of the map is an sm_107a-only full-DV record (base, gate-stream twin or its
+    prefetch twin) of the BF16-I/O FP32-state stateful contract, and its value is the
+    DV-split record with the same specializations; the map covers exactly the head
+    geometries that ship both."""
 
     routes = cake_gdn._ragged_dvsplit_routes()
     records = {r["name"]: r for r in cake_gdn._manifest()["variants"]}
@@ -673,6 +674,7 @@ def test_ragged_dvsplit_routes_pair_the_two_records_of_each_key() -> None:
         assert full_dv["source_schedule"] in (
             stem + "initial_sm107a_i64meta",
             stem + "initial_gatestream_full_sm107a_i64meta",
+            stem + "initial_gatestream_full_pf_sm107a_i64meta",
         )
         assert split["source_schedule"] == stem + "dvsplit_initial_sm107a_l7_vec2"
         assert split["specializations"] == full_dv["specializations"]
@@ -689,9 +691,8 @@ def test_ragged_dvsplit_routes_pair_the_two_records_of_each_key() -> None:
         num_v_heads = 1 << specs["NUM_O_HEADS_LOG2"]
         geometries.add((num_v_heads >> specs["HEAD_GROUP_LOG2"], num_v_heads))
     assert sorted(geometries) == sorted(_RAGGED_DVSPLIT_GEOMETRIES)
-    assert (
-        len(routes) == 15
-    )  # 8 base records and 7 gate-stream twins (none for Hq16/Hv64)
+    # 8 base records, 7 gate-stream twins (none for Hq16/Hv64) and their 7 prefetch twins
+    assert len(routes) == 22
 
 
 @pytest.mark.cpu_only

@@ -20,7 +20,7 @@ limitations under the License.
 # ``build_context_det_kcp``, the byte queries); the per-rank launch sequences and the autograd Function
 # (``cake_kcp``), the partition and context plan (``cake_kcp_plan``), the registry of the KCP programs
 # (``cake_kcp_jit``) and their generated sources live here.  The chunk stages a rank runs at its own shape are
-# those of ``flashinfer.experimental.cake_kda_det_train``.  The names below resolve on first access, so importing
+# those of ``flashinfer.experimental.cake.cake_kda_det_train``.  The names below resolve on first access, so importing
 # the package imports neither the host module (``torch.distributed``) nor the loader.
 
 from importlib import import_module

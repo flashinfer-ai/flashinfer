@@ -888,6 +888,18 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_103a": "e5fecce40a647b75e935879b7f15fbe69116019cac20b5551c10501c5a2e8c7e",
         },
     },
+    "cake_dsv4_25addc7a80a1e13c3ece": {
+        "sources": [
+            "sm_107a/cake_dsv4_25addc7a80a1e13c3ece_kernel.cu",
+            "sm_107a/cake_dsv4_25addc7a80a1e13c3ece_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "arg_plan": "fp8_lowhead_prefill",
+        "arches": ["sm_107a"],
+        "identity": {
+            "sm_107a": "1d8b01c91f7a6f9a037cae845dea4e9fd06dce03169b69bcaca61e2bdae6cae1",
+        },
+    },
     "cake_dsv4_289be7e9a77a8bb87264": {
         "sources": [
             "sm_100a/cake_dsv4_289be7e9a77a8bb87264_kernel.cu",
@@ -1472,6 +1484,7 @@ VARIANTS: dict[str, dict[str, str]] = {
         "fp8_lowhead_h64": "cake_dsv4_cbf3168c696847fd3f69",
         "fp8_lowhead_one_partition": "cake_dsv4_b7c345c94f3a216b24e5",
         "fp8_lowhead_prefill": "cake_dsv4_d9d623599c9697a9ccf3",
+        "fp8_lowhead_prefill_overlap": "cake_dsv4_d9d623599c9697a9ccf3",
         "split_reduce": "cake_dsv4_5f640d72462f26d33803",
     },
     "sm_103a": {
@@ -1506,6 +1519,7 @@ VARIANTS: dict[str, dict[str, str]] = {
         "fp8_lowhead_h64": "cake_dsv4_cbf3168c696847fd3f69",
         "fp8_lowhead_one_partition": "cake_dsv4_b78d35b605cb10daf20f",
         "fp8_lowhead_prefill": "cake_dsv4_e21760e2024d7c1e85c9",
+        "fp8_lowhead_prefill_overlap": "cake_dsv4_e21760e2024d7c1e85c9",
         "split_reduce": "cake_dsv4_5f640d72462f26d33803",
     },
     "sm_107a": {
@@ -1518,6 +1532,7 @@ VARIANTS: dict[str, dict[str, str]] = {
         "fp8_h64_prefill_source_persistent_m64_multi_tile": "cake_dsv4_ffa4216b35dae8d46543",
         "fp8_h64_prefill_source_persistent_m64_multi_tile_kv4": "cake_dsv4_8afa079cbcc688b8b5b9",
         "fp8_lowhead_prefill": "cake_dsv4_8625d6529808d0d51fc2",
+        "fp8_lowhead_prefill_overlap": "cake_dsv4_25addc7a80a1e13c3ece",
     },
 }
 

@@ -676,6 +676,12 @@ _GATE_STREAM_FULL_BASES = frozenset(
         "flashinfer_blackwell_gdn_prefill_initial_bf16state",
     }
 )
+# The architectures whose gate-stream twins also ship a ``_gatestream_full_pf`` twin: the same body
+# asking L2 for the initial state of each tile that follows another tile on its CTA (Cake's
+# ``sm107a_initial_state_l2_prefetch``).  The twin issues no prefetch when each CTA owns one tile,
+# so the resolver takes it only when the launch grid gives some CTA a second tile (see
+# ``select_cake_gdn_prefill_variant``); every stored value equals the twin's without it.
+_GATE_STREAM_PF_ARCHES = frozenset({"sm_107a"})
 
 
 def _cake_gdn_prefill_gate_stream_full(
@@ -700,6 +706,7 @@ def _prefill_schedule_attr(
     sm100a_state_inp_late: bool,
     sm103a_role_rebalanced: bool,
     gate_stream_full: bool,
+    initial_state_prefetch: bool = False,
 ) -> str:
     if gatepipe4:
         return "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4"
@@ -741,6 +748,9 @@ def _prefill_schedule_attr(
     if gate_stream_full and name in _GATE_STREAM_FULL_BASES:
         # The full-DV stateful bodies with several short tiles per CTA stream the successor's gate prologue.
         name += "_gatestream_full"
+        if initial_state_prefetch:
+            # Their prefetch twin also asks L2 for the initial state of a CTA's later tiles.
+            name += "_pf"
     return name
 
 
@@ -911,11 +921,11 @@ def _ragged_dvsplit_routes() -> dict[str, CakeGDNRoute]:
     sequence bounds the launch (``RAGGED_DVSPLIT_LOAD``); on a balanced batch the doubled tile
     count makes the DV-split launch slower.
 
-    Keys: the sm_107a-only full-DV base and gate-stream records of that contract whose exact
-    specializations also have a DV-split record (a key without either record is not here, so it
-    keeps its route or fails closed as before).  A resolved full-DV record of these keys is
-    over the tile budget: under it the key's own DV-split record is served first.  Built once
-    from the manifest.
+    Keys: the sm_107a-only full-DV base and gate-stream records (and the gate-stream records'
+    prefetch twins) of that contract whose exact specializations also have a DV-split record (a
+    key without either record is not here, so it keeps its route or fails closed as before).  A
+    resolved full-DV record of these keys is over the tile budget: under it the key's own
+    DV-split record is served first.  Built once from the manifest.
     """
 
     arch: CakeGDNArch = "sm_107a"
@@ -928,7 +938,9 @@ def _ragged_dvsplit_routes() -> dict[str, CakeGDNRoute]:
         "USE_STATE_INDICES": 0,
     }
 
-    def schedule(*, dvsplit: bool, gate_stream_full: bool) -> str:
+    def schedule(
+        *, dvsplit: bool, gate_stream_full: bool, initial_state_prefetch: bool = False
+    ) -> str:
         return cake_gdn_prefill_seq_schedule(
             arch,
             _prefill_schedule_attr(
@@ -942,14 +954,24 @@ def _ragged_dvsplit_routes() -> dict[str, CakeGDNRoute]:
                 sm100a_state_inp_late=False,
                 sm103a_role_rebalanced=False,
                 gate_stream_full=gate_stream_full,
+                initial_state_prefetch=initial_state_prefetch,
             ),
             use_state_indices=False,
         )
 
     prefix = "flashinfer.cake_gdn.generated.prefill:"
     full_dv = {
-        prefix + schedule(dvsplit=False, gate_stream_full=gate_stream_full)
-        for gate_stream_full in (False, True)
+        prefix
+        + schedule(
+            dvsplit=False,
+            gate_stream_full=gate_stream_full,
+            initial_state_prefetch=initial_state_prefetch,
+        )
+        for gate_stream_full, initial_state_prefetch in (
+            (False, False),
+            (True, False),
+            (True, True),
+        )
     }
     split = schedule(dvsplit=True, gate_stream_full=False)
     routes: dict[str, CakeGDNRoute] = {}
@@ -1002,6 +1024,7 @@ def select_cake_gdn_prefill_variant(
     use_state_indices: bool,
     gates_present: bool,
     host_seq_lens: tuple[int, ...] | None = None,
+    sm_count: int | None = None,
 ) -> CakeGDNRoute:
     """Resolve host-visible non-CP metadata to one frozen GDN non-CP variant.
 
@@ -1036,6 +1059,15 @@ def select_cake_gdn_prefill_variant(
     differ on a device that exposes fewer SMs than the nominal count (a
     GB300 with 152 of the nominal 160) -- the launch grid is authoritative
     for the workspace, the resolver only picks the body.
+
+    ``sm_count`` is the SM count the launch sizes its grid with (the
+    device's; the architecture's nominal active-cluster count when absent).
+    It only decides between a gate-stream twin and its prefetch twin
+    (``_gatestream_full_pf``, ``_GATE_STREAM_PF_ARCHES``): the prefetch twin
+    when the launch grid gives some CTA a second tile, else the gate-stream
+    twin itself, as the prefetch twin issues no prefetch when each CTA owns
+    one tile.  The launch evaluates the same grid rule with the same count,
+    so the two agree.
     """
 
     if arch not in _ARCH_ACTIVE_CLUSTERS:
@@ -1213,7 +1245,9 @@ def select_cake_gdn_prefill_variant(
         "USE_STATE_INDICES": int(use_state_indices),
     }
 
-    def _schedule_attr(*, gate_stream_full: bool) -> str:
+    def _schedule_attr(
+        *, gate_stream_full: bool, initial_state_prefetch: bool = False
+    ) -> str:
         return _prefill_schedule_attr(
             dvsplit=dvsplit,
             use_initial_state=use_initial_state,
@@ -1225,6 +1259,7 @@ def select_cake_gdn_prefill_variant(
             sm100a_state_inp_late=sm100a_state_inp_late,
             sm103a_role_rebalanced=sm103a_role_rebalanced,
             gate_stream_full=gate_stream_full,
+            initial_state_prefetch=initial_state_prefetch,
         )
 
     # The sm_107a sequential twin of the resolved schedule (`cake_gdn_prefill_seq_schedule`): a
@@ -1232,10 +1267,15 @@ def select_cake_gdn_prefill_variant(
     # gate-stream twin, whose `_sm107a_i64meta` record is the one that exists on sm_107a (the
     # gate-stream base record lists the other architectures only), so the gate-stream
     # fallback below probes the twin-resolved name.
-    def _seq_schedule_attr(*, gate_stream_full: bool) -> str:
+    def _seq_schedule_attr(
+        *, gate_stream_full: bool, initial_state_prefetch: bool = False
+    ) -> str:
         return cake_gdn_prefill_seq_schedule(
             arch,
-            _schedule_attr(gate_stream_full=gate_stream_full),
+            _schedule_attr(
+                gate_stream_full=gate_stream_full,
+                initial_state_prefetch=initial_state_prefetch,
+            ),
             use_state_indices=use_state_indices,
         )
 
@@ -1258,6 +1298,32 @@ def select_cake_gdn_prefill_variant(
         # did before the twin existed; only a missing base fails closed below.
         gate_stream_full = False
         schedule_attr = _seq_schedule_attr(gate_stream_full=False)
+    if (
+        gate_stream_full
+        and "_gatestream_full" in schedule_attr
+        and arch in _GATE_STREAM_PF_ARCHES
+    ):
+        # The gate-stream twin's prefetch twin asks L2 for the initial state of each tile that
+        # follows another tile on its CTA.  It issues no prefetch when each CTA owns one tile, so
+        # that launch keeps the twin without it.  The gate-stream decision above stays on the
+        # nominal count (the Cake rule's mirror); the launch grid here takes the launch's count.
+        launch_grid_x = _cake_gdn_prefill_grid_x(
+            total_tiles,
+            sm_count or _ARCH_ACTIVE_CLUSTERS[arch],
+            dvsplit,
+            max_seq_len,
+            host_seq_lens,
+        )
+        prefetch_schedule_attr = _seq_schedule_attr(
+            gate_stream_full=True, initial_state_prefetch=True
+        )
+        if launch_grid_x < total_tiles and _has_variant(
+            arch=arch,
+            domain="prefill",
+            schedule_attr=prefetch_schedule_attr,
+            specializations=specializations,
+        ):
+            schedule_attr = prefetch_schedule_attr
     if (
         arch == "sm_107a"
         and dvsplit

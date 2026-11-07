@@ -11,7 +11,7 @@ through FlashInfer.  The package registries (``cake_jit.py`` / ``jit.py`` /
 
 The manifest's ``package`` field is the dotted import path of the package
 directory (``flashinfer.experimental.cake_mok_bf16``,
-``flashinfer.cake_rmsnorm_det_train_backend``): the one spelling every exporter
+``flashinfer.experimental.cake.cake_rmsnorm_det_train``): the one spelling every exporter
 writes and this checker compares (``Package.name``); a directory path is not
 accepted.  ``name`` is the unique key of ``libraries``; ``closure_sha256`` is
 not unique (two entries of one program and architecture, for example two tile
@@ -42,8 +42,8 @@ In-tree checks (``--in-tree``, the default):
 * the ``cake_build.py`` files of all checked packages are byte-identical;
 * ``common.requires.tvm_ffi.python`` equals line 1 of ``requirements.txt``;
 * every package a package requires (``Package.requires``: a package it imports
-  as its sibling, as the numerical-mode ``dense_projection_gemm`` imports the
-  deterministic ``dense_projection_det_gemm``) is a row of this table with the
+  as its sibling, as the non-deterministic ``cake_dense_gemm_nondet_train`` imports
+  the deterministic ``cake_dense_gemm_det_train``) is a row of this table with the
   same parent package.
 
 Vendored gate (``--vendored-gate``; combinable with ``--package``): the form
@@ -279,7 +279,7 @@ def refs_lm_head_det_loss(package_dir: Path, loader: str) -> set[str]:
 
 
 def refs_lm_head_loss(package_dir: Path, loader: str) -> set[str]:
-    """The non-deterministic package ``flashinfer.experimental.cake.cake_lm_head_loss``: the registry shape of
+    """The non-deterministic package ``flashinfer.experimental.cake.cake_lm_head_nondet_train``: the registry shape of
     :func:`refs_lm_head_det_loss`; the stage's library stem is ``cake_lm_head_loss_<unit>``."""
     registry = module_literals(package_dir / loader)["_REGISTRY"]
     return {
@@ -310,7 +310,7 @@ def refs_moe_grouped_det_gemm(package_dir: Path, loader: str) -> set[str]:
     return refs
 
 
-# The non-deterministic package ``flashinfer.experimental.cake.cake_moe_grouped_gemm`` has the same registry shape
+# The non-deterministic package ``flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train`` has the same registry shape
 # (``PROGRAMS`` + ``ROUTES`` with per-stage specializations).
 refs_moe_grouped_gemm = refs_moe_grouped_det_gemm
 
@@ -371,20 +371,20 @@ class Package:
 # nvfp4_attention, cake_nvfp4_ptilemax_attention, vsa_sm90, Kimi-K3 AttnRes, deepgemm_fp8_gemm, deepgemm_batched_gemm and deepgemm_mega_gate MODULES) or per-stage sub-records carrying ``library`` (dsa_train).
 PACKAGES: tuple[Package, ...] = (
     Package(
-        "flashinfer.cake_rmsnorm_det_train_backend",
-        "flashinfer/cake_rmsnorm_det_train_backend",
+        "flashinfer.experimental.cake.cake_rmsnorm_det_train",
+        "flashinfer/experimental/cake/cake_rmsnorm_det_train",
         "cake_jit.py",
         refs_generic,
     ),
     Package(
-        "flashinfer.cake_rmsnorm_train_backend",
-        "flashinfer/cake_rmsnorm_train_backend",
+        "flashinfer.experimental.cake.cake_rmsnorm_nondet_train",
+        "flashinfer/experimental/cake/cake_rmsnorm_nondet_train",
         "cake_jit.py",
         refs_generic,
     ),
     Package(
-        "flashinfer.cake_causal_conv1d_det_train_backend",
-        "flashinfer/cake_causal_conv1d_det_train_backend",
+        "flashinfer.experimental.cake.cake_causal_conv1d_det_train",
+        "flashinfer/experimental/cake/cake_causal_conv1d_det_train",
         "cake_jit.py",
         refs_with_kcp,
     ),
@@ -473,8 +473,8 @@ PACKAGES: tuple[Package, ...] = (
         refs_generic,
     ),
     Package(
-        "flashinfer.experimental.cake_kda_det_train",
-        "flashinfer/experimental/cake_kda_det_train",
+        "flashinfer.experimental.cake.cake_kda_det_train",
+        "flashinfer/experimental/cake/cake_kda_det_train",
         "cake_jit.py",
         refs_generic,
     ),
@@ -509,26 +509,26 @@ PACKAGES: tuple[Package, ...] = (
         refs_shipped_modules,
     ),
     Package(
-        "flashinfer.experimental.cake_moe_grouped_det_gemm",
-        "flashinfer/experimental/cake_moe_grouped_det_gemm",
+        "flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train",
+        "flashinfer/experimental/cake/cake_moe_grouped_gemm_det_train",
         "cake_jit.py",
         refs_moe_grouped_det_gemm,
     ),
     Package(
-        "flashinfer.experimental.cake.cake_moe_grouped_gemm",
-        "flashinfer/experimental/cake/cake_moe_grouped_gemm",
+        "flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train",
+        "flashinfer/experimental/cake/cake_moe_grouped_gemm_nondet_train",
         "cake_jit.py",
         refs_moe_grouped_gemm,
     ),
     Package(
-        "flashinfer.experimental.cake_lm_head_det_loss",
-        "flashinfer/experimental/cake_lm_head_det_loss",
+        "flashinfer.experimental.cake.cake_lm_head_det_train",
+        "flashinfer/experimental/cake/cake_lm_head_det_train",
         "cake_jit.py",
         refs_lm_head_det_loss,
     ),
     Package(
-        "flashinfer.experimental.cake.cake_lm_head_loss",
-        "flashinfer/experimental/cake/cake_lm_head_loss",
+        "flashinfer.experimental.cake.cake_lm_head_nondet_train",
+        "flashinfer/experimental/cake/cake_lm_head_nondet_train",
         "cake_jit.py",
         refs_lm_head_loss,
     ),
@@ -539,18 +539,18 @@ PACKAGES: tuple[Package, ...] = (
         refs_mok_bf16,
     ),
     Package(
-        "flashinfer.experimental.dense_projection_det_gemm",
-        "flashinfer/experimental/dense_projection_det_gemm",
+        "flashinfer.experimental.cake.cake_dense_gemm_det_train",
+        "flashinfer/experimental/cake/cake_dense_gemm_det_train",
         "cake_jit.py",
         refs_generic,
     ),
     Package(
-        "flashinfer.experimental.dense_projection_gemm",
-        "flashinfer/experimental/dense_projection_gemm",
+        "flashinfer.experimental.cake.cake_dense_gemm_nondet_train",
+        "flashinfer/experimental/cake/cake_dense_gemm_nondet_train",
         "cake_jit.py",
         refs_generic,
-        # its deterministic path calls the deterministic package's programs
-        requires=("flashinfer.experimental.dense_projection_det_gemm",),
+        # its fixed-order rows run the deterministic package's programs
+        requires=("flashinfer.experimental.cake.cake_dense_gemm_det_train",),
     ),
     Package(
         "flashinfer.experimental.cake_stepfun_moe",
