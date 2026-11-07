@@ -653,8 +653,13 @@ def test_wide_tail_plan(clusters, max_seq_len, sm_count, expected):
 # Persistent wide route (main_wide_persistent + reduce_w<N>_tile_flags)
 # ---------------------------------------------------------------------------
 
+# Devices as the route keys them: ((major, minor) compute capability, SM count).
+B200 = ((10, 0), 148)
+B300 = ((10, 3), 148)
+GB300 = ((10, 3), 152)
+
 # (batch, q_len, num_heads, kv): wide tail plans on both sides of the item-length bound and of
-# the reducer class, and a uniform plan.  On 148 SMs: (13, 64, 12, 8192) and (13, 128, 12, 10240)
+# the reducer class, and a uniform plan.  On B200: (13, 64, 12, 8192) and (13, 128, 12, 10240)
 # merge on the two-warp reducer and take the persistent route; (1, 1024, 12, 8192) merges on the
 # single-warp reducer, (5, 256, 24, 24576) streams items longer than PERSISTENT_MAX_ITEM_KV and
 # (1, 1024, 12, 16384) is a uniform plan (no unsplit item), so these keep the shipped kernels.
@@ -673,9 +678,15 @@ def _sm_count() -> int:
     )
 
 
-def _persistent_route(batch, q_len, num_heads, kv, sm_count):
+def _device():
+    """``(compute capability, SM count)`` of the current CUDA device."""
+    return tuple(get_compute_capability(torch.device("cuda"))), _sm_count()
+
+
+def _persistent_route(batch, q_len, num_heads, kv, device):
     from flashinfer.mla.cake_kimi_k3_mla import plan_attention, use_persistent_route
 
+    capability, sm_count = device
     plan = plan_attention(
         batch=batch,
         max_q_len=q_len,
@@ -683,7 +694,7 @@ def _persistent_route(batch, q_len, num_heads, kv, sm_count):
         max_seq_len=kv,
         sm_count=sm_count,
     )
-    return plan, use_persistent_route(plan, sm_count, kv)
+    return plan, use_persistent_route(plan, capability, sm_count, kv)
 
 
 def test_persistent_route_predicate():
@@ -693,51 +704,70 @@ def test_persistent_route_predicate():
         use_persistent_route,
     )
 
-    assert PERSISTENT_MAX_ITEM_KV[148] == 16384
-    assert PERSISTENT_SHIPPED_REDUCE_WARPS == {148: (1,)}
+    assert PERSISTENT_MAX_ITEM_KV == {B200: 16384}
+    assert PERSISTENT_SHIPPED_REDUCE_WARPS == {B200: (1,)}
     # Tail plans (unsplit full waves, split last wave) with a second round and idle pairs whose
     # merge runs on the two-warp reducer.
     for shape in ((13, 64, 12, 8192), (13, 128, 12, 8192), (13, 128, 12, 10240)):
-        plan, routed = _persistent_route(*shape, 148)
+        plan, routed = _persistent_route(*shape, B200)
         assert plan.wide and plan.n_full_items > 0 and 2 <= plan.num_split <= 32
         assert plan.reduce_kind == "reduce_w2", (shape, plan.reduce_kind)
         assert routed, shape
     # The same tail-plan conditions with a single-warp reducer (more than 1024 merge rows) keep
-    # the shipped kernels on 148 SMs; the reducer class alone decides.
+    # the shipped kernels on B200; the reducer class alone decides.
     for shape in (
         (4, 1024, 12, 8192),
         (1, 1024, 12, 8192),
         (13, 256, 12, 16384),
         (15, 64, 24, 16384),
     ):
-        plan, routed = _persistent_route(*shape, 148)
+        plan, routed = _persistent_route(*shape, B200)
         assert plan.wide and plan.n_full_items > 0 and 2 <= plan.num_split <= 32
         assert plan.reduce_kind == "reduce_w1", (shape, plan.reduce_kind)
         assert not routed, shape
         for warps in (2, 4):
             other = dataclasses.replace(plan, reduce_warps=warps)
-            assert use_persistent_route(other, 148, shape[3]), (shape, warps)
-    # Items longer than the bound, uniform plans, row tiles and an SM count without a bound keep
-    # the shipped kernels.
-    for shape, sm_count in (
-        ((5, 256, 24, 24576), 148),
-        ((1, 1024, 12, 16384), 148),
-        ((8, 2, 96, 342305), 148),
-        ((1, 1, 12, 40000), 148),
-        ((4, 1024, 12, 8192), 160),
-        ((13, 64, 12, 8192), 152),
+            assert use_persistent_route(other, *B200, shape[3]), (shape, warps)
+    # Items longer than the bound, uniform plans, row tiles and devices without a bound keep the
+    # shipped kernels.
+    for shape, device in (
+        ((5, 256, 24, 24576), B200),
+        ((1, 1024, 12, 16384), B200),
+        ((8, 2, 96, 342305), B200),
+        ((1, 1, 12, 40000), B200),
+        ((4, 1024, 12, 8192), ((10, 0), 160)),
+        ((13, 64, 12, 8192), GB300),
     ):
-        assert not _persistent_route(*shape, sm_count)[1], (shape, sm_count)
+        assert not _persistent_route(*shape, device)[1], (shape, device)
+
+
+def test_persistent_route_keys_on_compute_capability_and_sm_count():
+    from flashinfer.mla.cake_kimi_k3_mla import use_persistent_route
+
+    # Two-warp reducer tail plans that take the persistent route on B200 (compute capability 10.0,
+    # 148 SMs).  B300 (10.3) has the same SM count, hence the same plan, and keeps the shipped
+    # kernels whatever the plan's reducer class, as do GB300 (10.3, 152 SMs) and the B200
+    # compute capability on another SM count.
+    for shape in ((13, 64, 12, 8192), (13, 128, 12, 8192), (13, 128, 12, 10240)):
+        plan, routed = _persistent_route(*shape, B200)
+        assert routed, shape
+        b300_plan, b300_routed = _persistent_route(*shape, B300)
+        assert b300_plan == plan and not b300_routed, shape
+        for warps in (1, 2, 4):
+            other = dataclasses.replace(plan, reduce_warps=warps)
+            assert not use_persistent_route(other, *B300, shape[3]), (shape, warps)
+        for device in (GB300, ((10, 0), 152)):
+            assert not _persistent_route(*shape, device)[1], (shape, device)
 
 
 def test_persistent_cases_cover_both_paths_on_this_device():
     _skip_unless_sm100_family()
     from flashinfer.mla.cake_kimi_k3_mla import PERSISTENT_MAX_ITEM_KV
 
-    sm_count = _sm_count()
-    if PERSISTENT_MAX_ITEM_KV.get(sm_count) is None:
-        pytest.skip(f"no persistent wide route on {sm_count} SMs")
-    routes = [_persistent_route(*case, sm_count)[1] for case in PERSISTENT_CASES]
+    device = _device()
+    if device not in PERSISTENT_MAX_ITEM_KV:
+        pytest.skip(f"no persistent wide route on {device}")
+    routes = [_persistent_route(*case, device)[1] for case in PERSISTENT_CASES]
     assert any(routes) and not all(routes), routes
 
 
@@ -752,8 +782,7 @@ def test_persistent_route_is_bitwise_the_shipped_kernels(
     import flashinfer.mla.cake_kimi_k3_mla as host
 
     device = torch.device("cuda")
-    sm_count = _sm_count()
-    plan, expected = _persistent_route(batch, q_len, num_heads, kv, sm_count)
+    plan, expected = _persistent_route(batch, q_len, num_heads, kv, _device())
     case = _make_case(
         batch, [q_len] * batch, [kv] * batch, num_heads, seed=645501, device=device
     )
@@ -822,7 +851,7 @@ def test_persistent_route_is_bitwise_the_shipped_kernels(
         g.replay()
         torch.cuda.synchronize()
         assert torch.equal(out, eager)
-    # The shipped kernels of the same plan (no persistent route on any SM count).
+    # The shipped kernels of the same plan (no persistent route on any device).
     monkeypatch.setattr(host, "PERSISTENT_MAX_ITEM_KV", {})
     shipped, shipped_out = launcher()
     assert not shipped.route_metadata["persistent"]
@@ -833,3 +862,58 @@ def test_persistent_route_is_bitwise_the_shipped_kernels(
     shipped.launch()
     torch.cuda.synchronize()
     assert torch.equal(shipped_out, eager)
+
+
+def test_persistent_route_reads_the_device_compute_capability(monkeypatch):
+    """The launcher keys the route on the device's compute capability as well as its SM count: on
+    a device with the persistent route, the same plan under the B300 compute capability (same SM
+    count, same programs) keeps the shipped kernels."""
+    _skip_unless_sm100_family()
+    import flashinfer.mla.cake_kimi_k3_mla as host
+
+    device = torch.device("cuda")
+    capability, sm_count = _device()
+    if (capability, sm_count) not in host.PERSISTENT_MAX_ITEM_KV:
+        pytest.skip(f"no persistent wide route on {(capability, sm_count)}")
+    batch, q_len, num_heads, kv = PERSISTENT_CASES[0]
+    plan, expected = _persistent_route(
+        batch, q_len, num_heads, kv, (capability, sm_count)
+    )
+    assert expected
+    case = _make_case(
+        batch, [q_len] * batch, [kv] * batch, num_heads, seed=645502, device=device
+    )
+    total_q = case["query"].shape[0]
+    arch = host._device_facts(host._device_index(device))[0]
+
+    def route_metadata():
+        attention = host.KimiK3MlaFp8PagedAttention(
+            query=case["query"],
+            kv_cache=case["kv_cache"],
+            block_tables=case["block_tables"],
+            seq_lens=case["seq_lens"],
+            out=torch.empty(
+                (total_q, num_heads, LATENT), dtype=torch.bfloat16, device=device
+            ),
+            workspace_buffer=torch.zeros(
+                host.workspace_bytes(plan.rows_max, plan.num_split),
+                dtype=torch.uint8,
+                device=device,
+            ),
+            bmm1_scale=case["bmm1_scale"],
+            cum_seq_lens_q=case["q_indptr"],
+            max_q_len=q_len,
+            max_seq_len=kv,
+        )
+        assert attention.plan == plan
+        return attention.route_metadata
+
+    assert route_metadata()["persistent"]
+    monkeypatch.setattr(host, "_device_facts", lambda index: (arch, B300[0], sm_count))
+    shipped = route_metadata()
+    assert not shipped["persistent"]
+    assert (
+        shipped["main_module"]
+        == get_cake_kimi_k3_mla_kernel(plan.main_kind, arch=arch)["name"]
+    )
+    assert shipped["reducer"] == plan.reduce_kind
