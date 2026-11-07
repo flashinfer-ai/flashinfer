@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, TypeVar
 
@@ -124,6 +124,8 @@ class DAWorkspaceLane:
     previous_conditional_node_handle: int = 0
     # Successful SWITCH injections sharing this lane in the pending outer graph.
     pending_invocation_count: int = 0
+    # Per-invocation buffers referenced by child graphs, retained through the graph lease.
+    capture_resources: list[Any] = field(default_factory=list)
     # Live graph lease currently pinning this lane, if any.
     leased: bool = False
 
@@ -132,6 +134,7 @@ class DAWorkspaceLane:
         self.pending_capture_id = None
         self.previous_conditional_node_handle = 0
         self.pending_invocation_count = 0
+        self.capture_resources.clear()
 
 
 @dataclass(frozen=True)
@@ -219,6 +222,8 @@ class DACaptureOutcome:
     topology: DAGraphTopology
     # Native conditional node that terminates this workspace-using invocation.
     conditional_node_handle: int
+    # Per-invocation storage referenced by the captured child graphs.
+    retained_resources: tuple[Any, ...] = ()
 
 
 def tensor_content_fingerprint(*tensors: torch.Tensor) -> str:
@@ -702,6 +707,7 @@ class DAMoEDispatcher:
         lane.pending_capture_id = topology.capture_id
         lane.previous_conditional_node_handle = outcome.conditional_node_handle
         lane.pending_invocation_count += 1
+        lane.capture_resources.extend(outcome.retained_resources)
         self._bindings.move_to_end(signature)
         binding.capture_count += 1
         binding.last_capture_id = topology.capture_id
