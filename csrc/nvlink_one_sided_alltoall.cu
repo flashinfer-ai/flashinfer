@@ -120,13 +120,72 @@ void resolveRankMask(bool enableRankMask, Optional<TensorView> const& activeRank
   }
 }
 
-// All offsets and capacities are per rank. Payload capacities are padded so
-// the following phase's control buffers remain aligned.
-meta::MoeA2AWorkspaceLayout calculateWorkspaceLayout(int64_t epSize, int64_t maxNumTokens,
-                                                     int64_t topK, int64_t dispatchBytes,
-                                                     int64_t combineInputBytes,
-                                                     int64_t combineRecvBytes,
-                                                     int64_t eplbStatsNumExperts, bool canUseCft) {
+// ============================================================================
+// Workspace layout
+// ============================================================================
+
+// Bytes of one row of a sentinel payload format: the payload and its scales, each a whole number
+// of 16-byte vectors.
+struct SentinelRowBytes {
+  int64_t payload;
+  int64_t scale;
+};
+
+SentinelRowBytes sentinelRowBytes(int64_t payloadFormat, int64_t hiddenSize) {
+  // Row bytes are kernel ints: hidden sizes beyond this bound are rejected, not wrapped.
+  TVM_FFI_ICHECK(hiddenSize > 0 && hiddenSize <= (1 << 24))
+      << "Invalid sentinel hidden size " << hiddenSize;
+  switch (payloadFormat) {
+    case sentinel::kBf16:
+      TVM_FFI_ICHECK(hiddenSize % 8 == 0)
+          << "Sentinel BF16 rows need hidden_size % 8 == 0, got " << hiddenSize;
+      return {2 * hiddenSize, 0};
+    case sentinel::kMxfp8:
+      TVM_FFI_ICHECK(hiddenSize % 512 == 0)
+          << "Sentinel MXFP8 rows need hidden_size % 512 == 0, got " << hiddenSize;
+      return {hiddenSize, hiddenSize / 32};
+    case sentinel::kFp8Block128:
+      TVM_FFI_ICHECK(hiddenSize % 512 == 0)
+          << "Sentinel FP8 block-128 rows need hidden_size % 512 == 0, got " << hiddenSize;
+      return {hiddenSize, hiddenSize / 32};
+    case sentinel::kNvfp4:
+      TVM_FFI_ICHECK(hiddenSize % 256 == 0)
+          << "Sentinel NVFP4 rows need hidden_size % 256 == 0, got " << hiddenSize;
+      return {hiddenSize / 2, hiddenSize / 16};
+    default:
+      TVM_FFI_LOG_AND_THROW(ValueError) << "Unknown sentinel payload format " << payloadFormat;
+  }
+  return {};
+}
+
+// Dispatch blocks per token slot: one per kNumThreads 16-byte vectors of the row.
+int64_t sentinelDispatchBlocksPerToken(SentinelRowBytes const& row) {
+  int64_t const vectors = (row.payload + row.scale) / 16;
+  return (vectors + sentinel::kNumThreads - 1) / sentinel::kNumThreads;
+}
+
+// Sentinel workspace bytes per (source rank, token) row, alignment padding aside: what the
+// sentinel token capacity multiplies. Landing rows of the payload, the scales, the weights and two
+// expert-id sets, a combine landing row and the expert-id and weight receive rows.
+int64_t sentinelBytesPerRow(int64_t topK, SentinelRowBytes const& row, int64_t hiddenSize) {
+  int64_t const topkRowBytes = 16 * sentinel::topk_row_vectors(topK);
+  return row.payload + row.scale + 3 * topkRowBytes + 2 * hiddenSize +
+         2 * topK * static_cast<int64_t>(sizeof(int32_t));
+}
+
+// The sentinel round state: int32 words (RoundStateWord) on their own cache line, then the uint64
+// receive-source mask of every token slot.
+constexpr int64_t kSentinelSourceMaskOffset = kCachelineAlignment;
+
+// The layout of one rank's workspace slice. Fence regions come first, in the order of the
+// metainfo indices, with the CFT regions among them when canUseCft; the sentinel regions follow
+// when sentinelMaxNumTokens > 0, each on a kWorkspaceAlignment boundary. Payload capacities are
+// padded so the following regions stay aligned.
+meta::MoeA2AWorkspaceLayout calculateWorkspaceLayout(
+    int64_t epSize, int64_t maxNumTokens, int64_t topK, int64_t dispatchBytes,
+    int64_t combineInputBytes, int64_t combineRecvBytes, int64_t eplbStatsNumExperts,
+    bool canUseCft, int64_t sentinelMaxNumTokens, int64_t sentinelPayloadFormat,
+    int64_t sentinelHiddenSize) {
   using namespace meta;
   TVM_FFI_ICHECK(epSize > 0 && epSize <= tl::kMaxRanks) << "Invalid EP size: " << epSize;
   TVM_FFI_ICHECK(maxNumTokens > 0 && maxNumTokens <= std::numeric_limits<int32_t>::max())
@@ -135,18 +194,18 @@ meta::MoeA2AWorkspaceLayout calculateWorkspaceLayout(int64_t epSize, int64_t max
   TVM_FFI_ICHECK(eplbStatsNumExperts >= 0 &&
                  eplbStatsNumExperts <= std::numeric_limits<int32_t>::max())
       << "Invalid EPLB expert capacity: " << eplbStatsNumExperts;
+  TVM_FFI_ICHECK(dispatchBytes > 0 && combineInputBytes > 0)
+      << "Dispatch and combine input payload capacities must be positive";
   TVM_FFI_ICHECK(canUseCft || combineRecvBytes == 0)
       << "A combine receive payload requires CFT support";
+  TVM_FFI_ICHECK(sentinelMaxNumTokens >= 0 && sentinelMaxNumTokens <= maxNumTokens)
+      << "Sentinel token capacity must be in [0, max_num_tokens], got " << sentinelMaxNumTokens;
 
-  auto alignedBytes = [](int64_t bytes) {
+  auto aligned = [](int64_t bytes) {
     TVM_FFI_ICHECK(bytes >= 0 && bytes <= std::numeric_limits<int64_t>::max() - kWorkspaceAlignment)
-        << "Invalid workspace payload capacity: " << bytes;
+        << "Invalid workspace region capacity: " << bytes;
     return static_cast<int64_t>(alignOffset(bytes, kWorkspaceAlignment));
   };
-  dispatchBytes = alignedBytes(dispatchBytes);
-  combineInputBytes = alignedBytes(combineInputBytes);
-  combineRecvBytes = alignedBytes(combineRecvBytes);
-
   MoeA2AWorkspaceLayout layout{};
   int64_t offset = 0;
   auto reserve = [&](MoeA2AMetaInfoIndex index, int64_t bytes,
@@ -162,9 +221,10 @@ meta::MoeA2AWorkspaceLayout calculateWorkspaceLayout(int64_t epSize, int64_t max
   int64_t const rankCountsBytes = epSize * sizeof(int32_t);
   int64_t const combineSlots = epSize * maxNumTokens;
 
+  // Fence protocol. Dispatch writes the counters and routes; combine reuses the completed routes
+  // and pulls from the peers' combine input. CFT counted writes count the bytes they receive and
+  // push the combine partials into a receive inbox instead.
   reserve(FLAG_VAL_OFFSET_INDEX, sizeof(uint32_t));
-
-  // Dispatch writes these counters and routes; combine reuses the completed routes.
   reserve(LOCAL_TOKEN_COUNTER_OFFSET_INDEX, sizeof(int32_t));
   reserve(SEND_COUNTERS_OFFSET_INDEX, rankCountsBytes);
   reserve(RECV_COUNTERS_OFFSET_INDEX, 2 * rankCountsBytes);
@@ -180,10 +240,8 @@ meta::MoeA2AWorkspaceLayout calculateWorkspaceLayout(int64_t epSize, int64_t max
           kCachelineAlignment);
   reserve(EPLB_GATHERED_STATS_OFFSET_INDEX, epSize * eplbStatsNumExperts * sizeof(int32_t),
           kCachelineAlignment);
-  reserve(DISPATCH_PAYLOAD_OFFSET_INDEX, dispatchBytes, kWorkspaceAlignment);
-  layout[DISPATCH_PAYLOAD_SIZE_INDEX] = dispatchBytes;
-
-  // Fence pulls from combine input; CFT pushes into the separate receive inbox.
+  layout[DISPATCH_PAYLOAD_SIZE_INDEX] = aligned(dispatchBytes);
+  reserve(DISPATCH_PAYLOAD_OFFSET_INDEX, layout[DISPATCH_PAYLOAD_SIZE_INDEX], kWorkspaceAlignment);
   reserve(COMBINE_COMPLETION_FLAGS_OFFSET_INDEX, rankCountsBytes, kCachelineAlignment);
   if (canUseCft) {
     reserve(COMBINE_COUNTED_WRITE_COUNTERS_OFFSET_INDEX, combineSlots * tl::kCftCounterStride,
@@ -191,27 +249,71 @@ meta::MoeA2AWorkspaceLayout calculateWorkspaceLayout(int64_t epSize, int64_t max
     reserve(COMBINE_COUNTER_BASELINE_OFFSET_INDEX, combineSlots * sizeof(uint64_t),
             kCachelineAlignment);
   }
-  reserve(COMBINE_INPUT_OFFSET_INDEX, combineInputBytes, kWorkspaceAlignment);
-  layout[COMBINE_INPUT_SIZE_INDEX] = combineInputBytes;
+  layout[COMBINE_INPUT_SIZE_INDEX] = aligned(combineInputBytes);
+  reserve(COMBINE_INPUT_OFFSET_INDEX, layout[COMBINE_INPUT_SIZE_INDEX], kWorkspaceAlignment);
   if (canUseCft) {
-    reserve(COMBINE_RECV_OFFSET_INDEX, combineRecvBytes, kWorkspaceAlignment);
-    layout[COMBINE_RECV_SIZE_INDEX] = combineRecvBytes;
+    layout[COMBINE_RECV_SIZE_INDEX] = aligned(combineRecvBytes);
+    reserve(COMBINE_RECV_OFFSET_INDEX, layout[COMBINE_RECV_SIZE_INDEX], kWorkspaceAlignment);
   }
 
+  // Sentinel protocol: sentinelMaxNumTokens * epSize rows (source rank, token).
+  if (sentinelMaxNumTokens > 0) {
+    TVM_FFI_ICHECK(epSize <= sentinel::kMaxRanks)
+        << "The sentinel protocol supports at most " << sentinel::kMaxRanks << " EP ranks";
+    TVM_FFI_ICHECK(topK <= sentinel::kMaxTopK)
+        << "The sentinel protocol supports top_k <= " << sentinel::kMaxTopK;
+    auto const row = sentinelRowBytes(sentinelPayloadFormat, sentinelHiddenSize);
+    int64_t const rows = epSize * sentinelMaxNumTokens;
+    int64_t const topkRowBytes = 16 * sentinel::topk_row_vectors(topK);
+    reserve(SENTINEL_STATE_OFFSET_INDEX,
+            kSentinelSourceMaskOffset + sentinelMaxNumTokens * sizeof(uint64_t),
+            kWorkspaceAlignment);
+    reserve(SENTINEL_PAYLOAD_ROWS_OFFSET_INDEX, aligned(rows * row.payload), kWorkspaceAlignment);
+    reserve(SENTINEL_SCALE_ROWS_OFFSET_INDEX, aligned(rows * row.scale), kWorkspaceAlignment);
+    reserve(SENTINEL_WEIGHT_ROWS_OFFSET_INDEX, aligned(rows * topkRowBytes), kWorkspaceAlignment);
+    layout[SENTINEL_ID_ROW_SET_SIZE_INDEX] = aligned(rows * topkRowBytes);
+    reserve(SENTINEL_ID_ROWS_OFFSET_INDEX, 2 * layout[SENTINEL_ID_ROW_SET_SIZE_INDEX],
+            kWorkspaceAlignment);
+    reserve(SENTINEL_COMBINE_ROWS_OFFSET_INDEX, aligned(rows * 2 * sentinelHiddenSize),
+            kWorkspaceAlignment);
+    reserve(SENTINEL_RECV_IDS_OFFSET_INDEX, rows * topK * sizeof(int32_t), kWorkspaceAlignment);
+    reserve(SENTINEL_RECV_WEIGHTS_OFFSET_INDEX, rows * topK * sizeof(uint32_t),
+            kCachelineAlignment);
+    layout[SENTINEL_MAX_NUM_TOKENS_INDEX] = sentinelMaxNumTokens;
+    layout[SENTINEL_PAYLOAD_FORMAT_INDEX] = sentinelPayloadFormat;
+    layout[SENTINEL_HIDDEN_SIZE_INDEX] = sentinelHiddenSize;
+  }
+
+  layout[EP_SIZE_INDEX] = epSize;
   layout[MAX_NUM_TOKENS_INDEX] = maxNumTokens;
   layout[TOP_K_INDEX] = topK;
-  layout[EP_SIZE_INDEX] = epSize;
   layout[EPLB_STATS_NUM_EXPERTS_INDEX] = eplbStatsNumExperts;
   layout[CFT_ENABLED_INDEX] = canUseCft;
-  layout[WORKSPACE_SIZE_INDEX] = offset;
+  layout[WORKSPACE_SIZE_INDEX] = static_cast<int64_t>(alignOffset(offset, kWorkspaceAlignment));
   return layout;
 }
 
-// Write the workspace layout into metainfo, a CPU int64 tensor of NUM_METAINFO_FIELDS.
+// The layout `layout`'s configuration fields give: a metainfo tensor is valid only if it equals it.
+meta::MoeA2AWorkspaceLayout recalculateWorkspaceLayout(meta::MoeA2AWorkspaceLayout const& layout) {
+  using namespace meta;
+  return calculateWorkspaceLayout(
+      layout[EP_SIZE_INDEX], layout[MAX_NUM_TOKENS_INDEX], layout[TOP_K_INDEX],
+      layout[DISPATCH_PAYLOAD_SIZE_INDEX], layout[COMBINE_INPUT_SIZE_INDEX],
+      layout[COMBINE_RECV_SIZE_INDEX], layout[EPLB_STATS_NUM_EXPERTS_INDEX],
+      layout[CFT_ENABLED_INDEX], layout[SENTINEL_MAX_NUM_TOKENS_INDEX],
+      layout[SENTINEL_PAYLOAD_FORMAT_INDEX], layout[SENTINEL_HIDDEN_SIZE_INDEX]);
+}
+
+// Write the workspace layout into metainfo, a CPU int64 tensor of NUM_METAINFO_FIELDS: CFT
+// regions with a combineRecvBytes receive inbox when canUseCft, sentinel regions for steps of at
+// most sentinelMaxNumTokens tokens per rank (none when 0) in sentinelPayloadFormat
+// (moe_alltoall_sentinel::PayloadFormat) at sentinelHiddenSize.
 void moeA2AGetWorkspaceLayoutOp(int64_t epSize, int64_t maxNumTokens, int64_t topK,
                                 int64_t dispatchBytes, int64_t combineInputBytes,
                                 int64_t combineRecvBytes, int64_t eplbStatsNumExperts,
-                                bool canUseCft, TensorView metainfo) {
+                                bool canUseCft, int64_t sentinelMaxNumTokens,
+                                int64_t sentinelPayloadFormat, int64_t sentinelHiddenSize,
+                                TensorView metainfo) {
   CHECK_CPU(metainfo);
   CHECK_CONTIGUOUS(metainfo);
   CHECK_INPUT_TYPE(metainfo, dl_int64);
@@ -219,173 +321,42 @@ void moeA2AGetWorkspaceLayoutOp(int64_t epSize, int64_t maxNumTokens, int64_t to
       << "metainfo must have NUM_METAINFO_FIELDS elements";
   auto const layout =
       calculateWorkspaceLayout(epSize, maxNumTokens, topK, dispatchBytes, combineInputBytes,
-                               combineRecvBytes, eplbStatsNumExperts, canUseCft);
+                               combineRecvBytes, eplbStatsNumExperts, canUseCft,
+                               sentinelMaxNumTokens, sentinelPayloadFormat, sentinelHiddenSize);
   std::copy(layout.begin(), layout.end(), static_cast<int64_t*>(metainfo.data_ptr()));
 }
 
-// ============================================================================
-// Sentinel protocol: workspace regions
-// ============================================================================
-
-// Bytes of one row of a sentinel payload format: the payload (landing and receive rows), its
-// scales as received, and its scales on the wire (MXFP8 scale bytes travel as 16-bit lanes).
-struct SentinelRowBytes {
-  int64_t payload;
-  int64_t scale;
-  int64_t wireScale;
-};
-
-SentinelRowBytes sentinelRowBytes(int64_t payloadFormat, int64_t hiddenSize) {
-  // Row bytes are kernel ints: hidden sizes beyond this bound are rejected, not wrapped.
-  TVM_FFI_ICHECK(hiddenSize > 0 && hiddenSize <= (1 << 24))
-      << "Invalid sentinel hidden size " << hiddenSize;
-  switch (payloadFormat) {
-    case sentinel::kBf16:
-      TVM_FFI_ICHECK(hiddenSize % 8 == 0)
-          << "Sentinel BF16 rows need hidden_size % 8 == 0, got " << hiddenSize;
-      return {2 * hiddenSize, 0, 0};
-    case sentinel::kMxfp8:
-      TVM_FFI_ICHECK(hiddenSize % 256 == 0)
-          << "Sentinel MXFP8 rows need hidden_size % 256 == 0, got " << hiddenSize;
-      return {hiddenSize, hiddenSize / 32, hiddenSize / 16};
-    case sentinel::kFp8Block128:
-      TVM_FFI_ICHECK(hiddenSize % 512 == 0)
-          << "Sentinel FP8 block-128 rows need hidden_size % 512 == 0, got " << hiddenSize;
-      return {hiddenSize, hiddenSize / 32, hiddenSize / 32};
-    case sentinel::kNvfp4:
-      TVM_FFI_ICHECK(hiddenSize % 256 == 0)
-          << "Sentinel NVFP4 rows need hidden_size % 256 == 0, got " << hiddenSize;
-      return {hiddenSize / 2, hiddenSize / 16, hiddenSize / 16};
-    default:
-      TVM_FFI_LOG_AND_THROW(ValueError) << "Unknown sentinel payload format " << payloadFormat;
-  }
-  return {};
-}
-
-// Dispatch blocks per token slot: one per kNumThreads 16-byte vectors of the wire row.
-int64_t sentinelDispatchBlocksPerToken(SentinelRowBytes const& row) {
-  int64_t const vectors = (row.payload + row.wireScale) / 16;
-  return (vectors + sentinel::kNumThreads - 1) / sentinel::kNumThreads;
-}
-
-// Round state at SENTINEL_STATE_OFFSET_INDEX: int32 words (RoundStateWord) on their own cache line,
-// then the uint64 receive-source mask of every token slot.
-constexpr int64_t kSentinelSourceMaskOffset = kCachelineAlignment;
-
-// Bytes of the sentinel regions of one rank for maxNumTokens tokens per source rank: the round
-// state, the landing rows (one set of payload, scale and weight rows, two sets of expert-id
-// rows), the combine landing rows and the receive buffers. Each region and each landing row
-// group starts on a kWorkspaceAlignment boundary.
-struct SentinelRegionBytes {
-  int64_t state;
-  int64_t payload, scale, weights, idsSet;  // landing row groups
-  int64_t landing;                          // all of them
-  int64_t combine;
-  int64_t recv;
-};
-
-SentinelRegionBytes sentinelRegionBytes(int64_t epSize, int64_t maxNumTokens, int64_t topK,
-                                        SentinelRowBytes const& row, int64_t hiddenSize) {
-  auto aligned = [](int64_t bytes) {
-    return static_cast<int64_t>(alignOffset(bytes, meta::kWorkspaceAlignment));
-  };
-  int64_t const rows = epSize * maxNumTokens;  // (source rank, token)
-  int64_t const topkRowBytes = 16 * sentinel::topk_row_vectors(topK);
-  SentinelRegionBytes bytes{};
-  bytes.state = kSentinelSourceMaskOffset + maxNumTokens * sizeof(uint64_t);
-  bytes.payload = aligned(rows * row.payload);
-  bytes.scale = aligned(rows * row.wireScale);
-  bytes.weights = aligned(rows * topkRowBytes);
-  bytes.idsSet = aligned(rows * topkRowBytes);
-  bytes.landing = bytes.payload + bytes.scale + bytes.weights + 2 * bytes.idsSet;
-  bytes.combine = aligned(rows * 2 * hiddenSize);
-  // Payload, scale, expert-id and weight rows, each starting on its own cache line.
-  bytes.recv = rows * (row.payload + row.scale + 2 * topK * sizeof(int32_t)) +
-               tl::kMaxPayloads * kCachelineAlignment;
-  return bytes;
-}
-
-// Sentinel workspace bytes per (source rank, token) row, alignment padding aside: what the token
-// limit multiplies.
-int64_t sentinelBytesPerRow(int64_t topK, SentinelRowBytes const& row, int64_t hiddenSize) {
-  int64_t const topkRowBytes = 16 * sentinel::topk_row_vectors(topK);
-  int64_t const landing = row.payload + row.wireScale + 3 * topkRowBytes;
-  int64_t const recv = row.payload + row.scale + 2 * topK * sizeof(int32_t);
-  return landing + 2 * hiddenSize + recv;
-}
-
-// Append the sentinel regions for steps of at most maxNumTokens tokens per rank to `layout`, after
-// every other region (whose offsets do not change).
-void appendSentinelRegions(meta::MoeA2AWorkspaceLayout& layout, int64_t maxNumTokens,
-                           int64_t payloadFormat, int64_t hiddenSize) {
-  using namespace meta;
-  int64_t const epSize = layout[EP_SIZE_INDEX];
-  int64_t const topK = layout[TOP_K_INDEX];
-  TVM_FFI_ICHECK_EQ(layout[SENTINEL_MAX_NUM_TOKENS_INDEX], 0)
-      << "The workspace layout already has sentinel regions";
-  TVM_FFI_ICHECK(epSize <= sentinel::kMaxRanks)
-      << "The sentinel protocol supports at most " << sentinel::kMaxRanks << " EP ranks";
-  TVM_FFI_ICHECK(topK <= sentinel::kMaxTopK)
-      << "The sentinel protocol supports top_k <= " << sentinel::kMaxTopK;
-  TVM_FFI_ICHECK(maxNumTokens > 0 && maxNumTokens <= layout[MAX_NUM_TOKENS_INDEX])
-      << "Sentinel token capacity must be in [1, max_num_tokens], got " << maxNumTokens;
-  auto const bytes = sentinelRegionBytes(epSize, maxNumTokens, topK,
-                                         sentinelRowBytes(payloadFormat, hiddenSize), hiddenSize);
-
-  int64_t offset = layout[WORKSPACE_SIZE_INDEX];
-  auto reserve = [&](MoeA2AMetaInfoIndex index, int64_t size) {
-    TVM_FFI_ICHECK(offset >= 0 &&
-                   offset <= std::numeric_limits<int64_t>::max() - kWorkspaceAlignment)
-        << "Workspace layout alignment overflows int64";
-    offset = static_cast<int64_t>(alignOffset(offset, kWorkspaceAlignment));
-    TVM_FFI_ICHECK(size >= 0 && size <= std::numeric_limits<int64_t>::max() - offset)
-        << "Workspace layout size overflows int64";
-    layout[index] = offset;
-    offset += size;
-  };
-  reserve(SENTINEL_STATE_OFFSET_INDEX, bytes.state);
-  reserve(SENTINEL_LANDING_OFFSET_INDEX, bytes.landing);
-  reserve(SENTINEL_COMBINE_LANDING_OFFSET_INDEX, bytes.combine);
-  reserve(SENTINEL_RECV_OFFSET_INDEX, bytes.recv);
-  layout[SENTINEL_RECV_SIZE_INDEX] = bytes.recv;
-
-  layout[SENTINEL_MAX_NUM_TOKENS_INDEX] = maxNumTokens;
-  layout[SENTINEL_PAYLOAD_FORMAT_INDEX] = payloadFormat;
-  layout[SENTINEL_HIDDEN_SIZE_INDEX] = hiddenSize;
-  layout[WORKSPACE_SIZE_INDEX] = offset;
-}
-
-// Landing regions of a layout with sentinel regions, as the kernels address them.
+// Landing rows of a layout with sentinel regions, as the kernels address them.
 sentinel::LandingLayout sentinelLandingLayout(meta::MoeA2AWorkspaceLayout const& layout) {
   using namespace meta;
-  int64_t const hiddenSize = layout[SENTINEL_HIDDEN_SIZE_INDEX];
-  auto const bytes = sentinelRegionBytes(
-      layout[EP_SIZE_INDEX], layout[SENTINEL_MAX_NUM_TOKENS_INDEX], layout[TOP_K_INDEX],
-      sentinelRowBytes(layout[SENTINEL_PAYLOAD_FORMAT_INDEX], hiddenSize), hiddenSize);
   sentinel::LandingLayout landing{};
-  landing.payload_offset = layout[SENTINEL_LANDING_OFFSET_INDEX];
-  landing.scale_offset = landing.payload_offset + bytes.payload;
-  landing.weights_offset = landing.scale_offset + bytes.scale;
-  landing.ids_offset = landing.weights_offset + bytes.weights;
-  landing.ids_set_bytes = bytes.idsSet;
-  landing.combine_offset = layout[SENTINEL_COMBINE_LANDING_OFFSET_INDEX];
+  landing.payload_offset = layout[SENTINEL_PAYLOAD_ROWS_OFFSET_INDEX];
+  landing.scale_offset = layout[SENTINEL_SCALE_ROWS_OFFSET_INDEX];
+  landing.weights_offset = layout[SENTINEL_WEIGHT_ROWS_OFFSET_INDEX];
+  landing.ids_offset = layout[SENTINEL_ID_ROWS_OFFSET_INDEX];
+  landing.ids_set_bytes = layout[SENTINEL_ID_ROW_SET_SIZE_INDEX];
+  landing.combine_offset = layout[SENTINEL_COMBINE_ROWS_OFFSET_INDEX];
   return landing;
 }
 
-// Arm this rank's landing rows: expert-id rows with kIdsSentinel bytes, the others with
-// kDataSentinel bytes. The round state is zero.
-void armSentinelRegions(uint8_t* rankWorkspace, meta::MoeA2AWorkspaceLayout const& layout,
-                        cudaStream_t stream) {
+// Init sentinel: fill this rank's landing rows with their sentinels, the payload rows with the
+// payload format's (sentinel::payload_sentinel), the expert-id rows with kIdsSentinel, the others
+// with kDataSentinel. The round state is zero.
+void initSentinelRegions(uint8_t* rankWorkspace, meta::MoeA2AWorkspaceLayout const& layout,
+                         cudaStream_t stream) {
   using namespace meta;
-  auto const landing = sentinelLandingLayout(layout);
-  auto memset = [&](int64_t begin, int value, int64_t end) {
-    TVM_FFI_ICHECK(cudaMemsetAsync(rankWorkspace + begin, value, end - begin, stream) ==
-                   cudaSuccess)
+  auto memset = [&](MoeA2AMetaInfoIndex begin, int value, MoeA2AMetaInfoIndex end) {
+    TVM_FFI_ICHECK(cudaMemsetAsync(rankWorkspace + layout[begin], value,
+                                   layout[end] - layout[begin], stream) == cudaSuccess)
         << "cudaMemsetAsync failed";
   };
-  memset(landing.payload_offset, 0xFF, landing.ids_offset);  // payload, scale and weight rows
-  memset(landing.ids_offset, 0x88, landing.ids_offset + 2 * landing.ids_set_bytes);
-  memset(landing.combine_offset, 0xFF, layout[SENTINEL_RECV_OFFSET_INDEX]);
+  // Each sentinel repeats one byte.
+  int const payloadSentinelByte =
+      sentinel::payload_sentinel(static_cast<int>(layout[SENTINEL_PAYLOAD_FORMAT_INDEX])) & 0xFF;
+  memset(SENTINEL_PAYLOAD_ROWS_OFFSET_INDEX, payloadSentinelByte, SENTINEL_SCALE_ROWS_OFFSET_INDEX);
+  memset(SENTINEL_SCALE_ROWS_OFFSET_INDEX, 0xFF, SENTINEL_ID_ROWS_OFFSET_INDEX);  // and weights
+  memset(SENTINEL_ID_ROWS_OFFSET_INDEX, 0x88, SENTINEL_COMBINE_ROWS_OFFSET_INDEX);
+  memset(SENTINEL_COMBINE_ROWS_OFFSET_INDEX, 0xFF, SENTINEL_RECV_IDS_OFFSET_INDEX);
 }
 
 // Workspace slices with a sentinel dispatch not combined yet. A sentinel combine reads routing
@@ -408,23 +379,6 @@ bool isSentinelRoundOpen(uint8_t const* rankWorkspace) {
   return g_open_sentinel_rounds.count(rankWorkspace) != 0;
 }
 
-// Append the sentinel regions to metainfo, a layout from moe_a2a_get_workspace_layout:
-// landing rows for steps of at most maxNumTokens tokens per rank in payloadFormat
-// (moe_alltoall_sentinel::PayloadFormat) at hiddenSize.
-void moeA2ASentinelExtendWorkspaceLayoutOp(TensorView metainfo, int64_t maxNumTokens,
-                                           int64_t payloadFormat, int64_t hiddenSize) {
-  using namespace meta;
-  auto layout = readWorkspaceLayout(metainfo);
-  auto const base =
-      calculateWorkspaceLayout(layout[EP_SIZE_INDEX], layout[MAX_NUM_TOKENS_INDEX],
-                               layout[TOP_K_INDEX], layout[DISPATCH_PAYLOAD_SIZE_INDEX],
-                               layout[COMBINE_INPUT_SIZE_INDEX], layout[COMBINE_RECV_SIZE_INDEX],
-                               layout[EPLB_STATS_NUM_EXPERTS_INDEX], layout[CFT_ENABLED_INDEX]);
-  TVM_FFI_ICHECK(layout == base) << "metainfo must be a layout from moe_a2a_get_workspace_layout";
-  appendSentinelRegions(layout, maxNumTokens, payloadFormat, hiddenSize);
-  std::copy(layout.begin(), layout.end(), static_cast<int64_t*>(metainfo.data_ptr()));
-}
-
 // Row geometry of a sentinel payload format at hiddenSize: (hidden-state row bytes, scale row
 // bytes, dispatch blocks per token slot, workspace bytes per (source rank, token) row). Raises for
 // an unsupported hidden size.
@@ -441,8 +395,8 @@ Array<int64_t> moeA2ASentinelRowBytesOp(int64_t payloadFormat, int64_t hiddenSiz
 // Whether this module carries the sentinel kernels for the current device.
 bool moeA2ASentinelAvailableOp() { return sentinel::moe_a2a_sentinel_kernels_available(); }
 
-// Reset this rank's control state after allocation. The caller must barrier the EP
-// group before any peer launches against the workspace.
+// Reset this rank's control state after allocation and init sentinel. The caller must barrier
+// the EP group before any peer launches against the workspace.
 void moeA2AInitializeOp(TensorView workspace, TensorView metainfo, int64_t epRank, int64_t epSize) {
   using namespace meta;
   CHECK_CUDA(workspace);
@@ -452,20 +406,8 @@ void moeA2AInitializeOp(TensorView workspace, TensorView metainfo, int64_t epRan
   TVM_FFI_ICHECK(epRank >= 0 && epRank < epSize) << "Invalid EP rank";
   auto const layout = readWorkspaceLayout(metainfo);
   TVM_FFI_ICHECK_EQ(layout[EP_SIZE_INDEX], epSize) << "Workspace layout EP size mismatch";
-  auto expected =
-      calculateWorkspaceLayout(epSize, layout[MAX_NUM_TOKENS_INDEX], layout[TOP_K_INDEX],
-                               layout[DISPATCH_PAYLOAD_SIZE_INDEX],
-                               layout[COMBINE_INPUT_SIZE_INDEX], layout[COMBINE_RECV_SIZE_INDEX],
-                               layout[EPLB_STATS_NUM_EXPERTS_INDEX], layout[CFT_ENABLED_INDEX]);
-  bool const hasSentinel = layout[SENTINEL_MAX_NUM_TOKENS_INDEX] > 0;
-  if (hasSentinel) {
-    appendSentinelRegions(expected, layout[SENTINEL_MAX_NUM_TOKENS_INDEX],
-                          layout[SENTINEL_PAYLOAD_FORMAT_INDEX],
-                          layout[SENTINEL_HIDDEN_SIZE_INDEX]);
-  }
-  TVM_FFI_ICHECK(layout == expected) << "Workspace layout metadata is inconsistent";
-  TVM_FFI_ICHECK(layout[DISPATCH_PAYLOAD_SIZE_INDEX] > 0 && layout[COMBINE_INPUT_SIZE_INDEX] > 0)
-      << "Dispatch and combine input payload capacities must be positive";
+  TVM_FFI_ICHECK(layout == recalculateWorkspaceLayout(layout))
+      << "metainfo must be a layout from moe_a2a_get_workspace_layout";
   TVM_FFI_ICHECK(!layout[CFT_ENABLED_INDEX] || layout[COMBINE_RECV_SIZE_INDEX] > 0)
       << "CFT requires a combine receive payload capacity";
   TVM_FFI_ICHECK(workspace.size(1) >= layout[WORKSPACE_SIZE_INDEX])
@@ -481,8 +423,8 @@ void moeA2AInitializeOp(TensorView workspace, TensorView metainfo, int64_t epRan
                                  2 * static_cast<size_t>(epSize) * sizeof(int32_t),
                                  stream) == cudaSuccess)
       << "cudaMemsetAsync failed";
-  if (hasSentinel) {
-    armSentinelRegions(rankWorkspace, layout, stream);
+  if (layout[SENTINEL_MAX_NUM_TOKENS_INDEX] > 0) {
+    initSentinelRegions(rankWorkspace, layout, stream);
   }
   setSentinelRoundOpen(rankWorkspace, false);
   auto err = cudaStreamSynchronize(stream);
@@ -630,6 +572,13 @@ void moeA2ACftEndpointIdsOp(TensorView workspace, int64_t epRank, TensorView ids
 // Sentinel protocol: dispatch and combine
 // ============================================================================
 
+// The kernel family (moe_alltoall_sentinel::PayloadKind) of a sentinel payload format.
+int sentinelPayloadKind(int64_t payloadFormat) {
+  return payloadFormat == sentinel::kBf16    ? sentinel::kKindBf16
+         : payloadFormat == sentinel::kNvfp4 ? sentinel::kKindNvfp4
+                                             : sentinel::kKindFp8;
+}
+
 // Fills every rank's workspace slice and the round state of a sentinel step's kernels; returns
 // this rank's slice.
 template <typename Params>
@@ -668,15 +617,16 @@ uint64_t sentinelActiveRankMask(bool enableRankMask, Optional<TensorView> const&
 }
 
 // A sentinel dispatch. inputPayloads = hidden states, [scales,] expert ids, [weights] (the expert
-// ids at expertIdPayloadIndex); recvOffsets = their receive buffers in the sentinel receive region.
-void sentinelDispatch(TensorView tokenSelectedExperts, Array<Tensor> const& inputPayloads,
-                      int64_t expertIdPayloadIndex, TensorView workspace,
-                      meta::MoeA2AWorkspaceLayout const& layout,
-                      std::vector<size_t> const& recvOffsets, int64_t runtimeMaxTokensPerRank,
-                      int64_t epRank, int64_t epSize, int64_t topK, int64_t numExperts,
-                      int64_t invalidExpertId, bool enableRankMask,
-                      Optional<TensorView> const& activeRankMask, int64_t timeoutSec,
-                      bool enablePdl) {
+// ids at expertIdPayloadIndex). Returns where each payload is received, as offsets from this
+// rank's workspace slice: the hidden states and scales in their landing rows, the expert ids and
+// weights in the sentinel receive region; row (src, token) = token * epSize + src.
+Array<int64_t> sentinelDispatch(TensorView tokenSelectedExperts, Array<Tensor> const& inputPayloads,
+                                int64_t expertIdPayloadIndex, TensorView workspace,
+                                meta::MoeA2AWorkspaceLayout const& layout,
+                                int64_t runtimeMaxTokensPerRank, int64_t epRank, int64_t epSize,
+                                int64_t topK, int64_t numExperts, int64_t invalidExpertId,
+                                bool enableRankMask, Optional<TensorView> const& activeRankMask,
+                                int64_t timeoutSec, bool enablePdl) {
   using namespace meta;
   sentinel::DispatchParams params{};
   uint8_t* rankWorkspace = setSentinelWorkspace(params, workspace, layout, epRank, epSize);
@@ -719,14 +669,11 @@ void sentinelDispatch(TensorView tokenSelectedExperts, Array<Tensor> const& inpu
   params.topk_weights =
       hasWeights ? static_cast<uint32_t const*>(inputPayloads[expertIdPayloadIndex + 1].data_ptr())
                  : nullptr;
-  params.recv_hidden_states = rankWorkspace + recvOffsets[0];
-  params.recv_hidden_states_scale = hasScale ? rankWorkspace + recvOffsets[1] : nullptr;
-  params.recv_topk_ids =
-      reinterpret_cast<int32_t*>(rankWorkspace + recvOffsets[expertIdPayloadIndex]);
+  int64_t const idsOffset = layout[SENTINEL_RECV_IDS_OFFSET_INDEX];
+  int64_t const weightsOffset = layout[SENTINEL_RECV_WEIGHTS_OFFSET_INDEX];
+  params.recv_topk_ids = reinterpret_cast<int32_t*>(rankWorkspace + idsOffset);
   params.recv_topk_weights =
-      hasWeights
-          ? reinterpret_cast<uint32_t*>(rankWorkspace + recvOffsets[expertIdPayloadIndex + 1])
-          : nullptr;
+      hasWeights ? reinterpret_cast<uint32_t*>(rankWorkspace + weightsOffset) : nullptr;
   params.num_experts = static_cast<int>(numExperts);
   params.experts_per_rank = static_cast<int>(numExperts / epSize);
   params.top_k = static_cast<int>(topK);
@@ -736,22 +683,27 @@ void sentinelDispatch(TensorView tokenSelectedExperts, Array<Tensor> const& inpu
   params.mx_scales = payloadFormat == sentinel::kMxfp8;
   params.payload_row_bytes = static_cast<int>(row.payload);
   params.scale_row_bytes = static_cast<int>(row.scale);
-  params.wire_scale_row_bytes = static_cast<int>(row.wireScale);
   params.payload_vectors = static_cast<int>(row.payload / 16);
-  params.wire_scale_vectors = static_cast<int>(row.wireScale / 16);
+  params.scale_vectors = static_cast<int>(row.scale / 16);
   params.blocks_per_token = static_cast<int>(sentinelDispatchBlocksPerToken(row));
   params.invalid_expert_id = static_cast<int32_t>(invalidExpertId);
   params.active_rank_mask = sentinelActiveRankMask(enableRankMask, activeRankMask, epRank);
   params.timeout_cycles = timeoutCycles(timeoutSec);
 
-  int const payloadKind = payloadFormat == sentinel::kBf16    ? sentinel::kKindBf16
-                          : payloadFormat == sentinel::kNvfp4 ? sentinel::kKindNvfp4
-                                                              : sentinel::kKindFp8;
-  sentinel::moe_a2a_sentinel_dispatch_launch(payloadKind, params, enableRankMask, enablePdl,
-                                             get_current_stream());
+  sentinel::moe_a2a_sentinel_dispatch_launch(sentinelPayloadKind(payloadFormat), params,
+                                             enableRankMask, enablePdl, get_current_stream());
+
+  Array<int64_t> recvOffsets;
+  recvOffsets.push_back(params.landing.payload_offset);
+  if (hasScale) recvOffsets.push_back(params.landing.scale_offset);
+  recvOffsets.push_back(idsOffset);
+  if (hasWeights) recvOffsets.push_back(weightsOffset);
+  return recvOffsets;
 }
 
-// A sentinel combine of payload [ep_size, runtimeMaxTokensPerRank, hidden_size] bf16 into output.
+// A sentinel combine of payload, ep_size * runtimeMaxTokensPerRank bf16 rows of hidden_size in the
+// dispatch's row order, into output. First resets the landing rows the dispatch received, which
+// the expert computation has read.
 void sentinelCombine(TensorView payload, int64_t localNumTokens, TensorView workspace,
                      meta::MoeA2AWorkspaceLayout const& layout, int64_t runtimeMaxTokensPerRank,
                      int64_t epRank, int64_t epSize, int64_t topK, bool enableRankMask,
@@ -759,7 +711,7 @@ void sentinelCombine(TensorView payload, int64_t localNumTokens, TensorView work
                      int64_t timeoutSec, bool enablePdl) {
   using namespace meta;
   sentinel::CombineParams params{};
-  setSentinelWorkspace(params, workspace, layout, epRank, epSize);
+  uint8_t* rankWorkspace = setSentinelWorkspace(params, workspace, layout, epRank, epSize);
   int64_t const hiddenSize = layout[SENTINEL_HIDDEN_SIZE_INDEX];
   TVM_FFI_ICHECK(runtimeMaxTokensPerRank <= layout[SENTINEL_MAX_NUM_TOKENS_INDEX])
       << "A sentinel step takes at most " << layout[SENTINEL_MAX_NUM_TOKENS_INDEX]
@@ -780,8 +732,25 @@ void sentinelCombine(TensorView payload, int64_t localNumTokens, TensorView work
   params.active_rank_mask = sentinelActiveRankMask(enableRankMask, activeRankMask, epRank);
   params.timeout_cycles = timeoutCycles(timeoutSec);
 
-  sentinel::moe_a2a_sentinel_combine_launch(params, enableRankMask, enablePdl,
-                                            get_current_stream());
+  int64_t const payloadFormat = layout[SENTINEL_PAYLOAD_FORMAT_INDEX];
+  auto const row = sentinelRowBytes(payloadFormat, hiddenSize);
+  sentinel::ResetParams reset{};
+  reset.rank_workspace = rankWorkspace;
+  reset.landing = params.landing;
+  reset.recv_source_mask = params.recv_source_mask;
+  reset.ep_rank = params.ep_rank;
+  reset.ep_size = params.ep_size;
+  reset.max_tokens_per_rank = params.max_tokens_per_rank;
+  reset.payload_row_bytes = static_cast<int>(row.payload);
+  reset.scale_row_bytes = static_cast<int>(row.scale);
+  reset.payload_vectors = static_cast<int>(row.payload / 16);
+  reset.scale_vectors = static_cast<int>(row.scale / 16);
+  reset.blocks_per_token = static_cast<int>(sentinelDispatchBlocksPerToken(row));
+
+  cudaStream_t const stream = get_current_stream();
+  sentinel::moe_a2a_sentinel_reset_launch(sentinelPayloadKind(payloadFormat), reset, enablePdl,
+                                          stream);
+  sentinel::moe_a2a_sentinel_combine_launch(params, enableRankMask, enablePdl, stream);
 }
 
 // MoE All-to-All Dispatch Operation
@@ -797,7 +766,8 @@ void sentinelCombine(TensorView payload, int64_t localNumTokens, TensorView work
 //     and sentinel paths fill with invalidTokenExpertId, or -1 to leave sanitization to the caller
 //   - useSentinel: run the sentinel protocol; the payloads must be the hidden states, their
 //     scales (quantized formats), the expert ids and optionally the weights, in the workspace's
-//     sentinel payload format. Received rows are then (source rank, token), not compacted.
+//     sentinel payload format. Received rows are then not compacted: row (source rank, token) =
+//     token * epSize + source rank, the hidden states and scales in their landing rows.
 //
 // Returns (recv_offsets, combine_payload_offset, eplb_gathered_stats_offset), all byte
 // offsets from this rank's workspace base. recv_offsets[i] addresses payload i's
@@ -862,14 +832,12 @@ Tuple<Array<int64_t>, int64_t, int64_t> moeA2ADispatchOp(
   // 3. We align the currentOffset during update.
   // In this way, it is guaranteed that the recv buffer is (over-)aligned, sufficient for 128bit
   // vectorized ld/st.
-  // A sentinel step receives into its own region (see moe_alltoall_sentinel.cuh).
+  // A sentinel step receives into its own regions (see sentinelDispatch).
   std::vector<int> payloadElementSizes;
   std::vector<int> payloadElementsPerToken;
   std::vector<size_t> payloadRecvBufferOffsets;
-  int64_t const recvRegionOffset =
-      offsets[useSentinel ? SENTINEL_RECV_OFFSET_INDEX : DISPATCH_PAYLOAD_OFFSET_INDEX];
-  int64_t const recvRegionSize =
-      offsets[useSentinel ? SENTINEL_RECV_SIZE_INDEX : DISPATCH_PAYLOAD_SIZE_INDEX];
+  int64_t const recvRegionOffset = offsets[DISPATCH_PAYLOAD_OFFSET_INDEX];
+  int64_t const recvRegionSize = offsets[DISPATCH_PAYLOAD_SIZE_INDEX];
   size_t currentOffset = static_cast<size_t>(recvRegionOffset);
   for (Tensor const& payload : inputPayloads) {
     CHECK_INPUT(payload);
@@ -922,25 +890,22 @@ Tuple<Array<int64_t>, int64_t, int64_t> moeA2ADispatchOp(
       << "Workspace was allocated without CFT support";
   TVM_FFI_ICHECK(workspace.size(1) >= offsets[WORKSPACE_SIZE_INDEX])
       << "Workspace is smaller than its layout";
-  TVM_FFI_ICHECK(currentOffset <= static_cast<size_t>(recvRegionOffset + recvRegionSize))
-      << "Dispatch payload exceeds its workspace capacity: need "
-      << currentOffset - recvRegionOffset << " bytes, capacity " << recvRegionSize;
 
   if (useSentinel) {
     TVM_FFI_ICHECK(!useCftCountedWrites && !enableEplb)
         << "A sentinel dispatch uses neither CFT counted writes nor EPLB statistics";
-    sentinelDispatch(tokenSelectedExperts, inputPayloads, expertIdPayloadIndex, workspace, offsets,
-                     payloadRecvBufferOffsets, runtimeMaxTokensPerRank, epRank, epSize, topK,
-                     numExperts, invalidTokenExpertId, enableRankMask, activeRankMask, timeoutSec,
-                     enablePdl);
+    Array<int64_t> recvOffsets = sentinelDispatch(
+        tokenSelectedExperts, inputPayloads, expertIdPayloadIndex, workspace, offsets,
+        runtimeMaxTokensPerRank, epRank, epSize, topK, numExperts, invalidTokenExpertId,
+        enableRankMask, activeRankMask, timeoutSec, enablePdl);
     setSentinelRoundOpen(rankWorkspacePtr(workspace, epRank), true);
-    Array<int64_t> recvOffsets;
-    for (size_t offset : payloadRecvBufferOffsets) {
-      recvOffsets.push_back(static_cast<int64_t>(offset));
-    }
     return Tuple(recvOffsets, static_cast<int64_t>(offsets[COMBINE_INPUT_OFFSET_INDEX]),
                  static_cast<int64_t>(-1));
   }
+
+  TVM_FFI_ICHECK(currentOffset <= static_cast<size_t>(recvRegionOffset + recvRegionSize))
+      << "Dispatch payload exceeds its workspace capacity: need "
+      << currentOffset - recvRegionOffset << " bytes, capacity " << recvRegionSize;
 
   // Get base workspace pointer
   uint8_t* workspacePtr = static_cast<uint8_t*>(workspace.data_ptr());
@@ -1337,7 +1302,7 @@ Tuple<Array<String>, Array<int64_t>> getMoeA2AMetaInfoIndexPairsOp() {
   std::pair<char const*, int64_t> const sentinelConstants[] = {
       {"MOE_A2A_SENTINEL_MAX_RANKS", sentinel::kMaxRanks},
       {"MOE_A2A_SENTINEL_MAX_TOP_K", sentinel::kMaxTopK},
-      {"MOE_A2A_SENTINEL_IDS_SENTINEL", static_cast<int32_t>(sentinel::kIdsSentinel)},
+      {"MOE_A2A_SENTINEL_ID_ROW_SENTINEL", static_cast<int32_t>(sentinel::kIdsSentinel)},
       {"MOE_A2A_SENTINEL_FORMAT_BF16", sentinel::kBf16},
       {"MOE_A2A_SENTINEL_FORMAT_MXFP8", sentinel::kMxfp8},
       {"MOE_A2A_SENTINEL_FORMAT_FP8_BLOCK128", sentinel::kFp8Block128},
@@ -1353,8 +1318,6 @@ Tuple<Array<String>, Array<int64_t>> getMoeA2AMetaInfoIndexPairsOp() {
 }  // namespace
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_get_workspace_layout, moeA2AGetWorkspaceLayoutOp);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_sentinel_extend_workspace_layout,
-                              moeA2ASentinelExtendWorkspaceLayoutOp);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_sentinel_row_bytes, moeA2ASentinelRowBytesOp);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_sentinel_available, moeA2ASentinelAvailableOp);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_initialize, moeA2AInitializeOp);

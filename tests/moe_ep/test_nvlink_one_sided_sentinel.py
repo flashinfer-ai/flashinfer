@@ -7,7 +7,7 @@ fence protocol (``sync_protocol="fence"``), and requires on every rank:
 
 * the same received rows from every source, byte for byte (as a set: the
   fence protocol compacts rows in arrival order), with the sentinel rows at
-  ``source * tokens_per_rank + token``;
+  ``token * world + source``;
 * a bitwise identical combine output, with an expert stand-in whose partial
   results cancel across ranks, so that the reduction order shows.
 
@@ -173,15 +173,26 @@ _DEFECTS = {
         "      atomicAdd(p.round_state + kEpoch, 1);\n",
         "",
     ),
-    8: (  # no D5 re-arm: received payload and scale vectors stay in their rows
+    8: (  # no R1 reset: received payload and scale vectors stay in their rows
         _HEADER,
-        "      store_volatile(address(j), splat(kDataSentinel));\n",
-        "",
+        "    store_volatile(column + landing_row(p.ep_size, pop_lowest_rank(sources), token) *"
+        " rv.row_bytes,\n                   sentinel);\n",
+        "    pop_lowest_rank(sources);\n",
     ),
-    9: (  # no C3 re-arm: received partials stay in their combine rows
+    9: (  # no C3 reset: received partials stay in their combine rows
         _HEADER,
         "if ((polled >> j) & 1u) store_volatile(address(j), splat(kDataSentinel));",
         "(void)polled;",
+    ),
+    10: (  # no D6 reset: received weights vectors stay in their rows
+        _HEADER,
+        "      store_volatile(address(kWeights), splat(kDataSentinel));\n",
+        "",
+    ),
+    11: (  # R1 resets the rows of every other source, also of those that sent nothing
+        _HEADER,
+        "p.recv_source_mask[token] & ~(1ull << p.ep_rank)",
+        "(~0ull >> (64 - p.ep_size)) & ~(1ull << p.ep_rank)",
     ),
 }
 
@@ -570,7 +581,13 @@ def _canonical_rows(fmt, x, scale, ids, weights, invalid_expert_id):
         x = w & (0x77777777 | (nonzero << 3))
     else:
         x = word_rule(x, 0x7FFFFFFF)
-    if scale is not None and fmt != "mxfp8":
+    if fmt == "mxfp8":
+        # A block whose UE8M0 scale is NaN arrives as NaN values with a scale of 1.
+        nan = _words(scale) == 0xFF
+        values = x.view(torch.uint8).view(*nan.shape, 32)
+        x = torch.where(nan[:, :, None], 0x7F, values)
+        scale = torch.where(nan, 0x7F, _words(scale))
+    elif scale is not None:
         scale = word_rule(scale, 0x7FFFFFFF)
     ids = torch.where(ids == _IDS_SENTINEL, invalid_expert_id, ids)
     if weights is not None:
@@ -580,11 +597,18 @@ def _canonical_rows(fmt, x, scale, ids, weights, invalid_expert_id):
     return torch.cat(parts, dim=1)
 
 
-def _received_rows(fmt, received, world, invalid_expert_id, canonical):
+def _received_rows(fmt, received, world, invalid_expert_id, canonical, sentinel):
     """Per source: [rows, bytes] of its valid received rows (some id differs
-    from invalid_expert_id) and their positions in the source's slice."""
+    from invalid_expert_id) and their positions in the source's slice. Rows
+    are by source, then token; after a sentinel step, by token, then source."""
     tokens_per_rank = received.tokens_per_rank
-    ids = received.topk_ids.view(world, tokens_per_rank, -1)
+
+    def by_source(t):
+        if sentinel:
+            return t.view(tokens_per_rank, world, -1).transpose(0, 1)
+        return t.view(world, tokens_per_rank, -1)
+
+    ids = by_source(received.topk_ids)
     parts = [
         received.hidden_states,
         received.hidden_states_scale,
@@ -595,7 +619,7 @@ def _received_rows(fmt, received, world, invalid_expert_id, canonical):
         rows = _canonical_rows(fmt, *parts, invalid_expert_id)
     else:
         rows = torch.cat([_words(p) for p in parts if p is not None], dim=1)
-    rows = rows.view(world, tokens_per_rank, -1)
+    rows = by_source(rows)
     result = []
     for source in range(world):
         valid = (ids[source] != invalid_expert_id).any(dim=1)
@@ -621,8 +645,12 @@ def _compare_dispatch(
     """Sentinel vs fence received rows (as sets per source) and the sentinel
     rows' positions against the routed tokens of each source (``expected``)."""
     failures = []
-    got = _received_rows(fmt, sentinel_recv, world, invalid_expert_id, canonical=False)
-    ref = _received_rows(fmt, fence_recv, world, invalid_expert_id, canonical=True)
+    got = _received_rows(
+        fmt, sentinel_recv, world, invalid_expert_id, canonical=False, sentinel=True
+    )
+    ref = _received_rows(
+        fmt, fence_recv, world, invalid_expert_id, canonical=True, sentinel=False
+    )
     for source in range(world):
         rows, positions = got[source]
         ref_rows, _ = ref[source]
@@ -1125,14 +1153,32 @@ def _skew_schedule(world: int) -> list:
 
 
 def _landing_rows(comm) -> list:
-    """This rank's sentinel landing rows: dispatch (payload, scale, weights,
-    ids) and combine, as bytes."""
+    """This rank's sentinel landing rows as bytes: dispatch (payload, scale,
+    weights, ids) and combine. The dispatch rows leave out this rank's own
+    payload and scale rows, which it stores itself and never polls."""
     index, meta = comm._index, comm.metainfo
-    bounds = [
-        int(meta[getattr(index, f"SENTINEL_{name}_OFFSET_INDEX")])
-        for name in ("LANDING", "COMBINE_LANDING", "RECV")
-    ]
-    return [comm._rank_bytes[a:b] for a, b in zip(bounds[:-1], bounds[1:], strict=True)]
+
+    def offset(name: str) -> int:
+        return int(meta[getattr(index, f"SENTINEL_{name}_OFFSET_INDEX")])
+
+    payload, combine, recv = (
+        offset("PAYLOAD_ROWS"),
+        offset("COMBINE_ROWS"),
+        offset("RECV_IDS"),
+    )
+    polled = torch.ones(combine - payload, dtype=torch.bool, device="cuda")
+    for name, row_bytes in (
+        ("PAYLOAD_ROWS", comm._sentinel_row.hidden_bytes),
+        ("SCALE_ROWS", comm._sentinel_row.scale_bytes),
+    ):
+        begin = offset(name) - payload
+        rows = polled[
+            begin : begin + comm.ep_size * comm.sentinel_max_tokens * row_bytes
+        ]
+        rows.view(comm.sentinel_max_tokens, comm.ep_size, row_bytes)[
+            :, comm.ep_rank
+        ] = False
+    return [comm._rank_bytes[payload:combine][polled], comm._rank_bytes[combine:recv]]
 
 
 def _rounds_under_skew(fmt) -> list:
@@ -1151,7 +1197,7 @@ def _rounds_under_skew(fmt) -> list:
         auto_sentinel_max_tokens=_SKEW_LIMIT,
         timeout_sec=_SKEW_TIMEOUT_SEC,
     )
-    armed = [rows.clone() for rows in _landing_rows(sentinel)]
+    initial = [rows.clone() for rows in _landing_rows(sentinel)]
     # Every rank holds its copy before a peer's first dispatch writes into
     # these rows.
     torch.cuda.synchronize()
@@ -1183,9 +1229,9 @@ def _rounds_under_skew(fmt) -> list:
     def check(sources, static, steps, label):
         torch.cuda.synchronize()
         failures = [
-            f"{label}: {n} bytes of the {name} landing rows not re-armed"
+            f"{label}: {n} bytes of the {name} landing rows not reset"
             for name, rows, ref in zip(
-                ("dispatch", "combine"), _landing_rows(sentinel), armed, strict=True
+                ("dispatch", "combine"), _landing_rows(sentinel), initial, strict=True
             )
             if (n := (rows != ref).sum().item())
         ]
@@ -1305,10 +1351,10 @@ def test_rounds_under_rank_skew(group):
     synchronization or fence step in between, while one rank spins before its
     dispatch and one before its combine: fast ranks start round n + 1 while
     peers are still in round n (what the two sets of ids rows, the single
-    landing rows of the payload and the order of the re-arms are for). T and
+    landing rows of the payload and the order of the resets are for). T and
     routing change every round (self-routed tokens and ranks without tokens
     included), and the last rounds cross the sentinel limit. Afterwards every
-    round against the fence instance, and every landing row re-armed. In a
+    round against the fence instance, and every polled landing row reset. In a
     child process with a short timeout_sec, since a deadlock traps."""
     return _in_child_process(_rounds_under_skew, "bf16")
 
@@ -1424,6 +1470,31 @@ def test_combine_takes_its_dispatch_protocol(group):
 
 @multi_rank
 @collective
+def test_combine_rejects_the_received_rows(group):
+    """A sentinel step's combine refuses a view of the rows its dispatch
+    returned, which it resets before reading its input; the round then ends
+    with a combine of a copy."""
+    num_experts = 32 * group.world
+    comm = _instance("bf16", 8, num_experts, 2048, 16, sync_protocol="sentinel", tag=9)
+    counts = _token_counts(1200, group.world, 8)
+    x, _, ids, w = _inputs(
+        1200, group.rank, counts[group.rank], "bf16", 8, num_experts, 2048, group.world
+    )
+    received = comm.dispatch(x, ids, w, runtime_max_tokens_per_rank=8)
+    failures = [] if comm._last_step_sentinel else ["the step took the fence protocol"]
+    try:
+        comm.combine(received.hidden_states)
+        failures.append("a combine of the received rows ran")
+    except ValueError as exc:
+        if "received" not in str(exc):
+            failures.append(f"unexpected ValueError: {exc}")
+    comm.combine(received.hidden_states.clone())
+    torch.cuda.synchronize()
+    return failures
+
+
+@multi_rank
+@collective
 def test_mixed_configs(group, monkeypatch):
     """Ranks constructed with different configs fail or agree alike: a
     sync_protocol or a deprecated lamport_max_tokens of rank 0 that differs
@@ -1510,7 +1581,7 @@ def _params(**overrides):
 _LAYOUT = SimpleNamespace(
     SENTINEL_MAX_RANKS=64,
     SENTINEL_MAX_TOP_K=22,
-    SENTINEL_IDS_SENTINEL=_IDS_SENTINEL,
+    SENTINEL_ID_ROW_SENTINEL=_IDS_SENTINEL,
     SENTINEL_FORMAT_BF16=0,
     SENTINEL_FORMAT_MXFP8=1,
     SENTINEL_FORMAT_FP8_BLOCK128=2,
@@ -1528,12 +1599,12 @@ def test_sentinel_row_geometry():
     def row(fmt, hidden, top_k):
         return Row(*map(int, module.moe_a2a_sentinel_row_bytes(fmt, hidden, top_k)))
 
-    assert row(index.SENTINEL_FORMAT_BF16, 7168, 8) == Row(14336, 0, 7, 43168)
-    assert row(index.SENTINEL_FORMAT_NVFP4, 7168, 8) == Row(3584, 448, 2, 22560)
-    assert row(index.SENTINEL_FORMAT_MXFP8, 3584, 16) == Row(3584, 112, 2, 14992)
-    assert row(index.SENTINEL_FORMAT_FP8_BLOCK128, 7168, 8) == Row(7168, 224, 4, 29280)
-    with pytest.raises(Exception, match="% 256"):
-        row(index.SENTINEL_FORMAT_MXFP8, 2880, 8)
+    assert row(index.SENTINEL_FORMAT_BF16, 7168, 8) == Row(14336, 0, 7, 28832)
+    assert row(index.SENTINEL_FORMAT_NVFP4, 7168, 8) == Row(3584, 448, 2, 18528)
+    assert row(index.SENTINEL_FORMAT_MXFP8, 3584, 16) == Row(3584, 112, 2, 11184)
+    assert row(index.SENTINEL_FORMAT_FP8_BLOCK128, 7168, 8) == Row(7168, 224, 4, 21888)
+    with pytest.raises(Exception, match="% 512"):
+        row(index.SENTINEL_FORMAT_MXFP8, 2304, 8)
 
 
 class _FakeModule:

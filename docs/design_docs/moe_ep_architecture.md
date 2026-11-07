@@ -115,7 +115,7 @@ Fleet transports:
 
 | Backend | Activation | Weight | Output | Arch | Tuning |
 |---|---|---|---|---|---|
-| `identity` (`IdentityConfig`) | passthrough | none | dispatch tensor unchanged | any | — |
+| `identity` (`IdentityConfig`) | passthrough | none | copy of the dispatch tensor | any | — |
 | `fused_moe` (`FusedMoeKernelConfig`) with `TrtllmBf16Config` | BF16 | BF16 | BF16 | SM100 family | inner `MoELayer` AutoTuner: per-runner tactic search + cross-backend winner per token bucket, up to `ExecutionConfig.tune_max_num_tokens` |
 | `fused_moe` with `TrtllmFp4Config` | NVFP4 (block-16) or MXFP8 (block-32), quantized post-dispatch in the bridge | NVFP4 or MXFP4, respectively | BF16 | SM100/SM103/SM107 | same `MoELayer` AutoTuner |
 | `fused_moe` with `CuteDslConfig` | NVFP4 (W4A4), MXFP8 (W4A8), or BF16 (W4A16); W4A8 may use pre-dispatch packed payloads with `mxfp8_dispatch=True` | NVFP4/MXFP4 | BF16 | SM100/SM103 (W4A4/W4A16 also SM107) | same `MoELayer` AutoTuner |

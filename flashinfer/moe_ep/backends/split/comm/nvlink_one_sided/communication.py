@@ -9,11 +9,10 @@ protocol (``include/flashinfer/comm/moe_alltoall_sentinel.cuh``) every pushed
 vector carries its own arrival, so neither direction waits for flags.
 
 One symmetric workspace, laid out by ``moe_a2a_get_workspace_layout``, holds
-the round state, the dispatch receive buffers and the combine buffers of a
-rank. Its size grows with ``ep_size * max_tokens_per_rank``; the sentinel
-regions, appended by ``moe_a2a_sentinel_extend_workspace_layout``, grow with
-``ep_size * sentinel_max_tokens``. Instances with the same layout share one
-workspace.
+each protocol's regions of a rank: the fence round state, dispatch receive
+region and combine input region grow with ``ep_size * max_tokens_per_rank``,
+the sentinel round state and landing rows with ``ep_size *
+sentinel_max_tokens``. Instances with the same layout share one workspace.
 """
 
 from __future__ import annotations
@@ -104,7 +103,7 @@ def _probe_sentinel_support(
         return "it combines BF16 expert outputs only"
     if config.use_low_precision_combine:
         return "it has no FP8 combine"
-    if ((params.invalid_expert_id - index.SENTINEL_IDS_SENTINEL) & 0xFFFFFFFF) == 0:
+    if ((params.invalid_expert_id - index.SENTINEL_ID_ROW_SENTINEL) & 0xFFFFFFFF) == 0:
         return "invalid_expert_id equals its expert-id sentinel as an int32"
     name = getattr(params.dispatch_format, "name", None)
     if name not in _SENTINEL_FORMATS:
@@ -138,8 +137,8 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
     ``hidden_states``, its optional scale factors, ``topk_ids`` and
     ``topk_weights`` travel as payloads of a single dispatch. Received rows
     beyond each source rank's token count get ``invalid_expert_id`` routing;
-    after a sentinel step, row ``source_rank * tokens_per_rank + token`` holds
-    that token and rows of tokens not routed here get ``invalid_expert_id``.
+    after a sentinel step, row ``token * ep_size + source_rank`` holds that
+    token and rows of tokens not routed here get ``invalid_expert_id``.
     See :class:`NVLinkOneSidedConfig` for the sync protocols and timeouts.
     """
 
@@ -251,6 +250,28 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
         # Expert outputs come back unquantized, at least 16 bits wide.
         combine_element_size = max(params.token_dtype.itemsize, 2)
         combine_input_bytes = tokens * params.hidden_size * combine_element_size
+        # Largest step of the sentinel protocol; 0 when the instance does not use it.
+        self.sentinel_max_tokens = 0
+        self._sentinel_format: Optional[str] = None
+        self._sentinel_row: Optional[_SentinelRow] = None
+        sentinel_format_index = 0
+        if protocol == "sentinel":
+            max_tokens = params.max_tokens_per_rank
+        elif config.lamport_max_tokens is not None:
+            max_tokens = config.lamport_max_tokens
+        else:
+            max_tokens = config_module.AUTO_SENTINEL_MAX_TOKENS
+        max_tokens = min(max_tokens, params.max_tokens_per_rank)
+        if sentinel_capable and max_tokens > 0:
+            sentinel_format = _SENTINEL_FORMATS[
+                getattr(params.dispatch_format, "name", None)
+            ]
+            self._sentinel_row = _sentinel_row(
+                self._module, index, sentinel_format, params
+            )
+            self.sentinel_max_tokens = max_tokens
+            self._sentinel_format = sentinel_format
+            sentinel_format_index = getattr(index, f"SENTINEL_FORMAT_{sentinel_format}")
         metainfo = torch.empty(index.NUM_METAINFO_FIELDS, dtype=torch.int64)
         # The module's CFT counted-write path stays unused: no CFT receive inbox
         # or counters.
@@ -263,38 +284,11 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
             0,
             config.eplb_stats_num_experts,
             False,
+            self.sentinel_max_tokens,
+            sentinel_format_index,
+            params.hidden_size,
             metainfo,
         )
-        # Largest step of the sentinel protocol; 0 when the instance does not use it.
-        self.sentinel_max_tokens = 0
-        self._sentinel_format: Optional[str] = None
-        self._sentinel_row: Optional[_SentinelRow] = None
-        self._sentinel_workspace_bytes = 0
-        if protocol == "sentinel":
-            max_tokens = params.max_tokens_per_rank
-        elif config.lamport_max_tokens is not None:
-            max_tokens = config.lamport_max_tokens
-        else:
-            max_tokens = config_module.AUTO_SENTINEL_MAX_TOKENS
-        max_tokens = min(max_tokens, params.max_tokens_per_rank)
-        if sentinel_capable and max_tokens > 0:
-            sentinel_format = _SENTINEL_FORMATS[
-                getattr(params.dispatch_format, "name", None)
-            ]
-            row = _sentinel_row(self._module, index, sentinel_format, params)
-            size_before = int(metainfo[index.WORKSPACE_SIZE_INDEX])
-            self._module.moe_a2a_sentinel_extend_workspace_layout(
-                metainfo,
-                max_tokens,
-                getattr(index, f"SENTINEL_FORMAT_{sentinel_format}"),
-                params.hidden_size,
-            )
-            self.sentinel_max_tokens = max_tokens
-            self._sentinel_format = sentinel_format
-            self._sentinel_row = row
-            self._sentinel_workspace_bytes = (
-                int(metainfo[index.WORKSPACE_SIZE_INDEX]) - size_before
-            )
         self._state = self._acquire_workspace(mapping, comm, metainfo)
         self.workspace: "torch.Tensor" = self._state["workspace"]
         self.metainfo: "torch.Tensor" = self._state["metainfo"]
@@ -325,11 +319,14 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
             # cleared its own slice.
             comm.barrier()
             if self.sentinel_max_tokens and self.ep_rank == 0:
+                sentinel_bytes = size - int(
+                    metainfo[self._index.SENTINEL_STATE_OFFSET_INDEX]
+                )
                 logger.info(
                     "NVLink one-sided sentinel protocol: steps of up to %d tokens per "
                     "rank, %.1f MiB of workspace per rank",
                     self.sentinel_max_tokens,
-                    self._sentinel_workspace_bytes / (1 << 20),
+                    sentinel_bytes / (1 << 20),
                 )
             state = {
                 "key": key,
@@ -544,12 +541,15 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
             self._enable_pdl,
         )
 
+        # Rows by source rank, then token; a sentinel step's by token, then
+        # source rank.
+        rows = (
+            (tokens_per_rank, self.ep_size)
+            if use_sentinel
+            else (self.ep_size, tokens_per_rank)
+        )
         recv = [
-            self._workspace_view(
-                int(offset),
-                payload.dtype,
-                (self.ep_size, tokens_per_rank, payload.shape[1]),
-            )
+            self._workspace_view(int(offset), payload.dtype, (*rows, payload.shape[1]))
             for offset, payload in zip(recv_offsets, payloads, strict=True)
         ]
         if not use_sentinel:
@@ -605,6 +605,21 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
             self._round["combine_offset"], dtype, (rows, self.params.hidden_size)
         )
 
+    def _check_not_received_rows(self, expert_output: "torch.Tensor") -> None:
+        """Raise if ``expert_output`` overlaps this rank's sentinel payload or
+        scale landing rows, the rows a sentinel dispatch returns."""
+        index, meta = self._index, self.metainfo
+        base = self._rank_bytes.data_ptr()
+        begin = base + int(meta[index.SENTINEL_PAYLOAD_ROWS_OFFSET_INDEX])
+        end = base + int(meta[index.SENTINEL_WEIGHT_ROWS_OFFSET_INDEX])
+        start = expert_output.data_ptr()
+        stop = start + expert_output.numel() * expert_output.element_size()
+        if start < end and begin < stop:
+            raise ValueError(
+                "expert_output is a view of the rows this sentinel step received, "
+                "which its combine resets before reading them; pass a copy"
+            )
+
     def combine(
         self,
         expert_output: "torch.Tensor",
@@ -615,12 +630,17 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
         """See :meth:`MoEEpCommunication.combine`.
 
         ``active_rank_mask`` must match the mask passed to :meth:`dispatch`.
+        ``expert_output`` must not be a view of the tensors :meth:`dispatch`
+        returned: a sentinel step resets its received rows before its combine
+        reads the expert output, and raises ``ValueError`` for such a view.
         """
         import torch
 
         state = self._round
         if state is None:
             raise RuntimeError("combine called before dispatch")
+        if state["sentinel"]:
+            self._check_not_received_rows(expert_output)
         self._check_rank_mask(active_rank_mask)
         tokens_per_rank = state["tokens_per_rank"]
         if expert_output.dim() == 2:
@@ -695,7 +715,7 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
 
     def checkpoint_restore(self, comm_backend: "CommBackend") -> None:
         """Back the workspace with new memory after :meth:`checkpoint_prepare`
-        and re-arm its sentinel regions.
+        and init sentinel in its sentinel regions.
 
         Collective over ``comm_backend``, a fresh backend that must span the
         EP group with the original ranks and world size. Every rank calls it

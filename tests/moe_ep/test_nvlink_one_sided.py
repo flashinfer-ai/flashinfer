@@ -512,13 +512,20 @@ def _verify_dispatch(
     case: Case, results: list[dict], receiver: int, index: int, sentinel: bool
 ) -> None:
     """Received rows, payload bytes, routing and padding against the inputs;
-    a sentinel step's row of token ``t`` from a source is its row ``t``."""
+    a sentinel step's row of token ``t`` from source ``s`` is its row
+    ``t * ep_size + s``."""
     payload, sf, slots, weights = results[receiver]["outputs"][index]["dispatch"]
     maximum = max(case.rounds[index].tokens)
-    payload = payload.view(case.ep_size, maximum, -1)
-    sf = None if sf is None else sf.view(case.ep_size, maximum, -1)
-    slots = slots.view(case.ep_size, maximum, -1)
-    weights = weights.view(case.ep_size, maximum, -1)
+
+    def by_source(t):
+        if sentinel:
+            return t.view(maximum, case.ep_size, -1).transpose(0, 1)
+        return t.view(case.ep_size, maximum, -1)
+
+    payload = by_source(payload)
+    sf = None if sf is None else by_source(sf)
+    slots = by_source(slots)
+    weights = by_source(weights)
     begin, end = _expert_bounds(case.model.num_experts, case.ep_size, receiver)
     for source in range(case.ep_size):
         orig, orig_sf, orig_slots, orig_weights = results[source]["inputs"][index]
@@ -667,7 +674,7 @@ CASES = [
         for num_tokens in (1, 128, 1024)
     ],
     # The sentinel protocol at the model shapes it carries (hidden_size a
-    # multiple of 256).
+    # multiple of 256, of 512 for MXFP8 and DeepSeek FP8).
     *[
         pytest.param(
             Case(
@@ -802,32 +809,42 @@ def test_nvlink_one_sided(case: Case) -> None:
 
 @pytest.mark.parametrize("cft", [False, True])
 def test_workspace_layout(cft: bool) -> None:
-    """Regions are disjoint, aligned and fixed by the allocation-time capacities."""
+    """Regions are disjoint, aligned and fixed by the allocation-time capacities;
+    the CFT regions sit among the fence regions and the sentinel regions follow
+    them."""
     from flashinfer.moe_ep.backends.split.comm.nvlink_one_sided.kernels import (
         get_nvlink_one_sided_alltoall_module,
         layout_constants,
     )
 
     index = layout_constants()
-    ep_size, top_k, capacity, hidden = 8, 6, 128, 7168
+    ep_size, top_k, capacity, hidden, sentinel_tokens = 8, 6, 128, 7168, 32
     dispatch_bytes = ep_size * capacity * (hidden + 2 * top_k * 4)
     combine_input_bytes = ep_size * capacity * hidden * 2
     combine_recv_bytes = ep_size * capacity * hidden if cft else 0
-    layout = torch.empty(index.NUM_METAINFO_FIELDS, dtype=torch.int64)
-    get_nvlink_one_sided_alltoall_module().moe_a2a_get_workspace_layout(
-        ep_size,
-        capacity,
-        top_k,
-        dispatch_bytes,
-        combine_input_bytes,
-        combine_recv_bytes,
-        0,
-        cft,
-        layout,
-    )
 
-    def field(name: str) -> int:
-        return int(layout[getattr(index, name)])
+    def layout(sentinel_max_tokens: int) -> torch.Tensor:
+        metainfo = torch.empty(index.NUM_METAINFO_FIELDS, dtype=torch.int64)
+        get_nvlink_one_sided_alltoall_module().moe_a2a_get_workspace_layout(
+            ep_size,
+            capacity,
+            top_k,
+            dispatch_bytes,
+            combine_input_bytes,
+            combine_recv_bytes,
+            0,
+            cft,
+            sentinel_max_tokens,
+            index.SENTINEL_FORMAT_BF16,
+            hidden,
+            metainfo,
+        )
+        return metainfo
+
+    fence_only, both = layout(0), layout(sentinel_tokens)
+
+    def field(name: str, metainfo: torch.Tensor = both) -> int:
+        return int(metainfo[getattr(index, name)])
 
     alignment = index.WORKSPACE_ALIGNMENT
     dispatch_start = field("DISPATCH_PAYLOAD_OFFSET_INDEX")
@@ -852,15 +869,52 @@ def test_workspace_layout(cft: bool) -> None:
         recv_bytes = field("COMBINE_RECV_SIZE_INDEX")
         assert combine_end <= recv_start and recv_start % alignment == 0
         assert recv_bytes == combine_recv_bytes
-        assert recv_start + recv_bytes <= total
         assert (
             dispatch_end
             <= field("COMBINE_COUNTED_WRITE_COUNTERS_OFFSET_INDEX")
             < combine_start
         )
+        fence_end = recv_start + recv_bytes
     else:
         assert field("COMBINE_RECV_SIZE_INDEX") == 0
-        assert combine_end <= total
+        fence_end = combine_end
+
+    # Without sentinel regions their fields are zero and the fence regions end
+    # the slice; with them the fence offsets stay and the sentinel regions
+    # follow in order, each sized by sentinel_max_tokens * ep_size rows.
+    sentinel_fields = [
+        name
+        for name in vars(index)
+        if name.startswith("SENTINEL_") and "_INDEX" in name
+    ]
+    assert all(field(name, fence_only) == 0 for name in sentinel_fields)
+    assert fence_end <= field("WORKSPACE_SIZE_INDEX", fence_only)
+    fence_fields = [
+        name
+        for name in vars(index)
+        if name.endswith("_OFFSET_INDEX") and not name.startswith("SENTINEL_")
+    ]
+    assert all(field(name, fence_only) == field(name) for name in fence_fields)
+    rows = ep_size * sentinel_tokens
+    topk_row = 16 * -(-top_k * 4 // 16)
+    regions = [
+        ("SENTINEL_STATE_OFFSET_INDEX", 128 + sentinel_tokens * 8),
+        ("SENTINEL_PAYLOAD_ROWS_OFFSET_INDEX", rows * 2 * hidden),
+        ("SENTINEL_SCALE_ROWS_OFFSET_INDEX", 0),
+        ("SENTINEL_WEIGHT_ROWS_OFFSET_INDEX", rows * topk_row),
+        ("SENTINEL_ID_ROWS_OFFSET_INDEX", 2 * field("SENTINEL_ID_ROW_SET_SIZE_INDEX")),
+        ("SENTINEL_COMBINE_ROWS_OFFSET_INDEX", rows * 2 * hidden),
+        ("SENTINEL_RECV_IDS_OFFSET_INDEX", rows * top_k * 4),
+        ("SENTINEL_RECV_WEIGHTS_OFFSET_INDEX", rows * top_k * 4),
+    ]
+    assert field("SENTINEL_ID_ROW_SET_SIZE_INDEX") >= rows * topk_row
+    end = fence_end
+    for name, size in regions:
+        assert field(name) >= end and field(name) % 128 == 0, name
+        end = field(name) + size
+    assert end <= total and total % alignment == 0
+    assert field("SENTINEL_MAX_NUM_TOKENS_INDEX") == sentinel_tokens
+    assert field("SENTINEL_HIDDEN_SIZE_INDEX") == hidden
 
 
 def _cft_endpoints_worker(rank: int, world: int, out_dir: str) -> None:

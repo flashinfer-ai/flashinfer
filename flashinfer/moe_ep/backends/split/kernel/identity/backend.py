@@ -1,4 +1,4 @@
-"""Identity split kernel — passes expert tensors through unchanged."""
+"""Identity split kernel — returns a copy of the expert tensors."""
 
 from __future__ import annotations
 
@@ -21,4 +21,15 @@ class IdentitySplitKernelBackend(SplitKernelBackend):
         return False
 
     def compute(self, ctx: SplitKernelContext):
-        return ctx.expert_tensors
+        # A copy, not the dispatched tensors themselves: a communication may
+        # reuse its receive rows before its combine reads the expert output.
+        tokens = ctx.expert_tensors
+        out = ctx.output
+        if (
+            out is not None
+            and out.dtype == tokens.dtype
+            and out.numel() == tokens.numel()
+            and out.is_contiguous()
+        ):
+            return out.view(tokens.shape).copy_(tokens)
+        return tokens.clone()

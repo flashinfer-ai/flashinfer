@@ -83,18 +83,11 @@ class TestKernelRequiresWeights:
 
 
 class TestIdentitySplitKernel:
-    def test_passes_expert_tensors_through_unchanged(self) -> None:
-        import torch
+    @staticmethod
+    def _context(expert, output=None):
+        from flashinfer.moe_ep import FleetParams, SplitKernelContext
 
-        from flashinfer.moe_ep import (
-            FleetParams,
-            IdentityConfig,
-            SplitKernelContext,
-            run_split_kernel,
-        )
-
-        expert = torch.randn(8, 128)
-        ctx = SplitKernelContext(
+        return SplitKernelContext(
             expert_tensors=expert,
             num_tokens=8,
             fleet_params=FleetParams(
@@ -102,9 +95,29 @@ class TestIdentitySplitKernel:
                 max_tokens_per_rank=8,
                 token_hidden_size=128,
             ),
+            output=output,
         )
-        out = run_split_kernel(IdentityConfig(), ctx)
-        assert out is expert
+
+    def test_returns_a_copy_of_the_expert_tensors(self) -> None:
+        import torch
+
+        from flashinfer.moe_ep import IdentityConfig, run_split_kernel
+
+        expert = torch.randn(8, 128)
+        out = run_split_kernel(IdentityConfig(), self._context(expert))
+        assert torch.equal(out, expert)
+        assert out.data_ptr() != expert.data_ptr()
+
+    def test_copies_into_the_context_output(self) -> None:
+        import torch
+
+        from flashinfer.moe_ep import IdentityConfig, run_split_kernel
+
+        expert = torch.randn(2, 4, 128)
+        output = torch.empty(8, 128)
+        out = run_split_kernel(IdentityConfig(), self._context(expert, output))
+        assert out.data_ptr() == output.data_ptr()
+        assert torch.equal(output.view(2, 4, 128), expert)
 
     def test_create_returns_identity_kernel(self) -> None:
         from flashinfer.moe_ep import IdentityConfig

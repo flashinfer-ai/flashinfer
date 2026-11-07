@@ -102,6 +102,16 @@ void moe_a2a_sentinel_dispatch_launch(int payload_kind, DispatchParams const& pa
   })
 }
 
+void moe_a2a_sentinel_reset_launch(int payload_kind, ResetParams const& params, bool enable_pdl,
+                                   cudaStream_t stream) {
+  void (*kernel)(ResetParams) = payload_kind == kKindBf16  ? moeA2ASentinelResetKernel<kKindBf16>
+                                : payload_kind == kKindFp8 ? moeA2ASentinelResetKernel<kKindFp8>
+                                                           : moeA2ASentinelResetKernel<kKindNvfp4>;
+  launchWithPdlWhenEnabled("moeA2ASentinelResetKernel", enable_pdl, kernel,
+                           dim3(params.max_tokens_per_rank * params.blocks_per_token),
+                           dim3(kNumThreads), 0, stream, params);
+}
+
 void moe_a2a_sentinel_combine_launch(CombineParams const& params, bool enable_rank_mask,
                                      bool enable_pdl, cudaStream_t stream) {
   MOE_A2A_SENTINEL_SWITCH_TOP_K(params.top_k, {

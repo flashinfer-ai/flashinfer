@@ -16,56 +16,72 @@
  */
 
 // Sentinel protocol of the NVLink one-sided MoE all-to-all (flashinfer.moe_ep
-// NVLinkOneSidedAlltoAll) for small steps: one dispatch and one combine kernel, no completion
-// flags and no fences between data and its readiness.
+// NVLinkOneSidedAlltoAll) for small steps: a dispatch, a reset and a combine kernel, no
+// completion flags and no fences between data and its readiness.
 //
-// Sentinel arrival. Every landing row a peer writes into is armed with a sentinel word that no
-// payload word takes (senders rewrite the few words that could, see canonicalize_*). A receiver
-// polls the data itself: a 16-byte vector has arrived when none of its four 32-bit words is the
-// sentinel (32-bit stores are single-copy atomic, so a torn vector still shows one). The
-// receiver copies the vector out and re-arms it; it is the vector's only reader.
+// Sentinel arrival. Every landing row a peer writes into holds a sentinel word that no payload
+// word takes (senders rewrite the few words that could, see canonicalize_*) until data replaces
+// it. A receiver polls the data itself: a 16-byte vector has arrived when none of its four 32-bit
+// words is the sentinel (32-bit stores are single-copy atomic, so a torn vector still shows one).
+// Once the data has been consumed, the receiver, its only reader, resets the vector to the
+// sentinel.
 //
 // Landing rows of a rank's workspace, row (src, token) = token * ep_size + src (the same rows in
 // every round, a token slot's rows adjacent):
-//   payload  hidden states in wire format        sentinel 0xFFFFFFFF
-//   scales   block scales in wire format         sentinel 0xFFFFFFFF
+//   payload  hidden states                       sentinel 0xFFFFFFFF, NVFP4 0x88888888
+//   scales   block scales                        sentinel 0xFFFFFFFF
 //   weights  top-k routing weights (optional)    sentinel 0xFFFFFFFF
 //   ids      top-k expert ids                    sentinel 0x88888888   two sets
 //   combine  partial output of this rank's token from rank src, row src * max_tokens_per_rank +
 //            token (this step's tokens per rank)
+// Payload and scale rows hold the payload format's own bytes: the first ep_size * tokens_per_rank
+// rows of a step are its received hidden states and scales, which the expert computation reads
+// in place; this rank's own tokens are stored into its rows (ep_rank, token). Expert ids and
+// weights are copied out into receive buffers of the same rows, since the ids rows alternate
+// between two sets and the weights rows are padded to whole 16-byte vectors.
 // A source stores its ids row (src, token) on EVERY alive peer, all invalid_expert_id where the
 // peer is no target: the ids row tells that slot `token` arrived and whether it holds a token.
 //
-// Re-arming. A dispatch ends only after every alive peer's ids rows of the round arrived, so no
+// Resets. A dispatch ends only after every alive peer's ids rows of the round arrived, so no
 // rank starts round n + 2 before every peer finished round n. Payload, scale and weights rows go
 // to targets only, and the sender's combine waits for every target's partial: a row is rewritten
-// only after its reader re-armed it, so one set suffices. Ids rows also reach non-targets, which
-// may still be in round n when the sender writes round n + 1, so they alternate two sets by an
-// epoch in device memory (CUDA graphs replay it) that the last combine block advances; the
-// combine re-arms them. A combine row is written in round n only by a rank that received the
-// reader's round-n ids rows, sent after the reader's previous combine re-armed the row.
+// only after its reader reset it, so one set suffices. The reader resets the weights rows it
+// received once it has copied them out (dispatch), the payload and scale rows once the expert
+// computation has read them (the reset kernel, before the combine sends any partial); a kernel
+// boundary separates each reset from the partials. It resets only the rows it received in the
+// round: a source that sent it nothing does not wait for it and may already have stored its next
+// round into its rows. This rank's own rows are never polled and need no reset. Ids rows also
+// reach non-targets, which may still be in round n when the sender writes round n + 1, so they
+// alternate two sets by an epoch in device memory (CUDA graphs replay it) that the last combine
+// block advances; the combine resets them. A combine row is written in round n only by a rank
+// that received the reader's round-n ids rows, sent after the reader's previous combine reset the
+// row.
 //
 // Dispatch, grid max_tokens_per_rank x blocks_per_token (a block: one token slot, one chunk of
-// kNumThreads 16-byte vectors of the wire row, payload vectors first, then scale vectors):
+// kNumThreads 16-byte vectors of the row, payload vectors first, then scale vectors):
 //   D1 route     warp 0 maps the token's top-k ids to target ranks (each rank once, at its first
 //                slot; masked ranks dropped) and stages the ids and weights rows; thread 0 reads
 //                the epoch.
 //   D2 push      each thread stores its vector into the landing row (ep_rank, token) of every
-//                target; for this rank itself it goes straight into the receive buffer.
+//                target, this rank included.
 //   D3 ids       the chunk-0 block stores the ids row to every alive peer, the weights to targets,
-//                its threads taking the (peer, vector) stores in turn.
-//   D4 poll ids  every source's ids row of slot `token` -> recv_source_mask; warp 0 lists the
-//                sources that sent a token.
-//   D5 receive   poll, copy out and re-arm this thread's vector of every source that sent one,
+//                its threads taking the (peer, vector) stores in turn; this rank's own rows go
+//                straight into the receive buffers.
+//   D4 poll ids  every source's ids row of slot `token` -> the ids receive buffer and
+//                recv_source_mask; warp 0 lists the sources that sent a token.
+//   D5 receive   poll this thread's vector of every source that sent one until it has arrived,
 //                8 sources of the slot's source list per round.
-//   D6 weights   in the same rounds, the chunk-0 block does the same for the weights rows.
+//   D6 weights   in the same rounds, the chunk-0 block polls the weights rows, copies them out
+//                and resets them.
 // Rank loops walk the set bits of a rank mask in ascending rank order (pop_lowest_rank).
+// Reset, same grid, after the expert computation:
+//   R1           each thread resets its vector of every other source that sent the slot a token.
 // Combine, same grid:
 //   C1 sources   warp 0 lists the token's target ranks in top-k slot order.
 //   C2 push      the expert output of row (src, token) goes to src's combine row (ep_rank, token).
-//   C3 reduce    poll this rank's partials 8 sources at a time, re-arm them and add them in the
+//   C3 reduce    poll this rank's partials 8 sources at a time, reset them and add them in the
 //                order of the fence combine (vectorized_combine_impl), then round to bf16.
-//   C4 tail      the chunk-0 block re-arms the slot's ids rows; the last block advances the epoch.
+//   C4 tail      the chunk-0 block resets the slot's ids rows; the last block advances the epoch.
 // The only fence is the device-scope one before the combine's finished-block count.
 
 #pragma once
@@ -100,18 +116,23 @@ __host__ __device__ constexpr int topk_row_vectors(int top_k) { return (top_k + 
 
 constexpr uint32_t kIdsSentinel = 0x88888888u;
 constexpr uint32_t kDataSentinel = 0xFFFFFFFFu;
-// NVFP4 data words travel XORed with this, so that the one word that could equal the sentinel
-// after canonicalisation (eight -0 nibbles) cannot.
-constexpr uint32_t kNvfp4WireXor = 0x77777777u;
+// The sentinel of NVFP4 payload rows: eight -0 nibbles, which canonicalize_fp4x8 leaves in no
+// word (every other e2m1 word, 0xFFFFFFFF included, is a value).
+constexpr uint32_t kNvfp4Sentinel = 0x88888888u;
 
 // Payload formats of the landing rows.
 enum PayloadFormat : int {
   kBf16 = 0,
-  kMxfp8 = 1,        // e4m3 [T, H] + UE8M0 scales [T, H / 32] (16-bit lanes on the wire)
+  kMxfp8 = 1,        // e4m3 [T, H] + UE8M0 scales [T, H / 32]
   kFp8Block128 = 2,  // e4m3 [T, H] + fp32 scales [T, H / 128]
   kNvfp4 = 3,        // e2m1 x2 [T, H / 2] + e4m3 scales [T, H / 16]
   kNumPayloadFormats
 };
+
+// The sentinel of a payload format's payload rows (its scale rows': kDataSentinel).
+__host__ __device__ constexpr uint32_t payload_sentinel(int payload_format) {
+  return payload_format == kNvfp4 ? kNvfp4Sentinel : kDataSentinel;
+}
 // Kernel families by the payload's element width (scales are handled at run time).
 enum PayloadKind : int { kKindBf16 = 0, kKindFp8 = 1, kKindNvfp4 = 2 };
 
@@ -142,9 +163,7 @@ struct DispatchParams {
   uint8_t const* hidden_states_scale;     // [local_num_tokens, scale_row_bytes]; null for BF16
   int32_t const* token_selected_experts;  // [local_num_tokens, top_k]
   uint32_t const* topk_weights;           // [local_num_tokens, top_k] 4-byte words
-  // Receive buffers, row (src, token) = src * max_tokens_per_rank + token.
-  uint8_t* recv_hidden_states;
-  uint8_t* recv_hidden_states_scale;
+  // Receive buffers of the expert ids and weights, row (src, token) = token * ep_size + src.
   int32_t* recv_topk_ids;
   uint32_t* recv_topk_weights;
   // Round state shared with the combine.
@@ -158,25 +177,40 @@ struct DispatchParams {
   int experts_per_rank;  // num_experts / ep_size (an even split)
   int top_k;
   int local_num_tokens;
-  int max_tokens_per_rank;  // of this step: the receive buffers' rows per source
+  int max_tokens_per_rank;  // of this step: the token slots of every source
   int has_topk_weights;     // the step carries routing weights (every rank alike)
-  int mx_scales;            // MXFP8: UE8M0 scale bytes travel as 16-bit lanes
-  int payload_row_bytes;    // landing and receive
-  int scale_row_bytes;      // input and receive scale row
-  int wire_scale_row_bytes;
-  int payload_vectors;  // 16-byte vectors per payload row
-  int wire_scale_vectors;
+  int mx_scales;            // MXFP8: a block with a NaN UE8M0 scale travels as NaN values
+  int payload_row_bytes;    // input and landing row
+  int scale_row_bytes;      // input and landing scale row
+  int payload_vectors;      // 16-byte vectors per payload row
+  int scale_vectors;
   int blocks_per_token;
   int32_t invalid_expert_id;
   uint64_t active_rank_mask;  // bit r: rank r takes part (rank-mask kernels only)
   int64_t timeout_cycles;
 };
 
+// The reset kernel's: this rank's landing payload and scale rows of the step.
+struct ResetParams {
+  uint8_t* rank_workspace;  // this rank's slice
+  LandingLayout landing;
+  uint64_t const* recv_source_mask;
+  int ep_rank;
+  int ep_size;
+  int max_tokens_per_rank;  // of this step
+  int payload_row_bytes;
+  int scale_row_bytes;
+  int payload_vectors;
+  int scale_vectors;
+  int blocks_per_token;  // the dispatch's
+};
+
 struct CombineParams {
   uint8_t* rank_workspaces[kMaxRanks];
   LandingLayout landing;
-  uint8_t const* expert_output;  // [ep_size * max_tokens_per_rank, hidden_size] bf16, row (src, t)
-  uint8_t* output;               // [local_num_tokens, hidden_size] bf16
+  // [ep_size * max_tokens_per_rank, hidden_size] bf16, row (src, t) = t * ep_size + src
+  uint8_t const* expert_output;
+  uint8_t* output;  // [local_num_tokens, hidden_size] bf16
   int32_t const* topk_target_ranks;
   uint64_t const* recv_source_mask;
   int32_t* round_state;
@@ -237,16 +271,15 @@ __device__ __forceinline__ int64_t landing_row(int ep_size, int source, int toke
 }
 
 // Polls the landing vectors whose bits are set in `pending` until each has arrived, every load in
-// flight before any check; address(i) is vector i's address, and before_each_spin() runs at the
-// start of every spin (e.g. to re-read address(i)'s inputs from shared memory, all before the
-// first load). Returns the bits still pending when the wait timed out (0: all arrived).
-template <int NUM_VECTORS, typename BeforeEachSpin, typename Address>
-__device__ __forceinline__ uint32_t poll_until_arrived(uint32_t pending, uint32_t sentinel,
-                                                       BeforeEachSpin const& before_each_spin,
-                                                       Address const& address,
-                                                       uint4 (&vectors)[NUM_VECTORS],
-                                                       long long wait_start,
-                                                       int64_t timeout_cycles) {
+// flight before any check; address(i) is vector i's address, sentinel_of(i) its sentinel, and
+// before_each_spin() runs at the start of every spin (e.g. to re-read address(i)'s inputs from
+// shared memory, all before the first load). Returns the bits still pending when the wait timed
+// out (0: all arrived).
+template <int NUM_VECTORS, typename SentinelOf, typename BeforeEachSpin, typename Address>
+__device__ __forceinline__ uint32_t
+poll_until_arrived(uint32_t pending, SentinelOf const& sentinel_of,
+                   BeforeEachSpin const& before_each_spin, Address const& address,
+                   uint4 (&vectors)[NUM_VECTORS], long long wait_start, int64_t timeout_cycles) {
   for (int spins = 1; pending; ++spins) {
     before_each_spin();
 #pragma unroll
@@ -254,7 +287,7 @@ __device__ __forceinline__ uint32_t poll_until_arrived(uint32_t pending, uint32_
       if ((pending >> i) & 1u) vectors[i] = load_volatile(address(i));
 #pragma unroll
     for (int i = 0; i < NUM_VECTORS; ++i)
-      if (((pending >> i) & 1u) && has_arrived(vectors[i], sentinel)) pending &= ~(1u << i);
+      if (((pending >> i) & 1u) && has_arrived(vectors[i], sentinel_of(i))) pending &= ~(1u << i);
     if (pending && spins % 64 == 0 && clock64() - wait_start > timeout_cycles) break;
   }
   return pending;
@@ -298,10 +331,12 @@ __device__ __forceinline__ void store_topk_words(uint32_t* row, int top_k, int v
     if (4 * vec + w < top_k) row[4 * vec + w] = words[w];
 }
 
-// ============================================== sender-side rewrites: no wire word is a sentinel
-// BF16 0xFFFFFFFF (two NaNs) -> 0x7FFF7FFF; FP8 data and fp32 / e4m3 scale or weight words
-// 0xFFFFFFFF -> 0x7FFFFFFF (NaN stays NaN); an id equal to kIdsSentinel (an invalid id) ->
-// invalid_expert_id. MXFP8 scales travel as 16-bit lanes 0x00XX, which never match.
+// ============================================ sender-side rewrites: no stored word is a sentinel
+// Each keeps the values a word encodes (NaN stays NaN): BF16 0xFFFFFFFF (two NaNs) -> 0x7FFF7FFF;
+// FP8 data and fp32 / e4m3 scale or weight words 0xFFFFFFFF -> 0x7FFFFFFF; NVFP4 -0 nibbles ->
+// +0; an id equal to kIdsSentinel (an invalid id) -> invalid_expert_id. UE8M0 has a single NaN,
+// so an MXFP8 block whose scale is NaN (0xFF) is stored as NaN values (e4m3 0x7F) with a scale of
+// 1 (0x7F): no scale byte is 0xFF.
 __device__ __forceinline__ uint32_t canonicalize_bf16x2(uint32_t word) {
   return word == kDataSentinel ? 0x7FFF7FFFu : word;
 }
@@ -314,17 +349,17 @@ __device__ __forceinline__ uint32_t canonicalize_expert_id(uint32_t id, uint32_t
   return id == kIdsSentinel ? invalid_id : id;
 }
 
-// NVFP4: every -0 nibble (1000b) becomes +0; the wire word is this XOR kNvfp4WireXor.
+// NVFP4: every -0 nibble (1000b) becomes +0, so that no word is kNvfp4Sentinel.
 __device__ __forceinline__ uint32_t canonicalize_fp4x8(uint32_t word) {
   uint32_t const magnitude = word & 0x77777777u;
   uint32_t const nonzero = (magnitude | (magnitude >> 1) | (magnitude >> 2)) & 0x11111111u;
   return word & (0x77777777u | (nonzero << 3));
 }
 
-// Wire <-> raw NVFP4 vector (an involution).
-__device__ __forceinline__ uint4 nvfp4_wire_xor(uint4 v) {
-  return make_uint4(v.x ^ kNvfp4WireXor, v.y ^ kNvfp4WireXor, v.z ^ kNvfp4WireXor,
-                    v.w ^ kNvfp4WireXor);
+// MXFP8 scales: every NaN byte (0xFF) becomes 1 (0x7F); its block's values are stored as NaN.
+__device__ __forceinline__ uint32_t canonicalize_ue8m0x4(uint32_t word) {
+  uint32_t const nan_bytes = ((word & 0x7F7F7F7Fu) + 0x01010101u) & word & 0x80808080u;
+  return word ^ nan_bytes;
 }
 
 // Combine partials: every bf16 lane 0xFFFF (a NaN) -> 0x7FFF.
@@ -339,24 +374,9 @@ __device__ __forceinline__ uint4 canonicalize_partial(uint4 v) {
                     canonicalize_bf16_lanes(v.z), canonicalize_bf16_lanes(v.w));
 }
 
-// MXFP8 scales: 8 UE8M0 bytes (raw) <-> 8 16-bit lanes 0x00XX (wire).
-__device__ __forceinline__ uint4 mx_scales_to_wire(uint2 raw) {
-  return make_uint4((raw.x & 0xFFu) | ((raw.x & 0xFF00u) << 8),
-                    ((raw.x >> 16) & 0xFFu) | ((raw.x >> 8) & 0xFF0000u),
-                    (raw.y & 0xFFu) | ((raw.y & 0xFF00u) << 8),
-                    ((raw.y >> 16) & 0xFFu) | ((raw.y >> 8) & 0xFF0000u));
-}
-
-__device__ __forceinline__ uint2 mx_scales_from_wire(uint4 wire) {
-  return make_uint2((wire.x & 0xFFu) | ((wire.x >> 8) & 0xFF00u) | ((wire.y & 0xFFu) << 16) |
-                        (((wire.y >> 16) & 0xFFu) << 24),
-                    (wire.z & 0xFFu) | ((wire.z >> 8) & 0xFF00u) | ((wire.w & 0xFFu) << 16) |
-                        (((wire.w >> 16) & 0xFFu) << 24));
-}
-
 // ============================================================================ dispatch phases
 // D1, warp 0, lane k = top-k slot k. Returns the token's target-rank mask (0 for a padding slot,
-// token >= local_num_tokens). Stages the token's wire ids row for D3 in s_ids_row_words
+// token >= local_num_tokens). Stages the token's ids row for D3 in s_ids_row_words
 // (canonical ids, invalid_expert_id past top_k) and, if topk_target_ranks_row is set, writes the
 // rank of every slot at its first occurrence (else -1).
 template <int TOP_K_CAPACITY, bool FIXED_TOP_K, bool ENABLE_RANK_MASK>
@@ -391,81 +411,60 @@ __device__ __forceinline__ uint64_t route_token(DispatchParams const& p, int tok
   return target_mask;
 }
 
-// D2 / D5: where vector `vec` of a wire row lives (payload vectors first, then scale vectors).
-struct WireVector {
+// D2 / D5 / R1: where vector `vec` of a landing row lives (payload vectors first, then scale
+// vectors).
+struct RowVector {
   bool is_payload;
   int64_t region_offset;  // the landing region
   int row_bytes;          // landing row
   int offset_in_row;      // bytes
 };
 
-__device__ __forceinline__ WireVector locate_wire_vector(DispatchParams const& p, int vec) {
+template <typename Params>
+__device__ __forceinline__ RowVector locate_row_vector(Params const& p, int vec) {
   if (vec < p.payload_vectors)
     return {true, p.landing.payload_offset, p.payload_row_bytes, vec * 16};
-  return {false, p.landing.scale_offset, p.wire_scale_row_bytes, (vec - p.payload_vectors) * 16};
+  return {false, p.landing.scale_offset, p.scale_row_bytes, (vec - p.payload_vectors) * 16};
 }
 
-// D2: vector `vec` of the token's wire row, canonicalised.
+// D2: vector `vec` of the token's row, canonicalised.
 template <int PAYLOAD_KIND>
-__device__ __forceinline__ uint4 load_wire_vector(DispatchParams const& p, int token,
-                                                  WireVector const& wv) {
-  if (wv.is_payload) {
+__device__ __forceinline__ uint4 load_row_vector(DispatchParams const& p, int token,
+                                                 RowVector const& rv) {
+  auto scale_row = [&] {
+    return p.hidden_states_scale + static_cast<int64_t>(token) * p.scale_row_bytes;
+  };
+  if (rv.is_payload) {
     uint4 const v = *reinterpret_cast<uint4 const*>(
-        p.hidden_states + static_cast<int64_t>(token) * p.payload_row_bytes + wv.offset_in_row);
+        p.hidden_states + static_cast<int64_t>(token) * p.payload_row_bytes + rv.offset_in_row);
     if constexpr (PAYLOAD_KIND == kKindBf16) {
       return make_uint4(canonicalize_bf16x2(v.x), canonicalize_bf16x2(v.y),
                         canonicalize_bf16x2(v.z), canonicalize_bf16x2(v.w));
     } else if constexpr (PAYLOAD_KIND == kKindFp8) {
+      // An MXFP8 vector holds 16 values of one 32-value block.
+      if (p.mx_scales && scale_row()[rv.offset_in_row / 32] == 0xFFu) return splat(0x7F7F7F7Fu);
       return make_uint4(canonicalize_word(v.x), canonicalize_word(v.y), canonicalize_word(v.z),
                         canonicalize_word(v.w));
     } else {
-      return nvfp4_wire_xor(make_uint4(canonicalize_fp4x8(v.x), canonicalize_fp4x8(v.y),
-                                       canonicalize_fp4x8(v.z), canonicalize_fp4x8(v.w)));
+      return make_uint4(canonicalize_fp4x8(v.x), canonicalize_fp4x8(v.y), canonicalize_fp4x8(v.z),
+                        canonicalize_fp4x8(v.w));
     }
   }
-  uint8_t const* scale_row =
-      p.hidden_states_scale + static_cast<int64_t>(token) * p.scale_row_bytes;
-  if (p.mx_scales)  // a wire vector = 8 raw UE8M0 bytes
-    return mx_scales_to_wire(*reinterpret_cast<uint2 const*>(scale_row + wv.offset_in_row / 2));
-  uint4 const v = *reinterpret_cast<uint4 const*>(scale_row + wv.offset_in_row);
+  uint4 const v = *reinterpret_cast<uint4 const*>(scale_row() + rv.offset_in_row);
+  if (p.mx_scales)
+    return make_uint4(canonicalize_ue8m0x4(v.x), canonicalize_ue8m0x4(v.y),
+                      canonicalize_ue8m0x4(v.z), canonicalize_ue8m0x4(v.w));
   return make_uint4(canonicalize_word(v.x), canonicalize_word(v.y), canonicalize_word(v.z),
                     canonicalize_word(v.w));
 }
 
-// D2 / D5: store a wire vector (own or received) into receive row `recv_row`, in raw format.
-template <int PAYLOAD_KIND>
-__device__ __forceinline__ void store_received_vector(DispatchParams const& p, int64_t recv_row,
-                                                      WireVector const& wv, uint4 wire) {
-  if (wv.is_payload) {
-    *reinterpret_cast<uint4*>(p.recv_hidden_states + recv_row * p.payload_row_bytes +
-                              wv.offset_in_row) =
-        PAYLOAD_KIND == kKindNvfp4 ? nvfp4_wire_xor(wire) : wire;
-    return;
-  }
-  uint8_t* scale_row = p.recv_hidden_states_scale + recv_row * p.scale_row_bytes;
-  if (p.mx_scales) {
-    *reinterpret_cast<uint2*>(scale_row + wv.offset_in_row / 2) = mx_scales_from_wire(wire);
-  } else {
-    *reinterpret_cast<uint4*>(scale_row + wv.offset_in_row) = wire;
-  }
-}
-
-// D2: store `wire` into the landing row (ep_rank, token) of every target rank; this rank's own
-// copy goes straight into its receive row `recv_row`.
-template <int PAYLOAD_KIND>
+// D2: store `v` into the landing row (ep_rank, token) of every target rank, this rank included.
 __device__ __forceinline__ void push_vector(DispatchParams const& p, uint64_t target_mask,
-                                            int token, int64_t recv_row, WireVector const& wv,
-                                            uint4 wire) {
+                                            int token, RowVector const& rv, uint4 v) {
   int64_t const offset =
-      wv.region_offset + landing_row(p.ep_size, p.ep_rank, token) * wv.row_bytes + wv.offset_in_row;
-  for (uint64_t targets = target_mask; targets;) {
-    int const target = pop_lowest_rank(targets);
-    if (target == p.ep_rank) {
-      store_received_vector<PAYLOAD_KIND>(p, recv_row, wv, wire);
-    } else {
-      store_volatile(p.rank_workspaces[target] + offset, wire);
-    }
-  }
+      rv.region_offset + landing_row(p.ep_size, p.ep_rank, token) * rv.row_bytes + rv.offset_in_row;
+  for (uint64_t targets = target_mask; targets;)
+    store_volatile(p.rank_workspaces[pop_lowest_rank(targets)] + offset, v);
 }
 
 // D3, chunk-0 block: the ids row (ep_rank, token) goes to EVERY alive peer (all invalid_expert_id
@@ -475,7 +474,7 @@ __device__ __forceinline__ void push_vector(DispatchParams const& p, uint64_t ta
 template <bool ENABLE_RANK_MASK>
 __device__ __forceinline__ void push_ids_and_weights(DispatchParams const& p, int top_k,
                                                      int ids_row_vectors, uint64_t target_mask,
-                                                     int token, int64_t recv_row,
+                                                     int token, int64_t own_row,
                                                      int64_t ids_set_offset, uint4 const* s_ids_row,
                                                      uint4 const* s_weights_row) {
   uint4 const no_target_ids = splat(static_cast<uint32_t>(p.invalid_expert_id));
@@ -487,10 +486,10 @@ __device__ __forceinline__ void push_ids_and_weights(DispatchParams const& p, in
     uint4 const ids = is_target ? s_ids_row[vec] : no_target_ids;
     bool const sends_weights = is_target && p.has_topk_weights;
     if (peer == p.ep_rank) {
-      store_topk_words(reinterpret_cast<uint32_t*>(p.recv_topk_ids) + recv_row * top_k, top_k, vec,
+      store_topk_words(reinterpret_cast<uint32_t*>(p.recv_topk_ids) + own_row * top_k, top_k, vec,
                        ids);
       if (sends_weights)
-        store_topk_words(p.recv_topk_weights + recv_row * top_k, top_k, vec, s_weights_row[vec]);
+        store_topk_words(p.recv_topk_weights + own_row * top_k, top_k, vec, s_weights_row[vec]);
       continue;
     }
     if (!is_rank_alive<ENABLE_RANK_MASK>(p.active_rank_mask, peer)) continue;
@@ -510,7 +509,7 @@ __device__ __forceinline__ void accept_ids_vector(DispatchParams const& p, int t
   if (ids.x != invalid_id || ids.y != invalid_id || ids.z != invalid_id || ids.w != invalid_id)
     atomicOr(reinterpret_cast<unsigned long long*>(&s_recv_source_mask), 1ull << source);
   if (chunk != 0) return;
-  int64_t const recv_row = static_cast<int64_t>(source) * p.max_tokens_per_rank + token;
+  int64_t const recv_row = landing_row(p.ep_size, source, token);
   store_topk_words(reinterpret_cast<uint32_t*>(p.recv_topk_ids) + recv_row * top_k, top_k, vec,
                    ids);
 }
@@ -519,7 +518,7 @@ __device__ __forceinline__ void accept_ids_vector(DispatchParams const& p, int t
 __device__ __forceinline__ void reject_masked_source(DispatchParams const& p, int top_k, int token,
                                                      int chunk, int source, int vec) {
   if (chunk != 0) return;
-  int64_t const recv_row = static_cast<int64_t>(source) * p.max_tokens_per_rank + token;
+  int64_t const recv_row = landing_row(p.ep_size, source, token);
   store_topk_words(reinterpret_cast<uint32_t*>(p.recv_topk_ids) + recv_row * top_k, top_k, vec,
                    splat(static_cast<uint32_t>(p.invalid_expert_id)));
 }
@@ -553,8 +552,8 @@ __device__ __forceinline__ void poll_ids_rows(DispatchParams const& p, int top_k
     return ids_rows + landing_row(p.ep_size, item / ids_row_vectors, token) * ids_row_bytes +
            (item % ids_row_vectors) * 16;
   };
-  pending =
-      poll_until_arrived(pending, kIdsSentinel, [] {}, address, ids, wait_start, p.timeout_cycles);
+  pending = poll_until_arrived(
+      pending, [](int) { return kIdsSentinel; }, [] {}, address, ids, wait_start, p.timeout_cycles);
   timed_out = pending != 0;
 #pragma unroll
   for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
@@ -577,13 +576,13 @@ __device__ __forceinline__ void list_sources(uint64_t source_mask, int* s_source
   if (lane == 0) *s_num_sources = __popc(low) + __popc(high);
 }
 
-// D5 / D6: poll, copy out (wire -> raw) and re-arm this thread's wire vector of every source in
-// s_sources[0, num_sources), 8 sources per round with every load in flight: n sources take
-// ceil(n / 8) rounds whatever their ranks. A round's sources are re-read from shared memory before
-// every spin's loads and before its copy-out (holding them across the round would exceed the
-// dispatch's register bound). A thread
-// with polls_weights (chunk 0, t < 8 * ids_row_vectors) also polls, as the round's vector 8,
-// weights vector t % ids_row_vectors of the round's source t / ids_row_vectors.
+// D5 / D6: poll this thread's vector of every source in s_sources[0, num_sources) until it has
+// arrived, 8 sources per round with every load in flight: n sources take ceil(n / 8) rounds
+// whatever their ranks. A round's sources are re-read from shared memory before every spin's
+// loads (holding them across the round would exceed the dispatch's register bound). A thread with
+// polls_weights (chunk 0, t < 8 * ids_row_vectors) also polls, as the round's vector 8, weights
+// vector t % ids_row_vectors of the round's source t / ids_row_vectors, then copies it out and
+// resets it.
 template <int PAYLOAD_KIND>
 __device__ __forceinline__ void receive_vectors(DispatchParams const& p, int top_k,
                                                 int ids_row_vectors, int token, int vec,
@@ -591,10 +590,12 @@ __device__ __forceinline__ void receive_vectors(DispatchParams const& p, int top
                                                 int num_sources, long long wait_start,
                                                 bool& timed_out) {
   constexpr int kWeights = 8;  // the round's vector 8: this thread's weights vector
-  bool const has_vector = vec < p.payload_vectors + p.wire_scale_vectors;
-  WireVector const wv = locate_wire_vector(p, vec);
+  bool const has_vector = vec < p.payload_vectors + p.scale_vectors;
+  RowVector const rv = locate_row_vector(p, vec);
+  uint32_t const vector_sentinel =
+      rv.is_payload && PAYLOAD_KIND == kKindNvfp4 ? kNvfp4Sentinel : kDataSentinel;
   uint8_t* const landing = p.rank_workspaces[p.ep_rank];
-  uint8_t* const vector_column = landing + wv.region_offset + wv.offset_in_row;
+  uint8_t* const vector_column = landing + rv.region_offset + rv.offset_in_row;
   int const weights_round_slot =
       polls_weights ? static_cast<int>(threadIdx.x) / ids_row_vectors : kWeights;  // 8: none
   int const weights_vec = static_cast<int>(threadIdx.x) % ids_row_vectors;
@@ -618,22 +619,14 @@ __device__ __forceinline__ void receive_vectors(DispatchParams const& p, int top
     auto address = [&](int i) {
       if (i == kWeights)
         return weights_column + landing_row(p.ep_size, weights_source, token) * ids_row_bytes;
-      return vector_column + landing_row(p.ep_size, sources[i], token) * wv.row_bytes;
+      return vector_column + landing_row(p.ep_size, sources[i], token) * rv.row_bytes;
     };
-    pending = poll_until_arrived(pending, kDataSentinel, read_sources, address, vectors, wait_start,
+    auto sentinel_of = [&](int i) { return i == kWeights ? kDataSentinel : vector_sentinel; };
+    pending = poll_until_arrived(pending, sentinel_of, read_sources, address, vectors, wait_start,
                                  p.timeout_cycles);
     timed_out = pending != 0;
-    uint32_t const received = polled & ~pending;
-    read_sources();
-#pragma unroll
-    for (int j = 0; j < kWeights; ++j) {
-      if (!((received >> j) & 1u)) continue;
-      int64_t const recv_row = static_cast<int64_t>(sources[j]) * p.max_tokens_per_rank + token;
-      store_received_vector<PAYLOAD_KIND>(p, recv_row, wv, vectors[j]);
-      store_volatile(address(j), splat(kDataSentinel));
-    }
-    if ((received >> kWeights) & 1u) {
-      int64_t const recv_row = static_cast<int64_t>(weights_source) * p.max_tokens_per_rank + token;
+    if (((polled & ~pending) >> kWeights) & 1u) {
+      int64_t const recv_row = landing_row(p.ep_size, weights_source, token);
       store_topk_words(p.recv_topk_weights + recv_row * top_k, top_k, weights_vec,
                        vectors[kWeights]);
       store_volatile(address(kWeights), splat(kDataSentinel));
@@ -664,12 +657,12 @@ __device__ __forceinline__ void receive_token_slot(DispatchParams const& p, int 
   __syncthreads();
   uint64_t const recv_source_mask = s_recv_source_mask;
   if (chunk == 0 && threadIdx.x == 0) p.recv_source_mask[token] = recv_source_mask;
-  if (threadIdx.x < 32)  // this rank's own row was received in D2
+  if (threadIdx.x < 32)  // this rank's own row was stored in D2
     list_sources(recv_source_mask & ~(1ull << p.ep_rank), s_sources, &s_num_sources);
   __syncthreads();
   bool const polls_weights =
       chunk == 0 && p.has_topk_weights && static_cast<int>(threadIdx.x) < 8 * ids_row_vectors;
-  if ((vec < p.payload_vectors + p.wire_scale_vectors || polls_weights) && !timed_out)  // D5, D6
+  if ((vec < p.payload_vectors + p.scale_vectors || polls_weights) && !timed_out)  // D5, D6
     receive_vectors<PAYLOAD_KIND>(p, top_k, ids_row_vectors, token, vec, polls_weights, s_sources,
                                   s_num_sources, wait_start, timed_out);
   if (timed_out)
@@ -690,7 +683,7 @@ __global__ void __launch_bounds__(kNumThreads, kDispatchBlocksPerSM)
   int const vec = chunk * kNumThreads + threadIdx.x;
   __shared__ uint64_t s_target_mask, s_recv_source_mask;
   __shared__ int s_landing_set;
-  __shared__ uint4 s_ids_row[kRowCapacity], s_weights_row[kRowCapacity];  // wire rows for D3
+  __shared__ uint4 s_ids_row[kRowCapacity], s_weights_row[kRowCapacity];  // rows for D3
   wait_for_previous_kernel();
   if (threadIdx.x < 32) {  // D1
     int const lane = threadIdx.x;
@@ -714,19 +707,43 @@ __global__ void __launch_bounds__(kNumThreads, kDispatchBlocksPerSM)
   __syncthreads();
   uint64_t const target_mask = s_target_mask;
   int64_t const ids_set_offset = s_landing_set * p.landing.ids_set_bytes;
-  int64_t const recv_row = static_cast<int64_t>(p.ep_rank) * p.max_tokens_per_rank + token;
-  if (target_mask && vec < p.payload_vectors + p.wire_scale_vectors) {  // D2
-    WireVector const wv = locate_wire_vector(p, vec);
-    push_vector<PAYLOAD_KIND>(p, target_mask, token, recv_row, wv,
-                              load_wire_vector<PAYLOAD_KIND>(p, token, wv));
+  if (target_mask && vec < p.payload_vectors + p.scale_vectors) {  // D2
+    RowVector const rv = locate_row_vector(p, vec);
+    push_vector(p, target_mask, token, rv, load_row_vector<PAYLOAD_KIND>(p, token, rv));
   }
   if (chunk == 0)  // D3
-    push_ids_and_weights<ENABLE_RANK_MASK>(p, top_k, ids_row_vectors, target_mask, token, recv_row,
-                                           ids_set_offset, s_ids_row, s_weights_row);
+    push_ids_and_weights<ENABLE_RANK_MASK>(p, top_k, ids_row_vectors, target_mask, token,
+                                           landing_row(p.ep_size, p.ep_rank, token), ids_set_offset,
+                                           s_ids_row, s_weights_row);
   allow_next_kernel();
   receive_token_slot<PAYLOAD_KIND, ENABLE_RANK_MASK>(p, top_k, ids_row_vectors, token, chunk, vec,
                                                      target_mask, ids_set_offset,
                                                      s_recv_source_mask);
+#else
+  __trap();  // not built for this architecture (see MOE_A2A_SENTINEL_COMPILE)
+#endif
+}
+
+// =============================================================================== reset kernel
+// R1, the dispatch's grid, between the expert computation (which has read the landing rows) and
+// the combine (whose partials let the sources store their next round into them): reset this
+// thread's vector of the payload and scale rows (src, token) of every other source that sent the
+// slot a token.
+template <int PAYLOAD_KIND>
+__global__ void __launch_bounds__(kNumThreads) moeA2ASentinelResetKernel(ResetParams const p) {
+#if MOE_A2A_SENTINEL_COMPILE
+  int const token = blockIdx.x / p.blocks_per_token, chunk = blockIdx.x % p.blocks_per_token;
+  int const vec = chunk * kNumThreads + threadIdx.x;
+  wait_for_previous_kernel();
+  allow_next_kernel();  // the combine still waits for this kernel's stores
+  if (vec >= p.payload_vectors + p.scale_vectors) return;
+  RowVector const rv = locate_row_vector(p, vec);
+  uint4 const sentinel =
+      splat(rv.is_payload && PAYLOAD_KIND == kKindNvfp4 ? kNvfp4Sentinel : kDataSentinel);
+  uint8_t* const column = p.rank_workspace + rv.region_offset + rv.offset_in_row;
+  for (uint64_t sources = p.recv_source_mask[token] & ~(1ull << p.ep_rank); sources;)
+    store_volatile(column + landing_row(p.ep_size, pop_lowest_rank(sources), token) * rv.row_bytes,
+                   sentinel);
 #else
   __trap();  // not built for this architecture (see MOE_A2A_SENTINEL_COMPILE)
 #endif
@@ -765,9 +782,7 @@ __device__ __forceinline__ void push_partials(CombineParams const& p, int token,
       sources[j] = unsent ? pop_lowest_rank(unsent) : -1;
       if (sources[j] >= 0)
         partials[j] = *reinterpret_cast<uint4 const*>(
-            p.expert_output +
-            (static_cast<int64_t>(sources[j]) * p.max_tokens_per_rank + token) * row_bytes +
-            vec * 16);
+            p.expert_output + landing_row(p.ep_size, sources[j], token) * row_bytes + vec * 16);
     }
 #pragma unroll
     for (int j = 0; j < 8; ++j)
@@ -787,7 +802,7 @@ __device__ __forceinline__ float sum_group(float const (&values)[8], int num_sou
 }
 
 // C3, sources 8 * group .. 8 * group + 7 of the slot-ordered list: poll their partials of this
-// rank's token (every load in flight), re-arm them, and sum each of the vector's 8 elements.
+// rank's token (every load in flight), reset them, and sum each of the vector's 8 elements.
 __device__ __forceinline__ void receive_group(CombineParams const& p, int token, int vec, int group,
                                               int num_sources, int const* s_sources,
                                               long long wait_start, bool& timed_out,
@@ -808,9 +823,7 @@ __device__ __forceinline__ void receive_group(CombineParams const& p, int token,
     partials[j] = make_uint4(0, 0, 0, 0);  // a missing source adds +0
     if (ranks[j] == p.ep_rank) {
       partials[j] = canonicalize_partial(*reinterpret_cast<uint4 const*>(
-          p.expert_output +
-          (static_cast<int64_t>(p.ep_rank) * p.max_tokens_per_rank + token) * row_bytes +
-          vec * 16));
+          p.expert_output + landing_row(p.ep_size, p.ep_rank, token) * row_bytes + vec * 16));
     } else if (ranks[j] >= 0) {
       pending |= 1u << j;
     }
@@ -821,7 +834,8 @@ __device__ __forceinline__ void receive_group(CombineParams const& p, int token,
            (static_cast<int64_t>(ranks[j]) * p.max_tokens_per_rank + token) * row_bytes;
   };
   if (poll_until_arrived(
-          pending, kDataSentinel, [] {}, address, partials, wait_start, p.timeout_cycles))
+          pending, [](int) { return kDataSentinel; }, [] {}, address, partials, wait_start,
+          p.timeout_cycles))
     timed_out = true;
 #pragma unroll
   for (int j = 0; j < 8; ++j)
@@ -861,10 +875,10 @@ __device__ __forceinline__ uint4 join_groups(float const (&group_sums)[NUM_GROUP
   return out;
 }
 
-// C4: re-arm this slot's ids rows of the round's landing set (their readers, the dispatch
+// C4: reset this slot's ids rows of the round's landing set (their readers, the dispatch
 // blocks, have all ended), then the last block closes the round and advances the epoch (every
 // block read it first).
-__device__ __forceinline__ void rearm_ids_and_advance_epoch(CombineParams const& p, int token,
+__device__ __forceinline__ void reset_ids_and_advance_epoch(CombineParams const& p, int token,
                                                             int chunk, int ids_row_vectors,
                                                             int landing_set) {
   if (chunk == 0) {
@@ -927,7 +941,7 @@ __global__ void __launch_bounds__(kNumThreads) moeA2ASentinelCombineKernel(Combi
   }
   if (timed_out)
     report_and_trap(p.round_state, p.ep_rank, "timed out waiting for a peer (combine)");
-  rearm_ids_and_advance_epoch(p, token, chunk, topk_row_vectors(top_k), s_landing_set);  // C4
+  reset_ids_and_advance_epoch(p, token, chunk, topk_row_vectors(top_k), s_landing_set);  // C4
 #else
   __trap();  // not built for this architecture (see MOE_A2A_SENTINEL_COMPILE)
 #endif
@@ -938,6 +952,8 @@ __global__ void __launch_bounds__(kNumThreads) moeA2ASentinelCombineKernel(Combi
 bool moe_a2a_sentinel_kernels_available();
 void moe_a2a_sentinel_dispatch_launch(int payload_kind, DispatchParams const& params,
                                       bool enable_rank_mask, bool enable_pdl, cudaStream_t stream);
+void moe_a2a_sentinel_reset_launch(int payload_kind, ResetParams const& params, bool enable_pdl,
+                                   cudaStream_t stream);
 void moe_a2a_sentinel_combine_launch(CombineParams const& params, bool enable_rank_mask,
                                      bool enable_pdl, cudaStream_t stream);
 
