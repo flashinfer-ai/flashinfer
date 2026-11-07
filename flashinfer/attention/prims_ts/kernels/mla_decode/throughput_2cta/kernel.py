@@ -2639,6 +2639,9 @@ class MlaDecodeTs(Nvfp4KVConfig):
             runtime_seq_len_q=seq_len_q,
             cp_rank=cp_rank,
         )
+        # Release the following PDL grid after this thread's stores.
+        if cutlass.const_expr(self.enable_pdl):
+            prims.griddepcontrol(kind=prims.GridDepAction.LAUNCH_DEPENDENTS)
 
     @cute.kernel
     def parallel_reduction_kernel(
@@ -2701,3 +2704,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
             split_divisor=split_divisor,
             cp_rank=cp_rank,
         )
+        # G1 returns here after its stores and G2+ after its final cluster
+        # barrier; both release the following PDL grid.
+        if cutlass.const_expr(self.enable_pdl):
+            prims.griddepcontrol(kind=prims.GridDepAction.LAUNCH_DEPENDENTS)
