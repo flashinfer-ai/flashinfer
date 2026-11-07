@@ -53,6 +53,31 @@ from ..gemm.batch_invariant.spec import MMA_K_OF, GemmSpec, reduction
 LEAN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lean")
 CASES_PATH = os.path.join(LEAN_DIR, "BIKernels", "Cases.lean")
 
+# attention toy cases: (name, D, T, C, p, window_left, row id, d) -- T = 16 (one PV step per tile) and C = 32 keep the printed
+# terms small; D = 64 / 128 / 256 are the three classes (4 / 8 / 16 MMA steps per score)
+ATTN_CASES = [
+    ("a0", 64, 16, 32, 40, -1, 0, 0),
+    ("a1", 64, 16, 32, 40, 20, 0, 1),
+    ("a2", 64, 16, 32, 7, -1, 3, 0),
+    ("a3", 64, 16, 32, 33, 5, 1, 2),
+    ("a4", 128, 16, 32, 40, -1, 0, 0),
+    ("a5", 128, 16, 32, 33, 5, 1, 2),
+    ("a6", 256, 16, 32, 40, -1, 0, 0),
+    ("a7", 256, 16, 32, 33, 5, 1, 2),
+    (
+        "a8",
+        64,
+        16,
+        32,
+        100,
+        0,
+        0,
+        0,
+    ),  # the window starts past the first chunks: chunks 0-2 absent, key 100 alone visible
+    ("a9", 64, 32, 64, 40, -1, 0, 0),  # two PV slices per tile (T = 2 x MMA_K)
+]
+ATTN_HEAD_DIMS = (64, 128, 256)
+
 GEMM_CASES = [
     (64, 1),
     (128, 1),
@@ -416,7 +441,20 @@ FORMATS: Tuple[LeanFormat, ...] = (
 BY_FMT: Dict[str, LeanFormat] = {F.in_fmt: F for F in FORMATS}
 #: The generated theorems closed by ``native_decide`` (the exhaustive checks over the configuration spaces); every
 #: other case is kernel ``decide``. ``lean/Axioms.lean`` pins exactly these names.
-DECIDED_THEOREMS = tuple(n for F in FORMATS for n in F.decided)
+DECIDED_THEOREMS = (
+    tuple(n for F in FORMATS for n in F.decided)
+    + tuple(f"attn_{n}_spec" for n, *_ in ATTN_CASES)
+    + tuple(
+        f"attn_space_d{D}_{what}" for D in ATTN_HEAD_DIMS for what in ("size", "ok")
+    )
+)
+#: `native_decide` theorems of the hand-written modules (not of the generated `Cases.lean`): the attention class-separation
+#: statements on toy rows; listed in `lean/Axioms.lean` with the generated ones.
+MODULE_DECIDED_THEOREMS = (
+    "Attn.output_depends_on_C",
+    "Attn.output_depends_on_D",
+    "Attn.output_depends_on_D_64",
+)
 
 
 def lean_str(s: str) -> str:
@@ -463,6 +501,30 @@ def bias_cases() -> List[Tuple[int, int, str]]:
         (K, C, term.sexpr(GemmSpec(K, chunks=C, bias=True).out(0, 0)))
         for K, C in GEMM_BIAS_CASES
     ]
+
+
+def attn_cases() -> List[Tuple[str, int, int, int, int, int, int, int, str]]:
+    """The attention toy cases with the Python spec's S-expression of the output element."""
+    from ..attention.batch_invariant.spec import AttentionSpec, RowSpec
+    from .fp_interface.term import sexpr
+
+    out = []
+    for name, D, T, C, p, win, rid, d in ATTN_CASES:
+        sx = sexpr(
+            AttentionSpec(D, T=T, C=C).output(RowSpec(p=p, window_left=win, row=rid), d)
+        )
+        out.append((name, D, T, C, p, win, rid, d, sx))
+    return out
+
+
+def attn_spaces() -> Dict[int, list]:
+    """The attention kernel's configuration space per head dim (`engine.all_valid_configs`)."""
+    from ..attention.batch_invariant.engine import all_valid_configs
+
+    spaces = {D: all_valid_configs(D) for D in ATTN_HEAD_DIMS}
+    for D, cfgs in spaces.items():
+        assert all(c.well_formed(D) for c in cfgs), D
+    return spaces
 
 
 def chunk_table(in_fmt: str = "bf16") -> List[Tuple[int, int, int]]:
@@ -785,12 +847,65 @@ def _render_bias(L: List[str]) -> None:
     L.append("")
 
 
+def _render_attention(L: List[str]) -> None:
+    """The attention class: the toy-case spec terms and the per-head-dim configuration spaces."""
+    mk = MMA_K_OF["bf16"]
+    L.append(
+        "/-! The attention class on toy sizes (T = 16: one PV step per tile; C = 32; D = 64 / 128 / 256 = 4 / 8 / 16 MMA steps per "
+        "score): the Python spec's output element (`attention/batch_invariant/spec.py`) reproduced by `Attention.lean` node for node, "
+        "and the split kernel's equality to it instantiated on every case. -/"
+    )
+    for name, D, T, C, p, win, rid, d, sx in attn_cases():
+        tb = T.bit_length() - 1
+        L.append(
+            f"def attnP_{name} : Attn.Params := ⟨{D // mk}, {tb}, {C}, {p}, {win}, {rid}, {d}⟩"
+        )
+        L.append(
+            f"theorem attn_{name}_spec : (Attn.output attnP_{name}).sexpr = {lean_str(sx)} := by native_decide"
+        )
+        L.append(
+            f"theorem attn_{name}_split : ∀ σ : Nat → Nat, Attn.splitKernel attnP_{name} σ = Attn.output attnP_{name} := "
+            f"fun σ => Attn.splitKernel_eq_fused _ σ"
+        )
+    L.append(
+        "def attnCases : List (String × Attn.Params) := ["
+        + ", ".join(f'("{n}", attnP_{n})' for n, *_ in ATTN_CASES)
+        + "]"
+    )
+    L.append("")
+    L.append(
+        "/-! The attention kernel's configuration space per head dim (`engine.all_valid_configs(D)`): every knob record checked "
+        "against the static constraints (`ConfigOKD`), counted, and `space_invariant` instantiated on it (R3). -/"
+    )
+    for D, cfgs in attn_spaces().items():
+        L.append(
+            f"def attnSpaceD{D} : List Attn.Config := ["
+            + ", ".join(c.lean() for c in cfgs)
+            + "]"
+        )
+        L.append(
+            f"theorem attn_space_d{D}_size : attnSpaceD{D}.length = {len(cfgs)} := by native_decide"
+        )
+        L.append(
+            f"theorem attn_space_d{D}_ok : attnSpaceD{D}.all (Attn.ConfigOKD {D}) = true := by native_decide"
+        )
+        L.append(
+            f"theorem attn_space_d{D}_invariant : ∀ b₁ ∈ attnSpaceD{D}, ∀ b₂ ∈ attnSpaceD{D}, "
+            "∀ (f₁ f₂ : Bool) (P : Attn.Params) (σ τ : Nat → Nat), Attn.kernel b₁ f₁ P σ = Attn.kernel b₂ f₂ P τ := "
+            f"Attn.space_invariant attnSpaceD{D}"
+        )
+    L.append("")
+
+
 def render() -> str:
     """The content of ``Cases.lean``."""
     L = [
+        "-- Copyright (c) 2026 by FlashInfer team.",
+        "-- SPDX-License-Identifier: Apache-2.0",
         "import BIKernels.GEMM",
         "import BIKernels.GEMMConfig",
         "import BIKernels.Export",
+        "import BIKernels.Attention",
         "namespace BIK",
         "-- GENERATED by flashinfer/batch_invariant/lean_cases.py from the Python spec / engine; do not edit.",
         "set_option maxRecDepth 4096",
@@ -801,6 +916,7 @@ def render() -> str:
     _render_bias(L)
     for F in FORMATS[1:]:
         _render_format(L, F)
+    _render_attention(L)
     L.append("end BIK")
     return "\n".join(L) + "\n"
 
@@ -820,6 +936,7 @@ def summary() -> str:
         "lean_cases coverage: "
         + "; ".join(parts)
         + f"; bias cases={len(GEMM_BIAS_CASES)}; native_decide theorems={len(DECIDED_THEOREMS)}"
+        + f"; attention cases={len(ATTN_CASES)} attention spaces={[len(v) for v in attn_spaces().values()]}"
     )
 
 

@@ -19,7 +19,8 @@ same launch forms, and two rows at H8 and H32): ``out``, the five gradients and 
 returns ``out * w``) with the hand-off on are bitwise those with it off and those of the direct pass, for
 ``use_reentrant`` False and True, with a recompute handle (both tiers), on a lean arena and a per-call workspace,
 with the ring exchange (where the partition allows it) and the overlap schedule, and over two backwards
-(``retain_graph``); the forward's launches and every collective are unchanged; the backward launches no intra
+(``retain_graph``); a forward that keeps the tape set runs the tape walk and ``fwd_o`` where the light forward
+runs the fused walk ``kcp_fwdh_o``, its other launches and every collective unchanged; the backward launches no intra
 program, WY or K1 tape walk; the saved set grows by the byte query's difference; a NaN-filled tape set, poisoned free
 blocks and a poisoned local arena (between the recompute and the backward) change no bit; ranks that decide
 differently (``"on"`` on some, ``"off"`` on others) change no bit; the refusals (``"off"``, no checkpoint, a blocked
@@ -276,12 +277,24 @@ def _run_rank_handoff(
             for r in (recs["orig"], recs["fwd"], recs["bwd"])
         )
 
+    def light_form(rec) -> list:
+        """A forward's launches in the light path's form: a forward that kept the tape set runs the tape walk and
+        ``fwd_o`` where the light forward runs the fused walk ``kcp_fwdh_o`` (its backward reads the tapes)."""
+        seq = rec["sequence"]
+        if rec.get("checkpoint_handoff") != "save":
+            return list(seq)
+        if seq.count("fwd_o") != 1 or "kcp_fwdh_o" in seq:
+            return ["not the tape form", *seq]  # never the light path's sequence
+        return [
+            ("kcp_fwdh_o" if x == "kcp_fwdh_tape" else x) for x in seq if x != "fwd_o"
+        ]
+
     def skips(recs_on, recs_off) -> bool:
-        """The hand-off's backward launches none of SKIPPED; the forward's launches and the backward's collectives
-        are the light path's."""
+        """The hand-off's backward launches none of SKIPPED; the forward's launches (in the light path's form,
+        :func:`light_form`) and the backward's collectives are the light path's."""
         on_b, off_b = recs_on["bwd"]["sequence"], recs_off["bwd"]["sequence"]
-        ok = recs_on["orig"]["sequence"] == recs_off["orig"]["sequence"]
-        ok = ok and recs_on["fwd"]["sequence"] == recs_off["fwd"]["sequence"]
+        ok = light_form(recs_on["orig"]) == recs_off["orig"]["sequence"]
+        ok = ok and light_form(recs_on["fwd"]) == recs_off["fwd"]["sequence"]
         ok = ok and _collectives(on_b) == _collectives(off_b)
         ok = ok and recs_on["bwd"]["n_collectives"] == recs_off["bwd"]["n_collectives"]
         if T_r > 0:
