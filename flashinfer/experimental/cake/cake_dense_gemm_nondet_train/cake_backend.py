@@ -1614,9 +1614,9 @@ class _VerdictTable(dict):
 #: weight gradient's head/tail program, :func:`router_partition_of`) or one of :func:`router_units_of` (``"forward"``,
 #: ``"pairs"``, ``"tiles"``, ``"S<n>"`` or a unit count) -- runs this package's stream-K program, a SIMT spec
 #: ``"simt_n<tile_n>m<tile_m>s<slices>[<form>]"`` the exact-FP32 program (plain, or compensated with a form) of the
-#: row's layout on the CUDA cores (:func:`router_simt`); ``None`` runs the deterministic program (its production
-#: split count).  A rule is ``None``, token windows ``((min_tokens, max_tokens, spec), ...)`` -- the spec of the window
-#: that holds the launch's token count (``K`` of the weight gradient, ``M`` of the forward and of the input gradient);
+#: row's layout on the CUDA cores (:func:`router_simt`); ``None`` runs the deterministic program (the split count
+#: that package plans for the row, its ``router_splits``).  A rule is ``None``, token windows
+#: ``((min_tokens, max_tokens, spec), ...)`` -- the spec of the window that holds the launch's token count (``K`` of the weight gradient, ``M`` of the forward and of the input gradient);
 #: every other token count runs the deterministic program -- or a spec alone, at every token count (the plan a test or a
 #: measurement forces; no row ships one).  A window carries a spec only where that partition was faster than the
 #: deterministic package's shipped plan in every measurement run at the token counts measured in it (one long-lived
@@ -1882,13 +1882,15 @@ ROUTER_FWD_SIMT_BLOCK_K = 128
 #: The forward's largest explicit split count: an element of the forward takes at most two partials, so a forward
 #: recomputed under activation checkpointing repeats bit for bit (``0 + a + b == 0 + b + a``).
 ROUTER_FORWARD_MAX_SPLITS = 2
-#: The deterministic package's production split count of the router weight gradient (its ``ROUTER_SPLITS["nn_t"]``):
-#: the plan the ``"waves"`` partition is measured against.
+#: The deterministic package's default split count of the router weight gradient (its ``ROUTER_SPLITS["nn_t"]``):
+#: the plan the ``"waves"`` partition is measured against, and the count of :func:`router_waves` without one.
+#: :func:`router_partition` passes the count that package plans for the row (its ``router_splits``), which differs
+#: from this one only on the rows of its ``ROUTER_SPLIT_RULES``; none of them meets a ``"waves"`` window.
 ROUTER_DET_WGRAD_SPLITS = 6
 #: The ``"waves"`` partition: about this many K blocks (32 elements each) of one tile per unit ...
 ROUTER_WAVE_K_BLOCKS = 68
 #: ... and only where the deterministic plan fills its last wave of CTA pairs below this fraction
-#: (``w / ceil(w)``, ``w = ROUTER_DET_WGRAD_SPLITS * tiles / pairs``).
+#: (``w / ceil(w)``, ``w = splits * tiles / pairs``, ``splits`` that plan's split count).
 ROUTER_WAVE_MAX_DET_FILL = 0.8
 
 
@@ -1906,15 +1908,21 @@ def router_rules(
 
 
 def router_waves(
-    m_pairs: int, n_tiles: int, k_iters: int, sm_count: int
+    m_pairs: int,
+    n_tiles: int,
+    k_iters: int,
+    sm_count: int,
+    det_splits: int = ROUTER_DET_WGRAD_SPLITS,
 ) -> Optional[int]:
     """The ``"waves"`` unit count on a device of ``sm_count`` SMs (CTA pairs ``sm_count // 2``): whole waves of the
     CTA pairs, ``c * pairs`` units with ``c = max(2, round(tiles * k_iters / (ROUTER_WAVE_K_BLOCKS * pairs))) + 1``
     (spans of about ``ROUTER_WAVE_K_BLOCKS`` K blocks of a tile, one wave more, so a kernel holding SMs on another
     stream delays a fine last wave rather than a coarse one), or ``None`` (the deterministic program) where the
-    deterministic plan's last wave is at least :data:`ROUTER_WAVE_MAX_DET_FILL` full."""
+    deterministic plan's last wave is at least :data:`ROUTER_WAVE_MAX_DET_FILL` full.  ``det_splits`` is that plan's
+    split count (default :data:`ROUTER_DET_WGRAD_SPLITS`; :func:`router_partition` passes the deterministic
+    package's count of the row)."""
     tiles, pairs = m_pairs * n_tiles, max(1, int(sm_count) // 2)
-    det_waves = ROUTER_DET_WGRAD_SPLITS * tiles / pairs
+    det_waves = int(det_splits) * tiles / pairs
     if det_waves / math.ceil(det_waves) >= ROUTER_WAVE_MAX_DET_FILL:
         return None
     return (max(2, round(tiles * k_iters / (ROUTER_WAVE_K_BLOCKS * pairs))) + 1) * pairs
@@ -2206,9 +2214,10 @@ def router_partition(
       :data:`ROUTER_RULES_BY_SM`, that table; :func:`router_rules`): the spec of its token window that holds the
       launch's token count (``K`` of the weight gradient, ``M`` of the forward), on a device of
       :data:`ROUTER_SM_COUNT` SMs or one with a table of its own (a ``"waves"`` window on every device where
-      :func:`router_waves` gives a partition); a row, token count or SM count without one, or a head/tail partition
-      the token count cannot hold (:func:`router_partition_fits`), runs the deterministic program.  A SIMT window is
-      no partition (``None``): the launch runs the SIMT program there (:func:`router_simt`).
+      :func:`router_waves` gives a partition against the deterministic package's split count of the row, its
+      ``router_splits``); a row, token count or SM count without one, or a head/tail partition the token count cannot
+      hold (:func:`router_partition_fits`), runs the deterministic program.  A SIMT window is no partition (``None``):
+      the launch runs the SIMT program there (:func:`router_simt`).
 
     A forward partition must give every element at most two partials (:func:`router_at_most_two_partials`) and
     cannot be a head/tail partition: ``ValueError`` otherwise."""
@@ -2233,7 +2242,11 @@ def router_partition(
     else:
         spec = _router_rule_spec(layout, arch=arch, sm_count=sm_count, M=M, N=N, K=K)
         if spec == "waves":  # its own SM-count condition, on every SM count
-            spec = router_waves(m_pairs, n_tiles, k_iters, sm_count)
+            # the deterministic plan the row runs without the partition: that package's split count of the row
+            det_splits = deterministic_backend().router_splits(
+                layout, M, N, K, arch, sm_count
+            )
+            spec = router_waves(m_pairs, n_tiles, k_iters, sm_count, det_splits)
         elif not router_rules(arch, sm_count)[1]:
             return None
         if spec is None or _router_is_simt(spec):
@@ -3356,9 +3369,9 @@ def _atomic_k2(
     """This package's K2 GEMM ``out = A @ B`` (FP32 through the BF16x3 emulation, or a SIMT program) of the layout
     classes ``kk`` / ``kn`` / ``nn_t``: ``op`` is ``"plan"``, ``"prepare"`` or ``"launch"`` as for
     :func:`_atomic_k1`.  A plan or a prepared launch :func:`plan_atomic_router` keeps on the deterministic program is
-    the deterministic package's object of ``op`` with the caller's ``splits`` (``None``: its production split count);
-    a launch runs that program through this package's binding (:func:`_launch_cached_atomic_k2`; ``views``: an entry
-    point's own launch views).
+    the deterministic package's object of ``op`` with the caller's ``splits`` (``None``: its split count of the row,
+    ``router_splits``); a launch runs that program through this package's binding (:func:`_launch_cached_atomic_k2`;
+    ``views``: an entry point's own launch views).
     ``enable_pdl`` (default: the device supports it) launches the split and the program as programmatic dependent
     launches."""
     if op == "launch":
@@ -3551,8 +3564,9 @@ _K2_PARTIALS_ARG = _Arg("partials")
 #: sum is one more launch in the bound launch chain instead of a PyTorch operator.  The tests check the program against
 #: ``torch.sum`` and against the written order on every split count it serves.
 PARTIALS_SUM_TEMPLATE = cake_jit.TEMPLATE_PREFIXES[5]
-#: The split counts the partial sum serves (its kernel requires two to eight; the deterministic router planner issues
-#: four for the forward and six for the weight gradient).
+#: The split counts the partial sum serves (its kernel requires two to eight).  The deterministic router planner issues
+#: four for the forward and six for the weight gradient, except on the rows of its ``ROUTER_SPLIT_RULES``: three
+#: (served) and nine (``torch.sum``) for the weight gradient.
 PARTIALS_SUM_SPLITS = range(2, 9)
 #: Threads per CTA of the partial sum and the ``out`` columns each thread sums (a flat grid over the rows' column
 #: quads).
@@ -4989,7 +5003,7 @@ def _pdl_kw(enable_pdl: Optional[bool]) -> dict[str, Any]:
 
 def _splits_kw(splits: Optional[int]) -> dict[str, Any]:
     """The ``splits`` keyword for a deterministic call: absent when the caller gave none, so the deterministic
-    package's own default (its production split count) applies."""
+    package's own split count of the row (its ``router_splits``) applies."""
     return {} if splits is None else {"splits": splits}
 
 
@@ -5538,7 +5552,9 @@ def cake_dense_gemm_nondet_train_router_wgrad(
     """``out[N, K] = G[T, N].T @ X[T, K]`` in FP32: the swapped GEMM ``X.T @ G`` with a
     transposed store; ``splits`` defaults to the partition of the row's verdict in :data:`ROUTER_RULES` or, on a part
     with a table of its own, in :data:`ROUTER_RULES_BY_SM` (:func:`router_partition`; a row or token count without one
-    runs the deterministic program, through this package's binding of it without planning the row here,
+    runs the deterministic program at that package's split count of the row -- its ``router_splits``: six; nine at
+    hidden 5120 and three at hidden 6144 from 16129 to 16384 tokens on 148- and 152-SM ``sm_100a`` / ``sm_103a``
+    parts, its ``ROUTER_SPLIT_RULES`` -- through this package's binding of it without planning the row here,
     :func:`_launch_cached_splitk_k2`)."""
     if out is None:
         out = torch.empty(G.shape[1], X.shape[1], device=G.device, dtype=torch.float32)

@@ -3265,9 +3265,29 @@ def test_router_head_tail_partition():
 
 def test_router_waves_partition():
     """``"waves"``: ``c`` whole waves of the CTA pairs, ``c = max(2, round(tiles * k_iters / (68 * pairs))) + 1``,
-    only where the deterministic plan (6 splits per tile) fills its last wave below 0.8; the deterministic split
-    count is the deterministic package's."""
+    only where the deterministic plan (``det_splits`` per tile, by default the deterministic package's default count,
+    6) fills its last wave below 0.8.  No weight-gradient row of the deterministic package's ``ROUTER_SPLIT_RULES``
+    meets a ``"waves"`` window of a router table (same architecture and hidden size, overlapping token counts): the
+    windows were measured against the default count, which is that package's count at every token count they hold."""
     assert det_backend.ROUTER_SPLITS["nn_t"] == cake_backend.ROUTER_DET_WGRAD_SPLITS
+    waves = [
+        (key[0], key[2], lo, hi)
+        for table in (
+            cake_backend.ROUTER_RULES,
+            *cake_backend.ROUTER_RULES_BY_SM.values(),
+        )
+        for key, rule in table.items()
+        if key[1] == "nn_t" and isinstance(rule, tuple)
+        for lo, hi, spec in rule
+        if spec == "waves"
+    ]
+    assert waves
+    for (arch, _, layout, hidden), windows in det_backend.ROUTER_SPLIT_RULES.items():
+        for lo, hi, _ in windows:
+            assert layout != "nn_t" or not any(
+                (a, h) == (arch, hidden) and lo <= w_hi and w_lo <= hi
+                for a, h, w_lo, w_hi in waves
+            ), (arch, hidden, lo, hi)
     # hidden 5120 (20 row-tile pairs x 2 column tiles), T = 16231 (508 K blocks)
     assert cake_backend.router_waves(20, 2, 508, 152) == 5 * 76
     assert cake_backend.router_waves(20, 2, 508, 216) == 4 * 108
@@ -3281,6 +3301,32 @@ def test_router_waves_partition():
     # few tiles: at least two waves, plus one
     assert cake_backend.router_waves(8, 2, 508, 152) == 3 * 76
     assert cake_backend.router_waves(20, 2, 129, 152) == 3 * 76
+    # another deterministic split count: nine fill the last wave of 76 pairs to 95 % (deterministic), three to 79 %
+    assert cake_backend.router_waves(20, 2, 508, 152, 9) is None
+    assert cake_backend.router_waves(20, 2, 508, 152, 3) == 5 * 76
+
+
+def test_router_partition_waves_weighs_the_deterministic_count_of_the_row(monkeypatch):
+    """A ``"waves"`` window weighs the plan the row runs without it: the deterministic package's split count of the
+    row (its ``router_splits``), so a row of its ``ROUTER_SPLIT_RULES`` in the window moves the partition's condition
+    with it.  Hidden 5120 at 192 tokens on a 153-SM ``sm_103a`` part (the ``"waves"`` window under the 152-SM SIMT
+    window): six splits fill the last wave of the 76 CTA pairs to 79 % (``"waves"``), nine to 95 % (the
+    deterministic program)."""
+    kw = dict(arch="sm_103a", sm_count=153, M=5120, N=256, K=192)
+    assert cake_backend._router_rule_spec("nn_t", **kw) == "waves"
+    assert det_backend.router_splits("nn_t", 5120, 256, 192, "sm_103a", 153) == 6
+    units = cake_backend.router_waves(20, 2, 6, 153)
+    assert units is not None
+    units = cake_backend.router_units_of(units, 20, 2, 6, 153)
+    assert cake_backend.router_partition("nn_t", **kw) == (units, 0, 0)
+    monkeypatch.setitem(
+        det_backend.ROUTER_SPLIT_RULES, ("sm_103a", 153, "nn_t", 5120), ((1, 192, 9),)
+    )
+    assert det_backend.router_splits("nn_t", 5120, 256, 192, "sm_103a", 153) == 9
+    assert cake_backend.router_partition("nn_t", **kw) is None
+    assert cake_backend.router_partition("nn_t", **{**kw, "K": 128}) is None
+    # another SM count keeps the default count (154 SMs: 77 pairs, the last wave 78 % full)
+    assert cake_backend.router_partition("nn_t", **{**kw, "sm_count": 154}) is not None
 
 
 def test_router_units_policy(monkeypatch):
@@ -6992,6 +7038,106 @@ def test_router_dgrad_entry_binds_the_simt_program(monkeypatch, T):
         assert args[2].data_ptr() == out.data_ptr()
 
 
+class _ReportsCuda(torch.Tensor):
+    """A CPU tensor whose ``is_cuda`` is true: the deterministic router planner reads the device's facts (for its
+    ``router_splits``) only for an ``out`` on a CUDA device."""
+
+    @property
+    def is_cuda(self):
+        return True
+
+
+# The parts with weight-gradient rows in the deterministic package's ROUTER_SPLIT_RULES, (arch, SM count)
+ROUTER_SPLIT_RULE_PARTS = sorted(
+    {
+        (a, sms)
+        for a, sms, layout, _ in det_backend.ROUTER_SPLIT_RULES
+        if layout == "nn_t"
+    }
+)
+
+
+@pytest.mark.parametrize("arch,sm_count", ROUTER_SPLIT_RULE_PARTS)
+def test_router_wgrad_split_rule_rows_take_the_deterministic_count(
+    monkeypatch, arch, sm_count
+):
+    """The weight gradient on a part with rows in the deterministic package's ``ROUTER_SPLIT_RULES``, at the edges of
+    each window, one token outside them and at the edges of this package's windows of the row among them: a token
+    count where this package has neither a partition nor a SIMT window (:func:`router_partition`,
+    :func:`router_simt`) runs the deterministic program through this package's binding at the deterministic
+    package's count of the row (its ``router_splits``: the rule's count inside the window, the default one outside),
+    its partials reduced by this package's partial sum where it serves the count, else by ``torch.sum``; every other
+    token count runs this package's program.  ``cake_dense_gemm_nondet_train_router_plan`` plans the same: the
+    deterministic package's plan (its count) where the call runs the deterministic program."""
+    _cpu_k2_launches(monkeypatch, arch)
+    facts = det_backend.DeviceFacts(
+        index=0, arch=arch, sm_count=sm_count, l2_bytes=126 << 20
+    )
+    monkeypatch.setattr(det_backend, "device_facts", lambda device=None: facts)
+    det_launch, own_launch = Recorder(), Recorder()
+    monkeypatch.setattr(cake_backend, "_launch_splitk_k2_binding", det_launch)
+    monkeypatch.setattr(cake_backend, "_launch_atomic_k2_binding", own_launch)
+    table, _ = cake_backend.router_rules(arch, sm_count)
+    default = det_backend.ROUTER_SPLITS["nn_t"]
+    ran = set()  # (hidden, tokens, splits) run on the deterministic program
+    for (a, sms, layout, hidden), windows in det_backend.ROUTER_SPLIT_RULES.items():
+        if (a, sms, layout) != (arch, sm_count, "nn_t"):
+            continue
+        rule = table.get((arch, "nn_t", hidden, 256))
+        own = rule if isinstance(rule, tuple) else ()
+        for lo, hi, splits in windows:
+            tokens = {lo - 1, lo, hi, hi + 1} | {
+                t
+                for first, last, _ in own
+                for t in (first - 1, first, last, last + 1)
+                if lo - 1 <= t <= hi + 1
+            }
+            for T in sorted(tokens):
+                want = splits if lo <= T <= hi else default
+                assert (
+                    det_backend.router_splits("nn_t", hidden, 256, T, arch, sm_count)
+                    == want
+                )
+                kw = dict(arch=arch, sm_count=sm_count, M=hidden, N=256, K=T)
+                runs_own = (
+                    cake_backend.router_partition("nn_t", **kw) is not None
+                    or cake_backend.router_simt("nn_t", **kw) is not None
+                )
+                X, G = torch.empty(T, hidden), torch.empty(T, 256)
+                out = torch.empty(256, hidden).as_subclass(_ReportsCuda)
+                plan, *_ = det_backend.cake_dense_gemm_det_train_router_plan(
+                    G.t(), X, out
+                )
+                assert plan.splits == want, (hidden, T)
+                plan = cake_backend.cake_dense_gemm_nondet_train_router_plan(
+                    G.t(), X, out
+                )
+                assert (
+                    isinstance(plan, cake_backend.CakeDenseGemmNondetRouterPlan)
+                    == runs_own
+                )
+                cake_backend._drop_convenience_entries()
+                det_launch.calls.clear()
+                own_launch.calls.clear()
+                assert (
+                    cake_backend.cake_dense_gemm_nondet_train_router_wgrad(G, X, out)
+                    is out
+                )
+                if runs_own:
+                    assert len(own_launch.calls) == 1 and not det_launch.calls
+                    continue
+                assert plan[0].splits == want, (hidden, T)
+                assert len(det_launch.calls) == 1 and not own_launch.calls
+                (entry,) = cake_backend._K2_SPLITK_CACHE.values()
+                assert entry.plan.splits == want, (hidden, T)
+                served = want in cake_backend.PARTIALS_SUM_SPLITS
+                assert (entry.sum_entry is not None) == served, (hidden, T)
+                assert not cake_backend._K2_ATOMIC_CACHE
+                ran.add((hidden, T, want))
+    # a rule's count ran on the deterministic program inside its window
+    assert any(want != default for _, _, want in ran), sorted(ran)
+
+
 def test_router_entry_cache_keys_and_routes_again(monkeypatch):
     """``_K2_ENTRY_CACHE`` keys a call by the device, the raw stream, the operation, the split count, the PDL flag and
     the entry point's tensors, and routes a key again after a router table changes (a forward verdict set at run time
@@ -10416,7 +10562,7 @@ def test_gpu_router_token_windows_run_at_their_edges():
 
 def test_gpu_router_rows_without_a_verdict_run_the_deterministic_program_unplanned():
     """Without a split count on a router row without a verdict (the forward; the weight
-    gradient at a token count outside every window): the deterministic program's bits (its production split counts),
+    gradient at a token count outside every window): the deterministic program's bits (its default split counts),
     through this package's binding of it (``_K2_SPLITK_CACHE``); this package plans nothing for the call."""
     device, arch = _atomic_device_or_skip()
     for hidden in (4096, 5120, 6144):
@@ -10435,6 +10581,53 @@ def test_gpu_router_rows_without_a_verdict_run_the_deterministic_program_unplann
         A, B, out = _router_case("fwd", X, W, G)
         assert cake_backend.cake_dense_gemm_nondet_train_router(A, B, out) is out
         assert torch.equal(out, fwd) and not cake_backend._K2_ATOMIC_CACHE
+
+
+def test_gpu_router_split_rule_rows_run_the_deterministic_count():
+    """A weight-gradient row of the deterministic package's ``ROUTER_SPLIT_RULES`` for this device, at the first and
+    the last token count of its window where this package has neither a partition nor a SIMT window: the
+    deterministic program at that package's count (its ``router_splits``) through this package's binding
+    (``_K2_SPLITK_CACHE``; nothing in ``_K2_ATOMIC_CACHE``), with its bits on repeated calls -- the partials reduced by
+    this package's partial sum where it serves the count, else by ``torch.sum``."""
+    device, arch = _atomic_device_or_skip()
+    sm_count = det_backend.device_facts(device).sm_count
+    ran = 0
+    for (rule_arch, sms, layout, hidden), windows in sorted(
+        det_backend.ROUTER_SPLIT_RULES.items()
+    ):
+        if (rule_arch, sms, layout) != (arch, sm_count, "nn_t"):
+            continue
+        for lo, hi, splits in windows:
+            for T in (lo, hi):
+                kw = dict(arch=arch, sm_count=sm_count, M=hidden, N=256, K=T)
+                if (
+                    cake_backend.router_partition("nn_t", **kw) is not None
+                    or cake_backend.router_simt("nn_t", **kw) is not None
+                ):
+                    continue  # this package's program
+                X, _, G = _router_inputs(T, device, SEED + 120, K=hidden)
+                cake_backend.cake_dense_gemm_nondet_train_convenience_cache_clear()
+                want = det_backend.cake_dense_gemm_det_train_router_wgrad(G, X)
+                out = torch.empty(256, hidden, device=device)
+                for _ in range(2):
+                    out.fill_(float("nan"))
+                    assert (
+                        cake_backend.cake_dense_gemm_nondet_train_router_wgrad(
+                            G, X, out
+                        )
+                        is out
+                    )
+                    assert torch.equal(out, want), (hidden, T)
+                (entry,) = cake_backend._K2_SPLITK_CACHE.values()
+                assert entry.plan.splits == splits, (hidden, T)
+                served = splits in cake_backend.PARTIALS_SUM_SPLITS
+                assert (entry.sum_entry is not None) == served, (hidden, T)
+                assert not cake_backend._K2_ATOMIC_CACHE
+                ran += 1
+    if not ran:
+        pytest.skip(
+            f"no ROUTER_SPLIT_RULES weight-gradient row of {arch} runs the deterministic program on {sm_count} SMs"
+        )
 
 
 def test_gpu_router_verdicts_set_at_run_time_are_seen(monkeypatch):
