@@ -6913,12 +6913,15 @@ def _plan(cu_seqlens: torch.Tensor) -> dict:
         for c in chunks:
             cu_chunks.append(cu_chunks[-1] + c)
         total_chunks = cu_chunks[-1]
+        # torch.tensor(list, device=cuda) copies from pageable memory, which
+        # blocks the host until the stream has drained. Copy from pinned memory
+        # instead; the plan keeps the pinned source alive for the async copy.
+        host_cu_chunks = torch.tensor(cu_chunks, dtype=torch.int32).pin_memory()
         plan = {
             "total_chunks": total_chunks,
-            "cu_chunks": torch.tensor(
-                cu_chunks, dtype=torch.int32, device=cu_seqlens.device
-            ),
+            "cu_chunks": host_cu_chunks.to(cu_seqlens.device, non_blocking=True),
             "cu_list": cu_list,
+            "host_cu_chunks": host_cu_chunks,
         }
         _PLAN_CACHE[key] = plan
     return plan
