@@ -1134,6 +1134,77 @@ def test_tc_plan_rule(arch, sm_count, monkeypatch) -> None:
         ), (row, rec)
 
 
+@pytest.mark.parametrize(
+    "arch, sm_count", [("sm_100a", 148), ("sm_103a", 148), ("sm_103a", 152)]
+)
+def test_tc_plan_prices_the_whole_segment_prescan(arch, sm_count, monkeypatch) -> None:
+    # on an architecture of TC_PLAN_PRESCAN a split candidate's pre-scan is priced for a value head that scans its whole
+    # segment: the head pairs keep the planner's serial adjoint table over 24 value heads (the 6-segment table measured
+    # +8 % backward on B200) and take a 12-segment table over 12 (-24 %); the warm-up price took the 6-segment table
+    _priced_device(monkeypatch, arch, sm_count)
+    monkeypatch.setattr(cake_chain, "CHAIN_PLAN", {})
+    options = cake_chain.make_options()
+    chunks = tuple(-(-n // 64) for n in _PAIR_LAYOUT)
+    for num_heads, segments in ((8, len(chunks)), (4, 12)):
+        num_v_heads = 3 * num_heads
+        (_fwd, bwd), _bwd_tc = cake_chain.host_plans(
+            _PAIR_LAYOUT, num_v_heads, 0, options, num_heads=num_heads
+        )
+        assert _segments(chunks, bwd) == segments, (num_heads, bwd)
+    planner = cake_chain.scan_plans(
+        sum(_PAIR_LAYOUT), len(_PAIR_LAYOUT), 24, 0, _PAIR_LAYOUT
+    )
+    planner = cake_chain._serial_adjoint_plan(_PAIR_LAYOUT, planner, 8, 24, 0, options)
+    assert _segments(chunks, planner[1]) == len(chunks)
+    with monkeypatch.context() as m:
+        m.setattr(cake_chain, "TC_PLAN_PRESCAN", {})
+        warm = cake_chain.tc_plan_pricing(chunks, 24, 0, planner[1])
+        assert warm["select"] and warm["segment_len"] > 0, warm
+    # the pre-scan term covers the longest pre-scanned segment
+    fixed, step, _co = cake_chain.TC_PLAN_PRESCAN[arch]
+    const = dict(cake_chain._dhu_tc_constants(arch))
+    const["t_lat"], const["t_full"] = cake_chain.TC_PLAN_STEP[arch]
+    res = cake_chain._scan_residency("dhu", *cake_chain.SDT_CONFIG, 0)
+    for seg_len in (16, 32, 48, 94):
+        rec = cake_chain._tc_table_price(
+            chunks, 24, seg_len, sm_count, const, res, cake_chain.TC_PLAN_PRESCAN[arch]
+        )
+        longest = max(-(-c // -(-c // seg_len)) for c in chunks)
+        assert rec["T_extra"] >= fixed + longest * step, (seg_len, rec)
+    # a selected split table runs its dhu_tc2 CTAs in one round
+    for row, seq_lens, num_heads, num_v_heads in PRICED_ROWS:
+        plans = cake_chain.scan_plans(
+            sum(seq_lens), len(seq_lens), num_v_heads, 0, seq_lens
+        )
+        plans = cake_chain._serial_adjoint_plan(
+            seq_lens, plans, num_heads, num_v_heads, 0, options
+        )
+        rows = tuple(-(-n // 64) for n in seq_lens)
+        rec = cake_chain.tc_plan_pricing(rows, num_v_heads, 0, plans[1])
+        if rec["select"] and rec["segment_len"] > 0:
+            assert rec["best"]["ctas"] <= sm_count, (row, rec)
+
+
+def test_tc_plan_prescan_leaves_r200_unchanged(monkeypatch) -> None:
+    # an architecture outside TC_PLAN_PRESCAN keeps the warm-up price (R200 prices its split tables with CHAIN_PLAN)
+    assert "sm_107a" not in cake_chain.TC_PLAN_PRESCAN
+    for sm_count in (212, 216):
+        _priced_device(monkeypatch, "sm_107a", sm_count)
+        options = cake_chain.make_options()
+        for row, seq_lens, num_heads, num_v_heads in PRICED_ROWS:
+            got = cake_chain.host_plans(
+                seq_lens, num_v_heads, 0, options, num_heads=num_heads
+            )
+            with monkeypatch.context() as m:
+                m.setattr(cake_chain, "TC_PLAN_PRESCAN", {"sm_100a": (0.0, 99.0, 9.0)})
+                assert (
+                    cake_chain.host_plans(
+                        seq_lens, num_v_heads, 0, options, num_heads=num_heads
+                    )
+                    == got
+                ), row
+
+
 @pytest.mark.parametrize("arch, sm_count", PRICED_DEVICES)
 def test_two_stream_forms_keep_their_tables(arch, sm_count, monkeypatch) -> None:
     # a serial adjoint table that the two-stream rule groups, and a split one of a value-head group of three whose

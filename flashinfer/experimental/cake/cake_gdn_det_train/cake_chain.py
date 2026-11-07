@@ -118,6 +118,7 @@ __all__ = [
     "TC_PLAN",
     "TC_PLAN_GAIN",
     "TC_PLAN_MIN_SAVING",
+    "TC_PLAN_PRESCAN",
     "TC_PLAN_SELECT",
     "TC_PLAN_STEP",
     "CakeGDNDetFunction",
@@ -1431,7 +1432,8 @@ def _serial_adjoint_plan(
 # table priced for ``dhu_tc2`` itself.  Candidates: the serial table and the ``SDT_CONFIG`` split tables of ``L``
 # chunks (``MIN_SEGMENT_CHUNKS`` to the pre-scan capacity), each priced (microseconds) T = makespan(segments x HV CTAs,
 # one per SM) x t(n) (the ``dhu_tc2`` interpolation of :func:`sdt_pricing` over ``TC_PLAN_STEP``) + the register
-# planner's pre-scan and stitch terms x ``t_unit`` + the ``dv_local`` tiles of the pre-scan's warm-up window.  The
+# planner's pre-scan and stitch terms x ``t_unit`` + the ``dv_local`` tiles of the pre-scan's warm-up window (on an
+# architecture of ``TC_PLAN_PRESCAN``: the stitch term + the pre-scan of a value head that scans its whole segment).  The
 # planner's table (after the serial-scan rule) is priced in the form its rules run (tcgen05, or the register pass
 # with ``dv_local``), and the cheapest candidate replaces it when it saves at least ``min_saving`` us and prices at
 # most ``gain`` x the planner's table (:func:`tc_plan_thresholds`); the backward then runs the candidate on
@@ -1449,6 +1451,21 @@ TC_PLAN_SELECT = {"sm_107a": (1.0, 2.0)}
 # durations of L = 64 tables, 3 to 288 CTAs: B200 2.32-2.44, GB300 2.15-2.26 per step); an architecture not listed takes
 # the dhu_tc2 record's t_lat / t_full.
 TC_PLAN_STEP = {"sm_100a": (2.35, 2.44), "sm_103a": (2.17, 2.25)}
+# The pre-scan of a split table scans each segment but one of its sequence until the decay sum passes
+# ``warmup_thresh_log2``: a value head that decays slowly scans its whole segment, and the launch lasts as long as its
+# slowest CTA.  On an architecture listed here the candidates' pre-scan is priced for that head (microseconds):
+# ``fixed`` + the longest pre-scanned segment x ``step`` x w, w = 1 while its CTAs (pre-scanned segments x HV x
+# HEAD_DIM / v_block) fit one per SM, else ``co_resident`` x their rounds of two per SM.  Measured (CUPTI kernel sums of
+# the pre-scan, dhu_tc2 and stitch of pinned tables of 11000 / 12000 / 9768 tokens over H = 1 to 8 value-head groups
+# of three, per-head decay rates 1e-4 to 1 per token): the warm-up price above (a few chunks per segment) priced the
+# B200 pre-scan of the 94-chunk table over 24 value heads at 20 us against 310 us measured, and took that table in
+# place of the serial one at +8 % backward; this price picks the measured fastest table of each layout on B200 and
+# GB300 when, as there, a split candidate is admissible only if its dhu_tc2 CTAs (segments x HV) fit one per SM (every
+# measured table of two rounds was slower than the best table of one).  Fast decay in every head ends the pre-scan
+# within a few chunks, so these prices then over-state the split tables.  An architecture not listed keeps the warm-up
+# price and every candidate (R200 prices its split tables with ``CHAIN_PLAN``).  The planner's table in the register
+# form is priced with the same pre-scan term.
+TC_PLAN_PRESCAN = {"sm_100a": (10.0, 2.95, 1.55), "sm_103a": (0.0, 3.05, 1.1)}
 
 
 def tc_plan_thresholds(arch: str) -> tuple[float, float]:
@@ -1463,8 +1480,10 @@ def _tc_table_price(
     sm_count: int,
     const: dict,
     pre_residency: int,
+    prescan: tuple[float, float, float] | None = None,
 ) -> dict:
-    """The priced ``dhu_tc2`` form of one adjoint table (``segment_len`` 0 or not below the longest sequence: serial)."""
+    """The priced ``dhu_tc2`` form of one adjoint table (``segment_len`` 0 or not below the longest sequence: serial);
+    ``prescan`` the architecture's ``TC_PLAN_PRESCAN`` constants (``None``: the warm-up price)."""
     if segment_len <= 0 or max(chunks) <= segment_len:
         splits = (1,) * len(chunks)
     else:
@@ -1479,15 +1498,28 @@ def _tc_table_price(
     extra = 0.0
     if max(splits) > 1:
         tails = sum(k - 1 for k in splits) * int(num_v_heads)
-        units = (
-            PRESCAN_WARMUP_CHUNKS * PRESCAN_STEP_FACTOR * SCAN_STEP_FACTOR[SDT_CONFIG]
-            * _wave_factor(tails * (HEAD_DIM // SDT_CONFIG[0]), sm_count, pre_residency)
-            + STITCH_FIXED_CHUNKS + STITCH_COPY_CHUNKS * (max(splits) - 1)
-        )  # fmt: skip
-        extra = (
-            units * const["t_unit"]
-            + tails * PRESCAN_WARMUP_CHUNKS * const["c_dvl"] / sm_count
-        )
+        pre_ctas = tails * (HEAD_DIM // SDT_CONFIG[0])
+        stitch = STITCH_FIXED_CHUNKS + STITCH_COPY_CHUNKS * (max(splits) - 1)
+        if prescan is not None:
+            fixed, step, co_resident = prescan
+            pre_steps = max(
+                -(-int(c) // k) for c, k in zip(chunks, splits, strict=True) if k > 1
+            )
+            rounds = (
+                1.0
+                if pre_ctas <= sm_count
+                else co_resident * -(-pre_ctas // (2 * sm_count))
+            )
+            extra = fixed + pre_steps * step * rounds + stitch * const["t_unit"]
+        else:
+            units = (
+                PRESCAN_WARMUP_CHUNKS * PRESCAN_STEP_FACTOR * SCAN_STEP_FACTOR[SDT_CONFIG]
+                * _wave_factor(pre_ctas, sm_count, pre_residency) + stitch
+            )  # fmt: skip
+            extra = (
+                units * const["t_unit"]
+                + tails * PRESCAN_WARMUP_CHUNKS * const["c_dvl"] / sm_count
+            )
     return {"segment_len": int(segment_len) if max(splits) > 1 else 0, "segments": sum(splits), "ctas": ctas,
             "steps": steps, "T_tc2": steps * t_n, "T_extra": extra, "T": steps * t_n + extra}  # fmt: skip
 
@@ -1502,6 +1534,7 @@ def _tc_plan_memo(
     arch: str,
     _gain: float,
     _min_saving: float,
+    prescan: tuple[float, float, float] | None = None,
 ) -> dict:
     rec: dict[str, Any] = {
         "arch": arch,
@@ -1520,7 +1553,13 @@ def _tc_plan_memo(
     pre_res = _scan_residency("dhu", *SDT_CONFIG, device_index)
     serial = plan.segment_len <= 0 or max(chunks) <= plan.segment_len
     at = _tc_table_price(
-        chunks, num_v_heads, 0 if serial else plan.segment_len, sm_count, const, pre_res
+        chunks,
+        num_v_heads,
+        0 if serial else plan.segment_len,
+        sm_count,
+        const,
+        pre_res,
+        prescan,
     )
     if serial:
         rule = dhu_tc_pricing(chunks, num_v_heads, device_index)
@@ -1535,11 +1574,14 @@ def _tc_plan_memo(
             else at["T_extra"] + rule.get("T_reg2", math.inf)
         )
     cap = _prescan_capacity("dhu", SDT_CONFIG)
-    cands = [_tc_table_price(chunks, num_v_heads, 0, sm_count, const, pre_res)]
+    cands = [_tc_table_price(chunks, num_v_heads, 0, sm_count, const, pre_res, prescan)]
     for seg_len in range(MIN_SEGMENT_CHUNKS, min(cap, max(chunks) - 1) + 1):
-        cands.append(
-            _tc_table_price(chunks, num_v_heads, seg_len, sm_count, const, pre_res)
+        cand = _tc_table_price(
+            chunks, num_v_heads, seg_len, sm_count, const, pre_res, prescan
         )
+        if prescan is not None and cand["segment_len"] and cand["ctas"] > sm_count:
+            continue  # TC_PLAN_PRESCAN: a split table runs its dhu_tc2 CTAs in one round
+        cands.append(cand)
     best = min(cands, key=lambda c: (c["T"], -c["segment_len"]))
     rec.update(plan_T=plan_t, best=best, saving=plan_t - best["T"])
     rec["select"] = bool(
@@ -1568,6 +1610,7 @@ def tc_plan_pricing(
             arch,
             gain,
             min_saving,
+            TC_PLAN_PRESCAN.get(arch),
         )  # fmt: skip
     )
 
