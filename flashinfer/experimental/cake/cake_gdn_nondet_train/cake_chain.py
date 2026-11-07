@@ -2041,22 +2041,23 @@ def _dense(t: torch.Tensor) -> torch.Tensor:
 def _row_stride(t: torch.Tensor) -> int:
     """The token-row stride in elements of a ``[..., T, heads, 128]`` tensor that a kernel addresses through that
     stride (its pointer declared strided, its binding checks no layout): a unit channel stride, head stride 128, rows
-    at least ``heads x 128`` apart, and leading axes that fold into the token axis (``ValueError`` otherwise)."""
-    heads, dim = t.size(-2), t.size(-1)
+    at least ``heads x 128`` apart, and leading axes that fold into the token axis (``ValueError`` otherwise).  Every
+    backward of a cluster tail asks it four times, so it reads the shape and the strides once each."""
+    shape = t.shape
+    heads, dim = shape[-2], shape[-1]
     if t.is_contiguous():
         return heads * dim
-    token = t.stride(-3)
-    expected = token
-    for axis in range(t.dim() - 4, -1, -1):
-        expected *= t.size(axis + 1)
-        if t.size(axis) > 1 and t.stride(axis) != expected:
+    stride = t.stride()
+    token = expected = stride[-3]
+    for axis in range(len(shape) - 4, -1, -1):
+        expected *= shape[axis + 1]
+        if shape[axis] > 1 and stride[axis] != expected:
             raise ValueError(
-                f"the leading axes of a {tuple(t.shape)} tensor of strides {t.stride()} do not fold into its "
-                "token axis"
+                f"the leading axes of a {tuple(shape)} tensor of strides {stride} do not fold into its token axis"
             )
-    if t.stride(-1) != 1 or t.stride(-2) != dim or token < heads * dim:
+    if stride[-1] != 1 or stride[-2] != dim or token < heads * dim:
         raise ValueError(
-            f"a {tuple(t.shape)} tensor of strides {t.stride()} is not token rows of {heads} heads x {dim} "
+            f"a {tuple(shape)} tensor of strides {stride} is not token rows of {heads} heads x {dim} "
             "contiguous elements"
         )
     return token
@@ -3181,7 +3182,9 @@ def _packed_row(q, k, v) -> torch.Tensor | None:
     """The packed row whose head views ``q``, ``k`` and ``v`` are, or ``None``: their common base, a contiguous BF16
     tensor of ``B x T`` rows of ``(2 H + HV) x 128`` elements that requires grad, q / k / v at its row offsets 0,
     ``H x 128`` and ``2 H x 128`` with its row stride, head stride 128 and unit channel stride, each requiring grad
-    through a view of it."""
+    through a view of it.  Every call with grad asks it, so it reads each tensor's shape, strides and offset once
+    (tuples compared whole; the strides of size-one axes, which any value may take, only when the whole compare
+    fails)."""
     base = q._base
     if base is None or k._base is not base or v._base is not base:
         return None
@@ -3189,65 +3192,71 @@ def _packed_row(q, k, v) -> torch.Tensor | None:
         base.requires_grad and q.requires_grad and k.requires_grad and v.requires_grad
     ):
         return None
-    if base.dtype != torch.bfloat16 or not base.is_contiguous():
+    if base.dtype != torch.bfloat16:
         return None
-    batch, seq_len, num_heads, dim = q.shape
-    num_v_heads = v.shape[2]
+    shape, v_shape = q.shape, v.shape
+    if len(shape) != 4 or len(v_shape) != 4:
+        return None
+    batch, seq_len, num_heads, dim = shape
+    num_v_heads = v_shape[2]
     width = (2 * num_heads + num_v_heads) * dim
+    base_shape = base.shape
     if (
-        base.dim() < 1
-        or base.size(-1) != width
+        not base_shape
+        or base_shape[-1] != width
+        or k.shape != shape
+        or v_shape != (batch, seq_len, num_v_heads, dim)
         or base.numel() != batch * seq_len * width
+        or not base.is_contiguous()
     ):
         return None
     offset = base.storage_offset()
-    for t, at, heads in (
-        (q, 0, num_heads),
-        (k, num_heads * dim, num_heads),
-        (v, 2 * num_heads * dim, num_v_heads),
+    if (
+        q.storage_offset() != offset
+        or k.storage_offset() != offset + num_heads * dim
+        or v.storage_offset() != offset + 2 * num_heads * dim
     ):
-        if t.storage_offset() != offset + at:
-            return None
-        strides = (seq_len * width, width, dim, 1)
-        if any(
-            size > 1 and t.stride(i) != strides[i] for i, size in enumerate(t.shape)
+        return None
+    strides = (seq_len * width, width, dim, 1)
+    for t in (q, k, v):
+        stride = t.stride()
+        if stride != strides and any(
+            size > 1 and got != want
+            for size, got, want in zip(t.shape, stride, strides, strict=True)
         ):
-            return None
-        if t.shape[:2] != (batch, seq_len) or t.shape[2:] != (heads, dim):
             return None
     return base
 
 
-def _row_views(row, batch: int, seq_len: int, num_heads: int, num_v_heads: int):
-    """The q / k / v head views ``[B, T, heads, 128]`` of a packed row tensor (contiguous)."""
-    flat = row.view(batch * seq_len, -1)
-    q_end, k_end = num_heads * HEAD_DIM, 2 * num_heads * HEAD_DIM
-    return (
-        flat[:, :q_end].view(batch, seq_len, num_heads, HEAD_DIM),
-        flat[:, q_end:k_end].view(batch, seq_len, num_heads, HEAD_DIM),
-        flat[:, k_end:].view(batch, seq_len, num_v_heads, HEAD_DIM),
-    )
-
-
 class CakeGDNNondetPackedFunction(torch.autograd.Function):
     """:class:`CakeGDNNondetFunction` with the packed row as its one q / k / v input (see :func:`_packed_row`): the
-    same forward on the row's head views, and a backward that returns the row's gradient, written by the tail."""
+    same forward on the caller's head views of the row, and a backward that returns the row's gradient, written by
+    the tail.  ``views`` is the tuple of those views: a container, so autograd does not take them as inputs, and the
+    forward reads them as they are instead of viewing the row again."""
 
     @staticmethod
     def forward(ctx, row, g, beta, scale, initial_state, output_final_state, cu_seqlens, cu_seqlens_cpu,
-                use_qk_l2norm_in_kernel, options, heads):  # fmt: skip
-        batch, seq_len, num_heads, num_v_heads = heads
-        q, k, v = _row_views(row, batch, seq_len, num_heads, num_v_heads)
-        ctx.heads = heads
+                use_qk_l2norm_in_kernel, options, views):  # fmt: skip
+        q, k, v = views
         ctx.row_shape = row.shape
+        ctx.view_shapes = (q.shape, v.shape)
         return _function_forward(ctx, q, k, v, g, beta, scale, initial_state, output_final_state, cu_seqlens,
                                  cu_seqlens_cpu, use_qk_l2norm_in_kernel, options)  # fmt: skip
 
     @staticmethod
     def backward(ctx, do, dht):
-        batch, seq_len, num_heads, num_v_heads = ctx.heads
+        # the gradient row and its q / k / v head views (one strided view each, at the row offsets of the forward's
+        # views), which the tail writes through their token-row strides
+        q_shape, v_shape = ctx.view_shapes
+        seq_len, num_heads, dim = q_shape[1], q_shape[2], q_shape[3]
+        width = ctx.row_shape[-1]
+        strides = (seq_len * width, width, dim, 1)
         d_row = torch.empty(ctx.row_shape, dtype=torch.bfloat16, device=do.device)
-        views = _row_views(d_row, batch, seq_len, num_heads, num_v_heads)
+        views = (
+            d_row.as_strided(q_shape, strides, 0),
+            d_row.as_strided(q_shape, strides, num_heads * dim),
+            d_row.as_strided(v_shape, strides, 2 * num_heads * dim),
+        )
         dq, dk, dv, dg, dbeta, dh0 = _function_backward(ctx, do, dht, views)
         for view, grad in zip(views, (dq, dk, dv), strict=True):
             if (
@@ -3334,9 +3343,8 @@ def cake_gdn_nondet(
         if row is not None:
             arch = cake_backend.device_arch(_tensor_index(q))
             if tail_form(q.shape[2], v.shape[2], options.tail, arch=arch) in F32X_TAILS:
-                heads = (q.shape[0], q.shape[1], q.shape[2], v.shape[2])
                 return CakeGDNNondetPackedFunction.apply(row, g, beta, float(scale), initial_state, output_final_state,
                                                          cu_seqlens, cu_seqlens_cpu, use_qk_l2norm_in_kernel, options,
-                                                         heads)  # fmt: skip
+                                                         (q, k, v))  # fmt: skip
     return CakeGDNNondetFunction.apply(q, k, v, g, beta, float(scale), initial_state, output_final_state, cu_seqlens,
                                        cu_seqlens_cpu, use_qk_l2norm_in_kernel, options)  # fmt: skip
