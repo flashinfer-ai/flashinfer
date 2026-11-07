@@ -80,6 +80,27 @@ namespace tensorrt_llm::kernels::cutlass_kernels {
 constexpr int WARP_SIZE = 32;
 constexpr int CVT_ELTS_PER_THREAD = 8;
 
+// Mask of the lanes in this warp that execute a thread-linear, block-strided
+// element loop at `elem_index`. All lanes of a warp have consecutive thread IDs,
+// so `elem_index < num_elems` is true for a contiguous prefix [0, n) of the warp:
+// n = clamp(num_elems - warp_first_elem_index, 0, WARP_SIZE). This is derived
+// from the loop predicate alone and does not depend on which lanes happen to be
+// converged, so it remains correct under independent thread scheduling.
+// Callers guarantee that the loop stride is a multiple of WARP_SIZE and that
+// num_elems is a multiple of the quantizer's SF group size, so both lanes of an
+// SF pair always take the same branch.
+__device__ __forceinline__ uint32_t warpPrefixMask(int64_t elem_index, int64_t num_elems) {
+  int64_t const warp_first_elem_index = elem_index - (threadIdx.x & (WARP_SIZE - 1));
+  int64_t const active_lanes = num_elems - warp_first_elem_index;
+  if (active_lanes >= WARP_SIZE) {
+    return 0xffffffffu;
+  }
+  if (active_lanes <= 0) {
+    return 0u;
+  }
+  return (uint32_t{1} << static_cast<int>(active_lanes)) - 1u;
+}
+
 __device__ __forceinline__ float computeSafeFP8QuantScale(float row_amax) {
   if (!(row_amax > 0.0f)) {
     return 1.0f;
@@ -1084,7 +1105,8 @@ __device__ auto quantizePackedFPXValue(
     ComputeElem& post_act_val, float global_scale_val, int64_t num_tokens_before_expert,
     int64_t expert_id, int64_t token_id, int64_t elem_idx, int64_t num_cols,
     TmaWarpSpecializedGroupedGemmInput::ElementSF* act_sf_flat,
-    TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType scaling_type) {
+    TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType scaling_type,
+    uint32_t activeMask = 0xffffffffu) {
   constexpr bool is_fp8 = std::is_same_v<QuantizedType, __nv_fp8_e4m3>;
   static constexpr int NumThreadsPerSF = VecSize / CVT_ELTS_PER_THREAD;
   // Quantize the input to FP4
@@ -1113,9 +1135,10 @@ __device__ auto quantizePackedFPXValue(
   auto func = [&]() {
     if constexpr (is_fp8) {
       return [](PackedVec<GemmOutputType>& vec, float /* ignored */, uint8_t* SFout,
-                float /* ignored */) -> uint64_t {
+                float /* ignored */, uint32_t mask) -> uint64_t {
         static_assert(TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize == VecSize);
-        return cvt_warp_fp16_to_mxfp8<GemmOutputType, VecSize, CVT_ELTS_PER_THREAD>(vec, SFout);
+        return cvt_warp_fp16_to_mxfp8<GemmOutputType, VecSize, CVT_ELTS_PER_THREAD>(vec, SFout,
+                                                                                    mask);
       };
     } else {
       if (scaling_type == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4) {
@@ -1127,7 +1150,7 @@ __device__ auto quantizePackedFPXValue(
     }
   }();
 
-  return func(packed_vec, global_scale_val, sf_out, 0.0f);
+  return func(packed_vec, global_scale_val, sf_out, 0.0f, activeMask);
 }
 
 template <int VecSize, int ElementsPerThread>
@@ -1675,6 +1698,10 @@ __global__ void expandInputRowsKernel(
     int64_t const num_elems_in_col = hidden_size / ELEM_PER_THREAD;
     assert(hidden_size % ELEM_PER_THREAD == 0);
     assert(hidden_size % VecSize == 0);
+    // The quantizer's warp reduction assumes that both threads of an SF group
+    // take the loop branch together. The assertion holds because the row length
+    // is VecSize-aligned and an SF group spans VecSize contiguous elements.
+    assert(num_elems_in_col % (VecSize / ELEM_PER_THREAD) == 0);
 
     if constexpr (is_nvfp4 || is_mxfp8) {
       static_assert(ELEM_PER_THREAD == 8, "Expecting 8 elements per thread for quantized types");
@@ -1692,13 +1719,15 @@ __global__ void expandInputRowsKernel(
         cutlass::arch::global_load<DataElem, sizeof(DataElem)>(in_vec, source_row_ptr + elem_index,
                                                                true);
         if constexpr (need_nvfp4_quant || need_mxfp8_quant) {
+          uint32_t const activeMask = warpPrefixMask(elem_index, num_elems_in_col);
           auto res =
               quantizePackedFPXValue<InputActivationsType, ExpandedActivationsType, DataElem,
                                      VecSize, DISABLE_FP4_QUANT_FAST_MATH, NVFP4_4OVER6_CONFIG>(
                   in_vec, global_scale_val, num_tokens_before_expert, expert, permuted_row,
                   elem_index, padded_hidden_size, fc1_act_sf_flat,
                   is_nvfp4 ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4
-                           : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX);
+                           : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX,
+                  activeMask);
           static_assert(sizeof(res) == sizeof(*dest_row_ptr),
                         "Quantized value must be the same size as the output");
           auto out_vec = cutlass::platform::bit_cast<OutputElem>(res);
@@ -2541,6 +2570,13 @@ __global__ __launch_bounds__(MAX_ACTIVATION_THREADS_PER_BLOCK) void doActivation
     int64_t const stride = blockDim.x;
     assert(inter_size % ACTIVATION_ELEM_PER_THREAD == 0);
     int64_t const num_elems_in_col = inter_size / ACTIVATION_ELEM_PER_THREAD;
+    // The quantizer's warp reduction assumes that both threads of an SF group
+    // take the loop branch together. The assertion holds because the row length
+    // is VecSize-aligned and an SF group spans VecSize contiguous elements.
+    if constexpr (IsNVFP4 || IsMXFP8) {
+      assert(inter_size % VecSize == 0);
+      assert(num_elems_in_col % (VecSize / ACTIVATION_ELEM_PER_THREAD) == 0);
+    }
     assert(gated_off % ACTIVATION_ELEM_PER_THREAD == 0);
     int64_t const gated_off_vec = gated_off / ACTIVATION_ELEM_PER_THREAD;
 
@@ -2619,12 +2655,14 @@ __global__ __launch_bounds__(MAX_ACTIVATION_THREADS_PER_BLOCK) void doActivation
       if constexpr (IsNVFP4 || IsMXFP8) {
         // We use GemmOutputType as the intermediate compute type as that should always be
         // unquantized
+        uint32_t const activeMask = warpPrefixMask(elem_index, num_elems_in_col);
         auto res = quantizePackedFPXValue<GemmOutputType, T, ComputeElem, VecSize,
                                           DISABLE_FP4_QUANT_FAST_MATH, NVFP4_4OVER6_CONFIG>(
             post_act_val, global_scale_val, num_tokens_before_expert, expert, token, elem_index,
             inter_size, fc2_act_sf_flat,
             IsNVFP4 ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4
-                    : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX);
+                    : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX,
+            activeMask);
         static_assert(sizeof(res) == sizeof(*output_vec),
                       "Quantized value must be the same size as the output");
         auto out_vec = cutlass::platform::bit_cast<OutputElem>(res);
