@@ -98,9 +98,10 @@ Host contract (flashinfer#4671 hardening)
   route (:func:`_k64_split_plan`) runs its ``W`` whole rows first and each
   later row ``t`` as ``s`` pieces of its sparse tiles, then merges the
   pieces into ``O`` (one ``run_sequence`` call): one CTA per row and head,
-  or, for the 128-head launches whose rule names ``s`` in
-  ``merge_by_splits``, a merge built for ``s`` pieces with one warp per row
-  and head and two heads per CTA (:func:`_k64_split_merge`). It carves
+  or, for the 128-head launches of ``s`` pieces and at least the rows their
+  rule's ``merge_by_splits`` names for ``s`` (on SM107 three pieces and 16
+  or 17 rows), a merge built for ``s`` pieces with one warp per row and head
+  and two heads per CTA (:func:`_k64_split_merge`). It carves
   ``cake_dsv4_workspace_layout(R, H, s)`` for its ``R = T - W`` split rows
   and stores the pieces in token-major order: piece ``j`` of row ``t`` is
   ``p = (t - W) * s + j``, its BF16 partial O the rows ``[p, :, :]`` of
@@ -2430,10 +2431,10 @@ def _pdl_variant(
 # each row as ``s`` pieces of its sparse tiles, two CTAs per piece, and writes
 # partial O and LSE (module docstring, "Split-KV pieces"); the merge program
 # (``_K64_SPLIT_MERGE``, one CTA per row and head, any ``s``) writes O from
-# them, or, for the 128-head launches whose rule names ``s`` in
-# ``merge_by_splits``, the merge built for ``s`` pieces alone
-# (``_K64_SPLIT_COUNT_MERGES``, :func:`_k64_split_merge`).  Both launch back
-# to back in one FFI call with the call's PDL setting.
+# them, or, for the 128-head launches of ``s`` pieces and at least the rows
+# their rule's ``merge_by_splits`` names for ``s``, the merge built for ``s``
+# pieces alone (``_K64_SPLIT_COUNT_MERGES``, :func:`_k64_split_merge`).  Both
+# launch back to back in one FFI call with the call's PDL setting.
 _K64_SPLIT_ROUTE = "fp8_h128_prefill_source_persistent_uniform"
 _K64_SPLIT_VARIANT = "fp8_h128_prefill_source_persistent_uniform_k64_split"
 # A launch splits only where the registry routes both keys to programs of
@@ -2441,8 +2442,8 @@ _K64_SPLIT_VARIANT = "fp8_h128_prefill_source_persistent_uniform_k64_split"
 _K64_SPLIT_MERGE = "fp8_h128_prefill_source_persistent_uniform_k64_split_reduce"
 _K64_SPLIT_HEADS = 128
 # The merges built for one piece count s (one warp per row and head, two heads
-# per CTA): a 128-head launch takes one where its rule's ``merge_by_splits``
-# names s (:func:`_k64_split_merge`).
+# per CTA): a 128-head launch of s pieces takes one where its rule's
+# ``merge_by_splits`` names s with at most its rows (:func:`_k64_split_merge`).
 _K64_SPLIT_COUNT_MERGES: Mapping[int, str] = {3: f"{_K64_SPLIT_MERGE}_s3"}
 _K64_SPLIT_COUNT_MERGE_HEADS_PER_CTA = 2
 
@@ -2471,27 +2472,30 @@ class _K64SplitRule:
 # at 4 (nine pieces), 1.34x at 8 (five).  Nine pieces at 5 rows (45 pieces)
 # measured 0.97x of five, so nine and five stay at 40 pieces.  Three pieces
 # run every launch of 9-17 rows (at most 17 x 3 = 51 pieces, so no launch
-# takes two) and merge with the three-piece merge (``merge_by_splits``: one
-# warp per row and head, two heads per CTA, the per-element operations of
-# the merge of any count).  With the merge of any count, three pieces
-# measured 1.23x of the K=32 program at 12 rows and 1.11-1.12x at 15, but
-# 0.91-0.92x of two pieces at 16 rows (48 pieces).  In a test harness on a
-# 216-SM R200, three pieces with a merge of the three-piece merge's geometry
-# ran a median 0.80-0.93 us per call faster than two pieces with the merge
-# of any count at 16 and 17 rows, and at least 0.3 us faster in each of 8
-# rounds.  A launch whose every row fits in one piece (at most ceil(9 / s)
-# tiles: short requests, piece 0 writes O itself) still runs the merge
-# kernel and measured 0.81-0.86x (0.97x of two pieces at 15 rows of at most
-# three tiles); the host does not read row lengths, so those launches split
-# as well.  Without PDL the 17-row launch measured 0.98x with two pieces: no
-# launch without PDL splits.
+# takes two).  With the merge of any count, three pieces measured 1.23x of
+# the K=32 program at 12 rows and 1.11-1.12x at 15, but 0.91-0.92x of two
+# pieces at 16 rows (48 pieces).  The launches of 16 and 17 rows merge with
+# the three-piece merge (``merge_by_splits``: one warp per row and head, two
+# heads per CTA, the per-element operations of the merge of any count): in a
+# test harness on a 216-SM R200, three pieces with a merge of the three-piece
+# merge's geometry ran a median 0.80-0.93 us per call faster than two pieces
+# with the merge of any count at 16 and 17 rows, and at least 0.3 us faster
+# in each of 8 rounds.  The launches of 9-15 rows keep the merge of any
+# count: in a test harness on a 212-SM VR200, a 15-row batch of mixed row
+# lengths ran slower with the three-piece merge in every round.  With the
+# merge of any count, a launch whose every row fits in one piece (at most
+# ceil(9 / s) tiles: short requests, piece 0 writes O itself) still runs the
+# merge kernel and measured 0.81-0.86x (0.97x of two pieces at 15 rows of at
+# most three tiles); the host does not read row lengths, so those launches
+# split as well.  Without PDL the 17-row launch measured 0.98x with two
+# pieces: no launch without PDL splits.
 _K64_SPLIT_RULES: Mapping[str, _K64SplitRule] = {
     "sm_107a": _K64SplitRule(
         num_tiles=9,
         max_tokens_pdl=17,
         max_tokens_no_pdl=0,
         splits=((9, 40), (5, 40), (3, 51)),
-        merge_by_splits=((3, 1),),
+        merge_by_splits=((3, 16),),
     ),
 }
 
@@ -2789,9 +2793,9 @@ def run_cake_dsv4(
     query tokens (``_pdl_variant``).  On SM107, PDL launches of few metadata
     rows run a split-KV producer and a merge when the workspace holds their
     carve: FP8/H128 over items 1025-1152 wide (``_K64_SPLIT_RULES``; their
-    three-piece launches merge with the three-piece merge where the registry
-    has it, :func:`_k64_split_merge`) and FP8/H64 over items of four to nine
-    tiles (``_K64_SPLIT_RULES_H64``) (:func:`_k64_split`;
+    three-piece launches of 16 or 17 rows merge with the three-piece merge
+    where the registry has it, :func:`_k64_split_merge`) and FP8/H64 over
+    items of four to nine tiles (``_K64_SPLIT_RULES_H64``) (:func:`_k64_split`;
     :func:`cake_dsv4_workspace_requirement` includes it).
 
     On SM107 the FP8 low-head prefill route runs launches of at most 64 query

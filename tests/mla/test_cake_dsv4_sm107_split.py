@@ -3,21 +3,21 @@
 On SM107, FP8 launches of 128 heads over items 1025-1152 wide (nine sparse
 tiles) with at most 17 metadata rows and PDL run a split-KV producer and a
 merge kernel (:func:`flashinfer.mla.cake_dsv4._k64_split`); launches of
-three pieces per row (9-17 rows) merge with the merge built for three pieces
-(one warp per row and head, two heads per CTA, grid ``(rows, 64)``), the
-others with the merge of any count (grid ``(rows, 128)``)
-(:func:`flashinfer.mla.cake_dsv4._k64_split_merge`).  These tests call
-``trtllm_batch_decode_sparse_mla_dsv4(backend="cake")`` on such launches and
-check that the launch splits and merges as planned, that the output matches
-the fp32 reference of the hardening suite at its contract tolerance (rows at
-every piece edge included, and through separate SWA / compressed tables and a
-lens offset, bit for bit equal to the combined call), that masked columns
-contribute nothing (bit-identical output under a poisoned page), and that
-repeated calls are bitwise identical (eager and CUDA graph replay, with the
-piece buffers poisoned before every call).  Launches outside the split
-rule (18 rows, PDL off, a workspace below the split carve at 8 rows and at
-17, items 1024 wide, the K=64 launch gate false) must run the route's own
-launch bit for bit.
+three pieces per row and 16 or 17 rows merge with the merge built for three
+pieces (one warp per row and head, two heads per CTA, grid ``(rows, 64)``),
+the others (three pieces at 9-15 rows included) with the merge of any count
+(grid ``(rows, 128)``) (:func:`flashinfer.mla.cake_dsv4._k64_split_merge`).
+These tests call ``trtllm_batch_decode_sparse_mla_dsv4(backend="cake")`` on
+such launches and check that the launch splits and merges as planned, that
+the output matches the fp32 reference of the hardening suite at its contract
+tolerance (rows at every piece edge included, and through separate SWA /
+compressed tables and a lens offset, bit for bit equal to the combined
+call), that masked columns contribute nothing (bit-identical output under a
+poisoned page), and that repeated calls are bitwise identical (eager and
+CUDA graph replay, with the piece buffers poisoned before every call).
+Launches outside the split rule (18 rows, PDL off, a workspace below the
+split carve at 8 rows and at 17, items 1024 wide, the K=64 launch gate
+false) must run the route's own launch bit for bit.
 FP8 launches of 64 heads over items of four to nine tiles with PDL split by
 the rows and pieces of ``_K64_SPLIT_RULES_H64``; the ``test_h64_*`` tests
 check the same contract at both ends of every pieces band of those rules
@@ -71,13 +71,14 @@ COMPRESSED_WIDTH = 1024
 WIDTH = hardening.SWA_WINDOW + COMPRESSED_WIDTH
 TILE = 128
 # Routed row counts and the pieces per row the SM107 rule plans for them.
+# Three pieces: 9 and 15 rows bound the launches that merge with the merge of
+# any count, 16 and 17 rows those that merge with the three-piece merge.
 ROUTED = [
     (1, 9),
     (2, 9),
     (4, 9),
     (8, 5),
     (9, 3),
-    (11, 3),
     (12, 3),
     (13, 3),
     (14, 3),
@@ -87,14 +88,16 @@ ROUTED = [
 ]
 REPEATS = 20
 # The merge built for three pieces per row (one warp per row and head, two
-# heads per CTA): every 128-head launch of three pieces per row merges with it.
+# heads per CTA): the 128-head launches of three pieces per row and at least
+# MERGE_S3_ROWS rows merge with it.
 MERGE_S3 = f"{cake._K64_SPLIT_MERGE}_s3"
+MERGE_S3_ROWS = 16
 
 
 def _merge_of(rows: int, splits: int, num_heads: int = HEADS) -> tuple:
     """The merge key and grid of a split launch of ``rows`` rows of ``splits``
     pieces each."""
-    if num_heads == HEADS and splits == 3:
+    if num_heads == HEADS and splits == 3 and rows >= MERGE_S3_ROWS:
         return (MERGE_S3, (rows, num_heads // 2, 1))
     return (cake._K64_SPLIT_MERGE, (rows, num_heads, 1))
 
@@ -292,8 +295,8 @@ _ROUTED_CASES = [
 @pytest.mark.parametrize("rows,splits,layout,lengths", _ROUTED_CASES)
 def test_split_launch_matches_reference(monkeypatch, rows, splits, layout, lengths):
     """The launch splits into ``splits`` pieces per row and merges with the
-    merge of its piece count, matches the reference and is bit-identical with
-    the masked columns' page poisoned."""
+    merge of its rows and pieces (``_merge_of``), matches the reference and is
+    bit-identical with the masked columns' page poisoned."""
     _skip_unless_sm107()
     case = _case(rows, splits, layout=layout, lengths=lengths)
     workspace = _workspace(case)
