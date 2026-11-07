@@ -328,6 +328,10 @@ if not hasattr(cutlass, "__version__"):
     cutlass.utils.StaticPersistentTileScheduler._get_cluster_work_idx_with_fastdivmod = hooked_get_cluster_work_idx_with_fastdivmod
 
 
+def _identity_epilogue(x):
+    return x
+
+
 class BlockScaledContiguousGatherGroupedGemmKernel:
     """This class implements contiguous grouped matrix multiplication with gather operation and SwiGLU fusion
     for FC1 layer computation (C = up * silu(gate), where up/gate come from interleaved GEMM result).
@@ -818,7 +822,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         clamped_relu2_limit: Optional[cute.Tensor],
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
-        epilogue_op: cutlass.Constexpr = lambda x: x,
+        epilogue_op: cutlass.Constexpr = _identity_epilogue,
     ):
         """Execute the contiguous grouped GEMM with gather operation and SwiGLU fusion.
 
@@ -930,6 +934,15 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
         # Setup sfc tensor by filling C tensor to scale factor atom layout
         self.generate_sfc = sfc_tensor is not None
+        # Fold ClampedRelu2's L ** 2 into the output scales to avoid per-element
+        # multiplies by L. The kernel caps the folded L at 2 ** 32 so L ** 2
+        # stays finite in fp32. A custom epilogue_op must
+        # see the full activation, not act / L ** 2, so it disables the fold.
+        self.fold_clamped_relu2_l2 = (
+            self.use_clamped_relu2
+            and self.generate_sfc
+            and epilogue_op is _identity_epilogue
+        )
         if cutlass.const_expr(
             self.generate_sfc and not self.is_mxfp8_output and norm_const_tensor is None
         ):
@@ -2632,7 +2645,14 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             # the reciprocal is computed once here, not per element.
             if cutlass.const_expr(self.use_clamped_relu2):
                 clamp_limit = clamped_relu2_limit[0]
+                if cutlass.const_expr(self.fold_clamped_relu2_l2):
+                    # A huge L (or inf) makes the folded L ** 2 overflow fp32 and
+                    # the outputs NaN. For |x| <= 2 ** 26, capping L at 2 ** 32
+                    # changes L * tanh(x / L) by less than the tanh.approx error.
+                    clamp_limit = fmin(clamp_limit, cutlass.Float32(2.0**32))
                 inv_clamp_limit = cutlass.Float32(1.0) / clamp_limit
+                if cutlass.const_expr(self.fold_clamped_relu2_l2):
+                    norm_const = norm_const * clamp_limit * clamp_limit
 
             #
             # Persistent tile scheduling loop
@@ -2699,6 +2719,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         expanded_idx = token_id_mapping_tensor[permuted_row]
                         token_idx = expanded_idx // self.topk
                         alpha_val = alpha_val * a_per_token_scale[token_idx]
+                act_scale = cutlass.Float32(alpha_val)
+                if cutlass.const_expr(self.fold_clamped_relu2_l2):
+                    act_scale = act_scale * inv_clamp_limit
 
                 #
                 # Slice to per mma tile index
@@ -2801,26 +2824,32 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         tCompute = cute.make_rmem_tensor(acc_vec.shape, self.acc_dtype)
                         # ClampedRelu2: relu(L * tanh(x / L)) ** 2 on the
                         # alpha-scaled accumulator x, with L read at runtime.
+                        # tanh uses tanh.approx.f32 (one MUFU op, max relative
+                        # error ~2^-11), below the FP8/FP4 output rounding step.
+                        # With fold_clamped_relu2_l2, act_scale is alpha / L and
+                        # L ** 2 is in norm_const: this computes relu(tanh(x / L)) ** 2.
                         if cutlass.const_expr(self.vectorized_f32):
                             for i in cutlass.range_constexpr(
                                 0, cute.size(tTR_rAcc_up), 2
                             ):
                                 acc_alpha = cute.arch.mul_packed_f32x2(
                                     (acc_vec[i], acc_vec[i + 1]),
-                                    (
-                                        cutlass.Float32(alpha_val),
-                                        cutlass.Float32(alpha_val),
-                                    ),
+                                    (act_scale, act_scale),
                                 )
-                                if cutlass.const_expr(self.use_clamped_relu2):
+                                if cutlass.const_expr(self.fold_clamped_relu2_l2):
+                                    acc_alpha = (
+                                        cute.math.tanh(acc_alpha[0], fastmath=True),
+                                        cute.math.tanh(acc_alpha[1], fastmath=True),
+                                    )
+                                elif cutlass.const_expr(self.use_clamped_relu2):
                                     acc_alpha = (
                                         clamp_limit
-                                        * tanh_f32(
+                                        * cute.math.tanh(
                                             acc_alpha[0] * inv_clamp_limit,
                                             fastmath=True,
                                         ),
                                         clamp_limit
-                                        * tanh_f32(
+                                        * cute.math.tanh(
                                             acc_alpha[1] * inv_clamp_limit,
                                             fastmath=True,
                                         ),
@@ -2833,9 +2862,11 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                                 ) = cute.arch.mul_packed_f32x2((r0, r1), (r0, r1))
                         else:
                             for i in cutlass.range_constexpr(cute.size(tTR_rAcc_up)):
-                                v = acc_vec[i] * cutlass.Float32(alpha_val)
-                                if cutlass.const_expr(self.use_clamped_relu2):
-                                    v = clamp_limit * tanh_f32(
+                                v = acc_vec[i] * act_scale
+                                if cutlass.const_expr(self.fold_clamped_relu2_l2):
+                                    v = cute.math.tanh(v, fastmath=True)
+                                elif cutlass.const_expr(self.use_clamped_relu2):
+                                    v = clamp_limit * cute.math.tanh(
                                         v * inv_clamp_limit, fastmath=True
                                     )
                                 v = cute.arch.fmax(v, cutlass.Float32(0.0))
@@ -3215,6 +3246,12 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                                 acc_scale1 = ue8m0_to_inv_scale_fast(
                                     tCrSFC[vi + 1].to(cutlass.Uint32)
                                 )
+                                if cutlass.const_expr(self.fold_clamped_relu2_l2):
+                                    # norm_const is L ** 2 here (1.0 otherwise).
+                                    acc_scale0, acc_scale1 = cute.arch.mul_packed_f32x2(
+                                        (acc_scale0, acc_scale1),
+                                        (norm_const, norm_const),
+                                    )
                                 vec0 = tTR_rAcc_frg[None, vi]
                                 vec1 = tTR_rAcc_frg[None, vi + 1]
                                 for ei in cutlass.range_constexpr(self.sf_vec_size):
@@ -4080,7 +4117,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         scaling_vector_size: cutlass.Constexpr,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
-        epilogue_op: cutlass.Constexpr = lambda x: x,
+        epilogue_op: cutlass.Constexpr = _identity_epilogue,
     ):
         scale_k = k // scaling_vector_size
         interm_size = n // self.out_n_factor
