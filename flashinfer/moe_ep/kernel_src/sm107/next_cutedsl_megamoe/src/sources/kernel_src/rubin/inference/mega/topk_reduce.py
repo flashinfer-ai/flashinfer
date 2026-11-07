@@ -194,7 +194,10 @@ class TopkReduce:
         topk_score: Optional[cute.Tensor],  # (token, topk)
         stream: cuda.CUstream,
         topk_indices: Optional[cute.Tensor] = None,
+        shared_output: Optional[cute.Tensor] = None,
     ):
+        if cutlass.const_expr(shared_output is not None and self.combine_format.is_quantized):
+            raise ValueError("Shared experts require BF16 combine.")
         if cutlass.const_expr(topk_indices is not None):
             if cutlass.const_expr(self.num_experts is None):
                 raise ValueError("Masked combine requires a static expert count.")
@@ -217,7 +220,7 @@ class TopkReduce:
             )
 
         if cutlass.const_expr(not self.combine_format.is_quantized):
-            self._reduce_bf16(combine_quant, topk_score, reduced_output, topk_indices).launch(grid=grid, block=block, stream=stream)
+            self._reduce_bf16(combine_quant, topk_score, reduced_output, topk_indices, shared_output).launch(grid=grid, block=block, stream=stream)
             return
 
         # The mega kernel hands sf in already as the depth-2 broadcast layout; a
@@ -252,7 +255,7 @@ class TopkReduce:
     # -- kernels --------------------------------------------------------------
 
     @cute.kernel
-    def _reduce_bf16(self, combine_output: cute.Tensor, topk_score: Optional[cute.Tensor], reduced_output: cute.Tensor, topk_indices: Optional[cute.Tensor] = None):
+    def _reduce_bf16(self, combine_output: cute.Tensor, topk_score: Optional[cute.Tensor], reduced_output: cute.Tensor, topk_indices: Optional[cute.Tensor] = None, shared_output: Optional[cute.Tensor] = None):
         threads = self._threads
         hidden_per_thread = self.hidden_per_thread
         hidden_tiles = self.hidden_tiles
@@ -320,6 +323,14 @@ class TopkReduce:
                         else:
                             acc[i] = value_pair[0]
                             acc[i + 1] = value_pair[1]
+
+            if cutlass.const_expr(shared_output is not None):
+                shared_src = cute.zipped_divide(shared_output[token_idx, 0, None], (hidden_per_thread,))[
+                    (None,), (hidden_tile_idx,)
+                ]
+                shared = cute.make_rmem_tensor((hidden_per_thread,), cutlass.BFloat16)
+                cute.copy(load_atom, mark_alignment(shared_src, hidden_per_thread * cutlass.BFloat16.width // 8), shared)
+                acc.store(acc.load() + shared.load().to(cutlass.Float32))
 
             out = cute.make_rmem_tensor((hidden_per_thread,), out_dtype)
             out.store(acc.load().to(out_dtype))

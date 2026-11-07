@@ -54,3 +54,9 @@ class Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig:
     kernel_variant: Literal["inference", "genphase", "auto"] = "inference"
     # Quantizes the FC2 return payload; the operator still returns BF16.
     combine_dtype: Literal["bf16", "nvfp4", "mxfp8"] = "bf16"
+    # One replicated E4M3 shared expert with the same width, activation and clamp.
+    shared_expert: bool = False
+
+    def __post_init__(self):
+        if type(self.shared_expert) is not bool:
+            raise ValueError("shared_expert must be a boolean")
