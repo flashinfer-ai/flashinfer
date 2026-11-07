@@ -522,8 +522,9 @@ def _tensor_index(t) -> int:
 _LAUNCH_ORDERS: dict = {}
 
 
-def _launch(stage, gx, gy, gz, *values):
-    """Launch ``stage`` on ``(gx, gy, gz)``; ``values`` in call-site order, the first a tensor on the device."""
+def _prepared(stage, gx, gy, gz, *values):
+    """The launch of ``stage`` on ``(gx, gy, gz)`` resolved ahead of time, for :func:`_fire`: ``values`` in call-site
+    order (the first a tensor on the device) put in the record's parameter order."""
     device_index = values[0].get_device()
     if device_index < 0:
         device_index = torch.cuda.current_device()
@@ -535,7 +536,18 @@ def _launch(stage, gx, gy, gz, *values):
     order = found[1]
     if order is not None:
         values = tuple([values[i] for i in order])
-    cake_backend.launch_stage(stage, (gx, gy, gz), values, device_index=device_index)
+    return stage, (gx, gy, gz), values, device_index
+
+
+def _fire(launch) -> None:
+    """Run one launch of :func:`_prepared`."""
+    stage, grid, values, device_index = launch
+    cake_backend.launch_stage(stage, grid, values, device_index=device_index)
+
+
+def _launch(stage, gx, gy, gz, *values):
+    """Launch ``stage`` on ``(gx, gy, gz)``; ``values`` in call-site order, the first a tensor on the device."""
+    _fire(_prepared(stage, gx, gy, gz, *values))
 
 
 # --------------------------------------------------------------------------- #
@@ -2231,7 +2243,9 @@ def _carve(device, pieces) -> list[torch.Tensor]:
         if base is None:
             base = typed[dtype] = arena.view(dtype)
         shape = tuple(shape)
-        views.append(base.as_strided(shape, _contiguous_strides(shape), offset // dtype.itemsize))
+        views.append(
+            base.as_strided(shape, _contiguous_strides(shape), offset // dtype.itemsize)
+        )
     return views
 
 
@@ -2272,10 +2286,16 @@ def _launch_wy(
     *,
     recompute,
     out=None,
+    deferred=None,
 ):
+    """``deferred``: a list the launch is appended to (:func:`_prepared`) for the caller to fire, else launched here."""
     w, u = _wy_outputs(kn, v, total_tokens, num_v_heads) if out is None else out
-    _launch(wy_stage(arch), meta.num_chunks, num_v_heads, 1, kn, v, g_cs, beta32, A, w, u, meta.chunk_start,
-            meta.chunk_len, num_heads, num_v_heads, 1 if recompute else 0)  # fmt: skip
+    launch = _prepared(wy_stage(arch), meta.num_chunks, num_v_heads, 1, kn, v, g_cs, beta32, A, w, u,
+                       meta.chunk_start, meta.chunk_len, num_heads, num_v_heads, 1 if recompute else 0)  # fmt: skip
+    if deferred is None:
+        _fire(launch)
+    else:
+        deferred.append(launch)
     return w, u
 
 
@@ -2391,12 +2411,16 @@ def _caller_rows(state, meta: ChunkMeta):
 
 
 def _launch_fwd_ho(arch, qn, kn, w, u, g_cs, initial_state, meta, num_heads, num_v_heads, *, store_final_state, table,
-                   workspaces, options, scale, wy=None, out=None):  # fmt: skip
+                   workspaces, options, scale, wy=None, out=None, deferred=None):  # fmt: skip
     """The fused forward scan and output on the plan's forward segment table: a split plan first runs the pre-scan
     and the stitch (``reverse = 0``) for the segments' start states.  ``wy`` (``(v, beta32, A)``, with
     ``meta.fwd_groups``): ``wy_tc`` has not run; it runs here with the scan as two sequence groups (P form).  ``out``:
     the caller's ``(h, v_new, o)``, else allocated here.  Every workspace is taken before the first launch, so the
-    launches follow one another without host work between them."""
+    launches follow one another without host work between them.  ``deferred`` (a list; not with ``wy``): the
+    launches are appended to it in order (:func:`_prepared`) for the caller to fire, and nothing launches here."""
+    if deferred is not None and wy is not None:
+        raise ValueError("the P form launches its two sequence groups itself")
+    run = _fire if deferred is None else deferred.append
     device = kn.device
     if out is None:
         h = torch.empty(
@@ -2443,11 +2467,12 @@ def _launch_fwd_ho(arch, qn, kn, w, u, g_cs, initial_state, meta, num_heads, num
         seg_start = workspaces.take(table, "f_seg_start", (segs.num_segments, num_v_heads, HEAD_DIM, HEAD_DIM),
                                     torch.float32, device)  # fmt: skip
         walk = _walk(device, segs, options)
-        _launch(pre, segs.num_segments, num_v_heads, 2 * HEAD_DIM // vb, kn, w, u, g_cs, h0, h, v_new, final_state,
-                seg_state, meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq, meta.seq_chunk_start,
-                num_heads, num_v_heads, use_init, 0, seg_flag, warmup_thresh_log2(options))  # fmt: skip
-        _launch("stitch", meta.num_seqs, num_v_heads, STITCH_VSPLIT, seg_state, h0, seg_start, segs.seq_seg_start,
-                seg_flag, num_v_heads, use_init, 0)  # fmt: skip
+        run(_prepared(pre, segs.num_segments, num_v_heads, 2 * HEAD_DIM // vb, kn, w, u, g_cs, h0, h, v_new,
+                      final_state, seg_state, meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq,
+                      meta.seq_chunk_start, num_heads, num_v_heads, use_init, 0, seg_flag,
+                      warmup_thresh_log2(options)))  # fmt: skip
+        run(_prepared("stitch", meta.num_seqs, num_v_heads, STITCH_VSPLIT, seg_state, h0, seg_start,
+                      segs.seq_seg_start, seg_flag, num_v_heads, use_init, 0))  # fmt: skip
         use_seg = 1
     else:
         walk = _walk(device, segs, options)
@@ -2459,9 +2484,10 @@ def _launch_fwd_ho(arch, qn, kn, w, u, g_cs, initial_state, meta, num_heads, num
             stage = "fwd_ho_vh2"
             if fwd_ho_vh2_splits(arch):
                 ctas = 2 * ctas
-        _launch(stage, ctas, 1, 1, qn, kn, w, u, g_cs, h0, seg_start, h, v_new, v_new, o, o, final_state,
-                meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq, meta.seq_chunk_start, walk,
-                num_heads, num_v_heads, use_init, 1 if store_final_state else 0, use_seg, float(scale))  # fmt: skip
+        run(_prepared(stage, ctas, 1, 1, qn, kn, w, u, g_cs, h0, seg_start, h, v_new, v_new, o, o, final_state,
+                      meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq, meta.seq_chunk_start,
+                      walk, num_heads, num_v_heads, use_init, 1 if store_final_state else 0, use_seg,
+                      float(scale)))  # fmt: skip
         return h, v_new, final_state, o
     # P form: the side stream runs wy_tc and fwd_ho of group A (the partial round); the caller's stream runs those of
     # group B (the full rounds) once wy_tc(A) is done, then joins the side stream.  fwd_ho(A) can read w / u rows past
@@ -2554,23 +2580,33 @@ def cake_gdn_nondet_train_forward(q, k, v, g, beta, *, meta, arch, scale=None, i
         beta32 = beta if beta.dtype == torch.float32 else beta.float()
     w, u, h, v_new = rest
     o = torch.empty(v.shape, dtype=v.dtype, device=device)
-    # v is read as contiguous rows (wy_tc, the backward tail), copied once byte for byte when it is a view
-    v = _dense(v, v_rows)
-    _launch(prep + ("_bf16beta" if beta_bf16 else ""), meta.num_chunks, num_heads if prep == "prep_tma" else num_v_heads,
-            1, q, k, g32, beta, beta32, qn, kn, rstd_q, rstd_k, g_cs, meta.chunk_start, meta.chunk_len, num_heads,
-            num_v_heads, 1 if normalize_qk else 0)  # fmt: skip
-    if meta.fwd_groups is None:
-        _launch_wy(arch, kn, v, g_cs, beta32, A, meta, num_heads, num_v_heads, total_tokens, recompute=False,
-                   out=(w, u))  # fmt: skip
-        wy = None
-    else:  # wy_tc runs with fwd_ho as two sequence groups
-        wy = (v, beta32, A)
+    # v is read as contiguous rows (wy_tc, the backward tail), copied once byte for byte when it is a view: the copy
+    # (into v_rows) is the first launch, the launches below read v_rows
+    v_in, v = v, (v_rows if copy_v else v)
+    # every launch is resolved before the first one (the fused scan's workspaces, start states and walk among them),
+    # so on a slow host the launches go back to back while the GPU runs the short kernels of a small row
+    launches = [_prepared(prep + ("_bf16beta" if beta_bf16 else ""), meta.num_chunks,
+                          num_heads if prep == "prep_tma" else num_v_heads, 1, q, k, g32, beta, beta32, qn, kn,
+                          rstd_q, rstd_k, g_cs, meta.chunk_start, meta.chunk_len, num_heads, num_v_heads,
+                          1 if normalize_qk else 0)]  # fmt: skip
     workspaces = _workspaces(options)
     table = workspaces.table(_tensor_index(kn))
-    h, v_new, final_state, o = _launch_fwd_ho(arch, qn, kn, w, u, g_cs, _table_rows(initial_state, meta), meta,
-                                              num_heads, num_v_heads, store_final_state=output_final_state,
-                                              table=table, workspaces=workspaces, options=options, scale=scale,
-                                              wy=wy, out=(h, v_new, o))  # fmt: skip
+    fwd_ho = {"store_final_state": output_final_state, "table": table, "workspaces": workspaces, "options": options,
+              "scale": scale, "out": (h, v_new, o)}  # fmt: skip
+    initial_rows = _table_rows(initial_state, meta)
+    if meta.fwd_groups is None:
+        _launch_wy(arch, kn, v, g_cs, beta32, A, meta, num_heads, num_v_heads, total_tokens, recompute=False,
+                   out=(w, u), deferred=launches)  # fmt: skip
+        h, v_new, final_state, o = _launch_fwd_ho(arch, qn, kn, w, u, g_cs, initial_rows, meta, num_heads,
+                                                  num_v_heads, deferred=launches, **fwd_ho)  # fmt: skip
+        _dense(v_in, v_rows)
+        for launch in launches:
+            _fire(launch)
+    else:  # wy_tc runs with fwd_ho as two sequence groups
+        _dense(v_in, v_rows)
+        _fire(launches[0])
+        h, v_new, final_state, o = _launch_fwd_ho(arch, qn, kn, w, u, g_cs, initial_rows, meta, num_heads,
+                                                  num_v_heads, wy=(v, beta32, A), **fwd_ho)  # fmt: skip
     if output_final_state:
         final_state = _caller_rows(final_state, meta)
     return {
