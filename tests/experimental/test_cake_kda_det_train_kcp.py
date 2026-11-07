@@ -5624,6 +5624,147 @@ def test_walk_form_of_passes_arch_to_a_per_architecture_rule_alone() -> None:
     )
 
 
+def test_walk_streams_knob_is_gated_and_validated(monkeypatch) -> None:
+    """``walk_streams`` is a private test knob: refused without :func:`cake_kcp_plan.enable_test_knobs`, never a
+    public keyword, validated against :data:`WALK_STREAMS`; the shipped default is ``"auto"`` (the rule per pair)."""
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", False)
+    assert cake_kcp.WALK_STREAMS == ("auto", "one", "two")
+    assert cake_kcp.WALK_STREAMS_DEFAULT == "auto"
+    assert cake_kcp.P2_KNOBS["walk_streams"] == cake_kcp.WALK_STREAMS
+    assert cake_kcp._options({}).walk_streams == "auto"
+    with pytest.raises(ValueError, match="enable_test_knobs"):
+        cake_kcp._options({"_kcp_test_knobs": {"walk_streams": "two"}})
+    with pytest.raises(TypeError):
+        cake_kcp._options({"walk_streams": "two"})
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
+    for form in cake_kcp.WALK_STREAMS:
+        o = cake_kcp._options({"_kcp_test_knobs": {"walk_streams": form}})
+        assert o.walk_streams == form
+    for bad in ("1", "both", "One"):
+        with pytest.raises(ValueError, match="walk_streams"):
+            cake_kcp._options({"_kcp_test_knobs": {"walk_streams": bad}})
+
+
+def test_default_options_are_fresh_validated_copies(monkeypatch) -> None:
+    """``_default_options()`` (an entry point without keyword options) equals ``_options({})`` and the defaults
+    validated through the full path field by field, returns a fresh object per call (a caller's change stays in its
+    copy), follows the plan module's ``SAVE_TRANSFER_DEFAULT`` (its cache key), and works when the options class is a
+    ``slots=True`` dataclass (the copy is the positional ``__init__`` over the cached field values, no ``__dict__``)."""
+    fields = dataclasses.fields(cake_kcp.CakeKDADetKcpOptions)
+    names = [f.name for f in fields]
+    assert all(f.init and not f.kw_only for f in fields)
+    # the copy does not re-validate: no __post_init__
+    assert not hasattr(cake_kcp.CakeKDADetKcpOptions, "__post_init__")
+    full = cake_kcp._options({"_kcp_test_knobs": None})
+    a, b = cake_kcp._default_options(), cake_kcp._options({})
+    for o in (a, b):
+        assert type(o) is cake_kcp.CakeKDADetKcpOptions
+        assert [getattr(o, n) for n in names] == [getattr(full, n) for n in names]
+    assert a is not b and a is not full and b is not full
+    a.exchange = "ring"
+    assert cake_kcp._default_options().exchange == full.exchange == "auto"
+    monkeypatch.setattr(kp, "SAVE_TRANSFER_DEFAULT", not kp.SAVE_TRANSFER_DEFAULT)
+    flipped = cake_kcp._default_options()
+    assert flipped.save_transfer is (not full.save_transfer)
+    assert flipped == cake_kcp._options({"_kcp_test_knobs": None})
+    monkeypatch.undo()
+    slotted = dataclasses.make_dataclass(
+        "CakeKDADetKcpOptionsSlots",
+        [(f.name, f.type, dataclasses.field(default=f.default)) for f in fields],
+        namespace={"check": cake_kcp.CakeKDADetKcpOptions.check},
+        slots=True,
+    )
+    monkeypatch.setattr(cake_kcp, "CakeKDADetKcpOptions", slotted)
+    monkeypatch.setattr(cake_kcp, "_DEFAULT_OPTIONS", [])
+    s1, s2 = cake_kcp._default_options(), cake_kcp._default_options()
+    assert type(s1) is slotted and not hasattr(s1, "__dict__") and s1 is not s2
+    assert [getattr(s1, n) for n in names] == [getattr(full, n) for n in names]
+
+
+def _wave_ref(chains, H: int, sm: int) -> str:
+    """The one-wave rule written out: two streams iff ``len(chains) H >= 2 N`` (K1 fills its ``2 N`` slots)."""
+    return "two" if chains and len(chains) * H >= 2 * sm else "one"
+
+
+def test_walk_streams_rule_is_one_k1_wave() -> None:
+    """:func:`cake_kcp.walk_streams` takes two streams exactly when K1 fills a wave of its ``2 N`` slots (``c1 =
+    len(chains) * H >= 2 N``) whatever the chain lengths, one stream below; the knob's forced forms pass through; an
+    empty list is one stream.  The rows of the layer A/B (W4, 16384 tokens per rank; 152 SMs: sm_100a / sm_103a; 212
+    SMs: sm_107a) keep their measured calls."""
+    shapes = {
+        "uniform": lambda n: [56] * n,
+        "edge": lambda n: [20] + [9] * (n - 1),
+        "below": lambda n: [20] + [8] * (n - 1),
+        "ramp": lambda n: [10 + i for i in range(n)],
+        "zero": lambda n: [0] + [12] * (n - 1),  # an empty segment
+    }
+    seen = set()
+    for sm in (132, 148, 152, 160, 212, 216):
+        for H in (1, 2, 3, 4, 8, 16, 32, 48, 64):
+            for n in range(1, 41):
+                for name, shape in shapes.items():
+                    chains = shape(n)
+                    want = _wave_ref(chains, H, sm)
+                    got = cake_kcp.walk_streams(chains, H, sm)
+                    assert got == want, (sm, H, n, name, chains, got, want)
+                    seen.add(got)
+                    for knob in ("one", "two"):
+                        assert cake_kcp.walk_streams(chains, H, sm, knob=knob) == knob
+    assert seen == {"one", "two"}
+    # the bound: c1 = 2 N - 1 is one stream, c1 = 2 N two
+    assert cake_kcp.walk_streams([7] * 299, 1, 150) == "one"
+    assert cake_kcp.walk_streams([7] * 300, 1, 150) == "two"
+    assert cake_kcp.walk_streams([7] * 29, 10, 150) == "one"  # c1 = 290
+    assert cake_kcp.walk_streams([7] * 30, 10, 150) == "two"  # c1 = 300 = 2 N
+    assert cake_kcp.walk_streams([], 64, 152) == "one"
+    with pytest.raises(ValueError, match="walk_streams"):
+        cake_kcp.walk_streams([7], 1, 152, knob="split")
+    # (chains, H, SM count) -> the call the layer A/B supports
+    w4r1 = [48, 48, 32, 32, 28, 28, 20, 20]  # the real h12 W4 interior rank: c1 = 512
+    rows = [
+        (w4r1, 64, 152, "two"),  # faster on two streams (sm_100a, sm_103a)
+        (w4r1, 64, 212, "two"),  # faster on two streams (sm_107a): 512 >= 424
+        ([48, 32, 28, 20], 64, 152, "one"),  # its rank 0: c1 = 256
+        # 16 walks at H 16: c1 = 256, slower on two streams (sm_100a, sm_103a)
+        ([56] * 16, 16, 152, "one"),
+        ([56] * 16, 16, 212, "one"),  # the same on 212 SMs: no faster
+    ]
+    for chains, H, sm, want in rows:
+        assert cake_kcp.walk_streams(chains, H, sm) == want, (chains, H, sm)
+
+
+def test_walk_streams_decided_once_per_table_set(monkeypatch) -> None:
+    """``_Tables.walk_streams`` evaluates the rule once per ``(walk list, H, SM count, knob)`` of the table set (a fresh
+    equal list finds the same entry) on the chunk counts of the listed segments."""
+    part = kp.cake_kda_det_train_kcp_partition(
+        (0, 64 * 200, 64 * 350), 4, layout="contiguous"
+    )
+    ctx = kp.cake_kda_det_train_kcp_build_context(part, None, 0, "cpu", 4, sm_count=148)
+    tb = cake_kcp._Tables(ctx, 64)
+    assert tb.walk_offset
+    evaluated: list[tuple] = []
+    rule = cake_kcp.walk_streams
+
+    def counting(chains, num_heads, sm_count, *, knob="auto"):
+        evaluated.append((tuple(chains), num_heads, sm_count, knob))
+        return rule(chains, num_heads, sm_count, knob=knob)
+
+    monkeypatch.setattr(cake_kcp, "walk_streams", counting)
+    seg = [int(x) for x in tb.hp.seg_chunk_start]
+    chains = [seg[s + 1] - seg[s] for s in tb.walk_offset]
+    for knob in cake_kcp.WALK_STREAMS:
+        for sm in (148, 212):
+            want = rule(chains, 64, sm, knob=knob)
+            for _ in range(3):
+                assert tb.walk_streams(tb.walk_offset, 64, sm, knob) == want
+            assert tb.walk_streams(list(tb.walk_offset), 64, sm, knob) == want
+    assert sorted(evaluated) == sorted(
+        (tuple(chains), 64, sm, knob)
+        for knob in cake_kcp.WALK_STREAMS
+        for sm in (148, 212)
+    )
+
+
 class _FakeGraphRt:
     """A CUDA-runtime double of the capture-graph entry points of the kernel-node cap forms: one
     active capture whose next operation depends on one kernel node; records every call."""
@@ -7213,4 +7354,191 @@ def test_gpu_graph_replay_after_a_forward_without_a_saved_set(device) -> None:
         assert events == ["eager", "capture", "replay"], events
         assert captured() == 2
     finally:  # the cached entries pin ws / ctx: never leak them into later tests
+        cake_kcp.graph_cache_clear()
+
+
+# (document lengths, H, plan SM count) of one rank whose forward runs the summary pair over a segmented plan (P > 1:
+# the pair writes the staging planes): a one-wave-fill row (one document of 108 chunks at H 16: the plan's
+# P = floor(N / 16) puts len(walk) * H in (N - 16, N] < 2 N on every exported device, so the rule keeps one stream),
+# the walk geometry of the real h12 W4 interior rank (four documents of 96 / 64 / 56 / 40 chunks that the plan of a
+# 512-SM count splits in two: 8 walks of 48, 48, 32, 32, 28, 28, 20, 20 chunks at H 64: c1 = 512 >= 2 N, two
+# streams) and a small three-document row (one stream)
+WALK_STREAMS_ROWS = (
+    ((6912,), 16, None),
+    ((6144, 4096, 3584, 2560), 64, 512),
+    ((300, 724, 476), 2, None),
+)
+WALK_STREAMS_IDS = ("band-h16", "w4r1walks-h64", "s300_724_476-h2")
+
+
+def _walk_streams_problem(device, lengths, H: int, plan_sm: int | None):
+    """A one-rank problem (``_ckpt_problem`` with an optional plan SM count) and the chunk counts of its offset walk."""
+    from tests.test_helpers.cake_kda_det_train_reference import make_inputs
+
+    cu = [0]
+    for n in lengths:
+        cu.append(cu[-1] + n)
+    part = kp.cake_kda_det_train_kcp_partition(cu, 1)
+    kw = {} if plan_sm is None else {"sm_count": plan_sm}
+    ctx = kp.cake_kda_det_train_kcp_build_context(part, None, 0, device, **kw)
+    ops = make_inputs(lengths, H, device)
+    names = ("q", "k", "v", "g", "beta", "dout")
+    tb = cake_kcp._Tables(ctx, H)
+    seg = [int(x) for x in tb.hp.seg_chunk_start]
+    chains = [seg[s + 1] - seg[s] for s in tb.walk_offset]
+    return ctx, {n: ops[n].to(device).contiguous() for n in names}, chains
+
+
+@pytest.mark.parametrize("lengths,H,plan_sm", WALK_STREAMS_ROWS, ids=WALK_STREAMS_IDS)
+def test_gpu_walk_streams_are_bitwise(device, monkeypatch, lengths, H, plan_sm) -> None:
+    """The summary pair on one stream (knob ``walk_streams="one"``), on two (``"two"``) and under the rule (``"auto"``,
+    shipped), one rank, ``P > 1``: the output, the saved set, the gradients of both backward modes (the replay-mode
+    backward's forward runs the pair again) and a checkpointed step with a recompute handle (its recompute runs the
+    stage walks again) are bitwise the same under the three forms.  Every form runs two rounds; the records show
+    each pair on the forced form, or under ``"auto"`` on the rule's form (:func:`cake_kcp.walk_streams` of the walk's
+    chains, H and the device's SM count; the band row keeps one stream, the W4 walk geometry takes two), except the
+    first two-stream pair of the table set, which runs on one stream (it uploads the launches' device tables)."""
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
+    ctx, ops, chains = _walk_streams_problem(device, lengths, H, plan_sm)
+    assert ctx.heads(H).P > 1 and chains
+    sm = cake_jit.sm_count(device.index)
+    rule = cake_kcp.walk_streams(chains, H, sm)
+    if plan_sm is None and len(lengths) == 1:  # the band row
+        assert rule == "one", (chains, H, sm)
+    if plan_sm is not None:  # the W4 interior rank's walks
+        assert sorted(chains, reverse=True) == [48, 48, 32, 32, 28, 28, 20, 20]
+        assert rule == "two", (chains, H, sm)
+    args = [ops[n] for n in ("q", "k", "v", "g", "beta")]
+
+    def one_round(form: str):
+        knobs = {"_kcp_test_knobs": {"walk_streams": form}}
+        ws = cake_kcp.CakeKDADetKcpWorkspace()
+        out, saved = cake_kcp.cake_kda_det_train_kcp_forward(
+            *args, ctx, workspace=ws, **knobs
+        )
+        rec_f = dict(cake_kcp.LAST_CALL["fwd"])
+        g_saved = cake_kcp.cake_kda_det_train_kcp_backward(
+            *args, ctx, ops["dout"], saved=saved, workspace=ws, **knobs
+        )
+        g_replay = cake_kcp.cake_kda_det_train_kcp_backward(
+            *args, ctx, ops["dout"], saved=None, workspace=ws, **knobs
+        )
+        rec_b = dict(cake_kcp.LAST_CALL["bwd"])
+        ck, (_orig, rec_r, _bwd) = _ckpt_pass(
+            ctx, ops, handle=cake_kcp.CakeKDADetKcpRecomputeHandle(), **knobs
+        )
+        torch.cuda.synchronize(device)
+        tensors = (
+            out,
+            *written_tensors(saved),
+            *g_saved,
+            *g_replay,
+            *(ck[n] for n in TENSOR_NAMES + ("dw",)),
+        )
+        # the pairs of the forward, of the replay-mode backward's forward and of the checkpoint's recompute
+        logs = [rec_f["walk_streams"], rec_b["walk_streams"], rec_r["walk_streams"]]
+        return tensors, [entry for log in logs for entry in log], logs
+
+    ref = None
+    records: dict = {}
+    for form in ("one", "two", "auto"):
+        for r in range(2):
+            tensors, pairs, logs = one_round(form)
+            records[(form, r)] = logs
+            assert all(len(log) == 1 for log in logs), (form, r, logs)
+            assert all(n == len(chains) for _d, _run, n in pairs), pairs
+            decided = rule if form == "auto" else form
+            assert all(d == decided for d, _run, _n in pairs), (form, r, pairs)
+            ran = [run for _d, run, _n in pairs]
+            if form == "two" and r == 0:
+                # the table set's first two-stream pair (the forward's) runs on one stream, the later ones on two
+                assert ran == ["one", "two", "two"], (form, r, pairs)
+            else:
+                assert ran == [decided] * 3, (form, r, pairs)
+            if ref is None:
+                ref = tuple(t.clone() for t in tensors)
+                assert all(torch.isfinite(t.float()).all().item() for t in ref)
+                continue
+            for a, b in zip(ref, tensors, strict=True):
+                assert (
+                    a.shape == b.shape
+                    and a.dtype == b.dtype
+                    and torch.equal(_bits(a), _bits(b))
+                ), (form, r)
+    _evidence(
+        "gpu_walk_streams",
+        {
+            "lengths": list(lengths),
+            "H": H,
+            "plan_sm": plan_sm,
+            "sm": sm,
+            "chains": chains,
+            "rule": rule,
+            "records": {f"{k[0]}:{k[1]}": v for k, v in records.items()},
+            "pass": True,
+        },
+    )
+
+
+def test_gpu_walk_streams_graph_replay_is_bitwise(device, monkeypatch) -> None:
+    """``graph="replay"`` with the summary pair on two streams (knob ``walk_streams="two"``), one rank, ``P > 1``: the
+    first call of a key runs eagerly, the second is captured (the fork and join events become graph dependencies of
+    the side stream's launch) and the later calls replay it; the forward's ``out`` and saved set and the replay-mode
+    backward's gradients (its forward runs the pair) are bitwise the eager one-stream results on every call, and the
+    captured and replayed calls record the pair on two streams."""
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
+    ctx, ops, chains = _walk_streams_problem(device, (300, 724, 476), 2, None)
+    assert ctx.heads(2).P > 1 and chains
+    args = [ops[n] for n in ("q", "k", "v", "g", "beta")]
+    ws = cake_kcp.CakeKDADetKcpWorkspace()
+
+    def run(form: str, graph: str):
+        knobs = {"_kcp_test_knobs": {"walk_streams": form}}
+        out, saved = cake_kcp.cake_kda_det_train_kcp_forward(
+            *args, ctx, workspace=ws, graph=graph, **knobs
+        )
+        rec_f = dict(cake_kcp.LAST_CALL["fwd"])
+        fwd = tuple(t.clone() for t in (out, *written_tensors(saved)))
+        grads = cake_kcp.cake_kda_det_train_kcp_backward(
+            *args, ctx, ops["dout"], saved=None, workspace=ws, graph=graph, **knobs
+        )
+        rec_b = dict(cake_kcp.LAST_CALL["bwd"])
+        res = fwd + tuple(t.clone() for t in grads)
+        return res, (rec_f, rec_b)
+
+    def same(a, b) -> bool:
+        return all(
+            x.shape == y.shape
+            and x.dtype == y.dtype
+            and torch.equal(_bits(x), _bits(y))
+            for x, y in zip(a, b, strict=True)
+        )
+
+    cake_kcp.graph_cache_clear()
+    try:
+        ref, recs = run("one", "off")
+        assert all(
+            log == [("one", "one", len(chains))]
+            for log in (r["walk_streams"] for r in recs)
+        )
+        fallback0 = cake_kcp.GRAPH_STATS["fallback"]
+        events = []
+        for i in range(4):
+            res, (rec_f, rec_b) = run("two", "replay")
+            events.append((rec_f["graph_event"], rec_b["graph_event"]))
+            assert same(ref, res), (i, events)
+            for rec in (rec_f, rec_b):
+                if (
+                    rec["graph_event"] != "eager"
+                ):  # the captured call's record (replays carry it)
+                    assert rec["walk_streams"] == [("two", "two", len(chains))], rec
+        assert [e[0] for e in events] == ["eager", "capture", "replay", "replay"], (
+            events
+        )
+        bwd_events = [e[1] for e in events]
+        assert bwd_events.count("capture") == 1 and bwd_events[-1] == "replay", events
+        assert cake_kcp.GRAPH_STATS["fallback"] == fallback0
+        res, _ = run("two", "off")
+        assert same(ref, res)
+    finally:
         cake_kcp.graph_cache_clear()
