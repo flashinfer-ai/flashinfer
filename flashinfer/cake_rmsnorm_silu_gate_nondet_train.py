@@ -87,8 +87,10 @@ Mode and dispatch rules:
    ``CakeRMSNormSiLUGateNondetFunction`` save only ``x``, ``z`` and ``weight``
    and run the backward of their own package.  A backward workspace serves
    only its own package (FP32 for the deterministic package, ``torch.uint8``
-   for the non-deterministic one): each backward refuses the other package's
-   workspace (``ValueError``), also in a call with no rows.
+   for the non-deterministic one).  This package's backward refuses the
+   deterministic package's workspace (``ValueError``) in every call, also with
+   no rows; the deterministic backward refuses this package's workspace in a
+   call with rows.
 5. The former names are gone, with no alias or shim: the former modules fail
    at import, and the former names without a mode word are attributes of
    neither ``flashinfer`` nor either module.  The SiLU-gated RMSNorm section
@@ -107,7 +109,8 @@ time its own buffer.  A buffer that did not come from that factory, or that
 anything else wrote into, must be zeroed with
 ``cake_rmsnorm_silu_gate_nondet_train_reset_workspace(ws)`` before its next
 backward.  It is not interchangeable with the deterministic package's FP32
-buffer: each backward refuses the other package's buffer (``ValueError``).
+buffer: this package's backward refuses that buffer (``ValueError``) in every
+call, and the deterministic backward refuses this one in a call with rows.
 Calls without a workspace use one buffer per device, stream and backward
 kernel (two per weight-gradient dtype: one for the one-wave backward, one for
 the claimed backward), kept for later calls; the autograd node retains nothing
@@ -290,7 +293,8 @@ def cake_rmsnorm_silu_gate_nondet_train_backward_workspace(
     that may run at the same time on another stream needs its own workspace.
     It is not the deterministic package's FP32 buffer
     (:func:`flashinfer.cake_rmsnorm_silu_gate_det_train.cake_rmsnorm_silu_gate_det_train_backward_workspace`):
-    each backward refuses the other package's buffer.
+    this package's backward refuses that buffer in every call, and the
+    deterministic backward refuses this one in a call with rows.
 
     Parameters
     ----------

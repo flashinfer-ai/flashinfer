@@ -261,8 +261,10 @@ short forward is not shown there.
    and run the backward of their own package.  A backward workspace holds the
    raw partial sums of one package and serves only that package (FP32 for the
    deterministic package, a ``torch.uint8`` buffer for the non-deterministic
-   one): each backward refuses the other package's workspace (``ValueError``),
-   also in a call with no rows.
+   one).  The non-deterministic backward refuses the deterministic package's
+   workspace (``ValueError``) in every call, also with no rows; the
+   deterministic backward refuses the non-deterministic package's workspace in
+   a call with rows.
 5. The former names are gone, with no alias or shim: the former modules fail
    at import, and the former names without a mode word are attributes of
    neither ``flashinfer`` nor either module.
