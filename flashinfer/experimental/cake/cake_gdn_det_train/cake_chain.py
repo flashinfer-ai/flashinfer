@@ -42,7 +42,13 @@ register one, and then launches no ``dv_local``: its pre-scan
 of two, a split adjoint plan the serial-scan rule (:func:`serial_scan_pricing`)
 prices slower than ``dhu_tc2`` over whole sequences becomes that serial plan
 (other bits of ``dk`` / ``dv`` / ``dg`` / ``dbeta``, within the same
-accuracy); then, for a
+accuracy).  A host-built table without plan pins then takes the adjoint table
+priced for ``dhu_tc2`` itself where that pricing (:func:`tc_plan_pricing`,
+``TC_PLAN``) beats the planner's table, and on the architectures of
+``CHAIN_PLAN`` deeper split tables priced for the ``fwd_ho`` and ``dhu_tc2``
+chains (:func:`chain_plan_pricing`); a table whose adjoint scan runs as two
+groups beside the fused tail keeps its form.  The backward runs such a table on
+``dhu_tc2``; the bits follow the table.  Then, for a
 value-head group of two or of three, the fused
 tcgen05 tail (``tail_g2`` / ``tail_g3``), else ``dqkwg``, the WY pullback and
 the finalize.  A host-built table lists the sequences longest first
@@ -102,12 +108,19 @@ import torch
 from . import cake_backend, cake_jit
 
 __all__ = [
+    "CHAIN_PLAN",
     "CHUNK",
     "FINALIZE_STAGES",
     "FULL",
     "HEAD_DIM",
     "PRESCAN_CONFIGS",
     "REG_SCAN_CONFIGS",
+    "TC_PLAN",
+    "TC_PLAN_GAIN",
+    "TC_PLAN_MIN_SAVING",
+    "TC_PLAN_PRESCAN",
+    "TC_PLAN_SELECT",
+    "TC_PLAN_STEP",
     "CakeGDNDetFunction",
     "ChainOptions",
     "ChunkMeta",
@@ -120,11 +133,13 @@ __all__ = [
     "cake_gdn_det",
     "cake_gdn_det_train_backward",
     "cake_gdn_det_train_forward",
+    "chain_plan_pricing",
     "choose_scan_plan",
     "dhu_tc_pricing",
     "finalize_stage",
     "fwd_ho_vh2_engaged",
     "fwd_ho_vh2_splits",
+    "host_plans",
     "lpt_sequence_order",
     "lpt_walk",
     "make_options",
@@ -133,6 +148,8 @@ __all__ = [
     "serial_scan_pricing",
     "sequence_groups",
     "stage_set",
+    "tc_plan_pricing",
+    "tc_plan_thresholds",
     "two_stream_split",
     "use_prep_tma",
     "wavefront_engaged",
@@ -479,7 +496,8 @@ class ChunkMeta:
     ``order_index`` holds it on the device as ``[order, inverse]`` for the state rows.  ``fwd_groups`` /
     ``bwd_groups``: the two-stream sequence groups of the forward / adjoint scan (``None``: one stream).
     ``bwd_wavefront``: the adjoint scan stage of the wavefront pair where the table's side of the wavefront rule
-    holds (:func:`_wavefront_table`; ``None``: the separate launches)."""
+    holds (:func:`_wavefront_table`; ``None``: the separate launches); ``bwd_tc``: the adjoint table is priced for
+    ``dhu_tc2`` (:func:`tc_plan_pricing`, :func:`chain_plan_pricing`), which runs it."""
 
     chunk_start: torch.Tensor
     chunk_len: torch.Tensor
@@ -494,6 +512,7 @@ class ChunkMeta:
     fwd_groups: StreamGroups | None = None
     bwd_groups: StreamGroups | None = None
     bwd_wavefront: str | None = None
+    bwd_tc: bool = False
 
 
 @dataclass(frozen=True)
@@ -1405,6 +1424,446 @@ def _serial_adjoint_plan(
 
 
 # --------------------------------------------------------------------------- #
+# the adjoint table priced for dhu_tc2 (host route)
+# --------------------------------------------------------------------------- #
+# The register planner prices the adjoint table for the register scans (two CTAs per (segment, value head) at
+# ``v_block`` 64, their step and co-residency factors); the pass-2 rules then run ``dhu_tc2`` on THAT table.  With
+# ``TC_PLAN`` a host-built table without plan pins whose planner configuration is ``SDT_CONFIG`` may instead take the
+# table priced for ``dhu_tc2`` itself.  Candidates: the serial table and the ``SDT_CONFIG`` split tables of ``L``
+# chunks (``MIN_SEGMENT_CHUNKS`` to the pre-scan capacity), each priced (microseconds) T = makespan(segments x HV CTAs,
+# one per SM) x t(n) (the ``dhu_tc2`` interpolation of :func:`sdt_pricing` over ``TC_PLAN_STEP``) + the register
+# planner's pre-scan and stitch terms x ``t_unit`` + the ``dv_local`` tiles of the pre-scan's warm-up window (on an
+# architecture of ``TC_PLAN_PRESCAN``: the stitch term + the pre-scan of a value head that scans its whole segment).  The
+# planner's table (after the serial-scan rule) is priced in the form its rules run (tcgen05, or the register pass
+# with ``dv_local``), and the cheapest candidate replaces it when it saves at least ``min_saving`` us and prices at
+# most ``gain`` x the planner's table (:func:`tc_plan_thresholds`); the backward then runs the candidate on
+# ``dhu_tc2``.  A table whose scan runs as two groups beside the fused tail keeps its form (:func:`_two_stream_kept`):
+# its scan overlaps the tail, which the pricing does not credit.  Another table moves the warm-up truncation and the
+# stitch points, so the bits follow the plan (bitwise run to run for the layout); plan pins keep the planner's table.
+TC_PLAN = True
+TC_PLAN_GAIN = 0.95
+TC_PLAN_MIN_SAVING = 10.0
+# (gain, min_saving) of an architecture in place of (TC_PLAN_GAIN, TC_PLAN_MIN_SAVING) (:func:`tc_plan_thresholds`).
+# R200 measured the priced table against the planner's (backward): faster at 4.2-5.6 us priced savings (-0.9 % to
+# -3.2 %), slower at 0.9 us (+0.35 %).
+TC_PLAN_SELECT = {"sm_107a": (1.0, 2.0)}
+# The dhu_tc2 step time (microseconds) at low and full residency that prices these tables, measured (CUPTI kernel
+# durations of L = 64 tables, 3 to 288 CTAs: B200 2.32-2.44, GB300 2.15-2.26 per step); an architecture not listed takes
+# the dhu_tc2 record's t_lat / t_full.
+TC_PLAN_STEP = {"sm_100a": (2.35, 2.44), "sm_103a": (2.17, 2.25)}
+# The pre-scan of a split table scans each segment but one of its sequence until the decay sum passes
+# ``warmup_thresh_log2``: a value head that decays slowly scans its whole segment, and the launch lasts as long as its
+# slowest CTA.  On an architecture listed here the candidates' pre-scan is priced for that head (microseconds):
+# ``fixed`` + the longest pre-scanned segment x ``step`` x w, w = 1 while its CTAs (pre-scanned segments x HV x
+# HEAD_DIM / v_block) fit one per SM, else ``co_resident`` x their rounds of two per SM.  Measured (CUPTI kernel sums of
+# the pre-scan, dhu_tc2 and stitch of pinned tables of 11000 / 12000 / 9768 tokens over H = 1 to 8 value-head groups
+# of three, per-head decay rates 1e-4 to 1 per token): the warm-up price above (a few chunks per segment) priced the
+# B200 pre-scan of the 94-chunk table over 24 value heads at 20 us against 310 us measured, and took that table in
+# place of the serial one at +8 % backward; this price picks the measured fastest table of each layout on B200 and
+# GB300 when, as there, a split candidate is admissible only if its dhu_tc2 CTAs (segments x HV) fit one per SM (every
+# measured table of two rounds was slower than the best table of one).  Fast decay in every head ends the pre-scan
+# within a few chunks, so these prices then over-state the split tables.  An architecture not listed keeps the warm-up
+# price and every candidate (R200 prices its split tables with ``CHAIN_PLAN``).  The planner's table in the register
+# form is priced with the same pre-scan term.
+TC_PLAN_PRESCAN = {"sm_100a": (10.0, 2.95, 1.55), "sm_103a": (25.0, 2.5, 1.55)}
+
+
+def tc_plan_thresholds(arch: str) -> tuple[float, float]:
+    """``(gain, min_saving)`` that select the tc-priced adjoint table on ``arch``."""
+    return TC_PLAN_SELECT.get(arch, (TC_PLAN_GAIN, TC_PLAN_MIN_SAVING))
+
+
+def _tc_table_price(
+    chunks,
+    num_v_heads: int,
+    segment_len: int,
+    sm_count: int,
+    const: dict,
+    pre_residency: int,
+    prescan: tuple[float, float, float] | None = None,
+) -> dict:
+    """The priced ``dhu_tc2`` form of one adjoint table (``segment_len`` 0 or not below the longest sequence: serial);
+    ``prescan`` the architecture's ``TC_PLAN_PRESCAN`` constants (``None``: the warm-up price)."""
+    if segment_len <= 0 or max(chunks) <= segment_len:
+        splits = (1,) * len(chunks)
+    else:
+        splits = tuple(max(1, -(-int(n) // int(segment_len))) for n in chunks)
+    ctas = sum(splits) * int(num_v_heads)
+    steps = _scan_makespan(chunks, splits, int(num_v_heads), sm_count, 1)
+    low = DHU_TC_LOW_RESIDENT
+    n = min(ctas, sm_count)
+    t_n = const["t_lat"] + (const["t_full"] - const["t_lat"]) * min(
+        max((n - low) / (sm_count - low), 0.0), 1.0
+    )
+    extra = 0.0
+    if max(splits) > 1:
+        tails = sum(k - 1 for k in splits) * int(num_v_heads)
+        pre_ctas = tails * (HEAD_DIM // SDT_CONFIG[0])
+        stitch = STITCH_FIXED_CHUNKS + STITCH_COPY_CHUNKS * (max(splits) - 1)
+        if prescan is not None:
+            fixed, step, co_resident = prescan
+            pre_steps = max(
+                -(-int(c) // k) for c, k in zip(chunks, splits, strict=True) if k > 1
+            )
+            rounds = (
+                1.0
+                if pre_ctas <= sm_count
+                else co_resident * -(-pre_ctas // (2 * sm_count))
+            )
+            extra = fixed + pre_steps * step * rounds + stitch * const["t_unit"]
+        else:
+            units = (
+                PRESCAN_WARMUP_CHUNKS * PRESCAN_STEP_FACTOR * SCAN_STEP_FACTOR[SDT_CONFIG]
+                * _wave_factor(pre_ctas, sm_count, pre_residency) + stitch
+            )  # fmt: skip
+            extra = (
+                units * const["t_unit"]
+                + tails * PRESCAN_WARMUP_CHUNKS * const["c_dvl"] / sm_count
+            )
+    return {"segment_len": int(segment_len) if max(splits) > 1 else 0, "segments": sum(splits), "ctas": ctas,
+            "steps": steps, "T_tc2": steps * t_n, "T_extra": extra, "T": steps * t_n + extra}  # fmt: skip
+
+
+@lru_cache(maxsize=1024)
+def _tc_plan_memo(
+    chunks: tuple[int, ...],
+    num_v_heads: int,
+    device_index: int,
+    plan: ScanPlan,
+    props,
+    arch: str,
+    _gain: float,
+    _min_saving: float,
+    prescan: tuple[float, float, float] | None = None,
+) -> dict:
+    rec: dict[str, Any] = {
+        "arch": arch,
+        "select": False,
+        "planner": [list(plan.config), plan.segment_len],
+    }
+    found = _dhu_tc_constants(arch)
+    if found is None or tuple(plan.config) != SDT_CONFIG:
+        return rec
+    if not (_available("dhu_tc2", arch) and _available(SDT_PRESCAN, arch)):
+        return rec
+    const = dict(found)
+    if arch in TC_PLAN_STEP:
+        const["t_lat"], const["t_full"] = TC_PLAN_STEP[arch]
+    sm_count = props[0]
+    pre_res = _scan_residency("dhu", *SDT_CONFIG, device_index)
+    serial = plan.segment_len <= 0 or max(chunks) <= plan.segment_len
+    at = _tc_table_price(
+        chunks,
+        num_v_heads,
+        0 if serial else plan.segment_len,
+        sm_count,
+        const,
+        pre_res,
+        prescan,
+    )
+    if serial:
+        rule = dhu_tc_pricing(chunks, num_v_heads, device_index)
+        plan_t = (
+            at["T"] if rule.get("select") else min(at["T"], rule.get("T_reg", math.inf))
+        )
+    else:
+        rule = sdt_pricing(chunks, plan.segment_len, num_v_heads, device_index)
+        plan_t = (
+            at["T"]
+            if rule.get("select")
+            else at["T_extra"] + rule.get("T_reg2", math.inf)
+        )
+    cap = _prescan_capacity("dhu", SDT_CONFIG)
+    cands = [_tc_table_price(chunks, num_v_heads, 0, sm_count, const, pre_res, prescan)]
+    for seg_len in range(MIN_SEGMENT_CHUNKS, min(cap, max(chunks) - 1) + 1):
+        cand = _tc_table_price(
+            chunks, num_v_heads, seg_len, sm_count, const, pre_res, prescan
+        )
+        if prescan is not None and cand["segment_len"] and cand["ctas"] > sm_count:
+            continue  # TC_PLAN_PRESCAN: a split table runs its dhu_tc2 CTAs in one round
+        cands.append(cand)
+    best = min(cands, key=lambda c: (c["T"], -c["segment_len"]))
+    rec.update(plan_T=plan_t, best=best, saving=plan_t - best["T"])
+    rec["select"] = bool(
+        best["segment_len"] != (0 if serial else plan.segment_len)
+        and plan_t - best["T"] >= _min_saving
+        and best["T"] <= _gain * plan_t
+    )
+    rec["segment_len"] = best["segment_len"]
+    return rec
+
+
+def tc_plan_pricing(
+    chunks, num_v_heads: int, device_index: int, plan: ScanPlan
+) -> dict:
+    """The adjoint table priced for ``dhu_tc2`` against the planner's ``plan`` for a host layout of ``chunks`` (chunks
+    per sequence); ``select`` is the answer and ``segment_len`` the table (0: serial).  See above."""
+    arch = cake_backend.device_arch(int(device_index))
+    gain, min_saving = tc_plan_thresholds(arch)
+    return dict(
+        _tc_plan_memo(
+            tuple(int(c) for c in chunks),
+            int(num_v_heads),
+            int(device_index),
+            plan,
+            _device_props(int(device_index)),
+            arch,
+            gain,
+            min_saving,
+            TC_PLAN_PRESCAN.get(arch),
+        )  # fmt: skip
+    )
+
+
+# --------------------------------------------------------------------------- #
+# deeper split tables priced for the tcgen05 chains (fwd_ho, dhu_tc2), per architecture
+# --------------------------------------------------------------------------- #
+# The register planner prices the forward table for the register scans (``HEAD_DIM / v_block`` CTAs per (segment, value
+# head), two per SM), but ``fwd_ho`` runs it with one CTA per (segment, value head) and one per SM; the adjoint table
+# that ``TC_PLAN`` keeps can likewise stay shallower than the ``dhu_tc2`` chain needs on a device with many SMs.  With
+# ``TC_PLAN`` (False keeps the planner's tables in both directions), on an architecture of ``CHAIN_PLAN``, a host-built
+# table without plan pins whose scan does not run as two groups (:func:`_two_stream_kept`) may take a DEEPER
+# ``SDT_CONFIG`` split table (more segments than the chosen table) for each direction, priced with the architecture's
+# measured constants (microseconds): T = makespan(segments x HV CTAs, one per SM) x t(n), t(n) = t_lat + (t_full -
+# t_lat) x clamp((n - 48) / (SMs - 48), 0, 1) for n = min(CTAs, SMs) resident, plus, for a split table, ``fixed`` +
+# ``per_segment`` x (most segments of a sequence - 1) + ``per_wave`` x the pre-scan's waves (segments x HV x 2
+# HEAD_DIM / v_block CTAs over 2 x SMs).  The cheapest deeper table replaces the chosen one when it saves at least
+# ``min_saving`` and prices at most ``gain`` x the chosen table; the forward then runs the pre-scan, the stitch and
+# ``fwd_ho`` on it, the backward the fused pre-scan, the stitch and ``dhu_tc2``.  The constants are R200 measurements
+# (212 SMs, ``fwd_ho`` / ``dhu_tc2`` step times of serial tables of 48 to 208 CTAs, split costs fitted to pinned split
+# tables of 12 rows; the fit's error per table: forward median 1.8 %, up to 11.7 %, adjoint 0.9 %, up to 4.7 %, hence
+# ``gain`` 0.95); an architecture not listed keeps its tables.  Another table moves the segment boundaries, so the
+# bits follow the plan (plan pins keep the planner's tables).  On an architecture of ``FWD_HO_VH2_ARCHS`` the forward
+# prices a table whose launch runs the value-half split (:func:`fwd_ho_vh2_engaged`: twice its segments x HV CTAs fit
+# one round) with its chain term scaled by ``FWD_HO_VH2_STEP``, the split's chain time over ``fwd_ho``'s on the same
+# table (R200, the 96-CTA table of one 16384-token sequence over 16 value heads: 61.44 against 81.76 us, 0.7515); the
+# deeper tables the split does not fit keep the ``fwd_ho`` price.
+CHAIN_PLAN_CONSTANTS = ("t_lat", "t_full", "fixed", "per_segment", "per_wave")
+CHAIN_PLAN: dict[str, dict[str, Any]] = {
+    "sm_107a": {
+        "fwd": (1.77, 2.31, 0.0, 1.7, 6.5),
+        "bwd": (1.66, 1.88, 0.0, 0.6, 10.8),
+        "gain": 0.95,
+        "min_saving": 2.0,
+    },
+}
+FWD_HO_VH2_STEP = 0.75
+
+
+def _chain_table_price(
+    chunks,
+    num_v_heads: int,
+    segment_len: int,
+    sm_count: int,
+    const: tuple,
+    vh2: float = 1.0,
+) -> float:
+    """The priced tcgen05 chain of one table (``segment_len`` 0 or not below the longest sequence: serial); ``vh2``
+    scales the chain term of a table whose launch runs the value-half split (:func:`fwd_ho_vh2_engaged`)."""
+    t_lat, t_full, fixed, per_segment, per_wave = const
+    if segment_len <= 0 or max(chunks) <= segment_len:
+        splits = (1,) * len(chunks)
+    else:
+        splits = tuple(max(1, -(-int(n) // int(segment_len))) for n in chunks)
+    ctas = sum(splits) * int(num_v_heads)
+    steps = _scan_makespan(chunks, splits, int(num_v_heads), sm_count, 1)
+    n = min(ctas, sm_count)
+    low = DHU_TC_LOW_RESIDENT
+    t_n = t_lat + (t_full - t_lat) * min(max((n - low) / (sm_count - low), 0.0), 1.0)
+    extra = 0.0
+    if max(splits) > 1:
+        pre_ctas = ctas * (2 * HEAD_DIM // SDT_CONFIG[0])
+        extra = (
+            fixed
+            + per_segment * (max(splits) - 1)
+            + per_wave * -(-pre_ctas // (2 * sm_count))
+        )
+    chain = steps * t_n
+    if vh2 != 1.0 and fwd_ho_vh2_engaged(sum(splits), num_v_heads, sm_count):
+        chain *= vh2
+    return chain + extra
+
+
+@lru_cache(maxsize=1024)
+def _chain_plan_memo(
+    kind: str,
+    chunks: tuple[int, ...],
+    num_v_heads: int,
+    segment_len: int,
+    sm_count: int,
+    arch: str,
+    const: tuple,
+    gain: float,
+    min_saving: float,
+    vh2: float,
+) -> dict:
+    current = 0 if segment_len <= 0 or max(chunks) <= segment_len else int(segment_len)
+    segments = sum(max(1, -(-int(n) // current)) if current else 1 for n in chunks)
+    plan_t = _chain_table_price(chunks, num_v_heads, current, sm_count, const, vh2)
+    rec: dict[str, Any] = {
+        "arch": arch,
+        "kind": kind,
+        "select": False,
+        "segment_len": current,
+        "plan_T": plan_t,
+    }
+    best = None
+    for seg_len in range(MIN_SEGMENT_CHUNKS, min(_prescan_capacity("dhu" if kind == "bwd" else "fwd_h", SDT_CONFIG),
+                                                    max(chunks) - 1) + 1):  # fmt: skip
+        if sum(max(1, -(-int(n) // seg_len)) for n in chunks) <= segments:
+            continue  # deeper tables only
+        t = _chain_table_price(chunks, num_v_heads, seg_len, sm_count, const, vh2)
+        if best is None or t < best[1]:
+            best = (seg_len, t)
+    if best is None:
+        return rec
+    rec.update(best={"segment_len": best[0], "T": best[1]}, saving=plan_t - best[1])
+    if plan_t - best[1] >= min_saving and best[1] <= gain * plan_t:
+        rec.update(select=True, segment_len=best[0])
+    return rec
+
+
+def chain_plan_pricing(
+    kind: str, chunks, num_v_heads: int, device_index: int, plan: ScanPlan
+) -> dict:
+    """``kind`` ``"fwd"`` (the ``fwd_ho`` chain) or ``"bwd"`` (``dhu_tc2``): the deeper split table priced for that
+    chain against ``plan`` for a host layout of ``chunks`` (chunks per sequence) on the device's architecture;
+    ``select`` is the answer and ``segment_len`` the table; on an architecture of ``FWD_HO_VH2_ARCHS`` a forward table
+    whose launch runs the value-half split is priced as that split (``FWD_HO_VH2_STEP``).  An architecture without
+    ``CHAIN_PLAN`` constants never selects.  See above."""
+    arch = cake_backend.device_arch(int(device_index))
+    found = CHAIN_PLAN.get(arch)
+    if found is None:
+        return {
+            "arch": arch,
+            "kind": kind,
+            "select": False,
+            "segment_len": int(plan.segment_len),
+        }
+    return dict(
+        _chain_plan_memo(
+            kind,
+            tuple(int(c) for c in chunks),
+            int(num_v_heads),
+            int(plan.segment_len),
+            _device_props(int(device_index))[0],
+            arch,
+            tuple(float(x) for x in found[kind]),
+            float(found["gain"]),
+            float(found["min_saving"]),
+            FWD_HO_VH2_STEP if kind == "fwd" and arch in FWD_HO_VH2_ARCHS else 1.0,
+        )  # fmt: skip
+    )
+
+
+def _two_stream_kept(
+    chunks,
+    plan: ScanPlan,
+    num_heads: int | None,
+    num_v_heads: int,
+    device_index: int,
+    options: ChainOptions,
+) -> bool:
+    """Whether the adjoint table ``plan`` of a host layout of ``chunks`` (chunks per sequence) keeps its form because
+    its scan runs as two groups beside the fused tail (:func:`sequence_groups`), an overlap the pricing above does not
+    credit: a serial table that :func:`two_stream_split` groups, or a split ``SDT_CONFIG`` table of a value-head group
+    of three beside ``tail_g3`` (no ``finalize`` pin) whose pass 2 the ``sdt_pricing`` rule runs on ``dhu_tc2`` and
+    whose segments :func:`two_stream_split` groups.  Both stream counts keep the same table (``streams=1`` runs it on
+    one stream: the same bits)."""
+    index = int(device_index)
+    sm_count = _device_props(index)[0]
+    seg_len = int(plan.segment_len)
+    if seg_len <= 0 or max(chunks) <= seg_len:
+        return two_stream_split(len(chunks), int(num_v_heads), sm_count) is not None
+    arch = cake_backend.device_arch(index)
+    if num_heads is None or int(num_v_heads) != 3 * int(num_heads):
+        return False
+    if options.finalize is not None or not _available("tail_g3", arch):
+        return False
+    if tuple(plan.config) != SDT_CONFIG:
+        return False
+    if not (_available("dhu_tc2", arch) and _available(SDT_PRESCAN, arch)):
+        return False
+    segments = sum(max(1, -(-int(n) // seg_len)) for n in chunks)
+    if two_stream_split(segments, int(num_v_heads), sm_count) is None:
+        return False
+    return bool(sdt_pricing(tuple(chunks), seg_len, int(num_v_heads), index)["select"])
+
+
+def _priced_plans(
+    seq_lens: tuple[int, ...],
+    plans: tuple[ScanPlan, ScanPlan],
+    num_heads: int | None,
+    num_v_heads: int,
+    device_index: int,
+    options: ChainOptions,
+) -> tuple[tuple[ScanPlan, ScanPlan], bool]:
+    """``plans`` with the adjoint table priced for ``dhu_tc2`` (``TC_PLAN``) and the deeper split tables of
+    ``CHAIN_PLAN``, and whether the adjoint table runs on ``dhu_tc2`` for that pricing (``ChunkMeta.bwd_tc``); plan
+    pins (and a ``dhu_scan`` pin) keep the planner's tables."""
+    if not TC_PLAN or options.pins != (None, None) or options.dhu_scan is not None:
+        return plans, False
+    index = int(device_index)
+    chunks = tuple(-(-int(n) // CHUNK) for n in seq_lens)
+    bwd_tc = False
+    kept = _two_stream_kept(chunks, plans[1], num_heads, num_v_heads, index, options)
+    if not kept:
+        priced = tc_plan_pricing(chunks, int(num_v_heads), index, plans[1])
+        if priced["select"]:
+            plans, bwd_tc = (
+                (plans[0], ScanPlan(SDT_CONFIG, priced["segment_len"])),
+                True,
+            )
+    if cake_backend.device_arch(index) in CHAIN_PLAN:
+        # deeper split tables priced for fwd_ho / dhu_tc2; a serial table that the two-stream rule groups keeps its
+        # form in each direction (its partial group overlaps the neighbouring stage), as does a kept adjoint table
+        stream_split = two_stream_split(
+            len(chunks), int(num_v_heads), _device_props(index)[0]
+        )
+        for kind in ("fwd", "bwd"):
+            plan = plans[0] if kind == "fwd" else plans[1]
+            serial = plan.segment_len <= 0 or max(chunks) <= plan.segment_len
+            if (serial and stream_split is not None) or (kind == "bwd" and kept):
+                continue
+            deeper = chain_plan_pricing(kind, chunks, int(num_v_heads), index, plan)
+            if not deeper["select"]:
+                continue
+            table = ScanPlan(SDT_CONFIG, deeper["segment_len"])
+            if kind == "fwd":
+                plans = (table, plans[1])
+            else:
+                plans, bwd_tc = (plans[0], table), True
+    return plans, bwd_tc
+
+
+def host_plans(
+    seq_lens,
+    num_v_heads: int,
+    device_index: int,
+    options: ChainOptions | None = None,
+    *,
+    total_tokens: int | None = None,
+    num_heads: int | None = None,
+) -> tuple[tuple[ScanPlan, ScanPlan], bool]:
+    """The forward and adjoint tables of a host layout (``seq_lens``, tokens per sequence) on device ``device_index``
+    and whether the adjoint table runs on ``dhu_tc2`` for its pricing (``ChunkMeta.bwd_tc``): the planner's tables,
+    the serial-scan rule's adjoint plan (``num_heads``, the key heads; ``None``: no value-head group), then the tables
+    priced for the tcgen05 chains (``TC_PLAN``, ``CHAIN_PLAN``); plan pins (and a ``dhu_scan`` pin) keep the
+    planner's tables.  Host work only."""
+    options = options or make_options()
+    seq_lens = tuple(int(n) for n in seq_lens)
+    index = int(device_index)
+    if total_tokens is None:
+        total_tokens = sum(seq_lens)
+    plans = scan_plans(int(total_tokens), len(seq_lens), int(num_v_heads), index, seq_lens,
+                       scan_config=options.scan_config, segment_chunks=options.segment_chunks)  # fmt: skip
+    plans = _serial_adjoint_plan(
+        seq_lens, plans, num_heads, int(num_v_heads), index, options
+    )
+    return _priced_plans(seq_lens, plans, num_heads, int(num_v_heads), index, options)
+
+
+# --------------------------------------------------------------------------- #
 # prep selection: prep_tma (TMA-staged q / k, one CTA per (chunk, key head)) or the plain prep
 # --------------------------------------------------------------------------- #
 # The rule: CTAs = chunks x H and slots = ctas_per_sm x SMs; the plain prep (grid (chunks, HV)) runs where prep_tma's
@@ -2158,10 +2617,12 @@ def cake_gdn_det_train_backward(
     token_hv = (total_tokens, num_v_heads, HEAD_DIM)
     segs = meta.bwd_segments
     serial = not (segs.segment_len > 0 and segs.num_segments > meta.num_seqs)
-    use_tc = serial and _dhu_tc_selected(meta, num_v_heads, index, options)
+    use_tc = serial and (
+        meta.bwd_tc or _dhu_tc_selected(meta, num_v_heads, index, options)
+    )
     # a split plan's pass 2 on dhu_tc2: the fused pre-scan computes the dv_local tiles it reads, no dv_local stage
-    split_tc = not serial and _sdt_selected(
-        meta, segs, num_v_heads, index, options, arch
+    split_tc = not serial and (
+        meta.bwd_tc or _sdt_selected(meta, segs, num_v_heads, index, options, arch)
     )
     dbeta_bf16 = dbeta_dtype == torch.bfloat16
     # the fused tail: tail_g2 for a value-head group of two, tail_g3 for three (unless a finalize pin), else None
@@ -2502,7 +2963,8 @@ def _chunk_meta(
 ) -> ChunkMeta:
     """The chunk and segment tables of one call on device ``index``: a ``host_cache`` hit on the layout's key, else
     planned (the layout's sequence lengths are derived only then).  ``num_heads`` (the key heads) lets a host-built
-    table take the serial-scan rule's adjoint plan (:func:`_serial_adjoint_plan`; ``None``: the planner's plans)."""
+    table take the serial-scan rule's adjoint plan (:func:`_serial_adjoint_plan`; ``None``: the planner's plans);
+    then the tables priced for the tcgen05 chains (:func:`host_plans`)."""
     total_tokens = int(batch) * int(seq_len)
     if cu_seqlens is None:
         layout: tuple[Any, ...] = ("equal", int(batch), int(seq_len))
@@ -2530,6 +2992,9 @@ def _chunk_meta(
         options.lpt,
         options.streams,
         num_heads,
+        options.finalize,
+        TC_PLAN,
+        tuple(sorted(CHAIN_PLAN)),
     )
     if options.host_cache:
         meta = _META_FRONT.get(key)
@@ -2541,12 +3006,11 @@ def _chunk_meta(
         # a layout reaches the table cache only after this check, so a cache hit is a checked layout
         _check_offsets(layout, total_tokens)
         seq_lens = tuple(b - a for a, b in zip(layout[:-1], layout[1:], strict=True))
-    plans = scan_plans(total_tokens, len(seq_lens), int(num_v_heads), int(index), seq_lens,
-                       scan_config=options.scan_config, segment_chunks=options.segment_chunks)  # fmt: skip
-    plans = _serial_adjoint_plan(
-        seq_lens, plans, num_heads, int(num_v_heads), int(index), options
-    )
+    plans, bwd_tc = host_plans(seq_lens, int(num_v_heads), int(index), options, total_tokens=total_tokens,
+                               num_heads=num_heads)  # fmt: skip
     meta = _host_chunk_meta(seq_lens, plans, int(index), options.lpt)
+    if bwd_tc:
+        meta = replace(meta, bwd_tc=True)
     if options.streams == 2:
         fwd_groups, bwd_groups = sequence_groups(
             meta, int(num_v_heads), _device_props(int(index))[0]

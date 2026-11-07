@@ -980,6 +980,8 @@ def _serial_scan_tables(monkeypatch) -> list:
     monkeypatch.setattr(cake_chain, "_META_FRONT", {})
     monkeypatch.setattr(cake_chain, "_host_chunk_meta", lambda seq_lens, plans, _index, lpt: cake_chain.build_chunk_meta(
         seq_lens, "cpu", scan_plans=plans, lpt=lpt))  # fmt: skip
+    # the serial-scan rule's tables alone (no tables priced for the tcgen05 chains)
+    monkeypatch.setattr(cake_chain, "TC_PLAN", False)
     priced: list = []
     pricing = cake_chain.serial_scan_pricing
     monkeypatch.setattr(
@@ -1041,6 +1043,357 @@ def test_dhu_scan_pin_keys_the_chunk_tables(
     for options in calls:
         assert cake_chain._chunk_meta(cu, cu, 1, sum(seq_lens), 0, num_v_heads, options,
                                       num_heads=num_heads) is metas[options.dhu_scan]  # fmt: skip
+
+
+# --------------------------------------------------------------------------- tables priced for the tcgen05 chains
+
+_PAIR_LAYOUT = (11000, 12000, 9768)
+# (row, seq_lens, H, HV): the campaign rows, the #7074 packs, head pairs and context-parallel packs, and the
+# value-head groups of two
+PRICED_ROWS = (
+    ("r01", (4096,) * 4, 8, 16),
+    ("r02", _REAL_3, 8, 16),
+    ("r03", (4096,) * 8, 8, 16),
+    ("r04", _REAL_7, 8, 16),
+    ("r07", (16384,), 8, 16),
+    ("r08", (4096,) * 4, 16, 32),
+    ("r10", (16384,), 16, 32),
+    ("issue", (131071, 87531, 43385), 2, 6),
+    ("P3", (128147, 131027), 2, 6),
+    ("P1", (126565, 32714, 33696, 15081, 22979, 10782), 2, 6),
+    ("64x4096", (4096,) * 64, 2, 6),
+    ("A16", _PAIR_LAYOUT, 16, 48),
+    ("h8_hv24", _PAIR_LAYOUT, 8, 24),
+    ("h4_hv12", _PAIR_LAYOUT, 4, 12),
+    ("h2_hv6", _PAIR_LAYOUT, 2, 6),
+    ("h1_hv3", _PAIR_LAYOUT, 1, 3),
+    ("cp2_h8", (30001, 20000, 15535), 8, 24),
+    ("cp4_h4", (70001, 40000, 21071), 4, 12),
+    ("cp16_h1", (262143, 131071, 99999, 31075), 1, 3),
+    ("h4_hv8", _PAIR_LAYOUT, 4, 8),
+    ("h2_hv4", _PAIR_LAYOUT, 2, 4),
+)
+PRICED_DEVICES = (
+    ("sm_100a", 148),
+    ("sm_103a", 148),
+    ("sm_103a", 152),
+    ("sm_107a", 212),
+    ("sm_107a", 216),
+)
+
+
+def _priced_device(monkeypatch, arch: str, sm_count: int) -> None:
+    monkeypatch.setattr(
+        cake_chain, "_device_props", lambda _index: (sm_count, 232448, 10)
+    )
+    monkeypatch.setattr(cake_backend, "device_arch", lambda _index: arch)
+
+
+def _segments(chunks, plan) -> int:
+    if plan.segment_len <= 0 or max(chunks) <= plan.segment_len:
+        return len(chunks)
+    return sum(-(-n // plan.segment_len) for n in chunks)
+
+
+@pytest.mark.parametrize("arch, sm_count", PRICED_DEVICES)
+def test_tc_plan_rule(arch, sm_count, monkeypatch) -> None:
+    # the tc-priced adjoint table replaces the planner's (after the serial-scan rule) only where it saves at least the
+    # floor and a fraction of the planner's price, within the pre-scan capacity at SDT_CONFIG; a table whose scan runs
+    # as two groups beside the fused tail keeps its form
+    _priced_device(monkeypatch, arch, sm_count)
+    monkeypatch.setattr(cake_chain, "CHAIN_PLAN", {})
+    cap = cake_chain._prescan_capacity("dhu", cake_chain.SDT_CONFIG)
+    gain, min_saving = cake_chain.tc_plan_thresholds(arch)
+    options = cake_chain.make_options()
+    for row, seq_lens, num_heads, num_v_heads in PRICED_ROWS:
+        chunks = tuple(-(-n // 64) for n in seq_lens)
+        plans = cake_chain.scan_plans(
+            sum(seq_lens), len(seq_lens), num_v_heads, 0, seq_lens
+        )
+        plans = cake_chain._serial_adjoint_plan(
+            seq_lens, plans, num_heads, num_v_heads, 0, options
+        )
+        got, bwd_tc = cake_chain.host_plans(
+            seq_lens, num_v_heads, 0, options, num_heads=num_heads
+        )
+        assert got[0] == plans[0], row
+        kept = cake_chain._two_stream_kept(
+            chunks, plans[1], num_heads, num_v_heads, 0, options
+        )
+        rec = cake_chain.tc_plan_pricing(chunks, num_v_heads, 0, plans[1])
+        if kept or not rec["select"]:
+            assert (got, bwd_tc) == (plans, False), (row, rec)
+            continue
+        assert bwd_tc and got[1] == cake_chain.ScanPlan(
+            cake_chain.SDT_CONFIG, rec["segment_len"]
+        ), (row, rec)
+        assert tuple(plans[1].config) == cake_chain.SDT_CONFIG, (row, rec)
+        assert 0 <= rec["segment_len"] <= cap, (row, rec)
+        assert (
+            rec["saving"] >= min_saving and rec["best"]["T"] <= gain * rec["plan_T"]
+        ), (row, rec)
+
+
+@pytest.mark.parametrize(
+    "arch, sm_count", [("sm_100a", 148), ("sm_103a", 148), ("sm_103a", 152)]
+)
+def test_tc_plan_prices_the_whole_segment_prescan(arch, sm_count, monkeypatch) -> None:
+    # on an architecture of TC_PLAN_PRESCAN a split candidate's pre-scan is priced for a value head that scans its whole
+    # segment: the head pairs keep the planner's serial adjoint table over 24 value heads (the 6-segment table measured
+    # +8 % backward on B200) and take a 12-segment table over 12 (-24 %); the warm-up price took the 6-segment table
+    _priced_device(monkeypatch, arch, sm_count)
+    monkeypatch.setattr(cake_chain, "CHAIN_PLAN", {})
+    options = cake_chain.make_options()
+    chunks = tuple(-(-n // 64) for n in _PAIR_LAYOUT)
+    for num_heads, segments in ((8, len(chunks)), (4, 12)):
+        num_v_heads = 3 * num_heads
+        (_fwd, bwd), _bwd_tc = cake_chain.host_plans(
+            _PAIR_LAYOUT, num_v_heads, 0, options, num_heads=num_heads
+        )
+        assert _segments(chunks, bwd) == segments, (num_heads, bwd)
+    planner = cake_chain.scan_plans(
+        sum(_PAIR_LAYOUT), len(_PAIR_LAYOUT), 24, 0, _PAIR_LAYOUT
+    )
+    planner = cake_chain._serial_adjoint_plan(_PAIR_LAYOUT, planner, 8, 24, 0, options)
+    assert _segments(chunks, planner[1]) == len(chunks)
+    with monkeypatch.context() as m:
+        m.setattr(cake_chain, "TC_PLAN_PRESCAN", {})
+        warm = cake_chain.tc_plan_pricing(chunks, 24, 0, planner[1])
+        assert warm["select"] and warm["segment_len"] > 0, warm
+    # the pre-scan term covers the longest pre-scanned segment
+    fixed, step, _co = cake_chain.TC_PLAN_PRESCAN[arch]
+    const = dict(cake_chain._dhu_tc_constants(arch))
+    const["t_lat"], const["t_full"] = cake_chain.TC_PLAN_STEP[arch]
+    res = cake_chain._scan_residency("dhu", *cake_chain.SDT_CONFIG, 0)
+    for seg_len in (16, 32, 48, 94):
+        rec = cake_chain._tc_table_price(
+            chunks, 24, seg_len, sm_count, const, res, cake_chain.TC_PLAN_PRESCAN[arch]
+        )
+        longest = max(-(-c // -(-c // seg_len)) for c in chunks)
+        assert rec["T_extra"] >= fixed + longest * step, (seg_len, rec)
+    # a selected split table runs its dhu_tc2 CTAs in one round
+    for row, seq_lens, num_heads, num_v_heads in PRICED_ROWS:
+        plans = cake_chain.scan_plans(
+            sum(seq_lens), len(seq_lens), num_v_heads, 0, seq_lens
+        )
+        plans = cake_chain._serial_adjoint_plan(
+            seq_lens, plans, num_heads, num_v_heads, 0, options
+        )
+        rows = tuple(-(-n // 64) for n in seq_lens)
+        rec = cake_chain.tc_plan_pricing(rows, num_v_heads, 0, plans[1])
+        if rec["select"] and rec["segment_len"] > 0:
+            assert rec["best"]["ctas"] <= sm_count, (row, rec)
+
+
+def test_tc_plan_prescan_leaves_r200_unchanged(monkeypatch) -> None:
+    # an architecture outside TC_PLAN_PRESCAN keeps the warm-up price (R200 prices its split tables with CHAIN_PLAN)
+    assert "sm_107a" not in cake_chain.TC_PLAN_PRESCAN
+    for sm_count in (212, 216):
+        _priced_device(monkeypatch, "sm_107a", sm_count)
+        options = cake_chain.make_options()
+        for row, seq_lens, num_heads, num_v_heads in PRICED_ROWS:
+            got = cake_chain.host_plans(
+                seq_lens, num_v_heads, 0, options, num_heads=num_heads
+            )
+            with monkeypatch.context() as m:
+                m.setattr(cake_chain, "TC_PLAN_PRESCAN", {"sm_100a": (0.0, 99.0, 9.0)})
+                assert (
+                    cake_chain.host_plans(
+                        seq_lens, num_v_heads, 0, options, num_heads=num_heads
+                    )
+                    == got
+                ), row
+
+
+@pytest.mark.parametrize("arch, sm_count", PRICED_DEVICES)
+def test_two_stream_forms_keep_their_tables(arch, sm_count, monkeypatch) -> None:
+    # a serial adjoint table that the two-stream rule groups, and a split one of a value-head group of three whose
+    # pass 2 runs on dhu_tc2 as two groups of segments beside tail_g3, keep the planner's table: the same tables with
+    # one or two streams, and with a finalize pin (the unfused tail) a group of three's split table is priced
+    _priced_device(monkeypatch, arch, sm_count)
+    monkeypatch.setattr(cake_chain, "CHAIN_PLAN", {})
+    for row, seq_lens, num_heads, num_v_heads in PRICED_ROWS:
+        chunks = tuple(-(-n // 64) for n in seq_lens)
+        tables = {
+            streams: cake_chain.host_plans(
+                seq_lens,
+                num_v_heads,
+                0,
+                cake_chain.make_options(streams=streams),
+                num_heads=num_heads,
+            )
+            for streams in (1, 2)
+        }
+        assert tables[1] == tables[2], row
+        bwd = cake_chain.scan_plans(
+            sum(seq_lens), len(seq_lens), num_v_heads, 0, seq_lens
+        )[1]
+        serial = _segments(chunks, bwd) == len(chunks)
+        grouped = cake_chain.two_stream_split(
+            len(chunks) if serial else _segments(chunks, bwd), num_v_heads, sm_count
+        )
+        r_form = (
+            not serial
+            and num_v_heads == 3 * num_heads
+            and tuple(bwd.config) == cake_chain.SDT_CONFIG
+            and cake_chain.sdt_pricing(chunks, bwd.segment_len, num_v_heads, 0)[
+                "select"
+            ]
+        )
+        kept = cake_chain._two_stream_kept(
+            chunks, bwd, num_heads, num_v_heads, 0, cake_chain.make_options()
+        )
+        if grouped is not None and (serial or r_form):
+            assert kept, row
+        if kept and not (arch == "sm_107a" and num_v_heads == 2 * num_heads):
+            assert tables[2][0][1] == bwd and tables[2][1] is False, row
+        if r_form and grouped is not None:
+            pinned = cake_chain.make_options(finalize="finalize")
+            assert not cake_chain._two_stream_kept(
+                chunks, bwd, num_heads, num_v_heads, 0, pinned
+            ), row
+
+
+@pytest.mark.parametrize(
+    "pins",
+    [
+        {"segment_chunks": 0},
+        {"scan_config": (64, 1)},
+        {"dhu_scan": "tc"},
+        {"dhu_scan": "reg"},
+    ],
+    ids=["serial", "config", "tc", "reg"],
+)
+@pytest.mark.parametrize("arch, sm_count", PRICED_DEVICES)
+def test_plan_pins_keep_the_planner_tables(arch, sm_count, pins, monkeypatch) -> None:
+    _priced_device(monkeypatch, arch, sm_count)
+    options = cake_chain.make_options(**pins)
+    for row, seq_lens, num_heads, num_v_heads in PRICED_ROWS:
+        plans = cake_chain.scan_plans(sum(seq_lens), len(seq_lens), num_v_heads, 0, seq_lens,
+                                      scan_config=options.scan_config, segment_chunks=options.segment_chunks)  # fmt: skip
+        got = cake_chain.host_plans(
+            seq_lens, num_v_heads, 0, options, num_heads=num_heads
+        )
+        assert got == (plans, False), (row, pins)
+
+
+@pytest.mark.parametrize(
+    "arch, sm_count", [d for d in PRICED_DEVICES if d[0] != "sm_107a"]
+)
+def test_chain_plan_keeps_the_b200_gb300_tables(arch, sm_count, monkeypatch) -> None:
+    # CHAIN_PLAN lists sm_107a only: on B200 and GB300 every row keeps the tables it plans without CHAIN_PLAN, also
+    # with a saving floor of 0
+    _priced_device(monkeypatch, arch, sm_count)
+    assert arch not in cake_chain.CHAIN_PLAN
+    options = cake_chain.make_options()
+    for row, seq_lens, num_heads, num_v_heads in PRICED_ROWS:
+        chunks = tuple(-(-n // 64) for n in seq_lens)
+        with monkeypatch.context() as m:
+            m.setattr(cake_chain, "CHAIN_PLAN", {})
+            want = cake_chain.host_plans(
+                seq_lens, num_v_heads, 0, options, num_heads=num_heads
+            )
+        floor0 = {
+            name: {**const, "min_saving": 0.0}
+            for name, const in cake_chain.CHAIN_PLAN.items()
+        }
+        for table in (cake_chain.CHAIN_PLAN, floor0):
+            with monkeypatch.context() as m:
+                m.setattr(cake_chain, "CHAIN_PLAN", table)
+                assert (
+                    cake_chain.host_plans(
+                        seq_lens, num_v_heads, 0, options, num_heads=num_heads
+                    )
+                    == want
+                ), row
+                for kind, plan in zip(("fwd", "bwd"), want[0], strict=True):
+                    rec = cake_chain.chain_plan_pricing(
+                        kind, chunks, num_v_heads, 0, plan
+                    )
+                    assert rec["select"] is False, (row, kind, rec)
+
+
+@pytest.mark.parametrize("sm_count", [212, 216])
+def test_chain_plan_rule_on_r200(sm_count, monkeypatch) -> None:
+    # a deeper table replaces the chosen one exactly where its pricing selects it and the table's scan does not run as
+    # two groups: a deeper SDT_CONFIG split table within the pre-scan capacity, priced cheaper by the floor and gain
+    _priced_device(monkeypatch, "sm_107a", sm_count)
+    const = cake_chain.CHAIN_PLAN["sm_107a"]
+    cap = {
+        "fwd": cake_chain._prescan_capacity("fwd_h", cake_chain.SDT_CONFIG),
+        "bwd": cake_chain._prescan_capacity("dhu", cake_chain.SDT_CONFIG),
+    }
+    options = cake_chain.make_options()
+    for row, seq_lens, num_heads, num_v_heads in PRICED_ROWS:
+        chunks = tuple(-(-n // 64) for n in seq_lens)
+        got, bwd_tc = cake_chain.host_plans(
+            seq_lens, num_v_heads, 0, options, num_heads=num_heads
+        )
+        with monkeypatch.context() as m:
+            m.setattr(cake_chain, "CHAIN_PLAN", {})
+            want, want_tc = cake_chain.host_plans(
+                seq_lens, num_v_heads, 0, options, num_heads=num_heads
+            )
+        planner = cake_chain.scan_plans(
+            sum(seq_lens), len(seq_lens), num_v_heads, 0, seq_lens
+        )
+        planner = cake_chain._serial_adjoint_plan(
+            seq_lens, planner, num_heads, num_v_heads, 0, options
+        )
+        kept = cake_chain._two_stream_kept(
+            chunks, planner[1], num_heads, num_v_heads, 0, options
+        )
+        split = cake_chain.two_stream_split(len(chunks), num_v_heads, sm_count)
+        for kind, new, old in zip(("fwd", "bwd"), got, want, strict=True):
+            grouped = (_segments(chunks, old) == len(chunks) and split is not None) or (
+                kind == "bwd" and kept
+            )
+            rec = cake_chain.chain_plan_pricing(kind, chunks, num_v_heads, 0, old)
+            assert (new != old) is (rec["select"] and not grouped), (row, kind, rec)
+            if new != old:
+                assert tuple(new.config) == cake_chain.SDT_CONFIG, (row, kind, new)
+                assert 0 < new.segment_len <= cap[kind], (row, kind, new)
+                assert _segments(chunks, new) > _segments(chunks, old), (
+                    row,
+                    kind,
+                    new,
+                    old,
+                )
+                assert rec["saving"] >= const["min_saving"], (row, kind, rec)
+                assert rec["best"]["T"] <= const["gain"] * rec["plan_T"], (
+                    row,
+                    kind,
+                    rec,
+                )
+        assert bwd_tc is (want_tc or got[1] != want[1]), row
+
+
+def test_priced_tables_are_keyed_with_the_chunk_tables(monkeypatch) -> None:
+    # TC_PLAN and CHAIN_PLAN enter the table cache's key: a table planned with them is not served without them
+    _priced_device(monkeypatch, "sm_107a", 212)
+    monkeypatch.setattr(cake_chain, "_META_FRONT", {})
+    monkeypatch.setattr(cake_chain, "_host_chunk_meta", lambda seq_lens, plans, _index, lpt: cake_chain.build_chunk_meta(
+        seq_lens, "cpu", scan_plans=plans, lpt=lpt))  # fmt: skip
+    seq_lens, num_heads, num_v_heads = (16384,), 8, 16
+    cu = torch.tensor(_cu(seq_lens), dtype=torch.int64)
+    options = cake_chain.make_options()
+    priced = cake_chain._chunk_meta(
+        cu, cu, 1, sum(seq_lens), 0, num_v_heads, options, num_heads=num_heads
+    )
+    want, bwd_tc = cake_chain.host_plans(
+        seq_lens, num_v_heads, 0, options, num_heads=num_heads
+    )
+    assert priced.bwd_tc is bwd_tc
+    assert priced.bwd_segments.segment_len == want[1].segment_len
+    monkeypatch.setattr(cake_chain, "TC_PLAN", False)
+    planner = cake_chain._chunk_meta(
+        cu, cu, 1, sum(seq_lens), 0, num_v_heads, options, num_heads=num_heads
+    )
+    assert planner is not priced and planner.bwd_tc is False
+    plans = cake_chain.scan_plans(
+        sum(seq_lens), len(seq_lens), num_v_heads, 0, seq_lens
+    )
+    assert planner.bwd_segments.segment_len == plans[1].segment_len
 
 
 def test_two_stream_split_rule() -> None:
@@ -1835,6 +2188,48 @@ def test_split_pass2_on_dhu_tc2_matches_the_register_pass2(
     _assert_bitwise(runs["tc"], runs["reg"], names)
 
 
+@pytest.mark.parametrize("heads", [(8, 16), (8, 24)], ids=["g2", "g3"])
+def test_tc_priced_table_changes_only_the_adjoint_table(
+    heads, device, monkeypatch
+) -> None:
+    # one 16384-token sequence (gates kept above the floors with TC_PLAN_GAIN = 1, no saving floor; no CHAIN_PLAN
+    # tables): the tc-priced adjoint table leaves the forward's bits, runs on dhu_tc2 (no dv_local stage), repeats
+    # bitwise and stays within the accuracy gate of the planner's table; a plan pin keeps the planner's table
+    seq_lens = (16384,)
+    index = cake_chain._device_index(device)
+    monkeypatch.setattr(cake_chain, "TC_PLAN_MIN_SAVING", 0.0)
+    monkeypatch.setattr(cake_chain, "TC_PLAN_GAIN", 1.0)
+    monkeypatch.setattr(cake_chain, "TC_PLAN_SELECT", {})
+    monkeypatch.setattr(cake_chain, "CHAIN_PLAN", {})
+    monkeypatch.setattr(cake_chain, "_META_FRONT", {})
+    plans = cake_chain.scan_plans(16384, 1, heads[1], index, seq_lens)
+    rec = cake_chain.tc_plan_pricing((256,), heads[1], index, plans[1])
+    inputs = _inputs(seq_lens, heads, torch.float32, device, seed=307)
+    monkeypatch.setattr(cake_chain, "TC_PLAN", False)
+    base = _run(inputs, seq_lens)
+    monkeypatch.setattr(cake_chain, "TC_PLAN", True)
+    stages = _record_launches(monkeypatch)
+    runs = [_run(inputs, seq_lens) for _ in range(2)]
+    assert torch.equal(runs[0]["o"], base["o"])
+    _assert_bitwise(runs[1], runs[0], OUTPUT_NAMES)
+    _assert_close_to_reference(runs[0], base, OUTPUT_NAMES)
+    if rec["select"]:
+        want = ("dhu_pre_dvl_r64k1", "dhu_tc2") if rec["segment_len"] else ("dhu_tc2",)
+        assert all(x in stages for x in want) and "dv_local" not in stages, (
+            rec,
+            stages,
+        )
+    else:  # the pricing keeps the planner's table: the same bits
+        _assert_bitwise(runs[0], base, OUTPUT_NAMES)
+    pins = {
+        "scan_config": tuple(plans[1].config),
+        "segment_chunks": plans[1].segment_len,
+    }
+    on = _run(inputs, seq_lens, **pins)
+    monkeypatch.setattr(cake_chain, "TC_PLAN", False)
+    _assert_bitwise(on, _run(inputs, seq_lens, **pins), OUTPUT_NAMES)
+
+
 @pytest.mark.parametrize(
     "beta_dtype", [torch.bfloat16, torch.float32], ids=["bf16beta", "fp32beta"]
 )
@@ -2452,6 +2847,8 @@ def test_serial_scan_rule_on_the_device(case, device, monkeypatch) -> None:
     sm_count, rows = SERIAL_SCAN_DEVICE_ROWS[arch]
     seq_lens, heads = rows[case]
     _small_device(monkeypatch, device, sm_count)
+    # the serial-scan rule's tables alone: the tc-priced table (TC_PLAN) also makes these layouts serial
+    monkeypatch.setattr(cake_chain, "TC_PLAN", False)
     inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=581)
     calls = _record_calls(monkeypatch)
     got = _run(inputs, seq_lens)
