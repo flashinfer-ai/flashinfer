@@ -1519,9 +1519,10 @@ def fused_add_rmsnorm_fp8_block_quant(
         dtype the fp8 block-scaled GEMMs consume).
     block_scale : torch.Tensor
         Block scales in a column-major (MN-major, TMA-aligned) layout. The dtype selects the
-        format and the consumer it is for:
+        format and the consumer it is for. Below, ``amax = max(block_amax, 1e-4)``, where
+        ``block_amax`` is the largest magnitude of the rounded normed values in a 1x128 block.
 
-        - ``torch.float32``: ``block_amax / 448``, shape
+        - ``torch.float32``: ``amax / 448``, shape
           ``(hidden_size // 128, round_up(batch_size, 4))``. The logical
           ``(batch_size, hidden_size // 128)`` scale is ``block_scale.transpose(0, 1)[:batch_size]``.
           For consumers that accept arbitrary fp32 block scales, such as DeepGEMM's SM90 FP8 GEMM.
@@ -1529,7 +1530,7 @@ def fused_add_rmsnorm_fp8_block_quant(
           only their exponent, which gives wrong results for these scales.
         - ``torch.int32``: packed UE8M0 for :mod:`flashinfer.deep_gemm` on SM100/SM103/SM107, which
           reads it without a layout transform. Shape ``(ceil(hidden_size / 512),
-          round_up(batch_size, 4))``. Each scale is ``ceil_to_ue8m0(block_amax / 448)``, stored as
+          round_up(batch_size, 4))``. Each scale is ``ceil_to_ue8m0(amax / 448)``, stored as
           its exponent byte, four consecutive blocks per int32 (little-endian); the unused bytes of
           a row's last int32 are zero.
     normed_out : Optional[torch.Tensor]
