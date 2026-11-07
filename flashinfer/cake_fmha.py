@@ -1667,6 +1667,108 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         None,
         False,
     ),
+    # Their sm103a one-stage builds of packs 1, 2, 4 and 8
+    # (_CONTEXT_FP8_FORM_ONE_STAGE_ROUTES).
+    ("context_fp8", "RUNTIME_PACK1_NC_PX_Q1"): (
+        "cake_fmha_context_fp8_8e82b164f633739b5629",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK2_NC_PX_Q1"): (
+        "cake_fmha_context_fp8_e93a40c1207c92f87a57",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK4_NC_PX_Q1"): (
+        "cake_fmha_context_fp8_3a283b3a3d8e2458600a",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK8_NC_PX_Q1"): (
+        "cake_fmha_context_fp8_0d8e81c1e5cc25d494be",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK1_LSE_PX_Q1"): (
+        "cake_fmha_context_fp8_6cb0aa1bc299570e3bb6",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK2_LSE_PX_Q1"): (
+        "cake_fmha_context_fp8_a5fe9901f54f0f82983e",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK4_LSE_PX_Q1"): (
+        "cake_fmha_context_fp8_a20192c91fa6463266af",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK8_LSE_PX_Q1"): (
+        "cake_fmha_context_fp8_67e4a476e798c6ef5eab",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK1_SINK_PX_Q1"): (
+        "cake_fmha_context_fp8_42a34f611e416b95f3c4",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK2_SINK_PX_Q1"): (
+        "cake_fmha_context_fp8_70a1f8d6422b88b2a5d1",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK4_SINK_PX_Q1"): (
+        "cake_fmha_context_fp8_a8f20df7b8e78c71187b",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK8_SINK_PX_Q1"): (
+        "cake_fmha_context_fp8_340f1b13ef6db66a4819",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK1_NC_LSE_PX_Q1"): (
+        "cake_fmha_context_fp8_f39420f79b571a0d7e68",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK2_NC_LSE_PX_Q1"): (
+        "cake_fmha_context_fp8_94e7c483b24b790cc3ee",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK4_NC_LSE_PX_Q1"): (
+        "cake_fmha_context_fp8_aaafe5a028f797974fcd",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK8_NC_LSE_PX_Q1"): (
+        "cake_fmha_context_fp8_51fbdbb46101ec85a10c",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK1_NC_SINK_PX_Q1"): (
+        "cake_fmha_context_fp8_9d57fae5c177b84f333c",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK2_NC_SINK_PX_Q1"): (
+        "cake_fmha_context_fp8_56ed41488640572f208c",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK4_NC_SINK_PX_Q1"): (
+        "cake_fmha_context_fp8_9633967d1993341e9e9e",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK8_NC_SINK_PX_Q1"): (
+        "cake_fmha_context_fp8_cdfe342fcf2ea3cd54e1",
+        None,
+        False,
+    ),
     # The FP8 split-KV programs: the runtime-size arguments, then the split plan.
     ("context_fp8", "RUNTIME_SK_PACK8"): (
         "cake_fmha_context_fp8_2b603161717df80f5fad",
@@ -2139,6 +2241,22 @@ _CONTEXT_FP8_SHORT_KV_ROUTES["sm103a"] |= {
     program: (program.removesuffix("_PX"), 128)
     for program in _CONTEXT_FP8_RUNTIME_FORM_ROUTES["sm103a"].values()
 }
+# Per target, ``(form, pack_g, page_size)`` -> the one-stage program of an FP8
+# call of that form (one 128-row query stage per tile, an m-block of ``128 /
+# pack_g`` query tokens): the call takes it in place of its form program
+# where every tile holds at most one stage of query tokens (``max_q_len <=
+# 128 / pack_g``: the two-stage tile's second stage holds no row, so the
+# tile's rows, key blocks and arithmetic are the same) and it has more keys
+# than the form program's short-KV entry.
+_CONTEXT_FP8_FORM_ONE_STAGE_ROUTES: dict[
+    str, dict[tuple[str, int, int | None], str]
+] = {
+    "sm103a": {
+        (form, pack, None): f"RUNTIME_PACK{pack}_{form}_PX_Q1"
+        for form in _CONTEXT_FP8_FORMS.values()
+        for pack in (1, *_CONTEXT_FP8_RUNTIME_PACKS[::-1])
+    },
+}
 # Per target, the most tiles of a short-KV call (one 128-key block per tile,
 # served by a short-KV one-stage program) at which it takes the smallest pack
 # whose tiles number at most that many, in place of the one-stage choice: such
@@ -2279,6 +2397,11 @@ _CONTEXT_FP8_ONE_STAGE_PROGRAMS = frozenset(
     name
     for routes in _CONTEXT_FP8_MULTI_WAVE_ROUTES.values()
     for name, _, _ in routes.values()
+)
+_CONTEXT_FP8_ONE_STAGE_PROGRAMS |= frozenset(
+    name
+    for routes in _CONTEXT_FP8_FORM_ONE_STAGE_ROUTES.values()
+    for name in routes.values()
 )
 _CONTEXT_FP8_ONE_STAGE_PROGRAMS |= frozenset(
     name
@@ -8784,13 +8907,23 @@ def select_cake_fmha_context_route(
             # A call of at most the keys of the program's short-KV entry: the
             # entry's program (the same schedule, pack, m-blocks and arguments).
             short = _CONTEXT_FP8_SHORT_KV_ROUTES.get(target, {}).get(program)
+            stages = 2
             if short and max_kv_len <= short[1]:
                 program = short[0]
+            elif program is not None and max_q_len <= 128 // pack:
+                # A call whose tiles hold at most one stage of query tokens:
+                # the one-stage program of its form and pack, where the
+                # target names one.
+                one_stage = _CONTEXT_FP8_FORM_ONE_STAGE_ROUTES.get(target, {}).get(
+                    (form, pack, None)
+                )
+                if one_stage is not None:
+                    program, stages = one_stage, 1
             if program is not None:
                 pack_g = pack
                 tok_per_stage = 128 // pack
-                num_m_blocks = (max_q_len + 2 * tok_per_stage - 1) // (
-                    2 * tok_per_stage
+                num_m_blocks = (max_q_len + stages * tok_per_stage - 1) // (
+                    stages * tok_per_stage
                 )
                 total_bh = batch_size * (num_q_heads // pack)
                 l2_swizzle = 8 if total_bh % 8 == 0 else 1
