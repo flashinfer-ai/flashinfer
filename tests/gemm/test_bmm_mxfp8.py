@@ -27,6 +27,8 @@ _SMOKE_CASES = [
     (16, 256, 512, 128, True, "cudnn", True),
     (16, 128, 128, 512, True, "cutlass", False),
     (1, 256, 512, 1024, True, "cutlass", True),
+    (8, 256, 1024, 512, True, "cute-dsl", False),
+    (8, 512, 1024, 1024, True, "cute-dsl", True),
 ]
 
 
@@ -41,6 +43,8 @@ def test_bmm_mxfp8(b, m, n, k, is_sf_swizzled_layout, backend, auto_tuning):
         pytest.skip("bmm_mxfp8 cudnn backend requires SM10x.")
     if backend == "cutlass" and compute_capability[0] != 12:
         pytest.skip("bmm_mxfp8 cutlass backend requires SM12x.")
+    if backend == "cute-dsl" and tuple(compute_capability) != (10, 7):
+        pytest.skip("bmm_mxfp8 cute-dsl backend requires SM107.")
     torch.manual_seed(42)
 
     # Create inputs and quantize them to MXFP8 format
@@ -196,3 +200,100 @@ def test_bmm_mxfp8_cudnn_dynamic_m(m: int):
 
 if __name__ == "__main__":
     pytest.main([__file__])
+
+
+@pytest.mark.parametrize("layout", ["contiguous", "interleaved"])
+@pytest.mark.parametrize("auto_tuning", [False, True])
+def test_bmm_mxfp8_cute_dsl_mxfp8_output(layout, auto_tuning):
+    """float8_e4m3fn output + out_scale equals the bf16 result passed through mxfp8_quantize,
+    bit for bit; ``interleaved`` reads A from and writes out to [m, b, *] storage, with
+    out_scale covering the [m, b * n] row (a grouped projection feeding one GEMM)."""
+    if tuple(get_compute_capability(torch.device("cuda"))) != (10, 7):
+        pytest.skip("bmm_mxfp8 cute-dsl backend requires SM107.")
+    b, m, n, k = 8, 512, 1024, 1024
+    torch.manual_seed(0)
+    x = torch.randn([b, m, k], device="cuda", dtype=torch.bfloat16)
+    x = x * torch.exp(torch.randn([b, m, 1], device="cuda")).bfloat16()
+    weight = torch.randn([b, n, k], device="cuda", dtype=torch.bfloat16) * 0.05
+    a, a_scale = mxfp8_quantize(x, True)
+    w, w_scale = mxfp8_quantize(weight, True)
+    if layout == "interleaved":
+        a = a.transpose(0, 1).contiguous().transpose(0, 1)  # [m, b, k] storage
+    ref = torch.empty([b, m, n], device="cuda", dtype=torch.bfloat16)
+    bmm_mxfp8(
+        a,
+        w.transpose(-2, -1),
+        a_scale,
+        w_scale,
+        torch.bfloat16,
+        ref,
+        backend="cute-dsl",
+    )
+    if layout == "interleaved":
+        storage = torch.empty([m, b * n], device="cuda", dtype=torch.float8_e4m3fn)
+        out = storage.view(m, b, n).transpose(0, 1)
+        ref_q, ref_s = mxfp8_quantize(ref.transpose(0, 1).reshape(m, b * n), True)
+    else:
+        storage = out = torch.empty([b, m, n], device="cuda", dtype=torch.float8_e4m3fn)
+        ref_q, ref_s = mxfp8_quantize(ref.reshape(b * m, n), True)
+    # Independent oracle: the strided A must reach the GEMM as the same values.
+    expected = torch.bmm(x.float(), weight.float().transpose(-2, -1))
+    cos_sim = F.cosine_similarity(expected.reshape(-1), ref.float().reshape(-1), dim=0)
+    assert cos_sim > 0.99, f"cosine similarity {cos_sim:.4f}"
+    out_scale = torch.zeros_like(ref_s)
+    if auto_tuning:
+        gemm_base.AutoTuner.get().clear_cache()  # tune afresh, not from an earlier test's entry
+    with warnings.catch_warnings(record=True) as caught, autotune(auto_tuning):
+        warnings.simplefilter("always")
+        bmm_mxfp8(
+            a,
+            w.transpose(-2, -1),
+            a_scale,
+            w_scale,
+            torch.float8_e4m3fn,
+            out,
+            backend="cute-dsl",
+            out_scale=out_scale,
+        )
+    assert not [
+        w for w in caught if "falling back to default tactic=-1" in str(w.message)
+    ]
+    assert torch.equal(
+        storage.view(torch.uint8).reshape(-1), ref_q.view(torch.uint8).reshape(-1)
+    )
+    assert torch.equal(out_scale, ref_s.view(torch.uint8))
+
+
+def test_bmm_mxfp8_fp8_output_needs_out_scale():
+    a = torch.empty((1, 128, 128), dtype=torch.float8_e4m3fn)
+    b = torch.empty((1, 128, 128), dtype=torch.float8_e4m3fn)
+    with pytest.raises(ValueError, match="needs out_scale"):
+        gemm_base._check_bmm_mxfp8_problem_size(  # pyright: ignore[reportPrivateUsage]
+            a,
+            b,
+            torch.empty(512, dtype=torch.uint8),
+            torch.empty(512, dtype=torch.uint8),
+            torch.float8_e4m3fn,
+        )
+
+
+def test_bmm_mxfp8_sm107_out_scale_geometry():
+    geometry = gemm_base._bmm_mxfp8_sm107_out_scale_geometry  # pyright: ignore[reportPrivateUsage]
+    b, m, n = 8, 512, 1024
+    # contiguous [b, m, n]: batches stacked along rows
+    assert geometry((b, m, n), (m * n, n, 1)) == (
+        n,
+        (m // 128) * n * 4,
+        b * m * n // 32,
+    )
+    # [m, b, n] storage: batches side by side in one [m, b * n] row
+    assert geometry((b, m, n), (n, b * n, 1)) == (
+        b * n,
+        (n // 128) * 512,
+        m * b * n // 32,
+    )
+    # a batch offset that carries into the next row cannot use one constant offset
+    assert geometry((4, 128, 128), (49280, 384, 1)) is None
+    # unaligned batch start / row pitch
+    assert geometry((2, 128, 128), (128 * 128 + 64, 128, 1)) is None
+    assert geometry((1, 128, 96), (96 * 128, 96, 1)) is None
