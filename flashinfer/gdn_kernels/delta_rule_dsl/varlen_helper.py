@@ -13,6 +13,8 @@ CP_SM120_SHORT_FIXUP_TO_PREFILL_WORKLOAD_RATIO_NUMERATOR = 1
 CP_SM120_SHORT_FIXUP_TO_PREFILL_WORKLOAD_RATIO_DENOMINATOR = 2
 CP_SM120_SHORT_HEURISTIC_MAX_HEADS = 16
 CP_SM100_PARALLELISM_THRESHOLD_DENOMINATOR = 4
+CP_SM110_MAX_PARALLEL_WORK = 2
+CP_SM110_MIN_MAX_SEQ_LEN = 4096
 CP_HBM_PARALLELISM_THRESHOLD_NUMERATOR = 1
 CP_HBM_PARALLELISM_THRESHOLD_DENOMINATOR = 2
 CP_GDDR_PARALLELISM_THRESHOLD_NUMERATOR = 1
@@ -195,13 +197,22 @@ def should_use_cp_host(
     num_sms: int,
     device_name: str,
     device_capability: tuple[int, int] | None = None,
+    max_seq_len: int | None = None,
 ) -> bool:
     """Return whether a public wrapper should dispatch to the CP path.
 
     `num_parallel_work` is the non-CP kernel parallelism, typically batch times
     output/state heads. CP is selected only when that parallelism is strictly
-    below the card-specific threshold.
+    below the card-specific threshold. SM110 also needs `max_seq_len`, the
+    longest sequence (an unknown length means no CP); other architectures
+    ignore it.
     """
+    if device_capability is not None and device_capability[0] == 11:
+        return (
+            max_seq_len is not None
+            and num_parallel_work <= CP_SM110_MAX_PARALLEL_WORK
+            and max_seq_len >= CP_SM110_MIN_MAX_SEQ_LEN
+        )
     if device_capability is not None and device_capability[0] == 10:
         return num_parallel_work * CP_SM100_PARALLELISM_THRESHOLD_DENOMINATOR < num_sms
 
