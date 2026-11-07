@@ -114,6 +114,7 @@ _STAGE_VALUES = {
     | {"num_vecs"}
     | (_GEMM_VALUES if stage.startswith("gemm") else set())
     | ({"n_slabs"} if stage == "slab_sum" else set())
+    | ({"num_chunks"} if stage == cake_backend.ZERO_DLOGP_PARTITION_STAGE else set())
     | ({"row_vecs", "num_rows"} if stage == "scale_cast_scatter_bf16" else set())
     | (
         {"ld_x_words", "row_vecs", "num_rows"}
@@ -349,6 +350,8 @@ def test_registry_records_are_well_formed():
         "gemm_logits_nostats",
         "gemm_logits_nostats_mcnt",
         "gemm_logits_dz",
+        "zero_dlogp_partition",
+        "gemm_logits_dz_dcnt",
         "gemm_logits_lbl",
         "row_finalize",
         "loss_reduce",
@@ -368,8 +371,12 @@ def test_registry_records_are_well_formed():
         "slab_sum",
         "gemm_dw_acc",
         "gemm_dw_acc_gn",
+        "gemm_dw_acc_dcnt",
+        "gemm_dw_acc_gn_dcnt",
         "gemm_dw_cast_bf16",
+        "gemm_dw_cast_bf16_dcnt",
         "gemm_dw_cast_bf16_tma",
+        "gemm_dw_cast_bf16_tma_dcnt",
         "gemm_dw_cast_f32",
         "gemm_dw_cast_f32_gn",
         "scale_cast_bf16",
@@ -396,7 +403,11 @@ def test_registry_records_are_well_formed():
     assert set(tau_tensors) == set(TAU_STAGES)
     for stage in TAU_STAGES:
         base = cake_backend.base_stage(stage)
-        assert set(tau_tensors[stage]) == set(STAGE_TENSORS[base]) | {"temperature"}
+        counted = {"CNT"} if cake_backend.parse_stage(stage)[1]["dcnt"] else set()
+        assert (
+            set(tau_tensors[stage])
+            == set(STAGE_TENSORS[base]) | {"temperature"} | counted
+        )
     assert not any("temperature" in tensors for tensors in STAGE_TENSORS.values())
     assert (
         tuple(s for s in cake_jit.STAGES if cake_backend.base_stage(s) == s)
@@ -455,10 +466,10 @@ def test_registry_records_are_well_formed():
                 if kind == "grid":
                     assert arg in ("grid_x", "grid_y", "grid_z")
                 else:  # every kernel argument is a host value of its stage (directly or through an alias)
-                    assert CONTRACT_ALIASES.get(arg, arg) in _STAGE_VALUES[stage], (
-                        stage,
-                        arg,
-                    )
+                    assert (
+                        arg in _STAGE_VALUES[stage]
+                        or CONTRACT_ALIASES.get(arg, arg) in _STAGE_VALUES[stage]
+                    ), (stage, arg)
             assert int(physical.get("tma_workspace_bytes", 0)) >= 0
             assert int(physical.get("workspace_bytes", 0)) >= 0
             kernel, binding = (s.removeprefix("csrc/") for s in entry["sources"])
@@ -539,6 +550,7 @@ def test_registry_temperature_forms_are_well_formed():
     twin = {
         "gemm_logits_mcnt_tau": "gemm_logits_mcnt",
         "gemm_logits_dz_tau": "gemm_logits_dz",
+        "gemm_logits_dz_dcnt_tau": "gemm_logits_dz_dcnt",
         "gemm_logits_lbl_tau": "gemm_logits_lbl",
         "row_finalize_tau": "row_finalize",
     }
@@ -1168,7 +1180,7 @@ def test_geometry_cluster_ctas():
 
 def test_stage_variant_grammar():
     bases = cake_jit.BASE_STAGES
-    assert len(bases) == 16 and set(bases) <= set(cake_jit.STAGES)
+    assert len(bases) == 17 and set(bases) <= set(cake_jit.STAGES)
     assert cake_backend.STAGE_KNOBS == (
         "count",
         "sliced",
@@ -1178,6 +1190,7 @@ def test_stage_variant_grammar():
         "swab",
         "blocked",
         "epi_store",
+        "dcnt",
         "temperature",
     )
     for stage in cake_jit.STAGES:
@@ -1201,6 +1214,7 @@ def test_stage_variant_grammar():
             "swab": False,
             "blocked": False,
             "epi_store": None,
+            "dcnt": False,
             "temperature": False,
         },
     )
@@ -1230,6 +1244,7 @@ def test_stage_variant_grammar():
             "swab": False,
             "blocked": False,
             "epi_store": None,
+            "dcnt": False,
             "temperature": False,
         },
     )
@@ -1249,6 +1264,7 @@ def test_stage_variant_grammar():
         swab=False,
         blocked=False,
         epi_store=None,
+        dcnt=False,
         temperature=False,
     )
     # the 2-D blocked weight-gradient raster (the block width is a launch scalar)
@@ -1268,6 +1284,7 @@ def test_stage_variant_grammar():
             swab=False,
             blocked=True,
             epi_store=None,
+            dcnt=False,
             temperature=False,
         ),
     )
@@ -1292,6 +1309,7 @@ def test_stage_variant_grammar():
             swab=False,
             blocked=False,
             epi_store="tma",
+            dcnt=False,
             temperature=False,
         ),
     )
@@ -1315,6 +1333,7 @@ def test_stage_variant_grammar():
             swab=True,
             blocked=False,
             epi_store=None,
+            dcnt=False,
             temperature=False,
         ),
     )
@@ -1346,12 +1365,16 @@ def test_stage_variant_grammar():
             swab=False,
             blocked=False,
             epi_store=None,
+            dcnt=False,
             temperature=True,
         ),
     )
     for stage in TAU_STAGES:
         base = cake_backend.base_stage(stage)
-        assert stage == base + ("_mcnt_tau" if stage.endswith("_mcnt_tau") else "_tau")
+        suffix = next(
+            s for s in ("_mcnt_tau", "_dcnt_tau", "_tau") if stage.endswith(s)
+        )
+        assert stage == base + suffix
         assert cake_backend.parse_stage(stage)[1]["temperature"] is True
     assert cake_backend.base_stage("row_finalize_tau") == "row_finalize"
     for bad in (
@@ -3152,11 +3175,24 @@ def test_reachable_variants_complete_the_rule_closure():
         rv(bases, "sm_90a", 4)
         == {"gemm_dx", "gemm_dx_s", "gemm_dx_tn256", "gemm_dx_s_tn256"} | logits_forms
     )
-    # every name of STAGES is a base stage or a form some record can reach
+    # the counted forms of the zero-gradient row skip (``_dcnt``): a skip plan selects them, not the per-chunk rules
+    counted = {s for s in cake_jit.STAGES if cake_backend.parse_stage(s)[1]["dcnt"]}
+    assert counted == {
+        "gemm_logits_dz_dcnt",
+        "gemm_dw_acc_dcnt",
+        "gemm_dw_acc_gn_dcnt",
+        "gemm_dw_cast_bf16_dcnt",
+        "gemm_dw_cast_bf16_tma_dcnt",
+    }
+    assert not counted & (rv(bases, "sm_103a", 4) | rv(bases, "sm_100a", 4))
+    # every name of STAGES is a base stage, a form some record can reach or a counted form
     assert set(cake_jit.STAGES) == (
-        set(cake_jit.BASE_STAGES) | rv(bases, "sm_103a", 4) | rv(bases, "sm_100a", 4)
+        set(cake_jit.BASE_STAGES)
+        | rv(bases, "sm_103a", 4)
+        | rv(bases, "sm_100a", 4)
+        | counted
     )
-    assert len(cake_jit.STAGES) == 32
+    assert len(cake_jit.STAGES) == 38
     # no rule reaches a temperature form (the call's temperature selects it: flashinfer#7637)
     assert not set(TAU_STAGES) & (rv(bases, "sm_103a", 4) | rv(bases, "sm_100a", 4))
     assert (
@@ -8406,7 +8442,11 @@ def test_device_logprob_arms_are_bitwise(glm_weight):
     and on a recount), run to run, over one-, two- and many-chunk calls, compacted and uncompacted calls with ignored
     rows (``-100`` and other negative labels), every row valid, labels at and beyond the last vocabulary column
     (clamped), the hidden valid-row count on and off and an ``X`` with a padded leading stride (read in place and
-    copied); the arms keep the accuracy gates."""
+    copied); the arms keep the accuracy gates.  The arms run on one plan: the zero-gradient row skip off (the off arm
+    has no ``dz`` arm and never takes it, so a call with a valid row of zero ``dlogp`` -- an edited label on a
+    formerly ignored row -- would compare the skip's row order against the forward's, another plan whose ``dX`` /
+    ``dW`` bits may differ within the budget); the default arms with the skip then give the same bits run to run and
+    through the forward's row index, and the same ``lse`` / ``logp``."""
     _require_program(entry="logprob")
     name, _ = cake_backend.record_for(CUDA)
     if not {"gemm_logits_dz", "gemm_logits_lbl"} <= set(
@@ -8445,17 +8485,24 @@ def test_device_logprob_arms_are_bitwise(glm_weight):
             labels[: len(edge_labels)] = torch.tensor(edge_labels, device=CUDA)
             inp = replace(inp, labels=labels)
         case = (T, C, ignore, switches, ld_pad, edit)
-        with _cache(True) as cache:
-            cache.clear()
-            on, first = _logprob_steps(inp, C, **switches)
-            off, _ = _logprob_steps(
-                inp, C, logprob_dz=False, logprob_lbl=False, **switches
-            )
-            # the forward bindings run the label-column arm under its switch, the backward bindings the dz arm
-            arms = {
-                (key[0], b.plan.logprob_lbl if key[0] == "fwd" else b.plan.logprob_dz)
-                for key, b in cache._bindings.items()
-            }
+        previous = cake_backend.set_zero_dlogp_min_rows(None)
+        try:
+            with _cache(True) as cache:
+                cache.clear()
+                on, first = _logprob_steps(inp, C, **switches)
+                off, _ = _logprob_steps(
+                    inp, C, logprob_dz=False, logprob_lbl=False, **switches
+                )
+                # the forward bindings run the label-column arm under its switch, the backward bindings the dz arm
+                arms = {
+                    (
+                        key[0],
+                        b.plan.logprob_lbl if key[0] == "fwd" else b.plan.logprob_dz,
+                    )
+                    for key, b in cache._bindings.items()
+                }
+        finally:
+            cake_backend.set_zero_dlogp_min_rows(previous)
         assert arms == {
             ("fwd", True),
             ("fwd", False),
@@ -8474,7 +8521,26 @@ def test_device_logprob_arms_are_bitwise(glm_weight):
         assert torch.all(on["dX0"][~inp.valid] == 0)
         if gate:
             _check_against_references(first, inp, entry="logprob")
-        del on, off, first
+        # the default arms with the zero-gradient row skip at its floor: one plan per call, the same bits run to run
+        # and through the forward's row index (the recount backward takes no skip: its plan is the arm comparison's)
+        with _cache(True) as cache:
+            cache.clear()
+            skip, skip_first = _logprob_steps(inp, C, **switches)
+        for key in ("lse", "logp_eager", "logp0", "logp1"):
+            assert torch.equal(skip[key], on[key]), (case, "skip", key)
+        for key in ("dX", "dW"):
+            assert torch.equal(skip[f"{key}0"], skip[f"{key}1"]), (case, "skip", key)
+            assert torch.equal(skip[f"{key}_index"], skip[f"{key}0"]), (
+                case,
+                "skip",
+                key,
+            )
+        assert torch.equal(skip["dX_recount"], on["dX_recount"]), case
+        assert torch.equal(skip["dW_recount"], on["dW_recount"]), case
+        assert torch.all(skip["dX0"][~inp.valid] == 0)
+        if gate:
+            _check_against_references(skip_first, inp, entry="logprob")
+        del on, off, first, skip, skip_first
 
 
 def test_device_logprob_keep_is_bitwise(glm_weight):
@@ -9745,6 +9811,7 @@ def test_device_preload(glm_weight):
 TAU_STAGES = (
     "gemm_logits_mcnt_tau",
     "gemm_logits_dz_tau",
+    "gemm_logits_dz_dcnt_tau",
     "gemm_logits_lbl_tau",
     "row_finalize_tau",
 )
@@ -9756,6 +9823,7 @@ _UNTAU_STAGES = frozenset(
         "gemm_logits_nostats",
         "gemm_logits_nostats_mcnt",
         "gemm_logits_dz",
+        "gemm_logits_dz_dcnt",
         "gemm_logits_lbl",
         "row_finalize",
         "row_grad",
@@ -10556,11 +10624,11 @@ def test_registry_declares_only_known_stages():
 
 def test_registered_stages_with_temperature(monkeypatch):
     """A call without a temperature reads the stage tables without the temperature forms: ``STAGES``,
-    ``GEMM_STAGES`` (24 GEMM stages), ``ROW_STAGES`` and ``STAGE_TENSORS`` carry none, and
+    ``GEMM_STAGES`` (29 GEMM stages), ``ROW_STAGES`` and ``STAGE_TENSORS`` carry none, and
     :func:`cake_jit.registered_stages` lists a record's stages without them.
     :func:`cake_jit.registered_stages_with_temperature` lists every registered stage in the launch order of
     ``STAGES_WITH_TEMPERATURE``, with the same declared-versus-carried check."""
-    assert len(cake_jit.GEMM_STAGES) == 24
+    assert len(cake_jit.GEMM_STAGES) == 29
     assert (
         tuple(
             s
