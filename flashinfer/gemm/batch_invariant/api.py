@@ -30,6 +30,7 @@ back."""
 
 from __future__ import annotations
 
+import functools
 import logging
 from typing import Dict, Optional, Tuple
 
@@ -96,8 +97,12 @@ def _layout_of_b(b: torch.Tensor, K: int, N: int, cls: str = CLASS) -> str:
     )
 
 
+def _device_key(device: torch.device) -> int:
+    return device.index if device.index is not None else torch.cuda.current_device()
+
+
 def sm_count_of(device: torch.device) -> int:
-    return torch.cuda.get_device_properties(device).multi_processor_count
+    return _sm_count_cached(_device_key(device))
 
 
 # the devices' answers to the occupancy query, keyed (device index, cluster size). A failed query is retried on the
@@ -222,13 +227,26 @@ def persistent_clusters(device: torch.device, cfg: Knobs) -> int:
 def part_of(device: torch.device) -> Tuple[int, str]:
     """The part the dispatcher models for ``device``: its SM count and architecture family (`heuristic.family_of`); the
     first call for a device also records its L2 size and co-resident cluster capacity for the heuristic."""
+    index = _device_key(device)
+    sm, fam = _part_cached(index)
+    _register_device(index, sm, fam)
+    return sm, fam
+
+
+# Both are device properties, fixed for the process, and are read on every call: cached per device index.
+@functools.lru_cache(maxsize=None)
+def _sm_count_cached(index: int) -> int:
+    return torch.cuda.get_device_properties(index).multi_processor_count
+
+
+@functools.lru_cache(maxsize=None)
+def _part_cached(index: int) -> Tuple[int, str]:
     from ...batch_invariant.support import compute_capability
     from .heuristic import family_of
 
-    sm, fam = sm_count_of(device), family_of(compute_capability(device))
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    _register_device(index, sm, fam)
-    return sm, fam
+    return _sm_count_cached(index), family_of(
+        compute_capability(torch.device("cuda", index))
+    )
 
 
 def prepare_operands(
