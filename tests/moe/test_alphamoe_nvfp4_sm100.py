@@ -635,6 +635,171 @@ def test_alphamoe_nvfp4_fused_batch_scale_loads_and_output_seed(scale_offsets):
     )
 
 
+# The fused-batch plan with one route per token and one 256-row W1 block: every
+# output element receives exactly one route contribution, so the FP32
+# accumulator is the same bits on every run.
+_SINGLE_ROUTE_CASE = (128, 256, 7168, 256, 1, 16, 0.8, 1.0, 28150)
+
+
+def _aligned_accumulator_of(case: dict) -> torch.Tensor:
+    """The aligned op's FP32 accumulator of ``case`` from zero, with no drain."""
+    from flashinfer.fused_moe.alphamoe_nvfp4_sm100 import (
+        get_alphamoe_nvfp4_sm100_module,
+    )
+
+    accumulator = torch.zeros(
+        (case["M"], case["K"]), dtype=torch.float32, device="cuda"
+    )
+    get_alphamoe_nvfp4_sm100_module().nvfp4_current_aligned_moe_op(
+        case["x"],
+        case["x_scale"],
+        case["w1"],
+        case["w1_scale"],
+        case["w2"],
+        case["w2_scale"],
+        case["output1_scale_gate_scalar"],
+        case["output1_scale_scalar"],
+        case["output2_scale_scalar"],
+        case["sorted_token_ids"],
+        case["expert_ids"],
+        case["num_tokens_post_padded"],
+        case["topk_weights"],
+        case["out"],
+        accumulator,
+        case["top_k"],
+        case["block_m"],
+        case["scaling_factor"],
+        None,
+        None,
+    )
+    return accumulator
+
+
+def _initial_output(case: dict, seed: int, scale: float = 4.0) -> torch.Tensor:
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    return (
+        torch.randn(
+            (case["M"], case["K"]),
+            dtype=torch.float32,
+            device="cuda",
+            generator=generator,
+        )
+        * scale
+    ).to(torch.bfloat16)
+
+
+def test_alphamoe_nvfp4_aligned_adds_the_output_last_in_fp32():
+    """The aligned entry adds the caller's output once, after every route:
+    out = bf16(accumulator + float32(out)), round to nearest even, bit exact."""
+    _skip_if_not_supported()
+    case = _make_case(*_SINGLE_ROUTE_CASE)
+    accumulator = _aligned_accumulator_of(case)
+    again = _aligned_accumulator_of(case)
+    torch.cuda.synchronize()
+    assert torch.equal(accumulator.view(torch.int32), again.view(torch.int32)), (
+        "the single-route accumulator is not the same bits on every run"
+    )
+    assert torch.count_nonzero(accumulator) > 0
+    for seed, scale in ((28151, 4.0), (28152, 1e-3)):
+        initial = _initial_output(case, seed, scale)
+        actual = _launch(case, out=initial.clone())
+        torch.cuda.synchronize()
+        expected = (accumulator + initial.float()).to(torch.bfloat16)
+        assert torch.equal(actual.view(torch.int16), expected.view(torch.int16)), (
+            f"output scale {scale}: not bf16(accumulator + float32(out))"
+        )
+        _assert_nvfp4_close(
+            actual, _reference(case, out_init=initial), f"output scale {scale}"
+        )
+
+
+def test_alphamoe_nvfp4_aligned_accumulator_is_zero_between_calls():
+    """Consecutive calls on a stream reuse one FP32 accumulator, which each call
+    leaves at +0: the second call matches the first one's contract, and a call
+    over an empty plan returns its output unchanged. Another stream uses its
+    own accumulator."""
+    _skip_if_not_supported()
+    from flashinfer.fused_moe import alphamoe_nvfp4_sm100 as entry
+
+    case = _make_case(*_FUSED_BATCH_CASE)
+    m, k = case["M"], case["K"]
+    initial = _initial_output(case, 28153)
+    expected = _reference(case, out_init=initial)
+    first = _launch(case, out=initial.clone())
+    second = _launch(case, out=initial.clone())
+    torch.cuda.synchronize()
+    _assert_nvfp4_close(first, expected, "first call")
+    _assert_nvfp4_close(second, expected, "second call")
+
+    key = (torch.cuda.current_device(), torch.cuda.current_stream().cuda_stream)
+    cached = entry._ALIGNED_ACCUMULATORS[key]
+    assert cached.dtype == torch.float32 and cached.numel() >= m * k
+    assert torch.count_nonzero(cached) == 0, "the accumulator is not +0 after a call"
+
+    zero_extent = torch.zeros((1,), dtype=torch.int32, device="cuda")
+    unchanged = _launch(case, out=initial.clone(), num_tokens_post_padded=zero_extent)
+    torch.cuda.synchronize()
+    assert torch.equal(unchanged.view(torch.int16), initial.view(torch.int16)), (
+        "an empty plan changed the output"
+    )
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        on_side = _launch(case, out=initial.clone())
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    _assert_nvfp4_close(on_side, expected, "call on another stream")
+    side_key = (torch.cuda.current_device(), side.cuda_stream)
+    assert entry._ALIGNED_ACCUMULATORS[side_key] is not cached
+    assert torch.count_nonzero(entry._ALIGNED_ACCUMULATORS[side_key]) == 0
+    assert entry._ALIGNED_ACCUMULATORS[key] is cached
+
+
+def test_alphamoe_nvfp4_aligned_cuda_graph_replays_add_into_their_output():
+    """A captured call takes its own zero-filled accumulator from the graph's
+    pool: each replay adds the routes into the output it finds, and eager calls
+    before and after the replays keep their own accumulator at +0."""
+    _skip_if_not_supported()
+    from flashinfer.fused_moe import alphamoe_nvfp4_sm100 as entry
+
+    case = _make_case(*_FUSED_BATCH_CASE)
+    static_out = torch.zeros(
+        (case["M"], case["K"]), dtype=torch.bfloat16, device="cuda"
+    )
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(capture_stream):
+        _launch(case, out=static_out)  # build the module and warm up eagerly
+    torch.cuda.current_stream().wait_stream(capture_stream)
+    torch.cuda.synchronize()
+    cached = dict(entry._ALIGNED_ACCUMULATORS)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _launch(case, out=static_out)
+    assert entry._ALIGNED_ACCUMULATORS.keys() == cached.keys()
+    assert all(entry._ALIGNED_ACCUMULATORS[key] is cached[key] for key in cached)
+
+    for seed in (28154, 28155):
+        initial = _initial_output(case, seed)
+        static_out.copy_(initial)
+        graph.replay()
+        torch.cuda.synchronize()
+        _assert_nvfp4_close(
+            static_out, _reference(case, out_init=initial), f"replay {seed}"
+        )
+    eager = _launch(case, out=initial.clone())
+    torch.cuda.synchronize()
+    _assert_nvfp4_close(
+        eager, _reference(case, out_init=initial), "eager after replays"
+    )
+    assert all(
+        torch.count_nonzero(buffer) == 0
+        for buffer in entry._ALIGNED_ACCUMULATORS.values()
+    )
+
+
 # ---------------------------------------------------------------------------
 # Deferred finalize (complete routes): identical arithmetic, BF16 caller seed.
 # ---------------------------------------------------------------------------
