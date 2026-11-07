@@ -1694,7 +1694,9 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 ab_tx_bytes = cutlass.Int32(self.num_tma_load_bytes)
                 if cutlass.const_expr(self.skip_padding_rows):
                     # Partial tile: number of 8-row A blocks holding routed rows
-                    # (a_rows >= 0 for a valid tile).
+                    # (a_rows >= 0 for a valid tile). The Uint32 cast keeps the
+                    # count in [0, 16] for bad metadata (a_rows < 0 wraps to a
+                    # full or empty A load), so expected_tx matches the copies.
                     a_rows = (
                         tile_info[4]
                         - mma_tile_coord_mnl[0] * self.cta_tile_shape_mnk[0]
