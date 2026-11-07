@@ -14322,33 +14322,13 @@ kernel_alpha_moe_nvfp4_up_down(const __grid_constant__ CakeTensorMap64 x, const 
                             route_weight = route_weights[token_slot_out];
                         }
                         float down = _tmem_load_2[token_slot_out] * down_scale_scalar_c;
-#if __CUDA_ARCH__ == 1030
-                        smem_out[out_buf * 2048 + token_slot_out * 128 + physical_feature] = down * route_weight * scaling_factor;
-#else
                         smem_out[(out_buf >> 1) * 4096 + token_slot_out * 256 + (out_buf & 1) * 128 + physical_feature] = down * route_weight * scaling_factor;
-#endif
                     }
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     asm volatile("barrier.sync 15, 128;" ::: "memory");
                     if (elect_sync()) {
                         mbarrier_arrive(down_free_addr + (down_stage_c) * 8);
                     }
-#if __CUDA_ARCH__ == 1030
-                    if (warp == 2) {
-                        if (elect_sync()) {
-                            #pragma unroll
-                            for (int token_slot_reduce = 0; token_slot_reduce < 16; token_slot_reduce++) {
-                                int pair_reduce = route_pairs[token_slot_reduce];
-                                if (pair_reduce < M * top_k) {
-                                    int token_reduce = output_tokens[token_slot_reduce];
-                                    int src = smem_out_addr + (unsigned int)(out_buf * 8192) + (unsigned int)(token_slot_reduce * 128 * 4);
-                                    {
-                                        void* _cpred_dst_15 = reinterpret_cast<void*>(out + (token_reduce * K + ob_c * 128));
-                                        asm volatile("cp.reduce.async.bulk.global.shared::cta.bulk_group.add.f32"
-                                            " [%0], [%1], %2;"
-                                            :: "l"(_cpred_dst_15), "r"(src), "r"((uint32_t)(512))
-                                            : "memory");
-#else
                     if (ob_c % 2 == 1) {
                         if (warp == 2) {
                             if (elect_sync()) {
@@ -14365,31 +14345,15 @@ kernel_alpha_moe_nvfp4_up_down(const __grid_constant__ CakeTensorMap64 x, const 
                                                 :: "l"(_cpred_dst_15), "r"(src), "r"((uint32_t)(1024))
                                                 : "memory");
                                         }
-#endif
                                     }
                                 }
-#if __CUDA_ARCH__ == 1030
-#else
                                 asm volatile("cp.async.bulk.commit_group;");
                                 asm volatile("cp.async.bulk.wait_group.read 1;");
-#endif
                             }
-#if __CUDA_ARCH__ == 1030
-                            asm volatile("cp.async.bulk.commit_group;");
-                            asm volatile("cp.async.bulk.wait_group.read 1;");
-#endif
                         }
-#if __CUDA_ARCH__ == 1030
-#else
                         asm volatile("barrier.sync 15, 128;" ::: "memory");
-#endif
                     }
-#if __CUDA_ARCH__ == 1030
-                    asm volatile("barrier.sync 15, 128;" ::: "memory");
-                    out_buf = out_buf + 1 & 1;
-#else
                     out_buf = out_buf + 1 & 3;
-#endif
                     down_stage_c += 1;
                     if (down_stage_c == 4) { down_stage_c = 0; _phase_down_ready ^= 1; }
                 }
