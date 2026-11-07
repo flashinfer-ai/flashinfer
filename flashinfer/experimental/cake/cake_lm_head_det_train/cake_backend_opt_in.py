@@ -124,6 +124,9 @@ from .cake_backend import (
     _zero_weight_exact_loss,
     _valid_rows_of_count,
     _zero_weight_logp,
+    _is_zero_accumulator,
+    _zero_accumulator,
+    _zero_gradient,
     gradient_index,
     gradient_rows,
     zero_weight_loss_mode,
@@ -226,6 +229,21 @@ def _allocated_bytes(nbytes: int, count: int = 1) -> int:
         return 0
     large = ALLOCATOR_LARGE_BYTES if nbytes >= ALLOCATOR_LARGE_BYTES else 0
     return count * (nbytes + ALLOCATOR_ROUND_BYTES + large)
+
+
+def _exact_loss_bytes(
+    rows: int, buffer_rows: int, *, zero_rows: int, zero_total: int
+) -> int:
+    """The bytes :func:`memory_plan` counts for the exact loss of a split call
+    (:func:`.cake_backend._zero_weight_exact_loss`), next to the chunk loop's held state: the term array of the valid
+    rows (``4 (rows + zero_total)``), the zero-weight rows' gathered weights (``4 zero_total``) and index
+    (``8 zero_total``) and, when their logp-only pass ran ahead of the loop, their compact ``logp`` (``4 zero_rows``);
+    then either the gradient rows' positions (``8 rows``) with the two kept term buffers (``4 rows + 4 buffer_rows``),
+    or after those are freed the zero-weight rows' positions (``8 zero_total``) -- the larger of the two."""
+    live = _allocated_bytes
+    R, Cb, Z, Zt = int(rows), int(buffer_rows), int(zero_rows), int(zero_total)
+    held = live(4 * (R + Zt)) + live(4 * Zt) + live(8 * Zt) + live(4 * Z)
+    return held + max(live(4 * R) + live(4 * Cb) + live(8 * R), live(8 * Zt))
 
 
 def memory_mode_default() -> str:
@@ -984,8 +1002,7 @@ def memory_plan(
     whether their pass runs or not (a call without ``logp`` skips it); ``budget_rows`` is at most
     ``rows + zero_total`` and ``rows + zero_total`` at most ``num_rows``.  ``exact_loss`` (a split call with the exact
     loss, :func:`.cake_backend._zero_weight_exact_loss`): after the chunk loop, with its accumulators and the deferred
-    chunk held, the two term buffers (``4 rows + 4 buffer_rows`` bytes), the term array of the valid rows
-    (``4 (rows + zero_total)``) and the gradient rows' positions (``8 rows``) are one more phase."""
+    chunk held, the exact loss's buffers are one more phase (:func:`_exact_loss_bytes`)."""
     if entry not in ENTRIES:
         raise ValueError(f"entry must be one of {ENTRIES}")
     T, R, H, V, C = (int(num_rows), int(rows), int(hidden), int(vocab), int(chunk))
@@ -1040,9 +1057,9 @@ def memory_plan(
             + live(4 * Z, 2)
             + rowvec
         )
-    # the exact loss of a split call: the kept term buffers, the term array and the gradient rows' positions
+    # the exact loss of a split call (:func:`_exact_loss_bytes`)
     exact = (
-        live(4 * R) + live(4 * Cb) + live(4 * (R + Zt)) + live(8 * R)
+        _exact_loss_bytes(R, Cb, zero_rows=Z, zero_total=Zt)
         if entry == "loss" and exact_loss and Zt
         else 0
     )
@@ -3963,11 +3980,15 @@ def _empty_forward(
     row_valid: Optional[torch.Tensor] = None,
     fuse_dw_cast: Optional[bool] = None,
     dx_finalize: Optional[bool] = None,
+    backend: str = "cake",
 ) -> ForwardResult:
     """Zeros without binding or launching: ``T == 0``, or every row ignored (``row_index`` empty).
 
     ``fuse_dw_cast`` / ``dx_finalize`` are the call's switches (``None`` = the documented default), so the memory
-    report records the form the caller asked for, as a launched call's would."""
+    report records the form the caller asked for, as a launched call's would.  ``backend``: the call's, kept on the
+    result for :meth:`ForwardResult.backward`.  The loss entry's ``dw_acc`` is a zero accumulator without ``[V, H]``
+    storage (:func:`_zero_accumulator`): the backward forms the zero weight gradient in the output dtype, and the
+    memory report counts the accumulator's one FP32 element."""
     device = X.device
     T = int(problem.num_rows)
     memory = memory_report(
@@ -3984,6 +4005,9 @@ def _empty_forward(
         fuse_dw_cast=fuse_dw_cast,
         dx_finalize=dx_finalize,
     )
+    if problem.entry == "loss" and "dW_acc" in memory["accumulators"]:
+        memory["accumulators"]["dW_acc"] = 4  # the zero accumulator's one element
+        memory["accumulator_bytes"] = sum(memory["accumulators"].values())
     zeros = torch.zeros((T,), dtype=torch.float32, device=device)
     if problem.entry == "loss":
         return ForwardResult(
@@ -3992,12 +4016,11 @@ def _empty_forward(
             dx_acc=torch.zeros((0, problem.hidden), dtype=torch.float32, device=device)
             if need_dx
             else None,
-            dw_acc=torch.zeros(
-                (problem.vocab, problem.hidden), dtype=torch.float32, device=device
-            )
+            dw_acc=_zero_accumulator((problem.vocab, problem.hidden), device)
             if need_dw
             else None,
             memory=memory,
+            backend=backend,
             row_index=row_index,
             row_valid=row_valid,
             num_rows=T,
@@ -4198,6 +4221,7 @@ def forward_loss(
             need_dw=need_dw,
             fuse_dw_cast=fuse_dw_cast,
             dx_finalize=dx_finalize,
+            backend=backend,
         )
     fused_dx = bool(
         need_dx and _resolve_dx_finalize(dx_finalize)
@@ -4332,54 +4356,9 @@ def forward_loss(
     zero_pass = bool(zero_rows and return_logp)
     zero_first = zero_pass and zero_order
     chunk0_alive = zero_first and hc is not None
-    # ahead of a loop that keeps the FP32 weight-gradient accumulator: the pass's chunk buffers in it, allocated first
-    # (:func:`.cake_backend.forward_loss`)
-    arena = (
-        torch.empty(
-            (problem.vocab, problem.hidden), dtype=torch.float32, device=X.device
-        )
-        if zero_arena and zero_first and backend == "cake"
-        else None
-    )
-    zero_logp = (
-        _zero_weight_logp(
-            problem,
-            X,
-            W,
-            labels,
-            zero_index,
-            backend=backend,
-            gemm_tuning=tuning,
-            arena=arena,
-        )
-        if zero_first
-        else None
-    )
-    if (
+    no_loop = (
         row_index is not None and row_index.numel() == 0
-    ):  # every row ignored (or of zero weight)
-        hc = None
-        result = _empty_forward(
-            problem,
-            X,
-            need_dx=need_dx,
-            need_dw=need_dw,
-            row_index=row_index,
-            row_valid=row_valid,
-            fuse_dw_cast=fuse_dw_cast,
-            dx_finalize=fused_dx,
-        )
-        if exact:
-            result.loss = _zero_weight_exact_loss(
-                problem, None, row_index, zero_index, loss_weights, backend=backend
-            ).reshape(())
-        if zero_pass and not zero_first:
-            zero_logp = _zero_weight_logp(
-                problem, X, W, labels, zero_index, backend=backend, gemm_tuning=tuning
-            )
-        return _with_zero_weight_rows(
-            result, zero_index, zero_logp, chunk0_alive=chunk0_alive, exact=exact
-        )
+    )  # every row ignored (or of zero weight)
     valid_count = None if row_index is None else int(row_index.numel())
     common = dict(
         objective=objective,
@@ -4392,7 +4371,7 @@ def forward_loss(
         grad_weight_dtype=grad_weight_dtype,
     )
     options: Optional[dict[str, Any]] = None
-    if budget:
+    if budget and not no_loop:
         # ``memory_mode="budget"``: the form :func:`memory_plan` picks for this call; a recompute form accumulates the
         # weight-gradient rows ``[0, dw_rows)`` in the chunk loop (none: the backward recomputes every row) and keeps
         # every chunk's per-row gradient scale (``options``: the plan's ``dw_rows`` / ``keep_row_grad``)
@@ -4433,7 +4412,7 @@ def forward_loss(
     cache = BINDING_CACHE
     key = None
     binding = None
-    if backend == "cake" and cache.enabled:
+    if backend == "cake" and cache.enabled and not no_loop:
         key = forward_binding_key(
             X,
             W,
@@ -4451,6 +4430,78 @@ def forward_loss(
         if dx_cap is not None:
             key += ("dx_slices_cap", int(dx_cap))  # the split's capped dX slice counts
         binding = cache.lookup(key)
+    # the pass arena below (the loop's FP32 weight-gradient accumulator, allocated ahead of the logp-only pass)
+    with_arena = bool(zero_arena and zero_first and backend == "cake")
+    if binding is None and with_arena and not no_loop:
+        # a call that misses the cache prepares its binding (below) before the arena exists, so the runner's workspace
+        # and the arena never coexist
+        runner = prepare_lm_head_det_loss(
+            X,
+            W,
+            labels,
+            entry="loss",
+            backend=backend,
+            compact_rows=False if row_index is None else row_index,
+            fuse_dw_cast=fuse,
+            gemm_tuning=tuning,
+            dx_finalize=fused_dx,
+            dw_stream=stream_mode,
+            _template_only=backend == "cake",
+            dx_slices_cap=dx_cap,
+            **common,
+            **(options or {}),
+        )
+        binding = _Binding.from_runner(runner, hc)
+        del runner
+        if key is not None:
+            cache.remember(key, binding)
+    # ahead of a loop that keeps the FP32 weight-gradient accumulator: the pass's chunk buffers in it, allocated first
+    # (:func:`.cake_backend.forward_loss`)
+    arena = (
+        torch.empty(
+            (problem.vocab, problem.hidden), dtype=torch.float32, device=X.device
+        )
+        if with_arena
+        else None
+    )
+    zero_logp = (
+        _zero_weight_logp(
+            problem,
+            X,
+            W,
+            labels,
+            zero_index,
+            backend=backend,
+            gemm_tuning=tuning,
+            arena=arena,
+        )
+        if zero_first
+        else None
+    )
+    if no_loop:
+        hc = None
+        result = _empty_forward(
+            problem,
+            X,
+            need_dx=need_dx,
+            need_dw=need_dw,
+            row_index=row_index,
+            row_valid=row_valid,
+            fuse_dw_cast=fuse_dw_cast,
+            dx_finalize=fused_dx,
+            backend=backend,
+        )
+        if exact:
+            result.loss = _zero_weight_exact_loss(
+                problem, None, row_index, zero_index, loss_weights, backend=backend
+            ).reshape(())
+        if zero_pass and not zero_first:
+            zero_logp = _zero_weight_logp(
+                problem, X, W, labels, zero_index, backend=backend, gemm_tuning=tuning
+            )
+        return _with_zero_weight_rows(
+            result, zero_index, zero_logp, chunk0_alive=chunk0_alive, exact=exact
+        )
     if binding is None:
         runner = prepare_lm_head_det_loss(
             X,
@@ -5700,6 +5751,9 @@ def backward_loss(
             backend=backend,
             gemm_tuning=gemm_tuning,
         )
+    elif dw_acc is not None and _is_zero_accumulator(dw_acc):
+        # a call without a gradient GEMM (:func:`_empty_forward`): no FP32 accumulator to read
+        dw = _zero_gradient(dw_acc, grad, grad_weight_dtype)
     else:
         dw = (
             None
@@ -6754,12 +6808,8 @@ class CakeLMHeadDetLossFunction(torch.autograd.Function):
             dw = (
                 None
                 if ctx.dw_acc is None
-                else torch.zeros(
-                    ctx.dw_acc.shape,
-                    dtype=ctx.grad_weight_dtype,
-                    device=ctx.dw_acc.device,
-                )
-            )
+                else _zero_gradient(ctx.dw_acc, grad_loss, ctx.grad_weight_dtype)
+            )  # cast(g * 0), as ForwardResult.backward forms it
             if not keep:
                 CakeLMHeadDetLossFunction._release(ctx)
             return (dx, dw) + none[2:]

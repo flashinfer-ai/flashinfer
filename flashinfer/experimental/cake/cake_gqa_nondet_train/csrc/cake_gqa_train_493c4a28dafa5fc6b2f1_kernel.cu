@@ -47,50 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 512
-#define TMEM_S_OFFSET 0
-#define TMEM_P0_OFFSET 64
-#define TMEM_P1_OFFSET 192
-#define TMEM_O_HI_OFFSET 256
-#define TMEM_O_LO_OFFSET 384
-#define NUM_KV_PIPE_STAGES 5
-#define NUM_Q_PIPE_STAGES 1
-#define NUM_S_PIPE_STAGES 2
-#define NUM_P_PIPE_STAGES 2
-#define NUM_O_PIPE_STAGES 2
-#define NUM_OF_PIPE_STAGES 1
-#define NUM_SC_PIPE_STAGES 1
-#define NUM_ST_PIPE_STAGES 1
-#define NUM_WORK_PIPE_STAGES 2
-#define SMEM_S_SCALE_OFF 230400
-#define SMEM_S_SCALE_STAGE_BYTES 512
-#define SMEM_S_SCALE_STRIDE 512
-#define SMEM_S_STATS_OFF 230912
-#define SMEM_S_STATS_STAGE_BYTES 1024
-#define SMEM_S_STATS_STRIDE 1024
-#define SMEM_SMEM_Q_HI_OFF 1024
-#define SMEM_SMEM_Q_HI_STAGE_BYTES 32768
-#define SMEM_SMEM_Q_HI_STRIDE 32768
-#define SMEM_SMEM_Q_LO_OFF 33792
-#define SMEM_SMEM_Q_LO_STAGE_BYTES 32768
-#define SMEM_SMEM_Q_LO_STRIDE 32768
-#define SMEM_SMEM_K_HI_OFF 66560
-#define SMEM_SMEM_K_HI_STAGE_BYTES 16384
-#define SMEM_SMEM_K_HI_STRIDE 16384
-#define SMEM_SMEM_K_LO_OFF 148480
-#define SMEM_SMEM_K_LO_STAGE_BYTES 16384
-#define SMEM_SMEM_K_LO_STRIDE 16384
-#define SMEM_SMEM_V_HI_OFF 66560
-#define SMEM_SMEM_V_HI_STAGE_BYTES 16384
-#define SMEM_SMEM_V_HI_STRIDE 16384
-#define SMEM_SMEM_V_LO_OFF 148480
-#define SMEM_SMEM_V_LO_STAGE_BYTES 16384
-#define SMEM_SMEM_V_LO_STRIDE 16384
-#define SMEM_CELLS_OFF 231936
-#define SMEM_CELLS_STAGE_BYTES 8
-#define SMEM_CELLS_STRIDE 8
-#define SMEM_TOTAL 232064
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -405,7 +361,7 @@ kernel_cake_gqa_train_493c4a28dafa5fc6b2f1(const __grid_constant__ CUtensorMap Q
     int cta_rank;
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
-    // Kernel setup ops
+    // Prologue
     float* s_scale = reinterpret_cast<float*>(smem_raw + 230400);
     const int s_scale_addr = smem + 230400;
     float* s_stats = reinterpret_cast<float*>(smem_raw + 230912);
@@ -425,8 +381,7 @@ kernel_cake_gqa_train_493c4a28dafa5fc6b2f1(const __grid_constant__ CUtensorMap Q
     unsigned int* cells = reinterpret_cast<unsigned int*>(smem_raw + 231936);
     const int cells_addr = smem + 231936;
 
-    // Mbarrier init (15 pipeline groups, 0 ordered-sequence groups, 29 barriers)
-    // Mbarriers at smem_raw[0..232)
+    // Mbarrier init (29 barriers at smem_raw[0..232))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -504,14 +459,14 @@ kernel_cake_gqa_train_493c4a28dafa5fc6b2f1(const __grid_constant__ CUtensorMap Q
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_s = taddr;
+    const unsigned int tmem_p0 = taddr + 64;
+    const unsigned int tmem_p1 = taddr + 192;
+    const unsigned int tmem_o_hi = taddr + 256;
+    const unsigned int tmem_o_lo = taddr + 384;
 
     // Kernel post-init ops
-    const int tmem_s = taddr;
-    const int tmem_p0 = taddr + 64;
-    const int tmem_p1 = taddr + 192;
-    const int tmem_o_hi = taddr + 256;
-    const int tmem_o_lo = taddr + 384;
     if (warp >= 8 && warp <= 11) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 88;");
     }
@@ -868,7 +823,7 @@ kernel_cake_gqa_train_493c4a28dafa5fc6b2f1(const __grid_constant__ CUtensorMap Q
                     if (!(_thresh_mask_6 & (1u << 29))) sv[125] = -CUDART_INF_F;
                     if (!(_thresh_mask_6 & (1u << 30))) sv[126] = -CUDART_INF_F;
                     if (!(_thresh_mask_6 & (1u << 31))) sv[127] = -CUDART_INF_F;
-                    float2 _reg_reduce_max2_9 = {-CAKE_INF, -CAKE_INF};
+                    float2 _reg_reduce_max2_9 = {-CUDART_INF_F, -CUDART_INF_F};
                     row_max_x32_accum(&sv[0], _reg_reduce_max2_9);
                     row_max_x32_accum(&sv[32], _reg_reduce_max2_9);
                     row_max_x32_accum(&sv[64], _reg_reduce_max2_9);
@@ -905,7 +860,7 @@ kernel_cake_gqa_train_493c4a28dafa5fc6b2f1(const __grid_constant__ CUtensorMap Q
                     asm volatile(
                         "tcgen05.st.sync.aligned.32x32b.x16.b32"
                         " [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};"
-                        :: "r"(p_addr + 0), "r"(*reinterpret_cast<const uint32_t*>(&pk_0[0])), "r"(*reinterpret_cast<const uint32_t*>(&pk_0[1])), "r"(*reinterpret_cast<const uint32_t*>(&pk_0[2])), "r"(*reinterpret_cast<const uint32_t*>(&pk_0[3])), "r"(*reinterpret_cast<const uint32_t*>(&pk_0[4])), "r"(*reinterpret_cast<const uint32_t*>(&pk_0[5])), "r"(*reinterpret_cast<const uint32_t*>(&pk_0[6])), "r"(*reinterpret_cast<const uint32_t*>(&pk_0[7])), "r"(*reinterpret_cast<const uint32_t*>(&pk_0[8])), "r"(*reinterpret_cast<const uint32_t*>(&pk_0[9])), "r"(*reinterpret_cast<const uint32_t*>(&pk_0[10])), "r"(*reinterpret_cast<const uint32_t*>(&pk_0[11])), "r"(*reinterpret_cast<const uint32_t*>(&pk_0[12])), "r"(*reinterpret_cast<const uint32_t*>(&pk_0[13])), "r"(*reinterpret_cast<const uint32_t*>(&pk_0[14])), "r"(*reinterpret_cast<const uint32_t*>(&pk_0[15])));
+                        :: "r"(p_addr), "r"(*reinterpret_cast<const uint32_t*>(&pk_0[0])), "r"(*reinterpret_cast<const uint32_t*>(&pk_0[1])), "r"(*reinterpret_cast<const uint32_t*>(&pk_0[2])), "r"(*reinterpret_cast<const uint32_t*>(&pk_0[3])), "r"(*reinterpret_cast<const uint32_t*>(&pk_0[4])), "r"(*reinterpret_cast<const uint32_t*>(&pk_0[5])), "r"(*reinterpret_cast<const uint32_t*>(&pk_0[6])), "r"(*reinterpret_cast<const uint32_t*>(&pk_0[7])), "r"(*reinterpret_cast<const uint32_t*>(&pk_0[8])), "r"(*reinterpret_cast<const uint32_t*>(&pk_0[9])), "r"(*reinterpret_cast<const uint32_t*>(&pk_0[10])), "r"(*reinterpret_cast<const uint32_t*>(&pk_0[11])), "r"(*reinterpret_cast<const uint32_t*>(&pk_0[12])), "r"(*reinterpret_cast<const uint32_t*>(&pk_0[13])), "r"(*reinterpret_cast<const uint32_t*>(&pk_0[14])), "r"(*reinterpret_cast<const uint32_t*>(&pk_0[15])));
                     unsigned int pk_1[16];
                     softmax_frag_exp2_cast(&sv[32], pk_1, 0);
                     asm volatile(
@@ -1005,7 +960,7 @@ kernel_cake_gqa_train_493c4a28dafa5fc6b2f1(const __grid_constant__ CUtensorMap Q
 #if __CUDA_ARCH__ == 1030
                     tile_max_1 = max_noftz(lo_max, hi_max);
 #else
-                    float2 _reg_reduce_max2_16 = {-CAKE_INF, -CAKE_INF};
+                    float2 _reg_reduce_max2_16 = {-CUDART_INF_F, -CUDART_INF_F};
                     row_max_x32_accum(&sv_1[0], _reg_reduce_max2_16);
                     row_max_x32_accum(&sv_1[32], _reg_reduce_max2_16);
                     row_max_x32_accum(&sv_1[64], _reg_reduce_max2_16);
@@ -1057,7 +1012,7 @@ kernel_cake_gqa_train_493c4a28dafa5fc6b2f1(const __grid_constant__ CUtensorMap Q
                     asm volatile(
                         "tcgen05.st.sync.aligned.32x32b.x16.b32"
                         " [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};"
-                        :: "r"(p_addr_1 + 0), "r"(*reinterpret_cast<const uint32_t*>(&pk_4[0])), "r"(*reinterpret_cast<const uint32_t*>(&pk_4[1])), "r"(*reinterpret_cast<const uint32_t*>(&pk_4[2])), "r"(*reinterpret_cast<const uint32_t*>(&pk_4[3])), "r"(*reinterpret_cast<const uint32_t*>(&pk_4[4])), "r"(*reinterpret_cast<const uint32_t*>(&pk_4[5])), "r"(*reinterpret_cast<const uint32_t*>(&pk_4[6])), "r"(*reinterpret_cast<const uint32_t*>(&pk_4[7])), "r"(*reinterpret_cast<const uint32_t*>(&pk_4[8])), "r"(*reinterpret_cast<const uint32_t*>(&pk_4[9])), "r"(*reinterpret_cast<const uint32_t*>(&pk_4[10])), "r"(*reinterpret_cast<const uint32_t*>(&pk_4[11])), "r"(*reinterpret_cast<const uint32_t*>(&pk_4[12])), "r"(*reinterpret_cast<const uint32_t*>(&pk_4[13])), "r"(*reinterpret_cast<const uint32_t*>(&pk_4[14])), "r"(*reinterpret_cast<const uint32_t*>(&pk_4[15])));
+                        :: "r"(p_addr_1), "r"(*reinterpret_cast<const uint32_t*>(&pk_4[0])), "r"(*reinterpret_cast<const uint32_t*>(&pk_4[1])), "r"(*reinterpret_cast<const uint32_t*>(&pk_4[2])), "r"(*reinterpret_cast<const uint32_t*>(&pk_4[3])), "r"(*reinterpret_cast<const uint32_t*>(&pk_4[4])), "r"(*reinterpret_cast<const uint32_t*>(&pk_4[5])), "r"(*reinterpret_cast<const uint32_t*>(&pk_4[6])), "r"(*reinterpret_cast<const uint32_t*>(&pk_4[7])), "r"(*reinterpret_cast<const uint32_t*>(&pk_4[8])), "r"(*reinterpret_cast<const uint32_t*>(&pk_4[9])), "r"(*reinterpret_cast<const uint32_t*>(&pk_4[10])), "r"(*reinterpret_cast<const uint32_t*>(&pk_4[11])), "r"(*reinterpret_cast<const uint32_t*>(&pk_4[12])), "r"(*reinterpret_cast<const uint32_t*>(&pk_4[13])), "r"(*reinterpret_cast<const uint32_t*>(&pk_4[14])), "r"(*reinterpret_cast<const uint32_t*>(&pk_4[15])));
                     unsigned int pk_5[16];
                     softmax_frag_exp2_cast(&sv_1[32], pk_5, 0);
                     asm volatile(
@@ -1260,7 +1215,7 @@ kernel_cake_gqa_train_493c4a28dafa5fc6b2f1(const __grid_constant__ CUtensorMap Q
                 int n_masked_7 = n_blocks_7 - n_full_7;
                 int row_1 = m_1 * 256 + cta_rank * 128 + tr_1;
                 bool row_valid = row_1 < q_len_7;
-                long long o_base = ((long long)(q0_1 + row_1) * (long long)num_heads_q + (long long)head_1) * 256;
+                long long o_base = ((long long)(q0_1 + row_1) * (long long)num_heads_q + (long long)head_1) * 256ll;
                 long long lse_index = (long long)head_1 * (long long)total_q + (long long)(q0_1 + row_1);
                 int has_block = ((n_blocks_7 > 0) ? 1 : 0);
                 #pragma unroll 1
@@ -1440,28 +1395,28 @@ kernel_cake_gqa_train_493c4a28dafa5fc6b2f1(const __grid_constant__ CUtensorMap Q
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(ov_8[_lp*2 + 0], ov_8[_lp*2+1 + 0]));
                         pk_8[_lp] = *(uint32_t*)&_bf2;
                     }
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 0)), "r"(pk_8[(0) + 0]), "r"(pk_8[(0) + 1]), "r"(pk_8[(0) + 2]), "r"(pk_8[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + o_base), "r"(pk_8[(0) + 0]), "r"(pk_8[(0) + 1]), "r"(pk_8[(0) + 2]), "r"(pk_8[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
                     unsigned int pk_9[4];
                     #pragma unroll
                     for (int _lp = 0; _lp < 4; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(ov_8[_lp*2 + 8], ov_8[_lp*2+1 + 8]));
                         pk_9[_lp] = *(uint32_t*)&_bf2;
                     }
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 8)), "r"(pk_9[(0) + 0]), "r"(pk_9[(0) + 1]), "r"(pk_9[(0) + 2]), "r"(pk_9[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 8ll)), "r"(pk_9[(0) + 0]), "r"(pk_9[(0) + 1]), "r"(pk_9[(0) + 2]), "r"(pk_9[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
                     unsigned int pk_10[4];
                     #pragma unroll
                     for (int _lp = 0; _lp < 4; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(ov_8[_lp*2 + 16], ov_8[_lp*2+1 + 16]));
                         pk_10[_lp] = *(uint32_t*)&_bf2;
                     }
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 16)), "r"(pk_10[(0) + 0]), "r"(pk_10[(0) + 1]), "r"(pk_10[(0) + 2]), "r"(pk_10[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 16ll)), "r"(pk_10[(0) + 0]), "r"(pk_10[(0) + 1]), "r"(pk_10[(0) + 2]), "r"(pk_10[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
                     unsigned int pk_11[4];
                     #pragma unroll
                     for (int _lp = 0; _lp < 4; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(ov_8[_lp*2 + 24], ov_8[_lp*2+1 + 24]));
                         pk_11[_lp] = *(uint32_t*)&_bf2;
                     }
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 24)), "r"(pk_11[(0) + 0]), "r"(pk_11[(0) + 1]), "r"(pk_11[(0) + 2]), "r"(pk_11[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 24ll)), "r"(pk_11[(0) + 0]), "r"(pk_11[(0) + 1]), "r"(pk_11[(0) + 2]), "r"(pk_11[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
                     unsigned int addr_9 = taddr + 288 + (unsigned int)(warp % 4 * 32 << 16);
                     float ov_9[32];
                     asm volatile(
@@ -1480,28 +1435,28 @@ kernel_cake_gqa_train_493c4a28dafa5fc6b2f1(const __grid_constant__ CUtensorMap Q
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(ov_9[_lp*2 + 0], ov_9[_lp*2+1 + 0]));
                         pk_12[_lp] = *(uint32_t*)&_bf2;
                     }
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 32)), "r"(pk_12[(0) + 0]), "r"(pk_12[(0) + 1]), "r"(pk_12[(0) + 2]), "r"(pk_12[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 32ll)), "r"(pk_12[(0) + 0]), "r"(pk_12[(0) + 1]), "r"(pk_12[(0) + 2]), "r"(pk_12[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
                     unsigned int pk_13[4];
                     #pragma unroll
                     for (int _lp = 0; _lp < 4; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(ov_9[_lp*2 + 8], ov_9[_lp*2+1 + 8]));
                         pk_13[_lp] = *(uint32_t*)&_bf2;
                     }
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 40)), "r"(pk_13[(0) + 0]), "r"(pk_13[(0) + 1]), "r"(pk_13[(0) + 2]), "r"(pk_13[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 40ll)), "r"(pk_13[(0) + 0]), "r"(pk_13[(0) + 1]), "r"(pk_13[(0) + 2]), "r"(pk_13[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
                     unsigned int pk_14[4];
                     #pragma unroll
                     for (int _lp = 0; _lp < 4; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(ov_9[_lp*2 + 16], ov_9[_lp*2+1 + 16]));
                         pk_14[_lp] = *(uint32_t*)&_bf2;
                     }
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 48)), "r"(pk_14[(0) + 0]), "r"(pk_14[(0) + 1]), "r"(pk_14[(0) + 2]), "r"(pk_14[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 48ll)), "r"(pk_14[(0) + 0]), "r"(pk_14[(0) + 1]), "r"(pk_14[(0) + 2]), "r"(pk_14[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
                     unsigned int pk_15[4];
                     #pragma unroll
                     for (int _lp = 0; _lp < 4; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(ov_9[_lp*2 + 24], ov_9[_lp*2+1 + 24]));
                         pk_15[_lp] = *(uint32_t*)&_bf2;
                     }
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 56)), "r"(pk_15[(0) + 0]), "r"(pk_15[(0) + 1]), "r"(pk_15[(0) + 2]), "r"(pk_15[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 56ll)), "r"(pk_15[(0) + 0]), "r"(pk_15[(0) + 1]), "r"(pk_15[(0) + 2]), "r"(pk_15[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
                     unsigned int addr_10 = taddr + 320 + (unsigned int)(warp % 4 * 32 << 16);
                     float ov_10[32];
                     asm volatile(
@@ -1520,28 +1475,28 @@ kernel_cake_gqa_train_493c4a28dafa5fc6b2f1(const __grid_constant__ CUtensorMap Q
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(ov_10[_lp*2 + 0], ov_10[_lp*2+1 + 0]));
                         pk_16[_lp] = *(uint32_t*)&_bf2;
                     }
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 64)), "r"(pk_16[(0) + 0]), "r"(pk_16[(0) + 1]), "r"(pk_16[(0) + 2]), "r"(pk_16[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 64ll)), "r"(pk_16[(0) + 0]), "r"(pk_16[(0) + 1]), "r"(pk_16[(0) + 2]), "r"(pk_16[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
                     unsigned int pk_17[4];
                     #pragma unroll
                     for (int _lp = 0; _lp < 4; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(ov_10[_lp*2 + 8], ov_10[_lp*2+1 + 8]));
                         pk_17[_lp] = *(uint32_t*)&_bf2;
                     }
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 72)), "r"(pk_17[(0) + 0]), "r"(pk_17[(0) + 1]), "r"(pk_17[(0) + 2]), "r"(pk_17[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 72ll)), "r"(pk_17[(0) + 0]), "r"(pk_17[(0) + 1]), "r"(pk_17[(0) + 2]), "r"(pk_17[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
                     unsigned int pk_18[4];
                     #pragma unroll
                     for (int _lp = 0; _lp < 4; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(ov_10[_lp*2 + 16], ov_10[_lp*2+1 + 16]));
                         pk_18[_lp] = *(uint32_t*)&_bf2;
                     }
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 80)), "r"(pk_18[(0) + 0]), "r"(pk_18[(0) + 1]), "r"(pk_18[(0) + 2]), "r"(pk_18[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 80ll)), "r"(pk_18[(0) + 0]), "r"(pk_18[(0) + 1]), "r"(pk_18[(0) + 2]), "r"(pk_18[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
                     unsigned int pk_19[4];
                     #pragma unroll
                     for (int _lp = 0; _lp < 4; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(ov_10[_lp*2 + 24], ov_10[_lp*2+1 + 24]));
                         pk_19[_lp] = *(uint32_t*)&_bf2;
                     }
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 88)), "r"(pk_19[(0) + 0]), "r"(pk_19[(0) + 1]), "r"(pk_19[(0) + 2]), "r"(pk_19[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 88ll)), "r"(pk_19[(0) + 0]), "r"(pk_19[(0) + 1]), "r"(pk_19[(0) + 2]), "r"(pk_19[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
                     unsigned int addr_11 = taddr + 352 + (unsigned int)(warp % 4 * 32 << 16);
                     float ov_11[32];
                     asm volatile(
@@ -1560,28 +1515,28 @@ kernel_cake_gqa_train_493c4a28dafa5fc6b2f1(const __grid_constant__ CUtensorMap Q
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(ov_11[_lp*2 + 0], ov_11[_lp*2+1 + 0]));
                         pk_20[_lp] = *(uint32_t*)&_bf2;
                     }
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 96)), "r"(pk_20[(0) + 0]), "r"(pk_20[(0) + 1]), "r"(pk_20[(0) + 2]), "r"(pk_20[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 96ll)), "r"(pk_20[(0) + 0]), "r"(pk_20[(0) + 1]), "r"(pk_20[(0) + 2]), "r"(pk_20[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
                     unsigned int pk_21[4];
                     #pragma unroll
                     for (int _lp = 0; _lp < 4; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(ov_11[_lp*2 + 8], ov_11[_lp*2+1 + 8]));
                         pk_21[_lp] = *(uint32_t*)&_bf2;
                     }
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 104)), "r"(pk_21[(0) + 0]), "r"(pk_21[(0) + 1]), "r"(pk_21[(0) + 2]), "r"(pk_21[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 104ll)), "r"(pk_21[(0) + 0]), "r"(pk_21[(0) + 1]), "r"(pk_21[(0) + 2]), "r"(pk_21[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
                     unsigned int pk_22[4];
                     #pragma unroll
                     for (int _lp = 0; _lp < 4; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(ov_11[_lp*2 + 16], ov_11[_lp*2+1 + 16]));
                         pk_22[_lp] = *(uint32_t*)&_bf2;
                     }
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 112)), "r"(pk_22[(0) + 0]), "r"(pk_22[(0) + 1]), "r"(pk_22[(0) + 2]), "r"(pk_22[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 112ll)), "r"(pk_22[(0) + 0]), "r"(pk_22[(0) + 1]), "r"(pk_22[(0) + 2]), "r"(pk_22[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
                     unsigned int pk_23[4];
                     #pragma unroll
                     for (int _lp = 0; _lp < 4; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(ov_11[_lp*2 + 24], ov_11[_lp*2+1 + 24]));
                         pk_23[_lp] = *(uint32_t*)&_bf2;
                     }
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 120)), "r"(pk_23[(0) + 0]), "r"(pk_23[(0) + 1]), "r"(pk_23[(0) + 2]), "r"(pk_23[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 120ll)), "r"(pk_23[(0) + 0]), "r"(pk_23[(0) + 1]), "r"(pk_23[(0) + 2]), "r"(pk_23[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
                     unsigned int addr_12 = taddr + 384 + (unsigned int)(warp % 4 * 32 << 16);
                     float ov_12[32];
                     asm volatile(
@@ -1600,28 +1555,28 @@ kernel_cake_gqa_train_493c4a28dafa5fc6b2f1(const __grid_constant__ CUtensorMap Q
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(ov_12[_lp*2 + 0], ov_12[_lp*2+1 + 0]));
                         pk_24[_lp] = *(uint32_t*)&_bf2;
                     }
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 128)), "r"(pk_24[(0) + 0]), "r"(pk_24[(0) + 1]), "r"(pk_24[(0) + 2]), "r"(pk_24[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 128ll)), "r"(pk_24[(0) + 0]), "r"(pk_24[(0) + 1]), "r"(pk_24[(0) + 2]), "r"(pk_24[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
                     unsigned int pk_25[4];
                     #pragma unroll
                     for (int _lp = 0; _lp < 4; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(ov_12[_lp*2 + 8], ov_12[_lp*2+1 + 8]));
                         pk_25[_lp] = *(uint32_t*)&_bf2;
                     }
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 136)), "r"(pk_25[(0) + 0]), "r"(pk_25[(0) + 1]), "r"(pk_25[(0) + 2]), "r"(pk_25[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 136ll)), "r"(pk_25[(0) + 0]), "r"(pk_25[(0) + 1]), "r"(pk_25[(0) + 2]), "r"(pk_25[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
                     unsigned int pk_26[4];
                     #pragma unroll
                     for (int _lp = 0; _lp < 4; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(ov_12[_lp*2 + 16], ov_12[_lp*2+1 + 16]));
                         pk_26[_lp] = *(uint32_t*)&_bf2;
                     }
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 144)), "r"(pk_26[(0) + 0]), "r"(pk_26[(0) + 1]), "r"(pk_26[(0) + 2]), "r"(pk_26[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 144ll)), "r"(pk_26[(0) + 0]), "r"(pk_26[(0) + 1]), "r"(pk_26[(0) + 2]), "r"(pk_26[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
                     unsigned int pk_27[4];
                     #pragma unroll
                     for (int _lp = 0; _lp < 4; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(ov_12[_lp*2 + 24], ov_12[_lp*2+1 + 24]));
                         pk_27[_lp] = *(uint32_t*)&_bf2;
                     }
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 152)), "r"(pk_27[(0) + 0]), "r"(pk_27[(0) + 1]), "r"(pk_27[(0) + 2]), "r"(pk_27[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 152ll)), "r"(pk_27[(0) + 0]), "r"(pk_27[(0) + 1]), "r"(pk_27[(0) + 2]), "r"(pk_27[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
                     unsigned int addr_13 = taddr + 416 + (unsigned int)(warp % 4 * 32 << 16);
                     float ov_13[32];
                     asm volatile(
@@ -1640,28 +1595,28 @@ kernel_cake_gqa_train_493c4a28dafa5fc6b2f1(const __grid_constant__ CUtensorMap Q
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(ov_13[_lp*2 + 0], ov_13[_lp*2+1 + 0]));
                         pk_28[_lp] = *(uint32_t*)&_bf2;
                     }
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 160)), "r"(pk_28[(0) + 0]), "r"(pk_28[(0) + 1]), "r"(pk_28[(0) + 2]), "r"(pk_28[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 160ll)), "r"(pk_28[(0) + 0]), "r"(pk_28[(0) + 1]), "r"(pk_28[(0) + 2]), "r"(pk_28[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
                     unsigned int pk_29[4];
                     #pragma unroll
                     for (int _lp = 0; _lp < 4; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(ov_13[_lp*2 + 8], ov_13[_lp*2+1 + 8]));
                         pk_29[_lp] = *(uint32_t*)&_bf2;
                     }
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 168)), "r"(pk_29[(0) + 0]), "r"(pk_29[(0) + 1]), "r"(pk_29[(0) + 2]), "r"(pk_29[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 168ll)), "r"(pk_29[(0) + 0]), "r"(pk_29[(0) + 1]), "r"(pk_29[(0) + 2]), "r"(pk_29[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
                     unsigned int pk_30[4];
                     #pragma unroll
                     for (int _lp = 0; _lp < 4; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(ov_13[_lp*2 + 16], ov_13[_lp*2+1 + 16]));
                         pk_30[_lp] = *(uint32_t*)&_bf2;
                     }
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 176)), "r"(pk_30[(0) + 0]), "r"(pk_30[(0) + 1]), "r"(pk_30[(0) + 2]), "r"(pk_30[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 176ll)), "r"(pk_30[(0) + 0]), "r"(pk_30[(0) + 1]), "r"(pk_30[(0) + 2]), "r"(pk_30[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
                     unsigned int pk_31[4];
                     #pragma unroll
                     for (int _lp = 0; _lp < 4; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(ov_13[_lp*2 + 24], ov_13[_lp*2+1 + 24]));
                         pk_31[_lp] = *(uint32_t*)&_bf2;
                     }
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 184)), "r"(pk_31[(0) + 0]), "r"(pk_31[(0) + 1]), "r"(pk_31[(0) + 2]), "r"(pk_31[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 184ll)), "r"(pk_31[(0) + 0]), "r"(pk_31[(0) + 1]), "r"(pk_31[(0) + 2]), "r"(pk_31[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
                     unsigned int addr_14 = taddr + 448 + (unsigned int)(warp % 4 * 32 << 16);
                     float ov_14[32];
                     asm volatile(
@@ -1680,28 +1635,28 @@ kernel_cake_gqa_train_493c4a28dafa5fc6b2f1(const __grid_constant__ CUtensorMap Q
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(ov_14[_lp*2 + 0], ov_14[_lp*2+1 + 0]));
                         pk_32[_lp] = *(uint32_t*)&_bf2;
                     }
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 192)), "r"(pk_32[(0) + 0]), "r"(pk_32[(0) + 1]), "r"(pk_32[(0) + 2]), "r"(pk_32[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 192ll)), "r"(pk_32[(0) + 0]), "r"(pk_32[(0) + 1]), "r"(pk_32[(0) + 2]), "r"(pk_32[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
                     unsigned int pk_33[4];
                     #pragma unroll
                     for (int _lp = 0; _lp < 4; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(ov_14[_lp*2 + 8], ov_14[_lp*2+1 + 8]));
                         pk_33[_lp] = *(uint32_t*)&_bf2;
                     }
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 200)), "r"(pk_33[(0) + 0]), "r"(pk_33[(0) + 1]), "r"(pk_33[(0) + 2]), "r"(pk_33[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 200ll)), "r"(pk_33[(0) + 0]), "r"(pk_33[(0) + 1]), "r"(pk_33[(0) + 2]), "r"(pk_33[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
                     unsigned int pk_34[4];
                     #pragma unroll
                     for (int _lp = 0; _lp < 4; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(ov_14[_lp*2 + 16], ov_14[_lp*2+1 + 16]));
                         pk_34[_lp] = *(uint32_t*)&_bf2;
                     }
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 208)), "r"(pk_34[(0) + 0]), "r"(pk_34[(0) + 1]), "r"(pk_34[(0) + 2]), "r"(pk_34[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 208ll)), "r"(pk_34[(0) + 0]), "r"(pk_34[(0) + 1]), "r"(pk_34[(0) + 2]), "r"(pk_34[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
                     unsigned int pk_35[4];
                     #pragma unroll
                     for (int _lp = 0; _lp < 4; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(ov_14[_lp*2 + 24], ov_14[_lp*2+1 + 24]));
                         pk_35[_lp] = *(uint32_t*)&_bf2;
                     }
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 216)), "r"(pk_35[(0) + 0]), "r"(pk_35[(0) + 1]), "r"(pk_35[(0) + 2]), "r"(pk_35[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 216ll)), "r"(pk_35[(0) + 0]), "r"(pk_35[(0) + 1]), "r"(pk_35[(0) + 2]), "r"(pk_35[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
                     unsigned int addr_15 = taddr + 480 + (unsigned int)(warp % 4 * 32 << 16);
                     float ov_15[32];
                     asm volatile(
@@ -1720,66 +1675,66 @@ kernel_cake_gqa_train_493c4a28dafa5fc6b2f1(const __grid_constant__ CUtensorMap Q
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(ov_15[_lp*2 + 0], ov_15[_lp*2+1 + 0]));
                         pk_36[_lp] = *(uint32_t*)&_bf2;
                     }
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 224)), "r"(pk_36[(0) + 0]), "r"(pk_36[(0) + 1]), "r"(pk_36[(0) + 2]), "r"(pk_36[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 224ll)), "r"(pk_36[(0) + 0]), "r"(pk_36[(0) + 1]), "r"(pk_36[(0) + 2]), "r"(pk_36[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
                     unsigned int pk_37[4];
                     #pragma unroll
                     for (int _lp = 0; _lp < 4; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(ov_15[_lp*2 + 8], ov_15[_lp*2+1 + 8]));
                         pk_37[_lp] = *(uint32_t*)&_bf2;
                     }
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 232)), "r"(pk_37[(0) + 0]), "r"(pk_37[(0) + 1]), "r"(pk_37[(0) + 2]), "r"(pk_37[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 232ll)), "r"(pk_37[(0) + 0]), "r"(pk_37[(0) + 1]), "r"(pk_37[(0) + 2]), "r"(pk_37[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
                     unsigned int pk_38[4];
                     #pragma unroll
                     for (int _lp = 0; _lp < 4; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(ov_15[_lp*2 + 16], ov_15[_lp*2+1 + 16]));
                         pk_38[_lp] = *(uint32_t*)&_bf2;
                     }
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 240)), "r"(pk_38[(0) + 0]), "r"(pk_38[(0) + 1]), "r"(pk_38[(0) + 2]), "r"(pk_38[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 240ll)), "r"(pk_38[(0) + 0]), "r"(pk_38[(0) + 1]), "r"(pk_38[(0) + 2]), "r"(pk_38[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
                     unsigned int pk_39[4];
                     #pragma unroll
                     for (int _lp = 0; _lp < 4; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(ov_15[_lp*2 + 24], ov_15[_lp*2+1 + 24]));
                         pk_39[_lp] = *(uint32_t*)&_bf2;
                     }
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 248)), "r"(pk_39[(0) + 0]), "r"(pk_39[(0) + 1]), "r"(pk_39[(0) + 2]), "r"(pk_39[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 248ll)), "r"(pk_39[(0) + 0]), "r"(pk_39[(0) + 1]), "r"(pk_39[(0) + 2]), "r"(pk_39[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
                 } else {
                     unsigned int zero[4];
                     zero[0] = 0;
                     zero[1] = 0;
                     zero[2] = 0;
                     zero[3] = 0;
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 0)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 8)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 16)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 24)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 32)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 40)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 48)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 56)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 64)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 72)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 80)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 88)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 96)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 104)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 112)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 120)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 128)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 136)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 144)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 152)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 160)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 168)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 176)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 184)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 192)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 200)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 208)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 216)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 224)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 232)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 240)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 248)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + o_base), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 8ll)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 16ll)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 24ll)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 32ll)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 40ll)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 48ll)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 56ll)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 64ll)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 72ll)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 80ll)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 88ll)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 96ll)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 104ll)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 112ll)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 120ll)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 128ll)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 136ll)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 144ll)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 152ll)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 160ll)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 168ll)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 176ll)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 184ll)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 192ll)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 200ll)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 208ll)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 216ll)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 224ll)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 232ll)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 240ll)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(O + (o_base + 248ll)), "r"(zero[(0) + 0]), "r"(zero[(0) + 1]), "r"(zero[(0) + 2]), "r"(zero[(0) + 3]), "r"((unsigned int)(row_valid)) : "memory");
                 }
                 asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(LSE + lse_index)), "f"(lse), "r"((unsigned int)(row_valid)) : "memory");
             }
@@ -2237,7 +2192,7 @@ kernel_cake_gqa_train_493c4a28dafa5fc6b2f1(const __grid_constant__ CUtensorMap Q
                     "mov.b64 db, {blo, dhi};\n\t"
                     "tcgen05.mma.cta_group::2.kind::f16 [%0], [ta], db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_o_hi), "r"(b_hi_0), "r"(tmem_p0), "r"(((first) ? 0 : 1)) : "memory");
+                    :: "r"(tmem_o_hi), "r"(b_hi_0), "r"(tmem_p0 + 0), "r"(((first) ? 0 : 1)) : "memory");
                                 asm volatile(
                     "{\n\t"
                     ".reg .pred p0, p1;\n\t"
@@ -2274,7 +2229,7 @@ kernel_cake_gqa_train_493c4a28dafa5fc6b2f1(const __grid_constant__ CUtensorMap Q
                     "mov.b64 db, {blo, dhi};\n\t"
                     "tcgen05.mma.cta_group::2.kind::f16 [%0], [ta], db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_o_lo), "r"(b_lo_0), "r"(tmem_p0), "r"(((first) ? 0 : 1)) : "memory");
+                    :: "r"(tmem_o_lo), "r"(b_lo_0), "r"(tmem_p0 + 0), "r"(((first) ? 0 : 1)) : "memory");
                             } else {
                                 asm volatile(
                     "{\n\t"
@@ -2312,7 +2267,7 @@ kernel_cake_gqa_train_493c4a28dafa5fc6b2f1(const __grid_constant__ CUtensorMap Q
                     "mov.b64 db, {blo, dhi};\n\t"
                     "tcgen05.mma.cta_group::2.kind::f16 [%0], [ta], db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_o_hi), "r"(b_hi_0), "r"(tmem_p1), "r"(((first) ? 0 : 1)) : "memory");
+                    :: "r"(tmem_o_hi), "r"(b_hi_0), "r"(tmem_p1 + 0), "r"(((first) ? 0 : 1)) : "memory");
                                 asm volatile(
                     "{\n\t"
                     ".reg .pred p0, p1;\n\t"
@@ -2349,7 +2304,7 @@ kernel_cake_gqa_train_493c4a28dafa5fc6b2f1(const __grid_constant__ CUtensorMap Q
                     "mov.b64 db, {blo, dhi};\n\t"
                     "tcgen05.mma.cta_group::2.kind::f16 [%0], [ta], db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_o_lo), "r"(b_lo_0), "r"(tmem_p1), "r"(((first) ? 0 : 1)) : "memory");
+                    :: "r"(tmem_o_lo), "r"(b_lo_0), "r"(tmem_p1 + 0), "r"(((first) ? 0 : 1)) : "memory");
                             }
                         }
                         mbarrier_wait(p_full_2_addr + (pq_2) * 8, _phase_p_full);
@@ -2376,7 +2331,7 @@ kernel_cake_gqa_train_493c4a28dafa5fc6b2f1(const __grid_constant__ CUtensorMap Q
                     "mov.b64 db, {blo, dhi};\n\t"
                     "tcgen05.mma.cta_group::2.kind::f16 [%0], [ta], db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_o_hi), "r"(b_hi_0), "r"(tmem_p0), "r"(1) : "memory");
+                    :: "r"(tmem_o_hi), "r"(b_hi_0), "r"(tmem_p0 + 0), "r"(1) : "memory");
                                 asm volatile(
                     "{\n\t"
                     ".reg .pred p0, p1;\n\t"
@@ -2397,7 +2352,7 @@ kernel_cake_gqa_train_493c4a28dafa5fc6b2f1(const __grid_constant__ CUtensorMap Q
                     "mov.b64 db, {blo, dhi};\n\t"
                     "tcgen05.mma.cta_group::2.kind::f16 [%0], [ta], db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_o_lo), "r"(b_lo_0), "r"(tmem_p0), "r"(1) : "memory");
+                    :: "r"(tmem_o_lo), "r"(b_lo_0), "r"(tmem_p0 + 0), "r"(1) : "memory");
                             } else {
                                 asm volatile(
                     "{\n\t"
@@ -2419,7 +2374,7 @@ kernel_cake_gqa_train_493c4a28dafa5fc6b2f1(const __grid_constant__ CUtensorMap Q
                     "mov.b64 db, {blo, dhi};\n\t"
                     "tcgen05.mma.cta_group::2.kind::f16 [%0], [ta], db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_o_hi), "r"(b_hi_0), "r"(tmem_p1), "r"(1) : "memory");
+                    :: "r"(tmem_o_hi), "r"(b_hi_0), "r"(tmem_p1 + 0), "r"(1) : "memory");
                                 asm volatile(
                     "{\n\t"
                     ".reg .pred p0, p1;\n\t"
@@ -2440,7 +2395,7 @@ kernel_cake_gqa_train_493c4a28dafa5fc6b2f1(const __grid_constant__ CUtensorMap Q
                     "mov.b64 db, {blo, dhi};\n\t"
                     "tcgen05.mma.cta_group::2.kind::f16 [%0], [ta], db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_o_lo), "r"(b_lo_0), "r"(tmem_p1), "r"(1) : "memory");
+                    :: "r"(tmem_o_lo), "r"(b_lo_0), "r"(tmem_p1 + 0), "r"(1) : "memory");
                             }
                             tcgen05_commit_cg2_multicast(o_full_addr + (oq_1) * 8, (uint16_t)(3));
                             tcgen05_commit_cg2_multicast(kv_empty_addr + (kv) * 8, (uint16_t)(3));
@@ -2505,7 +2460,7 @@ kernel_cake_gqa_train_493c4a28dafa5fc6b2f1(const __grid_constant__ CUtensorMap Q
                     "mov.b64 db, {blo, dhi};\n\t"
                     "tcgen05.mma.cta_group::2.kind::f16 [%0], [ta], db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_o_hi), "r"(b_hi_2), "r"(tmem_p0), "r"(((last_first) ? 0 : 1)) : "memory");
+                    :: "r"(tmem_o_hi), "r"(b_hi_2), "r"(tmem_p0 + 0), "r"(((last_first) ? 0 : 1)) : "memory");
                                 asm volatile(
                     "{\n\t"
                     ".reg .pred p0, p1;\n\t"
@@ -2542,7 +2497,7 @@ kernel_cake_gqa_train_493c4a28dafa5fc6b2f1(const __grid_constant__ CUtensorMap Q
                     "mov.b64 db, {blo, dhi};\n\t"
                     "tcgen05.mma.cta_group::2.kind::f16 [%0], [ta], db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_o_lo), "r"(b_lo_2), "r"(tmem_p0), "r"(((last_first) ? 0 : 1)) : "memory");
+                    :: "r"(tmem_o_lo), "r"(b_lo_2), "r"(tmem_p0 + 0), "r"(((last_first) ? 0 : 1)) : "memory");
                             } else {
                                 asm volatile(
                     "{\n\t"
@@ -2580,7 +2535,7 @@ kernel_cake_gqa_train_493c4a28dafa5fc6b2f1(const __grid_constant__ CUtensorMap Q
                     "mov.b64 db, {blo, dhi};\n\t"
                     "tcgen05.mma.cta_group::2.kind::f16 [%0], [ta], db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_o_hi), "r"(b_hi_2), "r"(tmem_p1), "r"(((last_first) ? 0 : 1)) : "memory");
+                    :: "r"(tmem_o_hi), "r"(b_hi_2), "r"(tmem_p1 + 0), "r"(((last_first) ? 0 : 1)) : "memory");
                                 asm volatile(
                     "{\n\t"
                     ".reg .pred p0, p1;\n\t"
@@ -2617,7 +2572,7 @@ kernel_cake_gqa_train_493c4a28dafa5fc6b2f1(const __grid_constant__ CUtensorMap Q
                     "mov.b64 db, {blo, dhi};\n\t"
                     "tcgen05.mma.cta_group::2.kind::f16 [%0], [ta], db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_o_lo), "r"(b_lo_2), "r"(tmem_p1), "r"(((last_first) ? 0 : 1)) : "memory");
+                    :: "r"(tmem_o_lo), "r"(b_lo_2), "r"(tmem_p1 + 0), "r"(((last_first) ? 0 : 1)) : "memory");
                             }
                         }
                         mbarrier_wait(p_full_2_addr + (pq_2) * 8, _phase_p_full);
@@ -2644,7 +2599,7 @@ kernel_cake_gqa_train_493c4a28dafa5fc6b2f1(const __grid_constant__ CUtensorMap Q
                     "mov.b64 db, {blo, dhi};\n\t"
                     "tcgen05.mma.cta_group::2.kind::f16 [%0], [ta], db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_o_hi), "r"(b_hi_2), "r"(tmem_p0), "r"(1) : "memory");
+                    :: "r"(tmem_o_hi), "r"(b_hi_2), "r"(tmem_p0 + 0), "r"(1) : "memory");
                                 asm volatile(
                     "{\n\t"
                     ".reg .pred p0, p1;\n\t"
@@ -2665,7 +2620,7 @@ kernel_cake_gqa_train_493c4a28dafa5fc6b2f1(const __grid_constant__ CUtensorMap Q
                     "mov.b64 db, {blo, dhi};\n\t"
                     "tcgen05.mma.cta_group::2.kind::f16 [%0], [ta], db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_o_lo), "r"(b_lo_2), "r"(tmem_p0), "r"(1) : "memory");
+                    :: "r"(tmem_o_lo), "r"(b_lo_2), "r"(tmem_p0 + 0), "r"(1) : "memory");
                             } else {
                                 asm volatile(
                     "{\n\t"
@@ -2687,7 +2642,7 @@ kernel_cake_gqa_train_493c4a28dafa5fc6b2f1(const __grid_constant__ CUtensorMap Q
                     "mov.b64 db, {blo, dhi};\n\t"
                     "tcgen05.mma.cta_group::2.kind::f16 [%0], [ta], db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_o_hi), "r"(b_hi_2), "r"(tmem_p1), "r"(1) : "memory");
+                    :: "r"(tmem_o_hi), "r"(b_hi_2), "r"(tmem_p1 + 0), "r"(1) : "memory");
                                 asm volatile(
                     "{\n\t"
                     ".reg .pred p0, p1;\n\t"
@@ -2708,7 +2663,7 @@ kernel_cake_gqa_train_493c4a28dafa5fc6b2f1(const __grid_constant__ CUtensorMap Q
                     "mov.b64 db, {blo, dhi};\n\t"
                     "tcgen05.mma.cta_group::2.kind::f16 [%0], [ta], db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_o_lo), "r"(b_lo_2), "r"(tmem_p1), "r"(1) : "memory");
+                    :: "r"(tmem_o_lo), "r"(b_lo_2), "r"(tmem_p1 + 0), "r"(1) : "memory");
                             }
                             tcgen05_commit_cg2_multicast(kv_empty_addr + (kv) * 8, (uint16_t)(3));
                         }
