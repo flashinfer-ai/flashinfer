@@ -260,6 +260,87 @@ def _nvfp4_operands(m, n, k):
     return a, b, a_fp4, a_s, b_fp4, b_s, 1.0 / (g_in * g_w)
 
 
+@pytest.mark.parametrize(
+    "m,n,out_dtype,backend,use_nvfp4,auto_tuning",
+    [
+        (1, 129, torch.bfloat16, "b12x", True, False),
+        (17, 1023, torch.float16, "b12x", True, False),
+        (129, 8193, torch.bfloat16, "auto", True, False),
+        (17, 129, torch.bfloat16, "b12x", False, False),
+        (129, 1023, torch.float16, "auto", False, True),
+        (1, 8193, torch.float16, "b12x", True, True),
+    ],
+)
+def test_mm_fp4_b12x_output_row_alignment(
+    m, n, out_dtype, backend, use_nvfp4, auto_tuning
+):
+    """Unaligned output rows must not use TMA, including cached FP4 tactics."""
+    if not (
+        is_sm12x_supported(torch.device("cuda"))
+        and version_at_least(torch.version.cuda, "13.0")
+    ):
+        pytest.skip("b12x NVFP4/MXFP4 requires SM120/SM121 + CUDA 13+.")
+
+    torch.manual_seed(0)
+    k = 256
+    # Alternate store modes in one process: the compiled-kernel cache must
+    # distinguish the aligned TMA path from the predicated global-store path.
+    aligned_n = (n + 7) // 8 * 8
+    for cols in (aligned_n, n, aligned_n):
+        a, b, a_fp4, a_s, b_fp4, b_s, alpha = _nvfp4_operands(m, cols, k)
+        if not use_nvfp4:
+            a_fp4, a_s = mxfp4_quantize(a)
+            b_fp4, b_s = mxfp4_quantize(b)
+            alpha = None
+        guard = 128
+        storage = torch.full(
+            (guard + m * cols + m * 128 + guard,),
+            42,
+            device="cuda",
+            dtype=out_dtype,
+        )
+        out = storage[guard : guard + m * cols].view(m, cols)
+        out.fill_(float("nan"))
+
+        def run():
+            mm_fp4(
+                a_fp4,
+                b_fp4.T,
+                a_s,
+                b_s.T,
+                alpha,
+                out_dtype,
+                out,
+                block_size=16 if use_nvfp4 else 32,
+                backend=backend,
+                use_nvfp4=use_nvfp4,
+                skip_check=False,
+            )
+
+        # Profile this regression shape without allocating unrelated M buckets.
+        with autotune(auto_tuning, tuning_buckets=(m,)):
+            run()
+        torch.cuda.synchronize()
+        assert torch.all(storage[:guard] == 42)
+        assert torch.all(storage[guard + m * cols :] == 42)
+        assert torch.isfinite(out).all()
+        reference = torch.mm(a, b.T).float()
+        assert torch.all(F.cosine_similarity(reference, out.float(), dim=1) > 0.97)
+
+        if cols == n:
+            expected = out.clone()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                run()
+            for _ in range(2):
+                out.fill_(float("nan"))
+                graph.replay()
+                torch.cuda.synchronize()
+                torch.testing.assert_close(out, expected, rtol=0, atol=0)
+                assert torch.all(storage[:guard] == 42)
+                assert torch.all(storage[guard + m * cols :] == 42)
+
+
 def test_mm_fp4_b12x_short_k_multi_wave():
     # One K tile and more work tiles than SMs stress the epilogue smem
     # handoff between a persistent CTA's work tiles, a regime the
