@@ -32,6 +32,7 @@ from flashinfer.grouped_mm.cute_sm120_fp8_groupwise.core import (
 )
 from flashinfer.testing.utils import per_block_cast_to_fp8, per_token_cast_to_fp8
 from flashinfer.utils import is_sm120a_supported
+from tests.test_helpers.pdl import late_store
 
 CALC_DIFF_THRESHOLD = 1e-3
 # Gated (fused SwiGLU) uses a looser tolerance: the fp8 GEMM output is 2N (gate+up),
@@ -174,6 +175,32 @@ def test_moe_gemm_fp8_nt_groupwise_forced_tactic(tactic, is_gated, mpe):
     threshold = GATED_CALC_DIFF_THRESHOLD if is_gated else CALC_DIFF_THRESHOLD
     diff = calc_diff(out.float(), ref.float())
     assert diff < threshold, f"forced tactic calc_diff={diff:.6e}"
+
+
+@pytest.mark.parametrize(
+    "is_gated,tactic",
+    [(False, tactic) for tactic in _FP8_MOE_PLAIN_TACTICS]
+    + [(True, tactic) for tactic in _FP8_MOE_GATED_TACTICS],
+)
+def test_moe_gemm_fp8_nt_groupwise_pdl_waits_for_a_scale(tactic, is_gated):
+    skip_if_not_sm120()
+    a, b, a_scale, b_scale, m_indptr, ref = make_inputs(
+        [8] * 4, 256, 2176, is_gated=is_gated
+    )
+    runner = _CuteSm120Fp8MoeRunner(
+        torch.empty_like(ref), is_gated, (1, 128, 128), "MN"
+    )
+    inputs = [a, b, a_scale, b_scale, m_indptr]
+    expected = runner(inputs, tactic=tactic).clone()
+
+    # Token 0's first scale is what the previous kernel is still producing.
+    # No other kernel may run between that producer and the GEMM.
+    a_scale_value = a_scale[0, 0].item()
+    a_scale[0, 0] = a_scale_value * 4
+    late_store(a_scale, a_scale_value)
+    out = runner(inputs, tactic=tactic)
+
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(
