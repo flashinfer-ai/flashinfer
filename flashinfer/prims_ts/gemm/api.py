@@ -33,7 +33,12 @@ from ..utils import is_prims_ts_arch_available
 from .config import PrimsTsGemmConfig
 from .support import nvfp4_128x4_numel as _nvfp4_128x4_numel
 from .support import validate_dense_gemm
-from .tactics import derived_ab_stages, fallback_cluster
+from .tactics import (
+    default_fp8_mma_k,
+    derived_ab_stages,
+    fallback_cluster,
+    loadable_ab_stages,
+)
 
 _COMPILED: dict[tuple[PrimsTsGemmConfig, int, int, bool], object] = {}
 _KERNEL_MODULES: dict[PrimsTsGemmConfig, ModuleType] = {}
@@ -223,6 +228,21 @@ def _overlap_epilogue_supported(config: PrimsTsGemmConfig) -> bool:
     return False
 
 
+def _fp8_mma_k(config: PrimsTsGemmConfig) -> int:
+    if config.operand_format != "fp8_e4m3":
+        if config.fp8_mma_k is not None:
+            raise ValueError("fp8_mma_k requires FP8 operands")
+        return 32
+    mma_k = (
+        default_fp8_mma_k(config.arch) if config.fp8_mma_k is None else config.fp8_mma_k
+    )
+    if mma_k not in (32, 64):
+        raise ValueError(f"fp8_mma_k must be 32 or 64, got {mma_k}")
+    if mma_k == 64 and config.arch != 107:
+        raise ValueError("fp8_mma_k=64 requires SM107")
+    return mma_k
+
+
 def _load_kernel(config: PrimsTsGemmConfig) -> ModuleType:
     module = _KERNEL_MODULES.get(config)
     if module is not None:
@@ -262,14 +282,21 @@ def _load_kernel(config: PrimsTsGemmConfig) -> ModuleType:
                 "MMA-K=64 BF16 QKV/QKNorm/RoPE epilogues only"
             )
         module.use_nvfp4_tmem_overlap = config.tmem_overlap
+        module._MMA_K_BYTES = _fp8_mma_k(config)
         module._tile_k_override = config.tile_k
-        if config.nvfp4_mma_k not in (64, 96):
-            raise ValueError("nvfp4_mma_k must be 64 or 96")
+        if config.nvfp4_mma_k not in (64, 96, 128):
+            raise ValueError("nvfp4_mma_k must be 64, 96 or 128")
         if config.nvfp4_mma_k == 96 and (
             config.arch != 103 or config.operand_format != "nvfp4_e2m1"
         ):
             raise ValueError("MMA-K=96 requires SM103 NVFP4 operands")
+        if config.nvfp4_mma_k == 128 and (
+            config.arch != 107 or config.operand_format != "nvfp4_e2m1"
+        ):
+            raise ValueError("MMA-K=128 requires SM107 NVFP4 operands")
         module.nvfp4_mma_k = config.nvfp4_mma_k
+        module.tmem_capacity_cols = 576 if config.arch == 107 else 512
+        module.smem_capacity_bytes = 334848 if config.arch == 107 else None
         module._tile_n_override = config.tile_n
         default_epilogue_warps = (
             8 if config.epilogue != "linear" or config.tmem_overlap else 4
@@ -283,6 +310,10 @@ def _load_kernel(config: PrimsTsGemmConfig) -> ModuleType:
             raise ValueError("epilogue_warps must be 4 or 8")
         if config.epilogue != "linear" and module.num_epilogue_warps != 8:
             raise ValueError("fused epilogues require 8 epilogue warps")
+        # Each 4-warp epilogue group RMS-normalizes the half tile it drains,
+        # so that half must be exactly one head.
+        if config.epilogue == "qkv_qknorm_rope" and config.tile_n != 256:
+            raise ValueError("QK-norm/RoPE epilogue requires tile_n=256")
         module.threads_in_epilogue = module.num_epilogue_warps * 32
         forced_stages = derived_ab_stages(
             config.operand_format,
@@ -291,11 +322,13 @@ def _load_kernel(config: PrimsTsGemmConfig) -> ModuleType:
             config.tile_n,
             config.tile_k,
         )
+        loadable = loadable_ab_stages(config.arch, config.operand_format)
         if config.ab_stages is None:
             module.ab_stages = forced_stages
-        elif config.ab_stages not in (1, 2, 4, 5, 6):
+        elif config.ab_stages not in loadable:
             raise ValueError(
-                f"ab_stages must be one of 1, 2, 4, 5, 6, got {config.ab_stages}"
+                f"ab_stages must be one of {', '.join(map(str, loadable))}, "
+                f"got {config.ab_stages}"
             )
         elif (
             config.nvfp4_mma_k == 96
@@ -430,6 +463,7 @@ def _compile(
                 f"tm{config.tile_m}",
                 f"tn{config.tile_n}",
                 f"tk{config.tile_k}",
+                f"mk{module._MMA_K_BYTES}",
                 f"f4mk{config.nvfp4_mma_k}",
                 f"epiw{field(config.epilogue_warps)}",
                 f"overlap{int(config.tmem_overlap)}",
@@ -892,7 +926,8 @@ def prepare_fp4_linear(
 
     On SM103, ``mma_k=96`` enables 3x NVFP4. ``tile_k=256`` uses separate
     256-element data and 384-element scale pipelines; ``tile_k=768`` selects
-    the large-tile baseline. The default K=64 path remains available on all
+    the large-tile baseline. On SM107, ``mma_k=128`` issues 64-byte
+    instructions. The default K=64 path remains available on all
     supported devices. ``tmem_overlap=True`` uses eight epilogue warps and
     alternating accumulator windows to overlap the next tile's MMA with
     output stores. It requires ``tile_k=256`` and BF16 output and is opt-in.

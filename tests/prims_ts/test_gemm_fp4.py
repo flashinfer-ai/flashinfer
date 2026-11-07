@@ -15,6 +15,7 @@ from flashinfer.prims_ts.gemm import (
 )
 from flashinfer.prims_ts.gemm.api import PreparedFp4Linear, _launch, _load_kernel
 from flashinfer.prims_ts.gemm.config import PrimsTsGemmConfig
+from flashinfer.prims_ts.gemm.tactics import tactic_is_legal
 from flashinfer.utils import get_compute_capability
 from tests.prims_ts.gemm_fp4_reference import (
     dequantize_nvfp4,
@@ -32,6 +33,11 @@ def _require_gemm_gpu():
 
 def _require_sm103(reason):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
+        pytest.skip(reason)
+
+
+def _require_sm107(reason):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
         pytest.skip(reason)
 
 
@@ -178,13 +184,26 @@ def test_fp4_qkv_qknorm_rope_bf16():
         qkv_scale=qkv_scale,
     )
     prepared_actual = prepared(a, a_sf, cos_sin=cos_sin, positions=positions)
+    expected = _qkv_qknorm_rope_reference(
+        a, a_scale, w, w_scale, q_weight, k_weight, cos_sin, qkv_scale, head_dim
+    )
+    torch.testing.assert_close(actual.float(), expected, atol=1.0, rtol=8e-2)
+    torch.testing.assert_close(prepared_actual, actual)
+
+
+def _qkv_qknorm_rope_reference(
+    a, a_scale, w, w_scale, q_weight, k_weight, cos_sin, qkv_scale, head_dim
+):
+    m = a.shape[0]
+    num_heads = w.shape[0] // (3 * head_dim)
     base = (
         F.linear(dequantize_nvfp4(a, a_scale, 1.0), dequantize_nvfp4(w, w_scale, 1.0))
         .bfloat16()
         .float()
     )
     shaped = base.view(m, 3, num_heads, head_dim)
-    shaped.mul_(qkv_scale.view(1, 3, 1, 1))
+    if qkv_scale is not None:
+        shaped.mul_(qkv_scale.view(1, 3, 1, 1))
     half = head_dim // 2
     cos, sin = cos_sin[:, None, :half], cos_sin[:, None, half:]
     for part, norm_weight in ((0, q_weight), (1, k_weight)):
@@ -202,10 +221,7 @@ def test_fp4_qkv_qknorm_rope_bf16():
             ),
             -1,
         ).flatten(-2)
-    torch.testing.assert_close(
-        actual.float(), shaped.reshape_as(base), atol=1.0, rtol=8e-2
-    )
-    torch.testing.assert_close(prepared_actual, actual)
+    return shaped.reshape_as(base)
 
 
 @pytest.mark.parametrize("scheduler", ["static", "clc_dynamic"])
@@ -335,6 +351,222 @@ def test_nvfp4_3x_rejects_unsupported_config(arch, operand, tile_k):
     )
     with pytest.raises(ValueError, match="MMA-K=96"):
         _load_kernel(config)
+
+
+@pytest.mark.parametrize("epilogue", ["linear", "swiglu"])
+@pytest.mark.parametrize("tile_n", [128, 256])
+@pytest.mark.parametrize("tile_k", [256, 512])
+@pytest.mark.parametrize("k", [256, 1024, 1536, 9216])
+def test_nvfp4_mma_k128(epilogue, tile_n, tile_k, k):
+    _require_sm107("MMA-K=128 requires SM107")
+    m, n = 512, 512
+    a, a_scale, b, b_scale = _fp4_problem(m, n, k)
+    sfa, sfb = _swizzled(a_scale, b_scale)
+    logical_n = n // 2 if epilogue == "swiglu" else n
+    out = torch.empty((m, logical_n), device="cuda", dtype=torch.bfloat16)
+    # tile_k=512 spans two TMA K-boxes; five stages of it do not fit in SMEM.
+    config = PrimsTsGemmConfig(
+        107,
+        "nvfp4_e2m1",
+        "bf16",
+        epilogue,
+        False,
+        None,
+        None,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        nvfp4_mma_k=128,
+        ab_stages=2 if tile_k == 512 else None,
+    )
+    _launch(config, a, b, out, (m, n, k), sfa=sfa, sfb=sfb)
+    expected = dequantize_nvfp4(a, a_scale, 1.0) @ dequantize_nvfp4(b, b_scale, 1.0).T
+    if epilogue == "swiglu":
+        expected = expected[:, 0::2] * F.silu(expected[:, 1::2])
+        torch.testing.assert_close(out.float(), expected, atol=1.0, rtol=6e-2)
+    else:
+        torch.testing.assert_close(out.float(), expected, atol=2e-3, rtol=4e-3)
+
+
+@pytest.mark.parametrize("scheduler", ["clc_dynamic", "static"])
+@pytest.mark.parametrize("cluster_shape", [(2, 1, 1), (4, 4, 1)])
+def test_nvfp4_mma_k128_persistent_tail_and_graph(scheduler, cluster_shape):
+    _require_sm107("MMA-K=128 requires SM107")
+    # Partial M and a K that ends mid-tile exercise persistent reuse, both
+    # AB/SF ring wraps and multicast scale delivery across pair rows.
+    m, n, k = 4097, 1024, 1280
+    a, a_scale, b, b_scale = _fp4_problem(m, n, k)
+    sfa, sfb = _swizzled(a_scale, b_scale)
+    out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn(n, device="cuda", dtype=torch.bfloat16)
+    config = PrimsTsGemmConfig(
+        107,
+        "nvfp4_e2m1",
+        "bf16",
+        "linear",
+        True,
+        None,
+        None,
+        tile_k=256,
+        nvfp4_mma_k=128,
+        scheduler=scheduler,
+        cluster_shape=cluster_shape,
+    )
+
+    def run():
+        _launch(config, a, b, out, (m, n, k), sfa=sfa, sfb=sfb, bias=bias, scale=0.375)
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    a.bitwise_xor_(0x88)
+    for _ in range(3):
+        graph.replay()
+    expected = (
+        (dequantize_nvfp4(a, a_scale, 1.0) @ dequantize_nvfp4(b, b_scale, 1.0).T)
+        + bias.float()
+    ) * 0.375
+    torch.testing.assert_close(out.float(), expected, atol=2e-3, rtol=4e-3)
+
+
+@pytest.mark.parametrize(
+    "arch,operand",
+    [(100, "nvfp4_e2m1"), (103, "nvfp4_e2m1"), (107, "fp8_e4m3")],
+)
+def test_nvfp4_mma_k128_rejects_unsupported_config(arch, operand):
+    config = PrimsTsGemmConfig(
+        arch,
+        operand,
+        "bf16",
+        "linear",
+        False,
+        None,
+        None,
+        tile_k=256,
+        nvfp4_mma_k=128,
+    )
+    with pytest.raises(ValueError, match="MMA-K=128"):
+        _load_kernel(config)
+
+
+@pytest.mark.parametrize(
+    "epilogue,tile_n",
+    [
+        ("linear", 128),
+        ("linear", 256),
+        ("swiglu_nvfp4", 128),
+        ("swiglu_nvfp4", 256),
+        ("qkv_qknorm_rope", 256),
+    ],
+)
+@pytest.mark.parametrize("scheduler", ["clc_dynamic", "static"])
+def test_nvfp4_two_accumulators_persistent(epilogue, tile_n, scheduler):
+    _require_sm107("576-column TMEM requires SM107")
+    # Every CTA pair owns several output tiles, so the MMA warp alternates
+    # between both accumulators and wraps back to the first. tile_n=256 needs
+    # 560 columns, which only SM107's exclusive allocation provides.
+    head_dim = 128
+    m, n, k = 4097, 3072, 1280
+    a, a_scale, w, w_scale = _fp4_problem(m, n, k)
+    a_sf, w_sf = _swizzled(a_scale, w_scale)
+    kernel_epilogue = "swiglu" if epilogue == "swiglu_nvfp4" else epilogue
+    output_format = "nvfp4_e2m1" if epilogue == "swiglu_nvfp4" else "bf16"
+    is_qkv = epilogue == "qkv_qknorm_rope"
+    config = PrimsTsGemmConfig(
+        107,
+        "nvfp4_e2m1",
+        output_format,
+        kernel_epilogue,
+        False,
+        head_dim if is_qkv else None,
+        False if is_qkv else None,
+        tile_n=tile_n,
+        tile_k=256,
+        nvfp4_mma_k=128,
+        scheduler=scheduler,
+    )
+    assert _load_kernel(config).acc_stages == 2
+    linear = F.linear(
+        dequantize_nvfp4(a, a_scale, 1.0), dequantize_nvfp4(w, w_scale, 1.0)
+    )
+    if epilogue == "linear":
+        prepared = prepare_fp4_linear(w, w_sf, 1.0, 1.0, config=config)
+        actual = prepared(a, a_sf)
+        torch.testing.assert_close(actual.float(), linear, atol=2e-3, rtol=4e-3)
+    elif epilogue == "swiglu_nvfp4":
+        expected = linear[:, 0::2] * F.silu(linear[:, 1::2])
+        encode_scale = (448.0 * 6.0 / expected.abs().amax()).reshape(1)
+        prepared = prepare_fp4_linear_swiglu(
+            w,
+            w_sf,
+            1.0,
+            1.0,
+            out_dtype=torch.uint8,
+            output_quant_scale=encode_scale,
+            config=config,
+        )
+        payload, scales = prepared(a, a_sf)
+        dequantized = dequantize_nvfp4_128x4(payload, scales, encode_scale)
+        block_error = (
+            (dequantized - expected).reshape(m, -1, 16).abs()
+            / expected.reshape(m, -1, 16).abs().amax(-1, keepdim=True).clamp(min=1)
+        ).amax()
+        # Same bound as test_fp4_swiglu_and_packed_output_contract.
+        assert block_error < 0.2
+        actual = payload
+    else:
+        q_weight = torch.rand((head_dim,), device="cuda", dtype=torch.bfloat16)
+        k_weight = torch.rand((head_dim,), device="cuda", dtype=torch.bfloat16)
+        angles = torch.randn((m, head_dim // 2), device="cuda")
+        cos_sin = torch.cat((angles.cos(), angles.sin()), dim=-1).contiguous()
+        positions = torch.arange(m, device="cuda", dtype=torch.int64)
+        num_heads = n // (3 * head_dim)
+        prepared = prepare_fp4_qkv_qknorm_rope(
+            w,
+            w_sf,
+            1.0,
+            1.0,
+            q_weight,
+            k_weight,
+            num_q_heads=num_heads,
+            num_kv_heads=num_heads,
+            head_dim=head_dim,
+            config=config,
+        )
+        actual = prepared(a, a_sf, cos_sin=cos_sin, positions=positions)
+        expected = _qkv_qknorm_rope_reference(
+            a, a_scale, w, w_scale, q_weight, k_weight, cos_sin, None, head_dim
+        )
+        torch.testing.assert_close(actual.float(), expected, atol=1.0, rtol=8e-2)
+    # A second launch must start from fresh accumulator pipeline state.
+    if epilogue == "linear":
+        again = prepared(a, a_sf)
+    elif epilogue == "swiglu_nvfp4":
+        again = prepared(a, a_sf)[0]
+    else:
+        again = prepared(a, a_sf, cos_sin=cos_sin, positions=positions)
+    torch.testing.assert_close(again, actual, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("operand", ["nvfp4_e2m1", "fp8_e4m3"])
+def test_qkv_qknorm_rope_rejects_narrow_tile(operand):
+    # Each 4-warp epilogue group normalizes half the tile, which must be a
+    # whole 128-wide head.
+    config = PrimsTsGemmConfig(
+        100,
+        operand,
+        "bf16",
+        "qkv_qknorm_rope",
+        False,
+        128,
+        False,
+        tile_n=128,
+        tile_k=256 if operand == "nvfp4_e2m1" else 128,
+    )
+    with pytest.raises(ValueError, match="tile_n=256"):
+        _load_kernel(config)
+    tactic = (2, 2, 128, config.tile_k, False, 4, 64, True, 8, False)
+    assert not tactic_is_legal(100, operand, "bf16", "qkv_qknorm_rope", tactic)
 
 
 @pytest.mark.parametrize(
