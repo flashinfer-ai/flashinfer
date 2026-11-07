@@ -10076,6 +10076,11 @@ _MM_MXFP8_CUTE_DSL_TUNING_CONFIG = replace(
     # Rank the runners from a cold L2.
     use_cold_l2_graph_replay=True,
     use_cold_l2_cache=True,
+    # As for BF16 (#6360), time a chain of 16 back-to-back launches per cold-L2
+    # sample instead of a single launch, each launch on its own lane of the
+    # weights and their scales.
+    cold_chain_launches=16,
+    profile_arena_input_indices=(1, 3),  # b, b_descale
 )
 
 
