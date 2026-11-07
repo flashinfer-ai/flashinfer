@@ -887,16 +887,21 @@ __global__ void BatchQKApplyRotaryKernel(
 }
 
 /*!
- * \brief Unified CUDA kernel to apply RoPE, quantize to FP8, and append to paged cache.
+ * \brief Unified CUDA kernel to apply RoPE, scale/cast, and append to paged cache.
  *
  * Templated on CacheT to support both GQA/MHA (paged_kv_t) and MLA (paged_kv_mla_t).
  * Cache-only behaviors are selected with constexpr on the CacheT.
+ *
+ * Q outputs are written as QOutType and the cache as CacheType, so the same kernel serves
+ * the FP8 path (both FP8) and the non-quantized path (Q in the input dtype, cache in the
+ * input dtype or FP8). Values are multiplied by quant_scale_q / quant_scale_kv before the
+ * cast; callers pass 1.0 where no scaling applies.
  */
 template <bool interleave, uint32_t vec_size, uint32_t bdx, typename DType, typename RoPEIdType,
-          typename PagedKVIdType, typename QuantType, typename CacheT>
+          typename PagedKVIdType, typename QOutType, typename CacheType, typename CacheT>
 __global__ void RopeQuantizeAppendPagedKVCacheKernel(
     DType* q_rope_in, DType* k_rope_in, DType* q_nope_in, DType* k_nope_in, DType* v_in,
-    QuantType* q_rope_out, QuantType* q_nope_out, CacheT paged_kv_like,
+    QOutType* q_rope_out, QOutType* q_nope_out, CacheT paged_kv_like,
     PagedKVIdType* __restrict__ batch_indices, PagedKVIdType* __restrict__ positions,
     float* __restrict__ cos_sin_cache, RoPEIdType* __restrict__ pos_ids,
     const RopeQuantizeAppendPagedKVCacheParams params) {
@@ -941,7 +946,7 @@ __global__ void RopeQuantizeAppendPagedKVCacheKernel(
   uint32_t k_nope_end = k_rope_end + num_kv_heads * no_rope_chunks;
 
   // Deduce MLA vs GQA/MHA from CacheT
-  constexpr bool IS_MLA = std::is_same<CacheT, paged_kv_mla_t<QuantType, PagedKVIdType>>::value;
+  constexpr bool IS_MLA = std::is_same<CacheT, paged_kv_mla_t<CacheType, PagedKVIdType>>::value;
 
   vec_t<float, vec_size> cos, sin;
   if (bx * bdy + ty < nnz) {
@@ -979,7 +984,7 @@ __global__ void RopeQuantizeAppendPagedKVCacheKernel(
         DType* q_rope_in_ptr =
             q_rope_in + get_elem_offset_impl(idx, q_head_idx, elem_offset, q_rope_in_stride_n,
                                              q_rope_in_stride_h);
-        QuantType* q_rope_out_ptr =
+        QOutType* q_rope_out_ptr =
             q_rope_out + get_elem_offset_impl(idx, q_head_idx, elem_offset, q_rope_out_stride_n,
                                               q_rope_out_stride_h);
 
@@ -1027,11 +1032,11 @@ __global__ void RopeQuantizeAppendPagedKVCacheKernel(
         }
 
         if constexpr (IS_MLA) {
-          QuantType* kpe_ptr =
+          CacheType* kpe_ptr =
               paged_kv_like.get_kpe_ptr(page_iter, entry_idx, elem_offset + tx * vec_size);
           k_rope_vec.cast_store(kpe_ptr);
         } else {
-          QuantType* k_ptr =
+          CacheType* k_ptr =
               paged_kv_like.get_k_ptr(page_iter, k_head_idx, entry_idx, tx * vec_size);
           k_rope_vec.cast_store(k_ptr);
         }
@@ -1043,7 +1048,7 @@ __global__ void RopeQuantizeAppendPagedKVCacheKernel(
         uint32_t elem_offset = nope_chunk_idx * rope_chunk_size;
 
         DType* k_nope_in_ptr;
-        QuantType* k_nope_out_ptr;
+        CacheType* k_nope_out_ptr;
         if constexpr (IS_MLA) {
           k_nope_in_ptr = k_nope_in + idx * k_nope_in_stride + elem_offset;
           k_nope_out_ptr = paged_kv_like.get_ckv_ptr(page_iter, entry_idx, elem_offset);
@@ -1068,7 +1073,7 @@ __global__ void RopeQuantizeAppendPagedKVCacheKernel(
           k_nope_vec.cast_store(k_nope_out_ptr + tx * vec_size);
         } else {
           // Tail chunk where no_rope_dim is not a multiple of rope_dim.
-          scale_store_partial_chunk<DType, QuantType, vec_size>(
+          scale_store_partial_chunk<DType, CacheType, vec_size>(
               k_nope_in_ptr, k_nope_out_ptr, tx * vec_size, chunk_valid, quant_scale_kv);
         }
 
@@ -1091,7 +1096,7 @@ __global__ void RopeQuantizeAppendPagedKVCacheKernel(
               for (uint32_t i = 0; i < vec_size; ++i) {
                 v_vec[i] = v_vec[i] * quant_scale_kv;
               }
-              QuantType* v_ptr = paged_kv_like.get_v_ptr(page_iter, kv_head_idx, entry_idx,
+              CacheType* v_ptr = paged_kv_like.get_v_ptr(page_iter, kv_head_idx, entry_idx,
                                                          v_elem_offset + tx * vec_size);
               v_vec.cast_store(v_ptr);
             }
@@ -1110,7 +1115,7 @@ __global__ void RopeQuantizeAppendPagedKVCacheKernel(
         DType* q_nope_in_ptr =
             q_nope_in + get_elem_offset_impl(idx, q_head_idx, elem_offset, q_nope_in_stride_n,
                                              q_nope_in_stride_h);
-        QuantType* q_nope_out_ptr =
+        QOutType* q_nope_out_ptr =
             q_nope_out + get_elem_offset_impl(idx, q_head_idx, elem_offset, q_nope_out_stride_n,
                                               q_nope_out_stride_h);
 
@@ -1127,7 +1132,7 @@ __global__ void RopeQuantizeAppendPagedKVCacheKernel(
           q_nope_vec.cast_store(q_nope_out_ptr + tx * vec_size);
         } else {
           // Tail chunk where no_rope_dim is not a multiple of rope_dim.
-          scale_store_partial_chunk<DType, QuantType, vec_size>(
+          scale_store_partial_chunk<DType, QOutType, vec_size>(
               q_nope_in_ptr, q_nope_out_ptr, tx * vec_size, chunk_valid, quant_scale_q);
         }
       }
@@ -1364,12 +1369,16 @@ cudaError_t RopeQuantize(
 }
 
 /*!
- * \brief Host function to apply RoPE, quantize to FP8, and append K/V to paged cache (GQA/MHA)
+ * \brief Host function to apply RoPE, scale/cast, and append K/V to paged cache (GQA/MHA)
+ *
+ * QOutType and CacheType are independent: FP8 for both on the quantized path, or the input
+ * dtype for Q with an input-dtype or FP8 cache on the non-quantized path.
  */
-template <typename DType, typename RoPEIdType, typename PagedKVIdType, typename QuantType>
+template <typename DType, typename RoPEIdType, typename PagedKVIdType, typename QOutType,
+          typename CacheType>
 cudaError_t RopeQuantizeAppendPagedKVCache(
     DType* q_rope_in, DType* k_rope_in, DType* q_nope_in, DType* k_nope_in, DType* v_in,
-    QuantType* q_rope_out, QuantType* q_nope_out, paged_kv_t<QuantType, PagedKVIdType> paged_kv,
+    QOutType* q_rope_out, QOutType* q_nope_out, paged_kv_t<CacheType, PagedKVIdType> paged_kv,
     PagedKVIdType* batch_indices, PagedKVIdType* positions, float* cos_sin_cache,
     RoPEIdType* pos_ids, uint32_t nnz, uint32_t num_qo_heads, uint32_t num_kv_heads,
     uint32_t rope_dim, uint32_t no_rope_dim, size_t q_rope_in_stride_n, size_t q_rope_in_stride_h,
@@ -1406,9 +1415,10 @@ cudaError_t RopeQuantizeAppendPagedKVCache(
     config.attrs = attribute;
     config.numAttrs = 1;
 
-    auto kernel = RopeQuantizeAppendPagedKVCacheKernel<INTERLEAVE, vec_size, /*bdx=*/1, DType,
-                                                       RoPEIdType, PagedKVIdType, QuantType,
-                                                       paged_kv_t<QuantType, PagedKVIdType>>;
+    auto kernel =
+        RopeQuantizeAppendPagedKVCacheKernel<INTERLEAVE, vec_size, /*bdx=*/1, DType, RoPEIdType,
+                                             PagedKVIdType, QOutType, CacheType,
+                                             paged_kv_t<CacheType, PagedKVIdType>>;
     RopeQuantizeAppendPagedKVCacheParams params;
     params.nnz = nnz;
     params.num_qo_heads = num_qo_heads;
@@ -1481,9 +1491,10 @@ cudaError_t RopeQuantizeAppendPagedMLACache(
     config.attrs = attribute;
     config.numAttrs = 1;
 
-    auto kernel = RopeQuantizeAppendPagedKVCacheKernel<INTERLEAVE, vec_size, /*bdx=*/1, DType,
-                                                       RoPEIdType, PagedKVIdType, QuantType,
-                                                       paged_kv_mla_t<QuantType, PagedKVIdType>>;
+    auto kernel =
+        RopeQuantizeAppendPagedKVCacheKernel<INTERLEAVE, vec_size, /*bdx=*/1, DType, RoPEIdType,
+                                             PagedKVIdType, QuantType, QuantType,
+                                             paged_kv_mla_t<QuantType, PagedKVIdType>>;
     DType* v_in_nullptr = nullptr;
     uint32_t num_kv_heads_1 = 1;
     size_t k_rope_in_stride_h_dup = k_rope_in_stride;

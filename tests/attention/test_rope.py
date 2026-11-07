@@ -1771,6 +1771,225 @@ def test_rope_quantize_fp8_append_paged_kv_cache_padding(
                 )
 
 
+def _rope_append_paged_kv_cache_ref(
+    rope_ref,
+    q_rope,
+    k_rope,
+    q_nope,
+    k_nope,
+    v,
+    pos_ids,
+    k_cache,
+    v_cache,
+    kv_indices,
+    kv_indptr,
+    batch_indices,
+    positions,
+    page_size,
+    kv_layout,
+    kv_scale,
+):
+    """Reference for rope_append_paged_kv_cache: writes K/V into the given caches.
+
+    ``rope_ref`` computes in float32 so K reaches the cache with a single rounding,
+    like the kernel. Returns Q in the input dtype and the (page, entry) slots written.
+    """
+    q_ref, k_ref = rope_ref.forward_native(
+        pos_ids,
+        torch.cat([q_rope, q_nope], dim=-1).float(),
+        torch.cat([k_rope, k_nope], dim=-1).float(),
+    )
+    v_ref = v.float()
+    if k_cache.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        bound = torch.finfo(k_cache.dtype).max
+        k_ref = (k_ref * kv_scale).clamp(-bound, bound)
+        v_ref = (v_ref * kv_scale).clamp(-bound, bound)
+    k_slots = k_cache if kv_layout == "NHD" else k_cache.transpose(1, 2)
+    v_slots = v_cache if kv_layout == "NHD" else v_cache.transpose(1, 2)
+    written = []
+    for i in range(batch_indices.numel()):
+        b = batch_indices[i].item()
+        if b < 0:  # CUDA graph padding
+            continue
+        pos = positions[i].item()
+        page = kv_indices[kv_indptr[b].item() + pos // page_size].item()
+        k_slots[page, pos % page_size] = k_ref[i].to(k_cache.dtype)
+        v_slots[page, pos % page_size] = v_ref[i].to(v_cache.dtype)
+        written.append((page, pos % page_size))
+    rope_dim = q_rope.shape[-1]
+    return (
+        q_ref[..., :rope_dim].to(q_rope.dtype),
+        q_ref[..., rope_dim:].to(q_rope.dtype),
+        written,
+    )
+
+
+@parametrize_product(
+    {
+        "num_qo_heads,num_kv_heads,rope_dim,no_rope_dim": [
+            (32, 8, 128, 0),  # Llama/Qwen style GQA
+            (32, 32, 64, 64),  # MHA with q_nope/k_nope present
+            (16, 4, 128, 64),  # no_rope_dim not a multiple of rope_dim
+        ],
+        "input_dtype": [torch.float16, torch.bfloat16],
+        "use_fp8_cache": [False, True],
+        "is_neox": [True, False],
+        "kv_layout": ["NHD", "HND"],
+        "enable_pdl": [True, False],
+        "rope_idtype": [torch.int32, torch.int64],
+    },
+    regular=pairwise_product_cases,
+)
+def test_rope_append_paged_kv_cache(
+    num_qo_heads,
+    num_kv_heads,
+    rope_dim,
+    no_rope_dim,
+    input_dtype,
+    use_fp8_cache,
+    is_neox,
+    kv_layout,
+    enable_pdl,
+    rope_idtype,
+):
+    """Prefill two live requests, then decode them in a CUDA-graph-padded batch.
+
+    Each append is checked against a full-cache reference: written slots must match,
+    and every other slot (including the padding tokens' targets and the slots after a
+    no-RoPE tail) must be bitwise unchanged.
+    """
+    device = "cuda:0"
+    torch.manual_seed(43)
+    head_dim = rope_dim + no_rope_dim
+    page_size = 16
+    # Always passed; it must only take effect for an FP8 cache.
+    kv_scale = 0.5
+    cache_dtype = torch.float8_e4m3fn if use_fp8_cache else input_dtype
+    rope_ref = FlashInferRotaryEmbedding(
+        head_dim, rope_dim, 4096, 10000, is_neox, torch.float32, device
+    )
+
+    # Two requests whose pages are scattered over a larger pool, so a write to the
+    # wrong page or entry lands in a slot the reference leaves untouched.
+    prefill_lens = [10, 21]
+    kv_indices = torch.tensor([3, 0, 5], dtype=torch.int32, device=device)
+    kv_indptr = torch.tensor([0, 1, 3], dtype=torch.int32, device=device)
+    num_pages = 7
+    if kv_layout == "NHD":
+        cache_shape = (num_pages, page_size, num_kv_heads, head_dim)
+    else:
+        cache_shape = (num_pages, num_kv_heads, page_size, head_dim)
+    k_cache = torch.randn(cache_shape, device=device).to(cache_dtype)
+    v_cache = torch.randn(cache_shape, device=device).to(cache_dtype)
+
+    def make_inputs(nnz):
+        return (
+            torch.randn(nnz, num_qo_heads, rope_dim, dtype=input_dtype, device=device),
+            torch.randn(nnz, num_kv_heads, rope_dim, dtype=input_dtype, device=device),
+            torch.randn(
+                nnz, num_qo_heads, no_rope_dim, dtype=input_dtype, device=device
+            ),
+            torch.randn(
+                nnz, num_kv_heads, no_rope_dim, dtype=input_dtype, device=device
+            ),
+            torch.randn(nnz, num_kv_heads, head_dim, dtype=input_dtype, device=device),
+        )
+
+    if use_fp8_cache:
+        cache_tol = dict(rtol=0.13, atol=1e-2)  # one e4m3 ulp
+    elif input_dtype == torch.float16:
+        cache_tol = dict(rtol=1e-3, atol=1e-3)
+    else:
+        cache_tol = dict(rtol=1e-2, atol=2e-2)
+    q_tol = (
+        dict(rtol=1e-3, atol=1e-3)
+        if input_dtype == torch.float16
+        else dict(rtol=1e-2, atol=2e-2)
+    )
+
+    def run_and_check(append_indptr, seq_lens, nnz, pos_ids):
+        batch_indices, positions = flashinfer.get_batch_indices_positions(
+            append_indptr, seq_lens, nnz
+        )
+        q_rope, k_rope, q_nope, k_nope, v = make_inputs(nnz)
+        k_ref, v_ref = k_cache.clone(), v_cache.clone()
+        q_rope_ref, q_nope_ref, written = _rope_append_paged_kv_cache_ref(
+            rope_ref,
+            q_rope,
+            k_rope,
+            q_nope,
+            k_nope,
+            v,
+            pos_ids,
+            k_ref,
+            v_ref,
+            kv_indices,
+            kv_indptr,
+            batch_indices,
+            positions,
+            page_size,
+            kv_layout,
+            kv_scale,
+        )
+        q_rope_out, q_nope_out = flashinfer.rope.rope_append_paged_kv_cache(
+            q_rope,
+            k_rope,
+            q_nope if no_rope_dim else None,
+            k_nope if no_rope_dim else None,
+            v,
+            rope_ref.cos_sin_cache,
+            pos_ids,
+            (k_cache, v_cache),
+            kv_indices,
+            kv_indptr,
+            batch_indices,
+            positions,
+            is_neox=is_neox,
+            kv_scale=kv_scale,
+            page_size=page_size,
+            kv_layout=kv_layout,
+            enable_pdl=enable_pdl,
+        )
+
+        real = batch_indices >= 0
+        torch.testing.assert_close(q_rope_out[real], q_rope_ref[real], **q_tol)
+        torch.testing.assert_close(q_nope_out[real], q_nope_ref[real], **q_tol)
+        mask = torch.zeros(num_pages, page_size, dtype=torch.bool, device=device)
+        for page, entry in written:
+            mask[page, entry] = True
+        for name, out, ref in (("K", k_cache, k_ref), ("V", v_cache, v_ref)):
+            out_slots = (out if kv_layout == "NHD" else out.transpose(1, 2)).float()
+            ref_slots = (ref if kv_layout == "NHD" else ref.transpose(1, 2)).float()
+            torch.testing.assert_close(
+                out_slots[mask], ref_slots[mask], msg=f"{name} written", **cache_tol
+            )
+            torch.testing.assert_close(
+                out_slots[~mask],
+                ref_slots[~mask],
+                rtol=0,
+                atol=0,
+                msg=f"{name} cache changed outside the appended slots",
+            )
+
+    # Step 1: prefill both requests.
+    run_and_check(
+        torch.tensor([0, 10, 31], dtype=torch.int32, device=device),
+        torch.tensor(prefill_lens, dtype=torch.int32, device=device),
+        sum(prefill_lens),
+        torch.cat([torch.arange(n, device=device) for n in prefill_lens]).to(
+            rope_idtype
+        ),
+    )
+    # Step 2: one decode token per request, padded to 4 tokens. Padding tokens get
+    # batch_indices == -1 from get_batch_indices_positions and must be skipped.
+    run_and_check(
+        torch.tensor([0, 1, 2], dtype=torch.int32, device=device),
+        torch.tensor([n + 1 for n in prefill_lens], dtype=torch.int32, device=device),
+        4,
+        torch.tensor(prefill_lens + [0, 0], dtype=rope_idtype, device=device),
+    )
+
+
 @pytest.mark.parametrize("num_tokens", [1, 19, 128, 199, 899, 2047])
 @pytest.mark.parametrize("input_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("quant_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])

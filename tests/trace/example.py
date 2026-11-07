@@ -161,6 +161,7 @@ rmsnorm_h4096.json
 rmsnorm_h7168.json
 rmsnorm_sigmoid_gate_nh32_h64.json
 rmsnorm_quant_h7168.json
+rope_append_paged_kv_cache_h8_kv2_rope64_ps16.json
 silu_and_mul_h16384.json
 silu_and_mul_mxfp8_experts_quantize_k8192.json
 silu_and_mul_nvfp4_quantize_k16384.json
@@ -3217,6 +3218,32 @@ with contextlib.suppress(Exception):
         _rqfap_cache,
         _rqfap_pos,
         (_rqfap_k_cache, _rqfap_v_cache),
+        _rqfap_kv_indices,
+        _rqfap_kv_indptr,
+        _rqfap_batch_indices,
+        _rqfap_positions,
+        is_neox=False,
+        page_size=_rqfap_PS,
+        kv_layout="NHD",
+    )
+
+# rope_append_paged_kv_cache (fused RoPE+append without Q quantization, GQA).
+# Reuses the inputs above with a bf16 cache.
+with contextlib.suppress(Exception):
+    from flashinfer.rope import rope_append_paged_kv_cache as _rapkv
+
+    _rapkv(
+        _rqfap_q_rope,
+        _rqfap_k_rope,
+        _rqfap_q_nope,
+        _rqfap_k_nope,
+        _rqfap_v,
+        _rqfap_cache,
+        _rqfap_pos,
+        (
+            torch.zeros_like(_rqfap_k_cache, dtype=torch.bfloat16),
+            torch.zeros_like(_rqfap_v_cache, dtype=torch.bfloat16),
+        ),
         _rqfap_kv_indices,
         _rqfap_kv_indptr,
         _rqfap_batch_indices,
