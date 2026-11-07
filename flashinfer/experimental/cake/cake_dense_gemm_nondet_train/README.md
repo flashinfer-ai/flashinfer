@@ -114,14 +114,32 @@ On some rows this module runs the deterministic package's fixed-order programs:
 
 *Table: the numerical, architecture and parallelism matrix of this module.*
 
+## Acceptance rules
+
+Two rules decide whether an output of this module may come from a program whose results can change from run to run.
+They apply to every program this package adds or keeps, on every supported architecture.
+
+- **Accuracy.** At every benchmarked shape (the rows of [Benchmark](#benchmark)), each output's error against an FP64
+  reference of the same operands stays within 1.1 times the median error of the reference implementation (FlashInfer
+  commit `2e989556`; flashinfer-ai/flashinfer#8946) at that shape.  This holds for random normal inputs and for
+  adversarial inputs: long sums, cancellation, values concentrated in a few elements, and values near the largest
+  magnitude of the dtype.  Partial sums stay in FP32 or wider, and each output element is rounded once.  The
+  absolute budgets of the table above apply as well.
+- **Speed.** An output may vary from run to run only where that makes the module at least 3 % faster at the shape:
+  the package's own time for the shape (its forward, input gradient and weight gradient through the public entry
+  points) must drop by at least 3 % against the program whose result repeats bit for bit.  Everywhere else the
+  output repeats bit for bit.  The benchmark checks each operation against a ratio of 0.97 (`ACCEPT_RATIO`) as a
+  proxy for this rule; a row it accepts is checked again on the package time of its shape.
+
 ## Planners and rule tables
 
 A planner decides, per row and device, whether a call runs this package's program and with which
 parameters; a row it leaves runs the deterministic program (`cake_dense_gemm_nondet_train_projection_plan` / `cake_dense_gemm_nondet_train_router_plan`
 say which).  Only measured rows carry a program: a row runs this package's program where that program was faster
 than the deterministic package's shipped plan of the row in every measurement run: a one-sided paired sign test
-(p < 0.05) with a median time ratio below 0.99, both in eager launches and in CUDA graph replays, and no more than
-3 % slower than that plan next to a kernel holding 8, 16 or 32 SMs on another stream.  A `None` entry is a measured
+(p < 0.05) with a median time ratio below 0.99 (the bar of the verdicts shipped in these tables; a new verdict needs
+a ratio below 0.97, see [Acceptance rules](#acceptance-rules)), both in eager launches and in CUDA graph replays,
+and no more than 3 % slower than that plan next to a kernel holding 8, 16 or 32 SMs on another stream.  A `None` entry is a measured
 row that missed; a row without an entry was not measured.  Both run the deterministic program.
 
 The K1 verdicts were measured at 16172 to 16384 tokens.  Those of `K1_SPLIT_RULES` hold at every token count their split
@@ -1141,13 +1159,57 @@ route takes, without building the transposed operand, routing the row or buildin
 routed again when a router table or `ROUTES` changes (with a table rebound to a plain `dict`, every call takes the
 full path).
 
+## Optimized and prebuilt paths
+
+- **Prepared launches.**  `cake_dense_gemm_nondet_train_projection_prepare`,
+  `cake_dense_gemm_nondet_train_projection_wgrad_prepare` and `cake_dense_gemm_nondet_train_router_prepare` plan
+  once and return a launch whose call issues only the kernels: no planning, no allocation and no host
+  synchronization.  Use them in a training step that runs the same shapes many times, and capture them into a CUDA
+  graph.
+- **Convenience entry points.**  The entry points of [Names](#names) cache their plans and workspace per (device,
+  stream), so the second and later calls with the same geometry skip planning.  Warm a call up once on the stream
+  before capturing it into a CUDA graph (see the CUDA graphs row of the table above).
+- **Prebuilt libraries.**  Each program loads from `aot/<library>.so` when the package ships it, and otherwise
+  FlashInfer's JIT builds it from `build.json` on its first use (this needs `nvcc`).  To build the programs ahead
+  of time in a FlashInfer tree, pass `cake_jit.specs_for_arch(arch)` of this package and of the deterministic
+  package to `flashinfer.jit.build_jit_specs`.  A vendoring build compiles the `build.json` entries into `aot/`
+  and writes the sidecar `aot/build_info.json` (see `cake_build.py`);
+  `scripts/check_cake_build_manifests.py --vendored-gate --package cake_dense_gemm_nondet_train --arch <arch> --keep
+  --work-dir <dir>` is the reference builder and leaves the vendored copies with their `aot/` libraries in the work directory.
+  `cake_build.library_path(name)` says which library a program loads.
+
 ## Benchmark
 
 `benchmarks/bench_cake_dense_gemm_nondet_train.py` times every row of the deterministic family's benchmark with the
-arms `det` (the deterministic package's prepared launch), `atomic` (this module), `atomic_p1` (the same
-program at one split), `cublas` (`torch.matmul`), `cublaslt` (a cuBLASLt heuristic sweep) and `bf16x9` (cuBLAS FP32
-in `CUBLAS_FP32_EMULATED_BF16X9_MATH`, the router rows), in paired groups, eager and in CUDA graphs; `--resident`
-re-times `det` and `atomic` next to a kernel holding `--resident-sms` SMs on another stream.
+arms `det` (the deterministic package's prepared launch), `atomic` (this module, prepared), `atomic_p1` (the same
+program at one split), `atomic_shim` (the operation's public entry point, the package path), `cublas`
+(`torch.matmul`), `cublaslt` (a cuBLASLt heuristic sweep) and `bf16x9` (cuBLAS FP32 in
+`CUBLAS_FP32_EMULATED_BF16X9_MATH`, the router rows), in paired groups, eager and in CUDA graphs; `--resident`
+re-times `det` and `atomic` next to a kernel holding `--resident-sms` SMs on another stream.  Each row has a class:
+`large` (in and out features both above 1024), `small-output` (at most 1024 out features), `batched` (the MLA head
+batch) or `router`.  Before timing, every arm runs `--bit-runs` times (default 5) and the row records whether its
+outputs repeated bit for bit.  The CSV names each row's family, class, operation, K, N, T, output dtype,
+architecture and SM count; the markdown report adds the plain cuBLAS and package-path latencies and a per-class
+summary; the header records whether CUPTI timed every call (`cupti_used`).  A row is accepted when every paired
+group is faster than `det` and the median ratio is below 0.97, in eager and in graph.
+
+## Tested versions
+
+The benchmark of this package (every row, eager and CUDA graph, at FlashInfer commit `fdd17bae`) ran on these GPUs:
+
+| GPU | architecture | SMs | driver (CUDA driver API) |
+|---|---|---|---|
+| NVIDIA B200 | `sm_100a` | 148 | 580.82.07 (13.4) |
+| NVIDIA GB200 | `sm_100a` | 152 | 580.126.20 (13.4) |
+| NVIDIA GB300 | `sm_103a` | 152 | 580.159.03 (13.4) |
+| NVIDIA R200 | `sm_107a` | 212 | 620.43 (13.5) |
+
+*Table: the GPUs of the measured benchmark runs.*
+
+Software: CUDA toolkit 13.4 (`nvcc` V13.4.92, builds the programs), PyTorch 2.14.1+cu130 (CUDA 13.0 runtime), cuBLAS
+and cuBLASLt 13.8.0 (the benchmark's library arms), Python 3.12.15, apache-tvm-ffi 0.1.15.post0, cuda-bindings
+13.5.0 and cupti-python 13.4.0 (the benchmark's timer).  The minimum toolkits per architecture are in the
+architectures row of the table above.
 
 ## Helpers of this package
 
