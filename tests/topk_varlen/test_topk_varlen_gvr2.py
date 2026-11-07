@@ -28,6 +28,8 @@ tie-interchangeable EXACT top-K:
 The route-dispatch fuzz tests are CPU-only (pure-Python host dispatch).
 """
 
+import math
+
 import pytest
 import torch
 
@@ -190,6 +192,19 @@ def _make_varlen_case(kv, next_n, cr, top_k, seed, msl_c=None):
 
 
 def _run_gvr2(logits, seq_lens, top_k, pre_idx, **kw):
+    """gvr_2 through the public API. Outputs the caller does not pass are
+    poisoned first (indices -7, values NaN): the API allocates with torch.empty,
+    which can hand back a block already holding a valid answer, so a slot the
+    kernel leaves unwritten could otherwise pass the checks."""
+    shape = (logits.shape[0], top_k)
+    if "out_indices" not in kw:
+        kw["out_indices"] = torch.full(
+            shape, -7, dtype=torch.int32, device=logits.device
+        )
+    if kw.get("return_values") and "out_values" not in kw:
+        kw["out_values"] = torch.full(
+            shape, float("nan"), dtype=logits.dtype, device=logits.device
+        )
     return flashinfer.top_k_varlen(
         logits, seq_lens, top_k, pre_idx=pre_idx, backend="gvr_2", **kw
     )
@@ -519,23 +534,53 @@ def test_gvr2_workspace_override():
 # ---------------------------------------------------------------------------
 
 
-def _assert_family(rows, msl_c, top_k, next_n, cr, want, hint_free=False):
-    """The varlen launcher must admit the same family the free route picks."""
-    key = (
+def _launcher_key(
+    rows, msl_c, top_k, next_n, cr, hint_free=False, n_env=None, page_shift=None
+):
+    """The varlen launcher cache key of a decode launch. ``n_env`` is the launch
+    envelope in columns (default: the buffer width ``msl_c``; a decode
+    ``max_window_len`` bound sets it below that); ``page_shift`` is log2 of the
+    page size of paged output (None: unpaged)."""
+    return (
         rows,
         msl_c,
         top_k,
-        msl_c,
+        msl_c if n_env is None else n_env,
         next_n,
         cr,
         hint_free,
-        None,  # page_shift: unpaged output
+        page_shift,
         _host._arch_token(),
         _host._sm_count(),
     )
+
+
+def _forget_launcher(*key_args, **key_kw):
+    """Drop the cached launcher of this key (``_launcher_key``'s arguments) right
+    before a launch whose family the test asserts. The cache is process-wide:
+    without this, a key an earlier test built would satisfy _assert_family even
+    when this launch planned another."""
+    _host._VARLEN_CACHE.pop(_launcher_key(*key_args, **key_kw), None)
+
+
+def _b200_family(family):
+    """``family`` on a 148-SM part, where the case tables' plans hold (B200);
+    None elsewhere: another SM count may plan the case onto a different family
+    that is just as exact, so _assert_family then checks the key only."""
+    return family if _host._sm_count() == 148 else None
+
+
+def _assert_family(
+    rows, msl_c, top_k, next_n, cr, want, hint_free=False, n_env=None, page_shift=None
+):
+    """The varlen launcher must admit the same family the free route picks.
+    Call _forget_launcher with the same key first: the key must then be one
+    the launch in between built. ``want`` None checks the key only."""
+    key = _launcher_key(rows, msl_c, top_k, next_n, cr, hint_free, n_env, page_shift)
     lc = _host._VARLEN_CACHE.get(key)
     assert lc is not None, f"launcher not cached for {key}"
-    assert lc[0] == want, f"family {lc[0]} != {want} for {key}"
+    if want is not None:
+        assert lc[0] == want, f"family {lc[0]} != {want} for {key}"
 
 
 @requires_gvr2
@@ -584,6 +629,7 @@ def test_gvr2_family_parity_and_oracle(rows, msl_c, top_k, next_n, cr, family):
     logits, seq_lens, pre_idx, n_r, _ = _make_varlen_case(
         kv, next_n, cr, top_k, seed=rows, msl_c=msl_c
     )
+    _forget_launcher(rows, msl_c, top_k, next_n, cr)
     indices, _ = _run_gvr2(
         logits, seq_lens, top_k, pre_idx, next_n=next_n, compress_ratio=cr
     )
@@ -660,6 +706,816 @@ def test_gvr2_warmup_then_capture():
     g.replay()
     torch.cuda.synchronize()
     _check_varlen_rows(logits, out_i, _row_valid_lens(kv, batch, 1, 1, msl), top_k)
+
+
+# ---------------------------------------------------------------------------
+# rows far shorter than the launch envelope (capacity-sized buffers)
+# ---------------------------------------------------------------------------
+# A serving stack captures its CUDA graphs on a logits buffer as wide as the
+# longest row it may ever hold (the capacity), while the rows of a replay are
+# usually far shorter. The launch plan then comes from the capacity and every
+# row runs it with its own length. The cases below reach each family's
+# capacity plan; the row lengths walk the edges those plans branch on per row
+# (top_k, the 2 * top_k small-row sample gate, the 4096 / 8192 / 16384 sample
+# caps) and, unlike the family parity cases above, no row is pinned to the
+# capacity.
+
+_ENVELOPE_CASES = [
+    # rows, capacity (columns), top_k, next_n, cr, family at the capacity
+    (100, 131072, 512, 1, 1, "main"),  # one-wave 1024-thread slab
+    (148, 262144, 1024, 1, 4, "main"),  # the same at cr=4 (1M-token graph)
+    (40, 131072, 2048, 1, 1, "main"),  # K=2048 unsplit slab, 33-74 rows
+    (4, 262144, 512, 1, 1, "main"),  # SPLIT slab, R=37
+    (8, 1048576, 2048, 1, 1, "main"),  # SPLIT slab, R=18
+    (16, 131072, 1024, 2, 1, "main"),  # SPLIT slab, R=9, next_n rows
+    (64, 131072, 512, 1, 1, "clus"),  # 2-CTA cluster split
+    (24, 262144, 1024, 1, 4, "clus"),  # 4-CTA cluster split
+    (8, 65536, 512, 1, 1, "reg_clus"),  # clustered register-resident
+    (200, 65536, 512, 1, 1, "main"),  # two-CTA (512, 8, 2) slab
+    (320, 32768, 2048, 1, 1, "main"),  # (256, 8, 4) slab
+]
+
+
+def _envelope_cols(batch, cap_c, top_k, seed):
+    """Live column counts far below ``cap_c``: the per-row branch edges of the
+    streaming plans first, then random counts up to min(cap_c, 32768)."""
+    edges = [
+        2 * top_k + 1,  # the first count the small-row sample gate admits
+        4100,  # just above each sample cap
+        8196,
+        16388,
+        2 * top_k,
+        top_k + 1,
+        4096,
+        8192,
+        16384,
+        2 * top_k + 4,
+        top_k,
+        1,
+        0,
+    ]
+    gen = torch.Generator().manual_seed(seed)
+    cols = edges[:batch]
+    while len(cols) < batch:
+        cols.append(int(torch.randint(1, min(cap_c, 32768) + 1, (1,), generator=gen)))
+    return cols
+
+
+def _refill(logits, n_r, gen):
+    """New scores in every row, +3e38 poison past each row's live count."""
+    logits.copy_(torch.randn(logits.shape, generator=gen, device=_DEV) - 2.0)
+    for r, n in enumerate(n_r):
+        logits[r, n:] = 3e38
+
+
+@requires_gvr2
+@pytest.mark.parametrize("rows,cap_c,top_k,next_n,cr,family", _ENVELOPE_CASES)
+@pytest.mark.parametrize("hinted", [False, True], ids=["hint_free", "hinted"])
+def test_gvr2_rows_far_shorter_than_envelope(
+    rows, cap_c, top_k, next_n, cr, family, hinted
+):
+    batch = rows // next_n
+    cols = _envelope_cols(batch, cap_c, top_k, seed=rows + cap_c + top_k)
+    kv = [c * cr for c in cols]
+    logits, seq_lens, pre_idx, n_r, _ = _make_varlen_case(
+        kv, next_n, cr, top_k, seed=rows, msl_c=cap_c
+    )
+    _forget_launcher(rows, cap_c, top_k, next_n, cr, hint_free=not hinted)
+    indices, _ = _run_gvr2(
+        logits,
+        seq_lens,
+        top_k,
+        pre_idx if hinted else None,
+        next_n=next_n,
+        compress_ratio=cr,
+    )
+    _assert_family(rows, cap_c, top_k, next_n, cr, family, hint_free=not hinted)
+    _check_varlen_rows(logits, indices, n_r, top_k)
+
+
+_REPLAY_CASES = [
+    # rows, capacity (columns), top_k, decode bound (tokens), family of the launch
+    (100, 131072, 512, None, "main"),  # one-wave 1024-thread slab
+    (4, 262144, 1024, None, "main"),  # SPLIT slab, R=37
+    (64, 131072, 512, None, "clus"),  # 2-CTA cluster split
+    (8, 65536, 2048, None, "reg_clus"),  # clustered register-resident, K > 1024
+    (200, 65536, 512, None, "main"),  # two-CTA (512, 8, 2) slab
+    (64, 1048576, 512, 16384, "reg"),  # V4.1 c1 buffer, the <= 16K-token graphs
+]
+
+
+@requires_gvr2
+@pytest.mark.parametrize("rows,cap_c,top_k,bound,family", _REPLAY_CASES)
+@pytest.mark.parametrize("hinted", [False, True], ids=["hint_free", "hinted"])
+def test_gvr2_graph_replay_lengths_change_after_capture(
+    rows, cap_c, top_k, bound, family, hinted
+):
+    """One capture at the capacity (or under a decode bound, which plans the
+    launch for the bound and which every replay keeps to), then replays whose
+    lengths were rewritten in place: all far below the capacity, full-width
+    rows mixed with short ones, every row short (identity path, empty rows
+    included), and a random draw. Scores are redrawn and the output poisoned
+    before each replay."""
+    gen = torch.Generator(device=_DEV).manual_seed(rows + top_k)
+    hgen = torch.Generator().manual_seed(rows)
+    cap = cap_c if bound is None else bound  # the longest row a replay may hold
+
+    def draw():
+        return [
+            int(torch.randint(0, cap + 1, (1,), generator=hgen)) for _ in range(rows)
+        ]
+
+    cols = draw()
+    logits = torch.empty(rows, cap_c, device=_DEV)
+    _refill(logits, cols, gen)
+    seq_lens = torch.tensor(cols, dtype=torch.int32, device=_DEV)
+    pre_idx = None
+    if hinted:
+        pre_idx = torch.randint(
+            0, 1000, (rows, top_k), generator=gen, device=_DEV, dtype=torch.int32
+        )
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    kw = dict(out_indices=out)
+    if bound is not None:
+        kw["max_window_len"] = bound
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    _forget_launcher(rows, cap_c, top_k, 1, 1, hint_free=not hinted, n_env=bound)
+    with torch.cuda.stream(s):  # eager warm-up on the capturing stream
+        _run_gvr2(logits, seq_lens, top_k, pre_idx, **kw)
+    torch.cuda.synchronize()
+    _assert_family(rows, cap_c, top_k, 1, 1, family, hint_free=not hinted, n_env=bound)
+    _check_varlen_rows(logits, out, cols, top_k)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(s), torch.cuda.graph(g, stream=s):
+        _run_gvr2(logits, seq_lens, top_k, pre_idx, **kw)
+    torch.cuda.current_stream().wait_stream(s)
+    short = [min(c, cap) for c in _envelope_cols(rows, cap, top_k, seed=rows)]
+    mixed = [cap if r % 3 == 0 else c for r, c in enumerate(short)]
+    tiny = [(r * 37) % (top_k + 1) for r in range(rows)]
+    for cols in (short, mixed, tiny, draw()):
+        seq_lens.copy_(torch.tensor(cols, dtype=torch.int32, device=_DEV))
+        _refill(logits, cols, gen)
+        out.fill_(-7)
+        g.replay()
+        torch.cuda.synchronize()
+        _check_varlen_rows(logits, out, cols, top_k)
+
+
+# ---------------------------------------------------------------------------
+# hard rows on the per-row branches of the capacity-sized launches
+# ---------------------------------------------------------------------------
+# Rows on both edges of the branches a capacity-sized launch takes per row:
+# the hint-free small-row sample of the one-CTA-per-row slabs (2k < n <=
+# SCAP) and rows at, below and beyond a decode bound. The scores drive the
+# sample, the retry ladder and the degenerate paths (tie floods, +inf floods
+# and +inf in the sampled head, whole -inf rows and rows with fewer than top_k
+# finite scores, denormals, ramps); paged output is mapped back through its
+# injective page table and checked like the unpaged output. Floods of more
+# +inf than top_k are covered separately (test_gvr2_streaming_flood*).
+
+_HARD_PATTERNS = [
+    "ties",
+    "two_values",
+    "posinf_k",
+    "posinf_lt_k",
+    "posinf_head",
+    "neginf_row",
+    "neginf_most",
+    "denormal",
+    "ramp_up",
+    "quantized4",
+]
+_PAGED_PATTERNS = ["ties", "posinf_k", "neginf_most"]
+
+
+def _with_patterns(cases):
+    """Every pattern for unpaged output, one tie, +inf and -inf pattern for
+    paged output (the last field of each case is its page size)."""
+    return [
+        (*case, pattern)
+        for case in cases
+        for pattern in (_HARD_PATTERNS if case[-1] is None else _PAGED_PATTERNS)
+    ]
+
+
+def _hard_logits(pattern, n_r, width, top_k, seed):
+    """``pattern`` scores in each row's live prefix, +3e38 poison past it."""
+    gen = torch.Generator(device=_DEV).manual_seed(seed)
+    x = torch.randn(len(n_r), width, generator=gen, device=_DEV)
+    for r, n in enumerate(n_r):
+        row = x[r, :n]
+        pos = torch.randperm(n, generator=gen, device=_DEV)
+        if pattern == "ties":
+            row.fill_(1.5)
+        elif pattern == "two_values":
+            row.copy_((torch.rand(n, generator=gen, device=_DEV) < 0.3) * 3.0 - 1.0)
+        elif pattern == "posinf_k":  # the top-k is exactly the +inf set
+            row[pos[:top_k]] = float("inf")
+        elif pattern == "posinf_lt_k":
+            row[pos[: top_k // 4]] = float("inf")
+        elif pattern == "posinf_head":  # in the sample's and identity's first lines
+            row[:8] = float("inf")
+        elif pattern == "neginf_row":
+            row.fill_(float("-inf"))
+        elif pattern == "neginf_most":  # fewer than top_k finite scores
+            row[pos[top_k // 2 :]] = float("-inf")
+        elif pattern == "denormal":
+            row.mul_(1e-40)
+            row[: top_k // 2] = 1e-38
+        elif pattern == "ramp_up":  # the top-k is the row's last k columns
+            row.copy_(torch.arange(n, device=_DEV, dtype=torch.float32) / max(n, 1))
+        elif pattern == "quantized4":
+            lv = torch.tensor([-2.0, -0.5, 0.5, 2.0], device=_DEV)
+            row.copy_(lv[torch.randint(0, 4, (n,), generator=gen, device=_DEV)])
+        x[r, n:] = 3e38
+    return x
+
+
+def _injective_page_table(batch, width, page_size, which=0):
+    """Page table q -> q * pages + (p * mult) % pages (injective per request,
+    so paged output maps back to columns) and the inverse map; ``which``
+    picks another multiplier coprime to the page count (another table)."""
+    pages = (width + page_size - 1) // page_size
+    mults = [m for m in (7, 5, 11, 13, 17, 19) if math.gcd(m, pages) == 1]
+    mult = mults[which % len(mults)]
+    p = torch.arange(pages, device=_DEV, dtype=torch.int64)
+    base = torch.arange(batch, device=_DEV, dtype=torch.int64).unsqueeze(1) * pages
+    pt = (base + (p * mult) % pages).to(torch.int32).contiguous()
+
+    def unpage(out, next_n):
+        shift = page_size.bit_length() - 1
+        o = out.to(torch.int64)
+        req = (torch.arange(out.shape[0], device=_DEV) // next_n).unsqueeze(1)
+        page = ((o >> shift) - req * pages) * pow(mult, -1, pages) % pages
+        col = (page << shift) | (o & (page_size - 1))
+        return torch.where(out >= 0, col, o).to(torch.int32)
+
+    return pt, unpage
+
+
+def _run_hard(logits, kv, top_k, n_r, want, next_n=1, cr=1, page_size=None, **kw):
+    """One hint-free launch (paged when ``page_size`` is given): family pin,
+    then every row exact against its first ``n_r[r]`` columns. Returns the
+    launch's cached launcher."""
+    rows, width = logits.shape
+    extra = {}
+    unpage = None
+    if page_size is not None:
+        pt, unpage = _injective_page_table(rows // next_n, width, page_size)
+        extra = dict(page_table=pt, page_size=page_size)
+    seq_lens = torch.tensor(kv, dtype=torch.int32, device=_DEV)
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    bound = kw.get("max_window_len")
+    key_kw = dict(
+        hint_free=True,
+        n_env=None if bound is None else min(bound // cr, width),
+        page_shift=None if page_size is None else page_size.bit_length() - 1,
+    )
+    _forget_launcher(rows, width, top_k, next_n, cr, **key_kw)
+    _run_gvr2(
+        logits,
+        seq_lens,
+        top_k,
+        None,
+        out_indices=out,
+        next_n=next_n,
+        compress_ratio=cr,
+        **extra,
+        **kw,
+    )
+    torch.cuda.synchronize()
+    _assert_family(rows, width, top_k, next_n, cr, want, **key_kw)
+    _check_varlen_rows(
+        logits, out if unpage is None else unpage(out, next_n), n_r, top_k
+    )
+    return _host._VARLEN_CACHE[_launcher_key(rows, width, top_k, next_n, cr, **key_kw)]
+
+
+_SAMPLE_GATE_CASES = [
+    # rows, width, top_k, SCAP of the slab the width launches, page size; widths
+    # below the register-path envelope gate (_MAIN_REG_ENV): from it on, these
+    # rows take the in-kernel register path (test_gvr2_main_register_path_*)
+    (148, 130944, 512, 16384, None),  # one-wave 1024-thread slab
+    (75, 65540, 512, 16384, None),  # the same slab: first rows / first width
+    (128, 130944, 1024, 16384, None),  # the same at K = 1024 (aim 7k/4: gate at 2k)
+    (64, 130944, 2048, 16384, None),  # K = 2048: the slab from 33 rows on
+    (128, 130944, 1024, 16384, 64),  # paged: DSv4 page size
+    (149, 65472, 512, 4096, None),  # two-CTA (512, U 8, MINB 2) slab
+    (296, 65472, 1024, 4096, None),  # the same at K = 1024 (aim 7k/4)
+    (297, 32768, 1024, 4096, None),  # (256, U 8, MINB 4) slab
+    (148, 130944, 512, 16384, 128),  # paged: V4.1 page size
+    (296, 65472, 1024, 4096, 64),  # paged: DSv4 page size
+    (297, 32768, 1024, 4096, 1),  # paged: one token per page
+]
+
+
+@requires_gvr2
+@pytest.mark.parametrize(
+    "rows,width,top_k,scap,page_size,pattern", _with_patterns(_SAMPLE_GATE_CASES)
+)
+def test_gvr2_small_row_sample_hard_rows(rows, width, top_k, scap, page_size, pattern):
+    """Hint-free rows on both edges of the small-row sample (2k < n <= SCAP),
+    of SCAP itself and on the 4k and 8k marks on every one-CTA-per-row slab
+    that samples them."""
+    assert _main_reg_cap(rows, width, top_k) == 0  # streamed, not register rows
+    edges = [2 * top_k + d for d in range(-1, 6)] + [scap + d for d in (-1, 0, 1, 3, 4)]
+    edges += [top_k, top_k + 1, 1, 0, scap // 2 + 3, 4 * top_k, 4 * top_k + 1]
+    edges += [8192, 8196]
+    gen = torch.Generator().manual_seed(rows + width + top_k)
+    n_r = [
+        edges[r]
+        if r < len(edges)
+        else int(torch.randint(2 * top_k + 1, scap + 1, (1,), generator=gen))
+        for r in range(rows)
+    ]
+    logits = _hard_logits(pattern, n_r, width, top_k, seed=rows + top_k)
+    lc = _run_hard(logits, n_r, top_k, n_r, "main", page_size=page_size)
+    if _host._sm_count() == 148:  # the B200 plan samples these rows (sd_en > 0)
+        assert lc[3][3] > 0, lc[3]
+
+
+# Streaming rows whose crossing refine narrows a flood in key space: more than
+# top_k copies of +inf, or of a finite score above 2^127, next to a few finite
+# scores. The bracket is then infinite (+inf in it) or overflows (the sentinel
+# bracket that replaces a collapsed one), so the candidates share one bin and the
+# refine's key-space narrowing ranks the staged set from its least key. The bin
+# holding the flood's keys could end past 0xFFFFFFFF; the wrapped upper bound
+# stopped the descent below them and the row came back with every slot unwritten.
+@requires_gvr2
+@pytest.mark.parametrize("value", [float("inf"), 3.1e38], ids=["posinf", "huge"])
+@pytest.mark.parametrize(
+    "rows,width,top_k",
+    [(148, 130944, 512), (160, 65472, 512), (75, 65540, 1024), (64, 65536, 2048)],
+    ids=["onewave512", "cta512", "onewave1024", "onewave2048"],
+)
+def test_gvr2_streaming_flood(rows, width, top_k, value):
+    """Rows of k + 2 .. 2k + 1 columns, n - 4 copies of the flood value and four
+    randn scores, on the one-CTA streaming slabs below the register-path gate
+    (1024 threads at K = 512 / 1024 / 2048, 512 threads at K = 512)."""
+    gen = torch.Generator(device=_DEV).manual_seed(rows + top_k)
+    k = top_k
+    lens = [k + 2, 3 * k // 2 + 1, 3 * k // 2 + 7, 2 * k - 1, 2 * k + 1]
+    n_r = [lens[r % len(lens)] for r in range(rows)]
+    logits = torch.randn(rows, width, generator=gen, device=_DEV)
+    for r, n in enumerate(n_r):
+        pos = torch.randperm(n, generator=gen, device=_DEV)[: n - 4]
+        logits[r, pos] = value
+        logits[r, n:] = 3e38
+    _run_hard(logits, n_r, top_k, n_r, "main")
+    # on a 148-SM B200 these launches carry no register path: the rows streamed
+    if _host._sm_count() == 148:
+        assert _main_reg_cap(rows, width, top_k) == 0
+
+
+@requires_gvr2
+@pytest.mark.parametrize(
+    "rows,width,top_k,lens,family",
+    [
+        (4, 262144, 512, (140001, 150002, 200003, 262143), "main"),
+        (32, 262144, 512, (20001, 40002, 60003, 100003), "clus"),
+        (64, 262144, 1024, (20001, 40002, 60003, 100003), "clus"),
+    ],
+    ids=["split", "clus4", "clus2"],
+)
+def test_gvr2_streaming_flood_neginf_rows(rows, width, top_k, lens, family):
+    """The same refine on streaming rows of the SPLIT and clus engines: -inf
+    except the first k columns (k - 4 copies of +inf and four randn scores, so
+    the hint-free bracket is infinite) and k / 4 more +inf further out, so the
+    crossing set is the flood and the finite scores."""
+    gen = torch.Generator(device=_DEV).manual_seed(rows + top_k)
+    n_r = [lens[r % len(lens)] for r in range(rows)]
+    logits = torch.full((rows, width), float("-inf"), device=_DEV)
+    for r, n in enumerate(n_r):
+        head = torch.full((top_k,), float("inf"), device=_DEV)
+        fin = torch.randn(4, generator=gen, device=_DEV)
+        head[torch.randperm(top_k, generator=gen, device=_DEV)[:4]] = fin
+        logits[r, :top_k] = head
+        far = torch.randperm(n - top_k, generator=gen, device=_DEV)[: top_k // 4]
+        logits[r, top_k + far] = float("inf")
+        logits[r, n:] = 3e38
+    _run_hard(logits, n_r, top_k, n_r, family)
+
+
+_ONECTA_CASES = [
+    # rows, width, top_k, page size: one-CTA-per-row slabs off the big regime
+    # (aim 7k/4), at widths that compile the register path in (longer rows stream)
+    (160, 262144, 512, None),  # 512 threads, two CTAs per SM
+    (160, 262144, 1024, None),
+    (160, 163840, 2048, None),  # KPT 4
+    (300, 131072, 1024, None),  # 256 threads: no register path, every row streams
+    (160, 262144, 512, 64),  # paged: DSv4 page size
+    (300, 131072, 512, 128),  # paged: V4.1 page size
+]
+
+
+@requires_gvr2
+@pytest.mark.parametrize(
+    "rows,width,top_k,page_size,pattern", _with_patterns(_ONECTA_CASES)
+)
+def test_gvr2_onecta_streamed_rows(rows, width, top_k, page_size, pattern):
+    """One-CTA slab rows off the big regime under hard scores: rows just past the
+    register path, around the crossover of the 7k/4 aim with sqrt(6 n) (K = 512:
+    133,803 columns), multi-tile and full-width rows, and short rows."""
+    cols = [8193, 8195, 8199, 16385, 32771, 98304, 133802, 133804, 131075, width]
+    cols += [top_k, top_k + 1, 2 * top_k + 1, 0]
+    n_r = [min(cols[r % len(cols)], width) for r in range(rows)]
+    logits = _hard_logits(pattern, n_r, width, top_k, seed=rows + width + top_k)
+    _run_hard(logits, n_r, top_k, n_r, "main", page_size=page_size)
+
+
+_ONECTA_WAVE_CASES = [
+    # rows, width, top_k, page size: the one-wave 1024-thread slab (big regime,
+    # R = 1) at K >= 1024 (aim 7k/4), at widths that compile the register path in
+    (128, 262144, 1024, None),
+    # past the aim's crossover with sqrt(6 n): 535,210 columns
+    (80, 540672, 1024, None),
+    (64, 262144, 2048, None),  # K = 2048: the slab from 33 rows on (KPT 2)
+    (144, 163840, 2048, 64),  # paged: DSv4 page size
+]
+
+
+@requires_gvr2
+@pytest.mark.parametrize(
+    "rows,width,top_k,page_size,pattern", _with_patterns(_ONECTA_WAVE_CASES)
+)
+def test_gvr2_onecta_wave_slab_rows(rows, width, top_k, page_size, pattern):
+    """The one-wave 1024-thread slab at K >= 1024 aims at 7k/4 (the launch's tail
+    scalar) and ranks exactly under hard scores: rows just past the register path,
+    32K-column rows and a few columns more, multi-tile and full-width rows, rows
+    around the aim's crossover with sqrt(6 n) (K = 1024), and short rows."""
+    cols = [16385, 16388, 32768, 32773, 65540, 131077, 535209, 535212, width]
+    cols += [top_k, top_k + 1, 2 * top_k + 1, 0]
+    n_r = [min(cols[r % len(cols)], width) for r in range(rows)]
+    logits = _hard_logits(pattern, n_r, width, top_k, seed=rows + width + top_k)
+    lc = _run_hard(logits, n_r, top_k, n_r, "main", page_size=page_size)
+    assert lc[2][5] == 1, lc  # one CTA per row
+    assert lc[3][0] == (7 * top_k) // 4, lc[3]  # aim_base
+
+
+_BOUND_EDGE_CASES = [
+    # rows, width, bound (tokens), top_k, cr, next_n, family at the bound
+    (16, 1048576, 512, 512, 1, 1, "reg"),  # bound = top_k: every row is short
+    (16, 1048576, 513, 512, 1, 1, "reg"),  # bound = top_k + 1
+    (16, 262144, 16383, 512, 4, 1, "reg"),  # not a multiple of cr: 4095 columns
+    (16, 262144, 16386, 1024, 4, 2, "reg"),  # ... with next_n rows
+    (4, 262144, 65536, 1024, 4, 1, "reg"),  # cr 4 on a 1M-token buffer: 16K columns
+    (8, 262144, 131072, 512, 4, 1, "reg_clus"),  # ... 32K columns
+    (8, 1048576, 65536, 512, 1, 1, "reg_clus"),
+    (32, 1048576, 262144, 512, 1, 1, "clus"),  # one-chunk and longer rows
+    (48, 262144, 262147, 512, 4, 3, "clus"),  # 65536 columns, three rows per request
+    (128, 1048576, 131072, 512, 1, 1, "main"),  # one-wave slab, sampled band
+    (4, 1048576, 262144, 512, 1, 1, "main"),  # SPLIT slab
+]
+
+
+@requires_gvr2
+@pytest.mark.parametrize("page_size", [None, 128], ids=["unpaged", "paged128"])
+@pytest.mark.parametrize("rows,width,bound,top_k,cr,next_n,family", _BOUND_EDGE_CASES)
+def test_gvr2_decode_bound_edges(
+    rows, width, bound, top_k, cr, next_n, family, page_size
+):
+    """Rows at, just below and beyond a decode bound in every family the
+    bound selects: requests within it rank in full, longer ones over their
+    first ``bound // cr`` columns (the documented truncation), never past the
+    buffer, unpaged and paged. Only gvr_2 uses the bound: radix_cutlass ranks
+    every request in full."""
+    nb = bound // cr
+    kv = [bound, bound - 1, bound + 1, 2 * bound, width * cr, bound - cr, 0, 1]
+    kv += [(top_k + 1) * cr + next_n - 1, top_k * cr, (2 * top_k + 1) * cr + next_n]
+    gen = torch.Generator().manual_seed(rows + bound)
+    while len(kv) < rows // next_n:
+        kv.append(int(torch.randint(0, bound + 1, (1,), generator=gen)))
+    kv = kv[: rows // next_n]
+    n_full = _row_valid_lens(kv, rows, next_n, cr, width)
+    logits = _hard_logits(
+        "two_values" if rows <= 16 else "ties", n_full, width, top_k, seed=bound
+    )
+    n_r = [min(n, nb) for n in n_full]
+    _run_hard(
+        logits,
+        kv,
+        top_k,
+        n_r,
+        family,
+        next_n=next_n,
+        cr=cr,
+        page_size=page_size,
+        max_window_len=bound,
+    )
+    if page_size is None and next_n == 1 and cr == 4:
+        full, _ = flashinfer.top_k_varlen(
+            logits,
+            torch.tensor(kv, dtype=torch.int32, device=_DEV),
+            top_k,
+            compress_ratio=cr,
+            max_window_len=bound,
+            backend="radix_cutlass",
+            out_indices=torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV),
+        )
+        _check_varlen_rows(logits, full, n_full, top_k)
+
+
+_REPLAY_BOTH_CASES = [
+    # rows, width, top_k, bound, page size, short / long live columns, family
+    # (the first two below the register-path envelope gate, _MAIN_REG_ENV)
+    (148, 130944, 512, None, 128, (513, 1024), (1025, 16388), "main"),  # sample gate
+    (296, 65472, 1024, None, 64, (1025, 2048), (2049, 4100), "main"),
+    (64, 1048576, 512, 16384, 128, (0, 512), (513, 16384), "reg"),  # 16K graph variant
+    (32, 1048576, 512, None, 128, (0, 512), (513, 16384), "clus"),  # V4.1 c1 capacity
+]
+
+
+@requires_gvr2
+@pytest.mark.parametrize("capture", ["short", "long"])
+@pytest.mark.parametrize(
+    "rows,width,top_k,bound,page_size,short,long,family", _REPLAY_BOTH_CASES
+)
+def test_gvr2_graph_replay_both_directions(
+    rows, width, top_k, bound, page_size, short, long, family, capture
+):
+    """Paged output captured on short rows then replayed on long ones, and the
+    other way round, then back again and on a mix: the per-row branches come
+    from seq_lens at replay time, never from the capture. Each replay also
+    rewrites the page table in place."""
+    gen = torch.Generator().manual_seed(rows + width)
+
+    def draw(lo_hi):
+        return [
+            int(torch.randint(lo_hi[0], lo_hi[1] + 1, (1,), generator=gen))
+            for _ in range(rows)
+        ]
+
+    phases = {"short": draw(short), "long": draw(long)}
+    mixed = [
+        c if r % 3 else [0, top_k, top_k + 1][r % 9 // 3]
+        for r, c in enumerate(draw(long))
+    ]
+    order = (
+        ["long", "short", "mixed", "long"]
+        if capture == "short"
+        else ["short", "long", "mixed", "short"]
+    )
+    phases["mixed"] = mixed
+    pt, unpage = _injective_page_table(rows, width, page_size)
+    logits = torch.empty(rows, width, device=_DEV)
+    seq_lens = torch.tensor(phases[capture], dtype=torch.int32, device=_DEV)
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    kw = dict(out_indices=out, page_table=pt, page_size=page_size)
+    if bound is not None:
+        kw["max_window_len"] = bound
+    logits.copy_(_hard_logits("two_values", phases[capture], width, top_k, seed=1))
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    key_kw = dict(hint_free=True, n_env=bound, page_shift=page_size.bit_length() - 1)
+    _forget_launcher(rows, width, top_k, 1, 1, **key_kw)
+    with torch.cuda.stream(s):  # eager warm-up on the capturing stream
+        _run_gvr2(logits, seq_lens, top_k, None, **kw)
+    torch.cuda.synchronize()
+    _assert_family(rows, width, top_k, 1, 1, _b200_family(family), **key_kw)
+    _check_varlen_rows(logits, unpage(out, 1), phases[capture], top_k)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(s), torch.cuda.graph(g, stream=s):
+        _run_gvr2(logits, seq_lens, top_k, None, **kw)
+    torch.cuda.current_stream().wait_stream(s)
+    for i, name in enumerate(order):
+        cols = phases[name]
+        seq_lens.copy_(torch.tensor(cols, dtype=torch.int32, device=_DEV))
+        logits.copy_(
+            _hard_logits(_HARD_PATTERNS[i % 3], cols, width, top_k, seed=i + 2)
+        )
+        pt_i, unpage = _injective_page_table(rows, width, page_size, which=i + 1)
+        pt.copy_(pt_i)
+        out.fill_(-7)
+        g.replay()
+        torch.cuda.synchronize()
+        _check_varlen_rows(logits, unpage(out, 1), cols, top_k)
+
+
+# ---------------------------------------------------------------------------
+# main engines: in-kernel register path for rows far shorter than the envelope
+# ---------------------------------------------------------------------------
+
+# (rows, msl_c, top_k, next_n, cr). The decode launch is planned for msl_c (the
+# CUDA-graph capacity) and lands on a main engine, while the rows are much
+# shorter: SPLIT (1024 threads, R CTAs per row: R = 33 / 16 / 9 / 4 here) or one
+# CTA per row (1024 threads at 128 and 64 rows, 512 threads at 160 rows).
+# Register rows are <= 16384 columns at 1024 threads and <= 8192 at 512; rows
+# up to half that take the VPT 2 body.
+_MAIN_REG_SHAPES = [
+    (1, 131136, 512, 1, 1),
+    (9, 131136, 512, 1, 1),
+    (16, 131136, 512, 1, 1),  # every length kind of _band_lengths at K = 512
+    (9, 131136, 2048, 1, 1),
+    (16, 131136, 1024, 2, 4),
+    (32, 131136, 2048, 1, 1),  # K = 2048 keeps SPLIT up to 32 rows
+    (128, 131136, 512, 1, 1),
+    (64, 131136, 2048, 1, 1),  # K = 2048: one CTA per row from 33 rows
+    (160, 65600, 1024, 2, 4),
+    (160, 65600, 2048, 1, 1),
+]
+
+
+def _main_reg_cap(rows, msl_c, top_k):
+    """Register-path capacity (columns) of the main engine the launcher builds
+    for this envelope, from the plan the launcher uses."""
+    plan = _host.route_streaming(
+        rows, max(msl_c, top_k + 1), msl_c, top_k, force_main=True
+    )
+    blk = plan["tpl"][0]
+    return blk * _host._main_reg_vpt(blk, plan["tpl"][5], msl_c) * 4
+
+
+# short register-path rows: top_k < n <= 2048 columns (1K-2K-column decode rows),
+# which the VPT 2 body ranks like every row of up to BLK * 8 columns (no kernel
+# bound sits at 2048)
+_NAR_CAP = 2048
+
+
+def _band_lengths(n, top_k, cap, msl_c, gen):
+    """n compressed row lengths cycling through the register band (top_k, cap],
+    its edges and the VPT 2 / VPT 4 boundary (cap / 2 and either side), short
+    rows (including 0), streaming rows, and k + 2 .. k + 4 (with k + 1, every
+    n % 4 of the VPT 2 body's scalar tail lane); none is pinned to the
+    envelope msl_c."""
+
+    def rnd(lo, hi):
+        return int(torch.randint(lo, hi + 1, (1,), generator=gen))
+
+    kinds = [
+        lambda: rnd(top_k + 1, cap),
+        lambda: cap,
+        lambda: cap + 1,
+        lambda: cap // 2,
+        lambda: cap // 2 + 1,
+        lambda: top_k + 1,
+        lambda: top_k,
+        lambda: rnd(0, top_k - 1),
+        lambda: rnd(cap + 2, msl_c),
+        lambda: 0,
+        lambda: top_k + 2,
+        lambda: top_k + 3,
+        lambda: top_k + 4,
+        lambda: cap // 2 - 1,
+    ]
+    return [kinds[i % len(kinds)]() for i in range(n)]
+
+
+@requires_gvr2
+@pytest.mark.parametrize("rows,msl_c,top_k,next_n,cr", _MAIN_REG_SHAPES)
+def test_gvr2_main_register_path_short_rows(rows, msl_c, top_k, next_n, cr):
+    """Rows far shorter than the launch envelope on the main engines, hinted
+    and hint-free: rows that fit the CTA's registers (short and empty rows
+    included) take the in-kernel register path, the others stream. Every row is
+    exact, including the band edges (cap, cap + 1), the VPT 2 / VPT 4 edge
+    (cap / 2 - 1 .. cap / 2 + 1) and k + 1 .. k + 4."""
+    cap = _main_reg_cap(rows, msl_c, top_k)
+    assert cap > 0
+    gen = torch.Generator().manual_seed(rows * 7 + top_k)
+    targets = _band_lengths(rows // next_n, top_k, cap, msl_c, gen)
+    # kv = t*cr + next_n - 1 gives every row of the request t (or t + rr) columns
+    kv = [t * cr + next_n - 1 for t in targets]
+    logits, seq_lens, pre_idx, n_r, _ = _make_varlen_case(
+        kv, next_n, cr, top_k, seed=rows + top_k, msl_c=msl_c
+    )
+    for hint_free in (False, True):
+        _forget_launcher(rows, msl_c, top_k, next_n, cr, hint_free=hint_free)
+        indices, _ = _run_gvr2(
+            logits,
+            seq_lens,
+            top_k,
+            None if hint_free else pre_idx,
+            next_n=next_n,
+            compress_ratio=cr,
+        )
+        _assert_family(rows, msl_c, top_k, next_n, cr, "main", hint_free=hint_free)
+        _check_varlen_rows(logits, indices, n_r, top_k)
+
+
+@requires_gvr2
+@pytest.mark.parametrize(
+    "rows,msl_c",
+    [(9, 131136), (16, 131136), (128, 131136), (160, 65600)],
+    ids=["split9", "split16", "cta1024", "cta512"],
+)
+@pytest.mark.parametrize(
+    "pattern", ["constant", "quantized4", "huge_flood_gt_k", "posinf", "neginf_tail"]
+)
+@pytest.mark.parametrize("band", ["vpt4", "narrow"])
+def test_gvr2_main_register_path_adversarial(rows, msl_c, pattern, band):
+    """Tie floods, +inf and an in-window -inf tail inside register-path rows of a
+    main launch (the register body's escape and degenerate-bracket arms),
+    hinted and hint-free, on the VPT 4 body and on rows of top_k < n <= 2048
+    columns (the VPT 2 body).
+    Rows of cap - 3 columns put the last column outside the float4 batch
+    (n % 4 == 1)."""
+    top_k = 1024 if band == "vpt4" else 512
+    n = (_main_reg_cap(rows, msl_c, top_k) if band == "vpt4" else _NAR_CAP) - 3
+    gen = torch.Generator(device=_DEV).manual_seed(rows + len(pattern))
+    if pattern == "posinf":
+        x = torch.randn(rows, n, generator=gen, device=_DEV) * 2.0
+        x[:, 1000] = float("inf")  # inside the first-k bracket window
+        x[:, n - 2] = float("inf")  # outside it
+        x[1::2, 0 : 4 * (top_k + 5) : 4] = float("inf")  # more +inf than K
+    elif pattern == "neginf_tail":
+        x = torch.randn(rows, n, generator=gen, device=_DEV)
+        x[:, n - 1] = float("-inf")  # the tail column, outside the float4 batch
+        x[1::2, 500:n] = float("-inf")  # odd rows: fewer than K finite values
+    else:
+        x = _adversarial_logits(pattern, rows, n, top_k, gen)
+    logits = torch.full((rows, msl_c), 3e38, device=_DEV)
+    logits[:, :n] = x
+    seq_lens = torch.full((rows,), n, dtype=torch.int32, device=_DEV)
+    hint = torch.randint(
+        0, n, (rows, top_k), generator=gen, device=_DEV, dtype=torch.int32
+    )
+    for pre_idx in (None, hint):
+        out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+        _forget_launcher(rows, msl_c, top_k, 1, 1, hint_free=pre_idx is None)
+        _run_gvr2(logits, seq_lens, top_k, pre_idx, out_indices=out)
+        torch.cuda.synchronize()
+        _assert_family(rows, msl_c, top_k, 1, 1, "main", hint_free=pre_idx is None)
+        _check_varlen_rows(logits, out, [n] * rows, top_k)
+
+
+@requires_gvr2
+@pytest.mark.parametrize(
+    "rows,msl_c,top_k",
+    [(9, 131136, 512), (32, 131136, 2048), (128, 131136, 512), (160, 65600, 2048)],
+    ids=["split9", "split32", "cta1024", "cta512"],
+)
+@pytest.mark.parametrize("paged", [False, True], ids=["unpaged", "paged64"])
+def test_gvr2_main_register_path_graph_replay(rows, msl_c, top_k, paged):
+    """Capture once with every row on the register path, then replay after
+    changing the lengths in place so rows move between the register, streaming
+    and short paths in both directions: the path is chosen per row on device,
+    so the one captured launch must stay exact for any mix. A register step
+    never touches the SPLIT slab, so the streaming step after it must find the
+    slab clean."""
+    cap = _main_reg_cap(rows, msl_c, top_k)
+    gen = torch.Generator().manual_seed(rows + top_k)
+    gdev = torch.Generator(device=_DEV).manual_seed(rows + top_k)
+    logits = torch.randn(rows, msl_c, generator=gdev, device=_DEV)
+    seq_lens = torch.full((rows,), cap, dtype=torch.int32, device=_DEV)
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    kw = {}
+    pages = (msl_c + 63) // 64
+    if paged:
+        # injective per row, reversed page order, a distinct page range per row
+        r_ = torch.arange(rows, device=_DEV).unsqueeze(1)
+        p_ = torch.arange(pages, device=_DEV).unsqueeze(0)
+        pt = ((pages - 1 - p_) + r_ * pages).to(torch.int32).contiguous()
+        kw = dict(page_table=pt, page_size=64)
+
+    def call():
+        flashinfer.top_k_varlen(
+            logits, seq_lens, top_k, out_indices=out, backend="gvr_2", **kw
+        )
+
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    key_kw = dict(hint_free=True, page_shift=6 if paged else None)
+    _forget_launcher(rows, msl_c, top_k, 1, 1, **key_kw)
+    with torch.cuda.stream(s):
+        call()  # compile + this stream's workspace slab, outside capture
+    torch.cuda.synchronize()
+    _assert_family(rows, msl_c, top_k, 1, 1, _b200_family("main"), **key_kw)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(s), torch.cuda.graph(g, stream=s):
+        call()
+    torch.cuda.synchronize()
+
+    def rnd(lo, hi, m):
+        return [int(v) for v in torch.randint(lo, hi + 1, (m,), generator=gen)]
+
+    steps = [
+        rnd(top_k + 1, cap, rows),  # register
+        rnd(cap + 1, msl_c, rows),  # streaming (the SPLIT slab)
+        _band_lengths(rows, top_k, cap, msl_c, gen),  # mixed
+        rnd(0, top_k, rows),  # short
+        # short register rows (top_k < n <= 2048 columns; K < 2048)
+        rnd(top_k + 1, max(top_k + 1, _NAR_CAP), rows),
+        rnd(top_k + 1, cap, rows),  # register again
+        rnd(cap + 1, msl_c, rows),  # streaming after a register step
+        rnd(top_k + 1, _NAR_CAP + 1, rows),  # the same rows up to 2049 columns
+    ]
+    for lens in steps:
+        seq_lens.copy_(torch.tensor(lens, dtype=torch.int32, device=_DEV))
+        logits.normal_(generator=gdev)
+        for r, n in enumerate(lens):
+            logits[r, n:] = 3e38  # poison past each row
+        out.fill_(-7)
+        g.replay()
+        torch.cuda.synchronize()
+        got = out
+        if paged:
+            # invert the page map back to row-local columns (pads stay -1)
+            q = (out.to(torch.int64) >> 6) - torch.arange(rows, device=_DEV).unsqueeze(
+                1
+            ) * pages
+            col = (pages - 1 - q) * 64 + (out.to(torch.int64) & 63)
+            got = torch.where(out >= 0, col, out.to(torch.int64)).to(torch.int32)
+        _check_varlen_rows(logits, got, lens, top_k)
 
 
 # ---------------------------------------------------------------------------
@@ -1027,6 +1883,138 @@ def test_gvr2_posinf_reg_clus(batch, n_valid, mode):
         ), "+inf dropped from the top-k"
         got = torch.sort(sel, dim=1, descending=True).values
         assert torch.equal(got, ref), "selected value multiset differs from torch.topk"
+
+
+# +inf and -inf among finite scores on every family. DeepSeek-V4.1's block top-k
+# forces each row's newest key (column n - 1) to +inf; these cases also put +inf
+# and -inf at the row head, in the scalar tail lane (n % 4 != 0), at K and more
+# than K random columns, and leave fewer than K finite scores. Hint-free and
+# unpaged; the ids name the launch each shape gets on a 148-SM B200.
+_INF_SHAPES = [
+    # rows, logits width (launch envelope), live length, top_k, family
+    # DEG rung (bracket = the whole row); the first is the v41block 4K-block launch
+    pytest.param(1, 4160, 4101, 2048, "reg", id="reg_deg_vpt2"),
+    pytest.param(160, 4160, 4100, 2048, "reg", id="reg_deg_vpt4"),
+    pytest.param(4, 1024, 1021, 512, "reg", id="reg_deg_vpt1"),
+    pytest.param(256, 4096, 4093, 1024, "reg", id="reg_deg_nonbrl"),
+    # rows > SMs with n < 2K: ballot emit (CUR off)
+    pytest.param(160, 4000, 3997, 2048, "reg", id="reg_deg_ballot"),
+    pytest.param(160, 1000, 997, 512, "reg", id="reg_deg_ballot_vpt1"),
+    # bracket = the first K values (register fold, identity gather)
+    pytest.param(1, 4096, 4093, 512, "reg", id="reg_fold_vpt1"),
+    pytest.param(1, 12288, 12001, 2048, "reg", id="reg_gather_vpt4"),
+    pytest.param(256, 4096, 4093, 512, "reg", id="reg_gather_nonbrl"),
+    pytest.param(2, 32832, 32773, 2048, "reg_clus", id="reg_clus_cs8"),
+    pytest.param(16, 32832, 32773, 2048, "reg_clus", id="reg_clus_cs4"),
+    pytest.param(32, 131072, 32773, 1024, "clus", id="clus_cs4"),
+    # main at the v41block serving width (SPLIT), big, and 512-thread slabs; the
+    # SPLIT engines rank rows of up to 16384 columns with the register body, and
+    # so do the one-CTA engines from an envelope of _MAIN_REG_ENV register rows
+    # (main_big_reg; main_b512: 512 threads, rows of up to 8192 columns)
+    pytest.param(1, 131104, 4101, 2048, "main", id="main_split"),
+    pytest.param(1, 131104, 32773, 2048, "main", id="main_split_stream"),
+    pytest.param(1, 131104, 2045, 512, "main", id="main_split_narrow"),
+    pytest.param(64, 131072, 32773, 2048, "main", id="main_big"),
+    pytest.param(64, 131104, 4101, 2048, "main", id="main_big_reg"),
+    pytest.param(160, 131072, 4101, 2048, "main", id="main_b512"),
+    pytest.param(160, 65472, 4101, 2048, "main", id="main_b512_stream"),
+    # ragged v41block rows at the serving width, cycled over the batch: register
+    # rows, a streaming row and rows of n <= K (identity path) in one launch
+    pytest.param(
+        160, 131104, (4101, 4100, 32773, 2049, 2048, 7), 2048, "main", id="v41_ragged"
+    ),
+]
+
+_INF_PATTERNS = [
+    "pos_newest",  # one +inf at column n - 1
+    "pos_first",
+    "pos_16",
+    "pos_k",  # exactly K +inf
+    "pos_gt_k",  # 1.5 K +inf: the selection is all +inf
+    "pos_head_run",  # +inf at columns 0 .. K - 2
+    "neg_newest",
+    "neg_64",
+    "neg_most",  # K / 2 finite scores left (newest one finite): -inf ties are selected
+    "neg_most_tail",  # the same with the newest column -inf
+    "mixed",  # +inf newest + K / 4 random +inf, 64 random -inf
+    "mixed_neg_most",  # 16 +inf, K / 2 - 16 finite, the rest -inf
+]
+
+
+def _inf_columns(pattern, n, top_k, gen):
+    """(+inf columns, -inf columns) for one row of live length n."""
+
+    def rand(count):
+        return torch.randperm(n, generator=gen, device=_DEV)[:count]
+
+    def at(*cols):
+        return torch.tensor(cols, dtype=torch.int64, device=_DEV)
+
+    none = at()
+    if pattern == "pos_newest":
+        return at(n - 1), none
+    if pattern == "pos_first":
+        return at(0), none
+    if pattern == "pos_16":
+        return rand(16), none
+    if pattern == "pos_k":
+        return rand(top_k), none
+    if pattern == "pos_gt_k":
+        return rand(top_k + top_k // 2), none
+    if pattern == "pos_head_run":
+        return torch.arange(top_k - 1, device=_DEV), none
+    if pattern == "neg_newest":
+        return none, at(n - 1)
+    if pattern == "neg_64":
+        return none, rand(64)
+    if pattern == "neg_most":  # columns 0 .. n - 2
+        return none, torch.randperm(n - 1, generator=gen, device=_DEV)[: n - top_k // 2]
+    if pattern == "neg_most_tail":
+        head = torch.randperm(n - 1, generator=gen, device=_DEV)[: n - top_k // 2 - 1]
+        return none, torch.cat([at(n - 1), head])
+    if pattern == "mixed":
+        perm = rand(top_k // 4 + 64)
+        neg = perm[top_k // 4 :]
+        return torch.cat([at(n - 1), perm[: top_k // 4]]), neg[neg != n - 1]
+    if pattern == "mixed_neg_most":
+        perm = rand(n - top_k // 2 + 16)
+        return perm[:16], perm[16:]
+    raise ValueError(pattern)
+
+
+@requires_gvr2
+@pytest.mark.parametrize("pattern", _INF_PATTERNS)
+@pytest.mark.parametrize("rows,width,n_valid,top_k,family", _INF_SHAPES)
+def test_gvr2_inf_scores_every_family(rows, width, n_valid, top_k, family, pattern):
+    """Rows holding +inf and -inf among finite scores are exact on every family:
+    every output slot written, distinct in-row indices, and the selected values
+    equal torch.topk's as a multiset (ties at the K-th value may pick other
+    columns). The live length stays below the envelope and the columns past it
+    are poisoned, so an out-of-row read fails the value check. A tuple of live
+    lengths gives ragged rows (rows of n <= top_k: identity + -1 tail). The
+    family is checked after the values, so a wrong value fails as such."""
+    seed = rows * 7 + width + top_k + _INF_PATTERNS.index(pattern)
+    gen = torch.Generator(device=_DEV).manual_seed(seed)
+    ragged = isinstance(n_valid, tuple)
+    n_r = [n_valid[r % len(n_valid)] if ragged else n_valid for r in range(rows)]
+    logits = torch.randn(rows, width, generator=gen, device=_DEV) * 2.0
+    for r, n in enumerate(n_r):
+        logits[r, n:] = 3e38
+        pos, neg = _inf_columns(pattern, n, top_k, gen)
+        logits[r, pos] = float("inf")
+        logits[r, neg] = float("-inf")
+    seq_lens = torch.tensor(n_r, dtype=torch.int32, device=_DEV)
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    _forget_launcher(rows, width, top_k, 1, 1, hint_free=True)
+    _run_gvr2(logits, seq_lens, top_k, None, out_indices=out)
+    if ragged:
+        torch.cuda.synchronize()
+        assert int((out == -7).sum()) == 0, "unwritten output slots"
+        _check_varlen_rows(logits, out, n_r, top_k)
+    else:
+        ref_vals = torch.topk(logits[:, :n_valid], top_k, dim=1).values
+        _check_complete_exact(out, logits, n_valid, ref_vals, -7)
+    _assert_family(rows, width, top_k, 1, 1, _b200_family(family), hint_free=True)
 
 
 @requires_gvr2
