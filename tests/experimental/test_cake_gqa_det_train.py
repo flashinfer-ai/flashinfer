@@ -958,23 +958,38 @@ def test_every_output_repeats_bit_for_bit(layout, device) -> None:
             _assert_outputs_same_bits(got, runs[0], f"{name} {label} run {i}")
 
 
-def _timed(call, *, sides=()):
-    """Milliseconds and result of ``call`` on the current stream, launched behind a short sleep kernel while a long
-    sleep kernel is resident on each stream of ``sides``."""
+def _timed(call, *, sides=(), side_cycles=SIDE_SLEEP_CYCLES, outlast=False):
+    """Milliseconds and result of ``call`` on the current stream, launched behind a short sleep kernel while a sleep
+    kernel of ``side_cycles`` is resident on each stream of ``sides``; with ``outlast``, every one of those must still
+    run when the call's last kernel ends."""
     start, end = (
         torch.cuda.Event(enable_timing=True),
         torch.cuda.Event(enable_timing=True),
     )
     torch.cuda.synchronize()
+    side_ends = []
     for side in sides:
         with torch.cuda.stream(side):
-            torch.cuda._sleep(SIDE_SLEEP_CYCLES)
+            torch.cuda._sleep(side_cycles)
+            side_ends.append(torch.cuda.Event(enable_timing=True))
+            side_ends[-1].record()
     torch.cuda._sleep(PRE_SLEEP_CYCLES)
     start.record()
     result = call()
     end.record()
     torch.cuda.synchronize()
-    return start.elapsed_time(end), result
+    ms = start.elapsed_time(end)
+    if outlast:
+        ends = [start.elapsed_time(e) for e in side_ends]
+        assert all(e > ms for e in ends), (ms, ends, "a resident kernel ended first")
+    return ms, result
+
+
+def _side_cycles_outlasting(ms: float) -> int:
+    """Sleep cycles of a resident kernel that outlasts, twice over, a call of ``ms`` milliseconds (calibrated on a
+    sleep of ``SIDE_SLEEP_CYCLES``, so the clock rate does not matter)."""
+    spin_ms = _timed(lambda: torch.cuda._sleep(SIDE_SLEEP_CYCLES))[0]
+    return max(SIDE_SLEEP_CYCLES, int(SIDE_SLEEP_CYCLES * 2 * (ms + 1.0) / spin_ms))
 
 
 @pytest.mark.parametrize("form", DKV_FORMS)
@@ -983,7 +998,8 @@ def test_no_kernel_reads_package_memory_it_did_not_write(
     layout, form, device, monkeypatch
 ) -> None:
     """The package's own buffers (the scratch, the dS^T workspace, the window gradients, the plan tables, the row-map
-    order) allocated full of 0xFF bytes (NaN, -1 for integers) give the bits of a run without that fill."""
+    order) allocated full of 0x00 bytes and then full of 0xFF bytes (NaN, -1 for integers) give the same bits: no
+    kernel reads a byte it did not write, whichever block the caching allocator hands back."""
     name, q_lens, k_lens, h_q, h_kv = layout
     x = _inputs(q_lens, k_lens, h_q, h_kv, device)
     row_map, n_dst = _scattered_row_map(x)
@@ -993,21 +1009,25 @@ def test_no_kernel_reads_package_memory_it_did_not_write(
         ws = cake_backend.CakeGQADetWorkspace(device)
         return _run(x, form, workspace=ws, dst_init=dst_init, row_map=row_map)
 
-    clean = run()
     uninitialized = cake_backend._uninitialized
-    filled = []
+    filled = {0x00: [], 0xFF: []}
 
-    def poisoned(shape, dtype, device):
-        t = uninitialized(shape, dtype, device)
-        t.untyped_storage().fill_(0xFF)
-        filled.append(t.untyped_storage().nbytes())
-        return t
+    def filled_with(byte):
+        def alloc(shape, dtype, device):
+            t = uninitialized(shape, dtype, device)
+            t.untyped_storage().fill_(byte)
+            filled[byte].append(t.untyped_storage().nbytes())
+            return t
 
-    monkeypatch.setattr(cake_backend, "_uninitialized", poisoned)
+        return alloc
+
+    monkeypatch.setattr(cake_backend, "_uninitialized", filled_with(0x00))
+    zeros = run()
+    monkeypatch.setattr(cake_backend, "_uninitialized", filled_with(0xFF))
     got = run()
     torch.cuda.synchronize()
-    assert filled, name
-    _assert_outputs_same_bits(got, clean, f"{name} {form} after 0xFF")
+    assert filled[0x00] and filled[0xFF], name
+    _assert_outputs_same_bits(got, zeros, f"{name} {form} 0xFF vs 0x00")
 
 
 @pytest.mark.parametrize("form", DKV_FORMS)
@@ -1033,9 +1053,9 @@ def test_the_bits_do_not_depend_on_resident_kernels(form, device) -> None:
 @pytest.mark.parametrize("name", ISSUE_LAYOUTS)
 def test_the_issue_shapes_repeat_bit_for_bit(name, device) -> None:
     """At the issue's rows (the benchmark's layouts, H_q 24, H_kv 4), ``REPEATS`` runs of every form alone and
-    ``REPEATS`` beside a kernel resident on another stream give the bits of the first run: out, lse, dq and dK / dV
-    (BF16, FP32 window, and row-map adds into non-zero destinations, the two segments of each document adding into
-    the same destination rows)."""
+    ``REPEATS`` beside a kernel resident on another stream for the whole forward and backward give the bits of the
+    first run: out, lse, dq and dK / dV (BF16, FP32 window, and row-map adds into non-zero destinations, the two
+    segments of each document adding into the same destination rows)."""
     q_lens, k_lens, starts, n_dst = _issue_layout(name)
     x = _inputs(q_lens, k_lens, 24, 4, device, seed=11)
     rows = [
@@ -1052,9 +1072,18 @@ def test_the_issue_shapes_repeat_bit_for_bit(name, device) -> None:
             return _run(x, form, workspace=ws, dst_init=dst_init, row_map=row_map)
 
         first = _timed(call)[1]
-        for i in range(1, 2 * REPEATS):
-            got = _timed(call, sides=(side,) if i >= REPEATS else ())[1]
+        alone_ms = 0.0
+        for i in range(1, REPEATS):
+            ms, got = _timed(call)
+            alone_ms = max(alone_ms, ms)
             _assert_outputs_same_bits(got, first, f"{name} {form} run {i}")
+            del got
+        cycles = _side_cycles_outlasting(alone_ms)
+        for i in range(REPEATS, 2 * REPEATS):
+            got = _timed(call, sides=(side,), side_cycles=cycles, outlast=True)[1]
+            _assert_outputs_same_bits(
+                got, first, f"{name} {form} run {i} beside a resident kernel"
+            )
             del got
 
 
@@ -1486,10 +1515,12 @@ def test_checkpoint_keeps_nothing_alive_and_matches_the_saved_set(form, device) 
 
 @pytest.mark.parametrize("form", DKV_FORMS)
 def test_steady_state_does_not_synchronize(form, device) -> None:
-    xs = [
-        _inputs(q, k, 24, 4, device, seed=i)
-        for i, (q, k) in enumerate((((700, 77), (3000, 77)), ((300,), (300,))))
-    ]
+    """No call synchronizes the host, with the tile tables from the plan kernel and (more pair positions than
+    ``PLAN_KERNEL_PAIRS``) from the PyTorch ops."""
+    layouts = (((700, 77), (3000, 77)), ((300,), (300,)), ((1,) * 1100, (3,) * 1100))
+    bounds = [cake_jit.pair_bound(sum(q), len(q)) for q, _k in layouts]
+    assert max(bounds[:2]) <= cake_jit.PLAN_KERNEL_PAIRS < bounds[2], bounds
+    xs = [_inputs(q, k, 24, 4, device, seed=i) for i, (q, k) in enumerate(layouts)]
     ws = cake_backend.CakeGQADetWorkspace(device)
     steps = []
     for x in xs:
@@ -1554,8 +1585,10 @@ def test_no_call_waits_for_the_device(device) -> None:
         every_form()
         torch.cuda.synchronize()
         torch.cuda._sleep(BEHIND_SLEEP_CYCLES)
+        behind = torch.cuda.Event()
+        behind.record()
         every_form()
-        busy = not torch.cuda.current_stream(device).query()
+        busy = not behind.query()
         torch.cuda.synchronize()
         assert busy, (len(q_lens), "a call waited for the device")
 
@@ -1686,15 +1719,37 @@ def deterministic_algorithms():
     torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
 
 
+# Layouts of the deterministic-mode test: a segment without queries (keys 200..249 that no query sees, whose dK / dV
+# the main kernel stores as zeros), and more pair positions than ``PLAN_KERNEL_PAIRS`` (the PyTorch tile-table ops).
+DET_MODE_LAYOUTS = {
+    "unseen_keys": ((130, 0, 77, 300), (200, 50, 77, 301)),
+    "torch_plan": ((1,) * 1100, (3,) * 1100),
+}
+
+
+def _unseen_key_rows(x) -> list[int]:
+    """The key rows of the segments without queries."""
+    cq, ck = x["cq"], x["ck"]
+    return [
+        j
+        for b in range(len(cq) - 1)
+        if cq[b + 1] == cq[b]
+        for j in range(ck[b], ck[b + 1])
+    ]
+
+
 @pytest.mark.parametrize("warn_only", (False, True), ids=("strict", "warn_only"))
 @pytest.mark.parametrize("form", DKV_FORMS)
+@pytest.mark.parametrize("layout", DET_MODE_LAYOUTS)
 def test_deterministic_mode_raises_no_alert_and_keeps_the_bits(
-    form, warn_only, device, deterministic_algorithms
+    layout, form, warn_only, device, deterministic_algorithms
 ) -> None:
     """Under ``torch.use_deterministic_algorithms(True)``, strict or ``warn_only=True``: no alert, no warning, and
     the two halves and autograd give the bits of a run outside that mode.  The outputs of the run in the mode are
-    allocated in it, so PyTorch fills them with NaN: the bits also show that every output element is written."""
-    x = _inputs((130, 77, 300), (200, 77, 301), 24, 4, device)
+    allocated in it, so PyTorch fills them with NaN: the bits also show that every output element of these layouts
+    is written, and the BF16 and FP32 dK / dV of keys no query sees are exact zeros."""
+    q_lens, k_lens = DET_MODE_LAYOUTS[layout]
+    x = _inputs(q_lens, k_lens, 24, 4, device)
     row_map, n_dst = _scattered_row_map(x)
     dst_init = _destinations(n_dst, 4, device)
 
@@ -1728,6 +1783,15 @@ def test_deterministic_mode_raises_no_alert_and_keeps_the_bits(
     _assert_outputs_same_bits(
         got_auto, base_auto, f"{form} autograd", ("out", "dq", "dk", "dv")
     )
+    unseen = _unseen_key_rows(x)
+    assert bool(unseen) == (layout == "unseen_keys"), layout
+    if unseen and form != "rowmap":
+        rows = torch.tensor(unseen, device=device)
+        for label, got in (("halves", got_low), ("autograd", got_auto)):
+            for t in ("dk", "dv"):
+                assert torch.equal(got[t][rows], torch.zeros_like(got[t][rows])), (
+                    f"{form} {label} {t} of keys no query sees"
+                )
 
 
 @pytest.mark.parametrize("form", DKV_FORMS)

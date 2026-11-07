@@ -344,8 +344,8 @@ FWD_CLUSTER = 2
 # Backward: a key block is 128 keys (one CTA pair of the main kernel), a Q tile
 # 64 query rows of one head pair (128 packed scratch rows).  The main kernel
 # stores dS^T per (head pair, key block, Q tile) as one 32 KiB workspace tile
-# (128 keys x 128 packed rows, BF16); the GEMMs read it as 256 lines of 128
-# bytes.  Every CTA group is a pair (``cta_group::2``).
+# (128 keys x 128 packed rows, BF16); the dQ GEMM reads it as 256 lines of
+# 128 bytes.  Every CTA group is a pair (``cta_group::2``).
 BWD_TILE_KEYS = 128
 BWD_TILE_ROWS = 64
 BWD_CLUSTER = 2
@@ -415,8 +415,9 @@ def scratch_bytes(total_q: int, num_heads_q: int, num_segments: int) -> int:
 
 
 def key_blocks(total_k: int, max_seqlen_k: Optional[int]) -> int:
-    """Key blocks of the longest segment, rounded up to even (a workspace chunk spans whole pairs of key blocks): from
-    ``max_seqlen_k`` when the caller gives it, else from ``T_k``, which bounds every segment."""
+    """Key blocks of the longest segment, rounded up to even: from ``max_seqlen_k`` when the caller gives it, else from
+    ``T_k``, which bounds every segment.  No kernel needs the even count (it is kept from the removed dK GEMM, which
+    paired key blocks), but the chunking, and so the dQ bits of a given budget, follow from it."""
     longest = total_k if max_seqlen_k is None else min(int(max_seqlen_k), total_k)
     blocks = max(1, -(-longest // BWD_TILE_KEYS))
     return blocks + (blocks & 1)
