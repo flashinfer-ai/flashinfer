@@ -163,6 +163,7 @@ struct BatchPrefillPagedParams {
   int num_kv_heads;
   int group_size;
   int page_size;
+  int num_pages;
   int window_left;
 
   bool causal;

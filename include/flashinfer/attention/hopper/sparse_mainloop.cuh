@@ -85,6 +85,7 @@ struct SparseCollectiveMainloop {
       SmemLayoutQ{}, select<0, 2>(TileShape_QKD{}), _1{}));  // no mcast for Q
 
   static constexpr bool USE_TMA_LOAD_KV = false;
+  static constexpr bool ZERO_V_TAIL = false;  // cp.async zero-fills rows past kv_len
   static constexpr int NUM_MMA_THREADS = size(typename Ktraits::TiledMmaQK{});
   // Verify NUM_PRODUCER_THREADS matches NUM_COPY_THREADS for sparse loading
   static_assert(Ktraits::NUM_PRODUCER_THREADS == NUM_COPY_THREADS,
