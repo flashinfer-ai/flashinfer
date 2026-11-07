@@ -307,6 +307,27 @@ CUDA 12.9 or newer uses one ``sm_100f`` module on CC 10.0 and CC 10.3.
 Unsupported devices or contracts raise an error without falling back to
 another KDA implementation.
 
+Host copy of ``cu_seqlens`` for serving
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The packed prefill routes that schedule on the host (small-BH, Cake, and the
+CuTe DSL decomposed variant) read ``cu_seqlens`` back from the device, which
+synchronizes the stream, so the call waits for every kernel queued before it. The
+read is cached per offsets tensor only when the tensor has a version counter,
+never under ``torch.inference_mode``, and a serving step that changes the
+offsets every call cannot reuse it anyway. A framework that already holds the
+batch offsets on the host (for example vLLM's ``query_start_loc_cpu``) should
+pass them as ``recurrent_kda(..., cu_seqlens_host=...)``, a 1-D CPU tensor or
+a sequence of ints with the same values as ``cu_seqlens``. The values are
+trusted and not compared with the device tensor, so the host and device copies
+must describe the same batch. The hint is honoured by the small-BH, Cake,
+CuTe DSL (including persistent), PTX and TIRx routes; the SM120 and cuDNN
+routes ignore it.
+Without the hint, the CuTe DSL decomposed and engine routes memoize the
+offsets contents per tensor object, also under ``torch.inference_mode``; an
+int64 offsets buffer refilled in place with a different segmentation is then
+not detected. Pass ``cu_seqlens_host`` (always honoured) or use a new tensor.
+
 Frozen / speculative-verify mode
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
