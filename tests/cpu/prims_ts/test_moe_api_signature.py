@@ -14,6 +14,7 @@
 
 import inspect
 from types import SimpleNamespace
+from typing import Optional
 
 import pytest
 import torch
@@ -70,29 +71,30 @@ def test_prims_ts_fp8_positional_contract_matches_trtllm():
     ) == inspect.signature(prims_ts_fp8_per_tensor_scale_moe)
 
 
+_ORDINARY_OPS = (
+    prims_ts_bf16_moe,
+    prims_ts_bf16_routed_moe,
+    prims_ts_fp4_block_scale_moe,
+    prims_ts_fp4_block_scale_routed_moe,
+    prims_ts_fp8_per_tensor_scale_moe,
+    prims_ts_fp8_block_scale_moe,
+    prims_ts_fp8_block_scale_routed_moe,
+)
+_PARTITIONED_OPS = (
+    prims_ts_bf16_moe_partitioned,
+    prims_ts_fp4_block_scale_moe_partitioned,
+    prims_ts_fp8_per_tensor_scale_moe_partitioned,
+    prims_ts_fp8_block_scale_moe_partitioned,
+)
+
+
 @pytest.mark.cpu_only
 def test_partition_resources_only_appear_on_partitioned_ops():
-    ordinary_ops = (
-        prims_ts_bf16_moe,
-        prims_ts_bf16_routed_moe,
-        prims_ts_fp4_block_scale_moe,
-        prims_ts_fp4_block_scale_routed_moe,
-        prims_ts_fp8_per_tensor_scale_moe,
-        prims_ts_fp8_block_scale_moe,
-        prims_ts_fp8_block_scale_routed_moe,
-    )
-
-    for op in ordinary_ops:
+    for op in _ORDINARY_OPS:
         assert "partition" not in inspect.signature(op).parameters
         assert "partition_resources" not in inspect.signature(op).parameters
 
-    partitioned_ops = (
-        prims_ts_bf16_moe_partitioned,
-        prims_ts_fp4_block_scale_moe_partitioned,
-        prims_ts_fp8_per_tensor_scale_moe_partitioned,
-        prims_ts_fp8_block_scale_moe_partitioned,
-    )
-    for op in partitioned_ops:
+    for op in _PARTITIONED_OPS:
         parameters = inspect.signature(op).parameters
         assert "partition_resources" in parameters
         assert "partition_strategy" in parameters
@@ -106,6 +108,16 @@ def test_partition_resources_only_appear_on_partitioned_ops():
             }
             & parameters.keys()
         )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "op", _ORDINARY_OPS + _PARTITIONED_OPS, ids=lambda op: op.__name__
+)
+def test_moe_exports_default_enable_pdl_to_none(op):
+    parameter = inspect.signature(op).parameters["enable_pdl"]
+    assert parameter.default is None
+    assert parameter.annotation in ("Optional[bool]", Optional[bool])
 
 
 def _routing_args():
@@ -177,3 +189,123 @@ def test_partitioned_op_rejects_wrong_shard_count():
             partition_resources=SimpleNamespace(),
             partition_strategy="tp_n_tp_n",
         )
+
+
+def _bf16_moe(enable_pdl):
+    weight = torch.empty((8, 256, 128), dtype=torch.bfloat16)
+    prims_ts_bf16_moe(
+        routing_logits=torch.empty((4, 8)),
+        routing_bias=None,
+        hidden_states=torch.empty((4, 128), dtype=torch.bfloat16),
+        gemm1_weights=weight,
+        gemm2_weights=weight,
+        **_moe_shape_args(),
+        enable_pdl=enable_pdl,
+    )
+
+
+def _fp8_per_tensor_scale_moe(enable_pdl):
+    weight = torch.empty((8, 256, 128), dtype=torch.float8_e4m3fn)
+    scale = torch.ones(8)
+    prims_ts_fp8_per_tensor_scale_moe(
+        routing_logits=torch.empty((4, 8)),
+        routing_bias=None,
+        hidden_states=torch.empty((4, 128), dtype=torch.float8_e4m3fn),
+        gemm1_weights=weight,
+        output1_scales_scalar=scale,
+        output1_scales_gate_scalar=scale,
+        gemm2_weights=weight,
+        output2_scales_scalar=scale,
+        **_moe_shape_args(),
+        routed_scaling_factor=None,
+        use_routing_scales_on_input=False,
+        enable_pdl=enable_pdl,
+    )
+
+
+def _fp8_block_scale_moe(enable_pdl):
+    weight = torch.empty((8, 256, 128), dtype=torch.float8_e4m3fn)
+    scale = torch.empty(0)
+    prims_ts_fp8_block_scale_moe(
+        routing_logits=torch.empty((4, 8)),
+        routing_bias=None,
+        hidden_states=torch.empty((4, 128), dtype=torch.float8_e4m3fn),
+        hidden_states_scale=torch.empty(0),
+        gemm1_weights=weight,
+        gemm1_weights_scale=scale,
+        gemm2_weights=weight,
+        gemm2_weights_scale=scale,
+        **_moe_shape_args(),
+        routed_scaling_factor=None,
+        enable_pdl=enable_pdl,
+    )
+
+
+def _fp4_block_scale_moe(enable_pdl):
+    weight = torch.empty((8, 256, 64), dtype=torch.uint8)
+    scale = torch.empty(0, dtype=torch.uint8)
+    ones = torch.ones(8)
+    prims_ts_fp4_block_scale_moe(
+        routing_logits=torch.empty((4, 8)),
+        routing_bias=None,
+        hidden_states=torch.empty((4, 128), dtype=torch.bfloat16),
+        hidden_states_scale=None,
+        gemm1_weights=weight,
+        gemm1_weights_scale=scale,
+        gemm1_bias=None,
+        gemm1_alpha=None,
+        gemm1_beta=None,
+        gemm1_clamp_limit=None,
+        gemm2_weights=weight,
+        gemm2_weights_scale=scale,
+        gemm2_bias=None,
+        output1_scale_scalar=ones,
+        output1_scale_gate_scalar=ones,
+        output2_scale_scalar=ones,
+        **_moe_shape_args(),
+        routed_scaling_factor=None,
+        enable_pdl=enable_pdl,
+    )
+
+
+def _fp4_block_scale_moe_partitioned(enable_pdl):
+    weight = torch.empty((8, 256, 64), dtype=torch.uint8)
+    scale = torch.empty(0, dtype=torch.uint8)
+    ones = torch.ones(8)
+    prims_ts_fp4_block_scale_moe_partitioned(
+        routing_logits=torch.empty((4, 8)),
+        routing_bias=None,
+        topk_ids=None,
+        topk_weights=None,
+        hidden_states=torch.empty((4, 128), dtype=torch.bfloat16),
+        hidden_states_scale=None,
+        gemm1_weights=[weight, weight],
+        gemm1_weights_scale=[scale, scale],
+        gemm2_weights=[weight, weight],
+        gemm2_weights_scale=[scale, scale],
+        output1_scale_scalar=ones,
+        output1_scale_gate_scalar=ones,
+        output2_scale_scalar=ones,
+        **_moe_shape_args(),
+        partition_resources=SimpleNamespace(),
+        partition_strategy="tp_n_tp_n",
+        enable_pdl=enable_pdl,
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("enable_pdl", (1, "true"))
+@pytest.mark.parametrize(
+    "call",
+    (
+        _bf16_moe,
+        _fp8_per_tensor_scale_moe,
+        _fp8_block_scale_moe,
+        _fp4_block_scale_moe,
+        _fp4_block_scale_moe_partitioned,
+    ),
+    ids=lambda call: call.__name__.lstrip("_"),
+)
+def test_moe_ops_reject_non_bool_enable_pdl(call, enable_pdl):
+    with pytest.raises(TypeError, match="enable_pdl must be a bool or None"):
+        call(enable_pdl)
