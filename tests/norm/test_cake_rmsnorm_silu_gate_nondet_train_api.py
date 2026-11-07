@@ -96,6 +96,7 @@ from __future__ import annotations
 import ast
 import inspect
 import json
+import math
 import shutil
 import subprocess
 import sys
@@ -1811,19 +1812,24 @@ def test_backward_with_infinite_grad_out_in_the_last_row_keeps_the_fp64_classes(
     assert rows % BACKWARD_BLOCK_ROWS[tier] != 0, rows
     assert loader.module_for_rows(arch, role, rows, sms) == name, (rows, sms)
     x, z, w, dy = suite.make(rows, 1, layout="flat", seed=28)
+    # (row, column, sign of the weight-gradient term): a term dy * silu(z) * x
+    # * rstd has dy's sign times that of z * x, so dy takes the product
     for r, c, sign in (
         (rows - 1, 3, 1.0),
         (rows - 1, 40, -1.0),
         (rows - 1, 77, 1.0),
         (rows - 2, 77, -1.0),
     ):
-        dy[r, c] = sign * float("inf")
+        zx = float(z[r, c]) * float(x[r, c])
+        assert zx != 0.0, (r, c)
+        dy[r, c] = math.copysign(float("inf"), sign * zx)
     cols = torch.zeros(D, dtype=torch.bool, device=x.device)
     cols[[3, 40, 77]] = True
     _, dx64, dz64, dw64 = suite.fp64_reference(dy, x, z, w, EPS)
     assert torch.equal(~torch.isfinite(dw64), cols), "FP64 dw columns"
-    assert bool(torch.isposinf(dw64[3])) and bool(torch.isneginf(dw64[40]))
-    assert bool(torch.isnan(dw64[77]))
+    assert bool(torch.isposinf(dw64[3])), dw64[3]
+    assert bool(torch.isneginf(dw64[40])), dw64[40]
+    assert bool(torch.isnan(dw64[77])), dw64[77]
     mag = suite.magnitudes(dy, x, z, EPS)
 
     def out():
