@@ -7069,8 +7069,14 @@ def _cute_dsl_gemm_mxfp8_runner(
     out_dtype: torch.dtype,
     warp_splitk_supports: Optional[Callable[[List[torch.Tensor]], bool]] = None,
     low_m_only: bool = False,
+    sm107_tune_sm100: bool = False,
 ):
-    """``low_m_only``: only the M <= 32 narrow-tile / split-K tactics (SM107)."""
+    """``low_m_only``: only the M <= 32 narrow-tile / split-K tactics (SM107).
+
+    ``sm107_tune_sm100``: the SM107 runner set under
+    ``FLASHINFER_MM_MXFP8_SM107_TUNE_SM100=1``: every tactic at every M, with the
+    same untuned low-M fallback as ``low_m_only`` and its own autotune cache keys.
+    """
     import cutlass
 
     from .kernels.dense_blockscaled_gemm_sm100 import (
@@ -7101,7 +7107,10 @@ def _cute_dsl_gemm_mxfp8_runner(
     class CuteDSLMxfp8GemmRunner(TunableRunner):
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
             _, _, _, _, _, out, _ = inputs
-            return (str(out.dtype), enable_pdl)
+            extras: tuple = (str(out.dtype), enable_pdl)
+            return (
+                extras + _MM_MXFP8_SM107_TUNE_SM100_KEY if sm107_tune_sm100 else extras
+            )
 
         def get_valid_tactics(
             self,
@@ -7191,7 +7200,7 @@ def _cute_dsl_gemm_mxfp8_runner(
                         split_k_kernel_cls,
                         get_device_sm_count(a.device),
                     )
-                    if low_m_only
+                    if low_m_only or sm107_tune_sm100
                     else 1
                 )
                 fallback_tactic = (
@@ -7378,10 +7387,10 @@ def _sm107_mxfp8_cute_dsl_kernel():
 def _use_sm107_mxfp8_cute_dsl(
     major: int, minor: int, a: torch.Tensor, b: torch.Tensor, out: torch.Tensor
 ) -> bool:
-    """Whether mm_mxfp8(backend="cute-dsl") runs the SM107 kernel.
+    """Whether mm_mxfp8(backend="cute-dsl") uses the SM107 runner set.
 
-    On SM107 the SM100 kernels only serve what the SM107 kernel cannot run: a
-    non-contiguous out, or an N or K that breaks its 16-byte alignment.
+    On SM107 only a non-contiguous out, or an N or K that breaks the SM107
+    kernel's 16-byte alignment, takes the SM100/SM103 runner set instead.
     """
     return (
         (major, minor) == (10, 7)
@@ -7392,14 +7401,31 @@ def _use_sm107_mxfp8_cute_dsl(
     )
 
 
+# Autotune cache-key extra of the SM107 runner set's runners under
+# FLASHINFER_MM_MXFP8_SM107_TUNE_SM100=1. A winner is cached under the key of the
+# runner that won, so a set with more candidates must not share the default set's
+# keys: a default-set SM107 winner would otherwise hide the SM100 candidates.
+_MM_MXFP8_SM107_TUNE_SM100_KEY = ("sm107_tune_sm100",)
+
+
+def _mm_mxfp8_sm107_tune_sm100() -> bool:
+    """``FLASHINFER_MM_MXFP8_SM107_TUNE_SM100=1``: on SM107, autotune the SM100
+    kernel at every M next to the SM107 kernel (read on every call)."""
+    return os.environ.get("FLASHINFER_MM_MXFP8_SM107_TUNE_SM100", "0") == "1"
+
+
 _CUTE_DSL_MM_MXFP8_SM107_KERNEL_CACHE: dict[tuple, tuple] = {}
 
 
-def _cute_dsl_gemm_mxfp8_sm107_runner(out_dtype: torch.dtype):
+def _cute_dsl_gemm_mxfp8_sm107_runner(
+    out_dtype: torch.dtype, sm107_tune_sm100: bool = False
+):
     """CuTe-DSL mm_mxfp8 runner for Sm107BlockScaledPersistentDenseGemmKernel.
 
     Tactics are (mma_tiler_mn, cluster_shape_mn, swap_ab, mma_inst_shape_m). The
     kernel has no PDL support, so unlike the SM100 runner it takes no enable_pdl.
+    ``sm107_tune_sm100``: part of the set built under
+    ``FLASHINFER_MM_MXFP8_SM107_TUNE_SM100=1``; only its cache keys differ.
     """
     import cutlass
 
@@ -7416,7 +7442,10 @@ def _cute_dsl_gemm_mxfp8_sm107_runner(out_dtype: torch.dtype):
     class CuteDSLMxfp8Sm107GemmRunner(TunableRunner):
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
             _, _, _, _, _, out, _ = inputs
-            return (str(out.dtype),)
+            extras: tuple = (str(out.dtype),)
+            return (
+                extras + _MM_MXFP8_SM107_TUNE_SM100_KEY if sm107_tune_sm100 else extras
+            )
 
         def get_valid_tactics(
             self,
@@ -7506,11 +7535,15 @@ def _cute_dsl_gemm_mxfp8_sm107_runner(out_dtype: torch.dtype):
 
 
 @functools.cache
-def _cute_dsl_warp_splitk_mxfp8_gemm_runner(enable_pdl: bool):
+def _cute_dsl_warp_splitk_mxfp8_gemm_runner(
+    enable_pdl: bool, sm107_tune_sm100: bool = False
+):
     """Warp split-K MXFP8 runner for ``backend="cute-dsl"`` (M <= 16, K <= 5120).
 
     Registered next to ``CuteDSLMxfp8GemmRunner`` so one autotune call profiles
     both; it offers no tactics for a profile it cannot serve.
+    ``sm107_tune_sm100``: part of the SM107 set built under
+    ``FLASHINFER_MM_MXFP8_SM107_TUNE_SM100=1``; only its cache keys differ.
     """
     from .kernels.dense_mxfp8_gemm_warp_splitk import (
         MxFp8WarpSplitKTactic,
@@ -7524,7 +7557,10 @@ def _cute_dsl_warp_splitk_mxfp8_gemm_runner(enable_pdl: bool):
     class CuteDSLMxfp8WarpSplitKRunner(TunableRunner):
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
             _, _, _, _, _, out, _ = inputs
-            return (str(out.dtype), enable_pdl)
+            extras: tuple = (str(out.dtype), enable_pdl)
+            return (
+                extras + _MM_MXFP8_SM107_TUNE_SM100_KEY if sm107_tune_sm100 else extras
+            )
 
         def supports_inputs(
             self, inputs: List[torch.Tensor], check_m: bool = True
@@ -7631,17 +7667,27 @@ def _cute_dsl_mxfp8_runners(
 def _cute_dsl_mxfp8_runners_sm107(
     out_dtype: torch.dtype, inputs: List[torch.Tensor]
 ) -> List[TunableRunner]:
-    """SM107 ``mm_mxfp8(backend="cute-dsl")`` runners; ``[0]`` is the untuned default."""
+    """SM107 ``mm_mxfp8(backend="cute-dsl")`` runners; ``[0]`` is the untuned default.
+
+    The SM100 runner offers only its M <= 32 tactics here, unless
+    ``FLASHINFER_MM_MXFP8_SM107_TUNE_SM100=1`` lets it compete at every M. That
+    does not change the untuned order below, only what autotuning profiles.
+    """
     from ..cute_dsl.availability import is_cute_dsl_experimental_available
 
-    sm107 = _cute_dsl_gemm_mxfp8_sm107_runner(out_dtype)
-    low_m = _cute_dsl_gemm_mxfp8_runner(10, 7, True, out_dtype, low_m_only=True)
+    tune_sm100 = _mm_mxfp8_sm107_tune_sm100()
+    sm107 = _cute_dsl_gemm_mxfp8_sm107_runner(out_dtype, sm107_tune_sm100=tune_sm100)
+    sm100 = _cute_dsl_gemm_mxfp8_runner(
+        10, 7, True, out_dtype, low_m_only=not tune_sm100, sm107_tune_sm100=tune_sm100
+    )
     a, b, _, _, _, out, _ = inputs
     m, k = a.shape
     n = b.shape[1]
     warp = None
     if is_cute_dsl_experimental_available():
-        warp = _cute_dsl_warp_splitk_mxfp8_gemm_runner(enable_pdl=True)
+        warp = _cute_dsl_warp_splitk_mxfp8_gemm_runner(
+            enable_pdl=True, sm107_tune_sm100=tune_sm100
+        )
         # The runner set must not depend on M; the warp runner gates M per tactic.
         if not warp.supports_inputs(inputs, check_m=False):
             warp = None
@@ -7658,12 +7704,12 @@ def _cute_dsl_mxfp8_runners_sm107(
         and k <= 2048
         and warp_grid_fits
     ):
-        return [warp, low_m, sm107]
-    # The low-M runner goes first only up to M=16: its 32-token tile with K split
+        return [warp, sm100, sm107]
+    # The SM100 runner goes first only up to M=16: its 32-token tile with K split
     # in 4 is slower than the SM107 kernel at M=17-32.
     if m <= 16 and out.is_contiguous():
-        return [low_m, sm107] + tail
-    return [sm107, low_m] + tail
+        return [sm100, sm107] + tail
+    return [sm107, sm100] + tail
 
 
 @functools.lru_cache(maxsize=64)
@@ -7908,7 +7954,13 @@ def mm_mxfp8(
           small-M decode tiles. It requires CUDA 13+, nvidia-cutlass-dsl >=
           4.6.0, 1D swizzled 128x4 scales, and K divisible by 128.
         - The ``"cute-dsl"`` backend currently requires swizzled 1D scales
-          (``mxfp8_quantize(..., is_sf_swizzled_layout=True)``).
+          (``mxfp8_quantize(..., is_sf_swizzled_layout=True)``). On SM107, for a
+          contiguous ``out`` with ``N % 8 == 0`` and ``K % 16 == 0``, it
+          autotunes the SM107 kernel at every M and the SM100 kernels (PDL,
+          split-K, warp split-K) at M <= 32 only.
+          ``FLASHINFER_MM_MXFP8_SM107_TUNE_SM100=1`` also autotunes the SM100
+          kernel at M > 32: it launches with PDL, the SM107 kernel does not. The
+          untuned default stays the same.
         - The ``"cutedsl_low_latency"`` backend requires SM100/SM103, ``M <= 8``,
           ``K % 128 == 0``, and swizzled 1D scales in the 128x4 layout.
         - The ``"trtllm"`` requires b to be quantized with 128x4 swizzle layout and shuffled.
