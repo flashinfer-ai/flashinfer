@@ -8538,13 +8538,16 @@ def _zero_gradient(
 ) -> torch.Tensor:
     """``cast(g * 0)`` of a :func:`_zero_accumulator` in a new ``out_dtype`` tensor of its shape, without reading or
     materializing the FP32 accumulator: the bits :func:`scale_cast` gives for a zero FP32 accumulator (``+0``, ``-0``
-    for a negative ``g``, NaN for a non-finite one)."""
+    for a negative ``g``, NaN for a non-finite one).  The product is formed in FP32 and cast once, as there, so a
+    finite ``g`` beyond the BF16 range still gives a signed zero."""
     if out_dtype not in GRAD_WEIGHT_DTYPES:
         raise ValueError("the cast produces bfloat16 or float32")
-    out = torch.zeros(acc.shape, dtype=out_dtype, device=acc.device)
+    zero = torch.zeros((), dtype=torch.float32, device=acc.device)
     if grad is not None:
-        out.mul_(grad.detach().reshape(()).to(device=acc.device, dtype=torch.float32))
-    return out
+        zero = zero * grad.detach().reshape(()).to(
+            device=acc.device, dtype=torch.float32
+        )
+    return torch.empty(acc.shape, dtype=out_dtype, device=acc.device).copy_(zero)
 
 
 def _empty_forward(
@@ -8564,7 +8567,8 @@ def _empty_forward(
     ``fuse_dw_cast`` / ``dx_finalize`` are the call's switches (``None`` = the documented default), so the memory
     report records the form the caller asked for, as a launched call's would.  ``backend``: the call's, kept on the
     result for :meth:`ForwardResult.backward`.  The loss entry's ``dw_acc`` is a zero accumulator without ``[V, H]``
-    storage (:func:`_zero_accumulator`): the backward forms the zero weight gradient in the output dtype."""
+    storage (:func:`_zero_accumulator`): the backward forms the zero weight gradient in the output dtype, and the
+    memory report counts the accumulator's one FP32 element."""
     device = X.device
     T = int(problem.num_rows)
     memory = memory_report(
@@ -8581,6 +8585,9 @@ def _empty_forward(
         fuse_dw_cast=fuse_dw_cast,
         dx_finalize=dx_finalize,
     )
+    if problem.entry == "loss" and "dW_acc" in memory["accumulators"]:
+        memory["accumulators"]["dW_acc"] = 4  # the zero accumulator's one element
+        memory["accumulator_bytes"] = sum(memory["accumulators"].values())
     zeros = torch.zeros((T,), dtype=torch.float32, device=device)
     if problem.entry == "loss":
         return ForwardResult(

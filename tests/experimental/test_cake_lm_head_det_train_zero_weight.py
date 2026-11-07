@@ -1080,21 +1080,59 @@ def test_all_zero_weight_split_result(module_name):
     assert fr.backend == "reference"
     assert tuple(fr.dw_acc.shape) == (V_HOST, H_HOST)
     assert fr.dw_acc.untyped_storage().nbytes() <= 4
+    assert fr.memory["accumulators"]["dW_acc"] == 4
+    assert fr.memory["accumulator_bytes"] == sum(fr.memory["accumulators"].values())
     zero_acc = torch.zeros((V_HOST, H_HOST), dtype=torch.float32, device=DEV)
-    for g in (None, 2.0, -2.0):
-        grad = None if g is None else torch.tensor(g, device=DEV)
+    f32_max = torch.finfo(torch.float32).max  # finite, beyond the BF16 range
+    for g in (None, 2.0, -2.0, f32_max, -f32_max, math.inf, math.nan):
+        grad = None if g is None else torch.tensor(g, dtype=torch.float32, device=DEV)
         dx, dw = fr.backward(grad)
         assert dw.dtype == torch.bfloat16 and tuple(dw.shape) == (V_HOST, H_HOST)
         ref = cake_backend.scale_cast(
             zero_acc, grad, torch.bfloat16, backend="reference"
         )
-        assert _same_bits(dw, ref), g
-        assert _all_plus_zero(dx)
+        if g is None or math.isfinite(g):
+            negative = g is not None and g < 0
+            assert _same_bits(dw, ref), g
+            assert bool((dw == 0).all()), g
+            assert bool((torch.signbit(dw) == negative).all()), g
+            assert _all_plus_zero(dx)
+        else:
+            assert bool(torch.isnan(dw).all() and torch.isnan(ref).all()), g
     _, dw32 = fr.backward(grad_weight_dtype=torch.float32)
     assert dw32.dtype == torch.float32 and _all_plus_zero(dw32)
     assert _all_plus_zero(out["loss"])
     assert out["dW"].dtype == torch.bfloat16 and _all_plus_zero(out["dW"])
     assert _all_plus_zero(out["dX"])
+
+
+@pytest.mark.parametrize("module_name", ["main", "opt_in"])
+@pytest.mark.parametrize("backend", ["reference", "cake"])
+def test_zero_row_result(module_name, backend):
+    """A call without rows (no binding, no launch): the result keeps the call's backend, its memory report counts the
+    zero ``dw_acc``'s one FP32 element (not an FP32 ``[V, H]`` buffer), and the backward's ``dW`` is the FP32 product
+    ``0 * g`` cast once (``+0``; ``-0`` for a negative ``g``, also beyond the BF16 range)."""
+    module = cake_backend if module_name == "main" else opt_in
+    W = torch.zeros(V_HOST, H_HOST, dtype=torch.bfloat16, device=DEV)
+    X0 = torch.zeros(0, H_HOST, dtype=torch.bfloat16, device=DEV)
+    labels0 = torch.zeros(0, dtype=torch.int64, device=DEV)
+    fr = module.forward_loss(
+        X0, W, labels0, objective="ce", loss_div=1.0, backend=backend
+    )
+    assert fr.backend == backend
+    assert fr.dw_acc.untyped_storage().nbytes() <= 4
+    assert fr.memory["accumulators"] == {"dX_acc": 0, "dW_acc": 4}
+    assert fr.memory["accumulator_bytes"] == 4
+    f32_max = torch.finfo(torch.float32).max
+    for g in (None, 2.0, f32_max, -f32_max):
+        grad = None if g is None else torch.tensor(g, dtype=torch.float32, device=DEV)
+        dx, dw = fr.backward(grad)
+        assert tuple(dx.shape) == (0, H_HOST) and dx.dtype == torch.bfloat16
+        assert dw.dtype == torch.bfloat16 and tuple(dw.shape) == (V_HOST, H_HOST)
+        if g is None or g > 0:
+            assert _all_plus_zero(dw), g
+        else:
+            assert bool((dw == 0).all() and torch.signbit(dw).all()), g
 
 
 def test_memory_plan_counts_the_exact_loss_phases():
