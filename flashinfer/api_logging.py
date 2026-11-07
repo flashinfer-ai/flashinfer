@@ -742,32 +742,35 @@ def _graph_tensor_plan(tensors, snapshot_keys):
     """Plan bounded storage copies using metadata only, before size admission."""
     groups = {}
     for key, tensor in tensors.items():
-        if tensor.layout != torch.strided or tensor.is_conj() or tensor.is_neg():
-            raise ValueError(
-                "Graph snapshots support dense strided tensors without conjugate/negative views"
-            )
-        # PyTorch's overlap status 2 means "too hard", not non-overlapping.
-        # Prove disjoint strides using metadata only, including sliced views.
-        # Conservatively reject layouts this sufficient condition cannot prove.
-        required_span = 1
-        if tensor.numel():
-            for stride, size in sorted(
-                (s, n)
-                for n, s in zip(tensor.shape, tensor.stride(), strict=True)
-                if n > 1
-            ):
-                if stride < required_span:
-                    raise ValueError(
-                        "Graph snapshots require provably non-overlapping tensor views"
-                    )
-                required_span += (size - 1) * stride
         storage = tensor.untyped_storage()
         groups.setdefault((tensor.device, storage._cdata), []).append((key, tensor))
     plan = []
     for items in groups.values():
         copy = any(key in snapshot_keys for key, _ in items)
+        # A read-only tensor that is not dumped and has no alias in this call is
+        # left on the reference path; its layout must not veto the whole dump.
         if not copy and len(items) == 1:
             continue
+        for _, tensor in items:
+            if tensor.layout != torch.strided or tensor.is_conj() or tensor.is_neg():
+                raise ValueError(
+                    "Graph snapshots support dense strided tensors without conjugate/negative views"
+                )
+            # PyTorch's overlap status 2 means "too hard", not non-overlapping.
+            # Prove disjoint strides using metadata only, including sliced views.
+            # Conservatively reject layouts this sufficient condition cannot prove.
+            required_span = 1
+            if tensor.numel():
+                for stride, size in sorted(
+                    (s, n)
+                    for n, s in zip(tensor.shape, tensor.stride(), strict=True)
+                    if n > 1
+                ):
+                    if stride < required_span:
+                        raise ValueError(
+                            "Graph snapshots require provably non-overlapping tensor views"
+                        )
+                    required_span += (size - 1) * stride
         first = items[0][1]
         if any(t.dtype != first.dtype for _, t in items):
             raise ValueError(
@@ -1855,7 +1858,24 @@ def replay_from_dump(
                         )
                         - backing_keys
                     )
-                    if metadata.get(
+                    if (
+                        execution_result is None
+                        and not expected_outputs
+                        and metadata.get("execution_status") == "completed"
+                    ):
+                        # An in-place API returning None has no post-call state
+                        # unless snapshots were enabled before capture. Report
+                        # that distinctly instead of calling it an incomplete dump.
+                        result_dict["comparison_match"] = None
+                        result_dict["comparison_error"] = (
+                            "No post-call state recorded for an in-place call; "
+                            "enable FLASHINFER_DUMP_GRAPH_SNAPSHOTS to compare"
+                        )
+                        _logger.info(
+                            "Replay comparison skipped: no post-call state was "
+                            "recorded for this in-place call."
+                        )
+                    elif metadata.get(
                         "execution_status"
                     ) != "completed" or recorded_keys != set(expected_outputs):
                         result_dict["comparison_match"] = None

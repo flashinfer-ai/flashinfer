@@ -51,6 +51,16 @@ def _graph_snapshot_alias_op(
     odd.add_(3)
 
 
+@flashinfer_api
+@register_custom_op(
+    "flashinfer::test_logging_graph_readonly",
+    mutates_args=("x",),
+)
+def _graph_snapshot_readonly_op(x: torch.Tensor, w: torch.Tensor) -> None:
+    """Declared mutation plus a read-only stride-0 argument."""
+    x.add_(1)
+
+
 def _snapshot_review_identity(x, repeated, distinct):
     assert x is repeated
     assert x is not distinct
@@ -380,6 +390,41 @@ def test_snapshot_output_completion(snapshot_logging, monkeypatch, captured, com
     else:
         assert replay["comparison_match"] is None
         assert replay["comparison_error"] == "Output dump is incomplete"
+
+
+@pytest.mark.cpu_only
+def test_graph_snapshot_readonly_stride0_arg_cpu(snapshot_logging, monkeypatch):
+    """A read-only singleton must not veto the whole call's dump."""
+    logging, root = snapshot_logging
+    logged_op = logging.flashinfer_api(inspect.unwrap(_graph_snapshot_readonly_op))
+    x = torch.arange(4, dtype=torch.float32)
+    w = torch.ones(4, 64, dtype=torch.float32).expand(4, 64)
+    with monkeypatch.context() as capture:
+        capture.setattr(logging, "_is_current_stream_capturing", lambda: True)
+        assert logged_op(x, w) is None
+    logging.flush_graph_dumps(synchronize=False)
+    call = _calls(root, "_graph_snapshot_readonly_op")[0]
+    snapshot = call / "graph_flushes" / "flush_0001"
+    assert snapshot.exists()
+    inputs = _load(snapshot, "inputs")
+    assert "arg_1" in inputs
+    assert inputs["arg_1"].stride() == (0, 1)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("snapshot_logging", [False], indirect=True)
+def test_none_return_without_snapshots_has_distinct_message(snapshot_logging):
+    """No post-call state is a distinct status, not an incomplete dump."""
+    logging, _ = snapshot_logging
+    func = _snapshot_review_none
+    x = torch.arange(8, dtype=torch.float32)
+    call = logging._dump_function_inputs(func, func.__name__, (x,), {})
+    logging._dump_function_outputs(call, func(x), args=(x,))
+    replay = logging.replay_from_dump(
+        call, device="cpu", run=True, compare_outputs=True
+    )
+    assert replay["comparison_match"] is None
+    assert "No post-call state recorded" in replay["comparison_error"]
 
 
 @pytest.mark.cpu_only
