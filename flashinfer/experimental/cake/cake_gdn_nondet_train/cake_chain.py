@@ -2530,11 +2530,12 @@ def cake_gdn_nondet_train_backward(
     ``dv``, ``dg``, ``dbeta`` and ``dinitial_state``.  The tape must carry this package's tag (``"mode": "nondet"``):
     any other tape, such as one of the deterministic package, is refused (``ValueError``).  ``grad_qkv``, three
     tensors of the shapes of ``dq``, ``dk`` and ``dv`` with a unit channel stride, head stride 128 and any token-row
-    stride (the head views of one packed gradient row), or a callable that returns them, receives ``dq`` / ``dk`` /
-    ``dv`` in place when the call's tail is a cluster tail of ``F32X_TAILS`` (a callable is called then, right before
-    the tail, and only then); the returned ``dq`` / ``dk`` / ``dv`` are then those tensors (other tails return tensors
-    of their own).  With PyTorch's deterministic algorithms enabled it runs as usual: every launch is fixed-order
-    today."""
+    stride (the head views of one packed gradient row), or a callable that returns them (optionally followed by
+    their common token-row stride, which the tail then takes without reading their strides), receives ``dq`` /
+    ``dk`` / ``dv`` in place when the call's tail is a cluster tail of ``F32X_TAILS`` (a callable is called then,
+    right before the tail, and only then); the returned ``dq`` / ``dk`` / ``dv`` are then those tensors (other tails
+    return tensors of their own).  With PyTorch's deterministic algorithms enabled it runs as usual: every launch is
+    fixed-order today."""
     if forward.get("mode") != _TAPE_MODE:
         raise ValueError("cake_gdn_nondet_train_backward reads the tape of a non-deterministic forward "
                          "(cake_gdn_nondet_train_forward, tag 'mode': 'nondet'); this tape does not carry that tag "
@@ -2689,8 +2690,12 @@ def cake_gdn_nondet_train_backward(
                         1 if has_initial_state else 0, scale)  # fmt: skip
 
             dhu_tc2(0, na)
+        qkv_stride = None
         if grad_qkv is not None and form in F32X_TAILS:
-            dq, dk, dv = grad_qkv() if callable(grad_qkv) else grad_qkv
+            qkv = grad_qkv() if callable(grad_qkv) else grad_qkv
+            dq, dk, dv = qkv[0], qkv[1], qkv[2]
+            if len(qkv) > 3:
+                qkv_stride = qkv[3]
         else:
             dq = torch.empty(qn.shape, dtype=qn.dtype, device=device)
             dk = torch.empty(kn.shape, dtype=kn.dtype, device=device)
@@ -2705,10 +2710,14 @@ def cake_gdn_nondet_train_backward(
         normalize = 1 if forward.get("normalize_qk", True) else 0
         rstd_q, rstd_k = forward["rstd_q"], forward["rstd_k"]
         num_chunks = meta.num_chunks
-        # the token-row strides of v, dq, dk and dv, which these tails take after their operands
-        strides = (
-            tuple(_row_stride(t) for t in (v, dq, dk, dv)) if form in F32X_TAILS else ()
-        )
+        # the token-row strides of v, dq, dk and dv, which these tails take after their operands (dq / dk / dv's
+        # from the caller when it gives it)
+        if form not in F32X_TAILS:
+            strides = ()
+        elif qkv_stride is not None:
+            strides = (_row_stride(v), qkv_stride, qkv_stride, qkv_stride)
+        else:
+            strides = tuple(_row_stride(t) for t in (v, dq, dk, dv))
         if form in GROUP_TAILS and groups is None:
             # one launch over the whole table, issued directly: the host path of the deterministic package's tail
             _launch(form + ("_bf16" if dbeta_bf16 else ""), num_chunks * num_v_heads, 1, 1, qn, kn, rstd_q, rstd_k,
@@ -3266,7 +3275,7 @@ class CakeGDNNondetPackedFunction(torch.autograd.Function):
                 d_row.as_strided(v_shape, strides, 2 * num_heads * dim),
             )
             made.append((d_row, views))
-            return views
+            return (*views, width)
 
         dq, dk, dv, dg, dbeta, dh0 = _function_backward(ctx, do, dht, row_views)
         if not made:
