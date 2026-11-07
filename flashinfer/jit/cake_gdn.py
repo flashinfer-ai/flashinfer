@@ -667,13 +667,15 @@ def _cake_gdn_prefill_grid_x(
 # full-DV stateful bodies take their ``_gatestream_full`` twin (the epilogue warp streams the strided successor
 # tile's gate/beta prologue during the current tile) when a CTA owns at least two work tiles under the grid rule
 # and the mean sequence length is at most 512 tokens; single-chunk and indexed-state launches and every other key
-# stay on their base.  Host scalars only.
+# stay on their base.  The FP16-I/O body's twin ships on sm_107a only: elsewhere its key finds no twin record and
+# runs its base (see ``select_cake_gdn_prefill_variant``).  Host scalars only.
 _GATE_STREAM_FULL_MIN_TILES_PER_CTA = 2
 _GATE_STREAM_FULL_MAX_MEAN_SEQ_LEN = 512
 _GATE_STREAM_FULL_BASES = frozenset(
     {
         "flashinfer_blackwell_gdn_prefill_initial",
         "flashinfer_blackwell_gdn_prefill_initial_bf16state",
+        "flashinfer_blackwell_gdn_prefill_initial_f16io",
     }
 )
 # The architectures whose gate-stream twins also ship a ``_gatestream_full_pf`` twin: the same body
@@ -1293,7 +1295,10 @@ def select_cake_gdn_prefill_variant(
         # The gate-stream twin is a performance specialization of the base body: the exporter
         # ships it for the head geometries its representative rows reach (the Hq16/Hv32,
         # Hq8/Hv16 and Hq4/Hv8 families; on sm_107a the FP32-state twin also covers the
-        # Qwen3-Next / Qwen3.5 TP2/TP4/TP8 splits Hq2/Hv4, Hq8/Hv32, Hq4/Hv16 and Hq2/Hv8).
+        # Qwen3-Next / Qwen3.5 TP2/TP4/TP8 splits Hq2/Hv4, Hq8/Hv32, Hq4/Hv16 and Hq2/Hv8, the
+        # BF16-state twin Hq8/Hv32, Hq4/Hv16 and Hq2/Hv8, and the FP16-I/O twin, sm_107a only,
+        # the fixed-head geometries of its base records: Hq2/Hv8, Hq4/Hv16, Hq8/Hv32,
+        # Hq16/Hv16, Hq16/Hv32, Hq16/Hv64 and Hq32/Hv32).
         # A key whose twin is not in the manifest runs its base record, exactly as the route
         # did before the twin existed; only a missing base fails closed below.
         gate_stream_full = False

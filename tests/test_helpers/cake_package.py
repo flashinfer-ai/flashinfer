@@ -25,6 +25,7 @@ PACKAGES: dict[str, str] = {
     "cake_sage_block_sparse_attention": "flashinfer.cake_sage_block_sparse_attention_backend",
     "cake.cake_mhc_det_train": "flashinfer.experimental.cake.cake_mhc_det_train",
     "cake.cake_mhc_head_det_train": "flashinfer.experimental.cake.cake_mhc_head_det_train",
+    "cake.cake_mhc_head_nondet_train": "flashinfer.experimental.cake.cake_mhc_head_nondet_train",
     "cake.cake_dsa_sparse_attention_nondet_train": "flashinfer.experimental.cake.cake_dsa_sparse_attention_nondet_train",
     "cake.cake_dsa_indexer_det_train": "flashinfer.experimental.cake.cake_dsa_indexer_det_train",
     "cake.cake_lm_head_det_train": "flashinfer.experimental.cake.cake_lm_head_det_train",

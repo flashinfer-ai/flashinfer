@@ -12213,6 +12213,84 @@
     {
       "host_binding": {
         "cuda_symbol": "kernel_cake_gdn_453069def52efc7aca98",
+        "module_ident": "cake_gdn_453069def52efc7aca98_2368e0ea90",
+        "params": {
+          "HQ": 2,
+          "HV": 8,
+          "IO_DL_CODE": 4,
+          "IO_TMA_DTYPE": "CU_TENSOR_MAP_DATA_TYPE_BFLOAT16",
+          "STATE_DL_BITS": 16,
+          "STATE_DL_CODE": 4,
+          "STATE_SLOT_STRIDE": 131072,
+          "TILES_PER_SEQ": 8
+        },
+        "shim_namespace": "e93368e7d52ec9ff",
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
+      },
+      "metadata_i64": true,
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_bf16state_gatestream_full_sm107a_i64meta_d28a977c404a",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_453069def52efc7aca98_1ebc50ce7606.cu"
+        }
+      ],
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 2,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 3,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      }
+    },
+    {
+      "host_binding": {
+        "cuda_symbol": "kernel_cake_gdn_453069def52efc7aca98_pf",
+        "module_ident": "cake_gdn_453069def52efc7aca98_pf_bfbbeeb8e5",
+        "params": {
+          "HQ": 2,
+          "HV": 8,
+          "IO_DL_CODE": 4,
+          "IO_TMA_DTYPE": "CU_TENSOR_MAP_DATA_TYPE_BFLOAT16",
+          "STATE_DL_BITS": 16,
+          "STATE_DL_CODE": 4,
+          "STATE_SLOT_STRIDE": 131072,
+          "TILES_PER_SEQ": 8
+        },
+        "shim_namespace": "da30e2218b780716",
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
+      },
+      "metadata_i64": true,
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_bf16state_gatestream_full_pf_sm107a_i64meta_d28a977c404a",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_453069def52efc7aca98_pf_7af7df3ad361.cu"
+        }
+      ],
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 2,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 3,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      }
+    },
+    {
+      "host_binding": {
+        "cuda_symbol": "kernel_cake_gdn_453069def52efc7aca98",
         "module_ident": "cake_gdn_453069def52efc7aca98_2d9a8ca97e",
         "params": {
           "HQ": 16,
@@ -12719,6 +12797,552 @@
         "HEAD_GROUP_LOG2": 2,
         "IS_GQA": 0,
         "NUM_O_HEADS_LOG2": 3,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      }
+    },
+    {
+      "host_binding": {
+        "cuda_symbol": "kernel_cake_gdn_2b64b167aeacd18e9b2b_gs",
+        "module_ident": "cake_gdn_2b64b167aeacd18e9b2b_gs_ffed90ccf5",
+        "params": {
+          "HQ": 2,
+          "HV": 8,
+          "IO_DL_CODE": 2,
+          "IO_TMA_DTYPE": "CU_TENSOR_MAP_DATA_TYPE_FLOAT16",
+          "STATE_DL_BITS": 32,
+          "STATE_DL_CODE": 2,
+          "STATE_SLOT_STRIDE": 131072,
+          "TILES_PER_SEQ": 8
+        },
+        "shim_namespace": "8dd6a73d7e5e192f",
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
+      },
+      "metadata_i64": true,
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_f16io_gatestream_full_sm107a_i64meta_1e9b588b8066",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_2b64b167aeacd18e9b2b_gs_c007e01efa00.cu"
+        }
+      ],
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 2,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 3,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      }
+    },
+    {
+      "host_binding": {
+        "cuda_symbol": "kernel_cake_gdn_2b64b167aeacd18e9b2b_gs_pf",
+        "module_ident": "cake_gdn_2b64b167aeacd18e9b2b_gs_pf_31dcf9797c",
+        "params": {
+          "HQ": 2,
+          "HV": 8,
+          "IO_DL_CODE": 2,
+          "IO_TMA_DTYPE": "CU_TENSOR_MAP_DATA_TYPE_FLOAT16",
+          "STATE_DL_BITS": 32,
+          "STATE_DL_CODE": 2,
+          "STATE_SLOT_STRIDE": 131072,
+          "TILES_PER_SEQ": 8
+        },
+        "shim_namespace": "5cf62f6495a04c53",
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
+      },
+      "metadata_i64": true,
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_f16io_gatestream_full_pf_sm107a_i64meta_1e9b588b8066",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_2b64b167aeacd18e9b2b_gs_pf_68d83e4233d8.cu"
+        }
+      ],
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 2,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 3,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      }
+    },
+    {
+      "host_binding": {
+        "cuda_symbol": "kernel_cake_gdn_2b64b167aeacd18e9b2b_gs",
+        "module_ident": "cake_gdn_2b64b167aeacd18e9b2b_gs_e79a306a1b",
+        "params": {
+          "HQ": 8,
+          "HV": 32,
+          "IO_DL_CODE": 2,
+          "IO_TMA_DTYPE": "CU_TENSOR_MAP_DATA_TYPE_FLOAT16",
+          "STATE_DL_BITS": 32,
+          "STATE_DL_CODE": 2,
+          "STATE_SLOT_STRIDE": 524288,
+          "TILES_PER_SEQ": 32
+        },
+        "shim_namespace": "ea732b144973268f",
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
+      },
+      "metadata_i64": true,
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_f16io_gatestream_full_sm107a_i64meta_3400019c1c9d",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_2b64b167aeacd18e9b2b_gs_c007e01efa00.cu"
+        }
+      ],
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 2,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 5,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      }
+    },
+    {
+      "host_binding": {
+        "cuda_symbol": "kernel_cake_gdn_2b64b167aeacd18e9b2b_gs_pf",
+        "module_ident": "cake_gdn_2b64b167aeacd18e9b2b_gs_pf_aabe09d5d3",
+        "params": {
+          "HQ": 8,
+          "HV": 32,
+          "IO_DL_CODE": 2,
+          "IO_TMA_DTYPE": "CU_TENSOR_MAP_DATA_TYPE_FLOAT16",
+          "STATE_DL_BITS": 32,
+          "STATE_DL_CODE": 2,
+          "STATE_SLOT_STRIDE": 524288,
+          "TILES_PER_SEQ": 32
+        },
+        "shim_namespace": "93ac909929f35866",
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
+      },
+      "metadata_i64": true,
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_f16io_gatestream_full_pf_sm107a_i64meta_3400019c1c9d",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_2b64b167aeacd18e9b2b_gs_pf_68d83e4233d8.cu"
+        }
+      ],
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 2,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 5,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      }
+    },
+    {
+      "host_binding": {
+        "cuda_symbol": "kernel_cake_gdn_2b64b167aeacd18e9b2b_gs",
+        "module_ident": "cake_gdn_2b64b167aeacd18e9b2b_gs_41a70f1842",
+        "params": {
+          "HQ": 16,
+          "HV": 32,
+          "IO_DL_CODE": 2,
+          "IO_TMA_DTYPE": "CU_TENSOR_MAP_DATA_TYPE_FLOAT16",
+          "STATE_DL_BITS": 32,
+          "STATE_DL_CODE": 2,
+          "STATE_SLOT_STRIDE": 524288,
+          "TILES_PER_SEQ": 32
+        },
+        "shim_namespace": "f525715f233749bb",
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
+      },
+      "metadata_i64": true,
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_f16io_gatestream_full_sm107a_i64meta_4b324091b0c8",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_2b64b167aeacd18e9b2b_gs_c007e01efa00.cu"
+        }
+      ],
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 1,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 5,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      }
+    },
+    {
+      "host_binding": {
+        "cuda_symbol": "kernel_cake_gdn_2b64b167aeacd18e9b2b_gs_pf",
+        "module_ident": "cake_gdn_2b64b167aeacd18e9b2b_gs_pf_afabdc34b7",
+        "params": {
+          "HQ": 16,
+          "HV": 32,
+          "IO_DL_CODE": 2,
+          "IO_TMA_DTYPE": "CU_TENSOR_MAP_DATA_TYPE_FLOAT16",
+          "STATE_DL_BITS": 32,
+          "STATE_DL_CODE": 2,
+          "STATE_SLOT_STRIDE": 524288,
+          "TILES_PER_SEQ": 32
+        },
+        "shim_namespace": "118b9698c1a55fbf",
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
+      },
+      "metadata_i64": true,
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_f16io_gatestream_full_pf_sm107a_i64meta_4b324091b0c8",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_2b64b167aeacd18e9b2b_gs_pf_68d83e4233d8.cu"
+        }
+      ],
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 1,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 5,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      }
+    },
+    {
+      "host_binding": {
+        "cuda_symbol": "kernel_cake_gdn_2b64b167aeacd18e9b2b_gs",
+        "module_ident": "cake_gdn_2b64b167aeacd18e9b2b_gs_fbdd6bf3a9",
+        "params": {
+          "HQ": 4,
+          "HV": 16,
+          "IO_DL_CODE": 2,
+          "IO_TMA_DTYPE": "CU_TENSOR_MAP_DATA_TYPE_FLOAT16",
+          "STATE_DL_BITS": 32,
+          "STATE_DL_CODE": 2,
+          "STATE_SLOT_STRIDE": 262144,
+          "TILES_PER_SEQ": 16
+        },
+        "shim_namespace": "897bcfb8d65ca894",
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
+      },
+      "metadata_i64": true,
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_f16io_gatestream_full_sm107a_i64meta_892e1bbebce0",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_2b64b167aeacd18e9b2b_gs_c007e01efa00.cu"
+        }
+      ],
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 2,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 4,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      }
+    },
+    {
+      "host_binding": {
+        "cuda_symbol": "kernel_cake_gdn_2b64b167aeacd18e9b2b_gs_pf",
+        "module_ident": "cake_gdn_2b64b167aeacd18e9b2b_gs_pf_20a6eec859",
+        "params": {
+          "HQ": 4,
+          "HV": 16,
+          "IO_DL_CODE": 2,
+          "IO_TMA_DTYPE": "CU_TENSOR_MAP_DATA_TYPE_FLOAT16",
+          "STATE_DL_BITS": 32,
+          "STATE_DL_CODE": 2,
+          "STATE_SLOT_STRIDE": 262144,
+          "TILES_PER_SEQ": 16
+        },
+        "shim_namespace": "a5e5c9383f8b9f5e",
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
+      },
+      "metadata_i64": true,
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_f16io_gatestream_full_pf_sm107a_i64meta_892e1bbebce0",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_2b64b167aeacd18e9b2b_gs_pf_68d83e4233d8.cu"
+        }
+      ],
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 2,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 4,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      }
+    },
+    {
+      "host_binding": {
+        "cuda_symbol": "kernel_cake_gdn_2b64b167aeacd18e9b2b_gs",
+        "module_ident": "cake_gdn_2b64b167aeacd18e9b2b_gs_de2478ee87",
+        "params": {
+          "HQ": 16,
+          "HV": 64,
+          "IO_DL_CODE": 2,
+          "IO_TMA_DTYPE": "CU_TENSOR_MAP_DATA_TYPE_FLOAT16",
+          "STATE_DL_BITS": 32,
+          "STATE_DL_CODE": 2,
+          "STATE_SLOT_STRIDE": 1048576,
+          "TILES_PER_SEQ": 64
+        },
+        "shim_namespace": "3925d2bac126f9c0",
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
+      },
+      "metadata_i64": true,
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_f16io_gatestream_full_sm107a_i64meta_926c590d59ab",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_2b64b167aeacd18e9b2b_gs_c007e01efa00.cu"
+        }
+      ],
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 2,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 6,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      }
+    },
+    {
+      "host_binding": {
+        "cuda_symbol": "kernel_cake_gdn_2b64b167aeacd18e9b2b_gs_pf",
+        "module_ident": "cake_gdn_2b64b167aeacd18e9b2b_gs_pf_32087a1d0a",
+        "params": {
+          "HQ": 16,
+          "HV": 64,
+          "IO_DL_CODE": 2,
+          "IO_TMA_DTYPE": "CU_TENSOR_MAP_DATA_TYPE_FLOAT16",
+          "STATE_DL_BITS": 32,
+          "STATE_DL_CODE": 2,
+          "STATE_SLOT_STRIDE": 1048576,
+          "TILES_PER_SEQ": 64
+        },
+        "shim_namespace": "681537caa068cc79",
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
+      },
+      "metadata_i64": true,
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_f16io_gatestream_full_pf_sm107a_i64meta_926c590d59ab",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_2b64b167aeacd18e9b2b_gs_pf_68d83e4233d8.cu"
+        }
+      ],
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 2,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 6,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      }
+    },
+    {
+      "host_binding": {
+        "cuda_symbol": "kernel_cake_gdn_2b64b167aeacd18e9b2b_gs",
+        "module_ident": "cake_gdn_2b64b167aeacd18e9b2b_gs_ce787b34c0",
+        "params": {
+          "HQ": 32,
+          "HV": 32,
+          "IO_DL_CODE": 2,
+          "IO_TMA_DTYPE": "CU_TENSOR_MAP_DATA_TYPE_FLOAT16",
+          "STATE_DL_BITS": 32,
+          "STATE_DL_CODE": 2,
+          "STATE_SLOT_STRIDE": 524288,
+          "TILES_PER_SEQ": 32
+        },
+        "shim_namespace": "6f32a9311b448f0e",
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
+      },
+      "metadata_i64": true,
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_f16io_gatestream_full_sm107a_i64meta_a7c45dca3f9d",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_2b64b167aeacd18e9b2b_gs_c007e01efa00.cu"
+        }
+      ],
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 0,
+        "IS_GQA": 1,
+        "NUM_O_HEADS_LOG2": 5,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      }
+    },
+    {
+      "host_binding": {
+        "cuda_symbol": "kernel_cake_gdn_2b64b167aeacd18e9b2b_gs_pf",
+        "module_ident": "cake_gdn_2b64b167aeacd18e9b2b_gs_pf_d32d980295",
+        "params": {
+          "HQ": 32,
+          "HV": 32,
+          "IO_DL_CODE": 2,
+          "IO_TMA_DTYPE": "CU_TENSOR_MAP_DATA_TYPE_FLOAT16",
+          "STATE_DL_BITS": 32,
+          "STATE_DL_CODE": 2,
+          "STATE_SLOT_STRIDE": 524288,
+          "TILES_PER_SEQ": 32
+        },
+        "shim_namespace": "f1abbeeea6eaea1f",
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
+      },
+      "metadata_i64": true,
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_f16io_gatestream_full_pf_sm107a_i64meta_a7c45dca3f9d",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_2b64b167aeacd18e9b2b_gs_pf_68d83e4233d8.cu"
+        }
+      ],
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 0,
+        "IS_GQA": 1,
+        "NUM_O_HEADS_LOG2": 5,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      }
+    },
+    {
+      "host_binding": {
+        "cuda_symbol": "kernel_cake_gdn_2b64b167aeacd18e9b2b_gs",
+        "module_ident": "cake_gdn_2b64b167aeacd18e9b2b_gs_5adca24ec4",
+        "params": {
+          "HQ": 16,
+          "HV": 16,
+          "IO_DL_CODE": 2,
+          "IO_TMA_DTYPE": "CU_TENSOR_MAP_DATA_TYPE_FLOAT16",
+          "STATE_DL_BITS": 32,
+          "STATE_DL_CODE": 2,
+          "STATE_SLOT_STRIDE": 262144,
+          "TILES_PER_SEQ": 16
+        },
+        "shim_namespace": "01a98f374bd659f8",
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
+      },
+      "metadata_i64": true,
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_f16io_gatestream_full_sm107a_i64meta_de5a927b5f1c",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_2b64b167aeacd18e9b2b_gs_c007e01efa00.cu"
+        }
+      ],
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 0,
+        "IS_GQA": 1,
+        "NUM_O_HEADS_LOG2": 4,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0
+      }
+    },
+    {
+      "host_binding": {
+        "cuda_symbol": "kernel_cake_gdn_2b64b167aeacd18e9b2b_gs_pf",
+        "module_ident": "cake_gdn_2b64b167aeacd18e9b2b_gs_pf_055268ad11",
+        "params": {
+          "HQ": 16,
+          "HV": 16,
+          "IO_DL_CODE": 2,
+          "IO_TMA_DTYPE": "CU_TENSOR_MAP_DATA_TYPE_FLOAT16",
+          "STATE_DL_BITS": 32,
+          "STATE_DL_CODE": 2,
+          "STATE_SLOT_STRIDE": 262144,
+          "TILES_PER_SEQ": 16
+        },
+        "shim_namespace": "449e340ff7ec4160",
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
+      },
+      "metadata_i64": true,
+      "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_f16io_gatestream_full_pf_sm107a_i64meta_de5a927b5f1c",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_2b64b167aeacd18e9b2b_gs_pf_68d83e4233d8.cu"
+        }
+      ],
+      "specializations": {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 0,
+        "IS_GQA": 1,
+        "NUM_O_HEADS_LOG2": 4,
         "SINGLE_CHUNK_NO_STATE": 0,
         "STORE_FINAL_STATE": 1,
         "UNIT_GATES": 0,

@@ -46,6 +46,7 @@ Every shipped training module after the renames. Each module has a backend packa
 | mHC | `flashinfer.cake_mhc_det_train` | det | single rank | #8907 |
 |  | `flashinfer.cake_mhc_nondet_train` | nondet | single rank | #8907 |
 | mHC head | `flashinfer.cake_mhc_head_det_train` | det | single rank | #8907 |
+|  | `flashinfer.cake_mhc_head_nondet_train` | nondet | single rank | #9044 |
 | GDN | `flashinfer.cake_gdn_det_train` | det | single rank | #8959 |
 |  | `flashinfer.cake_gdn_det_train_kcp` | det | KCP | #8959 |
 |  | `flashinfer.cake_gdn_nondet_train` | nondet | single rank | #8959 |
@@ -242,6 +243,7 @@ For vendoring builds that copy a backend directory.
 | package `flashinfer.experimental.cake.cake_causal_conv1d_train_backend` (with `.kcp`) | 0.7.4rc1 | package `flashinfer.experimental.cake.cake_causal_conv1d_nondet_train` (with `.kcp`) | #8906 |
 | `flashinfer.experimental.cake.cake_causal_conv1d_train_backend.{cake_causal_conv1d, CakeCausalConv1dFunction, is_cake_causal_conv1d_train_supported}` | 0.7.4rc1 | `flashinfer.experimental.cake.cake_causal_conv1d_nondet_train.{cake_causal_conv1d_nondet, CakeCausalConv1dNondetFunction, is_cake_causal_conv1d_nondet_train_supported}` | #8906 |
 | `flashinfer.experimental.cake.cake_causal_conv1d_train_backend.cake_causal_conv1d_train_{forward, backward, forward_workspace, backward_workspace, forward_workspace_bytes, backward_workspace_bytes}` | 0.7.4rc1 | `flashinfer.experimental.cake.cake_causal_conv1d_nondet_train.cake_causal_conv1d_nondet_train_{forward, backward, forward_workspace, backward_workspace, forward_workspace_bytes, backward_workspace_bytes}` | #8906 |
+| `flashinfer.experimental.cake.cake_causal_conv1d_train_backend.plan_cache_clear` | 0.7.4rc1 | `flashinfer.experimental.cake.cake_causal_conv1d_nondet_train.cake_causal_conv1d_nondet_train_plan_cache_clear` | #9057 |
 | `flashinfer.experimental.cake.cake_causal_conv1d_train_backend.kcp.{cake_causal_conv1d_kcp, cake_causal_conv1d_multi_kcp, RecomputeHandleKcp, CakeCausalConv1dFunctionKcp, CakeCausalConv1dMultiFunctionKcp, cake_causal_conv1d_forward_kcp, cake_causal_conv1d_backward_kcp, cake_causal_conv1d_multi_forward_kcp, cake_causal_conv1d_multi_backward_kcp, graph_cache_clear, host_cache_clear}` | 0.7.4rc1 | `flashinfer.experimental.cake.cake_causal_conv1d_nondet_train.kcp.{cake_causal_conv1d_nondet_kcp, cake_causal_conv1d_nondet_kcp_multi, CakeCausalConv1dNondetKcpRecomputeHandle, CakeCausalConv1dNondetKcpFunction, CakeCausalConv1dNondetKcpMultiFunction, cake_causal_conv1d_nondet_train_kcp_forward, cake_causal_conv1d_nondet_train_kcp_backward, cake_causal_conv1d_nondet_train_kcp_multi_forward, cake_causal_conv1d_nondet_train_kcp_multi_backward, cake_causal_conv1d_nondet_train_kcp_graph_cache_clear, cake_causal_conv1d_nondet_train_kcp_host_cache_clear}` | #8906 |
 
 ### mHC
@@ -547,12 +549,12 @@ On main, #8924 already removed the module `flashinfer.grouped_mm.cake`, the name
 | `flashinfer.gqa_train.{varlen_gqa_attention, varlen_gqa_attention_fwd, varlen_gqa_attention_bwd, gqa_train_workspace, gqa_train_workspace_bytes}` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_gqa_nondet_train.{cake_gqa_nondet, cake_gqa_nondet_train_forward, cake_gqa_nondet_train_backward, cake_gqa_nondet_train_workspace, cake_gqa_nondet_train_workspace_bytes}` | #8939 |
 | package `flashinfer.experimental.cake_gqa_train` | 0.7.3, 0.7.4rc1 | package `flashinfer.experimental.cake.cake_gqa_nondet_train` | #8939 |
 | `flashinfer.experimental.cake_gqa_train.{varlen_gqa_attention, gqa_attention_fwd, gqa_attention_bwd, workspace_bytes, VarlenGQAAttentionFunction, Workspace, DkvAccSource}` | 0.7.3, 0.7.4rc1 | `flashinfer.experimental.cake.cake_gqa_nondet_train.{cake_gqa_nondet, cake_gqa_nondet_train_forward, cake_gqa_nondet_train_backward, cake_gqa_nondet_train_workspace_bytes, CakeGQANondetFunction, CakeGQANondetWorkspace, CakeGQANondetDkvAccSource}` | #8939 |
+| `flashinfer.experimental.cake_gqa_train.default_workspace` | 0.7.3, 0.7.4rc1 | `flashinfer.experimental.cake.cake_gqa_nondet_train.cake_backend.default_workspace` (internal; not exported by the package or the facade). Calls with `workspace=None` use it; `flashinfer.cake_gqa_nondet_train.cake_gqa_nondet_train_workspace` makes a workspace to pass | #9054 |
 | `flashinfer.experimental.cake_gqa_train.cake_backend.{varlen_gqa_attention, gqa_attention_fwd, gqa_attention_bwd, workspace_bytes}` | 0.7.3, 0.7.4rc1 | `flashinfer.experimental.cake.cake_gqa_nondet_train.cake_backend.{cake_gqa_nondet, cake_gqa_nondet_train_forward, cake_gqa_nondet_train_backward, cake_gqa_nondet_train_workspace_bytes}` | #8939 |
 | `flashinfer.experimental.cake_gqa_train.cake_backend.{VarlenGQAAttentionFunction, Workspace, DkvAccSource}` | 0.7.3, 0.7.4rc1 | `flashinfer.cake_gqa_nondet_train.{CakeGQANondetFunction, CakeGQANondetWorkspace, CakeGQANondetDkvAccSource}` | #8939 |
 
 ## Reserved names
 
-- `flashinfer.cake_mhc_head_nondet_train` (`cake_mhc_head_nondet`, `CakeMHCHeadNondetFunction`): mHC head `nondet`, not implemented.
 - `flashinfer.cake_dsa_indexer_nondet_train`: DSA indexer `nondet`, not implemented.
 - `flashinfer.cake_dsa_sparse_attention_det_train`: DSA sparse attention `det`, not implemented.
 - `flashinfer.cake_gqa_det_train` (`cake_gqa_det`, `CakeGQADetFunction`): GQA HD256 `det`, not implemented.

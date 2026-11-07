@@ -650,9 +650,9 @@ def narrow_table(request, monkeypatch):
 
     if request.param == "synthetic":
         monkeypatch.setattr(cake_jit, "NARROW_TILES", SYNTHETIC_NARROW_TILES)
-    pkg.plan_cache_clear()
+    pkg.cake_causal_conv1d_nondet_train_plan_cache_clear()
     yield cake_jit.NARROW_TILES
-    pkg.plan_cache_clear()
+    pkg.cake_causal_conv1d_nondet_train_plan_cache_clear()
 
 
 def _covering(table: dict, arch: str, route: str, C: int):
@@ -860,11 +860,11 @@ def fake_device(monkeypatch):
     def use(arch: str, sms: int) -> None:
         monkeypatch.setattr(cake_jit, "device_arch", lambda device_index: arch)
         monkeypatch.setattr(cake_jit, "sm_count", lambda device_index: sms)
-        pkg.plan_cache_clear()
+        pkg.cake_causal_conv1d_nondet_train_plan_cache_clear()
 
-    pkg.plan_cache_clear()
+    pkg.cake_causal_conv1d_nondet_train_plan_cache_clear()
     yield use
-    pkg.plan_cache_clear()
+    pkg.cake_causal_conv1d_nondet_train_plan_cache_clear()
 
 
 def _per_call(arch: str, kind: str, S: int, C: int, num_docs: int, gm: int, policy):
@@ -921,7 +921,7 @@ def _sweep_row_plans(arch: str) -> int:
     docs = (1, 2, 4, 5, 1000) if FULL_PLAN_SWEEP else (1, 1000)
     checked = 0
     for order in orders:
-        pkg.plan_cache_clear()
+        pkg.cake_causal_conv1d_nondet_train_plan_cache_clear()
         for kind in cake_jit.ROUTES[arch]:
             backward = cake_jit.route_role(kind) == "bwd"
             policy = "fp32" if kind.endswith("fp32g") else "bf16" if backward else None
@@ -958,8 +958,8 @@ def test_row_plans_match_the_per_call_plan(arch, fake_device, record_property) -
 def test_row_plans_follow_a_replaced_override_table(
     arch, fake_device, monkeypatch
 ) -> None:
-    """A row planned before ``TILE_OVERRIDES`` changes keeps its plan until :func:`plan_cache_clear` empties the
-    cache; after it, with the rows of every architecture on ``arch``, every row's calls on both
+    """A row planned before ``TILE_OVERRIDES`` changes keeps its plan until
+    :func:`cake_causal_conv1d_nondet_train_plan_cache_clear` empties the cache; after it, with the rows of every architecture on ``arch``, every row's calls on both
     sides of its token range plan as a per-call plan does, the override's tiles inside the range."""
 
     fake_device(arch, PLAN_SWEEP_SMS[arch][0])
@@ -986,7 +986,7 @@ def test_row_plans_follow_a_replaced_override_table(
         assert _row_planned(arch, route, s_min, C, 3, 1, policy_of(route)) == before
         changed += now != before
     assert changed or rows.items() <= shipped.items(), arch
-    assert pkg.plan_cache_clear() >= 1
+    assert pkg.cake_causal_conv1d_nondet_train_plan_cache_clear() >= 1
     checked = 0
     for (route, C), (ct_vec, s_min, s_max) in rows.items():
         if route not in cake_jit.ROUTES[arch]:
@@ -1007,8 +1007,8 @@ def test_row_plans_follow_a_replaced_override_table(
 def test_row_plans_follow_a_replaced_narrow_table(
     arch, fake_device, monkeypatch
 ) -> None:
-    """A row planned before ``NARROW_TILES`` changes keeps its plan until :func:`plan_cache_clear` empties the
-    cache; after it, with :data:`SYNTHETIC_NARROW_TILES` in place, every key's calls at its channel ends and an
+    """A row planned before ``NARROW_TILES`` changes keeps its plan until
+    :func:`cake_causal_conv1d_nondet_train_plan_cache_clear` empties the cache; after it, with :data:`SYNTHETIC_NARROW_TILES` in place, every key's calls at its channel ends and an
     inner channel count, on both sides of its token range and at every ``bwd_grid_mult``, plan as a per-call plan
     does (the 32-vector tiles inside the range, the side-stream and whole-rank grid trims included), on fake
     devices of the architecture's SM counts."""
@@ -1029,7 +1029,7 @@ def test_row_plans_follow_a_replaced_narrow_table(
             m.setattr(cake_jit, "NARROW_TILES", SYNTHETIC_NARROW_TILES)
             for key, value in rows.items():
                 assert planned(key[0], value[0], key[1]) == before[key], (sms, key)
-            assert pkg.plan_cache_clear() >= 1
+            assert pkg.cake_causal_conv1d_nondet_train_plan_cache_clear() >= 1
             for (route, c_lo, c_hi), (s_min, s_max) in rows.items():
                 for C in sorted({c_lo, (c_lo + c_hi) // 16 * 8, c_hi}):
                     for S in (s_min - 1, s_min, s_max, s_max + 1):
@@ -1041,7 +1041,7 @@ def test_row_plans_follow_a_replaced_narrow_table(
                             if s_min <= S <= s_max and isinstance(got[1], dict):
                                 assert got[1]["ct_vec"] == ct_vec, (route, C, S, gm)
                             checked += 1
-            pkg.plan_cache_clear()
+            pkg.cake_causal_conv1d_nondet_train_plan_cache_clear()
     assert checked
 
 
@@ -1057,12 +1057,9 @@ PUBLIC = (
     "cake_causal_conv1d_nondet_train_backward_workspace",
     "cake_causal_conv1d_nondet_train_backward_workspace_bytes",
 )
-# The public helpers whose names carry no mode (they launch nothing).
-HELPERS = frozenset(
-    {"plan_cache_clear", "cake_causal_conv1d_nondet_train_kcp_graph_cache_clear"}
-)
 # The names before the mode word joined them: removed, with no alias.
 OLD_NAMES = (
+    "plan_cache_clear",
     "cake_causal_conv1d",
     "CakeCausalConv1dFunction",
     "cake_causal_conv1d_train_forward",
@@ -1077,7 +1074,7 @@ OLD_NAMES = (
 
 @pytest.mark.cpu_only
 def test_public_names_carry_the_mode_and_take_no_mode_keyword() -> None:
-    """Every public name of ``__all__`` but the constants and :data:`HELPERS` carries the mode word ``nondet``; no
+    """Every public name of ``__all__`` but the constants carries the mode word ``nondet``; no
     entry point and no parameter of the autograd function's forward is a ``deterministic`` keyword; the names before
     the rename are gone (no alias)."""
 
@@ -1092,7 +1089,7 @@ def test_public_names_carry_the_mode_and_take_no_mode_keyword() -> None:
         not in inspect.signature(pkg.CakeCausalConv1dNondetFunction.forward).parameters
     )
     for name in pkg.__all__:
-        assert name.isupper() or name in HELPERS or "nondet" in name.lower(), name
+        assert name.isupper() or "nondet" in name.lower(), name
     for name in OLD_NAMES:
         assert name not in pkg.__all__ and not hasattr(pkg, name), name
 

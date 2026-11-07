@@ -107,8 +107,8 @@ Host design (the knobs are keywords; no environment variable):
   grid (``cake_jit.plan_row``); later calls of the row only compare ``S`` with
   the entry's token range (and size the grid where ``launch_grid`` trims it
   by ``S``), so they launch the values a per-call plan gives.  A row whose
-  program selection reads ``S`` plans every call.  :func:`plan_cache_clear`
-  drops the rows.
+  program selection reads ``S`` plans every call.
+  :func:`cake_causal_conv1d_nondet_train_plan_cache_clear` drops the rows.
 """
 
 from __future__ import annotations
@@ -195,8 +195,8 @@ _ACCUMULATOR_VIEWS: dict[int, tuple[weakref.ref, dict]] = {}
 # NARROW_TILES row and sizing the grid cost several us of host time in front of every launch; with the row's plan a
 # call only compares ``S`` with the row's token range (``cake_jit.row_launch``).  A row whose program selection reads
 # ``S`` (``cake_jit.tokens_select``) holds ``None`` and plans every call.  At most ``_ROW_PLANS_MAX`` rows (then
-# emptied); :func:`plan_cache_clear` empties it (needed after a change of the registry tables, the SM count or the
-# architecture a device reports, which the rows were planned from).
+# emptied); :func:`cake_causal_conv1d_nondet_train_plan_cache_clear` empties it (needed after a change of the registry
+# tables, the SM count or the architecture a device reports, which the rows were planned from).
 _ROW_PLANS: dict[tuple, tuple[Optional[_loader.RowPlan], dict]] = {}
 _ROW_PLANS_MAX = 1024
 # The torch dtype of each accumulator / counter dtype name of a workspace rule.
@@ -662,7 +662,7 @@ def _call_plan(
     return row.names, row.record, scalars, grid, per_tiles
 
 
-def plan_cache_clear() -> int:
+def cake_causal_conv1d_nondet_train_plan_cache_clear() -> int:
     """Drop the host plans of the single-rank calls (``_ROW_PLANS``), planned again by the next call of each row;
     returns the number of rows dropped.  Call it after changing what the rows were planned from: the registry
     tables of ``cake_jit`` (``MODULES``, ``ROUTES``, ``TILE_OVERRIDES``, ``NARROW_TILES``, the grid-trim tables), its
@@ -1368,6 +1368,6 @@ __all__ = [
     "cake_causal_conv1d_nondet_train_forward",
     "cake_causal_conv1d_nondet_train_forward_workspace",
     "cake_causal_conv1d_nondet_train_forward_workspace_bytes",
+    "cake_causal_conv1d_nondet_train_plan_cache_clear",
     "is_cake_causal_conv1d_nondet_train_supported",
-    "plan_cache_clear",
 ]
