@@ -3516,15 +3516,13 @@ SPLIT_ROLES = ("fwd", "bwd")
 # The routes whose single-tile rows run 32-vector tiles (``ct_vec`` 32, four
 # token sub-tiles, the last tile partial) instead of one tile of ``cv = C /
 # vec`` vectors, per role, at 128 threads (:func:`_narrow_tile`): the backward
-# at 64 < cv <= 96 (C = 520 to 768, three tiles) and cv = 28 (C = 224), the
-# forward at 72 <= cv <= 96 (C = 576 to 768).  One tile of cv vectors leaves
-# 128 - cv lanes of every CTA idle over the whole token axis; the programs are
-# unchanged.  The backward's four-tile rows (96 < cv < 128) keep one tile
-# (their ``dweight`` error against FP64 is lowest there), and so do the
-# ``_fp32g`` and ``_dt`` backward routes.
+# at 64 < cv < 128 (C = 520 to 1016, three or four tiles) and cv = 28 (C =
+# 224), the forward at 72 <= cv <= 96 (C = 576 to 768).  One tile of cv
+# vectors leaves 128 - cv lanes of every CTA idle over the whole token axis;
+# the programs are unchanged.  Every route of both roles takes the rule.
 NARROW_TILE_ROUTES: dict[str, tuple[str, ...]] = {
-    "fwd": ("fwd", "fwd_bias"),
-    "bwd": ("bwd", "bwd_bias"),
+    "fwd": ("fwd", "fwd_dt", "fwd_bias"),
+    "bwd": ("bwd", "bwd_dt", "bwd_bias", "bwd_fp32g", "bwd_bias_fp32g"),
 }
 NARROW_TILE_THREADS = 128
 
@@ -3571,11 +3569,12 @@ def channel_split(
     ``route`` is the launch's route (one of :data:`KINDS` of the role; the
     host passes its record's).  On a route of :data:`NARROW_TILE_ROUTES` the
     single-tile rows of the role's narrow set run 32-vector tiles, ``(32,
-    threads // 32, ceil(cv / 32))``: the backward's C = 224 and 520 to 768,
-    the forward's C = 576 to 768, so C = 640 runs (32, 4, 3) instead of (80,
+    threads // 32, ceil(cv / 32))``: the backward's C = 224 and 520 to 1016
+    (three or four tiles) on every backward route, the forward's C = 576 to
+    768 on every forward route, so C = 640 runs (32, 4, 3) instead of (80,
     1, 1).  ``y`` and ``dx`` keep their bits; ``dweight`` and ``dbias`` sum in
     the narrow plan's fixed order (bitwise reproducible).  Without a route,
-    and on every other route, the single tile stays.
+    the single tile stays.
     """
 
     return _channel_split(
@@ -3665,7 +3664,7 @@ def _narrow_tile(channel_vectors: int, threads: int, role: str) -> bool:
     if threads != NARROW_TILE_THREADS:
         return False
     if role == "bwd":
-        return 64 < channel_vectors <= 96 or channel_vectors == 28
+        return 64 < channel_vectors < 128 or channel_vectors == 28
     return 72 <= channel_vectors <= 96
 
 
