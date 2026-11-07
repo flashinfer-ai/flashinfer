@@ -568,7 +568,9 @@ def _load_manifest() -> tuple[dict[str, Any], Path]:
 def _stages_for_arch(manifest: dict[str, Any], arch: str) -> list[dict[str, Any]]:
     """The manifest stages with the kernel symbol and bindings ``arch`` replaces."""
     overrides = manifest["arch_stage_overrides"].get(arch, {})
-    return [{**stage, **overrides.get(stage["name"], {})} for stage in manifest["stages"]]
+    return [
+        {**stage, **overrides.get(stage["name"], {})} for stage in manifest["stages"]
+    ]
 
 
 def _nvcc() -> Path:

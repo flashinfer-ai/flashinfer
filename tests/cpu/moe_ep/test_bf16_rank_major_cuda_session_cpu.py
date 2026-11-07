@@ -687,7 +687,9 @@ def test_sm107a_stages_replace_only_the_overridden_fields():
         for field, value in base.items():
             if field in fields:
                 expected = fields[field]
-                assert stage[field] == (list(expected) if field == "bindings" else expected)
+                assert stage[field] == (
+                    list(expected) if field == "bindings" else expected
+                )
             else:
                 assert stage[field] == value
     assert overrides
@@ -697,5 +699,8 @@ def test_sm107a_stages_replace_only_the_overridden_fields():
         assert by_name["stage_inputs"]["bindings"][-1] == "route_codes_out"
         assert by_name["input_arrive"]["symbol"] == "kernel_rank_major_input_arrive_v3"
     if "local_unpermute" in overrides:
-        assert by_name["local_unpermute"]["symbol"] == "kernel_rank_major_exact_unpermute_v11"
+        assert (
+            by_name["local_unpermute"]["symbol"]
+            == "kernel_rank_major_exact_unpermute_v11"
+        )
         assert by_name["local_unpermute"]["bindings"][3] == "local_partials_peers"
