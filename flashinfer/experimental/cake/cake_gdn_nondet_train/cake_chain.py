@@ -1960,15 +1960,15 @@ def split_r_form(
 # each middle piece's affine map ``[B | M]`` (``B`` from zero, ``M`` from the identity); the stitch composes the end
 # adjoint of every other piece; wave 2: ``dhu_tc2_dvl32_modes`` walks those pieces from their end adjoints with their
 # tapes, the first piece storing ``dh0``.  A sequence of one piece is walked whole in wave 1.  The end adjoints come
-# from ``piece_chain`` (FP32 FFMA, one dot product per element and step) where it is delivered, else from the stitch
-# (3xBF16 products, about 16 mantissa bits per step).  Every chunk's walk is the serial walk's from the same end
+# from the stitch (3xBF16 products, about 16 mantissa bits per step); ``piece_chain`` (FP32 FFMA, one dot product per
+# element and step, slower) is the FP32 composition a caller selects through ADJOINT_CHAIN_STAGES.  Every chunk's walk is the serial walk's from the same end
 # adjoint, which the split computes exactly up to that composition's rounding (no warm-up bound, so the plan and its
 # cost do not depend on the gates).  :func:`adjoint_split_pricing` selects it over the serial table, both at their
 # full cost.
 ADJOINT_SPLIT_ARCHS: frozenset[str] = frozenset({"sm_100a"})
 ADJOINT_SPLIT_STAGES = ("dhu_tc2_dvl32_modes", "dhu_tc2_dvl32_gm")
 # the stages that compose the end adjoints, in preference order
-ADJOINT_CHAIN_STAGES = ("piece_chain", "stitch")
+ADJOINT_CHAIN_STAGES = ("stitch", "piece_chain")
 # the mode bits of an entry of the forms (``seg_mode``): seed the walk from ``dht`` (row of the segment, or of its
 # sequence with SPLIT_SEED_SEQ), write the dh / dv2 tapes, store the adjoint at the segment's start into the B half of
 # ``seg_state`` (the stitch's layout)
@@ -2796,8 +2796,8 @@ def _adjoint_split_walk(split1: AdjointSplit, segs: SegmentTable, meta: ChunkMet
                         scale: float, table, workspaces: Workspaces, index: int, device) -> None:  # fmt: skip
     """The adjoint walk of a table's segments as the one-wave split (:class:`AdjointSplit`): wave 1, the last and
     one-piece walks (``dhu_tc2_dvl32_modes``, caller's stream) beside the middle pieces' summaries
-    (``dhu_tc2_dvl32_gm``, side stream, joined back); the composition of the pieces' end adjoints (``piece_chain``, or
-    the stitch with ``reverse``: each sequence's last piece ends at ``dht``, the piece before it at the B half its walk
+    (``dhu_tc2_dvl32_gm``, side stream, joined back); the composition of the pieces' end adjoints (the stitch with
+    ``reverse``, or ``piece_chain``: each sequence's last piece ends at ``dht``, the piece before it at the B half its walk
     stored, every earlier one at ``M x + B`` of the piece after it); wave 2, the other pieces' walks from those end
     adjoints.  ``dh`` / ``dv2`` receive every chunk's tapes, ``dh0`` each sequence's start adjoint (with
     ``has_initial_state``)."""
