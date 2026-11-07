@@ -123,9 +123,8 @@ def gemm_kernel_persistent(
         offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-        c = accumulator.to(c_ptr.dtype.element_ty)
-
-        c = tl.fma(c, alpha, beta * tl.load(c_ptrs, mask=c_mask))
+        # Keep the epilogue in FP32 to avoid overflow/underflow before scaling.
+        c = tl.fma(accumulator, alpha, beta * tl.load(c_ptrs, mask=c_mask))
         tl.store(c_ptrs, c, mask=c_mask)
 
 
@@ -280,11 +279,10 @@ def gemm_kernel(
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
-    c = accumulator.to(c_ptr.dtype.element_ty)
-
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    c = tl.fma(c, alpha, beta * tl.load(c_ptrs, mask=c_mask))
+    # Keep the epilogue in FP32 to avoid overflow/underflow before scaling.
+    c = tl.fma(accumulator, alpha, beta * tl.load(c_ptrs, mask=c_mask))
     tl.store(c_ptrs, c, mask=c_mask)
