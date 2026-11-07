@@ -11,6 +11,13 @@ NVLink-connected Hopper GPUs and a symmetric buffer allocated collectively
 before CUDA graph capture. NVFP4 supports four or eight ranks; MXFP4 supports
 power-of-two rank counts from one to 32.
 
+.. note::
+   **Availability.** ``flashinfer.megamoe`` is present on ``main`` after
+   `#6343 <https://github.com/flashinfer-ai/flashinfer/pull/6343>`_ /
+   `#6517 <https://github.com/flashinfer-ai/flashinfer/pull/6517>`_. It is
+   **absent** from the ``v0.7.2.post1`` wheels. Until a release ships the
+   module, install from source (:ref:`install-from-source`).
+
 Buffer and execution
 --------------------
 

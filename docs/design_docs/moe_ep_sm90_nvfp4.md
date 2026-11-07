@@ -1,5 +1,13 @@
 # SM90 NVFP4 × FP8 expert-parallel MegaMoE
 
+> **Availability / release note.** This CuTe DSL backend is on `main` after
+> [#6999](https://github.com/flashinfer-ai/flashinfer/pull/6999) (merge commit
+> `479c38bbfc` or later). It is **not** included in the `v0.7.2.post1` PyPI
+> wheels — use a [source install of `main`](../installation.rst#install-from-source).
+> Related feature request: [#5706](https://github.com/flashinfer-ai/flashinfer/issues/5706)
+> (NVFP4 MegaMoE). The standalone CUDA `flashinfer.megamoe` API landed separately
+> in [#6343](https://github.com/flashinfer-ai/flashinfer/pull/6343).
+
 This backend runs packed NVFP4 expert weights with FP8 E4M3 activations and
 BF16 output on Hopper. It uses the public `flashinfer.moe_ep.MoEEpLayer` API,
 pull-style expert parallel communication, fused gate/up and FC2 computation,
