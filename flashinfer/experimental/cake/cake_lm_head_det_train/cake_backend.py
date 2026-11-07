@@ -11191,12 +11191,8 @@ def _loss_backward_split(ctx, grad_loss):
         dw = (
             None
             if state.dw_acc is None
-            else torch.zeros(
-                state.dw_acc.shape,
-                dtype=ctx.grad_weight_dtype,
-                device=state.dw_acc.device,
-            )
-        )
+            else _zero_gradient(state.dw_acc, grad_loss, ctx.grad_weight_dtype)
+        )  # cast(g * 0), as ForwardResult.backward forms it
         return dx, dw
     return backward_loss(
         state.dx_acc,
@@ -11368,12 +11364,8 @@ class CakeLMHeadDetLossFunction(torch.autograd.Function):
             dw = (
                 None
                 if ctx.dw_acc is None
-                else torch.zeros(
-                    ctx.dw_acc.shape,
-                    dtype=ctx.grad_weight_dtype,
-                    device=ctx.dw_acc.device,
-                )
-            )
+                else _zero_gradient(ctx.dw_acc, grad_loss, ctx.grad_weight_dtype)
+            )  # cast(g * 0), as ForwardResult.backward forms it
             return (dx, dw) + none[2:]
         dz_last, x_last, x_src, x_idx = ctx.saved_tensors
         dx, dw = backward_loss(

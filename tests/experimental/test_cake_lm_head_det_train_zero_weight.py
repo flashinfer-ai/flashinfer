@@ -1135,6 +1135,52 @@ def test_zero_row_result(module_name, backend):
             assert bool((dw == 0).all() and torch.signbit(dw).all()), g
 
 
+@pytest.mark.parametrize("module_name", ["main", "opt_in"])
+@pytest.mark.parametrize("checkpointed", [False, True])
+def test_empty_autograd_scales_the_zero_weight_gradient(module_name, checkpointed):
+    """A loss call without gradient rows (``T == 0``; every row ignored), plain or under a non-reentrant checkpoint:
+    the autograd backward's ``dW`` has the bits :meth:`ForwardResult.backward` gives for the same upstream scalar (the
+    FP32 product ``0 * g`` cast once: ``+0``; ``-0`` for a negative ``g``, also beyond the BF16 range; NaN for a
+    non-finite one), and ``dX`` is ``+0``.  The opt-in arm passes ``num_valid_rows=0`` so its own autograd Function
+    runs (without an opt-in keyword the call is ``cake_backend``'s)."""
+    from torch.utils.checkpoint import checkpoint
+
+    module = cake_backend if module_name == "main" else opt_in
+    extra = {} if module_name == "main" else dict(num_valid_rows=0)
+    W0 = torch.zeros(V_HOST, H_HOST, dtype=torch.bfloat16, device=DEV)
+    f32_max = torch.finfo(torch.float32).max
+    for T in (0, 37):
+        X0 = torch.zeros(T, H_HOST, dtype=torch.bfloat16, device=DEV)
+        labels = torch.full((T,), -100, dtype=torch.int64, device=DEV)
+        kw = dict(objective="ce", loss_div=1.0, backend="reference", **extra)
+        fr = module.forward_loss(X0, W0, labels, **kw)
+
+        def call(X, W):
+            return module.cake_lm_head_det_train_loss(X, W, labels, **kw)
+
+        for g in (2.0, -2.0, f32_max, -f32_max, math.inf, math.nan):
+            grad = torch.tensor(g, dtype=torch.float32, device=DEV)
+            X = X0.clone().requires_grad_()
+            W = W0.clone().requires_grad_()
+            loss = (
+                checkpoint(call, X, W, use_reentrant=False)
+                if checkpointed
+                else call(X, W)
+            )
+            assert loss.grad_fn._forward_cls is module.CakeLMHeadDetLossFunction
+            loss.backward(grad)
+            _, ref = fr.backward(grad)
+            assert W.grad.dtype == ref.dtype == torch.bfloat16, (T, g)
+            if math.isfinite(g):
+                assert _same_bits(W.grad, ref), (T, g)
+                assert bool((torch.signbit(W.grad) == (g < 0)).all()), (T, g)
+            else:
+                both_nan = torch.isnan(W.grad).all() and torch.isnan(ref).all()
+                assert bool(both_nan), (T, g)
+            assert tuple(X.grad.shape) == (T, H_HOST), (T, g)
+            assert _all_plus_zero(X.grad), (T, g)
+
+
 def test_memory_plan_counts_the_exact_loss_phases():
     """``memory_plan``'s exact-loss phase (``_exact_loss_bytes``): the term array, the zero-weight rows' gathered
     weights and index and, when their pass ran first, their compact ``logp``, plus the larger of the gradient rows'
