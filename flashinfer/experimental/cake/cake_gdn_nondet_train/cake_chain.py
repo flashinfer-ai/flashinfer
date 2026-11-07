@@ -26,7 +26,11 @@ the plain prep; both give the same bits), the tcgen05 WY stage
 (:func:`wy_stage`: ``wy_tc2``, five CTAs per SM, on the architectures of
 ``WY_TC2_ARCHS``, else ``wy_tc``; the same bits) and the fused tcgen05 scan
 and output (``fwd_ho``; a split plan first runs the pre-scan and the stitch
-for the segment start states).  The backward runs ``dv_local`` and
+for the segment start states; on the architectures of ``FWD_HO_VH2_ARCHS`` a
+scan of one launch whose CTAs fill at most half of the SMs runs as
+``fwd_ho_vh2``, two CTAs per segment and value head, one value half each,
+:func:`fwd_ho_vh2_engaged`, where the record is the split program,
+:func:`fwd_ho_vh2_splits`; the same bits).  The backward runs ``dv_local`` and
 the register scan of the adjoint state (with the pre-scan and the stitch on a
 split plan), or on a serial plan the tcgen05 adjoint scan with ``dv_local``
 fused (``dhu_tc2``) when its selection rule (:func:`dhu_tc_pricing`) prices it
@@ -112,6 +116,8 @@ __all__ = [
     "TAIL_TILE_FLOATS",
     "TAIL_WORKSPACE_TILES",
     "CHAIN_PLAN",
+    "FWD_HO_VH2_ARCHS",
+    "FWD_HO_VH2_STEP",
     "SPLIT_R_FORM",
     "TC_PLAN",
     "TC_PLAN_GAIN",
@@ -135,6 +141,8 @@ __all__ = [
     "chain_plan_pricing",
     "dhu_tc_pricing",
     "finalize_stage",
+    "fwd_ho_vh2_engaged",
+    "fwd_ho_vh2_splits",
     "host_plans",
     "lpt_sequence_order",
     "lpt_walk",
@@ -222,6 +230,7 @@ LAUNCH_ARGS: dict[str, tuple[str, ...]] = {
     "wy_tc": _WY_ARGS,
     "wy_tc2": _WY_ARGS,
     "fwd_ho": _FWD_HO_ARGS,
+    "fwd_ho_vh2": _FWD_HO_ARGS,
     "stitch": _STITCH_ARGS,
     "dv_local": _DV_LOCAL_ARGS,
     "dhu_tc2": _DHU_TC2_ARGS,
@@ -1650,7 +1659,11 @@ def tc_plan_pricing(
 # step times of serial tables of 48 to 208 CTAs, split costs fitted to pinned split tables of 12 rows; the fit's error
 # per table: forward median 1.8 %, up to 11.7 % on the 6-sequence (2, 6) pack, adjoint 0.9 %, up to 4.7 %, hence
 # ``gain`` 0.95); an architecture not listed keeps its tables.  Another table moves the segment boundaries, so the bits
-# follow the plan (plan pins keep the planner's tables).
+# follow the plan (plan pins keep the planner's tables).  On an architecture of ``FWD_HO_VH2_ARCHS`` the forward prices a
+# table whose launch runs the value-half split (:func:`fwd_ho_vh2_engaged`: twice its segments x HV CTAs fit one round)
+# with its chain term scaled by ``FWD_HO_VH2_STEP``, the split's chain time over ``fwd_ho``'s on the same table (R200,
+# 216 SMs, the 96-CTA table of one 16384-token sequence over 16 value heads: 61.44 against 81.76 us, 0.7515); the
+# deeper tables the split does not fit keep the ``fwd_ho`` price.
 CHAIN_PLAN_CONSTANTS = ("t_lat", "t_full", "fixed", "per_segment", "per_wave")
 CHAIN_PLAN: dict[str, dict[str, Any]] = {
     "sm_107a": {
@@ -1660,12 +1673,19 @@ CHAIN_PLAN: dict[str, dict[str, Any]] = {
         "min_saving": 2.0,
     },
 }
+FWD_HO_VH2_STEP = 0.75
 
 
 def _chain_table_price(
-    chunks, num_v_heads: int, segment_len: int, sm_count: int, const: tuple
+    chunks,
+    num_v_heads: int,
+    segment_len: int,
+    sm_count: int,
+    const: tuple,
+    vh2: float = 1.0,
 ) -> float:
-    """The priced tcgen05 chain of one table (``segment_len`` 0 or not below the longest sequence: serial)."""
+    """The priced tcgen05 chain of one table (``segment_len`` 0 or not below the longest sequence: serial); ``vh2``
+    scales the chain term of a table whose launch runs the value-half split (:func:`fwd_ho_vh2_engaged`)."""
     t_lat, t_full, fixed, per_segment, per_wave = const
     if segment_len <= 0 or max(chunks) <= segment_len:
         splits = (1,) * len(chunks)
@@ -1684,7 +1704,10 @@ def _chain_table_price(
             + per_segment * (max(splits) - 1)
             + per_wave * -(-pre_ctas // (2 * sm_count))
         )
-    return steps * t_n + extra
+    chain = steps * t_n
+    if vh2 != 1.0 and fwd_ho_vh2_engaged(sum(splits), num_v_heads, sm_count):
+        chain *= vh2
+    return chain + extra
 
 
 @lru_cache(maxsize=1024)
@@ -1698,10 +1721,11 @@ def _chain_plan_memo(
     const: tuple,
     gain: float,
     min_saving: float,
+    vh2: float,
 ) -> dict:
     current = 0 if segment_len <= 0 or max(chunks) <= segment_len else int(segment_len)
     segments = sum(max(1, -(-int(n) // current)) if current else 1 for n in chunks)
-    plan_t = _chain_table_price(chunks, num_v_heads, current, sm_count, const)
+    plan_t = _chain_table_price(chunks, num_v_heads, current, sm_count, const, vh2)
     rec: dict[str, Any] = {
         "arch": arch,
         "kind": kind,
@@ -1714,7 +1738,7 @@ def _chain_plan_memo(
                                                     max(chunks) - 1) + 1):  # fmt: skip
         if sum(max(1, -(-int(n) // seg_len)) for n in chunks) <= segments:
             continue  # deeper tables only
-        t = _chain_table_price(chunks, num_v_heads, seg_len, sm_count, const)
+        t = _chain_table_price(chunks, num_v_heads, seg_len, sm_count, const, vh2)
         if best is None or t < best[1]:
             best = (seg_len, t)
     if best is None:
@@ -1730,8 +1754,9 @@ def chain_plan_pricing(
 ) -> dict:
     """``kind`` ``"fwd"`` (the ``fwd_ho`` chain) or ``"bwd"`` (``dhu_tc2``): the deeper split table priced for that
     chain against ``plan`` for a host layout of ``chunks`` (chunks per sequence) on the device's architecture;
-    ``select`` is the answer and ``segment_len`` the table.  An architecture without ``CHAIN_PLAN`` constants never
-    selects.  See above."""
+    ``select`` is the answer and ``segment_len`` the table; on an architecture of ``FWD_HO_VH2_ARCHS`` a forward table
+    whose launch runs the value-half split is priced as that split (``FWD_HO_VH2_STEP``).  An architecture without
+    ``CHAIN_PLAN`` constants never selects.  See above."""
     arch = cake_backend.device_arch(int(device_index))
     found = CHAIN_PLAN.get(arch)
     if found is None:
@@ -1752,6 +1777,7 @@ def chain_plan_pricing(
             tuple(float(x) for x in found[kind]),
             float(found["gain"]),
             float(found["min_saving"]),
+            FWD_HO_VH2_STEP if kind == "fwd" and arch in FWD_HO_VH2_ARCHS else 1.0,
         )  # fmt: skip
     )
 
@@ -2066,6 +2092,29 @@ def _launch_fwd_h(arch, kn, w, u, g_cs, initial_state, meta, num_heads, num_v_he
     return h, v_new, final_state
 
 
+# The value-half split of the fused forward scan and output: on an architecture of ``FWD_HO_VH2_ARCHS`` a forward
+# scan of one launch (no two-stream groups) whose CTAs fill at most half of the SMs runs ``fwd_ho_vh2``, two CTAs per
+# (segment, value head) on twice the grid, each the scan and output of one value half.  Its per-element math is
+# fwd_ho's, so the bits are the same; the split shortens each CTA's per-chunk chain where the SMs would sit idle.  The
+# deeper split tables of ``CHAIN_PLAN`` price that form (``FWD_HO_VH2_STEP``).
+FWD_HO_VH2_ARCHS = ("sm_107a",)
+
+
+@cache
+def fwd_ho_vh2_splits(arch: str) -> bool:
+    """Whether the ``fwd_ho_vh2`` record of ``arch`` is the split program (two CTAs per segment and value head).  On
+    ``sm_100a`` and ``sm_103a`` the record is the ``fwd_ho`` program itself, which runs on ``fwd_ho``'s grid."""
+    split = cake_backend.record(cake_backend.stage_record("fwd_ho_vh2", arch))
+    plain = cake_backend.record(cake_backend.stage_record("fwd_ho", arch))
+    return split["library"] != plain["library"]
+
+
+def fwd_ho_vh2_engaged(num_segments: int, num_v_heads: int, sm_count: int) -> bool:
+    """Whether a one-launch forward scan of ``num_segments`` segments runs as ``fwd_ho_vh2``: its ``2 x num_segments
+    x num_v_heads`` CTAs fit one round of ``sm_count`` SMs (one CTA per SM)."""
+    return 2 * int(num_segments) * int(num_v_heads) <= int(sm_count)
+
+
 _WALKS: dict = {}
 
 
@@ -2154,10 +2203,16 @@ def _launch_fwd_ho(arch, qn, kn, w, u, g_cs, initial_state, meta, num_heads, num
         use_seg = 1
     walk = _walk(device, segs, options)
     if wy is None:
-        _launch("fwd_ho", segs.num_segments * num_v_heads, 1, 1, qn, kn, w, u, g_cs, h0, seg_start, h, v_new, v_new, o,
-                o, final_state, meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq,
-                meta.seq_chunk_start, walk, num_heads, num_v_heads, use_init, 1 if store_final_state else 0, use_seg,
-                float(scale))  # fmt: skip
+        stage, ctas = "fwd_ho", segs.num_segments * num_v_heads
+        if arch in FWD_HO_VH2_ARCHS and fwd_ho_vh2_engaged(
+            segs.num_segments, num_v_heads, _device_props(_tensor_index(kn))[0]
+        ):
+            stage = "fwd_ho_vh2"
+            if fwd_ho_vh2_splits(arch):
+                ctas = 2 * ctas
+        _launch(stage, ctas, 1, 1, qn, kn, w, u, g_cs, h0, seg_start, h, v_new, v_new, o, o, final_state,
+                meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq, meta.seq_chunk_start, walk,
+                num_heads, num_v_heads, use_init, 1 if store_final_state else 0, use_seg, float(scale))  # fmt: skip
         return h, v_new, final_state, o
     # P form: the side stream runs wy_tc and fwd_ho of group A (the partial round); the caller's stream runs those of
     # group B (the full rounds) once wy_tc(A) is done, then joins the side stream.  fwd_ho(A) can read w / u rows past
@@ -2789,6 +2844,8 @@ def _chunk_meta(
         options.streams,
         TC_PLAN,
         tuple(sorted(CHAIN_PLAN)),
+        FWD_HO_VH2_ARCHS,
+        FWD_HO_VH2_STEP,
         group,
         options.tail,
         SPLIT_R_FORM,

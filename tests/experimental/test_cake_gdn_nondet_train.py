@@ -323,7 +323,7 @@ FUSED_TAIL_STAGES = {"tail_g2": 2, "tail_g2_bf16": 2, "tail_g3": 3, "tail_g3_bf1
 
 
 def test_registry_records_are_well_formed() -> None:
-    assert len(cake_jit.STAGES) == 35 and len(set(cake_jit.STAGES)) == 35
+    assert len(cake_jit.STAGES) == 36 and len(set(cake_jit.STAGES)) == 36
     assert set(cake_chain.LAUNCH_ARGS) == set(cake_jit.STAGES)
     for arch in ARCHES:
         for stage in cake_jit.STAGES:
@@ -348,8 +348,9 @@ def test_registry_records_are_well_formed() -> None:
         params = cake_backend.parameters(name)
         assert sorted(params) == sorted(cake_chain.LAUNCH_ARGS[rec["stage"]]), name
         libraries.add(rec["library"])
-    # one program per record: a kernel swap renames exactly the records it touches; the one shared library is the
-    # sm_107a wy_tc2, which is the sm_100a / sm_103a wy_tc2 program
+    # one program per record: a kernel swap renames exactly the records it touches; the two shared libraries are the
+    # sm_107a wy_tc2, which is the sm_100a / sm_103a wy_tc2 program, and the sm_100a / sm_103a fwd_ho_vh2, which is the
+    # fwd_ho program
     wy, wy2, wy2_107 = (
         cake_jit.MODULES[name] for name in ("wy_tc", "wy_tc2", "wy_tc2_sm_107a")
     )
@@ -358,7 +359,11 @@ def test_registry_records_are_well_formed() -> None:
         wy2_107["library"] == wy2["library"] != wy["library"]
         and "sm_107a" in wy["arches"]
     )
-    assert len(libraries) == len(cake_jit.MODULES) - 1
+    assert (
+        cake_jit.MODULES["fwd_ho_vh2"]["library"]
+        == cake_jit.MODULES["fwd_ho"]["library"]
+    )
+    assert len(libraries) == len(cake_jit.MODULES) - 2
 
 
 def test_the_wy_stage_follows_the_architecture() -> None:
@@ -372,6 +377,39 @@ def test_the_wy_stage_follows_the_architecture() -> None:
     assert (
         cake_jit.MODULES["wy_tc2"]["arg_plan"] == cake_jit.MODULES["wy_tc"]["arg_plan"]
     )
+
+
+def test_the_value_half_split_rule() -> None:
+    assert cake_chain.FWD_HO_VH2_ARCHS == ("sm_107a",)
+    assert 0.0 < cake_chain.FWD_HO_VH2_STEP < 1.0
+    assert cake_chain.LAUNCH_ARGS["fwd_ho_vh2"] == cake_chain.LAUNCH_ARGS["fwd_ho"]
+    split, fwd_ho = cake_jit.MODULES["fwd_ho_vh2_sm_107a"], cake_jit.MODULES["fwd_ho"]
+    assert split["stage"] == "fwd_ho_vh2" and split["arches"] == ["sm_107a"]
+    assert split["arg_plan"] == fwd_ho["arg_plan"]
+    assert split["library"] != fwd_ho["library"]
+    assert split["launch"] == fwd_ho["launch"]
+    # sm_100a / sm_103a never run the split: the stage's record there is the fwd_ho program
+    other = cake_jit.MODULES["fwd_ho_vh2"]
+    assert other["stage"] == "fwd_ho_vh2" and other["arches"] == ["sm_100a", "sm_103a"]
+    assert {
+        key: value for key, value in other.items() if key not in ("arches", "stage")
+    } == {key: value for key, value in fwd_ho.items() if key not in ("arches", "stage")}
+    assert [cake_jit.stage_record("fwd_ho_vh2", arch) for arch in ARCHES] == [
+        "fwd_ho_vh2",
+        "fwd_ho_vh2",
+        "fwd_ho_vh2_sm_107a",
+    ]
+    # the doubled grid only where the record is the split; elsewhere fwd_ho's grid (the program's own)
+    assert [cake_chain.fwd_ho_vh2_splits(arch) for arch in ARCHES] == [
+        False,
+        False,
+        True,
+    ]
+    engaged = cake_chain.fwd_ho_vh2_engaged
+    # twice the CTAs in one round of one CTA per SM
+    assert engaged(6, 16, 192) and not engaged(6, 16, 191)
+    assert engaged(1, 1, 2) and not engaged(1, 1, 1)
+    assert not engaged(6, 16, 148) and not engaged(6, 16, 152)
 
 
 def test_scan_records_carry_the_planner_constants() -> None:
@@ -2641,15 +2679,15 @@ BENCH_LAYOUTS = {
 # deeper table (None: the table without CHAIN_PLAN).  Every other layout keeps its tables.
 CHAIN_PLAN_ROWS = {
     212: {
-        "r07": (20, 20),
+        "r07": (None, 20),
         "A16": (43, None),
-        "h2_hv6": (16, 16),
+        "h2_hv6": (None, 16),
         "h1_hv3": (16, 16),
         "g3_16x4096_h1": (None, 16),
     },
     216: {
-        "r07": (20, 20),
-        "h2_hv6": (16, 15),
+        "r07": (None, 20),
+        "h2_hv6": (None, 15),
         "h1_hv3": (16, 15),
         "g3_16x4096_h1": (None, 16),
     },
@@ -2890,11 +2928,99 @@ def test_chain_plan_tables_stay_within_the_budgets(
         _stage, _vb, pre, _ = cake_chain._scan_stages(
             "fwd_h", cake_chain.SDT_CONFIG, arch
         )
-        assert all(x in stages for x in (pre, "stitch", "fwd_ho")), stages
+        assert all(x in stages for x in (pre, "stitch")), stages
+        assert "fwd_ho" in stages or "fwd_ho_vh2" in stages, stages
     if bwd != bwd0:
         assert all(x in stages for x in (cake_chain.SDT_PRESCAN, "dhu_tc2")), stages
         assert "dv_local" not in stages, stages
     _assert_same_bits(_run(inputs, seq_lens, **pins), base_pinned, OUTPUT_NAMES)
+
+
+# The bench layouts whose forward runs fwd_ho_vh2 per device (SMs, architecture), on the host route's tables
+# (host_plans: the planner's tables, TC_PLAN and CHAIN_PLAN, which prices the split): on R200 the one-launch forwards of
+# r07 and h2_hv6 on the planner's tables (96 and 102 CTAs; without the split's price CHAIN_PLAN deepens them to 208 and
+# 198 CTAs) and of h1_hv3 on CHAIN_PLAN's deeper table (99 CTAs); no layout on sm_100a / sm_103a.
+_VH2_R200 = {"r07", "h2_hv6", "h1_hv3"}
+VH2_BENCH_ROWS = {
+    ("sm_100a", 148): set(),
+    ("sm_103a", 148): set(),
+    ("sm_103a", 152): set(),
+    ("sm_107a", 208): _VH2_R200,
+    ("sm_107a", 212): _VH2_R200,
+    ("sm_107a", 216): _VH2_R200,
+}
+
+
+@pytest.mark.parametrize("arch, sm_count", sorted(VH2_BENCH_ROWS))
+def test_value_half_split_on_the_bench_layouts(arch, sm_count, monkeypatch) -> None:
+    monkeypatch.setattr(
+        cake_chain, "_device_props", lambda _index: (sm_count, 232448, 10)
+    )
+    monkeypatch.setattr(cake_backend, "device_arch", lambda _index: arch)
+    options = cake_chain.make_options()
+    engaged = set()
+    for row, (seq_lens, num_v_heads) in BENCH_LAYOUTS.items():
+        plans, bwd_tc = cake_chain.host_plans(seq_lens, num_v_heads, 0, options)
+        meta = cake_chain.build_chunk_meta(seq_lens, "cpu", scan_plans=plans, lpt=True)
+        fwd, _bwd = cake_chain.sequence_groups(meta, num_v_heads, sm_count)
+        segments = meta.fwd_segments.num_segments
+        if (
+            fwd is None
+            and arch in cake_chain.FWD_HO_VH2_ARCHS
+            and cake_chain.fwd_ho_vh2_engaged(segments, num_v_heads, sm_count)
+        ):
+            engaged.add(row)
+            # the forward table the split runs is not one CHAIN_PLAN deepened past the split
+            chunks = tuple(-(-n // 64) for n in seq_lens)
+            rec = cake_chain.chain_plan_pricing("fwd", chunks, num_v_heads, 0, plans[0])
+            assert not rec.get("select", False), (row, rec)
+    assert engaged == VH2_BENCH_ROWS[(arch, sm_count)]
+    # without the split's price (FWD_HO_VH2_ARCHS empty) r07 takes CHAIN_PLAN's deeper fwd_ho table on R200
+    monkeypatch.setattr(cake_chain, "FWD_HO_VH2_ARCHS", ())
+    (fwd_plan, _), _tc = cake_chain.host_plans((16384,), 16, 0, options)
+    assert (fwd_plan.segment_len == 20) is (arch == "sm_107a"), fwd_plan
+
+
+# (layout, heads, route, pins): a serial plan with grouped value heads and partial chunks, a split plan (segment start
+# states from the pre-scan and the stitch) and the device route (the table's segment bound, padding segments
+# included); each forward scan is one launch of at most half the SMs of any of the devices
+VH2_FORMS = {
+    "serial": ((300, 77, 640, 17), (2, 4), "host", {}),
+    "split": (
+        (2000, 300),
+        (1, 2),
+        "host",
+        {"scan_config": (32, 2), "segment_chunks": 4},
+    ),
+    "device": ((100, 640, 77, 300), (2, 6), "device", {}),
+}
+
+
+@pytest.mark.parametrize("form", sorted(VH2_FORMS))
+def test_the_value_half_split_stays_within_the_budgets(
+    form, device, monkeypatch
+) -> None:
+    # with the rule on for the device's architecture (fwd_ho_vh2 is delivered for every architecture) the forward scan
+    # runs fwd_ho_vh2, else fwd_ho on the same table (the planner's tables: CHAIN_PLAN off); both runs stay within the
+    # budgets against the FP64 recurrence, the final state and the initial-state gradient included
+    seq_lens, heads, route, pins = VH2_FORMS[form]
+    arch = cake_backend.device_arch(cake_chain._device_index(device))
+    monkeypatch.setattr(cake_chain, "CHAIN_PLAN", {})
+    inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=83)
+    gen = torch.Generator().manual_seed(89)
+    h0 = (
+        0.1 * torch.randn(len(seq_lens), heads[1], HEAD_DIM, HEAD_DIM, generator=gen)
+    ).to(device)
+    ref = _reference(inputs, seq_lens, initial_state=h0)
+    stages = _record_launches(monkeypatch)
+    runs = []
+    for archs, stage in (((arch,), "fwd_ho_vh2"), ((), "fwd_ho")):
+        monkeypatch.setattr(cake_chain, "FWD_HO_VH2_ARCHS", archs)
+        stages.clear()
+        runs.append(_run(inputs, seq_lens, route=route, initial_state=h0, output_final_state=True, **pins))  # fmt: skip
+        assert [name for name in stages if name.startswith("fwd_ho")] == [stage], stages
+        _assert_close_to_reference(runs[-1], ref, OUTPUT_NAMES + ("final_state", "dh0"))
+    _assert_within_budget(runs[0], runs[1], OUTPUT_NAMES + ("final_state", "dh0"))
 
 
 # #7038 / #7548 form: a one-thread sleep kernel resident on a side stream for the whole call; the gate is declared
