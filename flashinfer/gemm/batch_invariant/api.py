@@ -19,6 +19,11 @@ applied inside the block-scaled MMA instruction, for e4m3 A (M, K) row-major and
 (N, K) weight (the instruction takes K-major operands only), bf16 or fp16 output; the class is the device
 architecture's (`schedule.mx_class_for`: the sm_107 instruction folds 64 elements per step, the sm_100 / sm_103 one 32).
 
+``gemm_fp8_nt_groupwise_batch_invariant`` is what :func:`flashinfer.gemm_fp8_nt_groupwise` runs under
+``batch_invariant=True``: the DeepSeek-style block-scale class ``gemm.e4m3.kblock128`` -- e4m3 A (M, K) and B (N, K)
+row-major, fp32 scales per 1x128 block of A and per 128x128 block of B in the operator's ``K`` or ``MN`` layout, each
+128-element K block folded by the 32-wide fp8 step from +0 and the block partials folded in block order with
+``fma.rn(mul.rn(s_a, s_b), P, acc)`` by the epilogue warps, bf16 or fp16 output; one launch, no split.
 ``mm_fp4_batch_invariant`` is what :func:`flashinfer.mm_fp4` runs under ``batch_invariant=True``: C = cvt(mul.rn(A @ B, alpha))
 with the block scales (NVFP4: one e4m3 per 16 elements; MXFP4: one UE8M0 per 32; the 128x4 swizzled layout of
 :func:`flashinfer.nvfp4_quantize` / :func:`flashinfer.mxfp4_quantize`) applied inside the instruction and the caller's scalar
@@ -39,10 +44,13 @@ from ...batch_invariant.support import check_device, unsupported
 from .generator import Knobs
 from .schedule import chunks_for, default_config, fp4_class_for, mx_class_for
 from .spec import (
+    BLOCK_K,
     ELEM_BITS_OF,
+    FP8_BLOCKSCALE_FMTS,
     MMA_K_OF,
     MXFP4_FMTS,
     NVFP4_FMTS,
+    SCALE_BLOCK_N,
     chunk_unit,
     is_scaled,
     sf_bytes,
@@ -78,6 +86,11 @@ MM_MXFP8_API_OUT_DTYPES = (torch.bfloat16, torch.float16)
 MM_MXFP8_OUT_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
 MM_FP4_API_OUT_DTYPES = MM_MXFP8_API_OUT_DTYPES
 MM_FP4_OUT_DTYPES = MM_MXFP8_OUT_DTYPES
+#: The block-scale fp8 class of :func:`flashinfer.gemm_fp8_nt_groupwise` (``scale_granularity_mnk = (1, 128, 128)``).
+CLASS_FP8BS = "gemm.e4m3.kblock128"
+GEMM_FP8BS_ARCHS = MM_BF16_ARCHS
+GEMM_FP8BS_API_OUT_DTYPES = MM_MXFP8_API_OUT_DTYPES
+GEMM_FP8BS_OUT_DTYPES = MM_MXFP8_OUT_DTYPES
 _ONES: Dict[
     int, torch.Tensor
 ] = {}  # a 1-element fp32 1.0 per device: the alpha of an ``mm_fp4`` call without one
@@ -1374,3 +1387,171 @@ def mm_fp4_batch_invariant(
         cls,
         alpha=alpha,
     )
+
+
+# ----------------------------------------------------------------------------- the block-scale fp8 class
+
+
+def _blockscale_scale_view(
+    s: torch.Tensor,
+    name: str,
+    rows: int,
+    KB: int,
+    major: str,
+    device: torch.device,
+    mn_copy: bool = False,
+) -> torch.Tensor:
+    """The (rows, KB) view of a block-scale tensor: ``major == "K"`` takes it as ``(rows, KB)``, ``"MN"`` as ``(KB, rows)``
+    (:func:`flashinfer.gemm_fp8_nt_groupwise`'s ``scale_major_mode``); fp32 on the operands' device, any strides (the
+    kernel's producer warp stages a block's scales in smem from the tensor's own layout). ``mn_copy``: a K-major tensor is
+    handed over as its MN-major copy -- a layout copy, no arithmetic: the gather of one scale per row from K-major rows
+    is bound by the memory system, the MN-major rows of a block are contiguous."""
+    if not isinstance(s, torch.Tensor) or s.dtype != torch.float32:
+        raise unsupported(
+            CLASS_FP8BS,
+            f"{name} of type {type(s).__name__}"
+            if not isinstance(s, torch.Tensor)
+            else f"{name} {s.dtype}",
+            f"a float32 {name}",
+        )
+    if s.device != device:
+        raise unsupported(
+            CLASS_FP8BS, f"{name} on another device", f"{name} on A's device"
+        )
+    want = (rows, KB) if major == "K" else (KB, rows)
+    if tuple(s.shape) != want:
+        raise unsupported(
+            CLASS_FP8BS,
+            f"{name} {tuple(s.shape)}",
+            f"{name} of shape {want} for scale_major_mode={major!r} (one fp32 scale per 1x{BLOCK_K} block of A, per "
+            f"{SCALE_BLOCK_N}x{BLOCK_K} block of B)",
+        )
+    if major == "K":
+        return s.t().contiguous().t() if mn_copy else s
+    return s.t()
+
+
+def prepare_fp8_blockscale_operands(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    scale_major_mode: Optional[str],
+    out: Optional[torch.Tensor],
+    out_dtype: torch.dtype,
+) -> Tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int, int
+]:
+    """The block-scale class's typed checks: device and architecture, e4m3 A and B, 2-D shapes with matching K, K a whole
+    number of 128-element scale blocks, N a multiple of 8, A's row placement, B a row-major (N, K) weight (the NT
+    operator: K contiguous, 16-byte rows), the scale tensors of the layout's shapes (the ``K`` layout's A scales handed
+    over as their MN-major copy), the output's dtype / shape / layout (allocated when absent). Returns
+    ``(a, b, sfa, sfb, out, M, N, K)`` with ``sfa`` (M, K / 128) and ``sfb`` (ceil(N / 128), K / 128) views."""
+    cls = CLASS_FP8BS
+    check_device(a.device, cls, GEMM_FP8BS_ARCHS)
+    if a.dtype != torch.float8_e4m3fn or b.dtype != torch.float8_e4m3fn:
+        raise unsupported(
+            cls, f"dtypes ({a.dtype}, {b.dtype})", "A and B both float8_e4m3fn"
+        )
+    if a.dim() != 2 or b.dim() != 2:
+        raise unsupported(
+            cls, f"{a.dim()}-D A and {b.dim()}-D B", "2-D operands (M, K) and (N, K)"
+        )
+    M, K = a.shape
+    N, K2 = b.shape
+    if K != K2:
+        raise unsupported(cls, f"A (M, {K}) with B (N, {K2})", "matching K")
+    if b.device != a.device:
+        raise unsupported(cls, "operands on different devices", "A and B on one device")
+    if K == 0 or N == 0:
+        raise unsupported(
+            cls, f"K = {K}, N = {N}", "K > 0 and N > 0 (only M may be empty)"
+        )
+    if K % BLOCK_K:
+        raise unsupported(
+            cls,
+            f"K = {K}",
+            f"K a multiple of {BLOCK_K} (a whole number of scale blocks: the class has no K tail)",
+        )
+    if N % _ALIGN:
+        raise unsupported(
+            cls, f"N = {N}", f"N a multiple of {_ALIGN} (16-byte output rows)"
+        )
+    if scale_major_mode not in ("K", "MN"):
+        raise unsupported(
+            cls,
+            f"scale_major_mode={scale_major_mode!r}",
+            'scale_major_mode "K" or "MN"',
+        )
+    a = _aligned_rows(a, M, K, _ALIGN_FP8)
+    if b.stride(1) != 1 or (N > 1 and (b.stride(0) < K or b.stride(0) % _ALIGN_FP8)):
+        raise unsupported(
+            cls,
+            f"B with strides {tuple(b.stride())}",
+            "a row-major (N, K) weight with K contiguous and 16-byte rows",
+        )
+    _check_base(b, "B", cls)
+    KB, NB = K // BLOCK_K, -(-N // SCALE_BLOCK_N)
+    sfa = _blockscale_scale_view(
+        a_scale, "a_scale", M, KB, scale_major_mode, a.device, mn_copy=True
+    )
+    sfb = _blockscale_scale_view(b_scale, "b_scale", NB, KB, scale_major_mode, a.device)
+    if out_dtype not in GEMM_FP8BS_OUT_DTYPES:
+        raise unsupported(cls, f"out_dtype={out_dtype}", "bf16 or fp16 output")
+    out = _prepare_out(out, M, N, out_dtype, a.device, cls)
+    return a, b, sfa, sfb, out, M, N, K
+
+
+def gemm_fp8_nt_groupwise_batch_invariant(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    scale_major_mode: Optional[str] = "K",
+    out: Optional[torch.Tensor] = None,
+    *,
+    out_dtype: torch.dtype = torch.bfloat16,
+    config: Optional[Knobs] = None,
+) -> torch.Tensor:
+    """The block-scale class ``gemm.e4m3.kblock128`` of :func:`flashinfer.gemm_fp8_nt_groupwise` (``scale_granularity_mnk =
+    (1, 128, 128)``): per element ``out = cvt(fold_kb fma.rn(mul.rn(s_a[m, kb], s_b[n // 128, kb]), P_kb, acc))`` with
+    ``P_kb`` the 32-wide fp8 fold of K block ``kb`` from +0 and the block fold from +0 in block order. ``a`` (M, K) and
+    ``b`` (N, K) e4m3 row-major; ``a_scale`` (M, K / 128) and ``b_scale`` (ceil(N / 128), K / 128) fp32 in the ``K``
+    layout, or their transposes in the ``MN`` layout; ``out_dtype`` bf16 / fp16 (fp32 exposes the fold for tests);
+    ``config`` forces a record of the class's space (the dispatcher's pick by default: every record computes the same
+    bits). One launch, no split, no workspace."""
+    a, b, sfa, sfb, out, M, N, K = prepare_fp8_blockscale_operands(
+        a, b, a_scale, b_scale, scale_major_mode, out, out_dtype
+    )
+    cls = CLASS_FP8BS
+    if M == 0:
+        return out  # no rows: nothing to launch
+    from .blocks.compile_fp8bs import get_compiled_fp8bs
+    from .blocks.operands import can_implement
+
+    in_fmt = FP8_BLOCKSCALE_FMTS[0]
+    if config is None:
+        config = default_config(M, N, K, 1, "k", *part_of(a.device), in_fmt)
+    if not can_implement(config, M, N, K, "k", 1, in_fmt):
+        raise unsupported(
+            cls,
+            f"the configuration {config.describe()} at (M, N, K) = ({M}, {N}, {K})",
+            "a configuration of the enumerated space for the shape (the dispatcher's, or the tuner's candidates)",
+        )
+    kernel = get_compiled_fp8bs(
+        config,
+        persistent_clusters(a.device, config),
+        OUT_FMT_OF_DTYPE[out_dtype],
+        family=part_of(a.device)[1],
+    )
+    _require_disjoint(
+        cls,
+        [(out, "the output")],
+        [(a, "A"), (b, "B"), (sfa, "a_scale"), (sfb, "b_scale")],
+    )
+    # the kernel sees (m, k, l) / (n, k, l) / (m, n, l) operands with l = 1 and the scale views with their own strides
+    a3 = a.as_strided((M, K, 1), (a.stride(0), 1, K))
+    b3 = b.as_strided((N, K, 1), (b.stride(0), 1, K))
+    c3 = out.as_strided((M, N, 1), (out.stride(0), 1, N))
+    kernel(a3, b3, sfa, sfb, c3)
+    return out

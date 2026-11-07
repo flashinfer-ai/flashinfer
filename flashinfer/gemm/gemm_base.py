@@ -10656,6 +10656,7 @@ def _cutlass_gemm_fp8_nt_groupwise_requirement(
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
     backend: Literal["cutlass", "trtllm"] = "cutlass",
+    batch_invariant: bool = False,
 ):
     if scale_major_mode is None:
         raise ValueError("scale_major_mode is required in CUTLASS")
@@ -10675,6 +10676,7 @@ def _trtllm_gemm_fp8_nt_groupwise_requirement(
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
     backend: Literal["cutlass", "trtllm"] = "cutlass",
+    batch_invariant: bool = False,
 ):
     if scale_granularity_mnk != (1, 128, 128):
         raise ValueError("scale_granularity_mnk must be (1, 128, 128) in TRTLLM")
@@ -10695,6 +10697,7 @@ def _check_gemm_fp8_nt_groupwise_problem_size(
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
     backend: Literal["cutlass", "trtllm"] = "cutlass",
+    batch_invariant: bool = False,
 ):
     if a.ndim != 2 or b.ndim != 2:
         raise ValueError(f"Shape mismatch. a.shape = {a.shape}, b.shape = {b.shape}")
@@ -10724,6 +10727,7 @@ def _cutile_gemm_fp8_nt_groupwise_requirement(
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
     backend: Literal["cutlass", "trtllm", "cutile"] = "cutlass",
+    batch_invariant: bool = False,
 ):
     # v1 supports only K-major scales + (1, 128, 128) granularity.
     # MN-major and other granularities are documented follow-ups.
@@ -10753,6 +10757,7 @@ def _cute_dsl_gemm_fp8_nt_groupwise_requirement(
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
     backend: Literal["cutlass", "trtllm"] = "cutlass",
+    batch_invariant: bool = False,
 ):
     from ..cute_dsl.availability import is_rubin_cute_dsl_available
     from .kernels.gemm_fp8_groupwise_sm107 import check_problem
@@ -10802,7 +10807,12 @@ def _heuristic_func_gemm_fp8_nt_groupwise(
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
     backend: str = "auto",
+    batch_invariant: bool = False,
 ):
+    if batch_invariant:
+        return [
+            "batch_invariant"
+        ]  # the class replaces the backends (none may be chosen)
     # "trtllm" takes a different scale layout and "cutile" is K-major only, so the
     # automatic choice is between the two backends that share the cutlass contract.
     heuristic_backends = []
@@ -10842,6 +10852,8 @@ def gemm_fp8_nt_groupwise(
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
     backend: Literal["cutlass", "trtllm", "cutile", "cute-dsl", "auto"] = "cutlass",
+    *,
+    batch_invariant: bool = False,
 ) -> torch.Tensor:
     r"""Performs matrix multiplication with FP8 data types using groupwise scaling.
 
@@ -10912,6 +10924,21 @@ def gemm_fp8_nt_groupwise(
         (the function-level ``_validate_fp8_output_dtype`` rejects fp32 for
         all FP8 backends).
 
+    batch_invariant: bool
+        ``True`` runs the batch-invariant block-scale fp8 GEMM class in place of
+        the backends (requires ``backend="auto"``, ``scale_granularity_mnk =
+        (1, 128, 128)``, e4m3 operands, ``k`` a multiple of 128 and bf16 / fp16
+        output; both scale layouts are accepted): a row of the output is
+        bit-identical whatever the number of rows, the row's position in the
+        batch or the configuration chosen, and the result is deterministic.
+        Under autotuning the class's top configurations for the shape are
+        profiled; all of them compute the same bits. The specification is
+        ``flashinfer.batch_invariant.fingerprint("gemm_fp8_nt_groupwise", K=,
+        out_dtype=)``. Unsupported inputs raise
+        :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`
+        instead of falling back. See ``flashinfer/batch_invariant/README.md``.
+        Defaults to ``False``.
+
     Returns
     -------
     out: torch.Tensor
@@ -10921,6 +10948,21 @@ def gemm_fp8_nt_groupwise(
     -----
     The ``m`` should be padded to a multiple of 4 before calling this function, to accommodate the kernel's requirement.
     """
+    if batch_invariant:
+        from .batch_invariant.tuning import gemm_fp8_nt_groupwise_batch_invariant_auto
+
+        return gemm_fp8_nt_groupwise_batch_invariant_auto(
+            a,
+            b,
+            a_scale,
+            b_scale,
+            scale_major_mode,
+            mma_sm,
+            scale_granularity_mnk,
+            out,
+            out_dtype,
+            backend,
+        )
 
     workspace_buffer = _get_stream_cache_buf(
         "gemm_fp8_nt_groupwise_workspace", DEFAULT_WORKSPACE_SIZE, a.device

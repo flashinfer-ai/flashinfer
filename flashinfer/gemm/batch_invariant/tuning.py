@@ -34,11 +34,14 @@ from .api import (
     CLASS,
     CLASS_FP4,
     CLASS_FP8,
+    CLASS_FP8BS,
     CLASS_MXFP8,
+    GEMM_FP8BS_API_OUT_DTYPES,
     MM_FP4_API_OUT_DTYPES,
     MM_MXFP8_API_OUT_DTYPES,
     bmm_fp8_batch_invariant,
     fp4_format_for,
+    gemm_fp8_nt_groupwise_batch_invariant,
     mm_bf16_batch_invariant,
     mm_fp4_batch_invariant,
     mm_mxfp8_batch_invariant,
@@ -47,6 +50,7 @@ from .api import (
     prepare_bias,
     prepare_bmm_fp8_operands,
     prepare_fp4_operands,
+    prepare_fp8_blockscale_operands,
     prepare_mxfp8_operands,
     prepare_operands,
 )
@@ -56,12 +60,19 @@ from .spec import ELEM_BITS_OF, NVFP4_FMTS, sf_bytes
 
 #: The autotuner op names of the classes per API; ``skip_ops={"bf16_gemm_batch_invariant"}`` skips an API's profiling.
 CUSTOM_OP = "bf16_gemm_batch_invariant"
+CUSTOM_OP_FP8BS = "fp8_blockscale_gemm_batch_invariant"
 CUSTOM_OP_BMM_FP8 = "fp8_bmm_batch_invariant"
 CUSTOM_OP_MM_MXFP8 = "mxfp8_gemm_batch_invariant"
 CUSTOM_OP_MM_FP4 = "fp4_gemm_batch_invariant"
 #: The APIs the runner serves and the position of the output in their input lists.
-APIS = ("mm_bf16", "bmm_fp8", "mm_mxfp8", "mm_fp4")
-OUT_INDEX = {"mm_bf16": 2, "bmm_fp8": 4, "mm_mxfp8": 4, "mm_fp4": 5}
+APIS = ("mm_bf16", "bmm_fp8", "mm_mxfp8", "mm_fp4", "gemm_fp8_nt_groupwise")
+OUT_INDEX = {
+    "mm_bf16": 2,
+    "bmm_fp8": 4,
+    "mm_mxfp8": 4,
+    "mm_fp4": 5,
+    "gemm_fp8_nt_groupwise": 4,
+}
 #: How many of the dispatcher's configurations the autotuner profiles per shape bucket.
 TOP_K = 10
 
@@ -160,6 +171,29 @@ def _tuning_config(
 
 
 TUNING_CONFIG = _tuning_config(OUT_INDEX["mm_bf16"])  # inputs [a, b, out]
+#: The block-scale fp8 class: inputs [a (M, K), b (N, K), a_scale (K / 128, M), b_scale (K / 128, ceil(N / 128)), out]; a's
+#: row count is the tuned dimension, the output and the MN-layout A scales follow it (their last mode).
+TUNING_CONFIG_FP8BS = TuningConfig(
+    use_cuda_graph=True,
+    use_cold_l2_graph_replay=True,
+    use_cold_l2_cache=True,
+    cold_chain_launches=8,
+    profile_arena_input_indices=(1,),
+    dynamic_tensor_specs=(
+        DynamicTensorSpec(
+            (0,),
+            (-2,),
+            get_hybrid_num_tokens_buckets,
+            map_to_hybrid_bucket_uncapped,
+        ),
+    ),
+    constraint_specs=(
+        ConstraintSpec(
+            OUT_INDEX["gemm_fp8_nt_groupwise"], -2, lambda shapes: shapes[0][-2]
+        ),
+        ConstraintSpec(2, -1, lambda shapes: shapes[0][-2]),
+    ),
+)
 TUNING_CONFIG_BMM_FP8 = _tuning_config(
     OUT_INDEX["bmm_fp8"]
 )  # inputs [A, B, A_scale, B_scale, out]
@@ -201,6 +235,12 @@ class BatchInvariantGemmRunner(TunableRunner):
 
     def _shape(self, inputs: List[torch.Tensor]) -> tuple:
         a, b = inputs[0], inputs[1]
+        if self.api == "gemm_fp8_nt_groupwise":
+            return (
+                a.shape[0],
+                b.shape[0],
+                a.shape[1],
+            )  # the NT operator's weight is (N, K)
         per_unit = (
             2 if ELEM_BITS_OF[self.in_fmt] == 4 else 1
         )  # the 4-bit formats arrive byte-packed: two elements per unit of a's K mode; every other format, one
@@ -304,6 +344,13 @@ class BatchInvariantGemmRunner(TunableRunner):
                 config=cfg,
                 chunks=self.chunks,
                 in_fmt=self.in_fmt,
+            )
+        if self.api == "gemm_fp8_nt_groupwise":
+            a, b, sfa, sfb, out = (
+                inputs  # the scales in the MN layout: (K / 128, M) and (K / 128, ceil(N / 128))
+            )
+            return gemm_fp8_nt_groupwise_batch_invariant(
+                a, b, sfa, sfb, "MN", out, out_dtype=out.dtype, config=cfg
             )
         a, b, out, bias = (
             inputs  # bias: the (N,) vector or None (the autotuner keeps a None input as is)
@@ -493,6 +540,55 @@ def mm_fp4_batch_invariant_auto(
         [runner],
         TUNING_CONFIG_MM_FP4["nvfp4" if use_nvfp4 else "mxfp4"],
         inputs,
+    )
+    chosen(inputs=inputs, tactic=tactic)
+    return out
+
+
+def gemm_fp8_nt_groupwise_batch_invariant_auto(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    scale_major_mode: Optional[str],
+    mma_sm: int,
+    scale_granularity_mnk: tuple,
+    out: Optional[torch.Tensor],
+    out_dtype: Optional[torch.dtype],
+    backend: str,
+) -> torch.Tensor:
+    """``flashinfer.gemm_fp8_nt_groupwise(a, b, a_scale, b_scale, scale_major_mode, ..., batch_invariant=True)``: the
+    block-scale class behind the FlashInfer API's autotuner. The scale tensors reach the runner in the MN layout (a
+    K-major tensor is copied once: a layout copy, no arithmetic), so the tuned row count has one tensor mode to follow;
+    ``mma_sm`` is a placement of the backends and is ignored; the scale granularity must be the class's (1, 128, 128)."""
+    if backend != "auto":
+        raise unsupported(
+            CLASS_FP8BS,
+            f"backend={backend!r} together with batch_invariant=True",
+            'backend="auto" (the flag selects the batch-invariant class in place of the backends)',
+        )
+    if tuple(scale_granularity_mnk) != (1, 128, 128):
+        raise unsupported(
+            CLASS_FP8BS,
+            f"scale_granularity_mnk={tuple(scale_granularity_mnk)}",
+            "scale_granularity_mnk = (1, 128, 128) (the class's block sizes)",
+        )
+    if out is not None:
+        out_dtype = out.dtype
+    out_dtype = out_dtype or torch.bfloat16
+    if out_dtype not in GEMM_FP8BS_API_OUT_DTYPES:
+        raise unsupported(CLASS_FP8BS, f"out_dtype={out_dtype}", "bf16 or fp16 output")
+    a, b, sfa, sfb, out, M, N, K = prepare_fp8_blockscale_operands(
+        a, b, a_scale, b_scale, scale_major_mode, out, out_dtype
+    )
+    if M == 0:
+        return out
+    sfa_mn = sfa.t()  # (K / 128, M), contiguous: the MN layout (the K layout's copy)
+    sfb_mn = sfb.t().contiguous()  # (K / 128, ceil(N / 128))
+    runner = _runner("gemm_fp8_nt_groupwise", "e4m3_bs", "k", 1, *part_of(a.device))
+    inputs = [a, b, sfa_mn, sfb_mn, out]
+    chosen, tactic = AutoTuner.get().choose_one(
+        CUSTOM_OP_FP8BS, [runner], TUNING_CONFIG_FP8BS, inputs
     )
     chosen(inputs=inputs, tactic=tactic)
     return out
