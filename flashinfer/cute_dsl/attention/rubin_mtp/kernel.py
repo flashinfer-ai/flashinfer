@@ -67,6 +67,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.utils as utils
 import cutlass.cute as cute
+import cutlass.experimental.primitives as prims
 from cutlass.cute.nvgpu import tcgen05, OperandMajorMode
 import cutlass.cute.nvgpu.cpasync as cpasync
 import cutlass.pipeline as pipeline
@@ -159,6 +160,26 @@ def _wait_cluster_mbarrier(mbar_ptr: cute.Pointer, phase: cutlass.Int32) -> None
     wait (SASS has no cluster membar scope).
     """
     cute.arch.mbarrier_wait(mbar_ptr, phase)
+
+
+@cute.jit
+def _wait_cluster_mbarrier_acquire(
+    mbar_ptr: cute.Pointer, phase: cutlass.Int32
+) -> None:
+    """``mbarrier.try_wait.parity.acquire.cluster`` spin on a local mbarrier.
+
+    Needed when the data read after the wait was written by a PEER CTA's
+    thread via ``st.async`` (its complete-tx releases at cluster scope). The
+    default ``.acquire.cta`` wait only synchronizes with releases by this
+    CTA's own threads (and its own async proxy), so the plain wait gives no
+    happens-before edge to the peer's store. ``cute.arch.mbarrier_wait`` has
+    no scope argument, so this uses the Primitives ``mbarrier_try_wait_parity``
+    with ``MBarrierScope.CLUSTER``. Used only on the corr RAW site.
+    """
+    while not prims.mbarrier_try_wait_parity(
+        mbar_ptr, phase, scope=prims.MBarrierScope.CLUSTER
+    ):
+        pass
 
 
 @cute.jit
@@ -5077,8 +5098,9 @@ class RubinMultiHeadLatentAttentionForwardFP8TwoPlusTwo:
                 common_params.cor_full_mbar.arrive_mbarrier(p_cor_consumer_state.index)
 
         if_generate(is_sync_warp, _arrive_cor_full)
-        common_params.cor_full_mbar.wait(
-            p_cor_consumer_state.index, p_cor_consumer_state.phase
+        _wait_cluster_mbarrier_acquire(
+            common_params.cor_full_mbar.get_barrier(p_cor_consumer_state.index),
+            cutlass.Int32(p_cor_consumer_state.phase),
         )
 
         # Each thread reads its own row's metadata from the corr SMEM stage.
