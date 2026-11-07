@@ -64,7 +64,7 @@ Every shipped training module after the renames. Each module has a backend packa
 | DSA indexer | `flashinfer.cake_dsa_indexer_det_train` | det | single rank | #8936 |
 | DSA sparse attention | `flashinfer.cake_dsa_sparse_attention_nondet_train` | nondet | single rank | #8942 |
 | GQA HD256 | `flashinfer.cake_gqa_nondet_train` | nondet | single rank | #8939 |
-|  | `flashinfer.cake_gqa_det_train` | det | single rank | __PR__ |
+|  | `flashinfer.cake_gqa_det_train` | det | single rank | #9121 |
 
 ## Calls that took `deterministic=`
 
