@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import collections
 import functools
 import math
 import threading
@@ -296,16 +297,30 @@ def get_alphamoe_nvfp4_sm100_module():
 
 
 # The aligned entry's FP32 accumulators reused across eager calls, one per
-# (device index, CUDA stream handle). Each holds +0 whenever no call on its
-# stream is in flight: a call adds every route into it, and its last launch,
-# the drain, writes out = bf16(accumulator + float32(out)) and stores +0 back.
-# The lock keeps one call's launches together when several host threads share
-# a stream.
-_ALIGNED_ACCUMULATORS: dict[tuple[int, int], torch.Tensor] = {}
+# (device index, CUDA stream handle), least recently used first. Each holds -0,
+# the FP32 additive identity, whenever no call on its stream is in flight: a
+# call adds every route into it, and its last launch, the drain, writes
+# out = bf16(accumulator + float32(out)) and stores -0 back, so an element no
+# route reaches keeps its BF16 value, including -0 (a NaN stays a NaN, but the
+# add may change its payload). The lock keeps one
+# call's launches together when several host threads share a stream.
+_ALIGNED_ACCUMULATORS: collections.OrderedDict[tuple[int, int], torch.Tensor] = (
+    collections.OrderedDict()
+)
 _ALIGNED_ACCUMULATOR_LOCK = threading.Lock()
 # The largest accumulator kept across calls, in FP32 elements (16 MiB); a
-# larger output takes a zero-filled temporary of the call.
+# larger output takes a -0-filled temporary of the call.
 _ALIGNED_ACCUMULATOR_CACHE_ELEMENTS = 1 << 22
+# The most streams of one device that keep an accumulator, as many as
+# PyTorch's stream pool hands out per priority. A call on another stream
+# releases the least recently used one; the caching allocator reuses a
+# released buffer only for later allocations on its own stream, so the drain
+# still pending there finishes first.
+_ALIGNED_ACCUMULATOR_STREAMS = 32
+# cudaStreamPerThread: one handle names a different stream on each host
+# thread, so it cannot key a buffer shared across calls. A call on it takes a
+# per-call accumulator.
+_CUDA_STREAM_PER_THREAD = 2
 
 
 def _current_stream_capturing(device: torch.device) -> bool:
@@ -319,27 +334,44 @@ def _current_stream_capturing(device: torch.device) -> bool:
 def _aligned_accumulator(
     out: torch.Tensor,
 ) -> tuple[torch.Tensor, Optional[tuple[int, int]]]:
-    """A +0 FP32 accumulator shaped like ``out`` and its cache key.
+    """A -0 FP32 accumulator shaped like ``out`` and its cache key.
 
     Outside CUDA graph capture, an output of at most
-    ``_ALIGNED_ACCUMULATOR_CACHE_ELEMENTS`` elements takes a view of the
-    buffer cached for its device and current stream, which grows (zero-filled
-    on that stream) when a call needs more elements. Under capture, or for a
-    larger output, the accumulator is a zero-filled temporary (key ``None``);
-    under capture its storage belongs to the graph's memory pool and each
-    replay fills it, so no captured graph reads a buffer that eager calls
-    share.
+    ``_ALIGNED_ACCUMULATOR_CACHE_ELEMENTS`` elements on a stream other than
+    the per-thread default stream takes a view of the buffer cached for its
+    device and current stream, which grows (-0-filled on that stream) when a
+    call needs more elements. A device keeps buffers for at most
+    ``_ALIGNED_ACCUMULATOR_STREAMS`` streams and releases the least recently
+    used one. Under capture, on the per-thread default stream, or for a
+    larger output, the accumulator is a -0-filled temporary of the call (key
+    ``None``); under capture its storage belongs to the graph's memory pool
+    and each replay fills it, so no captured graph reads a buffer that eager
+    calls share. PyTorch's caching allocator keys its blocks by stream handle,
+    so it does not isolate concurrent host threads on the per-thread default
+    stream; that holds for every temporary tensor there, not only this one.
     """
     numel = out.numel()
-    if numel > _ALIGNED_ACCUMULATOR_CACHE_ELEMENTS or _current_stream_capturing(
-        out.device
+    stream = torch.cuda.current_stream(out.device).cuda_stream
+    if (
+        numel > _ALIGNED_ACCUMULATOR_CACHE_ELEMENTS
+        or stream == _CUDA_STREAM_PER_THREAD
+        or _current_stream_capturing(out.device)
     ):
-        return torch.zeros(out.shape, dtype=torch.float32, device=out.device), None
-    key = (out.device.index, torch.cuda.current_stream(out.device).cuda_stream)
+        return (
+            torch.full(out.shape, -0.0, dtype=torch.float32, device=out.device),
+            None,
+        )
+    key = (out.device.index, stream)
     buffer = _ALIGNED_ACCUMULATORS.get(key)
     if buffer is None or buffer.numel() < numel:
-        buffer = torch.zeros(numel, dtype=torch.float32, device=out.device)
+        buffer = torch.full((numel,), -0.0, dtype=torch.float32, device=out.device)
         _ALIGNED_ACCUMULATORS[key] = buffer
+        _ALIGNED_ACCUMULATORS.move_to_end(key)
+        same_device = [held for held in _ALIGNED_ACCUMULATORS if held[0] == key[0]]
+        for stale in same_device[:-_ALIGNED_ACCUMULATOR_STREAMS]:
+            del _ALIGNED_ACCUMULATORS[stale]
+    else:
+        _ALIGNED_ACCUMULATORS.move_to_end(key)
     return buffer[:numel].view(out.shape), key
 
 
@@ -367,15 +399,15 @@ def _alphamoe_nvfp4_aligned_moe_impl(
     w1_scale_prepared: Optional[torch.Tensor] = None,
     w2_scale_prepared: Optional[torch.Tensor] = None,
 ) -> None:
-    # Every route adds into an FP32 accumulator that starts at +0, and the
-    # drain adds the caller's output last: out = bf16(accumulator +
-    # float32(out)), one rounding, which keeps the additive semantics. The
-    # drain then stores +0 back, so a cached accumulator needs no fill before
-    # the next call (_aligned_accumulator). Both launches use the current
-    # stream. An output the drain kernel does not take (not a contiguous,
-    # 16-byte aligned 2D BF16 CUDA tensor of a multiple of eight elements)
-    # keeps the cast and the copy back, and the aligned op reports why it
-    # refuses it.
+    # Every route adds into an FP32 accumulator that starts at -0, the
+    # additive identity, and the drain adds the caller's output last: out =
+    # bf16(accumulator + float32(out)), one rounding, which keeps the additive
+    # semantics. The drain then stores -0 back, so a cached accumulator needs
+    # no fill before the next call (_aligned_accumulator). Both launches use
+    # the current stream. An output the drain kernel does not take (not a
+    # contiguous, 16-byte aligned 2D BF16 CUDA tensor of a multiple of eight
+    # elements) keeps the cast and the copy back, and the aligned op reports
+    # why it refuses it.
     module = get_alphamoe_nvfp4_sm100_module()
     drained = (
         out.is_cuda
@@ -419,7 +451,7 @@ def _alphamoe_nvfp4_aligned_moe_impl(
                 out.copy_(accumulator)
         except BaseException:
             # A refused or failed call may leave partial sums: drop the buffer,
-            # so the next call on the stream starts from a fresh zero fill.
+            # so the next call on the stream starts from a fresh -0 fill.
             if key is not None:
                 _ALIGNED_ACCUMULATORS.pop(key, None)
             raise
@@ -477,19 +509,27 @@ def alphamoe_nvfp4_aligned_moe(
 
     This SM100/SM103 operator consumes a pre-aligned routing plan. It does not
     run expert selection. Contributions accumulate in an FP32 ``[M, K]``
-    accumulator that starts at zero; the last launch adds it to the
-    caller-owned BF16 ``out`` with one rounding,
-    ``out = bf16(accumulator + float32(out))``, and stores zero back.
+    accumulator that starts at negative zero, the additive identity; the last
+    launch adds it to the caller-owned BF16 ``out`` with one rounding,
+    ``out = bf16(accumulator + float32(out))``, and stores negative zero back.
+    An element no route reaches keeps its value, including ``-0``; a NaN stays
+    a NaN, but the add may change its payload.
 
     Outside CUDA graph capture the accumulator is reused across calls: one
     buffer per device and stream, sized by the largest output of at most
-    ``2**22`` elements seen there (``4 * M * K`` bytes, kept for the life of
-    the process), and zero between calls. Calls on one stream use it in
-    stream order; calls on different streams use different buffers. A larger
-    output takes a zero-filled temporary of ``4 * M * K`` bytes. Under CUDA
-    graph capture every call takes such a temporary from the graph's memory
-    pool, filled with zeros by each replay, so a captured graph shares no
-    buffer with eager calls and may be replayed on any stream.
+    ``2**22`` elements seen there (``4 * M * K`` bytes), and negative zero
+    between calls. A device keeps buffers for its 32 most recently used
+    streams; a call on another stream releases the least recently used one.
+    Calls on one stream use it in stream order; calls on different streams use
+    different buffers. A larger output, or a call on the per-thread default
+    stream (``cudaStreamPerThread``), takes a per-call temporary of
+    ``4 * M * K`` bytes filled with negative zeros. PyTorch's caching
+    allocator keys its blocks by stream handle and does not isolate
+    concurrent host threads on ``cudaStreamPerThread``, as for any tensor
+    allocated there. Under CUDA graph capture every call
+    takes such a temporary from the graph's memory pool, filled by each
+    replay, so a captured graph shares no buffer with eager calls and may be
+    replayed on any stream.
 
     ``hidden_states``, ``gemm1_weights``, and ``gemm2_weights`` store two E2M1
     values per ``uint8`` byte, with the even logical value in the low nibble.
