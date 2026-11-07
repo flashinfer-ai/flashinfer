@@ -2781,7 +2781,8 @@ def test_fp8_wider_than_1152_is_rejected_on_every_path(arch, num_heads, page_siz
     shared-memory index buffer).  Every FP8 path -- decode, MTP and prefill
     rows of every head count -- raises one ValueError from the route before
     any launch, naming the width, the limit, the C128 layers past 128K context
-    that reach it and the routes that run them; 1152 itself still routes."""
+    that reach it and the routes that run them (the NVFP4 cache only up to its
+    route's 1536 slots); 1152 itself still routes."""
     assert cake._FP8_MAX_WIDTH == 1152
     sm_count = _SM107_SM_COUNT if arch == "sm_107a" else _SM_COUNT
     shapes = (
@@ -2807,7 +2808,7 @@ def test_fp8_wider_than_1152_is_rejected_on_every_path(arch, num_heads, page_siz
         )
         if arch != "sm_107a" or num_heads in (64, 128) or max_q_len >= 257:
             assert _route(sparse_topk=1152, **kwargs).startswith("fp8_")
-        for sparse_topk in (1153, 1156, 1280, 2176, 4224):
+        for sparse_topk in (1153, 1156, 1280, 1536, 1537, 2176, 4224):
             with pytest.raises(ValueError) as excinfo:
                 _route(sparse_topk=sparse_topk, **kwargs)
             message = str(excinfo.value)
@@ -2815,7 +2816,8 @@ def test_fp8_wider_than_1152_is_rejected_on_every_path(arch, num_heads, page_siz
             assert "at most 1152 sparse slots" in message
             assert "past 128K context" in message
             assert "backend='trtllm-gen'" in message
-            assert "kv_cache_format='nvfp4'" in message
+            # The NVFP4 cache is named only for rows its route takes.
+            assert ("kv_cache_format='nvfp4'" in message) == (sparse_topk <= 1536)
 
 
 @pytest.mark.cpu_only

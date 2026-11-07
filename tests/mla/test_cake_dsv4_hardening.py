@@ -2055,7 +2055,46 @@ def test_dsv4_c128_rows_past_128k_raise_before_any_launch(h_q, form):
     _skip_unless_cake_gpu()
     case = _dsv4_layer_case(h_q, "c128-128k", form, width=2176)
     out = case.nan_out()
-    with pytest.raises(ValueError, match=r"sparse_topk 2176: .* at most 1152"):
+    with pytest.raises(ValueError, match=r"sparse_topk 2176: .* at most 1152") as e:
         case.run(workspace=_workspace_128mib(), out=out, float_scales=True)
     torch.cuda.synchronize()
+    assert "nvfp4" not in str(e.value)
     assert torch.isnan(out.float()).all()
+
+
+@pytest.mark.parametrize("h_q", [128, 64, 32, 16, 8])
+@pytest.mark.parametrize("width", [320, 704], ids=["c128-16k", "c128-64k"])
+@pytest.mark.parametrize("batch", [8, 32])
+@pytest.mark.parametrize("minus_one_inside", [False, True], ids=["", "minus-one"])
+def test_dsv4_c128_mtp_rows_at_the_compression_boundary(
+    h_q, width, batch, minus_one_inside
+):
+    """C128 MTP rows whose active counts come from their positions, across a
+    128-position boundary: request ``b`` ends at position 640 + 128 b, so its
+    four rows attend 4 + b, 4 + b, 4 + b and 5 + b compressed rows of a table
+    padded to the server's context (320 or 704 slots).  Columns past each
+    row's count point at a poison page (bit-identical output), every seventh
+    active slot is ``-1`` with ``minus_one_inside``, and the last visible
+    window slot and the last active compressed column read beacon rows whose
+    sign flip must move every row.  Runs the persistent and the M64 bodies
+    (and the one-partition producer at 8/16/32 heads, width 320, 8
+    requests)."""
+    _skip_unless_cake_gpu()
+    seq = [640 + 128 * b for b in range(batch)]
+    lens = [max((s - 4 + i + 1) // 128, 1) for s in seq for i in range(4)]
+    assert lens[:4] == [4, 4, 4, 5]
+    case = _build_case(
+        num_heads=h_q,
+        dtype=torch.float8_e4m3fn,
+        seq_lens=seq,
+        q_lens=[4] * batch,
+        layout="dense",
+        compressed_width=width - SWA_WINDOW,
+        compressed_page=2,
+        compressed_pages=max(64, 4 * batch * (width - SWA_WINDOW) // 8),
+        compressed_lens=lens,
+        minus_one_inside=minus_one_inside,
+        newest_first=True,
+        beacon=True,
+    )
+    _assert_boundary_columns_attended(case, _workspace_128mib())

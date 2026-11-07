@@ -1521,14 +1521,23 @@ def _route(
     is_topk128x = not is_swa and compressed_page_size == 2
     if dtype == torch.float8_e4m3fn:
         if sparse_topk > _FP8_MAX_WIDTH:
+            # The backend='cake' NVFP4 route takes up to _NVFP4_MAX_SPLITS
+            # tiles of 128 slots per token; only rows within it are sent there.
+            nvfp4_max_width = _NVFP4_MAX_SPLITS * _TILE_KV
+            if sparse_topk <= nvfp4_max_width:
+                elsewhere = (
+                    "Run these rows with backend='trtllm-gen' on this cache, or on "
+                    "an NVFP4 KV cache (kv_cache_format='nvfp4'), whose "
+                    f"backend='cake' route takes up to {nvfp4_max_width} slots per "
+                    "token."
+                )
+            else:
+                elsewhere = "Run these rows with backend='trtllm-gen'."
             raise ValueError(
                 f"backend='cake' has no FP8 kernel for sparse_topk {sparse_topk}: "
                 f"the FP8 DSv4 kernels take at most {_FP8_MAX_WIDTH} sparse slots "
                 "per token (128 SWA + 1024 compressed). A C128 layer is wider past "
-                "128K context (128 + context / 128 slots, 2176 at 256K). Run these "
-                "rows with backend='trtllm-gen' on this cache, or on an NVFP4 KV "
-                "cache (kv_cache_format='nvfp4'), whose backend='cake' route takes "
-                f"up to {_NVFP4_MAX_SPLITS * _TILE_KV} slots per token."
+                "128K context (128 + context / 128 slots, 2176 at 256K). " + elsewhere
             )
         if num_heads == 128:
             # One producer for every FP8/H128 row: the persistent body (one
