@@ -20,6 +20,15 @@ split count, grids, reducer) depends only on the batch shape, the longest KV and
 count, so it is computed once per distinct shape (:func:`plan_attention`) and reused; device
 facts are read once per device.
 
+A wide plan whose split merge can overlap later attention work (:func:`use_persistent_route`) runs
+the persistent wide kernel instead (``main_wide_persistent``) with the flag-waiting warp reducer
+(``reduce_w<N>_tile_flags``): at most the co-resident SM pairs walk the plan's work clusters, the
+split chunks first, and each split item publishes a per-tile flag that its reducer rows wait on, so
+the merge runs on the pairs that finish early instead of after the whole attention grid.  Same
+split plan, same per-item code and fold order: the output is bitwise the shipped kernels'.  The
+flag words live in a buffer of the launcher (zeroed once when it is built); one launcher must not
+run on two streams at once (as its workspace).
+
 Query and KV views may be row-strided on every route: every row of ``query`` and every token
 row of ``kv_cache`` must be 576 contiguous FP8 elements, and rows must be equally spaced (a
 16-byte multiple); the TMA descriptors of the row-tile programs and of the two-CTA wide kernel
@@ -71,6 +80,17 @@ WIDE_MIN_KV = 8192
 WIDE_TILE_Q = 128  # packed rows per two-CTA cluster
 WIDE_CLUSTER = 2  # CTAs per cluster: one SM pair per work item
 WIDE_MIN_TILES_PER_SPLIT = 2
+# Longest work item (KV tokens) that takes the persistent wide route, per device: (compute
+# capability, SM count).  B200 ((10, 0), 148 SMs): 16384.  Every other device keeps the shipped
+# kernels until its own measurement, among them GB300 ((10, 3), 152 SMs) and B300 ((10, 3), 148
+# SMs): the SM count alone does not identify the measured device.
+PERSISTENT_MAX_ITEM_KV = {((10, 0), 148): 16384}
+# Merge reducer classes (``reduce_warps_per_row`` of the plan's merge rows) that keep the shipped
+# kernels instead of the persistent wide route, per device (as above).  B200: single-warp reducer
+# plans (more than 1024 merge rows) keep the shipped kernels.  On one such shape the measurement
+# did not show the persistent route faster than the shipped kernels, so the class keeps them
+# until a separate measurement confirms a gain.
+PERSISTENT_SHIPPED_REDUCE_WARPS = {((10, 0), 148): (1,)}
 # Per-wave fixed cost (prologue + drain of a work item) in 128-token tile periods.  Calibrated
 # on B200 (148 SMs: one wave of 305 tiles beat three waves of 99) and GB300 (152 SMs: one wave
 # of 9 splits over 298 tiles beat two full waves of 19 splits by 3 % on the 8-request H96 decode
@@ -83,6 +103,10 @@ WIDE_WAVE_COST_TILES = 16
 # the tail items are split, and only when the model predicts at least WIDE_TAIL_MIN_GAIN.
 WIDE_UNDERFILL_EXP = 0.33
 WIDE_TAIL_MIN_GAIN = 0.02
+# Persistent wide route: one CTA of the wide kernels per SM (WIDE_CTA_SMEM_BYTES of dynamic shared
+# memory), WIDE_CTA_THREADS threads, clusters of WIDE_CLUSTER CTAs.
+WIDE_CTA_THREADS = 384
+WIDE_CTA_SMEM_BYTES = 232448
 TMA_ROW_ALIGN = 16  # bytes: TMA global strides are 16-byte multiples
 
 
@@ -332,6 +356,51 @@ def plan_attention(
     )
 
 
+def wide_work_clusters(plan: AttentionPlan) -> int:
+    """Work clusters of a wide plan: one per unsplit item, ``num_split`` per tail item."""
+    return plan.grid_main[0] // WIDE_CLUSTER
+
+
+def use_persistent_route(
+    plan: AttentionPlan, capability: tuple[int, int], sm_count: int, max_seq_len: int
+) -> bool:
+    """Whether a plan runs the persistent wide kernel with the flag-waiting reducer.
+
+    With ``s`` splits, ``nf`` unsplit items, ``W`` work clusters, ``P = sm_count // 2`` SM pairs
+    and ``C`` split chunks (``tail x s`` on a tail plan, ``W`` on a uniform one): a warp-reducer
+    merge exists (``2 <= s <= 32``), a second round of work clusters exists (``W > P``: an item's
+    epilogue overlaps the next item, and a merge can overlap later work), every split chunk runs in
+    the first round (``nf == 0`` or ``C <= P``: split chunks go first), and some pairs run out of
+    work before the grid ends (``ceil(W / P) x P > W``: only they can host the flag-waiting merge;
+    a reducer CTA never shares an SM with a running attention CTA).
+
+    The gains (an item's epilogue hidden under the next item, the tail merge hidden under later
+    work) are fixed per item boundary, so the route also needs a tail plan (``nf > 0``: unsplit
+    items whose boundaries overlap) and items no longer than ``PERSISTENT_MAX_ITEM_KV`` for the
+    device (``max_seq_len``, the keys one unsplit item streams).  Both tables are keyed by the
+    device's compute capability and SM count (``(capability, sm_count)``): a device without a value
+    keeps the shipped kernels, as does a plan whose merge reducer class is listed in
+    ``PERSISTENT_SHIPPED_REDUCE_WARPS`` for the device (``reduce_warps``).
+    """
+    if not plan.wide or not 2 <= plan.num_split <= REDUCE_WARP_MAX_SPLITS:
+        return False
+    device = ((int(capability[0]), int(capability[1])), int(sm_count))
+    max_item_kv = PERSISTENT_MAX_ITEM_KV.get(device)
+    if plan.n_full_items == 0 or max_item_kv is None or int(max_seq_len) > max_item_kv:
+        return False
+    if plan.reduce_warps in PERSISTENT_SHIPPED_REDUCE_WARPS.get(device, ()):
+        return False
+    work = wide_work_clusters(plan)
+    pairs = max(1, sm_count // WIDE_CLUSTER)
+    chunks = work - plan.n_full_items
+    rounds = -(-work // pairs)
+    return (
+        work > pairs
+        and (plan.n_full_items == 0 or chunks <= pairs)
+        and rounds * pairs > work
+    )
+
+
 # ---------------------------------------------------------------------------
 # Workspace, device facts and tensor views
 # ---------------------------------------------------------------------------
@@ -378,10 +447,97 @@ def _device_index(device: torch.device) -> int:
 
 
 @functools.cache
-def _device_facts(device_index: int) -> tuple[str, int]:
-    """``(arch, sm_count)`` of a device, read once."""
+def _device_facts(device_index: int) -> tuple[str, tuple[int, int], int]:
+    """``(arch, capability, sm_count)`` of a device, read once."""
     props = torch.cuda.get_device_properties(device_index)
-    return f"sm_{props.major}{props.minor}a", int(props.multi_processor_count)
+    return (
+        f"sm_{props.major}{props.minor}a",
+        (int(props.major), int(props.minor)),
+        int(props.multi_processor_count),
+    )
+
+
+# A minimal kernel the driver JIT-compiles for the pair capacity probe: the capacity depends on the
+# launch shape (block, shared memory, cluster), not on the body.
+_PAIR_PROBE_PTX = b"""
+.version 7.8
+.target sm_90
+.address_size 64
+.visible .entry cake_kimi_k3_mla_pair_probe()
+{
+    ret;
+}
+\x00"""
+
+_WIDE_PAIR_CAPACITY: dict[int, int] = {}
+
+
+def _wide_pair_capacity(device_index: int) -> int:
+    """How many two-CTA clusters of the wide kernels the device holds at once.
+
+    ``cuOccupancyMaxActiveClusters`` for a probe kernel launched with the wide CTA's threads and
+    dynamic shared memory in clusters of two; the driver's answer follows the part's floorsweeping,
+    which can leave it below ``sm_count // 2``.  Only an answer is cached (per device): when the
+    driver cannot answer, the call returns 0 (the plan keeps the shipped wide kernels) and probes
+    again on the next call.  No probe runs inside a CUDA-Graph capture (0 there too): a shape
+    captured before its first eager call keeps the shipped wide kernels in that graph.
+    """
+    capacity = _WIDE_PAIR_CAPACITY.get(device_index)
+    if capacity is not None:
+        return capacity
+    if torch.cuda.is_current_stream_capturing():
+        return 0
+    try:
+        from cuda.bindings import driver
+
+        def check(result):
+            err, *values = result if isinstance(result, tuple) else (result,)
+            if err != driver.CUresult.CUDA_SUCCESS:
+                raise RuntimeError(f"CUDA driver error {err}")
+            return values[0] if values else None
+
+        with torch.cuda.device(device_index):
+            torch.empty(
+                0, device=f"cuda:{device_index}"
+            )  # the primary context is current
+            module = check(driver.cuModuleLoadData(_PAIR_PROBE_PTX))
+            try:
+                function = check(
+                    driver.cuModuleGetFunction(module, b"cake_kimi_k3_mla_pair_probe")
+                )
+                check(
+                    driver.cuFuncSetAttribute(
+                        function,
+                        driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                        WIDE_CTA_SMEM_BYTES,
+                    )
+                )
+                config = driver.CUlaunchConfig()
+                config.gridDimX, config.gridDimY, config.gridDimZ = WIDE_CLUSTER, 1, 1
+                config.blockDimX, config.blockDimY, config.blockDimZ = (
+                    WIDE_CTA_THREADS,
+                    1,
+                    1,
+                )
+                config.sharedMemBytes = WIDE_CTA_SMEM_BYTES
+                cluster = driver.CUlaunchAttribute()
+                cluster.id = (
+                    driver.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
+                )
+                cluster.value.clusterDim.x = WIDE_CLUSTER
+                cluster.value.clusterDim.y = 1
+                cluster.value.clusterDim.z = 1
+                config.attrs = [cluster]
+                config.numAttrs = 1
+                capacity = int(
+                    check(driver.cuOccupancyMaxActiveClusters(function, config))
+                )
+            finally:
+                driver.cuModuleUnload(module)
+    except Exception:  # noqa: BLE001
+        return 0
+    _WIDE_PAIR_CAPACITY[device_index] = capacity
+    return capacity
 
 
 _DENSE_Q_INDPTR: dict[tuple[int, int, int], torch.Tensor] = {}
@@ -555,7 +711,7 @@ class KimiK3MlaFp8PagedAttention:
             )
         if max_seq_len is None:
             max_seq_len = int(block_tables.shape[-1]) * PAGE_SIZE
-        self.arch, sm_count = _device_facts(_device_index(device))
+        self.arch, capability, sm_count = _device_facts(_device_index(device))
         self.batch = int(batch)
         self.num_heads = int(num_heads)
         self.max_q_len = int(max_q_len)
@@ -583,14 +739,35 @@ class KimiK3MlaFp8PagedAttention:
         self.partial_O, self.partial_max, self.partial_sum = _carve_workspace(
             workspace_buffer, plan.rows_max, plan.num_split
         )
-        main = get_cake_kimi_k3_mla_kernel(plan.main_kind, arch=self.arch)
-        reduce = get_cake_kimi_k3_mla_kernel(plan.reduce_kind, arch=self.arch)
+        grid_main = plan.grid_main
+        main_kind, reduce_kind = plan.main_kind, plan.reduce_kind
+        self.tile_flags = None
+        pairs = 0
+        if use_persistent_route(plan, capability, sm_count, int(max_seq_len)):
+            pairs = min(
+                wide_work_clusters(plan), _wide_pair_capacity(_device_index(device))
+            )
+        if pairs > 0:
+            # The persistent wide kernel walks the plan's work clusters on at most the co-resident
+            # SM pairs; its reducer waits per tile on the flag words of this launcher: [launch epoch,
+            # CTA ticket, publishes of each tail item], zeroed once here and kept consistent by the
+            # kernels from launch to launch (CUDA-Graph replays included).
+            main_kind = "main_wide_persistent"
+            reduce_kind = f"{plan.reduce_kind}_tile_flags"
+            grid_main = (WIDE_CLUSTER * pairs, 1, 1)
+            tail_items = plan.m_tiles * self.batch - plan.n_full_items
+            self.tile_flags = torch.zeros(
+                2 + tail_items, dtype=torch.int32, device=device
+            ).view(torch.uint32)
+        main = get_cake_kimi_k3_mla_kernel(main_kind, arch=self.arch)
+        reduce = get_cake_kimi_k3_mla_kernel(reduce_kind, arch=self.arch)
         self.route_metadata = dict(
             backend="cake",
             arch=self.arch,
             route="wide" if plan.wide else "swapped",
             rt=plan.rt,
-            reducer=plan.reduce_kind,
+            reducer=reduce_kind,
+            persistent=self.tile_flags is not None,
             main_module=main["name"],
             reduce_module=reduce["name"],
         )
@@ -618,32 +795,35 @@ class KimiK3MlaFp8PagedAttention:
             main_values.update(
                 O=self.o_rows, m_tiles=plan.m_tiles, n_full_items=plan.n_full_items
             )
+        if self.tile_flags is not None:
+            main_values.update(
+                n_work_clusters=wide_work_clusters(plan), tile_flags=self.tile_flags
+            )
         self._main_fn = _kernel_entry(main["name"], self.arch, main["ffi_entry"])
-        self._main_args = _bind_args(main, main_values, plan.grid_main)
+        self._main_args = _bind_args(main, main_values, grid_main)
         self._reduce_fn = None
         self._reduce_args = None
         if plan.num_split > 1:
             self._reduce_fn = _kernel_entry(
                 reduce["name"], self.arch, reduce["ffi_entry"]
             )
-            self._reduce_args = _bind_args(
-                reduce,
-                dict(
-                    partial_O=self.partial_O,
-                    partial_max=self.partial_max,
-                    partial_sum=self.partial_sum,
-                    O=self.o_rows,
-                    cum_seq_lens_q=self.cum_seq_lens_q,
-                    batch=self.batch,
-                    num_heads=self.num_heads,
-                    num_split=plan.num_split,
-                    bmm2_scale=self.bmm2_scale,
-                    m_tiles=plan.m_tiles,
-                    n_full_items=plan.n_full_items,
-                    tile_rows=plan.tile_rows,
-                ),
-                plan.grid_reduce,
+            reduce_values = dict(
+                partial_O=self.partial_O,
+                partial_max=self.partial_max,
+                partial_sum=self.partial_sum,
+                O=self.o_rows,
+                cum_seq_lens_q=self.cum_seq_lens_q,
+                batch=self.batch,
+                num_heads=self.num_heads,
+                num_split=plan.num_split,
+                bmm2_scale=self.bmm2_scale,
+                m_tiles=plan.m_tiles,
+                n_full_items=plan.n_full_items,
+                tile_rows=plan.tile_rows,
             )
+            if self.tile_flags is not None:
+                reduce_values.update(tile_flags=self.tile_flags)
+            self._reduce_args = _bind_args(reduce, reduce_values, plan.grid_reduce)
 
     def launch(self) -> None:
         """Enqueue the attention (and the split merge) on the current stream; no allocation."""
@@ -697,6 +877,8 @@ __all__ = [
     "reduce_warps_per_row",
     "run_cake_kimi_k3_mla_fp8_paged_attention",
     "swapped_rt",
+    "use_persistent_route",
     "use_wide_route",
+    "wide_work_clusters",
     "workspace_bytes",
 ]
