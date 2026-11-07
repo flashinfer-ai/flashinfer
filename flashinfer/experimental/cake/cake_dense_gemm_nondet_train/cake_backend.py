@@ -1701,12 +1701,11 @@ ROUTER_RULES: dict[
     # Hidden 4096 on sm_103a: "H1x4p44" (44 head units, then four tail units per CTA pair) from 20480 to 49152 tokens
     # (measured at 20480, 24576, 32768 and 49152 tokens, each on four or five parts); up to 7 % slower than the
     # deterministic plan next to a resident kernel at 8192 to 16384 tokens, and at 65536 the checkpointed step (two
-    # forwards and the backward pass) was up to 1.4 % slower.  Hidden 6144 on sm_103a keeps the deterministic plan
-    # above its SIMT window: "H1x5p44" (44 head units, then five tail units per CTA pair; measured against six splits
-    # at 16172, 16231, 16384 and 20480 tokens on four parts, up to 7.8 % slower next to a resident kernel at 8192 to
-    # 12288 tokens, the backward pass no faster at 24576 and up to 2.3 % slower at 32768) held only at 20480 tokens
-    # when measured again (below).  Hidden 6144 on sm_100a keeps the deterministic plan above its SIMT window: no
-    # partition was faster in every run in CUDA graphs.
+    # forwards and the backward pass) was up to 1.4 % slower.  Hidden 6144 on sm_103a: "H1x5p44" from 16385 to 20480
+    # tokens (first from 16172, measured at 16172, 16231, 16384 and 20480 tokens, each on four parts; 16172 to 16384
+    # below); up to 7.8 % slower next to a resident kernel at 8192 to 12288 tokens, the backward pass (input and weight
+    # gradient) no faster at 24576 and up to 2.3 % slower at 32768.  Hidden 6144 on sm_100a keeps the deterministic
+    # plan above its SIMT window: no partition was faster in every run in CUDA graphs.
     # sm_107a: hidden 5120 "H0.5x4" (four tail units, 108 head and 432 tail units on 216 SMs; measured on two parts at
     # 16172, 16231 and 16384 tokens); hidden 4096 and 6144 keep the deterministic plan: at 4096 "H0.5x4" was up to
     # 7 % slower than that plan when a kernel holding 16 SMs on another stream started during it (the kernel takes SMs
@@ -1733,19 +1732,25 @@ ROUTER_RULES: dict[
     #   launches it missed against that program's binding only); kept at 16400, 18432, 20480, 24576 and 28672 (against
     #   six), missed at 16385 (one eager checkpointed-step run on one part) and at 32768 (the checkpointed step in CUDA
     #   graphs on one part): the windows are 10240 to 16384 and 16400 to 28672 tokens.
-    # - sm_103a hidden 5120 "H0.5x3": missed at 16172 and 16231 tokens (alone, one eager run each, against nine
-    #   splits), kept at 16232 and 16384 (against nine) and at 16385, 24576 and 32768 (against six): the window is
-    #   16232 to 32768 tokens.
-    # - sm_103a hidden 6144 "H1x5p44": missed at 16172, 16231 and 16384 tokens (against three splits) and at 16385
-    #   (against six), kept at 20480 only: no window.
+    # - sm_103a hidden 5120 "H0.5x3": main's window (16172 to 32768 tokens) measured again with these tables on two
+    #   parts: faster than the deterministic plan at 16172 and 16231 tokens (nine splits) on both parts, alone, in the
+    #   backward pass and in the checkpointed step, eager and in CUDA graphs (through the entry against the plan
+    #   through it on one part: 3.9 to 5.1 % faster alone in eager launches, 9.6 to 9.9 % in CUDA graphs), kept at
+    #   16232 (nine splits), 16385, 20480, 24576, 28672 and 32768 (six), and at 16384 (nine) faster except alone in
+    #   eager launches against the deterministic program's binding: the window stays 16172 to 32768 tokens.
+    # - sm_103a hidden 6144 "H1x5p44": main's window (16172 to 20480 tokens) measured again: at 16172, 16231 and 16384
+    #   tokens (three splits) the window through this package's entry was 2.9 to 3.7 % slower alone in eager launches
+    #   than the deterministic plan through it, in every run on one part (no slower in the backward pass and the
+    #   checkpointed step, 1.4 to 2.0 % faster alone in CUDA graphs); at 16385 and 20480 tokens (six splits) it was
+    #   no slower than that plan: the window is 16385 to 20480 tokens.
     ("sm_100a", "nn_t", 4096, 256): ((1, 224, "simt_n128m64s2"),),
     ("sm_100a", "nn_t", 5120, 256): (
         (1, 256, "simt_n64m64s2"), (1, 128, "waves"), (10240, 16384, "H0.5x3"), (16400, 28672, "H0.5x3"),
     ),
     ("sm_100a", "nn_t", 6144, 256): ((1, 256, "simt_n64m64s2"),),
     ("sm_103a", "nn_t", 4096, 256): ((1, 288, "simt_n64m64s2"), (20480, 49152, "H1x4p44")),
-    ("sm_103a", "nn_t", 5120, 256): ((1, 192, "simt_n64m64s2"), (1, 192, "waves"), (16232, 32768, "H0.5x3")),
-    ("sm_103a", "nn_t", 6144, 256): ((1, 256, "simt_n64m64s2"),),
+    ("sm_103a", "nn_t", 5120, 256): ((1, 192, "simt_n64m64s2"), (1, 192, "waves"), (16172, 32768, "H0.5x3")),
+    ("sm_103a", "nn_t", 6144, 256): ((1, 256, "simt_n64m64s2"), (16385, 20480, "H1x5p44")),
     ("sm_107a", "nn_t", 4096, 256): None,
     ("sm_107a", "nn_t", 5120, 256): ((16172, 16384, "H0.5x4"),),
     ("sm_107a", "nn_t", 6144, 256): None,
