@@ -2228,6 +2228,17 @@ _ROUTES: tuple[_Route, ...] = (
     _bcta("seed_masked_bn__n7168_k2048_wave_bn96", (7168, 2048), (2, 2), (2, 2),
           ("cake_batch_deepgemm_fp8_40c9c1d3f7d59ad4b451", "masked_bn", 96, 128),
           m=(None, 128), arches=("sm_107a",)),
+    # The N=4096 K=7168 BLOCK_N 112 band keys with B >= 2 whose BLOCK_N 96 grid fits one wave move to the same
+    # program (B = 1 keys keep BLOCK_N 112).
+    _bcta("seed_masked_bn__n4096_k7168_wave_bn96", (4096, 7168), (2, 2), (2, 2),
+          ("cake_batch_deepgemm_fp8_40c9c1d3f7d59ad4b451", "masked_bn", 96, 128),
+          m=(None, None), arches=("sm_107a",)),
+    _bcta("seed_masked_bn__n4096_k7168_wave_bn96", (4096, 7168), (3, 3), (3, 3),
+          ("cake_batch_deepgemm_fp8_40c9c1d3f7d59ad4b451", "masked_bn", 96, 128),
+          m=(None, 128), arches=("sm_107a",)),
+    _bcta("seed_masked_bn__n4096_k7168_wave_bn96", (4096, 7168), (5, 5), (5, 5),
+          ("cake_batch_deepgemm_fp8_40c9c1d3f7d59ad4b451", "masked_bn", 96, 128),
+          m=(None, 128), arches=("sm_107a",)),
     # N=4096, K=7168.
     _band("seed_masked_bn__n4096_k7168_bn32", (4096, 7168),
           ("cake_batch_deepgemm_fp8_6bd449b1e45e0273fa0b", "masked_bn", 32, 256),
