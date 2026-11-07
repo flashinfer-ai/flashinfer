@@ -16,10 +16,12 @@
 
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass, replace
 import inspect
 import functools
 import math
+import textwrap
 from types import SimpleNamespace
 from typing import Sequence
 
@@ -74,6 +76,10 @@ from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.ke
 )
 from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.parallel_reduction import (
     GMEM_REDUCTION_RUNTIME_SPLIT_WINDOWS,
+    run_parallel_gmem_reduction_kernel,
+)
+from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.reduction import (
+    run_gmem_reduction_kernel,
 )
 from flashinfer.mla import (
     get_prims_ts_batch_mla_decode_workspace_size,
@@ -1468,6 +1474,50 @@ def test_attention_ts_sparse_mla_plan_enable_pdl_reaches_the_compiled_kernel(
     assert without_pdl.kernel.enable_pdl is False
     assert with_pdl.kernel.enable_pdl is True
     assert without_pdl != with_pdl
+
+
+def _is_mla_pdl_guard(node: ast.AST) -> bool:
+    """Match ``if cutlass.const_expr(<the kernel's enable_pdl>):``."""
+    return (
+        isinstance(node, ast.If)
+        and isinstance(node.test, ast.Call)
+        and ast.unparse(node.test.func) == "cutlass.const_expr"
+        and [ast.unparse(arg) for arg in node.test.args]
+        in (["self.enable_pdl"], ["use_pdl"])
+    )
+
+
+@pytest.mark.parametrize(
+    "grid_body",
+    (
+        MlaDecodeTs.split_kv_kernel,
+        MlaDecodeTs.reduction_kernel,
+        MlaDecodeTs.parallel_reduction_kernel,
+        ThroughputLatencyMlaDecodeTs.dense_kernel,
+        run_gmem_reduction_kernel,
+        run_parallel_gmem_reduction_kernel,
+    ),
+    ids=lambda grid_body: grid_body.__qualname__,
+)
+def test_attention_ts_mla_pdl_grids_wait_and_release_under_enable_pdl(grid_body):
+    """Every MLA producer and reducer grid launched under ``enable_pdl`` waits
+    for the preceding grid and releases the following one, both only under
+    that flag."""
+    tree = ast.parse(textwrap.dedent(inspect.getsource(grid_body)))
+    actions = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and ast.unparse(node.value) == "prims.GridDepAction"
+    ]
+    guarded = {
+        id(node)
+        for guard in ast.walk(tree)
+        if _is_mla_pdl_guard(guard)
+        for node in ast.walk(guard)
+    }
+    assert {action.attr for action in actions} == {"WAIT", "LAUNCH_DEPENDENTS"}
+    assert all(id(action) in guarded for action in actions)
 
 
 def test_attention_ts_mla_decode_wrapper_trace_names_softmax_rescale_threshold_log2():
