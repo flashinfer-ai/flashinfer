@@ -358,8 +358,13 @@ compare named mutated arguments, allowing eager/graph replay comparisons.
 Nested returned tensors use the same keys for dumping and comparison. An
 incomplete output dump (including one rejected by the size limit) reports
 ``comparison_match=None`` and ``comparison_error="Output dump is incomplete"``;
-it cannot establish a match. A completed call with no tensor outputs can still
-compare successfully without an output tensor file.
+it cannot establish a match. A completed call with no tensor outputs and no
+declared mutated arguments can still compare successfully without an output
+tensor file. If an in-place API returns ``None`` and graph snapshots were not
+enabled before capture, there is no post-call state to compare; replay reports
+``comparison_match=None`` with a distinct "No post-call state recorded" error.
+Enable ``FLASHINFER_DUMP_GRAPH_SNAPSHOTS=1`` to record and compare the mutated
+arguments.
 
 Snapshots support strided, same-dtype storage aliases. Replay restores shared
 storage, repeated tensor references, shapes, strides and relative offsets.
