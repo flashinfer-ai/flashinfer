@@ -260,6 +260,33 @@ def _nvfp4_operands(m, n, k):
     return a, b, a_fp4, a_s, b_fp4, b_s, 1.0 / (g_in * g_w)
 
 
+def _nvfp4_operands_wide_range(m, n, k, seed):
+    # Log-normal magnitudes, seeded so a run is repeatable. With plain randn operands
+    # every SM120 tactic, stream-K included, returned the same bits at this test's
+    # shapes on an RTX 5090 and an RTX 5060 Ti, so a test built on them could not tell
+    # a data-parallel tactic from a stream-K one; with the magnitudes spread over
+    # several binades (sigma 2.5; narrower and wider spreads were measured to be
+    # worse) the stream-K tactics return different bits on most seeds.
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    a = torch.randn([m, k], device="cuda", dtype=torch.float32, generator=gen)
+    b = torch.randn([n, k], device="cuda", dtype=torch.float32, generator=gen)
+    a = (a * torch.exp(2.5 * torch.randn(a.shape, device="cuda", generator=gen))).to(
+        torch.bfloat16
+    )
+    b = (b * torch.exp(2.5 * torch.randn(b.shape, device="cuda", generator=gen))).to(
+        torch.bfloat16
+    )
+    g_in = (448 * 6) / a.float().abs().nan_to_num().max()
+    g_w = (448 * 6) / b.float().abs().nan_to_num().max()
+    a_fp4, a_s = nvfp4_quantize(
+        a, g_in, sfLayout=SfLayout.layout_128x4, do_shuffle=False
+    )
+    b_fp4, b_s = nvfp4_quantize(
+        b, g_w, sfLayout=SfLayout.layout_128x4, do_shuffle=False
+    )
+    return a_fp4, a_s, b_fp4, b_s, 1.0 / (g_in * g_w)
+
+
 def test_mm_fp4_b12x_short_k_multi_wave():
     # One K tile and more work tiles than SMs stress the epilogue smem
     # handoff between a persistent CTA's work tiles, a regime the
@@ -735,3 +762,75 @@ def test_mm_fp4_l2_policy_rule():
     # other kernels are untouched
     assert mm_fp4_l2_policy(8, (128, 8), True, "sm100sk") is None
     assert mm_fp4_l2_policy(8, (128, 8), True, "sm103") is None
+
+
+@pytest.mark.parametrize("m", [1, 16, 128])
+def test_mm_fp4_cutlass_sm120_disable_stream_k(m, monkeypatch):
+    # With FLASHINFER_FP4_GEMM_DISABLE_STREAM_K=1 the SM120 CUTLASS runner offers the
+    # autotuner only data-parallel tactics. On wide-dynamic-range operands they all
+    # return the same bits while the stream-K tactics do not, so the test checks both
+    # halves: the offered set agrees, and the excluded set would not have. The second
+    # half is checked from m = 16 up: at m = 1 the stream-K tactics differed on only
+    # 2 of 24 seeds on an RTX 5090 and 1 of 24 on a 36-SM RTX 5060 Ti (see the PR
+    # thread), so a control there would be the flaky half.
+    from flashinfer.gemm import gemm_base
+
+    if not is_sm12x_supported(torch.device("cuda")):
+        pytest.skip("The SM120 CUTLASS FP4 GEMM needs SM12x.")
+    n, k = 4096, 4096
+    workspace = torch.empty(
+        gemm_base.DEFAULT_WORKSPACE_SIZE, device="cuda", dtype=torch.uint8
+    )
+    runner = gemm_base.get_gemm_sm120_module_cutlass_fp4().cutlass_fp4_gemm_runner()
+
+    def run(operands, tactic):
+        a_fp4, a_s, b_fp4, b_s, alpha = operands
+        alpha = torch.tensor([alpha], device="cuda", dtype=torch.float32)
+        out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+        inputs = [a_fp4, b_fp4.T, a_s, b_s.T, alpha, None, out, None, None, workspace]
+        runner(inputs=inputs, tactic=tactic)
+        torch.cuda.synchronize()
+        return out
+
+    monkeypatch.delenv("FLASHINFER_FP4_GEMM_DISABLE_STREAM_K", raising=False)
+    all_tactics = runner.get_valid_tactics([], None)
+    monkeypatch.setenv("FLASHINFER_FP4_GEMM_DISABLE_STREAM_K", "1")
+    tactics = runner.get_valid_tactics([], None)
+    assert len(tactics) > 1 and set(tactics) < set(all_tactics)
+    assert all(t % 4 < 2 for t in tactics)
+    # a stream-K tactic loaded from a saved autotune cache is rejected too
+    excluded = sorted(set(all_tactics) - set(tactics))
+    assert not any(runner.validate_tactic([], t) for t in excluded)
+    assert all(runner.validate_tactic([], t) for t in tactics + [-1])
+
+    # Several seeds: whether a stream-K tactic rounds differently depends on the
+    # operands (at m = 16, 2 of 24 seeds showed no difference on an RTX 5090 and 7 of
+    # 24 on a 36-SM RTX 5060 Ti; at m = 128, 1 of 24 on both), so the equality half is
+    # checked on every seed tried, and the negative control keeps drawing seeds until
+    # one shows a stream-K difference: four seeds always, then up to eight more only
+    # while none has differed, so a part where the first four happen to agree does
+    # not fail a healthy test.
+    stream_k_differs = False
+    first_seed, min_seeds, max_seeds = 20261029, 4, 12
+    for i in range(max_seeds):
+        if i >= min_seeds and (m < 16 or stream_k_differs):
+            break
+        seed = first_seed + i
+        operands = _nvfp4_operands_wide_range(m, n, k, seed)
+        ref = run(operands, tactics[0])
+        for t in tactics[1:]:
+            assert torch.equal(run(operands, t), ref), (
+                f"tactic {t} differs from tactic {tactics[0]} (seed {seed})"
+            )
+        if m >= 16:
+            stream_k_differs |= any(
+                not torch.equal(run(operands, t), ref) for t in excluded
+            )
+    # Negative control: the same equality over the excluded stream-K tactics must fail
+    # on some seed, or the operands could not have told a stream-K tactic apart from a
+    # data-parallel one and the assertion above would be empty.
+    if m >= 16:
+        assert stream_k_differs, (
+            f"every stream-K tactic matched the data-parallel output on all {max_seeds} "
+            "seeds; the operands do not expose the summation order, so this test cannot fail"
+        )
