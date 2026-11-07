@@ -10,7 +10,8 @@
 bucket's tactic; below 1024 uses 1024, and above 65536 uses 65536.
 ``autotune(tuning_buckets=..., round_up=True)`` replaces the bucket list;
 lookup uses the same ceil rule only while that override is still active.
-Dtype and epilogue select the cache entry; they are not tactics.
+Dtype, epilogue and ``enable_pdl`` select the cache entry; they are not
+tactics.
 """
 
 from __future__ import annotations
@@ -157,6 +158,8 @@ class GemmIdentity:
     head_dim: Optional[int]
     is_neox: Optional[bool]
     has_qkv_scale: bool
+    # PDL changes what every tactic costs, so it keys its own tuned record.
+    enable_pdl: bool
 
 
 class PrimsTsGemmRunner(TunableRunner):
@@ -190,6 +193,7 @@ class PrimsTsGemmRunner(TunableRunner):
             # Tactic tuples gained use_tma_store. Keep this so a winner saved
             # before that field is not replayed.
             "tma_store",
+            ("enable_pdl", identity.enable_pdl),
         )
 
     def precompile_tactics(self, inputs, tactics, profile, **kwargs) -> bool:
@@ -238,6 +242,7 @@ class PrimsTsGemmRunner(TunableRunner):
                 head_dim=identity.head_dim,
                 is_neox=identity.is_neox,
                 has_qkv_scale=identity.has_qkv_scale,
+                enable_pdl=identity.enable_pdl,
             )
         else:
             config = config_from_tactic(
@@ -249,6 +254,7 @@ class PrimsTsGemmRunner(TunableRunner):
                 head_dim=identity.head_dim,
                 is_neox=identity.is_neox,
                 has_qkv_scale=identity.has_qkv_scale,
+                enable_pdl=identity.enable_pdl,
                 tactic=tactic,
             )
         packed = identity.operand_format == "nvfp4_e2m1"
@@ -287,6 +293,7 @@ def launch_dense_gemm(
     head_dim: Optional[int],
     is_neox: Optional[bool],
     has_qkv_scale: bool,
+    enable_pdl: bool,
     a: torch.Tensor,
     weight: torch.Tensor,
     output: torch.Tensor,
@@ -307,14 +314,15 @@ def launch_dense_gemm(
 ) -> None:
     """Pick a cached tactic, or the historical default, then launch."""
     identity = GemmIdentity(
-        arch,
-        operand_format,
-        output_format,
-        epilogue,
-        has_bias,
-        head_dim,
-        is_neox,
-        has_qkv_scale,
+        arch=arch,
+        operand_format=operand_format,
+        output_format=output_format,
+        epilogue=epilogue,
+        has_bias=has_bias,
+        head_dim=head_dim,
+        is_neox=is_neox,
+        has_qkv_scale=has_qkv_scale,
+        enable_pdl=enable_pdl,
     )
     runner = PrimsTsGemmRunner(op_name, identity)
     inputs = [

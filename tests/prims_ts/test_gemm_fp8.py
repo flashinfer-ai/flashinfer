@@ -26,11 +26,12 @@ def _fp8_problem(m=128, n=512, k=128):
     return a, w, a_scale, w_scale
 
 
-def test_fp8_linear_per_token_per_channel_and_bias():
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_fp8_linear_per_token_per_channel_and_bias(enable_pdl):
     _require_gemm_gpu()
     a, w, a_scale, w_scale = _fp8_problem()
     bias = torch.randn((w.shape[0],), device="cuda", dtype=torch.bfloat16)
-    actual = fp8_linear(a, w, a_scale, w_scale, bias)
+    actual = fp8_linear(a, w, a_scale, w_scale, bias, enable_pdl=enable_pdl)
     expected = (
         F.linear(a.float(), w.float()) * a_scale[:, None] * w_scale[None, :]
         + bias.float()
@@ -67,10 +68,11 @@ def test_fp8_linear_qkv_scale_matches_three_scaled_output_groups():
     )
 
 
-def test_fp8_swiglu_interleaved_gate_activation():
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_fp8_swiglu_interleaved_gate_activation(enable_pdl):
     _require_gemm_gpu()
     a, w, a_scale, w_scale = _fp8_problem()
-    actual = fp8_linear_swiglu(a, w, a_scale, w_scale)
+    actual = fp8_linear_swiglu(a, w, a_scale, w_scale, enable_pdl=enable_pdl)
     linear = F.linear(a.float(), w.float()) * a_scale[:, None] * w_scale[None, :]
     expected = linear[:, 0::2] * F.silu(linear[:, 1::2])
     torch.testing.assert_close(actual.float(), expected, atol=0.3, rtol=3e-2)
@@ -100,7 +102,8 @@ def test_fp8_output_scale_ownership_and_preallocated_payload():
     assert actual is supplied_payload
 
 
-def test_fp8_qkv_qknorm_rope_matches_torch_oracle():
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_fp8_qkv_qknorm_rope_matches_torch_oracle(enable_pdl):
     _require_gemm_gpu()
     m, n, k, head_dim = 128, 1536, 128, 128
     a, w, a_scale, w_scale = _fp8_problem(m, n, k)
@@ -121,6 +124,7 @@ def test_fp8_qkv_qknorm_rope_matches_torch_oracle():
         num_q_heads=4,
         num_kv_heads=4,
         head_dim=head_dim,
+        enable_pdl=enable_pdl,
     )
     base = (
         (F.linear(a.float(), w.float()) * a_scale[:, None] * w_scale[None, :])
