@@ -685,6 +685,34 @@ _GATE_STREAM_FULL_BASES = frozenset(
 # ``select_cake_gdn_prefill_variant``); every stored value equals the twin's without it.
 _GATE_STREAM_PF_ARCHES = frozenset({"sm_107a"})
 
+# The sm_107a vec2-full twins of the three shared full-DV bodies that store a final state without
+# state indices: BF16 I/O with BF16 state and an initial state (without the gate-stream twin), and
+# BF16 or FP16 I/O with FP32 state and no initial state.  Each twin is a record of its own beside the
+# shared record of the same key (schedule ``..._sm107a_vec2full_i64meta``) and moves the final (and
+# initial) state as sector-complete 16x256b rows; every other operation, and every stored value, is
+# the shared body's.  It is faster where every sequence of the batch is short, and lost up to 0.8% on
+# an R200 (216 SMs) on ragged batches where one sequence of 8192 tokens (128 chunks) bounds the
+# launch (BF16 state Hq8/Hv32 0.997x, FP32 state Hq16/Hv32 0.992-0.996x).  Batches bounded by 4096
+# tokens still ran 1.011-1.020x with BF16 state, but as low as 0.999x on a ragged FP32-state batch
+# without an initial state (Hq16/Hv32), while every measured batch bounded by 2048 tokens ran 1.011x
+# or faster.  So the resolver takes the twin only when the longest sequence spans at most
+# ``_VEC2FULL_MAX_TILE_CHUNKS`` 64-token chunks (2048 tokens).  ``max_seq_len`` is an upper bound: a
+# loose bound only raises it, so the batch keeps the shared record.
+_VEC2FULL_MAX_TILE_CHUNKS = 32
+_VEC2FULL_SHARED_SCHEDULES = frozenset(
+    {
+        "flashinfer_blackwell_gdn_prefill_initial_bf16state_sm107a_i64meta",
+        "flashinfer_blackwell_gdn_prefill_sm107a_i64meta",
+        "flashinfer_blackwell_gdn_prefill_f16io_sm107a_i64meta",
+    }
+)
+
+
+def _vec2full_twin_schedule(shared_schedule: str) -> str:
+    """The schedule of the vec2-full twin of a ``_VEC2FULL_SHARED_SCHEDULES`` schedule."""
+
+    return shared_schedule.replace("_sm107a_i64meta", "_sm107a_vec2full_i64meta")
+
 
 def _cake_gdn_prefill_gate_stream_full(
     *, num_seqs: int, total_seq_len: int, total_tiles: int, grid_x: int
@@ -1104,6 +1132,14 @@ def select_cake_gdn_prefill_variant(
     twin itself, as the prefetch twin issues no prefetch when each CTA owns
     one tile.  The launch evaluates the same grid rule with the same count,
     so the two agree.
+
+    On sm_107a a batch that resolves the shared full-DV record of the BF16-state
+    contract without gate streaming or of the FP32-state contracts without an
+    initial state runs that key's vec2-full twin record when ``max_seq_len``
+    spans at most ``_VEC2FULL_MAX_TILE_CHUNKS`` chunks (2048 tokens), else the
+    shared record; outputs and final states are bitwise equal either way.  A
+    loose bound keeps the shared record, and the ragged DV-split route keeps
+    precedence.
     """
 
     if arch not in _ARCH_ACTIVE_CLUSTERS:
@@ -1438,6 +1474,31 @@ def select_cake_gdn_prefill_variant(
             ragged = _ragged_dvsplit_routes().get(record["name"])
             if ragged is not None:
                 return ragged
+    # The vec2-full twin of a shared full-DV record (``_VEC2FULL_SHARED_SCHEDULES``): when the
+    # longest sequence spans at most ``_VEC2FULL_MAX_TILE_CHUNKS`` chunks and the key ships the
+    # twin record, the batch runs the twin; the ragged DV-split route above keeps precedence and
+    # every other record (gate-stream twins, indexed state, checkpoints) stays as resolved.
+    if (
+        arch == "sm_107a"
+        and not dvsplit
+        and not use_state_indices
+        and _prefill_tile_chunks(max_seq_len) <= _VEC2FULL_MAX_TILE_CHUNKS
+    ):
+        shared_schedule = record.get("source_schedule", "").rsplit(":", 1)[-1]
+        if shared_schedule in _VEC2FULL_SHARED_SCHEDULES:
+            twin_schedule = _vec2full_twin_schedule(shared_schedule)
+            if _has_variant(
+                arch=arch,
+                domain="prefill",
+                schedule_attr=twin_schedule,
+                specializations=specializations,
+            ):
+                record = _variant_for(
+                    arch=arch,
+                    domain="prefill",
+                    schedule_attr=twin_schedule,
+                    specializations=specializations,
+                )
     if single_chunk:
         route = "flashinfer.gdn_prefill.noncp.single_chunk"
     elif enable_checkpoints:

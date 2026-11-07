@@ -501,11 +501,11 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan0",
         "arches": ["sm_107a"],
     },
-    "cake_batch_deepgemm_fp8_6bd449b1e45e0273fa0b": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_6bd449b1e45e0273fa0b",
+    "cake_batch_deepgemm_fp8_6371829fa379dd67c761": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_6371829fa379dd67c761",
         "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_6bd449b1e45e0273fa0b_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_6bd449b1e45e0273fa0b_binding.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_6371829fa379dd67c761_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_6371829fa379dd67c761_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -969,6 +969,18 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan0",
         "arches": ["sm_107a"],
     },
+    "cake_batch_deepgemm_fp8_fc4b600bd3dfbc29a89b": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_fc4b600bd3dfbc29a89b",
+        "sources": [
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_fc4b600bd3dfbc29a89b_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_fc4b600bd3dfbc29a89b_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan0",
+        "arches": ["sm_107a"],
+    },
     "cake_batch_deepgemm_fp8_fe5a14cba1d988faaf43": {
         "kernel": "kernel_cake_batch_deepgemm_fp8_fe5a14cba1d988faaf43",
         "sources": [
@@ -1168,9 +1180,9 @@ MODULES: dict[str, dict[str, str]] = {
         "arch": "sm_107a",
         "program": "cake_batch_deepgemm_fp8_616cb5c8ca050b74c79f",
     },
-    "cake_batch_deepgemm_fp8_6bd449b1e45e0273fa0b_sm_107a": {
+    "cake_batch_deepgemm_fp8_6371829fa379dd67c761_sm_107a": {
         "arch": "sm_107a",
-        "program": "cake_batch_deepgemm_fp8_6bd449b1e45e0273fa0b",
+        "program": "cake_batch_deepgemm_fp8_6371829fa379dd67c761",
     },
     "cake_batch_deepgemm_fp8_741ad4b48907eb89c3f4_sm_100a": {
         "arch": "sm_100a",
@@ -1411,6 +1423,10 @@ MODULES: dict[str, dict[str, str]] = {
     "cake_batch_deepgemm_fp8_fa7c913fa26439d68c52_sm_107a": {
         "arch": "sm_107a",
         "program": "cake_batch_deepgemm_fp8_fa7c913fa26439d68c52",
+    },
+    "cake_batch_deepgemm_fp8_fc4b600bd3dfbc29a89b_sm_107a": {
+        "arch": "sm_107a",
+        "program": "cake_batch_deepgemm_fp8_fc4b600bd3dfbc29a89b",
     },
     "cake_batch_deepgemm_fp8_fe5a14cba1d988faaf43_sm_100a": {
         "arch": "sm_100a",
@@ -2239,9 +2255,44 @@ _ROUTES: tuple[_Route, ...] = (
     _bcta("seed_masked_bn__n4096_k7168_wave_bn96", (4096, 7168), (5, 5), (5, 5),
           ("cake_batch_deepgemm_fp8_40c9c1d3f7d59ad4b451", "masked_bn", 96, 128),
           m=(None, 128), arches=("sm_107a",)),
-    # N=4096, K=7168.
+    # One wave at the worst case on the BLOCK_N 192 bands (sm_107a, 216 SMs): a key the N=4096 K=7168 or N=7168
+    # K=2048 BLOCK_N 192 band takes whose tiles, B * min(ceil(M / 128), ceil(expected_m / 128) + 1) * ceil(N / 192),
+    # fit 216 moves to the early-setup form of that build (masked_m read once and prefetched, split setup, early
+    # tensor-memory free; the same 256-byte L2 promotion): its CTAs pay the serial setup once, on the critical path.
+    _bcta("seed_masked_bn__n4096_k7168_wave_bn192", (4096, 7168), (1, 1), (8, 8),
+          ("cake_batch_deepgemm_fp8_6371829fa379dd67c761", "masked_bn", 192, 128),
+          m=(None, None), arches=("sm_107a",)),
+    _bcta("seed_masked_bn__n4096_k7168_wave_bn192", (4096, 7168), (1, 1), (9, 9),
+          ("cake_batch_deepgemm_fp8_6371829fa379dd67c761", "masked_bn", 192, 128),
+          m=(None, 1152), arches=("sm_107a",)),
+    _bcta("seed_masked_bn__n4096_k7168_wave_bn192", (4096, 7168), (2, 2), (8, 8),
+          ("cake_batch_deepgemm_fp8_6371829fa379dd67c761", "masked_bn", 192, 128),
+          m=(None, 512), arches=("sm_107a",)),
+    _bcta("seed_masked_bn__n4096_k7168_wave_bn192", (4096, 7168), (3, 3), (9, 9),
+          ("cake_batch_deepgemm_fp8_6371829fa379dd67c761", "masked_bn", 192, 128),
+          m=(None, 384), arches=("sm_107a",)),
+    _bcta("seed_masked_bn__n4096_k7168_wave_bn192", (4096, 7168), (4, 4), (8, 8),
+          ("cake_batch_deepgemm_fp8_6371829fa379dd67c761", "masked_bn", 192, 128),
+          m=(None, 256), arches=("sm_107a",)),
+    _bcta("seed_masked_bn__n4096_k7168_wave_bn192", (4096, 7168), (8, 9), (8, 9),
+          ("cake_batch_deepgemm_fp8_6371829fa379dd67c761", "masked_bn", 192, 128),
+          m=(None, 128), arches=("sm_107a",)),
+    _bcta("seed_masked_bn__n7168_k2048_wave_bn192", (7168, 2048), (1, 1), (4, 4),
+          ("cake_batch_deepgemm_fp8_6371829fa379dd67c761", "masked_bn", 192, 128),
+          m=(None, None), arches=("sm_107a",)),
+    _bcta("seed_masked_bn__n7168_k2048_wave_bn192", (7168, 2048), (1, 1), (5, 5),
+          ("cake_batch_deepgemm_fp8_6371829fa379dd67c761", "masked_bn", 192, 128),
+          m=(None, 640), arches=("sm_107a",)),
+    _bcta("seed_masked_bn__n7168_k2048_wave_bn192", (7168, 2048), (2, 2), (4, 4),
+          ("cake_batch_deepgemm_fp8_6371829fa379dd67c761", "masked_bn", 192, 128),
+          m=(None, 256), arches=("sm_107a",)),
+    _bcta("seed_masked_bn__n7168_k2048_wave_bn192", (7168, 2048), (4, 5), (4, 5),
+          ("cake_batch_deepgemm_fp8_6371829fa379dd67c761", "masked_bn", 192, 128),
+          m=(None, 128), arches=("sm_107a",)),
+    # N=4096, K=7168.  The BLOCK_N 32 band runs the scale-prefetch build (one K tile ahead, the unrolled, vector-store,
+    # split scale warp).
     _band("seed_masked_bn__n4096_k7168_bn32", (4096, 7168),
-          ("cake_batch_deepgemm_fp8_6bd449b1e45e0273fa0b", "masked_bn", 32, 256),
+          ("cake_batch_deepgemm_fp8_fc4b600bd3dfbc29a89b", "masked_bn", 32, 256),
           {"sm_107a": ((None, 1),)}),
     _band("seed_masked_bn__n4096_k7168_bn112", (4096, 7168),
           ("cake_batch_deepgemm_fp8_2dba8870634863384b03", "masked_bn", 112, 128),
