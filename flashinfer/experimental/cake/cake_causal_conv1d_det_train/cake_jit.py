@@ -3516,15 +3516,13 @@ SPLIT_ROLES = ("fwd", "bwd")
 # The routes whose single-tile rows run 32-vector tiles (``ct_vec`` 32, four
 # token sub-tiles, the last tile partial) instead of one tile of ``cv = C /
 # vec`` vectors, per role, at 128 threads (:func:`_narrow_tile`): the backward
-# at 64 < cv <= 96 (C = 520 to 768, three tiles) and cv = 28 (C = 224), the
-# forward at 72 <= cv <= 96 (C = 576 to 768).  One tile of cv vectors leaves
-# 128 - cv lanes of every CTA idle over the whole token axis; the programs are
-# unchanged.  The backward's four-tile rows (96 < cv < 128) keep one tile
-# (their ``dweight`` error against FP64 is lowest there), and so do the
-# ``_fp32g`` and ``_dt`` backward routes.
+# at 64 < cv < 128 (C = 520 to 1016, three or four tiles) and cv = 28 (C =
+# 224), the forward at 72 <= cv <= 96 (C = 576 to 768).  One tile of cv
+# vectors leaves 128 - cv lanes of every CTA idle over the whole token axis;
+# the programs are unchanged.  The ``_dt`` backward route keeps one tile.
 NARROW_TILE_ROUTES: dict[str, tuple[str, ...]] = {
     "fwd": ("fwd", "fwd_bias"),
-    "bwd": ("bwd", "bwd_bias"),
+    "bwd": ("bwd", "bwd_bias", "bwd_fp32g", "bwd_bias_fp32g"),
 }
 NARROW_TILE_THREADS = 128
 
@@ -3665,7 +3663,7 @@ def _narrow_tile(channel_vectors: int, threads: int, role: str) -> bool:
     if threads != NARROW_TILE_THREADS:
         return False
     if role == "bwd":
-        return 64 < channel_vectors <= 96 or channel_vectors == 28
+        return 64 < channel_vectors < 128 or channel_vectors == 28
     return 72 <= channel_vectors <= 96
 
 

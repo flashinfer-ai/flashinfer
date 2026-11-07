@@ -167,8 +167,8 @@ CASES = (
 # the route-specific code, which is the tap / bias load form and the store
 # form): the two new multi-sub-tile geometries, a whole-row tile, the
 # S = 5 row below one stage and a narrow single-tile row (C = 640: three
-# 32-vector tiles on the ``bwd`` / ``bwd_bias`` / ``fwd`` / ``fwd_bias``
-# routes, one 80-vector tile on the others).
+# 32-vector tiles on every backward route but ``bwd_dt`` and on the ``fwd`` /
+# ``fwd_bias`` routes, one 80-vector tile on the others).
 ROUTE_CASES = (
     (1000, 512, "perf"),
     (4097, 1280, (1000, 0, 3, 3094)),
@@ -231,12 +231,14 @@ NARROW_SPLIT_TABLE = {
         640: (32, 4, 3),
         648: (32, 4, 3),
         768: (32, 4, 3),
+        776: (32, 4, 4),
+        1016: (32, 4, 4),
     },
     "fwd": {576: (32, 4, 3), 640: (32, 4, 3), 768: (32, 4, 3)},
 }
 # Single-tile rows outside each role's narrow set (one tile on every route).
 ONE_TILE_ROWS = {
-    "bwd": (160, 192, 256, 512, 776, 1016, 1024),
+    "bwd": (160, 192, 256, 512, 1024),
     "fwd": (224, 520, 568, 776, 832),
 }
 # Rows whose plan, launch and gradients the narrow-tile tests check per route.
@@ -786,7 +788,7 @@ def test_channel_split_narrow_tiles_per_route() -> None:
     geometry = {"threads": 128, "vec": 8}
     assert loader.NARROW_TILE_ROUTES == {
         "fwd": ("fwd", "fwd_bias"),
-        "bwd": ("bwd", "bwd_bias"),
+        "bwd": ("bwd", "bwd_bias", "bwd_fp32g", "bwd_bias_fp32g"),
     }
     for kind in loader.KINDS:
         role = loader.route_role(kind)
@@ -813,7 +815,7 @@ def test_channel_split_narrow_tiles_per_route() -> None:
             base = loader.channel_split(C, geometry=geometry, role=role)
             got = loader.channel_split(C, geometry=geometry, role=role, route=kind)
             if role == "bwd":
-                in_set = 64 < cv <= 96 or cv == 28
+                in_set = 64 < cv < 128 or cv == 28
             else:
                 in_set = 72 <= cv <= 96
             assert got == ((32, 4, -(-cv // 32)) if narrow and in_set else base), (
@@ -1940,6 +1942,15 @@ def _bits(t: torch.Tensor) -> torch.Tensor:
     return t.view(torch.int16) if t.dtype == BF16 else t.view(torch.int32)
 
 
+def _clear_tile_rule_caches() -> None:
+    """Forget every cached value derived from the channel-tile rule."""
+
+    loader._channel_split.cache_clear()
+    loader._channel_choice.cache_clear()
+    loader._workspace_owners_of.cache_clear()
+    pkg._backward_workspace_bytes.cache_clear()
+
+
 @pytest.mark.parametrize("kind", tuple(ROUTE_SETTINGS))
 def test_narrow_tiles_launch_and_keep_y_and_dx_bits(kind, monkeypatch) -> None:
     """On the narrow single-tile rows each route launches its route's plan
@@ -1986,14 +1997,19 @@ def test_narrow_tiles_launch_and_keep_y_and_dx_bits(kind, monkeypatch) -> None:
         for got, first in zip(again, grads, strict=True):
             if first is not None:
                 assert torch.equal(_bits(got), _bits(first)), (kind, S, C)
+        # The one-tile plan is not the shipped rule's: forget every cached value
+        # the rule sizes (the channel split, the per-C program choice and
+        # workspace owners, and the backward workspace bytes the default
+        # workspace takes), so the forced plan gets the workspace the public
+        # bytes function gives its own rule, and the shipped rule's after.
         try:
             with monkeypatch.context() as m:
                 m.setattr(loader, "NARROW_TILE_ROUTES", {"fwd": (), "bwd": ()})
-                loader._channel_split.cache_clear()
+                _clear_tile_rule_caches()
                 y_one = cake_causal_conv1d_det_train_forward(x, w, cu, bias=b)
                 one = _backward(x, w, cu, dy, b, policy)
         finally:
-            loader._channel_split.cache_clear()
+            _clear_tile_rule_caches()
         assert torch.equal(_bits(y), _bits(y_one)), (kind, S, C, "y")
         assert torch.equal(_bits(grads[0]), _bits(one[0])), (kind, S, C, "dx")
 
