@@ -2776,6 +2776,8 @@ def test_serial_scan_rule_on_the_device(case, device, monkeypatch) -> None:
     sm_count, rows = SERIAL_SCAN_DEVICE_ROWS[arch]
     seq_lens, heads = rows[case]
     _small_device(monkeypatch, device, sm_count)
+    # the serial-scan rule's tables alone: the tc-priced table (TC_PLAN) also makes these layouts serial
+    monkeypatch.setattr(cake_chain, "TC_PLAN", False)
     inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=581)
     calls = _record_calls(monkeypatch)
     got = _run(inputs, seq_lens)
