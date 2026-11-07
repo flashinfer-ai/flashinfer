@@ -55,9 +55,9 @@ from flashinfer.trace.templates.moe import (
 )
 from flashinfer.utils import (
     check_shape_dtype_device,
-    device_support_pdl,
     register_custom_op,
     register_fake_op,
+    resolve_enable_pdl,
 )
 
 
@@ -221,7 +221,8 @@ def _prims_ts_fp8_per_tensor_scale_moe_impl(
     do_finalize : bool
         If ``True``, return the finalized MoE output.
     enable_pdl : Optional[bool]
-        Enable Programmatic Dependent Launch when supported.
+        Launch with programmatic dependent launch (PDL). ``None`` (default)
+        enables it on devices that support PDL.
     tune_max_num_tokens : int
         Autotune token-bucket upper bound (default ``8192``).
     activation_type : int
@@ -316,8 +317,7 @@ def _prims_ts_fp8_per_tensor_scale_moe_impl(
             if tensor is not None and tensor.dtype != routing_logits.dtype:
                 raise ValueError(f"{name} and routing_logits must use the same dtype")
 
-    if enable_pdl is None:
-        enable_pdl = device_support_pdl(hidden_states.device)
+    enable_pdl = resolve_enable_pdl(enable_pdl, hidden_states.device)
 
     num_tokens = hidden_states.shape[0]
     hidden_size = hidden_states.shape[-1]
@@ -571,7 +571,8 @@ def prims_ts_fp8_per_tensor_scale_moe(
     do_finalize : bool
         If ``True``, return the finalized MoE output.
     enable_pdl : Optional[bool]
-        Enable Programmatic Dependent Launch when supported.
+        Launch with programmatic dependent launch (PDL). ``None`` (default)
+        enables it on devices that support PDL.
     tune_max_num_tokens : int
         Autotune token-bucket upper bound (default ``8192``).
     activation_type : int
@@ -736,7 +737,8 @@ def prims_ts_fp8_per_tensor_scale_moe_partitioned(
     do_finalize : bool
         If ``True``, return the finalized MoE output.
     enable_pdl : Optional[bool]
-        Enable Programmatic Dependent Launch when supported.
+        Launch with programmatic dependent launch (PDL). ``None`` (default)
+        enables it on devices that support PDL.
     tune_max_num_tokens : int
         Autotune token-bucket upper bound (default ``8192``).
     activation_type : int
@@ -955,7 +957,8 @@ def prims_ts_fp8_block_scale_moe(
     do_finalize : bool
         If ``True``, return the finalized MoE output.
     enable_pdl : Optional[bool]
-        Enable Programmatic Dependent Launch when supported.
+        Launch with programmatic dependent launch (PDL). ``None`` (default)
+        enables it on devices that support PDL.
     tune_max_num_tokens : int
         Autotune token-bucket upper bound (default ``8192``).
     fp8_quantization_type : Fp8QuantizationType
@@ -1112,7 +1115,8 @@ def prims_ts_fp8_block_scale_routed_moe(
     do_finalize : bool
         If ``True``, return the finalized MoE output.
     enable_pdl : Optional[bool]
-        Enable Programmatic Dependent Launch when supported.
+        Launch with programmatic dependent launch (PDL). ``None`` (default)
+        enables it on devices that support PDL.
     gemm1_lora_delta : Optional[torch.Tensor]
         Optional MoE LoRA delta applied before the gated activation.
     output : Optional[torch.Tensor]
@@ -1271,8 +1275,7 @@ def _prims_ts_fp8_block_scale_moe_impl(
             "Prims-TS FP8 block-scale path does not support fused shared experts"
         )
 
-    if enable_pdl is None:
-        enable_pdl = device_support_pdl(hidden_states.device)
+    enable_pdl = resolve_enable_pdl(enable_pdl, hidden_states.device)
 
     num_tokens = hidden_states.shape[0]
     hidden_size = hidden_states.shape[-1]
@@ -1557,7 +1560,8 @@ def prims_ts_fp8_block_scale_moe_partitioned(
     do_finalize : bool
         If ``True``, return the finalized MoE output.
     enable_pdl : Optional[bool]
-        Enable Programmatic Dependent Launch when supported.
+        Launch with programmatic dependent launch (PDL). ``None`` (default)
+        enables it on devices that support PDL.
     tune_max_num_tokens : int
         Autotune token-bucket upper bound (default ``8192``).
     fp8_quantization_type : Fp8QuantizationType

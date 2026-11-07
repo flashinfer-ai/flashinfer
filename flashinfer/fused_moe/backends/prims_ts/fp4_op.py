@@ -57,9 +57,9 @@ from flashinfer.trace.templates.moe import (
 )
 from flashinfer.utils import (
     check_shape_dtype_device,
-    device_support_pdl,
     register_custom_op,
     register_fake_op,
+    resolve_enable_pdl,
 )
 
 
@@ -224,7 +224,8 @@ def prims_ts_fp4_block_scale_moe(
     do_finalize : bool
         If ``True``, return the finalized MoE output.
     enable_pdl : Optional[bool]
-        Enable Programmatic Dependent Launch when supported.
+        Launch with programmatic dependent launch (PDL). ``None`` (default)
+        enables it on devices that support PDL.
     activation_type : int
         Activation enum value (default Swiglu).
     per_token_scale : Optional[torch.Tensor]
@@ -292,8 +293,7 @@ def prims_ts_fp4_block_scale_moe(
             "or BF16 activations"
         )
 
-    if enable_pdl is None:
-        enable_pdl = device_support_pdl(hidden_states.device)
+    enable_pdl = resolve_enable_pdl(enable_pdl, hidden_states.device)
 
     num_tokens = hidden_states.shape[0]
     if output is None:
@@ -510,7 +510,8 @@ def prims_ts_fp4_block_scale_moe_partitioned(
     do_finalize : bool
         If ``True``, return the finalized MoE output.
     enable_pdl : Optional[bool]
-        Enable Programmatic Dependent Launch when supported.
+        Launch with programmatic dependent launch (PDL). ``None`` (default)
+        enables it on devices that support PDL.
     activation_type : int
         Activation enum value (default Swiglu).
     per_token_scale : Optional[torch.Tensor]
@@ -538,8 +539,7 @@ def prims_ts_fp4_block_scale_moe_partitioned(
         :func:`~flashinfer.fused_moe.prims_ts_fp4_block_scale_moe`.
     """
 
-    if enable_pdl is None:
-        enable_pdl = device_support_pdl(hidden_states.device)
+    enable_pdl = resolve_enable_pdl(enable_pdl, hidden_states.device)
     if per_token_scale is not None:
         raise NotImplementedError(
             "Partitioned FP4 MoE does not support per-token FC1-output requantization"
@@ -897,7 +897,8 @@ def prims_ts_fp4_block_scale_routed_moe(
     do_finalize : bool
         If ``True``, return the finalized MoE output.
     enable_pdl : Optional[bool]
-        Enable Programmatic Dependent Launch when supported.
+        Launch with programmatic dependent launch (PDL). ``None`` (default)
+        enables it on devices that support PDL.
     activation_type : int
         Activation enum value (default Swiglu).
     per_token_scale : Optional[torch.Tensor]
