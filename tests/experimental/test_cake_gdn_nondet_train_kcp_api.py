@@ -2278,8 +2278,8 @@ def test_program_vocabulary_is_the_design_list() -> None:
         kcp.TART_MODULE_OF["kcp_affine_merge"] == "kda_chunk_kcp_affine_merge_fp32_v1"
     )  # reused verbatim
     # the output walks are this package's own programs: det-neutral modules that no deterministic twin ships
-    assert kcp.TART_MODULE_OF["kcp_fwdh_out"] == "gdn_chunk_fwdh_out_v1_kcp"
-    assert kcp.TART_MODULE_OF["kcp_fwdh_out_tape"] == "gdn_chunk_fwdh_out_tape_v1_kcp"
+    assert kcp.TART_MODULE_OF["kcp_fwdh_out"] == "gdn_chunk_fwdh_out_v2_kcp"
+    assert kcp.TART_MODULE_OF["kcp_fwdh_out_tape"] == "gdn_chunk_fwdh_out_tape_v2_kcp"
     # save_mode="light_akk": the solve-free light replay of #1_l2n (this package's own module; a local program,
     # launched only in place of fwd_prep_l2n when the saved set holds the Akk tape)
     assert (
