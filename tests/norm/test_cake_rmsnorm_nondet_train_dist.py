@@ -15,11 +15,11 @@ limitations under the License.
 
 The Cake BF16 RMSNorm training forward and backward beside resident NCCL
 collectives (issues #7038, #8066): two processes, one per GPU, joined by a
-``torch.distributed`` NCCL process group, run this package's forward and
-backward on the compute stream while an all-gather or a reduce-scatter is in
-flight on a side stream -- with ``deterministic=True`` (the deterministic
-package) and ``deterministic=False`` (this package's kernels), BF16 and FP32
-weights, the plain and the residual route.
+``torch.distributed`` NCCL process group, run the forward and backward on the
+compute stream while an all-gather or a reduce-scatter is in flight on a side
+stream -- of the deterministic package (``flashinfer.cake_rmsnorm_det_train``)
+and of this package (``flashinfer.cake_rmsnorm_nondet_train``), BF16 and FP32 weights,
+the plain and the residual route.
 
 Two kinds of resident collective:
 
@@ -64,8 +64,8 @@ import torch
 WORLD = 2
 COLLECTIVES = ("all_gather", "reduce_scatter")
 MODES = ("waiting", "traffic")
-# (hidden, residual, weight dtype): deterministic=True runs BF16 weights only
-# (the deterministic package's routes).
+# (hidden, residual, weight dtype): the deterministic package's arm runs BF16
+# weights only.
 ROUTES = (
     (2048, False, "bf16"),
     (6144, False, "f32"),
@@ -138,8 +138,9 @@ def _worker(rank: int, port: int, out_dir: Path) -> int:
         device_id=device,
     )
     cpu = dist.new_group(backend="gloo")
-    pkg = cake_package("cake_rmsnorm_train")
-    loader = cake_package("cake_rmsnorm_train", "cake_jit")
+    pkg = cake_package("cake_rmsnorm_nondet_train")
+    loader = cake_package("cake_rmsnorm_nondet_train", "cake_jit")
+    det_pkg = cake_package("cake_rmsnorm_det_train")
     arch = loader.arch_for_capability(torch.cuda.get_device_capability(device))
     side = torch.cuda.Stream(device)
     results_path = out_dir / f"rank{rank}.jsonl"
@@ -218,23 +219,28 @@ def _worker(rank: int, port: int, out_dir: Path) -> int:
             )
             weight = (1 + 0.1 * torch.randn(hidden, **kw)).to(ref.W_DTYPES[w])
             eps = ref.EPS[hidden]
-            ws = pkg.cake_rmsnorm_train_backward_workspace(
-                rows, hidden, device, residual=residual, deterministic=deterministic
-            )
+            # the deterministic arm runs the deterministic package, the other
+            # this package (the mode is part of the name)
+            if deterministic:
+                forward = det_pkg.cake_rmsnorm_det_train_forward
+                backward = det_pkg.cake_rmsnorm_det_train_backward
+                workspace = det_pkg.cake_rmsnorm_det_train_backward_workspace
+            else:
+                forward = pkg.cake_rmsnorm_nondet_train_forward
+                backward = pkg.cake_rmsnorm_nondet_train_backward
+                workspace = pkg.cake_rmsnorm_nondet_train_backward_workspace
+            ws = workspace(rows, hidden, device, residual=residual)
 
             def call():
-                outputs = pkg.cake_rmsnorm_train_forward(
-                    x, weight, eps, residual=u, deterministic=deterministic
-                )
+                outputs = forward(x, weight, eps, residual=u)
                 normalized = outputs[2] if residual else x
-                dx, dw = pkg.cake_rmsnorm_train_backward(
+                dx, dw = backward(
                     g,
                     normalized,
                     weight,
                     outputs[1],
                     g_residual=g_h,
                     workspace=ws,
-                    deterministic=deterministic,
                 )
                 return tuple(t.clone() for t in (*outputs, dx, dw))
 

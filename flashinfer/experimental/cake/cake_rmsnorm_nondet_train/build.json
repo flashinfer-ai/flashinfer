@@ -11147,6 +11147,6 @@
       ]
     }
   ],
-  "package": "flashinfer.cake_rmsnorm_train_backend",
+  "package": "flashinfer.experimental.cake.cake_rmsnorm_nondet_train",
   "schema": "cake-build/1"
 }

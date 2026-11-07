@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Tests for the Cake fused BF16 RMSNorm training kernels with the
-non-deterministic weight gradient (``deterministic=False``; SM100 / SM103 /
-SM107).
+non-deterministic weight gradient (``flashinfer.cake_rmsnorm_nondet_train``;
+SM100 / SM103 / SM107).
 
 Every kernel output is compared with an FP64 reference of the same math: BF16
 ``y`` / ``dx`` at ``atol = rtol = 1e-2`` after normalizing both sides to unit
@@ -45,20 +45,23 @@ deterministic package where it serves the call, a workspace reused across token
 counts, windows and weight dtypes with its documented rest state checked after
 every call that reuses one, two streams, CUDA Graph capture and replay, the
 autograd wrapper (gradient
-accumulation, saved tensors, non-reentrant checkpointing, the mode resolved
-again when the backward runs) and argument validation.  The build manifest's
+accumulation, saved tensors, non-reentrant checkpointing, the
+``torch.use_deterministic_algorithms`` check made when the backward runs) and
+argument validation.  The build manifest's
 per-architecture CUDA floors and flags are checked without a device.
 
 This suite exercises the backend packages alone, through
 ``tests.test_helpers.cake_package``; the facade and the ``flashinfer`` top
-level are ``test_cake_rmsnorm_train_api.py``'s.
+level are ``test_cake_rmsnorm_nondet_train_api.py``'s.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import functools
+import re
 import statistics
+import warnings
 from pathlib import Path
 from typing import Optional
 
@@ -68,18 +71,16 @@ import torch.utils.checkpoint
 
 from tests.test_helpers.cake_package import cake_package
 
-pkg = cake_package("cake_rmsnorm_train")
-loader = cake_package("cake_rmsnorm_train", "cake_jit")
-cake_build = cake_package("cake_rmsnorm_train", "cake_build")
+pkg = cake_package("cake_rmsnorm_nondet_train")
+loader = cake_package("cake_rmsnorm_nondet_train", "cake_jit")
+cake_build = cake_package("cake_rmsnorm_nondet_train", "cake_build")
 det = cake_package("cake_rmsnorm_det_train")
 det_loader = cake_package("cake_rmsnorm_det_train", "cake_jit")
 det_build = cake_package("cake_rmsnorm_det_train", "cake_build")
-forward = functools.partial(pkg.cake_rmsnorm_train_forward, deterministic=False)
-backward = functools.partial(pkg.cake_rmsnorm_train_backward, deterministic=False)
-workspace_for = functools.partial(
-    pkg.cake_rmsnorm_train_backward_workspace, deterministic=False
-)
-rmsnorm = functools.partial(pkg.cake_rmsnorm, deterministic=False)
+forward = pkg.cake_rmsnorm_nondet_train_forward
+backward = pkg.cake_rmsnorm_nondet_train_backward
+workspace_for = pkg.cake_rmsnorm_nondet_train_backward_workspace
+rmsnorm = pkg.cake_rmsnorm_nondet
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 WIDTHS = (
@@ -141,7 +142,7 @@ def _supported() -> bool:
     return (
         torch.cuda.is_available()
         and _capability() in SUPPORTED_CAPABILITIES
-        and pkg.is_cake_rmsnorm_train_supported(_device(), deterministic=False)
+        and pkg.is_cake_rmsnorm_nondet_train_supported(_device())
     )
 
 
@@ -154,7 +155,7 @@ def device_or_skip(request):
     """Every test needs a supported device except the ``cpu_only`` ones."""
     if request.node.get_closest_marker("cpu_only") is None and not _supported():
         pytest.skip(
-            "cake_rmsnorm_train needs an SM100 / SM103 / SM107 device with exported routes"
+            "cake_rmsnorm_nondet_train needs an SM100 / SM103 / SM107 device with exported routes"
         )
 
 
@@ -278,8 +279,8 @@ def _workspace_at_rest(ws: torch.Tensor) -> bool:
 
 
 def _bytes(rows: int, hidden: int, residual: bool = False) -> int:
-    return pkg.cake_rmsnorm_train_backward_workspace_bytes(
-        rows, hidden, _device(), residual=residual, deterministic=False
+    return pkg.cake_rmsnorm_nondet_train_backward_workspace_bytes(
+        rows, hidden, _device(), residual=residual
     )
 
 
@@ -1109,7 +1110,7 @@ def test_workspace_reused_across_token_counts_and_weight_dtypes(hidden: int) -> 
     """One buffer serves a width's calls of every token count up to its rows,
     every window and both weight dtypes with no host write but NaN poison in its
     pair partial rows before each call; at rest after every call.  (Reuse across
-    widths, residual flags and stale bytes: ``test_cake_rmsnorm_train_api.py``.)"""
+    widths, residual flags and stale bytes: ``test_cake_rmsnorm_nondet_train_api.py``.)"""
     _skip_unless_route(hidden)
     ws = torch.zeros(_bytes(65536, hidden), dtype=torch.uint8, device=_device())
     w_dtypes = ["bf16"] + (["f32"] if _routes(hidden, "bwd", False, "f32") else [])
@@ -1450,71 +1451,85 @@ def _backward_launches(fn) -> list[str]:
 
 
 @pytest.mark.parametrize("w", tuple(W_DTYPES))
-def test_backward_resolves_the_mode_again_when_it_runs(w: str) -> None:
-    """The autograd backward resolves ``deterministic=False`` again when it runs.
-    Determinism switched on between forward and backward refuses it
-    (``RuntimeError``, nothing launched).  ``warn_only`` switched on there warns
-    and runs the det package's backward (BF16 weight: the det bits, no module of
-    this package), or raises one ``RuntimeError`` naming what the det package
-    lacks (FP32 weight).  A forward resolved under ``warn_only`` (BF16: warns
-    and runs this package's forward programs; FP32: refused before any work)
-    followed by a backward with determinism off runs this package's backward."""
+def test_autograd_backward_checks_deterministic_algorithms_when_it_runs(
+    w: str,
+) -> None:
+    """The autograd forward does not consult ``torch.use_deterministic_algorithms``;
+    the backward does when it runs.  Strict determinism: the forward runs this
+    package's forward with no alert, the backward raises ``RuntimeError`` naming
+    the det entry point and launches nothing.  ``warn_only`` at backward time:
+    one warning, then this package's backward -- ``dx`` bitwise equal to this
+    package's ``dx`` with determinism off, ``dw`` the kernel's at the det
+    budget.  Determinism on only at forward time: the backward runs with no
+    alert."""
     hidden, rows = 512, 257
     _skip_unless_route(hidden, w_dtype=w)
     eps = EPS[hidden]
     x, _u, g, _g_h, weight = _case_inputs(hidden, rows, w_dtype=W_DTYPES[w], key=67)
     expected = _window_records(hidden, "bwd", False, w, rows)
     rstd = forward(x, weight, eps)[1]
+    dx_off, _dw_off = backward(g, x, weight, rstd)
+    dx_ref, dw_ref = _reference_backward(g, x, weight, rstd)
 
     def graph():
         xa = x.clone().requires_grad_(True)
         wa = weight.clone().requires_grad_(True)
         return xa, wa, rmsnorm(xa, wa, eps)
 
-    # strict determinism at backward time
-    _xa, _wa, y = graph()
+    def package_warnings(caught) -> list[str]:
+        return [
+            str(item.message)
+            for item in caught
+            if "flashinfer.cake_rmsnorm_nondet_train." in str(item.message)
+        ]
+
+    # strict determinism: the forward runs, the backward refuses
     torch.use_deterministic_algorithms(True)
     start = len(_LAUNCHED)
-    with pytest.raises(RuntimeError, match="deterministic=True"):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        _xa, _wa, y = graph()
+    assert package_warnings(caught) == [], "the forward alerted"
+    assert _LAUNCHED[start:] == _window_records(hidden, "fwd", False, w, rows)
+    start = len(_LAUNCHED)
+    with pytest.raises(
+        RuntimeError, match=r"cake_rmsnorm_det_train\.cake_rmsnorm_det\b"
+    ):
         y.backward(g)
     assert _LAUNCHED[start:] == [], "a refused backward launched a module"
     torch.use_deterministic_algorithms(False)
 
-    # warn_only at backward time
+    # warn_only at backward time: one warning, this package's backward
     xa, wa, y = graph()
     torch.use_deterministic_algorithms(True, warn_only=True)
-    start = len(_LAUNCHED)
-    if w == "bf16":
-        with pytest.warns(UserWarning, match="deterministic package's backward"):
-            y.backward(g)
-        assert _LAUNCHED[start:] == [], "the det fallback launched this package"
-        dx_det, dw_det = det.cake_rmsnorm_det_train_backward(g, x, weight, rstd)
-        assert torch.equal(xa.grad, dx_det)
-        assert torch.equal(wa.grad, dw_det.to(wa.dtype))
-    else:
-        with pytest.raises(RuntimeError, match="only deterministic=False serves"):
-            y.backward(g)
-        assert _LAUNCHED[start:] == []
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        launched = _backward_launches(lambda: y.backward(g))
     torch.use_deterministic_algorithms(False)
-
-    # warn_only at forward time, determinism off at backward time
-    torch.use_deterministic_algorithms(True, warn_only=True)
-    if w == "f32":
-        start = len(_LAUNCHED)
-        with pytest.raises(RuntimeError, match="only deterministic=False serves"):
-            graph()
-        assert _LAUNCHED[start:] == []
-        torch.use_deterministic_algorithms(False)
-        return
-    with pytest.warns(UserWarning, match="this package's forward programs"):
-        xa, wa, y = graph()
-    torch.use_deterministic_algorithms(False)
-    launched = _backward_launches(lambda: y.backward(g))
+    messages = package_warnings(caught)
+    assert len(messages) == 1, messages
+    assert re.search(
+        r"flashinfer\.cake_rmsnorm_det_train\.cake_rmsnorm_det\b", messages[0]
+    ), messages[0]
     assert launched == expected, launched
-    dx_ref, dw_ref = _reference_backward(g, x, weight, rstd)
-    _assert_bf16_close(xa.grad, dx_ref, "re-resolved dx")
+    assert torch.equal(xa.grad, dx_off)
     _assert_autograd_dw(
-        wa.grad, weight, dw_ref, g, x, rstd, "re-resolved dw", _form(expected)
+        wa.grad, weight, dw_ref, g, x, rstd, "warn_only dw", _form(expected)
+    )
+
+    # determinism on only at forward time: the backward runs with no alert
+    torch.use_deterministic_algorithms(True)
+    xa, wa, y = graph()
+    torch.use_deterministic_algorithms(False)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        launched = _backward_launches(lambda: y.backward(g))
+    assert package_warnings(caught) == []
+    assert launched == expected, launched
+    assert torch.equal(xa.grad, dx_off)
+    _assert_bf16_close(xa.grad, dx_ref, "strict-at-forward dx")
+    _assert_autograd_dw(
+        wa.grad, weight, dw_ref, g, x, rstd, "strict-at-forward dw", _form(expected)
     )
 
 
@@ -1533,8 +1548,8 @@ def _refused(error: type, call, why: str) -> None:
 def test_argument_validation(hidden: int) -> None:
     """Wrong dtypes, shapes, devices, layouts, output buffers and workspaces
     (too small for the call, wrong dtype, on the CPU, misaligned, 2-D) are
-    refused with ``ValueError`` before any launch (the ``deterministic`` flag's
-    type: ``test_cake_rmsnorm_train_api.py``)."""
+    refused with ``ValueError`` before any launch (the ``deterministic``
+    keyword is Python's ``TypeError``: ``test_cake_rmsnorm_det_train_names.py``)."""
     _skip_unless_route(hidden)
     eps = EPS[hidden]
     rows = 4096
@@ -1575,8 +1590,8 @@ def test_argument_validation(hidden: int) -> None:
             "dw shape",
         ),
         (
-            lambda: pkg.cake_rmsnorm_train_backward_workspace_bytes(
-                -1, hidden, device, deterministic=False
+            lambda: pkg.cake_rmsnorm_nondet_train_backward_workspace_bytes(
+                -1, hidden, device
             ),
             "negative rows",
         ),

@@ -178,6 +178,23 @@ _PRIMS_TS_LAZY_EXPORTS = frozenset(
 # import the experimental tree.
 _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     **{name: (".fused_moe", name) for name in sorted(_PRIMS_TS_LAZY_EXPORTS)},
+    # RMSNorm training: det names from the det facade, and both facades as modules.
+    "cake_rmsnorm_det": (".cake_rmsnorm_det_train", "cake_rmsnorm_det"),
+    "CakeRMSNormDetFunction": (".cake_rmsnorm_det_train", "CakeRMSNormDetFunction"),
+    "cake_rmsnorm_det_train_forward": (
+        ".cake_rmsnorm_det_train",
+        "cake_rmsnorm_det_train_forward",
+    ),
+    "cake_rmsnorm_det_train_backward": (
+        ".cake_rmsnorm_det_train",
+        "cake_rmsnorm_det_train_backward",
+    ),
+    "cake_rmsnorm_det_train_backward_workspace_bytes": (
+        ".cake_rmsnorm_det_train",
+        "cake_rmsnorm_det_train_backward_workspace_bytes",
+    ),
+    "cake_rmsnorm_det_train": (".cake_rmsnorm_det_train", None),
+    "cake_rmsnorm_nondet_train": (".cake_rmsnorm_nondet_train", None),
     "CakeCausalConv1dDetFunction": (
         ".cake_causal_conv1d_det_train",
         "CakeCausalConv1dDetFunction",
@@ -364,33 +381,6 @@ from .norm import rmsnorm as rmsnorm
 from .norm import rmsnorm_quant as rmsnorm_quant
 from .norm import fused_rmsnorm_silu as fused_rmsnorm_silu
 from .norm import fused_qk_rmsnorm_rope as fused_qk_rmsnorm_rope
-from .cake_rmsnorm_det_train import CakeRMSNormDetFunction as CakeRMSNormDetFunction
-from .cake_rmsnorm_det_train import cake_rmsnorm_det as cake_rmsnorm_det
-from .cake_rmsnorm_det_train import (
-    cake_rmsnorm_det_train_backward as cake_rmsnorm_det_train_backward,
-)
-from .cake_rmsnorm_det_train import (
-    cake_rmsnorm_det_train_backward_workspace_bytes as cake_rmsnorm_det_train_backward_workspace_bytes,
-)
-from .cake_rmsnorm_det_train import (
-    cake_rmsnorm_det_train_forward as cake_rmsnorm_det_train_forward,
-)
-
-# The names before the det rename: the package with the deterministic default and the
-# opt-in non-deterministic weight gradient (``deterministic=False``).
-from .cake_rmsnorm_train import CakeRMSNormFunction as CakeRMSNormFunction
-from .cake_rmsnorm_train import cake_rmsnorm as cake_rmsnorm
-from .cake_rmsnorm_train import (
-    cake_rmsnorm_train_backward as cake_rmsnorm_train_backward,
-)
-from .cake_rmsnorm_train import (
-    cake_rmsnorm_train_backward_workspace_bytes as cake_rmsnorm_train_backward_workspace_bytes,
-)
-from .cake_rmsnorm_train import (
-    cake_rmsnorm_train_forward as cake_rmsnorm_train_forward,
-)
-from . import cake_rmsnorm_train as cake_rmsnorm_train
-from . import cake_rmsnorm_train_backend as cake_rmsnorm_train_backend
 
 # CakeCausalConv1dDetFunction and the workspace-bytes helpers are served by
 # ``_LAZY_EXPORTS`` above: they live in the backend package under flashinfer/experimental/cake/.

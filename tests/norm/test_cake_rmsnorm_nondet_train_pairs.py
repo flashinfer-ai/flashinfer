@@ -39,9 +39,9 @@ from tests.test_helpers.cake_package import cake_package
 
 pytestmark = pytest.mark.cpu_only
 
-pkg = cake_package("cake_rmsnorm_train")
-loader = cake_package("cake_rmsnorm_train", "cake_jit")
-windows = cake_package("cake_rmsnorm_train", "cake_windows")
+pkg = cake_package("cake_rmsnorm_nondet_train")
+loader = cake_package("cake_rmsnorm_nondet_train", "cake_jit")
+windows = cake_package("cake_rmsnorm_nondet_train", "cake_windows")
 SM_COUNTS = (148, 160, 132, 1)
 
 
@@ -532,5 +532,7 @@ def test_build_manifest_builds_every_library() -> None:
         for arch in record["arches"]
     }
     assert wanted <= built, sorted(wanted - built)[:5]
-    assert manifest["package"] == "flashinfer.cake_rmsnorm_train_backend"
+    assert (
+        manifest["package"] == "flashinfer.experimental.cake.cake_rmsnorm_nondet_train"
+    )
     assert all(name.startswith("cake_rmsnorm_train_") for name in built)

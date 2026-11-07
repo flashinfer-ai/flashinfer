@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Per-head views and activation checkpointing of the Cake BF16 RMSNorm training
-kernels with the non-deterministic weight gradient (``deterministic=False``;
-issues #7045 items 2-3, #7039, #8066).
+kernels with the non-deterministic weight gradient
+(``flashinfer.cake_rmsnorm_nondet_train``; issues #7045 items 2-3, #7039, #8066).
 
 Per-head views: the H=256 query view ``[T, 24, 256]`` of a ``[T, 24, 512]``
 buffer (strides ``(12288, 512, 1)``) and the contiguous key view ``[T, 4, 256]``
@@ -45,8 +45,6 @@ sibling.
 
 from __future__ import annotations
 
-import functools
-
 import pytest
 import torch
 import torch.utils.checkpoint
@@ -54,14 +52,12 @@ import torch.utils.checkpoint
 from tests.test_helpers import cake_rmsnorm_train_reference as ref
 from tests.test_helpers.cake_package import cake_package
 
-pkg = cake_package("cake_rmsnorm_train")
-loader = cake_package("cake_rmsnorm_train", "cake_jit")
-forward = functools.partial(pkg.cake_rmsnorm_train_forward, deterministic=False)
-backward = functools.partial(pkg.cake_rmsnorm_train_backward, deterministic=False)
-workspace_for = functools.partial(
-    pkg.cake_rmsnorm_train_backward_workspace, deterministic=False
-)
-rmsnorm = functools.partial(pkg.cake_rmsnorm, deterministic=False)
+pkg = cake_package("cake_rmsnorm_nondet_train")
+loader = cake_package("cake_rmsnorm_nondet_train", "cake_jit")
+forward = pkg.cake_rmsnorm_nondet_train_forward
+backward = pkg.cake_rmsnorm_nondet_train_backward
+workspace_for = pkg.cake_rmsnorm_nondet_train_backward_workspace
+rmsnorm = pkg.cake_rmsnorm_nondet
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 W_DTYPES = ref.W_DTYPES
@@ -88,7 +84,7 @@ def _supported() -> bool:
     return (
         torch.cuda.is_available()
         and _capability() in SUPPORTED_CAPABILITIES
-        and pkg.is_cake_rmsnorm_train_supported(_device(), deterministic=False)
+        and pkg.is_cake_rmsnorm_nondet_train_supported(_device())
     )
 
 
@@ -98,7 +94,7 @@ def _arch() -> str:
 
 pytestmark = pytest.mark.skipif(
     not _supported(),
-    reason="cake_rmsnorm_train(deterministic=False) needs an SM100 / SM103 / SM107 device with exported routes",
+    reason="cake_rmsnorm_nondet_train needs an SM100 / SM103 / SM107 device with exported routes",
 )
 
 
