@@ -1691,9 +1691,9 @@ ROUTER_RULES: dict[
     # ("H0.5x3", 76 head and 228 tail units on 152 SMs; windows measured at 10240 and 12288 (sm_100a), 16172, 16231,
     # 16384 and 32768 tokens; more than 3 % slower next to a resident kernel at 8192 tokens on sm_100a, at 10240 and
     # 12288 on sm_103a; a later sm_103a measurement passed at 10240 on two parts, between misses at 8192 and 12288, so
-    # 10240 was not added).  On sm_100a the window ends at 16384 tokens: measured again against the current
-    # deterministic plan, it was up to 4.5 % slower than that plan next to a resident kernel at 24576 tokens and up to
-    # 6.9 % at 32768 (16385 to 24575 tokens not measured).
+    # 10240 was not added).  On sm_100a the window ended at 16384 tokens: measured again against six splits, it was
+    # up to 4.5 % slower than that plan next to a resident kernel at 24576 tokens and up to 6.9 % at 32768 (16385 to
+    # 24575 tokens not measured); it ends at 12288 tokens now (below).
     # Hidden 4096 on sm_100a keeps the deterministic plan above its SIMT window: the head/tail partition with 44 head
     # units and five tail units per CTA pair ("H1x5p44"), measured again against the current deterministic plan at
     # 10240 to 16384 tokens, left the checkpointed step (two forwards and the backward pass) up to 2.7 % slower in
@@ -1701,21 +1701,39 @@ ROUTER_RULES: dict[
     # Hidden 4096 on sm_103a: "H1x4p44" (44 head units, then four tail units per CTA pair) from 20480 to 49152 tokens
     # (measured at 20480, 24576, 32768 and 49152 tokens, each on four or five parts); up to 7 % slower than the
     # deterministic plan next to a resident kernel at 8192 to 16384 tokens, and at 65536 the checkpointed step (two
-    # forwards and the backward pass) was up to 1.4 % slower.  Hidden 6144 on sm_103a: "H1x5p44" from 16172 to 20480
-    # tokens (measured at 16172, 16231, 16384 and 20480 tokens, each on four parts); up to 7.8 % slower next to a
-    # resident kernel at 8192 to 12288 tokens, the backward pass (input and weight gradient) no faster at 24576 and up
-    # to 2.3 % slower at 32768.  Hidden 6144 on sm_100a keeps the deterministic plan above its SIMT window: no
+    # forwards and the backward pass) was up to 1.4 % slower.  Hidden 6144 on sm_103a keeps the deterministic plan
+    # above its SIMT window: "H1x5p44" (44 head units, then five tail units per CTA pair; measured against six splits
+    # at 16172, 16231, 16384 and 20480 tokens on four parts, up to 7.8 % slower next to a resident kernel at 8192 to
+    # 12288 tokens, the backward pass no faster at 24576 and up to 2.3 % slower at 32768) held only at 20480 tokens
+    # when measured again (below).  Hidden 6144 on sm_100a keeps the deterministic plan above its SIMT window: no
     # partition was faster in every run in CUDA graphs.
     # sm_107a: hidden 5120 "H0.5x4" (four tail units, 108 head and 432 tail units on 216 SMs; measured on two parts at
     # 16172, 16231 and 16384 tokens); hidden 4096 and 6144 keep the deterministic plan: at 4096 "H0.5x4" was up to
     # 7 % slower than that plan when a kernel holding 16 SMs on another stream started during it (the kernel takes SMs
-    # the head spans wait for), at 6144 it left the backward pass no faster
+    # the head spans wait for), at 6144 it left the backward pass no faster.
+    # The deterministic plan of the measurements above is that package's six splits.  From 16129 to 16384 tokens on
+    # 148- and 152-SM sm_100a / sm_103a parts it plans nine splits at hidden 5120 and three at hidden 6144 (its
+    # ROUTER_SPLIT_RULES, router_splits).  The 152-SM head/tail windows at and next to those token counts were measured
+    # again on two parts against the plan the row runs without them (the rule's count from 16129 to 16384 tokens, six
+    # elsewhere), alone, in the backward pass and in the checkpointed step, in eager launches and in CUDA graphs.  A
+    # token count stays in a window where, on both parts, the partition was faster alone in every run (a one-sided
+    # paired sign test, p < 0.05, with a median time ratio below 0.99) and the backward pass and the checkpointed step
+    # were no slower (pooled median ratio at most 1.013, no run slower than the slowest run of that plan against
+    # itself); next to a resident kernel it was up to 4.5 % slower at some kept token counts (data, not a condition
+    # here).  A window ends at kept token counts and holds no token count that missed:
+    # - sm_100a hidden 5120 "H0.5x3": kept at 12288 tokens, missed at 16128 (alone, one eager run, against six
+    #   splits): the window is 10240 to 12288 tokens.
+    # - sm_103a hidden 5120 "H0.5x3": missed at 16172 and 16231 tokens (alone, one eager run each, against nine
+    #   splits), kept at 16232 and 16384 (against nine) and at 16385, 24576 and 32768 (against six): the window is
+    #   16232 to 32768 tokens.
+    # - sm_103a hidden 6144 "H1x5p44": missed at 16172, 16231 and 16384 tokens (against three splits) and at 16385
+    #   (against six), kept at 20480 only: no window.
     ("sm_100a", "nn_t", 4096, 256): ((1, 224, "simt_n128m64s2"),),
-    ("sm_100a", "nn_t", 5120, 256): ((1, 256, "simt_n64m64s2"), (1, 128, "waves"), (10240, 16384, "H0.5x3")),
+    ("sm_100a", "nn_t", 5120, 256): ((1, 256, "simt_n64m64s2"), (1, 128, "waves"), (10240, 12288, "H0.5x3")),
     ("sm_100a", "nn_t", 6144, 256): ((1, 256, "simt_n64m64s2"),),
     ("sm_103a", "nn_t", 4096, 256): ((1, 288, "simt_n64m64s2"), (20480, 49152, "H1x4p44")),
-    ("sm_103a", "nn_t", 5120, 256): ((1, 192, "simt_n64m64s2"), (1, 192, "waves"), (16172, 32768, "H0.5x3")),
-    ("sm_103a", "nn_t", 6144, 256): ((1, 256, "simt_n64m64s2"), (16172, 20480, "H1x5p44")),
+    ("sm_103a", "nn_t", 5120, 256): ((1, 192, "simt_n64m64s2"), (1, 192, "waves"), (16232, 32768, "H0.5x3")),
+    ("sm_103a", "nn_t", 6144, 256): ((1, 256, "simt_n64m64s2"),),
     ("sm_107a", "nn_t", 4096, 256): None,
     ("sm_107a", "nn_t", 5120, 256): ((16172, 16384, "H0.5x4"),),
     ("sm_107a", "nn_t", 6144, 256): None,
