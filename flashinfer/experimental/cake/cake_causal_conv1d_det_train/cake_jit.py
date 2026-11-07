@@ -3570,11 +3570,12 @@ def channel_split(
     ``route`` is the launch's route (one of :data:`KINDS` of the role; the
     host passes its record's).  On a route of :data:`NARROW_TILE_ROUTES` the
     single-tile rows of the role's narrow set run 32-vector tiles, ``(32,
-    threads // 32, ceil(cv / 32))``: the backward's C = 224 and 520 to 768,
-    the forward's C = 576 to 768, so C = 640 runs (32, 4, 3) instead of (80,
+    threads // 32, ceil(cv / 32))``: the backward's C = 224 and 520 to 1016
+    (three or four tiles) on every backward route, the forward's C = 576 to
+    768 on ``fwd`` / ``fwd_bias``, so C = 640 runs (32, 4, 3) instead of (80,
     1, 1).  ``y`` and ``dx`` keep their bits; ``dweight`` and ``dbias`` sum in
     the narrow plan's fixed order (bitwise reproducible).  Without a route,
-    and on every other route, the single tile stays.
+    and on ``fwd_dt``, the single tile stays.
     """
 
     return _channel_split(

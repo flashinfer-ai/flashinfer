@@ -178,8 +178,15 @@ ROUTE_CASES = (
 )
 LARGE_CASE = (262401, 8192, "perf")
 LARGE_CASE_FREE_BYTES = 40 * 2**30
-# S 250340 x C 512 and 1280 (CONTRACT §4): the perf-size rows of the fp32 gate.
-PRECISION_CASES = ((250340, 512, "perf"), (250340, 1280, "perf"))
+# S 250340 x C 512 and 1280 (CONTRACT §4): the perf-size rows of the fp32 gate,
+# plus C 640 and 1016, whose fp32g backward runs the narrow 32-vector tiles
+# (three and four tiles, the last one partial).
+PRECISION_CASES = (
+    (250340, 512, "perf"),
+    (250340, 1280, "perf"),
+    (250340, 640, "perf"),
+    (250340, 1016, "perf"),
+)
 GRAPH_CASES = (
     (65, 256, (64, 1)),
     (5, 136, (2, 0, 3)),
