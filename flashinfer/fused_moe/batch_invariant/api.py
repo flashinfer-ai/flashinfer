@@ -23,6 +23,24 @@ from ...gemm.batch_invariant.generator import Knobs
 from . import spec as S
 from .blocks.epilogue import GroupedChain
 
+_CONST: Dict[Tuple[int, int, float], torch.Tensor] = {}
+
+
+def _const(dev: torch.device, n: int, value: float) -> torch.Tensor:
+    """A cached fp32 constant tensor (``value`` repeated ``n`` times) per device: the route kernel reads an absent bias
+    or scale from it instead of a per-call fill (a fill is one more kernel in the caller's stream or graph)."""
+    key = (
+        dev.index if dev.index is not None else torch.cuda.current_device(),
+        n,
+        value,
+    )
+    t = _CONST.get(key)
+    if t is None:
+        t = torch.full((n,), value, dtype=torch.float32, device=dev)
+        _CONST[key] = t
+    return t
+
+
 _IN = {torch.float32: "f32", torch.bfloat16: "bf16"}
 _OUT = {torch.bfloat16: "bf16", torch.float16: "f16", torch.float32: "f32"}
 _DTYPE_OF = {v: k for k, v in _OUT.items()}
@@ -268,16 +286,16 @@ def route(
     b = (
         bias.to(device=dev, dtype=torch.float32).contiguous()
         if bias is not None
-        else torch.zeros(E, dtype=torch.float32, device=dev)
+        else _const(dev, E, 0.0)
     )
     if tuple(b.shape) != (E,):
         raise ValueError(f"route: bias must be [E] = [{E}]")
     if scaling_factor is None:
-        s = torch.ones(1, dtype=torch.float32, device=dev)
+        s = _const(dev, 1, 1.0)
     elif isinstance(scaling_factor, torch.Tensor):
         s = scaling_factor.to(device=dev, dtype=torch.float32).reshape(1)
     else:
-        s = torch.full((1,), float(scaling_factor), dtype=torch.float32, device=dev)
+        s = _const(dev, 1, float(scaling_factor))
     if experts is None:
         experts = torch.empty(T, top_k, dtype=torch.int32, device=dev)
     if weights is None:
