@@ -1101,7 +1101,68 @@ def write_if_different(path: Path, content: str) -> None:
     path.write_text(content)
 
 
+def _ensure_jit_submodules() -> None:
+    """Initialize cutlass/cccl/spdlog submodules when they are empty.
+
+    SM120 kernels are JIT-only (no pre-built cache wheel exists), so the
+    CUTLASS and CCCL headers must be present at runtime.  Without this
+    step, ``pip install .`` from a source checkout that did not pass
+    ``--recurse-submodules`` silently produces a wheel with no JIT
+    headers, and every SM120 JIT compilation fails at runtime with
+    ``cutlass/arch/arch.h not found``.
+
+    Guarded on ``.git`` because an sdist install has no git metadata:
+    the submodule trees travel inside the sdist as plain directories.
+    """
+    in_git_repo = (_root / ".git").exists()
+    # A header from each JIT include path. A partial checkout, for example one
+    # left by an interrupted update, lacks it and is not treated as complete.
+    _JIT_SUBMODULES = {
+        "cutlass": "include/cutlass/arch/arch.h",
+        "cccl": "cub/cub/cub.cuh",
+        "spdlog": "include/spdlog/spdlog.h",
+    }
+    for name, marker in _JIT_SUBMODULES.items():
+        submod = _root / "3rdparty" / name
+        if (submod / marker).exists():
+            continue
+        if not in_git_repo:
+            print(
+                f"[flashinfer] WARNING: 3rdparty/{name} is empty or incomplete and this is "
+                f"not a git checkout.  SM120 JIT compilation will fail.  "
+                f"Install from a git clone with --recurse-submodules, or "
+                f"symlink the {name} headers into "
+                f"$(python -c 'import flashinfer,os;print(os.path.dirname(flashinfer.__file__))')/data/{name}",
+                flush=True,
+            )
+            continue
+        print(
+            f"[flashinfer] Initializing 3rdparty/{name} submodule...",
+            flush=True,
+        )
+        try:
+            subprocess.run(
+                ["git", "submodule", "update", "--init", f"3rdparty/{name}"],
+                cwd=_root,
+                check=True,
+                timeout=300,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"Timed out initializing 3rdparty/{name}. "
+                "Check Git remote access and retry."
+            ) from exc
+        # `git submodule update` does nothing when the submodule is already at
+        # the recorded commit, so it cannot repair a partial checkout.
+        if not (submod / marker).exists():
+            raise RuntimeError(
+                f"3rdparty/{name} is incomplete ({marker} is missing). Run "
+                f"`git submodule update --init --force 3rdparty/{name}` and retry."
+            )
+
+
 def _create_data_dir(use_symlinks=True):
+    _ensure_jit_submodules()
     _data_dir.mkdir(parents=True, exist_ok=True)
 
     def ln(source: str, target: str) -> None:
