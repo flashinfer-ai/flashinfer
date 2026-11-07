@@ -520,24 +520,26 @@ fused one.
 
 The programs are exact-architecture tcgen05 payloads built for the exact
 targets `sm_100a`, `sm_103a` and `sm_107a` (`build.json` `arch_flags`).
-`cake_jit.PROGRAMS` lists twenty-two libraries, one per kernel and build,
+`cake_jit.PROGRAMS` lists twenty-nine libraries, one per kernel and build,
 each a kernel and a host-binding translation unit under
 `csrc/cake_moe_grouped_det_gemm/` shared by the architectures it is built for (an
 architecture-dependent line is folded under `__CUDA_ARCH__`):
 
-- `fwd` and `dgrad` in five builds each: the domain-scheduled build for
+- `fwd` and `dgrad` in six builds each: the domain-scheduled build for
   `sm_100a` and `sm_103a` and the static-schedule build for `sm_107a`, each
   with the 256-column output tile (the routes' `main` stage) and with the
-  512-column one (`main_wide`), and the `sm_107a` evict-first twin of the
-  512-column build (`main_wide_ef`); plus the 3 / 3 head / tail twin of the
+  512-column one (`main_wide`), and the evict-first twin of each 512-column
+  build (`main_wide_ef`; the domain-scheduled `fwd` twin, which loads X and
+  stores Y evict-first, for `sm_100a` and `sm_103a`, the domain-scheduled
+  `dgrad` twin for `sm_100a`); plus the 3 / 3 head / tail twin of the
   domain-scheduled A-collector 512-column build for `fwd` and `dgrad` on
   `sm_103a` (`main_wide_ts33`). A route spells the two builds of a stage as
   two stages of one name on disjoint architectures, and
   `cake_jit.stage_binding(name, stage, arch)` returns the one built for the
   architecture.
 - the wave-synchronized weight-gradient main kernel with a 256- or 512-wide
-  k tile, for `sm_100a`, `sm_103a` and `sm_107a` (the routes' `main_wave`
-  stage).
+  k tile, for `sm_100a` and `sm_103a` (the routes' `main_wave` stage; the
+  host launches it on no other architecture).
 - the 512-wide k tile's A-collector main kernel that releases the
   accumulator in two halves (`main_halves`): with the planned tile walk for
   `sm_100a` and `sm_103a`, without it for `sm_107a`; for `sm_107a` its twin
@@ -546,6 +548,14 @@ architecture-dependent line is folded under `__CUDA_ARCH__`):
   releases it in two halves (`main_wave_halves`), for `sm_100a` and `sm_103a`.
 - the 512-wide k tile's main kernel for `sm_107a`, a second `main` stage
   beside the one built for `sm_100a` and `sm_103a`.
+- the fp32 accumulate builds (`_acc`): the twins of `main_halves` (one for
+  `sm_100a` and `sm_103a`, one for `sm_107a`), `main_wave_halves` (`sm_100a`,
+  `sm_103a`) and `main_halves_k256t` (`sm_107a`) on the fp32 512-wide k tile
+  route, which add the weight gradient into `C` with one fp32 add per element
+  (their `build.json` entries need CUDA 13.4, `min_cuda`), and the twin of the
+  tail-reduce that adds the ordered sum of a split tail's partials into `C`
+  (`tail_reduce_acc`, on the fp32 512- and 256-wide k tile routes, for all
+  three architectures).
 - the weight-gradient main kernel with a 256- or 512-wide k tile and the
   weight-gradient tail-reduce, as the previous delivery shipped them.
 
