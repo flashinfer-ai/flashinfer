@@ -318,7 +318,6 @@ def test_backward_grid_gives_up_one_sm_when_the_last_rank_is_partial(
 
     monkeypatch.setattr(conv_kcp, "_launch_plan", recording_plan)
     monkeypatch.setattr(conv_kcp, "run_module", recording_run)
-    monkeypatch.setenv(conv_kcp.TEST_KNOBS_ENV, "1")
     try:
         for C, expected in rows:
             p = _problem((5000, 1003), (1, 2, 4997, 1003), C, device)
@@ -361,7 +360,6 @@ def test_graph_replay_is_bitwise_for_y_and_dx(monkeypatch, form) -> None:
     dx0, dw0 = _bwd(x, w, ctx, dy, hist0)
     kw = {}
     if form == "knob":
-        monkeypatch.setenv(conv_kcp.TEST_KNOBS_ENV, "1")
         conv_kcp._set_test_knobs({"graph": "replay"})
     else:
         kw = {"graph": "replay"}

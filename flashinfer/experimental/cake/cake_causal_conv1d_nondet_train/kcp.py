@@ -80,7 +80,7 @@ context and the shapes of the call, never a tensor's contents; it holds at most
 device index.  The operand checks, the gather, the exchange, its wait and the
 kernel launches run as before with the same arguments on the same stream, so
 no bit changes; a replayed graph (``graph="replay"``) contains no host work.
-``_set_test_knobs({"host_trim": 0})`` (with ``CAKE_KCP_TEST_KNOBS=1``) selects
+``_set_test_knobs({"host_trim": 0})`` (a private test hook; the backend reads no environment variable) selects
 the previous host path for the A/B record.
 
 Backward grid beside a concurrent kernel (FlashInfer issue #8365): the main
@@ -127,7 +127,6 @@ uses the trimmed host path's per-context cache (the ``host_trim`` test knob sele
 
 from __future__ import annotations
 
-import os
 from typing import Any, Optional
 
 import torch
@@ -157,7 +156,6 @@ HEAD_SLOTS = HALO  # send slots per head row (a head token is consumed by at mos
 KCP_FWD = "kcp_fwd"
 KCP_BWD = "kcp_bwd"
 KCP_BWD_HEAD = "kcp_bwd_head"
-TEST_KNOBS_ENV = "CAKE_KCP_TEST_KNOBS"  # the KCP route's private test-hook gate (the variable the KDA host module reads too)
 GRAPH_MODES = (
     "off",
     "replay",
@@ -458,7 +456,7 @@ def _handle_hist(
 #
 # The public keyword ``graph="replay"`` of :func:`cake_causal_conv1d_nondet_kcp` and of the forward / backward below
 # (shipped ``GRAPH_DEFAULT = "off"``) -- or, for the A/B record, the private ``_set_test_knobs({"graph": "replay"})``
-# (accepted only with ``CAKE_KCP_TEST_KNOBS=1``; a keyword contradicting an active knob is a ``ValueError``) -- makes
+# (a private test hook; a keyword contradicting an active knob is a ``ValueError``) -- makes
 # :func:`cake_causal_conv1d_nondet_train_kcp_forward` / :func:`cake_causal_conv1d_nondet_train_kcp_backward` run their
 # first call of a validity key (kind, the context object, its world size, and the shape / stride / dtype / data pointer
 # of every operand and caller-owned output) eagerly, capture the second call into a ``torch.cuda.CUDAGraph`` (replayed
@@ -673,16 +671,13 @@ def _reserve_fits(reserve: int, x: Any, entry: str) -> None:
 def _set_test_knobs(knobs: Optional[dict]) -> dict:
     """Set the module's private test knobs (``graph``: ``"off"`` shipped | ``"replay"``; ``host_trim``: ``1`` shipped =
     the trimmed host path of the eager call | ``0`` the previous host path); a knob
-    the dict does not name keeps its shipped default; ``None`` restores the defaults.  Refused without
-    ``CAKE_KCP_TEST_KNOBS=1`` in the environment.  Returns the active knobs."""
+    the dict does not name keeps its shipped default; ``None`` restores the defaults.  A private test hook: tests call
+    it directly and restore the defaults afterwards; the backend reads no environment variable.  Returns the active
+    knobs."""
     if knobs is None:
         _TEST_KNOBS["graph"] = "off"
         _TEST_KNOBS["host_trim"] = HOST_TRIM_DEFAULT
         return dict(_TEST_KNOBS)
-    if os.environ.get(TEST_KNOBS_ENV) != "1":
-        raise ValueError(
-            f"_set_test_knobs is a private test hook: it is accepted only with {TEST_KNOBS_ENV}=1 in the environment"
-        )
     if not isinstance(knobs, dict):
         raise TypeError(f"_set_test_knobs expects a dict, got {type(knobs).__name__}")
     unknown = sorted(set(knobs) - {"graph", "host_trim"})

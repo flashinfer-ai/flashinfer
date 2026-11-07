@@ -232,7 +232,6 @@ def test_backward_launches_the_reserved_grid(monkeypatch, reserve) -> None:
     rows = _widths(device)
     assert len(rows) == 2, rows
     seen = _record_main_grids(monkeypatch)
-    monkeypatch.setenv(conv_kcp.TEST_KNOBS_ENV, "1")
     try:
         for C, full, k, shipped in rows:
             p = _problem(LENS, CUTS, C, device)

@@ -14,8 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 CPU tests of the non-deterministic conv KCP module's private test knobs, the bookkeeping of its CUDA-graph replay
-cache, its trimmed host path, its recompute handle and its public names: the knob is refused without
-``CAKE_KCP_TEST_KNOBS=1``, validated against ``GRAPH_MODES`` and off by default; the validity key tells operands
+cache, its trimmed host path, its recompute handle and its public names: the knob is a private hook with no
+environment gate (the backend reads no environment variable), validated against ``GRAPH_MODES`` and off by default;
+the validity key tells operands
 apart by data pointer, shape, stride and dtype, keeps one entry per key, and the first call of a key runs eagerly;
 no public entry takes a ``deterministic`` keyword (the ordinary ``TypeError``) and every public name carries
 ``nondet``; the non-deterministic KCP package ``flashinfer.cake_causal_conv1d_nondet_train_kcp`` imports no KCP host
@@ -36,16 +37,27 @@ from tests.test_helpers.cake_package import PACKAGES
 
 
 @pytest.mark.cpu_only
-def test_graph_knob_is_gated_and_validated(monkeypatch) -> None:
-    monkeypatch.delenv(conv_kcp.TEST_KNOBS_ENV, raising=False)
+def test_backend_reads_no_environment_variable() -> None:
+    """The KCP route has no environment gate: no ``TEST_KNOBS_ENV`` constant, and neither ``kcp.py`` nor ``kcp_jit.py``
+    reads the environment (``os.environ`` / ``os.getenv`` / ``getenv``)."""
+    import inspect
+
+    from flashinfer.experimental.cake.cake_causal_conv1d_nondet_train import (
+        kcp_jit,
+    )
+
+    assert not hasattr(conv_kcp, "TEST_KNOBS_ENV")
+    for module in (conv_kcp, kcp_jit):
+        source = inspect.getsource(module)
+        for token in ("os.environ", "getenv", "environ.get", "import os"):
+            assert token not in source, (module.__name__, token)
+
+
+@pytest.mark.cpu_only
+def test_graph_knob_is_validated() -> None:
     assert conv_kcp.GRAPH_MODES == ("off", "replay")
     assert conv_kcp._set_test_knobs(None) == {"graph": "off", "host_trim": 1}
-    with pytest.raises(ValueError, match="CAKE_KCP_TEST_KNOBS"):
-        conv_kcp._set_test_knobs({"graph": "replay"})
-    with pytest.raises(ValueError, match="CAKE_KCP_TEST_KNOBS"):
-        conv_kcp._set_test_knobs({"host_trim": 1})
     assert conv_kcp._TEST_KNOBS == {"graph": "off", "host_trim": 1}
-    monkeypatch.setenv(conv_kcp.TEST_KNOBS_ENV, "1")
     try:
         with pytest.raises(ValueError, match="unknown"):
             conv_kcp._set_test_knobs({"grap": "replay"})
@@ -66,16 +78,11 @@ def test_graph_knob_is_gated_and_validated(monkeypatch) -> None:
 
 
 @pytest.mark.cpu_only
-def test_host_trim_knob_is_gated_and_validated(monkeypatch) -> None:
-    """``host_trim`` (the trimmed host path): refused without ``CAKE_KCP_TEST_KNOBS=1``,
-    validated against ``HOST_TRIMS`` (1 shipped = the trimmed host path of the eager halo call,
+def test_host_trim_knob_is_validated() -> None:
+    """``host_trim`` (the trimmed host path): validated against ``HOST_TRIMS`` (1 shipped = the trimmed host path of the eager halo call,
     0 = the previous host path), independent of ``graph``; a dict naming one knob keeps the other at its shipped default."""
-    monkeypatch.delenv(conv_kcp.TEST_KNOBS_ENV, raising=False)
     assert conv_kcp.HOST_TRIMS == (0, 1) and conv_kcp.HOST_TRIM_DEFAULT == 1
-    with pytest.raises(ValueError, match="CAKE_KCP_TEST_KNOBS"):
-        conv_kcp._set_test_knobs({"host_trim": 0})
     assert conv_kcp._TEST_KNOBS["host_trim"] == 1
-    monkeypatch.setenv(conv_kcp.TEST_KNOBS_ENV, "1")
     try:
         assert conv_kcp._set_test_knobs({"host_trim": 1}) == {
             "graph": "off",
@@ -110,7 +117,6 @@ def test_host_trim_knob_is_gated_and_validated(monkeypatch) -> None:
 
 @pytest.mark.cpu_only
 def test_graph_cache_key_and_eager_first_call(monkeypatch) -> None:
-    monkeypatch.setenv(conv_kcp.TEST_KNOBS_ENV, "1")
     x = torch.empty(8, 16, dtype=torch.bfloat16)
     w = torch.empty(16, 4, dtype=torch.float32)
     ctx = types.SimpleNamespace(T_r=8, n_frag=1, world_size=1)
@@ -176,7 +182,6 @@ def test_graph_public_keyword_mode_and_key(monkeypatch) -> None:
     """``graph=`` is a public keyword of the conv KCP calls (no environment gate): validated against
     ``GRAPH_MODES``, ``None`` = the module's shipped default (``GRAPH_DEFAULT == "off"``), keyed and recorded like the
     knob; a keyword contradicting an active knob is a ``ValueError``.  No kernel runs here."""
-    monkeypatch.delenv(conv_kcp.TEST_KNOBS_ENV, raising=False)
     conv_kcp._set_test_knobs(None)
     assert conv_kcp.GRAPH_DEFAULT == "off" and "GRAPH_DEFAULT" in conv_kcp.__all__
     assert conv_kcp._graph_mode(None) == "off"
@@ -219,7 +224,6 @@ def test_graph_public_keyword_mode_and_key(monkeypatch) -> None:
             "graph_key": e.digest,
             "graph_fallback": None,
         }
-        monkeypatch.setenv(conv_kcp.TEST_KNOBS_ENV, "1")
         conv_kcp._set_test_knobs({"graph": "replay"})
         assert (
             conv_kcp._graph_mode(None) == "replay"
@@ -272,7 +276,6 @@ def test_host_trim_ffi_device_and_cpu_refusal(monkeypatch) -> None:
     w = torch.zeros(16, 4, dtype=torch.float32)
     hist = torch.zeros(1, 16, dtype=torch.bfloat16)
     ctx = types.SimpleNamespace(cu_seqlens_local_cpu=(0, 4))
-    monkeypatch.setenv(conv_kcp.TEST_KNOBS_ENV, "1")
     try:
         conv_kcp._set_test_knobs({"host_trim": 1})
         with pytest.raises(ValueError, match="CUDA"):
