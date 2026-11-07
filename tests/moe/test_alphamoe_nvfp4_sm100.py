@@ -690,6 +690,14 @@ def _initial_output(case: dict, seed: int, scale: float = 4.0) -> torch.Tensor:
     ).to(torch.bfloat16)
 
 
+_NEGATIVE_ZERO_BITS = -(2**31)  # FP32 -0 viewed as int32
+
+
+def _is_negative_zero(buffer: torch.Tensor) -> bool:
+    """Every element of the FP32 ``buffer`` is -0 (a +0 element fails)."""
+    return bool(torch.all(buffer.view(torch.int32) == _NEGATIVE_ZERO_BITS))
+
+
 def test_alphamoe_nvfp4_aligned_adds_the_output_last_in_fp32():
     """The aligned entry adds the caller's output once, after every route:
     out = bf16(accumulator + float32(out)), round to nearest even, bit exact."""
@@ -736,7 +744,7 @@ def test_alphamoe_nvfp4_aligned_accumulator_is_zero_between_calls():
     key = (torch.cuda.current_device(), torch.cuda.current_stream().cuda_stream)
     cached = entry._ALIGNED_ACCUMULATORS[key]
     assert cached.dtype == torch.float32 and cached.numel() >= m * k
-    assert torch.count_nonzero(cached) == 0, "the accumulator is not 0 after a call"
+    assert _is_negative_zero(cached), "the accumulator is not -0 after a call"
 
     zero_extent = torch.zeros((1,), dtype=torch.int32, device="cuda")
     unchanged = _launch(case, out=initial.clone(), num_tokens_post_padded=zero_extent)
@@ -754,7 +762,7 @@ def test_alphamoe_nvfp4_aligned_accumulator_is_zero_between_calls():
     _assert_nvfp4_close(on_side, expected, "call on another stream")
     side_key = (torch.cuda.current_device(), side.cuda_stream)
     assert entry._ALIGNED_ACCUMULATORS[side_key] is not cached
-    assert torch.count_nonzero(entry._ALIGNED_ACCUMULATORS[side_key]) == 0
+    assert _is_negative_zero(entry._ALIGNED_ACCUMULATORS[side_key])
     assert entry._ALIGNED_ACCUMULATORS[key] is cached
 
 
@@ -797,12 +805,8 @@ def test_alphamoe_nvfp4_aligned_cuda_graph_replays_add_into_their_output():
         eager, _reference(case, out_init=initial), "eager after replays"
     )
     assert all(
-        torch.count_nonzero(buffer) == 0
-        for buffer in entry._ALIGNED_ACCUMULATORS.values()
+        _is_negative_zero(buffer) for buffer in entry._ALIGNED_ACCUMULATORS.values()
     )
-
-
-_NEGATIVE_ZERO_BITS = -(2**31)  # FP32 -0 viewed as int32
 
 
 def test_alphamoe_nvfp4_aligned_keeps_negative_zero_without_contributions():
@@ -916,18 +920,18 @@ def test_alphamoe_nvfp4_aligned_accumulator_cache_is_bounded():
     torch.cuda.synchronize()
     _assert_nvfp4_close(again, expected, "call on a released stream")
     assert all(
-        torch.count_nonzero(buffer) == 0
-        for buffer in entry._ALIGNED_ACCUMULATORS.values()
+        _is_negative_zero(buffer) for buffer in entry._ALIGNED_ACCUMULATORS.values()
     )
-
-
-_CUDA_STREAM_PER_THREAD = 2  # cudaStreamPerThread
 
 
 def _on_per_thread_stream(device: int, body, errors: list) -> None:
     """Run ``body`` on this host thread with cudaStreamPerThread current."""
+    from flashinfer.fused_moe import alphamoe_nvfp4_sm100 as entry
+
     try:
-        per_thread = torch.cuda.ExternalStream(_CUDA_STREAM_PER_THREAD, device=device)
+        per_thread = torch.cuda.ExternalStream(
+            entry._CUDA_STREAM_PER_THREAD, device=device
+        )
         with torch.cuda.device(device), torch.cuda.stream(per_thread):
             body()
     except BaseException as error:  # reported by the main thread
@@ -946,7 +950,7 @@ def test_alphamoe_nvfp4_aligned_per_thread_stream_keeps_no_accumulator():
     expected = _reference(case, out_init=initial)
     out = initial.clone()
     torch.cuda.synchronize()
-    entry._ALIGNED_ACCUMULATORS.pop((device, _CUDA_STREAM_PER_THREAD), None)
+    entry._ALIGNED_ACCUMULATORS.pop((device, entry._CUDA_STREAM_PER_THREAD), None)
     errors: list = []
 
     def body() -> None:
@@ -959,7 +963,7 @@ def test_alphamoe_nvfp4_aligned_per_thread_stream_keeps_no_accumulator():
     if errors:
         raise errors[0]
     torch.cuda.synchronize()
-    assert (device, _CUDA_STREAM_PER_THREAD) not in entry._ALIGNED_ACCUMULATORS
+    assert (device, entry._CUDA_STREAM_PER_THREAD) not in entry._ALIGNED_ACCUMULATORS
     _assert_nvfp4_close(out, expected, "call on the per-thread stream")
 
 
