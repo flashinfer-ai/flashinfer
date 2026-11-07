@@ -721,6 +721,147 @@ def test_workspace_arguments_of_the_argument_plans():
     assert int(HOST_PLAN_CONSTANTS["wave_sync_words"]) >= 1
 
 
+# The keywords the host binds a stage's argument plan from, by the stage it binds: the
+# forward and data-gradient stages, the weight-gradient main stages and the tail reduce.
+ROW_ARGUMENTS = {
+    "A",
+    "B",
+    "C",
+    "offs",
+    "num_groups",
+    "sum_m",
+    "N",
+    "K",
+    "ldc",
+    "c0",
+    "c1",
+}
+WGRAD_MAIN_ARGUMENTS = {
+    "A",
+    "B",
+    "C",
+    "offs",
+    "tensormap_workspace",
+    "partials",
+    "tail_splits",
+    "raster_rows",
+    "num_groups",
+    "sum_m",
+    "N",
+    "K",
+    "ldc",
+    "stride_e",
+    "wave_mode",
+}
+TAIL_ARGUMENTS = {
+    "partials",
+    "C",
+    "offs",
+    "num_groups",
+    "N",
+    "K",
+    "ldc",
+    "stride_e",
+    "num_clusters",
+    "tail_splits",
+    "raster_rows",
+}
+GRID_ARGUMENTS = {"grid_x", "grid_y", "grid_z"}
+
+
+def test_argument_plans_name_only_bound_arguments():
+    """Every argument the program of a route stage names, on every architecture, is one
+    the host binds for that stage: a grid dimension, a stream workspace, a keyword of the
+    stage's preparation, or an operand alias (``OPERAND_ALIASES``: a row-addressed base
+    of ``A`` / ``B`` that a build takes beside its TMA descriptors)."""
+    for name, route in ROUTES.items():
+        for stage in route["stages"]:
+            if route["op"] != "wgrad":
+                bound = ROW_ARGUMENTS
+            elif stage["name"].startswith(cb.TAIL_REDUCE):
+                bound = TAIL_ARGUMENTS
+            else:
+                bound = WGRAD_MAIN_ARGUMENTS
+            for kind, arg in PROGRAMS[stage["program"]]["arg_plan"]:
+                if kind == "grid":
+                    assert arg in GRID_ARGUMENTS, (name, stage["name"], arg)
+                elif kind == "buffer" and arg in cb.STREAM_WORKSPACES:
+                    continue
+                else:
+                    assert arg in bound or cb.OPERAND_ALIASES.get(arg) in bound, (
+                        name,
+                        stage["name"],
+                        stage["program"],
+                        arg,
+                    )
+
+
+def test_bind_passes_each_operand_alias_its_operand(monkeypatch):
+    """A program whose argument plan names ``A_rows`` / ``B_rows`` gets the tensors the
+    host binds as ``A`` / ``B``, in the plan's order; an argument the host does not bind
+    is refused with a ``KeyError`` naming it."""
+    program = "cake_moe_grouped_det_gemm_alias_probe"
+    arg_plan = [
+        ["buffer", "A"],
+        ["buffer", "A_rows"],
+        ["buffer", "B_rows"],
+        ["buffer", "B"],
+        ["parameter", "K"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ]
+    monkeypatch.setitem(
+        PROGRAMS,
+        program,
+        {"arg_plan": arg_plan, "ffi_entry": "run", "arches": ["sm_100a"]},
+    )
+    monkeypatch.setattr(
+        cb,
+        "stage_binding",
+        lambda name, stage, arch: {"program": program, "specializations": {}},
+    )
+    entry = object()
+    monkeypatch.setattr(
+        cb, "load_module", lambda *args: type("Module", (), {"run": entry})
+    )
+    a, b = object(), object()
+    kwargs = dict(A=a, B=b, K=7, grid=(4, 2, 1))
+    launch = cb._bind("alias_probe", "main", kwargs, "sm_100a")
+    assert launch.entry is entry
+    assert launch.arguments == (a, a, b, b, 7, 4, 2, 1)
+    assert launch.workspace_slots == ()
+    arg_plan.insert(1, ["buffer", "C_rows"])
+    with pytest.raises(KeyError, match="C_rows"):
+        cb._bind("alias_probe", "main", kwargs, "sm_100a")
+
+
+def test_k256_wave_build_launches_only_on_its_wave_archs():
+    """The 256-wide k tile's wave-synchronised build (``main_wave``) launches only on
+    the architectures ``wave_sync_archs[256]`` lists, never on sm_107a, whatever ``K``
+    and whether or not the route also builds it there; every architecture of the route
+    keeps its weight gradient (the ``main`` stage, ``program_registered``)."""
+    c = HOST_PLAN_CONSTANTS
+    assert "sm_107a" not in c["wave_sync_archs"][256]
+    min_k = int(c["wave_sync_min_k"])
+    for out_dtype in ("bfloat16", "float32"):
+        name = cake_jit.record_name("wgrad", out_dtype=out_dtype, tile_k=256)
+        for arch in ROUTES[name]["arches"]:
+            assert cake_jit.stage_served(name, "main", arch), (name, arch)
+            assert cake_jit.program_registered(
+                "wgrad", arch, out_dtype=out_dtype, tile_k=256
+            )
+            launched = arch in c["wave_sync_archs"][256]
+            if launched:
+                assert cake_jit.stage_served(name, "main_wave", arch), (name, arch)
+            for k in (min_k, 4 * min_k):
+                stage, wave = cb.select_wgrad_stage(
+                    name, k, 256, arch, c, sum_m=EXPERT_ROWS, num_groups=4
+                )
+                assert wave == launched, (name, arch, k)
+                assert stage == ("main_wave" if launched else "main"), (name, arch, k)
+
+
 # ---------------------------------------------------------------------------
 # GPU correctness
 # ---------------------------------------------------------------------------

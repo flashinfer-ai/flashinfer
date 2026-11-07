@@ -912,6 +912,10 @@ except AttributeError:  # pragma: no cover - older torch
 
 # The workspace kinds a program's argument plan may name, by argument name.
 STREAM_WORKSPACES = ("sched", "wave_sync")
+# Arguments a generated program may name beside the operands it addresses through TMA descriptors: the
+# operands' row-addressed bases, the same tensors as ``A`` / ``B`` (``_bind`` passes them where the
+# argument plan names them).
+OPERAND_ALIASES = {"A_rows": "A", "B_rows": "B"}
 # Stream workspaces (module docstring): one buffer per (kind, device index,
 # CUDA stream handle), created on the first launch on that stream.
 _stream_workspaces: dict[tuple[str, int, int], torch.Tensor] = {}
@@ -1318,7 +1322,8 @@ def _bind(
     its entry (the binding encodes the operands' TMA descriptors by value at every launch).  A buffer the
     plan names after a stream workspace kind is left to ``CakeMoEGroupedGemmDetLaunch.launch``; with ``split`` so
     are ``c0`` / ``c1``, which a launch replaces by the probed split of its ``sched`` once known, and the
-    queue probe is built here."""
+    queue probe is built here.  An argument of ``OPERAND_ALIASES`` the plan names gets the operand it
+    aliases."""
     binding = stage_binding(name, stage, arch)
     program = PROGRAMS[binding["program"]]
     grid = dict(zip(("grid_x", "grid_y", "grid_z"), kwargs["grid"], strict=True))
@@ -1332,6 +1337,8 @@ def _bind(
             arguments.append(None)
         elif arg in kwargs:
             arguments.append(kwargs[arg])
+        elif OPERAND_ALIASES.get(arg) in kwargs:
+            arguments.append(kwargs[OPERAND_ALIASES[arg]])
         else:
             raise KeyError(
                 f"generated program {binding['program']!r} (route {name!r}, stage {stage!r}) "
